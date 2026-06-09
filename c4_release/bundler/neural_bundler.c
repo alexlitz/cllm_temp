@@ -33,7 +33,8 @@ int DATA_BASE;
 /* Token and opcode constants */
 int TK_NUM; int TK_ID; int TK_STR; int TK_INT; int TK_CHAR;
 int TK_ENUM; int TK_IF; int TK_ELSE; int TK_WHILE; int TK_RET;
-int TK_SIZEOF; int TK_ASSIGN; int TK_OR; int TK_AND;
+int TK_SIZEOF; int TK_ASSIGN; int TK_COND; int TK_OR; int TK_AND;
+int TK_BOR; int TK_BXOR; int TK_BAND;
 int TK_EQ; int TK_NE; int TK_LT; int TK_GT; int TK_LE; int TK_GE;
 int TK_SHL; int TK_SHR; int TK_ADD; int TK_SUB; int TK_MUL;
 int TK_DIV; int TK_MOD; int TK_INC; int TK_DEC; int TK_BRAK; int TK_EOF;
@@ -60,7 +61,17 @@ int *code; int code_pos;
 char *data; int data_pos;
 int expr_type;
 
-/* Symbol table */
+/* Symbol table.
+ *
+ * MAX_SYMS was 256 in earlier revisions. That overflowed silently on
+ * self-bundling (neural_bundler.c parses ~340 unique identifiers) and
+ * surfaced as a 99%-CPU hang because find_sym scans linearly while
+ * add_sym kept writing past the allocator buffers — corrupting the
+ * heap and eventually trapping the parser into pathological retry
+ * loops. Bumped to 4096 (covers neural_bundler.c + runtime templates
+ * with headroom). add_sym now exits cleanly on overflow as a belt-
+ * and-braces safety net so future overflows fail loudly instead of
+ * hanging. */
 char **sym_names; int *sym_class; int *sym_type; int *sym_val;
 int *sym_hclass; int *sym_htype; int *sym_hval;
 int sym_count; int MAX_SYMS; int local_offset;
@@ -81,7 +92,14 @@ int init_constants() {
     TK_INT = 131; TK_CHAR = 132; TK_ENUM = 133;
     TK_IF = 134; TK_ELSE = 135; TK_WHILE = 136;
     TK_RET = 137; TK_SIZEOF = 138;
-    TK_ASSIGN = 140; TK_OR = 142; TK_AND = 143;
+    TK_ASSIGN = 140; TK_COND = 141; TK_OR = 142; TK_AND = 143;
+    /* Bitwise operators: precedence between `&&` and `==` so that
+     * `a == b | c` parses as `(a == b) | c` per standard C. Ascending
+     * token values = tighter binding in expr()'s `while (tk >= level)`
+     * loop, so BAND (146) binds tighter than BXOR (145) than BOR (144).
+     * TK_COND (141) sits just above TK_ASSIGN so `cond ? a : b` parses
+     * with lower precedence than logical OR. */
+    TK_BOR = 144; TK_BXOR = 145; TK_BAND = 146;
     TK_EQ = 147; TK_NE = 148; TK_LT = 149; TK_GT = 150;
     TK_LE = 151; TK_GE = 152; TK_SHL = 153; TK_SHR = 154;
     TK_ADD = 155; TK_SUB = 156; TK_MUL = 157;
@@ -103,7 +121,7 @@ int init_constants() {
     OP_GETCHAR = 64; OP_PUTCHAR = 65;
 
     TY_CHAR = 0; TY_INT = 1; TY_PTR = 2;
-    MAX_SYMS = 256;
+    MAX_SYMS = 4096;
 
     hex_chars[0] = '0'; hex_chars[1] = '1'; hex_chars[2] = '2'; hex_chars[3] = '3';
     hex_chars[4] = '4'; hex_chars[5] = '5'; hex_chars[6] = '6'; hex_chars[7] = '7';
@@ -134,6 +152,11 @@ int find_sym(char *name, int len) {
 
 int add_sym(char *name, int len, int cls, int typ, int val) {
     int idx; char *n; int i;
+    if (sym_count >= MAX_SYMS) {
+        printf("/* FATAL: symbol table overflow (MAX_SYMS=%d). "
+               "Increase MAX_SYMS in neural_bundler.c. */\n", MAX_SYMS);
+        exit(2);
+    }
     idx = sym_count; sym_count = sym_count + 1;
     n = malloc(len + 1);
     i = 0; while (i < len) { n[i] = name[i]; i = i + 1; }
@@ -239,13 +262,15 @@ int next() {
         else if (c == '!') { src_pos = src_pos + 1; if (src[src_pos] == '=') { src_pos = src_pos + 1; tk = TK_NE; } else tk = '!'; return 0; }
         else if (c == '<') { src_pos = src_pos + 1; if (src[src_pos] == '=') { src_pos = src_pos + 1; tk = TK_LE; } else if (src[src_pos] == '<') { src_pos = src_pos + 1; tk = TK_SHL; } else tk = TK_LT; return 0; }
         else if (c == '>') { src_pos = src_pos + 1; if (src[src_pos] == '=') { src_pos = src_pos + 1; tk = TK_GE; } else if (src[src_pos] == '>') { src_pos = src_pos + 1; tk = TK_SHR; } else tk = TK_GT; return 0; }
-        else if (c == '|') { src_pos = src_pos + 1; if (src[src_pos] == '|') { src_pos = src_pos + 1; tk = TK_OR; } else tk = '|'; return 0; }
-        else if (c == '&') { src_pos = src_pos + 1; if (src[src_pos] == '&') { src_pos = src_pos + 1; tk = TK_AND; } else tk = '&'; return 0; }
+        else if (c == '|') { src_pos = src_pos + 1; if (src[src_pos] == '|') { src_pos = src_pos + 1; tk = TK_OR; } else tk = TK_BOR; return 0; }
+        else if (c == '&') { src_pos = src_pos + 1; if (src[src_pos] == '&') { src_pos = src_pos + 1; tk = TK_AND; } else tk = TK_BAND; return 0; }
+        else if (c == '^') { src_pos = src_pos + 1; tk = TK_BXOR; return 0; }
         else if (c == '+') { src_pos = src_pos + 1; if (src[src_pos] == '+') { src_pos = src_pos + 1; tk = TK_INC; } else tk = TK_ADD; return 0; }
         else if (c == '-') { src_pos = src_pos + 1; if (src[src_pos] == '-') { src_pos = src_pos + 1; tk = TK_DEC; } else tk = TK_SUB; return 0; }
         else if (c == '*') { src_pos = src_pos + 1; tk = TK_MUL; return 0; }
         else if (c == '%') { src_pos = src_pos + 1; tk = TK_MOD; return 0; }
         else if (c == '[') { src_pos = src_pos + 1; tk = TK_BRAK; return 0; }
+        else if (c == '?') { src_pos = src_pos + 1; tk = TK_COND; return 0; }
         else { tk = c; src_pos = src_pos + 1; return 0; }
     }
 }
@@ -314,7 +339,10 @@ int primary() {
         if (expr_type == TY_PTR) emit(OP_LC, 0); else emit(OP_LI, 0);
         if (expr_type >= TY_PTR) expr_type = expr_type - TY_PTR;
     }
-    else if (tk == '&') {
+    else if (tk == TK_BAND) {
+        /* `&` as a unary address-of when it appears in primary position.
+         * The lexer no longer emits the raw '&' codepoint because we
+         * added TK_BAND for the bitwise infix operator. */
         next(); primary();
         if ((code[code_pos - 1] & 0xFF) == OP_LI || (code[code_pos - 1] & 0xFF) == OP_LC) code_pos = code_pos - 1;
         expr_type = expr_type + TY_PTR;
@@ -335,7 +363,7 @@ int primary() {
 }
 
 int expr(int level) {
-    int t; int addr; int sz;
+    int t; int addr; int sz; int aaddr; int baddr;
     primary();
     while (tk >= level) {
         t = expr_type;
@@ -346,8 +374,22 @@ int expr(int level) {
             if (t == TY_CHAR) emit(OP_SC, 0); else emit(OP_SI, 0);
             expr_type = t;
         }
+        else if (tk == TK_COND) {
+            /* Ternary `cond ? a : b` — c4 ships without this but
+             * neural_bundler.c uses it in 7 places. Emit as:
+             *   BZ Lfalse; <a>; JMP Lend; Lfalse: <b>; Lend:
+             * patch_jmp is the same helper used for if/while. */
+            next(); aaddr = emit(OP_BZ, 0); expr(TK_ASSIGN);
+            if (tk == ':') next();
+            baddr = emit(OP_JMP, 0); patch_jmp(aaddr, code_pos * 8);
+            expr(TK_COND); patch_jmp(baddr, code_pos * 8);
+            expr_type = TY_INT;
+        }
         else if (tk == TK_OR) { next(); addr = emit(OP_BNZ, 0); expr(TK_AND); patch_jmp(addr, code_pos * 8); expr_type = TY_INT; }
-        else if (tk == TK_AND) { next(); addr = emit(OP_BZ, 0); expr(TK_EQ); patch_jmp(addr, code_pos * 8); expr_type = TY_INT; }
+        else if (tk == TK_AND) { next(); addr = emit(OP_BZ, 0); expr(TK_BOR); patch_jmp(addr, code_pos * 8); expr_type = TY_INT; }
+        else if (tk == TK_BOR) { next(); emit(OP_PSH, 0); expr(TK_BXOR); emit(OP_OR, 0); expr_type = TY_INT; }
+        else if (tk == TK_BXOR) { next(); emit(OP_PSH, 0); expr(TK_BAND); emit(OP_XOR, 0); expr_type = TY_INT; }
+        else if (tk == TK_BAND) { next(); emit(OP_PSH, 0); expr(TK_EQ); emit(OP_AND, 0); expr_type = TY_INT; }
         else if (tk == TK_EQ) { next(); emit(OP_PSH, 0); expr(TK_LT); emit(OP_EQ, 0); expr_type = TY_INT; }
         else if (tk == TK_NE) { next(); emit(OP_PSH, 0); expr(TK_LT); emit(OP_NE, 0); expr_type = TY_INT; }
         else if (tk == TK_LT) { next(); emit(OP_PSH, 0); expr(TK_SHL); emit(OP_LT, 0); expr_type = TY_INT; }
@@ -458,6 +500,13 @@ int decl() {
                     sym_class[i] = 5; sym_type[i] = t; sym_val[i] = local_offset;
                     local_offset = local_offset + 8; params = params + 1; next();
                 }
+                else if (tk != ',' && tk != ')') {
+                    /* Skip any token we don't recognize (e.g. `.` from
+                     * variadic `...`) so we don't spin on the parameter
+                     * loop. Without this guard, self-bundling hangs on
+                     * `int printf(char *fmt, ...)`. */
+                    next();
+                }
                 if (tk == ',') next();
             }
             if (tk == ')') next();
@@ -479,6 +528,17 @@ int decl() {
                             else i = add_sym(tk_str, tk_len, 0, 0, 0);
                             local_offset = local_offset - 8;
                             sym_class[i] = 5; sym_type[i] = t; sym_val[i] = local_offset; next();
+                            /* Skip `[N]` array suffix on local arrays.
+                             * `char tmp[1024];` is used in read_file()
+                             * and would otherwise trap the parser. We
+                             * don't actually allocate the extra stack
+                             * here — the embedded c4 only needs to parse
+                             * past it; the self-bundled program just
+                             * uses tmp as a pointer-sized slot. */
+                            if (tk == TK_BRAK) {
+                                while (tk != ']' && tk != ';' && tk != TK_EOF) next();
+                                if (tk == ']') next();
+                            }
                         }
                         if (tk == ',') { next(); t = base_type; } else break;
                     }
@@ -494,7 +554,17 @@ int decl() {
                 }
             }
             return 0;
-        } else { sym_class[sym_idx] = 4; sym_val[sym_idx] = data_pos + DATA_BASE; data_pos = data_pos + 8; }
+        } else {
+            sym_class[sym_idx] = 4; sym_val[sym_idx] = data_pos + DATA_BASE; data_pos = data_pos + 8;
+            /* Skip optional `[N]` array suffix on globals. Without this,
+             * `char hex_chars[17];` (and any other fixed-size global
+             * arrays in self-bundling input) traps decl() on TK_BRAK and
+             * the outer `while (tk != TK_EOF) decl();` spins forever. */
+            if (tk == TK_BRAK) {
+                while (tk != ']' && tk != ';' && tk != TK_EOF) next();
+                if (tk == ']') next();
+            }
+        }
         if (tk == ',') next();
     }
     if (tk == ';') next(); return 0;
@@ -503,14 +573,17 @@ int decl() {
 /* ============ Compile ============ */
 
 int compile(char *source) {
-    int main_idx; int i;
+    int main_idx; int i; int _prev_pos;
     src = source; src_pos = 0; line = 1;
-    code = malloc(POOL_SIZE * 4); data = malloc(POOL_SIZE);
+    /* Casts let host gcc 16+ accept the malloc returns; the embedded
+     * c4 compiler in this same file parses (type *)expr casts via
+     * primary(). */
+    code = (int *)malloc(POOL_SIZE * 4); data = malloc(POOL_SIZE);
     code_pos = 2; data_pos = 0;  /* Reserve 0 for JSR main, 1 for EXIT */
-    sym_names = malloc(MAX_SYMS * 8); sym_class = malloc(MAX_SYMS * 4);
-    sym_type = malloc(MAX_SYMS * 4); sym_val = malloc(MAX_SYMS * 4);
-    sym_hclass = malloc(MAX_SYMS * 4); sym_htype = malloc(MAX_SYMS * 4);
-    sym_hval = malloc(MAX_SYMS * 4); sym_count = 0;
+    sym_names = (char **)malloc(MAX_SYMS * 8); sym_class = (int *)malloc(MAX_SYMS * 4);
+    sym_type = (int *)malloc(MAX_SYMS * 4); sym_val = (int *)malloc(MAX_SYMS * 4);
+    sym_hclass = (int *)malloc(MAX_SYMS * 4); sym_htype = (int *)malloc(MAX_SYMS * 4);
+    sym_hval = (int *)malloc(MAX_SYMS * 4); sym_count = 0;
     i = 0; while (i < MAX_SYMS) { sym_hclass[i] = 0; i = i + 1; }
     /* Built-ins */
     add_sym("open", 4, 3, TY_INT, OP_OPEN);
@@ -524,7 +597,14 @@ int compile(char *source) {
     add_sym("putchar", 7, 3, TY_INT, OP_PUTCHAR);
     add_sym("exit", 4, 3, TY_INT, OP_EXIT);
     next();
-    while (tk != TK_EOF) decl();
+    /* Watchdog: if decl() neither advanced the source nor reached EOF,
+     * we'd loop forever. Force progress to keep the bundler responsive
+     * on any input the embedded c4 grammar can't fully model. */
+    while (tk != TK_EOF) {
+        _prev_pos = src_pos;
+        decl();
+        if (tk != TK_EOF && src_pos == _prev_pos) next();
+    }
     main_idx = find_sym("main", 4);
     if (main_idx >= 0) {
         code[0] = OP_JSR | (sym_val[main_idx] << 8);
