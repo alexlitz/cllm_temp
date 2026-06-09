@@ -384,6 +384,70 @@ def _first_attention(model: Any) -> Any:
     return getattr(blocks[0], "attn", None)
 
 
+def _attn_head_counts(model: Any) -> List[int]:
+    """Return per-block attention head counts.
+
+    The VM has heterogeneous per-block attention widths — most blocks use
+    the default 8 heads, but a few are wider (production model: L13 has
+    12 heads, L31 has 14 heads). Qwen3-dense requires a uniform
+    ``num_attention_heads`` across all layers, so the export config picks
+    ``max(_attn_head_counts(model))`` and :func:`_build_export_state_dict`
+    zero-pads short blocks' Q/K/V rows and W_o columns up to that max.
+
+    Padding with zeros is semantically a no-op: the extra padded heads
+    have Q=K=V=0 (so their attention output is 0 regardless of softmax)
+    AND W_o has zero columns for them (so any non-zero attention output
+    is multiplied by 0). The contribution of every padded head is
+    therefore exactly zero on every input.
+    """
+
+    counts: List[int] = []
+    for block in _blocks(model):
+        attn = getattr(block, "attn", None)
+        if attn is None:
+            continue
+        n = getattr(attn, "num_heads", None)
+        if n is None:
+            continue
+        counts.append(int(n))
+    return counts
+
+
+def _pad_attn_proj_rows(t: torch.Tensor, *, target_rows: int) -> torch.Tensor:
+    """Zero-pad a (rows, d_model) attention projection up to ``target_rows``.
+
+    Used for ``W_q`` / ``W_k`` / ``W_v`` whose first axis is
+    ``n_heads * head_dim``. Padding with zero rows materialises extra
+    "phantom" heads whose Q/K/V output is zero on every input.
+    """
+
+    current = int(t.shape[0])
+    if current >= int(target_rows):
+        return t
+    pad_amount = int(target_rows) - current
+    return torch.nn.functional.pad(
+        t, [0, 0, 0, pad_amount], mode="constant", value=0.0
+    )
+
+
+def _pad_attn_o_cols(t: torch.Tensor, *, target_cols: int) -> torch.Tensor:
+    """Zero-pad a (d_model, cols) ``W_o`` up to ``target_cols`` along axis=1.
+
+    Mirror of :func:`_pad_attn_proj_rows` for the output projection. With
+    zero columns for the phantom heads, even a non-zero attention output
+    from those heads would be multiplied by zero before contributing to
+    the residual stream.
+    """
+
+    current = int(t.shape[1])
+    if current >= int(target_cols):
+        return t
+    pad_amount = int(target_cols) - current
+    return torch.nn.functional.pad(
+        t, [0, pad_amount, 0, 0], mode="constant", value=0.0
+    )
+
+
 def infer_qwen2_config_kwargs(model: Any) -> Dict[str, Any]:
     """Return Qwen2Config kwargs inferred from a VM model.
 
@@ -749,8 +813,22 @@ def _build_qwen3_dense_config(model: Any, *, K: float) -> Qwen3DenseConfig:
     attn = _first_attention(model)
     ffn_dims = _ffn_hidden_dims(model)
     d_model = int(getattr(model, "d_model", getattr(attn, "dim", 0)))
-    n_heads = int(getattr(attn, "num_heads", 1))
-    head_dim = d_model // n_heads if n_heads else 0
+    # Qwen3 dense requires a uniform ``num_attention_heads`` across all
+    # layers. The VM has heterogeneous per-block attention widths
+    # (production model: most blocks use 8 heads but L13 has 12 and L31
+    # has 14). The head_dim is uniform (= d_model / default_n_heads), so
+    # the wider layers manifest as more (head_dim-wide) Q/K/V rows. The
+    # config picks ``max`` and ``_build_export_state_dict`` zero-pads
+    # short blocks' Q/K/V/O up to that max; padded heads have Q=K=V=0
+    # AND W_o has zero columns for them, so their contribution is exactly
+    # zero on every input.
+    head_counts = _attn_head_counts(model)
+    base_n_heads = int(getattr(attn, "num_heads", 1))
+    n_heads = max(head_counts) if head_counts else base_n_heads
+    # head_dim is taken from the base (first) layer because it is uniform
+    # across the VM's attention layers; the per-layer total Q/K/V width
+    # is ``num_heads * head_dim`` and only ``num_heads`` varies.
+    head_dim = d_model // base_n_heads if base_n_heads else 0
     # Qwen3 dense requires a uniform ``intermediate_size`` across all layers.
     # The VM has heterogeneous PureFFN widths (production model: widths in
     # {1, 7, 8, 42, 64, 192, 512, 792, 1536, 1846, 1890, 2059, 3405, 4096}).
@@ -1466,6 +1544,17 @@ def _build_export_state_dict(
     # same shape — see ``extract_composite_ffn_weights``.
     ffn_dims = _ffn_hidden_dims(model)
     intermediate_size = max(ffn_dims) if ffn_dims else 0
+    # Qwen3 dense requires a uniform ``num_attention_heads`` across all
+    # layers; the VM has heterogeneous per-block head counts. Pick the
+    # max and zero-pad short blocks' Q/K/V rows + W_o columns up to
+    # ``max_n_heads * head_dim``. See ``_attn_head_counts`` for the
+    # algebraic argument that zero-padded heads contribute exactly zero.
+    head_counts = _attn_head_counts(model)
+    base_attn = _first_attention(model)
+    base_n_heads = int(getattr(base_attn, "num_heads", 1)) if base_attn else 1
+    max_n_heads = max(head_counts) if head_counts else base_n_heads
+    head_dim = d_model // base_n_heads if base_n_heads else 0
+    target_attn_rows = max_n_heads * head_dim
 
     for i, block in enumerate(blocks):
         prefix = f"model.layers.{i}"
@@ -1473,23 +1562,32 @@ def _build_export_state_dict(
         ffn = block.ffn
 
         # Attention projections. Qwen3 stores them as Linear weights of
-        # shape (out, in) — same convention as the VM. ``W_q`` etc. are
-        # already (d_model, d_model) on the VM, so a direct copy works.
+        # shape (out, in) — same convention as the VM. The VM's per-block
+        # ``W_q`` etc. are ``(n_heads_block * head_dim, d_model)``, so
+        # blocks whose ``n_heads_block < max_n_heads`` get zero-padded
+        # along the row axis (and W_o gets zero-padded along the column
+        # axis) to match Qwen3's uniform ``num_attention_heads`` config.
         W_q = _to_dense(attn.W_q.data).clone().float()
         W_k = _to_dense(attn.W_k.data).clone().float()
         W_v = _to_dense(attn.W_v.data).clone().float()
         W_o = _to_dense(attn.W_o.data).clone().float()
         W_k, W_v = _add_softmax_sink_to_kv(W_k, W_v)
 
-        state[f"{prefix}.self_attn.q_proj.weight"] = W_q
-        state[f"{prefix}.self_attn.k_proj.weight"] = W_k
-        state[f"{prefix}.self_attn.v_proj.weight"] = W_v
-        state[f"{prefix}.self_attn.o_proj.weight"] = W_o
+        if target_attn_rows > 0:
+            W_q = _pad_attn_proj_rows(W_q, target_rows=target_attn_rows)
+            W_k = _pad_attn_proj_rows(W_k, target_rows=target_attn_rows)
+            W_v = _pad_attn_proj_rows(W_v, target_rows=target_attn_rows)
+            W_o = _pad_attn_o_cols(W_o, target_cols=target_attn_rows)
+
+        state[f"{prefix}.self_attn.q_proj.weight"] = W_q.contiguous()
+        state[f"{prefix}.self_attn.k_proj.weight"] = W_k.contiguous()
+        state[f"{prefix}.self_attn.v_proj.weight"] = W_v.contiguous()
+        state[f"{prefix}.self_attn.o_proj.weight"] = W_o.contiguous()
 
         # Qwen3 dense has per-head q_norm/k_norm; we set them to identity
-        # via the same K/sqrt(d) trick. Head_dim is `d_model / n_heads`.
-        n_heads = int(attn.num_heads)
-        head_dim = d_model // n_heads if n_heads else 0
+        # via the same K/sqrt(d) trick. ``head_dim`` is uniform across
+        # the VM's attention layers, so the gamma vector is the same
+        # regardless of the per-block ``num_heads``.
         if head_dim > 0:
             head_gamma = _rmsnorm_identity_gamma(head_dim, K)
             state[f"{prefix}.self_attn.q_norm.weight"] = head_gamma.clone()
