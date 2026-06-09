@@ -806,11 +806,19 @@ def make_layer14_mem_generation_op() -> Operation:
         # ADDR_B0_LO after L14 in the same step; the PREV_STEP alias
         # retires the back-edge while keeping the numeric slot identical.
         reads={"MARK_MEM", "MARK_SP", "MARK_STACK0", "OP_PSH", "OP_SI", "OP_SC",
-               "OP_JSR", "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+               "OP_JSR", "OP_ENT", "OP_LI", "OP_LC",
+               "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1",
                "MEM_STORE", "MEM_ADDR_SRC", "STACK0_BYTE0", "L1H0", "L1H1", "L1H2",
                "H0", "H1", "L1H4", "H2", "H3", "H4",
-               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE"},
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3", "IS_BYTE",
+               # head specs (h=1,2,3) read STACK0_BYTE_VAL_h_{LO,HI} produced
+               # by L10 ``layer10_psh_ax_broadcast`` for the SI/SC byte-h
+               # source. Declared in ``reads`` so the producer-consumer dim
+               # contract (``stack0_byte_val_*_pshk2mem``) verifies clean.
+               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+               "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+               "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
         # Phase 8.G.6 follow-up: drop ``layer_idx=14`` literal and bind to
