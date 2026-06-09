@@ -329,6 +329,10 @@ def make_layer2_mem_byte_flags_op() -> Operation:
         reads={"H0", "H1", "H4", "IS_BYTE", "BYTE_INDEX_0",
                "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"},
         writes={"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+                # Per the unit 4 claim and the IR walk (audit
+                # 2026_06_09), BYTE_INDEX_0 is written too; previously
+                # omitted from the declared writes set.
+                "BYTE_INDEX_0",
                 "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                 "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"},
         kind="ffn",
