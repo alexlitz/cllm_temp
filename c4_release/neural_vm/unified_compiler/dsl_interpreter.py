@@ -208,7 +208,7 @@ class DSLInterpreter:
 
         Symbolic model: each spec is interpreted as a value-propagation
         channel. For every ``AO`` (output write) in the spec, we set
-        ``state[o.dim] += state.get(spec.value_dim_for(o.slot), 0)``.
+        ``state[o.out_dim] += state.get(spec.value_dim_for(o.slot), 0)``.
         This abstracts away the Q/K matching (which depends on token
         positions / runtime activations) and just propagates whatever
         the spec's value-side dim currently holds to the output-side dim.
@@ -239,7 +239,10 @@ class DSLInterpreter:
                     continue
                 v_value = self.state.get(v_dim, 0.0)
                 contribution = v_value * o.weight
-                key = o.dim
+                # AttentionOutputWrite carries ``out_dim`` (an int residual
+                # column); use it as the state key directly, mirroring the
+                # V-side which also keys state by an int dim.
+                key = o.out_dim
                 self.state[key] = self.state.get(key, 0.0) + contribution
                 step.writes.append((key, contribution))
         return step
@@ -259,9 +262,12 @@ class DSLInterpreter:
             rules_fired=len(rules),
         )
         for rule in rules:
+            # TokenEmbeddingRule fields are target / token_ids / writes;
+            # record a short summary without per-write expansion.
             step.notes.append(
-                f"embed token={rule.token} table={rule.table} "
-                f"dim={rule.target_dim} value={rule.value}"
+                f"embed target={getattr(rule, 'target', '?')} "
+                f"token_ids={getattr(rule, 'token_ids', ())} "
+                f"writes={len(getattr(rule, 'writes', ()))}"
             )
         return step
 
