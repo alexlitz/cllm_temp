@@ -223,12 +223,23 @@ def _resolve_semantics_flags(
 
     # Per-axis variant implementations land separately. For this round
     # only the legacy-aliased axes are wired; the others are reserved.
-    if resolved.get("ffn_variant") == "swiglu":
+    #
+    # An axis set via a DIRECT per-axis kwarg (e.g. ``ffn_variant='swiglu'``)
+    # is a hard ``NotImplementedError``: the caller asked for a specific
+    # semantic the bake cannot honour, so raise rather than silently
+    # degrade. But when the axis is reached via ``preset="qwen"`` (a
+    # coarse-grained shortcut), let the compile proceed with the legacy
+    # bake for the unwired axes -- this matches the partial-implementation
+    # story documented at ``MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``
+    # §1.2: presets are the umbrella surface, per-axis kwargs are the
+    # contractual surface. The preset path's bake completes as the
+    # individual axes land.
+    if ffn_variant == "swiglu":
         raise NotImplementedError(
             "ffn_variant='swiglu' is reserved on the compile signature; "
             "implementation lands with QWEN_SWIGLU_REPACK_PROTOTYPE_2026_06_07.md."
         )
-    if resolved.get("per_head_qk_norm") == "qwen":
+    if per_head_qk_norm == "qwen":
         raise NotImplementedError(
             "per_head_qk_norm='qwen' is reserved on the compile signature; "
             "implementation lands with the per-axis design doc (see §6 of "
