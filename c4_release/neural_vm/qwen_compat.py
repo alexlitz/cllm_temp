@@ -2059,7 +2059,150 @@ class AlibiToRopeReport:
     rope_base: float
 
 
-def alibi_to_rope_export(model: Any, *, rope_base: Optional[float] = None) -> AlibiToRopeReport:
+def _rebake_attention_for_rope(
+    attn: Any,
+    *,
+    positional_encoding: str,
+    num_heads: int,
+    head_dim: int,
+    max_seq_len: int,
+    rope_base: float,
+    reference_distance: float = 0.0,
+) -> Dict[str, Any]:
+    """Pre-rotate ``W_q`` / ``W_k`` to partially compensate the ALiBi→RoPE
+    semantic gap on address-bit-style content-addressed heads.
+
+    Research-level partial fix. Per the module note above and
+    BLOG_SPEC.md §410, the load-bearing semantics of attention scores in
+    the production VM is the binary-address match on L15 head dim slots
+    4..27 (24 bits, ±scale=10). Under ALiBi those Q·K contributions are
+    position-independent (the bias term is additive and head-uniform).
+    Under RoPE the same dims get a multiplicative rotation by
+    ``θ_p = p * inv_freq``, and the score contribution at a pair
+    ``(2k, 2k+1)`` becomes::
+
+        Q'·K' = (Q[2k]K[2k] + Q[2k+1]K[2k+1]) * cos(θ_q − θ_k)
+              + (Q[2k+1]K[2k] − Q[2k]K[2k+1]) * sin(θ_q − θ_k)
+
+    There is **no general algebraic transform** that recovers
+    ALiBi-equivalent scores under RoPE for arbitrary inputs (the
+    additive bias and the rotational mixing live in different
+    function-form classes — see also the module-level note above the
+    :func:`alibi_to_rope_export` definition).
+
+    What we CAN do, and what this helper does, is pre-rotate ``W_k`` by
+    a per-head **reference offset** ``θ_ref = reference_distance *
+    inv_freq``. The effect is to shift the *peak* of the post-RoPE
+    Q·K(Δp) curve from ``Δp = 0`` to ``Δp = reference_distance``::
+
+        Q'·K' peaks at  Δp = reference_distance   (cos argument is 0)
+
+    For ``reference_distance == 0`` (the default) the rebake is a
+    no-op and the byte-identity guarantee at causal position 0 is
+    preserved. For positive ``reference_distance`` the helper biases
+    the address-match peak to the expected lookback distance, trading
+    position-0 exactness for typical-distance recovery on L15-style
+    address-lookup heads.
+
+    Args:
+        attn: an attention module with ``W_q`` / ``W_k`` parameters,
+            shape ``[dim, dim]`` viewed as ``[dim, H, HD]`` per head.
+        positional_encoding: must be ``"rope"`` — the helper is a
+            no-op for any other value (ALiBi blocks should be
+            converted via :func:`alibi_to_rope_export` first, then
+            optionally re-baked through this helper).
+        num_heads: head count.
+        head_dim: per-head feature dim. Must be even (RoPE constraint).
+        max_seq_len: cache size; only used to bound
+            ``reference_distance`` sanity.
+        rope_base: RoPE base frequency (Qwen3 default 10000.0).
+        reference_distance: typical lookback distance in tokens. ``0``
+            preserves position-0 byte identity (no compensation).
+            Positive values bias the score peak toward ``Δp =
+            reference_distance``.
+
+    Returns:
+        A diagnostic dict with the per-head rotation angles applied and
+        the dim pairs touched. Lets callers gate the rebake on
+        head-specific knowledge (e.g. L15 heads 0-3 use the address-bit
+        pattern; other heads do not).
+    """
+
+    if positional_encoding != "rope":
+        return {
+            "rebaked": False,
+            "reason": f"positional_encoding={positional_encoding!r} != 'rope'",
+        }
+    if head_dim % 2 != 0:
+        raise ValueError(
+            f"_rebake_attention_for_rope: head_dim={head_dim} must be even"
+        )
+    if reference_distance == 0.0:
+        # Default no-op: preserves position-0 byte identity.
+        return {
+            "rebaked": False,
+            "reason": "reference_distance=0 (preserves position-0 identity)",
+            "num_pairs": head_dim // 2,
+        }
+    if reference_distance < 0 or reference_distance > max_seq_len:
+        raise ValueError(
+            f"_rebake_attention_for_rope: reference_distance="
+            f"{reference_distance} out of [0, {max_seq_len}]"
+        )
+
+    # Per-pair inverse frequencies (mirrors precompute_rope_cache).
+    half_idx = torch.arange(0, head_dim, 2, dtype=torch.float32, device=attn.W_k.device)
+    inv_freq = 1.0 / (rope_base ** (half_idx / head_dim))  # [HD/2]
+    theta_ref = reference_distance * inv_freq  # [HD/2]
+    # Build a per-head rotation block-diagonal: each (2k, 2k+1) pair is
+    # rotated by ``θ_ref[k]``. The rotation matrix on a pair (x0, x1)
+    # under the RoPE-matched convention (interleaved pairs) is::
+    #
+    #     [ cos  -sin ]
+    #     [ sin   cos ]
+    #
+    # i.e. ``x0' = cos*x0 - sin*x1``, ``x1' = sin*x0 + cos*x1``.
+    # ``W_k`` has shape ``[dim_in, dim_out]`` where ``dim_out`` = H * HD.
+    # Reshape ``dim_out`` as ``[H, HD/2, 2]`` and apply the rotation to
+    # the last two axes.
+    cos = theta_ref.cos()  # [HD/2]
+    sin = theta_ref.sin()  # [HD/2]
+    with torch.no_grad():
+        W_k = attn.W_k.data  # [dim_in, dim_out]
+        dim_in, dim_out = W_k.shape
+        if dim_out != num_heads * head_dim:
+            return {
+                "rebaked": False,
+                "reason": (
+                    f"unexpected W_k shape {tuple(W_k.shape)}; expected "
+                    f"dim_out=num_heads*head_dim={num_heads*head_dim}"
+                ),
+            }
+        Wk_view = W_k.view(dim_in, num_heads, head_dim // 2, 2)
+        x0 = Wk_view[..., 0]  # [dim_in, H, HD/2]
+        x1 = Wk_view[..., 1]
+        cos_b = cos.view(1, 1, -1)  # broadcast across (dim_in, H)
+        sin_b = sin.view(1, 1, -1)
+        x0_new = cos_b * x0 - sin_b * x1
+        x1_new = sin_b * x0 + cos_b * x1
+        new_Wk = torch.stack((x0_new, x1_new), dim=-1).reshape_as(W_k)
+        attn.W_k.data = new_Wk.contiguous()
+
+    return {
+        "rebaked": True,
+        "reference_distance": float(reference_distance),
+        "num_pairs": head_dim // 2,
+        "max_rotation": float(theta_ref.max().item()),
+        "min_rotation": float(theta_ref.min().item()),
+    }
+
+
+def alibi_to_rope_export(
+    model: Any,
+    *,
+    rope_base: Optional[float] = None,
+    rebake_reference_distance: float = 0.0,
+) -> AlibiToRopeReport:
     """Convert every ALiBi attention block in ``model`` to RoPE in-place.
 
     Walks every ``block.attn`` (and any ``post_op`` whose attention is
@@ -2169,6 +2312,23 @@ def alibi_to_rope_export(model: Any, *, rope_base: Optional[float] = None) -> Al
         # branch active.
         attn._positional_encoding = "rope"
         attn.rope_base = rope_base
+
+        # Optional W_q/W_k rebake: research-level partial compensation.
+        # Default ``rebake_reference_distance=0.0`` is a no-op and
+        # preserves the position-0 byte-identity guarantee. Positive
+        # values shift the post-RoPE Q·K peak toward the typical
+        # lookback distance — only meaningful on L15-style content-
+        # addressed heads. See ``_rebake_attention_for_rope``.
+        if rebake_reference_distance != 0.0:
+            _rebake_attention_for_rope(
+                attn,
+                positional_encoding="rope",
+                num_heads=int(getattr(attn, "num_heads")),
+                head_dim=head_dim,
+                max_seq_len=max_seq_len,
+                rope_base=rope_base,
+                reference_distance=float(rebake_reference_distance),
+            )
         converted += 1
 
     for layer_idx, block in enumerate(_blocks(model)):
@@ -2221,6 +2381,7 @@ __all__ = [
     "PostOpsFlatteningReport",
     "alibi_to_rope_export",
     "AlibiToRopeReport",
+    "_rebake_attention_for_rope",
     "apply_neural_vm_embedding_augmentations",
     "NeuralVMEmbeddingWrapper",
     "install_neural_vm_embedding_wrapper",

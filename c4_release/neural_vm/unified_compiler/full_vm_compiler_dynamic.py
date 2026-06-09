@@ -1916,6 +1916,36 @@ def compile_full_vm_dynamic(
         d_model_packing_target=d_model_packing_target,
     )
 
+    # Phase R8 / Blocker 4 partial fix: optional per-head W_k pre-rotation
+    # for RoPE-mode compiles. Gated by the ``C4_ROPE_REBAKE_REFERENCE_DISTANCE``
+    # env var; default is no-op (preserves position-0 byte identity). When
+    # set to a positive float, shifts the post-RoPE Q·K score peak toward
+    # the given lookback distance — research-level partial recovery on
+    # L15-style content-addressed heads. See
+    # ``neural_vm.qwen_compat._rebake_attention_for_rope`` for the math.
+    if positional_encoding == "rope":
+        _rope_rebake_d = os.environ.get("C4_ROPE_REBAKE_REFERENCE_DISTANCE")
+        if _rope_rebake_d is not None:
+            try:
+                _ref_d = float(_rope_rebake_d)
+            except ValueError:
+                _ref_d = 0.0
+            if _ref_d != 0.0:
+                from neural_vm.qwen_compat import _rebake_attention_for_rope
+                for _block in getattr(model, "blocks", []):
+                    _attn = getattr(_block, "attn", None)
+                    if _attn is None or not hasattr(_attn, "W_k"):
+                        continue
+                    _rebake_attention_for_rope(
+                        _attn,
+                        positional_encoding="rope",
+                        num_heads=int(getattr(_attn, "num_heads")),
+                        head_dim=int(getattr(_attn, "head_dim")),
+                        max_seq_len=int(getattr(_attn, "max_seq_len", max_seq_len)),
+                        rope_base=float(getattr(_attn, "rope_base", rope_base)),
+                        reference_distance=_ref_d,
+                    )
+
     # Post-compile shape rebuild. When the caller hands in
     # ``target_shape_overrides`` (a ``ModelShapeConstraint``), REPLACE the
     # compiled VM with a freshly-initialized ``AutoregressiveVM`` whose

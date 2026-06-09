@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.qwen_compat import (
     AlibiToRopeReport,
+    _rebake_attention_for_rope,
     alibi_to_rope_export,
 )
 from neural_vm.vm_step import AutoregressiveVM
@@ -289,3 +290,135 @@ def test_alibi_to_rope_export_rope_base_override():
     assert report.rope_base == pytest.approx(custom_base)
     for block in vm.blocks:
         assert block.attn.rope_base == pytest.approx(custom_base)
+
+
+# ---------------------------------------------------------------------------
+# _rebake_attention_for_rope — research-level partial compensation helper
+# ---------------------------------------------------------------------------
+
+
+def test_rebake_attention_for_rope_zero_reference_is_noop():
+    """``reference_distance=0`` is a documented no-op (preserves position-0)."""
+
+    vm = _tiny_alibi_vm(seed=5)
+    alibi_to_rope_export(vm)
+    attn = vm.blocks[0].attn
+    Wk_snap = attn.W_k.detach().clone()
+    report = _rebake_attention_for_rope(
+        attn,
+        positional_encoding="rope",
+        num_heads=int(attn.num_heads),
+        head_dim=int(attn.head_dim),
+        max_seq_len=int(attn.max_seq_len),
+        rope_base=float(attn.rope_base),
+        reference_distance=0.0,
+    )
+    assert report["rebaked"] is False
+    assert torch.equal(attn.W_k, Wk_snap)
+
+
+def test_rebake_attention_for_rope_positive_reference_rotates_Wk():
+    """Positive reference distance rotates ``W_k`` per pair, deterministically.
+
+    The post-RoPE forward should agree with the baseline at ``Δp =
+    reference_distance`` (the peak of the shifted cos curve) and
+    differ at other positions. We don't assert the score peak directly
+    (the forward path is non-linear); we just confirm the rebake
+    transforms ``W_k`` non-trivially and the per-pair angles match the
+    documented ``ref_d * inv_freq`` schedule.
+    """
+
+    vm = _tiny_alibi_vm(seed=6)
+    alibi_to_rope_export(vm)
+    attn = vm.blocks[0].attn
+    head_dim = int(attn.head_dim)
+    rope_base = float(attn.rope_base)
+    Wk_before = attn.W_k.detach().clone()
+    report = _rebake_attention_for_rope(
+        attn,
+        positional_encoding="rope",
+        num_heads=int(attn.num_heads),
+        head_dim=head_dim,
+        max_seq_len=int(attn.max_seq_len),
+        rope_base=rope_base,
+        reference_distance=2.0,
+    )
+    assert report["rebaked"] is True
+    assert report["num_pairs"] == head_dim // 2
+    # Per-pair max rotation = 2 * inv_freq[0] = 2 * 1/base^0 = 2.0.
+    assert report["max_rotation"] == pytest.approx(2.0)
+    assert not torch.equal(attn.W_k, Wk_before), (
+        "rebake with positive reference_distance did not change W_k"
+    )
+    # Magnitude is preserved per pair (rotation is orthogonal).
+    head_dim2 = head_dim // 2
+    Wk_pairs_before = Wk_before.view(-1, attn.num_heads, head_dim2, 2)
+    Wk_pairs_after = attn.W_k.view(-1, attn.num_heads, head_dim2, 2)
+    norm_before = (Wk_pairs_before ** 2).sum(dim=-1)
+    norm_after = (Wk_pairs_after ** 2).sum(dim=-1)
+    assert torch.allclose(norm_before, norm_after, atol=1e-6), (
+        "rotation is orthogonal — per-pair squared norm should be preserved"
+    )
+
+
+def test_rebake_attention_for_rope_rejects_odd_head_dim():
+    """Helper guards the RoPE even-head_dim contract."""
+
+    class _Stub:
+        W_k = torch.zeros(8, 8)
+        W_q = torch.zeros(8, 8)
+        num_heads = 1
+        head_dim = 7
+        max_seq_len = 16
+        rope_base = 10000.0
+
+    with pytest.raises(ValueError, match="head_dim=7"):
+        _rebake_attention_for_rope(
+            _Stub(),
+            positional_encoding="rope",
+            num_heads=1,
+            head_dim=7,
+            max_seq_len=16,
+            rope_base=10000.0,
+            reference_distance=1.0,
+        )
+
+
+def test_rebake_attention_for_rope_skips_non_rope():
+    """Helper is a no-op when ``positional_encoding != 'rope'``."""
+
+    vm = _tiny_alibi_vm(seed=7)
+    attn = vm.blocks[0].attn  # still ALiBi
+    Wk_snap = attn.W_k.detach().clone()
+    report = _rebake_attention_for_rope(
+        attn,
+        positional_encoding="alibi",
+        num_heads=int(attn.num_heads),
+        head_dim=int(attn.head_dim),
+        max_seq_len=int(attn.max_seq_len),
+        rope_base=float(attn.rope_base),
+        reference_distance=2.0,
+    )
+    assert report["rebaked"] is False
+    assert "positional_encoding" in report["reason"]
+    assert torch.equal(attn.W_k, Wk_snap)
+
+
+def test_alibi_to_rope_export_with_rebake_preserves_position_0_when_ref_is_zero():
+    """The export-time rebake hook respects the position-0 byte-identity guarantee.
+
+    When ``rebake_reference_distance=0`` (default), the rebake is a no-op
+    and the position-0 byte-identity guarantee from
+    :func:`alibi_to_rope_export` is preserved.
+    """
+
+    vm = _tiny_alibi_vm(seed=8)
+    input_ids = torch.tensor([[42]], dtype=torch.long)
+    with torch.no_grad():
+        baseline = _vm_forward_plain(vm, input_ids)
+    alibi_to_rope_export(vm, rebake_reference_distance=0.0)
+    with torch.no_grad():
+        converted = _vm_forward_plain(vm, input_ids)
+    assert torch.equal(baseline, converted), (
+        "rebake_reference_distance=0 must preserve position-0 byte identity"
+    )
