@@ -46,7 +46,18 @@ import os
 import re
 import warnings
 from dataclasses import InitVar, dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from .slot_registry import (
     ALLOWED_SLOT_KINDS as _SLOT_REGISTRY_ALLOWED_KINDS,
@@ -420,6 +431,17 @@ class Operation:
     # if another non-opted-in op claims the same slot at the same layer.
     # See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md for the live audit.
     slot_share: Tuple[str, ...] = ()
+    # Migration opt-in (docs/UNDECLARED_DIM_AUDIT_2026_06_09.md follow-up):
+    # when True, the op's ``reads`` / ``writes`` annotations are treated as
+    # advisory and the actual scheduling/contract sets are derived from
+    # ``compiler_ir`` rule contents via
+    # ``unified_compiler.op_introspect.derive_op_reads_writes_from_rules``.
+    # See ``Operation.derive_reads_writes`` (the method) below for the
+    # explicit derivation entry point and ``op_introspect.derive_operation``
+    # for the rewrite. Default False keeps every existing op byte-identical
+    # while authors migrate the 162-op corpus per the audit doc's
+    # priority list.
+    derive_reads_writes_flag: bool = False
 
     def __post_init__(
         self,
@@ -647,6 +669,47 @@ class Operation:
     def consumes_fresh(self, value):
         # Mirror of the ``produces`` setter — see above.
         self._consumes_fresh_explicit = value
+
+    # ---- Derive reads/writes from rules (migration entry point) ---------
+    # See docs/UNDECLARED_DIM_AUDIT_2026_06_09.md follow-up and
+    # ``unified_compiler/op_introspect.py`` for the underlying derivation.
+    def derive_reads_writes(
+        self,
+        *,
+        dim_positions: Optional[Mapping[str, int]] = None,
+        dim_sizes: Optional[Mapping[str, int]] = None,
+        head_dim: int = 64,
+    ) -> "Operation":
+        """Return a copy with ``reads`` / ``writes`` filled in from the IR.
+
+        Walks ``self.compiler_ir`` (or invokes ``compiler_ir_factory``)
+        and aggregates every dim name read / written across FFN rules and
+        attention head specs. The returned ``Operation`` is otherwise
+        byte-identical with ``self`` — only the ``reads`` / ``writes``
+        slots change.
+
+        Use this in op-factory call sites to drop the manual annotation:
+
+            return make_some_op().derive_reads_writes(
+                dim_positions=compiler.dim_positions,
+                dim_sizes=compiler.dim_sizes,
+            )
+
+        Attention head specs encode Q/K/V/O as resolved residual-column
+        ints; the derivation needs the layout's ``dim_positions`` /
+        ``dim_sizes`` to reverse-map them. Pure-FFN ops can omit them
+        (the derivation gracefully skips attention contributions when
+        the maps are not supplied — pure-FFN ops have no attention
+        spec to walk).
+        """
+        from .op_introspect import derive_operation
+
+        return derive_operation(
+            self,
+            dim_positions=dim_positions,
+            dim_sizes=dim_sizes,
+            head_dim=head_dim,
+        )
 
 
 def _install_legacy_init_aliases() -> None:
