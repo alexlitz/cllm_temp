@@ -560,6 +560,843 @@ def _layer15_memory_lookup_heads_0_3_specs(
     return tuple(specs)
 
 
+def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """L15 heads 0-3 base + ``_suppress_l15_lookup_heads_0_3`` merged.
+
+    Declarative replacement for the legacy post-bake patch
+    :func:`_suppress_l15_lookup_heads_0_3`. The override cells are
+    dict-merged into the per-head ``q``/``k``/``v``/``o`` maps so the
+    lowered weights are byte-identical with running the suppress
+    helper after :func:`_layer15_memory_lookup_heads_0_3_specs`.
+
+    Row wipes (``attn.W_q.data[base + row, :] = 0.0`` etc.) at
+    rows 35-43, 58-63 in the legacy helper are no-ops here because
+    the base spec does not write Q/K at those slots, except for V
+    slot 63 and O column 63 (head 0 only, where the
+    ``nonpop_stack0_marker_blocker`` wipe drops the base spec's
+    ``CLEAN_EMBED_HI+15`` -> ``OUTPUT_HI+15`` cell).
+    """
+
+    PC_I = 0
+    AX_I = 1
+    SP_I = 2
+    BP_I = 3
+    MEM_I = 4
+
+    base_specs = _layer15_memory_lookup_heads_0_3_specs(BD)
+    merged: list[DeclarativeAttentionHeadSpec] = []
+
+    byte_q_flags = [None, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]
+
+    for spec in base_specs:
+        head = spec.head_idx
+        q_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.q
+        }
+        k_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.k
+        }
+        v_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.v
+        }
+        o_map: dict[tuple[int, int], float] = {
+            (w.out_dim, w.slot): w.weight for w in spec.o
+        }
+
+        # === local_slot_scale: byte-0 nibble bit rows (slots 4..11) ===
+        local_slot_scale = 100.0
+        for nibble_offset, nibble_base in (
+            (0, BD.ADDR_B0_LO), (4, BD.ADDR_B0_HI),
+        ):
+            for bit in range(4):
+                row = 4 + nibble_offset + bit
+                for k in range(16):
+                    bit_val = 2 * ((k >> bit) & 1) - 1
+                    q_map[(row, nibble_base + k)] = (
+                        local_slot_scale * bit_val
+                    )
+                    k_map[(row, nibble_base + k)] = (
+                        local_slot_scale * bit_val
+                    )
+
+        # === one-hot rows 43+k: byte-0 lo nibble match ===
+        local_slot_onehot_scale = 100.0
+        for k in range(16):
+            row = 43 + k
+            q_map[(row, BD.CONST)] = -local_slot_onehot_scale
+            q_map[(row, BD.ADDR_B0_LO + k)] = local_slot_onehot_scale
+            q_map[(row, BD.OP_LI_RELAY)] = local_slot_onehot_scale
+            if head == 0:
+                q_map[(row, BD.OP_LC_RELAY)] = local_slot_onehot_scale
+            k_map[(row, BD.ADDR_B0_LO + k)] = local_slot_onehot_scale
+
+        if head == 0:
+            # === Strong default blocker + explicit LI/LC/pop restores ===
+            lookup_bias = 200000.0
+            q_map[(0, BD.CONST)] = -lookup_bias
+            q_map[(0, BD.OP_LI_RELAY)] = lookup_bias
+            q_map[(0, BD.OP_LC_RELAY)] = lookup_bias
+            q_map[(0, BD.OP_LI)] = lookup_bias
+            q_map[(0, BD.OP_LC)] = lookup_bias
+            q_map[(0, BD.CMP + 3)] = lookup_bias / 4.0
+            q_map[(1, BD.CMP + 3)] = 12.5
+
+            non_load_suppression = -1000000.0
+            q_map[(0, BD.OP_JSR)] = non_load_suppression
+            q_map[(0, BD.OP_ENT)] = non_load_suppression
+            q_map[(0, BD.OP_LEA)] = non_load_suppression
+            q_map[(0, BD.OP_IMM)] = non_load_suppression
+
+            q_map[(0, BD.MARK_STACK0)] = 75000.0
+            q_map[(0, BD.HAS_SE)] = 75000.0
+            q_map[(0, BD.ADDR_B0_LO + 8)] = 75000.0
+            q_map[(0, BD.ADDR_B0_HI + 14)] = 75000.0
+            q_map[(0, BD.ADDR_B0_HI + 15)] = -100000.0
+            q_map[(0, BD.IS_BYTE)] = -2000.0
+            q_map[(1, BD.IS_BYTE)] = -50.0
+            q_map[(1, BD.MARK_STACK0)] = 50.0
+            q_map[(1, BD.HAS_SE)] = 50.0
+            q_map[(1, BD.ADDR_B0_LO + 8)] = 50.0
+            q_map[(1, BD.ADDR_B0_HI + 14)] = 50.0
+            q_map[(1, BD.ADDR_B0_HI + 15)] = -150.0
+            q_map[(28, BD.IS_BYTE)] = -500.0
+            q_map[(28, BD.CONST)] = -20000.0
+            q_map[(28, BD.MARK_AX)] = 20000.0
+            q_map[(28, BD.MARK_STACK0)] = 20000.0
+
+            # Row 42: top-store e0 signature blocker.
+            for row, low, high in ((42, 0, 14),):
+                q_map[(row, BD.CONST)] = -60000.0
+                q_map[(row, BD.MARK_STACK0)] = 10000.0
+                q_map[(row, BD.HAS_SE)] = 10000.0
+                q_map[(row, BD.MEM_STORE)] = 10000.0
+                q_map[(row, BD.EMBED_LO + low)] = 10000.0
+                q_map[(row, BD.EMBED_HI + high)] = 10000.0
+                q_map[(row, BD.ADDR_B0_LO + low)] = 10000.0
+                q_map[(row, BD.ADDR_B0_HI + high)] = 10000.0
+                q_map[(row, BD.OP_LI_RELAY)] = 50000.0
+                q_map[(row, BD.OP_LC_RELAY)] = 50000.0
+                k_map[(row, BD.CONST)] = 20.0
+
+            # Rows 59, 60, 61: wipe Q/K (base has no writes here either).
+            # The base spec writes V at (slot, dim)=(59, CLEAN_EMBED_HI+11),
+            # (60, CLEAN_EMBED_HI+12), (61, CLEAN_EMBED_HI+13). These rows
+            # are valid V cells; only rows 62, 63 are touched by the V
+            # wipe via slot 63 below. Q/K at 59-61 stays empty: no base
+            # writes to drop.
+
+            # Row 60: top-store e8 signature.
+            row = 60
+            q_map[(row, BD.CONST)] = -30000.0
+            q_map[(row, BD.MARK_STACK0)] = 10000.0
+            q_map[(row, BD.MARK_SP)] = -100000.0
+            q_map[(row, BD.HAS_SE)] = 10000.0
+            q_map[(row, BD.MEM_STORE)] = 150000.0
+            q_map[(row, BD.ADDR_B0_LO + 8)] = 10000.0
+            q_map[(row, BD.ADDR_B0_HI + 14)] = 10000.0
+            q_map[(row, BD.ADDR_B0_HI + 15)] = -20000.0
+            k_map[(row, BD.CONST)] = -20.0
+
+            # Row 59: preserve e8 (STACK0 + HAS_SE + nibble match).
+            preserve_e8_s = 5000.0
+            row = 59
+            q_map[(row, BD.CONST)] = -3.5 * preserve_e8_s
+            q_map[(row, BD.MARK_STACK0)] = preserve_e8_s
+            q_map[(row, BD.HAS_SE)] = preserve_e8_s
+            q_map[(row, BD.ADDR_B0_LO + 8)] = preserve_e8_s
+            q_map[(row, BD.ADDR_B0_HI + 14)] = preserve_e8_s
+            q_map[(row, BD.IS_BYTE)] = -4.0 * preserve_e8_s
+            q_map[(row, BD.MEM_STORE)] = -5.0 * preserve_e8_s
+            k_map[(row, BD.ADDR_B0_LO + 8)] = preserve_e8_s
+            k_map[(row, BD.ADDR_B0_HI + 14)] = preserve_e8_s
+            k_map[(row, BD.STACK0_BYTE0)] = 5.0 * preserve_e8_s
+
+            # Row 61: AX LI/LC e8 value discriminator.
+            ax_li_e8_s = 10.0
+            row = 61
+            q_map[(row, BD.CONST)] = -3.5 * ax_li_e8_s
+            q_map[(row, BD.MARK_AX)] = ax_li_e8_s
+            q_map[(row, BD.OP_LI_RELAY)] = ax_li_e8_s
+            q_map[(row, BD.OP_LC_RELAY)] = ax_li_e8_s
+            q_map[(row, BD.MARK_STACK0)] = 2.5 * ax_li_e8_s
+            q_map[(row, BD.ADDR_B0_LO + 8)] = ax_li_e8_s
+            q_map[(row, BD.ADDR_B0_HI + 14)] = ax_li_e8_s
+            q_map[(row, BD.IS_BYTE)] = -4.0 * ax_li_e8_s
+            q_map[(row, BD.MEM_STORE)] = -4.0 * ax_li_e8_s
+            k_map[(row, BD.MEM_VAL_B1)] = ax_li_e8_s
+            k_map[(row, BD.ADDR_B0_LO + 8)] = ax_li_e8_s
+            k_map[(row, BD.ADDR_B0_HI + 14)] = ax_li_e8_s
+
+            # Row 58: early-ENT STACK0 discriminator.
+            # The legacy helper wipes Q/K at slot 58 first; base spec
+            # has no writes there, so the wipe is a no-op.
+            early_ent_stack0_q = 100000.0
+            row = 58
+            q_map[(row, BD.OP_ENT)] = 200000000.0
+            q_map[(row, BD.MARK_STACK0)] = early_ent_stack0_q
+            q_map[(row, BD.CONST)] = -early_ent_stack0_q
+            q_map[(row, BD.IS_BYTE)] = -2000000000.0
+            for marker_dim in (
+                BD.MARK_AX, BD.MARK_PC, BD.MARK_SP,
+                BD.MARK_BP, BD.MARK_MEM,
+            ):
+                q_map[(row, marker_dim)] = -2000000000.0
+            k_map[(row, BD.OP_ENT)] = 10000.0
+
+            # Row 34: pop_low8 nibble bias.
+            row = 34
+            q_map[(row, BD.CONST)] = -4000.0
+            q_map[(row, BD.MARK_STACK0)] = 2000.0
+            q_map[(row, BD.HAS_SE)] = 1000.0
+            q_map[(row, BD.CMP + 3)] = 1000.0
+            q_map[(row, BD.ADDR_B0_LO + 0)] = 1000.0
+            q_map[(row, BD.ADDR_B0_LO + 8)] = 1000.0
+            q_map[(row, BD.IS_BYTE)] = -10000.0
+            q_map[(row, BD.MARK_SP)] = -10000.0
+            q_map[(row, BD.MEM_STORE)] = -20000.0
+            k_map[(row, BD.ADDR_B0_LO + 8)] = 1000.0
+        else:
+            # === Heads 1-3: byte_q_flags-gated overrides ===
+            q_map[(0, BD.MARK_STACK0)] = -100000.0
+            q_map[(0, BD.MARK_SP)] = -100000.0
+            q_map[(28, BD.CONST)] = -20000.0
+            q_map[(28, byte_q_flags[head])] = 20000.0
+            # Slot 3 K-side per-head re-tuning.
+            for dim in (
+                BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3,
+                BD.H2 + MEM_I, BD.H3 + MEM_I,
+            ):
+                k_map[(3, dim)] = 0.0
+            if head == 1:
+                k_map[(3, BD.MEM_VAL_B2)] = 60.0
+            elif head == 2:
+                k_map[(3, BD.MEM_VAL_B3)] = 60.0
+            elif head == 3:
+                k_map[(3, BD.H3 + MEM_I)] = 60.0
+                k_map[(3, BD.H2 + MEM_I)] = -60.0
+
+        # === source_gate (slot 37): wipe K then re-author per head ===
+        # Base has no Q/K at slot 37 -- wipe is a no-op.
+        source_gate = 37
+        q_map[(source_gate, BD.CONST)] = 0.0
+        if head == 0:
+            q_map[(source_gate, BD.MARK_STACK0)] = 3000.0
+        else:
+            q_map[(source_gate, byte_q_flags[head])] = 3000.0
+        source_key_s = 10.0
+        k_map[(source_gate, BD.CONST)] = -source_key_s
+        k_map[(source_gate, BD.MEM_STORE)] = 0.5 * source_key_s
+        if head == 0:
+            k_map[(source_gate, BD.L2H0 + MEM_I)] = source_key_s
+            k_map[(source_gate, BD.H1 + MEM_I)] = -70.0
+        else:
+            k_map[(source_gate, BD.H1 + MEM_I)] = -70.0
+            if head == 1:
+                k_map[(source_gate, BD.MEM_VAL_B2)] = source_key_s
+            elif head == 2:
+                k_map[(source_gate, BD.MEM_VAL_B3)] = source_key_s
+            elif head == 3:
+                k_map[(source_gate, BD.H3 + MEM_I)] = source_key_s
+                k_map[(source_gate, BD.H2 + MEM_I)] = -source_key_s
+        # SP/BP register byte blockers on source_gate K.
+        for marker_i in (SP_I, BP_I):
+            for dim in (
+                BD.H1 + marker_i,
+                BD.H2 + marker_i,
+                BD.H3 + marker_i,
+                BD.L2H0 + marker_i,
+            ):
+                k_map[(source_gate, dim)] = -80.0
+
+        # === load_source_gate (slot 39): wipe Q/K then re-author ===
+        load_source_gate = 39
+        load_source_gate_s = 5000.0
+        load_source_key_s = 30.0
+        if head == 0:
+            q_map[(load_source_gate, BD.OP_LI_RELAY)] = load_source_gate_s
+            q_map[(load_source_gate, BD.OP_LC_RELAY)] = load_source_gate_s
+            q_map[(load_source_gate, BD.MARK_AX)] = load_source_gate_s
+            q_map[(load_source_gate, BD.CMP + 3)] = 2000.0
+            q_map[(load_source_gate, BD.CONST)] = -1.5 * load_source_gate_s
+            k_map[(load_source_gate, BD.MEM_VAL_B1)] = (
+                2.0 * load_source_key_s
+            )
+            k_map[(load_source_gate, BD.MEM_ADDR_SRC)] = 40.0
+        else:
+            q_map[(load_source_gate, BD.OP_LI_RELAY)] = load_source_gate_s
+            q_map[(load_source_gate, byte_q_flags[head])] = (
+                load_source_gate_s
+            )
+            q_map[(load_source_gate, BD.CONST)] = -1.5 * load_source_gate_s
+            if head == 1:
+                k_map[(load_source_gate, BD.MEM_VAL_B2)] = (
+                    2.0 * load_source_key_s
+                )
+            elif head == 2:
+                k_map[(load_source_gate, BD.MEM_VAL_B3)] = (
+                    2.0 * load_source_key_s
+                )
+            elif head == 3:
+                k_map[(load_source_gate, BD.H3 + MEM_I)] = (
+                    2.0 * load_source_key_s
+                )
+                k_map[(load_source_gate, BD.H2 + MEM_I)] = (
+                    -2.0 * load_source_key_s
+                )
+            k_map[(load_source_gate, BD.MEM_ADDR_SRC)] = 40.0
+
+        # === marker_value_gate (slot 40): head-0 only ===
+        if head == 0:
+            marker_value_gate = 40
+            marker_value_gate_s = 1000.0
+            q_map[(marker_value_gate, BD.OP_LI)] = marker_value_gate_s
+            q_map[(marker_value_gate, BD.OP_LC)] = marker_value_gate_s
+            k_map[(marker_value_gate, BD.MEM_VAL_B1)] = 80.0
+            k_map[(marker_value_gate, BD.MEM_ADDR_SRC)] = 40.0
+            k_map[(marker_value_gate, BD.CONST)] = -60.0
+
+        # === O scaling: value_scale=40.0 for OUTPUT band ===
+        # Replaces base spec's slot 32+k -> OUTPUT_LO+k weight=1.0
+        # with weight=40.0; same for HI.
+        value_scale = 40.0
+        for k in range(16):
+            o_map[(BD.OUTPUT_LO + k, 32 + k)] = value_scale
+            o_map[(BD.OUTPUT_HI + k, 48 + k)] = value_scale
+
+        # === addsub_blocker (slot 41) ===
+        addsub_blocker = 41
+        q_map[(addsub_blocker, BD.TEMP + 8)] = 10000.0
+        q_map[(addsub_blocker, BD.TEMP + 9)] = 10000.0
+        k_map[(addsub_blocker, BD.CONST)] = -20.0
+
+        # === sp_byte_blocker (slot 62) ===
+        sp_byte_blocker = 62
+        q_map[(sp_byte_blocker, BD.H1 + 2)] = 100000.0
+        q_map[(sp_byte_blocker, BD.MARK_BP)] = 100000.0
+        q_map[(sp_byte_blocker, BD.TEMP + 10)] = 100000.0
+        q_map[(sp_byte_blocker, BD.TEMP + 24)] = 100000.0
+        q_map[(sp_byte_blocker, BD.IS_BYTE)] = 0.0
+        k_map[(sp_byte_blocker, BD.CONST)] = -300000.0
+        if head == 0:
+            q_map[(sp_byte_blocker, BD.IS_BYTE)] = 500000.0
+            q_map[(sp_byte_blocker, BD.OP_ENT)] = 500000.0
+
+        # === pc_byte_blocker (slot 35) ===
+        pc_byte_blocker = 35
+        q_map[(pc_byte_blocker, BD.H1 + PC_I)] = 100000.0
+        q_map[(pc_byte_blocker, BD.MARK_PC)] = 100000000.0
+        q_map[(pc_byte_blocker, BD.IS_BYTE)] = 0.0
+        k_map[(pc_byte_blocker, BD.CONST)] = -100000.0
+        if head == 0:
+            q_map[(pc_byte_blocker, BD.MARK_STACK0)] = 10000.0
+            q_map[(pc_byte_blocker, BD.HAS_SE)] = 10000.0
+            q_map[(pc_byte_blocker, BD.CMP + 3)] = 10000.0
+            q_map[(pc_byte_blocker, BD.ADDR_B0_LO + 8)] = 10000.0
+            q_map[(pc_byte_blocker, BD.ADDR_B0_HI + 15)] = 10000.0
+            q_map[(pc_byte_blocker, BD.OP_LI_RELAY)] = -10000.0
+            q_map[(pc_byte_blocker, BD.OP_LC_RELAY)] = -10000.0
+
+            # === stack0_preserve (slot 36): head-0 only ===
+            stack0_preserve_row = 36
+            stack0_preserve_s = 1.0
+            q_map[(stack0_preserve_row, BD.CONST)] = (
+                -1.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MARK_STACK0)] = (
+                3.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.HAS_SE)] = (
+                1.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.CMP + 3)] = (
+                -5.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MEM_STORE)] = (
+                -10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.IS_BYTE)] = (
+                -10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MARK_AX)] = (
+                -10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.H1 + AX_I)] = (
+                10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.OP_LI_RELAY)] = (
+                10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.OP_LC_RELAY)] = (
+                10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MARK_PC)] = (
+                -10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MARK_SP)] = (
+                -10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MARK_BP)] = (
+                -10.0 * stack0_preserve_s
+            )
+            q_map[(stack0_preserve_row, BD.MARK_MEM)] = (
+                -10.0 * stack0_preserve_s
+            )
+            k_map[(stack0_preserve_row, BD.CONST)] = (
+                -2.0 * stack0_preserve_s
+            )
+            k_map[(stack0_preserve_row, BD.H1 + 10)] = (
+                2.0 * stack0_preserve_s
+            )
+            k_map[(stack0_preserve_row, BD.BYTE_INDEX_0)] = (
+                2.0 * stack0_preserve_s
+            )
+            k_map[(stack0_preserve_row, BD.OP_ENT)] = (
+                -0.25 * stack0_preserve_s
+            )
+            for marker_i in range(5):
+                k_map[(stack0_preserve_row, BD.H1 + marker_i)] = (
+                    -4.0 * stack0_preserve_s
+                )
+
+        # === mem_addr_byte_blocker (slot 36) for heads 1-3 ===
+        if head in (1, 2, 3):
+            mem_addr_byte_blocker = 36
+            q_map[(mem_addr_byte_blocker, BD.H1 + MEM_I)] = 100000.0
+            k_map[(mem_addr_byte_blocker, BD.CONST)] = -20.0
+
+        # === nonpop_stack0_marker_blocker (slot 63) ===
+        # Legacy: ``attn.W_v[base+63, :] = 0`` then explicit Q/K writes,
+        # then ``attn.W_o[:, base+63] = 0`` (wipe V row and O column 63).
+        # In the dict-merged form: drop V at slot 63 and any O writes
+        # targeting slot 63 (base has V (63, CLEAN_EMBED_HI+15)=1 and
+        # O (OUTPUT_HI+15, 63)=1; rescaled to 40.0 above).
+        nonpop_stack0_marker_blocker = 63
+        v_map.pop((nonpop_stack0_marker_blocker, BD.CLEAN_EMBED_HI + 15), None)
+        # Drop any O cell with slot=63 (we just set OUTPUT_HI+15 -> 63 = 40)
+        for out_dim_key in [
+            key for key in o_map
+            if key[1] == nonpop_stack0_marker_blocker
+        ]:
+            o_map.pop(out_dim_key, None)
+        q_map[(nonpop_stack0_marker_blocker, BD.MARK_STACK0)] = 60000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.CMP + 3)] = -15000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.IS_BYTE)] = 60000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.OP_LI_RELAY)] = -60000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.OP_LC_RELAY)] = -60000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_LO + 8)] = -40000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_HI + 14)] = -30000.0
+        k_map[(nonpop_stack0_marker_blocker, BD.CONST)] = -20.0
+        top_store_e8_from_e0_s = 10000.0
+        q_map[(nonpop_stack0_marker_blocker, BD.MEM_STORE)] = (
+            top_store_e8_from_e0_s
+        )
+        q_map[(nonpop_stack0_marker_blocker, BD.EMBED_LO + 8)] = (
+            top_store_e8_from_e0_s
+        )
+        q_map[(nonpop_stack0_marker_blocker, BD.EMBED_HI + 14)] = (
+            top_store_e8_from_e0_s
+        )
+        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_LO + 0)] = (
+            top_store_e8_from_e0_s
+        )
+        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_HI + 14)] = (
+            -2.0 * top_store_e8_from_e0_s
+        )
+
+        # === current_store_blocker (slot 38) ===
+        current_store_blocker = 38
+        current_store_block_s = 10000.0
+        q_map[(current_store_blocker, BD.MARK_MEM)] = current_store_block_s
+        q_map[(current_store_blocker, BD.H3 + MEM_I)] = current_store_block_s
+        k_map[(current_store_blocker, BD.CONST)] = -20.0
+
+        # === Broad current-MEM-section blockers on slots 0, 28-33 ===
+        for slot in (0, 28, 29, 30, 31, 32, 33):
+            q_map[(slot, BD.MARK_MEM)] = -100000.0
+            q_map[(slot, BD.H3 + MEM_I)] = -100000.0
+        # Slot 29: extras (PC H1).
+        q_map[(29, BD.MARK_MEM)] = -100000.0
+        q_map[(29, BD.H3 + MEM_I)] = -100000.0
+        q_map[(29, BD.H1 + PC_I)] = -20000.0
+        k_map[(29, BD.CONST)] = 5.0
+        # Slot 30: AX H1 blocker.
+        q_map[(30, BD.H1 + AX_I)] = -20000.0
+        k_map[(30, BD.CONST)] = 5.0
+        # Slot 31: LI/LC restore (head 0 also AX blocker reverse).
+        q_map[(31, BD.OP_LI_RELAY)] = 20000.0
+        if head == 0:
+            q_map[(31, BD.OP_LC_RELAY)] = 20000.0
+        else:
+            q_map[(31, BD.MARK_AX)] = -20000.0
+        q_map[(31, BD.OP_SI)] = -20000.0
+        q_map[(31, BD.OP_SC)] = -20000.0
+        k_map[(31, BD.MEM_STORE)] = 5.0
+
+        # Slot 32: AX marker default blocker.
+        q_map[(32, BD.MARK_AX)] = -20000.0
+        k_map[(32, BD.CONST)] = 5.0
+        if head == 0:
+            q_map[(33, BD.OP_LI_RELAY)] = 20000.0
+            q_map[(33, BD.OP_LC_RELAY)] = 20000.0
+            k_map[(33, BD.MEM_STORE)] = 5.0
+
+        new_q = tuple(
+            AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
+        )
+        new_k = tuple(
+            AP(slot, dim, weight) for (slot, dim), weight in k_map.items()
+        )
+        new_v = tuple(
+            AP(slot, dim, weight) for (slot, dim), weight in v_map.items()
+        )
+        new_o = tuple(
+            AO(out_dim, slot, weight)
+            for (out_dim, slot), weight in o_map.items()
+        )
+
+        merged.append(DeclarativeAttentionHeadSpec(
+            head_idx=head,
+            q=new_q,
+            k=new_k,
+            v=new_v,
+            o=new_o,
+        ))
+
+    return tuple(merged)
+
+
+def _layer15_memory_lookup_lev_heads_4_11_specs(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative L15 heads 4-11 mirroring ``_set_layer15_memory_lookup_lev_heads_4_11``.
+
+    Phase 7.C.3 follow-up: replaces the imperative ``W_q/W_k/W_v/W_o``
+    writes in :func:`vm_step._set_layer15_memory_lookup_lev_heads_4_11`
+    with a tuple of :class:`DeclarativeAttentionHeadSpec` so the
+    LEV-only saved_bp (heads 4-7, read ``memory[BP]``) and return_addr
+    (heads 8-11, read ``memory[BP+8]``) load heads are authored as
+    data, lowered by :meth:`CompilerIR.lower_attention` through
+    :func:`Primitives.generate_attention_heads`.
+
+    Only emitted by :func:`_layer15_memory_lookup_ir` when
+    ``num_heads >= 12`` (the 17-layer LEV build). Bodies mirror the
+    legacy helper cell-for-cell; the lowerer is assignment, so every
+    write is preserved bit-for-bit.
+
+    Heads 8 and 9 are intentionally emitted even though the L15
+    layout assigns those slots to other ops
+    (``layer15_alu_high_byte_relay`` for head 8;
+    ``layer15_memory_lookup.pop_d8_to_e0`` for head 9 via the suppress
+    helper). The legacy imperative helper wrote those rows too --
+    they are later overwritten by the alu_high_byte_relay spec and
+    the pop_d8 rewrite -- so emitting the same writes here keeps the
+    pre-overwrite snapshot byte-identical with the legacy bake.
+    """
+
+    AX_I = 1
+    BP_I = 3
+
+    specs: list[DeclarativeAttentionHeadSpec] = []
+
+    # === Heads 4-7: saved_bp lookup from memory[BP] (LEV) ===
+    for h in range(4, 8):
+        byte_idx = h - 4  # 0..3
+
+        q: list[AP] = []
+        k: list[AP] = []
+
+        # === Slot 0: bias ===
+        if byte_idx == 0:
+            q.append(AP(0, BD.CONST, -4000.0))
+            q.append(AP(0, BD.OP_LEV, 2000.0))
+            q.append(AP(0, BD.MARK_BP, 2000.0))
+            q.append(AP(0, BD.MARK_PC, -25000.0))
+            q.append(AP(0, BD.MARK_SP, -100000.0))
+            k.append(AP(0, BD.CONST, 10.0))
+        else:
+            q.append(AP(0, BD.CONST, 10.0))
+            k.append(AP(0, BD.CONST, 10.0))
+
+        # === Slot 1: store anchor ===
+        if byte_idx == 0:
+            q.append(AP(1, BD.CONST, -50.0))
+            q.append(AP(1, BD.OP_LEV, 50.0))
+            q.append(AP(1, BD.MARK_BP, 50.0))
+            q.append(AP(1, BD.MARK_PC, -200.0))
+            q.append(AP(1, BD.MARK_SP, -200.0))
+        else:
+            q.append(AP(1, BD.CONST, 10.0))
+        k.append(AP(1, BD.MEM_STORE, 100.0))
+        k.append(AP(1, BD.CONST, -50.0))
+
+        # === Slot 2: ZFOD negative offset ===
+        q.append(AP(2, BD.CONST, -96.0))
+        k.append(AP(2, BD.MEM_STORE, 50.0))
+
+        # === Slot 3: byte selection ===
+        if byte_idx == 0:
+            BS = 150.0
+            q.append(AP(3, BD.CONST, -BS))
+            q.append(AP(3, BD.OP_LEV, BS))
+            q.append(AP(3, BD.MARK_BP, BS))
+            q.append(AP(3, BD.MARK_PC, -BS * 20))
+            q.append(AP(3, BD.MARK_SP, -BS * 20))
+            k.append(AP(3, BD.MEM_VAL_B0, BS))
+            k.append(AP(3, BD.CONST, -BS))
+        else:
+            BS = 60.0
+            q.append(AP(3, BD.CONST, BS))
+            MEM_VAL_DIMS = [
+                None, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3,
+            ]
+            k.append(AP(3, MEM_VAL_DIMS[byte_idx], BS))
+
+        # === Slots 4..35: 32-dim one-hot address-byte-0 matching ===
+        L_addr = 50.0
+        for kk in range(16):
+            q.append(AP(4 + kk, BD.ADDR_B0_LO + kk, L_addr))
+            q.append(AP(4 + 16 + kk, BD.ADDR_B0_HI + kk, L_addr))
+            k.append(AP(4 + kk, BD.ADDR_KEY + kk, L_addr))
+            k.append(AP(4 + 16 + kk, BD.ADDR_KEY + 16 + kk, L_addr))
+
+        # === Slot 36: per-head position gate (with AX-byte suppression) ===
+        GATE_DIM = 36
+        SUPPRESS_AX_BYTE = -50000.0
+        q.append(AP(GATE_DIM, BD.IS_BYTE, SUPPRESS_AX_BYTE))
+        q.append(AP(GATE_DIM, BD.H1 + AX_I, SUPPRESS_AX_BYTE))
+        q.append(AP(GATE_DIM, BD.MARK_AX, SUPPRESS_AX_BYTE))
+        if byte_idx == 0:
+            q.append(AP(GATE_DIM, BD.CONST, -500.0))
+            q.append(AP(GATE_DIM, BD.MARK_BP, 500.0))
+            q.append(AP(GATE_DIM, BD.MARK_PC, -50000.0))
+        elif byte_idx == 1:
+            q.append(AP(GATE_DIM, BD.CONST, -500.0))
+            q.append(AP(GATE_DIM, BD.BYTE_INDEX_1, 500.0))
+            q.append(AP(GATE_DIM, BD.L1H1 + BP_I, 500.0))
+            q.append(AP(GATE_DIM, BD.MARK_BP, -1000.0))
+            q.append(AP(GATE_DIM, BD.MARK_PC, -50000.0))
+        elif byte_idx == 2:
+            q.append(AP(GATE_DIM, BD.CONST, -500.0))
+            q.append(AP(GATE_DIM, BD.BYTE_INDEX_2, 500.0))
+            q.append(AP(GATE_DIM, BD.H0 + BP_I, 500.0))
+            q.append(AP(GATE_DIM, BD.MARK_BP, -1000.0))
+            q.append(AP(GATE_DIM, BD.MARK_PC, -50000.0))
+        elif byte_idx == 3:
+            q.append(AP(GATE_DIM, BD.CONST, -500.0))
+            q.append(AP(GATE_DIM, BD.BYTE_INDEX_3, 500.0))
+            q.append(AP(GATE_DIM, BD.H1 + BP_I, 500.0))
+            q.append(AP(GATE_DIM, BD.MARK_BP, -1000.0))
+            q.append(AP(GATE_DIM, BD.MARK_PC, -50000.0))
+        k.append(AP(GATE_DIM, BD.CONST, 5.0))
+
+        # === V/O: copy byte value from CLEAN_EMBED to staging slots ===
+        v: list[AP] = []
+        o: list[AO] = []
+        for kk in range(16):
+            v.append(AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
+            v.append(AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
+        # Head 4 (byte 0) writes saved_bp byte 0 to OUTPUT_LO/HI.
+        if byte_idx == 0:
+            for kk in range(16):
+                o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, 1.0))
+                o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, 1.0))
+
+        specs.append(DeclarativeAttentionHeadSpec(
+            head_idx=h,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ))
+
+    # === Heads 8-11: return_addr lookup from memory[BP+8] (LEV) ===
+    # ADDR_B0 already shifted by L9 FFN; no extra +8 here.
+    for h in range(8, 12):
+        byte_idx = h - 8
+
+        q = []
+        k = []
+
+        # === Slot 0: bias -- fire at PC marker when OP_LEV active ===
+        q.append(AP(0, BD.CONST, -4000.0))
+        q.append(AP(0, BD.OP_LEV, 2000.0))
+        q.append(AP(0, BD.MARK_PC, 2000.0))
+        k.append(AP(0, BD.CONST, 10.0))
+
+        # === Slot 1: store anchor ===
+        q.append(AP(1, BD.CONST, -50.0))
+        q.append(AP(1, BD.OP_LEV, 50.0))
+        q.append(AP(1, BD.MARK_PC, 50.0))
+        k.append(AP(1, BD.MEM_STORE, 100.0))
+        k.append(AP(1, BD.CONST, -50.0))
+
+        # === Slot 2: ZFOD offset ===
+        q.append(AP(2, BD.CONST, -96.0))
+        k.append(AP(2, BD.MEM_STORE, 50.0))
+
+        # === Slot 3: byte selection ===
+        BS = 60.0
+        q.append(AP(3, BD.CONST, -BS))
+        q.append(AP(3, BD.OP_LEV, BS))
+        q.append(AP(3, BD.MARK_PC, BS))
+        MEM_VAL_DIMS = [
+            BD.MEM_VAL_B0, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3,
+        ]
+        k.append(AP(3, MEM_VAL_DIMS[byte_idx], BS))
+
+        # === Slots 4..35: 32-dim one-hot address-byte-0 matching ===
+        L_addr = 50.0
+        # Dims 4-19: byte 0 lo nibble (L9 FFN already shifted by +8)
+        for kk in range(16):
+            q.append(AP(4 + kk, BD.ADDR_B0_LO + kk, L_addr))
+            k.append(AP(4 + kk, BD.ADDR_KEY + kk, L_addr))
+        # Dims 20-35: byte 0 hi nibble (L9 FFN handles carry)
+        for kk in range(16):
+            q.append(AP(20 + kk, BD.ADDR_B0_HI + kk, L_addr))
+            k.append(AP(20 + kk, BD.ADDR_KEY + 16 + kk, L_addr))
+
+        # === Slot 36: position gate ===
+        GATE_DIM = 36
+        q.append(AP(GATE_DIM, BD.CONST, -500.0))
+        q.append(AP(GATE_DIM, BD.MARK_PC, 500.0))
+        q.append(AP(GATE_DIM, BD.MARK_BP, -1000.0))
+        q.append(AP(GATE_DIM, BD.IS_BYTE, -50000.0))
+        q.append(AP(GATE_DIM, BD.H1 + AX_I, -50000.0))
+        q.append(AP(GATE_DIM, BD.MARK_AX, -50000.0))
+        k.append(AP(GATE_DIM, BD.CONST, 5.0))
+
+        # === Slot 37: memory position suppression ===
+        SUPPRESS_DIM = 37
+        k.append(AP(SUPPRESS_DIM, BD.CONST, 40000.0))
+        k.append(AP(SUPPRESS_DIM, BD.MEM_STORE, -10000.0))
+        q.append(AP(SUPPRESS_DIM, BD.CONST, -1000.0))
+
+        # === V/O: copy byte value to TEMP at PC marker ===
+        v = []
+        o = []
+        for kk in range(16):
+            v.append(AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
+            v.append(AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
+        # Head 8 (byte 0) writes to TEMP for return_addr byte 0.
+        if byte_idx == 0:
+            for kk in range(16):
+                o.append(AO(BD.TEMP + kk, 32 + kk, 1.0))
+                o.append(AO(BD.TEMP + 16 + kk, 48 + kk, 1.0))
+        # Heads 9-11: V slots populated but no O projection (legacy parity).
+
+        specs.append(DeclarativeAttentionHeadSpec(
+            head_idx=h,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ))
+
+    return tuple(specs)
+
+
+def _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """L15 LEV heads 4-11 base + ``_suppress_l15_lookup_lev_blockers_4_11`` merged.
+
+    Phase 7.C.3 follow-up: drops head 9 from the lev_heads emission
+    (head 9 is fully replaced by the pop_d8_to_e0 declarative spec
+    via :func:`_pop_d8_head_9_spec` whenever ``num_heads > 9``; the
+    legacy bake wipes head 9 before writing pop_d8). The remaining
+    heads 4-8, 10-11 carry the LEV saved_bp/return_addr writes plus
+    the always-on ``MARK_MEM`` / ``H3+MEM_I`` blocker cells on rows
+    0, 36, 37.
+
+    The blocker writes mirror the legacy
+    ``_suppress_l15_lookup_lev_blockers_4_11`` loop, which iterates
+    ``range(4, min(num_heads, 12))``. Heads 4-11 are inside that
+    range when ``num_heads >= 12`` (the only configuration where
+    this builder runs), so every head we emit also gets blocker
+    overrides.
+
+    The blocker writes overlap with the lev_heads slot-0
+    bias/store-anchor cells but only at distinct ``dim``s
+    (``MARK_MEM`` and ``H3+MEM_I`` are not touched by the lev_heads
+    spec), so the merged map is a union of the two sets without
+    conflicts.
+    """
+
+    MEM_I = 4
+
+    base_specs = _layer15_memory_lookup_lev_heads_4_11_specs(BD)
+    merged: list[DeclarativeAttentionHeadSpec] = []
+    for spec in base_specs:
+        head = spec.head_idx
+        if head == 9:
+            # Head 9 is fully wiped + rewritten by the pop_d8_to_e0
+            # spec (see :func:`_pop_d8_head_9_spec`); skip it here so
+            # the lowered head-9 weights are exactly the pop_d8 spec's
+            # writes (matching the legacy ``W_q[base:base+HD, :] = 0``
+            # wipe in :func:`_suppress_l15_lookup_pop_d8_head_9`).
+            continue
+        q_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.q
+        }
+        k_map: dict[tuple[int, int], float] = {
+            (w.slot, w.dim): w.weight for w in spec.k
+        }
+        for row in (0, 36, 37):
+            q_map[(row, BD.MARK_MEM)] = -100000.0
+            q_map[(row, BD.H3 + MEM_I)] = -100000.0
+        new_q = tuple(
+            AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
+        )
+        new_k = tuple(
+            AP(slot, dim, weight) for (slot, dim), weight in k_map.items()
+        )
+        merged.append(DeclarativeAttentionHeadSpec(
+            head_idx=head,
+            q=new_q,
+            k=new_k,
+            v=spec.v,
+            o=spec.o,
+        ))
+    return tuple(merged)
+
+
+def _layer15_memory_lookup_lev_blockers_only_specs(
+    BD, max_head: int,
+) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Blocker-only specs for heads 4..max_head-1 (non-LEV builds).
+
+    For ``num_heads`` configurations between 5 and 11 inclusive the
+    legacy ``_suppress_l15_lookup_lev_blockers_4_11`` writes the
+    blocker cells on heads 4..num_heads-1 without the LEV saved_bp /
+    return_addr load body. The lev_heads_4_11 spec is NOT emitted in
+    that range (the legacy umbrella gate is ``num_heads >= 12``), so
+    here we emit minimal one-spec-per-head Q-only writes that match
+    the legacy blocker exactly.
+
+    ``max_head`` is ``min(num_heads, 12)`` so the body iterates
+    ``range(4, max_head)``. For ``num_heads <= 4`` the caller passes
+    ``max_head = 4`` and this returns an empty tuple.
+    """
+
+    MEM_I = 4
+    specs: list[DeclarativeAttentionHeadSpec] = []
+    for head in range(4, min(max_head, 12)):
+        q: list[AP] = []
+        for row in (0, 36, 37):
+            q.append(AP(row, BD.MARK_MEM, -100000.0))
+            q.append(AP(row, BD.H3 + MEM_I, -100000.0))
+        specs.append(DeclarativeAttentionHeadSpec(
+            head_idx=head,
+            q=tuple(q),
+            k=(),
+            v=(),
+            o=(),
+        ))
+    return tuple(specs)
+
+
 def _layer15_memory_lookup_ir(
     dim_positions,
     HD,
@@ -606,84 +1443,76 @@ def _layer15_memory_lookup_ir(
     bodies are unchanged -- W7 only moves the runtime-shape switch
     one level up, from the lowerer to the builder.
     """
-    from ...vm_step import (
-        _set_layer15_memory_lookup_lev_heads_4_11,
-    )
-
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
     attn_op = ir.layer(0).attention
 
-    # Phase 7.C.3: heads 0-3 (always-on LI/LC + STACK0 loads) are now a
-    # tuple of :class:`DeclarativeAttentionHeadSpec`. The legacy
-    # ``_set_layer15_memory_lookup_heads_0_3`` writer is byte-identical
-    # with :func:`_layer15_memory_lookup_heads_0_3_specs` and remains
-    # available for the per-op isolation tests.
-    for spec in _layer15_memory_lookup_heads_0_3_specs(proxy):
+    # Phase 7.C.3: heads 0-3 (always-on LI/LC + STACK0 loads) are a
+    # tuple of :class:`DeclarativeAttentionHeadSpec` with the
+    # always-on suppress overrides merged in by
+    # :func:`_layer15_memory_lookup_heads_0_3_specs_with_overrides`
+    # (L14 mem_generation override-merge pattern).
+    for spec in _layer15_memory_lookup_heads_0_3_specs_with_overrides(proxy):
         attn_op.append(
             spec,
             name=f"layer15_memory_lookup.li_lc_stack0_h{spec.head_idx}",
             metadata={"role": "load_heads", "always_on": True},
         )
 
-    # ``_set_layer15_memory_lookup_lev_heads_4_11`` and ``_suppress_l15_*``
-    # take ``(attn, S, BD, HD)`` and ``(attn, BD, HD)`` respectively; the
-    # ``bake_fn`` adapters absorb the IR's ``(attn, dim_positions, HD, S)``
-    # call shape and pass ``proxy`` for BD. ``dim_positions`` is already
-    # captured via closure; the param is accepted but unused so the IR
-    # contract stays uniform.
+    # Phase 7.C.3 follow-up: heads 4-11 (LEV-only saved_bp +
+    # return_addr loads) are now a tuple of declarative specs built
+    # by :func:`_layer15_memory_lookup_lev_heads_4_11_specs` with the
+    # ``num_heads > 4`` blocker rows merged in. Only emitted when
+    # ``num_heads >= 12`` (the 17-layer LEV build); the audit /
+    # declarations-only path (``num_heads=None``) also emits them so
+    # the lowered weight footprint stays a soft superset across
+    # configurations.
     if num_heads is None or int(num_heads) >= 12:
-        attn_op.add_fragment(
-            RuntimeAttentionFragment(
-                name="layer15_memory_lookup.lev_heads_4_11",
-                bake_fn=(
-                    lambda attn, _dp, hd, s:
-                    _set_layer15_memory_lookup_lev_heads_4_11(
-                        attn, s, proxy, hd
-                    )
-                ),
+        for spec in _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
+            proxy
+        ):
+            attn_op.append(
+                spec,
+                name=f"layer15_memory_lookup.lev_heads_4_11.h{spec.head_idx}",
                 metadata={"role": "lev_heads", "shape": "num_heads >= 12"},
             )
-        )
-    attn_op.add_fragment(
-        RuntimeAttentionFragment(
-            name="layer15_memory_lookup.suppress_heads_0_3",
-            bake_fn=(
-                lambda attn, _dp, hd, _s:
-                _suppress_l15_lookup_heads_0_3(attn, proxy, hd)
-            ),
-            metadata={"role": "current_store_suppress", "always_on": True},
-        )
-    )
-    # The blocker loop iterates ``range(4, min(num_heads, 12))`` in the
-    # legacy helper -- it has no LEV-build gate of its own. The body is
-    # empty for ``num_heads <= 4`` so always emitting would still be
-    # byte-identical, but restricting to ``num_heads > 4`` keeps the
-    # IR's intent explicit (these blocker rows belong to heads 4+).
-    if num_heads is None or int(num_heads) > 4:
-        attn_op.add_fragment(
-            RuntimeAttentionFragment(
-                name="layer15_memory_lookup.suppress_lev_blockers_4_11",
-                bake_fn=(
-                    lambda attn, _dp, hd, _s:
-                    _suppress_l15_lookup_lev_blockers_4_11(attn, proxy, hd)
+    elif num_heads is not None and int(num_heads) > 4:
+        # Non-LEV builds (5 <= num_heads < 12): emit only the
+        # blocker cells for heads 4..num_heads-1. The lev_heads body
+        # is not emitted (it gates on ``num_heads >= 12``), matching
+        # the legacy umbrella where
+        # ``_suppress_l15_lookup_lev_blockers_4_11`` ran independently
+        # of the LEV head writer.
+        for spec in _layer15_memory_lookup_lev_blockers_only_specs(
+            proxy, max_head=int(num_heads),
+        ):
+            attn_op.append(
+                spec,
+                name=(
+                    f"layer15_memory_lookup."
+                    f"suppress_lev_blockers_4_11.h{spec.head_idx}"
                 ),
                 metadata={
                     "role": "current_store_suppress_lev",
                     "shape": "num_heads > 4",
                 },
             )
-        )
+    # Head 9: pop_d8_to_e0 declarative spec.
+    # Legacy gate is ``num_heads > 9`` (skipped in default 16-layer
+    # build at num_heads=9). The audit / declarations-only path
+    # (num_heads=None) emits the spec so the IR carries head 9's
+    # writes.
     if num_heads is None or int(num_heads) > 9:
-        attn_op.add_fragment(
-            RuntimeAttentionFragment(
-                name="layer15_memory_lookup.suppress_pop_d8_head_9",
-                bake_fn=(
-                    lambda attn, _dp, hd, _s:
-                    _suppress_l15_lookup_pop_d8_head_9(attn, proxy, hd)
-                ),
-                metadata={"role": "pop_d8_to_e0", "shape": "num_heads > 9"},
-            )
+        # HD is captured from the IR builder param. The pop_d8 spec
+        # places its discriminator row at ``min(HD-1, 63)``.
+        attn_op.append(
+            _pop_d8_head_9_spec(
+                head_idx=9,
+                head_dim=int(HD) if HD is not None else 64,
+                BD=proxy,
+            ),
+            name="layer15_memory_lookup.pop_d8_head_9",
+            metadata={"role": "pop_d8_to_e0", "shape": "num_heads > 9"},
         )
     return ir
 
