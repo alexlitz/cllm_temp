@@ -1744,6 +1744,12 @@ def _layer10_psh_ax_broadcast_head_spec(BD, S, byte_h: int) -> DeclarativeAttent
     # K gate: fire on AX byte-h source row during OP_PSH. The OP_PSH gating
     # and OP-exclusivity terms live here (not on Q) because the K row IS
     # the OP_PSH-active row (per A3 diagnostic 2026-06-07).
+    #
+    # Slot-33 K-side magnitude (M_K33) is intentionally small (50) so that
+    # the ALiBi positional bias on broadcast heads 8/9/10 (slope=1.0 per
+    # A3.7) can dominate row selection. Earlier M=5000 dwarfed ALiBi's
+    # ~50-logit positional contribution by 100x.
+    M_K33 = 50.0
     k = [
         AP(0, BD.MARK_AX, L),
         AP(0, byte_index_dim, L),
@@ -1754,17 +1760,17 @@ def _layer10_psh_ax_broadcast_head_spec(BD, S, byte_h: int) -> DeclarativeAttent
         # other ops' K rows. Q[33] is ~+1 at the target Q row; multiplied
         # by K[33] this either reinforces (+OP_PSH) or suppresses (-other
         # ops). At non-AX K rows everything is 0, so no contribution.
-        AP(33, BD.MARK_AX, M),
-        AP(33, byte_index_dim, M),
-        AP(33, BD.OP_PSH, M),
+        AP(33, BD.MARK_AX, M_K33),
+        AP(33, byte_index_dim, M_K33),
+        AP(33, BD.OP_PSH, M_K33),
         # Block other ops at slot 33 so the head is OP_PSH-exclusive
         # (moved from Q side; only effective at the K row where the op
         # marker dims fire). Magnitude smaller than OP_PSH positive so a
         # benign K row (no op marker) stays near zero.
-        AP(33, BD.OP_SI, -M),
-        AP(33, BD.OP_SC, -M),
-        AP(33, BD.OP_JSR, -M),
-        AP(33, BD.OP_ENT, -M),
+        AP(33, BD.OP_SI, -M_K33),
+        AP(33, BD.OP_SC, -M_K33),
+        AP(33, BD.OP_JSR, -M_K33),
+        AP(33, BD.OP_ENT, -M_K33),
     ]
 
     # V: copy CLEAN_EMBED nibbles. O: write to new STACK0_BYTE_VAL_h dims.
