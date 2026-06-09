@@ -70,9 +70,26 @@ OP_LEV = 8
 OP_LI = 9
 OP_SI = 11
 OP_PSH = 13
+# Bitwise (14-16)
+OP_OR = 14
+OP_XOR = 15
+OP_AND = 16
+# Comparison (17-22) — result in AX is 0 or 1
+OP_EQ = 17
+OP_NE = 18
+OP_LT = 19
+OP_GT = 20
+OP_LE = 21
+OP_GE = 22
+# Shifts (23-24)
+OP_SHL = 23
+OP_SHR = 24
+# Arithmetic (25-29)
 OP_ADD = 25
 OP_SUB = 26
 OP_MUL = 27
+OP_DIV = 28
+OP_MOD = 29
 OP_EXIT = 38
 
 
@@ -82,7 +99,13 @@ _OPCODE_NAMES: Dict[int, str] = {
     OP_LEA: "LEA", OP_IMM: "IMM", OP_JMP: "JMP", OP_JSR: "JSR",
     OP_BZ: "BZ", OP_BNZ: "BNZ", OP_ENT: "ENT", OP_ADJ: "ADJ",
     OP_LEV: "LEV", OP_LI: "LI", OP_SI: "SI", OP_PSH: "PSH",
-    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL", OP_EXIT: "EXIT",
+    OP_OR: "OR", OP_XOR: "XOR", OP_AND: "AND",
+    OP_EQ: "EQ", OP_NE: "NE", OP_LT: "LT", OP_GT: "GT",
+    OP_LE: "LE", OP_GE: "GE",
+    OP_SHL: "SHL", OP_SHR: "SHR",
+    OP_ADD: "ADD", OP_SUB: "SUB", OP_MUL: "MUL",
+    OP_DIV: "DIV", OP_MOD: "MOD",
+    OP_EXIT: "EXIT",
 }
 
 

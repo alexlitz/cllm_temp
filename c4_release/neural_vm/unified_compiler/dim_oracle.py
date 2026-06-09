@@ -54,20 +54,33 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from .symbolic_forward import (
     OP_ADD,
     OP_ADJ,
+    OP_AND,
     OP_BNZ,
     OP_BZ,
+    OP_DIV,
     OP_ENT,
+    OP_EQ,
     OP_EXIT,
+    OP_GE,
+    OP_GT,
     OP_IMM,
     OP_JMP,
     OP_JSR,
+    OP_LE,
     OP_LEA,
     OP_LEV,
     OP_LI,
+    OP_LT,
+    OP_MOD,
     OP_MUL,
+    OP_NE,
+    OP_OR,
     OP_PSH,
+    OP_SHL,
+    OP_SHR,
     OP_SI,
     OP_SUB,
+    OP_XOR,
     decode_instr,
 )
 
@@ -414,6 +427,75 @@ class ReferenceOracle:
                 if sp in stack:
                     top = stack[sp]; sp += 8
                     ax = (top * ax) & 0xFFFFFFFF
+            elif opcode == OP_DIV:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    if ax == 0:
+                        ax = 0
+                    else:
+                        # C4 semantics: signed integer division (32-bit).
+                        a = top if top < 0x80000000 else top - 0x100000000
+                        b = ax if ax < 0x80000000 else ax - 0x100000000
+                        # Truncate toward zero (C semantics).
+                        q = abs(a) // abs(b)
+                        if (a < 0) ^ (b < 0):
+                            q = -q
+                        ax = q & 0xFFFFFFFF
+            elif opcode == OP_MOD:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    if ax == 0:
+                        ax = 0
+                    else:
+                        a = top if top < 0x80000000 else top - 0x100000000
+                        b = ax if ax < 0x80000000 else ax - 0x100000000
+                        q = abs(a) // abs(b)
+                        if (a < 0) ^ (b < 0):
+                            q = -q
+                        r = a - q * b
+                        ax = r & 0xFFFFFFFF
+            elif opcode == OP_OR:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    ax = (top | ax) & 0xFFFFFFFF
+            elif opcode == OP_XOR:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    ax = (top ^ ax) & 0xFFFFFFFF
+            elif opcode == OP_AND:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    ax = (top & ax) & 0xFFFFFFFF
+            elif opcode == OP_SHL:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    shift = ax & 0x1F  # C4 uses low bits for shift count
+                    ax = (top << shift) & 0xFFFFFFFF
+            elif opcode == OP_SHR:
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    shift = ax & 0x1F
+                    # C4 uses unsigned right shift on the 32-bit register.
+                    ax = (top & 0xFFFFFFFF) >> shift
+            elif opcode in (OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE):
+                if sp in stack:
+                    top = stack[sp]; sp += 8
+                    # Signed comparison (C4 treats words as signed int).
+                    a = top if top < 0x80000000 else top - 0x100000000
+                    b = ax if ax < 0x80000000 else ax - 0x100000000
+                    if opcode == OP_EQ:
+                        result = 1 if a == b else 0
+                    elif opcode == OP_NE:
+                        result = 1 if a != b else 0
+                    elif opcode == OP_LT:
+                        result = 1 if a < b else 0
+                    elif opcode == OP_GT:
+                        result = 1 if a > b else 0
+                    elif opcode == OP_LE:
+                        result = 1 if a <= b else 0
+                    else:  # OP_GE
+                        result = 1 if a >= b else 0
+                    ax = result & 0xFFFFFFFF
             elif opcode == OP_EXIT:
                 halted = True
             else:
