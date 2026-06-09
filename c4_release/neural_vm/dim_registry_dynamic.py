@@ -623,6 +623,15 @@ def build_default_registry_dynamic() -> DimRegistry:
         "AX byte-3 value hi nibble broadcast to STACK0 byte-3 row (PSH)",
         "mark == STACK0 AND byte_index == 3 AND opcode_in_step in {PSH}")
 
+    # ------------------------------------------------------------------
+    # C5 BZ branch-target re-fire fix — cross-step BZ_TARGET_FRESH bit
+    # ------------------------------------------------------------------
+    # Mirror of dim_registry.py allocation at slot 830 (1 wide).
+    # See docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md.
+    pin("BZ_TARGET_FRESH", 830, 1,
+        "C5: previous step was a BZ-taken step (cross-step gate)",
+        "mark == PC")
+
     reg = a.to_registry()
     # Phase 7.E.1 — apply the same semantic-category bindings as the
     # static registry so the dynamic mirror stays byte-identical (now

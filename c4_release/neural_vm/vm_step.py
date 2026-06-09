@@ -2562,6 +2562,16 @@ class _SetDim:
     # literal in op.reads (and exercised by tests/test_lev_detector_head.py).
     TEMP_PREV_STEP = 480  # alias of TEMP (consumer: lev_detector_head)
 
+    # --- C5: BZ branch-target re-fire fix (cross-step gate) ---
+    # Written 1.0 by ``post_l9_bz_bnz_pc_override`` on BZ-taken steps
+    # (MARK_PC + OP_BZ + CMP+4 + CMP+5 align). Consumed by the SAME op
+    # on the NEXT step via the ``BZ_TARGET_FRESH.*.-1`` cross-step alias
+    # as a negative gate term on the OUTPUT_LO cancel band, suppressing
+    # the spurious cancellation that otherwise wipes the BZ target on
+    # step >= 2 BZ instances (loop body, function body). See
+    # docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md.
+    BZ_TARGET_FRESH = 830  # 1 dim @ 830 (just past STACK0_BYTE_VAL_3_HI[15])
+
     # Convenience: map Opcode int → _SetDim opcode flag dim
     _OPCODE_DIM = None  # lazily built
 

@@ -1182,6 +1182,23 @@ def build_default_registry() -> DimRegistry:
               "AX byte-3 value hi nibble broadcast to STACK0 byte-3 row (PSH)",
               semantics="mark == STACK0 AND byte_index == 3 AND opcode_in_step in {PSH}")
 
+    # ------------------------------------------------------------------
+    # C5 BZ branch-target re-fire fix — cross-step BZ_TARGET_FRESH bit
+    # ------------------------------------------------------------------
+    # See docs/C5_BZ_REFIRE_ATTRIBUTION_2026_06_07.md and
+    # docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md.
+    #
+    # Written 1.0 at MARK_PC positions by the post_l9 BZ override block
+    # when the BZ-taken gates align (OP_BZ + CMP+4 + CMP+5). The .*.-1
+    # cross-step alias lets the SAME override block detect "the previous
+    # step was a BZ-taken step that produced a custom target as OUTPUT
+    # residual" and skip the cancel-band write, which would otherwise
+    # subtract an unrelated previous-step OUTPUT_LO residual when the
+    # current step is a non-step-0 BZ inside a loop or function body.
+    _pin("BZ_TARGET_FRESH", 830, 1,
+              "C5: previous step was a BZ-taken step (cross-step gate)",
+              semantics="mark == PC")
+
     reg = a.to_registry()
     _register_default_categories(reg)
     return reg

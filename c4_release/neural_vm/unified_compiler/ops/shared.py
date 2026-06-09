@@ -730,6 +730,13 @@ def declare_setdim_compat_dims(
         # consumed by L10 tail_sp_marker_* rules. See
         # ``investigation/bd-dim-usage-map`` REPORT Section 5.
         "SP_GATHERED_THIS_STEP",
+        # C5 BZ branch-target re-fire fix (2026-06-09): 1.0 at MARK_PC
+        # positions on BZ-taken steps. Written by
+        # ``post_l9_bz_bnz_pc_override``; consumed by the SAME op on the
+        # NEXT step via the ``BZ_TARGET_FRESH.*.-1`` cross-step alias as
+        # a gate term on the OUTPUT_LO cancel band. See
+        # ``docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md``.
+        "BZ_TARGET_FRESH",
     ]
     # 7-dim threshold head outputs (one per marker type)
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",

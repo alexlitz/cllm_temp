@@ -4531,6 +4531,15 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     step 0 while preserving the original step-1+ firing margin. Documented
     in ``docs/L34_FFN_ATTRIBUTION_2026_06_04.md`` (the cheapest fix for the
     L34 var_simple/var_three 0x00 leak at MEM_addr1 step 0).
+
+    C5 BZ re-fire fix (2026-06-09): the cancel band now carries an extra
+    cross-step gate term ``BZ_TARGET_FRESH.*.-1`` with weight ``+1`` so
+    that when the PREVIOUS step was BZ-taken (``BZ_TARGET_FRESH=1`` was
+    written on that step) the additional ``+1`` term cancels the
+    ``-OUTPUT_LO_prev`` cancel, leaving the BZ target write untouched. A
+    new BZ_TARGET_FRESH writer rule (positive constant_write) fires on
+    BZ-taken steps so the NEXT step's KV-cache lookup sees the bit.
+    See ``docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md``.
     """
 
     rules = []
@@ -4548,10 +4557,24 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     # OUTPUT_LO cancel gate is intentionally cross-step (`.*.-1`) because the
     # purpose of the cancel band is to subtract the PREVIOUS step's residual
     # from the current-step OUTPUT bank, mirroring the L6 semantics.
+    #
+    # C5 BZ re-fire fix: an additional cross-step ``BZ_TARGET_FRESH.*.-1``
+    # gate term suppresses the cancel on step N when step N-1 was BZ-taken
+    # (the LO band only — the HI band reads same-step OUTPUT_HI_THIS_STEP
+    # which is not subject to the cross-step residual problem). The
+    # algebra: gate = -OUTPUT_LO_prev[k] + (+1)*BZ_TARGET_FRESH.*.-1.
+    # When BZ_TARGET_FRESH.*.-1 = 1 AND OUTPUT_LO_prev[k] = 1 the cancel
+    # is zeroed; when BZ_TARGET_FRESH.*.-1 = 0 the cancel behaves as
+    # before. The (+1)*0 = 0 case on OUTPUT_LO_prev[k] = 0 is a no-op
+    # (the cancel rule writes 0 for either lane).
     for band, output_base, output_gate_base in (
         ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
         ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
     ):
+        extra_gate_terms = ()
+        if band == "lo":
+            # C5: suppress cancel on step-N when step N-1 was BZ-taken.
+            extra_gate_terms = (("BZ_TARGET_FRESH.*.-1", 1.0),)
         for k in range(16):
             rules.append(multi_way_and_rule(
                 name=f"post_l9_bz_cancel_{band}_{k}",
@@ -4559,6 +4582,7 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=3.5 + step0_guard_weight,
                 gate=f"{output_gate_base}+{k}",
                 gate_weight=-1.0,
+                gate_terms=extra_gate_terms,
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
     # FIX 2026-06-06: BZ branch immediates land in FETCH_LO as raw
@@ -4581,6 +4605,19 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         lo_source="FETCH_LO",
         write_scale=write_scale,
     )
+    # C5 BZ re-fire fix: write ``BZ_TARGET_FRESH = 1`` on this BZ-taken
+    # step so the NEXT step's KV-cache lookup of ``BZ_TARGET_FRESH.*.-1``
+    # at the MARK_PC row returns 1. The cancel band above uses that bit
+    # to suppress its spurious cancellation when the prev step was
+    # BZ-taken. Single one-wide write at MARK_PC; uses the same BZ-taken
+    # gating as the target write (sans MARK_STACK0 because BZ_TARGET_FRESH
+    # is written at MARK_PC, not STACK0).
+    rules.append(multi_way_and_rule(
+        name="post_l9_bz_target_fresh_write",
+        conditions=cancel_conditions,
+        threshold=3.5 + step0_guard_weight,
+        writes=(("BZ_TARGET_FRESH", write_scale),),
+    ))
     return tuple(rules)
 
 
@@ -4709,8 +4746,17 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
             # by 10 so step 0 cannot fire (no preceding CMP exists). See
             # docs/L34_FFN_ATTRIBUTION_2026_06_04.md.
             "HAS_SE",
+            # C5 BZ re-fire fix (2026-06-09): cross-step gate term on the
+            # cancel band so a prev-step-was-BZ-taken bit suppresses the
+            # spurious cancellation. See docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md.
+            "BZ_TARGET_FRESH.*.-1",
         },
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        writes={
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+            # C5: write the cross-step "this step was BZ-taken" bit so
+            # the next step's cancel band can suppress its firing.
+            "BZ_TARGET_FRESH",
+        },
         kind="ffn",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
@@ -4729,12 +4775,11 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
         # owns the post-L9 BZ/BNZ PC override band (the L21 tail FFN in
         # the audit). The bake lowers
         # ``_post_l9_bz_pc_override_rules + _post_l9_bnz_pc_override_rules``
-        # -- exactly 192 units. Prior to annotation, block[L21].ffn fell
-        # through to ``DEFAULT_LAYER_MAX_UNITS = 4096`` and
-        # ``_right_size_ffns`` trimmed 3904 dead rows post-bake.
-        # Declaring 192 here lets the dynamic-FFN allocator pre-size the
+        # -- 192 baseline units, plus 1 BZ_TARGET_FRESH writer (C5 fix,
+        # 2026-06-09) = 193 units.
+        # Declaring this here lets the dynamic-FFN allocator pre-size the
         # block correctly. The rule lowering starts at unit 0 and walks
         # a monotonic cursor independent of the layer max so byte-
         # identity is preserved.
-        ffn_units_used=192,
+        ffn_units_used=193,
     )
