@@ -1224,8 +1224,16 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
             # non-negative; the STACK0 query term neutralizes this row during
             # STACK0 preserves, while broad H1 gates can turn unrelated byte
             # queries into false-positive memory loads.
+            # Scaled-down (was 100000.0) by the same 10000x factor used on
+            # row 36: at s=100000 the Q-side miss combination (CONST -3.5s,
+            # IS_BYTE -4s, MEM_STORE -4s) produced Q[61]~=-1.5e5 at every
+            # non-0xffe8 LI step, and W_k[MEM_VAL_B1]=1e5 then drove K@(MEM
+            # val byte 1) to -1.5G, killing every normal LI/LC load. The
+            # legitimate 0xffe8 path still wins via the relative ordering
+            # of its Q + K terms; the absolute scale of this lane is not
+            # needed once it no longer drowns the rest of the head.
             ax_li_e8_row = 61
-            ax_li_e8_s = 100000.0
+            ax_li_e8_s = 10.0
             attn.W_q.data[base + ax_li_e8_row, BD.CONST] = -3.5 * ax_li_e8_s
             attn.W_q.data[base + ax_li_e8_row, BD.MARK_AX] = ax_li_e8_s
             attn.W_q.data[base + ax_li_e8_row, BD.OP_LI_RELAY] = ax_li_e8_s
@@ -1460,6 +1468,16 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
             attn.W_q.data[base + pc_byte_blocker, BD.CMP + 3] = 10000.0
             attn.W_q.data[base + pc_byte_blocker, BD.ADDR_B0_LO + 8] = 10000.0
             attn.W_q.data[base + pc_byte_blocker, BD.ADDR_B0_HI + 15] = 10000.0
+            # LI/LC steps also carry HAS_SE=1 at the AX marker, so the
+            # +10000 HAS_SE contribution above turns row 35 into a -1G
+            # constant penalty at every K position (W_k[CONST]=-100000),
+            # collapsing softmax onto the zero sink and aliasing LI as a
+            # return-the-address operation. Cancel HAS_SE at LI/LC by
+            # subtracting the same magnitude from the relay dims so the
+            # binary-pop guard only fires for pop steps (which have no
+            # LI/LC relay).
+            attn.W_q.data[base + pc_byte_blocker, BD.OP_LI_RELAY] = -10000.0
+            attn.W_q.data[base + pc_byte_blocker, BD.OP_LC_RELAY] = -10000.0
 
             # Non-pop, non-store STACK0 markers preserve the visible stack top.
             # Give them a positive source row for the latest prior STACK0 byte0
