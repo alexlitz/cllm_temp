@@ -425,7 +425,7 @@ int DATA_BASE;
 int STACK_BASE;
 
 char *memory;
-int *code;
+long long *code;
 int code_len;
 int pc;
 int sp;
@@ -510,7 +510,7 @@ int step() {
 
     else if (op == GETC_OP) { ax = getchar(); if (ax < 0) ax = 0; }
     else if (op == PUTC_OP) { putchar(mem_ri(sp)); }
-    else if (op == EXIT_OP) { halted = 1; return mem_ri(sp); }
+    else if (op == EXIT_OP) { halted = 1; return ax; }
 
     return 0;
 }
@@ -559,7 +559,7 @@ int run(int argc, char **argv) {
     sp = sp - 8; mem_wi(sp, argc);
     sp = sp - 8; mem_wi(sp, argv_base);
 
-    code = (int *)bundled_bytecode;
+    code = (long long *)bundled_bytecode;
     code_len = bundled_bytecode_len / 8;
     if (bundled_data_len > 0) mcopy(memory + DATA_BASE, bundled_data, bundled_data_len);
 

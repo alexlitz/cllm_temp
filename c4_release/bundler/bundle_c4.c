@@ -273,7 +273,7 @@ int print_vm() {
     printf("    else if (op==GE) { a=mem_ri(sp); sp+=8; ax=(a>=ax); }\n");
     printf("    else if (op==GETC_OP) ax=getchar_raw();\n");
     printf("    else if (op==PUTC_OP) putchar_raw((int)mem_ri(sp));\n");
-    printf("    else if (op==EXIT_OP) { halted=1; return (int)mem_ri(sp); }\n");
+    printf("    else if (op==EXIT_OP) { halted=1; return (int)ax; }\n");
     printf("    return 0;\n");
     printf("}\n\n");
 

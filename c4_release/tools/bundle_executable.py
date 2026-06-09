@@ -325,7 +325,7 @@ int vm_run() {{
         else if (op == MUL) {{ ax = mem_read_int(sp) * ax; sp = sp + 8; }}
         else if (op == DIV) {{ ax = mem_read_int(sp) / ax; sp = sp + 8; }}
         else if (op == MOD) {{ ax = mem_read_int(sp) % ax; sp = sp + 8; }}
-        else if (op == EXIT) {{ return (int)mem_read_int(sp); }}
+        else if (op == EXIT) {{ return (int)ax; }}
         else if (op == MALC) {{ ax = (int64)malloc((size_t)mem_read_int(sp)); sp = sp + 8; }}
         else if (op == FREE) {{ free((void *)mem_read_int(sp)); sp = sp + 8; }}
         /* Extended opcodes */
