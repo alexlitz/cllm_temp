@@ -1535,6 +1535,7 @@ def compile_full_vm_dynamic(
     d_model_packing: bool = False,
     d_model_packing_target: Optional[int] = None,
     cross_step_baseline_allowlist: Optional[Iterable[Tuple[str, str]]] = None,
+    softmax_variant: Optional[str] = None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -1646,6 +1647,45 @@ def compile_full_vm_dynamic(
     if declarations_only:
         require_declarative_bake = True
 
+    # ------------------------------------------------------------------
+    # softmax_variant (DSL variant scaffold; see
+    # ``docs/SOFTMAX_DSL_VARIANT_DESIGN_2026_06_09.md``)
+    #
+    # ``softmax_variant`` is the new high-level surface that coordinates
+    # the runtime softmax kernel and the bake-side ZFOD substitute. The
+    # default ``None`` means "infer from ``attention_normalization``" so
+    # every existing call site stays byte-identical.
+    #
+    # Validation only at this stage: the actual lowering wave (injecting
+    # the per-head sink K row into L7 / L15 memory-lookup heads) lands
+    # behind this flag in a follow-up. Today the flag plumbs through to
+    # ``attention_normalization`` exactly the way ``arch=`` does — pick
+    # one path per call site.
+    # ------------------------------------------------------------------
+    if softmax_variant is not None:
+        if softmax_variant not in ("softmax1", "standard"):
+            raise ValueError(
+                "compile_full_vm_dynamic: softmax_variant must be "
+                "'softmax1' or 'standard'; got "
+                f"{softmax_variant!r}"
+            )
+        _implied_norm = (
+            "softmax1" if softmax_variant == "softmax1" else "softmax"
+        )
+        if (
+            attention_normalization is not None
+            and attention_normalization != _implied_norm
+        ):
+            raise TypeError(
+                "compile_full_vm_dynamic: softmax_variant="
+                f"{softmax_variant!r} implies attention_normalization="
+                f"{_implied_norm!r} but caller passed "
+                f"attention_normalization={attention_normalization!r}; "
+                "pass softmax_variant= alone (preferred) OR "
+                "attention_normalization= alone, not both."
+            )
+        attention_normalization = _implied_norm
+
     from ..config import get_config
     vm_config = get_config()
 
@@ -1747,6 +1787,17 @@ def compile_full_vm_dynamic(
             # Qwen R1 (see _bake_from_scheduled_ops cache key for context).
             "C4_QWEN_EXPORT_COMPAT": (
                 os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
+            ),
+            # Softmax DSL variant scaffold (see
+            # docs/SOFTMAX_DSL_VARIANT_DESIGN_2026_06_09.md). Today this is
+            # a pass-through of ``attention_normalization`` so the cache
+            # key stays stable; once the bake-side sink injection lands
+            # the two values can diverge and need independent invalidation.
+            "softmax_variant": (
+                softmax_variant
+                if softmax_variant is not None
+                else ("softmax1" if attention_normalization == "softmax1"
+                      else "standard")
             ),
             "__dynamic": True,
         }

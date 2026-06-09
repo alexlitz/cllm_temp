@@ -155,6 +155,94 @@ def AO(out_dim: int, slot: int, weight: float) -> AttentionOutputWrite:
     return AttentionOutputWrite(out_dim=out_dim, slot=slot, weight=weight)
 
 
+def _inject_sink_k_row(
+    spec: DeclarativeAttentionHeadSpec,
+    sink_idx: int,
+) -> DeclarativeAttentionHeadSpec:
+    """Return a copy of ``spec`` with one synthetic "sink" K-slot appended.
+
+    Scaffold helper for the standard-softmax DSL variant (see
+    ``docs/SOFTMAX_DSL_VARIANT_DESIGN_2026_06_09.md``). Under the
+    deployed VM's ``attention_normalization="softmax1"`` the +1 anchor
+    in the softmax1 denominator gives every memory-lookup head the
+    "Zero Fill On Demand" semantics that the residual stream relies on
+    (an unmapped LI reads 0). Stock Qwen3 uses standard softmax, where
+    that anchor doesn't exist — so the parallel ``"standard"`` variant
+    has to bake a substitute into each affected head.
+
+    The substitute is the **bake-time** equivalent of the runtime sink
+    column appended in ``vm_step.AutoregressiveAttention.forward``
+    (see ``vm_step.py`` ~L537 — the SDPA path appends ``K=0, V=0`` when
+    ``use_softmax1`` is on). For per-head bakes we reserve one extra
+    K slot per spec at index ``sink_idx`` and write only ``CONST → 0``
+    into it. Effects:
+
+    * K_sink row = 0 (the only write at this slot is ``CONST → 0``),
+      so the sink's pre-softmax score against any Q is exactly 0;
+    * V_sink row absent => V[sink_idx] = 0 by default => the sink
+      contributes 0 to the V-weighted output;
+    * Q is unchanged — queries still see their natural K rows.
+
+    R3 proved the algebra in ``docs/QWEN_SOFTMAX_SINK_PROTOTYPE_2026_06_07.md``:
+    standard softmax over ``[0, scores]`` with ``V_sink = 0``
+    reproduces softmax1 over ``scores`` exactly on the real positions.
+
+    The helper is **idempotent and additive**: if a write at
+    ``slot=sink_idx`` already exists in ``spec.k``, the spec is
+    returned unchanged. The existing Q/K/V/O writes are passed through
+    so callers can chain this helper without touching the rest of the
+    head's bake.
+
+    Args:
+        spec: the head spec that historically relied on softmax1's
+            anchor. Typically a L7 memory_heads head or a L15
+            memory_lookup head (see design doc §3).
+        sink_idx: per-head K-slot index for the sink. Caller must
+            ensure this slot is otherwise unused (the allocator can
+            reserve one slot beyond the spec's max declared K slot).
+
+    Returns:
+        A new ``DeclarativeAttentionHeadSpec`` with one extra K row at
+        ``sink_idx`` writing ``CONST → 0``. All other fields are
+        carried over unchanged (including ``alibi_slope``,
+        ``group_size``, ``head_dim``).
+
+    Notes:
+        * Writing ``weight=0.0`` is deliberate. The sink's K row must
+          be all-zero regardless of the input residual, so any
+          ``CONST`` activation projected through this slot resolves
+          to 0. This differs from anti-anchor heads (the
+          ``softmax1_suppress`` audit class) where the K is pushed
+          *actively negative* — those are out of scope for the
+          ``"standard"`` variant scaffold (see design doc §3).
+        * This helper does NOT toggle off the runtime softmax1 path —
+          that's the caller's responsibility via
+          ``attention_normalization="softmax"`` /
+          ``softmax_variant="standard"``. Using the sink alongside
+          softmax1 doubles the anchor (sink + +1) and is incorrect.
+    """
+
+    if any(write.slot == sink_idx for write in spec.k):
+        return spec
+
+    sink_write = AttentionProjectionWrite(
+        slot=sink_idx,
+        dim=BD.CONST,
+        weight=0.0,
+    )
+    new_k = tuple(spec.k) + (sink_write,)
+    return DeclarativeAttentionHeadSpec(
+        head_idx=spec.head_idx,
+        q=spec.q,
+        k=new_k,
+        v=spec.v,
+        o=spec.o,
+        alibi_slope=spec.alibi_slope,
+        group_size=spec.group_size,
+        head_dim=spec.head_dim,
+    )
+
+
 class Primitives:
     """Core weight-setting primitives matching vm_step.py patterns."""
 
