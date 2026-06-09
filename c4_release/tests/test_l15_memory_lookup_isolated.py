@@ -232,10 +232,19 @@ def _softmax1(scores: torch.Tensor) -> torch.Tensor:
 
     softmax1(x_i) = exp(x_i) / (1 + sum_j exp(x_j))
 
+    Numerically stable via the standard max-shift trick, extended for the
+    implicit +1: shift by max(0, max(scores)) so neither the numerator nor
+    the denominator overflows.  Without this, scores > ~88 (float32) or
+    > ~709 (float64) produce ``inf/inf = nan``.
+
     BLOG_SPEC §410: 'softmax1' gives ZFOD — unmapped addresses return 0.
     """
-    e = torch.exp(scores)
-    return e / (1.0 + e.sum())
+    # Finite-only max so -inf-masked positions don't contaminate the shift.
+    finite = scores[torch.isfinite(scores)]
+    m_scores = float(finite.max().item()) if finite.numel() > 0 else 0.0
+    m = max(0.0, m_scores)
+    e = torch.exp(scores - m)
+    return e / (math.exp(-m) + e.sum())
 
 
 # ----------------------------------------------------------------------
@@ -521,9 +530,8 @@ def test_si_si_li_e2e_isolated():
     mask = torch.full((seq_len,), float("-inf"))
     mask[: q_pos + 1] = 0.0
     scores_masked = scores + mask
-    # softmax1
-    e = torch.exp(scores_masked)
-    probs = e / (1.0 + e.sum())
+    # softmax1 via the stable helper (handles exp overflow for large scores).
+    probs = _softmax1(scores_masked)
     head_out = probs @ V  # (HD,)
     # W_o projects head 0's slots back to OUTPUT_LO/HI.
     Wo_h = attn.W_o[:, base : base + HD]  # (d_model, HD)
@@ -562,7 +570,10 @@ def _apply_l15_ops_head_0_overlay(attn: _StubAttn) -> None:
     """
     base = 0  # head 0
     row = base + 36
-    stack0_preserve_s = 10000.0
+    # Mirrors l15_ops.py:1306 after the BYTE_INDEX_0-alias fix
+    # (was 10000.0; lowered to keep slot 36 within the L15 binary-address
+    # match scale).
+    stack0_preserve_s = 1.0
     ax_i = 1
     attn.W_q[row, BD.CONST] = -1.0 * stack0_preserve_s
     attn.W_q[row, BD.MARK_STACK0] = 3.0 * stack0_preserve_s

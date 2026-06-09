@@ -1303,7 +1303,12 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
             # token so preservation does not fall through to L16's ALU address
             # fallback.
             stack0_preserve_row = 36
-            stack0_preserve_s = 10000.0
+            # Scaled-down (was 10000.0) to keep slot 36 within +-300, the L15
+            # binary-address match scale.  At s=10000 this row scored 2.5e8
+            # for any K with BYTE_INDEX_0=1 (e.g. STACK0 byte 0), aliasing
+            # non-store rows as memory targets and destroying SI/LI roundtrip.
+            # See tests/test_l15_memory_lookup_isolated.py for the gate.
+            stack0_preserve_s = 1.0
             attn.W_q.data[base + stack0_preserve_row, BD.CONST] = (
                 -1.0 * stack0_preserve_s
             )
