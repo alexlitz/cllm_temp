@@ -1462,6 +1462,22 @@ def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             (BD.OP_LEV, -10000.0),
         ],
     )
+    # Suppress head 7 at MEM val byte Q rows. The byte passthrough chain is
+    # meant to relay BP byte values; at SI/SC steps the MEM val byte rows
+    # (MEM_VAL_B0/B1/B2/B3 = 1) were spuriously attending to the IMM byte
+    # rows of the preceding step (probe_l14_li_consumer.py confirmed head 7
+    # weight 0.61 from p=193 Q to K@170, leaking the 0x02 nibble of 0x200
+    # into OUTPUT_LO[2]/OUTPUT_HI[0]).  Adding a strongly negative slot-0
+    # Q contribution at MEM_VAL_B* positions makes Q[0] fall well below the
+    # q0_threshold so the head produces no measurable attention there.
+    L = S
+    mem_val_suppress = (
+        AP(0, BD.MEM_VAL_B0, -L),
+        AP(0, BD.MEM_VAL_B1, -L),
+        AP(0, BD.MEM_VAL_B2, -L),
+        AP(0, BD.MEM_VAL_B3, -L),
+    )
+    spec = replace(spec, q=spec.q + mem_val_suppress)
     # Stack-source top stores update STACK0 from the current AX byte, but the
     # ordinary stack persistence head shares an H1+AX key with a negative store
     # route.  Keep this top-store byte-0 route isolated in head 7 and select
