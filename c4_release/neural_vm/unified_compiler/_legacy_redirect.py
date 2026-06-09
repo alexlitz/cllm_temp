@@ -231,6 +231,7 @@ from .migrated_ops import (
     make_l12_alu_mul_genprop_op,
     make_l12_alu_mul_getobd_op,
     make_layer8_op_imm_relay_op,
+    make_layer10_divmod_op,
     make_layer10_residual_alibi_slopes_op,
     make_residual_alibi_slopes_op,
 )

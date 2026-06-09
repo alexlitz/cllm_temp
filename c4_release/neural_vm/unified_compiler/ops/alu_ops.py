@@ -1725,6 +1725,118 @@ def make_l10_alu_divmod_install_op(alu_mode: str = 'lookup') -> Operation:
     return make_alu_divmod_composite_ops(alu_mode=alu_mode)[3]
 
 
+def make_layer10_divmod_op() -> Operation:
+    """Declarative wrapper op for the L10 FlattenedDivMod composite (Bug #36).
+
+    Bug #36 / ``LONG_DIVISION_BUG36_2026_06_09.md`` flagged that DIV/MOD
+    semantics live entirely in an imperative ``nn.Module``
+    (``FlattenedDivMod``) appended at L10 phase=10.0-10.2, with
+    multi-byte DIV having no rule-set path (see
+    ``wide_alu_dsl.wide_div_rules`` -- ``width_bytes>1`` raises
+    ``NotImplementedError`` per ``DSL_W5_MULDIV_LIMIT.md``).
+
+    Full declarative migration is structurally infeasible: long
+    division requires conditional subtraction per nibble (8 outer x 15
+    inner trial-multiply / compare / subtract steps), and the partial
+    dividend lives in a 9-nibble GE workspace accumulator that does
+    not project onto the BD residual stream without 24+ extra layers
+    (see ``LongDivisionModule`` docstring in
+    ``alu/ops/divmod_longdiv.py``).
+
+    This wrapper is the alternative deliverable from the Bug #36
+    brief: a no-op declarative ``Operation`` whose ``reads`` /
+    ``writes`` enumerate every BD-format dim the imperative composite
+    actually touches at runtime, so:
+
+      * ``dim_contracts_audit`` and
+        ``decl_verifier.verify_rule_scopes`` see the divmod composite
+        as a single declarative producer/consumer rather than only as
+        4 stage ops carrying ``produces={'__module_replacement': ...}``
+        sentinels with individually-sliced reads/writes (the existing
+        ``l10_alu_divmod_{bdtoge,longdiv,getobd,install}`` ops).
+      * Future producer/consumer ``DimContract`` registrations for
+        ``AX_FULL_LO`` / ``AX_FULL_HI`` (the byte-1 stack staging
+        identified as the leak source for the ``div_5`` failure
+        shape) can name a single op rather than tracking the 4-stage
+        composite boundary.
+
+    The ``bake_fn`` is a deliberate no-op -- the actual composite
+    install happens via ``make_alu_divmod_composite_ops`` (the 4-stage
+    builder). This op MUST run alongside that composite (it does not
+    replace it) and is tagged with
+    ``produces={'__declarations_only': ...}`` so dynamic verifiers
+    (Mode B) skip drift detection and static (Mode A) snapshot diffing
+    is unaffected.
+
+    Read enumeration (cross-referenced with
+    ``efficient_alu_neural.BDToGEConverter.forward``):
+
+      * Operand bytes:       ``ALU_LO``, ``ALU_HI``, ``AX_CARRY_LO``, ``AX_CARRY_HI``
+      * Wide-operand byte-1: ``AX_FULL_LO``, ``AX_FULL_HI``
+      * Stack0 fallback:     ``STACK0_BYTE1``, ``CLEAN_EMBED_LO``, ``CLEAN_EMBED_HI``
+      * Opcode gates:        ``OP_DIV``, ``OP_MOD``, ``OP_MUL``, ``OP_SHL``, ``OP_SHR``
+      * Position gate:       ``MARK_AX``
+
+    Writes (from ``GEToBDConverter`` in the GE->BD writeback stage):
+
+      * Quotient/remainder:  ``OUTPUT_LO``, ``OUTPUT_HI_THIS_STEP``
+    """
+    def _bake(target, dim_positions, S):
+        # Deliberate no-op: the actual install is performed by the
+        # 4-stage builder in ``make_alu_divmod_composite_ops``. This
+        # op exists solely to declare the consolidated reads/writes
+        # set for ``dim_contracts_audit`` / ``verify_rule_scopes``
+        # coverage of the FlattenedDivMod composite.
+        pass
+
+    return Operation(
+        name="layer10_divmod",
+        # Co-bake alongside the 4-stage composite ops; no ordering
+        # constraint since this op is declarations-only and has no
+        # bake side effect.
+        slot_share=("post_ops_append",),
+        reads={
+            # Operand bytes (low/high) read by BDToGEConverter.
+            "ALU_LO", "ALU_HI",
+            "AX_CARRY_LO", "AX_CARRY_HI",
+            # Wide-operand byte-1 staging for 16/32-bit DIV/MOD.
+            "AX_FULL_LO", "AX_FULL_HI",
+            # STACK0 byte-1 fallback path (cummax over prefix).
+            "STACK0_BYTE1",
+            "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+            # Opcode gates (DIV/MOD plus the wide_op union used by
+            # the AX_FULL branch in BDToGEConverter).
+            "OP_DIV", "OP_MOD",
+            "OP_MUL", "OP_SHL", "OP_SHR",
+            # AX marker (position gate for the long-division step).
+            "MARK_AX",
+        },
+        writes={
+            # Quotient (DIV) or remainder (MOD) written into OUTPUT
+            # bands at the MARK_AX position by GEToBDConverter.
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+        },
+        kind="block",
+        declarative_bake_fn=_bake,
+        target_op_name="layer10_carry_relay",
+        migrated=True,
+        declarative_authority="structural_model",
+        # No per-cell claims -- the 4 stage ops own the module-attach
+        # claim; this wrapper only declares the I/O interface.
+        claims=set(),
+        # Declarations-only sentinel: dynamic verifier (Mode B) skips
+        # drift detection (no weights are written); static (Mode A)
+        # snapshot diffing is unaffected.
+        produces={'__declarations_only': 'L10.post_ops[FlattenedDivMod]'},
+        smoke_tests={
+            "TestSmokeBasic::test_div_basic",
+            "TestSmokeBasic::test_mod_basic",
+        },
+        spec_section="BLOG_SPEC.md#binary-ALU",
+        opcodes={"OP_DIV", "OP_MOD"},
+    )
+
+
 def make_layer10_residual_alibi_slopes_op(alu_mode: str = 'lookup') -> Operation:
     """Bake the residual L10 ALiBi-slope mutations previously inline in set_vm_weights.
 

@@ -1824,6 +1824,7 @@ def _build_layout_only(
         make_l12_alu_mul_genprop_op,
         make_l12_alu_mul_getobd_op,
         make_layer8_op_imm_relay_op,
+        make_layer10_divmod_op,
         make_layer10_residual_alibi_slopes_op,
         make_residual_alibi_slopes_op,
         all_alu_postop_attach_ops,
@@ -1853,6 +1854,9 @@ def _build_layout_only(
         compiler.add_op(make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
     for op in make_alu_divmod_composite_ops(alu_mode=alu_mode):
         compiler.add_op(op)
+    # Bug #36 declarative wrapper for the FlattenedDivMod composite
+    # (no-op bake, declarations-only).
+    compiler.add_op(make_layer10_divmod_op())
     compiler.add_op(make_residual_alibi_slopes_op())
     compiler.add_op(make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))
     compiler.add_op(make_layer8_op_imm_relay_op())

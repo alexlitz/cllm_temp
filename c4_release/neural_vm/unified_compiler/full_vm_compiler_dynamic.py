@@ -2342,6 +2342,9 @@ def _collect_ops_for_compile(
 
     for op in _static.make_alu_divmod_composite_ops(alu_mode=alu_mode):
         ops.append(op)
+    # Bug #36 declarative wrapper: no-op bake, consolidates the
+    # FlattenedDivMod composite's reads/writes for dim_contracts_audit.
+    ops.append(_static.make_layer10_divmod_op())
 
     ops.append(_static.make_residual_alibi_slopes_op())
     ops.append(_static.make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))
