@@ -32,7 +32,7 @@ from .shared import _as_setdim_proxy
 # updating this table in lock-step.
 _L16_FFN_UNIT_LAYOUT = (
     # (sub-stage name, legacy_start (docs only), n_units)
-    ("layer16_lev_routing", 0, 792),  # full LEV routing rule bank
+    ("layer16_lev_routing", 0, 824),  # full LEV routing rule bank (+32 for AX_FULL siblings, 2026-06-09)
 )
 
 
@@ -252,6 +252,44 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=lev_ax_carry_conditions,
             threshold=1.5 + step0_guard_weight,
             gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
+        ))
+
+    # 2026-06-09 Wave C7 surface #2: AX_FULL → OUTPUT relay on LEV.
+    # Per docs/NESTED_ATTRIBUTION_2026_06_09.md, the dim_flow_audit on
+    # AX_CARRY_LO/AX_FULL_LO shows that L19 layer14_alu_high_byte_relay
+    # materializes the MUL result into AX_FULL_LO at MUL step (carried
+    # forward at L3 head_5 from prev-step OUTPUT_LO), but AX_CARRY_LO
+    # is NOT refreshed from AX_FULL — it carries forward from prev-step
+    # EMBED_LO via L3 head_1, which is the pre-MUL value. At LEV step,
+    # the AX_CARRY-keyed materializers above route the stale pre-MUL
+    # AX through OUTPUT, producing the 0xFFE8 / 0xFFNN sentinel cluster
+    # on gcd_/rec_/nested_/absdiff_ (~145 rows).
+    #
+    # Fix: mirror the AX_CARRY rules with sibling rules keyed on AX_FULL_LO/HI.
+    # Both AX_FULL and AX_CARRY rules fire in parallel; the AX_FULL
+    # path materializes the post-MUL result that AX_CARRY has lost.
+    # The rules use the same lev_ax_carry_conditions (OP_LEV + MARK_AX
+    # + HAS_SE + anti-marker gates) so they fire on exactly the same
+    # rows as the AX_CARRY siblings. Same write_scale (2.0/S) so the
+    # double-write doesn't over-drive OUTPUT — when AX_CARRY and AX_FULL
+    # agree (most non-MUL LEVs) the parallel writes add to 4.0/S which
+    # is still in the materializer band. The gate uses AX_FULL_LO+k
+    # directly (one-hot per nibble) so only the correct nibble fires.
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"l16_lev_ax_full_lo_{k}",
+            conditions=lev_ax_carry_conditions,
+            threshold=1.5 + step0_guard_weight,
+            gate=f"AX_FULL_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+        ))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"l16_lev_ax_full_hi_{k}",
+            conditions=lev_ax_carry_conditions,
+            threshold=1.5 + step0_guard_weight,
+            gate=f"AX_FULL_HI+{k}",
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
@@ -1711,7 +1749,11 @@ def make_layer16_lev_routing_op() -> Operation:
                "MEM_VAL_B2", "MEM_VAL_B3", "BYTE_INDEX_0", "BYTE_INDEX_1",
                "BYTE_INDEX_2", "BYTE_INDEX_3",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2",
-               "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
+               "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+               # Wave C7 surface #2 (2026-06-09): AX_FULL gate for LEV
+               # AX materializer sibling. See l16_lev_ax_full_lo/hi_{k}
+               # rules — fix for nested_/gcd_/rec_/absdiff_ 0xFFE8 sentinel.
+               "AX_FULL_LO", "AX_FULL_HI"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "ALU_LO"},
         kind="ffn",
         bake_fn=bake,
@@ -1759,7 +1801,7 @@ def make_layer16_lev_routing_op() -> Operation:
         # (l16_lev_stack0_byte0_preserve_lo/hi_{k}) that keep the just-popped
         # stack-top byte stable through LEV (fixes step6:STACK0_byte0 50-row
         # cluster from the same triage).
-        ffn_units_used=792,
+        ffn_units_used=824,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
