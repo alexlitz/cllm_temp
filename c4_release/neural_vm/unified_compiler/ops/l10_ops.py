@@ -1755,6 +1755,15 @@ def _layer10_psh_ax_broadcast_head_spec(BD, S, byte_h: int) -> DeclarativeAttent
         AP(0, byte_index_dim, L),
         AP(0, BD.IS_BYTE, L),
         AP(0, BD.H1 + AX_IDX, L),
+        # A3.10 (2026-06-09): OP_IMM content discriminator. At AX BI_h K
+        # rows, OP_IMM=1 only when the step IS an OP_IMM (relayed by L8
+        # ``layer8_op_imm_relay``). At AX BI_h rows of PSH/SI/etc. steps,
+        # OP_IMM=0 and CLEAN_EMBED carries opcode bytes (0x0d=PSH), not
+        # the register value. Adding +L*OP_IMM at slot 0 boosts IMM-step
+        # AX BI_h rows by L^2 = 10000 nats over non-IMM-step AX BI_h
+        # rows, dominating ALiBi recency. Among IMM-step AX BI_h rows,
+        # ALiBi slope=1.0 then picks the most recent (latest-write-wins).
+        AP(0, BD.OP_IMM, L),
 
         # K-side gate: positive at OP_PSH AX byte-h K row, negative at
         # other ops' K rows. Q[33] is ~+1 at the target Q row; multiplied
