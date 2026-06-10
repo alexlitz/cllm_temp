@@ -25,6 +25,12 @@ import pytest
 from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 
+# Wave D (2026-06-10): handler-mode complex-program tests. Retired with
+# the Python ALU/CMP/IO dispatch chain. Auto-skipped by conftest.py;
+# opt in via `pytest -m legacy`. See
+# VANILLA_RESTORE_INVENTORY_2026_06_09.md.
+pytestmark = pytest.mark.legacy
+
 
 class TestRecursion:
     """Test recursive function execution."""

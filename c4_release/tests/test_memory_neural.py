@@ -27,6 +27,11 @@ from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.embedding import Opcode
 
+# Wave D (2026-06-10): LI/LC/SI/SC handler-mode shadow-memory tests.
+# Retired with the Python dispatch chain. Auto-skipped by conftest.py;
+# opt in via `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 
 class TestLIBasic:
     """Test LI (load int from stack) instruction."""

@@ -109,19 +109,30 @@ def test_lint_reports_current_count() -> None:
     assert "files" in payload
     assert "regressions" in payload
     assert payload["regressions"] == []
-    # Sanity: at least the dirty runners contribute non-trivially.
+    # Wave D acceptance (2026-06-10): every runner is at zero. The
+    # handler-mode dispatch chain in ``run_vm.py`` plus the residual
+    # PUTCHAR/EXIT per-op branches and ``set_mem_store_positions(None)``
+    # disable-calls in ``batched_pure_neural.py`` were all retired in a
+    # single cut, and the baseline was lowered to (0, 0, 0) on every
+    # tracked runner. Any future regression in any file is a brand-new
+    # override that the ratchet must reject.
     total = payload["total_forbidden"]
-    assert total > 0, "expected non-zero baseline at 2026-06-09"
-    # The two clean runners must be at zero.
-    for clean in (
+    assert total == 0, (
+        "Wave D baseline expects 0 forbidden patterns across all "
+        f"runners — got {total}. See "
+        "c4_release/docs/VANILLA_RESTORE_INVENTORY_2026_06_09.md."
+    )
+    for runner in (
+        "c4_release/neural_vm/run_vm.py",
+        "c4_release/neural_vm/batched_pure_neural.py",
         "c4_release/neural_vm/fast_runner.py",
         "c4_release/neural_vm/batch_runner.py",
         "c4_release/neural_vm/batch_runner_v2.py",
         "c4_release/neural_vm/transformer_first_runner.py",
     ):
-        assert sum(payload["files"][clean]["counts"]) == 0, (
-            f"clean runner {clean} gained forbidden patterns: "
-            f"{payload['files'][clean]['counts']}"
+        assert sum(payload["files"][runner]["counts"]) == 0, (
+            f"runner {runner} carries forbidden patterns: "
+            f"{payload['files'][runner]['counts']}"
         )
 
 

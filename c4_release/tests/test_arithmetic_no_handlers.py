@@ -25,10 +25,18 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pytest
 from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.vm_step import Opcode
 import torch
+
+# Wave D (2026-06-10): despite the file name, this suite relied on the
+# retired handler-mode Python ALU dispatch (the runner was constructed
+# without ``pure_neural=True``, so the WAVE C chain handled multi-byte
+# results). Auto-skipped by conftest.py; opt in via `pytest -m legacy`.
+# See VANILLA_RESTORE_INVENTORY_2026_06_09.md.
+pytestmark = pytest.mark.legacy
 
 
 def test_arithmetic_operations():

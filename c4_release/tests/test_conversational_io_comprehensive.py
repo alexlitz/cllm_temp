@@ -27,6 +27,12 @@ from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.vm_step import Token
 
+# Wave D (2026-06-10): conversational PRTF/IO tests. Relied on the
+# retired Python PRTF / THINKING_END synthesis shims. Auto-skipped by
+# conftest.py; opt in via `pytest -m legacy`. Neural THINK-protocol bakes
+# are tracked in IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
+pytestmark = pytest.mark.legacy
+
 
 class TestPRTFDetection:
     """Test PRTF opcode detection and THINKING_END emission."""

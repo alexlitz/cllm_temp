@@ -39,6 +39,11 @@ from neural_vm.weight_setter import (
 from neural_vm.vm_step import AutoregressiveVM
 from src.compiler import compile_c
 
+# Wave D (2026-06-10): dual-weight-mode tests compared handler-mode vs
+# neural-mode outputs. With handler-mode retired, the comparison is moot.
+# Auto-skipped by conftest.py; opt in via `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 
 # =============================================================================
 # Fixtures

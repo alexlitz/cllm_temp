@@ -24,6 +24,12 @@ import pytest
 from src.compiler import compile_c
 from neural_vm.run_vm import AutoregressiveVMRunner
 
+# Wave D (2026-06-10): KV-cache parity tests constructed the runner in
+# handler-mode. The byte-identical test_autoregressive_kv_cache_byte_identical.py
+# uses pure_neural=True separately and is not affected.
+# Auto-skipped by conftest.py; opt in via `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 
 # =============================================================================
 # Unit Tests - Parameter Initialization

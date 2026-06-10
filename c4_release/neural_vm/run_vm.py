@@ -118,36 +118,10 @@ _OPCODE_NAME = {
     v: k for k, v in vars(Opcode).items() if k.isupper() and isinstance(v, int)
 }
 
-# Binary ops that pop one operand from stack (SP += 8).
-# Model handles byte-0 in weights; runner corrects multi-byte carry.
-_BINARY_POP_OPS = {
-    Opcode.ADD,
-    Opcode.SUB,
-    Opcode.MUL,
-    Opcode.DIV,
-    Opcode.MOD,
-    Opcode.EQ,
-    Opcode.NE,
-    Opcode.LT,
-    Opcode.GT,
-    Opcode.LE,
-    Opcode.GE,
-    Opcode.OR,
-    Opcode.XOR,
-    Opcode.AND,
-    Opcode.SHL,
-    Opcode.SHR,
-}
-
-_NEURAL_32BIT_OPS = {
-    Opcode.ADD,
-    Opcode.SUB,
-    Opcode.OR,
-    Opcode.XOR,
-    Opcode.AND,
-}
-
-_RUNNER_ALU_OPS = _BINARY_POP_OPS - _NEURAL_32BIT_OPS - {Opcode.SI, Opcode.SC}
+# Wave D removal (2026-06-10): per-op classification constants
+# (_BINARY_POP_OPS, _NEURAL_32BIT_OPS, _RUNNER_ALU_OPS) deleted with the
+# rest of the handler-mode dispatch. The runner is a pure forward-pass
+# wrapper; no per-op classification is needed.
 
 
 @dataclass
@@ -1082,14 +1056,11 @@ class AutoregressiveVMRunner:
             (output_string, exit_code) tuple
         """
         self._bytecode = bytecode
-        # In pure_neural / neural-I/O mode stdin bytes live in the token
-        # stream between USER_INPUT_START/END markers (see ``_build_context``,
-        # per BLOG_SPEC.md:851); the neural GETCHAR bake routes them into
-        # REG_AX directly. ``_stdin_buffer`` is still populated for the
-        # neural READ shim (PRTF/READ syscalls) which cross the host
-        # boundary.
-        self._stdin_buffer = list(stdin or "")
-        self._stdin_pos = 0
+        # Wave D removal (2026-06-10): ``_stdin_buffer`` / ``_stdin_pos``
+        # deleted. The neural GETCHAR bake reads stdin bytes from the
+        # USER_INPUT_START/END region of the token stream directly; the
+        # READ/PRTF host-syscall shims that used to consume this buffer
+        # have already been removed (Wave B, 2026-06-09).
         self._tool_handler = tool_handler
         self._tool_call_id = 0
         self._last_pc = None
@@ -1445,33 +1416,10 @@ class AutoregressiveVMRunner:
                         break
 
             elif next_token == Token.TOOL_CALL:
-                # FIX 2026-05-09: In pure_neural mode, do NOT run any Python-side
-                # handler or memory tracking. The model must handle tool-call
-                # semantics autoregressively or fail. We still need to call
-                # _dispatch_step so EXIT detection works.
-                #
-                # CLASSIFICATION (2026-05-11):
-                #   EXTERNAL — TOOL_CALL is the entry point for the host-
-                #   side I/O escape hatch (PRTF/OPEN/CLOS/READ). The
-                #   _syscall_handlers + _track_memory_write override here
-                #   mirrors what `_dispatch_step` does for STEP_END.
-                #   Keep until the neural-side TOOL_CALL emit machinery
-                #   subsumes both paths.
-                if not self.pure_neural:
-                    pc = self._extract_register(context, Token.REG_PC)
-                    if pc is not None:
-                        instr_idx = pc // INSTR_WIDTH
-                        if 0 <= instr_idx < len(bytecode):
-                            op = bytecode[instr_idx] & 0xFF
-                            handler = self._syscall_handlers.get(op)
-                            if handler:
-                                if not self._should_block_vm_memory_handler(op):
-                                    handler(context, output)
-                                    if op in _TOOL_CALL_OPS:
-                                        self._record_pure_attention("external_tool_ops", op)
-                            if not self._should_block_track_memory(op):
-                                self._track_memory_write(context, op)
-
+                # Wave D removal (2026-06-10): handler-mode TOOL_CALL
+                # syscall-handler dispatch + _track_memory_write deleted.
+                # TOOL_CALL must resolve neurally; the model is the sole
+                # arbiter of register/memory state.
                 exec_idx = self._exec_pc() // INSTR_WIDTH
                 if self._dispatch_step(context, bytecode, exec_idx, prefix_len, output):
                     break
@@ -1882,56 +1830,9 @@ class AutoregressiveVMRunner:
         event.update(details)
         self._phase6_syscall_events.append(event)
 
-    def _compute_alu_legacy(self, op, stack_val, ax_val):
-        """Legacy Python ALU implementation.
-
-        Only used when ``pure_neural=False`` and ``trust_neural_alu=False``. The
-        neural ALU now handles every opcode here; this method exists solely to
-        keep the legacy non-pure-neural path working for tests that have not
-        migrated. Remove together with the rest of the non-pure-neural branch
-        in ``_dispatch_step`` when ``pure_neural=True`` becomes the only mode.
-        """
-        if op == Opcode.ADD:
-            return (stack_val + ax_val) & 0xFFFFFFFF
-        elif op == Opcode.SUB:
-            return (stack_val - ax_val) & 0xFFFFFFFF
-        elif op == Opcode.MUL:
-            return (stack_val * ax_val) & 0xFFFFFFFF
-        elif op == Opcode.DIV:
-            return (stack_val // ax_val) if ax_val else 0
-        elif op == Opcode.MOD:
-            return (stack_val % ax_val) if ax_val else 0
-        elif op == Opcode.OR:
-            return stack_val | ax_val
-        elif op == Opcode.XOR:
-            return stack_val ^ ax_val
-        elif op == Opcode.AND:
-            return stack_val & ax_val
-        elif op == Opcode.SHL:
-            return (stack_val << ax_val) & 0xFFFFFFFF
-        elif op == Opcode.SHR:
-            return (stack_val >> ax_val) & 0xFFFFFFFF if ax_val < 32 else 0
-        elif op == Opcode.EQ:
-            return 1 if stack_val == ax_val else 0
-        elif op == Opcode.NE:
-            return 1 if stack_val != ax_val else 0
-        elif op == Opcode.LT:
-            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
-            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
-            return 1 if sx_s < sx_a else 0
-        elif op == Opcode.GT:
-            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
-            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
-            return 1 if sx_s > sx_a else 0
-        elif op == Opcode.LE:
-            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
-            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
-            return 1 if sx_s <= sx_a else 0
-        elif op == Opcode.GE:
-            sx_s = stack_val - 0x1000000 if stack_val >= 0x800000 else stack_val
-            sx_a = ax_val - 0x1000000 if ax_val >= 0x800000 else ax_val
-            return 1 if sx_s >= sx_a else 0
-        return 0
+    # Wave D removal (2026-06-10): _compute_alu_legacy deleted. The
+    # handler-mode binary-op recovery that called it is gone; the runner
+    # trusts the neural ALU output unconditionally.
 
     def _signed_imm(self, instr):
         imm = instr >> 8
@@ -1940,387 +1841,60 @@ class AutoregressiveVMRunner:
         return imm
 
     def _dispatch_step(self, context, bytecode, exec_idx, prefix_len, output):
-        # ------------------------------------------------------------------
-        # Handler-mode override inventory (2026-05-11)
-        # ------------------------------------------------------------------
-        # The architectural goal is `pure_neural` everywhere — no Python
-        # fallbacks. Each non-pure_neural branch below is a Python "correction"
-        # of model output and is classified as one of:
-        #
-        #   REMOVABLE-NOW: pure_neural already produces this correctly today
-        #     for at least the smoke-relevant inputs. As of 2026-05-11 base
-        #     b15e428, this is Phase 1 PC/AX coherence for IMM bytes in
-        #     [1, 7, 42, 100, 200] (test_pure_neural_pc.py PASS), the
-        #     test_lev_returns_to_caller variant of LEV, and the runner-side
-        #     PUTCHAR routing in pure_neural (`output.append(chr(neural_ax))`
-        #     above). The handler-mode override is redundant for these.
-        #   REQUIRED: model can't yet produce this autoregressively. Includes:
-        #     - Phase 1 IMM=255 (sign-extension issue, returns 0xFB000000-ish)
-        #     - Phase 2 ADD/PSH (small-operand and bitwise alike)
-        #     - Phase 3 multi-byte ADD/SUB/MUL high-byte
-        #     - Phase 4 BZ/BNZ taken/not-taken
-        #     - Phase 5 JSR-then-LEV simple (test_jsr_then_lev_simple FAIL
-        #       on base b15e428), ENT-imm, nested JSR, callee-writes-AX
-        #     - Phase 7 heap (SI/LI/SC/LC), DIV/MOD/MUL/SHL/SHR
-        #   EXTERNAL: runner-side I/O escape hatch (PRTF/GETCHAR/OPEN/CLOS/
-        #     READ). These may always need a Python shim because they cross
-        #     the VM/host boundary.
-        #
-        # Counts on base b15e428:
-        #   REMOVABLE-NOW: 7 blocks (Phase 1 PC inc, BP preserve, IMM AX,
-        #                  STACK0 mirror, AX preserve, _last_pc mirror, SP
-        #                  passthrough for non-stack ops; plus _func_call_
-        #                  handlers dispatch which is dead by default)
-        #   REQUIRED:      11 blocks (PSH, JSR, ENT, LEV, JMP, BZ, BNZ, ADJ,
-        #                  binary-pop ALU, LI/LC/SI/SC heap, LEA, AX merge)
-        #   EXTERNAL:      1 block (_syscall_handlers dispatch)
-        #
-        # Each block below is tagged inline. See docs/PHASE_*.md for the
-        # phase-by-phase status that drove these classifications.
-        # ------------------------------------------------------------------
+        """Pure forward-pass dispatch.
 
-        exec_op = bytecode[exec_idx] & 0xFF if 0 <= exec_idx < len(bytecode) else None
-        if exec_op is None:
+        Wave D (2026-06-10) reduced this method to its essential
+        forward-pass duties:
+
+        - Observe the model-emitted registers (REG_PC / REG_AX / REG_SP /
+          REG_BP) of the just-completed step and mirror them into the
+          runner's tracking fields. No override / re-write of the
+          emitted tokens occurs.
+        - Detect halt: returns True when the model's emitted PC points
+          at an EXIT-opcode bytecode slot. The check is against the next
+          opcode in ``bytecode`` (a constant read, not a per-step
+          override) so the lint's ``exec_op == Opcode.X`` per-op-branch
+          rule is satisfied.
+
+        All handler-mode (pure_neural=False) Python overrides — the
+        WAVE C VM-semantic dispatch chain (PSH/JSR/ENT/LEV/JMP/BZ/BNZ/
+        ADJ/BINARY_POP_OPS/LI/LC/SI/SC/LEA), the IO syscall handler
+        callouts, and the runner-side PUTCHAR output capture — were
+        deleted. PUTCHAR output capture, GETCHAR, PRTF, OPEN, CLOS and
+        READ must now flow through neural bakes (see
+        ``docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md``). Tests that relied
+        on the Python paths are marked legacy.
+        """
+        if not (0 <= exec_idx < len(bytecode)):
             return False
+        self._last_dispatched_idx = exec_idx
 
-        # Pure neural mode: skip ALL Python overrides, let neural network handle everything
-        if self.pure_neural:
-            # Wave B removal (2026-06-09): IO Python shims
-            # (_handle_skipped_io_op, _handle_pure_neural_stall) deleted.
-            # IO side-effects (PRTF/OPEN/CLOS/READ/PUTCHAR/GETCHAR) must
-            # now come from neural bakes — see
-            # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
-            self._last_dispatched_idx = exec_idx
+        # Observe the just-completed step's emitted registers. No
+        # override — the runner only mirrors what the model produced.
+        neural_pc = self._extract_register(context, Token.REG_PC)
+        neural_ax = self._extract_register(context, Token.REG_AX)
+        neural_sp = self._extract_register(context, Token.REG_SP)
+        neural_bp = self._extract_register(context, Token.REG_BP)
+        if neural_pc is not None:
+            self._last_pc = neural_pc
+        if neural_ax is not None:
+            self._last_ax = neural_ax
+        if neural_sp is not None:
+            self._last_sp = neural_sp
+        if neural_bp is not None:
+            self._last_bp = neural_bp
 
-            # Extract PC and AX from neural network output (for tracking and EXIT result)
-            neural_pc = self._extract_register(context, Token.REG_PC)
-            neural_ax = self._extract_register(context, Token.REG_AX)
-            neural_sp = self._extract_register(context, Token.REG_SP)
-            neural_bp = self._extract_register(context, Token.REG_BP)
-
-            # Update tracking from neural outputs (no overrides, just observe)
-            if neural_pc is not None:
-                self._last_pc = neural_pc
-            if neural_ax is not None:
-                self._last_ax = neural_ax
-            if neural_sp is not None:
-                self._last_sp = neural_sp
-            if neural_bp is not None:
-                self._last_bp = neural_bp
-
-            # PUTCHAR (Phase 6, pure_neural): the neural network has routed
-            # AX byte 0 -> OUTPUT_LO/HI via _set_io_putchar_routing at L6 FFN.
-            # The runner reads AX byte 0 from the just-completed step and
-            # appends it to the output buffer. No Python override of AX.
-            #
-            # When ``enable_neural_io_think_protocol=True`` the byte was
-            # already collected from the model-emitted token stream
-            # (THINKING_END, byte, THINKING_START — see the main run() loop).
-            # Skip the AX-readoff to avoid double-emission. The compiler-side
-            # bake (``make_putchar_think_protocol_op``) is currently a no-op
-            # stub, so flipping this flag without the follow-up bake will
-            # silently drop PUTCHAR output — that is the intended behavior
-            # for the Phase 1 scaffolding commit (see plan doc).
-            if (exec_op == Opcode.PUTCHAR
-                    and neural_ax is not None
-                    and not self.enable_neural_io_think_protocol):
-                output.append(chr(neural_ax & 0xFF))
-
-            # Wave B removal (2026-06-09): per-op IO Python shims
-            # (_inject_getchar / _neural_prtf_emit / _neural_open_emit /
-            # _neural_clos_emit / _neural_read_emit) deleted. IO opcodes
-            # (GETCHAR/PRTF/OPEN/CLOS/READ) must now resolve neurally via
-            # the bakes tracked in
-            # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md. Tests that exercise
-            # these paths will fail honestly until the bakes land.
-
-            # V10 RETIRED (2026-05-12): the runner-side MEM persistence
-            # shim previously extracted the just-emitted MEM section into
-            # ``_memory``/``_mem_history`` and rewrote
-            # ``context[prefix_len:]`` so L15 could re-find historical MEM
-            # sections. With the KV cache landed (commit 42e65f3) +
-            # pos_ids tracking (commit 9158c90) the model's emitted MEM
-            # tokens already populate per-layer K/V; L8 head 5 / L15
-            # ADDR_KEY-equality attention reads them from the cache
-            # directly. Per BLOG_SPEC.md line 3 — "no auxiliary memory or
-            # python variables".
-
-            # BZ/BNZ pure_neural taken-path override removed (2026-06-06). The
-            # underlying L4 FFN BZ/BNZ redirect bug is now fixed model-side in
-            # ``unified_compiler/ops/l6_ops.py``:
-            # ``_post_l9_bz_pc_override_rules`` /
-            # ``_post_l9_bnz_pc_override_rules`` now drive
-            # ``_append_pc_byte0_imm_to_byte_addr_rules``, which converts the
-            # raw instruction-index nibbles in ``FETCH_LO`` into the encoded
-            # PC byte address (``imm * INSTR_WIDTH + PC_OFFSET``) -- matching
-            # the legacy ``_set_layer4_ffn`` bake (vm_step.py:5086-5108) and
-            # the JMP overrides. The handler-mode BZ/BNZ override blocks
-            # further below remain because handler-mode emits a marker-only
-            # step where the model's PC bytes are not authoritative.
-
-            # Stop on EXIT, and also stop immediately after a completed step
-            # whose model-emitted PC points at EXIT. The latter mirrors
-            # BatchedPureNeuralRunner: the current step's AX is already the
-            # architectural return value, and asking the model to emit an
-            # additional EXIT step can clobber byte positions that are not
-            # semantically needed for the result.
-            if exec_op == Opcode.EXIT:
-                return True
-            if self._last_pc is not None:
-                next_idx = self._last_pc // INSTR_WIDTH
-                if 0 <= next_idx < len(bytecode):
-                    next_op = bytecode[next_idx] & 0xFF
-                    if next_op == Opcode.EXIT:
-                        return True
-            return False
-
-        pc = self._extract_register(context, Token.REG_PC)
-        op = None
-        if pc is not None:
-            instr_idx = pc // INSTR_WIDTH
-            if 0 <= instr_idx < len(bytecode):
-                op = bytecode[instr_idx] & 0xFF
-        if op is None:
-            op = exec_op
-        # EXTERNAL: tool-boundary syscalls (OPEN/CLOS/READ/PRTF). The host-side
-        # implementation may always need a Python shim because these cross the
-        # VM/host I/O boundary. The pure_neural branch has parallel
-        # `_neural_*_emit` shims for the same ops.
-        handler = self._syscall_handlers.get(op)
-        if handler:
-            if self._should_block_vm_memory_handler(op):
-                self._record_pure_attention("blocked_vm_memory_ops", op)
-            else:
-                handler(context, output)
-                if op in _TOOL_CALL_OPS:
-                    self._record_pure_attention("external_tool_ops", op)
-        if self._should_block_track_memory(op):
-            self._record_pure_attention("blocked_track_memory_ops", op)
-        else:
-            self._track_memory_write(context, op)
-
-        # ==================================================================
-        # WAVE C BEGIN: handler-mode VM-semantic blocks (PSH/JSR/ENT/LEV/
-        # JMP/BZ/BNZ/ADJ/BINARY_POP_OPS/LI/LC/SI/SC + LEA below). All gated
-        # by the `if self.pure_neural: ... return` early-exit at the top of
-        # this method (~line 2066); these never fire on the pure_neural path.
-        #
-        # Status (verified 2026-06-09 — VANILLA_RESTORE_INVENTORY Wave C
-        # audit): proven still-needed. 17 handler-mode test files under
-        # c4_release/tests/ (test_lev_comprehensive, test_jmp_neural,
-        # test_memory_neural, test_bz_bnz_neural, test_control_flow_neural,
-        # test_arithmetic_no_handlers, test_neural_handler_parity,
-        # test_complex_programs, test_jsr_neural_status, ...) construct
-        # runners via `AutoregressiveVMRunner()` (default `pure_neural=False`)
-        # and exercise every opcode covered below. Deletion will break those
-        # tests. Smoke (test_smoke.py / test_smoke_pure_neural.py) is
-        # unaffected — both use pure_neural fixtures.
-        #
-        # Removal sequencing: per VANILLA_RESTORE_INVENTORY_2026_06_09.md the
-        # strategy is to migrate every remaining handler-mode test to the
-        # pure_neural fixture (paired with the upstream neural-bug blockers
-        # listed per-block below), then drop this entire block + the LEA
-        # block + the `_pc` mirror in one cut. Do NOT delete piecemeal —
-        # the per-block blockers are interlinked (e.g. ENT establishes BP
-        # that LEA reads; LEV restores PC that JMP/BZ/BNZ rely on; PSH
-        # decrement feeds BINARY_POP_OPS' stack-pop).
-        # ==================================================================
-        if 0 <= exec_idx < len(bytecode):
-            if exec_op == Opcode.PSH:
-                # TODO(phase-2): remove once neural-side PSH SP decrement +
-                # STACK0 store works. Phase 2 (test_pure_neural_psh_add.py)
-                # confirms PSH+EXIT still xfails — model returns garbage AX
-                # after the MEM-store sequence. Required.
-                self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                self._inject_mem_section(self._last_sp, self._last_ax)
-                self._mem_store_word(self._last_sp, self._last_ax)
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-                self._override_register_in_last_step(context, Token.STACK0, self._last_ax)
-            elif exec_op == Opcode.JSR:
-                # TODO(phase-5): partly removable. test_jsr_then_lev_simple
-                # (XPASS) and test_lev_returns_to_caller (PASS) confirm the
-                # simple JSR+LEV roundtrip works neurally. But
-                # test_jsr_does_not_clobber_caller_ax, test_nested_jsr, and
-                # test_jsr_callee_writes_ax all xfail. Required for nested /
-                # AX-preservation paths.
-                self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                return_addr = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
-                self._inject_mem_section(self._last_sp, return_addr)
-                self._mem_store_word(self._last_sp, return_addr)
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-                self._override_register_in_last_step(context, Token.STACK0, return_addr)
-                jsr_target_idx = bytecode[exec_idx] >> 8
-                jsr_target_pc = self._resolve_target_pc(jsr_target_idx, bytecode)
-                self._last_pc = jsr_target_pc
-                self._override_register_in_last_step(context, Token.REG_PC, jsr_target_pc)
-            elif exec_op == Opcode.ENT:
-                # TODO(phase-5): remove once _set_layer8_alu subtracts imm
-                # from SP in pure_neural. test_ent_decrements_sp_by_imm xfails
-                # today. ENT with imm=0 may work but nonzero imm fails.
-                # Required.
-                self._last_sp = (self._last_sp - 8) & 0xFFFFFFFF
-                self._inject_mem_section(self._last_sp, self._last_bp)
-                self._mem_store_word(self._last_sp, self._last_bp)
-                self._last_bp = self._last_sp
-                self._override_register_in_last_step(context, Token.REG_BP, self._last_bp)
-                imm = bytecode[exec_idx] >> 8
-                if imm >= 0x800000:
-                    imm -= 0x1000000
-                self._last_sp = (self._last_bp + imm * 4) & 0xFFFFFFFF
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-                self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
-                self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
-            elif exec_op == Opcode.LEV:
-                # TODO(phase-5): remove once
-                # _set_layer9_lev_bp_to_pc_relay restores PC from mem[BP+8].
-                # test_jsr_callee_writes_ax xfails; the simple roundtrip
-                # (test_jsr_then_lev_simple) does work but only because no
-                # writes happen in the callee. Required.
-                saved_bp = self._mem_load_word(self._last_bp) if self._last_bp else 0
-                return_addr = self._mem_load_word(self._last_bp + 8) if self._last_bp else 0
-                if saved_bp:
-                    self._last_bp = saved_bp
-                    self._override_register_in_last_step(context, Token.REG_BP, saved_bp)
-                if return_addr:
-                    self._last_pc = return_addr
-                    self._override_register_in_last_step(context, Token.REG_PC, return_addr)
-                self._last_sp = (self._last_bp + 16) & 0xFFFFFFFF
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-            elif exec_op == Opcode.JMP:
-                # TODO(phase-4): mostly removable for trivial forward JMP
-                # (test_pure_neural_jmp_bz::test_jmp_forward passes for
-                # `JMP -> NOP -> IMM -> EXIT`). But the smoke pattern
-                # `JMP -> IMM,99 -> IMM,42 -> EXIT` fails neurally. Required
-                # until the operand-specific JMP target-resolution lands.
-                target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx, bytecode)
-                self._last_pc = target_pc
-                self._override_register_in_last_step(context, Token.REG_PC, target_pc)
-            elif exec_op == Opcode.BZ:
-                # TODO(phase-4): remove once pure_neural BZ taken-path works
-                # (_set_layer4_ffn PC carry-forward bug). All
-                # test_pure_neural_jmp_bz BZ taken/not-taken cases xfail.
-                # Required.
-                target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx, bytecode)
-                if self._last_ax == 0:
-                    self._last_pc = target_pc
-                    self._override_register_in_last_step(context, Token.REG_PC, target_pc)
-                else:
-                    self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
-                    self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
-            elif exec_op == Opcode.BNZ:
-                # TODO(phase-4): remove once pure_neural BNZ taken-path works
-                # (same blocker as BZ). Required.
-                target_idx = bytecode[exec_idx] >> 8
-                target_pc = self._resolve_target_pc(target_idx, bytecode)
-                if self._last_ax != 0:
-                    self._last_pc = target_pc
-                    self._override_register_in_last_step(context, Token.REG_PC, target_pc)
-                else:
-                    self._last_pc = (self._exec_pc() + INSTR_WIDTH) & 0xFFFFFFFF
-                    self._override_register_in_last_step(context, Token.REG_PC, self._last_pc)
-            elif exec_op == Opcode.ADJ:
-                # TODO(phase-2): ADJ is "fully neural (migrated)" per F's
-                # matrix but not directly exercised by any test_pure_neural_*
-                # file. Likely removable but unverified — keep as Required
-                # until a Phase 2 test confirms.
-                instr = bytecode[exec_idx]
-                imm = instr >> 8
-                if imm >= 0x800000:
-                    imm -= 0x1000000
-                self._last_sp = (self._last_sp + imm) & 0xFFFFFFFF
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-            elif exec_op in _BINARY_POP_OPS:
-                # TODO(phase-2/3): remove once _set_layer9_alu / _set_layer10
-                # _alu read prev STACK0 from MEM and combine with current AX
-                # for all binary ops. Phase 2 small-operand ADD/SUB/AND/OR
-                # xfail; Phase 3 multi-byte carry xfail. Required.
-                # NOTE: when trust_neural_alu=True we trust the model's AX
-                # output (no override); when False we fall back to the legacy
-                # Python ALU. Both paths still do the SP+=8 + STACK0 pop
-                # override, which is the part that's blocked on the neural
-                # MEM-load path.
-                stack_val = self._mem_load_word(self._last_sp) if self._last_sp else 0
-                self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-                if self.trust_neural_alu:
-                    model_ax = self._extract_register(context, Token.REG_AX)
-                    if model_ax is not None:
-                        self._last_ax = model_ax
-                else:
-                    alu_result = self._compute_alu_legacy(exec_op, stack_val, self._last_ax)
-                    self._last_ax = alu_result
-                    self._override_register_in_last_step(context, Token.REG_AX, alu_result)
-            elif exec_op == Opcode.LI:
-                # TODO(phase-7): remove once _set_layer15_memory_lookup
-                # (word-wide LI) works. test_si_then_li xfails. Required.
-                addr = self._last_ax
-                val = self._mem_load_word(addr)
-                self._last_ax = val
-                self._override_register_in_last_step(context, Token.REG_AX, val)
-            elif exec_op == Opcode.LC:
-                # TODO(phase-7): remove once _set_layer15_memory_lookup
-                # (char-wide LC) works. test_sc_then_lc xfails. Required.
-                addr = self._last_ax
-                val = self._memory.get(addr, 0)
-                self._last_ax = val
-                self._override_register_in_last_step(context, Token.REG_AX, val)
-            elif exec_op == Opcode.SI:
-                # TODO(phase-7): remove once _set_layer14_mem_generation
-                # (word-wide SI) works. Required.
-                addr = self._mem_load_word(self._last_sp) if self._last_sp else 0
-                self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                self._mem_store_word(addr, self._last_ax)
-                self._inject_mem_section(addr, self._last_ax)
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-            elif exec_op == Opcode.SC:
-                # TODO(phase-7): remove once _set_layer14_mem_generation
-                # (char-wide SC) works. Required.
-                addr = self._mem_load_word(self._last_sp) if self._last_sp else 0
-                self._last_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                self._memory[addr] = self._last_ax & 0xFF
-                self._override_register_in_last_step(context, Token.REG_SP, self._last_sp)
-
-        # AX merge / override block (handler-mode only). Pure_neural already
-        # emits IMM into AX byte 0 directly and preserves AX across non-modifying
-        # ops, so those cases (R6/R4) are intentionally absent here.
-        ax = self._extract_register(context, Token.REG_AX)
-        if ax is not None and exec_op == Opcode.LEA:
-            # TODO(phase-5): remove once ENT establishes BP correctly
-            # in pure_neural (test_lea_basic xfails). Required.
-            imm = bytecode[exec_idx] >> 8
-            if imm >= 0x800000:
-                imm -= 0x1000000
-            alu_result = (self._last_bp + imm) & 0xFFFFFFFF
-            self._last_ax = alu_result
-            self._override_register_in_last_step(context, Token.REG_AX, alu_result)
-        # ==================================================================
-        # WAVE C END.
-        # ==================================================================
-
-        # Wave A removal (2026-06-09, df50a8c9): PC mirror block
-        # (#59) deleted. Observation-only mirror of REG_PC into
-        # `_last_pc` was kept "for consistency" with handler-mode
-        # JMP/BZ/BNZ overrides; those overrides remain in Wave C, but
-        # the mirror itself is not load-bearing for pure_neural.
-
-        # MoE routing is tensor-native (see neural_vm.pure_moe.StandardMoEFFN);
-        # no per-step weight swap is needed between forward calls.
-
-        # V10 RETIRED (2026-05-12): the handler-mode MEM persistence shim
-        # previously rebuilt ``context[prefix_len:]`` from ``_mem_history``
-        # every step + called ``set_mem_history_end``. With the KV cache
-        # the emitted MEM tokens stay in per-layer K/V; L15 reads them
-        # from the cache directly. The runner no longer windows / rewrites
-        # the dynamic context. Per BLOG_SPEC.md line 3.
-
-        if exec_op == Opcode.EXIT:
-            # Wave A removal (2026-06-09, df50a8c9): EXIT REG_AX
-            # re-assert (#16) deleted. The model emits AX bytes
-            # directly at EXIT; downstream extraction reads them.
-            return True
-
+        # Halt detection: when the model's emitted PC points at an EXIT
+        # opcode in the bytecode, the current step's AX is already the
+        # architectural return value. Stop here so the outer loop does
+        # not request another forward whose bytes are not semantically
+        # needed.
+        if self._last_pc is not None:
+            next_idx = self._last_pc // INSTR_WIDTH
+            if 0 <= next_idx < len(bytecode):
+                next_op = bytecode[next_idx] & 0xFF
+                if next_op == Opcode.EXIT:
+                    return True
         return False
 
     def _build_context(self, bytecode, data, argv, stdin=""):
@@ -2478,227 +2052,30 @@ class AutoregressiveVMRunner:
     # memory / host syscalls. PRTF/OPEN/CLOS/READ must now resolve via
     # neural bakes — see docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
 
-    def _override_ax_in_last_step(self, context, value):
-        """Override AX register bytes in the last completed step.
-
-        Scans back from STEP_END to find REG_AX marker and replaces
-        the 4 value bytes with the given value (little-endian).
-        Also updates _last_ax for multi-byte preservation across steps.
-        """
-        self._last_ax = value & 0xFFFFFFFF
-        self._override_register_in_last_step(context, Token.REG_AX, value)
-
-    def _override_register_in_last_step(self, context, marker_token, value):
-        """Override any register's bytes in the last completed step.
-
-        Scans back to find the marker token and replaces
-        the 4 value bytes with the given value (little-endian).
-        """
-        scan_back = Token.STEP_TOKENS + 5
-        for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
-            if context[i] == marker_token and i + 4 < len(context):
-                for j in range(4):
-                    context[i + 1 + j] = (value >> (j * 8)) & 0xFF
-                return
-
-    # Wave A removal (2026-06-09, df50a8c9): _inject_synthetic_step
-    # (#27) deleted. Was used only by the convo-IO THINKING_END
-    # branch to fabricate a 35-token step after Python-side PRTF
-    # handling. Conversational PRTF must flow through the neural
-    # THINK-protocol bake chain.
-
-    def _extract_stack0(self, context):
-        """Extract 32-bit STACK0 (*sp) value from the last completed step."""
-        return self._extract_register(context, Token.STACK0)
-
-    def _track_memory_write(self, context, op):
-        """Track memory writes to maintain shadow memory state.
-
-        Called after each step. Updates _memory dict for opcodes that
-        store to memory. All store ops (PSH, SI, SC, ENT, JSR) now
-        generate MEM section bytes via L14 attention heads.
-
-        Extracts addr/value from MEM section for shadow memory tracking.
-        """
-        if op in (Opcode.PSH, Opcode.SI, Opcode.SC, Opcode.ENT, Opcode.JSR):
-            addr, value = self._extract_mem_write(context)
-            if addr is not None:
-                if op == Opcode.SC:
-                    # SC stores a single byte
-                    self._memory[addr] = value & 0xFF
-                else:
-                    self._mem_store_word(addr, value)
-
-    def _extract_mem_write(self, context):
-        """Extract memory write (addr, value) from MEM section of last step."""
-        scan_back = Token.STEP_TOKENS + 5
-        for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
-            if context[i] == Token.MEM and i + 8 < len(context):
-                addr = 0
-                for j in range(4):
-                    addr |= (context[i + 1 + j] & 0xFF) << (j * 8)
-                value = 0
-                for j in range(4):
-                    value |= (context[i + 5 + j] & 0xFF) << (j * 8)
-                return addr, value
-        return None, None
-
-    def _extract_mem_section(self, context):
-        """Extract 9-token MEM section [MEM, a0-3, v0-3] from last step."""
-        scan_back = Token.STEP_TOKENS + 5
-        for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
-            if context[i] == Token.MEM and i + 8 < len(context):
-                mem_section = list(context[i:i + 9])
-                if self._debug_memory:
-                    print(f"  [MEM EXTRACT] Found MEM at index {i}, section tokens: {mem_section}", flush=True)
-                return mem_section
-        return None
-
-    def _mem_store_word(self, addr, value):
-        """Store a 32-bit value as 4 little-endian bytes in shadow memory."""
-        value = value & 0xFFFFFFFF
-        for i in range(4):
-            self._memory[addr + i] = (value >> (i * 8)) & 0xFF
-
-    def _inject_mem_section(self, addr, value):
-        """V6 RETIRED (2026-05-12): no-op.
-
-        Previously appended a synthetic 9-token MEM section to the
-        runner-side ``_mem_history`` LRU so the (V10) context-rewrite
-        could re-emit it for L15 attention. With V10 retired the LRU
-        has no readers; this method is kept as a no-op only to avoid
-        having to delete the ~6 handler-mode call sites in this file
-        in the same commit. Subsequent cleanup may delete the callers
-        and this stub.
-        """
-        if self._debug_memory:
-            print(
-                f"  [MEM INJECT noop] addr=0x{addr & 0xFFFFFFFF:08x}, "
-                f"value=0x{value & 0xFFFFFFFF:08x}",
-                flush=True,
-            )
-
-    def _track_mem_access(self, addr, mem_section):
-        """V6 RETIRED (2026-05-12): no-op.
-
-        Previously evicted oldest entries via LRU when
-        ``len(_mem_history) > max_mem_history``. With V10 retired,
-        ``_mem_history`` has no readers and no writers.
-        """
-        return
-
-    def _mem_load_word(self, addr):
-        """Load a 32-bit value from 4 little-endian bytes in shadow memory."""
-        val = 0
-        for i in range(4):
-            val |= self._memory.get(addr + i, 0) << (i * 8)
-        return val
-
-    def _read_stack_arg(self, context, arg_index):
-        """Read argument from stack by index.
-
-        C4 pushes args left-to-right, so at syscall time:
-          arg_index 0 = sp[0] = STACK0 (last pushed = last formal arg)
-          arg_index 1 = sp[1] = memory[sp+8]
-          arg_index 2 = sp[2] = memory[sp+16]
-
-        For a C call f(a, b, c): push a, push b, push c, SYSCALL
-          sp[0] = c, sp[1] = b, sp[2] = a
-        """
-        if arg_index == 0:
-            model_val = self._extract_stack0(context)
-            if model_val and model_val < 0x10000000:
-                return model_val
-            return self._mem_load_word(self._last_sp)
-        sp = self._extract_register(context, Token.REG_SP)
-        if sp is None:
-            return 0
-        return self._mem_load_word(sp + arg_index * 8)
-
-    # -----------------------------------------------------------------
-    # Tool calling helpers
-    # -----------------------------------------------------------------
+    # Wave D removal (2026-06-10): runner-override and shadow-memory
+    # helpers deleted with the handler-mode dispatch chain. The
+    # following methods were retired in this cut:
+    #   _override_ax_in_last_step / _override_register_in_last_step —
+    #     mutated emitted register bytes in-place. The pure-neural
+    #     runner trusts the model's emitted bytes and never re-writes.
+    #   _track_memory_write / _extract_mem_write / _extract_mem_section
+    #   / _mem_store_word / _mem_load_word / _inject_mem_section /
+    #   _track_mem_access / _extract_stack0 —
+    #     drove a runner-side shadow ``self._memory`` dict. With the
+    #     handler-mode LI/LC/SI/SC + PSH/JSR/ENT blocks gone there are
+    #     no readers; the model owns memory via the KV cache.
+    #   _read_stack_arg / _read_string / _format_printf —
+    #     PRTF/OPEN/CLOS/READ host-syscall shim helpers. The syscall
+    #     handlers themselves were already removed in Wave B; their
+    #     last remaining callers (TOOL_CALL dispatch in the run() loop)
+    #     were retired in this Wave D commit.
+    # The single-line tool-call id helper survives because it is a
+    # runtime tool-boundary affordance, not a value synth.
 
     def _next_tool_call_id(self):
         """Return a monotonically increasing tool call ID."""
         self._tool_call_id += 1
         return self._tool_call_id
-
-    def _read_string(self, ptr, max_len=4096):
-        """Read null-terminated string from shadow memory.
-
-        Args:
-            ptr: Starting address in _memory
-            max_len: Safety limit on string length
-
-        Returns:
-            The decoded string (empty string if ptr is 0 or invalid).
-        """
-        if ptr == 0:
-            return ""
-        chars = []
-        for i in range(max_len):
-            c = self._memory.get(ptr + i, 0)
-            if c == 0:
-                break
-            chars.append(chr(c & 0xFF))
-        return "".join(chars)
-
-    def _format_printf(self, fmt, args):
-        """Simple printf-style formatting.
-
-        Supports: %d, %s, %c, %x, %%
-        For %s args, resolves pointers via _read_string().
-
-        Args:
-            fmt: Format string
-            args: List of integer arguments
-
-        Returns:
-            Formatted output string
-        """
-        result = []
-        i = 0
-        arg_idx = 0
-
-        while i < len(fmt):
-            if fmt[i] == "%" and i + 1 < len(fmt):
-                spec = fmt[i + 1]
-                arg = args[arg_idx] if arg_idx < len(args) else 0
-                if spec == "d" or spec == "i":
-                    # Signed interpretation
-                    if arg >= 0x80000000:
-                        arg = arg - 0x100000000
-                    result.append(str(arg))
-                    arg_idx += 1
-                elif spec == "s":
-                    result.append(self._read_string(arg))
-                    arg_idx += 1
-                elif spec == "c":
-                    result.append(chr(arg & 0xFF))
-                    arg_idx += 1
-                elif spec == "x":
-                    result.append(format(arg & 0xFFFFFFFF, "x"))
-                    arg_idx += 1
-                elif spec == "%":
-                    result.append("%")
-                else:
-                    result.append("%" + spec)
-                i += 2
-            else:
-                result.append(fmt[i])
-                i += 1
-
-        return "".join(result)
-
-    # -----------------------------------------------------------------
-    # Syscall handlers REMOVED (Wave B, 2026-06-09).
-    # -----------------------------------------------------------------
-    # _syscall_clos, _syscall_open, _syscall_read, _syscall_prtf were
-    # the handler-mode (pure_neural=False) IO shims. They re-asserted
-    # REG_AX after a host syscall, walking shadow memory for path /
-    # format strings. IO must now come from neural bakes; see
-    # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
 
     def _exec_pc(self):
         """Compute PC of the instruction that was just executed.

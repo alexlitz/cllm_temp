@@ -20,6 +20,11 @@ from neural_vm.weight_modules import FunctionCallWeights, WeightConfig
 from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 from src.compiler import compile_c
 
+# Wave D (2026-06-10): ENT/LEV handler-mode tests. Retired with the Python
+# stack-frame dispatch chain. Auto-skipped by conftest.py; opt in via
+# `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 
 class TestENTLEVBasicBehavior:
     """Test basic ENT/LEV functionality."""

@@ -151,6 +151,7 @@ markers = [
     "validator: declarative verifier tests (static claims + dynamic produces/consumes). Run with `pytest -m validator`. Skipped by default in smoke since the verifier adds ~60s wall.",
     "validator_strict: declarative verifier strict-mode tests (flag UNDECLARED WRITEs as failures). Opt-in nightly only.",
     "lowering: cheap declarative-to-weight lowering equivalence checks that should run before neural smoke.",
+    "legacy: marks tests that relied on the retired handler-mode Python ALU/CMP/IO dispatch chain (Wave D, 2026-06-10). They are auto-skipped by default — opt in via `pytest -m legacy`. The runner is now a pure forward-pass wrapper per VANILLA_RESTORE_INVENTORY_2026_06_09; tests that asserted Python-side semantics are no longer applicable to the vanilla thesis.",
 ]
 filterwarnings = [
     "ignore::DeprecationWarning",

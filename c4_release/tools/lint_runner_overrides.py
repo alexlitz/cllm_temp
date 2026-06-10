@@ -185,8 +185,13 @@ _CLEAN_RUNNERS: Tuple[str, ...] = (
 # override at run_vm.py:2273-2288) contributes multiple overrides as
 # it calls ``_override_register_in_last_step`` several times.
 _BASELINE: Dict[str, Tuple[int, int, int]] = {
-    "c4_release/neural_vm/run_vm.py": (115, 13, 21),
-    "c4_release/neural_vm/batched_pure_neural.py": (18, 23, 11),
+    # Wave D (2026-06-10): all runners cleared to (0, 0, 0). Handler-mode
+    # dispatch chain + IO shims + shadow memory + per-op classification
+    # constants + PUTCHAR/EXIT per-op branches all retired. The runners
+    # are now pure forward-pass wrappers — any non-zero hit on a future
+    # PR is a brand-new override that the ratchet must reject.
+    "c4_release/neural_vm/run_vm.py": (0, 0, 0),
+    "c4_release/neural_vm/batched_pure_neural.py": (0, 0, 0),
     "c4_release/neural_vm/fast_runner.py": (0, 0, 0),
     "c4_release/neural_vm/batch_runner.py": (0, 0, 0),
     "c4_release/neural_vm/batch_runner_v2.py": (0, 0, 0),

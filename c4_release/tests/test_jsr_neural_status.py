@@ -20,6 +20,10 @@ import pytest
 from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.embedding import Opcode
 
+# Wave D (2026-06-10): JSR handler-mode tests. Retired with the Python
+# dispatch chain. Auto-skipped by conftest.py; opt in via `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 
 def make_bytecode(ops):
     """Convert operation list to bytecode."""

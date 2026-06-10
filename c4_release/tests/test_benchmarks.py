@@ -10,6 +10,11 @@ Run with:
 
 import pytest
 
+# Wave D (2026-06-10): benchmark suite ran the runner without
+# `pure_neural=True`, exercising the retired handler-mode dispatch.
+# Auto-skipped by conftest.py; opt in via `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 # Try to import benchmark fixture
 try:
     import pytest_benchmark  # noqa: F401

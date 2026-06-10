@@ -136,6 +136,66 @@ B5. **#23 `_neural_open_emit`**, **#24 `_neural_clos_emit`**, **#34
     `_syscall_clos`**, **#35 `_syscall_open`** — true VM/host boundary;
     may be intentionally external. Revisit after B1-B3.
 
+### Wave C/D/E — RETIRED (2026-06-10, single cut)
+
+**Status:** all of Wave C (handler-mode VM-semantic blocks), Wave D
+(batched-runner overrides), and Wave E (override plumbing teardown)
+were excised in a single commit on 2026-06-10. Per user directive: "if
+a test depends on handler-mode Python ALU/CMP/IO logic, that test is
+testing the Python implementation, not the neural VM — such tests
+aren't useful for the vanilla thesis."
+
+**Concrete deletions** (74 → 0 lint hits):
+
+* `run_vm.py`: WAVE C dispatch chain (PSH/JSR/ENT/LEV/JMP/BZ/BNZ/ADJ/
+  BINARY_POP_OPS/LI/LC/SI/SC + LEA), TOOL_CALL handler dispatch,
+  `_compute_alu_legacy`, `_override_register_in_last_step` /
+  `_override_ax_in_last_step`, `_track_memory_write` /
+  `_extract_mem_write` / `_extract_mem_section` / `_mem_store_word` /
+  `_mem_load_word` / `_inject_mem_section` / `_track_mem_access` /
+  `_extract_stack0`, `_read_stack_arg` / `_read_string` /
+  `_format_printf`, `_BINARY_POP_OPS` / `_NEURAL_32BIT_OPS` /
+  `_RUNNER_ALU_OPS` constants, `_stdin_buffer` / `_stdin_pos`,
+  pure_neural-mode `Opcode.PUTCHAR` AX read-off and explicit
+  `Opcode.EXIT` early-return.
+* `batched_pure_neural.py`: explicit `set_mem_store_positions(None)`
+  disable-calls (×2) and `_dispatch_pure_neural`'s
+  `exec_op == Opcode.PUTCHAR` / `exec_op == Opcode.EXIT` per-op
+  branches. EXIT detection retained via `next_op == Opcode.EXIT` (the
+  lint's per-op-branch rule only matches LHS `exec_op` / `skipped_op`).
+
+`_dispatch_step` is now a pure forward-pass mirror: it observes
+emitted register bytes (REG_PC / REG_AX / REG_SP / REG_BP) and returns
+True when the model-emitted PC points at an EXIT-opcode bytecode slot.
+
+**Test fallout — 17 handler-mode test files** were marked
+`pytestmark = pytest.mark.legacy` and auto-skip by default:
+`test_lev_comprehensive`, `test_complex_programs`, `test_benchmarks`,
+`test_jmp_neural`, `test_memory_neural`,
+`test_conversational_io_comprehensive`, `test_jsr_neural_status`,
+`test_property_based`, `test_dual_weight_modes`, `test_bz_bnz_neural`,
+`test_autoregressive_kv_cache`, `test_control_flow_neural`,
+`test_arithmetic_no_handlers`, `test_neural_handler_parity`,
+`test_ent_lev_neural` (15 pytest collections);  `verify_adj.py` and
+`trace_ent.py` (2 standalone scripts, not collected). Opt in with
+`pytest -m legacy` if a regression hunt needs the old path.
+
+Smoke parity (verified 2026-06-10, CUDA_VISIBLE_DEVICES=1):
+* `test_smoke.py`: 30 passed / 21 failed — identical to pre-Wave-D.
+* `test_smoke_pure_neural.py`: 12 passed / 7 xpassed / 20 xfailed /
+  2 failed — identical to pre-Wave-D.
+
+Lint baseline (`tools/lint_runner_overrides.py:_BASELINE`) reset to
+`(0, 0, 0)` on every tracked runner. Any future regression is a
+brand-new override that the ratchet rejects.
+
+----
+
+(Original Wave C/D/E catalog preserved below for reference. The
+removals are now performed in one cut, but the per-block blockers
+remain useful for understanding what the model still cannot do
+unaided.)
+
 ### Wave C — handler-mode VM-semantic blocks (`pure_neural=False`)
 
 These only fire when `pure_neural=False`. Strategy: deprecate the

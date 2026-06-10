@@ -24,6 +24,12 @@ from neural_vm.run_vm import AutoregressiveVMRunner
 from neural_vm.embedding import Opcode
 from neural_vm.constants import idx_to_pc
 
+# Wave D (2026-06-10): this file exercises the retired handler-mode
+# Python LEV dispatch (BP/PC restore from shadow memory). Auto-skipped
+# by conftest.py; opt in via `pytest -m legacy`. See
+# VANILLA_RESTORE_INVENTORY_2026_06_09.md.
+pytestmark = pytest.mark.legacy
+
 
 class TestLEVBasic:
     """Basic LEV tests - function returns with AX preservation."""

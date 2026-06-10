@@ -102,10 +102,15 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "quine: marks quine-specific tests")
     config.addinivalue_line("markers", "bundler: marks bundler tests")
     config.addinivalue_line("markers", "dual: marks tests that run with both weight modes")
+    config.addinivalue_line(
+        "markers",
+        "legacy: handler-mode-only tests retired by Wave D (2026-06-10). "
+        "Auto-skipped unless `pytest -m legacy` is requested.",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip GPU and opt-in slow tests."""
+    """Auto-skip GPU, slow, and legacy (Wave D, 2026-06-10) tests."""
     if not HAS_GPU:
         skip_gpu = pytest.mark.skip(reason="No GPU available")
         for item in items:
@@ -117,6 +122,23 @@ def pytest_collection_modifyitems(config, items):
         if slow_items:
             items[:] = [item for item in items if item not in slow_items]
             config.hook.pytest_deselected(items=slow_items)
+
+    # Legacy (handler-mode) tests: skip by default. The retired Python
+    # ALU/CMP/IO dispatch chain is gone — these tests have no neural-VM
+    # value. Opt in with `pytest -m legacy` to confirm they still fail.
+    selected_markers = config.getoption("-m") or ""
+    if "legacy" not in selected_markers:
+        skip_legacy = pytest.mark.skip(
+            reason=(
+                "handler-mode-only test (Wave D, 2026-06-10): the runner-side "
+                "Python ALU/CMP/IO dispatch chain was retired per "
+                "VANILLA_RESTORE_INVENTORY_2026_06_09. Run with "
+                "`pytest -m legacy` to opt in."
+            )
+        )
+        for item in items:
+            if "legacy" in item.keywords:
+                item.add_marker(skip_legacy)
 
 
 # =============================================================================

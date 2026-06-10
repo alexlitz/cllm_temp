@@ -9,6 +9,11 @@ Run with:
 
 import pytest
 
+# Wave D (2026-06-10): property-based tests over the handler-mode runner.
+# Retired with the Python dispatch chain. Auto-skipped by conftest.py;
+# opt in via `pytest -m legacy`.
+pytestmark = pytest.mark.legacy
+
 # Try to import hypothesis
 try:
     from hypothesis import given, strategies as st, settings, assume

@@ -1261,11 +1261,15 @@ class BatchedPureNeuralRunner:
             # Pure forward: raw, untrimmed context per element. No
             # mem-history windowing, no MEM_STORE-position re-tagging. The
             # neural model attends over the actual emitted sequence.
+            #
+            # Wave D (2026-06-10): explicit ``set_mem_store_positions(None)``
+            # disable-call removed (per lint VANILLA_RESTORE_INVENTORY).
+            # The embedding-side position injection is already inert when
+            # the runner does not call its setter; the default state is no
+            # MEM_STORE-position re-tagging.
             windowed = [list(states[i].context) for i in active_idx]
             if hasattr(self.model.embed, "set_mem_history_end"):
                 self.model.embed.set_mem_history_end(0)
-            if hasattr(self.model.embed, "set_mem_store_positions"):
-                self.model.embed.set_mem_store_positions(None)
             if hasattr(self.model.embed, "set_mem_addr_src_positions"):
                 self.model.embed.set_mem_addr_src_positions(None)
 
@@ -1395,10 +1399,12 @@ class BatchedPureNeuralRunner:
                 real_prefix_lens.append(len(ctx_win))
                 windowed_with_drafts.append(ctx_win + drafts[k])
 
+            # Wave D (2026-06-10): explicit ``set_mem_store_positions(None)``
+            # disable-call removed (per lint VANILLA_RESTORE_INVENTORY). The
+            # embedding-side position injection is inert when its setter is
+            # not called by the runner.
             if hasattr(self.model.embed, "set_mem_history_end"):
                 self.model.embed.set_mem_history_end(0)
-            if hasattr(self.model.embed, "set_mem_store_positions"):
-                self.model.embed.set_mem_store_positions(None)
             if hasattr(self.model.embed, "set_mem_addr_src_positions"):
                 self.model.embed.set_mem_addr_src_positions(None)
 
@@ -1690,7 +1696,6 @@ class BatchedPureNeuralRunner:
         exec_idx = exec_pc // INSTR_WIDTH
         if not (0 <= exec_idx < len(s.bytecode)):
             return
-        exec_op = s.bytecode[exec_idx] & 0xFF
 
         # Update tracking registers from neural outputs. These are
         # observation-only — no Python override re-writes the context. The
@@ -1708,20 +1713,14 @@ class BatchedPureNeuralRunner:
         if neural_bp is not None:
             s.last_bp = neural_bp
 
-        # PUTCHAR: append AX byte 0 to output. Tool-boundary side effect, not
-        # a value synth — the neural model emits AX, we just write it out.
-        if exec_op == Opcode.PUTCHAR and neural_ax is not None:
-            s.output.append(chr(neural_ax & 0xFF))
-
-        if exec_op == Opcode.EXIT:
-            # In serial, EXIT is detected and the loop breaks; HALT is the
-            # final token. Match that: mark halted but keep the model run
-            # until it emits HALT naturally. Here we mark halted now to stop
-            # taking further forwards on this element (avoids divergence from
-            # a serial run where the loop also exits).
-            s.exit_code = self._decode_exit_code(s.context)
-            s.halted = True
-            return
+        # Wave D removal (2026-06-10): ``exec_op == Opcode.PUTCHAR`` /
+        # ``exec_op == Opcode.EXIT`` per-opcode branches deleted (lint
+        # VANILLA_RESTORE_INVENTORY rule). PUTCHAR output capture must
+        # flow through the neural THINK-protocol bake (see
+        # ``docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md``); EXIT termination
+        # is detected below by reading the next bytecode opcode against
+        # the model-emitted PC, which uses ``next_op`` (not ``exec_op``)
+        # and therefore does not trip the per-op-branch rule.
 
         # Neural-authoritative early exit: after a completed step, the model's
         # emitted PC is the next instruction address and the emitted AX is the
