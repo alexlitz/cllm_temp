@@ -76,6 +76,75 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_disable_alu_recovery_ops() -> frozenset:
+    """Parse ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS`` into a frozenset of opcode ints.
+
+    The env var is a comma-separated list of opcode NAMES (e.g.
+    ``"ADD,SUB,EQ"``). Unknown / empty entries are silently skipped. An
+    empty / unset env var yields the empty frozenset (no per-op disables).
+
+    Used together with ``C4_DISABLE_BATCHED_ALU_RECOVERY`` to incrementally
+    remove the Python ALU recovery overrides one op-cluster at a time as
+    upstream neural fixes land. See
+    ``docs/SERIAL_MODE_DIVERGENCE_ATTRIBUTION_2026_06_09.md`` §7 for the
+    rollout protocol.
+    """
+    raw = os.environ.get("C4_DISABLE_BATCHED_ALU_RECOVERY_OPS", "")
+    if not raw.strip():
+        return frozenset()
+    ops: set = set()
+    for tok in raw.split(","):
+        name = tok.strip().upper()
+        if not name:
+            continue
+        opcode = getattr(Opcode, name, None)
+        if opcode is None:
+            continue
+        ops.add(int(opcode))
+    return frozenset(ops)
+
+
+# Global on/off toggle for the Python ALU recovery overrides in
+# ``_dispatch_pure_neural`` (collapsed-step + non-collapsed paths). When
+# ``C4_DISABLE_BATCHED_ALU_RECOVERY`` is set (``1``/``true``/...), the
+# runner skips ALL ``_compute_alu_legacy`` rescues and trusts the raw
+# neural AX emit unconditionally. Default ``False`` keeps the legacy
+# cheat in place so smoke ~46/51 baseline does not regress.
+_DISABLE_BATCHED_ALU_RECOVERY = _env_flag("C4_DISABLE_BATCHED_ALU_RECOVERY", False)
+
+# Per-op disable set. When non-empty, ONLY these opcodes skip the recovery;
+# every other op in ``_BINARY_POP_OPS`` continues to receive the legacy
+# Python cheat. This lets a fix agent verify a single neural cluster
+# (e.g. ``ADD,SUB`` for the 32-bit cascade) without breaking the rest of
+# the smoke gate.
+_DISABLE_BATCHED_ALU_RECOVERY_OPS = _parse_disable_alu_recovery_ops()
+
+
+def _alu_recovery_disabled_for(op: int) -> bool:
+    """Return True if the Python ALU recovery should be skipped for ``op``.
+
+    Honors both the global ``C4_DISABLE_BATCHED_ALU_RECOVERY`` toggle and
+    the per-op ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS`` allow-list. Re-reads
+    the environment each call so tests can flip the toggle at runtime via
+    ``monkeypatch.setenv`` without re-importing the module.
+    """
+    if _env_flag("C4_DISABLE_BATCHED_ALU_RECOVERY", _DISABLE_BATCHED_ALU_RECOVERY):
+        return True
+    raw = os.environ.get("C4_DISABLE_BATCHED_ALU_RECOVERY_OPS")
+    if raw is None:
+        ops = _DISABLE_BATCHED_ALU_RECOVERY_OPS
+    else:
+        ops = _parse_disable_alu_recovery_ops()
+    return int(op) in ops
+
+
 _ADAPTIVE_START_K = max(1, _env_int("C4_ADAPTIVE_START_K", 32))
 _ADAPTIVE_MIN_K = max(1, _env_int("C4_ADAPTIVE_MIN_K", 1))
 _ADAPTIVE_MAX_K = max(_ADAPTIVE_MIN_K, _env_int("C4_ADAPTIVE_MAX_K", 64))
@@ -2171,7 +2240,13 @@ class BatchedPureNeuralRunner:
             if (post_idx == skipped_idx + 1
                     and 0 <= skipped_idx < len(s.bytecode)):
                 skipped_op = s.bytecode[skipped_idx] & 0xFF
-                if skipped_op in _BINARY_POP_OPS:
+                # Incremental-removal toggle: skip the Python cheat if the
+                # caller opted ``skipped_op`` out via
+                # ``C4_DISABLE_BATCHED_ALU_RECOVERY`` (all ops) or
+                # ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS`` (comma-separated
+                # opcode names). Raw neural AX flows through unchanged.
+                if (skipped_op in _BINARY_POP_OPS
+                        and not _alu_recovery_disabled_for(skipped_op)):
                     # AX after the just-executed IMM = the IMM's imm value.
                     imm_val = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
                     if imm_val >= 0x800000:
@@ -2242,7 +2317,12 @@ class BatchedPureNeuralRunner:
             Opcode.ADD, Opcode.SUB, Opcode.OR, Opcode.XOR, Opcode.AND,
             Opcode.EQ, Opcode.NE,
         )
+        # Incremental-removal toggle: ``C4_DISABLE_BATCHED_ALU_RECOVERY``
+        # (global) or ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS=<names>`` (per
+        # op) skip the legacy Python ALU rescue and let the raw neural AX
+        # stand. Default: both empty → cheat stays enabled.
         if (exec_op in _NON_COLLAPSED_RECOVERY_OPS
+                and not _alu_recovery_disabled_for(exec_op)
                 and s.last_pushed_value is not None
                 and prev_ax is not None):
             stack_val = int(s.last_pushed_value) & 0xFFFFFFFF

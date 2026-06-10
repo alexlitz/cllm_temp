@@ -136,3 +136,65 @@ investigate per opcode family:
 
 Removing the Python recovery before the neural fix lands will re-fail
 the batched smoke gate for these 16 tests.
+
+## 7. Incremental-removal toggle (task #133, 2026-06-09)
+
+Removing the recovery code in one commit would regress smoke from
+"46/51 with cheats" to fewer-pass-without-cheats and force every fix
+agent to land simultaneously. Instead the recovery now consults two
+env vars so each cluster can be retired independently as its upstream
+neural fix lands.
+
+### 7.1 Env vars
+
+| Env var | Type | Default | Effect |
+|---|---|---|---|
+| `C4_DISABLE_BATCHED_ALU_RECOVERY` | bool (`1`/`true`/`yes`/`on`) | `0` | When set, BOTH recovery branches (collapsed + non-collapsed) skip `_compute_alu_legacy` for every op. Raw neural AX flows through. |
+| `C4_DISABLE_BATCHED_ALU_RECOVERY_OPS` | comma-separated opcode names | _empty_ | When non-empty, ONLY these ops skip recovery. Every other op in `_BINARY_POP_OPS` continues to receive the cheat. Unknown names are silently skipped. Case-insensitive; whitespace tolerated. |
+
+Both vars are checked at every dispatch call (re-read from
+`os.environ`), so tests can flip them at runtime via
+`monkeypatch.setenv` without re-importing the module.
+
+Defaults preserve the 2026-06-09 smoke ~46/51 baseline — the recovery
+code is NOT removed, only gated.
+
+### 7.2 Rollout protocol
+
+For each cluster owner in §6:
+
+1. Land the upstream neural fix (e.g. ADD/SUB `layer9_alu` + L17
+   correction). Confirm `replay_expected_diff` no longer flags the
+   relevant `OUTPUT_LO`/`OUTPUT_HI` divergence at the targeted layer.
+2. Run smoke locally with the per-op selector enabled for the
+   cluster's opcodes:
+
+   ```
+   C4_DISABLE_BATCHED_ALU_RECOVERY_OPS=ADD,SUB \
+       pytest tests/test_smoke.py -v
+   ```
+
+   Pass criteria: cluster tests pass WITHOUT the recovery; every other
+   smoke test still passes (the other ops still get the cheat).
+
+3. Once all 5 clusters are toggled off independently, flip the global
+   `C4_DISABLE_BATCHED_ALU_RECOVERY=1` for a final smoke run. When
+   that is green, a separate cleanup commit can delete the recovery
+   code outright.
+
+### 7.3 Test coverage
+
+`tests/test_batched_alu_recovery_toggle.py` verifies:
+
+- Env-var parsing (empty, well-formed, whitespace/case, unknown names).
+- `_alu_recovery_disabled_for` honors both the global flag and the
+  per-op selector.
+- Collapsed-step recovery path (`batched_pure_neural.py:2218-2264`)
+  actually consults the toggle — when disabled, `_compute_alu_legacy`
+  is NOT invoked and AX is NOT rewritten with the sentinel.
+- Non-collapsed recovery path (`batched_pure_neural.py:2266-2335`)
+  consults the toggle the same way.
+
+The dispatch is exercised with a stubbed `_serial` so no GPU / model
+build is required.
+
