@@ -41,6 +41,48 @@ byte-identity gate:
 >>> tensor.shape
 torch.Size([64])
 
+STEP_END residuals
+------------------
+
+The :func:`state_at_step_end` sibling models the *STEP_END token's*
+residual — the broadcast target of the L0/L1 relay (per
+``tools/probe_step_end_completeness.py``). Use it when verifying
+ALU/CMP/branch-decision migrations that move heavy compute off
+MARK_AX onto STEP_END:
+
+>>> # Same EQ-ready demo, but for the STEP_END position.
+>>> se = state_at_step_end([IMM(5), PSH, IMM(5), EQ, EXIT], step=3)
+>>> se["OP_EQ+0"]            # step 3's opcode (relayed)
+1.0
+>>> se["AX_CARRY_LO+5"]      # AX byte 0 lo nibble (operand B = 5)
+1.0
+>>> se["STACK0_BYTE0_LO+5"]  # STACK0 byte 0 lo nibble (operand A = 5)
+1.0
+>>> se["MARK_SE+0"]          # the STEP_END row marker
+1.0
+
+One step later, the previous step's CMP cascade flags are still in
+the relay window (the L9 cmp_default clear has not yet fired for
+the next CMP step):
+
+>>> se4 = state_at_step_end([IMM(5), PSH, IMM(5), EQ, EXIT], step=4)
+>>> se4["CMP+1"], se4["CMP+2"]  # hi_eq + lo_eq fired during EQ
+(1.0, 1.0)
+>>> se4["ALU_LO+5"]              # operand A's lo nibble was 5
+1.0
+
+Pass the dict straight to :func:`~.ir.compare_symbolic_to_lowered_ffn`
+to byte-identity-gate a migrated STEP_END-scoped rule:
+
+>>> from c4_release.neural_vm.unified_compiler.ir import (
+...     CompilerIR, compare_symbolic_to_lowered_ffn,
+... )
+>>> # Build an IR with the migrated rule, set OP_EQ to its silu
+>>> # pre-image, then compare symbolic vs lowered FFN output.
+>>> # See tests/test_symbolic_state_builder.py::
+>>> #     test_step_end_composes_with_compare_symbolic_to_lowered_ffn
+>>> # for a worked end-to-end example.
+
 The module intentionally exposes a *narrow* surface: programs in,
 dict (or tensor) out. The heavy lifting (VM semantics, embedding
 projection, byte/nibble decomposition) is all delegated to the
@@ -118,7 +160,9 @@ from .symbolic_forward import (
 __all__ = [
     "Instruction",
     "state_after_program",
+    "state_at_step_end",
     "to_tensor",
+    "to_tensor_at_step_end",
     "describe_state",
     "IMM",
     "PSH",
@@ -150,6 +194,24 @@ __all__ = [
     "LI",
     "SI",
 ]
+
+# Set of opcodes that drive the L9 CMP cascade. The L10 cmp_combine layer
+# folds the four partial flags into a single OUTPUT_LO write at the AX
+# marker; the partial flags themselves are still observable at STEP_END
+# via the L0/L1 relay, which is why they show up in
+# :func:`state_at_step_end` for the *prior* step.
+_CMP_OPCODES = frozenset({OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE})
+
+# Set of opcodes that pop a stack operand into the ALU (so the L9 ALU
+# staging dims ALU_LO/HI hold the popped operand's byte-0 nibbles). We
+# scope the prior-step ALU relay to these — non-ALU steps clear ALU_LO/HI
+# via L9 alu_lo_clear / alu_hi_clear, so the STEP_END residual would not
+# carry an ALU staging value for them.
+_ALU_OPCODES = frozenset({
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD,
+    OP_OR, OP_XOR, OP_AND, OP_SHL, OP_SHR,
+    OP_EQ, OP_NE, OP_LT, OP_GT, OP_LE, OP_GE,
+})
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +497,297 @@ def state_after_program(
             state[k] = float(v)
 
     return state
+
+
+# ---------------------------------------------------------------------------
+# STEP_END residual builder — the L0/L1-relay-aware sibling of
+# ``state_after_program``
+# ---------------------------------------------------------------------------
+#
+# The STEP_END position is the last token of the 35-token VM step window
+# (``POS_STEP_END = 34`` in :mod:`dim_oracle`). Per the architectural
+# directive captured in ``tools/probe_step_end_completeness.py`` the L0/L1
+# relay broadcasts the in-flight operand state to STEP_END so that heavy
+# compute (ALU, CMP combine, branch decisions) can migrate from MARK_AX
+# to STEP_END without losing its inputs.
+#
+# Concretely, at STEP_END for step ``N`` we expect to see:
+#
+#   * ``OP_<NAME>+0`` — step N's opcode (relayed from the PC marker).
+#   * ``AX_CARRY_LO/HI+k`` — AX byte 0 nibbles at the *start* of step N
+#     (i.e. the operand value the upcoming compute reads).
+#   * ``STACK0_BYTE{0..3}_LO/HI+k`` — STACK0 nibbles at the start of
+#     step N.
+#   * ``REG_{AX,SP,BP,PC}_BYTE{h}_LO/HI+k`` — register byte one-hots.
+#   * ``ALU_LO/HI+k`` — the *previous* step's ALU staging (which holds
+#     the popped operand A's byte-0 nibbles for ALU/CMP ops, and is
+#     cleared otherwise).
+#   * ``CMP+0..CMP+3`` — partial comparison flags emitted by the previous
+#     step's CMP cascade (CMP+1=hi_eq, CMP+2=lo_eq, CMP+0=hi_lt,
+#     CMP+3=lo_lt). Zero on non-CMP previous steps.
+#   * ``MARK_SE+0`` — the STEP_END marker itself, so callers that gate
+#     a rule on the STEP_END position can resolve the predicate.
+#   * ``CONST+0`` — the bias dim.
+
+
+def _emit_alu_staging(out: Dict[str, float], top_value: int) -> None:
+    """Emit ALU_LO/HI byte-0 one-hots for the *popped operand A*.
+
+    The L9 ALU layer reads ``ALU_LO+k`` and ``ALU_HI+k`` as the one-hot
+    representation of the popped stack-top's byte-0 nibbles. The relay
+    forwards the same staging to STEP_END so any rule migrated to
+    STEP_END that needs to inspect operand A can read these dims.
+    """
+    byte0 = top_value & 0xFF
+    lo = byte0 & 0x0F
+    hi = (byte0 >> 4) & 0x0F
+    out[f"ALU_LO+{lo}"] = 1.0
+    out[f"ALU_HI+{hi}"] = 1.0
+
+
+def _emit_ax_carry(out: Dict[str, float], ax_value: int) -> None:
+    """Emit AX_CARRY_LO/HI byte-0 one-hots for the operand B (= AX).
+
+    Mirrors :func:`dim_oracle._emit_ax_carry_at_marker` but in the
+    bag-of-dims form (no per-token position). AX_CARRY is the L3
+    carry-forward head's projection of AX byte 0 — the relay re-broadcasts
+    it at STEP_END so the migrated compute sees both operands side by
+    side.
+    """
+    byte0 = ax_value & 0xFF
+    lo = byte0 & 0x0F
+    hi = (byte0 >> 4) & 0x0F
+    out[f"AX_CARRY_LO+{lo}"] = 1.0
+    out[f"AX_CARRY_HI+{hi}"] = 1.0
+
+
+def _emit_prev_step_cmp_flags(
+    out: Dict[str, float], prev_top: int, prev_ax: int,
+) -> None:
+    """Emit CMP+0..CMP+3 partial flags as if the L9 CMP cascade fired on
+    ``(top=prev_top, ax=prev_ax)``.
+
+    Used to project the previous step's CMP staging into the current
+    step's STEP_END residual. Matches :func:`_layer9_cmp_rules`:
+
+      * CMP+0: ``hi_lt`` — high nibble of top < high nibble of ax.
+      * CMP+1: ``hi_eq`` — high nibbles equal.
+      * CMP+2: ``lo_eq`` — low nibbles equal.
+      * CMP+3: ``lo_lt`` — low nibble of top < low nibble of ax.
+
+    The caller decides *when* to fire these (only after a CMP op);
+    this helper is the pure flag computation.
+    """
+    a_byte0 = prev_top & 0xFF
+    b_byte0 = prev_ax & 0xFF
+    a_hi = (a_byte0 >> 4) & 0x0F
+    a_lo = a_byte0 & 0x0F
+    b_hi = (b_byte0 >> 4) & 0x0F
+    b_lo = b_byte0 & 0x0F
+    out["CMP+0"] = 1.0 if a_hi < b_hi else 0.0
+    out["CMP+1"] = 1.0 if a_hi == b_hi else 0.0
+    out["CMP+2"] = 1.0 if a_lo == b_lo else 0.0
+    out["CMP+3"] = 1.0 if a_lo < b_lo else 0.0
+
+
+def state_at_step_end(
+    program: Sequence[_InstrLike],
+    step: int,
+    *,
+    code_base: int = 0,
+    initial_sp: int = 0x100000,
+    extra_state: Optional[Mapping[str, float]] = None,
+) -> Dict[str, float]:
+    """Return a symbolic residual dict for the STEP_END position at step
+    ``step`` of ``program``.
+
+    Companion to :func:`state_after_program` (which models the AX-marker
+    position). STEP_END is the last token in the 35-token VM step window
+    where the L0/L1 attention relay deposits the in-flight operand state
+    so that migrated compute (ALU, CMP combine, branch decisions) can
+    read its inputs without an extra cross-marker hop.
+
+    The residual carries:
+
+    * ``OP_<NAME>+0`` for step N's opcode (the step whose compute is
+      in flight at this STEP_END).
+    * ``REG_{AX,SP,BP,PC}_BYTE{h}_LO/HI+k`` and
+      ``STACK0_BYTE{h}_LO/HI+k`` for the register state *at the start*
+      of step N (i.e. the operand state the upcoming compute reads).
+    * ``AX_CARRY_LO/HI+k`` byte-0 nibbles of AX — the carry-forward
+      relay dim consumed by the L9 CMP cascade and L10 ALU rules.
+    * ``ALU_LO/HI+k`` byte-0 nibbles of the *previous* step's popped
+      operand A, when the previous step was an ALU/CMP op (else zero —
+      the L9 ``alu_lo_clear`` / ``alu_hi_clear`` rules wipe these on
+      non-ALU steps).
+    * ``CMP+0..CMP+3`` partial comparison flags from the previous step
+      when that step was a CMP op (matches :func:`_layer9_cmp_rules`).
+    * ``MARK_SE+0`` — the STEP_END marker itself.
+    * ``CONST+0`` — the bias dim every FFN rule keys on.
+
+    Parameters
+    ----------
+    program, step, code_base, initial_sp, extra_state
+        Same semantics as :func:`state_after_program`. ``step`` is the
+        step whose STEP_END position to model (0 <= step < len(program)).
+    extra_state
+        Optional merge-on-top dict (same convention: caller wins on
+        collisions). Useful for sticking in flag dims a migrated rule
+        wants to gate on.
+
+    Returns
+    -------
+    Dict[str, float]
+        Bag-of-dims dict in the canonical ``"NAME+offset"`` form. Pass
+        directly to :func:`~.ir.compare_symbolic_to_lowered_ffn` as
+        ``state=`` — the byte-identity gate accepts the same dict shape
+        used by :func:`state_after_program`.
+
+    Examples
+    --------
+    >>> # The classic EQ-ready demo:
+    >>> state = state_at_step_end(
+    ...     [IMM(5), PSH, IMM(5), EQ, EXIT], step=3,
+    ... )
+    >>> state["OP_EQ+0"]
+    1.0
+    >>> state["AX_CARRY_LO+5"]
+    1.0
+    >>> state["STACK0_BYTE0_LO+5"]
+    1.0
+    >>> # One step later: the EQ result's partial CMP flags are still
+    >>> # in the relay's window.
+    >>> state4 = state_at_step_end(
+    ...     [IMM(5), PSH, IMM(5), EQ, EXIT], step=4,
+    ... )
+    >>> state4["CMP+2"]  # lo_eq fired during the EQ at step 3
+    1.0
+    """
+    if step < 0:
+        raise ValueError(
+            f"state_at_step_end: step must be >= 0, got {step}"
+        )
+    if step >= len(program):
+        raise ValueError(
+            f"state_at_step_end: step {step} is past program end "
+            f"(program has {len(program)} instructions)"
+        )
+
+    encoded = _normalize_program(program)
+
+    oracle = ReferenceOracle(
+        encoded, code_base=code_base, initial_sp=initial_sp,
+    )
+
+    # Register state at the START of step `step` — same convention as
+    # state_after_program. This is the operand state the L0/L1 relay
+    # broadcasts to STEP_END (the values that drive step N's compute).
+    if step == 0:
+        ax = 0
+        sp = initial_sp
+        bp = initial_sp
+        stack0 = 0
+        pc = code_base
+        prev_state = None
+    else:
+        prev = oracle.state_at_step(step - 1)
+        ax = prev.ax
+        sp = prev.sp
+        bp = prev.bp
+        stack0 = prev.stack0
+        pc = prev.pc
+        prev_state = prev
+
+    # Current-step opcode (relayed into STEP_END from the PC marker).
+    op, imm = decode_instr(encoded[step])
+    state: Dict[str, float] = dict(
+        default_embedding_for_instruction(op, imm, pc=pc)
+    )
+
+    # Mark this row as the STEP_END position so a rule scoped to
+    # ``MARK_SE`` can resolve the predicate against the seeded residual.
+    state["MARK_SE+0"] = 1.0
+
+    # Register byte one-hots — operand state for the current step.
+    _emit_register_nibbles(state, "AX", ax)
+    _emit_register_nibbles(state, "SP", sp)
+    _emit_register_nibbles(state, "BP", bp)
+    _emit_register_nibbles(state, "PC", pc)
+    _emit_stack0_nibbles(state, stack0)
+
+    # AX carry-forward staging (operand B for the L9 CMP cascade).
+    _emit_ax_carry(state, ax)
+
+    # PC scalar — match state_after_program's convention.
+    state["PC+0"] = float(pc)
+
+    # ------------------------------------------------------------------
+    # Previous-step staging dims (ALU_LO/HI, CMP).
+    #
+    # These hold the *previous* step's ALU/CMP outputs because the L9
+    # ALU/CMP rules fire at MARK_AX *of the step that owns them* and the
+    # relay carries those values forward into the next step's window
+    # (until the next L9 alu_lo_clear / cmp_default firing wipes them).
+    #
+    # Concretely, at step 4's STEP_END after an EQ at step 3 with
+    # operands 5 and 5: CMP+1 (hi_eq) and CMP+2 (lo_eq) are both 1.0,
+    # ALU_LO+5 and ALU_HI+0 are 1.0 (operand A's byte-0 nibbles), etc.
+    # ------------------------------------------------------------------
+    if prev_state is not None:
+        prev_op = prev_state.opcode
+        if prev_op in _ALU_OPCODES:
+            # The popped operand A at the start of the prior step lived
+            # in STACK0; the prior state's stack0 *post-step* is whatever
+            # is left below. Use the state at start of prev step (= state
+            # after step - 2) to get the value popped by the prior op.
+            if step >= 2:
+                pre_prev = oracle.state_at_step(step - 2)
+                prev_top = pre_prev.stack0
+                prev_ax = pre_prev.ax
+            else:
+                # step == 1 with prev being an ALU op is degenerate
+                # (initial stack is empty), but stay defensive.
+                prev_top = 0
+                prev_ax = 0
+            _emit_alu_staging(state, prev_top)
+            if prev_op in _CMP_OPCODES:
+                _emit_prev_step_cmp_flags(state, prev_top, prev_ax)
+
+    # Caller-supplied overrides last (so they win on collisions, same
+    # contract as state_after_program).
+    if extra_state:
+        for k, v in extra_state.items():
+            state[k] = float(v)
+
+    return state
+
+
+def to_tensor_at_step_end(
+    state: Mapping[str, float],
+    d_model: int,
+    *,
+    dim_positions: Optional[Mapping[str, int]] = None,
+    dtype: Any = None,
+) -> Any:
+    """Tensor helper for STEP_END residuals.
+
+    Thin wrapper around :func:`to_tensor` — kept as a distinct public
+    name so callers reading a test signal intent ("this is a STEP_END
+    residual") without having to read the dict's contents. The layout
+    convention is identical: ``dim_positions[family] + offset`` is the
+    cell index; out-of-range writes drop silently.
+
+    Examples
+    --------
+    >>> state = state_at_step_end([IMM(5), PSH, IMM(5), EQ, EXIT], step=3)
+    >>> layout = {"OP_EQ": 0, "AX_CARRY_LO": 1, "STACK0_BYTE0_LO": 17,
+    ...           "MARK_SE": 33, "CONST": 34}
+    >>> tensor = to_tensor_at_step_end(state, d_model=64,
+    ...                                dim_positions=layout)
+    >>> tensor.shape
+    torch.Size([64])
+    """
+    return to_tensor(state, d_model, dim_positions=dim_positions, dtype=dtype)
 
 
 # ---------------------------------------------------------------------------
