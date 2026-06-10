@@ -95,6 +95,15 @@ class DeclarativeAttentionHeadSpec:
     # head-index mapping. Lowering site:
     # ``Primitives.generate_attention_head(head_base=..., kv_head_base=...)``.
     head_dim: Optional[int] = None
+    # Phase 7.B.7 (AttentionIntent migration): optional declarative
+    # intent that captures the head's Q/K selection semantics. When
+    # set, :meth:`Primitives.generate_attention_head` runs
+    # :func:`verify_attention_intent` at bake time and raises if the
+    # intended K row does not dominate every plausible competitor.
+    # ``None`` (the default) leaves the spec byte-identical with every
+    # pre-7.B.7 baseline — heads that haven't been migrated continue
+    # to bake without intent-side verification.
+    intent: Optional["AttentionIntent"] = None
 
     def effective_head_dim(self, default_HD: int) -> int:
         """Return per-head slot count: ``spec.head_dim`` or ``default_HD``.
@@ -141,6 +150,408 @@ class ThresholdAttentionHeadSpec:
     out_base: int
     slope: float = 10.0
     bd: object = BD
+
+
+# ---------------------------------------------------------------------------
+# AttentionIntent (verifier-friendly Q/K declaration)
+# ---------------------------------------------------------------------------
+#
+# Hand-tuned ``AP(slot, dim, weight)`` writes for Q/K projections caught
+# several K-selection bugs that the existing verifier missed (L5 head 1
+# wrong OPCODE_BYTE, L8 head 4 uniform IMM dilution, L15 head 0 picking
+# STACK0 byte 0 over MEM val byte 0). The root cause was the same in all
+# three: the imperative bake had subtle weight math that looked correct
+# but selected the wrong K row. ``AttentionIntent`` is a high-level
+# declarative form that (a) carries enough structure to synthesize the
+# Q/K writes, and (b) carries enough semantic info that the verifier can
+# run synthetic Q/K positions and assert the intended K is selected.
+
+
+@dataclass(frozen=True)
+class PositionPredicate:
+    """A typed predicate over residual-stream dims at a specific token position.
+
+    The predicate language is intentionally minimal:
+
+    * ``positive_anchors``: dims that MUST be set at the position
+      (logical AND of all).
+    * ``negative_anchors``: dims that MUST NOT be set at the position
+      (the row's score is killed if any fire).
+    * ``binary_match_fields``: declare a multi-bit binary field shared
+      between Q and K positions. Each field is a tuple of
+      ``(label, q_nibble_bases, k_nibble_bases, bits_per_nibble)``: the
+      Q position's nibble band must equal the K position's nibble band
+      for the binary match to score positive. This mirrors the
+      :func:`building_blocks_dsl.binary_address_lookup_attention`
+      encoding (one slot per bit, +/-w per nibble value).
+    * ``label``: human-readable label used by verifier errors.
+
+    Compared to the imperative ``AP(slot, dim, weight)`` form, anchors
+    compose declaratively (AND of positives, AND-NOT of negatives) and
+    the binary-match field declares the LOGICAL semantics ("these two
+    multi-bit fields must agree") rather than the per-bit weight math.
+    """
+
+    label: str
+    positive_anchors: Tuple[int, ...] = ()
+    negative_anchors: Tuple[int, ...] = ()
+    binary_match_fields: Tuple[
+        Tuple[str, Tuple[int, ...], Tuple[int, ...], int], ...
+    ] = ()
+
+
+@dataclass(frozen=True)
+class AttentionIntent:
+    """Declarative intent for an attention head's Q/K selection.
+
+    Instead of hand-tuning ``AP(slot, dim, weight)``, the agent declares
+    the intent (which Q positions fire, which K positions are selected,
+    what V pulls, where O writes) and the framework synthesizes Q/K
+    weights + verifies them.
+
+    The synthesizer (:meth:`synthesize_writes`) produces tuples of
+    ``AP``/``AO`` writes compatible with
+    :class:`DeclarativeAttentionHeadSpec`. The verifier
+    (:func:`verify_attention_intent`) runs synthetic K positions and
+    asserts the intended K row scores higher than every other.
+
+    The intent is intentionally tied to the binary-address-match +
+    anchor pattern used by L7/L13/L15 lookups (Q/K share a multi-bit
+    address field plus per-side anchor masks). Other heads can still be
+    authored with raw ``AP`` writes — the intent path is opt-in.
+
+    Args:
+        name: human-readable head name (used in verifier error
+            messages).
+        q_at: predicate describing the Q-side firing condition.
+        k_at: predicate describing the K-side firing condition.
+        v_pulls: tuple of ``(residual_dim, head_slot)`` pairs — values
+            pulled from the selected K position into the per-head V
+            slot.
+        o_writes_to: tuple of ``(out_dim, head_slot, weight)`` triples —
+            where the head writes its V-weighted output.
+        head_idx: target attention-head index (allocator-resolved).
+        alibi_slope: optional per-head ALiBi slope.
+        anchor_weight: per-anchor projection weight (default 2000.0 —
+            matches the L15 memory_lookup head bias).
+        bias_slot: head-local slot for the Q anchor block (default 0).
+            The K anchor block lives at ``bias_slot + 1``.
+        match_slot_base: head-local slot at which the binary-match
+            block begins (default 4 — matches L15 where slots 0..3
+            carry anchors).
+        match_scale: per-bit weight for the binary-match writes
+            (default 10.0 — matches L15).
+    """
+
+    name: str
+    q_at: "PositionPredicate"
+    k_at: "PositionPredicate"
+    v_pulls: Tuple[Tuple[int, int], ...] = ()
+    o_writes_to: Tuple[Tuple[int, int, float], ...] = ()
+    head_idx: int = 0
+    alibi_slope: Optional[float] = None
+    anchor_weight: float = 2000.0
+    bias_slot: int = 0
+    match_slot_base: int = 4
+    match_scale: float = 10.0
+
+    # --------------------------------------------------------------
+    # Synthesis: intent -> AP/AO writes
+    # --------------------------------------------------------------
+
+    def synthesize_writes(
+        self,
+    ) -> Tuple[
+        Tuple["AttentionProjectionWrite", ...],
+        Tuple["AttentionProjectionWrite", ...],
+        Tuple["AttentionProjectionWrite", ...],
+        Tuple["AttentionOutputWrite", ...],
+    ]:
+        """Synthesize ``(q, k, v, o)`` write tuples from this intent.
+
+        Encoding:
+
+        * Q anchor block (slot = ``bias_slot``): positive anchors carry
+          ``+anchor_weight``; negative anchors carry
+          ``-anchor_weight * 5`` so any forbidden dim kills the row.
+          CONST carries ``-anchor_weight * (n_pos - 0.5)`` so the row
+          saturates only when all positive anchors fire.
+        * K anchor block (slot = ``bias_slot + 1``): same structure on
+          the K side. Decouples Q and K firing conditions.
+        * Binary-match block: one slot per bit per nibble field. For
+          each bit ``b``, ``q_slot`` and ``k_slot`` write
+          ``match_scale * (2 * ((nk >> b) & 1) - 1)`` for every nibble
+          value ``nk``. Q and K share the same slot, so the per-row
+          Q·K product saturates positive when the bits agree across
+          every declared nibble base.
+        * V/O writes are 1:1 from the declared mappings.
+        """
+
+        q_writes: List["AttentionProjectionWrite"] = []
+        k_writes: List["AttentionProjectionWrite"] = []
+        v_writes: List["AttentionProjectionWrite"] = []
+        o_writes: List["AttentionOutputWrite"] = []
+
+        bias = self.bias_slot
+
+        # Q anchor block — only emitted when the Q predicate carries
+        # at least one anchor. A predicate with no anchors models "any
+        # Q position is fine" (e.g. when the head is only validated
+        # against its binary-match block) and produces zero anchor
+        # writes so the resulting spec can be cleanly composed with
+        # external slot-0 writes.
+        if self.q_at.positive_anchors or self.q_at.negative_anchors:
+            n_pos_q = len(self.q_at.positive_anchors)
+            q_writes.append(AttentionProjectionWrite(
+                slot=bias,
+                dim=BD.CONST,
+                weight=-self.anchor_weight * (n_pos_q - 0.5),
+            ))
+            for dim in self.q_at.positive_anchors:
+                q_writes.append(AttentionProjectionWrite(
+                    slot=bias, dim=int(dim), weight=self.anchor_weight,
+                ))
+            for dim in self.q_at.negative_anchors:
+                q_writes.append(AttentionProjectionWrite(
+                    slot=bias, dim=int(dim),
+                    weight=-self.anchor_weight * 5.0,
+                ))
+            # K at bias slot: uniform CONST so this row's K
+            # contribution is not the load-bearing one (K selection
+            # happens via the K anchor + binary-match blocks).
+            k_writes.append(AttentionProjectionWrite(
+                slot=bias, dim=BD.CONST, weight=1.0,
+            ))
+
+        # K anchor block (only emitted when the K predicate declares
+        # at least one anchor).
+        k_anchor_slot = bias + 1
+        n_pos_k = len(self.k_at.positive_anchors)
+        if n_pos_k > 0 or len(self.k_at.negative_anchors) > 0:
+            k_writes.append(AttentionProjectionWrite(
+                slot=k_anchor_slot, dim=BD.CONST,
+                weight=-self.anchor_weight * (n_pos_k - 0.5),
+            ))
+            for dim in self.k_at.positive_anchors:
+                k_writes.append(AttentionProjectionWrite(
+                    slot=k_anchor_slot, dim=int(dim),
+                    weight=self.anchor_weight,
+                ))
+            for dim in self.k_at.negative_anchors:
+                k_writes.append(AttentionProjectionWrite(
+                    slot=k_anchor_slot, dim=int(dim),
+                    weight=-self.anchor_weight * 5.0,
+                ))
+            q_writes.append(AttentionProjectionWrite(
+                slot=k_anchor_slot, dim=BD.CONST, weight=1.0,
+            ))
+
+        # Binary-match block. Q and K must declare the same fields in
+        # the same order (POC constraint; future versions may pair by
+        # label).
+        slot = self.match_slot_base
+        q_fields = self.q_at.binary_match_fields
+        k_fields = self.k_at.binary_match_fields
+        if len(q_fields) != len(k_fields):
+            raise ValueError(
+                "AttentionIntent.synthesize_writes: Q and K predicates "
+                f"declare different numbers of binary_match_fields "
+                f"({len(q_fields)} vs {len(k_fields)})"
+            )
+        for q_field, k_field in zip(q_fields, k_fields):
+            q_label, q_lo_dims, _, q_bits = q_field
+            k_label, _, k_lo_dims, k_bits = k_field
+            if q_bits != k_bits:
+                raise ValueError(
+                    "AttentionIntent.synthesize_writes: bit count mismatch "
+                    f"for field {q_label}/{k_label}"
+                )
+            if len(q_lo_dims) != len(k_lo_dims):
+                raise ValueError(
+                    "AttentionIntent.synthesize_writes: nibble base count "
+                    f"mismatch for field {q_label}/{k_label}"
+                )
+            for q_base, k_base in zip(q_lo_dims, k_lo_dims):
+                for bit in range(q_bits):
+                    for nk in range(16):
+                        bit_val = 2 * ((nk >> bit) & 1) - 1
+                        w = self.match_scale * bit_val
+                        q_writes.append(AttentionProjectionWrite(
+                            slot=slot, dim=int(q_base) + nk, weight=w,
+                        ))
+                        k_writes.append(AttentionProjectionWrite(
+                            slot=slot, dim=int(k_base) + nk, weight=w,
+                        ))
+                    slot += 1
+
+        # V / O.
+        for residual_dim, slot_idx in self.v_pulls:
+            v_writes.append(AttentionProjectionWrite(
+                slot=int(slot_idx), dim=int(residual_dim), weight=1.0,
+            ))
+        for out_dim, slot_idx, weight in self.o_writes_to:
+            o_writes.append(AttentionOutputWrite(
+                out_dim=int(out_dim), slot=int(slot_idx),
+                weight=float(weight),
+            ))
+
+        return (
+            tuple(q_writes),
+            tuple(k_writes),
+            tuple(v_writes),
+            tuple(o_writes),
+        )
+
+    def to_spec(self) -> "DeclarativeAttentionHeadSpec":
+        """Lower the intent to a :class:`DeclarativeAttentionHeadSpec`.
+
+        Combines the synthesized Q/K/V/O writes with the intent's head
+        index and ALiBi slope so the result can be passed to
+        :meth:`Primitives.generate_attention_head` directly.
+        """
+
+        q, k, v, o = self.synthesize_writes()
+        return DeclarativeAttentionHeadSpec(
+            head_idx=self.head_idx,
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            alibi_slope=self.alibi_slope,
+        )
+
+
+def verify_attention_intent(
+    intent: "AttentionIntent",
+    *,
+    spec: Optional["DeclarativeAttentionHeadSpec"] = None,
+    d_model: int = 512,
+) -> List[str]:
+    """Run synthetic Q/K positions to verify the intent's K selection.
+
+    The verifier builds synthetic residual rows for:
+
+    * the intended Q position (Q anchors + Q binary-match dims set);
+    * the intended K position (K anchors + K binary-match dims set,
+      with the same nibble values as Q);
+    * negative K candidates:
+        - K anchors set but binary match WRONG (address mismatch);
+        - binary match correct but K anchors absent (e.g. STACK0 row
+          with matching address but no ``MEM_STORE``);
+        - bare K (no anchors, no binary match);
+        - if K has negative anchors, a K row that hits them.
+
+    For each candidate it computes the per-row Q·K score from the
+    synthesized (or supplied) Q/K projections and asserts the intended
+    K wins. Returns a list of human-readable error strings — empty
+    means the intent is verified.
+
+    Args:
+        intent: the :class:`AttentionIntent` to verify.
+        spec: optional spec to verify against (defaults to
+            ``intent.to_spec()`` — pass an existing spec to check
+            byte-identity equivalence with hand-authored writes).
+        d_model: residual-stream width (default 512).
+    """
+
+    errors: List[str] = []
+    spec = spec if spec is not None else intent.to_spec()
+
+    HD = max(
+        max((w.slot for w in spec.q), default=0),
+        max((w.slot for w in spec.k), default=0),
+        max((w.slot for w in spec.v), default=0),
+        max((w.slot for w in spec.o), default=0),
+    ) + 1
+    W_q = torch.zeros(HD, d_model)
+    W_k = torch.zeros(HD, d_model)
+    for w in spec.q:
+        if 0 <= w.dim < d_model:
+            W_q[w.slot, w.dim] = w.weight
+    for w in spec.k:
+        if 0 <= w.dim < d_model:
+            W_k[w.slot, w.dim] = w.weight
+
+    def make_q_residual():
+        x = torch.zeros(d_model)
+        x[BD.CONST] = 1.0
+        for dim in intent.q_at.positive_anchors:
+            if 0 <= dim < d_model:
+                x[dim] = 1.0
+        for _label, q_lo_dims, _, _bits in intent.q_at.binary_match_fields:
+            for nibble_base in q_lo_dims:
+                if 0 <= nibble_base + 5 < d_model:
+                    x[nibble_base + 5] = 1.0
+        return x
+
+    def make_k_residual(positive_anchors, binary_fields, nibble_value=5):
+        x = torch.zeros(d_model)
+        x[BD.CONST] = 1.0
+        for dim in positive_anchors:
+            if 0 <= dim < d_model:
+                x[dim] = 1.0
+        for _label, _, k_lo_dims, _bits in binary_fields:
+            for nibble_base in k_lo_dims:
+                if 0 <= nibble_base + nibble_value < d_model:
+                    x[nibble_base + nibble_value] = 1.0
+        return x
+
+    q_residual = make_q_residual()
+    q_proj = W_q @ q_residual  # (HD,)
+
+    def score(k_res):
+        return float((q_proj * (W_k @ k_res)).sum().item())
+
+    k_match = make_k_residual(
+        intent.k_at.positive_anchors,
+        intent.k_at.binary_match_fields,
+        nibble_value=5,
+    )
+    k_bare = make_k_residual(positive_anchors=(), binary_fields=())
+
+    target = score(k_match)
+    competitors: dict = {"bare": score(k_bare)}
+
+    # ``wrong_address`` only makes sense when the intent declares a
+    # binary-match field — without it, "intended" and "wrong" K rows
+    # carry the same dims and the comparison is trivially equal.
+    if intent.k_at.binary_match_fields:
+        k_wrong_addr = make_k_residual(
+            intent.k_at.positive_anchors,
+            intent.k_at.binary_match_fields,
+            nibble_value=7,
+        )
+        competitors["wrong_address"] = score(k_wrong_addr)
+
+    # ``no_anchor`` only makes sense when the intent declares K
+    # anchors — otherwise the row is identical to ``intended``.
+    if intent.k_at.positive_anchors:
+        k_no_anchor = make_k_residual(
+            positive_anchors=(),
+            binary_fields=intent.k_at.binary_match_fields,
+            nibble_value=5,
+        )
+        competitors["no_anchor"] = score(k_no_anchor)
+    if intent.k_at.negative_anchors:
+        k_with_neg = make_k_residual(
+            positive_anchors=tuple(intent.k_at.positive_anchors)
+                             + tuple(intent.k_at.negative_anchors),
+            binary_fields=intent.k_at.binary_match_fields,
+            nibble_value=5,
+        )
+        competitors["k_with_negatives"] = score(k_with_neg)
+
+    for label, comp_score in competitors.items():
+        if target <= comp_score:
+            errors.append(
+                f"AttentionIntent[{intent.name}]: intended K row "
+                f"(score={target:.2f}) does NOT dominate competitor "
+                f"{label!r} (score={comp_score:.2f}). This is a "
+                f"K-selection bug — check the K-side anchors and "
+                f"binary_match_fields in k_at."
+            )
+
+    return errors
 
 
 def AP(slot: int, dim: int, weight: float) -> AttentionProjectionWrite:
@@ -240,6 +651,7 @@ def _inject_sink_k_row(
         alibi_slope=spec.alibi_slope,
         group_size=spec.group_size,
         head_dim=spec.head_dim,
+        intent=spec.intent,
     )
 
 
@@ -326,6 +738,27 @@ class Primitives:
         if spec.alibi_slope is not None:
             if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
                 attn.alibi_slopes.data[spec.head_idx] = float(spec.alibi_slope)
+        # Phase 7.B.7: when the spec carries an AttentionIntent, run
+        # the intent-side K-selection verifier at bake time. The check
+        # runs against the fully-lowered Q/K matrices through the
+        # intent's recorded predicates; mismatches raise so the bake
+        # fails loudly instead of silently producing a head that
+        # attends to the wrong K row.
+        if spec.intent is not None:
+            d_model_for_check = getattr(
+                attn.W_q, "shape", (0, 512),
+            )[1]
+            errors = verify_attention_intent(
+                spec.intent,
+                spec=spec,
+                d_model=int(d_model_for_check),
+            )
+            if errors:
+                raise ValueError(
+                    "generate_attention_head: AttentionIntent "
+                    f"verification failed for head_idx={spec.head_idx}:"
+                    "\n  " + "\n  ".join(errors)
+                )
 
     @staticmethod
     def generate_attention_heads(attn, specs, HD: int):
