@@ -545,9 +545,15 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     def cmp_default(op_name: str, default_result: int, *, idx: int) -> FFNRule:
         # DSL v4b: 3-condition AND with explicit threshold 1.5; MARK_PC
         # blocker uses negative weight. constant_write style (no gate).
+        #
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY. Wave A's
+        # ``step_end_operand_relay`` (commit 10ca51a7) broadcasts CMP /
+        # OP_<cmp> from MARK_AX into MARK_SE_ONLY within the same step,
+        # so the rule fires one row later byte-identically. MARK_PC
+        # blocker retained for structural symmetry (zero at STEP_END).
         return multi_way_and_rule(
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 (op_name, 1.0),
                 ("MARK_PC", MARK_PC_BLOCK),
             ),
@@ -556,8 +562,8 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OUTPUT_LO+{default_result}", 2.0 / S),
                 ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
             ),
-            name=f"l10_cmp_default_{op_name.lower()}_{idx}",
-            scope=f"MARK_AX and {op_name} and not MARK_PC",
+            name=f"l10_cmp_default_{op_name.lower()}_{idx}_step_end",
+            scope=f"MARK_SE_ONLY and {op_name} and not MARK_PC",
         )
 
     def cmp_override_2way(
@@ -566,9 +572,12 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     ) -> FFNRule:
         # DSL v4b: 3-condition AND (MARK_AX + CMP cell + MARK_PC blocker)
         # gated on the opcode flag.
+        #
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+        # Wave A step_end_operand_relay (10ca51a7).
         return multi_way_and_rule(
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 (cmp_name, 1.0),
                 ("MARK_PC", MARK_PC_BLOCK),
             ),
@@ -579,8 +588,8 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
                 (f"OUTPUT_LO+{from_result}", -4.0 / S),
             ),
-            name=f"l10_cmp_override2_{op_name.lower()}_{idx}",
-            scope=f"MARK_AX and {op_name} and {cmp_name} and not MARK_PC",
+            name=f"l10_cmp_override2_{op_name.lower()}_{idx}_step_end",
+            scope=f"MARK_SE_ONLY and {op_name} and {cmp_name} and not MARK_PC",
         )
 
     def cmp_override_3way(
@@ -607,9 +616,11 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
         # LT/GT/LE/GE 3way overrides that gate on CMP+1: hi_eq cannot
         # be true when hi_lt is true. The 2way overrides on CMP+0 are
         # left untouched (they ARE the hi_lt path).
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+        # Wave A step_end_operand_relay (10ca51a7).
         return multi_way_and_rule(
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 (cmp_name1, 1.0),
                 (cmp_name2, 1.0),
                 ("MARK_PC", MARK_PC_BLOCK),
@@ -622,9 +633,9 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
                 (f"OUTPUT_LO+{from_result}", -4.0 / S),
             ),
-            name=f"l10_cmp_override3_{op_name.lower()}_{idx}",
+            name=f"l10_cmp_override3_{op_name.lower()}_{idx}_step_end",
             scope=(
-                f"MARK_AX and {op_name} and {cmp_name1} and "
+                f"MARK_SE_ONLY and {op_name} and {cmp_name1} and "
                 f"{cmp_name2} and not MARK_PC"
             ),
         )
@@ -716,16 +727,21 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         # DSL v4b: 3-condition AND with explicit threshold 2.5 and a
         # negative MARK_PC blocker (-50). multi_way_and_rule with
         # gate=None lowers via constant_write (gate_bias=1.0).
+        #
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY. Wave A
+        # ``step_end_operand_relay`` (10ca51a7) broadcasts CMP /
+        # OP_<cmp> from MARK_AX into MARK_SE_ONLY in the same step.
         return multi_way_and_rule(
-            name=f"l10_cmp_{op_name.lower()}_default",
+            name=f"l10_cmp_{op_name.lower()}_default_step_end",
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 (f"OP_{op_name}", 1.0),
                 # MARK_PC blocker: mirror the parallel rule at line 518
                 # which has MARK_PC_BLOCK=-50 to prevent the default from
                 # firing at positions where MARK_PC leaks into MARK_AX.
                 # Without this, OUTPUT_LO+default_result clobbers legitimate
                 # AX_byte0 writes on pure-IMM steps. See IF_EQ_CMP_DEFAULT_LEAK.md.
+                # Wave B: blocker preserved (zero at STEP_END, inert).
                 ("MARK_PC", -50.0),
             ),
             threshold=2.5,
@@ -741,10 +757,13 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
     ) -> FFNRule:
         # DSL v4b: 2-condition balanced AND (MARK_AX + CMP+i, both 1.0)
         # with threshold 1.5; OP_<NAME> gate via (opcode_flag, NAME).
+        #
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+        # Wave A step_end_operand_relay (10ca51a7).
         return multi_way_and_rule(
-            name=f"l10_cmp_{op_name.lower()}_override2_{suffix}",
+            name=f"l10_cmp_{op_name.lower()}_override2_{suffix}_step_end",
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 (f"CMP+{cmp_idx}", 1.0),
             ),
             threshold=1.5,
@@ -774,10 +793,12 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         # (1 + 10.587 + 0 = 11.587 >= 4.0) even when CMP+2 is zero.
         # With CMP+0 amplified to ~150 (true hi_lt), the -0.1 blocker
         # contributes -15 to the score, dropping it below 4.0.
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+        # Wave A step_end_operand_relay (10ca51a7).
         return multi_way_and_rule(
-            name=f"l10_cmp_{op_name.lower()}_override3_{suffix}",
+            name=f"l10_cmp_{op_name.lower()}_override3_{suffix}_step_end",
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 (f"CMP+{cmp_idx1}", 1.0),
                 (f"CMP+{cmp_idx2}", 1.0),
                 ("CMP+0", -0.1),
@@ -866,13 +887,17 @@ def _layer10_alu_bitwise_rules(
                 result = op_fn(a, b)
                 # DSL v4b: 3-way balanced AND across (MARK_AX, ALU_*[a],
                 # AX_CARRY_*[b]) at (40, 30, 30) > 80; gate=OP_<op>.
+                # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY
+                # under Wave A step_end_operand_relay (10ca51a7), which
+                # broadcasts ALU_LO/HI, AX_CARRY_LO/HI, OP_<bitwise>
+                # from MARK_AX into MARK_SE_ONLY in the same step.
                 rules.append(multi_way_and_rule(
                     name=(
                         f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
-                        f"a{a:x}_b{b:x}"
+                        f"a{a:x}_b{b:x}_step_end"
                     ),
                     conditions=(
-                        ("MARK_AX", 40.0),
+                        ("MARK_SE_ONLY", 40.0),
                         (f"{alu_dim}+{a}", 30.0),
                         (f"{carry_dim}+{b}", 30.0),
                     ),
@@ -886,13 +911,15 @@ def _layer10_alu_bitwise_rules(
         # Stale ALU_*+0: fires when ALU_*+0 >= 1.04 with legit AX_CARRY_*+b.
         for b in range(16):
             spurious = op_fn(0, b)
+            # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+            # Wave A step_end_operand_relay (10ca51a7).
             rules.append(multi_way_and_rule(
                 name=(
                     f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
-                    f"cancel_stale_alu0_b{b:x}"
+                    f"cancel_stale_alu0_b{b:x}_step_end"
                 ),
                 conditions=(
-                    ("MARK_AX", 40.0),
+                    ("MARK_SE_ONLY", 40.0),
                     (f"{alu_dim}+0", 1000.0),
                     (f"{carry_dim}+{b}", 30.0),
                 ),
@@ -909,13 +936,15 @@ def _layer10_alu_bitwise_rules(
         # otherwise erase the legit a==b write.
         for a in range(1, 16):
             spurious = op_fn(a, 0)
+            # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+            # Wave A step_end_operand_relay (10ca51a7).
             rules.append(multi_way_and_rule(
                 name=(
                     f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
-                    f"cancel_stale_a{a:x}_carry0"
+                    f"cancel_stale_a{a:x}_carry0_step_end"
                 ),
                 conditions=(
-                    ("MARK_AX", 40.0),
+                    ("MARK_SE_ONLY", 40.0),
                     (f"{alu_dim}+{a}", 30.0),
                     (f"{carry_dim}+0", 1000.0),
                 ),
@@ -976,10 +1005,15 @@ def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
         # DSL v4b: explicit-threshold AND (MARK_AX dominant + AX_CARRY_HI[0]
         # suppressor). Threshold 59 fires only when MARK_AX is hot AND
         # AX_CARRY_HI[0] is absent (i.e. shift >= 16).
+        #
+        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+        # Wave A step_end_operand_relay (10ca51a7), which broadcasts
+        # ALU_LO/HI, OP_SHL, OP_SHR from MARK_AX into MARK_SE_ONLY in
+        # the same step.
         return multi_way_and_rule(
-            name=f"l10_{op_name.lower()}_shift_ge16_zero",
+            name=f"l10_{op_name.lower()}_shift_ge16_zero_step_end",
             conditions=(
-                ("MARK_AX", 60.0),
+                ("MARK_SE_ONLY", 60.0),
                 ("AX_CARRY_HI+0", -1.0),
             ),
             threshold=59.0,
@@ -1108,10 +1142,15 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
             result = (a * b) % 16
             # DSL v4b: 3-way balanced AND across (MARK_AX, ALU_LO[a],
             # AX_CARRY_LO[b]) at (40, 30, 30) > 80; gate=OP_MUL.
+            #
+            # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
+            # Wave A step_end_operand_relay (10ca51a7), which broadcasts
+            # ALU_LO/HI, AX_CARRY_LO, OP_MUL from MARK_AX into
+            # MARK_SE_ONLY in the same step.
             rules.append(multi_way_and_rule(
-                name=f"l10_mul_lo_a{a:x}_b{b:x}",
+                name=f"l10_mul_lo_a{a:x}_b{b:x}_step_end",
                 conditions=(
-                    ("MARK_AX", 40.0),
+                    ("MARK_SE_ONLY", 40.0),
                     (f"ALU_LO+{a}", 30.0),
                     (f"AX_CARRY_LO+{b}", 30.0),
                 ),
@@ -7222,12 +7261,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # Comparison combine still sees amplified CMP residuals in the
         # expanded strict path. These two marker-only corrections restore the
         # truthy NE and LE cases without touching byte-lane arithmetic.
+        # Wave B Cluster 1 (2026-06-10): six tail_cmp_* rules migrated
+        # from MARK_AX to MARK_SE_ONLY under Wave A
+        # step_end_operand_relay (10ca51a7); the relay broadcasts CMP /
+        # OP_<cmp> from MARK_AX into MARK_SE_ONLY in the same step.
+        # scope and dominates_at follow the marker swap.
         multi_way_and_rule(
-            name="tail_cmp_ne_true_01",
-            scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            name="tail_cmp_ne_true_01_step_end",
+            scope="mark == SE_ONLY",
+            dominates_at={"OUTPUT_LO": "mark == SE_ONLY", "OUTPUT_HI_THIS_STEP": "mark == SE_ONLY"},
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("OP_NE", 1.0),
                 ("CMP+1", -0.5),
             ),
@@ -7235,11 +7279,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes=byte_writes(0x01, strength=1000.0),
         ),
         multi_way_and_rule(
-            name="tail_cmp_eq_false_00",
-            scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            name="tail_cmp_eq_false_00_step_end",
+            scope="mark == SE_ONLY",
+            dominates_at={"OUTPUT_LO": "mark == SE_ONLY", "OUTPUT_HI_THIS_STEP": "mark == SE_ONLY"},
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("OP_EQ", 1.0),
                 ("CMP+1", -1.0),
                 ("CMP+2", -1.0),
@@ -7248,11 +7292,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes=byte_writes(0x00, strength=1000.0),
         ),
         multi_way_and_rule(
-            name="tail_cmp_le_lt_true_01",
-            scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            name="tail_cmp_le_lt_true_01_step_end",
+            scope="mark == SE_ONLY",
+            dominates_at={"OUTPUT_LO": "mark == SE_ONLY", "OUTPUT_HI_THIS_STEP": "mark == SE_ONLY"},
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("OP_LE", 1.0),
                 ("CMP+3", 0.1),
                 ("CMP+0", -0.1),
@@ -7261,11 +7305,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes=byte_writes(0x01, strength=1000.0),
         ),
         multi_way_and_rule(
-            name="tail_cmp_le_eq_prefix_false_00",
-            scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            name="tail_cmp_le_eq_prefix_false_00_step_end",
+            scope="mark == SE_ONLY",
+            dominates_at={"OUTPUT_LO": "mark == SE_ONLY", "OUTPUT_HI_THIS_STEP": "mark == SE_ONLY"},
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("OP_LE", 1.0),
                 ("CMP+1", 0.1),
                 ("CMP+0", -1.0),
@@ -7289,11 +7333,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # above, but uses the gate to suppress LT fan-in (per the 2026-06-03
         # CMP polarity investigation doc).
         multi_way_and_rule(
-            name="tail_cmp_lt_false_00",
-            scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            name="tail_cmp_lt_false_00_step_end",
+            scope="mark == SE_ONLY",
+            dominates_at={"OUTPUT_LO": "mark == SE_ONLY", "OUTPUT_HI_THIS_STEP": "mark == SE_ONLY"},
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("CMP+0", -10.0),
             ),
             threshold=0.5,
@@ -7303,11 +7347,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             writes=byte_writes(0x00, strength=1000.0),
         ),
         multi_way_and_rule(
-            name="tail_cmp_gt_false_00",
-            scope="mark == AX",
-            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            name="tail_cmp_gt_false_00_step_end",
+            scope="mark == SE_ONLY",
+            dominates_at={"OUTPUT_LO": "mark == SE_ONLY", "OUTPUT_HI_THIS_STEP": "mark == SE_ONLY"},
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("OP_GT", 1.0),
                 ("CMP+3", 0.1),
                 ("CMP+0", -0.1),
