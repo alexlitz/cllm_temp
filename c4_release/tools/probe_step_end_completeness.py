@@ -93,6 +93,12 @@ def main() -> int:
         ("CMP (slot)",         9, "CMP",          4, "flag hot (CMP step)",   "cold"),
         ("STACK0_BYTE0",       8, "STACK0_BYTE0", 1, "cold (fires at byte row)", "cold"),
         ("NEXT_PC",            8, "NEXT_PC",      1, "cold", "hot (scheduler)"),
+        # 2026-06-10: L0/L1 within-step register-presence broadcast.
+        # SE_REG_AX_PRESENT is written by L1 head 6 (Q@MARK_SE_ONLY,
+        # K@MARK_AX, V@MARK_AX, ALiBi slope 0.2). After L1 the SE row
+        # carries the within-step MARK_AX presence ~= 1.0; the AX row
+        # itself is unwritten (Q gates the broadcast to SE rows only).
+        ("SE_REG_AX_PRESENT",  1, "SE_REG_AX_PRESENT", 1, "cold", "hot (within-step relay)"),
     ]
 
     print(f"{'probe':24}{'layer':>6}  {'@MARK_AX':<32}{'@MARK_SE':<32}{'expected':<30}")
@@ -151,6 +157,23 @@ def main() -> int:
         print("Same: STEP_END is not currently the AX-carry-forward target.")
     print("\nThe STEP_END row currently carries scheduler dims (NEXT_PC, "
           "MARK_SE, HAS_SE, MARK_SE_ONLY, CONST), not compute substrate.")
+
+    # --- L0/L1 within-step register-presence broadcast (2026-06-10) -----
+    print("\n" + "=" * 70)
+    print("L0/L1 WITHIN-STEP RELAY HEAD (L1 head 6)")
+    print("=" * 70)
+    arr_l1 = capture.after_layer[1]
+    se_reg_ax_d = capture.dim("SE_REG_AX_PRESENT")
+    se_reg_ax_at_se = float(arr_l1[0, se_row, se_reg_ax_d].item())
+    se_reg_ax_at_ax = float(arr_l1[0, ax_row, se_reg_ax_d].item())
+    print(f"SE_REG_AX_PRESENT@MARK_SE (L1): {se_reg_ax_at_se:+.3f}")
+    print(f"SE_REG_AX_PRESENT@MARK_AX (L1): {se_reg_ax_at_ax:+.3f}")
+    if se_reg_ax_at_se >= 0.5 and abs(se_reg_ax_at_ax) < 0.5:
+        print("VERIFIED: L1 head 6 within-step relay broadcasts MARK_AX")
+        print("presence to MARK_SE position (Q-gated to SE rows only).")
+    else:
+        print("WARNING: L1 head 6 broadcast did NOT land as expected. The")
+        print("relay head spec or ALiBi slope may need tuning.")
 
     return 0
 

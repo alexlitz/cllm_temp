@@ -70,7 +70,22 @@ def build_default_registry_dynamic() -> DimRegistry:
     # PSH broadcast that fills them, and L14 mem_generation will read
     # them. See docs/WAVE_PLAN_2026_06_07.md §A1 and
     # docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
-    a = Allocator(d_model=832)
+    #
+    # STEP_END register-presence broadcast (2026-06-10, L1 head 6):
+    # d_model further expanded 832 -> 840 to carry the
+    # ``SE_REG_<MARK>_PRESENT`` family (6 names × 1 wide) plus 2 cells
+    # of reserved padding so d_model stays divisible by the n_heads=8
+    # head count (the PureAttention.forward view does
+    # ``d_model // n_heads`` and demands an even split). These slots
+    # sit at 831..836 (just after BZ_TARGET_FRESH at 830); positions
+    # 837..839 are reserved for future SE-row broadcast targets. They
+    # are written by a new L1 within-step broadcast head that anchors
+    # Q at MARK_SE_ONLY and copies each register marker's presence
+    # (within the current step) into the matching SE-position dim.
+    # This is the L0/L1 foundation of the STEP_END compute migration
+    # in docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md (the parallel
+    # Wave-A L11 relay broadcasts the post-producer compute slots).
+    a = Allocator(d_model=840)
 
     def pin(name, start, size, desc, semantics=None, alias=False):
         # Tiny wrapper that mirrors the (name, start, size, desc, semantics)
@@ -631,6 +646,50 @@ def build_default_registry_dynamic() -> DimRegistry:
     pin("BZ_TARGET_FRESH", 830, 1,
         "C5: previous step was a BZ-taken step (cross-step gate)",
         "mark == PC")
+
+    # ------------------------------------------------------------------
+    # STEP_END register-presence broadcast (2026-06-10, L1 head 6).
+    # ------------------------------------------------------------------
+    # Each ``SE_REG_<MARK>_PRESENT`` slot (831..836, 1 wide each) is
+    # written by the new L1 within-step broadcast head (head 6,
+    # ``layer1_threshold_attn.step_end_reg_present``) which anchors Q
+    # on MARK_SE_ONLY and projects the matching MARK_<NAME> value via
+    # V/O at the SE row. Within a single 35-token VM step every
+    # register marker fires exactly once, so the broadcast yields ~1.0
+    # at MARK_SE_ONLY when its corresponding marker has been emitted
+    # in the same step. A positive ALiBi slope on the head bounds the
+    # match to the current step.
+    #
+    # Predicate ``mark == SE`` reflects the firing location after the
+    # broadcast lands (the slot is only meaningful at MARK_SE_ONLY
+    # positions). Off-SE positions remain 0 because the head's Q is
+    # gated on MARK_SE_ONLY.
+    #
+    # These slots are the L0/L1 foundation of the
+    # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md migration --
+    # they prove the within-step broadcast pattern at L1 and let
+    # downstream STEP_END-gated compute rules read register-presence
+    # signals directly at the SE row. Wave-A (parallel agent) extends
+    # the broadcast at L11 with OP_<NAME>, AX_CARRY, ALU, CMP, and
+    # STACK0_BYTE0..3 to cover the dispatch+compute substrate.
+    pin("SE_REG_AX_PRESENT", 831, 1,
+        "MARK_AX presence broadcast to MARK_SE within current step",
+        "mark == SE")
+    pin("SE_REG_PC_PRESENT", 832, 1,
+        "MARK_PC presence broadcast to MARK_SE within current step",
+        "mark == SE")
+    pin("SE_REG_SP_PRESENT", 833, 1,
+        "MARK_SP presence broadcast to MARK_SE within current step",
+        "mark == SE")
+    pin("SE_REG_BP_PRESENT", 834, 1,
+        "MARK_BP presence broadcast to MARK_SE within current step",
+        "mark == SE")
+    pin("SE_REG_STACK0_PRESENT", 835, 1,
+        "MARK_STACK0 presence broadcast to MARK_SE within current step",
+        "mark == SE")
+    pin("SE_REG_MEM_PRESENT", 836, 1,
+        "MARK_MEM presence broadcast to MARK_SE within current step",
+        "mark == SE")
 
     reg = a.to_registry()
     # Phase 7.E.1 — apply the same semantic-category bindings as the

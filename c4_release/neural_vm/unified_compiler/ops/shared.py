@@ -905,6 +905,24 @@ def declare_setdim_compat_dims(
     ):
         compiler.declare_dim(name, 16, pinned=None)
 
+    # 2026-06-10: STEP_END register-presence broadcast family. Each
+    # ``SE_REG_<MARK>_PRESENT`` is a 1-wide flag written at MARK_SE_ONLY
+    # rows by the L1 ``layer1_threshold_attn`` head 6 within-step relay
+    # (only SE_REG_AX_PRESENT is wired in this commit; the other 5 slots
+    # are declared scaffolding for follow-on broadcast heads). All slots
+    # are unpinned so the bump-pointer allocator places them above the
+    # wave-aligned high-water mark in the compat path. See
+    # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
+    for name in (
+        "SE_REG_AX_PRESENT",
+        "SE_REG_PC_PRESENT",
+        "SE_REG_SP_PRESENT",
+        "SE_REG_BP_PRESENT",
+        "SE_REG_STACK0_PRESENT",
+        "SE_REG_MEM_PRESENT",
+    ):
+        compiler.declare_dim(name, 1, pinned=None)
+
     # ------------------------------------------------------------------
     # Qwen R1 — opt-in NORM_COMPENSATOR slot
     # ------------------------------------------------------------------

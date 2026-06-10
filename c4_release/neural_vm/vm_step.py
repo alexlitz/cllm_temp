@@ -2572,6 +2572,20 @@ class _SetDim:
     # docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md.
     BZ_TARGET_FRESH = 830  # 1 dim @ 830 (just past STACK0_BYTE_VAL_3_HI[15])
 
+    # --- STEP_END register-presence broadcast (2026-06-10, L1 head 6) ---
+    # Written 1.0 at MARK_SE_ONLY rows by the new L1 within-step
+    # broadcast head (``layer1_threshold_attn.step_end_reg_present``).
+    # Each slot mirrors the matching ``MARK_<NAME>`` value from its
+    # own row to the SE row, bounded by ALiBi slope to the current step.
+    # L0/L1 foundation of the STEP_END compute migration; see
+    # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
+    SE_REG_AX_PRESENT     = 831  # MARK_AX present in current step
+    SE_REG_PC_PRESENT     = 832  # MARK_PC present in current step
+    SE_REG_SP_PRESENT     = 833  # MARK_SP present in current step
+    SE_REG_BP_PRESENT     = 834  # MARK_BP present in current step
+    SE_REG_STACK0_PRESENT = 835  # MARK_STACK0 present in current step
+    SE_REG_MEM_PRESENT    = 836  # MARK_MEM present in current step
+
     # Convenience: map Opcode int → _SetDim opcode flag dim
     _OPCODE_DIM = None  # lazily built
 

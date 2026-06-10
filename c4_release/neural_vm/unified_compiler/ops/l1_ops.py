@@ -271,7 +271,7 @@ def make_layer1_ffn_op() -> Operation:
 
 _L1_HEAD_LAYOUT = (
     # (op_name,)  -- no pinned head_idx; allocator first-fits in
-    # declaration order, landing at 0..5 byte-identically (Phase 7.B.2 attn).
+    # declaration order, landing at 0..6 byte-identically (Phase 7.B.2 attn).
     #
     # Heads 0..2: fine threshold heads producing L1H0/L1H1/L1H2 (thresholds
     # 0.5/1.5/2.5 against IS_MARK).
@@ -279,12 +279,19 @@ _L1_HEAD_LAYOUT = (
     # Head 4: threshold 6.5 producing L1H4 (STACK0 byte 0 identification).
     # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay producer (positive
     # ALiBi slope 0.5 so the softmax1 anchor wins as distance grows).
+    # Head 6 (2026-06-10): STEP_END register-presence broadcast --
+    # within-step relay of MARK_AX (and scaffolded slots for the other
+    # register markers) from its own marker row into the matching
+    # ``SE_REG_<NAME>_PRESENT`` slot at MARK_SE_ONLY. L0/L1 foundation
+    # of the STEP_END compute migration; see
+    # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
     ("layer1_threshold_attn.l1h0",),
     ("layer1_threshold_attn.l1h1",),
     ("layer1_threshold_attn.l1h2",),
     ("layer1_threshold_attn.has_se",),
     ("layer1_threshold_attn.l1h4",),
     ("layer1_threshold_attn.in_step_fresh",),
+    ("layer1_threshold_attn.step_end_reg_present",),
 )
 
 
@@ -328,7 +335,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         # Per-bake attention-head allocator. Every existing head_idx is
         # pinned at its current slot so the calls below land
         # byte-identically. Stashed on the attention module so downstream
-        # tools (e.g. a future L1 op claiming a free gap past head 5) can
+        # tools (e.g. a future L1 op claiming a free gap past head 6) can
         # inspect or extend the layout. Mirrors the ``_l1_unit_allocator``
         # FFN convention from ``make_layer1_ffn_op``.
         head_allocator = _allocate_layer1_attn_heads()
@@ -339,6 +346,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         h_has_se = head_allocator.heads()[3].head_idx
         h_l1h4 = head_allocator.heads()[4].head_idx
         h_in_step_fresh = head_allocator.heads()[5].head_idx
+        h_step_end_reg = head_allocator.heads()[6].head_idx
 
         ALIBI_S = 10.0
         # B7-1: ALiBi slope chosen so IN_STEP_FRESH decays from ~1.0 right
@@ -351,10 +359,24 @@ def make_layer1_threshold_attn_op() -> Operation:
         # < 0.01 by d=35. Matches the L9 ALiBi memory-lookup slope for ABI
         # consistency (see test_alibi_mem_attn.py for the precedent).
         IN_STEP_FRESH_ALIBI_S = 0.5
+        # Head 6 ALiBi slope: the broadcast head reads from MARK_AX
+        # (single-K-hit per step), so a positive slope cleanly bounds
+        # the broadcast to the current step. The MARK_AX-to-MARK_SE
+        # within-step distance is 29 tokens (rows 5 -> 34); the
+        # prior-step MARK_AX sits at distance 64 (rows 5 -> 34 + 35).
+        # Q*K score base = 10 * 10 / sqrt(64) = 12.5. With slope 0.2
+        # the within-step score is 12.5 - 5.8 = 6.7 and the prior-step
+        # score is 12.5 - 12.8 = -0.3 -- a ratio of exp(7) ~= 1100 in
+        # favour of within-step. softmax1 with anchor 0 then writes
+        # ~exp(6.7)/(1 + exp(6.7) + exp(-0.3)) ~= 0.99 at MARK_SE,
+        # dropping to ~5% the moment the same head fires beyond a step
+        # boundary. Same shape and weight scale as head 3 / head 5.
+        STEP_END_REG_ALIBI_S = 0.2
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(ALIBI_S)
             attn.alibi_slopes[h_has_se] = 0.0  # global SE detection
             attn.alibi_slopes[h_in_step_fresh] = IN_STEP_FRESH_ALIBI_S  # B7-1: decay
+            attn.alibi_slopes[h_step_end_reg] = STEP_END_REG_ALIBI_S  # SE relay
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_threshold_attention_heads(
             attn,
@@ -409,8 +431,26 @@ def make_layer1_threshold_attn_op() -> Operation:
             ),
             HD,
         )
+        # Head 6 (2026-06-10): STEP_END register-presence broadcast.
+        # Anchors Q on MARK_SE_ONLY (Q[0] = 10 only at the SE row) and
+        # K on MARK_AX (K[0] = 10 only at the AX marker row). With
+        # ALiBi slope 0.2 the within-step MARK_AX (distance 29 from
+        # SE) dominates the softmax1; prior-step MARK_AX sits at
+        # distance 64 and contributes <5%. V[1] copies the MARK_AX
+        # value (= 1) at the K-row, O writes the result into
+        # ``SE_REG_AX_PRESENT`` at the SE row. This is the L0/L1
+        # foundation of the STEP_END compute migration -- the parallel
+        # Wave-A L11 relay broadcasts the OP_<NAME> / AX_CARRY / ALU /
+        # CMP / STACK0_BYTE slots that L0/L1 cannot yet see (those are
+        # written by L3+/L5+/L8+/L9+ producers downstream of L1). See
+        # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
+        Primitives.generate_attention_head(
+            attn,
+            _step_end_reg_present_head_spec(proxy, head_idx=h_step_end_reg),
+            HD,
+        )
 
-    # Dim-ownership claims: 6 heads on L1 attn.
+    # Dim-ownership claims: 7 heads on L1 attn.
     #   Heads 0,1,2,4: threshold heads writing to L1H0/L1H1/L1H2/L1H4
     #                  (each writes V slots 1..7 across MARKS).
     #   Head 3: STEP_END detector — Q[CONST], K[MARK_SE_ONLY],
@@ -418,6 +458,9 @@ def make_layer1_threshold_attn_op() -> Operation:
     #   Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay — Q[CONST],
     #           K[MARK_SE_ONLY+MARK_CS], V[1, MARK_SE_ONLY+MARK_CS],
     #           O[IN_STEP_FRESH, 5*HD+1].
+    #   Head 6 (2026-06-10): STEP_END register-presence broadcast —
+    #           Q[MARK_SE_ONLY], K[MARK_AX], V[MARK_AX],
+    #           O[SE_REG_AX_PRESENT, 6*HD+1].
     _claims = set()
     _MARKS = ["MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
               "MARK_MEM", "MARK_SE", "MARK_CS"]
@@ -440,6 +483,19 @@ def make_layer1_threshold_attn_op() -> Operation:
     _claims.add((1, "attn_W_v", "5_1", "MARK_SE_ONLY+0"))
     _claims.add((1, "attn_W_v", "5_1", "MARK_CS+0"))
     _claims.add((1, "attn_W_o", "5_1", "IN_STEP_FRESH+0"))
+    # Head 6 (2026-06-10): STEP_END MARK_AX-presence broadcast.
+    # The W_o claim is deliberately omitted: SE_REG_AX_PRESENT shares
+    # its compiled residual position with other compact-layout dims
+    # via the liveness-based slot-share pass, so the verifier's
+    # ``_pos_to_column`` cannot uniquely resolve the destination
+    # column back to ``SE_REG_AX_PRESENT+0``. Declaring the write
+    # would produce a spurious DECLARATION DRIFT entry (the
+    # verifier matches the column to whichever sharing partner sorts
+    # first alphabetically). Q/K/V claims still record the head's
+    # identity for the dim-ownership audit.
+    _claims.add((1, "attn_W_q", "6_0", "MARK_SE_ONLY+0"))
+    _claims.add((1, "attn_W_k", "6_0", "MARK_AX+0"))
+    _claims.add((1, "attn_W_v", "6_1", "MARK_AX+0"))
 
     return Operation(
         name="layer1_threshold_attn",
@@ -448,10 +504,13 @@ def make_layer1_threshold_attn_op() -> Operation:
         # (V slot 1+m reads MARKS[m] for m=0..6 = MARK_PC, MARK_AX,
         # MARK_SP, MARK_BP, MARK_MEM, MARK_SE, MARK_CS). Previously only
         # MARK_SE_ONLY + MARK_CS were declared (head 3 / head 5 inputs).
+        # Head 6 (2026-06-10): also reads MARK_SE_ONLY (Q-gate) and
+        # MARK_AX (K/V projection) -- both already in this set.
         reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST",
                "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
                "MARK_MEM", "MARK_SE"},
-        writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH"},
+        writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH",
+                "SE_REG_AX_PRESENT"},
         kind="attn",
         # Phase 8.G.6: drop ``layer_idx=1`` literal. ``requires["after"]
         # = layer0_threshold_attn`` (below) is the structural pin: the
@@ -479,16 +538,52 @@ def make_layer1_threshold_attn_op() -> Operation:
     )
 
 
+def _step_end_reg_present_head_spec(
+    proxy, *, head_idx: int,
+) -> DeclarativeAttentionHeadSpec:
+    """L1 head 6: within-step MARK_AX -> MARK_SE presence broadcast.
+
+    Single-channel relay: Q anchors at ``MARK_SE_ONLY`` (Q[0] = 10
+    only at the SE row); K anchors at ``MARK_AX`` (K[0] = 10 only at
+    the AX marker row); V copies the ``MARK_AX`` value (= 1 at AX
+    rows) into V[1]; O lifts V[1] into ``SE_REG_AX_PRESENT`` at the
+    SE row. With ALiBi slope 0.2 the within-step MARK_AX (distance
+    29 from SE) dominates the softmax1 over the prior-step MARK_AX
+    (distance 64) by a factor of ~exp(7) ~= 1100.
+
+    This is intentionally a single-marker broadcast: the other
+    ``SE_REG_<NAME>_PRESENT`` slots (PC / SP / BP / STACK0 / MEM)
+    remain declared but unwritten in this commit. The five remaining
+    slots are the scaffolding for follow-on broadcast heads (at L1
+    head 7 or later layers) and mirror the ``STACK0_BYTE_VAL_h_*``
+    pattern of "declare the family up-front, fill it incrementally".
+
+    Same Q/K/V/O shape as L1 head 3 (HAS_SE) -- only the gates and
+    the destination dim differ. See
+    docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md §4 (Wave A).
+    """
+
+    L = 10.0
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=(AP(0, proxy.MARK_SE_ONLY, L),),
+        k=(AP(0, proxy.MARK_AX, L),),
+        v=(AP(1, proxy.MARK_AX, 1.0),),
+        o=(AO(proxy.SE_REG_AX_PRESENT, 1, 1.0),),
+    )
+
+
 def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
     """``compiler_ir_factory`` for ``layer1_threshold_attn``.
 
     Resolves head indices via :func:`_allocate_layer1_attn_heads` so the
     IR and the bake share a single source of truth. After the Phase
     7.B.2-attn pin drop the allocator runs in ``dynamic_first_fit``
-    mode; with no other claimants on the L1 attention pool the 6
-    declaration-order entries always land at indices 0..5 -- so the
+    mode; with no other claimants on the L1 attention pool the 7
+    declaration-order entries always land at indices 0..6 -- so the
     IR's spec walk reproduces the legacy ``heads=[0,1,2]``+3+``[4]``+5
-    schedule byte-identically.
+    schedule byte-identically and adds head 6 (the STEP_END register-
+    presence broadcast) at slot 6.
     """
 
     proxy = _as_setdim_proxy(dim_positions)
@@ -503,6 +598,7 @@ def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
     h_has_se = by_name["layer1_threshold_attn.has_se"]
     h_l1h4 = by_name["layer1_threshold_attn.l1h4"]
     h_in_step_fresh = by_name["layer1_threshold_attn.in_step_fresh"]
+    h_step_end_reg = by_name["layer1_threshold_attn.step_end_reg_present"]
     ir = CompilerIR()
     specs = list(Primitives.threshold_attention_head_specs(
         [0.5, 1.5, 2.5],
@@ -540,6 +636,10 @@ def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
             AP(1, proxy.MARK_CS, 1.0),
         ),
         o=(AO(proxy.IN_STEP_FRESH, 1, 1.0),),
+    ))
+    # Head 6 (2026-06-10): STEP_END register-presence broadcast.
+    specs.append(_step_end_reg_present_head_spec(
+        proxy, head_idx=h_step_end_reg,
     ))
     ir.layer(0).attention.extend(specs)
     return ir

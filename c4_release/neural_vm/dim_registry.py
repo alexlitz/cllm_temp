@@ -493,7 +493,16 @@ def build_default_registry() -> DimRegistry:
     # opt-in NORM_COMPENSATOR area (733). Scaffolding only — no writer
     # or reader at this commit (those land in Wave-1 A3 / L14 migration).
     # See docs/WAVE_PLAN_2026_06_07.md §A1.
-    a = Allocator(d_model=832)
+    #
+    # STEP_END register-presence broadcast (2026-06-10): d_model
+    # further expanded 832 -> 840 to carry the
+    # ``SE_REG_<MARK>_PRESENT`` family (6 names × 1 wide) at positions
+    # 831..836, just after BZ_TARGET_FRESH at 830, plus 3 reserved
+    # cells (837..839) so d_model stays divisible by n_heads=8.
+    # Written by the new L1 within-step broadcast head (head 6,
+    # ``layer1_threshold_attn.step_end_reg_present``).
+    # See docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
+    a = Allocator(d_model=840)
 
     def _pin(name, start, size, desc, semantics=None, alias=False):
         """Thin wrapper that mirrors ``DimRegistry.alloc``'s signature so
@@ -1198,6 +1207,39 @@ def build_default_registry() -> DimRegistry:
     _pin("BZ_TARGET_FRESH", 830, 1,
               "C5: previous step was a BZ-taken step (cross-step gate)",
               semantics="mark == PC")
+
+    # ------------------------------------------------------------------
+    # STEP_END register-presence broadcast (2026-06-10, L1 head 6).
+    # ------------------------------------------------------------------
+    # ``SE_REG_<MARK>_PRESENT`` (831..836, 1 wide each) is written by
+    # the new L1 within-step broadcast head 6
+    # (``layer1_threshold_attn.step_end_reg_present``). The head
+    # anchors Q on MARK_SE_ONLY and projects each register marker's
+    # presence-flag into the matching SE-position slot. ALiBi slope
+    # bounds the broadcast to the current step.
+    #
+    # These slots are the L0/L1 foundation of the
+    # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md migration; the
+    # parallel Wave-A L11 relay broadcasts post-producer compute
+    # slots (OP_<NAME>, AX_CARRY, ALU, CMP, STACK0_BYTE0..3).
+    _pin("SE_REG_AX_PRESENT", 831, 1,
+              "MARK_AX presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
+    _pin("SE_REG_PC_PRESENT", 832, 1,
+              "MARK_PC presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
+    _pin("SE_REG_SP_PRESENT", 833, 1,
+              "MARK_SP presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
+    _pin("SE_REG_BP_PRESENT", 834, 1,
+              "MARK_BP presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
+    _pin("SE_REG_STACK0_PRESENT", 835, 1,
+              "MARK_STACK0 presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
+    _pin("SE_REG_MEM_PRESENT", 836, 1,
+              "MARK_MEM presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
 
     reg = a.to_registry()
     _register_default_categories(reg)
