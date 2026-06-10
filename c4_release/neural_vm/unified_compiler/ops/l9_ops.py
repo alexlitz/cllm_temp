@@ -348,6 +348,24 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 7.E.3: gate uses :func:`dim_ref` for the
     ``(opcode_flag, ADJ)`` semantic pair.
+
+    Cluster 6 fix (2026-06-10): MARK_AX -> MARK_SE_ONLY (mirrors the
+    Wave B Cluster 2 migration applied to ``_layer8_alu_adj_lo_rules``
+    in commit b1e1f91e). The legacy MARK_AX-amplified units wrote
+    ``OUTPUT_HI_THIS_STEP+{result}`` at the AX marker row, which the LM
+    head reads as the AX byte 0 high nibble for the NEXT emitted token.
+    Because OP_ADJ persists into the post-ADJ step's MARK_AX row (via
+    Wave A's L11 ``step_end_operand_relay`` head, 10ca51a7) and the
+    unit's W_up reads ``ALU_HI.*.-1`` / ``CARRY.*.-1`` from the
+    previous step, the carry_in=0/a=0/b=0 unit (unit 1024) fired at
+    the post-ADJ REG_AX row and clobbered the preserved AX byte 0 high
+    nibble. Example: ``IMM 42; PSH; ADJ 8; EXIT`` returned 10 instead
+    of 42 because OUTPUT_HI+0 spiked from 3.14 to 34.99 at the L11
+    FFN, giving token 10 (low nibble 10 + high nibble 0) a higher
+    logit than token 42 (low nibble 10 + high nibble 2). Moving the
+    amplifier to MARK_SE_ONLY pushes the write into the STEP_END row
+    where the AX byte emit path does not consume it. See
+    ``docs/SMOKE_TRIAGE_2026_06_10.md`` Cluster 6.
     """
 
     gate_adj = dim_ref("opcode_flag", "ADJ")
@@ -360,7 +378,15 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
         for a in range(16):
             for b in range(16):
                 result = (a + b + carry_in) % 16
-                conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
+                # Cluster 6 fix: MARK_AX -> MARK_SE_ONLY (Wave B Cluster
+                # 2 pattern). The Wave A step_end_operand_relay head
+                # (10ca51a7) broadcasts ALU_HI/FETCH_HI/CARRY/OP_ADJ
+                # from MARK_AX to MARK_SE_ONLY within the same step, so
+                # the same 10-way AND fires at STEP_END over identical
+                # operand state without clobbering the post-ADJ AX byte.
+                conditions: list[tuple[str, float]] = [
+                    ("MARK_SE_ONLY", 20.0),
+                ]
                 conditions.extend(
                     (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
                 )
@@ -373,7 +399,7 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     conditions.append(("CARRY+0", 8.0))
                     threshold = 50.0
                 rules.append(multi_way_and_rule(
-                    name=f"l9_adj_hi_c{carry_in}_a{a}_b{b}",
+                    name=f"l9_adj_hi_c{carry_in}_a{a}_b{b}_step_end",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_adj,
