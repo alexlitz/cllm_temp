@@ -134,6 +134,17 @@ def _layer11_mul_partial_rules_for_a_lo(
     the ``TEMP+partial`` write stay as ``+N`` -- the ``partial`` offset
     is a value-bus lookup index (computed nibble of the MUL partial
     product), not a role-meaningful byte position.
+
+    Wave B Cluster 4 (2026-06-10): position marker migrated from
+    ``MARK_AX`` to ``MARK_SE_ONLY``. The Wave A ``step_end_operand_relay``
+    head (``make_layer11_step_end_operand_relay_op``, commit 10ca51a7)
+    broadcasts ALU_LO, AX_CARRY_LO/HI, and OP_MUL from MARK_AX to
+    MARK_SE_ONLY within the same step, so the same SwiGLU 4-way AND
+    fires at STEP_END over identical operand state. The TEMP[partial]
+    write is intermediate (not a byte-emit slot) and the lowering
+    cursor / unit layout are unchanged, preserving byte-identity. See
+    ``docs/WAVE_B_CLUSTER_4_PLAN_2026_06_10.md`` and
+    ``docs/STEP_END_MIGRATION_TEMPLATE.md`` for the recipe.
     """
     if not 0 <= a_lo < 16:
         raise ValueError(f"a_lo must be in [0, 16), got {a_lo}")
@@ -146,7 +157,9 @@ def _layer11_mul_partial_rules_for_a_lo(
             rules.append(multi_way_and_rule(
                 name=f"l11_mul_partial_a{a_lo:02d}_b{b_lo:02d}_h{b_hi:02d}",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    # Wave B Cluster 4: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 1.0),
                     # structural offset: a_lo/b_lo/b_hi are nibble-value
                     # one-hot lookup indices into the operand bands.
                     (f"ALU_LO+{a_lo}", 1.0),

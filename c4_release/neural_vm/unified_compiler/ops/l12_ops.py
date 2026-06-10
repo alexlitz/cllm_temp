@@ -84,6 +84,18 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
     (``TEMP+partial``, ``ALU_HI+a_hi``, ``AX_CARRY_LO+b_lo``) and the
     ``OUTPUT_HI+result_hi`` write stay as ``+N`` -- ``result_hi`` is a
     value-bus lookup index, not a role-meaningful byte position.
+
+    Wave B Cluster 4 (2026-06-10): position marker migrated from
+    ``MARK_AX`` to ``MARK_SE_ONLY``. The Wave A
+    ``step_end_operand_relay`` head (commit 10ca51a7) broadcasts
+    ALU_HI, AX_CARRY_LO, and OP_MUL from MARK_AX to MARK_SE_ONLY
+    within the same step. The L11 MUL partial output is staged in
+    TEMP[partial] at MARK_AX and re-read at MARK_SE_ONLY via the
+    standard intra-step residual carry. The ``OUTPUT_HI+result_hi``
+    write is preserved -- the residue lands on the STEP_END row and
+    is picked up by the byte-row relay downstream. See
+    ``docs/WAVE_B_CLUSTER_4_PLAN_2026_06_10.md`` and
+    ``docs/STEP_END_MIGRATION_TEMPLATE.md`` for the recipe.
     """
     write_scale = 2.0 / S
     gate_mul = dim_ref("opcode_flag", "MUL")
@@ -96,7 +108,13 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 rules.append(multi_way_and_rule(
                     name=f"l12_mul_combine_p{partial:02d}_ah{a_hi:02d}_bl{b_lo:02d}",
                     conditions=(
-                        ("MARK_AX", 1.0),
+                        # Wave B Cluster 4: MARK_AX -> MARK_SE_ONLY
+                        # under Wave A step_end_operand_relay
+                        # (10ca51a7). The L11-staged TEMP[partial]
+                        # carries to STEP_END via the intra-step
+                        # residual; ALU_HI / AX_CARRY_LO / OP_MUL ride
+                        # the relay.
+                        ("MARK_SE_ONLY", 1.0),
                         (f"TEMP+{partial}", 1.0),
                         (f"ALU_HI+{a_hi}", 1.0),
                         (f"AX_CARRY_LO+{b_lo}", 1.0),
@@ -104,9 +122,9 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
                     threshold=7.5,
                     gate=gate_mul,
                     writes=((f"OUTPUT_HI+{result_hi}", write_scale),),
-                    scope="MARK_AX and OP_MUL",
+                    scope="MARK_SE_ONLY and OP_MUL",
                     dominates_at={
-                        f"OUTPUT_HI+{result_hi}": "MARK_AX and OP_MUL",
+                        f"OUTPUT_HI+{result_hi}": "MARK_SE_ONLY and OP_MUL",
                     },
                 ))
 

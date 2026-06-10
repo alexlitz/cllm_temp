@@ -155,8 +155,8 @@ _MEMORY_READ_PATTERNS = (
 # commit; the ratchet only walks downward.
 _BASELINE: Dict[str, int] = {
     "c4_release/neural_vm/unified_compiler/ops/l10_ops.py": 15,
-    "c4_release/neural_vm/unified_compiler/ops/l11_ops.py": 1,
-    "c4_release/neural_vm/unified_compiler/ops/l12_ops.py": 1,
+    "c4_release/neural_vm/unified_compiler/ops/l11_ops.py": 0,  # Wave B Cluster 4 (2026-06-10)
+    "c4_release/neural_vm/unified_compiler/ops/l12_ops.py": 0,  # Wave B Cluster 4 (2026-06-10)
     "c4_release/neural_vm/unified_compiler/ops/l3_ops.py": 4,
     "c4_release/neural_vm/unified_compiler/ops/l6_ops.py": 2,
     "c4_release/neural_vm/unified_compiler/ops/l8_ops.py": 14,
