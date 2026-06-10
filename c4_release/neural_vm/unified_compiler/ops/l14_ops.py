@@ -3264,12 +3264,22 @@ def _addr_key_make_rule(
             writes=writes,
             scope=scope,
         )
+    # Mirror the conditions-side MARK_MEM hard blocker into gate_terms so
+    # the dim_alias_verifier's gate-fallback predicate (used when the
+    # AND-of-condition-semantics is unsat) is tightened to exclude MEM
+    # rows. Without this, the gate-fallback at byte_off=3 reduces to
+    # the tautological H2+4 semantics and re-admits MEM rows. Runtime
+    # impact at intended firing positions (MARK_MEM == 0) is zero.
+    gate_terms = (
+        (("MARK_MEM", -1e6),) if "MARK_MEM" in {c[0] for c in conditions} else ()
+    )
     return multi_way_and_rule(
         name=name,
         conditions=conditions,
         threshold=threshold,
         writes=writes,
         scope=scope,
+        gate_terms=gate_terms,
         **gate_kwargs,
     )
 
@@ -3313,6 +3323,13 @@ def _layer14_addr_key_neural_decode_lo_hi_rules(
                         (gate_dim_name, 1.0),
                         (f"ADDR_B0_LO+{lo}", 1.0),
                         (f"ADDR_B0_HI+{hi}", 1.0),
+                        # Hard MARK_MEM blocker: at MEM marker rows
+                        # ADDR_B0_LO/HI carry the *address* byte (aliased
+                        # with OPCODE_BYTE_LO/HI), so the dispatch atom
+                        # would read garbage. Byte-identical at intended
+                        # firing positions (MARK_MEM == 0).
+                        # dim_alias_verifier HARD_BLOCKER_THRESHOLD = 1e6.
+                        ("MARK_MEM", -1e6),
                     ),
                     threshold=2.5,
                     writes=(
@@ -3355,6 +3372,8 @@ def _layer14_addr_key_neural_decode_top_common_rules(
                 conditions=(
                     (gate_dim_name, 1.0),
                     (f"ADDR_B1_LO+{b1_lo}", 1.0),
+                    # Hard MARK_MEM blocker — see _lo_hi_rules.
+                    ("MARK_MEM", -1e6),
                 ),
                 threshold=1.5,
                 writes=(
@@ -3406,6 +3425,8 @@ def _layer14_addr_key_neural_decode_top_carry_rules(
                         ("ADDR_B0_HI+15", 1.0),
                         (f"ADDR_B0_LO+{lo}", 1.0),
                         (f"ADDR_B1_LO+{b1_lo}", 1.0),
+                        # Hard MARK_MEM blocker — see _lo_hi_rules.
+                        ("MARK_MEM", -1e6),
                     ),
                     threshold=3.5,
                     writes=(

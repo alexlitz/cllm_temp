@@ -77,12 +77,22 @@ def _add_stack0_x0_alu_materializer(
     standard mapping ``{"OUTPUT_LO": <predicate>, "OUTPUT_HI_THIS_STEP": <predicate>}``.
     """
 
+    # Gate-side MARK_MEM hard blocker — the gate dim ALU_LO/HI has
+    # semantics `mark == AX OR (is_byte AND byte_index == 0)`. When the
+    # condition AND collapses (under the verifier's over-approximation
+    # of MARK_STACK0 and ADDR_B0_LO's `mark == MEM` semantics), the
+    # gate-fallback predicate over-admits MEM rows where the slot
+    # carries OPCODE_BYTE_LO / ADDR_B0_LO. Gate-side blocker forces the
+    # fallback to exclude MEM rows. Byte-identical at intended firing
+    # positions (MARK_STACK0 rows with MARK_MEM == 0).
+    gate_terms = (("MARK_MEM", -1e6),)
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_{family}_marker_from_alu_lo_{k}",
             conditions=conditions,
             threshold=threshold,
             gate=f"ALU_LO+{k}",
+            gate_terms=gate_terms,
             writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
             scope=scope,
             dominates_at=dominates_at,
@@ -93,6 +103,7 @@ def _add_stack0_x0_alu_materializer(
             conditions=conditions,
             threshold=threshold,
             gate=f"ALU_HI+{k}",
+            gate_terms=gate_terms,
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 50.0 / S),),
             scope=scope,
             dominates_at=dominates_at,
@@ -132,7 +143,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_PC", -15.0),
         ("MARK_AX", -50.0),
         ("MARK_STACK0", -15.0),
-        ("MARK_MEM", -15.0),
+        # MARK_MEM bumped from -15 to -1e6 (HARD_BLOCKER_THRESHOLD) so
+        # the dim_alias_verifier treats it as a hard NOT-blocker. Bake
+        # math unchanged at intended firing positions (MARK_MEM == 0
+        # at MARK_SP rows).
+        ("MARK_MEM", -1e6),
         ("H3+4", -15.0),
         ("MARK_SE", -15.0),
         ("BYTE_INDEX_0", -10.0),
@@ -142,12 +157,18 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
+    # Gate-side MARK_MEM hard blocker — when the condition AND collapses
+    # to mark==MEM (because ADDR_B0_LO has mark==MEM semantics and the
+    # gate is parsed as positive), the gate-fallback would over-admit MEM
+    # rows. The gate-side blocker forces the fallback to exclude MEM rows.
+    sp_bp_plus16_gate_terms = (("MARK_MEM", -1e6),)
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_sp_bp_plus16_lo_{k}",
             conditions=sp_value_base_conditions + ((f"ADDR_B0_LO+{k}", 1.0),),
             threshold=40.0,
             gate=f"ADDR_B0_LO+{k}",
+            gate_terms=sp_bp_plus16_gate_terms,
             writes=((f"OUTPUT_LO+{k}", write_scale),),
         ))
     for k in range(16):
@@ -157,6 +178,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=sp_value_base_conditions + ((f"ADDR_B0_HI+{k}", 1.0),),
             threshold=40.0,
             gate=f"ADDR_B0_HI+{k}",
+            gate_terms=sp_bp_plus16_gate_terms,
             writes=((f"OUTPUT_HI_THIS_STEP+{result}", write_scale),),
         ))
 
@@ -526,7 +548,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_AX", -10.0),
         ("MARK_SP", -10.0),
         ("MARK_BP", -10.0),
-        ("MARK_MEM", -300.0),
+        # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
+        # dim_alias_verifier treats it as a hard NOT-blocker; runtime
+        # firing positions have MARK_MEM == 0 so bake math is unchanged.
+        ("MARK_MEM", -1e6),
     )
     stack0_e8_marker_conditions = stack0_e8_marker_base_conditions + (
         # Current SI/SC top-store markers carry residual MEM_STORE around 0.4;
@@ -616,7 +641,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_AX", -10.0),
         ("MARK_SP", -10.0),
         ("MARK_BP", -10.0),
-        ("MARK_MEM", -300.0),
+        # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
+        # dim_alias_verifier treats it as a hard NOT-blocker; runtime
+        # firing positions have MARK_MEM == 0 so bake math is unchanged.
+        ("MARK_MEM", -1e6),
     )
     stack0_e0_marker_threshold = 12.0
     # NOTE(L16-e0-marker-scope-honest): same shape as the e8 family above --
@@ -650,7 +678,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_AX", -10.0),
         ("MARK_SP", -10.0),
         ("MARK_BP", -10.0),
-        ("MARK_MEM", -10.0),
+        # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
+        # dim_alias_verifier treats it as a hard NOT-blocker; runtime
+        # firing positions have MARK_MEM == 0 so bake math is unchanged.
+        ("MARK_MEM", -1e6),
     )
     # NOTE(L16-f8-marker-scope-honest): same shape as the e8/e0 families
     # above -- the verifier-inferred effective predicate is the gate-only
@@ -992,7 +1023,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_SP", -10.0),
         ("MARK_BP", -10.0),
         ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
+        # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
+        # dim_alias_verifier treats it as a hard NOT-blocker.
+        ("MARK_MEM", -1e6),
     )
     stack0_byte1_zero = 1000.0 / S
     rules.append(multi_way_and_rule(

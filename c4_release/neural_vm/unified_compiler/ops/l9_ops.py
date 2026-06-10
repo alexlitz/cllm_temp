@@ -821,6 +821,12 @@ def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OP_LEV", 1.0 / 5.0),
                 ("MARK_BP", -10.0),
                 ("MARK_SP", -10.0),
+                # MARK_MEM hard blocker — the gate dim ADDR_B0_LO+k
+                # aliases OPCODE_BYTE_LO at byte rows. MARK_SE_ONLY in
+                # conditions restricts to STEP_END rows at runtime; the
+                # blocker tightens the dim_alias_verifier's effective
+                # predicate so MEM rows are explicitly excluded.
+                ("MARK_MEM", -1e6),
             ),
             threshold=1.5,
             gate=f"ADDR_B0_LO+{k}",
@@ -864,6 +870,12 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_LEV", 1.0 / 5.0),
         ("MARK_BP", -10.0),
         ("MARK_SP", -10.0),
+        # MARK_MEM hard blocker — the cascade rules' gate
+        # `ADDR_B0_LO+0` aliases the MEM-address slot at MEM rows.
+        # MARK_PC in conditions already restricts firing to PC rows at
+        # runtime; the blocker tightens the dim_alias_verifier's effective
+        # predicate so MEM rows are explicitly excluded.
+        ("MARK_MEM", -1e6),
     )
     threshold = 1.5
 

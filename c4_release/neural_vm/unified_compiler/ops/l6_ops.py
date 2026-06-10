@@ -1718,6 +1718,13 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
     #   * 32 ALU clear constants (no gate) at MARK_AX, writing -10/S to
     #     ALU_{LO,HI}+k to clear the ALU band.
     rules = []
+    # Hard MARK_MEM blocker on gate_terms — the gate dim OPCODE_BYTE_{LO,HI}
+    # has semantics `mark == MEM OR (is_byte AND byte_index == 0)`, which
+    # over-approximates to admit MEM rows in the dim_alias_verifier's
+    # gate-fallback mode. MARK_AX in conditions already restricts firing
+    # to AX rows at runtime; the gate-side blocker tightens the predicate
+    # so MEM rows are explicitly excluded. Byte-identical at intended
+    # firing positions (MARK_MEM == 0 at MARK_AX rows).
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l6_opcode_lo_cleanup_{k}",
@@ -1725,6 +1732,7 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=0.5,
             gate=f"OPCODE_BYTE_LO+{k}",
             gate_weight=-1.0,
+            gate_terms=(("MARK_MEM", -1e6),),
             writes=((f"ADDR_B0_LO+{k}", 2.0 / S),),
         ))
     for k in range(16):
@@ -1734,6 +1742,7 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=0.5,
             gate=f"OPCODE_BYTE_HI+{k}",
             gate_weight=-1.0,
+            gate_terms=(("MARK_MEM", -1e6),),
             writes=((f"ADDR_B1_LO+{k}", 2.0 / S),),
         ))
     for dim_name in ("MEM_STORE", "MEM_ADDR_SRC"):
