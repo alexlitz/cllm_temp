@@ -2208,7 +2208,17 @@ def _layer8_op_imm_relay_ir(dim_positions, HD) -> CompilerIR:
 
 
 def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
-    """Declarative replacement for the L8 head-4 OP_IMM relay bake."""
+    """Declarative replacement for the L8 head-4 OP_IMM relay bake.
+
+    ALiBi recency (slope 0.5) discriminates the slot-0 K signal across
+    multiple prior MARK_AX rows. Without it, softmax averages OP_IMM
+    across ALL prior MARK_AX positions; for multi-IMM programs (e.g.
+    ``IMM 0x200; PSH; IMM 0x1234``) this dilutes the 3rd IMM's relay
+    value below the L8 multibyte_routing threshold (6.5). Slope 0.5
+    pulls the most-recent matching MARK_AX to the front and lets the
+    IMM step's AX byte 0 land on the correct token. Matches the slope
+    used by the L9 ALiBi relay heads (l9_ops.py:1375+).
+    """
 
     AX_I = 1
     L8_relay = 20.0
@@ -2229,6 +2239,7 @@ def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         ),
         v=(AP(0, BD.OP_IMM, 1.0),),
         o=(AO(BD.OP_IMM, 0, 1.0),),
+        alibi_slope=0.5,
     )
 
 
