@@ -1372,30 +1372,42 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
         AP(43, BD.BYTE_INDEX_2, ROW_SELECT),
         AP(43, BD.CONST, ROW_SELECT_BIAS),
     )
+    # Part 2 fix (test_si_li_16bit_value): the CONST-weighted
+    # STORE_ROW_SELECT_BIAS used to apply on every Q row regardless of
+    # the active opcode. K[44..47] reads MEM_STORE*STORE_SELECT (=500);
+    # residual MEM_STORE leakage at byte 1 rows (~0.0086) of past steps
+    # multiplied by Q[44..47]=-50*S=-5000 accumulated ~-85k of unfair
+    # penalty against the most recent prior AX byte 1 K-row, causing the
+    # SI step's L10 AX byte_passthrough to attend to the older
+    # IMM 0x200's byte 1 (=0x02) instead of IMM 0x1234's byte 1 (=0x12).
+    # Fold the bias into the OP_LI_RELAY weight so the bias only applies
+    # when OP_LI_RELAY=1 (i.e. only during LI steps, the design intent):
+    # at LI step the effective Q[slot] contribution from OP_LI_RELAY is
+    # M + STORE_ROW_SELECT_BIAS = 50*S - 50*S = 0 (vs. the original
+    # M (=+5000) at LI step from OP_LI_RELAY plus a CONST term of
+    # -50*S=-5000 -> same net 0). At non-LI steps the contribution is 0
+    # instead of the original CONST*-50*S=-5000, removing the spurious
+    # MEM_STORE-leak penalty against past steps' byte 1 K-rows.
+    LI_GATED_BIAS = M + STORE_ROW_SELECT_BIAS  # = +5000 + -5000 = 0 (= original net at LI step)
     marker_store_query = (
-        AP(44, BD.OP_LI_RELAY, M),
+        AP(44, BD.OP_LI_RELAY, LI_GATED_BIAS),
         AP(44, BD.MARK_AX, STORE_ROW_SELECT),
-        AP(44, BD.CONST, STORE_ROW_SELECT_BIAS),
     )
     marker_addr_source_query = (
-        AP(48, BD.OP_LI_RELAY, M),
+        AP(48, BD.OP_LI_RELAY, LI_GATED_BIAS),
         AP(48, BD.MARK_AX, STORE_ROW_SELECT),
-        AP(48, BD.CONST, STORE_ROW_SELECT_BIAS),
     )
     byte0_store_query = (
-        AP(45, BD.OP_LI_RELAY, M),
+        AP(45, BD.OP_LI_RELAY, LI_GATED_BIAS),
         AP(45, BD.BYTE_INDEX_0, STORE_ROW_SELECT),
-        AP(45, BD.CONST, STORE_ROW_SELECT_BIAS),
     )
     byte1_store_query = (
-        AP(46, BD.OP_LI_RELAY, M),
+        AP(46, BD.OP_LI_RELAY, LI_GATED_BIAS),
         AP(46, BD.BYTE_INDEX_1, STORE_ROW_SELECT),
-        AP(46, BD.CONST, STORE_ROW_SELECT_BIAS),
     )
     byte2_store_query = (
-        AP(47, BD.OP_LI_RELAY, M),
+        AP(47, BD.OP_LI_RELAY, LI_GATED_BIAS),
         AP(47, BD.BYTE_INDEX_2, STORE_ROW_SELECT),
-        AP(47, BD.CONST, STORE_ROW_SELECT_BIAS),
     )
     store_ax_byte1_query = (
         AP(81, BD.OP_SI, STORE_AX_BYTE1_SELECT),
