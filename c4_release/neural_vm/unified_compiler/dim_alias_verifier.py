@@ -417,6 +417,85 @@ _SLOT_OPCODE_OWNERS: Dict[str, frozenset[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Improvement D (2026-06-10): phase_in_step disjointness
+# ---------------------------------------------------------------------------
+#
+# Several alias pairs are NOT disambiguable via opcode_in_step (the previous
+# atom) because at least one side is opcode-universal (every opcode performs
+# a fetch). The textbook example is ``DIV_STAGING ↔ FETCH_LO/HI``:
+#
+# * DIV_STAGING owner set = {DIV, MOD} (EXEC phase, DIV/MOD only).
+# * FETCH_LO/HI owner set = ALL opcodes (every opcode fetches its
+#   instruction byte during the FETCH phase).
+#
+# Opcode-set intersection is non-empty (DIV/MOD ⊂ all), so opcode_in_step
+# disjointness CAN'T fire. But the two slots are LIVE in different VM-step
+# PHASES:
+#
+#   step phases (ordered): FETCH -> DECODE -> EXEC -> WRITEBACK
+#
+# A rule that fires during FETCH (gates/conditions a FETCH-phase slot like
+# FETCH_HI/IMM_STAGING) cannot collide with an EXEC-phase scratch slot like
+# DIV_STAGING / MUL_ACCUM. Phases are mutually disjoint by VM construction.
+#
+# This atom mirrors opcode_in_step exactly:
+#
+# 1. **Rule phase set** — derived from positive references in
+#    ``conditions`` / ``gate_terms`` / ``gate`` to slots whose static phase
+#    owner is known. ``FETCH_HI+N`` as a positive condition implies the
+#    rule fires during the FETCH phase.
+# 2. **Slot phase owner set** — taken from the static
+#    ``_SLOT_PHASE_OWNERS`` table below (slots whose lifetime is genuinely
+#    phase-scoped by VM-step construction).
+#
+# When BOTH sets are non-empty and DISJOINT, the rule cannot fire in any
+# step-phase that touches the sibling's value — skip the violation.
+# Conservative: empty / unknown sets yield NO suppression.
+
+# Phase names used by the atom. Closed set; alphabetical for determinism.
+# FETCH        — instruction-byte fetch (PC/byte_index=0..3 rows)
+# DECODE       — opcode dispatch / immediate staging assembly
+# EXEC         — opcode-specific compute (ALU scratch, address calc)
+# WRITEBACK    — MEM stores, IO state-machine latches
+_PHASE_NAMES = frozenset({"FETCH", "DECODE", "EXEC", "WRITEBACK"})
+
+# Static map: slot name → set of phases that "own" the slot's value in any
+# given step. Conservative — only include slots whose lifetime is genuinely
+# phase-scoped. A slot omitted from this table contributes ``None`` (unknown)
+# to the rule's phase set and never participates in suppression.
+#
+# Notes
+# -----
+# * FETCH_LO/HI / IMM_STAGING are fetched/staged during FETCH; they are
+#   read by DECODE-phase dispatch rules so we include DECODE as well (a
+#   rule that gates on FETCH_HI may fire in either FETCH or DECODE).
+# * MEM_STORE is the SI/SC/PSH store wire — strictly WRITEBACK.
+# * DIV_STAGING / MUL_ACCUM are ALU compute scratch — strictly EXEC.
+# * IO_OUTPUT_COUNT and the IO state-machine latches fire on the
+#   PRTF/READ tool-call return path — strictly WRITEBACK.
+#
+# Adding a slot here is the CHEAPEST cleanup. Removing a slot is safe
+# (loses suppression power, never introduces false negatives).
+_SLOT_PHASE_OWNERS: Dict[str, frozenset[str]] = {
+    # FETCH-phase slots: instruction-byte fetch and immediate staging.
+    # Conservative: a rule whose positive condition is a FETCH_* / IMM_*
+    # reference fires during the FETCH/DECODE window; assigning {FETCH,
+    # DECODE} keeps the rule phase set disjoint from EXEC/WRITEBACK
+    # without artificially constraining DECODE-phase consumers.
+    "FETCH_LO": frozenset({"FETCH", "DECODE"}),
+    "FETCH_HI": frozenset({"FETCH", "DECODE"}),
+    "IMM_STAGING": frozenset({"FETCH", "DECODE"}),
+    # EXEC-phase scratch: ALU compute.
+    "DIV_STAGING": frozenset({"EXEC"}),
+    "MUL_ACCUM": frozenset({"EXEC"}),
+    "ADJ_CARRY": frozenset({"EXEC"}),
+    # WRITEBACK-phase slots: MEM stores and IO state-machine latches.
+    "MEM_STORE": frozenset({"WRITEBACK"}),
+    "IO_OUTPUT_COUNT": frozenset({"WRITEBACK"}),
+}
+
+
 def _walk_atoms(p: Predicate, out: List[Atom]) -> None:
     """Append every leaf Atom node reachable from ``p`` into ``out``."""
     if isinstance(p, Atom):
@@ -552,6 +631,70 @@ def _rule_opcode_in_step_set(
     return frozenset(found)
 
 
+def _slot_phase_in_step_set(
+    name: str,
+) -> Optional[frozenset[str]]:
+    """Best-effort phase set for slot ``name``.
+
+    Only consults the static ``_SLOT_PHASE_OWNERS`` table — there is no
+    phase atom in the predicate DSL, so semantics-based extraction is not
+    available. Returns ``None`` when the slot is not phase-scoped (the
+    disjointness check skips the suppression and the violation stands).
+    """
+    return _SLOT_PHASE_OWNERS.get(name)
+
+
+def _rule_phase_in_step_set(rule: FFNRule) -> Optional[frozenset[str]]:
+    """Derive the rule's phase-in-step constraint from its positive
+    references to phase-scoped slots.
+
+    The intuition mirrors :func:`_rule_opcode_in_step_set`: a rule that
+    lists ``("FETCH_HI+5", 1.0)`` as a positive condition only fires
+    during the FETCH-phase window in which FETCH_HI is live, so the
+    rule's phase set is FETCH_HI's owner set ``{FETCH, DECODE}``.
+    Multiple positive references intersect (the rule fires only when
+    every cited slot is live), so the rule phase set is the
+    intersection of each referenced slot's phase owners.
+
+    Positive references are collected from:
+      * ``rule.conditions`` with positive weight,
+      * ``rule.gate_terms`` with positive weight,
+      * ``rule.gate`` (always positive when present).
+
+    Returns ``None`` if no positive reference targets a phase-owned slot
+    — the rule's phase context is unknown and disjointness can't be
+    asserted. Returns the intersection of owner sets otherwise (empty
+    intersection means the rule cites mutually-exclusive phase slots,
+    which already entails ``satisfiable`` would be False; treated as
+    unknown for safety).
+    """
+    sets: List[frozenset[str]] = []
+
+    def _add_from_dim_name(dim_name: str) -> None:
+        owners = _SLOT_PHASE_OWNERS.get(dim_name)
+        if owners:
+            sets.append(owners)
+
+    for term in rule.conditions:
+        if term.weight > 0:
+            _add_from_dim_name(term.dim.name)
+    for term in rule.gate_terms:
+        if term.weight > 0:
+            _add_from_dim_name(term.dim.name)
+    if rule.gate is not None:
+        _add_from_dim_name(rule.gate.name)
+
+    if not sets:
+        return None
+    # Intersection across all cited phase-scoped references.
+    out = set(sets[0])
+    for s in sets[1:]:
+        out &= s
+    if not out:
+        return None
+    return frozenset(out)
+
+
 def _slot_semantics_is_tautology(
     registry: DimRegistry,
     name: str,
@@ -589,6 +732,7 @@ def verify_dim_aliases(
     skip_colocated_subbank: bool = True,
     skip_tautological_siblings: bool = True,
     skip_opcode_in_step_disjoint: bool = True,
+    skip_phase_in_step_disjoint: bool = True,
     tautology_cache: Optional[Dict[str, bool]] = None,
     opcode_semantics_cache: Optional[
         Dict[str, Optional[frozenset[str]]]
@@ -656,6 +800,15 @@ def verify_dim_aliases(
                 rule, registry, opcode_semantics_cache,
             )
 
+        # Improvement D (2026-06-10): derive the rule's phase_in_step
+        # constraint set from positive references to phase-scoped slots
+        # (FETCH_LO/HI, IMM_STAGING, DIV_STAGING, MUL_ACCUM, MEM_STORE,
+        # IO_OUTPUT_COUNT, ADJ_CARRY). Cached per (rule_id) for the inner
+        # sibling loop. ``None`` = unknown; never used to suppress.
+        rule_phase_set: Optional[frozenset[str]] = None
+        if skip_phase_in_step_disjoint:
+            rule_phase_set = _rule_phase_in_step_set(rule)
+
         read_dims = _collect_read_dim_refs(rule)
         for dim_name, dim_offset in read_dims:
             siblings = alias_index.get(dim_name, [])
@@ -717,6 +870,27 @@ def verify_dim_aliases(
                         and rule_opcode_set.isdisjoint(sibling_opcode_set)
                     ):
                         continue
+                # Improvement D (2026-06-10): phase_in_step disjointness.
+                # If the rule's phase set (derived from positive
+                # references to phase-scoped slots) and the sibling slot's
+                # phase owner set (from the static table) are BOTH
+                # non-empty and DISJOINT, the rule fires in a step phase
+                # that does not touch the sibling's value — the alias is
+                # design-time phase-shared, not a real bug. Catches the
+                # DIV_STAGING ↔ FETCH_LO/HI family where opcode_in_step
+                # cannot fire (FETCH is opcode-universal).
+                if (
+                    skip_phase_in_step_disjoint
+                    and rule_phase_set is not None
+                    and rule_phase_set
+                ):
+                    sibling_phase_set = _slot_phase_in_step_set(sibling)
+                    if (
+                        sibling_phase_set is not None
+                        and sibling_phase_set
+                        and rule_phase_set.isdisjoint(sibling_phase_set)
+                    ):
+                        continue
                 violations.append(
                     AliasViolation(
                         op_name=op_name,
@@ -738,6 +912,7 @@ def verify_dim_aliases_for_ops(
     skip_colocated_subbank: bool = True,
     skip_tautological_siblings: bool = True,
     skip_opcode_in_step_disjoint: bool = True,
+    skip_phase_in_step_disjoint: bool = True,
 ) -> List[AliasViolation]:
     """Run :func:`verify_dim_aliases` over an iterable of ops, sharing
     the alias index across calls.
@@ -757,6 +932,7 @@ def verify_dim_aliases_for_ops(
             skip_colocated_subbank=skip_colocated_subbank,
             skip_tautological_siblings=skip_tautological_siblings,
             skip_opcode_in_step_disjoint=skip_opcode_in_step_disjoint,
+            skip_phase_in_step_disjoint=skip_phase_in_step_disjoint,
             tautology_cache=tautology_cache,
             opcode_semantics_cache=opcode_semantics_cache,
         ):

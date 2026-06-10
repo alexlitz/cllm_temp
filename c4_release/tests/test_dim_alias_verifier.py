@@ -538,3 +538,187 @@ def test_same_extent_alias_without_refinement_stays_flagged():
         "ADDR_B0_LO alias (no semantic refinement, just verbatim "
         f"disjunct equality); got {violations!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 5) Improvement D (2026-06-10): phase_in_step disjointness
+# ---------------------------------------------------------------------------
+
+
+def _make_phase_aliasing_registry() -> DimRegistry:
+    """Registry with a FETCH-phase slot and an EXEC-phase slot at the
+    same byte range (FETCH_HI / DIV_STAGING analog). Both slots'
+    semantics overlap (each admits ``is_byte AND byte_index == 0``);
+    only the static ``_SLOT_PHASE_OWNERS`` table disambiguates them.
+    """
+    reg = DimRegistry(d_model=128)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    reg.alloc(
+        "IS_BYTE", 1, 1, "byte-row marker",
+        semantics="is_byte",
+    )
+    reg.alloc(
+        "BYTE_INDEX_0", 2, 1, "byte_index == 0",
+        semantics="byte_index == 0",
+    )
+    # FETCH_HI-like slot at byte 64 — semantics says PC or byte_index∈{0..3}.
+    reg.alloc(
+        "FETCH_HI", 64, 16, "FETCH_HI-like (FETCH-phase)",
+        semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})",
+    )
+    # DIV_STAGING-like slot at the same byte range — semantics admits
+    # mark == AX OR is_byte AND byte_index == 0; opcode owner is {DIV,MOD}
+    # but DIV/MOD ⊂ all-opcodes (FETCH is opcode-universal), so the
+    # opcode_in_step check CAN'T fire here.
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["DIV_STAGING"] = DimSlot(
+        name="DIV_STAGING",
+        start=64, size=16,
+        desc="DIV_STAGING-like (EXEC-phase)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    reg.alloc("OUT", 96, 1, "out", semantics="mark == AX")
+    return reg
+
+
+def test_phase_in_step_fetch_vs_exec_suppresses_violation():
+    """A rule that gates on ``FETCH_HI`` (FETCH-phase) reading FETCH_HI
+    has its conflict-alias DIV_STAGING (EXEC-phase) silently suppressed.
+    Opcode_in_step disjointness CAN'T do this because FETCH is
+    opcode-universal — only phase_in_step disjointness sees it."""
+    reg = _make_phase_aliasing_registry()
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("FETCH_HI+5", 1.0),
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="fetch_phase_reads_fetch_hi",
+    )
+    op = _FakeOp([rule], name="op_fetch_phase")
+    # Default: phase disjointness on -> no violation.
+    assert verify_dim_aliases(op, reg) == []
+    # Disabled: the violation surfaces (semantics-only overlap holds).
+    violations = verify_dim_aliases(
+        op, reg, skip_phase_in_step_disjoint=False,
+    )
+    assert any(
+        v.read_dim == "FETCH_HI"
+        and v.conflicting_alias == "DIV_STAGING"
+        for v in violations
+    ), (
+        "with phase disjointness off, expected FETCH_HI<->DIV_STAGING "
+        f"violation, got {violations!r}"
+    )
+
+
+def test_phase_in_step_unknown_rule_set_keeps_violation():
+    """When a rule carries NO positive reference to a phase-scoped slot,
+    its phase set is ``None`` (unknown) — the disjointness check must
+    NOT suppress (conservative)."""
+    reg = _make_phase_aliasing_registry()
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            # NO FETCH_HI / DIV_STAGING / phase-scoped reference here,
+            # yet the rule reads FETCH_HI (so the alias check runs).
+        ),
+        threshold=0.5,
+        writes=(("FETCH_HI+0", 1.0),),
+        name="no_phase_context",
+    )
+    # Force a read of the aliased slot via gate.
+    rule_with_read = FFNRule.constant_write(
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("MARK_AX", -1.0),  # admit byte rows (where DIV semantics applies)
+            ("FETCH_HI+5", 1.0),
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="reads_fetch_hi_in_phase_context",
+    )
+    # The variant we actually want for "unknown phase context": rule
+    # reads DIV_STAGING (aliased to FETCH_HI) without any phase-scoped
+    # positive reference.
+    rule_unknown = FFNRule.constant_write(
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("DIV_STAGING+5", 1.0),  # read the aliased slot, but no FETCH ref
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="reads_div_staging_no_phase_ctx",
+    )
+    op = _FakeOp([rule_unknown], name="op_no_phase_context")
+    violations = verify_dim_aliases(op, reg)
+    # DIV_STAGING is in _SLOT_PHASE_OWNERS, so the rule's positive
+    # DIV_STAGING reference DOES pin its phase set to {EXEC}. To exercise
+    # the "unknown" branch we need a rule whose positive references touch
+    # NEITHER side of the table — but it still reads an aliased slot.
+    # Use a rule that reads DIV_STAGING via a NEGATIVE reference (which
+    # we don't count) plus a positive non-phase-scoped reference:
+    rule_truly_unknown = FFNRule.constant_write(
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("DIV_STAGING+5", -10.0),  # NEGATIVE - not counted for phase
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="reads_div_staging_negative_only",
+    )
+    op2 = _FakeOp([rule_truly_unknown], name="op_truly_no_phase_ctx")
+    violations2 = verify_dim_aliases(op2, reg)
+    # The rule reads DIV_STAGING (alias of FETCH_HI). Phase set is None
+    # (no positive phase-scoped reference). Disjointness MUST not fire.
+    assert any(
+        v.read_dim == "DIV_STAGING"
+        and v.conflicting_alias == "FETCH_HI"
+        for v in violations2
+    ), (
+        "Rule with unknown phase context must NOT be suppressed; "
+        f"got {violations2!r}"
+    )
+
+
+def test_phase_in_step_overlapping_phases_do_not_suppress():
+    """A rule reading FETCH_HI whose aliased sibling is also FETCH-phase
+    (e.g. IMM_STAGING) must NOT be suppressed — the phase sets overlap."""
+    reg = _make_phase_aliasing_registry()
+    # Add IMM_STAGING-like slot overlapping FETCH_HI; phase set
+    # {FETCH, DECODE} matches FETCH_HI's set.
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["IMM_STAGING"] = DimSlot(
+        name="IMM_STAGING",
+        start=64, size=16,
+        desc="IMM_STAGING-like (FETCH-phase, intersects)",
+        semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})",
+    )
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("IS_BYTE", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            ("FETCH_HI+5", 1.0),
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="fetch_reads_fetch_hi_imm_overlap",
+    )
+    op = _FakeOp([rule], name="op_fetch_phase_overlap_imm")
+    violations = verify_dim_aliases(op, reg)
+    # FETCH_HI's owners {FETCH,DECODE} intersect IMM_STAGING's
+    # {FETCH,DECODE}; phase disjointness CAN'T fire — violation must stand.
+    assert any(
+        v.read_dim == "FETCH_HI"
+        and v.conflicting_alias == "IMM_STAGING"
+        for v in violations
+    ), (
+        "Same-phase pair (both FETCH/DECODE) must NOT be suppressed; "
+        f"got {violations!r}"
+    )
