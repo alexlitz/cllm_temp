@@ -298,7 +298,38 @@ def all_core_ops(
         # ALU_LO/HI, CMP, and STACK0_BYTE0..3 from MARK_AX -> MARK_SE
         # within the same step. Enables Wave B migration of L8/L9/L10
         # dispatch+ALU+CMP rules from MARK_AX gating to MARK_SE gating.
-        make_layer11_step_end_operand_relay_op(),
+        make_layer11_step_end_operand_relay_op(
+            enable=True,
+            # Scoped Wave A relay: only relay OP_<NAME> dispatch flags
+            # (the operand bands AX_CARRY / ALU / CMP / STACK0_BYTE
+            # are NOT relayed because broadcasting them at MARK_SE
+            # races downstream OUTPUT consumers and regresses 9 smoke
+            # tests). Within OP_<NAME>, OP_IMM and OP_SHR are excluded
+            # because their MARK_SE-side relay regresses
+            # test_add_basic / test_shr -- the L8 IMM/SHR rules read
+            # the opcode flag at MARK_SE under the migrated Wave B
+            # cluster, and the relayed flag interacts with a stale
+            # cross-step alias on those specific paths. Verified
+            # baseline-neutral on tests/test_smoke.py at 31/51 PASS.
+            # See ``docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md``
+            # section 4 for the Wave A v1 (RAW relay) vs v2 (SE_-
+            # tagged mirror) trade-off.
+            include_op_name=True,
+            include_ax_carry=False,
+            include_alu=False,
+            include_cmp=False,
+            include_stack0_byte=False,
+            op_name_subset=(
+                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+                "OP_BZ", "OP_BNZ", "OP_JMP", "OP_JSR", "OP_EXIT", "OP_LEV",
+                "OP_PSH",
+                "OP_ENT", "OP_ADJ", "OP_LEA",
+                "OP_LI", "OP_LC", "OP_SI", "OP_SC",
+                "OP_OR", "OP_AND", "OP_XOR",
+                "OP_MUL", "OP_DIV", "OP_MOD",
+                "OP_ADD", "OP_SUB", "OP_SHL",
+            ),
+        ),
         # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=12`` literals.

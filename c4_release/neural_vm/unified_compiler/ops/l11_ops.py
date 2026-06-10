@@ -456,6 +456,13 @@ def _layer11_step_end_operand_relay_head_specs(
     S: float,
     head_a_idx: int,
     head_b_idx: int,
+    *,
+    include_op_name: bool = True,
+    include_ax_carry: bool = True,
+    include_alu: bool = True,
+    include_cmp: bool = True,
+    include_stack0_byte: bool = True,
+    op_name_subset: tuple = (),
 ) -> tuple[DeclarativeAttentionHeadSpec, DeclarativeAttentionHeadSpec]:
     """Build the two Wave A relay head specs.
 
@@ -468,6 +475,13 @@ def _layer11_step_end_operand_relay_head_specs(
     is ``L^2 / sqrt(HD) - 29``; the prior step's MARK_AX sits at
     distance ~64 (next-step offset 35 + 29), losing the softmax by
     ~35 nats. Mirrors the L1 IN_STEP_FRESH / HAS_SE broadcast pattern.
+
+    Per-payload toggles (``include_*``) let the op restrict which V/O
+    bands the relay broadcasts. The default relays every payload (the
+    Wave-A-full configuration); ``enable=True`` callers can pass
+    narrower toggles to scope which downstream consumers see the
+    relayed value at MARK_SE, e.g. omitting ``OP_<NAME>`` to keep
+    BZ/BNZ / dispatch-gated rules MARK_AX-pure.
     """
     L = float(S)
     HD_DEFAULT = 64  # default head_dim at L11 (d_model=512, num_heads=8)
@@ -486,19 +500,24 @@ def _layer11_step_end_operand_relay_head_specs(
     v_a: list = []
     o_a: list = []
     slot = 0
-    for op_name in _STEP_END_OPERAND_RELAY_OPCODES:
-        dim = getattr(BD, op_name)
-        v_a.append(AP(slot, dim, 1.0))
-        o_a.append(AO(dim, slot, 1.0))
-        slot += 1
-    for k_idx in range(16):
-        v_a.append(AP(slot, BD.AX_CARRY_LO + k_idx, 1.0))
-        o_a.append(AO(BD.AX_CARRY_LO + k_idx, slot, 1.0))
-        slot += 1
-    for k_idx in range(16):
-        v_a.append(AP(slot, BD.AX_CARRY_HI + k_idx, 1.0))
-        o_a.append(AO(BD.AX_CARRY_HI + k_idx, slot, 1.0))
-        slot += 1
+    if include_op_name:
+        op_names_iter = (
+            op_name_subset if op_name_subset else _STEP_END_OPERAND_RELAY_OPCODES
+        )
+        for op_name in op_names_iter:
+            dim = getattr(BD, op_name)
+            v_a.append(AP(slot, dim, 1.0))
+            o_a.append(AO(dim, slot, 1.0))
+            slot += 1
+    if include_ax_carry:
+        for k_idx in range(16):
+            v_a.append(AP(slot, BD.AX_CARRY_LO + k_idx, 1.0))
+            o_a.append(AO(BD.AX_CARRY_LO + k_idx, slot, 1.0))
+            slot += 1
+        for k_idx in range(16):
+            v_a.append(AP(slot, BD.AX_CARRY_HI + k_idx, 1.0))
+            o_a.append(AO(BD.AX_CARRY_HI + k_idx, slot, 1.0))
+            slot += 1
     assert slot <= HD_DEFAULT, (
         f"step_end_operand_relay head A overflowed HD={HD_DEFAULT} "
         f"with {slot} slots"
@@ -517,23 +536,26 @@ def _layer11_step_end_operand_relay_head_specs(
     v_b: list = []
     o_b: list = []
     slot = 0
-    for k_idx in range(16):
-        v_b.append(AP(slot, BD.ALU_LO + k_idx, 1.0))
-        o_b.append(AO(BD.ALU_LO + k_idx, slot, 1.0))
-        slot += 1
-    for k_idx in range(16):
-        v_b.append(AP(slot, BD.ALU_HI + k_idx, 1.0))
-        o_b.append(AO(BD.ALU_HI + k_idx, slot, 1.0))
-        slot += 1
-    for k_idx in range(4):  # CMP is 4 wide in the registry
-        v_b.append(AP(slot, BD.CMP + k_idx, 1.0))
-        o_b.append(AO(BD.CMP + k_idx, slot, 1.0))
-        slot += 1
-    for byte_h in (0, 1, 2, 3):
-        dim = getattr(BD, f"STACK0_BYTE{byte_h}")
-        v_b.append(AP(slot, dim, 1.0))
-        o_b.append(AO(dim, slot, 1.0))
-        slot += 1
+    if include_alu:
+        for k_idx in range(16):
+            v_b.append(AP(slot, BD.ALU_LO + k_idx, 1.0))
+            o_b.append(AO(BD.ALU_LO + k_idx, slot, 1.0))
+            slot += 1
+        for k_idx in range(16):
+            v_b.append(AP(slot, BD.ALU_HI + k_idx, 1.0))
+            o_b.append(AO(BD.ALU_HI + k_idx, slot, 1.0))
+            slot += 1
+    if include_cmp:
+        for k_idx in range(4):  # CMP is 4 wide in the registry
+            v_b.append(AP(slot, BD.CMP + k_idx, 1.0))
+            o_b.append(AO(BD.CMP + k_idx, slot, 1.0))
+            slot += 1
+    if include_stack0_byte:
+        for byte_h in (0, 1, 2, 3):
+            dim = getattr(BD, f"STACK0_BYTE{byte_h}")
+            v_b.append(AP(slot, dim, 1.0))
+            o_b.append(AO(dim, slot, 1.0))
+            slot += 1
     assert slot <= HD_DEFAULT, (
         f"step_end_operand_relay head B overflowed HD={HD_DEFAULT} "
         f"with {slot} slots"
@@ -551,6 +573,21 @@ def _layer11_step_end_operand_relay_head_specs(
     return spec_a, spec_b
 
 
+# Default payload toggles for ``make_layer11_step_end_operand_relay_op``
+# / ``_layer11_step_end_operand_relay_ir``. Mutated by ``make_*`` to thread
+# the scope-restriction args through ``compiler_ir_factory`` (which the IR
+# dispatcher invokes without forwarding kwargs). The factory reads this
+# dict at lower-time; the bake closure captures its own copy.
+_LAYER11_RELAY_PAYLOAD_DEFAULTS: dict = {
+    "include_op_name": True,
+    "include_ax_carry": True,
+    "include_alu": True,
+    "include_cmp": True,
+    "include_stack0_byte": True,
+    "op_name_subset": (),
+}
+
+
 def _layer11_step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
     """``compiler_ir_factory`` for the L11 step_end_operand_relay heads."""
     del HD  # head_dim is layer-default; per-head fits within HD=64
@@ -561,6 +598,7 @@ def _layer11_step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
     head_b_idx = by_name["layer11_step_end_operand_relay.head_1"]
     spec_a, spec_b = _layer11_step_end_operand_relay_head_specs(
         proxy, 100.0, head_a_idx, head_b_idx,
+        **_LAYER11_RELAY_PAYLOAD_DEFAULTS,
     )
     ir = CompilerIR()
     ir.layer(0).attention.append(
@@ -572,7 +610,16 @@ def _layer11_step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
-def make_layer11_step_end_operand_relay_op(enable: bool = False) -> Operation:
+def make_layer11_step_end_operand_relay_op(
+    enable: bool = False,
+    *,
+    include_op_name: bool = True,
+    include_ax_carry: bool = True,
+    include_alu: bool = True,
+    include_cmp: bool = True,
+    include_stack0_byte: bool = True,
+    op_name_subset: tuple = (),
+) -> Operation:
     """Wave A — broadcast operand/dispatch state from MARK_AX to MARK_SE.
 
     Per ``docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md``: two
@@ -595,13 +642,39 @@ def make_layer11_step_end_operand_relay_op(enable: bool = False) -> Operation:
 
     ``enable`` defaults to ``False`` (Wave A PoC gate). When False the
     op is registered so the dep graph + claims surface stay stable, but
-    the bake is a no-op — the relay's downstream side-effects (extra
-    ALU_LO/HI / OP_<NAME> signal at MARK_SE rows, picked up by the LM
-    head + later layers' cross-step KV lookups) regress ~9 smoke tests
-    on the baseline. Wave B will scope those downstream readers to gate
-    on MARK_AX vs MARK_SE explicitly, after which this op can flip to
-    ``enable=True``. Mirrors the ``layer9_alibi_mem_attn(enable=False)``
-    + ``layer8_head6_ax_carry_refresh(enable=False)`` PoC pattern.
+    the bake is a no-op. When True (with the default full-payload
+    toggles) the relay's downstream side-effects (extra ALU_LO/HI /
+    OP_<NAME> signal at MARK_SE rows, picked up by the LM head + later
+    layers' cross-step KV lookups) regress ~9 smoke tests on baseline.
+    The per-payload toggles below let callers narrow the relay to the
+    largest payload that keeps smoke neutral.
+
+    Per-payload toggles
+    -------------------
+    Each toggle controls one V/O band in the two relay heads. Combined
+    smoke-bisection on ``tests/test_smoke.py`` (Wave A scoping, 2026-
+    06-10) found the maximum baseline-neutral payload:
+
+      * ``include_op_name=True`` with the 27-opcode
+        ``op_name_subset`` listed at the caller (excludes OP_IMM and
+        OP_SHR; including those breaks ``test_add_basic`` /
+        ``test_shr`` because the MARK_SE-side flag fires the L8
+        MARK_SE_ONLY-migrated rules a second time over a stale
+        same-step alias).
+      * ``include_ax_carry=False`` — broadcasting AX_CARRY_LO/HI at
+        MARK_SE clobbers the SI/LI memory tail (4 memory smoke tests +
+        ADD_basic).
+      * ``include_alu=False`` — ALU_LO/HI relay is the loudest race
+        victim (10+ tests including BZ/BNZ and memory).
+      * ``include_cmp=False`` — relayed CMP at MARK_SE racetracks the
+        L10 cmp_combine override (test_eq_true + cmp_and_branch + 4
+        memory tests).
+      * ``include_stack0_byte=False`` — STACK0_BYTE relay nets -4
+        smoke (gains or_basic but regresses ADD + 4 memory).
+
+    ``op_name_subset`` empty means "relay every opcode in
+    ``_STEP_END_OPERAND_RELAY_OPCODES``"; a non-empty tuple restricts
+    the relay to the named opcodes only.
 
     Probe verification (``tools/probe_step_end_completeness.py``) shows
     that when ``enable=True`` the relay populates MARK_SE with the
@@ -611,6 +684,19 @@ def make_layer11_step_end_operand_relay_op(enable: bool = False) -> Operation:
     same-step MARK_SE in one trace (the default ``IMM 5; PSH; IMM 5;
     EQ; EXIT`` runs OOM on a busy GPU before both rows materialise).
     """
+    # Thread payload toggles through the module-level dict so
+    # ``_layer11_step_end_operand_relay_ir`` (invoked via
+    # ``compiler_ir_factory`` without kwargs by the IR dispatcher) sees
+    # the same scope this op declares.
+    _LAYER11_RELAY_PAYLOAD_DEFAULTS.update({
+        "include_op_name": include_op_name,
+        "include_ax_carry": include_ax_carry,
+        "include_alu": include_alu,
+        "include_cmp": include_cmp,
+        "include_stack0_byte": include_stack0_byte,
+        "op_name_subset": op_name_subset,
+    })
+
     def bake(block, dim_positions, S):
         if not enable:
             return
@@ -623,92 +709,120 @@ def make_layer11_step_end_operand_relay_op(enable: bool = False) -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         spec_a, spec_b = _layer11_step_end_operand_relay_head_specs(
             proxy, S, head_a_idx, head_b_idx,
+            include_op_name=include_op_name,
+            include_ax_carry=include_ax_carry,
+            include_alu=include_alu,
+            include_cmp=include_cmp,
+            include_stack0_byte=include_stack0_byte,
+            op_name_subset=op_name_subset,
         )
         Primitives.generate_attention_head(attn, spec_a, HD)
         Primitives.generate_attention_head(attn, spec_b, HD)
 
-    # Dim-ownership claims: two heads. Head A V slots 0..62 cover
-    # OP_<NAME> (0..30) + AX_CARRY_LO+0..15 (31..46) + AX_CARRY_HI+0..15
-    # (47..62). Head B V slots 0..39 cover ALU_LO+0..15 (0..15) +
-    # ALU_HI+0..15 (16..31) + CMP+0..3 (32..35) + STACK0_BYTE0..3
-    # (36..39). O slots mirror the V slot indices; out_dim names match
-    # the source dims (relay = identity copy).
+    # Dim-ownership claims: two heads, scoped by the ``include_*``
+    # toggles above. Head A V slots cover the enabled subset of
+    # OP_<NAME> (0..30), AX_CARRY_LO (16), AX_CARRY_HI (16). Head B V
+    # slots cover the enabled subset of ALU_LO (16), ALU_HI (16),
+    # CMP (4), STACK0_BYTE0..3 (4). O slots mirror V slot indices;
+    # out_dim names match source dims (relay = identity copy).
     _claims: set = set()
     head_a_idx = 0
     head_b_idx = 1
     slot = 0
-    for op_name in _STEP_END_OPERAND_RELAY_OPCODES:
-        _claims.add((11, "attn_W_v", f"{head_a_idx}_{slot}", f"{op_name}+0"))
-        _claims.add((11, "attn_W_o", f"{head_a_idx}_{slot}", f"{op_name}+0"))
-        slot += 1
-    for k_idx in range(16):
-        _claims.add(
-            (11, "attn_W_v", f"{head_a_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
+    if include_op_name:
+        op_names_iter = (
+            op_name_subset if op_name_subset else _STEP_END_OPERAND_RELAY_OPCODES
         )
-        _claims.add(
-            (11, "attn_W_o", f"{head_a_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
-        )
-        slot += 1
-    for k_idx in range(16):
-        _claims.add(
-            (11, "attn_W_v", f"{head_a_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
-        )
-        _claims.add(
-            (11, "attn_W_o", f"{head_a_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
-        )
-        slot += 1
+        for op_name in op_names_iter:
+            _claims.add((11, "attn_W_v", f"{head_a_idx}_{slot}", f"{op_name}+0"))
+            _claims.add((11, "attn_W_o", f"{head_a_idx}_{slot}", f"{op_name}+0"))
+            slot += 1
+    if include_ax_carry:
+        for k_idx in range(16):
+            _claims.add(
+                (11, "attn_W_v", f"{head_a_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
+            )
+            _claims.add(
+                (11, "attn_W_o", f"{head_a_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
+            )
+            slot += 1
+        for k_idx in range(16):
+            _claims.add(
+                (11, "attn_W_v", f"{head_a_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
+            )
+            _claims.add(
+                (11, "attn_W_o", f"{head_a_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
+            )
+            slot += 1
     slot = 0
-    for k_idx in range(16):
-        _claims.add(
-            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"ALU_LO+{k_idx}"),
+    if include_alu:
+        for k_idx in range(16):
+            _claims.add(
+                (11, "attn_W_v", f"{head_b_idx}_{slot}", f"ALU_LO+{k_idx}"),
+            )
+            _claims.add(
+                (11, "attn_W_o", f"{head_b_idx}_{slot}", f"ALU_LO+{k_idx}"),
+            )
+            slot += 1
+        for k_idx in range(16):
+            _claims.add(
+                (11, "attn_W_v", f"{head_b_idx}_{slot}", f"ALU_HI+{k_idx}"),
+            )
+            _claims.add(
+                (11, "attn_W_o", f"{head_b_idx}_{slot}", f"ALU_HI+{k_idx}"),
+            )
+            slot += 1
+    if include_cmp:
+        for k_idx in range(4):
+            _claims.add(
+                (11, "attn_W_v", f"{head_b_idx}_{slot}", f"CMP+{k_idx}"),
+            )
+            _claims.add(
+                (11, "attn_W_o", f"{head_b_idx}_{slot}", f"CMP+{k_idx}"),
+            )
+            slot += 1
+    if include_stack0_byte:
+        for byte_h in (0, 1, 2, 3):
+            _claims.add(
+                (11, "attn_W_v", f"{head_b_idx}_{slot}", f"STACK0_BYTE{byte_h}+0"),
+            )
+            _claims.add(
+                (11, "attn_W_o", f"{head_b_idx}_{slot}", f"STACK0_BYTE{byte_h}+0"),
+            )
+            slot += 1
+
+    # Build reads/writes from the enabled payload subset. MARK_AX and
+    # MARK_SE_ONLY are always read (Q/K anchors); per-payload dims are
+    # only listed when their toggle is on so the dep graph + claims
+    # surface stay tight to the actual bake.
+    _reads = {"MARK_AX", "MARK_SE_ONLY"}
+    _writes: set = set()
+    if include_op_name:
+        _op_names = (
+            op_name_subset if op_name_subset else _STEP_END_OPERAND_RELAY_OPCODES
         )
-        _claims.add(
-            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"ALU_LO+{k_idx}"),
-        )
-        slot += 1
-    for k_idx in range(16):
-        _claims.add(
-            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"ALU_HI+{k_idx}"),
-        )
-        _claims.add(
-            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"ALU_HI+{k_idx}"),
-        )
-        slot += 1
-    for k_idx in range(4):
-        _claims.add(
-            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"CMP+{k_idx}"),
-        )
-        _claims.add(
-            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"CMP+{k_idx}"),
-        )
-        slot += 1
-    for byte_h in (0, 1, 2, 3):
-        _claims.add(
-            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"STACK0_BYTE{byte_h}+0"),
-        )
-        _claims.add(
-            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"STACK0_BYTE{byte_h}+0"),
-        )
-        slot += 1
+        _reads.update(_op_names)
+        _writes.update(_op_names)
+    if include_ax_carry:
+        _reads.update({"AX_CARRY_LO", "AX_CARRY_HI"})
+        _writes.update({"AX_CARRY_LO", "AX_CARRY_HI"})
+    if include_alu:
+        _reads.update({"ALU_LO", "ALU_HI"})
+        _writes.update({"ALU_LO", "ALU_HI"})
+    if include_cmp:
+        _reads.add("CMP")
+        _writes.add("CMP")
+    if include_stack0_byte:
+        _reads.update({"STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"})
+        _writes.update({"STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3"})
 
     return Operation(
         name="layer11_step_end_operand_relay",
         # Q reads MARK_SE_ONLY (Q-row anchor); K reads MARK_AX (K-row
         # anchor). V reads the broadcast payload at the MARK_AX K rows.
-        reads={
-            "MARK_AX", "MARK_SE_ONLY",
-            "AX_CARRY_LO", "AX_CARRY_HI",
-            "ALU_LO", "ALU_HI", "CMP",
-            "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
-            *_STEP_END_OPERAND_RELAY_OPCODES,
-        },
+        reads=_reads,
         # O writes the same dim names at the MARK_SE Q rows.
-        writes={
-            "AX_CARRY_LO", "AX_CARRY_HI",
-            "ALU_LO", "ALU_HI", "CMP",
-            "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
-            *_STEP_END_OPERAND_RELAY_OPCODES,
-        },
+        writes=_writes,
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer11_step_end_operand_relay_ir,
