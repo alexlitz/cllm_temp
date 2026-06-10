@@ -1088,17 +1088,12 @@ class AutoregressiveVMRunner:
             (output_string, exit_code) tuple
         """
         self._bytecode = bytecode
-        # V11 (2026-05-11): in pure_neural / neural-I/O mode stdin bytes
-        # live in the token stream between USER_INPUT_START/END markers (see
-        # `_build_context`, per BLOG_SPEC.md:851); ``_inject_getchar`` is a
-        # no-op in pure_neural and reads only from the token stream.
-        #
-        # Phase 6 (2026-05-12): the runner-side READ shim invoked via
-        # ``_handle_skipped_io_op`` (or via ``_handle_pure_neural_stall``
-        # when the neural network's PC freezes) still consumes
-        # ``_stdin_buffer`` because the neural USER_INPUT consumption bake
-        # is not yet flipped on. Keep the buffer populated in both modes so
-        # the synthesized READ can deliver the bytes the test expects.
+        # In pure_neural / neural-I/O mode stdin bytes live in the token
+        # stream between USER_INPUT_START/END markers (see ``_build_context``,
+        # per BLOG_SPEC.md:851); the neural GETCHAR bake routes them into
+        # REG_AX directly. ``_stdin_buffer`` is still populated for the
+        # neural READ shim (PRTF/READ syscalls) which cross the host
+        # boundary.
         self._stdin_buffer = list(stdin or "")
         self._stdin_pos = 0
         self._tool_handler = tool_handler
@@ -1106,13 +1101,8 @@ class AutoregressiveVMRunner:
         self._last_pc = None
         self._last_bp = 0x10000  # Initial BP (same as model embedding STACK_INIT)
         self._last_sp = 0x10000  # Initial SP (same as model embedding STACK_INIT)
-        # Track last dispatched instruction index for skipped-IO-op detection.
+        # Track last dispatched instruction index for observation only.
         self._last_dispatched_idx = -1
-        # Phase 6 stall recovery: count consecutive dispatches at the same
-        # exec_idx so we can detect when the neural network's PC has frozen
-        # (upstream L3 PC carry-forward bug) and synthesize forward progress
-        # for downstream IO ops. See _handle_pure_neural_stall().
-        self._stall_count_at_idx = 0
         # Reset THINK-tag protocol collector so leftover state from a prior
         # run() (e.g. truncated PUTCHAR step without a closing THINKING_START)
         # does not bleed into the next program.
@@ -2001,41 +1991,6 @@ class AutoregressiveVMRunner:
 
         # Pure neural mode: skip ALL Python overrides, let neural network handle everything
         if self.pure_neural:
-            # Phase 6 (2026-05-11): detect instructions skipped by the neural
-            # network. The model's PSH neurally advances PC past PRTF/READ/etc.
-            # treating them as no-ops at the PC level, so dispatch jumps from
-            # exec_idx=N (PSH) directly to N+2 (ADJ), skipping PRTF at N+1.
-            # We synthesize handler calls for the skipped IO ops here using
-            # arg values extracted from the bytecode (preceding IMM/PSH chain).
-            last_idx = getattr(self, "_last_dispatched_idx", -1)
-            if last_idx >= 0 and exec_idx > last_idx + 1:
-                for skipped in range(last_idx + 1, exec_idx):
-                    if 0 <= skipped < len(bytecode):
-                        skipped_op = bytecode[skipped] & 0xFF
-                        self._handle_skipped_io_op(
-                            skipped_op, skipped, bytecode, context, output,
-                        )
-            # Phase 6 stall recovery: if the same exec_idx is dispatched
-            # repeatedly, the neural network's PC has frozen (upstream L3 PC
-            # carry-forward bug surfaces when a program has 3+ consecutive
-            # PSHes followed by an IO op). Synthesize forward execution of
-            # the remaining IMM/PSH chain + IO op + ADJ + EXIT so the test
-            # can observe the correct side-effects.
-            #
-            # Only fire when there's an IO op in the remaining bytecode —
-            # otherwise we'd break Phase 1 PC tests (e.g. `IMM 5, IMM 7,
-            # EXIT`) that rely on the model's autoregressive AX writes and
-            # would prematurely exit with AX from the wrong step.
-            if exec_idx == last_idx and exec_idx >= 0:
-                self._stall_count_at_idx += 1
-                if (self._stall_count_at_idx >= 1
-                        and self._tail_has_io_op(exec_idx, bytecode)):
-                    if self._handle_pure_neural_stall(
-                        exec_idx, bytecode, context, output,
-                    ):
-                        return True  # synthesized EXIT — terminate run loop
-            else:
-                self._stall_count_at_idx = 0
             self._last_dispatched_idx = exec_idx
 
             # Extract PC and AX from neural network output (for tracking and EXIT result)
@@ -2071,12 +2026,6 @@ class AutoregressiveVMRunner:
                     and neural_ax is not None
                     and not self.enable_neural_io_think_protocol):
                 output.append(chr(neural_ax & 0xFF))
-
-            # GETCHAR: `_inject_getchar` short-circuits in pure_neural (V11);
-            # see its docstring. Call left in place so the tool-calling path
-            # stays symmetric.
-            if exec_op == Opcode.GETCHAR:
-                self._inject_getchar(context)
 
             # PRTF (Phase 6, pure_neural): the neural network does not yet have
             # a complete autoregressive format-string walker / byte emitter.
@@ -2474,36 +2423,6 @@ class AutoregressiveVMRunner:
             return chr(val & 0xFF)
         return None
 
-    def _inject_getchar(self, context):
-        """Runner-side GETCHAR: inject next stdin byte into context.
-
-        This is the V11 stdin-buffer + V9 AX-override shim. The spec
-        (BLOG_SPEC.md:851) says GETCHAR should read the byte via
-        position-tracking attention into the USER_INPUT_START/END block
-        (which `_build_context` already emits in the prefix). The neural
-        bake for that read lives in
-        `unified_compiler/ops/user_input_ops.py` (Phase 1: registered but
-        disabled); until those bakes are flipped on, the runner overrides
-        REG_AX directly from `_stdin_buffer`.
-
-        See docs/V9_GETCHAR_READ_NEURAL_PLAN.md for the migration plan.
-
-        If stdin is exhausted, injects -1 (0xFFFFFFFF) for EOF.
-
-        No-op in pure_neural / neural-I/O mode (V11, 2026-05-11): stdin
-        bytes live between USER_INPUT_START/END markers in the token stream
-        and the neural GETCHAR bake routes them into REG_AX.
-        """
-        if self.pure_neural:
-            return
-        if self._stdin_pos < len(self._stdin_buffer):
-            byte_val = ord(self._stdin_buffer[self._stdin_pos])
-            self._stdin_pos += 1
-        else:
-            byte_val = 0xFFFFFFFF  # EOF = -1
-
-        self._override_ax_in_last_step(context, byte_val)
-
     def _peek_argc_from_adj(self, exec_idx, bytecode):
         """Peek at the ADJ instruction following PRTF/OPEN/etc. to derive argc.
 
@@ -2552,218 +2471,6 @@ class AutoregressiveVMRunner:
             i -= 2
         # ``args[0]`` is the value pushed RIGHT BEFORE the syscall = sp[0].
         return args
-
-    def _handle_skipped_io_op(self, op, skipped_idx, bytecode, context, output):
-        """Handle an IO op that the neural network skipped over PC-wise.
-
-        The neural network's PSH advances PC past PRTF/OPEN/CLOS/READ
-        treating them as no-ops (no neural handler for them). When dispatch
-        sees a gap in exec_idx, we invoke the runner-side IO shim here using
-        args extracted from the bytecode (preceding IMM/PSH chain) rather
-        than from corrupted ``_last_sp`` / ``_memory`` state.
-        """
-        if op == Opcode.PRTF:
-            argc = self._peek_argc_from_adj(skipped_idx, bytecode)
-            args = self._extract_imm_chain_args(skipped_idx, bytecode, max(argc, 1))
-            if args is None or not args:
-                return
-            # args[0] is the value pushed RIGHT BEFORE PRTF = fmt_ptr (last push).
-            fmt_ptr = args[0]
-            fmt_str = self._read_string(fmt_ptr)
-            if not fmt_str:
-                return
-            if argc <= 1:
-                output.append(fmt_str)
-                self._override_ax_in_last_step(context, len(fmt_str) & 0xFFFFFFFF)
-                self._record_phase6_syscall_event(
-                    op, "pure_neural_skipped_op", exec_idx=skipped_idx,
-                    argc=argc, bytes=len(fmt_str),
-                )
-                return
-            # args[1..] correspond to sp[1..], i.e. earlier pushes.
-            varargs = args[1:argc]
-            formatted = self._format_printf(fmt_str, varargs)
-            output.append(formatted)
-            self._override_ax_in_last_step(context, len(formatted) & 0xFFFFFFFF)
-            self._record_phase6_syscall_event(
-                op, "pure_neural_skipped_op", exec_idx=skipped_idx,
-                argc=argc, bytes=len(formatted),
-            )
-            return
-        if op == Opcode.READ:
-            argc = self._peek_argc_from_adj(skipped_idx, bytecode)
-            args = self._extract_imm_chain_args(skipped_idx, bytecode, max(argc, 3))
-            if args is None or len(args) < 3:
-                return
-            # Heuristically identify (fd, buf, count) so we accept both the
-            # C4 push order (push fd, buf, count → args[0]=count, args[2]=fd)
-            # and the test's reverse order (push count, buf, fd → args[0]=fd,
-            # args[2]=count). The heuristic: buf is the value addressing
-            # data/heap (>= 0x10000); fd is the small int (< 256); count is
-            # the remaining slot. Mirrors ``_neural_read_emit`` (line ~1605).
-            slots = list(args[:3])
-            buf_ptr = next((v for v in slots if v >= 0x10000), 0)
-            fd = next((v for v in slots if v < 256 and v != buf_ptr), 0)
-            count_candidates = [
-                v for v in slots if v != buf_ptr and v != fd
-            ]
-            count = count_candidates[0] if count_candidates else 0
-            if buf_ptr == 0 or count == 0:
-                # Heuristic fallback: assume C4 (count, buf, fd) push order.
-                count, buf_ptr, fd = args[0], args[1], args[2]
-            data = b""
-            if fd == 0:
-                remaining = len(self._stdin_buffer) - self._stdin_pos
-                n = min(count, max(remaining, 0))
-                if n > 0:
-                    chunk = self._stdin_buffer[self._stdin_pos:self._stdin_pos + n]
-                    self._stdin_pos += n
-                    data = bytes(ord(c) if isinstance(c, str) else c for c in chunk)
-            else:
-                try:
-                    data = os.read(fd, count)
-                except OSError:
-                    self._override_ax_in_last_step(context, 0xFFFFFFFF)
-                    return
-            for i, b in enumerate(data):
-                self._memory[(buf_ptr + i) & 0xFFFFFFFF] = b & 0xFF
-            if data:
-                n_words = (len(data) + 3) // 4
-                for w in range(n_words):
-                    addr = (buf_ptr + w * 4) & 0xFFFFFFFF
-                    value = self._mem_load_word(addr)
-                    self._inject_mem_section(addr, value)
-            self._override_ax_in_last_step(context, len(data) & 0xFFFFFFFF)
-            self._record_phase6_syscall_event(
-                op, "pure_neural_skipped_op", exec_idx=skipped_idx,
-                fd=fd, buf_ptr=buf_ptr, count=count, bytes=len(data),
-            )
-            return
-        if op == Opcode.OPEN:
-            argc = self._peek_argc_from_adj(skipped_idx, bytecode)
-            args = self._extract_imm_chain_args(skipped_idx, bytecode, max(argc, 2))
-            if args is None or len(args) < 2:
-                return
-            # Accept both C4 push order (path, mode → args[0]=mode,
-            # args[1]=path) and the test's reverse order (mode, path →
-            # args[0]=path, args[1]=mode). Heuristic: path is the data/heap
-            # pointer (>= 0x10000); mode is the small flag.
-            slots = list(args[:2])
-            path_ptr = next((v for v in slots if v >= 0x10000), 0)
-            mode = next((v for v in slots if v != path_ptr), 0)
-            if path_ptr == 0:
-                # Fall back to C4 (mode, path) interpretation if no heap-addr
-                # was identified (e.g. test pushed both as small ints).
-                mode, path_ptr = args[0], args[1]
-            path = self._read_string(path_ptr)
-            try:
-                flags = os.O_RDONLY if (mode & 0xFFFFFFFF) == 0 else (os.O_WRONLY | os.O_CREAT)
-                fd = os.open(path, flags, 0o644)
-                self._open_fds[fd] = path
-                result = fd
-            except OSError:
-                result = 0xFFFFFFFF
-            self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
-            return
-        if op == Opcode.CLOS:
-            argc = self._peek_argc_from_adj(skipped_idx, bytecode)
-            args = self._extract_imm_chain_args(skipped_idx, bytecode, max(argc, 1))
-            if args is None or not args:
-                return
-            fd = args[0]
-            if fd in self._open_fds:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                self._open_fds.pop(fd, None)
-            self._override_ax_in_last_step(context, 0)
-            return
-        if op == Opcode.PUTCHAR:
-            # PUTCHAR pushes nothing - the byte is in AX. If we don't have
-            # a reliable AX trace at this point, look back for a preceding
-            # IMM at skipped_idx-1.
-            if skipped_idx >= 1 and (bytecode[skipped_idx - 1] & 0xFF) == Opcode.IMM:
-                imm = bytecode[skipped_idx - 1] >> 8
-                output.append(chr(imm & 0xFF))
-            return
-        # Unknown op: no-op.
-        return
-
-    # ``_IO_OPS_SKIPPABLE`` — opcodes whose pure_neural side-effects are
-    # synthesized by ``_handle_skipped_io_op`` when the neural network has
-    # treated them as PC no-ops (Phase 6).
-    _IO_OPS_SKIPPABLE = frozenset({
-        Opcode.PRTF, Opcode.OPEN, Opcode.CLOS, Opcode.READ, Opcode.PUTCHAR,
-    })
-    # ``_IO_OPS_STALL_RECOVERABLE`` — strict subset of ``_IO_OPS_SKIPPABLE``
-    # that we synthesize when the neural network's PC has frozen (stall
-    # recovery path). OPEN/CLOS are excluded: they exercise tool-boundary
-    # state and overwrite AX with the real OS result (often -1 in unit
-    # tests because the file doesn't exist), which would regress
-    # ``test_open_close_cycle_xfail`` (it asserts ``exit_code == 0``,
-    # currently true only because the model never reaches the syscall).
-    _IO_OPS_STALL_RECOVERABLE = frozenset({
-        Opcode.PRTF, Opcode.READ, Opcode.PUTCHAR,
-    })
-
-    def _tail_has_io_op(self, exec_idx, bytecode):
-        """Return True if the bytecode after ``exec_idx`` has a stall-
-        recoverable IO op.
-
-        Stall recovery (Phase 6) only kicks in when there's actually a
-        skippable IO op downstream — otherwise pure-arithmetic programs
-        like ``IMM 5; IMM 7; EXIT`` would prematurely exit at the first
-        repeated dispatch and report a stale AX value. We restrict to
-        ``_IO_OPS_STALL_RECOVERABLE`` so OPEN/CLOS don't trigger recovery
-        (see that constant's docstring).
-        """
-        for idx in range(exec_idx + 1, len(bytecode)):
-            op = bytecode[idx] & 0xFF
-            if op in self._IO_OPS_STALL_RECOVERABLE:
-                return True
-        return False
-
-    def _handle_pure_neural_stall(self, stalled_idx, bytecode, context, output):
-        """Synthesize forward execution when the neural network's PC has frozen.
-
-        The upstream L3 PC carry-forward attention bug causes the model's
-        autoregressive ``last_pc`` to collapse to a fixed value after ~3-4
-        dispatches. When ``_dispatch_step`` is invoked twice in a row at the
-        same ``exec_idx``, we treat it as a stall and walk the remaining
-        bytecode forward, dispatching ``_handle_skipped_io_op`` for any IO
-        op (PRTF/OPEN/CLOS/READ/PUTCHAR) and returning ``True`` if we reach
-        ``Opcode.EXIT`` so the run loop terminates cleanly.
-
-        Non-IO instructions (IMM/PSH/ADJ/etc.) are skipped — at the stall
-        point we cannot reliably reconstruct stack state, but the IO op
-        handlers walk the bytecode IMM/PSH chain themselves to recover args.
-
-        Returns:
-            True if EXIT was synthesized (caller should terminate the run
-            loop). False otherwise (caller continues; another stall detection
-            may fire next dispatch).
-        """
-        # Scan forward from the stalled idx + 1 for stall-recoverable IO
-        # ops and EXIT. Skip OPEN/CLOS — they overwrite AX with OS results
-        # (often -1 on unit-test machines) and would regress tests that
-        # rely on the model never reaching the syscall.
-        synthesized_any = False
-        for idx in range(stalled_idx + 1, len(bytecode)):
-            op = bytecode[idx] & 0xFF
-            if op in self._IO_OPS_STALL_RECOVERABLE:
-                self._handle_skipped_io_op(op, idx, bytecode, context, output)
-                synthesized_any = True
-            elif op == Opcode.EXIT:
-                # Reaching EXIT means we've synthesized the program's tail.
-                # Mark dispatch idx so a subsequent stall doesn't re-fire.
-                self._last_dispatched_idx = idx
-                return True
-        if synthesized_any:
-            # Move dispatched-idx past the last bytecode position so this
-            # path doesn't re-trigger if the model keeps emitting STEP_ENDs.
-            self._last_dispatched_idx = len(bytecode) - 1
-        return False
 
     def _neural_prtf_emit(self, context, output, exec_idx=None, bytecode=None):
         """Runner-side PRTF for pure_neural mode.

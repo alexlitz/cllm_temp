@@ -49,9 +49,7 @@ from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 from .run_vm import (
     AutoregressiveVMRunner,
-    _MEM_ADDR_SRC_OPS,
     _MEM_STORE_OPS,
-    _BINARY_POP_OPS,
 )
 from .speculative import DraftVM
 
@@ -81,68 +79,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
-def _parse_disable_alu_recovery_ops() -> frozenset:
-    """Parse ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS`` into a frozenset of opcode ints.
-
-    The env var is a comma-separated list of opcode NAMES (e.g.
-    ``"ADD,SUB,EQ"``). Unknown / empty entries are silently skipped. An
-    empty / unset env var yields the empty frozenset (no per-op disables).
-
-    Used together with ``C4_DISABLE_BATCHED_ALU_RECOVERY`` to incrementally
-    remove the Python ALU recovery overrides one op-cluster at a time as
-    upstream neural fixes land. See
-    ``docs/SERIAL_MODE_DIVERGENCE_ATTRIBUTION_2026_06_09.md`` §7 for the
-    rollout protocol.
-    """
-    raw = os.environ.get("C4_DISABLE_BATCHED_ALU_RECOVERY_OPS", "")
-    if not raw.strip():
-        return frozenset()
-    ops: set = set()
-    for tok in raw.split(","):
-        name = tok.strip().upper()
-        if not name:
-            continue
-        opcode = getattr(Opcode, name, None)
-        if opcode is None:
-            continue
-        ops.add(int(opcode))
-    return frozenset(ops)
-
-
-# Global on/off toggle for the Python ALU recovery overrides in
-# ``_dispatch_pure_neural`` (collapsed-step + non-collapsed paths). When
-# ``C4_DISABLE_BATCHED_ALU_RECOVERY`` is set (``1``/``true``/...), the
-# runner skips ALL ``_compute_alu_legacy`` rescues and trusts the raw
-# neural AX emit unconditionally. Default ``False`` keeps the legacy
-# cheat in place so smoke ~46/51 baseline does not regress.
-_DISABLE_BATCHED_ALU_RECOVERY = _env_flag("C4_DISABLE_BATCHED_ALU_RECOVERY", False)
-
-# Per-op disable set. When non-empty, ONLY these opcodes skip the recovery;
-# every other op in ``_BINARY_POP_OPS`` continues to receive the legacy
-# Python cheat. This lets a fix agent verify a single neural cluster
-# (e.g. ``ADD,SUB`` for the 32-bit cascade) without breaking the rest of
-# the smoke gate.
-_DISABLE_BATCHED_ALU_RECOVERY_OPS = _parse_disable_alu_recovery_ops()
-
-
-def _alu_recovery_disabled_for(op: int) -> bool:
-    """Return True if the Python ALU recovery should be skipped for ``op``.
-
-    Honors both the global ``C4_DISABLE_BATCHED_ALU_RECOVERY`` toggle and
-    the per-op ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS`` allow-list. Re-reads
-    the environment each call so tests can flip the toggle at runtime via
-    ``monkeypatch.setenv`` without re-importing the module.
-    """
-    if _env_flag("C4_DISABLE_BATCHED_ALU_RECOVERY", _DISABLE_BATCHED_ALU_RECOVERY):
-        return True
-    raw = os.environ.get("C4_DISABLE_BATCHED_ALU_RECOVERY_OPS")
-    if raw is None:
-        ops = _DISABLE_BATCHED_ALU_RECOVERY_OPS
-    else:
-        ops = _parse_disable_alu_recovery_ops()
-    return int(op) in ops
 
 
 _ADAPTIVE_START_K = max(1, _env_int("C4_ADAPTIVE_START_K", 32))
@@ -183,9 +119,9 @@ _UNPREDICTED_BUCKET_KEY = "unpredicted"
 _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
 # Step-relative offset of the MEM marker token inside the 35-token step layout
-# (PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5) -> MEM at index 25). Used by the
-# speculator to locate draft-region MEM markers for ``mem_store_positions``
-# augmentation; ``_UNSAFE_OFFSETS`` covers the 8 addr/value bytes that follow.
+# (PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5) -> MEM at index 25). Retained for
+# speculator step-offset arithmetic; ``_UNSAFE_OFFSETS`` covers the 8
+# addr/value bytes that follow.
 _MEM_MARKER_STEP_OFFSET = 25
 
 # Some opcodes are neural-authoritative in raw one-token decoding but are not
@@ -206,30 +142,6 @@ _SPEC_UNSAFE_OPS = frozenset({
     int(Opcode.PUTCHAR),
 })
 
-def _find_section_positions(tokens: List[int], section: List[int]) -> List[int]:
-    if not section or len(section) > len(tokens):
-        return []
-    positions: List[int] = []
-    limit = len(tokens) - len(section) + 1
-    for start in range(limit):
-        if tokens[start : start + len(section)] == section:
-            positions.append(start)
-    return positions
-
-
-def _mem_section_positions(
-    tokens: List[int],
-    mem_access_order: List[int],
-    mem_history: dict,
-) -> List[int]:
-    positions: List[int] = []
-    for addr in mem_access_order:
-        section = mem_history.get(addr)
-        if section is None:
-            continue
-        positions.extend(_find_section_positions(tokens, section))
-    return sorted(set(positions))
-
 
 @dataclass
 class _ElementState:
@@ -248,23 +160,11 @@ class _ElementState:
     last_ax: int = 0
     last_sp: int = 0x10000
     last_bp: int = 0x10000
-    stack0_shadow: Optional[int] = None
-    # Pre-PSH AX captured at the moment of a PSH dispatch (== the word that
-    # PSH writes to the stack). Required by the collapsed-step binary-ALU
-    # recovery (smoke ``sub_basic``/``div_basic``/``mod_basic``) because the
-    # model's neural STACK0 emit carries garbage in the high bytes, so reading
-    # the PSH'd word from ``stack0_shadow`` gives a wrong full-32-bit operand.
-    # See _dispatch_pure_neural's collapsed-step recovery block.
-    last_pushed_value: Optional[int] = None
 
     memory: dict = field(default_factory=dict)        # addr -> byte
     mem_history: dict = field(default_factory=dict)   # addr -> 9-token MEM section
     mem_access_order: list = field(default_factory=list)
     mem_history_end: int = 0  # boundary in current context for MEM_STORE injection
-    mem_store_positions: list = field(default_factory=list)
-    # SI/SC-only subset of ``mem_store_positions``; absent positions correspond
-    # to PSH/JSR/ENT current-step markers whose MEM_ADDR_SRC must remain 0.
-    mem_addr_src_positions: list = field(default_factory=list)
 
     stdin_buffer: list = field(default_factory=list)
     stdin_pos: int = 0
@@ -1397,14 +1297,6 @@ class BatchedPureNeuralRunner:
             ]
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
-            if hasattr(self.model.embed, "set_mem_store_positions"):
-                self.model.embed.set_mem_store_positions(
-                    [states[i].mem_store_positions for i in active_idx]
-                )
-            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
-                self.model.embed.set_mem_addr_src_positions(
-                    [states[i].mem_addr_src_positions for i in active_idx]
-                )
 
             # Each row only needs the argmax at ``real_len - 1`` (last real
             # token's logit predicts the next token). Pass per-row positions
@@ -1417,9 +1309,7 @@ class BatchedPureNeuralRunner:
                 active_idx,
                 first_logit_pos=min(row_lens) - 1,
                 protected_prefix_lens=[states[i].prefix_len for i in active_idx],
-                protected_mem_positions=[
-                    states[i].mem_store_positions for i in active_idx
-                ],
+                protected_mem_positions=None,
                 gather_positions=gather_positions,
             )
             for b, i in enumerate(active_idx):
@@ -1471,16 +1361,9 @@ class BatchedPureNeuralRunner:
             #    adding more drafts but keep the prefix.
             drafts = []  # list[list[int]] aligned with active_idx
             per_elem_k = []  # K actually used this iter, aligned with active_idx
-            # Per-element list of drafted-step indices (0..K-1) whose opcode is
-            # a MEM-store op. The corresponding draft MEM markers are tagged
-            # ``MEM_STORE=1`` below so the embedding's L15/L16 lookup
-            # injection mirrors what ``_windowed_context`` does for the
-            # current step's marker.
-            draft_store_step_idx: List[List[int]] = []
             for i in active_idx:
                 s = states[i]
                 d: List[int] = []
-                store_steps: List[int] = []
                 # Only speculate when the element is at a clean VM-step
                 # boundary. If a previous iter's verification rejected
                 # mid-step, the context now contains a partial step; we'd
@@ -1489,16 +1372,7 @@ class BatchedPureNeuralRunner:
                 # is simpler and only costs at most 35 forwards per
                 # rejection event.
                 at_step_boundary = (s.token_pos % STEP == 0)
-                # Pick K for this element this iteration:
-                #   * Adaptive mode reads ``s.adaptive_k`` (updated below).
-                #   * Fixed mode uses the global ``spec_k``.
-                # Then cap by available context room: drafts append to the
-                # windowed context, and the forward must fit under
-                # ``model_max_seq``. The windowed context length is bounded
-                # above by ``prefix_len + max_context_window`` (see
-                # ``_windowed_context``).
                 base_k = s.adaptive_k if adaptive else spec_k
-                # Estimate the windowed-context length to compute room.
                 est_ctx_len = min(
                     len(s.context),
                     s.prefix_len + max_context_window,
@@ -1516,10 +1390,6 @@ class BatchedPureNeuralRunner:
                     and at_step_boundary
                     and effective_k > 0
                 ):
-                    # Sync DraftVM register state from the element. Registers
-                    # are the dominant correctness signal; sparse memory
-                    # drift only causes extra rejections (not divergence —
-                    # the model remains the source of truth).
                     self._sync_draft_vm(s)
                     unsafe_stop = False
                     for step_j in range(effective_k):
@@ -1528,17 +1398,10 @@ class BatchedPureNeuralRunner:
                             break
                         if s.draft_vm.halted:
                             break
-                        # Capture the opcode that will execute this step BEFORE
-                        # ``step()`` advances pc/idx. Store ops need the MEM
-                        # marker tagged for the model forward (see comment
-                        # above on ``draft_store_step_idx``).
-                        pre_op = self._draft_current_opcode(s.draft_vm)
                         ok = s.draft_vm.step()
                         if not ok:
                             break
                         d.extend(s.draft_vm.draft_tokens())
-                        if pre_op is not None and pre_op in _MEM_STORE_OPS:
-                            store_steps.append(step_j)
                         if s.draft_vm.halted:
                             break
                     if unsafe_stop:
@@ -1549,7 +1412,6 @@ class BatchedPureNeuralRunner:
                     self._spec_stats["drafted"] += len(d)
                 drafts.append(d)
                 per_elem_k.append(effective_k)
-                draft_store_step_idx.append(store_steps)
 
             # 2) Build padded tensor: each active element gets windowed context
             #    + its draft tokens appended. Padded to the max combined length.
@@ -1561,42 +1423,8 @@ class BatchedPureNeuralRunner:
                 real_prefix_lens.append(len(ctx_win))
                 windowed_with_drafts.append(ctx_win + drafts[k])
 
-            # Augment mem_store_positions with draft-region MEM markers for
-            # drafted STORE steps. The transient list is for the embedding
-            # only; ``s.mem_store_positions`` keeps the windowed-context-only
-            # list because the drafted steps may be rejected and must not
-            # pollute persistent state.
-            mem_store_positions_with_drafts: List[List[int]] = []
-            for k, i in enumerate(active_idx):
-                base = list(states[i].mem_store_positions)
-                prefix_len_k = real_prefix_lens[k]
-                seq_k = windowed_with_drafts[k]
-                seen = set(base)
-                for step_j in draft_store_step_idx[k]:
-                    marker_pos = (
-                        prefix_len_k + step_j * STEP + _MEM_MARKER_STEP_OFFSET
-                    )
-                    if (
-                        marker_pos in seen
-                        or marker_pos >= len(seq_k)
-                        or seq_k[marker_pos] != Token.MEM
-                    ):
-                        continue
-                    base.append(marker_pos)
-                    seen.add(marker_pos)
-                base.sort()
-                mem_store_positions_with_drafts.append(base)
-
             mh_end = max(s.mem_history_end for s in states)
             self.model.embed.set_mem_history_end(mh_end)
-            if hasattr(self.model.embed, "set_mem_store_positions"):
-                self.model.embed.set_mem_store_positions(
-                    mem_store_positions_with_drafts
-                )
-            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
-                self.model.embed.set_mem_addr_src_positions(
-                    [states[i].mem_addr_src_positions for i in active_idx]
-                )
 
             # Pre-compute argmax for the verifier tensor once (GPU op) and
             # move to CPU in a single transfer. Per-row we only need positions
@@ -1623,7 +1451,7 @@ class BatchedPureNeuralRunner:
                 first_logit_pos=min(real_prefix_lens) - 1,
                 allow_kv=not any(drafts),
                 protected_prefix_lens=[states[i].prefix_len for i in active_idx],
-                protected_mem_positions=mem_store_positions_with_drafts,
+                protected_mem_positions=None,
                 gather_positions=gather_positions_per_row,
             )
 
@@ -1825,124 +1653,12 @@ class BatchedPureNeuralRunner:
             return False
         return op not in _SPEC_UNSAFE_OPS
 
-    @staticmethod
-    def _current_step_store_mem_marker(
-        s: _ElementState, context: List[int]
-    ) -> Tuple[Optional[int], bool]:
-        """Return the current step's MEM marker and whether it is an SI/SC op.
-
-        L15 / L16 lookup rules require ``MEM_STORE=1`` at the MEM marker BEFORE
-        the model predicts MEM_addr0. Historical store MEM markers get this
-        flag via ``mem_store_positions`` (set after STEP_END via
-        ``_track_mem_access``), but the *current* step's marker would be
-        missing until STEP_END dispatch — so the model emits MEM_addr0 without
-        the store-context flag and can pick a wrong address (e.g. ENT's
-        push-BP target ``0xfff0`` collapsing to ``0xffe0`` because the L14
-        attention sources the post-locals SP instead of the post-push SP).
-
-        Returns ``(position, is_si_sc)``. The flag is ``True`` only for SI/SC
-        markers (whose address is sourced from STACK0 — MEM_ADDR_SRC=1); it is
-        ``False`` for PSH/JSR/ENT markers, whose MEM_ADDR_SRC must remain 0.
-        Returns ``(None, False)`` when the current step has no in-progress
-        store marker.
-        """
-        scan_back = Token.STEP_TOKENS + 2
-        end = len(context)
-        start = max(0, end - scan_back)
-        for i in range(end - 1, start - 1, -1):
-            t = context[i]
-            if t == Token.STEP_END or t == Token.HALT or t == Token.TOOL_CALL:
-                # Prior MEM belongs to a previous step (already tracked via
-                # mem_history). Don't claim it as current-step.
-                return None, False
-            if t == Token.MEM:
-                exec_pc = s.exec_pc()
-                exec_idx = exec_pc // INSTR_WIDTH
-                if 0 <= exec_idx < len(s.bytecode):
-                    op = s.bytecode[exec_idx] & 0xFF
-                    if op in _MEM_STORE_OPS:
-                        return i, op in _MEM_ADDR_SRC_OPS
-                return None, False
-        return None, False
-
-    @staticmethod
-    def _add_current_step_marker(
-        positions: List[int],
-        current_marker_abs: Optional[int],
-        windowed: List[int],
-        *,
-        absolute_to_windowed: int = 0,
-    ) -> List[int]:
-        """Return ``positions`` augmented with the current-step MEM marker.
-
-        ``current_marker_abs`` is the marker position in the element's full
-        context. ``absolute_to_windowed`` shifts that absolute position into
-        the windowed coordinate space (zero when no windowing happened,
-        otherwise compensates for trimmed dynamic tokens and re-injected mem
-        history). Returns ``positions`` unchanged when the marker is missing,
-        out of range, or no longer points at a MEM token (defensive guard
-        against caller drift).
-        """
-        if current_marker_abs is None:
-            return positions
-        windowed_pos = current_marker_abs + absolute_to_windowed
-        if not (0 <= windowed_pos < len(windowed)):
-            return positions
-        if windowed[windowed_pos] != Token.MEM:
-            return positions
-        if windowed_pos in positions:
-            return positions
-        return sorted(set(positions) | {windowed_pos})
-
-    def _addr_src_positions(
-        self,
-        store_positions: List[int],
-        current_marker_abs: Optional[int],
-        current_marker_is_si_sc: bool,
-        windowed: List[int],
-        *,
-        absolute_to_windowed: int = 0,
-    ) -> List[int]:
-        """Return the SI/SC subset of ``store_positions``.
-
-        All historical store positions stay in the list (their MEM_ADDR_SRC=1
-        flag is load-bearing for L7 broadcasts feeding LI/LC lookups), but the
-        current-step marker is excluded when its op is PSH/JSR/ENT.
-        """
-        if current_marker_abs is None:
-            return list(store_positions)
-        windowed_pos = current_marker_abs + absolute_to_windowed
-        if not (0 <= windowed_pos < len(windowed)):
-            return list(store_positions)
-        if current_marker_is_si_sc:
-            return list(store_positions)
-        return [p for p in store_positions if p != windowed_pos]
-
     def _windowed_context(
         self, s: _ElementState, max_context_window: int
     ) -> List[int]:
         dynamic_full = s.context[s.prefix_len:]
-        current_marker_abs, current_marker_is_si_sc = (
-            self._current_step_store_mem_marker(s, s.context)
-        )
         if len(dynamic_full) <= max_context_window:
-            # The current context still contains every emitted MEM section.
-            # Keep the byte stream identical to the model's actual
-            # autoregressive context, but still mark tracked store MEM rows so
-            # L15 can distinguish historical stores from ordinary MEM traces.
             s.mem_history_end = 0
-            positions = _mem_section_positions(
-                s.context, s.mem_access_order, s.mem_history
-            )
-            s.mem_store_positions = self._add_current_step_marker(
-                positions, current_marker_abs, s.context
-            )
-            s.mem_addr_src_positions = self._addr_src_positions(
-                s.mem_store_positions,
-                current_marker_abs,
-                current_marker_is_si_sc,
-                s.context,
-            )
             return s.context[:]
 
         dynamic = dynamic_full[-max_context_window:]
@@ -1963,28 +1679,6 @@ class BatchedPureNeuralRunner:
                 mem_tokens.extend(section)
         s.mem_history_end = s.prefix_len + len(mem_tokens) if mem_tokens else 0
         windowed = s.context[: s.prefix_len] + mem_tokens + dynamic
-        positions = _mem_section_positions(
-            windowed, s.mem_access_order, s.mem_history
-        )
-        # When the dynamic tail is trimmed, the absolute-to-windowed shift is
-        # ``len(mem_tokens) - (len(dynamic_full) - len(dynamic))``: prefix
-        # stays in place, mem-history tokens come right after, and the
-        # surviving dynamic tail follows them.
-        dynamic_dropped = len(dynamic_full) - len(dynamic)
-        abs_to_windowed = len(mem_tokens) - dynamic_dropped
-        s.mem_store_positions = self._add_current_step_marker(
-            positions,
-            current_marker_abs,
-            windowed,
-            absolute_to_windowed=abs_to_windowed,
-        )
-        s.mem_addr_src_positions = self._addr_src_positions(
-            s.mem_store_positions,
-            current_marker_abs,
-            current_marker_is_si_sc,
-            windowed,
-            absolute_to_windowed=abs_to_windowed,
-        )
         return windowed
 
     def _pad_to_tensor(
@@ -2067,8 +1761,6 @@ class BatchedPureNeuralRunner:
         neural_ax = self._extract_register(s.context, Token.REG_AX)
         neural_sp = self._extract_register(s.context, Token.REG_SP)
         neural_bp = self._extract_register(s.context, Token.REG_BP)
-        neural_stack0 = self._extract_register(s.context, Token.STACK0)
-        prev_ax = s.last_ax
         if neural_pc is not None:
             s.last_pc = neural_pc
         if neural_ax is not None:
@@ -2077,82 +1769,10 @@ class BatchedPureNeuralRunner:
             s.last_sp = neural_sp
         if neural_bp is not None:
             s.last_bp = neural_bp
-        if neural_stack0 and exec_op not in (Opcode.SI, Opcode.SC):
-            s.stack0_shadow = neural_stack0
-        # PSH: snapshot the pre-PSH AX as the pushed word. The pre-PSH AX is
-        # the value PSH stores at *--SP per C4 semantics; preserving it in
-        # ``last_pushed_value`` lets the collapsed-step binary-ALU recovery
-        # (below) recover the clean 32-bit operand even when the model's
-        # neural STACK0 emit has garbage in the high bytes.
-        if exec_op == Opcode.PSH:
-            s.last_pushed_value = int(prev_ax) & 0xFFFFFFFF
-
-        # IMM AX recovery (2026-06-05). The neural L5 byte-decode emits the
-        # wrong AX byte 0 for imm bytes in [0xE0, 0xFF] (e.g. ``IMM 0xFF``
-        # produces AX=0xFFE8 instead of 0xFF, sign-extended). This breaks
-        # ``test_xor_basic`` (IMM 0xFF, PSH, IMM 0xD5, XOR, EXIT) because the
-        # broken AX from IMM 0xFF poisons the pushed operand, and the model's
-        # downstream PC carry-forward also goes off the rails. Since IMM is a
-        # pure literal load (no neural-ALU semantics needed), we always
-        # override REG_AX from the bytecode imm field — mirroring the LEA
-        # override at run_vm.py:2310-2318 and the collapsed-step recovery
-        # below. Cheap and consistent: the bytecode imm IS the spec.
-        #
-        # Removal-1 (2026-06-05) attempted to delete this override after
-        # adding MEM_ADDR_SRC predicate to l10_ops.tail_lea_local_ax_marker_
-        # byte0_e8. Smoke ran 45/52 (vs 46/52 baseline) — test_add_16bit
-        # regressed though test_xor_basic and test_add_carry_cascade
-        # recovered. Per RUNNER_OVERRIDE_REMOVAL_PLAN_2026_06_05.md acceptance
-        # criteria the override removal was reverted; the predicate fix in
-        # l10_ops remains as a partial structural improvement.
-        #
-        # 2026-06-06 retry: post L7 head 5 K-side OP_IMM blocker (ff4edb61)
-        # and L10 threshold refinement to 7 (983b70c9), the L34 residual
-        # probe shows the tail_lea rule scores sum=1.0 (MARK_AX only) at
-        # every IMM AX marker — well below threshold. Yet removing the
-        # override here STILL regresses ALL 3 critical tests (xor_basic,
-        # add_16bit, add_carry_cascade). Conclusion: the AX byte-0
-        # corruption on IMM rows is NOT solely from the tail_lea rule.
-        # A separate model-side surface is emitting wrong AX bytes for
-        # IMM in [0xE0, 0xFF]. See tools/removal_1_probe_and_smoke.py
-        # for the L34 probe + smoke combination used in the retry.
-        # Override stays in place pending identification of the
-        # remaining surface.
-        if exec_op == Opcode.IMM:
-            imm = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
-            if imm >= 0x800000:
-                imm -= 0x1000000
-            imm_val = imm & 0xFFFFFFFF
-            s.last_ax = imm_val
-            self._override_register_in_last_step(
-                s.context, Token.REG_AX, imm_val
-            )
 
         # PUTCHAR: append AX byte 0 to output.
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
             s.output.append(chr(neural_ax & 0xFF))
-
-        # GETCHAR: runner-side stdin injection. We have to overwrite REG_AX
-        # bytes in the just-completed step.
-        if exec_op == Opcode.GETCHAR:
-            byte_val = -1
-            if s.stdin_pos < len(s.stdin_buffer):
-                byte_val = ord(s.stdin_buffer[s.stdin_pos]) & 0xFF
-                s.stdin_pos += 1
-            else:
-                byte_val = 0xFFFFFFFF
-            self._override_register_in_last_step(s.context, Token.REG_AX, byte_val)
-            s.last_ax = byte_val
-
-        if exec_op in (Opcode.LI, Opcode.LC):
-            section = s.mem_history.get(int(prev_ax) & 0xFFFFFFFF)
-            if section is not None:
-                width = 1 if exec_op == Opcode.LC else 4
-                loaded = 0
-                for j in range(width):
-                    loaded |= (int(section[5 + j]) & 0xFF) << (j * 8)
-                self._override_register_in_last_step(s.context, Token.REG_AX, loaded)
-                s.last_ax = loaded
 
         # PRTF / OPEN / CLOS / READ: defer to serial runner for shim parity.
         if exec_op in (Opcode.PRTF, Opcode.OPEN, Opcode.CLOS, Opcode.READ):
@@ -2185,26 +1805,8 @@ class BatchedPureNeuralRunner:
                 addr = 0
                 for j in range(4):
                     addr |= (int(mem_section[1 + j]) & 0xFF) << (j * 8)
-                if addr == 0 and s.stack0_shadow:
-                    addr = int(s.stack0_shadow) & 0xFFFFFFFF
-                    for j in range(4):
-                        mem_section[1 + j] = (addr >> (j * 8)) & 0xFF
-                    self._override_mem_section_in_last_step(s.context, mem_section)
                 self._track_mem_access(s, addr, mem_section)
 
-        # BZ/BNZ runner-side PC carry-forward override removed (2026-06-06).
-        # The override (commit 44709e13) previously rewrote REG_PC after the
-        # model emitted the BZ/BNZ step. The model-side gap it masked was a
-        # post-L9 BZ/BNZ FFN rule that copied ``FETCH_LO+k`` into
-        # ``OUTPUT_LO+k`` (raw instruction-index nibble) instead of the
-        # ``imm * INSTR_WIDTH + PC_OFFSET`` byte-address conversion that
-        # ``_set_layer4_ffn`` (vm_step.py:5086-5108) bakes for the same band.
-        # The fix lives in ``unified_compiler/ops/l6_ops.py``:
-        # ``_post_l9_bz_pc_override_rules`` /
-        # ``_post_l9_bnz_pc_override_rules`` now call
-        # ``_append_pc_byte0_imm_to_byte_addr_rules`` which performs the
-        # index-to-byte-addr conversion. See
-        # ``docs/ABSDIFF_BZ_REDIRECT_BUG.md`` for context.
         if exec_op == Opcode.EXIT:
             # In serial, EXIT is detected and the loop breaks; HALT is the
             # final token. Match that: mark halted but keep the model run
@@ -2214,126 +1816,6 @@ class BatchedPureNeuralRunner:
             s.exit_code = self._decode_exit_code(s.context)
             s.halted = True
             return
-
-        # Collapsed-step binary-ALU recovery (2026-06-04). For smoke
-        # ``sub_basic``/``div_basic``/``mod_basic`` (plus the eq/gt/ge/shl/shr/
-        # mul_overflow comparison + shift suite, which follow the same
-        # IMM,PSH,IMM,<binop>,EXIT shape) the model emits TWO register blocks
-        # under a single STEP_END (e.g. IMM 8 reg-block then SUB reg-block then
-        # one STEP_END). The just-executed op was the IMM (``exec_op`` here),
-        # but ``s.last_pc`` — read from the LAST REG_PC in the collapsed step —
-        # already points past a skipped binary ALU op (e.g. SUB at idx 3
-        # between IMM at idx 2 and EXIT at idx 4). The neural emit for that
-        # skipped SUB step is broken (model writes AX=0 instead of 42), so the
-        # early-exit below reads the broken AX. Detect the one-instruction
-        # skip + binary-ALU pattern and synthesize the correct AX from the
-        # legacy ALU (mirrors the serial ``_BINARY_POP_OPS`` override at
-        # run_vm.py:2255-2275). Bounded to ONE skipped op so we don't paper
-        # over larger model divergences. Operands: ``ax_after_imm`` from the
-        # bytecode's IMM byte, ``stack_val`` from ``last_pushed_value`` (the
-        # clean pre-PSH AX snapshot, not the noisy neural STACK0 emit).
-        if (s.last_pc is not None
-                and exec_op == Opcode.IMM
-                and s.last_pushed_value is not None):
-            post_idx = s.last_pc // INSTR_WIDTH
-            skipped_idx = exec_idx + 1
-            if (post_idx == skipped_idx + 1
-                    and 0 <= skipped_idx < len(s.bytecode)):
-                skipped_op = s.bytecode[skipped_idx] & 0xFF
-                # Incremental-removal toggle: skip the Python cheat if the
-                # caller opted ``skipped_op`` out via
-                # ``C4_DISABLE_BATCHED_ALU_RECOVERY`` (all ops) or
-                # ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS`` (comma-separated
-                # opcode names). Raw neural AX flows through unchanged.
-                if (skipped_op in _BINARY_POP_OPS
-                        and not _alu_recovery_disabled_for(skipped_op)):
-                    # AX after the just-executed IMM = the IMM's imm value.
-                    imm_val = (s.bytecode[exec_idx] >> 8) & 0xFFFFFF
-                    if imm_val >= 0x800000:
-                        imm_val -= 0x1000000
-                    ax_after_imm = imm_val & 0xFFFFFFFF
-                    # stack_val = the value PSH most recently pushed (clean,
-                    # no neural-emit byte-3 noise). See _ElementState.
-                    stack_val = int(s.last_pushed_value) & 0xFFFFFFFF
-                    alu_result = self._serial._compute_alu_legacy(
-                        skipped_op, stack_val, ax_after_imm
-                    )
-                    s.last_ax = int(alu_result) & 0xFFFFFFFF
-                    self._override_register_in_last_step(
-                        s.context, Token.REG_AX, s.last_ax
-                    )
-
-        # Non-collapsed binary-ALU recovery. For the 32-bit cascade tests
-        # (test_add_16bit / test_sub_16bit / test_or_16bit / test_xor_16bit /
-        # test_add_carry_cascade) the model does NOT collapse: it emits a
-        # separate step for the binary op. In that emitted step the
-        # multi-byte ADD/SUB/OR/XOR writeback chain (OUTPUT_LO/HI byte-1..3
-        # lanes) drops or inverts the high bytes — wrong whenever the
-        # architectural result differs from the broken default.
-        # Detect a binary-pop op executed as its own step (exec_op itself
-        # is in _BINARY_POP_OPS) and synthesize the architecturally correct
-        # AX from the legacy ALU. Operands: ``ax_rhs`` is the pre-step AX
-        # (== the post-IMM AX, the RHS per C4 semantics); ``stack_val`` is
-        # the value PSH stored at *--SP. Scoped to the _NEURAL_32BIT_OPS
-        # set (ADD/SUB/OR/XOR/AND), where the multi-byte neural emit is
-        # broken. MUL/DIV/MOD/SHL/SHR are left untouched — they pass via
-        # the collapsed-step path and have no multi-byte writeback bug.
-        #
-        # Removal-4 (2026-06-07, this commit): EQ/NE/LT/GT/LE/GE removed
-        # from the recovery set. The Shape B EQ_FALSE / NE_TRUE failures
-        # the 69f77682 override originally masked are now fixed at the
-        # L10 cmp_combine rule layer: a CMP+0 blocker (weight -0.1) on
-        # the override_3way rules suppresses the spurious EQ/NE override
-        # firing caused by Shape B's CMP+1 (hi_eq) residual amplification
-        # to ~10. The other 5 CMP tests (Shape A: test_eq_true,
-        # test_lt_true, test_gt_true, test_le_true, test_ge_true) still
-        # rely on the collapsed-step _BINARY_POP_OPS recovery above
-        # (commit f3342968), not on this non-collapsed recovery, and so
-        # remain unaffected by the CMP removal. See
-        # docs/REMOVAL_4_DEEP_FIX_2026_06_06.md for the Shape A/B
-        # diagnosis that drove this fix.
-        # Removal-4 follow-up (2026-06-07): EQ/NE re-added to the recovery
-        # set. The original removal-4 commit (e70ddc6d) dropped EQ/NE
-        # under the assumption that the new L10 cmp_combine CMP+0
-        # blocker (Shape B fix) would cover both Shape B EQ_FALSE/NE_TRUE
-        # (default writes 0/1) AND Shape B EQ_TRUE/NE_FALSE (override3
-        # writes 1/0). In practice the override3 score for Shape B
-        # EQ_TRUE is below the +2.5 threshold (CMP+1~1.43, CMP+2~0,
-        # CMP+0~0 → score 2.43) because the upstream L9 lo_eq rule
-        # does not amplify CMP+2 at the EQ step's AX-marker row in
-        # Shape B. The override3 therefore never fires for Shape B
-        # EQ_TRUE, the default fires AX=0, and `test_cmp_and_branch`
-        # (integration EQ(5,5) + BZ) branches to AX=0. Restoring the
-        # EQ/NE entries to this recovery set covers Shape B EQ_TRUE
-        # (and NE_FALSE) via the legacy ALU. Shape A is unaffected:
-        # IMM+EQ collapses, and the collapsed-step recovery at line
-        # 2164 (commit f3342968) computes the correct AX regardless.
-        # The CMP+0 blocker stays in place — it remains semantically
-        # sound (hi_lt ⇒ not equal at hi nibble, so the equality
-        # override must not fire) and may matter for non-smoke
-        # corpus paths even if the smoke Shape B residual probe does
-        # not currently show CMP+0 amplification.
-        _NON_COLLAPSED_RECOVERY_OPS = (
-            Opcode.ADD, Opcode.SUB, Opcode.OR, Opcode.XOR, Opcode.AND,
-            Opcode.EQ, Opcode.NE,
-        )
-        # Incremental-removal toggle: ``C4_DISABLE_BATCHED_ALU_RECOVERY``
-        # (global) or ``C4_DISABLE_BATCHED_ALU_RECOVERY_OPS=<names>`` (per
-        # op) skip the legacy Python ALU rescue and let the raw neural AX
-        # stand. Default: both empty → cheat stays enabled.
-        if (exec_op in _NON_COLLAPSED_RECOVERY_OPS
-                and not _alu_recovery_disabled_for(exec_op)
-                and s.last_pushed_value is not None
-                and prev_ax is not None):
-            stack_val = int(s.last_pushed_value) & 0xFFFFFFFF
-            ax_rhs = int(prev_ax) & 0xFFFFFFFF
-            alu_result = self._serial._compute_alu_legacy(
-                exec_op, stack_val, ax_rhs
-            )
-            s.last_ax = int(alu_result) & 0xFFFFFFFF
-            self._override_register_in_last_step(
-                s.context, Token.REG_AX, s.last_ax
-            )
 
         # Neural-authoritative early exit: after a completed step, the model's
         # emitted PC is the next instruction address and the emitted AX is the
