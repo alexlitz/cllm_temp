@@ -61,6 +61,12 @@ from neural_vm.unified_compiler.decl_verifier import _collect_ffn_rules_from_op
 from neural_vm.unified_compiler.effective_predicate import effective_predicate
 from neural_vm.unified_compiler.ir import FFNRule
 from neural_vm.unified_compiler.predicates import (
+    And,
+    Atom,
+    OpcodeAtAxEq,
+    OpcodeAtAxIn,
+    OpcodeInStepIn,
+    Or,
     Predicate,
     entails,
     is_tautology,
@@ -303,6 +309,249 @@ def _is_colocated_subbank(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Improvement C (2026-06-10): opcode_in_step disjointness
+# ---------------------------------------------------------------------------
+#
+# Many residual alias pairs are time-shared by VM step phase: the same slot
+# carries different semantic values depending on which opcode is running in
+# the current step. Examples (from `docs/DIM_ALIAS_TRIAGE_2026_06_10.md`):
+#
+# * AX_CARRY_LO/HI ↔ POST_PRTF_SP_LO/HI — MUL scratch (compute) vs
+#   POST-PRTF SP save (IO phase). Disjoint by opcode_in_step.
+# * DIV_STAGING ↔ FETCH_LO/HI — DIV/MOD scratch vs instruction-byte fetch.
+# * MUL_ACCUM ↔ FETCH_LO — MUL scratch vs fetch.
+# * IO_OUTPUT_COUNT ↔ PSH_AT_SP — IO state vs PSH stack write.
+# * MEM_STORE ↔ IMM_STAGING — SI/SC/PSH store wire vs PC fetch.
+#
+# Neither slot's semantics encodes the opcode constraint at the registry
+# level (POST_PRTF_SP_LO and AX_CARRY_LO have IDENTICAL semantics strings);
+# the disambiguation lives in the per-rule conditions (positive OP_<X>
+# references) and in design-time knowledge of which opcodes touch which
+# scratch slot.
+#
+# This refinement encodes both sides:
+#
+# 1. **Rule opcode set** — derived from positive OP_<X> conditions /
+#    gate_terms / gate on the rule. ``OP_ADD+0`` as a positive condition
+#    implies the rule fires only when ``opcode_in_step == ADD`` (since
+#    OP_ADD's semantics pins ``opcode_at_AX == ADD`` at the AX marker
+#    position, and ``opcode_at_AX`` and ``opcode_in_step`` agree on
+#    non-IO opcodes at AX rows).
+# 2. **Slot opcode owner set** — derived from the sibling slot's semantics
+#    (via ``opcode_at_AX in/==`` or ``opcode_in_step in`` atoms in the DNF)
+#    OR from the static ``_SLOT_OPCODE_OWNERS`` table for slots whose
+#    semantics is opcode-agnostic by historical convention (POST_PRTF_*,
+#    MUL_ACCUM, DIV_STAGING, FETCH_*, IMM_STAGING, MEM_STORE, MEM_VAL_B*,
+#    PSH_AT_SP, IO_OUTPUT_COUNT, etc.).
+#
+# When BOTH sets are non-empty and DISJOINT, the rule and the conflicting
+# alias cannot both be live at the same step — emit ``disjoint=true`` and
+# skip the violation. Conservative: empty / unknown sets yield NO
+# suppression (we keep the violation).
+
+# Static map: slot name → set of opcodes that "own" the slot's value in
+# any given step. Derived from the slot descriptions in
+# ``neural_vm/dim_registry.py`` (search for "OP_<X>" / "PRTF" / "READ"
+# / per-opcode staging slot in the docstrings). Conservative:
+#
+# * Only include slots whose lifetime is genuinely opcode-scoped (the
+#   slot is dead under other opcodes).
+# * Slots that are written every step (FETCH_LO/HI, IMM_STAGING) get
+#   the FULL opcode set — they're owned by every opcode's fetch phase
+#   and cannot suppress anything via disjointness (the rule's set is a
+#   subset of the full set, never disjoint).
+# * Slots whose opcode-ownership is already encoded in their semantics
+#   (e.g. ``SP_OLD_LO`` semantics ends ``opcode_in_step in {ADJ}``) are
+#   handled by the semantics extractor and don't need a table entry.
+#
+# Adding a slot here is the CHEAPEST cleanup. Removing a slot is safe
+# (loses suppression power, never introduces false negatives).
+_SLOT_OPCODE_OWNERS: Dict[str, frozenset[str]] = {
+    # POST_PRTF_* aliases on AX_FULL_*/AX_CARRY_* — only written when the
+    # PRTF tool-call has just returned (post-return SP/PC save).
+    "POST_PRTF_PC_LO": frozenset({"PRTF"}),
+    "POST_PRTF_PC_HI": frozenset({"PRTF"}),
+    "POST_PRTF_SP_LO": frozenset({"PRTF"}),
+    "POST_PRTF_SP_HI": frozenset({"PRTF"}),
+    # FORMAT_PTR_* — format-string pointer for PRTF (alias of AX_FULL_*).
+    "FORMAT_PTR_LO": frozenset({"PRTF"}),
+    "FORMAT_PTR_HI": frozenset({"PRTF"}),
+    "FORMAT_PTR_LO_PIN": frozenset({"PRTF"}),
+    "FORMAT_PTR_HI_PIN": frozenset({"PRTF"}),
+    # MUL/DIV staging — alias of FETCH_LO/HI. Only used during MUL/DIV/MOD
+    # compute phases.
+    "MUL_ACCUM": frozenset({"MUL"}),
+    "DIV_STAGING": frozenset({"DIV", "MOD"}),
+    # MEM_STORE — set at MEM positions only during SI/SC/PSH stores.
+    "MEM_STORE": frozenset({"SI", "SC", "PSH"}),
+    # MEM_VAL_B0..3 — predicted memory value at LI/LC load.
+    "MEM_VAL_B0": frozenset({"LI", "LC"}),
+    "MEM_VAL_B1": frozenset({"LI", "LC"}),
+    "MEM_VAL_B2": frozenset({"LI", "LC"}),
+    "MEM_VAL_B3": frozenset({"LI", "LC"}),
+    # PSH_AT_SP — PSH opcode flag relayed to SP/STACK0 positions.
+    "PSH_AT_SP": frozenset({"PSH"}),
+    # IO_OUTPUT_COUNT — counts output bytes remaining for PRTF/READ.
+    "IO_OUTPUT_COUNT": frozenset({"PRTF", "READ"}),
+    # IO_IS_PRTF / IO_IS_READ — opcode detection flags (alias of MEM_VAL_B3
+    # / OP_LI_RELAY positions in the compact layout).
+    "IO_IS_PRTF": frozenset({"PRTF"}),
+    "IO_IS_READ": frozenset({"READ"}),
+    # OP_LI_RELAY / OP_LC_RELAY — already encoded via opcode_in_step in
+    # semantics; include here for symmetry.
+    "OP_LI_RELAY": frozenset({"LI"}),
+    "OP_LC_RELAY": frozenset({"LC"}),
+    # CMP_GROUP — set at AX when any comparison opcode active.
+    "CMP_GROUP": frozenset({"EQ", "NE", "LT", "GT", "LE", "GE"}),
+    # ADJ staging — already opcode_in_step-encoded; include for symmetry.
+    "SP_OLD_LO": frozenset({"ADJ"}),
+    "SP_OLD_HI": frozenset({"ADJ"}),
+    "ADJ_CARRY": frozenset({"ADJ"}),
+    # IO state-machine bookkeeping bits (alias MEM_VAL_B*/AX_FULL_HI tail);
+    # these latch on the PRTF/READ thinking-loop transitions only.
+    "LAST_WAS_IO_STATE_EMIT_BYTE": frozenset({"PRTF", "READ"}),
+    "LAST_WAS_IO_STATE_EMIT_THINKING": frozenset({"PRTF", "READ"}),
+    "LAST_WAS_THINKING_START": frozenset({"PRTF", "READ"}),
+    "LAST_WAS_THINKING_END": frozenset({"PRTF", "READ"}),
+}
+
+
+def _walk_atoms(p: Predicate, out: List[Atom]) -> None:
+    """Append every leaf Atom node reachable from ``p`` into ``out``."""
+    if isinstance(p, Atom):
+        out.append(p)
+        return
+    if isinstance(p, And) or isinstance(p, Or):
+        for child in p.children:
+            _walk_atoms(child, out)
+        return
+    # Not: recurse into the child (we only need positive atom mentions
+    # for opcode extraction; negated opcode atoms don't pin a single
+    # opcode and are skipped by the caller).
+    inner = getattr(p, "child", None)
+    if inner is not None:
+        _walk_atoms(inner, out)
+
+
+def _opcodes_from_semantics(
+    sem: Optional[str],
+    cache: Dict[str, Optional[frozenset[str]]],
+) -> Optional[frozenset[str]]:
+    """Extract the opcode-in-step set from a slot's parsed semantics.
+
+    Walks the semantics AST looking for positive ``opcode_at_AX == X``,
+    ``opcode_at_AX in {...}``, and ``opcode_in_step in {...}`` atoms.
+    If multiple appear, returns their UNION (the slot is alive under any
+    of those opcodes; the disjointness check below stays conservative).
+
+    Returns:
+      * ``None`` if no opcode atom is found (semantics is opcode-agnostic
+        — the caller should fall back to the static owner table).
+      * A frozenset of opcode names (e.g. ``{"ADD"}``, ``{"DIV", "MOD"}``)
+        when at least one opcode atom is present.
+
+    Cached per-``sem`` string so the production registry's ~200 slots
+    are parsed once. Parse errors degrade to ``None``.
+    """
+    if sem is None:
+        return None
+    if sem in cache:
+        return cache[sem]
+    try:
+        pred = parse(sem)
+    except Exception:
+        cache[sem] = None
+        return None
+    atoms: List[Atom] = []
+    _walk_atoms(pred, atoms)
+    found: set[str] = set()
+    saw_opcode_atom = False
+    for a in atoms:
+        if isinstance(a, OpcodeAtAxEq):
+            found.add(a.opcode)
+            saw_opcode_atom = True
+        elif isinstance(a, OpcodeAtAxIn):
+            found.update(a.opcodes)
+            saw_opcode_atom = True
+        elif isinstance(a, OpcodeInStepIn):
+            found.update(a.opcodes)
+            saw_opcode_atom = True
+    result = frozenset(found) if saw_opcode_atom else None
+    cache[sem] = result
+    return result
+
+
+def _slot_opcode_in_step_set(
+    registry: DimRegistry,
+    name: str,
+    semantics_cache: Dict[str, Optional[frozenset[str]]],
+) -> Optional[frozenset[str]]:
+    """Best-effort opcode set for slot ``name``.
+
+    Tries the static ``_SLOT_OPCODE_OWNERS`` table first (covers slots
+    whose semantics is opcode-agnostic by historical convention), then
+    falls back to extracting opcode atoms from the slot's semantics.
+
+    Returns ``None`` when nothing is known — the disjointness check
+    skips the suppression and the violation stands.
+    """
+    owners = _SLOT_OPCODE_OWNERS.get(name)
+    if owners:
+        return owners
+    sem = _slot_semantics(registry, name)
+    return _opcodes_from_semantics(sem, semantics_cache)
+
+
+def _rule_opcode_in_step_set(
+    rule: FFNRule,
+    registry: DimRegistry,
+    semantics_cache: Dict[str, Optional[frozenset[str]]],
+) -> Optional[frozenset[str]]:
+    """Derive the rule's opcode-in-step constraint from its positive
+    OP_<X> condition / gate_term / gate references.
+
+    The intuition: a rule that lists ``("OP_ADD+0", 1.0)`` as a positive
+    condition only fires when ``opcode_at_AX == ADD`` (the registry
+    semantics of OP_ADD); since each step has a single active opcode at
+    the AX marker, this pins ``opcode_in_step == ADD``. Multiple positive
+    OP_<X> references widen the set (the rule fires under ANY listed
+    opcode).
+
+    Positive references are collected from:
+      * ``rule.conditions`` with positive weight,
+      * ``rule.gate_terms`` with positive weight,
+      * ``rule.gate`` (always positive when present).
+
+    Returns ``None`` if no positive OP_<X> reference is found — the
+    rule's opcode context is unknown and disjointness can't be asserted.
+    Returns ``frozenset()`` only if all OP_<X> refs name unknown opcodes
+    (shouldn't happen in practice; treated as unknown).
+    """
+    found: set[str] = set()
+
+    def _add_from_dim_name(dim_name: str) -> None:
+        if not dim_name.startswith("OP_"):
+            return
+        sem = _slot_semantics(registry, dim_name)
+        opcodes = _opcodes_from_semantics(sem, semantics_cache)
+        if opcodes:
+            found.update(opcodes)
+
+    for term in rule.conditions:
+        if term.weight > 0:
+            _add_from_dim_name(term.dim.name)
+    for term in rule.gate_terms:
+        if term.weight > 0:
+            _add_from_dim_name(term.dim.name)
+    if rule.gate is not None:
+        _add_from_dim_name(rule.gate.name)
+
+    if not found:
+        return None
+    return frozenset(found)
+
+
 def _slot_semantics_is_tautology(
     registry: DimRegistry,
     name: str,
@@ -339,7 +588,11 @@ def verify_dim_aliases(
     alias_index: Optional[Dict[str, List[str]]] = None,
     skip_colocated_subbank: bool = True,
     skip_tautological_siblings: bool = True,
+    skip_opcode_in_step_disjoint: bool = True,
     tautology_cache: Optional[Dict[str, bool]] = None,
+    opcode_semantics_cache: Optional[
+        Dict[str, Optional[frozenset[str]]]
+    ] = None,
 ) -> List[AliasViolation]:
     """Walk an op's FFNRules and report reads of aliased dims whose
     effective firing predicate is COMPATIBLE with another alias's
@@ -374,6 +627,8 @@ def verify_dim_aliases(
         alias_index = _build_alias_index(registry)
     if tautology_cache is None:
         tautology_cache = {}
+    if opcode_semantics_cache is None:
+        opcode_semantics_cache = {}
 
     op_name = getattr(op, "name", None)
     rules = _collect_ffn_rules_from_op(op)
@@ -390,6 +645,16 @@ def verify_dim_aliases(
                 continue
         except Exception:
             continue
+
+        # Improvement C (2026-06-10): derive the rule's opcode_in_step
+        # constraint set from positive OP_<X> condition/gate references.
+        # Cached per (rule_id) for the inner sibling loop. ``None`` =
+        # unknown; never used to suppress.
+        rule_opcode_set: Optional[frozenset[str]] = None
+        if skip_opcode_in_step_disjoint:
+            rule_opcode_set = _rule_opcode_in_step_set(
+                rule, registry, opcode_semantics_cache,
+            )
 
         read_dims = _collect_read_dim_refs(rule)
         for dim_name, dim_offset in read_dims:
@@ -431,6 +696,27 @@ def verify_dim_aliases(
                     dim_name, sibling, registry,
                 ):
                     continue
+                # Improvement C (2026-06-10): opcode_in_step disjointness.
+                # If the rule's opcode set (derived from positive OP_<X>
+                # conditions/gate) and the sibling slot's opcode owner
+                # set (from semantics or the static table) are BOTH
+                # non-empty and DISJOINT, the rule cannot fire in any
+                # step that touches the sibling's value — the alias is
+                # design-time time-shared, not a real bug.
+                if (
+                    skip_opcode_in_step_disjoint
+                    and rule_opcode_set is not None
+                    and rule_opcode_set
+                ):
+                    sibling_opcode_set = _slot_opcode_in_step_set(
+                        registry, sibling, opcode_semantics_cache,
+                    )
+                    if (
+                        sibling_opcode_set is not None
+                        and sibling_opcode_set
+                        and rule_opcode_set.isdisjoint(sibling_opcode_set)
+                    ):
+                        continue
                 violations.append(
                     AliasViolation(
                         op_name=op_name,
@@ -451,6 +737,7 @@ def verify_dim_aliases_for_ops(
     *,
     skip_colocated_subbank: bool = True,
     skip_tautological_siblings: bool = True,
+    skip_opcode_in_step_disjoint: bool = True,
 ) -> List[AliasViolation]:
     """Run :func:`verify_dim_aliases` over an iterable of ops, sharing
     the alias index across calls.
@@ -461,6 +748,7 @@ def verify_dim_aliases_for_ops(
     """
     alias_index = _build_alias_index(registry)
     tautology_cache: Dict[str, bool] = {}
+    opcode_semantics_cache: Dict[str, Optional[frozenset[str]]] = {}
     seen: set = set()
     out: List[AliasViolation] = []
     for op in ops:
@@ -468,7 +756,9 @@ def verify_dim_aliases_for_ops(
             op, registry, alias_index=alias_index,
             skip_colocated_subbank=skip_colocated_subbank,
             skip_tautological_siblings=skip_tautological_siblings,
+            skip_opcode_in_step_disjoint=skip_opcode_in_step_disjoint,
             tautology_cache=tautology_cache,
+            opcode_semantics_cache=opcode_semantics_cache,
         ):
             key = (
                 v.op_name,

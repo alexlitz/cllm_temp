@@ -358,6 +358,158 @@ def test_same_extent_subbank_refinement_is_suppressed():
     assert verify_dim_aliases(op, reg) == []
 
 
+# ---------------------------------------------------------------------------
+# 4) Improvement C (2026-06-10): opcode_in_step disjointness
+# ---------------------------------------------------------------------------
+
+
+def _make_opcode_aliasing_registry() -> DimRegistry:
+    """Registry with two slots aliased at the same byte range whose
+    semantics are identical (both ``mark == AX``) but whose opcode
+    owners are disjoint — AX_CARRY_LO style vs POST_PRTF_SP_LO style.
+
+    Also includes ``OP_ADD`` and ``OP_PRTF`` opcode-flag slots so rules
+    can carry positive OP_<X> references for the disjointness derivation.
+    """
+    reg = DimRegistry(d_model=128)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    # OP_ADD-like flag.
+    reg.alloc(
+        "OP_ADD", 4, 1, "ADD opcode flag",
+        semantics="mark == AX AND opcode_at_AX == ADD",
+    )
+    # OP_PRTF-like flag (PRTF is shorthand for the print tool-call;
+    # using "PUTCHAR" as an in-registry stand-in to avoid colliding with
+    # the production registry's missing PRTF opcode atom).
+    reg.alloc(
+        "OP_PUTCHAR", 5, 1, "PUTCHAR opcode flag",
+        semantics="mark == AX AND opcode_at_AX == PUTCHAR",
+    )
+    # Aliased pair at slot 32 size 16 — identical semantics, distinct
+    # opcode owners (the test wires AX_CARRY_LO_LIKE to opcode-derived
+    # rules and asserts POST_PRTF_SP_LO_LIKE is in the static owner table
+    # by name).
+    reg.alloc(
+        "AX_CARRY_LO_LIKE", 32, 16, "AX carry lo nibble",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["POST_PRTF_SP_LO"] = DimSlot(
+        name="POST_PRTF_SP_LO",
+        start=32, size=16,
+        desc="post-PRTF SP lo (aliases AX_CARRY_LO_LIKE)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    reg.alloc("OUT", 64, 1, "out", semantics="mark == AX")
+    return reg
+
+
+def test_opcode_in_step_disjoint_suppresses_violation():
+    """A rule reading AX_CARRY_LO_LIKE under an OP_ADD positive
+    condition has opcode set {ADD}. The sibling POST_PRTF_SP_LO carries
+    a static owner set {PRTF} from ``_SLOT_OPCODE_OWNERS``. Disjoint —
+    skip the violation."""
+    reg = _make_opcode_aliasing_registry()
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("MARK_AX", 1.0),
+            ("OP_ADD+0", 1.0),
+            ("AX_CARRY_LO_LIKE+5", 1.0),
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="add_reads_ax_carry",
+    )
+    op = _FakeOp([rule], name="op_add_under_post_prtf_alias")
+    # Default: opcode_in_step disjointness on -> no violation.
+    assert verify_dim_aliases(op, reg) == []
+    # Disabled: violation surfaces (the semantics-only check sees
+    # overlap because both slots admit mark == AX).
+    violations = verify_dim_aliases(
+        op, reg, skip_opcode_in_step_disjoint=False,
+    )
+    assert any(
+        v.read_dim == "AX_CARRY_LO_LIKE"
+        and v.conflicting_alias == "POST_PRTF_SP_LO"
+        for v in violations
+    ), f"with disjointness off, expected violation, got {violations!r}"
+
+
+def test_opcode_in_step_overlapping_does_not_suppress():
+    """A rule reading the same slot under an OP_PUTCHAR positive
+    condition has opcode set {PUTCHAR}. The sibling POST_PRTF_SP_LO's
+    static owner set {PRTF} is disjoint from {PUTCHAR} — but a rule
+    that mentions BOTH OP_ADD and OP_PUTCHAR widens the set. This test
+    exercises the negative: a rule with opcode set {PRTF}-overlapping
+    must NOT be suppressed.
+
+    Since the test registry uses PUTCHAR as the in-registry stand-in
+    (the predicate DSL accepts PUTCHAR as a valid opcode name), we
+    extend ``_SLOT_OPCODE_OWNERS`` for the duration of this test to
+    include PUTCHAR. Restoring afterwards keeps the table immutable in
+    user code.
+    """
+    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    reg = _make_opcode_aliasing_registry()
+    # Override the static table: POST_PRTF_SP_LO is owned by {PUTCHAR}
+    # in this test world, matching the rule's opcode set -> the
+    # disjointness check should NOT suppress.
+    saved = _dav._SLOT_OPCODE_OWNERS.get("POST_PRTF_SP_LO")
+    _dav._SLOT_OPCODE_OWNERS["POST_PRTF_SP_LO"] = frozenset({"PUTCHAR"})
+    try:
+        rule = FFNRule.constant_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("OP_PUTCHAR+0", 1.0),
+                ("AX_CARRY_LO_LIKE+5", 1.0),
+            ),
+            threshold=0.5,
+            writes=(("OUT", 1.0),),
+            name="putchar_reads_ax_carry",
+        )
+        op = _FakeOp([rule], name="op_putchar_overlap")
+        violations = verify_dim_aliases(op, reg)
+        assert any(
+            v.read_dim == "AX_CARRY_LO_LIKE"
+            and v.conflicting_alias == "POST_PRTF_SP_LO"
+            for v in violations
+        ), (
+            "Rule and sibling share opcode {PUTCHAR}; disjointness must "
+            f"NOT suppress; got {violations!r}"
+        )
+    finally:
+        if saved is None:
+            _dav._SLOT_OPCODE_OWNERS.pop("POST_PRTF_SP_LO", None)
+        else:
+            _dav._SLOT_OPCODE_OWNERS["POST_PRTF_SP_LO"] = saved
+
+
+def test_opcode_in_step_unknown_rule_set_keeps_violation():
+    """When the rule carries NO positive OP_<X> reference, its opcode
+    set is ``None`` (unknown) — the disjointness check must NOT
+    suppress (conservative)."""
+    reg = _make_opcode_aliasing_registry()
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("MARK_AX", 1.0),
+            ("AX_CARRY_LO_LIKE+5", 1.0),
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="reads_ax_carry_without_opcode",
+    )
+    op = _FakeOp([rule], name="op_no_opcode_context")
+    violations = verify_dim_aliases(op, reg)
+    assert any(
+        v.read_dim == "AX_CARRY_LO_LIKE"
+        and v.conflicting_alias == "POST_PRTF_SP_LO"
+        for v in violations
+    ), (
+        "Rule with unknown opcode context must NOT be suppressed; "
+        f"got {violations!r}"
+    )
+
+
 def test_same_extent_alias_without_refinement_stays_flagged():
     """The textbook OPCODE_BYTE_LO/ADDR_B0_LO pair has same extent AND
     child semantics is a subset of parent's — but the child equals one
