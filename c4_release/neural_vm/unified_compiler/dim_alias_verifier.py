@@ -367,6 +367,23 @@ def _is_colocated_subbank(
 #
 # Adding a slot here is the CHEAPEST cleanup. Removing a slot is safe
 # (loses suppression power, never introduces false negatives).
+# Static set: ALU-family opcodes that write/read AX_CARRY_*, ALU_*, CMP
+# during the compute phase (the FIXME in dim_registry.py for AX_CARRY_*/
+# ALU_*/CARRY confirms this set). Used as the opcode-owner set for
+# AX_CARRY_*, ALU_*, CARRY, CMP* below — these slots are dead under
+# non-ALU/non-CMP opcodes (notably the PRTF/READ IO opcodes whose tool-
+# call returns alias them via POST_PRTF_SP_*/POST_PRTF_PC_*).
+_ALU_OPCODES: frozenset[str] = frozenset({
+    "ADD", "SUB", "MUL", "DIV", "MOD",
+    "OR", "XOR", "AND",
+    "SHL", "SHR",
+})
+_CMP_OPCODES: frozenset[str] = frozenset({
+    "EQ", "NE", "LT", "GT", "LE", "GE",
+})
+_ALU_CMP_OPCODES: frozenset[str] = _ALU_OPCODES | _CMP_OPCODES
+
+
 _SLOT_OPCODE_OWNERS: Dict[str, frozenset[str]] = {
     # POST_PRTF_* aliases on AX_FULL_*/AX_CARRY_* — only written when the
     # PRTF tool-call has just returned (post-return SP/PC save).
@@ -403,7 +420,7 @@ _SLOT_OPCODE_OWNERS: Dict[str, frozenset[str]] = {
     "OP_LI_RELAY": frozenset({"LI"}),
     "OP_LC_RELAY": frozenset({"LC"}),
     # CMP_GROUP — set at AX when any comparison opcode active.
-    "CMP_GROUP": frozenset({"EQ", "NE", "LT", "GT", "LE", "GE"}),
+    "CMP_GROUP": _CMP_OPCODES,
     # ADJ staging — already opcode_in_step-encoded; include for symmetry.
     "SP_OLD_LO": frozenset({"ADJ"}),
     "SP_OLD_HI": frozenset({"ADJ"}),
@@ -414,6 +431,25 @@ _SLOT_OPCODE_OWNERS: Dict[str, frozenset[str]] = {
     "LAST_WAS_IO_STATE_EMIT_THINKING": frozenset({"PRTF", "READ"}),
     "LAST_WAS_THINKING_START": frozenset({"PRTF", "READ"}),
     "LAST_WAS_THINKING_END": frozenset({"PRTF", "READ"}),
+    # ALU result + carry-forward staging — written at AX byte positions
+    # by the ALU compute phase (ADD/SUB/MUL/DIV/MOD/OR/XOR/AND/SHL/SHR)
+    # and read by CMP for the per-nibble comparison cascade. Dead under
+    # non-ALU/non-CMP opcodes (notably PRTF/READ whose IO write-back
+    # phase aliases AX_CARRY_* via POST_PRTF_SP_*). See FIXME notes on
+    # ALU_LO/HI, AX_CARRY_LO/HI, CARRY in ``dim_registry.py``.
+    "AX_CARRY_LO": _ALU_CMP_OPCODES,
+    "AX_CARRY_HI": _ALU_CMP_OPCODES,
+    "ALU_LO": _ALU_CMP_OPCODES,
+    "ALU_HI": _ALU_CMP_OPCODES,
+    "CARRY": _ALU_OPCODES,
+    # CMP cascade (LT/EQ/GT/ZERO) — written at AX by the CMP family.
+    # The L6 delayed-JMP cancel band reads ``CMP+0`` (positive) along
+    # with MARK_PC at a PC marker row one step after the CMP fires; the
+    # opcode pinned by the positive ``CMP+0`` reference is therefore the
+    # CMP-family writer that latched the cascade byte. The cancel is
+    # never fired under PRTF — the POST_PRTF_SP_* alias suppression
+    # holds via disjointness with the CMP set.
+    "CMP": _CMP_OPCODES,
 }
 
 
@@ -582,53 +618,156 @@ def _slot_opcode_in_step_set(
     return _opcodes_from_semantics(sem, semantics_cache)
 
 
+# Known opcode mnemonics (mirrors ``_OPCODE_ROLES`` in dim_registry.py).
+# Kept inline so the verifier doesn't reach into the registry-builder's
+# private symbol just for a literal fallback list. Adding an opcode here
+# is safe — the only effect is that a positive ``OP_<X>`` reference with
+# an opcode-agnostic semantics string will resolve to the matching
+# opcode role.
+_ALL_OPCODE_ROLES: frozenset[str] = frozenset({
+    "LEA", "IMM", "JMP", "JSR", "BZ", "BNZ", "ENT", "ADJ", "LEV",
+    "LI", "LC", "SI", "SC", "PSH", "OR", "XOR", "AND",
+    "EQ", "NE", "LT", "GT", "LE", "GE",
+    "SHL", "SHR", "ADD", "SUB", "MUL", "DIV", "MOD",
+    "EXIT", "NOP", "PUTCHAR", "GETCHAR",
+    # IO tool-call opcodes used by POST_PRTF_*/IO_*/MEM_VAL_* owners.
+    "PRTF", "READ",
+})
+
+
+def _op_x_opcode_from_dim(
+    dim_name: str,
+    registry: DimRegistry,
+    semantics_cache: Dict[str, Optional[frozenset[str]]],
+) -> Optional[frozenset[str]]:
+    """Recover the opcode role for an ``OP_<X>`` dim reference.
+
+    Tries the slot's semantics first (the standard
+    ``mark == AX AND opcode_at_AX == X`` form parses to ``{X}``); when
+    the registry uses the DSL-keyword fallback (``OR``/``AND``/``NOT``
+    cannot appear as opcode atoms in the predicate grammar so OP_OR/
+    OP_AND/OP_NOT carry a position-only semantics string), recovers the
+    opcode role from the dim-name suffix.
+
+    Returns ``None`` if the dim is not named ``OP_<role>`` for a known
+    role.
+    """
+    if not dim_name.startswith("OP_"):
+        return None
+    sem = _slot_semantics(registry, dim_name)
+    opcodes = _opcodes_from_semantics(sem, semantics_cache)
+    if opcodes:
+        return opcodes
+    suffix = dim_name[3:]
+    if suffix in _ALL_OPCODE_ROLES:
+        return frozenset({suffix})
+    return None
+
+
 def _rule_opcode_in_step_set(
     rule: FFNRule,
     registry: DimRegistry,
     semantics_cache: Dict[str, Optional[frozenset[str]]],
 ) -> Optional[frozenset[str]]:
     """Derive the rule's opcode-in-step constraint from its positive
-    OP_<X> condition / gate_term / gate references.
+    condition / gate_term / gate references.
 
     The intuition: a rule that lists ``("OP_ADD+0", 1.0)`` as a positive
     condition only fires when ``opcode_at_AX == ADD`` (the registry
     semantics of OP_ADD); since each step has a single active opcode at
-    the AX marker, this pins ``opcode_in_step == ADD``. Multiple positive
-    OP_<X> references widen the set (the rule fires under ANY listed
-    opcode).
+    the AX marker, this pins ``opcode_in_step == ADD``.
+
+    Two-phase derivation:
+
+      * **Phase 1 (OP_<X> UNION)** — collect opcode roles named by any
+        positive ``OP_<X>`` reference. Multiple positive ``OP_<X>``
+        references widen the set (a rule that lists both ``OP_ADD`` and
+        ``OP_SUB`` is design-time alive under either). This matches the
+        original (pre-Improvement D) behavior. Recovery covers both the
+        standard ``opcode_at_AX == X`` semantics form AND the DSL-keyword
+        literal fallback (OP_OR/OP_AND/OP_NOT — Improvement D).
+
+      * **Phase 2 (non-OP intersection)** — only runs when Phase 1
+        produced an empty set (the rule carries NO positive OP_<X>
+        reference). Walks the same positive condition / gate_term / gate
+        list and INTERSECTS the opcode-owner sets pulled from
+        ``_SLOT_OPCODE_OWNERS`` / slot semantics. INTERSECTION is the
+        correct combinator for AND'd conditions: a rule that needs BOTH
+        ``LAST_WAS_THINKING_START`` (owners ``{PRTF, READ}``) AND a
+        ``POST_PRTF_SP_LO`` gate (owners ``{PRTF}``) fires only when the
+        active opcode is in ``{PRTF, READ} ∩ {PRTF} = {PRTF}``. Examples
+        recovered by Phase 2 (Improvement E):
+          - L9 CMP rules gated on ``CMP_GROUP`` recover ``{CMP_OPCODES}``.
+          - convo-IO PC/SP latch rules recover ``{PRTF}``.
+          - L6 delayed-JMP cancel rules recover ``{CMP_OPCODES}``.
+
+    Phase 2 ONLY runs when Phase 1 yielded nothing. This preserves the
+    original behavior for rules that already had OP_<X> refs: their
+    opcode set is unchanged, so the historical DIV/MUL_ACCUM/FETCH_*
+    suppression matches stay stable. The intersection is over-cautious
+    when a positive non-OP reference is a weak booster (not necessary
+    for firing), but the failure mode is "we don't narrow enough" which
+    means MORE violations stand — conservative.
 
     Positive references are collected from:
       * ``rule.conditions`` with positive weight,
       * ``rule.gate_terms`` with positive weight,
       * ``rule.gate`` (always positive when present).
 
-    Returns ``None`` if no positive OP_<X> reference is found — the
-    rule's opcode context is unknown and disjointness can't be asserted.
-    Returns ``frozenset()`` only if all OP_<X> refs name unknown opcodes
-    (shouldn't happen in practice; treated as unknown).
+    Returns ``None`` when neither phase yields any opcode — the rule's
+    opcode context is unknown and disjointness can't be asserted.
     """
-    found: set[str] = set()
-
-    def _add_from_dim_name(dim_name: str) -> None:
-        if not dim_name.startswith("OP_"):
-            return
-        sem = _slot_semantics(registry, dim_name)
-        opcodes = _opcodes_from_semantics(sem, semantics_cache)
-        if opcodes:
-            found.update(opcodes)
-
+    # Collect positive references once (shared by both phases).
+    positive_refs: List[str] = []
     for term in rule.conditions:
         if term.weight > 0:
-            _add_from_dim_name(term.dim.name)
+            positive_refs.append(term.dim.name)
     for term in rule.gate_terms:
         if term.weight > 0:
-            _add_from_dim_name(term.dim.name)
+            positive_refs.append(term.dim.name)
     if rule.gate is not None:
-        _add_from_dim_name(rule.gate.name)
+        positive_refs.append(rule.gate.name)
 
-    if not found:
-        return None
-    return frozenset(found)
+    # --- Phase 1: OP_<X> UNION. ----------------------------------------
+    op_x_set: set[str] = set()
+    for dim_name in positive_refs:
+        opcodes = _op_x_opcode_from_dim(dim_name, registry, semantics_cache)
+        if opcodes:
+            op_x_set.update(opcodes)
+    if op_x_set:
+        return frozenset(op_x_set)
+
+    # --- Phase 2: non-OP positive INTERSECTION. -----------------------
+    # Walk the same positive refs; intersect opcode-owner sets pulled
+    # from _SLOT_OPCODE_OWNERS or slot semantics. Intersection assumes
+    # the rule's threshold needs every positive contributor active in
+    # the same step — an over-cautious model for rules whose weights
+    # encode an OR'd group, but never widens the rule's set so disjoint-
+    # ness suppressions never fire spuriously.
+    intersect: Optional[set[str]] = None
+    for dim_name in positive_refs:
+        # Skip OP_<X> — already handled in Phase 1 and gave nothing.
+        if dim_name.startswith("OP_"):
+            continue
+        opcodes = _slot_opcode_in_step_set(
+            registry, dim_name, semantics_cache,
+        )
+        if not opcodes:
+            continue
+        if intersect is None:
+            intersect = set(opcodes)
+        else:
+            intersect &= opcodes
+        if not intersect:
+            # Empty intersection means the rule's positive conditions
+            # demand mutually exclusive opcodes — i.e. it cannot fire
+            # under any single opcode. Treat as "unknown" rather than
+            # claim a vacuously-disjoint set; the conservative choice
+            # keeps the violation visible.
+            return None
+    if intersect:
+        return frozenset(intersect)
+    return None
 
 
 def _slot_phase_in_step_set(

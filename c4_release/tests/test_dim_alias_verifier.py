@@ -510,6 +510,175 @@ def test_opcode_in_step_unknown_rule_set_keeps_violation():
     )
 
 
+# ---------------------------------------------------------------------------
+# 5) Improvement D/E (2026-06-10): expanded opcode_in_step extraction
+# ---------------------------------------------------------------------------
+
+
+def _make_extended_opcode_aliasing_registry() -> DimRegistry:
+    """Registry with an OP_OR-like flag whose semantics is the DSL-
+    keyword fallback (no opcode atom) AND an AX_CARRY_LO_LIKE/
+    POST_PRTF_SP_LO alias pair, plus a CMP_GROUP_LIKE non-OP_ flag with
+    explicit opcode-atom semantics for Phase 2 coverage."""
+    reg = DimRegistry(d_model=128)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    reg.alloc(
+        "MARK_SE_ONLY", 1, 1, "STEP_END marker",
+        semantics="mark == SE",
+    )
+    # OP_OR_LIKE has the DSL-keyword fallback semantics (position-only,
+    # no opcode atom). The literal fallback in _rule_opcode_in_step_set
+    # must recover the "OR" role from the OP_<X> suffix.
+    reg.alloc(
+        "OP_OR", 4, 1, "OR opcode flag (DSL-keyword fallback)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    # CMP_GROUP_LIKE has semantics with an explicit opcode_at_AX atom set.
+    # Phase 2 path should pick it up via _opcodes_from_semantics fallback
+    # inside _slot_opcode_in_step_set.
+    reg.alloc(
+        "CMP_GROUP_LIKE", 5, 1, "Comparison-group flag",
+        semantics="mark == AX AND opcode_at_AX in {EQ, NE, LT}",
+    )
+    # Aliased pair at slot 32 size 16, identical semantics, distinct
+    # opcode owners (AX_CARRY_LO_LIKE: not in static table; the
+    # production registry's AX_CARRY_LO IS, but the test uses a
+    # synthetic name to isolate the literal-fallback path).
+    reg.alloc(
+        "AX_CARRY_LO_LIKE", 32, 16, "AX carry lo nibble (test stub)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["POST_PRTF_SP_LO"] = DimSlot(
+        name="POST_PRTF_SP_LO",
+        start=32, size=16,
+        desc="post-PRTF SP lo (aliases AX_CARRY_LO_LIKE)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    reg.alloc("OUT", 64, 1, "out", semantics="mark == AX")
+    return reg
+
+
+def test_op_or_literal_fallback_pins_opcode_for_dsl_keyword():
+    """Improvement D: a rule with ``gate=OP_OR`` (a DSL-keyword opcode
+    whose semantics is position-only) must recover ``{OR}`` from the
+    dim-name literal so disjointness with ``POST_PRTF_SP_LO`` (owners
+    ``{PRTF}``) fires."""
+    reg = _make_extended_opcode_aliasing_registry()
+    rule = FFNRule.gated_write(
+        conditions=(
+            ("MARK_SE_ONLY", 1.0),
+            ("AX_CARRY_LO_LIKE+5", 1.0),
+        ),
+        threshold=0.5,
+        gate="OP_OR+0",
+        writes=(("OUT", 1.0),),
+        name="l10_bitwise_or_under_dsl_keyword",
+    )
+    op = _FakeOp([rule], name="op_l10_bitwise_or_like")
+    # Default: opcode_in_step disjointness ON -> {OR} disjoint from
+    # POST_PRTF_SP_LO {PRTF} -> no violation.
+    assert verify_dim_aliases(op, reg) == [], (
+        "OP_OR literal fallback should pin rule opcode to {OR}; "
+        "disjoint from {PRTF} -> suppression must fire."
+    )
+
+
+def test_cmp_group_like_phase2_intersection_pins_opcodes():
+    """Improvement E: a rule with NO positive OP_<X> reference but a
+    gate on a CMP_GROUP-like slot (semantics encodes opcode_at_AX in
+    {EQ, NE, LT}) must recover ``{EQ, NE, LT}`` via Phase 2 intersection,
+    and the disjointness with POST_PRTF_SP_LO's ``{PRTF}`` owner set must
+    suppress."""
+    reg = _make_extended_opcode_aliasing_registry()
+    rule = FFNRule.gated_write(
+        conditions=(
+            ("MARK_SE_ONLY", 1.0),
+            ("AX_CARRY_LO_LIKE+3", 1.0),
+        ),
+        threshold=0.5,
+        gate="CMP_GROUP_LIKE+0",
+        writes=(("OUT", 1.0),),
+        name="l9_cmp_under_group_flag",
+    )
+    op = _FakeOp([rule], name="op_l9_cmp_under_group_like")
+    assert verify_dim_aliases(op, reg) == [], (
+        "Phase 2 intersection should pin rule opcode to a subset of "
+        "{EQ, NE, LT}; disjoint from {PRTF} -> suppression must fire."
+    )
+
+
+def test_phase2_intersection_collapses_to_empty_returns_none():
+    """When Phase 2 intersection collapses to the empty set (mutually
+    exclusive positive references), the rule's opcode set must be
+    treated as UNKNOWN rather than vacuously disjoint. The conservative
+    choice: keep the violation."""
+    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    reg = _make_extended_opcode_aliasing_registry()
+    # Add a second non-OP_ slot whose owners disjoint from CMP_GROUP_LIKE
+    # owners. Borrow the static table for a deterministic test.
+    saved = _dav._SLOT_OPCODE_OWNERS.get("MARK_AX")
+    _dav._SLOT_OPCODE_OWNERS["MARK_AX"] = frozenset({"PRTF"})
+    try:
+        rule = FFNRule.gated_write(
+            conditions=(
+                # MARK_AX -> {PRTF} (override above)
+                ("MARK_AX", 1.0),
+                ("AX_CARRY_LO_LIKE+3", 1.0),
+            ),
+            threshold=0.5,
+            # CMP_GROUP_LIKE -> {EQ, NE, LT}; intersection with {PRTF} = empty
+            gate="CMP_GROUP_LIKE+0",
+            writes=(("OUT", 1.0),),
+            name="phase2_empty_intersection",
+        )
+        op = _FakeOp([rule], name="op_phase2_empty_intersection")
+        # Phase 2 collapses to empty -> opcode set unknown -> violation stands.
+        violations = verify_dim_aliases(op, reg)
+        assert any(
+            v.read_dim == "AX_CARRY_LO_LIKE"
+            and v.conflicting_alias == "POST_PRTF_SP_LO"
+            for v in violations
+        ), (
+            "Phase 2 empty intersection must NOT vacuously suppress; "
+            f"got {violations!r}"
+        )
+    finally:
+        if saved is None:
+            _dav._SLOT_OPCODE_OWNERS.pop("MARK_AX", None)
+        else:
+            _dav._SLOT_OPCODE_OWNERS["MARK_AX"] = saved
+
+
+def test_op_x_phase_takes_precedence_over_phase2():
+    """When a rule has BOTH an OP_<X> positive reference AND non-OP_
+    positive references (e.g. L10 ALU rules with positive AX_CARRY_*
+    conditions), the rule's opcode set must come from Phase 1 (the
+    OP_<X> union), NOT Phase 2's intersection of the broader non-OP
+    refs. This preserves the historical narrowing — the rule's true
+    opcode set is the gate, not the broader ALU+CMP fingerprint of
+    AX_CARRY_*."""
+    reg = _make_extended_opcode_aliasing_registry()
+    rule = FFNRule.gated_write(
+        conditions=(
+            ("MARK_SE_ONLY", 1.0),
+            # AX_CARRY_LO_LIKE has no static-table entry; Phase 2 would
+            # ignore it. Adding the OP_OR gate (literal fallback {OR})
+            # pins Phase 1's union to {OR}.
+            ("AX_CARRY_LO_LIKE+5", 1.0),
+        ),
+        threshold=0.5,
+        gate="OP_OR+0",
+        writes=(("OUT", 1.0),),
+        name="phase1_dominates_phase2",
+    )
+    op = _FakeOp([rule], name="op_phase1_dominates")
+    assert verify_dim_aliases(op, reg) == [], (
+        "Phase 1 OP_<X> pinning must dominate; {OR} disjoint from "
+        "{PRTF} -> suppression must fire."
+    )
+
+
 def test_same_extent_alias_without_refinement_stays_flagged():
     """The textbook OPCODE_BYTE_LO/ADDR_B0_LO pair has same extent AND
     child semantics is a subset of parent's — but the child equals one
