@@ -142,15 +142,19 @@ def _l10_head_idx(op_name: str) -> int:
 # in ``vm_step._set_layer10_alu``.
 _L10_FFN_UNIT_LAYOUT_MAIN = (
     # (sub-stage name, legacy_start (docs only), n_units)
+    # bitwise_or/xor/and: 256 lo + 256 hi lookups + 62 stale-ALU
+    # residue cancels per op (31 per nibble: 16 stale_alu0_b + 15
+    # stale_a_carry0, skipping a=0 to avoid double-cancel at
+    # op_fn(0, 0)). See ``_layer10_alu_bitwise_rules`` (2026-06-10).
     ("layer10_alu.cmp_combine",       0,   18),  # 6 default + 12 override
-    ("layer10_alu.bitwise_or",       18,  512),  # 256 lo + 256 hi
-    ("layer10_alu.bitwise_xor",     530,  512),  # 256 lo + 256 hi
-    ("layer10_alu.bitwise_and",    1042,  512),  # 256 lo + 256 hi
-    ("layer10_alu.mul_lo",         1554,  256),  # (a*b)%16 lookup
-    ("layer10_alu.shl_shr_zero",   1810,    4),  # 2 per opcode (SHL, SHR)
-    ("layer10_alu.ax_passthrough", 1814,   32),  # 16 lo + 16 hi
+    ("layer10_alu.bitwise_or",       18,  574),  # 512 lookup + 62 cancel
+    ("layer10_alu.bitwise_xor",     592,  574),  # 512 lookup + 62 cancel
+    ("layer10_alu.bitwise_and",    1166,  574),  # 512 lookup + 62 cancel
+    ("layer10_alu.mul_lo",         1740,  256),  # (a*b)%16 lookup
+    ("layer10_alu.shl_shr_zero",   1996,    4),  # 2 per opcode (SHL, SHR)
+    ("layer10_alu.ax_passthrough", 2000,   32),  # 16 lo + 16 hi
 )
-_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 1846
+_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 2032
 
 # Combined post-op FFN baked by ``make_l10_post_ops_combined`` (kind="ffn",
 # dependency-assigned). Each range maps 1:1 to a post-op class's
@@ -832,6 +836,21 @@ def _layer10_alu_bitwise_rules(
 
     ``op_fn`` is the bitwise function (``operator.or_`` / ``xor`` /
     ``and_``) used to compute the result nibble.
+
+    Stale-ALU residue cancel band (added 2026-06-10): on COLLAPSED
+    IMM+OP steps the ``ALU_LO/HI+0`` and ``AX_CARRY_LO/HI+0`` channels
+    carry ~1.04 stale residual from the prior sub-cycle. The plain
+    3-way AND at threshold 80 happily fires on stale (1.04 vs the
+    legit 1.0 one-hot) and writes spurious mass to ``OUTPUT_LO/HI``.
+    For each (legit-operand, stale-+0) pair we emit one negative-write
+    cancel unit gated on an asymmetric-weight stale detector: weight
+    1000 on the ``+0`` dim with threshold ``40 + 1000*1.02 + 30 =
+    1090`` fires only when ``+0 >= 1.04`` (stale) while the legit
+    one-hot ``+0=1.0`` leaves the sum at ``40 + 1000 + 30 = 1070 <
+    1090``. The cancel write targets the same OUTPUT cell the
+    spurious lookup would have hit (``op_fn(0, b)`` for stale-A and
+    ``op_fn(a, 0)`` for stale-B). Codified by the L9/L10 isolation
+    test ``tests/test_l9_collapsed_imm_input_isolated.py``.
     """
 
     # Phase 8.D: pre-bind the (opcode_flag, op_name) gate ref so
@@ -862,6 +881,49 @@ def _layer10_alu_bitwise_rules(
                     gate_weight=1.0,
                     writes=((f"{out_dim}+{result}", 2.0 / S),),
                 ))
+        # Stale-ALU residue cancel band (added 2026-06-10).
+        # See class docstring for the asymmetric-weight stale detector.
+        # Stale ALU_*+0: fires when ALU_*+0 >= 1.04 with legit AX_CARRY_*+b.
+        for b in range(16):
+            spurious = op_fn(0, b)
+            rules.append(multi_way_and_rule(
+                name=(
+                    f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
+                    f"cancel_stale_alu0_b{b:x}"
+                ),
+                conditions=(
+                    ("MARK_AX", 40.0),
+                    (f"{alu_dim}+0", 1000.0),
+                    (f"{carry_dim}+{b}", 30.0),
+                ),
+                threshold=40.0 + 1000.0 * 1.02 + 30.0,
+                gate=gate_op,
+                gate_weight=1.0,
+                writes=((f"{out_dim}+{spurious}", -2.0 / S),),
+            ))
+        # Stale AX_CARRY_*+0: mirror of the ALU_*+0 cancel for operand B.
+        # Skip a=0 to avoid a duplicate cancel at op_fn(0, 0) -- the
+        # cancel_stale_alu0_b0 unit above already targets that cell.
+        # The double-firing matters most for XOR where op_fn(a, a) = 0
+        # collides with the spurious op_fn(0, 0) = 0 cell and would
+        # otherwise erase the legit a==b write.
+        for a in range(1, 16):
+            spurious = op_fn(a, 0)
+            rules.append(multi_way_and_rule(
+                name=(
+                    f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
+                    f"cancel_stale_a{a:x}_carry0"
+                ),
+                conditions=(
+                    ("MARK_AX", 40.0),
+                    (f"{alu_dim}+{a}", 30.0),
+                    (f"{carry_dim}+0", 1000.0),
+                ),
+                threshold=40.0 + 30.0 + 1000.0 * 1.02,
+                gate=gate_op,
+                gate_weight=1.0,
+                writes=((f"{out_dim}+{spurious}", -2.0 / S),),
+            ))
     return tuple(rules)
 
 
@@ -3213,10 +3275,13 @@ def make_layer10_alu_op() -> Operation:
         # is in-step producer). Previous: requires={"after":
         # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
         # ``_set_layer10_alu`` writes the comparison-combine (18 units) +
-        # bitwise-cross-product (~1536) + AX passthrough (~32) + DIV/MOD
-        # setup units, reaching unit 1845. No other op writes to L10 FFN
-        # so this op holds the per-layer width annotation.
-        ffn_units_used=1846,
+        # bitwise-cross-product (1722 = 1536 lookup + 186 stale-ALU
+        # residue cancel) + MUL lookup (256) + SHL/SHR zero (4) + AX
+        # passthrough (32), reaching unit 2031. No other op writes to
+        # L10 FFN so this op holds the per-layer width annotation.
+        # The +186 cancel units (2026-06-10) live inside
+        # ``_layer10_alu_bitwise_rules`` -- see that helper's docstring.
+        ffn_units_used=2032,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
