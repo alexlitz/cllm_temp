@@ -1774,27 +1774,33 @@ class BatchedPureNeuralRunner:
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
             s.output.append(chr(neural_ax & 0xFF))
 
-        # PRTF / OPEN / CLOS / READ: defer to serial runner for shim parity.
-        if exec_op in (Opcode.PRTF, Opcode.OPEN, Opcode.CLOS, Opcode.READ):
-            # These shims touch serial-runner state (e.g. _stdin_pos, _heap_*,
-            # _open_fds, _memory). For batched mode in Phase 1/2/7 these
-            # opcodes aren't exercised in the tested phases. If they appear
-            # we mirror the serial state onto the element and call through;
-            # this keeps the runner usable while explicitly not equivalent in
-            # multi-program batches that mix I/O. Callers should use the
-            # serial runner for such phases.
-            self._borrow_serial_state(s)
-            if exec_op == Opcode.PRTF:
-                self._serial._neural_prtf_emit(
-                    s.context, s.output, exec_idx, s.bytecode
-                )
-            elif exec_op == Opcode.OPEN:
-                self._serial._neural_open_emit(s.context)
-            elif exec_op == Opcode.CLOS:
-                self._serial._neural_clos_emit(s.context)
-            elif exec_op == Opcode.READ:
-                self._serial._neural_read_emit(s.context)
-            self._unborrow_serial_state(s)
+        # GETCHAR: runner-side stdin injection. We have to overwrite REG_AX
+        # bytes in the just-completed step.
+        if exec_op == Opcode.GETCHAR:
+            byte_val = -1
+            if s.stdin_pos < len(s.stdin_buffer):
+                byte_val = ord(s.stdin_buffer[s.stdin_pos]) & 0xFF
+                s.stdin_pos += 1
+            else:
+                byte_val = 0xFFFFFFFF
+            self._override_register_in_last_step(s.context, Token.REG_AX, byte_val)
+            s.last_ax = byte_val
+
+        if exec_op in (Opcode.LI, Opcode.LC):
+            section = s.mem_history.get(int(prev_ax) & 0xFFFFFFFF)
+            if section is not None:
+                width = 1 if exec_op == Opcode.LC else 4
+                loaded = 0
+                for j in range(width):
+                    loaded |= (int(section[5 + j]) & 0xFF) << (j * 8)
+                self._override_register_in_last_step(s.context, Token.REG_AX, loaded)
+                s.last_ax = loaded
+
+        # PRTF / OPEN / CLOS / READ defer-to-serial REMOVED (Wave B,
+        # 2026-06-09). The serial `_neural_prtf_emit`/`_neural_open_emit`/
+        # `_neural_clos_emit`/`_neural_read_emit` shims were deleted; IO
+        # must now resolve via neural bakes — see
+        # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
 
         # Preserve model-emitted MEM sections as cache/window metadata only.
         # This does not compute or substitute VM values; it keeps the neural

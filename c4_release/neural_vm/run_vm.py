@@ -488,19 +488,13 @@ class AutoregressiveVMRunner:
                 AutoregressiveVMRunner._MODEL_CACHE[cache_key] = self.model
         self.compile_mode = compile_mode
 
-        # Syscall dispatch table
-        # NOTE ON PURITY:
-        # - Tool boundary handlers (OPEN/READ/CLOS/PRTF/GETCHAR/PUTCHAR) are
-        #   intentionally external.
-        # - VM semantic handlers below are transitional fallbacks for bring-up
-        #   and debugging. In pure_attention_memory mode, these paths are
-        #   blocked so execution depends on transformer/autoregressive behavior.
-        self._syscall_handlers = {
-            Opcode.CLOS: self._syscall_clos,
-            Opcode.OPEN: self._syscall_open,
-            Opcode.READ: self._syscall_read,
-            Opcode.PRTF: self._syscall_prtf,
-        }
+        # Wave B removal (2026-06-09): handler-mode syscall shims
+        # (_syscall_prtf / _syscall_open / _syscall_read / _syscall_clos)
+        # deleted. The handler-mode TOOL_CALL branch in `run()` now
+        # dispatches against an empty table; IO opcodes raise honest
+        # neural failures until the bakes tracked in
+        # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md land.
+        self._syscall_handlers = {}
 
         # File descriptor tracking
         self._open_fds = {}  # fd → name
@@ -1991,6 +1985,11 @@ class AutoregressiveVMRunner:
 
         # Pure neural mode: skip ALL Python overrides, let neural network handle everything
         if self.pure_neural:
+            # Wave B removal (2026-06-09): IO Python shims
+            # (_handle_skipped_io_op, _handle_pure_neural_stall) deleted.
+            # IO side-effects (PRTF/OPEN/CLOS/READ/PUTCHAR/GETCHAR) must
+            # now come from neural bakes — see
+            # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
             self._last_dispatched_idx = exec_idx
 
             # Extract PC and AX from neural network output (for tracking and EXIT result)
@@ -2027,24 +2026,13 @@ class AutoregressiveVMRunner:
                     and not self.enable_neural_io_think_protocol):
                 output.append(chr(neural_ax & 0xFF))
 
-            # PRTF (Phase 6, pure_neural): the neural network does not yet have
-            # a complete autoregressive format-string walker / byte emitter.
-            # Runner-side shim walks the format string from shadow memory,
-            # interprets %d/%s/%c/%x/%% specifiers using stack args (C calling
-            # convention), and appends to output.
-            if exec_op == Opcode.PRTF:
-                self._neural_prtf_emit(context, output, exec_idx, bytecode)
-
-            # OPEN/CLOS/READ (Phase 6, pure_neural): runner-side tool-boundary
-            # shims. The neural network does not yet emit TOOL_CALL markers
-            # for these in pure_neural mode, so we read stack args, perform
-            # the I/O, and override AX with the result.
-            if exec_op == Opcode.OPEN:
-                self._neural_open_emit(context)
-            elif exec_op == Opcode.CLOS:
-                self._neural_clos_emit(context)
-            elif exec_op == Opcode.READ:
-                self._neural_read_emit(context)
+            # Wave B removal (2026-06-09): per-op IO Python shims
+            # (_inject_getchar / _neural_prtf_emit / _neural_open_emit /
+            # _neural_clos_emit / _neural_read_emit) deleted. IO opcodes
+            # (GETCHAR/PRTF/OPEN/CLOS/READ) must now resolve neurally via
+            # the bakes tracked in
+            # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md. Tests that exercise
+            # these paths will fail honestly until the bakes land.
 
             # V10 RETIRED (2026-05-12): the runner-side MEM persistence
             # shim previously extracted the just-emitted MEM section into
@@ -2423,6 +2411,11 @@ class AutoregressiveVMRunner:
             return chr(val & 0xFF)
         return None
 
+    # _inject_getchar REMOVED (Wave B, 2026-06-09). GETCHAR must resolve
+    # neurally via V9 phase-2 `make_layer5_user_input_gather_op` +
+    # `make_layer6_getchar_routing_op` bakes (currently NotImplementedError).
+    # See docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
+
     def _peek_argc_from_adj(self, exec_idx, bytecode):
         """Peek at the ADJ instruction following PRTF/OPEN/etc. to derive argc.
 
@@ -2472,200 +2465,18 @@ class AutoregressiveVMRunner:
         # ``args[0]`` is the value pushed RIGHT BEFORE the syscall = sp[0].
         return args
 
-    def _neural_prtf_emit(self, context, output, exec_idx=None, bytecode=None):
-        """Runner-side PRTF for pure_neural mode.
+    # _handle_skipped_io_op, _IO_OPS_SKIPPABLE, _IO_OPS_STALL_RECOVERABLE,
+    # _tail_has_io_op, _handle_pure_neural_stall REMOVED (Wave B,
+    # 2026-06-09). The shim previously synthesized PRTF/READ/OPEN/CLOS/
+    # PUTCHAR side-effects when the model treated them as PC no-ops; that
+    # behaviour must now come from neural bakes — see
+    # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
 
-        Walks the format string in shadow memory, substituting %d/%s/%c/%x/%%
-        from stack args. Determines argc by peeking at the following ADJ
-        instruction.
-
-        Stack layout assumes the test convention used in
-        ``test_pure_neural_io.py``: format pointer is the *last* arg pushed
-        (top of stack = sp[0]), with positional args underneath in
-        push-order (sp[1] = first int arg). For argc==1 (literal-only)
-        this matches the previous behavior; for argc>=2 the runner reads
-        ``args[k] = mem[sp + (k+1)*8]``.
-
-        For ``test_prtf_with_arg``
-        (``[IMM 42; PSH; IMM fmt_ptr; PSH; PRTF; ADJ 16]``) this gives
-        sp[0]=fmt_ptr, sp[1]=42, matching the expected ``"42"`` output for
-        the ``"%d"`` format.
-
-        Returns the number of bytes emitted (and writes that count to AX).
-        """
-        argc = self._peek_argc_from_adj(exec_idx, bytecode)
-
-        # Resolve fmt_ptr. Prefer model STACK0 (top of stack) when it
-        # matches a populated shadow-memory entry, then fall back to the
-        # mem-derived candidate at *_last_sp*.
-        stack0 = self._extract_register(context, Token.STACK0)
-        ax = self._extract_register(context, Token.REG_AX)
-        sp = self._last_sp if self._last_sp is not None else \
-            self._extract_register(context, Token.REG_SP)
-
-        candidates = []
-        if stack0:
-            candidates.append(stack0 & 0xFFFFFFFF)
-        if ax:
-            candidates.append(ax & 0xFFFFFFFF)
-        if sp is not None:
-            mem_val = self._mem_load_word(sp & 0xFFFFFFFF)
-            if mem_val:
-                candidates.append(mem_val & 0xFFFFFFFF)
-
-        fmt_ptr = None
-        for cand in candidates:
-            if cand in self._memory:
-                fmt_ptr = cand
-                break
-        if fmt_ptr is None and candidates:
-            fmt_ptr = candidates[0]
-        if fmt_ptr is None:
-            return 0
-
-        fmt_str = self._read_string(fmt_ptr)
-
-        # No varargs — emit the literal format string. (Matches the
-        # legacy ``test_prtf_simple`` behavior.)
-        if argc <= 1:
-            output.append(fmt_str)
-            self._override_ax_in_last_step(context, len(fmt_str) & 0xFFFFFFFF)
-            self._record_phase6_syscall_event(
-                Opcode.PRTF, "pure_neural_direct", exec_idx=exec_idx,
-                argc=argc, bytes=len(fmt_str),
-            )
-            return len(fmt_str)
-
-        # argc >= 2: read varargs from sp[1..argc-1] (deeper than fmt_ptr).
-        if sp is None:
-            sp = 0
-        args = []
-        for k in range(1, argc):
-            args.append(self._mem_load_word((sp + k * 8) & 0xFFFFFFFF))
-
-        formatted = self._format_printf(fmt_str, args)
-        output.append(formatted)
-        self._override_ax_in_last_step(context, len(formatted) & 0xFFFFFFFF)
-        self._record_phase6_syscall_event(
-            Opcode.PRTF, "pure_neural_direct", exec_idx=exec_idx,
-            argc=argc, bytes=len(formatted),
-        )
-        return len(formatted)
-
-    def _neural_open_emit(self, context):
-        """Runner-side OPEN for pure_neural mode.
-
-        Reads two stack slots and treats whichever is a populated address
-        in shadow memory as the path pointer; the other is the mode. This
-        accommodates both the C4 push order and the test's push order.
-        Calls ``os.open`` and writes the resulting fd (or -1 on error) to AX.
-        """
-        sp = self._last_sp if self._last_sp is not None else 0
-        s0 = self._mem_load_word(sp & 0xFFFFFFFF)
-        s1 = self._mem_load_word((sp + 8) & 0xFFFFFFFF)
-
-        if s0 in self._memory:
-            path_ptr, mode = s0, s1
-        elif s1 in self._memory:
-            path_ptr, mode = s1, s0
-        else:
-            path_ptr, mode = s0, s1
-
-        path = self._read_string(path_ptr)
-        try:
-            flags = os.O_RDONLY if (mode & 0xFFFFFFFF) == 0 else (os.O_WRONLY | os.O_CREAT)
-            fd = os.open(path, flags, 0o644)
-            self._open_fds[fd] = path
-            result = fd
-        except OSError:
-            result = 0xFFFFFFFF  # -1
-
-        self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
-
-    def _neural_clos_emit(self, context):
-        """Runner-side CLOS for pure_neural mode.
-
-        Pops fd from the top of stack, closes it (if previously opened by
-        ``_neural_open_emit``), and writes 0 to AX (matches the existing
-        ``_syscall_clos`` default).
-        """
-        sp = self._last_sp if self._last_sp is not None else 0
-        fd = self._mem_load_word(sp & 0xFFFFFFFF)
-        if fd in self._open_fds:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            self._open_fds.pop(fd, None)
-        self._override_ax_in_last_step(context, 0)
-
-    def _neural_read_emit(self, context):
-        """Runner-side READ for pure_neural mode.
-
-        This is the V11 stdin-buffer + V9 memory-write shim. The spec
-        (BLOG_SPEC.md:851) says stdin bytes arrive in the token stream
-        between USER_INPUT_START/END markers and READ should gather them
-        via attention into shadow memory. The neural READ bake is a
-        follow-up to the GETCHAR bake (see
-        docs/V9_GETCHAR_READ_NEURAL_PLAN.md §6); until both are flipped
-        on, this Python shim consumes ``_stdin_buffer`` and writes the
-        bytes into shadow memory + injects MEM sections so subsequent
-        L15 reads see them.
-
-        Reads three stack slots; identifies them by heuristic:
-          - buf_ptr: slot pointing into heap/data (>= 0x10000)
-          - fd: small int (< 256)
-          - count: remaining slot
-        For ``fd == 0`` (stdin), consumes up to ``count`` bytes from
-        ``self._stdin_buffer``; for other fds, falls back to ``os.read``.
-        Writes bytes to shadow memory at ``buf+i`` (and persists per-word
-        MEM sections so future L15 lookups see them) and the byte count
-        to AX.
-        """
-        sp = self._last_sp if self._last_sp is not None else 0
-        s0 = self._mem_load_word(sp & 0xFFFFFFFF)
-        s1 = self._mem_load_word((sp + 8) & 0xFFFFFFFF)
-        s2 = self._mem_load_word((sp + 16) & 0xFFFFFFFF)
-
-        slots = [s0, s1, s2]
-        buf_ptr = next((v for v in slots if v >= 0x10000), 0)
-        fd = next((v for v in slots if v < 256 and v != buf_ptr), 0)
-        count_candidates = [v for v in slots if v != buf_ptr and v != fd]
-        count = count_candidates[0] if count_candidates else 0
-        # Heuristic fallback: assume canonical (count, buf_ptr, fd) push order.
-        if buf_ptr == 0 or count == 0:
-            count, buf_ptr, fd = s0, s1, s2
-
-        data = b""
-        if fd == 0:
-            remaining = len(self._stdin_buffer) - self._stdin_pos
-            n = min(count, max(remaining, 0))
-            if n > 0:
-                chunk = self._stdin_buffer[self._stdin_pos:self._stdin_pos + n]
-                self._stdin_pos += n
-                data = bytes(ord(c) if isinstance(c, str) else c for c in chunk)
-        else:
-            try:
-                data = os.read(fd, count)
-            except OSError:
-                self._override_ax_in_last_step(context, 0xFFFFFFFF)
-                return
-
-        for i, b in enumerate(data):
-            self._memory[(buf_ptr + i) & 0xFFFFFFFF] = b & 0xFF
-
-        if data:
-            n_words = (len(data) + 3) // 4
-            for w in range(n_words):
-                addr = (buf_ptr + w * 4) & 0xFFFFFFFF
-                value = self._mem_load_word(addr)
-                self._inject_mem_section(addr, value)
-
-        self._override_ax_in_last_step(context, len(data) & 0xFFFFFFFF)
-        self._record_phase6_syscall_event(
-            Opcode.READ, "pure_neural_direct", fd=fd, buf_ptr=buf_ptr,
-            count=count, bytes=len(data),
-        )
+    # _neural_prtf_emit, _neural_open_emit, _neural_clos_emit,
+    # _neural_read_emit REMOVED (Wave B, 2026-06-09). These were the
+    # pure_neural per-op IO shims that overrode REG_AX from shadow
+    # memory / host syscalls. PRTF/OPEN/CLOS/READ must now resolve via
+    # neural bakes — see docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
 
     def _override_ax_in_last_step(self, context, value):
         """Override AX register bytes in the last completed step.
@@ -2881,159 +2692,13 @@ class AutoregressiveVMRunner:
         return "".join(result)
 
     # -----------------------------------------------------------------
-    # Syscall handlers
+    # Syscall handlers REMOVED (Wave B, 2026-06-09).
     # -----------------------------------------------------------------
-
-    def _syscall_clos(self, context, output):
-        """CLOS (close) — close fd, optionally via tool_handler.
-
-        C4: close(fd) → push fd, CLOS. So fd = sp[0] = STACK0.
-        """
-        fd = self._extract_stack0(context) or 0
-
-        if self._tool_handler:
-            call = ToolCall("close", self._next_tool_call_id(), {"fd": fd})
-            resp = self._tool_handler(call)
-            result = 0 if resp.success else 0xFFFFFFFF
-        else:
-            # Default: just remove from tracking
-            self._open_fds.pop(fd, None)
-            result = 0
-
-        self._override_ax_in_last_step(context, result)
-
-    def _syscall_open(self, context, output):
-        """OPEN — open file, optionally via tool_handler.
-
-        C4: open(path, mode) → push path_ptr, push mode, OPEN.
-        So: sp[0]=mode, sp[1]=path_ptr.
-        """
-        mode = self._read_stack_arg(context, 0)  # sp[0] = mode
-        path_ptr = self._read_stack_arg(context, 1)  # sp[1] = path_ptr
-        path = self._read_string(path_ptr)
-        mode_str = {0: "r", 1: "w", 2: "a"}.get(mode, "r")
-
-        if self._tool_handler:
-            call = ToolCall(
-                "open", self._next_tool_call_id(), {"path": path, "mode": mode_str}
-            )
-            resp = self._tool_handler(call)
-            result = resp.result if resp.success else 0xFFFFFFFF
-        else:
-            # Default: real file I/O
-            try:
-                flags = os.O_RDONLY if mode == 0 else os.O_WRONLY | os.O_CREAT
-                fd = os.open(path, flags, 0o644)
-                self._open_fds[fd] = path
-                result = fd
-            except OSError:
-                result = 0xFFFFFFFF  # -1
-
-        self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
-
-    def _syscall_read(self, context, output):
-        """READ — read from fd, optionally via tool_handler.
-
-        C4: read(fd, buf, count) → push fd, push buf_ptr, push count, READ.
-        So: sp[0]=count, sp[1]=buf_ptr, sp[2]=fd.
-        """
-        count = self._read_stack_arg(context, 0)  # sp[0] = count
-        buf_ptr = self._read_stack_arg(context, 1)  # sp[1] = buf_ptr
-        fd = self._read_stack_arg(context, 2)  # sp[2] = fd
-
-        if self._tool_handler:
-            call = ToolCall(
-                "read",
-                self._next_tool_call_id(),
-                {"fd": fd, "buf_ptr": buf_ptr, "size": count},
-            )
-            resp = self._tool_handler(call)
-            if resp.success and resp.result is not None:
-                data = resp.result
-                if isinstance(data, (bytes, bytearray)):
-                    for i, b in enumerate(data):
-                        self._memory[buf_ptr + i] = b
-                    result = len(data)
-                elif isinstance(data, int):
-                    result = data
-                else:
-                    result = 0
-            else:
-                result = 0xFFFFFFFF  # -1
-        else:
-            # Default: real file I/O
-            try:
-                data = os.read(fd, count)
-                for i, b in enumerate(data):
-                    self._memory[buf_ptr + i] = b
-                result = len(data)
-            except OSError:
-                result = 0xFFFFFFFF  # -1
-
-        self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
-        self._record_phase6_syscall_event(
-            Opcode.READ, "handler", fd=fd, buf_ptr=buf_ptr, count=count,
-            bytes=result if result != 0xFFFFFFFF else 0,
-            success=(result != 0xFFFFFFFF),
-        )
-
-    def _syscall_prtf(self, context, output):
-        """PRTF (printf) — formatted print, optionally via tool_handler.
-
-        C4 convention: printf(fmt, a, b, ...) pushes left-to-right.
-        At PRTF time the ADJ instruction immediately follows, telling us argc.
-        sp[argc-1] = fmt_ptr (first pushed, deepest).
-        sp[argc-2..0] = remaining args from second to last.
-        """
-        # Determine argc by peeking at the next instruction (ADJ n)
-        model_pc = self._extract_register(context, Token.REG_PC)
-        runner_pc = self._exec_pc()
-        pc = model_pc if model_pc is not None and 0 <= (model_pc // INSTR_WIDTH) < len(self._bytecode) else runner_pc
-        argc = 0
-        if pc is not None:
-            adj_idx = pc // INSTR_WIDTH + 1  # next instruction after PRTF
-            if 0 <= adj_idx < len(self._bytecode):
-                adj_instr = self._bytecode[adj_idx]
-                adj_op = adj_instr & 0xFF
-                if adj_op == Opcode.ADJ:
-                    adj_imm = adj_instr >> 8
-                    argc = adj_imm // 8
-
-        if argc < 1:
-            # Can't determine args — fallback
-            self._override_ax_in_last_step(context, 0)
-            return
-
-        # Read fmt_ptr (deepest on stack = sp[argc-1])
-        fmt_ptr = self._read_stack_arg(context, argc - 1)
-        fmt_str = self._read_string(fmt_ptr)
-
-        # Read remaining args: sp[argc-2] is first vararg, sp[0] is last
-        args = []
-        for i in range(argc - 2, -1, -1):
-            args.append(self._read_stack_arg(context, i))
-
-        if self._tool_handler:
-            call = ToolCall(
-                "printf", self._next_tool_call_id(), {"format": fmt_str, "args": args}
-            )
-            resp = self._tool_handler(call)
-            if resp.success and resp.result is not None:
-                formatted = str(resp.result)
-                result = len(formatted)
-            else:
-                result = 0
-        else:
-            # Default: format directly and append to output
-            formatted = self._format_printf(fmt_str, args)
-            output.append(formatted)
-            result = len(formatted)
-
-        self._override_ax_in_last_step(context, result & 0xFFFFFFFF)
-        self._record_phase6_syscall_event(
-            Opcode.PRTF, "handler", argc=argc, bytes=result,
-            success=True,
-        )
+    # _syscall_clos, _syscall_open, _syscall_read, _syscall_prtf were
+    # the handler-mode (pure_neural=False) IO shims. They re-asserted
+    # REG_AX after a host syscall, walking shadow memory for path /
+    # format strings. IO must now come from neural bakes; see
+    # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
 
     def _exec_pc(self):
         """Compute PC of the instruction that was just executed.
