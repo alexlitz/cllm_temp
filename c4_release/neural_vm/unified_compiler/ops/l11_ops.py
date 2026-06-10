@@ -1,11 +1,12 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
-from ..primitives import Primitives
+from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
 
@@ -374,4 +375,336 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # FFN fires ONLY on OP_MUL steps; non-MUL opcodes leave block 11
         # untouched.
         opcodes={"OP_MUL"},
+    )
+
+
+# === STEP_END operand relay (Wave A, 2026-06-10) =====================
+#
+# Two declarative attention heads at L11 that broadcast the in-step
+# operand/dispatch state from MARK_AX (row offset 5) to MARK_SE (row
+# offset 34) of the same step. Wave A of the STEP_END compute
+# architecture (docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md):
+# enables Wave B migration of L8/L9/L10 dispatch+ALU+CMP rules from
+# MARK_AX gating to MARK_SE gating.
+#
+# Why L11? The relay sources include ALU_LO/HI and CMP, which are not
+# written until L9. The L10 attention block is already at 12 heads with
+# slots 0..10 owned; L11's attention block is fresh (no other op writes
+# Q/K/V/O there today), so claiming heads 0/1 is collision-free.
+#
+# Why two heads? d_model=512, default num_heads=8, so HD=64 V/O slots per
+# head. Total relay payload = 31 OP_<NAME> + 32 AX_CARRY + 32 ALU_LO/HI +
+# 4 CMP + 4 STACK0_BYTE0..3 = ~103 dims. Two heads (128 slots) fit with
+# headroom.
+#
+# Head 0 (operand relay A): OP_<NAME> (31) + AX_CARRY_LO (16) +
+#                           AX_CARRY_HI (16) = 63 slots
+# Head 1 (operand relay B): ALU_LO (16) + ALU_HI (16) + CMP (4) +
+#                           STACK0_BYTE0..3 (4) = 40 slots
+#
+# Q anchors on MARK_SE_ONLY; K matches MARK_AX. Positive ALiBi slope
+# (1.0) keeps the head step-local: the most-recent MARK_AX K (29 rows
+# back from the current MARK_SE Q) wins by ~35 nats over the previous
+# step's MARK_AX K (64 rows back), so the relay reads the current
+# step's operand state, not a stale value. Mirrors the L1 IN_STEP_FRESH
+# slope convention (see ``make_layer1_threshold_attn_op``).
+_STEP_END_OPERAND_RELAY_OPCODES = (
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_OR", "OP_AND", "OP_XOR", "OP_SHL", "OP_SHR",
+    "OP_IMM", "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV",
+    "OP_LI", "OP_LC", "OP_SI", "OP_SC",
+    "OP_LEA", "OP_JMP", "OP_BZ", "OP_BNZ", "OP_ADJ", "OP_EXIT",
+)
+
+
+_L11_STEP_END_OPERAND_RELAY_HEAD_LAYOUT = (
+    ("layer11_step_end_operand_relay.head_0",),  # OP_<NAME> + AX_CARRY
+    ("layer11_step_end_operand_relay.head_1",),  # ALU + CMP + STACK0_BYTE
+)
+
+
+def _allocate_layer11_step_end_operand_relay_heads() -> AttentionHeadAllocator:
+    """Per-bake :class:`AttentionHeadAllocator` for the L11 relay heads.
+
+    Fresh first-fit pool over L11 attention's 8-head budget. With no
+    other L11 attention ops baking today the two relay heads land at
+    indices 0 and 1; future L11 attention ops can claim free slots
+    without touching this table.
+    """
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    for (op_name,) in _L11_STEP_END_OPERAND_RELAY_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=11)
+    return allocator
+
+
+def _layer11_step_end_operand_relay_head_specs(
+    BD,
+    S: float,
+    head_a_idx: int,
+    head_b_idx: int,
+) -> tuple[DeclarativeAttentionHeadSpec, DeclarativeAttentionHeadSpec]:
+    """Build the two Wave A relay head specs.
+
+    Q at MARK_SE_ONLY (the STEP_END row). K at MARK_AX (the in-step
+    operand-state row). V copies each named source dim with weight 1.0;
+    O writes the same dim back to the Q (MARK_SE) row with weight 1.0.
+
+    A positive ALiBi slope (1.0) plus L=S Q/K weights keeps the relay
+    step-local: at distance 29 (within-step MARK_AX -> MARK_SE) the score
+    is ``L^2 / sqrt(HD) - 29``; the prior step's MARK_AX sits at
+    distance ~64 (next-step offset 35 + 29), losing the softmax by
+    ~35 nats. Mirrors the L1 IN_STEP_FRESH / HAS_SE broadcast pattern.
+    """
+    L = float(S)
+    HD_DEFAULT = 64  # default head_dim at L11 (d_model=512, num_heads=8)
+
+    # Per-head Q/K bands: select MARK_SE rows on Q side, MARK_AX rows
+    # on K side. The CONST anchor (Q slot 0 = -L) cancels at non-MARK_SE
+    # Q rows so the slot-0 score collapses to ~-L^2 / sqrt(HD).
+    q_band = (
+        AP(0, BD.MARK_SE_ONLY, L),
+    )
+    k_band = (
+        AP(0, BD.MARK_AX, L),
+    )
+
+    # --- Head A: OP_<NAME> + AX_CARRY_LO/HI ---------------------------
+    v_a: list = []
+    o_a: list = []
+    slot = 0
+    for op_name in _STEP_END_OPERAND_RELAY_OPCODES:
+        dim = getattr(BD, op_name)
+        v_a.append(AP(slot, dim, 1.0))
+        o_a.append(AO(dim, slot, 1.0))
+        slot += 1
+    for k_idx in range(16):
+        v_a.append(AP(slot, BD.AX_CARRY_LO + k_idx, 1.0))
+        o_a.append(AO(BD.AX_CARRY_LO + k_idx, slot, 1.0))
+        slot += 1
+    for k_idx in range(16):
+        v_a.append(AP(slot, BD.AX_CARRY_HI + k_idx, 1.0))
+        o_a.append(AO(BD.AX_CARRY_HI + k_idx, slot, 1.0))
+        slot += 1
+    assert slot <= HD_DEFAULT, (
+        f"step_end_operand_relay head A overflowed HD={HD_DEFAULT} "
+        f"with {slot} slots"
+    )
+
+    spec_a = DeclarativeAttentionHeadSpec(
+        head_idx=head_a_idx,
+        q=q_band,
+        k=k_band,
+        v=tuple(v_a),
+        o=tuple(o_a),
+        alibi_slope=1.0,
+    )
+
+    # --- Head B: ALU_LO/HI + CMP + STACK0_BYTE0..3 --------------------
+    v_b: list = []
+    o_b: list = []
+    slot = 0
+    for k_idx in range(16):
+        v_b.append(AP(slot, BD.ALU_LO + k_idx, 1.0))
+        o_b.append(AO(BD.ALU_LO + k_idx, slot, 1.0))
+        slot += 1
+    for k_idx in range(16):
+        v_b.append(AP(slot, BD.ALU_HI + k_idx, 1.0))
+        o_b.append(AO(BD.ALU_HI + k_idx, slot, 1.0))
+        slot += 1
+    for k_idx in range(4):  # CMP is 4 wide in the registry
+        v_b.append(AP(slot, BD.CMP + k_idx, 1.0))
+        o_b.append(AO(BD.CMP + k_idx, slot, 1.0))
+        slot += 1
+    for byte_h in (0, 1, 2, 3):
+        dim = getattr(BD, f"STACK0_BYTE{byte_h}")
+        v_b.append(AP(slot, dim, 1.0))
+        o_b.append(AO(dim, slot, 1.0))
+        slot += 1
+    assert slot <= HD_DEFAULT, (
+        f"step_end_operand_relay head B overflowed HD={HD_DEFAULT} "
+        f"with {slot} slots"
+    )
+
+    spec_b = DeclarativeAttentionHeadSpec(
+        head_idx=head_b_idx,
+        q=q_band,
+        k=k_band,
+        v=tuple(v_b),
+        o=tuple(o_b),
+        alibi_slope=1.0,
+    )
+
+    return spec_a, spec_b
+
+
+def _layer11_step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
+    """``compiler_ir_factory`` for the L11 step_end_operand_relay heads."""
+    del HD  # head_dim is layer-default; per-head fits within HD=64
+    proxy = _as_setdim_proxy(dim_positions)
+    allocator = _allocate_layer11_step_end_operand_relay_heads()
+    by_name = {rec.op_name: rec.head_idx for rec in allocator.heads()}
+    head_a_idx = by_name["layer11_step_end_operand_relay.head_0"]
+    head_b_idx = by_name["layer11_step_end_operand_relay.head_1"]
+    spec_a, spec_b = _layer11_step_end_operand_relay_head_specs(
+        proxy, 100.0, head_a_idx, head_b_idx,
+    )
+    ir = CompilerIR()
+    ir.layer(0).attention.append(
+        spec_a, name="layer11_step_end_operand_relay.head_0",
+    )
+    ir.layer(0).attention.append(
+        spec_b, name="layer11_step_end_operand_relay.head_1",
+    )
+    return ir
+
+
+def make_layer11_step_end_operand_relay_op(enable: bool = False) -> Operation:
+    """Wave A — broadcast operand/dispatch state from MARK_AX to MARK_SE.
+
+    Per ``docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md``: two
+    declarative attention heads at L11 that relay OP_<NAME>,
+    AX_CARRY_LO/HI, ALU_LO/HI, CMP, and STACK0_BYTE0..3 from the
+    MARK_AX K row (in-step row offset 5) to the MARK_SE Q row (offset
+    34) of the same step, enabling Wave B migration of L8/L9/L10
+    dispatch + ALU + CMP rules from MARK_AX gating to MARK_SE gating.
+
+    Placed at L11 because:
+      * ALU_LO/HI and CMP are written at L9 — the relay needs L10+.
+      * AX_CARRY_LO/HI is written at L3/L6/L8 — visible by L11.
+      * L10 attention is at 12-head capacity with slots 0..10 owned;
+        L11 attention is currently empty so heads 0/1 are free.
+
+    A positive ALiBi slope (1.0) keeps the relay step-local: the
+    most-recent MARK_AX K (29 rows back from the current MARK_SE Q)
+    wins by ~35 nats over the previous step's MARK_AX K (64 rows
+    back), so the relay reads the current step's operand state.
+
+    ``enable`` defaults to ``False`` (Wave A PoC gate). When False the
+    op is registered so the dep graph + claims surface stay stable, but
+    the bake is a no-op — the relay's downstream side-effects (extra
+    ALU_LO/HI / OP_<NAME> signal at MARK_SE rows, picked up by the LM
+    head + later layers' cross-step KV lookups) regress ~9 smoke tests
+    on the baseline. Wave B will scope those downstream readers to gate
+    on MARK_AX vs MARK_SE explicitly, after which this op can flip to
+    ``enable=True``. Mirrors the ``layer9_alibi_mem_attn(enable=False)``
+    + ``layer8_head6_ax_carry_refresh(enable=False)`` PoC pattern.
+
+    Probe verification (``tools/probe_step_end_completeness.py``) shows
+    that when ``enable=True`` the relay populates MARK_SE with the
+    relayed operand band: AX_CARRY_LO/HI ~0.75 × source, ALU_LO/HI
+    ~1.0 × source, STACK0_BYTE0..3 ~1.0 × source. OP_<NAME> + CMP need
+    a longer-window programme to capture both MARK_AX and the
+    same-step MARK_SE in one trace (the default ``IMM 5; PSH; IMM 5;
+    EQ; EXIT`` runs OOM on a busy GPU before both rows materialise).
+    """
+    def bake(block, dim_positions, S):
+        if not enable:
+            return
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        head_allocator = _allocate_layer11_step_end_operand_relay_heads()
+        attn._l11_step_end_relay_head_allocator = head_allocator
+        head_a_idx = head_allocator.heads()[0].head_idx
+        head_b_idx = head_allocator.heads()[1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec_a, spec_b = _layer11_step_end_operand_relay_head_specs(
+            proxy, S, head_a_idx, head_b_idx,
+        )
+        Primitives.generate_attention_head(attn, spec_a, HD)
+        Primitives.generate_attention_head(attn, spec_b, HD)
+
+    # Dim-ownership claims: two heads. Head A V slots 0..62 cover
+    # OP_<NAME> (0..30) + AX_CARRY_LO+0..15 (31..46) + AX_CARRY_HI+0..15
+    # (47..62). Head B V slots 0..39 cover ALU_LO+0..15 (0..15) +
+    # ALU_HI+0..15 (16..31) + CMP+0..3 (32..35) + STACK0_BYTE0..3
+    # (36..39). O slots mirror the V slot indices; out_dim names match
+    # the source dims (relay = identity copy).
+    _claims: set = set()
+    head_a_idx = 0
+    head_b_idx = 1
+    slot = 0
+    for op_name in _STEP_END_OPERAND_RELAY_OPCODES:
+        _claims.add((11, "attn_W_v", f"{head_a_idx}_{slot}", f"{op_name}+0"))
+        _claims.add((11, "attn_W_o", f"{head_a_idx}_{slot}", f"{op_name}+0"))
+        slot += 1
+    for k_idx in range(16):
+        _claims.add(
+            (11, "attn_W_v", f"{head_a_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
+        )
+        _claims.add(
+            (11, "attn_W_o", f"{head_a_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
+        )
+        slot += 1
+    for k_idx in range(16):
+        _claims.add(
+            (11, "attn_W_v", f"{head_a_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
+        )
+        _claims.add(
+            (11, "attn_W_o", f"{head_a_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
+        )
+        slot += 1
+    slot = 0
+    for k_idx in range(16):
+        _claims.add(
+            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"ALU_LO+{k_idx}"),
+        )
+        _claims.add(
+            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"ALU_LO+{k_idx}"),
+        )
+        slot += 1
+    for k_idx in range(16):
+        _claims.add(
+            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"ALU_HI+{k_idx}"),
+        )
+        _claims.add(
+            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"ALU_HI+{k_idx}"),
+        )
+        slot += 1
+    for k_idx in range(4):
+        _claims.add(
+            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"CMP+{k_idx}"),
+        )
+        _claims.add(
+            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"CMP+{k_idx}"),
+        )
+        slot += 1
+    for byte_h in (0, 1, 2, 3):
+        _claims.add(
+            (11, "attn_W_v", f"{head_b_idx}_{slot}", f"STACK0_BYTE{byte_h}+0"),
+        )
+        _claims.add(
+            (11, "attn_W_o", f"{head_b_idx}_{slot}", f"STACK0_BYTE{byte_h}+0"),
+        )
+        slot += 1
+
+    return Operation(
+        name="layer11_step_end_operand_relay",
+        # Q reads MARK_SE_ONLY (Q-row anchor); K reads MARK_AX (K-row
+        # anchor). V reads the broadcast payload at the MARK_AX K rows.
+        reads={
+            "MARK_AX", "MARK_SE_ONLY",
+            "AX_CARRY_LO", "AX_CARRY_HI",
+            "ALU_LO", "ALU_HI", "CMP",
+            "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
+            *_STEP_END_OPERAND_RELAY_OPCODES,
+        },
+        # O writes the same dim names at the MARK_SE Q rows.
+        writes={
+            "AX_CARRY_LO", "AX_CARRY_HI",
+            "ALU_LO", "ALU_HI", "CMP",
+            "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
+            *_STEP_END_OPERAND_RELAY_OPCODES,
+        },
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer11_step_end_operand_relay_ir,
+        # Bind to the L11 FFN dep anchor so the block op lands at L11
+        # alongside ``layer11_mul_partial``.
+        target_op_name="_layer11_ffn_dep_anchor",
+        migrated=True,
+        declarative_authority="spec_generated",
+        claims=_claims,
+        smoke_tests={"all"},
+        spec_section="STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md#wave-a",
     )

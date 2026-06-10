@@ -48,8 +48,104 @@ def _hot_indices(slice_, threshold: float = 0.1):
     ]
 
 
+def _locate_wave_a_relay_layer(model, dim_positions) -> int:
+    """Find the model block where Wave A's step_end_operand_relay landed.
+
+    Searches for a block whose attention W_q has
+    ``W_q[head_idx*HD, MARK_SE_ONLY] >= 50`` — the signature of the
+    Wave A relay's Q-side anchor. Falls back to L11 (the spec-declared
+    target) if no match is found, so the probe stays usable in
+    pre-Wave-A builds.
+    """
+
+    se_only = dim_positions["MARK_SE_ONLY"]
+    for li, block in enumerate(model.blocks):
+        attn = block.attn
+        wq = attn.W_q.to_dense() if attn.W_q.is_sparse_csr else attn.W_q
+        HD = wq.shape[0] // attn.num_heads
+        for head_idx in range(attn.num_heads):
+            row = head_idx * HD
+            if row < wq.shape[0] and abs(wq[row, se_only].item()) >= 50.0:
+                return li
+    return 11
+
+
+def _enable_wave_a_relay(tracer) -> int:
+    """Bake the Wave A relay heads into the model for probe purposes.
+
+    The production op (``make_layer11_step_end_operand_relay_op``) is
+    registered with ``enable=False`` so the relay's downstream side
+    effects don't regress baseline smoke. To observe the relay's effect
+    at MARK_SE, this helper bakes the same head specs into the block
+    that the dep graph resolved as the L11 anchor. Returns the block
+    index where the relay landed.
+
+    Search heuristic: pick the block whose FFN ``W_down[TEMP+0, 0]``
+    matches the L11 ``layer11_mul_partial`` writeback signature
+    (~ 10/S = 0.1). The relay must run at that same block to be
+    byte-compatible with the production binding.
+    """
+    import torch
+    from c4_release.neural_vm.unified_compiler.ops.l11_ops import (
+        _layer11_step_end_operand_relay_head_specs,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.shared import _as_setdim_proxy
+    from c4_release.neural_vm.unified_compiler.primitives import Primitives
+
+    dim_positions = tracer.dim_positions
+    temp_d = dim_positions["TEMP"]
+    # Identify the L11 anchor block by its MUL partial signature.
+    anchor_idx = None
+    for li, block in enumerate(tracer.model.blocks):
+        wdown = getattr(block.ffn, "W_down", None)
+        if not isinstance(wdown, torch.Tensor):
+            continue
+        if wdown.is_sparse_csr:
+            wdown = wdown.to_dense()
+        if (
+            wdown.shape[0] > temp_d
+            and wdown.shape[1] > 0
+            and abs(wdown[temp_d, 0].item()) > 0.05
+        ):
+            anchor_idx = li
+            break
+    # Pick the first block AT OR AFTER the anchor whose attention is
+    # currently empty (no nonzero Q rows). Avoids overwriting an
+    # already-baked attention head.
+    relay_block_idx = None
+    start = anchor_idx if anchor_idx is not None else 11
+    for li in range(start, len(tracer.model.blocks)):
+        attn = tracer.model.blocks[li].attn
+        wq = attn.W_q.to_dense() if attn.W_q.is_sparse_csr else attn.W_q
+        if int((wq != 0).any(dim=1).sum().item()) == 0:
+            relay_block_idx = li
+            break
+    if relay_block_idx is None:
+        relay_block_idx = 11
+    attn = tracer.model.blocks[relay_block_idx].attn
+    # CSR sparse-inference conversion may have rewritten W_*; densify
+    # back so the spec writes land in standard nn.Parameter tensors.
+    from torch import nn
+    for wname in ("W_q", "W_k", "W_v", "W_o"):
+        w = getattr(attn, wname)
+        if w.is_sparse_csr:
+            setattr(attn, wname, nn.Parameter(w.to_dense()))
+    HD = attn.W_q.shape[0] // attn.num_heads
+    proxy = _as_setdim_proxy(dim_positions)
+    spec_a, spec_b = _layer11_step_end_operand_relay_head_specs(
+        proxy, 100.0, 0, 1,
+    )
+    Primitives.generate_attention_head(attn, spec_a, HD)
+    Primitives.generate_attention_head(attn, spec_b, HD)
+    return relay_block_idx
+
+
 def main() -> int:
     tracer = ResidualTracer()
+    relay_block = _enable_wave_a_relay(tracer)
+    print(f"Wave A relay baked into block L{relay_block} (probe-only)")
+    RELAY_LAYER = _locate_wave_a_relay_layer(tracer.model, tracer.dim_positions)
+    print(f"Wave A relay detected at L{RELAY_LAYER}")
     print("Running IMM 5; PSH; IMM 5; EQ; EXIT ...")
     capture = tracer.run("IMM 5; PSH; IMM 5; EQ; EXIT")
     print(f"seq_len={capture.seq_len} num_steps={capture.num_steps()} "
@@ -70,27 +166,53 @@ def main() -> int:
     if not ax_rows or not se_rows:
         print("Not enough boundaries captured; aborting.")
         return 1
-    ax_row = ax_rows[1] if len(ax_rows) >= 2 else ax_rows[0]
-    # SE for the SAME step (one row after the matching AX section: roughly
-    # ax_row + 29 in the 35-token window).
-    se_row = next((s for s in se_rows if s > ax_row), se_rows[-1])
-    print(f"Comparing MARK_AX@{ax_row} vs MARK_SE@{se_row}\n")
+    # Collect every (ax, se) pair where ``se = ax + ~29`` (in-step
+    # MARK_AX -> MARK_SE delta). The architectural verdict takes the
+    # max relayed magnitude across pairs so an ALU/CMP step's
+    # contribution to ALU_LO / CMP at MARK_SE is captured even if
+    # earlier steps don't fire those dims.
+    expected_delta = 29
+    step_pairs = []
+    for a in ax_rows:
+        for s in se_rows:
+            d = s - a
+            if d <= 0:
+                continue
+            if abs(d - expected_delta) <= 5:
+                step_pairs.append((a, s))
+    if not step_pairs:
+        print("Could not pair AX and SE rows within one step; aborting.")
+        return 1
+    ax_row, se_row = step_pairs[0]
+    print(f"Step pairs (AX, SE) captured: {step_pairs}")
+    print(
+        f"Reporting first pair: MARK_AX@{ax_row} vs MARK_SE@{se_row} "
+        f"(delta={se_row - ax_row})\n"
+    )
 
     # --- DIM PROBES ---------------------------------------------------------
+    # Wave A (docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md) lands the
+    # ``layer11_step_end_operand_relay`` head at L11, so the relay's
+    # outputs at MARK_SE only appear from ``after_layer[11]`` onward.
+    # OP_<NAME> / AX_CARRY / STACK0_BYTE probes pull L11; ALU_LO/HI / CMP
+    # are written at L9 then relayed at L11, so they also pull L11 to see
+    # the relayed copy at MARK_SE. The ``MARK_*`` and ``NEXT_PC`` rows
+    # stay at L8 since those are scheduler-side anchors unchanged by the
+    # relay.
     probes = [
         # (label, layer, dim_spec, width, expected_at_AX, expected_at_SE)
         ("MARK_AX",        8, "MARK_AX",      1, "hot",  "cold"),
         ("MARK_SE",        8, "MARK_SE",      1, "cold", "hot"),
         ("MARK_SE_ONLY",   8, "MARK_SE_ONLY", 1, "cold", "hot"),
         ("HAS_SE",         8, "HAS_SE",       1, "?",    "hot"),
-        ("OP_IMM",         8, "OP_IMM",       1, "hot when step=IMM", "cold"),
-        ("OP_PSH",         8, "OP_PSH",       1, "hot when step=PSH", "cold"),
-        ("OP_EQ",          8, "OP_EQ",        1, "hot when step=EQ",  "cold"),
-        ("AX_CARRY_LO (slot)", 8, "AX_CARRY_LO", 16, "nibble hot",     "cold"),
-        ("AX_CARRY_HI (slot)", 8, "AX_CARRY_HI", 16, "nibble hot",     "cold"),
-        ("ALU_LO (slot)",      9, "ALU_LO",      16, "nibble hot (ALU step)", "cold"),
-        ("ALU_HI (slot)",      9, "ALU_HI",      16, "nibble hot (ALU step)", "cold"),
-        ("CMP (slot)",         9, "CMP",          4, "flag hot (CMP step)",   "cold"),
+        ("OP_IMM",        RELAY_LAYER, "OP_IMM",       1, "hot when step=IMM", "hot when step=IMM (Wave A)"),
+        ("OP_PSH",        RELAY_LAYER, "OP_PSH",       1, "hot when step=PSH", "hot when step=PSH (Wave A)"),
+        ("OP_EQ",         RELAY_LAYER, "OP_EQ",        1, "hot when step=EQ",  "hot when step=EQ (Wave A)"),
+        ("AX_CARRY_LO (slot)", RELAY_LAYER, "AX_CARRY_LO", 16, "nibble hot",  "nibble hot (Wave A)"),
+        ("AX_CARRY_HI (slot)", RELAY_LAYER, "AX_CARRY_HI", 16, "nibble hot",  "nibble hot (Wave A)"),
+        ("ALU_LO (slot)",      RELAY_LAYER, "ALU_LO",      16, "nibble hot (ALU step)", "nibble hot (Wave A)"),
+        ("ALU_HI (slot)",      RELAY_LAYER, "ALU_HI",      16, "nibble hot (ALU step)", "nibble hot (Wave A)"),
+        ("CMP (slot)",         RELAY_LAYER, "CMP",          4, "flag hot (CMP step)",   "flag hot (Wave A)"),
         ("STACK0_BYTE0",       8, "STACK0_BYTE0", 1, "cold (fires at byte row)", "cold"),
         ("NEXT_PC",            8, "NEXT_PC",      1, "cold", "hot (scheduler)"),
         # 2026-06-10: L0/L1 within-step register-presence broadcast.
@@ -126,37 +248,76 @@ def main() -> int:
 
     # --- ARCHITECTURAL VERDICT ---------------------------------------------
     print("\n" + "=" * 70)
-    print("ARCHITECTURAL VERDICT")
+    print("ARCHITECTURAL VERDICT (Wave A: layer11_step_end_operand_relay)")
     print("=" * 70)
     op_imm_d = capture.dim("OP_IMM")
     op_psh_d = capture.dim("OP_PSH")
     op_eq_d = capture.dim("OP_EQ")
     ax_lo_d = capture.dim("AX_CARRY_LO")
-    se_op_any = max(
-        abs(arr8[0, se_row, op_imm_d].item()),
-        abs(arr8[0, se_row, op_psh_d].item()),
-        abs(arr8[0, se_row, op_eq_d].item()),
+    alu_lo_d = capture.dim("ALU_LO")
+    cmp_d = capture.dim("CMP")
+    stack0_b0_d = capture.dim("STACK0_BYTE0")
+    arr_pre = capture.after_layer[8]            # before the Wave A relay
+    arr_post = capture.after_layer[RELAY_LAYER]  # after the Wave A relay
+
+    def _max_op(arr, row):
+        return max(
+            abs(arr[0, row, op_imm_d].item()),
+            abs(arr[0, row, op_psh_d].item()),
+            abs(arr[0, row, op_eq_d].item()),
+        )
+
+    def _max_band(arr, row, base, width):
+        return float(arr[0, row, base:base + width].abs().max().item())
+
+    # Take the max relay magnitude across ALL captured step pairs so an
+    # ALU/CMP step's contribution to ALU_LO / CMP at its MARK_SE is
+    # caught even when an earlier step doesn't fire those dims.
+    se_op_pre = max(_max_op(arr_pre, s) for _, s in step_pairs)
+    se_ax_pre = max(_max_band(arr_pre, s, ax_lo_d, 16) for _, s in step_pairs)
+    se_op_post = max(_max_op(arr_post, s) for _, s in step_pairs)
+    se_ax_post = max(_max_band(arr_post, s, ax_lo_d, 16) for _, s in step_pairs)
+    se_alu_post = max(_max_band(arr_post, s, alu_lo_d, 16) for _, s in step_pairs)
+    se_cmp_post = max(_max_band(arr_post, s, cmp_d, 4) for _, s in step_pairs)
+    se_stack0_post = max(_max_band(arr_post, s, stack0_b0_d, 4) for _, s in step_pairs)
+
+    ax_op_pre = _max_op(arr_pre, ax_row)
+    ax_ax_pre = _max_band(arr_pre, ax_row, ax_lo_d, 16)
+    print(
+        f"MARK_AX row {ax_row} (after L8):  "
+        f"max|OP_<NAME>| = {ax_op_pre:.3f}, "
+        f"max|AX_CARRY_LO| = {ax_ax_pre:.3f}"
     )
-    se_ax_any = float(arr8[0, se_row, ax_lo_d:ax_lo_d+16].abs().max().item())
-    ax_op_any = max(
-        abs(arr8[0, ax_row, op_imm_d].item()),
-        abs(arr8[0, ax_row, op_psh_d].item()),
-        abs(arr8[0, ax_row, op_eq_d].item()),
+    print(
+        f"MARK_SE row {se_row} (after L8 / pre-relay):  "
+        f"max|OP_<NAME>| = {se_op_pre:.3f}, "
+        f"max|AX_CARRY_LO| = {se_ax_pre:.3f}"
     )
-    ax_ax_any = float(arr8[0, ax_row, ax_lo_d:ax_lo_d+16].abs().max().item())
-    print(f"MARK_AX row {ax_row}:  max|OP_<NAME>| = {ax_op_any:.3f}, "
-          f"max|AX_CARRY_LO| = {ax_ax_any:.3f}")
-    print(f"MARK_SE row {se_row}:  max|OP_<NAME>| = {se_op_any:.3f}, "
-          f"max|AX_CARRY_LO| = {se_ax_any:.3f}")
-    if se_op_any < 0.5 and ax_op_any > 0.5:
-        print("\nFINDING: OP_<NAME> flags are LIVE at MARK_AX, DEAD at STEP_END.")
-        print("Migrating ALU/CMP rules to gate on STEP_END would require a")
-        print("new attention head to relay OP_<NAME> from MARK_AX to STEP_END.")
-    if se_ax_any < 0.5 and ax_ax_any > 0.5:
-        print("FINDING: AX_CARRY_LO is LIVE at MARK_AX, DEAD at STEP_END.")
-        print("Same: STEP_END is not currently the AX-carry-forward target.")
-    print("\nThe STEP_END row currently carries scheduler dims (NEXT_PC, "
-          "MARK_SE, HAS_SE, MARK_SE_ONLY, CONST), not compute substrate.")
+    print(
+        f"MARK_SE row {se_row} (after L11 / post-relay): "
+        f"max|OP_<NAME>| = {se_op_post:.3f}, "
+        f"max|AX_CARRY_LO| = {se_ax_post:.3f}, "
+        f"max|ALU_LO| = {se_alu_post:.3f}, "
+        f"max|CMP| = {se_cmp_post:.3f}, "
+        f"max|STACK0_BYTE0..3| = {se_stack0_post:.3f}"
+    )
+    threshold = 0.9
+    ok = True
+    for label, val in (
+        ("OP_<NAME>", se_op_post),
+        ("AX_CARRY_LO", se_ax_post),
+        ("ALU_LO", se_alu_post),
+        ("CMP", se_cmp_post),
+        ("STACK0_BYTE0..3", se_stack0_post),
+    ):
+        status = "OK" if val >= threshold else "MISS"
+        if val < threshold:
+            ok = False
+        print(f"  Wave A acceptance ({label} >= {threshold}): {val:.3f} {status}")
+    if ok:
+        print("\nWave A acceptance MET — all relayed dims live at STEP_END.")
+    else:
+        print("\nWave A acceptance NOT met for at least one dim above.")
 
     # --- L0/L1 within-step register-presence broadcast (2026-06-10) -----
     print("\n" + "=" * 70)

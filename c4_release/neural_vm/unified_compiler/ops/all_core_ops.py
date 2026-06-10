@@ -275,6 +275,12 @@ def all_core_ops(
         # scheduler a layer-resident ffn op so the block op resolves to L11.
         make_layer11_ffn_dep_anchor_op(),
         make_layer11_mul_partial_op(alu_mode=alu_mode),
+        # Wave A (docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md):
+        # two-head attention relay broadcasting OP_<NAME>, AX_CARRY,
+        # ALU_LO/HI, CMP, and STACK0_BYTE0..3 from MARK_AX -> MARK_SE
+        # within the same step. Enables Wave B migration of L8/L9/L10
+        # dispatch+ALU+CMP rules from MARK_AX gating to MARK_SE gating.
+        make_layer11_step_end_operand_relay_op(),
         # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=12`` literals.
