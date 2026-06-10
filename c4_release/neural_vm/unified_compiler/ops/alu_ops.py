@@ -1419,6 +1419,20 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     POC matches the W3 (sub) / W5 (mul) "per-byte naive" convention so
     we land the install-site contract without blocking on the GE pipeline.
 
+    Byte-accurate (deferred): ``wide_div_rules_ge_format`` in
+    ``wide_alu_dsl.py`` provides a symbolically-correct flat 8-bit
+    cross-product lookup (65,536 rules per opcode batch) for
+    ``width_bytes=1``. It is **not** wired into this install op because
+    the residual at the L10 post_op install point is NOT clean one-hot
+    (cells outside the active index carry noise on the order of 4-6,
+    same magnitude as the active cell — see
+    ``docs/DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md``). The
+    byte-accurate rules require either a pre-``_clean_onehot`` stage
+    (not expressible as a single FFNRule list) or installation
+    upstream of L10 ALU passthrough where the residual is still clean.
+    ``FlattenedDivMod`` remains authoritative for byte-accurate DIV/MOD
+    until the staging issue is resolved.
+
     For the legacy ``alu_mode == 'lookup'`` path nothing changes —
     ``FlattenedDivMod`` is still appended as the post_op.
     """
@@ -1573,7 +1587,8 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
                 # 8-bit POC limit: per-nibble lookup only — NOT byte-
                 # identical for inputs spanning both nibbles. See the
                 # docstring on ``make_alu_divmod_composite_ops`` for the
-                # deferred multi-byte / cross-nibble plan.
+                # deferred multi-byte / cross-nibble plan and the
+                # ``wide_div_rules_ge_format`` follow-up helper.
                 from ...base_layers import PureFFN
                 from ..primitives import Primitives
                 from ..wide_alu_dsl import wide_div_rules

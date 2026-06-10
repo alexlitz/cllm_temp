@@ -20,8 +20,13 @@ Status (Task 81, scaffolding):
     to a partial-product cascade — see
     ``docs/DSL_W5_MULDIV_LIMIT.md``).
   - ``wide_div_rules`` — IMPLEMENTED (Wave W4, width_bytes=1 nibble
-    lookup POC; multi-byte deferred — per-nibble division does not
-    compose to wide DIV; see ``docs/DSL_W5_MULDIV_LIMIT.md``).
+    lookup POC; per-nibble and MATHEMATICALLY WRONG for cross-nibble
+    dividends; see ``docs/DSL_W5_MULDIV_LIMIT.md``). Superseded by
+    ``wide_div_rules_ge_format`` for byte-accurate single-byte div.
+  - ``wide_div_rules_ge_format`` — IMPLEMENTED. Byte-accurate
+    width_bytes=1 single-byte DIV/MOD via flat 8-bit cross-product
+    lookup (65,536 rules per opcode batch). Multi-byte deferred — see
+    ``docs/LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md``.
 
 The validation contract per helper is:
   ``rule_lowered_ffn.forward(x)  ==  hand_composite.forward(x)``
@@ -935,6 +940,151 @@ def wide_div_rules(
     return tuple(rules)
 
 
+def wide_div_rules_ge_format(
+    *,
+    dividend_lo_base: str,
+    dividend_hi_base: str,
+    divisor_lo_base: str,
+    divisor_hi_base: str,
+    result_lo_base: str,
+    result_hi_base: str,
+    width_bytes: int,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    op: str = "div",
+) -> Tuple[FFNRule, ...]:
+    """Byte-accurate multi-byte DIV/MOD via flat 8-bit cross-product lookup.
+
+    GE-format here refers to the "greater-or-equal" *semantic* of long
+    division (each output digit determined by whether the partial
+    dividend is >= k * divisor) — for single-byte operands the entire
+    256x256 quotient/remainder table fits in one FFN layer as a flat
+    cross-product lookup, which is *byte-accurate* (unlike
+    :func:`wide_div_rules` which is per-nibble and wrong for
+    cross-nibble dividends — see ``docs/DSL_W5_MULDIV_LIMIT.md``).
+
+    For ``width_bytes == 1`` (one full byte): each rule reads the
+    dividend ``a = a_hi*16 + a_lo`` and divisor ``b = b_hi*16 + b_lo``
+    one-hot encodings via a 5-way AND on
+    ``(marker_gate, dividend_lo+a_lo, dividend_hi+a_hi,
+    divisor_lo+b_lo, divisor_hi+b_hi)`` and writes the *byte-accurate*
+    quotient (``op="div"``) or remainder (``op="mod"``) nibbles to
+    ``result_lo+q_lo`` / ``result_hi+q_hi``.
+
+    Total rules per call:
+      * width_bytes=1: 256 * 256 = 65,536 rules (one per (a, b)).
+
+    Rule mechanics (5-way AND lookup — same shape as
+    ``wide_mul_rules(width_bytes=2)``):
+      * conditions: marker(+40), a_lo(+30), a_hi(+30), b_lo(+30),
+        b_hi(+30); total=160; threshold=150; all-on=160 > 150 fires;
+        missing marker -> 120 < 150 blocked; missing any nibble ->
+        130 < 150 blocked.
+      * gate: ``opcode_gate``.
+
+    Output writes use the standard ``2.0 / S`` lookup-mode amplitude
+    so the SwiGLU activation reconstructs a clean one-hot.
+
+    Divide-by-zero convention: ``q = r = 0`` (matches
+    ``_init_full_lookup_mode`` behavior in ``vm_step.py:1350``).
+
+    Args:
+        dividend_lo_base: dim base for the dividend low-nibble one-hot
+            band (e.g. ``"ALU_LO"``). Reads ``dividend_lo_base+a_lo``
+            for ``a_lo`` in 0..15.
+        dividend_hi_base: dim base for the dividend high-nibble band.
+        divisor_lo_base: dim base for the divisor low-nibble band.
+        divisor_hi_base: dim base for the divisor high-nibble band.
+        result_lo_base: dim base for the result low-nibble band
+            (writes land on ``result_lo_base+q_lo``).
+        result_hi_base: dim base for the result high-nibble band.
+        width_bytes: number of full bytes in the operands. Only
+            ``width_bytes == 1`` is supported here; wider widths
+            require GE-cascade across byte rows (deferred — see
+            ``docs/LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md``).
+        opcode_gate: dim ref for the ``DIV`` / ``MOD`` opcode flag
+            (e.g. ``"OP_DIV"`` or ``"OP_MOD"``).
+        marker_gate: dim name for the AX-style marker (e.g.
+            ``"MARK_AX"``).
+        S: SwiGLU scale.
+        op: ``"div"`` to emit quotient rules, ``"mod"`` to emit
+            remainder rules.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length ``256 * 256 = 65536`` for
+        ``width_bytes=1``.
+
+    Raises:
+        ValueError: if ``width_bytes < 1`` or ``op`` not in
+            ``{"div", "mod"}``.
+        NotImplementedError: if ``width_bytes > 1`` (multi-byte GE
+            cascade is deferred).
+    """
+    if not isinstance(width_bytes, int) or width_bytes < 1:
+        raise ValueError(
+            f"wide_div_rules_ge_format: width_bytes must be a positive "
+            f"int; got {width_bytes!r}"
+        )
+    if width_bytes > 1:
+        raise NotImplementedError(
+            f"wide_div_rules_ge_format: width_bytes={width_bytes} is "
+            f"deferred — multi-byte byte-accurate DIV requires a "
+            f"GE-cascade across byte rows (see "
+            f"docs/LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md). "
+            f"For 8-bit-fits-in-byte cases use width_bytes=1; for "
+            f"wider operands ``FlattenedDivMod`` remains authoritative."
+        )
+    if op not in ("div", "mod"):
+        raise ValueError(
+            f"wide_div_rules_ge_format: op must be 'div' or 'mod'; "
+            f"got {op!r}"
+        )
+
+    write_amplitude = 2.0 / S
+    rules: list[FFNRule] = []
+
+    # Flat 8-bit x 8-bit cross-product lookup. Each rule fires on a
+    # specific (a, b) pair and writes the byte-accurate q or r
+    # decomposition to result_lo/hi. 5-way AND mechanics:
+    #   marker(40) + a_lo(30) + a_hi(30) + b_lo(30) + b_hi(30) = 160
+    #   missing marker -> 120; missing any operand -> 130; threshold=150.
+    # (Same shape as wide_mul_rules width_bytes=2.)
+    for a in range(256):
+        a_lo = a & 0xF
+        a_hi = (a >> 4) & 0xF
+        for b in range(256):
+            b_lo = b & 0xF
+            b_hi = (b >> 4) & 0xF
+            if b == 0:
+                # Divide-by-zero convention: quotient = remainder = 0.
+                out_value = 0
+            else:
+                out_value = (a // b) if op == "div" else (a % b)
+            out_lo = out_value & 0xF
+            out_hi = (out_value >> 4) & 0xF
+            rules.append(multi_way_and_rule(
+                name=(
+                    f"wide_div_ge_{op}_a{a:02x}_b{b:02x}"
+                ),
+                conditions=(
+                    (marker_gate, 40.0),
+                    (f"{dividend_lo_base}+{a_lo}", 30.0),
+                    (f"{dividend_hi_base}+{a_hi}", 30.0),
+                    (f"{divisor_lo_base}+{b_lo}", 30.0),
+                    (f"{divisor_hi_base}+{b_hi}", 30.0),
+                ),
+                threshold=150.0,
+                gate=opcode_gate,
+                writes=(
+                    (f"{result_lo_base}+{out_lo}", write_amplitude),
+                    (f"{result_hi_base}+{out_hi}", write_amplitude),
+                ),
+            ))
+
+    return tuple(rules)
+
+
 # ---------------------------------------------------------------------------
 # Wave W3 (retry): GE-format wide ADD/SUB helpers.
 # ---------------------------------------------------------------------------
@@ -1254,4 +1404,5 @@ __all__ = [
     "wide_shift_rules",
     "wide_mul_rules",
     "wide_div_rules",
+    "wide_div_rules_ge_format",
 ]

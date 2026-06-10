@@ -29,6 +29,7 @@ from neural_vm.unified_compiler.primitives import Primitives  # noqa: E402
 from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
     bitwise_rules,
     wide_add_rules,
+    wide_div_rules_ge_format,
     wide_mul_rules,
     wide_shift_rules,
     wide_sub_rules,
@@ -1533,5 +1534,188 @@ def test_wide_shift_rules_byte_identity_32bit(
     assert not mismatches, (
         f"wide_shift width=4 (32-bit) {direction} byte-identity failures "
         f"({len(mismatches)}/{len(pairs)}):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
+# wide_div_rules_ge_format — byte-accurate single-byte DIV/MOD lookup
+# ---------------------------------------------------------------------------
+#
+# These tests validate the *symbolic* byte-identity contract of the
+# byte-accurate flat 8-bit cross-product DIV/MOD lookup. Each rule fires
+# on a specific (a, b) operand pair via a 5-way AND on
+# (MARK_AX, ALU_LO+a_lo, ALU_HI+a_hi, AX_CARRY_LO+b_lo, AX_CARRY_HI+b_hi),
+# gated on the opcode flag, writing the byte-accurate quotient/remainder
+# nibbles to OUTPUT_LO/OUTPUT_HI.
+#
+# Runtime install gap (see docs/DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md):
+# the residual at the L10 post_op install point is not clean one-hot, so
+# the lookup as currently wired does not produce the correct OUTPUT byte
+# inside the full VM. The tests below exercise the rules with clean
+# one-hot inputs to confirm the symbolic semantics; the architectural
+# fix is deferred.
+
+
+def _build_wide_div_ge_rules(op: str, S: float = 100.0):
+    return wide_div_rules_ge_format(
+        dividend_lo_base="ALU_LO",
+        dividend_hi_base="ALU_HI",
+        divisor_lo_base="AX_CARRY_LO",
+        divisor_hi_base="AX_CARRY_HI",
+        result_lo_base="OUTPUT_LO",
+        result_hi_base="OUTPUT_HI",
+        width_bytes=1,
+        opcode_gate="OP_DIV" if op == "div" else "OP_MOD",
+        marker_gate="MARK_AX",
+        S=S,
+        op=op,
+    )
+
+
+def _lowered_wide_div_ge_ffn(op: str, S: float = 100.0) -> PureFFN:
+    rules = _build_wide_div_ge_rules(op, S=S)
+    assert len(rules) == 256 * 256
+    ffn = PureFFN(dim=512, hidden_dim=len(rules))
+    names = Primitives.ffn_rule_dim_names(rules)
+    dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, dim_positions, start_unit=0, S=S,
+    )
+    assert end == len(rules)
+    return ffn
+
+
+def _make_div_input(*, a: int, b: int, op: str) -> torch.Tensor:
+    """One-position residual at MARK_AX with the dividend/divisor."""
+    op_dim = _SetDim.OP_DIV if op == "div" else _SetDim.OP_MOD
+    x = torch.zeros(1, 1, 512)
+    x[0, 0, _SetDim.MARK_AX] = 1.0
+    x[0, 0, op_dim] = 1.0
+    x[0, 0, _SetDim.ALU_LO + (a & 0xF)] = 1.0
+    x[0, 0, _SetDim.ALU_HI + ((a >> 4) & 0xF)] = 1.0
+    x[0, 0, _SetDim.AX_CARRY_LO + (b & 0xF)] = 1.0
+    x[0, 0, _SetDim.AX_CARRY_HI + ((b >> 4) & 0xF)] = 1.0
+    return x
+
+
+def test_wide_div_rules_ge_format_emit_expected_count():
+    """256 * 256 = 65,536 rules per opcode batch."""
+    for op in ("div", "mod"):
+        rules = _build_wide_div_ge_rules(op)
+        assert len(rules) == 65_536, (
+            f"wide_div_rules_ge_format(op={op!r}) emitted "
+            f"{len(rules)} rules, expected 65,536"
+        )
+
+
+def test_wide_div_rules_ge_format_rejects_bad_args():
+    """``width_bytes < 1`` is ValueError; ``width_bytes > 1`` is
+    NotImplementedError; ``op`` outside {'div', 'mod'} is ValueError.
+    """
+    with pytest.raises(ValueError, match="width_bytes"):
+        wide_div_rules_ge_format(
+            dividend_lo_base="A_LO", dividend_hi_base="A_HI",
+            divisor_lo_base="B_LO", divisor_hi_base="B_HI",
+            result_lo_base="R_LO", result_hi_base="R_HI",
+            width_bytes=0,
+            opcode_gate="OP", marker_gate="MARK", S=100.0,
+        )
+    with pytest.raises(NotImplementedError, match="multi-byte"):
+        wide_div_rules_ge_format(
+            dividend_lo_base="A_LO", dividend_hi_base="A_HI",
+            divisor_lo_base="B_LO", divisor_hi_base="B_HI",
+            result_lo_base="R_LO", result_hi_base="R_HI",
+            width_bytes=2,
+            opcode_gate="OP", marker_gate="MARK", S=100.0,
+        )
+    with pytest.raises(ValueError, match="op must be"):
+        wide_div_rules_ge_format(
+            dividend_lo_base="A_LO", dividend_hi_base="A_HI",
+            divisor_lo_base="B_LO", divisor_hi_base="B_HI",
+            result_lo_base="R_LO", result_hi_base="R_HI",
+            width_bytes=1,
+            opcode_gate="OP", marker_gate="MARK", S=100.0,
+            op="something_else",
+        )
+
+
+@pytest.fixture(scope="module")
+def lowered_wide_div_ge_ffns() -> dict:
+    return {op: _lowered_wide_div_ge_ffn(op) for op in ("div", "mod")}
+
+
+@pytest.mark.parametrize(
+    ("a", "b", "op"),
+    [
+        # Cross-nibble dividends (the per-nibble bug repro: 84 = 0x54).
+        (84, 2, "div"),    # 42 = 0x2A
+        (84, 2, "mod"),    # 0
+        (43, 10, "div"),   # 4
+        (43, 10, "mod"),   # 3
+        # Multi-nibble quotients.
+        (200, 7, "div"),   # 28 = 0x1C
+        (200, 7, "mod"),   # 4
+        # Same-nibble dividend (per-nibble case still works).
+        (15, 3, "div"),    # 5
+        (15, 3, "mod"),    # 0
+        # Boundary: max dividend.
+        (255, 16, "div"),  # 15 = 0x0F
+        (255, 16, "mod"),  # 15 = 0x0F
+        # Divide-by-zero: convention q = r = 0.
+        (84, 0, "div"),    # 0
+        (84, 0, "mod"),    # 0
+        # Identity.
+        (1, 1, "div"),     # 1
+        (1, 1, "mod"),     # 0
+    ],
+)
+def test_wide_div_rules_ge_format_byte_identity(
+    lowered_wide_div_ge_ffns, a, b, op
+):
+    """Lowered ``wide_div_rules_ge_format`` decodes to the same OUTPUT
+    byte as Python's ``a // b`` / ``a % b`` on clean one-hot input.
+
+    This is the *byte-accurate* contract that the per-nibble
+    ``wide_div_rules`` cannot satisfy for cross-nibble dividends — see
+    docs/DSL_W5_MULDIV_LIMIT.md for the per-nibble failure mode.
+    """
+    x = _make_div_input(a=a, b=b, op=op)
+    with torch.no_grad():
+        y = lowered_wide_div_ge_ffns[op](x)
+    decoded = _decode_output_byte(y)
+    if b == 0:
+        expected = 0
+    else:
+        expected = (a // b) if op == "div" else (a % b)
+    assert decoded == expected, (
+        f"wide_div_rules_ge_format({op}) {a} {b}: "
+        f"expected 0x{expected:02X}, got 0x{decoded:02X}"
+    )
+
+
+def test_wide_div_rules_ge_format_byte_identity_randomized(
+    lowered_wide_div_ge_ffns
+):
+    """Randomized sweep over 32 (a, b) pairs per opcode."""
+    gen = torch.Generator().manual_seed(0xD1ED1ED1)  # "DIE-DIE" hex-ish
+    n_trials = 32
+    pairs = torch.randint(1, 256, (n_trials, 2), generator=gen).tolist()
+
+    mismatches = []
+    for op in ("div", "mod"):
+        for a, b in pairs:
+            x = _make_div_input(a=a, b=b, op=op)
+            with torch.no_grad():
+                decoded = _decode_output_byte(lowered_wide_div_ge_ffns[op](x))
+            expected = (a // b) if op == "div" else (a % b)
+            if decoded != expected:
+                mismatches.append(
+                    f"{op} {a} {b}: expected=0x{expected:02X} "
+                    f"got=0x{decoded:02X}"
+                )
+    assert not mismatches, (
+        f"wide_div_rules_ge_format byte-identity failures "
+        f"({len(mismatches)}/{2 * n_trials}):\n  "
         + "\n  ".join(mismatches[:10])
     )
