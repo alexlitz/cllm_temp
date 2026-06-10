@@ -66,11 +66,20 @@ _L9_BP_PLUS8_RELAYED: tuple[str, ...] = (
 # layout until a follow-up reconciles the two ops onto distinct slots.
 _L9_HEAD_LAYOUT = (
     # (op-name key,)  -- no pinned head_idx; allocator first-fits in
-    # declaration order, landing at 0 / 1 / 2 byte-identically
+    # declaration order, landing at 0 / 1 / 2 / 3 byte-identically
     # (Phase 8.B retry attn pin drop).
     ("layer9_lev_addr_relay",),
     ("layer9_lev_bp_to_pc_relay",),
     ("layer9_alibi_mem_attn",),
+    # Wave A v2 (2026-06-10): register-tagged STEP_END operand relay.
+    # Q@MARK_SE_ONLY, K@MARK_AX (within-step), V copies raw
+    # ALU_LO/HI / AX_CARRY_LO/HI / CMP / OP_<cmp> into the SE_-tagged
+    # mirror dims so the migrated L9 CMP rules (which now gate on
+    # MARK_SE_ONLY -- commit 62b64449) have the operand state at the
+    # SE row without colliding with the raw band readers downstream.
+    # See docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md (Wave A) and
+    # memory note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+    ("layer9_step_end_operand_relay",),
 )
 
 
@@ -532,7 +541,14 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     structural (per-nibble one-hot lookups).
     """
 
-    gate_cmp_group = dim_ref("cmp_flag", "group")
+    # Wave A v2 (2026-06-10): SE-tagged CMP_GROUP gate. The rule now
+    # fires at MARK_SE_ONLY where the raw CMP_GROUP dim is zero (it was
+    # written at MARK_AX by L8). ``layer9_step_end_operand_relay``
+    # mirrors CMP_GROUP into ``SE_CMP_GROUP`` at the SE row, so the
+    # gate stays semantically equivalent. The cmp cascade outputs
+    # remain raw ``CMP+k`` (downstream BZ/BNZ predicate gate reads the
+    # raw cascade at MARK_AX cross-step via prev-step OUTPUT relays).
+    gate_cmp_group = "SE_CMP_GROUP+0"
     cmp_byte0 = dim_ref("cmp_flag", "cascade", 0)
     cmp_byte1 = dim_ref("cmp_flag", "cascade", 1)
     cmp_byte2 = dim_ref("cmp_flag", "cascade", 2)
@@ -546,17 +562,23 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     # takes the explicit threshold=2.5 (the default derivation requires all
     # positive weights and would not pass the negative MARK_PC blocker).
 
-    # Wave B Cluster 3 rows 1-4: the CMP factory's 4-way AND now fires
-    # at MARK_SE_ONLY (STEP_END) instead of MARK_AX. Wave A's
-    # ``step_end_operand_relay`` broadcasts CMP / ALU_LO/HI /
-    # AX_CARRY_LO/HI / OP_<cmp> from the AX row into STEP_END, so the
-    # rule fires one row later byte-identically. The MARK_PC negative
-    # blocker is retained: it was there to guard against MARK_AX leak
-    # at the PC marker row; at STEP_END the dim is zero (different
-    # row) and the term is structurally inert but preserves the AND
-    # threshold arithmetic. See ``step_end_migration.py`` for the
-    # helper and ``WAVE_B_CLUSTER_3_PLAN_2026_06_10.md`` for the
-    # migration recipe.
+    # Wave B Cluster 3 rows 1-4 + Wave A v2 (2026-06-10): the CMP
+    # factory's 4-way AND now fires at MARK_SE_ONLY (STEP_END) instead
+    # of MARK_AX. The Wave A v2 ``layer9_step_end_operand_relay``
+    # attention head mirrors ALU_LO/HI / AX_CARRY_LO/HI / CMP /
+    # OP_<cmp> from the same step's MARK_AX row into the SE_-tagged
+    # SE_ALU_LO/HI / SE_AX_CARRY_LO/HI / SE_CMP / SE_OP_<cmp> slots
+    # at MARK_SE_ONLY. The CMP rules read the SE_-tagged mirrors so
+    # they fire at the SE row without colliding with the raw band
+    # readers downstream (the previous L11 relay 10ca51a7 wrote raw
+    # ALU_LO/HI at MARK_SE and regressed 9 tests by polluting the
+    # cross-step / downstream-layer consumers of those bands; the
+    # SE_-prefixed mirrors are scoped ``mark == SE_ONLY`` so non-CMP
+    # readers never see them). The MARK_PC negative blocker is
+    # retained: at MARK_SE_ONLY the dim is zero so the term is
+    # structurally inert but preserves the AND threshold arithmetic.
+    # See ``step_end_migration.py`` for the helper and
+    # ``WAVE_B_CLUSTER_3_PLAN_2026_06_10.md`` for the migration recipe.
 
     # hi_eq: 16 units -> CMP+1
     for k in range(16):
@@ -565,8 +587,8 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=(
                 ("MARK_SE_ONLY", 1.0),
                 ("MARK_PC", -2.0),
-                (f"ALU_HI+{k}", 1.0),
-                (f"AX_CARRY_HI+{k}", 1.0),
+                (f"SE_ALU_HI+{k}", 1.0),
+                (f"SE_AX_CARRY_HI+{k}", 1.0),
             ),
             threshold=2.5,
             gate=gate_cmp_group,
@@ -580,8 +602,8 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=(
                 ("MARK_SE_ONLY", 1.0),
                 ("MARK_PC", -2.0),
-                (f"ALU_LO+{k}", 1.0),
-                (f"AX_CARRY_LO+{k}", 1.0),
+                (f"SE_ALU_LO+{k}", 1.0),
+                (f"SE_AX_CARRY_LO+{k}", 1.0),
             ),
             threshold=2.5,
             gate=gate_cmp_group,
@@ -596,8 +618,8 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 conditions=(
                     ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -2.0),
-                    (f"ALU_HI+{a}", 1.0),
-                    (f"AX_CARRY_HI+{b}", 1.0),
+                    (f"SE_ALU_HI+{a}", 1.0),
+                    (f"SE_AX_CARRY_HI+{b}", 1.0),
                 ),
                 threshold=2.5,
                 gate=gate_cmp_group,
@@ -612,8 +634,8 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 conditions=(
                     ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -2.0),
-                    (f"ALU_LO+{a}", 1.0),
-                    (f"AX_CARRY_LO+{b}", 1.0),
+                    (f"SE_ALU_LO+{a}", 1.0),
+                    (f"SE_AX_CARRY_LO+{b}", 1.0),
                 ),
                 threshold=2.5,
                 gate=gate_cmp_group,
@@ -1900,6 +1922,289 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         compiler_ir=CompilerIR(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#the-attention-layer",
+    )
+
+
+# =====================================================================
+# Wave A v2 (2026-06-10): register-tagged STEP_END operand relay.
+# =====================================================================
+#
+# Two declarative attention heads in L9 that mirror the same-step
+# operand state from MARK_AX into the SE_-tagged dims at MARK_SE_ONLY.
+# Sits in L9 attention so it fires BEFORE L9 FFN's CMP rules
+# (``_layer9_cmp_rules``, migrated to MARK_SE_ONLY by commit 62b64449)
+# and provides the operand bands the CMP rules need at the SE row.
+#
+# Head A (mirrors compute flags + ALU values):
+#   * SE_OP_EQ / NE / LT / GT / LE / GE (6 slots)
+#   * SE_CMP_GROUP (1 slot)
+#   * SE_CMP+0..3 (4 slots)
+#   * SE_ALU_LO+0..15 (16 slots)
+#   * SE_ALU_HI+0..15 (16 slots)
+#   = 43 slots total (fits HD=64)
+#
+# Head B (mirrors AX carry staging):
+#   * SE_AX_CARRY_LO+0..15 (16 slots)
+#   * SE_AX_CARRY_HI+0..15 (16 slots)
+#   = 32 slots total (fits HD=64)
+#
+# Why two heads (not one)? Total slot count (75) exceeds HD=64 for a
+# single head. Splitting along the ALU / CARRY boundary keeps each
+# head's V/O writes within budget without forcing a wider model.
+#
+# Why TAGGED dims (SE_*) instead of raw (ALU_LO etc.)? The L11 relay
+# (10ca51a7, enable=False) broadcasts RAW ALU_LO/HI at MARK_SE_ONLY
+# and regresses 9 smoke tests because downstream readers (BZ/BNZ gate,
+# LI/LC, memory ops) consume raw ALU_LO/HI at MARK_AX cross-step via
+# OUTPUT_LO_PREV_STEP-style relays; writing them again at MARK_SE_ONLY
+# pollutes that bus. The SE_ prefix keeps the operand band scoped to
+# ``mark == SE_ONLY`` (semantics declared in dim_registry.py) so the
+# raw band readers cannot see them. See memory note
+# ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+#
+# ALiBi slope 0.2 keeps the relay step-local: within-step MARK_AX is
+# 29 rows back from MARK_SE_ONLY, prior-step MARK_AX is ~64 back. With
+# slope 0.2 the within-step score is L^2/sqrt(HD) - 0.2*29 = 12.5-5.8
+# = 6.7, prior-step 12.5-12.8 = -0.3, so softmax favours the
+# within-step AX by ~exp(7) ≈ 1100. Same convention as L1 head 6
+# (``_step_end_reg_present_head_spec``) and the L11 step_end_relay.
+
+
+def _layer9_step_end_operand_relay_head_specs(
+    BD,
+) -> tuple[DeclarativeAttentionHeadSpec, DeclarativeAttentionHeadSpec]:
+    """Build the two Wave A v2 relay head specs.
+
+    Q at MARK_SE_ONLY (the STEP_END row). K at MARK_AX (the in-step
+    operand-state row). V copies each named source dim with weight 1.0;
+    O writes the same value into the SE_-tagged sister dim at the Q row
+    with weight 1.0.
+
+    A positive ALiBi slope (0.2) plus L=10 Q/K weights keeps the relay
+    step-local: at distance 29 (within-step MARK_AX -> MARK_SE_ONLY)
+    the score is ``L^2/sqrt(HD) - 0.2*29 ≈ 6.7``; the prior step's
+    MARK_AX sits at distance ~64 (loses by ~exp(7) ≈ 1100 in softmax).
+    Mirrors the L1 head 6 / L11 step_end_relay shape.
+    """
+    L = 10.0
+
+    # Per-head Q/K bands: Q anchors on MARK_SE_ONLY (slot 0 only when
+    # the row is a STEP_END marker), K anchors on MARK_AX (slot 0 only
+    # at the same-step AX marker row). Slot 0 is RESERVED for the Q-K
+    # score; V/O writes start at slot 1 to avoid the leak shape where
+    # softmax over -ALiBi penalties at non-SE Q rows attends to the
+    # local K row, and V slot 0 carries the source dim value into the
+    # SE_<NAME> output dim at non-SE rows. Mirrors the L1 head 6
+    # design (``_step_end_reg_present_head_spec``).
+    q_band = (
+        AP(0, BD.MARK_SE_ONLY, L),
+    )
+    k_band = (
+        AP(0, BD.MARK_AX, L),
+    )
+
+    # --- Head A: SE_OP_<cmp> + SE_CMP_GROUP + SE_CMP + SE_ALU_LO/HI ---
+    # V/O slots 1..43 (slot 0 reserved for Q-K score).
+    _CMP_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
+    v_a: list = []
+    o_a: list = []
+    slot = 1
+    for op_name in _CMP_OPS:
+        src_dim = getattr(BD, op_name)
+        out_dim = getattr(BD, f"SE_{op_name}")
+        v_a.append(AP(slot, src_dim, 1.0))
+        o_a.append(AO(out_dim, slot, 1.0))
+        slot += 1
+    # CMP_GROUP -> SE_CMP_GROUP
+    v_a.append(AP(slot, BD.CMP_GROUP, 1.0))
+    o_a.append(AO(BD.SE_CMP_GROUP, slot, 1.0))
+    slot += 1
+    # CMP+0..3 -> SE_CMP+0..3
+    for k_idx in range(4):
+        v_a.append(AP(slot, BD.CMP + k_idx, 1.0))
+        o_a.append(AO(BD.SE_CMP + k_idx, slot, 1.0))
+        slot += 1
+    # ALU_LO+0..15 -> SE_ALU_LO+0..15
+    for k_idx in range(16):
+        v_a.append(AP(slot, BD.ALU_LO + k_idx, 1.0))
+        o_a.append(AO(BD.SE_ALU_LO + k_idx, slot, 1.0))
+        slot += 1
+    # ALU_HI+0..15 -> SE_ALU_HI+0..15
+    for k_idx in range(16):
+        v_a.append(AP(slot, BD.ALU_HI + k_idx, 1.0))
+        o_a.append(AO(BD.SE_ALU_HI + k_idx, slot, 1.0))
+        slot += 1
+
+    spec_a = DeclarativeAttentionHeadSpec(
+        head_idx=_l9_head_idx("layer9_step_end_operand_relay"),
+        q=q_band,
+        k=k_band,
+        v=tuple(v_a),
+        o=tuple(o_a),
+        alibi_slope=0.2,
+    )
+
+    # --- Head B: SE_AX_CARRY_LO + SE_AX_CARRY_HI ---
+    # V/O slots 1..32 (slot 0 reserved for Q-K score).
+    v_b: list = []
+    o_b: list = []
+    slot = 1
+    for k_idx in range(16):
+        v_b.append(AP(slot, BD.AX_CARRY_LO + k_idx, 1.0))
+        o_b.append(AO(BD.SE_AX_CARRY_LO + k_idx, slot, 1.0))
+        slot += 1
+    for k_idx in range(16):
+        v_b.append(AP(slot, BD.AX_CARRY_HI + k_idx, 1.0))
+        o_b.append(AO(BD.SE_AX_CARRY_HI + k_idx, slot, 1.0))
+        slot += 1
+
+    head_a_idx = _l9_head_idx("layer9_step_end_operand_relay")
+    spec_b = DeclarativeAttentionHeadSpec(
+        head_idx=head_a_idx + 1,
+        q=q_band,
+        k=k_band,
+        v=tuple(v_b),
+        o=tuple(o_b),
+        alibi_slope=0.2,
+    )
+
+    return spec_a, spec_b
+
+
+def _layer9_step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
+    """``compiler_ir_factory`` for the L9 step_end_operand_relay heads."""
+    del HD  # head_dim is layer-default
+    BD = _as_setdim_proxy(dim_positions)
+    spec_a, spec_b = _layer9_step_end_operand_relay_head_specs(BD)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(
+        spec_a, name="layer9_step_end_operand_relay.head_a",
+    )
+    ir.layer(0).attention.append(
+        spec_b, name="layer9_step_end_operand_relay.head_b",
+    )
+    return ir
+
+
+def make_layer9_step_end_operand_relay_op() -> Operation:
+    """L9 Wave A v2: register-tagged STEP_END operand relay (2 heads).
+
+    Two declarative attention heads inside L9 attn that mirror the
+    same-step ALU/CARRY/CMP/OP operand bands at MARK_AX into the
+    register-tagged ``SE_*`` dims at MARK_SE_ONLY. Runs as the L9
+    attn-side complement to the migrated L9 CMP rules (commit
+    62b64449) which gate on MARK_SE_ONLY and consume the SE_-tagged
+    bands. See the long header comment above the spec helper and
+    ``docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md`` for the design
+    rationale.
+
+    Why not the L11 ``step_end_operand_relay`` (10ca51a7, enable=False)?
+    That earlier relay (i) writes raw ALU_LO/HI at MARK_SE_ONLY,
+    polluting cross-step / downstream readers (9 measured smoke
+    regressions), AND (ii) fires AT L11 -- AFTER L9 FFN, too late for
+    the L9 CMP rules. This L9 relay fixes BOTH: per-register tagging
+    via the SE_-prefixed slots AND placement upstream of L9 FFN.
+    """
+    def bake(block, dim_positions, S):
+        del S  # ALiBi slope is the only scale factor and is set below
+        attn = block.attn
+        # Per-bake L9 head allocator with the full layout pinned. Look
+        # up our relay head A by name; head B claims the next slot.
+        allocator = _allocate_layer9_attention_heads()
+        attn._l9_head_allocator = allocator
+        head_a_idx = next(
+            h.head_idx for h in allocator.heads()
+            if h.op_name == "layer9_step_end_operand_relay"
+        )
+        head_b_idx = head_a_idx + 1
+        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
+            attn.alibi_slopes[head_a_idx] = 0.2
+            attn.alibi_slopes[head_b_idx] = 0.2
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec_a, spec_b = _layer9_step_end_operand_relay_head_specs(
+            _as_setdim_proxy(dim_positions),
+        )
+        Primitives.generate_attention_head(attn, spec_a, HD)
+        Primitives.generate_attention_head(attn, spec_b, HD)
+
+    # Dim-ownership claims: 2 heads on L9 attn. Resolved head indices
+    # come from ``_l9_head_idx`` (head A) and ``head_a + 1`` (head B).
+    # We pin them as ``A_<slot>`` / ``B_<slot>`` strings; the verifier
+    # accepts the symbolic head names as long as they're unique per op.
+    _CMP_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
+    _claims: set = set()
+    head_a_idx = _l9_head_idx("layer9_step_end_operand_relay")
+    head_b_idx = head_a_idx + 1
+    # Slot 0 reserved for Q-K score; V/O start at slot 1.
+    slot = 1
+    for op_name in _CMP_OPS:
+        _claims.add((9, "attn_W_v", f"{head_a_idx}_{slot}", f"{op_name}+0"))
+        _claims.add((9, "attn_W_o", f"{head_a_idx}_{slot}", f"SE_{op_name}+0"))
+        slot += 1
+    _claims.add((9, "attn_W_v", f"{head_a_idx}_{slot}", "CMP_GROUP+0"))
+    _claims.add((9, "attn_W_o", f"{head_a_idx}_{slot}", "SE_CMP_GROUP+0"))
+    slot += 1
+    for k_idx in range(4):
+        _claims.add((9, "attn_W_v", f"{head_a_idx}_{slot}", f"CMP+{k_idx}"))
+        _claims.add((9, "attn_W_o", f"{head_a_idx}_{slot}", f"SE_CMP+{k_idx}"))
+        slot += 1
+    for k_idx in range(16):
+        _claims.add((9, "attn_W_v", f"{head_a_idx}_{slot}", f"ALU_LO+{k_idx}"))
+        _claims.add((9, "attn_W_o", f"{head_a_idx}_{slot}", f"SE_ALU_LO+{k_idx}"))
+        slot += 1
+    for k_idx in range(16):
+        _claims.add((9, "attn_W_v", f"{head_a_idx}_{slot}", f"ALU_HI+{k_idx}"))
+        _claims.add((9, "attn_W_o", f"{head_a_idx}_{slot}", f"SE_ALU_HI+{k_idx}"))
+        slot += 1
+    slot = 1
+    for k_idx in range(16):
+        _claims.add(
+            (9, "attn_W_v", f"{head_b_idx}_{slot}", f"AX_CARRY_LO+{k_idx}"),
+        )
+        _claims.add(
+            (9, "attn_W_o", f"{head_b_idx}_{slot}", f"SE_AX_CARRY_LO+{k_idx}"),
+        )
+        slot += 1
+    for k_idx in range(16):
+        _claims.add(
+            (9, "attn_W_v", f"{head_b_idx}_{slot}", f"AX_CARRY_HI+{k_idx}"),
+        )
+        _claims.add(
+            (9, "attn_W_o", f"{head_b_idx}_{slot}", f"SE_AX_CARRY_HI+{k_idx}"),
+        )
+        slot += 1
+
+    return Operation(
+        name="layer9_step_end_operand_relay",
+        reads={"MARK_SE_ONLY", "MARK_AX",
+               "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               "CMP_GROUP", "CMP",
+               "ALU_LO", "ALU_HI", "AX_CARRY_LO", "AX_CARRY_HI"},
+        writes={"SE_OP_EQ", "SE_OP_NE", "SE_OP_LT", "SE_OP_GT",
+                "SE_OP_LE", "SE_OP_GE",
+                "SE_CMP_GROUP", "SE_CMP",
+                "SE_ALU_LO", "SE_ALU_HI",
+                "SE_AX_CARRY_LO", "SE_AX_CARRY_HI"},
+        kind="block",
+        # Phase 9.3 places this AFTER the L9 LEV relays (phase 9.0,
+        # 9.1) and the disabled mem_attn (phase 9.2) so our
+        # alibi_slopes overrides on heads 3/4 don't get clobbered by
+        # a sibling op that fills the whole slope vector.
+        phase=9.3,
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer9_step_end_operand_relay_ir,
+        # Bind to ``layer9_marker_suppress`` (the L9 FFN topology
+        # anchor) so the block op resolves to the same physical layer
+        # as the other L9 attention ops (which today resolves to L11
+        # due to the 23-logical / 36-physical layer expansion -- the
+        # L11 attn fires BEFORE the L11 FFN that hosts the migrated
+        # L9 CMP rules, so the relay output is visible to the rules).
+        target_op_name="layer9_marker_suppress",
+        migrated=True,
+        declarative_authority="spec_generated",
+        claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 

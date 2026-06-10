@@ -2373,6 +2373,20 @@ class LayerCompiler:
         # CMP cascade per-opcode bytes — embed-time durable.
         "CMP+0", "CMP+1", "CMP+2", "CMP+3", "CMP+4",
         "CMP+5", "CMP+6", "CMP+7", "CMP+8", "CMP+9",
+        # 2026-06-10 Wave A v2: register-tagged STEP_END operand relay
+        # mirror dims. Written at MARK_SE_ONLY by
+        # ``layer9_step_end_operand_relay`` (two L9 attn heads) AND at
+        # MARK_AX rows as a small softmax leak (the score-only slot-0
+        # design reduces but does not eliminate the leak). Sharing a
+        # slot with a live dim that fires at MARK_AX (e.g.
+        # IN_STEP_FRESH, SP_BYTE0_IS_F8) would corrupt the partner.
+        # See docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md and
+        # memory note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+        "SE_ALU_LO", "SE_ALU_HI",
+        "SE_AX_CARRY_LO", "SE_AX_CARRY_HI",
+        "SE_CMP", "SE_CMP_GROUP",
+        "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT",
+        "SE_OP_GT", "SE_OP_LE", "SE_OP_GE",
     })
 
     def _liveness_never_share(self, name: str) -> bool:

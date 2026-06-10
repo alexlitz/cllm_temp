@@ -2586,6 +2586,28 @@ class _SetDim:
     SE_REG_STACK0_PRESENT = 835  # MARK_STACK0 present in current step
     SE_REG_MEM_PRESENT    = 836  # MARK_MEM present in current step
 
+    # --- Register-tagged STEP_END operand relay (2026-06-10, L9 head 3/4) ---
+    # Written at MARK_SE_ONLY rows by the new L9 attention head
+    # ``layer9_step_end_operand_relay`` (two heads, mirrors raw ALU/CARRY/
+    # CMP/OP bands at MARK_AX into the SE_-tagged slots). Consumed by the
+    # migrated L9 CMP rules (``_layer9_cmp_rules``, MARK_SE_ONLY gated)
+    # so the rules can fire at the STEP_END row without colliding with
+    # downstream readers of the raw bands. See
+    # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md (Wave A v2) and
+    # memory note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+    SE_ALU_LO        = 837   # ALU_LO mirror (16 wide)
+    SE_ALU_HI        = 853   # ALU_HI mirror (16 wide)
+    SE_AX_CARRY_LO   = 869   # AX_CARRY_LO mirror (16 wide)
+    SE_AX_CARRY_HI   = 885   # AX_CARRY_HI mirror (16 wide)
+    SE_CMP           = 901   # CMP cascade mirror (4 wide)
+    SE_OP_EQ         = 905   # OP_EQ mirror (1 wide)
+    SE_OP_NE         = 906   # OP_NE mirror (1 wide)
+    SE_OP_LT         = 907   # OP_LT mirror (1 wide)
+    SE_OP_GT         = 908   # OP_GT mirror (1 wide)
+    SE_OP_LE         = 909   # OP_LE mirror (1 wide)
+    SE_OP_GE         = 910   # OP_GE mirror (1 wide)
+    SE_CMP_GROUP     = 911   # CMP_GROUP mirror (1 wide) -- L9 CMP gate
+
     # Convenience: map Opcode int → _SetDim opcode flag dim
     _OPCODE_DIM = None  # lazily built
 

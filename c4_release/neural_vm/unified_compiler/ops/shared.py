@@ -923,6 +923,47 @@ def declare_setdim_compat_dims(
     ):
         compiler.declare_dim(name, 1, pinned=None)
 
+    # 2026-06-10 Wave A v2: register-tagged STEP_END operand relay.
+    # Written at MARK_SE_ONLY by ``layer9_step_end_operand_relay`` (two
+    # attn heads in L9 attn), consumed by the migrated L9 CMP rules
+    # (``_layer9_cmp_rules``, gated on MARK_SE_ONLY). The SE_ prefix
+    # keeps the operand bands scoped to the SE row so they do not
+    # collide with downstream readers of the raw ALU_LO/HI/CARRY/CMP
+    # bands. Pinned to the ``_SetDim.SE_*`` positions (837..911) so
+    # they sit above the existing dim layout and don't share slots
+    # via the liveness allocator with unrelated live dims (the L9 CMP
+    # rules' writes to SE_<NAME> at MARK_SE_ONLY would clobber any
+    # collided dim's writes at non-SE rows otherwise). See
+    # ``docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md`` and memory
+    # note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+    # The SE_* relay dims MUST NOT share slots with other live dims:
+    # the relay's attention head produces a small leak at non-SE rows
+    # (softmax over -ALiBi penalty distributes some mass to nearby K
+    # rows, producing residual contribution at non-SE Q rows even with
+    # the score-only slot-0 design). Sharing a slot with a dim that
+    # fires at MARK_AX (e.g. IN_STEP_FRESH, SP_BYTE0_IS_F8) would
+    # corrupt the partner's value. Leave the dims unpinned so the
+    # liveness allocator places them above the existing layout BUT
+    # the auto-share is disabled for SE_* by the bumped d_model: with
+    # explicit size declarations the bump-pointer puts them above
+    # the IO/scratch high-water mark unless the liveness pass coalesces
+    # them. The L1 head 6 SE_REG_* family takes the same approach.
+    for name, size in (
+        ("SE_ALU_LO", 16),
+        ("SE_ALU_HI", 16),
+        ("SE_AX_CARRY_LO", 16),
+        ("SE_AX_CARRY_HI", 16),
+        ("SE_CMP", 4),
+        ("SE_OP_EQ", 1),
+        ("SE_OP_NE", 1),
+        ("SE_OP_LT", 1),
+        ("SE_OP_GT", 1),
+        ("SE_OP_LE", 1),
+        ("SE_OP_GE", 1),
+        ("SE_CMP_GROUP", 1),
+    ):
+        compiler.declare_dim(name, size, pinned=None)
+
     # ------------------------------------------------------------------
     # Qwen R1 — opt-in NORM_COMPENSATOR slot
     # ------------------------------------------------------------------

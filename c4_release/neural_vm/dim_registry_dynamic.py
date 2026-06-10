@@ -85,7 +85,19 @@ def build_default_registry_dynamic() -> DimRegistry:
     # This is the L0/L1 foundation of the STEP_END compute migration
     # in docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md (the parallel
     # Wave-A L11 relay broadcasts the post-producer compute slots).
-    a = Allocator(d_model=840)
+    #
+    # Register-tagged STEP_END operand relay (2026-06-10 Wave A v2):
+    # d_model expanded 840 -> 920 to carry the new SE_-prefixed
+    # operand-mirror dims at 837..910 (SE_ALU_LO/HI, SE_AX_CARRY_LO/HI,
+    # SE_CMP, SE_OP_EQ/NE/LT/GT/LE/GE) plus 9 cells of padding so
+    # d_model stays divisible by n_heads=8 (920/8=115). Written by a
+    # new L9 attention head (``layer9_step_end_operand_relay``) that
+    # mirrors the raw ALU/CARRY/CMP/OP bands at MARK_AX into the
+    # SE-row tagged dims. Consumed by the migrated L9 CMP rules so
+    # they can fire at MARK_SE_ONLY without the broadcast regression
+    # of the L11 relay (10ca51a7, enable=False). See dim_registry.py
+    # for the full design rationale.
+    a = Allocator(d_model=920)
 
     def pin(name, start, size, desc, semantics=None, alias=False):
         # Tiny wrapper that mirrors the (name, start, size, desc, semantics)
@@ -689,6 +701,54 @@ def build_default_registry_dynamic() -> DimRegistry:
         "mark == SE")
     pin("SE_REG_MEM_PRESENT", 836, 1,
         "MARK_MEM presence broadcast to MARK_SE within current step",
+        "mark == SE")
+
+    # ------------------------------------------------------------------
+    # Register-tagged STEP_END operand relay slots (2026-06-10).
+    # ------------------------------------------------------------------
+    # Written by ``make_layer9_step_end_operand_relay_op``: a fresh L9
+    # attention head whose Q gates on MARK_SE_ONLY, K matches the
+    # same-step MARK_AX, and V/O mirrors raw ALU_LO/HI / AX_CARRY_LO/HI
+    # / CMP / OP_<cmp> into the SE_-prefixed slots below. Consumed by
+    # the migrated L9 CMP rules (``_layer9_cmp_rules``) so the rules
+    # can fire at MARK_SE_ONLY without polluting the raw bands that
+    # downstream readers (BZ/BNZ predicate gate, LI/LC, memory ops)
+    # consume at MARK_AX. See ``dim_registry.py`` for the design note.
+    pin("SE_ALU_LO", 837, 16,
+        "ALU_LO mirrored at MARK_SE_ONLY for STEP_END compute",
+        "mark == SE")
+    pin("SE_ALU_HI", 853, 16,
+        "ALU_HI mirrored at MARK_SE_ONLY for STEP_END compute",
+        "mark == SE")
+    pin("SE_AX_CARRY_LO", 869, 16,
+        "AX_CARRY_LO mirrored at MARK_SE_ONLY for STEP_END compute",
+        "mark == SE")
+    pin("SE_AX_CARRY_HI", 885, 16,
+        "AX_CARRY_HI mirrored at MARK_SE_ONLY for STEP_END compute",
+        "mark == SE")
+    pin("SE_CMP", 901, 4,
+        "CMP cascade mirrored at MARK_SE_ONLY for STEP_END compute",
+        "mark == SE")
+    pin("SE_OP_EQ", 905, 1,
+        "OP_EQ opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+        "mark == SE")
+    pin("SE_OP_NE", 906, 1,
+        "OP_NE opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+        "mark == SE")
+    pin("SE_OP_LT", 907, 1,
+        "OP_LT opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+        "mark == SE")
+    pin("SE_OP_GT", 908, 1,
+        "OP_GT opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+        "mark == SE")
+    pin("SE_OP_LE", 909, 1,
+        "OP_LE opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+        "mark == SE")
+    pin("SE_OP_GE", 910, 1,
+        "OP_GE opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+        "mark == SE")
+    pin("SE_CMP_GROUP", 911, 1,
+        "CMP_GROUP mirrored at MARK_SE_ONLY (gate for SE-row CMP rules)",
         "mark == SE")
 
     reg = a.to_registry()

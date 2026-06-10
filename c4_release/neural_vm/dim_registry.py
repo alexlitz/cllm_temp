@@ -502,7 +502,25 @@ def build_default_registry() -> DimRegistry:
     # Written by the new L1 within-step broadcast head (head 6,
     # ``layer1_threshold_attn.step_end_reg_present``).
     # See docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
-    a = Allocator(d_model=840)
+    #
+    # Register-tagged STEP_END operand relay (2026-06-10 Wave A v2):
+    # d_model further expanded 840 -> 920 to carry the SE-row operand
+    # mirror dims written by ``layer9_step_end_operand_relay``:
+    #   * SE_ALU_LO / SE_ALU_HI            (16 each = 32 dims) at 837..868
+    #   * SE_AX_CARRY_LO / SE_AX_CARRY_HI  (16 each = 32 dims) at 869..900
+    #   * SE_CMP                           (4 dims) at 901..904
+    #   * SE_OP_EQ / NE / LT / GT / LE / GE (1 each = 6 dims) at 905..910
+    # Positions 911..919 are reserved padding so d_model stays divisible
+    # by n_heads=8 (920 / 8 = 115). The new SE_-prefixed family is the
+    # register-tagged sister to the raw ALU_LO/HI/CARRY bands at MARK_AX:
+    # downstream consumers that need operand values at the STEP_END row
+    # read SE_ALU_LO/HI/CARRY/CMP/OP_* instead of raw ALU_LO/HI to avoid
+    # the broadcast regression observed when the L11 relay
+    # (``make_layer11_step_end_operand_relay_op``, enable=False) wrote
+    # raw ALU_LO/HI at MARK_SE and clobbered register-identity-dependent
+    # readers. See ``docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md``
+    # and memory note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+    a = Allocator(d_model=920)
 
     def _pin(name, start, size, desc, semantics=None, alias=False):
         """Thin wrapper that mirrors ``DimRegistry.alloc``'s signature so
@@ -1259,6 +1277,58 @@ def build_default_registry() -> DimRegistry:
               semantics="mark == SE")
     _pin("SE_REG_MEM_PRESENT", 836, 1,
               "MARK_MEM presence broadcast to MARK_SE within current step",
+              semantics="mark == SE")
+
+    # ------------------------------------------------------------------
+    # Register-tagged STEP_END operand relay slots (2026-06-10, L9
+    # ``layer9_step_end_operand_relay`` attention head). These mirror
+    # the raw ALU_LO/HI / AX_CARRY_LO/HI / CMP / OP_<cmp> bands at the
+    # MARK_AX row into MARK_SE-only dims so the migrated L9 CMP
+    # rules (and any future STEP_END-gated readers) can sample the
+    # operand state at the SE row without colliding with downstream
+    # readers of the raw bands. The L11 step_end_operand_relay
+    # (10ca51a7, enable=False) demonstrated that broadcasting raw
+    # ALU_LO/HI at MARK_SE regresses 9 tests because the downstream
+    # cross-step KV-cache lookups and register-identity-dependent
+    # readers see the relayed value as if it lived at MARK_AX.
+    # Writing into SE_-prefixed slots (semantics ``mark == SE_ONLY``)
+    # keeps the relay scoped to the SE row.
+    # ------------------------------------------------------------------
+    _pin("SE_ALU_LO", 837, 16,
+              "ALU_LO mirrored at MARK_SE_ONLY for STEP_END compute",
+              semantics="mark == SE")
+    _pin("SE_ALU_HI", 853, 16,
+              "ALU_HI mirrored at MARK_SE_ONLY for STEP_END compute",
+              semantics="mark == SE")
+    _pin("SE_AX_CARRY_LO", 869, 16,
+              "AX_CARRY_LO mirrored at MARK_SE_ONLY for STEP_END compute",
+              semantics="mark == SE")
+    _pin("SE_AX_CARRY_HI", 885, 16,
+              "AX_CARRY_HI mirrored at MARK_SE_ONLY for STEP_END compute",
+              semantics="mark == SE")
+    _pin("SE_CMP", 901, 4,
+              "CMP cascade mirrored at MARK_SE_ONLY for STEP_END compute",
+              semantics="mark == SE")
+    _pin("SE_OP_EQ", 905, 1,
+              "OP_EQ opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+              semantics="mark == SE")
+    _pin("SE_OP_NE", 906, 1,
+              "OP_NE opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+              semantics="mark == SE")
+    _pin("SE_OP_LT", 907, 1,
+              "OP_LT opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+              semantics="mark == SE")
+    _pin("SE_OP_GT", 908, 1,
+              "OP_GT opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+              semantics="mark == SE")
+    _pin("SE_OP_LE", 909, 1,
+              "OP_LE opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+              semantics="mark == SE")
+    _pin("SE_OP_GE", 910, 1,
+              "OP_GE opcode flag mirrored at MARK_SE_ONLY (CMP dispatch)",
+              semantics="mark == SE")
+    _pin("SE_CMP_GROUP", 911, 1,
+              "CMP_GROUP mirrored at MARK_SE_ONLY (gate for SE-row CMP rules)",
               semantics="mark == SE")
 
     reg = a.to_registry()

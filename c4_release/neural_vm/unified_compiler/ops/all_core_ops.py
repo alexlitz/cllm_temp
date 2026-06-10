@@ -222,6 +222,18 @@ def all_core_ops(
         # so existing tests are byte-identical. See l9_ops.py docstring
         # for the full design and slope-tuning analysis.
         make_layer9_alibi_mem_attn_op(enable=False),
+        # Wave A v2 (2026-06-10): register-tagged STEP_END operand
+        # relay. Two declarative attn heads in L9 attn that mirror raw
+        # ALU_LO/HI / AX_CARRY_LO/HI / CMP / OP_<cmp> from MARK_AX to
+        # the SE_-tagged dims at MARK_SE_ONLY. Fires BEFORE L9 FFN so
+        # the migrated L9 CMP rules (commit 62b64449, MARK_SE_ONLY
+        # gated) have the operand state at the SE row. Replaces the
+        # disabled L11 step_end_operand_relay (10ca51a7, enable=False)
+        # which both (i) fired too late and (ii) collapsed register
+        # identity by writing raw ALU_LO/HI at MARK_SE. See
+        # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md and memory
+        # note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
+        make_layer9_step_end_operand_relay_op(),
         # Convo-I/O L9 attn bake (phase=9.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. Fires regardless of
         # alu_mode; runs AFTER the L9 LEV bakes (phase 9.0/9.1) since the
