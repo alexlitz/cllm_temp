@@ -54,6 +54,10 @@ jobs:
         run: |
           pytest tests/test_smoke.py -v --tb=short || true
 
+      - name: Run dim-alias verifier (smoke)
+        run: |
+          pytest tests/test_dim_alias_verifier.py -v --tb=short
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
