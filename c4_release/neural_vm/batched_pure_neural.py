@@ -1774,27 +1774,10 @@ class BatchedPureNeuralRunner:
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
             s.output.append(chr(neural_ax & 0xFF))
 
-        # GETCHAR: runner-side stdin injection. We have to overwrite REG_AX
-        # bytes in the just-completed step.
-        if exec_op == Opcode.GETCHAR:
-            byte_val = -1
-            if s.stdin_pos < len(s.stdin_buffer):
-                byte_val = ord(s.stdin_buffer[s.stdin_pos]) & 0xFF
-                s.stdin_pos += 1
-            else:
-                byte_val = 0xFFFFFFFF
-            self._override_register_in_last_step(s.context, Token.REG_AX, byte_val)
-            s.last_ax = byte_val
-
-        if exec_op in (Opcode.LI, Opcode.LC):
-            section = s.mem_history.get(int(prev_ax) & 0xFFFFFFFF)
-            if section is not None:
-                width = 1 if exec_op == Opcode.LC else 4
-                loaded = 0
-                for j in range(width):
-                    loaded |= (int(section[5 + j]) & 0xFF) << (j * 8)
-                self._override_register_in_last_step(s.context, Token.REG_AX, loaded)
-                s.last_ax = loaded
+        # GETCHAR / LI / LC Python overrides REMOVED (2026-06-09).
+        # They used `_override_register_in_last_step` + shadow `mem_history`
+        # to mask broken L14/L15 neural memory emission. Neural ops must
+        # produce correct outputs without runner help.
 
         # PRTF / OPEN / CLOS / READ defer-to-serial REMOVED (Wave B,
         # 2026-06-09). The serial `_neural_prtf_emit`/`_neural_open_emit`/
