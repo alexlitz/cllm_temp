@@ -13,6 +13,27 @@ from .shared import (  # noqa: F401
 )
 
 
+# Wave B Cluster 3: operand dims that the Wave A step_end_operand_relay
+# broadcasts from MARK_AX into MARK_SE_ONLY for the L9 CMP factory.
+# After the relay the CMP factory's MARK_AX-gated rules can fire one
+# row later (at STEP_END) byte-identically.
+_L9_CMP_RELAYED: tuple[str, ...] = (
+    "CMP",
+    "ALU_LO", "ALU_HI",
+    "AX_CARRY_LO", "AX_CARRY_HI",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+)
+
+# Wave B Cluster 3 row 5: the LEV BP+8 shift gates on MARK_PC (not
+# MARK_AX). Wave A relays the LEV opcode flag and the address-byte
+# carriers into MARK_SE_ONLY; the helper extension swaps MARK_PC for
+# MARK_SE_ONLY when called with from_marker="MARK_PC".
+_L9_BP_PLUS8_RELAYED: tuple[str, ...] = (
+    "BP_FRAME_BYTE0", "BP_FRAME_BYTE1",
+    "OP_ENT", "OP_LEV",
+)
+
+
 # === L9 attention-head layout (pinned indices) ======================
 #
 # Three migrated ops claim heads on the L9 attention block today:
@@ -499,12 +520,24 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     # takes the explicit threshold=2.5 (the default derivation requires all
     # positive weights and would not pass the negative MARK_PC blocker).
 
+    # Wave B Cluster 3 rows 1-4: the CMP factory's 4-way AND now fires
+    # at MARK_SE_ONLY (STEP_END) instead of MARK_AX. Wave A's
+    # ``step_end_operand_relay`` broadcasts CMP / ALU_LO/HI /
+    # AX_CARRY_LO/HI / OP_<cmp> from the AX row into STEP_END, so the
+    # rule fires one row later byte-identically. The MARK_PC negative
+    # blocker is retained: it was there to guard against MARK_AX leak
+    # at the PC marker row; at STEP_END the dim is zero (different
+    # row) and the term is structurally inert but preserves the AND
+    # threshold arithmetic. See ``step_end_migration.py`` for the
+    # helper and ``WAVE_B_CLUSTER_3_PLAN_2026_06_10.md`` for the
+    # migration recipe.
+
     # hi_eq: 16 units -> CMP+1
     for k in range(16):
         rules.append(multi_way_and_rule(
-            name=f"l9_cmp_hi_eq_{k}",
+            name=f"l9_cmp_hi_eq_{k}_step_end",
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("MARK_PC", -2.0),
                 (f"ALU_HI+{k}", 1.0),
                 (f"AX_CARRY_HI+{k}", 1.0),
@@ -517,9 +550,9 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     # lo_eq: 16 units -> CMP+2
     for k in range(16):
         rules.append(multi_way_and_rule(
-            name=f"l9_cmp_lo_eq_{k}",
+            name=f"l9_cmp_lo_eq_{k}_step_end",
             conditions=(
-                ("MARK_AX", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("MARK_PC", -2.0),
                 (f"ALU_LO+{k}", 1.0),
                 (f"AX_CARRY_LO+{k}", 1.0),
@@ -533,9 +566,9 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     for a in range(16):
         for b in range(a + 1, 16):
             rules.append(multi_way_and_rule(
-                name=f"l9_cmp_hi_lt_a{a}_b{b}",
+                name=f"l9_cmp_hi_lt_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -2.0),
                     (f"ALU_HI+{a}", 1.0),
                     (f"AX_CARRY_HI+{b}", 1.0),
@@ -549,9 +582,9 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     for a in range(16):
         for b in range(a + 1, 16):
             rules.append(multi_way_and_rule(
-                name=f"l9_cmp_lo_lt_a{a}_b{b}",
+                name=f"l9_cmp_lo_lt_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -2.0),
                     (f"ALU_LO+{a}", 1.0),
                     (f"AX_CARRY_LO+{b}", 1.0),
@@ -560,6 +593,11 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 gate=gate_cmp_group,
                 writes=((cmp_byte3, 2.0 / S),),
             ))
+
+    # ``_L9_CMP_RELAYED`` documents the Wave A dims this factory depends
+    # on; the constant is read by audit tooling / future relay
+    # validators.
+    _ = _L9_CMP_RELAYED
 
     return tuple(rules)
 
@@ -766,13 +804,20 @@ def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
     LEV.
     """
 
+    # Wave B Cluster 3 row 5: this rule originally gated on MARK_PC
+    # (not MARK_AX); after Wave A relays OP_LEV / BP_FRAME_* into
+    # STEP_END the same shift fires one row later at MARK_SE_ONLY
+    # byte-identically. The MARK_BP / MARK_SP blockers are retained
+    # for structural symmetry (the dims are zero at STEP_END so they
+    # contribute nothing to the AND). See
+    # ``WAVE_B_CLUSTER_3_PLAN_2026_06_10.md`` for the recipe.
     rules: list[FFNRule] = []
     for k in range(16):
         new_k = (k + 8) % 16
         rules.append(multi_way_and_rule(
-            name=f"l9_bp_plus8_shift_{k}",
+            name=f"l9_bp_plus8_shift_{k}_step_end",
             conditions=(
-                ("MARK_PC", 1.0),
+                ("MARK_SE_ONLY", 1.0),
                 ("OP_LEV", 1.0 / 5.0),
                 ("MARK_BP", -10.0),
                 ("MARK_SP", -10.0),
@@ -786,6 +831,9 @@ def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"ADDR_B0_LO+{new_k}", 0.67 / S),
             ),
         ))
+    # ``_L9_BP_PLUS8_RELAYED`` documents the Wave A dims this factory
+    # depends on; read by audit tooling / future relay validators.
+    _ = _L9_BP_PLUS8_RELAYED
     return tuple(rules)
 
 

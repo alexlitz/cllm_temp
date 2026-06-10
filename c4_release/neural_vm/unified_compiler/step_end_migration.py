@@ -101,21 +101,29 @@ class MigrationSafetyError(ValueError):
 # ---------------------------------------------------------------------------
 
 
-def _rewrite_condition(term: ConditionTerm) -> ConditionTerm:
-    """Return a copy of ``term`` with ``MARK_AX`` rewritten to
+def _rewrite_condition(
+    term: ConditionTerm, *, from_marker: str = MARK_AX_NAME,
+) -> ConditionTerm:
+    """Return a copy of ``term`` with ``from_marker`` rewritten to
     ``MARK_SE_ONLY``. Other conditions are unchanged.
+
+    ``from_marker`` defaults to ``MARK_AX``. Wave B Cluster 3 row 5
+    (``_layer9_bp_plus8_shift_rules``) gates on ``MARK_PC`` instead;
+    callers pass ``from_marker="MARK_PC"`` for that case.
     """
 
     dim = term.dim
-    if dim.name == MARK_AX_NAME:
+    if dim.name == from_marker:
         new_dim = DimRef(name=MARK_SE_NAME, offset=dim.offset)
         return dataclasses.replace(term, dim=new_dim)
     return term
 
 
-def _rewrite_scope(scope: Optional[str]) -> Optional[str]:
+def _rewrite_scope(
+    scope: Optional[str], *, from_marker: str = MARK_AX_NAME,
+) -> Optional[str]:
     """Update predicate-DSL ``scope`` strings to reference
-    ``MARK_SE_ONLY`` where they previously referenced ``MARK_AX``.
+    ``MARK_SE_ONLY`` where they previously referenced ``from_marker``.
 
     The scope language is a simple AND/NOT of dim names; word-boundary
     substitution is faithful as long as the dim names are word-isolated
@@ -124,7 +132,7 @@ def _rewrite_scope(scope: Optional[str]) -> Optional[str]:
 
     if scope is None:
         return None
-    return re.sub(r"\bMARK_AX\b", MARK_SE_NAME, scope)
+    return re.sub(rf"\b{re.escape(from_marker)}\b", MARK_SE_NAME, scope)
 
 
 def _names_of_writes(writes: Iterable[WriteTerm]) -> Tuple[str, ...]:
@@ -140,13 +148,16 @@ def assert_migration_safe(
     rule: FFNRule,
     *,
     allow_step_end_writes_to: Iterable[str] = (),
+    from_marker: str = MARK_AX_NAME,
 ) -> None:
     """Validate that ``rule`` can be safely migrated to STEP_END.
 
     The check is structural and conservative:
 
-    * The rule must already gate on ``MARK_AX`` in at least one
-      condition (otherwise migration is a no-op or a category error).
+    * The rule must already gate on ``from_marker`` (default
+      ``MARK_AX``) in at least one condition (otherwise migration is a
+      no-op or a category error). Wave B Cluster 3 row 5 passes
+      ``from_marker="MARK_PC"`` for the LEV BP+8 shift rules.
     * No write may target a byte-emission slot
       (``OUTPUT_LO`` / ``OUTPUT_HI*``). Those slots are read only at
       per-byte rows; writing them at STEP_END drops the byte.
@@ -162,12 +173,12 @@ def assert_migration_safe(
     function is otherwise side-effect free.
     """
 
-    has_mark_ax = any(
-        term.dim.name == MARK_AX_NAME for term in rule.conditions
+    has_source_marker = any(
+        term.dim.name == from_marker for term in rule.conditions
     )
-    if not has_mark_ax:
+    if not has_source_marker:
         raise MigrationSafetyError(
-            f"rule {rule.name!r}: no MARK_AX condition to migrate"
+            f"rule {rule.name!r}: no {from_marker} condition to migrate"
         )
 
     allow = frozenset(allow_step_end_writes_to)
@@ -202,15 +213,16 @@ def migrate_rule_to_step_end(
     relayed_dims: Iterable[str] = (),
     safety_check: bool = True,
     allow_step_end_writes_to: Iterable[str] = (),
+    from_marker: str = MARK_AX_NAME,
 ) -> FFNRule:
     """Return a copy of ``rule`` gated on ``MARK_SE_ONLY`` instead of
-    ``MARK_AX``.
+    ``from_marker`` (default ``MARK_AX``).
 
     Parameters
     ----------
     rule:
         Source FFN rule whose conditions include at least one
-        ``MARK_AX`` term. Writes / threshold / gate are carried over
+        ``from_marker`` term. Writes / threshold / gate are carried over
         unchanged.
     relayed_dims:
         Names of operand dims that the Wave A relay broadcasts from
@@ -224,19 +236,26 @@ def migrate_rule_to_step_end(
         and propagate any :class:`MigrationSafetyError`.
     allow_step_end_writes_to:
         Forwarded to :func:`assert_migration_safe`.
+    from_marker:
+        Source marker dim to swap. Defaults to ``MARK_AX``. Wave B
+        Cluster 3 row 5 (``_layer9_bp_plus8_shift_rules``) gates on
+        ``MARK_PC`` instead of ``MARK_AX`` and passes
+        ``from_marker="MARK_PC"``. The helper assumes Wave A relays
+        the position marker into ``MARK_SE_ONLY`` either way.
 
     Returns
     -------
     FFNRule
-        A new rule with every ``MARK_AX`` condition rewritten and the
-        ``scope`` annotation refreshed. ``name`` is augmented with a
-        ``_step_end`` suffix so the verifier can tell the rules apart.
+        A new rule with every ``from_marker`` condition rewritten and
+        the ``scope`` annotation refreshed. ``name`` is augmented with
+        a ``_step_end`` suffix so the verifier can tell the rules apart.
     """
 
     if safety_check:
         assert_migration_safe(
             rule,
             allow_step_end_writes_to=allow_step_end_writes_to,
+            from_marker=from_marker,
         )
 
     # ``relayed_dims`` is accepted (and stored on the closure) for
@@ -245,8 +264,14 @@ def migrate_rule_to_step_end(
     # symbolic names stable across the AX -> SE row boundary.
     _ = frozenset(relayed_dims)
 
-    new_conditions = tuple(_rewrite_condition(c) for c in rule.conditions)
-    new_gate_terms = tuple(_rewrite_condition(c) for c in rule.gate_terms)
+    new_conditions = tuple(
+        _rewrite_condition(c, from_marker=from_marker)
+        for c in rule.conditions
+    )
+    new_gate_terms = tuple(
+        _rewrite_condition(c, from_marker=from_marker)
+        for c in rule.gate_terms
+    )
 
     new_name: Optional[str]
     if rule.name is not None and not rule.name.endswith("_step_end"):
@@ -254,11 +279,14 @@ def migrate_rule_to_step_end(
     else:
         new_name = rule.name
 
-    new_scope = _rewrite_scope(rule.scope)
+    new_scope = _rewrite_scope(rule.scope, from_marker=from_marker)
     new_dominates_at = (
         None
         if rule.dominates_at is None
-        else {k: _rewrite_scope(v) for k, v in rule.dominates_at.items()}
+        else {
+            k: _rewrite_scope(v, from_marker=from_marker)
+            for k, v in rule.dominates_at.items()
+        }
     )
 
     return dataclasses.replace(

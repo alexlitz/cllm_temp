@@ -160,7 +160,7 @@ _BASELINE: Dict[str, int] = {
     "c4_release/neural_vm/unified_compiler/ops/l3_ops.py": 4,
     "c4_release/neural_vm/unified_compiler/ops/l6_ops.py": 2,
     "c4_release/neural_vm/unified_compiler/ops/l8_ops.py": 14,
-    "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 5,
+    "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 0,
 }
 
 
