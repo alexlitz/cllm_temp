@@ -2162,6 +2162,32 @@ class AutoregressiveVMRunner:
         else:
             self._track_memory_write(context, op)
 
+        # ==================================================================
+        # WAVE C BEGIN: handler-mode VM-semantic blocks (PSH/JSR/ENT/LEV/
+        # JMP/BZ/BNZ/ADJ/BINARY_POP_OPS/LI/LC/SI/SC + LEA below). All gated
+        # by the `if self.pure_neural: ... return` early-exit at the top of
+        # this method (~line 2066); these never fire on the pure_neural path.
+        #
+        # Status (verified 2026-06-09 — VANILLA_RESTORE_INVENTORY Wave C
+        # audit): proven still-needed. 17 handler-mode test files under
+        # c4_release/tests/ (test_lev_comprehensive, test_jmp_neural,
+        # test_memory_neural, test_bz_bnz_neural, test_control_flow_neural,
+        # test_arithmetic_no_handlers, test_neural_handler_parity,
+        # test_complex_programs, test_jsr_neural_status, ...) construct
+        # runners via `AutoregressiveVMRunner()` (default `pure_neural=False`)
+        # and exercise every opcode covered below. Deletion will break those
+        # tests. Smoke (test_smoke.py / test_smoke_pure_neural.py) is
+        # unaffected — both use pure_neural fixtures.
+        #
+        # Removal sequencing: per VANILLA_RESTORE_INVENTORY_2026_06_09.md the
+        # strategy is to migrate every remaining handler-mode test to the
+        # pure_neural fixture (paired with the upstream neural-bug blockers
+        # listed per-block below), then drop this entire block + the LEA
+        # block + the `_pc` mirror in one cut. Do NOT delete piecemeal —
+        # the per-block blockers are interlinked (e.g. ENT establishes BP
+        # that LEA reads; LEV restores PC that JMP/BZ/BNZ rely on; PSH
+        # decrement feeds BINARY_POP_OPS' stack-pop).
+        # ==================================================================
         if 0 <= exec_idx < len(bytecode):
             if exec_op == Opcode.PSH:
                 # TODO(phase-2): remove once neural-side PSH SP decrement +
@@ -2332,6 +2358,9 @@ class AutoregressiveVMRunner:
             alu_result = (self._last_bp + imm) & 0xFFFFFFFF
             self._last_ax = alu_result
             self._override_register_in_last_step(context, Token.REG_AX, alu_result)
+        # ==================================================================
+        # WAVE C END.
+        # ==================================================================
 
         # Wave A removal (2026-06-09, df50a8c9): PC mirror block
         # (#59) deleted. Observation-only mirror of REG_PC into

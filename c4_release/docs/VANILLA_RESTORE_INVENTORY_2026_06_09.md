@@ -142,6 +142,31 @@ These only fire when `pure_neural=False`. Strategy: deprecate the
 non-pure-neural path entirely once every smoke test runs under
 pure_neural.
 
+**2026-06-09 audit result:** all Wave C blocks (C1-C9) are PROVEN
+STILL-NEEDED. No tests pass `pure_neural=False` explicitly, but
+`AutoregressiveVMRunner()` defaults to `pure_neural=False`, and 17 test
+files under `c4_release/tests/` construct the runner that way:
+test_lev_comprehensive, test_complex_programs, test_benchmarks,
+test_jmp_neural, test_memory_neural, test_conversational_io_comprehensive,
+test_jsr_neural_status, test_property_based, test_dual_weight_modes,
+test_bz_bnz_neural, test_autoregressive_kv_cache, test_control_flow_neural,
+test_arithmetic_no_handlers, test_neural_handler_parity, test_ent_lev_neural,
+verify_adj, trace_ent. Per-opcode coverage grep confirms every Wave C
+opcode (PSH/JSR/ENT/LEV/JMP/BZ/BNZ/ADJ/LI/LC/SI/SC/LEA + BINARY_POP_OPS:
+ADD/SUB/MUL/DIV/MOD/OR/XOR/AND/SHL/SHR/EQ/NE/LT/GT/LE/GE) is
+exercised. Helper utilities C8 (`_track_memory_write`, `_extract_mem_write`,
+`_mem_store_word`, `_mem_load_word`) and C9 (`_read_stack_arg`) are also
+called by the Wave B pure_neural IO shims (`_neural_prtf_emit`,
+`_handle_skipped_io_op`, `_neural_open_emit`, `_neural_clos_emit`,
+`_neural_read_emit`) so they cannot be retired before Wave B lands.
+The dispatch block is now framed by explicit `WAVE C BEGIN` / `WAVE C END`
+banners in `run_vm.py` so future cleanup can excise it as a single unit
+once the handler-mode tests are migrated to the pure_neural fixture.
+Smoke baseline (`CUDA_VISIBLE_DEVICES=1 pytest
+c4_release/tests/test_smoke.py --tb=no -q`) remains 46 passed / 5 failed
+(the 5 SI/LI/SC/LC memory tests are pre-existing — see
+`project_l15_li_stack0_byte_attribution`).
+
 C1. **#1 `_compute_alu_legacy`** — retire once C2 + D6/D7 land.
 C2. **#10 BINARY_POP_OPS** runner block. Blocker: L9/L10 ALU multi-byte
     writeback (Removals #2+#3 in RUNNER_OVERRIDE_REMOVAL_PLAN).
