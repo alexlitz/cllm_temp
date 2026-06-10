@@ -385,9 +385,11 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
         for b in range(16):
             result = (a + b) % 16
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_add_lo_a{a}_b{b}",
+                name=f"l8_alu_add_lo_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -4.0),
                     (f"ALU_LO+{a}", 1.0),
                     (f"AX_CARRY_LO+{b}", 1.0),
@@ -395,9 +397,9 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=2.5,
                 gate=gate_add,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_AX and OP_ADD",
+                scope="MARK_SE_ONLY and OP_ADD",
                 dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ADD",
+                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_ADD",
                 },
             ))
     return tuple(rules)
@@ -423,9 +425,11 @@ def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
         for b in range(16):
             result = (a + b) % 16
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_lea_lo_a{a}_b{b}",
+                name=f"l8_alu_lea_lo_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 60.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 60.0),
                     *blockers,
                     (f"ALU_LO+{a}", 1.0),
                     (f"FETCH_LO+{b}", 20.0),
@@ -433,9 +437,9 @@ def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=80.5,
                 gate=gate_lea,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_AX and OP_LEA",
+                scope="MARK_SE_ONLY and OP_LEA",
                 dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_AX and OP_LEA",
+                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_LEA",
                 },
             ))
     return tuple(rules)
@@ -457,9 +461,11 @@ def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
         for b in range(16):
             result = (a - b) % 16
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_sub_lo_a{a}_b{b}",
+                name=f"l8_alu_sub_lo_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -4.0),
                     (f"ALU_LO+{a}", 1.0),
                     (f"AX_CARRY_LO+{b}", 1.0),
@@ -467,9 +473,9 @@ def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=2.5,
                 gate=gate_sub,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_AX and OP_SUB",
+                scope="MARK_SE_ONLY and OP_SUB",
                 dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_AX and OP_SUB",
+                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_SUB",
                 },
             ))
     return tuple(rules)
@@ -501,9 +507,11 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
             if a + b < 16:
                 continue
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_add_carry_a{a}_b{b}",
+                name=f"l8_alu_add_carry_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -4.0),
                     (f"ALU_LO+{a}", 1.0),
                     (f"AX_CARRY_LO+{b}", 1.0),
@@ -511,8 +519,8 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=2.5,
                 gate=gate_add,
                 writes=((carry_byte0, carry_scale),),
-                scope="MARK_AX and OP_ADD",
-                dominates_at={carry_byte0: "MARK_AX and OP_ADD"},
+                scope="MARK_SE_ONLY and OP_ADD",
+                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_ADD"},
             ))
     return tuple(rules)
 
@@ -540,9 +548,11 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
             if a + b < 16:
                 continue
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_lea_carry_a{a}_b{b}",
+                name=f"l8_alu_lea_carry_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 60.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 60.0),
                     *blockers,
                     (f"ALU_LO+{a}", 1.0),
                     (f"FETCH_LO+{b}", 20.0),
@@ -550,8 +560,8 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=80.5,
                 gate=gate_lea,
                 writes=((carry_byte0, carry_scale),),
-                scope="MARK_AX and OP_LEA",
-                dominates_at={carry_byte0: "MARK_AX and OP_LEA"},
+                scope="MARK_SE_ONLY and OP_LEA",
+                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_LEA"},
             ))
     return tuple(rules)
 
@@ -575,9 +585,11 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
         for b in range(16):
             result = (a + b) % 16
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_adj_lo_a{a}_b{b}",
+                name=f"l8_alu_adj_lo_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 60.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 60.0),
                     *blockers,
                     (f"ALU_LO+{a}", 1.0),
                     (f"FETCH_LO+{b}", 20.0),
@@ -585,9 +597,9 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=85.0,
                 gate=gate_adj_lo,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_AX and OP_ADJ",
+                scope="MARK_SE_ONLY and OP_ADJ",
                 dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ADJ",
+                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_ADJ",
                 },
             ))
     return tuple(rules)
@@ -614,9 +626,11 @@ def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
             if a + b < 16:
                 continue
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_adj_carry_a{a}_b{b}",
+                name=f"l8_alu_adj_carry_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 60.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 60.0),
                     *blockers,
                     (f"ALU_LO+{a}", 1.0),
                     (f"FETCH_LO+{b}", 20.0),
@@ -624,8 +638,8 @@ def _layer8_alu_adj_carry_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=85.0,
                 gate=gate_adj,
                 writes=((carry_byte0, carry_scale),),
-                scope="MARK_AX and OP_ADJ",
-                dominates_at={carry_byte0: "MARK_AX and OP_ADJ"},
+                scope="MARK_SE_ONLY and OP_ADJ",
+                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_ADJ"},
             ))
     return tuple(rules)
 
@@ -651,9 +665,11 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
             if a >= b:
                 continue
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_sub_borrow_a{a}_b{b}",
+                name=f"l8_alu_sub_borrow_a{a}_b{b}_step_end",
                 conditions=(
-                    ("MARK_AX", 1.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 1.0),
                     ("MARK_PC", -4.0),
                     (f"ALU_LO+{a}", 1.0),
                     (f"AX_CARRY_LO+{b}", 1.0),
@@ -661,8 +677,8 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=2.5,
                 gate=gate_sub,
                 writes=((carry_byte0, carry_scale),),
-                scope="MARK_AX and OP_SUB",
-                dominates_at={carry_byte0: "MARK_AX and OP_SUB"},
+                scope="MARK_SE_ONLY and OP_SUB",
+                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_SUB"},
             ))
     return tuple(rules)
 
@@ -686,9 +702,11 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
             effective_b = (8 + imm_lo) % 16
             result = (sp_lo - effective_b) % 16
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_ent_lo_sp{sp_lo}_imm{imm_lo}",
+                name=f"l8_alu_ent_lo_sp{sp_lo}_imm{imm_lo}_step_end",
                 conditions=(
-                    ("MARK_AX", 60.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 60.0),
                     *blockers,
                     (f"ALU_LO+{sp_lo}", 1.0),
                     (f"FETCH_LO+{imm_lo}", 20.0),
@@ -696,9 +714,9 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=85.0,
                 gate=gate_ent_lo,
                 writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_AX and OP_ENT",
+                scope="MARK_SE_ONLY and OP_ENT",
                 dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_AX and OP_ENT",
+                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_ENT",
                 },
             ))
     return tuple(rules)
@@ -726,9 +744,11 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
             if not (sp_lo < (full_sum % 16) or full_sum >= 16):
                 continue
             rules.append(multi_way_and_rule(
-                name=f"l8_alu_ent_borrow_sp{sp_lo}_imm{imm_lo}",
+                name=f"l8_alu_ent_borrow_sp{sp_lo}_imm{imm_lo}_step_end",
                 conditions=(
-                    ("MARK_AX", 60.0),
+                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                    # the Wave A step_end_operand_relay (10ca51a7).
+                    ("MARK_SE_ONLY", 60.0),
                     *blockers,
                     (f"ALU_LO+{sp_lo}", 1.0),
                     (f"FETCH_LO+{imm_lo}", 20.0),
@@ -736,8 +756,8 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=85.0,
                 gate=gate_ent,
                 writes=((carry_byte0, carry_scale),),
-                scope="MARK_AX and OP_ENT",
-                dominates_at={carry_byte0: "MARK_AX and OP_ENT"},
+                scope="MARK_SE_ONLY and OP_ENT",
+                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_ENT"},
             ))
     return tuple(rules)
 
@@ -753,7 +773,7 @@ def _layer8_alu_cmp_group_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / (S * 9.0)
     return (
         multi_way_and_rule(
-            name="l8_alu_cmp_group",
+            name="l8_alu_cmp_group_step_end",
             conditions=(
                 ("OP_EQ", 1.0),
                 ("OP_NE", 1.0),
@@ -761,14 +781,16 @@ def _layer8_alu_cmp_group_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OP_GT", 1.0),
                 ("OP_LE", 1.0),
                 ("OP_GE", 1.0),
-                ("MARK_AX", 1.0),
+                # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
+                # the Wave A step_end_operand_relay (10ca51a7).
+                ("MARK_SE_ONLY", 1.0),
             ),
             threshold=1.5,
             writes=(("CMP_GROUP+0", write_scale),),
-            scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            scope="MARK_SE_ONLY and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
             dominates_at={
                 "CMP_GROUP+0":
-                    "MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+                    "MARK_SE_ONLY and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
             },
         ),
     )
@@ -796,20 +818,23 @@ def _layer8_alu_cmp_clear_rules(S: float) -> tuple[FFNRule, ...]:
     current CMP cell being negated, used as an up-branch operand).
     """
     write_scale = -2.0 / (S * S)
-    gate_mark_ax = dim_ref("marker", "AX")
+    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under the Wave A
+    # step_end_operand_relay (10ca51a7). The gate dim now resolves to
+    # MARK_SE_ONLY so the CMP clearing fires at STEP_END.
+    gate_mark_se = dim_ref("marker", "SE_ONLY")
     rules = []
     for k in range(4):
         cmp_k = dim_ref("cmp_flag", "cascade", k)
         rules.append(multi_way_and_rule(
-            name=f"l8_alu_cmp_clear_k{k}",
+            name=f"l8_alu_cmp_clear_k{k}_step_end",
             conditions=((f"CMP+{k}", 1.0),),
             threshold=0.0,
-            gate=gate_mark_ax,
+            gate=gate_mark_se,
             gate_weight=S,
             gate_bias=-S * 0.5,
             writes=((cmp_k, write_scale),),
-            scope="MARK_AX",
-            dominates_at={f"CMP+{k}": "MARK_AX"},
+            scope="MARK_SE_ONLY",
+            dominates_at={f"CMP+{k}": "MARK_SE_ONLY"},
         ))
     return tuple(rules)
 
@@ -925,16 +950,20 @@ def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / (S * 9.0)
     return (
         multi_way_and_rule(
-            name="l8_alu_lev_b1",
+            name="l8_alu_lev_b1_step_end",
             conditions=(
                 ("OP_LEV", 1.0),
-                ("MARK_BP", 1.0),
+                # Wave B Cluster 2: MARK_BP -> MARK_SE_ONLY under the
+                # Wave A step_end_operand_relay (10ca51a7). The relay
+                # broadcasts OP_LEV / BP_FRAME_* into MARK_SE_ONLY so
+                # the same SwiGLU AND fires at STEP_END.
+                ("MARK_SE_ONLY", 1.0),
             ),
             threshold=1.5,
             gate="CONST",
             writes=(("ADDR_B1_LO+0", write_scale),),
-            scope="OP_LEV and MARK_BP",
-            dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_BP"},
+            scope="OP_LEV and MARK_SE_ONLY",
+            dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_SE_ONLY"},
         ),
     )
 
@@ -950,16 +979,20 @@ def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / (S * 9.0)
     return (
         multi_way_and_rule(
-            name="l8_alu_lev_b2",
+            name="l8_alu_lev_b2_step_end",
             conditions=(
                 ("OP_LEV", 1.0),
-                ("MARK_BP", 1.0),
+                # Wave B Cluster 2: MARK_BP -> MARK_SE_ONLY under the
+                # Wave A step_end_operand_relay (10ca51a7). The relay
+                # broadcasts OP_LEV / BP_FRAME_* into MARK_SE_ONLY so
+                # the same SwiGLU AND fires at STEP_END.
+                ("MARK_SE_ONLY", 1.0),
             ),
             threshold=1.5,
             gate="CONST",
             writes=(("ADDR_B2_LO+0", write_scale),),
-            scope="OP_LEV and MARK_BP",
-            dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_BP"},
+            scope="OP_LEV and MARK_SE_ONLY",
+            dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_SE_ONLY"},
         ),
     )
 
