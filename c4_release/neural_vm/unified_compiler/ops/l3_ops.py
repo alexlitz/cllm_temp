@@ -255,16 +255,25 @@ def _layer3_ffn_rules(S: float) -> tuple:
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
+    # Wave B Cluster 5 (2026-06-10): inline ``dim_ref("byte_index", "1")``
+    # call instead of subscripting ``_BYTE_INDEX[1]``. Byte-identical
+    # (both resolve to the same ``"BYTE_INDEX_1+0"`` string), but the
+    # static-AST lint (tools/lint_position_role.py) can now resolve the
+    # ``BYTE_INDEX_1`` token through ``_resolve_dim_ref_call`` and stop
+    # flagging the HAS_SE-gated TOKEN_EMIT rule as missing a byte-index
+    # marker. See docs/WAVE_B_CLUSTER_5_PLAN_2026_06_10.md (Option A).
     rules.append(multi_way_and_rule(
         name="layer3_ffn.sp_byte_1_first_step_lo",
-        conditions=((f"H1+{_SP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
+        conditions=((f"H1+{_SP_I}", 1.0),
+                    (dim_ref("byte_index", "1"), 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_LO+1", 2.0 / S),),
     ))
     rules.append(multi_way_and_rule(
         name="layer3_ffn.sp_byte_1_first_step_hi",
-        conditions=((f"H1+{_SP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
+        conditions=((f"H1+{_SP_I}", 1.0),
+                    (dim_ref("byte_index", "1"), 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_HI+0", 2.0 / S),),
@@ -300,16 +309,24 @@ def _layer3_ffn_rules(S: float) -> tuple:
             threshold=1.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
+    # Wave B Cluster 5 (2026-06-10): inline ``dim_ref("byte_index", "1")``
+    # call instead of subscripting ``_BYTE_INDEX[1]``. Byte-identical
+    # (both resolve to the same ``"BYTE_INDEX_1+0"`` string), but the
+    # static-AST lint can now resolve ``BYTE_INDEX_1`` through
+    # ``_resolve_dim_ref_call``. Mirrors the SP-byte-1 first-step pair
+    # above. See docs/WAVE_B_CLUSTER_5_PLAN_2026_06_10.md (Option A).
     rules.append(multi_way_and_rule(
         name="layer3_ffn.bp_byte_1_first_step_lo",
-        conditions=((f"H1+{_BP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
+        conditions=((f"H1+{_BP_I}", 1.0),
+                    (dim_ref("byte_index", "1"), 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_LO+1", 2.0 / S),),
     ))
     rules.append(multi_way_and_rule(
         name="layer3_ffn.bp_byte_1_first_step_hi",
-        conditions=((f"H1+{_BP_I}", 1.0), (_BYTE_INDEX[1], 1.0),
+        conditions=((f"H1+{_BP_I}", 1.0),
+                    (dim_ref("byte_index", "1"), 1.0),
                     ("HAS_SE", -1.0)),
         threshold=1.5,
         writes=(("OUTPUT_HI+0", 2.0 / S),),

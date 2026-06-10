@@ -1749,17 +1749,25 @@ def _layer6_tail_cleanup_rules(S: float) -> tuple[FFNRule, ...]:
             gate_weight=-1.0,
             writes=((dim_name, 2.0 / S),),
         ))
+    # Wave B Cluster 5 (2026-06-10): position marker migrated from
+    # ``MARK_AX`` to ``MARK_SE_ONLY``. The ALU clear constants are
+    # ungated, unconditional writes of ``-10.0/S`` into ``ALU_{LO,HI}+k``
+    # — they don't depend on any relayed operand state, only on the
+    # row carrying a step-end marker. STEP_END is the architectural
+    # home for compute-band cleanup since the ALU compute itself now
+    # fires at ``MARK_SE_ONLY`` (cluster 4 migrations of L11/L12 MUL).
+    # See docs/WAVE_B_CLUSTER_5_PLAN_2026_06_10.md.
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l6_alu_lo_clear_{k}",
-            conditions=(("MARK_AX", 1.0),),
+            conditions=(("MARK_SE_ONLY", 1.0),),
             threshold=0.5,
             writes=((f"ALU_LO+{k}", -10.0 / S),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l6_alu_hi_clear_{k}",
-            conditions=(("MARK_AX", 1.0),),
+            conditions=(("MARK_SE_ONLY", 1.0),),
             threshold=0.5,
             writes=((f"ALU_HI+{k}", -10.0 / S),),
         ))
