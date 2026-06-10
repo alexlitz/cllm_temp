@@ -1348,20 +1348,9 @@ class AutoregressiveVMRunner:
                 break
 
             pos_in_step = i % Token.STEP_TOKENS
-            # FIX 2026-05-09: In pure_neural mode, do NOT force STEP_END at position 34.
-            # The model must predict step boundaries on its own. Other modes still force
-            # for backward compatibility with non-neural step sequencing.
-            #
-            # CLASSIFICATION (2026-05-11):
-            #   REMOVABLE-NOW — Phase 1 confirms pure_neural emits
-            #   STEP_END at the correct position. Handler-mode keeps the
-            #   forced rewrite for legacy bakes that didn't train the
-            #   step-boundary emit. Becomes dead code once handler-mode
-            #   retires.
-            if not self.pure_neural:
-                if pos_in_step == Token.STEP_TOKENS - 1 and next_token not in (Token.STEP_END, Token.HALT, Token.TOOL_CALL):
-                    context[-1] = Token.STEP_END
-                    next_token = Token.STEP_END
+            # Wave A removal (2026-06-09, df50a8c9): forced STEP_END
+            # rewrite at pos 34 (#56) deleted. Pure forward-pass — the
+            # model emits the step boundary itself.
 
             # Debug: Print step progress
             if self._debug_ent or self._debug_lev:
@@ -1395,56 +1384,13 @@ class AutoregressiveVMRunner:
                     output.append(chr(next_token & 0xFF))
                     continue
 
-            # Hybrid conversational I/O: handle THINKING_END
-            if self.conversational_io and next_token == Token.THINKING_END:
-                exec_pc = self._exec_pc()
-                # Extract format string pointer from STACK0 (model output)
-                fmt_ptr = self._extract_register(context, Token.STACK0)
-                # FALLBACK: If model outputs 0, read from shadow memory at SP
-                # The format string pointer was pushed to stack before PRTF
-                if not fmt_ptr:
-                    fmt_ptr = self._mem_load_word(self._last_sp)
-                    print(f"[HYBRID] Format ptr from shadow memory at SP=0x{self._last_sp:08x}: 0x{fmt_ptr:08x}")
-                else:
-                    print(f"[HYBRID] Format string pointer: 0x{fmt_ptr:08x}")
-                if fmt_ptr:
-                    # Read format string from memory
-                    fmt_str = []
-                    addr = fmt_ptr
-                    while len(fmt_str) < 256:  # Safety limit
-                        byte_val = self._memory.get(addr, 0)
-                        if byte_val == 0:  # Null terminator
-                            break
-                        fmt_str.append(byte_val)
-                        addr += 1
-
-                    # Emit output bytes (literal string for now, no format specifiers)
-                    print(f"[HYBRID] Format string: {bytes(fmt_str)}")
-                    for byte_val in fmt_str:
-                        context.append(byte_val)
-                        output.append(chr(byte_val))  # Convert to char for output buffer
-
-                    # Emit THINKING_START to resume execution
-                    context.append(Token.THINKING_START)
-
-                    # Calculate post-PRTF state:
-                    # - PC advances to next instruction
-                    # - SP pops the format string pointer argument
-                    new_pc = exec_pc + INSTR_WIDTH
-                    new_sp = (self._last_sp + 8) & 0xFFFFFFFF
-                    stack0_val = self._mem_load_word(new_sp) if new_sp else 0
-
-                    # Inject synthetic step with correct state
-                    self._inject_synthetic_step(
-                        context, new_pc, self._last_ax, new_sp, self._last_bp, stack0_val
-                    )
-
-                    # Update runner state
-                    self._last_pc = new_pc
-                    self._last_sp = new_sp
-
-                    print(f"[HYBRID] Emitted {len(fmt_str)} bytes + THINKING_START + synthetic step (PC=0x{new_pc:04x}, SP=0x{new_sp:08x})")
-                continue
+            # Wave A removal (2026-06-09, df50a8c9): hybrid
+            # conversational-IO THINKING_END branch (#38) + synthetic-
+            # step injection (#39) deleted. The Python format-string
+            # walk + synthetic 35-token step was a cheat. PRTF must
+            # come through the neural THINK protocol bake chain
+            # (l6_ops.py:4387 prtf_think_protocol). Until that bake
+            # lands, conversational_io=True is unsupported.
 
             if next_token == Token.STEP_END:
                 if step_num < 3:
@@ -1569,19 +1515,10 @@ class AutoregressiveVMRunner:
 
             # Halt detection
             if next_token == Token.HALT:
-                # FIX 2026-05-09: In pure_neural mode, do NOT override REG_AX.
-                # The model's emitted bytes ARE the result; result extraction
-                # reads them directly via _decode_exit_code().
-                #
-                # CLASSIFICATION (2026-05-11):
-                #   REMOVABLE-NOW — Phase 1 PC tests confirm pure_neural
-                #   emits AX bytes directly at the HALT point, so the
-                #   _last_ax override is redundant. The handler-mode path
-                #   re-asserts `_last_ax` which is just the Python-tracked
-                #   shadow of what the model has already emitted.
-                if not self.pure_neural:
-                    # Preserve final AX value before exiting
-                    self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+                # Wave A removal (2026-06-09, df50a8c9): handler-mode
+                # REG_AX re-assert at HALT (#58) deleted. The model's
+                # emitted bytes are the result; _decode_exit_code reads
+                # them directly.
                 self._pure_attention_report["halted"] = True
                 break
 
@@ -2396,13 +2333,11 @@ class AutoregressiveVMRunner:
             self._last_ax = alu_result
             self._override_register_in_last_step(context, Token.REG_AX, alu_result)
 
-        # REMOVABLE-NOW (Phase 1): mirror the model's emitted PC into
-        # `_last_pc` for ops that don't have explicit PC handling above.
-        # This is observation, not override — but kept here for consistency.
-        if exec_op not in (Opcode.ENT, Opcode.LEV, Opcode.JMP, Opcode.BZ, Opcode.BNZ, Opcode.JSR):
-            pc = self._extract_register(context, Token.REG_PC)
-            if pc is not None:
-                self._last_pc = pc
+        # Wave A removal (2026-06-09, df50a8c9): PC mirror block
+        # (#59) deleted. Observation-only mirror of REG_PC into
+        # `_last_pc` was kept "for consistency" with handler-mode
+        # JMP/BZ/BNZ overrides; those overrides remain in Wave C, but
+        # the mirror itself is not load-bearing for pure_neural.
 
         # MoE routing is tensor-native (see neural_vm.pure_moe.StandardMoEFFN);
         # no per-step weight swap is needed between forward calls.
@@ -2415,7 +2350,9 @@ class AutoregressiveVMRunner:
         # the dynamic context. Per BLOG_SPEC.md line 3.
 
         if exec_op == Opcode.EXIT:
-            self._override_register_in_last_step(context, Token.REG_AX, self._last_ax)
+            # Wave A removal (2026-06-09, df50a8c9): EXIT REG_AX
+            # re-assert (#16) deleted. The model emits AX bytes
+            # directly at EXIT; downstream extraction reads them.
             return True
 
         return False
@@ -3017,39 +2954,11 @@ class AutoregressiveVMRunner:
                     context[i + 1 + j] = (value >> (j * 8)) & 0xFF
                 return
 
-    def _inject_synthetic_step(self, context, pc, ax, sp, bp, stack0=0):
-        """Inject a complete synthetic step into context.
-
-        Used after PRTF handling to resume execution with correct state.
-        Format: [REG_PC, b0..b3, REG_AX, b0..b3, REG_SP, b0..b3,
-                 REG_BP, b0..b3, STACK0, b0..b3, MEM, b0..b8, STEP_END]
-        """
-        # PC: 5 tokens
-        context.append(Token.REG_PC)
-        for i in range(4):
-            context.append((pc >> (i * 8)) & 0xFF)
-        # AX: 5 tokens
-        context.append(Token.REG_AX)
-        for i in range(4):
-            context.append((ax >> (i * 8)) & 0xFF)
-        # SP: 5 tokens
-        context.append(Token.REG_SP)
-        for i in range(4):
-            context.append((sp >> (i * 8)) & 0xFF)
-        # BP: 5 tokens
-        context.append(Token.REG_BP)
-        for i in range(4):
-            context.append((bp >> (i * 8)) & 0xFF)
-        # STACK0: 5 tokens
-        context.append(Token.STACK0)
-        for i in range(4):
-            context.append((stack0 >> (i * 8)) & 0xFF)
-        # MEM: 9 tokens (marker + 8 bytes, all zeros for no-op)
-        context.append(Token.MEM)
-        for _ in range(8):
-            context.append(0)
-        # STEP_END
-        context.append(Token.STEP_END)
+    # Wave A removal (2026-06-09, df50a8c9): _inject_synthetic_step
+    # (#27) deleted. Was used only by the convo-IO THINKING_END
+    # branch to fabricate a 35-token step after Python-side PRTF
+    # handling. Conversational PRTF must flow through the neural
+    # THINK-protocol bake chain.
 
     def _extract_stack0(self, context):
         """Extract 32-bit STACK0 (*sp) value from the last completed step."""
