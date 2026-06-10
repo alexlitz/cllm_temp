@@ -6672,6 +6672,23 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_STACK0", -1000000.0),
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
+                # 2026-06-10 (project_si_li_16bit_block35_unit1242):
+                # the BYTE_INDEX_1 firing position above is the MEM val
+                # byte 1 row of a real multi-byte store (e.g.
+                # ``test_si_li_16bit_value`` stores 0x1234 -> 0x12 at
+                # val_b1). L14 head 5 correctly predicts 0x12 there, but
+                # this exact-byte-guarantee bank otherwise fires and
+                # overwrites the prediction with 0x00 (an "addr byte 2 is
+                # zero" inference that's only valid at *address* byte
+                # positions, not at MEM val byte positions). MEM_VAL_B0..3
+                # are L2-owned one-hot markers at the four MEM val byte
+                # rows; gating against them suppresses the rule at the
+                # MEM val rows while leaving the legitimate address-byte
+                # firing positions untouched.
+                ("MEM_VAL_B0", -1_000_000.0),
+                ("MEM_VAL_B1", -1_000_000.0),
+                ("MEM_VAL_B2", -1_000_000.0),
+                ("MEM_VAL_B3", -1_000_000.0),
             ),
             # B7-7: threshold raised from 35 to 140 so the structural-dim
             # evidence (ADDR_B2 lanes + ADDR_B0_VALID + IN_STEP_FRESH) is
