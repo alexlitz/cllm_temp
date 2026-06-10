@@ -786,69 +786,46 @@ def test_phase_in_step_fetch_vs_exec_suppresses_violation():
 def test_phase_in_step_unknown_rule_set_keeps_violation():
     """When a rule carries NO positive reference to a phase-scoped slot,
     its phase set is ``None`` (unknown) — the disjointness check must
-    NOT suppress (conservative)."""
+    NOT suppress (conservative).
+
+    Note (Improvement G, 2026-06-10 scattered-sweep): NEGATIVE-weight
+    references are blockers, not value reads — they are excluded from
+    both the alias-check read set AND the phase-set derivation. To
+    exercise "unknown phase" while still reading an aliased slot, we
+    use an aliased slot that is NOT in ``_SLOT_PHASE_OWNERS`` (so its
+    positive read does not pin a phase) but still shares a byte range
+    with FETCH_HI / DIV_STAGING.
+    """
     reg = _make_phase_aliasing_registry()
-    rule = FFNRule.constant_write(
-        conditions=(
-            ("IS_BYTE", 1.0),
-            ("BYTE_INDEX_0", 1.0),
-            # NO FETCH_HI / DIV_STAGING / phase-scoped reference here,
-            # yet the rule reads FETCH_HI (so the alias check runs).
-        ),
-        threshold=0.5,
-        writes=(("FETCH_HI+0", 1.0),),
-        name="no_phase_context",
+    # Add a non-phase-owned aliased slot at the same byte range
+    # (64..80) — the rule's positive read of this slot doesn't pin a
+    # phase, so the rule's phase set is None and disjointness must NOT
+    # suppress the aliasing of this slot with DIV_STAGING / FETCH_HI.
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["NON_PHASE_ALIAS"] = DimSlot(
+        name="NON_PHASE_ALIAS",
+        start=64, size=16,
+        desc="Aliased slot not tracked by _SLOT_PHASE_OWNERS",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
     )
-    # Force a read of the aliased slot via gate.
-    rule_with_read = FFNRule.constant_write(
-        conditions=(
-            ("IS_BYTE", 1.0),
-            ("BYTE_INDEX_0", 1.0),
-            ("MARK_AX", -1.0),  # admit byte rows (where DIV semantics applies)
-            ("FETCH_HI+5", 1.0),
-        ),
-        threshold=0.5,
-        writes=(("OUT", 1.0),),
-        name="reads_fetch_hi_in_phase_context",
-    )
-    # The variant we actually want for "unknown phase context": rule
-    # reads DIV_STAGING (aliased to FETCH_HI) without any phase-scoped
-    # positive reference.
-    rule_unknown = FFNRule.constant_write(
-        conditions=(
-            ("IS_BYTE", 1.0),
-            ("BYTE_INDEX_0", 1.0),
-            ("DIV_STAGING+5", 1.0),  # read the aliased slot, but no FETCH ref
-        ),
-        threshold=0.5,
-        writes=(("OUT", 1.0),),
-        name="reads_div_staging_no_phase_ctx",
-    )
-    op = _FakeOp([rule_unknown], name="op_no_phase_context")
-    violations = verify_dim_aliases(op, reg)
-    # DIV_STAGING is in _SLOT_PHASE_OWNERS, so the rule's positive
-    # DIV_STAGING reference DOES pin its phase set to {EXEC}. To exercise
-    # the "unknown" branch we need a rule whose positive references touch
-    # NEITHER side of the table — but it still reads an aliased slot.
-    # Use a rule that reads DIV_STAGING via a NEGATIVE reference (which
-    # we don't count) plus a positive non-phase-scoped reference:
     rule_truly_unknown = FFNRule.constant_write(
         conditions=(
             ("IS_BYTE", 1.0),
             ("BYTE_INDEX_0", 1.0),
-            ("DIV_STAGING+5", -10.0),  # NEGATIVE - not counted for phase
+            ("NON_PHASE_ALIAS+5", 1.0),  # positive read, no phase pin
         ),
         threshold=0.5,
         writes=(("OUT", 1.0),),
-        name="reads_div_staging_negative_only",
+        name="reads_non_phase_alias_unknown_phase_ctx",
     )
     op2 = _FakeOp([rule_truly_unknown], name="op_truly_no_phase_ctx")
     violations2 = verify_dim_aliases(op2, reg)
-    # The rule reads DIV_STAGING (alias of FETCH_HI). Phase set is None
-    # (no positive phase-scoped reference). Disjointness MUST not fire.
+    # The rule reads NON_PHASE_ALIAS (aliased to FETCH_HI / DIV_STAGING).
+    # Phase set is None (no positive phase-scoped reference). Phase
+    # disjointness MUST NOT suppress.
     assert any(
-        v.read_dim == "DIV_STAGING"
-        and v.conflicting_alias == "FETCH_HI"
+        v.read_dim == "NON_PHASE_ALIAS"
+        and v.conflicting_alias in {"FETCH_HI", "DIV_STAGING"}
         for v in violations2
     ), (
         "Rule with unknown phase context must NOT be suppressed; "
@@ -891,3 +868,118 @@ def test_phase_in_step_overlapping_phases_do_not_suppress():
         "Same-phase pair (both FETCH/DECODE) must NOT be suppressed; "
         f"got {violations!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Scattered-sweep (2026-06-10) Improvements F, G, I tests
+# ---------------------------------------------------------------------------
+
+
+def test_partial_overlap_read_outside_overlap_byte_not_flagged():
+    """Improvement F: FETCH_HI (bytes 436..452) and IMM_STAGING
+    (bytes 448..464) share bytes 448..451 only. A rule reading
+    FETCH_HI+0 lands at physical byte 436 — outside IMM_STAGING's
+    range — no alias risk."""
+    reg = DimRegistry(d_model=512)
+    reg.alloc("MARK_PC", 0, 1, "PC marker", semantics="mark == PC")
+    reg.alloc(
+        "FETCH_HI", 436, 16, "fetch hi bus",
+        semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})",
+    )
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["IMM_STAGING"] = DimSlot(
+        name="IMM_STAGING", start=448, size=16,
+        desc="immediate staging (partial overlap with FETCH_HI)",
+        semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})",
+    )
+    reg.alloc("OUT", 200, 1, "out", semantics="mark == AX")
+    # Read at offset 0 -> byte 436 -> NOT inside IMM_STAGING [448, 464).
+    rule = FFNRule.constant_write(
+        conditions=(("MARK_PC", 1.0), ("FETCH_HI+0", 1.0)),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="fetch_hi_low_offset",
+    )
+    op = _FakeOp([rule], name="op_fetch_hi_low")
+    # No violation — read byte is outside the sibling's range.
+    assert verify_dim_aliases(op, reg) == []
+
+
+def test_negative_weight_read_is_skipped():
+    """Improvement G: A negative-weight reference is a blocker, not a
+    value read — it can only suppress firing, never cause incorrect
+    activation on the aliased value. Skip it."""
+    reg = _make_minimal_registry()
+    # Reads OPCODE_BYTE_LO+5 NEGATIVELY (blocker).
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("MARK_MEM", 1.0),
+            ("OPCODE_BYTE_LO+5", -100.0),  # blocker, not a value read
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="blocker_use_of_alias",
+    )
+    op = _FakeOp([rule], name="blocker_op")
+    # No violation: the negative-weight read is a guard, not a value read.
+    assert verify_dim_aliases(op, reg) == []
+
+
+def test_displaced_ambient_slot_suppresses_violation():
+    """Improvement I: A rule pinned to {PRTF} reading a slot whose
+    sibling is ambient AX_FULL_HI-style (always alive) but in the
+    ``_SLOT_DISPLACED_BY`` table with displacer ⊇ rule's opcode set
+    is suppressed. At PRTF rows the byte carries the displacer's
+    content, not the sibling's."""
+    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    reg = DimRegistry(d_model=128)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    # A slot pinned to PRTF (via static owner table entry below).
+    reg.alloc(
+        "LAST_WAS_THINKING_START_LIKE", 32, 1,
+        "PRTF-state-machine flag",
+        semantics="NOT is_byte",
+    )
+    # A wider ambient sibling that overlaps; semantics is opcode-
+    # agnostic but the displaced-by table marks it as overlaid at PRTF.
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["AX_FULL_HI_LIKE"] = DimSlot(
+        name="AX_FULL_HI_LIKE", start=24, size=16,
+        desc="ambient AX register hi nibble (PRTF-displaced)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    reg.alloc("OUT", 64, 1, "out", semantics="mark == AX")
+
+    saved_owner = _dav._SLOT_OPCODE_OWNERS.get(
+        "LAST_WAS_THINKING_START_LIKE"
+    )
+    saved_displ = _dav._SLOT_DISPLACED_BY.get("AX_FULL_HI_LIKE")
+    _dav._SLOT_OPCODE_OWNERS["LAST_WAS_THINKING_START_LIKE"] = \
+        frozenset({"PRTF"})
+    _dav._SLOT_DISPLACED_BY["AX_FULL_HI_LIKE"] = frozenset({"PRTF"})
+    try:
+        rule = FFNRule.constant_write(
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("LAST_WAS_THINKING_START_LIKE+0", 1.0),
+            ),
+            threshold=0.5,
+            writes=(("OUT", 1.0),),
+            name="prtf_reads_last_was_thinking_start",
+        )
+        op = _FakeOp([rule], name="op_displaced_ambient")
+        # Default: displaced-by suppresses the violation.
+        assert verify_dim_aliases(op, reg) == []
+    finally:
+        if saved_owner is None:
+            _dav._SLOT_OPCODE_OWNERS.pop(
+                "LAST_WAS_THINKING_START_LIKE", None,
+            )
+        else:
+            _dav._SLOT_OPCODE_OWNERS[
+                "LAST_WAS_THINKING_START_LIKE"
+            ] = saved_owner
+        if saved_displ is None:
+            _dav._SLOT_DISPLACED_BY.pop("AX_FULL_HI_LIKE", None)
+        else:
+            _dav._SLOT_DISPLACED_BY["AX_FULL_HI_LIKE"] = saved_displ

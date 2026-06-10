@@ -532,6 +532,42 @@ _SLOT_PHASE_OWNERS: Dict[str, frozenset[str]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Improvement I (2026-06-10, scattered-sweep): "displaced ambient slot"
+# ---------------------------------------------------------------------------
+#
+# Some "ambient" slots (AX_FULL_LO/HI, FORMAT_PTR_LO/HI, POST_PRTF_PC_LO/HI)
+# carry the AX register's bytes by default but are *displaced* under specific
+# opcodes by a different slot at the same byte range. The textbook case is
+# AX_FULL_LO/HI bytes 471..503 during PRTF/READ sub-phases: at those rows
+# the bytes carry FORMAT_PTR_* / POST_PRTF_PC_* values instead of AX. So a
+# rule whose opcode set is contained in the displacer's opcode set ({PRTF,
+# READ}) is reading the displacer's content, not AX_FULL's. The sibling
+# AX_FULL_* is therefore NOT the actual content at the rule's firing
+# position; the alias is design-time time-shared, not a real read bug.
+#
+# Map: ``slot_name -> set of opcodes that displace this slot``.
+# When evaluating an alias check where the SIBLING is in this table and the
+# rule's opcode set is a subset of the displacing-opcode set, suppress the
+# violation: the sibling's value is not actually present at the rule's
+# firing position.
+_SLOT_DISPLACED_BY: Dict[str, frozenset[str]] = {
+    # AX_FULL_{LO,HI} bytes 471..503 are displaced by FORMAT_PTR_* /
+    # POST_PRTF_PC_* during PRTF state-machine sub-phases. At PRTF rows
+    # the byte carries the displacer's value, not the AX register value.
+    "AX_FULL_LO": frozenset({"PRTF", "READ"}),
+    "AX_FULL_HI": frozenset({"PRTF", "READ"}),
+    # FORMAT_PTR_{LO,HI} is displaced by POST_PRTF_PC_* in the post-
+    # return sub-phase (same range, different PRTF sub-phase).
+    "FORMAT_PTR_LO": frozenset({"PRTF", "READ"}),
+    "FORMAT_PTR_HI": frozenset({"PRTF", "READ"}),
+    # POST_PRTF_PC_{LO,HI} is displaced by FORMAT_PTR_* in the format-
+    # string-fetch sub-phase. Symmetric with FORMAT_PTR_* above.
+    "POST_PRTF_PC_LO": frozenset({"PRTF", "READ"}),
+    "POST_PRTF_PC_HI": frozenset({"PRTF", "READ"}),
+}
+
+
 def _walk_atoms(p: Predicate, out: List[Atom]) -> None:
     """Append every leaf Atom node reachable from ``p`` into ``out``."""
     if isinstance(p, Atom):
@@ -953,6 +989,18 @@ def verify_dim_aliases(
             siblings = alias_index.get(dim_name, [])
             if not siblings:
                 continue
+            # Improvement F (2026-06-10, scattered-sweep): physical-byte
+            # filter. The alias index is slot-level (FETCH_HI [436..452)
+            # overlaps IMM_STAGING [448..464) on bytes 448..452 alone),
+            # but a rule reading ``FETCH_HI+0`` lands at physical byte
+            # 436, which is OUTSIDE IMM_STAGING's range — no possible
+            # alias collision. Skip any sibling whose byte range does
+            # not include the rule's physical read byte.
+            read_slot = registry.slots.get(dim_name)
+            read_byte = (
+                read_slot.start + dim_offset if read_slot is not None
+                else None
+            )
             # Improvement A (2026-06-10): skip the entire alias check
             # when EITHER the slot being read or its sibling carries a
             # tautological semantics (e.g. TEMP's umbrella
@@ -972,6 +1020,16 @@ def verify_dim_aliases(
                             registry, sibling, tautology_cache,
                         ):
                     continue
+                # Improvement F: per-byte alias filter. A sibling that
+                # does not cover the rule's actual physical read byte
+                # cannot supply the aliased value at the firing position.
+                if read_byte is not None:
+                    sib_slot = registry.slots.get(sibling)
+                    if sib_slot is not None and not (
+                        sib_slot.start <= read_byte
+                        < sib_slot.start + sib_slot.size
+                    ):
+                        continue
                 sibling_sem = _slot_semantics(registry, sibling)
                 if sibling_sem is None:
                     continue
@@ -1028,6 +1086,24 @@ def verify_dim_aliases(
                         sibling_phase_set is not None
                         and sibling_phase_set
                         and rule_phase_set.isdisjoint(sibling_phase_set)
+                    ):
+                        continue
+                # Improvement I (2026-06-10, scattered-sweep): "displaced
+                # ambient slot". If the SIBLING is in the
+                # ``_SLOT_DISPLACED_BY`` table and the rule's opcode set
+                # is contained in the displacing-opcode set, the
+                # sibling's content is overlaid by a different slot at
+                # the rule's firing position — the named sibling is NOT
+                # the actual byte content here. Suppress.
+                if (
+                    skip_opcode_in_step_disjoint
+                    and rule_opcode_set is not None
+                    and rule_opcode_set
+                ):
+                    displacer = _SLOT_DISPLACED_BY.get(sibling)
+                    if (
+                        displacer is not None
+                        and rule_opcode_set.issubset(displacer)
                     ):
                         continue
                 violations.append(
@@ -1133,15 +1209,34 @@ def _build_alias_index(registry: DimRegistry) -> Dict[str, List[str]]:
 
 def _collect_read_dim_refs(rule: FFNRule) -> List[Tuple[str, int]]:
     """Return ``[(dim_name, offset), ...]`` for every dim the rule
-    reads (conditions, gate_terms, and gate)."""
+    *reads as a positive activation signal* (conditions, gate_terms,
+    and gate).
+
+    Improvement G (2026-06-10, scattered-sweep): NEGATIVE-weight
+    condition / gate_term references are blockers, not value reads —
+    they can only push the sum BELOW the threshold (suppressing
+    firing), never above it. If the slot's value at the rule's firing
+    position is actually the aliased sibling's, a negative-weight read
+    still produces a suppressive contribution (or zero), so the rule
+    cannot mis-fire on the wrong value. Skip them.
+
+    Example: ``layer14_clear_addr_key_pollution`` lists
+    ``("MEM_VAL_B3", -100.0)`` as a blocker — at PRTF AX rows where the
+    slot carries ``IO_IS_PRTF`` instead, the rule still conservatively
+    under-fires (no incorrect activation).
+    """
     seen: set = set()
     out: List[Tuple[str, int]] = []
     for term in rule.conditions:
+        if term.weight <= 0:
+            continue
         key = (term.dim.name, term.dim.offset)
         if key not in seen:
             seen.add(key)
             out.append(key)
     for term in rule.gate_terms:
+        if term.weight <= 0:
+            continue
         key = (term.dim.name, term.dim.offset)
         if key not in seen:
             seen.add(key)
