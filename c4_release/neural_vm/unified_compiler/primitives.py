@@ -25,6 +25,7 @@ import torch
 from dataclasses import dataclass, field
 from typing import Iterable, List, Mapping, Optional, Tuple, Union
 from ..vm_step import _SetDim as BD
+from .ir import StepWindowConstraint
 
 
 @dataclass(frozen=True)
@@ -95,15 +96,20 @@ class DeclarativeAttentionHeadSpec:
     # head-index mapping. Lowering site:
     # ``Primitives.generate_attention_head(head_base=..., kv_head_base=...)``.
     head_dim: Optional[int] = None
-    # Phase 7.B.7 (AttentionIntent migration): optional declarative
-    # intent that captures the head's Q/K selection semantics. When
-    # set, :meth:`Primitives.generate_attention_head` runs
-    # :func:`verify_attention_intent` at bake time and raises if the
-    # intended K row does not dominate every plausible competitor.
-    # ``None`` (the default) leaves the spec byte-identical with every
-    # pre-7.B.7 baseline — heads that haven't been migrated continue
-    # to bake without intent-side verification.
-    intent: Optional["AttentionIntent"] = None
+    # Step-window scope (see :class:`StepWindowConstraint`). Declares
+    # which VM-step windows this head is intended to read from. The
+    # verifier (``verify_step_window_constraint``) cross-checks the
+    # declaration against the spec's ALiBi slope and K-side
+    # step-boundary suppressors to catch cross-window leaks (e.g. the
+    # L8 head 4 OP_IMM relay dilution that motivated commit b23f818c).
+    # Defaults to ``CURRENT_STEP_ONLY`` — the safer choice for
+    # compute-intent heads. Memory-lookup heads (L7 memory_heads, L15
+    # memory_lookup) must declare ``ANY_STEP`` explicitly because
+    # memory persistence across steps is by design. Heads left at the
+    # default that lack a slope/suppressor are flagged as VIOLATIONS;
+    # heads tagged ``ANY_STEP`` that look compute-intent are flagged
+    # as WARNINGS.
+    step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
 
     def effective_head_dim(self, default_HD: int) -> int:
         """Return per-head slot count: ``spec.head_dim`` or ``default_HD``.
@@ -651,7 +657,7 @@ def _inject_sink_k_row(
         alibi_slope=spec.alibi_slope,
         group_size=spec.group_size,
         head_dim=spec.head_dim,
-        intent=spec.intent,
+        step_window=spec.step_window,
     )
 
 

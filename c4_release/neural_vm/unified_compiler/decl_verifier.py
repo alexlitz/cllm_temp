@@ -57,7 +57,7 @@ import inspect
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -4063,3 +4063,298 @@ def collect_all_authored_ops() -> list:
             # competition info with whatever ops we do get.
             pass
     return ops
+
+
+# ---------------------------------------------------------------------------
+# Step-window constraint verifier
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StepWindowConstraintIssue:
+    """One classified step-window-constraint check result.
+
+    ``kind`` is one of:
+
+    * ``"violation"`` — declared ``CURRENT_STEP_ONLY`` but the head's
+      structure (no ALiBi slope, no K-side step-boundary suppressor)
+      cannot keep softmax mass within a 35-token window.
+    * ``"any_step_compute_warning"`` — declared ``ANY_STEP`` but the
+      head's V/O writes look compute-intent (no MEM marker source,
+      large relay weights). Compute-intent heads almost always want
+      ``CURRENT_STEP_ONLY``.
+    * ``"prev_step_ok_info"`` — declared ``PREV_STEP_OK``; recorded
+      for audit context only.
+    * ``"ok"`` — declaration consistent with structure.
+    """
+
+    kind: str
+    head_idx: int
+    declared: str
+    reason: str
+    alibi_slope: Optional[float] = None
+
+
+@dataclass
+class StepWindowConstraintReport:
+    """Result of :func:`verify_step_window_constraint` over a set of heads."""
+
+    issues: List[StepWindowConstraintIssue] = field(default_factory=list)
+    n_heads_checked: int = 0
+
+    def violations(self) -> List[StepWindowConstraintIssue]:
+        return [i for i in self.issues if i.kind == "violation"]
+
+    def warnings(self) -> List[StepWindowConstraintIssue]:
+        return [i for i in self.issues if i.kind == "any_step_compute_warning"]
+
+    def has_violations(self) -> bool:
+        return bool(self.violations())
+
+    def format(self) -> str:
+        lines = [
+            "=== Step-window-constraint report ===",
+            f"Heads checked: {self.n_heads_checked}",
+            f"Violations:    {len(self.violations())}",
+            f"Warnings:      {len(self.warnings())}",
+        ]
+        for issue in self.issues:
+            lines.append(
+                f"  [{issue.kind}] head={issue.head_idx} "
+                f"declared={issue.declared} "
+                f"slope={issue.alibi_slope!r} -- {issue.reason}"
+            )
+        return "\n".join(lines)
+
+
+# Heuristic threshold for "large relay weight" in the ANY_STEP
+# compute-intent check. Memory-lookup heads (L7/L15) write nibble-
+# scaled values (weight ~1.0); compute-relay heads (L8 op_imm_relay,
+# L9 ALU relays) push 20-50 magnitude relays through Q for the
+# softmax-1 anchor. The 5.0 cutoff sits comfortably between.
+_STEP_WINDOW_COMPUTE_WEIGHT_THRESHOLD = 5.0
+
+# Dim-name substrings that mark "this head reads memory" — used by
+# the ANY_STEP compute-intent heuristic. If any K-side projection
+# touches one of these dims, the head looks memory-shaped and the
+# warning is suppressed even with large relay weights.
+_STEP_WINDOW_MEMORY_DIM_HINTS = (
+    "MARK_MEM",
+    "MEM_DATA",
+    "ADDR_KEY",
+    "ADDR_B",
+    "MARK_STACK0",
+)
+
+
+def _has_step_boundary_suppressor(
+    spec,
+    dim_positions: Optional[Mapping[str, int]] = None,
+) -> bool:
+    """Return True iff the spec's K writes contain a negative read of
+    a step-boundary marker dim (MARK_SE_ONLY / MARK_CS / MARK_SE).
+
+    The verifier uses this to count an explicit K-side step-boundary
+    suppressor as a substitute for an ALiBi slope. When the residual-
+    dim ID is known (``dim_positions`` provided), we resolve dim IDs
+    back to names; otherwise we accept any negative K read because
+    dim resolution would require building a model.
+    """
+    from .ir import STEP_BOUNDARY_K_SUPPRESSOR_DIMS
+
+    if dim_positions:
+        # Build a reverse lookup once.
+        dim_to_name: Dict[int, str] = {}
+        for name, idx in dim_positions.items():
+            dim_to_name.setdefault(int(idx), name)
+        for k_write in getattr(spec, "k", ()):
+            if k_write.weight >= 0:
+                continue
+            name = dim_to_name.get(int(k_write.dim))
+            if name in STEP_BOUNDARY_K_SUPPRESSOR_DIMS:
+                return True
+        return False
+
+    # No dim_positions: we can't name-resolve, so fall back to "any
+    # negative K weight counts". This is a permissive check — heads
+    # without any negative K weight definitely lack a suppressor.
+    return any(
+        k_write.weight < 0
+        for k_write in getattr(spec, "k", ())
+    )
+
+
+def _looks_compute_intent(
+    spec,
+    dim_positions: Optional[Mapping[str, int]] = None,
+) -> bool:
+    """Heuristic: does this head look like compute relay (vs. memory)?
+
+    Memory-lookup heads (L7 memory_heads, L15 memory_lookup) read
+    from MARK_MEM / MARK_STACK0 / ADDR_KEY families with unit-weight
+    V projections. Compute-relay heads (L8 op_imm_relay, L9 ALU
+    relays) carry high-magnitude V/O weights and do not read from
+    memory markers. This heuristic is intentionally coarse — it's
+    only used for the ANY_STEP warning, never for the violation.
+    """
+
+    if dim_positions:
+        dim_to_name: Dict[int, str] = {}
+        for name, idx in dim_positions.items():
+            dim_to_name.setdefault(int(idx), name)
+        for k_write in getattr(spec, "k", ()):
+            name = dim_to_name.get(int(k_write.dim), "")
+            for hint in _STEP_WINDOW_MEMORY_DIM_HINTS:
+                if hint in name:
+                    return False
+
+    # Large relay weight => looks like compute.
+    max_weight = max(
+        (abs(w.weight) for w in list(spec.v) + list(spec.o)),
+        default=0.0,
+    )
+    return max_weight > _STEP_WINDOW_COMPUTE_WEIGHT_THRESHOLD
+
+
+def verify_step_window_constraint(
+    head_spec,
+    *,
+    dim_positions: Optional[Mapping[str, int]] = None,
+    min_alibi_slope: Optional[float] = None,
+) -> StepWindowConstraintIssue:
+    """Verify a single :class:`DeclarativeAttentionHeadSpec`'s step-window claim.
+
+    The check has three cases:
+
+    * ``CURRENT_STEP_ONLY``: the head must have ``alibi_slope`` >=
+      ``min_alibi_slope`` (default :data:`ir.STEP_WINDOW_MIN_ALIBI_SLOPE`),
+      OR carry a K-side step-boundary suppressor (negative read of
+      ``MARK_SE_ONLY`` / ``MARK_CS`` / ``MARK_SE``). Otherwise the
+      result is ``kind="violation"``.
+    * ``PREV_STEP_OK``: no structural constraint — recorded as
+      informational (``kind="prev_step_ok_info"``).
+    * ``ANY_STEP``: no slope/suppressor needed, but compute-intent
+      heads (no memory-marker K reads, large V/O weights) are flagged
+      with ``kind="any_step_compute_warning"``.
+
+    Args:
+        head_spec: a ``DeclarativeAttentionHeadSpec`` (or any object
+            exposing ``head_idx``, ``alibi_slope``, ``step_window``,
+            ``k``, ``v``, ``o``).
+        dim_positions: optional name -> residual-dim-id mapping used
+            for resolving K dim names against
+            :data:`ir.STEP_BOUNDARY_K_SUPPRESSOR_DIMS` and the memory-
+            marker heuristic. When omitted the check uses sign-only
+            fallbacks (negative K weight counts as a suppressor;
+            memory-shape heuristic always returns "compute").
+        min_alibi_slope: override threshold for the
+            ``CURRENT_STEP_ONLY`` decay check. Defaults to
+            :data:`ir.STEP_WINDOW_MIN_ALIBI_SLOPE`.
+
+    Returns:
+        A single :class:`StepWindowConstraintIssue`. ``kind="ok"`` if
+        the head's structure matches its declaration.
+    """
+
+    from .ir import (
+        StepWindowConstraint,
+        STEP_WINDOW_MIN_ALIBI_SLOPE,
+    )
+
+    if min_alibi_slope is None:
+        min_alibi_slope = STEP_WINDOW_MIN_ALIBI_SLOPE
+
+    declared: StepWindowConstraint = getattr(
+        head_spec, "step_window", StepWindowConstraint.CURRENT_STEP_ONLY
+    )
+    head_idx = int(getattr(head_spec, "head_idx", -1))
+    slope = getattr(head_spec, "alibi_slope", None)
+
+    if declared is StepWindowConstraint.CURRENT_STEP_ONLY:
+        slope_ok = slope is not None and float(slope) >= min_alibi_slope
+        suppressor_ok = _has_step_boundary_suppressor(head_spec, dim_positions)
+        if slope_ok or suppressor_ok:
+            reason_parts = []
+            if slope_ok:
+                reason_parts.append(f"alibi_slope={slope!r} >= {min_alibi_slope}")
+            if suppressor_ok:
+                reason_parts.append("K-side step-boundary suppressor present")
+            return StepWindowConstraintIssue(
+                kind="ok",
+                head_idx=head_idx,
+                declared=declared.name,
+                reason="; ".join(reason_parts) or "structure OK",
+                alibi_slope=slope,
+            )
+        return StepWindowConstraintIssue(
+            kind="violation",
+            head_idx=head_idx,
+            declared=declared.name,
+            reason=(
+                "CURRENT_STEP_ONLY head has neither an ALiBi slope >= "
+                f"{min_alibi_slope} (got {slope!r}) nor a K-side "
+                "step-boundary suppressor (negative read of "
+                "MARK_SE_ONLY/MARK_CS/MARK_SE); prior-step tokens of "
+                "the same marker class will dilute the relay"
+            ),
+            alibi_slope=slope,
+        )
+
+    if declared is StepWindowConstraint.PREV_STEP_OK:
+        return StepWindowConstraintIssue(
+            kind="prev_step_ok_info",
+            head_idx=head_idx,
+            declared=declared.name,
+            reason="prev-step reads permitted; no structural constraint checked",
+            alibi_slope=slope,
+        )
+
+    # ANY_STEP
+    if _looks_compute_intent(head_spec, dim_positions):
+        return StepWindowConstraintIssue(
+            kind="any_step_compute_warning",
+            head_idx=head_idx,
+            declared=declared.name,
+            reason=(
+                "ANY_STEP head looks compute-intent (no MEM-marker K reads, "
+                "large V/O relay weights); compute heads almost always want "
+                "CURRENT_STEP_ONLY"
+            ),
+            alibi_slope=slope,
+        )
+    return StepWindowConstraintIssue(
+        kind="ok",
+        head_idx=head_idx,
+        declared=declared.name,
+        reason="ANY_STEP head reads memory markers; no constraint",
+        alibi_slope=slope,
+    )
+
+
+def verify_step_window_constraints(
+    head_specs: Sequence,
+    *,
+    dim_positions: Optional[Mapping[str, int]] = None,
+    min_alibi_slope: Optional[float] = None,
+) -> StepWindowConstraintReport:
+    """Verify a batch of attention head specs and aggregate results.
+
+    Convenience wrapper around :func:`verify_step_window_constraint`
+    that collects per-head issues and surfaces only non-``ok``
+    findings (plus the ok count) in :class:`StepWindowConstraintReport`.
+    Pass ``dim_positions`` to enable name-aware step-boundary
+    suppressor checks and the compute-intent memory-marker heuristic.
+    """
+
+    report = StepWindowConstraintReport()
+    for spec in head_specs:
+        issue = verify_step_window_constraint(
+            spec,
+            dim_positions=dim_positions,
+            min_alibi_slope=min_alibi_slope,
+        )
+        report.n_heads_checked += 1
+        # Only retain non-trivial findings to keep the report focused.
+        if issue.kind != "ok":
+            report.issues.append(issue)
+    return report

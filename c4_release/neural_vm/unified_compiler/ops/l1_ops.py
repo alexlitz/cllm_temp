@@ -4,7 +4,7 @@ from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule
-from ..ir import CompilerIR, FFNRule
+from ..ir import CompilerIR, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -374,6 +374,11 @@ def make_layer1_threshold_attn_op() -> Operation:
                 k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
                 v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
                 o=(AO(proxy.HAS_SE, 1, 1.0),),
+                # ANY_STEP: HAS_SE is a global STEP_END existence flag —
+                # by design it fires across every prior step's SE marker
+                # (alibi_slopes[h_has_se] is pinned to 0.0 below to opt
+                # out of the L1-wide ALiBi decay).
+                step_window=StepWindowConstraint.ANY_STEP,
             ),
             HD,
         )
@@ -513,6 +518,11 @@ def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
         k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
         v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
         o=(AO(proxy.HAS_SE, 1, 1.0),),
+        # ANY_STEP: HAS_SE is a global STEP_END existence flag — fires
+        # across every prior step's SE marker (alibi_slopes[h_has_se]
+        # is pinned to 0.0 in the bake to opt out of the L1-wide
+        # ALiBi decay).
+        step_window=StepWindowConstraint.ANY_STEP,
     ))
     specs.extend(Primitives.threshold_attention_head_specs(
         [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[h_l1h4], bd=proxy,

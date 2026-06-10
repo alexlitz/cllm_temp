@@ -17,6 +17,7 @@ legacy bakes are SwiGLU AND-gates of the form:
 
 from __future__ import annotations
 
+import enum
 import math
 from dataclasses import dataclass, field
 from typing import (
@@ -37,6 +38,64 @@ if TYPE_CHECKING:
 
 
 _SILU_ONE_INPUT = 1.278464542761074
+
+
+class StepWindowConstraint(enum.Enum):
+    """Declares the VM-step window an attention head is allowed to read.
+
+    The autoregressive VM emits ``Token.STEP_TOKENS = 35`` tokens per
+    VM step (PC + AX + SP + BP + STACK0 + MEM + STEP_END). Compute is
+    expected to fire at STEP_END within a single step's window:
+    same-step compute reads same-step inputs, and memory persistence
+    across steps is the exception (LI/SI memory lookups, MEM relays).
+
+    Attention heads that mix tokens across multiple step windows
+    without an ALiBi recency slope or an explicit step-boundary
+    K-suppressor are vulnerable to cross-step dilution — the IMM
+    relay bug at L8 head 4 is the canonical example: prior-step
+    MARK_AX positions diluted the current step's relay below the
+    multibyte_routing threshold until commit b23f818c added
+    ``alibi_slope=0.5``.
+
+    Values:
+
+    * ``CURRENT_STEP_ONLY`` — head must only attend within its own
+      35-token window. The verifier expects an ALiBi slope >=
+      :data:`STEP_WINDOW_MIN_ALIBI_SLOPE` (so prior-step positions
+      decay below the softmax mass) or an explicit step-boundary
+      suppressor (a negative K weight on ``MARK_SE_ONLY`` /
+      ``MARK_CS``). This is the default for compute-intent heads.
+    * ``PREV_STEP_OK`` — head may attend to the immediately prior
+      step's tokens (e.g. cross-step register relays). Verifier
+      records this as informational; no slope requirement.
+    * ``ANY_STEP`` — head may attend across all prior steps with no
+      decay constraint. Used by memory-lookup heads (memory persists
+      across steps by design). The verifier still warns when an
+      ``ANY_STEP`` head looks compute-intent (heuristic: large relay
+      V/O weights with no MEM marker reads).
+    """
+
+    CURRENT_STEP_ONLY = "current_step_only"
+    PREV_STEP_OK = "prev_step_ok"
+    ANY_STEP = "any_step"
+
+
+# Minimum ALiBi slope considered "strong enough" to confine a head's
+# attention mass to the current 35-token step window. Derived from
+# Token.STEP_TOKENS=35 and the L8 op_imm_relay slope (0.5): at
+# distance 35 the decay term ``0.5 * 35 = 17.5`` exceeds the relay K
+# score gap (~30) enough that softmax mass on prior-step MARK_AX rows
+# falls below 1%. Heads with smaller slopes will be flagged unless
+# they carry a K-side step-boundary suppressor (read of MARK_SE_ONLY
+# or MARK_CS with a sufficiently negative weight).
+STEP_WINDOW_MIN_ALIBI_SLOPE = 0.5
+
+# Names of K-marker dims whose negative-weighted reads count as
+# explicit "step-boundary suppressor" structure for the verifier.
+# Reading any of these with a sufficiently negative weight pushes
+# prior-step (or program-start) tokens out of the softmax mass even
+# without an ALiBi slope.
+STEP_BOUNDARY_K_SUPPRESSOR_DIMS = ("MARK_SE_ONLY", "MARK_CS", "MARK_SE")
 
 
 @dataclass(frozen=True)

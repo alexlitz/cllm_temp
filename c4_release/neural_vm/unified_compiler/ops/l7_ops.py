@@ -2,7 +2,7 @@
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..ir import CompilerIR
+from ..ir import CompilerIR, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (  # noqa: F401
@@ -476,6 +476,13 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
                 AO(BD.OP_JSR, 3, 1.0),
                 AO(BD.OP_ENT, 4, 1.0),
             ),
+            # ANY_STEP: MEM flag broadcast reads the MEM marker (a
+            # memory-side cross-step persistence channel — MEM_STORE /
+            # MEM_ADDR_SRC are programmed by prior SI/LI steps and read
+            # by subsequent steps). Memory persistence across steps is
+            # explicit, so cross-window K-reads here are correct, not
+            # a leak.
+            step_window=StepWindowConstraint.ANY_STEP,
         )
     ]
 

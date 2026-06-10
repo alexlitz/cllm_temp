@@ -4,7 +4,7 @@ from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
-from ..ir import CompilerIR, FFNRule
+from ..ir import CompilerIR, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -2240,6 +2240,12 @@ def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         v=(AP(0, BD.OP_IMM, 1.0),),
         o=(AO(BD.OP_IMM, 0, 1.0),),
         alibi_slope=0.5,
+        # b23f818c: the ALiBi slope keeps OP_IMM relay mass on the
+        # CURRENT step's MARK_AX. CURRENT_STEP_ONLY makes this contract
+        # explicit so the verifier flags any future regression that
+        # drops the slope back to None (the pre-b23f818c IMM dilution
+        # bug) at decl-time rather than waiting for a smoke failure.
+        step_window=StepWindowConstraint.CURRENT_STEP_ONLY,
     )
 
 
