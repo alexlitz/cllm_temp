@@ -110,6 +110,10 @@ class DeclarativeAttentionHeadSpec:
     # heads tagged ``ANY_STEP`` that look compute-intent are flagged
     # as WARNINGS.
     step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
+    # AttentionIntent: optional declarative Q/K intent that the verifier
+    # uses at bake-time to catch K-selection bugs (L5/L8/L15 class).
+    # ``None`` = legacy path, no intent check.
+    intent: Optional["AttentionIntent"] = None
 
     def effective_head_dim(self, default_HD: int) -> int:
         """Return per-head slot count: ``spec.head_dim`` or ``default_HD``.
