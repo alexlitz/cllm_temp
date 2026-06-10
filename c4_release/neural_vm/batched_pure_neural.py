@@ -12,23 +12,18 @@ The serial pure-neural runner does:
         if next_token == HALT: break
 
 The batched version replaces ``model.generate_next`` with a single forward over
-the padded tensor ``[B, max_len]``. Each program keeps its own context, runner
-state (last_pc/ax/sp/bp, mem_history, etc.) and output buffer. Programs
-terminate independently: once a program emits HALT, its slot is no longer
-read out of the next forward pass, but it stays in the batch tensor (filled
-with HALT tokens) until all programs finish.
+the padded tensor ``[B, max_len]``. Each program keeps its own context, observed
+register tracking (last_pc/ax/sp/bp) and output buffer. Programs terminate
+independently: once a program emits HALT, its slot is no longer read out of the
+next forward pass, but it stays in the batch tensor (filled with HALT tokens)
+until all programs finish.
 
-Scope (Phase 1):
-    * Designed for tests that run with ``pure_neural=True, trust_neural_alu=True``
-      with NO Python overrides on syscalls or func-call handlers.
-    * Programs that use MEM-store ops (SI/SC/PSH/JSR/ENT) update each batch
-      element's ``_mem_history`` and rebuild contexts the same way the serial
-      runner does. The shared ``model.embed._mem_history_end`` is set to the
-      maximum across the active batch so historical MEM markers in any program
-      get MEM_STORE injection. (This is conservative; a batch with mixed
-      mem-store lengths may inject MEM_STORE flags onto a few padding-region
-      MEM tokens. For Phase 1/2/7 tests this is harmless because the active
-      programs are functionally homogeneous.)
+Pure forward-pass contract: the runner appends model-emitted tokens verbatim
+to each element's context and never re-writes register bytes from Python. The
+only Python-side semantics are: PUTCHAR byte append (tool-boundary side
+effect), EXIT halt detection, and a neural-authoritative "next instruction is
+EXIT" early stop. The neural model is the sole authority for AX/PC/SP/BP/STACK0
+and for every MEM section.
 
 Output equivalence:
     For each batch element, the produced ``(output_string, exit_code)`` must
@@ -49,7 +44,6 @@ from .embedding import Opcode
 from .constants import INSTR_WIDTH, PC_OFFSET
 from .run_vm import (
     AutoregressiveVMRunner,
-    _MEM_STORE_OPS,
 )
 from .speculative import DraftVM
 
@@ -118,12 +112,6 @@ _UNPREDICTED_BUCKET_KEY = "unpredicted"
 # would-be emission for any correct C4 program.
 _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
-# Step-relative offset of the MEM marker token inside the 35-token step layout
-# (PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5) -> MEM at index 25). Retained for
-# speculator step-offset arithmetic; ``_UNSAFE_OFFSETS`` covers the 8
-# addr/value bytes that follow.
-_MEM_MARKER_STEP_OFFSET = 25
-
 # Some opcodes are neural-authoritative in raw one-token decoding but are not
 # safe speculation boundaries yet. In particular, call-frame control changes
 # rewrite PC/SP/BP in ways where a long DraftVM continuation can poison the
@@ -162,30 +150,11 @@ class _ElementState:
     last_bp: int = 0x10000
 
     memory: dict = field(default_factory=dict)        # addr -> byte
-    mem_history: dict = field(default_factory=dict)   # addr -> 9-token MEM section
-    mem_access_order: list = field(default_factory=list)
-    mem_history_end: int = 0  # boundary in current context for MEM_STORE injection
 
     stdin_buffer: list = field(default_factory=list)
     stdin_pos: int = 0
 
     token_pos: int = 0  # number of tokens generated since context start
-    # Snapshot of ``last_ax`` after the most recent STEP_END dispatch.
-    # ``_decode_bail_exit_code`` falls back to this when no REG_AX appears
-    # after the snapshot position (e.g. the model collapsed before re-emitting
-    # the next step's register block).
-    last_step_end_ax: Optional[int] = None
-    # Absolute context position immediately after the most recent STEP_END
-    # token (i.e. the first token of the next step). Used at cap-hit time
-    # to scan forward for the in-progress step's REG_AX, which holds the
-    # architecturally-correct exit value when the model emitted IMM/
-    # EXIT-precursor correctly but then collapsed before STEP_END. Required
-    # for smoke ``and_basic`` / ``xor_basic`` (IMM operand with the high bit
-    # set drives the L15/L16 MEM_STORE-injection-sensitive heads to over-
-    # emit tokens past the architectural EXIT, so the trailing REG_AX
-    # ``_decode_exit_code`` finds is zeroed/truncated even though an
-    # earlier in-progress step had the correct value).
-    last_step_end_pos: int = 0
 
     # Speculative-decoding helper. `draft_vm` is a per-element DraftVM (Python
     # C4 interpreter) that emits the deterministic next-N tokens. Set when
@@ -1117,14 +1086,12 @@ class BatchedPureNeuralRunner:
                 max_context_window=max_context_window,
             )
 
-        # Build results. For programs that never emitted HALT, decode via
-        # ``_decode_bail_exit_code`` so we pick up the in-progress step's
-        # REG_AX when present (matches the smoke-driven semantics — see the
-        # helper's docstring for the IMM-operand-high-bit motivation).
+        # Build results. For programs that never emitted HALT, decode the
+        # last REG_AX from the context.
         results = []
         for s in states:
             if not s.halted:
-                s.exit_code = self._decode_bail_exit_code(s)
+                s.exit_code = self._decode_exit_code(s.context)
             results.append(("".join(s.output), s.exit_code))
         return results
 
@@ -1291,12 +1258,16 @@ class BatchedPureNeuralRunner:
             if not active_idx:
                 break
 
-            windowed = [
-                self._windowed_context(states[i], max_context_window)
-                for i in active_idx
-            ]
-            mh_end = max(s.mem_history_end for s in states)
-            self.model.embed.set_mem_history_end(mh_end)
+            # Pure forward: raw, untrimmed context per element. No
+            # mem-history windowing, no MEM_STORE-position re-tagging. The
+            # neural model attends over the actual emitted sequence.
+            windowed = [list(states[i].context) for i in active_idx]
+            if hasattr(self.model.embed, "set_mem_history_end"):
+                self.model.embed.set_mem_history_end(0)
+            if hasattr(self.model.embed, "set_mem_store_positions"):
+                self.model.embed.set_mem_store_positions(None)
+            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
+                self.model.embed.set_mem_addr_src_positions(None)
 
             # Each row only needs the argmax at ``real_len - 1`` (last real
             # token's logit predicts the next token). Pass per-row positions
@@ -1319,9 +1290,8 @@ class BatchedPureNeuralRunner:
     # ------------------------------------------------------------------
     # Speculative inner loop: DraftVM proposes K*35 tokens per element,
     # model verifies them in one batched forward pass, accepted prefix is
-    # replayed through ``_step_one`` (so STEP_END dispatch, mem_history
-    # rebuilds, EXIT halting all behave identically to the unspeculative
-    # path).
+    # replayed through ``_step_one`` (so STEP_END dispatch + EXIT halting
+    # behave identically to the unspeculative path).
     # ------------------------------------------------------------------
 
     def _run_speculative(
@@ -1372,11 +1342,13 @@ class BatchedPureNeuralRunner:
                 # is simpler and only costs at most 35 forwards per
                 # rejection event.
                 at_step_boundary = (s.token_pos % STEP == 0)
+                # Pick K for this element this iteration:
+                #   * Adaptive mode reads ``s.adaptive_k`` (updated below).
+                #   * Fixed mode uses the global ``spec_k``.
+                # Then cap by available context room: drafts append to the
+                # context, and the forward must fit under ``model_max_seq``.
                 base_k = s.adaptive_k if adaptive else spec_k
-                est_ctx_len = min(
-                    len(s.context),
-                    s.prefix_len + max_context_window,
-                )
+                est_ctx_len = len(s.context)
                 room_tokens = max(0, model_max_seq - est_ctx_len)
                 room_k = room_tokens // STEP
                 effective_k = max(0, min(base_k, room_k))
@@ -1413,18 +1385,22 @@ class BatchedPureNeuralRunner:
                 drafts.append(d)
                 per_elem_k.append(effective_k)
 
-            # 2) Build padded tensor: each active element gets windowed context
-            #    + its draft tokens appended. Padded to the max combined length.
+            # 2) Build padded tensor: each active element gets the raw context
+            #    + its draft tokens appended. No mem-history windowing.
             windowed_with_drafts = []
             real_prefix_lens = []  # len of context prefix per element (no draft)
             for k, i in enumerate(active_idx):
                 s = states[i]
-                ctx_win = self._windowed_context(s, max_context_window)
+                ctx_win = list(s.context)
                 real_prefix_lens.append(len(ctx_win))
                 windowed_with_drafts.append(ctx_win + drafts[k])
 
-            mh_end = max(s.mem_history_end for s in states)
-            self.model.embed.set_mem_history_end(mh_end)
+            if hasattr(self.model.embed, "set_mem_history_end"):
+                self.model.embed.set_mem_history_end(0)
+            if hasattr(self.model.embed, "set_mem_store_positions"):
+                self.model.embed.set_mem_store_positions(None)
+            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
+                self.model.embed.set_mem_addr_src_positions(None)
 
             # Pre-compute argmax for the verifier tensor once (GPU op) and
             # move to CPU in a single transfer. Per-row we only need positions
@@ -1505,8 +1481,8 @@ class BatchedPureNeuralRunner:
 
                 # Replay accepted tokens through _step_one, then the
                 # correction (if any). _step_one mutates s.context so the
-                # dispatch path (STEP_END mem_history rebuild, EXIT halting)
-                # stays identical to the unspeculative loop.
+                # dispatch path (STEP_END dispatch + EXIT halting) stays
+                # identical to the unspeculative loop.
                 #
                 # We deliberately do NOT take the "free bonus" emission at
                 # position prefix-1+len(draft) when all drafts accept: that
@@ -1653,34 +1629,6 @@ class BatchedPureNeuralRunner:
             return False
         return op not in _SPEC_UNSAFE_OPS
 
-    def _windowed_context(
-        self, s: _ElementState, max_context_window: int
-    ) -> List[int]:
-        dynamic_full = s.context[s.prefix_len:]
-        if len(dynamic_full) <= max_context_window:
-            s.mem_history_end = 0
-            return s.context[:]
-
-        dynamic = dynamic_full[-max_context_window:]
-        mem_tokens: List[int] = []
-
-        def contains_section(tokens: List[int], section: List[int]) -> bool:
-            if not section or len(section) > len(tokens):
-                return False
-            limit = len(tokens) - len(section) + 1
-            for start in range(limit):
-                if tokens[start : start + len(section)] == section:
-                    return True
-            return False
-
-        for addr in s.mem_access_order:
-            section = s.mem_history[addr]
-            if not contains_section(dynamic, section):
-                mem_tokens.extend(section)
-        s.mem_history_end = s.prefix_len + len(mem_tokens) if mem_tokens else 0
-        windowed = s.context[: s.prefix_len] + mem_tokens + dynamic
-        return windowed
-
     def _pad_to_tensor(
         self, sequences: List[List[int]]
     ) -> Tuple[torch.Tensor, List[int]]:
@@ -1717,13 +1665,6 @@ class BatchedPureNeuralRunner:
 
         if next_token == Token.STEP_END or next_token == Token.TOOL_CALL:
             self._dispatch_pure_neural(s)
-            # Snapshot the well-formed step's AX + position so a later
-            # cap-hit decode can scan forward from here for the next REG_AX
-            # (the in-progress step's AX, which holds the architecturally
-            # correct exit value when the model emitted IMM/EXIT-precursor
-            # correctly before going off-rails).
-            s.last_step_end_ax = int(s.last_ax) & 0xFFFFFFFF
-            s.last_step_end_pos = len(s.context)
             if s.halted:
                 return
 
@@ -1732,15 +1673,10 @@ class BatchedPureNeuralRunner:
             and s.token_pos >= s.expected_steps * Token.STEP_TOKENS
             and not s.halted
         ):
-            # Cap reached without an explicit HALT. Mirror the serial runner's
-            # behaviour after its ``draft_divergence`` bail / max-token loop
-            # exit (``AutoregressiveVMRunner.run`` lines 1199-1223 + the
-            # final ``return ... _decode_exit_code(context)``): instead of
-            # returning ``None`` (which was the prior behaviour and caused
-            # smoke ``and_basic``/``xor_basic`` to fail despite the model
-            # emitting the correct AX on the EXIT-precursor step), decode the
-            # in-progress step's REG_AX. See ``_decode_bail_exit_code``.
-            s.exit_code = self._decode_bail_exit_code(s)
+            # Cap reached without an explicit HALT. Take the most recent
+            # well-formed REG_AX as the exit code (pure neural emit, no
+            # forward-scan recovery).
+            s.exit_code = self._decode_exit_code(s.context)
             s.halted = True
             return
 
@@ -1756,7 +1692,9 @@ class BatchedPureNeuralRunner:
             return
         exec_op = s.bytecode[exec_idx] & 0xFF
 
-        # Update tracking registers from neural outputs.
+        # Update tracking registers from neural outputs. These are
+        # observation-only — no Python override re-writes the context. The
+        # neural model is the sole authority for register/AX/PC values.
         neural_pc = self._extract_register(s.context, Token.REG_PC)
         neural_ax = self._extract_register(s.context, Token.REG_AX)
         neural_sp = self._extract_register(s.context, Token.REG_SP)
@@ -1770,31 +1708,10 @@ class BatchedPureNeuralRunner:
         if neural_bp is not None:
             s.last_bp = neural_bp
 
-        # PUTCHAR: append AX byte 0 to output.
+        # PUTCHAR: append AX byte 0 to output. Tool-boundary side effect, not
+        # a value synth — the neural model emits AX, we just write it out.
         if exec_op == Opcode.PUTCHAR and neural_ax is not None:
             s.output.append(chr(neural_ax & 0xFF))
-
-        # GETCHAR / LI / LC Python overrides REMOVED (2026-06-09).
-        # They used `_override_register_in_last_step` + shadow `mem_history`
-        # to mask broken L14/L15 neural memory emission. Neural ops must
-        # produce correct outputs without runner help.
-
-        # PRTF / OPEN / CLOS / READ defer-to-serial REMOVED (Wave B,
-        # 2026-06-09). The serial `_neural_prtf_emit`/`_neural_open_emit`/
-        # `_neural_clos_emit`/`_neural_read_emit` shims were deleted; IO
-        # must now resolve via neural bakes — see
-        # docs/IO_NEURAL_BAKE_QUEUE_2026_06_09.md.
-
-        # Preserve model-emitted MEM sections as cache/window metadata only.
-        # This does not compute or substitute VM values; it keeps the neural
-        # store tokens addressable after tail windowing so L15 can read them.
-        if exec_op in _MEM_STORE_OPS:
-            mem_section = self._extract_mem_section(s.context)
-            if mem_section is not None:
-                addr = 0
-                for j in range(4):
-                    addr |= (int(mem_section[1 + j]) & 0xFF) << (j * 8)
-                self._track_mem_access(s, addr, mem_section)
 
         if exec_op == Opcode.EXIT:
             # In serial, EXIT is detected and the loop breaks; HALT is the
@@ -1844,23 +1761,6 @@ class BatchedPureNeuralRunner:
                 return
 
     @staticmethod
-    def _extract_mem_section(context) -> Optional[list]:
-        # MEM section is 9 tokens: MEM + 4 addr + 4 value, near end of step.
-        scan_back = Token.STEP_TOKENS + 5
-        for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
-            if context[i] == Token.MEM and i + 8 < len(context):
-                return list(context[i : i + 9])
-        return None
-
-    @staticmethod
-    def _override_mem_section_in_last_step(context, mem_section: list) -> None:
-        scan_back = Token.STEP_TOKENS + 5
-        for i in range(len(context) - 1, max(0, len(context) - scan_back), -1):
-            if context[i] == Token.MEM and i + 8 < len(context):
-                context[i : i + 9] = list(mem_section[:9])
-                return
-
-    @staticmethod
     def _decode_exit_code(context) -> int:
         for i in range(len(context) - 1, -1, -1):
             if context[i] == Token.REG_AX and i + 4 < len(context):
@@ -1869,86 +1769,3 @@ class BatchedPureNeuralRunner:
                     val |= (context[i + 1 + j] & 0xFF) << (j * 8)
                 return val
         return 0
-
-    @staticmethod
-    def _decode_bail_exit_code(s: _ElementState) -> int:
-        """Exit code at divergence-bail / cap-hit time.
-
-        Strategy (mirrors how ``AutoregressiveVMRunner.run`` ends up returning
-        the right answer for ``and_basic``/``xor_basic`` after its
-        ``draft_divergence`` bail):
-
-        1. Scan forward from the position just after the last STEP_END for the
-           NEXT REG_AX marker. This captures the in-progress step's AX — when
-           the model collapses mid-step but had already emitted the
-           architecturally-correct AX for the EXIT-precursor instruction, this
-           value is the right answer. Required for the smoke
-           ``and_basic``/``xor_basic`` tests where the AND/XOR step emits the
-           correct AX (=0x2A) but never reaches STEP_END before the model
-           devolves into a repeat-byte loop.
-
-        2. Fall back to the snapshot taken at the last STEP_END (the last
-           well-formed step's AX).
-
-        3. Final fallback: scan the full context (legacy behaviour).
-        """
-        ctx = s.context
-        start = max(0, int(getattr(s, "last_step_end_pos", 0)))
-        n = len(ctx)
-        for i in range(start, n):
-            if ctx[i] == Token.REG_AX and i + 4 < n:
-                val = 0
-                for j in range(4):
-                    val |= (ctx[i + 1 + j] & 0xFF) << (j * 8)
-                return val
-        if s.last_step_end_ax is not None:
-            return int(s.last_step_end_ax) & 0xFFFFFFFF
-        return BatchedPureNeuralRunner._decode_exit_code(ctx)
-
-    @staticmethod
-    def _track_mem_access(s: _ElementState, addr: int, mem_section: list) -> None:
-        max_history = 64
-        if addr in s.mem_history:
-            s.mem_access_order.remove(addr)
-        s.mem_history[addr] = mem_section
-        s.mem_access_order.append(addr)
-        while len(s.mem_access_order) > max_history:
-            evict_addr = s.mem_access_order.pop(0)
-            del s.mem_history[evict_addr]
-
-    # ------------------------------------------------------------------
-    # Serial-state borrow helpers (used by PRTF/OPEN/CLOS/READ shims)
-    # ------------------------------------------------------------------
-
-    def _borrow_serial_state(self, s: _ElementState) -> None:
-        ser = self._serial
-        self._saved_serial = {
-            "_bytecode": getattr(ser, "_bytecode", None),
-            "_memory": getattr(ser, "_memory", None),
-            "_stdin_buffer": getattr(ser, "_stdin_buffer", []),
-            "_stdin_pos": getattr(ser, "_stdin_pos", 0),
-            "_last_pc": getattr(ser, "_last_pc", None),
-            "_last_ax": getattr(ser, "_last_ax", 0),
-            "_last_sp": getattr(ser, "_last_sp", 0x10000),
-            "_last_bp": getattr(ser, "_last_bp", 0x10000),
-        }
-        ser._bytecode = s.bytecode
-        ser._memory = s.memory
-        ser._stdin_buffer = s.stdin_buffer
-        ser._stdin_pos = s.stdin_pos
-        ser._last_pc = s.last_pc
-        ser._last_ax = s.last_ax
-        ser._last_sp = s.last_sp
-        ser._last_bp = s.last_bp
-
-    def _unborrow_serial_state(self, s: _ElementState) -> None:
-        ser = self._serial
-        # Read back any state the serial shim may have mutated on the element.
-        s.stdin_pos = ser._stdin_pos
-        s.last_pc = ser._last_pc
-        s.last_ax = ser._last_ax
-        s.last_sp = ser._last_sp
-        s.last_bp = ser._last_bp
-        for k, v in self._saved_serial.items():
-            setattr(ser, k, v)
-        self._saved_serial = None

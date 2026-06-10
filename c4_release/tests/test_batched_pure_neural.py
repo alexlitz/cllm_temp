@@ -238,12 +238,11 @@ def test_speculation_guard_blocks_call_frame_opcodes():
 
 
 def test_declarative_halt_horizon_marks_overrun_as_divergence():
-    """Cap-hit decodes from the in-progress step's REG_AX instead of returning
-    ``None`` (updated 2026-06-03 to match serial behaviour — see
-    ``BatchedPureNeuralRunner._decode_bail_exit_code`` docstring). The element
-    still halts at the horizon; the observable change is that ``exit_code``
-    now mirrors what ``AutoregressiveVMRunner.run`` returns after its own
-    ``draft_divergence`` / max-token loop exit (``_decode_exit_code``).
+    """Cap-hit decodes the most recent REG_AX from the context instead of
+    returning ``None``. The element still halts at the horizon; the
+    observable change is that ``exit_code`` now mirrors what
+    ``AutoregressiveVMRunner.run`` returns after its own ``draft_divergence``
+    / max-token loop exit (``_decode_exit_code``).
     """
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
     from neural_vm.vm_step import Token
@@ -421,158 +420,10 @@ def test_run_speculative_disables_spec_after_persistent_first_token_rejects():
     assert runner._spec_stats["first_token_rejects"] >= 4
 
 
-def test_run_speculative_tags_draft_region_store_mem_markers():
-    """When a drafted step executes a MEM-store opcode (SI/SC/PSH/ENT/JSR),
-    its MEM marker inside the draft region must be added to the per-element
-    ``mem_store_positions`` passed to the embedding for that forward. Without
-    this tagging the embedding's ``MEM_STORE=1`` / ``MEM_ADDR_SRC=1`` flags
-    are missing at the drafted marker, the model predicts a different
-    ``MEM_addr0`` byte than DraftVM emitted, and L15/L16's lookup feeds
-    wrong addresses into the next step's PC/SP/BP — corrupting the verifier
-    even though the MEM addr/val bytes themselves are trusted from DraftVM
-    via ``_UNSAFE_OFFSETS``.
-    """
-    import torch
-
-    from neural_vm.batched_pure_neural import (
-        BatchedPureNeuralRunner,
-        _ElementState,
-        _MEM_MARKER_STEP_OFFSET,
-    )
-    from neural_vm.run_vm import DraftVM
-    from neural_vm.vm_step import Token
-
-    captured_positions = []
-
-    class _Embed:
-        def set_mem_history_end(self, _value):
-            pass
-
-        def set_mem_store_positions(self, positions):
-            captured_positions.append(
-                [list(row) for row in (positions or [])]
-            )
-
-    class _Model:
-        max_seq_len = 4096
-        embed = _Embed()
-
-        def forward(self, token_ids, **_kwargs):
-            logits = torch.zeros(
-                token_ids.shape[0],
-                token_ids.shape[1],
-                Token.VOCAB_SIZE,
-                device=token_ids.device,
-            )
-            logits[:, :, Token.HALT] = 1.0
-            return logits
-
-    runner = object.__new__(BatchedPureNeuralRunner)
-    runner.model = _Model()
-    runner._device = torch.device("cpu")
-    runner.use_kv_cache = False
-    runner.incremental_kv_safe = False
-    runner.spec_fail_on_correction = False
-    runner.spec_fail_fast = False
-    runner._kv_stats = {"fresh_forwards": 0}
-    runner._reset_spec_stats()
-
-    # IMM 7 then PSH (a store op): DraftVM will draft both steps; the second
-    # step's MEM marker must be tagged.
-    bytecode = _encode([(Opcode.IMM, 7), Opcode.PSH, Opcode.EXIT])
-    state = _ElementState(
-        bytecode=bytecode,
-        context=[Token.CODE_START],
-        prefix_len=1,
-        expected_steps=3,
-        draft_vm=DraftVM(bytecode),
-    )
-
-    runner._run_speculative(
-        [state],
-        max_steps=None,
-        max_context_window=512,
-        spec_k=2,
-    )
-
-    # First iteration must have captured ``mem_store_positions`` for the
-    # forward pass; the second drafted step (PSH at draft step index 1) is
-    # a store op, so its MEM marker at ``prefix_len + 1*35 + 25`` must be
-    # included in the positions row passed to the embedding.
-    assert captured_positions, (
-        "Speculator should have called set_mem_store_positions before its first forward"
-    )
-    first_call = captured_positions[0]
-    assert len(first_call) == 1, "single-element batch expected"
-    expected_psh_marker = 1 + 1 * Token.STEP_TOKENS + _MEM_MARKER_STEP_OFFSET
-    assert expected_psh_marker in first_call[0], (
-        f"Drafted PSH MEM marker at position {expected_psh_marker} should be "
-        f"tagged for the forward, got {first_call[0]}"
-    )
-
-
-def test_windowed_context_does_not_duplicate_memory_history_without_eviction():
-    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
-    from neural_vm.vm_step import Token
-
-    runner = object.__new__(BatchedPureNeuralRunner)
-    prefix = [Token.CODE_START, Token.CODE_END]
-    mem_section = [Token.MEM, 1, 0, 0, 0, 7, 0, 0, 0]
-    dynamic = [Token.REG_AX, 7, 0, 0, 0] + mem_section + [Token.STEP_END]
-    state = _ElementState(
-        bytecode=[],
-        context=prefix + dynamic,
-        prefix_len=len(prefix),
-        mem_history={1: mem_section},
-        mem_access_order=[1],
-    )
-
-    windowed = runner._windowed_context(state, max_context_window=128)
-
-    assert windowed == prefix + dynamic
-    assert state.mem_history_end == 0
-
-
-def test_windowed_context_does_not_mark_current_store_before_step_complete():
-    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
-    from neural_vm.vm_step import Token
-
-    runner = object.__new__(BatchedPureNeuralRunner)
-    prefix = [Token.CODE_START, Token.CODE_END]
-    dynamic = [0] * 25 + [Token.MEM]
-    state = _ElementState(
-        bytecode=_encode([Opcode.PSH, Opcode.EXIT]),
-        context=prefix + dynamic,
-        prefix_len=len(prefix),
-        token_pos=len(dynamic),
-    )
-
-    windowed = runner._windowed_context(state, max_context_window=128)
-
-    assert windowed == prefix + dynamic
-    assert state.mem_history_end == 0
-    assert state.mem_store_positions == []
-
-
-def test_windowed_context_does_not_mark_current_store_during_value_bytes():
-    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
-    from neural_vm.vm_step import Token
-
-    runner = object.__new__(BatchedPureNeuralRunner)
-    prefix = [Token.CODE_START, Token.CODE_END]
-    dynamic = [0] * 25 + [Token.MEM, 0xF8, 0xFF, 0x00, 0x00]
-    state = _ElementState(
-        bytecode=_encode([Opcode.PSH, Opcode.EXIT]),
-        context=prefix + dynamic,
-        prefix_len=len(prefix),
-        token_pos=len(dynamic),
-    )
-
-    windowed = runner._windowed_context(state, max_context_window=128)
-
-    assert windowed == prefix + dynamic
-    assert state.mem_history_end == 0
-    assert state.mem_store_positions == []
+# Mem-history-windowing tests (test_run_speculative_tags_draft_region_store_mem_markers,
+# test_windowed_context_*) removed with Wave D — the runner no longer
+# maintains mem_history/mem_store_positions or rebuilds windowed contexts.
+# The neural model attends over the raw emitted context.
 
 
 def test_batched_kv_bypasses_incremental_path_by_default():
@@ -616,34 +467,6 @@ def test_batched_kv_bypasses_incremental_path_by_default():
     assert runner._kv_stats["fresh_forwards"] == 1
     assert runner._kv_stats["kv_forwards"] == 0
     assert runner._kv_stats["unsafe_model_fresh_bypass"] == 1
-
-
-def test_windowed_context_splices_only_evicted_memory_history():
-    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner, _ElementState
-    from neural_vm.vm_step import Token
-
-    runner = object.__new__(BatchedPureNeuralRunner)
-    prefix = [Token.CODE_START, Token.CODE_END]
-    evicted_mem = [Token.MEM, 1, 0, 0, 0, 7, 0, 0, 0]
-    retained_mem = [Token.MEM, 2, 0, 0, 0, 9, 0, 0, 0]
-    tail = [Token.REG_AX, 9, 0, 0, 0] + retained_mem + [Token.STEP_END]
-    dynamic = evicted_mem + [Token.REG_PC, 2, 0, 0, 0] + tail
-    state = _ElementState(
-        bytecode=[],
-        context=prefix + dynamic,
-        prefix_len=len(prefix),
-        mem_history={1: evicted_mem, 2: retained_mem},
-        mem_access_order=[1, 2],
-    )
-
-    windowed = runner._windowed_context(state, max_context_window=len(tail))
-
-    assert windowed == prefix + evicted_mem + tail
-    assert state.mem_history_end == len(prefix) + len(evicted_mem)
-    assert state.mem_store_positions == [
-        len(prefix),
-        len(prefix) + len(evicted_mem) + 5,
-    ]
 
 
 class _FakeBatchedModel:
