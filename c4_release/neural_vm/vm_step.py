@@ -1879,7 +1879,8 @@ class AutoregressiveVM(nn.Module):
         """Load a previously compacted model from disk."""
         return torch.load(path, weights_only=False)
 
-    def forward(self, token_ids, kv_cache=None, cached_prefix_len=0):
+    def forward(self, token_ids, kv_cache=None, cached_prefix_len=0,
+                stop_after_block=None):
         """Forward pass: token IDs -> logits.
 
         Args:
@@ -1894,10 +1895,22 @@ class AutoregressiveVM(nn.Module):
                 augmentations (e.g. _inject_mem_exec_autoregressive scanning
                 MEM markers) see all prior positions. Returns logits of shape
                 ``[batch, seq - cached_prefix_len, vocab_size]`` when > 0.
+            stop_after_block: probe-only. When an int ``b``, run the embedding
+                + physical blocks ``0..b`` (inclusive) and return the
+                **residual hidden state** ``[batch, seq, d_model]`` *before*
+                the LM head, instead of logits. ``None`` (the default — and the
+                only value any production/runner caller ever passes) is fully
+                byte-identical to the prior behaviour: the early-return branch
+                is never entered. This exists so
+                ``tools/probe_groundtruth.py`` can read a block's residual via
+                the model's own normally-computed returned tensor — no forward
+                hooks, no weight overrides.
 
         Returns:
             ``[batch, seq, vocab_size]`` logits when ``cached_prefix_len == 0``,
-            else ``[batch, seq - cached_prefix_len, vocab_size]``.
+            else ``[batch, seq - cached_prefix_len, vocab_size]``. When
+            ``stop_after_block`` is set, returns the ``[batch, seq, d_model]``
+            residual after that physical block instead.
         """
         # Pure forward pass: embed → blocks → head
         # All augmentations (ADDR_KEY, MEM_STORE) are inside NeuralVMEmbedding
@@ -1918,6 +1931,12 @@ class AutoregressiveVM(nn.Module):
         for i, block in enumerate(self.blocks):
             layer_cache = kv_cache.get_layer_cache(i) if kv_cache is not None else None
             x = block(x, kv_cache=layer_cache, x_is_new_only=x_is_new_only)
+            # Probe-only early return (stop_after_block is None on every
+            # production path, so this branch is dead weight for the runner).
+            # ``x`` here is the model's own post-block residual — exactly what
+            # block i+1 would receive as input.
+            if stop_after_block is not None and i == stop_after_block:
+                return x
 
         if self.head.weight.is_sparse:
             return sparse_linear(x, self.head.weight, self.head.bias)
@@ -2736,8 +2755,18 @@ def _expand_wrapper_blocks(model):
     pureffn_rebakes = 0
 
     # Split post_ops into their own blocks.
+    #
+    # Probe provenance (no behaviour change): tag every emitted physical block
+    # with ``_logical_layer`` (its originating pre-expansion logical layer, in
+    # 0..len(model.blocks)-1) and ``_is_post_op_expansion`` (False for the
+    # original block, True for each passthrough block split off its post_ops).
+    # ``tools/probe_groundtruth.py`` reads these to print the exact 37↔logical
+    # mapping instead of guessing it from attention-weight norms (which alias
+    # legitimately FFN-only original layers against passthrough blocks).
     final_blocks = []
-    for block in model.blocks:
+    for logical_idx, block in enumerate(model.blocks):
+        block._logical_layer = logical_idx
+        block._is_post_op_expansion = False
         final_blocks.append(block)
         if hasattr(block, 'post_ops') and len(block.post_ops) > 0:
             post_ops_list = list(block.post_ops)
@@ -2755,6 +2784,8 @@ def _expand_wrapper_blocks(model):
                 new_block = _make_passthrough_block(
                     block.attn, ffn_module, len(final_blocks), d_model
                 )
+                new_block._logical_layer = logical_idx
+                new_block._is_post_op_expansion = True
                 final_blocks.append(new_block)
                 post_op_expansions += 1
 
