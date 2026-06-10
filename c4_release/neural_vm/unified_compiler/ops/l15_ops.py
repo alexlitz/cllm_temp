@@ -10,7 +10,13 @@ from ..building_blocks_dsl import (
     binary_address_lookup_attention,
     multi_way_and_rule,
 )
-from ..ir import CompilerIR, FFNRule, RuntimeAttentionFragment, StructuralOp
+from ..ir import (
+    CompilerIR,
+    FFNRule,
+    RuntimeAttentionFragment,
+    StepWindowConstraint,
+    StructuralOp,
+)
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -555,6 +561,13 @@ def _layer15_memory_lookup_heads_0_3_specs(
             k=tuple(k),
             v=tuple(v),
             o=tuple(o),
+            # STEP_WINDOW_AUDIT_2026_06_10: LI/LC + STACK0 load heads
+            # read MARK_MEM tokens by address — memory persists across
+            # step boundaries by design (runtime slope=0.05 for the L15
+            # primary load heads keeps the most-recent write dominant).
+            # Declares the cross-step intent the verifier
+            # would otherwise misclassify as CURRENT_STEP_ONLY violation.
+            step_window=StepWindowConstraint.ANY_STEP,
         ))
 
     return tuple(specs)
@@ -1062,6 +1075,11 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             k=new_k,
             v=new_v,
             o=new_o,
+            # STEP_WINDOW_AUDIT_2026_06_10: propagate the base spec's
+            # step-window declaration so the override pass doesn't drop
+            # the ANY_STEP annotation on heads 0-3 (LI/LC + STACK0 load).
+            step_window=spec.step_window,
+            alibi_slope=spec.alibi_slope,
         ))
 
     return tuple(merged)
@@ -1209,6 +1227,13 @@ def _layer15_memory_lookup_lev_heads_4_11_specs(
             k=tuple(k),
             v=tuple(v),
             o=tuple(o),
+            # STEP_WINDOW_AUDIT_2026_06_10: LEV saved_bp lookup heads
+            # (4-7) read MEM_VAL_B[0..3] across step boundaries by
+            # design — memory persistence is the whole point. Runtime
+            # slope is 0.01 so the verifier flags these as
+            # CURRENT_STEP_ONLY violations. ANY_STEP encodes the
+            # cross-step-OK intent the runtime already follows.
+            step_window=StepWindowConstraint.ANY_STEP,
         ))
 
     # === Heads 8-11: return_addr lookup from memory[BP+8] (LEV) ===
@@ -1292,6 +1317,13 @@ def _layer15_memory_lookup_lev_heads_4_11_specs(
             k=tuple(k),
             v=tuple(v),
             o=tuple(o),
+            # STEP_WINDOW_AUDIT_2026_06_10: LEV return_addr lookup heads
+            # (8-11) read MEM_VAL_B[0..3] across step boundaries by
+            # design — memory persistence is the whole point. Runtime
+            # slope is 0.01 (heads 10/11 get none) so the verifier flags
+            # these as CURRENT_STEP_ONLY violations. ANY_STEP encodes
+            # the cross-step-OK intent the runtime already follows.
+            step_window=StepWindowConstraint.ANY_STEP,
         ))
 
     return tuple(specs)
@@ -1358,6 +1390,11 @@ def _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
             k=new_k,
             v=spec.v,
             o=spec.o,
+            # STEP_WINDOW_AUDIT_2026_06_10: propagate the base spec's
+            # step-window declaration so the override pass doesn't drop
+            # the ANY_STEP annotation on heads 8-11 (LEV memory lookup).
+            step_window=spec.step_window,
+            alibi_slope=spec.alibi_slope,
         ))
     return tuple(merged)
 
