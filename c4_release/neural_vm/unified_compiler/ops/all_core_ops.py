@@ -265,12 +265,18 @@ def all_core_ops(
         make_layer10_sp_byte_passthrough_bake_op(),
         make_layer10_bp_byte_passthrough_bake_op(),
         make_layer10_psh_stack0_passthrough_bake_op(),
-        # Wave 1 A3: resize L10 attn 8 -> 12 heads BEFORE the broadcast
-        # bake (otherwise slots 8/9/10 write out-of-bounds). Mirrors
-        # ``l15_attention_resize`` for L15.
+        # Wave 1 A3: resize L10 attn 8 -> 13 heads BEFORE the broadcast
+        # / PC byte_passthrough bakes (otherwise slots 8/9/10/11 write
+        # out-of-bounds). Mirrors ``l15_attention_resize`` for L15.
         make_l10_attention_resize_op(),
         # Wave 1 A3 broadcast heads bake (slots 8/9/10), phase ~10.35.
         make_layer10_psh_ax_broadcast_bake_op(),
+        # JSR/LEV PC byte_passthrough head (slot 11), phase ~10.37.
+        # Mirrors BP/SP/AX byte_passthrough but at the MARK_PC marker;
+        # suppressed on OP_JSR/JMP/BZ/BNZ/LEV so the L6/L9 PC override
+        # writers are not stomped. See
+        # ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` for context.
+        make_layer10_pc_byte_passthrough_bake_op(),
         make_layer10_stack0_byte_relay_bake_op(),
         make_layer10_alu_op(),
         # Cluster D fix (2026-06-03): post-L9 BZ/BNZ PC override owner.

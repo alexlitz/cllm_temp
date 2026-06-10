@@ -51,6 +51,20 @@ _L10_HEAD_LAYOUT = (
     ("layer10_psh_ax_broadcast_bake.head_8",             8),  # PSH AX_b1 -> STACK0_BYTE_VAL_1
     ("layer10_psh_ax_broadcast_bake.head_9",             9),  # PSH AX_b2 -> STACK0_BYTE_VAL_2
     ("layer10_psh_ax_broadcast_bake.head_10",            10), # PSH AX_b3 -> STACK0_BYTE_VAL_3
+    # JSR/LEV PC byte_passthrough head (slot 11): mirrors the AX/SP/BP
+    # byte_passthrough pattern so PC bytes 1-3 are explicitly carried
+    # from the prior step's PC byte 1-3 (MARK_PC + BYTE_INDEX_k) into
+    # this step's MARK_PC byte rows. Suppressed on opcodes that
+    # rewrite PC (OP_JSR, OP_JMP, OP_BZ, OP_BNZ, OP_LEV) so the L6
+    # JSR/JMP/branch PC override (byte 0) and L9 LEV PC restore
+    # (byte 0 from mem[BP+8]) are not stomped. Without this head, PC
+    # bytes 1-3 at JSR/LEV steps fall back to L3 default (0x00),
+    # leaking residual SP / return-addr bytes into the AX byte
+    # passthrough chain at MARK_AX rows (see
+    # ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` 2026-05-11; PC byte
+    # contamination of 0xf8/0x03 at AX byte 1-3 was the documented
+    # JSR clobber shape).
+    ("layer10_pc_byte_passthrough_bake.head_11",         11), # PC byte passthrough
 )
 
 
@@ -72,8 +86,12 @@ def _allocate_layer10_attention_heads() -> AttentionHeadAllocator:
     this stage — first-fit only consumes 0..7 because
     :data:`_L10_HEAD_LAYOUT` declares exactly 8 heads — so the bake is
     byte-identical with the pre-widen state.
+
+    JSR/LEV follow-up: ``layer_max_heads`` bumped to 13 to host the
+    PC byte_passthrough head at slot 11 (see
+    :func:`_layer10_pc_byte_passthrough_head_spec`).
     """
-    allocator = AttentionHeadAllocator(layer_max_heads=12)
+    allocator = AttentionHeadAllocator(layer_max_heads=13)
     for name, _legacy_head_idx in _L10_HEAD_LAYOUT:
         allocator.alloc(name, layer_idx=10)
     return allocator
@@ -1660,6 +1678,105 @@ def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
     )
 
 
+def _layer10_pc_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
+    """Carry PC bytes 1-3 across non-branch steps.
+
+    Mirrors the AX/SP/BP byte_passthrough heads (see
+    :func:`_layer10_ax_byte_passthrough_head_spec`,
+    :func:`_layer10_sp_byte_passthrough_head_spec`,
+    :func:`_layer10_bp_byte_passthrough_head_spec`) but for the PC
+    register marker (``H1 + PC_IDX``). At MARK_PC byte rows the head
+    attends back to the previous step's MARK_PC byte row at the same
+    BYTE_INDEX_k and copies CLEAN_EMBED -> OUTPUT_LO/HI.
+
+    Suppressed on opcodes that rewrite PC so the L6/L7 JSR/JMP/branch
+    PC override (byte 0 from the IMM bytes) and the L9 LEV PC restore
+    (byte 0 from mem[BP+8]) are not overwritten by the carry:
+
+    - ``OP_JSR`` / ``OP_JMP`` -- jumps to the IMM target; bytes 1-3
+      should come from the IMM bytes (L6 override) or default to 0,
+      not the prior step's PC.
+    - ``OP_BZ`` / ``OP_BNZ`` -- conditional branches; the L9 PC
+      override selects the target or fall-through and writes byte 0.
+    - ``OP_LEV`` -- restores PC from ``mem[BP+8]`` via the L9 BP-to-
+      PC ADDR_B0 relay; bytes 1-3 of the saved PC should not be
+      clobbered with the current step's PC.
+
+    Without this head, PC bytes 1-3 at JSR/LEV steps fall back to the
+    L3 default (0x00). For the simple-function smoke test
+    ``JSR 3; EXIT; NOP; ENT 0; IMM 42; LEV`` the JSR target PC = 3
+    and the LEV return PC = 4 both fit in byte 0 — but downstream
+    attention heads (notably the AX byte_passthrough and the SI/SC
+    store routing) read PC byte rows during JSR for the return-
+    address push, and the spurious L3-default zeros leak into AX
+    bytes 1-3 (documented contamination shape: ``0xf8030063`` per
+    ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` 2026-05-11). The
+    byte_passthrough head supplies a clean PC value at MARK_PC byte
+    1-3 rows that downstream heads can attend to without picking up
+    SP / return-addr residue.
+    """
+    PC_IDX = 0
+    spec = _byte_passthrough_chain_spec(
+        BD,
+        head_idx=_l10_head_idx("layer10_pc_byte_passthrough_bake.head_11"),
+        source_marker_dim=BD.H1 + PC_IDX,
+        target_marker_dim=BD.H1 + PC_IDX,
+        value_lo_dim=BD.CLEAN_EMBED_LO,
+        value_hi_dim=BD.CLEAN_EMBED_HI,
+        # PC-rewriting opcodes suppress the carry so downstream PC
+        # override writers (L6/L7/L9) are not stomped at byte 0 and
+        # the carry does not propagate stale upper bytes when the
+        # target PC has bytes 1-3 != prior step's bytes 1-3.
+        suppress_op_dims=[
+            BD.OP_JSR,
+            BD.OP_JMP,
+            BD.OP_BZ,
+            BD.OP_BNZ,
+            BD.OP_LEV,
+        ],
+        S=S,
+        is_byte_strength=1.0,
+        has_se_strength=2.0,
+        suppress_strength=2.0,
+        q0_threshold=1.5,
+        gate_const=-30000.0,
+        gate_extras=[
+            (BD.IS_BYTE, 10000.0),
+            (BD.OP_JSR, -10000.0),
+            (BD.OP_JMP, -10000.0),
+            (BD.OP_BZ, -10000.0),
+            (BD.OP_BNZ, -10000.0),
+            (BD.OP_LEV, -10000.0),
+        ],
+    )
+    # Suppress the head at non-PC marker rows. The chain spec's Q[1] /
+    # Q[33] gates select for ``H1 + PC_IDX`` (proximity to MARK_PC),
+    # which is naturally low at MARK_AX/SP/BP/MEM byte rows. But because
+    # the K side's ``H1 + PC_IDX`` band is also low at those non-PC K
+    # positions, the row-level score reduces to other gates and the
+    # softmax can still distribute attention across irrelevant K rows,
+    # producing a uniform-attention contribution to OUTPUT_LO/HI that
+    # leaks into the AX/SP/BP byte_passthrough writers at the same
+    # dim band. Mirrors the ``mem_val_suppress`` block on
+    # :func:`_layer10_bp_byte_passthrough_head_spec`: drive Q[0]
+    # strongly negative at other-marker rows so the head's per-row
+    # softmax output stays effectively zero at those positions.
+    L = S
+    non_pc_marker_suppress = (
+        AP(0, BD.H1 + 1, -L),  # MARK_AX proximity
+        AP(0, BD.H1 + 2, -L),  # MARK_SP proximity
+        AP(0, BD.H1 + 3, -L),  # MARK_BP proximity
+        AP(0, BD.H1 + 4, -L),  # MARK_MEM proximity
+        AP(0, BD.MARK_STACK0, -L),
+        AP(0, BD.MEM_VAL_B0, -L),
+        AP(0, BD.MEM_VAL_B1, -L),
+        AP(0, BD.MEM_VAL_B2, -L),
+        AP(0, BD.MEM_VAL_B3, -L),
+    )
+    spec = replace(spec, q=spec.q + non_pc_marker_suppress)
+    return spec
+
+
 def _bake_layer10_psh_stack0_passthrough_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 3 PSH STACK0 passthrough spec."""
     Primitives.generate_attention_head(
@@ -2003,6 +2120,19 @@ def _layer10_stack0_byte_relay_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
         AP(34, BD.H3 + 4, 60.0),
         AP(34, BD.H2 + 4, -60.0),
         AP(34, BD.STACK0_BYTE3, 60.0),
+        # Tie-breaker: penalize MEM_STORE rows at the byte-select slots so
+        # the STACK0_BYTE{1,2,3} relay path beats the MEM_VAL_B{2,3} legacy
+        # path when both are present. Without this, ALiBi recency lets a
+        # nearby MEM-region row (stale 0xFF stack init or a different
+        # MEM-frame entry) win the slot-31/32/34 score by ~0.79 score
+        # points and the head copies the wrong CLEAN nibble into ALU,
+        # firing BitwiseBytePropagationPostOp with 0xFF at AX bytes 1..3.
+        # STACK0_BYTE{1,2,3} marker rows never carry MEM_STORE, so the
+        # penalty leaves the desired winner untouched. See
+        # tools/probe_or_full_lo_hi.py for the OR-step trace.
+        AP(31, BD.MEM_STORE, -5.0),
+        AP(32, BD.MEM_STORE, -5.0),
+        AP(34, BD.MEM_STORE, -5.0),
         AP(33, BD.CONST, 5.0),
         # K-side complement for the slot-33 IS_BYTE gate (mirrors slot 0).
         AP(33, BD.MARK_STACK0, 0.1),
@@ -2263,6 +2393,16 @@ def _layer10_bp_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
     ir.layer(0).attention.append(
         _layer10_bp_byte_passthrough_head_spec(proxy, 100.0),
         name="layer10_bp_byte_passthrough_bake.head_7",
+    )
+    return ir
+
+
+def _layer10_pc_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    ir.layer(0).attention.append(
+        _layer10_pc_byte_passthrough_head_spec(proxy, 100.0),
+        name="layer10_pc_byte_passthrough_bake.head_11",
     )
     return ir
 
@@ -2929,6 +3069,69 @@ def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
     )
 
 
+def make_layer10_pc_byte_passthrough_bake_op() -> Operation:
+    """Bake PC upper-byte passthrough into ``model.blocks[10].attn``.
+
+    PC byte 0 is written by L3 (default IS_BYTE -> byte 0 = PC_idx
+    increment) and overridden by L6/L7 (JSR/JMP/branch target) or L9
+    (LEV mem[BP+8] byte 0). This head carries PC bytes 1-3 across
+    ordinary non-branch / non-LEV steps so PC stays valid at MARK_PC
+    byte rows for downstream heads (notably the AX byte_passthrough
+    cross-step value lookup). Mirrors the BP/SP/AX byte_passthrough
+    bake ops; runs at L10 attn slot 11.
+
+    See ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` (2026-05-11) for the
+    architectural cascade this closes the first step on.
+    """
+    def bake(block, dim_positions, S):
+        proxy = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        # Per-bake attention-head allocator with the L10 head layout pinned.
+        # See ``make_layer10_carry_relay_bake_op`` for the rationale.
+        head_allocator = _allocate_layer10_attention_heads()
+        attn._l10_head_allocator = head_allocator
+        HD = attn.W_q.shape[0] // attn.num_heads
+        Primitives.generate_attention_head(
+            attn, _layer10_pc_byte_passthrough_head_spec(proxy, S), HD,
+        )
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes.data[11] = 1.0
+
+    # Dim-ownership claims: L10 attn head 11 PC byte passthrough.
+    # ``byte_passthrough_chain`` writes V slots 0..31 + O writes
+    # OUTPUT_LO/HI mirror the AX/SP/BP heads.
+    _claims = set()
+    for k in range(16):
+        _claims.add((10, "attn_W_v", f"11_{k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add((10, "attn_W_v", f"11_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+
+    return Operation(
+        name="layer10_pc_byte_passthrough_bake",
+        reads={"IS_BYTE", "HAS_SE", "H1", "CONST",
+               "OP_JSR", "OP_JMP", "OP_BZ", "OP_BNZ", "OP_LEV",
+               "MARK_STACK0",
+               "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+               "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer10_pc_byte_passthrough_ir,
+        target_op_name="_layer10_attn_anchor",
+        migrated=True,
+        declarative_authority="spec_generated",
+        # Ensure attn resize (8 -> 13 heads) runs before this bake so
+        # slot 11 is in-bounds when generate_attention_head writes
+        # W_q/W_k/W_v/W_o at head_idx=11.
+        requires={"after": "l10_attention_resize"},
+        claims=_claims,
+        smoke_tests={
+            "TestSmokeFunctionCall::test_simple_function",
+        },
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
 def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
     """Bake ``_set_layer10_psh_stack0_passthrough`` into ``model.blocks[10].attn``.
 
@@ -3033,14 +3236,15 @@ def _layer10_attention_resize_structural_ir(dim_positions, head_dim) -> Compiler
     The L10 attention block default-builds with ``num_heads=8`` but Wave
     1 A3 broadcast heads land at slots 8/9/10 — the attention block
     must grow accordingly. Mirrors the L15 resize pattern with a single
-    ``target_num_heads=12`` for all build configurations.
+    ``target_num_heads=13`` for all build configurations (slot 11
+    hosts the JSR/LEV PC byte_passthrough head).
     """
     del dim_positions, head_dim
     ir = CompilerIR()
     ir.layer(0).structural_ops.append(
         StructuralOp(
             kind="attention_resize",
-            target_num_heads=12,
+            target_num_heads=13,
             alibi_pin_value=None,
             follow_up=_layer10_attention_resize_follow_up,
             metadata={
@@ -3053,17 +3257,19 @@ def _layer10_attention_resize_structural_ir(dim_positions, head_dim) -> Compiler
 
 
 def make_l10_attention_resize_op() -> Operation:
-    """Resize L10 attention from ``num_heads=8`` to ``num_heads=12``.
+    """Resize L10 attention from ``num_heads=8`` to ``num_heads=13``.
 
     Wave 1 A3 prerequisite: default L10 attn ships with 8 heads, so
     the A3 broadcast heads (slots 8/9/10) would write out-of-bounds
     into ``attn.W_q/W_k/W_v/W_o``. This op resizes the attention block
-    to 12 heads before the broadcast bake fires, mirroring
-    ``l15_attention_resize``. Existing heads 0..7 are preserved
-    bit-for-bit; the leading slice of each weight matrix is copied
-    through unchanged. Runs AFTER the original L10 attn bakes (phase
-    10.0..10.3) and BEFORE the A3 broadcast bake (phase 10.35) and
-    stack0_byte_relay bake (phase 10.4).
+    to 13 heads before the broadcast / PC byte_passthrough bakes fire,
+    mirroring ``l15_attention_resize``. Existing heads 0..7 are
+    preserved bit-for-bit; the leading slice of each weight matrix is
+    copied through unchanged. Runs AFTER the original L10 attn bakes
+    (phase 10.0..10.3) and BEFORE the A3 broadcast bake (phase 10.35),
+    PC byte_passthrough bake (phase 10.37), and stack0_byte_relay bake
+    (phase 10.4). Slot 11 hosts the PC byte_passthrough head added by
+    the JSR/LEV follow-up.
     """
     def bake(block, dim_positions, S):
         ir = _layer10_attention_resize_structural_ir(dim_positions, None)
