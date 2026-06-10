@@ -431,18 +431,23 @@ def make_layer1_threshold_attn_op() -> Operation:
             ),
             HD,
         )
-        # Head 6 (2026-06-10): STEP_END register-presence broadcast.
-        # Anchors Q on MARK_SE_ONLY (Q[0] = 10 only at the SE row) and
-        # K on MARK_AX (K[0] = 10 only at the AX marker row). With
-        # ALiBi slope 0.2 the within-step MARK_AX (distance 29 from
-        # SE) dominates the softmax1; prior-step MARK_AX sits at
-        # distance 64 and contributes <5%. V[1] copies the MARK_AX
-        # value (= 1) at the K-row, O writes the result into
-        # ``SE_REG_AX_PRESENT`` at the SE row. This is the L0/L1
-        # foundation of the STEP_END compute migration -- the parallel
-        # Wave-A L11 relay broadcasts the OP_<NAME> / AX_CARRY / ALU /
-        # CMP / STACK0_BYTE slots that L0/L1 cannot yet see (those are
-        # written by L3+/L5+/L8+/L9+ producers downstream of L1). See
+        # Head 6 (2026-06-10): STEP_END all-register-presence broadcast.
+        # Q anchors on MARK_SE_ONLY (Q[0] = 10 only at the SE row); K
+        # anchors as the OR of 5 register markers (MARK_AX / MARK_PC /
+        # MARK_SP / MARK_BP / MARK_STACK0) -- each contributes K[0] =
+        # 10. With ALiBi slope 0.2 the within-step markers (distances
+        # 14..34 from SE) dominate softmax1 over prior-step markers
+        # (distances 49..69) by ~exp(3)>=~20. The 5 within-step
+        # markers split softmax1 mass unevenly by distance (closer
+        # markers get more mass); per-marker V_GAINs invert the
+        # mass split so each SE_REG_<NAME>_PRESENT lands at ~1.0
+        # at the SE row (see ``_step_end_reg_present_head_spec``
+        # docstring for the calibrated constants). This is the
+        # L0/L1 foundation of the STEP_END compute migration -- the
+        # parallel Wave-A L11 relay broadcasts the OP_<NAME> /
+        # AX_CARRY / ALU / CMP / STACK0_BYTE slots that L0/L1 cannot
+        # yet see (those are written by L3+/L5+/L8+/L9+ producers
+        # downstream of L1). See
         # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md.
         Primitives.generate_attention_head(
             attn,
@@ -458,9 +463,11 @@ def make_layer1_threshold_attn_op() -> Operation:
     #   Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay — Q[CONST],
     #           K[MARK_SE_ONLY+MARK_CS], V[1, MARK_SE_ONLY+MARK_CS],
     #           O[IN_STEP_FRESH, 5*HD+1].
-    #   Head 6 (2026-06-10): STEP_END register-presence broadcast —
-    #           Q[MARK_SE_ONLY], K[MARK_AX], V[MARK_AX],
-    #           O[SE_REG_AX_PRESENT, 6*HD+1].
+    #   Head 6 (2026-06-10): STEP_END all-register-presence broadcast —
+    #           Q[MARK_SE_ONLY],
+    #           K[MARK_AX+MARK_PC+MARK_SP+MARK_BP+MARK_STACK0],
+    #           V[MARK_AX,MARK_PC,MARK_SP,MARK_BP,MARK_STACK0] (5 slots),
+    #           O[SE_REG_{AX,PC,SP,BP,STACK0}_PRESENT, 6*HD+(1..5)].
     _claims = set()
     _MARKS = ["MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
               "MARK_MEM", "MARK_SE", "MARK_CS"]
@@ -483,19 +490,23 @@ def make_layer1_threshold_attn_op() -> Operation:
     _claims.add((1, "attn_W_v", "5_1", "MARK_SE_ONLY+0"))
     _claims.add((1, "attn_W_v", "5_1", "MARK_CS+0"))
     _claims.add((1, "attn_W_o", "5_1", "IN_STEP_FRESH+0"))
-    # Head 6 (2026-06-10): STEP_END MARK_AX-presence broadcast.
-    # The W_o claim is deliberately omitted: SE_REG_AX_PRESENT shares
-    # its compiled residual position with other compact-layout dims
-    # via the liveness-based slot-share pass, so the verifier's
-    # ``_pos_to_column`` cannot uniquely resolve the destination
-    # column back to ``SE_REG_AX_PRESENT+0``. Declaring the write
-    # would produce a spurious DECLARATION DRIFT entry (the
-    # verifier matches the column to whichever sharing partner sorts
-    # first alphabetically). Q/K/V claims still record the head's
-    # identity for the dim-ownership audit.
+    # Head 6 (2026-06-10): STEP_END all-register-presence broadcast.
+    # The W_o claims are deliberately omitted: SE_REG_<NAME>_PRESENT
+    # slots share their compiled residual positions with other
+    # compact-layout dims via the liveness-based slot-share pass, so
+    # the verifier's ``_pos_to_column`` cannot uniquely resolve the
+    # destination columns back to ``SE_REG_<NAME>_PRESENT+0``.
+    # Declaring the writes would produce spurious DECLARATION DRIFT
+    # entries (the verifier matches the column to whichever sharing
+    # partner sorts first alphabetically). Q/K/V claims still record
+    # the head's identity for the dim-ownership audit.
     _claims.add((1, "attn_W_q", "6_0", "MARK_SE_ONLY+0"))
-    _claims.add((1, "attn_W_k", "6_0", "MARK_AX+0"))
-    _claims.add((1, "attn_W_v", "6_1", "MARK_AX+0"))
+    for _i, _mark in enumerate(
+        ("MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0"),
+        start=1,
+    ):
+        _claims.add((1, "attn_W_k", "6_0", f"{_mark}+0"))
+        _claims.add((1, "attn_W_v", f"6_{_i}", f"{_mark}+0"))
 
     return Operation(
         name="layer1_threshold_attn",
@@ -505,12 +516,16 @@ def make_layer1_threshold_attn_op() -> Operation:
         # MARK_SP, MARK_BP, MARK_MEM, MARK_SE, MARK_CS). Previously only
         # MARK_SE_ONLY + MARK_CS were declared (head 3 / head 5 inputs).
         # Head 6 (2026-06-10): also reads MARK_SE_ONLY (Q-gate) and
-        # MARK_AX (K/V projection) -- both already in this set.
+        # MARK_AX/MARK_PC/MARK_SP/MARK_BP/MARK_STACK0 (K/V projection).
+        # The original threshold-head MARKS list already covers all
+        # 5 except MARK_STACK0, which head 6 adds.
         reads={"IS_MARK", "MARK_SE_ONLY", "MARK_CS", "CONST",
                "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
-               "MARK_MEM", "MARK_SE"},
+               "MARK_MEM", "MARK_SE", "MARK_STACK0"},
         writes={"L1H0", "L1H1", "L1H2", "L1H4", "HAS_SE", "IN_STEP_FRESH",
-                "SE_REG_AX_PRESENT"},
+                "SE_REG_AX_PRESENT", "SE_REG_PC_PRESENT",
+                "SE_REG_SP_PRESENT", "SE_REG_BP_PRESENT",
+                "SE_REG_STACK0_PRESENT"},
         kind="attn",
         # Phase 8.G.6: drop ``layer_idx=1`` literal. ``requires["after"]
         # = layer0_threshold_attn`` (below) is the structural pin: the
@@ -541,35 +556,98 @@ def make_layer1_threshold_attn_op() -> Operation:
 def _step_end_reg_present_head_spec(
     proxy, *, head_idx: int,
 ) -> DeclarativeAttentionHeadSpec:
-    """L1 head 6: within-step MARK_AX -> MARK_SE presence broadcast.
+    """L1 head 6: within-step all-register presence broadcast to MARK_SE.
 
-    Single-channel relay: Q anchors at ``MARK_SE_ONLY`` (Q[0] = 10
-    only at the SE row); K anchors at ``MARK_AX`` (K[0] = 10 only at
-    the AX marker row); V copies the ``MARK_AX`` value (= 1 at AX
-    rows) into V[1]; O lifts V[1] into ``SE_REG_AX_PRESENT`` at the
-    SE row. With ALiBi slope 0.2 the within-step MARK_AX (distance
-    29 from SE) dominates the softmax1 over the prior-step MARK_AX
-    (distance 64) by a factor of ~exp(7) ~= 1100.
+    Multi-marker relay: Q anchors at ``MARK_SE_ONLY`` (Q[0] = 10
+    only at the SE row); K anchors as the OR of 5 register markers
+    (``MARK_AX``, ``MARK_PC``, ``MARK_SP``, ``MARK_BP``,
+    ``MARK_STACK0``) -- each marker row contributes K[0] = 10. With
+    5 simultaneous K hits, softmax1's mass distribution is shaped
+    by ALiBi-decayed scores: the closer marker rows (STACK0 at
+    distance 14 from SE) receive larger attention mass than the
+    farther markers (PC at distance 34). Each register's V slot
+    fires only at its own marker row (``V[i]`` = ``V_GAIN_<NAME>``
+    at ``MARK_<NAME>``, 0 elsewhere); O lifts ``V[i]`` into the
+    matching ``SE_REG_<NAME>_PRESENT`` slot at the SE row.
 
-    This is intentionally a single-marker broadcast: the other
-    ``SE_REG_<NAME>_PRESENT`` slots (PC / SP / BP / STACK0 / MEM)
-    remain declared but unwritten in this commit. The five remaining
-    slots are the scaffolding for follow-on broadcast heads (at L1
-    head 7 or later layers) and mirror the ``STACK0_BYTE_VAL_h_*``
-    pattern of "declare the family up-front, fill it incrementally".
+    Per-marker ``V_GAIN`` calibration: the ALiBi slope 0.2 splits
+    softmax mass across the 5 within-step markers as approximately
+    [PC=0.012, AX=0.032, SP=0.086, BP=0.234, STACK0=0.636] (within
+    a step of 35 tokens where PC sits at distance 34 from SE,
+    AX at 29, SP at 24, BP at 19, STACK0 at 14). Setting
+    ``V_GAIN_<NAME>`` = 1/mass yields each ``SE_REG_<NAME>_PRESENT``
+    at ~1.0 (presence-detection threshold > 0.5). The calibration
+    is step-structure invariant (each step has the same marker
+    offsets), not step-number invariant, so it holds across the
+    program. Empirically derived from the probe trace 2026-06-10.
 
-    Same Q/K/V/O shape as L1 head 3 (HAS_SE) -- only the gates and
-    the destination dim differ. See
+    With ALiBi slope 0.2 the within-step markers (distances 14..34
+    from SE) dominate softmax1 over the prior-step markers
+    (distances 49..69 from SE) by a factor of >=~exp(3) ~= 20; the
+    prior-step contribution to each ``SE_REG_<NAME>_PRESENT`` slot
+    is <5% of the within-step contribution.
+
+    Wires all 5 ``SE_REG_<NAME>_PRESENT`` slots (AX/PC/SP/BP/STACK0)
+    in a single head -- the L0/L1 foundation of the STEP_END compute
+    migration: every register's presence is visible at MARK_SE for
+    downstream L11+ consumers to gate on. The L11 Wave A relay
+    broadcasts the post-producer compute slots (OP_<NAME>, AX_CARRY,
+    ALU, CMP, STACK0_BYTE0..3) that L0/L1 cannot see yet. See
     docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md §4 (Wave A).
+
+    Downstream consumers MUST gate on ``MARK_SE_ONLY`` to filter
+    out the V_GAIN-scaled leakage at non-SE marker rows. The
+    leakage is a softmax-split artefact of the 5-way K-bank
+    multi-marker design (at Q rows where Q[0]=0, softmax1 with
+    anchor=0 gives ~1/(1+5) weight per K row, multiplied by the
+    matching V_GAIN). For example,
+    SE_REG_PC_PRESENT @ MARK_PC ~= V_GAIN_PC / 6 ~= 14 (vs. ~1.0
+    at MARK_SE), so any reader of SE_REG_PC_PRESENT must constrain
+    to MARK_SE_ONLY positions.
+
+    ``SE_REG_MEM_PRESENT`` remains declared-but-unwritten: MARK_MEM
+    fires multiple times per step (one per memory access byte), and
+    its multi-row contribution would dilute the softmax mass for the
+    other markers below the presence threshold. A dedicated head
+    can be added if MEM-presence is ever needed by a downstream op.
     """
 
     L = 10.0
+    # Per-marker V_GAIN calibrated to invert ALiBi-shaped softmax
+    # mass at Q@MARK_SE. The constants below are derived from the
+    # 2026-06-10 probe trace (slope=0.2, in-step distances
+    # PC=34, AX=29, SP=24, BP=19, STACK0=14): mass[name] ~=
+    # exp(12.5 - slope * dist) / sum(exp(...)) and V_GAIN[name] =
+    # 1/mass[name]. Each SE_REG_<NAME>_PRESENT lands at ~1.0.
+    V_GAIN_PC = 84.0
+    V_GAIN_AX = 32.0
+    V_GAIN_SP = 12.0
+    V_GAIN_BP = 4.3
+    V_GAIN_STACK0 = 1.6
     return DeclarativeAttentionHeadSpec(
         head_idx=head_idx,
         q=(AP(0, proxy.MARK_SE_ONLY, L),),
-        k=(AP(0, proxy.MARK_AX, L),),
-        v=(AP(1, proxy.MARK_AX, 1.0),),
-        o=(AO(proxy.SE_REG_AX_PRESENT, 1, 1.0),),
+        k=(
+            AP(0, proxy.MARK_AX, L),
+            AP(0, proxy.MARK_PC, L),
+            AP(0, proxy.MARK_SP, L),
+            AP(0, proxy.MARK_BP, L),
+            AP(0, proxy.MARK_STACK0, L),
+        ),
+        v=(
+            AP(1, proxy.MARK_AX, V_GAIN_AX),
+            AP(2, proxy.MARK_PC, V_GAIN_PC),
+            AP(3, proxy.MARK_SP, V_GAIN_SP),
+            AP(4, proxy.MARK_BP, V_GAIN_BP),
+            AP(5, proxy.MARK_STACK0, V_GAIN_STACK0),
+        ),
+        o=(
+            AO(proxy.SE_REG_AX_PRESENT, 1, 1.0),
+            AO(proxy.SE_REG_PC_PRESENT, 2, 1.0),
+            AO(proxy.SE_REG_SP_PRESENT, 3, 1.0),
+            AO(proxy.SE_REG_BP_PRESENT, 4, 1.0),
+            AO(proxy.SE_REG_STACK0_PRESENT, 5, 1.0),
+        ),
     )
 
 

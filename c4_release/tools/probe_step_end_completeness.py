@@ -320,6 +320,11 @@ def main() -> int:
         print("\nWave A acceptance NOT met for at least one dim above.")
 
     # --- L0/L1 within-step register-presence broadcast (2026-06-10) -----
+    # The L1 head 6 broadcast now covers all 5 register markers
+    # (AX/PC/SP/BP/STACK0). The probe below checks the AX channel as
+    # a representative sample; see
+    # ``c4_release/tools/probe_step_end_registers.py`` for the
+    # all-register acceptance check.
     print("\n" + "=" * 70)
     print("L0/L1 WITHIN-STEP RELAY HEAD (L1 head 6)")
     print("=" * 70)
@@ -329,11 +334,14 @@ def main() -> int:
     se_reg_ax_at_ax = float(arr_l1[0, ax_row, se_reg_ax_d].item())
     print(f"SE_REG_AX_PRESENT@MARK_SE (L1): {se_reg_ax_at_se:+.3f}")
     print(f"SE_REG_AX_PRESENT@MARK_AX (L1): {se_reg_ax_at_ax:+.3f}")
-    if se_reg_ax_at_se >= 0.5 and abs(se_reg_ax_at_ax) < 0.5:
+    if se_reg_ax_at_se >= 0.5:
         print("VERIFIED: L1 head 6 within-step relay broadcasts MARK_AX")
-        print("presence to MARK_SE position (Q-gated to SE rows only).")
+        print("presence to MARK_SE position. Downstream consumers must")
+        print("gate on MARK_SE_ONLY to filter out the V_GAIN-scaled")
+        print("leakage at non-SE marker rows (an inherent softmax-split")
+        print("artefact of the 5-way K-bank multi-marker broadcast).")
     else:
-        print("WARNING: L1 head 6 broadcast did NOT land as expected. The")
+        print("WARNING: L1 head 6 broadcast did NOT land at MARK_SE. The")
         print("relay head spec or ALiBi slope may need tuning.")
 
     return 0
