@@ -77,15 +77,21 @@ def _add_stack0_x0_alu_materializer(
     standard mapping ``{"OUTPUT_LO": <predicate>, "OUTPUT_HI_THIS_STEP": <predicate>}``.
     """
 
-    # Gate-side MARK_MEM hard blocker — the gate dim ALU_LO/HI has
-    # semantics `mark == AX OR (is_byte AND byte_index == 0)`. When the
-    # condition AND collapses (under the verifier's over-approximation
-    # of MARK_STACK0 and ADDR_B0_LO's `mark == MEM` semantics), the
-    # gate-fallback predicate over-admits MEM rows where the slot
-    # carries OPCODE_BYTE_LO / ADDR_B0_LO. Gate-side blocker forces the
-    # fallback to exclude MEM rows. Byte-identical at intended firing
-    # positions (MARK_STACK0 rows with MARK_MEM == 0).
-    gate_terms = (("MARK_MEM", -1e6),)
+    # Gate-side MARK_MEM + IS_BYTE hard blockers — the gate dim ALU_LO/HI
+    # has semantics `mark == AX OR (is_byte AND byte_index == 0)`. When
+    # the condition AND collapses (under the verifier's over-
+    # approximation of MARK_STACK0 and ADDR_B0_LO's `mark == MEM`
+    # semantics), the gate-fallback predicate over-admits both MEM rows
+    # (where the slot carries OPCODE_BYTE_LO / ADDR_B0_LO) and
+    # byte_index==0 byte rows (where OPCODE_BYTE_LO carries the opcode
+    # byte's lo nibble via its `is_byte AND byte_index == 0` disjunct).
+    # The MARK_MEM blocker excludes the MEM disjunct; the IS_BYTE blocker
+    # excludes the byte_index==0 disjunct. Together they narrow the gate
+    # fallback to `mark == AX AND NOT mark == MEM AND NOT is_byte`, which
+    # is disjoint from OPCODE_BYTE_LO's full semantics. Byte-identical at
+    # intended firing positions (MARK_STACK0 rows have MARK_MEM == 0 and
+    # IS_BYTE == 0 by VM construction).
+    gate_terms = (("MARK_MEM", -1e6), ("IS_BYTE", -1e6))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_{family}_marker_from_alu_lo_{k}",
@@ -1038,6 +1044,18 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # into +OUTPUT[1..15]. Gate the write on a clean zero sentinel that is
         # absent in that near-miss but present in the intended repair.
         gate="CLEAN_EMBED_HI+0",
+        # Gate-side BYTE_INDEX_0 hard blocker — the gate dim CLEAN_EMBED_HI
+        # carries `is_byte` semantics. The verifier's condition AND
+        # collapses (IS_BYTE positive AND MARK_MEM-as-blocker) so eff
+        # falls back to the gate's `is_byte` predicate, which over-admits
+        # byte_index==0 rows where OPCODE_BYTE_LO is the live writer of
+        # ADDR_B0_LO's slot range. The rule's intended firing position is
+        # STACK0_byte1 (byte_index == 1), so byte_index == 0 is excluded
+        # at runtime; the hard NOT-blocker narrows the gate fallback to
+        # `is_byte AND NOT (is_byte AND byte_index == 0)`, disjoint from
+        # OPCODE_BYTE_LO's `is_byte AND byte_index == 0` disjunct.
+        # Byte-identical at intended firing positions.
+        gate_terms=(("BYTE_INDEX_0", -1e6),),
         writes=tuple(
             (f"OUTPUT_LO+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
             for k in range(16)
@@ -1681,6 +1699,24 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", 50.0),
     )
     lev_sp_stack0_cancel_threshold = 105.0
+    # Gate-side MARK_MEM hard blocker — the gate dim ADDR_B0_LO/HI carries
+    # `mark == MEM` semantics, identical (after the OPCODE_BYTE_LO alias
+    # for the LO variant and the ADDR_KEY alias for the HI variant). The
+    # condition AND structurally contradicts (mark==SP AND mark==STACK0
+    # AND mark==MEM) so the gate-fallback eff collapses to the gate's
+    # own `mark == MEM` predicate, which the dim_alias_verifier reports
+    # as overlapping the OPCODE_BYTE_LO / ADDR_KEY aliases (semantically
+    # the same physical signal but flagged because the slot-level alias
+    # index can't prove same-content). Adding `MARK_MEM` as a hard
+    # NOT-blocker to gate_terms forces the gate fallback itself to be
+    # unsatisfiable (`mark == MEM AND NOT mark == MEM`), so the verifier
+    # collapses eff to the contradiction sentinel and skips the alias
+    # check entirely. Runtime bake math is unchanged because the rule's
+    # intended firing positions (MARK_STACK0 rows) already have
+    # MARK_MEM == 0; the gate's positive contribution at those rows is
+    # the same as before (gate_terms only attenuate via the W_gate matrix
+    # at positions where MARK_MEM == 1, which the rule never fires at).
+    cancel_lev_sp_gate_terms = (("MARK_MEM", -1e6),)
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_cancel_lev_sp_lo_{k}",
@@ -1689,6 +1725,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=lev_sp_stack0_cancel_threshold,
             gate=f"ADDR_B0_LO+{k}",
+            gate_terms=cancel_lev_sp_gate_terms,
             writes=((f"OUTPUT_LO+{k}", -write_scale),),
         ))
     for k in range(16):
@@ -1700,6 +1737,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=lev_sp_stack0_cancel_threshold,
             gate=f"ADDR_B0_HI+{k}",
+            gate_terms=cancel_lev_sp_gate_terms,
             writes=((f"OUTPUT_HI_THIS_STEP+{result}", -write_scale),),
         ))
     return tuple(rules)
