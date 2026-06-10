@@ -718,11 +718,18 @@ def build_default_registry() -> DimRegistry:
               semantics="mark == PC AND mark == AX")
 
     # MUL/DIV staging — written at AX byte positions when MUL/DIV active.
-    # FIXME(F-4): refine — exact gating opcode set unknown at slot level.
+    # Gated on ``opcode_at_AX in {MUL}`` (and ``{DIV, MOD}``) so the alias
+    # verifier can prove disjointness vs FETCH_{LO,HI} (which overlap this
+    # range during the instruction-fetch phase of any other opcode) and
+    # vs sibling rules whose eff pins ``opcode_at_AX == X`` for some
+    # non-MUL X. The ``OR (is_byte AND byte_index == 0)`` over-claim is
+    # dropped here because the staging slot's authoritative writer is AX
+    # rows; the byte-0 row claim was structural noise that prevented
+    # any opcode-discriminated alias disambiguation.
     _pin("MUL_ACCUM",   416, 16, "Multiplication accumulator",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+              semantics="mark == AX AND opcode_at_AX == MUL")
     _pin("DIV_STAGING", 432, 16, "Division quotient/remainder",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)")
+              semantics="mark == AX AND opcode_at_AX in {DIV, MOD}")
 
     # Immediate staging — fetched immediate bytes following the opcode.
     # FIXME(F-4): refine — fires at PC byte positions during fetch.
@@ -946,7 +953,7 @@ def build_default_registry() -> DimRegistry:
               semantics="mark == AX OR NOT is_byte", alias=True)
     _pin("IO_OUTPUT_COUNT", 467, 1,
               "Output bytes remaining (aliases PSH_AT_SP)",
-              semantics="mark == AX OR NOT is_byte", alias=True)
+              semantics="mark == AX AND opcode_at_AX == PRTF", alias=True)
     _pin("IO_FORMAT_POS",   468, 1, "Position in format string (aliases MEM_EXEC)",
               semantics="mark == AX OR NOT is_byte", alias=True)
     _pin("MEM_EXEC", 468, 1, "Deprecated; retained as IO_FORMAT_POS alias",
@@ -959,11 +966,16 @@ def build_default_registry() -> DimRegistry:
     # --- FORMAT_PTR / AX_FULL nibble pointers (471..502 — two views) ---
     # FORMAT_PTR_* and AX_FULL_* share the same byte range; both are
     # populated at AX positions.
+    # FORMAT_PTR_* is specific to PRTF tool-calls (the format-string
+    # pointer is only meaningful when PRTF is the active opcode), so we
+    # gate on ``opcode_at_AX == PRTF`` to give the alias verifier a
+    # disjointness handle vs AX_FULL_* (which fires for any AX-valued
+    # opcode).
     _pin("FORMAT_PTR_LO", 471, 16, "Format string ptr lo nibble (aliases AX_FULL_LO)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              semantics="(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
               alias=True)
     _pin("FORMAT_PTR_HI", 487, 16, "Format string ptr hi nibble (aliases AX_FULL_HI)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              semantics="(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
               alias=True)
     _pin("AX_FULL_LO",    471, 16, "Full AX lo nibble (aliases FORMAT_PTR_LO)",
               semantics="mark == AX OR (is_byte AND byte_index == 0)",
@@ -981,10 +993,14 @@ def build_default_registry() -> DimRegistry:
 
     # --- "LAST_WAS_*" / "ACTIVE_OPCODE_*" / "MARK_THINKING_*" flags ---
     # All single-dim history/marker flags within the TEMP region.
+    # LAST_WAS_THINKING_{END,START} alias the tail of AX_FULL_HI (bytes
+    # 14/15 of the 471..502 range). They are 1-bit history flags set at
+    # the THINKING marker token (not at any VM register marker), so the
+    # AX claim of AX_FULL_HI is disjoint from them by ``NOT mark == AX``.
     _pin("LAST_WAS_THINKING_END",   501, 1, "Prev token was THINKING_END",
-              semantics="NOT is_byte", alias=True)
+              semantics="NOT is_byte AND NOT mark == AX", alias=True)
     _pin("LAST_WAS_THINKING_START", 502, 1, "Prev token was THINKING_START",
-              semantics="NOT is_byte", alias=True)
+              semantics="NOT is_byte AND NOT mark == AX", alias=True)
     _pin("LAST_WAS_BYTE", 503, 1, "Prev token was byte (0-255)",
               semantics="is_byte OR NOT is_byte", alias=True)
     _pin("LAST_WAS_IO_STATE_EMIT_BYTE", 462, 1,
@@ -1003,19 +1019,23 @@ def build_default_registry() -> DimRegistry:
               semantics="NOT is_byte", alias=True)
 
     # --- POST_PRTF aliases (471..502 / 328..359) ---
-    # FIXME(F-4-ext): refine — these alias AX_FULL/AX_CARRY ranges and are
-    # populated when a PRTF tool-call returns; conservatively gate on AX.
+    # These alias AX_FULL/AX_CARRY ranges and are populated when a PRTF
+    # tool-call returns. Gate on ``opcode_at_AX == PRTF`` to give the
+    # alias verifier a disjointness handle vs the parent AX_FULL/AX_CARRY
+    # slots (which fire for any AX-valued opcode) and vs other VM-opcode
+    # rules (LEV, JMP, JSR, ADD, …) whose effective predicates pin a
+    # different ``opcode_at_AX == X``.
     _pin("POST_PRTF_PC_LO", 471, 16, "Post-PRTF PC lo (aliases AX_FULL_LO)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              semantics="(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
               alias=True)
     _pin("POST_PRTF_PC_HI", 487, 16, "Post-PRTF PC hi (aliases AX_FULL_HI)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              semantics="(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
               alias=True)
     _pin("POST_PRTF_SP_LO", 328, 16, "Post-PRTF SP lo (aliases AX_CARRY_LO)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              semantics="(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
               alias=True)
     _pin("POST_PRTF_SP_HI", 344, 16, "Post-PRTF SP hi (aliases AX_CARRY_HI)",
-              semantics="mark == AX OR (is_byte AND byte_index == 0)",
+              semantics="(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
               alias=True)
 
     # --- Opcode-byte aliases (12, 28) — unused in autoregressive but
