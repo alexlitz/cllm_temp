@@ -1549,6 +1549,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 (mem_val_dim, 1.0),
                 ("MEM_STORE", -100.0),
                 ("MARK_MEM", -100.0),
+                # MARK_PC hard blocker: tightens the rule against the
+                # IMM_STAGING ↔ MEM_VAL_B* alias at the byte-0..3 rows of
+                # the FETCH-phase window. IS_BYTE already excludes the PC
+                # marker row, but the hard blocker (|w| >= 1e6) propagates
+                # into the rule's effective predicate as ``NOT mark == PC``,
+                # which the verifier composes with IMM_STAGING's FETCH-phase
+                # owner set so the alias is provably not live here. Closes
+                # the last 3 IMM_STAGING ↔ MEM_VAL_B{0,1,2} dim-alias
+                # violations (DIM_ALIAS_RESIDUAL_2026_06_10.md).
+                ("MARK_PC", -1e6),
             ),
             threshold=2.5,
             writes=tuple(

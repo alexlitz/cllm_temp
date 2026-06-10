@@ -526,6 +526,20 @@ _SLOT_PHASE_OWNERS: Dict[str, frozenset[str]] = {
     "DIV_STAGING": frozenset({"EXEC"}),
     "MUL_ACCUM": frozenset({"EXEC"}),
     "ADJ_CARRY": frozenset({"EXEC"}),
+    # EXEC-phase memory-load predictions: MEM_VAL_B{0..3} carry the
+    # predicted bytes read from memory during LI/LC loads. Their lifetime
+    # is the EXEC window of those opcodes — strictly disjoint from the
+    # FETCH/DECODE phases that own IMM_STAGING (which aliases the same
+    # slot range during the fetch window). Tagging here lets phase
+    # disjointness suppress the IMM_STAGING ↔ MEM_VAL_B{0,1,2} alias on
+    # rules whose positive ``MEM_VAL_B*`` reference pins them to EXEC,
+    # closing the last 3 residual byte-row violations documented in
+    # DIM_ALIAS_RESIDUAL_2026_06_10.md (composes with the MARK_PC hard
+    # blocker added to the offending l16_nonstore_mem_value*_zero rules).
+    "MEM_VAL_B0": frozenset({"EXEC"}),
+    "MEM_VAL_B1": frozenset({"EXEC"}),
+    "MEM_VAL_B2": frozenset({"EXEC"}),
+    "MEM_VAL_B3": frozenset({"EXEC"}),
     # WRITEBACK-phase slots: MEM stores and IO state-machine latches.
     "MEM_STORE": frozenset({"WRITEBACK"}),
     "IO_OUTPUT_COUNT": frozenset({"WRITEBACK"}),
