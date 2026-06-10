@@ -526,7 +526,7 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
             ),
             threshold=2.5,
             gate=gate_cmp_group,
-            writes=((cmp_byte2, 2.0 / S),),
+            writes=((cmp_byte2, 8.0 / S),),
         ))
 
     # hi_lt: 120 units -> CMP+0 (a < b for hi nibble)
