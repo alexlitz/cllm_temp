@@ -99,3 +99,35 @@ def test_overlap_byte_value_compatible():
 def test_overlap_byte_value_incompatible():
     """0xF8's lo nibble is 0x8, NOT 0x0, so these don't overlap."""
     assert not overlaps(parse("byte_value == 0xF8"), parse("byte_value.lo_nibble == 0x0"))
+
+
+# === Cross-family: marker rows vs byte rows are mutually exclusive ===
+
+
+def test_mark_eq_contradicts_is_byte():
+    """Non-NONE marker rows are not byte rows (residual-tagging invariant)."""
+    for role in ("SP", "AX", "PC", "BP", "MEM", "STACK0", "SE"):
+        assert not satisfiable(parse(f"mark == {role} AND is_byte")), role
+
+
+def test_mark_in_set_contradicts_is_byte():
+    """A set of non-NONE marker roles is disjoint from is_byte."""
+    assert not satisfiable(parse("mark in {AX, MEM} AND is_byte"))
+
+
+def test_mark_none_does_not_contradict_is_byte():
+    """``mark == NONE`` is the byte-row marker; satisfiable with is_byte."""
+    assert satisfiable(parse("mark == NONE AND is_byte"))
+
+
+def test_mark_in_set_with_none_does_not_contradict_is_byte():
+    """A set including NONE remains satisfiable with is_byte."""
+    assert satisfiable(parse("mark in {NONE, AX} AND is_byte"))
+
+
+def test_opcode_byte_lo_byte_index_0_disjoint_from_mark_mem():
+    """The textbook OPCODE_BYTE_LO read at byte-row 0 must NOT overlap
+    with ADDR_B0_LO's ``mark == MEM`` semantics (cross-family disjoint)."""
+    eff = parse("is_byte AND byte_index == 0")
+    addr_b0_lo_sem = parse("mark == MEM")
+    assert not overlaps(eff, addr_b0_lo_sem)

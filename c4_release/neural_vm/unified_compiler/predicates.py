@@ -1428,6 +1428,19 @@ def _format_conj(conj: frozenset[Atom]) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _mark_role_implies_not_byte(role: str) -> bool:
+    """A marker role X != NONE pins a non-byte token (a marker row); byte
+    tokens carry ``mark == NONE``. Therefore ``mark == X`` is disjoint from
+    ``is_byte`` for any non-NONE role.
+
+    This cross-family contradiction is the runtime invariant of the
+    residual-stream tagging: every position is either a marker row
+    (``mark in {SP, AX, PC, BP, MEM, STACK0, SE}``, ``NOT is_byte``) or a
+    byte row (``mark == NONE``, ``is_byte``).
+    """
+    return role != "NONE"
+
+
 def atom_contradicts(a: Atom, b: Atom) -> bool:
     """Return True iff atoms `a` and `b` cannot both hold at any position.
 
@@ -1435,9 +1448,33 @@ def atom_contradicts(a: Atom, b: Atom) -> bool:
     a ⊥ b iff a ⊨ NOT b (or symmetrically b ⊨ NOT a). For cross-family
     pairs (e.g., mark vs step_index), neither subsumption holds and the
     function correctly returns False (independent dimensions).
+
+    A targeted cross-family rule encodes the residual-tagging invariant
+    that marker rows (``mark == X``, X != NONE) and byte rows
+    (``is_byte``) are mutually exclusive — without this the over-
+    approximation in :mod:`effective_predicate` flags a flood of
+    tautological dim-alias false positives at byte-row reads of slots
+    whose semantics list ``mark == X OR (is_byte AND byte_index == k)``.
     """
     if a == b:
         return False
+    # Cross-family invariant: marker rows and byte rows partition all
+    # positions, so any non-NONE mark atom contradicts is_byte (and the
+    # symmetric pair).
+    if isinstance(a, BoolAtom) and a.name == "is_byte" and not a.negated:
+        if isinstance(b, MarkEq) and _mark_role_implies_not_byte(b.role):
+            return True
+        if isinstance(b, MarkIn) and b.roles and all(
+            _mark_role_implies_not_byte(r) for r in b.roles
+        ):
+            return True
+    if isinstance(b, BoolAtom) and b.name == "is_byte" and not b.negated:
+        if isinstance(a, MarkEq) and _mark_role_implies_not_byte(a.role):
+            return True
+        if isinstance(a, MarkIn) and a.roles and all(
+            _mark_role_implies_not_byte(r) for r in a.roles
+        ):
+            return True
     # Try a entails NOT b, then symmetric.
     try:
         neg_b = _negate_atom(b)
