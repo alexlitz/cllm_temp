@@ -4121,6 +4121,21 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         low-nibble residue into SP byte 1. The just-emitted ``0xe8`` byte and
         the binary-pop relay form a narrow signature for the no-carry case,
         where stack byte 1 must remain ``0xff``.
+
+        2026-06-10: explicit OP_ADD/OP_SUB blockers added. These rules are
+        a SP-pop byte-1 preserve only and must NEVER fire on arithmetic
+        steps' AX byte-1 emit positions where ADD/SUB carry propagation
+        should drive OUTPUT instead. Probe (capture_residual_trace on
+        ``IMM 200; PSH; IMM 100; ADD; EXIT``) confirms these rules
+        currently score < 40.5 at all ADD-step rows; the blockers
+        make that invariant declarative. The actual byte-1 carry
+        failure on ``test_add_16bit`` / ``test_sub_16bit`` /
+        ``test_add_carry_cascade`` attributes upstream to the L7
+        operand_gather + L9 ALU/CARRY+1 surfaces (F1/F2 of
+        ``docs/RUNNER_OVERRIDE_FULL_REMOVAL_2026_06_09.md``); the
+        L9 ALU emits operand A in ALU_LO at the MARK_AX row instead
+        of the sum, so no L10 declarative rewrite can recover the
+        right byte-1 here without first fixing F1/F2.
         """
 
         return (
@@ -4150,6 +4165,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("OP_GT", -1000000.0),
                     ("OP_LE", -1000000.0),
                     ("OP_GE", -1000000.0),
+                    ("OP_ADD", -1000000.0),
+                    ("OP_SUB", -1000000.0),
                 ),
                 threshold=40.5,
                 writes=byte_writes(0xFF, strength=5000.0),
@@ -4180,6 +4197,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("OP_GT", -1000000.0),
                     ("OP_LE", -1000000.0),
                     ("OP_GE", -1000000.0),
+                    ("OP_ADD", -1000000.0),
+                    ("OP_SUB", -1000000.0),
                 ),
                 threshold=40.5,
                 writes=byte_writes(0xFF, strength=5000.0),
@@ -4210,6 +4229,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("OP_GT", -1000000.0),
                     ("OP_LE", -1000000.0),
                     ("OP_GE", -1000000.0),
+                    ("OP_ADD", -1000000.0),
+                    ("OP_SUB", -1000000.0),
                 ),
                 threshold=40.5,
                 writes=byte_writes(0xFF, strength=5000.0),
@@ -4241,6 +4262,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("OP_GT", -1000000.0),
                     ("OP_LE", -1000000.0),
                     ("OP_GE", -1000000.0),
+                    ("OP_ADD", -1000000.0),
+                    ("OP_SUB", -1000000.0),
                 ),
                 threshold=85.0,
                 writes=byte_writes(0xFF, strength=5000.0),
