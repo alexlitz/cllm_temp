@@ -63,9 +63,11 @@ from neural_vm.unified_compiler.ir import FFNRule
 from neural_vm.unified_compiler.predicates import (
     Predicate,
     entails,
+    is_tautology,
     overlaps,
     parse,
     satisfiable,
+    strictly_refines,
 )
 
 
@@ -231,21 +233,33 @@ def _is_colocated_subbank(
     read_dim: str, sibling: str, registry: DimRegistry,
 ) -> bool:
     """Heuristic: a sibling is a "sub-bank parent" of the read dim if
-    they have the SAME slot range (start + size) AND the read dim's
-    semantics is a STRICT subset of the sibling's. The ``OPCODE_FLAGS``
-    -> ``OP_LEV`` case: same slot range, OP_LEV's semantics
-    ``mark == AX AND opcode_at_AX == LEV`` is strictly tighter than the
-    parent's ``mark == AX``. Both reference the same byte; the child is
-    just an indicator subset of the parent.
+    they share a byte range AND one's semantics is a strict refinement
+    of the other's (extra atoms beyond a verbatim disjunct copy).
+
+    Two cases are recognised as parent/child sub-banks:
+
+    * **Strict containment**: ``OP_LEV`` (1 wide at byte 270) sits
+      inside ``OPCODE_FLAGS`` (34 wide at 262..295) and OP_LEV's
+      semantics ``mark == AX AND opcode_at_AX == LEV`` strictly
+      refines ``mark == AX`` by adding the ``opcode_at_AX`` atom.
+    * **Same-extent refinement** (Improvement B, 2026-06-10):
+      ``OPCODE_BASE`` and ``OP_LEA`` occupy the same 1-wide slot at
+      byte 262. OP_LEA's semantics
+      ``mark == AX AND opcode_at_AX == LEA`` strictly refines
+      OPCODE_BASE's ``mark == AX OR (is_byte AND byte_index == 0)``
+      by ADDING the ``opcode_at_AX == LEA`` atom.
+
+      The discriminator is :func:`predicates.strictly_refines`: the
+      child must add at least one atom not present in any parent
+      disjunct, so the child is a true narrowing of the parent (the
+      same physical signal, refined). The genuine alias pair
+      ``OPCODE_BYTE_LO`` vs ``ADDR_B0_LO`` does NOT qualify: ADDR_B0_LO
+      ``mark == MEM`` equals one disjunct of OPCODE_BYTE_LO
+      ``mark == MEM OR (is_byte AND byte_index == 0)`` verbatim — no
+      extra atoms, so it remains flagged as a true alias.
 
     This is a conservative filter — it suppresses parent/child false
-    positives without dropping the OPCODE_BYTE_LO/ADDR_B0_LO case where
-    one semantics is a subset of the other but the slots are TRULY
-    aliased (different writers, different content). The distinguishing
-    test is "same writer" which we can't infer from the registry alone,
-    so we use the proxy "same slot range" — production registry's
-    parent/child families all match this; production true-aliasing pairs
-    have either different slot ranges or non-subset semantics.
+    positives without dropping the OPCODE_BYTE_LO/ADDR_B0_LO case.
     """
     slot_a = registry.slots.get(read_dim)
     slot_b = registry.slots.get(sibling)
@@ -255,22 +269,17 @@ def _is_colocated_subbank(
     sem_b = slot_b.semantics
     if sem_a is None or sem_b is None:
         return False
-    # Parent/child sub-bank: one slot is FULLY CONTAINED in the other
-    # AND their semantics are in a subset relation. ``OP_LEV`` (1 wide
-    # at byte 270) sits inside ``OPCODE_FLAGS`` (34 wide at 262..295)
-    # and OP_LEV's semantics is a strict subset of OPCODE_FLAGS'. The
-    # true-aliasing OPCODE_BYTE_LO/ADDR_B0_LO pair has the SAME slot
-    # range (both 12..28), not a strict containment, so this filter
-    # leaves them flagged.
+    # The slots must share at least one byte position — either strict
+    # containment (one fully inside the other, possibly equal extents)
+    # OR same range entirely. We require A ⊆ B or B ⊆ A (range
+    # containment, equal allowed).
     a_in_b = (
         slot_b.start <= slot_a.start
         and slot_a.start + slot_a.size <= slot_b.start + slot_b.size
-        and (slot_b.size > slot_a.size or slot_b.start != slot_a.start)
     )
     b_in_a = (
         slot_a.start <= slot_b.start
         and slot_b.start + slot_b.size <= slot_a.start + slot_a.size
-        and (slot_a.size > slot_b.size or slot_a.start != slot_b.start)
     )
     if not (a_in_b or b_in_a):
         return False
@@ -279,10 +288,48 @@ def _is_colocated_subbank(
         p_b = parse(sem_b)
     except Exception:
         return False
+    # Whichever slot is the smaller range plays the "child" role for
+    # the semantic discriminator; if extents are equal we try both
+    # directions.
     try:
-        return entails(p_a, p_b) or entails(p_b, p_a)
+        if a_in_b and not b_in_a:
+            # A strictly inside B's range -> A is the child candidate.
+            return strictly_refines(p_a, p_b)
+        if b_in_a and not a_in_b:
+            return strictly_refines(p_b, p_a)
+        # Equal extents: either could be the refinement of the other.
+        return strictly_refines(p_a, p_b) or strictly_refines(p_b, p_a)
     except Exception:
         return False
+
+
+def _slot_semantics_is_tautology(
+    registry: DimRegistry,
+    name: str,
+    cache: Dict[str, bool],
+) -> bool:
+    """Return True iff ``registry``'s slot ``name`` carries a
+    tautological semantics string (always true, e.g. the production
+    umbrella ``is_byte OR NOT is_byte`` declared on TEMP and friends).
+
+    Cached per-name across the verifier run so repeated lookups for
+    the same alias parent (TEMP shows up as a sibling of ~30 slots) are
+    O(1). Parse / solver errors degrade to False (treat as
+    non-tautological) so a malformed semantics does NOT silently
+    suppress a real alias.
+    """
+    cached = cache.get(name)
+    if cached is not None:
+        return cached
+    sem = _slot_semantics(registry, name)
+    if sem is None:
+        cache[name] = False
+        return False
+    try:
+        cache[name] = is_tautology(parse(sem))
+    except Exception:
+        cache[name] = False
+    return cache[name]
 
 
 def verify_dim_aliases(
@@ -291,6 +338,8 @@ def verify_dim_aliases(
     *,
     alias_index: Optional[Dict[str, List[str]]] = None,
     skip_colocated_subbank: bool = True,
+    skip_tautological_siblings: bool = True,
+    tautology_cache: Optional[Dict[str, bool]] = None,
 ) -> List[AliasViolation]:
     """Walk an op's FFNRules and report reads of aliased dims whose
     effective firing predicate is COMPATIBLE with another alias's
@@ -323,6 +372,8 @@ def verify_dim_aliases(
     """
     if alias_index is None:
         alias_index = _build_alias_index(registry)
+    if tautology_cache is None:
+        tautology_cache = {}
 
     op_name = getattr(op, "name", None)
     rules = _collect_ffn_rules_from_op(op)
@@ -345,7 +396,25 @@ def verify_dim_aliases(
             siblings = alias_index.get(dim_name, [])
             if not siblings:
                 continue
+            # Improvement A (2026-06-10): skip the entire alias check
+            # when EITHER the slot being read or its sibling carries a
+            # tautological semantics (e.g. TEMP's umbrella
+            # ``is_byte OR NOT is_byte``). A tautology declares the
+            # slot "ambient" — no positional constraint is asserted at
+            # the registry level, so every overlap report is structural
+            # noise rather than a real read bug.
+            read_dim_taut = skip_tautological_siblings and \
+                _slot_semantics_is_tautology(
+                    registry, dim_name, tautology_cache,
+                )
             for sibling in siblings:
+                if read_dim_taut:
+                    continue
+                if skip_tautological_siblings and \
+                        _slot_semantics_is_tautology(
+                            registry, sibling, tautology_cache,
+                        ):
+                    continue
                 sibling_sem = _slot_semantics(registry, sibling)
                 if sibling_sem is None:
                     continue
@@ -381,6 +450,7 @@ def verify_dim_aliases_for_ops(
     registry: DimRegistry,
     *,
     skip_colocated_subbank: bool = True,
+    skip_tautological_siblings: bool = True,
 ) -> List[AliasViolation]:
     """Run :func:`verify_dim_aliases` over an iterable of ops, sharing
     the alias index across calls.
@@ -390,12 +460,15 @@ def verify_dim_aliases_for_ops(
     multiple ops does not flood the report.
     """
     alias_index = _build_alias_index(registry)
+    tautology_cache: Dict[str, bool] = {}
     seen: set = set()
     out: List[AliasViolation] = []
     for op in ops:
         for v in verify_dim_aliases(
             op, registry, alias_index=alias_index,
             skip_colocated_subbank=skip_colocated_subbank,
+            skip_tautological_siblings=skip_tautological_siblings,
+            tautology_cache=tautology_cache,
         ):
             key = (
                 v.op_name,

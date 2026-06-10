@@ -283,3 +283,106 @@ def test_verify_collects_violations_on_production_ops():
         assert d["kind"] == "dim_alias_read_without_disambiguation"
         assert "read_dim" in d
         assert "conflicting_alias" in d
+
+
+# ---------------------------------------------------------------------------
+# 3) Improvement A (tautology) + Improvement B (same-extent refinement)
+# ---------------------------------------------------------------------------
+
+
+def test_tautological_sibling_suppresses_violations():
+    """A rule reading a dim whose alias parent carries a tautological
+    semantics (``is_byte OR NOT is_byte`` — the TEMP umbrella pattern)
+    must NOT be flagged: the parent declares the slot ambient and
+    overlaps every effective predicate by construction."""
+    reg = DimRegistry(d_model=64)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    # Real dim with a meaningful semantics:
+    reg.alloc("AX_FULL_LO", 8, 16, "AX low half",
+              semantics="mark == AX")
+    # Tautological umbrella aliasing the same range (TEMP-style):
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["TEMP_UMBRELLA"] = DimSlot(
+        name="TEMP_UMBRELLA",
+        start=8, size=16,
+        desc="scratch (ambient)",
+        semantics="is_byte OR NOT is_byte",
+    )
+    reg.alloc("OUT", 32, 1, "out", semantics="mark == AX")
+    rule = FFNRule.constant_write(
+        conditions=(("MARK_AX", 1.0), ("AX_FULL_LO+5", 1.0)),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="reads_ax_full_against_temp_umbrella",
+    )
+    op = _FakeOp([rule], name="op_temp_umbrella")
+    # With tautology skip on (default), no violation.
+    assert verify_dim_aliases(op, reg) == []
+    # With it OFF, the umbrella sibling surfaces as an alias.
+    violations = verify_dim_aliases(
+        op, reg, skip_tautological_siblings=False,
+    )
+    assert any(
+        v.conflicting_alias == "TEMP_UMBRELLA" for v in violations
+    ), f"expected TEMP_UMBRELLA flagged with skip off, got {violations!r}"
+
+
+def test_same_extent_subbank_refinement_is_suppressed():
+    """OPCODE_BASE/OP_LEA both occupy slot 262 size 1; OP_LEA's
+    semantics strictly refines OPCODE_BASE's via ``opcode_at_AX == LEA``.
+    Improvement B recognises this as a same-extent parent/child
+    sub-bank and suppresses the false positive."""
+    reg = DimRegistry(d_model=64)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    # Parent + same-extent child:
+    reg.alloc(
+        "OPCODE_BASE_LIKE", 4, 1, "opcode base banded write",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["OP_LEA_LIKE"] = DimSlot(
+        name="OP_LEA_LIKE",
+        start=4, size=1,
+        desc="LEA one-hot (same slot as OPCODE_BASE_LIKE)",
+        semantics="mark == AX AND opcode_at_AX == LEA",
+    )
+    reg.alloc("OUT", 16, 1, "out", semantics="mark == AX")
+    rule = FFNRule.constant_write(
+        conditions=(("MARK_AX", 1.0), ("OP_LEA_LIKE+0", 1.0)),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="lea_dispatch",
+    )
+    op = _FakeOp([rule], name="lea_subbank")
+    # With colocated-subbank skip on (default), no violation.
+    assert verify_dim_aliases(op, reg) == []
+
+
+def test_same_extent_alias_without_refinement_stays_flagged():
+    """The textbook OPCODE_BYTE_LO/ADDR_B0_LO pair has same extent AND
+    child semantics is a subset of parent's — but the child equals one
+    parent disjunct VERBATIM (no added atoms). Improvement B must NOT
+    suppress this; it remains the textbook real-bug case."""
+    reg = _make_minimal_registry()
+    # The minimal registry already creates OPCODE_BYTE_LO/ADDR_B0_LO
+    # at slot 12 size 16. Reproduce the textbook bad read.
+    bad_rule = FFNRule.constant_write(
+        conditions=(
+            ("MARK_MEM", 1.0),
+            ("OPCODE_BYTE_LO+5", 1.0),
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="bad_read_post_improvement_b",
+    )
+    op = _FakeOp([bad_rule], name="op_textbook_alias")
+    violations = verify_dim_aliases(op, reg)
+    assert any(
+        v.read_dim == "OPCODE_BYTE_LO"
+        and v.conflicting_alias == "ADDR_B0_LO"
+        for v in violations
+    ), (
+        "Improvement B must not suppress textbook OPCODE_BYTE_LO/"
+        "ADDR_B0_LO alias (no semantic refinement, just verbatim "
+        f"disjunct equality); got {violations!r}"
+    )

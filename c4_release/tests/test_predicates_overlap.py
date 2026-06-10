@@ -1,6 +1,12 @@
 """S-3: predicate satisfiability + overlap tests."""
 import pytest
-from neural_vm.unified_compiler.predicates import parse, satisfiable, overlaps
+from neural_vm.unified_compiler.predicates import (
+    is_tautology,
+    overlaps,
+    parse,
+    satisfiable,
+    strictly_refines,
+)
 
 
 # === satisfiable ===
@@ -131,3 +137,81 @@ def test_opcode_byte_lo_byte_index_0_disjoint_from_mark_mem():
     eff = parse("is_byte AND byte_index == 0")
     addr_b0_lo_sem = parse("mark == MEM")
     assert not overlaps(eff, addr_b0_lo_sem)
+
+
+# === is_tautology (Improvement A — dim-alias verifier TEMP umbrella) ===
+
+
+def test_temp_umbrella_semantics_is_tautology():
+    """``is_byte OR NOT is_byte`` is the production umbrella semantics
+    declared on TEMP, TEMP_PREV_STEP, OUTPUT_BYTE_*, STACK0_BYTE*.
+    The verifier MUST detect it as a tautology so those slots can be
+    skipped as alias parents."""
+    assert is_tautology(parse("is_byte OR NOT is_byte"))
+
+
+def test_marker_atom_is_not_tautology():
+    """A non-trivial constraint like ``mark == AX`` is NOT a tautology
+    — there exist positions where it fails. The verifier must keep
+    flagging it as a real alias parent."""
+    assert not is_tautology(parse("mark == AX"))
+
+
+def test_disjunction_of_non_complementary_atoms_is_not_tautology():
+    """``mark == AX OR mark == MEM`` excludes other marker rows and
+    byte rows; not every position satisfies it."""
+    assert not is_tautology(parse("mark == AX OR mark == MEM"))
+
+
+def test_three_way_tautology_with_complementary_pair():
+    """A predicate is a tautology when at least one pair of disjuncts
+    is the complement of another — the verifier's solver must spot
+    this even when an extra disjunct is mixed in."""
+    assert is_tautology(parse("mark == AX OR is_byte OR NOT is_byte"))
+
+
+# === strictly_refines (Improvement B — sub-bank discriminator) ===
+
+
+def test_op_lea_strictly_refines_opcode_base_same_extent():
+    """The textbook same-extent parent/child: OP_LEA's semantics adds
+    an ``opcode_at_AX == LEA`` atom on top of OPCODE_BASE's
+    ``mark == AX`` disjunct. The verifier must classify this as a
+    sub-bank refinement (suppress) — both occupy slot 262 size 1."""
+    op_lea = parse("mark == AX AND opcode_at_AX == LEA")
+    opcode_base = parse("mark == AX OR (is_byte AND byte_index == 0)")
+    assert strictly_refines(op_lea, opcode_base)
+    # The reverse direction must NOT hold — parent does not refine child.
+    assert not strictly_refines(opcode_base, op_lea)
+
+
+def test_addr_b0_lo_does_not_refine_opcode_byte_lo_textbook_alias():
+    """ADDR_B0_LO ``mark == MEM`` equals one disjunct of OPCODE_BYTE_LO
+    ``mark == MEM OR (is_byte AND byte_index == 0)`` VERBATIM — no
+    added atoms, so it is NOT a refinement. The verifier must keep
+    this textbook alias flagged."""
+    addr_b0_lo = parse("mark == MEM")
+    opcode_byte_lo = parse("mark == MEM OR (is_byte AND byte_index == 0)")
+    assert not strictly_refines(addr_b0_lo, opcode_byte_lo)
+    assert not strictly_refines(opcode_byte_lo, addr_b0_lo)
+
+
+def test_op_lev_strictly_refines_opcode_flags_different_extent():
+    """The original strict-containment case still works: OP_LEV (1 wide
+    at byte 270) sits inside OPCODE_FLAGS (34 wide at 262..295) and its
+    semantics adds ``opcode_at_AX == LEV``."""
+    op_lev = parse("mark == AX AND opcode_at_AX == LEV")
+    opcode_flags = parse("mark == AX OR (is_byte AND byte_index == 0)")
+    assert strictly_refines(op_lev, opcode_flags)
+
+
+def test_identical_semantics_is_not_a_refinement():
+    """Two slots that share the SAME semantics (e.g. OP_OR and
+    OPCODE_FLAGS both declared with the umbrella
+    ``mark == AX OR ...``) are NOT in a parent/child refinement
+    relation — they're declared the same way and must remain visible
+    to the alias verifier."""
+    a = parse("mark == AX OR (is_byte AND byte_index == 0)")
+    b = parse("mark == AX OR (is_byte AND byte_index == 0)")
+    assert not strictly_refines(a, b)
+    assert not strictly_refines(b, a)

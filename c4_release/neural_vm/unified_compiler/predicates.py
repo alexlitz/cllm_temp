@@ -1525,6 +1525,77 @@ def overlaps(p: Predicate, q: Predicate) -> bool:
     return satisfiable(And((p, q)))
 
 
+def is_tautology(p: Predicate) -> bool:
+    """Decide whether ``p`` is true at every position (a tautology).
+
+    Implemented via ``not satisfiable(NOT p)``: a predicate is a
+    tautology iff its negation has no satisfying assignment under the
+    pairwise atom-contradiction solver.
+
+    This catches the production "umbrella" semantics
+    ``is_byte OR NOT is_byte`` declared on TEMP, TEMP_PREV_STEP,
+    OUTPUT_BYTE_*, STACK0_BYTE*, and other ambient slots whose role is
+    intentionally unconstrained at the registry level. Such slots
+    trivially "overlap" every other slot at every position; the
+    dim-alias verifier uses :func:`is_tautology` to skip them as alias
+    parents.
+    """
+    try:
+        return not satisfiable(Not(p))
+    except Exception:
+        return False
+
+
+def strictly_refines(child: Predicate, parent: Predicate) -> bool:
+    """Decide whether ``child`` is a *strict refinement* of ``parent``.
+
+    A child predicate strictly refines its parent when:
+
+    1. ``child ⊨ parent`` (every position firing the child also fires
+       the parent), and
+    2. every DNF disjunct of ``child`` properly contains (as an atom
+       set) at least one DNF disjunct of ``parent``. "Properly contains"
+       means the child disjunct adds an atom not present in the parent
+       disjunct it refines — i.e. the child specialises with extra
+       conditions rather than equalling a parent disjunct verbatim.
+
+    This is the distinguishing test the dim-alias verifier uses to
+    separate same-extent parent/child sub-banks (``OP_LEA`` strictly
+    refines ``OPCODE_BASE`` via ``opcode_at_AX == LEA``) from genuine
+    alias pairs (``ADDR_B0_LO`` equals one disjunct of
+    ``OPCODE_BYTE_LO`` verbatim — no added atoms, no refinement).
+    """
+    if not entails(child, parent):
+        return False
+    child_dnf = [d for d in dnf(child) if _disjunct_satisfiable(d)]
+    parent_dnf = [d for d in dnf(parent) if _disjunct_satisfiable(d)]
+    if not child_dnf or not parent_dnf:
+        return False
+    for c_disj in child_dnf:
+        refined = False
+        for p_disj in parent_dnf:
+            # c_disj properly contains p_disj as an atom set iff every
+            # parent atom appears in the child disjunct AND the child
+            # disjunct carries at least one extra atom. "Appears in" is
+            # checked structurally: a parent atom must be subsumed by
+            # some child atom (so step_index in {1,2} refines
+            # step_index in {1,2,3}).
+            if not all(
+                any(atom_subsumes(ca, pa) for ca in c_disj) for pa in p_disj
+            ):
+                continue
+            extras = [
+                ca for ca in c_disj
+                if not any(atom_subsumes(ca, pa) for pa in p_disj)
+            ]
+            if extras:
+                refined = True
+                break
+        if not refined:
+            return False
+    return True
+
+
 def explain_failure(p: Predicate, q: Predicate) -> Optional[str]:
     """Return None if p ⊨ q else a one-line explanation."""
     p_dnf = dnf(p)
