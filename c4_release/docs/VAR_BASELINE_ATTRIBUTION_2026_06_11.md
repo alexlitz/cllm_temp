@@ -127,3 +127,45 @@ the L3 SP_byte2 / L13-witness / MEM-addr paths (not on the failing path at
 this HEAD). Per `feedback_single_rule_fixes_are_zero_sum`, use
 `decl_verifier.py` + block residual decomposition at L6/L10 before any rule
 change. This is a multi-commit frame-prologue surface, not a single rule.
+
+---
+
+## RESOLUTION (2026-06-11, commit fc2beea1) — step-0 JSR→BP leak fixed
+
+**The "dims 79/85 = H2/H3" pin above was read against the STALE
+`dim_registry_dynamic.py`.** In the PRODUCTION `model.dim_positions`,
+dim 79 = `OUTPUT_LO+10` (the value-0xA low-nibble one-hot) and dim 85 =
+`OUTPUT_HI_THIS_STEP+0` — the OUTPUT decode band, not the L0 H2/H3
+attention outputs. (Verify with `probe.model.dim_positions`, not the
+dynamic registry.)
+
+**Actual root cause (probe chain: `probe_var_l20ffn.py` →
+`probe_var_jsr.py`):** the REG_BP byte0 `0x0a` is written by
+`l16_jsr_initial_stack0_marker_0a` (in `make_layer16_lev_routing_op`,
+placed at physical block 29 / logical L20). That rule writes
+`byte_value_writes(0x0A)` — the initial JSR return address — and is
+meant to fire ONLY at the STACK0 marker row, with `-300` blockers on
+the other register markers + IS_BYTE. **OP_JSR is the in-step opcode
+broadcast and reaches ~15.5 at every register marker/byte row**, so
+`OP_JSR*50` scores ~775 and the `-300` blockers no longer veto it → the
+0x0A writer mis-fired at the REG_BP byte rows.
+
+**Fix:** promote the IS_BYTE + non-STACK0-marker blockers in that rule
+to hard NOT-blockers (`-1e6`). Also bounded the L6 JSR PC-target FETCH
+gate (`gate_weight=1/40`) since L5 fetch head 3 amplifies the PC-marker
+FETCH band 40x un-attenuated for the PC-marker consumers.
+
+**Result:** step-0 now emits PC=26 AX=0 SP=0xfff8 **BP=0x00010000** on
+ids 250/262/271 (the 0x0a flood gone). Smoke unchanged 24/8-of-8.
+
+## REMAINING (next agent) — step-1 ENT AX byte0 = 0xf0 (genesis L10)
+
+First divergence now uniformly at `step1 op=ENT reg=AX byte0 exp=0x00
+neural=0xf0`. Genesis: physical block 11 / **L10 FFN unit 2304** writes
+`OUTPUT_HI+15` ≈ +177 at the step-1 AX-marker row, gated by **OP_ENT
+(broadcast ~11.4)**, reading FETCH_HI/ALU_HI/CARRY — a wrong ENT-AX
+materialization that overpowers `layer14_ent_ax_bytes_zero`'s -3/S
+suppressor. SAME class of bug (opcode broadcast defeating intent), but
+the seed is in **L10** (agent a40f8a22's territory). Use
+`probe_var_l10ent.py` pattern. Did NOT pursue to avoid l10_ops textual
+conflicts.
