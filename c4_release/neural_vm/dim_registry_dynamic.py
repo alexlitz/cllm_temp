@@ -254,9 +254,9 @@ def build_default_registry_dynamic() -> DimRegistry:
     # MUL/DIV staging
     # ------------------------------------------------------------------
     pin("MUL_ACCUM",   416, 16, "Multiplication accumulator",
-        "mark == AX OR (is_byte AND byte_index == 0)")
+        "mark == AX AND opcode_at_AX == MUL")
     pin("DIV_STAGING", 432, 16, "Division quotient/remainder",
-        "mark == AX OR (is_byte AND byte_index == 0)")
+        "mark == AX AND opcode_at_AX in {DIV, MOD}")
 
     # ------------------------------------------------------------------
     # Immediate staging
@@ -275,6 +275,13 @@ def build_default_registry_dynamic() -> DimRegistry:
     # STACK0_BYTE1..3, LAST_WAS_*, ACTIVE_OPCODE_*, MARK_THINKING_*)
     # ------------------------------------------------------------------
     pin("TEMP", 480, 32, "General temporaries / reserved", "is_byte OR NOT is_byte")
+    # Phase 9.C: TEMP_PREV_STEP retained — consumed by
+    # ``make_lev_detector_head_op`` (control_flow_heads.py) as a string
+    # literal in op.reads (and exercised by tests/test_lev_detector_head.py).
+    # Aliases TEMP (same start/size/semantics).
+    pin("TEMP_PREV_STEP", 480, 32,
+        "TEMP from previous step (aliases TEMP; consumer: lev_detector_head)",
+        "is_byte OR NOT is_byte", alias=True)
 
     # ==================================================================
     # F-4-extension: aliases that OVERLAP parent slots (OPCODE_FLAGS,
@@ -429,7 +436,7 @@ def build_default_registry_dynamic() -> DimRegistry:
         "mark == AX OR NOT is_byte", alias=True)
     pin("IO_OUTPUT_COUNT", 467, 1,
         "Output bytes remaining (aliases PSH_AT_SP)",
-        "mark == AX OR NOT is_byte", alias=True)
+        "mark == AX AND opcode_at_AX == PRTF", alias=True)
     pin("IO_FORMAT_POS",   468, 1, "Position in format string (aliases MEM_EXEC)",
         "mark == AX OR NOT is_byte", alias=True)
     pin("MEM_EXEC", 468, 1, "Deprecated; retained as IO_FORMAT_POS alias",
@@ -444,10 +451,12 @@ def build_default_registry_dynamic() -> DimRegistry:
     # 487..502 sits inside TEMP.
     pin("FORMAT_PTR_LO", 471, 16,
         "Format string ptr lo nibble (aliases AX_FULL_LO)",
-        "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+        "(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
+        alias=True)
     pin("FORMAT_PTR_HI", 487, 16,
         "Format string ptr hi nibble (aliases AX_FULL_HI)",
-        "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+        "(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
+        alias=True)
     pin("AX_FULL_LO",    471, 16, "Full AX lo nibble (aliases FORMAT_PTR_LO)",
         "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
     pin("AX_FULL_HI",    487, 16, "Full AX hi nibble (aliases FORMAT_PTR_HI)",
@@ -461,9 +470,9 @@ def build_default_registry_dynamic() -> DimRegistry:
 
     # --- "LAST_WAS_*" / "ACTIVE_OPCODE_*" / "MARK_THINKING_*" flags ---
     pin("LAST_WAS_THINKING_END",   501, 1, "Prev token was THINKING_END",
-        "NOT is_byte", alias=True)
+        "NOT is_byte AND NOT mark == AX", alias=True)
     pin("LAST_WAS_THINKING_START", 502, 1, "Prev token was THINKING_START",
-        "NOT is_byte", alias=True)
+        "NOT is_byte AND NOT mark == AX", alias=True)
     pin("LAST_WAS_BYTE", 503, 1, "Prev token was byte (0-255)",
         "is_byte OR NOT is_byte", alias=True)
     pin("LAST_WAS_IO_STATE_EMIT_BYTE", 462, 1,
@@ -483,13 +492,17 @@ def build_default_registry_dynamic() -> DimRegistry:
 
     # --- POST_PRTF aliases (471..502 / 328..359) ---
     pin("POST_PRTF_PC_LO", 471, 16, "Post-PRTF PC lo (aliases AX_FULL_LO)",
-        "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+        "(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
+        alias=True)
     pin("POST_PRTF_PC_HI", 487, 16, "Post-PRTF PC hi (aliases AX_FULL_HI)",
-        "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+        "(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
+        alias=True)
     pin("POST_PRTF_SP_LO", 328, 16, "Post-PRTF SP lo (aliases AX_CARRY_LO)",
-        "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+        "(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
+        alias=True)
     pin("POST_PRTF_SP_HI", 344, 16, "Post-PRTF SP hi (aliases AX_CARRY_HI)",
-        "mark == AX OR (is_byte AND byte_index == 0)", alias=True)
+        "(mark == AX OR (is_byte AND byte_index == 0)) AND opcode_at_AX == PRTF",
+        alias=True)
 
     # --- Opcode-byte aliases (12, 28) — alias ADDR_B0_LO / ADDR_B1_LO ---
     pin("OPCODE_BYTE_LO", 12, 16, "Opcode byte lo nibble (aliases ADDR_B0_LO)",
