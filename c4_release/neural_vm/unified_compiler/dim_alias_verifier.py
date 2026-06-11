@@ -300,13 +300,59 @@ def _is_colocated_subbank(
     try:
         if a_in_b and not b_in_a:
             # A strictly inside B's range -> A is the child candidate.
-            return strictly_refines(p_a, p_b)
-        if b_in_a and not a_in_b:
-            return strictly_refines(p_b, p_a)
-        # Equal extents: either could be the refinement of the other.
-        return strictly_refines(p_a, p_b) or strictly_refines(p_b, p_a)
+            if strictly_refines(p_a, p_b):
+                return True
+        elif b_in_a and not a_in_b:
+            if strictly_refines(p_b, p_a):
+                return True
+        else:
+            # Equal extents: either could be the refinement of the other.
+            if strictly_refines(p_a, p_b) or strictly_refines(p_b, p_a):
+                return True
     except Exception:
         return False
+
+    # ------------------------------------------------------------------
+    # Improvement L (2026-06-11): identical-semantics overlapping
+    # sub-bank. When one slot's byte range is STRICTLY CONTAINED inside
+    # the other AND the two carry LOGICALLY-EQUIVALENT semantics, the
+    # smaller slot is a sub-slice (lane/cell) of the larger BANK that
+    # spans the same positions. Reading the cell's bytes reads exactly
+    # those bytes of the bank — there is no third writer at the
+    # contained bytes, so the cell and the bank name the SAME residual
+    # content. This is the same-physical-signal sub-bank relationship:
+    #
+    #   * ``OP_OR`` / ``OP_AND`` (1-wide opcode-flag cells, ``category ==
+    #     "opcode_flag"``) sit inside ``OPCODE_FLAGS`` (34-wide one-hot
+    #     bank). Their registry semantics is the DSL-keyword fallback
+    #     ``mark == AX OR (is_byte AND byte_index == 0)`` — identical to
+    #     the parent bank (OR/AND are reserved predicate keywords so the
+    #     ``opcode_at_AX == OR`` atom cannot be expressed; the cell
+    #     CANNOT ``strictly_refine`` the bank above). The cell is still a
+    #     genuine one-hot lane of the bank: reading ``OP_OR+0`` reads byte
+    #     276, which IS the OR lane of ``OPCODE_FLAGS``.
+    #   * ``ADDR_B0_HI`` (16-wide, ``aliases ADDR_KEY[0:16]``) sits inside
+    #     ``ADDR_KEY`` (48-wide one-hot key bank); both ``mark == MEM``.
+    #
+    # The discriminator is ``entails`` BOTH ways (logical equivalence)
+    # under strict byte containment. Containment + equivalence is
+    # provably same-signal: two DISTINCT signals overlapping on a
+    # byte-sub-range are modelled in the registry as time-shared via
+    # DISTINCT semantics / opcode-owner discriminators (e.g.
+    # ``AX_CARRY_LO`` vs ``POST_PRTF_SP_LO`` are separated by the
+    # opcode_in_step owner table, NOT by equivalent semantics), so they
+    # never reach this branch. Equal-extent equivalence is deliberately
+    # NOT accepted here (no containment hierarchy ⇒ no bank/cell role);
+    # those pairs are left to the eff-based suppressors below.
+    a_strict_in_b = a_in_b and not b_in_a
+    b_strict_in_a = b_in_a and not a_in_b
+    if a_strict_in_b or b_strict_in_a:
+        try:
+            if entails(p_a, p_b) and entails(p_b, p_a):
+                return True
+        except Exception:
+            return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +959,180 @@ def _slot_semantics_is_tautology(
     return cache[name]
 
 
+# ---------------------------------------------------------------------------
+# Improvement G (2026-06-11): read_dim role strictly contained in sibling
+# ---------------------------------------------------------------------------
+#
+# Some alias pairs are reverse-role: the rule reads the NARROWER alias at
+# a position the narrower alias owns, while the WIDER sibling merely
+# co-claims a superset of positions. The textbook case is the L9 BP+8
+# shift band:
+#
+#   * ``ADDR_B0_LO`` semantics ``mark == MEM`` (narrow role: the gathered
+#     MEM-address byte).
+#   * ``OPCODE_BYTE_LO`` semantics ``mark == MEM OR (is_byte AND
+#     byte_index == 0)`` (wider: also claims opcode-byte-0 rows).
+#
+# A rule reading ``ADDR_B0_LO+k`` with ``eff == mark == MEM`` fires only
+# at MEM-marker rows. At those rows ``ADDR_B0_LO`` is the active writer
+# (its narrower ``mark == MEM`` role is the one that holds), and the
+# wider ``OPCODE_BYTE_LO`` claim degenerates to the SAME ``mark == MEM``
+# disjunct there. The read returns the address byte the rule wants — no
+# ambiguity.
+#
+# Suppress when BOTH:
+#   1. ``eff ⊨ read_dim_sem`` — every firing position is one the read_dim
+#      explicitly claims (so the read_dim IS the writer there), AND
+#   2. ``read_dim_sem`` STRICTLY entails ``sibling_sem`` — the read_dim's
+#      role is a PROPER subset of the sibling's, i.e. the read_dim is the
+#      narrower of the two. (Strict, not mutual: a mutually-equivalent
+#      pair has no narrower role and is handled by the containment
+#      sub-bank branch in ``_is_colocated_subbank`` instead, which
+#      additionally requires byte containment to prove same-signal.)
+#
+# Conservative: the textbook FORWARD bug (rule reads ``OPCODE_BYTE_LO+k``
+# at ``mark == MEM``) is NOT suppressed because there ``read_dim`` is the
+# WIDER slot — ``read_dim_sem`` (OPCODE_BYTE_LO) does NOT entail
+# ``sibling_sem`` (ADDR_B0_LO), so condition 2 fails and the violation
+# stands.
+def _eff_role_contained_in_sibling(
+    eff: Predicate,
+    read_sem: Optional[str],
+    sibling_sem: Optional[str],
+) -> bool:
+    if read_sem is None or sibling_sem is None:
+        return False
+    try:
+        p_read = parse(read_sem)
+        p_sib = parse(sibling_sem)
+    except Exception:
+        return False
+    try:
+        # read_dim must be the NARROWER role: read ⊨ sib but NOT sib ⊨ read.
+        if not entails(p_read, p_sib):
+            return False
+        if entails(p_sib, p_read):
+            # Mutual equivalence — no narrower/wider hierarchy. Leave to
+            # the byte-containment sub-bank branch.
+            return False
+        # The rule must fire only where the (narrower) read_dim is the
+        # active writer.
+        return entails(eff, p_read)
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Improvement K (2026-06-11): eff disjoint from read_dim's own write zone
+# ---------------------------------------------------------------------------
+#
+# Some rules deliberately read an aliased slot at positions the slot's
+# OWN semantics does NOT claim — a deliberate alias-traversal that
+# consumes the SIBLING's value through the shared byte range. The
+# textbook case is the L14 address-key neural decode:
+#
+#   * ``l14_addr_key_top_common_off3_b1lo*`` reads ``ADDR_B1_LO+k``
+#     (semantics ``mark == MEM``) with ``eff ==
+#     (is_byte OR NOT is_byte) AND NOT mark == MEM`` — i.e. the rule
+#     fires ONLY at NON-MEM rows (byte rows), explicitly the positions
+#     where ``ADDR_B1_LO`` is NOT the writer. There the shared slot
+#     carries the sibling ``OPCODE_BYTE_HI`` byte-0 value, which is
+#     exactly what the decode is built to consume.
+#
+# When ``eff ⊨ NOT read_dim_sem`` the rule never fires at a position the
+# read_dim claims, so the read is by-construction reading the aliased
+# sibling content — a deliberate traversal, not an accidental misread.
+#
+# Symmetric to Improvement G (which suppresses reads INSIDE the read_dim's
+# zone where its narrower role holds). The textbook OPCODE_BYTE_LO-at-MEM
+# bug is NOT touched because its eff is INSIDE the read_dim's zone
+# (``mark == MEM`` ⊨ ``mark == MEM OR ...``), not disjoint from it.
+def _eff_disjoint_from_read_dim(
+    eff: Predicate,
+    read_sem: Optional[str],
+) -> bool:
+    if read_sem is None:
+        return False
+    try:
+        p_read = parse(read_sem)
+    except Exception:
+        return False
+    try:
+        # eff ⊨ NOT read_sem  <=>  eff AND read_sem is unsatisfiable.
+        return not satisfiable(And((eff, p_read)))
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Improvement M (2026-06-11): logically-equivalent same-signal alias
+# ---------------------------------------------------------------------------
+#
+# Two overlapping slots whose semantics are LOGICALLY EQUIVALENT and which
+# carry NO distinguishing opcode/phase owner are the SAME physical signal
+# under two names — a deliberate aliasing convenience, not a read bug.
+# Examples in the production registry:
+#
+#   * ``FETCH_HI`` ↔ ``IMM_STAGING`` — both the fetched-immediate bus
+#     (semantics ``mark == PC OR (is_byte AND byte_index in {0,1,2,3})``,
+#     phase owners both ``{FETCH, DECODE}``). FETCH_HI [436..452) overlaps
+#     IMM_STAGING [448..464) on bytes 448..451 (partial, NOT containment),
+#     so the byte-containment sub-bank branch cannot fire.
+#   * ``IO_FORMAT_POS`` ↔ ``MEM_EXEC`` — ``MEM_EXEC`` is registry-
+#     documented as "Deprecated; retained as IO_FORMAT_POS alias". Same
+#     1-wide byte [468..469) (equal extent, no containment hierarchy),
+#     identical semantics.
+#
+# Safety. The registry distinguishes every GENUINE different-signal pair
+# that shares a byte range by ENRICHING its semantics with an opcode /
+# phase atom (e.g. ``AX_CARRY_LO`` carries the ALU-opcode owner set and
+# ``POST_PRTF_SP_LO`` carries ``opcode_at_AX == PRTF``; ``DIV_STAGING``
+# carries ``opcode_at_AX in {DIV, MOD}``). Those pairs are therefore NOT
+# logically equivalent (``equiv_sem == False``) and never reach this
+# branch. Belt-and-suspenders: we additionally require that the two slots
+# carry NO DIFFERING non-empty opcode-owner OR phase-owner set, so even a
+# future registry edit that leaves two distinct signals equivalent-in-
+# string but separable via the owner tables stays flagged.
+def _equivalent_semantics_same_signal(
+    registry: DimRegistry,
+    read_dim: str,
+    sibling: str,
+    read_sem: Optional[str],
+    sibling_sem: Optional[str],
+    opcode_semantics_cache: Dict[str, Optional[frozenset[str]]],
+) -> bool:
+    if read_sem is None or sibling_sem is None:
+        return False
+    try:
+        p_read = parse(read_sem)
+        p_sib = parse(sibling_sem)
+    except Exception:
+        return False
+    try:
+        if not (entails(p_read, p_sib) and entails(p_sib, p_read)):
+            return False
+    except Exception:
+        return False
+    # Belt-and-suspenders discriminator: require the two slots to carry
+    # the EXACT SAME opcode-owner set AND the EXACT SAME phase-owner set
+    # (``None == None`` counts as same). Any asymmetry — one slot pinned
+    # to ``{PRTF}`` while the other is owner-agnostic, or differing owner
+    # sets — marks them as distinct time-shared signals (e.g. the
+    # ``AX_CARRY_LO`` ↔ ``POST_PRTF_SP_LO`` pair where only the latter is
+    # in the owner table), so M must NOT collapse them. Both production
+    # same-signal pairs (FETCH_HI ↔ IMM_STAGING, IO_FORMAT_POS ↔
+    # MEM_EXEC) carry identical owner sets on both sides.
+    oa = _slot_opcode_in_step_set(registry, read_dim, opcode_semantics_cache)
+    ob = _slot_opcode_in_step_set(registry, sibling, opcode_semantics_cache)
+    if oa != ob:
+        return False
+    pa = _slot_phase_in_step_set(read_dim)
+    pb = _slot_phase_in_step_set(sibling)
+    if pa != pb:
+        return False
+    return True
+
+
 def verify_dim_aliases(
     op,
     registry: DimRegistry,
@@ -922,6 +1142,9 @@ def verify_dim_aliases(
     skip_tautological_siblings: bool = True,
     skip_opcode_in_step_disjoint: bool = True,
     skip_phase_in_step_disjoint: bool = True,
+    skip_role_contained_in_sibling: bool = True,
+    skip_eff_disjoint_from_read_dim: bool = True,
+    skip_equivalent_same_signal: bool = True,
     tautology_cache: Optional[Dict[str, bool]] = None,
     opcode_semantics_cache: Optional[
         Dict[str, Optional[frozenset[str]]]
@@ -1026,6 +1249,10 @@ def verify_dim_aliases(
                 _slot_semantics_is_tautology(
                     registry, dim_name, tautology_cache,
                 )
+            # Improvements G/K (2026-06-11) read the read_dim's own
+            # semantics to decide whether the rule fires inside (G) or
+            # outside (K) the read_dim's declared write zone.
+            read_dim_sem = _slot_semantics(registry, dim_name)
             for sibling in siblings:
                 if read_dim_taut:
                     continue
@@ -1120,6 +1347,42 @@ def verify_dim_aliases(
                         and rule_opcode_set.issubset(displacer)
                     ):
                         continue
+                # Improvement G (2026-06-11): read_dim's narrower role is
+                # the active writer at every firing position, and that
+                # role is a PROPER subset of the sibling's wider claim.
+                # The read returns the read_dim's own value, not the
+                # sibling's. Catches the L9 BP+8 shift band reading
+                # ADDR_B0_LO (mark == MEM) at mark == MEM rows where
+                # OPCODE_BYTE_LO merely co-claims the broader byte-0
+                # range.
+                if skip_role_contained_in_sibling and \
+                        _eff_role_contained_in_sibling(
+                            eff, read_dim_sem, sibling_sem,
+                        ):
+                    continue
+                # Improvement K (2026-06-11): the rule fires ONLY at
+                # positions the read_dim explicitly does NOT claim
+                # (eff ⊨ NOT read_dim_sem). The read is a deliberate
+                # alias-traversal of the sibling's content, not an
+                # accidental misread. Catches the L14 addr_key neural
+                # decode reading ADDR_B1_LO at NON-MEM byte rows to
+                # consume the OPCODE_BYTE_HI byte-0 value.
+                if skip_eff_disjoint_from_read_dim and \
+                        _eff_disjoint_from_read_dim(eff, read_dim_sem):
+                    continue
+                # Improvement M (2026-06-11): read_dim and sibling have
+                # logically-equivalent semantics and no distinguishing
+                # opcode/phase owner — they are the SAME physical signal
+                # under two names (FETCH_HI ↔ IMM_STAGING fetched-immediate
+                # bus; IO_FORMAT_POS ↔ deprecated MEM_EXEC alias). No
+                # ambiguity: both names denote the same residual content.
+                if skip_equivalent_same_signal and \
+                        _equivalent_semantics_same_signal(
+                            registry, dim_name, sibling,
+                            read_dim_sem, sibling_sem,
+                            opcode_semantics_cache,
+                        ):
+                    continue
                 violations.append(
                     AliasViolation(
                         op_name=op_name,
@@ -1142,6 +1405,9 @@ def verify_dim_aliases_for_ops(
     skip_tautological_siblings: bool = True,
     skip_opcode_in_step_disjoint: bool = True,
     skip_phase_in_step_disjoint: bool = True,
+    skip_role_contained_in_sibling: bool = True,
+    skip_eff_disjoint_from_read_dim: bool = True,
+    skip_equivalent_same_signal: bool = True,
 ) -> List[AliasViolation]:
     """Run :func:`verify_dim_aliases` over an iterable of ops, sharing
     the alias index across calls.
@@ -1162,6 +1428,11 @@ def verify_dim_aliases_for_ops(
             skip_tautological_siblings=skip_tautological_siblings,
             skip_opcode_in_step_disjoint=skip_opcode_in_step_disjoint,
             skip_phase_in_step_disjoint=skip_phase_in_step_disjoint,
+            skip_role_contained_in_sibling=skip_role_contained_in_sibling,
+            skip_eff_disjoint_from_read_dim=(
+                skip_eff_disjoint_from_read_dim
+            ),
+            skip_equivalent_same_signal=skip_equivalent_same_signal,
             tautology_cache=tautology_cache,
             opcode_semantics_cache=opcode_semantics_cache,
         ):

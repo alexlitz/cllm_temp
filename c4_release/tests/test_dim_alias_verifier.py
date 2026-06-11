@@ -201,8 +201,13 @@ def test_colocated_alias_is_not_flagged():
     # With co-location filtering on (default), no violation.
     assert verify_dim_aliases(op, reg) == []
     # With co-location filtering OFF, the parent/child overlap surfaces.
+    # Improvement G (role-contained-in-sibling) ALSO recognises OP_LEV as
+    # the narrower role inside OPCODE_FLAGS and suppresses independently,
+    # so disable it here to isolate the colocated-subbank path under test.
     violations = verify_dim_aliases(
-        op, reg, skip_colocated_subbank=False,
+        op, reg,
+        skip_colocated_subbank=False,
+        skip_role_contained_in_sibling=False,
     )
     assert any(
         v.read_dim == "OP_LEV" and v.conflicting_alias == "OPCODE_FLAGS"
@@ -857,7 +862,14 @@ def test_phase_in_step_overlapping_phases_do_not_suppress():
         name="fetch_reads_fetch_hi_imm_overlap",
     )
     op = _FakeOp([rule], name="op_fetch_phase_overlap_imm")
-    violations = verify_dim_aliases(op, reg)
+    # These stubs share IDENTICAL semantics AND identical phase owners —
+    # exactly the same-signal pattern Improvement M (equivalent-same-
+    # signal) collapses. Disable M here to isolate the phase-disjointness
+    # path under test (the point of this case is that phase disjointness
+    # alone CANNOT fire for a same-phase pair).
+    violations = verify_dim_aliases(
+        op, reg, skip_equivalent_same_signal=False,
+    )
     # FETCH_HI's owners {FETCH,DECODE} intersect IMM_STAGING's
     # {FETCH,DECODE}; phase disjointness CAN'T fire — violation must stand.
     assert any(
@@ -983,3 +995,229 @@ def test_displaced_ambient_slot_suppresses_violation():
             _dav._SLOT_DISPLACED_BY.pop("AX_FULL_HI_LIKE", None)
         else:
             _dav._SLOT_DISPLACED_BY["AX_FULL_HI_LIKE"] = saved_displ
+
+
+# ---------------------------------------------------------------------------
+# Raw-corpus closers (2026-06-11): Improvements G, K, L, M
+# ---------------------------------------------------------------------------
+
+
+def test_role_contained_in_sibling_suppresses_reverse_read():
+    """Improvement G: a rule reading the NARROWER alias (ADDR_B0_LO,
+    ``mark == MEM``) at a position the narrower alias owns is safe even
+    though the WIDER sibling (OPCODE_BYTE_LO) co-claims a superset of
+    positions. The read returns the read_dim's own value."""
+    reg = _make_minimal_registry()
+    rule = FFNRule.constant_write(
+        conditions=(
+            ("MARK_MEM", 1.0),
+            ("ADDR_B0_LO+5", 1.0),  # reads the NARROWER alias
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="l9_bp_plus8_shift_like",
+    )
+    op = _FakeOp([rule], name="op_reverse_read")
+    # Default: Improvement G suppresses (read_dim is the narrower role).
+    assert verify_dim_aliases(op, reg) == []
+    # Disabled: the overlap surfaces.
+    violations = verify_dim_aliases(
+        op, reg, skip_role_contained_in_sibling=False,
+    )
+    assert any(
+        v.read_dim == "ADDR_B0_LO"
+        and v.conflicting_alias == "OPCODE_BYTE_LO"
+        for v in violations
+    ), f"with G off, expected ADDR_B0_LO<->OPCODE_BYTE_LO, got {violations!r}"
+
+
+def test_role_containment_does_not_suppress_forward_textbook_bug():
+    """Improvement G must NOT suppress the textbook FORWARD bug: reading
+    the WIDER alias (OPCODE_BYTE_LO) at ``mark == MEM`` where the slot
+    actually carries the address byte. There read_dim is the wider slot
+    so ``read_dim_sem`` does NOT entail ``sibling_sem`` and G stands
+    down."""
+    reg = _make_minimal_registry()
+    bad = FFNRule.constant_write(
+        conditions=(
+            ("MARK_MEM", 1.0),
+            ("OPCODE_BYTE_LO+5", 1.0),  # reads the WIDER alias
+        ),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="forward_textbook_bug",
+    )
+    op = _FakeOp([bad], name="op_forward_bug")
+    violations = verify_dim_aliases(op, reg)
+    assert any(
+        v.read_dim == "OPCODE_BYTE_LO"
+        and v.conflicting_alias == "ADDR_B0_LO"
+        for v in violations
+    ), (
+        "Improvement G must not suppress the textbook forward bug; "
+        f"got {violations!r}"
+    )
+
+
+def test_eff_disjoint_from_read_dim_helper():
+    """Improvement K (helper unit test): ``_eff_disjoint_from_read_dim``
+    returns True iff the rule's eff fires ONLY at positions the read_dim
+    does NOT claim (``eff |= NOT read_dim_sem``) — a deliberate alias-
+    traversal of the sibling's content. Mirrors the L14 addr_key decode
+    reading ADDR_B1_LO (``mark == MEM``) at NON-MEM byte rows
+    (``eff == (is_byte OR NOT is_byte) AND NOT mark == MEM``).
+
+    Tested at the helper level because ``effective_predicate``'s
+    composition of positive-read semantics + hard blockers is hard to
+    reproduce faithfully on a synthetic registry; the END-TO-END coverage
+    for K is the raw-corpus ratchet
+    (``test_raw_factory_corpus_has_zero_dim_alias_violations``), where the
+    real L14 ``ADDR_B1_LO <-> OPCODE_BYTE_HI`` family is suppressed by K.
+    """
+    from neural_vm.unified_compiler.dim_alias_verifier import (
+        _eff_disjoint_from_read_dim,
+    )
+    from neural_vm.unified_compiler.predicates import parse
+
+    # L14-shaped eff: fires only at NON-MEM rows.
+    eff = parse("(is_byte OR NOT is_byte) AND NOT mark == MEM")
+    # ADDR_B1_LO's own zone is ``mark == MEM`` — disjoint from eff.
+    assert _eff_disjoint_from_read_dim(eff, "mark == MEM") is True
+    # The textbook FORWARD bug eff (``mark == MEM``) is INSIDE the
+    # read_dim's zone — NOT disjoint, so K must stand down.
+    eff_forward = parse("mark == MEM")
+    assert _eff_disjoint_from_read_dim(eff_forward, "mark == MEM") is False
+    # An eff that partly overlaps the zone is also not disjoint.
+    eff_partial = parse("mark == MEM OR mark == AX")
+    assert _eff_disjoint_from_read_dim(eff_partial, "mark == MEM") is False
+    # No read semantics -> conservative False.
+    assert _eff_disjoint_from_read_dim(eff, None) is False
+
+
+def test_opcode_flag_subbank_cell_is_suppressed():
+    """Improvement L: an opcode-flag CELL whose registry semantics is the
+    DSL-keyword fallback (identical to the parent bank, e.g. OP_OR /
+    OP_AND inside OPCODE_FLAGS) is a one-hot lane of the bank. Byte
+    containment + logically-equivalent semantics => same physical signal;
+    suppress."""
+    reg = DimRegistry(d_model=64)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    # Parent bank.
+    reg.alloc(
+        "OPCODE_FLAGS_LIKE", 4, 16, "one-hot opcode bank",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    # Cell with the DSL-keyword fallback (identical sem to the bank).
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["OP_OR_LIKE"] = DimSlot(
+        name="OP_OR_LIKE", start=10, size=1,
+        desc="OPCODE_FLAGS_LIKE[6] = OR active flag (DSL-keyword fallback)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    reg.alloc("OUT", 24, 1, "out", semantics="mark == AX")
+    rule = FFNRule.constant_write(
+        conditions=(("MARK_AX", 1.0), ("OP_OR_LIKE+0", 1.0)),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="l10_bitwise_or_like",
+    )
+    op = _FakeOp([rule], name="op_opcode_cell")
+    # Default: colocated-subbank (containment + equiv) suppresses.
+    assert verify_dim_aliases(op, reg) == []
+    # Disabled: the cell/bank overlap surfaces. Improvement M would ALSO
+    # collapse this (equivalent sem, equal owners), so disable it too to
+    # isolate the colocated-subbank containment path under test.
+    violations = verify_dim_aliases(
+        op, reg,
+        skip_colocated_subbank=False,
+        skip_equivalent_same_signal=False,
+    )
+    assert any(
+        v.read_dim == "OP_OR_LIKE"
+        and v.conflicting_alias == "OPCODE_FLAGS_LIKE"
+        for v in violations
+    ), f"with subbank skip off, expected cell/bank overlap, got {violations!r}"
+
+
+def test_equivalent_same_signal_alias_is_suppressed():
+    """Improvement M: two overlapping slots with logically-equivalent
+    semantics and IDENTICAL owner sets are the same physical signal under
+    two names (FETCH_HI <-> IMM_STAGING fetched-immediate bus). Suppress.
+    """
+    reg = DimRegistry(d_model=128)
+    reg.alloc("MARK_PC", 0, 1, "PC marker", semantics="mark == PC")
+    reg.alloc(
+        "ALIAS_A", 64, 16, "signal A",
+        semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})",
+    )
+    from neural_vm.dim_registry import DimSlot
+    # Equal-extent equivalent-semantics alias (the IO_FORMAT_POS<->MEM_EXEC
+    # equal-extent case the byte-containment branch deliberately skips).
+    reg.slots["ALIAS_B"] = DimSlot(
+        name="ALIAS_B", start=64, size=16,
+        desc="signal B (deprecated alias of ALIAS_A)",
+        semantics="mark == PC OR (is_byte AND byte_index in {0, 1, 2, 3})",
+    )
+    reg.alloc("OUT", 96, 1, "out", semantics="mark == AX")
+    rule = FFNRule.constant_write(
+        conditions=(("MARK_PC", 1.0), ("ALIAS_A+5", 1.0)),
+        threshold=0.5,
+        writes=(("OUT", 1.0),),
+        name="reads_alias_a",
+    )
+    op = _FakeOp([rule], name="op_same_signal")
+    # Default: Improvement M suppresses (equivalent sem, equal owners).
+    assert verify_dim_aliases(op, reg) == []
+    # Disabled: the overlap surfaces.
+    violations = verify_dim_aliases(
+        op, reg, skip_equivalent_same_signal=False,
+    )
+    assert any(
+        v.read_dim == "ALIAS_A" and v.conflicting_alias == "ALIAS_B"
+        for v in violations
+    ), f"with M off, expected ALIAS_A<->ALIAS_B, got {violations!r}"
+
+
+def test_equivalent_same_signal_does_not_collapse_distinct_owners():
+    """Improvement M must NOT collapse two equivalent-semantics slots when
+    their owner sets DIFFER (one pinned to {PRTF}, the other agnostic) —
+    that asymmetry marks them as distinct time-shared signals
+    (AX_CARRY_LO <-> POST_PRTF_SP_LO style)."""
+    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    reg = DimRegistry(d_model=128)
+    reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
+    reg.alloc(
+        "CARRY_LIKE", 32, 16, "ALU carry (agnostic owners)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    from neural_vm.dim_registry import DimSlot
+    reg.slots["POST_PRTF_LIKE"] = DimSlot(
+        name="POST_PRTF_LIKE", start=32, size=16,
+        desc="post-PRTF save (PRTF-owned, equivalent sem to CARRY_LIKE)",
+        semantics="mark == AX OR (is_byte AND byte_index == 0)",
+    )
+    reg.alloc("OUT", 64, 1, "out", semantics="mark == AX")
+    saved = _dav._SLOT_OPCODE_OWNERS.get("POST_PRTF_LIKE")
+    _dav._SLOT_OPCODE_OWNERS["POST_PRTF_LIKE"] = frozenset({"PRTF"})
+    try:
+        rule = FFNRule.constant_write(
+            conditions=(("MARK_AX", 1.0), ("CARRY_LIKE+5", 1.0)),
+            threshold=0.5,
+            writes=(("OUT", 1.0),),
+            name="reads_carry_like",
+        )
+        op = _FakeOp([rule], name="op_distinct_owner_alias")
+        violations = verify_dim_aliases(op, reg)
+        assert any(
+            v.read_dim == "CARRY_LIKE"
+            and v.conflicting_alias == "POST_PRTF_LIKE"
+            for v in violations
+        ), (
+            "Improvement M must NOT collapse equivalent-sem slots with "
+            f"differing owner sets; got {violations!r}"
+        )
+    finally:
+        if saved is None:
+            _dav._SLOT_OPCODE_OWNERS.pop("POST_PRTF_LIKE", None)
+        else:
+            _dav._SLOT_OPCODE_OWNERS["POST_PRTF_LIKE"] = saved
