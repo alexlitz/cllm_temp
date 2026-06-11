@@ -4680,6 +4680,21 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         (f"CLEAN_EMBED_HI+{hi}", 30.0),
                         ("FETCH_HI+15", 100.0),
                         ("TEMP+10", 80.0),
+                        # IMM-decode residual fix (2026-06-11): this byte-1=0xFF
+                        # LEA local-address preserve keys on the byte-0 value
+                        # (CLEAN_EMBED e8/e0/d8) but had NO opcode gate, so a
+                        # plain ``IMM 0xE0/0xE8/0xD8; EXIT`` byte-1 row -- whose
+                        # immediate value coincidentally matches the frame-
+                        # address signature -- mis-fired (score ~156 >= 150),
+                        # emitting byte1=0xff (0xE0 -> 0xFFE0). These are the 3
+                        # residual IMM mis-decodes left after the cell-8 0xE8
+                        # keystone fix. spec_k=0 attribution:
+                        # tools/probe_imm_byte1_residual.py. FIX
+                        # (broadcast-hardening, mirrors the sibling fixes this
+                        # session): OP_IMM hard NOT-blocker so an IMM step can
+                        # never satisfy it; the legit LEA byte-1 preserve
+                        # (OP_IMM=0) is byte-identical.
+                        ("OP_IMM", -1_000_000.0),
                         ("MARK_AX", -10000.0),
                         ("MARK_PC", -10000.0),
                         ("MARK_SP", -10000.0),
