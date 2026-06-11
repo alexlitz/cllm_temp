@@ -7,8 +7,14 @@ this file is the contributor-facing one.
 
 ## Architecture in one paragraph
 
-The neural VM is a transformer (~18 layers, 8 heads, d_model=512) whose
-weights compute the full C4 instruction set deterministically. Every
+The neural VM is a transformer (**27 logical layers**, `d_model=872`,
+`vocab=276`; head count varies per block) whose weights compute the full
+C4 instruction set deterministically. Logical layers expand to **37
+physical blocks** post-`_expand_wrapper_blocks` (each logical layer's
+`post_ops` become passthrough blocks): L8 +1, L14 +8, L25 +1. For the
+authoritative block↔layer map and the spec_k=0 ground-truth probe, see
+[`docs/PROBE_GROUNDTRUTH_2026_06_10.md`](docs/PROBE_GROUNDTRUTH_2026_06_10.md)
+and [`tools/probe_groundtruth.py`](tools/probe_groundtruth.py). Every
 opcode (LEA, IMM, JMP, JSR, BZ, BNZ, ENT, ADJ, LEV, LI, SI, PSH,
 OR/XOR/AND, EQ/NE/LT/GT/LE/GE, SHL/SHR, ADD/SUB/MUL/DIV/MOD, EXIT) is
 implemented by hand-authored weights, lowered from declarative IR
