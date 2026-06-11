@@ -1238,6 +1238,29 @@ class AutoregressiveVMRunner:
             next_token = self._generate_next_cached(generation_context)
             context.append(next_token)
 
+            # Re-anchor the per-step compare position to the model's own
+            # step structure. ``DraftVM.draft_tokens()`` always lays a step
+            # out as ``[REG_PC, ...]`` (REG_PC is draft offset 0). The model
+            # marks the start of every emitted VM step with the same REG_PC
+            # token, but its real step length is not rigidly 35 tokens — it
+            # occasionally emits a stray boundary token, which slips
+            # ``draft_step_pos`` permanently out of phase with the DraftVM
+            # reference after the first step. That phase slip made ~half of
+            # the per-token compares spuriously mismatch on short, correct
+            # programs (e.g. the smoke CMP/MEM tests), pushing the 50-token
+            # window over ``_DRAFT_BAIL_RATE`` and tripping a FALSE
+            # ``draft_divergence`` bail that truncated execution before the
+            # result was computed. That false bail is why the spec_k=0 serial
+            # path diverged from the spec_k>0 serial path (which has no bail)
+            # and from the batched ``spec_k=0`` smoke gate. Re-anchoring on
+            # REG_PC keeps the compare in phase with the model's actual step
+            # boundaries; genuine divergence (wrong VALUE bytes after the
+            # marker) still trips the window. ``draft_step_pos`` is reset
+            # BEFORE the compare so the REG_PC token itself lines up with
+            # draft offset 0.
+            if next_token == Token.REG_PC and self._draft_step_tokens is not None:
+                draft_step_pos = 0
+
             # Primary divergence signal: compare against DraftVM's
             # deterministic prediction for this token offset within the
             # current VM step. The 50-token sliding window absorbs the
