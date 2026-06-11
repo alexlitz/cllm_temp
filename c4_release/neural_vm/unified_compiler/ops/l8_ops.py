@@ -958,6 +958,25 @@ def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
                 # broadcasts OP_LEV / BP_FRAME_* into MARK_SE_ONLY so
                 # the same SwiGLU AND fires at STEP_END.
                 ("MARK_SE_ONLY", 1.0),
+                # Opcode-broadcast hardening (2026-06-11, batch fix): the only
+                # positive non-opcode condition is MARK_SE_ONLY, so a broadcast
+                # OP_LEV (in-step, addressed to EVERY row) could otherwise let
+                # this fire at a non-STEP_END row (OP_LEV*1 alone > thr 1.5).
+                # The legit firing row is STEP_END (MARK_SE_ONLY=1), where
+                # IS_BYTE and every register MARK_* are 0 (verified spec_k=0 at
+                # the L8-input residual for the JSR/ENT/LEV function program),
+                # so these hard -1e6 NOT-blockers are SUBTRACTIVE (byte-
+                # identical at the legit row) and veto every byte/marker row
+                # regardless of the OP_LEV broadcast. Mirrors the MARK_MEM=-1e6
+                # hard blocker on the sibling l9_bp_plus8_shift_*_step_end rules
+                # (same MARK_SE_ONLY regime).
+                ("IS_BYTE", -1e6),
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=1.5,
             gate="CONST",
@@ -987,6 +1006,18 @@ def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
                 # broadcasts OP_LEV / BP_FRAME_* into MARK_SE_ONLY so
                 # the same SwiGLU AND fires at STEP_END.
                 ("MARK_SE_ONLY", 1.0),
+                # Opcode-broadcast hardening (2026-06-11, batch fix): see
+                # l8_alu_lev_b1_step_end above. STEP_END is the legit row;
+                # IS_BYTE + register MARK_* are all 0 there, so these hard -1e6
+                # NOT-blockers are subtractive (byte-identical at the legit
+                # row) and veto the broadcast everywhere else.
+                ("IS_BYTE", -1e6),
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=1.5,
             gate="CONST",
