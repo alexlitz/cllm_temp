@@ -32,7 +32,7 @@ from .shared import _as_setdim_proxy
 # updating this table in lock-step.
 _L16_FFN_UNIT_LAYOUT = (
     # (sub-stage name, legacy_start (docs only), n_units)
-    ("layer16_lev_routing", 0, 824),  # full LEV routing rule bank (+32 for AX_FULL siblings, 2026-06-09)
+    ("layer16_lev_routing", 0, 827),  # full LEV routing rule bank (+32 for AX_FULL siblings, 2026-06-09; +3 l16_ent_frame_sp_byte{1_ff,2_zero,3_zero}, 2026-06-11)
 )
 
 
@@ -1427,6 +1427,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # it over-writes these nested SP markers back to 0xfff0. The initial entry
     # carries a strongly negative OUTPUT_HI_THIS_STEP+15 before this block, while nested
     # entries are near zero there, so use that as the narrow discriminator.
+    # NOTE(SP byte0 vs the L25 tail pipeline): this nested SP-byte0 = 0xd8
+    # override ALSO mis-fires on the initial ENT 8 of id 262 via the OP_ENT
+    # broadcast (same class as the BP twin above), driving SP byte0 0xe8 ->
+    # 0xd8 at L20. However the L25 post_op tail SP-marker rules
+    # (tail_sp_pop_marker_*, l10_ops.py) are COUPLED to this: they expect the
+    # 0xd8/0xf0-shaped SP byte0 from L20 and convert it to the emitted 0xf0,
+    # which is the value the rest of the prologue pipeline (and the brief's
+    # stated want SP=0x0000fff0) consume. Re-gating this rule in isolation (a
+    # FETCH_LO+8 blocker) leaves L20 at the true 0xe8 but the L25 tail then
+    # numerically explodes the SP byte0 row (1e13) and desyncs framing — a
+    # zero-sum trade documented in feedback_single_rule_fixes_are_zero_sum.
+    # The byte0 value (0xf0 vs the oracle's 0xe8 = the missing imm subtraction)
+    # is a SEPARATE downstream link; this fix targets the brief's primary ask,
+    # SP byte1 = 0xff (added below), so SP reads 0x0000fff0. Leave this rule
+    # unchanged so the L20<->L25 SP-byte0 pipeline stays stable.
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_sp_byte0_d8",
         conditions=ent_sp_frame_conditions + (
@@ -1443,26 +1458,182 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+15", -10.0),
         ),
     ))
+    # JSR->ENT prologue link (var/func/loop/rec, ~525 programs): this rule is
+    # meant to force the saved-BP byte0 to 0xd8 ONLY for a genuinely NESTED
+    # function entry (recursive call arriving with SP=0xffe0, so BP saves
+    # 0xffd8). The previous design gated on ``MARK_BP * 20000`` (the gate alone
+    # = 20000 of the 20250 threshold) with a ``OUTPUT_HI_THIS_STEP+15 * -50``
+    # discriminator. spec_k=0 probe (tools/probe_var_entframe.py,
+    # probe_d8_disc.py) showed:
+    #   * OP_ENT broadcasts at ~15.5 (NOT ~1) at every ENT-step marker row, so
+    #     ``OP_ENT * 100`` ~= 1549 trivially clears the 250-point gap left by
+    #     MARK_BP*20000 -> the rule fired on the INITIAL (top-level main) ENT
+    #     of id 262 too, corrupting BP byte0 from L6's correct 0xf0 -> 0xd8 and
+    #     cascading to exit 0 instead of 28.
+    #   * OUTPUT_HI_THIS_STEP+15 is ~+14.7 for BOTH initial and nested entries
+    #     (the -50 discriminator never separated them).
+    # The clean discriminator is OUTPUT_HI_THIS_STEP+0 at the L20-input residual
+    # (after block 28): the initial entry carries -1.78 (L6's correct 0xf0 high
+    # nibble = 0xf is fully asserted, so the stale-zero high nibble is negated),
+    # while a nested entry / d8-tolerant entry carries +12.7..+39 (the stale
+    # zero high nibble that the d8 correction must overwrite). Re-gate with a
+    # small-scale, OP_ENT-required, HI+0-discriminated AND:
+    #   step0 JSR (OP_ENT~=0)        -> ~109   (no fire; preserves the step-0
+    #                                    JSR->BP link fixed in commit 2e91979c)
+    #   step1 initial ENT (HI+0=-1.8)-> ~1372  (NO FIRE; keeps L6's 0xf0)
+    #   bootstrap ENT (lea_basic)    -> ~2851  (fires, tolerated by _ne(0) check)
+    #   genuine nested ENT (HI+0~+39)-> ~5451  (fires -> 0xd8, unchanged)
+    # threshold 2000 separates the initial entry (1372) from the d8-needing
+    # entries (>=2851). The HI+0 * 100 term decisively vetoes the initial entry
+    # without touching the genuine nested correction.
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_bp_byte0_d8",
         conditions=(
             ("OP_ENT", 100.0),
-            ("MARK_BP", 20000.0),
+            ("MARK_BP", 1.0),
             ("HAS_SE", 1.0),
-            ("OUTPUT_HI_THIS_STEP+15", -50.0),
+            ("OUTPUT_HI_THIS_STEP+0", 100.0),
             ("IS_BYTE", -1_000_000_000.0),
-            ("MARK_PC", -1000.0),
-            ("MARK_AX", -1000.0),
-            ("MARK_SP", -1000.0),
-            ("MARK_STACK0", -1000.0),
-            ("MARK_MEM", -1000.0),
+            ("MARK_PC", -1_000_000.0),
+            ("MARK_AX", -1_000_000.0),
+            ("MARK_SP", -1_000_000.0),
+            ("MARK_STACK0", -1_000_000.0),
+            ("MARK_MEM", -1_000_000.0),
         ),
-        threshold=20250.0,
+        threshold=2000.0,
         writes=(
             ("OUTPUT_LO+8", 1.0),
             ("OUTPUT_LO+0", -1.0),
             ("OUTPUT_HI_THIS_STEP+13", 1.0),
             ("OUTPUT_HI_THIS_STEP+15", -1.0),
+        ),
+    ))
+    # JSR->ENT prologue link (var/func/loop/rec): the ENT frame keeps SP in the
+    # 0xff__ range (SP = 0xfff8 - 8 - imm), so SP byte1 must be 0xff. The PSH
+    # path has psh_sp_byte1_{lo,hi}_ff (l15_ops.py) gated on PSH_AT_SP, but ENT
+    # had NO equivalent SP byte1 writer -- spec_k=0 probe (probe_var_entframe.py)
+    # showed the ENT SP byte1 prediction row carrying only the default
+    # OUTPUT_LO+0 / OUTPUT_HI+0 (~+3..+7), so it emitted 0x00 (SP = 0x000000f0)
+    # instead of 0xff (SP = 0x0000ffe8). The SP byte1 is predicted at the SP
+    # byte0 token row, identified by the H1+2 marker-distance hint (H1+2 = SP
+    # register byte rows; H1+0/1/3 = PC/AX/BP) + BYTE_INDEX_0 (just emitted byte
+    # 0). Mirror the l16_bp_frame_byte1_ff override (50/S strength) but scoped to
+    # the SP byte row under OP_ENT. The genuine SP byte0 may be 0xe8/0xe0/0xf0
+    # (imm-dependent), all of which keep byte1 = 0xff, so this rule does not key
+    # on a specific byte0 value.
+    # Blocker weights are kept at -10 (not -1e3): the SP byte0 row carries a
+    # tiny BYTE_INDEX_1 ~= 0.013 residual which, at -1e3, would subtract ~13 and
+    # spuriously veto the rule (the OP_ENT/IS_BYTE/H1+2/BYTE_INDEX_0 signal sums
+    # to ~15.7). At -10 the 0.013 residue costs ~0.13 (negligible) while a
+    # genuine byte_index==1/2/3 or PC/AX/BP byte row (hint == 1) subtracts -10,
+    # decisively below the threshold.
+    sp_frame_byte1_ff_conditions = (
+        ("OP_ENT", 1.0),
+        ("IS_BYTE", 1.0),
+        ("HAS_SE", 1.0),
+        ("H1+2", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+        ("BYTE_INDEX_1", -10.0),
+        ("BYTE_INDEX_2", -10.0),
+        ("BYTE_INDEX_3", -10.0),
+        # H1+2 already selects the SP byte rows, but assert the other register
+        # marker-distance hints are off so the +0xff override cannot leak onto
+        # PC/AX/BP byte rows under the OP_ENT broadcast.
+        ("H1+0", -10.0),
+        ("H1+1", -10.0),
+        ("H1+3", -10.0),
+        ("MARK_AX", -10.0),
+        ("MARK_PC", -10.0),
+        ("MARK_SP", -10.0),
+        ("MARK_BP", -10.0),
+        ("MARK_STACK0", -10.0),
+        ("MARK_MEM", -10.0),
+    )
+    rules.append(multi_way_and_rule(
+        name="l16_ent_frame_sp_byte1_ff",
+        conditions=sp_frame_byte1_ff_conditions,
+        threshold=4.5,
+        # The SP byte1 prediction row carries a default OUTPUT_HI_THIS_STEP+0
+        # ~= +6.9 / OUTPUT_LO+0 ~= +2.9 (the L18 zero-byte default), so the
+        # 0xff override needs a margin above that without overshooting (a very
+        # large write destabilises the downstream byte2/byte3 framing). 800/S =
+        # 8 per nibble flips OUTPUT_{LO,HI}+15 just above the +0 default.
+        writes=(
+            ("OUTPUT_LO+15", 800.0 / S),
+            ("OUTPUT_HI_THIS_STEP+15", 800.0 / S),
+            ("OUTPUT_LO+0", -800.0 / S),
+            ("OUTPUT_HI_THIS_STEP+0", -800.0 / S),
+        ),
+    ))
+    # With SP byte1 = 0xff asserted above, the autoregressive run would extend
+    # 0xff into SP byte2/byte3 (the model reads "SP looks like 0xffff..."). SP is
+    # 0x0000fff0, so byte2 and byte3 are 0x00. Mirror l16_bp_after_ent_byte2_zero
+    # for the SP byte rows: at the SP byte1 token (BYTE_INDEX_1, CLEAN_EMBED of
+    # 0xff) force byte2 = 0x00; at the SP byte2 token (BYTE_INDEX_2, CLEAN_EMBED
+    # of 0x00) force byte3 = 0x00. Gated on H1+2 (SP marker-distance hint) so it
+    # cannot touch PC/AX/BP byte rows. Strength 10000/S matches the BP twin.
+    rules.append(multi_way_and_rule(
+        name="l16_ent_frame_sp_byte2_zero",
+        conditions=(
+            ("OP_ENT", 1.0),
+            ("IS_BYTE", 1.0),
+            ("HAS_SE", 1.0),
+            ("H1+2", 10.0),
+            ("H1+0", -100.0),
+            ("H1+1", -100.0),
+            ("H1+3", -100.0),
+            ("BYTE_INDEX_1", 1.0),
+            ("BYTE_INDEX_0", -100.0),
+            ("BYTE_INDEX_2", -100.0),
+            ("BYTE_INDEX_3", -100.0),
+            ("CLEAN_EMBED_LO+15", 1.0),
+            ("CLEAN_EMBED_HI+15", 1.0),
+            ("MARK_AX", -100.0),
+            ("MARK_PC", -100.0),
+            ("MARK_SP", -100.0),
+            ("MARK_BP", -100.0),
+            ("MARK_STACK0", -100.0),
+            ("MARK_MEM", -100.0),
+        ),
+        threshold=14.5,
+        writes=tuple(
+            (f"OUTPUT_LO+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            for k in range(16)
+        ) + tuple(
+            (f"OUTPUT_HI_THIS_STEP+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            for k in range(16)
+        ),
+    ))
+    rules.append(multi_way_and_rule(
+        name="l16_ent_frame_sp_byte3_zero",
+        conditions=(
+            ("OP_ENT", 1.0),
+            ("IS_BYTE", 1.0),
+            ("HAS_SE", 1.0),
+            ("H1+2", 10.0),
+            ("H1+0", -100.0),
+            ("H1+1", -100.0),
+            ("H1+3", -100.0),
+            ("BYTE_INDEX_2", 1.0),
+            ("BYTE_INDEX_0", -100.0),
+            ("BYTE_INDEX_1", -100.0),
+            ("BYTE_INDEX_3", -100.0),
+            ("CLEAN_EMBED_LO+0", 1.0),
+            ("CLEAN_EMBED_HI+0", 1.0),
+            ("MARK_AX", -100.0),
+            ("MARK_PC", -100.0),
+            ("MARK_SP", -100.0),
+            ("MARK_BP", -100.0),
+            ("MARK_STACK0", -100.0),
+            ("MARK_MEM", -100.0),
+        ),
+        threshold=14.5,
+        writes=tuple(
+            (f"OUTPUT_LO+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            for k in range(16)
+        ) + tuple(
+            (f"OUTPUT_HI_THIS_STEP+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            for k in range(16)
         ),
     ))
     rules.append(multi_way_and_rule(
@@ -1897,7 +2068,7 @@ def make_layer16_lev_routing_op() -> Operation:
         # (l16_lev_stack0_byte0_preserve_lo/hi_{k}) that keep the just-popped
         # stack-top byte stable through LEV (fixes step6:STACK0_byte0 50-row
         # cluster from the same triage).
-        ffn_units_used=824,
+        ffn_units_used=827,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
