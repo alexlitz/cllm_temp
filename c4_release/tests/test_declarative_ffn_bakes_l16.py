@@ -1767,7 +1767,10 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
     assert ("MARK_SP+0", 10.0) in nested_conditions
     assert ("FETCH_LO+0", 1.0) in nested_conditions
     assert ("FETCH_HI+0", 1.0) in nested_conditions
-    assert ("OUTPUT_HI_THIS_STEP+15", 1.0) in nested_conditions
+    # SIXTH JSR->ENT prologue link: the HI+15 discriminator weight was
+    # promoted 1.0 -> 5.0 so the strongly-negative initial-ENT value (-14.4)
+    # decisively vetoes the d8 override without firing on the initial entry.
+    assert ("OUTPUT_HI_THIS_STEP+15", 5.0) in nested_conditions
     assert nested.threshold == 70.0
 
     nested_writes = {write.dim.key(): write.weight for write in nested.writes}

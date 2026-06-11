@@ -1427,28 +1427,46 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # it over-writes these nested SP markers back to 0xfff0. The initial entry
     # carries a strongly negative OUTPUT_HI_THIS_STEP+15 before this block, while nested
     # entries are near zero there, so use that as the narrow discriminator.
-    # NOTE(SP byte0 vs the L25 tail pipeline): this nested SP-byte0 = 0xd8
-    # override ALSO mis-fires on the initial ENT 8 of id 262 via the OP_ENT
-    # broadcast (same class as the BP twin above), driving SP byte0 0xe8 ->
-    # 0xd8 at L20. However the L25 post_op tail SP-marker rules
-    # (tail_sp_pop_marker_*, l10_ops.py) are COUPLED to this: they expect the
-    # 0xd8/0xf0-shaped SP byte0 from L20 and convert it to the emitted 0xf0,
-    # which is the value the rest of the prologue pipeline (and the brief's
-    # stated want SP=0x0000fff0) consume. Re-gating this rule in isolation (a
-    # FETCH_LO+8 blocker) leaves L20 at the true 0xe8 but the L25 tail then
-    # numerically explodes the SP byte0 row (1e13) and desyncs framing — a
-    # zero-sum trade documented in feedback_single_rule_fixes_are_zero_sum.
-    # The byte0 value (0xf0 vs the oracle's 0xe8 = the missing imm subtraction)
-    # is a SEPARATE downstream link; this fix targets the brief's primary ask,
-    # SP byte1 = 0xff (added below), so SP reads 0x0000fff0. Leave this rule
-    # unchanged so the L20<->L25 SP-byte0 pipeline stays stable.
+    #
+    # JSR->ENT prologue link (SIXTH link, var/func/loop/rec ~525 programs):
+    # this nested SP-byte0 = 0xd8 override MIS-fired on the INITIAL top-level
+    # ENT 8 of id 262 (same class as the BP twin fixed in commit e2e334c8),
+    # forcing SP byte0 0xe8 -> 0xd8 at L20 (block 29). spec_k=0 probe
+    # (tools/probe_sp_d8_activation.py, residual AFTER block 28):
+    #   * The OP_ENT broadcast is ~9.74 (NOT ~1) at the ENT-step SP marker row,
+    #     so ``OP_ENT * 10`` ~= 97 trivially cleared the 70 threshold -> the
+    #     rule fired on the initial ENT, overwriting block-28's correct 0xe8.
+    #   * OUTPUT_HI_THIS_STEP+15 (the discriminator the comment already names)
+    #     was only weighted 1.0, contributing -14.4 -> nowhere near enough to
+    #     veto the 97-point OP_ENT broadcast (score 95.04 > 70 -> mis-fired).
+    # Probed discriminator values (OUTPUT_HI_THIS_STEP+15 after block 28):
+    #   id262 initial ENT8 (want 0xe8)   = -14.39  (d8 must NOT fire)
+    #   nested-main initial ENT8         = -14.36  (identical signature)
+    #   test_lea_basic bootstrap ENT0    = +20.00  (fires; emits 0xe0 via L25)
+    #   genuine nested entry (per above) ~  0       (fires -> 0xd8)
+    # FIX (subtractive, mirrors the BP twin): promote the existing HI+15
+    # discriminator weight 1.0 -> 5.0 so the strongly-negative initial value
+    # decisively vetoes the fire without touching the rule structure (the
+    # genuine-nested / bootstrap / L25-tail coupling is byte-identical for
+    # every non-initial case). Score arithmetic at this row (base score
+    # excluding the HI+15 term = 109.43):
+    #   id262 initial (HI+15=-14.39): 109.43 + 5*(-14.39) = 37.5  < 70 -> NO FIRE
+    #   genuine nested (HI+15~=0)   : 109.43 + 5*( 0.0)   = 109.4 >= 70 -> FIRE
+    #   bootstrap lea (HI+15=+20)   : 109.12 + 5*(+20.0)  = 209.1 >= 70 -> FIRE
+    # weight 5.0 keeps the nested fire-margin down to HI+15 ~= -7.9 (well below
+    # the initial's -14.4), so "near zero" nested entries are unaffected.
+    # Why this now works where the 3 pre-fifth-link attempts desynced: commit
+    # 0dd14aff fixed the L25 tail (tail_sp_marker_byte0_f8 IS_BYTE/OP_ENT
+    # blocker promotions) so the L25 post_op now PRESERVES the L20 SP byte0
+    # value instead of exploding it -- leaving L20 at the true 0xe8 no longer
+    # blows up the byte0 row.
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_sp_byte0_d8",
         conditions=ent_sp_frame_conditions + (
             ("OP_ENT", 9.8),
             ("FETCH_LO+0", 1.0),
             ("FETCH_HI+0", 1.0),
-            ("OUTPUT_HI_THIS_STEP+15", 1.0),
+            ("OUTPUT_HI_THIS_STEP+15", 5.0),
         ),
         threshold=70.0,
         writes=(
