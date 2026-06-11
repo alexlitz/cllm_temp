@@ -653,8 +653,103 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         from ...base_layers import PureFFN
         from ..primitives import Primitives
         from ..wide_alu_dsl import bitwise_rules
+        from ..building_blocks_dsl import step_function_rule
 
-        # Generate per-opcode rule batches (512 rules each: 256 lo + 256 hi).
+        # d_model comes from the pre-existing block.ffn so we stay
+        # shape-stable whether or not the host is the production residual.
+        ffn_in = block.ffn
+        if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+            d_model = int(ffn_in.W_up.shape[1])
+        else:
+            d_model = int(getattr(ffn_in, "dim", 512))
+
+        bd_proxy = _as_setdim_proxy(dim_positions)
+
+        def _lower(rule_tuple):
+            ffn = PureFFN(dim=d_model, hidden_dim=len(rule_tuple))
+            names = Primitives.ffn_rule_dim_names(rule_tuple)
+            dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
+            end = Primitives.lower_ffn_rules(
+                ffn, rule_tuple, dim_pos, start_unit=0, S=S,
+            )
+            assert end == len(rule_tuple), (
+                f"lower_ffn_rules wrote {end} units; expected {len(rule_tuple)}"
+            )
+            return ffn
+
+        # ============================================================
+        # AND/OR/XOR MARK_AX compute: div-style operand-cleanup pattern
+        # (2026-06-11). The IMM-decode keystone (5479fe4c / 383a6eb7)
+        # delivered clean immediate VALUES, but the operand BANDS at the
+        # MARK_AX row are still NOT clean one-hots -- the block-8 head-0
+        # gather leaves constant additive artifacts (spec_k=0 probe
+        # ``tools/probe_bitwise_operand_chars.py``):
+        #
+        #   ALU_LO/HI : real-nibble cell ~5.82, cell 0 ~+5.56,
+        #               cell 8 ~+0.45, cell 15 ~+0.47 artifacts.
+        #   AX_CARRY  : real-nibble cell ~0.94, cell 0 ~+0.30 artifact.
+        #
+        # The historical wrap fed these dirty bands straight into a fixed
+        # (40,30,30)/thr-80 ``bitwise_rules`` lookup. With a real cell at
+        # ~5.82, a single operand term (30*5.82 = 175) clears thr-80
+        # alone, so the lookup MASSIVELY over-fires on every artifact
+        # cell. For OR that lands on the right answer cell (0 OR b = b),
+        # which is why ``or_basic`` passed; for AND the cell-0 artifact
+        # firings all write ``a AND 0 = 0`` -> a dominant OUTPUT cell-0
+        # spike that buries the real answer (and the L26 tail then
+        # amplifies the wrong argmax). EQ/XOR share the path. See
+        # ``docs/AND_MUL_MARK_AX_ENDRUN_2026_06_11.md``.
+        #
+        # FIX = the exact two-stage div pattern (``make_alu_divmod_
+        # composite_ops`` GE-format install). The wrap historically did
+        # ``block.ffn = bitwise_lookup`` (discarding L10's original FFN).
+        # We preserve that "discard + own the AX-row bitwise compute"
+        # contract but split into TWO cooperating modules:
+        #   1. block.ffn := operand-cleanup FFN: subtracts the constant
+        #      operand artifacts so each band becomes a clean one-hot of
+        #      its real nibble (gated OP_AND/OP_OR/OP_XOR + MARK_AX).
+        #   2. post_op := rescaled ``bitwise_rules`` lookup over the now-
+        #      cleaned bands, writing OUTPUT_LO/HI at MARK_AX. The post_op
+        #      expands to its own passthrough block AFTER block.ffn, so
+        #      the lookup reads the cleaned operands. A clean single answer
+        #      cell then dominates at the L14 materialise (block 15) and
+        #      survives the L26 tail amplify -- exactly like ``or_basic``
+        #      does today.
+        #
+        # Calibration (probe_bitwise_clean_calib.py, spec_k=0): a
+        # MARK_AX-gated ``step_function_rule(write_value=V)`` changes the
+        # target residual cell by ~``_RESID_PER_V * V``; measured
+        # _RESID_PER_V ~= 2.502 (the same lowering as div's cleanup).
+        _RESID_PER_V = 2.502
+        _ALU_ARTIFACTS = ((0, 5.56), (8, 0.45), (15, 0.47))
+        _CARRY_ARTIFACTS = ((0, 0.30),)
+        OPCODES = ("OP_AND", "OP_OR", "OP_XOR")
+
+        cleanup_rules: list = []
+        for op_gate in OPCODES:
+            for bnd, arts in (
+                ("ALU_LO", _ALU_ARTIFACTS), ("ALU_HI", _ALU_ARTIFACTS),
+                ("AX_CARRY_LO", _CARRY_ARTIFACTS),
+                ("AX_CARRY_HI", _CARRY_ARTIFACTS),
+            ):
+                for cell, art in arts:
+                    cleanup_rules.append(step_function_rule(
+                        name=f"bitwise_operand_clean_{op_gate}_{bnd}_{cell}",
+                        input_dim="MARK_AX",
+                        threshold=0.5,
+                        write_dim=f"{bnd}+{cell}",
+                        write_value=-art / _RESID_PER_V,
+                        gate=op_gate,
+                        S=S,
+                    ))
+        cleanup_ffn = _lower(tuple(cleanup_rules))
+
+        # ---- Stage 2: rescaled bitwise lookup over the cleaned bands ----
+        # Cleaned operand-A cells ~5.82, operand-B (AX_CARRY) cells ~0.94.
+        # Rescale cond weights so a matched cell contributes ~30, keeping
+        # the default-equivalent 40 + 30 + 30 = 100 > 80 threshold math.
+        operand_a_cw = 30.0 / 5.82
+        operand_b_cw = 30.0 / 0.94
         rule_list: list = []
         for op_name, opcode_gate in (
             ("and", "OP_AND"),
@@ -672,32 +767,23 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
                 opcode_gate=opcode_gate,
                 marker_gate="MARK_AX",
                 S=S,
+                operand_a_cond_weight=operand_a_cw,
+                operand_b_cond_weight=operand_b_cw,
+                marker_cond_weight=40.0,
+                threshold=80.0,
             ))
         rules = tuple(rule_list)
         assert len(rules) == 3 * 512, (
             f"bitwise_rules: expected 1536 rules (3 opcodes x 512), got {len(rules)}"
         )
+        lookup_ffn = _lower(rules)
 
-        # Build a fresh PureFFN sized for the rule count and lower in one pass.
-        # d_model comes from the pre-existing block.ffn so we stay shape-stable
-        # whether or not the host is the production 512-dim residual.
-        ffn_in = block.ffn
-        if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
-            d_model = int(ffn_in.W_up.shape[1])
-        else:
-            d_model = int(getattr(ffn_in, "dim", 512))
-        new_ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
-
-        bd_proxy = _as_setdim_proxy(dim_positions)
-        names = Primitives.ffn_rule_dim_names(rules)
-        dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
-        end = Primitives.lower_ffn_rules(
-            new_ffn, rules, dim_pos, start_unit=0, S=S,
-        )
-        assert end == len(rules), (
-            f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
-        )
-        block.ffn = new_ffn
+        # Stage 1 owns block.ffn (replacing L10's original FFN, exactly
+        # as the historical wrap did); Stage 2 is a post_op that
+        # ``_expand_wrapper_blocks`` splits into its own passthrough block
+        # AFTER block.ffn -- so the lookup reads the cleaned operands.
+        block.ffn = cleanup_ffn
+        block.post_ops.append(lookup_ffn)
 
     return Operation(
         name="efficient_l10_andorxor_wrap",

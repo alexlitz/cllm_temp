@@ -67,6 +67,11 @@ def bitwise_rules(
     opcode_gate: str,
     marker_gate: str,
     S: float,
+    operand_a_cond_weight: float = 30.0,
+    operand_b_cond_weight: float = 30.0,
+    marker_cond_weight: float = 40.0,
+    threshold: float = 80.0,
+    result_write_value: float = 2.0,
 ) -> Tuple[FFNRule, ...]:
     """Generate FFNRule list for a per-byte bitwise op (AND/OR/XOR).
 
@@ -98,6 +103,20 @@ def bitwise_rules(
             the ``dim_ref("opcode_flag", "AND")`` semantic form).
         marker_gate: dim name for the AX-style marker (e.g. ``"MARK_AX"``).
         S: SwiGLU scale (typically 100.0).
+        operand_a_cond_weight: per-cell condition weight for operand A
+            (default 30.0 preserves byte-identity). The L10 MARK_AX install
+            reads a non-unit operand one-hot (~5.82 after the operand
+            cleanup stage), so it rescales this to ``30/5.82`` — mirroring
+            ``wide_div_rules_ge_format``'s ``dividend_cond_weight``.
+        operand_b_cond_weight: per-cell condition weight for operand B
+            (default 30.0). The cleaned AX_CARRY one-hot is ~0.94, so the
+            install passes ``30/0.94``.
+        marker_cond_weight: marker condition weight (default 40.0).
+        threshold: 3-way AND threshold (default 80.0). With the rescaled
+            cond weights a match contributes ~30 each, so the install keeps
+            the default-equivalent ``40 + 30 + 30 = 100 > 80`` math.
+        result_write_value: numerator of the output write weight
+            (default 2.0, lowered as ``result_write_value / S``).
 
     Returns:
         ``tuple[FFNRule, ...]`` of length 512 — same shape as
@@ -128,13 +147,13 @@ def bitwise_rules(
                         f"a{a:x}_b{b:x}"
                     ),
                     conditions=(
-                        (marker_gate, 40.0),
-                        (f"{a_band}+{a}", 30.0),
-                        (f"{b_band}+{b}", 30.0),
+                        (marker_gate, marker_cond_weight),
+                        (f"{a_band}+{a}", operand_a_cond_weight),
+                        (f"{b_band}+{b}", operand_b_cond_weight),
                     ),
-                    threshold=80.0,
+                    threshold=threshold,
                     gate=opcode_gate,
-                    writes=((f"{out_band}+{result}", 2.0 / S),),
+                    writes=((f"{out_band}+{result}", result_write_value / S),),
                 ))
     return tuple(rules)
 
