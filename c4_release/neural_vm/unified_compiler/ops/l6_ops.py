@@ -1375,6 +1375,20 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("HAS_SE", 1.0),
                 ("EMBED_LO+8", 1.0),
                 ("EMBED_HI+15", 1.0),
+                # Opcode-broadcast hardening (2026-06-11, batch fix): OP_ENT is
+                # broadcast in-step to every row (~11.4 by L20), so without a
+                # hard blocker its term could carry this rule's threshold at a
+                # NON-SP row. Legit firing row is the SP marker, where IS_BYTE
+                # + every non-SP register MARK_* are 0 (verified spec_k=0 at the
+                # L6-input residual), so these -1e6 NOT-blockers are subtractive
+                # (byte-identical at the legit SP marker) and veto the broadcast
+                # at every byte / other-marker row.
+                ("IS_BYTE", -1e6),
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=7.5,
             writes=(
@@ -1406,6 +1420,15 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("EMBED_LO+0", 1.0),
                 ("EMBED_HI+15", 1.0),
                 ("EMBED_LO+8", -1.0),
+                # Opcode-broadcast hardening (2026-06-11): SP-marker target; see
+                # l6_ent_after_jsr_sp_byte0_e8. IS_BYTE + non-SP markers are 0
+                # at the legit SP marker row -> subtractive -1e6 NOT-blockers.
+                ("IS_BYTE", -1e6),
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=7.5,
             writes=(
@@ -1432,6 +1455,17 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OP_ENT", 1.0),
                 ("MARK_BP", 1.0),
                 ("HAS_SE", 1.0),
+                # Opcode-broadcast hardening (2026-06-11): BP-marker target.
+                # IS_BYTE + every non-BP register MARK_* are 0 at the legit BP
+                # marker row (verified spec_k=0 at L6-input), so these -1e6
+                # NOT-blockers are subtractive and veto the OP_ENT broadcast at
+                # every byte / other-marker row. MARK_BP stays positive.
+                ("IS_BYTE", -1e6),
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=6.5,
             writes=(
@@ -1455,6 +1489,22 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("H1+3", 1.0),
                 ("BYTE_INDEX_0", 1.0),
                 ("HAS_SE", 1.0),
+                # Opcode-broadcast hardening (2026-06-11): BYTE-row target
+                # (IS_BYTE=1, BYTE_INDEX_0). The OP_ENT broadcast could push
+                # this onto a register-MARKER row. Every register MARK_* is 0 at
+                # the legit byte rows (verified spec_k=0 at L6-input), so these
+                # -1e6 NOT-blockers are subtractive there and veto the broadcast
+                # at marker rows. IS_BYTE is NOT blocked (it is the legit
+                # positive); wrong-BYTE_INDEX dims are NOT hard-blocked because
+                # they carry a ~0.01 adjacent-index residue that -1e6 would
+                # spuriously veto (cf. commit e2e334c8) — the BYTE_INDEX_0
+                # positive + thr 8.5 already discriminate the byte rows.
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=8.5,
             writes=(
@@ -1480,6 +1530,17 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("H1+3", 1.0),
                 ("BYTE_INDEX_1", 1.0),
                 ("HAS_SE", 1.0),
+                # Opcode-broadcast hardening (2026-06-11): BYTE-row target
+                # (BYTE_INDEX_1); see l6_ent_after_jsr_bp_byte1_ff. Register
+                # MARK_* are 0 at the legit byte rows -> subtractive -1e6
+                # NOT-blockers; IS_BYTE / wrong-BYTE_INDEX deliberately not
+                # hard-blocked.
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=8.5,
             writes=(
@@ -1504,6 +1565,17 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("H1+3", 1.0),
                 ("BYTE_INDEX_2", 1.0),
                 ("HAS_SE", 1.0),
+                # Opcode-broadcast hardening (2026-06-11): BYTE-row target
+                # (BYTE_INDEX_2); see l6_ent_after_jsr_bp_byte1_ff. Register
+                # MARK_* are 0 at the legit byte rows -> subtractive -1e6
+                # NOT-blockers; IS_BYTE / wrong-BYTE_INDEX deliberately not
+                # hard-blocked.
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_STACK0", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=8.5,
             writes=(
@@ -1526,6 +1598,17 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OP_ENT", 1.0),
                 ("MARK_STACK0", 1.0),
                 ("HAS_SE", 1.0),
+                # Opcode-broadcast hardening (2026-06-11): STACK0-marker target.
+                # IS_BYTE + every non-STACK0 register MARK_* are 0 at the legit
+                # STACK0 marker row (verified spec_k=0 at L6-input), so these
+                # -1e6 NOT-blockers are subtractive and veto the OP_ENT
+                # broadcast at every byte / other-marker row.
+                ("IS_BYTE", -1e6),
+                ("MARK_PC", -1e6),
+                ("MARK_AX", -1e6),
+                ("MARK_SP", -1e6),
+                ("MARK_BP", -1e6),
+                ("MARK_MEM", -1e6),
             ),
             threshold=6.5,
             writes=(
