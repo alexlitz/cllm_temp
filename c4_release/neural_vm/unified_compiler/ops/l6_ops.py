@@ -1038,10 +1038,28 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
     # JSR SP byte 0 fixup: 2 N-way AND rules (no gate; constant_write
     # path) on (OP_JSR, MARK_SP, ~HAS_SE), writing 0xf8 into OUTPUT_LO/HI.
     write_scale = 2.0 / S
+    # Opcode-broadcast hardening (2026-06-11, batch fix): this is an (a)
+    # genuinely-vulnerable JSR SP byte-0 fixup -- it writes 0xf8 into the OUTPUT
+    # emission bank at the SP marker, gated by OP_JSR(*0.2) + MARK_SP + a weak
+    # HAS_SE(-1) blocker. The OP_JSR flag is broadcast in-step to every row, so
+    # the broadcast could carry the low thr 1.5 at a non-SP row and corrupt that
+    # row's emitted byte. Legit firing row is the SP marker on the JSR step,
+    # where IS_BYTE + every non-SP register MARK_* are 0 (verified spec_k=0 at
+    # L6-input) -> subtractive -1e6 NOT-blockers (byte-identical at the legit SP
+    # marker), vetoing the broadcast at every byte / other-marker row.
+    _jsr_sp_fixup_blockers = (
+        ("IS_BYTE", -1e6),
+        ("MARK_PC", -1e6),
+        ("MARK_AX", -1e6),
+        ("MARK_BP", -1e6),
+        ("MARK_STACK0", -1e6),
+        ("MARK_MEM", -1e6),
+    )
     return (
         multi_way_and_rule(
             name="l6_jsr_sp_fixup_lo",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
+            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0))
+            + _jsr_sp_fixup_blockers,
             threshold=1.5,
             writes=(
                 ("OUTPUT_LO+8", write_scale),
@@ -1050,7 +1068,8 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         multi_way_and_rule(
             name="l6_jsr_sp_fixup_hi",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0)),
+            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0))
+            + _jsr_sp_fixup_blockers,
             threshold=1.5,
             writes=(
                 ("OUTPUT_HI_THIS_STEP+15", write_scale),
@@ -1254,13 +1273,28 @@ def _layer6_psh_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_adj_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 ADJ AX passthrough units 744..775."""
 
+    # Opcode-broadcast hardening (2026-06-11, batch fix): this is the (a)
+    # genuinely-vulnerable ADJ AX route -- it routes AX_CARRY into the OUTPUT
+    # emission bank at the AX marker, gated only by OP_ADJ + MARK_AX with a weak
+    # -1 MARK_PC blocker. The OP_ADJ flag is broadcast in-step to every row, so
+    # the broadcast could carry thr 4 at a non-AX row and corrupt that row's
+    # emitted byte. Legit firing row is the AX marker, where IS_BYTE + every
+    # non-AX register MARK_* are 0 (verified spec_k=0 at L6-input), so these
+    # -1e6 NOT-blockers are subtractive (byte-identical at the legit AX marker)
+    # and veto the broadcast at every byte / other-marker row. The original
+    # MARK_PC=-1 is promoted to -1e6 in the same set.
     return _layer6_ax_output_route_rules(
         name_prefix="l6_adj_ax_to_output",
         threshold=4.0,
         conditions=(
             ("OP_ADJ", 1.0),
             ("MARK_AX", 1.0),
-            ("MARK_PC", -1.0),
+            ("IS_BYTE", -1e6),
+            ("MARK_PC", -1e6),
+            ("MARK_SP", -1e6),
+            ("MARK_BP", -1e6),
+            ("MARK_STACK0", -1e6),
+            ("MARK_MEM", -1e6),
         ),
         S=S,
     )
@@ -1269,9 +1303,24 @@ def _layer6_adj_ax_route_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_adj_sp_writeback_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 ADJ SP writeback units 776..807."""
 
+    # Opcode-broadcast hardening (2026-06-11, batch fix): SP-marker writeback
+    # gated only by OP_ADJ + MARK_SP (thr 1.5), no IS_BYTE / non-SP MARK
+    # blocker. The OP_ADJ broadcast could carry the threshold at a non-SP row.
+    # Legit firing row is the SP marker, where IS_BYTE + every non-SP register
+    # MARK_* are 0 -> subtractive -1e6 NOT-blockers (byte-identical at the legit
+    # SP marker), vetoing the broadcast everywhere else.
     return _layer6_stack_writeback_rules(
         name_prefix="l6_adj_sp_writeback",
-        conditions=(("OP_ADJ", 1.0), ("MARK_SP", 1.0)),
+        conditions=(
+            ("OP_ADJ", 1.0),
+            ("MARK_SP", 1.0),
+            ("IS_BYTE", -1e6),
+            ("MARK_PC", -1e6),
+            ("MARK_AX", -1e6),
+            ("MARK_BP", -1e6),
+            ("MARK_STACK0", -1e6),
+            ("MARK_MEM", -1e6),
+        ),
         threshold=1.5,
         S=S,
     )
@@ -1280,12 +1329,24 @@ def _layer6_adj_sp_writeback_rules(S: float) -> tuple[FFNRule, ...]:
 def _layer6_ent_sp_writeback_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 ENT SP writeback units 808..839."""
 
+    # Opcode-broadcast hardening (2026-06-11, batch fix): SP-marker writeback
+    # gated by OP_ENT + MARK_SP + HAS_SE (thr 2.5), no IS_BYTE / non-SP MARK
+    # blocker. The OP_ENT broadcast (~11.4 by L20) could carry the threshold at
+    # a non-SP row. Legit firing row is the SP marker, where IS_BYTE + every
+    # non-SP register MARK_* are 0 -> subtractive -1e6 NOT-blockers
+    # (byte-identical at the legit SP marker), vetoing the broadcast elsewhere.
     return _layer6_stack_writeback_rules(
         name_prefix="l6_ent_sp_writeback",
         conditions=(
             ("OP_ENT", 1.0),
             ("MARK_SP", 1.0),
             ("HAS_SE", 1.0),
+            ("IS_BYTE", -1e6),
+            ("MARK_PC", -1e6),
+            ("MARK_AX", -1e6),
+            ("MARK_BP", -1e6),
+            ("MARK_STACK0", -1e6),
+            ("MARK_MEM", -1e6),
         ),
         threshold=2.5,
         S=S,
