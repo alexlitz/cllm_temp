@@ -1579,6 +1579,39 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # threshold 2000 separates the initial entry (1372) from the d8-needing
     # entries (>=2851). The HI+0 * 100 term decisively vetoes the initial entry
     # without touching the genuine nested correction.
+    # LEA/ENT local-address chain fix (2026-06-11, var/func/loop ~525 progs):
+    # the OUTPUT_HI_THIS_STEP+0 * 100 discriminator above PROVED STALE on
+    # current HEAD. spec_k=0 probe (tools/probe_d8_conds.py / probe_d8_nested.py,
+    # residual after block 28) of id 262 + id 704 (recursive 4!) shows:
+    #   * The comment's premise ("initial ENT carries OUTPUT_HI+0 ~= -1.78,
+    #     nested ~= +12.7..+39") no longer holds. The INITIAL main ENT now
+    #     carries OUTPUT_HI_THIS_STEP+0 = +4.97 (id 262 AND id 704 step-1 are
+    #     IDENTICAL), so OUTPUT_HI+0 * 100 = +497 PUSHES the initial ENT over
+    #     threshold instead of vetoing it: score 1549(OP_ENT) + 497(HI+0) + 2
+    #     = 2047 >= 2000 -> the d8 rule MIS-FIRES on the top-level main ENT,
+    #     forcing BP byte0 0xf0 -> 0xd8 (the saved BP must be 0xfff0 there, per
+    #     both symbolic oracles). This 0xd8 then feeds the step-2 LEA (BP-8),
+    #     so LEA AX comes out wrong too.
+    #   * At the step-2 LEA AX MARKER row, an upstream L10 runaway drives
+    #     OUTPUT_HI_THIS_STEP+0 to ~+53000, so OUTPUT_HI+0 * 100 = +5.3e6
+    #     DEFEATS the old MARK_AX * -1e6 blocker (net positive) -> the rule
+    #     mis-fires CATASTROPHICALLY on the LEA AX row too (unit 749 writes
+    #     OUTPUT_LO+8/HI+13 ~= +4.3e8), corrupting AX to 0xd8.
+    # The genuine nested fire (id 704 step-5 factorial ENT, BP=0xffd8) is
+    # discriminated NOT by OUTPUT_HI+0 but by the absence of the L6 0xf0 frame
+    # signature: at the initial/main ENT L6 asserts OUTPUT_LO+0 ~= +15.7 AND
+    # OUTPUT_HI_THIS_STEP+15 ~= +14.7 (the "byte0 = 0xf0" pattern); at a genuine
+    # nested ENT (saved BP = 0xffd8) L6 does NOT assert that 0xf0 pattern.
+    # FIX (subtractive, byte-identical at the genuine 0xd8 firing row):
+    #   (a) Veto the main-ENT mis-fire with hard -5 NOT-blockers on the L6 0xf0
+    #       signature (OUTPUT_LO+0, OUTPUT_HI_THIS_STEP+15): at the initial ENT
+    #       these subtract ~5*(15.7+14.7) = -152 -> score 2047 - 152 = 1895
+    #       < 2000 -> NO FIRE; at a genuine nested ENT (0xf0 pattern absent)
+    #       they are ~0 -> the d8 fire is preserved unchanged.
+    #   (b) Promote the wrong-register-marker blockers -1e6 -> -1e11 so the
+    #       runaway OUTPUT_HI+0 (~+5.3e6 at the LEA AX row) can no longer defeat
+    #       the MARK_AX veto. At the legit BP marker row every other MARK_* is
+    #       exactly 0, so this is byte-identical there.
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_bp_byte0_d8",
         conditions=(
@@ -1586,12 +1619,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_BP", 1.0),
             ("HAS_SE", 1.0),
             ("OUTPUT_HI_THIS_STEP+0", 100.0),
+            # L6 0xf0-frame-signature veto: only present on the initial/main
+            # ENT (saved BP = 0xfff0), absent on a genuine nested ENT (0xffd8).
+            ("OUTPUT_LO+0", -5.0),
+            ("OUTPUT_HI_THIS_STEP+15", -5.0),
             ("IS_BYTE", -1_000_000_000.0),
-            ("MARK_PC", -1_000_000.0),
-            ("MARK_AX", -1_000_000.0),
-            ("MARK_SP", -1_000_000.0),
-            ("MARK_STACK0", -1_000_000.0),
-            ("MARK_MEM", -1_000_000.0),
+            ("MARK_PC", -1e11),
+            ("MARK_AX", -1e11),
+            ("MARK_SP", -1e11),
+            ("MARK_STACK0", -1e11),
+            ("MARK_MEM", -1e11),
         ),
         threshold=2000.0,
         writes=(
