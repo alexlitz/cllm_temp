@@ -1,6 +1,46 @@
 # GE-format wide_div_rules — install-site staging blocker (2026-06-10)
 
-Status: **architectural blocker**. Companion to
+> **RESOLVED 2026-06-11 (DSL Wave W6).** The byte-accurate GE-format
+> lookup is now wired into the L10 efficient-mode install
+> (`alu_ops.make_install`). `test_div_basic` (84/2=42) and
+> `test_mod_basic` (43%10=3) PASS; the two `xfail` markers are removed.
+> Zero regression on the smoke gate (24→26 pass, only div/mod flipped).
+>
+> **What unblocked it (the analysis below was correct but incomplete):**
+> the @0 magnitude artifact persists on the **MARK_AX row** — the row
+> the install gates on. Wall-1 (block-8 head-0 slope=0.1) cleaned the
+> **SE** row only. Crucially, the artifact is a *constant* additive
+> ~5.56 on cell 0 of ALU_LO/HI (verified across many dividends via
+> `tools/probe_div_operand_clean.py`): cell-0 reads ~5.56 when the true
+> nibble is elsewhere, and ~11.38 (= 5.56 + 5.82) when the true nibble
+> IS 0. So a **constant subtraction of 5.56 from cell 0** (gated
+> OP_DIV/OP_MOD + MARK_AX) cleans BOTH cases — leaving a clean
+> per-nibble one-hot — without needing a 64-dim clean band (there are
+> only 3 free residual dims; d_model=872). This is the fix the analysis
+> below ("raise the threshold doesn't work") didn't consider.
+>
+> Two additional facts the original blocker missed:
+>   1. The GE-format threshold (150) assumed operand cells of magnitude
+>      1.0. The cleaned dividend cells are ~5.82, so the per-cell
+>      condition weight is rescaled to 30/5.82 (helper now takes
+>      `dividend_cond_weight` / `divisor_cond_weight` / `threshold`).
+>      AX_CARRY (divisor) is already ~1.0 → default weight.
+>   2. DIV decodes from the **MARK_AX row** (the pre-Wave-B AX-row decode
+>      path), NOT the SE row — so it is NOT Wall-4-blocked like the
+>      migrated CMP path. Verified via `tools/probe_div_decode_row.py`.
+>
+> Remaining edge cases (NOT targets, NOT regressions): dividends whose
+> L8 operand-gather is itself corrupt (e.g. a=255 gathers to nibble 8,
+> not 15) still mis-divide. That is an upstream operand-gather bug,
+> independent of the GE-format install.
+>
+> The rest of this document is the original (now-superseded) blocker
+> analysis, kept for provenance.
+
+---
+
+Status: **architectural blocker** (SUPERSEDED — see resolution above).
+Companion to
 [`DSL_W5_MULDIV_LIMIT.md`](DSL_W5_MULDIV_LIMIT.md),
 [`LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md`](LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md),
 and [`DIV_22_FAILING_ATTRIBUTION_2026_06_09.md`](DIV_22_FAILING_ATTRIBUTION_2026_06_09.md).

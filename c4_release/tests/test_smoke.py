@@ -1110,12 +1110,15 @@ class TestSmokeBasic:
     def test_mul_basic(self, _smoke_basic_results):
         _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_mul_basic")
 
-    @pytest.mark.xfail(strict=False, reason="MUL/DIV/MOD arch blocked: wide_div_rules per-nibble wrong for cross-nibble dividends, see memory project_mul_div_mod_arch_blocked.md")
     def test_div_basic(self, _smoke_basic_results):
+        # Byte-accurate GE-format DIV install (DSL Wave W6, 2026-06-11):
+        # wide_div_rules_ge_format + AX-row operand cleanup at L10
+        # efficient-mode install. See alu_ops.make_install and
+        # docs/DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md.
         _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_div_basic")
 
-    @pytest.mark.xfail(strict=False, reason="MUL/DIV/MOD arch blocked: wide_div_rules per-nibble wrong for cross-nibble dividends, see memory project_mul_div_mod_arch_blocked.md")
     def test_mod_basic(self, _smoke_basic_results):
+        # Byte-accurate GE-format MOD install (DSL Wave W6, 2026-06-11).
         _lookup_and_check(_smoke_basic_results, "TestSmokeBasic::test_mod_basic")
 
 
