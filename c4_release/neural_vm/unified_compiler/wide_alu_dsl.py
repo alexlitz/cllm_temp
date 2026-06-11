@@ -953,6 +953,10 @@ def wide_div_rules_ge_format(
     marker_gate: str,
     S: float,
     op: str = "div",
+    dividend_cond_weight: float = 30.0,
+    divisor_cond_weight: float = 30.0,
+    marker_cond_weight: float = 40.0,
+    threshold: float = 150.0,
 ) -> Tuple[FFNRule, ...]:
     """Byte-accurate multi-byte DIV/MOD via flat 8-bit cross-product lookup.
 
@@ -1010,6 +1014,18 @@ def wide_div_rules_ge_format(
         S: SwiGLU scale.
         op: ``"div"`` to emit quotient rules, ``"mod"`` to emit
             remainder rules.
+        dividend_cond_weight: per-cell condition weight for the dividend
+            (ALU_LO/HI) one-hots. Default ``30.0`` assumes clean binary
+            one-hots (value 1.0). When the operand bands carry a larger
+            residual magnitude (e.g. ~5.82 from the L8 operand-gather),
+            rescale to ``30.0 / magnitude`` so a matched cell contributes
+            ~30 and the 5-way-AND threshold math is preserved.
+        divisor_cond_weight: per-cell condition weight for the divisor
+            (AX_CARRY_LO/HI) one-hots. Default ``30.0``.
+        marker_cond_weight: condition weight for ``marker_gate``.
+            Default ``40.0``.
+        threshold: 5-way-AND firing threshold. Default ``150.0`` (all-on
+            = 40 + 4*30 = 160 fires; missing one operand -> 130 blocked).
 
     Returns:
         ``tuple[FFNRule, ...]`` of length ``256 * 256 = 65536`` for
@@ -1068,13 +1084,13 @@ def wide_div_rules_ge_format(
                     f"wide_div_ge_{op}_a{a:02x}_b{b:02x}"
                 ),
                 conditions=(
-                    (marker_gate, 40.0),
-                    (f"{dividend_lo_base}+{a_lo}", 30.0),
-                    (f"{dividend_hi_base}+{a_hi}", 30.0),
-                    (f"{divisor_lo_base}+{b_lo}", 30.0),
-                    (f"{divisor_hi_base}+{b_hi}", 30.0),
+                    (marker_gate, marker_cond_weight),
+                    (f"{dividend_lo_base}+{a_lo}", dividend_cond_weight),
+                    (f"{dividend_hi_base}+{a_hi}", dividend_cond_weight),
+                    (f"{divisor_lo_base}+{b_lo}", divisor_cond_weight),
+                    (f"{divisor_hi_base}+{b_hi}", divisor_cond_weight),
                 ),
-                threshold=150.0,
+                threshold=threshold,
                 gate=opcode_gate,
                 writes=(
                     (f"{result_lo_base}+{out_lo}", write_amplitude),
