@@ -6325,7 +6325,21 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OUTPUT_HI_THIS_STEP+14", -1000.0),
                 ("ALU_LO+14", -1000.0),
                 ("OP_IMM", -1_000_000_000.0),
-                ("OP_ENT", -1_000_000.0),
+                # OP_ENT hard blocker promoted -1e6 -> -1e11. This rule is
+                # the JSR-bootstrap SP byte0 = 0xF8 exactness writer (SP =
+                # 0xfffffff8 at the bootstrap marker); the ENT step's SP is
+                # 0xffe8 (= old_SP - 8 - imm), NOT 0xf8, so this rule must be
+                # OFF on every ENT step. The -1e6 blocker was insufficient:
+                # the JSR->ENT prologue marker row (id 262) carries
+                # OUTPUT_HI_THIS_STEP+14 ~= -2.8e4 (L20's ENT-frame zero-byte
+                # suppressors), and the ``OUTPUT_HI_THIS_STEP+14 * -1000``
+                # discriminator then contributes ~+2.8e7, swamping
+                # OP_ENT*-1e6 (~-9.7e6) so this 0xF8 writer fired on the ENT
+                # SP marker and drove byte0 0xd8 -> 0xf0 (want 0xe8). -1e11
+                # makes OP_ENT (~10) contribute -1e12, decisively OFF on any
+                # ENT step regardless of the OUTPUT_HI+14 scale, while the
+                # genuine JSR-bootstrap firing (OP_ENT ~= 0) is unaffected.
+                ("OP_ENT", -100_000_000_000.0),
                 ("MARK_AX", -1_000_000_000.0),
                 ("MARK_PC", -1_000_000_000.0),
                 ("MARK_BP", -1_000_000_000.0),
@@ -6335,7 +6349,24 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_STACK0", -1_000_000_000.0),
                 ("MARK_MEM", -1_000_000_000.0),
                 ("OP_JSR", -1_000_000.0),
-                ("IS_BYTE", -100.0),
+                # IS_BYTE hard blocker (was -100). This rule is scoped
+                # ``mark == SP`` and may only fire at the SP MARKER row
+                # (predicting byte0), never at SP byte1/byte2/byte3 rows
+                # (IS_BYTE=1). The prior -100 was far too weak: on the
+                # JSR->ENT prologue (id 262 / var/func/loop/rec, ~525
+                # programs) the ENT-step SP byte1/byte2 rows carry the L20
+                # ``l16_ent_frame_sp_byte{2,3}_zero`` one-hot suppressors,
+                # which drive OUTPUT_HI_THIS_STEP+14 to ~-1.2e5. The
+                # ``OUTPUT_HI_THIS_STEP+14 * -1000`` marker-row discriminator
+                # then contributes ~+1.2e8, swamping the OP_ENT/OP_JSR -1e6
+                # blockers (~-1.3e7) so this 0xF8 writer FIRED on the byte
+                # rows and inverted the just-asserted 0x00 byte2/byte3 lanes
+                # (emitting SP=0x__18__/0x__22__ garbage instead of
+                # 0x0000ffe8). -1e9 makes the byte-row activation decisively
+                # negative regardless of OUTPUT_HI+14 scale, while IS_BYTE=0
+                # at the marker row leaves the legitimate byte0 firing
+                # untouched. spec_k=0 probe: tools/probe_var_f8_rule.py.
+                ("IS_BYTE", -1_000_000_000.0),
                 # Replaces the prior HAS_SE=-100 "soft step-0 gate" which
                 # let the rule fire on step 0 of arbitrary programs.  The
                 # +10 weight + +10 threshold bump (BZ pattern from commit
@@ -6350,7 +6381,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_SE", -1000000.0),
             ),
             threshold=20.04,
-            max_abs_weight=1_000_000_000.0,
+            max_abs_weight=100_000_000_000.0,
         ),
         *exact_output_byte_rules(
             name="tail_sp_byte1_ff_from_initial_stack_exact",
