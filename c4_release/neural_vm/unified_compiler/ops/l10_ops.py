@@ -7536,6 +7536,29 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # absent MEM_ADDR_SRC) stay below. See
                 # tools/l10_tail_lea_residual_probe.py for the probe.
                 ("MEM_ADDR_SRC", 5.0),
+                # IMM-decode keystone fix (2026-06-11): the MEM_ADDR_SRC=5
+                # positive was meant to make a live LEA address-byte source
+                # REQUIRED, but it is only ADDITIVE -- the FETCH_LO+8(2.0) /
+                # FETCH_HI+15(0.2) terms cross threshold ALONE because FETCH
+                # carries the IMM OPERAND at band magnitude ~40 (NOT one-hot).
+                # On a plain ``IMM v; EXIT`` AX decode row (MARK_AX=1, OP_LEA=0,
+                # MEM_ADDR_SRC=0) any immediate with lo-nibble 8 (FETCH_LO+8~40
+                # -> 2*40=80) or hi-nibble F (FETCH_HI+15~40 -> 0.2*40=8) scored
+                # 81 / 9 >= 7.0 and mis-fired this 0xE8 writer (strength 1e6),
+                # producing the ±228M block-36 spike that flips OUTPUT argmax to
+                # 0xE8 -> the 0xFFE8 / 0xE8 sentinel (lo-nibble-8 + hi-nibble-F
+                # families, the bulk of the 46/256 IMM mis-decodes). The prior
+                # OP_LEA_LEAK_INVESTIGATION_2026_06_05 threshold-tuning failed
+                # because it assumed FETCH ~1.0; with FETCH ~40 no positive-only
+                # threshold can separate LEA from the IMM operand broadcast.
+                # FIX (broadcast-hardening, mirrors the l16 lev_routing
+                # l16_lea_local_ax_byte0_hi_e sibling fix this same session):
+                # add OP_IMM as a HARD NOT-blocker so the FETCH operand
+                # broadcast can never satisfy the rule on an IMM step. The legit
+                # LEA byte-0 0xE8 emit (OP_LEA=1, OP_IMM=0, MEM_ADDR_SRC live)
+                # is byte-identical. spec_k=0 attribution:
+                # tools/probe_tail_rule_attrib.py.
+                ("OP_IMM", -1_000_000.0),
                 ("IS_BYTE", -10.0),
                 ("MARK_PC", -10000.0),
                 ("MARK_SP", -10000.0),

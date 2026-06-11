@@ -663,6 +663,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # older e8 marker materializer above rejects the e0 address signature.
     # Materialize only the exact e8 byte and require both ALU nibbles so nearby
     # e0 marker rows with unrelated ALU residue stay inert.
+    # IMM-decode leak fix (2026-06-11): the gating conditions ALU_LO+8 /
+    # ALU_HI+14 were weighted 1.0 calibrated for a one-hot ALU band, but ALU_LO
+    # carries the IMM OPERAND at band magnitude ~+300 (NOT one-hot). On a plain
+    # ``IMM v; EXIT`` AX decode row (MARK_AX=1, MARK_STACK0=0) any immediate
+    # with lo-nibble 8 (ALU_LO+8~+300) scored ~245 >= 19.0 even though the
+    # MARK_AX(-10) blocker should have vetoed it -- the ±300 operand broadcast
+    # swamped the -10 blocker. The rule then wrote the 0xE8 byte
+    # (OUTPUT_LO+8 one-hot) onto the AX OUTPUT, corrupting the lo-nibble-8 IMM
+    # family. spec_k=0 attribution: tools/probe_imm_rule_attrib.py.
+    # FIX (broadcast-hardening): promote the non-STACK0 marker blockers to HARD
+    # NOT-blockers (-1e6) so any non-STACK0-marker row (incl. the IMM/EXIT AX
+    # row) decisively vetoes regardless of the ALU operand magnitude. The legit
+    # e8 STACK0-marker firing (MARK_STACK0=1, all other markers=0) is
+    # byte-identical: -1e6 * 0 = 0 at the intended firing positions.
     rules.append(multi_way_and_rule(
         name="l16_stack0_e0_marker_e8_from_alu_exact",
         conditions=(
@@ -677,11 +691,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OP_JSR", -10.0),
             ("OP_ENT", -10.0),
             ("OP_LEV", -10.0),
-            ("MARK_PC", -10.0),
-            ("MARK_AX", -10.0),
-            ("MARK_SP", -10.0),
-            ("MARK_BP", -10.0),
-            ("MARK_MEM", -10.0),
+            ("MARK_PC", -1_000_000.0),
+            ("MARK_AX", -1_000_000.0),
+            ("MARK_SP", -1_000_000.0),
+            ("MARK_BP", -1_000_000.0),
+            ("MARK_MEM", -1_000_000.0),
         ),
         threshold=19.0,
         writes=Primitives.byte_value_writes(0xE8, strength=50.0 / S),
@@ -1990,6 +2004,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # layers compute the low nibble strongly, but the high-nibble lanes can
     # tie at residual scale and let 0x08 win by a few thousandths.  Nudge only
     # this local-address marker shape so downstream byte generation sees 0xe8.
+    #
+    # IMM-decode leak fix (2026-06-11): the FETCH_LO+8 / FETCH_HI+15 terms were
+    # weighted 0.2 calibrated for a one-hot FETCH (~1.0), but FETCH carries the
+    # IMM operand at band magnitude ~40 (the OPERAND broadcast, NOT one-hot).
+    # On a plain ``IMM v; EXIT`` AX decode row (MARK_AX=1, OP_LEA=0, HAS_SE=0,
+    # CMP+7=0) any immediate with lo-nibble 8 (FETCH_LO+8~40) or hi-nibble F
+    # (FETCH_HI+15~40) scored 1.0(MARK_AX)+0.2*40 = 9.0 >= 8.0 and mis-fired,
+    # spraying OUTPUT_HI_THIS_STEP+14 (= high nibble 0xE) onto the AX OUTPUT.
+    # That 0xE evidence is then amplified by the L25 (block 36) output-authority
+    # writer into the 0xFFE8 / 0xE8 sentinel (lo-nibble-8 + hi-nibble-{E,F}
+    # families, 46/256 immediates). spec_k=0 attribution:
+    # tools/probe_imm_rule_attrib.py.  FIX (broadcast-hardening, mirrors the
+    # l6/l8 OP_*=-1e6 audit fixes): add OP_IMM as a HARD NOT-blocker so the
+    # FETCH operand broadcast can never satisfy the rule on an IMM step. The
+    # legit LEA local-address firing (OP_LEA=1, OP_IMM=0) is byte-identical.
     rules.append(multi_way_and_rule(
         name="l16_lea_local_ax_byte0_hi_e",
         conditions=(
@@ -1999,6 +2028,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("CMP+7", 1.0),
             ("FETCH_LO+8", 0.2),
             ("FETCH_HI+15", 0.2),
+            ("OP_IMM", -1_000_000.0),
             ("IS_BYTE", -10.0),
             ("MARK_PC", -10.0),
             ("MARK_SP", -10.0),
