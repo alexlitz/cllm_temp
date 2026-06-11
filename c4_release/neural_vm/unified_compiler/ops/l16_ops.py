@@ -523,12 +523,27 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("ADDR_B0_LO+0", -20.0),
             ("ADDR_B0_HI+14", -20.0),
             ("ADDR_B0_HI+15", 20.0),
-            ("IS_BYTE", -300.0),
-            ("MARK_PC", -300.0),
-            ("MARK_AX", -300.0),
-            ("MARK_SP", -300.0),
-            ("MARK_BP", -300.0),
-            ("MARK_MEM", -300.0),
+            # var/func JSR-prologue leak fix (2026-06-11): the non-STACK0
+            # marker / byte blockers were -300, calibrated for a one-hot
+            # OP_JSR ~1.0. OP_JSR is the in-step opcode broadcast and reaches
+            # ~15.5 at the register-marker AND register-byte rows
+            # (probe_var_jsr.py), so ``OP_JSR*50`` scores ~775 and a -300
+            # blocker no longer beats it: this 0x0A return-address writer
+            # mis-fired at the REG_BP byte-0/1/3 emission rows of every
+            # func/var/loop/rec program, emitting 0x0a instead of the fresh-
+            # frame BP bytes (var_simple_12 -> exit 0 not 28). Promote the
+            # IS_BYTE + non-STACK0 marker blockers to hard NOT-blockers
+            # (-1e6) so they decisively veto regardless of the OP_JSR
+            # broadcast magnitude; the legitimate STACK0-marker firing
+            # (MARK_STACK0==1, IS_BYTE==0, all marker blockers==0) is
+            # unchanged. See docs/VAR_BASELINE_ATTRIBUTION_2026_06_11.md and
+            # probe_var_l20ffn.py.
+            ("IS_BYTE", -1_000_000.0),
+            ("MARK_PC", -1_000_000.0),
+            ("MARK_AX", -1_000_000.0),
+            ("MARK_SP", -1_000_000.0),
+            ("MARK_BP", -1_000_000.0),
+            ("MARK_MEM", -1_000_000.0),
         ),
         threshold=320.0,
         writes=Primitives.byte_value_writes(0x0A, strength=20.0),

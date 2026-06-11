@@ -367,6 +367,21 @@ def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
     ffn.W_down.data[:, start:end] = 0
 
 
+# L5 fetch head 3 amplifies the first-step PC-marker FETCH band by this
+# factor (l5_ops ``_band_output_writes(BD.FETCH_LO, 32, 40.0)``) so the
+# immediate survives the ~37x L6 head-5 relay attenuation en route to the
+# AX-marker IMM consumers. The JSR PC-target override below reads FETCH
+# directly at the *PC* marker, where it is NOT relay-attenuated, so its
+# multiplicative ``FETCH_LO+k`` gate sees the raw ~40-67x value. Dividing
+# the gate weight by this factor cancels the head-3 amplification so the
+# one-hot select contributes ~1.0 instead of ~5e2 to the OUTPUT_LO/HI
+# byte-0 nibble — the nibble CHOICE (which FETCH_LO+k is active) is
+# unchanged, only the runaway magnitude that the L20 carrier was gathering
+# into the REG_BP byte-0 prediction row (the var/func JSR-prologue leak).
+# See docs/VAR_BASELINE_ATTRIBUTION_2026_06_11.md and tools/probe_var_l6_unit.py.
+_FETCH_PC_MARKER_AMP = 40.0
+
+
 def _pc_target_lo_from_index(k: int) -> int:
     return (k * 8 + 2) & 0xF
 
@@ -655,12 +670,14 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 writes=((f"{output_base}+{k}", write_scale),),
             ))
 
+    fetch_gate_weight = 1.0 / _FETCH_PC_MARKER_AMP
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l6_jsr_all_step_target_lo_{k}",
             conditions=conditions,
             threshold=threshold,
             gate=f"FETCH_LO+{k}",
+            gate_weight=fetch_gate_weight,
             writes=((f"OUTPUT_LO+{_pc_target_lo_from_index(k)}", write_scale),),
         ))
     for k in range(16):
@@ -669,6 +686,7 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=threshold,
             gate=f"FETCH_LO+{k}",
+            gate_weight=fetch_gate_weight,
             writes=((f"OUTPUT_HI_THIS_STEP+{_pc_target_hi_from_index(k)}", write_scale),),
         ))
     odd_imm_hi_gate = tuple(
