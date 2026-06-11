@@ -490,6 +490,28 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     # (a = SP's hi nibble via ALU_HI, b = imm's hi nibble via FETCH_HI).
     # Thresholds 42.0 / 50.0 match the ADJ tuning. Writes
     # (sp_hi - imm_hi - borrow_in) % 16 to OUTPUT_HI_THIS_STEP.
+    #
+    # BUG FIX 2026-06-11 (step-1 ENT-AX 0xf0 leak, genesis): this band
+    # materializes the ENT SP hi nibble (SP - (8+imm)) into OUTPUT_HI at
+    # the AX *register-marker* row, where it doubles as the step-0 BP
+    # cascade source (BP = old_SP - 8 reads the AX-row frame value). On the
+    # **first** ENT step (HAS_SE = 0) that contribution is load-bearing —
+    # ``test_lea_basic``'s LEA result depends on it. But on a **subsequent**
+    # ENT step (HAS_SE = 1, e.g. the JSR→ENT prologue: var/func/loop/rec),
+    # AX byte0 is already correct (OUTPUT_HI[0]) entering this layer, and
+    # the SP value comes from the dedicated AX_CARRY→SP writeback — NOT
+    # from this OUTPUT_HI. There the OP_ENT in-step broadcast (~11.4 at the
+    # AX marker) over-amplifies the band so the (sp_hi-imm_hi-borrow)=15
+    # unit writes ~+177 on OUTPUT_HI[15], flipping the AX byte-0 marker-row
+    # argmax 0→15 and emitting AX byte0 = 0xf0. ``layer14_ent_ax_bytes_zero``
+    # only suppresses AX bytes 1-3 (IS_BYTE-gated), so byte 0 leaked.
+    #
+    # Fix (same class as the L16 JSR→BP prologue fix — neutralize the
+    # genesis writer rather than fight its broadcast-amplified magnitude
+    # downstream): add a hard ``HAS_SE`` NOT-blocker so the band fires
+    # ONLY on the first ENT step. Subsequent-step ENT then keeps the clean
+    # OUTPUT_HI[0] it already carries; step-0 ENT (test_lea_basic frame
+    # setup) is byte-identical.
     for borrow_in in (0, 1):
         for sp_hi in range(16):
             for imm_hi in range(16):
@@ -498,6 +520,11 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 conditions.extend(
                     (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
                 )
+                # Subsequent-step ENT (HAS_SE) must NOT re-materialize the
+                # SP hi nibble onto the AX row; hard-block so the OP_ENT
+                # broadcast cannot reopen it. First-step ENT (HAS_SE=0)
+                # keeps the BP-cascade contribution.
+                conditions.append(("HAS_SE", -1000.0))
                 conditions.append((f"ALU_HI+{sp_hi}", 1.0))
                 conditions.append((f"FETCH_HI+{imm_hi}", 20.0))
                 if borrow_in == 0:
@@ -1305,6 +1332,11 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # Breaks 2 L10 -> L9 back-edges.
         reads={"MARK_AX", "MARK_PC", "ALU_HI.*.-1", "AX_CARRY_HI", "FETCH_HI",
                "CARRY.*.-1",
+               # HAS_SE: the ENT hi-nibble band (2026-06-11 step-1 ENT-AX
+               # 0xf0 leak fix) blocks on HAS_SE so it fires only on the
+               # first ENT step. Declared so the compact per-op audit layout
+               # allocates HAS_SE inside d_model.
+               "HAS_SE",
                "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                # Phase 9.B (ALU_LO SCC rename): ALU_LO -> ALU_LO.*.-1 marks

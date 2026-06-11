@@ -6203,12 +6203,23 @@ def _set_layer9_alu(ffn, S, BD):
     # BUG FIX 2026-04-17: Add MARK_SP blocker. When OP_ENT is amplified to 22+,
     # the gate opens fully and ALU_HI[0]=58 at SP marker meets the threshold,
     # causing OUTPUT_HI[15] to be written instead of OUTPUT_HI[0].
+    # BUG FIX 2026-06-11 (step-1 ENT-AX 0xf0 leak): hard HAS_SE blocker so
+    # this band fires ONLY on the FIRST ENT step (where its OUTPUT_HI write
+    # is the load-bearing BP-cascade source for test_lea_basic). On a
+    # subsequent ENT step (JSR→ENT prologue) the OP_ENT in-step broadcast
+    # over-amplifies the (sp_hi-imm_hi-borrow)=15 unit to ~+177 on
+    # OUTPUT_HI[15], flipping the AX byte-0 marker-row argmax 0→15 and
+    # leaking AX byte0=0xf0. The clean OUTPUT_HI[0] entering this layer on
+    # subsequent steps is correct; SP comes from the AX_CARRY→SP writeback,
+    # not this dim. Mirror of the ``_layer9_ent_hi_nibble_rules`` fix
+    # (l9_ops.py) — keeps the legacy/declarative parity guard byte-identical.
     for borrow_in in [0, 1]:
         for sp_hi in range(16):
             for imm_hi in range(16):
                 result = (sp_hi - imm_hi - borrow_in) % 16
                 ffn.W_up[unit, BD.MARK_AX] = S * 20
                 _block_non_ax_marker_sites(unit)
+                ffn.W_up[unit, BD.HAS_SE] = -S * 1000  # first ENT step only
                 ffn.W_up[unit, BD.ALU_HI + sp_hi] = S  # SP hi nibble from L7
                 ffn.W_up[unit, BD.FETCH_HI + imm_hi] = S * 20  # Immediate hi nibble
                 if borrow_in == 0:
