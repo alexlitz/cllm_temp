@@ -465,14 +465,62 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("ALU_LO+14", -30.0),
         ),
     ))
+    # JSR->ENT prologue link (SEVENTH link, var/func/loop/rec ~525 programs):
+    # this local-frame e0 MEM-address writer MIS-fired on id 262's step-0
+    # STEP_END row, spraying a stray 0xE0 byte that desynced ALL of step 1
+    # (the autoregressive run emitted 0xE0 at the post-STEP_END marker slot
+    # instead of REG_PC, shifting every subsequent token; the ENT-step SP
+    # marker / byte0 row was therefore never reached cleanly even though
+    # links 1-6 already make it compute 0xe8 teacher-forced).
+    # Root cause (tools/probe_e0_rule_gating.py, residual AFTER block 28,
+    # spec_k=0): same OP_JSR-broadcast-defeats-weak-gate class as links 1-6.
+    #   * OP_JSR is the in-step opcode broadcast ~= 11.4 (NOT ~1) at the
+    #     STEP_END row, so ``OP_JSR * 1000`` ~= 11455 single-handedly cleared
+    #     the 500 threshold. MARK_MEM (weight 1.0) and MEM_STORE (weight 1.0)
+    #     were far too weak to gate -- MARK_MEM=0 / MEM_STORE~=0 at STEP_END
+    #     subtracted nothing, and the HAS_SE *gate* is ~0.99 at STEP_END, so
+    #     it did not veto either. The e0/f8 OUTPUT discriminator nets to 0 at
+    #     STEP_END (all OUTPUT lanes equal -240), so it could not save it.
+    #   * Worse, for id 262 the step-0 JSR is the INITIAL top-level store
+    #     (addr 0xfff8 = the f8 case): even its real MEM row carries a
+    #     NEGATIVE e0-f8 discriminator (-4.2; tools/probe_e0_legit_site.py),
+    #     so this e0 writer should never fire on id 262 at all.
+    # FIX (3-way structural AND, mirrors the disciplined L25 tail sibling
+    # tail_mem_store_addr0_e0_from_jsr_local_exact which gates on OP_JSR +
+    # MARK_MEM + MEM_STORE structurally, NOT the OP_JSR=1000 dominance). The
+    # rule must fire ONLY at a JSR MEM-store marker row, which is uniquely
+    # OP_JSR present AND MARK_MEM=1 AND MEM_STORE~=2. Make all three NECESSARY
+    # so that missing ANY one vetoes:
+    #   * OP_JSR weight 30: distinguishes a JSR store (OP_JSR~17) from a
+    #     non-JSR SI/SC store (OP_JSR=0). The PREVIOUS naive demotion to a
+    #     small OP_JSR + MARK_MEM/MEM_STORE-only gate REGRESSED the 5 SI/LI/SC
+    #     memory roundtrip smoke tests, because the SI store row (MARK_MEM=1,
+    #     MEM_STORE=2, OP_JSR=0, HAS_SE=1) then scored 600 and mis-fired,
+    #     corrupting the store address to 0xE0. Requiring OP_JSR fixes that.
+    #   * MARK_MEM weight 300 / MEM_STORE weight 150: distinguish a store row
+    #     from the STEP_END row (MARK_MEM=0, MEM_STORE~0) where the original
+    #     OP_JSR*1000 broadcast mis-fired and desynced step 1.
+    # Threshold 900 sits between the three firing combinations (probed AFTER
+    # block 28, spec_k=0):
+    #   id262 JSR store row  (OP_JSR~17,MARK_MEM=1,MEM_STORE=2): ~510+300+300=1110 >= 900 FIRE
+    #   SI store row         (OP_JSR=0, MARK_MEM=1,MEM_STORE=2): ~  0+300+300= 600 <  900 NO FIRE
+    #   id262 STEP_END       (OP_JSR~11,MARK_MEM=0,MEM_STORE~0): ~343+  0+  0= 343 <  900 NO FIRE
+    # The HAS_SE GATE (unchanged) is the e0-vs-f8 discriminator: the INITIAL
+    # top-level JSR (f8 store, id262) carries HAS_SE=0 at its MEM store row, so
+    # even when the score fires the writes are gated to ~0 -- the rule only
+    # actually writes 0xE0 for a local-frame (HAS_SE=1) JSR store. The tiny
+    # (+-0.0015) evidence writes + OUTPUT discriminator are unchanged, so the
+    # legitimate local-frame e0 store (jointly with the L25 tail) is
+    # byte-identical. id262 step1 framing is restored (the stray 0xE0 at
+    # STEP_END is gone) WITHOUT touching the SI/LI/SC store path.
     rules.append(multi_way_and_rule(
         name="l16_jsr_mem_addr0_e0_from_l14_evidence",
         conditions=(
-            ("OP_JSR", 1000.0),
+            ("OP_JSR", 30.0),
             ("OP_ENT", -10.0),
             ("PSH_AT_SP", -100_000.0),
-            ("MARK_MEM", 1.0),
-            ("MEM_STORE", 1.0),
+            ("MARK_MEM", 300.0),
+            ("MEM_STORE", 150.0),
             ("HAS_SE", 1.0),
             ("IS_BYTE", -1_000_000_000_000.0),
             ("MARK_PC", -1_000_000.0),
@@ -485,7 +533,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+14", 1.0),
             ("OUTPUT_HI_THIS_STEP+15", -1.0),
         ),
-        threshold=500.0,
+        threshold=900.0,
         gate="HAS_SE",
         writes=(
             Primitives.nibble_value_writes(
@@ -1403,15 +1451,42 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 for k in range(16)
             ),
         ))
+    # JSR->ENT prologue link (SEVENTH link, var/func/loop/rec ~525 programs):
+    # These high-nibble frame writers compute SP byte0's high nibble =
+    # (0xf - imm_hi - borrow). The loop has 16 imm_hi variants (lo0 sub-loop)
+    # and the _hi_lo8_ loop below has 16 more (lo8 sub-loop). The ORIGINAL
+    # gating used FETCH_LO/FETCH_HI as +1.0 conditions with threshold 13.5,
+    # but the ent_sp_frame_conditions BASE (MARK_SP*10 + HAS_SE + OP_ENT*0.2 ~=
+    # 12.9 at an ENT SP marker row) already crossed 13.5 with a single FETCH
+    # term -- so ALL 32 hi writers fired at EVERY ENT SP marker row regardless
+    # of the actual imm. spec_k=0 probe (tools/probe_sp_hi_offset.py) on id262
+    # (ENT 8, FETCH_LO+8/FETCH_HI+0): 32 firing writers each dumped a -50/S DC
+    # offset that the multi_way_and activation (~44-144) amplified to ~-2200
+    # per lane => a ~-37000 DC sink on EVERY OUTPUT_HI lane. The correct e8
+    # argmax (HI+14 least-negative) survived, but the absolute magnitude sank
+    # every BYTE token below the marker floor (-10), so the autoregressive LM
+    # head emitted a REG_PC MARKER instead of the 0xe8 byte (the byte-vs-marker
+    # loss the prologue handoff documented). THIS is why naive prior attempts
+    # "desync the frame": the un-gated writers spray a giant DC sink.
+    # FIX (mirrors the _lo_ loop which already gates on FETCH_LO): gate each
+    # hi writer on FETCH_HI+imm_hi (multiplicative -> imm_hi mismatch writes
+    # 0*write = 0, no DC offset, no inversion), and make FETCH_LO+L a DECISIVE
+    # condition (weight 10) with threshold 20 so the wrong-low-nibble sub-loop
+    # is vetoed by SCORE (base+FETCH_HI(1) ~= 13.9 < 20 -> SiLU(neg) ~= 0).
+    # Net: exactly ONE hi writer (matching imm_lo AND imm_hi) fires per ENT SP
+    # marker row. id262: only _hi_lo8_0 fires (-> HI+14 = 0xE), the DC sink is
+    # gone, 0xe8 beats the marker. PARAMETERIZED: works for every ENT frame
+    # size (imm 0..255) since the gate+score pick the single (lo,hi) match.
     for imm_hi in range(16):
         result_hi = (15 - imm_hi) & 0xF
         rules.append(multi_way_and_rule(
             name=f"l16_ent_frame_sp_byte0_hi_lo0_{imm_hi:x}",
             conditions=ent_sp_frame_conditions + (
-                ("FETCH_LO+0", 1.0),
+                ("FETCH_LO+0", 10.0),
                 (f"FETCH_HI+{imm_hi}", 1.0),
             ),
-            threshold=13.5,
+            threshold=20.0,
+            gate=f"FETCH_HI+{imm_hi}",
             writes=tuple(
                 (
                     f"OUTPUT_HI_THIS_STEP+{k}",
@@ -1738,15 +1813,24 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("OUTPUT_HI_THIS_STEP+15", -50.0 / S),
         ),
     ))
+    # SEVENTH JSR->ENT prologue link: the lo8 (imm_lo=8) high-nibble sub-loop.
+    # For SP byte0 = 0xf0 - 8 - (imm_hi<<4), the LOW nibble borrows (0x0 - 8 =>
+    # borrow), so the high nibble is (0xf - imm_hi - 1) = (14 - imm_hi). id262
+    # is ENT 8: imm_lo=8, imm_hi=0 => result_hi = 0xE, giving SP byte0 = 0xe8.
+    # Same gating fix as the _hi_lo0_ loop above: gate on FETCH_HI+imm_hi so
+    # only the matching imm_hi writes (no DC sink), and FETCH_LO+8 weight 10 +
+    # threshold 20 so the wrong (lo0) sub-loop is score-vetoed. Exactly one of
+    # the 32 hi writers fires per ENT SP marker row.
     for imm_hi in range(16):
         result_hi = (14 - imm_hi) & 0xF
         rules.append(multi_way_and_rule(
             name=f"l16_ent_frame_sp_byte0_hi_lo8_{imm_hi:x}",
             conditions=ent_sp_frame_conditions + (
-                ("FETCH_LO+8", 1.0),
+                ("FETCH_LO+8", 10.0),
                 (f"FETCH_HI+{imm_hi}", 1.0),
             ),
-            threshold=13.5,
+            threshold=20.0,
+            gate=f"FETCH_HI+{imm_hi}",
             writes=tuple(
                 (
                     f"OUTPUT_HI_THIS_STEP+{k}",

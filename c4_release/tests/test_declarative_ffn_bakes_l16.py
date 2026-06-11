@@ -1280,16 +1280,25 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
     rule = rules["l16_jsr_mem_addr0_e0_from_l14_evidence"]
 
     condition_dims = {(term.dim.key(), term.weight) for term in rule.conditions}
-    assert ("OP_JSR+0", 1000.0) in condition_dims
+    # SEVENTH JSR->ENT prologue link: re-gated as a 3-way structural AND
+    # (OP_JSR + MARK_MEM + MEM_STORE all NECESSARY, threshold 900). The old
+    # OP_JSR*1000 broadcast (~11.4 in-step, NOT ~1) single-handedly cleared the
+    # 500 threshold at the STEP_END row, spraying a stray 0xE0 byte that
+    # desynced step 1. OP_JSR=30 keeps the rule scoped to JSR stores (a non-JSR
+    # SI/SC store has OP_JSR=0, so it must NOT fire -- a naive demotion broke
+    # the SI/LI/SC memory roundtrip smoke tests); MARK_MEM=300 / MEM_STORE=150
+    # exclude the STEP_END row (MARK_MEM=0, MEM_STORE~0). The HAS_SE gate
+    # (unchanged) stays the e0-vs-f8 discriminator. See l16_ops.py.
+    assert ("OP_JSR+0", 30.0) in condition_dims
     assert ("PSH_AT_SP+0", -100_000.0) in condition_dims
-    assert ("MARK_MEM+0", 1.0) in condition_dims
-    assert ("MEM_STORE+0", 1.0) in condition_dims
+    assert ("MARK_MEM+0", 300.0) in condition_dims
+    assert ("MEM_STORE+0", 150.0) in condition_dims
     assert ("HAS_SE+0", 1.0) in condition_dims
     assert ("OUTPUT_LO+0", 1.0) in condition_dims
     assert ("OUTPUT_LO+8", -1.0) in condition_dims
     assert ("OUTPUT_HI_THIS_STEP+14", 1.0) in condition_dims
     assert ("OUTPUT_HI_THIS_STEP+15", -1.0) in condition_dims
-    assert rule.threshold == 500.0
+    assert rule.threshold == 900.0
     assert rule.gate.key() == "HAS_SE+0"
 
     writes = {write.dim.key(): write.weight for write in rule.writes}
@@ -1755,8 +1764,23 @@ def test_layer16_ent_frame_sp_byte0_rules_use_relayed_frame_size():
 
     hi16_writes = {write.dim.key(): write.weight for write in hi_frame16.writes}
     hi24_writes = {write.dim.key(): write.weight for write in hi_frame24.writes}
-    assert hi_frame16.threshold == 13.5
-    assert hi_frame24.threshold == 13.5
+    # SEVENTH JSR->ENT prologue link: the hi sub-loops were re-gated so exactly
+    # ONE writer fires per ENT SP marker row. Previously the un-gated +1.0
+    # FETCH conditions + threshold 13.5 let the ent_sp_frame base (~12.9) cross
+    # with a single FETCH term, so all 32 hi writers fired and sprayed a giant
+    # negative DC offset that sank every byte logit below the marker floor
+    # (the byte-vs-marker loss). Each writer now gates on FETCH_HI+imm_hi
+    # (multiplicative: imm_hi mismatch -> zero output, no DC sink) and makes
+    # FETCH_LO+L decisive (weight 10, threshold 20) so the wrong low-nibble
+    # sub-loop is score-vetoed. See l16_ops.py.
+    assert hi_frame16.threshold == 20.0
+    assert hi_frame24.threshold == 20.0
+    assert hi_frame16.gate.key() == "FETCH_HI+1"
+    assert hi_frame24.gate.key() == "FETCH_HI+1"
+    hi16_conditions = {(term.dim.key(), term.weight) for term in hi_frame16.conditions}
+    hi24_conditions = {(term.dim.key(), term.weight) for term in hi_frame24.conditions}
+    assert ("FETCH_LO+0", 10.0) in hi16_conditions
+    assert ("FETCH_LO+8", 10.0) in hi24_conditions
     assert hi16_writes["OUTPUT_HI_THIS_STEP+14"] == 5000.0 / 100.0
     assert hi24_writes["OUTPUT_HI_THIS_STEP+13"] == 5000.0 / 100.0
     assert hi16_writes["OUTPUT_HI_THIS_STEP+1"] == -5000.0 / 100.0
