@@ -841,7 +841,32 @@ def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     # (default threshold derivation would over-shoot to 15.5 = "all on").
     common_conditions = [("MARK_AX", 1.0)]
     common_conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
-    common_conditions = tuple(common_conditions)
+    # Opcode-broadcast hardening (2026-06-11, batch fix): _L9_NON_ALU_OPCODES
+    # includes the broadcasting frame/control opcodes OP_JSR (~17.2),
+    # OP_ENT (~11.4), OP_ADJ / OP_LEV (each carried as ``(dim, 1.0)``). Those
+    # flags are broadcast IN-STEP to EVERY register/byte/marker row (NOT
+    # one-hot at the opcode's own marker), so on a JSR/ENT step the opcode sum
+    # ALONE (e.g. OP_JSR*1 = 17.2) clears thr 1.5 even where MARK_AX = 0, so the
+    # clear could fire at a wrong NON-AX register MARKER row.
+    #
+    # IMPORTANT (legit-row coupling — verified spec_k=0 at the L9-input residual
+    # for the SI/LI program, tools probe): this clear LEGITIMATELY fires at the
+    # AX *byte* rows (IS_BYTE=1, OP_LI/SI ~5) as well as the AX marker — it is a
+    # broad ALU residue scrubber across the whole AX register during non-ALU
+    # ops, not a single-marker write. So an IS_BYTE NOT-blocker would veto the
+    # legit byte-row clear and corrupt the loaded value (regresses
+    # test_si_li_16bit_value). We therefore harden ONLY the NON-AX register
+    # MARK_* dims, which ARE 0 at every legit firing row (AX marker + AX byte
+    # rows): these -1e6 NOT-blockers are SUBTRACTIVE (byte-identical at the
+    # legit rows) and veto the broadcast at every other-register marker row.
+    # MARK_AX stays a positive condition; IS_BYTE is deliberately NOT blocked.
+    common_conditions = tuple(common_conditions) + (
+        ("MARK_PC", -1e6),
+        ("MARK_SP", -1e6),
+        ("MARK_BP", -1e6),
+        ("MARK_STACK0", -1e6),
+        ("MARK_MEM", -1e6),
+    )
 
     # ALU_LO clear: 16 units.
     for k in range(16):
