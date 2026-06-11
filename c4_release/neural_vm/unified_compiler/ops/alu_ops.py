@@ -1401,37 +1401,43 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     block when needed; their bake_fns operate on the shared builder
     rather than the block). Install op is kind="block", layer_idx=10.
 
-    DSL Wave W4 (``docs/IR_DSL_DESIGN.md`` Section 5): when
-    ``alu_mode == 'efficient'``, the 3 stage ops (bdtoge/longdiv/getobd)
-    become no-ops and the install op installs a rule-derived ``PureFFN``
-    post_op baked from ``wide_alu_dsl.wide_div_rules`` (DIV + MOD
-    batches) instead of the hand-written ``FlattenedDivMod`` composite.
+    DSL Wave W6 (2026-06-11): when ``alu_mode == 'efficient'``, the 3
+    stage ops (bdtoge/longdiv/getobd) become no-ops and the install op
+    installs the BYTE-ACCURATE ``wide_alu_dsl.wide_div_rules_ge_format``
+    lookup (DIV + MOD batches) as two cooperating ``PureFFN`` post_ops,
+    in place of both the hand-written ``FlattenedDivMod`` composite and
+    the earlier per-nibble ``wide_div_rules`` POC.
 
-    8-bit POC limit (W4): ``wide_div_rules(width_bytes=1, ...)`` emits a
-    per-nibble lookup (256 rules per byte band per opcode). The
-    legacy ``FlattenedDivMod`` runs a true 8-bit long-division pipeline
-    over the GE workspace (cross-nibble carries). The per-nibble lookup
-    is therefore NOT byte-identical for inputs that span both nibbles
-    (e.g. ``84 / 2 = 42`` would require dividing ``0x54`` as a single
-    integer, not nibble-by-nibble). Multi-byte / cross-nibble lowering is
-    deferred to a follow-up wave that lowers the 4-stage GE composite
-    (BD->GE, long-division loop, GE->BD writeback) as rules. The current
-    POC matches the W3 (sub) / W5 (mul) "per-byte naive" convention so
-    we land the install-site contract without blocking on the GE pipeline.
+    Why the GE-format is now wired (the W4 blocker is resolved): the
+    per-nibble ``wide_div_rules`` POC was mathematically wrong for
+    cross-nibble dividends (84 = 0x54 / 2 -> 42 must divide 0x54 as a
+    single integer, not nibble-by-nibble — see
+    ``docs/DSL_W5_MULDIV_LIMIT.md``). ``wide_div_rules_ge_format`` is a
+    flat 256x256 cross-product lookup (65,536 rules per opcode batch)
+    that is byte-accurate by construction. It was blocked at the L10
+    install point on operand cleanliness: the block-8 operand-gather
+    leaves a constant ~5.56 magnitude artifact on cell 0 of ALU_LO/HI
+    at the AX row (Wall-1's block-8 head-0 slope=0.1 fix cleaned the SE
+    row, NOT the AX row this MARK_AX-gated install reads — see
+    ``docs/DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md`` and
+    ``tools/probe_div_operand_clean.py``).
 
-    Byte-accurate (deferred): ``wide_div_rules_ge_format`` in
-    ``wide_alu_dsl.py`` provides a symbolically-correct flat 8-bit
-    cross-product lookup (65,536 rules per opcode batch) for
-    ``width_bytes=1``. It is **not** wired into this install op because
-    the residual at the L10 post_op install point is NOT clean one-hot
-    (cells outside the active index carry noise on the order of 4-6,
-    same magnitude as the active cell — see
-    ``docs/DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md``). The
-    byte-accurate rules require either a pre-``_clean_onehot`` stage
-    (not expressible as a single FFNRule list) or installation
-    upstream of L10 ALU passthrough where the residual is still clean.
-    ``FlattenedDivMod`` remains authoritative for byte-accurate DIV/MOD
-    until the staging issue is resolved.
+    The install resolves this with two staged post_ops (each
+    ``post_ops`` entry expands to its own passthrough block):
+
+      1. operand-cleanup FFN: subtracts the constant ~5.56 cell-0
+         artifact from ALU_LO/HI (gated OP_DIV/OP_MOD + MARK_AX), making
+         the dividend bands clean per-nibble one-hots. AX_CARRY (divisor)
+         is already clean.
+      2. GE-format lookup FFN: reads the cleaned operands, writes the
+         byte-accurate quotient/remainder to OUTPUT_LO/HI at MARK_AX.
+         The cleaned dividend cells sit at ~5.82 residual magnitude, so
+         the per-cell dividend condition weight is rescaled to 30/5.82
+         to preserve the 5-way-AND threshold math.
+
+    DIV decodes from the MARK_AX row (the pre-Wave-B AX-row decode path,
+    verified via ``tools/probe_div_decode_row.py``) — it is NOT
+    SE-row-decode-blocked like the migrated CMP path (Wall-4).
 
     For the legacy ``alu_mode == 'lookup'`` path nothing changes —
     ``FlattenedDivMod`` is still appended as the post_op.
@@ -1580,94 +1586,136 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     def make_install():
         def bake(block, dim_positions, S):
             if alu_mode == 'efficient':
-                # DSL Wave W4: install a rule-derived PureFFN post_op
-                # baked from ``wide_div_rules`` (DIV + MOD batches) in
-                # place of the hand-written ``FlattenedDivMod`` composite.
+                # DSL Wave W6 (2026-06-11): install the BYTE-ACCURATE
+                # GE-format DIV/MOD lookup (``wide_div_rules_ge_format``)
+                # in place of the per-nibble ``wide_div_rules`` POC. The
+                # per-nibble lookup was mathematically wrong for
+                # cross-nibble dividends (84 = 0x54 / 2 -> 42 needs 0x54
+                # divided as a single integer, not nibble-by-nibble — see
+                # ``docs/DSL_W5_MULDIV_LIMIT.md``).
                 #
-                # 8-bit POC limit: per-nibble lookup only — NOT byte-
-                # identical for inputs spanning both nibbles. See the
-                # docstring on ``make_alu_divmod_composite_ops`` for the
-                # deferred multi-byte / cross-nibble plan and the
-                # ``wide_div_rules_ge_format`` follow-up helper.
+                # Two-post_op staging (each ``post_ops`` entry expands to
+                # its own passthrough block via ``_expand_wrapper_blocks``):
+                #
+                #   1. operand-cleanup FFN: the block-8 operand-gather
+                #      leaves a constant ~5.56 magnitude artifact on cell 0
+                #      of ALU_LO/ALU_HI at the AX row (the dividend bands).
+                #      Wall-1 (block-8 head-0 slope=0.1) cleaned the SE row
+                #      but NOT the AX row, which is where this MARK_AX-gated
+                #      install reads. The cleanup subtracts the constant
+                #      artifact from cell 0 (gated OP_DIV/OP_MOD + MARK_AX)
+                #      so the dividend bands become clean per-nibble
+                #      one-hots. AX_CARRY (the divisor) is already clean.
+                #      See ``docs/DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md``
+                #      and ``tools/probe_div_operand_clean.py``.
+                #
+                #   2. GE-format lookup FFN: 256x256 byte-accurate
+                #      cross-product, reading the now-clean operands and
+                #      writing quotient (DIV) / remainder (MOD) to
+                #      OUTPUT_LO/HI at the MARK_AX row (the pre-Wave-B
+                #      AX-row decode path — NOT the SE-row CMP/ALU Wall-4
+                #      decode site, verified via
+                #      ``tools/probe_div_decode_row.py``).
+                #
+                # Operand-magnitude rescale: the cleaned dividend cells are
+                # ~5.82 in residual units (not the 1.0 binary one-hot the
+                # default cond weights assume). We rescale the dividend
+                # condition weight to 30/5.82 so a matched dividend cell
+                # contributes ~30, restoring the 5-way-AND threshold math
+                # (marker 40 + 4*30 = 160 > 150 fires; missing one -> 130).
+                # The divisor cells (AX_CARRY) are already ~1.0, so keep
+                # the default 30.0.
                 from ...base_layers import PureFFN
                 from ..primitives import Primitives
-                from ..wide_alu_dsl import wide_div_rules
+                from ..wide_alu_dsl import wide_div_rules_ge_format
+                from ..building_blocks_dsl import step_function_rule
 
-                rule_list: list = []
-                # DIV: quotient -> OUTPUT_LO/HI; remainder discarded by
-                # routing it to a non-output band (we route both into the
-                # same OUTPUT bands and rely on the opcode gate to keep
-                # only the active opcode's write).
-                rule_list.extend(wide_div_rules(
-                    dividend_base="ALU_LO",
-                    divisor_base="AX_CARRY_LO",
-                    quotient_base="OUTPUT_LO",
-                    remainder_base="OUTPUT_LO",
-                    width_bytes=1,
-                    opcode_gate="OP_DIV",
-                    marker_gate="MARK_AX",
-                    S=S,
-                ))
-                rule_list.extend(wide_div_rules(
-                    dividend_base="ALU_HI",
-                    divisor_base="AX_CARRY_HI",
-                    quotient_base="OUTPUT_HI",
-                    remainder_base="OUTPUT_HI",
-                    width_bytes=1,
-                    opcode_gate="OP_DIV",
-                    marker_gate="MARK_AX",
-                    S=S,
-                ))
-                # MOD: remainder -> OUTPUT_LO/HI; quotient routed onto
-                # same OUTPUT band, opcode-gated by OP_MOD so only this
-                # batch fires for MOD opcodes.
-                rule_list.extend(wide_div_rules(
-                    dividend_base="ALU_LO",
-                    divisor_base="AX_CARRY_LO",
-                    quotient_base="OUTPUT_LO",
-                    remainder_base="OUTPUT_LO",
-                    width_bytes=1,
-                    opcode_gate="OP_MOD",
-                    marker_gate="MARK_AX",
-                    S=S,
-                ))
-                rule_list.extend(wide_div_rules(
-                    dividend_base="ALU_HI",
-                    divisor_base="AX_CARRY_HI",
-                    quotient_base="OUTPUT_HI",
-                    remainder_base="OUTPUT_HI",
-                    width_bytes=1,
-                    opcode_gate="OP_MOD",
-                    marker_gate="MARK_AX",
-                    S=S,
-                ))
-                rules = tuple(rule_list)
-                # 4 batches x 256 rules (per byte band) = 1024 rules.
-                assert len(rules) == 4 * 256, (
-                    f"wide_div_rules: expected 1024 rules "
-                    f"(4 batches x 256), got {len(rules)}"
-                )
-
-                # d_model from the existing block.ffn; PureFFN post_op
-                # uses the same residual width.
+                # --- d_model from the existing block.ffn ---
                 ffn_in = block.ffn
                 if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
                     d_model = int(ffn_in.W_up.shape[1])
                 else:
                     d_model = int(getattr(ffn_in, "dim", 512))
-                new_ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
 
                 bd_proxy = _as_setdim_proxy(dim_positions)
-                names = Primitives.ffn_rule_dim_names(rules)
-                dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
-                end = Primitives.lower_ffn_rules(
-                    new_ffn, rules, dim_pos, start_unit=0, S=S,
+
+                def _lower(rule_tuple):
+                    ffn = PureFFN(dim=d_model, hidden_dim=len(rule_tuple))
+                    names = Primitives.ffn_rule_dim_names(rule_tuple)
+                    dim_pos = Primitives.dim_positions_from_bd(bd_proxy, names)
+                    end = Primitives.lower_ffn_rules(
+                        ffn, rule_tuple, dim_pos, start_unit=0, S=S,
+                    )
+                    assert end == len(rule_tuple), (
+                        f"lower_ffn_rules wrote {end} units; "
+                        f"expected {len(rule_tuple)}"
+                    )
+                    return ffn
+
+                # ---------- Stage 1: dividend operand cleanup ----------
+                # The artifact magnitude (~5.56 residual) and the residual-
+                # per-write-weight factor (~2.502 for a MARK_AX-gated
+                # threshold-0.5 write at this scale) were measured at the
+                # install block (probe_div_operand_clean.py). V is the raw
+                # write numerator that subtracts exactly the artifact:
+                # 2.502 * V == 5.56  ->  V == 5.56 / 2.502.
+                _ARTIFACT = 5.56
+                _RESID_PER_V = 2.502
+                cleanup_V = _ARTIFACT / _RESID_PER_V
+                # Each rule is a MARK_AX-keyed, opcode-gated constant
+                # write of ``-cleanup_V`` into cell 0 (step_function_rule
+                # with the marker as the >=0.5 input). Two opcodes x two
+                # dividend bands = 4 rules.
+                cleanup_rules: list = []
+                for op_gate in ("OP_DIV", "OP_MOD"):
+                    for cell in ("ALU_LO+0", "ALU_HI+0"):
+                        cleanup_rules.append(step_function_rule(
+                            name=f"div_operand_clean_{op_gate}_{cell}",
+                            input_dim="MARK_AX",
+                            threshold=0.5,
+                            write_dim=cell,
+                            write_value=-cleanup_V,
+                            gate=op_gate,
+                            S=S,
+                        ))
+                cleanup_ffn = _lower(tuple(cleanup_rules))
+
+                # ---------- Stage 2: GE-format byte-accurate lookup -------
+                # Dividend cells ~5.82 -> rescale cond weight so a match
+                # contributes ~30 (matching the helper's threshold math).
+                dividend_cw = 30.0 / 5.82
+                rule_list: list = []
+                for op_gate, op_name in (("OP_DIV", "div"), ("OP_MOD", "mod")):
+                    rule_list.extend(wide_div_rules_ge_format(
+                        dividend_lo_base="ALU_LO",
+                        dividend_hi_base="ALU_HI",
+                        divisor_lo_base="AX_CARRY_LO",
+                        divisor_hi_base="AX_CARRY_HI",
+                        result_lo_base="OUTPUT_LO",
+                        result_hi_base="OUTPUT_HI",
+                        width_bytes=1,
+                        opcode_gate=op_gate,
+                        marker_gate="MARK_AX",
+                        S=S,
+                        op=op_name,
+                        dividend_cond_weight=dividend_cw,
+                        divisor_cond_weight=30.0,
+                        marker_cond_weight=40.0,
+                        threshold=150.0,
+                    ))
+                ge_rules = tuple(rule_list)
+                # 2 opcodes x 256 x 256 = 131,072 rules.
+                assert len(ge_rules) == 2 * 256 * 256, (
+                    f"wide_div_rules_ge_format: expected 131072 rules "
+                    f"(2 x 256 x 256), got {len(ge_rules)}"
                 )
-                assert end == len(rules), (
-                    f"lower_ffn_rules wrote {end} units; "
-                    f"expected {len(rules)}"
-                )
-                block.post_ops.append(new_ffn)
+                ge_ffn = _lower(ge_rules)
+
+                # Cleanup runs first (its expanded passthrough block lands
+                # before the lookup block), so the lookup reads the
+                # already-cleaned dividend bands.
+                block.post_ops.append(cleanup_ffn)
+                block.post_ops.append(ge_ffn)
                 return
 
             if builder.composite is None:
