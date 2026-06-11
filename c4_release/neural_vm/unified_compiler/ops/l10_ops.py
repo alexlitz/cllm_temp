@@ -5734,6 +5734,65 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 blocked.append(replace(rule, conditions=rule.conditions + (blocker,)))
         return tuple(blocked)
 
+    def mem_value_row_blocked_tail_rules(
+        rules: tuple[FFNRule, ...],
+    ) -> tuple[FFNRule, ...]:
+        """Keep the 0xff SP/STACK0/SUB byte-1 emitters off PSH/SI store VALUE rows.
+
+        Root cause of the AX bytes-1-3 = 0xff leak (or_basic / xor_basic /
+        or_16bit / xor_16bit / sub_16bit): a family of ``tail_*_byte1_ff_*``
+        emitters write SP byte-1 = 0xff (correct for SP=0xfffffff8) but ALSO
+        fire on the PSH/SI memory-store VALUE byte rows, which share their
+        ``IS_BYTE + H1+2 + BYTE_INDEX_0 + CLEAN_EMBED-0xf8`` signature and lack
+        a value-byte scope blocker. The relay then copies that stale 0xff into
+        the ALU and the bitwise/add post-op computes ``0 | 0xff = 0xff``.
+
+        spec_k=0 block-34 residual probe (``IMM 0x0f; PSH; IMM 0x30; OR``)
+        confirms the store VALUE byte rows (pos 106-110) carry
+        ``MEM_VAL_B0..B3 ~= 0.97`` with ``MEM_ADDR_SRC = 0``; the legitimate
+        store ADDRESS byte rows that ``tail_mem_store_addr1_ff_*`` is meant to
+        fire on use ``MEM_ADDR_SRC`` and never carry ``MEM_VAL_B*``. Hence a
+        ``MEM_VAL_B0..B3`` hard blocker suppresses ONLY the spurious VALUE-row
+        firing and leaves the genuine SP/STACK0/ADDR byte-1 = 0xff repairs and
+        the genuine all-0xff sub-borrow result untouched.
+
+        Mirrors the ``ax_lea_local_addr_byte1_preserve_rules`` precedent (which
+        already carries these four ``MEM_VAL_B*`` blockers) and applies the
+        same discriminator to EVERY remaining 0xff byte-1 emitter in one sweep
+        (single-rule fixes relocate the leak — see
+        ``feedback_single_rule_fixes_are_zero_sum``).
+        """
+
+        blockers = (
+            ConditionTerm(DimRef.parse("MEM_VAL_B0"), -1_000_000.0),
+            ConditionTerm(DimRef.parse("MEM_VAL_B1"), -1_000_000.0),
+            ConditionTerm(DimRef.parse("MEM_VAL_B2"), -1_000_000.0),
+            ConditionTerm(DimRef.parse("MEM_VAL_B3"), -1_000_000.0),
+        )
+        # Only the 0xff byte-1 emitters that lack a value-byte discriminator.
+        # ``tail_ax_lea_local_addr_byte1_ff_*`` already carries these blockers
+        # (the design precedent) and is intentionally excluded. The
+        # ``tail_mem_store_addr1_ff_*`` ADDR-byte repair fires on MEM_ADDR_SRC
+        # rows (no MEM_VAL), so the blocker is a no-op on its legitimate rows
+        # but suppresses its misfire on the SP=0xf8 store VALUE byte.
+        blocked_prefixes = (
+            "tail_sp_pop_byte1_ff_after_",
+            "tail_stack0_pushed_addr_byte1_ff_after_",
+            "tail_stack0_pushed_addr_byte1_store_ff_after_",
+            "tail_ax_sub_full_underflow_byte1_ff",
+            "tail_sp_byte1_ff_from_initial_stack_exact",
+            "tail_mem_store_addr1_ff_from_stack_store_exact",
+        )
+        blocked = []
+        for rule in rules:
+            if rule.name and rule.name.startswith(blocked_prefixes):
+                blocked.append(
+                    replace(rule, conditions=rule.conditions + blockers)
+                )
+            else:
+                blocked.append(rule)
+        return tuple(blocked)
+
     def stack0_span_blocked_tail_rules(
         rules: tuple[FFNRule, ...],
     ) -> tuple[FFNRule, ...]:
@@ -7698,7 +7757,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         ),
     ) + sp_pop_carry_rules()
     return step_end_transition_blocked(
-        pc_byte_span_blocked(stack0_span_blocked_tail_rules(rules))
+        pc_byte_span_blocked(
+            stack0_span_blocked_tail_rules(
+                mem_value_row_blocked_tail_rules(rules)
+            )
+        )
     )
 
 
