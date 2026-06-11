@@ -617,6 +617,10 @@ def wide_mul_rules(
     opcode_gate: str,
     marker_gate: str,
     S: float,
+    operand_a_cond_weight: float = 30.0,
+    operand_b_cond_weight: float = 30.0,
+    marker_cond_weight: float = 40.0,
+    threshold: float = None,
 ) -> Tuple[FFNRule, ...]:
     """Generate FFNRule list for wide MUL — nibble-stacked flat lookup.
 
@@ -713,6 +717,12 @@ def wide_mul_rules(
 
     if width_bytes == 1:
         # 4-bit POC: 3-way AND (marker + a + b).
+        # Default threshold 80 fires when all three default-weight (40/30/30)
+        # binary one-hots are present. The cond-weight kwargs let callers
+        # rescale for operand bands carrying non-1.0 residual magnitude (the
+        # L8 operand-gather emits ~5-6-magnitude one-hots on ALU_LO and only
+        # ~0.9 on AX_CARRY_LO); pass a matching ``threshold`` then.
+        thr1 = 80.0 if threshold is None else threshold
         for a_nib in range(16):
             for b_nib in range(16):
                 product = (a_nib * b_nib) & 0xFFFF
@@ -721,11 +731,11 @@ def wide_mul_rules(
                 rules.append(multi_way_and_rule(
                     name=f"wide_mul_b0_a{a_nib:x}_b{b_nib:x}",
                     conditions=(
-                        (marker_gate, 40.0),
-                        (f"{operand_a_base}+{a_nib}", 30.0),
-                        (f"{operand_b_base}+{b_nib}", 30.0),
+                        (marker_gate, marker_cond_weight),
+                        (f"{operand_a_base}+{a_nib}", operand_a_cond_weight),
+                        (f"{operand_b_base}+{b_nib}", operand_b_cond_weight),
                     ),
-                    threshold=80.0,
+                    threshold=thr1,
                     gate=opcode_gate,
                     writes=(
                         (f"{result_base}+{lo_nib}", write_amplitude),
@@ -757,13 +767,13 @@ def wide_mul_rules(
                             f"blo{b_lo:x}_bhi{b_hi:x}"
                         ),
                         conditions=(
-                            (marker_gate, 40.0),
-                            (f"{operand_a_base}+{a_lo}", 30.0),
-                            (f"{operand_a_base}+{16 + a_hi}", 30.0),
-                            (f"{operand_b_base}+{b_lo}", 30.0),
-                            (f"{operand_b_base}+{16 + b_hi}", 30.0),
+                            (marker_gate, marker_cond_weight),
+                            (f"{operand_a_base}+{a_lo}", operand_a_cond_weight),
+                            (f"{operand_a_base}+{16 + a_hi}", operand_a_cond_weight),
+                            (f"{operand_b_base}+{b_lo}", operand_b_cond_weight),
+                            (f"{operand_b_base}+{16 + b_hi}", operand_b_cond_weight),
                         ),
-                        threshold=150.0,
+                        threshold=150.0 if threshold is None else threshold,
                         gate=opcode_gate,
                         writes=(
                             (f"{result_base}+{nib0}", write_amplitude),
