@@ -1210,6 +1210,23 @@ def make_residual_alibi_slopes_op() -> Operation:
         attn8 = model.blocks[8].attn
         if hasattr(attn8, 'alibi_slopes') and attn8.alibi_slopes is not None:
             attn8.alibi_slopes.fill_(0.5)
+            # Operand-gather one-hot fix (2026-06-11): head 0 is the
+            # binary-op operand-A gather (STACK0 byte 0 -> ALU_LO/HI, baked
+            # by layer7_operand_gather). The operand source token can be FAR
+            # from the AX query row (~40 positions in a smoke step), so the
+            # default recency slope 0.5 imposes a ~-20 alibi penalty that
+            # nearly cancels the head's strong STACK0_BYTE0 QK match (~31.75)
+            # relative to the uniform CONST baseline (~10.78 on every row).
+            # The operand then wins by a razor-thin margin (w~0.51) and a
+            # tail of nearby zero-byte AX-result rows (CLEAN_EMBED one-hot at
+            # nibble 0) bleeds into the band copy -> the value-proportional
+            # @0 magnitude artifact in ALU_LO/HI that blocks the CMP/ALU
+            # multi_way_and consumers (AX_CARRY, a sharper head, stays a
+            # clean one-hot). A shallow slope sharpens the pointer onto the
+            # single operand source so ALU_LO/HI become clean per-nibble
+            # one-hots. This op (phase 999) is the authoritative block-8
+            # slope owner; it runs AFTER layer7_operand_gather's bake.
+            attn8.alibi_slopes[0] = 0.1
             # Head 3 fetches IMM bytes from the static code prefix by exact
             # ADDR_KEY. A steep recency penalty makes long smoke contexts lose
             # the code-byte match to the zero anchor, leaving stale AX_CARRY.
