@@ -195,25 +195,22 @@ _DEFAULT_MEM_STEP_SCALE = 1.0
 
 # Length buckets (upper bound on declarative steps) -> per-chunk batch width.
 #
-# The memory driver is the per-block attention score tensor ``[B, H, S, S]``
-# (O(B * S^2) in the context length S). When a program's neural decode
-# DIVERGES it runs to the full declarative horizon, so S grows to
-# ``steps * 35`` and the score tensor co-grows for EVERY batch slot. Measured:
-# a 48-wide batch of ~45-step diverging programs hit 24 GB; a 12-wide one still
-# OOM'd; a 6-wide ~150-step batch climbs past 23 GB. So only the genuinely
-# trivial programs (<=15 steps) batch wide; deeper bands narrow sharply and
-# anything that can diverge to a large S runs solo.
+# The memory driver is NOT the context length alone but the per-block forward
+# working set at batch width B: with this model (d_model=872, 37 physical
+# blocks) even a width-32 batch of <=15-step DIVERGING programs OOM'd a 24 GB
+# GPU (the diverging members run their full ~15-step horizon and the shared
+# FFN/score tensors balloon). Measured OOM points, all on a free 24 GB GPU:
+# width 48 @ ~45 steps, width 12 @ ~45 steps, width 32 @ ~15 steps. width 8
+# @ <=25 steps and width 2 @ <=40 steps stayed safe (<=~21 GB) across a full
+# run. So the table is uniformly conservative: NOTHING wider than 8, and the
+# width shrinks as depth grows because a diverging member fills the horizon.
 #
 # Tuples are ``(step_upper_bound, width)`` checked in order; first whose bound
-# >= the chunk's deepest member wins. Deliberately conservative: a diverging
-# member runs its FULL horizon, so the score tensor ``[B, H, S, S]`` co-grows
-# for every batch slot. A 48-wide batch of ~45-step diverging programs hit
-# 24 GB and a 12-wide one still OOM'd (measured), so the deeper bands narrow
-# sharply and anything > 80 steps runs solo.
+# >= the chunk's deepest member wins. ``--mem-step-scale`` shrinks all widths
+# further for a shared GPU.
 _LENGTH_BUCKET_CHUNKS: Tuple[Tuple[int, int], ...] = (
-    (15, 32),    # trivially shallow (S<=525): batch wide for throughput.
-    (25, 8),
-    (40, 2),     # 25..40 steps: mostly diverging loop/gcd -> width 2.
+    (25, 8),     # <=25 steps: width 8 (the widest verified-safe batch).
+    (40, 2),     # 25..40 steps: width 2 (a diverging member fills S~1400).
     (80, 1),
     (1 << 30, 1),  # >80 steps: SOLO (a diverging member fills the horizon).
 )
