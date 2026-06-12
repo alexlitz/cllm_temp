@@ -204,8 +204,11 @@ def make_l15_psh_stack_ir() -> CompilerIR:
     bp_i = 3
     threshold = 3.5
 
+    all_byte_indices = ("BYTE_INDEX_0", "BYTE_INDEX_1",
+                        "BYTE_INDEX_2", "BYTE_INDEX_3")
+
     def psh_byte_conditions(marker_index, byte_index_name):
-        return (
+        conds = [
             ("PSH_AT_SP", 1.0),
             (f"H1+{marker_index}", 1.0),
             ("IS_BYTE", 1.0),
@@ -216,7 +219,43 @@ def make_l15_psh_stack_ir() -> CompilerIR:
             # from the actual SP register row.
             (f"H1+10", -1.0),
             (f"H4+{bp_i}", -1.0),
-        )
+        ]
+        # PSH_AT_SP arrives at value ~2.0 on the var-store frame PSH step
+        # (not the ~1.0 of the flat-PSH smoke path).  That +1.0 of unearned
+        # AND-headroom otherwise lets the WRONG-byte-index and WRONG-marker
+        # units clear the 3.5 threshold on every SP-byte row, leaking the
+        # byte1 0xf nibble + spurious HI[0] writes onto the byte2/byte3
+        # prediction rows (var_simple_12 step-3 SP byte2 -> 0x0f).  Make the
+        # byte-index and marker discriminators load-bearing by subtracting
+        # the *other* one-hot indices: on the legit row the negatives are 0
+        # (byte-identical), on a wrong-index/wrong-marker row the active
+        # one-hot drives the sum back below threshold regardless of the
+        # PSH_AT_SP magnitude.
+        for other_bi in all_byte_indices:
+            if other_bi != byte_index_name:
+                conds.append((other_bi, -1.0))
+        # Cross-marker blocker (BP producer only), frame-scoped via OP_ENT.
+        #
+        # The BP byte2 preserver shares BYTE_INDEX_1 with the SP byte2
+        # zero-writer, so on a PSH step (PSH_AT_SP=2.0) the +1.0 of unearned
+        # AND-headroom lets it ride onto the SP byte2 row and leak
+        # OUTPUT_HI[0]/OUTPUT_LO[1] (var step-3 PSH SP byte2 -> 0x0f / 0x01).
+        #
+        # We darken it there with an OP_ENT condition rather than a bare
+        # ``-H1+sp`` marker blocker: a bare marker blocker also corrects the
+        # *otherwise benign* SP byte2 residue on the flat PSH+ADJ smoke path
+        # (``test_adj_sp``), which un-masks a latent L9 OP_ADJ AX writer and
+        # turns that test red.  OP_ENT is the one clean discriminator between
+        # the two: it is present (frame prologue residue ~0.5-16 on the var
+        # store/recall path) on every var leak row and ~0 on the flat
+        # PSH+ADJ row.  ``-2.0 * OP_ENT`` pulls the BP producer below the 3.5
+        # threshold on the var SP byte2 row while leaving the flat-PSH path
+        # (OP_ENT=0) byte-identical, and the BP producer never fires on a
+        # genuine BP byte row in either trace (PSH_AT_SP=0 there), so this is
+        # a pure leak suppression.
+        if marker_index == bp_i:
+            conds.append(("OP_ENT", -2.0))
+        return tuple(conds)
 
     # SP byte 0 position predicts SP byte 1 = 0xff after SP -= 8.
     rules.append(multi_way_and_rule(
