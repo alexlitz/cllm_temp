@@ -759,9 +759,24 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # still carry the raw (dirty) bands the engine thresholds expect,
         # and the EQ units (gated OP_EQ) never touch the bitwise cleanup.
         # CMP+0/CMP+3 are never written -> lt/le/gt/ge untouched.
-        from .l10_ops import _layer10_alu_eq_engine_rules
+        # Wall-4 SESSION 4 (2026-06-12): the engine's 256 nibble-pair units
+        # write the decisive EQ-true byte 0x01 when equal; ``eq_default``
+        # adds ONE unconditional OP_EQ default-0 unit writing 0x00 (smaller
+        # magnitude) so UNEQUAL operands -- which fire no engine unit --
+        # still decode 0x00 and survive the +238 L25 tail band that
+        # otherwise corrupts eq_false to 0x11=17. Both gated OP_EQ ->
+        # lt/le/gt/ge/ne untouched. The default lives ONLY in this
+        # efficient-mode merge (the smoke path); lookup-mode keeps its
+        # 256-unit eq_engine layout.
+        from .l10_ops import (
+            _layer10_alu_eq_engine_rules,
+            _layer10_alu_eq_default_rules,
+        )
         eq_rules = _layer10_alu_eq_engine_rules(S)
-        cleanup_ffn = _lower(tuple(cleanup_rules) + tuple(eq_rules))
+        eq_default_rules = _layer10_alu_eq_default_rules(S)
+        cleanup_ffn = _lower(
+            tuple(cleanup_rules) + tuple(eq_rules) + tuple(eq_default_rules)
+        )
 
         # ---- Stage 2: rescaled bitwise lookup over the cleaned bands ----
         # Cleaned operand-A cells ~5.82, operand-B (AX_CARRY) cells ~0.94.

@@ -1304,21 +1304,49 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
     comparisons are structurally untouched.
     """
     gate_eq = dim_ref("opcode_flag", "EQ")
-    # Per-term AND weights normalising the over-amplified ALU vs clean
-    # AX_CARRY and rejecting the index-0 artifact. Tuned for the MAXIMUM
-    # symmetric firing margin (tools/tune_eq_engine.py): the true match
-    # (h=0,l=5) sums to 6.47 while the worst non-target (the index-0
-    # ALU_LO artifact unit) sums to 5.27, so the 5.872 threshold sits
-    # 0.60 above the artifact ceiling AND 0.60 below the true match --
-    # the widest separation any clean weighting achieves. Leans on the
-    # AXC_LO discriminator (0.32 artifact vs 0.94 true one-hot, the
-    # cleanest per-build-stable signal). See docstring.
-    W_MARK = 0.8
-    W_ALU_HI = 0.2
-    W_AXC_HI = 0.4
+    # SESSION 4 retune (2026-06-12): the prior weighting/threshold was tuned
+    # ONLY against 5==5 and did NOT fire on the smoke test's 42==42 (true
+    # match summed 5.33 < the 5.87 threshold), so eq_true silently fell
+    # through to the default-0 and decoded 0 -- the real "razor edge".
+    # Per-term AND weights. The decisive equality discriminator is
+    # AX_CARRY, which is a CLEAN one-hot of operand B's nibble (1.0 at the
+    # true nibble, ~0.3 index-0 artifact); ALU carries A's nibble but with
+    # a value-proportional index-0 artifact NEARLY EQUAL to the true nibble
+    # (5.56 vs 5.83), so ALU cannot discriminate the artifact and is
+    # weighted lightly (just confirms A's nibble is present; its index-0
+    # artifact ~5.4 is NEARLY EQUAL to a true nibble ~5.83, so ALU cannot
+    # cleanly discriminate). The clean AX_CARRY one-hots (B's nibbles) carry
+    # the equality signal at 1.5 each. Weights/threshold chosen for the
+    # WIDEST, most build-robust margin (probed AX-row operand bands):
+    #   - smoke 42==42 true match (h=2,l=10) fires; 10!=20 rejected.
+    #   - all four truly-equal smoke/cluster pairs fire (none lost), and the
+    #     bulk of unequal pairs are rejected -> if_eq 1096 ids 400-424 lift
+    #     11/25 -> 21/25.
+    # The prior 5.872 tuning was fit ONLY to 5==5 and silently mis-FIRED on
+    # the smoke 42==42 (true match summed 5.33 < 5.872), so eq_true fell
+    # through to the default-0 and decoded 0 -- the real "razor edge".
+    # CMP+0/CMP+3 are never written -> lt/le/gt/ge structurally untouched.
+    # MARK_AX kept as a small +0.3 condition so the rule is scoped to AX
+    # rows (the operand bands only exist there); constant across candidate
+    # rows so it shifts only the absolute threshold, not the discrimination.
+    # RESIDUAL LIMIT (documented, out of this op's lane): a minority of
+    # unequal pairs whose SECOND operand B has high nibble 0 (B<16) and
+    # which share the low nibble or collide with the irreducible ALU index-0
+    # artifact (e.g. 16==9, 28==12, 50==11, 37==3) score as high as a true
+    # match and still mis-fire -- the operand-gather hybrid-encoding wall
+    # (project_operand_gather_hybrid_encoding_is_cmp_alu_root): ALU's
+    # value-proportional index-0 artifact is indistinguishable from a true
+    # zero nibble, so no clean per-nibble linear AND can separate them
+    # without a clean-one-hot operand-gather fix at block 8. A tighter
+    # AX_CARRY-heavy weighting reclaims a couple of these but loses a true
+    # match (41==41) to a thinner margin, a worse trade -- this robust
+    # weighting keeps every true case and the widest separation.
+    W_MARK = 0.3
+    W_ALU_HI = 0.1
+    W_AXC_HI = 1.5
     W_ALU_LO = 0.2
-    W_AXC_LO = 1.8
-    THRESH = 5.872
+    W_AXC_LO = 1.5
+    THRESH = 4.0
     # The matching unit writes ``CMP+1`` (hi_eq) and ``CMP+2`` (lo_eq) at
     # the AX row, which is exactly what the live ``ComparisonCombine``
     # post-op (logical L14, block 22) reads for the EQ override
@@ -1336,6 +1364,45 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
     # MARK_AX weight) matches the CMP flag magnitudes L9 would have
     # written had its cascade transmitted.
     FLAG = 2.5
+    # Wall-4 SESSION 4 decode-margin push (2026-06-12): in addition to the
+    # CMP+1/CMP+2 flags (consumed by the SE-row ComparisonCombine EQ
+    # override through the Wave-A relay), each EQUAL-firing unit ALSO writes
+    # the EQ result DIRECTLY into OUTPUT_LO at the same MARK_AX row -- the
+    # row the L3-head-5 AX_FULL relay decodes into the EXIT step's exit-code
+    # byte. The direct write makes the equality byte win the
+    # OUTPUT_LO[1]-vs-[0] argmax by a LARGE, fp-order-robust margin instead
+    # of riding the razor-thin CMP->ComparisonCombine->relay amplification
+    # (which decoded eq_true on a ~84-logit knife edge that some
+    # forward-state differences flipped to 0). ``OUT`` is scaled so the
+    # accumulated OUTPUT_LO[1] decisively dominates the +238 L25 tail band
+    # at the byte-0 emit row. Gated hard on OP_EQ + the matched nibble pair,
+    # so it fires ONLY when A == B; unequal operands fire no unit and the
+    # OUTPUT_LO[1] write never lands. CMP+0 (the load-bearing hi_lt
+    # guardrail leak) and CMP+3 are still never written -> lt/le/gt/ge are
+    # structurally untouched.
+    # Decode of the exit-code byte reads BOTH nibbles: OUTPUT_LO (low) and
+    # OUTPUT_HI (high). The razor-edge for eq_true is NOT OUTPUT_LO (tokens
+    # 0x01/0x11/0x21 all share low-nibble 1, so OUTPUT_LO only moves them
+    # together) but OUTPUT_HI[0]-vs-[1]: the EQ-true byte 0x01 has high
+    # nibble 0, and OUTPUT_HI[0] won by only ~16.8 (a ~84-logit knife edge
+    # that pytest's forward state flipped). So the equal-firing units write
+    # the WHOLE result byte 0x01 decisively -- OUTPUT_LO[1]+/OUTPUT_HI[0]+
+    # as the one-hot winners and a strong negative on every competitor cell
+    # in both bands -- with ``OUT`` large enough that OUTPUT_HI[0] survives
+    # and dominates the +238 L25 tail band at the byte-0 emit row, AND
+    # clears the eq-default-0 unit's OUTPUT_LO[1] suppression (``-DEF``) by
+    # a wide margin so the equal low-nibble flips decisively to 1.
+    OUT = 900.0
+    def eq_one_byte_writes() -> tuple[tuple[str, float], ...]:
+        w: list[tuple[str, float]] = []
+        # low nibble = 1
+        for k in range(16):
+            w.append((f"OUTPUT_LO+{k}", (OUT if k == 1 else -OUT) / S))
+        # high nibble = 0
+        for k in range(16):
+            w.append((f"OUTPUT_HI_THIS_STEP+{k}", (OUT if k == 0 else -OUT) / S))
+        return tuple(w)
+    eq_one = eq_one_byte_writes()
     rules: list[FFNRule] = []
     for h in range(16):
         for l in range(16):
@@ -1354,10 +1421,57 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
                 writes=(
                     ("CMP+1", FLAG / S),
                     ("CMP+2", FLAG / S),
-                ),
+                ) + eq_one,
                 scope="MARK_AX and OP_EQ",
             ))
     return tuple(rules)
+
+
+def _layer10_alu_eq_default_rules(S: float) -> tuple[FFNRule, ...]:
+    """EQ default-0 OUTPUT writer: makes eq_false survive the L25 tail band.
+
+    Wall-4 SESSION 4 (2026-06-12). The per-nibble EQ engine fires a unit
+    ONLY when the operands are equal; for UNEQUAL operands no unit fires,
+    so the EQ result falls through to ComparisonCombine's default-0
+    (OUTPUT_LO[0]=+9.6, a weak write). At the byte-0 emit row the L25 tail
+    bank then floods OUTPUT_LO[1..15] and OUTPUT_HI[1..15] with a uniform
+    +238 band (a relay of the SE-row 0x00 writer, inverted), overpowering
+    the weak default-0 and decoding eq_false as 0x11 = 17.
+
+    This single unit fires UNCONDITIONALLY for OP_EQ at MARK_AX and writes
+    the byte 0x00 (OUTPUT_LO[0]+ / OUTPUT_HI[0]+, every competitor cell
+    strongly negative) at a magnitude chosen to DOMINATE the +238 band.
+    For EQUAL operands the 256 nibble-pair engine units ALSO fire and write
+    0x01 at the LARGER ``OUT`` magnitude (OUTPUT_LO[1]+/OUTPUT_LO[0]-,
+    OUTPUT_HI[0]+): their OUTPUT_LO[1] (+OUT) beats this default's
+    OUTPUT_LO[1] (-DEF) so the low nibble flips to 1 for eq_true, while both
+    REINFORCE OUTPUT_HI[0] (high nibble 0, shared by 0x00 and 0x01). So
+    eq_true -> 0x01, eq_false -> 0x00, both with a decisive, fp-order-robust
+    margin. Gated hard on OP_EQ -> lt/le/gt/ge/ne are structurally
+    untouched; CMP is never written here.
+
+    NOTE: only wired into the EFFICIENT-mode L10 wrap (the smoke path); the
+    lookup-mode ``layer10_alu`` FFN keeps its 256-unit eq_engine layout.
+    """
+    gate_eq = dim_ref("opcode_flag", "EQ")
+    # Default-0 magnitude. Smaller than the equal units' OUT so the equal
+    # path wins the low nibble, but large enough that OUTPUT_LO[0] /
+    # OUTPUT_HI[0] survive and dominate the +238 L25 tail band.
+    DEF = 500.0
+    w: list[tuple[str, float]] = []
+    for k in range(16):
+        w.append((f"OUTPUT_LO+{k}", (DEF if k == 0 else -DEF) / S))
+    for k in range(16):
+        w.append((f"OUTPUT_HI_THIS_STEP+{k}", (DEF if k == 0 else -DEF) / S))
+    return (multi_way_and_rule(
+        name="l10_eq_default_zero",
+        conditions=(("MARK_AX", 1.0),),
+        threshold=0.5,
+        gate=gate_eq,
+        gate_weight=1.0,
+        writes=tuple(w),
+        scope="MARK_AX and OP_EQ",
+    ),)
 
 
 def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
