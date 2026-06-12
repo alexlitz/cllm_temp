@@ -936,6 +936,31 @@ def _layer14_mem_generation_head_specs_with_overrides(
             )[own_value_idx]
             target_query_dim = mem_val_dims[own_value_idx]
             q_map[(44, BD.OP_ENT)] = ent_old_bp_s
+            # OPCODE-BROADCAST HARDENING (2026-06-11, var_simple_12 / id 262):
+            # slot 44 is the ENT-store value-SOURCE selector (it makes the head
+            # attend the JSR-prologue old-BP position via K[OP_JSR]). Its only
+            # Q gate was OP_ENT -- but OP_ENT does NOT stay one-hot at its own
+            # marker; it BROADCASTS in-step onto every row at ~12-17 (audit
+            # docs/OPCODE_BROADCAST_BLOCKER_AUDIT_2026_06_11.md). On the step-2
+            # LEA PC-emit row (MARK_PC=1, OP_ENT=12.63, OP_JSR=0.86,
+            # MEM_VAL_Bx=0) the slot-44 Q-score is 80 * 12.63 = 1010, so all
+            # four value heads (4-7) attend the prologue position and copy its
+            # CLEAN_EMBED_HI into OUTPUT_HI+0 (+1.0 each = +4.0), flipping the
+            # PC high nibble 2->0 (0x2a -> 0x0a) and desyncing the program
+            # (probe_var_full_chain.py 262: genesis at block 29 / logical L18).
+            # FIX: hard subtractive NOT-blockers on the register-emit markers
+            # (MARK_PC/AX/SP/BP). On the legitimate ENT MEM-value-emit firing
+            # row those markers are ALL 0 (the value-target row carries
+            # MARK_MEM + MEM_VAL_Bx, confirmed by the slot-38 base blocker which
+            # already excludes MARK_PC/AX/BP), so the slot-44 score is
+            # byte-identical there; on any register-emit row a single marker
+            # contributes -1e6 << -(80 * OP_ENT_broadcast_max ~= 1400), burying
+            # the OP_ENT broadcast and killing the misfire. Pure subtractive (no
+            # net-zero compensation term) so it cannot perturb the legit row
+            # even if a marker is fractionally nonzero.
+            slot44_marker_block_s = 1000000.0  # 1e6 >> ent_old_bp_s * ENT_bcast
+            for blk_dim in (BD.MARK_PC, BD.MARK_AX, BD.MARK_SP, BD.MARK_BP):
+                q_map[(44, blk_dim)] = -slot44_marker_block_s
             k_map[(44, BD.OP_JSR)] = ent_old_bp_s
             k_map[(44, BD.H1 + bp_i)] = ent_old_bp_s
             k_map[(44, source_byte_dim)] = ent_old_bp_s
@@ -1587,6 +1612,20 @@ def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
             BD.MEM_VAL_B3,
         )[own_value_idx]
         attn.W_q.data[base + 44, BD.OP_ENT] = ent_old_bp_s
+        # OPCODE-BROADCAST HARDENING (2026-06-11, var_simple_12 / id 262):
+        # mirror of the declarative spec
+        # ``_layer14_mem_generation_head_specs_with_overrides`` slot 44. The
+        # declarative spec is the LIVE path (make_layer14_mem_generation_op's
+        # bake calls Primitives.generate_attention_heads on it); this imperative
+        # ``_clear_l14_mem_generation_overbroad_sp_suppression`` helper is no
+        # longer invoked (folded into the spec). Kept in sync to prevent a stale
+        # re-enable from reintroducing the misfire. Hard subtractive NOT-blockers
+        # on the register-emit markers bury OP_ENT's in-step broadcast (~12-17)
+        # so slot 44 cannot fire on the step-2 LEA PC-emit row; byte-identical on
+        # the legit ENT MEM-value row (MARK_PC/AX/SP/BP all 0 there).
+        slot44_marker_block_s = 1000000.0  # 1e6 >> ent_old_bp_s * ENT_bcast
+        for blk_dim in (BD.MARK_PC, BD.MARK_AX, BD.MARK_SP, BD.MARK_BP):
+            attn.W_q.data[base + 44, blk_dim] = -slot44_marker_block_s
         attn.W_k.data[base + 44, BD.OP_JSR] = ent_old_bp_s
         attn.W_k.data[base + 44, BD.H1 + bp_i] = ent_old_bp_s
         attn.W_k.data[base + 44, source_byte_dim] = ent_old_bp_s
