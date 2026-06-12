@@ -1074,9 +1074,16 @@ def wide_div_rules_ge_format(
     if width_bytes > 1:
         raise NotImplementedError(
             f"wide_div_rules_ge_format: width_bytes={width_bytes} is "
-            f"deferred — multi-byte byte-accurate DIV requires a "
-            f"GE-cascade across byte rows (see "
-            f"docs/LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md). "
+            f"deferred — multi-byte byte-accurate DIV hits TWO walls: "
+            f"(a) a general 2-byte-dividend / 1-byte-divisor table is a "
+            f"3-input (256^3 = 16.7M-rule) lookup, intractable as a flat "
+            f"FFN; the bit-serial multi_pass alternative needs a GE-cascade "
+            f"across byte rows. (b) the L7 operand-gather only delivers "
+            f"STACK0 byte 0 to ALU_LO/HI at the AX row, so the dividend's "
+            f"high byte is never in the residual the lookup reads — a "
+            f"multi-byte operand relay is a prerequisite. See "
+            f"docs/DIV_MOD_MULTIBYTE_DIVIDEND_BLOCKER_2026_06_12.md and "
+            f"docs/LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md. "
             f"For 8-bit-fits-in-byte cases use width_bytes=1; for "
             f"wider operands ``FlattenedDivMod`` remains authoritative."
         )
