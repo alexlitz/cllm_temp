@@ -124,8 +124,65 @@ Phase 1 is the solid, byte-identical landing; Phase 2 is fully specified
 above and is now a clean cascade-rule edit (3) once the scratch dim (1) +
 relay head (2) exist.
 
+## RESOLUTION (2026-06-12, LANDED — sub_16bit PASS, zero smoke regression)
+
+Phase 2 landed WITHOUT a new dim or d_model widening. Two premises in
+"Why it was not landed" above were wrong:
+
+1. **No new scratch dim is needed.** The decoupled band the cascade reads
+   is the *existing* `STACK0_BYTE_VAL_{h}` family itself (enabler #2 in the
+   brief). A new L13 attention head (`layer13_sub_minuend_relay`, head 4)
+   re-deposits `STACK0_BYTE_VAL_{k+1}` from the populated PSH frame back
+   INTO `STACK0_BYTE_VAL_{k+1}` at the SUB byte-emit row. STACK0_BYTE_VAL
+   is neither OUTPUT nor AX_FULL nor CARRY, so the CARRY+3 borrow relay is
+   untouched and sub_borrow stays 0xFFFFFFFF. No d_model change.
+
+2. **The byte_idx → output-byte mapping is +1, not identity.** The cascade
+   is an INTER-byte stage: the rule scoped on `BYTE_INDEX_k` produces
+   **output byte k+1** (the autoregressive predictor row for byte k+1,
+   verified via the LM-head decode at OUTPUT_LO=69/HI=85). So output byte 1
+   needs `byte_idx=0` reading `STACK0_BYTE_VAL_1` at the `BYTE_INDEX_0` row
+   — NOT `byte_idx∈{1,2}` as this doc originally specified. The relay
+   delivers byte (k+1) to the `BYTE_INDEX_k` row; the cascade `sub_rule_for`
+   (all byte_idx) reads `STACK0_BYTE_VAL_{byte_idx+1}` and EMITS on OUTPUT
+   (cancel cell 0 = the un-relayed 0x00, set the computed nibble).
+
+ALiBi note: the runtime applies `-slope * |dist|` (vm_step), so a NEGATIVE
+slope rewards distance → selects the deepest/oldest PSH frame. The K
+source-flag match is boosted to `K_FLAG=200` so STACK0_BYTE rows dominate
+the alibi distance penalty under the ~0.096 score scale; the per-byte Q
+selector folds in TEMP+9 so the head is dark off-SUB (STACK0_BYTE_VAL
+aliases FORMAT_PTR/LEV_DETECTOR in the compact layout — writing it off-SUB
+would regress).
+
+Verified spec_k=0: sub_16bit→0xFF PASS, sub_borrow→0xFFFFFFFF PASS,
+sub_basic→42 PASS (byte-identical). `pytest tests/test_smoke.py`:
+**46 passed / 3 failed / 2 xfailed** (was 45/4/2; sub_16bit flipped;
+the 3 remaining — mul_basic/eq_true/eq_false — are the pre-existing
+CMP/mul surface; ZERO regression). 1096 sub cluster: **3/50 → 12/50**
+(+9; the multi-byte-minuend cases with a single-nibble high byte AND a
+byte-0 borrow). Commits: `feat(l13): ...relay head (Part 1)`,
+`feat(l10): SUB cascade reads relayed multi-byte minuend (Part 2)`.
+
+### Remaining (follow-ups, NOT this surface)
+
+- **No-borrow multi-byte SUB** (e.g. 827-26=801, byte0 doesn't underflow):
+  the cascade borrow rule subtracts a hardcoded -1 and is borrow-gated, so
+  byte 1 = minuend_byte1 when there is no borrow is NOT emitted (defaults
+  to 0x00). Needs a non-borrow minuend-high-byte passthrough to OUTPUT
+  (a separate corrective op, ~38 of the 45 multi-byte sub fails).
+- **2-nibble high bytes** (e.g. 0x1234-0x34, byte1=0x12): the UPSTREAM
+  `layer10_psh_ax_broadcast` stores only the LOW nibble of STACK0_BYTE_VAL_h
+  (probe: 0x1234 → STACK0_BYTE_VAL_1 = 0x02 not 0x12). The relay faithfully
+  copies the truncated value; the fix is upstream in the PSH broadcast head.
+- **ADD multi-byte** (add 3/50 unchanged): the analogous `add_rule_for`
+  still matches OUTPUT; an ADD relay + read-repoint mirrors the SUB fix but
+  ADD operand bytes reach OUTPUT differently — needs its own probe pass.
+
 ## Artifacts
 
 - `tools/verify_carry_migration.py` — Phase 1 byte-identity gate (committed).
 - `tools/probe_sub_minuend_source.py` — the spec_k=0 probe behind the table
   above (OUTPUT vs STACK0_BYTE_VAL_h at the cascade rows).
+- `tools/probe_sub_relay_design.py`, `tools/probe_sub_cascade_rows.py` —
+  the spec_k=0 probes behind the RESOLUTION (relay delivery + cascade map).
