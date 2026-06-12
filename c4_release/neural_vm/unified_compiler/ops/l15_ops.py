@@ -745,11 +745,31 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # Row 58: early-ENT STACK0 discriminator.
             # The legacy helper wipes Q/K at slot 58 first; base spec
             # has no writes there, so the wipe is a no-op.
+            #
+            # OPCODE-BROADCAST HARDENING (2026-06-11, var_simple_12 / id 262):
+            # the original gate cleared its -1e5 CONST bias with OP_ENT alone
+            # (Q weight 2e8). OP_ENT does NOT stay one-hot at its own marker --
+            # it BROADCASTS in-step onto every row at magnitude ~12-17 (audit
+            # docs/OPCODE_BROADCAST_BLOCKER_AUDIT_2026_06_11.md). At 2e8 * 12.6
+            # = 2.5e9 it overran even the -2e9 single-marker NOT-blockers, so on
+            # the step-2 LEA PC byte0 prediction row (MARK_PC=1, OP_ENT=12.6,
+            # MARK_STACK0=0) the discriminator fired, forced head-0 to attend to
+            # an operand position, and copied its CLEAN_EMBED into OUTPUT_LO+0
+            # at scale 40 -- flooding the PC byte to 0x00 and desyncing the
+            # whole program (probe_var_full_chain.py 262 step-2 LEA PC byte0).
+            # FIX: make MARK_STACK0 a HARD requirement. We offset CONST by
+            # -stack0_gate and MARK_STACK0 by +stack0_gate so the net delta is
+            # ZERO on the legitimate firing row (MARK_STACK0=1) -- byte-identical
+            # there -- while on any non-STACK0 row (MARK_STACK0=0) the -1e10 bias
+            # buries OP_ENT's largest broadcast (2e8 * ~17.5 = 3.5e9). OP_ENT
+            # stays as the in-step confirming term; the K-side OP_ENT match is
+            # unchanged.
             early_ent_stack0_q = 100000.0
+            stack0_gate = 10000000000.0  # 1e10 >> 2e8 * OP_ENT_broadcast_max
             row = 58
             q_map[(row, BD.OP_ENT)] = 200000000.0
-            q_map[(row, BD.MARK_STACK0)] = early_ent_stack0_q
-            q_map[(row, BD.CONST)] = -early_ent_stack0_q
+            q_map[(row, BD.MARK_STACK0)] = early_ent_stack0_q + stack0_gate
+            q_map[(row, BD.CONST)] = -early_ent_stack0_q - stack0_gate
             q_map[(row, BD.IS_BYTE)] = -2000000000.0
             for marker_dim in (
                 BD.MARK_AX, BD.MARK_PC, BD.MARK_SP,
@@ -2122,14 +2142,37 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
             # cannot become positive evidence.
             early_ent_stack0_row = 58
             early_ent_stack0_q = 100000.0
+            # OPCODE-BROADCAST HARDENING (2026-06-11, var_simple_12 / id 262):
+            # OP_ENT does NOT stay one-hot at its own marker -- it BROADCASTS
+            # in-step onto every row at magnitude ~12-17 (audit
+            # docs/OPCODE_BROADCAST_BLOCKER_AUDIT_2026_06_11.md). At Q weight
+            # 2e8 * ~12.6 = 2.5e9 it overran even the -2e9 single-marker
+            # NOT-blockers, so on the step-2 LEA PC byte0 prediction row
+            # (MARK_PC=1, OP_ENT=12.6, MARK_STACK0=0) this discriminator fired,
+            # forced load-head 0 to attend an operand position and copy its
+            # CLEAN_EMBED into OUTPUT_LO+0 at scale 40 -- flooding the PC byte
+            # to 0x00 and desyncing the whole program (probe_var_full_chain.py
+            # 262 step-2 LEA PC byte0). FIX: make MARK_STACK0 a HARD requirement
+            # by offsetting CONST by -stack0_gate and MARK_STACK0 by
+            # +stack0_gate. Net delta on the legitimate firing row
+            # (MARK_STACK0=1) is ZERO -- byte-identical there -- while on any
+            # non-STACK0 row the -1e10 bias buries OP_ENT's largest broadcast
+            # (2e8 * ~17.5 = 3.5e9). OP_ENT stays the in-step confirming term;
+            # the K-side OP_ENT match is unchanged.
+            # NOTE: the declarative mirror
+            # ``_layer15_memory_lookup_heads_0_3_specs_with_overrides`` slot 58
+            # carries the identical change; this imperative writer is the one
+            # that actually lands because make_l15_attention_resize_op re-runs
+            # it after the declarative bake.
+            early_ent_stack0_gate = 10000000000.0  # 1e10 >> 2e8 * ENT_bcast_max
             attn.W_q.data[base + early_ent_stack0_row, :] = 0.0
             attn.W_k.data[base + early_ent_stack0_row, :] = 0.0
             attn.W_q.data[base + early_ent_stack0_row, BD.OP_ENT] = 200000000.0
             attn.W_q.data[base + early_ent_stack0_row, BD.MARK_STACK0] = (
-                early_ent_stack0_q
+                early_ent_stack0_q + early_ent_stack0_gate
             )
             attn.W_q.data[base + early_ent_stack0_row, BD.CONST] = (
-                -early_ent_stack0_q
+                -early_ent_stack0_q - early_ent_stack0_gate
             )
             attn.W_q.data[base + early_ent_stack0_row, BD.IS_BYTE] = (
                 -2000000000.0
