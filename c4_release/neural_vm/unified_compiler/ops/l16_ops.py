@@ -1975,6 +1975,18 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -10.0),
         ("MARK_MEM", -10.0),
     )
+    # WEAK-WRITER FIX (2026-06-11, var_simple_12 / id 262): the gate FIRES
+    # correctly (score 4.96 >= 4.5) but the original 20/S = 0.2 per-nibble write
+    # was far too weak -- at the AX byte1 prediction row the prevailing 0x00
+    # mass sits at OUTPUT nib0 ~= 0.94 (with a ~10 transient at L18/L19), so the
+    # 0.2 nudge to nib15 never won and the 0xff sign-extension byte never
+    # materialized (AX stayed 0x..e8 instead of 0xffe8 -> probe_var_full_chain
+    # step-2 LEA AX byte1 exp=0xff neu=0x00). Raise the magnitude to a decisive
+    # raw write (the sibling l16_lea_local_ax_byte0_hi_e writes its winning
+    # nibble at raw 2.0); 5.0 dominates both the ~1.0 settled default and the
+    # transient. The discriminator is unchanged, so only the legit LEA-local
+    # sign-extension row is affected.
+    lea_ax_byte1_ff_strength = 5.0
     rules.append(multi_way_and_rule(
         name="l16_lea_local_ax_byte1_ff_lo",
         conditions=lea_ax_byte1_conditions,
@@ -1982,7 +1994,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         writes=tuple(
             (
                 f"OUTPUT_LO+{k}",
-                (20.0 / S) if k == 15 else (-20.0 / S),
+                lea_ax_byte1_ff_strength if k == 15 else -lea_ax_byte1_ff_strength,
             )
             for k in range(16)
         ),
@@ -1994,7 +2006,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         writes=tuple(
             (
                 f"OUTPUT_HI_THIS_STEP+{k}",
-                (20.0 / S) if k == 15 else (-20.0 / S),
+                lea_ax_byte1_ff_strength if k == 15 else -lea_ax_byte1_ff_strength,
             )
             for k in range(16)
         ),
