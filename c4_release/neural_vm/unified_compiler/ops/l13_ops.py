@@ -783,6 +783,183 @@ def make_layer13_sub_minuend_relay_op() -> Operation:
     )
 
 
+# =====================================================================
+# ADD multi-byte addend relay (L13 head 5)  -- 2026-06-12
+# =====================================================================
+#
+# Sibling of the SUB minuend relay (head 4) for the ADD path. Where SUB
+# only needed the minuend's byte 1 (the subtrahend byte 1 is 0x00 for
+# every 1096 case, so result_byte1 = minuend_byte1 - borrow), ADD needs
+# a TWO-operand byte-1 sum: result_byte1 = a1 + b1 + carry. This head
+# delivers the missing operand: operand-A byte 1 (a1), pushed by
+# ``layer10_psh_ax_broadcast`` into the PSH-frame STACK0_BYTE_VAL_1 band
+# and otherwise absent at the ADD byte-1 emit row.
+#
+# Root (confirmed spec_k0, tools/probe_add_autoregressive_carry.py): at
+# the ADD byte-1 PREDICTOR row -- the BYTE_INDEX_0 row, TEMP+8=1 (the ADD
+# byte-row selector; OP_ADD already decayed to 0) -- the only operand
+# bytes present are b1 (operand B byte 1, in ADDR_B1_LO, from L13 head 1)
+# and the byte-0 carry-out (CARRY+1: 2.0 when byte 0 carried, 0.0 when
+# not -- a CLEAN discriminator in the REAL autoregressive decode, unlike
+# the teacher-forced residual the prior ADD attempt trusted). a1 is NOT
+# there: the SUB relay (head 4) is TEMP+9-gated and dark on ADD, so
+# STACK0_BYTE_VAL_1 is empty on the ADD byte-1 row. This head supplies it.
+#
+# Mirror of head 4 with two changes:
+#   1. Gated on TEMP+8 (ADD byte-row selector) not TEMP+9 (SUB). TEMP+8
+#      and TEMP+9 are mutually exclusive (probe: ADD byte-1 row has
+#      TEMP+8=1/TEMP+9=0; SUB byte-1 row has TEMP+9=1/TEMP+8=0), so head 5
+#      and head 4 never both fire -- both write STACK0_BYTE_VAL_1 but on
+#      disjoint (ADD vs SUB) rows, additive residual is safe.
+#   2. Routes byte 1 only (BYTE_INDEX_0 row -> STACK0_BYTE_VAL_1): the
+#      1096 add corpus is all 2-byte (result <= 0x7FF, a1/b1 <= 3), so
+#      byte 2/3 carry never propagates an operand byte. (Keeping it to one
+#      route also keeps the head dark on the deeper byte rows.)
+#
+# Byte-identity: for 8-bit ADD (add_basic 10+32, a1=0) the relay writes
+# STACK0_BYTE_VAL_1 = 0x00 = the empty default, so the downstream adder
+# computes 0 + b1 + carry unchanged. The STACK0_BYTE_VAL_1 band is
+# neither OUTPUT nor CARRY, so the existing ADD carry path is untouched
+# until the L10 adder reads it.
+def _layer13_add_addend_relay_head_specs(BD) -> tuple:
+    """L13 head 5: relay ADD operand-A byte 1 (a1) to STACK0_BYTE_VAL_1.
+
+    One spec firing on the ADD byte-1 emit row (BYTE_INDEX_0 + TEMP+8).
+    Q selects that row; K selects the PSH-frame STACK0 byte-1 value row
+    via STACK0_BYTE1; the V/O nibble copy re-deposits STACK0_BYTE_VAL_1
+    into STACK0_BYTE_VAL_1 at the emit row. ALiBi recency (negative slope,
+    set in the bake) picks the oldest populated PSH frame (the original
+    operand-A PSH) over the current ADD step's empty STACK0 frame.
+    """
+    L = 15.0
+    # K source-flag match weight -- see head 4's note: must dominate the
+    # ALiBi distance penalty so only STACK0_BYTE1 rows are candidates.
+    K_FLAG = 200.0
+    # Single route: emit BYTE_INDEX_0 row -> operand byte 1 (a1) in
+    # STACK0_BYTE_VAL_1 (the 1096 add corpus is all 2-byte; result byte 1
+    # is the high byte and is predicted at the BYTE_INDEX_0 row).
+    emit_bi_dim = BD.BYTE_INDEX_0
+    src_flag_dim = BD.STACK0_BYTE1
+    val_lo = BD.STACK0_BYTE_VAL_1_LO
+    val_hi = BD.STACK0_BYTE_VAL_1_HI
+    # Q slot 0: gate STRICTLY on the ADD byte-emit selector TEMP+8 (1.0
+    # ONLY on ADD byte rows; 0 on SUB/bitwise/everything else). Mirrors
+    # head 4's TEMP+9 gate -- positive only when TEMP+8 fires, negative
+    # otherwise, so the relay never writes STACK0_BYTE_VAL off-ADD (those
+    # dims alias FORMAT_PTR/LEV_DETECTOR; writing them off-ADD risks
+    # regression). slot 33 anti-leak mirrors the same TEMP+8-gated bias.
+    q = [
+        AP(0, BD.TEMP + 8, L),
+        AP(0, BD.CONST, -L / 2),
+        AP(0, BD.MARK_AX, -L * 10),
+        AP(0, BD.MARK_PC, -L * 10),
+        AP(0, BD.TEMP + 9, -L * 10),
+        AP(0, BD.BYTE_INDEX_3, -L * 10),
+        AP(33, BD.TEMP + 8, L),
+        AP(33, BD.CONST, -L / 2),
+    ]
+    k = [AP(33, BD.CONST, L)]
+    v = []
+    o = []
+    # Per-byte K-select slot 1 + V/O nibble copies (slots 3..34).
+    sel = 1
+    # Q[sel] = BYTE_INDEX_0 + TEMP+8 - CONST: ~+L on an ADD byte-1 row
+    # (1+1-1) but ~0 on a non-ADD byte-1 row (1+0-1=0), so on SUB/bitwise
+    # byte rows the STACK0_BYTE1 K-match multiplies a ~0 query and the
+    # head does NOT gather (keeps STACK0_BYTE_VAL untouched off-ADD).
+    q.append(AP(sel, emit_bi_dim, L))
+    q.append(AP(sel, BD.TEMP + 8, L))
+    q.append(AP(sel, BD.CONST, -L))
+    k.append(AP(sel, src_flag_dim, K_FLAG))
+    k.append(AP(sel, BD.CONST, -K_FLAG / 2))
+    base = 3
+    for kk in range(16):
+        v.append(AP(base + kk, val_lo + kk, 1.0))
+        v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
+        o.append(AO(val_lo + kk, base + kk, 1.0))
+        o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
+
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=5,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ),
+    )
+
+
+def _layer13_add_addend_relay_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer13_add_addend_relay_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
+
+
+def make_layer13_add_addend_relay_op() -> Operation:
+    """L13 attn head 5: relay ADD operand-A byte 1 (a1) to STACK0_BYTE_VAL_1.
+
+    Part 1 of the multi-byte ADD fix (mirror of the SUB minuend relay,
+    head 4, for the ADD path). Delivers operand-A byte 1 -- pushed by
+    ``layer10_psh_ax_broadcast`` at the PSH-frame STACK0 byte-1 row -- to
+    the ADD byte-1 emit row so the L10 ADD byte-1 adder (Part 2,
+    ``l10_add_high_byte_adder``) can compute a1 + b1 + carry. See the
+    module comment block above for the root cause (a1 absent off-SUB), the
+    TEMP+8 vs TEMP+9 mutual exclusion with head 4, and the byte-identity
+    property (8-bit ADD relays a1 = 0x00, unchanged).
+    """
+    def bake(block, dim_positions, S):
+        del S
+        attn = block.attn
+        proxy = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        # NEGATIVE ALiBi slope on head 5 (mirrors head 4): the runtime
+        # applies ``-slope * |q_pos - k_pos|`` so a negative slope rewards
+        # distance -> prefers the OLDEST populated STACK0_BYTE1 row (the
+        # original operand-A PSH frame). The K source-flag match dominates
+        # the alibi penalty so only STACK0_BYTE1 rows are candidates; the
+        # slope breaks the tie toward the oldest among them.
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[5] = -1.0
+        Primitives.generate_attention_head(
+            attn,
+            _layer13_add_addend_relay_head_specs(proxy)[0],
+            HD,
+        )
+
+    _claims = set()
+    base = 3
+    for k in range(16):
+        _claims.add((13, "attn_W_v", f"5_{base + k}", f"STACK0_BYTE_VAL_1_LO+{k}"))
+        _claims.add((13, "attn_W_v", f"5_{base + 16 + k}",
+                     f"STACK0_BYTE_VAL_1_HI+{k}"))
+
+    return Operation(
+        name="layer13_add_addend_relay",
+        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_0", "STACK0_BYTE1",
+               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI", "CONST"},
+        writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer13_add_addend_relay_ir,
+        declarative_authority="spec_generated",
+        # Co-place on the L13 attn block (heads 0-2 = mem_addr_gather,
+        # head 3 = bitwise_byte1_gather, head 4 = sub_minuend_relay); this
+        # claims head 5. Run after the SUB relay so the block is populated.
+        target_op_name="_layer13_mem_addr_anchor",
+        requires={"after": "layer13_sub_minuend_relay"},
+        migrated=True,
+        claims=_claims,
+        smoke_tests={
+            "TestSmoke32Bit::test_add_16bit",
+        },
+        spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+    )
+
+
 def make_layer13_mem_addr_anchor_op() -> Operation:
     """L13 attn-side anchor for the mem-addr family (Phase 3b mem cluster fix).
 
