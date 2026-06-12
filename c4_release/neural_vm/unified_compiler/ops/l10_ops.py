@@ -5139,7 +5139,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("TEMP+6", -1000000.0),  # XOR relay
             ("TEMP+7", -1000000.0),  # SHR relay
             ("TEMP+9", -1000000.0),  # SUB relay
-            ("TEMP+10", -1000000.0),  # MUL relay
+            # NOTE (2026-06-11, ADD byte-1 0x88 leak fix): the TEMP+10
+            # blocker (labelled "MUL relay") over-blocked EVERY ADD step.
+            # Probe (spec_k=0, tools/probe_add_byte1.py) at the byte-1 emit
+            # row shows TEMP+10 ~= 1.0-1.25 is present on ADD itself (and on
+            # MUL/SHL), so -1e6*1.25 hard-blocked the no-carry byte-1=0x00
+            # materializer -> byte 1 leaked 0x88 (test_add_basic 0x002A ->
+            # 0x882A). MUL/SHL are already excluded by the positive
+            # ``("TEMP+8", 100.0)`` ADD-relay gate (TEMP+8 = 1.0 only on ADD;
+            # MUL/SHL byte-1 rows carry TEMP+8 = 0.0), so the TEMP+10 blocker
+            # was both harmful and redundant. Removed.
         )
         transition_blockers = (
             ("NEXT_PC", -1000000.0),
@@ -5168,7 +5177,21 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     (f"ALU_LO+{other}", -50.0)
                     for other in range(1, 16)
                 ) + tuple(
-                    (f"AX_CARRY_LO+{other}", -2000.0)
+                    # ADD byte-1 0x88 leak fix (2026-06-11): softened from
+                    # -2000 to -100. The original -2000 hard-blocked
+                    # test_add_basic: at the byte-1 emit row a benign
+                    # AX_CARRY_LO+12 ~= 0.83 residue scored -1660, sinking the
+                    # rule below threshold so byte-1 = 0x00 was never
+                    # materialized and the block-17 OUTPUT cell-0 suppressor
+                    # left a stale cell-8 residue winning -> 0x88. The actual
+                    # no-carry guard is the dedicated ``CARRY+1 = -10000``
+                    # signal (a real ADD carry parks CARRY+1 ~= 2.0 and keeps
+                    # this rule dark, so add_16bit / add_carry_cascade still
+                    # route to ``ax_add_carry_rules``); the AX_CARRY_LO band
+                    # is only a weak secondary no-carry hint, so -100 tolerates
+                    # the ~0.83 residue while still penalising a full carry
+                    # nibble.
+                    (f"AX_CARRY_LO+{other}", -100.0)
                     for other in range(1, 16)
                 ) + marker_blockers + non_add_blockers + transition_blockers,
                 threshold=300.0,
