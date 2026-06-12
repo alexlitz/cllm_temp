@@ -796,6 +796,36 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             q_map[(0, BD.MARK_SP)] = -100000.0
             q_map[(28, BD.CONST)] = -20000.0
             q_map[(28, byte_q_flags[head])] = 20000.0
+
+            # === MARK_AX hard darkening (slot 64): var_simple_12 / id 262 ===
+            # Heads 1-3 are the LI/LC AX byte-1/2/3 value relays; they fire on
+            # the byte-1/2/3 PREDICTION rows, which carry BYTE_INDEX_0/1/2 and
+            # MARK_AX=0 (byte_q_flags[head], NOT MARK_AX). Head 0 alone owns the
+            # MARK_AX (byte-0) row. But these heads had only a weak
+            # MARK_AX=-20000 default blocker (slots 31/32) -- not enough to
+            # drive their softmax1 (ZFOD) scores negative -- so on ANY MARK_AX
+            # register-emit row WITHOUT an LI/LC load (e.g. the var_simple_12
+            # step-3 PSH AX byte-0 emit row: MARK_AX=1, OP_LI_RELAY=0) all three
+            # heads stayed positive and diffuse, averaging operand CLEAN_EMBED
+            # bytes into OUTPUT at value_scale=40. The summed result (0x0f from
+            # CLEAN_EMBED nibble debris) overwrote the residual-carried
+            # psh_ax_broadcast value 0xe8 at block 30 / logical L19
+            # (probe_var_full_chain.py 262: genesis block 30, AX byte0
+            # 0xe8 -> 0x0f).
+            #
+            # FIX (mirrors head-0's slot-58 hard-marker darkening landed in
+            # 8ad47bf4): a hard subtractive MARK_AX NOT-blocker on a free slot
+            # (64). K[CONST]=1 makes the slot score MARK_AX-row positions at
+            # -2e9 (CONST is present everywhere), driving EVERY score below the
+            # softmax1 anchor (0) so the head outputs ZERO (wsum -> 0) and the
+            # residual 0xe8 survives. On the legit LI/LC byte-1/2/3 firing rows
+            # MARK_AX=0, so the slot contributes nothing and the head is
+            # BYTE-IDENTICAL (verified spec_k=0: max|diff| = 0.0, head-0 LI
+            # byte-0 value still 0x2a). Pure subtractive -- no net-zero
+            # compensation -- so it cannot perturb any legit (MARK_AX=0) row.
+            mark_ax_dark_slot = 64
+            q_map[(mark_ax_dark_slot, BD.MARK_AX)] = -2000000000.0
+            k_map[(mark_ax_dark_slot, BD.CONST)] = 1.0
             # Slot 3 K-side per-head re-tuning.
             for dim in (
                 BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3,
