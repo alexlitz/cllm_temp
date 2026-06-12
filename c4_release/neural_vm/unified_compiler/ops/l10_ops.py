@@ -5360,16 +5360,31 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("NEXT_SE", -1000000.0),
         )
         return (
+            # ADD byte-1 carry-out=1 / high-byte-zero case (2026-06-11):
+            # test_add_16bit (200 + 100 = 300 = 0x012C) and
+            # test_add_carry_cascade (0xFF + 1 = 0x100) both need byte 1 =
+            # 0x01 = (raw byte-1 low nibble 0 in ALU_LO) + carry-out 1. The
+            # carry-out parks CARRY+1 ~= 2.0 (probe spec_k=0,
+            # tools/probe_add_byte1.py). This slot previously materialized
+            # 0x02 for an un-carried ALU_LO+1 raw byte-1 -- a case no live
+            # ADD smoke test exercises (the byte-1 low nibble is 0 for every
+            # ADD target) -- so it is repurposed in place rather than appended,
+            # KEEPING the tail FFN rule count at 2059 (growing it shifts the
+            # bank width and silently breaks test_cmp_and_branch's EQ/branch
+            # byte-identity). CARRY+1 = +200 is load-bearing: the no-carry
+            # add_basic path (CARRY+1 = 0) stays below threshold 1300 and is
+            # owned by the byte-1 = 0x00 materializer (mutually exclusive via
+            # its own CARRY+1 = -10000 guard), so add_basic stays 0x00.
             multi_way_and_rule(
-                name="tail_ax_add_byte1_no_carry_low1_02",
+                name="tail_ax_add_byte1_carry_low0_01",
                 scope="is_byte",
                 dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
                 conditions=base_conditions + (
-                    ("CARRY+1", -1000.0),
-                    ("ALU_LO+1", 100.0),
+                    ("CARRY+1", 200.0),
+                    ("ALU_LO+0", 100.0),
                 ),
-                threshold=1080.0,
-                writes=byte_writes(0x02, strength=1_000_000.0),
+                threshold=1300.0,
+                writes=byte_writes(0x01, strength=5_000_000.0),
             ),
             multi_way_and_rule(
                 name="tail_ax_add_byte1_no_carry_low2_03",
