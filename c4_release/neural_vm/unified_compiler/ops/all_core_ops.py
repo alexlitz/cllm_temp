@@ -351,6 +351,12 @@ def all_core_ops(
         # operand-A byte 1 into AX_FULL on OR/XOR so the L15
         # high_byte_relay (gate widened to OP_OR/OP_XOR) can emit byte 1.
         make_layer13_bitwise_byte1_gather_op(),
+        # Multi-byte SUB minuend relay (2026-06-12): L13 attn head 4
+        # delivers the pushed operand's high bytes (STACK0_BYTE_VAL_h)
+        # to the SUB byte-h emit rows so the L14 borrow cascade can
+        # compute byte 1/2 of a multi-byte SUB (Part 1 of the sub_16bit
+        # fix; the cascade rule re-point is Part 2 in l10_ops.py).
+        make_layer13_sub_minuend_relay_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
         # meaningful in efficient mode. The 5 ops returned by

@@ -550,6 +550,227 @@ def make_layer13_bitwise_byte1_gather_op() -> Operation:
     )
 
 
+# =====================================================================
+# SUB multi-byte minuend relay (L13 head 4)  -- 2026-06-12
+# =====================================================================
+#
+# Root: the L14 inter-byte borrow cascade (_l10_carry_propagation_rules,
+# cascade=True for byte_idx 1/2) reads its per-byte MINUEND from
+# OUTPUT_LO/HI at the SUB byte-h emit row. But only operand byte 0 is
+# relayed into OUTPUT by the L7 operand_gather; the minuend HIGH bytes
+# never reach the cascade row, so every multi-byte SUB computes
+# (0x00 - borrow) for bytes 1/2/3 -> 0xFF, byte-identically for
+# 0x100-1 (wants 0x00) and 0-1 (wants 0xFF). Confirmed spec_k=0
+# (tools/probe_sub_minuend_source.py, probe_sub_relay_design.py):
+# STACK0_BYTE_VAL_1 = 0x01 (sub_16bit) vs 0x00 (sub_borrow) at the
+# PSH-frame STACK0 byte-1 rows, but 0x00 (absent) at the SUB emit rows.
+#
+# This head supplies the missing minuend high byte. At the SUB byte-h
+# emit row (TEMP+9 SUB-selector + BYTE_INDEX_h, NOT MARK_AX/PC) it
+# attends back to the most-recent PSH-frame STACK0 byte-h value row
+# (STACK0_BYTE{1,2,3} position flag, where layer10_psh_ax_broadcast
+# stored the pushed operand's high byte) and copies
+# STACK0_BYTE_VAL_h_LO/HI back INTO STACK0_BYTE_VAL_h_LO/HI at the emit
+# row. The (now-declarative) cascade SUB rule for byte_idx 1/2 is then
+# re-pointed to read its minuend from STACK0_BYTE_VAL_h instead of
+# OUTPUT (Part 2). This keeps the CARRY+3 byte0->byte1 borrow relay on
+# OUTPUT untouched -- the documented collision that regresses
+# sub_borrow when the minuend is routed through OUTPUT/AX_FULL
+# (SUB_16BIT_PHASE2_CASCADE_SOURCE_FIX_2026_06_12.md).
+#
+# Byte-identity property: for 8-bit SUB (sub_basic 50-8) the pushed
+# operand's byte 1/2/3 = 0x00, so the relay writes STACK0_BYTE_VAL_h =
+# 0x00 = the current OUTPUT byte-h = 0x00 -> identical result. For
+# sub_16bit the relay writes 0x01 so byte-1 fires (0x01 - borrow = 0x00)
+# instead of (0x00 - borrow = 0xFF). For sub_borrow the relay writes
+# 0x00 -> byte-1 stays 0xFF and the borrow continues -> 0xFFFFFFFF
+# preserved. The discriminator that makes 0x100-1 != 0-1 rides the
+# decoupled STACK0_BYTE_VAL band, never CARRY+3.
+#
+# Placement: L13 (block 14) -- after layer10_psh_ax_broadcast (which
+# writes STACK0_BYTE_VAL_h, visible from block 12) and before the L14
+# carry post_ops (block 16+) that read it. Heads 0-2 = mem_addr_gather;
+# head 3 = bitwise_byte1_gather; this claims the free slot 4. A negative
+# ALiBi slope (mirrors the bitwise gather) skips the empty current-step
+# STACK0 frame and lands on the populated PSH frame.
+def _layer13_sub_minuend_relay_head_specs(BD) -> tuple:
+    """L13 head 4: relay SUB minuend bytes 1/2/3 to STACK0_BYTE_VAL_h.
+
+    One spec firing simultaneously on the byte-1/2 SUB emit rows. The
+    per-byte routing uses two Q/K slot pairs (one per byte index):
+    Q selects the emit row via BYTE_INDEX_h, K selects the PSH-frame
+    STACK0 byte-h value row via STACK0_BYTE{1,2}; the matching V/O
+    nibble copy runs in parallel for both bytes. ALiBi recency
+    (negative slope, set in the bake) picks the most-recent populated
+    PSH frame over older frames / the empty current-step frame.
+    """
+    L = 15.0
+    # K source-flag match weight. The post-scale Q*K score for a
+    # STACK0_BYTE{h} row must DOMINATE the ALiBi distance penalty
+    # (-slope * |q_pos - k_pos|, scale ~= 0.096): the populated PSH
+    # frame sits ~90 rows back from the SUB emit row, so with the
+    # default L=15 match (~211 raw -> ~20 scaled) the alibi penalty
+    # (~90) swamps the K score and the softmax drifts to nearby
+    # non-STACK0 rows. A large source-flag weight (15 * 200 * 0.94 ~=
+    # 2820 raw -> ~270 scaled) makes every STACK0_BYTE{h} row beat
+    # every non-STACK0 row by a margin no alibi distance can overcome,
+    # leaving the (gentle) negative slope to pick the OLDEST STACK0
+    # frame (the original PSH) among them.
+    K_FLAG = 200.0
+    # Per-byte (emit BYTE_INDEX_h dim, source STACK0_BYTE{h} flag dim).
+    _BYTE_ROUTES = (
+        (1, BD.BYTE_INDEX_1, BD.STACK0_BYTE1,
+         BD.STACK0_BYTE_VAL_1_LO, BD.STACK0_BYTE_VAL_1_HI),
+        (2, BD.BYTE_INDEX_2, BD.STACK0_BYTE2,
+         BD.STACK0_BYTE_VAL_2_LO, BD.STACK0_BYTE_VAL_2_HI),
+    )
+    # Q slot 0: gate STRICTLY on the SUB byte-emit selector. TEMP+9 is
+    # the cascade's SUB discriminator (1.0 ONLY on SUB byte rows; 0 on
+    # ADD/bitwise/everything else). The slot-0 score must be POSITIVE
+    # only when TEMP+9 fires and NEGATIVE otherwise, so the relay never
+    # writes STACK0_BYTE_VAL on non-SUB rows (those dims alias
+    # FORMAT_PTR / LEV_DETECTOR -- writing them off-SUB risks
+    # regression). With CONST=1.0 everywhere: SUB byte row scores
+    # TEMP+9*L - L/2 = +L/2; every non-SUB row scores 0 - L/2 = -L/2.
+    # IS_BYTE/MARK/BYTE_INDEX terms only sharpen; the load-bearing gate
+    # is TEMP+9 minus the CONST baseline. The slot-33 anti-leak mirrors
+    # the same TEMP+9-gated bias so the slot-0 softmax routes positively
+    # only at SUB byte rows.
+    q = [
+        AP(0, BD.TEMP + 9, L),
+        AP(0, BD.CONST, -L / 2),
+        AP(0, BD.MARK_AX, -L * 10),
+        AP(0, BD.MARK_PC, -L * 10),
+        AP(0, BD.TEMP + 8, -L * 10),
+        AP(0, BD.BYTE_INDEX_0, -L * 10),
+        AP(0, BD.BYTE_INDEX_3, -L * 10),
+        # slot 33 anti-leak: require TEMP+9 so the slot-0 softmax only
+        # routes positively on the SUB byte-h emit rows.
+        AP(33, BD.TEMP + 9, L),
+        AP(33, BD.CONST, -L / 2),
+    ]
+    k = [AP(33, BD.CONST, L)]
+    v = []
+    o = []
+    # Per-byte K-select slots and V/O nibble copies. Slot indices:
+    #   byte route j uses Q/K slot (1 + j) as the byte-index selector,
+    #   V/O slots [base .. base+31] for the 32 nibble copies.
+    for j, (h, emit_bi_dim, src_flag_dim, val_lo, val_hi) in enumerate(_BYTE_ROUTES):
+        sel = 1 + j  # 1, 2
+        # The per-byte Q selector folds in the SUB discriminator TEMP+9
+        # so the (large) K source-flag match only contributes on a SUB
+        # byte-h row: Q[sel] = BYTE_INDEX_h + TEMP+9 - CONST, which is
+        # ~+L on a SUB byte-h emit row (1+1-1) but ~0 on a non-SUB
+        # byte-h row (1+0-1=0) -- so on ADD/OR/XOR/AND byte rows the
+        # STACK0_BYTE_h K-match multiplies a ~0 query and the head does
+        # NOT gather (keeps STACK0_BYTE_VAL / its FORMAT_PTR alias
+        # untouched off-SUB). On a SUB row the K_FLAG-scaled match then
+        # dominates the alibi penalty and selects the PSH frame.
+        q.append(AP(sel, emit_bi_dim, L))
+        q.append(AP(sel, BD.TEMP + 9, L))
+        q.append(AP(sel, BD.CONST, -L))
+        k.append(AP(sel, src_flag_dim, K_FLAG))
+        k.append(AP(sel, BD.CONST, -K_FLAG / 2))
+        base = 3 + j * 32  # 3.., 35..
+        for kk in range(16):
+            v.append(AP(base + kk, val_lo + kk, 1.0))
+            v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
+            o.append(AO(val_lo + kk, base + kk, 1.0))
+            o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
+
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=4,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ),
+    )
+
+
+def _layer13_sub_minuend_relay_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer13_sub_minuend_relay_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
+
+
+def make_layer13_sub_minuend_relay_op() -> Operation:
+    """L13 attn head 4: relay SUB minuend bytes 1/2 to STACK0_BYTE_VAL_h.
+
+    Part 1 of the multi-byte SUB minuend fix. Delivers the pushed
+    operand's high bytes (stored by layer10_psh_ax_broadcast at the
+    PSH-frame STACK0 byte rows) to the SUB byte-h emit rows so the L14
+    borrow cascade (Part 2, re-pointed in _l10_carry_propagation_rules)
+    can compute byte 1/2 of a multi-byte SUB. See the module comment
+    block above for the root cause, the byte-identity property, and why
+    the decoupled STACK0_BYTE_VAL band avoids the CARRY+3 collision.
+    """
+    def bake(block, dim_positions, S):
+        del S
+        attn = block.attn
+        proxy = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        # NEGATIVE ALiBi slope on head 4: the runtime applies the bias
+        # ``-slope * |q_pos - k_pos|`` (vm_step.AutoregressiveAttention),
+        # so a negative slope REWARDS distance -> prefers the OLDEST
+        # (deepest) STACK0 byte-h value row. That is the original PSH
+        # frame that pushed the SUB's operand A (minuend); the
+        # most-RECENT STACK0_BYTE_h row is the current SUB step's own
+        # re-marked STACK0 frame, which carries 0x00 (the operand high
+        # byte is only populated at the original PSH frame by
+        # layer10_psh_ax_broadcast). The K source-flag match (K_FLAG
+        # above) dominates the alibi penalty so only STACK0_BYTE{h} rows
+        # are candidates; the negative slope then breaks the tie toward
+        # the oldest among them. (Verified spec_k=0: sub_16bit PSH frame
+        # = 0x01; SUB-step frame = 0x00.)
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[4] = -1.0
+        Primitives.generate_attention_head(
+            attn,
+            _layer13_sub_minuend_relay_head_specs(proxy)[0],
+            HD,
+        )
+
+    _claims = set()
+    for j, (lo_name, hi_name) in enumerate(
+        (("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"),
+         ("STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"))
+    ):
+        base = 3 + j * 32
+        for k in range(16):
+            _claims.add((13, "attn_W_v", f"4_{base + k}", f"{lo_name}+{k}"))
+            _claims.add((13, "attn_W_v", f"4_{base + 16 + k}", f"{hi_name}+{k}"))
+
+    return Operation(
+        name="layer13_sub_minuend_relay",
+        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "STACK0_BYTE1", "STACK0_BYTE2",
+               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+               "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI", "CONST"},
+        writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer13_sub_minuend_relay_ir,
+        declarative_authority="spec_generated",
+        # Co-place on the L13 attn block (heads 0-2 = mem_addr_gather,
+        # head 3 = bitwise_byte1_gather); this claims head 4. Run after
+        # the bitwise gather so the 8-head block is already populated.
+        target_op_name="_layer13_mem_addr_anchor",
+        requires={"after": "layer13_bitwise_byte1_gather"},
+        migrated=True,
+        claims=_claims,
+        smoke_tests={
+            "TestSmoke32Bit::test_sub_16bit",
+        },
+        spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+    )
+
+
 def make_layer13_mem_addr_anchor_op() -> Operation:
     """L13 attn-side anchor for the mem-addr family (Phase 3b mem cluster fix).
 
