@@ -873,153 +873,51 @@ class CarryPropagationPostOp(PureFFN):
         self.S = S
 
     def _bake_weights(self):
+        # Phase 7.C cut (2026-06-12): the inter-byte carry/borrow cascade is
+        # now authored declaratively. The 256 ADD + 256 SUB units this method
+        # used to write imperatively are expressed as ``FFNRule``s in
+        # ``unified_compiler.ops.l10_ops._l10_carry_propagation_rules`` and
+        # lowered through ``Primitives.lower_ffn_rules`` -- the same lowering
+        # the live model's ``make_l10_post_op_attach_op`` now drives directly.
+        # Byte-identity (element-wise tensor diff = 0 vs the legacy bake +
+        # lowering-contract OK) is gated by ``tools/verify_carry_migration.py``.
+        # ``PureFFN.forward`` is final/shared, so this delegation is a pure
+        # weight-authoring cut with no behavioral change.
         S = self._pending_S
         byte_idx = self._pending_byte_idx
         cascade = self._pending_cascade
-        BD = _resolve_bd(getattr(self, '_pending_dim_positions', None))
+        dim_positions = getattr(self, '_pending_dim_positions', None)
 
-        byte_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][byte_idx]
-        add_carry_in = BD.CARRY + (3 if cascade else 1)
-        sub_carry_in = BD.CARRY + (3 if cascade else 2)
-        first_carry_stage = byte_idx == 0 and not cascade
-        # Require a real byte-level carry/borrow relay. Earlier thresholds let
-        # large zero-byte OUTPUT residuals satisfy carry propagation even when
-        # CARRY was zero, which corrupted non-ADD/SUB byte rows such as EXIT
-        # after MUL. True carry/borrow relays are ~2.0; this threshold admits
-        # that relay with normal byte/output predicates while blocking
-        # output-only matches.
-        # Make the carry/borrow relay mandatory without letting it swamp the
-        # nibble match. The gate also depends on the carry relay, so stale
-        # positive/negative OUTPUT residue cannot mutate rows when CARRY == 0.
-        carry_weight = 1.0
-        output_weight = 20.0
-        mismatch_weight = 0.0
-        carry_threshold = 56.0
-        cascade_carry_threshold = 40.0
+        # Lazy imports avoid an import cycle (l10_ops imports vm_step).
+        from .unified_compiler.ops.l10_ops import _l10_carry_propagation_rules
+        from .unified_compiler.primitives import Primitives
 
-        # FIX 2026-05-08: Wrong byte positions to suppress (prevent firing at wrong byte)
-        wrong_byte_dims = [d for d in [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2] if d != byte_dim]
+        rules = _l10_carry_propagation_rules(
+            S, byte_idx=byte_idx, cascade=cascade,
+        )
 
-        non_arith_ops = [
-            BD.OP_LEA, BD.OP_IMM, BD.OP_JMP, BD.OP_JSR, BD.OP_BZ, BD.OP_BNZ,
-            BD.OP_ENT, BD.OP_ADJ, BD.OP_LEV, BD.OP_LI, BD.OP_LC, BD.OP_SI,
-            BD.OP_SC, BD.OP_PSH, BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_EQ,
-            BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE, BD.OP_SHL,
-            BD.OP_SHR, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD, BD.OP_EXIT, BD.OP_NOP,
-            BD.OP_PUTCHAR, BD.OP_GETCHAR,
-        ]
-        unit = 0
+        if dim_positions is None:
+            # Legacy ``_SetDim`` layout (unit-test path with no compact
+            # dim_positions). Build the name->position map the lowerer needs
+            # from the static ``_SetDim`` table. Every name the rules
+            # reference resolves against ``_SetDim`` (verified; e.g.
+            # OUTPUT_HI_THIS_STEP aliases OUTPUT_HI = 190).
+            names = set()
+            for rule in rules:
+                for term in rule.conditions:
+                    names.add(term.dim.name)
+                if rule.gate is not None:
+                    names.add(rule.gate.name)
+                for term in rule.gate_terms:
+                    names.add(term.dim.name)
+                for write in rule.writes:
+                    names.add(write.dim.name)
+            dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+
         with torch.no_grad():
-            # ADD carry propagation
-            # NOTE: At byte positions, OP_ADD is NOT set (only at markers).
-            # We use CARRY[1/3] as the discriminator instead - it's only set by ADD overflow.
-            for lo in range(16):
-                for hi in range(16):
-                    new_val = lo + hi * 16 + 1
-                    new_lo = new_val & 0xF
-                    new_hi = (new_val >> 4) & 0xF
-                    self.W_up.data[unit, add_carry_in] = S * carry_weight
-                    # Removed: self.W_up.data[unit, BD.OP_ADD] = S
-                    self.W_up.data[unit, BD.IS_BYTE] = S
-                    self.W_up.data[unit, BD.H1 + 1] = S
-                    self.W_up.data[unit, BD.MARK_AX] = -S * 5000
-                    self.W_up.data[unit, BD.MARK_PC] = -S * 5000
-                    self.W_up.data[unit, byte_dim] = S
-                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S * output_weight
-                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S * output_weight
-                    for other in range(16):
-                        if other != lo:
-                            self.W_up.data[unit, BD.OUTPUT_LO + other] = -S * mismatch_weight
-                        if other != hi:
-                            self.W_up.data[unit, BD.OUTPUT_HI + other] = -S * mismatch_weight
-                    for op_dim in non_arith_ops:
-                        self.W_up.data[unit, op_dim] = -S * 20
-                    self.W_up.data[unit, BD.OP_SUB] = -S * 20
-                    # Suppress when BITWISE_OP (TEMP[3]) is set - indicates AND/OR/XOR
-                    self.W_up.data[unit, BD.TEMP + 3] = -S * 10
-                    # FIX 2026-05-08: Mutual exclusion with SUB. Suppress when sub_carry_in is set.
-                    # This prevents ADD units from firing during SUB (when CARRY[2] is set).
-                    # Cascaded ADD/SUB both use CARRY[3], so dispatch those stages via
-                    # the relayed L7 opcode flags instead of suppressing the shared carry.
-                    if cascade:
-                        self.W_up.data[unit, BD.TEMP + 8] = S
-                        self.W_up.data[unit, BD.TEMP + 9] = -S * 10
-                    else:
-                        self.W_up.data[unit, sub_carry_in] = -S * 10
-                    # FIX 2026-05-08: Suppress at wrong byte positions.
-                    # CARRY is relayed to ALL byte positions, so we must explicitly block
-                    # firing at wrong positions (e.g., byte_idx=0 unit shouldn't fire at byte 1).
-                    for wrong_dim in wrong_byte_dims:
-                        self.W_up.data[unit, wrong_dim] = -S * 10
-                    # L10/L15 zeroing can leave OUTPUT_LO/HI zero slots around
-                    # 3 at AX byte positions. The first carry stage therefore
-                    # uses a lower carry coefficient plus a tighter threshold:
-                    # it admits the real zero byte, but rejects nonmatching
-                    # high/low nibble cases that otherwise fan out.
-                    self.b_up.data[unit] = -S * (
-                        cascade_carry_threshold if cascade else carry_threshold
-                    )
-                    self.W_gate.data[unit, add_carry_in] = 0.5
-                    self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
-                    self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
-                    self.W_down.data[BD.OUTPUT_LO + new_lo, unit] = 2.0 / S
-                    self.W_down.data[BD.OUTPUT_HI + new_hi, unit] = 2.0 / S
-                    if lo == 15 and hi == 15 and byte_idx < 2:
-                        self.W_down.data[BD.CARRY + 3, unit] = 2.0 / S
-                    unit += 1
-
-            # SUB borrow propagation (same threshold adjustment as ADD)
-            # FIX 2026-05-08: Threshold increased to 9.5 and BORROW weight to 2S.
-            # See ADD carry comment above for the math.
-            # FIX 2026-05-08: Also suppress when BITWISE_OP (TEMP[3]) is set.
-            for lo in range(16):
-                for hi in range(16):
-                    new_val = (lo + hi * 16 - 1) & 0xFF
-                    new_lo = new_val & 0xF
-                    new_hi = (new_val >> 4) & 0xF
-                    self.W_up.data[unit, sub_carry_in] = S * carry_weight
-                    # Removed: self.W_up.data[unit, BD.OP_SUB] = S
-                    self.W_up.data[unit, BD.IS_BYTE] = S
-                    self.W_up.data[unit, BD.H1 + 1] = S
-                    self.W_up.data[unit, BD.MARK_AX] = -S * 5000
-                    self.W_up.data[unit, BD.MARK_PC] = -S * 5000
-                    self.W_up.data[unit, byte_dim] = S
-                    self.W_up.data[unit, BD.OUTPUT_LO + lo] = S * output_weight
-                    self.W_up.data[unit, BD.OUTPUT_HI + hi] = S * output_weight
-                    for other in range(16):
-                        if other != lo:
-                            self.W_up.data[unit, BD.OUTPUT_LO + other] = -S * mismatch_weight
-                        if other != hi:
-                            self.W_up.data[unit, BD.OUTPUT_HI + other] = -S * mismatch_weight
-                    for op_dim in non_arith_ops:
-                        self.W_up.data[unit, op_dim] = -S * 20
-                    self.W_up.data[unit, BD.OP_ADD] = -S * 20
-                    # Suppress when BITWISE_OP (TEMP[3]) is set
-                    self.W_up.data[unit, BD.TEMP + 3] = -S * 10
-                    # FIX 2026-05-08: Mutual exclusion with ADD. Suppress when add_carry_in is set.
-                    # This prevents SUB units from firing during ADD (when CARRY[1] is set).
-                    # Cascaded ADD/SUB both use CARRY[3], so dispatch those stages via
-                    # the relayed L7 opcode flags instead of suppressing the shared carry.
-                    if cascade:
-                        self.W_up.data[unit, BD.TEMP + 9] = S
-                        self.W_up.data[unit, BD.TEMP + 8] = -S * 10
-                    else:
-                        self.W_up.data[unit, add_carry_in] = -S * 10
-                    # FIX 2026-05-08: Suppress at wrong byte positions.
-                    for wrong_dim in wrong_byte_dims:
-                        self.W_up.data[unit, wrong_dim] = -S * 10
-                    # Match the ADD threshold: OUTPUT alone is not a borrow.
-                    self.b_up.data[unit] = -S * (
-                        cascade_carry_threshold if cascade else carry_threshold
-                    )
-                    self.W_gate.data[unit, sub_carry_in] = 0.5
-                    self.W_down.data[BD.OUTPUT_LO + lo, unit] = -2.0 / S
-                    self.W_down.data[BD.OUTPUT_HI + hi, unit] = -2.0 / S
-                    self.W_down.data[BD.OUTPUT_LO + new_lo, unit] = 2.0 / S
-                    self.W_down.data[BD.OUTPUT_HI + new_hi, unit] = 2.0 / S
-                    if lo == 0 and hi == 0 and byte_idx < 2:
-                        self.W_down.data[BD.CARRY + 3, unit] = 2.0 / S
-                    unit += 1
+            Primitives.lower_ffn_rules(
+                self, rules, dim_positions, start_unit=0, S=S,
+            )
 
 
 class AddSubBytePropagationPostOp(PureFFN):

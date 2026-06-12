@@ -532,6 +532,49 @@ def _l10_carry_propagation_rules(
     return tuple(rules)
 
 
+# Number of hidden units in one carry instance (256 ADD + 256 SUB).
+_L10_CARRY_HIDDEN_DIM = 512
+
+
+def _build_l10_carry_post_op(
+    *, d_model: int, S: float, byte_idx: int, cascade: bool, dim_positions,
+):
+    """Build one L10 carry/borrow post-op from the declarative DSL.
+
+    Phase 7.C cut: replaces the imperative
+    ``vm_step.CarryPropagationPostOp(...)._bake_weights`` bake with a
+    declarative lowering of :func:`_l10_carry_propagation_rules` into a
+    bare ``PureFFN``. ``compare_symbolic_to_lowered_ffn`` + an element-
+    wise tensor diff (``tools/verify_carry_migration.py``) confirm the
+    lowered weights are byte-identical to the legacy bake's, so the
+    forward (``PureFFN.forward`` is final and shared) is unchanged.
+
+    The post-construction ``_strengthen_*`` / ``_suppress_*`` helpers in
+    ``make_l10_post_op_attach_op`` continue to run on the returned module
+    exactly as before; they mutate the resulting weights identically
+    regardless of how the base weights were authored.
+    """
+    from ...base_layers import PureFFN
+
+    post_op = PureFFN(dim=d_model, hidden_dim=_L10_CARRY_HIDDEN_DIM)
+    end = Primitives.lower_ffn_rules(
+        post_op,
+        _l10_carry_propagation_rules(S, byte_idx=byte_idx, cascade=cascade),
+        dim_positions,
+        start_unit=0,
+        S=S,
+    )
+    assert end == _L10_CARRY_HIDDEN_DIM, (
+        f"l10 carry post-op (byte_idx={byte_idx}, cascade={cascade}) "
+        f"lowered {end} units, expected {_L10_CARRY_HIDDEN_DIM}"
+    )
+    # Carry forward-relevant attributes that the legacy
+    # ``CarryPropagationPostOp`` exposed for downstream auditors.
+    post_op.d_model = d_model
+    post_op.S = S
+    return post_op
+
+
 def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """Declarative rules for ``ComparisonCombine`` (18 units).
 
@@ -8036,7 +8079,6 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         from ...vm_step import (
             BinaryOpByteZeroingPostOp,
             AddSubBytePropagationPostOp,
-            CarryPropagationPostOp,
             BitwiseBytePropagationPostOp,
             ComparisonCombine,
             _SetDim,
@@ -8098,7 +8140,14 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         _suppress_l10_addsub_on_wide_alu(addsub, BD, S)
         _suppress_ffn_on_step_boundary(addsub, dim_positions, S)
         block.post_ops.append(addsub)
-        carry0 = CarryPropagationPostOp(
+        # Phase 7.C cut: the three carry/borrow post-ops are now authored
+        # declaratively via ``_l10_carry_propagation_rules`` lowered into a
+        # bare PureFFN by ``_build_l10_carry_post_op``, byte-identically to
+        # the legacy ``CarryPropagationPostOp._bake_weights`` (gate:
+        # ``tools/verify_carry_migration.py`` -- element-wise tensor diff
+        # = 0 + lowering-contract OK). The post-construction strengthen /
+        # suppress helpers run unchanged on the resulting weights.
+        carry0 = _build_l10_carry_post_op(
             d_model=d_model, S=S, byte_idx=0, cascade=False,
             dim_positions=dim_positions,
         )
@@ -8106,14 +8155,14 @@ def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
         _strengthen_l10_first_carry_delta(carry0, BD)
         _suppress_ffn_on_step_boundary(carry0, dim_positions, S)
         block.post_ops.append(carry0)
-        carry1 = CarryPropagationPostOp(
+        carry1 = _build_l10_carry_post_op(
             d_model=d_model, S=S, byte_idx=1, cascade=True,
             dim_positions=dim_positions,
         )
         _strengthen_l10_carry_wrong_byte_blockers(carry1, BD, byte_idx=1, S=S)
         _suppress_ffn_on_step_boundary(carry1, dim_positions, S)
         block.post_ops.append(carry1)
-        carry2 = CarryPropagationPostOp(
+        carry2 = _build_l10_carry_post_op(
             d_model=d_model, S=S, byte_idx=2, cascade=True,
             dim_positions=dim_positions,
         )
