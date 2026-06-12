@@ -8573,6 +8573,309 @@ def make_tail_bit32_result_correction_op() -> Operation:
     )
 
 
+# === Multi-byte ADD high-byte adder (runs AFTER tail_bit32) =============
+# (2026-06-12) Completes the multi-byte ADD result the model's carry-only
+# byte-1 emit path leaves at ``byte1 = carry``.
+#
+# Root (confirmed spec_k0 on the REAL AUTOREGRESSIVE runner,
+# tools/probe_add_autoregressive_carry.py): the active ADD byte-1 tail
+# rules in ``_tail_bit32_result_correction_rules`` (the
+# ``tail_ax_add_byte1_*`` family, run at the L25 tail block) compute
+# byte 1 = (raw ALU_LO byte-1 low nibble) + CARRY+1, but only operand
+# byte 0 ever reaches the ALU, so the raw byte-1 base is 0 and every
+# multi-byte ADD decodes byte 1 = carry only (``654 + 114`` -> 256 =
+# 0x100, dropping a1=2; ``432 + 32`` -> 0x0D0, dropping a1=1). Unlike SUB
+# (subtrahend byte1 = 0x00 -> single relayed minuend value, so the SUB
+# tail rules PRESERVE OUTPUT_LO and the L14 sub_noborrow passthrough
+# wins), ADD is a genuine TWO-operand byte-1 sum a1 + b1 + carry and the
+# ADD tail rules FORCE byte 1 from ALU_LO with strength 5e6, overriding
+# any earlier (e.g. L14) OUTPUT_LO write.
+#
+# So this op runs as a NEW post_op appended AFTER ``tail_bit32_result_
+# correction`` on the same L25 block (so nothing downstream overrides it,
+# and the count-locked 2059-rule tail bank is untouched). At the ADD
+# byte-1 predictor row (BYTE_INDEX_0 + TEMP+8, with IS_BYTE/H1+1/HAS_SE),
+# all three addends survive cleanly to this block (probe verified):
+#   * a1    = STACK0_BYTE_VAL_1_LO  (delivered by layer13_add_addend_relay,
+#                                    head 5, TEMP+8-gated; magnitude ~3.0)
+#   * b1    = ADDR_B1_LO            (operand B byte 1, from L13 head 1)
+#   * carry = CARRY+1               (2.0 when byte 0 carried, 0.0 when not
+#                                    -- the discriminator that reads CLEANLY
+#                                    in the real autoregressive decode, the
+#                                    crux the prior ADD attempt missed by
+#                                    trusting a fixed teacher-forced row)
+# One AND-rule per (a1 in 0..7, b1 in 0..7, carry in {0,1}) over-writes
+# OUTPUT byte 1 with byte_value(a1+b1+carry) at a dominating strength so
+# the byte-(a1+b1+carry) token wins argmax. The tail's existing carry-only
+# rules are LEFT INTACT (they provide the cross-step OUTPUT_LO stabiliser,
+# whose 0x88-leak crush keeps the band bounded); this op simply runs after
+# them and overrides the byte-1 cell. The 1096 add corpus has a1,b1 <= 3
+# and result byte1 <= 7, all single-nibble (OUTPUT_HI byte1 = 0); 0..7
+# each covers that with headroom (max 7+7+1=15 still one nibble).
+#
+# Byte-identity: for 8-bit ADD (add_basic 10+32: a1=0, b1=0, carry=0) the
+# (0,0,0) rule writes 0x00 = the carry-only default, unchanged. Gated on
+# TEMP+8 (ADD byte selector, 0 on SUB/bitwise/everything else) so it is
+# dark off-ADD; the SUB / bitwise / wide-ALU paths are untouched.
+
+# Number of (a1, b1, carry) rules: 8 * 8 * 2.
+_L10_ADD_HIGH_BYTE_ADDER_HIDDEN_DIM = 128
+
+
+def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
+    """128 rules: OUTPUT byte 1 = a1 + b1 + carry on multi-byte ADD.
+
+    One rule per ``(a1, b1, carry)`` with ``a1, b1 in 0..7`` and
+    ``carry in {0, 1}``. Each fires at the ADD byte-1 predictor row --
+    ``TEMP+8`` (ADD byte selector) + ``H1[AX]`` + ``IS_BYTE`` +
+    ``HAS_SE`` + ``BYTE_INDEX_0`` -- when ``STACK0_BYTE_VAL_1_LO == a1``
+    (relayed operand A byte 1) AND ``ADDR_B1_LO == b1`` (operand B byte 1)
+    AND the byte-0 carry state matches ``carry`` (``CARRY+1`` high for
+    carry=1, blocked for carry=0). The firing rule over-writes OUTPUT
+    byte 1 with ``byte_value(a1+b1+carry)`` at a dominating strength so it
+    wins the OUTPUT argmax over the carry-only tail rules.
+
+    CARRY+1 reads 2.0 (carry) / 0.0 (no carry) at this row, so the carry=1
+    rules weight it 500 (a real carry scores +1000) and the carry=0 rules
+    block it (-50000 -> -100000 on a real carry). The relay deposits a1
+    into STACK0_BYTE_VAL_1_LO at magnitude ~3.0 (the L13 head-5 V/O copy
+    scale), so that condition is weighted GATE/3 to match the other
+    one-hot gates and keep the AND balanced.
+    """
+    AX_I = 1
+    # Per-condition gate weight. Each one-hot positive condition scores
+    # ~GATE; the threshold sits between all-on and missing-one.
+    GATE = 1000.0
+    # The relay deposits a1 into STACK0_BYTE_VAL_1_LO with magnitude ~3.0
+    # (the L13 head 5 V/O copy scale), not a unit one-hot. Weight that
+    # condition GATE/3 so its contribution (~3.0 * GATE/3 = GATE) matches
+    # the other one-hot gates, keeping the AND balanced (a missing 1.0
+    # gate must drop the score below threshold; an inflated a1 term would
+    # otherwise let a wrong-b1 rule clear the threshold).
+    A1_W = GATE / 3.0
+    CARRY_REQ_W = 500.0      # CARRY+1 (= 2.0) on a real carry -> +1000
+    CARRY_BLOCK = -50_000.0  # a real carry (2.0) -> -100000, hard block
+    # Output write strength. This op runs AFTER the whole tail bank, whose
+    # legacy carry-only ADD byte-1 rules boost the WRONG cell (carry only)
+    # at strength up to 5e6 while also providing the cross-step OUTPUT_LO
+    # stabiliser (0x00 / 0x88-leak crush). This op one-hots the correct
+    # (a1+b1+carry) byte at 5e6 so it OVER-writes the carry-only result and
+    # wins the argmax, while the tail's stabiliser keeps the band bounded.
+    STRENGTH = 5_000_000.0     # target-cell boost (overrides the tail)
+    COMPETITOR = 5_000_000.0   # symmetric suppression of non-target cells
+
+    # Marker / opcode / transition blockers are EXACTLY 0 at the ADD AX
+    # byte-1 row (markers off, opcode bits decayed, NEXT_* off), so a large
+    # magnitude is safe -- they only fire (and sink the unit) off the ADD
+    # byte row. Byte-index blockers are deliberately MODEST (-3000): the
+    # byte-1 row carries a ~0.013 BYTE_INDEX_1 leak, so -3000*0.013 = -39 is
+    # negligible, while a FULLY-on wrong byte index (1.0 -> -3000) combines
+    # with the lost positive BYTE_INDEX_0 gate (-GATE) to sink that row.
+    # NOTE: the TEMP+4/5/6/7/9 relay blockers are deliberately NOT added --
+    # TEMP+6 carries a benign ~0.3 residue on some ADD byte-1 rows (probe
+    # spec_k0, add_18 ``828+890``), so a -1e6 TEMP+6 blocker amplifies that
+    # leak to -30e6 and over-blocks the genuine ADD adder. The positive
+    # TEMP+8 gate is the load-bearing ADD discriminator.
+    marker_blockers = (
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
+        ("H1+0", -1_000_000.0),
+        ("H1+2", -1_000_000.0),
+        ("H1+3", -1_000_000.0),
+        ("H1+4", -1_000_000.0),
+        ("BYTE_INDEX_1", -3_000.0),
+        ("BYTE_INDEX_2", -3_000.0),
+        ("BYTE_INDEX_3", -3_000.0),
+    )
+    non_add_blockers = (
+        ("OP_IMM", -1_000_000.0),
+        ("OP_LEA", -1_000_000.0),
+        ("OP_SUB", -1_000_000.0),
+        ("OP_DIV", -1_000_000.0),
+        ("OP_MOD", -1_000_000.0),
+        ("OP_AND", -1_000_000.0),
+        ("OP_OR", -1_000_000.0),
+        ("OP_XOR", -1_000_000.0),
+        ("OP_EQ", -1_000_000.0),
+        ("OP_NE", -1_000_000.0),
+        ("OP_LT", -1_000_000.0),
+        ("OP_GT", -1_000_000.0),
+        ("OP_LE", -1_000_000.0),
+        ("OP_GE", -1_000_000.0),
+        ("OP_SHL", -1_000_000.0),
+        ("OP_SHR", -1_000_000.0),
+        ("OP_SI", -1_000_000.0),
+        ("OP_SC", -1_000_000.0),
+        ("OP_LI", -1_000_000.0),
+        ("OP_LC", -1_000_000.0),
+        ("OP_ENT", -1_000_000.0),
+        ("MEM_STORE", -1_000_000.0),
+    )
+    transition_blockers = (
+        ("NEXT_PC", -1_000_000.0),
+        ("NEXT_AX", -1_000_000.0),
+        ("NEXT_SP", -1_000_000.0),
+        ("NEXT_BP", -1_000_000.0),
+        ("NEXT_STACK0", -1_000_000.0),
+        ("NEXT_MEM", -1_000_000.0),
+        ("NEXT_SE", -1_000_000.0),
+    )
+
+    rules: list[FFNRule] = []
+    for carry in (0, 1):
+        for a1 in range(8):
+            for b1 in range(8):
+                v = a1 + b1 + carry  # <= 15 -> single nibble
+                base_conditions = (
+                    ("IS_BYTE", GATE),
+                    ("HAS_SE", GATE),
+                    (f"H1+{AX_I}", GATE),
+                    ("BYTE_INDEX_0", GATE),
+                    ("TEMP+8", GATE),
+                    (f"STACK0_BYTE_VAL_1_LO+{a1}", A1_W),  # a1 (~3.0 * A1_W)
+                    (f"ADDR_B1_LO+{b1}", GATE),            # b1
+                ) + marker_blockers + non_add_blockers + transition_blockers
+                if carry:
+                    conditions = base_conditions + (
+                        ("CARRY+1", CARRY_REQ_W),
+                    )
+                    # all-on: a1 (A1_W*~3.0 ~= GATE) + 6 one-hot gates
+                    # (~5970, BYTE_INDEX_0=0.97/HAS_SE=0.995) + carry (+1000)
+                    # ~= 7970; missing ANY single gate (incl. a wrong a1/b1
+                    # -> that cell = 0) -> <= 6970; missing carry -> 6970.
+                    # Threshold 7400 fires only on the exact (a1,b1,carry).
+                    threshold = 7400.0
+                    scope = (
+                        "is_byte and TEMP+8 and BYTE_INDEX_0 and CARRY+1"
+                    )
+                else:
+                    conditions = base_conditions + (
+                        ("CARRY+1", CARRY_BLOCK),
+                    )
+                    # all-on (a1 + 6 one-hot gates, no carry) ~= 6970; a real
+                    # carry adds -100000 -> hard block; missing any single
+                    # gate -> <= 5970. Threshold 6400 fires only all-on.
+                    threshold = 6400.0
+                    scope = (
+                        "is_byte and TEMP+8 and BYTE_INDEX_0 and not CARRY+1"
+                    )
+                rules.append(
+                    multi_way_and_rule(
+                        name=f"l10_add_high_byte_c{carry}_a{a1:x}_b{b1:x}",
+                        scope=scope,
+                        dominates_at={
+                            "OUTPUT_LO": "is_byte",
+                            "OUTPUT_HI_THIS_STEP": "is_byte",
+                        },
+                        conditions=conditions,
+                        threshold=threshold,
+                        writes=Primitives.byte_value_writes(
+                            v,
+                            hi_base="OUTPUT_HI_THIS_STEP",
+                            strength=STRENGTH,
+                            competitor_strength=COMPETITOR,
+                        ),
+                    )
+                )
+    return tuple(rules)
+
+
+def make_l10_add_high_byte_adder_op() -> Operation:
+    """Append a multi-byte ADD high-byte adder post_op after tail_bit32.
+
+    Completes the multi-byte ADD result (OUTPUT byte 1 = a1 + b1 + carry)
+    that the model's carry-only byte-1 emit path leaves at ``byte1 =
+    carry``. Runs as a standalone ``PureFFN`` post_op appended AFTER
+    ``tail_bit32_result_correction`` on the L25 block, so it dominates the
+    carry-only tail rules and leaves the count-locked 2059-rule tail bank
+    untouched. Reads the three byte-1 addends that survive to this block:
+    a1 (``layer13_add_addend_relay`` -> STACK0_BYTE_VAL_1), b1 (ADDR_B1_LO,
+    from L13 head 1), and the byte-0 carry (CARRY+1). See the module
+    comment block above for the autoregressive carry-row finding, the
+    (a1, b1, carry) -> byte-(a1+b1+carry) map, and the byte-identity
+    property (8-bit ADD unchanged; gated on TEMP+8 so dark off-ADD).
+    1096 ``add`` cluster: 4/50 -> 39/50 (the remaining fails are byte-0
+    ALU-precision / carry-propagation cases, not byte-1).
+    """
+    rules = _l10_add_high_byte_adder_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _L10_ADD_HIGH_BYTE_ADDER_HIDDEN_DIM, (
+            f"l10 add high-byte adder rule-count drift: produced "
+            f"{len(rules)}, expected {_L10_ADD_HIGH_BYTE_ADDER_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        _suppress_ffn_on_step_boundary(ffn, dim_map, S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_add_high_byte_adder",
+        reads={
+            "CONST", "IS_BYTE", "HAS_SE", "H1",
+            "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+            "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
+            "NEXT_STACK0", "NEXT_MEM", "NEXT_SE",
+            "OP_IMM", "OP_LEA", "OP_SUB", "OP_DIV", "OP_MOD", "OP_AND",
+            "OP_OR", "OP_XOR", "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE",
+            "OP_GE", "OP_SHL", "OP_SHR", "OP_SI", "OP_SC", "OP_LI", "OP_LC",
+            "OP_ENT", "MEM_STORE", "TEMP", "CARRY",
+            "STACK0_BYTE_VAL_1_LO", "ADDR_B1_LO",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        # Append AFTER the tail correction on the same L25 block so this
+        # adder is the last OUTPUT writer at the ADD byte-1 row.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={
+            "TestSmokeBasic::test_add_basic",
+            "TestSmoke32Bit::test_add_16bit",
+            "TestSmoke32Bit::test_add_carry_cascade",
+        },
+        spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+    )
+
+
 def make_l10_post_op_attach_op(alu_mode: str = "lookup") -> Operation:
     """Block-level op: attach L10 post_op modules onto block.post_ops.
 

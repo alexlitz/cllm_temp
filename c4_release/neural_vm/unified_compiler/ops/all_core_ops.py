@@ -357,6 +357,13 @@ def all_core_ops(
         # compute byte 1/2 of a multi-byte SUB (Part 1 of the sub_16bit
         # fix; the cascade rule re-point is Part 2 in l10_ops.py).
         make_layer13_sub_minuend_relay_op(),
+        # Multi-byte ADD addend relay (2026-06-12): L13 attn head 5
+        # delivers operand-A byte 1 (a1) into STACK0_BYTE_VAL_1 at the ADD
+        # byte-1 emit row so the L10 ADD adder can compute a1 + b1 + carry
+        # (Part 1 of the multi-byte ADD fix; the byte-1 adder is the L10
+        # post-tail ``l10_add_high_byte_adder``). Mirror of head 4 (SUB),
+        # gated on TEMP+8 (ADD) instead of TEMP+9 (SUB).
+        make_layer13_add_addend_relay_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
         # meaningful in efficient mode. The 5 ops returned by
@@ -471,6 +478,14 @@ def all_core_ops(
         # reprocessed in the late tail layer.
         make_l10_post_ops_combined(),
         make_tail_bit32_result_correction_op(),
+        # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
+        # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =
+        # a1 + b1 + carry at the ADD byte-1 row, completing the multi-byte
+        # ADD result the carry-only tail rules leave at byte1=carry. Reads
+        # a1 (relayed by ``layer13_add_addend_relay``), b1 (ADDR_B1_LO) and
+        # the byte-0 carry (CARRY+1, the clean autoregressive
+        # discriminator). Byte-identical on 8-bit ADD; add 1096 4/50->39/50.
+        make_l10_add_high_byte_adder_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).
