@@ -195,24 +195,25 @@ _DEFAULT_MEM_STEP_SCALE = 1.0
 
 # Length buckets (upper bound on declarative steps) -> per-chunk batch width.
 #
-# The memory driver is NOT the context length alone but the per-block forward
-# working set at batch width B: with this model (d_model=872, 37 physical
-# blocks) even a width-32 batch of <=15-step DIVERGING programs OOM'd a 24 GB
-# GPU (the diverging members run their full ~15-step horizon and the shared
-# FFN/score tensors balloon). Measured OOM points, all on a free 24 GB GPU:
-# width 48 @ ~45 steps, width 12 @ ~45 steps, width 32 @ ~15 steps. width 8
-# @ <=25 steps and width 2 @ <=40 steps stayed safe (<=~21 GB) across a full
-# run. So the table is uniformly conservative: NOTHING wider than 8, and the
-# width shrinks as depth grows because a diverging member fills the horizon.
+# These are the FIRST-TRY widths; they are tuned for throughput, NOT for
+# guaranteed safety. ``_run_one_chunk_with_oom_retry`` recursively HALVES any
+# chunk that OOMs and retries (down to B=1), so an over-optimistic width here
+# only costs a re-run of the few chunks that actually OOM — it never loses a
+# verdict. The memory driver is the per-block forward working set at batch
+# width B times the (possibly diverging) horizon; on this model (d_model=872,
+# 37 blocks) width 32 @ <=15 steps and width 8 @ ~17 steps each OOM'd on SOME
+# chunks (members that all diverge), but most chunks at those widths are fine —
+# exactly the case the retry handles. Deep programs still start solo because
+# they would OOM at any B>1 and splitting them gains nothing.
 #
 # Tuples are ``(step_upper_bound, width)`` checked in order; first whose bound
 # >= the chunk's deepest member wins. ``--mem-step-scale`` shrinks all widths
-# further for a shared GPU.
+# (e.g. 0.5 on a shared GPU) to reduce how often the retry has to fire.
 _LENGTH_BUCKET_CHUNKS: Tuple[Tuple[int, int], ...] = (
-    (25, 8),     # <=25 steps: width 8 (the widest verified-safe batch).
-    (40, 2),     # 25..40 steps: width 2 (a diverging member fills S~1400).
-    (80, 1),
-    (1 << 30, 1),  # >80 steps: SOLO (a diverging member fills the horizon).
+    (15, 32),    # <=15 steps: wide for throughput (retry halves any OOM).
+    (30, 8),
+    (60, 2),
+    (1 << 30, 1),  # >60 steps: SOLO (a diverging member fills the horizon).
 )
 
 
@@ -401,6 +402,120 @@ def _length_bucketed_chunks(
     return chunks
 
 
+def _score_neural_results(
+    chunk: List[Tuple[int, int, str, int, int, list, bytes]],
+    neural_results: List[Tuple[str, Optional[int]]],
+) -> List[ProgramResult]:
+    """Turn one chunk's ``run_batch`` output into scored ``ProgramResult``s."""
+    out: List[ProgramResult] = []
+    for entry, (_neural_output, neural_exit) in zip(chunk, neural_results):
+        idx, expected, description, decl_exit, decl_steps, _, _ = entry
+        if neural_exit is None:
+            status = "error"
+            err = "neural exit is None (no halt within horizon)"
+            ne_masked = None
+        else:
+            ne = int(neural_exit) & 0xFFFFFFFF
+            de = int(decl_exit) & 0xFFFFFFFF
+            ne_masked = ne
+            if ne == de:
+                status = "ok"
+                err = None
+            else:
+                status = "fail"
+                err = None
+        out.append(
+            ProgramResult(
+                idx=idx,
+                description=description,
+                suite_expected=expected,
+                declarative_exit=decl_exit,
+                declarative_steps=decl_steps,
+                neural_exit=ne_masked,
+                status=status,
+                error=err,
+            )
+        )
+    return out
+
+
+def _run_one_chunk_with_oom_retry(
+    neural_runner,
+    chunk: List[Tuple[int, int, str, int, int, list, bytes]],
+    *,
+    spec_k: int,
+    max_context_window: int,
+) -> List[ProgramResult]:
+    """Run one chunk, halving the batch on CUDA OOM and retrying.
+
+    The forward memory of a chunk scales with its batch width times the
+    (possibly diverging) horizon, and on this model that working set is hard to
+    predict — a width that is safe for most chunks can still OOM on a chunk
+    whose members all diverge. Rather than mark the whole chunk as ``error``
+    (losing real verdicts), on a ``torch.cuda.OutOfMemoryError`` we free the
+    allocator cache and re-run the chunk as two halves, recursing down to a
+    single program. A solo program below the step cap is the smallest possible
+    forward; if even that OOMs the program is genuinely too big and is returned
+    as ``error`` (never as pass). This guarantees every in-cap program gets a
+    real verdict regardless of the bucket widths.
+    """
+    import torch
+
+    try:
+        neural_results = neural_runner.run_batch(
+            [e[5] for e in chunk],
+            data_list=[e[6] for e in chunk],
+            max_steps=None,
+            expected_steps_list=[e[4] for e in chunk],
+            max_context_window=max_context_window,
+            spec_k=spec_k,
+        )
+        return _score_neural_results(chunk, neural_results)
+    except torch.cuda.OutOfMemoryError as exc:  # noqa: BLE001
+        _empty_cuda_cache()
+        if len(chunk) <= 1:
+            idx, expected, description, decl_exit, decl_steps, _, _ = chunk[0]
+            return [
+                ProgramResult(
+                    idx=idx,
+                    description=description,
+                    suite_expected=expected,
+                    declarative_exit=decl_exit,
+                    declarative_steps=decl_steps,
+                    neural_exit=None,
+                    status="error",
+                    error=f"solo OOM (too deep for GPU even at B=1): {exc!r}",
+                )
+            ]
+        mid = len(chunk) // 2
+        print(
+            f"[1096-canonical]   OOM on size={len(chunk)} chunk "
+            f"ids={min(e[0] for e in chunk):04d}-{max(e[0] for e in chunk):04d}"
+            f"; splitting -> {mid}+{len(chunk) - mid} and retrying",
+            file=sys.stderr,
+            flush=True,
+        )
+        out: List[ProgramResult] = []
+        out.extend(
+            _run_one_chunk_with_oom_retry(
+                neural_runner,
+                chunk[:mid],
+                spec_k=spec_k,
+                max_context_window=max_context_window,
+            )
+        )
+        _empty_cuda_cache()
+        out.extend(
+            _run_one_chunk_with_oom_retry(
+                neural_runner,
+                chunk[mid:],
+                spec_k=spec_k,
+                max_context_window=max_context_window,
+            )
+        )
+        return out
+
+
 def _run_chunks_streaming(
     neural_runner,
     prepared: List[Tuple[int, int, str, int, int, list, bytes]],
@@ -450,39 +565,35 @@ def _run_chunks_streaming(
 
     try:
         for chunk_no, chunk in enumerate(chunks, start=1):
-            bytecodes = [entry[5] for entry in chunk]
-            data_list = [entry[6] for entry in chunk]
             expected_steps = [entry[4] for entry in chunk]
             chunk_ids = [entry[0] for entry in chunk]
 
             chunk_t0 = time.monotonic()
-            chunk_results: List[ProgramResult] = []
             try:
-                neural_results = neural_runner.run_batch(
-                    bytecodes,
-                    data_list=data_list,
-                    max_steps=None,
-                    expected_steps_list=expected_steps,
-                    max_context_window=max_context_window,
+                # Runs the chunk, recursively halving on CUDA OOM so every
+                # in-cap program gets a real verdict (never a whole-chunk
+                # error just because the chosen batch width was too wide).
+                chunk_results = _run_one_chunk_with_oom_retry(
+                    neural_runner,
+                    chunk,
                     spec_k=spec_k,
+                    max_context_window=max_context_window,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 (non-OOM hard failure)
                 tb = traceback.format_exc(limit=3)
-                for entry in chunk:
-                    idx, expected, description, decl_exit, decl_steps, _, _ = entry
-                    chunk_results.append(
-                        ProgramResult(
-                            idx=idx,
-                            description=description,
-                            suite_expected=expected,
-                            declarative_exit=decl_exit,
-                            declarative_steps=decl_steps,
-                            neural_exit=None,
-                            status="error",
-                            error=f"neural batch error: {exc!r}",
-                        )
+                chunk_results = [
+                    ProgramResult(
+                        idx=entry[0],
+                        description=entry[2],
+                        suite_expected=entry[1],
+                        declarative_exit=entry[3],
+                        declarative_steps=entry[4],
+                        neural_exit=None,
+                        status="error",
+                        error=f"neural batch error: {exc!r}",
                     )
-                    cum_error += 1
+                    for entry in chunk
+                ]
                 print(
                     f"[1096-canonical] chunk {chunk_no}/{len(chunks)} "
                     f"ids={min(chunk_ids):04d}-{max(chunk_ids):04d} "
@@ -490,41 +601,14 @@ def _run_chunks_streaming(
                     file=sys.stderr,
                     flush=True,
                 )
-                neural_results = None
-            else:
-                for entry, (_neural_output, neural_exit) in zip(
-                    chunk, neural_results
-                ):
-                    idx, expected, description, decl_exit, decl_steps, _, _ = entry
-                    if neural_exit is None:
-                        status = "error"
-                        cum_error += 1
-                        err = "neural exit is None (no halt within horizon)"
-                        ne_masked = None
-                    else:
-                        ne = int(neural_exit) & 0xFFFFFFFF
-                        de = int(decl_exit) & 0xFFFFFFFF
-                        ne_masked = ne
-                        if ne == de:
-                            status = "ok"
-                            cum_pass += 1
-                            err = None
-                        else:
-                            status = "fail"
-                            cum_fail += 1
-                            err = None
-                    chunk_results.append(
-                        ProgramResult(
-                            idx=idx,
-                            description=description,
-                            suite_expected=expected,
-                            declarative_exit=decl_exit,
-                            declarative_steps=decl_steps,
-                            neural_exit=ne_masked,
-                            status=status,
-                            error=err,
-                        )
-                    )
+
+            for r in chunk_results:
+                if r.status == "ok":
+                    cum_pass += 1
+                elif r.status == "error":
+                    cum_error += 1
+                else:
+                    cum_fail += 1
 
             chunk_elapsed = time.monotonic() - chunk_t0
             results.extend(chunk_results)
@@ -538,11 +622,11 @@ def _run_chunks_streaming(
                 ckpt_fh.flush()
                 os.fsync(ckpt_fh.fileno())
 
-            # Drop references to this chunk's tensors / decode state and free
-            # the CUDA allocator cache so memory does not accumulate across
-            # chunks. The model weights are held by ``neural_runner`` and are
-            # NOT freed.
-            del bytecodes, data_list, neural_results, chunk
+            # Free the CUDA allocator cache so memory does not accumulate
+            # across chunks. The model weights are held by ``neural_runner``
+            # and are NOT freed; only the per-chunk decode scratch is released
+            # (the chunk's input tensors are already out of scope inside
+            # ``_run_one_chunk_with_oom_retry``).
             _empty_cuda_cache()
 
             print(
