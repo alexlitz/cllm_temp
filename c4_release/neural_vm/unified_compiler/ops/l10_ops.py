@@ -176,8 +176,15 @@ _L10_FFN_UNIT_LAYOUT_MAIN = (
     # gated OP_EQ at MARK_AX. Writes OUTPUT_LO+1 / cancels OUTPUT_LO+0
     # for equal operands. See ``_layer10_alu_eq_engine_rules``.
     ("layer10_alu.eq_engine",      2032,  256),  # 16x16 nibble-pair EQ
+    # Per-nibble ORDERING engine (2026-06-12): 272-unit CMP-cascade
+    # recompute at MARK_AX gated CMP_GROUP — hi_lt(120)+lo_lt(120)+
+    # hi_eq(16)+lo_eq(16) writing CMP+0/+3/+1/+2, feeding the live
+    # ComparisonCombine for LT/GT/LE/GE (and EQ/NE; sole CMP-flag writer
+    # for all six comparison opcodes). See
+    # ``_layer10_alu_ordering_engine_rules``.
+    ("layer10_alu.ordering_engine", 2288,  272),  # hi/lo lt + hi/lo eq
 )
-_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 2288
+_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 2560
 
 # Combined post-op FFN baked by ``make_l10_post_ops_combined`` (kind="ffn",
 # dependency-assigned). Each range maps 1:1 to a post-op class's
@@ -1347,23 +1354,15 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
     W_ALU_LO = 0.2
     W_AXC_LO = 1.5
     THRESH = 4.0
-    # The matching unit writes ``CMP+1`` (hi_eq) and ``CMP+2`` (lo_eq) at
-    # the AX row, which is exactly what the live ``ComparisonCombine``
-    # post-op (logical L14, block 22) reads for the EQ override
-    # ``_cmp_override_3way(OP_EQ, CMP+1, CMP+2, 1, 0)``. That override
-    # fires iff MARK_AX + CMP+1 + CMP+2 - 0.1*CMP+0 >= 2.5; for eq_true
-    # the spurious ``CMP+0 ~= 7.03`` contributes only -0.703 (not the
-    # -15 of a TRUE hi_lt), so writing each flag at ~2.5 clears the
-    # threshold and flips EQ to 1. This reuses the SAME proven path lt/le
-    # use via CMP+0 (the result survives to the L25 band and decodes
-    # correctly), instead of fighting the block-11 -> block-22 OUTPUT_LO
-    # amplification. CMP+0 (hi_lt, the load-bearing guardrail flag) and
-    # CMP+3 are NEVER written here, so lt/le/gt/ge are structurally
-    # untouched. Gated hard on OP_EQ so non-EQ comparisons see nothing.
-    # Strength ~2.5 (i.e. ~ the ComparisonCombine override unit's own
-    # MARK_AX weight) matches the CMP flag magnitudes L9 would have
-    # written had its cascade transmitted.
-    FLAG = 2.5
+    # RECONCILE (2026-06-12): this engine NO LONGER writes the CMP+1/CMP+2
+    # (hi_eq/lo_eq) flags. The general ``_layer10_alu_ordering_engine_rules``
+    # is now the SOLE writer of CMP+0..3 for all six comparison opcodes; its
+    # hi_eq/lo_eq families subsume the full-equality flag this engine used to
+    # write, so keeping both would DOUBLE-WRITE the EQ flags and over-trip
+    # the ComparisonCombine ``_cmp_override_3way(OP_EQ, CMP+1, CMP+2, 1, 0)``
+    # EQ override. This engine retains ONLY its decode-margin push
+    # (``eq_one`` below) and its weights/threshold above still control which
+    # equal nibble-pairs fire that push. CMP+0/CMP+3 were never written here.
     # Wall-4 SESSION 4 decode-margin push (2026-06-12): in addition to the
     # CMP+1/CMP+2 flags (consumed by the SE-row ComparisonCombine EQ
     # override through the Wave-A relay), each EQUAL-firing unit ALSO writes
@@ -1418,10 +1417,20 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=THRESH,
                 gate=gate_eq,
                 gate_weight=1.0,
-                writes=(
-                    ("CMP+1", FLAG / S),
-                    ("CMP+2", FLAG / S),
-                ) + eq_one,
+                # RECONCILE (2026-06-12): the CMP+1/CMP+2 flag writes were
+                # REMOVED here. The general per-nibble ORDERING engine
+                # (``_layer10_alu_ordering_engine_rules``) is now the SOLE
+                # writer of CMP+0..3 for all six comparison opcodes; its
+                # hi_eq(CMP+1)/lo_eq(CMP+2) families subsume this engine's
+                # full-equality flag (both fire iff A.hi==B.hi and
+                # A.lo==B.lo). Keeping both would DOUBLE-WRITE CMP+1/CMP+2
+                # and over-trip the ComparisonCombine EQ 3-way override.
+                # This engine now contributes ONLY its decode-margin push
+                # ``eq_one`` (the decisive 0x01 OUTPUT byte for equal
+                # operands at the AX decode row) -- separable from and
+                # downstream of flag computation. See the merge note in
+                # ``make_efficient_l10_andorxor_wrap_op``.
+                writes=eq_one,
                 scope="MARK_AX and OP_EQ",
             ))
     return tuple(rules)
@@ -1474,6 +1483,220 @@ def _layer10_alu_eq_default_rules(S: float) -> tuple[FFNRule, ...]:
     ),)
 
 
+def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
+    """Per-nibble ORDERING engine: 272 units recomputing the CMP cascade
+    at the AX row for LT/GT/LE/GE (and EQ/NE), gated on ``CMP_GROUP``.
+
+    Companion to ``_layer10_alu_eq_engine_rules``. Same root, same proof:
+    after Wave B moved the CMP compute to the STEP_END (MARK_SE_ONLY) row,
+    the L9 ``step_end_operand_relay`` never transmits AX->SE, so the
+    SE-tagged CMP cascade is structurally dead (``SE_CMP_GROUP``=0 gates
+    every L9 cmp rule to silence; probed spec_k=0). The live decoder is
+    the legacy ``ComparisonCombine`` post-op (logical L14, physical block
+    22) which reads the RAW ``CMP[0..3]`` flags at MARK_AX:
+    ``CMP+0``=hi_lt, ``CMP+1``=hi_eq, ``CMP+2``=lo_eq, ``CMP+3``=lo_lt.
+    Those flags are NEVER computed at the AX row for the if/bool clusters
+    (the only partial AX-row hi_lt source is an L6 attention path that
+    fires only when the high nibbles are 0/1), so every comparison falls
+    through to its ComparisonCombine *default* (GT=1, LT=0) and the
+    if-then-else branch takes the wrong path. This was the shared root
+    behind if_gt / if_lt / if_var / bool_and (and the residual if_eq
+    decode-margin failures that the OP_EQ-only eq_engine could not reach).
+
+    The raw operands the L9 cascade WOULD use are present and STABLE at
+    the AX row across blocks 11..23 (probed spec_k=0): operand A's nibbles
+    in ``ALU_HI``/``ALU_LO`` (one-hot ~5.82, plus the value-proportional
+    index-0 magnitude artifact ~5.54 from the hybrid operand-gather
+    encoding, see ``project_operand_gather_hybrid_encoding_is_cmp_alu_root``),
+    operand B's nibbles in ``AX_CARRY_HI``/``AX_CARRY_LO`` (clean one-hot
+    ~1.0, index-0 floor ~0.29). This engine recomputes the four flags
+    directly:
+
+      * ``hi_lt`` (CMP+0): one 2-way AND per pair ``a < b`` over
+        ``(ALU_HI+a, AX_CARRY_HI+b)``; fires iff A.hi == a AND B.hi == b.
+      * ``lo_lt`` (CMP+3): the same over ``(ALU_LO+a, AX_CARRY_LO+b)``.
+      * ``hi_eq`` (CMP+1): one unit per nibble h over
+        ``(ALU_HI+h, AX_CARRY_HI+h)`` PLUS a small negative blocker on the
+        other non-zero ``ALU_HI`` indices. The blocker disambiguates the
+        index-0 artifact: when A.hi is genuinely non-zero its strong
+        ``ALU_HI+A.hi`` (~5.82) suppresses the artifact-only ``ALU_HI+0``
+        firing of the h=0 unit, so hi_eq fires iff A.hi == h == B.hi.
+      * ``lo_eq`` (CMP+2): the same over the LO bands.
+
+    Weights/thresholds were locked offline against the probed AX-row
+    operand bands (``tools/tune_eq_engine.py`` methodology) so that EVERY
+    one of the 256 high-nibble states and 256 low-nibble states yields the
+    correct flag with zero false positives AND zero firing on non-AX rows
+    (``MARK_AX`` carries weight 4.0; with ``MARK_AX``=0 the largest
+    operand-leak sum stays below threshold). Gated multiplicatively on
+    ``CMP_GROUP`` so the engine is structurally inert on every non-cmp
+    opcode. Writing all four flags broadly (rather than per-opcode) is
+    safe because the per-op selection happens downstream in
+    ``ComparisonCombine``: hi_eq/lo_eq feed EQ/NE only via the
+    ``(CMP+1 AND CMP+2)`` 3-way override which requires BOTH, and hi_lt /
+    (hi_eq AND lo_lt) feed LT/GT/LE/GE -- exactly the proven flag algebra
+    the cascade always intended.
+
+    RECONCILE (2026-06-12): this engine is now the SOLE writer of the four
+    CMP flags for ALL six comparison opcodes (EQ/NE/LT/GT/LE/GE). The
+    earlier per-nibble ``_layer10_alu_eq_engine_rules`` retune (commit
+    414abfc1) ALSO wrote CMP+1/CMP+2 on full equality; that flag write was
+    REMOVED there so the EQ flags are never double-written (a double-write
+    over-trips the ComparisonCombine EQ 3-way override). The eq_engine now
+    contributes ONLY its decode-margin push (the decisive 0x01 OUTPUT byte
+    for equal operands) plus ``_layer10_alu_eq_default_rules`` (the 0x00
+    L25-band default for unequal operands) -- both DOWNSTREAM of and
+    complementary to this engine's flag computation, not contradicting it.
+    """
+    # Gate on the OR of comparison opcode flags (effectively CMP_GROUP, but
+    # expressed via the OP_<cmp> dims). The compiler's bake-time dim proxy
+    # resolves the OP_<cmp> flags to their compiler-allocated positions
+    # (the same path the proven eq_engine's OP_EQ gate uses), whereas the
+    # raw ``CMP_GROUP`` name falls back to a stale legacy ``_SetDim`` slot
+    # under the compact layout and would gate the engine on the wrong dim.
+    # Exactly one flag is hot per comparison step (one-hot), so the summed
+    # gate is the active opcode's value (~5.0) and zero on non-cmp opcodes.
+    #
+    # All six comparison opcode flags are summed into the gate. The
+    # hi_eq/lo_eq families (CMP+1/CMP+2) fire on EQ/NE and feed the
+    # ComparisonCombine EQ override directly; the eq_engine's OUTPUT-byte
+    # decode-margin push lands on top for the equal-operand cases. A
+    # residual band of EQ-false cases whose operands carry a ZERO nibble
+    # (e.g. 16 == 9) is still mis-decided by the shared index-0 magnitude
+    # artifact -- the hard EQ decode-margin documented in
+    # ``project_operand_gather_hybrid_encoding_is_cmp_alu_root`` /
+    # ``project_eq_byte1_l6_divergence``. That band is an EQ
+    # decode-margin frontier, NOT a CMP->branch-relay failure, so it is
+    # out of scope for this fix (if_gt/if_lt do not depend on it).
+    gate_cmp_terms = (
+        (dim_ref("opcode_flag", "EQ"), 1.0),
+        (dim_ref("opcode_flag", "NE"), 1.0),
+        (dim_ref("opcode_flag", "LT"), 1.0),
+        (dim_ref("opcode_flag", "GT"), 1.0),
+        (dim_ref("opcode_flag", "LE"), 1.0),
+        (dim_ref("opcode_flag", "GE"), 1.0),
+    )
+
+    # Shared per-term weights. Every family is a balanced AND of:
+    #   MARK_AX (positional gate, weight 6.0)
+    #   ALU side  (operand A nibble one-hot, weight 0.5)
+    #   AXC side  (operand B nibble one-hot, weight 6.0 — the CLEAN
+    #              discriminator; AX_CARRY is a clean ~1.0 one-hot)
+    #   blocker   (negative weight on the OTHER non-zero ALU indices —
+    #              rejects the value-proportional index-0 magnitude
+    #              artifact in ALU when operand A's true nibble is
+    #              non-zero, the only thing that makes a pure 2-way AND
+    #              ambiguous; weight tuned per family).
+    # Thresholds were locked offline (``/tmp/tune_lt_blk`` /
+    # ``tune_eq_blk`` methodology, same as ``tools/tune_eq_engine.py``)
+    # for the LARGEST true-fire margin that keeps every false / off-row
+    # (MARK_AX=0) sum below threshold across all 256 hi-states and 256
+    # lo-states. The firing margin (~1.4 lt / ~0.75 eq) is what sets the
+    # silu output magnitude, so it must be comfortably positive — a
+    # correct-but-thin-margin design produces a CMP write too weak to
+    # trip the ComparisonCombine override (the failure mode of the
+    # first pass).
+    W_MARK = 6.0
+    W_ALU = 0.5
+    W_AXC = 6.0
+    # CMP flag write strength. The live ComparisonCombine override math
+    # (vm_step.ComparisonCombine, the decode row) is:
+    #   * 2-way (hi_lt): fires iff  MARK_AX + cmp_flag - 1.5 > 0,
+    #     i.e. cmp_flag > 0.5.
+    #   * 3-way (hi_eq AND lo_lt / hi_eq AND lo_eq): fires iff
+    #     MARK_AX + cmp_flag_1 + cmp_flag_2 - 2.5 > 0,
+    #     i.e. cmp_flag_1 + cmp_flag_2 > 1.5.
+    # So EVERY CMP flag must land in the window (0.75, 1.5) at the decode
+    # row: a SINGLE flag (plus MARK_AX) must NOT trip the 3-way override
+    # (else lo_lt alone flips LT-false to LT-true, e.g. 50 < 44, or hi_eq
+    # alone flips GT-true to GT-false, e.g. 54 > 53), but the two intended
+    # flags together MUST. The engine's silu output is amplified by the
+    # block-15 -> block-22 CMP relay, and the amplification differs with
+    # the per-family firing margin (the lt families have the larger margin
+    # ~1.4, the eq families ~0.75), so the write strengths are tuned PER
+    # FAMILY to land every flag at ~1.1 at the decode row.
+    FLAG_LT = 0.15  # hi_lt / lo_lt (margin ~1.4) -> ~1.1 at decode row
+    FLAG_EQ = 0.30  # hi_eq / lo_eq (margin ~0.75) -> ~1.1 at decode row
+
+    rules: list[FFNRule] = []
+
+    # ---- hi_lt -> CMP+0 : 120 units (a < b) -------------------------------
+    for a in range(16):
+        blocker = tuple(
+            (f"ALU_HI+{j}", -0.5) for j in range(1, 16) if j != a
+        )
+        for b in range(a + 1, 16):
+            rules.append(multi_way_and_rule(
+                name=f"l10_ord_hi_lt_a{a:x}_b{b:x}",
+                conditions=(
+                    ("MARK_AX", W_MARK),
+                    (f"ALU_HI+{a}", W_ALU),
+                    (f"AX_CARRY_HI+{b}", W_AXC),
+                ) + blocker,
+                threshold=13.22,
+                gate_terms=gate_cmp_terms,
+                writes=(("CMP+0", FLAG_LT / S),),
+                scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            ))
+
+    # ---- lo_lt -> CMP+3 : 120 units (a < b) -------------------------------
+    for a in range(16):
+        blocker = tuple(
+            (f"ALU_LO+{j}", -0.5) for j in range(1, 16) if j != a
+        )
+        for b in range(a + 1, 16):
+            rules.append(multi_way_and_rule(
+                name=f"l10_ord_lo_lt_a{a:x}_b{b:x}",
+                conditions=(
+                    ("MARK_AX", W_MARK),
+                    (f"ALU_LO+{a}", W_ALU),
+                    (f"AX_CARRY_LO+{b}", W_AXC),
+                ) + blocker,
+                threshold=13.22,
+                gate_terms=gate_cmp_terms,
+                writes=(("CMP+3", FLAG_LT / S),),
+                scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+            ))
+
+    # ---- hi_eq -> CMP+1 : 16 units (A.hi == h == B.hi) --------------------
+    for h in range(16):
+        blocker = tuple(
+            (f"ALU_HI+{j}", -0.8) for j in range(1, 16) if j != h
+        )
+        rules.append(multi_way_and_rule(
+            name=f"l10_ord_hi_eq_{h:x}",
+            conditions=(
+                ("MARK_AX", W_MARK),
+                (f"ALU_HI+{h}", W_ALU),
+                (f"AX_CARRY_HI+{h}", W_AXC),
+            ) + blocker,
+            threshold=13.79,
+            gate_terms=gate_cmp_terms,
+            writes=(("CMP+1", FLAG_EQ / S),),
+            scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+        ))
+
+    # ---- lo_eq -> CMP+2 : 16 units (A.lo == l == B.lo) --------------------
+    for l in range(16):
+        blocker = tuple(
+            (f"ALU_LO+{j}", -0.8) for j in range(1, 16) if j != l
+        )
+        rules.append(multi_way_and_rule(
+            name=f"l10_ord_lo_eq_{l:x}",
+            conditions=(
+                ("MARK_AX", W_MARK),
+                (f"ALU_LO+{l}", W_ALU),
+                (f"AX_CARRY_LO+{l}", W_AXC),
+            ) + blocker,
+            threshold=13.43,
+            gate_terms=gate_cmp_terms,
+            writes=(("CMP+2", FLAG_EQ / S),),
+            scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
+        ))
+
+    return tuple(rules)
+
+
 def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
     """Composite ordered ``FFNRule`` sequence for ``layer10_alu``.
 
@@ -1493,6 +1716,7 @@ def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
         + _layer10_alu_shl_shr_zero_rules(S)
         + _layer10_alu_ax_passthrough_rules(S)
         + _layer10_alu_eq_engine_rules(S)
+        + _layer10_alu_ordering_engine_rules(S)
     )
 
 
@@ -3850,12 +4074,19 @@ def make_layer10_alu_op() -> Operation:
                # Wall-4 EQ engine (2026-06-12): reads OP_EQ + the raw
                # operand bands at MARK_AX to recompute equality directly.
                "OP_EQ",
+               # Ordering engine (2026-06-12): gated on the OR of the six
+               # comparison opcode flags, reads the same raw operand bands
+               # at MARK_AX to recompute the full hi/lo lt/eq cascade for
+               # LT/GT/LE/GE (and EQ/NE).
+               "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                # V2/G7 LEV detector: in-step topology edge replacing the
                # cross-step requires["after"]=layer16_lev_routing below.
                "PC_VIA_LEV_DETECTOR_LO"},
-        # Wall-4 EQ engine (2026-06-12): also writes CMP (hi_eq=CMP+1,
-        # lo_eq=CMP+2) at the AX row, gated OP_EQ, feeding the live
-        # ComparisonCombine EQ override. CMP+0/CMP+3 are never touched.
+        # Ordering engine (2026-06-12): the SOLE CMP-flag writer for all
+        # six comparison opcodes -- writes CMP+0 (hi_lt), CMP+1 (hi_eq),
+        # CMP+2 (lo_eq), CMP+3 (lo_lt) at the AX row, feeding the live
+        # ComparisonCombine for LT/GT/LE/GE and the EQ/NE override. The
+        # eq_engine no longer writes CMP (only its OUTPUT decode-margin).
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING", "CMP"},
         kind="block",
         declarative_bake_fn=bake,
@@ -3883,7 +4114,9 @@ def make_layer10_alu_op() -> Operation:
         # ``_layer10_alu_bitwise_rules`` -- see that helper's docstring.
         # Wall-4 EQ engine (2026-06-12): +256 units (eq_engine) reaching
         # 2288. See ``_layer10_alu_eq_engine_rules``.
-        ffn_units_used=2288,
+        # Ordering engine (2026-06-12): +272 units reaching 2560. See
+        # ``_layer10_alu_ordering_engine_rules``.
+        ffn_units_used=2560,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",

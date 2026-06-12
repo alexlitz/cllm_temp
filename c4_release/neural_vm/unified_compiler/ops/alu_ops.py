@@ -742,40 +742,61 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
                         gate=op_gate,
                         S=S,
                     ))
-        # Wall-4 SESSION 2 per-nibble EQ engine (2026-06-12).
+        # Wall-4 CMP/EQ engines (2026-06-12, RECONCILED).
         # ------------------------------------------------------------
         # In efficient mode this wrap REPLACES L10's block.ffn, so the
         # lookup-mode ``layer10_alu`` FFN -- which carries the declarative
-        # ``_layer10_alu_eq_engine_rules`` -- is discarded. The smoke gate
-        # runs efficient mode (trust_neural_alu=True), so the EQ engine
-        # must live here to fire. It is MERGED into ``block.ffn`` (the
-        # cleanup FFN) rather than appended as a post_op so it does NOT
-        # add an extra passthrough block (which would shift every
-        # downstream block index and break absolute-position-dependent
-        # ops like lea). Its 256 units read the raw operands at MARK_AX
-        # gated OP_EQ and write CMP+1 (hi_eq) / CMP+2 (lo_eq) -- the flags
-        # the live ComparisonCombine EQ override reads. The cleanup units
-        # only subtract artifacts for OP_AND/OP_OR/OP_XOR, so EQ rows
-        # still carry the raw (dirty) bands the engine thresholds expect,
-        # and the EQ units (gated OP_EQ) never touch the bitwise cleanup.
-        # CMP+0/CMP+3 are never written -> lt/le/gt/ge untouched.
-        # Wall-4 SESSION 4 (2026-06-12): the engine's 256 nibble-pair units
-        # write the decisive EQ-true byte 0x01 when equal; ``eq_default``
-        # adds ONE unconditional OP_EQ default-0 unit writing 0x00 (smaller
-        # magnitude) so UNEQUAL operands -- which fire no engine unit --
-        # still decode 0x00 and survive the +238 L25 tail band that
-        # otherwise corrupts eq_false to 0x11=17. Both gated OP_EQ ->
-        # lt/le/gt/ge/ne untouched. The default lives ONLY in this
-        # efficient-mode merge (the smoke path); lookup-mode keeps its
-        # 256-unit eq_engine layout.
+        # comparison engines -- is discarded. The smoke gate runs efficient
+        # mode (trust_neural_alu=True), so the engines must live here to
+        # fire. They are MERGED into ``block.ffn`` (the cleanup FFN) rather
+        # than appended as post_ops so they do NOT add extra passthrough
+        # blocks (which would shift every downstream block index and break
+        # absolute-position-dependent ops like lea). The cleanup units only
+        # subtract artifacts for OP_AND/OP_OR/OP_XOR, so comparison rows
+        # still carry the raw (dirty) bands the engines threshold against,
+        # and the comparison units (gated on the cmp opcodes) never touch
+        # the bitwise cleanup.
+        #
+        # THREE pieces, reconciled so the CMP flags are written EXACTLY ONCE:
+        #
+        # 1. ORDERING engine (``_layer10_alu_ordering_engine_rules``, 272
+        #    units): the SOLE writer of CMP+0..3 for ALL six comparison
+        #    opcodes (EQ/NE/LT/GT/LE/GE). Recomputes hi_lt/hi_eq/lo_eq/lo_lt
+        #    from the raw AX-row operands (A in ALU_HI/LO, B in
+        #    AX_CARRY_HI/LO), gated on the OR of the cmp opcode flags,
+        #    feeding the live ComparisonCombine. Each flag lands ~1.1 at the
+        #    decode row -- a single flag must NOT trip the 3-way override,
+        #    two together must. This is the if_* ordering cluster fix.
+        # 2. EQ engine (``_layer10_alu_eq_engine_rules``, 256 units): its
+        #    CMP+1/CMP+2 flag writes were REMOVED (the ordering engine's
+        #    hi_eq/lo_eq subsume them; double-writing would over-trip the
+        #    EQ override). It now contributes ONLY the decode-margin push --
+        #    the decisive 0x01 OUTPUT byte at the AX decode row for EQUAL
+        #    operands -- DOWNSTREAM of the flags.
+        # 3. EQ default (``_layer10_alu_eq_default_rules``, 1 unit): the
+        #    L25-band fix -- one unconditional OP_EQ default-0 unit writes
+        #    0x00 (smaller magnitude) so UNEQUAL operands (which fire no
+        #    equal unit) decode 0x00 and survive the +238 L25 tail band that
+        #    otherwise corrupts eq_false to 0x11=17.
+        #
+        # All three are gated on the cmp opcodes (ordering: all six; eq +
+        # default: OP_EQ) so non-cmp opcodes are structurally untouched.
+        # The decode-margin + default live ONLY in this efficient-mode merge
+        # (the smoke path); lookup-mode keeps the same layout via
+        # ``_layer10_alu_rules``.
         from .l10_ops import (
             _layer10_alu_eq_engine_rules,
             _layer10_alu_eq_default_rules,
+            _layer10_alu_ordering_engine_rules,
         )
         eq_rules = _layer10_alu_eq_engine_rules(S)
         eq_default_rules = _layer10_alu_eq_default_rules(S)
+        ordering_rules = _layer10_alu_ordering_engine_rules(S)
         cleanup_ffn = _lower(
-            tuple(cleanup_rules) + tuple(eq_rules) + tuple(eq_default_rules)
+            tuple(cleanup_rules)
+            + tuple(eq_rules)
+            + tuple(eq_default_rules)
+            + tuple(ordering_rules)
         )
 
         # ---- Stage 2: rescaled bitwise lookup over the cleaned bands ----
