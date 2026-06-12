@@ -166,18 +166,53 @@ byte-0 borrow). Commits: `feat(l13): ...relay head (Part 1)`,
 
 ### Remaining (follow-ups, NOT this surface)
 
-- **No-borrow multi-byte SUB** (e.g. 827-26=801, byte0 doesn't underflow):
-  the cascade borrow rule subtracts a hardcoded -1 and is borrow-gated, so
-  byte 1 = minuend_byte1 when there is no borrow is NOT emitted (defaults
-  to 0x00). Needs a non-borrow minuend-high-byte passthrough to OUTPUT
-  (a separate corrective op, ~38 of the 45 multi-byte sub fails).
+- ~~**No-borrow multi-byte SUB**~~ **LANDED 2026-06-12** (commit
+  `feat(l14): SUB no-borrow ... passthrough`). The borrow-gated cascade
+  cannot reach the no-borrow path (its SUB cells are *multiplicatively*
+  gated on the byte-0 borrow-out CARRY+2, so they emit nothing when there
+  is no borrow). Adding a non-borrow rule to the cascade is impossible: the
+  3 carry instances are pinned to exactly 512 units (256 ADD + 256 SUB),
+  no spare cells. The landed fix is a NEW L14 cleanup-chain FFN op
+  `layer14_sub_noborrow_high_byte_passthrough` (16 units, one per minuend
+  byte-1 nibble): at the SUB byte-1 predictor row (TEMP+9 + H1[AX] +
+  IS_BYTE + BYTE_INDEX_0), gated to fire ONLY when CARRY+2 is absent
+  (no byte-0 borrow), it reads the relayed minuend byte 1
+  (STACK0_BYTE_VAL_1, delivered by `layer13_sub_minuend_relay`) and writes
+  OUTPUT byte 1 = that value. Discriminator verified spec_k=0 (block 15,
+  SUB byte-1 predictor): no-borrow CARRY+2=0.0; borrow CARRY+2=2.0. 8-bit
+  SUB relays 0x00 = the default → byte-identical (sub_basic 50-8 → 42).
+  Borrow path untouched (cascade keeps owning it). **1096 sub: 12/50 →
+  43/50 (+31)**; pytest smoke 46/3/2 unchanged.
 - **2-nibble high bytes** (e.g. 0x1234-0x34, byte1=0x12): the UPSTREAM
   `layer10_psh_ax_broadcast` stores only the LOW nibble of STACK0_BYTE_VAL_h
   (probe: 0x1234 → STACK0_BYTE_VAL_1 = 0x02 not 0x12). The relay faithfully
   copies the truncated value; the fix is upstream in the PSH broadcast head.
-- **ADD multi-byte** (add 3/50 unchanged): the analogous `add_rule_for`
-  still matches OUTPUT; an ADD relay + read-repoint mirrors the SUB fix but
-  ADD operand bytes reach OUTPUT differently — needs its own probe pass.
+  The 7 remaining sub fails are NOT this — they are pre-existing byte-0
+  ALU precision / runner-error cases (ids 63-66, 70, 72, 87; minuend byte1
+  all ≤ 0x06, single-nibble), not high-byte issues.
+- **ADD multi-byte** (add 3/50, NOT landed): ATTEMPTED and reverted
+  2026-06-12. Unlike SUB (subtrahend byte1 = 0x00 for every 1096 case,
+  so result byte1 = minuend_byte1 - borrow, a single relayed value), ADD
+  needs **a_byte1 + b_byte1 + carry** — a TWO-operand add. The signals
+  exist at the ADD byte-1 predictor row (verified spec_k=0, teacher-forced
+  block 15 r141): a_byte1 relayable into STACK0_BYTE_VAL_1 (a working ADD
+  relay was built, head 5 gated on TEMP+8, delivered a1 correctly);
+  b_byte1 in ADDR_B1_LO; carry in CARRY+1. A 128-unit FFN adder
+  (per (a1,b1)×carry → a1+b1+carry) was written and gated on the carry
+  state. **It regressed in the REAL autoregressive runner**: the carry
+  discriminator (CARRY+1) that reads cleanly in the teacher-forced residual
+  does NOT match in the autoregressive decode path (add_basic 5+3, no
+  carry, fired the carry-present rule → byte1=0x01). The autoregressive
+  byte-1 predictor row is the byte-0 *token*'s position in the growing
+  context, NOT a fixed teacher-forced row, so teacher-forced CARRY+1 is the
+  wrong reference. The existing ADD carry cascade also emits a 0x88 default
+  byte1 that the adder must override. **Lesson for the next ADD agent:**
+  do NOT trust the teacher-forced residual for the ADD carry signal — drive
+  the real `BatchedPureNeuralRunner` (spec_k=0) and instrument the actual
+  per-step byte predictor, OR find a single-value (copy, not add) ADD
+  formulation. The SUB fix worked precisely because it was a single relayed
+  copy gated on an absence (no-borrow), not a value-dependent arithmetic
+  match.
 
 ## Artifacts
 
