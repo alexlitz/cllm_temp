@@ -12,8 +12,10 @@ sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.dirname(_ROOT))
 import torch
 from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
-from tests.test_smoke import _SMOKE_GROUPS
-from tests.declarative_oracle import declarative_oracle_for_program
+# NOTE: tests.test_smoke / tests.declarative_oracle are imported LAZILY inside
+# main() AFTER the model is built. Importing them at module top (before the
+# build) systematically perturbed the bake so eq_true decoded 0 -- a real
+# import-order side effect on the compiler's global state.
 
 TARGETS = {
     "TestSmokeComparison::test_eq_true", "TestSmokeComparison::test_eq_false",
@@ -29,6 +31,7 @@ GUARDRAILS = {
 
 
 def run_group(runner, tests):
+    from tests.declarative_oracle import declarative_oracle_for_program
     oracles = [declarative_oracle_for_program(t["bytecode"], b"", suite_check=t["check"], label=t["name"]) for t in tests]
     runnable = [(t, o) for t, o in zip(tests, oracles) if o.error is None]
     out = {t["name"]: ("", None, o.error) for t, o in zip(tests, oracles) if o.error is not None}
@@ -64,6 +67,9 @@ def main():
     mr.model = model
     mr._func_call_handlers = {}; mr._syscall_handlers = {}
     runner = BatchedPureNeuralRunner(model_runner=mr)
+
+    # Import the smoke corpus AFTER the build (see module-top note).
+    from tests.test_smoke import _SMOKE_GROUPS
 
     name_to_check = {}
     results = {}

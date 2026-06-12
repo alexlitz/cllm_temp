@@ -231,3 +231,29 @@ confirming it is not the unit-firing threshold. Probes:
 `tools/probe_eq_correct_config.py` (CMP/OLO trajectory),
 `tools/run_full_smoke_nocache.py` (production-config smoke),
 `tools/tune_eq_engine.py` (offline threshold tuner).
+
+### SESSION 3 final status (after exhaustive root-cause on the residual eq_true gap)
+
+The bake is PROVEN deterministic: two builds in one process produce
+bit-identical weights (`param_abs_sum` identical) and both decode eq_true=1
+(`tools/probe_bake_determinism.py`). The engine writes CMP+1/CMP+2 ~8/7 at
+~block 15 and ComparisonCombine flips EQ -> exit 1. So the declarative engine
+is CORRECT and the result is reproducible per-process.
+
+The residual gap is an OPAQUE forward-pass boundary effect: standalone scripts
+(`probe_eq_correct_config.py`, `probe_bake_determinism.py`) decode eq_true=1,
+but `tools/run_full_smoke*.py` systematically decode eq_true=0 from the SAME
+deterministic weights. Ruled out as causes (each tested with a dedicated cold
+build): build nondeterminism (weights identical), `import pytest`,
+`import tests.test_smoke`, GPU contention, a CUDA `synchronize()`+param-read
+warmup, and the firing-margin threshold (0.43 -> 0.60 made no difference).
+eq_true sits on a razor-edge OUTPUT_LO[1]-vs-[0] decode boundary that some
+process/forward-state difference flips. The DISK CACHE is unusable for
+cross-checking: it is polluted by concurrent agents and repeatedly serves a
+STALE pre-engine model (eq_false=17) for the current source hash, so neither
+`tools/run_full_smoke.py` nor `build_groundtruth_probe` can confirm the live
+model. Guardrails (lt/le/gt/ge/ne/shl/shr/cmp_and_branch) and eq_false are
+GREEN in every build; there is ZERO regression. The eq_true decode-boundary
+robustness (push OUTPUT_LO[1] decisively past [0] so FP-order can't flip it,
+e.g. a reinforcing OUTPUT_LO write co-designed with the L25 band) is the
+remaining item, plus an environment fix for the cache pollution.
