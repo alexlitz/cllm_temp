@@ -2284,6 +2284,74 @@ def make_layer14_clear_mem_marker_output_op() -> Operation:
     )
 
 
+def _layer14_mem_addr_src_default_suppress_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_mem_addr_src_default_suppress``.
+
+    8 ungated (``constant_write``) hidden units that cancel the L3
+    ``MEM DEFAULT`` +0.940 baseline at SI/SC store positions
+    (``MEM_ADDR_SRC=1``). Mirrors the imperative helper cell-for-cell:
+
+      * 2 marker units (LO/HI nibble): fire when MARK_MEM=1 AND
+        MEM_ADDR_SRC=1. Imperative ``W_up[MARK_MEM]=S`` +
+        ``W_up[MEM_ADDR_SRC]=S`` + ``b_up=-S*1.5`` ->
+        ``conditions=(("MARK_MEM",1.0),("MEM_ADDR_SRC",1.0))``,
+        ``threshold=1.5``.
+      * 6 byte units (LO/HI nibble for BYTE_INDEX_{0,1,2}): fire when
+        H1[MEM]=1 AND BYTE_INDEX_K=1 AND MEM_ADDR_SRC=1. Imperative
+        ``W_up[H1+MEM_I]=S`` + ``W_up[byte_idx]=S`` +
+        ``W_up[MEM_ADDR_SRC]=S`` + ``b_up=-S*2.5`` -> three positive
+        conditions, ``threshold=2.5``.
+
+    Each unit writes ``-2.0/S`` into the LO/HI nibble's OUTPUT cell
+    (``W_down[OUTPUT_*+0, unit] = -2.0/S``). The legacy helper used the
+    ungated form (``b_gate=1.0``, no ``W_gate`` content dim) -> the
+    ``gate=None`` (``constant_write``) path here, which lowers
+    ``b_gate=1.0`` and leaves ``W_gate`` zero, byte-identically.
+    """
+    MEM_I = 4  # MEM marker index in MARKS array
+    WRITE = -2.0 / S
+    rules: list[FFNRule] = []
+
+    # Marker rule (MARK_MEM AND MEM_ADDR_SRC), LO then HI nibble.
+    for band in ("OUTPUT_LO", "OUTPUT_HI"):
+        rules.append(
+            multi_way_and_rule(
+                name=f"l14_mem_addr_src_suppress_marker_{band.lower()}",
+                conditions=(
+                    ("MARK_MEM", 1.0),
+                    ("MEM_ADDR_SRC", 1.0),
+                ),
+                threshold=1.5,
+                writes=((f"{band}+0", WRITE),),
+                scope="MARK_MEM and MEM_ADDR_SRC",
+            )
+        )
+
+    # Byte rules (H1[MEM] AND BYTE_INDEX_K AND MEM_ADDR_SRC), LO then HI.
+    for byte_k in (0, 1, 2):
+        for band in ("OUTPUT_LO", "OUTPUT_HI"):
+            rules.append(
+                multi_way_and_rule(
+                    name=f"l14_mem_addr_src_suppress_byte{byte_k}_{band.lower()}",
+                    conditions=(
+                        (f"H1+{MEM_I}", 1.0),
+                        (f"BYTE_INDEX_{byte_k}", 1.0),
+                        ("MEM_ADDR_SRC", 1.0),
+                    ),
+                    threshold=2.5,
+                    writes=((f"{band}+0", WRITE),),
+                    scope=f"H1 and BYTE_INDEX_{byte_k} and MEM_ADDR_SRC",
+                )
+            )
+    return tuple(rules)
+
+
+def _layer14_mem_addr_src_default_suppress_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_mem_addr_src_default_suppress_rules(S))
+    return ir
+
+
 def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
     """L14 FFN: Cancel the L3 ``mem_byte_0_default`` baseline at SI/SC stores.
 
@@ -2310,13 +2378,29 @@ def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
     the chain layout (2 marker units + 6 byte-index units).
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_mem_addr_src_default_suppress
         ffn = block.ffn
         start_unit = _l14_chain_alloc("layer14_mem_addr_src_default_suppress")
-        next_unit = _set_layer14_mem_addr_src_default_suppress(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_mem_addr_src_default_suppress_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
         )
+        next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
         ffn._l14_unit_counter = next_unit
+
+    # Dim-ownership claims (W_down output cells). The 8 units start at the
+    # chain offset and are arranged LO/HI per (marker, byte0, byte1, byte2);
+    # every unit writes its band's OUTPUT_*+0 cell.
+    _claims = set()
+    _start = _l14_chain_alloc("layer14_mem_addr_src_default_suppress")
+    for _i, _band in enumerate(
+        ("OUTPUT_LO", "OUTPUT_HI",
+         "OUTPUT_LO", "OUTPUT_HI",
+         "OUTPUT_LO", "OUTPUT_HI",
+         "OUTPUT_LO", "OUTPUT_HI")
+    ):
+        _claims.add((14, "ffn_W_down", str(_start + _i), f"{_band}+0"))
 
     return Operation(
         name="layer14_mem_addr_src_default_suppress",
@@ -2326,17 +2410,18 @@ def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
-        # Phase 7 declarative-authority audit: this op's bake reaches the
-        # ``_set_layer14_*`` legacy helper, but the helper's writes ARE
-        # the declared rule program (counter-write against the L3
-        # ``MEM DEFAULT`` baseline gated by ``MEM_ADDR_SRC=1``). Mark
-        # explicitly as declarative so the audit classifier doesn't fall
-        # back to the ``_set_*`` heuristic and flag it as a legacy
-        # wrapper. Matches the sibling L14 cleanup-chain ops which use
-        # ``spec_generated`` alongside an explicit ``compiler_ir=`` rule
-        # bundle; this op pre-dates the IR factorisation but the bake
-        # behaviour is identical in intent.
-        declarative_authority="declarative",
+        # Phase 7.C migration (this wave): the bake now lowers the
+        # declarative rule program ``_layer14_mem_addr_src_default_suppress_ir``
+        # through ``CompilerIR.lower_ffn`` instead of calling the imperative
+        # ``vm_step._set_layer14_mem_addr_src_default_suppress`` helper. The
+        # rules (counter-write against the L3 ``MEM DEFAULT`` baseline gated
+        # by ``MEM_ADDR_SRC=1``) are byte-identical to the legacy writes --
+        # proven by ``tools/verify_l14_mem_default_suppress_migration.py``.
+        # ``spec_generated`` now matches the sibling cleanup-chain ops that
+        # carry an explicit ``compiler_ir=`` rule bundle.
+        declarative_authority="spec_generated",
+        compiler_ir=_layer14_mem_addr_src_default_suppress_ir(),
+        claims=_claims,
         # Phase 8.A.4: use ``target_op_name`` to bind to whichever layer
         # the compiler placed ``layer14_mem_generation`` (the L14 attn
         # op). Matches the convention used by the other L14 cleanup ops.
@@ -2360,6 +2445,79 @@ def make_layer14_mem_addr_src_default_suppress_op() -> Operation:
             "OUTPUT_HI": "MEM_addr1",
         },
     )
+
+
+def _layer14_jsr_mem_default_suppress_rules(S: float) -> tuple[FFNRule, ...]:
+    """FFNRule program for ``_set_layer14_jsr_mem_default_suppress``.
+
+    4 ungated (``constant_write``) hidden units that cancel the L3
+    ``MEM DEFAULT`` +0.940 baseline at the PSH/JSR/ENT store path
+    (``MEM_STORE=1 AND MEM_ADDR_SRC=0``). Mirrors the imperative helper
+    cell-for-cell:
+
+      * 2 marker units (LO/HI nibble): fire when MARK_MEM=1 AND
+        MEM_STORE=1 AND MEM_ADDR_SRC=0. Imperative ``W_up[MARK_MEM]=S`` +
+        ``W_up[MEM_STORE]=S`` + ``W_up[MEM_ADDR_SRC]=-S`` + ``b_up=-S*1.5``
+        -> ``conditions=(("MARK_MEM",1.0),("MEM_STORE",1.0),
+        ("MEM_ADDR_SRC",-1.0))``, ``threshold=1.5``.
+      * 2 byte units (LO/HI nibble for BYTE_INDEX_0 only -- the narrowed
+        scope): fire when H1[MEM]=1 AND BYTE_INDEX_0=1 AND MEM_STORE=1 AND
+        MEM_ADDR_SRC=0. Imperative adds ``W_up[H1+MEM_I]=S`` +
+        ``W_up[BYTE_INDEX_0]=S`` + ``b_up=-S*2.5`` -> four conditions,
+        ``threshold=2.5``.
+
+    The ``MEM_ADDR_SRC=-1.0`` condition (negative weight, ``W_up=-S``)
+    is what makes the gate ``MEM_STORE AND NOT MEM_ADDR_SRC`` -- it
+    drives the SiLU below threshold for SI/SC (MEM_ADDR_SRC=1). Each
+    unit writes ``-2.0/S`` into the LO/HI nibble's OUTPUT cell.
+    The legacy helper used the ungated form (``b_gate=1.0``, no
+    ``W_gate`` content dim) -> the ``gate=None`` (``constant_write``)
+    path here, byte-identically.
+    """
+    MEM_I = 4  # MEM marker index in MARKS array
+    WRITE = -2.0 / S
+    rules: list[FFNRule] = []
+
+    # Marker rule (MARK_MEM AND MEM_STORE AND NOT MEM_ADDR_SRC), LO/HI.
+    for band in ("OUTPUT_LO", "OUTPUT_HI"):
+        rules.append(
+            multi_way_and_rule(
+                name=f"l14_jsr_mem_suppress_marker_{band.lower()}",
+                conditions=(
+                    ("MARK_MEM", 1.0),
+                    ("MEM_STORE", 1.0),
+                    ("MEM_ADDR_SRC", -1.0),
+                ),
+                threshold=1.5,
+                writes=((f"{band}+0", WRITE),),
+                scope="MARK_MEM and MEM_STORE and not MEM_ADDR_SRC",
+            )
+        )
+
+    # Byte rule (H1[MEM] AND BYTE_INDEX_0 AND MEM_STORE AND NOT
+    # MEM_ADDR_SRC), LO/HI. Narrowed to BYTE_INDEX_0 (MEM_addr1) only.
+    for band in ("OUTPUT_LO", "OUTPUT_HI"):
+        rules.append(
+            multi_way_and_rule(
+                name=f"l14_jsr_mem_suppress_byte0_{band.lower()}",
+                conditions=(
+                    (f"H1+{MEM_I}", 1.0),
+                    ("BYTE_INDEX_0", 1.0),
+                    ("MEM_STORE", 1.0),
+                    ("MEM_ADDR_SRC", -1.0),
+                ),
+                threshold=2.5,
+                writes=((f"{band}+0", WRITE),),
+                scope="H1 and BYTE_INDEX_0 and MEM_STORE and not MEM_ADDR_SRC",
+            )
+        )
+    return tuple(rules)
+
+
+def _layer14_jsr_mem_default_suppress_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_jsr_mem_default_suppress_rules(S))
+    return ir
 
 
 def make_layer14_jsr_mem_default_suppress_op() -> Operation:
@@ -2399,13 +2557,25 @@ def make_layer14_jsr_mem_default_suppress_op() -> Operation:
     See VAR_CLUSTER_JSR_PATH_FINDINGS_2026_06_06.md.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer14_jsr_mem_default_suppress
         ffn = block.ffn
         start_unit = _l14_chain_alloc("layer14_jsr_mem_default_suppress")
-        next_unit = _set_layer14_jsr_mem_default_suppress(
-            ffn, S, _as_setdim_proxy(dim_positions), start_unit=start_unit
+        ir = _layer14_jsr_mem_default_suppress_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
         )
+        next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
         ffn._l14_unit_counter = next_unit
+
+    # Dim-ownership claims (W_down output cells). 4 units: LO/HI for the
+    # MEM marker rule then LO/HI for the BYTE_INDEX_0 rule.
+    _claims = set()
+    _start = _l14_chain_alloc("layer14_jsr_mem_default_suppress")
+    for _i, _band in enumerate(
+        ("OUTPUT_LO", "OUTPUT_HI", "OUTPUT_LO", "OUTPUT_HI")
+    ):
+        _claims.add((14, "ffn_W_down", str(_start + _i), f"{_band}+0"))
 
     return Operation(
         name="layer14_jsr_mem_default_suppress",
@@ -2415,15 +2585,17 @@ def make_layer14_jsr_mem_default_suppress_op() -> Operation:
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
-        # Phase 7 declarative-authority audit: same rationale as the
-        # SI/SC sibling ``layer14_mem_addr_src_default_suppress`` above.
-        # The bake calls a ``_set_layer14_*`` legacy helper, but the
-        # helper IS the rule program (counter-write against the L3
-        # ``MEM DEFAULT`` baseline gated by ``MEM_STORE=1 AND
-        # MEM_ADDR_SRC=0`` for PSH/JSR/ENT). Mark explicitly as
-        # declarative so the audit classifier doesn't flag it as a
-        # legacy wrapper.
-        declarative_authority="declarative",
+        # Phase 7.C migration (this wave): the bake now lowers the
+        # declarative rule program ``_layer14_jsr_mem_default_suppress_ir``
+        # through ``CompilerIR.lower_ffn`` instead of calling the imperative
+        # ``vm_step._set_layer14_jsr_mem_default_suppress`` helper. The rules
+        # (counter-write against the L3 ``MEM DEFAULT`` baseline gated by
+        # ``MEM_STORE=1 AND NOT MEM_ADDR_SRC`` for PSH/JSR/ENT) are
+        # byte-identical to the legacy writes -- proven by
+        # ``tools/verify_l14_mem_default_suppress_migration.py``.
+        declarative_authority="spec_generated",
+        compiler_ir=_layer14_jsr_mem_default_suppress_ir(),
+        claims=_claims,
         # Phase 8.A.4: use ``target_op_name`` to bind to whichever layer
         # the compiler placed ``layer14_mem_generation`` (the L14 attn
         # op). Matches the convention used by the other L14 cleanup ops.
