@@ -138,3 +138,97 @@ investment until the basic JSR roundtrip is fixed. Concretely:
   marker, L679-713)
 - `c4_release/scripts/debug/trace_jsr_lev_simple.py` (existing trace
   harness, extend it)
+
+---
+
+## 2026-06-12 spec_k=0 re-probe (agent adfb7a9) — root PINNED to L7 operand_gather head 1 (BP/SP→ALU on spurious OP_ENT); no in-scope or discrete-gate fix
+
+A fresh, hook-free, spec_k=0 ground-truth investigation (`tools/probe_groundtruth.py`
+`residual_at` / `_final_context`, one model build, ~6 throwaway traces, all removed,
+NO production weight change) pins the IMM-in-callee corruption to a **single
+mechanism** and proves there is **no declarative gate to fix it** in or out of
+the briefed JSR scope.
+
+### Method: three-way isolation
+- `CONTROL = IMM 42; EXIT` — first-step IMM, PASSES (AX=42).
+- `NONFIRST = IMM 1; PSH; IMM 42; EXIT` — **non-first-step IMM, no call frame**,
+  PASSES (AX=42). The critical control the prior agents lacked.
+- `SIMPLE = JSR 3; EXIT; NOP; ENT 0; IMM 42; LEV` — callee IMM, FAILS (AX=8 →
+  carried → 208/17).
+
+The IMM step in all three is probed at its REG_AX marker across the 37 physical
+blocks (logical map: blk6=L6, blk7=L7, blk8/9=L8 AddSub, blk10=L9, blk11=L10).
+
+### What diverges (and what does NOT)
+- **The operand IS gathered correctly through L7 (blk7):** all three reach
+  `ALU_LO=12(nibble for value-4-lo), ALU_HI=4`. SIMPLE's blk7 operand bands are
+  **byte-identical** to the passing NONFIRST.
+- **The DISCRETE gates at the IMM-step AX marker are byte-identical** across
+  CONTROL / NONFIRST / SIMPLE: `OP_IMM=0, OP_ENT=1, OP_PSH=1, OP_LEA/ADJ/LEV=0,
+  MARK_AX=1, HAS_SE=0` after both L6 and L7. So `OP_ENT=1 at the IMM AX marker
+  is NORMAL` (confirms the af3960a/a6e7d80 notes) — it is **not** a mis-decode,
+  and there is no opcode/marker flag that separates the failing callee IMM from
+  the passing non-call IMM.
+- **The ONLY input difference is value-level:** `CLEAN_EMBED_HI` = `8(mag 40)`
+  in CONTROL (the L5 head-3 **first-step 40× FETCH amplification**, gated
+  `HAS_SE=0` first-step only) vs `0(mag 1)` in BOTH NONFIRST and SIMPLE.
+
+### The corruptor (PINNED)
+At **L7 (blk7) `_layer7_operand_gather_head_specs` head 1**
+(`l7_ops.py:263-287`): Q is gated **positively on OP_ENT/OP_LEA/OP_ADJ**
+(`AP(0, BD.OP_ENT, L)`), K attends `MARK_BP`/`MARK_SP`, V copies OUTPUT, O writes
+`ALU_LO/HI` at **scale 6.0**. Head 0 (the legit STACK0-byte0→ALU operand gather)
+is **SUPPRESSED** by `AP(0, BD.OP_ENT, -L)` whenever OP_ENT is active.
+
+So on the callee IMM step (OP_ENT spuriously 1): head 0 is OFF (the real operand
+does not reach ALU at full strength), and **head 1 FIRES and pulls the call
+frame's BP/SP register value into ALU** (`ALU_LO=1` at **magnitude 81**, vs the
+clean operand's magnitude 1). L8 (blk8) then computes against the polluted ALU,
+writing `OUTPUT_HI[1]=+5` and `AX_CARRY_LO[2]=+90`; the emitted AX byte0 = **8**
+(the ENT frame constant). That 8 carries forward (L3 head 1) into the LEV-step
+AX_CARRY; **L16 `l16_lev_ax_carry_*` (l16_ops.py:256-322) faithfully routes the
+carried 8 → OUTPUT** → final 208/17. (L16 LEV routing is CORRECT — it restores
+whatever AX it is handed; the bug is purely the upstream callee-IMM corruption.)
+
+### Why CONTROL passes but NONFIRST/SIMPLE differ
+- CONTROL: first-step 40× amplification makes the operand magnitude 40, which
+  **overpowers** head 1's corruption.
+- NONFIRST: no 40× (non-first step), operand magnitude 1 — but there is **no
+  frame data** for head 1's BP/SP gather to find, so head 1 is harmless → passes.
+- SIMPLE: no 40× AND head 1 finds the live JSR/ENT frame → corruption magnitude
+  81 buries the magnitude-1 operand → fails.
+
+### Why NO fix lands (in OR out of the briefed scope)
+1. **The corruptor is L7 operand_gather head 1 — explicitly OUT OF SCOPE** (the
+   brief reserves L7 heads 0/1 for a parallel agent; this session must not edit
+   them).
+2. **Even with scope, there is no discrete gate to hang a declarative rule on:**
+   the failing callee IMM and the passing non-call IMM have byte-identical
+   opcode/marker flags. The only separator is the value-level frame-memory
+   content head 1 attends to — not expressible as an FFN/attention gate without a
+   new "actual-opcode == IMM (not ENT)" signal the AX marker does not carry.
+3. The "make the callee tag OP_IMM not OP_ENT" path is upstream opcode-flag
+   decode (L4/L5/L6), also out of scope, and risky: OP_ENT=1 at the AX marker is
+   the *shared normal state* the 46 passing tests rely on.
+
+### Candidate fix directions (for a future, broad-tree, in-scope owner)
+- **(A) Amplify the legit operand on subsequent steps** so head 0's STACK0→ALU
+  (or the L6 IMM-carry-refresh) beats head 1's frame gather — e.g. extend the L5
+  head-3 40× amplification (or an L6/L7 equivalent) to non-first IMM steps. HIGH
+  RISK: touches the shared operand path used by all non-first-step IMM (memory /
+  var / expr clusters). Must be byte-identity-gated against those.
+- **(B) Make head 1 require a *real* ENT/LEA/ADJ opcode** (a clean
+  actual-opcode-at-AX flag) so it stops firing on the spurious OP_ENT at IMM
+  steps. Needs a new opcode-flag dim/decode (L4/L5/L6 surface).
+- **(C) Per-step frame-context clear** of STACK0/BP/SP residue before the callee
+  body runs, so head 1's gather finds nothing (mirrors NONFIRST's passing case).
+  This is the "frame-boundary clear" the brief envisioned; it must be gated on a
+  callee-entry context the model does not currently expose discretely.
+
+func_* baseline (canonical runner, spec_k=0): **0 pass** (confirmed for the 48
+func_max/min ids reached before the 1200s OOM-split timeout; func_* is 0/150
+per all prior runs). simple_function pytest: **expected 0, got 17** (FAIL).
+Smoke baseline this session (authoritative `pytest tests/test_smoke.py`):
+**46 pass / 5 fail** {mul_basic, simple_function, eq_true, eq_false,
+mul_overflow}, 0 xfail — unchanged (no weight edit). Worktree left at the green
+baseline; throwaway probes removed.
