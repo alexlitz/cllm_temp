@@ -435,6 +435,14 @@ def all_core_ops(
         # Mirrors the JSR / LC / nocarry-ALU variants above; gates on
         # OP_ENT (broadcast by L7 head 7 V slot 4).
         make_layer14_ent_ax_bytes_zero_op(),
+        # SUB no-borrow multi-byte minuend-byte1 passthrough (2026-06-12):
+        # completes the multi-byte SUB result on the no-borrow path the
+        # borrow-gated L14 carry cascade cannot reach. Reads the minuend
+        # byte 1 that ``layer13_sub_minuend_relay`` deposits into
+        # STACK0_BYTE_VAL_1 and writes OUTPUT byte 1 when CARRY+2 (byte-0
+        # borrow-out) is absent. Byte-identical on 8-bit SUB; fixes the
+        # ~38 no-borrow 1096 ``sub`` cases (e.g. ``827 - 26``).
+        make_layer14_sub_noborrow_high_byte_passthrough_op(),
         # Phase 6 Wave 7 demo: pure-declaration corrective op. One
         # ``FFNRule`` + ``pin=None`` auto-fit + slim ``bake_fn`` wrapper.
         # Byte-identically a no-op on the live corpus -- the demo proves

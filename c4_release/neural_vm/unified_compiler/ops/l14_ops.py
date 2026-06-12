@@ -133,6 +133,14 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # L7 head 7 V slot 4) instead of ``OP_JSR``. Runs after
     # ``layer14_alu_nocarry_ax_bytes_zero`` in the cleanup chain.
     "layer14_ent_ax_bytes_zero":             (None,    4),
+    # SUB no-borrow multi-byte minuend-byte1 passthrough (2026-06-12).
+    # 16 units (one per minuend byte-1 nibble value): emits OUTPUT byte 1
+    # = relayed minuend byte 1 (STACK0_BYTE_VAL_1) at the SUB byte-1
+    # predictor row when there is NO byte-0 borrow (CARRY+2 absent).
+    # Completes the multi-byte SUB result that the borrow-gated L14 carry
+    # cascade cannot reach on the no-borrow path (sub_0 ``827-26``-class).
+    # See ``make_layer14_sub_noborrow_high_byte_passthrough_op``.
+    "layer14_sub_noborrow_high_byte_passthrough": (None, 16),
     # Phase 6 Wave 7 demo: pure-declaration corrective op. The op's single
     # rule is byte-identically a no-op on the live corpus -- it carries the
     # impossible condition ``CONST=-100`` so SiLU collapses to 0 and the
@@ -2907,6 +2915,153 @@ def make_layer14_ent_ax_bytes_zero_op() -> Operation:
     )
 
 
+# === L14 SUB no-borrow multi-byte minuend-byte1 passthrough =============
+# (2026-06-12) Mirrors the relay+cascade SUB fix (commit b7a3064a /
+# fe82f8c0) for the NO-BORROW path the borrow-gated cascade cannot reach.
+#
+# Root (spec_k=0): the L14 inter-byte borrow cascade
+# (``_l10_carry_propagation_rules.sub_rule_for``) computes byte 1 of a
+# multi-byte SUB as ``minuend_byte1 - 1`` and is gated on the byte-0
+# borrow-out (CARRY+2 at the byte-1 predictor row). When byte 0 does NOT
+# underflow (e.g. ``827 - 26`` -> ``0x3B - 0x1A = 0x21``, no borrow), the
+# cascade SUB cells never fire, so OUTPUT byte 1 stays at the 0x00 default
+# instead of ``minuend_byte1`` (the subtrahend's byte 1 is 0x00 for every
+# 1096 sub case, so ``result_byte1 = minuend_byte1 - 0 - 0``). That drops
+# the whole high byte -- ``827-26`` decodes as ``0x21`` not ``0x321``.
+#
+# ``layer13_sub_minuend_relay`` (L13 head 4) already delivers the pushed
+# minuend's byte 1 into STACK0_BYTE_VAL_1 at the SUB byte-1 predictor row
+# (BYTE_INDEX_0 + TEMP+9). This op reads that relayed value and, ONLY when
+# there is no byte-0 borrow (CARRY+2 absent), writes OUTPUT byte 1 =
+# STACK0_BYTE_VAL_1. The minuend byte 1 is <= 0x07 for the whole corpus
+# (operands < 1000), so it fits the low nibble and OUTPUT_HI byte 1 = 0.
+#
+# Discriminator verified spec_k=0 (block 15, SUB byte-1 predictor row):
+#   * no-borrow (827-26, 50-8):     CARRY+2 = 0.0  -> this op fires
+#   * borrow    (1537-87, 256-1, 0-1): CARRY+2 = 2.0 -> blocked (cascade)
+# So the borrow path (sub_16bit / sub_borrow / borrow-class 1096) is
+# untouched -- the cascade keeps owning it. For 8-bit SUB the relayed
+# minuend byte 1 is 0x00, so the write is byte-identical to the 0x00
+# default (sub_basic 50-8 -> 42 unchanged). The op gates on TEMP+9 (the
+# SUB byte-row selector, dark on ADD/everything else) so it never fires
+# off-SUB.
+
+
+def _layer14_sub_noborrow_high_byte_passthrough_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """16 rules: OUTPUT byte 1 = relayed minuend byte 1 on no-borrow SUB.
+
+    One rule per minuend-byte1 nibble value ``v`` (0..15). Each fires at
+    the SUB byte-1 predictor row -- ``TEMP+9`` (SUB byte selector) +
+    ``H1[AX]`` + ``IS_BYTE`` + ``BYTE_INDEX_0`` -- when ``STACK0_BYTE_VAL_1_LO
+    == v`` and there is NO byte-0 borrow (``CARRY+2`` blocked). The single
+    firing rule cancels OUTPUT_LO/HI byte 1 (the 0x00 default, cell 0 hot)
+    and sets OUTPUT_LO cell ``v`` so the byte-``v`` token wins argmax.
+
+    Byte-identity: ``v == 0`` (8-bit SUB) cancels every LO cell and
+    re-boosts cell 0 -- the same 0x00 the default emits. ``v > 0`` is the
+    corrective multi-byte path.
+    """
+    AX_I = 1
+    BORROW_BLOCK = -10.0  # CARRY+2 borrow-out blocker (no-borrow gate)
+    rules: list[FFNRule] = []
+    for v in range(16):
+        conditions = (
+            ("IS_BYTE", 1.0),
+            (f"H1+{AX_I}", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            (f"STACK0_BYTE_VAL_1_LO+{v}", 1.0),
+            # No-borrow gate: byte-0 borrow-out rides CARRY+2 at this row.
+            ("CARRY+2", BORROW_BLOCK),
+        )
+        # Cancel the 0x00 byte-1 default across both nibble bands, then
+        # boost LO cell v (net +5/S like the sibling *_ax_bytes_zero ops)
+        # and HI cell 0 so byte 1 = 0x0v.
+        writes: list[tuple[str, float]] = []
+        for k in range(16):
+            writes.append((f"OUTPUT_LO+{k}", -3.0 / S))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S))
+        writes.append((f"OUTPUT_LO+{v}", 8.0 / S))
+        writes.append(("OUTPUT_HI_THIS_STEP+0", 8.0 / S))
+        rules.append(
+            multi_way_and_rule(
+                name=f"l14_sub_noborrow_high_byte_v{v:x}",
+                conditions=conditions,
+                # All five real conditions on (one-hot) -> 5.0; missing any
+                # drops below 4.5. CARRY+2 (-10) hard-blocks the borrow row.
+                threshold=4.5,
+                gate="TEMP+9",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=tuple(writes),
+                scope=(
+                    "TEMP+9 and IS_BYTE and H1+1 and BYTE_INDEX_0 "
+                    "and not CARRY+2"
+                ),
+            )
+        )
+    return tuple(rules)
+
+
+def _layer14_sub_noborrow_high_byte_passthrough_ir(
+    S: float = 100.0,
+) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(
+        _layer14_sub_noborrow_high_byte_passthrough_rules(S)
+    )
+    return ir
+
+
+def make_layer14_sub_noborrow_high_byte_passthrough_op() -> Operation:
+    """L14 FFN: emit OUTPUT byte 1 = relayed minuend byte 1 on no-borrow SUB.
+
+    Completes the multi-byte SUB result on the no-borrow path that the
+    borrow-gated L14 carry cascade cannot reach. Reads the minuend byte 1
+    that ``layer13_sub_minuend_relay`` deposits into STACK0_BYTE_VAL_1 at
+    the SUB byte-1 predictor row. See the module comment block above for
+    the root cause, the CARRY+2 no-borrow discriminator, and the
+    byte-identity property (8-bit SUB unchanged; borrow path owned by the
+    cascade). 1096 ``sub`` cluster: covers the ~38 no-borrow multi-byte
+    cases (e.g. ``sub_0: 827 - 26``).
+    """
+    def bake(block, dim_positions, S):
+        ffn = block.ffn
+        start_unit = _l14_chain_alloc(
+            "layer14_sub_noborrow_high_byte_passthrough"
+        )
+        ir = _layer14_sub_noborrow_high_byte_passthrough_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(
+            ffn, dim_map, start_unit=start_unit, S=S,
+        )
+        _guard_l14_output_units_on_step_boundary(
+            ffn, dim_positions, S, start_unit, next_unit
+        )
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_sub_noborrow_high_byte_passthrough",
+        slot_share=("ffn_units",),
+        reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_0", "CARRY",
+               "STACK0_BYTE_VAL_1_LO", "CONST"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir=_layer14_sub_noborrow_high_byte_passthrough_ir(),
+        declarative_authority="spec_generated",
+        target_op_name="layer14_mem_generation",
+        migrated=True,
+        requires={"after": "layer14_mem_generation"},
+        spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+    )
+
+
 # === L14 Phase 6 Wave 7 demo: pure-declaration corrective op =============
 #
 # A minimal demonstration of the declarative IR vision: adding a fix is one
@@ -3054,16 +3209,19 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
             "layer14_alu_nocarry_ax_bytes_zero",
             "layer14_mem_generation",
         ]},
-        # New chain tail: prior ops fill [0, 1890), the demo's auto-fit
-        # picks unit 1890 (single-unit rule), so the cumulative max is 1891.
+        # New chain tail: prior ops fill [0, 1906), the demo's auto-fit
+        # picks unit 1906 (single-unit rule), so the cumulative max is 1907.
         # Var-cluster JSR-path follow-up (2026-06-06) added units between
         # ``mem_addr_src_default_suppress`` and ``addr_key_neural_decode``
         # (``jsr_mem_default_suppress``); the same-day narrowing reduced
         # that from 8 to 4. Wave 1 Cluster B1 (2026-06-07) added
         # ``layer14_ent_ax_bytes_zero`` (4 units) after
-        # ``alu_nocarry_ax_bytes_zero``, shifting demo from 1886 to 1890
-        # → tail = 1891.
-        ffn_units_used=1891,
+        # ``alu_nocarry_ax_bytes_zero``, shifting demo from 1886 to 1890.
+        # Multi-byte SUB follow-up (2026-06-12) added
+        # ``layer14_sub_noborrow_high_byte_passthrough`` (16 units) after
+        # ``layer14_ent_ax_bytes_zero``, shifting demo from 1890 to 1906
+        # → tail = 1907.
+        ffn_units_used=1907,
         smoke_tests=set(),
         spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
     )
