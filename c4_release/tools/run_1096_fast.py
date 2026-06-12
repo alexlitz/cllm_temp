@@ -62,6 +62,16 @@ class ProgramResult:
     status: str  # "ok", "fail", "error"
     error: Optional[str] = None
 
+    # Full-trace (fail-fast) divergence point, populated only by the
+    # ``--fail-fast`` path in run_1096_canonical.py. ``divergence_step`` is the
+    # 0-based VM step where the model's decoded (PC, AX) first diverged from the
+    # declarative oracle; the expected/got pairs are that step's register state.
+    divergence_step: Optional[int] = None
+    expected_pc: Optional[int] = None
+    expected_ax: Optional[int] = None
+    got_pc: Optional[int] = None
+    got_ax: Optional[int] = None
+
     def to_row(self) -> str:
         if self.status == "ok":
             tag = "OK  "

@@ -112,6 +112,33 @@ _UNPREDICTED_BUCKET_KEY = "unpredicted"
 # would-be emission for any correct C4 program.
 _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
+
+def _step_offset_field(offset: int) -> str:
+    """Human-readable name for a token offset inside a 35-token VM step.
+
+    Layout (see DraftVM.draft_tokens): REG_PC marker + 4 bytes, REG_AX + 4,
+    REG_SP + 4, REG_BP + 4, STACK0 + 4, MEM marker + 4 addr + 4 val, STEP_END.
+    Used by the fail-fast divergence report so a (step, offset) pair reads as
+    e.g. ``AX[1]`` (byte 1 of REG_AX) or ``PC_marker``.
+    """
+    offset = int(offset) % Token.STEP_TOKENS
+    if offset == 34:
+        return "STEP_END/HALT"
+    field_starts = (
+        (0, "PC"), (5, "AX"), (10, "SP"), (15, "BP"), (20, "STACK0"),
+        (25, "MEM"),
+    )
+    if offset >= 26:
+        # MEM section: marker(25) + addr bytes(26..29) + val bytes(30..33).
+        if offset <= 29:
+            return f"MEM_ADDR[{offset - 26}]"
+        return f"MEM_VAL[{offset - 30}]"
+    for start, name in reversed(field_starts):
+        if offset >= start:
+            rel = offset - start
+            return f"{name}_marker" if rel == 0 else f"{name}[{rel - 1}]"
+    return f"off{offset}"
+
 # Some opcodes are neural-authoritative in raw one-token decoding but are not
 # safe speculation boundaries yet. In particular, call-frame control changes
 # rewrite PC/SP/BP in ways where a long DraftVM continuation can poison the
@@ -184,6 +211,24 @@ class _ElementState:
     recent_rejections: deque = field(
         default_factory=lambda: deque(maxlen=_ADAPTIVE_WINDOW)
     )
+
+    # Fail-fast (full-token-trace) verdict fields. Populated only by
+    # ``_run_fail_fast``. ``ff_status`` is one of "pass" / "fail" / "error".
+    # On the FIRST safe-offset divergence the element is marked "fail" and the
+    # divergence point is recorded so the program is dropped from the active
+    # batch immediately (this is what makes the fail-fast measurement fast).
+    ff_status: Optional[str] = None
+    ff_div_step: Optional[int] = None      # 0-based VM step of the divergence
+    ff_expected_pc: Optional[int] = None   # oracle PC at the diverging step
+    ff_expected_ax: Optional[int] = None   # oracle AX at the diverging step
+    ff_got_pc: Optional[int] = None        # model's decoded PC at that step
+    ff_got_ax: Optional[int] = None        # model's decoded AX at that step
+    # Per-step oracle reference: (pc, ax) the declarative DraftVM holds AFTER
+    # each VM step. ``ff_steps_checked`` is how many completed steps have been
+    # compared so far (so the fail-fast loop only checks newly-completed ones).
+    ff_oracle_steps: Optional[list] = None
+    ff_steps_checked: int = 0
+
     def exec_pc(self) -> int:
         return PC_OFFSET if self.last_pc is None else self.last_pc
 
@@ -1017,6 +1062,219 @@ class BatchedPureNeuralRunner:
         )
 
     # ------------------------------------------------------------------
+    # Fail-fast (full-token-trace) public entry point.
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def run_batch_fail_fast(
+        self,
+        bytecodes: List[List[int]],
+        *,
+        data_list: Optional[List[bytes]] = None,
+        argv_list: Optional[List[List[str]]] = None,
+        stdin_list: Optional[List[str]] = None,
+        expected_steps_list: Optional[List[Optional[int]]] = None,
+        max_steps: Optional[int] = None,
+        max_context_window: int = 512,
+        spec_k: int = 32,
+    ) -> List[dict]:
+        """Run N programs against the DraftVM/oracle per-step trace, fail-fast.
+
+        Unlike :meth:`run_batch` (which decodes the full horizon and compares
+        only the final EXIT code), this decodes the REAL production trace
+        (DraftVM proposes the oracle tokens, the model verifies ``spec_k``
+        steps ahead per forward and is the arbiter — byte-identity with
+        production) and, after EACH completed VM step, compares the model's
+        decoded ``(PC, AX)`` register state to the declarative DraftVM oracle's
+        ``(PC, AX)`` for that step. On the FIRST step where they disagree the
+        program FAILS and is dropped from the active batch immediately (this is
+        the speedup: a diverging program stops at its divergence step instead
+        of running the full horizon). A program PASSES iff every completed
+        step's ``(PC, AX)`` matches the oracle through HALT.
+
+        Why ``(PC, AX)`` and not raw tokens: this model emits register *bytes*
+        that legitimately read 0 on intermediate steps (cross-step zero
+        propagation) and re-anchors the first token of each step via the
+        Python STEP_END dispatch, so a flat-forward token-vs-oracle compare
+        flags every step boundary even for passing programs. The decoded
+        per-step ``(PC, AX)`` is the semantically meaningful state and is
+        exactly what determines control flow and the result; it is a strict
+        superset of the exit-code criterion (a program whose every step's
+        ``(PC, AX)`` matches the oracle necessarily exits with the oracle's
+        AX), so it catches the "lucky exit" cases (right final byte, wrong
+        intermediate state) that the exit-code criterion passes.
+
+        Returns one dict per program (input order) with keys:
+        ``status`` ("pass" / "fail" / "error"), ``divergence_step``,
+        ``expected_pc``, ``expected_ax``, ``got_pc``, ``got_ax``,
+        ``decoded_exit`` (the neural exit code at the stop point, for
+        cross-checking against the exit-code criterion).
+        """
+        B = len(bytecodes)
+        if B == 0:
+            return []
+        data_list = data_list or [b""] * B
+        argv_list = argv_list or [[]] * B
+        stdin_list = stdin_list or [""] * B
+        expected_steps_list = expected_steps_list or [None] * B
+
+        self._reset_kv_cache()
+        self._reset_spec_stats()
+
+        # ``spec_k <= 0`` would disable the DraftVM entirely, but fail-fast
+        # NEEDS the oracle trace, so clamp to at least 1 here. A positive K is
+        # the throughput knob (verify K steps per forward); correctness of the
+        # verdict is independent of K (the model is the arbiter at every slot).
+        eff_spec_k = spec_k if spec_k > 0 else 1
+
+        states = [
+            self._build_element(
+                bc,
+                data_list[i],
+                argv_list[i],
+                stdin_list[i],
+                spec_k=eff_spec_k,  # forces a DraftVM oracle per element
+                adaptive_start_k=0,
+                expected_steps=(
+                    expected_steps_list[i]
+                    if expected_steps_list is not None
+                    else None
+                ),
+            )
+            for i, bc in enumerate(bytecodes)
+        ]
+
+        # Precompute the per-step (PC, AX) oracle reference for every element
+        # from a FRESH DraftVM (the speculation DraftVM on the state is mutated
+        # by ``_sync_draft_vm`` during decode, so it cannot double as the
+        # reference). This is the declarative-byte-identity semantic trace.
+        for i, s in enumerate(states):
+            s.ff_oracle_steps = self._oracle_pc_ax_steps(
+                bytecodes[i],
+                data_list[i],
+                stdin_list[i],
+                expected_steps=(
+                    expected_steps_list[i]
+                    if expected_steps_list is not None
+                    else None
+                ),
+            )
+
+        self._run_fail_fast(
+            states,
+            max_steps=max_steps,
+            max_context_window=max_context_window,
+            spec_k=eff_spec_k,
+        )
+
+        results: List[dict] = []
+        for s in states:
+            # Any element that never tripped a per-step divergence and never
+            # hit an error is a PASS candidate. But a candidate must ALSO have
+            # the right final exit: a program can match the oracle on every
+            # step it COMPLETED yet halt EARLY (the model's PC trace decided
+            # EXIT was next before running the oracle's remaining steps) with a
+            # wrong exit code. That is a divergence too — recorded as a fail at
+            # the first un-run oracle step so full_trace stays a strict subset
+            # of exit_code.
+            decoded_exit = (
+                s.exit_code
+                if s.exit_code is not None
+                else self._decode_exit_code(s.context)
+            )
+            if s.ff_status is None:
+                oracle = s.ff_oracle_steps or []
+                completed = s.token_pos // Token.STEP_TOKENS
+                oracle_final_ax = (
+                    int(oracle[-1][1]) & 0xFFFFFFFF if oracle else None
+                )
+                de = (
+                    None if decoded_exit is None
+                    else int(decoded_exit) & 0xFFFFFFFF
+                )
+                if completed < len(oracle) and de != oracle_final_ax:
+                    # Halted before running every oracle step AND the exit
+                    # disagrees: divergence at the first un-run step.
+                    s.ff_status = "fail"
+                    s.ff_div_step = completed
+                    nxt = oracle[completed] if completed < len(oracle) else (None, None)
+                    s.ff_expected_pc = (
+                        None if nxt[0] is None else int(nxt[0]) & 0xFFFFFFFF
+                    )
+                    s.ff_expected_ax = oracle_final_ax
+                    s.ff_got_pc = (
+                        None if s.last_pc is None
+                        else int(s.last_pc) & 0xFFFFFFFF
+                    )
+                    s.ff_got_ax = de
+                elif oracle_final_ax is not None and de != oracle_final_ax:
+                    # Ran the whole oracle but the decoded exit still disagrees
+                    # (e.g. final-step AX truncation): fail at the final step.
+                    s.ff_status = "fail"
+                    s.ff_div_step = len(oracle) - 1
+                    s.ff_expected_pc = (
+                        int(oracle[-1][0]) & 0xFFFFFFFF if oracle else None
+                    )
+                    s.ff_expected_ax = oracle_final_ax
+                    s.ff_got_pc = (
+                        None if s.last_pc is None
+                        else int(s.last_pc) & 0xFFFFFFFF
+                    )
+                    s.ff_got_ax = de
+            status = s.ff_status or "pass"
+            results.append(
+                {
+                    "status": status,
+                    "divergence_step": s.ff_div_step,
+                    "expected_pc": s.ff_expected_pc,
+                    "expected_ax": s.ff_expected_ax,
+                    "got_pc": s.ff_got_pc,
+                    "got_ax": s.ff_got_ax,
+                    "decoded_exit": (
+                        None if decoded_exit is None
+                        else int(decoded_exit) & 0xFFFFFFFF
+                    ),
+                }
+            )
+        return results
+
+    def _oracle_pc_ax_steps(
+        self,
+        bytecode: List[int],
+        data,
+        stdin,
+        *,
+        expected_steps: Optional[int],
+    ) -> List[Tuple[int, int]]:
+        """Per-step ``(pc, ax)`` the declarative DraftVM holds AFTER each step.
+
+        This is the fail-fast oracle reference (declarative byte-identity). The
+        DraftVM is the same interpreter the speculation path trusts, so its
+        per-step register state is exactly the declarative semantics. Bounded
+        by ``expected_steps`` (the declarative halt horizon) plus a small slack
+        so a program that halts exactly at the horizon is fully covered.
+        """
+        cap = (int(expected_steps) + 2) if expected_steps else 4096
+        vm = DraftVM(list(bytecode))
+        if isinstance(data, (bytes, bytearray, list)):
+            for k, b in enumerate(data):
+                vm.memory[0x10000 + k] = int(b)
+        if stdin:
+            vm.set_stdin(stdin)
+        steps: List[Tuple[int, int]] = []
+        for _ in range(cap):
+            if vm.halted:
+                break
+            if not vm.step():
+                break
+            steps.append(
+                (int(vm.pc) & 0xFFFFFFFF, int(vm.ax) & 0xFFFFFFFF)
+            )
+            if vm.halted:
+                break
+        return steps
+
+    # ------------------------------------------------------------------
     # Core run path (no bucketing). Used directly by ``run_batch`` when
     # bucketing is disabled, and called per-bucket from ``_run_bucketed``.
     # ------------------------------------------------------------------
@@ -1552,6 +1810,252 @@ class BatchedPureNeuralRunner:
                                 s.recent_rejections.clear()
 
             tok_i += 1  # outer-iteration counter, not strict token count
+
+    # ------------------------------------------------------------------
+    # Fail-fast inner loop. Decodes the REAL production trace using the same
+    # DraftVM-drafts-then-model-verifies-and-corrects machinery as
+    # ``_run_speculative`` (so the emitted trace is byte-identity with
+    # production), then after EACH completed VM step compares the model's
+    # decoded ``(PC, AX)`` to the declarative oracle's ``(PC, AX)`` for that
+    # step. The FIRST mismatch FAILS + STOPS the element (drops it from the
+    # active batch -> the speed win). A program whose every completed step
+    # matches the oracle through HALT PASSES.
+    # ------------------------------------------------------------------
+
+    def _run_fail_fast(
+        self,
+        states: List[_ElementState],
+        *,
+        max_steps: Optional[int],
+        max_context_window: int,
+        spec_k: int,
+    ) -> None:
+        total_tokens = self._total_token_budget(states, max_steps)
+        STEP = Token.STEP_TOKENS
+        model_max_seq = int(getattr(self.model, "max_seq_len", max_context_window))
+
+        tok_i = 0
+        while tok_i < total_tokens:
+            active_idx = [i for i, s in enumerate(states) if not s.halted]
+            if not active_idx:
+                break
+            self._spec_stats["iterations"] += 1
+
+            # 1) Build per-element oracle drafts (teacher-forced from the
+            #    speculation DraftVM). These propose the next K*35 tokens; the
+            #    model verifies them and is the arbiter (byte-identity with
+            #    production). Drafts only fire at a clean step boundary.
+            drafts: List[List[int]] = []
+            for i in active_idx:
+                s = states[i]
+                d: List[int] = []
+                at_step_boundary = (s.token_pos % STEP == 0)
+                room_tokens = max(0, model_max_seq - len(s.context))
+                room_k = room_tokens // STEP
+                effective_k = max(0, min(spec_k, room_k))
+                if (
+                    not s.spec_disabled
+                    and s.draft_vm is not None
+                    and at_step_boundary
+                    and effective_k > 0
+                ):
+                    self._sync_draft_vm(s)
+                    for _step_j in range(effective_k):
+                        if not self._draft_opcode_safe_for_speculation(s.draft_vm):
+                            break
+                        if s.draft_vm.halted:
+                            break
+                        ok = s.draft_vm.step()
+                        if not ok:
+                            break
+                        d.extend(s.draft_vm.draft_tokens())
+                        if s.draft_vm.halted:
+                            break
+                if d:
+                    self._spec_stats["drafted"] += len(d)
+                else:
+                    self._spec_stats["no_draft_slots"] += 1
+                drafts.append(d)
+
+            # 2) Build padded tensor: context + oracle draft per element.
+            windowed_with_drafts: List[List[int]] = []
+            real_prefix_lens: List[int] = []
+            for k, i in enumerate(active_idx):
+                s = states[i]
+                ctx_win = list(s.context)
+                real_prefix_lens.append(len(ctx_win))
+                windowed_with_drafts.append(ctx_win + drafts[k])
+
+            if hasattr(self.model.embed, "set_mem_history_end"):
+                self.model.embed.set_mem_history_end(0)
+            if hasattr(self.model.embed, "set_mem_addr_src_positions"):
+                self.model.embed.set_mem_addr_src_positions(None)
+
+            gather_positions_per_row: List[List[int]] = []
+            for k, i in enumerate(active_idx):
+                prefix_len_k = real_prefix_lens[k]
+                draft_len = len(drafts[k])
+                count = draft_len if draft_len > 0 else 1
+                gather_positions_per_row.append(
+                    [prefix_len_k - 1 + j for j in range(count)]
+                )
+            preds_cpu, _pred_start, _ = self._forward_argmax_batch(
+                windowed_with_drafts,
+                active_idx,
+                first_logit_pos=min(real_prefix_lens) - 1,
+                allow_kv=not any(drafts),
+                protected_prefix_lens=[states[i].prefix_len for i in active_idx],
+                protected_mem_positions=None,
+                gather_positions=gather_positions_per_row,
+            )
+
+            # 3) For each element: verify the draft against the model's argmax
+            #    (same accept/correct rule as _run_speculative), replay the
+            #    accepted tokens + correction through _step_one, then compare
+            #    every NEWLY-completed step's decoded (PC, AX) to the oracle.
+            for k, i in enumerate(active_idx):
+                s = states[i]
+                if s.halted:
+                    continue
+                draft = drafts[k]
+                row_preds = preds_cpu[k]
+
+                if len(draft) == 0:
+                    # Pure single-token decode for this element (no spec budget
+                    # this iter, e.g. mid-step after a correction, or
+                    # speculation disabled). The model's argmax at prefix-1 is
+                    # the emitted token.
+                    next_tok = int(row_preds[0])
+                    self._step_one(s, next_tok, tok_i)
+                    self._ff_check_new_steps(s)
+                    continue
+
+                # Accept the matching draft prefix; the first SAFE-offset
+                # mismatch becomes the model's correction (the model is the
+                # arbiter). UNSAFE offsets (MEM addr/val bytes) are trusted from
+                # the DraftVM — the embedding's MEM metadata injection makes
+                # them disagree with the flat-forward argmax for EVERY program,
+                # so they are not a model emission we can read here.
+                base_pos = s.token_pos
+                accepted = 0
+                correction: Optional[int] = None
+                for j in range(len(draft)):
+                    offset = (base_pos + j) % STEP
+                    if offset in _UNSAFE_OFFSETS:
+                        accepted = j + 1
+                        continue
+                    if int(row_preds[j]) == int(draft[j]):
+                        accepted = j + 1
+                    else:
+                        correction = int(row_preds[j])
+                        break
+                self._spec_stats["accepted"] += accepted
+                if correction is None:
+                    self._spec_stats["full_accepts"] += 1
+                else:
+                    self._spec_stats["corrections"] += 1
+
+                emitted: List[int] = list(draft[:accepted])
+                if correction is not None:
+                    emitted.append(correction)
+
+                for tok in emitted:
+                    if s.halted:
+                        break
+                    self._step_one(s, tok, tok_i)
+                    # Check after every token so a step that completes mid-replay
+                    # is gated immediately (and we stop replaying a diverged
+                    # element's remaining accepted tokens).
+                    if self._ff_check_new_steps(s):
+                        break
+
+                # Persistent first-token rejection means the DraftVM is out of
+                # sync with this element; fall back to single-token decode for
+                # it (re-anchors across the step boundary) instead of spinning
+                # on guaranteed-rejected drafts. The per-step (PC, AX) gate is
+                # what actually decides pass/fail, independent of this.
+                if correction is not None and accepted == 0:
+                    self._spec_stats["first_token_rejects"] += 1
+                    s.spec_zero_streak += 1
+                    if s.spec_zero_streak >= 4:
+                        s.spec_disabled = True
+                else:
+                    s.spec_zero_streak = 0
+
+            tok_i += 1
+
+    @staticmethod
+    def _decode_step_register(step_tokens: List[int], marker: int) -> Optional[int]:
+        """Decode a 32-bit register from ONE 35-token VM-step slice.
+
+        Each step encodes ``marker + 4 little-endian value bytes`` per register.
+        We decode from the step's OWN slice (not a scan-back over the whole
+        context): a scan-back can return a stale prior-step value when the
+        current step's value bytes read 0 (the cross-step zero-propagation
+        class-of-bug), which makes the per-step compare spuriously diverge. The
+        slice decode reads exactly the bytes the model emitted for THIS step.
+        """
+        for i, tk in enumerate(step_tokens):
+            if tk == marker and i + 4 < len(step_tokens):
+                val = 0
+                for j in range(4):
+                    val |= (int(step_tokens[i + 1 + j]) & 0xFF) << (j * 8)
+                return val
+        return None
+
+    def _ff_check_new_steps(self, s: _ElementState) -> bool:
+        """Compare any newly-completed VM steps' (PC, AX) to the oracle.
+
+        Returns True iff a divergence was found (the element is then marked
+        ``ff_status="fail"`` + halted and dropped from the active batch). A
+        completed step is one whose 35 tokens are fully emitted into
+        ``s.context``; we decode that step's ``(PC, AX)`` from its own slice
+        ``context[prefix_len + step*35 : ... + 35]`` and compare to the oracle's
+        ``(pc, ax)`` for that step. ``token_pos // STEP_TOKENS`` is the number
+        of completed steps so far.
+        """
+        if s.ff_status is not None:
+            return s.ff_status == "fail"
+        STEP = Token.STEP_TOKENS
+        completed = s.token_pos // STEP
+        oracle = s.ff_oracle_steps or []
+        while s.ff_steps_checked < completed:
+            step_idx = s.ff_steps_checked
+            start = s.prefix_len + step_idx * STEP
+            step_tokens = s.context[start:start + STEP]
+            g_pc = self._decode_step_register(step_tokens, Token.REG_PC)
+            g_ax = self._decode_step_register(step_tokens, Token.REG_AX)
+            g_ax = None if g_ax is None else (g_ax & 0xFFFFFFFF)
+            g_pc = None if g_pc is None else (g_pc & 0xFFFFFFFF)
+
+            if step_idx >= len(oracle):
+                # Model ran MORE steps than the oracle declares before halting:
+                # it failed to halt where the declarations say it must.
+                s.ff_status = "fail"
+                s.ff_div_step = step_idx
+                s.ff_expected_pc = None
+                s.ff_expected_ax = None
+                s.ff_got_pc = g_pc
+                s.ff_got_ax = g_ax
+                s.exit_code = None
+                s.halted = True
+                return True
+
+            o_pc, o_ax = oracle[step_idx]
+            o_pc &= 0xFFFFFFFF
+            o_ax &= 0xFFFFFFFF
+            if g_pc != o_pc or g_ax != o_ax:
+                s.ff_status = "fail"
+                s.ff_div_step = step_idx
+                s.ff_expected_pc = o_pc
+                s.ff_expected_ax = o_ax
+                s.ff_got_pc = g_pc
+                s.ff_got_ax = g_ax
+                s.exit_code = None
+                s.halted = True
+                return True
+            s.ff_steps_checked += 1
+        return False
 
     @staticmethod
     def _total_token_budget(

@@ -440,12 +440,63 @@ def _score_neural_results(
     return out
 
 
+def _score_fail_fast_results(
+    chunk: List[Tuple[int, int, str, int, int, list, bytes]],
+    ff_results: List[dict],
+) -> List[ProgramResult]:
+    """Turn one chunk's ``run_batch_fail_fast`` output into ``ProgramResult``s.
+
+    The full-trace criterion: PASS iff every completed VM step's decoded
+    ``(PC, AX)`` matched the declarative oracle through HALT. A FAIL records the
+    divergence point (step + expected/got register state) — a debugging
+    goldmine for the fix agents. ``error`` means the fail-fast decode could not
+    produce a verdict (e.g. ran out of context room before any oracle token).
+    """
+    out: List[ProgramResult] = []
+    for entry, r in zip(chunk, ff_results):
+        idx, expected, description, decl_exit, decl_steps, _, _ = entry
+        status_raw = r.get("status")
+        if status_raw == "pass":
+            status = "ok"
+            err = None
+        elif status_raw == "error":
+            status = "error"
+            err = "fail-fast: decode produced no verdict"
+        else:
+            status = "fail"
+            div = r.get("divergence_step")
+            err = (
+                f"full-trace divergence at step {div}: "
+                f"expected (pc={r.get('expected_pc')}, ax={r.get('expected_ax')}) "
+                f"got (pc={r.get('got_pc')}, ax={r.get('got_ax')})"
+            )
+        out.append(
+            ProgramResult(
+                idx=idx,
+                description=description,
+                suite_expected=expected,
+                declarative_exit=decl_exit,
+                declarative_steps=decl_steps,
+                neural_exit=r.get("decoded_exit"),
+                status=status,
+                error=err,
+                divergence_step=r.get("divergence_step"),
+                expected_pc=r.get("expected_pc"),
+                expected_ax=r.get("expected_ax"),
+                got_pc=r.get("got_pc"),
+                got_ax=r.get("got_ax"),
+            )
+        )
+    return out
+
+
 def _run_one_chunk_with_oom_retry(
     neural_runner,
     chunk: List[Tuple[int, int, str, int, int, list, bytes]],
     *,
     spec_k: int,
     max_context_window: int,
+    fail_fast: bool = False,
 ) -> List[ProgramResult]:
     """Run one chunk, halving the batch on CUDA OOM and retrying.
 
@@ -463,6 +514,16 @@ def _run_one_chunk_with_oom_retry(
     import torch
 
     try:
+        if fail_fast:
+            ff_results = neural_runner.run_batch_fail_fast(
+                [e[5] for e in chunk],
+                data_list=[e[6] for e in chunk],
+                max_steps=None,
+                expected_steps_list=[e[4] for e in chunk],
+                max_context_window=max_context_window,
+                spec_k=(spec_k if spec_k > 0 else 32),
+            )
+            return _score_fail_fast_results(chunk, ff_results)
         neural_results = neural_runner.run_batch(
             [e[5] for e in chunk],
             data_list=[e[6] for e in chunk],
@@ -503,6 +564,7 @@ def _run_one_chunk_with_oom_retry(
                 chunk[:mid],
                 spec_k=spec_k,
                 max_context_window=max_context_window,
+                fail_fast=fail_fast,
             )
         )
         _empty_cuda_cache()
@@ -512,6 +574,7 @@ def _run_one_chunk_with_oom_retry(
                 chunk[mid:],
                 spec_k=spec_k,
                 max_context_window=max_context_window,
+                fail_fast=fail_fast,
             )
         )
         return out
@@ -526,6 +589,7 @@ def _run_chunks_streaming(
     mem_step_scale: float,
     fixed_chunk: Optional[int],
     checkpoint_path: Optional[str],
+    fail_fast: bool = False,
 ) -> List[ProgramResult]:
     """Run prepared programs through the neural runner in length-aware chunks.
 
@@ -579,6 +643,7 @@ def _run_chunks_streaming(
                     chunk,
                     spec_k=spec_k,
                     max_context_window=max_context_window,
+                    fail_fast=fail_fast,
                 )
             except Exception as exc:  # noqa: BLE001 (non-OOM hard failure)
                 tb = traceback.format_exc(limit=3)
@@ -725,7 +790,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--print-failures", action="store_true",
         help="Stream each non-passing program row to stdout.",
     )
+    parser.add_argument(
+        "--fail-fast", action="store_true",
+        help="Use the FULL-TOKEN-TRACE criterion (a.k.a. --criterion "
+             "full_trace): decode the real production trace and, after EACH "
+             "VM step, compare the model's decoded (PC, AX) to the declarative "
+             "DraftVM oracle. FAIL + STOP a program on the FIRST diverging "
+             "step (drop it from the batch -> dramatically faster than running "
+             "the full horizon). PASS = every step matches through HALT. This "
+             "is stricter than the default exit-code criterion (it catches the "
+             "'lucky exit' programs: right final byte, wrong intermediate "
+             "state) and the --output JSON records each FAIL's divergence "
+             "point. Reuses the spec_k path (the DraftVM teacher-forces the "
+             "oracle tokens, the model verifies k-ahead per forward).",
+    )
+    parser.add_argument(
+        "--criterion", type=str, default=None,
+        choices=["exit_code", "full_trace"],
+        help="Pass criterion. 'exit_code' (default) = neural EXIT == "
+             "declarative EXIT (the canonical suite criterion). 'full_trace' "
+             "= the per-step (PC, AX) fail-fast criterion (equivalent to "
+             "--fail-fast). When both are given they must agree.",
+    )
     args = parser.parse_args(argv)
+
+    # ``--fail-fast`` and ``--criterion full_trace`` are the same mode.
+    if args.criterion == "full_trace":
+        args.fail_fast = True
+    if args.fail_fast and args.criterion == "exit_code":
+        parser.error("--fail-fast conflicts with --criterion exit_code")
+    criterion_name = "full_trace" if args.fail_fast else "exit_code"
 
     # Match run_1096_fast: only set a default device if the caller hasn't.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -742,8 +836,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         f"chunk={'mem-safe' if args.chunk <= 0 else args.chunk} "
         f"mem_step_scale={args.mem_step_scale} "
         f"spec_k={args.spec_k} max_steps_cap={args.max_steps_cap} "
+        f"criterion={criterion_name} "
         f"alloc_conf={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '<unset>')} "
-        f"(suite-exact criterion; pure-neural path) "
+        f"(pure-neural path) "
         f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
         file=sys.stderr,
         flush=True,
@@ -799,6 +894,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         mem_step_scale=float(args.mem_step_scale),
         fixed_chunk=fixed_chunk,
         checkpoint_path=checkpoint_path,
+        fail_fast=args.fail_fast,
     )
 
     all_results: List[ProgramResult] = (
@@ -818,7 +914,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # xfail). The canonical headline number is PASS / total. Skipped programs
     # are reported separately and are NEVER counted as pass.
     print(
-        f"\n[1096-canonical] CANONICAL SCORE: {pass_n}/{total_n} PASS "
+        f"\n[1096-canonical] CANONICAL SCORE [{criterion_name}]: "
+        f"{pass_n}/{total_n} PASS "
         f"({100.0 * pass_n / total_n:.2f}%)  "
         f"[fail={fail_n} error={err_n} skipped(>cap)={skip_n}]  "
         f"wall={total_elapsed:.1f}s",
@@ -828,6 +925,29 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     table = _cluster_breakdown(all_results)
     _print_cluster_table(table)
+
+    # In fail-fast mode, surface a few sample divergence reports to stderr —
+    # a debugging goldmine for the fix agents (step + expected/got register
+    # state at the FIRST diverging step).
+    if args.fail_fast:
+        diverged = [
+            r for r in all_results
+            if r.status == "fail" and r.divergence_step is not None
+        ]
+        if diverged:
+            print(
+                f"\n[1096-canonical] full-trace divergence samples "
+                f"(first {min(15, len(diverged))} of {len(diverged)} fails):",
+                file=sys.stderr,
+            )
+            for r in diverged[:15]:
+                print(
+                    f"    id={r.idx:04d} {cluster_of(r.description):16s} "
+                    f"step={r.divergence_step} "
+                    f"expected(pc={r.expected_pc},ax={r.expected_ax}) "
+                    f"got(pc={r.got_pc},ax={r.got_ax})  {r.description}",
+                    file=sys.stderr,
+                )
 
     if args.print_failures:
         for r in all_results:
@@ -839,11 +959,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump(
                 {
                     "wall_seconds": total_elapsed,
+                    "criterion_name": criterion_name,
                     "criterion": (
-                        "suite-exact: compile_c ok AND "
-                        "decl_exit==(suite_expected & 0xFFFFFFFF) AND "
-                        "neural_exit==decl_exit (both masked 0xFFFFFFFF); "
-                        "pure-neural batched path"
+                        (
+                            "full_trace (fail-fast): compile_c ok AND "
+                            "decl_exit==(suite_expected & 0xFFFFFFFF) AND "
+                            "every completed VM step's decoded (PC, AX) matches "
+                            "the declarative DraftVM oracle through HALT; STOPS "
+                            "on the FIRST diverging step (divergence point "
+                            "recorded per result). pure-neural batched path"
+                        )
+                        if args.fail_fast else
+                        (
+                            "exit_code (suite-exact): compile_c ok AND "
+                            "decl_exit==(suite_expected & 0xFFFFFFFF) AND "
+                            "neural_exit==decl_exit (both masked 0xFFFFFFFF); "
+                            "pure-neural batched path"
+                        )
                     ),
                     "spec_k": args.spec_k,
                     "chunk": (
