@@ -1,10 +1,12 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import dataclasses
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
-from ..ir import CompilerIR, FFNRule, StepWindowConstraint
+from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -953,36 +955,37 @@ def _layer8_alu_lev_b1_rules(S: float) -> tuple[FFNRule, ...]:
             name="l8_alu_lev_b1_step_end",
             conditions=(
                 ("OP_LEV", 1.0),
-                # Wave B Cluster 2: MARK_BP -> MARK_SE_ONLY under the
-                # Wave A step_end_operand_relay (10ca51a7). The relay
-                # broadcasts OP_LEV / BP_FRAME_* into MARK_SE_ONLY so
-                # the same SwiGLU AND fires at STEP_END.
+                # PRODUCTION REALITY (2026-06-12, L8 ALU live-imperative cut):
+                # the now-removed legacy ``_set_layer8_alu`` re-bake (phase 8.3)
+                # used to write ``W_up[MARK_BP] = +S`` here via ``=``, which
+                # OVERWROTE the Wave-B/broadcast ``MARK_BP=-1e6`` blocker laid
+                # down by the phase-8.2 declarative pass. The two passes
+                # superpose, so the LIVE model fires this unit at the BP marker
+                # (MARK_BP=+S) AND keeps the leftover -1e6 hard NOT-blockers on
+                # the OTHER markers (MARK_AX/PC/SP/MEM/STACK0/IS_BYTE) from the
+                # phase-8.2 pass, plus MARK_SE_ONLY=+S. With the imperative
+                # re-bake folded into this single declarative rule, MARK_BP is
+                # the imperative ``=`` winner (+1.0), not the dead -1e6 blocker;
+                # MARK_SE_ONLY stays +1.0 (Wave B). Byte-identity proof:
+                # tools/verify_l8_alu_migration.py.
                 ("MARK_SE_ONLY", 1.0),
-                # Opcode-broadcast hardening (2026-06-11, batch fix): the only
-                # positive non-opcode condition is MARK_SE_ONLY, so a broadcast
-                # OP_LEV (in-step, addressed to EVERY row) could otherwise let
-                # this fire at a non-STEP_END row (OP_LEV*1 alone > thr 1.5).
-                # The legit firing row is STEP_END (MARK_SE_ONLY=1), where
-                # IS_BYTE and every register MARK_* are 0 (verified spec_k=0 at
-                # the L8-input residual for the JSR/ENT/LEV function program),
-                # so these hard -1e6 NOT-blockers are SUBTRACTIVE (byte-
-                # identical at the legit row) and veto every byte/marker row
-                # regardless of the OP_LEV broadcast. Mirrors the MARK_MEM=-1e6
-                # hard blocker on the sibling l9_bp_plus8_shift_*_step_end rules
-                # (same MARK_SE_ONLY regime).
+                ("MARK_BP", 1.0),
+                # Leftover phase-8.2 hard NOT-blockers (subtractive at the legit
+                # BP/STEP_END row where IS_BYTE + the other register MARK_* are
+                # all 0). The imperative re-bake never wrote these dims, so they
+                # survive into the live weights at -1e6 (-> -1e8 after *S).
                 ("IS_BYTE", -1e6),
                 ("MARK_PC", -1e6),
                 ("MARK_AX", -1e6),
                 ("MARK_SP", -1e6),
-                ("MARK_BP", -1e6),
                 ("MARK_STACK0", -1e6),
                 ("MARK_MEM", -1e6),
             ),
             threshold=1.5,
             gate="CONST",
             writes=(("ADDR_B1_LO+0", write_scale),),
-            scope="OP_LEV and MARK_SE_ONLY",
-            dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_SE_ONLY"},
+            scope="OP_LEV and MARK_BP and MARK_SE_ONLY",
+            dominates_at={"ADDR_B1_LO+0": "OP_LEV and MARK_BP and MARK_SE_ONLY"},
         ),
     )
 
@@ -1001,29 +1004,27 @@ def _layer8_alu_lev_b2_rules(S: float) -> tuple[FFNRule, ...]:
             name="l8_alu_lev_b2_step_end",
             conditions=(
                 ("OP_LEV", 1.0),
-                # Wave B Cluster 2: MARK_BP -> MARK_SE_ONLY under the
-                # Wave A step_end_operand_relay (10ca51a7). The relay
-                # broadcasts OP_LEV / BP_FRAME_* into MARK_SE_ONLY so
-                # the same SwiGLU AND fires at STEP_END.
+                # PRODUCTION REALITY (2026-06-12, L8 ALU live-imperative cut):
+                # see l8_alu_lev_b1_step_end above. The now-removed imperative
+                # ``_set_layer8_alu`` re-bake wrote ``W_up[MARK_BP] = +S`` here
+                # via ``=``, overwriting the phase-8.2 ``MARK_BP=-1e6`` blocker;
+                # MARK_BP folds to the ``=`` winner (+1.0). The leftover -1e6
+                # NOT-blockers on the OTHER markers survive from the phase-8.2
+                # pass. Byte-identity proof: tools/verify_l8_alu_migration.py.
                 ("MARK_SE_ONLY", 1.0),
-                # Opcode-broadcast hardening (2026-06-11, batch fix): see
-                # l8_alu_lev_b1_step_end above. STEP_END is the legit row;
-                # IS_BYTE + register MARK_* are all 0 there, so these hard -1e6
-                # NOT-blockers are subtractive (byte-identical at the legit
-                # row) and veto the broadcast everywhere else.
+                ("MARK_BP", 1.0),
                 ("IS_BYTE", -1e6),
                 ("MARK_PC", -1e6),
                 ("MARK_AX", -1e6),
                 ("MARK_SP", -1e6),
-                ("MARK_BP", -1e6),
                 ("MARK_STACK0", -1e6),
                 ("MARK_MEM", -1e6),
             ),
             threshold=1.5,
             gate="CONST",
             writes=(("ADDR_B2_LO+0", write_scale),),
-            scope="OP_LEV and MARK_SE_ONLY",
-            dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_SE_ONLY"},
+            scope="OP_LEV and MARK_BP and MARK_SE_ONLY",
+            dominates_at={"ADDR_B2_LO+0": "OP_LEV and MARK_BP and MARK_SE_ONLY"},
         ),
     )
 
@@ -1083,14 +1084,75 @@ def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
+def _l8_alu_add_mark_ax_mirror(rules: tuple[FFNRule, ...]) -> tuple[FFNRule, ...]:
+    """Fold the legacy ``_set_layer8_alu`` re-bake into the declarative rules.
+
+    Until the 2026-06-12 L8 ALU cut, ``layer8_alu`` baked these rules
+    (Wave-B ``MARK_SE_ONLY`` variant) at phase 8.2, and then the
+    ``layer8_multibyte_routing`` bake re-ran the imperative
+    ``vm_step._set_layer8_alu`` helper (the un-migrated ``MARK_AX``
+    variant) at phase 8.3 via ``=`` assignment. The two passes
+    SUPERPOSE: ``_set_layer8_alu`` only writes ``W_up[MARK_AX]`` /
+    ``W_gate[MARK_AX]`` (it never touches ``MARK_SE_ONLY``), so the LIVE
+    weights carry BOTH markers on every ALU unit -- the Wave-B marker
+    migration was masked and never actually took effect in production.
+
+    This transform makes the declared rules MATCH that live reality so
+    the imperative re-bake can be removed (closing the last live
+    imperative weight write): for every rule that does NOT already carry
+    an explicit ``MARK_AX`` term, mirror each ``MARK_SE_ONLY`` term
+    (condition AND gate) into an equal-weight ``MARK_AX`` term. Rules
+    that already name ``MARK_AX`` (the LEV bytes-1/2 ``-1e6`` hard
+    blocker) are left untouched -- their ``MARK_AX`` blocker survived the
+    imperative ``=`` pass (which only wrote ``MARK_BP`` there), so the
+    LEV factories already encode their folded form directly.
+
+    Byte-identity vs the legacy two-pass bake is proven by
+    ``tools/verify_l8_alu_migration.py``.
+    """
+    out: list[FFNRule] = []
+    for rule in rules:
+        has_ax = any(t.dim.name == "MARK_AX" for t in rule.conditions)
+        if has_ax:
+            out.append(rule)
+            continue
+        new_conditions = list(rule.conditions)
+        for term in rule.conditions:
+            if term.dim.name == "MARK_SE_ONLY":
+                new_conditions.append(ConditionTerm(
+                    dim=DimRef(name="MARK_AX", offset=term.dim.offset),
+                    weight=term.weight,
+                ))
+        new_gate_terms = list(rule.gate_terms)
+        if rule.gate is not None and rule.gate.name == "MARK_SE_ONLY":
+            new_gate_terms.append(ConditionTerm(
+                dim=DimRef(name="MARK_AX", offset=rule.gate.offset),
+                weight=rule.gate_weight,
+            ))
+        for term in rule.gate_terms:
+            if term.dim.name == "MARK_SE_ONLY":
+                new_gate_terms.append(ConditionTerm(
+                    dim=DimRef(name="MARK_AX", offset=term.dim.offset),
+                    weight=term.weight,
+                ))
+        out.append(dataclasses.replace(
+            rule,
+            conditions=tuple(new_conditions),
+            gate_terms=tuple(new_gate_terms),
+        ))
+    return tuple(out)
+
+
 def _layer8_alu_rules(S: float) -> tuple[FFNRule, ...]:
     """Full ordered ``FFNRule`` sequence for ``layer8_alu``.
 
-    Concatenates the 18 sub-stage rule tuples in cursor order so the
-    composite list lowers byte-identically against
-    ``_set_layer8_alu``. Total: 2023 rules covering offsets 0..2022.
+    Concatenates the 18 sub-stage rule tuples in cursor order, then folds
+    the (now-removed) legacy ``_set_layer8_alu`` re-bake in via
+    ``_l8_alu_add_mark_ax_mirror`` so the composite list lowers
+    byte-identically against the live two-pass production weights. Total:
+    2023 rules covering offsets 0..2022.
     """
-    return (
+    rules = (
         _layer8_alu_add_lo_rules(S)
         + _layer8_alu_lea_lo_rules(S)
         + _layer8_alu_sub_lo_rules(S)
@@ -1110,6 +1172,7 @@ def _layer8_alu_rules(S: float) -> tuple[FFNRule, ...]:
         + _layer8_alu_lev_b2_rules(S)
         + _layer8_alu_lea_axb2_rules(S)
     )
+    return _l8_alu_add_mark_ax_mirror(rules)
 
 
 def _layer8_alu_ir(S: float = 100.0) -> CompilerIR:
@@ -1173,11 +1236,20 @@ def make_layer8_alu_op() -> Operation:
     MIGRATED 2026 Phase 6 Wave 4F: the imperative ``_set_layer8_alu``
     bake is replaced with a declarative ``FFNRule`` list lowered via
     ``Primitives.lower_ffn_rules`` (see ``lower_layer8_alu_ir`` and the
-    18 ``_layer8_alu_<substage>_rules`` factories). The ``vm_step``
-    helper is still imported by ``layer8_multibyte_routing`` for cursor
-    recovery (an idempotent overwrite of the same weights), so it
-    stays in place; this op no longer calls it. ``compiler_ir`` exposes
-    the rule spec to verifier / scope / dominance tooling.
+    18 ``_layer8_alu_<substage>_rules`` factories). ``compiler_ir``
+    exposes the rule spec to verifier / scope / dominance tooling.
+
+    MIGRATED 2026-06-12 (L8 ALU live-imperative cut): the
+    ``layer8_multibyte_routing`` bake used to re-invoke the imperative
+    ``vm_step._set_layer8_alu`` helper over units 0..2022 (the LAST live
+    imperative weight write in the production model). That ``MARK_AX``
+    re-bake superposed onto these declarative ``MARK_SE_ONLY`` rules via
+    ``=`` assignment, so the live weights carry BOTH markers. The
+    superposition is now folded directly into ``_layer8_alu_rules`` (see
+    ``_l8_alu_add_mark_ax_mirror`` + the LEV bytes-1/2 ``MARK_BP`` edit)
+    and the imperative re-bake is removed; the ``vm_step`` helper stays
+    defined only for the byte-identity verifier + legacy unit tests.
+    Byte-identity proof: ``tools/verify_l8_alu_migration.py``.
     """
     def bake(block, dim_positions, S):
         # Per-bake FFN-unit allocator. ``layer8_alu`` claims the whole
@@ -1602,28 +1674,29 @@ def make_layer8_multibyte_routing_op() -> Operation:
     call ``_set_layer8_multibyte_routing(ffn8, S, BD)`` in
     ``set_vm_weights`` (both alu_mode branches) has been removed; this op
     now owns the bake. Phase=8.3 places it after ``layer8_alu`` (8.2)
-    so the shared unit counter starts after the ALU units (the helper
-    internally re-invokes ``_set_layer8_alu`` to compute ``unit_start``;
-    that re-call is an idempotent overwrite of the same ALU weights).
+    so the shared unit counter starts after the ALU units.
+
+    MIGRATED 2026-06-12 (L8 ALU live-imperative cut): the bake no longer
+    re-invokes the imperative ``vm_step._set_layer8_alu`` helper. That
+    re-call was the LAST live imperative weight write in the production
+    bake -- it superposed the legacy ``MARK_AX`` ALU weights onto the
+    phase-8.2 declarative ``MARK_SE_ONLY`` weights via ``=`` assignment.
+    The superposition is now folded into ``layer8_alu``'s declarative
+    rules (see ``_l8_alu_add_mark_ax_mirror``), so phase 8.2 already
+    produces the both-markers production state. This bake only needs the
+    allocator-pinned cursor (offset 2023) -- the source of truth for the
+    multibyte-routing start -- and appends its own 32 routing units.
+    Byte-identity proof: ``tools/verify_l8_alu_migration.py``.
     """
     def bake(block, dim_positions, S):
-        from ...vm_step import _set_layer8_alu
-
         proxy = _as_setdim_proxy(dim_positions)
-        # Per-bake allocator. ``layer8_alu`` (phase 8.2) already ran
-        # and produced units 0..2022; the helper re-call below is the
-        # legacy idempotent overwrite that recovers the cursor. With
-        # the allocator in place the pinned offset 2023 is the source
-        # of truth -- the helper return is now a byte-identity guard.
+        # Per-bake allocator. ``layer8_alu`` (phase 8.2) already produced
+        # units 0..2022 (now including the folded ``MARK_AX`` ALU weights);
+        # the allocator-pinned offset 2023 is the cursor source of truth.
         allocator = _allocate_layer8_ffn_units()
         block.ffn._l8_unit_allocator = allocator
-        unit_start = _set_layer8_alu(block.ffn, S, proxy)
         expected_start = _l8_ffn_range_start(
             allocator, "layer8_multibyte_routing"
-        )
-        assert unit_start == expected_start, (
-            f"L8 multibyte_routing unit start drift: helper returned "
-            f"{unit_start}, allocator expected {expected_start}"
         )
         lower_layer8_multibyte_routing_ir(
             block.ffn,
