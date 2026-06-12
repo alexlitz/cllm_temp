@@ -171,8 +171,13 @@ _L10_FFN_UNIT_LAYOUT_MAIN = (
     ("layer10_alu.mul_lo",         1740,  256),  # (a*b)%16 lookup
     ("layer10_alu.shl_shr_zero",   1996,    4),  # 2 per opcode (SHL, SHR)
     ("layer10_alu.ax_passthrough", 2000,   32),  # 16 lo + 16 hi
+    # Wall-4 SESSION 2 per-nibble EQ engine (2026-06-12): 256-unit
+    # 4-way AND on (ALU_HI+h, AX_CARRY_HI+h, ALU_LO+l, AX_CARRY_LO+l)
+    # gated OP_EQ at MARK_AX. Writes OUTPUT_LO+1 / cancels OUTPUT_LO+0
+    # for equal operands. See ``_layer10_alu_eq_engine_rules``.
+    ("layer10_alu.eq_engine",      2032,  256),  # 16x16 nibble-pair EQ
 )
-_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 2032
+_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 2288
 
 # Combined post-op FFN baked by ``make_l10_post_ops_combined`` (kind="ffn",
 # dependency-assigned). Each range maps 1:1 to a post-op class's
@@ -1223,6 +1228,108 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
+    """Per-nibble EQ engine: 256 units gated on OP_EQ at the AX marker.
+
+    Wall-4 SESSION 2 frontier fix (2026-06-12). Background: after Wave B
+    moved the CMP compute to the STEP_END (MARK_SE_ONLY) row, the L9 SE
+    relay never transmits, so the migrated SE cmp cascade is dead
+    (SE_CMP empty). EQ/NE need ``CMP+1`` (hi_eq) and ``CMP+2`` (lo_eq)
+    at the binop AX row, which are NEVER computed there. The legacy
+    ``ComparisonCombine`` post-op (logical L14, physical block 22) reads
+    raw ``CMP[0..3]`` at MARK_AX; for EQ those are wrong (hi_lt spuriously
+    hot, hi_eq weak), so EQ falls through to its default-0 result and
+    eq_true is wrong. (lt/le/gt/ge pass by ACCIDENT because their
+    overrides gate on the spuriously-hot ``CMP+0``; this engine MUST NOT
+    touch ``CMP`` so those guardrails are untouched.)
+
+    The raw operands the L9 cascade WOULD use are present and STABLE at
+    the AX row across every block 11..23 (probed spec_k=0): operand A's
+    nibbles in ``ALU_LO/ALU_HI``, operand B's nibbles in
+    ``AX_CARRY_LO/AX_CARRY_HI``. This engine recomputes equality there
+    directly. For each nibble pair ``(h, l)`` one 4-way AND fires iff
+    ``ALU_HI+h AND AX_CARRY_HI+h AND ALU_LO+l AND AX_CARRY_LO+l`` are all
+    the active cell — i.e. A.hi == h == B.hi AND A.lo == l == B.lo, i.e.
+    A == B. The matching unit writes ``CMP+1`` (hi_eq) and ``CMP+2``
+    (lo_eq) — the two flags the live ``ComparisonCombine`` EQ override
+    reads — so EQ flips to 1 through the SAME proven path lt/le use (via
+    CMP+0). For unequal operands NO unit fires, CMP+1/CMP+2 stay zero,
+    and EQ's default-0 result is left intact. ``CMP+0`` (hi_lt, the
+    load-bearing accidental guardrail flag) and ``CMP+3`` are NEVER
+    written, so lt/le/gt/ge are structurally untouched.
+
+    Threshold tuning (the ~0.44-margin index-0 magnitude artifact from
+    ``project_operand_gather_hybrid_encoding_is_cmp_alu_root``): the
+    operand-gather emits a hybrid magnitude+nibble encoding, so
+    ``ALU_*+0`` carries a value-proportional artifact (~5-11) and
+    ``AX_CARRY_LO+0`` a ~0.32 floor, while the clean ``AX_CARRY`` true
+    one-hot is ~0.9-1.3 and ``ALU`` is over-amplified (~6-11). A balanced
+    4-way AND with per-term weights ``(MARK_AX 0.3, ALU_HI 0.2,
+    AX_CARRY_HI 0.8, ALU_LO 0.2, AX_CARRY_LO 1.2)`` and threshold
+    ``5.48`` separates the true match (sum 5.91) from BOTH the index-0
+    artifact unit (sum 5.05) and every cross-nibble near-miss (the
+    unequal-operand sums all <= 5.05) with ~0.43 headroom on each side.
+    Derived offline against the probed AX-row operand bands
+    (``tools/tune_eq_engine.py``). Gated hard on OP_EQ so non-EQ
+    comparisons are structurally untouched.
+    """
+    gate_eq = dim_ref("opcode_flag", "EQ")
+    # Per-term AND weights normalising the over-amplified ALU vs clean
+    # AX_CARRY and rejecting the index-0 artifact. Tuned for the MAXIMUM
+    # symmetric firing margin (tools/tune_eq_engine.py): the true match
+    # (h=0,l=5) sums to 6.47 while the worst non-target (the index-0
+    # ALU_LO artifact unit) sums to 5.27, so the 5.872 threshold sits
+    # 0.60 above the artifact ceiling AND 0.60 below the true match --
+    # the widest separation any clean weighting achieves. Leans on the
+    # AXC_LO discriminator (0.32 artifact vs 0.94 true one-hot, the
+    # cleanest per-build-stable signal). See docstring.
+    W_MARK = 0.8
+    W_ALU_HI = 0.2
+    W_AXC_HI = 0.4
+    W_ALU_LO = 0.2
+    W_AXC_LO = 1.8
+    THRESH = 5.872
+    # The matching unit writes ``CMP+1`` (hi_eq) and ``CMP+2`` (lo_eq) at
+    # the AX row, which is exactly what the live ``ComparisonCombine``
+    # post-op (logical L14, block 22) reads for the EQ override
+    # ``_cmp_override_3way(OP_EQ, CMP+1, CMP+2, 1, 0)``. That override
+    # fires iff MARK_AX + CMP+1 + CMP+2 - 0.1*CMP+0 >= 2.5; for eq_true
+    # the spurious ``CMP+0 ~= 7.03`` contributes only -0.703 (not the
+    # -15 of a TRUE hi_lt), so writing each flag at ~2.5 clears the
+    # threshold and flips EQ to 1. This reuses the SAME proven path lt/le
+    # use via CMP+0 (the result survives to the L25 band and decodes
+    # correctly), instead of fighting the block-11 -> block-22 OUTPUT_LO
+    # amplification. CMP+0 (hi_lt, the load-bearing guardrail flag) and
+    # CMP+3 are NEVER written here, so lt/le/gt/ge are structurally
+    # untouched. Gated hard on OP_EQ so non-EQ comparisons see nothing.
+    # Strength ~2.5 (i.e. ~ the ComparisonCombine override unit's own
+    # MARK_AX weight) matches the CMP flag magnitudes L9 would have
+    # written had its cascade transmitted.
+    FLAG = 2.5
+    rules: list[FFNRule] = []
+    for h in range(16):
+        for l in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"l10_eq_engine_h{h:x}_l{l:x}",
+                conditions=(
+                    ("MARK_AX", W_MARK),
+                    (f"ALU_HI+{h}", W_ALU_HI),
+                    (f"AX_CARRY_HI+{h}", W_AXC_HI),
+                    (f"ALU_LO+{l}", W_ALU_LO),
+                    (f"AX_CARRY_LO+{l}", W_AXC_LO),
+                ),
+                threshold=THRESH,
+                gate=gate_eq,
+                gate_weight=1.0,
+                writes=(
+                    ("CMP+1", FLAG / S),
+                    ("CMP+2", FLAG / S),
+                ),
+                scope="MARK_AX and OP_EQ",
+            ))
+    return tuple(rules)
+
+
 def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
     """Composite ordered ``FFNRule`` sequence for ``layer10_alu``.
 
@@ -1241,6 +1348,7 @@ def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
         + _layer10_alu_mul_lo_rules(S)
         + _layer10_alu_shl_shr_zero_rules(S)
         + _layer10_alu_ax_passthrough_rules(S)
+        + _layer10_alu_eq_engine_rules(S)
     )
 
 
@@ -3553,10 +3661,16 @@ def make_layer10_alu_op() -> Operation:
         # back-edge.
         reads={"MARK_AX", "ALU_LO", "AX_CARRY_LO", "ALU_HI.*.-1", "AX_CARRY_HI",
                "OP_OR", "OP_XOR", "OP_AND", "OP_DIV", "OP_MOD",
+               # Wall-4 EQ engine (2026-06-12): reads OP_EQ + the raw
+               # operand bands at MARK_AX to recompute equality directly.
+               "OP_EQ",
                # V2/G7 LEV detector: in-step topology edge replacing the
                # cross-step requires["after"]=layer16_lev_routing below.
                "PC_VIA_LEV_DETECTOR_LO"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING"},
+        # Wall-4 EQ engine (2026-06-12): also writes CMP (hi_eq=CMP+1,
+        # lo_eq=CMP+2) at the AX row, gated OP_EQ, feeding the live
+        # ComparisonCombine EQ override. CMP+0/CMP+3 are never touched.
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "DIV_STAGING", "CMP"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir=_layer10_alu_ir(),
@@ -3581,7 +3695,9 @@ def make_layer10_alu_op() -> Operation:
         # L10 FFN so this op holds the per-layer width annotation.
         # The +186 cancel units (2026-06-10) live inside
         # ``_layer10_alu_bitwise_rules`` -- see that helper's docstring.
-        ffn_units_used=2032,
+        # Wall-4 EQ engine (2026-06-12): +256 units (eq_engine) reaching
+        # 2288. See ``_layer10_alu_eq_engine_rules``.
+        ffn_units_used=2288,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",

@@ -742,7 +742,26 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
                         gate=op_gate,
                         S=S,
                     ))
-        cleanup_ffn = _lower(tuple(cleanup_rules))
+        # Wall-4 SESSION 2 per-nibble EQ engine (2026-06-12).
+        # ------------------------------------------------------------
+        # In efficient mode this wrap REPLACES L10's block.ffn, so the
+        # lookup-mode ``layer10_alu`` FFN -- which carries the declarative
+        # ``_layer10_alu_eq_engine_rules`` -- is discarded. The smoke gate
+        # runs efficient mode (trust_neural_alu=True), so the EQ engine
+        # must live here to fire. It is MERGED into ``block.ffn`` (the
+        # cleanup FFN) rather than appended as a post_op so it does NOT
+        # add an extra passthrough block (which would shift every
+        # downstream block index and break absolute-position-dependent
+        # ops like lea). Its 256 units read the raw operands at MARK_AX
+        # gated OP_EQ and write CMP+1 (hi_eq) / CMP+2 (lo_eq) -- the flags
+        # the live ComparisonCombine EQ override reads. The cleanup units
+        # only subtract artifacts for OP_AND/OP_OR/OP_XOR, so EQ rows
+        # still carry the raw (dirty) bands the engine thresholds expect,
+        # and the EQ units (gated OP_EQ) never touch the bitwise cleanup.
+        # CMP+0/CMP+3 are never written -> lt/le/gt/ge untouched.
+        from .l10_ops import _layer10_alu_eq_engine_rules
+        eq_rules = _layer10_alu_eq_engine_rules(S)
+        cleanup_ffn = _lower(tuple(cleanup_rules) + tuple(eq_rules))
 
         # ---- Stage 2: rescaled bitwise lookup over the cleaned bands ----
         # Cleaned operand-A cells ~5.82, operand-B (AX_CARRY) cells ~0.94.
@@ -782,6 +801,9 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # as the historical wrap did); Stage 2 is a post_op that
         # ``_expand_wrapper_blocks`` splits into its own passthrough block
         # AFTER block.ffn -- so the lookup reads the cleaned operands.
+        # Stage 1 (cleanup + EQ engine) owns block.ffn; Stage 2 (lookup)
+        # is a post_op expanded into its own passthrough block AFTER
+        # block.ffn so the bitwise lookup reads the cleaned operands.
         block.ffn = cleanup_ffn
         block.post_ops.append(lookup_ffn)
 

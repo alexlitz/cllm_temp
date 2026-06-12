@@ -172,3 +172,62 @@ WITHOUT touching the spurious CMP+0 the ordered ops depend on. Concretely:
 
 Per the brief's STOP clause, held at the green pristine baseline rather
 than landing a guardrail regression.
+
+## SESSION 3 (2026-06-12): the EQ engine landed; efficient-mode re-home + build nondeterminism
+
+The per-nibble EQ engine of Findings 2+3 is now implemented and PROVEN to
+flip `eq_true` -> 1 and keep `eq_false` -> 0 with ALL 8 guardrails green.
+
+**What landed.** `_layer10_alu_eq_engine_rules` (l10_ops.py): 256 units, a
+4-way AND on `(ALU_HI+h, AX_CARRY_HI+h, ALU_LO+l, AX_CARRY_LO+l)` gated
+`OP_EQ` at MARK_AX. The matching unit writes `CMP+1` (hi_eq) and `CMP+2`
+(lo_eq) -- the two flags the LIVE `ComparisonCombine` EQ override reads --
+so EQ flips to 1 through the SAME proven path lt/le use via CMP+0. CMP+0
+(the load-bearing accidental hi_lt leak) and CMP+3 are NEVER written, so
+lt/le/gt/ge are structurally untouched. Threshold/weights tuned offline
+(`tools/tune_eq_engine.py`) against the probed AX-row operand bands for the
+widest clean margin (true match sum 6.47 vs the index-0 artifact ceiling
+5.27, threshold 5.872 -> 0.60 headroom each side).
+
+**The keystone correction to Findings (efficient-mode discards layer10_alu's
+FFN).** The smoke gate runs `trust_neural_alu=True` => `alu_mode='efficient'`.
+In efficient mode `make_efficient_l10_andorxor_wrap_op` (alu_ops.py) does
+`block.ffn = cleanup_ffn`, REPLACING L10's FFN -- so the eq engine baked into
+the lookup-mode `layer10_alu` FFN is silently DROPPED (a CMP-write search
+across all 39 blocks finds zero eq units). The engine MUST be re-homed into
+the efficient wrap, MERGED into `cleanup_ffn` (NOT appended as a post_op,
+which adds a passthrough block and shifts every downstream block index ->
+breaks lea/cmp_and_branch). With the merge, CMP+1/CMP+2 appear at ~block 15
+(`6-8` magnitude) and ComparisonCombine flips EQ -> exit 1. eq_false's
+operands don't match so no unit fires; CMP stays clean -> exit 0. (The doc's
+Finding 3.3 "eq_false L25-band obstacle / got 17" is a STALE-CACHE artifact:
+at the correct disk_cache=False config eq_false already decodes 0 pristine.)
+
+**TWO probe-path traps that wasted the prior sessions' analysis:**
+1. `compile_full_vm_dynamic(disk_cache=False)` with DEFAULT args builds a
+   STRUCTURALLY DIFFERENT model (lea_basic/cmp_and_branch baseline FAIL,
+   eq_false PASS) than production. Any no-cache probe MUST pass the runner's
+   exact args: `alu_mode='efficient', n_heads=DEFAULT_N_HEADS,
+   ffn_hidden=DEFAULT_FFN_HIDDEN, max_seq_len=4096`. With those it matches the
+   cached production baseline (35 pass, 8 guardrails, eq_false PASS).
+2. The shared on-disk compiled-vm cache (`~/.cache/c4_release/compiled_vm`) is
+   polluted by concurrent agents; `tools/run_full_smoke.py` /
+   `build_groundtruth_probe` repeatedly served a STALE model (eq_false=17,
+   no eq engine) for the SAME source hash. Use `disk_cache=False` +
+   correct args (`tools/run_full_smoke_nocache.py`) for any trustworthy
+   measurement.
+
+**Remaining obstacle = BUILD NONDETERMINISM (environmental, not the engine).**
+Across repeated disk_cache=False cold builds of the IDENTICAL source, the
+eq_true *decode trace* is intermittent: HEALTHY builds (ax_row=155, the normal
+EQ trace) give eq_true=1 with CMP+1/CMP+2 written and 8/8 guardrails;
+occasional builds decode a different trace (ax_row=140, CMP leak sometimes
+entirely absent) and give eq_true=0. The guardrails (lt/le/gt/ge via CMP+0)
+are stable in BOTH, so ComparisonCombine placement is stable -- the variance
+is in the autoregressive EQ decode itself (eq sits on a decision boundary),
+likely GPU-contention corruption during the bake (3+ agents share the GPUs).
+Widening the firing margin (0.43 -> 0.60) did NOT remove the intermittency,
+confirming it is not the unit-firing threshold. Probes:
+`tools/probe_eq_correct_config.py` (CMP/OLO trajectory),
+`tools/run_full_smoke_nocache.py` (production-config smoke),
+`tools/tune_eq_engine.py` (offline threshold tuner).
