@@ -1968,8 +1968,11 @@ def _bake_layer10_psh_stack0_passthrough_head(attn, BD, S, HD) -> None:
 
 
 def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
+    PC_IDX = 0
     AX_IDX = 1
+    SP_IDX = 2
     BP_IDX = 3
+    MEM_IDX = 4
     L = S
     q = [
         AP(0, BD.IS_BYTE, L),
@@ -1989,6 +1992,40 @@ def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHead
         AP(33, BD.H1 + BP_IDX, -10000.0),
         AP(33, BD.PSH_AT_SP, 10000.0),
         AP(33, BD.MARK_STACK0, -10000.0),
+        # === Register-byte-row hard darkening (slot 7): var_simple / id 262 ===
+        # This head is the PSH STACK0-store passthrough: its ONLY legit firing
+        # rows are STACK0 *frame* byte rows (STACK0_BYTE_h ~= 0.97, H1
+        # register-marker band ALL-ZERO). But its active gate (slot 33) keys on
+        # PSH_AT_SP + IS_BYTE without excluding register byte rows, so on a PSH
+        # step it ALSO fires (softmax1 wsum -> 1.0) on the SP/BP/AX *register*
+        # byte rows (PSH_AT_SP=2, all STACK0_BYTE=0, exactly one H1+{PC/AX/SP/
+        # BP/MEM}=1). There it attends diffusely and averages CLEAN_EMBED /
+        # (OUTPUT-CLEAN_EMBED) debris into OUTPUT at scale 3.0, CRUSHING the
+        # OUTPUT band to ~-569 (probe_var_full_chain.py 262: OUTPUT_LO/HI
+        # +0.94 through block 11, -568.79 at block 12 / logical L11 on the
+        # step-3 PSH SP byte3 row pred_row=212). With OUTPUT dead the SP-byte3
+        # LM logit dies and the BP-marker token (260) wins -> SP truncates ->
+        # whole-program desync (the LINK5/6 root, docs/
+        # VAR_SIMPLE_12_LINK5_6_DIAGNOSIS_2026_06_11.md).
+        #
+        # FIX (mirrors the l15 slot-64 / l18 slot-44 hard-marker darkening
+        # landed in e457ba31 / 8ad47bf4): a hard subtractive NOT-blocker on a
+        # fully-free Q/K slot (7), keyed on the H1 register-marker proximity
+        # band (H1+0..H1+4 = PC/AX/SP/BP/MEM). On a register byte row exactly
+        # one H1+idx=1 so the slot scores every key position at -2e9 (K[CONST]=1
+        # everywhere), driving all real scores below the softmax1 anchor (0) ->
+        # the head outputs ZERO (wsum -> 0) and the residual OUTPUT survives. On
+        # the legit STACK0 frame byte rows H1+0..4 are ALL ZERO, so the slot
+        # contributes nothing and the head is BYTE-IDENTICAL (no register-marker
+        # proximity on a stack-frame byte). Pure subtractive -- no net-zero
+        # compensation -- and it touches NEITHER CMP, PSH_AT_SP nor MEM_STORE
+        # (the CMP path is owned by the if_* agent), only the register-marker
+        # band that already (weakly) discriminates this head at slot 1/33.
+        AP(7, BD.H1 + PC_IDX, -2000000000.0),
+        AP(7, BD.H1 + AX_IDX, -2000000000.0),
+        AP(7, BD.H1 + SP_IDX, -2000000000.0),
+        AP(7, BD.H1 + BP_IDX, -2000000000.0),
+        AP(7, BD.H1 + MEM_IDX, -2000000000.0),
     ]
     k = [
         AP(0, BD.IS_BYTE, L),
@@ -1999,6 +2036,11 @@ def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHead
         AP(5, BD.BYTE_INDEX_2, L),
         AP(6, BD.BYTE_INDEX_3, L),
         AP(33, BD.CONST, 5.0),
+        # K-side complement for the slot-7 register-byte NOT-blocker: CONST is
+        # present at EVERY position, so the slot-7 score is Q[7]*1 uniformly
+        # across keys -> a register-byte query row scores -2e9 everywhere and
+        # darkens; a STACK0-frame byte query row scores 0 (Q[7]=0) -> no effect.
+        AP(7, BD.CONST, 1.0),
     ]
     v = []
     o = []
