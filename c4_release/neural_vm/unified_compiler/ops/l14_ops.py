@@ -1197,6 +1197,15 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(36, BD.MARK_MEM, -6000.0),
         AP(36, BD.STACK0_BYTE0, -6000.0),
     ]
+    # 16-bit OR/XOR byte-1 fix (2026-06-11): widen the K-gate from
+    # OP_MUL/OP_SHL to also fire on OP_OR/OP_XOR. The L13
+    # ``layer13_bitwise_byte1_gather`` head stages operand-A byte 1 into
+    # AX_FULL_LO/HI at the OR/XOR MARK_AX row; this relay then copies that
+    # staged byte 1 into OUTPUT at the byte-1 AX-emit token, exactly as it
+    # does for MUL/SHL. OP_AND is intentionally NOT added: and_16bit needs
+    # byte 1 = 0x00 (A_b1 AND 0), which the un-staged (empty AX_FULL)
+    # default already emits -- so AND keeps its current passing behaviour.
+    _BITWISE_RELAY_OPS = (BD.OP_OR, BD.OP_XOR)
     k = [
         AP(0, BD.MARK_AX, 100.0),
         AP(1, BD.OP_MUL, 100.0),
@@ -1211,6 +1220,10 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(36, BD.OP_MUL, 200.0),
         AP(36, BD.OP_SHL, 200.0),
     ]
+    for _op in _BITWISE_RELAY_OPS:
+        k.append(AP(1, _op, 100.0))
+        k.append(AP(35, _op, 2000.0))
+        k.append(AP(36, _op, 200.0))
     v = []
     o = []
     for idx in range(16):
@@ -1269,6 +1282,9 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
                "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "STACK0_BYTE0", "OP_MUL",
                "OP_SHL", "OP_LI_RELAY", "OP_LC_RELAY",
+               # 16-bit OR/XOR byte-1 fix (2026-06-11): K-gate widened to
+               # OP_OR/OP_XOR so the relay also fires for bitwise byte 1.
+               "OP_OR", "OP_XOR",
                "AX_FULL_LO", "AX_FULL_HI", "TEMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",

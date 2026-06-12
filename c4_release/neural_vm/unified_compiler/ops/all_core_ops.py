@@ -347,6 +347,10 @@ def all_core_ops(
         # on ``make_layer13_mem_addr_anchor_op``.
         make_layer13_mem_addr_anchor_op(),
         make_layer13_mem_addr_gather_op(),
+        # 16-bit OR/XOR byte-1 fix (2026-06-11): L13 attn head 3 stages
+        # operand-A byte 1 into AX_FULL on OR/XOR so the L15
+        # high_byte_relay (gate widened to OP_OR/OP_XOR) can emit byte 1.
+        make_layer13_bitwise_byte1_gather_op(),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
         # meaningful in efficient mode. The 5 ops returned by

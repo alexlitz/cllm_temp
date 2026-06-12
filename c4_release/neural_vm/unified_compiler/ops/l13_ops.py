@@ -391,6 +391,165 @@ def _layer13_mem_addr_gather_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
+# === L13 head 3: bitwise byte-1 operand gather ======================
+#
+# 16-bit OR/XOR byte-1 fix (2026-06-11). The byte-0 AND/OR/XOR compute
+# (commit e4c4c396) computes the low byte at the MARK_AX row, but byte 1
+# was never computed or relayed -- the byte-1 AX-emit token defaults to
+# 0x00 (probe ``tools/probe_or16_byte1.py``: at the OR compute row only
+# byte-0 operands exist; operand A byte 1 lives in STACK0_BYTE_VAL_1_LO/HI
+# at the STACK0 byte-1 rows, never gathered to the AX row).
+#
+# The working high-byte path stages result byte 1 into AX_FULL_LO/HI at
+# the MARK_AX row, and ``layer15_alu_high_byte_relay`` (l14_ops.py) copies
+# AX_FULL -> OUTPUT at the byte-1 emit token -- but it is K-gated on
+# OP_MUL/OP_SHL ONLY. This head supplies the missing AX_FULL staging for
+# bitwise: at the MARK_AX row of an OR/XOR step it attends back to the
+# top-of-stack STACK0 byte-1 row and copies STACK0_BYTE_VAL_1_LO/HI ->
+# AX_FULL_LO/HI. The relay-gate widening (l14_ops.py) then copies that
+# staged byte 1 to OUTPUT at the byte-1 emit.
+#
+# Why OP_OR/OP_XOR only (not OP_AND)? For all three 16-bit bitwise smoke
+# programs operand B's byte 1 is 0x00, so result byte 1 = A_b1 OP 0:
+#   OR/XOR -> A_b1  (must be staged; default 0x00 is wrong)
+#   AND    -> 0x00  (empty AX_FULL already emits 0x00; staging A_b1
+#                    would BREAK and_16bit). So AND is left unstaged.
+# operand B byte 1 does NOT reach the MARK_AX row in any usable band
+# (verified spec_k=0), so a general A_b1 OP B_b1 compute is not landable
+# in this surface; the OR/XOR-only relay of A_b1 is exact for the targets
+# and leaves and_16bit (already passing) untouched.
+#
+# Placement: L13 (physical block after the L11/L10 ``psh_ax_broadcast``
+# heads that WRITE STACK0_BYTE_VAL_1, and before the L15 relay that READS
+# AX_FULL). L13 attn heads 0-2 are owned by mem_addr_gather; this head
+# claims the free slot 3. A positive ALiBi slope keeps the gather
+# step-local / top-of-stack: the most-recent STACK0 byte-1 row (the
+# current OR/XOR's operand A) wins the softmax over older frames.
+def _layer13_bitwise_byte1_gather_head_specs(BD) -> tuple:
+    """L13 head 3: stage operand-A byte 1 into AX_FULL on OR/XOR.
+
+    Q fires at MARK_AX AND (OP_OR or OP_XOR); a CONST anti-leak penalty
+    plus per-opcode exclusions keep the head dark on every other step.
+    K fires at the STACK0 byte-1 value row (STACK0_BYTE1). V copies the
+    STACK0_BYTE_VAL_1_LO/HI nibble pair; O writes AX_FULL_LO/HI at the Q
+    (MARK_AX) row. ALiBi recency (slope set in the bake) selects the
+    most-recent STACK0 byte-1 row = current top of stack = operand A.
+    """
+    L = 15.0
+    # Exclude every non-OR/XOR opcode at the Q row so the head only fires
+    # on OR/XOR steps (mirrors the L7 operand_gather exclusion pattern).
+    _EXCLUDE_OPCODES = (
+        "OP_AND", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+        "OP_SHL", "OP_SHR", "OP_EQ", "OP_NE", "OP_LT", "OP_GT",
+        "OP_LE", "OP_GE", "OP_IMM", "OP_PSH", "OP_JSR", "OP_ENT",
+        "OP_LEV", "OP_LI", "OP_LC", "OP_SI", "OP_SC", "OP_LEA",
+        "OP_JMP", "OP_BZ", "OP_BNZ", "OP_ADJ", "OP_EXIT",
+    )
+    q = [
+        AP(0, BD.MARK_AX, L),
+        AP(0, BD.OP_OR, L),
+        AP(0, BD.OP_XOR, L),
+        AP(0, BD.CONST, -L / 2),
+    ]
+    for opname in _EXCLUDE_OPCODES:
+        op_dim = getattr(BD, opname, None)
+        if op_dim is not None:
+            q.append(AP(0, op_dim, -L * 10))
+    # Slot 33 anti-leak: require MARK_AX strongly so the slot-0 softmax
+    # only routes positively at the OR/XOR MARK_AX Q row.
+    q.append(AP(33, BD.MARK_AX, L))
+    q.append(AP(33, BD.CONST, -L / 2))
+
+    k = [
+        AP(0, BD.STACK0_BYTE1, L),
+        AP(33, BD.CONST, L),
+    ]
+    # V slots 1..32 copy the STACK0 byte-1 value nibbles.
+    v = [AP(1 + kk, BD.STACK0_BYTE_VAL_1_LO + kk, 1.0) for kk in range(16)]
+    v += [AP(17 + kk, BD.STACK0_BYTE_VAL_1_HI + kk, 1.0) for kk in range(16)]
+    # O slots 1..32 route the gathered nibbles into AX_FULL_LO/HI.
+    o = [AO(BD.AX_FULL_LO + kk, 1 + kk, 1.0) for kk in range(16)]
+    o += [AO(BD.AX_FULL_HI + kk, 17 + kk, 1.0) for kk in range(16)]
+
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=3,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ),
+    )
+
+
+def _layer13_bitwise_byte1_gather_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer13_bitwise_byte1_gather_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
+
+
+def make_layer13_bitwise_byte1_gather_op() -> Operation:
+    """L13 attention head 3: stage operand-A byte 1 into AX_FULL on OR/XOR.
+
+    Supplies the AX_FULL byte-1 staging that ``layer15_alu_high_byte_relay``
+    (with its widened OP_OR/OP_XOR K-gate) relays to OUTPUT for the 16-bit
+    OR/XOR byte-1 emit. See the module-level comment block above for the
+    design rationale and the OR/XOR-only gating choice.
+    """
+    def bake(block, dim_positions, S):
+        del S
+        attn = block.attn
+        proxy = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        # NEGATIVE ALiBi slope on head 3: prefer the OLDEST (deepest)
+        # STACK0 byte-1 K row. The current OR/XOR step's own STACK0 frame
+        # is the MOST RECENT byte-1 row but was NEVER PSH-populated (the
+        # ``psh_ax_broadcast`` head only writes STACK0_BYTE_VAL_1 on
+        # OP_PSH steps), so it carries 0x00, not operand A's byte 1. The
+        # PSH-step frame that pushed operand A is further back; a negative
+        # recency bias skips the empty current-step frame and lands on the
+        # populated PSH frame. (Verified spec_k=0: rows 66/101 = 0x0F via
+        # PSH broadcast; row 136 = OR-step frame = 0x00.)
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[3] = -1.0
+        Primitives.generate_attention_head(
+            attn,
+            _layer13_bitwise_byte1_gather_head_specs(proxy)[0],
+            HD,
+        )
+
+    _claims = set()
+    for k in range(16):
+        _claims.add((13, "attn_W_v", f"3_{1 + k}", f"STACK0_BYTE_VAL_1_LO+{k}"))
+        _claims.add((13, "attn_W_v", f"3_{17 + k}", f"STACK0_BYTE_VAL_1_HI+{k}"))
+
+    return Operation(
+        name="layer13_bitwise_byte1_gather",
+        reads={"MARK_AX", "OP_OR", "OP_XOR", "STACK0_BYTE1",
+               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI", "CONST"},
+        writes={"AX_FULL_LO", "AX_FULL_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer13_bitwise_byte1_gather_ir,
+        declarative_authority="spec_generated",
+        # Co-place on the L13 attn block (heads 0-2 owned by
+        # mem_addr_gather; this claims head 3). Run after the mem-addr
+        # gather so the 8-head block is already populated.
+        target_op_name="_layer13_mem_addr_anchor",
+        requires={"after": "layer13_mem_addr_gather"},
+        migrated=True,
+        claims=_claims,
+        smoke_tests={
+            "TestSmoke32Bit::test_or_16bit",
+            "TestSmoke32Bit::test_xor_16bit",
+        },
+        spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+    )
+
+
 def make_layer13_mem_addr_anchor_op() -> Operation:
     """L13 attn-side anchor for the mem-addr family (Phase 3b mem cluster fix).
 

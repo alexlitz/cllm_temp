@@ -4678,6 +4678,25 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ("MEM_VAL_B3", -1000.0),
                         (f"CLEAN_EMBED_LO+{lo}", 30.0),
                         (f"CLEAN_EMBED_HI+{hi}", 30.0),
+                        # 16-bit XOR byte-1 fix (2026-06-11): require the EXACT
+                        # byte-0 high nibble. The FETCH_HI+15 (100) + TEMP+10
+                        # (80) terms alone nearly clear threshold 150, so this
+                        # LEA-local-address preserve over-fired on ``IMM 0x0F0F;
+                        # PSH; IMM 0x00FF; XOR`` (byte 0 = 0xF0, CLEAN_EMBED_HI+15
+                        # != the e0/e8 target +14), stamping byte 1 = 0xff
+                        # (0x0FF0 -> 0xFFF0) on top of the correct 0x0F staged by
+                        # layer13_bitwise_byte1_gather + the widened relay. A
+                        # real BP-relative LEA local addr (e8/e0/d8) has
+                        # CLEAN_EMBED_HI = 14/13 exactly, so blocking the
+                        # non-target HI nibbles is byte-identical for the legit
+                        # case. Mirrors the non-target CLEAN_EMBED guards on the
+                        # sibling ``stack0_pushed_addr_byte1`` rules. Opcode-free
+                        # (avoids the OP_XOR-blocker / CMP-coupling regression).
+                        *(
+                            (f"CLEAN_EMBED_HI+{k}", -100.0)
+                            for k in range(16)
+                            if k != hi
+                        ),
                         ("FETCH_HI+15", 100.0),
                         ("TEMP+10", 80.0),
                         # IMM-decode residual fix (2026-06-11): this byte-1=0xFF
