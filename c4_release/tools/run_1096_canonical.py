@@ -195,25 +195,26 @@ _DEFAULT_MEM_STEP_SCALE = 1.0
 
 # Length buckets (upper bound on declarative steps) -> per-chunk batch width.
 #
-# These are the FIRST-TRY widths; they are tuned for throughput, NOT for
-# guaranteed safety. ``_run_one_chunk_with_oom_retry`` recursively HALVES any
-# chunk that OOMs and retries (down to B=1), so an over-optimistic width here
-# only costs a re-run of the few chunks that actually OOM — it never loses a
-# verdict. The memory driver is the per-block forward working set at batch
-# width B times the (possibly diverging) horizon; on this model (d_model=872,
-# 37 blocks) width 32 @ <=15 steps and width 8 @ ~17 steps each OOM'd on SOME
-# chunks (members that all diverge), but most chunks at those widths are fine —
-# exactly the case the retry handles. Deep programs still start solo because
-# they would OOM at any B>1 and splitting them gains nothing.
+# First-try widths. ``_run_one_chunk_with_oom_retry`` recursively HALVES any
+# chunk that OOMs (down to B=1) so an over-optimistic width never loses a
+# verdict — but a too-wide first try is EXPENSIVE: it OOMs, splits all the way
+# down, and (because ``expandable_segments`` holds reserved memory across the
+# failed forward) can leave so little free memory that even the B=1 retries
+# OOM. So the widths are kept conservative — wide enough for throughput on the
+# shallow band, narrow enough that OOM/splitting is rare. The memory driver is
+# the per-block forward working set at batch width B times the (possibly
+# diverging) horizon; on this model (d_model=872, 37 blocks) width 8 @ <=25
+# steps and width 2 @ <=40 steps were safe across a full run, while width 32
+# @ <=15 steps OOM'd. Deep programs start solo (they OOM at any B>1).
 #
 # Tuples are ``(step_upper_bound, width)`` checked in order; first whose bound
 # >= the chunk's deepest member wins. ``--mem-step-scale`` shrinks all widths
 # (e.g. 0.5 on a shared GPU) to reduce how often the retry has to fire.
 _LENGTH_BUCKET_CHUNKS: Tuple[Tuple[int, int], ...] = (
-    (15, 32),    # <=15 steps: wide for throughput (retry halves any OOM).
-    (30, 8),
-    (60, 2),
-    (1 << 30, 1),  # >60 steps: SOLO (a diverging member fills the horizon).
+    (25, 8),     # <=25 steps: width 8 (widest verified-safe batch).
+    (40, 2),     # 25..40 steps: width 2 (a diverging member fills S~1400).
+    (80, 1),
+    (1 << 30, 1),  # >80 steps: SOLO (a diverging member fills the horizon).
 )
 
 
