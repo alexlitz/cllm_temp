@@ -617,12 +617,22 @@ def _layer13_sub_minuend_relay_head_specs(BD) -> tuple:
     # leaving the (gentle) negative slope to pick the OLDEST STACK0
     # frame (the original PSH) among them.
     K_FLAG = 200.0
-    # Per-byte (emit BYTE_INDEX_h dim, source STACK0_BYTE{h} flag dim).
+    # Per-byte route: (emit BYTE_INDEX_k dim, source STACK0_BYTE{k+1}
+    # flag dim, source STACK0_BYTE_VAL_{k+1} value band). The L14 borrow
+    # cascade is an INTER-byte stage: the rule scoped on BYTE_INDEX_k
+    # (the row that, autoregressively, PREDICTS output byte k+1)
+    # computes the byte-(k+1) difference and needs the MINUEND's byte
+    # k+1. So BYTE_INDEX_0 row needs operand byte 1 = STACK0_BYTE_VAL_1,
+    # BYTE_INDEX_1 row needs byte 2 = STACK0_BYTE_VAL_2, BYTE_INDEX_2 row
+    # needs byte 3 = STACK0_BYTE_VAL_3. (Verified spec_k=0: output byte 1
+    # is decoded by the LM head from the BYTE_INDEX_0 predictor row.)
     _BYTE_ROUTES = (
-        (1, BD.BYTE_INDEX_1, BD.STACK0_BYTE1,
+        (0, BD.BYTE_INDEX_0, BD.STACK0_BYTE1,
          BD.STACK0_BYTE_VAL_1_LO, BD.STACK0_BYTE_VAL_1_HI),
-        (2, BD.BYTE_INDEX_2, BD.STACK0_BYTE2,
+        (1, BD.BYTE_INDEX_1, BD.STACK0_BYTE2,
          BD.STACK0_BYTE_VAL_2_LO, BD.STACK0_BYTE_VAL_2_HI),
+        (2, BD.BYTE_INDEX_2, BD.STACK0_BYTE3,
+         BD.STACK0_BYTE_VAL_3_LO, BD.STACK0_BYTE_VAL_3_HI),
     )
     # Q slot 0: gate STRICTLY on the SUB byte-emit selector. TEMP+9 is
     # the cascade's SUB discriminator (1.0 ONLY on SUB byte rows; 0 on
@@ -642,7 +652,6 @@ def _layer13_sub_minuend_relay_head_specs(BD) -> tuple:
         AP(0, BD.MARK_AX, -L * 10),
         AP(0, BD.MARK_PC, -L * 10),
         AP(0, BD.TEMP + 8, -L * 10),
-        AP(0, BD.BYTE_INDEX_0, -L * 10),
         AP(0, BD.BYTE_INDEX_3, -L * 10),
         # slot 33 anti-leak: require TEMP+9 so the slot-0 softmax only
         # routes positively on the SUB byte-h emit rows.
@@ -738,7 +747,8 @@ def make_layer13_sub_minuend_relay_op() -> Operation:
     _claims = set()
     for j, (lo_name, hi_name) in enumerate(
         (("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"),
-         ("STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"))
+         ("STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"),
+         ("STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"))
     ):
         base = 3 + j * 32
         for k in range(16):
@@ -747,12 +757,14 @@ def make_layer13_sub_minuend_relay_op() -> Operation:
 
     return Operation(
         name="layer13_sub_minuend_relay",
-        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "STACK0_BYTE1", "STACK0_BYTE2",
+        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
                "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
-               "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI", "CONST"},
+               "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+               "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI", "CONST"},
         writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
-                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"},
+                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+                "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer13_sub_minuend_relay_ir,

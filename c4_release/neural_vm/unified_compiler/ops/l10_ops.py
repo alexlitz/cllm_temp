@@ -405,6 +405,26 @@ def _l10_carry_propagation_rules(
     carry_byte3 = dim_ref("carry", "alu", 3)
     threshold = 40.0 if cascade else 56.0
 
+    # Phase 2 multi-byte SUB minuend source (2026-06-12). The L14 borrow
+    # cascade is an INTER-byte stage: the rule scoped on BYTE_INDEX_k
+    # produces output byte (k+1) and needs the MINUEND's byte (k+1). The
+    # legacy bake matched the minuend from OUTPUT, but only operand byte
+    # 0 is relayed into OUTPUT (L7 operand_gather) -- bytes 1/2/3 of
+    # OUTPUT are always 0x00 (un-relayed). So every multi-byte SUB
+    # computed (0x00 - borrow) = 0xFF for bytes 1/2/3, byte-identically
+    # for 0x100-1 (wants 0x00) and 0-1 (wants 0xFF). The new SUB minuend
+    # selector reads STACK0_BYTE_VAL_{byte_idx+1}, where
+    # layer13_sub_minuend_relay (L13 head 4) deposits the pushed
+    # operand's byte (byte_idx+1) at the BYTE_INDEX_{byte_idx} predictor
+    # row. For 8-bit SUB those operand bytes are 0x00 (= the old OUTPUT
+    # match) so the result is byte-identical; for multi-byte it is
+    # corrective. ADD keeps its OUTPUT minuend match (ADD operands ARE
+    # in OUTPUT via the add path); only the SUB selector moves, and only
+    # the minuend SELECTOR -- the result still EMITS on OUTPUT so the
+    # CARRY+3 borrow relay (which rides OUTPUT) is untouched.
+    sub_minuend_lo = f"STACK0_BYTE_VAL_{byte_idx + 1}_LO"
+    sub_minuend_hi = f"STACK0_BYTE_VAL_{byte_idx + 1}_HI"
+
     # carry_weight=1.0, output_weight=20.0, mismatch_weight=0.0 in the
     # legacy bake; mismatch writes drop out of the rule because they
     # multiply to zero (``-S * 0 = 0`` produces no W_up cell).
@@ -495,19 +515,29 @@ def _l10_carry_propagation_rules(
             conds.append(("TEMP+8", -10.0))
         else:
             conds.append((add_carry_in_name, -10.0))
-        conds.append((f"OUTPUT_LO+{lo}", output_weight))
-        conds.append((f"OUTPUT_HI_THIS_STEP+{hi}", output_weight))
+        # SUB minuend match: the relayed STACK0_BYTE_VAL_{byte_idx+1}
+        # band (see the ``sub_minuend_lo/hi`` note above), not OUTPUT.
+        conds.append((f"{sub_minuend_lo}+{lo}", output_weight))
+        conds.append((f"{sub_minuend_hi}+{hi}", output_weight))
 
+        # The result EMITS on OUTPUT. At the cascade input OUTPUT byte
+        # (byte_idx+1) is always 0x00 (cell 0 hot in LO and HI) because
+        # only byte 0 was relayed there; the minuend now rides
+        # STACK0_BYTE_VAL. So cancel OUTPUT's known current content
+        # (cell 0) and set the computed new nibble. For 8-bit SUB the
+        # minuend = 0x00 -> (lo,hi)=(0,0) -> cancel-0 == the legacy
+        # cancel-lo, byte-identical; for multi-byte the cancel-0 + set
+        # yields the corrected byte.
         writes: list[tuple[str, float]] = []
-        if new_lo == lo:
-            writes.append((f"OUTPUT_LO+{lo}", 2.0 / S))
+        if new_lo == 0:
+            writes.append(("OUTPUT_LO+0", 2.0 / S))
         else:
-            writes.append((f"OUTPUT_LO+{lo}", -2.0 / S))
+            writes.append(("OUTPUT_LO+0", -2.0 / S))
             writes.append((f"OUTPUT_LO+{new_lo}", 2.0 / S))
-        if new_hi == hi:
-            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", 2.0 / S))
+        if new_hi == 0:
+            writes.append(("OUTPUT_HI_THIS_STEP+0", 2.0 / S))
         else:
-            writes.append((f"OUTPUT_HI_THIS_STEP+{hi}", -2.0 / S))
+            writes.append(("OUTPUT_HI_THIS_STEP+0", -2.0 / S))
             writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 2.0 / S))
         if lo == 0 and hi == 0 and byte_idx < 2:
             writes.append((carry_byte3, 2.0 / S))
