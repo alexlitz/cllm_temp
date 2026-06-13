@@ -2438,6 +2438,16 @@ class LayerCompiler:
         # ``stack0_byte0_sharp_flag`` precursor and read by the dump FFN. Private
         # slot so a liveness merge can't clobber the sharpness signal.
         "STACK0_B0_SHARP",
+        # Bounded RATIO-based PREV-dominant flag (Root 2 smear gate): written by
+        # the ``stack0_byte0_prev_dom_flag`` precursor and read by the
+        # NON-COMPARISON blocker on the SAME L25 tail block. Private slot so a
+        # liveness merge can't clobber the magnitude-independent one-hot signal.
+        "STACK0_B0_PREV_DOM",
+        # Bounded NON-COMPARISON blocker flag (Root 2 default-ON gate): written by
+        # the ``stack0_byte0_not_cmp_flag`` precursor and read by the dump FFN on
+        # the SAME L25 tail block. Private slot so a liveness merge can't clobber
+        # the arithmetic-vs-comparison signal that darkens the over-fire rows.
+        "STACK0_B0_NOT_CMP",
     })
 
     def _liveness_never_share(self, name: str) -> bool:

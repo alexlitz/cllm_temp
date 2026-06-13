@@ -560,6 +560,25 @@ def all_core_ops(
         # this flag so it fires ONLY on the genuinely-corrupted rows and stays a
         # no-op on healthy emissions. See l11_ops.make_stack0_byte0_sharp_flag_op.
         make_stack0_byte0_sharp_flag_op(),
+        # STACK0 byte-0 RATIO-based PREV-dominant flag precursor (Root 2 smear
+        # gate): writes ``STACK0_B0_PREV_DOM`` = 1 when ONE PREV slot dominates (a
+        # clean carried one-hot of ANY magnitude). Unlike SHARP (absolute per-slot
+        # margin -> misses a small clean one-hot like the comparison-result byte
+        # 0x01) this RATIO test is magnitude-independent, so the NON-COMPARISON
+        # blocker's smear rule darkens the add_16bit smear WITHOUT darkening small
+        # comparison results. See l11_ops.make_stack0_byte0_prev_dom_flag_op.
+        make_stack0_byte0_prev_dom_flag_op(),
+        # STACK0 byte-0 NON-COMPARISON blocker precursor (Root 2 DEFAULT-ON gate):
+        # writes the BOUNDED ``STACK0_B0_NOT_CMP`` flag on the L25 tail. NOT_CMP = 1
+        # on an arithmetic-result / JMP STACK0 row (rule 1: per-step arith/JMP
+        # opcode) OR a SMEARED-PREV row (rule 2: the add_16bit over-fire), and 0 on
+        # the genuine comparison drift rows. Reads the WIDENED-layout opcode bands
+        # (the static registry mismaps them — the same dim-map error Root 3
+        # corrected). The dump's re-point reads this flag as a -1000 BLOCKER so it
+        # darkens the add_16bit + jmp_forward over-fire while leaving the if/bool/
+        # expr drift rows firing -> the carry ships DEFAULT-ON. See
+        # l11_ops.make_stack0_byte0_not_cmp_flag_op.
+        make_stack0_byte0_not_cmp_flag_op(),
         # STACK0 byte-0 DUMP repopulate FFN (Root 2): the carried-vs-fresh GATE
         # half. On carried STACK0-marker rows (gated on the bounded
         # ``STACK0_B0_CARRIED`` flag AND, for the re-point path, ``STACK0_B0_SHARP``)

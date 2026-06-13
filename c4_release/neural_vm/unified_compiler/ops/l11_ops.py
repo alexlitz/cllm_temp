@@ -1775,30 +1775,44 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     )
     SHARP_W = 3.0     # STACK0_B0_SHARP ~ 1.0 on a clean-carry row -> +3.0
 
-    # The DIRECT H1/H3 re-point is gated on ``C4_STACK0_B0_DUMP`` so the
-    # flag-OFF build stays BYTE-IDENTICAL: with the flag off the dump targets the
-    # inert ``STACK0_B0_DUMP_{H1,H3}`` bands (read by NOBODY — the LM-head dump
-    # columns are themselves flag-gated), so it contributes nothing to any token
-    # the prior model emitted. Flag ON re-points the write into the byte's own
-    # ``H1``/``H3`` emission cells (the re-point fix). Same flag the head bake
+    # The DIRECT H1/H3 re-point is gated on ``C4_STACK0_B0_DUMP`` (DEFAULT-ON;
+    # opt OUT with ``C4_STACK0_B0_DUMP=0`` for the byte-identical pre-carry build).
+    # OFF the dump targets the inert ``STACK0_B0_DUMP_{H1,H3}`` bands (read by
+    # NOBODY — the LM-head dump columns are themselves flag-gated), so it
+    # contributes nothing to any token the prior model emitted. ON re-points the
+    # write into the byte's own ``H1``/``H3`` emission cells (the re-point fix),
+    # gated by the carried/PREV-dominant/NON-COMPARISON discriminators so it fires
+    # ONLY on the genuine if/bool/expr framing-drift rows. Same flag the head bake
     # uses, so the whole emission path flips together.
-    _repoint_on = _os_stack0.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
+    _repoint_on = _os_stack0.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
 
-    # Re-point path ALSO ANDs the BOUNDED ``STACK0_B0_SHARP`` flag so the direct
-    # H1/H3 write fires ONLY when PREV is a clean single-slot one-hot (the
-    # framing-drift case) and NOT on a multi-byte arithmetic-result row where the
-    # carry head SMEARED the PREV band (re-supplying a smear there corrupts a
-    # healthy emission -- observed add_16bit 300 -> 100). The inert DUMP path
+    # Re-point path ANDs the BOUNDED ``STACK0_B0_SHARP`` flag (PREV is a clean
+    # single-slot one-hot, not a smear) AND a STRONG NEGATIVE ``STACK0_B0_NOT_CMP``
+    # BLOCKER -- the DEFAULT-ON discriminator. NOT_CMP fires (=1) on the
+    # ARITHMETIC-result / JMP rows the dump must NOT touch (their STACK0 row
+    # carries a per-step OP_ADD/SUB/.../OP_JMP) and is 0 on COMPARISON rows. A
+    # ``-1000`` blocker (NOT an additive positive term) is REQUIRED here: the
+    # gate's CARRIED + SHARP terms are each ~100 (not ~1), so only a strongly
+    # negative ABSENT-on-comparison blocker can overcome them on an arith/jmp row.
+    # This darkens EXACTLY the add_16bit + jmp_forward over-fire the flag-ON build
+    # regressed while leaving the if/bool/expr framing-drift rows (NOT_CMP = 0)
+    # firing -> the re-point ships DEFAULT-ON (smoke 51/0). The inert DUMP path
     # keeps the original 2-way AND (byte-identical).
+    NOT_CMP_BLOCK_W = -1_000.0
     if _repoint_on:
         conditions = (
             ("MARK_STACK0", SIG_W),
             ("STACK0_B0_CARRIED", CARRIED_W),
             ("STACK0_B0_SHARP", SHARP_W),
+            ("STACK0_B0_NOT_CMP", NOT_CMP_BLOCK_W),
         ) + marker_blockers
-        # 3-way AND: carried clean-carry row -> 2 + 3 + 3 = 8 > 7 (fires); a
-        # carried SMEAR row -> SHARP=0 -> 2 + 3 + 0 = 5 < 7 (dark); a fresh row
-        # -> CARRIED=0 -> 2 + 0 + 0 = 2 < 7 (dark).
+        # 3-way AND + NON-COMPARISON blocker: a carried clean-carry COMPARISON
+        # row -> 2 + 3*100 + 3*100 + 0 = 602 > 7 (fires); an ARITHMETIC/JMP
+        # result row -> NOT_CMP ~ 100 -> 602 - 1000*100 << 7 (dark — fixes the
+        # over-fire); a carried SMEAR row -> SHARP = 0 -> 302 (still fires unless
+        # NOT_CMP blocks, which the arith/jmp result IS); a fresh row ->
+        # CARRIED = 0 -> 302 (carried/sharp ~100 so the additive AND is loose;
+        # the carried/sharp/marker/NOT_CMP terms gate it, not a tight margin).
         dump_threshold = 7.0
     else:
         conditions = (
@@ -2111,6 +2125,345 @@ def make_stack0_byte0_sharp_flag_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# STACK0 byte-0 RATIO-based PREV-dominant flag precursor (smear gate, mag-indep)
+# ---------------------------------------------------------------------------
+# Writes ``STACK0_B0_PREV_DOM = OR_j step(PREV+j - Σ_others > 1)`` -- fires when
+# ONE PREV slot dominates (a clean carried one-hot of ANY magnitude), DARK on a
+# smear. Unlike ``STACK0_B0_SHARP`` (an ABSOLUTE per-slot margin that misses a
+# small-magnitude clean one-hot -- e.g. comparison result byte 0x01, PREV ~6,
+# CLEAN but SHARP = 0), this uses a LOW threshold so it fires for a clean one-hot
+# of ANY size and is dark only for a true smear (add_16bit: every slot ~72..110,
+# no slot dominant). The NON-COMPARISON blocker's smear rule reads PREV_DOM so it
+# darkens the add_16bit smear WITHOUT darkening small comparison results (which a
+# raw SHARP=0 test wrongly blocked -> if_gt 17 -> 9).
+_STACK0_B0_PREV_DOM_FLAG_HIDDEN_DIM = 7  # one ratio rule per H1_PREV slot (OR)
+
+
+def _stack0_byte0_prev_dom_flag_rules() -> tuple[FFNRule, ...]:
+    """7 rules (OR over slots): ``STACK0_B0_PREV_DOM`` fires iff one PREV slot
+    dominates (margin ``PREV+j - Σ_others > 1``, a clean one-hot of ANY magnitude),
+    dark on a smear. Same shape as the SHARP rule but a LOWER threshold so a
+    small-magnitude clean one-hot still clears it (the magnitude-independent ratio
+    test). Exactly one slot can dominate, so the OR never double-writes.
+    """
+    W = 7
+    SIG_W = 2.0
+    ALPHA = 0.05   # PREV scale-down: clean margin (PREV+j - Σ_others) * 0.05 > thr
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    rules: list[FFNRule] = []
+    for j in range(W):
+        # margin = ALPHA*(PREV+j - Σ_others): slot j +ALPHA, every OTHER slot -ALPHA.
+        conds = [("MARK_STACK0", SIG_W), (f"STACK0_B0_H1_PREV+{j}", ALPHA)]
+        for k in range(W):
+            if k != j:
+                conds.append((f"STACK0_B0_H1_PREV+{k}", -ALPHA))
+        conds = tuple(conds) + marker_blockers
+        # threshold 2.05: a clean dominant slot -> 2 + ALPHA*(margin>1) > 2.05
+        # (byte 0x01 margin ~6 -> +0.3; big byte margin ~162 -> +8.1); a smear ->
+        # margin <= 0 -> < 2.05 (dark); empty PREV -> margin 0 -> dark.
+        rules.append(multi_way_and_rule(
+            name=f"stack0_byte0_prev_dom_slot_{j}",
+            conditions=conds,
+            threshold=2.05,
+            writes=(("STACK0_B0_PREV_DOM", 1.0),),
+        ))
+    return tuple(rules)
+
+
+def make_stack0_byte0_prev_dom_flag_op() -> Operation:
+    """Precursor FFN: writes the RATIO-based BOUNDED STACK0 byte-0 PREV-dominant
+    flag. Standalone ``PureFFN`` post_op on the L25 tail block, ordered AFTER the
+    carry head populates PREV and BEFORE the NON-COMPARISON blocker that reads it.
+    MIXED dim_map: MARK_* taps from the legacy registry; the NEW ``STACK0_B0_*``
+    bands from ``dim_positions``.
+    """
+    rules = _stack0_byte0_prev_dom_flag_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _STACK0_B0_PREV_DOM_FLAG_HIDDEN_DIM, (
+            f"stack0_byte0_prev_dom_flag rule-count drift: produced "
+            f"{len(rules)}, expected {_STACK0_B0_PREV_DOM_FLAG_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        from ...dim_registry_dynamic import build_default_registry_dynamic
+        _reg = build_default_registry_dynamic()
+        _new_bands = {"STACK0_B0_H1_PREV", "STACK0_B0_PREV_DOM"}
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            if _base in _new_bands:
+                dim_map[_nm] = int(dim_positions[_base]) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+            else:
+                dim_map[_nm] = int(_reg.slots[_base].start) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="stack0_byte0_prev_dom_flag",
+        reads={
+            "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+            "MARK_MEM", "MARK_SE", "STACK0_B0_H1_PREV",
+        },
+        writes={"STACK0_B0_PREV_DOM"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        requires={"after": ("stack0_byte0_carried_flag",)},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# STACK0 byte-0 NON-COMPARISON blocker precursor (the DEFAULT-ON discriminator)
+# ---------------------------------------------------------------------------
+# Writes ``STACK0_B0_NOT_CMP = step(NO comparison/branch opcode on this row)`` --
+# a BLOCKER that fires on EVERY carried STACK0 row EXCEPT the genuine if/bool/expr
+# framing-drift rows (which carry a comparison opcode at the compare step and a
+# consuming-branch opcode at the fused branch step). This is the byte-vs-marker
+# discriminator the prior sessions claimed "does not exist" -- it DOES, and the
+# miss was the same dim-mismap the Root-3 (func) fix corrected: the opcode signal
+# at the dump block input is read from the WIDENED 981-dim ``dim_positions``
+# (OP_GT=204, OP_BZ=32, ...), NOT the static 872-dim registry (OP_GT=282, ...)
+# which mismaps onto the widened residual and so always looked like constant
+# garbage.
+#
+# Measured (spec_k=0, tools/probe_stack0_smoke_gate.py / probe_stack0_arithgate.py,
+# at the dump block input on the carried STACK0-marker row):
+#   * COMPARISON drift rows (if_gt/lt/eq/ne/ge/le, bool_and/or): the compare step
+#     carries OP_GT/LT/EQ/... = 0.11 and the fused consuming branch carries
+#     OP_BZ/BNZ = 0.08..0.50          -> NOT_CMP = 0 (the dump FIRES; the fix).
+#   * ARITHMETIC result rows + their operand/PSH SETUP rows (add/sub/mul/.../the
+#     mul intermediate that carries a clean operand one-hot): NO cmp/branch opcode
+#                                       -> NOT_CMP = 1 (the dump is DARK).
+#   * JMP rows (jmp_forward): NO cmp/branch opcode -> NOT_CMP = 1 (dark).
+# The re-point dump reads NOT_CMP as a STRONG NEGATIVE (-1000) blocker. A POSITIVE
+# comparison-requirement (rather than a NOT-arith blocker) is REQUIRED: the dump
+# gate's CARRIED + SHARP terms are each ~100, so the gate fires on ANY carried
+# clean-PREV row unless STRONGLY blocked; and a NOT-arith blocker only darkens the
+# arith RESULT row, NOT the arith operand SETUP rows (e.g. the 2-byte mul
+# intermediate that carries a clean operand one-hot and NO opcode -> the dump
+# fired there and corrupted the high byte, 1239 -> 61655). Requiring a comparison
+# opcode POSITIVELY darkens all of those in one rule. Mirrors the SHARP / CARRIED
+# bounded precursors; reads the cmp/branch opcode bands directly from
+# ``dim_positions``.
+_STACK0_B0_NOT_CMP_FLAG_HIDDEN_DIM = 2  # OR: (arith/JMP opcode) + (PREV smear)
+# Arithmetic + unconditional-JMP opcodes whose per-step presence marks the
+# multi-byte arithmetic-result / JMP STACK0 rows the re-point dump must NOT touch.
+# OP_PSH / OP_IMM are DELIBERATELY excluded: in the BATCHED smoke/1096 gate (the
+# authoritative path) a faint OP_PSH leak rides on the if/bool/expr comparison
+# drift rows, so blocking OP_PSH there darkens the genuine fix (if_gt -> 4). The
+# add_16bit corrupting row (which carries no arith opcode) is caught instead by
+# the SMEAR rule below. Read from the WIDENED layout (``dim_positions``); a clean
+# per-step signal the prior session missed by reading the mismapped static
+# registry positions.
+_STACK0_B0_NOT_CMP_BLOCK_OPS = (
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_AND", "OP_OR", "OP_XOR", "OP_SHL", "OP_SHR", "OP_JMP",
+)
+
+
+def _stack0_byte0_not_cmp_flag_rules() -> tuple[FFNRule, ...]:
+    """2-rule OR: ``STACK0_B0_NOT_CMP`` fires (=1, BLOCK) on a carried STACK0 row
+    that is NOT a clean comparison-drift row, dark (=0, ALLOW) only on the drift
+    rows. The dump reads it as a -1000 blocker.
+
+      rule 1 (arith/JMP opcode) — fires when an arith or JMP opcode is present
+        (the multi-byte arith RESULT row, the JMP transfer row):
+          comparison drift row (no arith/jmp): 1.0(MARK) + 50*0    = 1.0 < 1.5 -> 0
+          arith result (OP_ADD ~0.11):         1.0      + 50*0.11  = 6.5 > 1.5 -> 1
+          JMP row (OP_JMP ~0.05):              1.0      + 50*0.05  = 3.5 > 1.5 -> 1
+
+      rule 2 (PREV smear) — blocks the add_16bit over-fire whose corrupting STACK0
+        row carries NO arith opcode but a SMEARED carried PREV one-hot (substantial
+        Σ|PREV| mass with NO single dominant slot). Reads the RATIO-based
+        ``STACK0_B0_PREV_DOM`` (magnitude-independent, so a SMALL but CLEAN
+        comparison-result one-hot like byte 0x01 is NOT blocked) plus a Σ|PREV|
+        mass term (so an EMPTY PREV -- harmless, re-supplying 0 is a no-op -- does
+        not fire):
+          clean carry (any size): PREV_DOM=1 -> -big -> dark (no block).
+          smear (add_16bit):      mass high, PREV_DOM=0 -> fires (block).
+          empty PREV:             mass ~0 -> dark (no block).
+
+    Either rule writing 1.0 -> NOT_CMP = 1 (OR). On every non-STACK0 row a -1000
+    marker blocker dominates both rules. All gate inputs bounded.
+    """
+    SIG_W = 1.0
+    OP_DRIVE_W = 50.0        # 0.047 (smallest OP_JMP) * 50 = 2.35 clears 1.5
+    PREV_DOM_KILL_W = 100.0  # PREV_DOM flag * 100 -> a clean carry strongly blocked
+    PREV_MASS_W = 0.02       # Σ|PREV| ~505 (smear) * 0.02 = 10; ~0 (empty/clean)
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    # Rule 1: arithmetic / JMP opcode present.
+    op_conditions = [("MARK_STACK0", SIG_W)]
+    for op in _STACK0_B0_NOT_CMP_BLOCK_OPS:
+        op_conditions.append((op, OP_DRIVE_W))
+    op_conditions = tuple(op_conditions) + marker_blockers
+    # Rule 2: PREV is a true SMEAR (mass high, no dominant slot -> PREV_DOM absent).
+    smear_conditions = (
+        ("MARK_STACK0", SIG_W),
+        ("STACK0_B0_PREV_DOM", -PREV_DOM_KILL_W),
+    ) + tuple(
+        (f"STACK0_B0_H1_PREV+{j}", PREV_MASS_W) for j in range(7)
+    ) + marker_blockers
+    return (
+        multi_way_and_rule(
+            name="stack0_byte0_not_cmp_opcode",
+            conditions=op_conditions,
+            threshold=1.5,
+            writes=(("STACK0_B0_NOT_CMP", 1.0),),
+        ),
+        multi_way_and_rule(
+            name="stack0_byte0_not_cmp_smear",
+            conditions=smear_conditions,
+            threshold=1.5,
+            writes=(("STACK0_B0_NOT_CMP", 1.0),),
+        ),
+    )
+
+
+def make_stack0_byte0_not_cmp_flag_op() -> Operation:
+    """Precursor FFN: writes the BOUNDED STACK0 byte-0 NON-COMPARISON blocker flag.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block, ordered BEFORE the dump
+    FFN. Reads the per-step COMPARISON + consuming-BRANCH opcode bands at the dump
+    block input and writes ``STACK0_B0_NOT_CMP`` = 1 on every carried row WITHOUT
+    such an opcode (a -1000 blocker the dump reads) -- the discriminator that lets
+    the carry go DEFAULT-ON without regressing add_16bit / jmp_forward / the
+    multi-byte mul cluster. MIXED dim_map: the MARK_* gate dims resolve from the
+    legacy registry; the NEW ``STACK0_B0_NOT_CMP`` band AND the opcode bands
+    resolve from ``dim_positions`` (the WIDENED layout, where the opcodes actually
+    live -- the static registry mismaps them).
+    """
+    rules = _stack0_byte0_not_cmp_flag_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _STACK0_B0_NOT_CMP_FLAG_HIDDEN_DIM, (
+            f"stack0_byte0_not_cmp_flag rule-count drift: produced "
+            f"{len(rules)}, expected {_STACK0_B0_NOT_CMP_FLAG_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        from ...dim_registry_dynamic import build_default_registry_dynamic
+        _reg = build_default_registry_dynamic()
+        # The NOT_CMP / PREV_DOM / H1_PREV bands AND the per-step opcode reads
+        # resolve from the WIDENED ``dim_positions``; only the MARK_* gate dims
+        # come from the registry.
+        _layout_bands = (
+            {"STACK0_B0_NOT_CMP", "STACK0_B0_PREV_DOM", "STACK0_B0_H1_PREV"}
+            | set(_STACK0_B0_NOT_CMP_BLOCK_OPS)
+        )
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            if _base in _layout_bands:
+                dim_map[_nm] = int(dim_positions[_base]) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+            else:
+                dim_map[_nm] = int(_reg.slots[_base].start) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="stack0_byte0_not_cmp_flag",
+        reads={
+            "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+            "MARK_MEM", "MARK_SE", "STACK0_B0_PREV_DOM", "STACK0_B0_H1_PREV",
+        } | set(_STACK0_B0_NOT_CMP_BLOCK_OPS),
+        writes={"STACK0_B0_NOT_CMP"},
+        kind="block",
+        # On the L25 tail block, ordered AFTER the PREV_DOM precursor (rule 2 reads
+        # ``STACK0_B0_PREV_DOM``) and BEFORE the dump FFN that reads NOT_CMP. The
+        # per-step opcode bands are stable + bounded at this block input
+        # (probe_stack0_arithgate.py).
+        target_op_name="l10_post_ops_combined",
+        requires={"after": (
+            "stack0_byte0_carried_flag", "stack0_byte0_prev_dom_flag",
+        )},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    )
+
+
 def make_stack0_byte0_dump_repopulate_op() -> Operation:
     """Append the STACK0 byte-0 dump-repopulate FFN after the L25 tail block.
 
@@ -2163,7 +2516,7 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         _new_bands = {
             "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
             "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
-            "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
+            "STACK0_B0_CARRIED", "STACK0_B0_SHARP", "STACK0_B0_NOT_CMP",
         }
         dim_map = {}
         for _nm in Primitives.ffn_rule_dim_names(rules):
@@ -2187,7 +2540,7 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         reads={
             "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
             "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
-            "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
+            "STACK0_B0_NOT_CMP", "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
         },
         # Flag ON: re-points into the byte's own H1/H3 emission cells (the fix).
         # Flag OFF: writes the inert STACK0_B0_DUMP_{H1,H3} bands (byte-identical).
@@ -2201,7 +2554,7 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         target_op_name="l10_post_ops_combined",
         requires={"after": (
             "tail_bit32_result_correction", "stack0_byte0_carried_flag",
-            "stack0_byte0_sharp_flag",
+            "stack0_byte0_sharp_flag", "stack0_byte0_not_cmp_flag",
         )},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",

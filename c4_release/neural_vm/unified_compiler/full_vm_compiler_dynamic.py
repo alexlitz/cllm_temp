@@ -2063,6 +2063,40 @@ def compile_full_vm_dynamic(
         # rows and stays a NO-OP on healthy multi-byte emissions (which would
         # otherwise be corrupted by re-supplying a smeared one-hot).
         "STACK0_B0_SHARP": 1,
+        # Bounded RATIO-based PREV-dominant flag (Root 2 default-ON smear gate).
+        # ``STACK0_B0_SHARP`` uses an ABSOLUTE per-slot margin (>=100) so it MISSES
+        # a CLEAN one-hot whose magnitude is small (a comparison result byte 0x01,
+        # PREV ~6, CLEAN but SHARP = 0). A magnitude-independent RATIO test fires on
+        # a clean one-hot of ANY size and is DARK on a smear (add_16bit). The
+        # NON-COMPARISON blocker's smear rule reads this so it darkens the add_16bit
+        # smear WITHOUT darkening small comparison results (which a raw SHARP=0 test
+        # wrongly blocked -> if_gt 17 -> 9). Written by the
+        # ``stack0_byte0_prev_dom_flag`` precursor; read by
+        # ``stack0_byte0_not_cmp_flag``.
+        "STACK0_B0_PREV_DOM": 1,
+        # Bounded NON-COMPARISON blocker flag (Root 2 default-ON discriminator).
+        # The framing-drift rows the dump must re-emit are COMPARISON results; the
+        # rows it must NOT touch are ARITHMETIC results (add_16bit), JMP transfers
+        # (jmp_forward), AND the operand/PSH SETUP rows of an arithmetic program
+        # (e.g. the 2-byte mul intermediate). The discriminator is a clean per-step
+        # opcode the prior session missed: it read the STATIC 872-dim registry
+        # opcode dims (OP_GT=282 ...) which mismap onto the WIDENED 981-dim build
+        # (OP_GT=204, OP_BZ=32 ...) and so always saw constant garbage. Reading the
+        # WIDENED dim_positions, the genuine drift rows carry a COMPARISON opcode at
+        # the compare step (OP_GT/LT/EQ/... ~ 0.11) and a consuming-BRANCH opcode at
+        # the fused branch step (OP_BZ/BNZ ~ 0.08..0.50), while EVERY other carried
+        # row (arith result, arith setup, JMP) has NONE (probe_stack0_smoke_gate.py
+        # / probe_stack0_arithgate.py, spec_k=0). A precursor FFN writes
+        # ``STACK0_B0_NOT_CMP = 1`` when NO cmp/branch opcode is present and 0 on a
+        # comparison/branch row; the re-point dump reads it as a -1000 BLOCKER so it
+        # fires ONLY on the drift rows. THIS is the discriminator that lets the
+        # carry go default-ON (smoke 51/0): it darkens the add_16bit + jmp_forward +
+        # mul over-fire the flag-ON build regressed. A POSITIVE comparison
+        # requirement (not a NOT-arith blocker) is required because the gate's
+        # CARRIED + SHARP terms are each ~100 (so any clean-PREV row fires unless
+        # strongly blocked) AND a NOT-arith blocker misses the arith SETUP rows.
+        # Mirrors the SHARP / CARRIED bounded precursors.
+        "STACK0_B0_NOT_CMP": 1,
     }
     # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the production-default
     # bands (A/B diagnostics only — the carry ops then reference undeclared
@@ -2192,7 +2226,7 @@ def compile_full_vm_dynamic(
             # columns (output-affecting, no source change), so the ON and OFF
             # builds must NEVER share a memo / disk entry.
             "C4_STACK0_B0_DUMP": (
-                os.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
+                os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -2678,7 +2712,7 @@ def _bake_from_scheduled_ops(
         # with =0, output-affecting, no source change): the ON / OFF builds must
         # never share a serialised entry.
         "C4_STACK0_B0_DUMP": (
-            os.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
+            os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

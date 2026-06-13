@@ -2168,7 +2168,7 @@ def make_stack0_byte0_dump_head_bake_op() -> Operation:
     docs/STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md for the full probe trail.
     """
     import os as _os
-    _emission_on = _os.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
+    _emission_on = _os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
 
     def _bake(model, dim_positions, S):
         del S

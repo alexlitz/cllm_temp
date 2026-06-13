@@ -1,19 +1,84 @@
 # STACK0 byte-0 cross-step carry (Root 2 — if/bool/expr framing drift) — 2026-06-13
 
-Status: **carry + DIRECT-H1/H3 RE-POINT LANDED, flag-gated OFF** (`C4_STACK0_B0_DUMP`,
-default 0). Byte-identical to clean main; smoke **50/1** (only the pre-existing
-`simple_function` arch-block). The re-point (this update, 2026-06-13) makes the
-carried step emit the CORRECT byte and is a strong NET-POSITIVE on the target
-clusters (**if_gt 4→17, bool_and 8→16** at full_trace) — but it cannot be
-default-ON because there is NO residual-level discriminator between a
-framing-drift row (byte should emit) and a healthy carried-marker row (marker
-should emit), so it over-fires on multi-byte arithmetic-result rows
-(`add` band 16→8, smoke `add_16bit`/`jmp_forward` regress). See
-"The re-point that LANDED" + "Why it STILL can't be default-ON" below. The
-original "additive-band" sections (kept below for history) were SUPERSEDED by
-the direct-H1/H3 re-point.
+Status: **LANDED DEFAULT-ON** (`C4_STACK0_B0_DUMP`, default **1**; opt OUT with
+`=0`). Rebased onto current main `dedbb063` (incl. the Root-3 func fix). The
+missing gate discriminator — claimed "does not exist" by the prior session — DID
+exist; the prior agent's no-discriminator claim repeated the func agents'
+"OP_ENT is a hard constant" error (a DIM-MISMAP, not a real absence). Smoke
+**51/0** default-ON; byte-identical to the Root-3 main with `=0`.
 
-Branch base: main HEAD `2479bb06`. spec_k=0, GPU 0, `alu_mode='efficient'`.
+Target clusters (full_trace, flag-OFF baseline → default-ON):
+**if_gt 4→17, if_lt 4→21, if_eq 8→21, bool_and 8→16, expr_add_mul 1→2,
+expr_paren →12, expr_mod →9** (net +52 across the if/bool/expr targets).
+
+KNOWN TRADE (corpus-level, NOT a smoke guard): the 1096 `mul` cluster regresses
+**20→11** (-9). The dump over-fires on the operand-PSH SETUP rows of a multi-byte
+arithmetic program (those carry a clean operand one-hot and — in the BATCHED gate
+— a faint `OP_PSH` leak that ALSO rides the if-comparison drift rows, so an
+explicit `OP_PSH` block recovers mul but darkens the if-fix, if_gt→4). The
+smoke `mul_basic`/`mul_overflow` tests PASS (smoke 51/0). The if/bool gains
+(+52) dominate the mul trade (-9), and the brief's hard `smoke==51/0` invariant
+is met, so the carry ships default-ON. The clean fix for the next agent is a
+batched-robust operand-SETUP vs comparison-result discriminator (the serial-only
+`OP_PSH`/positive-`OP_GT` signals don't survive the batched residual).
+
+## The discriminator the prior session missed (the DIM-MISMAP)
+
+The prior session tried "opcode/CMP markers (all stale=1.0 at STACK0 rows)" and
+concluded no per-step discriminator exists. That reading sampled the opcode dims
+at their **STATIC 872-dim registry positions** (`OP_ADD=287`, `OP_JMP=264`, ...)
+which **mismap onto the WIDENED 981-dim build** (`OP_ADD=209`, `OP_JMP=189`, ...).
+Reading the WIDENED `layout.dim_positions`, the carried STACK0-marker row at the
+dump block input DOES carry a clean, stable, BOUNDED per-step opcode (spec_k=0,
+`tools/probe_stack0_arithgate.py` / `probe_stack0_smoke_gate.py`):
+
+* COMPARISON / bool result rows (if_gt/lt/eq/ne/ge/le, bool_and/or): every arith
+  opcode = 0.000 AND `OP_JMP` = 0.000.
+* ARITHMETIC result rows (add/sub/mul/and/or/shl ...): `Σ(arith opcodes)` = 0.110
+  (the per-step OP_ADD/SUB/...).
+* JMP rows (jmp_forward): `OP_JMP` = 0.05..0.30.
+
+So the over-fire victims (`add_16bit`, `jmp_forward`) are exactly the rows with a
+per-step arith/JMP opcode, and the framing-drift rows the carry must fix are
+exactly the comparison rows (opcode = 0). That is the discriminator.
+
+## The gate (two bounded blockers folded into `STACK0_B0_NOT_CMP`)
+
+The re-point dump reads a single bounded `STACK0_B0_NOT_CMP` BLOCKER (`-1000`
+weight — a positive flag cannot work because the gate's `CARRIED`+`SHARP` terms
+are each ~100, so only a strongly-negative ABSENT-on-comparison blocker overcomes
+them). `NOT_CMP` is an OR of two precursor rules (`stack0_byte0_not_cmp_flag`):
+
+1. **arith/JMP opcode present** — `step(MARK_STACK0 + 50·Σ(OP_ADD/.../OP_JMP) ≥
+   1.5)`. Blocks `jmp_forward` (which has a CLEAN PREV one-hot, so the smear rule
+   alone misses it). Reads the opcode bands from the WIDENED `dim_positions`.
+2. **PREV is a true SMEAR** — `step(MARK_STACK0 + 0.02·Σ|PREV| − 100·PREV_DOM ≥
+   1.5)`. Blocks `add_16bit` (whose corrupting STACK0 row carries NO arith opcode
+   but a smeared PREV one-hot). Uses a new RATIO-based `STACK0_B0_PREV_DOM` flag
+   (`stack0_byte0_prev_dom_flag`): `OR_j step(PREV+j − Σ_others > 1)` — fires for
+   a clean one-hot of **ANY magnitude**, unlike the absolute-margin
+   `STACK0_B0_SHARP` which MISSES a small clean one-hot (the comparison result
+   byte `0x01`, PREV ~6) and so wrongly blocked those (regressed if_gt 17→9 when
+   used as the smear test). The `Σ|PREV|` mass term keeps an EMPTY PREV from
+   firing (re-supplying 0 is a harmless no-op).
+
+Net: the dump fires ONLY on a carried COMPARISON row whose carried PREV is a
+clean one-hot — exactly the framing-drift rows — and is dark on arith-result and
+JMP rows. `add_16bit` (300→300) and `jmp_forward` (42→42) stay byte-correct.
+
+## Geometry / bands
+
+Two new bounded width-1 bands (`STACK0_B0_PREV_DOM`, `STACK0_B0_NOT_CMP`) added
+to `_PRODUCTION_EXTRA_RESIDUAL_DIMS` (now 47 extra dims: `872+47=919` still rounds
+up to the SAME `d_model=981` = 9×109, so **no geometry change, no new head**).
+Both are in `_LIVENESS_NEVER_SHARE`. Two new tail precursor FFNs
+(`stack0_byte0_prev_dom_flag`, `stack0_byte0_not_cmp_flag`).
+
+Branch base: rebased onto main `dedbb063`. spec_k=0, GPU 0, `alu_mode='efficient'`.
+
+---
+
+## (historical) the prior flag-OFF status
 
 ## The bug (probe-confirmed, NOT the brief's hypothesis)
 
