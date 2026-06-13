@@ -515,13 +515,20 @@ def all_core_ops(
         # the byte-0 carry (CARRY+1, the clean autoregressive
         # discriminator). Byte-identical on 8-bit ADD; add 1096 4/50->39/50.
         make_l10_add_high_byte_adder_op(),
+        # AX byte-1 DUMP band-pass UPPER-cut precursor: writes
+        # ``AX_CARRY_OVERFLOW = step(AX_CARRY_HI+2 >= 3.0)`` so the dump FFN
+        # below can BAND-PASS Σ AX_CARRY (exclude SHL ~+12.85 / JMP ~+47.86),
+        # not just lower-bound it. Must bake BEFORE the dump (the dump's
+        # requires-after pins it). See l11_ops.make_ax_byte1_carry_overflow_flag_op.
+        make_ax_byte1_carry_overflow_flag_op(),
         # AX byte-1 DUMP repopulate FFN: the carried-vs-fresh GATE half of the
         # AX byte-1 register-dump carry. Copies the prev-step one-hot from
         # ``H1_PREV_STEP`` (filled by ``layer13_ax_byte1_dump_carry``) into the
         # emission band ``H1_DUMP_OUT`` ONLY on carried (non-AX-writing) steps
-        # (gated on the AX_CARRY fresh ~-988 / carried ~+2.7 separation, held
-        # to the final block). Standalone PureFFN post_op on the L25 tail block
-        # after tail_bit32. See l11_ops.make_ax_byte1_dump_repopulate_op.
+        # (gated on the AX_CARRY fresh ~-988 / carried ~+2.7 separation +
+        # the AX_CARRY_OVERFLOW upper-cut, held to the final block). Standalone
+        # PureFFN post_op on the L25 tail block after tail_bit32. See
+        # l11_ops.make_ax_byte1_dump_repopulate_op.
         make_ax_byte1_dump_repopulate_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates

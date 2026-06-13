@@ -1984,7 +1984,16 @@ def compile_full_vm_dynamic(
     # byte-behaviour-identical (every new band is zero on every row the prior
     # model touched). Threaded by NAME via ``layout.dim_positions`` -- they
     # must NOT be op-declared ``declare_dim``s.
-    _PRODUCTION_EXTRA_RESIDUAL_DIMS = {"H1_PREV_STEP": 7, "H1_DUMP_OUT": 7}
+    # ``AX_CARRY_OVERFLOW`` (1) is the band-pass UPPER-cut kill flag: the
+    # precursor ``ax_byte1_carry_overflow_flag`` FFN writes a step indicator
+    # here (0 in the carry band, large-positive for SHL/JMP) that the dump FFN
+    # reads as a strong negative AND condition. It excludes the over-fire step
+    # classes (SHL Σ AX_CARRY ~+12.85, JMP ~+47.86) that a single LOWER-bound
+    # threshold cannot. Always present (the precursor + dump are baked
+    # unconditionally; only the LM-head emission is C4_AX_BYTE1_DUMP-gated).
+    _PRODUCTION_EXTRA_RESIDUAL_DIMS = {
+        "H1_PREV_STEP": 7, "H1_DUMP_OUT": 7, "AX_CARRY_OVERFLOW": 1,
+    }
     # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the production-default
     # bands (A/B diagnostics only — the carry ops then reference undeclared
     # dims, so this is for layout/geometry comparison, not a runnable build).

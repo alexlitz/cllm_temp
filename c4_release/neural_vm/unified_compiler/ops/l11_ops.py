@@ -3,7 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -1207,21 +1207,45 @@ def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
         conditions_base.append((f"AX_CARRY_HI+{k}", AXC_W))
     conditions = tuple(conditions_base) + blockers
 
+    # ------------------------------------------------------------------
+    # Two-sided band-pass on Σ AX_CARRY (the §524 range check applied to a
+    # CONTINUOUS band): an UPPER-bound OVERFLOW KILL on top of the LOWER bound.
+    # ------------------------------------------------------------------
+    # A SINGLE linear AND can only LOWER-bound Σ AX_CARRY (fire on >= lo). It
+    # cannot exclude step classes whose AX_CARRY sits ABOVE the carry band:
+    # measured (spec_k=0, efficient ALU, last block, AX byte-1 predictor row):
+    #   * genuine CARRY (PSH/ADJ)  Σ AX_CARRY ~ +2.65 (tight cluster 2.65-2.70)
+    #   * memory LOAD (LI/LC)       ~ +0.85   -> dark (below lo)
+    #   * fresh IMM/ADD             ~ -988    -> dark (far below)
+    #   * SHL/SHR result            ~ +12.85  -> MUST be dark (was over-firing)
+    #   * JMP                       ~ +47.86  -> MUST be dark (was over-firing)
+    # The fire cluster (2.65-2.70) and the over-fire classes (>= 12.85) have a
+    # WIDE clean gap, so the upper cut is robust. The discriminator that is
+    # bounded in the fire band but blows up for the over-fire classes is the
+    # ``AX_CARRY_HI+2`` cell (carry ~0.63-1.31, SHL +6.41, JMP +23.93 — see
+    # tools/probe_ax_carry_cells.py).
+    #
+    # A simple difference-of-SiLU-steps CANNOT band-pass a continuous input
+    # (the two unbounded ReLU tails never cancel; verified: the negative-write
+    # ceiling drove H1_DUMP_OUT NEGATIVE on SHR, flipping the byte-1 argmax to a
+    # wrong token -> 0x2A became 0x102A). The robust form is a TWO-STAGE kill: a
+    # precursor FFN (``ax_byte1_carry_overflow_flag``) writes a bounded-by-use
+    # ``AX_CARRY_OVERFLOW`` step indicator that is ZERO in the carry band and
+    # large-positive for SHL/JMP; this rule then adds it as a STRONG NEGATIVE
+    # condition. Out of band the AND sum is driven far below threshold ->
+    # silu ~= 0 -> H1_DUMP_OUT == EXACTLY 0 (NOT negative), so the real SHL/JMP
+    # byte-1 comes through the normal H1 path untouched. In band the flag is 0,
+    # so the dump fires byte-identically to the lower-bound-only design.
+    OVERFLOW_KILL_W = 1_000.0
+    conditions = conditions + (("AX_CARRY_OVERFLOW", -OVERFLOW_KILL_W),)
+
     rules: list[FFNRule] = []
     for j in range(H1_W):
         rules.append(multi_way_and_rule(
             name=f"ax_byte1_dump_repopulate_slot_{j}",
             # threshold 4.5 (balanced AND of AX-register + byte-1-signature*2 +
-            # the +2.7-vs-+0.8 carry-vs-load AX_CARRY split):
-            #   genuine CARRY AX+1 = ADDR_B1_HI+8(4.0*0.25=1.0) + sig(0.97*2=1.94)
-            #     + AXC(+2.7) ~= 5.6 > 4.5 -> FIRES;
-            #   memory-LOAD AX+1 (LI/LC) = 1.0 + 1.94 + AXC(+0.8) ~= 3.74 < 4.5
-            #     -> DARK (prevents the stale-byte-1 leak onto loaded values);
-            #   AX byte-2/3 = 0.82/0.68 + 0(no sig) + AXC(+2.7) ~= 3.5 < 4.5 ->
-            #     DARK (missing the byte-1 signature);
-            #   carried-PC byte-1 = ~0 + 1.94 + AXC(~0.9) ~= 2.8 < 4.5 -> DARK
-            #     (no AX-register signal);
-            #   fresh IMM/ADD AX+1 = 1.0 + 1.94 - 988 << 4.5 -> DARK.
+            # the +2.7-vs-+0.8 carry-vs-load AX_CARRY split). The OVERFLOW kill
+            # term excludes SHL(+12.85)/JMP(+47.86) without touching the carry.
             conditions=conditions,
             threshold=4.5,
             gate=f"H1_PREV_STEP+{j}",
@@ -1231,6 +1255,121 @@ def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
             writes=((f"H1_DUMP_OUT+{j}", 0.02),),
         ))
     return tuple(rules)
+
+
+# ---------------------------------------------------------------------------
+# AX byte-1 dump band-pass — UPPER-CUT precursor (overflow kill flag)
+# ---------------------------------------------------------------------------
+# Writes ``AX_CARRY_OVERFLOW = step(AX_CARRY_HI+2 >= 3.0)`` so the dump FFN can
+# band-PASS Σ AX_CARRY (not just lower-bound it). The discriminator
+# ``AX_CARRY_HI+2`` is BOUNDED in the carry band (~0.63-1.31) and large for the
+# over-fire classes (SHL +6.41, JMP +23.93) — see tools/probe_ax_carry_cells.py.
+# The step output is unbounded-positive out of band, which is exactly what a
+# KILL term wants: it pushes the dump AND deeply below threshold (-> silu ~= 0
+# -> H1_DUMP_OUT == EXACTLY 0, NOT negative, so the real SHL/JMP byte-1 stays on
+# the normal H1 path). In the carry band the step input is far below 3.0, so the
+# flag is ~0 and the dump fires byte-identically to the lower-bound-only design.
+_AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM = 1
+# Separation threshold on AX_CARRY_HI+2: carry rows <= ~1.31, over-fire rows
+# >= 6.41 -> 3.0 sits cleanly in the gap.
+_AX_CARRY_OVERFLOW_HI2_THRESHOLD = 3.0
+
+
+def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:
+    """1 rule: ``AX_CARRY_OVERFLOW = step(AX_CARRY_HI+2 >= 3.0)``."""
+    return (
+        step_function_rule(
+            name="ax_byte1_carry_overflow_flag",
+            input_dim="AX_CARRY_HI+2",
+            # threshold target-0.5 convention: fire when the raw value is at or
+            # above 3.0 (carry rows ~<=1.31 stay dark; SHL ~6.41 / JMP ~23.93
+            # fire). write_value 2.0 -> the dump reads it with weight -1000, so
+            # even a small positive flag deeply darkens the dump AND.
+            threshold=_AX_CARRY_OVERFLOW_HI2_THRESHOLD,
+            write_dim="AX_CARRY_OVERFLOW",
+            write_value=2.0,
+        ),
+    )
+
+
+def make_ax_byte1_carry_overflow_flag_op() -> Operation:
+    """Precursor FFN: writes the AX byte-1 dump band-pass UPPER-cut kill flag.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block, appended AFTER
+    ``tail_bit32_result_correction`` but BEFORE ``ax_byte1_dump_repopulate`` (so
+    the dump reads a freshly-written ``AX_CARRY_OVERFLOW``). MIXED dim_map: the
+    input ``AX_CARRY_HI`` resolves from the legacy dynamic *registry* (the model
+    residual carries it there, NOT at the declarative layout position — same
+    split the dump documents); the output ``AX_CARRY_OVERFLOW`` is a NEW
+    declarative band, resolved from ``dim_positions``.
+    """
+    rules = _ax_byte1_carry_overflow_flag_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM, (
+            f"ax_byte1_carry_overflow_flag rule-count drift: produced "
+            f"{len(rules)}, expected {_AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        from ...dim_registry_dynamic import build_default_registry_dynamic
+        _reg = build_default_registry_dynamic()
+        _new_bands = {"AX_CARRY_OVERFLOW"}
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            if _base in _new_bands:
+                dim_map[_nm] = int(dim_positions[_base]) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+            else:
+                dim_map[_nm] = int(_reg.slots[_base].start) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="ax_byte1_carry_overflow_flag",
+        reads={"AX_CARRY_HI"},
+        writes={"AX_CARRY_OVERFLOW"},
+        kind="block",
+        # Append on the same L25 block AFTER the tail correction but BEFORE the
+        # dump (the dump's ``requires after this`` pins the order).
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
 
 
 def make_ax_byte1_dump_repopulate_op() -> Operation:
@@ -1287,7 +1426,10 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
         # declarative layout, so THOSE resolve from ``dim_positions``.
         from ...dim_registry_dynamic import build_default_registry_dynamic
         _reg = build_default_registry_dynamic()
-        _new_bands = {"H1_PREV_STEP", "H1_DUMP_OUT"}
+        # AX_CARRY_OVERFLOW is also a NEW declarative band (written by the
+        # precursor at dim_positions), so it resolves from the layout, not the
+        # legacy registry.
+        _new_bands = {"H1_PREV_STEP", "H1_DUMP_OUT", "AX_CARRY_OVERFLOW"}
         dim_map = {}
         for _nm in Primitives.ffn_rule_dim_names(rules):
             _base = _nm.split("+", 1)[0]
@@ -1310,14 +1452,18 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
         reads={
             "ADDR_B0_LO", "ADDR_B1_HI", "AX_CARRY_LO", "AX_CARRY_HI",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
-            "MARK_MEM", "MARK_SE", "H1_PREV_STEP",
+            "MARK_MEM", "MARK_SE", "H1_PREV_STEP", "AX_CARRY_OVERFLOW",
         },
         writes={"H1_DUMP_OUT"},
         kind="block",
-        # Append AFTER the tail correction on the same L25 block so this op is
-        # the last writer of H1_DUMP_OUT before the LM head reads it.
+        # Append AFTER the tail correction AND after the overflow-flag precursor
+        # on the same L25 block, so this op is the last writer of H1_DUMP_OUT
+        # before the LM head reads it AND it reads a freshly-written
+        # AX_CARRY_OVERFLOW (the band-pass UPPER-cut kill flag).
         target_op_name="l10_post_ops_combined",
-        requires={"after": "tail_bit32_result_correction"},
+        requires={"after": (
+            "tail_bit32_result_correction", "ax_byte1_carry_overflow_flag",
+        )},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=ir,

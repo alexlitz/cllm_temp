@@ -2415,6 +2415,11 @@ class LayerCompiler:
         # carried one-hot), corrupting the byte-1 emission. See
         # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
         "H1_PREV_STEP", "H1_DUMP_OUT",
+        # AX byte-1 dump band-pass UPPER-cut kill flag. Written by the
+        # ``ax_byte1_carry_overflow_flag`` precursor FFN and read by the dump
+        # FFN on the SAME L25 tail block — a short but cross-op lifetime; keep
+        # it private so a liveness merge can't clobber the kill signal.
+        "AX_CARRY_OVERFLOW",
     })
 
     def _liveness_never_share(self, name: str) -> bool:
