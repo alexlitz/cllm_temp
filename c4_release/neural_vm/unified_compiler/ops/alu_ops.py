@@ -936,6 +936,21 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # and dim_layout.py:52-58). Result base = OUTPUT_LO; the high
         # nibble write at OUTPUT_LO+16+k lands in OUTPUT_HI+k since the
         # two bands are contiguous in _SetDim (174..189, 190..205).
+        # Operand-magnitude-matched AND thresholds (2026-06-13 MUL root fix).
+        # The L8 operand-gather emits a ~6-magnitude one-hot on ALU_LO
+        # (operand A) and a ~0.9-magnitude one-hot on AX_CARRY_LO (operand B)
+        # at the MARK_AX MUL row — NOT the 1.0/1.0 the default 30/30/40+thr80
+        # AND-pattern assumes. With the defaults the ALU_LO term alone
+        # (30 * 6 = 180) blows past threshold 80, so every (a=k, b=*) rule
+        # fires and the OUTPUT product band fills with noise (decodes to 1).
+        # Rescale: operand_a weight 5 (5 * 6 = 30), operand_b weight 30
+        # (30 * 0.9 = 27), marker 40, threshold 80. All-on = 97 > 80; drop
+        # b = 70 < 80; drop a = 67 < 80; drop marker = 57 < 80 — a clean
+        # 3-way AND for the real operand magnitudes. (a=0 / b=0 nibble rules
+        # write to OUTPUT_LO+0 only when the *zero* one-hot is hot, which the
+        # gather does emit, so a*0 / 0*b still resolve to 0.) Verified
+        # byte-identical lo-nibble product for 6*7=42 and 100*5=500 via
+        # tools/probe_mul_full_fix_validate.py.
         rules = wide_mul_rules(
             operand_a_base="ALU_LO",
             operand_b_base="AX_CARRY_LO",
@@ -944,6 +959,10 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
             opcode_gate="OP_MUL",
             marker_gate="MARK_AX",
             S=S,
+            operand_a_cond_weight=5.0,
+            operand_b_cond_weight=30.0,
+            marker_cond_weight=40.0,
+            threshold=80.0,
         )
         assert len(rules) == 256, (
             f"wide_mul_rules(width_bytes=1): expected 256 rules, "
@@ -990,18 +1009,27 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
-        # Phase 11.A r3: dropped phase=11.05 — target_op_name +
-        # requires['after']: dep chain alone pins placement.
-        # Phase 8.G.6: drop ``layer_idx=11`` literal; bind to the L11
-        # ffn dep anchor so the block op resolves to whichever layer
-        # the compiler places the anchor at.
-        # DSL Wave W5: requires['after'] now waits for the FINAL 9-stage
-        # installer (``l12_alu_mul_getobd``, phase=12.3) so the
-        # rule-derived install discards a fully-assembled
-        # ``FlattenedALUMul`` cleanly. Pre-W5 the dep was the FIRST
-        # installer (``l11_alu_mul_bdtoge``, phase=11.0) and the bake
-        # skipped when ``FlattenedALUMul`` was present.
-        target_op_name="_layer11_ffn_dep_anchor",
+        # 2026-06-13 MUL placement fix: RESTORE the explicit ``layer_idx=11``
+        # pin (pre-expansion block 11 -> physical block 12 -> logical L11).
+        # The Phase 8.G.6 ``target_op_name="_layer11_ffn_dep_anchor"`` binding
+        # was MIS-RESOLVING: the dep-scheduler stacks the L10 op family
+        # (passthrough / ax_broadcast / stack0_relay / carry_relay) across
+        # pre-exp layers 9..14, which pushed ``_layer11_ffn_dep_anchor``
+        # (``requires after: layer10_carry_relay``) to pre-exp layer 15
+        # (= physical block 26 = logical L15). The 256-rule wide_mul FFN was
+        # therefore baked onto L15, NOT L11 — so the MUL operands (present and
+        # clean at the MARK_AX row through L11) were never multiplied, and the
+        # L15-resident wide_mul wrote a noisy OUTPUT product band that the
+        # L20 tail spike then amplified into a wrong decode (mul_basic -> 1).
+        # This is the "L15 OUTPUT materialiser" the AND_MUL_MARK_AX_ENDRUN doc
+        # described: it IS this misplaced wrap. Pinning ``layer_idx=11``
+        # restores the intended L11 placement (validated:
+        # tools/probe_mul_full_fix_validate.py -> 6*7=42, 100*5=500).
+        # ``requires['after']`` is KEPT so the rule-derived install still
+        # fires AFTER the 9-stage FlattenedALUMul installer chain
+        # (``l12_alu_mul_getobd``, phase=12.3) and discards any
+        # partially-assembled composite cleanly.
+        layer_idx=11,
         requires={"after": "l12_alu_mul_getobd"},
         migrated=True,
         # Dim-ownership claims: empty. ``bake`` replaces
