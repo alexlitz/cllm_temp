@@ -838,7 +838,16 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l10_cmp_{op_name.lower()}_default_step_end",
             conditions=(
                 ("MARK_SE_ONLY", 1.0),
-                (f"OP_{op_name}", 1.0),
+                # Wave B Phase 2.2 (2026-06-12): raw OP_<NAME> -> SE_OP_<NAME>.
+                # This SE-row default reads the relayed opcode flag (the L9
+                # step_end_operand_relay now mirrors OP_<cmp> -> SE_OP_<cmp>
+                # AND transmits across the AX->SE gap after the slope fix in
+                # make_layer9_se_relay_slope_op). Raw OP_<NAME> is cold at
+                # MARK_SE_ONLY; SE_OP_<NAME> carries the same flag at the SE
+                # row. The MARK_AX ordering engine still drives the live
+                # decode this phase (Wall 4 / Phase 3), so this SE-row write
+                # is parallel/additive, not the decode source.
+                (f"SE_OP_{op_name}", 1.0),
                 # MARK_PC blocker: mirror the parallel rule at line 518
                 # which has MARK_PC_BLOCK=-50 to prevent the default from
                 # firing at positions where MARK_PC leaks into MARK_AX.
@@ -867,10 +876,19 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l10_cmp_{op_name.lower()}_override2_{suffix}_step_end",
             conditions=(
                 ("MARK_SE_ONLY", 1.0),
+                # The CMP cascade is computed FRESH at the SE row by the
+                # L9 CMP rules (_layer9_cmp_rules, which read the relayed
+                # SE_ALU/SE_AX_CARRY operands), so the override reads the
+                # raw CMP cascade at MARK_SE_ONLY directly -- it is hot
+                # here (not at MARK_AX). The SE_CMP relay mirror would be
+                # cold (it mirrors AX-row CMP, which is empty this step).
                 (f"CMP+{cmp_idx}", 1.0),
             ),
             threshold=1.5,
-            gate=dim_ref("opcode_flag", op_name),
+            # Wave B Phase 2.2 (2026-06-12): gate on the relayed
+            # SE_OP_<NAME> dispatch flag (raw OP_<NAME> is cold at the SE
+            # row; the L9 relay mirrors the opcode flag to SE_OP_<NAME>).
+            gate=f"SE_OP_{op_name}+0",
             gate_weight=1.0,
             writes=(
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
@@ -902,12 +920,16 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l10_cmp_{op_name.lower()}_override3_{suffix}_step_end",
             conditions=(
                 ("MARK_SE_ONLY", 1.0),
+                # Raw CMP cascade computed fresh at the SE row by the L9
+                # CMP rules (see override2 note); read it directly here.
                 (f"CMP+{cmp_idx1}", 1.0),
                 (f"CMP+{cmp_idx2}", 1.0),
                 ("CMP+0", -0.1),
             ),
             threshold=4.0,
-            gate=dim_ref("opcode_flag", op_name),
+            # Wave B Phase 2.2 (2026-06-12): gate on the relayed
+            # SE_OP_<NAME> dispatch flag.
+            gate=f"SE_OP_{op_name}+0",
             gate_weight=1.0,
             writes=(
                 (f"OUTPUT_LO+{to_result}", 4.0 / S),
@@ -4079,6 +4101,16 @@ def make_layer10_alu_op() -> Operation:
                # at MARK_AX to recompute the full hi/lo lt/eq cascade for
                # LT/GT/LE/GE (and EQ/NE).
                "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+               # Wave B Phase 2.2 (2026-06-12): the cmp_combine sub-stage
+               # (_layer10_alu_cmp_combine_rules) now gates on the relayed
+               # SE_OP_<cmp> dispatch flags at MARK_SE_ONLY (raw OP_<cmp>
+               # is cold at the SE row). The CMP cascade it reads is
+               # computed fresh at the SE row by the L9 CMP rules. The L9
+               # step_end_operand_relay transmits SE_OP_<cmp> after the
+               # slope fix (make_layer9_se_relay_slope_op). The MARK_AX
+               # ordering engine still drives the live decode this phase.
+               "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT",
+               "SE_OP_GT", "SE_OP_LE", "SE_OP_GE",
                # V2/G7 LEV detector: in-step topology edge replacing the
                # cross-step requires["after"]=layer16_lev_routing below.
                "PC_VIA_LEV_DETECTOR_LO"},
