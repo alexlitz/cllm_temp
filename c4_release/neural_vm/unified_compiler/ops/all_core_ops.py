@@ -338,16 +338,17 @@ def all_core_ops(
                 "OP_ADD", "OP_SUB", "OP_SHL",
             ),
         ),
-        # AX byte-1 DUMP carry (the H1 cross-step SSA split). Re-supplies
-        # the AX byte-1 ``H1`` one-hot on carried (non-AX-writing) steps so
-        # the register dump emits byte 1 instead of 0x00. Reads the prev
-        # step's one-hot via ``H1.*.-1`` (SSA cross-step, no same-step
-        # back-edge) and writes ``H1_DUMP`` (same-slot alias of H1, distinct
-        # dep name -> no edge from the 54 same-step H1 readers) -> the
-        # 2-cycle that blocked every prior single-head attempt is broken.
-        # See l11_ops.make_layer11_ax_byte1_dump_carry_op and
+        # AX byte-1 DUMP carry (dedicated ``H1_PREV_STEP`` band). The CARRY
+        # HEAD half: copies the PREVIOUS step's AX byte-1 ``H1`` one-hot into
+        # the fresh ``H1_PREV_STEP`` band UNCONDITIONALLY (via ``H1.*.-1``, an
+        # SSA cross-step read -> no same-step back-edge). The carried-vs-fresh
+        # gate + the LM-head re-supply live in the partner
+        # ``ax_byte1_dump_repopulate`` FFN + ``ax_byte1_dump_head_bake`` below.
+        # Writing the distinct ``H1_PREV_STEP`` band (read by nobody upstream)
+        # breaks the H1-write 2-cycle that blocked every prior single-head
+        # attempt. See l11_ops.make_layer11_ax_byte1_dump_carry_op and
         # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
-        make_layer11_ax_byte1_dump_carry_op(enable=False),
+        make_layer11_ax_byte1_dump_carry_op(enable=True),
         # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=12`` literals.

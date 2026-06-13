@@ -1525,6 +1525,21 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "The cross-step alias delivers the prev-step CMP (the BZ/BNZ "
         "branch decision just committed). See ops/l8_ops.py:1702-1712 "
         "(Phase 8.A CMP_PREV_STEP rationale).",
+    ('layer13_ax_byte1_dump_carry', 'H1.*.-1'):
+        "AX byte-1 register-dump carry. The carry head's ENTIRE purpose is "
+        "to read the PREVIOUS VM step's ``H1`` one-hot (born at L9/block 10 "
+        "on the producing fresh-AX step, held through block 39 via the KV "
+        "cache) and copy it forward into ``H1_PREV_STEP`` so the carried-step "
+        "byte-1 dump can re-emit it. The only same-step ``H1`` writer is "
+        "``layer0_threshold_attn`` (L0), which produces the CURRENT step's "
+        "(empty, on a carried step) one-hot — exactly the value we must NOT "
+        "read. The ``.*.-1`` SSA alias correctly resolves to the prior "
+        "step's value via the KV cache; reading the same-step dim would "
+        "defeat the carry. This is the intentional cross-step read that "
+        "breaks the H1-write 2-cycle (the head WRITES the distinct band "
+        "``H1_PREV_STEP``, read by nobody upstream). See "
+        "ops/l11_ops.py make_layer11_ax_byte1_dump_carry_op and "
+        "docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.",
 }
 
 
@@ -1921,33 +1936,63 @@ def compile_full_vm_dynamic(
                 )
 
     # ------------------------------------------------------------------
-    # width=2 MUL — route MUL_RESULT_HI through extra_residual_dims.
+    # UNIFIED extra residual bands — AX byte-1 carry (always) + MUL (gated).
     # ------------------------------------------------------------------
-    # When ``C4_MUL_WIDTH2=1`` the width=2 (8-bit x 8-bit -> 16-bit) MUL
-    # path needs a dedicated byte-1 result band (MUL_RESULT_HI_LO/HI,
-    # 16+16 dims). These dims MUST be declared via ``extra_residual_dims``
-    # (NOT ``declare_setdim_compat_dims``) so they grow d_model through the
-    # head-dim-preserving auto-widen in ``_bake_from_scheduled_ops``:
-    # ``base_head_dim`` is captured BEFORE the extra bands are declared, so
-    # the widen rounds d_model up to a multiple of the BASE head_dim and
-    # ADDS heads instead of repartitioning every existing head. Declaring
-    # them in ``declare_setdim_compat_dims`` (which runs before the
-    # base_head_dim capture) would re-derive head_dim from the widened
-    # width and scramble attention content -> regresses test_bnz_branch.
-    # Folding them into ``extra_residual_dims`` also threads them through
-    # the disk/in-proc cache key (which hashes ``extra_residual_dims`` but
-    # NOT ``C4_MUL_WIDTH2`` directly), so flag-on and flag-off builds never
-    # share a serialised cache entry. See docs/MUL_WIDTH2_WIDEN_2026_06_13.md
-    # and memory note ``project_mul_div_mod_arch_blocked``.
+    # Two independent over-width families both route through
+    # ``extra_residual_dims`` so they share the SINGLE head-dim-preserving
+    # auto-widen in ``_bake_from_scheduled_ops`` (``base_head_dim`` captured
+    # from the BASE layout BEFORE any extra band is appended, so the widen
+    # rounds d_model up to a multiple of the BASE head_dim and ADDS heads
+    # instead of repartitioning every existing head — declaring them via
+    # ``declare_setdim_compat_dims`` would re-derive head_dim from the widened
+    # width and scramble attention content -> regresses test_bnz_branch).
+    # Folding them here also threads them through the disk/in-proc cache key
+    # (which hashes ``extra_residual_dims`` but NOT ``C4_MUL_WIDTH2`` /
+    # ``C4_AX_BYTE1_DUMP`` directly), so flag-on and flag-off builds never
+    # share a serialised cache entry.
+    #
+    # (1) AX byte-1 register-dump cross-step carry (production-default):
+    #     TWO fresh 7-wide bands (each mirrors the 7-wide ``H1`` one-hot):
+    #       * ``H1_PREV_STEP`` — the ``layer13_ax_byte1_dump_carry`` head copies
+    #         the PREVIOUS step's ``H1`` one-hot here UNCONDITIONALLY (via the
+    #         ``H1.*.-1`` SSA cross-step read). Read ONLY by the dump FFN below.
+    #       * ``H1_DUMP_OUT`` — the ``ax_byte1_dump_repopulate`` FFN copies
+    #         ``H1_PREV_STEP`` here ONLY on carried (non-AX-writing) steps, gated
+    #         on the crystallised ``AX_CARRY`` separation (~-988 fresh / ~+2.7
+    #         carried). The LM head reads it via mirrored ``head.weight`` columns
+    #         (``ax_byte1_dump_head_bake``, gated by ``C4_AX_BYTE1_DUMP``), so
+    #         the byte-1 emission additively picks up the carried high-byte
+    #         one-hot on carried steps and is UNTOUCHED on fresh steps (where
+    #         ``H1_DUMP_OUT`` is all-zero).
+    #     Writing a SEPARATE emission band (not ``H1`` directly) is what avoids
+    #     the 2-cycle: a late FFN that wrote ``H1`` while reading ``AX_CARRY``
+    #     would cycle (``layer6_routing_ffn`` reads ``H1`` AND writes
+    #     ``AX_CARRY``). Both bands are read by nobody upstream, so no back-edge
+    #     is created. The bands are ALWAYS present (production-default residual
+    #     geometry) regardless of ``C4_AX_BYTE1_DUMP``; only the LM-head
+    #     emission columns are flag-gated.
+    #
+    # (2) width=2 MUL (gated on ``C4_MUL_WIDTH2``): a dedicated byte-1 result
+    #     band ``MUL_RESULT_HI_LO/HI`` (16+16 dims) for the 8-bit x 8-bit ->
+    #     16-bit product. See docs/MUL_WIDTH2_WIDEN_2026_06_13.md and memory
+    #     note ``project_mul_div_mod_arch_blocked``.
+    #
+    # The COMBINED widen (14 AX dims always + 32 MUL dims when enabled) rounds
+    # head-dim-preservingly (base head_dim 109): 872 -> 981 (AX-only, n_heads
+    # 8 -> 9) or 872 -> 981 when MUL is also on (the 46 extra dims still fit
+    # within the +109-dim added head). All existing dims are
+    # byte-behaviour-identical (every new band is zero on every row the prior
+    # model touched). Threaded by NAME via ``layout.dim_positions`` -- they
+    # must NOT be op-declared ``declare_dim``s.
+    _PRODUCTION_EXTRA_RESIDUAL_DIMS = {"H1_PREV_STEP": 7, "H1_DUMP_OUT": 7}
+    _merged_extra = dict(_PRODUCTION_EXTRA_RESIDUAL_DIMS)
     from .ops.shared import mul_width2_enabled
     if mul_width2_enabled():
-        _mul_hi_dims = {"MUL_RESULT_HI_LO": 16, "MUL_RESULT_HI_HI": 16}
-        if extra_residual_dims:
-            _merged = dict(extra_residual_dims)
-            _merged.update(_mul_hi_dims)
-            extra_residual_dims = _merged
-        else:
-            extra_residual_dims = _mul_hi_dims
+        _merged_extra["MUL_RESULT_HI_LO"] = 16
+        _merged_extra["MUL_RESULT_HI_HI"] = 16
+    if extra_residual_dims:
+        _merged_extra.update(extra_residual_dims)
+    extra_residual_dims = _merged_extra
 
     from ..config import get_config
     vm_config = get_config()
@@ -2561,12 +2606,15 @@ def _bake_from_scheduled_ops(
     # ------------------------------------------------------------------
     # Auto-widen: declare caller/op-requested residual bands at the tail
     # BEFORE adding ops, so ops that read/write those bands (e.g. the L13
-    # ``layer13_mul_result_hi_relay`` reading ``MUL_RESULT_HI_*``) pass
-    # ``add_op``'s undeclared-dim validation. They are bump-pointer
-    # allocated (no pin) so they land past the highest existing dim, and
-    # ``base_head_dim`` below is captured from the width EXCLUDING them so
-    # the widen stays head-dim-preserving. An op never has to hardcode
-    # d_model to claim a fresh band.
+    # ``layer13_mul_result_hi_relay`` reading ``MUL_RESULT_HI_*``, and the
+    # AX ``layer13_ax_byte1_dump_carry`` / ``ax_byte1_dump_repopulate``
+    # reading/writing ``H1_PREV_STEP`` / ``H1_DUMP_OUT``) pass ``add_op``'s
+    # undeclared-dim validation. They are bump-pointer allocated (no pin) so
+    # they land past the highest existing dim, and ``base_head_dim`` below is
+    # captured from the width EXCLUDING them (by name) so the widen stays
+    # head-dim-preserving. An op never has to hardcode d_model to claim a
+    # fresh band. BOTH band families (AX always + MUL when ``C4_MUL_WIDTH2``)
+    # flow through here via the unified ``extra_residual_dims`` above.
     extra_dim_names: set[str] = set()
     if extra_residual_dims:
         for _name, _size in extra_residual_dims.items():
@@ -2586,9 +2634,9 @@ def _bake_from_scheduled_ops(
     # it is the load-bearing invariant the ops author against (every head
     # spec writes rows at ``head_idx * head_dim``). The auto-widen below
     # preserves THIS head_dim; it must never be re-derived from a width
-    # that already includes the extra bands. The extra bands are already
-    # declared (above) so ``add_op`` could validate op refs to them, but
-    # they are EXCLUDED from the base width here (and from any SSA alias
+    # that already includes the extra bands. The extra bands (AX + MUL) are
+    # already declared (above) so ``add_op`` could validate op refs to them,
+    # but they are EXCLUDED from the base width here (and from any SSA alias
     # of them) so widening still rounds up to a multiple of the BASE
     # head_dim and ADDS heads instead of repartitioning existing heads.
     layout = compiler.compile()

@@ -912,96 +912,84 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     head_idx: int,
     *,
     L: float = 15.0,
-    gate_w: float = 0.05,
     h1_w: float = 3.0,
     sink_w: float = 8.0,
+    k_axc_w: float = 0.05,
     alibi_slope: float = 0.5,
 ) -> DeclarativeAttentionHeadSpec:
-    """Build the AX byte-1 DUMP carry head spec.
+    """Build the AX byte-1 DUMP carry head spec (``H1_PREV_STEP`` band).
+
+    RE-ARCHITECTED (dedicated-band version): the carry head copies the
+    PREVIOUS step's ``H1`` one-hot into the fresh ``H1_PREV_STEP`` band
+    UNCONDITIONALLY (no carried-vs-fresh Q-gate, no sink-driven OFF state).
+    The carried-vs-fresh gate is moved DOWNSTREAM to the
+    ``ax_byte1_dump_repopulate`` FFN, which re-supplies ``H1_PREV_STEP`` into
+    ``H1`` only on carried (non-AX-writing) steps via the crystallised
+    ``AX_CARRY`` separation. This DISSOLVES the over-fire wall that blocked
+    the prior ``H1_DUMP`` same-slot-alias attempt (whose Q-gate over-fired on
+    fresh / multi-step rows and regressed smoke when enabled).
+
+    Because ``H1_PREV_STEP`` is read by NOBODY except the gated dump FFN,
+    writing the prev one-hot there on a fresh predictor row is harmless — the
+    dump FFN gates it out. So the head only needs to ATTEND the correct row
+    (the prior step's byte-1 predictor row that HOLDS the one-hot) and copy
+    it; no Q-gate is required.
 
     Slots (V/O occupy 10..16 so they never collide with the Q/K gate slots):
 
-    Q (current carried byte-1 predictor row):
+    Q (byte-1 predictor row, fresh OR carried):
       slot 0 = ``ADDR_B0_LO+5`` * L  (fire on byte-1 predictor rows)
-             + ``CONST`` * (-0.5 L)  (baseline: signature alone clears it)
-             + Sum_k (AX_CARRY_LO/HI + k) * gate_w  (gate: fresh -> very
-               negative Q-proj -> slot-0 score collapses below the sink ->
-               head attends the V=0 sink; carried -> small +ve -> head fires)
-      slot 9 = ``CONST`` * L          (sink driver, always on)
+      slot 2 = ``CONST`` * L         (drives the one-hot-presence K-pref)
+      slot 3 = ``ADDR_B0_LO+5`` * L  (drives the sink for rows with no prev
+               one-hot, e.g. the very first step)
     K:
       slot 0 = ``ADDR_B0_LO+5`` * L  (match byte-1 predictor rows)
              - Sum_k (AX_CARRY_LO/HI + k) * k_axc_w  (prefer the FRESH prev
                row: its AX_CARRY ~= -988 -> huge +K boost; the current
                carried row's AX_CARRY ~= 0 -> no boost -> the prev fresh row
-               wins by hundreds of nats, dominating the ALiBi recency tie)
-      slot 9 = ``STEP_BOUNDARY`` * sink_w  (the V=0 sink row: position 0 of
-               every step carries STEP_BOUNDARY and H1 == 0, so attending
-               there contributes nothing; it wins whenever slot-0 is gated
-               off on a fresh q row)
+               wins, reinforced by positive-ALiBi recency)
+      slot 2 = Sum_j (H1 + j) * h1_w  (one-hot-presence K-preference: the prev
+               fresh predictor holds the one-hot, band-sum ~= 14, so it
+               out-scores the current empty predictor, band-sum ~= 0.9)
+      slot 3 = ``MARK_AX`` * sink_w   (V=0 sink: on the first step there is no
+               prev predictor; the head falls onto an H1==0 marker row and
+               writes ~0 into ``H1_PREV_STEP`` -> no garbage seed)
     V (slots 10..16): copy the prev step's H1 one-hot via ``H1.*.-1``
-      (cross-step SSA read -> aliased to slot 67, no same-step back-edge).
-    O (slots 10..16): write into ``H1_DUMP`` (same-slot alias of H1 ->
-      physical 67, distinct dep name -> no edge from the 54 same-step H1
-      readers). The sink row's H1 == 0 so a gated-off / mis-fired attend
-      writes exactly zero -> the cascade-sensitive H1 band is never
-      corrupted on fresh or non-predictor rows.
+      (cross-step SSA read of the prev step's value through the KV cache).
+    O (slots 10..16): write into ``H1_PREV_STEP`` (the dedicated band; read
+      ONLY by the gated dump FFN -> NO edge from the 54 same-step H1 readers,
+      NO 2-cycle). The band's physical position comes from the BAKE's
+      ``dim_positions`` map (it is a NEW band, absent from the legacy
+      registry).
     """
-    # IMPORTANT — position source: the bake's ``dim_positions`` map is the
-    # dynamic compiler's *internal* layout (e.g. H1 -> 246), which is NOT the
-    # layout the running model's residual uses. The H1 pipeline (L0 producer,
-    # the 54 readers, the LM head) is baked at the LEGACY ``_SetDim`` / dynamic
+    # IMPORTANT — position source. The H1 pipeline (L0 producer, the 54
+    # readers, the LM head) is baked at the LEGACY ``_SetDim`` / dynamic
     # *registry* positions (H1 -> 67; the LM head's byte-1 emission reads
-    # ``head.weight[0x02]-[0x00]`` from dims 69/71 == H1+2 / H1+4). So this head
-    # MUST resolve every position from ``build_default_registry_dynamic()`` —
-    # the same map every probe uses — or it writes into dead slots. (Verified:
-    # registry H1=67/ADDR_B0_LO=12/AX_CARRY_LO=328 == _SetDim == the actual
-    # residual; ``dim_positions`` H1=246 is the inconsistent outlier.)
+    # ``head.weight[0x02]-[0x00]`` from dims 69/71 == H1+2 / H1+4). So the V
+    # cross-step read of ``H1`` and the K-side AX_CARRY / ADDR_B0_LO / MARK_AX
+    # taps MUST resolve from ``build_default_registry_dynamic()`` — the same
+    # map every probe uses — or they tap dead slots. (Verified:
+    # registry H1=67/ADDR_B0_LO=12/AX_CARRY_LO=328 == the actual residual.)
+    #
+    # The O write TARGET (``H1_PREV_STEP``) is a NEW band that does NOT exist
+    # in the registry; its physical position is allocated by the dynamic
+    # compiler and surfaced ONLY via the bake's ``dim_positions`` map. Resolve
+    # it from there.
     from ...dim_registry_dynamic import build_default_registry_dynamic
     _reg = build_default_registry_dynamic()
 
     def _P(name: str) -> int:
         return int(_reg.slots[name].start)
 
-    h1 = _P("H1")            # cross-step read (H1.*.-1) AND write (H1_DUMP)
+    h1 = _P("H1")            # registry H1 (cross-step V read of prev one-hot)
     addr_sig = _P("ADDR_B0_LO") + 5
     axc_lo = _P("AX_CARRY_LO")
     axc_hi = _P("AX_CARRY_HI")
     const = _P("CONST")
-
-    # Separated-slot design. A Q-gate with a uniform (CONST) K cannot turn the
-    # head off — softmax is shift-invariant, so a constant added to every k's
-    # score leaves the distribution unchanged. The gate must instead make the
-    # SINK out-score the real K rows on a fresh q. So the carried gate lives on
-    # the SIGNATURE slot's Q side, flipping the signature score negative on
-    # fresh q rows (-> sink wins) and positive on carried q rows (-> prev fresh
-    # predictor wins).
-    #
-    # slot 0  SIGNATURE + CARRIED GATE:
-    #           Q = ADDR_B0_LO+5 * L  +  Sum(AX_CARRY) * gate_w
-    #           K = ADDR_B0_LO+5 * L
-    #         carried q (AXC ~= +2.7): Q[0] ~= +L  -> predictor K rows score
-    #           large positive -> head attends a predictor row.
-    #         fresh   q (AXC ~= -988): Q[0] ~= -49 -> predictor K rows score
-    #           NEGATIVE -> they lose to the slot-3 sink -> head writes ~0.
-    # slot 2  ONE-HOT-PRESENCE K-PREFERENCE: Q = CONST * L; K = Sum(H1) * h1_w.
-    #         Among predictor rows on a carried q, the PREV FRESH predictor
-    #         (which HOLDS the H1 one-hot, band-sum ~= 14) gets a big +K boost
-    #         while the current carried predictor (H1 band-sum ~= 0.9) gets
-    #         almost none -> the head attends the row that actually carries the
-    #         one-hot, not the current (empty) predictor. (AX_CARRY can't serve
-    #         as the discriminator here: marker rows have an even more negative
-    #         AX_CARRY than the fresh predictor, so an AX_CARRY K-preference
-    #         boosts the H1==0 marker sink and breaks the selection.) This is a
-    #         SAME-STEP read of H1 -- it adds the head to the 54 H1 readers but
-    #         does NOT cycle: the head WRITES H1_DUMP (no op reads H1_DUMP), so
-    #         there is no back-edge from the write into any H1/AX_CARRY producer.
-    # slot 3  SINK: Q = ADDR_B0_LO+5 * L (fires at the predictor q row);
-    #         K = MARK_AX * sink_w -> targets AX MARKER rows (H1 ~= 0). On a
-    #         fresh q the negated signature (slot 0) drops predictor K rows
-    #         below this H1==0 marker sink -> head writes ~0 -> fresh stays
-    #         byte-identical. sink_w is small enough that on a carried q the
-    #         (positive) signature + one-hot-present predictor out-scores it.
     mark_ax = _P("MARK_AX")
+    # H1_PREV_STEP O target: from the bake layout (new band, not in registry).
+    h1_prev = int(dim_positions["H1_PREV_STEP"])
+
     q = [
         AP(0, addr_sig, L),
         AP(2, const, L),
@@ -1011,10 +999,17 @@ def _layer13_ax_byte1_dump_carry_head_spec(
         AP(0, addr_sig, L),
         AP(3, mark_ax, sink_w),
     ]
+    # K-side prev-fresh-row preference via the AX_CARRY differential: the prev
+    # FRESH predictor has very-negative AX_CARRY (sum ~= -988), the current
+    # carried predictor ~0 -> ``-AX_CARRY`` boosts the prev fresh row's K.
     for j in range(16):
-        q.append(AP(0, axc_lo + j, gate_w))   # carried gate (lo)
-        q.append(AP(0, axc_hi + j, gate_w))   # carried gate (hi)
-    # K-side one-hot-presence preference (same-step H1 read).
+        k.append(AP(0, axc_lo + j, -k_axc_w))
+        k.append(AP(0, axc_hi + j, -k_axc_w))
+    # K-side one-hot-presence preference (same-step H1 read): the prev fresh
+    # predictor HOLDS the one-hot (band-sum ~= 14) and wins over the current
+    # empty predictor. SAME-STEP H1 read -> adds the head to the H1 readers but
+    # does NOT cycle (the head WRITES the distinct H1_PREV_STEP band, read by
+    # nobody upstream, so no back-edge into any H1 / AX_CARRY producer).
     for j in range(7):
         k.append(AP(2, h1 + j, h1_w))
 
@@ -1023,8 +1018,8 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     H1_W = 7
     V_BASE = 10
     for j in range(H1_W):
-        v.append(AP(V_BASE + j, h1 + j, 1.0))  # V reads prev H1 (cross-step)
-        o.append(AO(h1 + j, V_BASE + j, 1.0))  # O writes H1_DUMP (== H1 slot)
+        v.append(AP(V_BASE + j, h1 + j, 1.0))       # V: prev H1 (cross-step)
+        o.append(AO(h1_prev + j, V_BASE + j, 1.0))  # O: write H1_PREV_STEP
 
     return DeclarativeAttentionHeadSpec(
         head_idx=head_idx,
@@ -1036,19 +1031,22 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     )
 
 
-def make_layer11_ax_byte1_dump_carry_op(enable: bool = False) -> Operation:
-    """L12 attn head 0: re-supply the AX byte-1 H1 one-hot on carried steps.
+def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
+    """L13 attn head 6: copy the prev step's AX byte-1 H1 one-hot forward.
 
-    The H1 cross-step SSA split that lands the AX byte-1 DUMP carry. See the
-    module-level comment above for the root, the proof that no ``H1``-writing
-    head can be scheduled, and the geometry. (Function name keeps the
-    ``layer11`` prefix for registration stability; the head is hosted on L12.)
+    The cross-step carry HEAD half of the AX byte-1 register-dump fix. It
+    copies the PREVIOUS VM step's ``H1`` one-hot into the dedicated
+    ``H1_PREV_STEP`` band UNCONDITIONALLY (via the ``H1.*.-1`` SSA cross-step
+    read). The carried-vs-fresh gating + the re-supply into ``H1`` for the LM
+    head live in the partner ``make_ax_byte1_dump_repopulate_op`` FFN. See the
+    module-level comment above for the root and the geometry. (Function name
+    keeps the ``layer11`` prefix for registration stability; the head is hosted
+    on L13.)
 
-    ``enable`` defaults to ``False``: the bake is a no-op so the production
-    build is byte-identical, but the Operation is always registered so its
-    ``reads``/``writes`` participate in the dep graph -- this is the proof
-    that the ``H1.*.-1`` read + ``H1_DUMP`` write break the 2-cycle (the
-    compile would raise ``Dependency cycle detected`` if they did not).
+    ``enable`` defaults to ``True`` (the production fix). The Operation's
+    ``reads``/``writes`` participate in the dep graph: the ``H1.*.-1`` read +
+    the distinct-band ``H1_PREV_STEP`` write break the H1-write 2-cycle (the
+    compile would raise ``Dependency cycle detected`` otherwise).
     """
     def bake(block, dim_positions, S):
         if not enable:
@@ -1078,26 +1076,25 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = False) -> Operation:
 
     return Operation(
         name="layer13_ax_byte1_dump_carry",
-        # Q anchors on ADDR_B0_LO+5 (byte-1 predictor signature) + AX_CARRY
-        # (gate). K matches the prev fresh byte-1 row. V reads the prev step's
-        # H1 one-hot cross-step (``H1.*.-1`` -> no same-step back-edge). O
-        # writes ``H1_DUMP`` (same-slot alias of H1, distinct dep identity ->
-        # no edge from the 54 same-step H1 readers). THIS is the cycle break.
-        # H1 (same-step) is read on the K side as a one-hot-presence
-        # discriminator (prefer the prev fresh predictor that HOLDS the one-hot
-        # over the current empty one). This makes the head one of the 54 H1
-        # readers but does NOT cycle: it WRITES H1_DUMP (read by nobody), so no
-        # back-edge into any H1 / AX_CARRY producer is created. ``H1.*.-1`` is
-        # the V-side cross-step read of the prev step's one-hot to copy forward.
+        # K matches the prev fresh byte-1 predictor row (ADDR_B0_LO+5 signature
+        # + AX_CARRY differential + one-hot-presence H1 preference + positive
+        # ALiBi recency). V reads the prev step's H1 one-hot cross-step
+        # (``H1.*.-1`` -> no same-step back-edge). O writes the dedicated
+        # ``H1_PREV_STEP`` band (read ONLY by the gated dump FFN -> no edge from
+        # the 54 same-step H1 readers). THIS is the cycle break. H1 (same-step)
+        # is read on the K side as a one-hot-presence discriminator; it makes
+        # the head one of the H1 readers but does NOT cycle (it WRITES
+        # H1_PREV_STEP, read by nobody upstream). ``H1.*.-1`` is the V-side
+        # cross-step read of the prev step's one-hot to copy forward.
         reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1", "H1.*.-1"},
-        writes={"H1_DUMP"},
+        writes={"H1_PREV_STEP"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_ir,
-        # Bind to the L12 FFN dep anchor so the head lands on the L12 attn
-        # block (physical block 15, all 8 heads free at bake AND runtime). The
-        # L12 read point (after block 14) still sees the crystallised AX_CARRY
-        # gate and the held prev-step H1 one-hot.
+        # Bind to the L13 mem-addr dep anchor so the head lands on the L13 attn
+        # block (physical block 16, heads 6/7 free at bake AND runtime). The
+        # L13 read point holds both the crystallised AX_CARRY gate signal and
+        # the held prev-step H1 one-hot.
         target_op_name="_layer13_mem_addr_anchor",
         migrated=True,
         declarative_authority="spec_generated",
