@@ -2010,26 +2010,24 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     (``H1_DUMP_OUT == 0`` -> these columns contribute nothing).
     """
     # The byte-1 register-dump EMISSION (the LM-head ``H1_DUMP_OUT`` columns) is
-    # gated by ``C4_AX_BYTE1_DUMP``. The full carry machinery — the
-    # ``H1_PREV_STEP`` band, the L13 carry head, the gated L25 dump FFN — runs
-    # unconditionally; only these LM-head emission columns are gated. With the
-    # flag OFF (the DEFAULT) ``H1_DUMP_OUT`` has no LM-head columns, so the model
-    # is byte-identical to the pre-carry build (the carry head / dump FFN write
-    # fresh bands that nothing else reads) and the smoke gate stays 49/2.
+    # gated by ``C4_AX_BYTE1_DUMP``, which is now DEFAULT-ON (opt out with
+    # ``C4_AX_BYTE1_DUMP=0``). The full carry machinery — the ``H1_PREV_STEP``
+    # band, the L13 carry head, the L25 overflow-flag precursor + gated dump FFN
+    # — runs unconditionally; only these LM-head emission columns are gated.
+    # With the flag OFF ``H1_DUMP_OUT`` has no LM-head columns, so the model is
+    # byte-identical to the pre-carry build (the carry head / dump FFN write
+    # fresh bands that nothing else reads) and the smoke gate stays 50/1.
     #
-    # Set ``C4_AX_BYTE1_DUMP=1`` to ENABLE the emission: it delivers the
-    # cross-step AX byte-1 carry — add 0-49 full_trace 12/50 -> 40/50, sub 50-99
-    # 5/50 -> 9/50 (spec_k=0). It is DEFAULT-OFF only because the dump-read GATE
-    # still over-fires on two step classes whose AX_CARRY sits outside the
-    # +2.7 carry band (SHL result AX_CARRY ~ +12.8, JMP ~ +47.9) — the clean
-    # fresh-vs-carry discriminator there is the CURRENT row's ``H1`` high-byte
-    # one-hot, but adding an ``H1`` read to this tail FFN breaks the
-    # efficient-ALU decode path (pc=None). That residual is the last mile;
-    # everything else (band, cycle break, carry-head attention, registry/layout
-    # dim_map, liveness never-share) is landed. See
-    # ``docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md``.
+    # Default ON delivers the cross-step AX byte-1 carry: add 0-49 full_trace
+    # 12/50 -> 40/50, sub 50-99 5/50 -> 9/50 (spec_k=0), smoke 50/1 (only the
+    # pre-existing simple_function fails). The dump-read GATE no longer
+    # over-fires on the SHL-result (AX_CARRY ~ +12.85) / JMP (~ +47.86) step
+    # classes — the two-sided Σ AX_CARRY band-pass (the
+    # ``ax_byte1_carry_overflow_flag`` precursor + the ``AX_CARRY_OVERFLOW``
+    # kill condition on the dump) excludes them. See
+    # ``docs/AX_BYTE1_DUMP_CARRY_LANDED_2026_06_13.md``.
     import os as _os
-    _emission_on = _os.environ.get("C4_AX_BYTE1_DUMP", "0") == "1"
+    _emission_on = _os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
 
     def _bake(model, dim_positions, S):
         del S

@@ -2110,11 +2110,12 @@ def compile_full_vm_dynamic(
             "C4_QWEN_EXPORT_COMPAT": (
                 os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
             ),
-            # AX byte-1 register-dump emission flag: toggles the LM-head
-            # ``H1_DUMP_OUT`` columns (output-affecting, no source change), so
-            # the ON and OFF builds must NEVER share a memo / disk entry.
+            # AX byte-1 register-dump emission flag (DEFAULT-ON; opt out with
+            # =0): toggles the LM-head ``H1_DUMP_OUT`` columns (output-affecting,
+            # no source change), so the ON and OFF builds must NEVER share a
+            # memo / disk entry.
             "C4_AX_BYTE1_DUMP": (
-                os.environ.get("C4_AX_BYTE1_DUMP", "0") == "1"
+                os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -2590,10 +2591,11 @@ def _bake_from_scheduled_ops(
         "C4_QWEN_EXPORT_COMPAT": (
             os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
         ),
-        # AX byte-1 register-dump emission flag (output-affecting, no source
-        # change): the ON / OFF builds must never share a serialised entry.
+        # AX byte-1 register-dump emission flag (DEFAULT-ON; opt out with =0,
+        # output-affecting, no source change): the ON / OFF builds must never
+        # share a serialised entry.
         "C4_AX_BYTE1_DUMP": (
-            os.environ.get("C4_AX_BYTE1_DUMP", "0") == "1"
+            os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
