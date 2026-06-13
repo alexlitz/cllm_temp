@@ -234,6 +234,13 @@ def all_core_ops(
         # docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md and memory
         # note ``project_wave_b_cmp_needs_l9_internal_relay.md``.
         make_layer9_step_end_operand_relay_op(),
+        # Wave B Phase 2.1: re-assert the SE relay heads' ALiBi slope to
+        # 0.2 AFTER layer10_residual_alibi_slopes (phase 999.1) clobbers
+        # blocks[10] heads 3/4 to 0.5/1.0. Without this the relay attends
+        # to nothing across the d=29 AX->SE gap and SE_* never transmits
+        # (Wall 2, project_attention_dsl_alibi_slope_gap). Slope-only;
+        # owns no weights.
+        make_layer9_se_relay_slope_op(),
         # Convo-I/O L9 attn bake (phase=9.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. Fires regardless of
         # alu_mode; runs AFTER the L9 LEV bakes (phase 9.0/9.1) since the

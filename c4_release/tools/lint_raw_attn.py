@@ -151,7 +151,7 @@ _BASELINE: Dict[str, int] = {
     "c4_release/neural_vm/unified_compiler/ops/l15_ops.py": 234,    # W_*=231 alibi=3 fill=0
     "c4_release/neural_vm/unified_compiler/ops/l8_ops.py": 81,      # W_*=79  alibi=2 fill=0
     "c4_release/neural_vm/unified_compiler/ops/l14_ops.py": 80,     # W_*=78  alibi=2 fill=0
-    "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 20,      # W_*=14  alibi=5 fill=1
+    "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 22,      # W_*=14  alibi=7 fill=1  (+2: Wave B Phase 2 SE-relay slope re-assert)
     "c4_release/neural_vm/unified_compiler/ops/model_ops.py": 17,   # W_*=0   alibi=13 fill=4
     "c4_release/neural_vm/unified_compiler/ops/l4_ops.py": 14,      # W_*=13  alibi=0 fill=1
     "c4_release/neural_vm/unified_compiler/ops/l10_ops.py": 11,     # W_*=0   alibi=11 fill=0

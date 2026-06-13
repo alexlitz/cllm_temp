@@ -2265,6 +2265,77 @@ def make_layer9_step_end_operand_relay_op() -> Operation:
     )
 
 
+def make_layer9_se_relay_slope_op() -> Operation:
+    """Wave B Phase 2.1: re-assert the SE operand relay's ALiBi slopes.
+
+    The L9 ``step_end_operand_relay`` heads (A/B) land physically on the
+    relay block (``model.blocks[10]`` pre-expansion -> physical block 11
+    = logical L10 after ``expand_wrapper_blocks``). Their intended slope
+    is 0.2 (set in ``make_layer9_step_end_operand_relay_op``'s bake at
+    phase 9.3), which keeps the relay step-local: over the d=29
+    MARK_AX->MARK_SE gap a 0.2 slope is only a -5.8 penalty (within-step
+    AX wins by ~exp(7) over the prior step's AX at d~64).
+
+    BUT ``make_layer10_residual_alibi_slopes_op`` runs LATER (phase
+    999.1) and unconditionally overwrites ``blocks[10].alibi_slopes[3] =
+    0.5`` and ``[4] = 1.0`` -- the legacy "PSH STACK0 passthrough" /
+    "STACK0 byte relay" slopes for heads that the relay has since
+    physically displaced (verified: blocks[11] heads 3/4 carry ONLY the
+    relay's Q@MARK_SE / K@MARK_AX / V(ALU,CARRY,CMP,OP) / O(SE_*) -- no
+    surviving L10 passthrough V/O). A 0.5 slope over the d=29 gap is a
+    -14.5 penalty that swamps the L=10 QK match, so the relay attends to
+    nothing and ``SE_*`` collapses to its bias floor (~-1.4) -- the
+    documented Wall-2 transmission failure
+    (``project_attention_dsl_alibi_slope_gap``).
+
+    Fix per the slope-ownership rule (set the slope LAST): re-assert the
+    relay heads' slope to 0.2 AFTER ``layer10_residual_alibi_slopes``.
+    This op owns NO weights -- only the two slope cells the relay needs.
+    The L10 passthrough functions that previously read heads 3/4 are
+    already gone from this block in the baseline (the MARK_AX ordering
+    engine drives lt/le today), so re-sloping is additive, not a
+    passthrough regression.
+    """
+    def _bake(model, dim_positions, S):
+        del dim_positions, S
+        # Same pre-expansion index residual_alibi writes (blocks[10] ->
+        # physical block 11 = logical L10 post-expansion). The relay's
+        # head A/B indices come from the L9 allocator layout.
+        if len(model.blocks) <= 10:
+            return
+        attn = model.blocks[10].attn
+        if not (hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None):
+            return
+        head_a = _l9_head_idx("layer9_step_end_operand_relay")
+        head_b = head_a + 1
+        if head_b < attn.alibi_slopes.shape[0]:
+            attn.alibi_slopes[head_a] = 0.2  # SE relay head A (ALU/CMP/OP)
+            attn.alibi_slopes[head_b] = 0.2  # SE relay head B (AX_CARRY)
+
+    return Operation(
+        name="layer9_se_relay_slope",
+        # Run AFTER layer10_residual_alibi_slopes (phase 999.1) so the
+        # relay's 0.2 slope wins the last write, and before
+        # expand_wrapper_blocks (phase 1300) -- the same pre-expansion
+        # window residual_alibi occupies. Model-ops are applied in phase
+        # order (layer_compiler sorts model_ops by ``o.phase``), so the
+        # explicit phase 999.2 -- not just ``requires["after"]`` -- is
+        # what guarantees we run last among the slope writers.
+        requires={"after": ("layer10_residual_alibi_slopes",)},
+        phase=999.2,
+        reads=set(),
+        writes=set(),
+        kind="model",
+        declarative_bake_fn=_bake,
+        migrated=True,
+        declarative_authority="structural_model",
+        # Slope-only re-assertion; no per-cell weight claims.
+        claims=set(),
+        smoke_tests=set(),
+        spec_section="BLOG_SPEC.md#the-attention-layer",
+    )
+
+
 def make_layer9_marker_suppress_op() -> Operation:
     """No-op dep anchor for marker suppression owned by ``layer9_alu``.
 
