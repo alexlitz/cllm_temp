@@ -349,6 +349,20 @@ def all_core_ops(
         # attempt. See l11_ops.make_layer11_ax_byte1_dump_carry_op and
         # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
         make_layer11_ax_byte1_dump_carry_op(enable=True),
+        # STACK0 byte-0 DUMP carry (Root 2 — the if/bool/expr framing drift).
+        # The CARRY HEAD half (mirror of the AX byte-1 carry above): copies the
+        # PREVIOUS step's STACK0-marker ``H1``/``H3`` byte-0 one-hot into the
+        # fresh ``STACK0_B0_H1_PREV``/``STACK0_B0_H3_PREV`` bands (via
+        # ``H1.*.-1``/``H3.*.-1`` SSA cross-step reads -> no same-step
+        # back-edge). The byte-0 emission one-hot is decoded fresh at the PSH
+        # step but ABSENT (then smeared+nuked to ~-289M by the L21/L25
+        # correctors) on the carried comparison step -> a marker wins and the
+        # model emits a spurious extra register block (57-token step) that the
+        # fixed-35 slicer misreads. The carried-vs-fresh gate + LM-head re-supply
+        # live in the partner ``stack0_byte0_dump_repopulate`` FFN +
+        # ``stack0_byte0_dump_head_bake`` below. See
+        # l11_ops.make_stack0_byte0_dump_carry_op.
+        make_stack0_byte0_dump_carry_op(enable=True),
         # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=12`` literals.
@@ -530,6 +544,22 @@ def all_core_ops(
         # PureFFN post_op on the L25 tail block after tail_bit32. See
         # l11_ops.make_ax_byte1_dump_repopulate_op.
         make_ax_byte1_dump_repopulate_op(),
+        # STACK0 byte-0 carried-step flag precursor (Root 2): writes the BOUNDED
+        # ``STACK0_B0_CARRIED`` gate flag at an EARLY block (L7 anchor) where the
+        # same-step H3 byte-0 one-hot is still bounded (fresh ~3.3 present,
+        # carried ~0 absent) -- BEFORE the L25 corruptor nukes H1/H3 to ~-289M.
+        # The flag persists to the L25 tail where the dump FFN gates on it (a
+        # raw H1/H3 read there would drive the dump's silu gate to ~+10^9). See
+        # l11_ops.make_stack0_byte0_carried_flag_op.
+        make_stack0_byte0_carried_flag_op(),
+        # STACK0 byte-0 DUMP repopulate FFN (Root 2): the carried-vs-fresh GATE
+        # half. Copies the prev-step byte-0 one-hot from
+        # ``STACK0_B0_{H1,H3}_PREV`` (filled by ``stack0_byte0_dump_carry``)
+        # into the emission bands ``STACK0_B0_DUMP_{H1,H3}`` ONLY on carried
+        # STACK0-marker rows (gated on the bounded ``STACK0_B0_CARRIED`` flag).
+        # Standalone PureFFN post_op on the L25 tail block after tail_bit32. See
+        # l11_ops.make_stack0_byte0_dump_repopulate_op.
+        make_stack0_byte0_dump_repopulate_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).
@@ -646,6 +676,13 @@ def all_core_ops(
         # byte. Phase=1002 (additive, AFTER head_bake). Byte-identical on fresh
         # steps (H1_DUMP_OUT == 0). See model_ops.make_ax_byte1_dump_head_bake_op.
         make_ax_byte1_dump_head_bake_op(),
+        # STACK0 byte-0 DUMP emission columns (Root 2): mirrors the byte-value
+        # H1/H3 one-hot columns onto STACK0_B0_DUMP_{H1,H3} so the LM head
+        # re-emits the carried STACK0 byte-0 on carried steps. Phase=1002
+        # (additive, AFTER head_bake). Byte-identical on fresh steps (DUMP bands
+        # == 0). Gated by C4_STACK0_B0_DUMP (default-on). See
+        # model_ops.make_stack0_byte0_dump_head_bake_op.
+        make_stack0_byte0_dump_head_bake_op(),
         make_embedding_bake_op(),
         # Initial-PC bake: writes the PC_OFFSET pattern into the REG_PC
         # token-embedding row (replaces the runtime `_inject_initial_pc`).

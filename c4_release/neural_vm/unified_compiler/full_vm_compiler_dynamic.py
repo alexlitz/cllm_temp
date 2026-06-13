@@ -1540,6 +1540,25 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "``H1_PREV_STEP``, read by nobody upstream). See "
         "ops/l11_ops.py make_layer11_ax_byte1_dump_carry_op and "
         "docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.",
+    ('stack0_byte0_dump_carry', 'H1.*.-1'):
+        "STACK0 byte-0 cross-step emission carry (Root 2). The carry head's "
+        "purpose is to read the PREVIOUS VM step's STACK0-marker ``H1`` (high "
+        "nibble) one-hot (decoded fresh at L6 on the PSH/producing step, held "
+        "through the tail via the KV cache) and copy it forward into "
+        "``STACK0_B0_H1_PREV`` so the carried-step byte-0 dump can re-emit it. "
+        "The clean one-hot is ABSENT on the carried comparison step (L6 does "
+        "not re-decode it) and is then smeared+nuked to ~-289M by the L21/L25 "
+        "correctors, so the same-step dim is exactly the value we must NOT "
+        "read. The ``.*.-1`` SSA alias resolves to the prior step's value via "
+        "the KV cache. The head WRITES the distinct band ``STACK0_B0_H1_PREV`` "
+        "(read by nobody upstream) -> no back-edge. See "
+        "ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
+    ('stack0_byte0_dump_carry', 'H3.*.-1'):
+        "STACK0 byte-0 cross-step emission carry (Root 2): the LOW-nibble "
+        "partner of the ``H1.*.-1`` read above. Copies the prev step's "
+        "STACK0-marker ``H3`` (low nibble) one-hot into ``STACK0_B0_H3_PREV``. "
+        "Same rationale: the clean low-nibble one-hot is absent/corrupted on "
+        "the carried step. See ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
 }
 
 
@@ -1993,6 +2012,45 @@ def compile_full_vm_dynamic(
     # unconditionally; only the LM-head emission is C4_AX_BYTE1_DUMP-gated).
     _PRODUCTION_EXTRA_RESIDUAL_DIMS = {
         "H1_PREV_STEP": 7, "H1_DUMP_OUT": 7, "AX_CARRY_OVERFLOW": 1,
+        # (3) STACK0 byte-0 cross-step emission carry (Root 2, production-default
+        #     geometry). The STACK0 byte-0 (stack-top low byte) emission one-hot
+        #     lives in the LM-head H1 (high nibble) + H3 (low nibble) bands. It
+        #     is decoded FRESH at the PSH step (block 6) but is ABSENT / smeared
+        #     and then nuked to ~-289M by the L21 + L25-tail correctors on the
+        #     NEXT (carried) comparison step -> the byte-0 value token is
+        #     suppressed to ~-100M and a marker ([PC]) wins, so the model emits a
+        #     spurious extra register block (57-token step) and the fixed-35
+        #     slicer misreads the PC ("framing drift" — the if/bool/expr step-3
+        #     full-trace fails). Mirrors the AX-byte-1 carry:
+        #       * ``STACK0_B0_H1_PREV`` / ``STACK0_B0_H3_PREV`` — the carry head
+        #         copies the PREVIOUS step's clean STACK0-marker H1/H3 one-hot
+        #         here UNCONDITIONALLY (via ``H1.*.-1`` / ``H3.*.-1`` SSA
+        #         cross-step reads). Read ONLY by the dump FFN.
+        #       * ``STACK0_B0_DUMP_H1`` / ``STACK0_B0_DUMP_H3`` — the dump FFN
+        #         copies the PREV bands here on a carried STACK0-marker row
+        #         (gated on the byte-0 one-hot being ABSENT). The LM head reads
+        #         them via mirrored byte-token columns (gated by
+        #         ``C4_STACK0_B0_DUMP``), so the byte-0 emission additively picks
+        #         up the carried one-hot on carried steps and is UNTOUCHED on
+        #         fresh steps (where the dump bands are all-zero).
+        #     Writing SEPARATE emission bands (not H1/H3 directly) avoids the
+        #     L21/L25 corruption entirely: those correctors clobber the H1/H3
+        #     band, but the LM head reads the carried value from the private dump
+        #     bands they never touch. All four are read by nobody upstream -> no
+        #     back-edge. Always present (production-default geometry); only the
+        #     LM-head dump columns are ``C4_STACK0_B0_DUMP``-gated.
+        "STACK0_B0_H1_PREV": 7, "STACK0_B0_H3_PREV": 7,
+        "STACK0_B0_DUMP_H1": 7, "STACK0_B0_DUMP_H3": 7,
+        # Bounded carried-step flag (Root 2): a precursor FFN on the L25 tail
+        # writes ``STACK0_B0_CARRIED = step(-Σ H1 >= 1.0)`` -- it fires when the
+        # STACK0-marker row's same-step H1 byte-0 one-hot has been NUKED to the
+        # ~-289M garbage by the L25 corruptor (a CARRIED step) and is dark when
+        # H1 holds the clean small-positive one-hot (a FRESH PSH step). The dump
+        # FFN gates on this BOUNDED flag instead of reading the unbounded
+        # (corrupted) H1/H3 directly -- a raw negative-weighted H1 condition
+        # would drive the silu gate to ~+10^9 and write garbage into the DUMP
+        # band. Same role as ``AX_CARRY_OVERFLOW`` for the AX carry.
+        "STACK0_B0_CARRIED": 1,
     }
     # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the production-default
     # bands (A/B diagnostics only — the carry ops then reference undeclared
@@ -2116,6 +2174,13 @@ def compile_full_vm_dynamic(
             # memo / disk entry.
             "C4_AX_BYTE1_DUMP": (
                 os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
+            ),
+            # STACK0 byte-0 register-dump emission flag (Root 2; DEFAULT-ON, opt
+            # out with =0): toggles the LM-head ``STACK0_B0_DUMP_{H1,H3}``
+            # columns (output-affecting, no source change), so the ON and OFF
+            # builds must NEVER share a memo / disk entry.
+            "C4_STACK0_B0_DUMP": (
+                os.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -2596,6 +2661,12 @@ def _bake_from_scheduled_ops(
         # share a serialised entry.
         "C4_AX_BYTE1_DUMP": (
             os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
+        ),
+        # STACK0 byte-0 register-dump emission flag (Root 2; DEFAULT-ON, opt out
+        # with =0, output-affecting, no source change): the ON / OFF builds must
+        # never share a serialised entry.
+        "C4_STACK0_B0_DUMP": (
+            os.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

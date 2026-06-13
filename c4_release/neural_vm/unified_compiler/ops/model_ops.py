@@ -2087,6 +2087,126 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# STACK0 byte-0 register-dump emission head bake (STACK0_B0_DUMP_{H1,H3})
+# ---------------------------------------------------------------------------
+#
+# Root 2 (the if/bool/expr framing drift). Mirrors the byte-value emission
+# columns onto the dedicated ``STACK0_B0_DUMP_H1`` / ``STACK0_B0_DUMP_H3`` bands
+# the ``stack0_byte0_dump_repopulate`` FFN populates on carried STACK0-marker
+# rows. The legacy byte-value emission reads ``head.weight[byte, H1+(lo+2)]``
+# (LOW nibble) + ``head.weight[byte, H3+(hi+4)]`` (HIGH nibble) at +5.0 (the
+# imperative ``setup_head_weights`` encoding; covers lo in 0..4, hi in 0..2 --
+# the same limited range as the AX byte-1 dump). ADDITIVE (runs AFTER head_bake
+# at a higher phase, never zeroes), and the DUMP bands are all-zero on fresh
+# steps -> the byte-0 emission is byte-identical on fresh steps and additively
+# re-emits the carried byte-0 one-hot on carried steps.
+_STACK0_B0_DUMP_HEAD_MAX_LO = 4  # H1 (low-nibble) one-hot slots +2..+6
+_STACK0_B0_DUMP_HEAD_MAX_HI = 2  # H3 (high-nibble) one-hot slots +4..+6
+
+
+def _stack0_byte0_dump_head_bake_rules(vocab_size: int) -> tuple:
+    """For each byte token ``b`` (lo<=4, hi<=2): mirror its H1/H3 columns onto
+    ``STACK0_B0_DUMP_H1+(lo+2)`` / ``STACK0_B0_DUMP_H3+(hi+4)`` at +5.0."""
+    rules: list[TokenEmbeddingRule] = []
+    for b in range(min(256, vocab_size)):
+        lo = b & 0xF
+        hi = (b >> 4) & 0xF
+        writes: list = []
+        if lo <= _STACK0_B0_DUMP_HEAD_MAX_LO:
+            writes.append((f"STACK0_B0_DUMP_H1+{lo + 2}", 5.0))
+        if hi <= _STACK0_B0_DUMP_HEAD_MAX_HI:
+            writes.append((f"STACK0_B0_DUMP_H3+{hi + 4}", 5.0))
+        if not writes:
+            continue
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[b],
+            writes=tuple(writes),
+            name=f"stack0_byte0_dump_head_token_{b}",
+        ))
+    return tuple(rules)
+
+
+def make_stack0_byte0_dump_head_bake_op() -> Operation:
+    """Add the ``STACK0_B0_DUMP_{H1,H3}`` byte-0 emission columns to the LM head.
+
+    Runs at phase=1002 (AFTER ``head_bake`` phase=1000 AND the legacy H1/H3
+    emission columns) so it ADDS to ``head.weight`` rather than being zeroed.
+    Mirrors the byte-value H1/H3 one-hot columns onto the DUMP bands so the LM
+    head re-emits the carried STACK0 byte-0 once the
+    ``stack0_byte0_dump_repopulate`` FFN fills the DUMP bands on carried steps.
+    Byte-identical on fresh steps (DUMP bands == 0 -> these columns contribute
+    nothing).
+
+    Gated by ``C4_STACK0_B0_DUMP`` (DEFAULT-**OFF**; opt IN with
+    ``C4_STACK0_B0_DUMP=1``). The full carry machinery (the PREV/DUMP/CARRIED
+    bands, the L9->L10 carry head, the L7 carried-flag precursor, the L25 gated
+    dump FFN) runs unconditionally and is byte-identical to the pre-carry build
+    (the carry ops write fresh bands nothing else reads); only these LM-head
+    emission columns are flag-gated, so with the flag OFF the smoke gate stays
+    50/1.
+
+    WHY DEFAULT-OFF (the additive-band approach is architecturally insufficient
+    for Root 2, unlike the AX byte-1 carry): the carry mechanism is verified
+    end-to-end (the carry head copies the prev STACK0-marker byte-0 H1/H3
+    one-hot into the PREV band, the carried-flag fires only on carried
+    STACK0-marker rows, the dump FFN copies the one-hot into the DUMP band at
+    the correct slots). BUT it CANNOT win the LM-head argmax. Unlike the AX
+    byte-1 case (where H1 is ZERO on the carried step so an additive DUMP band
+    cleanly supplies the byte), here the L16 ``stack0_e8_output_authoritative``
+    materializer (l16_ops.py:784, gated MARK_STACK0*1e9) writes the byte-0
+    one-hot into the SAME H1/H3 cells the byte token reads -- and on a carried
+    step its OUTPUT_LO/OUTPUT_HI_THIS_STEP input is WRONG, so it materializes a
+    ~-10^7 (to -10^15, value-dependent) GARBAGE one-hot into H1/H3. The byte
+    token reads H1+lo (=-10^7) AND the additive DUMP band (=+10^5); the -10^7
+    suppression wins -> logit ~-10^8 -> a marker still wins. An additive band
+    cannot overcome a NEGATIVE corruption in the same cells. The real fix is to
+    fix/gate the L16 e8 materializer (its OUTPUT input is wrong on carried
+    steps) OR to clear the corrupted H1/H3 before the LM head -- both touch the
+    load-bearing, WIDTH-SENSITIVE L16/L25 STACK0-marker bank (see memory note
+    ``project_l10_tail_bank_width_sensitive``). See
+    docs/STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md for the full probe trail.
+    """
+    import os as _os
+    _emission_on = _os.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
+
+    def _bake(model, dim_positions, S):
+        del S
+        if not _emission_on:
+            return
+        from ...vm_step import Token
+        ir = CompilerIR()
+        ir.embeddings.extend(
+            _stack0_byte0_dump_head_bake_rules(Token.VOCAB_SIZE)
+        )
+        ir.lower_token_embeddings(model, dim_positions)
+
+    def _ir_factory(dim_positions, HD):
+        del HD
+        from ...vm_step import Token
+        ir = CompilerIR()
+        if _emission_on:
+            ir.embeddings.extend(
+                _stack0_byte0_dump_head_bake_rules(Token.VOCAB_SIZE)
+            )
+        return ir
+
+    return Operation(
+        name="stack0_byte0_dump_head_bake",
+        reads=set(),
+        writes=set(),
+        audited_empty_produces=True,
+        kind="model",
+        declarative_bake_fn=_bake,
+        compiler_ir_factory=_ir_factory,
+        phase=1002,
+        declarative_authority="declarative",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    )
+
+
 def _embedding_bake_rules(vocab_size: int) -> tuple:
     """Build the :class:`TokenEmbeddingRule` list mirroring ``setup_token_embeddings``.
 

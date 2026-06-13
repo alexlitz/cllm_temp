@@ -2420,6 +2420,20 @@ class LayerCompiler:
         # FFN on the SAME L25 tail block — a short but cross-op lifetime; keep
         # it private so a liveness merge can't clobber the kill signal.
         "AX_CARRY_OVERFLOW",
+        # STACK0 byte-0 cross-step emission carry bands (Root 2). Same private-
+        # slot requirement as the H1_PREV_STEP/H1_DUMP_OUT pair: the carry head
+        # writes the PREV bands (multi-block lifetime to the L25 dump FFN) and
+        # the dump FFN writes the DUMP bands (read by the LM head). A liveness
+        # merge onto a same-width donor whose lifetime "ended" would leave the
+        # donor's residue in the shared slot and corrupt the carried byte-0
+        # one-hot. See docs (Root 2 STACK0 byte-0 dump carry).
+        "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
+        "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
+        # Bounded carried-step flag (Root 2 band-pass): written by the
+        # ``stack0_byte0_carried_flag`` precursor and read by the dump FFN on
+        # the SAME L25 tail block. Private slot so a liveness merge can't
+        # clobber the carried signal.
+        "STACK0_B0_CARRIED",
     })
 
     def _liveness_never_share(self, name: str) -> bool:
