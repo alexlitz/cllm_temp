@@ -64,7 +64,10 @@ import math
 import os
 import warnings
 from collections import defaultdict
-from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Any, Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set,
+    Tuple,
+)
 
 from .layer_compiler import (
     Operation,
@@ -1752,6 +1755,7 @@ def compile_full_vm_dynamic(
     ffn_variant: Optional[str] = None,
     per_head_qk_norm: Optional[str] = None,
     ffn_routing: Optional[str] = None,
+    extra_residual_dims: Optional[Mapping[str, int]] = None,
 ):
     """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
 
@@ -1890,6 +1894,32 @@ def compile_full_vm_dynamic(
         arch=arch,
     )
 
+    # ------------------------------------------------------------------
+    # Auto-widen: extra residual bands requested by an op / caller.
+    # ------------------------------------------------------------------
+    # ``extra_residual_dims`` maps ``name -> size`` for fresh residual
+    # bands that should be appended past the natural d_model. Declaring
+    # them grows d_model automatically (the layout's d_model is the
+    # highest dim end), and the head-dim-preserving alignment in
+    # ``_bake_from_scheduled_ops`` then rounds d_model up to a multiple of
+    # the base head_dim and ADDS heads — so an op never has to hardcode
+    # d_model to claim a fresh band. The dims are bump-pointer allocated
+    # at the tail; the op's rules reference them by name through
+    # ``layout.dim_positions``. This is the API for AX ``H1_PREV_STEP``,
+    # MUL ``MUL_RESULT_HI``, and any future over-width family.
+    if extra_residual_dims:
+        for _name, _size in extra_residual_dims.items():
+            if not isinstance(_name, str) or not _name:
+                raise ValueError(
+                    f"extra_residual_dims: name must be a non-empty str "
+                    f"(got {_name!r})"
+                )
+            if not isinstance(_size, int) or _size <= 0:
+                raise ValueError(
+                    f"extra_residual_dims[{_name!r}]: size must be a "
+                    f"positive int (got {_size!r})"
+                )
+
     from ..config import get_config
     vm_config = get_config()
 
@@ -1991,6 +2021,12 @@ def compile_full_vm_dynamic(
             # Qwen R1 (see _bake_from_scheduled_ops cache key for context).
             "C4_QWEN_EXPORT_COMPAT": (
                 os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
+            ),
+            # Auto-widen: extra residual bands change d_model / n_heads, so
+            # widened and baseline builds must never share a memo entry.
+            "extra_residual_dims": (
+                tuple(sorted(extra_residual_dims.items()))
+                if extra_residual_dims else None
             ),
             "__dynamic": True,
         }
@@ -2107,6 +2143,7 @@ def compile_full_vm_dynamic(
         kv_eviction_n_steps=kv_eviction_n_steps,
         d_model_packing=d_model_packing,
         d_model_packing_target=d_model_packing_target,
+        extra_residual_dims=extra_residual_dims,
     )
 
     # Post-compile shape rebuild. When the caller hands in
@@ -2394,6 +2431,7 @@ def _bake_from_scheduled_ops(
     kv_eviction_n_steps: int = 64,
     d_model_packing: bool = False,
     d_model_packing_target: Optional[int] = None,
+    extra_residual_dims: Optional[Mapping[str, int]] = None,
 ):
     """Run the unchanged static compile/bake pipeline against ``scheduled``.
 
@@ -2458,6 +2496,13 @@ def _bake_from_scheduled_ops(
         "C4_QWEN_EXPORT_COMPAT": (
             os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
         ),
+        # Auto-widen: extra residual bands change d_model / n_heads, so a
+        # widened model must never share a serialised cache entry with the
+        # baseline (or with a different requested band set).
+        "extra_residual_dims": (
+            tuple(sorted(extra_residual_dims.items()))
+            if extra_residual_dims else None
+        ),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).
         "__dynamic": True,
@@ -2486,11 +2531,62 @@ def _bake_from_scheduled_ops(
     for op in scheduled:
         compiler.add_op(op)
 
+    # ------------------------------------------------------------------
+    # Establish the canonical (base) ``head_dim``.
+    # ------------------------------------------------------------------
+    # The natural layout d_model (e.g. 869) is first padded up to a
+    # multiple of ``n_heads`` — exactly the legacy alignment — to obtain
+    # the canonical production geometry (869 -> 872, head_dim = 872 / 8 =
+    # 109). ``base_head_dim`` is captured from THAT padded width because
+    # it is the load-bearing invariant the ops author against (every head
+    # spec writes rows at ``head_idx * head_dim``). The auto-widen below
+    # preserves THIS head_dim; it must never be re-derived from a width
+    # that already includes the extra bands.
     layout = compiler.compile()
     if layout.d_model % n_heads != 0:
         pad = n_heads - (layout.d_model % n_heads)
         compiler.declare_dim("_pad", pad)
         layout = compiler.compile()
+    base_head_dim = layout.d_model // n_heads
+    if base_head_dim <= 0:
+        base_head_dim = layout.d_model  # degenerate single-head fallback
+
+    # ------------------------------------------------------------------
+    # Auto-widen: append caller/op-requested residual bands at the tail.
+    # ------------------------------------------------------------------
+    # Bump-pointer allocated (no pin) so they land past the highest
+    # existing dim, growing d_model automatically — an op never has to
+    # hardcode d_model to claim a fresh band.
+    if extra_residual_dims:
+        for _name, _size in extra_residual_dims.items():
+            compiler.declare_dim(_name, int(_size))
+        layout = compiler.compile()
+
+        # ------------------------------------------------------------------
+        # Head-dim-preserving alignment of the widened d_model.
+        # ------------------------------------------------------------------
+        # The attention reshape ``x.view(B, S, num_heads, head_dim)``
+        # splits the residual stream into ``num_heads`` contiguous bands
+        # of width ``head_dim = d_model // num_heads``. ``head_dim`` fixes
+        # which residual dims belong to which head, so widening with a
+        # FIXED ``num_heads`` (the legacy multiple-of-n_heads pad) changes
+        # ``head_dim``, repartitions every head and scrambles all
+        # attention content even though no new dim is read (confirmed: a
+        # naive widen to 920 regresses test_lea_basic; residual diverges
+        # by ~0.063 starting at block 1).
+        #
+        # Instead we round the widened d_model up to a multiple of the
+        # BASE ``head_dim`` and derive ``num_heads = d_model // head_dim``.
+        # A widen therefore ADDS heads (the new trailing band is all-zero
+        # and contributes nothing) while every existing head keeps its
+        # exact dim span and weights — byte-behaviour-identical on
+        # existing dims (verified: logits diff == 0, smoke 49/2 including
+        # bnz + lea at d_model 872 -> 981, n_heads 8 -> 9).
+        if layout.d_model % base_head_dim != 0:
+            widen_pad = base_head_dim - (layout.d_model % base_head_dim)
+            compiler.declare_dim("_widen_pad", widen_pad)
+            layout = compiler.compile()
+        n_heads = layout.d_model // base_head_dim
 
     # Phase 10.A: optionally repack unpinned dims via best-fit decreasing
     # so the residual stream is tighter. Pinned IO dims (declared via

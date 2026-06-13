@@ -142,6 +142,28 @@ class ToolResponse:
     result: Any = None
 
 
+def _parse_extra_residual_dims_env():
+    """Parse ``C4_EXTRA_RESIDUAL_DIMS`` into a ``{name: size}`` dict.
+
+    Format: ``"NAME:SIZE,NAME:SIZE"`` (e.g. ``"H1_PREV_STEP:16,FOO:32"``).
+    Returns ``None`` when the env var is unset/empty so the production
+    geometry stays byte-identical. Used to exercise the compiler's
+    head-dim-preserving auto-widen path (the requested bands grow d_model
+    to a multiple of the base head_dim and add heads).
+    """
+    raw = os.environ.get("C4_EXTRA_RESIDUAL_DIMS", "").strip()
+    if not raw:
+        return None
+    out = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, _, size = entry.partition(":")
+        out[name.strip()] = int(size.strip())
+    return out or None
+
+
 class AutoregressiveVMRunner:
     """Generation loop for the autoregressive VM.
 
@@ -347,7 +369,10 @@ class AutoregressiveVMRunner:
                      enable_neural_io_think_protocol, compile_mode,
                      bool(enable_moe_routing),
                      bool(csr_inference),
-                     bool(compact_gather))
+                     bool(compact_gather),
+                     # Auto-widen bands change d_model/n_heads — keep widened
+                     # and baseline models in separate cache slots.
+                     os.environ.get("C4_EXTRA_RESIDUAL_DIMS") or None)
         if cache_model and cache_key in AutoregressiveVMRunner._MODEL_CACHE:
             self.model = AutoregressiveVMRunner._MODEL_CACHE[cache_key]
             # Re-install the CSR F.linear shim defensively in case the
@@ -359,6 +384,12 @@ class AutoregressiveVMRunner:
                 install_csr_linear_shim()
         else:
             from .unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
+            # Auto-widen passthrough: ``C4_EXTRA_RESIDUAL_DIMS`` (a
+            # "name:size,name:size" string) requests fresh residual bands
+            # so the compiler auto-grows d_model (rounded to a multiple of
+            # the base head_dim, adding heads) without an op hardcoding
+            # d_model. Off by default => byte-identical production geometry.
+            _extra_dims = _parse_extra_residual_dims_env()
             self.model, _layout = compile_full_vm_dynamic(
                 enable_conversational_io=conversational_io,
                 enable_neural_io_think_protocol=enable_neural_io_think_protocol,
@@ -368,6 +399,7 @@ class AutoregressiveVMRunner:
                 max_seq_len=max_seq_len,
                 enable_moe_routing=enable_moe_routing,
                 strict=False,
+                extra_residual_dims=_extra_dims,
             )
             if torch.cuda.is_available():
                 self.model = self.model.cuda()
