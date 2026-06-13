@@ -19,26 +19,32 @@ from ..layer_compiler import Operation
 # ---------------------------------------------------------------------------
 
 def mul_width2_enabled() -> bool:
-    """Return True iff the width=2 (16-bit) MUL path is opted in.
+    """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
-    When ``C4_MUL_WIDTH2=1`` is set:
-      * ``declare_setdim_compat_dims`` declares the dedicated
-        ``MUL_RESULT_HI_LO/HI`` byte-1 result band (16+16 dims), which
-        auto-widens d_model from 920 toward 944 (bump-pointer + n_heads
-        padding).
+    The width=2 (8-bit x 8-bit -> 16-bit) MUL is now the PRODUCTION default
+    (2026-06-13). When enabled:
+      * ``compile_full_vm_dynamic`` injects the dedicated
+        ``MUL_RESULT_HI_LO/HI`` byte-1 result band (16+16 dims) into
+        ``extra_residual_dims`` so the d_model auto-widen (872 -> 981,
+        n_heads 8 -> 9) is HEAD-DIM-PRESERVING (adds heads, keeps every
+        existing head's span) -- this is what makes the widen bnz-safe.
       * ``make_efficient_l11_alumul_wrap_op`` bakes the
-        ``wide_mul_rules(width_bytes=2)`` 65,536-rule lookup, routing the
-        product's BYTE 1 (high byte) into ``MUL_RESULT_HI_*`` instead of
-        ``OUTPUT_LO+32`` (= ADDR_KEY) and keeping BYTE 0 in OUTPUT_LO/HI.
+        ``wide_mul_rules(width_bytes=2)`` 65,536-rule lookup with the
+        operand-magnitude-matched 5-way AND + cell-0 artifact blocker,
+        routing the product's BYTE 1 into ``MUL_RESULT_HI_*`` (NOT
+        ``OUTPUT_LO+32`` = ADDR_KEY) and keeping BYTE 0 in OUTPUT_LO/HI.
+      * ``make_layer13_mul_result_hi_relay_op`` stages byte 1 into AX_FULL
+        for the existing ``layer15_alu_high_byte_relay`` byte-1 emit.
 
-    With the flag OFF the build is byte-identical to pre-width2 main:
-    d_model stays 920, the width=1 lo-byte MUL path is installed, and
-    ``mul_basic`` (6*7=42) continues to pass. The full width=2 path is
-    "ready, pending" the d_model widen / bnz fix landing in a sibling
-    agent's work (the band growth otherwise regresses ``test_bnz_branch``).
-    See docs / memory note ``project_mul_div_mod_arch_blocked``.
+    Result: ``mul_overflow`` (100*5=500=0x01F4) emits both bytes correctly
+    (smoke 49/2 -> 50/1) while ``mul_basic`` (6*7=42), bnz, and the 32-bit
+    ALU / bitwise / shift / cmp suite stay green.
+
+    Opt-OUT with ``C4_MUL_WIDTH2=0`` to restore the pre-width2 build
+    (d_model 920, width=1 lo-byte MUL, ``mul_overflow`` decodes 20). Any
+    other value (or unset) keeps the width=2 default ON.
     """
-    return os.environ.get("C4_MUL_WIDTH2") == "1"
+    return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -1009,29 +1015,18 @@ def declare_setdim_compat_dims(
         compiler.declare_dim("NORM_COMPENSATOR", 1, pinned=None)
 
     # ------------------------------------------------------------------
-    # width=2 MUL — opt-in MUL_RESULT_HI byte-1 result band (2026-06-13)
+    # width=2 MUL — MUL_RESULT_HI byte-1 result band (2026-06-13)
     # ------------------------------------------------------------------
-    # When ``C4_MUL_WIDTH2=1`` is set, declare the dedicated high-byte
-    # result band for the width=2 (8-bit x 8-bit -> 16-bit) MUL. The
-    # band holds the product's BYTE 1 nibbles (bits 8..15): nib2 ->
-    # MUL_RESULT_HI_LO, nib3 -> MUL_RESULT_HI_HI. Routing byte 1 here
-    # (instead of OUTPUT_LO+32 = ADDR_KEY) avoids corrupting the memory
-    # address-key band that the width=1 result layout would collide with.
-    #
-    # Declared unpinned so the bump-pointer allocator places the two
-    # 16-wide bands above the SE_* high-water mark (positions 912..943),
-    # auto-widening the live d_model to cover them (ir.py inferred_d_model
-    # = max_dim + 1, then padded to n_heads). With the flag OFF the dim is
-    # not declared, so d_model and the residual layout stay byte-identical
-    # to pre-width2 main (920). The width=2 wide_mul install in
-    # ``make_efficient_l11_alumul_wrap_op`` is gated by the SAME flag, so
-    # the band is always populated when present.
-    #
-    # PENDING: d_model widen / bnz fix for e2e + smoke. Growing d_model
-    # past 920 regresses ``test_bnz_branch`` until the sibling widen agent
-    # lands its fix; this flag keeps the width=2 path ready-to-activate
-    # without disturbing the default 49/2 build. See memory note
-    # ``project_mul_div_mod_arch_blocked``.
-    if mul_width2_enabled():
-        compiler.declare_dim("MUL_RESULT_HI_LO", 16, pinned=None)
-        compiler.declare_dim("MUL_RESULT_HI_HI", 16, pinned=None)
+    # The dedicated high-byte result band for the width=2 (8-bit x 8-bit
+    # -> 16-bit) MUL (MUL_RESULT_HI_LO/HI; nib2 -> _LO, nib3 -> _HI) is NO
+    # LONGER declared here. When ``C4_MUL_WIDTH2=1`` it is injected into
+    # ``extra_residual_dims`` at the top of ``compile_full_vm_dynamic`` so
+    # the d_model widen is HEAD-DIM-PRESERVING (the auto-widen captures the
+    # base head_dim BEFORE the extra bands are declared and rounds up to a
+    # multiple of it, ADDING heads instead of repartitioning existing ones).
+    # Declaring it here ran BEFORE the base_head_dim capture and re-derived
+    # head_dim from the widened width, scrambling attention -> regressed
+    # test_bnz_branch. See ``compile_full_vm_dynamic`` and
+    # docs/MUL_WIDTH2_WIDEN_2026_06_13.md. With the flag OFF nothing is
+    # declared, so d_model / the residual layout stay byte-identical to
+    # pre-width2 main (920).

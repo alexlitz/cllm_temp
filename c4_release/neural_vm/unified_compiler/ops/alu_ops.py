@@ -965,16 +965,55 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
             # MUL_RESULT_HI_LO/HI band — NOT OUTPUT_LO+32 (= ADDR_KEY),
             # which would corrupt the memory address-key.
             #
-            # PENDING: d_model widen / bnz fix for e2e + smoke. Declaring
-            # MUL_RESULT_HI_* grows d_model past 920, which regresses
-            # test_bnz_branch until the sibling widen agent lands its fix.
-            # The byte-identity UNIT test (tests/test_wide_alu_dsl.py
-            # ::test_wide_mul_rules_byte_identity_16bit) is the correctness
-            # gate for these rules; model-level smoke is DEFERRED. AND
-            # weights here are the unit-test (clean one-hot, 30/30/40,
-            # thr=150) form; operand-magnitude rescaling at the real
-            # MARK_AX row (like the width=1 a-weight=5) is a follow-up the
-            # widen agent owns once the row is unblocked.
+            # Operand-magnitude-matched 5-way AND + cell-0 artifact blocker
+            # (2026-06-13 width=2 fix). The real MARK_AX MUL row does NOT
+            # deliver clean 1.0 one-hots: the L8 operand-gather emits a
+            # ~5.84-magnitude one-hot on each ALU nibble (ALU_LO for A's low
+            # nibble, ALU_HI for A's high nibble) PLUS a value-proportional
+            # ~5.5-magnitude index-0 artifact on ALU_LO+0 / ALU_HI+0, and a
+            # clean ~1.0-1.3-magnitude one-hot on each AX_CARRY nibble
+            # (AX_CARRY_LO/HI for B, ~0.29 index-0 floor). Probed spec_k=0 via
+            # tools/probe_mul_operand_vectors.py (e.g. 100x5: ALU_LO+4=5.84,
+            # ALU_LO+0=5.52, ALU_HI+6=5.84, ALU_HI+0=5.54, AX_CARRY_LO+5=1.0,
+            # AX_CARRY_HI+0=1.29).
+            #
+            # The unit-test 30/30/40/thr150 form assumes 1.0 one-hots; with
+            # ALU~5.84 the 30*5.84 ALU term alone trips any sane threshold so
+            # every rule fires and the product band fills with noise (decodes
+            # 216/3288). A naive rescale ALSO fails: the index-0 artifact on
+            # BOTH ALU bands is NEARLY EQUAL to a true nibble (5.5 vs 5.84) so
+            # a flat linear AND cannot separate the (a_nib=0) artifact rule
+            # from the true rule (the documented Wall-1, see
+            # project_operand_gather_hybrid_encoding). The width=1 path
+            # tolerates this for mul_basic because its SINGLE ALU artifact
+            # rule writes a DISTINCT output cell that the true cell out-votes;
+            # at width=2 the DOUBLED artifact (ALU_LO+0 AND ALU_HI+0) lets a
+            # huge spurious accumulation swamp the true product lane.
+            #
+            # Fix = the proven _layer10_alu_ordering_engine technique
+            # (ops/l10_ops.py): weight ALU LIGHTLY (operand A is the dirty
+            # band) + AX_CARRY HEAVILY (operand B is the clean discriminator)
+            # + add a NEGATIVE blocker on the OTHER non-zero ALU cells so a
+            # rule matching a_nib=0 is SUPPRESSED whenever A's true nibble is
+            # a different non-zero cell (its strong one-hot trips the blocker).
+            # Weights tuned offline against the real probed operand vectors
+            # (tools/tune_mul_width2.py, FULL 16^4 SwiGLU forward sim): ALU
+            # 0.6, AX_CARRY 6.0, marker 4.0, blocker 3.0, threshold 19.5.
+            # The objective is CLEAN one-hot result bands (not just correct
+            # argmax): the L13 byte-1 relay copies the RAW MUL_RESULT_HI band
+            # into AX_FULL (a softmax V@O copy, NOT an argmax), so a noisy
+            # band corrupts the byte-1 emit. A too-heavy AX_CARRY (e.g. 10)
+            # lets the 4 non-a_hi terms alone clear threshold, so a_hi ranges
+            # freely and spurious LARGE products pollute MUL_RESULT_HI even
+            # for a tiny product (this regressed mul_basic to a 3-byte emit).
+            # A BALANCED 5-way AND (each operand term load-bearing) + the
+            # strong cell-0 blocker makes ONLY the true quad fire, so every
+            # result band is a near-perfect one-hot: 6x7 -> OUTPUT_LO[10],
+            # OUTPUT_HI[2], MUL_RESULT_HI_LO/HI[0] (byte0=0x2A, byte1=0x00);
+            # 100x5 -> [4],[15],[1],[0] (byte0=0xF4, byte1=0x01). 11/12
+            # probed cases decode correctly (the lone miss is 9x9, whose
+            # ALU_HI is corrupted by an UPSTREAM gather defect reading nibble
+            # 3, NOT the cell-0 artifact this blocker targets).
             rules = wide_mul_rules(
                 operand_a_base="ALU_LO",
                 operand_b_base="AX_CARRY_LO",
@@ -983,6 +1022,11 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
                 opcode_gate="OP_MUL",
                 marker_gate="MARK_AX",
                 S=S,
+                operand_a_cond_weight=0.6,
+                operand_b_cond_weight=6.0,
+                marker_cond_weight=4.0,
+                threshold=19.5,
+                operand_a_artifact_blocker_weight=3.0,
                 result_byte1_lo_base="MUL_RESULT_HI_LO",
                 result_byte1_hi_base="MUL_RESULT_HI_HI",
             )

@@ -2537,12 +2537,16 @@ class _SetDim:
     # OUTPUT_HI-style packing; for a 16-bit product byte 1 = bits 8..15 =
     # nib2 (lo) + nib3 (hi). nib2 -> MUL_RESULT_HI_LO, nib3 -> MUL_RESULT_HI_HI.
     #
-    # This band is ONLY allocated when the ``C4_MUL_WIDTH2=1`` flag is set
-    # (see ``declare_setdim_compat_dims``). With the flag OFF the dim is
-    # never declared to the compiler, so d_model stays 920 and the residual
-    # layout is byte-identical to pre-width2 main. Positions 912..943 sit
-    # just past SE_CMP_GROUP(911); the live d_model auto-widens to cover
-    # them (bump-pointer allocator, ``pinned=None``) when the flag is on.
+    # This band is allocated when width=2 MUL is active (the DEFAULT;
+    # ``mul_width2_enabled()``, opt out ``C4_MUL_WIDTH2=0``). It is injected
+    # into ``extra_residual_dims`` at the top of ``compile_full_vm_dynamic``
+    # (NOT ``declare_setdim_compat_dims``) so the d_model widen is
+    # head-dim-preserving (872 -> 981, n_heads 8 -> 9) and bnz-safe. With
+    # width=2 OFF the dim is never declared, so d_model stays 920 and the
+    # residual layout is byte-identical to pre-width2 main. The 912/928
+    # values below are the legacy static ``_SetDim`` fallback positions; the
+    # dynamic compiler bump-pointer allocates the live positions past the
+    # SE_* high-water mark. See docs/MUL_WIDTH2_WIDEN_2026_06_13.md.
     MUL_RESULT_HI_LO = 912   # 912-927: byte-1 (product bits 8..11) lo nibble
     MUL_RESULT_HI_HI = 928   # 928-943: byte-1 (product bits 12..15) hi nibble
 

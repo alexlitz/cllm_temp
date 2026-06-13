@@ -376,9 +376,11 @@ def all_core_ops(
         # copies the product's high byte (MUL_RESULT_HI_LO/HI, written by
         # the width=2 wide_mul install) into AX_FULL at the MUL MARK_AX
         # row so the existing layer15_alu_high_byte_relay emits byte 1.
-        # Always registered (dep graph stable); INERT unless the
-        # C4_MUL_WIDTH2 flag is on. PENDING d_model widen / bnz fix for
-        # e2e + smoke -- the byte-identity UNIT test gates the rules.
+        # Always registered (dep graph stable); enabled by default via
+        # mul_width2_enabled() (opt out with C4_MUL_WIDTH2=0). The d_model
+        # widen is head-dim-preserving (MUL_RESULT_HI routed through
+        # extra_residual_dims), so bnz stays green -> smoke 50/1. See
+        # docs/MUL_WIDTH2_WIDEN_2026_06_13.md.
         make_layer13_mul_result_hi_relay_op(enable=mul_width2_enabled()),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only

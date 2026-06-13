@@ -1920,6 +1920,35 @@ def compile_full_vm_dynamic(
                     f"positive int (got {_size!r})"
                 )
 
+    # ------------------------------------------------------------------
+    # width=2 MUL — route MUL_RESULT_HI through extra_residual_dims.
+    # ------------------------------------------------------------------
+    # When ``C4_MUL_WIDTH2=1`` the width=2 (8-bit x 8-bit -> 16-bit) MUL
+    # path needs a dedicated byte-1 result band (MUL_RESULT_HI_LO/HI,
+    # 16+16 dims). These dims MUST be declared via ``extra_residual_dims``
+    # (NOT ``declare_setdim_compat_dims``) so they grow d_model through the
+    # head-dim-preserving auto-widen in ``_bake_from_scheduled_ops``:
+    # ``base_head_dim`` is captured BEFORE the extra bands are declared, so
+    # the widen rounds d_model up to a multiple of the BASE head_dim and
+    # ADDS heads instead of repartitioning every existing head. Declaring
+    # them in ``declare_setdim_compat_dims`` (which runs before the
+    # base_head_dim capture) would re-derive head_dim from the widened
+    # width and scramble attention content -> regresses test_bnz_branch.
+    # Folding them into ``extra_residual_dims`` also threads them through
+    # the disk/in-proc cache key (which hashes ``extra_residual_dims`` but
+    # NOT ``C4_MUL_WIDTH2`` directly), so flag-on and flag-off builds never
+    # share a serialised cache entry. See docs/MUL_WIDTH2_WIDEN_2026_06_13.md
+    # and memory note ``project_mul_div_mod_arch_blocked``.
+    from .ops.shared import mul_width2_enabled
+    if mul_width2_enabled():
+        _mul_hi_dims = {"MUL_RESULT_HI_LO": 16, "MUL_RESULT_HI_HI": 16}
+        if extra_residual_dims:
+            _merged = dict(extra_residual_dims)
+            _merged.update(_mul_hi_dims)
+            extra_residual_dims = _merged
+        else:
+            extra_residual_dims = _mul_hi_dims
+
     from ..config import get_config
     vm_config = get_config()
 
@@ -2528,6 +2557,22 @@ def _bake_from_scheduled_ops(
 
     compiler = LayerCompiler()
     declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
+
+    # ------------------------------------------------------------------
+    # Auto-widen: declare caller/op-requested residual bands at the tail
+    # BEFORE adding ops, so ops that read/write those bands (e.g. the L13
+    # ``layer13_mul_result_hi_relay`` reading ``MUL_RESULT_HI_*``) pass
+    # ``add_op``'s undeclared-dim validation. They are bump-pointer
+    # allocated (no pin) so they land past the highest existing dim, and
+    # ``base_head_dim`` below is captured from the width EXCLUDING them so
+    # the widen stays head-dim-preserving. An op never has to hardcode
+    # d_model to claim a fresh band.
+    extra_dim_names: set[str] = set()
+    if extra_residual_dims:
+        for _name, _size in extra_residual_dims.items():
+            compiler.declare_dim(_name, int(_size))
+            extra_dim_names.add(_name)
+
     for op in scheduled:
         compiler.add_op(op)
 
@@ -2541,25 +2586,44 @@ def _bake_from_scheduled_ops(
     # it is the load-bearing invariant the ops author against (every head
     # spec writes rows at ``head_idx * head_dim``). The auto-widen below
     # preserves THIS head_dim; it must never be re-derived from a width
-    # that already includes the extra bands.
+    # that already includes the extra bands. The extra bands are already
+    # declared (above) so ``add_op`` could validate op refs to them, but
+    # they are EXCLUDED from the base width here (and from any SSA alias
+    # of them) so widening still rounds up to a multiple of the BASE
+    # head_dim and ADDS heads instead of repartitioning existing heads.
     layout = compiler.compile()
-    if layout.d_model % n_heads != 0:
-        pad = n_heads - (layout.d_model % n_heads)
-        compiler.declare_dim("_pad", pad)
-        layout = compiler.compile()
-    base_head_dim = layout.d_model // n_heads
+    if extra_dim_names:
+        excluded = set(extra_dim_names)
+        for _dn, _alias in getattr(compiler, "_aliases", {}).items():
+            if _alias in extra_dim_names:
+                excluded.add(_dn)
+        base_d_model = 0
+        for _name, _pos in layout.dim_positions.items():
+            if _name in excluded:
+                continue
+            base_d_model = max(base_d_model, _pos + compiler.dims[_name])
+    else:
+        base_d_model = layout.d_model
+    if base_d_model % n_heads != 0:
+        base_d_model += n_heads - (base_d_model % n_heads)
+    base_head_dim = base_d_model // n_heads
     if base_head_dim <= 0:
-        base_head_dim = layout.d_model  # degenerate single-head fallback
+        base_head_dim = base_d_model  # degenerate single-head fallback
+
+    # Production (no-extra) path: pad the layout up to a multiple of
+    # ``n_heads`` exactly as the legacy alignment did, by declaring the
+    # ``_pad`` filler band. (With extra bands the head-dim-preserving
+    # ``_widen_pad`` below subsumes this; declaring both would double-pad.)
+    if not extra_dim_names and layout.d_model % n_heads != 0:
+        compiler.declare_dim("_pad", n_heads - (layout.d_model % n_heads))
+        layout = compiler.compile()
 
     # ------------------------------------------------------------------
-    # Auto-widen: append caller/op-requested residual bands at the tail.
+    # Auto-widen: align the widened d_model to the base head_dim.
     # ------------------------------------------------------------------
-    # Bump-pointer allocated (no pin) so they land past the highest
-    # existing dim, growing d_model automatically — an op never has to
-    # hardcode d_model to claim a fresh band.
     if extra_residual_dims:
-        for _name, _size in extra_residual_dims.items():
-            compiler.declare_dim(_name, int(_size))
+        # (extra bands already declared above; recompile picks up the
+        # current layout / d_model including them.)
         layout = compiler.compile()
 
         # ------------------------------------------------------------------

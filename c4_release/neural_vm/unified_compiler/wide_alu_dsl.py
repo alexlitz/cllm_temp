@@ -642,6 +642,7 @@ def wide_mul_rules(
     threshold: float = None,
     result_byte1_lo_base: str = None,
     result_byte1_hi_base: str = None,
+    operand_a_artifact_blocker_weight: float = 0.0,
 ) -> Tuple[FFNRule, ...]:
     """Generate FFNRule list for wide MUL — nibble-stacked flat lookup.
 
@@ -730,6 +731,25 @@ def wide_mul_rules(
             routed to a dedicated band instead of ``result_base+32/+48``.
         result_byte1_hi_base: optional dim base for the product's BYTE-1
             HIGH nibble (nib3). See ``result_byte1_lo_base``.
+        operand_a_artifact_blocker_weight: width_bytes=2 only. When > 0,
+            each rule adds a NEGATIVE condition of weight
+            ``-operand_a_artifact_blocker_weight`` on every OTHER non-zero
+            operand-A nibble cell (``operand_a_base+j`` for j in 1..15,
+            j != a_lo on the low-nibble lane and j != a_hi on the
+            high-nibble lane). This disambiguates the value-proportional
+            index-0 magnitude artifact the L8 operand-gather emits on
+            ``operand_a_base+0`` / ``operand_a_base+16`` (~5.5, NEARLY
+            equal to a true ~5.84 nibble): when operand A's true nibble is
+            NON-zero, its strong one-hot at the real cell trips this
+            blocker and suppresses the spurious ``a_nib=0`` rule that the
+            artifact would otherwise fire. When A's true nibble IS zero
+            (A < 16, e.g. mul_basic's 6) no other A cell is hot so the
+            ``a_nib=0`` rule fires correctly. This is the SAME technique
+            ``_layer10_alu_ordering_engine_rules`` uses for the CMP flags
+            (see ops/l10_ops.py); it is the documented workaround for the
+            ``project_operand_gather_hybrid_encoding`` Wall-1 cell-0
+            artifact without an upstream gather fix. Default 0.0 keeps the
+            byte-identity (clean-one-hot) form for the DSL unit test.
 
     Returns:
         ``tuple[FFNRule, ...]`` — 256 rules for ``width_bytes=1``,
@@ -841,18 +861,33 @@ def wide_mul_rules(
                             (f"{result_base}+{32 + nib2}", write_amplitude),
                             (f"{result_base}+{48 + nib3}", write_amplitude),
                         )
+                    conditions = [
+                        (marker_gate, marker_cond_weight),
+                        (f"{operand_a_base}+{a_lo}", operand_a_cond_weight),
+                        (f"{operand_a_base}+{16 + a_hi}", operand_a_cond_weight),
+                        (f"{operand_b_base}+{b_lo}", operand_b_cond_weight),
+                        (f"{operand_b_base}+{16 + b_hi}", operand_b_cond_weight),
+                    ]
+                    if operand_a_artifact_blocker_weight > 0.0:
+                        # Suppress the index-0 magnitude artifact: a rule
+                        # whose A nibble is k is blocked if ANY OTHER
+                        # non-zero A cell is hot (-> the real nibble is
+                        # that other cell, and this k is the artifact).
+                        bw = -operand_a_artifact_blocker_weight
+                        conditions += [
+                            (f"{operand_a_base}+{j}", bw)
+                            for j in range(1, 16) if j != a_lo
+                        ]
+                        conditions += [
+                            (f"{operand_a_base}+{16 + j}", bw)
+                            for j in range(1, 16) if j != a_hi
+                        ]
                     rules.append(multi_way_and_rule(
                         name=(
                             f"wide_mul_w2_alo{a_lo:x}_ahi{a_hi:x}_"
                             f"blo{b_lo:x}_bhi{b_hi:x}"
                         ),
-                        conditions=(
-                            (marker_gate, marker_cond_weight),
-                            (f"{operand_a_base}+{a_lo}", operand_a_cond_weight),
-                            (f"{operand_a_base}+{16 + a_hi}", operand_a_cond_weight),
-                            (f"{operand_b_base}+{b_lo}", operand_b_cond_weight),
-                            (f"{operand_b_base}+{16 + b_hi}", operand_b_cond_weight),
-                        ),
+                        conditions=tuple(conditions),
                         threshold=150.0 if threshold is None else threshold,
                         gate=opcode_gate,
                         writes=writes,

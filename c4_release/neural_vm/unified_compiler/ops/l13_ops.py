@@ -985,11 +985,12 @@ def make_layer13_add_addend_relay_op() -> Operation:
 # on -- because it reads MUL_RESULT_HI_*, which only exist (are declared
 # / d_model-allocated) under the same flag.
 #
-# PENDING: d_model widen / bnz fix for e2e + smoke. The byte-identity
-# UNIT test for the underlying width=2 rules is the correctness gate;
-# the e2e mul_overflow (100*5=500) emit verification is DEFERRED until
-# the widen lands (declaring MUL_RESULT_HI_* grows d_model past 920,
-# regressing test_bnz_branch until then).
+# LANDED (2026-06-13): the d_model widen is head-dim-preserving
+# (MUL_RESULT_HI_* routed through extra_residual_dims, 872 -> 981,
+# n_heads 8 -> 9), so e2e mul_overflow (100*5=500=0x01F4) emits both
+# bytes correctly and bnz stays green -> smoke 50/1. width=2 is the
+# default (opt out C4_MUL_WIDTH2=0). See
+# docs/MUL_WIDTH2_WIDEN_2026_06_13.md.
 def _layer13_mul_result_hi_relay_head_specs(BD) -> tuple:
     """L13 head 6: copy MUL byte-1 result (MUL_RESULT_HI_*) into AX_FULL.
 
@@ -1049,7 +1050,7 @@ def make_layer13_mul_result_hi_relay_op(enable: bool = False) -> Operation:
     (already K-gated on OP_MUL) can emit byte 1 to OUTPUT at the byte-1
     token. This mirrors the byte-0 result path (OUTPUT_LO/HI direct). See
     the module comment block above for the full byte-1 emit chain and the
-    PENDING d_model widen / bnz note.
+    head-dim-preserving widen note.
 
     The op is ALWAYS registered (keeps the dep graph / layer count stable
     per the ``all_core_ops`` convention) but is fully INERT when
