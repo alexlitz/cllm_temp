@@ -1908,10 +1908,27 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             writes=set(),
             kind="block",
             declarative_bake_fn=bake,
-            # Phase 8.G.6: drop ``layer_idx=10`` literal; bind to the L10
-            # attn anchor ``layer10_carry_relay`` so the block op resolves
-            # to whichever layer the compiler places the anchor at.
-            target_op_name="layer10_carry_relay",
+            # 2026-06-13 DIVMOD placement fix (mirrors the MUL L11 fix at
+            # ``efficient_l11_alumul_wrap``): RESTORE the explicit
+            # ``layer_idx=10`` pin. The Phase 8.G.6
+            # ``target_op_name="layer10_carry_relay"`` binding was
+            # MIS-RESOLVING: the L10 attn anchor ``layer10_carry_relay`` is
+            # itself placed at pre-exp layer 14 (the dep-scheduler floats it
+            # downstream of the L10 op family), so the efficient-mode divmod
+            # post_ops (the hidden=4 operand-cleanup FFN + the 131072-rule
+            # ``wide_div_rules_ge_format`` lookup) were appended to the L14
+            # block and expanded onto physical blocks 24/25 (= logical L14),
+            # NOT L10. The DIV/MOD operands are clean at the MARK_AX row
+            # around L10, but at L14 the memory/borrow machinery has already
+            # run and the residual state differs — so the misplaced lookup
+            # read garbage and produced a wrong quotient/remainder. Pinning
+            # ``layer_idx=10`` restores the intended L10 placement so the
+            # post_ops expand right after the L10 block (physical ~11) where
+            # the operands are still clean. ``requires['after']`` is KEPT so
+            # the efficient-mode install still fires AFTER the lookup-mode
+            # GE→BD stage chain (no-ops in efficient mode) and the legacy
+            # ``FlattenedDivMod`` assembly is discarded cleanly.
+            layer_idx=10,
             requires={"after": "l10_alu_divmod_getobd"},
             migrated=True,
             declarative_authority="structural_model",

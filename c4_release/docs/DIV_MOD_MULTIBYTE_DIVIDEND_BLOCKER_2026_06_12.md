@@ -175,3 +175,73 @@ layer, plus an operand relay the pipeline does not yet have.
   gather; the operand-relay prerequisite lives here).
 - `neural_vm/dim_registry_dynamic.py:234,647` — `ALU_LO/HI` (one byte) and the
   reserved `STACK0_BYTE_VAL_h_*` band (the multi-byte relay target).
+
+---
+
+## ADDENDUM (2026-06-13): divmod-compute L14 PLACEMENT DRIFT — found + fixed
+
+Independent of the multi-byte wall above, the efficient-mode DIV/MOD compute was
+**mis-placed onto the wrong physical block** — the exact same drift class as the
+MUL L11 fix (`docs/MUL_BASIC_L11_PLACEMENT_FIX_2026_06_13.md`). This was found
+while re-checking the brief's "is the divmod wrap mis-bound like MUL?" lead.
+
+### The drift
+
+`make_alu_divmod_composite_ops`'s install op (`l10_alu_divmod_install`, the only
+one of the 4 ops that bakes in efficient mode) bound via
+`target_op_name="layer10_carry_relay"`. That L10 attn anchor is itself **placed
+at pre-exp layer 14** (the dep-scheduler floats it downstream of the L10 op
+family — same mechanism that pushed `_layer11_ffn_dep_anchor` to L15 for MUL).
+So the two efficient-mode divmod post_ops it appends to `block.post_ops` —
+
+| FFN | hidden | landed (before) | landed (after fix) |
+| --- | --- | --- | --- |
+| operand-cleanup | 4 | phys 24 = logical **L14** | phys 12 = logical **L10** |
+| `wide_div_rules_ge_format` lookup | 131072 | phys 25 = logical **L14** | phys 13 = logical **L10** |
+
+Verified with `tools/probe_divmod_assignment.py` (spec_k=0, disk_cache=False):
+`layer10_carry_relay` is at pre-exp layer 14, not 11; before the fix the GE_FFN
+sat at physical block 25 (= logical L14), four logical layers past its intended
+L10 install point — where the operand bands the install reads are no longer the
+clean MARK_AX state the cleanup+lookup were tuned against.
+
+### The fix (one line + comment, `alu_ops.py make_install`)
+
+```python
+-   target_op_name="layer10_carry_relay",   # mis-resolves to L14
++   layer_idx=10,                            # pin to L10 (physical ~11)
+    requires={"after": "l10_alu_divmod_getobd"},   # KEPT
+```
+
+Mirrors the MUL fix exactly: `layer_idx` takes precedence over `target_op_name`
+for block ops (`layer_compiler.py:1505`); `requires['after']` is kept so the
+efficient install still fires after the (no-op in efficient mode) lookup-mode
+GE→BD stage chain.
+
+### Result — byte-identity-safe structural correctness, NO pass-set change
+
+- `tools/probe_divmod_assignment.py`: GE_FFN now lands at physical block 13 =
+  **logical L10** (was L14). Confirmed.
+- `pytest tests/test_smoke.py -q`: **49 passed / 2 failed** (same two pre-existing
+  fails: `test_simple_function`, `test_mul_overflow`). `test_div_basic` /
+  `test_mod_basic` stay green; zero ALU/bitwise/shift/cmp/32-bit regressions.
+- `pytest tests/test_div_mode.py -q`: **11 passed**.
+- `run_1096_canonical.py --criterion full_trace --ids 150-249`: **div 21/50,
+  mod 22/50 — UNCHANGED**, with byte-identical divergences (same fail ids, same
+  expected/got AX).
+
+### Why the placement fix recovers ZERO failing programs
+
+The full-trace divergences are **all at the dividend-LOAD step (step 1), BEFORE
+the divide executes** — `expected ax=<full dividend>, got ax=<low_byte(dividend)>`
+(e.g. id150 `1162/37`: expected ax=1162, got ax=138=1162&0xFF). Every single
+failing program has a multi-byte dividend (`a > 255`); every passing one has a
+single-byte dividend. The divmod compute — now correctly placed — never sees a
+correct multi-byte operand because the truncation is upstream (the byte-0-only
+operand gather + the AX byte-1 DUMP truncation, the latter owned by the
+in-flight task #220 / HEAD commit `bf2ce4f7`). The placement fix is real and
+structurally correct (the compute is no longer baked onto L14 garbage state),
+byte-identity safe, and a prerequisite-cleanup for the eventual multi-byte
+relay, but it cannot flip any case alone. The remaining path is the
+multi-session bit-serial cascade + multi-byte operand relay described above —
+HARD STOP per the div/mod fix brief.
