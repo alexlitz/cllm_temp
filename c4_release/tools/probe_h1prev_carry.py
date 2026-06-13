@@ -41,8 +41,14 @@ def main():
     probe = GroundTruthProbe.build()
     model = probe.model
     from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
-    _, layout = compile_full_vm_dynamic(disk_cache=True)
+    # Match the GroundTruthProbe's EFFICIENT-ALU model (trust_neural_alu=True ->
+    # alu_mode='efficient'); the lookup-mode layout has different band positions.
+    _, layout = compile_full_vm_dynamic(disk_cache=True, alu_mode="efficient")
     dp = layout.dim_positions
+    assert layout.d_model == model.head.weight.shape[1], (
+        f"layout d_model {layout.d_model} != model d_model "
+        f"{model.head.weight.shape[1]} — probe layout/model mismatch"
+    )
     H1 = _REG.slots["H1"].start
     H1P = dp["H1_PREV_STEP"]
     H1D = dp.get("H1_DUMP_OUT")
@@ -73,6 +79,12 @@ def main():
         if h1d is not None:
             print(f"  H1_DUMP_OUT {h1d}")
         print(f"  sum(AX_CARRY) = {axc_sum:.2f}")
+        ADDR = _REG.slots["ADDR_B0_LO"].start
+        print(f"  ADDR_B0_LO+5 = {float(res[ADDR + 5]):.3f}")
+        for mk in ("MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM", "MARK_SE"):
+            mp = _REG.slots[mk].start
+            print(f"  {mk} = {float(res[mp]):.3f}", end="  ")
+        print()
 
 
 if __name__ == "__main__":

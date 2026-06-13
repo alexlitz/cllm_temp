@@ -515,6 +515,14 @@ def all_core_ops(
         # the byte-0 carry (CARRY+1, the clean autoregressive
         # discriminator). Byte-identical on 8-bit ADD; add 1096 4/50->39/50.
         make_l10_add_high_byte_adder_op(),
+        # AX byte-1 DUMP repopulate FFN: the carried-vs-fresh GATE half of the
+        # AX byte-1 register-dump carry. Copies the prev-step one-hot from
+        # ``H1_PREV_STEP`` (filled by ``layer13_ax_byte1_dump_carry``) into the
+        # emission band ``H1_DUMP_OUT`` ONLY on carried (non-AX-writing) steps
+        # (gated on the AX_CARRY fresh ~-988 / carried ~+2.7 separation, held
+        # to the final block). Standalone PureFFN post_op on the L25 tail block
+        # after tail_bit32. See l11_ops.make_ax_byte1_dump_repopulate_op.
+        make_ax_byte1_dump_repopulate_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).
@@ -626,6 +634,11 @@ def all_core_ops(
         ),
         # Model-level bakes (run after legacy_bake's per-layer/head/embed work)
         make_head_bake_op(),
+        # AX byte-1 DUMP emission columns: mirrors the H1 high-byte one-hot
+        # columns onto H1_DUMP_OUT so the LM head re-emits the carried high
+        # byte. Phase=1002 (additive, AFTER head_bake). Byte-identical on fresh
+        # steps (H1_DUMP_OUT == 0). See model_ops.make_ax_byte1_dump_head_bake_op.
+        make_ax_byte1_dump_head_bake_op(),
         make_embedding_bake_op(),
         # Initial-PC bake: writes the PC_OFFSET pattern into the REG_PC
         # token-embedding row (replaces the runtime `_inject_initial_pc`).

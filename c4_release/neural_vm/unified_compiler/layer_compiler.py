@@ -1177,6 +1177,14 @@ class LayerCompiler:
     def __init__(self, *, enable_dim_liveness: Optional[bool] = None):
         self.ops: List[Operation] = []
         self.dims: Dict[str, int] = {}  # name -> size
+        # Names of residual bands that will be declared AFTER the ``add_op``
+        # loop (at the tail, by the auto-widen path) but that the ops added
+        # before then legitimately reference. ``add_op``'s dim-validation
+        # treats these as already-known so the ops validate; the bands get
+        # their actual position post-loop. Used for ``extra_residual_dims``
+        # (e.g. the AX byte-1 carry bands) whose tail placement must be
+        # computed from the FULL op-dim layout, not the compat-dims-only one.
+        self.pending_extra_dims: set = set()
         self._op_by_name: Dict[str, Operation] = {}
         # Block-level and model-level ops are bake-only; they don't participate
         # in dim-position allocation, so they're held separately.
@@ -1246,9 +1254,16 @@ class LayerCompiler:
         for d in op.reads | op.writes:
             if d in self.dims:
                 continue
+            if d in self.pending_extra_dims:
+                # Declared post-loop at the tail (auto-widen). Accept the
+                # forward reference; ``compile()`` will resolve the position.
+                continue
             if is_ssa_form(d):
                 parsed = parse_ssa_name(d)
-                if parsed.base_dim not in self.dims:
+                if (
+                    parsed.base_dim not in self.dims
+                    and parsed.base_dim not in self.pending_extra_dims
+                ):
                     raise ValueError(
                         f"Op {op.name!r} SSA dim {d!r} references "
                         f"undeclared base dim {parsed.base_dim!r}"
@@ -1296,7 +1311,10 @@ class LayerCompiler:
                 # keys -- they are intentionally NOT declared dims.
                 if dim_name.startswith("__"):
                     continue
-                if dim_name not in self.dims:
+                if (
+                    dim_name not in self.dims
+                    and dim_name not in self.pending_extra_dims
+                ):
                     raise ValueError(
                         f"Op {op.name!r} {fname} references undeclared dim "
                         f"{dim_name!r}"
@@ -2387,6 +2405,16 @@ class LayerCompiler:
         "SE_CMP", "SE_CMP_GROUP",
         "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT",
         "SE_OP_GT", "SE_OP_LE", "SE_OP_GE",
+        # AX byte-1 register-dump carry bands. ``H1_PREV_STEP`` carries the
+        # prev step's H1 one-hot from the L13 carry head to the L25 dump FFN
+        # (multi-block lifetime); ``H1_DUMP_OUT`` carries the re-supplied
+        # one-hot from the L25 dump FFN to the LM head. Both must keep PRIVATE
+        # slots: a liveness merge onto a same-width donor whose lifetime
+        # "ended" leaves the donor's residue in the shared slot (observed:
+        # H1_DUMP_OUT shared slot 323 returned a stale 1.0 instead of the
+        # carried one-hot), corrupting the byte-1 emission. See
+        # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
+        "H1_PREV_STEP", "H1_DUMP_OUT",
     })
 
     def _liveness_never_share(self, name: str) -> bool:

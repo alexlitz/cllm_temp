@@ -1985,6 +1985,11 @@ def compile_full_vm_dynamic(
     # model touched). Threaded by NAME via ``layout.dim_positions`` -- they
     # must NOT be op-declared ``declare_dim``s.
     _PRODUCTION_EXTRA_RESIDUAL_DIMS = {"H1_PREV_STEP": 7, "H1_DUMP_OUT": 7}
+    # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the production-default
+    # bands (A/B diagnostics only — the carry ops then reference undeclared
+    # dims, so this is for layout/geometry comparison, not a runnable build).
+    if os.environ.get("C4_DISABLE_AX_CARRY_BANDS") == "1":
+        _PRODUCTION_EXTRA_RESIDUAL_DIMS = {}
     _merged_extra = dict(_PRODUCTION_EXTRA_RESIDUAL_DIMS)
     from .ops.shared import mul_width2_enabled
     if mul_width2_enabled():
@@ -1992,7 +1997,7 @@ def compile_full_vm_dynamic(
         _merged_extra["MUL_RESULT_HI_HI"] = 16
     if extra_residual_dims:
         _merged_extra.update(extra_residual_dims)
-    extra_residual_dims = _merged_extra
+    extra_residual_dims = _merged_extra or None
 
     from ..config import get_config
     vm_config = get_config()
@@ -2095,6 +2100,12 @@ def compile_full_vm_dynamic(
             # Qwen R1 (see _bake_from_scheduled_ops cache key for context).
             "C4_QWEN_EXPORT_COMPAT": (
                 os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
+            ),
+            # AX byte-1 register-dump emission flag: toggles the LM-head
+            # ``H1_DUMP_OUT`` columns (output-affecting, no source change), so
+            # the ON and OFF builds must NEVER share a memo / disk entry.
+            "C4_AX_BYTE1_DUMP": (
+                os.environ.get("C4_AX_BYTE1_DUMP", "0") == "1"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -2570,6 +2581,11 @@ def _bake_from_scheduled_ops(
         "C4_QWEN_EXPORT_COMPAT": (
             os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
         ),
+        # AX byte-1 register-dump emission flag (output-affecting, no source
+        # change): the ON / OFF builds must never share a serialised entry.
+        "C4_AX_BYTE1_DUMP": (
+            os.environ.get("C4_AX_BYTE1_DUMP", "0") == "1"
+        ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
         # baseline (or with a different requested band set).
@@ -2602,25 +2618,18 @@ def _bake_from_scheduled_ops(
 
     compiler = LayerCompiler()
     declare_setdim_compat_dims(compiler, pin_io_only=pin_io_only)
-
-    # ------------------------------------------------------------------
-    # Auto-widen: declare caller/op-requested residual bands at the tail
-    # BEFORE adding ops, so ops that read/write those bands (e.g. the L13
-    # ``layer13_mul_result_hi_relay`` reading ``MUL_RESULT_HI_*``, and the
-    # AX ``layer13_ax_byte1_dump_carry`` / ``ax_byte1_dump_repopulate``
-    # reading/writing ``H1_PREV_STEP`` / ``H1_DUMP_OUT``) pass ``add_op``'s
-    # undeclared-dim validation. They are bump-pointer allocated (no pin) so
-    # they land past the highest existing dim, and ``base_head_dim`` below is
-    # captured from the width EXCLUDING them (by name) so the widen stays
-    # head-dim-preserving. An op never has to hardcode d_model to claim a
-    # fresh band. BOTH band families (AX always + MUL when ``C4_MUL_WIDTH2``)
-    # flow through here via the unified ``extra_residual_dims`` above.
-    extra_dim_names: set[str] = set()
+    # Forward-declare the extra residual band NAMES so the ops added below
+    # validate even though the bands are positioned AFTER the loop (at the
+    # tail, by the auto-widen path). Their tail placement must be computed
+    # from the FULL op-dim layout (NOT the compat-dims-only one), so the
+    # actual ``declare_dim`` happens post-loop. ``extra_residual_dims`` here
+    # carries BOTH band families: the AX byte-1 carry bands
+    # (``H1_PREV_STEP`` / ``H1_DUMP_OUT``, always present) and — when
+    # ``C4_MUL_WIDTH2`` is on — the MUL byte-1 result bands
+    # (``MUL_RESULT_HI_LO`` / ``MUL_RESULT_HI_HI``), read by the L13
+    # ``layer13_mul_result_hi_relay``. Both are resolved post-loop.
     if extra_residual_dims:
-        for _name, _size in extra_residual_dims.items():
-            compiler.declare_dim(_name, int(_size))
-            extra_dim_names.add(_name)
-
+        compiler.pending_extra_dims.update(extra_residual_dims.keys())
     for op in scheduled:
         compiler.add_op(op)
 
@@ -2635,43 +2644,34 @@ def _bake_from_scheduled_ops(
     # spec writes rows at ``head_idx * head_dim``). The auto-widen below
     # preserves THIS head_dim; it must never be re-derived from a width
     # that already includes the extra bands. The extra bands (AX + MUL) are
-    # already declared (above) so ``add_op`` could validate op refs to them,
-    # but they are EXCLUDED from the base width here (and from any SSA alias
-    # of them) so widening still rounds up to a multiple of the BASE
-    # head_dim and ADDS heads instead of repartitioning existing heads.
+    # NOT yet declared at this point — they're only forward-declared as names
+    # in ``compiler.pending_extra_dims`` — so this layout is the clean BASE
+    # layout (no extra-band width folded in). The head-dim-preserving widen
+    # below therefore rounds up to a multiple of the BASE head_dim and ADDS
+    # heads instead of repartitioning existing heads.
     layout = compiler.compile()
-    if extra_dim_names:
-        excluded = set(extra_dim_names)
-        for _dn, _alias in getattr(compiler, "_aliases", {}).items():
-            if _alias in extra_dim_names:
-                excluded.add(_dn)
-        base_d_model = 0
-        for _name, _pos in layout.dim_positions.items():
-            if _name in excluded:
-                continue
-            base_d_model = max(base_d_model, _pos + compiler.dims[_name])
-    else:
-        base_d_model = layout.d_model
-    if base_d_model % n_heads != 0:
-        base_d_model += n_heads - (base_d_model % n_heads)
-    base_head_dim = base_d_model // n_heads
-    if base_head_dim <= 0:
-        base_head_dim = base_d_model  # degenerate single-head fallback
-
-    # Production (no-extra) path: pad the layout up to a multiple of
-    # ``n_heads`` exactly as the legacy alignment did, by declaring the
-    # ``_pad`` filler band. (With extra bands the head-dim-preserving
-    # ``_widen_pad`` below subsumes this; declaring both would double-pad.)
-    if not extra_dim_names and layout.d_model % n_heads != 0:
-        compiler.declare_dim("_pad", n_heads - (layout.d_model % n_heads))
+    if layout.d_model % n_heads != 0:
+        pad = n_heads - (layout.d_model % n_heads)
+        compiler.declare_dim("_pad", pad)
         layout = compiler.compile()
+    base_head_dim = layout.d_model // n_heads
+    if base_head_dim <= 0:
+        base_head_dim = layout.d_model  # degenerate single-head fallback
 
     # ------------------------------------------------------------------
-    # Auto-widen: align the widened d_model to the base head_dim.
+    # Auto-widen: append caller/op-requested residual bands at the tail.
     # ------------------------------------------------------------------
+    # Bump-pointer allocated (no pin) so they land past the highest existing
+    # dim, growing d_model automatically — an op never has to hardcode d_model
+    # to claim a fresh band. (Pinning them at an explicit tail position is
+    # WRONG: it defeats the default-ON dim-liveness slot-sharing allocator,
+    # which then refuses to compact and blows up d_model — e.g. efficient-mode
+    # 920 -> 1635, relocating ALU_LO past the efficient-ALU's 512-wide W_proj.
+    # The forward-declared names — both AX (``H1_PREV_STEP`` / ``H1_DUMP_OUT``)
+    # and MUL (``MUL_RESULT_HI_*``) — are now resolved by this declare.)
     if extra_residual_dims:
-        # (extra bands already declared above; recompile picks up the
-        # current layout / d_model including them.)
+        for _name, _size in extra_residual_dims.items():
+            compiler.declare_dim(_name, int(_size))
         layout = compiler.compile()
 
         # ------------------------------------------------------------------

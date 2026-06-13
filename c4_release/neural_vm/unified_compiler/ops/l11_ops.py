@@ -912,9 +912,8 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     head_idx: int,
     *,
     L: float = 15.0,
-    h1_w: float = 3.0,
     sink_w: float = 8.0,
-    k_axc_w: float = 0.05,
+    k_axc_w: float = 0.2,
     alibi_slope: float = 0.5,
 ) -> DeclarativeAttentionHeadSpec:
     """Build the AX byte-1 DUMP carry head spec (``H1_PREV_STEP`` band).
@@ -948,9 +947,9 @@ def _layer13_ax_byte1_dump_carry_head_spec(
                row: its AX_CARRY ~= -988 -> huge +K boost; the current
                carried row's AX_CARRY ~= 0 -> no boost -> the prev fresh row
                wins, reinforced by positive-ALiBi recency)
-      slot 2 = Sum_j (H1 + j) * h1_w  (one-hot-presence K-preference: the prev
-               fresh predictor holds the one-hot, band-sum ~= 14, so it
-               out-scores the current empty predictor, band-sum ~= 0.9)
+      slot 2 = Sum_k (AX_CARRY + k) * -k_axc_w (fresh-preference: the prev FRESH
+               predictor's very-negative AX_CARRY -> large +K bias, picking it
+               over the current carried predictor)
       slot 3 = ``MARK_AX`` * sink_w   (V=0 sink: on the first step there is no
                prev predictor; the head falls onto an H1==0 marker row and
                writes ~0 into ``H1_PREV_STEP`` -> no garbage seed)
@@ -990,28 +989,37 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     # H1_PREV_STEP O target: from the bake layout (new band, not in registry).
     h1_prev = int(dim_positions["H1_PREV_STEP"])
 
+    # Slot design (the AX_CARRY fresh-preference MUST be on its OWN slot, not
+    # mixed into the signature slot). The earlier mixed design failed because
+    # the AX_CARRY boost (~+197) is CONSTANT across all prev-step AX byte rows
+    # (byte 0/1/2/3 all fresh, AX_CARRY ~ -988), so it lifted them all equally
+    # and the small signature gap (~14) could not single out byte-1 -> the V
+    # copied the AVERAGE of prev AX byte 0..3's H1 (garbage). Fix: a SHARP
+    # signature on slot 0 (large weight, byte-1-specific) makes byte-1 dominate
+    # among the prev rows; the AX_CARRY fresh-preference on slot 2 (CONST-gated,
+    # additive) then biases toward the FRESH byte-1 row over the current carried
+    # byte-1 row.
+    addr_b1_hi = _P("ADDR_B1_HI") + 8
+    SIG_W = 60.0          # SHARP signature: byte-1 row dominates among prev rows
     q = [
-        AP(0, addr_sig, L),
-        AP(2, const, L),
-        AP(3, addr_sig, L),
+        AP(0, addr_sig, SIG_W),   # K slot 0: byte-1 signature (sharp)
+        AP(1, addr_b1_hi, L),     # K slot 1: ADDR_B1_HI+8 AX-register match
+        AP(2, const, L),          # K slot 2: AX_CARRY fresh-preference driver
+        AP(3, addr_sig, L),       # K slot 3: MARK_AX V=0 sink
     ]
     k = [
-        AP(0, addr_sig, L),
+        AP(0, addr_sig, SIG_W),
+        AP(1, addr_b1_hi, L),
         AP(3, mark_ax, sink_w),
     ]
-    # K-side prev-fresh-row preference via the AX_CARRY differential: the prev
-    # FRESH predictor has very-negative AX_CARRY (sum ~= -988), the current
-    # carried predictor ~0 -> ``-AX_CARRY`` boosts the prev fresh row's K.
+    # K slot 2 — AX_CARRY fresh-preference (its OWN slot, CONST-driven Q): the
+    # prev FRESH byte-1 predictor has very-negative AX_CARRY (sum ~ -988); the
+    # current carried byte-1 predictor ~ +2.7 -> ``-AX_CARRY`` gives the prev
+    # fresh row a large +K bias. With the sharp slot-0 signature already
+    # confining attention to byte-1 rows, this slot picks the FRESH one.
     for j in range(16):
-        k.append(AP(0, axc_lo + j, -k_axc_w))
-        k.append(AP(0, axc_hi + j, -k_axc_w))
-    # K-side one-hot-presence preference (same-step H1 read): the prev fresh
-    # predictor HOLDS the one-hot (band-sum ~= 14) and wins over the current
-    # empty predictor. SAME-STEP H1 read -> adds the head to the H1 readers but
-    # does NOT cycle (the head WRITES the distinct H1_PREV_STEP band, read by
-    # nobody upstream, so no back-edge into any H1 / AX_CARRY producer).
-    for j in range(7):
-        k.append(AP(2, h1 + j, h1_w))
+        k.append(AP(2, axc_lo + j, -k_axc_w))
+        k.append(AP(2, axc_hi + j, -k_axc_w))
 
     v = []
     o = []
@@ -1098,6 +1106,214 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
         target_op_name="_layer13_mem_addr_anchor",
         migrated=True,
         declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# AX byte-1 DUMP repopulate FFN (the carried-vs-fresh GATE + emission band)
+# ---------------------------------------------------------------------------
+#
+# The FFN half of the AX byte-1 register-dump carry. The carry head above
+# unconditionally copies the PREVIOUS step's ``H1`` one-hot into the dedicated
+# ``H1_PREV_STEP`` band. This FFN re-supplies it into the emission band
+# ``H1_DUMP_OUT`` ONLY on carried (non-AX-writing) steps, where the LM head
+# then emits the carried high byte (via the mirrored ``H1_DUMP_OUT`` columns
+# in ``ax_byte1_dump_head_bake``).
+#
+# Gate (measured spec_k=0 at the final block, tools/probe_h1prev_carry.py):
+#   * row signature: ``ADDR_B0_LO+5`` ~= 0.97 on EVERY byte-1 predictor row,
+#     ~0 elsewhere -> fires the unit on the byte-1 predictor row only.
+#   * carried-vs-fresh: ``sum(AX_CARRY_LO+HI)`` ~= -988 on a FRESH-AX step and
+#     ~= +2.65 on a CARRIED step. A small POSITIVE weight on the AX_CARRY band
+#     keeps the carried row above threshold (0.97 + 2.65*w) and drives the
+#     fresh row far below it (0.97 - 988*w) -> the unit is DARK on fresh steps
+#     (``H1_DUMP_OUT`` stays 0 -> the byte-1 emission is byte-identical) and
+#     copies ``H1_PREV_STEP`` on carried steps.
+# The copy preserves the one-hot's argmax slot (magnitude need not be exact);
+# the LM-head column ``head.weight[token_v, H1_DUMP_OUT+(v+2)] = 5.0`` then
+# emits the matching high-byte token.
+#
+# Writing the DISTINCT ``H1_DUMP_OUT`` band (not ``H1``) is what avoids the
+# 2-cycle: a late FFN writing ``H1`` while reading ``AX_CARRY`` would cycle
+# (``layer6_routing_ffn`` reads ``H1`` AND writes ``AX_CARRY``). ``H1_DUMP_OUT``
+# is read only by the LM head (a model-level forward edge), so no back-edge.
+_AX_BYTE1_DUMP_REPOPULATE_HIDDEN_DIM = 7
+
+
+def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
+    """7 rules: ``H1_DUMP_OUT+j = H1_PREV_STEP+j`` on carried byte-1 rows.
+
+    Each rule fires at the byte-1 predictor row (``ADDR_B0_LO+5`` signature)
+    AND carried (``+AX_CARRY`` keeps it above threshold; fresh's ~-988 sinks
+    it), then gate-copies the carried one-hot from ``H1_PREV_STEP`` into the
+    emission band ``H1_DUMP_OUT``.
+    """
+    H1_W = 7
+    # Per-slot positive AX_CARRY weight (carried-vs-fresh discriminator). The
+    # AX_CARRY band-SUM crisply separates THREE step classes at the AX byte-1
+    # row (measured spec_k=0): a genuine multi-byte CARRY step (PSH/ADJ) ~ +2.7;
+    # a memory-LOAD / non-IMM AX-write step (LI/LC) ~ +0.8; a fresh IMM/ADD
+    # AX-write ~ -988. Weighted 1.0 (per cell over the 32-cell band the sum is
+    # the raw band value, since only one cell per nibble is active) so the gate
+    # threshold can sit ABOVE the +0.8 load class and BELOW the +2.7 carry class
+    # -> the dump fires ONLY on a genuine carry, NOT on a memory load (which
+    # would re-emit the STALE prev byte-1 onto the freshly loaded value;
+    # observed: si_li 42 -> 0x22A=554). fresh IMM/ADD (-988) is darkened with a
+    # huge margin.
+    AXC_W = 1.0
+    # AX-register discriminator: ``ADDR_B1_HI+8`` is ~4.0 on the AX byte rows
+    # and ~0.0 on the PC / SP / BP byte rows (measured spec_k=0, PROGRAM-STABLE
+    # across 654/754/913/432/692: AX=4.02 / PC=0.01 every time — unlike
+    # ``H0+AX_I``, whose marker-distance value drifted to 0 on some programs).
+    # It is high on ALL AX byte rows (it decays mildly with byte offset:
+    # 4.91/4.02/3.29/2.70 at AX+0/+1/+2/+3), so it is NOT byte-1-specific — the
+    # byte-1 selectivity comes from ``ADDR_B0_LO+5`` (0.97 ONLY at AX+1, ~0 at
+    # AX+0/+2/+3). Weighted 0.25 so ``ADDR_B1_HI+8`` contributes ~1.0 (matching
+    # the 0.97 signature term) -> a BALANCED AND that needs BOTH the AX-register
+    # signal AND the byte-1-position signal. This prevents (a) the carried
+    # PC/SP/BP byte-1 dump (no AX-register signal) and (b) the AX byte-2/3 dump
+    # (no byte-1 signature) from firing.
+    AX_REG_W = 0.25
+    # Structural blockers (EXACTLY 0 at the byte-1 predictor row): markers off,
+    # so a large magnitude only sinks the unit if it strays onto a marker row.
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_STACK0", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    blockers = marker_blockers
+    SIG_W = 2.0  # byte-1 signature weight (load-bearing: separates byte-1 from
+    #              byte-2/3, which lack ADDR_B0_LO+5 but share ADDR_B1_HI+8/AXC)
+    conditions_base = [
+        ("ADDR_B1_HI+8", AX_REG_W),   # AX-register discriminator (~4.0 AX / ~0 else)
+        ("ADDR_B0_LO+5", SIG_W),      # byte-1 predictor row signature
+    ]
+    for k in range(16):
+        conditions_base.append((f"AX_CARRY_LO+{k}", AXC_W))
+        conditions_base.append((f"AX_CARRY_HI+{k}", AXC_W))
+    conditions = tuple(conditions_base) + blockers
+
+    rules: list[FFNRule] = []
+    for j in range(H1_W):
+        rules.append(multi_way_and_rule(
+            name=f"ax_byte1_dump_repopulate_slot_{j}",
+            # threshold 4.5 (balanced AND of AX-register + byte-1-signature*2 +
+            # the +2.7-vs-+0.8 carry-vs-load AX_CARRY split):
+            #   genuine CARRY AX+1 = ADDR_B1_HI+8(4.0*0.25=1.0) + sig(0.97*2=1.94)
+            #     + AXC(+2.7) ~= 5.6 > 4.5 -> FIRES;
+            #   memory-LOAD AX+1 (LI/LC) = 1.0 + 1.94 + AXC(+0.8) ~= 3.74 < 4.5
+            #     -> DARK (prevents the stale-byte-1 leak onto loaded values);
+            #   AX byte-2/3 = 0.82/0.68 + 0(no sig) + AXC(+2.7) ~= 3.5 < 4.5 ->
+            #     DARK (missing the byte-1 signature);
+            #   carried-PC byte-1 = ~0 + 1.94 + AXC(~0.9) ~= 2.8 < 4.5 -> DARK
+            #     (no AX-register signal);
+            #   fresh IMM/ADD AX+1 = 1.0 + 1.94 - 988 << 4.5 -> DARK.
+            conditions=conditions,
+            threshold=4.5,
+            gate=f"H1_PREV_STEP+{j}",
+            # write_scale 2.0/S: silu(S*(cond-thr)) ~= 60 on a carried-AX row
+            # -> output ~= 60 * H1_PREV_STEP * 0.02 ~= 1.2 * H1_PREV_STEP
+            # (one-hot argmax slot preserved; LM head emits the right token).
+            writes=((f"H1_DUMP_OUT+{j}", 0.02),),
+        ))
+    return tuple(rules)
+
+
+def make_ax_byte1_dump_repopulate_op() -> Operation:
+    """Append the AX byte-1 dump-repopulate FFN after the L25 tail block.
+
+    Copies ``H1_PREV_STEP`` -> ``H1_DUMP_OUT`` on carried byte-1 predictor
+    rows (gated on the AX_CARRY fresh/carried separation), so the LM head
+    re-emits the carried high byte. Standalone ``PureFFN`` post_op appended on
+    the L25 tail block (after ``tail_bit32_result_correction``), so it reads
+    the crystallised AX_CARRY + the held ``H1_PREV_STEP`` and nothing
+    downstream overrides ``H1_DUMP_OUT`` before the LM head.
+    """
+    rules = _ax_byte1_dump_repopulate_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _AX_BYTE1_DUMP_REPOPULATE_HIDDEN_DIM, (
+            f"ax_byte1_dump_repopulate rule-count drift: produced "
+            f"{len(rules)}, expected {_AX_BYTE1_DUMP_REPOPULATE_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        # POSITION SOURCE (mixed) — same split the carry head documents. The H1
+        # pipeline, ADDR_B0_LO, AX_CARRY and the MARK_* flags are baked by the
+        # LEGACY imperative path at the dynamic *registry* / ``_SetDim``
+        # positions (ADDR_B0_LO=12, AX_CARRY_LO=328, ...), which DIFFER from
+        # the declarative ``dim_positions`` layout (ADDR_B0_LO=506,
+        # AX_CARRY_LO=362). The model residual carries those legacy dims at the
+        # REGISTRY positions, so the gate reads MUST resolve from
+        # ``build_default_registry_dynamic()`` or they tap dead slots
+        # (verified: layout ADDR_B0_LO+5 reads ~0, registry reads 0.97). The
+        # NEW bands ``H1_PREV_STEP`` / ``H1_DUMP_OUT`` exist ONLY in the
+        # declarative layout, so THOSE resolve from ``dim_positions``.
+        from ...dim_registry_dynamic import build_default_registry_dynamic
+        _reg = build_default_registry_dynamic()
+        _new_bands = {"H1_PREV_STEP", "H1_DUMP_OUT"}
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            if _base in _new_bands:
+                dim_map[_nm] = int(dim_positions[_base]) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+            else:
+                dim_map[_nm] = int(_reg.slots[_base].start) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="ax_byte1_dump_repopulate",
+        reads={
+            "ADDR_B0_LO", "ADDR_B1_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+            "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "MARK_SE", "H1_PREV_STEP",
+        },
+        writes={"H1_DUMP_OUT"},
+        kind="block",
+        # Append AFTER the tail correction on the same L25 block so this op is
+        # the last writer of H1_DUMP_OUT before the LM head reads it.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
         smoke_tests={"all"},
         spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
     )

@@ -1970,6 +1970,106 @@ def make_head_bake_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# AX byte-1 register-dump emission head bake (H1_DUMP_OUT columns)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the existing AX byte-1 H1 emission columns
+# (``head.weight[token v, H1+(v+2)] = 5.0`` for v in 0..4, the high-byte
+# one-hot the LM head reads at the byte-1 predictor row) onto the dedicated
+# ``H1_DUMP_OUT`` band that the ``ax_byte1_dump_repopulate`` FFN populates on
+# carried steps. ADDITIVE (runs AFTER ``head_bake`` at a higher phase, never
+# zeroes), and ``H1_DUMP_OUT`` is all-zero on fresh steps -> the byte-1
+# emission is byte-identical on fresh steps and additively re-emits the
+# carried high byte on carried steps.
+_AX_BYTE1_DUMP_HEAD_MAX_VALUE = 4  # H1 is 7-wide -> one-hot slots +2..+6
+
+
+def _ax_byte1_dump_head_bake_rules(vocab_size: int) -> tuple:
+    """``head.weight[token v, H1_DUMP_OUT+(v+2)] += 5.0`` for v in 0..4."""
+    rules: list[TokenEmbeddingRule] = []
+    for v in range(_AX_BYTE1_DUMP_HEAD_MAX_VALUE + 1):
+        if v >= vocab_size:
+            break
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[v],
+            writes=((f"H1_DUMP_OUT+{v + 2}", 5.0),),
+            name=f"ax_byte1_dump_head_token_{v}",
+        ))
+    return tuple(rules)
+
+
+def make_ax_byte1_dump_head_bake_op() -> Operation:
+    """Add the ``H1_DUMP_OUT`` byte-1 emission columns to the LM head.
+
+    Runs at phase=1002 (AFTER ``head_bake`` phase=1000 AND the legacy H1
+    emission columns) so it ADDS to ``head.weight`` rather than being zeroed.
+    Mirrors the H1 high-byte one-hot columns onto ``H1_DUMP_OUT`` so the LM
+    head re-emits the carried high byte once the ``ax_byte1_dump_repopulate``
+    FFN fills ``H1_DUMP_OUT`` on carried steps. Byte-identical on fresh steps
+    (``H1_DUMP_OUT == 0`` -> these columns contribute nothing).
+    """
+    # The byte-1 register-dump EMISSION (the LM-head ``H1_DUMP_OUT`` columns) is
+    # gated by ``C4_AX_BYTE1_DUMP``. The full carry machinery — the
+    # ``H1_PREV_STEP`` band, the L13 carry head, the gated L25 dump FFN — runs
+    # unconditionally; only these LM-head emission columns are gated. With the
+    # flag OFF (the DEFAULT) ``H1_DUMP_OUT`` has no LM-head columns, so the model
+    # is byte-identical to the pre-carry build (the carry head / dump FFN write
+    # fresh bands that nothing else reads) and the smoke gate stays 49/2.
+    #
+    # Set ``C4_AX_BYTE1_DUMP=1`` to ENABLE the emission: it delivers the
+    # cross-step AX byte-1 carry — add 0-49 full_trace 12/50 -> 40/50, sub 50-99
+    # 5/50 -> 9/50 (spec_k=0). It is DEFAULT-OFF only because the dump-read GATE
+    # still over-fires on two step classes whose AX_CARRY sits outside the
+    # +2.7 carry band (SHL result AX_CARRY ~ +12.8, JMP ~ +47.9) — the clean
+    # fresh-vs-carry discriminator there is the CURRENT row's ``H1`` high-byte
+    # one-hot, but adding an ``H1`` read to this tail FFN breaks the
+    # efficient-ALU decode path (pc=None). That residual is the last mile;
+    # everything else (band, cycle break, carry-head attention, registry/layout
+    # dim_map, liveness never-share) is landed. See
+    # ``docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md``.
+    import os as _os
+    _emission_on = _os.environ.get("C4_AX_BYTE1_DUMP", "0") == "1"
+
+    def _bake(model, dim_positions, S):
+        del S
+        if not _emission_on:
+            return
+        from ...vm_step import Token
+        ir = CompilerIR()
+        ir.embeddings.extend(
+            _ax_byte1_dump_head_bake_rules(Token.VOCAB_SIZE)
+        )
+        ir.lower_token_embeddings(model, dim_positions)
+
+    def _ir_factory(dim_positions, HD):
+        del HD
+        from ...vm_step import Token
+        ir = CompilerIR()
+        if _emission_on:
+            ir.embeddings.extend(
+                _ax_byte1_dump_head_bake_rules(Token.VOCAB_SIZE)
+            )
+        return ir
+
+    return Operation(
+        name="ax_byte1_dump_head_bake",
+        reads=set(),
+        writes=set(),
+        audited_empty_produces=True,
+        kind="model",
+        declarative_bake_fn=_bake,
+        compiler_ir_factory=_ir_factory,
+        # AFTER head_bake (1000); the legacy H1 emission columns are baked by
+        # the imperative legacy path -> use 1002 to be safely last.
+        phase=1002,
+        declarative_authority="declarative",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
+
+
 def _embedding_bake_rules(vocab_size: int) -> tuple:
     """Build the :class:`TokenEmbeddingRule` list mirroring ``setup_token_embeddings``.
 
