@@ -162,7 +162,7 @@ _BASELINE: Dict[str, int] = {
     "c4_release/neural_vm/unified_compiler/ops/l2_ops.py": 2,       # W_*=0   alibi=1 fill=1
     "c4_release/neural_vm/unified_compiler/ops/l5_ops.py": 1,       # W_*=0   alibi=0 fill=1
     "c4_release/neural_vm/unified_compiler/ops/l3_ops.py": 1,       # W_*=0   alibi=0 fill=1
-    "c4_release/neural_vm/unified_compiler/ops/l13_ops.py": 1,      # W_*=0   alibi=0 fill=1
+    "c4_release/neural_vm/unified_compiler/ops/l13_ops.py": 5,      # alibi_slopes[idx]= for relay heads 3/4/5/6 (known ALiBi-slope DSL gap)
     "c4_release/neural_vm/unified_compiler/ops/l0_ops.py": 1,       # W_*=0   alibi=0 fill=1
 }
 

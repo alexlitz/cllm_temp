@@ -7,7 +7,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, _empty_compiler_ir_factory
 
 
 # === L13 attention-head layout (pinned indices) =====================
@@ -957,6 +957,169 @@ def make_layer13_add_addend_relay_op() -> Operation:
             "TestSmoke32Bit::test_add_16bit",
         },
         spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+    )
+
+
+# =====================================================================
+# width=2 MUL byte-1 result relay (L13 head 6)  -- 2026-06-13
+# =====================================================================
+#
+# Opt-in via C4_MUL_WIDTH2=1. Completes the width=2 (8-bit x 8-bit ->
+# 16-bit) MUL byte-1 emit path, mirroring the byte-0 result path:
+#
+#   byte 0:  L11 wide_mul writes product byte 0 -> OUTPUT_LO/OUTPUT_HI
+#            (at the MARK_AX row); the existing decode emits it directly.
+#   byte 1:  L11 wide_mul writes product byte 1 -> MUL_RESULT_HI_LO/HI
+#            (dedicated band, NOT OUTPUT_LO+32 = ADDR_KEY). THIS head
+#            copies MUL_RESULT_HI_LO/HI -> AX_FULL_LO/HI at the MARK_AX
+#            row, and the existing ``layer15_alu_high_byte_relay``
+#            (l14_ops.py, already K-gated on OP_MUL) then copies
+#            AX_FULL -> OUTPUT at the byte-1 emit token.
+#
+# This is a SAME-ROW copy (source MUL_RESULT_HI_* and destination
+# AX_FULL_* both live at the MUL MARK_AX row), so it uses slot-0
+# self-attention: Q fires at MARK_AX AND OP_MUL, K matches CONST at the
+# same row (the recency softmax keeps the copy local to the firing row),
+# V reads MUL_RESULT_HI_LO/HI, O writes AX_FULL_LO/HI. The whole op is
+# gated by ``mul_width2_enabled()`` -- registered only when the flag is
+# on -- because it reads MUL_RESULT_HI_*, which only exist (are declared
+# / d_model-allocated) under the same flag.
+#
+# PENDING: d_model widen / bnz fix for e2e + smoke. The byte-identity
+# UNIT test for the underlying width=2 rules is the correctness gate;
+# the e2e mul_overflow (100*5=500) emit verification is DEFERRED until
+# the widen lands (declaring MUL_RESULT_HI_* grows d_model past 920,
+# regressing test_bnz_branch until then).
+def _layer13_mul_result_hi_relay_head_specs(BD) -> tuple:
+    """L13 head 6: copy MUL byte-1 result (MUL_RESULT_HI_*) into AX_FULL.
+
+    Same-row copy at the MUL MARK_AX row. Q fires at MARK_AX AND OP_MUL
+    (with a CONST anti-leak penalty and a slot-33 MARK_AX requirement so
+    the slot-0 softmax only routes positively on the MUL MARK_AX row).
+    K matches CONST at the same row. V copies the MUL_RESULT_HI_LO/HI
+    nibble pair; O writes AX_FULL_LO/HI at the Q row.
+    """
+    L = 15.0
+    q = [
+        AP(0, BD.MARK_AX, L),
+        AP(0, BD.OP_MUL, L),
+        AP(0, BD.CONST, -L / 2),
+        # slot 33 anti-leak: require MARK_AX so the slot-0 softmax only
+        # routes positively at the MUL MARK_AX Q row.
+        AP(33, BD.MARK_AX, L),
+        AP(33, BD.CONST, -L / 2),
+    ]
+    k = [
+        AP(0, BD.CONST, L),
+        AP(33, BD.CONST, L),
+    ]
+    # V slots 1..32 copy the MUL byte-1 result nibbles.
+    v = [AP(1 + kk, BD.MUL_RESULT_HI_LO + kk, 1.0) for kk in range(16)]
+    v += [AP(17 + kk, BD.MUL_RESULT_HI_HI + kk, 1.0) for kk in range(16)]
+    # O slots 1..32 route the gathered nibbles into AX_FULL_LO/HI.
+    o = [AO(BD.AX_FULL_LO + kk, 1 + kk, 1.0) for kk in range(16)]
+    o += [AO(BD.AX_FULL_HI + kk, 17 + kk, 1.0) for kk in range(16)]
+
+    return (
+        DeclarativeAttentionHeadSpec(
+            head_idx=6,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+        ),
+    )
+
+
+def _layer13_mul_result_hi_relay_ir(dim_positions, HD) -> CompilerIR:
+    del HD
+    proxy = _as_setdim_proxy(dim_positions)
+    ir = CompilerIR()
+    for spec in _layer13_mul_result_hi_relay_head_specs(proxy):
+        ir.layer(0).attention.append(spec)
+    return ir
+
+
+def make_layer13_mul_result_hi_relay_op(enable: bool = False) -> Operation:
+    """L13 attn head 6: stage width=2 MUL byte-1 result into AX_FULL.
+
+    Opt-in (``C4_MUL_WIDTH2=1`` -> ``enable=True``). Copies the product's
+    high byte from the dedicated MUL_RESULT_HI_LO/HI band into AX_FULL_LO/HI
+    at the MUL MARK_AX row, so the existing ``layer15_alu_high_byte_relay``
+    (already K-gated on OP_MUL) can emit byte 1 to OUTPUT at the byte-1
+    token. This mirrors the byte-0 result path (OUTPUT_LO/HI direct). See
+    the module comment block above for the full byte-1 emit chain and the
+    PENDING d_model widen / bnz note.
+
+    The op is ALWAYS registered (keeps the dep graph / layer count stable
+    per the ``all_core_ops`` convention) but is fully INERT when
+    ``enable=False``: empty reads/writes/claims, a no-op bake, and an empty
+    IR factory. It only references MUL_RESULT_HI_* (a flag-gated dim band)
+    when ``enable=True``, so the compiler never sees those dims unless the
+    flag is on.
+    """
+    if not enable:
+        # Inert no-op form. References no flag-gated dims so the compiler
+        # accepts it under the default (flag-off) build with d_model=920.
+        return Operation(
+            name="layer13_mul_result_hi_relay",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            declarative_bake_fn=lambda block, dim_positions, S: None,
+            compiler_ir_factory=_empty_compiler_ir_factory,
+            declarative_authority="spec_generated",
+            target_op_name="_layer13_mem_addr_anchor",
+            requires={"after": "layer13_add_addend_relay"},
+            migrated=True,
+            claims=set(),
+            spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+        )
+
+    def bake(block, dim_positions, S):
+        del S
+        attn = block.attn
+        proxy = _as_setdim_proxy(dim_positions)
+        HD = attn.W_q.shape[0] // attn.num_heads
+        # Slot-0 self-row copy: a slightly POSITIVE ALiBi slope keeps the
+        # softmax mass on the firing (MARK_AX) row itself (the source and
+        # destination bands both live there). The slot-33 anti-leak +
+        # CONST gate make the head dark off the MUL MARK_AX row.
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[6] = 1.0
+        Primitives.generate_attention_head(
+            attn,
+            _layer13_mul_result_hi_relay_head_specs(proxy)[0],
+            HD,
+        )
+
+    _claims = set()
+    for k in range(16):
+        _claims.add((13, "attn_W_v", f"6_{1 + k}", f"MUL_RESULT_HI_LO+{k}"))
+        _claims.add((13, "attn_W_v", f"6_{17 + k}", f"MUL_RESULT_HI_HI+{k}"))
+
+    return Operation(
+        name="layer13_mul_result_hi_relay",
+        reads={"MARK_AX", "OP_MUL", "MUL_RESULT_HI_LO", "MUL_RESULT_HI_HI",
+               "CONST"},
+        writes={"AX_FULL_LO", "AX_FULL_HI"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_layer13_mul_result_hi_relay_ir,
+        declarative_authority="spec_generated",
+        # Co-place on the L13 attn block (heads 0-2 = mem_addr_gather,
+        # head 3 = bitwise_byte1_gather, head 4 = sub_minuend_relay,
+        # head 5 = add_addend_relay); this claims head 6. Run after the
+        # ADD relay so the block is populated.
+        target_op_name="_layer13_mem_addr_anchor",
+        requires={"after": "layer13_add_addend_relay"},
+        migrated=True,
+        claims=_claims,
+        smoke_tests={
+            "TestSmoke32Bit::test_mul_overflow",
+        },
+        spec_section="BLOG_SPEC.md#wide-alu-byte-relay",
+        opcodes={"OP_MUL"},
     )
 
 

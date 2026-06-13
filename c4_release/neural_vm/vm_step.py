@@ -2525,6 +2525,27 @@ class _SetDim:
     SE_OP_GE         = 910   # OP_GE mirror (1 wide)
     SE_CMP_GROUP     = 911   # CMP_GROUP mirror (1 wide) -- L9 CMP gate
 
+    # --- width=2 MUL high-byte result band (2026-06-13) ---
+    # Dedicated 16-wide band (lo/hi nibble of the product's BYTE 1) for the
+    # width=2 (8-bit x 8-bit -> 16-bit) MUL path. The low byte (byte 0) of
+    # the product still lands in OUTPUT_LO / OUTPUT_HI exactly as the
+    # width=1 path does; the HIGH byte (byte 1) is routed HERE instead of
+    # the would-be ``OUTPUT_LO+32`` slot, which is ADDR_KEY (206) and would
+    # corrupt the memory-address key band. MUL_RESULT_HI+nib holds byte-1's
+    # low nibble (k in 0..15) and MUL_RESULT_HI+16... — no: this band is
+    # the byte-1 lo nibble at +0..15 and the byte-1 hi nibble shares the
+    # OUTPUT_HI-style packing; for a 16-bit product byte 1 = bits 8..15 =
+    # nib2 (lo) + nib3 (hi). nib2 -> MUL_RESULT_HI_LO, nib3 -> MUL_RESULT_HI_HI.
+    #
+    # This band is ONLY allocated when the ``C4_MUL_WIDTH2=1`` flag is set
+    # (see ``declare_setdim_compat_dims``). With the flag OFF the dim is
+    # never declared to the compiler, so d_model stays 920 and the residual
+    # layout is byte-identical to pre-width2 main. Positions 912..943 sit
+    # just past SE_CMP_GROUP(911); the live d_model auto-widens to cover
+    # them (bump-pointer allocator, ``pinned=None``) when the flag is on.
+    MUL_RESULT_HI_LO = 912   # 912-927: byte-1 (product bits 8..11) lo nibble
+    MUL_RESULT_HI_HI = 928   # 928-943: byte-1 (product bits 12..15) hi nibble
+
     # Convenience: map Opcode int → _SetDim opcode flag dim
     _OPCODE_DIM = None  # lazily built
 

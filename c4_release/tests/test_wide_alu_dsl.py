@@ -1050,12 +1050,15 @@ def test_wide_mul_rules_rejects_bad_args():
             marker_gate="MARK_GATE",
             S=100.0,
         )
-    with pytest.raises(NotImplementedError, match="multi-byte"):
+    # width_bytes=2 is SUPPORTED (8-bit x 8-bit flat lookup, 16-bit result);
+    # see ``test_wide_mul_rules_byte_identity_16bit``. Only width_bytes > 2 is
+    # deferred (the flat cross-product would emit 16 ** (2 * w) rules).
+    with pytest.raises(NotImplementedError, match="partial-product"):
         wide_mul_rules(
             operand_a_base="OPERAND_A",
             operand_b_base="OPERAND_B",
             result_base="RESULT",
-            width_bytes=2,
+            width_bytes=3,
             opcode_gate="OP_MUL_GATE",
             marker_gate="MARK_GATE",
             S=100.0,
@@ -1080,6 +1083,141 @@ def test_wide_mul_rules_byte_identity_8bit(lowered_mul_ffn):
 
     assert not mismatches, (
         f"wide_mul byte-identity failures ({len(mismatches)}/256):\n  "
+        + "\n  ".join(mismatches[:10])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Wave W5 (width=2): wide_mul_rules 8-bit x 8-bit -> 16-bit byte-identity.
+#
+# This is the correctness gate for the ``mul_overflow`` (100 * 5 = 500)
+# fix. The width_bytes=2 helper emits 65,536 rules (one per
+# (a_lo, a_hi, b_lo, b_hi) quad), each writing the full 16-bit product
+# across four nibble lanes (result_base + lane*16 + nib). The decoded
+# result must reproduce ``(a * b) & 0xFFFF`` for every sampled operand
+# pair, including the canonical 100 * 5 = 0x01F4 overflow case where the
+# product needs the byte-1 (high) result nibbles.
+#
+# Ad-hoc dim layout: operand bands are 32-wide (2 nibble lanes each);
+# the result band is 64-wide (4 nibble lanes). No model build — pure
+# rule-lowered PureFFN, same as the 8-bit POC above.
+# ---------------------------------------------------------------------------
+
+_MUL16_DIM_LAYOUT = {
+    "MARK_GATE": 0,
+    "OP_MUL_GATE": 1,
+    "OPERAND_A": 2,        # +k for k in 0..31 (2 nibble lanes)
+    "OPERAND_B": 34,       # +k for k in 0..31
+    "RESULT": 66,          # +k for k in 0..63 (4 nibble lanes)
+}
+_MUL16_FFN_DIM = 66 + 64
+
+
+def _build_wide_mul_rules_16bit(S: float = 100.0):
+    """Construct the 65,536-rule wide_mul lookup for width_bytes=2."""
+    return wide_mul_rules(
+        operand_a_base="OPERAND_A",
+        operand_b_base="OPERAND_B",
+        result_base="RESULT",
+        width_bytes=2,
+        opcode_gate="OP_MUL_GATE",
+        marker_gate="MARK_GATE",
+        S=S,
+    )
+
+
+def _lowered_pureffn_for_wide_mul_16bit(S: float = 100.0) -> PureFFN:
+    """Lower the width_bytes=2 wide_mul rules into a PureFFN."""
+    rules = _build_wide_mul_rules_16bit(S=S)
+    assert len(rules) == 65536, (
+        f"wide_mul_rules(width_bytes=2) emitted {len(rules)} rules, "
+        f"expected 65536"
+    )
+    ffn = PureFFN(dim=_MUL16_FFN_DIM, hidden_dim=len(rules))
+    end = Primitives.lower_ffn_rules(
+        ffn, rules, _MUL16_DIM_LAYOUT, start_unit=0, S=S,
+    )
+    assert end == 65536, f"lower_ffn_rules wrote {end} units, expected 65536"
+    return ffn
+
+
+def _make_mul16_input(*, a: int, b: int) -> torch.Tensor:
+    """One-position residual with marker, opcode, and both operand bytes
+    split into low/high nibble one-hots (2 nibble lanes per operand)."""
+    x = torch.zeros(1, 1, _MUL16_FFN_DIM)
+    x[0, 0, _MUL16_DIM_LAYOUT["MARK_GATE"]] = 1.0
+    x[0, 0, _MUL16_DIM_LAYOUT["OP_MUL_GATE"]] = 1.0
+    x[0, 0, _MUL16_DIM_LAYOUT["OPERAND_A"] + (a & 0xF)] = 1.0
+    x[0, 0, _MUL16_DIM_LAYOUT["OPERAND_A"] + 16 + ((a >> 4) & 0xF)] = 1.0
+    x[0, 0, _MUL16_DIM_LAYOUT["OPERAND_B"] + (b & 0xF)] = 1.0
+    x[0, 0, _MUL16_DIM_LAYOUT["OPERAND_B"] + 16 + ((b >> 4) & 0xF)] = 1.0
+    return x
+
+
+def _decode_mul16_output(y: torch.Tensor) -> int:
+    """Reassemble the 16-bit product by argmax over each of the 4 nibble
+    lanes, packed little-endian."""
+    base = _MUL16_DIM_LAYOUT["RESULT"]
+    value = 0
+    for lane in range(4):
+        nib = int(y[0, 0, base + lane * 16:base + lane * 16 + 16].argmax().item())
+        value |= nib << (4 * lane)
+    return value
+
+
+def test_wide_mul_rules_emit_expected_unit_count_16bit():
+    """Sanity: width_bytes=2 emits exactly 65,536 rules (256 x 256)."""
+    rules = _build_wide_mul_rules_16bit()
+    assert len(rules) == 65536
+
+
+@pytest.fixture(scope="module")
+def lowered_mul_ffn_16bit() -> PureFFN:
+    return _lowered_pureffn_for_wide_mul_16bit()
+
+
+def test_wide_mul_rules_byte_identity_16bit(lowered_mul_ffn_16bit):
+    """Lowered ``wide_mul_rules(width_bytes=2)`` decoded result equals
+    ``(a * b) & 0xFFFF`` for every sampled (a, b) pair.
+
+    This is the byte-identity correctness gate for the ``mul_overflow``
+    (100 * 5 = 500) fix: 500 = 0x01F4 requires the byte-1 high result
+    nibbles (nib2 = 0x1). The boundary cases force the high-byte lanes
+    and the full 16-bit product range.
+    """
+    gen = torch.Generator().manual_seed(0x16B17005)  # "16-bit mul"
+    n_trials = 200
+    pairs = torch.randint(0, 256, (n_trials, 2), generator=gen).tolist()
+    # Boundary / load-bearing cases.
+    pairs += [
+        (100, 5),    # mul_overflow: 500 = 0x01F4 (byte 1 = 0x01)
+        (6, 7),      # mul_basic: 42 = 0x002A (byte 1 = 0x00)
+        (0, 0),
+        (255, 255),  # 0xFE01 — max product, all 4 nibbles non-trivial
+        (1, 255),
+        (255, 1),
+        (16, 16),    # 0x0100 — byte-1-only product
+        (170, 85),   # 0x3872 — interleaved bits
+        (128, 2),    # 0x0100 — high-byte carry boundary
+        (15, 15),    # 0x00E1 — low-byte only
+    ]
+
+    mismatches = []
+    for a, b in pairs:
+        x = _make_mul16_input(a=a, b=b)
+        with torch.no_grad():
+            y = lowered_mul_ffn_16bit(x)
+        decoded = _decode_mul16_output(y)
+        expected = (a * b) & 0xFFFF
+        if decoded != expected:
+            mismatches.append(
+                f"a=0x{a:02X} b=0x{b:02X}: "
+                f"expected=0x{expected:04X} got=0x{decoded:04X}"
+            )
+
+    assert not mismatches, (
+        f"wide_mul width=2 (8-bit x 8-bit -> 16-bit) byte-identity "
+        f"failures ({len(mismatches)}/{len(pairs)}):\n  "
         + "\n  ".join(mismatches[:10])
     )
 

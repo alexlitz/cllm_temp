@@ -640,6 +640,8 @@ def wide_mul_rules(
     operand_b_cond_weight: float = 30.0,
     marker_cond_weight: float = 40.0,
     threshold: float = None,
+    result_byte1_lo_base: str = None,
+    result_byte1_hi_base: str = None,
 ) -> Tuple[FFNRule, ...]:
     """Generate FFNRule list for wide MUL — nibble-stacked flat lookup.
 
@@ -684,6 +686,22 @@ def wide_mul_rules(
       single nibble totals 130 < 150 → blocked. This mirrors the 4-way
       AND pattern :func:`wide_add_rules` uses for the carry-in=1 case.
 
+      Result-HIGH-byte routing (``result_byte1_lo_base`` /
+      ``result_byte1_hi_base``): the 16-bit product's two BYTES are
+      byte 0 = bits 0..7 (nib0 lo, nib1 hi) and byte 1 = bits 8..15
+      (nib2 lo, nib3 hi). By default all four nibble lanes write to a
+      single contiguous ``result_base`` (lanes at +0/+16/+32/+48). When
+      ``result_byte1_lo_base`` and ``result_byte1_hi_base`` are BOTH
+      supplied (width_bytes=2 only), the BYTE-1 lanes are re-routed:
+        - byte 0 lo: ``result_base + nib0``
+        - byte 0 hi: ``result_base + 16 + nib1``
+        - byte 1 lo: ``result_byte1_lo_base + nib2``
+        - byte 1 hi: ``result_byte1_hi_base + nib3``
+      This is how the L11 install keeps byte 0 in OUTPUT_LO/OUTPUT_HI
+      while routing byte 1 to the dedicated MUL_RESULT_HI band (instead
+      of ``result_base+32`` = OUTPUT_LO+32 = ADDR_KEY, which would
+      corrupt the memory address-key band).
+
     ``width_bytes > 2``: deferred (see ``docs/DSL_W5_MULDIV_LIMIT.md``).
     A flat cross-product table grows as ``16 ** (2 * width_bytes)`` —
     ``width_bytes=3`` would emit ~16.8M rules, intractable as a single
@@ -706,13 +724,22 @@ def wide_mul_rules(
         opcode_gate: dim ref for the ``MUL`` opcode flag (e.g. ``"OP_MUL"``).
         marker_gate: dim name for the AX-style marker (e.g. ``"MARK_AX"``).
         S: SwiGLU scale (typically 100.0).
+        result_byte1_lo_base: optional dim base for the product's BYTE-1
+            LOW nibble (nib2). When supplied together with
+            ``result_byte1_hi_base`` (width_bytes=2 only), byte 1 is
+            routed to a dedicated band instead of ``result_base+32/+48``.
+        result_byte1_hi_base: optional dim base for the product's BYTE-1
+            HIGH nibble (nib3). See ``result_byte1_lo_base``.
 
     Returns:
         ``tuple[FFNRule, ...]`` — 256 rules for ``width_bytes=1``,
         65536 rules for ``width_bytes=2``.
 
     Raises:
-        ValueError: if ``width_bytes < 1``.
+        ValueError: if ``width_bytes < 1``, or if exactly one of
+            ``result_byte1_lo_base`` / ``result_byte1_hi_base`` is given
+            (both or neither required), or if either is given with
+            ``width_bytes != 2``.
         NotImplementedError: if ``width_bytes > 2`` (intractable flat
             lookup; multi-byte requires partial-product cascade).
     """
@@ -730,6 +757,23 @@ def wide_mul_rules(
             f"(see docs/DSL_W5_MULDIV_LIMIT.md and FlattenedALUMul in "
             f"efficient_alu_neural.py)."
         )
+
+    route_byte1 = (
+        result_byte1_lo_base is not None or result_byte1_hi_base is not None
+    )
+    if route_byte1:
+        if result_byte1_lo_base is None or result_byte1_hi_base is None:
+            raise ValueError(
+                "wide_mul_rules: result_byte1_lo_base and "
+                "result_byte1_hi_base must both be supplied (or both "
+                f"omitted); got lo={result_byte1_lo_base!r}, "
+                f"hi={result_byte1_hi_base!r}."
+            )
+        if width_bytes != 2:
+            raise ValueError(
+                "wide_mul_rules: result_byte1_lo_base/result_byte1_hi_base "
+                f"routing requires width_bytes=2; got {width_bytes!r}."
+            )
 
     write_amplitude = 2.0 / S
     rules: list[FFNRule] = []
@@ -780,6 +824,23 @@ def wide_mul_rules(
                     nib1 = (product >> 4) & 0xF
                     nib2 = (product >> 8) & 0xF
                     nib3 = (product >> 12) & 0xF
+                    if route_byte1:
+                        # Byte 0 -> result_base (OUTPUT_LO/HI); byte 1 ->
+                        # dedicated MUL_RESULT_HI band (avoids result_base+32
+                        # = ADDR_KEY collision).
+                        writes = (
+                            (f"{result_base}+{nib0}", write_amplitude),
+                            (f"{result_base}+{16 + nib1}", write_amplitude),
+                            (f"{result_byte1_lo_base}+{nib2}", write_amplitude),
+                            (f"{result_byte1_hi_base}+{nib3}", write_amplitude),
+                        )
+                    else:
+                        writes = (
+                            (f"{result_base}+{nib0}", write_amplitude),
+                            (f"{result_base}+{16 + nib1}", write_amplitude),
+                            (f"{result_base}+{32 + nib2}", write_amplitude),
+                            (f"{result_base}+{48 + nib3}", write_amplitude),
+                        )
                     rules.append(multi_way_and_rule(
                         name=(
                             f"wide_mul_w2_alo{a_lo:x}_ahi{a_hi:x}_"
@@ -794,12 +855,7 @@ def wide_mul_rules(
                         ),
                         threshold=150.0 if threshold is None else threshold,
                         gate=opcode_gate,
-                        writes=(
-                            (f"{result_base}+{nib0}", write_amplitude),
-                            (f"{result_base}+{16 + nib1}", write_amplitude),
-                            (f"{result_base}+{32 + nib2}", write_amplitude),
-                            (f"{result_base}+{48 + nib3}", write_amplitude),
-                        ),
+                        writes=writes,
                     ))
     return tuple(rules)
 

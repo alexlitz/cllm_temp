@@ -29,6 +29,7 @@ from .user_input_ops import (  # noqa: F401
     make_layer6_getchar_routing_op,
 )
 from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
+from .shared import mul_width2_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -371,6 +372,14 @@ def all_core_ops(
         # post-tail ``l10_add_high_byte_adder``). Mirror of head 4 (SUB),
         # gated on TEMP+8 (ADD) instead of TEMP+9 (SUB).
         make_layer13_add_addend_relay_op(),
+        # width=2 MUL byte-1 result relay (2026-06-13): L13 attn head 6
+        # copies the product's high byte (MUL_RESULT_HI_LO/HI, written by
+        # the width=2 wide_mul install) into AX_FULL at the MUL MARK_AX
+        # row so the existing layer15_alu_high_byte_relay emits byte 1.
+        # Always registered (dep graph stable); INERT unless the
+        # C4_MUL_WIDTH2 flag is on. PENDING d_model widen / bnz fix for
+        # e2e + smoke -- the byte-identity UNIT test gates the rules.
+        make_layer13_mul_result_hi_relay_op(enable=mul_width2_enabled()),
         make_layer13_shifts_op(alu_mode=alu_mode),
         # 4-stage SHL/SHR composite (replaces ALUShift wrapper). Only
         # meaningful in efficient mode. The 5 ops returned by

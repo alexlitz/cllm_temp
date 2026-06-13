@@ -928,6 +928,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         from ...base_layers import PureFFN
         from ..primitives import Primitives
         from ..wide_alu_dsl import wide_mul_rules
+        from .shared import mul_width2_enabled
 
         # W5 POC: 256 rules covering nibble × nibble = 0..15 × 0..15.
         # Operand A's low nibble lives in ALU_LO band, operand B's in
@@ -951,23 +952,62 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # gather does emit, so a*0 / 0*b still resolve to 0.) Verified
         # byte-identical lo-nibble product for 6*7=42 and 100*5=500 via
         # tools/probe_mul_full_fix_validate.py.
-        rules = wide_mul_rules(
-            operand_a_base="ALU_LO",
-            operand_b_base="AX_CARRY_LO",
-            result_base="OUTPUT_LO",
-            width_bytes=1,
-            opcode_gate="OP_MUL",
-            marker_gate="MARK_AX",
-            S=S,
-            operand_a_cond_weight=5.0,
-            operand_b_cond_weight=30.0,
-            marker_cond_weight=40.0,
-            threshold=80.0,
-        )
-        assert len(rules) == 256, (
-            f"wide_mul_rules(width_bytes=1): expected 256 rules, "
-            f"got {len(rules)}"
-        )
+        if mul_width2_enabled():
+            # width=2 (8-bit x 8-bit -> 16-bit) path — opt-in via
+            # C4_MUL_WIDTH2=1. Reads BOTH operand bytes (lo + hi nibble
+            # lanes): ALU_LO+0..15 (A byte lo) / ALU_LO+16..31 = ALU_HI
+            # (A byte hi); AX_CARRY_LO+0..15 (B byte lo) / +16..31 =
+            # AX_CARRY_HI (B byte hi) — the two band pairs are contiguous
+            # in _SetDim (ALU_LO=360/ALU_HI=376; AX_CARRY_LO=328/
+            # AX_CARRY_HI=344). The product's BYTE 0 still lands in
+            # OUTPUT_LO/OUTPUT_HI exactly as width=1; the product's BYTE 1
+            # (high byte, bits 8..15) is routed to the dedicated
+            # MUL_RESULT_HI_LO/HI band — NOT OUTPUT_LO+32 (= ADDR_KEY),
+            # which would corrupt the memory address-key.
+            #
+            # PENDING: d_model widen / bnz fix for e2e + smoke. Declaring
+            # MUL_RESULT_HI_* grows d_model past 920, which regresses
+            # test_bnz_branch until the sibling widen agent lands its fix.
+            # The byte-identity UNIT test (tests/test_wide_alu_dsl.py
+            # ::test_wide_mul_rules_byte_identity_16bit) is the correctness
+            # gate for these rules; model-level smoke is DEFERRED. AND
+            # weights here are the unit-test (clean one-hot, 30/30/40,
+            # thr=150) form; operand-magnitude rescaling at the real
+            # MARK_AX row (like the width=1 a-weight=5) is a follow-up the
+            # widen agent owns once the row is unblocked.
+            rules = wide_mul_rules(
+                operand_a_base="ALU_LO",
+                operand_b_base="AX_CARRY_LO",
+                result_base="OUTPUT_LO",
+                width_bytes=2,
+                opcode_gate="OP_MUL",
+                marker_gate="MARK_AX",
+                S=S,
+                result_byte1_lo_base="MUL_RESULT_HI_LO",
+                result_byte1_hi_base="MUL_RESULT_HI_HI",
+            )
+            assert len(rules) == 65536, (
+                f"wide_mul_rules(width_bytes=2): expected 65536 rules, "
+                f"got {len(rules)}"
+            )
+        else:
+            rules = wide_mul_rules(
+                operand_a_base="ALU_LO",
+                operand_b_base="AX_CARRY_LO",
+                result_base="OUTPUT_LO",
+                width_bytes=1,
+                opcode_gate="OP_MUL",
+                marker_gate="MARK_AX",
+                S=S,
+                operand_a_cond_weight=5.0,
+                operand_b_cond_weight=30.0,
+                marker_cond_weight=40.0,
+                threshold=80.0,
+            )
+            assert len(rules) == 256, (
+                f"wide_mul_rules(width_bytes=1): expected 256 rules, "
+                f"got {len(rules)}"
+            )
 
         # Size the PureFFN to the rule count and lower in one pass.
         # d_model comes from whatever the prior bake left on block.ffn
