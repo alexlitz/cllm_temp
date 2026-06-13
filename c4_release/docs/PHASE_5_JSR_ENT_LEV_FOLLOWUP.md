@@ -253,3 +253,77 @@ The deciding quantity is **ALU at the AX marker**, and ALU-at-AX is written only
 Inside `_layer7_operand_gather_head_specs` (l7_ops.py:263-287), head 1 attends MARK_BP/MARK_SP and copies their **OUTPUT** into ALU at scale 6.0, gated `AP(0, BD.OP_ENT, L)`. The minimal fix is to make head 1 (and the head-0 un-suppression) key on a **real-opcode-at-AX == ENT/LEA/ADJ** signal instead of the marker-scheme `OP_ENT` (which a callee IMM also carries). That requires a new clean opcode-flag dim decoded at L4/L5/L6 (`actual_opcode_at_AX`) — a multi-commit opcode-decode change — and then head 1's Q gate `AP(0, BD.OP_ENT, L) → AP(0, BD.ACTUAL_OP_ENT, L)` plus head 0's suppression `AP(*, BD.OP_ENT, -L) → AP(*, BD.ACTUAL_OP_ENT, -L)`. With that, on the callee IMM (ACTUAL_OP_ENT=0) head 0 fires (real operand → ALU) and head 1 stays off (mirrors NONFIRST's passing case); on a real ENT it behaves as today. This is THE single fix and it is squarely inside the reserved operand_gather + opcode-decode surface.
 
 func_* after (canonical, spec_k=0, same 35-id slice): **1/35 (unchanged).** simple_function pytest: **expected 42, got 8 (FAIL, unchanged).** Smoke subset {simple_function,imm,add_basic,sub_basic,lea,ent,adj,lev,psh}: 6 pass / 1 fail (only simple_function) — NO regression. Worktree left at the green baseline; NO production weight change; throwaway probes removed.
+
+## 2026-06-13 spec_k=0 independent re-confirmation (agent a547862) — wall re-pinned, two prior claims CORRECTED, no regression-free fix found
+
+Fresh, hook-free, spec_k=0 ground-truth investigation (`tools/probe_groundtruth.py`
+`residual_at`/`_final_context`, one model build, ~6 throwaway probes all removed,
+NO production weight change). Baseline `pytest tests/test_smoke.py`: **49 pass / 2
+fail {simple_function (got 8, want 42), mul_overflow}**. `simple_function`'s
+current bytecode is `JSR 3; EXIT; NOP; ENT 0; IMM 42; LEV` (the SIMPLE program of
+the adfb7a9 entry) — there is **no LEA/LI** in it, so the brief's "frame-local
+load (`LEA BP-8; LI`)" framing does **not** describe what `simple_function` tests.
+LEV here only relays the carried AX; the corruption is the callee `IMM 42` step
+emitting **8** (the ENT frame constant), which LEV then faithfully returns.
+
+### Two corrections to the prior entries
+1. **Root is L8, NOT L7 operand_gather head 1.** Probed the IMM-step **REG_AX
+   marker** band-by-band across physical blocks (map: blk6=L6, blk7=L7,
+   blk8=L8-FFN, blk9=L8-AddSub post-op, blk10=L9, blk11=L10). Through **block 7
+   (post-L7) the failing and passing IMM steps are BYTE-IDENTICAL**:
+   `ALU_LO[12]=1.0`, `AX_CARRY=0`. The operand survives L7 cleanly; L7 head 1 does
+   **not** corrupt. The divergence is entirely at **block 8 (L8)**: the failing
+   step jumps to `ALU_LO[1]≈70, AX_CARRY_LO[2]≈82, AX_CARRY_HI[2]≈79` (the live
+   frame bytes at scale ~80), while the passing step stays `ALU_LO[12]=1.0,
+   AX_CARRY_LO[3]≈6`. The scale-80 frame write at the AX marker comes from the L8
+   attention family (multibyte_fetch head 3 writes AX_CARRY at the AX byte
+   positions; the sp-gather / mem-to-alu mirrors write ALU) reading the
+   ENT-modified frame state. This matches and supersedes the 2026-06-12 "block 8
+   not block 7" note and **refutes adfb7a9's "L7 head 1" localization**.
+2. **NOT call-frame-specific.** The minimal reproducer is `REALENT = ENT 0;
+   IMM 42; EXIT` (a real ENT, no JSR/call frame): it **also returns 8**, with the
+   identical block-8 divergence (`ALU_LO[1]≈70`). So the bug is simply: **any ENT
+   followed by IMM corrupts the IMM operand to the ENT SP-decrement constant.**
+   The call frame is incidental; `simple_function` fails for the same reason a
+   bare `ENT; IMM` does.
+
+### Why there is still NO discrete-gate fix (independently re-confirmed, hard)
+Diffed **EVERY size-1 (scalar) residual dim** between the failing `REALENT` IMM
+step and the passing `NONFIRST` (`IMM 1; PSH; IMM 42; EXIT`) IMM step at the AX
+marker: **0 diffs at block 6, 0 diffs at block 7**; at block 8 the only diffs are
+`MARK_THINKING_START/END` (downstream IO artifacts, ungateable). At **every**
+block 3-8 both carry `OP_IMM=0, OP_ENT=1` at the AX marker — and critically
+**`NONFIRST` carries `OP_ENT=1` too despite having NO ENT anywhere in its
+program.** So `OP_ENT=1` at the AX marker is a **marker-scheme constant** (a
+default the operand-gather decode emits on every IMM-step AX marker), **not** a
+signal that an ENT is active. It therefore cannot key any rule to separate the
+two cases. The only real difference is value-level: whether ENT-decremented frame
+bytes exist for the L8 head to gather. This is the same wall the prior 3 sessions
+hit, re-confirmed from a fresh angle.
+
+The L8 ALU FFN ENT machinery (`_layer8_alu_ent_lo_rules`/`ent_borrow`,
+l8_ops.py:688-764, gate `OP_ENT`, fire at `MARK_SE_ONLY`) is **not** the byte-0
+corruptor here: at the IMM-step STEP_END/MARK_SE_ONLY position `OP_ENT=0` for both
+programs. The corruption is purely the scale-80 frame write into ALU/AX_CARRY at
+the **AX marker** at L8, which then drives L8/L9's per-nibble ALU compute to byte
+value 8.
+
+### What was NOT tried (correctly, per "don't force a regressing change")
+Both remaining directions reduce to ones already empirically refuted:
+- **Operand amplification** (make the magnitude-1 clean operand survive L8): the
+  doc's L6/L5 amplification attempts (lines 245-250) were tested and either had no
+  effect or are first-step-only; any amplification on the shared IMM/memory/var
+  operand path must beat the scale-80 frame write *after* L8 attention fires and
+  is byte-identity-unsafe on the 46 passing tests.
+- **A real `ACTUAL_OP_ENT` opcode-flag dim** (lines 252-253): still THE clean fix,
+  still a multi-commit L4/L5/L6 opcode-decode change (the marker-scheme `OP_ENT`
+  is provably a constant, so a *new* decode dim is genuinely required), out of a
+  single byte-identity-safe commit's scope.
+
+### Verdict
+simple_function: **49/2 unchanged (got 8, want 42).** Byte-identity: N/A — **no
+production weight change made.** Final smoke: **49 pass / 2 fail** {simple_function,
+mul_overflow}, identical to baseline. The single landable fix is the
+`ACTUAL_OP_ENT` opcode-decode dim of §"Minimal change that WOULD fix it"; it needs
+the reserved multi-commit L4/L5/L6 opcode-decode surface and a parallel owner.
+Throwaway probes removed; worktree left at the green 49/2 baseline.
