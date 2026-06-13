@@ -884,18 +884,25 @@ def make_layer11_step_end_operand_relay_op(
 # corpus has high byte <= 4, so this carry covers it; a value-general fix needs
 # a real 8-bit dump band (separate task).
 # Host = L13 (physical block 16): a native logical layer with a REAL,
-# non-passthrough attention block whose heads 6/7 are free at BOTH bake and
-# runtime (heads 0..2 = mem_addr_gather, 3 = bitwise_byte1, 4 = sub_minuend,
-# 5 = add_addend). The carry head is pinned to slot 6. Rejected hosts:
+# non-passthrough attention block. Heads 0..5 are always occupied (0..2 =
+# mem_addr_gather, 3 = bitwise_byte1, 4 = sub_minuend, 5 = add_addend). Head
+# 6 is taken by ``layer13_mul_result_hi_relay`` whenever ``C4_MUL_WIDTH2`` is
+# on (the production default since the mul width=2 landing) — two ops baking
+# the SAME (layer, head) silently clobber each other and scramble the whole
+# L13 attention block (observed: smoke 14/51 when the carry head ALSO pinned
+# slot 6). The carry head is therefore pinned to slot 7, which is free at
+# BOTH bake and runtime regardless of the mul flag (the head-dim-preserving
+# widen adds a 9th head 8, also free, but slot 7 keeps the bake within the
+# original 8-head band). Rejected hosts:
 #   * L11 / block 14 — attention is shared and expands 8->13 heads at runtime,
 #     clobbering any bake into heads 0..7.
 #   * L12 / block 15 — attention block is a pure passthrough (W_q == 0 at
 #     runtime), so a bake there has no effect on the forward.
 # L13's read point (after block 15) holds both the crystallised AX_CARRY gate
 # (-988 fresh / +2.7 carried) and the prev-step H1 one-hot.
-_AX_BYTE1_DUMP_CARRY_HEAD_IDX = 6
+_AX_BYTE1_DUMP_CARRY_HEAD_IDX = 7
 _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT = (
-    ("layer13_ax_byte1_dump_carry.head_6", _AX_BYTE1_DUMP_CARRY_HEAD_IDX),
+    ("layer13_ax_byte1_dump_carry.head_7", _AX_BYTE1_DUMP_CARRY_HEAD_IDX),
 )
 
 
@@ -1040,7 +1047,7 @@ def _layer13_ax_byte1_dump_carry_head_spec(
 
 
 def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
-    """L13 attn head 6: copy the prev step's AX byte-1 H1 one-hot forward.
+    """L13 attn head 7: copy the prev step's AX byte-1 H1 one-hot forward.
 
     The cross-step carry HEAD half of the AX byte-1 register-dump fix. It
     copies the PREVIOUS VM step's ``H1`` one-hot into the dedicated
@@ -1078,7 +1085,7 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
         ir = CompilerIR()
         if enable:
             ir.layer(0).attention.append(
-                spec, name="layer13_ax_byte1_dump_carry.head_6",
+                spec, name="layer13_ax_byte1_dump_carry.head_7",
             )
         return ir
 
@@ -1100,9 +1107,10 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
         declarative_bake_fn=bake,
         compiler_ir_factory=_ir,
         # Bind to the L13 mem-addr dep anchor so the head lands on the L13 attn
-        # block (physical block 16, heads 6/7 free at bake AND runtime). The
-        # L13 read point holds both the crystallised AX_CARRY gate signal and
-        # the held prev-step H1 one-hot.
+        # block (physical block 16, slot 7 free at bake AND runtime — slot 6 is
+        # the mul width=2 result relay when C4_MUL_WIDTH2 is on). The L13 read
+        # point holds both the crystallised AX_CARRY gate signal and the held
+        # prev-step H1 one-hot.
         target_op_name="_layer13_mem_addr_anchor",
         migrated=True,
         declarative_authority="spec_generated",
