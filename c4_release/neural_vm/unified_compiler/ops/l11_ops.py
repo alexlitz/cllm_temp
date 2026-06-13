@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os as _os_stack0
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -1710,10 +1712,43 @@ def make_stack0_byte0_dump_carry_op(enable: bool = True) -> Operation:
 # marker blockers keep the unit off non-STACK0 rows.
 _STACK0_B0_DUMP_REPOPULATE_HIDDEN_DIM = 14  # 7 (H1) + 7 (H3)
 
+# Re-point write_scale for the DIRECT H1/H3 emission re-supply (Root 2 fix).
+# The dump runs at the LAST post_op block (block 42), AFTER the block-38
+# ``tail_bit32_result_correction`` corruptor has nuked the byte's OWN H1/H3
+# emission cells to ~-1e7 (the cells the LM head reads at +5.0:
+# ``H1+(lo+2)`` low nibble, ``H3+(hi+4)`` high nibble — confirmed via
+# tools/probe_stack0_byte0_logit.py: byte 0x11 reads H1+3=-1.05e7, H3+5=-9.98e6).
+# An additive band in SEPARATE dims (the original DUMP-band approach) cannot
+# overcome a NEGATIVE write in the SAME cells; so on a CARRIED step we re-supply
+# the carried byte-0 one-hot DIRECTLY into ``H1+j`` / ``H3+j`` (the residual is
+# additive, so this ADDS to the -1e7 nuke). The PREV band carries the clean
+# one-hot (~160 at the argmax slot); to net a large POSITIVE at the read slot
+# over the -1e7 nuke we scale: output ~= silu(AND)~=60 * PREV~=160 * write_scale.
+# Default 70.0 -> the read slot nets ~+7e9 over the -1e7 nuke. Env-overridable
+# for probe sweeps via ``C4_STACK0_B0_REPOINT_WS``.
+_STACK0_B0_REPOINT_WS = float(
+    _os_stack0.environ.get("C4_STACK0_B0_REPOINT_WS", "70.0")
+)
+
 
 def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
-    """14 rules: ``STACK0_B0_DUMP_{H1,H3}+j = STACK0_B0_{H1,H3}_PREV+j`` on
-    carried STACK0-marker rows.
+    """14 rules: re-supply the carried byte-0 one-hot DIRECTLY into the byte's
+    own ``H1+j`` / ``H3+j`` LM-head emission cells on carried STACK0-marker rows.
+
+    THE RE-POINT (Root 2 fix): the byte-0 emission one-hot lives in the LM-head
+    ``H1`` (low nibble) + ``H3`` (high nibble) bands; the byte token reads
+    ``H1+(lo+2)`` and ``H3+(hi+4)`` at +5.0. On a CARRIED comparison step the
+    block-38 ``tail_bit32_result_correction`` corruptor nukes those SAME cells to
+    ~-1e7, suppressing the byte token so a ``[PC]`` marker wins (the 57-token
+    framing-drift step). The carry head copied the PREVIOUS (PSH) step's clean
+    byte-0 ``H1``/``H3`` one-hot into ``STACK0_B0_{H1,H3}_PREV`` (identity slot
+    map: ``STACK0_B0_H1_PREV+j -> H1+j``, ``STACK0_B0_H3_PREV+j -> H3+j``). This
+    FFN runs at the LAST post_op block (AFTER the nuke) and ADDS a large positive
+    multiple of that carried one-hot back into ``H1+j`` / ``H3+j`` ONLY on a
+    carried STACK0-marker row -> the read slot nets positive -> the byte token
+    wins. BYTE-IDENTICAL on fresh steps: the gate AND requires the BOUNDED
+    ``STACK0_B0_CARRIED`` flag (0 on fresh PSH steps and every non-STACK0 row),
+    so the silu activation is ~0 and ``H1``/``H3`` are untouched.
 
     GATE (the BOUNDED design — the raw-H1 read is fatal): the dump reads the
     pre-computed ``STACK0_B0_CARRIED`` flag (a bounded 0/1 step indicator
@@ -1721,9 +1756,9 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     where H1/H3 are still bounded). It MUST NOT read the same-step H1/H3 here:
     at this L25-tail read point the L25 corruptor has nuked H1/H3 to ~-289M, so
     a negative-weighted H1 condition drives the silu gate to ~+10^9 and writes
-    billions into the DUMP band (observed: the model emitted all-zeros). The
-    flag is 1 on a carried STACK0-marker row, 0 on a fresh PSH STACK0-marker row
-    and on every non-STACK0 row.
+    billions into the band (observed: the model emitted all-zeros). The flag is
+    1 on a carried STACK0-marker row, 0 on a fresh PSH STACK0-marker row and on
+    every non-STACK0 row.
     """
     W = 7
     # Row signature + carried flag (both bounded). A balanced AND that needs
@@ -1738,31 +1773,71 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
         ("MARK_MEM", -1_000.0),
         ("MARK_SE", -1_000.0),
     )
-    conditions = (
-        ("MARK_STACK0", SIG_W),
-        ("STACK0_B0_CARRIED", CARRIED_W),
-    ) + marker_blockers
+    SHARP_W = 3.0     # STACK0_B0_SHARP ~ 1.0 on a clean-carry row -> +3.0
 
+    # The DIRECT H1/H3 re-point is gated on ``C4_STACK0_B0_DUMP`` so the
+    # flag-OFF build stays BYTE-IDENTICAL: with the flag off the dump targets the
+    # inert ``STACK0_B0_DUMP_{H1,H3}`` bands (read by NOBODY — the LM-head dump
+    # columns are themselves flag-gated), so it contributes nothing to any token
+    # the prior model emitted. Flag ON re-points the write into the byte's own
+    # ``H1``/``H3`` emission cells (the re-point fix). Same flag the head bake
+    # uses, so the whole emission path flips together.
+    _repoint_on = _os_stack0.environ.get("C4_STACK0_B0_DUMP", "0") != "0"
+
+    # Re-point path ALSO ANDs the BOUNDED ``STACK0_B0_SHARP`` flag so the direct
+    # H1/H3 write fires ONLY when PREV is a clean single-slot one-hot (the
+    # framing-drift case) and NOT on a multi-byte arithmetic-result row where the
+    # carry head SMEARED the PREV band (re-supplying a smear there corrupts a
+    # healthy emission -- observed add_16bit 300 -> 100). The inert DUMP path
+    # keeps the original 2-way AND (byte-identical).
+    if _repoint_on:
+        conditions = (
+            ("MARK_STACK0", SIG_W),
+            ("STACK0_B0_CARRIED", CARRIED_W),
+            ("STACK0_B0_SHARP", SHARP_W),
+        ) + marker_blockers
+        # 3-way AND: carried clean-carry row -> 2 + 3 + 3 = 8 > 7 (fires); a
+        # carried SMEAR row -> SHARP=0 -> 2 + 3 + 0 = 5 < 7 (dark); a fresh row
+        # -> CARRIED=0 -> 2 + 0 + 0 = 2 < 7 (dark).
+        dump_threshold = 7.0
+    else:
+        conditions = (
+            ("MARK_STACK0", SIG_W),
+            ("STACK0_B0_CARRIED", CARRIED_W),
+        ) + marker_blockers
+        dump_threshold = 4.0
     rules: list[FFNRule] = []
-    # Low-nibble (H3) copies, then high-nibble (H1) copies.
-    for (dump_band, prev_band) in (
-        ("STACK0_B0_DUMP_H3", "STACK0_B0_H3_PREV"),
-        ("STACK0_B0_DUMP_H1", "STACK0_B0_H1_PREV"),
+    # Low-nibble lives in H1 (PREV idx = lo+2), high-nibble in H3 (idx = hi+4):
+    # the carry head copied the prev step's registry-H1/H3 one-hots into the
+    # like-named PREV bands at the SAME slot index, so the re-point write target
+    # is the identity-indexed registry cell.
+    for (emit_band, dump_band, prev_band) in (
+        ("H3", "STACK0_B0_DUMP_H3", "STACK0_B0_H3_PREV"),
+        ("H1", "STACK0_B0_DUMP_H1", "STACK0_B0_H1_PREV"),
     ):
+        # Flag ON -> write the byte's own H1/H3 emission cell (the re-point);
+        # flag OFF -> write the inert DUMP band (byte-identical, read by nobody).
+        target = emit_band if _repoint_on else dump_band
+        ws = _STACK0_B0_REPOINT_WS if _repoint_on else 0.02
         for j in range(W):
             rules.append(multi_way_and_rule(
-                name=f"{dump_band.lower()}_slot_{j}",
-                # threshold 4.0: fires on a carried STACK0-marker row
-                # (2 + 3 = 5 > 4) and is dark on a fresh STACK0 row (2 + 0 = 2 <
-                # 4) and on every non-STACK0 row (a -1000 marker blocker
-                # dominates). Both inputs are bounded 0/1 -> no silu blowup.
+                name=f"stack0_b0_repoint_{target.lower()}_slot_{j}",
+                # Flag OFF (thr 4.0): fires on a carried STACK0-marker row
+                # (2 + 3 = 5 > 4), dark on a fresh STACK0 row (2 + 0 < 4) and on
+                # every non-STACK0 row (a -1000 marker blocker dominates).
+                # Flag ON (thr 7.0): ADDS the SHARP flag -> fires ONLY on a
+                # clean-carry row (2+3+3 > 7); a carried smear (SHARP=0 -> 5) and
+                # a fresh row (CARRIED=0 -> 2) are dark. All gate inputs bounded.
                 conditions=conditions,
-                threshold=4.0,
+                threshold=dump_threshold,
                 gate=f"{prev_band}+{j}",
-                # write_scale 0.02/S: silu(S*(cond-thr)) ~= 60 on a carried row
-                # -> output ~= 60 * PREV * 0.02 ~= 1.2 * PREV (one-hot argmax
-                # slot preserved; the LM head emits the matching byte token).
-                writes=((f"{dump_band}+{j}", 0.02),),
+                # write_scale: silu(S*(cond-thr)) ~= 60 on a carried row,
+                # gate = PREV+j (~160 at the argmax slot, ~0 elsewhere) ->
+                # output ~= 60 * 160 * write_scale at the correct slot. Tuned
+                # large so the read slot nets POSITIVE over the -1e7 nuke (the
+                # residual is additive). The PREV one-hot keeps the write off
+                # the wrong slots; the LM head emits the matching byte token.
+                writes=((f"{target}+{j}", ws),),
             ))
     return tuple(rules)
 
@@ -1897,6 +1972,145 @@ def make_stack0_byte0_carried_flag_op() -> Operation:
     )
 
 
+# ---------------------------------------------------------------------------
+# STACK0 byte-0 PREV-sharpness flag precursor (the re-point no-regress gate)
+# ---------------------------------------------------------------------------
+# Writes ``STACK0_B0_SHARP = OR_j step(PREV+j - Σ_{k!=j} PREV+k >= thr)`` on a
+# STACK0-marker row. The carry head copies the prev step's byte-0 H1/H3 one-hot
+# into ``STACK0_B0_H1_PREV``: a CLEAN single-slot one-hot (~160 at one slot, ~0
+# elsewhere) on the if/bool/expr framing-drift case, but a SMEAR (~85 across all
+# slots) on a multi-byte arithmetic result (add_16bit etc.) where there was no
+# single prev STACK0 byte to copy. The DIRECT H1/H3 re-point ANDs this flag so
+# it fires ONLY on the genuinely-corrupted clean-carry rows and is a NO-OP on
+# healthy multi-byte emissions (re-supplying a smeared one-hot would corrupt
+# them). Mirrors the carried-flag precursor; reads the (already-populated) PREV
+# band rather than H3, so it binds to a LATER anchor (after the L9 carry head).
+_STACK0_B0_SHARP_FLAG_HIDDEN_DIM = 7  # one step rule per H1_PREV slot (OR)
+
+
+def _stack0_byte0_sharp_flag_rules() -> tuple[FFNRule, ...]:
+    """7 rules (OR over slots): ``STACK0_B0_SHARP`` fires iff ONE H1_PREV slot
+    dominates the rest (a clean carried one-hot), dark on a smear.
+
+    PREV reads are SCALED DOWN (alpha) to keep the silu input bounded: PREV ~160
+    raw would overflow. With alpha=0.02 the per-slot margin is
+    ``alpha*(PREV+j - Σ_others)`` ~ +3.1 (clean) / -6.8 (smear), so a small
+    MARK_STACK0 anchor + threshold cleanly separates them and the silu stays
+    finite. Exactly one slot can be the argmax, so the OR never double-writes.
+    """
+    W = 7
+    SIG_W = 2.0
+    ALPHA = 0.02   # PREV scale-down: clean margin ~ +3.1, smear ~ -6.8
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    rules: list[FFNRule] = []
+    for j in range(W):
+        conds = [("MARK_STACK0", SIG_W), (f"STACK0_B0_H1_PREV+{j}", ALPHA)]
+        for k in range(W):
+            if k != j:
+                conds.append((f"STACK0_B0_H1_PREV+{k}", -ALPHA))
+        conds = tuple(conds) + marker_blockers
+        # threshold 4.0: clean slot -> 2 + 3.1 = 5.1 > 4 (fires); smear ->
+        # 2 - 6.8 = -4.8 < 4 (dark); non-argmax clean slot -> 2 + alpha*(~0 -
+        # 160) = 2 - 3.1 = -1.1 < 4 (dark). So exactly the argmax slot of a clean
+        # one-hot fires. write 1.0 (bounded); the dump reads SHARP with weight 3.
+        rules.append(multi_way_and_rule(
+            name=f"stack0_byte0_sharp_flag_slot_{j}",
+            conditions=conds,
+            threshold=4.0,
+            writes=(("STACK0_B0_SHARP", 1.0),),
+        ))
+    return tuple(rules)
+
+
+def make_stack0_byte0_sharp_flag_op() -> Operation:
+    """Precursor FFN: writes the BOUNDED STACK0 byte-0 PREV-sharpness gate flag.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block, ordered BEFORE the dump
+    FFN. Reads the (block-10-populated, liveness-private) ``STACK0_B0_H1_PREV``
+    band and writes ``STACK0_B0_SHARP`` so the re-point dump can AND a bounded
+    0/1 sharpness signal. MIXED dim_map: MARK_* taps from the legacy registry;
+    the NEW ``STACK0_B0_*`` bands from ``dim_positions``.
+    """
+    rules = _stack0_byte0_sharp_flag_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _STACK0_B0_SHARP_FLAG_HIDDEN_DIM, (
+            f"stack0_byte0_sharp_flag rule-count drift: produced "
+            f"{len(rules)}, expected {_STACK0_B0_SHARP_FLAG_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        from ...dim_registry_dynamic import build_default_registry_dynamic
+        _reg = build_default_registry_dynamic()
+        _new_bands = {"STACK0_B0_H1_PREV", "STACK0_B0_SHARP"}
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            if _base in _new_bands:
+                dim_map[_nm] = int(dim_positions[_base]) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+            else:
+                dim_map[_nm] = int(_reg.slots[_base].start) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="stack0_byte0_sharp_flag",
+        reads={
+            "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+            "MARK_MEM", "MARK_SE", "STACK0_B0_H1_PREV",
+        },
+        writes={"STACK0_B0_SHARP"},
+        kind="block",
+        # On the L25 tail block (where the PREV band — set at the L9 carry head,
+        # block 10 — has long since persisted). Ordered AFTER the carried-flag
+        # precursor and BEFORE the dump FFN that reads SHARP.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": ("stack0_byte0_carried_flag",)},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    )
+
+
 def make_stack0_byte0_dump_repopulate_op() -> Operation:
     """Append the STACK0 byte-0 dump-repopulate FFN after the L25 tail block.
 
@@ -1943,10 +2157,13 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         # *registry*; the NEW ``STACK0_B0_*`` bands from ``dim_positions``.
         from ...dim_registry_dynamic import build_default_registry_dynamic
         _reg = build_default_registry_dynamic()
+        # ``STACK0_B0_*`` bands resolve from ``dim_positions`` (declarative-only
+        # layout); the re-point's ``H1``/``H3`` emission targets and the MARK_*
+        # gate dims resolve from the legacy dynamic registry.
         _new_bands = {
             "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
             "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
-            "STACK0_B0_CARRIED",
+            "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
         }
         dim_map = {}
         for _nm in Primitives.ffn_rule_dim_names(rules):
@@ -1969,18 +2186,22 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         name="stack0_byte0_dump_repopulate",
         reads={
             "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
-            "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED",
+            "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
             "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
         },
-        writes={"STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3"},
+        # Flag ON: re-points into the byte's own H1/H3 emission cells (the fix).
+        # Flag OFF: writes the inert STACK0_B0_DUMP_{H1,H3} bands (byte-identical).
+        writes={"H1", "H3", "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3"},
         kind="block",
         # Append AFTER the tail correction on the L25 tail block, so this op is
-        # the last writer of the DUMP bands before the LM head reads them. It
-        # reads the pre-computed BOUNDED ``STACK0_B0_CARRIED`` flag (from the
-        # L7 precursor) -- NOT the same-step H1/H3 (nuked to ~-289M here).
+        # the LAST writer of the H1/H3 emission cells before the LM head reads
+        # them (it runs after the block-38 corruptor that nukes them). It reads
+        # the pre-computed BOUNDED ``STACK0_B0_CARRIED`` + ``STACK0_B0_SHARP``
+        # flags (from the precursors) -- NOT the same-step H1/H3 (nuked here).
         target_op_name="l10_post_ops_combined",
         requires={"after": (
             "tail_bit32_result_correction", "stack0_byte0_carried_flag",
+            "stack0_byte0_sharp_flag",
         )},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",

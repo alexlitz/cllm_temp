@@ -1,11 +1,17 @@
 # STACK0 byte-0 cross-step carry (Root 2 — if/bool/expr framing drift) — 2026-06-13
 
-Status: **carry infrastructure LANDED, flag-gated OFF** (`C4_STACK0_B0_DUMP`,
+Status: **carry + DIRECT-H1/H3 RE-POINT LANDED, flag-gated OFF** (`C4_STACK0_B0_DUMP`,
 default 0). Byte-identical to clean main; smoke **50/1** (only the pre-existing
-`simple_function` arch-block). The carry mechanism is verified end-to-end but
-the additive-band approach is **architecturally insufficient** for this bug
-(see "Why flag-off" below) — the real fix is localized but touches the
-load-bearing, width-sensitive L16/L25 STACK0-marker bank.
+`simple_function` arch-block). The re-point (this update, 2026-06-13) makes the
+carried step emit the CORRECT byte and is a strong NET-POSITIVE on the target
+clusters (**if_gt 4→17, bool_and 8→16** at full_trace) — but it cannot be
+default-ON because there is NO residual-level discriminator between a
+framing-drift row (byte should emit) and a healthy carried-marker row (marker
+should emit), so it over-fires on multi-byte arithmetic-result rows
+(`add` band 16→8, smoke `add_16bit`/`jmp_forward` regress). See
+"The re-point that LANDED" + "Why it STILL can't be default-ON" below. The
+original "additive-band" sections (kept below for history) were SUPERSEDED by
+the direct-H1/H3 re-point.
 
 Branch base: main HEAD `2479bb06`. spec_k=0, GPU 0, `alu_mode='efficient'`.
 
@@ -109,34 +115,84 @@ arithmetic-result rows) and did NOT fix the drift, confirming the approach is
 architecturally insufficient. Default-OFF is byte-identical (if_gt 4/25,
 if_var 0/25, bool_and 8/25 — exactly the baseline; smoke 50/1).
 
-## The real fix (next agent)
+## The re-point that LANDED (flag-gated `C4_STACK0_B0_DUMP`, still default OFF) — 2026-06-13 update
 
-The carry CONCEPT is right (the clean value only exists at the prev step), but
-the re-emission must reach the byte token THROUGH the corruption, not around it.
-Two candidate paths, both touching the load-bearing, WIDTH-SENSITIVE L16/L25
-STACK0-marker bank (`project_l10_tail_bank_width_sensitive` — appending breaks
-byte-identity; must REPURPOSE in place):
+The re-point IS BUILT and proven on the target clusters, but a clean discriminator
+to keep smoke at 50/1 **does not exist** — so it stays flag-gated. Details:
 
-* **(A) Fix the L16 e8 materializer's input.** `stack0_e8_output_authoritative`
-  (`l16_ops.py:784`) reads `OUTPUT_LO+lo` / `OUTPUT_HI_THIS_STEP+hi` to emit the
-  STACK0 byte-0, but on a carried step OUTPUT is WRONG (`OUTPUT_LO[6]` not `[3]`
-  for 0x23). Re-point it to read the carried byte-0 (from the `STACK0_B0_*_PREV`
-  band this carry already provides, gated on `STACK0_B0_CARRIED`) instead of the
-  broken OUTPUT band. This is the cleanest fix: the materializer already OWNS the
-  H1/H3 write at the STACK0 marker; just feed it the right value.
+### Two corrections to the original diagnosis (probe-confirmed, this update)
+1. **The block-38 nuke is NOT the `stack0_e8_output_authoritative` materializer.**
+   That materializer writes `OUTPUT_LO`/`OUTPUT_HI` (`byte_value_writes` defaults),
+   NOT H1/H3, and its gate (`OUTPUT_LO+lo AND OUTPUT_HI+hi`) is DARK on the carried
+   row (OUTPUT_HI is empty there). The actual H1/H3 nuke is the **`tail_bit32_result_correction`
+   bank** (block 38, 2059 units): its STACK0-marker materializer units read the
+   block-32 SMEARED H1/H3 one-hot (e.g. H1+3=3718, H1+2=664) at +5.0, producing a
+   huge silu, then write ±500 (`W_down`) to H1/H3 → the ±1.8e7 competing writes net
+   to ~-1e7. Probe: `tools/probe_nuke_trigger.py` (the up-drivers are
+   `MARK_STACK0*1e9 + CONST*-1e9 + 5*H3+5 + 5*H1+3 ...`). The LM head reads H1+3/H3+5
+   at +5.0 → logit[byte] ~ -1e8 → a marker wins. (`tools/probe_stack0_byte0_logit.py`
+   at the FINAL block confirms `H1+3=-1.05e7, H3+5=-9.98e6 → logit[0x11]=-1.02e8`.)
+2. **Logical L16 is physical block 28; the nuke + dump live in the L25-tail expansion
+   (blocks 37-43).** The widened (carry-band) build has **44 blocks** (was 37); the
+   carry head lands block 10, tail_bit32 nuke block 38, the dump FFN block 42.
 
-* **(B) Gate the block-38 nuke OFF carried STACK0 rows + write the carried
-  one-hot into the same H1/H3 cells.** Higher risk (the 1e9 MARK_STACK0 gate is
-  load-bearing for the fresh-step materialization).
+### The re-point (`stack0_byte0_dump_repopulate`, `l11_ops.py`)
+On `C4_STACK0_B0_DUMP=1` the dump FFN (block 42, AFTER the nuke) writes the carried
+byte-0 one-hot DIRECTLY into the byte's own `H1+j`/`H3+j` emission cells (identity
+slot map `STACK0_B0_H1_PREV+j -> H1+j`), large `write_scale` (~70) so the read slot
+nets POSITIVE over the -1e7 nuke. It runs LAST, so it reaches the byte token THROUGH
+the corruption. Gated on `STACK0_B0_CARRIED` AND a new bounded `STACK0_B0_SHARP` flag
+(`stack0_byte0_sharp_flag` precursor: PREV is a clean single-slot one-hot vs a smear).
+Flag OFF = byte-identical (writes the inert `STACK0_B0_DUMP_*` bands; smoke 50/1).
 
-Path (A) is recommended — it reuses the existing STACK0-marker H1/H3 writer
-rather than fighting it, and the carry bands already deliver the correct value
-to that block.
+### It WORKS on the target clusters (flag ON, full_trace, GPU 0)
+* `if_gt`   4/25  → **17/25** (+13)
+* `bool_and` 8/25 → **16/25** (+8)
+* `if_var`  0/25  → 0/25 (deeper root, not this bug)
+* `tools/probe_stack0_byte0_logit.py` (flag on): carried CMP step now emits the
+  correct byte (token 0x11, logit ~+3e9, was [PC] token 257 at -1e8).
+
+### Why it STILL can't be default-ON (the architectural wall, now precise)
+The re-point fires on EVERY carried STACK0 row whose PREV is a clean one-hot. The
+**framing-drift row (byte should emit) and a healthy carried-marker row (a marker
+should emit) are STRUCTURALLY INDISTINGUISHABLE** at the residual: both are carried
+(`CARRIED~100`), have a clean PREV one-hot (`SHARP~108`), are H1/H3-nuked, emit token
+257 pre-fix, and the block-32 smear argmax matches the PREV slot. The ONLY difference
+is the VALUE carried (AX_CARRY nibbles), NOT byte-vs-marker semantics — which is set
+by VM stack layout not locally encoded. So the re-point forces a value byte onto
+multi-byte arithmetic-RESULT rows where a marker belongs → corrupts them:
+* `add` band (ids 100-115) 16/16 → **8/16** (full_trace), and smoke regresses
+  `test_add_16bit` (300→100) + `test_jmp_forward` (flag ON = 48/3).
+Tried discriminators that ALL FAILED to separate the cases: PREV-sharpness
+(`SHARP`, both clean), opcode/CMP markers (all stale=1.0 at STACK0 rows),
+`STACK0_BYTE1/2/3` (constant -2.0 both), nuke-present (both nuked),
+per-slot competitor-subtraction in the linear gate (leaks negatives → MORE
+regressions). The flag is therefore a NET-POSITIVE TRADE, not a clean win, and the
+brief's hard `smoke==50/1` invariant keeps it OFF by default.
+
+### Real fix for the NEXT agent
+The re-point machinery is correct; what's missing is a **byte-vs-marker discriminator**
+at the carried STACK0 row, OR a fix at the nuke SOURCE: gate the block-38
+`tail_bit32_result_correction` STACK0-materializer units OFF the SMEARED-input case
+(they fire on the block-32 smear; suppressing them only when the smear is a
+spurious carried artifact would stop the nuke without needing the additive re-point).
+That touches the WIDTH-SENSITIVE 2059-unit tail bank in place
+(`project_l10_tail_bank_width_sensitive`) — must repurpose, not append.
 
 ## Probe tools (read-only, spec_k=0, build `alu_mode='efficient'`)
 - `tools/probe_stack0_byte0_persist.py` — per-step token count (57 vs 35) +
   raw token dump of the drift step (shows the spurious [PC] register restart).
 - `tools/probe_stack0_byte0_logit.py` — LM-head logit attribution at the STACK0
-  byte-0 predictor (marker) row; identifies the H1/H3 corruption.
+  byte-0 predictor (marker) row; identifies the H1/H3 corruption. Run with
+  `C4_STACK0_B0_DUMP=1` to confirm the re-point makes the carried step emit
+  the correct byte token (logit ~+3e9 instead of -1e8).
 - `tools/probe_stack0_byte0_blocktrace.py` — per-block H1/H3 trace (block 32
   smear -> block 38 nuke).
+- `tools/probe_stack0_l16_repoint.py` — confirms the carried-step premises:
+  CARRIED flag (100 carried / 0 fresh), PREV band holds the clean carried byte,
+  the OUTPUT band is wrong on the carried row.
+- `tools/probe_nuke_trigger.py` — the DEFINITIVE root: which block-38
+  `tail_bit32_result_correction` units nuke H1/H3 and their up-drivers (the
+  block-32 smeared H1/H3 one-hot read at +5.0).
+- `tools/probe_stack0_add16.py` — the no-discriminator evidence: compares the
+  framing-drift `if` row vs the healthy `add_16bit` carried row.

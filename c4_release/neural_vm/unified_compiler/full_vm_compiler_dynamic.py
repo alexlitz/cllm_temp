@@ -2051,6 +2051,18 @@ def compile_full_vm_dynamic(
         # would drive the silu gate to ~+10^9 and write garbage into the DUMP
         # band. Same role as ``AX_CARRY_OVERFLOW`` for the AX carry.
         "STACK0_B0_CARRIED": 1,
+        # Bounded PREV-sharpness flag (Root 2 re-point no-regress gate): a
+        # precursor FFN writes ``STACK0_B0_SHARP = OR_j step(PREV+j - Σ_{k≠j}
+        # PREV+k >= thr)`` -- it fires only when the carried byte-0 ``H1``/``H3``
+        # one-hot the carry head copied into the PREV band is a CLEAN single-slot
+        # one-hot (the if/bool/expr framing-drift case: ~160 at one slot, ~0
+        # elsewhere) and is DARK when PREV is SMEARED (a multi-byte arithmetic
+        # result like add_16bit: ~85 across all slots, where the carry head had
+        # no single prev STACK0 byte to copy). The dump's DIRECT H1/H3 re-point
+        # ANDs this flag so it fires ONLY on the genuinely-corrupted framing-drift
+        # rows and stays a NO-OP on healthy multi-byte emissions (which would
+        # otherwise be corrupted by re-supplying a smeared one-hot).
+        "STACK0_B0_SHARP": 1,
     }
     # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the production-default
     # bands (A/B diagnostics only — the carry ops then reference undeclared

@@ -552,11 +552,22 @@ def all_core_ops(
         # raw H1/H3 read there would drive the dump's silu gate to ~+10^9). See
         # l11_ops.make_stack0_byte0_carried_flag_op.
         make_stack0_byte0_carried_flag_op(),
+        # STACK0 byte-0 PREV-sharpness flag precursor (Root 2 re-point gate):
+        # writes the BOUNDED ``STACK0_B0_SHARP`` flag on the L25 tail, reading the
+        # PREV band the carry head populated. SHARP=1 only when PREV is a CLEAN
+        # single-slot one-hot (the framing-drift case) and 0 on a SMEAR (a
+        # multi-byte arithmetic result). The dump's DIRECT H1/H3 re-point ANDs
+        # this flag so it fires ONLY on the genuinely-corrupted rows and stays a
+        # no-op on healthy emissions. See l11_ops.make_stack0_byte0_sharp_flag_op.
+        make_stack0_byte0_sharp_flag_op(),
         # STACK0 byte-0 DUMP repopulate FFN (Root 2): the carried-vs-fresh GATE
-        # half. Copies the prev-step byte-0 one-hot from
-        # ``STACK0_B0_{H1,H3}_PREV`` (filled by ``stack0_byte0_dump_carry``)
-        # into the emission bands ``STACK0_B0_DUMP_{H1,H3}`` ONLY on carried
-        # STACK0-marker rows (gated on the bounded ``STACK0_B0_CARRIED`` flag).
+        # half. On carried STACK0-marker rows (gated on the bounded
+        # ``STACK0_B0_CARRIED`` flag AND, for the re-point path, ``STACK0_B0_SHARP``)
+        # it re-supplies the prev-step byte-0 one-hot from ``STACK0_B0_{H1,H3}_PREV``
+        # (filled by ``stack0_byte0_dump_carry``). Flag OFF: into the inert
+        # ``STACK0_B0_DUMP_{H1,H3}`` bands (byte-identical). Flag ON: DIRECTLY into
+        # the byte's own ``H1``/``H3`` LM-head emission cells (the re-point fix --
+        # reaches the byte token THROUGH the block-38 corruption it runs after).
         # Standalone PureFFN post_op on the L25 tail block after tail_bit32. See
         # l11_ops.make_stack0_byte0_dump_repopulate_op.
         make_stack0_byte0_dump_repopulate_op(),

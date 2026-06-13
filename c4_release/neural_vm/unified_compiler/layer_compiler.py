@@ -2434,6 +2434,10 @@ class LayerCompiler:
         # the SAME L25 tail block. Private slot so a liveness merge can't
         # clobber the carried signal.
         "STACK0_B0_CARRIED",
+        # Bounded PREV-sharpness flag (Root 2 re-point gate): written by the
+        # ``stack0_byte0_sharp_flag`` precursor and read by the dump FFN. Private
+        # slot so a liveness merge can't clobber the sharpness signal.
+        "STACK0_B0_SHARP",
     })
 
     def _liveness_never_share(self, name: str) -> bool:
