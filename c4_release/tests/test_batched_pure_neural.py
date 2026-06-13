@@ -581,6 +581,168 @@ def test_run_batch_fail_fast_passes_perfect_oracle_and_records_divergence():
     assert res2[0]["got_ax"] != res2[0]["expected_ax"]
 
 
+def test_ff_check_new_steps_strict_token_identity():
+    """``strict_trace`` compares every SAFE-offset token to the DraftVM
+    ``draft_tokens()`` reference and fails on the FIRST divergent token, while
+    ignoring the UNSAFE MEM addr/val offsets (26..33). It is strictly stronger
+    than ``full_trace`` (catches SP/BP/STACK0/STEP_END drift that full_trace
+    ignores)."""
+    from neural_vm.batched_pure_neural import (
+        BatchedPureNeuralRunner, _ElementState, _step_offset_field,
+        _UNSAFE_OFFSETS,
+    )
+    from neural_vm.speculative import DraftVM
+    from neural_vm.vm_step import Token
+
+    STEP = Token.STEP_TOKENS
+    runner = object.__new__(BatchedPureNeuralRunner)
+
+    bytecode = _encode([(Opcode.IMM, 7), Opcode.EXIT])
+    vm = DraftVM(bytecode)
+    oracle, toks = [], []
+    for _ in range(6):
+        if vm.halted:
+            break
+        if not vm.step():
+            break
+        oracle.append((vm.pc & 0xFFFFFFFF, vm.ax & 0xFFFFFFFF))
+        toks.append([int(t) for t in vm.draft_tokens()])
+        if vm.halted:
+            break
+
+    def mk(step_tokens):
+        s = _ElementState(bytecode=bytecode, context=[], prefix_len=0,
+                          expected_steps=len(oracle) + 1)
+        s.ff_oracle_steps = oracle
+        s.ff_oracle_tokens = toks
+        s.context = [t for st in step_tokens for t in st]
+        s.token_pos = len(step_tokens) * STEP
+        return s
+
+    # Perfect trace -> strict_trace passes.
+    s = mk([list(toks[0]), list(toks[1])])
+    assert runner._ff_check_new_steps(s, criterion="strict_trace") is False
+    assert s.ff_status is None
+
+    # Corrupt AX byte-1 (offset 7) of step 0 -> first divergence there.
+    bad0 = list(toks[0]); bad0[7] = (bad0[7] + 1) & 0xFF
+    s = mk([bad0, list(toks[1])])
+    assert runner._ff_check_new_steps(s, criterion="strict_trace") is True
+    assert s.ff_status == "fail"
+    assert s.ff_div_step == 0
+    assert s.ff_div_offset == 7
+    assert s.ff_div_offset_name == "AX[1]" == _step_offset_field(7)
+    assert s.ff_expected_tok == toks[0][7]
+    assert s.ff_got_tok == bad0[7]
+
+    # Corrupting ONLY the UNSAFE MEM offsets (26..33) is IGNORED.
+    unsafe0 = list(toks[0])
+    for off in _UNSAFE_OFFSETS:
+        unsafe0[off] = (unsafe0[off] + 3) & 0xFF
+    s = mk([unsafe0, list(toks[1])])
+    assert runner._ff_check_new_steps(s, criterion="strict_trace") is False
+    assert s.ff_status is None
+
+    # SP-byte drift: full_trace IGNORES it (only PC/AX), strict_trace CATCHES it.
+    sp0 = list(toks[0]); sp0[11] = (sp0[11] + 5) & 0xFF  # SP[0] at offset 11
+    s_full = mk([sp0, list(toks[1])])
+    assert runner._ff_check_new_steps(s_full, criterion="full_trace") is False
+    assert s_full.ff_status is None
+    s_strict = mk([sp0, list(toks[1])])
+    assert runner._ff_check_new_steps(s_strict, criterion="strict_trace") is True
+    assert s_strict.ff_div_offset == 11
+    assert s_strict.ff_div_offset_name == "SP[0]"
+
+
+def test_run_batch_fail_fast_strict_trace_integration():
+    """End-to-end ``run_batch_fail_fast(criterion='strict_trace')`` on a fake
+    CPU model: a model emitting the exact oracle trace PASSES; flipping one
+    SAFE-offset token FAILS at the right step+offset with the token recorded."""
+    import torch
+
+    from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
+    from neural_vm.speculative import DraftVM
+    from neural_vm.vm_step import Token
+
+    bytecode = _encode([(Opcode.IMM, 9), Opcode.EXIT])
+    vm = DraftVM(bytecode)
+    trace = []
+    for _ in range(6):
+        if vm.halted:
+            break
+        if not vm.step():
+            break
+        trace.extend(vm.draft_tokens())
+        if vm.halted:
+            break
+
+    class _Embed:
+        def set_mem_history_end(self, _v):
+            pass
+
+        def set_mem_addr_src_positions(self, _v):
+            pass
+
+    def _make_runner(corrupt_pos=None):
+        class _Model:
+            max_seq_len = 4096
+            embed = _Embed()
+
+            def forward(self, token_ids, **_kwargs):
+                B, S = token_ids.shape[0], token_ids.shape[1]
+                logits = torch.zeros(B, S, Token.VOCAB_SIZE, device=token_ids.device)
+                for b in range(B):
+                    for p in range(S):
+                        if 0 <= p < len(trace):
+                            tok = trace[p]
+                            if corrupt_pos is not None and p == corrupt_pos:
+                                tok = (tok + 1) % Token.VOCAB_SIZE
+                        else:
+                            tok = Token.HALT
+                        logits[b, p, tok] = 1.0
+                return logits
+
+        runner = object.__new__(BatchedPureNeuralRunner)
+        runner.model = _Model()
+        runner._device = torch.device("cpu")
+        runner.use_kv_cache = False
+        runner.incremental_kv_safe = False
+        runner.spec_fail_on_correction = False
+        runner.spec_fail_fast = False
+        runner._kv_stats = {"fresh_forwards": 0}
+        runner._reset_kv_cache = lambda: None
+        runner._reset_spec_stats()
+        return runner
+
+    class _Serial:
+        def _build_context(self, *_a, **_k):
+            return [Token.CODE_START]
+
+    decl_steps = len(trace) // Token.STEP_TOKENS
+
+    runner = _make_runner(corrupt_pos=None)
+    runner._serial = _Serial()
+    res = runner.run_batch_fail_fast(
+        [bytecode], expected_steps_list=[decl_steps], max_steps=None, spec_k=1,
+        criterion="strict_trace",
+    )
+    assert res[0]["status"] == "pass", res[0]
+    assert res[0]["divergence_offset"] is None
+
+    # Corrupt AX byte-0 of step 0 (offset 6 in the trace) -> strict FAIL there.
+    runner2 = _make_runner(corrupt_pos=6)
+    runner2._serial = _Serial()
+    res2 = runner2.run_batch_fail_fast(
+        [bytecode], expected_steps_list=[decl_steps], max_steps=None, spec_k=1,
+        criterion="strict_trace",
+    )
+    assert res2[0]["status"] == "fail", res2[0]
+    assert res2[0]["divergence_step"] == 0, res2[0]
+    assert res2[0]["divergence_offset"] == 6, res2[0]
+    assert res2[0]["divergence_offset_name"] == "AX[0]", res2[0]
+    assert res2[0]["got_tok"] != res2[0]["expected_tok"], res2[0]
+
+
 # Mem-history-windowing tests (test_run_speculative_tags_draft_region_store_mem_markers,
 # test_windowed_context_*) removed with Wave D — the runner no longer
 # maintains mem_history/mem_store_positions or rebuilds windowed contexts.

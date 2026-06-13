@@ -228,6 +228,18 @@ class _ElementState:
     # compared so far (so the fail-fast loop only checks newly-completed ones).
     ff_oracle_steps: Optional[list] = None
     ff_steps_checked: int = 0
+    # Per-step FULL 35-token DraftVM reference (``draft_tokens()`` after each
+    # step), built only for the ``strict_trace`` (token-identity) criterion.
+    # ``ff_oracle_tokens[i]`` is the 35-token reference for step ``i``.
+    ff_oracle_tokens: Optional[list] = None
+    # strict_trace (token-identity) divergence detail. Populated only when the
+    # ``strict_trace`` criterion trips: the OFFSET (0..34) inside the diverging
+    # 35-token step, its human-readable field name, and the expected/got token
+    # ids at that offset. ``ff_div_step`` (shared with full_trace) is the step.
+    ff_div_offset: Optional[int] = None
+    ff_div_offset_name: Optional[str] = None
+    ff_expected_tok: Optional[int] = None
+    ff_got_tok: Optional[int] = None
 
     def exec_pc(self) -> int:
         return PC_OFFSET if self.last_pc is None else self.last_pc
@@ -1077,6 +1089,7 @@ class BatchedPureNeuralRunner:
         max_steps: Optional[int] = None,
         max_context_window: int = 512,
         spec_k: int = 32,
+        criterion: str = "full_trace",
     ) -> List[dict]:
         """Run N programs against the DraftVM/oracle per-step trace, fail-fast.
 
@@ -1104,12 +1117,38 @@ class BatchedPureNeuralRunner:
         AX), so it catches the "lucky exit" cases (right final byte, wrong
         intermediate state) that the exit-code criterion passes.
 
+        ``criterion`` selects the per-step compare:
+
+          * ``"full_trace"`` (default): the per-step ``(PC, AX)`` compare above.
+            Unchanged from the original behaviour.
+          * ``"strict_trace"`` (token-identity): for each completed 35-token
+            step, compare the model's emitted token at every SAFE offset
+            (0..25 and 34; the MEM addr/val metadata offsets 26..33 in
+            ``_UNSAFE_OFFSETS`` are SKIPPED because the embedding's MEM-metadata
+            injection makes them unreadable from flat-forward argmax) to the
+            oracle's ``draft_tokens()`` reference token at that offset. FAIL on
+            the FIRST mismatch, recording the offset + offset name + expected
+            and got token. This is the literal "autofail on the first divergent
+            token from the DraftVM" and is strictly STRONGER than ``full_trace``
+            (every PC/AX-byte token is among the safe offsets, so any (PC, AX)
+            divergence is also a token divergence — and strict_trace also
+            catches SP/BP/STACK0/STEP_END byte drift that full_trace ignores).
+
         Returns one dict per program (input order) with keys:
         ``status`` ("pass" / "fail" / "error"), ``divergence_step``,
         ``expected_pc``, ``expected_ax``, ``got_pc``, ``got_ax``,
         ``decoded_exit`` (the neural exit code at the stop point, for
-        cross-checking against the exit-code criterion).
+        cross-checking against the exit-code criterion). When
+        ``criterion == "strict_trace"`` the dict also carries
+        ``divergence_offset``, ``divergence_offset_name``, ``expected_tok``,
+        ``got_tok`` (the offset-level divergence detail; ``None`` for passes
+        and for full_trace runs).
         """
+        if criterion not in ("full_trace", "strict_trace"):
+            raise ValueError(
+                f"criterion must be 'full_trace' or 'strict_trace', "
+                f"got {criterion!r}"
+            )
         B = len(bytecodes)
         if B == 0:
             return []
@@ -1148,23 +1187,38 @@ class BatchedPureNeuralRunner:
         # from a FRESH DraftVM (the speculation DraftVM on the state is mutated
         # by ``_sync_draft_vm`` during decode, so it cannot double as the
         # reference). This is the declarative-byte-identity semantic trace.
+        want_tokens = criterion == "strict_trace"
         for i, s in enumerate(states):
-            s.ff_oracle_steps = self._oracle_pc_ax_steps(
-                bytecodes[i],
-                data_list[i],
-                stdin_list[i],
-                expected_steps=(
-                    expected_steps_list[i]
-                    if expected_steps_list is not None
-                    else None
-                ),
+            es = (
+                expected_steps_list[i]
+                if expected_steps_list is not None
+                else None
             )
+            if want_tokens:
+                # strict_trace: build the (pc,ax) steps AND the full 35-token
+                # reference per step from the SAME fresh DraftVM, so the token
+                # oracle is byte-aligned with the (pc,ax) oracle.
+                s.ff_oracle_steps, s.ff_oracle_tokens = self._oracle_pc_ax_steps(
+                    bytecodes[i],
+                    data_list[i],
+                    stdin_list[i],
+                    expected_steps=es,
+                    with_tokens=True,
+                )
+            else:
+                s.ff_oracle_steps = self._oracle_pc_ax_steps(
+                    bytecodes[i],
+                    data_list[i],
+                    stdin_list[i],
+                    expected_steps=es,
+                )
 
         self._run_fail_fast(
             states,
             max_steps=max_steps,
             max_context_window=max_context_window,
             spec_k=eff_spec_k,
+            criterion=criterion,
         )
 
         results: List[dict] = []
@@ -1230,6 +1284,12 @@ class BatchedPureNeuralRunner:
                     "expected_ax": s.ff_expected_ax,
                     "got_pc": s.ff_got_pc,
                     "got_ax": s.ff_got_ax,
+                    # strict_trace offset-level detail (None unless the
+                    # token-identity criterion tripped this element).
+                    "divergence_offset": s.ff_div_offset,
+                    "divergence_offset_name": s.ff_div_offset_name,
+                    "expected_tok": s.ff_expected_tok,
+                    "got_tok": s.ff_got_tok,
                     "decoded_exit": (
                         None if decoded_exit is None
                         else int(decoded_exit) & 0xFFFFFFFF
@@ -1245,7 +1305,8 @@ class BatchedPureNeuralRunner:
         stdin,
         *,
         expected_steps: Optional[int],
-    ) -> List[Tuple[int, int]]:
+        with_tokens: bool = False,
+    ):
         """Per-step ``(pc, ax)`` the declarative DraftVM holds AFTER each step.
 
         This is the fail-fast oracle reference (declarative byte-identity). The
@@ -1253,6 +1314,16 @@ class BatchedPureNeuralRunner:
         per-step register state is exactly the declarative semantics. Bounded
         by ``expected_steps`` (the declarative halt horizon) plus a small slack
         so a program that halts exactly at the horizon is fully covered.
+
+        When ``with_tokens`` is True, returns ``(steps, tokens)`` where
+        ``tokens[i]`` is the FULL 35-token ``DraftVM.draft_tokens()`` reference
+        for step ``i`` — captured from the SAME fresh DraftVM at the SAME point
+        as the ``(pc, ax)`` pair (right after ``vm.step()``), so the token list
+        is byte-aligned with the per-step register oracle. This is the
+        reference the ``strict_trace`` (token-identity) criterion compares the
+        model's emitted tokens against, offset-by-offset. Default
+        (``with_tokens=False``) preserves the legacy ``full_trace`` return type
+        (a plain ``List[(pc, ax)]``) so the (PC, AX) path is unchanged.
         """
         cap = (int(expected_steps) + 2) if expected_steps else 4096
         vm = DraftVM(list(bytecode))
@@ -1262,6 +1333,7 @@ class BatchedPureNeuralRunner:
         if stdin:
             vm.set_stdin(stdin)
         steps: List[Tuple[int, int]] = []
+        tokens: List[List[int]] = []
         for _ in range(cap):
             if vm.halted:
                 break
@@ -1270,8 +1342,18 @@ class BatchedPureNeuralRunner:
             steps.append(
                 (int(vm.pc) & 0xFFFFFFFF, int(vm.ax) & 0xFFFFFFFF)
             )
+            if with_tokens:
+                # ``draft_tokens()`` reads current register/mem state; calling
+                # it here (right after step(), same point as the (pc,ax)
+                # capture) yields exactly the 35 tokens the model should emit
+                # for this VM step. ``vm.halted`` already updated by step(), so
+                # offset 34 is HALT on the halting step and STEP_END otherwise
+                # — matching the model's would-be emission.
+                tokens.append([int(t) for t in vm.draft_tokens()])
             if vm.halted:
                 break
+        if with_tokens:
+            return steps, tokens
         return steps
 
     # ------------------------------------------------------------------
@@ -1829,6 +1911,7 @@ class BatchedPureNeuralRunner:
         max_steps: Optional[int],
         max_context_window: int,
         spec_k: int,
+        criterion: str = "full_trace",
     ) -> None:
         total_tokens = self._total_token_budget(states, max_steps)
         STEP = Token.STEP_TOKENS
@@ -1927,7 +2010,7 @@ class BatchedPureNeuralRunner:
                     # the emitted token.
                     next_tok = int(row_preds[0])
                     self._step_one(s, next_tok, tok_i)
-                    self._ff_check_new_steps(s)
+                    self._ff_check_new_steps(s, criterion=criterion)
                     continue
 
                 # Accept the matching draft prefix; the first SAFE-offset
@@ -1966,7 +2049,7 @@ class BatchedPureNeuralRunner:
                     # Check after every token so a step that completes mid-replay
                     # is gated immediately (and we stop replaying a diverged
                     # element's remaining accepted tokens).
-                    if self._ff_check_new_steps(s):
+                    if self._ff_check_new_steps(s, criterion=criterion):
                         break
 
                 # Persistent first-token rejection means the DraftVM is out of
@@ -2003,17 +2086,27 @@ class BatchedPureNeuralRunner:
                 return val
         return None
 
-    def _ff_check_new_steps(self, s: _ElementState) -> bool:
-        """Compare any newly-completed VM steps' (PC, AX) to the oracle.
+    def _ff_check_new_steps(
+        self, s: _ElementState, *, criterion: str = "full_trace"
+    ) -> bool:
+        """Compare any newly-completed VM steps to the oracle.
 
         Returns True iff a divergence was found (the element is then marked
         ``ff_status="fail"`` + halted and dropped from the active batch). A
         completed step is one whose 35 tokens are fully emitted into
-        ``s.context``; we decode that step's ``(PC, AX)`` from its own slice
-        ``context[prefix_len + step*35 : ... + 35]`` and compare to the oracle's
-        ``(pc, ax)`` for that step. ``token_pos // STEP_TOKENS`` is the number
-        of completed steps so far.
+        ``s.context``; ``token_pos // STEP_TOKENS`` is the number of completed
+        steps so far. The compare depends on ``criterion``:
+
+          * ``"full_trace"`` (default): decode the step's ``(PC, AX)`` from its
+            own slice ``context[prefix_len + step*35 : ... + 35]`` and compare
+            to the oracle's ``(pc, ax)`` for that step.
+          * ``"strict_trace"`` (token-identity): compare the model's emitted
+            token at every SAFE offset (0..25 and 34; skip ``_UNSAFE_OFFSETS``)
+            to the oracle ``draft_tokens()`` reference. Fail on the FIRST
+            mismatch, recording the offset + offset name + expected/got token.
         """
+        if criterion == "strict_trace":
+            return self._ff_check_new_steps_strict(s)
         if s.ff_status is not None:
             return s.ff_status == "fail"
         STEP = Token.STEP_TOKENS
@@ -2054,6 +2147,97 @@ class BatchedPureNeuralRunner:
                 s.exit_code = None
                 s.halted = True
                 return True
+            s.ff_steps_checked += 1
+        return False
+
+    def _ff_check_new_steps_strict(self, s: _ElementState) -> bool:
+        """Token-identity (``strict_trace``) per-step compare.
+
+        For each newly-completed 35-token step, compare the model's emitted
+        token at every SAFE offset (0..25 and 34; ``_UNSAFE_OFFSETS`` 26..33 are
+        SKIPPED — the embedding's MEM-metadata injection makes them unreadable
+        from flat-forward argmax, so the DraftVM is trusted there) to the
+        oracle ``draft_tokens()`` reference for that step. On the FIRST mismatch
+        the element FAILS, recording the divergence step, offset, offset name,
+        and expected/got token ids. This is the literal "autofail on the first
+        divergent token from the DraftVM" and is strictly stronger than
+        full_trace (the PC/AX value bytes are all safe offsets).
+
+        Also records (PC, AX) at the diverging step (decoded from the same
+        slice + oracle) so the result row carries the familiar register context
+        alongside the offset-level detail.
+        """
+        if s.ff_status is not None:
+            return s.ff_status == "fail"
+        STEP = Token.STEP_TOKENS
+        completed = s.token_pos // STEP
+        oracle = s.ff_oracle_steps or []
+        oracle_tokens = s.ff_oracle_tokens or []
+        while s.ff_steps_checked < completed:
+            step_idx = s.ff_steps_checked
+            start = s.prefix_len + step_idx * STEP
+            step_tokens = s.context[start:start + STEP]
+            # (PC, AX) context for the result row (best-effort; the offset
+            # detail is the authoritative strict_trace signal).
+            g_pc = self._decode_step_register(step_tokens, Token.REG_PC)
+            g_ax = self._decode_step_register(step_tokens, Token.REG_AX)
+            g_ax = None if g_ax is None else (g_ax & 0xFFFFFFFF)
+            g_pc = None if g_pc is None else (g_pc & 0xFFFFFFFF)
+
+            if step_idx >= len(oracle_tokens):
+                # Model ran MORE steps than the oracle declares before halting:
+                # it failed to halt where the declarations say it must. Report
+                # as a STEP_END/HALT-offset divergence (the model did not halt
+                # where the oracle did).
+                s.ff_status = "fail"
+                s.ff_div_step = step_idx
+                s.ff_div_offset = STEP - 1  # 34 = STEP_END/HALT
+                s.ff_div_offset_name = _step_offset_field(STEP - 1)
+                s.ff_expected_tok = None
+                s.ff_got_tok = (
+                    int(step_tokens[STEP - 1])
+                    if len(step_tokens) >= STEP else None
+                )
+                if step_idx < len(oracle):
+                    o_pc, o_ax = oracle[step_idx]
+                    s.ff_expected_pc = int(o_pc) & 0xFFFFFFFF
+                    s.ff_expected_ax = int(o_ax) & 0xFFFFFFFF
+                else:
+                    s.ff_expected_pc = None
+                    s.ff_expected_ax = None
+                s.ff_got_pc = g_pc
+                s.ff_got_ax = g_ax
+                s.exit_code = None
+                s.halted = True
+                return True
+
+            ref = oracle_tokens[step_idx]
+            # Compare every SAFE offset, in order, and fail on the first
+            # mismatch. ``step_tokens`` may be short only if the slice ran past
+            # the context end (it never does for a completed step), so guard.
+            for offset in range(STEP):
+                if offset in _UNSAFE_OFFSETS:
+                    continue
+                if offset >= len(step_tokens) or offset >= len(ref):
+                    break
+                got = int(step_tokens[offset])
+                exp = int(ref[offset])
+                if got != exp:
+                    s.ff_status = "fail"
+                    s.ff_div_step = step_idx
+                    s.ff_div_offset = offset
+                    s.ff_div_offset_name = _step_offset_field(offset)
+                    s.ff_expected_tok = exp
+                    s.ff_got_tok = got
+                    if step_idx < len(oracle):
+                        o_pc, o_ax = oracle[step_idx]
+                        s.ff_expected_pc = int(o_pc) & 0xFFFFFFFF
+                        s.ff_expected_ax = int(o_ax) & 0xFFFFFFFF
+                    s.ff_got_pc = g_pc
+                    s.ff_got_ax = g_ax
+                    s.exit_code = None
+                    s.halted = True
+                    return True
             s.ff_steps_checked += 1
         return False
 

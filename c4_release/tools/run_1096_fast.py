@@ -72,6 +72,15 @@ class ProgramResult:
     got_pc: Optional[int] = None
     got_ax: Optional[int] = None
 
+    # strict_trace (token-identity) divergence detail. Populated only by the
+    # ``--criterion strict_trace`` path in run_1096_canonical.py: the OFFSET
+    # (0..34) inside the diverging 35-token VM step, its human-readable field
+    # name (e.g. ``AX[1]``), and the expected/got token ids at that offset.
+    divergence_offset: Optional[int] = None
+    divergence_offset_name: Optional[str] = None
+    expected_tok: Optional[int] = None
+    got_tok: Optional[int] = None
+
     def to_row(self) -> str:
         if self.status == "ok":
             tag = "OK  "

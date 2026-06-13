@@ -443,6 +443,8 @@ def _score_neural_results(
 def _score_fail_fast_results(
     chunk: List[Tuple[int, int, str, int, int, list, bytes]],
     ff_results: List[dict],
+    *,
+    criterion: str = "full_trace",
 ) -> List[ProgramResult]:
     """Turn one chunk's ``run_batch_fail_fast`` output into ``ProgramResult``s.
 
@@ -451,6 +453,12 @@ def _score_fail_fast_results(
     divergence point (step + expected/got register state) — a debugging
     goldmine for the fix agents. ``error`` means the fail-fast decode could not
     produce a verdict (e.g. ran out of context room before any oracle token).
+
+    The strict_trace (token-identity) criterion: PASS iff every safe-offset
+    token in every completed VM step matched the DraftVM ``draft_tokens()``
+    reference through HALT. A FAIL records the divergence step + OFFSET (which
+    of the 35 step tokens diverged) + offset name + expected/got token, in
+    addition to the (PC, AX) context.
     """
     out: List[ProgramResult] = []
     for entry, r in zip(chunk, ff_results):
@@ -462,6 +470,19 @@ def _score_fail_fast_results(
         elif status_raw == "error":
             status = "error"
             err = "fail-fast: decode produced no verdict"
+        elif criterion == "strict_trace":
+            status = "fail"
+            div = r.get("divergence_step")
+            off = r.get("divergence_offset")
+            off_name = r.get("divergence_offset_name")
+            err = (
+                f"strict-trace token divergence at step {div} "
+                f"offset {off} ({off_name}): "
+                f"expected_tok={r.get('expected_tok')} "
+                f"got_tok={r.get('got_tok')} "
+                f"[pc={r.get('got_pc')} ax={r.get('got_ax')} "
+                f"vs oracle pc={r.get('expected_pc')} ax={r.get('expected_ax')}]"
+            )
         else:
             status = "fail"
             div = r.get("divergence_step")
@@ -485,6 +506,10 @@ def _score_fail_fast_results(
                 expected_ax=r.get("expected_ax"),
                 got_pc=r.get("got_pc"),
                 got_ax=r.get("got_ax"),
+                divergence_offset=r.get("divergence_offset"),
+                divergence_offset_name=r.get("divergence_offset_name"),
+                expected_tok=r.get("expected_tok"),
+                got_tok=r.get("got_tok"),
             )
         )
     return out
@@ -497,6 +522,7 @@ def _run_one_chunk_with_oom_retry(
     spec_k: int,
     max_context_window: int,
     fail_fast: bool = False,
+    criterion: str = "full_trace",
 ) -> List[ProgramResult]:
     """Run one chunk, halving the batch on CUDA OOM and retrying.
 
@@ -522,8 +548,11 @@ def _run_one_chunk_with_oom_retry(
                 expected_steps_list=[e[4] for e in chunk],
                 max_context_window=max_context_window,
                 spec_k=(spec_k if spec_k > 0 else 32),
+                criterion=criterion,
             )
-            return _score_fail_fast_results(chunk, ff_results)
+            return _score_fail_fast_results(
+                chunk, ff_results, criterion=criterion
+            )
         neural_results = neural_runner.run_batch(
             [e[5] for e in chunk],
             data_list=[e[6] for e in chunk],
@@ -565,6 +594,7 @@ def _run_one_chunk_with_oom_retry(
                 spec_k=spec_k,
                 max_context_window=max_context_window,
                 fail_fast=fail_fast,
+                criterion=criterion,
             )
         )
         _empty_cuda_cache()
@@ -575,6 +605,7 @@ def _run_one_chunk_with_oom_retry(
                 spec_k=spec_k,
                 max_context_window=max_context_window,
                 fail_fast=fail_fast,
+                criterion=criterion,
             )
         )
         return out
@@ -590,6 +621,7 @@ def _run_chunks_streaming(
     fixed_chunk: Optional[int],
     checkpoint_path: Optional[str],
     fail_fast: bool = False,
+    criterion: str = "full_trace",
 ) -> List[ProgramResult]:
     """Run prepared programs through the neural runner in length-aware chunks.
 
@@ -644,6 +676,7 @@ def _run_chunks_streaming(
                     spec_k=spec_k,
                     max_context_window=max_context_window,
                     fail_fast=fail_fast,
+                    criterion=criterion,
                 )
             except Exception as exc:  # noqa: BLE001 (non-OOM hard failure)
                 tb = traceback.format_exc(limit=3)
@@ -806,20 +839,38 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--criterion", type=str, default=None,
-        choices=["exit_code", "full_trace"],
+        choices=["exit_code", "full_trace", "strict_trace"],
         help="Pass criterion. 'exit_code' (default) = neural EXIT == "
              "declarative EXIT (the canonical suite criterion). 'full_trace' "
              "= the per-step (PC, AX) fail-fast criterion (equivalent to "
-             "--fail-fast). When both are given they must agree.",
+             "--fail-fast). 'strict_trace' = the TOKEN-IDENTITY fail-fast "
+             "criterion: after each VM step, compare the model's emitted token "
+             "at every SAFE offset (all 35 except the MEM addr/val metadata "
+             "bytes 26..33) to the DraftVM draft_tokens() reference, and FAIL "
+             "on the FIRST divergent token (records the offset + token). "
+             "strict_trace is strictly stronger than full_trace (full_trace's "
+             "(PC, AX) bytes are a subset of the safe offsets). When --fail-fast "
+             "and --criterion are both given they must agree.",
     )
     args = parser.parse_args(argv)
 
-    # ``--fail-fast`` and ``--criterion full_trace`` are the same mode.
-    if args.criterion == "full_trace":
+    # ``--fail-fast`` and ``--criterion full_trace`` are the same mode;
+    # ``--criterion strict_trace`` is also a fail-fast (per-step trace) mode.
+    if args.criterion in ("full_trace", "strict_trace"):
         args.fail_fast = True
     if args.fail_fast and args.criterion == "exit_code":
         parser.error("--fail-fast conflicts with --criterion exit_code")
-    criterion_name = "full_trace" if args.fail_fast else "exit_code"
+    # The per-step trace criterion name. ``--fail-fast`` alone (no --criterion)
+    # is full_trace; --criterion strict_trace selects token-identity.
+    if not args.fail_fast:
+        criterion_name = "exit_code"
+        trace_criterion = "full_trace"  # unused in exit_code mode
+    elif args.criterion == "strict_trace":
+        criterion_name = "strict_trace"
+        trace_criterion = "strict_trace"
+    else:
+        criterion_name = "full_trace"
+        trace_criterion = "full_trace"
 
     # Match run_1096_fast: only set a default device if the caller hasn't.
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -895,6 +946,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         fixed_chunk=fixed_chunk,
         checkpoint_path=checkpoint_path,
         fail_fast=args.fail_fast,
+        criterion=trace_criterion,
     )
 
     all_results: List[ProgramResult] = (
@@ -936,18 +988,33 @@ def main(argv: Optional[List[str]] = None) -> int:
         ]
         if diverged:
             print(
-                f"\n[1096-canonical] full-trace divergence samples "
+                f"\n[1096-canonical] {criterion_name} divergence samples "
                 f"(first {min(15, len(diverged))} of {len(diverged)} fails):",
                 file=sys.stderr,
             )
             for r in diverged[:15]:
-                print(
-                    f"    id={r.idx:04d} {cluster_of(r.description):16s} "
-                    f"step={r.divergence_step} "
-                    f"expected(pc={r.expected_pc},ax={r.expected_ax}) "
-                    f"got(pc={r.got_pc},ax={r.got_ax})  {r.description}",
-                    file=sys.stderr,
-                )
+                if criterion_name == "strict_trace":
+                    # Token-identity: lead with the offset-level divergence
+                    # (which of the 35 step tokens broke + expected/got token),
+                    # then the (PC, AX) context.
+                    print(
+                        f"    id={r.idx:04d} {cluster_of(r.description):16s} "
+                        f"step={r.divergence_step} "
+                        f"offset={r.divergence_offset}({r.divergence_offset_name}) "
+                        f"expected_tok={r.expected_tok} got_tok={r.got_tok} "
+                        f"[got(pc={r.got_pc},ax={r.got_ax}) "
+                        f"oracle(pc={r.expected_pc},ax={r.expected_ax})]  "
+                        f"{r.description}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"    id={r.idx:04d} {cluster_of(r.description):16s} "
+                        f"step={r.divergence_step} "
+                        f"expected(pc={r.expected_pc},ax={r.expected_ax}) "
+                        f"got(pc={r.got_pc},ax={r.got_ax})  {r.description}",
+                        file=sys.stderr,
+                    )
 
     if args.print_failures:
         for r in all_results:
@@ -961,6 +1028,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "wall_seconds": total_elapsed,
                     "criterion_name": criterion_name,
                     "criterion": (
+                        (
+                            "strict_trace (token-identity fail-fast): compile_c "
+                            "ok AND decl_exit==(suite_expected & 0xFFFFFFFF) AND "
+                            "the model's emitted token at every SAFE offset (all "
+                            "35 except MEM addr/val bytes 26..33) of every "
+                            "completed VM step matches the DraftVM "
+                            "draft_tokens() reference through HALT; STOPS on the "
+                            "FIRST divergent token (step+offset+token recorded "
+                            "per result). Strictly stronger than full_trace. "
+                            "pure-neural batched path"
+                        )
+                        if criterion_name == "strict_trace" else
                         (
                             "full_trace (fail-fast): compile_c ok AND "
                             "decl_exit==(suite_expected & 0xFFFFFFFF) AND "
