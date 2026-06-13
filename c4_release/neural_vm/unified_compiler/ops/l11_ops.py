@@ -835,3 +835,190 @@ def make_layer11_step_end_operand_relay_op(
         smoke_tests={"all"},
         spec_section="STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md#wave-a",
     )
+
+
+# ---------------------------------------------------------------------------
+# AX byte-1 DUMP carry head (the H1 cross-step SSA split)
+# ---------------------------------------------------------------------------
+#
+# Root: the per-step AX byte-1 register dump reads its value EXCLUSIVELY from
+# the ``H1`` band (L0 attn head-1, dims 67..73) as a one-hot ``H1+(byte1+2)``.
+# That one-hot is born at block 10 (L9) on the producing (fresh-AX) step and is
+# NEVER regenerated on a carried (non-AX-writing, e.g. PSH) step, so the dump
+# emits 0x00 for byte 1 on carried steps. See
+# ``docs/AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md``.
+#
+# Four prior agents proved no SINGLE-head carry that *writes ``H1``* can be
+# scheduled: ``H1`` is read fresh (same-step) by 54 ops across L1..L16, and the
+# carried-vs-fresh gate the carry head needs (``AX_CARRY``) is produced by ops
+# that themselves read ``H1`` -> a 2-cycle the dim-only scheduler cannot break.
+# See ``docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md``.
+#
+# THE FIX (this op) is the H1 cross-step SSA split (mirror of the
+# ``OUTPUT_HI`` -> ``OUTPUT_HI.*.-1`` split, Phase 7.A / 9.B):
+#   * The head READS the previous step's H1 one-hot via the SSA cross-step
+#     spelling ``H1.*.-1`` -- a DISTINCT dep-graph identity from the 54
+#     same-step ``H1`` readers, so there is NO same-step back-edge.
+#   * The head WRITES the re-supplied one-hot into ``H1_DUMP`` -- a same-slot
+#     alias of ``H1`` (slots 67..73, declared via shared.py ``_ALIAS_OF``).
+#     The LM head reads the PHYSICAL slots so emission is byte-identical; the
+#     distinct *name* keeps the write off the 54 H1-reader dep edges. No cycle.
+#
+# Geometry (all measured spec_k=0 at the L11 read point = after block 13, see
+# ``tools/probe_h1dump_design.py 13`` / ``tools/probe_carry_rowsig.py 13``):
+#   * Byte-1 predictor row signature: ``ADDR_B0_LO+5`` ~= 0.97 on EVERY byte-1
+#     predictor row (fresh + carried, all add programs), ~0 on the neighbouring
+#     byte-0 / byte-2 rows. Fires the Q (current carried row) AND matches the K
+#     (the prev fresh row that holds the one-hot).
+#   * Carried-vs-fresh gate: ``Sum(AX_CARRY_LO+HI)`` ~= -988 on a FRESH-AX step
+#     vs ~= +2.7 on a CARRIED step. Used BOTH on the Q side (gate the head ON
+#     only on carried rows) AND on the K side (prefer the fresh prev row, whose
+#     AX_CARRY is very negative, over the current carried row whose AX_CARRY is
+#     ~0 -- this is what excludes the self-match that plain positive ALiBi
+#     would otherwise pick).
+#   * ALiBi: positive slope (recency) as a tie-breaker only; the AX_CARRY K
+#     differential is the dominant prev-vs-current discriminator.
+#
+# Brittleness (documented, accepted for the add/sub corpus): ``H1`` is 7 wide
+# so the ``H1+(v+2)`` one-hot caps byte-1 value at v=4. The whole 1096 add/sub
+# corpus has high byte <= 4, so this carry covers it; a value-general fix needs
+# a real 8-bit dump band (separate task).
+_AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT = (
+    ("layer11_ax_byte1_dump_carry.head_2",),
+)
+
+
+def _allocate_layer11_ax_byte1_dump_carry_heads() -> AttentionHeadAllocator:
+    """Per-bake head allocator for the AX byte-1 DUMP carry head.
+
+    Pre-claims the two ``step_end_operand_relay`` heads (0/1) so this
+    head first-fits at index 2, leaving the table self-documenting and
+    independent of registration order.
+    """
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    for (op_name,) in _L11_STEP_END_OPERAND_RELAY_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=11)
+    for (op_name,) in _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=11)
+    return allocator
+
+
+def _layer11_ax_byte1_dump_carry_head_spec(
+    dim_positions: dict,
+    head_idx: int,
+    *,
+    L: float = 15.0,
+    gate_w: float = 1.0,
+    k_axc_w: float = 0.05,
+    alibi_slope: float = 0.5,
+) -> DeclarativeAttentionHeadSpec:
+    """Build the AX byte-1 DUMP carry head spec.
+
+    Q (current carried byte-1 predictor row):
+      slot 0 = ``ADDR_B0_LO+5`` * L  (fire on byte-1 predictor rows)
+             + Sum_k (AX_CARRY_LO/HI + k) * gate_w  (gate: fresh -> very
+               negative Q-proj -> head off; carried -> ~+L Q-proj -> on)
+    K (prev fresh byte-1 predictor row, holding the one-hot):
+      slot 0 = ``ADDR_B0_LO+5`` * L  (match byte-1 predictor rows)
+             - Sum_k (AX_CARRY_LO/HI + k) * k_axc_w  (prefer the FRESH row:
+               its AX_CARRY ~= -988 -> +49 K-proj boost; the current carried
+               row's AX_CARRY ~= 0 -> no boost -> the prev fresh row wins by
+               ~hundreds of nats, dominating the ALiBi recency tie-break)
+    V (slots 1..7): copy the prev step's H1 one-hot via ``H1.*.-1`` (cross-step
+      SSA read -> aliased to slot 67, no same-step back-edge).
+    O (slots 1..7): write into ``H1_DUMP`` (same-slot alias of H1 -> physical
+      67, distinct dep name -> no edge from the 54 same-step H1 readers).
+    """
+    # SSA cross-step read of H1 resolves to H1's physical slot (67) but is a
+    # distinct dep identity. ``H1_DUMP`` is the same-slot write alias.
+    h1_prev = dim_positions["H1.*.-1"]
+    h1_dump = dim_positions["H1_DUMP"]
+    addr_sig = dim_positions["ADDR_B0_LO"] + 5
+    axc_lo = dim_positions["AX_CARRY_LO"]
+    axc_hi = dim_positions["AX_CARRY_HI"]
+
+    q = [AP(0, addr_sig, L)]
+    k = [AP(0, addr_sig, L)]
+    # AX_CARRY gate (Q-side ON-only-when-carried; K-side prefer-fresh-prev).
+    for base in (axc_lo, axc_hi):
+        for j in range(16):
+            q.append(AP(0, base + j, gate_w))
+            k.append(AP(0, base + j, -k_axc_w))
+
+    v = []
+    o = []
+    H1_W = 7
+    for j in range(H1_W):
+        v.append(AP(1 + j, h1_prev + j, 1.0))
+        o.append(AO(h1_dump + j, 1 + j, 1.0))
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+        alibi_slope=alibi_slope,
+    )
+
+
+def make_layer11_ax_byte1_dump_carry_op(enable: bool = False) -> Operation:
+    """L11 attn head 2: re-supply the AX byte-1 H1 one-hot on carried steps.
+
+    The H1 cross-step SSA split that lands the AX byte-1 DUMP carry. See the
+    module-level comment above for the root, the proof that no ``H1``-writing
+    head can be scheduled, and the geometry.
+
+    ``enable`` defaults to ``False``: the bake is a no-op so the production
+    build is byte-identical, but the Operation is always registered so its
+    ``reads``/``writes`` participate in the dep graph -- this is the proof
+    that the ``H1.*.-1`` read + ``H1_DUMP`` write break the 2-cycle (the
+    compile would raise ``Dependency cycle detected`` if they did not).
+    """
+    def bake(block, dim_positions, S):
+        if not enable:
+            return
+        proxy = _as_setdim_proxy(dim_positions)  # noqa: F841 (parity w/ peers)
+        attn = block.attn
+        allocator = _allocate_layer11_ax_byte1_dump_carry_heads()
+        attn._l11_ax_byte1_dump_carry_head_allocator = allocator
+        head_idx = allocator.heads()[-1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec = _layer11_ax_byte1_dump_carry_head_spec(
+            dim_positions, head_idx,
+        )
+        Primitives.generate_attention_head(attn, spec, HD)
+
+    def _ir(dim_positions, HD) -> CompilerIR:
+        del HD
+        allocator = _allocate_layer11_ax_byte1_dump_carry_heads()
+        head_idx = allocator.heads()[-1].head_idx
+        spec = _layer11_ax_byte1_dump_carry_head_spec(dim_positions, head_idx)
+        ir = CompilerIR()
+        if enable:
+            ir.layer(0).attention.append(
+                spec, name="layer11_ax_byte1_dump_carry.head_2",
+            )
+        return ir
+
+    return Operation(
+        name="layer11_ax_byte1_dump_carry",
+        # Q anchors on ADDR_B0_LO+5 (byte-1 predictor signature) + AX_CARRY
+        # (gate). K matches the prev fresh byte-1 row. V reads the prev step's
+        # H1 one-hot cross-step (``H1.*.-1`` -> no same-step back-edge). O
+        # writes ``H1_DUMP`` (same-slot alias of H1, distinct dep identity ->
+        # no edge from the 54 same-step H1 readers). THIS is the cycle break.
+        reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1.*.-1"},
+        writes={"H1_DUMP"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_ir,
+        # Bind to the L11 FFN dep anchor so the head lands on the L11 attn
+        # block (physical block 14, read point = after block 13 where the
+        # AX_CARRY gate has crystallised and the prev-step one-hot is held).
+        target_op_name="_layer11_ffn_dep_anchor",
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
