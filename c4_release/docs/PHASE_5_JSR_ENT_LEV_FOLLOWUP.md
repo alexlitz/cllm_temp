@@ -327,3 +327,106 @@ mul_overflow}, identical to baseline. The single landable fix is the
 `ACTUAL_OP_ENT` opcode-decode dim of §"Minimal change that WOULD fix it"; it needs
 the reserved multi-commit L4/L5/L6 opcode-decode surface and a parallel owner.
 Throwaway probes removed; worktree left at the green 49/2 baseline.
+
+## 2026-06-13 spec_k=0 (agent abddcd6) — localization CORRECTED to block-8 operand_gather head 1; tested CMP-gate + head-1-disable; both refuted; wall re-pinned hard
+
+Fresh hook-free spec_k=0 ground-truth investigation (`tools/probe_groundtruth`
+`residual_at`/`emitted_result`, one build, ~7 throwaway probes all removed). Baseline
+re-confirmed `pytest tests/test_smoke.py`: **49 pass / 2 fail {simple_function (got 8,
+want 42), mul_overflow}**. Two of the prior entries' localizations are wrong; the
+fix-direction verdict (needs `ACTUAL_OP_ENT`, out of single-commit scope) STANDS,
+now on firmer ground. **No production weight change made** (one CMP-gate attempt and
+one head-1-disable experiment were built, tested, and fully reverted; git diff
+empty).
+
+### Correction 1 — the corruptor is `_layer7_operand_gather_head_specs` HEAD 1, baked at PHYSICAL BLOCK 8 (not "L7 head 1"/block 7, NOT a generic "L8 attention family")
+Per-head `W_o` audit of the **built** model (densify the CSR `W_o`, slice each head's
+`HD`-column block, take `|W_o[ALU_LO:ALU_LO+16, head_cols]|.max()`):
+- **block 7 (L7): ZERO ALU_LO writers.** The operand_gather heads do NOT live at
+  block 7 in this build.
+- **block 8 (L8): heads 0 and 1 each write `ALU_LO` rows [0,1] at scale 6.0** — the
+  unique signature of `operand_gather` (`_band_output_writes(BD.ALU_LO, 1, 6.0)`).
+  block 8's PureFFN is **right-sized to 0 units** (`W_down` shape `(872,0)`), so block
+  8 is attention-only; the L8 ALU compute lives in the **AddSub post-op at block 9**.
+So adfb7a9's "L7 head 1" and a547862's "L8 attention family (multibyte_fetch/sp_gather
+mirrors)" are both imprecise: the actual writer is operand_gather head 1 placed at
+block 8 by the dynamic scheduler (`target_op_name="layer8_sp_gather"`). The residual
+divergence: block 7 `ALU_LO[12]=1.0` (clean operand 42) → block 8 `ALU_LO=[(1,70.55),
+(12,1.0)]` (frame value 70 ADDED, burying the magnitude-1 operand) → L8/L9 nibble
+argmax picks index-1 → emits 8.
+
+### Correction 2 — head 1's OPCODE Q gates are INERT; `OP_ENT` at the AX marker is a hard CONSTANT present already at BLOCK 0
+Probing `OP_ENT` at the AX marker across **every step of every program** (IMM-first,
+PSH, ENT, IMM, ADD, LEA, ADJ, EXIT): `OP_ENT = +1.00` on **all of them**, and it is
+already `+1.00` at **block 0** (the token embedding), before any opcode decode runs.
+`OP_IMM=0`, `OP_LEA=0`, `OP_ADJ=0` even on real IMM/LEA/ADJ steps at the AX marker. So
+head 1's Q dim-0 `AP(0, OP_ENT, L)+AP(0, OP_LEA, L)+AP(0, OP_ADJ, L)` reduces to a
+constant: with `MARK_AX=1, OP_ENT=1, CONST=1` the dim-0 score is `10L + L − 5L = 6L`
+on EVERY AX marker regardless of opcode. **Head 1 fires on every step**; whether it
+HARMS is governed only by (a) a live BP/SP frame existing for its K side and (b) the
+ALU result being consumed. `lea_basic` (`ENT;IMM 0;LEA 2`) survives the identical
+bug only because LEA discards the corrupted IMM-0 result.
+
+### Tested fix A (REVERTED) — gate head 1 OFF on IMM via the CMP band — REFUTED, plus a dim-width trap
+The CMP band carries opcode-discriminating content at the AX marker that the OP_*
+flags do not: probed (CORRECT 8-wide band, `CMP=396..403`) **CMP[0]=LEA**, **CMP[6]=ADJ**,
+**CMP[1]=first-step** (set on the first instruction, ENT or IMM), **CMP[2]=binary-2nd-
+operand IMM**. Looked like a gate ("fire head 1 only on CMP[0]|CMP[1]|CMP[6]"). It is
+NOT usable:
+- **TRAP:** `CMP` is only **8 dims wide** (`CMP=396`, `CLEAN_EMBED_HI=404`). An initial
+  "CMP[8]=IMM marker" reading was actually `CLEAN_EMBED_HI[0]` (a VALUE dim) — gating
+  on it (`AP(0, BD.CMP+8, −600)`) silently reads the operand's high nibble and had
+  **zero effect** (built + tested: REALENT/SIMPLE still 8). Reverted.
+- **FATAL (correct band):** the **non-first / JSR-reached ENT step has CMP EMPTY** at
+  the AX marker. Probed `IMM 5;PSH;ENT 0;IMM 42` → the ENT step CMP=∅; `simple_function`
+  → the callee ENT step (s3) CMP=∅. So in the func/`simple_function` flow the **real
+  ENT step and the following callee IMM step are BOTH CMP-empty** — byte-identical in
+  the CMP band, the OP_* flags, and every marker. CMP[0]/CMP[6] are clean for LEA/ADJ
+  but ENT has no dedicated bit (it shares first-step CMP[1]), so no CMP gate can keep
+  head 1 ON for the func ENT while turning it OFF for the func IMM.
+
+### Tested fix B (REVERTED) — disable head 1 entirely — REFUTED (head 1 is load-bearing AND removing it doesn't fix simple_function)
+Forced head 1's dim-0 Q strongly negative (`AP(0, CONST, −1000L)`, overriding the
+constant OP_ENT) so it never attends the frame. Smoke: **6 fail** — regresses
+`test_adj_sp`, `test_or_basic`, `test_or_16bit`, `test_xor_16bit` (head 1's BP/SP→ALU
+gather is load-bearing for ADJ and the bitwise-pop ops) **AND `simple_function` STILL
+fails (got 8)**. The second half matters: removing head 1 does NOT recover the operand,
+because head 0 (the legit STACK0→ALU operand gather) is **also permanently suppressed**
+at the AX marker (`AP(0, OP_ENT, −L)`, OP_ENT constant ⇒ head 0 always off). The
+callee IMM operand reaches ALU only via the **L6 attention** staging (`ALU_LO[12]=1.0`,
+present already at block 6 and surviving block 7); head 1's frame write (70) is what
+buries it. So the operand path on a non-first IMM is the L6-staged magnitude-1 value
+ALONE — there is no full-strength in-step gather to amplify.
+
+### Why this is a genuine multi-session wall (re-pinned, sharper)
+The deciding quantity is ALU at the AX marker on the callee IMM step. To fix it you
+must EITHER (i) make head 1 not fire there, OR (ii) make the operand out-magnitude
+head 1's 70. Both require a per-step "this step is a real ENT/LEA/ADJ" vs "this step
+is a fresh IMM" signal at the AX marker, and the encoding does not carry one for
+non-first steps:
+- `OP_ENT`/`OP_IMM`/`OP_LEA`/`OP_ADJ` at AX are constants/zero (embedding-baked).
+- `OPCODE_BYTE_LO/HI` at the AX (and PC) marker is contaminated address content on
+  every NON-first step (clean only on the first step via the HAS_SE=−1 first-step
+  decode path); a non-first ENT decodes `OP_ENT=0` at its own PC marker.
+- The `CMP` band carries clean per-opcode bits only for LEA (CMP[0]), ADJ (CMP[6]),
+  and the first step (CMP[1]); the func-context ENT and IMM are both CMP-empty.
+
+The single landable fix remains **(B) a real `ACTUAL_OP_ENT`/`ACTUAL_OP_IMM` opcode
+flag**, but it now demonstrably requires *first creating a clean per-step opcode
+decode* (the marker-scheme `OP_ENT` is a constant and the opcode byte is only clean on
+the first step), then relaying it single-step (NOT durably, unlike `OP_ENT`/`CMP[2]`)
+to the AX marker, then re-gating head 1's Q (`AP(0, OP_ENT, L) → AP(0, ACTUAL_OP_ENT,
+L)`) AND head 0's suppression (`AP(0, OP_ENT, −L) → AP(0, ACTUAL_OP_ENT, −L)`). That is
+the reserved multi-commit L4/L5/L6 opcode-decode surface — out of a single
+byte-identity-safe commit's scope. `extra_residual_dims` unblocks the DIM, not the
+DECODE LOGIC, which is the actual hard part.
+
+### Verdict
+simple_function: **49/2 unchanged (got 8, want 42).** Byte-identity: N/A — **no
+production weight change made** (CMP-gate + head-1-disable both built/tested/reverted;
+`git diff` empty). Final smoke: **49 pass / 2 fail** {simple_function, mul_overflow}.
+Localization corrected to **operand_gather head 1 @ physical block 8**; both candidate
+single-commit fixes empirically refuted. Throwaway probes removed; worktree left at the
+green 49/2 baseline. NOTE: a parallel agent shares GPU 1 — full-smoke runs can
+spuriously pytest-timeout the memory cluster under contention; verify those in
+isolation (each passes solo).
