@@ -710,6 +710,25 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     # the Wave A step_end_operand_relay (10ca51a7).
                     ("MARK_SE_ONLY", 60.0),
                     *blockers,
+                    # PER-STEP ACTUAL-IMM BLOCKER (func / simple_function fix).
+                    # This ENT lo-nibble band (SP - (8+imm)) is gated on
+                    # OP_ENT, which is durably carried across the call frame
+                    # from the ENT step into the callee body. On the callee
+                    # ``IMM`` step OP_ENT is still ~5 at the AX marker, so the
+                    # band SPURIOUSLY computes the ENT SP-decrement constant
+                    # over the IMM operand and writes it onto OUTPUT_LO,
+                    # burying the genuine immediate -> ``ENT 0; IMM 42`` emits
+                    # 40/8 (the func / 150-fail cluster). The L5 main-AX opcode
+                    # decode produces a CLEAN per-step OP_IMM one-hot (= +5.0
+                    # ONLY on real IMM steps, 0 on real ENT steps; probed
+                    # spec_k=0) that is present at the AX marker where this
+                    # band actually fires, so a strong OP_IMM NOT-blocker
+                    # suppresses it on the callee IMM step while leaving a real
+                    # ENT step (OP_IMM = 0) byte-identical. Same class as the
+                    # HAS_SE blocker in ``l9_ops._layer9_ent_hi_nibble_rules``
+                    # and the head-1 actual-IMM suppression in
+                    # ``l7_ops._layer7_operand_gather_head_specs``.
+                    ("OP_IMM", -1000.0),
                     (f"ALU_LO+{sp_lo}", 1.0),
                     (f"FETCH_LO+{imm_lo}", 20.0),
                 ),
@@ -752,6 +771,13 @@ def _layer8_alu_ent_borrow_rules(S: float) -> tuple[FFNRule, ...]:
                     # the Wave A step_end_operand_relay (10ca51a7).
                     ("MARK_SE_ONLY", 60.0),
                     *blockers,
+                    # PER-STEP ACTUAL-IMM BLOCKER (func / simple_function fix).
+                    # Companion to the ent_lo blocker above: the ENT borrow
+                    # band is also OP_ENT-gated and spuriously fires on the
+                    # callee IMM step (durable OP_ENT carry). Suppress on the
+                    # clean per-step OP_IMM so a real ENT (OP_IMM=0) is
+                    # byte-identical. See ``_layer8_alu_ent_lo_rules``.
+                    ("OP_IMM", -1000.0),
                     (f"ALU_LO+{sp_lo}", 1.0),
                     (f"FETCH_LO+{imm_lo}", 20.0),
                 ),
@@ -1288,6 +1314,7 @@ def make_layer8_alu_op() -> Operation:
         # ALU_LO back-edges inside SCC #1.
         reads={"MARK_AX", "MARK_PC", "ALU_LO.*.-1", "AX_CARRY_LO", "FETCH_LO",
                "OP_ADD", "OP_SUB", "OP_LEA",
+               "OP_IMM",  # ent_lo/ent_borrow per-step actual-IMM blocker
                "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
                # V2/G7 LEV detector: in-step topology edge from
                # lev_detector_head (phase=8.06) replaces the cross-step

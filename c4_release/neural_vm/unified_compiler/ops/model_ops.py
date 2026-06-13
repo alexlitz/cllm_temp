@@ -514,10 +514,28 @@ def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _function_call_ent_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
-    """ENT AX passthrough: AX_CARRY -> OUTPUT at AX marker (32 units)."""
+    """ENT AX passthrough: AX_CARRY -> OUTPUT at AX marker (32 units).
+
+    PER-STEP ACTUAL-IMM BLOCKER (func / simple_function fix). This band
+    routes the ENT frame's AX_CARRY onto OUTPUT at the ENT step's AX
+    marker, gated ``OP_ENT + MARK_AX >= 4``. ``OP_ENT`` is durably carried
+    forward across the call frame (re-broadcast by the L6 opcode-relay /
+    marker carry from the ENT step into the body), so on the *callee* ``IMM``
+    step that immediately follows ENT, ``OP_ENT`` is still ~5 at the AX
+    marker and this band SPURIOUSLY fires, copying the carried frame value
+    (the ENT SP-decrement constant 8) onto OUTPUT_LO and burying the genuine
+    immediate -> ``ENT 0; IMM 42`` emits 40/8 and the func / 150-fail cluster
+    fails. The L5 main-AX opcode decode produces a CLEAN per-step ``OP_IMM``
+    one-hot (= +5.0 ONLY on real IMM steps, 0 on real ENT steps; probed
+    spec_k=0) that survives to this band's input, so a strong ``OP_IMM``
+    NOT-blocker suppresses the band on the callee IMM step while leaving a
+    real ENT step (OP_IMM = 0) byte-identical. Mirrors the head-1 actual-IMM
+    suppression in ``l7_ops._layer7_operand_gather_head_specs`` and the
+    HAS_SE blocker in ``l9_ops._layer9_ent_hi_nibble_rules``.
+    """
     T = 4.0
     write_scale = 2.0 / S
-    conditions = (("OP_ENT", 1.0), ("MARK_AX", 1.0))
+    conditions = (("OP_ENT", 1.0), ("MARK_AX", 1.0), ("OP_IMM", -10.0))
     rules: list[FFNRule] = []
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -927,6 +945,7 @@ def make_function_call_weights_op() -> Operation:
         # and ``_function_call_l6_ffn_rules``.
         reads={"MARK_STACK0", "MARK_BP", "MARK_SP", "MARK_PC", "MARK_AX",
                "CONST", "OP_JSR", "OP_ENT",
+               "OP_IMM",  # ent_ax_passthrough per-step actual-IMM blocker
                "EMBED_LO", "EMBED_HI",
                "OUTPUT_LO", "OUTPUT_HI"},
         # UNDECLARED_DIM_AUDIT_2026_06_09: added ALU_HI/LO, OUTPUT_HI/LO,

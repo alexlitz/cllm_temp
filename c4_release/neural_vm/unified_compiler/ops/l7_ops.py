@@ -188,6 +188,7 @@ def make_layer7_operand_gather_op() -> Operation:
         # MARK_BP, MARK_SP (head 1 K reads ``BD.MARK_BP`` + ``BD.MARK_SP``
         # at slot 0; BP/SP marker self-attention gate for LEA/ADJ/ENT).
         reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
+               "OP_IMM",  # head 1 Q: per-step actual-IMM suppression gate
                "CONST",
                "MARK_BP", "MARK_SP",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
@@ -268,6 +269,28 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
                 AP(0, BD.OP_ADJ, L),
                 AP(0, BD.OP_ENT, L),
                 AP(0, BD.CONST, -L * 5),
+                # PER-STEP ACTUAL-IMM SUPPRESSION (func / simple_function fix).
+                # Head 1 pulls the live frame BP/SP into ALU at the AX marker
+                # for LEA/ADJ/ENT operand-A relay. Its dim-0 score is dominated
+                # by MARK_AX * 10 (= 150), so it fires on EVERY AX marker
+                # regardless of opcode -- including the callee `IMM` step that
+                # follows an ENT (where it buries the magnitude-1 immediate
+                # under the frame value and L8 emits the ENT frame constant 8;
+                # this is the `ENT 0; IMM 42` -> 8 bug and the func / 150-fail
+                # cluster). The per-step opcode decode at the L5 main-AX path
+                # (``_opcode_decode_main_rules``) produces a CLEAN per-step
+                # ``OP_IMM`` one-hot at the AX marker that survives intact to
+                # this block's input (probed spec_k=0: OP_IMM = +5.0 ONLY on
+                # real IMM steps, ~0 on ENT/ADJ/LEA/PSH/OR steps -- the
+                # discriminator the prior "OP_ENT is a constant" analyses
+                # missed by reading OP_ENT *after* block 8 re-broadcasts it).
+                # A real ENT/LEA/ADJ step carries OP_IMM = 0, so this term is
+                # inert there and head 1 still fires for its load-bearing
+                # cases (ADJ + bitwise-pop). On a real IMM step OP_IMM = +5.0
+                # drives the dim-0 score deeply negative, so head 1 does NOT
+                # gather the frame and the genuine immediate reaches ALU
+                # (mirroring the passing non-call IMM case).
+                AP(0, BD.OP_IMM, -L * 30),
                 AP(1, BD.CONST, -L * 2),
                 AP(1, BD.MARK_AX, L * 3),
             ),
