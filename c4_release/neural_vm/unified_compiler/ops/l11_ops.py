@@ -883,74 +883,148 @@ def make_layer11_step_end_operand_relay_op(
 # so the ``H1+(v+2)`` one-hot caps byte-1 value at v=4. The whole 1096 add/sub
 # corpus has high byte <= 4, so this carry covers it; a value-general fix needs
 # a real 8-bit dump band (separate task).
+# Host = L13 (physical block 16): a native logical layer with a REAL,
+# non-passthrough attention block whose heads 6/7 are free at BOTH bake and
+# runtime (heads 0..2 = mem_addr_gather, 3 = bitwise_byte1, 4 = sub_minuend,
+# 5 = add_addend). The carry head is pinned to slot 6. Rejected hosts:
+#   * L11 / block 14 — attention is shared and expands 8->13 heads at runtime,
+#     clobbering any bake into heads 0..7.
+#   * L12 / block 15 — attention block is a pure passthrough (W_q == 0 at
+#     runtime), so a bake there has no effect on the forward.
+# L13's read point (after block 15) holds both the crystallised AX_CARRY gate
+# (-988 fresh / +2.7 carried) and the prev-step H1 one-hot.
+_AX_BYTE1_DUMP_CARRY_HEAD_IDX = 6
 _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT = (
-    ("layer11_ax_byte1_dump_carry.head_2",),
+    ("layer13_ax_byte1_dump_carry.head_6", _AX_BYTE1_DUMP_CARRY_HEAD_IDX),
 )
 
 
-def _allocate_layer11_ax_byte1_dump_carry_heads() -> AttentionHeadAllocator:
-    """Per-bake head allocator for the AX byte-1 DUMP carry head.
-
-    Pre-claims the two ``step_end_operand_relay`` heads (0/1) so this
-    head first-fits at index 2, leaving the table self-documenting and
-    independent of registration order.
-    """
+def _allocate_layer13_ax_byte1_dump_carry_heads() -> AttentionHeadAllocator:
+    """Per-bake head allocator for the AX byte-1 DUMP carry head (L13 host)."""
     allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
-    for (op_name,) in _L11_STEP_END_OPERAND_RELAY_HEAD_LAYOUT:
-        allocator.alloc(op_name, layer_idx=11)
-    for (op_name,) in _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT:
-        allocator.alloc(op_name, layer_idx=11)
+    for (op_name, head_idx) in _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=13, pin=head_idx)
     return allocator
 
 
-def _layer11_ax_byte1_dump_carry_head_spec(
+def _layer13_ax_byte1_dump_carry_head_spec(
     dim_positions: dict,
     head_idx: int,
     *,
     L: float = 15.0,
-    gate_w: float = 1.0,
-    k_axc_w: float = 0.05,
+    gate_w: float = 0.05,
+    h1_w: float = 3.0,
+    sink_w: float = 8.0,
     alibi_slope: float = 0.5,
 ) -> DeclarativeAttentionHeadSpec:
     """Build the AX byte-1 DUMP carry head spec.
 
+    Slots (V/O occupy 10..16 so they never collide with the Q/K gate slots):
+
     Q (current carried byte-1 predictor row):
       slot 0 = ``ADDR_B0_LO+5`` * L  (fire on byte-1 predictor rows)
+             + ``CONST`` * (-0.5 L)  (baseline: signature alone clears it)
              + Sum_k (AX_CARRY_LO/HI + k) * gate_w  (gate: fresh -> very
-               negative Q-proj -> head off; carried -> ~+L Q-proj -> on)
-    K (prev fresh byte-1 predictor row, holding the one-hot):
+               negative Q-proj -> slot-0 score collapses below the sink ->
+               head attends the V=0 sink; carried -> small +ve -> head fires)
+      slot 9 = ``CONST`` * L          (sink driver, always on)
+    K:
       slot 0 = ``ADDR_B0_LO+5`` * L  (match byte-1 predictor rows)
-             - Sum_k (AX_CARRY_LO/HI + k) * k_axc_w  (prefer the FRESH row:
-               its AX_CARRY ~= -988 -> +49 K-proj boost; the current carried
-               row's AX_CARRY ~= 0 -> no boost -> the prev fresh row wins by
-               ~hundreds of nats, dominating the ALiBi recency tie-break)
-    V (slots 1..7): copy the prev step's H1 one-hot via ``H1.*.-1`` (cross-step
-      SSA read -> aliased to slot 67, no same-step back-edge).
-    O (slots 1..7): write into ``H1_DUMP`` (same-slot alias of H1 -> physical
-      67, distinct dep name -> no edge from the 54 same-step H1 readers).
+             - Sum_k (AX_CARRY_LO/HI + k) * k_axc_w  (prefer the FRESH prev
+               row: its AX_CARRY ~= -988 -> huge +K boost; the current
+               carried row's AX_CARRY ~= 0 -> no boost -> the prev fresh row
+               wins by hundreds of nats, dominating the ALiBi recency tie)
+      slot 9 = ``STEP_BOUNDARY`` * sink_w  (the V=0 sink row: position 0 of
+               every step carries STEP_BOUNDARY and H1 == 0, so attending
+               there contributes nothing; it wins whenever slot-0 is gated
+               off on a fresh q row)
+    V (slots 10..16): copy the prev step's H1 one-hot via ``H1.*.-1``
+      (cross-step SSA read -> aliased to slot 67, no same-step back-edge).
+    O (slots 10..16): write into ``H1_DUMP`` (same-slot alias of H1 ->
+      physical 67, distinct dep name -> no edge from the 54 same-step H1
+      readers). The sink row's H1 == 0 so a gated-off / mis-fired attend
+      writes exactly zero -> the cascade-sensitive H1 band is never
+      corrupted on fresh or non-predictor rows.
     """
-    # SSA cross-step read of H1 resolves to H1's physical slot (67) but is a
-    # distinct dep identity. ``H1_DUMP`` is the same-slot write alias.
-    h1_prev = dim_positions["H1.*.-1"]
-    h1_dump = dim_positions["H1_DUMP"]
-    addr_sig = dim_positions["ADDR_B0_LO"] + 5
-    axc_lo = dim_positions["AX_CARRY_LO"]
-    axc_hi = dim_positions["AX_CARRY_HI"]
+    # IMPORTANT — position source: the bake's ``dim_positions`` map is the
+    # dynamic compiler's *internal* layout (e.g. H1 -> 246), which is NOT the
+    # layout the running model's residual uses. The H1 pipeline (L0 producer,
+    # the 54 readers, the LM head) is baked at the LEGACY ``_SetDim`` / dynamic
+    # *registry* positions (H1 -> 67; the LM head's byte-1 emission reads
+    # ``head.weight[0x02]-[0x00]`` from dims 69/71 == H1+2 / H1+4). So this head
+    # MUST resolve every position from ``build_default_registry_dynamic()`` —
+    # the same map every probe uses — or it writes into dead slots. (Verified:
+    # registry H1=67/ADDR_B0_LO=12/AX_CARRY_LO=328 == _SetDim == the actual
+    # residual; ``dim_positions`` H1=246 is the inconsistent outlier.)
+    from ...dim_registry_dynamic import build_default_registry_dynamic
+    _reg = build_default_registry_dynamic()
 
-    q = [AP(0, addr_sig, L)]
-    k = [AP(0, addr_sig, L)]
-    # AX_CARRY gate (Q-side ON-only-when-carried; K-side prefer-fresh-prev).
-    for base in (axc_lo, axc_hi):
-        for j in range(16):
-            q.append(AP(0, base + j, gate_w))
-            k.append(AP(0, base + j, -k_axc_w))
+    def _P(name: str) -> int:
+        return int(_reg.slots[name].start)
+
+    h1 = _P("H1")            # cross-step read (H1.*.-1) AND write (H1_DUMP)
+    addr_sig = _P("ADDR_B0_LO") + 5
+    axc_lo = _P("AX_CARRY_LO")
+    axc_hi = _P("AX_CARRY_HI")
+    const = _P("CONST")
+
+    # Separated-slot design. A Q-gate with a uniform (CONST) K cannot turn the
+    # head off — softmax is shift-invariant, so a constant added to every k's
+    # score leaves the distribution unchanged. The gate must instead make the
+    # SINK out-score the real K rows on a fresh q. So the carried gate lives on
+    # the SIGNATURE slot's Q side, flipping the signature score negative on
+    # fresh q rows (-> sink wins) and positive on carried q rows (-> prev fresh
+    # predictor wins).
+    #
+    # slot 0  SIGNATURE + CARRIED GATE:
+    #           Q = ADDR_B0_LO+5 * L  +  Sum(AX_CARRY) * gate_w
+    #           K = ADDR_B0_LO+5 * L
+    #         carried q (AXC ~= +2.7): Q[0] ~= +L  -> predictor K rows score
+    #           large positive -> head attends a predictor row.
+    #         fresh   q (AXC ~= -988): Q[0] ~= -49 -> predictor K rows score
+    #           NEGATIVE -> they lose to the slot-3 sink -> head writes ~0.
+    # slot 2  ONE-HOT-PRESENCE K-PREFERENCE: Q = CONST * L; K = Sum(H1) * h1_w.
+    #         Among predictor rows on a carried q, the PREV FRESH predictor
+    #         (which HOLDS the H1 one-hot, band-sum ~= 14) gets a big +K boost
+    #         while the current carried predictor (H1 band-sum ~= 0.9) gets
+    #         almost none -> the head attends the row that actually carries the
+    #         one-hot, not the current (empty) predictor. (AX_CARRY can't serve
+    #         as the discriminator here: marker rows have an even more negative
+    #         AX_CARRY than the fresh predictor, so an AX_CARRY K-preference
+    #         boosts the H1==0 marker sink and breaks the selection.) This is a
+    #         SAME-STEP read of H1 -- it adds the head to the 54 H1 readers but
+    #         does NOT cycle: the head WRITES H1_DUMP (no op reads H1_DUMP), so
+    #         there is no back-edge from the write into any H1/AX_CARRY producer.
+    # slot 3  SINK: Q = ADDR_B0_LO+5 * L (fires at the predictor q row);
+    #         K = MARK_AX * sink_w -> targets AX MARKER rows (H1 ~= 0). On a
+    #         fresh q the negated signature (slot 0) drops predictor K rows
+    #         below this H1==0 marker sink -> head writes ~0 -> fresh stays
+    #         byte-identical. sink_w is small enough that on a carried q the
+    #         (positive) signature + one-hot-present predictor out-scores it.
+    mark_ax = _P("MARK_AX")
+    q = [
+        AP(0, addr_sig, L),
+        AP(2, const, L),
+        AP(3, addr_sig, L),
+    ]
+    k = [
+        AP(0, addr_sig, L),
+        AP(3, mark_ax, sink_w),
+    ]
+    for j in range(16):
+        q.append(AP(0, axc_lo + j, gate_w))   # carried gate (lo)
+        q.append(AP(0, axc_hi + j, gate_w))   # carried gate (hi)
+    # K-side one-hot-presence preference (same-step H1 read).
+    for j in range(7):
+        k.append(AP(2, h1 + j, h1_w))
 
     v = []
     o = []
     H1_W = 7
+    V_BASE = 10
     for j in range(H1_W):
-        v.append(AP(1 + j, h1_prev + j, 1.0))
-        o.append(AO(h1_dump + j, 1 + j, 1.0))
+        v.append(AP(V_BASE + j, h1 + j, 1.0))  # V reads prev H1 (cross-step)
+        o.append(AO(h1 + j, V_BASE + j, 1.0))  # O writes H1_DUMP (== H1 slot)
 
     return DeclarativeAttentionHeadSpec(
         head_idx=head_idx,
@@ -963,11 +1037,12 @@ def _layer11_ax_byte1_dump_carry_head_spec(
 
 
 def make_layer11_ax_byte1_dump_carry_op(enable: bool = False) -> Operation:
-    """L11 attn head 2: re-supply the AX byte-1 H1 one-hot on carried steps.
+    """L12 attn head 0: re-supply the AX byte-1 H1 one-hot on carried steps.
 
     The H1 cross-step SSA split that lands the AX byte-1 DUMP carry. See the
     module-level comment above for the root, the proof that no ``H1``-writing
-    head can be scheduled, and the geometry.
+    head can be scheduled, and the geometry. (Function name keeps the
+    ``layer11`` prefix for registration stability; the head is hosted on L12.)
 
     ``enable`` defaults to ``False``: the bake is a no-op so the production
     build is byte-identical, but the Operation is always registered so its
@@ -980,43 +1055,50 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = False) -> Operation:
             return
         proxy = _as_setdim_proxy(dim_positions)  # noqa: F841 (parity w/ peers)
         attn = block.attn
-        allocator = _allocate_layer11_ax_byte1_dump_carry_heads()
-        attn._l11_ax_byte1_dump_carry_head_allocator = allocator
+        allocator = _allocate_layer13_ax_byte1_dump_carry_heads()
+        attn._l13_ax_byte1_dump_carry_head_allocator = allocator
         head_idx = allocator.heads()[-1].head_idx
         HD = attn.W_q.shape[0] // attn.num_heads
-        spec = _layer11_ax_byte1_dump_carry_head_spec(
+        spec = _layer13_ax_byte1_dump_carry_head_spec(
             dim_positions, head_idx,
         )
         Primitives.generate_attention_head(attn, spec, HD)
 
     def _ir(dim_positions, HD) -> CompilerIR:
         del HD
-        allocator = _allocate_layer11_ax_byte1_dump_carry_heads()
+        allocator = _allocate_layer13_ax_byte1_dump_carry_heads()
         head_idx = allocator.heads()[-1].head_idx
-        spec = _layer11_ax_byte1_dump_carry_head_spec(dim_positions, head_idx)
+        spec = _layer13_ax_byte1_dump_carry_head_spec(dim_positions, head_idx)
         ir = CompilerIR()
         if enable:
             ir.layer(0).attention.append(
-                spec, name="layer11_ax_byte1_dump_carry.head_2",
+                spec, name="layer13_ax_byte1_dump_carry.head_6",
             )
         return ir
 
     return Operation(
-        name="layer11_ax_byte1_dump_carry",
+        name="layer13_ax_byte1_dump_carry",
         # Q anchors on ADDR_B0_LO+5 (byte-1 predictor signature) + AX_CARRY
         # (gate). K matches the prev fresh byte-1 row. V reads the prev step's
         # H1 one-hot cross-step (``H1.*.-1`` -> no same-step back-edge). O
         # writes ``H1_DUMP`` (same-slot alias of H1, distinct dep identity ->
         # no edge from the 54 same-step H1 readers). THIS is the cycle break.
-        reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1.*.-1"},
+        # H1 (same-step) is read on the K side as a one-hot-presence
+        # discriminator (prefer the prev fresh predictor that HOLDS the one-hot
+        # over the current empty one). This makes the head one of the 54 H1
+        # readers but does NOT cycle: it WRITES H1_DUMP (read by nobody), so no
+        # back-edge into any H1 / AX_CARRY producer is created. ``H1.*.-1`` is
+        # the V-side cross-step read of the prev step's one-hot to copy forward.
+        reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1", "H1.*.-1"},
         writes={"H1_DUMP"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_ir,
-        # Bind to the L11 FFN dep anchor so the head lands on the L11 attn
-        # block (physical block 14, read point = after block 13 where the
-        # AX_CARRY gate has crystallised and the prev-step one-hot is held).
-        target_op_name="_layer11_ffn_dep_anchor",
+        # Bind to the L12 FFN dep anchor so the head lands on the L12 attn
+        # block (physical block 15, all 8 heads free at bake AND runtime). The
+        # L12 read point (after block 14) still sees the crystallised AX_CARRY
+        # gate and the held prev-step H1 one-hot.
+        target_op_name="_layer13_mem_addr_anchor",
         migrated=True,
         declarative_authority="spec_generated",
         smoke_tests={"all"},

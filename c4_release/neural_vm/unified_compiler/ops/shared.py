@@ -773,8 +773,13 @@ def declare_setdim_compat_dims(
         "BZ_TARGET_FRESH",
     ]
     # 7-dim threshold head outputs (one per marker type)
+    # H1_DUMP is a same-position alias of H1 (slots 67..73) declared AFTER
+    # H1 so the alias machinery picks up H1's resolved position. The AX
+    # byte-1 DUMP carry head writes the re-supplied byte-1 H1 one-hot here
+    # on carried steps; distinct name keeps it off the 54 same-step H1
+    # readers' dep-graph edges. See _ALIAS_OF below.
     seven_dim = ["H0", "H1", "H2", "H3", "H4", "H5", "H6", "H7",
-                 "L1H0", "L1H1", "L1H2", "L1H4", "L2H0"]
+                 "L1H0", "L1H1", "L1H2", "L1H4", "L2H0", "H1_DUMP"]
     # 16-dim nibble groups
     sixteen_dim = ["EMBED_LO",
                    "EMBED_HI",
@@ -825,6 +830,12 @@ def declare_setdim_compat_dims(
     # is declared. See docs/B9_OUTPUT_HI_SPLIT_SPEC.md §6.4.
     _ALIAS_OF = {
         "OUTPUT_HI_THIS_STEP": "OUTPUT_HI",
+        # AX byte-1 DUMP carry: H1_DUMP shares H1's 7 slots (67..73). The
+        # carry head writes the re-supplied byte-1 one-hot here on carried
+        # steps; the LM head reads the physical slots so emission is
+        # byte-identical, while the distinct name avoids the H1-write
+        # 2-cycle. See vm_step.py:_SetDim.H1_DUMP.
+        "H1_DUMP": "H1",
         # Phase 9.C: all ``*_PREV_STEP`` aliases (OUTPUT_HI/LO, TEMP,
         # ADDR_KEY, ALU_LO, AX_CARRY_{LO,HI}, EMBED_{LO,HI}, ADDR_B*_*,
         # CARRY, CMP, OP_LEV, OPCODE_BYTE_LO) were retired now that

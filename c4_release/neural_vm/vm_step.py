@@ -2206,6 +2206,18 @@ class _SetDim:
     # Thresholds: [3.5, 4.5, 5.5, 9.5, 10.5, 14.5, 15.5, 19.5]
     H0 = 60
     H1 = 67
+    # AX byte-1 DUMP carry alias: a distinct dim NAME sharing H1's 7 slots
+    # (67..73). The per-step byte-1 register DUMP carry head (logical L11,
+    # ``make_layer11_ax_byte1_dump_carry_op``) WRITES the re-supplied H1
+    # one-hot here on carried (non-AX-writing) steps. Mirrors the
+    # OUTPUT_HI -> OUTPUT_HI_THIS_STEP split: same numeric base so the LM
+    # head (which reads physical slots 67..73 for byte-1 emission) sees a
+    # byte-identical residual, while the DISTINCT name keeps the carry
+    # head out of the dep-graph edge set of the 54 same-step ``H1``
+    # readers -- the write -> read back-edge that forms the unbreakable
+    # 2-cycle when the carry head writes base ``H1``. See
+    # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
+    H1_DUMP = 67  # alias of H1
     H2 = 74
     H3 = 81
     H4 = 88
