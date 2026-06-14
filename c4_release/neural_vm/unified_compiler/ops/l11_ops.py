@@ -1966,7 +1966,26 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     W = 7
     # Row signature + carried flag (both bounded). A balanced AND that needs
     # BOTH the STACK0-marker row AND the carried flag.
-    SIG_W = 2.0       # MARK_STACK0 ~ 1.0 on the row -> +2.0
+    #
+    # MARK_STACK0 is a HARD ROW PREREQUISITE, not a swampable +2 anchor. The
+    # SHARP/CARRIED gate terms are each ~100 (the flag values are ~100, not 1),
+    # so a +2 MARK_STACK0 weight is overwhelmed: a row with a clean PREV one-hot
+    # but MARK_STACK0=0 (e.g. a JSR step-0 PC *byte* row whose entry PC >= 256 —
+    # the rec_fib cluster, target idx 32 -> PC 258 — where STACK0_B0_SHARP
+    # spuriously leaks ~128 onto the PC byte rows and NOT_CMP=0 so it is not
+    # blocked) cleared the +7 threshold on SHARP alone (3*128 = 385 >> 7) and the
+    # L25-tail dump nuked OUTPUT_HI to ~6.9e8, corrupting the PC byte 1/2/3
+    # emission -> step-0 divergence. EVERY genuine dump-fire row has
+    # MARK_STACK0 == 1.00 (the STACK0-marker row signature); the over-fire rows
+    # have MARK_STACK0 == 0. We make MARK_STACK0 a hard prerequisite by adding a
+    # large fixed weight ``SIG_HARD`` AND raising the threshold by the SAME
+    # amount: a MARK_STACK0=1 row nets ``+SIG_HARD - SIG_HARD = 0`` (gate margin
+    # BYTE-IDENTICAL to before, so every if/bool/expr framing-drift fire is
+    # preserved) while a MARK_STACK0=0 row sits ``-SIG_HARD`` below threshold
+    # (hard-blocked, regardless of SHARP). Mirrors the AX byte-1 dump's
+    # ADDR_B1_HI hard-prerequisite fix (PC_BYTE23_STEP0_FRAMING_DRIFT doc).
+    SIG_W = 2.0       # MARK_STACK0 ~ 1.0 on the row -> +2.0 (margin anchor)
+    SIG_HARD = 1_000.0  # MARK_STACK0 hard-prerequisite component (threshold-matched)
     CARRIED_W = 3.0   # STACK0_B0_CARRIED ~ 1.0 on a carried row -> +3.0
     marker_blockers = (
         ("MARK_AX", -1_000.0),
@@ -2004,25 +2023,31 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     NOT_CMP_BLOCK_W = -1_000.0
     if _repoint_on:
         conditions = (
-            ("MARK_STACK0", SIG_W),
+            # MARK_STACK0 hard prerequisite: SIG_W margin + SIG_HARD prereq,
+            # the SIG_HARD is cancelled by the matched +SIG_HARD threshold bump
+            # on a MARK_STACK0=1 row (byte-identical) and blocks MARK_STACK0=0.
+            ("MARK_STACK0", SIG_W + SIG_HARD),
             ("STACK0_B0_CARRIED", CARRIED_W),
             ("STACK0_B0_SHARP", SHARP_W),
             ("STACK0_B0_NOT_CMP", NOT_CMP_BLOCK_W),
         ) + marker_blockers
-        # 3-way AND + NON-COMPARISON blocker: a carried clean-carry COMPARISON
-        # row -> 2 + 3*100 + 3*100 + 0 = 602 > 7 (fires); an ARITHMETIC/JMP
-        # result row -> NOT_CMP ~ 100 -> 602 - 1000*100 << 7 (dark — fixes the
-        # over-fire); a carried SMEAR row -> SHARP = 0 -> 302 (still fires unless
-        # NOT_CMP blocks, which the arith/jmp result IS); a fresh row ->
-        # CARRIED = 0 -> 302 (carried/sharp ~100 so the additive AND is loose;
-        # the carried/sharp/marker/NOT_CMP terms gate it, not a tight margin).
-        dump_threshold = 7.0
+        # 3-way AND + NON-COMPARISON blocker + MARK_STACK0 hard prerequisite:
+        # a carried clean-carry COMPARISON row -> 1000+2 + 3*100 + 3*100 + 0 =
+        # 1602 > 1007 (fires, margin == the legacy 602 vs 7); an ARITHMETIC/JMP
+        # result row -> NOT_CMP ~ 100 -> << 1007 (dark — fixes the over-fire);
+        # a carried SMEAR row -> SHARP = 0 -> 1302 (still fires unless NOT_CMP
+        # blocks); a fresh STACK0 row -> CARRIED = 0 -> 1302 (still fires, as
+        # before); a NON-STACK0 byte row (MARK_STACK0=0, e.g. the rec entry-PC>=
+        # 256 PC byte rows) -> 0 + ... <= 391 << 1007 (HARD-BLOCKED regardless of
+        # the leaked SHARP). The +SIG_HARD weight is matched by the +SIG_HARD
+        # threshold so every MARK_STACK0=1 gate margin is unchanged.
+        dump_threshold = 7.0 + SIG_HARD
     else:
         conditions = (
-            ("MARK_STACK0", SIG_W),
+            ("MARK_STACK0", SIG_W + SIG_HARD),
             ("STACK0_B0_CARRIED", CARRIED_W),
         ) + marker_blockers
-        dump_threshold = 4.0
+        dump_threshold = 4.0 + SIG_HARD
     rules: list[FFNRule] = []
     # Low-nibble lives in H1 (PREV idx = lo+2), high-nibble in H3 (idx = hi+4):
     # the carry head copied the prev step's registry-H1/H3 one-hots into the

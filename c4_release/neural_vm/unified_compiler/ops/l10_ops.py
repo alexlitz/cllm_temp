@@ -6850,6 +6850,22 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # tail_pc_byte0_1a_* family but the conditions here were not
                 # gated against OP_JSR.
                 ("OP_JSR", -1000000.0),
+                # E3 follow-up (rec entry PC>=256): the OP_JSR blocker above is
+                # INERT here -- OP_JSR is 0 on the PC *marker* row (the opcode
+                # is not propagated to it). On a JSR step 0 whose target index
+                # is >= 16 (entry PC >= 256, e.g. rec_fib target idx 32), the L6
+                # JSR override emits the byte-0 high nibble into
+                # OUTPUT_HI_THIS_STEP+0 at the FETCH_PC_MARKER_AMP-amplified
+                # magnitude (~258), which CLEARS threshold 250 on the
+                # +1.0 OUTPUT_HI_THIS_STEP+0 term ALONE (OP_BZ=0, FETCH_LO+3=0).
+                # The rule then stamps byte0=0x1A over the correct 0x02. The
+                # decisive discriminator is the FETCH HIGH NIBBLE: a genuine
+                # taken branch to instruction index 3 (the only legitimate 0x1A
+                # target) has high nibble 0 (FETCH_HI+0 only); a JSR/branch to
+                # index >= 16 has FETCH_HI+{>=1}. Hard-block every non-zero high
+                # nibble so OUTPUT_HI alone can never fire it; byte-identical for
+                # the genuine index-3 branch (FETCH_HI+{>=1} == 0 there).
+                *(("FETCH_HI+%d" % k, -1000000.0) for k in range(1, 16)),
             ),
             threshold=250.0,
             writes=Primitives.byte_value_writes(0x1A, strength=5000.0),
@@ -6880,6 +6896,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_MEM", -1000000.0),
                 # E3 fix: see _bz variant above.
                 ("OP_JSR", -1000000.0),
+                # E3 follow-up (rec entry PC>=256): see the _bz variant. The
+                # OP_JSR blocker is inert on the marker row; the JSR override's
+                # amplified OUTPUT_HI_THIS_STEP+0 (~258) clears threshold 250
+                # alone. Hard-block non-zero FETCH high nibbles so only a
+                # genuine index-3 (FETCH_HI+0) branch can fire it.
+                *(("FETCH_HI+%d" % k, -1000000.0) for k in range(1, 16)),
             ),
             threshold=250.0,
             writes=Primitives.byte_value_writes(0x1A, strength=5000.0),
