@@ -3,6 +3,31 @@
 from ..ir import CompilerIR
 from ..layer_compiler import Operation
 from .shared import _as_setdim_proxy, _make_alu_postop_attach_op, _ensure_l11_mul_module
+from .shared import mul_width2_enabled
+from .residual_band_registry import register_residual_band
+
+
+# ---------------------------------------------------------------------------
+# Op-local residual-band declaration: width=2 MUL byte-1 result band.
+# ---------------------------------------------------------------------------
+# ``make_efficient_l11_alumul_wrap_op`` (below) bakes ``wide_mul_rules(
+# width_bytes=2)`` which writes the product's BYTE 1 into this dedicated
+# MUL_RESULT_HI_LO/HI band (nib2 -> _LO, nib3 -> _HI; NOT OUTPUT_LO+32 =
+# ADDR_KEY); ``make_layer13_mul_result_hi_relay_op`` (l13_ops) then stages it
+# into AX_FULL. Flag-gated on ``C4_MUL_WIDTH2`` (DEFAULT-ON): registered with a
+# ``flag=mul_width2_enabled`` predicate so a flag-off build omits the band
+# entirely (byte-identical pre-width2 d_model). NOT ``never_share`` (the band's
+# lifetime is single-step result staging, safe for liveness merge). The auto-
+# widen in ``compile_full_vm_dynamic`` rounds the +32 dims head-dim-preservingly
+# (base head_dim 109, adds heads). See docs/MUL_WIDTH2_WIDEN_2026_06_13.md.
+register_residual_band(
+    "MUL_RESULT_HI_LO", 16, owner="make_efficient_l11_alumul_wrap_op",
+    flag=mul_width2_enabled,
+)
+register_residual_band(
+    "MUL_RESULT_HI_HI", 16, owner="make_efficient_l11_alumul_wrap_op",
+    flag=mul_width2_enabled,
+)
 
 
 def _mark_structural_declarations(op: Operation) -> Operation:

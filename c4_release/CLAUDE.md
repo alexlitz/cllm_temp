@@ -94,6 +94,32 @@ migrations, or `pin=None` once the layer's Phase 7.B wave is in.
   aliases — two ops writing the same `head_idx` in the same layer is a
   hard error.
 
+## Op-local residual bands (over-width families)
+
+An op that needs a FRESH residual band past the natural d_model (an
+"over-width" family like the AX byte-1 carry, the Root 2 STACK0 byte-0
+carry, or the width=2 MUL result) declares it **op-locally** — never by
+hand-editing a shared dict. At the top of the op's `lN_ops.py` module:
+
+```python
+from .residual_band_registry import register_residual_band
+register_residual_band("MY_BAND", 7, owner="make_my_op",
+                       flag=None, never_share=True)
+```
+
+[`ops/residual_band_registry.py`](neural_vm/unified_compiler/ops/residual_band_registry.py)
+populates a module-level registry at import time;
+`compile_full_vm_dynamic` AUTO-COLLECTS every active band
+(`collect_registered_residual_bands`) and feeds the union into the SAME
+head-dim-preserving auto-widen + cache keys + `_LIVENESS_NEVER_SHARE`. A
+`flag=<zero-arg predicate>` band is collected only when the flag is on
+(flag-off → byte-identical smaller d_model); a `never_share=True` band
+keeps a private dim-liveness slot. **A new band-adding op never touches
+`full_vm_compiler_dynamic.py` or `layer_compiler.py`** — this is what
+eliminates the cross-lane merge conflict. Full API + the legacy
+`_PRODUCTION_EXTRA_RESIDUAL_DIMS` migration:
+[`docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md`](docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md).
+
 ## Verification + sweep tools
 
 Run these BEFORE committing any new op or rule change:

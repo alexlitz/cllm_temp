@@ -1955,162 +1955,59 @@ def compile_full_vm_dynamic(
                 )
 
     # ------------------------------------------------------------------
-    # UNIFIED extra residual bands — AX byte-1 carry (always) + MUL (gated).
+    # Auto-collect op-local residual bands (replaces the central dict).
     # ------------------------------------------------------------------
-    # Two independent over-width families both route through
-    # ``extra_residual_dims`` so they share the SINGLE head-dim-preserving
-    # auto-widen in ``_bake_from_scheduled_ops`` (``base_head_dim`` captured
-    # from the BASE layout BEFORE any extra band is appended, so the widen
-    # rounds d_model up to a multiple of the BASE head_dim and ADDS heads
-    # instead of repartitioning every existing head — declaring them via
+    # Band-adding ops no longer hand-edit a shared dict here. Each op declares
+    # the over-width residual band(s) it needs LOCALLY, next to the op that
+    # reads/writes them, via ``register_residual_band`` in
+    # ``ops/residual_band_registry.py`` (populated at op-module import time —
+    # ``all_core_ops`` wildcard-imports every ``lN_ops`` module). The registry
+    # is auto-collected here: ``collect_registered_residual_bands`` evaluates
+    # each band's flag predicate FRESH (so flag-off builds omit the band and
+    # stay byte-identical) and returns the union in registration order.
+    #
+    # The current production registry holds: the AX byte-1 carry bands
+    # (``H1_PREV_STEP`` / ``H1_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``, l11_ops,
+    # always present), the Root 2 STACK0 byte-0 carry bands (``STACK0_B0_*``,
+    # l11_ops, always present), and the flag-gated width=2 MUL result band
+    # (``MUL_RESULT_HI_LO/HI``, alu_ops, ``C4_MUL_WIDTH2``-gated). Every band
+    # routes through the SINGLE head-dim-preserving auto-widen in
+    # ``_bake_from_scheduled_ops`` (``base_head_dim`` captured from the BASE
+    # layout BEFORE any extra band is appended, so the widen rounds d_model up
+    # to a multiple of the BASE head_dim and ADDS heads instead of
+    # repartitioning every existing head — declaring them via
     # ``declare_setdim_compat_dims`` would re-derive head_dim from the widened
-    # width and scramble attention content -> regresses test_bnz_branch).
-    # Folding them here also threads them through the disk/in-proc cache key
-    # (which hashes ``extra_residual_dims`` but NOT ``C4_MUL_WIDTH2`` /
-    # ``C4_AX_BYTE1_DUMP`` directly), so flag-on and flag-off builds never
-    # share a serialised cache entry.
+    # width and scramble attention content -> regresses test_bnz_branch). The
+    # collected set flows into the disk/in-proc cache key below (which hashes
+    # ``extra_residual_dims`` but NOT ``C4_MUL_WIDTH2`` / ``C4_AX_BYTE1_DUMP``
+    # directly), so flag-on and flag-off builds never share a serialised entry.
     #
-    # (1) AX byte-1 register-dump cross-step carry (production-default):
-    #     TWO fresh 7-wide bands (each mirrors the 7-wide ``H1`` one-hot):
-    #       * ``H1_PREV_STEP`` — the ``layer13_ax_byte1_dump_carry`` head copies
-    #         the PREVIOUS step's ``H1`` one-hot here UNCONDITIONALLY (via the
-    #         ``H1.*.-1`` SSA cross-step read). Read ONLY by the dump FFN below.
-    #       * ``H1_DUMP_OUT`` — the ``ax_byte1_dump_repopulate`` FFN copies
-    #         ``H1_PREV_STEP`` here ONLY on carried (non-AX-writing) steps, gated
-    #         on the crystallised ``AX_CARRY`` separation (~-988 fresh / ~+2.7
-    #         carried). The LM head reads it via mirrored ``head.weight`` columns
-    #         (``ax_byte1_dump_head_bake``, gated by ``C4_AX_BYTE1_DUMP``), so
-    #         the byte-1 emission additively picks up the carried high-byte
-    #         one-hot on carried steps and is UNTOUCHED on fresh steps (where
-    #         ``H1_DUMP_OUT`` is all-zero).
-    #     Writing a SEPARATE emission band (not ``H1`` directly) is what avoids
-    #     the 2-cycle: a late FFN that wrote ``H1`` while reading ``AX_CARRY``
-    #     would cycle (``layer6_routing_ffn`` reads ``H1`` AND writes
-    #     ``AX_CARRY``). Both bands are read by nobody upstream, so no back-edge
-    #     is created. The bands are ALWAYS present (production-default residual
-    #     geometry) regardless of ``C4_AX_BYTE1_DUMP``; only the LM-head
-    #     emission columns are flag-gated.
-    #
-    # (2) width=2 MUL (gated on ``C4_MUL_WIDTH2``): a dedicated byte-1 result
-    #     band ``MUL_RESULT_HI_LO/HI`` (16+16 dims) for the 8-bit x 8-bit ->
-    #     16-bit product. See docs/MUL_WIDTH2_WIDEN_2026_06_13.md and memory
-    #     note ``project_mul_div_mod_arch_blocked``.
-    #
-    # The COMBINED widen (14 AX dims always + 32 MUL dims when enabled) rounds
-    # head-dim-preservingly (base head_dim 109): 872 -> 981 (AX-only, n_heads
-    # 8 -> 9) or 872 -> 981 when MUL is also on (the 46 extra dims still fit
-    # within the +109-dim added head). All existing dims are
+    # The COMBINED widen (14 AX/Root2-flag dims + 28 Root2 PREV/DUMP dims always
+    # + 32 MUL dims when enabled) rounds head-dim-preservingly (base head_dim
+    # 109): 872 -> 981 (n_heads 8 -> 9). All existing dims are
     # byte-behaviour-identical (every new band is zero on every row the prior
-    # model touched). Threaded by NAME via ``layout.dim_positions`` -- they
-    # must NOT be op-declared ``declare_dim``s.
-    # ``AX_CARRY_OVERFLOW`` (1) is the band-pass UPPER-cut kill flag: the
-    # precursor ``ax_byte1_carry_overflow_flag`` FFN writes a step indicator
-    # here (0 in the carry band, large-positive for SHL/JMP) that the dump FFN
-    # reads as a strong negative AND condition. It excludes the over-fire step
-    # classes (SHL Σ AX_CARRY ~+12.85, JMP ~+47.86) that a single LOWER-bound
-    # threshold cannot. Always present (the precursor + dump are baked
-    # unconditionally; only the LM-head emission is C4_AX_BYTE1_DUMP-gated).
-    _PRODUCTION_EXTRA_RESIDUAL_DIMS = {
-        "H1_PREV_STEP": 7, "H1_DUMP_OUT": 7, "AX_CARRY_OVERFLOW": 1,
-        # (3) STACK0 byte-0 cross-step emission carry (Root 2, production-default
-        #     geometry). The STACK0 byte-0 (stack-top low byte) emission one-hot
-        #     lives in the LM-head H1 (high nibble) + H3 (low nibble) bands. It
-        #     is decoded FRESH at the PSH step (block 6) but is ABSENT / smeared
-        #     and then nuked to ~-289M by the L21 + L25-tail correctors on the
-        #     NEXT (carried) comparison step -> the byte-0 value token is
-        #     suppressed to ~-100M and a marker ([PC]) wins, so the model emits a
-        #     spurious extra register block (57-token step) and the fixed-35
-        #     slicer misreads the PC ("framing drift" — the if/bool/expr step-3
-        #     full-trace fails). Mirrors the AX-byte-1 carry:
-        #       * ``STACK0_B0_H1_PREV`` / ``STACK0_B0_H3_PREV`` — the carry head
-        #         copies the PREVIOUS step's clean STACK0-marker H1/H3 one-hot
-        #         here UNCONDITIONALLY (via ``H1.*.-1`` / ``H3.*.-1`` SSA
-        #         cross-step reads). Read ONLY by the dump FFN.
-        #       * ``STACK0_B0_DUMP_H1`` / ``STACK0_B0_DUMP_H3`` — the dump FFN
-        #         copies the PREV bands here on a carried STACK0-marker row
-        #         (gated on the byte-0 one-hot being ABSENT). The LM head reads
-        #         them via mirrored byte-token columns (gated by
-        #         ``C4_STACK0_B0_DUMP``), so the byte-0 emission additively picks
-        #         up the carried one-hot on carried steps and is UNTOUCHED on
-        #         fresh steps (where the dump bands are all-zero).
-        #     Writing SEPARATE emission bands (not H1/H3 directly) avoids the
-        #     L21/L25 corruption entirely: those correctors clobber the H1/H3
-        #     band, but the LM head reads the carried value from the private dump
-        #     bands they never touch. All four are read by nobody upstream -> no
-        #     back-edge. Always present (production-default geometry); only the
-        #     LM-head dump columns are ``C4_STACK0_B0_DUMP``-gated.
-        "STACK0_B0_H1_PREV": 7, "STACK0_B0_H3_PREV": 7,
-        "STACK0_B0_DUMP_H1": 7, "STACK0_B0_DUMP_H3": 7,
-        # Bounded carried-step flag (Root 2): a precursor FFN on the L25 tail
-        # writes ``STACK0_B0_CARRIED = step(-Σ H1 >= 1.0)`` -- it fires when the
-        # STACK0-marker row's same-step H1 byte-0 one-hot has been NUKED to the
-        # ~-289M garbage by the L25 corruptor (a CARRIED step) and is dark when
-        # H1 holds the clean small-positive one-hot (a FRESH PSH step). The dump
-        # FFN gates on this BOUNDED flag instead of reading the unbounded
-        # (corrupted) H1/H3 directly -- a raw negative-weighted H1 condition
-        # would drive the silu gate to ~+10^9 and write garbage into the DUMP
-        # band. Same role as ``AX_CARRY_OVERFLOW`` for the AX carry.
-        "STACK0_B0_CARRIED": 1,
-        # Bounded PREV-sharpness flag (Root 2 re-point no-regress gate): a
-        # precursor FFN writes ``STACK0_B0_SHARP = OR_j step(PREV+j - Σ_{k≠j}
-        # PREV+k >= thr)`` -- it fires only when the carried byte-0 ``H1``/``H3``
-        # one-hot the carry head copied into the PREV band is a CLEAN single-slot
-        # one-hot (the if/bool/expr framing-drift case: ~160 at one slot, ~0
-        # elsewhere) and is DARK when PREV is SMEARED (a multi-byte arithmetic
-        # result like add_16bit: ~85 across all slots, where the carry head had
-        # no single prev STACK0 byte to copy). The dump's DIRECT H1/H3 re-point
-        # ANDs this flag so it fires ONLY on the genuinely-corrupted framing-drift
-        # rows and stays a NO-OP on healthy multi-byte emissions (which would
-        # otherwise be corrupted by re-supplying a smeared one-hot).
-        "STACK0_B0_SHARP": 1,
-        # Bounded RATIO-based PREV-dominant flag (Root 2 default-ON smear gate).
-        # ``STACK0_B0_SHARP`` uses an ABSOLUTE per-slot margin (>=100) so it MISSES
-        # a CLEAN one-hot whose magnitude is small (a comparison result byte 0x01,
-        # PREV ~6, CLEAN but SHARP = 0). A magnitude-independent RATIO test fires on
-        # a clean one-hot of ANY size and is DARK on a smear (add_16bit). The
-        # NON-COMPARISON blocker's smear rule reads this so it darkens the add_16bit
-        # smear WITHOUT darkening small comparison results (which a raw SHARP=0 test
-        # wrongly blocked -> if_gt 17 -> 9). Written by the
-        # ``stack0_byte0_prev_dom_flag`` precursor; read by
-        # ``stack0_byte0_not_cmp_flag``.
-        "STACK0_B0_PREV_DOM": 1,
-        # Bounded NON-COMPARISON blocker flag (Root 2 default-ON discriminator).
-        # The framing-drift rows the dump must re-emit are COMPARISON results; the
-        # rows it must NOT touch are ARITHMETIC results (add_16bit), JMP transfers
-        # (jmp_forward), AND the operand/PSH SETUP rows of an arithmetic program
-        # (e.g. the 2-byte mul intermediate). The discriminator is a clean per-step
-        # opcode the prior session missed: it read the STATIC 872-dim registry
-        # opcode dims (OP_GT=282 ...) which mismap onto the WIDENED 981-dim build
-        # (OP_GT=204, OP_BZ=32 ...) and so always saw constant garbage. Reading the
-        # WIDENED dim_positions, the genuine drift rows carry a COMPARISON opcode at
-        # the compare step (OP_GT/LT/EQ/... ~ 0.11) and a consuming-BRANCH opcode at
-        # the fused branch step (OP_BZ/BNZ ~ 0.08..0.50), while EVERY other carried
-        # row (arith result, arith setup, JMP) has NONE (probe_stack0_smoke_gate.py
-        # / probe_stack0_arithgate.py, spec_k=0). A precursor FFN writes
-        # ``STACK0_B0_NOT_CMP = 1`` when NO cmp/branch opcode is present and 0 on a
-        # comparison/branch row; the re-point dump reads it as a -1000 BLOCKER so it
-        # fires ONLY on the drift rows. THIS is the discriminator that lets the
-        # carry go default-ON (smoke 51/0): it darkens the add_16bit + jmp_forward +
-        # mul over-fire the flag-ON build regressed. A POSITIVE comparison
-        # requirement (not a NOT-arith blocker) is required because the gate's
-        # CARRIED + SHARP terms are each ~100 (so any clean-PREV row fires unless
-        # strongly blocked) AND a NOT-arith blocker misses the arith SETUP rows.
-        # Mirrors the SHARP / CARRIED bounded precursors.
-        "STACK0_B0_NOT_CMP": 1,
-    }
-    # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the production-default
-    # bands (A/B diagnostics only — the carry ops then reference undeclared
-    # dims, so this is for layout/geometry comparison, not a runnable build).
+    # model touched). Threaded by NAME via ``layout.dim_positions`` -- they must
+    # NOT be op-declared ``declare_dim``s. To add a new band-adding op, call
+    # ``register_residual_band`` at that op's module top — never touch this file.
+    # See docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md.
+    from .ops.residual_band_registry import (
+        collect_registered_residual_bands,
+        collect_never_share_band_names,
+    )
+    _merged_extra = collect_registered_residual_bands()
+    # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the auto-collected
+    # production bands (A/B diagnostics only — the carry ops then reference
+    # undeclared dims, so this is for layout/geometry comparison, not a runnable
+    # build). The caller-passed / env ``extra_residual_dims`` below is preserved.
     if os.environ.get("C4_DISABLE_AX_CARRY_BANDS") == "1":
-        _PRODUCTION_EXTRA_RESIDUAL_DIMS = {}
-    _merged_extra = dict(_PRODUCTION_EXTRA_RESIDUAL_DIMS)
-    from .ops.shared import mul_width2_enabled
-    if mul_width2_enabled():
-        _merged_extra["MUL_RESULT_HI_LO"] = 16
-        _merged_extra["MUL_RESULT_HI_HI"] = 16
+        _merged_extra = {}
     if extra_residual_dims:
         _merged_extra.update(extra_residual_dims)
     extra_residual_dims = _merged_extra or None
+    # Carry/dump bands that must keep a private dim-liveness slot — threaded
+    # into the compiler's never-share set inside ``_bake_from_scheduled_ops``
+    # (no class-level ``_LIVENESS_NEVER_SHARE_NAMES`` hand-edit needed).
+    _never_share_band_names = collect_never_share_band_names()
 
     from ..config import get_config
     vm_config = get_config()
@@ -2350,6 +2247,7 @@ def compile_full_vm_dynamic(
         d_model_packing=d_model_packing,
         d_model_packing_target=d_model_packing_target,
         extra_residual_dims=extra_residual_dims,
+        never_share_band_names=_never_share_band_names,
     )
 
     # Post-compile shape rebuild. When the caller hands in
@@ -2638,6 +2536,7 @@ def _bake_from_scheduled_ops(
     d_model_packing: bool = False,
     d_model_packing_target: Optional[int] = None,
     extra_residual_dims: Optional[Mapping[str, int]] = None,
+    never_share_band_names: Optional[Set[str]] = None,
 ):
     """Run the unchanged static compile/bake pipeline against ``scheduled``.
 
@@ -2758,6 +2657,12 @@ def _bake_from_scheduled_ops(
     # ``layer13_mul_result_hi_relay``. Both are resolved post-loop.
     if extra_residual_dims:
         compiler.pending_extra_dims.update(extra_residual_dims.keys())
+    # Thread the op-local registry's ``never_share`` band names into this
+    # compile's dim-liveness allocator so carry/dump bands keep PRIVATE slots
+    # (replaces the hand-listed class-level ``_LIVENESS_NEVER_SHARE_NAMES``
+    # entries). See ``ops/residual_band_registry.py``.
+    if never_share_band_names:
+        compiler.add_never_share_names(never_share_band_names)
     for op in scheduled:
         compiler.add_op(op)
 

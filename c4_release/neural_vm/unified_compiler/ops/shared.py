@@ -1030,11 +1030,14 @@ def declare_setdim_compat_dims(
     # ------------------------------------------------------------------
     # The dedicated high-byte result band for the width=2 (8-bit x 8-bit
     # -> 16-bit) MUL (MUL_RESULT_HI_LO/HI; nib2 -> _LO, nib3 -> _HI) is NO
-    # LONGER declared here. When ``C4_MUL_WIDTH2=1`` it is injected into
-    # ``extra_residual_dims`` at the top of ``compile_full_vm_dynamic`` so
-    # the d_model widen is HEAD-DIM-PRESERVING (the auto-widen captures the
-    # base head_dim BEFORE the extra bands are declared and rounds up to a
-    # multiple of it, ADDING heads instead of repartitioning existing ones).
+    # LONGER declared here. It is now declared OP-LOCALLY (next to the wide_mul
+    # op in ``ops/alu_ops.py``) via ``register_residual_band(..., flag=
+    # mul_width2_enabled)`` and AUTO-COLLECTED into ``extra_residual_dims`` at
+    # the top of ``compile_full_vm_dynamic`` (see
+    # ``ops/residual_band_registry.py``) so the d_model widen is
+    # HEAD-DIM-PRESERVING (the auto-widen captures the base head_dim BEFORE the
+    # extra bands are declared and rounds up to a multiple of it, ADDING heads
+    # instead of repartitioning existing ones).
     # Declaring it here ran BEFORE the base_head_dim capture and re-derived
     # head_dim from the widened width, scrambling attention -> regressed
     # test_bnz_branch. See ``compile_full_vm_dynamic`` and

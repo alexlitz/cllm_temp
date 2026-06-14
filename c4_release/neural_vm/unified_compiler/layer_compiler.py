@@ -1185,6 +1185,12 @@ class LayerCompiler:
         # (e.g. the AX byte-1 carry bands) whose tail placement must be
         # computed from the FULL op-dim layout, not the compat-dims-only one.
         self.pending_extra_dims: set = set()
+        # Extra never-share residual-band names threaded in at compile time
+        # (op-local declarations from ``ops/residual_band_registry.py``). These
+        # are unioned with the class-level ``_LIVENESS_NEVER_SHARE_NAMES`` by
+        # ``_liveness_never_share`` so an op-declared carry/dump band keeps a
+        # private dim-liveness slot WITHOUT being hand-added to the class set.
+        self._extra_never_share_names: Set[str] = set()
         self._op_by_name: Dict[str, Operation] = {}
         # Block-level and model-level ops are bake-only; they don't participate
         # in dim-position allocation, so they're held separately.
@@ -1203,6 +1209,17 @@ class LayerCompiler:
         # the metrics report in ``liveness_savings_report``.
         self.liveness_slots: List[Dict[str, Any]] = []
         self.liveness_stats: Dict[str, Any] = {}
+
+    def add_never_share_names(self, names) -> None:
+        """Register extra residual-band names that must keep a private slot.
+
+        Used by ``compile_full_vm_dynamic`` to thread the op-local
+        residual-band registry's ``never_share`` names (see
+        ``ops/residual_band_registry.py``) into this compile's dim-liveness
+        allocator WITHOUT hand-editing the class-level
+        ``_LIVENESS_NEVER_SHARE_NAMES`` set. Accepts any iterable of dim names.
+        """
+        self._extra_never_share_names.update(names)
 
     def declare_dim(self, name: str, size: int, pinned: Optional[int] = None,
                     alias_of: Optional[str] = None):
@@ -2405,49 +2422,15 @@ class LayerCompiler:
         "SE_CMP", "SE_CMP_GROUP",
         "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT",
         "SE_OP_GT", "SE_OP_LE", "SE_OP_GE",
-        # AX byte-1 register-dump carry bands. ``H1_PREV_STEP`` carries the
-        # prev step's H1 one-hot from the L13 carry head to the L25 dump FFN
-        # (multi-block lifetime); ``H1_DUMP_OUT`` carries the re-supplied
-        # one-hot from the L25 dump FFN to the LM head. Both must keep PRIVATE
-        # slots: a liveness merge onto a same-width donor whose lifetime
-        # "ended" leaves the donor's residue in the shared slot (observed:
-        # H1_DUMP_OUT shared slot 323 returned a stale 1.0 instead of the
-        # carried one-hot), corrupting the byte-1 emission. See
-        # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
-        "H1_PREV_STEP", "H1_DUMP_OUT",
-        # AX byte-1 dump band-pass UPPER-cut kill flag. Written by the
-        # ``ax_byte1_carry_overflow_flag`` precursor FFN and read by the dump
-        # FFN on the SAME L25 tail block — a short but cross-op lifetime; keep
-        # it private so a liveness merge can't clobber the kill signal.
-        "AX_CARRY_OVERFLOW",
-        # STACK0 byte-0 cross-step emission carry bands (Root 2). Same private-
-        # slot requirement as the H1_PREV_STEP/H1_DUMP_OUT pair: the carry head
-        # writes the PREV bands (multi-block lifetime to the L25 dump FFN) and
-        # the dump FFN writes the DUMP bands (read by the LM head). A liveness
-        # merge onto a same-width donor whose lifetime "ended" would leave the
-        # donor's residue in the shared slot and corrupt the carried byte-0
-        # one-hot. See docs (Root 2 STACK0 byte-0 dump carry).
-        "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
-        "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
-        # Bounded carried-step flag (Root 2 band-pass): written by the
-        # ``stack0_byte0_carried_flag`` precursor and read by the dump FFN on
-        # the SAME L25 tail block. Private slot so a liveness merge can't
-        # clobber the carried signal.
-        "STACK0_B0_CARRIED",
-        # Bounded PREV-sharpness flag (Root 2 re-point gate): written by the
-        # ``stack0_byte0_sharp_flag`` precursor and read by the dump FFN. Private
-        # slot so a liveness merge can't clobber the sharpness signal.
-        "STACK0_B0_SHARP",
-        # Bounded RATIO-based PREV-dominant flag (Root 2 smear gate): written by
-        # the ``stack0_byte0_prev_dom_flag`` precursor and read by the
-        # NON-COMPARISON blocker on the SAME L25 tail block. Private slot so a
-        # liveness merge can't clobber the magnitude-independent one-hot signal.
-        "STACK0_B0_PREV_DOM",
-        # Bounded NON-COMPARISON blocker flag (Root 2 default-ON gate): written by
-        # the ``stack0_byte0_not_cmp_flag`` precursor and read by the dump FFN on
-        # the SAME L25 tail block. Private slot so a liveness merge can't clobber
-        # the arithmetic-vs-comparison signal that darkens the over-fire rows.
-        "STACK0_B0_NOT_CMP",
+        # NOTE: the AX byte-1 register-dump carry bands (``H1_PREV_STEP`` /
+        # ``H1_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``) and the Root 2 STACK0 byte-0
+        # carry bands (``STACK0_B0_*``) USED to be hand-listed here. They are now
+        # declared OP-LOCALLY with ``never_share=True`` via
+        # ``ops/residual_band_registry.py`` (next to the carry/dump ops that own
+        # them) and threaded into this set per-compile by
+        # ``compile_full_vm_dynamic`` -> ``LayerCompiler.add_never_share_names``.
+        # A new carry/dump band declares ``never_share=True`` at its registration
+        # site and never edits this file. See ``_liveness_never_share``.
     })
 
     def _liveness_never_share(self, name: str) -> bool:
@@ -2462,6 +2445,11 @@ class LayerCompiler:
         correctness.
         """
         if name in self._LIVENESS_NEVER_SHARE_NAMES:
+            return True
+        # Op-local residual-band registry: bands declared with
+        # ``never_share=True`` are threaded in per-compile via
+        # ``add_never_share_names`` (no class-set hand-edit needed).
+        if name in self._extra_never_share_names:
             return True
         for prefix in self._LIVENESS_NEVER_SHARE_PREFIXES:
             if name.startswith(prefix):

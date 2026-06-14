@@ -10,6 +10,84 @@ from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+from .residual_band_registry import register_residual_band
+
+
+# ---------------------------------------------------------------------------
+# Op-local residual-band declarations: AX byte-1 + Root 2 STACK0 byte-0 carry.
+# ---------------------------------------------------------------------------
+# These are PRODUCTION-DEFAULT residual geometry (always present, NOT
+# flag-gated): the carry/dump ops below bake unconditionally; only the LM-head
+# EMISSION columns are flag-gated (``C4_AX_BYTE1_DUMP`` / ``C4_STACK0_B0_DUMP``,
+# both default-ON), and those are model-level head bakes that don't change
+# d_model. Every band passes ``never_share=True`` so the dim-liveness allocator
+# keeps it in a PRIVATE slot — a merge onto a same-width donor whose lifetime
+# "ended" would leave stale residue in the shared slot and corrupt the carried
+# one-hot (observed: H1_DUMP_OUT slot 323 returned a stale 1.0). The registry
+# threads these names into ``LayerCompiler._LIVENESS_NEVER_SHARE`` per-compile.
+# Registration order here is load-bearing: it fixes the tail dim_positions
+# (AX bands, then the four Root 2 PREV/DUMP bands, then the four bounded Root 2
+# flag bands) — byte-identical to the legacy central dict ordering.
+#
+# (1) AX byte-1 register-dump cross-step carry. ``H1_PREV_STEP`` carries the
+#     prev step's H1 one-hot from the L13 carry head to the L25 dump FFN
+#     (``make_layer11_ax_byte1_dump_carry_op`` /
+#     ``make_ax_byte1_dump_repopulate_op``); ``H1_DUMP_OUT`` carries the
+#     re-supplied one-hot from the dump FFN to the LM head; ``AX_CARRY_OVERFLOW``
+#     is the band-pass UPPER-cut kill flag written by
+#     ``make_ax_byte1_carry_overflow_flag_op``. See
+#     docs/AX_BYTE1_DUMP_CARRY_LANDED_2026_06_13.md.
+register_residual_band(
+    "H1_PREV_STEP", 7, owner="make_layer11_ax_byte1_dump_carry_op",
+    never_share=True,
+)
+register_residual_band(
+    "H1_DUMP_OUT", 7, owner="make_ax_byte1_dump_repopulate_op",
+    never_share=True,
+)
+register_residual_band(
+    "AX_CARRY_OVERFLOW", 1, owner="make_ax_byte1_carry_overflow_flag_op",
+    never_share=True,
+)
+# (2) Root 2 STACK0 byte-0 cross-step emission carry. The four PREV/DUMP bands
+#     are the carry-head -> dump-FFN -> LM-head relay
+#     (``make_stack0_byte0_dump_carry_op`` /
+#     ``make_stack0_byte0_dump_repopulate_op``); the four bounded flag bands are
+#     the band-pass gates (``make_stack0_byte0_{carried,sharp,prev_dom,not_cmp}
+#     _flag_op``) that discriminate carried-comparison rows from arithmetic / JMP
+#     over-fire rows. See memory note ``project_1096_first_reliable_baseline``.
+register_residual_band(
+    "STACK0_B0_H1_PREV", 7, owner="make_stack0_byte0_dump_carry_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_H3_PREV", 7, owner="make_stack0_byte0_dump_carry_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_DUMP_H1", 7, owner="make_stack0_byte0_dump_repopulate_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_DUMP_H3", 7, owner="make_stack0_byte0_dump_repopulate_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_CARRIED", 1, owner="make_stack0_byte0_carried_flag_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_SHARP", 1, owner="make_stack0_byte0_sharp_flag_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_PREV_DOM", 1, owner="make_stack0_byte0_prev_dom_flag_op",
+    never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_NOT_CMP", 1, owner="make_stack0_byte0_not_cmp_flag_op",
+    never_share=True,
+)
 
 
 # === L11 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
