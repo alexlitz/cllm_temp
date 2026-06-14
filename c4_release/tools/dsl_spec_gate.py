@@ -678,11 +678,18 @@ def _faithfulness_probe(ctx: GateContext) -> None:
         print(f"  {match:<8} {nm}: oracle byte0=0x{(exp or 0):02x} "
               f"argmax-decode=0x{(got or 0):02x}  "
               f"[expected-cell writers LO={r.lo_writers} HI={r.hi_writers}]")
-    print("\n  FINDING: the argmax decode diverges because OUTPUT one-hot")
-    print("  selection is an attention/softmax phenomenon the interpreter")
-    print("  abstracts away. The gate's authoring verdict therefore uses the")
-    print("  rule-COVERAGE invariant (is the expected nibble written at all),")
-    print("  which the interpreter evaluates faithfully.\n")
+    print("\n  FINDING: the BAG-OF-DIMS DSLInterpreter's argmax decode diverges")
+    print("  because OUTPUT one-hot selection is an attention/softmax phenomenon")
+    print("  THIS gate's interpreter abstracts away. The gate's authoring verdict")
+    print("  therefore uses the rule-COVERAGE invariant (is the expected nibble")
+    print("  written at all), which the bag-of-dims interpreter evaluates faithfully.\n")
+    print("  VALUE-FAITHFUL PATH: the per-token faithful interpreter")
+    print("  (neural_vm/unified_compiler/faithful_interpreter.py) closes exactly")
+    print("  this gap — real per-token positions, softmax1+ALiBi attention, real")
+    print("  SwiGLU, and argmax over the LM head. It decodes byte-for-byte with")
+    print("  the real model (see tools/faithful_interpreter_validate.py). Use it")
+    print("  when you need a VALUE verdict, not just the coverage necessary-")
+    print("  condition this gate reports.\n")
 
 
 # ---------------------------------------------------------------------------
