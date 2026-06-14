@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os
+
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule
@@ -7,6 +9,31 @@ from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, _opcode_name_map
+
+
+def _nested_jsr_pc_fix_enabled() -> bool:
+    """Flag for the nested-JSR (JSR-after-ENT) IS_JSR decode. Default ON.
+
+    Root B (``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md``): a JSR that occurs
+    AFTER an ENT (a nested call / any non-first JSR inside a call frame)
+    fails to jump to the callee. The model_ops ``_function_call_jsr_pc_override``
+    fires only when ``TEMP+0`` (IS_JSR) clears its threshold, but TEMP+0 is
+    written cleanly only by the HAS_SE-gated FIRST-step decode -- on a
+    nested JSR it is the weak ``+1`` residual leak, below threshold, so the
+    override never fires and PC falls through to ``pc+8``. (A spec_k=0
+    BUILT-dim re-probe REFUTED the prior "OP_ENT broadcast veto / TEMP one
+    step late" diagnosis: ``OP_ENT == 0`` and ``TEMP+0 == +1`` at the real
+    nested-JSR PC marker, and the opcode byte decodes cleanly as JSR.)
+
+    The fix adds an ALL-step JSR IS_JSR decode at the PC marker (mirroring
+    the existing all-step BZ/BNZ/LEV/EXIT/JMP decode at units 84-88) that
+    writes ``TEMP+0`` from the clean per-step JSR opcode byte
+    (``OPCODE_BYTE_LO+3`` AND ``OPCODE_BYTE_HI+0``) on EVERY step, not just
+    the first. The two-nibble AND at threshold 2.5 is JSR-exclusive. Default
+    ON; with ``C4_NESTED_JSR_PC_FIX=0`` the L5 FFN footprint is exactly the
+    prior 89 units and the build is byte-identical.
+    """
+    return os.environ.get("C4_NESTED_JSR_PC_FIX", "1") != "0"
 
 
 # === L5 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
@@ -64,7 +91,13 @@ _L5_FFN_UNIT_LAYOUT = (
 # Total = 34 + 18 + 1 + 31 + 5 = 89 units (final cursor lands at 89;
 # highest used unit index is 88, matching the 5/ffn_W_down/88 claim on
 # OP_JMP+0 in ``make_opcode_decode_ffn_op``).
-_L5_FFN_TOTAL_UNITS = 89
+_L5_FFN_BASE_UNITS = 89
+
+
+def _l5_ffn_total_units() -> int:
+    """89 base units, +1 (unit 89, all-step JSR TEMP+0 decode) when the
+    Root B nested-JSR fix flag is on. Flag-off => 89 (byte-identical)."""
+    return _L5_FFN_BASE_UNITS + (1 if _nested_jsr_pc_fix_enabled() else 0)
 
 
 def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
@@ -91,6 +124,9 @@ def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
     allocator = FFNUnitAllocator()
     for name, _legacy_start, n_units in _L5_FFN_UNIT_LAYOUT:
         allocator.alloc(name, n_units)
+    if _nested_jsr_pc_fix_enabled():
+        # Root B: one extra all-step JSR TEMP+0 decode unit at index 89.
+        allocator.alloc("opcode_decode_ffn.all_step_jsr_at_pc", 1)
     return allocator
 
 
@@ -499,9 +535,9 @@ def make_opcode_decode_ffn_op() -> Operation:
         # at the allocator's declared footprint. If the layout table
         # drifts from the helper's writes, this assertion fires before
         # any weight surgery happens.
-        assert final_unit == _L5_FFN_TOTAL_UNITS, (
+        assert final_unit == _l5_ffn_total_units(), (
             f"L5 FFN unit cursor drift: helper returned {final_unit}, "
-            f"allocator expected {_L5_FFN_TOTAL_UNITS}"
+            f"allocator expected {_l5_ffn_total_units()}"
         )
 
     # Dim-ownership claims (W_down output cells). The bake programs four
@@ -569,6 +605,11 @@ def make_opcode_decode_ffn_op() -> Operation:
         ("88", "OP_JMP+0"),
     ):
         _claims.add((5, "ffn_W_down", unit, col))
+    # Root B (flag C4_NESTED_JSR_PC_FIX): all-step JSR IS_JSR (TEMP+0)
+    # decode at unit 89. Only present when the flag is on (flag-off keeps
+    # the 89-unit footprint, no unit 89).
+    if _nested_jsr_pc_fix_enabled():
+        _claims.add((5, "ffn_W_down", "89", "TEMP+0"))
 
     return Operation(
         name="opcode_decode_ffn",
@@ -801,6 +842,37 @@ def _opcode_decode_all_step_pc_rules(S):
     )
 
 
+def _opcode_decode_all_step_jsr_rules(S):
+    """All-step JSR IS_JSR (TEMP+0) decode at the PC marker. Root B fix.
+
+    The legacy first-step JSR decode (:func:`_opcode_decode_first_step_rules`)
+    writes ``TEMP+0`` only when ``HAS_SE == 0`` (the program's first step), so
+    a NESTED JSR (inside a call frame, after an ENT) gets no clean IS_JSR and
+    the model_ops JSR PC-override never fires. This rule mirrors the all-step
+    BZ/BNZ/LEV/EXIT/JMP decode (:func:`_opcode_decode_all_step_pc_rules`) for
+    JSR (opcode ``0x03`` = ``OPCODE_BYTE_LO+3`` AND ``OPCODE_BYTE_HI+0``),
+    with NO ``HAS_SE`` gate, so it writes ``TEMP+0`` on every JSR step. The
+    two-nibble AND at threshold 2.5 (each nibble +1, MARK_PC +1) is
+    JSR-exclusive: a single matching nibble scores 2.0 < 2.5. Flag-gated
+    (:func:`_nested_jsr_pc_fix_enabled`); empty tuple when off so the L5 FFN
+    footprint stays at the legacy 89 units (byte-identical).
+    """
+    if not _nested_jsr_pc_fix_enabled():
+        return ()
+    return (
+        multi_way_and_rule(
+            name="l5_all_step_decode_jsr_temp0_at_pc",
+            conditions=(
+                ("OPCODE_BYTE_LO+3", 1.0),
+                ("OPCODE_BYTE_HI+0", 1.0),
+                ("MARK_PC", 1.0),
+            ),
+            threshold=2.5,
+            writes=(("TEMP+0", 10.0 / S),),
+        ),
+    )
+
+
 def _opcode_decode_jsr_temp0_blank_rule() -> FFNRule:
     """Blank-unit placeholder for the reserved unit-52 JSR TEMP[0] slot.
 
@@ -858,6 +930,10 @@ def _opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
         + (_opcode_decode_jsr_temp0_blank_rule(),)
         + _opcode_decode_temp_clear_rules(S)
         + _opcode_decode_all_step_pc_rules(S)
+        # Root B (flag C4_NESTED_JSR_PC_FIX, default ON): one extra all-step
+        # JSR IS_JSR (TEMP+0) decode at unit 89. Empty tuple when the flag is
+        # off => 89-unit footprint, byte-identical to the prior build.
+        + _opcode_decode_all_step_jsr_rules(S)
     )
 
 
@@ -945,14 +1021,14 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         spec_section=None,
         # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): L5's
         # opcode_decode_ffn bake claims 89 fetch / opcode-decode units
-        # via ``_L5_FFN_TOTAL_UNITS``. The audit reported 88 non-zero
-        # rows post-bake (one reserved blank slot has empty W_up/W_gate)
-        # but the allocator footprint and the bake's monotonic cursor
-        # both walk 89 units, so the layer must be sized to 89.
-        # Declaring this here lets the dynamic-FFN allocator pre-size
-        # block[L5].ffn to 89 instead of the historical 4096 fallback,
-        # eliminating ~4007 dead rows. The rule lowering uses a
-        # monotonic cursor independent of the layer max so byte-identity
-        # is preserved.
-        ffn_units_used=_L5_FFN_TOTAL_UNITS,
+        # via ``_l5_ffn_total_units()`` (90 with the Root B nested-JSR fix
+        # flag on; 89 off). The audit reported 88 non-zero rows post-bake
+        # (one reserved blank slot has empty W_up/W_gate) but the allocator
+        # footprint and the bake's monotonic cursor both walk the full
+        # count, so the layer must be sized to it. Declaring this here lets
+        # the dynamic-FFN allocator pre-size block[L5].ffn instead of the
+        # historical 4096 fallback, eliminating ~4007 dead rows. The rule
+        # lowering uses a monotonic cursor independent of the layer max so
+        # byte-identity is preserved.
+        ffn_units_used=_l5_ffn_total_units(),
     )

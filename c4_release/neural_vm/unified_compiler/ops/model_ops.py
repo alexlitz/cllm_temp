@@ -306,11 +306,16 @@ def _function_call_jsr_stack0_marker_rules(S: float) -> tuple[FFNRule, ...]:
 def _function_call_jsr_pc_override_conditions() -> tuple[tuple[str, float], ...]:
     """Common up-branch conditions for the JSR PC override band.
 
-    Gates on MARK_PC + TEMP[0] (IS_JSR flag relayed by L6 head 3), with
-    strong negative blockers for every other opcode (NOP, EXIT, JMP, BZ,
-    BNZ, IMM, LEV, ENT) to prevent spurious firing on non-JSR steps
-    where TEMP[0] is polluted by L6 head 4 (BZ/BNZ relay). IS_BYTE
-    blocker confines to the PC marker position.
+    Gates on MARK_PC + TEMP[0] (IS_JSR flag). On a step-0 JSR the
+    HAS_SE-gated L5 first-step decode supplies ``TEMP+0 = +5``; on a
+    NESTED JSR (after an ENT) the all-step JSR IS_JSR decode
+    (:func:`l5_ops._opcode_decode_all_step_jsr_rules`, flag
+    ``C4_NESTED_JSR_PC_FIX``) supplies the same ``+5`` from the clean
+    per-step JSR opcode byte. Strong negative blockers for every other
+    opcode (NOP, EXIT, JMP, BZ, BNZ, IMM, LEV, ENT) prevent spurious firing
+    on non-JSR steps where TEMP[0] is polluted by L6 head 4 (BZ/BNZ relay).
+    IS_BYTE blocker confines to the PC marker position. See Root B in
+    ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md``.
     """
     return (
         ("MARK_PC", 1.0),

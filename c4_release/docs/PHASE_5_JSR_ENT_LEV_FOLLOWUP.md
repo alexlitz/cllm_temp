@@ -590,3 +590,65 @@ over a real 0xF0.
 
 Root B (nested-JSR PC override) is untouched, a separate follow-up as the brief
 framed. Throwaway probes removed.
+
+## 2026-06-14 Root B SOLVED — nested-JSR PC override now fires; the "OP_ENT veto / TEMP late" diagnosis was a wrong-dim artifact. Fix landed, smoke 51/0, byte-identical opt-out.
+
+The prior Root B diagnosis (the 2026-06-14 da09f54a entry: "the nested-JSR PC
+override is blocked by the broadcast OP_ENT constant; TEMP[0] appears one step
+late") is **REFUTED** — it was the SAME static-dim read artifact that defeated
+the Root A sessions. Re-probed at BUILT `layout.dim_positions` (spec_k=0,
+hook-free GroundTruthProbe, ~9 throwaway probes all removed), on the REAL failing
+program `func_identity_0` (`JSR 7; HALT; NOP; ENT; LEA; LOAD; RET; ENT; IMM 70;
+PUSH; JSR 3; ADJ; HALT` — the nested JSR is `JSR 3` at idx 10, step 4, AFTER
+main's `ENT` at idx 7).
+
+### What is actually true at the nested-JSR PC marker (step 4, BUILT dims)
+- The opcode byte decodes **cleanly as JSR**: `OPCODE_BYTE_LO+3 = +1.0` AND
+  `OPCODE_BYTE_HI+0 = +1.0` (0x03) at blocks 5/6/7/47.
+- `FETCH_LO+3 = +41` — the callee target (idx 3) is present and amplified.
+- **`OP_ENT = 0`** at this row (NOT the durable broadcast veto the prior entry
+  claimed; OP_ENT is broadcast to the AX marker, not the JSR PC marker).
+- **`TEMP+0 = +1.0`** (IS_JSR) — PRESENT, not "one step late", but only the weak
+  residual leak, NOT the `+5` the step-0 JSR gets.
+The override (`model_ops._function_call_jsr_pc_override`, threshold 4.0) gates
+`MARK_PC(+1) + TEMP+0(+1) + opcode-blockers + IS_BYTE(-10)`. With `TEMP+0 = +1`
+and `OP_ENT = 0`, the gate is `+2 < 4` → the override does NOT fire → PC falls
+through to `pc+8` (idx 11 instead of idx 3). The deciding quantity is purely
+**TEMP+0 strength**, not any OP_ENT veto.
+
+### Root: TEMP+0 (IS_JSR) is written ONLY by the HAS_SE-gated first-step decode
+`_opcode_decode_first_step_rules` (l5_ops.py) writes `TEMP+0` for JSR gated
+`HAS_SE = -1` (first step only). BZ/BNZ/LEV/EXIT/JMP additionally get an
+**all-step PC-marker decode** (`_opcode_decode_all_step_pc_rules`, units 84-88)
+that re-decodes the flag from the opcode byte on EVERY step — **JSR was missing
+from that all-step list**. So a nested (non-first) JSR has no clean per-step
+IS_JSR; the +1 leak is all the override sees. (This is why the BZ/BNZ override
+works mid-frame inside if/loop bodies but the JSR override does not.)
+
+### Fix (declarative, flag-gated `C4_NESTED_JSR_PC_FIX`, default ON, byte-identical opt-out)
+Added `_opcode_decode_all_step_jsr_rules` (l5_ops.py): one all-step JSR IS_JSR
+decode at the PC marker — `OPCODE_BYTE_LO+3 AND OPCODE_BYTE_HI+0 AND MARK_PC`,
+threshold 2.5, writes `TEMP+0 = 10/S` — appended at L5 FFN unit 89. Mirrors the
+existing all-step BZ/BNZ/LEV/EXIT/JMP decode exactly. The two-nibble AND at
+threshold 2.5 is JSR-exclusive (a single matching nibble scores 2.0 < 2.5;
+LT = lo3/hi1, ENT = lo6/hi0 each match only one nibble). With it, the nested-JSR
+TEMP+0 jumps `+1 → +6`, the override's gate clears (`+7 > 4`), the fall-through
+PC is cancelled and the callee target written. No model_ops change at all — the
+override op is untouched; it simply now receives a clean per-step IS_JSR. Flag
+off ⇒ L5 FFN is exactly 89 units and the build is byte-identical.
+
+### Verification
+- `func_identity_0` per-step PC decode BEFORE: step4 (nested `JSR 3`) → next
+  idx 11 (fall-through), override O0 = +0. AFTER: step4 → **next idx 3** (callee),
+  TEMP+0 +6, override O0 = +6.4 (fires); step5 → idx 4 (callee body continues).
+- `pytest tests/test_smoke.py`: **51 passed / 0 failed** (no regression).
+- Byte-identity: `C4_NESTED_JSR_PC_FIX=0` full state_dict SHA256 == HEAD's
+  (43 blocks, d_model 981, L5 FFN 89 units, unit 89 / claim absent). Flag-off
+  build is byte-for-byte the prior model.
+- `test_opcode_decode_ffn_rules_total_unit_count` / `_full_ir_matches_legacy_helper`
+  updated to pin the flag OFF for the legacy byte-identity check and assert the
+  90-unit footprint when ON.
+
+The remaining func/nested failures advance PAST the nested JSR; the next
+divergence is the separate in-frame LEV PC-restore / step-1 ENT cluster (tasks
+#227/#228), out of scope for this fix. Throwaway probes removed.

@@ -94,7 +94,10 @@ def test_layer4_ffn_declarative_matches_legacy_helper():
     _assert_same_ffn(actual, expected)
 
 
-def test_opcode_decode_ffn_declarative_matches_legacy_helper():
+def test_opcode_decode_ffn_declarative_matches_legacy_helper(monkeypatch):
+    # The legacy helper has the 89-unit footprint; pin the Root B nested-JSR
+    # fix OFF (flag-off => byte-identical) for the legacy byte-identity check.
+    monkeypatch.setenv("C4_NESTED_JSR_PC_FIX", "0")
     actual = _StubFFN(hidden_dim=128)
     expected = _StubFFN(hidden_dim=128)
 
@@ -221,18 +224,29 @@ def test_opcode_decode_jsr_temp0_blank_rule_is_no_op_lowering():
     assert report.ok, report.format()
 
 
-def test_opcode_decode_ffn_rules_total_unit_count():
-    """The composite rule list must total 89 units (matches _L5_FFN_TOTAL_UNITS)."""
+def test_opcode_decode_ffn_rules_total_unit_count(monkeypatch):
+    """The composite rule list totals 89 units with the Root B nested-JSR
+    fix OFF, and 90 with it ON (the extra all-step JSR TEMP+0 decode)."""
 
-    rules = _opcode_decode_ffn_rules(100.0)
+    monkeypatch.setenv("C4_NESTED_JSR_PC_FIX", "0")
+    rules_off = _opcode_decode_ffn_rules(100.0)
     # 34 main + 18 first-step + 1 blank + 31 temp-clear + 5 all-step = 89.
-    assert len(rules) == 89
+    assert len(rules_off) == 89
+
+    monkeypatch.setenv("C4_NESTED_JSR_PC_FIX", "1")
+    rules_on = _opcode_decode_ffn_rules(100.0)
+    # + 1 all-step JSR TEMP+0 decode (Root B).
+    assert len(rules_on) == 90
 
 
-def test_opcode_decode_ffn_full_ir_matches_legacy_helper():
+def test_opcode_decode_ffn_full_ir_matches_legacy_helper(monkeypatch):
     """One-shot ``Primitives.lower_ffn_rules`` of the composite IR equals the
-    legacy ``_set_opcode_decode_ffn`` byte-for-byte across all 89 units."""
+    legacy ``_set_opcode_decode_ffn`` byte-for-byte across all 89 units.
 
+    The legacy reference has the 89-unit footprint, so this byte-identity
+    check pins the Root B nested-JSR fix OFF (flag-off => byte-identical)."""
+
+    monkeypatch.setenv("C4_NESTED_JSR_PC_FIX", "0")
     actual = _StubFFN(hidden_dim=128)
     expected = _StubFFN(hidden_dim=128)
 
@@ -282,9 +296,14 @@ def test_opcode_decode_ffn_ir_passes_declaration_and_lowering_checks():
     )
 
 
-def test_opcode_decode_ffn_op_exposes_compiler_ir():
-    """``make_opcode_decode_ffn_op()`` must attach the composite IR."""
+def test_opcode_decode_ffn_op_exposes_compiler_ir(monkeypatch):
+    """``make_opcode_decode_ffn_op()`` must attach the composite IR.
 
+    Pinned to the Root B nested-JSR fix OFF so the rule count matches the
+    legacy 89-unit footprint (with the flag on it is 90 — see
+    ``test_opcode_decode_ffn_rules_total_unit_count``)."""
+
+    monkeypatch.setenv("C4_NESTED_JSR_PC_FIX", "0")
     op = make_opcode_decode_ffn_op()
     assert op.compiler_ir is not None
     assert len(op.compiler_ir.layer(0).ffn.rules) == 89
