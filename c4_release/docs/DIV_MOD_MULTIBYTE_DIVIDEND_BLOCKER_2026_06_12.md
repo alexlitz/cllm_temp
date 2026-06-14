@@ -1,7 +1,46 @@
 # Multi-byte-dividend DIV/MOD — root cause, boundary, and the multi-byte-division design (2026-06-12)
 
-Status: **architecture wall** (operand-pipeline single-byte gather + flat-lookup
-width wall). Companion to
+> **RESOLVED 2026-06-14 (commit `83ba5602`, flag `C4_DIV_MULTIBYTE`, default
+> OFF — flag-off byte-identical).** The "architecture wall" below was WRONG on
+> three counts (the brief's lead about a static-dim probe artifact was correct):
+>
+> 1. **"STACK0_BYTE_VAL_1 written nowhere" was a static-dim / wrong-band /
+>    wrong-row artifact.** At BUILT `layout.dim_positions` (d_model=981,
+>    spec_k=0) the high dividend byte IS stored: `1162/37` →
+>    `STACK0_BYTE_VAL_1` (built dim **602**, NOT the static 734) = `0x04` at the
+>    PSH-frame rows. The prior probes read the static registry dim and the wrong
+>    `CLEAN_EMBED` band. Case **(a)**: stored, just not relayed into the operand
+>    band the divide read.
+> 2. **The long-division pipeline is ALREADY multi-byte capable.** Lookup-mode
+>    `FlattenedDivMod` (`alu/ops/divmod_longdiv.py::LongDivisionModule`) reads the
+>    dividend as a full 8-nibble GE vector and does a real MSB→LSB long division
+>    (up to 32 bits). "Wall B" (no carry cascade in one FFN) does not apply — the
+>    cascade lives inside the module.
+> 3. **The actual root**: the smoke/groundtruth path builds `alu_mode='efficient'`
+>    (`trust_neural_alu=True`), whose divmod install lowers
+>    `wide_div_rules_ge_format(width_bytes=1)` — a flat 256×256 **single-byte**
+>    lookup reading only `ALU_LO/HI` (byte 0). THAT is the single-byte truncation
+>    (the 16.7M-rule "Wall A" was about extending *this lookup*, never necessary).
+>
+> **Fix (two flag-gated parts).** (i) `make_alu_divmod_composite_ops`: under
+> `C4_DIV_MULTIBYTE`, build+install the multi-byte `FlattenedDivMod` long-division
+> composite even in efficient mode (the install co-locates at the
+> `layer10_carry_relay` anchor where the 3 stage bakes assemble it, so
+> `builder.composite` is populated before append). (ii) `BDToGEConverter`: route
+> the DIV/MOD operand-A byte-1 gather to `STACK0_BYTE_VAL_1_LO/HI` (the carrier
+> `layer10_psh_ax_broadcast` populates at the cummax-picked `STACK0_BYTE1` row)
+> instead of `CLEAN_EMBED_LO/HI` (= 0x00 there).
+>
+> **Result (spec_k=0):** `1162/37→31`, `300/5→60`, `280%6→4` (were 3/8/0);
+> single-byte `84/2→42` unchanged. `run_1096_canonical --ids 150-249
+> --criterion exit_code`: **div 21/50→48/50, mod 24/50→48/50** (45/100→96/100).
+> `tests/test_smoke.py` with `C4_DIV_MULTIBYTE=1`: **51 passed / 0 failed**.
+> Flag-off param hash == HEAD (byte-identical). The 4 residual fails are the
+> documented operand-cleanliness outliers (the `~5.56` cell-0 artifact), not the
+> multi-byte truncation. The rest of this doc is the SUPERSEDED pre-fix analysis.
+
+Status: ~~**architecture wall** (operand-pipeline single-byte gather + flat-lookup
+width wall)~~ **RESOLVED (see banner above)**. Companion to
 [`DSL_W5_MULDIV_LIMIT.md`](DSL_W5_MULDIV_LIMIT.md),
 [`LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md`](LONG_DIVISION_FFN_RULE_INFEASIBILITY_2026_06_09.md),
 and [`DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md`](DIV_GE_FORMAT_INSTALL_BLOCKER_2026_06_10.md).
