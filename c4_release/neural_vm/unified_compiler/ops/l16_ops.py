@@ -1,5 +1,6 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os
 import os as _os
 
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -49,6 +50,39 @@ def _ent_sp_byte1_ismark_blocker_on() -> bool:
     build, not a solo corrector.
     """
     return _os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
+
+
+def _ent_sp_byte1_ff_h1_hardening_enabled() -> bool:
+    """Flag for the ``l16_ent_frame_sp_byte1_ff`` H1+2 hard-requirement.
+
+    Default ON. With ``C4_ENT_SP_BYTE1_FF_H1_HARDEN=0`` the rule's
+    conditions are exactly the legacy tuple and the build is byte-identical.
+
+    Root (``docs/FUNC_ENT_SP_BYTE1_FF_OP_ENT_BROADCAST_2026_06_14.md``):
+    ``l16_ent_frame_sp_byte1_ff`` is the genuine SP-byte1=0xff override.
+    Its only strong positive gate is ``OP_ENT`` (weight 1.0), but ``OP_ENT``
+    does NOT stay one-hot at its own step -- it BROADCASTS at ~10..18 onto
+    every row one VM step after an ENT (opcode markers are not one-hot
+    in-step). The rule's threshold (4.5) is far below that broadcast
+    magnitude, so ``OP_ENT`` alone clears it and the rule MIS-FIRES on the
+    post-ENT step's STEP_END row and the saved-BP-store MEM byte rows
+    (built-dim probe, func_identity_0 id 550: STEP_END row score 10.76,
+    MEM addr/val byte rows 12.5..14.6 -- all >> 4.5). The misfire forces
+    OUTPUT_{LO,HI}+15 = 0xff there, which (a) over-emits two leading 0xff
+    tokens at the start of the post-ENT step => the +2 (37-token) desync
+    that drops the next-step PSH MEM store, and (b) corrupts the ENT
+    saved-BP store to ``[1,255,18,255]``.
+
+    The clean discriminator: the GENUINE SP byte rows carry the SP
+    register marker-distance hint ``H1+2 ~= 1.0``; EVERY misfire row carries
+    ``H1+2 == 0`` (they are STEP_END / MEM byte rows, not SP register byte
+    rows). This fix promotes ``H1+2`` to a hard requirement via a net-zero
+    CONST baseline (``+H1+2 - CONST``): byte-identical on the genuine row
+    (``H1+2 ~= 0.99..1.0`` -> net ~= 0) while subtracting the full hardening
+    weight on any ``H1+2 == 0`` row, burying the OP_ENT broadcast below the
+    4.5 threshold.
+    """
+    return os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
 
 
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
@@ -1732,11 +1766,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # SP-byte1 firing because H1+2 is ~0.99 there, not exactly 1.0 -- that
     # remaining family (the step-2 PC desync) is the documented next root, see
     # docs/VAR_STEP1_STACK0_LEA_DESYNC_2026_06_13.md.
+    # OP_ENT-broadcast STEP_END / MEM-row misfire hardening (2026-06-14, func
+    # cluster -- see _ent_sp_byte1_ff_h1_hardening_enabled). The legacy H1+2
+    # weight (1.0) is too weak: the OP_ENT broadcast (~10..18) alone clears the
+    # 4.5 threshold on the post-ENT STEP_END row and saved-BP-store MEM byte
+    # rows (which all carry H1+2 == 0), forcing 0xff there and triggering the
+    # 37-token post-ENT desync. Promote H1+2 to a HARD requirement: raise its
+    # weight to 1.0 + W and add a net-zero ``CONST`` baseline of -W. Byte-
+    # identical on the genuine SP byte rows (H1+2 ~= 0.99..1.0 -> the +W*H1+2
+    # gain is cancelled by the -W CONST baseline, |loss| <= 0.01*W on the
+    # existing ~11-pt margin) while subtracting the full W on any H1+2 == 0
+    # misfire row (14.6 - 20 < 4.5 -> vetoed). Pure subtractive on the misfire
+    # side; cannot perturb the genuine firing. Flag-off restores the exact
+    # legacy tuple (H1+2 weight 1.0, no CONST term) => byte-identical build.
+    _h1_harden_w = 20.0 if _ent_sp_byte1_ff_h1_hardening_enabled() else 0.0
     sp_frame_byte1_ff_conditions = (
         ("OP_ENT", 1.0),
         ("IS_BYTE", 1.0),
         ("HAS_SE", 1.0),
-        ("H1+2", 1.0),
+        ("H1+2", 1.0 + _h1_harden_w),
         ("BYTE_INDEX_0", 1.0),
         ("BYTE_INDEX_1", -10.0),
         ("BYTE_INDEX_2", -10.0),
@@ -1757,7 +1805,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("STACK0_BYTE1", -100.0),
         ("STACK0_BYTE2", -100.0),
         ("STACK0_BYTE3", -100.0),
-    )
+    ) + ((("CONST", -_h1_harden_w),) if _h1_harden_w else ())
     # OP_ENT-broadcast post-ENT framing fix (2026-06-14, the func/var/rec/nested
     # 37-token desync). The five register-marker blockers above guard the PC/AX/
     # SP/BP/MEM byte rows, but NOT the STEP_END / marker rows -- and the OP_ENT
