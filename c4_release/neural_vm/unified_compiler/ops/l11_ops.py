@@ -1349,14 +1349,46 @@ def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
 # -> H1_DUMP_OUT == EXACTLY 0, NOT negative, so the real SHL/JMP byte-1 stays on
 # the normal H1 path). In the carry band the step input is far below 3.0, so the
 # flag is ~0 and the dump fires byte-identically to the lower-bound-only design.
-_AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM = 1
+#
+# UNIT 2 (2026-06-13 prologue-framing-drift fix): a SECOND kill condition on the
+# NON-AX-register rows. The dump's lower bound is ``+1.0 * Σ AX_CARRY`` which is
+# UNBOUNDED; on the FIRST step (step 0) of var/func/nested programs the AX_CARRY
+# band carries large step-0 garbage (Σ AX_CARRY ~ +25..+112 at the REG_PC byte
+# 2/3 predictor rows, spec_k=0 — vs ~+2.65 on a genuine carry), which SWAMPS the
+# +4.5 threshold and FIRES the dump on PC byte 2/3 rows. The carried
+# ``H1_PREV_STEP`` there is negative garbage (~-26.6), so the dump writes ~-3403
+# into ``H1_DUMP_OUT`` and the LM head (reading ``H1_DUMP_OUT+(v+2)`` at +5.0)
+# drives the byte-0 token to ~-1e8 -> a garbage PC high byte wins -> the
+# fixed-35 step desyncs -> the dominant 1096 "PC-wrong" full-trace fail across
+# the var/func/nested/loop/rec/gcd clusters (581 programs). The CLEAN
+# discriminator (probe_groundtruth spec_k=0): ``ADDR_B1_HI+8`` is the AX-register
+# signal — ~4.02/3.29/2.70 on AX byte 1/2/3 rows (PROGRAM-STABLE, both legit and
+# over-fire programs) and EXACTLY ~0.00 on PC/SP/BP/STACK0/MEM byte rows. The
+# dump must NEVER fire on a non-AX row regardless of Σ AX_CARRY, so this unit
+# writes the kill flag whenever ``ADDR_B1_HI+8 <= 2.0`` (i.e. the AX-register
+# signal is ABSENT). On a real AX byte row (>= 2.70) it stays dark, so the legit
+# carry (add/sub byte-1) is byte-identical; on every PC/SP/BP/STACK0/MEM row it
+# fires -> dump killed -> H1_DUMP_OUT == EXACTLY 0 (the byte stays on the normal
+# H1 path). This makes the AX-register signal a HARD prerequisite instead of a
+# +0.25-weighted term the unbounded Σ AX_CARRY could overwhelm.
+_AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM = 2
 # Separation threshold on AX_CARRY_HI+2: carry rows <= ~1.31, over-fire rows
 # >= 6.41 -> 3.0 sits cleanly in the gap.
 _AX_CARRY_OVERFLOW_HI2_THRESHOLD = 3.0
+# Separation threshold on ADDR_B1_HI+8 (AX-register signal): AX byte rows
+# >= 2.70 (byte 1/2/3 = 4.02/3.29/2.70), non-AX rows ~0.00 -> 2.0 sits cleanly
+# in the gap (margin >= 0.7 from the lowest legit AX row).
+_AX_REGISTER_PRESENT_B1HI8_THRESHOLD = 2.0
 
 
 def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:
-    """1 rule: ``AX_CARRY_OVERFLOW = step(AX_CARRY_HI+2 >= 3.0)``."""
+    """2 rules into ``AX_CARRY_OVERFLOW`` (OR of two dump-kill conditions).
+
+    Unit 0: ``step(AX_CARRY_HI+2 >= 3.0)`` — the SHL/JMP upper-cut.
+    Unit 1: ``step(ADDR_B1_HI+8 <= 2.0)`` — the NON-AX-register kill (PC/SP/BP/
+    STACK0/MEM byte rows), so the unbounded Σ AX_CARRY lower bound can never
+    fire the dump on a non-AX row (the step-0 prologue framing-drift root).
+    """
     return (
         step_function_rule(
             name="ax_byte1_carry_overflow_flag",
@@ -1368,6 +1400,20 @@ def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:
             threshold=_AX_CARRY_OVERFLOW_HI2_THRESHOLD,
             write_dim="AX_CARRY_OVERFLOW",
             write_value=2.0,
+        ),
+        # Unit 1: fire when ADDR_B1_HI+8 <= 2.0 (AX-register signal ABSENT).
+        # conditions = ((ADDR_B1_HI+8, -1.0),), threshold = -2.0 -> the SiLU
+        # score is ``-ADDR_B1_HI+8`` and the rule fires when
+        # ``-ADDR_B1_HI+8 >= -2.0`` i.e. ``ADDR_B1_HI+8 <= 2.0``. On a PC row
+        # (signal 0) score = 0 >= -2.0 -> fires strongly (silu(S*2.0)); on the
+        # lowest legit AX byte-3 row (signal 2.70) score = -2.70 < -2.0 ->
+        # silu(S*-0.7) ~= 0 -> dark. write_value 2.0 (same as unit 0) -> the
+        # dump's -1000 read deeply kills it.
+        multi_way_and_rule(
+            name="ax_byte1_not_ax_register_kill",
+            conditions=(("ADDR_B1_HI+8", -1.0),),
+            threshold=-_AX_REGISTER_PRESENT_B1HI8_THRESHOLD,
+            writes=(("AX_CARRY_OVERFLOW", 2.0 / 100.0),),
         ),
     )
 
@@ -1436,7 +1482,7 @@ def make_ax_byte1_carry_overflow_flag_op() -> Operation:
 
     return Operation(
         name="ax_byte1_carry_overflow_flag",
-        reads={"AX_CARRY_HI"},
+        reads={"AX_CARRY_HI", "ADDR_B1_HI"},
         writes={"AX_CARRY_OVERFLOW"},
         kind="block",
         # Append on the same L25 block AFTER the tail correction but BEFORE the
