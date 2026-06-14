@@ -195,11 +195,38 @@ class BDToGEConverter(nn.Module):
                 else:
                     latest_score, latest_idx = torch.cummax(scores, dim=1)
                 gather_idx = latest_idx[:, :, None].expand(-1, -1, 16)
+                # Source of operand-A byte 1 at the picked STACK0_BYTE1 row.
+                #
+                # HEAD default reads CLEAN_EMBED_LO/HI — but at the PSH-frame
+                # STACK0_BYTE1 row that band is 0x00; the pushed value's high
+                # byte is deposited by ``layer10_psh_ax_broadcast`` into the
+                # DESIGNATED carrier STACK0_BYTE_VAL_1_LO/HI at that same row
+                # (verified spec_k=0: 1162/37 -> STACK0_BYTE_VAL_1 = 0x04,
+                # CLEAN_EMBED = 0x00). Reading CLEAN_EMBED is why multi-byte
+                # dividends truncated to low_byte(dividend) / divisor.
+                #
+                # When C4_DIV_MULTIBYTE is on, gather the high byte from
+                # STACK0_BYTE_VAL_1 instead. Flag-gated so flag-off is
+                # byte-identical to HEAD; requires the divmod compute to run
+                # AFTER the L11 broadcast that populates this band (handled by
+                # the divmod-install layer_idx=11 reroute in the same flag).
+                from .unified_compiler.ops.shared import div_multibyte_enabled
+                use_stack0_val = (
+                    div_multibyte_enabled()
+                    and hasattr(BD, "STACK0_BYTE_VAL_1_LO")
+                    and hasattr(BD, "STACK0_BYTE_VAL_1_HI")
+                )
+                if use_stack0_val:
+                    src_lo_base = BD.STACK0_BYTE_VAL_1_LO
+                    src_hi_base = BD.STACK0_BYTE_VAL_1_HI
+                else:
+                    src_lo_base = BD.CLEAN_EMBED_LO
+                    src_hi_base = BD.CLEAN_EMBED_HI
                 clean_lo = _clean_onehot(
-                    x_bd[:, :, BD.CLEAN_EMBED_LO:BD.CLEAN_EMBED_LO + 16]
+                    x_bd[:, :, src_lo_base:src_lo_base + 16]
                 )
                 clean_hi = _clean_onehot(
-                    x_bd[:, :, BD.CLEAN_EMBED_HI:BD.CLEAN_EMBED_HI + 16]
+                    x_bd[:, :, src_hi_base:src_hi_base + 16]
                 )
                 valid = (latest_score >= 0)[:, :, None].to(dtype=x_bd.dtype)
                 prev_stack_lo = torch.gather(clean_lo, 1, gather_idx) * valid

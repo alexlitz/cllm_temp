@@ -1989,9 +1989,24 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     """
     builder = _FlattenedDivModBuilder()
 
+    # Multi-byte-dividend DIV/MOD (C4_DIV_MULTIBYTE, default OFF). The
+    # efficient-mode install lowers ``wide_div_rules_ge_format(width_bytes=1)``
+    # — a flat 256x256 single-byte lookup reading ONLY ALU_LO/HI (byte 0), so
+    # a dividend >= 256 truncates to ``low_byte(dividend) / divisor`` (the
+    # documented wall). The lookup-mode ``FlattenedDivMod`` composite is a real
+    # MSB->LSB long-division pipeline that IS multi-byte capable (reads the
+    # dividend as a full 8-nibble GE vector, positions 0..7). When the flag is
+    # ON we build + install that composite EVEN under efficient mode, and the
+    # paired ``BDToGEConverter`` reroute (efficient_alu_neural.py, same flag)
+    # feeds the high dividend byte from STACK0_BYTE_VAL_1 into GE positions
+    # 2/3. Flag-off keeps the byte-identical single-byte GE-format lookup.
+    def _use_longdiv_composite() -> bool:
+        from .shared import div_multibyte_enabled
+        return alu_mode != 'efficient' or div_multibyte_enabled()
+
     def make_bdtoge():
         def bake(block, dim_positions, S):
-            if alu_mode == 'efficient':
+            if not _use_longdiv_composite():
                 # DSL W4: stage ops are no-ops; install op builds the
                 # rule-derived PureFFN directly.
                 return
@@ -2041,7 +2056,7 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
     def make_longdiv():
         def bake(block, dim_positions, S):
-            if alu_mode == 'efficient':
+            if not _use_longdiv_composite():
                 return
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
@@ -2081,7 +2096,7 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
     def make_getobd():
         def bake(block, dim_positions, S):
-            if alu_mode == 'efficient':
+            if not _use_longdiv_composite():
                 return
             BD = _as_setdim_proxy(dim_positions)
             composite = builder.ensure(S, BD)
@@ -2130,7 +2145,7 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
     def make_install():
         def bake(block, dim_positions, S):
-            if alu_mode == 'efficient':
+            if alu_mode == 'efficient' and not _use_longdiv_composite():
                 # DSL Wave W6 (2026-06-11): install the BYTE-ACCURATE
                 # GE-format DIV/MOD lookup (``wide_div_rules_ge_format``)
                 # in place of the per-nibble ``wide_div_rules`` POC. The
@@ -2268,6 +2283,28 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
                 return
             block.post_ops.append(builder.composite)
 
+        # Placement: when the multi-byte long-division composite is in play
+        # (lookup mode, OR efficient mode under C4_DIV_MULTIBYTE) the install
+        # must append the FULLY-ASSEMBLED ``builder.composite`` — which the 3
+        # stage ops assemble at the ``layer10_carry_relay`` anchor block. With
+        # the byte-identical efficient default (``layer_idx=10``) the install
+        # block runs BEFORE the stages' anchor block, so ``builder.composite``
+        # is still None and the append is skipped. Bind the install to the
+        # SAME ``layer10_carry_relay`` anchor (after getobd) so it co-locates
+        # with the assembled composite — exactly how lookup mode has always
+        # placed it. The single-byte GE-format lookup path (flag-off
+        # efficient) keeps the byte-identical ``layer_idx=10`` pin.
+        if _use_longdiv_composite():
+            _install_placement = dict(
+                target_op_name="layer10_carry_relay",
+                requires={"after": "l10_alu_divmod_getobd"},
+            )
+        else:
+            _install_placement = dict(
+                layer_idx=10,
+                requires={"after": "l10_alu_divmod_getobd"},
+            )
+
         return Operation(
             name="l10_alu_divmod_install",
             # Phase 1 (memory cluster fix plan): co-bakes L10
@@ -2301,8 +2338,12 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
             # the efficient-mode install still fires AFTER the lookup-mode
             # GE→BD stage chain (no-ops in efficient mode) and the legacy
             # ``FlattenedDivMod`` assembly is discarded cleanly.
-            layer_idx=10,
-            requires={"after": "l10_alu_divmod_getobd"},
+            #
+            # ``_install_placement`` is the byte-identical ``layer_idx=10``
+            # for the flag-off efficient default, and the composite-co-locating
+            # ``layer10_carry_relay`` anchor for the multi-byte/lookup path —
+            # see the placement comment above.
+            **_install_placement,
             migrated=True,
             declarative_authority="structural_model",
             # Dim-ownership claims: empty. ``bake`` appends the

@@ -47,6 +47,48 @@ def mul_width2_enabled() -> bool:
     return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
 
 
+def div_multibyte_enabled() -> bool:
+    """Return True iff the multi-byte-dividend DIV/MOD relay is active
+    (DEFAULT OFF — opt-in via ``C4_DIV_MULTIBYTE=1``).
+
+    Background — the wall this lifts (verified spec_k=0, built dims):
+    the lookup-mode ``FlattenedDivMod`` long-division pipeline
+    (``alu/ops/divmod_longdiv.py::LongDivisionModule``) is ALREADY
+    multi-byte-capable: it reads the dividend as a full 8-nibble vector
+    from GE positions 0..7 and does a real MSB->LSB long division. The
+    ``BDToGEConverter`` (``efficient_alu_neural.py``) maps BD operand
+    bands into those GE positions: byte 0 from ALU_LO/HI (positions 0/1),
+    byte 1 into positions 2/3. For DIV/MOD it RECOVERS byte 1 from the
+    autoregressive prefix via a cummax over ``STACK0_BYTE1`` rows.
+
+    The bug (NOT "STACK0_BYTE_VAL_1 written nowhere" — that was a
+    static-dim / wrong-row artifact): the converter's DIV/MOD fallback
+    gathered ``CLEAN_EMBED_LO/HI`` at the picked STACK0-frame row, where
+    that band is 0x00 — the pushed value's high byte is deposited by
+    ``layer10_psh_ax_broadcast`` into ``STACK0_BYTE_VAL_1_LO/HI`` at that
+    SAME row (e.g. 1162/37: STACK0_BYTE_VAL_1 = 0x04 at the PSH frame).
+    Compounded by TIMING: the broadcast runs at L11 (physical block 15)
+    but the FlattenedDivMod compute ran at L10 (physical block 14), ONE
+    block too early to see the high byte.
+
+    When enabled this op:
+      * routes the FlattenedDivMod install to ``layer_idx=11`` so the
+        divmod compute runs AFTER the L11 ``layer10_psh_ax_broadcast``
+        head populates ``STACK0_BYTE_VAL_1`` (operands ALU_LO/HI +
+        AX_CARRY are byte-stable across blocks 14..20, verified
+        ``tools/probe_div_operand_survival.py``);
+      * has ``BDToGEConverter`` read ``STACK0_BYTE_VAL_1_LO/HI`` (the
+        designated high-byte carrier) at the cummax-picked STACK0_BYTE1
+        row instead of ``CLEAN_EMBED_LO/HI``.
+
+    DEFAULT OFF so flag-off is byte-identical to HEAD (divmod stays at
+    block 14, converter reads CLEAN_EMBED). Opt-in via
+    ``C4_DIV_MULTIBYTE=1``. See
+    ``docs/DIV_MOD_MULTIBYTE_DIVIDEND_BLOCKER_2026_06_12.md``.
+    """
+    return os.environ.get("C4_DIV_MULTIBYTE", "0") == "1"
+
+
 def addsub_declarative_enabled() -> bool:
     """Return True iff efficient-mode L8 ADD/SUB uses the DECLARATIVE wrap
     (DEFAULT OFF — opt-in via ``C4_ADDSUB_DECLARATIVE=1``).
