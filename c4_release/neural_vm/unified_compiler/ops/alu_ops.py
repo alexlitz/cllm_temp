@@ -372,6 +372,64 @@ def make_l9_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     )
 
 
+def _l10_bitwise_lookup_rules(S: float) -> tuple:
+    """The 1,536 ``bitwise_rules`` (AND/OR/XOR x 512) the lookup-mode L10
+    post-op lowers into a ``PureFFN``.
+
+    Sole source of truth for both the imperative ``bake`` (which lowers them
+    via ``Primitives.lower_ffn_rules``) and the descriptive
+    ``compiler_ir_factory`` (which wraps the SAME rules in a ``CompilerIR`` so
+    the symbolic gate / faithful interpreter can execute them). Because
+    ``Primitives.lower_ffn_rules`` IS ``CompilerIR.lower_ffn`` over the same
+    rule list, the two paths produce byte-identical ``PureFFN`` weights — the
+    IR is a faithful, byte-exact description of the baked post-op, not an
+    approximation.
+    """
+    from ..wide_alu_dsl import bitwise_rules
+
+    rule_list: list = []
+    for op_name, opcode_gate in (
+        ("and", "OP_AND"),
+        ("or", "OP_OR"),
+        ("xor", "OP_XOR"),
+    ):
+        rule_list.extend(bitwise_rules(
+            op=op_name,
+            operand_a_lo="ALU_LO",
+            operand_a_hi="ALU_HI",
+            operand_b_lo="AX_CARRY_LO",
+            operand_b_hi="AX_CARRY_HI",
+            result_lo="OUTPUT_LO",
+            result_hi="OUTPUT_HI",
+            opcode_gate=opcode_gate,
+            marker_gate="MARK_AX",
+            S=S,
+        ))
+    rules = tuple(rule_list)
+    assert len(rules) == 3 * 512, (
+        f"bitwise_rules: expected 1536 rules (3 opcodes x 512), got {len(rules)}"
+    )
+    return rules
+
+
+def _l10_bitwise_lookup_ir(dim_positions, HD) -> CompilerIR:
+    """``compiler_ir_factory`` for ``l10_alu_postop_attach`` (lookup mode).
+
+    Returns a ``CompilerIR`` carrying the SAME 1,536 ``bitwise_rules`` the
+    op's ``bake`` lowers. Production weights are still produced by the
+    imperative ``bake`` (``dispatch_operation_bake`` runs ``declarative_bake_fn``
+    first and returns), so this factory changes NO weight — it only exposes
+    the post-op's FFN as readable IR to the DSL spec gate (``_op_has_ir``) and
+    the value-faithful interpreter (``extract_op_ir``). Byte-identity of the
+    IR-lowering vs the bake is proven in
+    ``tests/test_wide_alu_dsl.py`` (same generator + lower path).
+    """
+    del HD  # FFN-only op; head_dim is irrelevant.
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_l10_bitwise_lookup_rules(100.0))
+    return ir
+
+
 def make_lookup_mode_l10_bitwise_rules_op() -> Operation:
     """Lookup-mode rule-derived replacement for the L10 ``ALUAndOrXor`` post_op.
 
@@ -390,6 +448,13 @@ def make_lookup_mode_l10_bitwise_rules_op() -> Operation:
     (which compare the same rule-derived PureFFN against ``ALUAndOrXor``
     on randomized AND/OR/XOR inputs).
 
+    Task #230 (declarative-coverage close): the op now ALSO carries a
+    ``compiler_ir_factory`` (``_l10_bitwise_lookup_ir``) describing the SAME
+    1,536 rules. The factory is purely descriptive — the imperative ``bake``
+    still owns the production weights — so the symbolic DSL gate and the
+    value-faithful interpreter can execute this post-op's FFN instead of
+    flagging it opaque, with ZERO weight change.
+
     Forward semantics:
       - Input: BD-format residual ``[B, seq_len, d_model]``.
       - Output: input + SwiGLU contribution that writes ``2.0 / S`` into
@@ -406,31 +471,10 @@ def make_lookup_mode_l10_bitwise_rules_op() -> Operation:
     def bake(block, dim_positions, S):
         from ...base_layers import PureFFN
         from ..primitives import Primitives
-        from ..wide_alu_dsl import bitwise_rules
 
-        # Generate per-opcode rule batches (512 rules each: 256 lo + 256 hi).
-        rule_list: list = []
-        for op_name, opcode_gate in (
-            ("and", "OP_AND"),
-            ("or", "OP_OR"),
-            ("xor", "OP_XOR"),
-        ):
-            rule_list.extend(bitwise_rules(
-                op=op_name,
-                operand_a_lo="ALU_LO",
-                operand_a_hi="ALU_HI",
-                operand_b_lo="AX_CARRY_LO",
-                operand_b_hi="AX_CARRY_HI",
-                result_lo="OUTPUT_LO",
-                result_hi="OUTPUT_HI",
-                opcode_gate=opcode_gate,
-                marker_gate="MARK_AX",
-                S=S,
-            ))
-        rules = tuple(rule_list)
-        assert len(rules) == 3 * 512, (
-            f"bitwise_rules: expected 1536 rules (3 opcodes x 512), got {len(rules)}"
-        )
+        # Generate per-opcode rule batches (512 rules each: 256 lo + 256 hi)
+        # — shared with the descriptive compiler_ir_factory.
+        rules = _l10_bitwise_lookup_rules(S)
 
         # Size the new PureFFN to match the parent block's d_model. The
         # post_op runs in its own passthrough block downstream (see
@@ -471,6 +515,12 @@ def make_lookup_mode_l10_bitwise_rules_op() -> Operation:
         # path so the dynamic scheduler co-places this op with the L10 ALU.
         target_op_name="layer10_carry_relay",
         bake_fn=bake,
+        # Task #230: descriptive IR for the symbolic gate / faithful
+        # interpreter. NOT lowered in production (``bake_fn`` owns the
+        # weights; ``dispatch_operation_bake`` runs ``declarative_bake_fn``
+        # first and returns). Byte-identical to ``bake`` by construction
+        # (same ``_l10_bitwise_lookup_rules`` + lower path).
+        compiler_ir_factory=_l10_bitwise_lookup_ir,
         # Same phase as the legacy factory (1180 + 10 * 0.01 = 1180.10).
         phase=1180 + 10 * 0.01,
         migrated=True,
