@@ -49,7 +49,8 @@ def mul_width2_enabled() -> bool:
 
 def div_multibyte_enabled() -> bool:
     """Return True iff the multi-byte-dividend DIV/MOD relay is active
-    (DEFAULT OFF — opt-in via ``C4_DIV_MULTIBYTE=1``).
+    (DEFAULT ON — opt-out via ``C4_DIV_MULTIBYTE=0``; +51: div 21->48/50,
+    mod 24->48/50, add/sub guard 84/100 unchanged, smoke 51/0).
 
     Background — the wall this lifts (verified spec_k=0, built dims):
     the lookup-mode ``FlattenedDivMod`` long-division pipeline
@@ -81,12 +82,12 @@ def div_multibyte_enabled() -> bool:
         designated high-byte carrier) at the cummax-picked STACK0_BYTE1
         row instead of ``CLEAN_EMBED_LO/HI``.
 
-    DEFAULT OFF so flag-off is byte-identical to HEAD (divmod stays at
-    block 14, converter reads CLEAN_EMBED). Opt-in via
-    ``C4_DIV_MULTIBYTE=1``. See
+    DEFAULT ON (verified +51 with no add/sub/smoke regression). Opt-out
+    via ``C4_DIV_MULTIBYTE=0`` restores the byte-identical-to-HEAD path
+    (divmod stays at block 14, converter reads CLEAN_EMBED). See
     ``docs/DIV_MOD_MULTIBYTE_DIVIDEND_BLOCKER_2026_06_12.md``.
     """
-    return os.environ.get("C4_DIV_MULTIBYTE", "0") == "1"
+    return os.environ.get("C4_DIV_MULTIBYTE", "1") != "0"
 
 
 def addsub_declarative_enabled() -> bool:
