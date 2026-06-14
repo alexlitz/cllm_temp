@@ -1671,6 +1671,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # to ~15.7). At -10 the 0.013 residue costs ~0.13 (negligible) while a
     # genuine byte_index==1/2/3 or PC/AX/BP byte row (hint == 1) subtracts -10,
     # decisively below the threshold.
+    # OP_ENT-broadcast STACK0 misfire hardening (2026-06-14, var cluster).
+    # This SP-byte1=0xff override is gated almost entirely on OP_ENT, which
+    # BROADCASTS its residue (OP_ENT ~= 10..18 one VM step after ENT -- opcode
+    # markers are not one-hot in-step). spec_k=0 audit (probe_ent_f0_firing.py /
+    # probe_var_l20_ffn.py) showed it leaking onto the LEA-step STACK0
+    # marker/byte rows, forcing OUTPUT high nibble F (0xff) into the empty stack
+    # word -> STACK0[1]=0xff at logit ~2.4e11 (the residual leak that survives
+    # the l16_ent_nested_stack0_saved_bp_byte0_f0 threshold fix in this commit).
+    # The genuine SP byte rows carry H1+2=1 and STACK0_BYTE*=MARK_STACK0=0; the
+    # STACK0-row misfires carry the opposite. The hard MARK_STACK0 (-100) +
+    # STACK0_BYTE{0..3} (-100) blockers below veto the STACK0 marker/byte
+    # misfires (they overpower the OP_ENT broadcast) and are byte-identical on
+    # the genuine SP byte rows (those dims are exactly 0 there). H1+2 / IS_BYTE
+    # weights are deliberately left unchanged: promoting them to make H1+2 a
+    # hard requirement (the only clean separator for the step-2 PC-byte-row
+    # OP_ENT-broadcast misfires that this rule ALSO hits) disturbs the genuine
+    # SP-byte1 firing because H1+2 is ~0.99 there, not exactly 1.0 -- that
+    # remaining family (the step-2 PC desync) is the documented next root, see
+    # docs/VAR_STEP1_STACK0_LEA_DESYNC_2026_06_13.md.
     sp_frame_byte1_ff_conditions = (
         ("OP_ENT", 1.0),
         ("IS_BYTE", 1.0),
@@ -1690,13 +1709,17 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_PC", -10.0),
         ("MARK_SP", -10.0),
         ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
+        ("MARK_STACK0", -100.0),
         ("MARK_MEM", -10.0),
+        ("STACK0_BYTE0", -100.0),
+        ("STACK0_BYTE1", -100.0),
+        ("STACK0_BYTE2", -100.0),
+        ("STACK0_BYTE3", -100.0),
     )
     rules.append(multi_way_and_rule(
         name="l16_ent_frame_sp_byte1_ff",
-        conditions=sp_frame_byte1_ff_conditions,
         threshold=4.5,
+        conditions=sp_frame_byte1_ff_conditions,
         # The SP byte1 prediction row carries a default OUTPUT_HI_THIS_STEP+0
         # ~= +6.9 / OUTPUT_LO+0 ~= +2.9 (the L18 zero-byte default), so the
         # 0xff override needs a margin above that without overshooting (a very
@@ -1780,6 +1803,29 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             for k in range(16)
         ),
     ))
+    # OP_ENT-broadcast misfire fix (2026-06-14, var cluster step-1 LEA STACK0).
+    # This rule fired on a STACK0 *marker* row gated almost entirely on
+    # ``OP_ENT * 10``. spec_k=0 audit (tools/probe_ent_f0_firing.py) over
+    # var / func-call / nested / recursive ENT programs showed it NEVER fires on
+    # a clean ENT-step STACK0 row -- it fires ONLY on the OP_ENT *broadcast*
+    # residue (one VM step after ENT, OP_ENT ~= 9.8..17.5 instead of a clean
+    # one-hot; opcode markers are not one-hot in-step). On every probed program
+    # it lit exactly two broadcast rows, one of them with MARK_STACK0 = 0. On
+    # the var step-1 LEA STACK0 marker row that misfire forced OUTPUT_HI's high
+    # nibble to 0xF (the BP frame value 0xfff0 leaking in), emitting
+    # STACK0 = [240,255,15,15] vs the oracle's empty-top [0,0,0,0]. The bad
+    # STACK0 desynced the step-1 MEM section, prepending 2 spurious 0xFF tokens
+    # to step 2 and shifting every later frame +2 -- the "37-token" full_trace
+    # desync that fails the whole var cluster from step 2 on
+    # (docs/VAR_STEP1_STACK0_LEA_DESYNC_2026_06_13.md).
+    #
+    # Fix: raise the threshold above the OP_ENT broadcast ceiling so the rule
+    # can no longer be triggered by residue. The broadcast gate sum peaks at
+    # ~145 (OP_ENT 17.5*10 + MARK_STACK0 10 + HAS_SE 1 - e8-sig ~41); 2000
+    # (matching the OP_ENT-broadcast-hardened sibling l16_ent_nested_bp_byte0_d8)
+    # is far above any residue. Byte-identical on every legitimate row because
+    # the rule had no legitimate firing (audit above): the empty-stack-top
+    # default (STACK0 = 0) is the correct emission and is what survives.
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_stack0_saved_bp_byte0_f0",
         conditions=(
@@ -1796,7 +1842,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_BP", -1000.0),
             ("MARK_MEM", -1000.0),
         ),
-        threshold=80.0,
+        threshold=2000.0,
         writes=(
             ("OUTPUT_HI_THIS_STEP+15", 5.0),
             ("OUTPUT_HI_THIS_STEP+0", -5.0),
