@@ -729,6 +729,25 @@ def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
                     # and the head-1 actual-IMM suppression in
                     # ``l7_ops._layer7_operand_gather_head_specs``.
                     ("OP_IMM", -1000.0),
+                    # SUBSEQUENT-STEP ENT BLOCKER (absdiff / func / nested /
+                    # rec step-1 ENT-AX leak fix, 2026-06-14). This band is
+                    # the LO-nibble sibling of l9_ops._layer9_ent_hi_nibble_
+                    # rules and leaks the SP-decrement result onto OUTPUT_LO
+                    # at the AX register-marker row. AX must be PRESERVED
+                    # across ENT (C calling convention), so on the JSR->ENT
+                    # prologue step (HAS_SE=1: every corpus func/absdiff/
+                    # nested/rec callee ENT) the band must NOT write the
+                    # SP-decrement low nibble onto AX byte0. The leak was
+                    # masked whenever (sp_lo-(8+imm_lo))%16 == 0 (e.g. main's
+                    # ``ENT 8`` -> result 0), but ``ENT 0`` (every callee with
+                    # no locals) computes result 8 -> AX byte0 = 0x08, the
+                    # universal step-1 divergence for all function-call
+                    # clusters. The FIRST-step ENT (HAS_SE=0, e.g. smoke
+                    # ``test_lea_basic`` whose bytecode opens with ENT) is
+                    # load-bearing (the LEA frame setup reads it) and stays
+                    # byte-identical -- hard-block ONLY the HAS_SE=1 case, the
+                    # exact mirror of the l9 ent_hi_nibble HAS_SE blocker.
+                    ("HAS_SE", -1000.0),
                     (f"ALU_LO+{sp_lo}", 1.0),
                     (f"FETCH_LO+{imm_lo}", 20.0),
                 ),
