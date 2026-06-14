@@ -363,6 +363,21 @@ def all_core_ops(
         # ``stack0_byte0_dump_head_bake`` below. See
         # l11_ops.make_stack0_byte0_dump_carry_op.
         make_stack0_byte0_dump_carry_op(enable=True),
+        # ENT saved-BP store DUMP carry (BP_SAVE_PREV — the func/nested/rec/var
+        # LI-from-frame 37-token desync). The CARRY HEAD half (mirror of the AX
+        # byte-1 / STACK0 byte-0 carries above): the callee's saved-BP store (the
+        # ENT step's MEM val bytes) emits 0xFF garbage because the L14 value heads
+        # content-address the WRONG source at the ENT step. Instead of fixing the
+        # failing same-step attention, this head carries the clean old_BP across
+        # the step boundary: it attends from each ENT-step MEM val-byte-k PREDICTOR
+        # row BACK to the prev step's BP byte-k row (matched per-byte by
+        # ``MEM_VAL_B{k}`` <-> ``BYTE_INDEX_{k}`` + ``OP_JSR`` prologue preference)
+        # and V-copies the clean ``CLEAN_EMBED_LO/HI`` old_BP nibbles into the
+        # dedicated ``BP_SAVE_PREV`` band. The OP_ENT gate + OUTPUT re-supply live
+        # in the partner ``bp_save_dump_repopulate`` FFN below. See
+        # l11_ops.make_bp_save_prev_carry_op and
+        # docs/FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md.
+        make_bp_save_prev_carry_op(enable=True),
         # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=12`` literals.
@@ -597,6 +612,17 @@ def all_core_ops(
         # Standalone PureFFN post_op on the L25 tail block after tail_bit32. See
         # l11_ops.make_stack0_byte0_dump_repopulate_op.
         make_stack0_byte0_dump_repopulate_op(),
+        # ENT saved-BP store DUMP repopulate FFN: the OP_ENT gate + OUTPUT
+        # re-supply half. On the ENT-store val-byte predictor rows (gated on the
+        # high OP_ENT broadcast ~10.7 + the MEM_VAL_B markers, so SI/SC/PSH/JSR
+        # stores stay dark) it re-supplies the carried old_BP nibbles from
+        # ``BP_SAVE_PREV`` (filled by ``bp_save_prev_carry``) DIRECTLY into
+        # ``OUTPUT_LO/HI`` -- overwriting the 0xFF garbage AFTER the tail
+        # corruptor runs, so the LM head emits the clean old_BP byte tokens.
+        # Flag OFF (``C4_BP_SAVE_DUMP=0``): writes nothing into OUTPUT
+        # (byte-identical). Standalone PureFFN post_op on the L25 tail block after
+        # tail_bit32. See l11_ops.make_bp_save_dump_repopulate_op.
+        make_bp_save_dump_repopulate_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).

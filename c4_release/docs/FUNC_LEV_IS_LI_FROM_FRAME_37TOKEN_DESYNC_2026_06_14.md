@@ -203,3 +203,64 @@ already correct).
   value-band residual across blocks (one context, per-block forward).
 * `_probe_li_l15.py <id> <ms> <li_step>` — L15 lookup output at the AX-value row
   (`OUTPUT_LO` per block; shows the lookup never delivers the loaded value).
+
+## PARTIAL LANDING — `BP_SAVE_PREV` cross-step carry (2026-06-14)
+
+A dedicated cross-step carry-band lane (the PROVEN AX-byte-1 / STACK0-byte-0
+pattern) was built and landed **flag-gated default-ON** (`C4_BP_SAVE_DUMP`). It
+fixes the **VALUE** half of the ENT saved-BP store: instead of repairing the
+failing same-step L14 content-addressing, it CARRIES `old_BP` across the step
+boundary and re-emits it into the ENT-step MEM val rows.
+
+**What it achieves (verified spec_k=0 on id550/575):**
+* `func_identity_0` ENT saved-BP store now emits the **clean old_BP**: the
+  callee ENT (step 5) val bytes go `[0,255,18,255]` (0xFF garbage) → `[240,255,
+  0,0]` = 65520; the main ENT (step 1) val bytes → `[0,0,1,0]` = 65536. This is
+  exactly the "clean `[0,0,1,0]` not `[1,255,18,255]`" target above. ✓
+* Smoke **51/0** (SI/SC/LI/LC stay green — the dump fires ONLY on the ENT-store
+  val rows, gated on the high `OP_ENT` broadcast + the `MEM_VAL_B{k}` markers).
+* Byte-identity flag-off (`C4_BP_SAVE_DUMP=0`) == HEAD (weight-hash identical;
+  d_model 981, the band/head/dump are omitted).
+* No guard regression: add/sub/mul/div/if/var are byte-for-byte identical
+  flag-off vs default-on (the dump never fires outside ENT-bearing programs).
+
+**What it does NOT yet fix (why the cluster is still 0/N full_trace):** the LI
+still returns 0 and the post-ENT **37-token desync persists** — because the ENT
+store's **ADDR bytes are STILL 0xFF garbage** (`[255,255,17,0]`) and the
+post-ENT `0xFF` over-emit (the sentinel-magnitude trigger) latches onto THOSE,
+not the val bytes this lane cleaned. So the desync chain has ≥2 more members
+beyond the val store:
+  1. the ENT-store **ADDR** bytes (a SECOND carry — `SP`, not `BP`), and
+  2. the post-ENT `0xFF` over-emitter suppression (other lanes own this).
+
+This confirms the doc's "two-part build" is really a THREE+-part build: the val
+carry (this lane) is necessary but not sufficient; the ADDR carry + the
+over-emit suppression must land together to close the LI. The val carry is a
+clean, isolated, byte-identity-gated building block the next agent can build the
+ADDR carry on top of (mirror `make_bp_save_prev_carry_op` with `SP`-byte source
+and an `ADDR`-row dump gate).
+
+**Implementation** (`C4_BP_SAVE_DUMP`, default ON):
+* `BP_SAVE_PREV` band (32 = 16 LO + 16 HI nibbles), `register_residual_band(...,
+  flag=_bp_save_dump_enabled, never_share=True)` in `ops/l11_ops.py`.
+* `make_bp_save_prev_carry_op` — L13 block-16 head 8 (a widen-padding slot). Q
+  at each ENT val-byte-k PREDICTOR row (`MEM_VAL_B{k}`), K at the prev step's BP
+  byte-k row (`BYTE_INDEX_{k}`) with an `OP_JSR` prev-prologue preference, a
+  same-step-`OP_ENT` reject, and the DECISIVE `STACK0_BYTE{0..3}` reject (the
+  prev JSR step's pushed-arg STACK0 byte rows share the BP byte rows' signature
+  and are NEARER → recency would otherwise carry the arg, not old_BP). V copies
+  `CLEAN_EMBED_LO/HI` (the clean old_BP nibbles — pristine in the token
+  embedding even though the OUTPUT residual is later nuked) into `BP_SAVE_PREV`
+  with a boosted O weight (so the dump gate magnitude dominates the corruptor).
+* `make_bp_save_dump_repopulate_op` — L25 tail PureFFN after
+  `tail_bit32_result_correction`; gate-copies `BP_SAVE_PREV` → `OUTPUT_LO/HI` at
+  the ENT val rows with a SENTINEL-magnitude write_scale (the corruptor pre-loads
+  the rows with ±7e7 0xFF garbage INCLUDING a negative on byte-0's cell, so the
+  additive re-supply must clear both).
+* ALL gate dims resolve from the declarative LAYOUT (`dim_positions`), NOT the
+  registry — the OPPOSITE of the AX/STACK0 carries; verified the residual
+  carries `MEM_VAL_B*/OP_ENT/CLEAN_EMBED/OUTPUT` at LAYOUT positions in this
+  build (e.g. `OUTPUT_LO` layout=69 vs registry=174).
+
+New probes: `tools/_probe_bp_carry{,2,3,4,_check,_attn}.py` (the source-location,
+gate-discriminator, and band/OUTPUT verification chain).

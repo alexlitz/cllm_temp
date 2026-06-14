@@ -1579,6 +1579,25 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "STACK0-marker ``H3`` (low nibble) one-hot into ``STACK0_B0_H3_PREV``. "
         "Same rationale: the clean low-nibble one-hot is absent/corrupted on "
         "the carried step. See ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
+    ('bp_save_prev_carry', 'CLEAN_EMBED_LO.*.-1'):
+        "ENT saved-BP store cross-step carry (BP_SAVE_PREV — the func/nested/"
+        "rec/var LI-from-frame 37-token desync). The carry head reads the "
+        "PREVIOUS VM step's BP byte-k ``CLEAN_EMBED_LO`` (the low nibble of the "
+        "clean old_BP, emitted correctly as the prev step's BP byte token but "
+        "whose same-step OUTPUT residual is later nuked to 0xFF by the tail "
+        "corruptor) and copies it forward into the distinct ``BP_SAVE_PREV`` "
+        "band (read ONLY by the gated dump FFN -> no back-edge). The same-step "
+        "``CLEAN_EMBED_LO`` is the FRESH ENT-step value (0xFF garbage / wrong "
+        "row), so the ``.*.-1`` SSA alias (prev step's value via the KV cache) "
+        "is exactly what we must read. The first ENT-bearing step is never VM "
+        "step 0 (it follows a JSR), so the step-1 zero-propagation does not "
+        "apply. See ops/l11_ops.py make_bp_save_prev_carry_op.",
+    ('bp_save_prev_carry', 'CLEAN_EMBED_HI.*.-1'):
+        "ENT saved-BP store cross-step carry (BP_SAVE_PREV): the HIGH-nibble "
+        "partner of the ``CLEAN_EMBED_LO.*.-1`` read above. Copies the prev "
+        "step's BP byte-k ``CLEAN_EMBED_HI`` (high nibble of old_BP) into "
+        "``BP_SAVE_PREV+16..31``. Same rationale. See ops/l11_ops.py "
+        "make_bp_save_prev_carry_op.",
 }
 
 

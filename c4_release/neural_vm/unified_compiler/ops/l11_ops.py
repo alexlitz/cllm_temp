@@ -120,6 +120,44 @@ register_residual_band(
     "STACK0_B0_NOT_CMP", 1, owner="make_stack0_byte0_not_cmp_flag_op",
     never_share=True,
 )
+# (3) ENT saved-BP store cross-step carry (BP_SAVE_PREV). The ENT step's own
+#     MEM section (the saved-BP store: addr=SP, val=old_BP) emits 0xFF garbage
+#     for the VALUE bytes because the L14 value heads (4-7) content-address the
+#     WRONG source position at the ENT step (the same-step old-BP lookup fails;
+#     see docs/FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md). Instead
+#     of fixing the failing same-step attention, CARRY old_BP across the step
+#     boundary: the BP register holds the clean old_BP at EVERY step (its byte
+#     tokens are emitted correctly; CLEAN_EMBED_LO/HI at the prev-step BP byte
+#     rows decode to the exact old_BP nibbles, even though their OUTPUT residual
+#     is later nuked to 0xFF — verified spec_k=0, tools/_probe_bp_carry3.py on
+#     id550/575). A dedicated L13 carry head copies the prev step's
+#     CLEAN_EMBED_LO/HI (per byte) into ``BP_SAVE_PREV``; a late-tail dump FFN
+#     re-supplies it into OUTPUT_LO/HI at the ENT-step MEM val PREDICTOR rows
+#     (gated on the high OP_ENT broadcast, ~10.7 at the val-predictor rows, so
+#     SI/SC/PSH/JSR stores — which carry OP_JSR or no OP_ENT — stay dark and
+#     byte-identical). BP_SAVE_PREV is 32-wide: a single shared band carries
+#     16 LO + 16 HI nibble one-hots, because the carry head delivers byte k's
+#     nibbles to the (distinct) val-byte-k predictor row, so the four bytes
+#     never collide in the band. The LM head already emits byte tokens from
+#     OUTPUT_LO/HI, so NO new head-bake columns are needed; only the OUTPUT
+#     re-supply is flag-gated (``C4_BP_SAVE_DUMP``, default ON). With the flag
+#     OFF the dump FFN writes nothing into OUTPUT -> byte-identical.
+def _bp_save_dump_enabled() -> bool:
+    """``C4_BP_SAVE_DUMP`` flag predicate (DEFAULT-ON).
+
+    Gates the WHOLE ENT saved-BP carry feature — the ``BP_SAVE_PREV`` band, the
+    L13 carry head, and the L25 dump FFN. Flag-off (``C4_BP_SAVE_DUMP=0``) omits
+    the band entirely (byte-identical pre-carry d_model) and the carry head +
+    dump bake as no-ops. Evaluated lazily (at compile time) so a per-process
+    env flip is honoured and the cache key reflects it.
+    """
+    return _os_stack0.environ.get("C4_BP_SAVE_DUMP", "1") != "0"
+
+
+register_residual_band(
+    "BP_SAVE_PREV", 32, owner="make_bp_save_prev_carry_op",
+    flag=_bp_save_dump_enabled, never_share=True,
+)
 
 
 # === L11 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
@@ -2790,4 +2828,459 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    )
+
+
+# ===========================================================================
+# ENT saved-BP store cross-step carry (BP_SAVE_PREV — the func/nested/rec/var
+# LI-from-frame 37-token desync). MIRRORS the AX byte-1 / STACK0 byte-0 carries
+# above, but carries a 4-BYTE VALUE (old_BP) via CLEAN_EMBED -> OUTPUT instead
+# of a single byte-1 one-hot via the H-bands.
+# ===========================================================================
+#
+# ROOT (spec_k=0, tools/_probe_bp_carry*.py on id550/575): after a function ENT
+# the callee's saved-BP store (the ENT step's MEM section value bytes) emits
+# 0xFF garbage [.,0xff,.,0xff] instead of old_BP because the L14 value heads
+# (4-7) content-address the WRONG source position at the ENT step (the same-step
+# old-BP lookup via slot 44 fails). The garbage VALUE bytes (0xFF) then drive a
+# +2-token 0xFF over-emit on the NEXT step (the post-ENT 37-token desync), which
+# poisons the in-frame MEM section so a later frame-local ``LI`` returns 0 ->
+# func/nested/rec/var diverge at the first ``LI``.
+#
+# FIX (the PROVEN cross-step carry-band pattern, NOT a same-step attention fix):
+# the BP register holds the CLEAN old_BP at EVERY step (its byte TOKENS are
+# emitted correctly, and the token EMBEDDING ``CLEAN_EMBED_LO/HI`` at the
+# prev-step BP byte rows decodes to the exact old_BP nibbles even though the
+# OUTPUT residual there is later nuked to 0xFF). So:
+#   * The carry head (below, L13 block-16 head 8) attends from each ENT-step MEM
+#     val-byte-k PREDICTOR row BACK to the prev step's BP byte-k row (matched by
+#     ``MEM_VAL_B{k}`` Q <-> ``BYTE_INDEX_{k}`` K, with an ``OP_JSR`` K-preference
+#     that selects the prev-step prologue BP rows + positive-ALiBi recency), and
+#     V-copies ``CLEAN_EMBED_LO/HI`` there into the dedicated ``BP_SAVE_PREV``
+#     band. Each byte k lands on a DISTINCT val-predictor row, so one 32-wide
+#     band (16 LO + 16 HI) carries all four bytes without collision.
+#   * The dump FFN (``bp_save_dump_repopulate``) re-supplies ``BP_SAVE_PREV`` ->
+#     ``OUTPUT_LO/HI`` at the ENT-store val-predictor rows ONLY (gated on the
+#     high ``OP_ENT`` broadcast ~10.7 + the ``MEM_VAL_B*`` markers, so SI/SC/PSH/
+#     JSR stores — which carry ``OP_JSR`` or no ``OP_ENT`` — stay byte-identical),
+#     overwriting the 0xFF garbage AFTER the tail corruptor runs. The LM head
+#     already emits byte tokens from OUTPUT_LO/HI, so NO new head-bake columns
+#     are needed; the OUTPUT re-supply is flag-gated (``C4_BP_SAVE_DUMP``,
+#     default ON) -> flag-off is byte-identical (the dump writes nothing).
+_BP_SAVE_PREV_CARRY_HEAD_IDX = 8  # heads 0..7 used on L13; 8/9 free pre-this-band
+_BP_SAVE_PREV_CARRY_HEAD_LAYOUT = (
+    ("bp_save_prev_carry.head_8", _BP_SAVE_PREV_CARRY_HEAD_IDX),
+)
+
+
+def _allocate_bp_save_prev_carry_heads() -> AttentionHeadAllocator:
+    """Per-bake head allocator for the BP_SAVE_PREV carry head (L13 host).
+
+    Head 8 is a WIDEN-padding slot on the physical L13 block (block 16): the
+    AX byte-1 carry (head 7) + mul width=2 relay (head 6) consume the 8-head
+    logical budget, and the residual-band auto-widen pads block 16 to 10
+    physical heads (heads 8/9 all-zero). We pin head 8 (the first free padding
+    slot), so ``layer_max_heads`` must be raised past the default 8.
+    """
+    allocator = AttentionHeadAllocator(
+        strategy="dynamic_first_fit", layer_max_heads=10,
+    )
+    for (op_name, head_idx) in _BP_SAVE_PREV_CARRY_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=13, pin=head_idx)
+    return allocator
+
+
+def _bp_save_prev_carry_head_spec(
+    dim_positions: dict,
+    head_idx: int,
+    *,
+    idx_w: float = 40.0,
+    jsr_w: float = 6.0,
+    ent_block_w: float = 8.0,
+    alibi_slope: float = 0.5,
+) -> DeclarativeAttentionHeadSpec:
+    """Carry head: copy the prev step's BP byte-k CLEAN_EMBED into BP_SAVE_PREV.
+
+    Q row = the ENT-step MEM val-byte-k PREDICTOR row (``MEM_VAL_B{k}`` active).
+    K row = the prev step's BP byte-k row (``BYTE_INDEX_{k}`` active +
+    ``OP_JSR`` prologue broadcast). The per-byte ``MEM_VAL_B{k}`` <->
+    ``BYTE_INDEX_{k}`` pairing (each on its OWN K-slot) makes val_k attend
+    BP byte_k; the ``OP_JSR`` K-bias (its own slot) prefers the prev-step
+    prologue BP rows over any other ``BYTE_INDEX``-carrying row, and the
+    positive ALiBi slope prefers the NEAREST prev step (the immediate caller
+    frame for recursion). V reads ``CLEAN_EMBED_LO/HI`` (the clean old_BP
+    nibble one-hots) at the matched BP byte row; O writes ``BP_SAVE_PREV``
+    (the dedicated band, read ONLY by the gated dump FFN -> no same-step
+    back-edge, no cycle).
+    """
+    # POSITION SOURCE — ALL from the declarative LAYOUT (``dim_positions``).
+    # UNLIKE the AX/STACK0 carries (whose H1/ADDR_B0_LO/AX_CARRY pipeline is
+    # baked by the legacy imperative path at the dynamic *registry* positions),
+    # the dims THIS head taps (``MEM_VAL_B*``, ``BYTE_INDEX_*``, ``OP_JSR``,
+    # ``CLEAN_EMBED_LO/HI``) are carried by the model residual at the LAYOUT
+    # positions in this build — verified spec_k=0 (tools/_probe_bp_carry4.py read
+    # them via ``dim_positions`` and saw value 1.0; the registry positions for
+    # these dims DIFFER, e.g. MEM_VAL_B0 layout=219 vs registry=461, and tap dead
+    # slots). So resolve every dim from ``dim_positions``.
+    def _P(name: str) -> int:
+        return int(dim_positions[name])
+
+    cle_lo = _P("CLEAN_EMBED_LO")   # source nibble one-hot (16-wide)
+    cle_hi = _P("CLEAN_EMBED_HI")
+    op_jsr = _P("OP_JSR")
+    bp_save = int(dim_positions["BP_SAVE_PREV"])  # O target (new band)
+
+    # Slots 0..3: per-byte MEM_VAL_B{k} (Q) <-> BYTE_INDEX_{k} (K) positional
+    # match. Slot 4: OP_JSR K-preference (selects prev-step prologue BP rows).
+    q = []
+    k = []
+    for kk in range(4):
+        mvb = _P(f"MEM_VAL_B{kk}")
+        bidx = _P(f"BYTE_INDEX_{kk}")
+        q.append(AP(kk, mvb, idx_w))
+        k.append(AP(kk, bidx, idx_w))
+    # OP_JSR K-bias on its own slot (CONST-driven Q): the prev-step BP byte rows
+    # carry the JSR-prologue OP_JSR broadcast (~12); the ENT-step val/addr rows do
+    # NOT (they carry OP_ENT instead). A K +OP_JSR, Q CONST biases attention
+    # toward the prev prologue BP rows over the SAME-step ENT rows (which also
+    # carry BYTE_INDEX and are NEARER -> positive-ALiBi recency would otherwise
+    # pull attention onto them, contaminating the carried byte with same-step
+    # addr/val residue — observed: val0/2/3 picked up the ENT addr2 token 0x11).
+    const = _P("CONST")
+    op_ent = _P("OP_ENT")
+    q.append(AP(4, const, jsr_w))
+    k.append(AP(4, op_jsr, jsr_w))
+    # Slot 5: HARD same-step-ENT REJECT. K -OP_ENT (the same-step rows carry
+    # OP_ENT ~5-12; the prev-prologue BP rows carry ~0 OP_ENT). Driven by CONST
+    # on Q -> a strong NEGATIVE score on every same-step ENT row, so the carry
+    # CANNOT attend the current ENT step's own addr/val byte rows. The prev BP
+    # rows (OP_ENT~0) are unaffected.
+    q.append(AP(5, const, ent_block_w))
+    k.append(AP(5, op_ent, -ent_block_w))
+    # Slot 6: HARD STACK0-byte REJECT (the DECISIVE BP-vs-STACK0 discriminator).
+    # The prev JSR step pushes the argument: its STACK0 byte rows carry the
+    # IDENTICAL signature to the BP byte rows (same step -> OP_JSR~12, BYTE_INDEX,
+    # MEM_STORE, ADDR_B0_LO) and are NEARER to the ENT val rows, so positive-ALiBi
+    # recency picks the STACK0 byte (the pushed arg, 0x0a) over the BP byte
+    # (old_BP, 0xF0) — observed: val0 carried 0x0a. The ``STACK0_BYTE0..3`` family
+    # is ~1.0 on STACK0 byte rows and ~0.0 on BP byte rows (PROGRAM-stable across
+    # step0/step4), so a K -SUM(STACK0_BYTE) rejects them and the carry locks onto
+    # the BP byte rows.
+    stack0_block_w = ent_block_w
+    for sbk in range(4):
+        k.append(AP(6, _P(f"STACK0_BYTE{sbk}"), -stack0_block_w))
+    q.append(AP(6, const, stack0_block_w))
+
+    # V/O: copy CLEAN_EMBED_LO[0..15] -> BP_SAVE_PREV[0..15] and
+    # CLEAN_EMBED_HI[0..15] -> BP_SAVE_PREV[16..31]. V slots 10..41 (far from the
+    # Q/K gate slots 0..4). The O write weight is BOOSTED (``O_W``) so the carried
+    # one-hot lands at a LARGE magnitude in ``BP_SAVE_PREV``: the dump FFN reads
+    # it as its multiplicative gate, and the ENT-step val rows are pre-loaded with
+    # SENTINEL-magnitude (~7e7) 0xFF garbage INCLUDING a NEGATIVE suppression on
+    # the correct byte-0 cell (the corruptor writes a symmetric ±7e7 pattern), so
+    # the dump's additive re-supply must clear BOTH the +7e7 wrong cell AND the
+    # -7e7 right-cell suppression. A large gate magnitude makes the dump output
+    # (silu(AND) * gate * write_scale) dominate with margin.
+    v = []
+    o = []
+    V_BASE = 10
+    O_W = 200.0
+    for j in range(16):
+        v.append(AP(V_BASE + j, cle_lo + j, 1.0))
+        o.append(AO(bp_save + j, V_BASE + j, O_W))
+    for j in range(16):
+        v.append(AP(V_BASE + 16 + j, cle_hi + j, 1.0))
+        o.append(AO(bp_save + 16 + j, V_BASE + 16 + j, O_W))
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+        alibi_slope=alibi_slope,
+    )
+
+
+def make_bp_save_prev_carry_op(enable: bool = True) -> Operation:
+    """L13 attn head 8: carry the prev step's old_BP (CLEAN_EMBED) forward.
+
+    The cross-step carry HEAD half of the ENT saved-BP store fix. Copies the
+    PREVIOUS VM step's BP byte-k ``CLEAN_EMBED_LO/HI`` (the clean old_BP
+    nibbles) into the dedicated ``BP_SAVE_PREV`` band, matched per-byte
+    (``MEM_VAL_B{k}`` Q <-> ``BYTE_INDEX_{k}`` K + ``OP_JSR`` prev-prologue
+    preference). The carried-vs-fresh gate + the re-supply into ``OUTPUT_LO/HI``
+    live in the partner ``make_bp_save_dump_repopulate_op`` FFN. Hosted on L13
+    (physical block 16), head 8 (free pre-this-band: L13 declares 0..7).
+    """
+    def bake(block, dim_positions, S):
+        # Flag-gated (``C4_BP_SAVE_DUMP``, default ON): flag-off omits the
+        # ``BP_SAVE_PREV`` band (and this head), so the head can only bake when
+        # the band exists in ``dim_positions``. ``enable`` is the op-level
+        # override (kept for tests/probes).
+        if not enable or not _bp_save_dump_enabled():
+            return
+        attn = block.attn
+        allocator = _allocate_bp_save_prev_carry_heads()
+        attn._l13_bp_save_prev_carry_head_allocator = allocator
+        head_idx = allocator.heads()[-1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec = _bp_save_prev_carry_head_spec(dim_positions, head_idx)
+        Primitives.generate_attention_head(attn, spec, HD)
+
+    def _ir(dim_positions, HD) -> CompilerIR:
+        del HD
+        ir = CompilerIR()
+        if enable and _bp_save_dump_enabled():
+            allocator = _allocate_bp_save_prev_carry_heads()
+            head_idx = allocator.heads()[-1].head_idx
+            spec = _bp_save_prev_carry_head_spec(dim_positions, head_idx)
+            ir.layer(0).attention.append(
+                spec, name="bp_save_prev_carry.head_8",
+            )
+        return ir
+
+    # Flag-off: empty reads/writes so the op never references the OMITTED
+    # ``BP_SAVE_PREV`` band (which would fail ``add_op`` dim validation); the
+    # bake is a no-op in that case.
+    _on = enable and _bp_save_dump_enabled()
+    if _on:
+        reads = {
+            "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+            "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+            "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
+            "OP_JSR", "OP_ENT", "CONST", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+            "CLEAN_EMBED_LO.*.-1", "CLEAN_EMBED_HI.*.-1",
+        }
+        writes = {"BP_SAVE_PREV"}
+    else:
+        reads = set()
+        writes = set()
+
+    return Operation(
+        name="bp_save_prev_carry",
+        # Q@MEM_VAL_B{k} (ENT-step val-byte-k predictor) / K@BYTE_INDEX_{k}
+        # (prev BP byte-k) + OP_JSR prev-prologue preference. V reads the prev
+        # step's CLEAN_EMBED cross-step (``CLEAN_EMBED_LO/HI.*.-1`` -> no
+        # same-step back-edge). O writes the dedicated ``BP_SAVE_PREV`` band
+        # (read ONLY by the gated dump FFN -> no edge from same-step
+        # CLEAN_EMBED/OUTPUT readers -> no cycle).
+        reads=reads,
+        writes=writes,
+        audited_empty_produces=not _on,
+        kind="block",
+        # Bind to the L13 mem-addr anchor (physical block 16, head 8 free). The
+        # L13 read point holds clean MEM_VAL_B / OP_ENT / OP_JSR signatures (the
+        # 0xFF tail corruption is downstream at block 32+).
+        target_op_name="_layer13_mem_addr_anchor",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=_ir,
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# ENT saved-BP store dump FFN (the OP_ENT gate + OUTPUT re-supply)
+# ---------------------------------------------------------------------------
+#
+# The FFN half of the ENT saved-BP carry. The carry head copies the prev step's
+# old_BP nibbles into ``BP_SAVE_PREV`` (per byte, delivered to the val-byte-k
+# predictor row). This FFN re-supplies them into ``OUTPUT_LO``/``OUTPUT_HI`` at
+# the ENT-store val-predictor rows ONLY, where the LM head then emits the clean
+# old_BP byte token. It runs on the L25 tail block AFTER the tail corruptor
+# (which writes the 0xFF garbage), so it is the LAST writer of OUTPUT before the
+# LM head.
+#
+# Gate (measured spec_k=0, tools/_probe_bp_carry4.py at block 32, the dump read
+# point): the ENT-store val-predictor rows carry ``OP_ENT`` ~10.7 + a
+# ``MEM_VAL_B{k}`` marker + ``MEM_STORE``; SI/SC/PSH stores carry ``OP_JSR`` or
+# no ``OP_ENT`` (steps 2/3/6/7/8 in id550 have OP_ENT ~1.x or absent), and JSR
+# pushes carry ``OP_JSR`` ~10.7. So a high-OP_ENT AND a MEM_VAL_B marker
+# uniquely select the ENT saved-BP store value rows. The flag (``C4_BP_SAVE_DUMP``,
+# default ON) gates whether OUTPUT is written: flag-off writes nothing (the
+# carry head still fills the inert BP_SAVE_PREV band, read by nobody) ->
+# byte-identical.
+_BP_SAVE_DUMP_OP_ENT_THRESHOLD = 6.0  # OP_ENT ~10.7 on ENT store, ~1.x elsewhere
+# OUTPUT re-supply write scale. The ENT-step val rows are overwritten with 0xFF
+# SENTINEL-MAGNITUDE garbage (~5e3 to ~7e7) by the L25 tail corruptor BEFORE this
+# dump runs; the residual is ADDITIVE, so the re-supply must net POSITIVE at the
+# correct OUTPUT nibble slot to flip the argmax. write_scale tuned large so
+# ``silu(S*(cond-thr)) * BP_SAVE_PREV * write_scale`` dominates the nuke. Probe
+# override via ``C4_BP_SAVE_DUMP_WS``.
+_BP_SAVE_DUMP_WS = float(
+    _os_stack0.environ.get("C4_BP_SAVE_DUMP_WS", "200000.0")
+)
+
+
+def _bp_save_dump_repopulate_rules(emission_on: bool) -> tuple[FFNRule, ...]:
+    """32 rules: ``OUTPUT_LO/HI[j] = BP_SAVE_PREV[j/16]`` on ENT-store val rows.
+
+    For each val byte k (0..3), the predictor row carries ``MEM_VAL_B{k}``; the
+    16 OUTPUT_LO + 16 OUTPUT_HI nibble cells are gate-copied from the carried
+    ``BP_SAVE_PREV`` band (which holds byte k's CLEAN_EMBED nibbles, delivered to
+    THIS row by the carry head). The gate AND is ``OP_ENT >= 6.0`` (the
+    ENT-store discriminator) AND ``MEM_VAL_B{k}`` (the val-byte-k row) — so the
+    rule fires ONLY on the ENT saved-BP store value rows, never on SI/SC/PSH/JSR
+    stores. When ``emission_on`` is False the OUTPUT writes are dropped (the
+    rules write the inert BP_SAVE_PREV band onto itself, a no-op) ->
+    byte-identical to the pre-carry build.
+    """
+    # Balanced AND: OP_ENT*1.0 (>= 6 on ENT store) + MEM_VAL_B{k}*8.0 (the row
+    # marker) over threshold; the MEM_VAL_B marker (weight 8) is the row
+    # selector, OP_ENT (~10.7) is the opcode discriminator. Threshold sits ABOVE
+    # the non-ENT-store classes (OP_ENT <= ~1.5) and below the ENT store
+    # (10.7 + 8 = 18.7).
+    OPENT_W = 1.0
+    MVB_W = 8.0
+    # Structural marker blockers: the OUTPUT re-supply must NOT fire on a
+    # register-marker row even if OP_ENT broadcasts there (it stays at the
+    # val-byte rows, which carry MEM_VAL_B + IS_BYTE, NOT the markers).
+    marker_blockers = (
+        ("MARK_PC", -1_000.0),
+        ("MARK_AX", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_STACK0", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    # Flag-off: the ``BP_SAVE_PREV`` band is OMITTED from the layout (the band is
+    # registered with ``flag=_bp_save_dump_enabled``), so the dump produces ZERO
+    # rules and the whole op is inert -> byte-identical pre-carry build.
+    if not emission_on:
+        return ()
+    threshold = _BP_SAVE_DUMP_OP_ENT_THRESHOLD + MVB_W  # OP_ENT>=6 AND MEM_VAL_B
+
+    rules: list[FFNRule] = []
+    for kk in range(4):
+        conditions = (
+            ("OP_ENT", OPENT_W),
+            (f"MEM_VAL_B{kk}", MVB_W),
+        ) + marker_blockers
+        for nib in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"bp_save_dump_val{kk}_lo_{nib}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"BP_SAVE_PREV+{nib}",
+                writes=((f"OUTPUT_LO+{nib}", _BP_SAVE_DUMP_WS),),
+            ))
+        for nib in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"bp_save_dump_val{kk}_hi_{nib}",
+                conditions=conditions,
+                threshold=threshold,
+                gate=f"BP_SAVE_PREV+{16 + nib}",
+                writes=((f"OUTPUT_HI+{nib}", _BP_SAVE_DUMP_WS),),
+            ))
+    return tuple(rules)
+
+
+def make_bp_save_dump_repopulate_op() -> Operation:
+    """Append the ENT saved-BP dump FFN after the L25 tail block.
+
+    Copies ``BP_SAVE_PREV`` -> ``OUTPUT_LO/HI`` at the ENT-store val-predictor
+    rows (gated on the high OP_ENT broadcast + the MEM_VAL_B markers), so the LM
+    head re-emits the clean old_BP byte tokens. Standalone ``PureFFN`` post_op on
+    the L25 tail block, after ``tail_bit32_result_correction`` (the 0xFF-garbage
+    corruptor), so it is the last writer of OUTPUT before the LM head.
+    """
+    emission_on = _bp_save_dump_enabled()
+    rules = _bp_save_dump_repopulate_rules(emission_on)
+
+    def bake(block, dim_positions, S):
+        if not rules:
+            return  # flag-off: inert (BP_SAVE_PREV band omitted)
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        # dim_map — ALL from the declarative LAYOUT (``dim_positions``). The gate
+        # dims THIS dump taps (``OP_ENT``, ``MEM_VAL_B*``, ``OUTPUT_LO/HI``) are
+        # carried by the model residual at the LAYOUT positions in this build
+        # (verified spec_k=0: OP_ENT~10.7 + OUTPUT decode read via ``dim_positions``;
+        # the registry positions for these DIFFER, e.g. OUTPUT_LO layout=69 vs
+        # registry=174, and tap dead slots). The ``MARK_*`` blockers are at the
+        # SAME index in both maps, and ``BP_SAVE_PREV`` exists only in the layout,
+        # so resolving everything from ``dim_positions`` is correct. (This is the
+        # OPPOSITE of the AX/STACK0 dumps, whose H1/ADDR_B0_LO/AX_CARRY pipeline
+        # IS at the registry positions — those dims are baked by the legacy path.)
+        from ...dim_registry_dynamic import build_default_registry_dynamic
+        _reg = build_default_registry_dynamic()  # noqa: F841 (parity w/ peers)
+        _new_bands = {
+            "BP_SAVE_PREV", "OP_ENT", "OUTPUT_LO", "OUTPUT_HI",
+            "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+            "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "MARK_SE",
+        }
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            if _base in _new_bands:
+                dim_map[_nm] = int(dim_positions[_base]) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+            else:
+                dim_map[_nm] = int(_reg.slots[_base].start) + (
+                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+                )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    # Flag-off: empty reads/writes so the op never references the OMITTED
+    # ``BP_SAVE_PREV`` band (which would fail ``add_op`` dim validation).
+    if emission_on:
+        reads = {
+            "OP_ENT", "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+            "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "MARK_SE", "BP_SAVE_PREV",
+        }
+        writes = {"OUTPUT_LO", "OUTPUT_HI", "BP_SAVE_PREV"}
+    else:
+        reads = set()
+        writes = set()
+
+    return Operation(
+        name="bp_save_dump_repopulate",
+        reads=reads,
+        writes=writes,
+        audited_empty_produces=not emission_on,
+        kind="block",
+        # Append AFTER the tail correction on the L25 tail block, so this op is
+        # the LAST writer of OUTPUT_LO/HI before the LM head reads them (it runs
+        # after the block-32+ corruptor that writes the 0xFF garbage).
+        target_op_name="l10_post_ops_combined",
+        requires={"after": ("tail_bit32_result_correction",)},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md",
     )
