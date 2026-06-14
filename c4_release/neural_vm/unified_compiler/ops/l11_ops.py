@@ -26,8 +26,9 @@ from .residual_band_registry import register_residual_band
 # one-hot (observed: H1_DUMP_OUT slot 323 returned a stale 1.0). The registry
 # threads these names into ``LayerCompiler._LIVENESS_NEVER_SHARE`` per-compile.
 # Registration order here is load-bearing: it fixes the tail dim_positions
-# (AX bands, then the four Root 2 PREV/DUMP bands, then the four bounded Root 2
-# flag bands) — byte-identical to the legacy central dict ordering.
+# (AX H1 bands + AX_CARRY_OVERFLOW, then the H2/H3 value-general AX bands, then
+# the four Root 2 PREV/DUMP bands, then the four bounded Root 2 flag bands) —
+# byte-identical to the legacy central dict ordering.
 #
 # (1) AX byte-1 register-dump cross-step carry. ``H1_PREV_STEP`` carries the
 #     prev step's H1 one-hot from the L13 carry head to the L25 dump FFN
@@ -47,6 +48,37 @@ register_residual_band(
 )
 register_residual_band(
     "AX_CARRY_OVERFLOW", 1, owner="make_ax_byte1_carry_overflow_flag_op",
+    never_share=True,
+)
+# (1b) AX byte-1 register-dump VALUE-GENERALISATION (byte-1 0..15). The
+#     fresh-step byte-1 emission one-hot is SPREAD across the LM-head's H1/H2/H3
+#     marker-distance bands (``head.weight[v, H<k>+off]=+5.0``): v=0..4 ->
+#     H1+(v+2), v=5..11 -> H2+(v-5), v=12..15 -> H3+(v-12). The original carry
+#     copied ONLY the H1 band, so byte-1 >= 5 (whose live one-hot sits in H2/H3
+#     on the producing step) was DROPPED to 0 on the carried step (the whole
+#     add/sub corpus has byte-1 0..7 -> the H2 band). These two band-pairs
+#     mirror ``H1_PREV_STEP`` / ``H1_DUMP_OUT`` for the H2 and H3 one-hots: the
+#     L13 carry head ALSO V-copies the prev step's H2/H3 one-hot here (cross-step
+#     ``H2.*.-1`` / ``H3.*.-1``); the L25 dump FFN copies them to the DUMP bands
+#     on carried steps (the SAME AX_CARRY band-pass + ``AX_CARRY_OVERFLOW`` kill
+#     gate, so they NEVER over-fire on PC/SP/BP rows); the LM head reads them via
+#     mirrored ``ax_byte1_dump_head_bake`` columns. Registered right after the
+#     AX_CARRY_OVERFLOW flag and BEFORE the Root 2 bands to keep the tail
+#     ``dim_positions`` order load-bearing-identical to the legacy central dict.
+register_residual_band(
+    "H2_PREV_STEP", 7, owner="make_layer11_ax_byte1_dump_carry_op",
+    never_share=True,
+)
+register_residual_band(
+    "H2_DUMP_OUT", 7, owner="make_ax_byte1_dump_repopulate_op",
+    never_share=True,
+)
+register_residual_band(
+    "H3_PREV_STEP", 7, owner="make_layer11_ax_byte1_dump_carry_op",
+    never_share=True,
+)
+register_residual_band(
+    "H3_DUMP_OUT", 7, owner="make_ax_byte1_dump_repopulate_op",
     never_share=True,
 )
 # (2) Root 2 STACK0 byte-0 cross-step emission carry. The four PREV/DUMP bands
@@ -1068,6 +1100,8 @@ def _layer13_ax_byte1_dump_carry_head_spec(
         return int(_reg.slots[name].start)
 
     h1 = _P("H1")            # registry H1 (cross-step V read of prev one-hot)
+    h2 = _P("H2")            # registry H2 (byte-1 5..11 one-hot, cross-step V)
+    h3 = _P("H3")            # registry H3 (byte-1 12..15 one-hot, cross-step V)
     addr_sig = _P("ADDR_B0_LO") + 5
     axc_lo = _P("AX_CARRY_LO")
     axc_hi = _P("AX_CARRY_HI")
@@ -1075,6 +1109,9 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     mark_ax = _P("MARK_AX")
     # H1_PREV_STEP O target: from the bake layout (new band, not in registry).
     h1_prev = int(dim_positions["H1_PREV_STEP"])
+    # H2/H3 PREV O targets (value-general byte-1 5..15; same new-band source).
+    h2_prev = int(dim_positions["H2_PREV_STEP"])
+    h3_prev = int(dim_positions["H3_PREV_STEP"])
 
     # Slot design (the AX_CARRY fresh-preference MUST be on its OWN slot, not
     # mixed into the signature slot). The earlier mixed design failed because
@@ -1115,6 +1152,19 @@ def _layer13_ax_byte1_dump_carry_head_spec(
     for j in range(H1_W):
         v.append(AP(V_BASE + j, h1 + j, 1.0))       # V: prev H1 (cross-step)
         o.append(AO(h1_prev + j, V_BASE + j, 1.0))  # O: write H1_PREV_STEP
+    # Value-general byte-1 (5..15): also carry the prev step's H2/H3 one-hots
+    # forward. The fresh-step emission one-hot for byte-1 v sits in H2 (v=5..11)
+    # or H3 (v=12..15), NOT H1 (v=0..4), so the H1-only carry dropped v>=5. Copy
+    # the SAME prev row's H2/H3 bands into their own PREV bands (disjoint V/O
+    # slots 17..23 / 24..30 within the 109-wide head — far from the gate slots).
+    H2_VBASE = V_BASE + H1_W            # 17
+    H3_VBASE = H2_VBASE + H1_W          # 24
+    for j in range(H1_W):
+        v.append(AP(H2_VBASE + j, h2 + j, 1.0))      # V: prev H2 (cross-step)
+        o.append(AO(h2_prev + j, H2_VBASE + j, 1.0))  # O: write H2_PREV_STEP
+    for j in range(H1_W):
+        v.append(AP(H3_VBASE + j, h3 + j, 1.0))      # V: prev H3 (cross-step)
+        o.append(AO(h3_prev + j, H3_VBASE + j, 1.0))  # O: write H3_PREV_STEP
 
     return DeclarativeAttentionHeadSpec(
         head_idx=head_idx,
@@ -1181,8 +1231,12 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
         # the head one of the H1 readers but does NOT cycle (it WRITES
         # H1_PREV_STEP, read by nobody upstream). ``H1.*.-1`` is the V-side
         # cross-step read of the prev step's one-hot to copy forward.
-        reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1", "H1.*.-1"},
-        writes={"H1_PREV_STEP"},
+        reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1", "H1.*.-1",
+               # Value-general byte-1 (5..15): the prev step's H2/H3 one-hots
+               # are V-copied cross-step into H2/H3_PREV_STEP (read by nobody
+               # upstream, like H1.*.-1 -> no same-step back-edge / no cycle).
+               "H2.*.-1", "H3.*.-1"},
+        writes={"H1_PREV_STEP", "H2_PREV_STEP", "H3_PREV_STEP"},
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_ir,
@@ -1227,7 +1281,7 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
 # 2-cycle: a late FFN writing ``H1`` while reading ``AX_CARRY`` would cycle
 # (``layer6_routing_ffn`` reads ``H1`` AND writes ``AX_CARRY``). ``H1_DUMP_OUT``
 # is read only by the LM head (a model-level forward edge), so no back-edge.
-_AX_BYTE1_DUMP_REPOPULATE_HIDDEN_DIM = 7
+_AX_BYTE1_DUMP_REPOPULATE_HIDDEN_DIM = 21  # 7 (H1) + 7 (H2) + 7 (H3)
 
 
 def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
@@ -1334,6 +1388,23 @@ def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
             # (one-hot argmax slot preserved; LM head emits the right token).
             writes=((f"H1_DUMP_OUT+{j}", 0.02),),
         ))
+    # Value-general byte-1 (5..15): the SAME gated copy for the H2/H3 PREV bands
+    # the carry head now also fills. The carried-vs-fresh gate (AX_CARRY split +
+    # OVERFLOW kill + byte-1 signature) is byte-1-VALUE-INDEPENDENT, so the H2/H3
+    # copies reuse the identical ``conditions`` / ``threshold`` and only change
+    # the gate/write band. On a byte-1 0..4 carried row the prev H2/H3 one-hots
+    # are ~0 (the value lives in H1) so these write ~0 -> the LM emission is
+    # unchanged; on a byte-1 5..15 row H1_PREV is ~0 and the H2/H3 copy supplies
+    # the carried one-hot. Fresh steps: all PREV bands 0 (gate dark anyway).
+    for band in ("H2", "H3"):
+        for j in range(H1_W):
+            rules.append(multi_way_and_rule(
+                name=f"ax_byte1_dump_repopulate_{band.lower()}_slot_{j}",
+                conditions=conditions,
+                threshold=4.5,
+                gate=f"{band}_PREV_STEP+{j}",
+                writes=((f"{band}_DUMP_OUT+{j}", 0.02),),
+            ))
     return tuple(rules)
 
 
@@ -1555,7 +1626,12 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
         # AX_CARRY_OVERFLOW is also a NEW declarative band (written by the
         # precursor at dim_positions), so it resolves from the layout, not the
         # legacy registry.
-        _new_bands = {"H1_PREV_STEP", "H1_DUMP_OUT", "AX_CARRY_OVERFLOW"}
+        _new_bands = {
+            "H1_PREV_STEP", "H1_DUMP_OUT",
+            "H2_PREV_STEP", "H2_DUMP_OUT",
+            "H3_PREV_STEP", "H3_DUMP_OUT",
+            "AX_CARRY_OVERFLOW",
+        }
         dim_map = {}
         for _nm in Primitives.ffn_rule_dim_names(rules):
             _base = _nm.split("+", 1)[0]
@@ -1579,8 +1655,11 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
             "ADDR_B0_LO", "ADDR_B1_HI", "AX_CARRY_LO", "AX_CARRY_HI",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
             "MARK_MEM", "MARK_SE", "H1_PREV_STEP", "AX_CARRY_OVERFLOW",
+            # Value-general byte-1 (5..15): the H2/H3 PREV bands the carry head
+            # now fills; gated-copied into the H2/H3 DUMP bands (same gate).
+            "H2_PREV_STEP", "H3_PREV_STEP",
         },
-        writes={"H1_DUMP_OUT"},
+        writes={"H1_DUMP_OUT", "H2_DUMP_OUT", "H3_DUMP_OUT"},
         kind="block",
         # Append AFTER the tail correction AND after the overflow-flag precursor
         # on the same L25 block, so this op is the last writer of H1_DUMP_OUT

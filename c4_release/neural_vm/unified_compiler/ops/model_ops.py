@@ -2001,18 +2001,49 @@ def make_head_bake_op() -> Operation:
 # zeroes), and ``H1_DUMP_OUT`` is all-zero on fresh steps -> the byte-1
 # emission is byte-identical on fresh steps and additively re-emits the
 # carried high byte on carried steps.
-_AX_BYTE1_DUMP_HEAD_MAX_VALUE = 4  # H1 is 7-wide -> one-hot slots +2..+6
+_AX_BYTE1_DUMP_HEAD_MAX_VALUE = 15  # value-general: H1 (0..4) + H2 (5..11) +
+#                                     H3 (12..15) mirror the LM-head H-band map
+
+
+def _ax_byte1_dump_band_for_value(v: int) -> tuple[str, int]:
+    """Return ``(DUMP_band, offset)`` mirroring the LM head's H-band emission.
+
+    The LM head emits byte token ``v`` at the byte-1 predictor row via a
+    positional one-hot SPREAD across its marker-distance H-bands (verified by
+    ``tools/probe_hband_byte1_map.py``, spec_k=0):
+
+      * v in 0..4   -> ``H1+(v+2)``
+      * v in 5..11  -> ``H2+(v-5)``
+      * v in 12..15 -> ``H3+(v-12)``
+
+    The carried-step dump must therefore write the SAME (band, offset) into the
+    matching private ``H<k>_DUMP_OUT`` band so the additive LM column re-emits
+    the right token. Original H1-only carry capped byte-1 at 4 (v>=5 lives in
+    H2/H3); this generalises it to 0..15 (covers the whole add/sub corpus,
+    whose high byte is 0..7 -> the H2 band).
+    """
+    if v <= 4:
+        return "H1_DUMP_OUT", v + 2
+    if v <= 11:
+        return "H2_DUMP_OUT", v - 5
+    return "H3_DUMP_OUT", v - 12
 
 
 def _ax_byte1_dump_head_bake_rules(vocab_size: int) -> tuple:
-    """``head.weight[token v, H1_DUMP_OUT+(v+2)] += 5.0`` for v in 0..4."""
+    """``head.weight[token v, H<k>_DUMP_OUT+off] += 5.0`` for v in 0..15.
+
+    Value-general byte-1 register-dump emission columns. Mirrors the LM head's
+    own H1/H2/H3 byte-1 one-hot layout onto the private ``H<k>_DUMP_OUT`` bands
+    the carry FFN fills on carried steps (see ``_ax_byte1_dump_band_for_value``).
+    """
     rules: list[TokenEmbeddingRule] = []
     for v in range(_AX_BYTE1_DUMP_HEAD_MAX_VALUE + 1):
         if v >= vocab_size:
             break
+        band, off = _ax_byte1_dump_band_for_value(v)
         rules.append(TokenEmbeddingRule.head_weight_write(
             token_ids=[v],
-            writes=((f"H1_DUMP_OUT+{v + 2}", 5.0),),
+            writes=((f"{band}+{off}", 5.0),),
             name=f"ax_byte1_dump_head_token_{v}",
         ))
     return tuple(rules)

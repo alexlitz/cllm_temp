@@ -7,18 +7,55 @@ now **default ON**; opt out with `C4_AX_BYTE1_DUMP=0` to restore the
 byte-identical pre-carry behaviour. The last-mile gate over-fire (SHL/JMP) is
 RESOLVED by a two-sided Σ AX_CARRY band-pass (see "Gate" below).
 
+## VALUE-GENERAL byte-1 (0..15) — LANDED (2026-06-13, update)
+
+The original carry copied ONLY the 7-wide `H1` one-hot, so byte-1 capped at
+value ≤ 4 (`H1+(v+2)`, slots +2..+6); byte-1 ≥ 5 was DROPPED to 0 on the
+carried step (the dominant remaining add/sub full-trace fail, e.g. `sub_4`
+`1347-81` byte-1 0x05 → emitted 67; `sub_6` `1593-31` byte-1 0x06 → 57). The
+root: the LM head's byte-1 emission one-hot is SPREAD across its
+marker-distance bands `head.weight[v, H<k>+off]=+5.0` (verified
+`tools/probe_hband_byte1_map.py`, spec_k=0): **v∈0..4 → H1+(v+2); v∈5..11 →
+H2+(v-5); v∈12..15 → H3+(v-12)**. The H1-only carry never copied the H2/H3
+bands where v≥5's live one-hot sits on the producing step, so the value was
+genuinely absent on the carried row (no value band: `SE_AX_CARRY` / `AX_FULL` /
+`OUTPUT_LO/HI` are all capped/constant/zero there — confirmed by probe).
+
+Fix (a pure EMISSION re-point, no compute change): mirror the H1 machinery for
+the H2 and H3 bands. Two new band-pairs `H2_PREV_STEP/H2_DUMP_OUT` +
+`H3_PREV_STEP/H3_DUMP_OUT` (`_PRODUCTION_EXTRA_RESIDUAL_DIMS`, +28 dims,
+auto-widen head-dim-preserving — d_model stays **981**, n_heads 9, no `bnz`
+regression). The L13 carry head ALSO V-copies the prev step's `H2.*.-1` /
+`H3.*.-1` one-hots into the new PREV bands (disjoint V/O slots 17..30 in the
+109-wide head); the L25 dump FFN copies them to the DUMP bands under the SAME
+AX_CARRY gate (14 extra rules, value-independent gate); the head bake mirrors
+the LM `H<k>+off` columns onto `H<k>_DUMP_OUT` for v∈0..15
+(`_ax_byte1_dump_band_for_value`). The whole add/sub corpus has byte-1 0..7
+(→ the H2 band), so this closes the H2 gap entirely.
+
 ## Results (spec_k=0, GPU 0, canonical runner = efficient ALU)
 
 | build | add 0-49 full_trace | sub 50-99 full_trace | smoke |
 |-------|---------------------|----------------------|-------|
 | baseline (pre-carry) | 12/50 | 5/50 | 50/1 |
 | `C4_AX_BYTE1_DUMP=0` (opt-out) | 12/50 (byte-identical) | 5/50 | **50/1** |
-| `C4_AX_BYTE1_DUMP=1` (**default**) | **40/50** (+28) | **27/50** (+22) | **50/1** |
+| H1-only carry (prior landing) | 40/50 | 27/50 | 50/1 |
+| **value-general H1+H2+H3 (this update)** | **40/50** | **44/50** (+17) | **51/0** |
 
-(The single remaining smoke failure in every column is the pre-existing
-`simple_function` JSR/ENT/LEV arch-block — identical to clean main; NOT a
-carry regression.) id-0 (`654+114`) passes at the default: the PSH-step byte-1
+`sub_4` (1347-81) and `sub_6` (1593-31) now PASS full-trace (step-1 carried AX
+= 1347 / 1593). A direct byte-1 5..15 sweep (`b1*256+0x40`) is now all-PASS
+(was all-drop at ≥5). The fresh byte-1 ≤4 path is byte-identical (spot-check
+all-OK). The add cluster is UNCHANGED at 40/50 (its 10 fails are at step=3, the
+ADD-*result* fresh emission — a separate fresh-step root, not the carry; they
+were identical in the pre-carry baseline). Smoke is **51/0** (the prior
+`simple_function` arch-block now passes via the per-step actual-IMM gate landed
+in `dedbb063`). id-0 (`654+114`) passes at the default: the PSH-step byte-1
 dump re-emits `0x02` (654) instead of dropping it (142).
+
+(Below documents the original H1-only landing; the H2/H3 extension reuses every
+piece of it verbatim — same carry head, dump FFN gate, overflow precursor and
+band-pass — only the band set, the carry head V/O loop, the dump-FFN rule
+count, and the head-bake value→band map are widened from H1 to H1+H2+H3.)
 
 ## Integration onto main (mul width=2 default-on)
 

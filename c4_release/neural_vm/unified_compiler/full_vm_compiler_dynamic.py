@@ -1540,6 +1540,26 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "``H1_PREV_STEP``, read by nobody upstream). See "
         "ops/l11_ops.py make_layer11_ax_byte1_dump_carry_op and "
         "docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.",
+    ('layer13_ax_byte1_dump_carry', 'H2.*.-1'):
+        "AX byte-1 register-dump carry VALUE-GENERALISATION (byte-1 5..11): "
+        "the H2-band partner of the ``H1.*.-1`` read above. The fresh-step "
+        "byte-1 emission one-hot is SPREAD across the LM head's H1/H2/H3 "
+        "marker-distance bands (v 0..4 -> H1, 5..11 -> H2, 12..15 -> H3); the "
+        "H1-only carry dropped byte-1 >= 5. This reads the PREVIOUS step's "
+        "``H2`` one-hot via the ``.*.-1`` SSA alias (the only same-step ``H2`` "
+        "writer is the L0 ``layer0_threshold_attn`` topology producer, which "
+        "holds the CURRENT carried-step empty one-hot — the value we must NOT "
+        "read) and copies it into the distinct ``H2_PREV_STEP`` band (read by "
+        "nobody upstream -> no back-edge / no 2-cycle). See ops/l11_ops.py "
+        "make_layer11_ax_byte1_dump_carry_op and "
+        "docs/AX_BYTE1_DUMP_CARRY_LANDED_2026_06_13.md.",
+    ('layer13_ax_byte1_dump_carry', 'H3.*.-1'):
+        "AX byte-1 register-dump carry VALUE-GENERALISATION (byte-1 12..15): "
+        "the H3-band partner of the ``H1.*.-1`` / ``H2.*.-1`` reads above. "
+        "Same rationale: reads the PREVIOUS step's ``H3`` one-hot via the "
+        "``.*.-1`` SSA alias and copies it into the distinct ``H3_PREV_STEP`` "
+        "band (read by nobody upstream). See ops/l11_ops.py "
+        "make_layer11_ax_byte1_dump_carry_op.",
     ('stack0_byte0_dump_carry', 'H1.*.-1'):
         "STACK0 byte-0 cross-step emission carry (Root 2). The carry head's "
         "purpose is to read the PREVIOUS VM step's STACK0-marker ``H1`` (high "
@@ -1990,6 +2010,13 @@ def compile_full_vm_dynamic(
     # NOT be op-declared ``declare_dim``s. To add a new band-adding op, call
     # ``register_residual_band`` at that op's module top — never touch this file.
     # See docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md.
+    #
+    # AX byte-1 VALUE-GENERALISATION (byte-1 0..15): the carry now ALSO copies
+    # the H2/H3 marker-distance one-hots (``H2/H3_PREV_STEP`` ->
+    # ``H2/H3_DUMP_OUT``, +28 dims) because the fresh-step byte-1 emission
+    # one-hot is SPREAD across H1 (v 0..4) / H2 (v 5..11) / H3 (v 12..15). Those
+    # four bands are now ALSO declared op-locally via ``register_residual_band``
+    # in ``ops/l11_ops.py`` (next to the H1 pair), so they auto-collect here.
     from .ops.residual_band_registry import (
         collect_registered_residual_bands,
         collect_never_share_band_names,

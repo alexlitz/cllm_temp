@@ -2423,9 +2423,10 @@ class LayerCompiler:
         "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT",
         "SE_OP_GT", "SE_OP_LE", "SE_OP_GE",
         # NOTE: the AX byte-1 register-dump carry bands (``H1_PREV_STEP`` /
-        # ``H1_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``) and the Root 2 STACK0 byte-0
-        # carry bands (``STACK0_B0_*``) USED to be hand-listed here. They are now
-        # declared OP-LOCALLY with ``never_share=True`` via
+        # ``H1_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``), their VALUE-GENERAL H2/H3
+        # extension (``H2/H3_PREV_STEP`` / ``H2/H3_DUMP_OUT``), and the Root 2
+        # STACK0 byte-0 carry bands (``STACK0_B0_*``) USED to be hand-listed
+        # here. They are now declared OP-LOCALLY with ``never_share=True`` via
         # ``ops/residual_band_registry.py`` (next to the carry/dump ops that own
         # them) and threaded into this set per-compile by
         # ``compile_full_vm_dynamic`` -> ``LayerCompiler.add_never_share_names``.
