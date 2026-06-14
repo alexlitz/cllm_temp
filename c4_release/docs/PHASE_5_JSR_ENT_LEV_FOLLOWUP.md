@@ -430,3 +430,97 @@ single-commit fixes empirically refuted. Throwaway probes removed; worktree left
 green 49/2 baseline. NOTE: a parallel agent shares GPU 1 — full-smoke runs can
 spuriously pytest-timeout the memory cluster under contention; verify those in
 isolation (each passes solo).
+
+## 2026-06-14 spec_k=0 (agent, HEAD da09f54a) — func/nested cascade re-pinned to the NON-FIRST-PSH SP-decrement (PSH_AT_SP is DEAD) + nested-JSR PC override blocked by broadcast OP_ENT; new wall, byte-identity-safe fix not found
+
+After dedbb063 fixed the step-1 ENT=8 *operand* corruption (simple_function now
+PASSES, smoke 51/0), the **func (150)** + **nested (50)** clusters still fail.
+A fresh hook-free spec_k=0 probe (GroundTruthProbe `_final_context` +
+`residual_at`, one build, ~9 throwaway probes all removed; **NO production weight
+change made — `git diff` empty**) pins the surviving cascade precisely.
+
+### Ground-truth per-step register trace (func_identity_0 = identity(70), want 70 → got 72)
+Decoded the emitted REG_PC/AX/SP/BP per step and diffed vs the symbolic oracle:
+
+| step | op  | sym SP | neu SP | sym PC | neu PC | note |
+|------|-----|--------|--------|--------|--------|------|
+| 0 | JSR | fff8 | fff8 | 003a | 003a | ✓ (ret-addr push works) |
+| 1 | ENT | fff0 | fff0 | 0042 | 0042 | SP ✓; **AX=8 benign** (recovers at next IMM) |
+| 2 | IMM | fff0 | fff0 | 004a | 004a | ✓ AX=0x46=70 recovered |
+| 3 | PSH | **ffe8** | **fff8** ✗ | 0052 | 0052 | **non-first PSH fails to decrement SP** (byte0 0xf0→0xf8, the stale initial-stack default, not 0xe8) |
+| 4 | JSR | **001a** | **005a** ✗ | — | — | **nested JSR never jumps** — PC = fall-through (pc+8), not the callee entry |
+
+After step 4 the run derails (callee body never runs). func_add_0 is identical:
+step-3 PSH SP `ffe8→fff8`, step-6 nested JSR PC `001a→008a` fall-through. So the
+two FATAL divergences are (a) the non-first PSH SP-decrement and (b) the
+nested-JSR PC override — exactly as the brief framed.
+
+### Root A — the PSH SP-decrement is DEAD CODE: its gate `PSH_AT_SP` is never produced
+`_layer6_psh_sp_decrement_rules` (l6_ops.py:970) computes `SP_byte0 = EMBED-8` at
+the SP marker, gated `("PSH_AT_SP",1.0)+("MARK_SP",1.0)` thr 1.5. **Probed
+`PSH_AT_SP` at the SP marker across ALL 37 blocks on a real PSH step (func and a
+plain non-call `IMM;PSH;IMM;PSH;IMM;ADD` control): it is `0.000` at every
+block/step, on the working first-PSH AND the failing later-PSH.** PSH_AT_SP is
+also 0 at the PC/AX/BP markers (there is no emitted STACK0 marker). So the entire
+PSH SP-decrement chain never fires.
+- The producer (`model_ops` L6 head 6, V slot1 reads `OP_PSH`×0.2, K=MARK_AX) and
+  the L7-head-6 relay both depend on `OP_PSH` at the AX marker — but **`OP_PSH` at
+  the AX marker is a hard CONSTANT `+1.00` on EVERY step at EVERY block** (IMM,
+  PSH, ADD all read 1.0; identical to the OP_ENT-constant story). Unlike dedbb063's
+  win, there is **NO clean per-step `OP_PSH`** (dedbb063 exploited `OP_IMM`, which IS
+  per-step clean in the ENT frame; `OP_PSH` is not). There is no `SE_OP_PSH` either
+  (the SE band carries only the 6 comparison opcodes). So you cannot resurrect
+  PSH_AT_SP from any existing per-step PSH discriminator — gating on the constant
+  OP_PSH would decrement SP on every step and break all 51 smoke tests.
+- Why the FIRST push still "works": `SP=0x10000-8=0xFFF8` coincides with the
+  initial-stack bootstrap default (`SP_BYTE0_IS_F8` / `tail_sp_marker_byte0_f8_*`).
+  The 2nd push needs a real `0xF8→0xF0` decrement and there is none → byte0 garbage
+  (the control's 2nd PSH emits SP=0x__ff48, not 0xfff0). **This is a GENERAL
+  non-first-PSH failure — reproduced with NO call frame** (`imm_psh_psh` control) —
+  not JSR-specific. simple_function passes only because its callee body (`IMM;LEV`)
+  has no 2nd push.
+
+### Root A is entangled with the L0 distance heads (the OUTPUT bank is byte-identical)
+Diffing the SP-marker residual of a correct first-push (emits 0xF8) vs a failing
+later-push (emits 0x48) at the final block: the **declarative OUTPUT bank is
+byte-identical** (`OUTPUT_LO`/`OUTPUT_HI_THIS_STEP` decode to 0x79 in BOTH). The
+only large diffs are the **L0 distance heads H1..H5** (e.g. `H1+2`: +8 on the first
+push vs −1.5e5 on the later push; H2/H3/H4/H5 saturate to ±2.7e5 as the sequence
+grows). The LM-head byte decode flips on those position-saturated dims, NOT on any
+declarative-controllable gate. Several SP-byte emitters are literally gated on
+`H1+2` (e.g. the JSR byte1=0xff units vm_step.py:4785; `tail_sp_marker_byte0_f8_*`
+conditions `H1+2`/`H1+9` l10_ops.py:7020) — i.e. the SP byte decode is wired to a
+position proxy that only lands for the first push. There is no discrete dim that
+separates "first push" from "later push" except these saturating distance heads.
+
+### Root B — the nested-JSR PC override is blocked by the broadcast OP_ENT constant
+`_function_call_jsr_pc_override_*` (model_ops.py:306-400) gates on
+`MARK_PC + TEMP[0](IS_JSR, relayed by L6 head 3)` with `-4.0` blockers on
+OP_NOP/EXIT/JMP/BZ/BNZ/IMM/LEV/**OP_ENT**. After the first ENT executes, OP_ENT is
+durably broadcast across the call frame (the same constant the ENT-corruptor story
+relies on), so on the **nested** JSR step its `OP_ENT*-4.0` term vetoes the
+override → PC falls through (pc+8) instead of jumping to the callee. The step-0
+JSR works because no ENT has run yet (OP_ENT≈0). Probed `TEMP[0]` at the PC marker:
+it is 0 on the nested-JSR step at blocks 5-7 (IS_JSR not relayed to the PC marker
+inside the frame; it appears one step late, on the following ENT's PC marker) — so
+even with the OP_ENT blocker neutralized the override has no live IS_JSR to fire on.
+This mirrors Root A: the per-step opcode/JSR signal does not reach the gate inside
+the frame; only the durable broadcast constants do.
+
+### Verdict — genuine multi-commit wall; no byte-identity-safe sub-fix landed
+Both halves reduce to the SAME documented prerequisite: a **clean per-step actual
+opcode decode relayed single-step to the SP/PC marker inside the call frame**
+(`ACTUAL_OP_PSH` for the SP-decrement gate; live single-step IS_JSR + dropping the
+broadcast-OP_ENT blocker for the nested-JSR override). The marker-scheme OP_PSH/
+OP_ENT are embedding-baked constants; the opcode byte is clean only on the first
+step; the OUTPUT bank for SP byte0 is byte-identical between the working and failing
+push (the discriminator is the saturating L0 distance heads). No single declarative
+condition separates the failing later-PSH from the passing first-PSH without
+regressing the 51 shared-frame smoke tests (add/sub/mul all PSH once; adj_sp/lea/
+memory all share the SP-decrement + distance-head path). Per the brief's STOP rule,
+no production weight change was made. func/nested full-trace **0/200 before and
+after** (no change); smoke **51/0 unchanged**; byte-identity N/A. The reserved
+multi-commit L4/L5/L6 per-step opcode-decode + single-step relay surface is the
+prerequisite (same conclusion as the 5 prior ENT-frame sessions, now re-pinned to
+the PSH SP-decrement + nested-JSR PC override with new precision). Throwaway probes
+removed; worktree left at the green 51/0 baseline.
