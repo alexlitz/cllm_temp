@@ -78,6 +78,90 @@ Branch base: rebased onto main `dedbb063`. spec_k=0, GPU 0, `alu_mode='efficient
 
 ---
 
+## mul-cluster recovery attempt — NO batched-robust gate discriminator exists (2026-06-13, GPU 1)
+
+A follow-up session tried to recover the `mul` cluster regression (full_trace at
+HEAD `ac9177d1`: **mul 28/50**, flag-OFF baseline **45/50**, so the carry costs
+**-17**; if **59/100**, bool **16/25** must hold). EXHAUSTIVE probing
+(`tools/probe_mul_blockscan.py`, `probe_mul_opcode_ctx.py`,
+`probe_mul_if_residual_diff.py`, spec_k=0, the LIVE NOT_CMP/dump block **44**)
+proves the gate-refinement avenue is a **genuine architectural wall**: the
+mul-operand-PSH over-fire row and the load-bearing if-fix PSH row are
+batched-INDISTINGUISHABLE on EVERY local residual signal.
+
+### What the dump fires on (per-row, block 44, the authoritative path)
+The dump gate (`2 + 3·CARRIED + 3·SHARP − 1000·NOT_CMP > 7`) fires on EVERY
+carried STACK0 row where `CARRIED~100` and `NOT_CMP=0`. **SHARP is NOT
+load-bearing** — `3·CARRIED=300` already clears the threshold 7 alone, so the
+gate fires regardless of SHARP. The carried byte the dump re-supplies is
+CONSTANT across all rows of a program (the carry head captures one top-of-stack
+value). Per-step opcode at the carried rows:
+* mul: step1-2 `OP_PSH`, step3 `OP_MUL` (the OP_MUL row is blocked by NOT_CMP
+  rule 1; the **PSH operand rows step1-2 are the over-fire victims**).
+* if/bool: step1-2 `OP_PSH`, step3 `OP_GT/LT/EQ/NE`, step4-5 `OP_BZ/BNZ`.
+
+### Every separator tried, and why each FAILS (all measured, not hypothesised)
+1. **Band-mass / nibble-sharpness (the brief's "value-magnitude" angle).** The
+   carried byte rides as a low-nibble one-hot in `STACK0_B0_H1_PREV` (mass Σ) and
+   a high-nibble one-hot in `STACK0_B0_H3_PREV`. mul over-fire rows always have
+   ONE band degraded to a weak smear (mass ~6..10 vs strong ~166..170). A
+   NOT_CMP rule blocking "either band weak" cleanly darkened mul (28→**43**, zero
+   new mul regressions) **but ALSO darkened the if-fix rows**: the 1096 if
+   programs (e.g. `if_gt 28>9`, `if_eq 30==45`) carry the EXACT same weak-nibble
+   signature (H1mass=6.2) on EVERY row including the comparison rows, because the
+   captured value (e.g. 0x03) is constant and degraded. Result: **if 59→25**
+   (if_gt 17→6). REFUTED.
+2. **Carried-byte VALUE magnitude (≤1 boolean vs arbitrary operand).** ANTI-
+   correlated with the desired behavior: `mul 97*94` carries byte **0x01** (≤1,
+   boolean-like → a "≤1 ⇒ fire" gate FIRES and corrupts it), while `if_gt 28>9`
+   carries byte **0x03** (>1 → a "≤1 ⇒ fire" gate BLOCKS it and breaks the fix).
+   Exactly backwards. REFUTED.
+3. **POSITIVE comparison/branch-opcode requirement** (dump fires only on rows
+   carrying `OP_GT/LT/EQ/NE/GE/LE/BZ/BNZ`). Recovered **mul 45/50 (perfect)** but
+   **if_gt 17→4**: the if-fix CRITICALLY needs the dump to fire on the PSH
+   operand rows (step1-2, NO cmp opcode); firing only on the comparison/branch
+   rows (step3-5) collapses if. REFUTED.
+4. **Explicit `OP_PSH`/`OP_IMM` block** (block the operand-setup rows). **if_gt
+   17→4** — same reason as (3): the if PSH rows are load-bearing. REFUTED
+   (reproduces the prior session's finding at spec_k=0, block 44).
+5. **Full-residual diff** of `mul_21x59`.s2 vs `ifGT_28x9`.s2 (the two
+   batched-identical weak-H1 PSH rows): the only dims that differ are the
+   H1/H3 LM-head NUKE region (both ~-2.9e8, identical to 0.07%) and a handful of
+   sub-0.1 values that are INCONSISTENT across the H1-weak and H3-weak pairs.
+   **No clean, consistent local separator exists.** REFUTED.
+
+### The root of the wall (precise)
+The dump fires on the SAME PSH rows in mul and if; on if it PREVENTS a marker
+drift (the H1/H3 nuke would otherwise emit token 257 → 57-token step), on mul it
+OVERWRITES an operand byte that emits CORRECTLY without it (mul flag-OFF = 45/50,
+the nuke does NOT drift mul's operand rows). Whether a row "would drift without
+the dump" is NOT locally encoded — it is determined by the program's FUTURE
+opcodes (an upstream `OP_MUL` vs a downstream `OP_GT`+`OP_BZ`), which never
+appear in the PSH row's own residual. The mul-vs-if class is a property of VM
+control flow, not of the carried byte or the current row. So a single-row FFN
+gate (the only surface the brief allows) **cannot** separate them.
+
+### What a REAL fix would need (next agent — NOT a gate refinement)
+* A **cross-step opcode-context band** the carry head propagates forward
+  ("a comparison+branch is pending in this program / recent steps") so the dump
+  can gate on control-flow context rather than the local row. This is a new
+  head behavior, not a NOT_CMP refinement, and is risky (the carry head K-
+  selection is already load-bearing per `_LIVENESS_NEVER_SHARE`).
+* OR fix the dump at the NUKE SOURCE: gate the block-38
+  `tail_bit32_result_correction` STACK0 materializer OFF the spurious-carried
+  case so the byte never gets nuked → no additive dump needed → no mul over-fire
+  (touches the WIDTH-SENSITIVE 2059-unit tail bank in place; repurpose, not
+  append — `project_l10_tail_bank_width_sensitive`).
+* OR accept the trade: flag-OFF gives mul 45 but loses the if/bool +52. The
+  current default-ON ships the if/bool gains at the mul cost.
+
+Probe tools added: `tools/probe_mul_blockscan.py` (per-row SHARP/PREV/NOT_CMP +
+band mass at block 44), `probe_mul_opcode_ctx.py` (all opcodes per carried row),
+`probe_mul_if_residual_diff.py` (full-residual diff of the indistinguishable
+PSH rows), `probe_mul_operand_discriminator.py`. All read-only, spec_k=0, GPU 1.
+
+---
+
 ## (historical) the prior flag-OFF status
 
 ## The bug (probe-confirmed, NOT the brief's hypothesis)
