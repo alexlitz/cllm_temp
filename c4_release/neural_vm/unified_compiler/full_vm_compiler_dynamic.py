@@ -2178,6 +2178,14 @@ def compile_full_vm_dynamic(
             "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
                 os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
             ),
+            # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
+            # opt out with =0): promotes H1+2 to a hard requirement on
+            # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
+            # (output-affecting on the OP_ENT-broadcast misfire rows), so the
+            # ON / OFF builds must NEVER share a memo / disk entry.
+            "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
+                os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
+            ),
             # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
             # DEFAULT-OFF, opt in with =1): adds 32 MARK_SE_ONLY-gated OUTPUT
             # suppressor units to post_l9_bz_bnz_pc_override (output-affecting),
@@ -2685,6 +2693,12 @@ def _bake_from_scheduled_ops(
         # share a serialised entry.
         "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
             os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
+        ),
+        # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
+        # opt out with =0, output-affecting): the ON / OFF builds must never
+        # share a serialised entry.
+        "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
+            os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
         ),
         # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
         # DEFAULT-OFF, opt in with =1, output-affecting): the ON / OFF builds
