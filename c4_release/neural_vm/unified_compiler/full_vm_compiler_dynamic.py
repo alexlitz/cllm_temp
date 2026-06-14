@@ -2152,6 +2152,20 @@ def compile_full_vm_dynamic(
             "C4_STACK0_B0_DUMP": (
                 os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
             ),
+            # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
+            # opt in with =1): adds a NOT-blocker condition to
+            # l16_ent_frame_sp_byte1_ff (output-affecting), so the ON / OFF builds
+            # must NEVER share a memo / disk entry.
+            "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
+                os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
+            ),
+            # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
+            # DEFAULT-OFF, opt in with =1): adds 32 MARK_SE_ONLY-gated OUTPUT
+            # suppressor units to post_l9_bz_bnz_pc_override (output-affecting),
+            # so the ON / OFF builds must NEVER share a memo / disk entry.
+            "C4_POST_ENT_SE_SUPPRESS": (
+                os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2646,6 +2660,18 @@ def _bake_from_scheduled_ops(
         # must never share a serialised entry.
         "C4_ADDSUB_DECLARATIVE": (
             os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
+        ),
+        # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
+        # opt in with =1, output-affecting): the ON / OFF builds must never
+        # share a serialised entry.
+        "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
+            os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
+        ),
+        # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
+        # DEFAULT-OFF, opt in with =1, output-affecting): the ON / OFF builds
+        # must never share a serialised entry.
+        "C4_POST_ENT_SE_SUPPRESS": (
+            os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

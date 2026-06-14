@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os as _os
+
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
 from ..building_blocks_dsl import multi_way_and_rule
@@ -7,6 +9,46 @@ from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .shared import _as_setdim_proxy
+
+
+def _ent_sp_byte1_ismark_blocker_on() -> bool:
+    """DEFAULT-OFF guard (opt in with ``C4_ENT_SP_BYTE1_ISMARK_BLOCKER=1``): add
+    an ``IS_MARK`` NOT-blocker to ``l16_ent_frame_sp_byte1_ff`` so the OP_ENT
+    broadcast (~10, not one-hot in the step AFTER an ENT) cannot solo-fire the
+    SP-byte1=0xff override on the post-ENT STEP_END / marker rows.
+
+    This is a CORRECT-but-INSUFFICIENT partial fix kept default-OFF (so HEAD is
+    byte-identical) for the next agent who tackles the full multi-emitter
+    post-ENT framing fix. See
+    ``docs/POST_ENT_37TOKEN_SENTINEL_CASCADE_2026_06_14.md``.
+
+    Background (spec_k=0, tools/_probe_sentinel_block.py + _probe_sp_byte1_gate.py
+    + _probe_ismark_check.py, 2026-06-14): the SP-byte1=0xff override is gated on
+    {OP_ENT, IS_BYTE, HAS_SE, H1+2, BYTE_INDEX_0}. OP_ENT*S alone (residual ~10 *
+    100 = +980) clears the +450 threshold even when IS_BYTE/BYTE_INDEX_0/H1+2 are
+    ~0, so the rule MIS-FIRES on the leading STEP_END/marker rows of the step
+    immediately after an ENT, decoding 0xFF (low-nib-15 AND hi-nib-15) at logit
+    ~4.7e4. The rule's OWN comments already flag this misfire; the clean
+    separator it was looking for is:
+
+    Discriminator: IS_MARK (dim 7) == 1.000 EXACTLY on every spurious post-ENT
+    marker/STEP_END misfire row (func/add/var/rec/nested all confirmed) and
+    == 0.000 EXACTLY on every genuine SP-byte0 row where the 0xff override SHOULD
+    fire. A -10*S IS_MARK blocker therefore vetoes the misfire and is
+    byte-identical on the legitimate firing rows.
+
+    WHY DEFAULT-OFF (the negative result): suppressing THIS one emitter does NOT
+    restore the 35-token step. The post-ENT STEP_END row is corrupted by a CASCADE
+    of THREE stacked byte-default emitters — block 31/L20 (this rule, +4.7e4),
+    block 41/L25 (token-0 via dim 882, defeated MARK_SE=-1e5 veto by a runaway
+    dim-344=3626 input), and block 38/L25 (0xff via units 49/50, amplifies to
+    4.49e10 by reading the OUTPUT-nibble dims 84/100 it is meant to correct). With
+    only this rule blocked the next emitter wins, so the step stays 37 tokens and
+    NO program advances (func/var/rec/nested 0/55 with flag ON == OFF; smoke 51/0;
+    guard add/mul/if 29/43 ON == OFF). The real fix is the project-level multi-part
+    build, not a solo corrector.
+    """
+    return _os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
 
 
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
@@ -1716,6 +1758,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("STACK0_BYTE2", -100.0),
         ("STACK0_BYTE3", -100.0),
     )
+    # OP_ENT-broadcast post-ENT framing fix (2026-06-14, the func/var/rec/nested
+    # 37-token desync). The five register-marker blockers above guard the PC/AX/
+    # SP/BP/MEM byte rows, but NOT the STEP_END / marker rows -- and the OP_ENT
+    # broadcast (~10) alone clears the +4.5*S threshold there, mis-firing the
+    # 0xff override on the leading STEP_END row of the step after an ENT (the 2
+    # extra 0xFF tokens -> 37-token step -> slicer desync). IS_MARK == 1.0 on
+    # every such misfire row and == 0.0 on every genuine SP byte row, so a hard
+    # IS_MARK NOT-blocker vetoes the misfire and is byte-identical on the
+    # legitimate firing. See _ent_sp_byte1_ismark_blocker_on (default ON).
+    if _ent_sp_byte1_ismark_blocker_on():
+        sp_frame_byte1_ff_conditions = sp_frame_byte1_ff_conditions + (
+            ("IS_MARK", -10.0),
+        )
     rules.append(multi_way_and_rule(
         name="l16_ent_frame_sp_byte1_ff",
         threshold=4.5,

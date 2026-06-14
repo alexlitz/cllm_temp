@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os as _os
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...dim_registry import dim_ref
@@ -4866,6 +4868,110 @@ def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _post_ent_se_value_suppressor_on() -> bool:
+    """DEFAULT-OFF flag (opt in with ``C4_POST_ENT_SE_SUPPRESS=1``): suppress
+    the byte-value OUTPUT decode on ``MARK_SE_ONLY`` (STEP_END marker) rows so
+    the post-ENT step re-emits a clean 35-token frame instead of 37.
+
+    KEPT DEFAULT-OFF (the negative result, 2026-06-14): this CORRECTLY restores
+    the 35-token frame and defeats the WHOLE post-ENT 0xFF/0x00 cascade at the
+    decode point (breaking the documented single-emitter zero-sum trap that
+    ``C4_ENT_SP_BYTE1_ISMARK_BLOCKER`` falls into), but framing recovery ALONE
+    does NOT advance any func/nested/rec/var program: the spec_k=0 (smoke/prod)
+    EXIT code is BYTE-IDENTICAL flag OFF vs ON (e.g. func_identity_0 -> 1536,
+    func_add_0 -> 3056, var_simple -> 768 either way) because the divergence is
+    dominated by the LI-from-frame VALUE corruption (the load-indirect of a
+    stack-frame argument returns 0, not mem[BP+off]), which fixes the exit
+    independently of the frame width. Smoke held 51/0 with the flag ON, guards
+    (add/sub/mul/if/bool) byte-identical, byte-identity flag-OFF == HEAD. So
+    this is preserved (flag-gated, off) as the FRAMING half of the project-level
+    two-part build for the next agent who fixes the LI value path -- not landed
+    on by default. See ``docs/POST_ENT_SE_VALUE_SUPPRESSOR_NEGATIVE_2026_06_14.md``
+    and ``docs/FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md``.
+
+    THE WALL (docs/FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md):
+    after a function ``ENT`` the next instruction emits 37 tokens, not 35 -- the
+    2 EXTRA leading tokens are spurious 0xFF/0x00 value bytes emitted at the
+    STEP_END marker row (which must predict ``REG_PC``). The fixed-35-token
+    slicer in ``batched_pure_neural`` then misaligns and the verifier misreads
+    PC for every subsequent step. ~400-450 func/nested/rec/var programs gate
+    here.
+
+    ROOT (spec_k=0, BUILT dims via tools/_probe_cascade_emitters.py +
+    _probe_spurrow_full.py, 2026-06-14):
+
+    * The STEP_END marker row carries ``MARK_SE_ONLY`` (dim 10) == 1.0. A clean
+      STEP_END row has the entire OUTPUT byte-decode band (``OUTPUT_LO`` dims
+      69-84, ``OUTPUT_HI_THIS_STEP`` dims 85-100) at a UNIFORM ``-240`` "no
+      byte" default, so no value token (0-255) wins and the marker token
+      ``REG_PC`` (logit ~18) is emitted -> 35-token frame.
+    * On the post-ENT STEP_END row a CASCADE of byte-default emitters
+      (block 31/L20 ``l16_ent_frame_sp_byte1_ff`` -> 0xFF via OUTPUT dims
+      84/100; block 41/L25 -> 0x00 via OUTPUT dims 69/85; etc.) elevates a few
+      OUTPUT-band dims ABOVE the -240 floor (84/100 -> +4767/+4782), so a value
+      byte (0xFF, then 0x00 once 0xFF is blocked) wins at logit ~4.7e4,
+      emitting an extra leading token -> 37-token frame.
+    * Suppressing ONE cascade emitter just lets the next win (the documented
+      zero-sum trap; ``C4_ENT_SP_BYTE1_ISMARK_BLOCKER`` proves it -- step stays
+      37, 0/55 advance).
+
+    THE FRAMING-RECOVERY FIX (this op): a STEP_END (``MARK_SE_ONLY``) row must
+    emit a register MARKER, NEVER a raw value byte. So at the FINAL FFN (placed
+    after every cascade emitter via ``requires``) drive the ENTIRE OUTPUT
+    byte-decode band strongly negative whenever ``MARK_SE_ONLY`` == 1. This
+    defeats the WHOLE cascade at once (every value token 0-255 loses), so the
+    marker wins and the frame returns to 35 tokens.
+
+    WHY BYTE-IDENTITY-SAFE (the discriminator): the head's byte-value-decode
+    dims (OUTPUT_LO 69-84 + OUTPUT_HI 85-100, plus the dump bands) and its
+    marker-decode dims (21-31) are DISJOINT (zero overlap, verified). Genuine
+    0xFF/value-byte rows carry ``IS_BYTE`` == 1.0 and ``MARK_SE_ONLY`` == 0.0;
+    only STEP_END marker rows carry ``MARK_SE_ONLY`` == 1.0. So a
+    ``MARK_SE_ONLY``-gated OUTPUT suppressor never touches a legitimate value
+    emission, and on a clean STEP_END row it only pushes an already-losing
+    -240 band further negative (the emitted token is unchanged). HEAD is
+    byte-identical with the flag OFF (no rules are appended).
+    """
+    return _os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
+
+
+def _post_ent_se_value_suppressor_rules(S: float) -> tuple[FFNRule, ...]:
+    """Drive the OUTPUT byte-decode band negative on every ``MARK_SE_ONLY`` row.
+
+    One unit per OUTPUT sub-cell (16 LO + 16 HI = 32 units). Each fires only
+    when ``MARK_SE_ONLY`` >= 0.5 (the STEP_END marker row) and subtracts a
+    sentinel-dominating magnitude from its OUTPUT dim so no value token can win
+    the LM-head argmax there. The write magnitude (``-200 * S`` post-relu, i.e.
+    a ~-10000 residual delta on a firing row) comfortably overcomes the
+    observed cascade peak (~+4.8e3 per OUTPUT dim / ~4.7e4 logit) without being
+    so large it destabilises the (already-losing, never-emitted) value tokens.
+
+    NOTE: this is a NOT-blocker on the OUTPUT band, NOT on the upstream cascade
+    emitters -- it neutralises ALL of them at the decode point, which is why it
+    breaks the documented single-emitter zero-sum trap.
+    """
+    if not _post_ent_se_value_suppressor_on():
+        return ()
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(FFNRule.constant_write(
+            name=f"post_ent_se_output_lo_suppress_{k}",
+            conditions=(("MARK_SE_ONLY", 1.0),),
+            threshold=0.5,
+            writes=((f"OUTPUT_LO+{k}", -200.0),),
+            scope="MARK_SE_ONLY",
+        ))
+    for k in range(16):
+        rules.append(FFNRule.constant_write(
+            name=f"post_ent_se_output_hi_suppress_{k}",
+            conditions=(("MARK_SE_ONLY", 1.0),),
+            threshold=0.5,
+            writes=((f"OUTPUT_HI_THIS_STEP+{k}", -200.0),),
+            scope="MARK_SE_ONLY",
+        ))
+    return tuple(rules)
+
+
 def _post_l9_bz_bnz_pc_override_ir(S: float = 100.0) -> CompilerIR:
     """CompilerIR exposing the post-L9 BZ/BNZ override rules."""
 
@@ -4873,6 +4979,7 @@ def _post_l9_bz_bnz_pc_override_ir(S: float = 100.0) -> CompilerIR:
     ffn_op = ir.layer(0).ffn
     ffn_op.rules.extend(_post_l9_bz_pc_override_rules(S))
     ffn_op.rules.extend(_post_l9_bnz_pc_override_rules(S))
+    ffn_op.rules.extend(_post_ent_se_value_suppressor_rules(S))
     return ir
 
 
@@ -4901,6 +5008,11 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
         rules = (
             _post_l9_bz_pc_override_rules(S)
             + _post_l9_bnz_pc_override_rules(S)
+            # Post-ENT 37-token desync framing-recovery (default OFF; returns ()
+            # unless C4_POST_ENT_SE_SUPPRESS=1, so HEAD is byte-identical). See
+            # _post_ent_se_value_suppressor_on for the full root-cause analysis
+            # AND the negative result (framing alone does not advance programs).
+            + _post_ent_se_value_suppressor_rules(S)
         )
         rule_dim_positions = Primitives.dim_positions_from_bd(
             proxy, Primitives.ffn_rule_dim_names(rules),
@@ -4929,6 +5041,13 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
             # cancel band so a prev-step-was-BZ-taken bit suppresses the
             # spurious cancellation. See docs/BZ_TARGET_FRESH_CROSS_STEP_2026_06_09.md.
             "BZ_TARGET_FRESH.*.-1",
+            # Post-ENT 37-token desync framing-recovery (C4_POST_ENT_SE_SUPPRESS,
+            # default OFF): suppress the OUTPUT byte-decode on STEP_END marker
+            # rows so the post-ENT step re-emits a 35-token frame. Read only
+            # when the flag is opted in (the reads set is a conservative
+            # superset; declaring it unconditionally is harmless when off). See
+            # _post_ent_se_value_suppressor_on.
+            "MARK_SE_ONLY",
         },
         writes={
             "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
@@ -4960,5 +5079,10 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
         # block correctly. The rule lowering starts at unit 0 and walks
         # a monotonic cursor independent of the layer max so byte-
         # identity is preserved.
-        ffn_units_used=193,
+        #
+        # Baseline 193 units (BZ/BNZ override). The post-ENT SE value
+        # suppressor (default OFF) appends 32 more (16 OUTPUT_LO + 16
+        # OUTPUT_HI) only when C4_POST_ENT_SE_SUPPRESS=1. Default (off) ->
+        # 0 extra -> 193 -> byte-identical with HEAD.
+        ffn_units_used=193 + (32 if _post_ent_se_value_suppressor_on() else 0),
     )
