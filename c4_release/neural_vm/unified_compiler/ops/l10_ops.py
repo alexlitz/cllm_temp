@@ -1,7 +1,30 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os
 from dataclasses import replace
 from typing import Mapping, Optional
+
+
+def _nonfirst_psh_sp_fix_enabled() -> bool:
+    """Flag for the non-first-PSH SP byte-0 over-correction fix.
+
+    The L25 ``tail_sp_marker_byte0_f8_from_initial_stack_exact`` rule forces
+    SP byte 0 = 0xF8 on any HAS_SE SP-marker row whose H1 distance pattern +
+    MARK_SP gate clears its threshold. That is correct on the FIRST push of a
+    program (input SP byte0 = 0x00, decrement result = 0xF8) and the
+    JSR-bootstrap row, but it WRONGLY fires on every SUBSEQUENT push whose
+    input SP byte0 is already 0xF8 (decrement result = 0xF0, not 0xF8),
+    overwriting the correct 0xF0 the L6 decrement already produced with
+    garbage byte 0 = 0x48. See the SP-decrement diagnosis appended to
+    docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md.
+
+    The fix adds an EMBED_LO+8 / EMBED_HI+15 NOT-blocker (the input SP byte0
+    == 0xF8 evidence carried onto the MARK_SP row by the L3 carry-forward)
+    so the rule is suppressed on a push whose incoming SP already ends in
+    0xF8. Default ON; with ``C4_NONFIRST_PSH_SP_FIX=0`` the rule's conditions
+    are byte-identical to the prior build.
+    """
+    return os.environ.get("C4_NONFIRST_PSH_SP_FIX", "1") != "0"
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
@@ -11,7 +34,24 @@ from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
+from .residual_band_registry import register_residual_band
 from .shared import _as_setdim_proxy
+
+
+# Non-first-PSH SP byte-0 fix scratch band (flag-gated; default ON via
+# ``_nonfirst_psh_sp_fix_enabled``). Holds the per-step AND signal "this
+# step's SP-decrement RESULT byte0 == 0xF0" (OUTPUT_LO+0 & OUTPUT_HI+15 at
+# the SP marker), written by ``make_l10_nonfirst_psh_sp_helper_op`` (before
+# the L25 tail block) and read as a NOT-blocker by
+# ``tail_sp_marker_byte0_f8_from_initial_stack_exact`` so it stops forcing
+# 0xF8 over the genuine 0xF0 of a non-first push. Flag-off => band not
+# collected (byte-identical d_model) and the blocker condition is skipped.
+register_residual_band(
+    "NONFIRST_PSH_SP_SUPPRESS", 1,
+    owner="make_l10_nonfirst_psh_sp_helper_op",
+    flag=_nonfirst_psh_sp_fix_enabled,
+    never_share=True,
+)
 
 
 # === L10 attention-head layout (auto-fit; legacy head_idx as docs) ===
@@ -7083,6 +7123,34 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("NEXT_STACK0", -1000000.0),
                 ("NEXT_MEM", -1000000.0),
                 ("NEXT_SE", -1000000.0),
+            ) + (
+                # NON-FIRST-PSH SP byte-0 fix (default ON; see
+                # ``_nonfirst_psh_sp_fix_enabled``). This 0xF8 exactness
+                # writer forces SP byte0 = 0xF8. It is correct on the FIRST
+                # push (input SP byte0 = 0x00, decrement result = 0xF8) and on
+                # a non-PSH step whose SP is unchanged at 0xF8 (e.g. the
+                # SI/LI steps of si_li_16bit). But on a SUBSEQUENT *push* whose
+                # input SP byte0 is already 0xF8, the L6 decrement correctly
+                # produces 0xF0 and this rule WRONGLY overwrites it ->
+                # garbage byte0 = 0x48 (the documented non-first-PSH bug).
+                #
+                # The clean, universally-safe discriminator is "the genuine
+                # SP-decrement RESULT is 0xF0" -- you never want to force 0xF8
+                # over a real 0xF0. That is the AND ``OUTPUT_LO+0 &
+                # OUTPUT_HI_THIS_STEP+15`` of the L6 result (intact in OUTPUT
+                # at this tail's input), which 0x00 (HI+0, not HI+15) and 0xF8
+                # (LO+8, not LO+0) both fail -- so every load-bearing 0xF8 case
+                # is untouched. A plain OR of the two negative nibble blockers
+                # cannot express that AND (OUTPUT_LO+0 alone also fires on the
+                # initial SP=0x00 row, breaking the ~71% bootstrap case), so
+                # the AND is materialised in the dedicated single-unit helper
+                # ``make_l10_nonfirst_psh_sp_helper_op`` (scheduled before this
+                # block) which writes ``NONFIRST_PSH_SP_SUPPRESS``. This rule
+                # NOT-blocks on it. spec_k=0 probe (block 37): the helper
+                # fires only on push2 (result 0xF0); 0 on push1 / si_li IMM /
+                # si_li SI / every 0x00-input / bootstrap row.
+                (("NONFIRST_PSH_SP_SUPPRESS", -1_000_000_000.0),)
+                if _nonfirst_psh_sp_fix_enabled() else ()
             ),
             threshold=20.04,
             max_abs_weight=100_000_000_000.0,
@@ -8584,9 +8652,7 @@ def make_tail_bit32_result_correction_op() -> Operation:
     ir = CompilerIR()
     ir.layer(0).ffn.rules.extend(rules)
 
-    return Operation(
-        name="tail_bit32_result_correction",
-        reads={
+    _tail_reads = {
             "CONST", "IS_BYTE", "HAS_SE", "H1", "H3",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
@@ -8602,7 +8668,18 @@ def make_tail_bit32_result_correction_op() -> Operation:
             "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "MEM_STORE",
             "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
             "ADDR_B0_LO", "ADDR_B0_HI",
-        },
+    }
+    if _nonfirst_psh_sp_fix_enabled():
+        # Non-first-PSH SP byte-0 fix: read the helper's AND scratch dim as a
+        # NOT-blocker on the 0xF8 SP exactness writer (see the conditions of
+        # ``tail_sp_marker_byte0_f8_from_initial_stack_exact``). Declaring the
+        # read here also makes the scheduler place the helper (the producer)
+        # before this tail block. Flag-off => band absent and not read.
+        _tail_reads.add("NONFIRST_PSH_SP_SUPPRESS")
+
+    return Operation(
+        name="tail_bit32_result_correction",
+        reads=_tail_reads,
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",
         # Phase 8.A.4 retry: layer_idx=17 literal dropped (was redundant
@@ -8927,6 +9004,154 @@ def make_l10_add_high_byte_adder_op() -> Operation:
             "TestSmoke32Bit::test_add_carry_cascade",
         },
         spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+    )
+
+
+def _l10_nonfirst_psh_sp_helper_rules() -> tuple[FFNRule, ...]:
+    """One AND unit: ``NONFIRST_PSH_SP_SUPPRESS = (SP result byte0 == 0xF0)``.
+
+    Fires at the SP MARKER row when the SP-decrement RESULT byte 0 (still
+    intact in OUTPUT_LO/HI at this pre-tail block) is exactly 0xF0 -- i.e.
+    ``OUTPUT_LO+0`` (low nibble 0) AND ``OUTPUT_HI_THIS_STEP+15`` (high
+    nibble 0xF). That is true ONLY on a non-first push (e.g. the 2nd push of
+    a program: 0xFFF8 - 8 = 0xFFF0); on the first push the result is 0xF8
+    (OUTPUT_LO+8, not +0) and on the initial/bootstrap SP it is 0x00
+    (OUTPUT_HI+0, not +15), so the AND is 0 in both load-bearing cases of the
+    0xF8 exactness rule. The scratch flag NOT-blocks
+    ``tail_sp_marker_byte0_f8_from_initial_stack_exact`` so it stops forcing
+    0xF8 over the genuine 0xF0, fixing the non-first-PSH SP byte-0 bug while
+    leaving every 0xF8 case (first push, JSR-bootstrap, unchanged-SP SI/LI)
+    untouched (the 0xF8 result has OUTPUT_LO+0 ~0, so the AND -- and the
+    blocker -- stay off). MARK_SP + HAS_SE gate it to the SP marker on
+    non-first steps; IS_BYTE / other-marker blockers keep it off byte and
+    non-SP rows. spec_k=0 probe (block 37): result 0xF0 -> fires on push2
+    only.
+    """
+    # BOTH nibble one-hots must be present (a tight AND) -- 0xF8 and 0xF0
+    # SHARE the high nibble 0xF (OUTPUT_HI+15), so the low nibble
+    # (OUTPUT_LO+0, set for 0xF0 but NOT 0xF8) is the decisive term and must
+    # not be out-voted. Weight each nibble 10 and require threshold 18: both
+    # present (~0.9 each) -> ~18-20 fires; only HI+15 (0xF8 case) -> ~10+2 < 18
+    # stays off; only LO+0 (e.g. 0x00, HI+0) -> ~10+2 < 18 stays off. MARK_SP
+    # + HAS_SE add a small ~2 of headroom (they are 1.0/1.0 at the live SP
+    # marker) without letting a single nibble cross alone. The -1e6 blockers
+    # drive byte / non-SP / next-step rows decisively negative.
+    return (
+        multi_way_and_rule(
+            name="l10_nonfirst_psh_sp_suppress_and",
+            conditions=(
+                ("OUTPUT_LO+0", 10.0),
+                ("OUTPUT_HI_THIS_STEP+15", 10.0),
+                ("MARK_SP", 1.0),
+                ("HAS_SE", 1.0),
+                ("IS_BYTE", -1_000_000.0),
+                ("MARK_AX", -1_000_000.0),
+                ("MARK_PC", -1_000_000.0),
+                ("MARK_BP", -1_000_000.0),
+                ("MARK_STACK0", -1_000_000.0),
+                ("MARK_MEM", -1_000_000.0),
+                ("NEXT_PC", -1_000_000.0),
+                ("NEXT_AX", -1_000_000.0),
+                ("NEXT_SP", -1_000_000.0),
+                ("NEXT_BP", -1_000_000.0),
+                ("NEXT_STACK0", -1_000_000.0),
+                ("NEXT_MEM", -1_000_000.0),
+                ("NEXT_SE", -1_000_000.0),
+            ),
+            threshold=18.0,
+            writes=(("NONFIRST_PSH_SP_SUPPRESS", 1.0),),
+        ),
+    )
+
+
+def make_l10_nonfirst_psh_sp_helper_op() -> Operation:
+    """AND helper for the non-first-PSH SP byte-0 fix (flag-gated, default ON).
+
+    Computes ``NONFIRST_PSH_SP_SUPPRESS`` (SP-decrement result byte0 == 0xF0
+    at the SP marker) in a single standalone ``PureFFN`` post_op, BEFORE the
+    L25 ``tail_bit32_result_correction`` block (the scheduler orders this
+    producer first because that op reads the band). The flag-off build
+    produces zero rules and the band is not collected, so it is byte-identical
+    to the prior model. See ``_nonfirst_psh_sp_fix_enabled`` and
+    ``_l10_nonfirst_psh_sp_helper_rules``.
+    """
+    if not _nonfirst_psh_sp_fix_enabled():
+        # Flag off: no-op op (no rules, no band). Kept registered so the op
+        # list shape is stable; the bake appends nothing.
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_nonfirst_psh_sp_helper",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#registers",
+        )
+
+    rules = _l10_nonfirst_psh_sp_helper_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        _suppress_ffn_on_step_boundary(ffn, dim_map, S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_nonfirst_psh_sp_helper",
+        reads={
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP", "MARK_SP", "MARK_AX",
+            "MARK_PC", "MARK_BP", "MARK_STACK0", "MARK_MEM", "HAS_SE",
+            "IS_BYTE", "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP",
+            "NEXT_STACK0", "NEXT_MEM", "NEXT_SE",
+        },
+        writes={"NONFIRST_PSH_SP_SUPPRESS"},
+        kind="block",
+        # Attach on the L25 tail block; the produces/consumes dep (tail_bit32
+        # reads NONFIRST_PSH_SP_SUPPRESS) orders this helper BEFORE it.
+        target_op_name="l10_post_ops_combined",
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 

@@ -524,3 +524,69 @@ multi-commit L4/L5/L6 per-step opcode-decode + single-step relay surface is the
 prerequisite (same conclusion as the 5 prior ENT-frame sessions, now re-pinned to
 the PSH SP-decrement + nested-JSR PC override with new precision). Throwaway probes
 removed; worktree left at the green 51/0 baseline.
+
+## 2026-06-14 Root A SOLVED — the 2026-06-14 diagnosis above is WRONG (wrong-dim probe artifact); real root is the L25 0xF8 SP exactness corrector over-firing on non-first pushes. Fix landed, smoke 51/0, byte-identity verified.
+
+The immediately-preceding entry's two central claims are **REFUTED**, and both
+were the SAME wrong-dim artifact that defeated the 5 prior ENT-frame sessions:
+they read `OP_PSH` / `PSH_AT_SP` / `OPCODE_BYTE` at the **static** registry
+positions (`build_default_registry_dynamic().slots`, d_model 920) instead of the
+**built model's** `layout.dim_positions` (the repacked d_model=981 layout). The
+real positions differ for almost every dim (OP_PSH 275→197, OP_IMM 263→188,
+OPCODE_BYTE_LO 12→474, PSH_AT_SP 467→225, CMP 396→670, ...; only the 0-2 markers
+and IS_BYTE coincide). **Always resolve probe dims via
+`compile_full_vm_dynamic()[1].dim_positions`, never the static registry.**
+
+### What is actually true (spec_k=0, `layout.dim_positions`)
+- There **IS a clean per-step `OP_PSH` at the AX marker** at the L5 decode output
+  (block 5): `OP_PSH=+5.0` on real PSH steps, `OP_IMM=+5.0` on real IMM steps,
+  with clean `OPCODE_BYTE_LO[13]+HI[0]` (PSH) / `LO[1]+HI[0]` (IMM) one-hots. The
+  "OP_PSH is a hard +1.0 constant" reading was the static-dim alias reading a
+  different (positional) dim. dedbb063's `OP_IMM` decode is likewise real.
+- **`PSH_AT_SP` is NOT dead.** At the SP marker it is `+1.0` (block 6) → `+2.0`
+  (block 9+) on real PSH steps and `0` on non-PSH steps — produced exactly as the
+  model_ops L6-head-6 → l7-head-6 chain intends. `_layer6_psh_sp_decrement_rules`
+  fires correctly.
+- **The L6 SP decrement is CORRECT** on every push: push1 `0x00→0xF8`,
+  push2 `0xF8→0xF0`, intact in OUTPUT_LO/HI from block 6 all the way to block 37.
+
+### The actual bug (precisely localized)
+At **physical block 38 (logical L25)** the tail corrector
+`tail_sp_marker_byte0_f8_from_initial_stack_exact`
+(`l10_ops.py` `_tail_bit32_result_correction_rules`) FORCES SP byte0 = `0xF8`
+(at max_abs_weight 1e11, driven by the saturating H1 distance heads) on **every**
+HAS_SE SP-marker row that clears its gate. That is correct on the FIRST push
+(genuine result 0xF8) and the JSR-bootstrap / unchanged-SP SI-LI rows, but on the
+SECOND push (genuine result 0xF0) it OVERWRITES the correct 0xF0 → byte0 0x48
+(`0xfff8 → 0x__ff48`, the exact "2nd push garbage" symptom). Reproduced with the
+plain `IMM 100; PSH; IMM 200; PSH; EXIT` control: push1 SP `0xFFF8` (right),
+push2 SP `0x__FF48` (wrong) — and the corruption enters ONLY at block 38.
+
+### Fix (declarative, flag-gated, byte-identity-safe; default ON)
+`C4_NONFIRST_PSH_SP_FIX` (default ON). New op-local band
+`NONFIRST_PSH_SP_SUPPRESS` + a single-unit AND helper
+`make_l10_nonfirst_psh_sp_helper_op` (scheduled BEFORE the L25 tail block via the
+produces/consumes dep) that fires iff the **genuine SP-decrement result byte0 ==
+0xF0** (`OUTPUT_LO+0` AND `OUTPUT_HI_THIS_STEP+15`, both required — threshold 18
+so the shared high-nibble 0xF can't trigger it alone). The 0xF8 corrector
+NOT-blocks on that scratch dim (`-1e9`). Because the corrector only ever asserts
+0xF8 (low nibble 8), and the helper only fires on a genuine 0xF0 result, no
+load-bearing 0xF8 case is ever suppressed (first push, JSR-bootstrap,
+unchanged-SP SI/LI all keep 0xF8). Universally safe: you never want to force 0xF8
+over a real 0xF0.
+
+### Verification
+- Control `IMM 100; PSH; IMM 200; PSH; EXIT`: BEFORE push2 SP=`0x__FF48`; AFTER
+  push1 SP=`0xFFF8`, push2 SP=`0xFFF0` (both correct).
+- `pytest tests/test_smoke.py`: **51 passed / 0 failed** (the one transient
+  regression — `si_li_16bit_value`, from an earlier too-broad single-nibble
+  blocker — is gone once the helper AND requires BOTH nibbles).
+- **Byte-identity:** flag OFF (`C4_NONFIRST_PSH_SP_FIX=0`) full state_dict hash ==
+  HEAD's (43 blocks, d_model 981, band absent). Flag-off build is byte-for-byte
+  the prior model.
+- func-shaped `JSR;EXIT;NOP;ENT;IMM;PSH;IMM;PSH;LEV`: JSR/ENT/IMM SP all correct
+  and no 0x48 garbage; the remaining in-frame push +8 drift is the separate
+  nested-frame Root B (out of scope).
+
+Root B (nested-JSR PC override) is untouched, a separate follow-up as the brief
+framed. Throwaway probes removed.

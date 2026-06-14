@@ -520,6 +520,13 @@ def all_core_ops(
         # only by the attached L10 post-op block so 16-bit XOR is not
         # reprocessed in the late tail layer.
         make_l10_post_ops_combined(),
+        # Non-first-PSH SP byte-0 fix (flag C4_NONFIRST_PSH_SP_FIX, default
+        # ON): AND helper computing NONFIRST_PSH_SP_SUPPRESS (SP-decrement
+        # result == 0xF0 at the SP marker). Scheduled BEFORE tail_bit32
+        # (which reads the band) so its NOT-blocker suppresses the 0xF8 SP
+        # exactness writer on non-first pushes. Flag-off => no-op + no band
+        # (byte-identical).
+        make_l10_nonfirst_psh_sp_helper_op(),
         make_tail_bit32_result_correction_op(),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =
