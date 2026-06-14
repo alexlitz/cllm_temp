@@ -2640,6 +2640,13 @@ def _bake_from_scheduled_ops(
         "C4_STACK0_B0_DUMP": (
             os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
         ),
+        # Declarative L8 ADD/SUB wrap flag (DEFAULT-OFF; opt in with =1,
+        # swaps the imperative AddSub5StageBlock for the DeclarativeAddSubBlock
+        # composite, output-affecting, no source change): the ON / OFF builds
+        # must never share a serialised entry.
+        "C4_ADDSUB_DECLARATIVE": (
+            os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
+        ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
         # baseline (or with a different requested band set).

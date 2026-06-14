@@ -594,11 +594,177 @@ def make_l13_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
 #     was already present.
 # ---------------------------------------------------------------------------
 
-def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
-    """Wrap L8 ``block.ffn`` with ``HybridALUBlock(ffn, AddSub5StageBlock)``.
+# ---------------------------------------------------------------------------
+# Declarative ADD/SUB byte-0 wrap weights (2026-06-14, AddSub migration).
+# ---------------------------------------------------------------------------
+# The L8 ADD/SUB MARK_AX operand bands are NOT clean 1.0 one-hots (same dirty
+# operand-gather encoding the MUL/bitwise wraps face): operand A in ALU_LO/HI
+# arrives ~6.0 at the true nibble PLUS a value-proportional ~5.4 index-0
+# magnitude artifact and a ~0.45 cell-8 artifact; operand B in
+# AX_CARRY_LO/HI arrives ~1.0-1.3 (clean-ish). Probed spec_k=0 at the
+# AddSub5StageBlock input row via tools/probe_addsub_operand_vectors.py.
+#
+# So the historical 30/30/40+thr80 AND (which assumes 1.0 one-hots) misfires:
+# a single A term (30*6=180) blows past threshold 80 and every (a=*, b=*) rule
+# fires. Fix = the proven _layer10_alu_ordering_engine / wide_mul_width2
+# technique: weight A LIGHTLY (the dirty band), B HEAVILY (the clean
+# discriminator), marker moderate, + a NEGATIVE blocker on the OTHER non-zero
+# A cells so the spurious a_nib=0 (index-0 artifact) rule is suppressed
+# whenever A's true nibble is a different non-zero cell. Tuned offline against
+# the real probed operand vectors (tools/tune_addsub_wrap.py, full 16x16x16
+# SwiGLU forward sim + the downstream L9 leak floor).
+_ADDSUB_OPERAND_A_W = 3.0
+_ADDSUB_OPERAND_B_W = 30.0
+_ADDSUB_MARKER_W = 40.0
+_ADDSUB_BLOCKER_W = 3.0
+_ADDSUB_THRESHOLD = 70.0
+# Absolute inter-nibble carry-discrimination weight (decoupled from the light
+# operand-A weight). The carry cascade dim CARRY+0 is written at residual ~6.0
+# by the lo pass; csw=5 makes csw*6=30 (one operand-B discriminator's worth),
+# so a present carry acts like an extra required operand in the hi pass's
+# carry-in lookup -- a clean flip without swamping the operand discrimination.
+_ADDSUB_CARRY_SIGNAL_W = 5.0
+# Dominant OUTPUT write amplitude (the folded-in +5 fix). The byte-0 result is
+# written at ~20.0 (vs the imperative GEToBD's 2.0) so the correct OUTPUT_LO
+# cell out-votes the downstream block-11 L9 ALU_LO->OUTPUT_LO leak (which
+# floods all 16 cells at ~83 with a +12.6 spike at cell 0). At 2.0 the correct
+# cell won by only ~2 (fragile); at 20.0 it wins by ~20.
+_ADDSUB_RESULT_AMPLITUDE = 20.0
 
-    Migrates the inline efficient-mode wrap at vm_step.py:
-        ``model.blocks[8].ffn = HybridALUBlock(ffn8, AddSub5StageBlock(S, BD))``
+
+# Operand-cleanup artifacts (measured spec_k=0 at the AddSub input row via
+# tools/probe_addsub_operand_vectors.py): the operand-gather emits a constant
+# value-proportional artifact on these cells of operand A's ALU bands (and a
+# small index-0 floor on operand B's AX_CARRY bands) ON TOP of the true
+# nibble one-hot. Subtracting them (gated OP_ADD/OP_SUB + MARK_AX) makes each
+# band a clean one-hot so the lo/hi lookups fire exactly one rule.
+_ADDSUB_CLEAN_RESID_PER_V = 2.502  # bitwise-wrap calibration (same lowering)
+_ADDSUB_A_ARTIFACTS = ((0, 5.4), (8, 0.45), (15, 0.46))
+_ADDSUB_B_ARTIFACTS = ((0, 0.31),)
+
+
+def _build_addsub_cleanup_rules(S: float):
+    """Operand-cleanup pre-pass rules (clean the dirty MARK_AX operand bands).
+
+    Mirrors ``make_efficient_l10_andorxor_wrap_op``'s ``bitwise_operand_clean_*``
+    stage: a MARK_AX-gated ``step_function_rule`` subtracts each constant
+    artifact from its cell so the operand band becomes a clean one-hot of its
+    true nibble before the lo/hi add/sub lookup reads it.
+    """
+    from ..building_blocks_dsl import step_function_rule
+
+    rules: list = []
+    for op_gate in ("OP_ADD", "OP_SUB"):
+        for band, arts in (
+            ("ALU_LO", _ADDSUB_A_ARTIFACTS), ("ALU_HI", _ADDSUB_A_ARTIFACTS),
+            ("AX_CARRY_LO", _ADDSUB_B_ARTIFACTS),
+            ("AX_CARRY_HI", _ADDSUB_B_ARTIFACTS),
+        ):
+            for cell, art in arts:
+                rules.append(step_function_rule(
+                    name=f"addsub_operand_clean_{op_gate}_{band}_{cell}",
+                    input_dim="MARK_AX",
+                    threshold=0.5,
+                    write_dim=f"{band}+{cell}",
+                    write_value=-art / _ADDSUB_CLEAN_RESID_PER_V,
+                    gate=op_gate,
+                    S=S,
+                ))
+    return tuple(rules)
+
+
+def _build_addsub_wrap_rules(S: float):
+    """Return ``(lo_rules, hi_rules)`` for the TWO-pass byte-0 declarative wrap.
+
+    The L8 byte-0 add/sub is a NIBBLE pair (lo nibble in ALU_LO/AX_CARRY_LO/
+    OUTPUT_LO, hi nibble in ALU_HI/AX_CARRY_HI/OUTPUT_HI) with an inter-nibble
+    carry. A single FFN forward CANNOT self-cascade that carry (``W_up`` only
+    reads the INPUT residual — the hi nibble would read a stale CARRY+0). So
+    the wrap mirrors the imperative ``AddSub5StageBlock`` 5-stage pipeline as
+    TWO sequential declarative FFN passes (the documented Path-2 cascade in
+    docs/DSL_W3_ADDSUB_LIMIT.md):
+
+      * ``lo_rules`` (pass 1): the byte-0 LOW nibble lookup. Writes the lo
+        result to OUTPUT_LO and the inter-nibble carry/borrow to CARRY+0.
+      * ``hi_rules`` (pass 2): the byte-0 HIGH nibble lookup. Reads CARRY+0
+        (the carry/borrow-IN written by pass 1) and writes the hi result to
+        OUTPUT_HI plus the byte-level overflow/borrow OUT to CARRY+1 (ADD) /
+        CARRY+2 (SUB) — the dims the downstream L10 ``CarryPropagationPostOp``
+        reads for inter-BYTE propagation.
+
+    Both passes use the ``wide_add_rules`` / ``wide_sub_rules`` width_bytes=2
+    generator (byte 0 = lo lane, byte 1 = hi lane) and then partition the
+    emitted rules by lane so each lane lowers into its own FFN pass.
+    """
+    from ..wide_alu_dsl import wide_add_rules, wide_sub_rules
+
+    kw = dict(
+        operand_a_base="ALU_LO",
+        operand_b_base="AX_CARRY_LO",
+        result_base="OUTPUT_LO",
+        width_bytes=2,
+        marker_gate="MARK_AX",
+        S=S,
+        operand_a_cond_weight=_ADDSUB_OPERAND_A_W,
+        operand_b_cond_weight=_ADDSUB_OPERAND_B_W,
+        marker_cond_weight=_ADDSUB_MARKER_W,
+        threshold=_ADDSUB_THRESHOLD,
+        operand_a_artifact_blocker_weight=_ADDSUB_BLOCKER_W,
+        result_write_amplitude=_ADDSUB_RESULT_AMPLITUDE,
+        # Absolute inter-nibble carry discrimination (decoupled from the
+        # light operand-A weight). The lo pass writes CARRY+0 at residual
+        # ~2.0; the hi pass reads it with this +/-50 weight so the carry-in
+        # decision flips cleanly regardless of the dominant result amplitude.
+        carry_signal_weight=_ADDSUB_CARRY_SIGNAL_W,
+    )
+    add_rules = wide_add_rules(
+        carry_base="CARRY",  # nibble carry CARRY+0; byte-0 overflow CARRY+1
+        opcode_gate="OP_ADD",
+        **kw,
+    )
+    sub_rules = wide_sub_rules(
+        borrow_base="CARRY",  # nibble borrow CARRY+0
+        opcode_gate="OP_SUB",
+        # Byte-0 SUB borrow -> CARRY+2 (the downstream CarryPropagation SUB
+        # input), not CARRY+1 (= ADD's overflow dim).
+        final_borrow_dim="CARRY+2",
+        **kw,
+    )
+    all_rules = tuple(add_rules) + tuple(sub_rules)
+    # Partition by lane. Pass-1 (lo) = the "b0" rules; pass-2 (hi) = the "b1"
+    # rules (incl. the carry-in-detect relay). The rule names encode the lane.
+    lo_rules = tuple(r for r in all_rules if "_b0_" in (r.name or ""))
+    hi_rules = tuple(r for r in all_rules if "_b1_" in (r.name or ""))
+    assert len(lo_rules) + len(hi_rules) == len(all_rules), (
+        f"lane partition lost rules: lo={len(lo_rules)} hi={len(hi_rules)} "
+        f"total={len(all_rules)}"
+    )
+    return lo_rules, hi_rules
+
+
+def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
+    """Install the efficient-mode L8 ADD/SUB byte-0 compute.
+
+    Declarative path (``addsub_declarative_enabled()``, opt-IN via
+    ``C4_ADDSUB_DECLARATIVE=1``): the ``DeclarativeAddSubBlock`` composite —
+    two ``PureFFN`` passes BOTH lowered purely from
+    ``wide_alu_dsl.wide_add_rules`` + ``wide_sub_rules`` — is inserted into
+    ``model.blocks[8].post_ops`` (the SAME single-block slot the imperative
+    ``AddSub5StageBlock`` used). The lo pass reads operand A from ALU_LO,
+    operand B from AX_CARRY_LO; writes the lo result to OUTPUT_LO and the
+    inter-nibble carry to CARRY+0. The hi pass reads ALU_HI / AX_CARRY_HI +
+    CARRY+0 (the carry-in) and writes the hi result to OUTPUT_HI plus the ADD
+    carry (CARRY+1) / SUB borrow (CARRY+2) flags the downstream L10
+    ``CarryPropagationPostOp`` consumes. The result band is written at a
+    DOMINANT amplitude (the folded-in +5 fix). No imperative forward compute
+    (BDToGEConverter / GE add/sub layers / GEToBDConverter) runs in this path.
+
+    DEFAULT (imperative, ``C4_ADDSUB_DECLARATIVE`` unset/0): the imperative
+    ``AddSub5StageBlock`` post-op. The declarative path is byte-identical on
+    CLEAN operands but regresses multi-byte add/sub on the model's DIRTY
+    MARK_AX operand bands (needs an operand-cleanup pre-pass — see
+    ``addsub_declarative_enabled`` docstring + docs/ADDSUB_DSL_MIGRATION_
+    2026_06_14.md). Kept OFF until that follow-up wave lands.
 
     ``kind="model"`` at phase=1002 because the ``_set_layer8_alu`` and
     ``_set_layer8_multibyte_routing`` calls in legacy_bake (phase=999) require
@@ -608,15 +774,62 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
     def bake(model, dim_positions, S):
         if alu_mode != 'efficient':
             return
+        from .shared import addsub_declarative_enabled
         from ...efficient_alu_addsub_split import AddSub5StageBlock
         BD = _as_setdim_proxy(dim_positions)
         block = model.blocks[8]
-        addsub = AddSub5StageBlock(S, BD)
-        # Idempotent guard: if already attached, skip.
-        if any(isinstance(po, AddSub5StageBlock) for po in block.post_ops):
+
+        if not addsub_declarative_enabled():
+            # Pre-migration imperative path.
+            addsub = AddSub5StageBlock(S, BD)
+            if any(isinstance(po, AddSub5StageBlock) for po in block.post_ops):
+                return
+            block.post_ops.insert(0, addsub)
             return
-        # Attach as post_op; _expand_wrapper_blocks splits it downstream.
-        block.post_ops.insert(0, addsub)
+
+        # ---- Declarative path (default) ----
+        from ...base_layers import PureFFN
+        from ...efficient_alu_addsub_split import DeclarativeAddSubBlock
+        from ..primitives import Primitives
+
+        # Idempotent guard: skip if our declarative composite (or the legacy
+        # AddSub5StageBlock) is already attached.
+        if any(getattr(po, "_is_addsub_decl_wrap", False)
+               or isinstance(po, AddSub5StageBlock)
+               for po in block.post_ops):
+            return
+
+        lo_rules, hi_rules = _build_addsub_wrap_rules(S)
+        # d_model from the L8 main FFN (shape-stable for any residual width).
+        ffn_in = block.ffn
+        if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+            d_model = int(ffn_in.W_up.shape[1])
+        elif hasattr(block, "attn") and hasattr(block.attn, "dim"):
+            d_model = int(block.attn.dim)
+        else:
+            d_model = int(getattr(ffn_in, "dim", 512))
+
+        def _lower(rules):
+            ffn = PureFFN(dim=d_model, hidden_dim=len(rules))
+            names = Primitives.ffn_rule_dim_names(rules)
+            dim_pos = Primitives.dim_positions_from_bd(BD, names)
+            end = Primitives.lower_ffn_rules(ffn, rules, dim_pos,
+                                             start_unit=0, S=S)
+            assert end == len(rules), (
+                f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
+            )
+            return ffn
+
+        cleanup_rules = _build_addsub_cleanup_rules(S)
+        cleanup_ffn = _lower(cleanup_rules)  # pre-pass: clean dirty operands
+        lo_ffn = _lower(lo_rules)  # pass 1: lo nibble + CARRY+0
+        hi_ffn = _lower(hi_rules)  # pass 2: hi nibble (reads CARRY+0) + CARRY+1/2
+        # All three rule-derived FFN passes run SEQUENTIALLY inside ONE
+        # composite block (cleanup -> lo writes CARRY+0 -> hi reads it in the
+        # same forward), so the carry cascades while the model's physical block
+        # count stays identical to the imperative AddSub5StageBlock (1 block).
+        composite = DeclarativeAddSubBlock(lo_ffn, hi_ffn, cleanup_ffn=cleanup_ffn)
+        block.post_ops.insert(0, composite)
 
     return Operation(
         name="efficient_l8_addsub_wrap",
@@ -627,15 +840,16 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
         declarative_bake_fn=bake,
         declarative_authority="structural_model",
         migrated=True,
-        # Dim-ownership claims: empty. ``bake`` inserts an
-        # ``AddSub5StageBlock`` into ``model.blocks[8].post_ops``
-        # (module attach -- functionally equivalent to swapping
-        # ``model.blocks[8].ffn``), not per-cell ``(layer, scope,
-        # identifier, column)`` writes.
+        # Dim-ownership claims: empty. ``bake`` inserts a rule-derived
+        # ``PureFFN`` (declarative default) or the imperative
+        # ``AddSub5StageBlock`` (C4_ADDSUB_DECLARATIVE=0) into
+        # ``model.blocks[8].post_ops`` -- module attach, not per-cell
+        # ``(layer, scope, identifier, column)`` writes.
         claims=set(),
         # Module-replacement sentinel: dynamic verifier (Mode B) skips
         # drift detection; static (Mode A) snapshot diffing unaffected.
-        produces={'__module_replacement': 'L8.post_ops[AddSub5StageBlock]'},
+        produces={'__module_replacement':
+                  'L8.post_ops[PureFFN/wide_add+sub_rules]'},
         smoke_tests={
             "TestSmoke32Bit::test_add_16bit",
             "TestSmoke32Bit::test_sub_16bit",

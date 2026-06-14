@@ -286,3 +286,64 @@ class AddSub5StageBlock(nn.Module):
 
     def compact_moe(self, opcode_range=None, relay_map=None):
         pass
+
+
+class DeclarativeAddSubBlock(nn.Module):
+    """Declarative byte-0 ADD/SUB composite — two rule-derived FFN passes.
+
+    The migration replacement for ``AddSub5StageBlock`` (2026-06-14). Holds
+    two ``PureFFN`` modules, both lowered purely from
+    ``wide_alu_dsl.wide_add_rules`` / ``wide_sub_rules`` (NO imperative
+    BDToGEConverter / GE add-sub layers / GEToBDConverter forward compute):
+
+      * ``lo_ffn`` (pass 1): byte-0 LOW nibble add/sub lookup. Reads operand A
+        from ALU_LO, operand B from AX_CARRY_LO; writes the lo result to
+        OUTPUT_LO and the inter-nibble carry/borrow to CARRY+0.
+      * ``hi_ffn`` (pass 2): byte-0 HIGH nibble lookup. Reads ALU_HI /
+        AX_CARRY_HI + the CARRY+0 carry-in written by pass 1; writes the hi
+        result to OUTPUT_HI and the byte-level overflow/borrow to CARRY+1
+        (ADD) / CARRY+2 (SUB) for the downstream L10 CarryPropagationPostOp.
+
+    A single FFN forward cannot self-cascade the inter-nibble carry (``W_up``
+    only reads the input residual), so the two passes run SEQUENTIALLY inside
+    this one block's forward — exactly the way the imperative
+    ``AddSub5StageBlock`` ran its 5-stage ``nn.Sequential`` inside one block.
+    Keeping it ONE block preserves the model's physical block count (so
+    absolute-position-dependent ops like lea are unaffected).
+
+    The OUTPUT result is written at a DOMINANT amplitude so the correct cell
+    out-votes the downstream block-N L9 ALU_LO->OUTPUT_LO leak (the folded-in
+    +5 fix). Both FFNs are residual-add ``PureFFN``s, so the composite forward
+    is just ``hi_ffn(lo_ffn(x))``.
+    """
+
+    def __init__(self, lo_ffn: nn.Module, hi_ffn: nn.Module,
+                 cleanup_ffn: nn.Module = None):
+        super().__init__()
+        # Optional operand-cleanup pre-pass: subtracts the constant
+        # operand-gather artifacts (index-0 ~5.4 etc.) so the lo/hi lookups
+        # read clean one-hots on the model's DIRTY MARK_AX operand bands
+        # (the same div-style cleanup pattern the bitwise wrap uses).
+        self.cleanup_ffn = cleanup_ffn
+        self.lo_ffn = lo_ffn
+        self.hi_ffn = hi_ffn
+        # Mark so the L8 wrap's idempotent guard recognises an existing attach.
+        self._is_addsub_decl_wrap = True
+
+    def forward(self, x):
+        # (Optional) operand cleanup -> pass 1 (lo nibble + CARRY+0) ->
+        # pass 2 (hi nibble reading CARRY+0 + CARRY+1/2). Each PureFFN adds
+        # its writes to the residual.
+        if self.cleanup_ffn is not None:
+            x = self.cleanup_ffn(x)
+        return self.hi_ffn(self.lo_ffn(x))
+
+    # Compatibility stubs (mirror PureNeuralALU / AddSub5StageBlock).
+    def compact(self, block_size=1):
+        pass
+
+    def sparsify(self):
+        pass
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        pass

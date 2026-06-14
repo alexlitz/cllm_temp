@@ -47,6 +47,39 @@ def mul_width2_enabled() -> bool:
     return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
 
 
+def addsub_declarative_enabled() -> bool:
+    """Return True iff efficient-mode L8 ADD/SUB uses the DECLARATIVE wrap
+    (DEFAULT OFF — opt-in via ``C4_ADDSUB_DECLARATIVE=1``).
+
+    When enabled, ``make_efficient_l8_addsub_wrap_op`` installs the
+    ``DeclarativeAddSubBlock`` composite (two ``PureFFN`` passes, both lowered
+    purely from ``wide_alu_dsl.wide_add_rules`` + ``wide_sub_rules``) instead
+    of the imperative ``AddSub5StageBlock`` (BDToGEConverter + GE add/sub
+    layers + GEToBDConverter). The declarative band writes OUTPUT at a
+    DOMINANT amplitude (the folded-in +5 fix) so the correct result cell
+    out-votes the downstream L9 ALU_LO->OUTPUT_LO leak. The two passes run
+    sequentially inside ONE block (carry CARRY+0 cascades lo->hi internally),
+    keeping the physical block count identical to the imperative.
+
+    DEFAULT OFF (2026-06-14): the declarative byte-0 add/sub + carry/borrow
+    flags are byte-identical to the imperative on CLEAN one-hot operands
+    (tests/test_addsub_decl_wrap.py: full 0..255 value grid) AND in isolation
+    on the real model. BUT the live MARK_AX operand bands are DIRTY (operand A
+    in ALU_LO/HI arrives ~6.0 at the true nibble plus a ~5.4 index-0
+    magnitude artifact — the documented operand-gather hybrid encoding). On
+    those dirty bands the lo pass's CARRY+0 over-accumulates (multiple partial
+    rule firings) and the hi pass over-fires, so multi-byte add/sub (the
+    add_16bit / sub_16bit / *_cascade smoke + 32-bit negative sub) regress.
+    The imperative ``BDToGEConverter._clean_onehot`` thresholds operands to
+    0/1 BEFORE computing, which is what makes it dirty-operand robust; the
+    declarative wrap needs an analogous operand-cleanup pre-pass (the same
+    technique ``make_efficient_l10_andorxor_wrap_op`` uses for bitwise) as a
+    FOLLOW-UP wave before it can be the default. See
+    docs/ADDSUB_DSL_MIGRATION_2026_06_14.md.
+    """
+    return os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
