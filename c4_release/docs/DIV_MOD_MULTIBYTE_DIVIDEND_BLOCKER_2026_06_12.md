@@ -245,3 +245,68 @@ byte-identity safe, and a prerequisite-cleanup for the eventual multi-byte
 relay, but it cannot flip any case alone. The remaining path is the
 multi-session bit-serial cascade + multi-byte operand relay described above —
 HARD STOP per the div/mod fix brief.
+
+---
+
+## ADDENDUM (2026-06-13): re-verified at HEAD ac9177d1 — AX_BYTE1_DUMP default-ON does NOT touch the operand relay; wall stands
+
+Re-diagnosed the WHOLE div/mod/gcd cluster at HEAD `ac9177d1` (spec_k=0,
+`full_trace`). HEAD is materially newer than the doc's `5b42e26a`: it now
+carries the **AX byte-1 register-dump carry DEFAULT-ON** (`C4_AX_BYTE1_DUMP`,
+commit `f080a46e`) plus the L10 divmod placement fix (`a30e1048`, the addendum
+above). The lead worth checking was: *does the now-default-on AX byte-1 carry
+make the multi-byte dividend survive into the divide?* **It does not** — those
+are two different residual paths (register-emit vs operand-gather).
+
+### Cluster boundary at HEAD (unchanged from the doc body)
+
+`run_1096_canonical.py --criterion full_trace --spec-k 0`:
+**div 21/50, mod 24/50** (single-byte dividends pass; multi-byte fail).
+The gcd cluster (ids 900-949) is 0/50 — gcd's `while(b) { b = a%b; a = temp; }`
+loop is built on the same `%` op, so every gcd inherits the div/mod multi-byte
+truncation (and most gcd inputs reach a multi-byte intermediate remainder).
+
+### The compute-error mechanism, quantified (52/55 + airtight)
+
+Of the 55 div+mod failures, **49 are byte-exactly `low_byte(dividend) op
+divisor`**; verified on the fresh slice (`--ids 150-159,200-209`):
+
+```
+id150 1162/37: 1162&0xFF=138 -> 138/37=3  == got_ax 3
+id151  843/31:  843&0xFF=75  ->  75/31=2  == got_ax 2
+id200  390%19:  390&0xFF=134 -> 134%19=1  == got_ax 1
+id208  434%10:  434&0xFF=178 -> 178%10=8  == got_ax 8
+```
+
+The 6 non-truncation outliers are NOT a different div/mod root: id170/173/183
+are the same truncation caught one step earlier at the dividend-LOAD step
+(`got_ax = a&0xFF` itself); id184/203 are the AX byte-1 **0xFF / leak** family
+(`got=0xFFxx` / `0x1xx`), owned by the AX-byte1 task, not the divide; id201
+(`89%10`, single-byte) is a lone **operand-cleanliness** miss — the dividend
+low nibble 0x9 is decoded as 0x7 (89→87, 87%10=7=got), an L8 operand-gather
+noise perturbation of the `~5.56` cell-0 artifact, NOT a divmod-rule bug, and
+high-risk to chase (the `_ARTIFACT=5.56` cleanup constant is load-bearing for
+the 42 single-byte div/mod cases that pass).
+
+### The structural smoking gun (re-probed at HEAD, AX_BYTE1_DUMP ON)
+
+For `1162/37` (high byte 0x04), at block 13 (post-L10-divmod-install):
+
+```
+REG_AX register tokens decode = 1162 = 0x048A  (byte0=0x8A, byte1=0x04 PRESENT)
+   ^ the AX byte-1 DUMP carry DOES preserve the full dividend in the REGISTER.
+operand band ALU_LO/HI (what the 256x256 lookup reads) = a SINGLE byte only.
+reserved high-byte relay STACK0_BYTE_VAL_1 written ANYWHERE? -> False.
+```
+
+So the register-emit carry and the operand-gather are **independent paths**:
+AX_BYTE1_DUMP fixed the former; the latter (the band the divide reads) is
+still single-byte, and the reserved `STACK0_BYTE_VAL_1_*` relay slot is still
+unwritten. The `wide_div_rules_ge_format(width_bytes=1)` lookup is
+byte-accurate by construction (`out_value = a//b` / `a%b` per (a,b) pair —
+read at `wide_alu_dsl.py:1206`); it simply never sees `a`'s high byte, so it
+divides `a&0xFF`. **No declarative single-rule / install tweak can flip a
+multi-byte case** without first writing the high dividend byte into the
+operand band — which is the new attention head (Wall-A prereq) + the bit-serial
+cascade (Wall-B), both multi-session structural. HARD STOP confirmed; no source
+change shipped (smoke stays 51/51 by construction).
