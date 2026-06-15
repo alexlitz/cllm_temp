@@ -2208,6 +2208,14 @@ def compile_full_vm_dynamic(
             "C4_PSH_ARG_VAL_AX": (
                 os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
             ),
+            # L15 head-0 LI/LC-load suppressor inert (DEFAULT-ON, opt out =0):
+            # adds per-suppressor cancel slots to L15 memory_lookup head 0 so a
+            # frame-local LI/LC load is not buried by the func-frame OP_ENT
+            # broadcast (output-affecting on func/nested/rec/var LI), so the
+            # ON / OFF builds must NEVER share a memo / disk entry.
+            "C4_L15_LI_SUPPR_INERT": (
+                os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2732,6 +2740,12 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_PSH_ARG_VAL_AX": (
             os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
+        ),
+        # L15 head-0 LI/LC-load suppressor inert (DEFAULT-ON, opt out =0,
+        # output-affecting on func/nested/rec/var LI loads): the ON / OFF
+        # builds must never share a serialised entry.
+        "C4_L15_LI_SUPPR_INERT": (
+            os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

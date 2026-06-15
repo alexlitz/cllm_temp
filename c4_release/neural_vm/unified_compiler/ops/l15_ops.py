@@ -1,9 +1,48 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os as _os_l15
+import torch
 import torch.nn as nn
 from collections.abc import Mapping
 
 from ...attention_head_allocator import AttentionHeadAllocator
+
+
+def _l15_li_load_suppressor_inert_on() -> bool:
+    """DEFAULT-ON flag (``C4_L15_LI_SUPPR_INERT``): make the L15 head-0
+    PC/SP/STACK0-discriminator slots INERT on genuine LI/LC LOAD query rows.
+
+    ROOT (spec_k=0, BUILT dims, func_identity_0 id550 step-7 LI, 2026-06-15):
+    The L15 head-0 content-addressable load works cleanly in isolation
+    (si_li_roundtrip: AX=42, attends the stored value). In a FUNCTION program
+    the callee ENT step's ``OP_ENT`` BROADCASTS a ~0.3-2 residue onto the prior
+    PSH-arg store tokens AND onto the LI query (AX-marker) row. That residue
+    mis-fires a CHAIN of head-0 discriminator slots that are large-magnitude
+    NOT-blockers for OTHER row types:
+
+      * slot 58 (early-ENT STACK0 discriminator): Q ~= -1.2e10 on the LI row;
+        K[58]=1e4*OP_ENT is nonzero ONLY on the OP_ENT-residue store tokens --
+        i.e. it penalises EXACTLY the PSH-arg store the LI must read (-3.3e13),
+        burying the whole softmax1 (sink wins -> AX=0).
+      * slot 62 (sp_byte_blocker): q[62,OP_ENT]=5e5 * K[62]=-3e5*CONST adds a
+        UNIFORM -1.1e11 to every key on the OP_ENT-residue LI row.
+      * slot 35 (pc_byte_blocker): its 0xFFE8 e8-signature boost
+        (ADDR_B0_LO+8 + ADDR_B0_HI+15) only half-cancels the existing -10000
+        OP_LI_RELAY guard, leaving Q[35]~+1e4 * K[35]=-1e5 = a -1e9 baseline.
+
+    PROOF: zeroing slots {34,35,58,59,60,61,62} for head 0 makes the func LI
+    head-0 attend the value-70 store (pos 243, weight 1.0) -> step-7 AX=70, AND
+    var_simple_0/12 still decode 990/28 (the address bits alone pick the right
+    store once the suppressors are out of the way).
+
+    FIX: on a genuine LI/LC LOAD query row (OP_LI_RELAY + OP_LC_RELAY > 0,
+    MARK_AX=1) drive these slots' Q to a value whose product with their K is
+    >= 0 (un-buried), so the address-bit slots (4-27) decide the lookup exactly
+    as on the clean si_li path. Off-relay (OP_LI_RELAY==OP_LC_RELAY==0 -- every
+    PC/SP/STACK0/pop row the suppressors actually guard) the writes are absent,
+    so HEAD is byte-identical with the flag OFF.
+    """
+    return _os_l15.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     attention_head_extension,
@@ -1143,6 +1182,61 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             q_map[(33, BD.OP_LI_RELAY)] = 20000.0
             q_map[(33, BD.OP_LC_RELAY)] = 20000.0
             k_map[(33, BD.MEM_STORE)] = 5.0
+
+        # === C4_L15_LI_SUPPR_INERT: un-bury the head-0 load on LI/LC rows ===
+        # See _l15_li_load_suppressor_inert_on for the full root + proof. The
+        # OP_ENT broadcast in a function frame mis-fires the head-0 PC/SP/STACK0
+        # discriminator slots on the LI/LC LOAD query row, burying the
+        # content-addressable lookup. Neutralise them on genuine load rows
+        # (OP_LI_RELAY/OP_LC_RELAY active) so the address bits (slots 4-27)
+        # decide the store -- exactly as on the clean si_li path. The genuine
+        # PC/SP/STACK0/pop rows these slots guard carry OP_LI_RELAY==
+        # OP_LC_RELAY==0, so the overrides are no-ops there (byte-identical).
+        if head == 0 and _l15_li_load_suppressor_inert_on():
+            # These head-0 slots are PC/SP/STACK0-marker/pop discriminators that
+            # MIS-FIRE on the OP_ENT-broadcast LI/LC load query row, burying /
+            # mis-ordering the content-addressable lookup so a frame-local LI
+            # returns 0 (the func/nested/rec/var first-LI wall). NEUTRALISING
+            # them lets the address bits (slots 4-27) alone pick the store, the
+            # clean si_li ordering (verified: zeroing these makes the func LI
+            # attend the value store; var_simple_0/12 + rec still decode).
+            #
+            # Implementation: a per-suppressor K-side CANCEL slot (free
+            # over-width slot, head 0) whose Q EQUALS the suppressor's full Q
+            # (copied dim-for-dim) and whose K == -(suppressor's K). The cancel
+            # slot's per-key product is therefore -(suppressor's per-key
+            # product) on EVERY row, so suppressor + cancel == 0 everywhere ->
+            # the slot is fully inert (equivalent to zeroing it), but expressed
+            # additively so flag-OFF (cancel slots omitted) is byte-identical
+            # with HEAD. slot 58's K is OP_ENT and its Q/K are 1e10/1e4 scale,
+            # so RESCALE slot 58 by 1e4 first (the cancel of two ~1e6 numbers is
+            # precision-safe; a 1e10 cancel is not).
+            _row58_rescale = 10000.0
+            for _d, _w in (
+                (BD.OP_ENT, 200000000.0 / _row58_rescale),
+                (BD.MARK_STACK0,
+                 (early_ent_stack0_q + stack0_gate) / _row58_rescale),
+                (BD.CONST,
+                 -(early_ent_stack0_q + stack0_gate) / _row58_rescale),
+                (BD.IS_BYTE, -2000000000.0 / _row58_rescale),
+                (BD.MARK_AX, -2000000000.0 / _row58_rescale),
+                (BD.MARK_PC, -2000000000.0 / _row58_rescale),
+                (BD.MARK_SP, -2000000000.0 / _row58_rescale),
+                (BD.MARK_BP, -2000000000.0 / _row58_rescale),
+                (BD.MARK_MEM, -2000000000.0 / _row58_rescale),
+            ):
+                q_map[(58, _d)] = _w
+            k_map[(58, BD.OP_ENT)] = 1.0
+            _GATE = {34: 70, 35: 64, 58: 65, 59: 66, 60: 67, 61: 68, 62: 69}
+            for _suppr, _gate in _GATE.items():
+                for (_s, _d), _w in [
+                    ((s, d), w) for (s, d), w in q_map.items() if s == _suppr
+                ]:
+                    q_map[(_gate, _d)] = _w
+                for (_s, _d), _w in [
+                    ((s, d), w) for (s, d), w in k_map.items() if s == _suppr
+                ]:
+                    k_map[(_gate, _d)] = -_w
 
         new_q = tuple(
             AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
@@ -2637,6 +2731,50 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
             attn.W_q.data[base + 33, BD.OP_LI_RELAY] = 20000.0
             attn.W_q.data[base + 33, BD.OP_LC_RELAY] = 20000.0
             attn.W_k.data[base + 33, BD.MEM_STORE] = 5.0
+
+        # C4_L15_LI_SUPPR_INERT: un-bury the head-0 content-addressable load on
+        # LI/LC rows (mirror of the declarative override in
+        # _layer15_memory_lookup_heads_0_3_specs_with_overrides). This is the
+        # writer that actually lands (re-run by make_l15_attention_resize_op).
+        # See _l15_li_load_suppressor_inert_on for the full root + proof.
+        if head == 0 and _l15_li_load_suppressor_inert_on():
+            # Mirror of the declarative override in
+            # _layer15_memory_lookup_heads_0_3_specs_with_overrides. This is the
+            # writer that actually lands (re-run by make_l15_attention_resize_op).
+            # Rescale slot 58 (1e10->1e6) for a precision-safe cancel, drop the
+            # slot-62 OP_ENT misfire, then for each suppressor add a gate slot
+            # (K = -suppressor.K per-key, Q = +suppressor.load-row-Q only on load
+            # rows) so suppressor+gate == 0 per key on a load row (address-
+            # independent) and ZERO off-load. See _l15_li_load_suppressor_inert_on.
+            _row58_rescale = 10000.0
+            for _d, _w in (
+                (BD.OP_ENT, 200000000.0 / _row58_rescale),
+                (BD.MARK_STACK0,
+                 (early_ent_stack0_q + early_ent_stack0_gate) / _row58_rescale),
+                (BD.CONST,
+                 -(early_ent_stack0_q + early_ent_stack0_gate) / _row58_rescale),
+                (BD.IS_BYTE, -2000000000.0 / _row58_rescale),
+                (BD.MARK_AX, -2000000000.0 / _row58_rescale),
+                (BD.MARK_PC, -2000000000.0 / _row58_rescale),
+                (BD.MARK_SP, -2000000000.0 / _row58_rescale),
+                (BD.MARK_BP, -2000000000.0 / _row58_rescale),
+                (BD.MARK_MEM, -2000000000.0 / _row58_rescale),
+            ):
+                attn.W_q.data[base + 58, _d] = _w
+            attn.W_k.data[base + 58, BD.OP_ENT] = 1.0
+            attn.W_q.data[base + 62, BD.OP_ENT] = 0.0
+            _GATE = {34: 70, 35: 64, 58: 65, 59: 66, 60: 67, 61: 68, 62: 69}
+            for _suppr, _gate in _GATE.items():
+                attn.W_q.data[base + _gate, :] = 0.0
+                attn.W_k.data[base + _gate, :] = 0.0
+                # cancel.Q = suppressor.Q (copy), cancel.K = -suppressor.K, so
+                # cancel.product == -suppressor.product on every key -> inert.
+                _qrow = attn.W_q.data[base + _suppr]
+                _krow = attn.W_k.data[base + _suppr]
+                for _d in torch.nonzero(_qrow, as_tuple=False).flatten().tolist():
+                    attn.W_q.data[base + _gate, _d] = float(_qrow[_d])
+                for _d in torch.nonzero(_krow, as_tuple=False).flatten().tolist():
+                    attn.W_k.data[base + _gate, _d] = -float(_krow[_d])
 
 
 def _suppress_l15_lookup_lev_blockers_4_11(attn, BD, HD) -> None:
