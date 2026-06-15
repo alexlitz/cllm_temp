@@ -377,8 +377,28 @@ class GEToBDConverter(nn.Module):
                 torch.sigmoid(S * (diff_b1_hi + 0.5))
                 - torch.sigmoid(S * (diff_b1_hi - 0.5))
             )
+            # width=2 MUL byte-1 re-stage suppression (2026-06-15). When the
+            # width=2 (8-bit x 8-bit -> 16-bit) MUL path is active, the
+            # product's byte 1 is computed by the L11 wide_mul into the
+            # dedicated MUL_RESULT_HI band and staged into AX_FULL by the L13
+            # ``layer13_mul_result_hi_relay`` head. This FlattenedALUMul
+            # composite re-fires on the MUL MARK_AX row (a second instance at
+            # logical L15 / physical block 26 after _expand_wrapper_blocks --
+            # see docs/L17_TAIL_MUL_DOUBLE_FIRE.md) and its OWN GE high-byte
+            # result DISAGREES with the wide_mul band (e.g. 97*94: wide_mul
+            # byte1=0x23, this composite re-stages 0xFD), CLOBBERING the
+            # correct AX_FULL staging so the byte-1 emit relay copies garbage.
+            # Exclude OP_MUL from the AX_FULL byte-1 re-stage when width=2 is
+            # on so the L13 relay's correct MUL_RESULT_HI staging survives to
+            # the byte-1 emit. Verified spec_k=0 / BUILT dims: AX_FULL at the
+            # MUL row stays 0x23 across blocks 15..30. With C4_MUL_WIDTH2=0
+            # (flag off) OP_MUL is kept in the mask -> byte-identical to HEAD
+            # (no MUL_RESULT_HI band exists in that build).
+            from .unified_compiler.ops.shared import mul_width2_enabled
+            _suppress_mul_b1_restage = mul_width2_enabled()
             wide_op = (
-                (x_bd[:, :, BD.OP_MUL] > 0.5)
+                ((x_bd[:, :, BD.OP_MUL] > 0.5) if not _suppress_mul_b1_restage
+                 else torch.zeros_like(x_bd[:, :, BD.OP_MUL], dtype=torch.bool))
                 | (x_bd[:, :, BD.OP_SHL] > 0.5)
                 | (x_bd[:, :, BD.OP_SHR] > 0.5)
                 | (x_bd[:, :, BD.OP_DIV] > 0.5)
