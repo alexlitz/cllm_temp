@@ -566,6 +566,17 @@ def all_core_ops(
         # PureFFN post_op on the L25 tail block after tail_bit32. See
         # l11_ops.make_ax_byte1_dump_repopulate_op.
         make_ax_byte1_dump_repopulate_op(),
+        # AX byte-2/3 ENT-frame zero cap (THE callee-ENT prologue blocker for
+        # func/nested/rec/var): on the callee ENT step the AX dump leaks garbage
+        # into bytes 2/3 (func_identity_0 step-1 ax=0x0a0a0000) because the L18
+        # PC-byte default (OUTPUT_LO+10) wins on the high-byte rows when the L9
+        # AX-result zero default does not fire (opcode is ENT, not IMM/ADD).
+        # Restores byte=0 on the byte-2/3 dump rows gated on OP_ENT (the clean,
+        # program-stable ENT-frame discriminator; callee AX is always 0 there).
+        # Standalone PureFFN post_op on the L25 tail block after tail_bit32.
+        # Gated by C4_AX_BYTE23_DUMP (default ON). See
+        # l11_ops.make_ax_byte23_dump_zero_op.
+        make_ax_byte23_dump_zero_op(),
         # STACK0 byte-0 carried-step flag precursor (Root 2): writes the BOUNDED
         # ``STACK0_B0_CARRIED`` gate flag at an EARLY block (L7 anchor) where the
         # same-step H3 byte-0 one-hot is still bounded (fresh ~3.3 present,
