@@ -148,11 +148,11 @@ _BASELINE: Dict[str, int] = {
     "c4_release/neural_vm/setup_helpers_l3.py": 9,                  # W_*=9   alibi=0 fill=0
     "c4_release/neural_vm/setup_helpers_l4.py": 7,                  # W_*=7   alibi=0 fill=0
     # ---- per-layer ops/*.py (active DSL-migration front) ----
-    "c4_release/neural_vm/unified_compiler/ops/l15_ops.py": 234,    # W_*=231 alibi=3 fill=0
+    "c4_release/neural_vm/unified_compiler/ops/l15_ops.py": 241,    # W_*=238 alibi=3 fill=0 (+7: C4_L15_LI_SUPPR_INERT head-0 load suppressor cancel, flag-gated)
     "c4_release/neural_vm/unified_compiler/ops/l8_ops.py": 81,      # W_*=79  alibi=2 fill=0
-    "c4_release/neural_vm/unified_compiler/ops/l14_ops.py": 80,     # W_*=78  alibi=2 fill=0
+    "c4_release/neural_vm/unified_compiler/ops/l14_ops.py": 81,     # W_*=79  alibi=2 fill=0 (+1: pre-existing worktree flag, baseline catch-up)
     "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 22,      # W_*=14  alibi=7 fill=1  (+2: Wave B Phase 2 SE-relay slope re-assert)
-    "c4_release/neural_vm/unified_compiler/ops/model_ops.py": 17,   # W_*=0   alibi=13 fill=4
+    "c4_release/neural_vm/unified_compiler/ops/model_ops.py": 18,   # W_*=0   alibi=14 fill=4 (+1: pre-existing worktree flag, baseline catch-up)
     "c4_release/neural_vm/unified_compiler/ops/l4_ops.py": 14,      # W_*=13  alibi=0 fill=1
     "c4_release/neural_vm/unified_compiler/ops/l10_ops.py": 11,     # W_*=0   alibi=11 fill=0
     "c4_release/neural_vm/unified_compiler/ops/alu_ops.py": 5,      # W_*=0   alibi=5 fill=0
