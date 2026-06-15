@@ -104,3 +104,117 @@ number), `tools/probe_stack0_b0_nibble.py` (per-frame STACK0_BYTE0 value),
 `tools/probe_expr_intermediate_relay.py`,
 `tools/probe_mul_psh_allbands.py` (locates the high byte across all bands),
 `tools/probe_psh_axrows.py`, `tools/probe_div_operand_select.py`.
+
+---
+
+# UPDATE 2026-06-15 (#221 comprehensive lane): the corruptor is the C4_STACK0_B0_DUMP, and it's a confirmed +27 architectural TRADE
+
+A deeper built-dim probe lane (HEAD `47246509`, GPU 1, spec_k=0, BUILT 49-block
+build, `tools/probe_stack0_framechain.py` + direct LM-head logit attribution)
+**re-localized** the expr corruptor and **measured the exact trade**. Two
+corrections to the "stale frame the 2nd op reads" framing above:
+
+## Correction 1: the value the 2nd op reads is correct UNTIL the L25 tail; the dump then over-stamps the stale one
+
+For `14*56/8` the STACK0 frame the DIV reads (the op2-operand marker row, the
+frame persisted across the intervening `IMM 8` step) holds byte0 = **16
+(correct intermediate)** all the way through **block 31 (the ALU→OUTPUT
+materializer) and blocks 31–37** (`OUTPUT_LO+0`/`OUTPUT_HI+1` = the 16 one-hot,
+just at ~20× magnitude vs a fresh frame: 4017 vs 184). Then:
+
+* **block 38** (`tail_bit32_result_correction`, the 2059-unit WIDTH-SENSITIVE
+  bank) BLANKS all OUTPUT_LO/HI to ~−263 M on the carried frame (it does NOT
+  fire on the fresh frame, whose OUTPUT is small/clean), and
+* **block 46** (the `stack0_byte0_dump_repopulate` re-point, ON only under
+  `C4_STACK0_B0_DUMP=1`) writes `OUTPUT_LO+14` = +67 M / `OUTPUT_HI+0` = +100 M
+  → emits **14** (the ORIGINAL operand `a`).
+
+LM-head logit attribution at the DIV-frame predictor row: `logit[14]=8.4e8`
+(via `OUTPUT_HI+0=5.0e8 + OUTPUT_LO+14=3.4e8`) beats `logit[16]=3.0e7`. The
+emitted byte-0 = 14 is then **baked into the context** and the operand-gather
+re-reads it next pass (`ALU_LO+10`=stale for `10*9/1` from block 6 on) — a
+**self-perpetuating** loop. So the "2nd op reads a stale prior frame" symptom
+is REAL but its proximate cause is the dump over-stamp, not a persistence-head
+mis-selection.
+
+## Correction 2: it's the C4_STACK0_B0_DUMP, and it's NET +27 (can't disable)
+
+Direct A/B on the target window (`tools/run_1096_canonical.py --ids
+825-899,350-399,75-124 --criterion full_trace`):
+
+| cluster      | DUMP ON (HEAD) | DUMP OFF | Δ(ON−OFF) |
+|--------------|----------------|----------|-----------|
+| sub          | 23/25          | 23/25    | 0         |
+| mul          | 24/25          | 24/25    | 0         |
+| if_gt        | **17**/25      | 4/25     | **+13**   |
+| if_lt        | **21**/25      | 4/25     | **+17**   |
+| expr_paren   | 19/25          | 14/25    | +5        |
+| expr_mul_div | **0**/25       | **9**/25 | **−9**    |
+| expr_mod     | 3/25           | 2/25     | +1        |
+| **TOTAL**    | **107**/175    | 80/175   | **+27**   |
+
+So the dump is a strong NET +27 (if_gt/if_lt +30 dominate the expr_mul_div −9).
+`C4_STACK0_B0_DUMP=0` would recover expr_mul_div 0→9 but crater if_gt/if_lt
+17/21→4/4. **Disabling is net −27 and is NOT the move.**
+
+## The discriminator IS genuinely absent (built-dim confirmed, not a dim-mismap)
+
+At the dump block (44/45) the expr op2-operand frame and the if/bool
+comparison framing-drift frame are **batched-identical**: both are MARK_STACK0
+rows with `STACK0_B0_CARRIED≈100`, `SHARP=0`, `PREV_DOM=21`, `NOT_CMP=0`,
+`HAS_SE≈1`, and **NO per-step opcode** (the arith opcode OP_DIV/OP_MUL sits on
+the *result* frame's marker, NOT the operand frame the dump corrupts —
+`probe`: expr `14*56/8` marker rows: 195=OP_MUL, **268=∅** ← corrupted, 305=
+OP_DIV; the existing `STACK0_B0_NOT_CMP` opcode rule fires =499 on 195/305 but
+**=0 on 268** because no opcode lands there). Every other band probed
+(OP_PSH/PSH_AT_SP trace, ALU presence, CMP+0..4, value magnitude, PREV
+sharpness, pre-nuke OUTPUT cleanliness, and a FULL-RESIDUAL scan) is
+overlapping. A full-residual scan at an EARLY block (15) surfaced ONE candidate
+(`ADDR_B0_HI`≈0.13 on if-frames vs 0 on expr-frames) but it **washes out** by
+the dump block (44): there `ADDR_B0_HI` band-mass ≈ 38 on EVERY carried frame,
+expr and if alike — so it is NOT usable where the dump reads. The ONLY true
+separator is **"the next step is arithmetic vs comparison+branch"** — a
+**FUTURE opcode**, which is *causally unavailable* at the operand frame
+(attention is causal; OP_DIV at row 305 follows row 268). This reproduces and
+SHARPENS the ROOT_2 doc's conclusion with current numbers; it is not a
+dim-mismap (read at BUILT `dim_positions`).
+
+## Why even the "value-faithful carry" is NOT a clean win (tested, this lane)
+
+The dump's carry head (`stack0_byte0_dump_carry`, L9 block 10) copies the prev
+**marker row's** registry `H1`/`H3` one-hot. At block 9 the marker rows carry a
+CONSTANT marker signature (`H1+10`, `H3+3`, `H3+10` — identical for every frame
+regardless of value 14/56/16/8). So the carry re-emits a **near-constant byte**;
+this happens to help the if/bool comparison rows and corrupts the per-frame
+expr operands. The per-frame value DOES exist at block 9 in the **byte0 ROW**
+(marker+1) `CLEAN_EMBED_LO/HI` (`14*56/8`: rows 233=16, 269=14; the byte0 rows
+carry `STACK0_BYTE0≈0.97`, MARK_STACK0=0 — cleanly K-matchable). So the obvious
+"value-faithful" fix is to re-point the carry head to attend the **previous
+frame's byte0 row** (`STACK0_BYTE0` K-match + ALiBi recency) and copy *its*
+`CLEAN_EMBED`. For expr that supplies the correct intermediate (marker 268 ->
+prev byte0 row 233 = 16). **BUT a per-frame probe (`probe_stack0_framechain`
++ prev-byte0 trace) shows this REGRESSES if/bool**: the if comparison frames
+need DIFFERENT per-frame values than "the previous frame's byte0", e.g.
+`if_gt 28>9` carried marker 239 currently emits 28 (correct) but the prev-byte0
+value is 2 — value-faithful carry would WRONGLY change it to 2; marker 203 emits
+2 and prev-byte0 is 28. The if/bool comparison frames carry a mixed
+operand+result value structure that "copy the prev frame's value" does not
+satisfy. So the value-faithful carry trades expr-correct for if/bool-regress —
+**also a trade, not a pure win**. The dump's constant-broadcast is a tuned
+compromise the two clusters pull in opposite directions, NOT a fixable
+mis-wiring.
+
+The remaining (untested, higher-risk) lever is the **block-38 nuke source**
+(`tail_bit32_result_correction`): the correct expr value is present at block 37
+and only the nuke + dump destroy it; gating the nuke OFF the carried-operand
+frame would let expr's value survive with NO dump needed and NO if/bool change.
+But that touches the WIDTH-SENSITIVE 2059-unit bank
+(`project_l10_tail_bank_width_sensitive`: repurpose, don't append) and the nuke
+fires on the SAME carried-STACK0 signature (no opcode), so it likely inherits
+the same indistinguishability. A genuine win requires a forward-propagating
+control-flow band built during op1 (an arith-vs-cmp program-context the carry
+propagates), which is a new multi-op head behavior, NOT a tail refinement.
+
+New probe: `tools/probe_stack0_framechain.py` (per-frame byte0 across blocks +
+op2 ALU read; the tool that localized the 16-survives-to-block-37 fact).
+No model edit landed; smoke 51/0; HEAD `47246509` byte-identical.
