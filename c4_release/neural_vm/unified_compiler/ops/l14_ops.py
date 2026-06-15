@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os as _os
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -8,6 +10,28 @@ from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
+
+
+def _psh_arg_val_ax_enabled() -> bool:
+    """PSH-of-argument store-value AX-source lock (DEFAULT-ON; opt out =0).
+
+    The L14/L18 mem-generation value heads (4-7) choose their value SOURCE
+    via slots 1/2/36, gated by ``OP_JSR`` / ``OP_ENT`` (STACK0 source for
+    JSR/ENT, AX source otherwise). On a function-argument PSH that precedes a
+    JSR;ENT prologue, ``OP_ENT`` (and ``OP_JSR``) BROADCAST a small residue
+    (~0.3) back onto the PSH step's MEM value row via the KV cache. That weak
+    residue is enough to tip the source selector toward the STACK0 path, so
+    head 4 attends a far-away garbage row (value 0x0A) instead of the AX
+    byte-0 row (the pushed argument), corrupting the stored byte-0. SI/SC and
+    normal-PSH stores have ``OP_JSR==OP_ENT==0`` so they already lock onto AX.
+
+    This flag adds a hard, MEM_STORE-gated AX-source boost (a fresh attention
+    slot) that is suppressed by the GENUINE opcode (``OP_JSR`` / ``OP_ENT`` ~
+    10.8) but survives the broadcast residue (~0.3), so a PSH-arg store sources
+    its value from AX like every other PSH/SI/SC store. Output-affecting; flag
+    OFF reverts to byte-identical pre-fix weights.
+    """
+    return _os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
 
 
 # === L14 attention-head layout (pinned indices) =====================
@@ -979,6 +1003,98 @@ def _layer14_mem_generation_head_specs_with_overrides(
             # Slot 37: explicit zero-out in legacy override. The base
             # spec does not touch slot 37, so the assignments are
             # already 0; nothing to record.
+
+            # === Slot 2 OP-residue floor: PSH-of-argument value-source AX ==
+            # lock (C4_PSH_ARG_VAL_AX, DEFAULT-ON; HEAD 4 / val byte 0 only).
+            #
+            # Slot 2 is the value-head STACK0/JSR-ENT source selector: its Q
+            # is ``L*(OP_JSR + OP_ENT)`` and its K pushes TOWARD the STACK0
+            # source row (``+si_source_s`` on STACK0_BYTE0) and AWAY from the
+            # AX source row (``-si_source_s`` on H1+AX). On a PSH it should be
+            # fully OFF (the value comes from AX). It IS off for a normal PSH
+            # (OP_JSR==OP_ENT==0). BUT a function-argument PSH that precedes a
+            # JSR;ENT prologue gets an OP_JSR/OP_ENT broadcast residue (~0.3)
+            # on its MEM value row (KV-cache bleed from the later ENT step):
+            # Q_slot2 = 15*0.34 = 5.1 > 0, a weak STACK0 pull that tips head 4
+            # off the AX byte-0 row (the pushed argument) onto a far-away
+            # garbage STACK0/JSR-ENT val row -> stored byte-0 = 0x0A.
+            #
+            # FIX: subtract a CONST FLOOR from Q_slot2 so the STACK0 source
+            # only activates when the opcode is GENUINE (OP_JSR+OP_ENT above
+            # the threshold), not on broadcast residue. With FLOOR = L*2 = 30
+            # (threshold at OP sum = 2.0, between the 0.34 residue and the
+            # 10.79 real opcode):
+            #   PSH-arg (0.34): Q_slot2 = 5.1 - 30 = -24.9 -> slot 2 now
+            #     pushes AWAY from STACK0 and TOWARD the AX source row (the K
+            #     sign-flip: -24.9 * -si_source_s = + on the AX row), so head
+            #     4 locks onto AX byte 0 (the argument). Other slots' per-step
+            #     position gates (33/34/38) keep it on THIS step's AX row.
+            #   real JSR (10.79): Q_slot2 = 162 - 30 = 132 (STACK0, correct).
+            #   real ENT (12.07): Q_slot2 = 181 - 30 = 151 (STACK0, correct).
+            #   normal PSH / SI / SC (OP sum = 0): Q_slot2 = -30 -> a uniform
+            #     negative on the STACK0 row, +30*si_source_s toward AX. SI/SC
+            #     source from AX anyway (byte-identical output); PSH likewise.
+            # Scoped to head 4 (byte-0 = the documented gap, the bulk of small
+            # arg values). Flag OFF: the floor is omitted (byte-identical).
+            if _psh_arg_val_ax_enabled() and own_value_idx == 0:
+                # === Slot 46: PSH-of-argument ENT-source cancel ========
+                # The DOMINANT corruptor of the call-argument PSH store value
+                # is slot 44 (the ENT old-BP value-SOURCE override): its Q is
+                # gated only on OP_ENT, its K selects the JSR-prologue old-BP
+                # position via K@OP_JSR. The existing broadcast hardening
+                # blocks only REGISTER-emit rows (MARK_PC/AX/SP/BP), leaving
+                # the MEM value-target row unguarded. On a function-argument
+                # PSH that precedes a JSR;ENT prologue, the later ENT's OP_ENT
+                # BROADCASTS a ~0.30 residue onto the PSH val row (KV-cache
+                # bleed), so Q_slot44 = 80*0.30 = 24, and multiplied by the
+                # prologue row's GENUINE OP_JSR=10.79 (K_slot44 ~ 1482) gives
+                # a +35580 pull onto the garbage old-BP row (value 0x0A),
+                # burying the AX byte-0 row (the pushed argument).
+                #
+                # We cancel slot 44 ONLY on the genuine JSR-prologue rows
+                # (K46 @ -OP_JSR; OP_JSR is large ONLY on real JSR rows and
+                # is exactly 0 in non-call programs, so SI/SC/normal-PSH
+                # contexts are untouched -- K46 ~ 0 there). Q46 = MEM_STORE-
+                # gated, sign-flipped by OP_ENT at threshold ~2.0 (CANCEL_W /
+                # ENT_SUPPRESS = 2.0): on a PSH store (OP_ENT=0.30) Q46 ~
+                # +42.5 -> Q46*K46 ~ -36.7k cancels the +35.6k slot-44 pull,
+                # letting the clean slot-1/36 AX selection win; on a GENUINE
+                # ENT store (OP_ENT=10.79) Q46 ~ -382 flips sign so
+                # Q46*K46 = (neg)*(neg) REINFORCES slot 44 (the ENT old-BP
+                # source stays authoritative). Scoped to head 4 (byte-0 = the
+                # documented gap). Flag OFF omits the slot (byte-identical).
+                CANCEL_W = 50.0          # MEM_STORE-gated cancel strength
+                ENT_SUPPRESS = CANCEL_W / 2.0  # sign-flip at OP_ENT = 2.0
+                q_map[(46, BD.MEM_STORE)] = CANCEL_W
+                q_map[(46, BD.OP_ENT)] = -ENT_SUPPRESS
+                # K negates the slot-44 ENT-prologue selector (OP_JSR only:
+                # the cleanest JSR-prologue discriminator; 0 in non-call
+                # programs). Magnitude matches slot 44's ent_old_bp_s so the
+                # cancel tracks the slot-44 pull it counters.
+                k_map[(46, BD.OP_JSR)] = -ent_old_bp_s
+
+                # === Slot 47: AX byte-0 in-step boost ===================
+                # With slot 44's cross-step garbage pull cancelled (slot 46),
+                # the residual competition is in-step: the AX byte-0 source
+                # row (the pushed argument) and the step's frame/SP byte rows
+                # (e.g. 0xF0) score within ~300. Add a modest, MEM_STORE-gated
+                # boost onto the AX byte-0 row (K @ H1+AX one-hot AND
+                # BYTE_INDEX_0, both = 1 on that row -> K = 2) to tip it over,
+                # suppressed by GENUINE OP_JSR/OP_ENT so JSR/ENT stores (which
+                # source from STACK0) push AWAY from the AX row instead. PSH/
+                # SI/SC (OP sum <= ~0.34): Q ~ +1864 -> +3.7k onto AX byte-0
+                # (wins). Real JSR (10.79): Q ~ -2316; real ENT (12.07): Q ~
+                # -2828 -> the boost vanishes / repels (correct). The boost is
+                # value-content-blind (K targets the AX-byte-0 POSITION), so
+                # ALiBi recency keeps the CURRENT step's AX row over earlier
+                # ones; SI/SC already pick AX (byte-identical output).
+                AX_BOOST_W = 2000.0
+                AX_BOOST_OP_SUPPRESS = 400.0  # sign-flip at OP sum = 5.0
+                q_map[(47, BD.MEM_STORE)] = AX_BOOST_W
+                q_map[(47, BD.OP_JSR)] = -AX_BOOST_OP_SUPPRESS
+                q_map[(47, BD.OP_ENT)] = -AX_BOOST_OP_SUPPRESS
+                k_map[(47, BD.H1 + ax_i)] = 1.0
+                k_map[(47, BD.BYTE_INDEX_0)] = 1.0
 
         # === O override: zero-nibble cancel softened to -0.5 ========
         o_map[(BD.OUTPUT_LO + 0, 0)] = -0.5

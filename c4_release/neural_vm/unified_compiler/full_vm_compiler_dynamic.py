@@ -2193,6 +2193,13 @@ def compile_full_vm_dynamic(
             "C4_POST_ENT_SE_SUPPRESS": (
                 os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
             ),
+            # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0):
+            # adds a MEM_STORE-gated AX-row boost slot to L14/L18 value head 4
+            # (output-affecting on the call-arg PSH store value), so the ON /
+            # OFF builds must NEVER share a memo / disk entry.
+            "C4_PSH_ARG_VAL_AX": (
+                os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2705,6 +2712,12 @@ def _bake_from_scheduled_ops(
         # must never share a serialised entry.
         "C4_POST_ENT_SE_SUPPRESS": (
             os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
+        ),
+        # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0,
+        # output-affecting on the call-arg PSH store value): the ON / OFF
+        # builds must never share a serialised entry.
+        "C4_PSH_ARG_VAL_AX": (
+            os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
