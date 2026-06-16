@@ -8,7 +8,13 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
-from ..isa_semantics_dsl import CrossStepCarrySpec, cross_step_carry
+from ..isa_semantics_dsl import (
+    CrossStepCarrySpec,
+    DumpBlock,
+    HeadWrite,
+    PrecursorFlagSpec,
+    cross_step_carry,
+)
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -1135,6 +1141,180 @@ def _allocate_layer13_ax_byte1_dump_carry_heads() -> AttentionHeadAllocator:
     return allocator
 
 
+# ===========================================================================
+# ISA-semantics DSL migration: the AX byte-1 cross-step carry is now GENERATED
+# by ``cross_step_carry(_AX_BYTE1_CARRY_SPEC)`` — the SAME 4-part structure the
+# BP migration proved, exercising the generator's generalizations:
+#   (1) ``position_source="mixed"``: the H1/H2/H3 pipeline + ADDR_B*/AX_CARRY/
+#       MARK_AX gate taps from the legacy dynamic *registry*; the new
+#       ``H{1,2,3}_PREV_STEP`` / ``H{1,2,3}_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``
+#       bands from the declarative layout.
+#   (2) the THREE cross-step value bands (H1/H2/H3) the carry head V-copies
+#       forward (value-general byte-1 0..15) — multi-band carry.
+#   (3) the two-stage ``AX_CARRY_OVERFLOW`` band-pass KILL: a precursor
+#       step_function flag (``ax_byte1_carry_overflow_flag``, ~2-3 OR units)
+#       writes a bounded out-of-band indicator; the dump ANDs it as a -1000
+#       KILL condition so Σ AX_CARRY is band-PASSED (not just lower-bounded).
+#       Generated via the generator's ``make_mixed_dim_map_ffn_op`` scaffolding.
+#
+# The carry head Q/K/V/O is declared EXPLICITLY (a sharp ADDR_B0_LO+5 byte-1
+# signature on slot 0, an ADDR_B1_HI+8 AX-register match on slot 1, a
+# CONST-driven AX_CARRY fresh-preference K-loop on slot 2, a MARK_AX V=0 sink on
+# slot 3, and three cross-step H1/H2/H3 value-copy blocks at V slots 10/17/24).
+# The bands are registered by the module-scope ``register_residual_band`` calls
+# above (LOAD-BEARING order), so ``register_band=False``. The dump rules are
+# flag-INDEPENDENT (``C4_AX_BYTE1_DUMP`` gates only the LM-head emission columns
+# in model_ops, not these rules), so ``dump_blocks == dump_blocks_off``.
+# Verified byte-identical against the HEAD golden state_dict hash (flag-ON and
+# flag-OFF).
+
+# Head tuning (production defaults — the hand-built call passed none).
+_AX_B1_HEAD_SIG_W = 60.0   # SHARP ADDR_B0_LO+5 byte-1 signature (slot 0)
+_AX_B1_HEAD_L = 15.0       # ADDR_B1_HI/CONST/ADDR sig driver magnitude
+_AX_B1_HEAD_SINK_W = 8.0   # MARK_AX V=0 sink (slot 3 K)
+_AX_B1_HEAD_K_AXC_W = 0.2  # AX_CARRY fresh-preference K-loop (slot 2)
+_AX_B1_HEAD_W = 7          # H1/H2/H3 band width (cells)
+_AX_B1_HEAD_V_BASE = 10    # V slot base for the H1 copy block
+_AX_B1_AXC_CELLS = 16      # AX_CARRY LO/HI cell count
+
+
+def _ax_byte1_dump_blocks():
+    """Build the AX byte-1 dump blocks (H1/H2/H3 -> H*_DUMP_OUT).
+
+    Mirrors ``_ax_byte1_dump_repopulate_rules`` EXACTLY: the shared
+    AND conditions (ADDR_B1_HI+8 AX-register discriminator + ADDR_B0_LO+5 byte-1
+    signature + the 32-cell Σ AX_CARRY lower bound + 7 marker blockers + the
+    ``AX_CARRY_OVERFLOW`` two-stage KILL), threshold 4.5, write_scale 0.02, in
+    the SAME (H1, H2, H3) band/unit ORDER and the SAME rule names. Flag-
+    INDEPENDENT (``C4_AX_BYTE1_DUMP`` gates only the LM-head columns), so this is
+    used for BOTH ``dump_blocks`` and ``dump_blocks_off``.
+    """
+    from ..isa_semantics_dsl import DumpBlock
+
+    AXC_W = 1.0
+    AX_REG_W = 0.25
+    SIG_W = 2.0
+    OVERFLOW_KILL_W = 1_000.0
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_STACK0", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    conditions = [
+        ("ADDR_B1_HI+8", AX_REG_W),
+        ("ADDR_B0_LO+5", SIG_W),
+    ]
+    for k in range(_AX_B1_AXC_CELLS):
+        conditions.append((f"AX_CARRY_LO+{k}", AXC_W))
+        conditions.append((f"AX_CARRY_HI+{k}", AXC_W))
+    conditions = tuple(conditions) + marker_blockers + (
+        ("AX_CARRY_OVERFLOW", -OVERFLOW_KILL_W),
+    )
+    # H1 block keeps the legacy ``ax_byte1_dump_repopulate_slot_{j}`` name (no
+    # band infix); H2/H3 carry the ``_{band}`` infix.
+    blocks = [
+        DumpBlock(
+            name_prefix="ax_byte1_dump_repopulate_slot",
+            width=_AX_B1_HEAD_W,
+            gate_band="H1_PREV_STEP",
+            emit_band="H1_DUMP_OUT",
+            write_scale=0.02,
+            conditions=conditions,
+            threshold=4.5,
+        ),
+    ]
+    for band in ("H2", "H3"):
+        blocks.append(DumpBlock(
+            name_prefix=f"ax_byte1_dump_repopulate_{band.lower()}_slot",
+            width=_AX_B1_HEAD_W,
+            gate_band=f"{band}_PREV_STEP",
+            emit_band=f"{band}_DUMP_OUT",
+            write_scale=0.02,
+            conditions=conditions,
+            threshold=4.5,
+        ))
+    return tuple(blocks)
+
+
+_AX_BYTE1_CARRY_REGISTRY_DIMS = (
+    "H1", "H2", "H3", "ADDR_B0_LO", "ADDR_B1_HI", "AX_CARRY_LO",
+    "AX_CARRY_HI", "CONST", "MARK_AX",
+)
+_AX_BYTE1_CARRY_SPEC = CrossStepCarrySpec(
+    name="ax_byte1_dump",
+    band_name="H1_PREV_STEP",        # nominal (register_band=False -> unused)
+    band_width=_AX_B1_HEAD_W,
+    register_band=False,
+    band_flag=None,
+    carry_head_alibi_slope=0.5,
+    carry_byte_count=1,
+    position_source="mixed",
+    registry_dims=_AX_BYTE1_CARRY_REGISTRY_DIMS,
+    head_q=(
+        HeadWrite(0, "ADDR_B0_LO+5", _AX_B1_HEAD_SIG_W),  # byte-1 signature
+        HeadWrite(1, "ADDR_B1_HI+8", _AX_B1_HEAD_L),      # AX-register match
+        HeadWrite(2, "CONST", _AX_B1_HEAD_L),             # AXC fresh-pref driver
+        HeadWrite(3, "ADDR_B0_LO+5", _AX_B1_HEAD_L),      # MARK_AX sink driver
+    ),
+    head_k=(
+        HeadWrite(0, "ADDR_B0_LO+5", _AX_B1_HEAD_SIG_W),
+        HeadWrite(1, "ADDR_B1_HI+8", _AX_B1_HEAD_L),
+        HeadWrite(3, "MARK_AX", _AX_B1_HEAD_SINK_W),
+        # slot-2 AX_CARRY fresh-preference (its OWN slot, CONST-driven Q): the
+        # SLOT stays fixed at 2 (slot_stride=0); the DIM advances over the 16
+        # AX_CARRY LO/HI cells (all 32 K writes land on the single slot-2 K row).
+        HeadWrite(2, "AX_CARRY_LO", -_AX_B1_HEAD_K_AXC_W, count=_AX_B1_AXC_CELLS,
+                  slot_stride=0),
+        HeadWrite(2, "AX_CARRY_HI", -_AX_B1_HEAD_K_AXC_W, count=_AX_B1_AXC_CELLS,
+                  slot_stride=0),
+    ),
+    head_v=(
+        HeadWrite(_AX_B1_HEAD_V_BASE, "H1", 1.0, count=_AX_B1_HEAD_W),
+        HeadWrite(_AX_B1_HEAD_V_BASE + _AX_B1_HEAD_W, "H2", 1.0,
+                  count=_AX_B1_HEAD_W),
+        HeadWrite(_AX_B1_HEAD_V_BASE + 2 * _AX_B1_HEAD_W, "H3", 1.0,
+                  count=_AX_B1_HEAD_W),
+    ),
+    head_o=(
+        HeadWrite(_AX_B1_HEAD_V_BASE, "H1_PREV_STEP", 1.0, count=_AX_B1_HEAD_W),
+        HeadWrite(_AX_B1_HEAD_V_BASE + _AX_B1_HEAD_W, "H2_PREV_STEP", 1.0,
+                  count=_AX_B1_HEAD_W),
+        HeadWrite(_AX_B1_HEAD_V_BASE + 2 * _AX_B1_HEAD_W, "H3_PREV_STEP", 1.0,
+                  count=_AX_B1_HEAD_W),
+    ),
+    head_reads={"ADDR_B0_LO", "AX_CARRY_LO", "AX_CARRY_HI", "H1", "H1.*.-1",
+                "H2.*.-1", "H3.*.-1"},
+    head_writes={"H1_PREV_STEP", "H2_PREV_STEP", "H3_PREV_STEP"},
+    dump_blocks=_ax_byte1_dump_blocks,
+    dump_blocks_off=_ax_byte1_dump_blocks,  # flag-independent dump rules
+    dump_reads_explicit={
+        "ADDR_B0_LO", "ADDR_B1_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+        "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
+        "MARK_MEM", "MARK_SE", "H1_PREV_STEP", "AX_CARRY_OVERFLOW",
+        "H2_PREV_STEP", "H3_PREV_STEP",
+    },
+    dump_writes_explicit={"H1_DUMP_OUT", "H2_DUMP_OUT", "H3_DUMP_OUT"},
+    precursors=(
+        PrecursorFlagSpec(
+            op_name="ax_byte1_carry_overflow_flag",
+            flag_band="AX_CARRY_OVERFLOW",
+            rules_builder=lambda: _ax_byte1_carry_overflow_flag_rules(),
+            reads={"AX_CARRY_HI", "AX_CARRY_LO", "ADDR_B1_HI"},
+            writes={"AX_CARRY_OVERFLOW"},
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "tail_bit32_result_correction"},
+            registry_dims=("AX_CARRY_HI", "AX_CARRY_LO", "ADDR_B1_HI"),
+            spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+        ),
+    ),
+)
+_AX_BYTE1_CARRY_BUNDLE = cross_step_carry(_AX_BYTE1_CARRY_SPEC)
+
+
 def _layer13_ax_byte1_dump_carry_head_spec(
     dim_positions: dict,
     head_idx: int,
@@ -1189,99 +1369,44 @@ def _layer13_ax_byte1_dump_carry_head_spec(
       ``dim_positions`` map (it is a NEW band, absent from the legacy
       registry).
     """
-    # IMPORTANT — position source. The H1 pipeline (L0 producer, the 54
-    # readers, the LM head) is baked at the LEGACY ``_SetDim`` / dynamic
-    # *registry* positions (H1 -> 67; the LM head's byte-1 emission reads
-    # ``head.weight[0x02]-[0x00]`` from dims 69/71 == H1+2 / H1+4). So the V
-    # cross-step read of ``H1`` and the K-side AX_CARRY / ADDR_B0_LO / MARK_AX
-    # taps MUST resolve from ``build_default_registry_dynamic()`` — the same
-    # map every probe uses — or they tap dead slots. (Verified:
-    # registry H1=67/ADDR_B0_LO=12/AX_CARRY_LO=328 == the actual residual.)
-    #
-    # The O write TARGET (``H1_PREV_STEP``) is a NEW band that does NOT exist
-    # in the registry; its physical position is allocated by the dynamic
-    # compiler and surfaced ONLY via the bake's ``dim_positions`` map. Resolve
-    # it from there.
-    from ...dim_registry_dynamic import build_default_registry_dynamic
-    _reg = build_default_registry_dynamic()
-
-    def _P(name: str) -> int:
-        return int(_reg.slots[name].start)
-
-    h1 = _P("H1")            # registry H1 (cross-step V read of prev one-hot)
-    h2 = _P("H2")            # registry H2 (byte-1 5..11 one-hot, cross-step V)
-    h3 = _P("H3")            # registry H3 (byte-1 12..15 one-hot, cross-step V)
-    addr_sig = _P("ADDR_B0_LO") + 5
-    axc_lo = _P("AX_CARRY_LO")
-    axc_hi = _P("AX_CARRY_HI")
-    const = _P("CONST")
-    mark_ax = _P("MARK_AX")
-    # H1_PREV_STEP O target: from the bake layout (new band, not in registry).
-    h1_prev = int(dim_positions["H1_PREV_STEP"])
-    # H2/H3 PREV O targets (value-general byte-1 5..15; same new-band source).
-    h2_prev = int(dim_positions["H2_PREV_STEP"])
-    h3_prev = int(dim_positions["H3_PREV_STEP"])
-
-    # Slot design (the AX_CARRY fresh-preference MUST be on its OWN slot, not
-    # mixed into the signature slot). The earlier mixed design failed because
-    # the AX_CARRY boost (~+197) is CONSTANT across all prev-step AX byte rows
-    # (byte 0/1/2/3 all fresh, AX_CARRY ~ -988), so it lifted them all equally
-    # and the small signature gap (~14) could not single out byte-1 -> the V
-    # copied the AVERAGE of prev AX byte 0..3's H1 (garbage). Fix: a SHARP
-    # signature on slot 0 (large weight, byte-1-specific) makes byte-1 dominate
-    # among the prev rows; the AX_CARRY fresh-preference on slot 2 (CONST-gated,
-    # additive) then biases toward the FRESH byte-1 row over the current carried
-    # byte-1 row.
-    addr_b1_hi = _P("ADDR_B1_HI") + 8
-    SIG_W = 60.0          # SHARP signature: byte-1 row dominates among prev rows
-    q = [
-        AP(0, addr_sig, SIG_W),   # K slot 0: byte-1 signature (sharp)
-        AP(1, addr_b1_hi, L),     # K slot 1: ADDR_B1_HI+8 AX-register match
-        AP(2, const, L),          # K slot 2: AX_CARRY fresh-preference driver
-        AP(3, addr_sig, L),       # K slot 3: MARK_AX V=0 sink
-    ]
-    k = [
-        AP(0, addr_sig, SIG_W),
-        AP(1, addr_b1_hi, L),
-        AP(3, mark_ax, sink_w),
-    ]
-    # K slot 2 — AX_CARRY fresh-preference (its OWN slot, CONST-driven Q): the
-    # prev FRESH byte-1 predictor has very-negative AX_CARRY (sum ~ -988); the
-    # current carried byte-1 predictor ~ +2.7 -> ``-AX_CARRY`` gives the prev
-    # fresh row a large +K bias. With the sharp slot-0 signature already
-    # confining attention to byte-1 rows, this slot picks the FRESH one.
-    for j in range(16):
-        k.append(AP(2, axc_lo + j, -k_axc_w))
-        k.append(AP(2, axc_hi + j, -k_axc_w))
-
-    v = []
-    o = []
-    H1_W = 7
-    V_BASE = 10
-    for j in range(H1_W):
-        v.append(AP(V_BASE + j, h1 + j, 1.0))       # V: prev H1 (cross-step)
-        o.append(AO(h1_prev + j, V_BASE + j, 1.0))  # O: write H1_PREV_STEP
-    # Value-general byte-1 (5..15): also carry the prev step's H2/H3 one-hots
-    # forward. The fresh-step emission one-hot for byte-1 v sits in H2 (v=5..11)
-    # or H3 (v=12..15), NOT H1 (v=0..4), so the H1-only carry dropped v>=5. Copy
-    # the SAME prev row's H2/H3 bands into their own PREV bands (disjoint V/O
-    # slots 17..23 / 24..30 within the 109-wide head — far from the gate slots).
-    H2_VBASE = V_BASE + H1_W            # 17
-    H3_VBASE = H2_VBASE + H1_W          # 24
-    for j in range(H1_W):
-        v.append(AP(H2_VBASE + j, h2 + j, 1.0))      # V: prev H2 (cross-step)
-        o.append(AO(h2_prev + j, H2_VBASE + j, 1.0))  # O: write H2_PREV_STEP
-    for j in range(H1_W):
-        v.append(AP(H3_VBASE + j, h3 + j, 1.0))      # V: prev H3 (cross-step)
-        o.append(AO(h3_prev + j, H3_VBASE + j, 1.0))  # O: write H3_PREV_STEP
-
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-        alibi_slope=alibi_slope,
+    # ISA-semantics DSL migration: re-expressed via
+    # ``cross_step_carry(_AX_BYTE1_CARRY_SPEC)`` (explicit-head + mixed
+    # position-source mode). The bundle's ``carry_head_spec_builder`` reproduces
+    # the legacy hand-built Q/K/V/O writes BYTE-IDENTICALLY (the H1 pipeline +
+    # ADDR_B*/AX_CARRY/MARK_AX taps from the dynamic *registry*, the H*_PREV_STEP
+    # O targets from the layout) — verified against the HEAD golden state_dict
+    # hash. The tuning args (``L`` / ``sink_w`` / ``k_axc_w`` / ``alibi_slope``,
+    # kept for probes) default to the spec's frozen values; when ALL are at their
+    # defaults the module-level bundle is used directly, otherwise a per-call
+    # override rebuilds the explicit head's varying weights.
+    if (L == _AX_B1_HEAD_L
+            and sink_w == _AX_B1_HEAD_SINK_W
+            and k_axc_w == _AX_B1_HEAD_K_AXC_W
+            and alibi_slope == _AX_BYTE1_CARRY_SPEC.carry_head_alibi_slope):
+        return _AX_BYTE1_CARRY_BUNDLE.carry_head_spec_builder(
+            dim_positions, head_idx,
+        )
+    override = replace(
+        _AX_BYTE1_CARRY_SPEC,
+        carry_head_alibi_slope=alibi_slope,
+        head_q=(
+            HeadWrite(0, "ADDR_B0_LO+5", _AX_B1_HEAD_SIG_W),
+            HeadWrite(1, "ADDR_B1_HI+8", L),
+            HeadWrite(2, "CONST", L),
+            HeadWrite(3, "ADDR_B0_LO+5", L),
+        ),
+        head_k=(
+            HeadWrite(0, "ADDR_B0_LO+5", _AX_B1_HEAD_SIG_W),
+            HeadWrite(1, "ADDR_B1_HI+8", L),
+            HeadWrite(3, "MARK_AX", sink_w),
+            HeadWrite(2, "AX_CARRY_LO", -k_axc_w, count=_AX_B1_AXC_CELLS,
+                      slot_stride=0),
+            HeadWrite(2, "AX_CARRY_HI", -k_axc_w, count=_AX_B1_AXC_CELLS,
+                      slot_stride=0),
+        ),
+    )
+    return cross_step_carry(override).carry_head_spec_builder(
+        dim_positions, head_idx,
     )
 
 
@@ -1400,121 +1525,22 @@ def _ax_byte1_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     AND carried (``+AX_CARRY`` keeps it above threshold; fresh's ~-988 sinks
     it), then gate-copies the carried one-hot from ``H1_PREV_STEP`` into the
     emission band ``H1_DUMP_OUT``.
+
+    ISA-semantics DSL migration: re-expressed via
+    ``cross_step_carry(_AX_BYTE1_CARRY_SPEC)``. The bundle's
+    ``dump_rules_builder`` produces the IDENTICAL 21-rule set (7 H1 + 7 H2 + 7
+    H3) — same names (``ax_byte1_dump_repopulate_slot_{j}`` for H1, ``_{band}``
+    infix for H2/H3), the shared AND conditions (ADDR_B1_HI+8 AX-register
+    discriminator + ADDR_B0_LO+5 byte-1 signature + the 32-cell Σ AX_CARRY lower
+    bound + 7 marker blockers + the ``AX_CARRY_OVERFLOW`` two-stage KILL),
+    threshold 4.5, write_scale 0.02, and the H1->H2->H3 band/unit ORDER —
+    verified byte-identical against the HEAD golden state_dict hash. The dump is
+    flag-INDEPENDENT (``C4_AX_BYTE1_DUMP`` gates only the LM-head emission
+    columns in model_ops), so ``emission_on=True`` always.
+    ``_AX_BYTE1_DUMP_REPOPULATE_HIDDEN_DIM`` is retained as the rule-count
+    assert.
     """
-    H1_W = 7
-    # Per-slot positive AX_CARRY weight (carried-vs-fresh discriminator). The
-    # AX_CARRY band-SUM crisply separates THREE step classes at the AX byte-1
-    # row (measured spec_k=0): a genuine multi-byte CARRY step (PSH/ADJ) ~ +2.7;
-    # a memory-LOAD / non-IMM AX-write step (LI/LC) ~ +0.8; a fresh IMM/ADD
-    # AX-write ~ -988. Weighted 1.0 (per cell over the 32-cell band the sum is
-    # the raw band value, since only one cell per nibble is active) so the gate
-    # threshold can sit ABOVE the +0.8 load class and BELOW the +2.7 carry class
-    # -> the dump fires ONLY on a genuine carry, NOT on a memory load (which
-    # would re-emit the STALE prev byte-1 onto the freshly loaded value;
-    # observed: si_li 42 -> 0x22A=554). fresh IMM/ADD (-988) is darkened with a
-    # huge margin.
-    AXC_W = 1.0
-    # AX-register discriminator: ``ADDR_B1_HI+8`` is ~4.0 on the AX byte rows
-    # and ~0.0 on the PC / SP / BP byte rows (measured spec_k=0, PROGRAM-STABLE
-    # across 654/754/913/432/692: AX=4.02 / PC=0.01 every time — unlike
-    # ``H0+AX_I``, whose marker-distance value drifted to 0 on some programs).
-    # It is high on ALL AX byte rows (it decays mildly with byte offset:
-    # 4.91/4.02/3.29/2.70 at AX+0/+1/+2/+3), so it is NOT byte-1-specific — the
-    # byte-1 selectivity comes from ``ADDR_B0_LO+5`` (0.97 ONLY at AX+1, ~0 at
-    # AX+0/+2/+3). Weighted 0.25 so ``ADDR_B1_HI+8`` contributes ~1.0 (matching
-    # the 0.97 signature term) -> a BALANCED AND that needs BOTH the AX-register
-    # signal AND the byte-1-position signal. This prevents (a) the carried
-    # PC/SP/BP byte-1 dump (no AX-register signal) and (b) the AX byte-2/3 dump
-    # (no byte-1 signature) from firing.
-    AX_REG_W = 0.25
-    # Structural blockers (EXACTLY 0 at the byte-1 predictor row): markers off,
-    # so a large magnitude only sinks the unit if it strays onto a marker row.
-    marker_blockers = (
-        ("MARK_AX", -1_000.0),
-        ("MARK_PC", -1_000.0),
-        ("MARK_SP", -1_000.0),
-        ("MARK_BP", -1_000.0),
-        ("MARK_STACK0", -1_000.0),
-        ("MARK_MEM", -1_000.0),
-        ("MARK_SE", -1_000.0),
-    )
-    blockers = marker_blockers
-    SIG_W = 2.0  # byte-1 signature weight (load-bearing: separates byte-1 from
-    #              byte-2/3, which lack ADDR_B0_LO+5 but share ADDR_B1_HI+8/AXC)
-    conditions_base = [
-        ("ADDR_B1_HI+8", AX_REG_W),   # AX-register discriminator (~4.0 AX / ~0 else)
-        ("ADDR_B0_LO+5", SIG_W),      # byte-1 predictor row signature
-    ]
-    for k in range(16):
-        conditions_base.append((f"AX_CARRY_LO+{k}", AXC_W))
-        conditions_base.append((f"AX_CARRY_HI+{k}", AXC_W))
-    conditions = tuple(conditions_base) + blockers
-
-    # ------------------------------------------------------------------
-    # Two-sided band-pass on Σ AX_CARRY (the §524 range check applied to a
-    # CONTINUOUS band): an UPPER-bound OVERFLOW KILL on top of the LOWER bound.
-    # ------------------------------------------------------------------
-    # A SINGLE linear AND can only LOWER-bound Σ AX_CARRY (fire on >= lo). It
-    # cannot exclude step classes whose AX_CARRY sits ABOVE the carry band:
-    # measured (spec_k=0, efficient ALU, last block, AX byte-1 predictor row):
-    #   * genuine CARRY (PSH/ADJ)  Σ AX_CARRY ~ +2.65 (tight cluster 2.65-2.70)
-    #   * memory LOAD (LI/LC)       ~ +0.85   -> dark (below lo)
-    #   * fresh IMM/ADD             ~ -988    -> dark (far below)
-    #   * SHL/SHR result            ~ +12.85  -> MUST be dark (was over-firing)
-    #   * JMP                       ~ +47.86  -> MUST be dark (was over-firing)
-    # The fire cluster (2.65-2.70) and the over-fire classes (>= 12.85) have a
-    # WIDE clean gap, so the upper cut is robust. The discriminator that is
-    # bounded in the fire band but blows up for the over-fire classes is the
-    # ``AX_CARRY_HI+2`` cell (carry ~0.63-1.31, SHL +6.41, JMP +23.93 — see
-    # tools/probe_ax_carry_cells.py).
-    #
-    # A simple difference-of-SiLU-steps CANNOT band-pass a continuous input
-    # (the two unbounded ReLU tails never cancel; verified: the negative-write
-    # ceiling drove H1_DUMP_OUT NEGATIVE on SHR, flipping the byte-1 argmax to a
-    # wrong token -> 0x2A became 0x102A). The robust form is a TWO-STAGE kill: a
-    # precursor FFN (``ax_byte1_carry_overflow_flag``) writes a bounded-by-use
-    # ``AX_CARRY_OVERFLOW`` step indicator that is ZERO in the carry band and
-    # large-positive for SHL/JMP; this rule then adds it as a STRONG NEGATIVE
-    # condition. Out of band the AND sum is driven far below threshold ->
-    # silu ~= 0 -> H1_DUMP_OUT == EXACTLY 0 (NOT negative), so the real SHL/JMP
-    # byte-1 comes through the normal H1 path untouched. In band the flag is 0,
-    # so the dump fires byte-identically to the lower-bound-only design.
-    OVERFLOW_KILL_W = 1_000.0
-    conditions = conditions + (("AX_CARRY_OVERFLOW", -OVERFLOW_KILL_W),)
-
-    rules: list[FFNRule] = []
-    for j in range(H1_W):
-        rules.append(multi_way_and_rule(
-            name=f"ax_byte1_dump_repopulate_slot_{j}",
-            # threshold 4.5 (balanced AND of AX-register + byte-1-signature*2 +
-            # the +2.7-vs-+0.8 carry-vs-load AX_CARRY split). The OVERFLOW kill
-            # term excludes SHL(+12.85)/JMP(+47.86) without touching the carry.
-            conditions=conditions,
-            threshold=4.5,
-            gate=f"H1_PREV_STEP+{j}",
-            # write_scale 2.0/S: silu(S*(cond-thr)) ~= 60 on a carried-AX row
-            # -> output ~= 60 * H1_PREV_STEP * 0.02 ~= 1.2 * H1_PREV_STEP
-            # (one-hot argmax slot preserved; LM head emits the right token).
-            writes=((f"H1_DUMP_OUT+{j}", 0.02),),
-        ))
-    # Value-general byte-1 (5..15): the SAME gated copy for the H2/H3 PREV bands
-    # the carry head now also fills. The carried-vs-fresh gate (AX_CARRY split +
-    # OVERFLOW kill + byte-1 signature) is byte-1-VALUE-INDEPENDENT, so the H2/H3
-    # copies reuse the identical ``conditions`` / ``threshold`` and only change
-    # the gate/write band. On a byte-1 0..4 carried row the prev H2/H3 one-hots
-    # are ~0 (the value lives in H1) so these write ~0 -> the LM emission is
-    # unchanged; on a byte-1 5..15 row H1_PREV is ~0 and the H2/H3 copy supplies
-    # the carried one-hot. Fresh steps: all PREV bands 0 (gate dark anyway).
-    for band in ("H2", "H3"):
-        for j in range(H1_W):
-            rules.append(multi_way_and_rule(
-                name=f"ax_byte1_dump_repopulate_{band.lower()}_slot_{j}",
-                conditions=conditions,
-                threshold=4.5,
-                gate=f"{band}_PREV_STEP+{j}",
-                writes=((f"{band}_DUMP_OUT+{j}", 0.02),),
-            ))
-    return tuple(rules)
+    return _AX_BYTE1_CARRY_BUNDLE.dump_rules_builder(True)
 
 
 # ---------------------------------------------------------------------------
@@ -1674,79 +1700,28 @@ def make_ax_byte1_carry_overflow_flag_op() -> Operation:
     residual carries it there, NOT at the declarative layout position — same
     split the dump documents); the output ``AX_CARRY_OVERFLOW`` is a NEW
     declarative band, resolved from ``dim_positions``.
+
+    ISA-semantics DSL migration: re-expressed via
+    ``cross_step_carry(_AX_BYTE1_CARRY_SPEC)``. The bundle's
+    ``precursor_ops_builder`` returns this standalone bounded-flag ``Operation``
+    (the generator's ``make_mixed_dim_map_ffn_op`` scaffolding supplies the
+    IDENTICAL PureFFN post_op + mixed dim_map bake + ``requires={"after":
+    "tail_bit32_result_correction"}``) — verified byte-identical against the HEAD
+    golden state_dict hash. The two-stage KILL rule logic stays in
+    ``_ax_byte1_carry_overflow_flag_rules`` (the spec references it lazily);
+    the ``_AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM`` (+LEV) rule-count assert is
+    preserved here.
     """
-    rules = _ax_byte1_carry_overflow_flag_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        _expected_units = _AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM + (
-            1 if _lev_ax_byte1_kill_enabled() else 0
-        )
-        assert len(rules) == _expected_units, (
-            f"ax_byte1_carry_overflow_flag rule-count drift: produced "
-            f"{len(rules)}, expected {_expected_units}"
-        )
-        ffn = PureFFN(d_model, len(rules))
-        from ...dim_registry_dynamic import build_default_registry_dynamic
-        _reg = build_default_registry_dynamic()
-        _new_bands = {"AX_CARRY_OVERFLOW"}
-        dim_map = {}
-        for _nm in Primitives.ffn_rule_dim_names(rules):
-            _base = _nm.split("+", 1)[0]
-            if _base in _new_bands:
-                dim_map[_nm] = int(dim_positions[_base]) + (
-                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
-                )
-            else:
-                dim_map[_nm] = int(_reg.slots[_base].start) + (
-                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
-                )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
-        name="ax_byte1_carry_overflow_flag",
-        # AX_CARRY_LO is read only by the C4_LEV_AX_BYTE1_KILL unit 2; declaring
-        # it unconditionally is harmless when the flag is off (no rule taps it).
-        reads={"AX_CARRY_HI", "AX_CARRY_LO", "ADDR_B1_HI"},
-        writes={"AX_CARRY_OVERFLOW"},
-        kind="block",
-        # Append on the same L25 block AFTER the tail correction but BEFORE the
-        # dump (the dump's ``requires after this`` pins the order).
-        target_op_name="l10_post_ops_combined",
-        requires={"after": "tail_bit32_result_correction"},
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
-        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    _expected_units = _AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM + (
+        1 if _lev_ax_byte1_kill_enabled() else 0
     )
+    assert len(_ax_byte1_carry_overflow_flag_rules()) == _expected_units, (
+        "ax_byte1_carry_overflow_flag rule-count drift: produced "
+        f"{len(_ax_byte1_carry_overflow_flag_rules())}, "
+        f"expected {_expected_units}"
+    )
+    (op,) = _AX_BYTE1_CARRY_BUNDLE.precursor_ops_builder()
+    return op
 
 
 def make_ax_byte1_dump_repopulate_op() -> Operation:
@@ -2132,6 +2107,233 @@ def _allocate_stack0_byte0_dump_carry_heads() -> AttentionHeadAllocator:
     return allocator
 
 
+# ===========================================================================
+# ISA-semantics DSL migration: the STACK0 byte-0 cross-step carry is now
+# GENERATED by ``cross_step_carry(_STACK0_B0_CARRY_SPEC)`` — the SAME 4-part
+# structure (PREV bands + unconditional carry head + gated dump FFN + bounded
+# precursor flag) the BP_SAVE_PREV migration proved, now exercising the
+# generator's THREE generalizations over BP:
+#   (1) ``position_source="mixed"``: the H1/H3 emission pipeline + the
+#       MARK_STACK0/MARK_AX/CONST gate taps are baked at the legacy dynamic
+#       *registry* positions; only the new ``STACK0_B0_*`` bands live in the
+#       declarative layout. The split resolves head taps + the precursor /
+#       dump dim_map from the right map.
+#   (2) the ``STACK0_B0_CARRIED`` PRECURSOR FLAG op: a bounded 0/1 carried-step
+#       indicator written at an early block (where H3 is still bounded), read by
+#       the dump as the carried-vs-fresh gate. Generated via the generator's
+#       ``make_mixed_dim_map_ffn_op`` scaffolding.
+#   (3) the DIRECT-REPOINT dump: on a carried step the dump re-supplies the
+#       carried one-hot DIRECTLY into the byte's OWN ``H1+j`` / ``H3+j`` LM-head
+#       emission cells (write band == the SRC the carry head copied from),
+#       overcoming the L25-tail negative nuke (an additive separate band cannot).
+#       Flag-OFF flips the write target to the inert ``STACK0_B0_DUMP_{H1,H3}``
+#       band (byte-identical pre-carry build).
+#
+# The carry head's Q/K/V/O is declared EXPLICITLY (it is NOT the BP per-byte
+# positional match): a sharp MARK_STACK0 signature on slot 0, a CONST-driven
+# one-hot-presence K-pref on slot 1 (over the prev H1/H3 cells), a MARK_AX V=0
+# sink on slot 3, and two cross-step value-copy blocks (prev H3 -> H3_PREV at V
+# slots 1..7, prev H1 -> H1_PREV at V slots 10..16). The bands are registered by
+# the module-scope ``register_residual_band`` calls above (LOAD-BEARING order),
+# so the spec sets ``register_band=False``. Verified byte-identical against the
+# HEAD golden ``state_dict`` hash (flag-ON and flag-OFF).
+
+# Head tuning (production defaults — the hand-built call passed none).
+_STACK0_B0_HEAD_SIG_W = 60.0   # SHARP MARK_STACK0 signature (slot 0)
+_STACK0_B0_HEAD_L = 15.0       # CONST/MARK_STACK0 driver magnitude
+_STACK0_B0_HEAD_SINK_W = 8.0   # MARK_AX V=0 sink (slot 3 K)
+_STACK0_B0_HEAD_PRES_W = 6.0   # one-hot-presence K preference (slot 1)
+_STACK0_B0_HEAD_W = 7          # H1/H3 band width (cells)
+_STACK0_B0_HEAD_LO_BASE = 1    # V slots for the low-nibble (H3) copy
+_STACK0_B0_HEAD_HI_BASE = 10   # V slots for the high-nibble (H1) copy
+
+
+def _stack0_b0_dump_blocks_on():
+    """Build the DIRECT-REPOINT dump blocks (flag-ON), honouring
+    ``C4_STACK0_NEXT_ARITH`` fresh at compile time.
+
+    Mirrors ``_stack0_byte0_dump_repopulate_rules`` (``_repoint_on=True``)
+    EXACTLY: the conditions, threshold (1007), the per-(H3, H1) repoint into the
+    byte's OWN emission cell at ``_STACK0_B0_REPOINT_WS``, in the SAME
+    (H3-first, H1-second) band order.
+    """
+    from ..isa_semantics_dsl import DumpBlock
+
+    SIG_W = 2.0
+    SIG_HARD = 1_000.0
+    CARRIED_W = 3.0
+    SHARP_W = 3.0
+    NOT_CMP_BLOCK_W = -1_000.0
+    DUMP_BLOCK_W = -2_000.0
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    _next_arith_on = _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
+    conditions = (
+        ("MARK_STACK0", SIG_W + SIG_HARD),
+        ("STACK0_B0_CARRIED", CARRIED_W),
+        ("STACK0_B0_SHARP", SHARP_W),
+        ("STACK0_B0_NOT_CMP", NOT_CMP_BLOCK_W),
+    ) + (
+        (("STACK0_B0_DUMP_BLOCK", DUMP_BLOCK_W),) if _next_arith_on else ()
+    ) + marker_blockers
+    threshold = 7.0 + SIG_HARD
+    blocks = []
+    for (emit_band, prev_band) in (
+        ("H3", "STACK0_B0_H3_PREV"),
+        ("H1", "STACK0_B0_H1_PREV"),
+    ):
+        blocks.append(DumpBlock(
+            name_prefix=f"stack0_b0_repoint_{emit_band.lower()}_slot",
+            width=_STACK0_B0_HEAD_W,
+            gate_band=prev_band,
+            emit_band=emit_band,
+            write_scale=_STACK0_B0_REPOINT_WS,
+            conditions=conditions,
+            threshold=threshold,
+        ))
+    return tuple(blocks)
+
+
+def _stack0_b0_dump_blocks_off():
+    """Build the INERT dump blocks (flag-OFF): the 2-way AND into the inert
+    ``STACK0_B0_DUMP_{H3,H1}`` bands at write_scale 0.02 (read by nobody — the
+    LM-head dump columns are themselves flag-gated). Byte-identical pre-carry
+    build. Mirrors ``_stack0_byte0_dump_repopulate_rules`` (``_repoint_on=False``).
+    """
+    from ..isa_semantics_dsl import DumpBlock
+
+    SIG_W = 2.0
+    SIG_HARD = 1_000.0
+    CARRIED_W = 3.0
+    marker_blockers = (
+        ("MARK_AX", -1_000.0),
+        ("MARK_PC", -1_000.0),
+        ("MARK_SP", -1_000.0),
+        ("MARK_BP", -1_000.0),
+        ("MARK_MEM", -1_000.0),
+        ("MARK_SE", -1_000.0),
+    )
+    conditions = (
+        ("MARK_STACK0", SIG_W + SIG_HARD),
+        ("STACK0_B0_CARRIED", CARRIED_W),
+    ) + marker_blockers
+    threshold = 4.0 + SIG_HARD
+    blocks = []
+    for (dump_band, prev_band) in (
+        ("STACK0_B0_DUMP_H3", "STACK0_B0_H3_PREV"),
+        ("STACK0_B0_DUMP_H1", "STACK0_B0_H1_PREV"),
+    ):
+        blocks.append(DumpBlock(
+            name_prefix=(
+                f"stack0_b0_repoint_{dump_band.lower()}_slot"
+            ),
+            width=_STACK0_B0_HEAD_W,
+            gate_band=prev_band,
+            emit_band=dump_band,
+            write_scale=0.02,
+            conditions=conditions,
+            threshold=threshold,
+        ))
+    return tuple(blocks)
+
+
+# The STACK0 byte-0 cross-step carry spec. Bands are registered by the
+# module-scope ``register_residual_band`` calls (load-bearing order), so
+# ``register_band=False``. The carry head is explicit (NOT the BP per-byte
+# match); the dump is the direct-repoint + flag-flip; the ``STACK0_B0_CARRIED``
+# precursor is generated via ``make_mixed_dim_map_ffn_op``. ``position_source``
+# is ``"mixed"``: the H1/H3 + MARK/CONST taps from the dynamic registry, the new
+# ``STACK0_B0_*`` bands from the layout.
+_STACK0_B0_REGISTRY_DIMS = (
+    "H1", "H3", "CONST", "MARK_STACK0", "MARK_AX",
+)
+_STACK0_B0_CARRY_SPEC = CrossStepCarrySpec(
+    name="stack0_byte0_dump",
+    band_name="STACK0_B0_H1_PREV",   # nominal (register_band=False -> unused)
+    band_width=_STACK0_B0_HEAD_W,
+    register_band=False,
+    band_flag=None,
+    carry_head_alibi_slope=0.5,
+    carry_byte_count=1,              # explicit head: not per-byte (>=1 sentinel)
+    position_source="mixed",
+    registry_dims=_STACK0_B0_REGISTRY_DIMS,
+    # Explicit carry head (resolved by ``position_source``):
+    head_q=(
+        HeadWrite(0, "MARK_STACK0", _STACK0_B0_HEAD_SIG_W),  # slot 0 signature
+        HeadWrite(1, "CONST", _STACK0_B0_HEAD_L),            # slot 1 pres driver
+        HeadWrite(3, "MARK_STACK0", _STACK0_B0_HEAD_L),      # slot 3 sink driver
+    ),
+    head_k=(
+        HeadWrite(0, "MARK_STACK0", _STACK0_B0_HEAD_SIG_W),
+        HeadWrite(3, "MARK_AX", _STACK0_B0_HEAD_SINK_W),
+        # slot-1 one-hot-presence preference over the prev H1/H3 cells: the SLOT
+        # stays fixed at 1 (slot_stride=0) while the DIM advances over the 7
+        # H1/H3 cells (all 14 K writes land on the single slot-1 K row).
+        HeadWrite(1, "H1", _STACK0_B0_HEAD_PRES_W, count=_STACK0_B0_HEAD_W,
+                  slot_stride=0),
+        HeadWrite(1, "H3", _STACK0_B0_HEAD_PRES_W, count=_STACK0_B0_HEAD_W,
+                  slot_stride=0),
+    ),
+    head_v=(
+        # V slots 1..7 <- prev H3 (lo nibble); 10..16 <- prev H1 (hi nibble).
+        HeadWrite(_STACK0_B0_HEAD_LO_BASE, "H3", 1.0, count=_STACK0_B0_HEAD_W),
+        HeadWrite(_STACK0_B0_HEAD_HI_BASE, "H1", 1.0, count=_STACK0_B0_HEAD_W),
+    ),
+    head_o=(
+        # O writes STACK0_B0_H3_PREV from V slots 1..7; H1_PREV from 10..16.
+        HeadWrite(_STACK0_B0_HEAD_LO_BASE, "STACK0_B0_H3_PREV", 1.0,
+                  count=_STACK0_B0_HEAD_W),
+        HeadWrite(_STACK0_B0_HEAD_HI_BASE, "STACK0_B0_H1_PREV", 1.0,
+                  count=_STACK0_B0_HEAD_W),
+    ),
+    head_reads={"MARK_STACK0", "MARK_AX", "CONST", "H1", "H3",
+                "H1.*.-1", "H3.*.-1"},
+    head_writes={"STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV"},
+    # Direct-repoint dump (flag-on) / inert DUMP band (flag-off). Callable so the
+    # secondary ``C4_STACK0_NEXT_ARITH`` flag is read fresh per compile.
+    dump_blocks=_stack0_b0_dump_blocks_on,
+    dump_blocks_off=_stack0_b0_dump_blocks_off,
+    dump_reads_explicit={
+        "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+        "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
+        "STACK0_B0_NOT_CMP", "STACK0_B0_DUMP_BLOCK",
+        "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
+    },
+    dump_writes_explicit={
+        "H1", "H3", "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
+    },
+    # The bounded carried-step gate-flag precursor (generated via the generator's
+    # ``make_mixed_dim_map_ffn_op`` scaffolding). The rule logic stays in
+    # ``_stack0_byte0_carried_flag_rules`` (referenced lazily — defined below);
+    # the generator owns the standalone PureFFN post_op + mixed dim_map bake.
+    precursors=(
+        PrecursorFlagSpec(
+            op_name="stack0_byte0_carried_flag",
+            flag_band="STACK0_B0_CARRIED",
+            rules_builder=lambda: _stack0_byte0_carried_flag_rules(),
+            reads={
+                "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+                "MARK_MEM", "MARK_SE", "H3",
+            },
+            writes={"STACK0_B0_CARRIED"},
+            target_op_name="layer8_multibyte_fetch",
+            registry_dims=(
+                "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+                "MARK_MEM", "MARK_SE", "H3",
+            ),
+            spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+        ),
+    ),
+)
+_STACK0_B0_CARRY_BUNDLE = cross_step_carry(_STACK0_B0_CARRY_SPEC)
+
+
 def _stack0_byte0_dump_carry_head_spec(
     dim_positions: dict,
     head_idx: int,
@@ -2166,68 +2368,39 @@ def _stack0_byte0_dump_carry_head_spec(
       O: write ``STACK0_B0_H1_PREV`` (from H1) and ``STACK0_B0_H3_PREV`` (from
         H3) — dedicated bands, position from the bake ``dim_positions``.
     """
-    # Position source (same MIXED split the AX carry documents): the H1/H3
-    # pipeline and the MARK_* gate dims are baked at the LEGACY dynamic
-    # *registry* positions (the model residual carries them there); the NEW
-    # ``STACK0_B0_*`` bands exist ONLY in the declarative layout. So the
-    # cross-step V reads (H1/H3) and the K-side MARK taps resolve from the
-    # registry, and the O targets from ``dim_positions``.
-    from ...dim_registry_dynamic import build_default_registry_dynamic
-    _reg = build_default_registry_dynamic()
-
-    def _P(name: str) -> int:
-        return int(_reg.slots[name].start)
-
-    h1 = _P("H1")                 # registry H1 (cross-step V read of prev hi-nibble)
-    h3 = _P("H3")                 # registry H3 (cross-step V read of prev lo-nibble)
-    const = _P("CONST")
-    mark_stack0 = _P("MARK_STACK0")
-    mark_ax = _P("MARK_AX")
-    h1_prev = int(dim_positions["STACK0_B0_H1_PREV"])
-    h3_prev = int(dim_positions["STACK0_B0_H3_PREV"])
-
-    SIG_W = 60.0  # SHARP signature: STACK0-marker rows dominate among prev rows
-    # ONE-HOT-PRESENCE K preference (the decisive fix): among the STACK0-marker
-    # rows the head can attend, the FRESH (PSH) prev row HOLDS the clean byte-0
-    # H1/H3 one-hot (Σ|H1|+|H3| ~ 4 at this block, BEFORE the L25 corruption);
-    # the CURRENT (carried) STACK0-marker row's one-hot is ABSENT (Σ ~ 0). A
-    # K-side +PRES_W on every H1/H3 cell, driven by the CONST Q slot, biases the
-    # head toward the row that HAS the one-hot -> it picks the fresh prev STACK0
-    # marker over the current carried one. Without this the positive-ALiBi
-    # recency picks the NEAREST (current, empty) marker and the carry copies 0.
-    PRES_W = 6.0
-    q = [
-        AP(0, mark_stack0, SIG_W),   # K slot 0: STACK0-marker signature (sharp)
-        AP(1, const, L),             # K slot 1: one-hot-presence driver
-        AP(3, mark_stack0, L),       # K slot 3: MARK_AX V=0 sink driver
-    ]
-    k = [
-        AP(0, mark_stack0, SIG_W),
-        AP(3, mark_ax, sink_w),
-    ]
-    # K slot 1 (CONST-driven): prefer the row WITH the one-hot present.
-    for j in range(7):
-        k.append(AP(1, h1 + j, PRES_W))
-        k.append(AP(1, h3 + j, PRES_W))
-
-    v = []
-    o = []
-    W = 7
-    LO_BASE = 1    # V slots for the low-nibble (H3) copy
-    HI_BASE = 10   # V slots for the high-nibble (H1) copy
-    for j in range(W):
-        v.append(AP(LO_BASE + j, h3 + j, 1.0))       # V: prev H3 (cross-step)
-        v.append(AP(HI_BASE + j, h1 + j, 1.0))       # V: prev H1 (cross-step)
-        o.append(AO(h3_prev + j, LO_BASE + j, 1.0))  # O: write STACK0_B0_H3_PREV
-        o.append(AO(h1_prev + j, HI_BASE + j, 1.0))  # O: write STACK0_B0_H1_PREV
-
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-        alibi_slope=alibi_slope,
+    # ISA-semantics DSL migration: re-expressed via
+    # ``cross_step_carry(_STACK0_B0_CARRY_SPEC)`` (explicit-head + mixed
+    # position-source mode). The bundle's ``carry_head_spec_builder`` reproduces
+    # the legacy hand-built Q/K/V/O writes BYTE-IDENTICALLY (verified against the
+    # HEAD golden state_dict hash). The tuning args (``L`` / ``sink_w`` /
+    # ``alibi_slope``, kept for probes/tests) default to the spec's frozen
+    # values; when ALL are at their defaults the module-level bundle is used
+    # directly, otherwise a per-call override spec rebuilds the explicit head.
+    if (L == _STACK0_B0_HEAD_L
+            and sink_w == _STACK0_B0_HEAD_SINK_W
+            and alibi_slope == _STACK0_B0_CARRY_SPEC.carry_head_alibi_slope):
+        return _STACK0_B0_CARRY_BUNDLE.carry_head_spec_builder(
+            dim_positions, head_idx,
+        )
+    override = replace(
+        _STACK0_B0_CARRY_SPEC,
+        carry_head_alibi_slope=alibi_slope,
+        head_q=(
+            HeadWrite(0, "MARK_STACK0", _STACK0_B0_HEAD_SIG_W),
+            HeadWrite(1, "CONST", L),
+            HeadWrite(3, "MARK_STACK0", L),
+        ),
+        head_k=(
+            HeadWrite(0, "MARK_STACK0", _STACK0_B0_HEAD_SIG_W),
+            HeadWrite(3, "MARK_AX", sink_w),
+            HeadWrite(1, "H1", _STACK0_B0_HEAD_PRES_W, count=_STACK0_B0_HEAD_W,
+                      slot_stride=0),
+            HeadWrite(1, "H3", _STACK0_B0_HEAD_PRES_W, count=_STACK0_B0_HEAD_W,
+                      slot_stride=0),
+        ),
+    )
+    return cross_step_carry(override).carry_head_spec_builder(
+        dim_positions, head_idx,
     )
 
 
@@ -2363,143 +2536,21 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     1 on a carried STACK0-marker row, 0 on a fresh PSH STACK0-marker row and on
     every non-STACK0 row.
     """
-    W = 7
-    # Row signature + carried flag (both bounded). A balanced AND that needs
-    # BOTH the STACK0-marker row AND the carried flag.
-    #
-    # MARK_STACK0 is a HARD ROW PREREQUISITE, not a swampable +2 anchor. The
-    # SHARP/CARRIED gate terms are each ~100 (the flag values are ~100, not 1),
-    # so a +2 MARK_STACK0 weight is overwhelmed: a row with a clean PREV one-hot
-    # but MARK_STACK0=0 (e.g. a JSR step-0 PC *byte* row whose entry PC >= 256 —
-    # the rec_fib cluster, target idx 32 -> PC 258 — where STACK0_B0_SHARP
-    # spuriously leaks ~128 onto the PC byte rows and NOT_CMP=0 so it is not
-    # blocked) cleared the +7 threshold on SHARP alone (3*128 = 385 >> 7) and the
-    # L25-tail dump nuked OUTPUT_HI to ~6.9e8, corrupting the PC byte 1/2/3
-    # emission -> step-0 divergence. EVERY genuine dump-fire row has
-    # MARK_STACK0 == 1.00 (the STACK0-marker row signature); the over-fire rows
-    # have MARK_STACK0 == 0. We make MARK_STACK0 a hard prerequisite by adding a
-    # large fixed weight ``SIG_HARD`` AND raising the threshold by the SAME
-    # amount: a MARK_STACK0=1 row nets ``+SIG_HARD - SIG_HARD = 0`` (gate margin
-    # BYTE-IDENTICAL to before, so every if/bool/expr framing-drift fire is
-    # preserved) while a MARK_STACK0=0 row sits ``-SIG_HARD`` below threshold
-    # (hard-blocked, regardless of SHARP). Mirrors the AX byte-1 dump's
-    # ADDR_B1_HI hard-prerequisite fix (PC_BYTE23_STEP0_FRAMING_DRIFT doc).
-    SIG_W = 2.0       # MARK_STACK0 ~ 1.0 on the row -> +2.0 (margin anchor)
-    SIG_HARD = 1_000.0  # MARK_STACK0 hard-prerequisite component (threshold-matched)
-    CARRIED_W = 3.0   # STACK0_B0_CARRIED ~ 1.0 on a carried row -> +3.0
-    marker_blockers = (
-        ("MARK_AX", -1_000.0),
-        ("MARK_PC", -1_000.0),
-        ("MARK_SP", -1_000.0),
-        ("MARK_BP", -1_000.0),
-        ("MARK_MEM", -1_000.0),
-        ("MARK_SE", -1_000.0),
-    )
-    SHARP_W = 3.0     # STACK0_B0_SHARP ~ 1.0 on a clean-carry row -> +3.0
-
-    # The DIRECT H1/H3 re-point is gated on ``C4_STACK0_B0_DUMP`` (DEFAULT-ON;
-    # opt OUT with ``C4_STACK0_B0_DUMP=0`` for the byte-identical pre-carry build).
-    # OFF the dump targets the inert ``STACK0_B0_DUMP_{H1,H3}`` bands (read by
-    # NOBODY — the LM-head dump columns are themselves flag-gated), so it
-    # contributes nothing to any token the prior model emitted. ON re-points the
-    # write into the byte's own ``H1``/``H3`` emission cells (the re-point fix),
-    # gated by the carried/PREV-dominant/NON-COMPARISON discriminators so it fires
-    # ONLY on the genuine if/bool/expr framing-drift rows. Same flag the head bake
-    # uses, so the whole emission path flips together.
+    # ISA-semantics DSL migration: re-expressed via
+    # ``cross_step_carry(_STACK0_B0_CARRY_SPEC)`` (explicit DIRECT-REPOINT dump).
+    # The bundle's ``dump_rules_builder(emission_on)`` produces the IDENTICAL
+    # per-cell ``multi_way_and_rule`` set — same names
+    # (``stack0_b0_repoint_{target}_slot_{j}``), conditions (the MARK_STACK0
+    # hard-prereq + CARRIED/SHARP/NOT_CMP/DUMP_BLOCK gate + the 6 marker
+    # blockers), threshold (1007 on / 1004 off), ``STACK0_B0_{H3,H1}_PREV+{j}``
+    # gates, and the H3-then-H1 band/unit ORDER — verified byte-identical against
+    # the HEAD golden state_dict hash, flag-ON and flag-OFF. The
+    # ``_STACK0_B0_REPOINT_WS`` / ``C4_STACK0_NEXT_ARITH`` knobs are folded into
+    # the ``_stack0_b0_dump_blocks_{on,off}`` builders the spec carries (read
+    # fresh per compile). ``_STACK0_B0_DUMP_REPOPULATE_HIDDEN_DIM`` is retained as
+    # the rule-count assert.
     _repoint_on = _os_stack0.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
-
-    # Re-point path ANDs the BOUNDED ``STACK0_B0_SHARP`` flag (PREV is a clean
-    # single-slot one-hot, not a smear) AND a STRONG NEGATIVE ``STACK0_B0_NOT_CMP``
-    # BLOCKER -- the DEFAULT-ON discriminator. NOT_CMP fires (=1) on the
-    # ARITHMETIC-result / JMP rows the dump must NOT touch (their STACK0 row
-    # carries a per-step OP_ADD/SUB/.../OP_JMP) and is 0 on COMPARISON rows. A
-    # ``-1000`` blocker (NOT an additive positive term) is REQUIRED here: the
-    # gate's CARRIED + SHARP terms are each ~100 (not ~1), so only a strongly
-    # negative ABSENT-on-comparison blocker can overcome them on an arith/jmp row.
-    # This darkens EXACTLY the add_16bit + jmp_forward over-fire the flag-ON build
-    # regressed while leaving the if/bool/expr framing-drift rows (NOT_CMP = 0)
-    # firing -> the re-point ships DEFAULT-ON (smoke 51/0). The inert DUMP path
-    # keeps the original 2-way AND (byte-identical).
-    NOT_CMP_BLOCK_W = -1_000.0
-    # Consumer-arith blocker (#221, flag-gated C4_STACK0_NEXT_ARITH). The bounded
-    # ``STACK0_B0_DUMP_BLOCK`` flag (=1 on a MULTI-op intermediate-operand frame:
-    # its CONSUMER -- the next instr at PC+8 -- is arithmetic AND a PRIOR arith op
-    # already produced the on-stack value; 0 on single-op operand frames and on
-    # comparison frames) marks the expr arithmetic-INTERMEDIATE frames the dump
-    # must NOT touch (the fresh value should emit, like the DUMP-OFF build). A
-    # -1000 blocker (like NOT_CMP): a flagged row -> +1602 - 1000 = +602 ... not
-    # enough; the firing margin is ~595 over thr, so use a blocker that exceeds
-    # it. STACK0_B0_DUMP_BLOCK is bounded 0/1 so -2000 gives a flagged row
-    # +1602 - 2000 = -398 < 1007 (dark). Single-op / comparison frames have the
-    # flag=0 -> +1602 (still fire; mul/sub guards + if/bool +27 preserved). Added
-    # ONLY when the feature flag is on; off-flag the band does not exist
-    # (byte-identical pre-feature gate).
-    _next_arith_on = _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
-    DUMP_BLOCK_W = -2_000.0
-    if _repoint_on:
-        conditions = (
-            # MARK_STACK0 hard prerequisite: SIG_W margin + SIG_HARD prereq,
-            # the SIG_HARD is cancelled by the matched +SIG_HARD threshold bump
-            # on a MARK_STACK0=1 row (byte-identical) and blocks MARK_STACK0=0.
-            ("MARK_STACK0", SIG_W + SIG_HARD),
-            ("STACK0_B0_CARRIED", CARRIED_W),
-            ("STACK0_B0_SHARP", SHARP_W),
-            ("STACK0_B0_NOT_CMP", NOT_CMP_BLOCK_W),
-        ) + (
-            (("STACK0_B0_DUMP_BLOCK", DUMP_BLOCK_W),)
-            if _next_arith_on else ()
-        ) + marker_blockers
-        # 3-way AND + NON-COMPARISON blocker + MARK_STACK0 hard prerequisite:
-        # a carried clean-carry COMPARISON row -> 1000+2 + 3*100 + 3*100 + 0 =
-        # 1602 > 1007 (fires, margin == the legacy 602 vs 7); an ARITHMETIC/JMP
-        # result row -> NOT_CMP ~ 100 -> << 1007 (dark — fixes the over-fire);
-        # a carried SMEAR row -> SHARP = 0 -> 1302 (still fires unless NOT_CMP
-        # blocks); a fresh STACK0 row -> CARRIED = 0 -> 1302 (still fires, as
-        # before); a NON-STACK0 byte row (MARK_STACK0=0, e.g. the rec entry-PC>=
-        # 256 PC byte rows) -> 0 + ... <= 391 << 1007 (HARD-BLOCKED regardless of
-        # the leaked SHARP). The +SIG_HARD weight is matched by the +SIG_HARD
-        # threshold so every MARK_STACK0=1 gate margin is unchanged.
-        dump_threshold = 7.0 + SIG_HARD
-    else:
-        conditions = (
-            ("MARK_STACK0", SIG_W + SIG_HARD),
-            ("STACK0_B0_CARRIED", CARRIED_W),
-        ) + marker_blockers
-        dump_threshold = 4.0 + SIG_HARD
-    rules: list[FFNRule] = []
-    # Low-nibble lives in H1 (PREV idx = lo+2), high-nibble in H3 (idx = hi+4):
-    # the carry head copied the prev step's registry-H1/H3 one-hots into the
-    # like-named PREV bands at the SAME slot index, so the re-point write target
-    # is the identity-indexed registry cell.
-    for (emit_band, dump_band, prev_band) in (
-        ("H3", "STACK0_B0_DUMP_H3", "STACK0_B0_H3_PREV"),
-        ("H1", "STACK0_B0_DUMP_H1", "STACK0_B0_H1_PREV"),
-    ):
-        # Flag ON -> write the byte's own H1/H3 emission cell (the re-point);
-        # flag OFF -> write the inert DUMP band (byte-identical, read by nobody).
-        target = emit_band if _repoint_on else dump_band
-        ws = _STACK0_B0_REPOINT_WS if _repoint_on else 0.02
-        for j in range(W):
-            rules.append(multi_way_and_rule(
-                name=f"stack0_b0_repoint_{target.lower()}_slot_{j}",
-                # Flag OFF (thr 4.0): fires on a carried STACK0-marker row
-                # (2 + 3 = 5 > 4), dark on a fresh STACK0 row (2 + 0 < 4) and on
-                # every non-STACK0 row (a -1000 marker blocker dominates).
-                # Flag ON (thr 7.0): ADDS the SHARP flag -> fires ONLY on a
-                # clean-carry row (2+3+3 > 7); a carried smear (SHARP=0 -> 5) and
-                # a fresh row (CARRIED=0 -> 2) are dark. All gate inputs bounded.
-                conditions=conditions,
-                threshold=dump_threshold,
-                gate=f"{prev_band}+{j}",
-                # write_scale: silu(S*(cond-thr)) ~= 60 on a carried row,
-                # gate = PREV+j (~160 at the argmax slot, ~0 elsewhere) ->
-                # output ~= 60 * 160 * write_scale at the correct slot. Tuned
-                # large so the read slot nets POSITIVE over the -1e7 nuke (the
-                # residual is additive). The PREV one-hot keeps the write off
-                # the wrong slots; the LM head emits the matching byte token.
-                writes=((f"{target}+{j}", ws),),
-            ))
-    return tuple(rules)
+    return _STACK0_B0_CARRY_BUNDLE.dump_rules_builder(_repoint_on)
 
 
 # ---------------------------------------------------------------------------
@@ -2559,77 +2610,25 @@ def make_stack0_byte0_carried_flag_op() -> Operation:
     so the dump FFN can gate on a bounded 0/1 flag instead of the corrupted
     H1/H3. MIXED dim_map: the MARK_* / H3 read taps resolve from the legacy
     dynamic *registry*; the NEW ``STACK0_B0_CARRIED`` band from ``dim_positions``.
+
+    ISA-semantics DSL migration: re-expressed via
+    ``cross_step_carry(_STACK0_B0_CARRY_SPEC)``. The bundle's
+    ``precursor_ops_builder`` returns the standalone bounded-flag ``Operation``
+    (the generator's ``make_mixed_dim_map_ffn_op`` scaffolding supplies the
+    IDENTICAL PureFFN post_op + mixed dim_map bake) — verified byte-identical
+    against the HEAD golden state_dict hash. The flag RULE logic stays in
+    ``_stack0_byte0_carried_flag_rules`` (the spec references it lazily); the
+    ``_STACK0_B0_CARRIED_FLAG_HIDDEN_DIM`` rule-count assert is preserved here.
     """
-    rules = _stack0_byte0_carried_flag_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        assert len(rules) == _STACK0_B0_CARRIED_FLAG_HIDDEN_DIM, (
-            f"stack0_byte0_carried_flag rule-count drift: produced "
-            f"{len(rules)}, expected {_STACK0_B0_CARRIED_FLAG_HIDDEN_DIM}"
-        )
-        ffn = PureFFN(d_model, len(rules))
-        from ...dim_registry_dynamic import build_default_registry_dynamic
-        _reg = build_default_registry_dynamic()
-        _new_bands = {"STACK0_B0_CARRIED"}
-        dim_map = {}
-        for _nm in Primitives.ffn_rule_dim_names(rules):
-            _base = _nm.split("+", 1)[0]
-            if _base in _new_bands:
-                dim_map[_nm] = int(dim_positions[_base]) + (
-                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
-                )
-            else:
-                dim_map[_nm] = int(_reg.slots[_base].start) + (
-                    int(_nm.split("+", 1)[1]) if "+" in _nm else 0
-                )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
-        name="stack0_byte0_carried_flag",
-        reads={
-            "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
-            "MARK_MEM", "MARK_SE", "H3",
-        },
-        writes={"STACK0_B0_CARRIED"},
-        kind="block",
-        # Bind to the L8 attn op (an early block where H3 is still bounded --
-        # the L25 corruptor that nukes H3 to ~-289M runs much later). The flag
-        # persists to the L25 tail (nothing else writes it).
-        target_op_name="layer8_multibyte_fetch",
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
-        spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    assert len(_stack0_byte0_carried_flag_rules()) == (
+        _STACK0_B0_CARRIED_FLAG_HIDDEN_DIM
+    ), (
+        "stack0_byte0_carried_flag rule-count drift: produced "
+        f"{len(_stack0_byte0_carried_flag_rules())}, "
+        f"expected {_STACK0_B0_CARRIED_FLAG_HIDDEN_DIM}"
     )
+    (op,) = _STACK0_B0_CARRY_BUNDLE.precursor_ops_builder()
+    return op
 
 
 # ---------------------------------------------------------------------------

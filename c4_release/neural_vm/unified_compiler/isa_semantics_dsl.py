@@ -52,6 +52,195 @@ from .ops.residual_band_registry import register_residual_band
 
 
 # ---------------------------------------------------------------------------
+# Position-source split (the AX/STACK0 generalization over BP's layout-only)
+# ---------------------------------------------------------------------------
+#
+# BP_SAVE_PREV resolves EVERY dim from the declarative LAYOUT (``dim_positions``):
+# the legacy registry dims it taps (OP_ENT, OUTPUT_LO/HI, MARK_*) happen to sit
+# at the SAME index in both maps OR the model residual carries them at the
+# layout index. So ``position_source="layout"`` resolves the whole carry from
+# ``dim_positions``.
+#
+# The AX byte-1 + STACK0 byte-0 carries are different: their H1/H2/H3 emission
+# pipeline + the ADDR_B*/AX_CARRY/MARK_* gate taps are baked by the LEGACY
+# imperative path at the dynamic *registry* positions (H1=67, ADDR_B0_LO=12,
+# AX_CARRY_LO=328, ...), which DIFFER from the declarative layout
+# (ADDR_B0_LO=506, AX_CARRY_LO=362). Reading those from the layout taps DEAD
+# slots; they MUST resolve from ``build_default_registry_dynamic()`` — the same
+# map every probe uses. Only the NEW carry bands (``H1_PREV_STEP`` etc.) live
+# in the layout. ``position_source="mixed"`` + ``registry_dims`` expresses this
+# split: a base dim name listed in ``registry_dims`` resolves from the registry,
+# everything else from ``dim_positions``.
+
+
+def _make_position_resolver(
+    dim_positions: Dict[str, int],
+    *,
+    position_source: str,
+    registry_dims: Sequence[str],
+) -> Callable[[str], int]:
+    """Return a ``base_dim_name -> int`` resolver honouring the split.
+
+    ``position_source="layout"`` => every dim from ``dim_positions``.
+    ``position_source="mixed"`` => dims in ``registry_dims`` from the dynamic
+    registry (``build_default_registry_dynamic()``), the rest from
+    ``dim_positions``. Building the registry is lazy (only the mixed path pays
+    the import + build cost), matching the hand-built ops that build it inside
+    their head-spec / bake bodies.
+    """
+    if position_source not in ("layout", "mixed"):
+        raise ValueError(
+            f"position_source must be 'layout' or 'mixed', got "
+            f"{position_source!r}"
+        )
+    reg_set = set(registry_dims)
+    _reg_holder: Dict[str, object] = {}
+
+    def _registry():
+        if "reg" not in _reg_holder:
+            from ..dim_registry_dynamic import build_default_registry_dynamic
+            _reg_holder["reg"] = build_default_registry_dynamic()
+        return _reg_holder["reg"]
+
+    def resolve(name: str) -> int:
+        if position_source == "mixed" and name in reg_set:
+            return int(_registry().slots[name].start)
+        return int(dim_positions[name])
+
+    return resolve
+
+
+def _resolve_dim_token(token: str, resolve: Callable[[str], int]) -> int:
+    """Resolve a ``BASE`` or ``BASE+offset`` token to an int position."""
+    if "+" in token:
+        base, off = token.rsplit("+", 1)
+        return resolve(base) + int(off)
+    return resolve(token)
+
+
+# ---------------------------------------------------------------------------
+# Explicit head directives (the head-shape generalization over BP per-byte)
+# ---------------------------------------------------------------------------
+#
+# BP's carry head is a per-byte positional MATCH (Q@MEM_VAL_B{k} <->
+# K@BYTE_INDEX_{k}) + k_prefer/k_reject + a single LO/HI value-copy block. The
+# AX byte-1 + STACK0 byte-0 heads are structurally DIFFERENT (a sharp MARK/ADDR
+# signature on slot 0, a CONST-driven one-hot-presence or AX_CARRY-preference
+# K-loop on its own slot, a MARK_AX V=0 sink on slot 3, and 1-3 cross-step
+# value-copy blocks). Rather than contort the per-byte-match builder, the spec
+# may declare the head's Q/K/V/O writes EXPLICITLY via :class:`HeadWrite`
+# directives. ``generate_attention_head`` lowers by DIRECT indexed assignment
+# (``W_q[base+slot, dim] = w``), so the resulting weights depend ONLY on the
+# final (slot, dim, weight) set — NOT the emit order — and an explicit directive
+# list reproduces any hand-built head byte-identically.
+
+
+@dataclass(frozen=True)
+class HeadWrite:
+    """One Q/K/V/O directive in an explicit carry-head spec.
+
+    A directive expands to ``count`` writes at ``(slot, dim_base + j*1)`` for the
+    V/O value-copy blocks (``count``/``src_count`` per-cell loops) or a single
+    write when ``count == 1``. ``dim`` is a base dim NAME (registry- or
+    layout-resolved per ``position_source``); ``+offset`` suffixes are honoured.
+
+    For Q/K writes (``v_slot`` unused): emits ``AP(slot + i*slot_stride,
+    resolve(dim) + i*dim_stride, weight)`` for ``i in range(count)``.
+
+    For V writes: emits ``AP(slot + i, resolve(dim) + i, weight)`` for
+    ``i in range(count)`` (the per-cell copy block — V slot and src dim advance
+    together).
+
+    For O writes: emits ``AO(resolve(out_dim) + i, slot + i, weight)`` for
+    ``i in range(count)`` (out band cell j written from V slot ``slot + i``).
+    ``dim`` is the O OUT band; ``slot`` is the V slot base it reads.
+    """
+
+    slot: int
+    dim: str
+    weight: float
+    count: int = 1
+    slot_stride: int = 1
+    dim_stride: int = 1
+
+
+# ---------------------------------------------------------------------------
+# Explicit dump-rule directives (the direct-repoint + heterogeneous-gate
+# generalization over BP's per-byte LO/HI split)
+# ---------------------------------------------------------------------------
+#
+# BP's dump is a uniform per-byte LO/HI gate-copy: ``OUTPUT_{LO,HI}[j] =
+# BP_SAVE_PREV[j]`` gated on ``OP_ENT + MEM_VAL_B{k}``. The AX byte-1 + STACK0
+# byte-0 dumps differ on two axes the BP form cannot express:
+#   * DIRECT REPOINT: the dump WRITE band == the cross-step SRC band (STACK0
+#     re-supplies into the byte's OWN ``H1+j``/``H3+j`` LM-head emission cell,
+#     gated by the precursor flags; AX writes the distinct ``H*_DUMP_OUT``).
+#   * heterogeneous, NON-per-byte gate conditions (precursor-flag ANDs, an
+#     unbounded AX_CARRY band sum, a two-stage ``*_OVERFLOW`` KILL).
+# A :class:`DumpBlock` declares one ``(gate_band -> emit_band)`` copy block of
+# ``width`` cells sharing a single ``conditions``/``threshold`` AND; the dump is
+# a tuple of blocks. ``emit_band`` may equal ``gate_band``'s SRC band (the
+# repoint) or differ (the separate DUMP band).
+
+
+@dataclass(frozen=True)
+class DumpBlock:
+    """One gated per-cell copy block in an explicit dump-rule spec.
+
+    For each cell ``j in range(width)`` emits a ``multi_way_and_rule`` named
+    ``{name_prefix}_{j}`` whose AND is ``conditions`` over ``threshold``, gated
+    on ``{gate_band}+{j}`` (multiplicative), writing ``({emit_band}+{j},
+    write_scale)``. ``conditions`` dims are base names (registry/layout-resolved
+    by NAME at lower time); ``gate_band`` / ``emit_band`` likewise.
+    """
+
+    name_prefix: str
+    width: int
+    gate_band: str
+    emit_band: str
+    write_scale: float
+    conditions: Tuple[Tuple[str, float], ...]
+    threshold: float
+
+
+@dataclass(frozen=True)
+class PrecursorFlagSpec:
+    """A precursor FFN that writes a BOUNDED gate flag the dump ANDs.
+
+    The two-stage KILL (AX ``AX_CARRY_OVERFLOW``) and the carried/sharp/etc.
+    STACK0 gate flags share an IDENTICAL op shape: a standalone ``PureFFN``
+    post_op, bound to an anchor, with a MIXED dim_map (input taps from the
+    legacy registry, the NEW flag band from the layout), writing a small bounded
+    value the dump reads (positively for an enable flag, or via a large negative
+    weight for a KILL flag). The varying part is the RULE LIST and the band /
+    anchor; the generator supplies the bake scaffolding via
+    :func:`make_mixed_dim_map_ffn_op`.
+
+    Attributes:
+        op_name: the Operation name (also the rule-count-assert label).
+        flag_band: the NEW residual band the precursor writes (layout dim).
+        rules_builder: ``() -> tuple[FFNRule, ...]`` — the flag logic. Owns the
+            step/AND rules (domain-specific weights stay in the op module).
+        reads / writes: the Operation dep-graph dim sets.
+        target_op_name: the bind anchor.
+        requires: optional ``{"after": (...)}`` ordering.
+        registry_dims: base dim names resolved from the dynamic registry (the
+            input taps); the ``flag_band`` resolves from the layout.
+        spec_section: doc tag.
+    """
+
+    op_name: str
+    flag_band: str
+    rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    reads: Set[str]
+    writes: Set[str]
+    target_op_name: str
+    requires: Optional[Dict[str, object]] = None
+    registry_dims: Tuple[str, ...] = ()
+    spec_section: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
 # Spec — the varying parameters of a cross-step carry
 # ---------------------------------------------------------------------------
 
@@ -141,20 +330,24 @@ class CrossStepCarrySpec:
     band_width: int
     carry_head_alibi_slope: float
     carry_byte_count: int
-    match_q_band: str
-    match_k_band: str
-    match_weight: float
-    value_src_lo: str
-    value_src_hi: str
-    value_o_write_scale: float
-    dump_emit_lo: str
-    dump_emit_hi: str
-    dump_write_scale: float
-    dump_per_byte_marker: str
-    dump_per_byte_marker_weight: float
-    dump_marker_blockers: Tuple[Tuple[str, float], ...]
-    dump_gate_conditions: Tuple[Tuple[str, float], ...]
-    dump_opent_floor: float
+    # --- BP per-byte-match head fields (the ``head_*`` explicit mode leaves
+    #     these at their no-op defaults; only the BP layout-mode head uses them).
+    match_q_band: str = ""
+    match_k_band: str = ""
+    match_weight: float = 0.0
+    value_src_lo: str = ""
+    value_src_hi: str = ""
+    value_o_write_scale: float = 0.0
+    # --- BP per-byte LO/HI dump fields (the ``dump_blocks`` explicit mode leaves
+    #     these at their no-op defaults; only the BP layout-mode dump uses them).
+    dump_emit_lo: str = ""
+    dump_emit_hi: str = ""
+    dump_write_scale: float = 0.0
+    dump_per_byte_marker: str = ""
+    dump_per_byte_marker_weight: float = 0.0
+    dump_marker_blockers: Tuple[Tuple[str, float], ...] = ()
+    dump_gate_conditions: Tuple[Tuple[str, float], ...] = ()
+    dump_opent_floor: float = 0.0
     band_flag: Optional[Callable[[], bool]] = None
     value_v_slot_base: int = 10
     dump_threshold: Optional[float] = None
@@ -173,9 +366,80 @@ class CrossStepCarrySpec:
     # hand-built call (the registry is collision-checked on
     # (name, size, owner, never_share)). ``None`` => use ``name``.
     band_owner: Optional[str] = None
+    # ``never_share`` for the band registration. BP omitted it (defaulted True
+    # in its hand-built call); AX/STACK0 pass it explicitly. Carry/dump bands
+    # hold cross-step state so this is ~always True.
+    band_never_share: bool = True
+
+    # === Generalization fields (the AX byte-1 + STACK0 byte-0 carries) ========
+    #
+    # position-source split: the carry head + dump + precursor resolve dims via
+    # this. ``"layout"`` (BP) => all from ``dim_positions``; ``"mixed"`` =>
+    # ``registry_dims`` from the dynamic registry, the rest from the layout.
+    position_source: str = "layout"
+    registry_dims: Tuple[str, ...] = ()
+    # explicit carry-head mode: when ANY of these is non-None the head is built
+    # from the explicit :class:`HeadWrite` directives (resolved by
+    # ``position_source``) INSTEAD of the BP per-byte-match construction. The
+    # head stays UNCONDITIONAL (no head-gate field — the API shape invariant).
+    head_q: Optional[Tuple[HeadWrite, ...]] = None
+    head_k: Optional[Tuple[HeadWrite, ...]] = None
+    head_v: Optional[Tuple[HeadWrite, ...]] = None
+    head_o: Optional[Tuple[HeadWrite, ...]] = None
+    # explicit carry-head Operation dep-graph dims (the head READS its taps + the
+    # cross-step ``X.*.-1`` value sources, WRITES the PREV bands). When the
+    # explicit head mode is used these are declared verbatim (the auto-derived
+    # BP sets do not apply).
+    head_reads: Optional[Set[str]] = None
+    head_writes: Optional[Set[str]] = None
+    # explicit dump mode: a tuple of :class:`DumpBlock` (or a zero-arg callable
+    # returning one — so a dump whose gate conditions depend on a SECONDARY
+    # runtime flag, e.g. STACK0's ``C4_STACK0_NEXT_ARITH``, can rebuild the
+    # blocks fresh at each compile). When non-None the dump is built from these
+    # blocks (the direct-repoint + heterogeneous-gate path) INSTEAD of the BP
+    # per-byte LO/HI split. Selected by ``emission_on``: when ``False`` the dump
+    # may flip its blocks to an inert target (the AX/STACK0 repoint-vs-inert
+    # flag) via ``dump_blocks_off``.
+    dump_blocks: Optional[
+        "Tuple[DumpBlock, ...] | Callable[[], Tuple[DumpBlock, ...]]"
+    ] = None
+    dump_blocks_off: Optional[
+        "Tuple[DumpBlock, ...] | Callable[[], Tuple[DumpBlock, ...]]"
+    ] = None
+    # explicit dump Operation dep-graph dims.
+    dump_reads_explicit: Optional[Set[str]] = None
+    dump_writes_explicit: Optional[Set[str]] = None
+    # precursor flag ops (the two-stage KILL precursor + the STACK0 bounded
+    # gate-flag precursors). Each declares a standalone bounded-flag FFN the dump
+    # ANDs; the generator supplies the bake scaffolding.
+    precursors: Tuple[PrecursorFlagSpec, ...] = ()
+    # band registration: BP (single-band) lets the generator register
+    # ``band_name`` at import. The AX/STACK0 carries register MULTIPLE bands
+    # (PREV + DUMP + flag bands) in a LOAD-BEARING order from explicit
+    # module-scope ``register_residual_band`` calls; the generator must NOT
+    # re-register (it would (a) need the per-band order and (b) collide). Set
+    # ``register_band=False`` to keep the explicit calls authoritative.
+    register_band: bool = True
+
+    @property
+    def explicit_head(self) -> bool:
+        """True when the carry head is built from explicit ``head_*`` directives."""
+        return any(
+            d is not None
+            for d in (self.head_q, self.head_k, self.head_v, self.head_o)
+        )
+
+    @property
+    def explicit_dump(self) -> bool:
+        """True when the dump is built from explicit :class:`DumpBlock` directives."""
+        return self.dump_blocks is not None or self.dump_blocks_off is not None
 
     def __post_init__(self) -> None:
-        if self.band_width % 2 != 0:
+        # The BP per-byte LO/HI split needs an even band width; the explicit
+        # multi-band carries register odd (7-wide) PREV bands separately and
+        # build the dump from explicit blocks, so the even check applies only to
+        # the BP layout-mode dump.
+        if not self.explicit_dump and self.band_width % 2 != 0:
             raise ValueError(
                 f"CrossStepCarrySpec({self.name!r}): band_width must be even "
                 f"(LO+HI split), got {self.band_width}"
@@ -224,6 +488,190 @@ class CrossStepCarryBundle:
     carry_head_writes: Set[str]
     dump_reads: Set[str]
     dump_writes: Set[str]
+    # Precursor flag ops generated from ``spec.precursors`` (the two-stage KILL +
+    # the STACK0 bounded gate flags). Each is a fully-wired ``Operation`` ready
+    # to add to the build. ``()`` for the BP carry (no precursors).
+    precursor_ops_builder: Callable[[], Tuple[object, ...]] = (
+        lambda: ()  # type: ignore[assignment]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Explicit-mode lowering helpers
+# ---------------------------------------------------------------------------
+
+
+def _expand_head_writes(
+    directives: Sequence[HeadWrite],
+    resolve: Callable[[str], int],
+    *,
+    kind: str,
+) -> list:
+    """Expand :class:`HeadWrite` directives to ``AP`` / ``AO`` writes.
+
+    ``kind="proj"`` => Q/K/V writes (``AP(slot, dim, weight)``); ``kind="out"``
+    => O writes (``AO(out_dim, slot, weight)``). A directive with ``count > 1``
+    expands to the per-cell loop (V/O value-copy blocks + the K one-hot-presence
+    loops): for ``i in range(count)`` the slot advances by ``slot_stride`` and
+    the dim by ``dim_stride``. ``generate_attention_head`` lowers by direct
+    indexed assignment, so the EMIT ORDER does not affect the weights — only the
+    final (slot, dim, weight) set matters — but the expansion is deterministic.
+    """
+    out: list = []
+    for d in directives:
+        for i in range(d.count):
+            slot = d.slot + i * d.slot_stride
+            dim = _resolve_dim_token(d.dim, resolve) + i * d.dim_stride
+            if kind == "proj":
+                out.append(AP(slot, dim, d.weight))
+            elif kind == "out":
+                # O directive: ``dim`` is the OUT band cell, ``slot`` is the V
+                # slot it reads. The per-cell loop advances BOTH.
+                out.append(AO(dim, slot, d.weight))
+            else:  # pragma: no cover - guarded by callers
+                raise ValueError(f"_expand_head_writes: bad kind {kind!r}")
+    return out
+
+
+def _expand_dump_blocks(
+    blocks: Sequence[DumpBlock],
+) -> Tuple[FFNRule, ...]:
+    """Expand :class:`DumpBlock` directives to per-cell ``multi_way_and_rule``s.
+
+    Per block, per cell ``j in range(width)``: a balanced AND over ``conditions``
+    at ``threshold``, gated multiplicatively on ``{gate_band}+{j}``, writing
+    ``({emit_band}+{j}, write_scale)``. The dump dims resolve by NAME at lower
+    time (``Primitives.lower_ffn_rules`` + the op's mixed dim_map), so the rules
+    are position-source-agnostic here.
+    """
+    rules: list[FFNRule] = []
+    for b in blocks:
+        for j in range(b.width):
+            rules.append(multi_way_and_rule(
+                name=f"{b.name_prefix}_{j}",
+                conditions=tuple(b.conditions),
+                threshold=b.threshold,
+                gate=f"{b.gate_band}+{j}",
+                writes=((f"{b.emit_band}+{j}", b.write_scale),),
+            ))
+    return tuple(rules)
+
+
+def make_mixed_dim_map_ffn_op(
+    precursor: PrecursorFlagSpec,
+    *,
+    position_source: str,
+):
+    """Build the standalone bounded-flag precursor ``Operation``.
+
+    Supplies the IDENTICAL ~40-line ``PureFFN`` post_op bake the hand-built
+    precursors (AX ``ax_byte1_carry_overflow_flag``, STACK0
+    ``stack0_byte0_{carried,sharp,...}_flag``) each duplicated: derive d_model,
+    build a ``PureFFN`` sized to the rule count, lower with a MIXED dim_map (the
+    NEW ``flag_band`` from the layout, the input taps from the dynamic registry
+    when ``position_source="mixed"``), and append to ``block.post_ops``. The
+    op's RULE LIST is the spec's ``rules_builder()`` (the domain-specific flag
+    logic stays in the op module).
+    """
+    # Imported lazily so the ISA-DSL module stays import-light (the
+    # ``layer_compiler.Operation`` import would otherwise pull the compiler).
+    from .layer_compiler import Operation
+    from .ir import CompilerIR
+    from .primitives import Primitives
+
+    rules = precursor.rules_builder()
+    reg_set = set(precursor.registry_dims)
+
+    def bake(block, dim_positions, S):
+        from ..base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = _mixed_dim_map(
+            rules, dim_positions,
+            registry_dims=reg_set if position_source == "mixed" else set(),
+            new_bands={precursor.flag_band},
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    op_kwargs = dict(
+        name=precursor.op_name,
+        reads=set(precursor.reads),
+        writes=set(precursor.writes),
+        kind="block",
+        target_op_name=precursor.target_op_name,
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+    )
+    if precursor.requires is not None:
+        op_kwargs["requires"] = precursor.requires
+    if precursor.spec_section is not None:
+        op_kwargs["spec_section"] = precursor.spec_section
+    return Operation(**op_kwargs)
+
+
+def _mixed_dim_map(
+    rules,
+    dim_positions: Dict[str, int],
+    *,
+    registry_dims: Set[str],
+    new_bands: Set[str],
+) -> Dict[str, int]:
+    """Resolve every ``base+off`` dim a rule list touches under the split.
+
+    ``new_bands`` resolve from the LAYOUT (``dim_positions``); everything in
+    ``registry_dims`` from the dynamic registry; the remainder from the layout
+    (the ``position_source="layout"`` fallback — the same map the BP dump uses).
+    Mirrors the hand-built precursor / dump bake bodies EXACTLY.
+    """
+    from .primitives import Primitives
+
+    _reg_holder: Dict[str, object] = {}
+
+    def _registry():
+        if "reg" not in _reg_holder:
+            from ..dim_registry_dynamic import build_default_registry_dynamic
+            _reg_holder["reg"] = build_default_registry_dynamic()
+        return _reg_holder["reg"]
+
+    dim_map: Dict[str, int] = {}
+    for nm in Primitives.ffn_rule_dim_names(rules):
+        base = nm.split("+", 1)[0]
+        off = int(nm.split("+", 1)[1]) if "+" in nm else 0
+        if base in new_bands:
+            dim_map[nm] = int(dim_positions[base]) + off
+        elif base in registry_dims:
+            dim_map[nm] = int(_registry().slots[base].start) + off
+        else:
+            dim_map[nm] = int(dim_positions[base]) + off
+    return dim_map
 
 
 # ---------------------------------------------------------------------------
@@ -246,158 +694,218 @@ def cross_step_carry(spec: CrossStepCarrySpec) -> CrossStepCarryBundle:
     """
     # (1) Register the dedicated ``_PREV`` band (import-time side effect). The
     #     registry is idempotent on (name, size, owner, never_share), so a
-    #     module reload under test re-registers cleanly.
-    register_residual_band(
-        spec.band_name,
-        spec.band_width,
-        owner=spec.band_owner if spec.band_owner is not None else spec.name,
-        flag=spec.band_flag,
-        never_share=True,
-    )
+    #     module reload under test re-registers cleanly. The multi-band AX/STACK0
+    #     carries set ``register_band=False`` and keep their LOAD-BEARING-ordered
+    #     module-scope ``register_residual_band`` calls authoritative.
+    if spec.register_band:
+        register_residual_band(
+            spec.band_name,
+            spec.band_width,
+            owner=spec.band_owner if spec.band_owner is not None else spec.name,
+            flag=spec.band_flag,
+            never_share=spec.band_never_share,
+        )
 
     half = spec.band_width // 2
 
-    # (2) Carry head spec builder — UNCONDITIONAL. Reproduces the hand-built
-    #     Q/K/V/O writes in the SAME append order.
-    def carry_head_spec_builder(
-        dim_positions: Dict[str, int], head_idx: int
-    ) -> DeclarativeAttentionHeadSpec:
-        def _P(name: str) -> int:
-            return int(dim_positions[name])
-
-        src_lo = _P(spec.value_src_lo)
-        src_hi = _P(spec.value_src_hi)
-        band = int(dim_positions[spec.band_name])
-        const = _P(spec.const_dim)
-
-        q: list = []
-        k: list = []
-
-        # Slots 0..(carry_byte_count-1): per-byte positional match. Q reads the
-        # consuming row's ``match_q_band{k}``; K reads the prev row's
-        # ``match_k_band{k}``. Each on its OWN slot.
-        for kk in range(spec.carry_byte_count):
-            qb = _P(f"{spec.match_q_band}{kk}")
-            kb = _P(f"{spec.match_k_band}{kk}")
-            q.append(AP(kk, qb, spec.match_weight))
-            k.append(AP(kk, kb, spec.match_weight))
-
-        # K-preference slots: CONST-driven Q + positive K signature (bias the
-        # carry TOWARD the prev row).
-        for (slot, dim_name, weight) in spec.k_prefer:
-            q.append(AP(slot, const, weight))
-            k.append(AP(slot, _P(dim_name), weight))
-
-        # K-reject slots: NEGATIVE K signature (hard-reject same-step / wrong
-        # source rows) + CONST-driven Q at the positive magnitude. Multiple
-        # entries may share a slot (e.g. the STACK0_BYTE{0..3} family); the
-        # Q-side CONST write is emitted ONCE PER (slot) — in the hand-built BP
-        # code the STACK0 group emits the four K writes first, then ONE Q
-        # write. To reproduce that exact append order, emit all K writes for a
-        # contiguous run of entries sharing a slot, then the single Q write.
-        ki = 0
-        while ki < len(spec.k_reject):
-            slot = spec.k_reject[ki][0]
-            # Gather the contiguous run of entries on this slot.
-            run = []
-            while ki < len(spec.k_reject) and spec.k_reject[ki][0] == slot:
-                run.append(spec.k_reject[ki])
-                ki += 1
-            # K writes (negative), in order.
-            for (_slot, dim_name, weight) in run:
-                k.append(AP(slot, _P(dim_name), -weight))
-            # Single Q write at the positive magnitude of the run's |weight|.
-            q.append(AP(slot, const, run[0][2]))
-
-        # V/O: copy ``value_src_lo[0..half-1]`` -> band[0..half-1] and
-        # ``value_src_hi[0..half-1]`` -> band[half..band_width-1]. V slots from
-        # ``value_v_slot_base`` (far from the Q/K gate slots).
-        v: list = []
-        o: list = []
-        vb = spec.value_v_slot_base
-        for j in range(half):
-            v.append(AP(vb + j, src_lo + j, 1.0))
-            o.append(AO(band + j, vb + j, spec.value_o_write_scale))
-        for j in range(half):
-            v.append(AP(vb + half + j, src_hi + j, 1.0))
-            o.append(AO(band + half + j, vb + half + j, spec.value_o_write_scale))
-
-        return DeclarativeAttentionHeadSpec(
-            head_idx=head_idx,
-            q=tuple(q),
-            k=tuple(k),
-            v=tuple(v),
-            o=tuple(o),
-            alibi_slope=spec.carry_head_alibi_slope,
-        )
-
-    # (3) Dump rules builder — the GATE lives here. Per consuming byte k, per
-    #     band cell j: ``emit_band[j] = band[j]`` gated on
-    #     (dump_gate_conditions AND per_byte_marker{k}) over threshold, with
-    #     the MARK_* blockers ANDed in. Returns () when emission off (flag-off
-    #     byte-identical: the band is omitted from the layout so there are zero
-    #     rules and the op is inert).
-    if spec.dump_threshold is not None:
-        threshold = spec.dump_threshold
+    # (2) Carry head spec builder — UNCONDITIONAL (no head-gate field; the
+    #     API-shape invariant). Two modes:
+    #       * explicit-head (AX/STACK0): lower the explicit ``head_*`` directives
+    #         resolved by ``position_source``;
+    #       * BP per-byte-match (layout): the per-byte positional MATCH +
+    #         k_prefer/k_reject + LO/HI value-copy construction.
+    if spec.explicit_head:
+        def carry_head_spec_builder(
+            dim_positions: Dict[str, int], head_idx: int
+        ) -> DeclarativeAttentionHeadSpec:
+            resolve = _make_position_resolver(
+                dim_positions,
+                position_source=spec.position_source,
+                registry_dims=spec.registry_dims,
+            )
+            q = _expand_head_writes(spec.head_q or (), resolve, kind="proj")
+            k = _expand_head_writes(spec.head_k or (), resolve, kind="proj")
+            v = _expand_head_writes(spec.head_v or (), resolve, kind="proj")
+            o = _expand_head_writes(spec.head_o or (), resolve, kind="out")
+            return DeclarativeAttentionHeadSpec(
+                head_idx=head_idx,
+                q=tuple(q),
+                k=tuple(k),
+                v=tuple(v),
+                o=tuple(o),
+                alibi_slope=spec.carry_head_alibi_slope,
+            )
     else:
-        threshold = spec.dump_opent_floor + spec.dump_per_byte_marker_weight
+        def carry_head_spec_builder(
+            dim_positions: Dict[str, int], head_idx: int
+        ) -> DeclarativeAttentionHeadSpec:
+            def _P(name: str) -> int:
+                return int(dim_positions[name])
 
-    def dump_rules_builder(emission_on: bool) -> Tuple[FFNRule, ...]:
-        if not emission_on:
-            return ()
-        rules: list[FFNRule] = []
+            src_lo = _P(spec.value_src_lo)
+            src_hi = _P(spec.value_src_hi)
+            band = int(dim_positions[spec.band_name])
+            const = _P(spec.const_dim)
+
+            q: list = []
+            k: list = []
+
+            # Slots 0..(carry_byte_count-1): per-byte positional match. Q reads
+            # the consuming row's ``match_q_band{k}``; K reads the prev row's
+            # ``match_k_band{k}``. Each on its OWN slot.
+            for kk in range(spec.carry_byte_count):
+                qb = _P(f"{spec.match_q_band}{kk}")
+                kb = _P(f"{spec.match_k_band}{kk}")
+                q.append(AP(kk, qb, spec.match_weight))
+                k.append(AP(kk, kb, spec.match_weight))
+
+            # K-preference slots: CONST-driven Q + positive K signature (bias the
+            # carry TOWARD the prev row).
+            for (slot, dim_name, weight) in spec.k_prefer:
+                q.append(AP(slot, const, weight))
+                k.append(AP(slot, _P(dim_name), weight))
+
+            # K-reject slots: NEGATIVE K signature (hard-reject same-step / wrong
+            # source rows) + CONST-driven Q at the positive magnitude. Multiple
+            # entries may share a slot (e.g. the STACK0_BYTE{0..3} family); the
+            # Q-side CONST write is emitted ONCE PER (slot) — in the hand-built
+            # BP code the STACK0 group emits the four K writes first, then ONE Q
+            # write. To reproduce that exact append order, emit all K writes for
+            # a contiguous run of entries sharing a slot, then the single Q
+            # write.
+            ki = 0
+            while ki < len(spec.k_reject):
+                slot = spec.k_reject[ki][0]
+                # Gather the contiguous run of entries on this slot.
+                run = []
+                while ki < len(spec.k_reject) and spec.k_reject[ki][0] == slot:
+                    run.append(spec.k_reject[ki])
+                    ki += 1
+                # K writes (negative), in order.
+                for (_slot, dim_name, weight) in run:
+                    k.append(AP(slot, _P(dim_name), -weight))
+                # Single Q write at the positive magnitude of the run's |weight|.
+                q.append(AP(slot, const, run[0][2]))
+
+            # V/O: copy ``value_src_lo[0..half-1]`` -> band[0..half-1] and
+            # ``value_src_hi[0..half-1]`` -> band[half..band_width-1]. V slots
+            # from ``value_v_slot_base`` (far from the Q/K gate slots).
+            v: list = []
+            o: list = []
+            vb = spec.value_v_slot_base
+            for j in range(half):
+                v.append(AP(vb + j, src_lo + j, 1.0))
+                o.append(AO(band + j, vb + j, spec.value_o_write_scale))
+            for j in range(half):
+                v.append(AP(vb + half + j, src_hi + j, 1.0))
+                o.append(AO(band + half + j, vb + half + j,
+                            spec.value_o_write_scale))
+
+            return DeclarativeAttentionHeadSpec(
+                head_idx=head_idx,
+                q=tuple(q),
+                k=tuple(k),
+                v=tuple(v),
+                o=tuple(o),
+                alibi_slope=spec.carry_head_alibi_slope,
+            )
+
+    # (3) Dump rules builder — the GATE lives here. Two modes:
+    #       * explicit-dump (AX/STACK0): per-block per-cell gate-copy from
+    #         ``dump_blocks`` (emission_on) / ``dump_blocks_off`` (off — the
+    #         repoint-vs-inert flip; the band stays present so the off build is
+    #         NOT zero-rule but writes the inert DUMP band, byte-identical to the
+    #         hand-built flag-off);
+    #       * BP per-byte LO/HI (layout): per byte k, per band cell j the
+    #         ``emit_band[j] = band[j]`` gate-copy; off => zero rules (the band is
+    #         OMITTED from the layout, so the op is inert).
+    if spec.explicit_dump:
+        def dump_rules_builder(emission_on: bool) -> Tuple[FFNRule, ...]:
+            blocks = spec.dump_blocks if emission_on else spec.dump_blocks_off
+            if callable(blocks):
+                blocks = blocks()
+            if not blocks:
+                return ()
+            return _expand_dump_blocks(blocks)
+    else:
+        if spec.dump_threshold is not None:
+            threshold = spec.dump_threshold
+        else:
+            threshold = spec.dump_opent_floor + spec.dump_per_byte_marker_weight
+
+        def dump_rules_builder(emission_on: bool) -> Tuple[FFNRule, ...]:
+            if not emission_on:
+                return ()
+            rules: list[FFNRule] = []
+            for kk in range(spec.carry_byte_count):
+                conditions = tuple(spec.dump_gate_conditions) + (
+                    (f"{spec.dump_per_byte_marker}{kk}",
+                     spec.dump_per_byte_marker_weight),
+                ) + tuple(spec.dump_marker_blockers)
+                for nib in range(half):
+                    rules.append(multi_way_and_rule(
+                        name=f"{spec.name}_val{kk}_lo_{nib}",
+                        conditions=conditions,
+                        threshold=threshold,
+                        gate=f"{spec.band_name}+{nib}",
+                        writes=((f"{spec.dump_emit_lo}+{nib}",
+                                 spec.dump_write_scale),),
+                    ))
+                for nib in range(half):
+                    rules.append(multi_way_and_rule(
+                        name=f"{spec.name}_val{kk}_hi_{nib}",
+                        conditions=conditions,
+                        threshold=threshold,
+                        gate=f"{spec.band_name}+{half + nib}",
+                        writes=((f"{spec.dump_emit_hi}+{nib}",
+                                 spec.dump_write_scale),),
+                    ))
+            return tuple(rules)
+
+    # (4) Reads/writes dim sets (flag-on). Explicit mode declares them verbatim
+    #     on the spec; BP mode derives them structurally.
+    if spec.explicit_head:
+        carry_head_reads = set(spec.head_reads or ())
+        carry_head_writes = set(spec.head_writes or ())
+    else:
+        carry_head_reads = set()
         for kk in range(spec.carry_byte_count):
-            conditions = tuple(spec.dump_gate_conditions) + (
-                (f"{spec.dump_per_byte_marker}{kk}",
-                 spec.dump_per_byte_marker_weight),
-            ) + tuple(spec.dump_marker_blockers)
-            for nib in range(half):
-                rules.append(multi_way_and_rule(
-                    name=f"{spec.name}_val{kk}_lo_{nib}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=f"{spec.band_name}+{nib}",
-                    writes=((f"{spec.dump_emit_lo}+{nib}",
-                             spec.dump_write_scale),),
-                ))
-            for nib in range(half):
-                rules.append(multi_way_and_rule(
-                    name=f"{spec.name}_val{kk}_hi_{nib}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=f"{spec.band_name}+{half + nib}",
-                    writes=((f"{spec.dump_emit_hi}+{nib}",
-                             spec.dump_write_scale),),
-                ))
-        return tuple(rules)
+            carry_head_reads.add(f"{spec.match_q_band}{kk}")
+            carry_head_reads.add(f"{spec.match_k_band}{kk}")
+        for (_slot, dim_name, _w) in spec.k_prefer:
+            carry_head_reads.add(dim_name)
+        for (_slot, dim_name, _w) in spec.k_reject:
+            carry_head_reads.add(dim_name)
+        carry_head_reads.add(spec.const_dim)
+        carry_head_reads.add(spec.value_src_lo)
+        carry_head_reads.add(spec.value_src_hi)
+        carry_head_reads.add(f"{spec.value_src_lo}.*.-1")
+        carry_head_reads.add(f"{spec.value_src_hi}.*.-1")
+        carry_head_reads.update(spec.carry_head_extra_reads)
+        carry_head_writes = {spec.band_name}
 
-    # Reads/writes dim sets (flag-on). Derived structurally from the spec so
-    # the op factory can declare them.
-    carry_head_reads: Set[str] = set()
-    for kk in range(spec.carry_byte_count):
-        carry_head_reads.add(f"{spec.match_q_band}{kk}")
-        carry_head_reads.add(f"{spec.match_k_band}{kk}")
-    for (_slot, dim_name, _w) in spec.k_prefer:
-        carry_head_reads.add(dim_name)
-    for (_slot, dim_name, _w) in spec.k_reject:
-        carry_head_reads.add(dim_name)
-    carry_head_reads.add(spec.const_dim)
-    carry_head_reads.add(spec.value_src_lo)
-    carry_head_reads.add(spec.value_src_hi)
-    carry_head_reads.add(f"{spec.value_src_lo}.*.-1")
-    carry_head_reads.add(f"{spec.value_src_hi}.*.-1")
-    carry_head_reads.update(spec.carry_head_extra_reads)
-    carry_head_writes: Set[str] = {spec.band_name}
+    if spec.explicit_dump:
+        dump_reads = set(spec.dump_reads_explicit or ())
+        dump_writes = set(spec.dump_writes_explicit or ())
+    else:
+        dump_reads = set()
+        for (dim_name, _w) in spec.dump_gate_conditions:
+            dump_reads.add(dim_name)
+        for kk in range(spec.carry_byte_count):
+            dump_reads.add(f"{spec.dump_per_byte_marker}{kk}")
+        for (dim_name, _w) in spec.dump_marker_blockers:
+            dump_reads.add(dim_name)
+        dump_reads.add(spec.band_name)
+        dump_writes = {spec.dump_emit_lo, spec.dump_emit_hi, spec.band_name}
 
-    dump_reads: Set[str] = set()
-    for (dim_name, _w) in spec.dump_gate_conditions:
-        dump_reads.add(dim_name)
-    for kk in range(spec.carry_byte_count):
-        dump_reads.add(f"{spec.dump_per_byte_marker}{kk}")
-    for (dim_name, _w) in spec.dump_marker_blockers:
-        dump_reads.add(dim_name)
-    dump_reads.add(spec.band_name)
-    dump_writes: Set[str] = {spec.dump_emit_lo, spec.dump_emit_hi, spec.band_name}
+    # (5) Precursor flag ops builder — the two-stage KILL + STACK0 bounded gate
+    #     flags. Each is a standalone bounded-flag FFN with a mixed dim_map; the
+    #     generator owns the bake scaffolding (``make_mixed_dim_map_ffn_op``).
+    def precursor_ops_builder() -> Tuple[object, ...]:
+        return tuple(
+            make_mixed_dim_map_ffn_op(p, position_source=spec.position_source)
+            for p in spec.precursors
+        )
 
     return CrossStepCarryBundle(
         spec=spec,
@@ -407,6 +915,7 @@ def cross_step_carry(spec: CrossStepCarrySpec) -> CrossStepCarryBundle:
         carry_head_writes=carry_head_writes,
         dump_reads=dump_reads,
         dump_writes=dump_writes,
+        precursor_ops_builder=precursor_ops_builder,
     )
 
 
