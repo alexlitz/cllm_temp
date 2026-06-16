@@ -2179,6 +2179,16 @@ def compile_full_vm_dynamic(
             "C4_STACK0_B0_DUMP": (
                 os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
             ),
+            # Consumer-opcode LOOKAHEAD (#221; DEFAULT-OFF, opt in =1): adds the
+            # PC+8 chain + lookahead fetch head + arith-decode flag bands
+            # (LOOKAHEAD_PC/NEXT_OPCODE/STACK0_B0_NEXT_ARITH) AND the dump's
+            # -NEXT_ARITH blocker (output-affecting on arith-consumer operand
+            # frames). On / off builds must NEVER share a memo / disk entry --
+            # the band presence changes d_model and the dump gate changes
+            # emission, so this flag toggles geometry AND output.
+            "C4_STACK0_NEXT_ARITH": (
+                os.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0"
+            ),
             # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
             # opt in with =1): adds a NOT-blocker condition to
             # l16_ent_frame_sp_byte1_ff (output-affecting), so the ON / OFF builds

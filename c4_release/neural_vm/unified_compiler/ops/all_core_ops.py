@@ -126,6 +126,20 @@ def all_core_ops(
         make_layer4_sp_to_addr_key_op(enable=False),
         make_layer5_fetch_op(),
         make_layer5_fetch_dep_anchor_op(),
+        # Consumer-opcode LOOKAHEAD (#221 framing-drift fix; flag-gated
+        # C4_STACK0_NEXT_ARITH, DEFAULT-OFF). The C4_STACK0_B0_DUMP over-fires
+        # on arithmetic-intermediate operand frames (expr a*b/c) but is needed
+        # on comparison-result frames (if/bool). The only separator is the
+        # CONSUMER opcode (the next instruction), causally unavailable at the
+        # operand frame -- but the single-slot C4 ISA puts it at a fixed PC+8 in
+        # program memory. (1) build PC+8, (2) fetch op2's opcode byte by
+        # ADDR_KEY content-match, (3) decode "arith consumer" -> a bounded flag
+        # the dump reads as a blocker so it skips arith-consumer operand frames
+        # (fresh value survives) while keeping the +27 on cmp/branch frames.
+        # See l5_ops.make_lookahead_pc8_chain_op / _opcode_fetch / _next_arith.
+        make_lookahead_pc8_chain_op(),
+        make_lookahead_opcode_fetch_op(),
+        make_next_arith_flag_op(),
         # V9 GETCHAR neural read scaffolding (BLOG_SPEC.md:851).
         # Phase 1: registered but disabled (enable=False). The runner-side
         # _inject_getchar shim still owns byte transfer until phase 2

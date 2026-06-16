@@ -9,6 +9,66 @@ from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, _opcode_name_map
+from .residual_band_registry import register_residual_band
+
+
+# ---------------------------------------------------------------------------
+# Consumer-opcode LOOKAHEAD bands (#221 framing-drift fix).
+# ---------------------------------------------------------------------------
+# The C4_STACK0_B0_DUMP over-fires on arithmetic-INTERMEDIATE operand frames
+# (expr ``a*b/c`` etc.) where the STACK0 frame the 2nd op will consume must NOT
+# be dumped, but it is NEEDED on comparison-result frames (if/bool). The two
+# frames are batched-identical in every CURRENT residual band; the ONLY
+# separator is the CONSUMER opcode (the NEXT instruction), which is causally
+# UNAVAILABLE at the operand frame within a single forward pass (attention is
+# causal; the consumer is a future position). But the C4 ISA is single-slot
+# (each instruction is one 8-byte slot ``op + (imm<<8)``; PC_OFFSET=2 -> PC is
+# the first immediate byte), so the NEXT instruction sits at a FIXED byte
+# offset PC+8 in program memory, which the L5 fetch heads ALREADY read by
+# ADDR_KEY content-match. This feature mirrors that fetch but offset by +8: it
+# builds the PC+8 address, fetches op2's opcode byte, decodes "consumer is
+# arithmetic", carries that as a bounded flag, and gates the dump OFF on
+# arith-consumer frames (so the fresh intermediate value emits) while keeping
+# the +27 dump on comparison-consumer frames byte-identically.
+#
+# All three bands are flag-gated (``C4_STACK0_NEXT_ARITH``): flag-off omits
+# them entirely (smaller d_model, byte-identical pre-feature build). They keep
+# private liveness slots (``never_share=True``): the PC+8 / opcode / flag bands
+# hold per-step lookahead state that must not be clobbered by a same-width
+# liveness donor.
+def _stack0_next_arith_enabled() -> bool:
+    """``C4_STACK0_NEXT_ARITH`` flag predicate.
+
+    Gates the WHOLE consumer-opcode lookahead feature (#221): the PC+8 chain,
+    the lookahead fetch head, the arith-decode flag FFN, AND the dump's
+    ``-NEXT_ARITH`` blocker. Flag-off (the default until the feature is
+    validated) omits the three bands entirely (byte-identical pre-feature
+    d_model) and bakes the ops as no-ops. Evaluated lazily (compile time) so a
+    per-process env flip is honoured and the cache key reflects it.
+    """
+    return os.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0"
+
+
+register_residual_band(
+    "LOOKAHEAD_PC_LO", 16, owner="make_lookahead_pc8_chain_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
+register_residual_band(
+    "LOOKAHEAD_PC_HI", 16, owner="make_lookahead_pc8_chain_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
+register_residual_band(
+    "NEXT_OPCODE_LO", 16, owner="make_lookahead_opcode_fetch_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
+register_residual_band(
+    "NEXT_OPCODE_HI", 16, owner="make_lookahead_opcode_fetch_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
+register_residual_band(
+    "STACK0_B0_NEXT_ARITH", 1, owner="make_next_arith_flag_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
 
 
 def _nested_jsr_pc_fix_enabled() -> bool:
@@ -1031,4 +1091,323 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         # lowering uses a monotonic cursor independent of the layer max so
         # byte-identity is preserved.
         ffn_units_used=_l5_ffn_total_units(),
+    )
+
+
+# ===========================================================================
+# Consumer-opcode LOOKAHEAD ops (#221 framing-drift fix). Flag-gated
+# (``C4_STACK0_NEXT_ARITH``, DEFAULT-OFF until validated). Three ops:
+#
+#   (1) make_lookahead_pc8_chain_op   -- FFN: build PC+8 nibbles (the NEXT
+#       instruction's byte-address) from EMBED_LO/HI at the AX marker, via the
+#       declarative nibble_rotation_chain (offset=8, with carry).
+#   (2) make_lookahead_opcode_fetch_op -- attn head: content-match the PC+8
+#       address against the immutable per-CODE-position ADDR_KEY and copy that
+#       CODE position's CLEAN_EMBED (the opcode byte nibbles) into
+#       NEXT_OPCODE_LO/HI. Mirrors the L5 ``layer5_fetch`` head 1.
+#   (3) make_next_arith_flag_op       -- FFN: decode "consumer is an arithmetic
+#       op (OR/XOR/AND/SHL/SHR/ADD/SUB/MUL/DIV/MOD)" from NEXT_OPCODE_LO/HI ->
+#       the bounded ``STACK0_B0_NEXT_ARITH`` flag (1 dim). The dump's re-point
+#       reads this as a hard blocker so on an arith-consumer operand frame the
+#       dump does NOT fire (the fresh intermediate value emits, like the
+#       DUMP-OFF build) while comparison/branch-consumer frames keep the +27.
+# ===========================================================================
+from ...constants import INSTR_WIDTH as _INSTR_WIDTH
+
+
+def _lookahead_pc8_rules(S: float) -> tuple[FFNRule, ...]:
+    """PC+INSTR_WIDTH chain at MARK_AX: EMBED -> LOOKAHEAD_PC (offset=8 carry).
+
+    The C4 ISA is single-slot (each instruction is one ``INSTR_WIDTH``-byte
+    slot), so the NEXT instruction's byte-address is exactly ``PC + 8``. We
+    reuse the declarative ``_nibble_rotation_chain_rules`` (the same one L4 uses
+    for PC+1/+2/+3/+4) with offset=8: ``32 + 32*8 = 288`` units. Gated on
+    MARK_AX (the relayed-PC row, where EMBED holds the current PC).
+    """
+    from .l4_ops import _nibble_rotation_chain_rules
+    assert _INSTR_WIDTH == 8, (
+        f"lookahead PC+8 chain assumes INSTR_WIDTH==8 (got {_INSTR_WIDTH})"
+    )
+    return _nibble_rotation_chain_rules(
+        name_prefix="lookahead_pc8_ax",
+        gate_marker_name="MARK_AX",
+        source_lo_name="EMBED_LO", source_lo_offset=0,
+        source_hi_name="EMBED_HI", source_hi_offset=0,
+        target_lo_name="LOOKAHEAD_PC_LO", target_lo_offset=0,
+        target_hi_name="LOOKAHEAD_PC_HI", target_hi_offset=0,
+        offset=8, with_carry=True, S=S, magnitude=2.0,
+        scope="MARK_AX",
+    )
+
+
+_LOOKAHEAD_PC8_HIDDEN_DIM = 32 + 32 * 8  # offset=8, with carry
+
+
+def make_lookahead_pc8_chain_op() -> Operation:
+    """FFN: build the PC+8 (next-instruction) byte-address nibbles at MARK_AX.
+
+    Standalone ``PureFFN`` post_op bound to the L4 PC-relay block (where EMBED
+    holds the relayed current PC). Writes ``LOOKAHEAD_PC_{LO,HI}`` (a fresh band
+    nothing else writes) so the lookahead fetch head can content-match it
+    against ADDR_KEY. No-op when ``C4_STACK0_NEXT_ARITH`` is off (the band is
+    not collected, the bake returns early -> byte-identical).
+    """
+    enabled = _stack0_next_arith_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        from ...base_layers import PureFFN
+        rules = _lookahead_pc8_rules(S)
+        assert len(rules) == _LOOKAHEAD_PC8_HIDDEN_DIM, (
+            f"lookahead_pc8 rule-count drift: {len(rules)} != "
+            f"{_LOOKAHEAD_PC8_HIDDEN_DIM}"
+        )
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None and hasattr(attn, "W_q"):
+            try:
+                d_model = attn.W_q.shape[0]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            d_model = max(int(v) for v in dim_positions.values()) + 1
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        # Resolve EVERY dim from the BUILT ``dim_positions`` (the widened layout).
+        # The static registry MISMAPS EMBED_LO/HI (registry 142 vs built 37), so
+        # a registry read fetches garbage -> the chain produces nothing.
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    return Operation(
+        name="lookahead_pc8_chain",
+        reads={"MARK_AX", "EMBED_LO", "EMBED_HI"} if enabled else set(),
+        writes={"LOOKAHEAD_PC_LO", "LOOKAHEAD_PC_HI"} if enabled else set(),
+        kind="block",
+        # Host on the L4 FFN block (physical block right after the PC relay)
+        # via declarative_bake_fn (post_op append). NO compiler_ir -> the op is
+        # NOT dep-scheduled into ops_per_layer; it bakes purely as a post_op on
+        # the resolved target block, so its physical placement is deterministic.
+        target_op_name="_layer4_ffn_dep_anchor",
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
+    )
+
+
+def _lookahead_opcode_fetch_head_spec(
+    dim_positions: dict, head_idx: int,
+) -> DeclarativeAttentionHeadSpec:
+    """Lookahead fetch head: Q=PC+8 address, K=ADDR_KEY, V=CLEAN_EMBED.
+
+    Mirrors ``_layer5_fetch_head_specs`` head 1 (non-first-step opcode fetch at
+    AX) but the Q address is ``LOOKAHEAD_PC`` (PC+8) instead of the current PC
+    (EMBED). The matched CODE position is op2's slot; its CLEAN_EMBED nibbles
+    (the opcode byte) are copied into ``NEXT_OPCODE_{LO,HI}``. Gated on MARK_AX
+    so it fires only on the relayed-PC AX rows (one fetch per step).
+    """
+    # Resolve EVERY dim from the BUILT ``dim_positions`` (the widened layout).
+    # The static registry mismaps several bands (e.g. EMBED/CLEAN_EMBED), so the
+    # fetch head must read the address/code/marker dims at their built indices.
+    def _P(name: str) -> int:
+        return int(dim_positions[name])
+
+    ADDR_KEY = _P("ADDR_KEY")
+    CLEAN_EMBED_LO = _P("CLEAN_EMBED_LO")
+    CLEAN_EMBED_HI = _P("CLEAN_EMBED_HI")
+    MARK_AX = _P("MARK_AX")
+    CONST = _P("CONST")
+    HAS_SE = _P("HAS_SE")
+    la_lo = int(dim_positions["LOOKAHEAD_PC_LO"])
+    la_hi = int(dim_positions["LOOKAHEAD_PC_HI"])
+    next_lo = int(dim_positions["NEXT_OPCODE_LO"])
+    next_hi = int(dim_positions["NEXT_OPCODE_HI"])
+
+    ADDR_L = 20.0
+    L = 20.0
+    TOP = 35
+    # Q: PC+8 address nibbles (lo at slots 0..15, hi at 16..31). The
+    # current-instruction fetch uses a 48-bit key (lo/hi/top); the lookahead
+    # only needs lo+hi (instruction addresses fit two nibble pairs for the
+    # corpus) and a CONST top-nibble match so the top group is non-discriminating.
+    q = (
+        tuple(AP(k, la_lo + k, ADDR_L) for k in range(16))
+        + tuple(AP(16 + k, la_hi + k, ADDR_L) for k in range(16))
+        + (AP(32, MARK_AX, L),)
+        + (AP(TOP, CONST, ADDR_L),)  # top nibble == 0 for corpus PCs
+        # MARK_AX Q-gate (mirror ax_gate slot 33) + HAS_SE gate (slot 34).
+        + (AP(33, MARK_AX, 500.0), AP(33, CONST, -500.0))
+        + (AP(34, HAS_SE, 500.0), AP(34, CONST, -500.0))
+    )
+    k = (
+        tuple(AP(k_, ADDR_KEY + k_, ADDR_L) for k_ in range(16))
+        + tuple(AP(16 + k_, ADDR_KEY + 16 + k_, ADDR_L) for k_ in range(16))
+        + (AP(TOP, ADDR_KEY + 32, ADDR_L),)  # K top nibble 0 slot
+        + (AP(33, MARK_AX, 500.0), AP(33, CONST, -500.0))
+        + (AP(34, CONST, 5.0),)
+    )
+    v = (
+        tuple(AP(32 + k_, CLEAN_EMBED_LO + k_, 1.0) for k_ in range(16))
+        + tuple(AP(48 + k_, CLEAN_EMBED_HI + k_, 1.0) for k_ in range(16))
+    )
+    o = (
+        tuple(AO(next_lo + k_, 32 + k_, 1.0) for k_ in range(16))
+        + tuple(AO(next_hi + k_, 48 + k_, 1.0) for k_ in range(16))
+    )
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx, q=q, k=k, v=v, o=o, alibi_slope=0.0,
+    )
+
+
+_LOOKAHEAD_FETCH_HEAD_IDX = 6  # free on L5 (heads 0..5 used by layer5_fetch)
+
+
+def _allocate_lookahead_fetch_heads() -> "AttentionHeadAllocator":
+    from ...attention_head_allocator import AttentionHeadAllocator
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    allocator.alloc("lookahead_opcode_fetch.head_6", layer_idx=5,
+                    pin=_LOOKAHEAD_FETCH_HEAD_IDX)
+    return allocator
+
+
+def make_lookahead_opcode_fetch_op() -> Operation:
+    """L5 attn head 6: fetch op2's opcode byte (at PC+8) into NEXT_OPCODE_{LO,HI}.
+
+    Content-matches the ``LOOKAHEAD_PC`` (PC+8) address against the immutable
+    per-CODE-position ADDR_KEY and copies that slot's CLEAN_EMBED (opcode byte
+    nibbles) into the lookahead bands. Hosted on the L5 fetch block (head 6 is
+    free in the pre-widen band) so it sees the same ADDR_KEY/CLEAN_EMBED code
+    rows the production fetch uses. No-op when the flag is off.
+    """
+    enabled = _stack0_next_arith_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        attn = block.attn
+        allocator = _allocate_lookahead_fetch_heads()
+        attn._l5_lookahead_fetch_head_allocator = allocator
+        head_idx = allocator.heads()[-1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec = _lookahead_opcode_fetch_head_spec(dim_positions, head_idx)
+        Primitives.generate_attention_head(attn, spec, HD)
+
+    return Operation(
+        name="lookahead_opcode_fetch",
+        reads=({"MARK_AX", "CONST", "HAS_SE", "ADDR_KEY",
+                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+                "LOOKAHEAD_PC_LO", "LOOKAHEAD_PC_HI"} if enabled else set()),
+        writes={"NEXT_OPCODE_LO", "NEXT_OPCODE_HI"} if enabled else set(),
+        kind="block",
+        # Host on the L5 fetch block via declarative_bake_fn (generate the head
+        # on block.attn). NO compiler_ir_factory -> NOT dep-scheduled into a
+        # separate (mis-placed) layer; bakes onto the resolved L5 block where the
+        # production fetch heads live and ADDR_KEY/CLEAN_EMBED code rows are read.
+        target_op_name="_layer5_fetch_dep_anchor",
+        requires={"after": "lookahead_pc8_chain"} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
+    )
+
+
+# Arithmetic consumer opcodes whose presence at PC+8 means the operand frame is
+# an arithmetic INTERMEDIATE (the dump must NOT fire). (lo, hi) nibble pairs
+# from the L5 opcode-decode table. EXCLUDES comparisons (EQ..GE) and branches.
+_NEXT_ARITH_OPCODES = (
+    ("OR", 14, 0), ("XOR", 15, 0),
+    ("AND", 0, 1), ("SHL", 7, 1), ("SHR", 8, 1),
+    ("ADD", 9, 1), ("SUB", 10, 1), ("MUL", 11, 1),
+    ("DIV", 12, 1), ("MOD", 13, 1),
+)
+_NEXT_ARITH_FLAG_HIDDEN_DIM = len(_NEXT_ARITH_OPCODES)
+
+
+def _next_arith_flag_rules() -> tuple[FFNRule, ...]:
+    """10-rule OR: ``STACK0_B0_NEXT_ARITH`` = 1 iff the fetched NEXT opcode byte
+    decodes to an arithmetic op (OR/XOR/AND/SHL/SHR/ADD/SUB/MUL/DIV/MOD).
+
+    Reads the fetched ``NEXT_OPCODE_{LO,HI}`` one-hot nibbles. Each rule is the
+    same two-nibble AND the L5 opcode decode uses, writing 1.0 (bounded). The
+    flag persists (nothing else writes it) to the L25 tail dump.
+    """
+    rules: list[FFNRule] = []
+    for name, lo, hi in _NEXT_ARITH_OPCODES:
+        rules.append(multi_way_and_rule(
+            name=f"next_arith_{name.lower()}",
+            conditions=(
+                (f"NEXT_OPCODE_LO+{lo}", 1.0),
+                (f"NEXT_OPCODE_HI+{hi}", 1.0),
+            ),
+            threshold=1.5,
+            writes=(("STACK0_B0_NEXT_ARITH", 1.0),),
+        ))
+    return tuple(rules)
+
+
+def make_next_arith_flag_op() -> Operation:
+    """FFN: decode the bounded ``STACK0_B0_NEXT_ARITH`` consumer flag.
+
+    Standalone ``PureFFN`` post_op bound to the L6 attn block (after the L5
+    lookahead fetch populated NEXT_OPCODE). Writes the flag so the L25-tail dump
+    re-point can read it as a hard blocker. No-op when the flag is off.
+    """
+    enabled = _stack0_next_arith_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        from ...base_layers import PureFFN
+        rules = _next_arith_flag_rules()
+        assert len(rules) == _NEXT_ARITH_FLAG_HIDDEN_DIM
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None and hasattr(attn, "W_q"):
+            try:
+                d_model = attn.W_q.shape[0]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            d_model = max(int(v) for v in dim_positions.values()) + 1
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        _bands = {"NEXT_OPCODE_LO", "NEXT_OPCODE_HI", "STACK0_B0_NEXT_ARITH"}
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            assert _base in _bands, f"unexpected dim {_base} in next_arith"
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    return Operation(
+        name="next_arith_flag",
+        reads={"NEXT_OPCODE_LO", "NEXT_OPCODE_HI"} if enabled else set(),
+        writes={"STACK0_B0_NEXT_ARITH"} if enabled else set(),
+        kind="block",
+        # Host on the L6 attn block (post_op) -- runs AFTER the L5 lookahead
+        # fetch wrote NEXT_OPCODE. NO compiler_ir -> post_op-only placement.
+        target_op_name="_layer6_attn_dep_anchor",
+        requires={"after": "lookahead_opcode_fetch"} if enabled else {},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
     )
