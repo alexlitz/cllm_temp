@@ -9,7 +9,7 @@ from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, no_stack0_emit_enabled
 
 
 # === L8 attention head layout (auto-fit; legacy head_idx as docs) ====
@@ -2653,6 +2653,16 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # stack byte 1 available at the marker before the shift pipeline runs.
         # Stage the historical MEM value byte 1 into AX_FULL_* at the AX
         # marker. GE conversion consumes AX_FULL_* as operand-A positions 2/3.
+        #
+        # ONLY needed when the STACK0 emission is dropped (C4_NO_STACK0_EMIT):
+        # in the 35-token build the wide-ALU byte-1 path already reads stack
+        # byte 1 from the emitted STACK0 byte-1 token, so this memory-sourced
+        # AX_FULL write would DOUBLE-WRITE / conflict with that path and
+        # corrupts SHL/SHR/MUL/16-bit (observed Step A: operand flag ON but
+        # STACK0 still emitted). Gate head 7 on no_stack0_emit so it only
+        # supplies byte-1 from memory when the emitted token is gone.
+        if not no_stack0_emit_enabled():
+            return
         head = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_7"]
         base = head * HD
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
