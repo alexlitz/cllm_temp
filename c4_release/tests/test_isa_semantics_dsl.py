@@ -749,6 +749,90 @@ def test_full_width_byte_emission_dump_gate_blocks_when_off():
     assert all(abs(v) < 1e-2 for v in out)
 
 
+def test_full_width_byte_emission_nibble_source_count_and_band():
+    """Nibble-pair source with offset 2: nibbles capped at 13 (16-2-1) so
+    nibble+2 stays in-band. v=16..255 with lo,hi in 0..13 (hi>=1) => 14*13=182
+    fill rules; each writes band+v."""
+    bundle = full_width_byte_emission(
+        _fwbe_spec(name="fwbe_n", band_name="FWBE_N_WIDE",
+                   dump_nibble_lo="NLO", dump_nibble_hi="NHI",
+                   dump_nibble_lo_offset=2, dump_nibble_hi_offset=2,
+                   dump_gate_conditions=(("IS_BYTE", 1.0),),
+                   dump_threshold=2.5))
+    assert bundle.spec.effective_nibble_max == 13
+    rules = list(bundle.dump_rules_builder(True, {}))
+    assert len(rules) == 14 * 13  # lo 0..13 x hi 1..13
+    # rule for v writes band cell v.
+    by_v = {int(r.name.rsplit("_", 1)[1]): r for r in rules}
+    assert by_v[37].writes[0].dim.name == "FWBE_N_WIDE"
+    assert by_v[37].writes[0].dim.offset == 37
+    # 0xFF (nibble 15) is SKIPPED (overflow) -> no rule.
+    assert 255 not in by_v
+    assert 0xEE not in by_v  # nibble 14 also skipped
+    assert "NLO" in bundle.dump_reads and "NHI" in bundle.dump_reads
+
+
+def test_full_width_byte_emission_nibble_source_offset0_full_range():
+    """Offset 0 (cell == nibble) => no cap, all 240 values 16..255 emit a fill
+    rule (the AX_CARRY production config)."""
+    bundle = full_width_byte_emission(
+        _fwbe_spec(name="fwbe_o", band_name="FWBE_O_WIDE",
+                   dump_nibble_lo="NLO", dump_nibble_hi="NHI",
+                   dump_nibble_lo_offset=0, dump_nibble_hi_offset=0,
+                   dump_gate_conditions=(("IS_BYTE", 3.0),),
+                   dump_threshold=7.5))
+    assert bundle.spec.effective_nibble_max == 15
+    rules = list(bundle.dump_rules_builder(True, {}))
+    assert len(rules) == 240  # v=16..255 all present (16 lo x 15 hi)
+    by_v = {int(r.name.rsplit("_", 1)[1]): r for r in rules}
+    assert 255 in by_v  # 0xFF (nibble 15,15) NOW present (no overflow)
+    # rule 0xFF reads cells 15,15 (no offset)
+    conds = {(c.dim.name, c.dim.offset) for c in by_v[255].conditions}
+    assert ("NLO", 15) in conds and ("NHI", 15) in conds
+
+
+def test_full_width_byte_emission_nibble_source_reconstructs_value():
+    """The nibble pair (lo+off, hi+off) ADDITIVE-AND with the row gate fills
+    ONLY band cell v=hi*16+lo (the value-source re-point). The AND requires
+    BOTH nibble cells AND the row gate (IS_BYTE), with the threshold sized so a
+    missing nibble or a missing row gate sinks."""
+    bundle = full_width_byte_emission(
+        _fwbe_spec(name="fwbe_r", band_name="FWBE_R_WIDE",
+                   dump_nibble_lo="NLO", dump_nibble_hi="NHI",
+                   dump_nibble_lo_offset=2, dump_nibble_hi_offset=2,
+                   dump_nibble_lo_weight=1.0, dump_nibble_hi_weight=1.0,
+                   dump_gate_conditions=(("IS_BYTE", 3.0),),
+                   dump_threshold=7.5, dump_write_scale=5.0))
+    rules = list(bundle.dump_rules_builder(True, {}))
+    dp = {"NLO": 300, "NHI": 330, "FWBE_R_WIDE": 600, "IS_BYTE": 6}
+    ffn = _lowered_ffn_at_S(rules, dp, S=100.0)
+    # byte 0x25 = hi 2, lo 5 -> ALU cells lo+2=7, hi+2=4 (offset 2). With both
+    # nibble cells ~3 (sum 6) + IS_BYTE*3=3 => 9 > 7.5 -> ONLY cell 0x25=37.
+    state = {"NLO+7": 3.0, "NHI+4": 3.0, "IS_BYTE": 1.0}
+    out = _forward_band(ffn, dp, state, "FWBE_R_WIDE", 256)
+    assert out[37] > 1.0, out[37]
+    assert all(abs(out[j]) < 1e-1 for j in range(256) if j != 37)
+    # ONLY the lo nibble present (hi nibble absent) => 3 + 3 = 6 < 7.5 -> no fill.
+    out_lo_only = _forward_band(
+        ffn, dp, {"NLO+7": 3.0, "IS_BYTE": 1.0}, "FWBE_R_WIDE", 256)
+    assert all(abs(v) < 1e-1 for v in out_lo_only), max(out_lo_only)
+    # Row gate off (IS_BYTE absent, both nibbles present) => 3 + 3 = 6 < 7.5 ->
+    # no fill (the marker-row exclusion).
+    out_norow = _forward_band(
+        ffn, dp, {"NLO+7": 3.0, "NHI+4": 3.0}, "FWBE_R_WIDE", 256)
+    assert all(abs(v) < 1e-1 for v in out_norow), max(out_norow)
+
+
+def test_full_width_byte_emission_nibble_source_requires_both():
+    with pytest.raises(ValueError, match="BOTH"):
+        _fwbe_spec(dump_nibble_lo="NLO")  # hi missing
+    with pytest.raises(ValueError, match="even bit width"):
+        # odd bit width can't split into symmetric nibbles
+        FullWidthByteEmissionSpec(
+            name="x", band_name="X_WIDE", bits=7, emission_flag=_never,
+            dump_nibble_lo="NLO", dump_nibble_hi="NHI")
+
+
 def test_full_width_byte_emission_bad_bits_rejected():
     with pytest.raises(ValueError, match="bits must be"):
         _fwbe_spec(bits=0)

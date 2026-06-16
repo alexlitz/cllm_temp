@@ -791,6 +791,14 @@ def all_core_ops(
         # deferred IMM-decode relay plugs into to fix edge_literal / byte1 >= 16.
         # See model_ops.make_ax_byte1_full_width_emission_op.
         make_ax_byte1_full_width_emission_op(),
+        # AX byte-1 FULL-WIDTH band FILL (the value-source re-point FFN):
+        # reconstructs byte-1's full value (16-255) into AX_BYTE1_FULL_WIDE by
+        # AND-ing the ALU_LO/ALU_HI nibble pair at the byte-1 predictor row, so
+        # the un-aliased LM-head column emits the correct high byte (fixes
+        # edge_literal / IMM byte1 >= 16). L25-tail block FFN; gated by
+        # C4_AX_BYTE1_FULL_WIDTH (flag-off => zero rules => byte-identical).
+        # See model_ops.make_ax_byte1_full_width_fill_op.
+        make_ax_byte1_full_width_fill_op(),
         # STACK0 byte-0 DUMP emission columns (Root 2): mirrors the byte-value
         # H1/H3 one-hot columns onto STACK0_B0_DUMP_{H1,H3} so the LM head
         # re-emits the carried STACK0 byte-0 on carried steps. Phase=1002

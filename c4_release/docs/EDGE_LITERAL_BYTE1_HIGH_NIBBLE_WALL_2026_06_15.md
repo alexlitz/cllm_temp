@@ -127,3 +127,51 @@ dangerous here.
 - `tools/interp_oracle_gate.py --ids 1031-1045` — CPU diagnosis (the lane gate).
 - `tools/probe_hband_byte1_map.py` — LM-head H-band emission map (the mod-16 alias).
 - ad-hoc lo-matched band diff at the byte-1 predictor row (high nibble absent).
+
+---
+
+## RESOLVED (2026-06-16) — `full_width_byte_emission` + AX_CARRY value re-point
+
+**edge_literal 1031-1045 now PASS 15/15 with `C4_AX_BYTE1_FULL_WIDTH=1`.** The
+two-part build landed; flag default-OFF (the shipping build is byte-identical,
+hash `7474f269…`, smoke 51/0).
+
+### The "no value-faithful source" verdict was a STATIC-REGISTRY MISREAD
+The original "`OUTPUT_HI` / `AX_FULL_HI` / `AX_CARRY_HI` empty at every block"
+diff read the **static dim_registry positions** (`AX_CARRY_LO`=328). The
+flag-OFF build already repacks dims (the widen moves `AX_CARRY_LO` 328→362), so
+the static-328 probe read a **dead cell**. At the BUILT layout position
+(`compile_full_vm_dynamic()[1].dim_positions`, the memory note
+`feedback_probe_dims_use_built_layout_not_static_registry`) the source IS
+present: **`AX_CARRY_LO+lo` / `AX_CARRY_HI+hi` carry byte-1's nibbles
+value-faithfully (cell == nibble, NO offset)** at the byte-1 predictor row, on
+an IMM step. A clean nibble sweep 0..F confirms `AC_LO am == lo`, `AC_HI am ==
+hi` (`tools/probe_axcarry_byte1.py`, `tools/probe_byte1_builtscan.py`).
+
+### The fix (two coordinated halves, both in `full_width_byte_emission`)
+1. **Emission half** (the prior agent's `make_ax_byte1_full_width_emission_op`):
+   the 256-cell `AX_BYTE1_FULL_WIDE` band + un-aliased LM-head columns 16..255.
+2. **Value re-point** (this lane): `make_ax_byte1_full_width_fill_op` — an L25-
+   tail FFN whose 240 rules reconstruct byte-1 into the wide band by AND-ing the
+   `AX_CARRY_LO[lo]` + `AX_CARRY_HI[hi]` nibble pair, gated `OP_IMM` (IMM scope —
+   ADD/SUB hold the arithmetic CARRY here, NOT byte-1) + `IS_BYTE` + a hard
+   `NOT MARK_AX` blocker (marker+0 holds byte-0 at ~40). Generator extended with
+   a `dump_nibble_lo/hi(+offset/weight)` + `dump_nibble_max` nibble-pair source.
+
+### Gates (flag ON unless noted)
+- edge_literal 1031-1045 full_trace: **5/15 → 15/15**.
+- 1096 arith control ids 0-60: **54/61 unchanged** (no regression).
+- byte-identity flag-OFF == golden (whole-model hash test passes); smoke 51/0.
+
+### Remaining blocker for DEFAULT-ON: head-count width sensitivity
+The 256-cell band pushes d_model 1080→1336, and the head-dim-preserving
+auto-widen jumps **n_heads 10 → 13**. That head-count change perturbs the
+documented width-sensitive tail ops → **2 smoke fails flag-ON**
+(`test_mul_overflow` 500, `test_shl_8bit` 256 — both emit 0). This is the same
+MUL/L10-tail width wall (`project_l10_tail_bank_width_sensitive`,
+`project_mul_div_mod_arch_blocked`: "the 32-dim MUL_RESULT_HI family forces
+d_model up which ALONE regresses bnz"), NOT a fill bug (the fill is OP_IMM-gated
+and never fires on MUL/SHL). Making the feature default-ON needs a
+**head-count-stable band packing** (a narrower band, or packing into existing
+free dims without crossing the head-multiple) — a separate width-management
+effort. Until then the feature ships flag-OFF.

@@ -1024,12 +1024,55 @@ class FullWidthByteEmissionSpec:
     dump_threshold: Optional[float] = None
     dump_write_scale: float = 5.0
     band_owner: Optional[str] = None
+    # --- Nibble-pair source (the value carry re-point) ---------------------
+    #
+    # A flat ``dump_value_source`` one-hot does not always exist. The C4 byte
+    # value frequently lives as a NIBBLE PAIR — two 16-wide one-hots (a LOW
+    # nibble band + a HIGH nibble band), each optionally offset by a constant
+    # (e.g. the ALU_LO/ALU_HI byte-dump bands encode the byte's nibbles at
+    # cell ``nibble + 2``). When ``dump_nibble_lo`` AND ``dump_nibble_hi`` are
+    # set the dump fills ``band+v`` by AND-ing the two nibble cells of value v
+    # — ``{dump_nibble_lo}+{(v & (2**(bits//2) - 1)) + dump_nibble_lo_offset}``
+    # and ``{dump_nibble_hi}+{(v >> (bits//2)) + dump_nibble_hi_offset}`` —
+    # together with the row-selector ``dump_gate_conditions``. This is the
+    # value-source RE-POINT half of the edge_literal fix: the wide band is fed
+    # from the nibble pair that DOES carry the high byte at the consuming row,
+    # instead of a (nonexistent) flat one-hot. ``bits`` must be even (a
+    # symmetric lo/hi nibble split). Takes precedence over
+    # ``dump_value_source`` when both are set.
+    dump_nibble_lo: Optional[str] = None
+    dump_nibble_hi: Optional[str] = None
+    dump_nibble_lo_offset: int = 0
+    dump_nibble_hi_offset: int = 0
+    dump_nibble_lo_weight: float = 1.0
+    dump_nibble_hi_weight: float = 1.0
+    # Highest nibble value the source band faithfully distinguishes. An offset
+    # source band has only ``nibble_width - offset`` usable cells, so nibble
+    # values above ``nibble_width - offset - 1`` either overflow the band (read
+    # a NEIGHBOURING band's cell -> spurious cross-talk fills) or alias a lower
+    # nibble. The dump SKIPS any value whose lo OR hi nibble exceeds this cap
+    # (no faithful source -> no fill rule -> the H-band mod-16 path keeps owning
+    # it). ``None`` => derive ``nibble_width - max(lo_off, hi_off) - 1`` so the
+    # offset never overflows the band. (For the ALU byte-dump the firmware
+    # encoding ALSO collapses nibbles 14,15 onto cell 2, so the derived cap of
+    # 13 is exactly the faithful range.)
+    dump_nibble_max: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.bits <= 0 or self.bits > 16:
             raise ValueError(
                 f"FullWidthByteEmissionSpec({self.name!r}): bits must be in "
                 f"1..16, got {self.bits}"
+            )
+        if (self.dump_nibble_lo is None) != (self.dump_nibble_hi is None):
+            raise ValueError(
+                f"FullWidthByteEmissionSpec({self.name!r}): dump_nibble_lo "
+                "and dump_nibble_hi must BOTH be set or BOTH unset"
+            )
+        if self.dump_nibble_lo is not None and self.bits % 2 != 0:
+            raise ValueError(
+                f"FullWidthByteEmissionSpec({self.name!r}): nibble-pair source "
+                f"requires an even bit width (got bits={self.bits})"
             )
         if self.lo_value < 0:
             raise ValueError(
@@ -1045,6 +1088,28 @@ class FullWidthByteEmissionSpec:
     @property
     def band_width(self) -> int:
         return 1 << self.bits
+
+    @property
+    def nibble_width(self) -> int:
+        """Cell count of each nibble one-hot (``2**(bits/2)``)."""
+        return 1 << (self.bits // 2)
+
+    @property
+    def has_nibble_source(self) -> bool:
+        """True when the dump fills from a ``(lo, hi)`` nibble pair."""
+        return self.dump_nibble_lo is not None
+
+    @property
+    def effective_nibble_max(self) -> int:
+        """Highest nibble the offset source band reaches without overflow.
+
+        Explicit ``dump_nibble_max`` wins; else derive ``nibble_width -
+        max(offset) - 1`` so ``nibble + offset`` stays inside the band.
+        """
+        if self.dump_nibble_max is not None:
+            return int(self.dump_nibble_max)
+        max_off = max(self.dump_nibble_lo_offset, self.dump_nibble_hi_offset)
+        return self.nibble_width - max_off - 1
 
 
 @dataclass(frozen=True)
@@ -1138,13 +1203,72 @@ def full_width_byte_emission(
     else:
         threshold = 0.0
 
+    # Nibble-pair dump threshold: the AND is over JUST the two nibble cells
+    # (lo, hi); the row selector is a SEPARATE MULTIPLICATIVE gate (so the row
+    # marker's large magnitude does NOT swamp the additive nibble AND and make
+    # every value fire). The threshold sits between "one nibble present" and
+    # "both present": with nibble weight ``w`` and an active cell value ``a``,
+    # both-on ``= 2*w*a`` must clear and one-on ``= w*a (+ w*off)`` must sink.
+    # ``dump_threshold`` overrides; else use ``1.5 * w`` (the balanced-AND
+    # midpoint for two equal-weight conditions, which for a one-hot ``a~=1``
+    # clears on both-on=2w and sinks on one-on=w). For continuous sources the
+    # caller passes an explicit ``dump_threshold`` matched to the cell
+    # magnitude.
+    if spec.has_nibble_source:
+        if spec.dump_threshold is not None:
+            nib_threshold: Optional[float] = spec.dump_threshold
+        else:
+            _wl, _wh = spec.dump_nibble_lo_weight, spec.dump_nibble_hi_weight
+            _t = _wl + _wh
+            nib_threshold = (_t + (_t - max(_wl, _wh))) / 2.0
+        nib_w = spec.nibble_width
+
     def dump_rules_builder(
         emission_on: bool, dim_positions: Dict[str, int]
     ) -> Tuple[FFNRule, ...]:
         del dim_positions  # all dims resolve by name at lower time
-        if not emission_on or spec.dump_value_source is None:
+        if not emission_on:
             return ()
         rules: list[FFNRule] = []
+        if spec.has_nibble_source:
+            # Value v = hi*nib_w + lo. Fill band+v iff the LOW nibble cell
+            # (value lo) AND the HIGH nibble cell (value hi) AND the row gate
+            # are all active. Each nibble band cell carries its nibble at
+            # ``base + nibble + offset``. SKIP any value whose lo OR hi nibble
+            # exceeds the faithful range (``effective_nibble_max``): above it
+            # the offset cell overflows the band (reading a neighbouring band's
+            # cell => spurious cross-talk fills) — the H-band mod-16 path keeps
+            # owning those values.
+            nib_max = spec.effective_nibble_max
+            # The AND is over the two nibble cells PLUS the row-selector
+            # conditions, ALL ADDITIVE. ``dump_threshold`` is sized by the
+            # caller so the AND requires BOTH nibble cells (each ~``cell_on``):
+            # the threshold sits ABOVE "one nibble present + the full row gate"
+            # so the row marker's magnitude alone (or one nibble) can NOT clear
+            # it — only both nibbles + the row gate together. (A multiplicative
+            # gate was tried but silu is not sharp enough to floor the off-row
+            # contribution; an additive AND with a high threshold is sharper.)
+            row_conditions = tuple(spec.dump_gate_conditions)
+            for v in range(spec.lo_value, hi_value + 1):
+                lo = v % nib_w
+                hi = v // nib_w
+                if lo > nib_max or hi > nib_max:
+                    continue
+                conditions = (
+                    (f"{spec.dump_nibble_lo}+{lo + spec.dump_nibble_lo_offset}",
+                     spec.dump_nibble_lo_weight),
+                    (f"{spec.dump_nibble_hi}+{hi + spec.dump_nibble_hi_offset}",
+                     spec.dump_nibble_hi_weight),
+                ) + row_conditions
+                rules.append(multi_way_and_rule(
+                    name=f"{spec.name}_fill_{v}",
+                    conditions=conditions,
+                    threshold=nib_threshold,
+                    writes=((f"{spec.band_name}+{v}", spec.dump_write_scale),),
+                ))
+            return tuple(rules)
+        if spec.dump_value_source is None:
+            return ()
         conditions = tuple(spec.dump_gate_conditions)
         for v in range(spec.lo_value, hi_value + 1):
             if conditions:
@@ -1172,7 +1296,10 @@ def full_width_byte_emission(
     dump_reads: Set[str] = set()
     for (dim_name, _w) in spec.dump_gate_conditions:
         dump_reads.add(dim_name)
-    if spec.dump_value_source is not None:
+    if spec.has_nibble_source:
+        dump_reads.add(spec.dump_nibble_lo)
+        dump_reads.add(spec.dump_nibble_hi)
+    elif spec.dump_value_source is not None:
         dump_reads.add(spec.dump_value_source)
     dump_writes: Set[str] = {spec.band_name}
 

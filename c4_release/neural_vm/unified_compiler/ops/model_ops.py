@@ -2175,6 +2175,41 @@ def _ax_byte1_full_width_enabled() -> bool:
     return _os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
 
 
+# Value SOURCE for the wide band (the re-point, 2026-06-16): the byte-1
+# predictor row carries the IMM operand's byte-1 value VALUE-FAITHFULLY as a
+# NIBBLE PAIR in the AX_CARRY register bands — ``AX_CARRY_LO+lo`` (low nibble)
+# and ``AX_CARRY_HI+hi`` (high nibble), where lo/hi are byte-1's nibbles and the
+# cell == the nibble (NO offset). Confirmed spec_k=0 at the BUILT layout
+# position (tools/probe_axcarry_byte1.py + probe_byte1_builtscan.py): a clean
+# nibble sweep 0..7 maps AC_LO am==lo, AC_HI am==hi exactly. The wall doc
+# (EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15) "AX_CARRY_HI empty" verdict
+# was a STATIC-REGISTRY misread — the widen repack moves AX_CARRY_LO 328->362,
+# so the static-328 probe read a DEAD cell. At the BUILT position the source IS
+# present (the dim-repack trap, memory feedback_probe_dims_use_built_layout).
+#
+# AX_CARRY at the byte-1 row is byte-1 ONLY on an IMM step. For an ADD/SUB it
+# holds the arithmetic CARRY (NOT byte-1) and for some operands that carry is a
+# non-zero high nibble -> a spurious >=16 emission (verified: ADD 464+650 emitted
+# 0x2600). So the fill MUST be hard-gated on ``OP_IMM`` (=5.0 at the IMM byte-1
+# row, 0 on ADD/SUB; probe_axcarry_byte1.py + the OP_IMM check). Row gate:
+# ``OP_IMM`` (IMM scope) + ``IS_BYTE`` + a hard ``MARK_AX`` blocker (excludes the
+# AX-marker row marker+0, whose AX_CARRY holds byte-0 at ~40 and would otherwise
+# swamp IS_BYTE). marker+2/+3 carry byte=0 -> no >=16 column -> harmless.
+_AX_CARRY_NIBBLE_OFFSET = 0     # AX_CARRY encodes nibble n at cell n (no offset)
+# Additive AND over [AX_CARRY_LO[lo], AX_CARRY_HI[hi], IS_BYTE, OP_IMM,
+# NOT MARK_AX]. At the IMM byte-1 row: AC cells ~3.0, IS_BYTE=1, OP_IMM=5,
+# MARK_AX=0. OP_IMM (weight 1 -> ~5) is NECESSARY: the threshold (11) is above
+# everything reachable WITHOUT it, so ADD/SUB (OP_IMM=0) can never fire.
+#   IMM correct (both nibbles + IS_BYTE + OP_IMM): 3 + 3 + 1 + 5 = 12  -> clears
+#   IMM missing one nibble:                      ~0.5 + 3 + 1 + 5 = 9.5 -> sinks
+#   ADD byte-1 (no OP_IMM, AC=carry):           up to 3+3+1+0     = 7   -> sinks
+#   marker+0 (MARK_AX=1):                          .. - 1000 << 0       -> sinks
+_AX_B1_FW_NIB_W = 1.0
+_AX_B1_FW_ISBYTE_W = 1.0
+_AX_B1_FW_OPIMM_W = 1.0
+_AX_B1_FW_MARK_AX_BLOCK = 1000.0
+_AX_B1_FW_THRESHOLD = 11.0
+
 _AX_BYTE1_FULL_WIDTH_EMISSION = full_width_byte_emission(
     FullWidthByteEmissionSpec(
         name="ax_byte1_full_width",
@@ -2183,6 +2218,31 @@ _AX_BYTE1_FULL_WIDTH_EMISSION = full_width_byte_emission(
         head_scale=5.0,          # mirror the H-band +5.0 emission columns
         lo_value=16,             # 0..15 already emit via the H-band columns
         emission_flag=_ax_byte1_full_width_enabled,
+        # Value-source RE-POINT: fill band+v from the AX_CARRY nibble pair at the
+        # byte-1 predictor row (the IMM operand's byte-1, value-faithful, cell ==
+        # nibble), gated on the byte-1 row.
+        dump_nibble_lo="AX_CARRY_LO",
+        dump_nibble_hi="AX_CARRY_HI",
+        dump_nibble_lo_offset=_AX_CARRY_NIBBLE_OFFSET,
+        dump_nibble_hi_offset=_AX_CARRY_NIBBLE_OFFSET,
+        dump_nibble_lo_weight=_AX_B1_FW_NIB_W,
+        dump_nibble_hi_weight=_AX_B1_FW_NIB_W,
+        # Offset 0 -> all 16 nibbles fit the 16-cell band (no overflow / cap).
+        dump_nibble_max=15,
+        # Row selector: OP_IMM (IMM scope -- excludes ADD/SUB whose byte-1-row
+        # AX_CARRY is the arithmetic carry, not byte-1) + IS_BYTE + a hard
+        # MARK_AX blocker (excludes the AX-marker row marker+0). The nibble cells
+        # select the value; marker+2/+3 carry byte=0 so they fill no >=16 column.
+        dump_gate_conditions=(
+            ("OP_IMM", _AX_B1_FW_OPIMM_W),
+            ("IS_BYTE", _AX_B1_FW_ISBYTE_W),
+            ("MARK_AX", -_AX_B1_FW_MARK_AX_BLOCK),
+        ),
+        dump_threshold=_AX_B1_FW_THRESHOLD,
+        # The wide-band cell must overcome the LM head's value-emission
+        # competition (token byte1&0xF wins via OUTPUT_LO/HI). A large write
+        # makes the +5.0 emission column dominate (cell ~large * 5.0).
+        dump_write_scale=2000.0,
     )
 )
 
@@ -2192,14 +2252,12 @@ def make_ax_byte1_full_width_emission_op() -> Operation:
 
     Uses the ISA-DSL :func:`full_width_byte_emission` generator. The 256-cell
     wide value band breaks the LM head's mod-16 H-band alias: each byte value
-    16..255 gets its OWN distinct LM-head column, so a future relay that fills
-    the band with the value-faithful byte-1 one-hot lets the LM head emit the
-    full high byte (fixing edge_literal / every byte1 >= 16) with no further
-    change. Runs at phase=1002 (additive, AFTER head_bake); byte-identical when
-    the band is empty (fresh steps) and when the flag is OFF (default).
+    16..255 gets its OWN distinct LM-head column. Runs at phase=1002 (additive,
+    AFTER head_bake); byte-identical when the band is empty (fresh steps) and
+    when the flag is OFF (default).
 
-    Gated by ``C4_AX_BYTE1_FULL_WIDTH`` (default-OFF: the band/columns are inert
-    until the deferred IMM-decode relay supplies the source one-hot).
+    Gated by ``C4_AX_BYTE1_FULL_WIDTH`` (default-OFF -> the band is not collected
+    -> smaller d_model -> byte-identical to the pre-feature build).
     """
     _emission_on = _ax_byte1_full_width_enabled()
     bundle = _AX_BYTE1_FULL_WIDTH_EMISSION
@@ -2235,6 +2293,73 @@ def make_ax_byte1_full_width_emission_op() -> Operation:
         compiler_ir_factory=_ir_factory,
         phase=1002,
         declarative_authority="declarative",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# AX byte-1 FULL-WIDTH band FILL (the value-source re-point FFN)
+# ---------------------------------------------------------------------------
+#
+# Fills ``AX_BYTE1_FULL_WIDE`` from the ALU nibble pair at the byte-1 predictor
+# row (see the SOURCE comment on ``_AX_BYTE1_FULL_WIDTH_EMISSION``). The 240
+# fill rules (v = 16..255) each AND the LOW nibble cell ``ALU_LO+(lo+2)``, the
+# HIGH nibble cell ``ALU_HI+(hi+2)`` and the byte-1 row gate, writing the wide
+# band cell the LM-head emission column reads. Runs at the L25 tail (after the
+# tail correctors) so the ALU bands are final; gated by the SAME
+# ``C4_AX_BYTE1_FULL_WIDTH`` flag (flag-off => zero rules => byte-identical).
+def make_ax_byte1_full_width_fill_op() -> Operation:
+    """Fill ``AX_BYTE1_FULL_WIDE`` from the ALU byte-1 nibble pair (FFN).
+
+    The VALUE half of the edge_literal fix: an L25-tail FFN whose 240 rules
+    reconstruct byte-1's full value (16..255) into the wide band by AND-ing the
+    two ALU nibble cells at the byte-1 predictor row, so the un-aliased LM-head
+    column emits the correct high byte. Gated by ``C4_AX_BYTE1_FULL_WIDTH``
+    (flag-off => no band collected + zero rules => byte-identical).
+    """
+    _emission_on = _ax_byte1_full_width_enabled()
+    bundle = _AX_BYTE1_FULL_WIDTH_EMISSION
+
+    def _rules():
+        return bundle.dump_rules_builder(_emission_on, {})
+
+    def _bake(block, dim_positions, S):
+        rules = _rules()
+        if not rules:
+            return
+        from ...base_layers import PureFFN
+        d_model = block.ffn.W_up.shape[1] if hasattr(block, "ffn") else None
+        if d_model is None:
+            d_model = max(int(v) for v in dim_positions.values()) + 1
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {
+            nm: int(dim_positions[nm.split("+", 1)[0]])
+            + (int(nm.split("+", 1)[1]) if "+" in nm else 0)
+            for nm in Primitives.ffn_rule_dim_names(rules)
+        }
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    def _ir_factory(dim_positions, HD):
+        del HD, dim_positions
+        ir = CompilerIR()
+        ir.layer(0).ffn.rules.extend(_rules())
+        return ir
+
+    reads = set(bundle.dump_reads) if _emission_on else set()
+    writes = set(bundle.dump_writes) if _emission_on else set()
+    return Operation(
+        name="ax_byte1_full_width_fill",
+        reads=reads,
+        writes=writes,
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=_bake,
+        compiler_ir_factory=_ir_factory,
+        declarative_authority="spec_generated",
         migrated=True,
         smoke_tests={"all"},
         spec_section="EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md",

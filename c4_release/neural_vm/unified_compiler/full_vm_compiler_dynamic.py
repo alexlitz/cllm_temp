@@ -2241,6 +2241,16 @@ def compile_full_vm_dynamic(
             "C4_ADDSUB_DUMP_BOOST": (
                 os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
             ),
+            # AX byte-1 FULL-WIDTH emission (DEFAULT-OFF, opt in =1): adds the
+            # AX_BYTE1_FULL_WIDE band + un-aliased LM-head columns 16..255 + the
+            # L25-tail band-FILL FFN (reads the ALU nibble pair -> wide band).
+            # The band changes d_model (already disambiguated by
+            # extra_residual_dims) AND the fill rules + columns are
+            # output-affecting, so the ON / OFF builds must NEVER share a memo /
+            # disk entry.
+            "C4_AX_BYTE1_FULL_WIDTH": (
+                os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2749,6 +2759,13 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_ADDSUB_DUMP_BOOST": (
             os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
+        ),
+        # AX byte-1 FULL-WIDTH emission (DEFAULT-OFF, opt in =1,
+        # output-affecting + geometry-affecting): adds the AX_BYTE1_FULL_WIDE
+        # band, the un-aliased LM-head columns 16..255, and the L25-tail
+        # band-FILL FFN. The ON / OFF builds must never share a serialised entry.
+        "C4_AX_BYTE1_FULL_WIDTH": (
+            os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
         ),
         # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
         # opt in with =1, output-affecting): the ON / OFF builds must never
