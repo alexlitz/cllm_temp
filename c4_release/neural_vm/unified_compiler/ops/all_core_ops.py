@@ -140,6 +140,10 @@ def all_core_ops(
         make_lookahead_pc8_chain_op(),
         make_lookahead_opcode_fetch_op(),
         make_next_arith_flag_op(),
+        # Broadcast STACK0_B0_NEXT_ARITH from the step's AX row (where the flag
+        # was decoded) to its STACK0-marker row (where the dump fires), via an
+        # intra-step relay head (Q@MARK_STACK0, K@MARK_AX, positive ALiBi).
+        make_next_arith_relay_op(),
         # V9 GETCHAR neural read scaffolding (BLOG_SPEC.md:851).
         # Phase 1: registered but disabled (enable=False). The runner-side
         # _inject_getchar shim still owns byte transfer until phase 2

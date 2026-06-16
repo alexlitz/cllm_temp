@@ -1411,3 +1411,87 @@ def make_next_arith_flag_op() -> Operation:
         smoke_tests={"all"},
         spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
     )
+
+
+# ---------------------------------------------------------------------------
+# STACK0_B0_NEXT_ARITH within-step broadcast head (#221).
+# ---------------------------------------------------------------------------
+# The lookahead fetch + decode set the flag at the STEP's AX-marker row (the
+# only row carrying the relayed PC -> NEXT_OPCODE). The dump fires on the SAME
+# step's STACK0-marker row (a DIFFERENT, later row). Broadcast the flag from the
+# AX row to the STACK0-marker row of the SAME step, mirroring the L11
+# step_end_operand_relay (Q anchors the target marker, K matches MARK_AX,
+# positive ALiBi keeps the relay step-local so the CURRENT step's AX wins over
+# the prior step's). Hosted on the L7 attn block (a free head), after the flag
+# FFN and well before the L25-tail dump.
+_NEXT_ARITH_RELAY_HEAD_IDX = 6  # free on L9 (heads 0..3 + dump-carry head 5)
+
+
+def _allocate_next_arith_relay_heads() -> "AttentionHeadAllocator":
+    from ...attention_head_allocator import AttentionHeadAllocator
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    allocator.alloc("next_arith_relay.head_6", layer_idx=9,
+                    pin=_NEXT_ARITH_RELAY_HEAD_IDX)
+    return allocator
+
+
+def _next_arith_relay_head_spec(
+    dim_positions: dict, head_idx: int, *, S: float = 100.0,
+) -> DeclarativeAttentionHeadSpec:
+    """Relay head: copy STACK0_B0_NEXT_ARITH from the step's AX row to its STACK0
+    marker row. Q@MARK_STACK0, K@MARK_AX, positive ALiBi (step-local)."""
+    def _P(name: str) -> int:
+        return int(dim_positions[name])
+    MARK_STACK0 = _P("MARK_STACK0")
+    MARK_AX = _P("MARK_AX")
+    FLAG = _P("STACK0_B0_NEXT_ARITH")
+    L = float(S)
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=(AP(0, MARK_STACK0, L),),
+        k=(AP(0, MARK_AX, L),),
+        v=(AP(0, FLAG, 1.0),),
+        o=(AO(FLAG, 0, 1.0),),
+        alibi_slope=1.0,
+    )
+
+
+def make_next_arith_relay_op() -> Operation:
+    """L7 attn head 7: broadcast STACK0_B0_NEXT_ARITH AX-row -> STACK0-marker row.
+
+    The flag is computed at the AX row (where NEXT_OPCODE lives); the dump reads
+    it at the STACK0 marker row. This intra-step relay carries it across, so the
+    dump's gate sees the consumer-arith flag on the exact operand frame it fires
+    on. No-op when the flag is off.
+    """
+    enabled = _stack0_next_arith_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        attn = block.attn
+        allocator = _allocate_next_arith_relay_heads()
+        attn._next_arith_relay_head_allocator = allocator
+        head_idx = allocator.heads()[-1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec = _next_arith_relay_head_spec(dim_positions, head_idx, S=S)
+        Primitives.generate_attention_head(attn, spec, HD)
+
+    return Operation(
+        name="next_arith_relay",
+        reads={"MARK_STACK0", "MARK_AX", "STACK0_B0_NEXT_ARITH"} if enabled else set(),
+        writes={"STACK0_B0_NEXT_ARITH"} if enabled else set(),
+        kind="block",
+        # Host on the L9 marker-suppress attn block (head 6 free): MARK_STACK0 /
+        # MARK_AX / the flag are all present, it runs after the flag FFN (block 8)
+        # and well before the L25-tail dump. Same anchor the dump-carry head uses
+        # (head 5); head 6 is a distinct free slot.
+        target_op_name="layer9_marker_suppress",
+        requires={"after": "next_arith_flag"} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
+    )
