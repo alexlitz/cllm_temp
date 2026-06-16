@@ -47,11 +47,28 @@ The four gaps, and how each is made faithful to the real op:
 
 Faithful-coverage boundary
 ---------------------------
-A handful of ops are still imperative ``bake_fn``-only (the ALU divmod
-compute being migrated to declarative IR in task #230, plus a few
-model-level slope/seed ops). Those are NOT IR-executable; this interpreter
-flags them as a coverage gap (``opaque_ops``) rather than faking them. Every
-other op runs through the faithful IR forward.
+A handful of ops are still imperative ``bake_fn``-only (the 4 composite ALU
+blocks — ``AddSub5StageBlock`` / ``FlattenedALUMul`` / ``FlattenedDivMod`` /
+``ALUShiftComposite`` — being migrated to declarative IR in task #230, plus a
+few model-level slope/seed ops). Those have no IR rule form, so the *pure-IR*
+forward (:meth:`FaithfulInterpreter.forward` over per-op IR) cannot run them
+from the IR and still flags them ``opaque_skipped``.
+
+ALU-block execution (the imperative composite blocks)
+-----------------------------------------------------
+The pure-IR forward is not the only path. For an end-to-end faithful decode
+the interpreter must still EXECUTE those 4 ALU composite blocks — they are
+the actual arithmetic. Rather than fake or skip them, the interpreter runs the
+REAL baked ``nn.Module`` FFN block on its residual tape (a vanilla CPU
+forward, slower but exact). :func:`run_faithful_blocks` walks the real model
+block-by-block: every attention block + every IR-executable (``PureFFN``)
+block runs through the faithful pure-IR math, and every composite ALU FFN
+block runs through its real baked forward. The result is a fully faithful
+per-token decode that INCLUDES the imperative ALU result — so an ALU program
+gets a real per-step ``(PC, AX)`` verdict instead of an ALU-OPAQUE skip. The
+ALU step's contribution is then attributable only at block granularity (no
+declarative rule — it is imperative), which the oracle gate reports as
+``attributed_op=<ALU block>, attributed_rule=None``.
 """
 
 from __future__ import annotations
@@ -456,6 +473,189 @@ class FaithfulInterpreter:
 
 
 # ---------------------------------------------------------------------------
+# ALU-block execution: the imperative composite ALU FFN blocks.
+#
+# These 4 FFN block types have no W_up/W_gate/W_down declarative rule form
+# (the still-imperative #230 coverage gap), so the pure-IR forward cannot run
+# them. Rather than skip them — which would leave every ALU result wrong
+# downstream and force the gate to flag ALU-OPAQUE — :func:`run_faithful_blocks`
+# executes the REAL baked block on the residual tape (a vanilla CPU forward,
+# slower but exact). The rest of every block (all attention + the IR-executable
+# PureFFN blocks) still runs through the faithful pure-IR math, so the only
+# imperative step is the arithmetic itself.
+# ---------------------------------------------------------------------------
+
+# FFN block class names that are still imperative composite ALU blocks (no IR
+# rule form). ``FlattenedPureFFN`` is a flattened-but-declarative variant kept
+# here for parity with the validator's recovery boundary.
+COMPOSITE_ALU_FFN = (
+    "AddSub5StageBlock",
+    "FlattenedALUMul",
+    "FlattenedDivMod",
+    "ALUShiftComposite",
+    "FlattenedPureFFN",
+)
+
+
+def _recover_attn_head_specs(attn, d_model: int) -> list:
+    """Read a baked ``AutoregressiveAttention``'s W_q/W_k/W_v/W_o into a list
+    of declarative head specs (the inverse of ``lower_attention``).
+
+    Recovers the exact head-spec the block was baked from, so the faithful
+    pure-IR attention math over these specs reproduces the block exactly.
+    """
+    from .primitives import (
+        DeclarativeAttentionHeadSpec,
+        AttentionProjectionWrite,
+        AttentionOutputWrite,
+    )
+
+    H = attn.num_heads
+    HD = attn.head_dim
+    W_q = (attn.W_q.data.to_dense() if attn.W_q.is_sparse else attn.W_q.data).cpu()
+    W_k = (attn.W_k.data.to_dense() if attn.W_k.is_sparse else attn.W_k.data).cpu()
+    W_v = (attn.W_v.data.to_dense() if attn.W_v.is_sparse else attn.W_v.data).cpu()
+    W_o = (attn.W_o.data.to_dense() if attn.W_o.is_sparse else attn.W_o.data).cpu()
+    slopes = getattr(attn, "alibi_slopes", None)
+    heads = []
+    for h in range(H):
+        base = h * HD
+        q, k, v, o = [], [], [], []
+        for slot in range(HD):
+            row = base + slot
+            for dim in W_q[row].nonzero(as_tuple=True)[0].tolist():
+                q.append(AttentionProjectionWrite(slot, dim, float(W_q[row, dim])))
+            for dim in W_k[row].nonzero(as_tuple=True)[0].tolist():
+                k.append(AttentionProjectionWrite(slot, dim, float(W_k[row, dim])))
+            for dim in W_v[row].nonzero(as_tuple=True)[0].tolist():
+                v.append(AttentionProjectionWrite(slot, dim, float(W_v[row, dim])))
+        for out_dim in range(W_o.shape[0]):
+            col_vals = W_o[out_dim, base:base + HD]
+            for slot in col_vals.nonzero(as_tuple=True)[0].tolist():
+                o.append(AttentionOutputWrite(out_dim, int(slot), float(col_vals[slot])))
+        slope = float(slopes[h]) if slopes is not None else None
+        heads.append(DeclarativeAttentionHeadSpec(
+            head_idx=h, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),
+            alibi_slope=slope,
+        ))
+    return heads
+
+
+def _faithful_attn_block(heads, x: torch.Tensor, HD: int,
+                         use_softmax1: bool) -> torch.Tensor:
+    """Faithful softmax1+ALiBi MHA over recovered head specs (one block).
+
+    Term-for-term identical to ``FaithfulInterpreter._apply_attention_op``;
+    factored out so :func:`run_faithful_blocks` can drive it with the
+    recovered baked-weight specs.
+    """
+    S = x.shape[0]
+    scale = 1.0 / math.sqrt(float(HD))
+    pos = torch.arange(S, device=x.device, dtype=x.dtype)
+    dist = (pos.unsqueeze(1) - pos.unsqueeze(0)).abs()
+    causal = torch.triu(
+        torch.full((S, S), float("-inf"), device=x.device, dtype=x.dtype),
+        diagonal=1,
+    )
+    out_delta = torch.zeros_like(x)
+    for spec in heads:
+        Q = torch.zeros(S, HD, device=x.device, dtype=x.dtype)
+        K = torch.zeros(S, HD, device=x.device, dtype=x.dtype)
+        V = torch.zeros(S, HD, device=x.device, dtype=x.dtype)
+        for w in spec.q:
+            Q[:, int(w.slot)] += x[:, int(w.dim)] * float(w.weight)
+        for w in spec.k:
+            K[:, int(w.slot)] += x[:, int(w.dim)] * float(w.weight)
+        for w in spec.v:
+            V[:, int(w.slot)] += x[:, int(w.dim)] * float(w.weight)
+        slope = spec.alibi_slope if spec.alibi_slope is not None else 0.0
+        scores = (Q @ K.t()) * scale - slope * dist + causal
+        if use_softmax1:
+            anchor = torch.zeros((), device=x.device, dtype=x.dtype)
+            max_val = torch.maximum(scores.amax(dim=-1, keepdim=True), anchor)
+            exp_scores = torch.exp(scores - max_val)
+            exp_anchor = torch.exp(anchor - max_val)
+            attn = exp_scores / (exp_anchor + exp_scores.sum(dim=-1, keepdim=True))
+        else:
+            attn = torch.softmax(scores, dim=-1)
+        head_out = attn @ V
+        for w in spec.o:
+            out_delta[:, int(w.out_dim)] += head_out[:, int(w.slot)] * float(w.weight)
+    return x + out_delta
+
+
+def _faithful_ffn_block(ffn, x: torch.Tensor) -> torch.Tensor:
+    """Faithful SwiGLU over a baked ``PureFFN``: ``x + W_down·(silu(W_up·x+b)·
+    (W_gate·x+b))`` per token — the exact PureFFN.forward math, IR-shaped."""
+    W_up = (ffn.W_up.data.to_dense() if ffn.W_up.is_sparse else ffn.W_up.data)
+    W_gate = (ffn.W_gate.data.to_dense() if ffn.W_gate.is_sparse else ffn.W_gate.data)
+    W_down = (ffn.W_down.data.to_dense() if ffn.W_down.is_sparse else ffn.W_down.data)
+    up = x @ W_up.t() + ffn.b_up
+    gate = x @ W_gate.t() + ffn.b_gate
+    hidden = torch.nn.functional.silu(up) * gate
+    return x + hidden @ W_down.t()
+
+
+@torch.no_grad()
+def run_faithful_blocks(
+    model,
+    tape: Sequence[int],
+    *,
+    return_logits: bool = True,
+) -> Tuple[torch.Tensor, List[OpTrace]]:
+    """Run the faithful per-token forward over every real block + the LM head.
+
+    This is the end-to-end faithful decode that EXECUTES the imperative ALU
+    composite blocks (rather than skipping them as the pure-IR :meth:`forward`
+    does). For each physical block:
+
+      * attention runs through the faithful pure-IR softmax1+ALiBi math over the
+        head specs recovered from the baked weights;
+      * an IR-executable ``PureFFN`` block runs through the faithful SwiGLU math;
+      * a composite ALU FFN block (:data:`COMPOSITE_ALU_FFN`) runs through its
+        REAL baked ``block.ffn(...)`` forward — the imperative arithmetic, exact
+        but not IR-attributable.
+
+    Returns ``(logits_or_residual, traces)`` where ``logits`` is ``[S, vocab]``
+    (``head.weight·x + head.bias``, the model has no final norm) when
+    ``return_logits`` else the pre-head residual ``[S, d_model]``; ``traces``
+    records each block's kind and whether the FFN ran imperatively (the ALU
+    blocks carry ``kind='alu_block'`` so the gate can attribute coarsely).
+    """
+    device = next(model.parameters()).device
+    token_ids = torch.tensor([list(tape)], dtype=torch.long, device=device)
+    x = model.embed(token_ids)[0]  # [S, D]
+    d_model = model.d_model
+    traces: List[OpTrace] = []
+    for bi, block in enumerate(model.blocks):
+        attn = block.attn
+        heads = _recover_attn_head_specs(attn, d_model)
+        x = _faithful_attn_block(
+            heads, x, attn.head_dim, getattr(attn, "use_softmax1", True),
+        )
+        ffn_name = type(block.ffn).__name__
+        if ffn_name in COMPOSITE_ALU_FFN:
+            # Imperative ALU composite — execute the REAL baked block on the
+            # residual tape (CPU forward, exact). NOT IR-attributable.
+            x = block.ffn(x.unsqueeze(0))[0]
+            traces.append(OpTrace(
+                name=ffn_name, kind="alu_block", layer_idx=bi, rules_fired=0,
+                note="imperative composite ALU block executed via real forward",
+            ))
+        else:
+            x = _faithful_ffn_block(block.ffn, x)
+            traces.append(OpTrace(
+                name=ffn_name, kind="ffn", layer_idx=bi,
+                note="faithful pure-IR SwiGLU",
+            ))
+    if return_logits:
+        out = x @ model.head.weight.t() + model.head.bias
+    else:
+        out = x
+    return out, traces
+
+
+# ---------------------------------------------------------------------------
 # Convenience: token decode helpers (step-tape register readout).
 # ---------------------------------------------------------------------------
 
@@ -487,6 +687,8 @@ __all__ = [
     "OpTrace",
     "extract_op_ir",
     "op_is_ir_executable",
+    "run_faithful_blocks",
+    "COMPOSITE_ALU_FFN",
     "step_token_positions",
     "STEP_TOKENS",
 ]

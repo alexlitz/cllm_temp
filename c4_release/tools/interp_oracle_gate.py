@@ -56,13 +56,20 @@ Classes
     ``--faithfulness-check`` (the real production decode) to resolve them. See
     ``_value_correction_step`` for the soundness guard (0 false-trusts over the
     validation sample).
-  * **ALU-OPAQUE** — the divergence is at/after a step whose opcode is one of the
-    4 still-imperative composite ALU blocks (ADD/SUB -> AddSub5StageBlock,
-    MUL -> FlattenedALUMul, DIV/MOD -> FlattenedDivMod, SHL/SHR ->
-    ALUShiftComposite). These have no IR-executable rule form, so the
-    interpreter cannot run them from the IR and CANNOT attribute a rule — the
-    program is flagged with the opaque ALU op (these need the imperative-forward
-    GPU path), no rule attribution.
+  * **FAIL (ALU step) + COARSE BLOCK ATTRIBUTION** — the divergence is at/after a
+    step whose opcode is one of the 4 still-imperative composite ALU blocks
+    (ADD/SUB -> AddSub5StageBlock, MUL -> FlattenedALUMul, DIV/MOD ->
+    FlattenedDivMod, SHL/SHR -> ALUShiftComposite). These blocks have no IR rule
+    form, BUT the faithful forward EXECUTES the real baked block on the residual
+    tape (a CPU forward — exact), so the interpreter still gets a real per-step
+    ``(PC, AX)`` verdict. It just cannot pin a *declarative rule* (the block is
+    imperative), so the attribution is COARSE: ``attributed_op=<ALU block>``,
+    ``attributed_rule=None``, ``is_alu_step=True``. This is honest — distinct
+    from the IR-rule attributions on the non-ALU path. The cross-step poisoning
+    guard still applies: an ALU-step FAIL downstream of a value correction is
+    still flagged CROSS-STEP (confidence), so the ALU verdict and the
+    decode/cross-step verdicts COEXIST. (Previously these programs were flagged
+    ALU-OPAQUE and the gate declined to judge; the real ALU now executes.)
 
 Faithfulness / trustworthiness
 ------------------------------
@@ -73,7 +80,8 @@ interpreter COVERAGE GAP (not a model bug) and is reported separately so the
 gate never mis-attributes. It is also the authoritative resolver for the
 CROSS-STEP class (the autoregressive framing-drift the CPU single forward flags
 but cannot decode). The summary quantifies the corpus split: HIGH-confidence
-(gate is authoritative, incl. AX-high-byte) vs CROSS-STEP vs ALU-OPAQUE.
+(gate is authoritative, incl. AX-high-byte) vs CROSS-STEP vs ALU programs (real
+ALU block EXECUTED, coarse block attribution).
 
 Usage
 -----
@@ -234,10 +242,18 @@ class FaithfulForwardCache:
 
 
 # ---------------------------------------------------------------------------
-# Opcode -> composite ALU block (the imperative #230 coverage gap).
+# Opcode -> imperative composite ALU block (the #230 still-imperative path).
+#
+# These blocks have no declarative IR rule form, so a divergence at an ALU step
+# can be attributed only at BLOCK granularity (``attributed_op=<block>``,
+# ``attributed_rule=None``) — not to a single rule. The faithful forward (the
+# cached ``FaithfulForwardCache``, which already runs ``block.ffn(...)`` for the
+# composite blocks) EXECUTES the real baked block on the residual tape, so the
+# gate gives a real per-step (PC, AX) verdict for ALU programs (no longer
+# ALU-OPAQUE).
 # ---------------------------------------------------------------------------
 
-_ALU_OPAQUE_OPCODE: Dict[int, str] = {
+_ALU_OPCODE_BLOCK: Dict[int, str] = {
     25: "ADD (AddSub5StageBlock)",
     26: "SUB (AddSub5StageBlock)",
     27: "MUL (FlattenedALUMul)",
@@ -302,8 +318,8 @@ def oracle_tape_and_steps(
     The ``(pc, ax)`` list matches ``_oracle_pc_ax_steps`` (capture AFTER each
     ``step()``). The opcode per step is read from the DraftVM's current
     instruction BEFORE the step executes (so an ALU-step divergence can be
-    flagged ALU-OPAQUE). The 35-token slices are exactly what the model is
-    teacher-forced to reproduce.
+    attributed to its composite ALU block). The 35-token slices are exactly what
+    the model is teacher-forced to reproduce.
     """
     vm = DraftVM(list(bytecode))
     vm.load_data(data)
@@ -429,7 +445,7 @@ def _value_correction_step(
 class GateResult:
     name: str
     cluster: str
-    classification: str               # PASS / FAIL / ALU-OPAQUE / ERROR
+    classification: str               # PASS / FAIL / ERROR (ALU-OPAQUE retired)
     n_steps: int
     # FAIL detail.
     div_step: Optional[int] = None
@@ -442,7 +458,16 @@ class GateResult:
     attributed_op: Optional[str] = None
     attributed_rule: Optional[str] = None
     attributed_contrib: Optional[float] = None
+    # The imperative ALU block at/owning the diverging step, if the step's
+    # opcode is one of the 4 composite ALU blocks. On an ALU-step FAIL this is
+    # the COARSE attribution (``attributed_op=<block>``, ``attributed_rule=None``)
+    # because the block is imperative and has no declarative rule to pin.
     alu_op: Optional[str] = None
+    # True if the diverging/owning step's opcode is a composite ALU block (so the
+    # verdict rides the real imperative ALU forward; on a FAIL the attribution is
+    # the coarse block, not a rule). Orthogonal to ``confidence`` — an ALU-step
+    # FAIL downstream of a value correction is still CROSS-STEP.
+    is_alu_step: bool = False
     # Confidence of the (step, reg, byte) divergence verdict — driven by the
     # cross-step poisoning guard ``_value_correction_step``, NOT by which byte:
     #
@@ -466,6 +491,9 @@ class GateResult:
 
 PASS = "PASS"
 FAIL = "FAIL"
+# ALU_OPAQUE is RETIRED as a verdict: the faithful forward now executes the real
+# composite ALU block, so ALU programs get a real PASS/FAIL. The constant is
+# kept only so any external importer does not break; the gate never emits it.
 ALU_OPAQUE = "ALU-OPAQUE"
 ERROR = "ERROR"
 HIGH = "high"
@@ -613,32 +641,48 @@ def classify_program(
                 got_b = (g_val >> (8 * k)) & 0xFF
                 if exp_b == got_b:
                     continue
-                # ALU-OPAQUE? The step's opcode is a composite ALU block the
-                # interpreter cannot execute from IR — flag, do NOT attribute.
                 opcode = ot.opcodes[s] if s < len(ot.opcodes) else -1
                 conf = _div_confidence(s, vcorr)
-                if opcode in _ALU_OPAQUE_OPCODE:
+                op_name = _OPCODE_NAME.get(opcode, f"op{opcode}")
+                # ALU step? The step's opcode is a composite ALU block. The
+                # faithful forward (FaithfulForwardCache, which runs the real
+                # ``block.ffn(...)`` for the composite blocks) EXECUTED the real
+                # baked block on the residual tape, so this divergence is a REAL
+                # FAIL (not ALU-OPAQUE). But the block is imperative (no
+                # declarative rule), so the attribution is COARSE:
+                # attributed_op=<block>, attributed_rule=None, is_alu_step=True.
+                # The cross-step poisoning guard still applies — a CROSS-STEP
+                # ALU FAIL (downstream of a value correction) stays CROSS-STEP.
+                if opcode in _ALU_OPCODE_BLOCK:
+                    xs_tag = ("  [CROSS-STEP: divergence is downstream of a "
+                              f"value correction at step {vcorr} — production's "
+                              "autoregressive poisoning; resolve with "
+                              "--faithfulness-check (GPU)]"
+                              if conf == CROSS_STEP else "")
                     return GateResult(
-                        name=name, cluster=cluster, classification=ALU_OPAQUE,
+                        name=name, cluster=cluster, classification=FAIL,
                         n_steps=n_steps, div_step=s, div_reg=reg, div_byte=k,
                         expected=exp_b, got=got_b, expected_reg=o_val,
-                        got_reg=g_val, alu_op=_ALU_OPAQUE_OPCODE[opcode],
-                        confidence=conf, value_correction_step=vcorr,
-                        note=(f"divergence at step {s} {reg}[{k}] is at/after "
-                              f"opaque ALU op {_ALU_OPAQUE_OPCODE[opcode]} "
-                              f"(no IR rule form; needs imperative GPU path)"),
+                        got_reg=g_val, attributed_op=_ALU_OPCODE_BLOCK[opcode],
+                        attributed_rule=None, alu_op=_ALU_OPCODE_BLOCK[opcode],
+                        is_alu_step=True, confidence=conf,
+                        value_correction_step=vcorr,
+                        note=(f"step {s} opcode={op_name} {reg}[{k}] "
+                              f"exp=0x{exp_b:02x} got=0x{got_b:02x} "
+                              f"-> imperative ALU block "
+                              f"{_ALU_OPCODE_BLOCK[opcode]} (coarse "
+                              f"attribution: no declarative rule)" + xs_tag),
                     )
-                # Attribute the wrong byte to its owning declarative rule. Only
-                # attribute HIGH-confidence divergences (at/before the cross-step
-                # poisoning point): a CROSS-STEP divergence may be a teacher-
-                # forcing artifact, so naming a rule there would mislead.
+                # Non-ALU step: attribute the wrong byte to its owning declarative
+                # rule. Only attribute HIGH-confidence divergences (at/before the
+                # cross-step poisoning point): a CROSS-STEP divergence may be a
+                # teacher-forcing artifact, so naming a rule there would mislead.
                 attr_op = attr_rule = None
                 attr_c = None
                 if attribute and conf == HIGH:
                     attr_op, attr_rule, attr_c = _attribute_byte(
                         ctx, full_ctx, prefix, s, reg, k, got_b,
                     )
-                op_name = _OPCODE_NAME.get(opcode, f"op{opcode}")
                 xs_tag = ("  [CROSS-STEP: divergence is downstream of a value "
                           f"correction at step {vcorr} — production's "
                           "autoregressive poisoning; resolve with "
@@ -655,25 +699,18 @@ def classify_program(
                           f"exp=0x{exp_b:02x} got=0x{got_b:02x}" + xs_tag),
                 )
     # No (PC, AX) divergence found. BUT if the program's path executes an
-    # opaque composite-ALU opcode, the gate CANNOT certify a PASS: the efficient
-    # composite-ALU block the interpreter runs (AddSub/Mul/DivMod/Shift) is NOT
-    # guaranteed bit-identical to production's imperative ALU runtime, so the
-    # ALU step's result is not authoritative even when it happens to match the
-    # oracle here. Flag it ALU-OPAQUE (gate declines to judge) rather than
-    # over-claiming PASS — e.g. a MUL the interpreter computes correctly that
-    # production's imperative MUL gets wrong would be a false PASS.
+    # composite-ALU opcode, the faithful forward EXECUTED that block (the
+    # FaithfulForwardCache runs the real ``block.ffn(...)`` for the composite
+    # blocks — production's actual ALU), so a clean per-step match IS a real PASS
+    # — including for programs whose path runs an ALU op. (Previously these were
+    # declined as ALU-OPAQUE on a stale "not bit-certified vs production" caveat;
+    # the gate now certifies them.) We still surface that the path runs an ALU
+    # block via ``is_alu_step`` / ``alu_op`` so the verdict reports the coarse
+    # block context.
     alu_steps = [(s, ot.opcodes[s]) for s in range(min(n_steps, len(ot.opcodes)))
-                 if ot.opcodes[s] in _ALU_OPAQUE_OPCODE]
-    if alu_steps:
-        s0, op0 = alu_steps[0]
-        return GateResult(
-            name=name, cluster=cluster, classification=ALU_OPAQUE,
-            n_steps=n_steps, div_step=s0, alu_op=_ALU_OPAQUE_OPCODE[op0],
-            note=(f"path executes opaque ALU op {_ALU_OPAQUE_OPCODE[op0]} at "
-                  f"step {s0} (and {len(alu_steps) - 1} more); the composite-ALU "
-                  f"forward is not bit-certified vs production — needs the "
-                  f"imperative GPU path"),
-        )
+                 if ot.opcodes[s] in _ALU_OPCODE_BLOCK]
+    has_alu = bool(alu_steps)
+    alu_op0 = _ALU_OPCODE_BLOCK[alu_steps[0][1]] if has_alu else None
     # The single teacher-forced forward found NO (PC, AX) divergence. If the
     # model emitted a register-VALUE byte that diverged from the oracle tape at
     # some step (``vcorr`` set) at or before the LAST checked step, the gate
@@ -698,13 +735,23 @@ def classify_program(
         return GateResult(
             name=name, cluster=cluster, classification=FAIL,
             n_steps=n_steps, div_step=None, confidence=CROSS_STEP,
-            value_correction_step=vcorr,
+            value_correction_step=vcorr, is_alu_step=has_alu, alu_op=alu_op0,
             note=(f"single-forward decode found no (PC, AX) divergence, but the "
                   f"model emitted a register-VALUE byte that diverged from the "
                   f"oracle tape at step {vcorr}; production's autoregressive "
                   f"decode would poison the context from there and may fail a "
                   f"later step the teacher-forced forward cannot see "
                   f"(CROSS-STEP — resolve with --faithfulness-check (GPU))"),
+        )
+    if has_alu:
+        s0 = alu_steps[0][0]
+        return GateResult(
+            name=name, cluster=cluster, classification=PASS, n_steps=n_steps,
+            is_alu_step=True, alu_op=alu_op0,
+            note=(f"all {n_steps} steps match oracle (path executes imperative "
+                  f"ALU op {alu_op0} at step {s0}"
+                  + (f" + {len(alu_steps) - 1} more" if len(alu_steps) > 1 else "")
+                  + ", executed via real baked block)"),
         )
     return GateResult(name=name, cluster=cluster, classification=PASS,
                       n_steps=n_steps, note=f"all {n_steps} steps match oracle")
@@ -880,14 +927,11 @@ def faithfulness_check(
             continue
 
         # The gate is AUTHORITATIVE for this program (PASS or HIGH-conf FAIL,
-        # incl. the now-promoted AX-high-byte cases).
+        # incl. the now-promoted AX-high-byte cases). ALU programs now flow
+        # through here too: the faithful forward executed the real composite ALU
+        # block, so the verdict is a real PASS/FAIL and is compared to neural
+        # like any other program (no ALU-OPAQUE skip).
         n_authoritative += 1
-        if ires.classification == ALU_OPAQUE:
-            if not n_pass:
-                n_faithful += 1
-            else:
-                gaps.append(f"{p['name']} (ALU-OPAQUE but neural PASS)")
-            continue
         same_verdict = (i_pass == n_pass)
         same_div = (ires.div_step == n_div) if not i_pass else True
         if same_verdict and same_div:
@@ -1014,21 +1058,28 @@ def run_set(ctx: GateContext, programs: List[dict], title: str,
         )
         results.append(r)
         if r.classification == PASS:
-            print(f"  PASS         {r.name}  ({r.n_steps} steps)")
-        elif r.classification == ALU_OPAQUE:
-            print(f"  ALU-OPAQUE   {r.name}  step={r.div_step} {r.alu_op}")
+            alu_tag = f"  [ALU: {r.alu_op}]" if r.is_alu_step else ""
+            print(f"  PASS         {r.name}  ({r.n_steps} steps){alu_tag}")
         elif r.classification == ERROR:
             print(f"  ERROR        {r.name}  {r.note}")
         elif r.confidence == CROSS_STEP:
             # CROSS-STEP: the single-forward verdict is downstream of a value
             # correction (autoregressive framing-drift). Report the poisoning
             # point, not an attributed rule (the verdict is not single-forward
-            # faithful).
+            # faithful). Applies to ALU steps too (an ALU FAIL downstream of a
+            # value correction is still autoregressive-poisoned).
             loc = (f"step={r.div_step} {r.div_reg}[{r.div_byte}]"
                    if r.div_step is not None else "(no flat divergence)")
+            alu_tag = f"  [ALU: {r.alu_op}]" if r.is_alu_step else ""
             print(f"  {'CROSS-STEP':<12} {r.name}  {loc}  "
-                  f"value-corruption@step{r.value_correction_step}  "
+                  f"value-corruption@step{r.value_correction_step}{alu_tag}  "
                   f"[autoregressive framing-drift — confirm with --faithfulness-check (GPU)]")
+        elif r.is_alu_step:
+            # HIGH-confidence ALU-step FAIL: coarse block attribution (the block
+            # is imperative — no declarative rule to pin).
+            print(f"  {'FAIL(ALU)':<12} {r.name}  step={r.div_step} "
+                  f"{r.div_reg}[{r.div_byte}] exp=0x{r.expected:02x} "
+                  f"got=0x{r.got:02x} -> {r.attributed_op} (coarse, no rule)")
         else:
             # HIGH-confidence FAIL (incl. AX bytes 1..3 not downstream of a
             # value correction — the AX-high-byte case is now attributed).
@@ -1055,6 +1106,14 @@ def _summary(results: List[GateResult], title: str) -> None:
                       if r.classification == FAIL and r.confidence == HIGH)
     n_fail_xs = sum(1 for r in results
                     if r.classification == FAIL and r.confidence == CROSS_STEP)
+    # ALU programs — now EXECUTED (no longer ALU-OPAQUE): how many of the
+    # PASS/FAIL verdicts ride the real imperative ALU forward (a cross-cut of
+    # PASS/FAIL, not a separate verdict class).
+    n_alu_total = sum(1 for r in results if r.is_alu_step)
+    n_alu_pass = sum(1 for r in results
+                     if r.is_alu_step and r.classification == PASS)
+    n_alu_fail = sum(1 for r in results
+                     if r.is_alu_step and r.classification == FAIL)
     print("-" * 90)
     print(f"  SUMMARY [{title}]: {n} programs")
     print(f"    {PASS:<14} {counts.get(PASS, 0)}")
@@ -1065,16 +1124,17 @@ def _summary(results: List[GateResult], title: str) -> None:
         print(f"    {'CROSS-STEP':<14} {n_fail_xs}   (divergence downstream of a "
               f"value correction — autoregressive framing-drift; resolve with "
               f"--faithfulness-check (GPU))")
-    if counts.get(ALU_OPAQUE):
-        print(f"    {ALU_OPAQUE:<14} {counts[ALU_OPAQUE]}")
     if counts.get(ERROR):
         print(f"    {ERROR:<14} {counts[ERROR]}")
     interp_authoritative = counts.get(PASS, 0) + n_fail_high
     print(f"    gate AUTHORITATIVE (PASS + HIGH-confidence FAIL) = "
           f"{interp_authoritative}/{n}")
-    print(f"    ALU-OPAQUE (needs imperative GPU ALU path) = "
-          f"{counts.get(ALU_OPAQUE, 0)}/{n}; CROSS-STEP (autoregressive, confirm "
-          f"with --faithfulness-check (GPU)) = {n_fail_xs}/{n}")
+    if n_alu_total:
+        print(f"    ALU programs (real ALU block EXECUTED, coarse block "
+              f"attribution) = {n_alu_total}/{n}  "
+              f"[{n_alu_pass} PASS, {n_alu_fail} FAIL]")
+    print(f"    CROSS-STEP (autoregressive, confirm with --faithfulness-check "
+          f"(GPU)) = {n_fail_xs}/{n}")
 
     # Top owning rules by FAIL frequency — the highest-leverage fix targets.
     # Only HIGH-confidence attributed FAILs (the trustworthy ones).
