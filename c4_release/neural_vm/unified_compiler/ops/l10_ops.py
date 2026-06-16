@@ -56,6 +56,42 @@ def _psh_stack0_highbyte_darken_enabled() -> bool:
     """
     return os.environ.get("C4_PSH_STACK0_HIGHBYTE_DARKEN", "1") != "0"
 
+
+def _stack0_pop_loaded_shallow_crush_enabled() -> bool:
+    """Flag for the L25 ``tail_stack0_pop_loaded`` shallow-competitor fix.
+
+    The L25 ``tail_stack0_pop_loaded_byte_*`` family (255 rules,
+    ``stack0_pop_loaded_output_rules`` below, baked into the
+    ``tail_bit32_result_correction`` bank at physical block 41) reinforces a
+    STACK0 byte that a strong upstream load relayed into the OUTPUT band. Each
+    rule fires iff ``MARK_STACK0 + ... + 0.05*OUTPUT_LO[lo] + 0.05*OUTPUT_HI[hi]
+    >= 12``. The ``0.05*OUTPUT`` term is meant as a near-binary one-hot selector
+    (OUTPUT ~= 1 for a genuine one-hot byte), but the L20 ``layer16_lev_routing``
+    SP/BP frame-address relay (``l16_lev_sp_bp_plus16_*``) writes the relayed
+    nibble at HUGE magnitude (~3300 in the residual). The selector then drives
+    the unit to ~32000x its intended firing strength, and the
+    ``byte_writes(value, strength=500)`` COMPETITOR side-effects (``-500`` to the
+    15 non-matching nibbles of each lane) scale by that runaway hidden to
+    ~-16M per nibble. Summed across every sibling that matches EITHER the
+    relayed lo OR hi nibble, the whole OUTPUT band is crushed to ~-8M and the
+    genuine relayed value (e.g. 0xE8 frame address) lands at -8.4M -- below the
+    LM-head reference, so a stray REGISTER-MARKER token (REG_PC=257) wins the
+    argmax instead of the value byte. That stray 257 lands at the STACK0[0]
+    offset and the production full_trace decoder (fixed-35-token slice, FIRST
+    REG_PC scan) reads PC from the wrong offset -> the var/expr/if-bool
+    full_trace step-5 PC desync (expected pc=66 got pc=74; all 100 var_*).
+
+    Fix: drop the per-byte COMPETITOR strength from 500 -> 5 (keep the +500
+    matching-nibble reinforcement) so the runaway crush stays shallow enough
+    that the relayed value survives POSITIVE. The genuine small-magnitude
+    SI/LI/SC/LC memory loads already win by their own reinforcement, so the
+    weaker competitor is byte-identity-irrelevant to the memory smoke (verified
+    si/li/sc/lc all green). Default ON; with
+    ``C4_STACK0_POP_LOADED_SHALLOW_CRUSH=0`` the family is byte-identical to the
+    prior build (competitor strength stays 500).
+    """
+    return os.environ.get("C4_STACK0_POP_LOADED_SHALLOW_CRUSH", "1") != "0"
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -5468,6 +5504,16 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
     def stack0_pop_loaded_output_rules() -> tuple[FFNRule, ...]:
         """Let strong L15 STACK0 memory loads beat stale pop-marker cleanup."""
 
+        # Shallow-competitor fix: a HUGE-magnitude L20 frame-address relay drives
+        # these units to runaway firing strength; the -500 competitor side-effects
+        # then crush the whole OUTPUT band and the relayed value loses to a stray
+        # marker (var/expr/if-bool full_trace step-5 PC desync). Drop the
+        # COMPETITOR strength to 5 (keep the +500 matching reinforcement) so the
+        # crush stays shallow and the relayed value survives POSITIVE. Genuine
+        # small-magnitude SI/LI/SC/LC loads win by their own reinforcement and are
+        # unaffected. See _stack0_pop_loaded_shallow_crush_enabled.
+        competitor = 5.0 if _stack0_pop_loaded_shallow_crush_enabled() else 500.0
+
         base_conditions = (
             ("MARK_STACK0", 1.0),
             ("HAS_SE", 1.0),
@@ -5507,7 +5553,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         ),
                         threshold=12.0,
                         gate=gate_mark_stack0,
-                        writes=byte_writes(value, strength=500.0),
+                        writes=Primitives.byte_value_writes(
+                            value, strength=500.0, competitor_strength=competitor,
+                        ),
                     )
                 )
         return tuple(rules)
