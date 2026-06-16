@@ -153,6 +153,63 @@ def addsub_declarative_enabled() -> bool:
     return os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
 
 
+def operand_from_memsp_enabled() -> bool:
+    """Return True iff the binary-op operand-A read is routed to ``mem[SP]``
+    via the L4 SP-to-ADDR_KEY + L8 mem-to-ALU memory-attention CAM
+    (DEFAULT OFF — opt-in via ``C4_OPERAND_FROM_MEMSP=1``).
+
+    This is the STACK0-emission-drop *prerequisite*. The binary-op operand-A
+    (the top-of-stack value that ADD/SUB/AND/OR/XOR/EQ/NE/SI/SC read) is
+    sourced today from the EMITTED STACK0 byte-0 token via L7 head 0's
+    ``STACK0_BYTE0``-keyed gather. When ``C4_NO_STACK0_EMIT=1`` drops the
+    STACK0 register block from the step, that emitted token is gone and the
+    operand read is starved (-130 full_trace, see
+    ``docs/NO_STACK0_EMIT_MEASURED_2026_06_16.md``).
+
+    When this flag is on:
+      * ``make_layer4_sp_to_addr_key_op`` (L4 attn heads 2-3) stages the live
+        SP value into the ADDR_KEY band at the AX marker (Q-side address).
+      * ``make_layer8_mem_to_alu_op`` (L8 attn head 5) reads ``mem[SP]`` byte 0
+        via the ADDR_KEY CAM (most-recent matching ``MEM_STORE`` wins via
+        ALiBi recency) and writes ``ALU_LO/HI`` at the AX marker — the exact
+        source/dest L7 head 0 uses today, one block later, sourced from
+        memory instead of the emitted token.
+      * L7 head 0's ``STACK0_BYTE0`` -> ALU write is suppressed (the L8 head
+        is the sole operand-A source; head 1's LEA/ADJ/ENT frame relay is
+        untouched).
+
+    This implements Phase 1 of ``docs/STACK0_VIA_MEM_ATTENTION_PLAN.md``
+    (the L4 + L8 ops were built but left ``enable=False`` / unvalidated).
+    DEFAULT OFF = byte-identical to HEAD. Flip on TOGETHER with
+    ``C4_NO_STACK0_EMIT`` to eliminate the Root #2 framing-drift class without
+    starving the operand read. With ``C4_NO_STACK0_EMIT=0`` (STACK0 still
+    emitted) it is a no-regression equivalence check (operand now read from
+    ``mem[SP]`` instead of the still-emitted token).
+    """
+    return os.environ.get("C4_OPERAND_FROM_MEMSP", "0") == "1"
+
+
+def no_stack0_emit_enabled() -> bool:
+    """Return True iff the STACK0 register block is dropped from the emitted
+    step (DEFAULT OFF — opt-in via ``C4_NO_STACK0_EMIT=1``).
+
+    Mirror of ``l0_ops._no_stack0_emit`` (kept here so the L1 positional-gate
+    fix and other ops can consult the same env switch without importing l0).
+    When on, the 35-token step collapses to 30 tokens (STACK0 marker + 4 value
+    bytes dropped), so the MEM register block shifts 5 positions earlier:
+    the d=6-from-BP slot that used to be STACK0 byte 0 is now MEM addr byte 0.
+    The ``STACK0_BYTE0`` positional flag (L1 FFN unit 0, fired at d=6 from BP)
+    must therefore be neutralized so it does not misfire onto the MEM addr
+    byte — see ``l1_ops._layer1_ffn_rules``.
+
+    This flag does NOT itself drop the emission (that machinery — the L0
+    marker-transition chain, ``Token.STEP_TOKENS``, the DraftVM oracle, the
+    decode offsets — lives on the ``proto/drop-stack0-emit-measure`` branch).
+    It is the per-op consultation point so flag-off is byte-identical.
+    """
+    return os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

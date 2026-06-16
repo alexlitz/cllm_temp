@@ -7,7 +7,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, no_stack0_emit_enabled
 
 
 # === L1 FFN unit layout (auto-fit offsets, Phase 7.B.1) =============
@@ -100,13 +100,27 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
 
     # Unit 0: STACK0_BYTE0 = L1H4[BP] AND IS_BYTE AND NOT H1[BP].
+    #
+    # STACK0_BYTE0 is a d=6-from-BP POSITIONAL flag (L1H4[BP] => d<=6.5, IS_BYTE,
+    # NOT H1[BP] => d>4.5). It fires on STACK0 byte 0 (offset 21 = d=6 from BP in
+    # the 35-token layout). Under C4_NO_STACK0_EMIT the STACK0 register block is
+    # dropped, so the MEM block shifts 5 tokens earlier and MEM addr byte 0 lands
+    # at d=6 from BP — exactly where this flag fires. Left as-is, the positional
+    # gate would MISFIRE onto MEM addr byte 0 and corrupt every consumer that
+    # reads STACK0_BYTE0 (L3/L10/L11/L14/L16). With the operand-A read re-routed
+    # to mem[SP] (C4_OPERAND_FROM_MEMSP) and the STACK0 emission gone, nothing
+    # legitimately needs this flag, so neutralize it: keep the unit allocated
+    # (5-unit byte-count guard) but raise the AND threshold unreachably high so
+    # it never fires. STACK0_BYTE0 then reads 0 everywhere (the STACK0 consumers
+    # go dark cleanly). Flag-off => threshold 1.5 => byte-identical to HEAD.
+    _stack0_byte0_threshold = 1.0e9 if no_stack0_emit_enabled() else 1.5
     rules.append(multi_way_and_rule(
         name="l1_stack0_byte0",
         conditions=(
             (f"L1H4+{BP_I}", 1.0),
             ("IS_BYTE", 1.0),
         ),
-        threshold=1.5,
+        threshold=_stack0_byte0_threshold,
         gate_terms=((f"H1+{BP_I}", -1.0),),
         gate_bias=1.0,
         writes=(("STACK0_BYTE0", write_scale),),

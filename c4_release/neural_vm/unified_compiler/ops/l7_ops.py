@@ -8,6 +8,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (  # noqa: F401
     _as_setdim_proxy,
     _empty_compiler_ir_factory,
+    operand_from_memsp_enabled,
 )
 
 
@@ -237,6 +238,34 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
     L = 15.0
     AX_I = 1
 
+    # STACK0-emission-drop prerequisite (C4_OPERAND_FROM_MEMSP): when the
+    # operand-A read is re-routed to mem[SP] via the L4 SP-to-ADDR_KEY + L8
+    # mem-to-ALU memory-attention CAM, head 0's STACK0_BYTE0 -> ALU write is
+    # the OLD operand source and must NOT also fire (otherwise it double-writes
+    # ALU from the emitted STACK0 token, and under C4_NO_STACK0_EMIT it reads
+    # the wrong d=6-from-BP token). Suppress head 0's V/O (the ALU write) so the
+    # L8 head 5 is the sole operand-A source. The Q/K gates are kept (zero
+    # contribution without V) so the head slot/layout is unchanged and head 1
+    # (LEA/ADJ/ENT frame relay) is untouched. Satisfies
+    # STACK0_VIA_MEM_ATTENTION_PLAN.md Phase 1 step 3 ("disable old L7 head 0").
+    _memsp = operand_from_memsp_enabled()
+    _head0_v = (
+        ()
+        if _memsp
+        else (
+            _band_projection_writes(1, BD.CLEAN_EMBED_LO)
+            + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
+        )
+    )
+    _head0_o = (
+        ()
+        if _memsp
+        else (
+            _band_output_writes(BD.ALU_LO, 1, 6.0)
+            + _band_output_writes(BD.ALU_HI, 17, 6.0)
+        )
+    )
+
     return (
         DeclarativeAttentionHeadSpec(
             head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_operand_gather.head_0"],
@@ -252,14 +281,8 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
                 AP(33, BD.OP_ENT, -L * 10),
             ),
             k=(AP(0, BD.STACK0_BYTE0, L), AP(33, BD.CONST, L)),
-            v=(
-                _band_projection_writes(1, BD.CLEAN_EMBED_LO)
-                + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
-            ),
-            o=(
-                _band_output_writes(BD.ALU_LO, 1, 6.0)
-                + _band_output_writes(BD.ALU_HI, 17, 6.0)
-            ),
+            v=_head0_v,
+            o=_head0_o,
         ),
         DeclarativeAttentionHeadSpec(
             head_idx=_L7_HEAD_LAYOUT_BY_NAME["layer7_operand_gather.head_1"],

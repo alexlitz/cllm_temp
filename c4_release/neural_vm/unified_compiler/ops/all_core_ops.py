@@ -30,7 +30,7 @@ from .user_input_ops import (  # noqa: F401
     make_layer6_getchar_routing_op,
 )
 from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
-from .shared import mul_width2_enabled  # noqa: F401
+from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -118,13 +118,16 @@ def all_core_ops(
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
         make_layer4_ffn_dep_anchor_op(),
-        # STACK0 via mem attention remains registered but disabled on the
-        # authoritative smoke path. Its L8 reader runs before the current
-        # neural ADDR_KEY decode, so MEM value tokens do not yet carry stable
-        # byte-address keys and the head can select the wrong store. L7's
-        # declarative STACK0 gather owns binary-pop operand 2 until an earlier
-        # address-key producer lands.
-        make_layer4_sp_to_addr_key_op(enable=False),
+        # STACK0 via mem attention: Q-side staging for the mem[SP] operand-A
+        # read. Flag-gated by C4_OPERAND_FROM_MEMSP (DEFAULT OFF =
+        # byte-identical). When on, this stages the live SP value into the
+        # ADDR_KEY band at the AX marker so the L8 mem-to-ALU head (below)
+        # can match mem[SP] by address. This is the STACK0-emission-drop
+        # prerequisite (docs/STACK0_VIA_MEM_ATTENTION_PLAN.md Phase 1):
+        # flip on TOGETHER with C4_NO_STACK0_EMIT so the binary-op operand
+        # survives without the emitted STACK0 token. With the flag off, L7's
+        # declarative STACK0 gather owns binary-pop operand 2 unchanged.
+        make_layer4_sp_to_addr_key_op(enable=operand_from_memsp_enabled()),
         make_layer5_fetch_op(),
         make_layer5_fetch_dep_anchor_op(),
         # Consumer-opcode LOOKAHEAD (#221 framing-drift fix; flag-gated
@@ -231,10 +234,14 @@ def all_core_ops(
         make_layer8_ffn_dep_anchor_op(),
         make_layer8_sp_gather_bake_op(),
         make_layer8_multibyte_fetch_bake_op(),
-        # Paired with the disabled L4 SP-to-ADDR_KEY staging above. Keep the
-        # op in the registry for topology/claims coverage, but leave the bake
-        # off until MEM value-byte address keys exist before L8.
-        make_layer8_mem_to_alu_op(enable=False),
+        # Paired with the L4 SP-to-ADDR_KEY staging above. Flag-gated by
+        # C4_OPERAND_FROM_MEMSP (DEFAULT OFF = byte-identical). When on, this
+        # head 5 reads mem[SP] byte 0 via the ADDR_KEY CAM (most-recent
+        # matching MEM_STORE wins via ALiBi recency) and writes ALU_LO/HI at
+        # the AX marker — the binary-op operand-A read re-routed from the
+        # emitted STACK0 token to memory. STACK0-emission-drop prerequisite;
+        # see make_layer4_sp_to_addr_key_op above.
+        make_layer8_mem_to_alu_op(enable=operand_from_memsp_enabled()),
         # B7-5 SP_GATHERED_THIS_STEP sentinel: marks MARK_SP rows with a
         # single bit indicating L8's SP gather has fired this step. Phase
         # 8.6 runs after all other L8 ops so the sentinel is visible to
