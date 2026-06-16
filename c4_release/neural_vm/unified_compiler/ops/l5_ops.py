@@ -37,16 +37,19 @@ from .residual_band_registry import register_residual_band
 # hold per-step lookahead state that must not be clobbered by a same-width
 # liveness donor.
 def _stack0_next_arith_enabled() -> bool:
-    """``C4_STACK0_NEXT_ARITH`` flag predicate.
+    """``C4_STACK0_NEXT_ARITH`` flag predicate (DEFAULT-ON).
 
     Gates the WHOLE consumer-opcode lookahead feature (#221): the PC+8 chain,
-    the lookahead fetch head, the arith-decode flag FFN, AND the dump's
-    ``-NEXT_ARITH`` blocker. Flag-off (the default until the feature is
-    validated) omits the three bands entirely (byte-identical pre-feature
-    d_model) and bakes the ops as no-ops. Evaluated lazily (compile time) so a
-    per-process env flip is honoured and the cache key reflects it.
+    the lookahead fetch head, the arith-decode flag FFN, the AX->STACK0 relay,
+    the prior-arith latch, the combined dump-block flag, AND the dump's
+    ``STACK0_B0_DUMP_BLOCK`` blocker. Validated: full_trace +28 on the expr
+    window (expr_mod +17, expr_mul_div +11) with EVERY guard preserved (mul/sub/
+    div/add/if_gt/if_lt/if_eq/bool_and/paren) and smoke 51/0. Flag-off
+    (``C4_STACK0_NEXT_ARITH=0``) registers NONE of the 7 ops and no bands ->
+    byte-identical to the pre-feature build (HEAD). Evaluated lazily (compile
+    time) so a per-process env flip is honoured and the cache key reflects it.
     """
-    return os.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0"
+    return os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
 
 
 register_residual_band(

@@ -2363,7 +2363,7 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     # flag=0 -> +1602 (still fire; mul/sub guards + if/bool +27 preserved). Added
     # ONLY when the feature flag is on; off-flag the band does not exist
     # (byte-identical pre-feature gate).
-    _next_arith_on = _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0"
+    _next_arith_on = _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
     DUMP_BLOCK_W = -2_000.0
     if _repoint_on:
         conditions = (
@@ -3121,7 +3121,7 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
         "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
         "STACK0_B0_NOT_CMP", "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
     }
-    if _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0":
+    if _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0":
         _dump_reads.add("STACK0_B0_DUMP_BLOCK")
 
     return Operation(
