@@ -111,9 +111,22 @@ class Token:
     IO_STATE_EMIT_THINKING = 275  # Internal state: emit THINKING_START next
     VOCAB_SIZE = 276
 
-    STEP_TOKENS = (
-        35  # Tokens per VM step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
-    )
+    # Tokens per VM step. Default 35: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1).
+    #
+    # PROTOTYPE (C4_NO_STACK0_EMIT=1): drop the redundant STACK0 register block
+    # (marker + 4 value bytes) from the EMITTED step -> 30 tokens:
+    # PC(5)+AX(5)+SP(5)+BP(5)+MEM(9)+SE(1). STACK0 == mem[SP] is fully recoverable
+    # from memory state (see DraftVM.draft_tokens), so its emission carries no
+    # information the decoder reads (full_trace only checks PC + AX). Removing it
+    # eliminates the Root #2 framing-drift class (a failed STACK0 byte breaks the
+    # fixed-stride framing). Resolved once at import; the runner sets the env
+    # before importing this module and bakes a fresh model per process.
+    import os as _os_step
+    if _os_step.environ.get("C4_NO_STACK0_EMIT", "0") != "0":
+        STEP_TOKENS = 30  # PC(5)+AX(5)+SP(5)+BP(5)+MEM(9)+SE(1) -- STACK0 dropped
+    else:
+        STEP_TOKENS = 35
+    del _os_step
 
 
 class AutoregressiveAttention(nn.Module):

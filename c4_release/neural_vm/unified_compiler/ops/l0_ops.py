@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os as _os_l0
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
@@ -7,6 +9,18 @@ from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .shared import _as_setdim_proxy
+
+
+def _no_stack0_emit() -> bool:
+    """PROTOTYPE flag: drop the STACK0 register block from the emitted step.
+
+    When ``C4_NO_STACK0_EMIT=1`` the L0 marker-transition chain skips
+    NEXT_STACK0 (emits NEXT_MEM straight after BP's value bytes), so the model
+    never emits ``Token.STACK0`` -> a 30-token step (matching
+    ``Token.STEP_TOKENS == 30`` and the DraftVM oracle). Default-off =
+    byte-identical 35-token build.
+    """
+    return _os_l0.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
 
 # L0 threshold-attention configuration shared between the bake_fn and the
 # declarative ``compiler_ir_factory``. The two lists are positional siblings:
@@ -93,15 +107,35 @@ def _phase_a_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     # role-meaningful byte index.
     PC_I, AX_I, SP_I, BP_I, MEM_I, SE_I = 0, 1, 2, 3, 4, 5
     write_scale = 2.0 / S
-    transitions = (
-        (f"H0+{SE_I}", None, "NEXT_PC"),
-        (f"H1+{PC_I}", f"H0+{PC_I}", "NEXT_AX"),
-        (f"H1+{AX_I}", f"H0+{AX_I}", "NEXT_SP"),
-        (f"H1+{SP_I}", f"H0+{SP_I}", "NEXT_BP"),
-        (f"H1+{BP_I}", f"H0+{BP_I}", "NEXT_STACK0"),
-        (f"H4+{BP_I}", f"H3+{BP_I}", "NEXT_MEM"),
-        (f"H3+{MEM_I}", f"H2+{MEM_I}", "NEXT_SE"),
-    )
+    if _no_stack0_emit():
+        # PROTOTYPE (C4_NO_STACK0_EMIT=1): drop the STACK0 register block from
+        # the emitted step. The marker chain skips STACK0: after BP's 4 value
+        # bytes (BP byte-3 row = d=4 from BP, the H1+BP AND NOT H0+BP gate that
+        # used to fire NEXT_STACK0) we emit NEXT_MEM directly, so the MEM marker
+        # follows BP byte-3. The STACK0->MEM transition (d=9, H4+BP) is dropped.
+        # The downstream MEM->SE transition is distance-from-MEM-marker so it is
+        # unaffected by the removed STACK0 tokens. NEXT_STACK0 is never written,
+        # so the LM head never emits Token.STACK0. (35-token: 7 transitions; the
+        # 30-token build has 6 -- the byte-identity unit-count guard in the bake
+        # is relaxed under the flag.)
+        transitions = (
+            (f"H0+{SE_I}", None, "NEXT_PC"),
+            (f"H1+{PC_I}", f"H0+{PC_I}", "NEXT_AX"),
+            (f"H1+{AX_I}", f"H0+{AX_I}", "NEXT_SP"),
+            (f"H1+{SP_I}", f"H0+{SP_I}", "NEXT_BP"),
+            (f"H1+{BP_I}", f"H0+{BP_I}", "NEXT_MEM"),
+            (f"H3+{MEM_I}", f"H2+{MEM_I}", "NEXT_SE"),
+        )
+    else:
+        transitions = (
+            (f"H0+{SE_I}", None, "NEXT_PC"),
+            (f"H1+{PC_I}", f"H0+{PC_I}", "NEXT_AX"),
+            (f"H1+{AX_I}", f"H0+{AX_I}", "NEXT_SP"),
+            (f"H1+{SP_I}", f"H0+{SP_I}", "NEXT_BP"),
+            (f"H1+{BP_I}", f"H0+{BP_I}", "NEXT_STACK0"),
+            (f"H4+{BP_I}", f"H3+{BP_I}", "NEXT_MEM"),
+            (f"H3+{MEM_I}", f"H2+{MEM_I}", "NEXT_SE"),
+        )
     rules = []
     for idx, (up_dim, gate_dim, out_dim) in enumerate(transitions):
         if gate_dim is None:
@@ -176,8 +210,12 @@ def make_phase_a_ffn_op() -> Operation:
         # Byte-identity guard: the helper's returned cursor MUST equal the
         # sum of all declared unit ranges. If the table drifts from the
         # helper's writes, this assertion fires before any weight surgery
-        # propagates downstream.
+        # propagates downstream. The PROTOTYPE 30-token build drops the
+        # BP->STACK0 + STACK0->MEM pair for a single BP->MEM transition (6
+        # units, not 7), so relax the count under the flag.
         expected_total = sum(n for _, n in _PHASE_A_FFN_UNIT_LAYOUT)
+        if _no_stack0_emit():
+            expected_total -= 1  # one fewer transition (no STACK0 marker)
         assert n0 == expected_total, (
             f"L0 phase_a_ffn unit cursor drift: helper wrote {n0} units, "
             f"allocator declared {expected_total}"

@@ -110,7 +110,14 @@ _UNPREDICTED_BUCKET_KEY = "unpredicted"
 # disagree at these positions. DraftVM is trusted for these offsets — its
 # values are derived from synchronized register state and match the model's
 # would-be emission for any correct C4 program.
-_UNSAFE_OFFSETS = frozenset(range(26, 34))
+# In the 30-token layout (C4_NO_STACK0_EMIT=1) the STACK0 register block is
+# gone, so the MEM section (marker + 4 addr + 4 val) shifts 5 positions earlier:
+# marker@20, addr 21..24, val 25..28, STEP_END@29. The unsafe band is the 8
+# MEM addr/val bytes (21..28).
+if Token.STEP_TOKENS == 30:
+    _UNSAFE_OFFSETS = frozenset(range(21, 29))
+else:
+    _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
 
 def _step_offset_field(offset: int) -> str:
@@ -122,8 +129,23 @@ def _step_offset_field(offset: int) -> str:
     e.g. ``AX[1]`` (byte 1 of REG_AX) or ``PC_marker``.
     """
     offset = int(offset) % Token.STEP_TOKENS
-    if offset == 34:
+    if offset == Token.STEP_TOKENS - 1:
         return "STEP_END/HALT"
+    if Token.STEP_TOKENS == 30:
+        # 30-token layout (C4_NO_STACK0_EMIT): STACK0 block dropped, MEM shifts
+        # 5 earlier. marker@20, addr 21..24, val 25..28, STEP_END@29.
+        field_starts = (
+            (0, "PC"), (5, "AX"), (10, "SP"), (15, "BP"), (20, "MEM"),
+        )
+        if offset >= 21:
+            if offset <= 24:
+                return f"MEM_ADDR[{offset - 21}]"
+            return f"MEM_VAL[{offset - 25}]"
+        for start, name in reversed(field_starts):
+            if offset >= start:
+                rel = offset - start
+                return f"{name}_marker" if rel == 0 else f"{name}[{rel - 1}]"
+        return f"off{offset}"
     field_starts = (
         (0, "PC"), (5, "AX"), (10, "SP"), (15, "BP"), (20, "STACK0"),
         (25, "MEM"),

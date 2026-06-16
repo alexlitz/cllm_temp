@@ -450,7 +450,15 @@ class DraftVM:
         return steps
 
     def draft_tokens(self):
-        """Encode current state as 35 tokens."""
+        """Encode current state as ``Token.STEP_TOKENS`` tokens.
+
+        Default layout = 35 tokens. With ``C4_NO_STACK0_EMIT=1``
+        (``Token.STEP_TOKENS == 30``) the STACK0 register block (marker + 4
+        value bytes) is dropped: STACK0 == ``mem[SP]`` is recoverable from
+        memory state, so it carries no information the decoder reads. The
+        oracle must agree with the model's emitted layout and the decode
+        stride, so this is gated by the SAME ``Token.STEP_TOKENS`` switch.
+        """
         tokens = []
         tokens.append(Token.REG_PC)
         tokens.extend(_le_bytes(self.pc))
@@ -460,11 +468,12 @@ class DraftVM:
         tokens.extend(_le_bytes(self.sp))
         tokens.append(Token.REG_BP)
         tokens.extend(_le_bytes(self.bp))
-        tokens.append(Token.STACK0)
-        tokens.extend(_le_bytes(self._mem_read(self.sp)))
+        if Token.STEP_TOKENS != 30:
+            tokens.append(Token.STACK0)
+            tokens.extend(_le_bytes(self._mem_read(self.sp)))
         tokens.append(Token.MEM)
         tokens.extend(_le_bytes(self._last_mem_addr))
         tokens.extend(_le_bytes(self._last_mem_val))
         tokens.append(Token.HALT if self.halted else Token.STEP_END)
-        assert len(tokens) == 35
+        assert len(tokens) == Token.STEP_TOKENS
         return tokens
