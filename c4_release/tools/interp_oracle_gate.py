@@ -36,14 +36,26 @@ over the production decode setup:
 
 Classes
 -------
-  * **PASS** — the interpreter's per-step ``(PC, AX)`` matches the oracle every
-    step through HALT (same criterion as ``--criterion full_trace``).
-  * **FAIL@step/byte + ATTRIBUTED RULE** — the first step+register+byte where the
-    interpreter diverges from the oracle, AND the single declarative rule whose
-    RUNTIME SwiGLU contribution dominates the wrong value at the predicting
-    position (the structural attribution: not "which rule could write" but
-    "which rule's actual output produced the wrong byte"). THIS IS THE KEY
-    OUTPUT — the highest-leverage fix target.
+  * **PASS** — the per-step ``(PC, AX)`` matches the oracle every step through
+    HALT (same criterion as ``--criterion full_trace``) AND the program is not
+    downstream of a cross-step poisoning correction (the guard below).
+  * **FAIL@step/byte + ATTRIBUTED RULE** (HIGH-confidence) — the first step where
+    the decode diverges, with the divergence AT OR BEFORE the cross-step poison
+    point, AND the single declarative rule whose RUNTIME SwiGLU contribution
+    dominates the wrong value. THIS IS THE KEY OUTPUT — the highest-leverage fix
+    target. Now covers the AX HIGH BYTES (1..3): the fixed-offset re-anchored
+    decode reads them faithfully when not poisoned (the edge_literal AX-byte-1
+    cluster matches the neural full_trace 10/10), so they are attributed, not
+    deferred.
+  * **CROSS-STEP** — the divergence (or a clean single-forward "pass" with a
+    register-VALUE correction before the last step) is DOWNSTREAM of production's
+    autoregressive context poisoning, which a single teacher-forced forward
+    cannot reproduce (the model "recovers" under teacher forcing). The var/func
+    PC framing-drift + deep expr AX live here. The gate FLAGS these (never
+    over-claims a verdict the single forward can't certify) and points at the GPU
+    ``--faithfulness-check`` (the real production decode) to resolve them. See
+    ``_value_correction_step`` for the soundness guard (0 false-trusts over the
+    validation sample).
   * **ALU-OPAQUE** — the divergence is at/after a step whose opcode is one of the
     4 still-imperative composite ALU blocks (ADD/SUB -> AddSub5StageBlock,
     MUL -> FlattenedALUMul, DIV/MOD -> FlattenedDivMod, SHL/SHR ->
@@ -58,8 +70,10 @@ Faithfulness / trustworthiness
 the same per-step decode with the REAL NEURAL model (not the oracle) on a sample
 and confirms interpreter==neural step-for-step. Where they disagree, that is an
 interpreter COVERAGE GAP (not a model bug) and is reported separately so the
-gate never mis-attributes. The summary quantifies the corpus split:
-INTERPRETABLE+faithful (gate is authoritative) vs ALU-OPAQUE vs faithfulness-gap.
+gate never mis-attributes. It is also the authoritative resolver for the
+CROSS-STEP class (the autoregressive framing-drift the CPU single forward flags
+but cannot decode). The summary quantifies the corpus split: HIGH-confidence
+(gate is authoritative, incl. AX-high-byte) vs CROSS-STEP vs ALU-OPAQUE.
 
 Usage
 -----
@@ -108,6 +122,9 @@ from neural_vm.constants import IMMEDIATE_SIZE, PADDING_SIZE  # noqa: E402
 from tools.faithful_interpreter_validate import (  # noqa: E402
     faithful_full_forward,
     _faithful_residual_pre_head,
+    _attn_block_to_specs,
+    _faithful_attn_forward,
+    _COMPOSITE_FFN,
 )
 
 
@@ -138,6 +155,82 @@ def build_production_model(device: str = "cpu"):
     model = model.to(device)
     model.eval()
     return model, layout
+
+
+# ---------------------------------------------------------------------------
+# Cached faithful forward.
+#
+# ``faithful_full_forward`` re-extracts every block's head-specs from the baked
+# weights on EVERY call (~2.2M ``nonzero()`` calls per forward => ~4.5 s on CPU,
+# >90 % of its runtime, and INDEPENDENT of context length). The gate runs one
+# forward per program (the single teacher-forced pass) plus one residual pass
+# for attribution, so that re-extraction would dominate the corpus run.
+# ``FaithfulForwardCache`` extracts the head-specs + dense FFN weights ONCE and
+# reuses them, dropping each forward to ~0.4-1.1 s (5-13x) while staying
+# BYTE-IDENTICAL to ``faithful_full_forward`` (validated by
+# tools/faithful_interpreter_validate.py + the per-position argmax parity check).
+# ---------------------------------------------------------------------------
+
+
+class FaithfulForwardCache:
+    """One-time extraction of the faithful-forward block specs + FFN weights.
+
+    ``forward(tape)`` reproduces ``faithful_full_forward(model, tape)`` exactly
+    (same softmax1+ALiBi attention math, same SwiGLU FFN, same composite-ALU
+    real-block fallback, same LM head) but without the per-call head-spec
+    re-extraction. Built on CPU; the gate never touches the GPU.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.blocks = []
+        for block in model.blocks:
+            attn = block.attn
+            heads = _attn_block_to_specs(attn, model.d_model)
+            is_comp = type(block.ffn).__name__ in _COMPOSITE_FFN
+            if is_comp:
+                ff = None
+            else:
+                ffn = block.ffn
+                W_up = (ffn.W_up.data.to_dense() if ffn.W_up.is_sparse
+                        else ffn.W_up.data).clone()
+                W_gate = (ffn.W_gate.data.to_dense() if ffn.W_gate.is_sparse
+                          else ffn.W_gate.data).clone()
+                W_down = (ffn.W_down.data.to_dense() if ffn.W_down.is_sparse
+                          else ffn.W_down.data).clone()
+                ff = (W_up, ffn.b_up.clone(), W_gate, ffn.b_gate.clone(), W_down)
+            self.blocks.append((
+                heads, attn.num_heads, attn.head_dim,
+                getattr(attn, "use_softmax1", True), block, is_comp, ff,
+            ))
+        self.head_w = model.head.weight.clone()
+        self.head_b = model.head.bias.clone()
+
+    @torch.no_grad()
+    def _residual_pre_head(self, tape: Sequence[int]) -> torch.Tensor:
+        """Faithful per-token residual after all blocks, before the LM head —
+        byte-identical to ``_faithful_residual_pre_head(model, tape)`` but cached.
+        """
+        tok = torch.tensor([list(tape)], dtype=torch.long)
+        x = self.model.embed(tok)[0]
+        for (heads, nh, hd, sm1, block, is_comp, ff) in self.blocks:
+            x = _faithful_attn_forward(heads, x, nh, hd, sm1)
+            if is_comp:
+                x = block.ffn(x.unsqueeze(0))[0]
+            else:
+                W_up, b_up, W_gate, b_gate, W_down = ff
+                up = x @ W_up.t() + b_up
+                gate = x @ W_gate.t() + b_gate
+                hidden = torch.nn.functional.silu(up) * gate
+                x = x + hidden @ W_down.t()
+        return x
+
+    @torch.no_grad()
+    def forward(self, tape: Sequence[int]) -> torch.Tensor:
+        """Return ``[S, vocab]`` logits — byte-identical to
+        ``faithful_full_forward(model, tape)``."""
+        x = self._residual_pre_head(tape)
+        return x @ self.head_w.t() + self.head_b
 
 
 # ---------------------------------------------------------------------------
@@ -250,12 +343,81 @@ def _decode_reg_fixed(slice_tokens: Sequence[int], marker_off: int) -> int:
     Decoding at the FIXED offset (not by searching for the marker token)
     re-anchors the marker exactly as production re-anchors the first token of
     each step via the Python STEP_END dispatch — so a passing program decodes
-    cleanly.
+    cleanly. This is what makes the AX HIGH BYTES (1..3) faithful: their value
+    tokens sit at fixed offsets 7/8/9 and the model's argmax there over the
+    teacher-forced tape == the model's own emission for the steps that are not
+    downstream of a cross-step poisoning correction (see ``_value_correction_step``).
     """
     val = 0
     for j in range(4):
         val |= (int(slice_tokens[marker_off + 1 + j]) & 0xFF) << (j * 8)
     return val & 0xFFFFFFFF
+
+
+# ---------------------------------------------------------------------------
+# The cross-step faithfulness GUARD (the key to AX-high-byte / framing-drift
+# confidence).
+#
+# A SINGLE teacher-forced forward reads the model's argmax over the DraftVM's
+# byte-exact oracle tape. For a step whose context is NOT yet poisoned, that
+# argmax == the model's own production emission (validated byte-for-byte). But
+# production decode is AUTOREGRESSIVE: the moment the model emits a REGISTER
+# VALUE byte that differs from the oracle tape (a "value correction"), production
+# appends the WRONG byte and re-syncs its DraftVM from the model's now-wrong
+# register state — so EVERY later step reads a poisoned context the teacher-
+# forced single forward never sees (the model "recovers" under teacher forcing).
+# Therefore:
+#   * the single-forward per-step (PC, AX) decode is FAITHFUL to production for
+#     every step AT OR BEFORE the first register-VALUE-byte correction, and
+#   * it is UNRELIABLE (the autoregressive framing-drift / cross-step class) for
+#     any step strictly after it.
+# A MARKER-token misprediction (offsets 0/5/10/15/20/25/34) does NOT poison —
+# production re-anchors the marker structurally (STEP_END dispatch), so only the
+# register VALUE bytes matter. This guard is the soundness contract: when it
+# says "faithful" the gate's verdict provably matches the neural full_trace
+# runner (measured: 0 false-trusts over the var/func/expr/edge sample); when it
+# says "cross-step" the verdict may be a teacher-forcing artifact and is reported
+# as a distinct CROSS-STEP class, never silently trusted.
+# ---------------------------------------------------------------------------
+
+# Step-relative offsets that carry a REGISTER VALUE byte the model re-emits on a
+# later step (PC 1..4, AX 6..9, SP 11..14, BP 16..19, STACK0 21..24). The MEM
+# addr/val offsets 26..33 are the ``_UNSAFE_OFFSETS`` (DraftVM-trusted, never a
+# model correction); the marker offsets 0/5/10/15/20/25/34 are re-anchored.
+_VALUE_OFFSETS = frozenset(
+    list(range(1, 5)) + list(range(6, 10)) + list(range(11, 15))
+    + list(range(16, 20)) + list(range(21, 25))
+)
+# MEM addr/val bytes the DraftVM is trusted for (production never reads a model
+# correction here — the embedding's MEM-metadata injection makes them disagree
+# with the flat argmax for EVERY program). Mirrors batched_pure_neural._UNSAFE_OFFSETS.
+_UNSAFE_OFFSETS = frozenset(range(26, 34))
+
+
+def _value_correction_step(
+    pred_fn, draft_tokens: Sequence[int], offsets=_VALUE_OFFSETS,
+) -> Optional[int]:
+    """First VM step at which the model's emitted register-VALUE byte (at one of
+    ``offsets``, default all five registers) diverges from the DraftVM oracle
+    tape (the cross-step poisoning point).
+
+    ``pred_fn(t)`` is the model's argmax for draft position ``t`` (= argmax at
+    ``prefix + t - 1`` over the teacher-forced forward). A divergence at a value
+    offset is the FIRST place production's autoregressive context goes wrong.
+    Returns the step index, or ``None`` if the model reproduces every value byte
+    (single-forward faithful). Marker / MEM offsets are never a poisoning
+    correction (re-anchored / DraftVM-trusted). The default ``_VALUE_OFFSETS``
+    (PC/AX/SP/BP/STACK0) is the SOUND guard — an early SP/BP/STACK0 correction
+    can poison a later PC (var/func), so the full set is required (0 false-trusts
+    measured; PC+AX-only gave 34+).
+    """
+    for t in range(len(draft_tokens)):
+        off = t % STEP_TOKENS
+        if off not in offsets:
+            continue
+        if int(pred_fn(t)) != int(draft_tokens[t]):
+            return t // STEP_TOKENS
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -281,16 +443,24 @@ class GateResult:
     attributed_rule: Optional[str] = None
     attributed_contrib: Optional[float] = None
     alu_op: Optional[str] = None
-    # "high"  = PC or AX byte-0 divergence — the flat teacher-forced decode is
-    #           faithful here (these determine control flow + the single-byte
-    #           result); the attributed rule is trustworthy.
-    # "low"   = AX byte>=1 (or SP/BP/STACK0) divergence — the multi-byte high
-    #           bytes are subject to the cross-step re-anchoring that a flat
-    #           forward cannot reproduce (a known faithfulness gap; see the
-    #           module docstring). The divergence MAY be a real bug (production
-    #           also fails some) OR a flat-decode artifact — confirm with
-    #           --faithfulness-check before trusting the attribution.
+    # Confidence of the (step, reg, byte) divergence verdict — driven by the
+    # cross-step poisoning guard ``_value_correction_step``, NOT by which byte:
+    #
+    #   "high"       = the divergence is AT OR BEFORE the first register-VALUE-
+    #                  byte correction, so the single-forward decode provably
+    #                  matches the neural full_trace runner (incl. PC, AX byte 0,
+    #                  AND AX bytes 1..3 — the AX-HIGH-BYTE case). Attributed.
+    #   "cross-step" = the divergence is strictly AFTER a value correction, so it
+    #                  rides production's autoregressive context poisoning that a
+    #                  single teacher-forced forward cannot reproduce (the
+    #                  framing-drift / cross-step class: var/func PC, deep expr
+    #                  AX). The single-forward verdict is a teacher-forcing
+    #                  artifact — NOT attributed; resolve with the GPU
+    #                  ``--faithfulness-check`` (the real production decode).
     confidence: str = "high"
+    # The cross-step poisoning point (first register-VALUE-byte correction step),
+    # or None if the whole program is single-forward faithful. Set on FAIL.
+    value_correction_step: Optional[int] = None
     note: str = ""
 
 
@@ -298,17 +468,25 @@ PASS = "PASS"
 FAIL = "FAIL"
 ALU_OPAQUE = "ALU-OPAQUE"
 ERROR = "ERROR"
+HIGH = "high"
+CROSS_STEP = "cross-step"
 
-# Bytes the flat teacher-forced decode reproduces faithfully vs production:
-# PC (all 4 bytes — control flow) and AX byte 0 (the single-byte result). AX
-# bytes 1..3 and the SP/BP/STACK0 registers ride the cross-step re-anchoring
-# the flat forward cannot replicate, so a divergence there is LOW confidence.
-def _div_confidence(reg: str, byte_k: int) -> str:
-    if reg == "PC":
-        return "high"
-    if reg == "AX" and byte_k == 0:
-        return "high"
-    return "low"
+
+def _div_confidence(div_step: int, value_corr_step: Optional[int]) -> str:
+    """HIGH-confidence iff the divergence is at or before the first cross-step
+    poisoning correction (so the single teacher-forced forward == production);
+    CROSS-STEP otherwise (the autoregressive framing-drift class).
+
+    This replaces the old per-byte heuristic ("PC/AX-byte0 = high, AX-high-byte
+    = low"). The byte INDEX is irrelevant to faithfulness — what matters is
+    whether the step is downstream of a value correction that poisons the
+    autoregressive context. AX bytes 1..3 ARE faithful when not poisoned (the
+    edge_literal cluster: 10/10 vs neural); PC IS unfaithful when poisoned (the
+    var/func cluster). See ``_value_correction_step``.
+    """
+    if value_corr_step is None or div_step <= value_corr_step:
+        return HIGH
+    return CROSS_STEP
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +501,7 @@ class GateContext:
     dim_positions: Dict[str, int]
     flat_ffn_ops: List[object]        # ops with IR FFN rules (for attribution)
     interp: FaithfulInterpreter
+    fwd: "FaithfulForwardCache"       # cached faithful forward (5-13x faster)
 
 
 def build_gate_context(verbose: bool = True) -> GateContext:
@@ -345,13 +524,15 @@ def build_gate_context(verbose: bool = True) -> GateContext:
         d_model=model.d_model, num_heads=model.blocks[0].attn.num_heads,
         head_dim=model.blocks[0].attn.head_dim,
     )
+    fwd = FaithfulForwardCache(model)
     if verbose:
         print(f"[interp-oracle-gate] model: d_model={model.d_model} "
-              f"blocks={len(model.blocks)} ops={len(flat_ops)}",
+              f"blocks={len(model.blocks)} ops={len(flat_ops)} "
+              f"(cached faithful forward ready)",
               file=sys.stderr, flush=True)
     return GateContext(
         model=model, layout=layout, dim_positions=dim_positions,
-        flat_ffn_ops=flat_ops, interp=interp,
+        flat_ffn_ops=flat_ops, interp=interp, fwd=fwd,
     )
 
 
@@ -390,7 +571,7 @@ def classify_program(
     n_steps = len(ot.steps)
 
     try:
-        logits = faithful_full_forward(ctx.model, full_ctx)
+        logits = ctx.fwd.forward(full_ctx)
         fa = logits.argmax(dim=-1).tolist()
     except Exception as exc:  # noqa: BLE001
         return GateResult(name=name, cluster=cluster, classification=ERROR,
@@ -400,8 +581,22 @@ def classify_program(
     def pred_tok(t: int) -> int:
         return int(fa[prefix + t - 1])
 
+    # The cross-step faithfulness guard: the first VM step at which the model's
+    # emitted register-VALUE byte diverges from the oracle tape. Every step AT OR
+    # BEFORE it decodes faithfully from this single teacher-forced forward;
+    # anything strictly after rides production's autoregressive context poisoning
+    # (the framing-drift / cross-step class) the single forward cannot reproduce.
+    # The guard uses ALL register-value offsets (PC/AX/SP/BP/STACK0): an early
+    # SP/BP/STACK0 correction CAN poison a later PC (the var/func cluster), so a
+    # PC+AX-only guard would falsely certify those — measured 0 false-trusts with
+    # the full set, 34+ with PC+AX-only.
+    vcorr = _value_correction_step(pred_tok, ot.draft_tokens)
+
     # Per step, decode the model's predicted (PC, AX) from its draft slice and
-    # compare to the oracle. FIRST diverging byte wins.
+    # compare to the oracle. FIRST diverging byte wins. The decode is at the
+    # FIXED (re-anchored) value offsets — production re-anchors the marker via
+    # STEP_END dispatch, so the AX HIGH BYTES (1..3) decode faithfully here for
+    # any step not downstream of a value correction (the guard above).
     for s in range(n_steps):
         base = s * STEP_TOKENS
         slice_pred = [pred_tok(base + k) for k in range(STEP_TOKENS)]
@@ -421,40 +616,43 @@ def classify_program(
                 # ALU-OPAQUE? The step's opcode is a composite ALU block the
                 # interpreter cannot execute from IR — flag, do NOT attribute.
                 opcode = ot.opcodes[s] if s < len(ot.opcodes) else -1
-                conf = _div_confidence(reg, k)
+                conf = _div_confidence(s, vcorr)
                 if opcode in _ALU_OPAQUE_OPCODE:
                     return GateResult(
                         name=name, cluster=cluster, classification=ALU_OPAQUE,
                         n_steps=n_steps, div_step=s, div_reg=reg, div_byte=k,
                         expected=exp_b, got=got_b, expected_reg=o_val,
                         got_reg=g_val, alu_op=_ALU_OPAQUE_OPCODE[opcode],
-                        confidence=conf,
+                        confidence=conf, value_correction_step=vcorr,
                         note=(f"divergence at step {s} {reg}[{k}] is at/after "
                               f"opaque ALU op {_ALU_OPAQUE_OPCODE[opcode]} "
                               f"(no IR rule form; needs imperative GPU path)"),
                     )
-                # Attribute the wrong byte to its owning declarative rule.
-                # Only attribute HIGH-confidence (PC / AX byte-0) divergences:
-                # a LOW-confidence (AX high-byte cross-step) divergence may be a
-                # flat-decode artifact, so naming a rule there would mislead.
+                # Attribute the wrong byte to its owning declarative rule. Only
+                # attribute HIGH-confidence divergences (at/before the cross-step
+                # poisoning point): a CROSS-STEP divergence may be a teacher-
+                # forcing artifact, so naming a rule there would mislead.
                 attr_op = attr_rule = None
                 attr_c = None
-                if attribute and conf == "high":
+                if attribute and conf == HIGH:
                     attr_op, attr_rule, attr_c = _attribute_byte(
                         ctx, full_ctx, prefix, s, reg, k, got_b,
                     )
                 op_name = _OPCODE_NAME.get(opcode, f"op{opcode}")
-                low_tag = ("  [LOW-CONFIDENCE: AX high-byte cross-step "
-                           "re-anchor — confirm with --faithfulness-check]"
-                           if conf == "low" else "")
+                xs_tag = ("  [CROSS-STEP: divergence is downstream of a value "
+                          f"correction at step {vcorr} — production's "
+                          "autoregressive poisoning; resolve with "
+                          "--faithfulness-check (GPU)]"
+                          if conf == CROSS_STEP else "")
                 return GateResult(
                     name=name, cluster=cluster, classification=FAIL,
                     n_steps=n_steps, div_step=s, div_reg=reg, div_byte=k,
                     expected=exp_b, got=got_b, expected_reg=o_val, got_reg=g_val,
                     attributed_op=attr_op, attributed_rule=attr_rule,
                     attributed_contrib=attr_c, confidence=conf,
+                    value_correction_step=vcorr,
                     note=(f"step {s} opcode={op_name} {reg}[{k}] "
-                          f"exp=0x{exp_b:02x} got=0x{got_b:02x}" + low_tag),
+                          f"exp=0x{exp_b:02x} got=0x{got_b:02x}" + xs_tag),
                 )
     # No (PC, AX) divergence found. BUT if the program's path executes an
     # opaque composite-ALU opcode, the gate CANNOT certify a PASS: the efficient
@@ -476,10 +674,43 @@ def classify_program(
                   f"forward is not bit-certified vs production — needs the "
                   f"imperative GPU path"),
         )
+    # The single teacher-forced forward found NO (PC, AX) divergence. If the
+    # model emitted a register-VALUE byte that diverged from the oracle tape at
+    # some step (``vcorr`` set) at or before the LAST checked step, the gate
+    # CANNOT certify PASS: under teacher forcing the model "recovers" each later
+    # step (it is fed the correct tape), but production's autoregressive decode
+    # would have poisoned the context from ``vcorr`` on and may FAIL a later step
+    # the single forward cannot see (the var/func cluster: neural fails @ step 4,
+    # the single forward "passes"). A correction at the LAST step (``vcorr >=
+    # n_steps - 1``) cannot poison any later (PC, AX) check, so it stays a faithful
+    # PASS (the edge_literal single/last-step cluster). The PASS-path uses the
+    # FULL-offset correction step (``vcorr``): an SP/BP/STACK0 correction at an
+    # early step CAN poison a later PC (the var/func cluster — neural fails @ step
+    # 4 from a step-1 BP correction). SOUNDNESS demands the full guard here:
+    # PC+AX-only would falsely PASS those 5 var programs (measured). The cost is
+    # conservative — some genuine passes whose only corrections are SP/BP/STACK0
+    # (e.g. the eq/lt/boolean smoke) are flagged CROSS-STEP rather than PASSed;
+    # that is the safe direction (the gate never claims a PASS it cannot back).
+    # Resolve those with --faithfulness-check (GPU). A correction at the LAST step
+    # (``vcorr >= n_steps - 1``) cannot poison any later (PC, AX) check, so it
+    # stays a faithful PASS.
+    if vcorr is not None and vcorr < n_steps - 1:
+        return GateResult(
+            name=name, cluster=cluster, classification=FAIL,
+            n_steps=n_steps, div_step=None, confidence=CROSS_STEP,
+            value_correction_step=vcorr,
+            note=(f"single-forward decode found no (PC, AX) divergence, but the "
+                  f"model emitted a register-VALUE byte that diverged from the "
+                  f"oracle tape at step {vcorr}; production's autoregressive "
+                  f"decode would poison the context from there and may fail a "
+                  f"later step the teacher-forced forward cannot see "
+                  f"(CROSS-STEP — resolve with --faithfulness-check (GPU))"),
+        )
     return GateResult(name=name, cluster=cluster, classification=PASS,
                       n_steps=n_steps, note=f"all {n_steps} steps match oracle")
 
 
+# ---------------------------------------------------------------------------
 # AX byte0 is decoded from the OUTPUT_LO/OUTPUT_HI result nibble cells. (PC and
 # AX bytes 1..3 are decoded from per-byte families that are not uniformly
 # OUTPUT_*; we attribute the AX byte-0 / OUTPUT path precisely and fall back to
@@ -509,7 +740,7 @@ def _attribute_byte(
     moff = _REG_OFFSETS[reg]
     pred_pos = prefix + step * STEP_TOKENS + moff + byte_k
     try:
-        resid = _faithful_residual_pre_head(ctx.model, full_ctx)[pred_pos]
+        resid = ctx.fwd._residual_pre_head(full_ctx)[pred_pos]
     except Exception:  # noqa: BLE001
         return None, None, None
 
@@ -589,7 +820,7 @@ def _free_gpu() -> Optional[int]:
 @torch.no_grad()
 def faithfulness_check(
     ctx: GateContext, programs: List[dict], gpu: int, max_steps: int = 48,
-) -> Tuple[int, int, List[str]]:
+) -> Tuple[int, int, List[str], List[str]]:
     """Run interpreter-vs-NEURAL per-step decode on ``programs`` (GPU build).
 
     Builds the REAL neural runner on ``gpu`` and, for each program, runs the
@@ -597,7 +828,7 @@ def faithfulness_check(
     the CPU interpreter's per-step decode over the SAME oracle tape, and counts
     programs where they AGREE step-for-step. Disagreements are interpreter
     COVERAGE GAPS (reported by name) so the gate never mis-attributes them.
-    Returns ``(n_faithful, n_authoritative, gap_names, lowconf_gap_names)``.
+    Returns ``(n_faithful, n_authoritative, gap_names, cross_step_gap_names)``.
     ``CUDA_VISIBLE_DEVICES`` is already pinned to ``gpu`` by ``main`` (before
     any torch init) so the runner lands on the GPU.
     """
@@ -623,8 +854,8 @@ def faithfulness_check(
 
     n_faithful = 0
     n_authoritative = 0          # gate is authoritative (PASS or HIGH-conf FAIL)
-    gaps: List[str] = []         # interp != neural and NOT a known low-conf gap
-    lowconf_gaps: List[str] = []  # the characterized AX high-byte flat-decode gap
+    gaps: List[str] = []         # interp != neural where the gate claimed HIGH-conf
+    xs_gaps: List[str] = []      # CROSS-STEP class (flagged, not authoritative)
     for p, nres in zip(programs, neural):
         # CPU interpreter verdict (no attribution to keep it fast).
         ires = classify_program(
@@ -636,20 +867,20 @@ def faithfulness_check(
         i_pass = ires.classification == PASS
         n_pass = n_status == "pass"
 
-        # LOW-confidence interp FAIL (AX high-byte cross-step): this is the
-        # CHARACTERIZED flat-decode gap, NOT an interpreter math bug. Count it
-        # as a coverage gap only when it actually disagrees with the neural
-        # verdict (interp fails, neural passes).
-        if ires.classification == FAIL and ires.confidence == "low":
-            if n_pass:
-                lowconf_gaps.append(
-                    f"{p['name']} (interp FAIL? @ step{ires.div_step} "
-                    f"AX[{ires.div_byte}] cross-step, neural PASS)")
-            else:
-                n_faithful += 1  # both fail — consistent
+        # CROSS-STEP interp verdict (divergence downstream of a value correction):
+        # the autoregressive framing-drift class the single forward cannot
+        # reproduce — flagged, NOT authoritative. Report whether it agrees with
+        # neural for the record, but never count it against the gate.
+        if ires.classification == FAIL and ires.confidence == CROSS_STEP:
+            agree = (not n_pass) and (ires.div_step == n_div if ires.div_step is not None else True)
+            xs_gaps.append(
+                f"{p['name']} (interp CROSS-STEP @ "
+                f"step{ires.div_step}/poison@{ires.value_correction_step}, "
+                f"neural={n_status}@{n_div}{' [agree]' if agree else ''})")
             continue
 
-        # The gate is AUTHORITATIVE for this program (PASS or HIGH-conf FAIL).
+        # The gate is AUTHORITATIVE for this program (PASS or HIGH-conf FAIL,
+        # incl. the now-promoted AX-high-byte cases).
         n_authoritative += 1
         if ires.classification == ALU_OPAQUE:
             if not n_pass:
@@ -666,7 +897,7 @@ def faithfulness_check(
                 f"{p['name']} (interp={ires.classification}@{ires.div_step} "
                 f"neural={n_status}@{n_div})"
             )
-    return n_faithful, n_authoritative, gaps, lowconf_gaps
+    return n_faithful, n_authoritative, gaps, xs_gaps
 
 
 # ---------------------------------------------------------------------------
@@ -788,19 +1019,27 @@ def run_set(ctx: GateContext, programs: List[dict], title: str,
             print(f"  ALU-OPAQUE   {r.name}  step={r.div_step} {r.alu_op}")
         elif r.classification == ERROR:
             print(f"  ERROR        {r.name}  {r.note}")
+        elif r.confidence == CROSS_STEP:
+            # CROSS-STEP: the single-forward verdict is downstream of a value
+            # correction (autoregressive framing-drift). Report the poisoning
+            # point, not an attributed rule (the verdict is not single-forward
+            # faithful).
+            loc = (f"step={r.div_step} {r.div_reg}[{r.div_byte}]"
+                   if r.div_step is not None else "(no flat divergence)")
+            print(f"  {'CROSS-STEP':<12} {r.name}  {loc}  "
+                  f"value-corruption@step{r.value_correction_step}  "
+                  f"[autoregressive framing-drift — confirm with --faithfulness-check (GPU)]")
         else:
-            tag = "FAIL" if r.confidence == "high" else "FAIL?"
+            # HIGH-confidence FAIL (incl. AX bytes 1..3 not downstream of a
+            # value correction — the AX-high-byte case is now attributed).
             rule = (f"{r.attributed_op}::{r.attributed_rule}"
                     if r.attributed_rule
-                    else ("(low-conf AX high-byte — not attributed)"
-                          if r.confidence == "low"
-                          else "(no runtime writer / default cell)"))
-            print(f"  {tag:<12} {r.name}  step={r.div_step} "
+                    else "(no runtime writer / default cell)")
+            print(f"  {'FAIL':<12} {r.name}  step={r.div_step} "
                   f"{r.div_reg}[{r.div_byte}] exp=0x{r.expected:02x} "
                   f"got=0x{r.got:02x} -> {rule}"
                   + (f"  (contrib={r.attributed_contrib:+.3f})"
-                     if r.attributed_contrib is not None else "")
-                  + ("  [LOW-CONF cross-step]" if r.confidence == "low" else ""))
+                     if r.attributed_contrib is not None else ""))
     _summary(results, title)
     return results
 
@@ -813,17 +1052,19 @@ def _summary(results: List[GateResult], title: str) -> None:
     for r in results:
         counts[r.classification] = counts.get(r.classification, 0) + 1
     n_fail_high = sum(1 for r in results
-                      if r.classification == FAIL and r.confidence == "high")
-    n_fail_low = sum(1 for r in results
-                     if r.classification == FAIL and r.confidence == "low")
+                      if r.classification == FAIL and r.confidence == HIGH)
+    n_fail_xs = sum(1 for r in results
+                    if r.classification == FAIL and r.confidence == CROSS_STEP)
     print("-" * 90)
     print(f"  SUMMARY [{title}]: {n} programs")
     print(f"    {PASS:<14} {counts.get(PASS, 0)}")
-    print(f"    {'FAIL':<14} {n_fail_high}   (HIGH-confidence: PC / AX byte-0 "
-          f"divergence — attributed)")
-    if n_fail_low:
-        print(f"    {'FAIL?':<14} {n_fail_low}   (LOW-confidence: AX high-byte "
-              f"cross-step re-anchor — possible flat-decode gap)")
+    print(f"    {'FAIL':<14} {n_fail_high}   (HIGH-confidence: divergence at/"
+          f"before the cross-step poison point — PC / AX byte-0 / AX high bytes "
+          f"— attributed)")
+    if n_fail_xs:
+        print(f"    {'CROSS-STEP':<14} {n_fail_xs}   (divergence downstream of a "
+              f"value correction — autoregressive framing-drift; resolve with "
+              f"--faithfulness-check (GPU))")
     if counts.get(ALU_OPAQUE):
         print(f"    {ALU_OPAQUE:<14} {counts[ALU_OPAQUE]}")
     if counts.get(ERROR):
@@ -832,14 +1073,14 @@ def _summary(results: List[GateResult], title: str) -> None:
     print(f"    gate AUTHORITATIVE (PASS + HIGH-confidence FAIL) = "
           f"{interp_authoritative}/{n}")
     print(f"    ALU-OPAQUE (needs imperative GPU ALU path) = "
-          f"{counts.get(ALU_OPAQUE, 0)}/{n}; LOW-confidence (confirm with "
-          f"--faithfulness-check) = {n_fail_low}/{n}")
+          f"{counts.get(ALU_OPAQUE, 0)}/{n}; CROSS-STEP (autoregressive, confirm "
+          f"with --faithfulness-check (GPU)) = {n_fail_xs}/{n}")
 
     # Top owning rules by FAIL frequency — the highest-leverage fix targets.
     # Only HIGH-confidence attributed FAILs (the trustworthy ones).
     rule_freq: Dict[str, int] = {}
     for r in results:
-        if (r.classification == FAIL and r.confidence == "high"
+        if (r.classification == FAIL and r.confidence == HIGH
                 and r.attributed_rule):
             key = f"{r.attributed_op}::{r.attributed_rule}"
             rule_freq[key] = rule_freq.get(key, 0) + 1
@@ -851,7 +1092,7 @@ def _summary(results: List[GateResult], title: str) -> None:
             print(f"    {freq:3d}x  {key}")
     # FAILs with no runtime writer (default/relay cells) are a distinct class.
     n_nowriter = sum(1 for r in results
-                     if r.classification == FAIL and r.confidence == "high"
+                     if r.classification == FAIL and r.confidence == HIGH
                      and not r.attributed_rule)
     if n_nowriter:
         print(f"  ({n_nowriter} HIGH-confidence FAILs had NO runtime FFN writer "
@@ -975,14 +1216,15 @@ def main(argv=None) -> int:
                   f"per-step on {args.faithfulness_check} sampled programs...")
             sample = corpus_programs(sample=args.faithfulness_check,
                                      max_decl_steps=args.max_decl_steps)
-            n_ok, n_auth, gaps, lowconf = faithfulness_check(
+            n_ok, n_auth, gaps, xs = faithfulness_check(
                 ctx, sample, gpu, args.max_steps)
             print(f"  Over {len(sample)} sampled programs: gate is "
-                  f"AUTHORITATIVE on {n_auth} (PASS or HIGH-confidence FAIL); "
-                  f"of those, interp == neural on {n_ok}/{n_auth}.")
-            print(f"  LOW-confidence (AX high-byte cross-step) gaps where the "
-                  f"flat decode disagrees with neural: {len(lowconf)} "
-                  f"(CHARACTERIZED flat-decode limitation, not a model bug).")
+                  f"AUTHORITATIVE on {n_auth} (PASS or HIGH-confidence FAIL, "
+                  f"incl. the AX-high-byte cases); of those, interp == neural "
+                  f"on {n_ok}/{n_auth}.")
+            print(f"  CROSS-STEP (autoregressive framing-drift) programs flagged "
+                  f"(NOT authoritative; resolve with the GPU --faithfulness-check): "
+                  f"{len(xs)}.")
             if gaps:
                 print(f"  UNEXPECTED FAITHFULNESS GAPS ({len(gaps)} — HIGH-conf "
                       f"interp verdict disagreed with neural; these would be "
@@ -993,10 +1235,10 @@ def main(argv=None) -> int:
                 print("  No UNEXPECTED gaps — every HIGH-confidence verdict "
                       "matched the neural model (the gate is authoritative "
                       "exactly where it claims to be).")
-            if lowconf:
-                print(f"  (low-confidence cross-step gaps, reported separately "
-                      f"so the gate never mis-attributes them:)")
-                for g in lowconf[:12]:
+            if xs:
+                print(f"  (CROSS-STEP programs, flagged so the gate never "
+                      f"mis-attributes the autoregressive framing-drift; resolve on GPU:)")
+                for g in xs[:12]:
                     print(f"      - {g}")
         print()
 
