@@ -2350,6 +2350,21 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
     # firing -> the re-point ships DEFAULT-ON (smoke 51/0). The inert DUMP path
     # keeps the original 2-way AND (byte-identical).
     NOT_CMP_BLOCK_W = -1_000.0
+    # Consumer-arith blocker (#221, flag-gated C4_STACK0_NEXT_ARITH). The bounded
+    # ``STACK0_B0_DUMP_BLOCK`` flag (=1 on a MULTI-op intermediate-operand frame:
+    # its CONSUMER -- the next instr at PC+8 -- is arithmetic AND a PRIOR arith op
+    # already produced the on-stack value; 0 on single-op operand frames and on
+    # comparison frames) marks the expr arithmetic-INTERMEDIATE frames the dump
+    # must NOT touch (the fresh value should emit, like the DUMP-OFF build). A
+    # -1000 blocker (like NOT_CMP): a flagged row -> +1602 - 1000 = +602 ... not
+    # enough; the firing margin is ~595 over thr, so use a blocker that exceeds
+    # it. STACK0_B0_DUMP_BLOCK is bounded 0/1 so -2000 gives a flagged row
+    # +1602 - 2000 = -398 < 1007 (dark). Single-op / comparison frames have the
+    # flag=0 -> +1602 (still fire; mul/sub guards + if/bool +27 preserved). Added
+    # ONLY when the feature flag is on; off-flag the band does not exist
+    # (byte-identical pre-feature gate).
+    _next_arith_on = _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0"
+    DUMP_BLOCK_W = -2_000.0
     if _repoint_on:
         conditions = (
             # MARK_STACK0 hard prerequisite: SIG_W margin + SIG_HARD prereq,
@@ -2359,6 +2374,9 @@ def _stack0_byte0_dump_repopulate_rules() -> tuple[FFNRule, ...]:
             ("STACK0_B0_CARRIED", CARRIED_W),
             ("STACK0_B0_SHARP", SHARP_W),
             ("STACK0_B0_NOT_CMP", NOT_CMP_BLOCK_W),
+        ) + (
+            (("STACK0_B0_DUMP_BLOCK", DUMP_BLOCK_W),)
+            if _next_arith_on else ()
         ) + marker_blockers
         # 3-way AND + NON-COMPARISON blocker + MARK_STACK0 hard prerequisite:
         # a carried clean-carry COMPARISON row -> 1000+2 + 3*100 + 3*100 + 0 =
@@ -3074,6 +3092,7 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
             "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
             "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
             "STACK0_B0_CARRIED", "STACK0_B0_SHARP", "STACK0_B0_NOT_CMP",
+            "STACK0_B0_DUMP_BLOCK",
         }
         dim_map = {}
         for _nm in Primitives.ffn_rule_dim_names(rules):
@@ -3092,13 +3111,22 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
     ir = CompilerIR()
     ir.layer(0).ffn.rules.extend(rules)
 
+    # Build reads as a LITERAL set OFF (no ``set | set`` union, which produces a
+    # different internal hash-table iteration order than the literal even with
+    # identical elements -> would non-deterministically perturb the dep-graph
+    # topological sort + downstream FFN packing on a flag-OFF build). ON adds the
+    # one extra band element.
+    _dump_reads = {
+        "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+        "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
+        "STACK0_B0_NOT_CMP", "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
+    }
+    if _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "0") != "0":
+        _dump_reads.add("STACK0_B0_DUMP_BLOCK")
+
     return Operation(
         name="stack0_byte0_dump_repopulate",
-        reads={
-            "MARK_STACK0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
-            "MARK_MEM", "MARK_SE", "STACK0_B0_CARRIED", "STACK0_B0_SHARP",
-            "STACK0_B0_NOT_CMP", "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
-        },
+        reads=_dump_reads,
         # Flag ON: re-points into the byte's own H1/H3 emission cells (the fix).
         # Flag OFF: writes the inert STACK0_B0_DUMP_{H1,H3} bands (byte-identical).
         writes={"H1", "H3", "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3"},

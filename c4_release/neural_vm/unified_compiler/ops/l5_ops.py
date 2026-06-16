@@ -69,6 +69,30 @@ register_residual_band(
     "STACK0_B0_NEXT_ARITH", 1, owner="make_next_arith_flag_op",
     flag=_stack0_next_arith_enabled, never_share=True,
 )
+# Prior-arith durability latch (#221 NARROWING). The consumer-arith flag fires
+# on EVERY operand frame whose next instruction is arithmetic -- but the dump is
+# LOAD-BEARING on a single-op operand frame (``a*b``: the IMM-b frame's dump
+# correctly re-supplies operand ``a`` for the MUL). Only a MULTI-op expression's
+# INTERMEDIATE-operand frame (``a*b/c``: the IMM-c frame, where a PRIOR arith
+# already produced the on-stack intermediate) needs the dump blocked. The two
+# frames are batched-identical in every existing flag (CARRIED=100, SHARP=0,
+# PREV_DOM=0, NOT_CMP=0). The discriminator is "did a PRIOR arith op already
+# execute in this expression": false for single-op (dump load-bearing, keep),
+# true for multi-op (intermediate on stack, block). This durable latch ORs the
+# per-step arith opcode across steps so the block ANDs it.
+register_residual_band(
+    "STACK0_PRIOR_ARITH", 1, owner="make_prior_arith_latch_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
+# Combined dump-block flag = AND(NEXT_ARITH consumer, PRIOR_ARITH latch). The
+# dump reads THIS single bounded flag as its blocker: it fires (=1) only on a
+# multi-op intermediate-operand frame (consumer is arith AND a prior arith
+# already produced the on-stack value), never on a single-op operand frame
+# (no prior arith) or a comparison frame (NEXT_ARITH=0).
+register_residual_band(
+    "STACK0_B0_DUMP_BLOCK", 1, owner="make_dump_block_flag_op",
+    flag=_stack0_next_arith_enabled, never_share=True,
+)
 
 
 def _nested_jsr_pc_fix_enabled() -> bool:
@@ -1488,6 +1512,184 @@ def make_next_arith_relay_op() -> Operation:
         # (head 5); head 6 is a distinct free slot.
         target_op_name="layer9_marker_suppress",
         requires={"after": "next_arith_flag"} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prior-arith durability latch head (#221 narrowing).
+# ---------------------------------------------------------------------------
+# Detects "has ANY arithmetic op already executed before this frame" -- the
+# discriminator between a single-op operand frame (dump load-bearing, keep) and
+# a multi-op INTERMEDIATE-operand frame (dump emits stale, block). A CAUSAL head
+# (Q@MARK_STACK0, K matches the per-step arith-opcode bands OP_ADD..OP_MOD on
+# prior AX rows, V=CONST=1) gives this for free: the causal mask means the head
+# only sees PRIOR positions, so a*b's IMM-b frame (the MUL is a FUTURE position)
+# reads no prior arith (latch 0 -> keep dump), while a*b/c's IMM-c frame (the
+# MUL executed at an EARLIER step) reads it (latch 1 -> block dump). Flat ALiBi
+# so every prior arith row contributes; the per-step arith opcode sits at the
+# step's AX-marker row at +5.
+_PRIOR_ARITH_LATCH_HEAD_IDX = 7  # free on L9 (heads 0..3, dump-carry 5, relay 6)
+_PRIOR_ARITH_OPCODES = (
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
+)
+
+
+def _allocate_prior_arith_latch_heads() -> "AttentionHeadAllocator":
+    from ...attention_head_allocator import AttentionHeadAllocator
+    allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
+    allocator.alloc("prior_arith_latch.head_7", layer_idx=9,
+                    pin=_PRIOR_ARITH_LATCH_HEAD_IDX)
+    return allocator
+
+
+def _prior_arith_latch_head_spec(
+    dim_positions: dict, head_idx: int, *, S: float = 100.0,
+) -> DeclarativeAttentionHeadSpec:
+    """Causal head: STACK0_PRIOR_ARITH = 1 iff any PRIOR position carried an
+    arith opcode. Q@MARK_STACK0; K matches OP_ADD..OP_MOD (the per-step arith
+    opcodes, ~5 at their AX row) + a faint CONST self-match sink; V=CONST=1;
+    O->STACK0_PRIOR_ARITH. Flat ALiBi so all prior arith rows are reachable; the
+    softmax mass on ANY prior arith row drives the latch toward 1."""
+    def _P(name: str) -> int:
+        return int(dim_positions[name])
+    MARK_STACK0 = _P("MARK_STACK0")
+    MARK_AX = _P("MARK_AX")
+    CONST = _P("CONST")
+    LATCH = _P("STACK0_PRIOR_ARITH")
+    L = float(S)
+    OPW = 12.0   # K weight per arith opcode dim (opcode ~5 at AX row -> ~60)
+    # Q fires on STACK0 marker rows; the single K slot scores prior AX rows by
+    # their arith-opcode content (high on an arith result row, ~0 elsewhere) plus
+    # a small CONST baseline on EVERY row so a no-prior-arith frame has a defined
+    # (non-arith) attention target whose V contributes ~0.
+    q = (
+        AP(0, MARK_STACK0, L),
+    )
+    k = (
+        tuple(AP(0, _P(op), OPW) for op in _PRIOR_ARITH_OPCODES)
+        + (AP(0, MARK_AX, 0.5),)   # tiny baseline: AX rows are the candidates
+    )
+    # V = sum of the arith-opcode dims (~5 on a prior arith AX row, ~0 on any
+    # non-arith row). When a prior arith exists the softmax concentrates on it
+    # -> latch ~5; with NO prior arith the mass spreads over non-arith AX rows
+    # whose arith-opcode V is ~0 -> latch ~0. The block reads it thresholded.
+    v = tuple(AP(0, _P(op), 1.0) for op in _PRIOR_ARITH_OPCODES)
+    o = (AO(LATCH, 0, 1.0),)
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx, q=q, k=k, v=v, o=o, alibi_slope=0.0,
+    )
+
+
+def make_prior_arith_latch_op() -> Operation:
+    """L9 attn head 7: latch STACK0_PRIOR_ARITH=1 on STACK0 rows with a prior arith.
+
+    Causal head: the per-step arith opcode (OP_ADD..OP_MOD) sits at each step's
+    AX-marker row; a STACK0 marker row attends back to any such PRIOR row and
+    latches 1. The dump block ANDs this so it only blocks the dump on multi-op
+    intermediate frames (prior arith executed), NOT single-op operand frames
+    (where the dump is load-bearing). No-op when the flag is off.
+    """
+    enabled = _stack0_next_arith_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        attn = block.attn
+        allocator = _allocate_prior_arith_latch_heads()
+        attn._prior_arith_latch_head_allocator = allocator
+        head_idx = allocator.heads()[-1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec = _prior_arith_latch_head_spec(dim_positions, head_idx, S=S)
+        Primitives.generate_attention_head(attn, spec, HD)
+
+    return Operation(
+        name="prior_arith_latch",
+        reads=({"MARK_STACK0", "MARK_AX", "CONST"} | set(_PRIOR_ARITH_OPCODES))
+              if enabled else set(),
+        writes={"STACK0_PRIOR_ARITH"} if enabled else set(),
+        kind="block",
+        target_op_name="layer9_marker_suppress",
+        requires={"after": "next_arith_flag"} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md",
+    )
+
+
+def _dump_block_flag_rules() -> tuple[FFNRule, ...]:
+    """1 rule: STACK0_B0_DUMP_BLOCK = AND(NEXT_ARITH consumer, PRIOR_ARITH latch).
+
+    Fires (=1) only on a multi-op intermediate-operand frame: the consumer (next
+    instr) is arithmetic (STACK0_B0_NEXT_ARITH ~50) AND a prior arith already
+    executed (STACK0_PRIOR_ARITH ~5). Single-op operand frames have PRIOR_ARITH=0
+    (the only arith is the FUTURE consumer); comparison frames have NEXT_ARITH=0.
+    Bounded inputs (50 and 5), small AND weights so the silu stays finite.
+    """
+    return (
+        multi_way_and_rule(
+            name="stack0_dump_block_and",
+            conditions=(
+                ("STACK0_B0_NEXT_ARITH", 0.1),   # ~50 -> +5.0
+                ("STACK0_PRIOR_ARITH", 0.5),     # ~5  -> +2.5
+            ),
+            threshold=6.0,   # both present: 5.0 + 2.5 = 7.5 > 6 (fires); either
+                             # alone: 5.0 or 2.5 < 6 (dark). AND.
+            writes=(("STACK0_B0_DUMP_BLOCK", 1.0),),
+        ),
+    )
+
+
+def make_dump_block_flag_op() -> Operation:
+    """FFN: combined dump-block flag = AND(NEXT_ARITH, PRIOR_ARITH).
+
+    Standalone PureFFN post_op on the L9 block (after the latch + relay). Writes
+    the single bounded STACK0_B0_DUMP_BLOCK flag the L25-tail dump reads as its
+    consumer-arith blocker. No-op when the feature flag is off.
+    """
+    enabled = _stack0_next_arith_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        from ...base_layers import PureFFN
+        rules = _dump_block_flag_rules()
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None and hasattr(attn, "W_q"):
+            try:
+                d_model = attn.W_q.shape[0]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            d_model = max(int(v) for v in dim_positions.values()) + 1
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    return Operation(
+        name="dump_block_flag",
+        reads={"STACK0_B0_NEXT_ARITH", "STACK0_PRIOR_ARITH"} if enabled else set(),
+        writes={"STACK0_B0_DUMP_BLOCK"} if enabled else set(),
+        kind="block",
+        target_op_name="layer9_marker_suppress",
+        requires={"after": ("next_arith_relay", "prior_arith_latch")} if enabled else {},
         declarative_bake_fn=bake,
         compiler_ir=CompilerIR(),
         migrated=True,

@@ -10,6 +10,7 @@ from .l2_ops import *  # noqa: F401,F403
 from .l3_ops import *  # noqa: F401,F403
 from .l4_ops import *  # noqa: F401,F403
 from .l5_ops import *  # noqa: F401,F403
+from .l5_ops import _stack0_next_arith_enabled  # noqa: F401 (underscore name)
 from .l6_ops import *  # noqa: F401,F403
 from .l7_ops import *  # noqa: F401,F403
 from .l8_ops import *  # noqa: F401,F403
@@ -133,17 +134,25 @@ def all_core_ops(
         # CONSUMER opcode (the next instruction), causally unavailable at the
         # operand frame -- but the single-slot C4 ISA puts it at a fixed PC+8 in
         # program memory. (1) build PC+8, (2) fetch op2's opcode byte by
-        # ADDR_KEY content-match, (3) decode "arith consumer" -> a bounded flag
-        # the dump reads as a blocker so it skips arith-consumer operand frames
-        # (fresh value survives) while keeping the +27 on cmp/branch frames.
-        # See l5_ops.make_lookahead_pc8_chain_op / _opcode_fetch / _next_arith.
-        make_lookahead_pc8_chain_op(),
-        make_lookahead_opcode_fetch_op(),
-        make_next_arith_flag_op(),
-        # Broadcast STACK0_B0_NEXT_ARITH from the step's AX row (where the flag
-        # was decoded) to its STACK0-marker row (where the dump fires), via an
-        # intra-step relay head (Q@MARK_STACK0, K@MARK_AX, positive ALiBi).
-        make_next_arith_relay_op(),
+        # ADDR_KEY content-match, (3) decode "arith consumer", (4) relay it to the
+        # STACK0 row, (5) AND a prior-arith latch -> the bounded dump-block flag
+        # the dump reads as a blocker so it skips MULTI-op arith-intermediate
+        # operand frames (fresh value survives) while keeping the +27 on cmp/
+        # branch frames AND the single-op operand-frame dump (mul/sub guards).
+        # The whole chain is registered ONLY when the feature flag is on so a
+        # flag-off build is byte-identical to HEAD (no op-graph / scheduling
+        # perturbation). See l5_ops.make_lookahead_pc8_chain_op etc.
+        *(
+            [
+                make_lookahead_pc8_chain_op(),
+                make_lookahead_opcode_fetch_op(),
+                make_next_arith_flag_op(),
+                make_next_arith_relay_op(),
+                make_prior_arith_latch_op(),
+                make_dump_block_flag_op(),
+            ]
+            if _stack0_next_arith_enabled() else []
+        ),
         # V9 GETCHAR neural read scaffolding (BLOG_SPEC.md:851).
         # Phase 1: registered but disabled (enable=False). The runner-side
         # _inject_getchar shim still owns byte transfer until phase 2
