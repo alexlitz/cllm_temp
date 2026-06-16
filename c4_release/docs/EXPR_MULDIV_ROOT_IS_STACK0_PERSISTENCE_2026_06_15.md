@@ -218,3 +218,83 @@ propagates), which is a new multi-op head behavior, NOT a tail refinement.
 New probe: `tools/probe_stack0_framechain.py` (per-frame byte0 across blocks +
 op2 ALU read; the tool that localized the 16-survives-to-block-37 fact).
 No model edit landed; smoke 51/0; HEAD `47246509` byte-identical.
+
+---
+
+# RESOLVED 2026-06-15 (#221 comprehensive lane): consumer-opcode lookahead + prior-arith latch — +28 full_trace, guards held, smoke 51/0
+
+The "future opcode is causally unavailable" blocker is REAL within a single
+forward pass, but the C4 ISA is **single-slot** (each instruction is one
+`INSTR_WIDTH=8`-byte slot `op + (imm<<8)`; PC_OFFSET=2), so the consumer (next
+instruction) sits at a FIXED `PC+8` in **program memory**, fetchable exactly
+like the L5 opcode fetch. The landed mechanism (`C4_STACK0_NEXT_ARITH`,
+DEFAULT-ON, commits acdccc68 / a8051a63 / 7675368d / 88cc5598):
+
+1. **`lookahead_pc8_chain`** (L4 post-op FFN): build the `PC+8` address from
+   `EMBED_LO/HI` via the declarative `nibble_rotation_chain` (offset=8, carry)
+   -> `LOOKAHEAD_PC` band.
+2. **`lookahead_opcode_fetch`** (L5 head): content-match `PC+8` vs the immutable
+   per-CODE-position `ADDR_KEY`, copy op2's `CLEAN_EMBED` opcode-byte nibbles ->
+   `NEXT_OPCODE`. (Mirrors `layer5_fetch` head 1.)
+3. **`next_arith_flag`** (L6 FFN): decode "consumer is arithmetic"
+   (OR/XOR/AND/SHL/SHR/ADD/SUB/MUL/DIV/MOD) -> bounded `STACK0_B0_NEXT_ARITH`.
+4. **`next_arith_relay`** (L9 head): broadcast the flag from the step's AX row
+   (where `NEXT_OPCODE` lives) to its STACK0-marker row (where the dump fires).
+5. **`prior_arith_latch`** (L9 CAUSAL head): `STACK0_PRIOR_ARITH=1` iff some
+   PRIOR position carried an arith opcode. **This is the lever.** Causality gives
+   the single-op-vs-multi-op discriminator FOR FREE: `a*b`'s IMM-b operand frame
+   sees the MUL as a FUTURE position (latch 0 -> KEEP the dump, which correctly
+   re-supplies operand `a`), while `a*b/c`'s IMM-c frame sees the EARLIER MUL
+   (latch 1 -> BLOCK the dump, which would emit the stale operand). The two
+   frames are batched-identical in every other flag (CARRIED=100, SHARP=0,
+   PREV_DOM=0, NOT_CMP=0) — the prior-arith latch is the ONLY separator.
+6. **`dump_block_flag`** (L9 FFN): `STACK0_B0_DUMP_BLOCK = AND(NEXT_ARITH,
+   PRIOR_ARITH)`; the L25-tail dump re-point reads it as a -2000 blocker.
+
+## Why the naive blocker was a TRADE and the latch is a WIN
+
+"Block the dump on ANY arith-consumer frame" was NET **-4** (expr_mul_div +9,
+but expr_paren -5 / mul -3 / sub -4): the dump is LOAD-BEARING on single-op
+operand frames (`a*b`: the dump re-supplies operand `a` for the MUL), which ALSO
+have an arith consumer. The prior-arith latch excludes exactly those (no prior
+arith on the first-operand frame), recovering all guards.
+
+## A/B (spec_k=0, GPU0, `tools/run_1096_canonical.py --criterion full_trace`)
+
+| cluster      | base (HEAD 072461c0) | ON  | Δ |
+|--------------|----------------------|-----|----|
+| expr_mod     | 3                    | 20  | **+17** |
+| expr_mul_div | 0                    | 11  | **+11** |
+| expr_paren   | 19                   | 19  | 0 |
+| if_gt        | 17                   | 17  | 0 |
+| if_lt        | 21                   | 21  | 0 |
+| if_eq        | 21                   | 21  | 0 |
+| bool_and     | 16                   | 16  | 0 |
+| mul          | 24                   | 24  | 0 |
+| sub          | 23                   | 23  | 0 |
+| div          | 47                   | 47  | 0 |
+| add          | 40                   | 40  | 0 |
+| **expr window total** | **107**     |**135**| **+28** |
+
+Smoke 51/0 (authoritative pytest, default-ON). `C4_STACK0_NEXT_ARITH=0` is
+BYTE-IDENTICAL to HEAD (all 721 weight tensors match; verified atomically at
+fixed PYTHONHASHSEED + cache cleared — the shared cross-worktree disk cache
+`~/.cache/c4_release` produces spurious "block-40 diff" readings otherwise).
+
+## What this does NOT fix
+
+`expr_add_mul` stays 0/25 (the ADD intermediate path has a separate residual
+issue) and the **var clusters stay 0/25 full_trace** (var's full_trace blocker
+is the L3 SP_byte2 root per `project_var_failure_mode_shifted`, upstream of and
+independent from this expr corruptor — no regression, but no conversion). The
+remaining expr_mul_div / expr_mod fails (14/25, 5/25) are the MULTI-BYTE
+intermediates where blocking the dump lets the post-L25-nuke OUTPUT survive as
+garbage rather than the true intermediate (e.g. `14*56/8` -> 770 not 98): the
+true win there needs the higher-risk **value-faithful** emission on the
+blocked frames (re-supply the real prev-frame byte0), now cleanly gateable on
+`STACK0_B0_DUMP_BLOCK` — a follow-up, not attempted this lane.
+
+New probes (spec_k=0, BUILT dims): `tools/probe_consumer_opcode.py` (consumer
+opcode at block 8/41), `tools/probe_temp_lookahead.py` (TEMP=PC+1 confirms the
+single-slot +8 lookahead), `tools/probe_frame_discriminator.py` (confirms NO
+same-frame separator), `tools/probe_next_arith_band.py` (band correctness).
