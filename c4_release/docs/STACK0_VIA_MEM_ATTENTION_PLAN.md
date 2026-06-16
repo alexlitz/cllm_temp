@@ -357,3 +357,70 @@ SP-to-AX relay + test-fix sweep), then 1-2 per subsequent phase.
    zeroed (not just unused) — verified by a small unit test that
    asserts `attn.W_q[0:HD].abs().sum() == 0` for L7 attn head 0.
 5. `purity_guard.py` does not regress.
+
+## 10. MEASUREMENT VERDICT — 2026-06-16 (combined-flag A/B, REFUTED)
+
+The thesis ("`C4_NO_STACK0_EMIT` + `C4_OPERAND_FROM_MEMSP` together become
+net-positive on full_trace by killing Root #2 framing-drift while the L4+L8
+mem[SP] CAM restores the operand") was driven to a verdict and is **REFUTED
+by measurement**. The combined-flag build is a TOTAL framing collapse, not a
+net win, and the emission-drop is broken even standalone — upstream of and
+independent from the operand re-route.
+
+### Byte-identity gate (both flags default OFF) — PASS
+Golden in the original brief (`ce9bf961…`) was STALE (pre ISA-DSL-carry
+migrations now in main). The correct golden for this base is
+**`7474f26955e79619…`** — and the flag-OFF whole-model state_dict SHA256
+equals `main`'s exactly (`tools/_isa_golden_hash.py`, CPU, disk_cache=False).
+Flags are byte-identical to golden when OFF.
+
+### Combined-flag results (BOTH flags ON), spec_k=0
+- **Smoke (`pytest tests/test_smoke.py`, authoritative): 16 pass / 35 FAIL**
+  (baseline 51/0). Every stack-operand op breaks: add, or/and/xor, ALL
+  comparisons (eq/ne/lt/gt/le/ge), ALL memory (si/li/sc/lc), shifts, 16-bit,
+  cmp_and_branch. `test_add_basic` (10+32) returns `16843050 = 0x0101010A`:
+  low byte 0x0A=10 (operand-A read, NO add of 32) + 0x01 leak in bytes 1-3.
+- **full_trace on a 525-program representative slice (controls add/sub/div/mod
+  + Root #2 var/if/expr/bool): 0 / 525 pass** vs **310/525 flag-OFF**.
+  Cluster delta: Root #2 clusters 126→0 (−126), controls (add/sub/div/mod)
+  184→0 (−184). Net **−310 on the slice; ≈ −389 vs the full-corpus 389
+  baseline**. ALL 525 diverge at step 1 (281) or step 2 (244); 369/525 show a
+  PC high-byte leak (`got_pc > 0xFFFF`, e.g. `0x01010121`), 156 are
+  PC-correct/AX-wrong (the operand truncation, add 654→142=0x8E byte-0-only).
+
+### Root cause — the emission-drop reframe is broken at the EMISSION layer
+`strict_trace` (token-identity, spec_k=0) localizes the FIRST divergence:
+- **Both flags ON:** step 0, offset **19 = BP[3]**, model emits value-byte
+  token **1**, oracle expects **0**. That stray `0x01` is the byte-1-3 leak
+  seen in every decoded PC/AX.
+- **Emission-drop ALONE (`C4_NO_STACK0_EMIT=1`, operand flag OFF):** *also*
+  0-passing. `add_0` diverges at step 1 **offset 0 = PC_marker**, expecting
+  token 257 (REG_PC) but emitting **0** — the 30-token build cannot even emit
+  a coherent next-step register frame. `var_simple_0` diverges at BP[1]
+  (expected 255, got 0).
+
+So the 30-token L0 marker-transition reframe (drop NEXT_STACK0, BP→MEM direct)
+corrupts the **register-marker / value-byte EMISSION** at step boundaries
+(missing/zeroed PC marker, stray `0x01` at BP value bytes). This is upstream
+of the operand path; **the L4+L8 mem[SP] CAM cannot rescue it** because PC and
+the BP register frame have nothing to do with the binary-op operand. The
+recovery commits' L1 STACK0_BYTE0 neutralization (d=6) and the
+`batched_pure_neural`/`speculative` decode-offset adaptation are correct as
+far as they go, but they do NOT cover the broken BP value-byte / PC-marker
+emission in the shifted 30-token frame.
+
+### Operand-A status under the CAM
+The CAM IS firing — `test_add_basic` returns operand-A=10 in ALU byte-0,
+proving the L4 SP→ADDR_KEY stage + L8 head-5 mem[SP] read deliver byte 0.
+But: (a) it delivers byte 0 ONLY (multi-byte operands truncate: 654→142), and
+(b) it is moot while the step frame itself is corrupt.
+
+### Verdict
+NOT net-positive; net **≈ −389** vs baseline. To make these flags viable, the
+emission-drop must FIRST be fixed at the L0 emission layer so the 30-token
+build emits coherent register markers + correct BP/SP/PC value bytes at every
+step boundary (current break: PC marker dropped at step-1 offset 0; stray
+`0x01` at BP value bytes). Only after the 30-token frame is byte-clean at
+step 0 (no operand involved) does the operand re-route become measurable; and
+even then the CAM needs a byte-1+ path (it is byte-0-only today). Flags remain
+default-OFF + byte-identical to golden; no production behavior changed.
