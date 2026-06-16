@@ -227,13 +227,50 @@ total; stabilization only buys us a finite number to look at.
 
 ---
 
-## 6. LR `1e-5` and `1e-7` (forgetting-curve fill-in)
+## 6. Supplementary sweep — lower LR, plain SGD, and a trust-region anchor
 
-_(populated when the runs complete; the matrix's first `1e-5` attempt OOM'd
-under a multi-agent shared-GPU memory spike — not a model issue — and was
-re-run.)_
+Three follow-ups (harness flags `--optimizer {adamw,sgd}` and `--anchor-lambda`)
+asked whether *any* gradient-based knob rescues stability. 25-program sample
+(`0-9,1031-1045`, the add + edge_literal clusters), 30 steps, eval every 10.
+`PASS-survive` = how many of the 12 baseline-passing programs still pass.
 
-<!-- RESULTS_1e5_1e7 -->
+| optimizer | LR     | anchor λ | step 0 | step 10 | step 30 |
+|-----------|--------|:--------:|:------:|:-------:|:-------:|
+| AdamW     | `1e-10`| —        | 12/12  | **0/12**| 0/12    |
+| AdamW     | `1e-12`| —        | 12/12  | **0/12**| 0/12    |
+| SGD       | `1e-8` | —        | 12/12  | **0/12**| 0/12    |
+| SGD       | `1e-10`| —        | 12/12  | **0/12**| 0/12    |
+| AdamW     | `1e-5` | 1.0      | 12/12  | **0/12**| 0/12    |
+| SGD       | `1e-6` | 1000     | 12/12  | **0/12**| 0/12    |
+
+Three conclusions, all reinforcing §2 + §7:
+
+1. **Lower LR does not help.** Extending the LR grid two more orders of magnitude
+   (`1e-10`, `1e-12`) reproduces the identical first-eval cliff. Consistent with
+   the break-threshold estimate `LR × 1e26 (cancellation) × 100^k (amplification)
+   < margin ⟹ LR ≲ 1e-46`: no LR that does anything is small enough.
+
+2. **It is NOT an AdamW-normalization artifact.** Plain SGD (per-step delta
+   `∝ lr·grad`, no RMS normalization) collapses at `1e-8` and `1e-10` just as
+   totally. The first-step catastrophe is optimizer-independent — it is the
+   architecture's `S=100` amplification of any perturbation, not Adam spreading a
+   tiny gradient into a `~lr` step.
+
+3. **A trust-region anchor does not rescue it.** The L2 penalty `λ‖W−W₀‖²` to the
+   compiled weights is **0 at step 0** (no drift yet), so it cannot oppose the
+   fatal first step; by the time drift exists, the cancellation is already broken.
+   AdamW λ=1.0 and even SGD λ=1000 both collapse. The only λ that holds the
+   passing set is one large enough to make every step ≈ 0 — i.e. *freeze* the
+   model (stable-but-inert), which learns nothing. This is the **stable XOR
+   effective** boundary made explicit: survival requires not moving.
+
+**Net:** no gradient-based modification (LR, optimizer, or trust-region anchor)
+yields a regime that is both stable and able to move. Stability is reachable only
+*architecturally* — lower `S`, baked-in residual normalization, or a redundant
+(non-exact-cancellation) encoding — and each of those changes the model and trades
+away the byte-exactness that is the entire point of compiling it. GD and these
+weights occupy disjoint regions of weight space; widening the architecture
+declaratively remains the only path to the failing programs.
 
 ---
 
