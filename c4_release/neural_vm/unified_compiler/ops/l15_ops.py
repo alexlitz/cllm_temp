@@ -43,6 +43,50 @@ def _l15_li_load_suppressor_inert_on() -> bool:
     so HEAD is byte-identical with the flag OFF.
     """
     return _os_l15.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+
+
+def _l15_lev_pc_restore_head_on() -> bool:
+    """DEFAULT-ON flag (``C4_L15_LEV_PC_RESTORE``): add a 15th L15 memory-lookup
+    head that content-addressably restores the saved return address into PC at
+    the LEV step.
+
+    ROOT (spec_k=0, BUILT dims, func_identity_0 id550 step-8 LEV, 2026-06-15):
+    LEV must set ``pc = mem[BP+8]`` (the return address pushed by JSR). The L9
+    ``lev_bp_to_pc_relay`` + ``bp_plus8_shift`` machinery already stamps the
+    BP+8 gather key into ADDR_B0/B1/B2 at the LEV PC marker; the working L15
+    head-0 LI/LC content-addressable load already knows how to pick a stored
+    value by that 24-bit address key and copy it into OUTPUT_LO/HI. But NO L15
+    head delivers the return-address store to OUTPUT at the LEV PC marker:
+    the legacy ``lev_return_addr`` heads 8-11 (a) only exist at
+    ``num_heads >= 12``, (b) write byte 0 to TEMP not OUTPUT, and (c) heads 8/9
+    are overwritten by ``layer15_alu_high_byte_relay`` / ``pop_d8_to_e0``. So at
+    the LEV PC marker the L15 block makes ZERO change to the PC OUTPUT and the
+    wrong upstream default (PC[0]=0x0a) survives -> full_trace fails at step 8
+    (exit_code is unaffected; the body already halts with the right AX).
+
+    PROBE (id550, marker row 388): the LEV gather key is ADDR_KEY nibbles
+    ``[0, 15, 0]`` (= 0xFFF0-class), which UNIQUELY matches the JSR return-addr
+    push at pos 269 (``MARK_STACK0`` byte-0 row, MEM_STORE~1.53,
+    CLEAN_EMBED=0x5a=90 -- the CORRECT return address). The wrong JSR MEM_VAL
+    store (pos 278, value 0x46=70) carries a DIFFERENT key ``[0, 14, 15]`` so
+    the address match filters it out; we do NOT need to repair the MEM_VAL
+    store value -- the STACK0 push already carries both the right value and a
+    matching key.
+
+    FIX: a new head 14 mirroring head 0's 24-bit binary address lookup
+    (slots 4..27 reading ADDR_B0/B1/B2 on both Q and K) but gated to fire at
+    the LEV PC marker (``OP_LEV`` + ``MARK_PC``), selecting the stored value's
+    byte 0 and copying CLEAN_EMBED -> OUTPUT_LO/HI so the LM head emits the
+    return address as PC[0]. Default ON; ``C4_L15_LEV_PC_RESTORE=0`` keeps the
+    resize target at 14 heads and omits the head, so the build is BYTE-IDENTICAL
+    to HEAD (num_heads=14). Expanding L15 to 15 heads grows only the L15
+    ``W_q/W_k/W_v`` row count and ``W_o`` column count -- d_model is unchanged
+    so every OTHER block is byte-identical regardless of the flag.
+    """
+    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
+
+
+_L15_LEV_PC_RESTORE_HEAD_IDX = 14
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     attention_head_extension,
@@ -114,7 +158,17 @@ _L15_HEAD_LAYOUT = (
     ("layer15_store_stack0_sp_byte0_addr",             12),  # head 12: SI/SC store-top SP byte0 -> ADDR_B0
     ("layer15_si_mem_addr0_from_stack0",               13),  # head 13: SI/SC MEM addr0 from pre-store STACK0 byte0
 )
+# head 14 (flag C4_L15_LEV_PC_RESTORE, default ON): LEV return-address
+# content-addressable restore into PC OUTPUT. Appended only when the flag is
+# on so flag-off keeps num_heads=14 byte-identical.
+if _l15_lev_pc_restore_head_on():
+    _L15_HEAD_LAYOUT = _L15_HEAD_LAYOUT + (
+        ("layer15_memory_lookup.lev_pc_restore", _L15_LEV_PC_RESTORE_HEAD_IDX),
+    )
 _L15_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L15_HEAD_LAYOUT}
+# Widest configured L15 head count: 15 when the LEV PC-restore head is on,
+# else 14 (the legacy LEV build).
+_L15_MAX_HEADS = 15 if _l15_lev_pc_restore_head_on() else 14
 
 
 def _allocate_layer15_attention_heads() -> AttentionHeadAllocator:
@@ -137,7 +191,7 @@ def _allocate_layer15_attention_heads() -> AttentionHeadAllocator:
     ``layer15_memory_lookup`` and ``l15_attention_resize`` bakes so
     downstream tooling can audit the layout.
     """
-    allocator = AttentionHeadAllocator(layer_max_heads=14)
+    allocator = AttentionHeadAllocator(layer_max_heads=_L15_MAX_HEADS)
     for name, _legacy_head_idx in _L15_HEAD_LAYOUT:
         allocator.alloc(name, layer_idx=15)
     return allocator
@@ -1512,6 +1566,143 @@ def _layer15_memory_lookup_lev_heads_4_11_specs(
     return tuple(specs)
 
 
+def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """L15 head 14: LEV return-address content-addressable restore into PC.
+
+    Mirrors the working head-0 (``li_lc_stack0_h0``) 24-bit binary-address
+    lookup but gated to fire at the LEV PC marker (``OP_LEV`` + ``MARK_PC``)
+    instead of an LI/LC load at the AX marker. At the LEV PC marker the L9
+    ``lev_bp_to_pc_relay`` + ``bp_plus8_shift`` machinery has stamped the BP+8
+    gather key into ADDR_B0/B1/B2; this head matches that key against the
+    stored 24-bit address of every store token (the binary encoding at slots
+    4..27, identical to head 0) and copies the matched store's byte-0 value
+    (``CLEAN_EMBED`` -> ``OUTPUT_LO/HI``) so the LM head emits the saved return
+    address as PC[0].
+
+    For func_identity_0 (id550, probe row 388) the gather key uniquely matches
+    the JSR return-address push (a ``MARK_STACK0`` byte-0 row, MEM_STORE~1.53,
+    value 0x5a=90); the wrong JSR ``MEM_VAL`` store (value 70) carries a
+    different address key so the binary-address match filters it out.
+
+    Only emitted when ``num_heads >= 15`` (flag ``C4_L15_LEV_PC_RESTORE`` on).
+    """
+
+    PC_I = 0
+    AX_I = 1
+    SP_I = 2
+    BP_I = 3
+    MEM_I = 4
+
+    q: list[AP] = []
+    k: list[AP] = []
+
+    # === Slot 0: Bias -- fire only at the LEV PC marker. ===
+    # Head 0 suppresses MARK_PC (-25000) and OP_LEV (-1000); we invert: the
+    # LEV PC marker is the ONLY firing row. Strong negative on CONST so a
+    # non-LEV / non-PC row never crosses the store-anchor threshold.
+    q.append(AP(0, BD.CONST, -2000.0))
+    q.append(AP(0, BD.OP_LEV, 2000.0))
+    q.append(AP(0, BD.MARK_PC, 2000.0))
+    # Keep the head dark on the AX marker / byte rows and on the BP/SP frame
+    # rows of the LEV step (those carry OP_LEV too but a different marker).
+    q.append(AP(0, BD.MARK_AX, -25000.0))
+    q.append(AP(0, BD.MARK_SP, -100000.0))
+    q.append(AP(0, BD.MARK_BP, -100000.0))
+    q.append(AP(0, BD.H1 + SP_I, -50000.0))
+    q.append(AP(0, BD.H1 + BP_I, -50000.0))
+    k.append(AP(0, BD.CONST, 10.0))
+
+    # === Slot 29: PC byte position blocker (mirror head 0). ===
+    # The LEV PC marker row is MARK_PC=1 but the PC *value* byte rows
+    # (H1+PC_I) must stay dark so the head only fires on the marker.
+    q.append(AP(29, BD.H1 + PC_I, -20000.0))
+    k.append(AP(29, BD.CONST, 5.0))
+
+    # === Slot 30: AX byte position blocker (mirror head 0). ===
+    q.append(AP(30, BD.H1 + AX_I, -20000.0))
+    k.append(AP(30, BD.CONST, 5.0))
+
+    # === Slot 31: K-side marker-row suppressor (exclude self/marker rows). ===
+    # Unlike head 0 (whose query at the AX marker is never a perfect
+    # self-address-match against a store), the LEV query lives at the PC
+    # marker whose own ADDR_B0/B1/B2 = the gather target. Without this slot
+    # the marker row self-matches the 24-bit address block at maximal score
+    # and the head attends to itself instead of the return-addr store. Drive
+    # the query high (CONST) and the key strongly negative on the marker/
+    # frame rows (MARK_PC/MARK_AX/MARK_SP/MARK_BP) and on the just-emitted PC
+    # value bytes (H1+PC). Store tokens (MARK_STACK0/MARK_MEM) are untouched.
+    q.append(AP(31, BD.CONST, 200.0))
+    k.append(AP(31, BD.MARK_PC, -200.0))
+    k.append(AP(31, BD.MARK_AX, -200.0))
+    k.append(AP(31, BD.MARK_SP, -200.0))
+    k.append(AP(31, BD.MARK_BP, -200.0))
+    k.append(AP(31, BD.H1 + PC_I, -200.0))
+
+    # === Slot 1: Store anchor -- only store K cross the threshold. ===
+    q.append(AP(1, BD.OP_LEV, 50.0))
+    q.append(AP(1, BD.MARK_PC, 50.0))
+    k.append(AP(1, BD.MEM_STORE, 100.0))
+    k.append(AP(1, BD.CONST, -50.0))
+
+    # === Slot 2: ZFOD negative offset for store entries (mirror head 0). ===
+    q.append(AP(2, BD.CONST, -96.0))
+    k.append(AP(2, BD.MEM_STORE, 50.0))
+
+    # === Slot 3: Byte selection -- pick byte 0 of the matched store. ===
+    # The return-address store byte-0 sits at the STACK0 byte-0 row
+    # (L2H0[MEM]=1, H1[MEM]=0), exactly as head 0's byte-0 selection.
+    BS = 60.0
+    q.append(AP(3, BD.MARK_STACK0, BS))
+    q.append(AP(3, BD.BYTE_INDEX_0, BS))
+    k.append(AP(3, BD.L2H0 + MEM_I, BS))
+    k.append(AP(3, BD.H1 + MEM_I, -BS))
+
+    # === Slots 4..27: 24-bit binary address encoding (mirror head 0). ===
+    scale = 10.0
+    addr_dim = 4
+    addr_bases = [
+        (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
+        (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
+        (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
+    ]
+    for ab_lo, ab_hi in addr_bases:
+        for nibble_base in (ab_lo, ab_hi):
+            for bit in range(4):
+                for nk in range(16):
+                    bit_val = 2 * ((nk >> bit) & 1) - 1
+                    q.append(AP(addr_dim, nibble_base + nk, scale * bit_val))
+                    k.append(AP(addr_dim, nibble_base + nk, scale * bit_val))
+                addr_dim += 1
+
+    # === Slot 28: Per-head position gate (fire at the LEV PC marker). ===
+    q.append(AP(28, BD.CONST, -500.0))
+    q.append(AP(28, BD.OP_LEV, 500.0))
+    q.append(AP(28, BD.MARK_PC, 500.0))
+    k.append(AP(28, BD.CONST, 5.0))
+
+    # === V/O: copy matched store byte value to OUTPUT (mirror head 0). ===
+    v: list[AP] = []
+    o: list[AO] = []
+    for kk in range(16):
+        v.append(AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
+        v.append(AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
+        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, 1.0))
+        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, 1.0))
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=_L15_LEV_PC_RESTORE_HEAD_IDX,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+        # The return-address store was written on the JSR step; the LEV
+        # lookup reads it across step boundaries by design (memory
+        # persistence) -- ANY_STEP encodes that the verifier should not
+        # flag it as a CURRENT_STEP_ONLY violation.
+        step_window=StepWindowConstraint.ANY_STEP,
+    )
+
+
 def _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
     BD,
 ) -> tuple[DeclarativeAttentionHeadSpec, ...]:
@@ -1733,6 +1924,17 @@ def _layer15_memory_lookup_ir(
             ),
             name="layer15_memory_lookup.pop_d8_head_9",
             metadata={"role": "pop_d8_to_e0", "shape": "num_heads > 9"},
+        )
+    # Head 14: LEV PC-restore (flag C4_L15_LEV_PC_RESTORE, default ON).
+    # Emitted when the resize has allocated a 15th head (num_heads >= 15) or
+    # on the declarations-only audit path (num_heads=None) when the flag is on.
+    if _l15_lev_pc_restore_head_on() and (
+        num_heads is None or int(num_heads) >= 15
+    ):
+        attn_op.append(
+            _layer15_lev_pc_restore_head_spec(proxy),
+            name="layer15_memory_lookup.lev_pc_restore",
+            metadata={"role": "lev_pc_restore", "shape": "num_heads >= 15"},
         )
     return ir
 
@@ -3104,7 +3306,6 @@ def _l15_attention_resize_follow_up(block, dim_positions, S) -> None:
     the resize.
     """
 
-    del S  # the suppress helper does not consume S
     attn = block.attn
     head_allocator = _allocate_layer15_attention_heads()
     attn._l15_head_allocator = head_allocator
@@ -3116,6 +3317,21 @@ def _l15_attention_resize_follow_up(block, dim_positions, S) -> None:
         _as_setdim_proxy(dim_positions),
         head_dim,
     )
+    # Head 14: LEV PC-restore (flag C4_L15_LEV_PC_RESTORE, default ON).
+    # The production ``layer15_memory_lookup`` bake runs at num_heads=10
+    # (BEFORE this resize), so a head gated on the resized count never gets
+    # its body. Lower head 14's body HERE, after the resize has grown the
+    # attn to >=15 heads, so the new head's Q/K/V/O cells actually land.
+    # Flag-off keeps the resize target at 14 and skips this bake entirely
+    # -> byte-identical with HEAD.
+    if _l15_lev_pc_restore_head_on() and getattr(
+        attn, "num_heads", 0
+    ) > _L15_LEV_PC_RESTORE_HEAD_IDX:
+        Primitives.generate_attention_head(
+            attn,
+            _layer15_lev_pc_restore_head_spec(_as_setdim_proxy(dim_positions)),
+            int(head_dim),
+        )
 
 
 def _l15_attention_resize_structural_ir(dim_positions, head_dim) -> CompilerIR:
@@ -3134,10 +3350,16 @@ def _l15_attention_resize_structural_ir(dim_positions, head_dim) -> CompilerIR:
 
     del dim_positions, head_dim  # the structural op is shape-agnostic
     ir = CompilerIR()
+    # target_num_heads is 15 when the LEV PC-restore head (head 14) is on so
+    # the resize allocates a slot for it; flag-off keeps the legacy 14-head
+    # build byte-identical. small_num_heads (16-layer smoke build) is
+    # unaffected -- the LEV PC-restore head only matters for >16-layer LEV
+    # builds where the return-address restore path exists.
+    _lev_target = _L15_MAX_HEADS  # 15 (flag on) or 14 (flag off)
     ir.layer(0).structural_ops.append(
         StructuralOp(
             kind="attention_resize",
-            target_num_heads=14,
+            target_num_heads=_lev_target,
             small_num_heads=9,
             layers_threshold=16,
             alibi_pin_value=0.05,
