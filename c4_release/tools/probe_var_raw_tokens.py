@@ -32,7 +32,7 @@ def main():
     # Print tokens from start of step0 through step3, with offset field labels.
     # We don't know exact step boundaries (model may emit extra), so print
     # absolute index + token + a guess of the 35-frame offset.
-    for i in range(plen, min(len(ctx), plen + 35 * 4)):
+    for i in range(plen, min(len(ctx), plen + 35 * 6)):
         rel = i - plen
         off = rel % 35
         step = rel // 35

@@ -26,6 +26,36 @@ def _nonfirst_psh_sp_fix_enabled() -> bool:
     """
     return os.environ.get("C4_NONFIRST_PSH_SP_FIX", "1") != "0"
 
+
+def _psh_stack0_highbyte_darken_enabled() -> bool:
+    """Flag for the PSH-STACK0-passthrough high-byte (byte2/byte3) darkening.
+
+    ``_layer10_psh_stack0_passthrough_head_spec`` (block 16 / logical L11,
+    head 3) is the PSH STACK0-store passthrough. Its active gate (slot 33)
+    keys on ``PSH_AT_SP + IS_BYTE + H4+BP`` and so fires not only at the
+    STACK0 byte-0 producer row but ALSO on the STACK0 byte-1/2/3 query rows
+    (``BYTE_INDEX_{1,2,3} ~= 0.97``), where it averages CLEAN_EMBED debris
+    into OUTPUT at scale 3.0 and CRUSHES the OUTPUT band to ~-652. On the
+    var PSH (push of the LEA-local address 0xFFE8) this kills the STACK0
+    byte-3 emission: with OUTPUT dead nothing scores positively at the
+    STACK0[3] LM row and a stray REGISTER MARKER token (261) wins, ending
+    the step one token early -> the 35-token frame shifts by 1 from step 3
+    onward -> the production per-step decode re-anchors on the wrong markers
+    and reads step-4 PC = 66 instead of 58 (the var_simple full_trace
+    blocker; all 25 var_simple diverge identically at step 4 PC).
+
+    The STACK0 high bytes (byte 2/3) of any pushed value <= 0xFFFF are 0x00
+    and the residual pre-block-16 OUTPUT already defaults to 0x00 (+0.94), so
+    darkening the head on the byte-2/byte-3 query rows lets the clean 0x00
+    default survive -> no stray marker -> frame stays aligned -> step-4 PC
+    reads 58. Byte 0 (the pushed-value producer at the STACK0 marker row,
+    BYTE_INDEX all ~0) and byte 1 (the 16-bit round-trip path exercised by
+    test_si_li_16bit_value) are UNTOUCHED. Default ON; with
+    ``C4_PSH_STACK0_HIGHBYTE_DARKEN=0`` the head spec is byte-identical to
+    the prior build (the two slot-7 BYTE_INDEX terms are omitted).
+    """
+    return os.environ.get("C4_PSH_STACK0_HIGHBYTE_DARKEN", "1") != "0"
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -2427,6 +2457,23 @@ def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHead
         AP(7, BD.H1 + BP_IDX, -2000000000.0),
         AP(7, BD.H1 + MEM_IDX, -2000000000.0),
     ]
+    # === STACK0 high-byte (byte2/byte3) hard darkening (slot 7): var_simple ===
+    # The active gate (slot 33) also fires on the STACK0 byte-1/2/3 QUERY rows
+    # of a PSH step, crushing OUTPUT to ~-652. On the var PSH that kills the
+    # STACK0[3] = 0x00 emission -> a stray register-marker token (261) wins ->
+    # the step ends one token early -> 35-token frame shift -> step-4 PC misread
+    # (the var_simple full_trace blocker). Darken the head on the byte-2 and
+    # byte-3 query rows (BYTE_INDEX_{2,3} ~= 0.97) so the clean residual 0x00
+    # default (OUTPUT +0.94 pre-block-16) survives. Reuses the slot-7 K[CONST]=1
+    # complement already present below; on a byte-2/3 query row BYTE_INDEX_h=1
+    # -> Q[7] scores -2e9 across all keys -> wsum -> 0 -> residual OUTPUT
+    # survives. Byte 0 (STACK0 marker producer, BYTE_INDEX all ~0) and byte 1
+    # (test_si_li_16bit_value 0x200 byte-1 round-trip) are NOT darkened.
+    if _psh_stack0_highbyte_darken_enabled():
+        q += [
+            AP(7, BD.BYTE_INDEX_2, -2000000000.0),
+            AP(7, BD.BYTE_INDEX_3, -2000000000.0),
+        ]
     k = [
         AP(0, BD.IS_BYTE, L),
         AP(1, BD.H1 + AX_IDX, L),
