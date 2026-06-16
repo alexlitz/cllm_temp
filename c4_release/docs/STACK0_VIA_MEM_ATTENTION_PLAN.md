@@ -424,3 +424,60 @@ step boundary (current break: PC marker dropped at step-1 offset 0; stray
 step 0 (no operand involved) does the operand re-route become measurable; and
 even then the CAM needs a byte-1+ path (it is byte-0-only today). Flags remain
 default-OFF + byte-identical to golden; no production behavior changed.
+
+## 11. L0 FRAME FIX — 2026-06-16 (no-STACK0 30-token register frame made coherent)
+
+The §10 emission-drop break ("PC marker dropped at step-1 offset 0; stray byte
+at BP value bytes") was localized and FIXED. The diagnosis in §10 mis-attributed
+it: the L0 marker-transition chain (`_phase_a_ffn_rules`, flag-ON branch) was
+ALREADY correct — at the STEP_END row it fires `NEXT_PC` cleanly, and the LM
+head is DESIGNED to make `REG_PC` win there (`head.weight[byte<v>, NEXT_PC] =
+−80` suppresses every byte token when a register marker is due; `head.weight
+[REG_PC, NEXT_PC] = +20`).
+
+### Real root (spec_k=0, `tools/probe_nostack0_logits.py`)
+The head's −80·NEXT_PC byte suppression is BOUNDED — it assumes OUTPUT carries
+normal byte magnitudes (≤255 → byte logit ≤1275). But OUTPUT at the post-
+STEP_END row is GARBAGE: the L20 (block 34) tail FFN and the L25 (block 41)
+tail corrector spray `OUTPUT_LO/HI` up to ~5e16 there. `head.weight[byte0x00,
+OUTPUT_LO+0] = +5` then drives the byte-0 logit to ~2.5e17, blowing past the
+−80·NEXT_PC suppression → the head emits a STRAY `0x00` byte AFTER STEP_END
+instead of REG_PC, inserting **+1 token per step**. This drift exists in the
+35-token build TOO, but is ABSORBED by the STACK0 block's 5 tokens of decode
+slack; the 30-token layout has no slack, so the same drift desyncs the fixed-
+stride decode after a few steps (got_pc off by a register block, got_ax=None).
+
+### Fix — `make_no_stack0_se_output_clear_op` (`ops/l0_ops.py`)
+A standalone `PureFFN` post_op appended AFTER `tail_bit32_result_correction` on
+the L25 tail block (the LAST OUTPUT writer before the LM head). 32 balanced-AND
+units gated on the bounded `MARK_SE_ONLY` one-hot (fires ONLY at the STEP_END
+row) drive `OUTPUT_LO/HI[0..15]` to a large negative (`−1e16`/nibble), sinking
+every byte logit far below `REG_PC`'s so the head's intended marker win is
+restored. OUTPUT at the STEP_END row is meaningless (the only token emitted
+there is the next step's REG_PC), so clobbering it is semantically free.
+Registered in `all_core_ops` after `make_bp_save_dump_repopulate_op`. Gated by
+`C4_NO_STACK0_EMIT`; flag-OFF bakes NO units (byte-identical).
+
+### Result (spec_k=0, `tools/run_1096_canonical.py` criterion = full_trace)
+- **Register frame is now byte-clean on the controls.** add/sub/div/mod (24
+  programs measured): EVERY step's REG_PC/AX/SP/BP markers sit at offsets
+  {0,5,10,15,20}, the +1/step drift is GONE, and `got_pc == exp_pc` on every
+  step (no `got_pc > 0xFFFF`; the §10 frame-corruption symptom is eliminated).
+  The controls still FAIL full_trace, but ONLY on the AX VALUE (operand-A read,
+  which `C4_OPERAND_FROM_MEMSP` owns) — the REGISTER FRAME / PC decode is clean,
+  satisfying the §10 prerequisite.
+- Pre/post on add_0 (flag-ON): before, markers drifted {0}{1}{2}{3}{4} across
+  steps 0–4; after, {0,5,10,15,20} on all steps; PC decodes 10/18/26/34/42 =
+  oracle.
+- Byte-identity (flag default-OFF): CPU `compile_full_vm_dynamic(disk_cache=
+  False)` state_dict SHA256 = `7474f26955e79619…` == main flag-OFF. `pytest
+  tests/test_smoke.py` = 51/0 at flag-OFF.
+
+### Remaining (out of scope for the L0 register frame)
+Longer Root #2 programs (e.g. `var_simple`) still desync on a SEPARATE root:
+the MEM-SECTION emission collapses mid-step (the MEM marker is followed
+directly by the next step's REG_PC, dropping the 8 MEM bytes) — a value/store-
+path failure that ALSO occurs flag-OFF (var_simple fails at step 4 in the
+35-token build). That is the operand/MEM lane, not the register frame. With the
+register frame now coherent, the operand re-route + the Root #2 STACK0 fix
+stack on top as §10 anticipated.

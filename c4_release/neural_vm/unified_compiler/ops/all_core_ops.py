@@ -668,6 +668,14 @@ def all_core_ops(
         # (byte-identical). Standalone PureFFN post_op on the L25 tail block after
         # tail_bit32. See l11_ops.make_bp_save_dump_repopulate_op.
         make_bp_save_dump_repopulate_op(),
+        # No-STACK0 (30-token) STEP_END OUTPUT-clear FFN: drives OUTPUT_LO/HI
+        # hugely negative at the MARK_SE_ONLY row so the LM head emits REG_PC (not
+        # a stray byte) after STEP_END, killing the +1-token/step frame drift that
+        # desyncs the 30-token fixed-stride decode. Standalone PureFFN post_op on
+        # the L25 tail block after tail_bit32 (LAST OUTPUT writer before the head).
+        # Gated by C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
+        # See l0_ops.make_no_stack0_se_output_clear_op.
+        make_no_stack0_se_output_clear_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).

@@ -537,3 +537,177 @@ def make_layer0_threshold_attn_op() -> Operation:
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
+
+
+# ===========================================================================
+# No-STACK0 (30-token) step-boundary OUTPUT clear (C4_NO_STACK0_EMIT)
+# ===========================================================================
+#
+# ROOT (spec_k=0, tools/probe_nostack0_logits.py): the L0 marker-transition
+# chain emits NEXT_PC correctly at the STEP_END row (MARK_SE_ONLY=1), and the
+# LM head is DESIGNED to make the REG_PC marker win there — ``head.weight``
+# carries ``byte<v>[NEXT_PC] = -80`` (suppress every byte token when a register
+# marker is due) and ``REG_PC[NEXT_PC] = +20``. That suppression is BOUNDED:
+# it assumes OUTPUT carries normal byte magnitudes (<=255 -> byte logit <=1275).
+# But OUTPUT at the post-STEP_END row is GARBAGE — the L20 (block 34) tail FFN
+# and the L25 (block 41) tail corrector spray OUTPUT_LO/HI up to ~5e16 there.
+# ``byte<v>[OUTPUT_LO+k] = +5`` then drives the byte-0 logit to ~2.5e17, blowing
+# past the -80*NEXT_PC suppression -> the head emits a STRAY 0x00 byte AFTER
+# STEP_END instead of REG_PC, inserting ONE extra token per step. In the
+# 35-token build this +1/step drift is ABSORBED by the STACK0 block's 5 tokens
+# of decode slack; in the 30-token build the slack is gone, so the drift
+# desyncs the fixed-stride decode after a few steps (PC/AX read from the wrong
+# offset -> got_pc off by a register block, got_ax=None).
+#
+# FIX: at the STEP_END row ONLY (gated on the bounded one-hot ``MARK_SE_ONLY``,
+# which fires nowhere else in a step), drive OUTPUT_LO/HI hugely NEGATIVE so the
+# byte-token logits sink far below the REG_PC marker logit and the head's
+# intended -80*NEXT_PC suppression is restored. OUTPUT at the STEP_END row is
+# meaningless (the only token the head emits there is the next step's REG_PC),
+# so clobbering it is semantically free. The op is a standalone ``PureFFN``
+# post_op appended AFTER ``tail_bit32_result_correction`` on the L25 tail block,
+# so it is the LAST writer of OUTPUT before the LM head (it runs after the L20 /
+# L25 garbage writes). Gated by ``C4_NO_STACK0_EMIT``: flag-OFF bakes NO units
+# (byte-identical to HEAD).
+_NO_STACK0_SE_OUTPUT_CLEAR_HIDDEN_DIM = 32  # OUTPUT_LO[0..15] + OUTPUT_HI[0..15]
+# Per-nibble negative write weight. The post-tail PureFFN's balanced-AND silu
+# saturates large (S=100) on a MARK_SE_ONLY fire; ``-1e16`` per nibble lands an
+# OUTPUT delta far below -(the +5e16 garbage), making every byte logit
+# ((OUTPUT_*+nibble)*5) hugely negative so REG_PC (NEXT_PC*20) wins the argmax.
+_NO_STACK0_SE_OUTPUT_CLEAR_WW = -1.0e16
+
+
+def _no_stack0_se_output_clear_rules() -> tuple[FFNRule, ...]:
+    """32 AND rules pushing OUTPUT_LO/HI hugely negative at the STEP_END row.
+
+    Each unit fires on ``MARK_SE_ONLY`` (the bounded STEP_END one-hot) with the
+    other register/section markers ANDed in as blockers so it can only fire on
+    the genuine STEP_END token, and writes a large-negative value into one
+    OUTPUT nibble. On a fire the balanced-AND silu saturates; the write sinks
+    OUTPUT well below the L20/L25 garbage so the LM head's byte logits
+    (``head.weight[byte, OUTPUT_*+k] = +5``) go hugely negative and the REG_PC
+    marker (``head.weight[REG_PC, NEXT_PC] = +20``, NEXT_PC fired here) wins.
+    """
+    # MARK_SE_ONLY ~= 1.0 at the STEP_END row and 0 elsewhere; gate it x1.0 with
+    # the other markers as -1000 blockers (defensive — MARK_SE_ONLY is already
+    # exclusive). Threshold 0.5 fires on the lone MARK_SE_ONLY=1.
+    BLOCKER_W = 1_000.0
+    conditions = (
+        ("MARK_SE_ONLY", 1.0),
+        ("MARK_PC", -BLOCKER_W),
+        ("MARK_AX", -BLOCKER_W),
+        ("MARK_SP", -BLOCKER_W),
+        ("MARK_BP", -BLOCKER_W),
+        ("MARK_STACK0", -BLOCKER_W),
+        ("MARK_MEM", -BLOCKER_W),
+    )
+    WW = _NO_STACK0_SE_OUTPUT_CLEAR_WW
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"no_stack0_se_output_clear_lo_{k}",
+            conditions=conditions,
+            threshold=0.5,
+            writes=((f"OUTPUT_LO+{k}", WW),),
+        ))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"no_stack0_se_output_clear_hi_{k}",
+            conditions=conditions,
+            threshold=0.5,
+            writes=((f"OUTPUT_HI+{k}", WW),),
+        ))
+    return tuple(rules)
+
+
+def make_no_stack0_se_output_clear_op() -> Operation:
+    """Append the no-STACK0 STEP_END OUTPUT-clear FFN after the L25 tail block.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block (appended AFTER
+    ``tail_bit32_result_correction``), so it is the LAST writer of OUTPUT on the
+    STEP_END row before the LM head. Gated by ``C4_NO_STACK0_EMIT`` (default
+    OFF); flag-OFF bakes NO units (byte-identical to HEAD). See the module-level
+    block comment above for the root cause / mechanism.
+    """
+    if not _no_stack0_emit():
+        # Flag OFF: register a no-op so the dep graph / op list is stable but no
+        # weights change (byte-identical to the pre-flag build).
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="no_stack0_se_output_clear",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "tail_bit32_result_correction"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="STACK0_VIA_MEM_ATTENTION_PLAN.md#10",
+        )
+
+    rules = _no_stack0_se_output_clear_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _NO_STACK0_SE_OUTPUT_CLEAR_HIDDEN_DIM, (
+            f"no_stack0_se_output_clear rule-count drift: produced {len(rules)}, "
+            f"expected {_NO_STACK0_SE_OUTPUT_CLEAR_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="no_stack0_se_output_clear",
+        reads={
+            "MARK_SE_ONLY", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+            "MARK_STACK0", "MARK_MEM",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # Append AFTER the tail correction on the L25 block, so this op is the
+        # last writer of OUTPUT on the STEP_END row before the LM head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_VIA_MEM_ATTENTION_PLAN.md#10",
+    )
