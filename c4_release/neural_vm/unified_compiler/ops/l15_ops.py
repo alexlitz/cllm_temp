@@ -86,6 +86,102 @@ def _l15_lev_pc_restore_head_on() -> bool:
     return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
 
 
+def _l15_lev_addr_widen_on() -> bool:
+    """Master flag (``C4_L15_LEV_ADDR_WIDEN``, default OFF) gating the LEV
+    return-address ADDRESS-WIDENING machinery on head 14.
+
+    When ON, head 14 gains:
+      * a byte-0 address-bit boost (``C4_L15_LEV_B0_BOOST``, default 8) that
+        separates the genuine return store (mem[inner_BP+8]=0xFFF0) from the
+        wrong-FRAME saved-BP store (mem[outer_BP+8]=0xFFF8);
+      * an OP_JSR / -OP_ENT return-store discriminator (slots 64/65) +
+        K-side byte-0 selection that separates the genuine JSR-pushed return
+        word from the SAME-ADDRESS ENT-pushed saved-BP word (the deepest CAM
+        aliasing layer);
+      * value_scale=40 on the V/O OUTPUT delivery (the scaffold's 1.0 was too
+        weak to register) and a stronger self-row suppressor (slot 31) + a
+        store-key dark gate (slot 66) so the boosted head stays a no-op except
+        at the LEV PC marker.
+
+    This machinery makes head 14 attend the CORRECT return-address store in the
+    isolated gather (tools/_probe_lev_realattn 550 8 -> head14 picks the
+    JSR-return byte-0 store, w=1.0). It is DEFAULT-OFF because the byte-0 boost
+    that is REQUIRED for the LEV address discrimination also lets the strong
+    (value_scale=40) head fire on LI/LC store rows during a plain LI/LC load
+    (the AX-marker query self-/store-matches the boosted address), clobbering
+    the head-0 CAM load -> the SI/SC/LI/LC smoke CAM tests regress. Decoupling
+    the two is blocked by the SAME framing/STACK0 desync that gates the func
+    full_trace at step 4 (a separate lane): the return-store layout is unstable
+    on the diverged decode, so a clean LEV-only gate cannot be tuned. With the
+    flag OFF head 14 keeps the byte-identical scaffold behaviour (uniform
+    address scale, value_scale 1.0, original slot-31), so smoke stays at the
+    HEAD baseline. Turn ON once the single-store framing fix lands.
+    """
+    return _os_l15.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0"
+
+
+def _l15_lev_b0_boost_factor() -> float:
+    """Byte-0 address-bit scale multiplier for the LEV PC-restore head 14
+    (env ``C4_L15_LEV_B0_BOOST``, default ``8``).
+
+    The head's 24-bit binary-address CAM key normally scores every address bit
+    at the same per-bit scale (10.0). The LEV return-address aliasing wall is
+    that the genuine return store and the WRONG-FRAME return store differ ONLY
+    in address byte 0 (one stack slot apart, e.g. 0xFFF0 vs 0xFFF8) and share
+    an identical byte-1/byte-2 key plus the same real ``MEM_STORE`` anchor, so
+    the byte-0 bit is the ONLY clean discriminator. Multiplying the byte-0 bit
+    scale by this factor makes that same-byte-0 match dominate the (store-time)
+    byte-1 one-hot softness gap, flipping the head onto the correct store. The
+    crossover for func_identity_0 is factor 5; 8 leaves a comfortable margin.
+    Set to 1.0 to restore the uniform-scale scaffold behaviour (A/B). Only
+    consulted when the parent flag ``C4_L15_LEV_PC_RESTORE`` is on, so the
+    flag-off build is byte-identical regardless of this value.
+    """
+    raw = _os_l15.environ.get("C4_L15_LEV_B0_BOOST", "8")
+    try:
+        v = float(raw)
+    except ValueError:
+        return 8.0
+    return v if v > 0.0 else 1.0
+
+
+def _l15_lev_jsr_disc_strength() -> float:
+    """OP_JSR return-store discriminator strength for the LEV PC-restore head
+    (env ``C4_L15_LEV_JSR_DISC``, default ``100``).
+
+    The K-side weight on ``OP_JSR`` (and ``-OP_ENT``) that lets head 14 prefer
+    the JSR-pushed return-address store over the same-address ENT-pushed
+    saved-BP store. Multiplied by the query's ``OP_LEV`` activation (~5) at the
+    LEV PC marker, ~100 yields the ~500 effective boost the re-score showed is
+    needed to overturn the saved-BP word's higher ``MEM_STORE`` anchor. Set to
+    0 to omit slots 64/65 entirely (the byte-0-boost-only build). Only
+    consulted when ``C4_L15_LEV_PC_RESTORE`` is on, so flag-off is
+    byte-identical regardless.
+    """
+    raw = _os_l15.environ.get("C4_L15_LEV_JSR_DISC", "100")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 100.0
+
+
+def _l15_lev_byte0_select_strength() -> float:
+    """K-side byte-0 selection strength for the LEV PC-restore head 14
+    (env ``C4_L15_LEV_BYTE0_SELECT``, default ``400``).
+
+    Rewards ``BYTE_INDEX_0`` and punishes ``BYTE_INDEX_1/2/3`` on the K side so
+    the OP_JSR-boosted gather lands on the byte-0 row of the return store
+    (whose ``CLEAN_EMBED`` is the return-PC byte 0) rather than the byte-1/2/3
+    rows of the same JSR store. Multiplied by the query's ``OP_LEV`` (~5),
+    ~400 gives the ~2000 effective selection the re-score required.
+    """
+    raw = _os_l15.environ.get("C4_L15_LEV_BYTE0_SELECT", "400")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 400.0
+
+
 _L15_LEV_PC_RESTORE_HEAD_IDX = 14
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
@@ -1593,6 +1689,11 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     BP_I = 3
     MEM_I = 4
 
+    # Master address-widening flag (default OFF). When OFF every widening term
+    # below collapses to the byte-identical scaffold value, so flag-off keeps
+    # head 14 == the committed scaffold (smoke-safe).
+    _widen = _l15_lev_addr_widen_on()
+
     q: list[AP] = []
     k: list[AP] = []
 
@@ -1631,12 +1732,85 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     # the query high (CONST) and the key strongly negative on the marker/
     # frame rows (MARK_PC/MARK_AX/MARK_SP/MARK_BP) and on the just-emitted PC
     # value bytes (H1+PC). Store tokens (MARK_STACK0/MARK_MEM) are untouched.
-    q.append(AP(31, BD.CONST, 200.0))
-    k.append(AP(31, BD.MARK_PC, -200.0))
-    k.append(AP(31, BD.MARK_AX, -200.0))
-    k.append(AP(31, BD.MARK_SP, -200.0))
-    k.append(AP(31, BD.MARK_BP, -200.0))
-    k.append(AP(31, BD.H1 + PC_I, -200.0))
+    #
+    # The penalty MUST exceed the self-row 24-bit address-match score, which is
+    # ~2.1e5 (post head_dim^-0.5 scale) and GROWS with the byte-0 boost above.
+    # The original 200x-200 = -4e4 product is far too small (the self row still
+    # won at +2.1e5), so the head attended itself and delivered nothing. Use a
+    # 2000x-2000 = -4e6 product so the PC/AX/SP/BP marker rows are decisively
+    # excluded regardless of the byte-0 boost factor. Genuine store rows are
+    # MARK_STACK0 (no MARK_PC/AX/SP/BP), so they keep their full score.
+    # 200 (scaffold) keeps flag-off byte-identical; 2000 (widen on) is needed
+    # to beat the byte-0-boosted self-row 24-bit address-match (~2.1e5).
+    suppress = 2000.0 if _widen else 200.0
+    q.append(AP(31, BD.CONST, suppress))
+    k.append(AP(31, BD.MARK_PC, -suppress))
+    k.append(AP(31, BD.MARK_AX, -suppress))
+    k.append(AP(31, BD.MARK_SP, -suppress))
+    k.append(AP(31, BD.MARK_BP, -suppress))
+    k.append(AP(31, BD.H1 + PC_I, -suppress))
+
+    # === Slot 66: store-key dark gate on non-LEV steps (CAM-load safety). ===
+    # value_scale=40 makes head 14 a STRONG OUTPUT writer; without a per-key
+    # gate the byte-0-boosted address self-match lets it fire on LI/LC/SI/SC
+    # steps too (the AX-marker query self-matches a stored address), clobbering
+    # the head-0 LI/LC load -> the SI/SC/LI/LC smoke CAM tests regress. This
+    # slot drives every STORE key (MEM_STORE>0) hugely NEGATIVE whenever the
+    # query is NOT a LEV PC marker, so on a non-LEV step the head attends only
+    # the zero-value prelude/sink rows and writes ~nothing to OUTPUT. On the LEV
+    # PC marker the query's OP_LEV makes q positive, so store keys keep their
+    # full (positive) score and the return-address gather proceeds normally.
+    # q = (OP_LEV+MARK_PC - 1.5*CONST) -> positive only at the LEV PC marker;
+    # k = MEM_STORE*BIG -> only store rows feel the gate. (Slots 32-63 are the
+    # V band, 64/65 the JSR/byte0 discriminators, so this uses slot 66.)
+    # Only emitted with the address-widening master flag (it is dead weight in
+    # the scaffold build and keeps flag-off byte-identical when omitted).
+    if _widen:
+        dark = 5000.0
+        q.append(AP(66, BD.OP_LEV, 1.0))
+        q.append(AP(66, BD.MARK_PC, 1.0))
+        q.append(AP(66, BD.CONST, -1.5))
+        k.append(AP(66, BD.MEM_STORE, dark))
+
+    # === Slot 64: OP_JSR return-store discriminator (ADDRESS-WIDENING). ===
+    # The deepest CAM-aliasing layer (after byte-0 separates 0xFFF0 from the
+    # wrong-frame 0xFFF8): the genuine return store and a SAME-ADDRESS stale
+    # store both sit at 0xFFF0. The stale store is the callee's saved-BP word,
+    # pushed by the ENT prologue (its token rows carry OP_ENT ~18, OP_JSR ~2);
+    # the GENUINE return-address word was pushed by the caller's JSR (its rows
+    # carry OP_JSR ~18, OP_ENT ~0). OP_JSR is therefore a clean, VALUE-
+    # INDEPENDENT key that distinguishes the return word from the saved-BP word
+    # at the same address -- the address-encoding "widening" the brief asked for
+    # (the store's writing-opcode tag makes its identity unique without changing
+    # its 24-bit address, so the BP+8 query still matches). The store anchor
+    # alone lets the higher-MEM_STORE saved-BP word win by ~705; boosting OP_JSR
+    # K by ~500 reverses that (probe tools/_probe_lev_realattn + the OP_JSR/
+    # BYTE_INDEX_0 re-score: pos164 saved-BP -> pos268 JSR-return).
+    JSR_DISC = float(_l15_lev_jsr_disc_strength())
+    if _widen and JSR_DISC > 0.0:
+        q.append(AP(64, BD.OP_LEV, 1.0))
+        q.append(AP(64, BD.MARK_PC, 1.0))
+        q.append(AP(64, BD.CONST, -1.0))
+        k.append(AP(64, BD.OP_JSR, JSR_DISC))
+        k.append(AP(64, BD.OP_ENT, -JSR_DISC))
+
+    # === Slot 65: K-side byte-0 selection (reject byte-1/2/3 store rows). ===
+    # The OP_JSR boost on its own promotes the byte-1/2/3 rows of the SAME JSR
+    # store (they also carry OP_JSR ~18) over the byte-0 row. A strong K-side
+    # byte-0 selector keeps the gather on the byte-0 row (the one whose
+    # CLEAN_EMBED is the return-PC byte 0). Unlike the legacy slot-3 selector
+    # (Q-side, which never fires because the LEV query is a PC-marker not a
+    # STACK0 byte-0 row), this is purely K-side: reward BYTE_INDEX_0, punish
+    # BYTE_INDEX_1/2/3, so only the byte-0 store row survives.
+    if _widen and JSR_DISC > 0.0:
+        BSEL = float(_l15_lev_byte0_select_strength())
+        q.append(AP(65, BD.OP_LEV, 1.0))
+        q.append(AP(65, BD.MARK_PC, 1.0))
+        q.append(AP(65, BD.CONST, -1.0))
+        k.append(AP(65, BD.BYTE_INDEX_0, BSEL))
+        k.append(AP(65, BD.BYTE_INDEX_1, -BSEL))
+        k.append(AP(65, BD.BYTE_INDEX_2, -BSEL))
+        k.append(AP(65, BD.BYTE_INDEX_3, -BSEL))
 
     # === Slot 1: Store anchor -- only store K cross the threshold. ===
     q.append(AP(1, BD.OP_LEV, 50.0))
@@ -1658,20 +1832,43 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     k.append(AP(3, BD.H1 + MEM_I, -BS))
 
     # === Slots 4..27: 24-bit binary address encoding (mirror head 0). ===
+    #
+    # ADDRESS-WIDENING (C4_L15_LEV_B0_BOOST, default ON): the BYTE-0 address
+    # nibbles get a higher per-bit scale than byte-1/byte-2. The CAM-aliasing
+    # wall for the LEV return-address restore is that the genuine return store
+    # (e.g. func_identity_0 pos 268, mem[inner_BP+8]=0xFFF0, value 90) and the
+    # WRONG-FRAME return store (pos 129, mem[outer_BP+8]=0xFFF8, value 10)
+    # differ ONLY in address BYTE 0 (one stack slot, 0xF0 vs 0xF8) -- their
+    # byte-1/byte-2 keys are identical (0xFF/0x00) and they share the same real
+    # MEM_STORE anchor. At the uniform scale=10 the genuine store LOSES because
+    # (a) its byte-1 address one-hot is softer (residual pk ~1.74 vs 2.0, a
+    # store-time encoding accident) costing it ~3053 on the byte-1 bipolar bit
+    # match, while (b) the byte-0 bit it WINS on contributes only ~139 because
+    # the L9 BP+8 query key's byte-0 lo-nibble is weakly encoded (pk ~0.41).
+    # Amplifying ONLY the byte-0 bits makes the genuine same-byte-0 match
+    # dominate the byte-1 softness gap, so the head attends the correct
+    # return-address store. Re-score probe (tools/_probe_lev_rescore.py 550 8):
+    # the winner flips from pos 129 (wrong, 0xFFF8) to pos 268 (correct,
+    # 0xFFF0) at a byte-0 scale multiplier of 5; the default 8x gives a ~5857
+    # attention-logit margin (softmax ~1.0 on the genuine store). Byte-1/byte-2
+    # keep scale=10 so the address VALUE still gates (0x..F0 stores beat the
+    # 0x..00 MEM-image rows). The boost only ever lands when the head exists
+    # (parent flag C4_L15_LEV_PC_RESTORE on), so flag-off is byte-identical.
     scale = 10.0
+    b0_scale = scale * (_l15_lev_b0_boost_factor() if _widen else 1.0)
     addr_dim = 4
     addr_bases = [
-        (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
-        (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
-        (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
+        (BD.ADDR_B0_LO, BD.ADDR_B0_HI, b0_scale),
+        (BD.ADDR_B1_LO, BD.ADDR_B1_HI, scale),
+        (BD.ADDR_B2_LO, BD.ADDR_B2_HI, scale),
     ]
-    for ab_lo, ab_hi in addr_bases:
+    for ab_lo, ab_hi, byte_scale in addr_bases:
         for nibble_base in (ab_lo, ab_hi):
             for bit in range(4):
                 for nk in range(16):
                     bit_val = 2 * ((nk >> bit) & 1) - 1
-                    q.append(AP(addr_dim, nibble_base + nk, scale * bit_val))
-                    k.append(AP(addr_dim, nibble_base + nk, scale * bit_val))
+                    q.append(AP(addr_dim, nibble_base + nk, byte_scale * bit_val))
+                    k.append(AP(addr_dim, nibble_base + nk, byte_scale * bit_val))
                 addr_dim += 1
 
     # === Slot 28: Per-head position gate (fire at the LEV PC marker). ===
@@ -1681,13 +1878,22 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     k.append(AP(28, BD.CONST, 5.0))
 
     # === V/O: copy matched store byte value to OUTPUT (mirror head 0). ===
+    # value_scale=40.0 mirrors the working head-0 LI/LC load O scaling (see
+    # ``_layer15_memory_lookup_heads_0_3_specs_with_overrides``); the scaffold's
+    # original 1.0 left the delivered byte at residual magnitude ~1.0 at the
+    # L15 block, far too weak to register as a clean OUTPUT one-hot. At 40.0 the
+    # gathered return-address byte lands as a sharp OUTPUT_LO/HI one-hot exactly
+    # like an LI load. Only with the address-widening flag (the strong write is
+    # what makes the boosted head clobber LI/LC loads); flag-off keeps the
+    # byte-identical scaffold 1.0.
+    value_scale = 40.0 if _widen else 1.0
     v: list[AP] = []
     o: list[AO] = []
     for kk in range(16):
         v.append(AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
         v.append(AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
-        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, 1.0))
-        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, 1.0))
+        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
+        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
 
     return DeclarativeAttentionHeadSpec(
         head_idx=_L15_LEV_PC_RESTORE_HEAD_IDX,
