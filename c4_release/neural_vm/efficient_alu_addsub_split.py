@@ -172,6 +172,14 @@ class _AddSubGEToBD(nn.Module):
     return signature).
     """
 
+    # Dominant byte-0 OUTPUT write amplitude when the boost flag is on. Tuned
+    # spec_k=0 / BUILT dims: the downstream block-11 (logical L9) ALU_LO leak
+    # writes ~96 on the spurious lane and ~95 on the correct lane (~1.2 margin);
+    # a 30.0 write on the correct lane at block 10 carries through the L9
+    # additive flood to keep the correct lane the argmax. See
+    # ``shared.addsub_output_boost_enabled``.
+    _BOOST_OUTPUT_AMPLITUDE = 30.0
+
     def __init__(self, BD, S, state: _AddSubGEState):
         super().__init__()
         self.BD = BD
@@ -179,6 +187,14 @@ class _AddSubGEToBD(nn.Module):
         self.state = state
         self.S = S
         self.ge_to_bd = GEToBDConverter(BD, self.ge, S)
+        # Read the flag at build time so the compile cache key reflects it and a
+        # per-process flip is honoured. Flag-OFF keeps the 2.0 HEAD amplitude
+        # (byte-identical); flag-ON writes byte-0 OUTPUT at the dominant value.
+        from .unified_compiler.ops.shared import addsub_output_boost_enabled
+        self._output_amplitude = (
+            self._BOOST_OUTPUT_AMPLITUDE if addsub_output_boost_enabled()
+            else 2.0
+        )
 
     def forward(self, x_bd):
         BD = self.BD
@@ -201,7 +217,10 @@ class _AddSubGEToBD(nn.Module):
         x_bd_clean[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] *= (1.0 - active)
         x_bd_clean[:, :, BD.CARRY:BD.CARRY + 3] *= (1.0 - active)
 
-        x_bd_out = self.ge_to_bd(x_ge_out, x_bd_clean, opcode_mask=opcode_mask)
+        x_bd_out = self.ge_to_bd(
+            x_ge_out, x_bd_clean, opcode_mask=opcode_mask,
+            output_amplitude=self._output_amplitude,
+        )
         return x_bd_out
 
     # Stub methods for compatibility with vm_step.py model utilities.

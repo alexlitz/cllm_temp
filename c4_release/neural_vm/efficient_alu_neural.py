@@ -310,7 +310,8 @@ class GEToBDConverter(nn.Module):
         self.out_pos_lo = 0
         self.out_pos_hi = 1
 
-    def forward(self, x_ge, x_bd, opcode_mask=None, emit_carry=True):
+    def forward(self, x_ge, x_bd, opcode_mask=None, emit_carry=True,
+                output_amplitude=2.0):
         """
         Args:
             x_ge: [B, seq_len, 8, 160] GenericE format with RESULT filled
@@ -358,8 +359,15 @@ class GEToBDConverter(nn.Module):
             indicator_lo = indicator_lo * mask_expanded
             indicator_hi = indicator_hi * mask_expanded
 
-        x_bd_out[:, :, BD.OUTPUT_LO:BD.OUTPUT_LO + 16] += indicator_lo * 2.0
-        x_bd_out[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] += indicator_hi * 2.0
+        # ``output_amplitude`` (default 2.0 = byte-identical to HEAD) lets the
+        # add/sub stage write the byte-0 result one-hot at a DOMINANT magnitude
+        # so it out-votes the downstream block-11 / logical-L9 ALU_LO->OUTPUT_LO
+        # operand leak (see ``shared.addsub_output_boost_enabled``). Every other
+        # GEToBD caller (divmod / shift / mul GE writeback) keeps the 2.0
+        # default, so this is scoped strictly to the add/sub stage that passes a
+        # boosted value.
+        x_bd_out[:, :, BD.OUTPUT_LO:BD.OUTPUT_LO + 16] += indicator_lo * output_amplitude
+        x_bd_out[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16] += indicator_hi * output_amplitude
 
         # Stage result byte 1 at AX markers for the autoregressive byte
         # relay. The marker itself predicts byte 0; the following AX byte

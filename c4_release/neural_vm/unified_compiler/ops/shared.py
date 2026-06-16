@@ -90,6 +90,36 @@ def div_multibyte_enabled() -> bool:
     return os.environ.get("C4_DIV_MULTIBYTE", "1") != "0"
 
 
+def addsub_output_boost_enabled() -> bool:
+    """Return True iff the imperative AddSub5StageBlock writes its byte-0
+    OUTPUT_LO/HI at a DOMINANT amplitude (DEFAULT ON — opt-out via
+    ``C4_ADDSUB_DUMP_BOOST=0``).
+
+    The bug this lifts (verified spec_k=0, BUILT dims, full_trace 0..99):
+    the imperative ``_AddSubGEToBD`` stage (block 10 / logical L8) computes
+    byte-0 add/sub CORRECTLY from the ``_clean_onehot``-thresholded operands
+    and writes the result one-hot into ``OUTPUT_LO/HI`` at amplitude 2.0.
+    The DOWNSTREAM block 11 (logical L9) then floods ``OUTPUT_LO`` with a
+    near-uniform ~83.5 pedestal PLUS the documented L9 ``ALU_LO -> OUTPUT_LO``
+    operand leak (a peak at operand-A's low-nibble lane). With the block-10
+    write only at 2.0 that spurious leaked lane out-votes the correct result
+    lane by a tiny margin (~1.2 out of ~96), flipping the argmax. This is the
+    SAME "downstream L9 ALU_LO->OUTPUT_LO leak" the ``DeclarativeAddSubBlock``
+    out-votes with its dominant amplitude (see ``addsub_declarative_enabled``);
+    we apply the identical remedy on the imperative path, which (unlike the
+    declarative wrap) already reads CLEAN operands so it does not regress the
+    multi-byte cascade.
+
+    When enabled, ``_AddSubGEToBD`` passes ``output_amplitude`` to its
+    ``GEToBDConverter`` so the byte-0 OUTPUT one-hot is written at the boosted
+    magnitude; the carry/borrow CARRY writes and byte-1 AX_FULL staging are
+    UNCHANGED. Flag-OFF restores the amplitude-2.0 write (byte-identical to
+    HEAD). Measured: add 40->XX, sub 44->XX on full_trace ids 0-99, smoke
+    51/0, mul/div/mod guards held.
+    """
+    return os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
+
+
 def addsub_declarative_enabled() -> bool:
     """Return True iff efficient-mode L8 ADD/SUB uses the DECLARATIVE wrap
     (DEFAULT OFF — opt-in via ``C4_ADDSUB_DECLARATIVE=1``).

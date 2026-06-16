@@ -2234,6 +2234,13 @@ def compile_full_vm_dynamic(
             "C4_LEV_AX_BYTE1_KILL": (
                 os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
             ),
+            # Imperative AddSub byte-0 OUTPUT dominant-amplitude write
+            # (DEFAULT-ON, opt out =0, output-affecting): out-votes the
+            # downstream L9 ALU_LO->OUTPUT_LO leak. The ON / OFF builds must
+            # never share a memo entry.
+            "C4_ADDSUB_DUMP_BOOST": (
+                os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2734,6 +2741,14 @@ def _bake_from_scheduled_ops(
         # must never share a serialised entry.
         "C4_ADDSUB_DECLARATIVE": (
             os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
+        ),
+        # Imperative AddSub byte-0 OUTPUT dominant-amplitude write (DEFAULT-ON,
+        # opt out =0, output-affecting on the add/sub MARK_AX OUTPUT_LO/HI byte-0
+        # one-hot): writes the block-10 result at amplitude 30.0 instead of 2.0
+        # to out-vote the downstream L9 ALU_LO->OUTPUT_LO leak. The ON / OFF
+        # builds must never share a serialised entry.
+        "C4_ADDSUB_DUMP_BOOST": (
+            os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
         ),
         # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
         # opt in with =1, output-affecting): the ON / OFF builds must never
