@@ -2,6 +2,10 @@
 
 from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
 from ..building_blocks_dsl import multi_way_and_rule
+from ..isa_semantics_dsl import (
+    FullWidthByteEmissionSpec,
+    full_width_byte_emission,
+)
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
@@ -2120,6 +2124,120 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# AX byte-1 FULL-WIDTH emission (lift the 16-cell H-band one-hot cap)
+# ---------------------------------------------------------------------------
+#
+# The byte-1 emission path is a marker-distance positional one-hot SPREAD
+# across the L0 H1/H2/H3 bands (16 distinct cells), and the LM head's H-band
+# columns ALIAS mod 16 -> every byte value >= 16 collapses to ``byte mod 16``
+# (the edge_literal cluster: ``got == exp & 0x0F``; see
+# ``docs/EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md`` +
+# ``project_ax_byte1_dump_is_h1_onehot_wall``).
+#
+# This op uses the ISA-semantics-DSL :func:`full_width_byte_emission` generator
+# to supply the MECHANICAL alias-break: a dedicated 256-cell WIDE value band
+# (``AX_BYTE1_FULL_WIDE``) with ONE distinct cell per byte value, plus the
+# un-aliased LM-head columns for values 16..255 (``head.weight[v,
+# AX_BYTE1_FULL_WIDE+v] = 5.0``). On a step where the wide band's cell ``v`` is
+# active, the LM head emits the byte token ``v`` directly (no mod-16 fold).
+#
+# Honest scope (probed exhaustively spec_k=0, 2026-06-16):
+#   * The columns + band are byte-identity-gateable on CPU
+#     (``compare_symbolic_to_lowered_embedding``) and FLAG-OFF (default) omits
+#     the band (smaller d_model) + emits zero columns -> the model is
+#     BYTE-IDENTICAL to the pre-feature build.
+#   * The wide band is NOT fed by this op. The byte-1 HIGH nibble (value >=
+#     4096 / byte1 >= 16) has NO value-faithful source at the byte-1 predictor
+#     row: ``OUTPUT_HI`` / ``AX_FULL_HI`` / ``AX_CARRY_HI`` are empty at every
+#     block, and the high nibble survives only as a coarse ``H3+4`` hi==0-vs-
+#     hi>0 flag. Materializing the source one-hot at the IMM decode point +
+#     relaying it to the predictor row is the DEFERRED two-part build (the plan
+#     deferred list + the wall doc's coordinated halves). This op is the
+#     EMISSION half that build plugs into: once a partner relay fills
+#     ``AX_BYTE1_FULL_WIDE`` with the value-faithful byte-1 one-hot, edge_literal
+#     (and every byte1 >= 16) emits correctly with NO further model change.
+#
+# Default OFF (``C4_AX_BYTE1_FULL_WIDTH`` opt-in) because the band/columns are
+# inert until the deferred relay supplies the source: shipping them ON would
+# add d_model + LM-head columns that nothing feeds (still byte-IDENTICAL in
+# logits, but pure overhead). Default-OFF keeps the build byte-identical; the
+# relay increment flips it ON together with its source feed. The
+# ``emission_flag`` gates the WIDE band registration too (flag-off => the band
+# is NOT collected -> smaller d_model -> byte-identical to the pre-feature
+# build), evaluated FRESH at each compile (so an env flip takes effect without
+# a re-import).
+def _ax_byte1_full_width_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
+
+
+_AX_BYTE1_FULL_WIDTH_EMISSION = full_width_byte_emission(
+    FullWidthByteEmissionSpec(
+        name="ax_byte1_full_width",
+        band_name="AX_BYTE1_FULL_WIDE",
+        bits=8,
+        head_scale=5.0,          # mirror the H-band +5.0 emission columns
+        lo_value=16,             # 0..15 already emit via the H-band columns
+        emission_flag=_ax_byte1_full_width_enabled,
+    )
+)
+
+
+def make_ax_byte1_full_width_emission_op() -> Operation:
+    """Add the un-aliased ``AX_BYTE1_FULL_WIDE`` byte-1 emission columns (16-255).
+
+    Uses the ISA-DSL :func:`full_width_byte_emission` generator. The 256-cell
+    wide value band breaks the LM head's mod-16 H-band alias: each byte value
+    16..255 gets its OWN distinct LM-head column, so a future relay that fills
+    the band with the value-faithful byte-1 one-hot lets the LM head emit the
+    full high byte (fixing edge_literal / every byte1 >= 16) with no further
+    change. Runs at phase=1002 (additive, AFTER head_bake); byte-identical when
+    the band is empty (fresh steps) and when the flag is OFF (default).
+
+    Gated by ``C4_AX_BYTE1_FULL_WIDTH`` (default-OFF: the band/columns are inert
+    until the deferred IMM-decode relay supplies the source one-hot).
+    """
+    _emission_on = _ax_byte1_full_width_enabled()
+    bundle = _AX_BYTE1_FULL_WIDTH_EMISSION
+
+    def _bake(model, dim_positions, S):
+        del S
+        if not _emission_on:
+            return
+        from ...vm_step import Token
+        ir = CompilerIR()
+        ir.embeddings.extend(
+            bundle.head_columns_builder(True, Token.VOCAB_SIZE)
+        )
+        ir.lower_token_embeddings(model, dim_positions)
+
+    def _ir_factory(dim_positions, HD):
+        del HD, dim_positions
+        from ...vm_step import Token
+        ir = CompilerIR()
+        if _emission_on:
+            ir.embeddings.extend(
+                bundle.head_columns_builder(True, Token.VOCAB_SIZE)
+            )
+        return ir
+
+    return Operation(
+        name="ax_byte1_full_width_emission",
+        reads=set(),
+        writes=set(),
+        audited_empty_produces=True,
+        kind="model",
+        declarative_bake_fn=_bake,
+        compiler_ir_factory=_ir_factory,
+        phase=1002,
+        declarative_authority="declarative",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md",
     )
 
 

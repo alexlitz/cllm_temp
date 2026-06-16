@@ -777,6 +777,13 @@ def all_core_ops(
         # byte. Phase=1002 (additive, AFTER head_bake). Byte-identical on fresh
         # steps (H1_DUMP_OUT == 0). See model_ops.make_ax_byte1_dump_head_bake_op.
         make_ax_byte1_dump_head_bake_op(),
+        # AX byte-1 FULL-WIDTH emission columns (ISA-DSL full_width_byte_emission):
+        # a 256-cell wide value band + un-aliased LM-head columns 16-255 that
+        # break the H-band mod-16 cap. Gated by C4_AX_BYTE1_FULL_WIDTH
+        # (default-OFF -> band omitted -> byte-identical). The emission half the
+        # deferred IMM-decode relay plugs into to fix edge_literal / byte1 >= 16.
+        # See model_ops.make_ax_byte1_full_width_emission_op.
+        make_ax_byte1_full_width_emission_op(),
         # STACK0 byte-0 DUMP emission columns (Root 2): mirrors the byte-value
         # H1/H3 one-hot columns onto STACK0_B0_DUMP_{H1,H3} so the LM head
         # re-emits the carried STACK0 byte-0 on carried steps. Phase=1002

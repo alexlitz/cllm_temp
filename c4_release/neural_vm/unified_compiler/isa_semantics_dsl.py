@@ -42,11 +42,11 @@ bands).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Set, Tuple
 
 from .building_blocks_dsl import multi_way_and_rule
-from .ir import FFNRule
+from .ir import FFNRule, TokenEmbeddingRule
 from .primitives import AO, AP, DeclarativeAttentionHeadSpec
 from .ops.residual_band_registry import register_residual_band
 
@@ -405,6 +405,274 @@ def cross_step_carry(spec: CrossStepCarrySpec) -> CrossStepCarryBundle:
         dump_rules_builder=dump_rules_builder,
         carry_head_reads=carry_head_reads,
         carry_head_writes=carry_head_writes,
+        dump_reads=dump_reads,
+        dump_writes=dump_writes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Full-width byte emission — lift the 16-cell one-hot cap
+# ---------------------------------------------------------------------------
+#
+# The byte-1 (high-byte) emission path is a MARKER-DISTANCE positional one-hot
+# SPREAD across the L0 ``H1``/``H2``/``H3`` bands (7 cells each, 16 distinct
+# output cells), and the LM head reads those cells via
+# ``head.weight[v, H<k>+off]`` columns that ALIAS mod 16
+# (``head.weight[v] == head.weight[v+16] == head.weight[v+32]`` — verified by
+# ``tools/probe_hband_byte1_map.py``, spec_k=0). So the emitter has only 16
+# distinct output tokens and every byte ``>= 16`` collapses to ``byte mod 16``
+# (the ``edge_literal`` cluster: ``got == exp & 0x0F``; see
+# ``docs/EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md``).
+#
+# :func:`full_width_byte_emission` is the GENERATOR that lifts the cap. It
+# supplies the two MECHANICAL halves the alias-break needs — independent of
+# WHERE the value source comes from:
+#
+#   1. a dedicated WIDE value band (``2**bits`` cells, a FULL value-faithful
+#      one-hot — NOT the 16-cell positional spread). One cell per byte value;
+#      no aliasing.
+#   2. the LM-head columns for the FULL value range (``head.weight[v, band+v]
+#      = scale``) — one DISTINCT column per token, so values 16..255 emit their
+#      own token instead of ``v mod 16``.
+#
+# Plus a gated DUMP FFN that fills ``band+v`` from a value-source one-hot at the
+# consuming row (the same gate-in-FFN discriminator the cross-step carry uses).
+# The band + the columns + the dump are gated by ``emission_flag``: flag-OFF
+# omits the band (smaller d_model) AND emits zero columns / zero rules, so the
+# model is BYTE-IDENTICAL to the pre-feature build.
+#
+# Scope contract (honest): the columns + band + dump are mechanical and
+# byte-identity-gateable on CPU. Whether ``edge_literal`` (or any specific byte
+# >= 16) actually CLEARS additionally requires a value-faithful one-hot SOURCE
+# for the byte at the consuming row to feed ``dump_value_source``. On the IMM
+# byte-1 predictor row that source does NOT exist (probed exhaustively: the
+# high nibble is encoded only as a coarse ``H3+4`` hi==0-vs-hi>0 flag, and
+# ``OUTPUT_HI`` / ``AX_FULL_HI`` / ``AX_CARRY_HI`` are empty at every block) —
+# materializing it is the DEFERRED IMM-decode band + relay build (the plan's
+# deferred list; the wall doc's two coordinated halves). This generator is the
+# emission half that build plugs into.
+
+
+@dataclass(frozen=True)
+class FullWidthByteEmissionSpec:
+    """Declarative description of a full-width (un-aliased) byte emission band.
+
+    The hand-built byte-1 dump (``model_ops._ax_byte1_dump_band_for_value`` +
+    ``_ax_byte1_dump_head_bake_rules``) MIRRORS the LM head's 16-cell H-band
+    positional layout, so it inherits the mod-16 alias and caps byte values at
+    15. This spec declares a flat ``2**bits`` value band that breaks the alias:
+    one cell per value, one LM-head column per value.
+
+    Every field is a VARYING parameter; the IDENTICAL 3-part structure (wide
+    band + full-range LM-head columns + gated dump FFN) is supplied by
+    :func:`full_width_byte_emission`. The band/columns/dump are ALL gated by
+    :attr:`emission_flag` — flag-off omits the band and emits zero
+    columns/rules (byte-identical to the pre-feature build).
+
+    Attributes:
+        name: feature name (band owner + rule-name prefix).
+        band_name: dedicated WIDE value band name (``2**bits`` cells).
+            Registered at import time by :func:`full_width_byte_emission`.
+        bits: byte width in bits (8 => 256 cells, values 0..255).
+        head_scale: LM-head column weight (mirrors the H-band ``+5.0``).
+        lo_value: first value to emit columns for. The hand-built H-band
+            columns already cover ``0..15`` (the alias range); the full-width
+            generator covers ``lo_value..(2**bits - 1)``. Default 16 (the
+            payoff: ADD the un-aliased high values WITHOUT re-emitting the
+            already-correct 0..15 columns — keeps the off-build byte-identical
+            and the on-build additive).
+        emission_flag: zero-arg predicate gating the WHOLE feature (band +
+            columns + dump). ``None`` => always on. When supplied, flag-off
+            omits the band (smaller d_model) and bakes no columns / rules.
+        dump_value_source: the value-source band the dump reads to fill the
+            wide band — a ``2**bits``-wide one-hot of the byte value at the
+            consuming row (e.g. a relay-populated band). The dump copies
+            ``dump_value_source+v -> band+v`` gated on the row marker. ``None``
+            => no dump rules are generated (the band is filled by a partner op,
+            or this is a columns-only build).
+        dump_gate_conditions: the carry-vs-fresh / row-selector GATE — a tuple
+            of ``(dim_name, weight)`` AND conditions shared across all dump
+            cells. THE ONLY dump gating surface. ``()`` => the dump fires
+            whenever the source cell is active (gate = the source one-hot
+            alone).
+        dump_threshold: explicit AND threshold for the dump cells. ``None`` =>
+            the sum of the ``dump_gate_conditions`` weights (so every declared
+            condition must be present).
+        dump_write_scale: dump band-write magnitude. Default mirrors the
+            H-band carry's large write so it dominates the tail. Default 5.0.
+        band_owner: ``register_residual_band(owner=...)`` diagnostic string.
+            ``None`` => use ``name``.
+    """
+
+    name: str
+    band_name: str
+    bits: int = 8
+    head_scale: float = 5.0
+    lo_value: int = 16
+    emission_flag: Optional[Callable[[], bool]] = None
+    dump_value_source: Optional[str] = None
+    dump_gate_conditions: Tuple[Tuple[str, float], ...] = ()
+    dump_threshold: Optional[float] = None
+    dump_write_scale: float = 5.0
+    band_owner: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.bits <= 0 or self.bits > 16:
+            raise ValueError(
+                f"FullWidthByteEmissionSpec({self.name!r}): bits must be in "
+                f"1..16, got {self.bits}"
+            )
+        if self.lo_value < 0:
+            raise ValueError(
+                f"FullWidthByteEmissionSpec({self.name!r}): lo_value must be "
+                f">= 0, got {self.lo_value}"
+            )
+        if self.lo_value >= (1 << self.bits):
+            raise ValueError(
+                f"FullWidthByteEmissionSpec({self.name!r}): lo_value "
+                f"{self.lo_value} >= 2**bits {1 << self.bits} — nothing to emit"
+            )
+
+    @property
+    def band_width(self) -> int:
+        return 1 << self.bits
+
+
+@dataclass(frozen=True)
+class FullWidthByteEmissionBundle:
+    """The artifacts :func:`full_width_byte_emission` generates.
+
+    The wide band has ALREADY been registered (import-time side effect) by the
+    time this bundle exists. The builders are pure (no global side effects).
+
+    Attributes:
+        spec: the originating :class:`FullWidthByteEmissionSpec`.
+        head_columns_builder: ``(emission_on: bool, vocab_size: int) ->
+            tuple[TokenEmbeddingRule, ...]``. The LM-head columns for
+            ``lo_value..min(2**bits - 1, vocab_size - 1)``. Returns ``()`` when
+            ``emission_on`` is False (byte-identical flag-off).
+        dump_rules_builder: ``(emission_on: bool, dim_positions) ->
+            tuple[FFNRule, ...]``. The gated FFN that fills the wide band from
+            ``dump_value_source``. Returns ``()`` when off OR when
+            ``dump_value_source`` is None.
+        head_reads / head_writes: dim-name sets for the LM-head bake (the wide
+            band cells are the head's read columns).
+        dump_reads / dump_writes: dim-name sets for the dump FFN's Operation.
+    """
+
+    spec: FullWidthByteEmissionSpec
+    head_columns_builder: Callable[[bool, int], Tuple[TokenEmbeddingRule, ...]]
+    dump_rules_builder: Callable[[bool, Dict[str, int]], Tuple[FFNRule, ...]]
+    head_reads: Set[str]
+    head_writes: Set[str]
+    dump_reads: Set[str]
+    dump_writes: Set[str]
+
+
+def full_width_byte_emission(
+    spec: FullWidthByteEmissionSpec,
+) -> FullWidthByteEmissionBundle:
+    """Generate the un-aliased full-width byte emission scaffolding for ``spec``.
+
+    Side effect (import time): registers ``spec.band_name`` (``2**spec.bits``
+    cells) via :func:`register_residual_band` with ``never_share=True`` and
+    ``flag=spec.emission_flag``. Call at MODULE-IMPORT scope of the owning
+    ``lN_ops``/``model_ops`` module.
+
+    The bundle's two builders reproduce the un-aliased emission columns + the
+    gated band-fill FFN. Flag-off => zero columns / zero rules / no band
+    (byte-identical to the pre-feature build).
+    """
+    # (1) Register the dedicated WIDE value band (import-time side effect).
+    register_residual_band(
+        spec.band_name,
+        spec.band_width,
+        owner=spec.band_owner if spec.band_owner is not None else spec.name,
+        flag=spec.emission_flag,
+        never_share=True,
+    )
+
+    hi_value = spec.band_width - 1
+
+    # (2) LM-head columns — one DISTINCT column per value (no mod-16 alias).
+    def head_columns_builder(
+        emission_on: bool, vocab_size: int
+    ) -> Tuple[TokenEmbeddingRule, ...]:
+        if not emission_on:
+            return ()
+        rules: list[TokenEmbeddingRule] = []
+        top = min(hi_value, int(vocab_size) - 1)
+        for v in range(spec.lo_value, top + 1):
+            rules.append(TokenEmbeddingRule.head_weight_write(
+                token_ids=[v],
+                writes=((f"{spec.band_name}+{v}", spec.head_scale),),
+                name=f"{spec.name}_head_token_{v}",
+            ))
+        return tuple(rules)
+
+    # (3) Dump FFN — fill ``band+v`` from ``dump_value_source+v`` gated on the
+    #     row conditions. Per value cell v in [lo_value, hi_value]. The gate is
+    #     the value-source one-hot cell ``dump_value_source+v`` (so cell v fills
+    #     iff the source's value == v); the conditions are the row selector.
+    #
+    #     Threshold derivation mirrors ``multi_way_and_rule``'s own midpoint
+    #     ``(total + (total - max_w)) / 2`` (the "all conditions on" sum clears
+    #     it; "any one missing" sinks below) so the AND fires only when EVERY
+    #     declared condition is present. When there are no conditions the gate
+    #     alone selects (threshold 0 => the source one-hot drives the write).
+    if spec.dump_threshold is not None:
+        threshold: Optional[float] = spec.dump_threshold
+    elif spec.dump_gate_conditions:
+        _weights = [w for (_d, w) in spec.dump_gate_conditions]
+        _total = sum(_weights)
+        threshold = (_total + (_total - max(_weights))) / 2.0
+    else:
+        threshold = 0.0
+
+    def dump_rules_builder(
+        emission_on: bool, dim_positions: Dict[str, int]
+    ) -> Tuple[FFNRule, ...]:
+        del dim_positions  # all dims resolve by name at lower time
+        if not emission_on or spec.dump_value_source is None:
+            return ()
+        rules: list[FFNRule] = []
+        conditions = tuple(spec.dump_gate_conditions)
+        for v in range(spec.lo_value, hi_value + 1):
+            if conditions:
+                rules.append(multi_way_and_rule(
+                    name=f"{spec.name}_fill_{v}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate=f"{spec.dump_value_source}+{v}",
+                    writes=((f"{spec.band_name}+{v}", spec.dump_write_scale),),
+                ))
+            else:
+                # No row conditions: the source one-hot cell alone gates the
+                # write. Use the source cell as the single "condition" so the
+                # AND degenerates to "source cell active".
+                rules.append(multi_way_and_rule(
+                    name=f"{spec.name}_fill_{v}",
+                    conditions=((f"{spec.dump_value_source}+{v}", 1.0),),
+                    writes=((f"{spec.band_name}+{v}", spec.dump_write_scale),),
+                ))
+        return tuple(rules)
+
+    head_reads: Set[str] = {spec.band_name}
+    head_writes: Set[str] = set()  # writes the LM head, not a residual dim
+
+    dump_reads: Set[str] = set()
+    for (dim_name, _w) in spec.dump_gate_conditions:
+        dump_reads.add(dim_name)
+    if spec.dump_value_source is not None:
+        dump_reads.add(spec.dump_value_source)
+    dump_writes: Set[str] = {spec.band_name}
+
+    return FullWidthByteEmissionBundle(
+        spec=spec,
+        head_columns_builder=head_columns_builder,
+        dump_rules_builder=dump_rules_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
         dump_reads=dump_reads,
         dump_writes=dump_writes,
     )
