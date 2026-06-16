@@ -642,7 +642,6 @@ def classify_program(
                 if exp_b == got_b:
                     continue
                 opcode = ot.opcodes[s] if s < len(ot.opcodes) else -1
-                conf = _div_confidence(s, vcorr)
                 op_name = _OPCODE_NAME.get(opcode, f"op{opcode}")
                 # ALU step? The step's opcode is a composite ALU block. The
                 # faithful forward (FaithfulForwardCache, which runs the real
@@ -651,28 +650,46 @@ def classify_program(
                 # FAIL (not ALU-OPAQUE). But the block is imperative (no
                 # declarative rule), so the attribution is COARSE:
                 # attributed_op=<block>, attributed_rule=None, is_alu_step=True.
-                # The cross-step poisoning guard still applies — a CROSS-STEP
-                # ALU FAIL (downstream of a value correction) stays CROSS-STEP.
+                #
+                # CROSS-STEP RECONCILIATION (clean-ALU certification): when the
+                # DIVERGING STEP'S OWN OPCODE is a composite ALU block, the wrong
+                # (PC, AX) IS the ALU block's own result — the GENUINE first
+                # divergence — NOT a value byte the autoregressive decode poisoned
+                # downstream of a benign SP/STACK0 re-anchoring. The blanket vcorr
+                # guard otherwise defers these as CROSS-STEP because the unrelated
+                # step-1 SP-byte-2 / STACK0-high-byte re-anchoring corrections fire
+                # FIRST (``div_step > vcorr``). But those corrections are the
+                # benign re-anchoring noise the gate already trusts for the marker
+                # offsets; they do NOT poison the ALU step's own result. So an
+                # ALU-OPCODE-step divergence is certified HIGH-confidence (a real
+                # coarse-attributed FAIL). Measured: every such ALU-step FAIL over
+                # mul/div/mod/expr matches the neural full_trace FAIL verdict
+                # (7/7), and the 43 clean ALU programs (no ALU-step divergence) all
+                # match neural PASS — 0 false-trusts. The cross-step guard remains
+                # intact for NON-ALU divergences (the var/func PC framing-drift,
+                # where the flat divergence is on a PC/AX value the early SP/BP/
+                # STACK0 correction genuinely poisons).
                 if opcode in _ALU_OPCODE_BLOCK:
-                    xs_tag = ("  [CROSS-STEP: divergence is downstream of a "
-                              f"value correction at step {vcorr} — production's "
-                              "autoregressive poisoning; resolve with "
-                              "--faithfulness-check (GPU)]"
-                              if conf == CROSS_STEP else "")
                     return GateResult(
                         name=name, cluster=cluster, classification=FAIL,
                         n_steps=n_steps, div_step=s, div_reg=reg, div_byte=k,
                         expected=exp_b, got=got_b, expected_reg=o_val,
                         got_reg=g_val, attributed_op=_ALU_OPCODE_BLOCK[opcode],
                         attributed_rule=None, alu_op=_ALU_OPCODE_BLOCK[opcode],
-                        is_alu_step=True, confidence=conf,
+                        is_alu_step=True, confidence=HIGH,
                         value_correction_step=vcorr,
                         note=(f"step {s} opcode={op_name} {reg}[{k}] "
                               f"exp=0x{exp_b:02x} got=0x{got_b:02x} "
                               f"-> imperative ALU block "
                               f"{_ALU_OPCODE_BLOCK[opcode]} (coarse "
-                              f"attribution: no declarative rule)" + xs_tag),
+                              f"attribution: no declarative rule; GENUINE ALU-step "
+                              f"divergence — certified HIGH-confidence)"),
                     )
+                # Non-ALU divergence: the cross-step poisoning guard applies — a
+                # divergence strictly AFTER the first register-VALUE-byte
+                # correction may be a teacher-forcing artifact (the var/func PC
+                # framing-drift) and is flagged CROSS-STEP, not attributed.
+                conf = _div_confidence(s, vcorr)
                 # Non-ALU step: attribute the wrong byte to its owning declarative
                 # rule. Only attribute HIGH-confidence divergences (at/before the
                 # cross-step poisoning point): a CROSS-STEP divergence may be a
@@ -731,7 +748,24 @@ def classify_program(
     # Resolve those with --faithfulness-check (GPU). A correction at the LAST step
     # (``vcorr >= n_steps - 1``) cannot poison any later (PC, AX) check, so it
     # stays a faithful PASS.
-    if vcorr is not None and vcorr < n_steps - 1:
+    #
+    # CLEAN-ALU CERTIFICATION (cross-step reconciliation): the blanket vcorr
+    # deferral was DEFERRING essentially every ALU program (mul/div/mod/expr)
+    # because the upstream step-1 SP-byte-2 + STACK0-high-byte re-anchoring
+    # corrections fire FIRST (``vcorr = 0 or 1``). But for a program whose path
+    # executes a composite ALU block AND whose every (PC, AX) decodes cleanly,
+    # those benign re-anchoring corrections do NOT poison the ALU result: the ALU
+    # block's output is the program's whole point and it matched the oracle at
+    # every step. Measured over mul/div/mod/expr (100-119,150-169,850-874): all
+    # 43 clean ALU programs (no (PC, AX) divergence) have neural full_trace = ok
+    # (0 false-trusts). So a clean program whose path RUNS an ALU block is
+    # certified PASS even when its only corrections are the SP/STACK0 re-anchoring
+    # noise. NON-ALU clean programs (``not has_alu``) keep the conservative
+    # CROSS-STEP deferral: 5 var_simple programs (262/263/267/271/272) have NO
+    # flat (PC, AX) divergence yet neural FAILS @ step 4 (a step-1 BP/SP
+    # correction poisons a later PC the single forward never sees) — certifying
+    # those would be false-trusts, so the guard stays intact for them.
+    if vcorr is not None and vcorr < n_steps - 1 and not has_alu:
         return GateResult(
             name=name, cluster=cluster, classification=FAIL,
             n_steps=n_steps, div_step=None, confidence=CROSS_STEP,
@@ -745,13 +779,17 @@ def classify_program(
         )
     if has_alu:
         s0 = alu_steps[0][0]
+        vc_tag = (f"; certified despite a benign SP/STACK0 re-anchoring "
+                  f"correction at step {vcorr} (clean-ALU certification — the "
+                  f"ALU block's own result matched the oracle at every step)"
+                  if vcorr is not None else "")
         return GateResult(
             name=name, cluster=cluster, classification=PASS, n_steps=n_steps,
-            is_alu_step=True, alu_op=alu_op0,
-            note=(f"all {n_steps} steps match oracle (path executes imperative "
-                  f"ALU op {alu_op0} at step {s0}"
+            is_alu_step=True, alu_op=alu_op0, value_correction_step=vcorr,
+            note=(f"all {n_steps} steps' (PC, AX) match oracle (path executes "
+                  f"imperative ALU op {alu_op0} at step {s0}"
                   + (f" + {len(alu_steps) - 1} more" if len(alu_steps) > 1 else "")
-                  + ", executed via real baked block)"),
+                  + ", executed via real baked block" + vc_tag + ")"),
         )
     return GateResult(name=name, cluster=cluster, classification=PASS,
                       n_steps=n_steps, note=f"all {n_steps} steps match oracle")
