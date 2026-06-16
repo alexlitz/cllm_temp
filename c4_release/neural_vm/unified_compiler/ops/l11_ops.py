@@ -1488,17 +1488,59 @@ _AX_CARRY_OVERFLOW_HI2_THRESHOLD = 3.0
 # >= 2.70 (byte 1/2/3 = 4.02/3.29/2.70), non-AX rows ~0.00 -> 2.0 sits cleanly
 # in the gap (margin >= 0.7 from the lowest legit AX row).
 _AX_REGISTER_PRESENT_B1HI8_THRESHOLD = 2.0
+# LEV stale-carry kill: Σ AX_CARRY threshold. Genuine multi-byte carry ~2.65
+# (value-independent), LEV func-return step ~3.66; 3.0 sits cleanly in the gap.
+_LEV_AX_CARRY_SUM_KILL_THRESHOLD = 3.0
+
+
+def _lev_ax_byte1_kill_enabled() -> bool:
+    """``C4_LEV_AX_BYTE1_KILL`` flag predicate (DEFAULT-ON).
+
+    Adds a THIRD ``AX_CARRY_OVERFLOW`` dump-kill unit that fires when the
+    summed ``Σ AX_CARRY`` band crosses 3.0. This targets the func/nested/rec
+    LEV (function-return) epilogue: at the LEV step the restored AX is the
+    single-byte loaded return value (byte-1 == 0 for the whole func_*/nested_*
+    cluster, all of which return values <= 255), but the byte-1 dump misfires
+    and re-emits a STALE carried one-hot (e.g. value 6 -> AX 70 -> 0x646), so
+    the function EXIT value is wrong.
+
+    ROOT (spec_k=0, BUILT dims, func_identity_0 id550 step-8 LEV, 2026-06-15):
+    exact LM-head logit attribution at the LEV-step AX byte-1 predictor row
+    pins the leak to ``H2_DUMP_OUT+1`` (res 16.2, +81 logit contrib) — the
+    ``ax_byte1_dump_repopulate`` band, re-emitting the stale prev-step byte-1.
+    The dump fires there because its lower-bound gate ``Σ AX_CARRY`` sits in
+    the carry band. PROOF of separability (probe_lev / _probe_dump_gate, full
+    add+sub corpus): a GENUINE multi-byte carry (where the dump MUST fire to
+    re-emit a real high byte) has ``Σ AX_CARRY`` clustered tightly at
+    **2.65** (value-INDEPENDENT step-class signal; 1.98-2.65 across add_0..11
+    / sub_0..7), while the LEV stale-carry step sits tightly at **3.66**. A
+    kill threshold at **3.0** separates them with margin 0.35 below (genuine)
+    and 0.66 above (LEV). The over-fire SHL(~12.85)/JMP(~47.86) classes are
+    also >= 3.0 so this unit ALSO redundantly catches them (unit 0 already
+    does via ``AX_CARRY_HI+2``).
+
+    SAFETY: every func_*/nested_* return value is <= 255 (verified 0/75 in
+    550-599 + 950-974 exceed 255), so the dump never genuinely needs to fire
+    at a LEV step in these clusters — killing it there is exactly correct, not
+    a trade. Flag-off (``C4_LEV_AX_BYTE1_KILL=0``) omits the unit, so the
+    overflow flag is byte-identical with the prior 2-unit design.
+    """
+    return _os_stack0.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
 
 
 def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:
-    """2 rules into ``AX_CARRY_OVERFLOW`` (OR of two dump-kill conditions).
+    """2 (or 3) rules into ``AX_CARRY_OVERFLOW`` (OR of dump-kill conditions).
 
     Unit 0: ``step(AX_CARRY_HI+2 >= 3.0)`` — the SHL/JMP upper-cut.
     Unit 1: ``step(ADDR_B1_HI+8 <= 2.0)`` — the NON-AX-register kill (PC/SP/BP/
     STACK0/MEM byte rows), so the unbounded Σ AX_CARRY lower bound can never
     fire the dump on a non-AX row (the step-0 prologue framing-drift root).
+    Unit 2 (``C4_LEV_AX_BYTE1_KILL``, default ON): ``step(Σ AX_CARRY >= 3.0)``
+    — the LEV (function-return) stale-carry kill (see
+    :func:`_lev_ax_byte1_kill_enabled`). Genuine multi-byte carries sit at
+    Σ AX_CARRY ~2.65 (dark), LEV sits at ~3.66 (fires).
     """
-    return (
+    base = (
         step_function_rule(
             name="ax_byte1_carry_overflow_flag",
             input_dim="AX_CARRY_HI+2",
@@ -1522,6 +1564,30 @@ def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:
             name="ax_byte1_not_ax_register_kill",
             conditions=(("ADDR_B1_HI+8", -1.0),),
             threshold=-_AX_REGISTER_PRESENT_B1HI8_THRESHOLD,
+            writes=(("AX_CARRY_OVERFLOW", 2.0 / 100.0),),
+        ),
+    )
+    if not _lev_ax_byte1_kill_enabled():
+        return base
+    # Unit 2 (C4_LEV_AX_BYTE1_KILL): fire when Σ AX_CARRY >= 3.0 (the LEV
+    # stale-carry step). conditions = every AX_CARRY_{LO,HI}+k cell at weight
+    # 1.0 -> the AND score IS the raw band SUM; threshold 3.0 sits in the gap
+    # between the genuine-carry cluster (~2.65) and the LEV step (~3.66). On a
+    # genuine carry row the score 2.65 < 3.0 -> silu(S*-0.35) ~= 0 -> dark
+    # (byte-identical to the 2-unit design); on a LEV row 3.66 >= 3.0 -> fires
+    # -> dump killed -> H*_DUMP_OUT == 0 -> AX byte-1 falls back to the clean
+    # normal H1 path (value 0). write_value 2.0/100 matches units 0/1 so the
+    # dump's -1000 read deeply darkens its AND.
+    lev_kill_conditions = tuple(
+        (f"AX_CARRY_LO+{k}", 1.0) for k in range(16)
+    ) + tuple(
+        (f"AX_CARRY_HI+{k}", 1.0) for k in range(16)
+    )
+    return base + (
+        multi_way_and_rule(
+            name="ax_byte1_lev_stale_carry_kill",
+            conditions=lev_kill_conditions,
+            threshold=_LEV_AX_CARRY_SUM_KILL_THRESHOLD,
             writes=(("AX_CARRY_OVERFLOW", 2.0 / 100.0),),
         ),
     )
@@ -1564,9 +1630,12 @@ def make_ax_byte1_carry_overflow_flag_op() -> Operation:
                 d_model = None
         if d_model is None:
             d_model = 512
-        assert len(rules) == _AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM, (
+        _expected_units = _AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM + (
+            1 if _lev_ax_byte1_kill_enabled() else 0
+        )
+        assert len(rules) == _expected_units, (
             f"ax_byte1_carry_overflow_flag rule-count drift: produced "
-            f"{len(rules)}, expected {_AX_CARRY_OVERFLOW_FLAG_HIDDEN_DIM}"
+            f"{len(rules)}, expected {_expected_units}"
         )
         ffn = PureFFN(d_model, len(rules))
         from ...dim_registry_dynamic import build_default_registry_dynamic
@@ -1591,7 +1660,9 @@ def make_ax_byte1_carry_overflow_flag_op() -> Operation:
 
     return Operation(
         name="ax_byte1_carry_overflow_flag",
-        reads={"AX_CARRY_HI", "ADDR_B1_HI"},
+        # AX_CARRY_LO is read only by the C4_LEV_AX_BYTE1_KILL unit 2; declaring
+        # it unconditionally is harmless when the flag is off (no rule taps it).
+        reads={"AX_CARRY_HI", "AX_CARRY_LO", "ADDR_B1_HI"},
         writes={"AX_CARRY_OVERFLOW"},
         kind="block",
         # Append on the same L25 block AFTER the tail correction but BEFORE the

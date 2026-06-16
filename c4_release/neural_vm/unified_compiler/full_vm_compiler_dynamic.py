@@ -2216,6 +2216,14 @@ def compile_full_vm_dynamic(
             "C4_L15_LI_SUPPR_INERT": (
                 os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
             ),
+            # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
+            # opt out =0): adds a 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY
+            # >= 3.0, killing the byte-1 dump at the func/nested/rec LEV step
+            # (output-affecting on the func EXIT value), so the ON / OFF builds
+            # must NEVER share a memo / disk entry.
+            "C4_LEV_AX_BYTE1_KILL": (
+                os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2746,6 +2754,13 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_L15_LI_SUPPR_INERT": (
             os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+        ),
+        # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
+        # opt out =0, output-affecting on the func/nested/rec EXIT value): adds a
+        # 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY >= 3.0. The ON / OFF
+        # builds must never share a serialised entry.
+        "C4_LEV_AX_BYTE1_KILL": (
+            os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
