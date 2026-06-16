@@ -109,6 +109,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "CE/acc (no-grad). Keeps peak memory bounded; the "
                          "reported mean CE is chunk-invariant.")
     ap.add_argument("--weight-decay", type=float, default=0.0)
+    ap.add_argument("--optimizer", type=str, default="adamw",
+                    choices=["adamw", "sgd"],
+                    help="adamw (RMS-normalized step ~lr) or sgd (step ~ lr*grad)")
+    ap.add_argument("--anchor-lambda", type=float, default=0.0,
+                    help="L2 trust-region anchor to the INITIAL compiled weights: "
+                         "loss += lambda * ||W - W0||^2. Makes the exact-VM point "
+                         "an attractor instead of a non-attracting saddle. 0 = off.")
     ap.add_argument("--grad-clip", type=float, default=1.0,
                     help="Max global grad-norm (the hand-built logits emit "
                          "huge grads; clipping is essential).")
@@ -181,7 +188,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     trainable = _select_trainable_params(model, args.trainable, args.last_k)
     n_train = sum(p.numel() for p in trainable)
     print(f"[run:{label}] trainable params: {n_train} ({args.trainable})", file=sys.stderr, flush=True)
-    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "sgd":
+        # Plain SGD: the per-step weight delta scales with the ACTUAL gradient
+        # magnitude (no RMS normalization). Isolates whether the first-step
+        # cliff is AdamW's gradient-normalization (step ~ lr regardless of |grad|)
+        # vs. the architecture's S=100 amplification of any perturbation.
+        opt = torch.optim.SGD(trainable, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=args.weight_decay)
+
+    # Trust-region anchor: snapshot the compiled weights so the loss can pull
+    # GD back toward the exact-VM point. Only clone when active (doubles the
+    # trainable-param memory footprint).
+    anchor_ref = None
+    if args.anchor_lambda and args.anchor_lambda > 0:
+        anchor_ref = [p.detach().clone() for p in trainable]
+        print(f"[run:{label}] anchor L2 to compiled weights, lambda={args.anchor_lambda}",
+              file=sys.stderr, flush=True)
 
     traj: List[dict] = []
 
@@ -242,6 +265,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         model.train()
         opt.zero_grad(set_to_none=True)
         loss, st = H.teacher_forced_loss(model, batch, dev, temperature=args.temperature)
+        if anchor_ref is not None:
+            anchor_pen = sum(((p - a) ** 2).sum() for p, a in zip(trainable, anchor_ref))
+            loss = loss + args.anchor_lambda * anchor_pen
         loss.backward()
         if args.stabilize:
             # Scrub nan/inf grads -> 0 (the backward through the 50-block
@@ -273,6 +299,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         "config": {
             "ids": args.ids,
             "lr": args.lr,
+            "optimizer": args.optimizer,
+            "anchor_lambda": args.anchor_lambda,
             "steps": args.steps,
             "eval_every": args.eval_every,
             "batch": args.batch,
