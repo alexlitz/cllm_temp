@@ -46,9 +46,12 @@ def _l15_li_load_suppressor_inert_on() -> bool:
 
 
 def _l15_lev_pc_restore_head_on() -> bool:
-    """DEFAULT-ON flag (``C4_L15_LEV_PC_RESTORE``): add a 15th L15 memory-lookup
+    """DEFAULT-OFF flag (``C4_L15_LEV_PC_RESTORE``): add a 15th L15 memory-lookup
     head that content-addressably restores the saved return address into PC at
-    the LEV step.
+    the LEV step. (Flipped to default-OFF on integration: the head is
+    output-affecting and only delivers the return PC once the post-ENT framing
+    desync is fixed -- see C4_PSH_STACK0_BYTE3_RELAY_DARKEN -- so it ships
+    flag-off / byte-identical and is turned on together with the framing flag.)
 
     ROOT (spec_k=0, BUILT dims, func_identity_0 id550 step-8 LEV, 2026-06-15):
     LEV must set ``pc = mem[BP+8]`` (the return address pushed by JSR). The L9
@@ -77,13 +80,14 @@ def _l15_lev_pc_restore_head_on() -> bool:
     (slots 4..27 reading ADDR_B0/B1/B2 on both Q and K) but gated to fire at
     the LEV PC marker (``OP_LEV`` + ``MARK_PC``), selecting the stored value's
     byte 0 and copying CLEAN_EMBED -> OUTPUT_LO/HI so the LM head emits the
-    return address as PC[0]. Default ON; ``C4_L15_LEV_PC_RESTORE=0`` keeps the
-    resize target at 14 heads and omits the head, so the build is BYTE-IDENTICAL
-    to HEAD (num_heads=14). Expanding L15 to 15 heads grows only the L15
+    return address as PC[0]. Default OFF; the default build keeps the resize
+    target at 14 heads and omits the head, so it is BYTE-IDENTICAL to HEAD
+    (num_heads=14). ``C4_L15_LEV_PC_RESTORE=1`` grows L15 to 15 heads. Expanding
+    L15 to 15 heads grows only the L15
     ``W_q/W_k/W_v`` row count and ``W_o`` column count -- d_model is unchanged
     so every OTHER block is byte-identical regardless of the flag.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
+    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
 
 
 def _l15_lev_addr_widen_on() -> bool:
