@@ -163,7 +163,16 @@ _AP_AO_BASELINE: Dict[str, int] = {
     "c4_release/neural_vm/unified_compiler/ops/model_ops.py": 57,
     "c4_release/neural_vm/unified_compiler/ops/l3_ops.py": 56,
     "c4_release/neural_vm/unified_compiler/ops/l15_ops.py": 49,
+    # #221 consumer_lookahead_gate migration: 27 AP/AO calls (the 3 hand-built
+    # head-spec builder bodies) moved OUT of l5_ops (74 -> 47, back AT its
+    # baseline) INTO the reusable isa_semantics_dsl generator — the DSL
+    # consolidation the ratchet rewards. Baseline stays 47 (l5_ops had drifted
+    # ABOVE it when the #221 ops landed; the migration restores it).
     "c4_release/neural_vm/unified_compiler/ops/l5_ops.py": 47,
+    # isa_semantics_dsl is the ISA-semantics DSL HOME for the carry/gate head
+    # generators (cross_step_carry 10 + consumer_lookahead_gate 27). These AP/AO
+    # are the canonical generated-head plumbing, not per-layer hand-wiring.
+    "c4_release/neural_vm/unified_compiler/isa_semantics_dsl.py": 37,
     "c4_release/neural_vm/unified_compiler/ops/l9_ops.py": 33,
     "c4_release/neural_vm/unified_compiler/ops/l4_ops.py": 25,
     "c4_release/neural_vm/unified_compiler/ops/flag_gated_ops.py": 23,

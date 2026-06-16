@@ -9,7 +9,10 @@ from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, _opcode_name_map
-from .residual_band_registry import register_residual_band
+from ..isa_semantics_dsl import (
+    ConsumerLookaheadGateSpec,
+    consumer_lookahead_gate,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -52,50 +55,73 @@ def _stack0_next_arith_enabled() -> bool:
     return os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
 
 
-register_residual_band(
-    "LOOKAHEAD_PC_LO", 16, owner="make_lookahead_pc8_chain_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
+# ===========================================================================
+# #221 re-expressed via the ISA-semantics DSL: the entire six-op consumer-
+# opcode lookahead gate is now GENERATED from ONE declaration.
+# ===========================================================================
+# "Gate the STACK0 dump on the CONSUMER (next) opcode": detect that the next
+# instruction (at PC+INSTR_WIDTH) is arithmetic, AND it with a causal prior-
+# arith latch, and drive the bounded ``STACK0_B0_DUMP_BLOCK`` flag the L25 dump
+# reads as its blocker. ``consumer_lookahead_gate`` supplies the IDENTICAL
+# six-op structure (the PC+8 chain, the opcode-fetch head, the consumer-class
+# flag FFN, the within-step relay, the causal prior-class latch, the AND-gate
+# FFN) + registers the six feature bands. The op factories below install the
+# generator's pure builders, keeping the head allocation / placement / Operation
+# wiring byte-identical to the hand-built #221. Flag-off omits everything ->
+# byte-identical to the pre-feature build (HEAD). This is the next ISA-semantics
+# increment after ``cross_step_carry`` (BP_SAVE_PREV) and is proven the same
+# way: whole-model state_dict SHA256 == HEAD golden, flag-on AND off.
+#
+# The arithmetic consumer class (OR/XOR/AND/SHL/SHR/ADD/SUB/MUL/DIV/MOD) as
+# (name, lo_nibble, hi_nibble) one-hot pairs from the L5 opcode-decode table.
+# EXCLUDES comparisons (EQ..GE) and branches (the +27 dump must stay on those).
+_NEXT_ARITH_OPCODES = (
+    ("OR", 14, 0), ("XOR", 15, 0),
+    ("AND", 0, 1), ("SHL", 7, 1), ("SHR", 8, 1),
+    ("ADD", 9, 1), ("SUB", 10, 1), ("MUL", 11, 1),
+    ("DIV", 12, 1), ("MOD", 13, 1),
 )
-register_residual_band(
-    "LOOKAHEAD_PC_HI", 16, owner="make_lookahead_pc8_chain_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
+# The prior-arith causal-latch class: the per-step arith opcode DIMS (at each
+# step's AX-marker row) the latch matches on PRIOR positions. Discriminates the
+# single-op operand frame (no prior arith -> keep dump) from the multi-op
+# intermediate-operand frame (prior arith executed -> block dump).
+_PRIOR_ARITH_OPCODES = (
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
 )
-register_residual_band(
-    "NEXT_OPCODE_LO", 16, owner="make_lookahead_opcode_fetch_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
+
+# THE one-line declaration. Every band name / owner / scalar matches the hand-
+# built #221 so the migration is byte-identical (the generator registers the
+# six bands as an import-time side effect, exactly where the hand-built
+# register_residual_band calls sat).
+_ARITH_CONSUMER_SPEC = ConsumerLookaheadGateSpec(
+    name="stack0_arith_consumer",
+    feature_flag=_stack0_next_arith_enabled,
+    pc_offset=8,  # C4 single-slot stride (INSTR_WIDTH)
+    pc_band_lo="LOOKAHEAD_PC_LO", pc_band_hi="LOOKAHEAD_PC_HI",
+    pc_chain_source_lo="EMBED_LO", pc_chain_source_hi="EMBED_HI",
+    pc_chain_gate_marker="MARK_AX",
+    opcode_band_lo="NEXT_OPCODE_LO", opcode_band_hi="NEXT_OPCODE_HI",
+    fetch_addr_key="ADDR_KEY",
+    fetch_clean_embed_lo="CLEAN_EMBED_LO", fetch_clean_embed_hi="CLEAN_EMBED_HI",
+    fetch_marker="MARK_AX", fetch_const="CONST", fetch_has_se="HAS_SE",
+    consumer_opcodes=_NEXT_ARITH_OPCODES,
+    consumer_flag_band="STACK0_B0_NEXT_ARITH",
+    relay_target_marker="MARK_STACK0",
+    prior_opcodes=_PRIOR_ARITH_OPCODES,
+    prior_latch_band="STACK0_PRIOR_ARITH",
+    dump_block_band="STACK0_B0_DUMP_BLOCK",
+    # Owners kept identical to the hand-built register_residual_band calls so the
+    # migration is byte-identical (the registry is collision-checked on owner).
+    band_owner_pc="make_lookahead_pc8_chain_op",
+    band_owner_opcode="make_lookahead_opcode_fetch_op",
+    band_owner_flag="make_next_arith_flag_op",
+    band_owner_latch="make_prior_arith_latch_op",
+    band_owner_dump="make_dump_block_flag_op",
 )
-register_residual_band(
-    "NEXT_OPCODE_HI", 16, owner="make_lookahead_opcode_fetch_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
-)
-register_residual_band(
-    "STACK0_B0_NEXT_ARITH", 1, owner="make_next_arith_flag_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
-)
-# Prior-arith durability latch (#221 NARROWING). The consumer-arith flag fires
-# on EVERY operand frame whose next instruction is arithmetic -- but the dump is
-# LOAD-BEARING on a single-op operand frame (``a*b``: the IMM-b frame's dump
-# correctly re-supplies operand ``a`` for the MUL). Only a MULTI-op expression's
-# INTERMEDIATE-operand frame (``a*b/c``: the IMM-c frame, where a PRIOR arith
-# already produced the on-stack intermediate) needs the dump blocked. The two
-# frames are batched-identical in every existing flag (CARRIED=100, SHARP=0,
-# PREV_DOM=0, NOT_CMP=0). The discriminator is "did a PRIOR arith op already
-# execute in this expression": false for single-op (dump load-bearing, keep),
-# true for multi-op (intermediate on stack, block). This durable latch ORs the
-# per-step arith opcode across steps so the block ANDs it.
-register_residual_band(
-    "STACK0_PRIOR_ARITH", 1, owner="make_prior_arith_latch_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
-)
-# Combined dump-block flag = AND(NEXT_ARITH consumer, PRIOR_ARITH latch). The
-# dump reads THIS single bounded flag as its blocker: it fires (=1) only on a
-# multi-op intermediate-operand frame (consumer is arith AND a prior arith
-# already produced the on-stack value), never on a single-op operand frame
-# (no prior arith) or a comparison frame (NEXT_ARITH=0).
-register_residual_band(
-    "STACK0_B0_DUMP_BLOCK", 1, owner="make_dump_block_flag_op",
-    flag=_stack0_next_arith_enabled, never_share=True,
-)
+# Generate the bundle (registers the six feature bands at import scope, exactly
+# where the hand-built register_residual_band calls sat).
+_ARITH_CONSUMER_GATE = consumer_lookahead_gate(_ARITH_CONSUMER_SPEC)
 
 
 def _nested_jsr_pc_fix_enabled() -> bool:
@@ -1145,29 +1171,21 @@ from ...constants import INSTR_WIDTH as _INSTR_WIDTH
 def _lookahead_pc8_rules(S: float) -> tuple[FFNRule, ...]:
     """PC+INSTR_WIDTH chain at MARK_AX: EMBED -> LOOKAHEAD_PC (offset=8 carry).
 
-    The C4 ISA is single-slot (each instruction is one ``INSTR_WIDTH``-byte
-    slot), so the NEXT instruction's byte-address is exactly ``PC + 8``. We
-    reuse the declarative ``_nibble_rotation_chain_rules`` (the same one L4 uses
-    for PC+1/+2/+3/+4) with offset=8: ``32 + 32*8 = 288`` units. Gated on
-    MARK_AX (the relayed-PC row, where EMBED holds the current PC).
+    GENERATED by ``consumer_lookahead_gate`` (the ISA-semantics DSL). The C4
+    ISA is single-slot (each instruction is one ``INSTR_WIDTH``-byte slot), so
+    the NEXT instruction's byte-address is exactly ``PC + 8``; the generator
+    reuses the declarative ``_nibble_rotation_chain_rules`` (the same one L4
+    uses for PC+1..+4) with offset=8 -> ``32 + 32*8 = 288`` units. Byte-
+    identical to the hand-built #221 chain (the only difference is the rule-name
+    prefix, which does NOT affect lowered weights).
     """
-    from .l4_ops import _nibble_rotation_chain_rules
     assert _INSTR_WIDTH == 8, (
         f"lookahead PC+8 chain assumes INSTR_WIDTH==8 (got {_INSTR_WIDTH})"
     )
-    return _nibble_rotation_chain_rules(
-        name_prefix="lookahead_pc8_ax",
-        gate_marker_name="MARK_AX",
-        source_lo_name="EMBED_LO", source_lo_offset=0,
-        source_hi_name="EMBED_HI", source_hi_offset=0,
-        target_lo_name="LOOKAHEAD_PC_LO", target_lo_offset=0,
-        target_hi_name="LOOKAHEAD_PC_HI", target_hi_offset=0,
-        offset=8, with_carry=True, S=S, magnitude=2.0,
-        scope="MARK_AX",
-    )
+    return _ARITH_CONSUMER_GATE.pc_chain_rules_builder(S)
 
 
-_LOOKAHEAD_PC8_HIDDEN_DIM = 32 + 32 * 8  # offset=8, with carry
+_LOOKAHEAD_PC8_HIDDEN_DIM = _ARITH_CONSUMER_GATE.pc_chain_hidden_dim
 
 
 def make_lookahead_pc8_chain_op() -> Operation:
@@ -1237,62 +1255,15 @@ def _lookahead_opcode_fetch_head_spec(
 ) -> DeclarativeAttentionHeadSpec:
     """Lookahead fetch head: Q=PC+8 address, K=ADDR_KEY, V=CLEAN_EMBED.
 
-    Mirrors ``_layer5_fetch_head_specs`` head 1 (non-first-step opcode fetch at
-    AX) but the Q address is ``LOOKAHEAD_PC`` (PC+8) instead of the current PC
-    (EMBED). The matched CODE position is op2's slot; its CLEAN_EMBED nibbles
-    (the opcode byte) are copied into ``NEXT_OPCODE_{LO,HI}``. Gated on MARK_AX
-    so it fires only on the relayed-PC AX rows (one fetch per step).
+    GENERATED by ``consumer_lookahead_gate``. Mirrors ``_layer5_fetch_head_specs``
+    head 1 (non-first-step opcode fetch at AX) but the Q address is
+    ``LOOKAHEAD_PC`` (PC+8) instead of the current PC (EMBED). The matched CODE
+    position is op2's slot; its CLEAN_EMBED nibbles (the opcode byte) are copied
+    into ``NEXT_OPCODE_{LO,HI}``. Byte-identical to the hand-built #221 fetch
+    head (every dim resolves from the BUILT ``dim_positions``).
     """
-    # Resolve EVERY dim from the BUILT ``dim_positions`` (the widened layout).
-    # The static registry mismaps several bands (e.g. EMBED/CLEAN_EMBED), so the
-    # fetch head must read the address/code/marker dims at their built indices.
-    def _P(name: str) -> int:
-        return int(dim_positions[name])
-
-    ADDR_KEY = _P("ADDR_KEY")
-    CLEAN_EMBED_LO = _P("CLEAN_EMBED_LO")
-    CLEAN_EMBED_HI = _P("CLEAN_EMBED_HI")
-    MARK_AX = _P("MARK_AX")
-    CONST = _P("CONST")
-    HAS_SE = _P("HAS_SE")
-    la_lo = int(dim_positions["LOOKAHEAD_PC_LO"])
-    la_hi = int(dim_positions["LOOKAHEAD_PC_HI"])
-    next_lo = int(dim_positions["NEXT_OPCODE_LO"])
-    next_hi = int(dim_positions["NEXT_OPCODE_HI"])
-
-    ADDR_L = 20.0
-    L = 20.0
-    TOP = 35
-    # Q: PC+8 address nibbles (lo at slots 0..15, hi at 16..31). The
-    # current-instruction fetch uses a 48-bit key (lo/hi/top); the lookahead
-    # only needs lo+hi (instruction addresses fit two nibble pairs for the
-    # corpus) and a CONST top-nibble match so the top group is non-discriminating.
-    q = (
-        tuple(AP(k, la_lo + k, ADDR_L) for k in range(16))
-        + tuple(AP(16 + k, la_hi + k, ADDR_L) for k in range(16))
-        + (AP(32, MARK_AX, L),)
-        + (AP(TOP, CONST, ADDR_L),)  # top nibble == 0 for corpus PCs
-        # MARK_AX Q-gate (mirror ax_gate slot 33) + HAS_SE gate (slot 34).
-        + (AP(33, MARK_AX, 500.0), AP(33, CONST, -500.0))
-        + (AP(34, HAS_SE, 500.0), AP(34, CONST, -500.0))
-    )
-    k = (
-        tuple(AP(k_, ADDR_KEY + k_, ADDR_L) for k_ in range(16))
-        + tuple(AP(16 + k_, ADDR_KEY + 16 + k_, ADDR_L) for k_ in range(16))
-        + (AP(TOP, ADDR_KEY + 32, ADDR_L),)  # K top nibble 0 slot
-        + (AP(33, MARK_AX, 500.0), AP(33, CONST, -500.0))
-        + (AP(34, CONST, 5.0),)
-    )
-    v = (
-        tuple(AP(32 + k_, CLEAN_EMBED_LO + k_, 1.0) for k_ in range(16))
-        + tuple(AP(48 + k_, CLEAN_EMBED_HI + k_, 1.0) for k_ in range(16))
-    )
-    o = (
-        tuple(AO(next_lo + k_, 32 + k_, 1.0) for k_ in range(16))
-        + tuple(AO(next_hi + k_, 48 + k_, 1.0) for k_ in range(16))
-    )
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx, q=q, k=k, v=v, o=o, alibi_slope=0.0,
+    return _ARITH_CONSUMER_GATE.opcode_fetch_head_spec_builder(
+        dim_positions, head_idx,
     )
 
 
@@ -1351,15 +1322,8 @@ def make_lookahead_opcode_fetch_op() -> Operation:
     )
 
 
-# Arithmetic consumer opcodes whose presence at PC+8 means the operand frame is
-# an arithmetic INTERMEDIATE (the dump must NOT fire). (lo, hi) nibble pairs
-# from the L5 opcode-decode table. EXCLUDES comparisons (EQ..GE) and branches.
-_NEXT_ARITH_OPCODES = (
-    ("OR", 14, 0), ("XOR", 15, 0),
-    ("AND", 0, 1), ("SHL", 7, 1), ("SHR", 8, 1),
-    ("ADD", 9, 1), ("SUB", 10, 1), ("MUL", 11, 1),
-    ("DIV", 12, 1), ("MOD", 13, 1),
-)
+# ``_NEXT_ARITH_OPCODES`` (the arithmetic consumer class) is declared at module
+# top as part of ``_ARITH_CONSUMER_SPEC``; the flag FFN is GENERATED from it.
 _NEXT_ARITH_FLAG_HIDDEN_DIM = len(_NEXT_ARITH_OPCODES)
 
 
@@ -1367,22 +1331,12 @@ def _next_arith_flag_rules() -> tuple[FFNRule, ...]:
     """10-rule OR: ``STACK0_B0_NEXT_ARITH`` = 1 iff the fetched NEXT opcode byte
     decodes to an arithmetic op (OR/XOR/AND/SHL/SHR/ADD/SUB/MUL/DIV/MOD).
 
-    Reads the fetched ``NEXT_OPCODE_{LO,HI}`` one-hot nibbles. Each rule is the
-    same two-nibble AND the L5 opcode decode uses, writing 1.0 (bounded). The
-    flag persists (nothing else writes it) to the L25 tail dump.
+    GENERATED by ``consumer_lookahead_gate``. Reads the fetched
+    ``NEXT_OPCODE_{LO,HI}`` one-hot nibbles; each rule is the same two-nibble AND
+    the L5 opcode decode uses, writing 1.0 (bounded). Byte-identical to the
+    hand-built #221 flag FFN.
     """
-    rules: list[FFNRule] = []
-    for name, lo, hi in _NEXT_ARITH_OPCODES:
-        rules.append(multi_way_and_rule(
-            name=f"next_arith_{name.lower()}",
-            conditions=(
-                (f"NEXT_OPCODE_LO+{lo}", 1.0),
-                (f"NEXT_OPCODE_HI+{hi}", 1.0),
-            ),
-            threshold=1.5,
-            writes=(("STACK0_B0_NEXT_ARITH", 1.0),),
-        ))
-    return tuple(rules)
+    return _ARITH_CONSUMER_GATE.consumer_flag_rules_builder()
 
 
 def make_next_arith_flag_op() -> Operation:
@@ -1466,20 +1420,12 @@ def _next_arith_relay_head_spec(
     dim_positions: dict, head_idx: int, *, S: float = 100.0,
 ) -> DeclarativeAttentionHeadSpec:
     """Relay head: copy STACK0_B0_NEXT_ARITH from the step's AX row to its STACK0
-    marker row. Q@MARK_STACK0, K@MARK_AX, positive ALiBi (step-local)."""
-    def _P(name: str) -> int:
-        return int(dim_positions[name])
-    MARK_STACK0 = _P("MARK_STACK0")
-    MARK_AX = _P("MARK_AX")
-    FLAG = _P("STACK0_B0_NEXT_ARITH")
-    L = float(S)
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=(AP(0, MARK_STACK0, L),),
-        k=(AP(0, MARK_AX, L),),
-        v=(AP(0, FLAG, 1.0),),
-        o=(AO(FLAG, 0, 1.0),),
-        alibi_slope=1.0,
+    marker row. Q@MARK_STACK0, K@MARK_AX, positive ALiBi (step-local).
+
+    GENERATED by ``consumer_lookahead_gate`` (byte-identical to the hand-built
+    #221 relay head)."""
+    return _ARITH_CONSUMER_GATE.relay_head_spec_builder(
+        dim_positions, head_idx, float(S),
     )
 
 
@@ -1538,10 +1484,8 @@ def make_next_arith_relay_op() -> Operation:
 # so every prior arith row contributes; the per-step arith opcode sits at the
 # step's AX-marker row at +5.
 _PRIOR_ARITH_LATCH_HEAD_IDX = 7  # free on L9 (heads 0..3, dump-carry 5, relay 6)
-_PRIOR_ARITH_OPCODES = (
-    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
-    "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
-)
+# ``_PRIOR_ARITH_OPCODES`` (the causal-latch class) is declared at module top as
+# part of ``_ARITH_CONSUMER_SPEC``; the latch head is GENERATED from it.
 
 
 def _allocate_prior_arith_latch_heads() -> "AttentionHeadAllocator":
@@ -1557,36 +1501,14 @@ def _prior_arith_latch_head_spec(
 ) -> DeclarativeAttentionHeadSpec:
     """Causal head: STACK0_PRIOR_ARITH = 1 iff any PRIOR position carried an
     arith opcode. Q@MARK_STACK0; K matches OP_ADD..OP_MOD (the per-step arith
-    opcodes, ~5 at their AX row) + a faint CONST self-match sink; V=CONST=1;
-    O->STACK0_PRIOR_ARITH. Flat ALiBi so all prior arith rows are reachable; the
-    softmax mass on ANY prior arith row drives the latch toward 1."""
-    def _P(name: str) -> int:
-        return int(dim_positions[name])
-    MARK_STACK0 = _P("MARK_STACK0")
-    MARK_AX = _P("MARK_AX")
-    CONST = _P("CONST")
-    LATCH = _P("STACK0_PRIOR_ARITH")
-    L = float(S)
-    OPW = 12.0   # K weight per arith opcode dim (opcode ~5 at AX row -> ~60)
-    # Q fires on STACK0 marker rows; the single K slot scores prior AX rows by
-    # their arith-opcode content (high on an arith result row, ~0 elsewhere) plus
-    # a small CONST baseline on EVERY row so a no-prior-arith frame has a defined
-    # (non-arith) attention target whose V contributes ~0.
-    q = (
-        AP(0, MARK_STACK0, L),
-    )
-    k = (
-        tuple(AP(0, _P(op), OPW) for op in _PRIOR_ARITH_OPCODES)
-        + (AP(0, MARK_AX, 0.5),)   # tiny baseline: AX rows are the candidates
-    )
-    # V = sum of the arith-opcode dims (~5 on a prior arith AX row, ~0 on any
-    # non-arith row). When a prior arith exists the softmax concentrates on it
-    # -> latch ~5; with NO prior arith the mass spreads over non-arith AX rows
-    # whose arith-opcode V is ~0 -> latch ~0. The block reads it thresholded.
-    v = tuple(AP(0, _P(op), 1.0) for op in _PRIOR_ARITH_OPCODES)
-    o = (AO(LATCH, 0, 1.0),)
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx, q=q, k=k, v=v, o=o, alibi_slope=0.0,
+    opcodes, ~5 at their AX row) + a faint MARK_AX baseline sink; V=those opcode
+    dims; O->STACK0_PRIOR_ARITH. Flat ALiBi so all prior arith rows are
+    reachable; the softmax mass on ANY prior arith row drives the latch toward 1.
+
+    GENERATED by ``consumer_lookahead_gate`` (byte-identical to the hand-built
+    #221 prior-arith latch head)."""
+    return _ARITH_CONSUMER_GATE.prior_latch_head_spec_builder(
+        dim_positions, head_idx, float(S),
     )
 
 
@@ -1632,24 +1554,14 @@ def make_prior_arith_latch_op() -> Operation:
 def _dump_block_flag_rules() -> tuple[FFNRule, ...]:
     """1 rule: STACK0_B0_DUMP_BLOCK = AND(NEXT_ARITH consumer, PRIOR_ARITH latch).
 
-    Fires (=1) only on a multi-op intermediate-operand frame: the consumer (next
-    instr) is arithmetic (STACK0_B0_NEXT_ARITH ~50) AND a prior arith already
-    executed (STACK0_PRIOR_ARITH ~5). Single-op operand frames have PRIOR_ARITH=0
-    (the only arith is the FUTURE consumer); comparison frames have NEXT_ARITH=0.
-    Bounded inputs (50 and 5), small AND weights so the silu stays finite.
+    GENERATED by ``consumer_lookahead_gate``. Fires (=1) only on a multi-op
+    intermediate-operand frame: the consumer (next instr) is arithmetic
+    (STACK0_B0_NEXT_ARITH ~50 -> +5.0) AND a prior arith already executed
+    (STACK0_PRIOR_ARITH ~5 -> +2.5); both present clears the 6.0 threshold,
+    either alone is dark. Single-op operand frames have PRIOR_ARITH=0; comparison
+    frames have NEXT_ARITH=0. Byte-identical to the hand-built #221 AND-gate.
     """
-    return (
-        multi_way_and_rule(
-            name="stack0_dump_block_and",
-            conditions=(
-                ("STACK0_B0_NEXT_ARITH", 0.1),   # ~50 -> +5.0
-                ("STACK0_PRIOR_ARITH", 0.5),     # ~5  -> +2.5
-            ),
-            threshold=6.0,   # both present: 5.0 + 2.5 = 7.5 > 6 (fires); either
-                             # alone: 5.0 or 2.5 < 6 (dark). AND.
-            writes=(("STACK0_B0_DUMP_BLOCK", 1.0),),
-        ),
-    )
+    return _ARITH_CONSUMER_GATE.dump_block_rules_builder()
 
 
 def make_dump_block_flag_op() -> Operation:

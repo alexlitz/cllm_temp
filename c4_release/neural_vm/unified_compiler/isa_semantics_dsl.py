@@ -676,3 +676,547 @@ def full_width_byte_emission(
         dump_reads=dump_reads,
         dump_writes=dump_writes,
     )
+
+
+# ---------------------------------------------------------------------------
+# Consumer-opcode lookahead gate — gate a band on the CONSUMER (next) opcode
+# ---------------------------------------------------------------------------
+#
+# The #221 framing-drift fix (commits ``acdccc68..fb984bc1``) is a SIX-OP
+# control-flow mechanism whose only purpose is to GATE the L25-tail STACK0
+# dump on the CONSUMER opcode (the NEXT instruction). The dump over-fires on
+# arithmetic-INTERMEDIATE operand frames (expr ``a*b/c``) but is load-bearing
+# on comparison-result frames (if/bool). The two frames are batched-identical
+# in every CURRENT residual band; the ONLY separator is the next instruction.
+# That instruction is causally UNAVAILABLE at the operand frame within a pass
+# (attention is causal, the consumer is a future position), but the single-slot
+# C4 ISA puts it at a FIXED ``PC + INSTR_WIDTH`` in program memory — fetchable
+# exactly like the L5 opcode fetch, offset by the instruction stride.
+#
+# The six ops share an IDENTICAL structure parameterized only by (the consumer
+# opcode CLASS to detect, the PC offset to the consumer, whether to add the
+# CAUSAL prior-class latch, and which band/dump the AND-gate drives):
+#
+#   1. SIX flag-gated ``_PREV``-style bands (the PC+offset address, the fetched
+#      opcode nibbles, the consumer-class flag, the prior-class latch, and the
+#      combined dump-block flag), registered at MODULE-IMPORT scope.
+#   2. a PC+offset NIBBLE-ROTATION chain FFN (build the consumer's byte-address
+#      from EMBED at the relayed-PC marker row) -> the address band.
+#   3. an OPCODE-FETCH head (content-match the PC+offset address vs ADDR_KEY,
+#      copy that CODE slot's CLEAN_EMBED opcode nibbles) -> the opcode band.
+#   4. a CONSUMER-CLASS flag FFN (per-opcode two-nibble AND, OR'd) -> the
+#      bounded consumer-class flag (1 dim).
+#   5. a within-step RELAY head (broadcast the flag from the AX-marker row,
+#      where the lookahead lives, to the marker row the dump fires on).
+#   6. an OPTIONAL CAUSAL prior-class LATCH head (Q@target-marker, K matches the
+#      prior-class opcode bands on PRIOR AX rows, V=those opcode dims) -> the
+#      latch (1 dim) — the key NARROWING lever (single-op vs multi-op frame).
+#   7. an AND-GATE flag FFN -> the combined dump-block flag (1 dim) the gated
+#      band/dump reads as its hard blocker. When the latch is OMITTED the gate
+#      degenerates to the consumer-class flag alone.
+#
+# :func:`consumer_lookahead_gate` takes the VARYING params via
+# :class:`ConsumerLookaheadGateSpec` and supplies the IDENTICAL structure as a
+# bundle of pure builders the op factories install (mirroring
+# :func:`cross_step_carry`). NO compiler change — every builder lowers through
+# the existing ``Operation(kind="block")`` path.
+#
+# The first migration re-expresses the LANDED #221 ops via
+# ``consumer_lookahead_gate(ARITH_CONSUMER_SPEC)``. It is byte-identity-gated
+# against the HEAD golden ``state_dict`` hash (flag-on AND flag-off) — the
+# proof the generator reproduces the hand-built weights bit-for-bit.
+#
+# See ``docs/EXPR_MULDIV_ROOT_IS_STACK0_PERSISTENCE_2026_06_15.md``.
+
+
+@dataclass(frozen=True)
+class ConsumerLookaheadGateSpec:
+    """Declarative description of a consumer-opcode lookahead gate.
+
+    "Gate a band on the consumer (next) opcode": detect that the NEXT
+    instruction's opcode is in a declared CLASS, optionally AND it with a
+    causal prior-class latch, and drive a bounded dump-block flag the gated
+    band/dump reads as a hard blocker.
+
+    Every field is a VARYING parameter; the IDENTICAL 6-op structure is
+    supplied by :func:`consumer_lookahead_gate`. The generator returns pure
+    builders the op factories install — the band-flag, head indices, target
+    anchors, and ``Operation`` wiring stay in the factory (so a migration keeps
+    those byte-identical too).
+
+    Attributes:
+        name: feature name (band owner prefix + rule-name prefix).
+        feature_flag: zero-arg predicate gating the WHOLE feature (every band +
+            op). ``None`` => always present. Flag-off omits the bands (smaller
+            d_model) and the ops bake as no-ops — byte-identical to the
+            pre-feature build.
+
+        pc_offset: byte offset from the current PC to the CONSUMER instruction
+            (the C4 single-slot stride => ``INSTR_WIDTH`` == 8).
+        pc_band_lo / pc_band_hi: the PC+offset address band names (16 cells
+            each — a nibble one-hot pair). Built by the chain FFN.
+        pc_chain_source_lo / pc_chain_source_hi: the EMBED bands the chain reads
+            the current PC from (at the relayed-PC marker row).
+        pc_chain_gate_marker: the marker dim the chain FFN gates on (the
+            relayed-PC AX row). Also the chain ``scope``.
+        pc_chain_magnitude: per-nibble write magnitude (chain ``magnitude=``).
+
+        opcode_band_lo / opcode_band_hi: the fetched-opcode band names (16 each
+            — the consumer's opcode-byte nibble one-hots). Written by the fetch
+            head.
+        fetch_addr_key / fetch_clean_embed_lo / fetch_clean_embed_hi: the
+            content-match KEY band (per-CODE-position immutable address) and the
+            CLEAN_EMBED value bands the fetch head copies.
+        fetch_marker / fetch_const / fetch_has_se: the fetch head's gate dims
+            (the relayed-PC marker, the CONST top-nibble match, the HAS_SE
+            gate). Mirror the production L5 fetch head.
+        fetch_addr_weight / fetch_marker_weight / fetch_gate_weight: the fetch
+            head's per-nibble address weight, marker-slot weight, and the
+            500-style hard gate weight.
+        fetch_top_slot: the head-local slot index for the top-nibble CONST
+            match (the production fetch's 35th slot).
+
+        consumer_opcodes: the CONSUMER CLASS — a tuple of
+            ``(name, lo_nibble, hi_nibble)`` opcode one-hot pairs. The flag
+            fires iff the fetched next opcode matches ANY of these.
+        consumer_flag_band: the bounded consumer-class flag band (1 cell).
+        consumer_flag_threshold: the per-opcode two-nibble AND threshold.
+
+        relay_target_marker: the marker dim the RELAY head's Q anchors (the row
+            the dump fires on). K matches ``pc_chain_gate_marker`` (the AX row).
+        relay_alibi_slope: the relay head's ALiBi slope (positive => step-local,
+            the CURRENT step's AX row wins).
+
+        prior_opcodes: the PRIOR-class opcode dim names the causal latch matches
+            (the per-step arith opcodes on prior AX rows). EMPTY => NO latch
+            head is generated and the dump-block gate degenerates to the
+            consumer-class flag alone.
+        prior_latch_band: the prior-class latch band (1 cell). Ignored when
+            ``prior_opcodes`` is empty.
+        prior_latch_k_weight: per-opcode K-match weight (the latch's ``OPW``).
+        prior_latch_baseline_weight: the faint CONST/marker K baseline so a
+            no-prior frame has a defined (non-matching) attention target.
+        prior_latch_alibi_slope: the latch head's ALiBi slope (0 => flat, every
+            prior row reachable).
+
+        dump_block_band: the combined dump-block flag band (1 cell) the gated
+            band/dump reads. = AND(consumer_flag, prior_latch) when the latch is
+            present, else = consumer_flag.
+        dump_block_consumer_weight / dump_block_prior_weight: the AND-gate input
+            weights (bound the silu). The hand-built #221 uses 0.1 (consumer ~50
+            -> +5) and 0.5 (latch ~5 -> +2.5).
+        dump_block_threshold: the AND-gate threshold (both present clears it;
+            either alone is dark).
+
+        band_owner_pc / band_owner_opcode / band_owner_flag /
+        band_owner_latch / band_owner_dump: ``register_residual_band(owner=...)``
+            diagnostic strings (kept identical to the hand-built ``owner=`` for a
+            byte-identity migration — the registry is collision-checked on
+            ``(name, size, owner, never_share)``). ``None`` => use ``name``.
+    """
+
+    name: str
+
+    # PC+offset chain
+    pc_offset: int
+    pc_band_lo: str
+    pc_band_hi: str
+    pc_chain_source_lo: str
+    pc_chain_source_hi: str
+    pc_chain_gate_marker: str
+
+    # opcode fetch head
+    opcode_band_lo: str
+    opcode_band_hi: str
+    fetch_addr_key: str
+    fetch_clean_embed_lo: str
+    fetch_clean_embed_hi: str
+    fetch_marker: str
+    fetch_const: str
+    fetch_has_se: str
+
+    # consumer-class flag
+    consumer_opcodes: Tuple[Tuple[str, int, int], ...]
+    consumer_flag_band: str
+
+    # within-step relay
+    relay_target_marker: str
+
+    # combined dump-block flag
+    dump_block_band: str
+
+    feature_flag: Optional[Callable[[], bool]] = None
+
+    pc_chain_magnitude: float = 2.0
+
+    fetch_addr_weight: float = 20.0
+    fetch_marker_weight: float = 20.0
+    fetch_gate_weight: float = 500.0
+    fetch_top_slot: int = 35
+
+    consumer_flag_threshold: float = 1.5
+
+    relay_alibi_slope: float = 1.0
+
+    # prior-class causal latch (optional)
+    prior_opcodes: Tuple[str, ...] = ()
+    prior_latch_band: str = ""
+    prior_latch_k_weight: float = 12.0
+    prior_latch_baseline_weight: float = 0.5
+    prior_latch_alibi_slope: float = 0.0
+
+    dump_block_consumer_weight: float = 0.1
+    dump_block_prior_weight: float = 0.5
+    dump_block_threshold: float = 6.0
+
+    band_owner_pc: Optional[str] = None
+    band_owner_opcode: Optional[str] = None
+    band_owner_flag: Optional[str] = None
+    band_owner_latch: Optional[str] = None
+    band_owner_dump: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.pc_offset <= 0:
+            raise ValueError(
+                f"ConsumerLookaheadGateSpec({self.name!r}): pc_offset must be "
+                f"positive, got {self.pc_offset}"
+            )
+        if not self.consumer_opcodes:
+            raise ValueError(
+                f"ConsumerLookaheadGateSpec({self.name!r}): consumer_opcodes "
+                "must be non-empty"
+            )
+        if self.prior_opcodes and not self.prior_latch_band:
+            raise ValueError(
+                f"ConsumerLookaheadGateSpec({self.name!r}): prior_opcodes set "
+                "but prior_latch_band empty"
+            )
+
+    @property
+    def has_prior_latch(self) -> bool:
+        return bool(self.prior_opcodes)
+
+
+@dataclass(frozen=True)
+class ConsumerLookaheadGateBundle:
+    """The artifacts :func:`consumer_lookahead_gate` generates.
+
+    The SIX bands have ALREADY been registered (import-time side effect) by the
+    time this bundle exists. Every builder is pure (no global side effects) so
+    the op factories call them at bake time identically.
+
+    Attributes:
+        spec: the originating :class:`ConsumerLookaheadGateSpec`.
+        pc_chain_rules_builder: ``(S: float) -> tuple[FFNRule, ...]``. The
+            PC+offset nibble-rotation chain rules.
+        pc_chain_hidden_dim: the chain's exact hidden-unit count (the op
+            factory asserts no rule-count drift).
+        opcode_fetch_head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. The content-match fetch head.
+        consumer_flag_rules_builder: ``() -> tuple[FFNRule, ...]``. The
+            consumer-class flag OR rules.
+        relay_head_spec_builder: ``(dim_positions, head_idx, S) ->
+            DeclarativeAttentionHeadSpec``. The within-step broadcast head.
+        prior_latch_head_spec_builder: ``(dim_positions, head_idx, S) ->
+            DeclarativeAttentionHeadSpec`` or ``None`` (when no latch).
+        dump_block_rules_builder: ``() -> tuple[FFNRule, ...]``. The combined
+            dump-block AND-gate rule(s).
+        *_reads / *_writes: the per-op Operation read/write dim-name sets
+            (flag-on).
+    """
+
+    spec: ConsumerLookaheadGateSpec
+    pc_chain_rules_builder: Callable[[float], Tuple[FFNRule, ...]]
+    pc_chain_hidden_dim: int
+    opcode_fetch_head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    consumer_flag_rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    relay_head_spec_builder: Callable[
+        [Dict[str, int], int, float], DeclarativeAttentionHeadSpec
+    ]
+    prior_latch_head_spec_builder: Optional[
+        Callable[[Dict[str, int], int, float], DeclarativeAttentionHeadSpec]
+    ]
+    dump_block_rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    pc_chain_reads: Set[str]
+    pc_chain_writes: Set[str]
+    fetch_reads: Set[str]
+    fetch_writes: Set[str]
+    consumer_flag_reads: Set[str]
+    consumer_flag_writes: Set[str]
+    relay_reads: Set[str]
+    relay_writes: Set[str]
+    prior_latch_reads: Set[str]
+    prior_latch_writes: Set[str]
+    dump_block_reads: Set[str]
+    dump_block_writes: Set[str]
+
+
+def consumer_lookahead_gate(
+    spec: ConsumerLookaheadGateSpec,
+) -> ConsumerLookaheadGateBundle:
+    """Generate the consumer-opcode lookahead-gate scaffolding for ``spec``.
+
+    Side effect (import time): registers the SIX (five when no prior latch)
+    feature bands via :func:`register_residual_band` with ``never_share=True``
+    and ``flag=spec.feature_flag``. Call this at MODULE-IMPORT scope of the
+    owning ``lN_ops.py`` (the SAME position the hand-built
+    ``register_residual_band`` calls occupied) — registration order is
+    load-bearing for the tail ``dim_positions``.
+
+    Returns a :class:`ConsumerLookaheadGateBundle` whose builders reproduce the
+    hand-built ops byte-identically.
+    """
+    has_latch = spec.has_prior_latch
+
+    def _owner(explicit: Optional[str]) -> str:
+        return explicit if explicit is not None else spec.name
+
+    # (1) Register the SIX feature bands (import-time side effect). 16-wide
+    #     address + opcode bands, 1-wide flag/latch/dump bands.
+    register_residual_band(
+        spec.pc_band_lo, 16, owner=_owner(spec.band_owner_pc),
+        flag=spec.feature_flag, never_share=True,
+    )
+    register_residual_band(
+        spec.pc_band_hi, 16, owner=_owner(spec.band_owner_pc),
+        flag=spec.feature_flag, never_share=True,
+    )
+    register_residual_band(
+        spec.opcode_band_lo, 16, owner=_owner(spec.band_owner_opcode),
+        flag=spec.feature_flag, never_share=True,
+    )
+    register_residual_band(
+        spec.opcode_band_hi, 16, owner=_owner(spec.band_owner_opcode),
+        flag=spec.feature_flag, never_share=True,
+    )
+    register_residual_band(
+        spec.consumer_flag_band, 1, owner=_owner(spec.band_owner_flag),
+        flag=spec.feature_flag, never_share=True,
+    )
+    if has_latch:
+        register_residual_band(
+            spec.prior_latch_band, 1, owner=_owner(spec.band_owner_latch),
+            flag=spec.feature_flag, never_share=True,
+        )
+    register_residual_band(
+        spec.dump_block_band, 1, owner=_owner(spec.band_owner_dump),
+        flag=spec.feature_flag, never_share=True,
+    )
+
+    # (2) PC+offset nibble-rotation chain rules. Reuses the declarative L4
+    #     chain (the same one L4 uses for PC+1..+4) with ``offset=pc_offset``.
+    pc_chain_hidden_dim = 32 + 32 * spec.pc_offset  # offset, with carry
+
+    def pc_chain_rules_builder(S: float) -> Tuple[FFNRule, ...]:
+        # Lazy import: the L4 chain helper lives in the ops package; importing
+        # it at module scope would create an import cycle (l4_ops imports the
+        # registry which this module's siblings populate).
+        from .ops.l4_ops import _nibble_rotation_chain_rules
+        return _nibble_rotation_chain_rules(
+            name_prefix=f"{spec.name}_pc{spec.pc_offset}_ax",
+            gate_marker_name=spec.pc_chain_gate_marker,
+            source_lo_name=spec.pc_chain_source_lo, source_lo_offset=0,
+            source_hi_name=spec.pc_chain_source_hi, source_hi_offset=0,
+            target_lo_name=spec.pc_band_lo, target_lo_offset=0,
+            target_hi_name=spec.pc_band_hi, target_hi_offset=0,
+            offset=spec.pc_offset, with_carry=True, S=S,
+            magnitude=spec.pc_chain_magnitude,
+            scope=spec.pc_chain_gate_marker,
+        )
+
+    # (3) Opcode-fetch head: Q = PC+offset address (lo 0..15, hi 16..31) +
+    #     marker gate + CONST top-nibble + hard MARK/HAS_SE gates; K = ADDR_KEY;
+    #     V/O = CLEAN_EMBED -> opcode band. Mirrors the production L5 fetch head.
+    def opcode_fetch_head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return int(dim_positions[name])
+
+        ADDR_KEY = _P(spec.fetch_addr_key)
+        CLEAN_LO = _P(spec.fetch_clean_embed_lo)
+        CLEAN_HI = _P(spec.fetch_clean_embed_hi)
+        MARK = _P(spec.fetch_marker)
+        CONST = _P(spec.fetch_const)
+        HAS_SE = _P(spec.fetch_has_se)
+        la_lo = _P(spec.pc_band_lo)
+        la_hi = _P(spec.pc_band_hi)
+        next_lo = _P(spec.opcode_band_lo)
+        next_hi = _P(spec.opcode_band_hi)
+
+        ADDR_L = spec.fetch_addr_weight
+        L = spec.fetch_marker_weight
+        TOP = spec.fetch_top_slot
+        G = spec.fetch_gate_weight
+
+        q = (
+            tuple(AP(k, la_lo + k, ADDR_L) for k in range(16))
+            + tuple(AP(16 + k, la_hi + k, ADDR_L) for k in range(16))
+            + (AP(32, MARK, L),)
+            + (AP(TOP, CONST, ADDR_L),)
+            + (AP(33, MARK, G), AP(33, CONST, -G))
+            + (AP(34, HAS_SE, G), AP(34, CONST, -G))
+        )
+        k = (
+            tuple(AP(k_, ADDR_KEY + k_, ADDR_L) for k_ in range(16))
+            + tuple(AP(16 + k_, ADDR_KEY + 16 + k_, ADDR_L) for k_ in range(16))
+            + (AP(TOP, ADDR_KEY + 32, ADDR_L),)
+            + (AP(33, MARK, G), AP(33, CONST, -G))
+            + (AP(34, CONST, 5.0),)
+        )
+        v = (
+            tuple(AP(32 + k_, CLEAN_LO + k_, 1.0) for k_ in range(16))
+            + tuple(AP(48 + k_, CLEAN_HI + k_, 1.0) for k_ in range(16))
+        )
+        o = (
+            tuple(AO(next_lo + k_, 32 + k_, 1.0) for k_ in range(16))
+            + tuple(AO(next_hi + k_, 48 + k_, 1.0) for k_ in range(16))
+        )
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx, q=q, k=k, v=v, o=o, alibi_slope=0.0,
+        )
+
+    # (4) Consumer-class flag rules: per-opcode two-nibble AND, OR'd into the
+    #     bounded flag (1.0 per match).
+    def consumer_flag_rules_builder() -> Tuple[FFNRule, ...]:
+        rules: list[FFNRule] = []
+        for op_name, lo, hi in spec.consumer_opcodes:
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_consumer_{op_name.lower()}",
+                conditions=(
+                    (f"{spec.opcode_band_lo}+{lo}", 1.0),
+                    (f"{spec.opcode_band_hi}+{hi}", 1.0),
+                ),
+                threshold=spec.consumer_flag_threshold,
+                writes=((spec.consumer_flag_band, 1.0),),
+            ))
+        return tuple(rules)
+
+    # (5) Within-step relay head: Q@relay_target_marker, K@pc_chain_gate_marker,
+    #     V=flag, O->flag. Positive ALiBi keeps it step-local.
+    def relay_head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int, S: float
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return int(dim_positions[name])
+        TGT = _P(spec.relay_target_marker)
+        SRC = _P(spec.pc_chain_gate_marker)
+        FLAG = _P(spec.consumer_flag_band)
+        L = float(S)
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=(AP(0, TGT, L),),
+            k=(AP(0, SRC, L),),
+            v=(AP(0, FLAG, 1.0),),
+            o=(AO(FLAG, 0, 1.0),),
+            alibi_slope=spec.relay_alibi_slope,
+        )
+
+    # (6) Optional causal prior-class latch head: Q@relay_target_marker; K
+    #     matches the prior-class opcode dims on PRIOR AX rows + a faint
+    #     marker baseline; V = those opcode dims; O -> latch. Flat ALiBi.
+    prior_latch_head_spec_builder: Optional[
+        Callable[[Dict[str, int], int, float], DeclarativeAttentionHeadSpec]
+    ] = None
+    if has_latch:
+        def prior_latch_head_spec_builder(  # type: ignore[misc]
+            dim_positions: Dict[str, int], head_idx: int, S: float
+        ) -> DeclarativeAttentionHeadSpec:
+            def _P(name: str) -> int:
+                return int(dim_positions[name])
+            TGT = _P(spec.relay_target_marker)
+            MARK_AX = _P(spec.pc_chain_gate_marker)
+            LATCH = _P(spec.prior_latch_band)
+            OPW = spec.prior_latch_k_weight
+            q = (AP(0, TGT, float(S)),)
+            k = (
+                tuple(AP(0, _P(op), OPW) for op in spec.prior_opcodes)
+                + (AP(0, MARK_AX, spec.prior_latch_baseline_weight),)
+            )
+            v = tuple(AP(0, _P(op), 1.0) for op in spec.prior_opcodes)
+            o = (AO(LATCH, 0, 1.0),)
+            return DeclarativeAttentionHeadSpec(
+                head_idx=head_idx, q=q, k=k, v=v, o=o,
+                alibi_slope=spec.prior_latch_alibi_slope,
+            )
+
+    # (7) Combined dump-block flag. AND(consumer_flag, prior_latch) when the
+    #     latch is present, else the consumer flag alone.
+    def dump_block_rules_builder() -> Tuple[FFNRule, ...]:
+        if has_latch:
+            return (
+                multi_way_and_rule(
+                    name=f"{spec.name}_dump_block_and",
+                    conditions=(
+                        (spec.consumer_flag_band, spec.dump_block_consumer_weight),
+                        (spec.prior_latch_band, spec.dump_block_prior_weight),
+                    ),
+                    threshold=spec.dump_block_threshold,
+                    writes=((spec.dump_block_band, 1.0),),
+                ),
+            )
+        return (
+            multi_way_and_rule(
+                name=f"{spec.name}_dump_block_passthrough",
+                conditions=(
+                    (spec.consumer_flag_band, spec.dump_block_consumer_weight),
+                ),
+                threshold=spec.dump_block_threshold,
+                writes=((spec.dump_block_band, 1.0),),
+            ),
+        )
+
+    # Per-op reads/writes (flag-on), derived structurally so the op factory can
+    # declare them on its Operation.
+    pc_chain_reads = {spec.pc_chain_gate_marker,
+                      spec.pc_chain_source_lo, spec.pc_chain_source_hi}
+    pc_chain_writes = {spec.pc_band_lo, spec.pc_band_hi}
+
+    fetch_reads = {spec.fetch_marker, spec.fetch_const, spec.fetch_has_se,
+                   spec.fetch_addr_key, spec.fetch_clean_embed_lo,
+                   spec.fetch_clean_embed_hi, spec.pc_band_lo, spec.pc_band_hi}
+    fetch_writes = {spec.opcode_band_lo, spec.opcode_band_hi}
+
+    consumer_flag_reads = {spec.opcode_band_lo, spec.opcode_band_hi}
+    consumer_flag_writes = {spec.consumer_flag_band}
+
+    relay_reads = {spec.relay_target_marker, spec.pc_chain_gate_marker,
+                   spec.consumer_flag_band}
+    relay_writes = {spec.consumer_flag_band}
+
+    if has_latch:
+        prior_latch_reads = ({spec.relay_target_marker,
+                              spec.pc_chain_gate_marker}
+                             | set(spec.prior_opcodes))
+        prior_latch_writes = {spec.prior_latch_band}
+        dump_block_reads = {spec.consumer_flag_band, spec.prior_latch_band}
+    else:
+        prior_latch_reads = set()
+        prior_latch_writes = set()
+        dump_block_reads = {spec.consumer_flag_band}
+    dump_block_writes = {spec.dump_block_band}
+
+    return ConsumerLookaheadGateBundle(
+        spec=spec,
+        pc_chain_rules_builder=pc_chain_rules_builder,
+        pc_chain_hidden_dim=pc_chain_hidden_dim,
+        opcode_fetch_head_spec_builder=opcode_fetch_head_spec_builder,
+        consumer_flag_rules_builder=consumer_flag_rules_builder,
+        relay_head_spec_builder=relay_head_spec_builder,
+        prior_latch_head_spec_builder=prior_latch_head_spec_builder,
+        dump_block_rules_builder=dump_block_rules_builder,
+        pc_chain_reads=pc_chain_reads,
+        pc_chain_writes=pc_chain_writes,
+        fetch_reads=fetch_reads,
+        fetch_writes=fetch_writes,
+        consumer_flag_reads=consumer_flag_reads,
+        consumer_flag_writes=consumer_flag_writes,
+        relay_reads=relay_reads,
+        relay_writes=relay_writes,
+        prior_latch_reads=prior_latch_reads,
+        prior_latch_writes=prior_latch_writes,
+        dump_block_reads=dump_block_reads,
+        dump_block_writes=dump_block_writes,
+    )
