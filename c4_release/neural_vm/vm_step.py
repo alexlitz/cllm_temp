@@ -139,11 +139,30 @@ class AutoregressiveAttention(nn.Module):
 
     def __init__(self, dim, num_heads=4, max_seq_len=4096, layer_idx=None,
                  use_flash_attention=True, positional_encoding=None,
-                 attention_normalization=None, rope_base=None):
+                 attention_normalization=None, rope_base=None,
+                 alibi_base_heads=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        # ALiBi-slope base head count. The default ALiBi slope of head ``i`` is
+        # ``2**(-8/N * (i+1))`` where ``N`` is the slope BASE. When the
+        # head-dim-preserving auto-widen
+        # (``full_vm_compiler_dynamic._bake_from_scheduled_ops``) appends an
+        # over-width residual band, it rounds d_model up to a multiple of the
+        # BASE head_dim and ADDS trailing (inert) heads -- e.g.
+        # ``C4_AX_BYTE1_FULL_WIDTH`` grows n_heads 10 -> 13. If the slope base
+        # were the WIDENED count, every EXISTING head's slope would shift (10
+        # -> 13 moves head 0 from 0.574 to 0.653), silently perturbing every
+        # globally-sized attention block (mul/shl tail regressions). Pinning
+        # the base to the pre-widen count keeps existing heads' slopes
+        # byte-identical and gives the trailing padding heads harmless
+        # extrapolated slopes. ``None`` => use ``num_heads`` (backward-compat:
+        # un-widened builds are unchanged because base == num_heads).
+        self.alibi_base_heads = (
+            int(alibi_base_heads) if alibi_base_heads is not None
+            else num_heads
+        )
         # When True, ``forward`` routes through PyTorch 2.x's
         # ``F.scaled_dot_product_attention`` (SDPA), which auto-selects
         # Flash Attention 2 / mem-efficient / math backends. Default ON for
@@ -208,8 +227,12 @@ class AutoregressiveAttention(nn.Module):
         use_alibi = (self._positional_encoding == "alibi" or
                      (self._positional_encoding == "hybrid" and layer_idx is not None and layer_idx < 3))
         if use_alibi:
+            # Slope base is ``alibi_base_heads`` (== num_heads for un-widened
+            # builds), so the head-dim-preserving auto-widen's trailing padding
+            # heads do not shift existing heads' slopes (see __init__ note).
+            _alibi_n = self.alibi_base_heads
             slopes = torch.tensor(
-                [2.0 ** (-8.0 / num_heads * (i + 1)) for i in range(num_heads)]
+                [2.0 ** (-8.0 / _alibi_n * (i + 1)) for i in range(num_heads)]
             )
             self.register_buffer("alibi_slopes", slopes)  # [H]
         else:
@@ -1568,6 +1591,7 @@ class AutoregressiveVM(nn.Module):
         use_rms_norm=None,
         rms_norm_eps=None,
         rope_base=None,
+        alibi_base_heads=None,
     ):
         super().__init__()
         if vocab_size is None:
@@ -1604,6 +1628,16 @@ class AutoregressiveVM(nn.Module):
         self.use_rms_norm = bool(use_rms_norm)
         self.rms_norm_eps = rms_norm_eps
         self.rope_base = rope_base
+        # Pre-widen head count used as the ALiBi-slope BASE so the
+        # head-dim-preserving auto-widen's trailing padding heads do not shift
+        # existing heads' slopes (see ``AutoregressiveAttention.__init__``).
+        # ``None`` => slope base == ``n_heads`` (byte-identical to the
+        # historical un-threaded path). Also read by num_heads-keyed layout
+        # logic that must see the pre-widen geometry.
+        self._alibi_base_heads = (
+            int(alibi_base_heads) if alibi_base_heads is not None
+            else n_heads
+        )
 
         # Compiler-allocated dim_positions (None => fall back to _SetDim for
         # backward-compat callers that construct AutoregressiveVM directly).
@@ -1641,6 +1675,7 @@ class AutoregressiveVM(nn.Module):
                         positional_encoding=positional_encoding,
                         attention_normalization=attention_normalization,
                         rope_base=rope_base,
+                        alibi_base_heads=self._alibi_base_heads,
                     ),
                     ffn=PureFFN(d_model, ffn_widths.get(i, default_hidden)),
                     use_rms_norm=use_rms_norm,
@@ -2654,6 +2689,11 @@ def _expand_wrapper_blocks(model):
                 template_attn, "attention_normalization", None
             ),
             rope_base=getattr(template_attn, "rope_base", None),
+            # Propagate the over-width-band-invariant ALiBi-slope base from the
+            # template so expansion passthrough blocks keep the same slope
+            # geometry as the original blocks (a widen-added padding head must
+            # not shift slopes here either).
+            alibi_base_heads=getattr(template_attn, "alibi_base_heads", None),
         )
         return TransformerBlock(attn=attn_passthrough, ffn=ffn_module)
 

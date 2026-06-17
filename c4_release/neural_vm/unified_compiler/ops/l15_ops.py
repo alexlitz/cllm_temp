@@ -1778,13 +1778,26 @@ def make_layer15_memory_lookup_op() -> Operation:
         attn._l15_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
 
-        # DSL Wave W7: pass the live ``attn.num_heads`` into the
-        # IR builder so the LEV / head-9 branches are selected at
-        # IR-build time via plain Python ``if``. The lowering pass
-        # below emits every fragment unconditionally -- shape gating
-        # has already happened.
+        # DSL Wave W7: pass the LIVE head count into the IR builder so the
+        # LEV / head-9 branches are selected at IR-build time via plain Python
+        # ``if``. The lowering pass below emits every fragment
+        # unconditionally -- shape gating has already happened.
+        #
+        # Fragment selection must key on the GOLDEN (pre-widen) head count,
+        # NOT the global ``attn.num_heads``: the head-dim-preserving auto-widen
+        # for an over-width band (e.g. ``C4_AX_BYTE1_FULL_WIDTH`` grows
+        # n_heads 10 -> 13) would otherwise flip the ``num_heads >= 12`` LEV
+        # branch on at this CONSTRUCTION-time bake (the only writer of the
+        # LEV saved_bp / return_addr heads -- the resize op does not re-bake
+        # them), baking heads 4-11 that the golden 10-head build never writes
+        # and diverging the L15 attention. ``alibi_base_heads`` is the
+        # over-width-band-invariant head count (== ``attn.num_heads`` on every
+        # un-widened build, so this is byte-identical there).
+        _sel_num_heads = int(
+            getattr(attn, "alibi_base_heads", attn.num_heads)
+        )
         ir = _layer15_memory_lookup_ir(
-            dim_positions, HD, num_heads=int(attn.num_heads)
+            dim_positions, HD, num_heads=_sel_num_heads
         )
         ir.lower_attention(attn, HD, dim_positions=dim_positions, S=S)
         # Mark so the legacy umbrella entry point

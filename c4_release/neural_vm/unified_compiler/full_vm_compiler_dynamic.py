@@ -2039,16 +2039,28 @@ def compile_full_vm_dynamic(
     from .ops.residual_band_registry import (
         collect_registered_residual_bands,
         collect_never_share_band_names,
+        collect_alibi_base_residual_bands,
     )
     _merged_extra = collect_registered_residual_bands()
+    # The ALiBi-slope BASE band set: bands active with every C4_* flag at its
+    # DEFAULT. Used to derive the slope base head count so a non-default
+    # over-width flag (e.g. C4_AX_BYTE1_FULL_WIDTH) does not shift existing
+    # heads' ALiBi slopes (see collect_alibi_base_residual_bands +
+    # _bake_from_scheduled_ops base_n_heads). Caller/env extra_residual_dims
+    # are folded in below so an explicitly-requested band is part of the base.
+    _alibi_base_extra = collect_alibi_base_residual_bands()
     # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the auto-collected
     # production bands (A/B diagnostics only — the carry ops then reference
     # undeclared dims, so this is for layout/geometry comparison, not a runnable
     # build). The caller-passed / env ``extra_residual_dims`` below is preserved.
     if os.environ.get("C4_DISABLE_AX_CARRY_BANDS") == "1":
         _merged_extra = {}
+        _alibi_base_extra = {}
     if extra_residual_dims:
         _merged_extra.update(extra_residual_dims)
+        # An explicitly-requested band is part of the geometry the existing
+        # heads are authored against, so it belongs in the slope base too.
+        _alibi_base_extra.update(extra_residual_dims)
     extra_residual_dims = _merged_extra or None
     # Carry/dump bands that must keep a private dim-liveness slot — threaded
     # into the compiler's never-share set inside ``_bake_from_scheduled_ops``
@@ -2374,6 +2386,7 @@ def compile_full_vm_dynamic(
         d_model_packing_target=d_model_packing_target,
         extra_residual_dims=extra_residual_dims,
         never_share_band_names=_never_share_band_names,
+        alibi_base_extra_dims=(_alibi_base_extra or None),
     )
 
     # Post-compile shape rebuild. When the caller hands in
@@ -2663,6 +2676,7 @@ def _bake_from_scheduled_ops(
     d_model_packing_target: Optional[int] = None,
     extra_residual_dims: Optional[Mapping[str, int]] = None,
     never_share_band_names: Optional[Set[str]] = None,
+    alibi_base_extra_dims: Optional[Mapping[str, int]] = None,
 ):
     """Run the unchanged static compile/bake pipeline against ``scheduled``.
 
@@ -2883,6 +2897,42 @@ def _bake_from_scheduled_ops(
         base_head_dim = layout.d_model  # degenerate single-head fallback
 
     # ------------------------------------------------------------------
+    # ALiBi-slope base head count (over-width-band-invariant).
+    # ------------------------------------------------------------------
+    # The auto-widen below rounds the widened d_model up to a multiple of
+    # ``base_head_dim`` and DERIVES a larger ``n_heads`` (it ADDS trailing
+    # heads). The ALiBi-slope formula ``2**(-8/N * (i+1))`` must keep ``N``
+    # PINNED to the head count of the build WITHOUT the flag-gated over-width
+    # bands, otherwise flipping such a band on (e.g.
+    # ``C4_AX_BYTE1_FULL_WIDTH`` adds the 256-cell ``AX_BYTE1_FULL_WIDE`` band
+    # -> n_heads 10 -> 13) would shift EVERY existing head's slope (head 0
+    # 0.574 -> 0.653) and silently perturb every globally-sized attention
+    # block (the mul_overflow / shl_8bit tail regression). The slope base is
+    # the n_heads obtained by widening with only the ALWAYS-ON bands
+    # (``alibi_base_extra_dims``; the flag-gated emission bands excluded), so
+    # it equals the default build's n_heads on BOTH flag-off and flag-on
+    # compiles. ``AutoregressiveVM`` receives it as ``alibi_base_heads``.
+    # (L15's num_heads-keyed head layout is insulated separately by its own
+    # ``l15_attention_resize`` op, which recomputes its slopes from a fixed
+    # target_num_heads.) When ``alibi_base_extra_dims is None`` the base
+    # equals the FULL widen -> byte-identical to the historical path.
+    _base_widen_dims = (
+        alibi_base_extra_dims
+        if alibi_base_extra_dims is not None
+        else extra_residual_dims
+    )
+    _base_extra_total = (
+        sum(int(s) for s in _base_widen_dims.values())
+        if _base_widen_dims else 0
+    )
+    # Round (base layout d_model + always-on extra width) up to a multiple of
+    # base_head_dim (mirrors the widen alignment below) and derive n_heads.
+    _base_widened = layout.d_model + _base_extra_total
+    if _base_widened % base_head_dim != 0:
+        _base_widened += base_head_dim - (_base_widened % base_head_dim)
+    base_n_heads = _base_widened // base_head_dim
+
+    # ------------------------------------------------------------------
     # Auto-widen: append caller/op-requested residual bands at the tail.
     # ------------------------------------------------------------------
     # Bump-pointer allocated (no pin) so they land past the highest existing
@@ -3019,6 +3069,10 @@ def _bake_from_scheduled_ops(
         rope_base=rope_base,
         use_rms_norm=use_rms_norm,
         rms_norm_eps=rms_norm_eps,
+        # Pin the ALiBi-slope base to the PRE-widen head count so the
+        # auto-widen's trailing padding heads (added when an over-width band
+        # crosses a head-dim multiple) do not shift existing heads' slopes.
+        alibi_base_heads=base_n_heads,
     )
 
     with _torch.no_grad():

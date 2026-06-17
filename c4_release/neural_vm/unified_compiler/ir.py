@@ -1646,14 +1646,31 @@ class CompilerIR:
             head_dim_old = d // attn.num_heads
 
             if getattr(attn, "num_heads", 0) >= num_heads_new:
+                # Resize is a no-op for the head COUNT (the module already has
+                # >= num_heads_new heads), but the ALiBi slopes must still be
+                # made DETERMINISTIC from the resized geometry rather than
+                # inherited from construction time. Otherwise an
+                # over-width-band widen that pushes the GLOBAL head count up to
+                # (or past) ``num_heads_new`` -- e.g. ``C4_AX_BYTE1_FULL_WIDTH``
+                # grows n_heads 10 -> 13 == this op's effective target -- skips
+                # the resize and leaks the construction-time
+                # ``alibi_base_heads`` slope geometry, diverging from the
+                # golden build (which resized from a smaller count and
+                # recomputed the slopes with N == this block's own head count).
+                # Recompute with the block's CURRENT head count (== the count
+                # the golden non-skip path resized to) so the resized block's
+                # slopes are identical regardless of the widen.
                 if (
-                    sop.alibi_pin_value is not None
-                    and hasattr(attn, "alibi_slopes")
+                    hasattr(attn, "alibi_slopes")
                     and attn.alibi_slopes is not None
                 ):
-                    attn.alibi_slopes[: sop.alibi_pin_count] = (
-                        sop.alibi_pin_value
+                    _n = int(attn.num_heads)
+                    new_slopes = torch.tensor(
+                        [2.0 ** (-8.0 / _n * (i + 1)) for i in range(_n)]
                     )
+                    if sop.alibi_pin_value is not None:
+                        new_slopes[: sop.alibi_pin_count] = sop.alibi_pin_value
+                    attn.register_buffer("alibi_slopes", new_slopes)
                 if sop.follow_up is not None:
                     sop.follow_up(block, dim_positions, S)
                 applied += 1

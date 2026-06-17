@@ -181,6 +181,45 @@ def collect_never_share_band_names() -> Set[str]:
     return out
 
 
+def collect_alibi_base_residual_bands() -> Dict[str, int]:
+    """Return ``{name: size}`` for every band active at its flag's DEFAULT state.
+
+    This is the band set that defines the ALiBi-SLOPE BASE head count -- the
+    head count of the GOLDEN default build (every env flag at its default).
+    The head-dim-preserving auto-widen derives ``n_heads`` from the residual
+    width, and the default ALiBi slope of head ``i`` is ``2**(-8/N*(i+1))``
+    with ``N == n_heads``. If a non-default over-width flag is toggled on
+    (e.g. ``C4_AX_BYTE1_FULL_WIDTH=1`` appends the 256-cell
+    ``AX_BYTE1_FULL_WIDE`` band -> n_heads 10 -> 13), every EXISTING head's
+    slope would shift and silently perturb every globally-sized attention
+    block. Pinning the slope base to THIS set (flags at default) keeps the
+    slope base equal to the golden n_heads on every compile, regardless of
+    which over-width flag is toggled, so the widen's trailing padding heads
+    are inert (the toggled band's own emission columns still light up; only
+    the slope geometry is held constant).
+
+    Each flag predicate is re-evaluated with the ``C4_*`` environment cleared
+    so the DEFAULT state is observed (predicates read ``os.environ.get(NAME,
+    DEFAULT)``); the environment is restored before returning. Insertion order
+    is preserved (matches :func:`collect_registered_residual_bands`).
+    """
+    import os as _os
+
+    saved = {k: v for k, v in _os.environ.items() if k.startswith("C4_")}
+    for k in saved:
+        del _os.environ[k]
+    try:
+        out: Dict[str, int] = {}
+        for spec in _REGISTRY:
+            if spec.flag is not None and not spec.flag():
+                continue
+            out[spec.name] = spec.size
+        return out
+    finally:
+        for k, v in saved.items():
+            _os.environ[k] = v
+
+
 def registered_band_specs() -> "List[_BandSpec]":
     """Return the raw registered specs (diagnostics / tests only)."""
     return list(_REGISTRY)
