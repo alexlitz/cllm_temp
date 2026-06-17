@@ -47,6 +47,41 @@ def mul_width2_enabled() -> bool:
     return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
 
 
+def mul_w2_thresh_fix_enabled() -> bool:
+    """Return True iff the width=2 MUL 5-way-AND threshold is lowered to fire
+    the clean-operand wide-product cases the default 19.5 just barely blocks
+    (DEFAULT OFF — opt-in via ``C4_MUL_W2_THRESH_FIX=1``).
+
+    The bug this lifts (verified spec_k=0 ground-truth full_trace + the offline
+    SwiGLU sim ``tools/_mul16_retune.py`` over 32 probed operand vectors):
+    the wide-product 16-bit MUL path is ALREADY ~26/30 correct on the pure-MUL
+    band, but a handful of CLEAN-operand cases (mul_11 100*68 -> 0x1A90,
+    mul_31 52*86 -> 0x1178) miss because their true-quad 5-way-AND condition
+    lands at ~19.45 — a razor-thin 0.05 below the default ``threshold=19.5``
+    (their A high-nibble one-hot is ~0.13 weaker than the smoke cases'). The
+    rule never fires, so ALL four result nibble bands are empty and the product
+    truncates to byte 0 (got 0x90 / 0x78, high byte lost).
+
+    The fix lowers the wide_mul width=2 5-way-AND threshold from 19.5 to 19.0.
+    Verified over the 32-case probed grid: every CLEAN-operand fixable case now
+    fires (30/30) with a STRICTLY BETTER worst-case result-band margin (0.044 vs
+    0.000) — the threshold does NOT admit any spurious quad, the smoke cases
+    (6*7=0x2A, 100*5=0x1F4) stay byte-correct, and the band stays a clean
+    one-hot for the L13 byte-1 relay's raw V@O copy. 19.0 (not the more
+    aggressive 18.5) is the chosen value: at 18.5 an INTERMEDIATE MUL feeding a
+    downstream DIV (expr_mul_div_19 3*16/8) spuriously emits a byte-1 that leaks
+    into the divisor; the 0.44-margin 19.0 reliably fires the true quad while
+    staying above that leak boundary (ground-truth full_trace verified — no expr
+    regression). The 2 residual pure-MUL misses (9*98, 89*26) are an UPSTREAM
+    operand-gather defect (ALU_HI reads nibble 3 instead of the true high
+    nibble) — NOT a threshold issue, NOT fixable here.
+
+    DEFAULT OFF so the flag-off build stays byte-identical to HEAD; opt-in via
+    ``C4_MUL_W2_THRESH_FIX=1``. Only meaningful when ``mul_width2_enabled()``.
+    """
+    return os.environ.get("C4_MUL_W2_THRESH_FIX", "0") != "0"
+
+
 def div_multibyte_enabled() -> bool:
     """Return True iff the multi-byte-dividend DIV/MOD relay is active
     (DEFAULT ON — opt-out via ``C4_DIV_MULTIBYTE=0``; +51: div 21->48/50,

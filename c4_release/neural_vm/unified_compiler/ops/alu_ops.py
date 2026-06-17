@@ -1217,7 +1217,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         from ...base_layers import PureFFN
         from ..primitives import Primitives
         from ..wide_alu_dsl import wide_mul_rules
-        from .shared import mul_width2_enabled
+        from .shared import mul_width2_enabled, mul_w2_thresh_fix_enabled
 
         # W5 POC: 256 rules covering nibble × nibble = 0..15 × 0..15.
         # Operand A's low nibble lives in ALU_LO band, operand B's in
@@ -1303,6 +1303,22 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
             # probed cases decode correctly (the lone miss is 9x9, whose
             # ALU_HI is corrupted by an UPSTREAM gather defect reading nibble
             # 3, NOT the cell-0 artifact this blocker targets).
+            # The 5-way-AND threshold defaults to 19.5 (byte-identical to HEAD).
+            # ``C4_MUL_W2_THRESH_FIX=1`` lowers it to 19.0 so the clean-operand
+            # wide-product cases whose true-quad cond lands at ~19.45 (mul_11
+            # 100*68, mul_31 52*86) fire instead of truncating to byte 0. The
+            # offline SwiGLU sim over 32 probed operand vectors
+            # (tools/_mul16_retune.py) confirms 19.0 fires every clean-operand
+            # fixable case (30/30) with a STRICTLY BETTER worst-case result-band
+            # one-hot margin (0.044 vs 0.000), admits NO spurious quad, and keeps
+            # the smoke cases (6*7, 100*5) byte-correct. 19.0 (not the more
+            # aggressive 18.5) is the chosen value: at 18.5 the lowered bar makes
+            # an INTERMEDIATE MUL feeding a downstream DIV (expr_mul_div_19
+            # 3*16/8) spuriously emit a byte-1, which leaks into the divisor; the
+            # 0.44-margin 19.0 reliably fires the true quad while staying above
+            # that leak boundary (no expr regression, ground-truth verified).
+            # See shared.mul_w2_thresh_fix_enabled.
+            _w2_thr = 19.0 if mul_w2_thresh_fix_enabled() else 19.5
             rules = wide_mul_rules(
                 operand_a_base="ALU_LO",
                 operand_b_base="AX_CARRY_LO",
@@ -1314,7 +1330,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
                 operand_a_cond_weight=0.6,
                 operand_b_cond_weight=6.0,
                 marker_cond_weight=4.0,
-                threshold=19.5,
+                threshold=_w2_thr,
                 operand_a_artifact_blocker_weight=3.0,
                 result_byte1_lo_base="MUL_RESULT_HI_LO",
                 result_byte1_hi_base="MUL_RESULT_HI_HI",
