@@ -27,6 +27,41 @@ def _nonfirst_psh_sp_fix_enabled() -> bool:
     return os.environ.get("C4_NONFIRST_PSH_SP_FIX", "1") != "0"
 
 
+def _lea_local_e8_multilocal_guard_enabled() -> bool:
+    """Flag for the multi-local LEA 0xE8 over-fire guard (var_mul / var_three).
+
+    ``tail_lea_local_ax_marker_byte0_e8`` hardcodes the BP-8 effective-address
+    low byte 0xE8 onto the LEA AX-marker row. Its FETCH discriminator
+    (``FETCH_LO+8`` w=2.0, ``FETCH_HI+15`` w=0.2) is only ADDITIVE -- the 9-pt
+    non-FETCH positive sum (MARK_AX+HAS_SE+OP_LEA+CMP+7+MEM_ADDR_SRC) already
+    clears threshold=7 ALONE, so the 0xE8 writer over-fires on EVERY multi-local
+    LEA. On a program's SECOND local (BP-16, imm=-16, correct low byte 0xE0) and
+    THIRD local (BP-24, imm=-24, correct low byte 0xD8) it stamps 0xE8, so the
+    two/three locals ALIAS to the same stack slot -- the var_mul step-6 / var_three
+    step-9/10 AX 0xFFE8 instead of 0xFFE0 / 0xFFD8 (diag commit 18365452,
+    tools/probe_var_fetch_band.py).
+
+    The FETCH band carries the LEA immediate (NOT one-hot, magnitude ~40). The
+    imm=-8 signature is FETCH_LO nib 8 + FETCH_HI nib F (15); imm=-16 has
+    FETCH_LO nib 0 (the low nibble of 0xF0); imm=-24 has FETCH_HI nib E (14) and
+    FETCH_LO nib 8 again. Adding strong NOT-blockers on the DISTINGUISHING
+    nibbles -- ``FETCH_LO+0`` (the imm=-16 low-nibble) and ``FETCH_HI+14`` (the
+    imm=-24 high-nibble) -- makes the imm=-8 fire a genuine requirement: on a
+    2nd/3rd local LEA the competing nibble carries the ~40 broadcast, the -10
+    blocker drives the sum well below 7, and the 0xE8 writer stays silent so the
+    correct 0xE0 / 0xD8 byte (produced by the L8 effective-address compute and
+    relayed through OUTPUT) survives.
+
+    This is the load-bearing PER-STEP component the multi-local fix needs once the
+    cross-step BP-high-byte relay (the L15 nibble-copy BP blocker, commit eddad334,
+    + the L16 BP_byte1=0xff persistence) lands. Default ON. With
+    ``C4_LEA_LOCAL_E8_MULTILOCAL_GUARD=0`` the rule is byte-identical to the prior
+    build (the two FETCH NOT-blocker terms are omitted). The legit imm=-8 LEA
+    byte-0 0xE8 emit (FETCH_LO+0 ~= 0, FETCH_HI+14 ~= 0) is unaffected.
+    """
+    return os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "1") != "0"
+
+
 def _psh_stack0_highbyte_darken_enabled() -> bool:
     """Flag for the PSH-STACK0-passthrough high-byte (byte2/byte3) darkening.
 
@@ -8517,7 +8552,20 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_BP", -10000.0),
                 ("MARK_STACK0", -10000.0),
                 ("MARK_MEM", -10000.0),
-            ),
+            ) + ((
+                # Multi-local LEA 0xE8 over-fire guard (var_mul / var_three): make
+                # the imm=-8 FETCH signature a GENUINE requirement so this 0xE8
+                # writer cannot stamp the BP-8 low byte onto the 2nd local (BP-16,
+                # imm=-16, low byte 0xE0) or 3rd local (BP-24, imm=-24, 0xD8). The
+                # imm=-16 low-nibble lights FETCH_LO+0; the imm=-24 high-nibble
+                # lights FETCH_HI+14. Both carry the ~40 FETCH broadcast on the
+                # WRONG-immediate LEA and ~0 on imm=-8, so a -10 NOT-blocker drives
+                # the positive sum well below threshold=7 there while leaving the
+                # legit imm=-8 fire byte-identical. See
+                # ``_lea_local_e8_multilocal_guard_enabled`` + diag 18365452.
+                ("FETCH_LO+0", -10.0),
+                ("FETCH_HI+14", -10.0),
+            ) if _lea_local_e8_multilocal_guard_enabled() else ()),
             threshold=7.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
