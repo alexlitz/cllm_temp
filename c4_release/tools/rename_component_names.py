@@ -30,17 +30,17 @@ anywhere outside the rename sites (collision guard).
 Usage::
 
     python tools/rename_component_names.py \
-        --safe-files neural_vm/unified_compiler/ops/l1_ops.py \
-        --rename l1_stack0_byte0=stack0_byte0 \
+        --safe-files neural_vm/unified_compiler/ops/lN_ops.py \
+        --rename OLD_RULE_NAME=NEW_RULE_NAME \
         [--apply]            # default is dry-run
 
 The pairs may also be supplied via ``--map FILE`` (one ``old=new`` per
 line, ``#`` comments allowed).
 
 Each occurrence is matched on a word boundary (``\bold\b``) so substrings
-of longer identifiers are never touched (e.g. renaming ``l1_byte_index``
-will NOT touch ``l1_byte_index_0`` -- callers must enumerate the full
-family or the f-string prefix explicitly).
+of longer identifiers are never touched (e.g. renaming ``foo_bar``
+will NOT touch ``foo_bar_0`` -- callers must enumerate the full
+family or rewrite the f-string prefix explicitly).
 """
 from __future__ import annotations
 
