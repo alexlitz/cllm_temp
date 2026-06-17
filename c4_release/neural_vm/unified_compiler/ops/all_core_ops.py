@@ -397,6 +397,17 @@ def all_core_ops(
         # ``stack0_byte0_dump_head_bake`` below. See
         # l11_ops.make_stack0_byte0_dump_carry_op.
         make_stack0_byte0_dump_carry_op(enable=True),
+        # STACK0 byte-0 POP discriminator (if_gt/if_lt/if_eq/bool_and fix). The
+        # carry above re-supplies the STALE operand byte-0 on EVERY carried
+        # STACK0 row, including the rows AFTER the comparison/branch popped it
+        # (id 350 emits 35 on the post-pop steps instead of the oracle's 0). This
+        # L9 head-8 CAUSAL LATCH fires on a STACK0 row from the consuming cmp/
+        # branch opcode step ONWARD and the L25 dump reads ``STACK0_B0_POPPED``
+        # as a HARD blocker -> it stops re-supplying the popped operand. FLAG-
+        # GATED (``C4_STACK0_B0_POPPED``, default-OFF): off = no band, no op, no
+        # dump condition -> byte-identical. See
+        # l11_ops.make_stack0_byte0_popped_latch_op.
+        make_stack0_byte0_popped_latch_op(),
         # ENT saved-BP store DUMP carry (BP_SAVE_PREV — the func/nested/rec/var
         # LI-from-frame 37-token desync). The CARRY HEAD half (mirror of the AX
         # byte-1 / STACK0 byte-0 carries above): the callee's saved-BP store (the

@@ -21,6 +21,28 @@ from .shared import _as_setdim_proxy
 from .residual_band_registry import register_residual_band
 
 
+def _stack0_b0_popped_enabled() -> bool:
+    """``C4_STACK0_B0_POPPED`` flag predicate (DEFAULT-OFF).
+
+    Gates the STACK0 byte-0 POP-discriminator feature: the ``STACK0_B0_POPPED``
+    band, the L9 causal pop-latch head (``make_stack0_byte0_popped_latch_op``),
+    AND the extra ``STACK0_B0_POPPED`` blocker term in the L25 dump's re-point
+    conditions. The ``C4_STACK0_B0_DUMP`` carry re-supplies the STALE operand
+    byte-0 one-hot on EVERY carried STACK0 row — including the rows AFTER the
+    comparison/branch popped the operand off the stack — so id 350 (operand
+    0x23) emits 0x23 on the post-pop steps instead of the oracle's 0x00, which
+    desyncs the if/bool/expr frame. This latch fires on a STACK0 row whose step
+    (or any PRIOR step) carried a comparison/branch opcode — i.e. from the
+    CONSUMING opcode step ONWARD — and the dump reads it as a HARD blocker, so
+    the dump stops re-supplying the popped operand. Flag-off
+    (``C4_STACK0_B0_POPPED=0``) registers NO band and NO op and adds NO dump
+    condition -> byte-identical to the pre-feature build. Evaluated lazily (at
+    compile time) so a per-process env flip is honoured and the cache key
+    reflects it.
+    """
+    return _os_stack0.environ.get("C4_STACK0_B0_POPPED", "0") != "0"
+
+
 # ---------------------------------------------------------------------------
 # Op-local residual-band declarations: AX byte-1 + Root 2 STACK0 byte-0 carry.
 # ---------------------------------------------------------------------------
@@ -127,6 +149,17 @@ register_residual_band(
 register_residual_band(
     "STACK0_B0_NOT_CMP", 1, owner="make_stack0_byte0_not_cmp_flag_op",
     never_share=True,
+)
+# (2b) STACK0 byte-0 POP-discriminator latch (``STACK0_B0_POPPED``). A bounded
+#     0/1 causal latch that fires on a STACK0 row from the consuming
+#     comparison/branch opcode step ONWARD (the operand has been popped); the
+#     L25 dump reads it as a HARD blocker so it stops re-supplying the STALE
+#     operand byte-0 on post-pop rows. FLAG-GATED (default-OFF) so a flag-off
+#     build collects NO dim -> byte-identical d_model. Registered AFTER the
+#     always-on STACK0_B0 flag bands so it only ever appends at the tail.
+register_residual_band(
+    "STACK0_B0_POPPED", 1, owner="make_stack0_byte0_popped_latch_op",
+    flag=_stack0_b0_popped_enabled, never_share=True,
 )
 # (3) ENT saved-BP store cross-step carry (BP_SAVE_PREV). The ENT step's own
 #     MEM section (the saved-BP store: addr=SP, val=old_BP) emits 0xFF garbage
@@ -2165,6 +2198,7 @@ def _stack0_b0_dump_blocks_on():
     SHARP_W = 3.0
     NOT_CMP_BLOCK_W = -1_000.0
     DUMP_BLOCK_W = -2_000.0
+    POPPED_BLOCK_W = -2_000.0  # HARD blocker on post-pop (consuming-op onward)
     marker_blockers = (
         ("MARK_AX", -1_000.0),
         ("MARK_PC", -1_000.0),
@@ -2174,6 +2208,7 @@ def _stack0_b0_dump_blocks_on():
         ("MARK_SE", -1_000.0),
     )
     _next_arith_on = _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
+    _popped_on = _stack0_b0_popped_enabled()
     conditions = (
         ("MARK_STACK0", SIG_W + SIG_HARD),
         ("STACK0_B0_CARRIED", CARRIED_W),
@@ -2181,6 +2216,13 @@ def _stack0_b0_dump_blocks_on():
         ("STACK0_B0_NOT_CMP", NOT_CMP_BLOCK_W),
     ) + (
         (("STACK0_B0_DUMP_BLOCK", DUMP_BLOCK_W),) if _next_arith_on else ()
+    ) + (
+        # The POP discriminator: a STRONG negative blocker the L9 causal latch
+        # drives to 1 from the consuming comparison/branch step onward, so the
+        # dump stops re-supplying the popped operand byte-0. Only added when the
+        # feature flag is on (the dim is not collected otherwise -> flag-off
+        # byte-identical).
+        (("STACK0_B0_POPPED", POPPED_BLOCK_W),) if _popped_on else ()
     ) + marker_blockers
     threshold = 7.0 + SIG_HARD
     blocks = []
@@ -2458,6 +2500,131 @@ def make_stack0_byte0_dump_carry_op(enable: bool = True) -> Operation:
         target_op_name="layer9_marker_suppress",
         declarative_bake_fn=bake,
         compiler_ir_factory=_ir,
+        migrated=True,
+        declarative_authority="spec_generated",
+        smoke_tests={"all"},
+        spec_section="STACK0_BYTE0_DUMP_CARRY_ROOT_2_2026_06_13.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# STACK0 byte-0 POP-discriminator causal latch head (the if/bool fix)
+# ---------------------------------------------------------------------------
+# The ``C4_STACK0_B0_DUMP`` carry re-supplies the STALE operand byte-0 one-hot
+# on EVERY carried STACK0 row -- including the rows AFTER the comparison/branch
+# POPPED the operand off the stack. For id 350 (``35 > 43``) the oracle STACK0[0]
+# is ``0,35,35,0,0,0,0`` but the dump emits 35 on the post-pop steps too, so the
+# step emits >35 tokens and the fixed-35-slice misreads the next step's PC.
+#
+# ``STACK0_B0_POPPED`` is a bounded 0/1 CAUSAL LATCH (sibling of CARRIED / SHARP
+# / NOT_CMP, and structurally identical to the ``prior_arith_latch`` head used by
+# the #221 consumer-lookahead gate): a STACK0-marker row (Q) attends back over
+# all CAUSALLY-prior positions and matches any comparison/branch opcode
+# (OP_LT/GT/EQ/NE/LE/GE + OP_BZ/BNZ, each ~5 at its AX-marker row). Because the
+# mask is causal and the AX-marker row of the COMPARISON step precedes that
+# step's STACK0 row, the latch fires on the comparison step ITSELF and -- since
+# every later step also sees that prior opcode -- STAYS SET on every subsequent
+# STACK0 row. The L25 dump reads it as a STRONG negative blocker so it stops
+# re-supplying the popped operand byte-0 from the consuming-opcode step onward,
+# while the ON-stack steps (before any comparison opcode) keep the +35 dump.
+# Flat ALiBi so EVERY prior comparison/branch row contributes. FLAG-GATED
+# (``C4_STACK0_B0_POPPED``, default-OFF): flag-off bakes nothing -> byte-
+# identical.
+_STACK0_B0_POPPED_LATCH_HEAD_IDX = 8  # free on L9 (block has 10 heads; 0..7 used)
+# The consuming-opcode class: comparison results + the conditional branches that
+# consume them. Per-step each opcode sits at ~5 on its AX-marker row.
+_STACK0_B0_POPPED_OPCODES = (
+    "OP_LT", "OP_GT", "OP_EQ", "OP_NE", "OP_LE", "OP_GE", "OP_BZ", "OP_BNZ",
+)
+_STACK0_B0_POPPED_K_W = 12.0        # per-opcode K-match (mirrors prior_latch OPW)
+_STACK0_B0_POPPED_BASELINE_W = 0.5  # faint MARK_AX baseline so empty steps sink
+_STACK0_B0_POPPED_ALIBI = 0.0       # flat: every prior cmp/branch row reachable
+
+
+def _allocate_stack0_byte0_popped_latch_heads() -> AttentionHeadAllocator:
+    """Per-bake head allocator for the STACK0 byte-0 POPPED latch head (L9).
+
+    L9 (physical block 11) is widened to 10 heads; heads 0..4 are L9-native and
+    5/6/7 are the dump-carry / next_arith_relay / prior_arith_latch heads, so the
+    POPPED latch claims head 8. ``layer_max_heads=None`` opts into the Phase 8.O.2
+    unbounded pool so the pin past the legacy ``DEFAULT_LAYER_MAX_HEADS=8`` bound
+    is honoured (the bake writes within the block's real 10-head W_q/W_o).
+    """
+    allocator = AttentionHeadAllocator(
+        layer_max_heads=None, strategy="dynamic_first_fit",
+    )
+    allocator.alloc("stack0_byte0_popped_latch.head_8", layer_idx=9,
+                    pin=_STACK0_B0_POPPED_LATCH_HEAD_IDX)
+    return allocator
+
+
+def _stack0_byte0_popped_latch_head_spec(
+    dim_positions: dict, head_idx: int, *, S: float = 100.0,
+) -> DeclarativeAttentionHeadSpec:
+    """Causal head: ``STACK0_B0_POPPED`` = 1 iff any CAUSALLY-prior position
+    carried a comparison/branch opcode. Q@MARK_STACK0; K matches OP_LT..OP_BNZ
+    (the per-step cmp/branch opcodes, ~5 at their AX row) + a faint MARK_AX
+    baseline sink; V=those opcode dims; O -> STACK0_B0_POPPED. Flat ALiBi so all
+    prior cmp/branch rows are reachable; softmax mass on ANY such prior row drives
+    the latch toward 1. Mirrors ``_prior_arith_latch_head_spec`` (the #221 latch).
+    """
+    def _P(name: str) -> int:
+        return int(dim_positions[name])
+
+    TGT = _P("MARK_STACK0")
+    MARK_AX = _P("MARK_AX")
+    LATCH = _P("STACK0_B0_POPPED")
+    q = (AP(0, TGT, float(S)),)
+    k = (
+        tuple(AP(0, _P(op), _STACK0_B0_POPPED_K_W)
+              for op in _STACK0_B0_POPPED_OPCODES)
+        + (AP(0, MARK_AX, _STACK0_B0_POPPED_BASELINE_W),)
+    )
+    v = tuple(AP(0, _P(op), 1.0) for op in _STACK0_B0_POPPED_OPCODES)
+    o = (AO(LATCH, 0, 1.0),)
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx, q=q, k=k, v=v, o=o,
+        alibi_slope=_STACK0_B0_POPPED_ALIBI,
+    )
+
+
+def make_stack0_byte0_popped_latch_op() -> Operation:
+    """L9 attn head 8: latch ``STACK0_B0_POPPED`` from the consuming cmp/branch on.
+
+    The POP discriminator for the STACK0 byte-0 dump. A STACK0-marker row attends
+    back to any PRIOR comparison/branch opcode (OP_LT..OP_BNZ at its AX-marker
+    row) and latches 1 -- firing on the comparison step itself and staying set on
+    every later step (causal). The L25 dump reads it as a HARD blocker so it stops
+    re-supplying the POPPED operand byte-0 on post-pop rows, fixing the
+    if_gt/if_lt/if_eq/bool_and framing drift (id 350 etc.). No-op + no band when
+    ``C4_STACK0_B0_POPPED`` is off (byte-identical).
+    """
+    enabled = _stack0_b0_popped_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        attn = block.attn
+        allocator = _allocate_stack0_byte0_popped_latch_heads()
+        attn._stack0_byte0_popped_latch_head_allocator = allocator
+        head_idx = allocator.heads()[-1].head_idx
+        HD = attn.W_q.shape[0] // attn.num_heads
+        spec = _stack0_byte0_popped_latch_head_spec(dim_positions, head_idx, S=S)
+        Primitives.generate_attention_head(attn, spec, HD)
+
+    return Operation(
+        name="stack0_byte0_popped_latch",
+        reads=({"MARK_STACK0", "MARK_AX"} | set(_STACK0_B0_POPPED_OPCODES))
+              if enabled else set(),
+        writes={"STACK0_B0_POPPED"} if enabled else set(),
+        kind="block",
+        # Host on the L9 marker-suppress attn block (head 8 free in the 10-head
+        # block): MARK_STACK0 / MARK_AX / the cmp/branch opcodes are all present,
+        # and it runs well before the L25-tail dump. Same anchor the dump-carry
+        # head (5) + relay (6) + prior_arith_latch (7) use.
+        target_op_name="layer9_marker_suppress",
+        declarative_bake_fn=bake,
+        compiler_ir=CompilerIR(),
         migrated=True,
         declarative_authority="spec_generated",
         smoke_tests={"all"},
@@ -3162,7 +3329,7 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
             "STACK0_B0_H1_PREV", "STACK0_B0_H3_PREV",
             "STACK0_B0_DUMP_H1", "STACK0_B0_DUMP_H3",
             "STACK0_B0_CARRIED", "STACK0_B0_SHARP", "STACK0_B0_NOT_CMP",
-            "STACK0_B0_DUMP_BLOCK",
+            "STACK0_B0_DUMP_BLOCK", "STACK0_B0_POPPED",
         }
         dim_map = {}
         for _nm in Primitives.ffn_rule_dim_names(rules):
@@ -3193,6 +3360,8 @@ def make_stack0_byte0_dump_repopulate_op() -> Operation:
     }
     if _os_stack0.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0":
         _dump_reads.add("STACK0_B0_DUMP_BLOCK")
+    if _stack0_b0_popped_enabled():
+        _dump_reads.add("STACK0_B0_POPPED")
 
     return Operation(
         name="stack0_byte0_dump_repopulate",
