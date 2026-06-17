@@ -7,7 +7,7 @@ from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
-from ..ir import CompilerIR, FFNRule
+from ..ir import CompilerIR, ConditionTerm, FFNRule
 from ..isa_semantics_dsl import (
     CrossStepCarrySpec,
     DumpBlock,
@@ -3648,6 +3648,99 @@ def _bp_save_dump_repopulate_rules(emission_on: bool) -> tuple[FFNRule, ...]:
     return _BP_SAVE_CARRY_BUNDLE.dump_rules_builder(emission_on)
 
 
+# ---------------------------------------------------------------------------
+# Root A: tighten the dump gate so the MEM_VAL_B{k} marker is MANDATORY
+# ---------------------------------------------------------------------------
+#
+# THE BUG (CPU spec_k=0, var_mul id275 step-1 ENT frame, probe_root_a_*):
+# At the ENT frame-establishing step BP = 0x0000fff0, so the BP register VALUE
+# byte-1 row should decode 0xFF. It IS 0xFF through block 49 but block 50
+# (the L25 tail, where this dump runs LAST) crushes it to 0x00. Runtime
+# attribution (probe_root_a_attrib.py) pins the crush to THIS op's
+# ``bp_save_dump_val{k}_{lo,hi}_0`` rules at +8.5e8/+1.2e9 — NOT to
+# ``layer16_lev_routing`` (its ``l16_bp_frame_byte1_ff`` rule actually writes
+# the CORRECT 0xFF, but at only -47.8, drowned 1e9-to-1).
+#
+# WHY IT MISFIRES: the dump gate is the ADDITIVE AND
+# ``silu(S*(OP_ENT*1 + MEM_VAL_B{k}*8 - 14))``. The threshold 14 = floor 6 +
+# marker 8 assumed OP_ENT ~10.7 on the legit MEM-store rows. But the ENT
+# OP_ENT BROADCAST residue climbs to ~16-18 on the register VALUE byte rows
+# (probe_root_a_step_scan.py: rows off 16-21 carry OP_ENT 16.0..17.85, with
+# MEM_VAL_B{k} == 0 and NO MARK_* — the MARK blockers sit only on the MARKER
+# rows, not the value-byte rows). So ``OP_ENT*1`` ALONE (16 > 14) clears the
+# threshold with the marker absent, and the carried BP_SAVE_PREV band (the
+# PREV step's old_BP = 0x00000000) writes 0x00 over the live BP=0xff byte.
+#
+# THE FIX (flag-gated, default-OFF -> byte-identical to current main): make
+# the MEM_VAL_B{k} marker the DECISIVE term. The legit MEM-store rows carry
+# OP_ENT in [6, 11] AND MEM_VAL_B{k} ~ 0.97; the spurious register rows carry
+# OP_ENT in [12, 18] AND MEM_VAL_B{k} == 0; SI/SC/PSH non-ENT stores carry
+# OP_ENT ~ 1.x AND a marker. With OP_ENT weight 1.0, marker weight 20.0,
+# threshold 23.0:
+#   * legit ENT-store (OP_ENT>=6, marker 0.97): 6 + 19.4 = 25.4  > 23 -> FIRE
+#   * register broadcast (OP_ENT<=18, marker 0):       18 = 18   < 23 -> blocked
+#   * SI/SC non-ENT store (OP_ENT~1.5, marker 0.97): 1.5 + 19.4 = 20.9 < 23 -> blocked
+# i.e. the marker (19.4) now OUTWEIGHS the OP_ENT broadcast spread (18-6=12),
+# so its ABSENCE alone drops the register rows below threshold regardless of
+# how high the spurious OP_ENT broadcast spikes, while OP_ENT still keeps the
+# SI/SC (low-OP_ENT) stores out. The MARK_* blockers + write_scale + the gate
+# (BP_SAVE_PREV) are untouched; only the OP_ENT / MEM_VAL_B condition weights
+# and the threshold are rewritten IN PLACE (rule count unchanged at 128).
+def _bp_save_dump_marker_req_enabled() -> bool:
+    """``C4_BP_SAVE_DUMP_MARKER_REQ`` flag predicate (DEFAULT-OFF).
+
+    When ON, rewrites the dump-rule gate so the per-byte ``MEM_VAL_B{k}``
+    marker is mandatory (Root A: stop the ENT OP_ENT broadcast from firing
+    the dump on the register VALUE-byte rows and crushing the live BP byte to
+    0x00). Flag-off -> the gate weights/threshold are unchanged ->
+    byte-identical to the current default-ON ``C4_BP_SAVE_DUMP`` build.
+    """
+    return _os_stack0.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
+
+
+# Root-A gate constants (used only when the flag is ON).
+_BP_SAVE_DUMP_MARKER_REQ_OPENT_W = 1.0     # OP_ENT weight (keeps SI/SC out)
+_BP_SAVE_DUMP_MARKER_REQ_MARKER_W = 20.0   # MEM_VAL_B{k} weight (now decisive)
+_BP_SAVE_DUMP_MARKER_REQ_THRESHOLD = 23.0  # marker MANDATORY: bare OP_ENT<=18 < 23
+
+
+def _bp_save_dump_apply_marker_req(
+    rules: tuple[FFNRule, ...],
+) -> tuple[FFNRule, ...]:
+    """Rewrite each dump rule's OP_ENT / MEM_VAL_B weight + threshold in place.
+
+    Repurposes the EXISTING 128 dump rules (no append, no count change): for
+    each rule, set the ``OP_ENT`` condition weight to
+    ``_BP_SAVE_DUMP_MARKER_REQ_OPENT_W``, the single ``MEM_VAL_B{k}`` condition
+    weight to ``_BP_SAVE_DUMP_MARKER_REQ_MARKER_W``, and the threshold to
+    ``_BP_SAVE_DUMP_MARKER_REQ_THRESHOLD``. The MARK_* blockers, the gate
+    (BP_SAVE_PREV) and the OUTPUT writes are left untouched. Returns the
+    original tuple unchanged when there are no rules (flag-off / emission-off).
+    """
+    if not rules:
+        return rules
+    out: list[FFNRule] = []
+    for rule in rules:
+        new_conds = []
+        for c in rule.conditions:
+            if c.dim.name == "OP_ENT":
+                new_conds.append(
+                    ConditionTerm(c.dim, _BP_SAVE_DUMP_MARKER_REQ_OPENT_W)
+                )
+            elif c.dim.name.startswith("MEM_VAL_B"):
+                new_conds.append(
+                    ConditionTerm(c.dim, _BP_SAVE_DUMP_MARKER_REQ_MARKER_W)
+                )
+            else:
+                new_conds.append(c)
+        out.append(replace(
+            rule,
+            conditions=tuple(new_conds),
+            threshold=_BP_SAVE_DUMP_MARKER_REQ_THRESHOLD,
+        ))
+    return tuple(out)
+
+
 def make_bp_save_dump_repopulate_op() -> Operation:
     """Append the ENT saved-BP dump FFN after the L25 tail block.
 
@@ -3659,6 +3752,11 @@ def make_bp_save_dump_repopulate_op() -> Operation:
     """
     emission_on = _bp_save_dump_enabled()
     rules = _bp_save_dump_repopulate_rules(emission_on)
+    # Root A (flag-gated, default-OFF): tighten the gate so the MEM_VAL_B{k}
+    # marker is mandatory, stopping the ENT OP_ENT broadcast from crushing the
+    # live BP register VALUE byte to 0x00 on the frame-establishing step.
+    if _bp_save_dump_marker_req_enabled():
+        rules = _bp_save_dump_apply_marker_req(rules)
 
     def bake(block, dim_positions, S):
         if not rules:
