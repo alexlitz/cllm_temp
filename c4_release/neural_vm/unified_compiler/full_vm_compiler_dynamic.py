@@ -2216,6 +2216,16 @@ def compile_full_vm_dynamic(
             "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
                 os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
             ),
+            # L16 LEV STACK0-byte0-preserve MARK_SE blocker (framing-recovery;
+            # DEFAULT-OFF, opt in with =1): adds a -100*MARK_SE NOT-blocker to the
+            # l16_lev_stack0_byte0_preserve_* family so the post-LEV OP_LEV
+            # broadcast residue (~4.1) cannot solo-fire the OUTPUT-preserve nudge
+            # on the next-step STEP_END row (the step-9 stray-0 over-emit root).
+            # Output-affecting on that STEP_END row, so ON / OFF builds must NEVER
+            # share a memo / disk entry. Ships with the C4_L15_LEV func chain.
+            "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
+                os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
+            ),
             # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1): adds a
             # BYTE_INDEX_2-keyed Q/K NOT-blocker slot to the L10
             # psh_stack0_passthrough head so the PSH-arg byte-3 relay does not
@@ -2824,6 +2834,12 @@ def _bake_from_scheduled_ops(
         # share a serialised entry.
         "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
             os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
+        ),
+        # L16 LEV STACK0-byte0-preserve MARK_SE blocker (framing-recovery;
+        # DEFAULT-OFF, opt in with =1, output-affecting on the post-LEV STEP_END
+        # row): the ON / OFF builds must never share a serialised entry.
+        "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
+            os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
         ),
         # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1,
         # output-affecting on func/nested PSH steps): the ON / OFF builds must
