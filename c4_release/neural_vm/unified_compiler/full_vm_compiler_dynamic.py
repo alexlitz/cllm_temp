@@ -2314,6 +2314,18 @@ def compile_full_vm_dynamic(
             "C4_AX_BYTE1_FULL_WIDTH": (
                 os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
             ),
+            # LEA-local multi-local E8 guard (DEFAULT-OFF, opt in =1, output-
+            # affecting on the var multi-local LEA-from-frame address): the
+            # ON / OFF builds must never share a memo entry.
+            "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
+                os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
+            ),
+            # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1,
+            # output-affecting on the BP-byte1 OUTPUT crush): the ON / OFF
+            # builds must never share a memo entry.
+            "C4_BP_SAVE_DUMP_MARKER_REQ": (
+                os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2903,6 +2915,20 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_LEV_AX_BYTE1_KILL": (
             os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
+        ),
+        # LEA-local multi-local E8 guard (DEFAULT-OFF, opt in =1, output-
+        # affecting on the var multi-local LEA-from-frame address): the ON / OFF
+        # builds must never share a serialised entry. See l10_ops.py
+        # ``_lea_local_e8_multilocal_guard_enabled``.
+        "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
+            os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
+        ),
+        # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1, output-
+        # affecting on the BP-byte1 OUTPUT crush): the ON / OFF builds must never
+        # share a serialised entry. See l11_ops.py
+        # ``_bp_save_dump_marker_req_enabled``.
+        "C4_BP_SAVE_DUMP_MARKER_REQ": (
+            os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
