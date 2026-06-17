@@ -177,8 +177,27 @@ def _stack0_e8_authoritative_addr_gate_on() -> bool:
     one validated piece of that sweep, kept default-OFF as a building block.
 
     DEFAULT-OFF so HEAD is byte-identical (gate_bias stays 1.0, no gate_terms).
+    The umbrella sweep flag ``C4_OUTPUT_SELFREINFORCE_DECOUPLE`` ALSO enables
+    this family (one flag for the whole sweep; see
+    _output_selfreinforce_decouple_on).
     """
-    return os.environ.get("C4_L16_STACK0_E8_ADDR_GATE", "0") == "1"
+    return (os.environ.get("C4_L16_STACK0_E8_ADDR_GATE", "0") == "1"
+            or _output_selfreinforce_decouple_on())
+
+
+def _output_selfreinforce_decouple_on() -> bool:
+    """DEFAULT-OFF umbrella flag for THE OUTPUT-band self-reinforcement
+    decoupling sweep (``C4_OUTPUT_SELFREINFORCE_DECOUPLE=1``). See the matching
+    helper in l10_ops.py for the full root analysis. In l16_ops.py this flag
+    (a) enables the family #1 e8-authoritative address gate (via
+    _stack0_e8_authoritative_addr_gate_on) and (b) promotes the family #3
+    e0-marker materializer's ``ADDR_B0_HI+14`` to a HARD silu requirement so the
+    e0 ALU->OUTPUT projection fires ONLY on a genuine 0xffe0 local-frame STACK0
+    marker (ADDR_B0_HI+14 +8.7..+20.9, CPU-verified var_simple/var_mul) and goes
+    inert on every if/bool empty-stack / non-frame STACK0 row (ADDR_B0_HI+14 <=0),
+    killing the tiny-ALU-operand projection that sustains the if/bool framing
+    drift. DEFAULT-OFF -> HEAD byte-identical."""
+    return os.environ.get("C4_OUTPUT_SELFREINFORCE_DECOUPLE", "0") == "1"
 
 
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
@@ -889,28 +908,63 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # OUTPUT_LO/HI.  Keep this strictly non-store, non-JSR/ENT/LEV, and exclude
     # the e8 lookalike via the ADDR_B0_LO+8 negative weight so PSH/SI rows at
     # 0xffe8 do not co-fire.
-    stack0_e0_marker_conditions = (
-        ("MARK_STACK0", 1.0),
-        ("HAS_SE", 1.0),
-        ("ADDR_B0_LO+0", 10.0),
-        ("ADDR_B0_LO+8", -2.0),
-        ("ADDR_B0_HI+14", 1.0),
-        ("ADDR_B0_HI+15", -2.0),
-        ("IS_BYTE", -10.0),
-        ("OP_JSR", -10.0),
-        ("OP_ENT", -100.0),
-        ("OP_LEV", -10.0),
-        ("MEM_STORE", -20.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
-        # dim_alias_verifier treats it as a hard NOT-blocker; runtime
-        # firing positions have MARK_MEM == 0 so bake math is unchanged.
-        ("MARK_MEM", -1e6),
-    )
-    stack0_e0_marker_threshold = 12.0
+    # OUTPUT-self-reinforcement decouple, family #3 (the e0-marker ALU->OUTPUT
+    # materializer; C4_OUTPUT_SELFREINFORCE_DECOUPLE). DEFAULT-OFF path is
+    # byte-identical (ADDR_B0_HI+14 weight 1.0, threshold 12). Bug: the e0-frame
+    # address requirement is WEAK -- the rule fires on ANY STACK0 row where
+    # ADDR_B0_LO+0 (*10) carries an 0x_0 low nibble (true on if/bool empty rows
+    # too), and the ALU_LO/HI gate then projects the tiny leaked ALU operand
+    # residue onto OUTPUT, sustaining the if/bool framing drift. FIX: promote
+    # ``ADDR_B0_HI+14`` (0xE_ high nibble of a genuine 0xffe0 frame: +8.7..+20.9
+    # at a real var/func local frame, <=0 at every if/bool empty STACK0 row --
+    # CPU-verified) to the HARD silu requirement (weight 1000, threshold +4000
+    # so up>0 iff ADDR_B0_HI+14 > ~4). Off-frame -> silu(up) ~= 0 -> the
+    # materializer is inert -> no spurious ALU projection.
+    if _output_selfreinforce_decouple_on():
+        stack0_e0_marker_conditions = (
+            ("MARK_STACK0", 1.0),
+            ("HAS_SE", 1.0),
+            ("ADDR_B0_LO+0", 10.0),
+            ("ADDR_B0_LO+8", -2.0),
+            # e0 frame high nibble promoted to a HARD requirement.
+            ("ADDR_B0_HI+14", 1000.0),
+            ("ADDR_B0_HI+15", -2.0),
+            ("IS_BYTE", -10.0),
+            ("OP_JSR", -10.0),
+            ("OP_ENT", -100.0),
+            ("OP_LEV", -10.0),
+            ("MEM_STORE", -20.0),
+            ("MARK_PC", -10.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            ("MARK_MEM", -1e6),
+        )
+        # 12 (base) + 4000 so up>0 iff ADDR_B0_HI+14 > ~4 (genuine e0 frame).
+        stack0_e0_marker_threshold = 4012.0
+    else:
+        stack0_e0_marker_conditions = (
+            ("MARK_STACK0", 1.0),
+            ("HAS_SE", 1.0),
+            ("ADDR_B0_LO+0", 10.0),
+            ("ADDR_B0_LO+8", -2.0),
+            ("ADDR_B0_HI+14", 1.0),
+            ("ADDR_B0_HI+15", -2.0),
+            ("IS_BYTE", -10.0),
+            ("OP_JSR", -10.0),
+            ("OP_ENT", -100.0),
+            ("OP_LEV", -10.0),
+            ("MEM_STORE", -20.0),
+            ("MARK_PC", -10.0),
+            ("MARK_AX", -10.0),
+            ("MARK_SP", -10.0),
+            ("MARK_BP", -10.0),
+            # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
+            # dim_alias_verifier treats it as a hard NOT-blocker; runtime
+            # firing positions have MARK_MEM == 0 so bake math is unchanged.
+            ("MARK_MEM", -1e6),
+        )
+        stack0_e0_marker_threshold = 12.0
     # NOTE(L16-e0-marker-scope-honest): same shape as the e8 family above --
     # the verifier-inferred effective predicate is the gate-only fallback
     # (mark == AX OR (is_byte AND byte_index == 0)) once the MARK_STACK0 vs

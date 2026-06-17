@@ -2326,6 +2326,20 @@ def compile_full_vm_dynamic(
             "C4_BP_SAVE_DUMP_MARKER_REQ": (
                 os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
             ),
+            # OUTPUT-band self-reinforcement decoupling sweep (DEFAULT-OFF, opt
+            # in =1; the unified flag for families #1/#2/#3/#4 -- re-gates the
+            # l16 e8-authoritative + e0-materializer + l10 tail
+            # store_loaded + shr-marker overflow guard on a structural address /
+            # OP_SHR signal). Output-affecting on the if/bool + expr + var STACK0
+            # framing-drift rows: the ON / OFF builds must never share a memo
+            # entry. Also fold in the per-family C4_L16_STACK0_E8_ADDR_GATE so a
+            # build with EITHER flag set invalidates against the baseline.
+            "C4_OUTPUT_SELFREINFORCE_DECOUPLE": (
+                os.environ.get("C4_OUTPUT_SELFREINFORCE_DECOUPLE", "0") != "0"
+            ),
+            "C4_L16_STACK0_E8_ADDR_GATE": (
+                os.environ.get("C4_L16_STACK0_E8_ADDR_GATE", "0") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
