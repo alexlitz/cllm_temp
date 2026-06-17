@@ -1856,3 +1856,312 @@ def consumer_lookahead_gate(
         dump_block_reads=dump_block_reads,
         dump_block_writes=dump_block_writes,
     )
+
+
+# ---------------------------------------------------------------------------
+# CAM / frame-lookup attention — the content-addressable relay head
+# ---------------------------------------------------------------------------
+#
+# The recurring "content-addressable attention head" pattern: a single head
+# that attends from a QUERY-MARKER row to the memory/stack/frame row whose
+# SIGNATURE (an address / byte-index / opcode tag) matches a declared key, and
+# RELAYS that matched row's VALUE band into a TARGET band. It is hand-built
+# repeatedly across the VM:
+#
+#   * L7 ``layer7_operand_gather`` head 0 (``l7_ops.py:269-286``): Q@MARK_AX,
+#     K@STACK0_BYTE0, V=CLEAN_EMBED_{LO,HI}, O->ALU_{LO,HI} — the operand-A
+#     gather (the prev STACK0 byte-0 token's value -> the ALU at the AX marker).
+#   * the L15 memory / LEV / LI lookups (Q@a memory-op marker, K@a byte-index
+#     or address signature, V=the matched MEM row's value, O->OUTPUT / a LI
+#     band).
+#   * the C4_OPERAND_FROM_MEMSP operand->mem[SP] CAM (L4 SP->ADDR_KEY + L8
+#     mem-to-ALU memory-attention).
+#
+# Each is the SAME shape; only the (query marker, key signature, value source
+# band, target band, alibi slope, head layer/idx) vary. :func:`cam_lookup`
+# lifts it to ONE generator. The CAM INVARIANT is made STRUCTURAL by the API
+# shape: the key signature is a declared row-MATCH (``CamKeyMatch`` — a single
+# ``(query_dim @ query, key_dim @ key)`` pair on the query slot), and the value
+# relay is a declared ``(source_band -> target_band)`` block (``CamValueBand``).
+# There are NO free Q/K/V/O writes — the only Q richness allowed is the
+# declared OPCODE-BLOCKER overlay (``query_blockers``) and the optional
+# CONST-anchored confirmation slot (``CamConfirmSlot``), both of which are still
+# row-selection structure, not arbitrary projections.
+#
+# Like :func:`cross_step_carry`, the generator returns a pure builder bundle
+# (``head_spec_builder(dim_positions, head_idx)``) the op factory installs; no
+# compiler change — it lowers through the existing
+# ``Primitives.generate_attention_heads`` path. The byte-identity proof
+# re-expresses the SETTLED L7 operand-gather head 0 and gates the whole-model
+# state_dict hash unchanged.
+
+
+@dataclass(frozen=True)
+class CamKeyMatch:
+    """The content-address row MATCH — the CAM invariant made structural.
+
+    A CAM head fires at the ``query_dim`` marker row and selects the K row
+    carrying ``key_dim`` (the address / byte-index / opcode SIGNATURE). Both
+    land on the head's ``query_slot`` (slot 0 in the L7 operand-gather head):
+    ``AP(query_slot, query_dim, weight)`` on Q and ``AP(query_slot, key_dim,
+    weight)`` on K. Expressing the match as a single declared pair — rather
+    than free Q/K writes — is what makes the "attend to the row whose signature
+    matches" semantics a structural contract: a CAM head has EXACTLY one key
+    match.
+
+    Attributes:
+        query_dim: the QUERY-MARKER residual dim (the row the head fires on;
+            L7: ``MARK_AX``).
+        key_dim: the KEY-SIGNATURE residual dim the matched K row must carry
+            (the content address; L7: ``STACK0_BYTE0``).
+        weight: the shared Q/K projection weight (L7: ``15.0``).
+        query_slot: head-local slot the match lands on (L7: ``0``).
+    """
+
+    query_dim: str
+    key_dim: str
+    weight: float
+    query_slot: int = 0
+
+
+@dataclass(frozen=True)
+class CamConfirmSlot:
+    """An optional CONST-anchored confirmation slot (sharpens the row select).
+
+    The L7 operand-gather head adds a SECOND Q/K slot (slot 33) that anchors a
+    CONST key and re-asserts the marker + amplified opcode blockers, so the
+    softmax winner is pinned even when the primary signature is weakly present.
+    Structurally it is: Q ``AP(slot, marker_dim, marker_weight)`` +
+    ``AP(slot, const_dim, const_q_weight)`` + the amplified ``blockers``; K
+    ``AP(slot, const_dim, const_k_weight)``. The marker / const dims default to
+    the match's query dim / the spec ``const_dim``.
+
+    Attributes:
+        slot: head-local confirmation slot (L7: ``33``).
+        marker_weight: the marker Q write on the confirm slot (L7: ``+15.0``).
+        const_q_weight: the CONST Q write on the confirm slot (L7: ``-7.5``).
+        const_k_weight: the CONST K write on the confirm slot (L7: ``+15.0``).
+        blockers: amplified ``(opcode_dim, weight)`` Q rejects on the confirm
+            slot (L7: ``OP_LEA/ADJ/ENT`` @ ``-150.0``). Negative => reject.
+        marker_dim: the marker dim re-asserted on the confirm slot. ``None`` =>
+            reuse the key-match ``query_dim``.
+    """
+
+    slot: int
+    marker_weight: float
+    const_q_weight: float
+    const_k_weight: float
+    blockers: Tuple[Tuple[str, float], ...] = ()
+    marker_dim: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CamValueBand:
+    """One ``source_band -> target_band`` value-relay block.
+
+    V copies ``source_band[0..width-1]`` into head-local V slots
+    ``v_slot_base..v_slot_base+width-1``; O writes those slots into
+    ``target_band[0..width-1]`` at ``o_scale``. The L7 operand-gather head
+    relays TWO bands: ``CLEAN_EMBED_LO -> ALU_LO`` (slots 1..16) and
+    ``CLEAN_EMBED_HI -> ALU_HI`` (slots 17..32), both at ``o_scale=6.0``.
+
+    Attributes:
+        source_band: the matched row's VALUE band the V slots read.
+        target_band: the band the O writes the relayed value into.
+        width: cell count (L7: ``16`` — a byte's nibble one-hot).
+        v_slot_base: head-local V slot base (L7: ``1`` and ``17``).
+        o_scale: O-write magnitude (L7: ``6.0``).
+    """
+
+    source_band: str
+    target_band: str
+    width: int
+    v_slot_base: int
+    o_scale: float
+
+
+@dataclass(frozen=True)
+class CamLookupSpec:
+    """Declarative description of a CAM / frame-lookup attention head.
+
+    A CAM head attends from a query-marker row to the row whose declared
+    SIGNATURE matches a key, and relays that row's value band to a target band.
+    Every field is a VARYING parameter; the IDENTICAL head structure (the key
+    MATCH + the opcode-blocker overlay + the optional confirm slot + the value
+    relay blocks) is supplied by :func:`cam_lookup`.
+
+    The CAM invariant is enforced by the API shape: the row selection is a
+    single :class:`CamKeyMatch` (one query/key signature pair), the value flow
+    is a tuple of :class:`CamValueBand` relay blocks, and the only extra Q
+    structure is the declared :attr:`query_blockers` overlay + the optional
+    :class:`CamConfirmSlot`. There is NO free Q/K/V/O field.
+
+    Attributes:
+        name: head family name (rule-name / diagnostic prefix).
+        key_match: the content-address row MATCH (:class:`CamKeyMatch`).
+        value_bands: the value-relay blocks (:class:`CamValueBand`), in the
+            order the hand-built head appended them (the V/O write order is NOT
+            load-bearing for the lowered weights — ``generate_attention_head``
+            uses direct indexed assignment — but the order is kept identical for
+            a clean diff).
+        alibi_slope: per-head ALiBi slope. ``None`` => the op writes its own
+            ``alibi_slopes`` (the L7 operand-gather head's slope is set by the
+            op's ``attn.alibi_slopes.fill_(0.5)`` bake, NOT the spec, so the
+            re-expression leaves it ``None`` to stay byte-identical).
+        query_blockers: opcode-reject Q writes on the key-match query slot —
+            ``(opcode_dim, weight)`` with a NEGATIVE weight rejecting wrong-op
+            rows (L7: ``OP_LEA/ADJ/ENT`` @ ``-15.0``). These narrow WHICH marker
+            rows the head fires on; they are row-selection structure, not free
+            projections.
+        confirm: the optional CONST-anchored confirmation slot
+            (:class:`CamConfirmSlot`). ``None`` => no second gate slot.
+        const_dim: the CONST residual dim name (the confirm slot's anchor).
+        value_active: when ``False`` the value relay (V/O) is OMITTED while the
+            Q/K row-select gates are KEPT — the C4_OPERAND_FROM_MEMSP
+            "disable the old operand source but leave the head slot/layout
+            unchanged" mode (``l7_ops.py:251-267``). Byte-identical to the
+            hand-built suppressed head.
+        extra_reads: extra dim names the head's Operation should declare as
+            reads beyond the auto-derived set (e.g. a cross-step ``X.*.-1``
+            alias the source band is read through).
+    """
+
+    name: str
+    key_match: CamKeyMatch
+    value_bands: Tuple[CamValueBand, ...]
+    alibi_slope: Optional[float] = None
+    query_blockers: Tuple[Tuple[str, float], ...] = ()
+    confirm: Optional[CamConfirmSlot] = None
+    const_dim: str = "CONST"
+    value_active: bool = True
+    extra_reads: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.value_bands:
+            raise ValueError(
+                f"CamLookupSpec({self.name!r}): value_bands must be non-empty "
+                "(a CAM head relays at least one value band)"
+            )
+        for vb in self.value_bands:
+            if vb.width <= 0:
+                raise ValueError(
+                    f"CamLookupSpec({self.name!r}): value band "
+                    f"{vb.source_band!r}->{vb.target_band!r} width must be "
+                    f"positive, got {vb.width}"
+                )
+
+
+@dataclass(frozen=True)
+class CamLookupBundle:
+    """The artifacts :func:`cam_lookup` generates for one CAM head.
+
+    The builder is pure (no global side effects) so the op factory can call it
+    at bake time and IR-factory time identically.
+
+    Attributes:
+        spec: the originating :class:`CamLookupSpec`.
+        head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. Reproduces the hand-built CAM head
+            EXACTLY (same Q/K/V/O writes at the resolved dim positions).
+        head_reads / head_writes: dim-name sets for the head's Operation. The
+            head READS the key-match query/key dims + the blocker opcode dims +
+            the value source bands; WRITES the value target bands. When
+            ``value_active`` is False the value bands are still declared (the
+            slots exist) but the source reads / target writes are omitted from
+            the auto sets, matching the suppressed hand-built head's deps.
+    """
+
+    spec: CamLookupSpec
+    head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    head_reads: Set[str]
+    head_writes: Set[str]
+
+
+def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
+    """Generate the content-addressable / frame-lookup attention head for ``spec``.
+
+    Returns a :class:`CamLookupBundle` whose ``head_spec_builder`` reproduces
+    the hand-built CAM head byte-identically. Unlike :func:`cross_step_carry`
+    this generator registers NO residual band (a CAM head relays into EXISTING
+    bands — ALU / OUTPUT / a LI band — so there is no import-time side effect).
+    """
+    km = spec.key_match
+    confirm = spec.confirm
+
+    def head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return int(dim_positions[name])
+
+        # (1) The content-address row MATCH on the query slot: Q@query_dim,
+        #     K@key_dim — the CAM invariant. ONE pair.
+        q: list = [AP(km.query_slot, _P(km.query_dim), km.weight)]
+        k: list = [AP(km.query_slot, _P(km.key_dim), km.weight)]
+
+        # (2) The opcode-blocker overlay on the SAME query slot (narrow which
+        #     marker rows fire — negative weights reject wrong-op rows).
+        for (op_dim, w) in spec.query_blockers:
+            q.append(AP(km.query_slot, _P(op_dim), w))
+
+        # (3) The optional CONST-anchored confirmation slot (re-assert the
+        #     marker + amplified blockers; anchor a CONST key so the softmax
+        #     winner is pinned). Marker dim defaults to the match query dim.
+        if confirm is not None:
+            marker_dim = (
+                confirm.marker_dim if confirm.marker_dim is not None
+                else km.query_dim
+            )
+            const = _P(spec.const_dim)
+            q.append(AP(confirm.slot, _P(marker_dim), confirm.marker_weight))
+            q.append(AP(confirm.slot, const, confirm.const_q_weight))
+            for (op_dim, w) in confirm.blockers:
+                q.append(AP(confirm.slot, _P(op_dim), w))
+            k.append(AP(confirm.slot, const, confirm.const_k_weight))
+
+        # (4) The value relay blocks: V copies source_band -> V slots; O writes
+        #     those slots into target_band. Omitted when value_active is False
+        #     (the row-select gates stay, the relay is suppressed).
+        v: list = []
+        o: list = []
+        if spec.value_active:
+            for vb in spec.value_bands:
+                src = _P(vb.source_band)
+                tgt = _P(vb.target_band)
+                for j in range(vb.width):
+                    v.append(AP(vb.v_slot_base + j, src + j, 1.0))
+                    o.append(AO(tgt + j, vb.v_slot_base + j, vb.o_scale))
+
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+            alibi_slope=spec.alibi_slope,
+        )
+
+    # Operation dep-graph dim sets (structural derivation).
+    head_reads: Set[str] = {km.query_dim, km.key_dim, spec.const_dim}
+    for (op_dim, _w) in spec.query_blockers:
+        head_reads.add(op_dim)
+    if confirm is not None:
+        if confirm.marker_dim is not None:
+            head_reads.add(confirm.marker_dim)
+        for (op_dim, _w) in confirm.blockers:
+            head_reads.add(op_dim)
+    head_writes: Set[str] = set()
+    if spec.value_active:
+        for vb in spec.value_bands:
+            head_reads.add(vb.source_band)
+            head_writes.add(vb.target_band)
+    head_reads.update(spec.extra_reads)
+
+    return CamLookupBundle(
+        spec=spec,
+        head_spec_builder=head_spec_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
+    )
