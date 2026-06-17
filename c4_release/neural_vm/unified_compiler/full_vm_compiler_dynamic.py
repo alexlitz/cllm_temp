@@ -2216,6 +2216,17 @@ def compile_full_vm_dynamic(
             "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
                 os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
             ),
+            # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1): adds a
+            # BYTE_INDEX_2-keyed Q/K NOT-blocker slot to the L10
+            # psh_stack0_passthrough head so the PSH-arg byte-3 relay does not
+            # crush the value-byte OUTPUT (the post-ENT 34-token desync root),
+            # output-affecting on func/nested PSH steps -> ON / OFF builds must
+            # NEVER share a memo / disk entry. Held off (HEAD-identical) as a
+            # verified framing building block -- net -1 exit_code trade, see
+            # _psh_stack0_byte3_relay_darken_enabled.
+            "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
+                os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
+            ),
             # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
             # DEFAULT-OFF, opt in with =1): adds 32 MARK_SE_ONLY-gated OUTPUT
             # suppressor units to post_l9_bz_bnz_pc_override (output-affecting),
@@ -2237,6 +2248,27 @@ def compile_full_vm_dynamic(
             # ON / OFF builds must NEVER share a memo / disk entry.
             "C4_L15_LI_SUPPR_INERT": (
                 os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+            ),
+            # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows the L15
+            # memory-lookup attention from 14 -> 15 heads and adds the
+            # content-addressable return-address restore head. CHANGES num_heads
+            # and the L15 W_q/W_k/W_v/W_o shapes, so the ON / OFF builds MUST
+            # NEVER share a memo / disk entry. (Address-widen + the sub-tuning
+            # env knobs only matter when this parent flag is on.)
+            "C4_L15_LEV_PC_RESTORE": (
+                os.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+            ),
+            # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
+            # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
+            # value_scale=40 V/O delivery. Output-affecting on the LEV PC marker
+            # AND (the wall) on LI/LC load rows, so the ON / OFF builds MUST
+            # NEVER share a memo / disk entry. Sub-knobs fold into the same key.
+            "C4_L15_LEV_ADDR_WIDEN": (
+                os.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0",
+                os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
+                os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
+                os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
+                os.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0",
             ),
             # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
             # opt out =0): adds a 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY
@@ -2793,6 +2825,12 @@ def _bake_from_scheduled_ops(
         "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
             os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
         ),
+        # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1,
+        # output-affecting on func/nested PSH steps): the ON / OFF builds must
+        # never share a serialised entry.
+        "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
+            os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
+        ),
         # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
         # DEFAULT-OFF, opt in with =1, output-affecting): the ON / OFF builds
         # must never share a serialised entry.
@@ -2810,6 +2848,23 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_L15_LI_SUPPR_INERT": (
             os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+        ),
+        # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows L15
+        # memory-lookup attention 14 -> 15 heads (changes num_heads + the L15
+        # W_q/W_k/W_v/W_o shapes), so the ON / OFF builds must never share a
+        # serialised entry.
+        "C4_L15_LEV_PC_RESTORE": (
+            os.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+        ),
+        # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
+        # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs
+        # fold into the same key so any retune invalidates the entry.
+        "C4_L15_LEV_ADDR_WIDEN": (
+            os.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0",
+            os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
+            os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
+            os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
+            os.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0",
         ),
         # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
         # opt out =0, output-affecting on the func/nested/rec EXIT value): adds a
