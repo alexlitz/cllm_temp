@@ -59,7 +59,7 @@ def _lea_local_e8_multilocal_guard_enabled() -> bool:
     build (the two FETCH NOT-blocker terms are omitted). The legit imm=-8 LEA
     byte-0 0xE8 emit (FETCH_LO+0 ~= 0, FETCH_HI+14 ~= 0) is unaffected.
     """
-    return os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "1") != "0"
+    return os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
 
 
 def _psh_stack0_highbyte_darken_enabled() -> bool:
