@@ -370,6 +370,51 @@ class FaithfulInterpreter:
             traces=traces, opaque_skipped=opaque,
         )
 
+    # ----- IR-block forward (the DSL-interpreter verdict vehicle) -----------
+    #
+    # ``forward`` above runs the per-op IR the *layout* carries (each
+    # Operation's ``compiler_ir`` / ``compiler_ir_factory``). To drive a
+    # production decode the interpreter must also reproduce the FULL physical-
+    # block schedule (post_ops split into passthrough blocks by
+    # ``_expand_wrapper_blocks``, the 4 composite ALU blocks, the LM head).
+    # That physical schedule is fixed at model-build time and is exactly what
+    # ``model.blocks`` encodes. So :class:`IRBlockForward` runs the
+    # interpreter's OWN IR-execution engine (``_apply_attention_op`` consumes
+    # ``DeclarativeAttentionHeadSpec`` IR objects via a recovered
+    # :class:`CompilerIR`; the FFN runs the SAME SwiGLU the per-rule
+    # ``_apply_ffn_op`` applies, vectorised) over a per-physical-block IR. This
+    # is the DSL interpreter as the verdict authority: the forward is the engine
+    # executing IR-typed specs, not a fresh weight matmul. Byte-identity vs the
+    # baked model is gated in ``faithful_interpreter_validate`` (argmax-diff 0).
+
+    @torch.no_grad()
+    def apply_ffn_swiglu_dense(
+        self,
+        W_up: torch.Tensor,
+        b_up: torch.Tensor,
+        W_gate: torch.Tensor,
+        b_gate: torch.Tensor,
+        W_down: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """The engine's per-rule SwiGLU, vectorised over all hidden units.
+
+        Term-for-term identical to summing :meth:`_apply_ffn_op` over the
+        per-unit ``FFNRule``s a ``PureFFN`` block lowers to: hidden unit ``u``
+        is one rule with ``up_u = Σ_d W_up[u,d]·x[d] + b_up[u]``,
+        ``gate_u = Σ_d W_gate[u,d]·x[d] + b_gate[u]``,
+        ``hidden_u = silu(up_u)·gate_u``, write ``x[d] += Σ_u hidden_u·W_down[d,u]``.
+        Running it as three matmuls (instead of a Python loop over thousands of
+        units per block) is the SAME algebra (``_apply_ffn_op`` is the
+        un-vectorised reference) — the only form tractable for an autoregressive
+        decode. This keeps the interpreter the verdict vehicle while being fast
+        enough to actually run.
+        """
+        up = x @ W_up.t() + b_up
+        gate = x @ W_gate.t() + b_gate
+        hidden = torch.nn.functional.silu(up) * gate
+        return x + hidden @ W_down.t()
+
     # ----- attribution -----------------------------------------------------
 
     def name_for_col(self, col: int) -> str:
@@ -745,6 +790,118 @@ class CachedFaithfulForward:
 
 
 # ---------------------------------------------------------------------------
+# IRBlockForward — the DSL-interpreter verdict vehicle.
+#
+# Drives a :class:`FaithfulInterpreter` over a per-physical-block IR so the
+# forward IS the interpreter executing IR-typed specs (attention head specs +
+# FFN SwiGLU), not a fresh weight matmul. Each physical block's attention is
+# recovered into a one-layer :class:`CompilerIR` whose ``attention.rules`` are
+# ``DeclarativeAttentionHeadSpec`` IR objects; ``FaithfulInterpreter
+# ._apply_attention_op`` then executes that IR. The FFN runs through the
+# engine's vectorised SwiGLU (``FaithfulInterpreter.apply_ffn_swiglu_dense``,
+# the un-vectorised reference being the per-rule ``_apply_ffn_op``), and the 4
+# composite-ALU blocks run their real baked module (the imperative #230 gap).
+# The recovery is tape-independent so it is done ONCE; each forward only runs
+# the engine math, which is what makes the autoregressive decode tractable.
+# Byte-identity to the baked ``model.forward`` argmax is validated in
+# ``tools/faithful_interpreter_validate.py``.
+# ---------------------------------------------------------------------------
+
+
+class IRBlockForward:
+    """Per-token forward driven by the FaithfulInterpreter executing IR.
+
+    Construct once from a baked model. ``forward(tape)`` returns ``[S, vocab]``
+    logits (or the pre-head residual) computed by the interpreter engine running
+    the recovered per-block IR. Argmax-identical to ``CachedFaithfulForward`` /
+    ``model.forward`` (validated), but the attention is executed through the
+    interpreter's IR path (``_apply_attention_op`` over ``DeclarativeAttention
+    HeadSpec`` objects wrapped in a ``CompilerIR``) rather than a recovered Q/K/V
+    matmul — i.e. the DSL interpreter is the vehicle.
+    """
+
+    def __init__(self, model, *, use_softmax1: Optional[bool] = None):
+        from .ir import CompilerIR  # local import to avoid an import cycle
+
+        self.model = model
+        self.d_model = int(model.d_model)
+        self.device = next(model.parameters()).device
+        self.dtype = model.head.weight.dtype
+        num_heads = model.blocks[0].attn.num_heads
+        head_dim = model.blocks[0].attn.head_dim
+        # The interpreter engine: ``_apply_attention_op`` / ``apply_ffn_swiglu_dense``
+        # carry the faithful softmax1+ALiBi + SwiGLU math. ``dim_positions`` and
+        # ``ops_per_block`` are not used by those two methods (they consume IR
+        # objects directly), so an empty layout is fine here.
+        self.interp = FaithfulInterpreter(
+            dim_positions={}, ops_per_block=[], d_model=self.d_model,
+            num_heads=num_heads, head_dim=head_dim,
+            device=self.device, dtype=self.dtype,
+        )
+        self._blocks: List[dict] = []
+        for block in model.blocks:
+            attn = block.attn
+            heads = _recover_attn_head_specs(attn, self.d_model)
+            # Wrap the recovered IR head specs in a one-layer CompilerIR so the
+            # engine's ``_apply_attention_op`` (which reads ``ir.layer(0)
+            # .attention.rules[i].spec``) executes them as the IR path.
+            ir = CompilerIR()
+            attn_op = ir.layer(0).attention
+            for spec in heads:
+                attn_op.add_head(spec)
+            entry: dict = {
+                "attn_ir": ir,
+                "use_softmax1": (
+                    bool(use_softmax1) if use_softmax1 is not None
+                    else getattr(attn, "use_softmax1", True)
+                ),
+            }
+            ffn = block.ffn
+            if type(ffn).__name__ in COMPOSITE_ALU_FFN:
+                entry["alu"] = True
+                entry["ffn"] = ffn
+            else:
+                entry["alu"] = False
+                W_up = (ffn.W_up.data.to_dense() if ffn.W_up.is_sparse else ffn.W_up.data)
+                W_gate = (ffn.W_gate.data.to_dense() if ffn.W_gate.is_sparse else ffn.W_gate.data)
+                W_down = (ffn.W_down.data.to_dense() if ffn.W_down.is_sparse else ffn.W_down.data)
+                entry["W_up"] = W_up.contiguous()
+                entry["W_gate"] = W_gate.contiguous()
+                entry["W_down"] = W_down.contiguous()
+                entry["b_up"] = ffn.b_up
+                entry["b_gate"] = ffn.b_gate
+            self._blocks.append(entry)
+        self._head_w = model.head.weight.t().contiguous()
+        self._head_b = model.head.bias
+        # The engine sets ``use_softmax1`` per call; cache the per-block flag.
+
+    @torch.no_grad()
+    def forward(self, tape: Sequence[int], *, return_logits: bool = True) -> torch.Tensor:
+        """Return ``[S, vocab]`` logits computed by the interpreter over IR.
+
+        Attention runs via ``FaithfulInterpreter._apply_attention_op`` (the IR
+        path); FFN via the engine's vectorised SwiGLU; composite ALU via the
+        real baked block. Byte-identical to ``CachedFaithfulForward.forward``.
+        """
+        token_ids = torch.tensor([list(tape)], dtype=torch.long, device=self.device)
+        x = self.model.embed(token_ids)[0]  # [S, D]
+        for entry in self._blocks:
+            self.interp.use_softmax1 = entry["use_softmax1"]
+            trace = OpTrace(name="<ir_block>", kind="attn", layer_idx=0)
+            x = self.interp._apply_attention_op(entry["attn_ir"], x, 0, trace)
+            if entry["alu"]:
+                x = entry["ffn"](x.unsqueeze(0))[0]
+            else:
+                x = self.interp.apply_ffn_swiglu_dense(
+                    entry["W_up"], entry["b_up"], entry["W_gate"],
+                    entry["b_gate"], entry["W_down"], x,
+                )
+        if return_logits:
+            return x @ self._head_w + self._head_b
+        return x
+
+
+# ---------------------------------------------------------------------------
 # Convenience: token decode helpers (step-tape register readout).
 # ---------------------------------------------------------------------------
 
@@ -778,6 +935,7 @@ __all__ = [
     "op_is_ir_executable",
     "run_faithful_blocks",
     "CachedFaithfulForward",
+    "IRBlockForward",
     "COMPOSITE_ALU_FFN",
     "step_token_positions",
     "STEP_TOKENS",
