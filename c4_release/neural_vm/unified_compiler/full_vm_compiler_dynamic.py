@@ -2237,6 +2237,27 @@ def compile_full_vm_dynamic(
             "C4_L15_LI_SUPPR_INERT": (
                 os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
             ),
+            # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows the L15
+            # memory-lookup attention from 14 -> 15 heads and adds the
+            # content-addressable return-address restore head. CHANGES num_heads
+            # and the L15 W_q/W_k/W_v/W_o shapes, so the ON / OFF builds MUST
+            # NEVER share a memo / disk entry. (Address-widen + the sub-tuning
+            # env knobs only matter when this parent flag is on.)
+            "C4_L15_LEV_PC_RESTORE": (
+                os.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+            ),
+            # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
+            # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
+            # value_scale=40 V/O delivery. Output-affecting on the LEV PC marker
+            # AND (the wall) on LI/LC load rows, so the ON / OFF builds MUST
+            # NEVER share a memo / disk entry. Sub-knobs fold into the same key.
+            "C4_L15_LEV_ADDR_WIDEN": (
+                os.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0",
+                os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
+                os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
+                os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
+                os.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0",
+            ),
             # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
             # opt out =0): adds a 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY
             # >= 3.0, killing the byte-1 dump at the func/nested/rec LEV step
@@ -2813,6 +2834,23 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_L15_LI_SUPPR_INERT": (
             os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+        ),
+        # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows L15
+        # memory-lookup attention 14 -> 15 heads (changes num_heads + the L15
+        # W_q/W_k/W_v/W_o shapes), so the ON / OFF builds must never share a
+        # serialised entry.
+        "C4_L15_LEV_PC_RESTORE": (
+            os.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+        ),
+        # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
+        # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs
+        # fold into the same key so any retune invalidates the entry.
+        "C4_L15_LEV_ADDR_WIDEN": (
+            os.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0",
+            os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
+            os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
+            os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
+            os.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0",
         ),
         # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
         # opt out =0, output-affecting on the func/nested/rec EXIT value): adds a

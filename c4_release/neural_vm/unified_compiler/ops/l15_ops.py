@@ -186,6 +186,37 @@ def _l15_lev_byte0_select_strength() -> float:
         return 400.0
 
 
+def _l15_lev_pc_only_on() -> bool:
+    """DEFAULT-OFF flag (``C4_L15_LEV_PC_ONLY``): hard-gate the address-widened
+    LEV PC-restore head 14 so it fires STRICTLY at the LEV PC marker and never
+    self-fires on a non-LEV STACK0/MEM store row.
+
+    ROOT (spec_k=0, BUILT dims, func_identity_0 id550, 2026-06-17): with
+    ``C4_L15_LEV_ADDR_WIDEN`` on, head 14's byte-0-BOOSTED 24-bit binary-address
+    self-match (slots 4..27, b0 scale ~80) scores ~2.1e5 on a STACK0 marker row
+    whose own ADDR_B0/B1/B2 block matches itself. That self-match OVERWHELMS the
+    slot-0 (-2000) firing bias AND the slot-66 store-dark gate (-7500 at
+    non-LEV), so head 14 self-fires (w=1.0) at value_scale=40 on the func-frame
+    STACK0 store rows -- corrupting the pushed-argument store value (the LI's
+    mem[0xFFE8]=70 becomes 0). Measured: ``pc+widen`` LI_AX 70 -> 0, the
+    SI/SC/LI/LC smoke CAM regression, var_simple 17 -> 0.
+
+    FIX: a single fully-additive HARD-DARK slot whose query is hugely positive
+    on every NON-LEV-PC row and hugely negative on the LEV PC marker, paired
+    with a ``k = -CONST`` (present at every key). On a non-LEV query this drives
+    EVERY real key's score to ~-1e9 so softmax1 collapses to the zero-value sink
+    and head 14 writes ~0 -- the address self-match can no longer leak. On the
+    LEV PC marker the query is strongly NEGATIVE so ``-CONST`` makes a uniform
+    POSITIVE add to every key (no relative darkening), leaving the genuine
+    return-address gather untouched. Because the slot is only emitted when BOTH
+    the parent flag and ADDR_WIDEN are on, and it never moves the relative
+    ordering on the LEV PC marker, the LEV PC restore is preserved while the LI
+    load is no longer clobbered. Flag-off omits the slot (byte-identical to the
+    widen build); consulted only when ``C4_L15_LEV_ADDR_WIDEN`` is on.
+    """
+    return _os_l15.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0"
+
+
 _L15_LEV_PC_RESTORE_HEAD_IDX = 14
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
@@ -1776,6 +1807,40 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         q.append(AP(66, BD.CONST, -1.5))
         k.append(AP(66, BD.MEM_STORE, dark))
 
+    # === Slots 67/69: HARD (MARK_PC AND OP_LEV) firing gate (C4_L15_LEV_PC_ONLY).
+    # The address-widened head must fire ONLY at the LEV *PC marker* row. Two
+    # leak classes the scaffold gates miss:
+    #   (a) non-LEV STACK0/MEM store rows: the byte-0-BOOSTED 24-bit address
+    #       self-match (~2.1e5) overwhelms slot 0's -2000 bias + slot 66's -7500
+    #       store-dark, so the value_scale=40 head self-fires and corrupts the
+    #       pushed func-arg store value (LI mem[0xFFE8] 70 -> 0).
+    #   (b) the LEV step's OWN AX/SP/BP marker rows: they carry OP_LEV (an
+    #       OP_LEV-only gate leaves them neutral) but NOT MARK_PC, and the head's
+    #       strong OUTPUT delivery of the return PC (90) bleeds onto the BP
+    #       marker -> BP restored as 90 -> the post-LEV main frame desyncs
+    #       (step-9 AX 70 -> 72, exit_code wrong).
+    # The fire row is the unique (MARK_PC=1 AND OP_LEV>0) row; every other row
+    # fails at least one condition. Two INDEPENDENT dark slots implement the AND:
+    # each fails-CLOSED (drives the query +HARD -> -HARD per key -> softmax1 sink
+    # wins) when its own condition is absent, and contributes ZERO (q=0) when
+    # present. A row missing EITHER condition is darkened by that slot; the LEV
+    # PC marker passes BOTH (q=0,0) so the address slots 4..27 + the STACK0-byte0
+    # selector decide the genuine return-store gather. A uniform additive on the
+    # passing rows would corrupt the softmax1 sink competition (forcing the head
+    # to fire on every PC marker), so the passing case MUST be exactly zero --
+    # hence the fail-closed-only (no negative-q firing-bonus) design.
+    #   slot 67: q = HARD*CONST - HARD*MARK_PC      (MARK_PC=1 -> 0 ; else +HARD)
+    #   slot 69: q = HARD*CONST - (HARD/5)*OP_LEV   (OP_LEV~5 -> 0 ; else +HARD)
+    #   both k = -CONST (present, value 1, at every real key; sink stays 0).
+    if _widen and _l15_lev_pc_only_on():
+        HARD = 5_000_000.0
+        q.append(AP(67, BD.CONST, HARD))
+        q.append(AP(67, BD.MARK_PC, -HARD))
+        k.append(AP(67, BD.CONST, -1.0))
+        q.append(AP(69, BD.CONST, HARD))
+        q.append(AP(69, BD.OP_LEV, -HARD / 4.0))
+        k.append(AP(69, BD.CONST, -1.0))
+
     # === Slot 64: OP_JSR return-store discriminator (ADDRESS-WIDENING). ===
     # The deepest CAM-aliasing layer (after byte-0 separates 0xFFF0 from the
     # wrong-frame 0xFFF8): the genuine return store and a SAME-ADDRESS stale
@@ -1815,6 +1880,26 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         k.append(AP(65, BD.BYTE_INDEX_1, -BSEL))
         k.append(AP(65, BD.BYTE_INDEX_2, -BSEL))
         k.append(AP(65, BD.BYTE_INDEX_3, -BSEL))
+
+    # === Slot 68: STACK0-byte0 return-store selector (C4_L15_LEV_PC_ONLY). ===
+    # Deepest LEV CAM aliasing: the saved-BP word's MEM-frame byte-0 row (e.g.
+    # func_identity_0 pos264, value 0xF0=240) and the GENUINE return store (the
+    # JSR-pushed STACK0 byte-0 row, pos269, value 0x5a=90) BOTH sit at addr
+    # 0xFFF0 AND BOTH carry BYTE_INDEX_0 + OP_JSR -- so slots 64/65 reward them
+    # equally and the higher-MEM_STORE saved-BP MEM rows (anchor slot 1) win by
+    # ~263 (probe tools/_probe_lev_head14_keys 550 8: pos267 558622 vs the
+    # genuine pos269 558359). The ONE clean separator is ``STACK0_BYTE0``: the
+    # return store is the live STACK0 push (STACK0_BYTE0~1.0) while every
+    # saved-BP / MEM-image row has STACK0_BYTE0~0. A strong K-side reward on
+    # STACK0_BYTE0, gated by the LEV PC query, pulls the gather onto the genuine
+    # return value byte-0 (90). Only emitted in the PC-ONLY decouple build (the
+    # base widen build is unchanged), so it folds into the same cache key.
+    if _widen and _l15_lev_pc_only_on():
+        STK0_SEL = 40000.0
+        q.append(AP(68, BD.OP_LEV, 1.0))
+        q.append(AP(68, BD.MARK_PC, 1.0))
+        q.append(AP(68, BD.CONST, -1.0))
+        k.append(AP(68, BD.STACK0_BYTE0, STK0_SEL))
 
     # === Slot 1: Store anchor -- only store K cross the threshold. ===
     q.append(AP(1, BD.OP_LEV, 50.0))
