@@ -85,6 +85,37 @@ def _ent_sp_byte1_ff_h1_hardening_enabled() -> bool:
     return os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
 
 
+def _lev_stack0_preserve_se_blocker_on() -> bool:
+    """DEFAULT-OFF guard (opt in with ``C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER=1``):
+    add a ``MARK_SE`` NOT-blocker to the ``l16_lev_stack0_byte0_preserve_*``
+    family so the OP_LEV broadcast residue cannot solo-fire the OUTPUT-preserve
+    nudge on the post-LEV STEP_END row.
+
+    Root (spec_k=0, tools/_probe_lev_step9_overemit.py, func_identity_0 id 550
+    with the C4_L15_LEV chain ON): the LEV epilogue (step 8) leaves an OP_LEV
+    residue ~4.1 on the next step's STEP_END row (opcode markers are NOT one-hot
+    in-step). The preserve rule's only strong positive gate is ``OP_LEV``
+    (weight 5.0); ``5.0 * 4.13 = 20.6`` alone clears the 7.5 threshold even
+    though ``MARK_STACK0`` and ``BYTE_INDEX_0`` are BOTH 0 on that STEP_END row.
+    The rule then MIS-FIRES with ``gate=OUTPUT_LO`` (already ~-240 from the
+    normal STEP_END family) and ``silu(up=1414)*gate*0.5`` drives the OUTPUT
+    band to ~-1.7e5 -> block-41/L25 tail amplifies to ~1.1e16 -> the LM head's
+    ``head.weight[byte0x00, OUTPUT_LO+0]`` spikes a stray leading ``0`` token at
+    the start of the next step (36-token over-emit -> fixed-35-slice frame
+    desync -> AX 70->72, wrong exit_code).
+
+    Clean discriminator: ``MARK_SE`` (the STEP_END-row marker) == 1.0 EXACTLY on
+    the spurious STEP_END misfire row and == 0.0 EXACTLY on the genuine LEV-step
+    STACK0 marker (pos 408) and STACK0 byte-0 (pos 409) rows where the preserve
+    SHOULD fire. A ``-100*MARK_SE`` blocker therefore vetoes the misfire and is
+    byte-identical on the legitimate firing rows. Same op_ent_in_step_broadcast
+    corruptor family as ``_ent_sp_byte1_ff_h1_hardening``, now for OP_LEV.
+
+    DEFAULT-OFF so HEAD is byte-identical; ships with the C4_L15_LEV func chain.
+    """
+    return os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
+
+
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer16_lev_routing`` op currently owns the entire L16 FFN. Its
@@ -427,6 +458,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", -10.0),
         ("MEM_STORE", -10.0),
     )
+    if _lev_stack0_preserve_se_blocker_on():
+        # OP_LEV broadcast residue (~4.1) on the post-LEV STEP_END row clears
+        # the 7.5 threshold solo (5.0*4.1=20.6) with MARK_STACK0/BYTE_INDEX_0=0.
+        # MARK_SE==1 ONLY on that STEP_END row (==0 on genuine STACK0 rows), so a
+        # large NOT-blocker vetoes the misfire without touching legitimate fires.
+        lev_stack0_preserve_conditions = (
+            *lev_stack0_preserve_conditions,
+            ("MARK_SE", -100.0),
+        )
     # Use nudge-strength (50/S) to match the sibling stack0_e0/e8/f8 marker
     # materializer families; this is enough to overcome the residual
     # zero-default but not so strong that we clobber legitimate L14/L15
