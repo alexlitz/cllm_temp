@@ -1,6 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 import dataclasses
+import os as _os_l8
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
@@ -568,6 +569,37 @@ def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _adj_lo_ax_marker_blocker_on() -> bool:
+    """DEFAULT-OFF guard (``C4_L8_ADJ_LO_AX_MARKER_BLOCKER=1``): add a MARK_AX
+    NOT-blocker to the ``l8_alu_adj_lo_*_step_end`` ADJ low-nibble ALU rules so
+    the SP-adjustment result cannot leak into the AX register dump.
+
+    Root (spec_k=0, tools/_probe_l9_outlo8.py, func_identity_0 id550 with the
+    C4_L15_LEV func chain ON): the func epilogue's ADJ step (``ADJ 8`` cleaning
+    the call frame) computes ``SP = SP + 8`` in the L8 ADJ ALU. The result's low
+    nibble (8) is staged into ``OUTPUT_LO[8]`` for relay to the SP register. But
+    the ADJ-lo rule fires on the ``MARK_SE_ONLY`` residue WITHOUT a MARK_AX
+    blocker (the shared ``_block_non_ax_marker_conditions`` set deliberately
+    leaves MARK_AX un-blocked, because the sibling ADD/SUB ALU rules DO write
+    their result at the AX row). On the ADJ AX byte-0 row the staged
+    ``OUTPUT_LO[8]`` (the SP-adjustment ``8``) is the DOMINANT writer (+8.83,
+    attributed to ``l8_alu_adj_lo_a0_b8_step_end``), overwhelming the correct
+    AX-carry materialization of the returned value (``l6_adj_ax_to_output_lo_6``
+    only reaches +5.13 at the weak post-LEV ADJ row) -> the AX byte-0 low nibble
+    decodes as 8 instead of 6 -> ``identity(70)`` returns ``72`` (0x46 -> 0x48).
+    Uniform low-nibble->8 corruption across func_identity because the ADJ amount
+    is always one stack slot (8).
+
+    Fix: ADJ writes SP, never AX, so a MARK_AX NOT-blocker on the ADJ-lo result
+    write is semantically correct AND surgical -- it vetoes the leak onto the AX
+    row while the legitimate SP-staging fires at MARK_SE_ONLY (MARK_AX=0) exactly
+    as before. DEFAULT-OFF so HEAD stays byte-identical; ships with the
+    C4_L15_LEV func chain. Same op-broadcast-corruptor family as the L16 LEV
+    STACK0 preserve SE-blocker, now for the ADJ SP result on the AX row.
+    """
+    return _os_l8.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "0") == "1"
+
+
 def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
     """ADJ lo nibble (256 units, offsets 1008..1263).
 
@@ -582,6 +614,9 @@ def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     gate_adj_lo = dim_ref("opcode_flag", "ADJ")
     blockers = _layer8_alu_block_non_ax_marker_conditions()
+    if _adj_lo_ax_marker_blocker_on():
+        # ADJ writes SP, never AX: veto the SP-result leak onto the AX dump row.
+        blockers = (*blockers, ("MARK_AX", -1000.0))
     rules = []
     for a in range(16):
         for b in range(16):

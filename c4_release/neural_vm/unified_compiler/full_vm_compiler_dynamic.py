@@ -2226,6 +2226,15 @@ def compile_full_vm_dynamic(
             "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
                 os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
             ),
+            # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1): adds a MARK_AX
+            # NOT-blocker to the l8_alu_adj_lo_*_step_end ADJ low-nibble ALU rules
+            # so the SP-adjustment result cannot leak into the AX register dump on
+            # the post-LEV ADJ step (the func_identity low-nibble->8 corruption).
+            # Output-affecting on ADJ AX rows, so ON / OFF builds must NEVER share
+            # a memo / disk entry. Ships with the C4_L15_LEV func chain.
+            "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
+                os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "0") == "1"
+            ),
             # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1): adds a
             # BYTE_INDEX_2-keyed Q/K NOT-blocker slot to the L10
             # psh_stack0_passthrough head so the PSH-arg byte-3 relay does not
@@ -2840,6 +2849,12 @@ def _bake_from_scheduled_ops(
         # row): the ON / OFF builds must never share a serialised entry.
         "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
             os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
+        ),
+        # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1, output-affecting on
+        # post-LEV ADJ AX rows): the ON / OFF builds must never share a
+        # serialised entry. Ships with the C4_L15_LEV func chain.
+        "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
+            os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "0") == "1"
         ),
         # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1,
         # output-affecting on func/nested PSH steps): the ON / OFF builds must
