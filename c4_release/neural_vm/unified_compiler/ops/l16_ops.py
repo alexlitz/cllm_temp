@@ -116,6 +116,71 @@ def _lev_stack0_preserve_se_blocker_on() -> bool:
     return os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
 
 
+def _stack0_e8_authoritative_addr_gate_on() -> bool:
+    """DEFAULT-OFF guard (opt in with ``C4_L16_STACK0_E8_ADDR_GATE=1``): make the
+    ``l16_stack0_e8_output_authoritative_*`` family's e8-frame-address signature
+    a HARD multiplicative gate so the family fires ONLY on a genuine 0xffe8 frame
+    STACK0 marker -- killing the if/bool STACK0-byte-0 high-nibble framing-drift.
+
+    Root (spec_k=0, BUILT dims, d_model=1090 / 52-block efficient build;
+    tools/interp_oracle_gate.py id 350 if_gt_0 ``35 > 43``, operand 0x23 =
+    both-nibbles-nonzero; project_if_bool_expr_is_stack0_highnibble_framing_drift).
+    The 255-rule ``l16_stack0_e8_output_authoritative_{byte}`` family (above)
+    reinforces a previously-loaded STACK0 byte so a genuine e8-frame load
+    out-votes the ALU-address fallback. Each rule's silu AND-gate is
+    ``MARK_STACK0 * 1e9 + HAS_SE * 10 + ADDR_B0_LO+8 * 10 + ADDR_B0_HI+14 * 10
+    + ... + OUTPUT_LO+{lo} * 100 + OUTPUT_HI_THIS_STEP+{hi} * 100`` with
+    threshold ``1e9 + 6000``.  Solving the margin: ``sum - threshold ~=
+    100*(OUTPUT_LO+lo + OUTPUT_HI+hi) - 6020`` -- i.e. the rule fires on ANY
+    STACK0 marker whose OUTPUT band carries the byte's nibbles, REGARDLESS of the
+    e8-address signature (its +/-30 contribution is swamped by the OUTPUT terms,
+    and the rule self-reinforces OUTPUT at strength 2000 so the band explodes to
+    ~5e29 in a single forward).
+
+    On an if/bool comparison program (no ENT frame, no local var) the STACK0
+    marker rows are bare stack-tops at 0xfff8 / popped 0xffe0, NOT an e8 frame:
+    ``ADDR_B0_HI+14`` (the 0xE_ high nibble of 0xffe8) is <= 0 at EVERY if/bool
+    STACK0 row (step0 empty = 0.0, step3 GT-result = -2.0) but is ~+8.9 at every
+    genuine e8-frame load (var_simple / func / if_var step6/7/9). The family then
+    mis-fires at the if/bool IMM/CMP rows and makes the leaked AX operand
+    (0x23 -> 0x11 high-nibble drift) authoritative at STACK0 byte 0. Because the
+    decode emits a non-zero STACK0 byte-0 the production fixed-35-token slicer
+    re-anchors on the wrong marker -> the comparison step's next-step PC is
+    misread (all if_gt/if_lt/if_eq/bool_and diverge at the value-correction step
+    0; the gate reports CROSS-STEP value-corruption@step0).
+
+    Fix (see the rule construction below): RESTRUCTURE the family so the e8 frame
+    address is the LOAD-BEARING silu AND-gate and the OUTPUT byte-value match is
+    the MULTIPLICATIVE selector -- so a non-e8 STACK0 row goes truly INERT
+    (silu(up) ~= 0), not negative. (A negative multiplicative gate alone does NOT
+    work: ``silu(up)*gate < 0`` also inverts the ``byte_value_writes`` COMPETITOR
+    penalties, so a leaked 0x23 row's -2000 on the OTHER nibbles becomes a +boost
+    that re-selects 0x23 -- verified zero-sum.)  Concretely: promote
+    ``ADDR_B0_HI+14`` (the 0xE_ high nibble of 0xffe8) to weight 1000 in the silu
+    conditions with the threshold raised +4000, so ``up>0`` iff
+    ``ADDR_B0_HI+14 > 4`` -- true ONLY on a genuine e8 frame (~+8.9), false on
+    EVERY if/bool bare-stack-top / popped row (``<= 0``) -> silu ~= 0 -> the family
+    is inert and the clean 0x00 STACK0 byte-0 default survives. The OUTPUT
+    nibble match moves to ``gate_terms`` so the loaded byte is still the one
+    reinforced at a genuine frame.
+
+    SCOPE (honest): this e8-address gate is byte-identity-safe (off = baseline; on
+    = inert on if/bool, var/func/if_var unchanged) and CORRECTLY e8-scopes THIS
+    family, but it does NOT by itself flip the if/bool framing-drift verdict. The
+    leaked STACK0 byte-0 operand is ALSO sustained by two parallel self-reinforcing
+    families with the identical OUTPUT-swamps-the-gate bug -- the L25 tail bank
+    ``tail_stack0_store_loaded_byte_*`` (l10_ops.py, 255 rules) and the L16
+    ``l16_stack0_e0_marker_from_alu_*`` origin -- so the if/bool fix needs the
+    COORDINATED multi-family tail-bank sweep documented in
+    project_if_bool_expr_is_stack0_highnibble_framing_drift /
+    project_ff_tail_emitter_mega_root_confirmed (width-sensitive). This flag is
+    one validated piece of that sweep, kept default-OFF as a building block.
+
+    DEFAULT-OFF so HEAD is byte-identical (gate_bias stays 1.0, no gate_terms).
+    """
+    return os.environ.get("C4_L16_STACK0_E8_ADDR_GATE", "0") == "1"
+
+
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer16_lev_routing`` op currently owns the entire L16 FFN. Its
@@ -921,20 +986,58 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # rule out of default-zero rows; 0xe8 is excluded because it already
     # agrees with the fallback.
     stack0_e8_output_authoritative_threshold = 1_000_006_000.0
+    # DEFAULT-OFF e8-address gate (C4_L16_STACK0_E8_ADDR_GATE). When ON the
+    # family is RESTRUCTURED so the e8-frame-address signature is the LOAD-BEARING
+    # silu AND-gate and the OUTPUT byte-value match is the MULTIPLICATIVE selector
+    # -- so a non-e8 STACK0 row goes truly INERT (hidden ~= 0), not negative. See
+    # _stack0_e8_authoritative_addr_gate_on. Why not just multiply the existing
+    # rule by a negative gate: flipping silu(up)*gate negative inverts the
+    # ``byte_value_writes`` COMPETITOR terms too, so a leaked 0x23 row's -2000
+    # penalty on the OTHER nibbles becomes a +boost that re-selects 0x23 (verified
+    # zero-sum). The clean fix is to make silu(up) itself ~0 off-frame:
+    #   * conditions (silu AND-gate): MARK_STACK0 base + the e8-address signature
+    #     promoted to a hard requirement (ADDR_B0_HI+14 weight 1000, threshold
+    #     raised by +4000 over the MARK_STACK0 base) so up>0 iff ADDR_B0_HI+14>4
+    #     -- true ONLY on a genuine 0xffe8 frame (~+8.9), false on EVERY if/bool
+    #     bare-stack-top/popped row (ADDR_B0_HI+14 <= 0). OUTPUT terms removed.
+    #   * gate (multiplicative): OUTPUT_LO+{lo} + OUTPUT_HI+{hi} so the byte whose
+    #     nibbles the load relayed into OUTPUT is the one reinforced. gate_bias
+    #     keeps the genuine-frame write strongly positive.
+    _e8_addr_gate = _stack0_e8_authoritative_addr_gate_on()
     for byte in range(1, 256):
         if byte == 0xE8:
             continue
         lo = byte & 0xF
         hi = (byte >> 4) & 0xF
-        rules.append(multi_way_and_rule(
-            name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
-            conditions=stack0_e8_output_authoritative_conditions + (
-                (f"OUTPUT_LO+{lo}", 100.0),
-                (f"OUTPUT_HI_THIS_STEP+{hi}", 100.0),
-            ),
-            threshold=stack0_e8_output_authoritative_threshold,
-            writes=Primitives.byte_value_writes(byte, strength=2000.0),
-        ))
+        if _e8_addr_gate:
+            rules.append(multi_way_and_rule(
+                name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
+                conditions=stack0_e8_output_authoritative_conditions + (
+                    # Promote the e8 high-nibble address to a HARD requirement:
+                    # weight 1000 vs the +4000 threshold bump means up>0 iff
+                    # ADDR_B0_HI+14 > 4 (genuine e8 frame ~+8.9), never on the
+                    # if/bool rows (ADDR_B0_HI+14 <= 0) -> silu ~= 0 -> inert.
+                    ("ADDR_B0_HI+14", 1000.0),
+                ),
+                threshold=stack0_e8_output_authoritative_threshold + 4000.0,
+                # Multiplicative OUTPUT byte-value selector (was a silu condition).
+                gate_terms=(
+                    (f"OUTPUT_LO+{lo}", 100.0),
+                    (f"OUTPUT_HI_THIS_STEP+{hi}", 100.0),
+                ),
+                gate_bias=0.0,
+                writes=Primitives.byte_value_writes(byte, strength=2000.0),
+            ))
+        else:
+            rules.append(multi_way_and_rule(
+                name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
+                conditions=stack0_e8_output_authoritative_conditions + (
+                    (f"OUTPUT_LO+{lo}", 100.0),
+                    (f"OUTPUT_HI_THIS_STEP+{hi}", 100.0),
+                ),
+                threshold=stack0_e8_output_authoritative_threshold,
+                writes=Primitives.byte_value_writes(byte, strength=2000.0),
+            ))
 
     # ENT's frame-save store writes to the newly established BP slot. At that
     # MEM marker a stale ALU_LO+14 lane from frame arithmetic can feed a later
