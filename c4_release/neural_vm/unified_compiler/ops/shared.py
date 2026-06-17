@@ -76,10 +76,11 @@ def mul_w2_thresh_fix_enabled() -> bool:
     operand-gather defect (ALU_HI reads nibble 3 instead of the true high
     nibble) — NOT a threshold issue, NOT fixable here.
 
-    DEFAULT OFF so the flag-off build stays byte-identical to HEAD; opt-in via
-    ``C4_MUL_W2_THRESH_FIX=1``. Only meaningful when ``mul_width2_enabled()``.
+    DEFAULT ON (flipped 2026-06-17 after smoke 51/0 flag-ON + +2 16-bit MUL
+    verified): lowers the wide_mul width=2 firing threshold 19.5->19.0. Opt OUT
+    via ``C4_MUL_W2_THRESH_FIX=0``. Only meaningful when ``mul_width2_enabled()``.
     """
-    return os.environ.get("C4_MUL_W2_THRESH_FIX", "0") != "0"
+    return os.environ.get("C4_MUL_W2_THRESH_FIX", "1") != "0"
 
 
 def div_multibyte_enabled() -> bool:
