@@ -387,7 +387,7 @@ def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
 
     return (
         multi_way_and_rule(
-            name="layer2_initial_pc_bake_cancel_lo",
+            name="embed_pc_bake_cancel_lo",
             conditions=(("HAS_SE", 1.0),),
             threshold=0.5,
             gate=gate_mark_pc,
@@ -396,7 +396,7 @@ def _layer2_initial_pc_bake_cancel_rules(S: float) -> tuple[FFNRule, ...]:
             writes=((f"EMBED_LO+{init_pc_lo}", write_scale),),
         ),
         multi_way_and_rule(
-            name="layer2_initial_pc_bake_cancel_hi",
+            name="embed_pc_bake_cancel_hi",
             conditions=(("HAS_SE", 1.0),),
             threshold=0.5,
             gate=gate_mark_pc,

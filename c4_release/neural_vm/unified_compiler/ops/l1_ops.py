@@ -115,7 +115,7 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     # go dark cleanly). Flag-off => threshold 1.5 => byte-identical to HEAD.
     _stack0_byte0_threshold = 1.0e9 if no_stack0_emit_enabled() else 1.5
     rules.append(multi_way_and_rule(
-        name="l1_stack0_byte0",
+        name="stack0_byte0_flag",
         conditions=(
             (f"L1H4+{BP_I}", 1.0),
             ("IS_BYTE", 1.0),
@@ -147,11 +147,13 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
         for i in range(NM):
             conditions.append((f"{src_base}+{i}", 1.0))
             gate_terms.append((f"{blocker_base}+{i}", -1.0))
-        # Recover the human-readable name (drops the "+0" so the rule
-        # name keeps the legacy ``l1_byte_index_<n>`` form).
+        # Recover the human-readable name (drops the "+0"). Semantic-naming
+        # wave: the rule label is the function-descriptive ``byte_index_<n>_flag``
+        # (was ``l1_byte_index_<n>``); these units compute the positional
+        # BYTE_INDEX_<n> flags read by the L1 FFN consumers.
         out_name = out_dim.split("+", 1)[0].lower()
         rules.append(multi_way_and_rule(
-            name=f"l1_{out_name}",
+            name=f"{out_name}_flag",
             conditions=tuple(conditions),
             threshold=1.5,
             gate_terms=tuple(gate_terms),

@@ -686,12 +686,12 @@ def _layer4_temp_clear_pc_rules(S: float) -> tuple[FFNRule, ...]:
         writes=(),
         gate=None,
         gate_bias=0.0,
-        name="l4_temp_clear_pc_jsr_placeholder",
+        name="temp_clear_pc_jsr_placeholder",
     ))
     # TEMP[1..31] clear: gate=-TEMP[k] at MARK_PC writes 2/S back into TEMP[k].
     for k in range(1, 32):
         rules.append(multi_way_and_rule(
-            name=f"l4_temp_clear_pc_{k}",
+            name=f"temp_clear_pc_{k}",
             conditions=(("MARK_PC", 1.0),),
             threshold=0.5,
             gate=f"TEMP+{k}",

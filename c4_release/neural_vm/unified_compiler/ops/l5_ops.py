@@ -974,7 +974,7 @@ def _opcode_decode_all_step_jsr_rules(S):
         return ()
     return (
         multi_way_and_rule(
-            name="l5_all_step_decode_jsr_temp0_at_pc",
+            name="all_step_decode_jsr_temp0_at_pc",
             conditions=(
                 ("OPCODE_BYTE_LO+3", 1.0),
                 ("OPCODE_BYTE_HI+0", 1.0),
@@ -1015,7 +1015,7 @@ def _opcode_decode_jsr_temp0_blank_rule() -> FFNRule:
         writes=(),
         gate=None,
         gate_bias=0.0,
-        name="l5_opcode_decode_jsr_temp0_blank",
+        name="opcode_decode_jsr_temp0_blank",
     )
 
 
