@@ -818,6 +818,21 @@ def all_core_ops(
         # C4_AX_BYTE1_FULL_WIDTH (flag-off => zero rules => byte-identical).
         # See model_ops.make_ax_byte1_full_width_fill_op.
         make_ax_byte1_full_width_fill_op(),
+        # AX byte-1 HIGH-NIBBLE emission columns (narrow alias-break): a 16-cell
+        # AX_BYTE1_HINIB band + un-aliased HIGH-nibble LM-head columns 16-255
+        # that break the byte-1 mod-16 cap with only +1 head (d_model
+        # 1090->1199, n_heads 10->11) vs the 256-cell FULL_WIDTH's +3 heads.
+        # Phase=1002 (additive, AFTER head_bake). Gated by C4_AX_BYTE1_HINIB
+        # (default-OFF -> band omitted -> byte-identical). See
+        # model_ops.make_ax_byte1_hinib_emission_op.
+        make_ax_byte1_hinib_emission_op(),
+        # AX byte-1 HIGH-NIBBLE band FILL: lights AX_BYTE1_HINIB+hi from the
+        # carried H3 high-nibble one-hot (H3_PREV_STEP+(4+hi)) at the byte-1
+        # predictor row, present on BOTH the fresh IMM and carried persisting-AX
+        # steps -> emits the correct byte1>=16 high nibble on every step.
+        # L25-tail block FFN; gated by C4_AX_BYTE1_HINIB (flag-off => zero rules
+        # => byte-identical). See model_ops.make_ax_byte1_hinib_fill_op.
+        make_ax_byte1_hinib_fill_op(),
         # STACK0 byte-0 DUMP emission columns (Root 2): mirrors the byte-value
         # H1/H3 one-hot columns onto STACK0_B0_DUMP_{H1,H3} so the LM head
         # re-emits the carried STACK0 byte-0 on carried steps. Phase=1002

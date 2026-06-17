@@ -175,3 +175,75 @@ and never fires on MUL/SHL). Making the feature default-ON needs a
 **head-count-stable band packing** (a narrower band, or packing into existing
 free dims without crossing the head-multiple) — a separate width-management
 effort. Until then the feature ships flag-OFF.
+
+---
+
+## NARROW REBUILD (2026-06-17) — `AX_BYTE1_HINIB` 16-cell high-nibble band + carried-step source (`C4_AX_BYTE1_HINIB`)
+
+The 256-cell `C4_AX_BYTE1_FULL_WIDTH` build above was NOT robust on the
+**faithful CPU interpreter** (`tools/interp_oracle_gate.py`, byte-for-byte ==
+neural): with the flag ON, edge_literal still **FAILed at step=1** (the
+persisting-AX EXIT step), not step=0. The "15/15 GPU PASS" was measured on a
+decode path that only checked the fresh IMM step. Two independent gaps in the
+256-cell build: (a) the fill is `OP_IMM`-gated so it fixes ONLY the fresh IMM
+step — on the carried step `return <v>` re-dumps AX, and `OP_IMM=0` there, so the
+high nibble reverts to mod-16; (b) the 256-cell band needs +3 heads (default-ON
+blocker above).
+
+### What the byte-1 emission actually is (corrects the stale H1/H2/H3 story)
+At the BUILT layout the LM head emits the byte-1 token as a **FACTORED nibble
+pair** (probed spec_k=0, `tools/probe_ax_b1_hinib_cpu.py`):
+`head.weight[v, OUTPUT_LO.*.-1+(v&0xF)] = 5.0` (LOW nibble) +
+`head.weight[v, OUTPUT_HI.*.-1+(v>>4)] = 5.0` (HIGH nibble) + a
+`STACK0_B0_DUMP_H3+(hi+4)` carry column. The LOW nibble emits correctly on
+every step (carried via `H{1,2,3}_DUMP_OUT`); the HIGH nibble is the ONLY thing
+lost, because an L14 default rule (`l14_ops.py:1852`,
+`OUTPUT_HI_THIS_STEP+0=+50, +{nonzero}=-5000/S`) FORCES the byte-1 high nibble to
+zero → every byte1≥16 collapses to `byte1 & 0x0F`.
+
+### The narrow fix (two coordinated halves, both flag-gated default-OFF)
+Only a **16-cell** high-nibble emission axis is needed, not a 256-cell value
+band → d_model 1090→**1199**, n_heads 10→**11** (+1 head, not +3).
+1. **Emission** (`make_ax_byte1_hinib_emission_op`): for v=16..255, add
+   `head.weight[v, AX_BYTE1_HINIB+(v>>4)] = 5.0` (the un-aliased high nibble)
+   AND a MIRROR of the carried LOW-nibble DUMP cell that token `v&0xF` already
+   reads (`_ax_byte1_lo_dump_cell`: H1/H2/H3_DUMP_OUT). The low-nibble mirror is
+   load-bearing — without it, on a carried step the within-high-nibble-group
+   low-nibble tie-break falls back to the unreliable fresh `OUTPUT_LO` band and
+   a same-high-nibble neighbour (e.g. 0x20 vs 0x25) wins.
+2. **Fill** (`make_ax_byte1_hinib_fill_op`, L25 tail after the tail correctors):
+   lights `AX_BYTE1_HINIB+hi` from a value-faithful high-nibble SOURCE present on
+   BOTH steps — `H3_PREV_STEP+(4+hi)` (the existing AX byte-1 carry head's H3
+   band, which already transports the byte-value H3 high-nibble one-hot
+   cross-step; am==4+hi, v~12 on step0 AND step1). The carried-step source is
+   exactly what the `OP_IMM`-gated 256-cell fill missed.
+
+### The fill's row gate (THREE discriminators — the carry broadcasts widely)
+`H3_PREV_STEP+(4+hi)` is broadcast by the carry head to the byte-1 row of EVERY
+register (PC/SP/BP/STACK0) AND to byte2/3 of AX. A naive source-only gate
+corrupts all of them (observed: byte2→0x10, PC byte-1→0x10 breaking the EXIT
+PC). The gate needs all three:
+  * `BYTE_INDEX_0+0` as the **multiplicative SwiGLU gate** (byte-1-only: ~1 at
+    byte1, ~0 at byte2/3) — must be multiplicative, an additive byte-index term
+    is swamped by the source's ~12 magnitude;
+  * `SE_REG_AX_PRESENT` (additive, weight 4) as the **AX-register discriminator**
+    (~4 at AX byte rows, ~1.48 SP, ~0.54 BP, ~0 PC);
+  * the `H3_PREV_STEP+(4+hi)` source cell (additive) as the **value selector**.
+  Threshold 24 passes AX-with-matching-hi and sinks PC/SP/BP and the hi-mismatch.
+The HINIB write (`C4_AX_B1_HINIB_WRITE`, default 6 → HINIB cell ~6.9k →
+contribution ~34k) is big enough to beat the L14 `-5000/S` OUTPUT_HI zero-default
+yet small enough that the ~5-logit OUTPUT_LO low-nibble resolution survives.
+
+### Gates (CPU-only, deferred-verify; parent runs the GPU verdict)
+- edge_literal 1031-1045 (`tools/interp_oracle_gate.py`, faithful CPU):
+  **2 PASS / 10 FAIL → 11 PASS / 0 FAIL** (the rest CROSS-STEP, the gate's
+  conservative autoregressive deferral — `tools/probe_edge_fulltrace_cpu.py`
+  decodes their per-step (PC,AX) and confirms **13/13 full_trace PASS**).
+- Source range: H3_PREV_STEP reaches hi 1..2 (cells 5,6), covering edge_literal
+  (byte1 max 0x26). Higher high nibbles (value≥0x3000) need a wider source carry
+  (deferred); the columns/band already cover all 16 high nibbles.
+- byte-identity flag-OFF: **whole-model state_dict SHA256 IDENTICAL** to pristine
+  HEAD (`dfb7405495001aed…`, verified via a throwaway HEAD worktree). Flag-off
+  omits the band (d_model 1090, n_heads 10) and bakes zero columns/rules.
+- Default-OFF (`C4_AX_BYTE1_HINIB` opt-in). Probes: `tools/probe_ax_b1_hinib_cpu.py`,
+  `tools/probe_b1_hinib_carry_source.py`, `tools/probe_edge_fulltrace_cpu.py`.

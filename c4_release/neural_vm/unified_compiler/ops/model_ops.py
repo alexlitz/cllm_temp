@@ -10,6 +10,7 @@ from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
 from .shared import _as_setdim_proxy
+from .residual_band_registry import register_residual_band
 
 
 _IO_PUTCHAR_ROUTING_START_UNIT = 1500
@@ -2352,6 +2353,303 @@ def make_ax_byte1_full_width_fill_op() -> Operation:
     writes = set(bundle.dump_writes) if _emission_on else set()
     return Operation(
         name="ax_byte1_full_width_fill",
+        reads=reads,
+        writes=writes,
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=_bake,
+        compiler_ir_factory=_ir_factory,
+        declarative_authority="spec_generated",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md",
+    )
+
+
+# ---------------------------------------------------------------------------
+# AX byte-1 HIGH-NIBBLE band (narrow, head-count-friendly alias-break)
+# ---------------------------------------------------------------------------
+#
+# The 256-cell ``AX_BYTE1_FULL_WIDE`` build (above) breaks the mod-16 byte-1
+# emission alias by giving every value 16..255 its own band cell + LM-head
+# column. But the 256-cell band pushes d_model 1090->1417 (n_heads 10->13),
+# which perturbs the width-sensitive L10/L25 tail ops -> can't ship default-ON
+# (docs/EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md "Remaining blocker").
+#
+# This op is the NARROW alternative: the LM head already emits the byte-1 token
+# as a FACTORED nibble pair -- ``head.weight[v, OUTPUT_LO.*.-1 + (v&0xF)] = 5.0``
+# (LOW nibble) + ``head.weight[v, OUTPUT_HI.*.-1 + (v>>4)] = 5.0`` (HIGH nibble),
+# verified spec_k=0 at the BUILT layout. The LOW nibble is correct on every step
+# (byte1<16 emits fine). The HIGH nibble is the only thing lost: an L14 default
+# rule (l14_ops.py:1852, ``OUTPUT_HI_THIS_STEP+0=+50, +{nonzero}=-5000``) forces
+# the byte-1 HIGH nibble to ZERO -> every byte1>=16 collapses to ``byte1 & 0x0F``.
+#
+# So we only need a 16-CELL high-nibble emission axis (one cell per high nibble
+# 1..15), NOT a 256-cell full-value band -> d_model 1090->1199 (n_heads 10->11,
+# +1 head not +3). The fill reads a value-faithful high-nibble SOURCE that is
+# present on BOTH the fresh IMM step AND the carried (persisting-AX) step:
+# ``H3_PREV_STEP+(4+hi)`` (the existing AX byte-1 carry head's H3 band, which
+# already transports the byte-value H3 high-nibble one-hot cross-step -- probed
+# spec_k=0: am == 4+hi, v~12, on step0 AND step1, present ONLY at the byte-1
+# predictor row). The carried-step source is what the 256-cell ``OP_IMM``-gated
+# fill MISSED (it fixed only the fresh IMM step; the faithful gate showed
+# edge_literal still failing at step=1). This unified source fixes both.
+#
+# Default-OFF (``C4_AX_BYTE1_HINIB`` opt-in): flag-off omits the band (smaller
+# d_model) + bakes zero columns / zero rules -> byte-identical to the pre-feature
+# build (the legacy emission already covers byte1<16; this only ADDS byte1>=16).
+def _ax_byte1_hinib_enabled() -> bool:
+    import os as _os
+    return _os.environ.get("C4_AX_BYTE1_HINIB", "0") != "0"
+
+
+_AX_BYTE1_HINIB_BAND = "AX_BYTE1_HINIB"
+_AX_BYTE1_HINIB_WIDTH = 16            # one cell per high nibble 0..15
+_AX_BYTE1_HINIB_HEAD_SCALE = 5.0     # mirror the OUTPUT_HI +5.0 emission column
+# Highest high nibble the H3_PREV_STEP source faithfully reaches: the H3 band is
+# 7 cells and the high-nibble one-hot sits at H3_PREV_STEP+(4+hi), so hi in
+# 1..2 (cells 5,6) is in-band. hi=0 needs no fix (byte1<16 already emits via the
+# unchanged LOW-nibble path), and the cap stays low so the source never reads a
+# neighbouring band's cell. edge_literal byte1 max = 0x26 (hi=2) -> covered.
+_AX_BYTE1_HINIB_SRC_MAX_HI = 2
+_AX_BYTE1_HINIB_SRC_BAND = "H3_PREV_STEP"
+_AX_BYTE1_HINIB_SRC_OFFSET = 4       # high-nibble one-hot at H3_PREV_STEP+(4+hi)
+# Row gate (the AX byte-1 predictor row ONLY). THREE discriminators, because the
+# H3_PREV_STEP carry broadcasts the AX high nibble to the byte-1 row of EVERY
+# register (PC/SP/BP/STACK0) and to byte2/3 of the AX register (probed spec_k=0)
+# -- a fill gated only on the source corrupts all of them (observed: PC byte-1
+# -> 0x10/0x20, breaking the EXIT PC).
+#   1. BYTE_INDEX_0+0 (multiplicative SwiGLU gate): =~1 at byte1, =~0 at
+#      byte2/3 (advances to cell 1/2) -> floors byte2/3 to a zero write
+#      REGARDLESS of source magnitude (an additive byte-index term is useless --
+#      the source's ~12 magnitude alone blows past any additive threshold).
+#   2. SE_REG_AX_PRESENT (additive, the AX-REGISTER discriminator): ~4.0 at AX
+#      byte rows, ~1.48 at SP, ~0.54 at BP, ~0.0 at PC -> a high weight + high
+#      threshold passes AX but sinks PC/SP/BP byte-1.
+#   3. the H3_PREV_STEP+(4+hi) source cell (additive, the VALUE selector): picks
+#      WHICH high-nibble cell to fill and forces the rule off when AX's high
+#      nibble != hi (so the AX byte-1 row fires the RIGHT cell, not a stale one).
+# Plus IS_BYTE (excludes the byte0 marker row) and a hard NOT-marker blocker.
+_AX_B1_HINIB_SRC_W = 1.0
+_AX_B1_HINIB_ISBYTE_W = 1.0
+_AX_B1_HINIB_AXPRESENT_W = 4.0       # SE_REG_AX_PRESENT (AX~4 vs SP~1.48/BP~.54)
+_AX_B1_HINIB_BYTEIDX_GATE = "BYTE_INDEX_0+0"   # multiplicative row selector
+_AX_B1_HINIB_MARKER_BLOCK = 1000.0
+# AND threshold. Reachable sums (BYTE_INDEX_0+0 ~1 multiplies the silu output):
+#   AX byte1, hi MATCH:    src~12 + AXP 4*4=16 + IS_BYTE 1   = ~29   -> CLEAR
+#   AX byte1, hi MISMATCH: src~0  + 16          + 1          = ~17   -> sink
+#   SP byte1, hi match:    src~12 + AXP 1.48*4=5.9 + 1       = ~18.9 -> sink
+#   PC byte1:              src~12 + AXP 0*4=0   + 1          = ~13   -> sink
+# Threshold 24 sits above the SP/PC/mismatch ceilings and below the AX-match sum.
+_AX_B1_HINIB_THRESHOLD = 24.0
+# H3_PREV_STEP+(4+hi) cell value is ~12 on the byte-1 row (one-hot * carry
+# magnitude). Threshold sits above "row gate alone" (IS_BYTE + BYTE_INDEX_0,
+# weights 1+1=2) and below "row gate + source cell" so the AND requires the
+# source. The source's large native magnitude (~12) is folded via the source
+# weight; we keep weights ~1 and set the threshold between gate-only and
+# gate+source. The HINIB write must be BIG ENOUGH to overcome the L14 OUTPUT_HI
+# zero-default (-5000/S -> residual ~-1700..-8500 on the wrong-token
+# competition) yet SMALL ENOUGH that the ~5-logit OUTPUT_LO low-nibble emission
+# still resolves WHICH token within the high-nibble group wins (a write that is
+# too large saturates every same-high-nibble token to the same fp logit and the
+# low nibble stops deciding). The HINIB->logit gain is head_scale(5) * residual;
+# write_scale ~6 gives a HINIB cell ~6.9k -> contribution ~34k (clears -8500
+# with margin) while leaving the OUTPUT_LO ~5-logit resolution intact at that
+# magnitude. Configurable via C4_AX_B1_HINIB_WRITE for CPU tuning.
+import os as _os_hinib
+_AX_B1_HINIB_WRITE_SCALE = float(
+    _os_hinib.environ.get("C4_AX_B1_HINIB_WRITE", "6.0")
+)
+
+register_residual_band(
+    _AX_BYTE1_HINIB_BAND, _AX_BYTE1_HINIB_WIDTH,
+    owner="make_ax_byte1_hinib_emission_op",
+    flag=_ax_byte1_hinib_enabled, never_share=True,
+)
+
+
+def _ax_byte1_lo_dump_cell(lo: int) -> str:
+    """The carried-step LOW-nibble DUMP cell the LM head reads for nibble ``lo``.
+
+    Mirrors the legacy byte-value emission's H-band DUMP layout (probed
+    spec_k=0): lo 0..4 -> ``H1_DUMP_OUT+(lo+2)``, lo 5..11 -> ``H2_DUMP_OUT+
+    (lo-5)``, lo 12..15 -> ``H3_DUMP_OUT+(lo-12)``. This is the band the
+    existing AX byte-1 carry re-supplies on the carried step, so a value 0..15
+    emits its low nibble correctly when AX persists. Byte tokens >= 16 do NOT
+    read these cells natively (the carry only feeds tokens 0..15), so the
+    full-byte fix must MIRROR this low-nibble column onto token v's high-nibble
+    sibling — otherwise on a carried step the low-nibble tie-break inside a
+    high-nibble group falls back to the (unreliable) fresh ``OUTPUT_LO`` band.
+    """
+    if lo <= 4:
+        return f"H1_DUMP_OUT+{lo + 2}"
+    if lo <= 11:
+        return f"H2_DUMP_OUT+{lo - 5}"
+    return f"H3_DUMP_OUT+{lo - 12}"
+
+
+def _ax_byte1_hinib_head_rules(vocab_size: int) -> tuple:
+    """For v in 16..255: HIGH-nibble column + a MIRROR of the carried LOW-nibble.
+
+    Two additive emission columns per byte value 16..255:
+      * ``AX_BYTE1_HINIB+(v>>4)`` — the un-aliased HIGH-nibble axis (the new
+        narrow band the fill lights on the byte-1 row).
+      * the carried LOW-nibble DUMP cell that token ``v & 0xF`` already reads
+        (``_ax_byte1_lo_dump_cell``) — so token v gets the SAME carried
+        low-nibble support its 0..15 sibling gets. Without this, on a carried
+        step the low-nibble tie-break inside the v's high-nibble group is left
+        to the unreliable fresh ``OUTPUT_LO`` band and a same-high-nibble
+        neighbour (e.g. 0x20 vs 0x25) can win.
+
+    Values 0..15 (hi=0) get NO column, so byte1<16 stays byte-identical. With
+    the flag OFF this returns nothing (the band/columns are omitted).
+    """
+    rules: list[TokenEmbeddingRule] = []
+    top = min(255, int(vocab_size) - 1)
+    for v in range(16, top + 1):
+        hi = (v >> 4) & 0xF
+        lo = v & 0xF
+        writes = (
+            (f"{_AX_BYTE1_HINIB_BAND}+{hi}", _AX_BYTE1_HINIB_HEAD_SCALE),
+            (_ax_byte1_lo_dump_cell(lo), _AX_BYTE1_HINIB_HEAD_SCALE),
+        )
+        rules.append(TokenEmbeddingRule.head_weight_write(
+            token_ids=[v],
+            writes=writes,
+            name=f"ax_byte1_hinib_head_token_{v}",
+        ))
+    return tuple(rules)
+
+
+def make_ax_byte1_hinib_emission_op() -> Operation:
+    """Add the narrow ``AX_BYTE1_HINIB`` byte-1 HIGH-nibble emission columns.
+
+    16-cell high-nibble alias-break (head-count-friendly: d_model 1090->1199,
+    n_heads 10->11). Phase=1002 (additive, AFTER head_bake). Gated by
+    ``C4_AX_BYTE1_HINIB`` (default-OFF -> band omitted -> byte-identical).
+    """
+    _emission_on = _ax_byte1_hinib_enabled()
+
+    def _bake(model, dim_positions, S):
+        del S
+        if not _emission_on:
+            return
+        from ...vm_step import Token
+        ir = CompilerIR()
+        ir.embeddings.extend(_ax_byte1_hinib_head_rules(Token.VOCAB_SIZE))
+        ir.lower_token_embeddings(model, dim_positions)
+
+    def _ir_factory(dim_positions, HD):
+        del HD, dim_positions
+        from ...vm_step import Token
+        ir = CompilerIR()
+        if _emission_on:
+            ir.embeddings.extend(_ax_byte1_hinib_head_rules(Token.VOCAB_SIZE))
+        return ir
+
+    return Operation(
+        name="ax_byte1_hinib_emission",
+        reads=set(),
+        writes=set(),
+        audited_empty_produces=True,
+        kind="model",
+        declarative_bake_fn=_bake,
+        compiler_ir_factory=_ir_factory,
+        phase=1002,
+        declarative_authority="declarative",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="EDGE_LITERAL_BYTE1_HIGH_NIBBLE_WALL_2026_06_15.md",
+    )
+
+
+def _ax_byte1_hinib_fill_rules() -> tuple[FFNRule, ...]:
+    """Fill ``AX_BYTE1_HINIB+hi`` from ``H3_PREV_STEP+(4+hi)`` on the byte-1 row.
+
+    For each high nibble hi in 1.._AX_BYTE1_HINIB_SRC_MAX_HI: AND the source
+    cell (the value selector) with the byte-1 row gate (IS_BYTE + BYTE_INDEX_0+0
+    + NOT-marker) and write the matching high-nibble band cell. The source is
+    present on BOTH the fresh IMM step and the carried persisting-AX step, so the
+    byte-1 high nibble emits correctly on every step (unlike the OP_IMM-gated
+    256-cell fill, which only fixed the fresh step).
+    """
+    if not _ax_byte1_hinib_enabled():
+        return ()
+    marker_blockers = (
+        ("MARK_AX", -_AX_B1_HINIB_MARKER_BLOCK),
+        ("MARK_PC", -_AX_B1_HINIB_MARKER_BLOCK),
+        ("MARK_SP", -_AX_B1_HINIB_MARKER_BLOCK),
+        ("MARK_BP", -_AX_B1_HINIB_MARKER_BLOCK),
+        ("MARK_STACK0", -_AX_B1_HINIB_MARKER_BLOCK),
+        ("MARK_MEM", -_AX_B1_HINIB_MARKER_BLOCK),
+        ("MARK_SE", -_AX_B1_HINIB_MARKER_BLOCK),
+    )
+    rules: list[FFNRule] = []
+    for hi in range(1, _AX_BYTE1_HINIB_SRC_MAX_HI + 1):
+        src_cell = f"{_AX_BYTE1_HINIB_SRC_BAND}+{_AX_BYTE1_HINIB_SRC_OFFSET + hi}"
+        conditions = (
+            (src_cell, _AX_B1_HINIB_SRC_W),
+            ("SE_REG_AX_PRESENT", _AX_B1_HINIB_AXPRESENT_W),
+            ("IS_BYTE", _AX_B1_HINIB_ISBYTE_W),
+        ) + marker_blockers
+        # Additive AND over source (value selector) + SE_REG_AX_PRESENT (AX-reg
+        # discriminator) + IS_BYTE, MULTIPLICATIVELY gated on BYTE_INDEX_0+0
+        # (byte-1-only). Requires BOTH the source AND the AX-register signal, so
+        # it fires ONLY at the AX byte-1 row with the matching high nibble.
+        rules.append(multi_way_and_rule(
+            name=f"ax_byte1_hinib_fill_hi{hi}",
+            conditions=conditions,
+            threshold=_AX_B1_HINIB_THRESHOLD,
+            gate=_AX_B1_HINIB_BYTEIDX_GATE,
+            writes=((f"{_AX_BYTE1_HINIB_BAND}+{hi}", _AX_B1_HINIB_WRITE_SCALE),),
+        ))
+    return tuple(rules)
+
+
+def make_ax_byte1_hinib_fill_op() -> Operation:
+    """Fill ``AX_BYTE1_HINIB`` from the carried H3 high-nibble one-hot (FFN).
+
+    The VALUE half of the narrow edge_literal fix: an L25-tail FFN whose rules
+    light ``AX_BYTE1_HINIB+hi`` from ``H3_PREV_STEP+(4+hi)`` at the byte-1 row,
+    so the un-aliased HINIB LM-head column emits the correct high nibble on both
+    the fresh and carried steps. Gated by ``C4_AX_BYTE1_HINIB`` (flag-off => no
+    band collected + zero rules => byte-identical).
+    """
+    _emission_on = _ax_byte1_hinib_enabled()
+
+    def _bake(block, dim_positions, S):
+        rules = _ax_byte1_hinib_fill_rules()
+        if not rules:
+            return
+        from ...base_layers import PureFFN
+        d_model = block.ffn.W_up.shape[1] if hasattr(block, "ffn") else None
+        if d_model is None:
+            d_model = max(int(v) for v in dim_positions.values()) + 1
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {
+            nm: int(dim_positions[nm.split("+", 1)[0]])
+            + (int(nm.split("+", 1)[1]) if "+" in nm else 0)
+            for nm in Primitives.ffn_rule_dim_names(rules)
+        }
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    def _ir_factory(dim_positions, HD):
+        del HD, dim_positions
+        ir = CompilerIR()
+        ir.layer(0).ffn.rules.extend(_ax_byte1_hinib_fill_rules())
+        return ir
+
+    reads = (
+        {_AX_BYTE1_HINIB_SRC_BAND, "SE_REG_AX_PRESENT", "IS_BYTE",
+         "BYTE_INDEX_0", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP",
+         "MARK_STACK0", "MARK_MEM", "MARK_SE"}
+        if _emission_on else set()
+    )
+    writes = {_AX_BYTE1_HINIB_BAND} if _emission_on else set()
+    return Operation(
+        name="ax_byte1_hinib_fill",
         reads=reads,
         writes=writes,
         kind="block",
