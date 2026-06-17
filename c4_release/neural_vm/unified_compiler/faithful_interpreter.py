@@ -656,6 +656,95 @@ def run_faithful_blocks(
 
 
 # ---------------------------------------------------------------------------
+# Cached faithful forward (for the autoregressive decoder).
+#
+# ``run_faithful_blocks`` recovers the head specs + densifies the FFN weights on
+# EVERY call. In an autoregressive decode (one forward per generated token, over
+# a growing tape) that per-call recovery dominates — it makes the faithful
+# forward ~15x slower than the real ``model.forward`` on CPU. The math does not
+# depend on the tape, so :class:`CachedFaithfulForward` does the recovery ONCE
+# (at construction) and each :meth:`forward` only runs the attention + FFN
+# matmuls. The per-forward math is term-for-term identical to
+# ``run_faithful_blocks`` (same softmax1+ALiBi attention, same SwiGLU, same head)
+# so the argmax decode is byte-identical — only faster.
+# ---------------------------------------------------------------------------
+
+
+class CachedFaithfulForward:
+    """Faithful per-token forward with the per-block recovery cached.
+
+    Construct once from a baked model; call :meth:`forward(tape)` per autoregressive
+    step. Byte-identical to :func:`run_faithful_blocks` (validated) but skips the
+    per-call dense spec recovery, so it is suitable for the long autoregressive
+    decode (one forward per token over a growing tape).
+    """
+
+    def __init__(self, model, *, use_softmax1: Optional[bool] = None):
+        self.model = model
+        self.d_model = int(model.d_model)
+        self.device = next(model.parameters()).device
+        self.dtype = model.head.weight.dtype
+        # Precompute per-block: recovered head specs (kept as the spec objects;
+        # the inner ``_faithful_attn_block`` reads their q/k/v/o write lists),
+        # the block's head_dim + softmax1 flag, and — for IR-executable FFN —
+        # the densified W_up/W_gate/W_down + biases. ALU composites keep the
+        # real ``block.ffn`` callable (executed unchanged).
+        self._blocks: List[dict] = []
+        for block in model.blocks:
+            attn = block.attn
+            heads = _recover_attn_head_specs(attn, self.d_model)
+            entry: dict = {
+                "heads": heads,
+                "head_dim": attn.head_dim,
+                "use_softmax1": (
+                    bool(use_softmax1) if use_softmax1 is not None
+                    else getattr(attn, "use_softmax1", True)
+                ),
+            }
+            ffn = block.ffn
+            ffn_name = type(ffn).__name__
+            if ffn_name in COMPOSITE_ALU_FFN:
+                entry["alu"] = True
+                entry["ffn"] = ffn
+            else:
+                entry["alu"] = False
+                W_up = (ffn.W_up.data.to_dense() if ffn.W_up.is_sparse else ffn.W_up.data)
+                W_gate = (ffn.W_gate.data.to_dense() if ffn.W_gate.is_sparse else ffn.W_gate.data)
+                W_down = (ffn.W_down.data.to_dense() if ffn.W_down.is_sparse else ffn.W_down.data)
+                entry["W_up"] = W_up.contiguous()
+                entry["W_gate"] = W_gate.contiguous()
+                entry["W_down"] = W_down.contiguous()
+                entry["b_up"] = ffn.b_up
+                entry["b_gate"] = ffn.b_gate
+            self._blocks.append(entry)
+        self._head_w = model.head.weight.t().contiguous()
+        self._head_b = model.head.bias
+
+    @torch.no_grad()
+    def forward(self, tape: Sequence[int], *, return_logits: bool = True) -> torch.Tensor:
+        """Return ``[S, vocab]`` logits (or ``[S, d_model]`` residual).
+
+        Identical math to :func:`run_faithful_blocks` with cached recovery.
+        """
+        token_ids = torch.tensor([list(tape)], dtype=torch.long, device=self.device)
+        x = self.model.embed(token_ids)[0]  # [S, D]
+        for entry in self._blocks:
+            x = _faithful_attn_block(
+                entry["heads"], x, entry["head_dim"], entry["use_softmax1"],
+            )
+            if entry["alu"]:
+                x = entry["ffn"](x.unsqueeze(0))[0]
+            else:
+                up = x @ entry["W_up"].t() + entry["b_up"]
+                gate = x @ entry["W_gate"].t() + entry["b_gate"]
+                hidden = torch.nn.functional.silu(up) * gate
+                x = x + hidden @ entry["W_down"].t()
+        if return_logits:
+            return x @ self._head_w + self._head_b
+        return x
+
+
+# ---------------------------------------------------------------------------
 # Convenience: token decode helpers (step-tape register readout).
 # ---------------------------------------------------------------------------
 
@@ -688,6 +777,7 @@ __all__ = [
     "extract_op_ir",
     "op_is_ir_executable",
     "run_faithful_blocks",
+    "CachedFaithfulForward",
     "COMPOSITE_ALU_FFN",
     "step_token_positions",
     "STEP_TOKENS",
