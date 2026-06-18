@@ -1673,7 +1673,7 @@ def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:
     base = (
         step_function_rule(
             name="ax_byte1_carry_overflow_flag",
-            input_dim="AX_CARRY_HI+2",
+            input_dim=dim_ref("ax_carry_hi", "AX", 2),
             # threshold target-0.5 convention: fire when the raw value is at or
             # above 3.0 (carry rows ~<=1.31 stay dark; SHL ~6.41 / JMP ~23.93
             # fire). write_value 2.0 -> the dump reads it with weight -1000, so
