@@ -11,7 +11,7 @@ FINDINGS (2026-06-10, spec_k=0 ground truth):
     block 11 == logical L10; the relay binds to ``layer9_marker_suppress``
     so it fires one physical attn BEFORE the L10 FFN that reads SE_*). It is
     NOT at physical block 10. Set L9_BLOCK=11 (the default here).
-  * On that attn the relay resolves to head slots 3/4 (via ``_l9_head_idx``),
+  * On that attn the relay resolves to head slots 3/4 (via ``_alu_head_idx``),
     which COLLIDE with the L10 byte-passthrough heads. ``alu_ops.py``'s
     ``make_layer10_residual_alibi_slopes_op`` (phase 999+) overwrites
     ``alibi_slopes[3]=0.5`` / ``[4]=1.0`` AFTER the relay's phase-9.3

@@ -63,10 +63,10 @@ Wave B row #7 — ``_layer9_cmp_rules`` (hi_eq, lo_eq, lo_lt):
   test_l9_cmp_lo_eq_at_step_end
   test_l9_cmp_lo_lt_at_step_end
 
-Wave B row #8 — ``_layer9_add_hi_nibble_rules``:
+Wave B row #8 — ``_add_hi_nibble_rules``:
   test_l9_add_hi_nibble_at_step_end
 
-Wave B row #9 — ``_layer9_sub_hi_nibble_rules``:
+Wave B row #9 — ``_sub_hi_nibble_rules``:
   test_l9_sub_hi_nibble_at_step_end
 
 Whole file targets <2s runtime; module-scope fixture caches the nine
@@ -87,9 +87,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.base_layers import PureFFN  # noqa: E402
 from neural_vm.unified_compiler.ops.l9_ops import (  # noqa: E402
-    _layer9_add_hi_nibble_rules,
+    _add_hi_nibble_rules,
     _layer9_cmp_rules,
-    _layer9_sub_hi_nibble_rules,
+    _sub_hi_nibble_rules,
 )
 from neural_vm.unified_compiler.ops.l10_ops import (  # noqa: E402
     _l10_comparison_combine_rules,
@@ -131,8 +131,8 @@ def _build_ffn(rules) -> PureFFN:
 def ffns() -> dict:
     """Module-scoped FFN cache: nine FFNs are baked once per session."""
     return {
-        "l9_add_hi": _build_ffn(_layer9_add_hi_nibble_rules(S)),
-        "l9_sub_hi": _build_ffn(_layer9_sub_hi_nibble_rules(S)),
+        "l9_add_hi": _build_ffn(_add_hi_nibble_rules(S)),
+        "l9_sub_hi": _build_ffn(_sub_hi_nibble_rules(S)),
         "l9_cmp": _build_ffn(_layer9_cmp_rules(S)),
         "l10_or": _build_ffn(_layer10_alu_bitwise_or_rules(S)),
         "l10_and": _build_ffn(_layer10_alu_bitwise_and_rules(S)),
@@ -491,7 +491,7 @@ def test_l9_cmp_lo_lt_at_step_end(ffns):
 
 
 # ======================================================================
-# Wave B row #8 — _layer9_add_hi_nibble_rules (1 test)
+# Wave B row #8 — _add_hi_nibble_rules (1 test)
 # ======================================================================
 
 
@@ -499,7 +499,7 @@ def test_l9_cmp_lo_lt_at_step_end(ffns):
 def test_l9_add_hi_nibble_at_step_end(ffns):
     """L9 ADD hi nibble at STEP_END: 0x53 + 0x42, hi result = 5+4 = 9.
 
-    Wave B #8. ``_layer9_add_hi_nibble_rules`` migrated to MARK_SE_ONLY.
+    Wave B #8. ``_add_hi_nibble_rules`` migrated to MARK_SE_ONLY.
     With a=0x53 (hi=5), b=0x42 (hi=4), and carry=0, the hi-nibble add
     unit ``l9_add_hi_c0_a5_b4`` should fire and write OUTPUT_HI+9.
     """
@@ -516,7 +516,7 @@ def test_l9_add_hi_nibble_at_step_end(ffns):
 
 
 # ======================================================================
-# Wave B row #9 — _layer9_sub_hi_nibble_rules (1 test)
+# Wave B row #9 — _sub_hi_nibble_rules (1 test)
 # ======================================================================
 
 

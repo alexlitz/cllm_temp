@@ -17,7 +17,7 @@ from .shared import (  # noqa: F401
 # broadcasts from MARK_AX into MARK_SE_ONLY for the L9 CMP factory.
 # After the relay the CMP factory's MARK_AX-gated rules can fire one
 # row later (at STEP_END) byte-identically.
-_L9_CMP_RELAYED: tuple[str, ...] = (
+_CMP_RELAYED: tuple[str, ...] = (
     "CMP",
     "ALU_LO", "ALU_HI",
     "AX_CARRY_LO", "AX_CARRY_HI",
@@ -28,7 +28,7 @@ _L9_CMP_RELAYED: tuple[str, ...] = (
 # MARK_AX). Wave A relays the LEV opcode flag and the address-byte
 # carriers into MARK_SE_ONLY; the helper extension swaps MARK_PC for
 # MARK_SE_ONLY when called with from_marker="MARK_PC".
-_L9_BP_PLUS8_RELAYED: tuple[str, ...] = (
+_BP_PLUS8_RELAYED: tuple[str, ...] = (
     "BP_FRAME_BYTE0", "BP_FRAME_BYTE1",
     "OP_ENT", "OP_LEV",
 )
@@ -64,7 +64,7 @@ _L9_BP_PLUS8_RELAYED: tuple[str, ...] = (
 # pre-dates the allocator and is not modeled here; the allocator
 # forbids head aliasing, so the convo-I/O head stays outside this
 # layout until a follow-up reconciles the two ops onto distinct slots.
-_L9_HEAD_LAYOUT = (
+_ALU_HEAD_LAYOUT = (
     # (op-name key,)  -- no pinned head_idx; allocator first-fits in
     # declaration order, landing at 0 / 1 / 2 / 3 byte-identically
     # (Phase 8.B retry attn pin drop).
@@ -83,7 +83,7 @@ _L9_HEAD_LAYOUT = (
 )
 
 
-def _allocate_layer9_attention_heads() -> AttentionHeadAllocator:
+def _allocate_alu_attention_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` for L9 heads.
 
     Phase 8.B retry auto-fit: the allocator is built in
@@ -96,16 +96,16 @@ def _allocate_layer9_attention_heads() -> AttentionHeadAllocator:
     future allocator reshuffle.
     """
     allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
-    for (name,) in _L9_HEAD_LAYOUT:
+    for (name,) in _ALU_HEAD_LAYOUT:
         allocator.alloc(name, layer_idx=9)
     return allocator
 
 
-def _l9_head_idx(op_name: str) -> int:
+def _alu_head_idx(op_name: str) -> int:
     """Return the L9 ``head_idx`` for ``op_name`` under the current
     layout / allocator strategy.
 
-    Replays :func:`_allocate_layer9_attention_heads` (cheap; the L9
+    Replays :func:`_allocate_alu_attention_heads` (cheap; the L9
     pool has 3 declared heads) and returns the named head's resolved
     ``head_idx``. The static-lookup contract held before the pin drop,
     but with ``dynamic_first_fit`` the layout decision is "compute the
@@ -114,11 +114,11 @@ def _l9_head_idx(op_name: str) -> int:
     through multiple call sites should pass the allocator instance
     directly rather than re-replaying for every lookup.
     """
-    allocator = _allocate_layer9_attention_heads()
+    allocator = _allocate_alu_attention_heads()
     for rec in allocator.heads():
         if rec.op_name == op_name:
             return rec.head_idx
-    raise KeyError(f"_l9_head_idx: unknown L9 attention op {op_name!r}")
+    raise KeyError(f"_alu_head_idx: unknown L9 attention op {op_name!r}")
 
 
 # === L9 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
@@ -168,7 +168,7 @@ _L9_ALU_UNIT_LAYOUT = (
 )
 
 
-def _allocate_layer9_alu_units() -> FFNUnitAllocator:
+def _allocate_alu_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L9 ALU sub-stages.
 
     Phase 7.B.4: ``pin=`` is dropped from every entry in
@@ -216,7 +216,7 @@ def _allocate_layer9_alu_units() -> FFNUnitAllocator:
 # Markers the LEA/ADJ/ENT high-nibble units block when the AX-marker
 # amplification is high. Mirrors ``_block_non_ax_marker_sites`` inside
 # :func:`vm_step._set_layer9_alu`.
-_L9_NON_AX_BLOCKERS: tuple[str, ...] = (
+_NON_AX_BLOCKERS: tuple[str, ...] = (
     "MARK_PC",
     "MARK_SP",
     "MARK_BP",
@@ -227,7 +227,7 @@ _L9_NON_AX_BLOCKERS: tuple[str, ...] = (
 )
 
 
-def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+def _add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """ADD hi-nibble cross-product (512 units).
 
     Mirrors the first loop in :func:`vm_step._set_layer9_alu` -- 4-way
@@ -290,7 +290,7 @@ def _layer9_add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+def _lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """LEA hi-nibble cross-product (512 units).
 
     Mirrors the second loop in :func:`vm_step._set_layer9_alu` -- amplified
@@ -303,12 +303,15 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     ``OUTPUT_HI_THIS_STEP+result``.
 
     Phase 7.E.3: gate uses :func:`dim_ref` for the
-    ``(opcode_flag, LEA)`` semantic pair. Structural reads
+    ``(opcode_flag, LEA)`` semantic pair; the ``CARRY+0`` carry-in read
+    resolves through ``dim_ref("carry", "alu", 0)`` (byte 0 of the
+    inter-byte ALU carry cascade). Structural reads
     (``ALU_HI+a`` / ``FETCH_HI+b``) and the result-nibble write stay as
     ``+N`` (value-bus one-hot lookups).
     """
 
     gate_lea = dim_ref("opcode_flag", "LEA")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     rules: list[FFNRule] = []
     # 10-way amplified AND: MARK_AX(+20) + seven non-AX marker blockers(-1000
     # each) + ALU_HI nibble(+1) + FETCH_HI nibble(+20) + CARRY+0 carry-in
@@ -324,18 +327,18 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 result = (a + b + carry_in) % 16
                 conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
                 conditions.extend(
-                    (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
+                    (dim, -1000.0) for dim in _NON_AX_BLOCKERS
                 )
                 conditions.append((f"ALU_HI+{a}", 1.0))
                 conditions.append((f"FETCH_HI+{b}", 20.0))
                 if carry_in == 0:
-                    conditions.append(("CARRY+0", -8.0))
+                    conditions.append((carry_byte0, -8.0))
                     threshold = 40.5
                 else:
-                    conditions.append(("CARRY+0", 8.0))
+                    conditions.append((carry_byte0, 8.0))
                     threshold = 48.5
                 rules.append(multi_way_and_rule(
-                    name=f"l9_lea_hi_c{carry_in}_a{a}_b{b}",
+                    name=f"lea_hi_c{carry_in}_a{a}_b{b}",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_lea,
@@ -344,10 +347,10 @@ def _layer9_lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+def _adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """ADJ hi-nibble cross-product (512 units).
 
-    Same structural shape as ``_layer9_lea_hi_nibble_rules`` (amplified
+    Same structural shape as ``_lea_hi_nibble_rules`` (amplified
     AX marker AND with ``ALU_HI`` and ``FETCH_HI``, non-AX blocker dims
     at ``-S*1000``) but gates on ``OP_ADJ`` and uses slightly shifted
     thresholds (42.0 / 50.0) so the carry/no-carry discrimination still
@@ -378,8 +381,9 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     gate_adj = dim_ref("opcode_flag", "ADJ")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     rules: list[FFNRule] = []
-    # Same 10-way amplified AND shape as _layer9_lea_hi_nibble_rules but
+    # Same 10-way amplified AND shape as _lea_hi_nibble_rules but
     # gated on OP_ADJ with slightly shifted thresholds (42.0 / 50.0) to
     # accommodate the ADJ-side opcode amplification. Writes the same
     # (a + b + carry_in) % 16 sum to OUTPUT_HI_THIS_STEP.
@@ -397,18 +401,18 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                     ("MARK_SE_ONLY", 20.0),
                 ]
                 conditions.extend(
-                    (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
+                    (dim, -1000.0) for dim in _NON_AX_BLOCKERS
                 )
                 conditions.append((f"ALU_HI+{a}", 1.0))
                 conditions.append((f"FETCH_HI+{b}", 20.0))
                 if carry_in == 0:
-                    conditions.append(("CARRY+0", -8.0))
+                    conditions.append((carry_byte0, -8.0))
                     threshold = 42.0
                 else:
-                    conditions.append(("CARRY+0", 8.0))
+                    conditions.append((carry_byte0, 8.0))
                     threshold = 50.0
                 rules.append(multi_way_and_rule(
-                    name=f"l9_adj_hi_c{carry_in}_a{a}_b{b}_step_end",
+                    name=f"adj_hi_c{carry_in}_a{a}_b{b}_step_end",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_adj,
@@ -417,7 +421,7 @@ def _layer9_adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+def _sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """SUB hi-nibble cross-product (512 units).
 
     Mirrors the SUB loop in :func:`vm_step._set_layer9_alu` -- 4-way
@@ -431,9 +435,10 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     gate_sub = dim_ref("opcode_flag", "SUB")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     rules: list[FFNRule] = []
-    # Same 5-way AND shape as _layer9_add_hi_nibble_rules but gated on OP_SUB
-    # and writing ``(a - b - borrow_in) % 16``. CARRY+0 carries the borrow-in
+    # Same 5-way AND shape as _add_hi_nibble_rules but gated on OP_SUB
+    # and writing ``(a - b - borrow_in) % 16``. carry_byte0 carries the borrow-in
     # bit with the same +/- 2.0 sign-flipped discrimination at threshold
     # 2.5 (no borrow) / 4.5 (with borrow).
     for borrow_in in (0, 1):
@@ -446,7 +451,7 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", -2.0),
+                        (carry_byte0, -2.0),
                     )
                     threshold = 2.5
                 else:
@@ -455,11 +460,11 @@ def _layer9_sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", 2.0),
+                        (carry_byte0, 2.0),
                     )
                     threshold = 4.5
                 rules.append(multi_way_and_rule(
-                    name=f"l9_sub_hi_b{borrow_in}_a{a}_b{b}",
+                    name=f"sub_hi_b{borrow_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_sub,
@@ -484,9 +489,10 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     gate_ent = dim_ref("opcode_flag", "ENT")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     rules: list[FFNRule] = []
-    # Same 10-way amplified AND shape as _layer9_lea_hi_nibble_rules /
-    # _layer9_adj_hi_nibble_rules but gated on OP_ENT, computing SP - imm
+    # Same 10-way amplified AND shape as _lea_hi_nibble_rules /
+    # _adj_hi_nibble_rules but gated on OP_ENT, computing SP - imm
     # (a = SP's hi nibble via ALU_HI, b = imm's hi nibble via FETCH_HI).
     # Thresholds 42.0 / 50.0 match the ADJ tuning. Writes
     # (sp_hi - imm_hi - borrow_in) % 16 to OUTPUT_HI_THIS_STEP.
@@ -518,7 +524,7 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 result = (sp_hi - imm_hi - borrow_in) % 16
                 conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
                 conditions.extend(
-                    (dim, -1000.0) for dim in _L9_NON_AX_BLOCKERS
+                    (dim, -1000.0) for dim in _NON_AX_BLOCKERS
                 )
                 # Subsequent-step ENT (HAS_SE) must NOT re-materialize the
                 # SP hi nibble onto the AX row; hard-block so the OP_ENT
@@ -528,13 +534,13 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
                 conditions.append((f"ALU_HI+{sp_hi}", 1.0))
                 conditions.append((f"FETCH_HI+{imm_hi}", 20.0))
                 if borrow_in == 0:
-                    conditions.append(("CARRY+0", -8.0))
+                    conditions.append((carry_byte0, -8.0))
                     threshold = 42.0
                 else:
-                    conditions.append(("CARRY+0", 8.0))
+                    conditions.append((carry_byte0, 8.0))
                     threshold = 50.0
                 rules.append(multi_way_and_rule(
-                    name=f"l9_ent_hi_b{borrow_in}_sp{sp_hi}_imm{imm_hi}",
+                    name=f"ent_hi_b{borrow_in}_sp{sp_hi}_imm{imm_hi}",
                     conditions=tuple(conditions),
                     threshold=threshold,
                     gate=gate_ent,
@@ -669,15 +675,15 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
                 writes=((cmp_byte3, 2.0 / S),),
             ))
 
-    # ``_L9_CMP_RELAYED`` documents the Wave A dims this factory depends
+    # ``_CMP_RELAYED`` documents the Wave A dims this factory depends
     # on; the constant is read by audit tooling / future relay
     # validators.
-    _ = _L9_CMP_RELAYED
+    _ = _CMP_RELAYED
 
     return tuple(rules)
 
 
-def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
+def _add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
     """ADD hi-nibble carry-out -> CARRY+1 (256 units).
 
     For every (a, b, carry_in) where ``a + b + carry_in >= 16`` the unit
@@ -696,13 +702,14 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     gate_add = dim_ref("opcode_flag", "ADD")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     carry_byte1 = dim_ref("carry", "alu", 1)
     rules: list[FFNRule] = []
-    # Same 5-way AND shape as _layer9_add_hi_nibble_rules but with weaker
-    # CARRY+0 discrimination (raw +/- 0.01/S) and relaxed thresholds
+    # Same 5-way AND shape as _add_hi_nibble_rules but with weaker
+    # carry_byte0 discrimination (raw +/- 0.01/S) and relaxed thresholds
     # (2.5 / 2.9); the threshold itself does most of the discrimination
     # work since the raw stack-top carry signal isn't amplified here.
-    # Writes to CARRY+1 (byte-level carry for inter-byte propagation).
+    # Writes to carry_byte1 (byte-level carry for inter-byte propagation).
     for carry_in in (0, 1):
         for a in range(16):
             for b in range(16):
@@ -714,7 +721,7 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", -0.01 / S),
+                        (carry_byte0, -0.01 / S),
                     )
                     threshold = 2.5
                 else:
@@ -723,11 +730,11 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", 0.01 / S),
+                        (carry_byte0, 0.01 / S),
                     )
                     threshold = 2.9
                 rules.append(multi_way_and_rule(
-                    name=f"l9_add_carry_out_c{carry_in}_a{a}_b{b}",
+                    name=f"add_carry_out_c{carry_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_add,
@@ -736,7 +743,7 @@ def _layer9_add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
+def _sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
     """SUB hi-nibble borrow-out -> CARRY+2 (256 units).
 
     Mirrors the SUB borrow-out loop in :func:`vm_step._set_layer9_alu`.
@@ -752,11 +759,12 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     gate_sub = dim_ref("opcode_flag", "SUB")
+    carry_byte0 = dim_ref("carry", "alu", 0)
     carry_byte2 = dim_ref("carry", "alu", 2)
     rules: list[FFNRule] = []
-    # Mirror of _layer9_add_carry_out_rules: same 5-way AND shape with weak
+    # Mirror of _add_carry_out_rules: same 5-way AND shape with weak
     # +/- 0.01/S carry discrimination and relaxed thresholds, gated on
-    # OP_SUB and writing to CARRY+2 (byte-2 of the inter-byte ALU carry
+    # OP_SUB and writing to carry_byte2 (byte-2 of the inter-byte ALU carry
     # cascade). Pair-filter selects only (a, b) combinations that produce
     # a borrow: a < b (no borrow_in) or a <= b (with borrow_in).
     for borrow_in in (0, 1):
@@ -774,7 +782,7 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", -0.01 / S),
+                        (carry_byte0, -0.01 / S),
                     )
                     threshold = 2.5
                 else:
@@ -783,11 +791,11 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
                         ("MARK_PC", -2.0),
                         (f"ALU_HI+{a}", 1.0),
                         (f"AX_CARRY_HI+{b}", 1.0),
-                        ("CARRY+0", 0.01 / S),
+                        (carry_byte0, 0.01 / S),
                     )
                     threshold = 2.9
                 rules.append(multi_way_and_rule(
-                    name=f"l9_sub_borrow_out_b{borrow_in}_a{a}_b{b}",
+                    name=f"sub_borrow_out_b{borrow_in}_a{a}_b{b}",
                     conditions=conditions,
                     threshold=threshold,
                     gate=gate_sub,
@@ -801,7 +809,7 @@ def _layer9_sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
 # ALU_LO/HI values do not contaminate Layer 10 bitwise / MUL units.
 # Mirrors the inline ``non_alu_opcodes`` list inside
 # :func:`vm_step._set_layer9_alu`.
-_L9_NON_ALU_OPCODES: tuple[str, ...] = (
+_NON_ALU_OPCODES: tuple[str, ...] = (
     "OP_IMM",
     "OP_NOP",
     "OP_JMP",
@@ -820,7 +828,7 @@ _L9_NON_ALU_OPCODES: tuple[str, ...] = (
 )
 
 
-def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
+def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     """ALU LO/HI clear at non-ALU opcodes (32 units).
 
     Pair of identical 16-unit bands writing ``-10.0 / S`` to
@@ -840,8 +848,8 @@ def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     # threshold=1.5 captures the same structural N-way conditional write
     # (default threshold derivation would over-shoot to 15.5 = "all on").
     common_conditions = [("MARK_AX", 1.0)]
-    common_conditions.extend((dim, 1.0) for dim in _L9_NON_ALU_OPCODES)
-    # Opcode-broadcast hardening (2026-06-11, batch fix): _L9_NON_ALU_OPCODES
+    common_conditions.extend((dim, 1.0) for dim in _NON_ALU_OPCODES)
+    # Opcode-broadcast hardening (2026-06-11, batch fix): _NON_ALU_OPCODES
     # includes the broadcasting frame/control opcodes OP_JSR (~17.2),
     # OP_ENT (~11.4), OP_ADJ / OP_LEV (each carried as ``(dim, 1.0)``). Those
     # flags are broadcast IN-STEP to EVERY register/byte/marker row (NOT
@@ -871,7 +879,7 @@ def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     # ALU_LO clear: 16 units.
     for k in range(16):
         rules.append(multi_way_and_rule(
-            name=f"l9_alu_lo_clear_{k}",
+            name=f"alu_lo_clear_{k}",
             conditions=common_conditions,
             threshold=1.5,
             writes=((f"ALU_LO+{k}", -10.0 / S),),
@@ -880,7 +888,7 @@ def _layer9_alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     # ALU_HI clear: 16 units.
     for k in range(16):
         rules.append(multi_way_and_rule(
-            name=f"l9_alu_hi_clear_{k}",
+            name=f"alu_hi_clear_{k}",
             conditions=common_conditions,
             threshold=1.5,
             writes=((f"ALU_HI+{k}", -10.0 / S),),
@@ -937,13 +945,13 @@ def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
                 (f"ADDR_B0_LO+{new_k}", 0.67 / S),
             ),
         ))
-    # ``_L9_BP_PLUS8_RELAYED`` documents the Wave A dims this factory
+    # ``_BP_PLUS8_RELAYED`` documents the Wave A dims this factory
     # depends on; read by audit tooling / future relay validators.
-    _ = _L9_BP_PLUS8_RELAYED
+    _ = _BP_PLUS8_RELAYED
     return tuple(rules)
 
 
-def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
+def _addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
     """``ADDR_B1`` 0xff set + BP=0xfff8 cascade fixup (6 units).
 
     Six contiguous units that finish setting up the LEV return-address
@@ -983,7 +991,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
 
     # Unit 0: ADDR_B1_LO[15] = 1 (byte 1 = 0xff lo nibble).
     rules.append(multi_way_and_rule(
-        name="l9_addr_b1_lo_set",
+        name="addr_b1_lo_set",
         conditions=common_conditions,
         threshold=threshold,
         gate="CONST",
@@ -994,7 +1002,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
 
     # Unit 1: ADDR_B1_HI[15] = 1 (byte 1 = 0xff hi nibble).
     rules.append(multi_way_and_rule(
-        name="l9_addr_b1_hi_set",
+        name="addr_b1_hi_set",
         conditions=common_conditions,
         threshold=threshold,
         gate="CONST",
@@ -1027,7 +1035,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
     )
     for suffix, writes in cascade_writes:
         rules.append(multi_way_and_rule(
-            name=f"l9_{suffix}",
+            name=f"addr_cascade_{suffix}",
             conditions=common_conditions,
             threshold=threshold,
             gate="ADDR_B0_LO+0",
@@ -1040,7 +1048,7 @@ def _layer9_addr_b1_set_and_cascade_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer9_marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
+def _marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
     """``NEXT_*`` marker-suppression band (7 units).
 
     Mirrors :func:`vm_step._set_layer9_marker_suppress`. One unit per
@@ -1073,7 +1081,7 @@ def _layer9_marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
             writes.append((f"OUTPUT_LO+{k}", -1.0))
             writes.append((f"OUTPUT_HI_THIS_STEP+{k}", -1.0))
         rules.append(multi_way_and_rule(
-            name=f"l9_marker_suppress_{next_dim.lower()}",
+            name=f"marker_suppress_{next_dim.lower()}",
             conditions=((next_dim, 100.0 / S),),
             threshold=80.0 / S,
             gate=next_dim,
@@ -1084,7 +1092,7 @@ def _layer9_marker_suppress_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer9_alu_rules(S: float) -> tuple[FFNRule, ...]:
+def _alu_rules(S: float) -> tuple[FFNRule, ...]:
     """Full ordered ``FFNRule`` sequence for ``layer9_alu`` (3405 units).
 
     Concatenates every L9 ALU sub-stage in the order declared by
@@ -1101,25 +1109,25 @@ def _layer9_alu_rules(S: float) -> tuple[FFNRule, ...]:
     """
 
     return (
-        _layer9_add_hi_nibble_rules(S)
-        + _layer9_lea_hi_nibble_rules(S)
-        + _layer9_adj_hi_nibble_rules(S)
-        + _layer9_sub_hi_nibble_rules(S)
+        _add_hi_nibble_rules(S)
+        + _lea_hi_nibble_rules(S)
+        + _adj_hi_nibble_rules(S)
+        + _sub_hi_nibble_rules(S)
         + _layer9_ent_hi_nibble_rules(S)
         + _layer9_cmp_rules(S)
-        + _layer9_add_carry_out_rules(S)
-        + _layer9_sub_borrow_out_rules(S)
-        + _layer9_alu_clear_rules(S)
+        + _add_carry_out_rules(S)
+        + _sub_borrow_out_rules(S)
+        + _alu_clear_rules(S)
         + _layer9_bp_plus8_shift_rules(S)
-        + _layer9_addr_b1_set_and_cascade_rules(S)
-        + _layer9_marker_suppress_rules(S)
+        + _addr_b1_set_and_cascade_rules(S)
+        + _marker_suppress_rules(S)
     )
 
 
-def _layer9_alu_ir(S: float = 100.0) -> CompilerIR:
+def _alu_ir(S: float = 100.0) -> CompilerIR:
     """Build the declarative ``CompilerIR`` exposed by ``layer9_alu``."""
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer9_alu_rules(S))
+    ir.layer(0).ffn.rules.extend(_alu_rules(S))
     return ir
 
 
@@ -1132,7 +1140,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         ``_set_layer9_marker_suppress(ffn9, S, BD, n9)``
 
     Phase 6 Wave 4C migration: the entire 3405-unit weight surface is now
-    declared via :func:`_layer9_alu_rules` -- a concatenation of 12
+    declared via :func:`_alu_rules` -- a concatenation of 12
     sub-stage rule helpers (ADD/LEA/ADJ/SUB/ENT hi nibble, CMP family,
     ADD carry-out, SUB borrow-out, ALU LO/HI clear, BP+8 shift, ADDR_B1
     set + cascade, NEXT_* marker suppress). The bake_fn lowers them
@@ -1147,7 +1155,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     ``set_vm_weights`` to avoid double-bake. Phase stays at 9. Fires in
     both lookup and efficient ALU modes -- the lookup-branch nesting was
     incidental and the rules are alu_mode-agnostic. In the efficient
-    path the imperative :func:`_suppress_l9_legacy_addsub_writes` post-pass
+    path the imperative :func:`_suppress_legacy_addsub_writes` post-pass
     still zeroes the ADD/SUB legacy output units and legacy carry rows;
     we keep it imperative because it operates on the already-lowered
     ``W_down`` cells as a downstream mutation rather than as a rule fan-out.
@@ -1159,7 +1167,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # its existing offset so the rule lowering below -- which appends
         # units monotonically starting at ``start_unit=0`` -- lands
         # byte-identically with the legacy ``_set_layer9_alu`` cursor walk.
-        allocator = _allocate_layer9_alu_units()
+        allocator = _allocate_alu_units()
         marker_range = next(
             r for r in allocator.ranges()
             if r.op_name == "layer9_alu.marker_suppress"
@@ -1172,7 +1180,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
         # object so the layout is structured, not just a monotonic int.
         block.ffn._l9_unit_allocator = allocator
 
-        rules = _layer9_alu_rules(S)
+        rules = _alu_rules(S)
         rule_dim_positions = Primitives.dim_positions_from_bd(
             proxy,
             Primitives.ffn_rule_dim_names(rules),
@@ -1193,7 +1201,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
             f"expected {marker_end}"
         )
         if alu_mode == "efficient":
-            _suppress_l9_legacy_addsub_writes(block.ffn, proxy)
+            _suppress_legacy_addsub_writes(block.ffn, proxy)
 
     # Dim-ownership claims (W_down output cells). Mirrors ``_set_layer9_alu``
     # in ``vm_step.py`` (3398 units) followed by ``_set_layer9_marker_suppress``
@@ -1330,12 +1338,12 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
 
     # Declarative IR exposed to symbolic execution / verifier tooling.
     # The ``efficient`` alu_mode skips the IR-only dispatch path because
-    # the post-bake :func:`_suppress_l9_legacy_addsub_writes` mutation
+    # the post-bake :func:`_suppress_legacy_addsub_writes` mutation
     # zeroes a subset of the lowered cells -- a step the IR does not
     # model. The bake_fn handles both modes correctly; only the
     # declarations-only path (compiler_ir lowering without bake_fn) needs
     # to be gated.
-    compiler_ir = _layer9_alu_ir() if alu_mode == "lookup" else None
+    compiler_ir = _alu_ir() if alu_mode == "lookup" else None
 
     return Operation(
         name="layer9_alu",
@@ -1422,7 +1430,7 @@ def make_layer9_alu_op(alu_mode: str = "lookup") -> Operation:
     )
 
 
-def _suppress_l9_legacy_addsub_writes(ffn, BD) -> None:
+def _suppress_legacy_addsub_writes(ffn, BD) -> None:
     """Let the efficient add/sub block own byte carry/borrow state.
 
     L8/L9 legacy nibble logic leaves ``CARRY[0]`` as an intra-byte
@@ -1448,7 +1456,7 @@ def _suppress_l9_legacy_addsub_writes(ffn, BD) -> None:
     ffn.W_down.data[BD.CARRY + 2, :] = 0.0
 
 
-def make_layer9_lev_addr_relay_op() -> Operation:
+def make_lev_addr_relay_op() -> Operation:
     """L9 attention head 0: BP byte 0 → ADDR_B0 at SP marker for LEV.
 
     Originally an inline call inside ``set_vm_weights`` (in the
@@ -1472,7 +1480,7 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         # pinned. Looking up the relay head by name keeps its index
         # identical to the legacy ``head_idx=0`` literal without baking
         # the integer into the call site.
-        allocator = _allocate_layer9_attention_heads()
+        allocator = _allocate_alu_attention_heads()
         attn._l9_head_allocator = allocator
         relay_head_idx = next(
             h.head_idx for h in allocator.heads()
@@ -1485,7 +1493,7 @@ def make_layer9_lev_addr_relay_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
             attn,
-            _layer9_lev_addr_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            _lev_addr_relay_head_spec(_as_setdim_proxy(dim_positions)),
             HD,
         )
 
@@ -1502,14 +1510,14 @@ def make_layer9_lev_addr_relay_op() -> Operation:
     return Operation(
         name="layer9_lev_addr_relay",
         # Declaration audit (2026-06-05): added CONST -- the GATE Q slot
-        # _layer9_lev_addr_relay_head_spec uses on Q[33, BD.CONST] /
+        # _lev_addr_relay_head_spec uses on Q[33, BD.CONST] /
         # K[33, BD.CONST] / Q[0, BD.CONST] gating writes.
         reads={"MARK_SP", "OP_LEV", "L1H1", "BYTE_INDEX_0", "CONST",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
         declarative_bake_fn=bake,
-        compiler_ir_factory=_layer9_lev_addr_relay_ir,
+        compiler_ir_factory=_lev_addr_relay_ir,
         # Phase 8.A.4 retry: layer_idx=9 literal dropped. ``target_op_name``
         # binds this block op to the layer of ``layer9_marker_suppress``
         # (kind="ffn", L9 anchor pinned via ``requires["after"]: layer8_alu``).
@@ -1522,7 +1530,7 @@ def make_layer9_lev_addr_relay_op() -> Operation:
     )
 
 
-def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
+def make_lev_bp_to_pc_relay_op() -> Operation:
     """L9 attention head 1: BP byte 0 → ADDR_B0 at PC marker for LEV return.
 
     Originally an inline call inside ``set_vm_weights`` (in the
@@ -1546,7 +1554,7 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         # pinned. Resolving the BP→PC relay head by name reproduces the
         # legacy ``head_idx=1`` literal without depending on the
         # addr-relay op having already populated ``attn._l9_head_allocator``.
-        allocator = _allocate_layer9_attention_heads()
+        allocator = _allocate_alu_attention_heads()
         attn._l9_head_allocator = allocator
         relay_head_idx = next(
             h.head_idx for h in allocator.heads()
@@ -1559,7 +1567,7 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_head(
             attn,
-            _layer9_lev_bp_to_pc_relay_head_spec(_as_setdim_proxy(dim_positions)),
+            _lev_bp_to_pc_relay_head_spec(_as_setdim_proxy(dim_positions)),
             HD,
         )
 
@@ -1576,14 +1584,14 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
     return Operation(
         name="layer9_lev_bp_to_pc_relay",
         # Declaration audit (2026-06-05): added CONST -- the GATE Q slot
-        # _layer9_lev_bp_to_pc_relay_head_spec uses on Q[33, BD.CONST] /
+        # _lev_bp_to_pc_relay_head_spec uses on Q[33, BD.CONST] /
         # K[33, BD.CONST] / Q[0, BD.CONST] gating writes.
         reads={"MARK_PC", "OP_LEV", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
                "L1H1", "BYTE_INDEX_0", "CONST"},
         writes={"ADDR_B0_LO", "ADDR_B0_HI"},
         kind="block",
         declarative_bake_fn=bake,
-        compiler_ir_factory=_layer9_lev_bp_to_pc_relay_ir,
+        compiler_ir_factory=_lev_bp_to_pc_relay_ir,
         # Phase 8.A.4 retry: layer_idx=9 literal dropped. ``target_op_name``
         # binds this block op to the layer of ``layer9_marker_suppress``
         # (kind="ffn", L9 anchor pinned via ``requires["after"]: layer8_alu``).
@@ -1596,21 +1604,21 @@ def make_layer9_lev_bp_to_pc_relay_op() -> Operation:
     )
 
 
-def _layer9_lev_addr_relay_ir(dim_positions, HD) -> CompilerIR:
+def _lev_addr_relay_ir(dim_positions, HD) -> CompilerIR:
     BD = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.append(_layer9_lev_addr_relay_head_spec(BD))
+    ir.layer(0).attention.append(_lev_addr_relay_head_spec(BD))
     return ir
 
 
-def _layer9_lev_bp_to_pc_relay_ir(dim_positions, HD) -> CompilerIR:
+def _lev_bp_to_pc_relay_ir(dim_positions, HD) -> CompilerIR:
     BD = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.append(_layer9_lev_bp_to_pc_relay_head_spec(BD))
+    ir.layer(0).attention.append(_lev_bp_to_pc_relay_head_spec(BD))
     return ir
 
 
-def _layer9_lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+def _lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Declarative L9 head 0: previous BP byte0 -> ADDR_B0 at SP marker."""
 
     L = 50.0
@@ -1628,7 +1636,7 @@ def _layer9_lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         # baking in a ``head_idx=0`` literal here. Both the bake and IR
         # paths consult the same source of truth, so renumbering the
         # layout in one place stays consistent across every consumer.
-        head_idx=_l9_head_idx("layer9_lev_addr_relay"),
+        head_idx=_alu_head_idx("layer9_lev_addr_relay"),
         q=(
             AP(0, BD.MARK_SP, L),
             AP(0, BD.OP_LEV, L / 5),
@@ -1646,7 +1654,7 @@ def _layer9_lev_addr_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     )
 
 
-def _layer9_lev_bp_to_pc_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+def _lev_bp_to_pc_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Declarative L9 head 1: previous BP byte0 -> ADDR_B0 at PC marker."""
 
     L = 50.0
@@ -1664,7 +1672,7 @@ def _layer9_lev_bp_to_pc_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         # baking in a ``head_idx=1`` literal here. Both the bake and IR
         # paths consult the same source of truth, so renumbering the
         # layout in one place stays consistent across every consumer.
-        head_idx=_l9_head_idx("layer9_lev_bp_to_pc_relay"),
+        head_idx=_alu_head_idx("layer9_lev_bp_to_pc_relay"),
         q=(
             AP(0, BD.MARK_PC, L),
             AP(0, BD.OP_LEV, L / 5),
@@ -1783,7 +1791,7 @@ def _format_string_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     )
 
 
-def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
+def make_alibi_mem_attn_op(enable: bool = False) -> Operation:
     """L9 attention head 2: ALiBi-based memory-propagation attention.
 
     PROOF-OF-CONCEPT for the directive "all of the memory conversions should
@@ -1869,7 +1877,7 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
         # index identical to the legacy ``head = 2`` literal without
         # baking the integer into the call site. Stash on the attn
         # block so downstream tooling can inspect the layout.
-        allocator = _allocate_layer9_attention_heads()
+        allocator = _allocate_alu_attention_heads()
         attn._l9_head_allocator = allocator
         head = next(
             h.head_idx for h in allocator.heads()
@@ -2027,7 +2035,7 @@ def make_layer9_alibi_mem_attn_op(enable: bool = False) -> Operation:
 # (``_step_end_reg_present_head_spec``) and the L11 step_end_relay.
 
 
-def _layer9_step_end_operand_relay_head_specs(
+def _step_end_operand_relay_head_specs(
     BD,
 ) -> tuple[DeclarativeAttentionHeadSpec, DeclarativeAttentionHeadSpec]:
     """Build the two Wave A v2 relay head specs.
@@ -2093,7 +2101,7 @@ def _layer9_step_end_operand_relay_head_specs(
         slot += 1
 
     spec_a = DeclarativeAttentionHeadSpec(
-        head_idx=_l9_head_idx("layer9_step_end_operand_relay"),
+        head_idx=_alu_head_idx("layer9_step_end_operand_relay"),
         q=q_band,
         k=k_band,
         v=tuple(v_a),
@@ -2115,7 +2123,7 @@ def _layer9_step_end_operand_relay_head_specs(
         o_b.append(AO(BD.SE_AX_CARRY_HI + k_idx, slot, 1.0))
         slot += 1
 
-    head_a_idx = _l9_head_idx("layer9_step_end_operand_relay")
+    head_a_idx = _alu_head_idx("layer9_step_end_operand_relay")
     spec_b = DeclarativeAttentionHeadSpec(
         head_idx=head_a_idx + 1,
         q=q_band,
@@ -2128,11 +2136,11 @@ def _layer9_step_end_operand_relay_head_specs(
     return spec_a, spec_b
 
 
-def _layer9_step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
+def _step_end_operand_relay_ir(dim_positions, HD) -> CompilerIR:
     """``compiler_ir_factory`` for the L9 step_end_operand_relay heads."""
     del HD  # head_dim is layer-default
     BD = _as_setdim_proxy(dim_positions)
-    spec_a, spec_b = _layer9_step_end_operand_relay_head_specs(BD)
+    spec_a, spec_b = _step_end_operand_relay_head_specs(BD)
     ir = CompilerIR()
     ir.layer(0).attention.append(
         spec_a, name="layer9_step_end_operand_relay.head_a",
@@ -2167,7 +2175,7 @@ def make_layer9_step_end_operand_relay_op() -> Operation:
         attn = block.attn
         # Per-bake L9 head allocator with the full layout pinned. Look
         # up our relay head A by name; head B claims the next slot.
-        allocator = _allocate_layer9_attention_heads()
+        allocator = _allocate_alu_attention_heads()
         attn._l9_head_allocator = allocator
         head_a_idx = next(
             h.head_idx for h in allocator.heads()
@@ -2178,19 +2186,19 @@ def make_layer9_step_end_operand_relay_op() -> Operation:
             attn.alibi_slopes[head_a_idx] = 0.2
             attn.alibi_slopes[head_b_idx] = 0.2
         HD = attn.W_q.shape[0] // attn.num_heads
-        spec_a, spec_b = _layer9_step_end_operand_relay_head_specs(
+        spec_a, spec_b = _step_end_operand_relay_head_specs(
             _as_setdim_proxy(dim_positions),
         )
         Primitives.generate_attention_head(attn, spec_a, HD)
         Primitives.generate_attention_head(attn, spec_b, HD)
 
     # Dim-ownership claims: 2 heads on L9 attn. Resolved head indices
-    # come from ``_l9_head_idx`` (head A) and ``head_a + 1`` (head B).
+    # come from ``_alu_head_idx`` (head A) and ``head_a + 1`` (head B).
     # We pin them as ``A_<slot>`` / ``B_<slot>`` strings; the verifier
     # accepts the symbolic head names as long as they're unique per op.
     _CMP_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
     _claims: set = set()
-    head_a_idx = _l9_head_idx("layer9_step_end_operand_relay")
+    head_a_idx = _alu_head_idx("layer9_step_end_operand_relay")
     head_b_idx = head_a_idx + 1
     # Slot 0 reserved for Q-K score; V/O start at slot 1.
     slot = 1
@@ -2249,7 +2257,7 @@ def make_layer9_step_end_operand_relay_op() -> Operation:
         # a sibling op that fills the whole slope vector.
         phase=9.3,
         declarative_bake_fn=bake,
-        compiler_ir_factory=_layer9_step_end_operand_relay_ir,
+        compiler_ir_factory=_step_end_operand_relay_ir,
         # Bind to ``layer9_marker_suppress`` (the L9 FFN topology
         # anchor) so the block op resolves to the same physical layer
         # as the other L9 attention ops (which today resolves to L11
@@ -2306,7 +2314,7 @@ def make_layer9_se_relay_slope_op() -> Operation:
         attn = model.blocks[10].attn
         if not (hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None):
             return
-        head_a = _l9_head_idx("layer9_step_end_operand_relay")
+        head_a = _alu_head_idx("layer9_step_end_operand_relay")
         head_b = head_a + 1
         if head_b < attn.alibi_slopes.shape[0]:
             attn.alibi_slopes[head_a] = 0.2  # SE relay head A (ALU/CMP/OP)
@@ -2336,7 +2344,7 @@ def make_layer9_se_relay_slope_op() -> Operation:
     )
 
 
-def make_layer9_marker_suppress_op() -> Operation:
+def make_marker_suppress_op() -> Operation:
     """No-op dep anchor for marker suppression owned by ``layer9_alu``.
 
     ``make_layer9_alu_op`` owns the true migrated bake: it calls

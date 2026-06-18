@@ -69,9 +69,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.base_layers import PureFFN  # noqa: E402
 from neural_vm.unified_compiler.ops.l9_ops import (  # noqa: E402
-    _layer9_add_hi_nibble_rules,
+    _add_hi_nibble_rules,
     _layer9_cmp_rules,
-    _layer9_sub_hi_nibble_rules,
+    _sub_hi_nibble_rules,
 )
 from neural_vm.unified_compiler.ops.l10_ops import (  # noqa: E402
     _layer10_alu_bitwise_and_rules,
@@ -116,8 +116,8 @@ def _build_ffn(rules) -> PureFFN:
 def ffns() -> dict:
     """Module-scoped FFN cache so the 7 FFNs are baked once per session."""
     return {
-        "l9_add": _build_ffn(_layer9_add_hi_nibble_rules(S)),
-        "l9_sub": _build_ffn(_layer9_sub_hi_nibble_rules(S)),
+        "l9_add": _build_ffn(_add_hi_nibble_rules(S)),
+        "l9_sub": _build_ffn(_sub_hi_nibble_rules(S)),
         "l9_cmp": _build_ffn(_layer9_cmp_rules(S)),
         "l10_or": _build_ffn(_layer10_alu_bitwise_or_rules(S)),
         "l10_and": _build_ffn(_layer10_alu_bitwise_and_rules(S)),

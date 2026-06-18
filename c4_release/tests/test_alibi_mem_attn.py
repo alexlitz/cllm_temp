@@ -1,6 +1,6 @@
 """ALiBi-based memory-propagation attention head: proof-of-concept tests.
 
-These tests exercise the new ``make_layer9_alibi_mem_attn_op`` op
+These tests exercise the new ``make_alibi_mem_attn_op`` op
 (see ``neural_vm/unified_compiler/ops/l9_ops.py``) at two levels:
 
 1. **Registration**: the op is in ``all_core_ops()``, lands at layer_idx=9

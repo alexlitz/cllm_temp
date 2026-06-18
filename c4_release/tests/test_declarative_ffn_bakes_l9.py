@@ -125,48 +125,48 @@ def _compare_symbolic_to_lowered(rules) -> None:
 
 
 def test_layer9_add_hi_nibble_matches_legacy():
-    """``_layer9_add_hi_nibble_rules`` lowers byte-identically at unit 0."""
+    """``_add_hi_nibble_rules`` lowers byte-identically at unit 0."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_add_hi_nibble_rules,
+        _add_hi_nibble_rules,
     )
 
-    rules = _layer9_add_hi_nibble_rules(100.0)
+    rules = _add_hi_nibble_rules(100.0)
     assert len(rules) == 512
     _assert_unit_range_matches_legacy(rules, start_unit=0, n_units=512)
     _compare_symbolic_to_lowered(rules)
 
 
 def test_layer9_lea_hi_nibble_matches_legacy():
-    """``_layer9_lea_hi_nibble_rules`` lowers byte-identically at unit 512."""
+    """``_lea_hi_nibble_rules`` lowers byte-identically at unit 512."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_lea_hi_nibble_rules,
+        _lea_hi_nibble_rules,
     )
 
-    rules = _layer9_lea_hi_nibble_rules(100.0)
+    rules = _lea_hi_nibble_rules(100.0)
     assert len(rules) == 512
     _assert_unit_range_matches_legacy(rules, start_unit=512, n_units=512)
     _compare_symbolic_to_lowered(rules)
 
 
 def test_layer9_adj_hi_nibble_matches_legacy():
-    """``_layer9_adj_hi_nibble_rules`` lowers byte-identically at unit 1024."""
+    """``_adj_hi_nibble_rules`` lowers byte-identically at unit 1024."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_adj_hi_nibble_rules,
+        _adj_hi_nibble_rules,
     )
 
-    rules = _layer9_adj_hi_nibble_rules(100.0)
+    rules = _adj_hi_nibble_rules(100.0)
     assert len(rules) == 512
     _assert_unit_range_matches_legacy(rules, start_unit=1024, n_units=512)
     _compare_symbolic_to_lowered(rules)
 
 
 def test_layer9_sub_hi_nibble_matches_legacy():
-    """``_layer9_sub_hi_nibble_rules`` lowers byte-identically at unit 1536."""
+    """``_sub_hi_nibble_rules`` lowers byte-identically at unit 1536."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_sub_hi_nibble_rules,
+        _sub_hi_nibble_rules,
     )
 
-    rules = _layer9_sub_hi_nibble_rules(100.0)
+    rules = _sub_hi_nibble_rules(100.0)
     assert len(rules) == 512
     _assert_unit_range_matches_legacy(rules, start_unit=1536, n_units=512)
     _compare_symbolic_to_lowered(rules)
@@ -203,12 +203,12 @@ def test_layer9_cmp_rules_match_legacy():
 
 
 def test_layer9_add_carry_out_rules_match_legacy():
-    """``_layer9_add_carry_out_rules`` lowers byte-identically at unit 2832."""
+    """``_add_carry_out_rules`` lowers byte-identically at unit 2832."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_add_carry_out_rules,
+        _add_carry_out_rules,
     )
 
-    rules = _layer9_add_carry_out_rules(100.0)
+    rules = _add_carry_out_rules(100.0)
     # 120 (carry_in=0) + 136 (carry_in=1) = 256.
     assert len(rules) == 256
     _assert_unit_range_matches_legacy(rules, start_unit=2832, n_units=256)
@@ -216,12 +216,12 @@ def test_layer9_add_carry_out_rules_match_legacy():
 
 
 def test_layer9_sub_borrow_out_rules_match_legacy():
-    """``_layer9_sub_borrow_out_rules`` lowers byte-identically at unit 3088."""
+    """``_sub_borrow_out_rules`` lowers byte-identically at unit 3088."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_sub_borrow_out_rules,
+        _sub_borrow_out_rules,
     )
 
-    rules = _layer9_sub_borrow_out_rules(100.0)
+    rules = _sub_borrow_out_rules(100.0)
     # 120 (borrow_in=0: a<b) + 136 (borrow_in=1: a<=b) = 256.
     assert len(rules) == 256
     _assert_unit_range_matches_legacy(rules, start_unit=3088, n_units=256)
@@ -229,12 +229,12 @@ def test_layer9_sub_borrow_out_rules_match_legacy():
 
 
 def test_layer9_alu_clear_rules_match_legacy():
-    """``_layer9_alu_clear_rules`` lowers byte-identically at unit 3344 (32 units)."""
+    """``_alu_clear_rules`` lowers byte-identically at unit 3344 (32 units)."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_alu_clear_rules,
+        _alu_clear_rules,
     )
 
-    rules = _layer9_alu_clear_rules(100.0)
+    rules = _alu_clear_rules(100.0)
     assert len(rules) == 32
     _assert_unit_range_matches_legacy(rules, start_unit=3344, n_units=32)
     _compare_symbolic_to_lowered(rules)
@@ -255,10 +255,10 @@ def test_layer9_bp_plus8_shift_rules_match_legacy():
 def test_layer9_addr_b1_set_and_cascade_rules_match_legacy():
     """ADDR_B1 set + BP=0xfff8 cascade lowers byte-identically at unit 3392."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_addr_b1_set_and_cascade_rules,
+        _addr_b1_set_and_cascade_rules,
     )
 
-    rules = _layer9_addr_b1_set_and_cascade_rules(100.0)
+    rules = _addr_b1_set_and_cascade_rules(100.0)
     # 1 (B1_LO) + 1 (B1_HI) + 4 cascade = 6.
     assert len(rules) == 6
     _assert_unit_range_matches_legacy(rules, start_unit=3392, n_units=6)
@@ -283,10 +283,10 @@ def _legacy_l9_with_marker_suppress() -> _StubFFN:
 def test_layer9_marker_suppress_rules_match_legacy():
     """Marker-suppress band (7 units) lowers byte-identically at unit 3398."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_marker_suppress_rules,
+        _marker_suppress_rules,
     )
 
-    rules = _layer9_marker_suppress_rules(100.0)
+    rules = _marker_suppress_rules(100.0)
     assert len(rules) == 7
     _assert_unit_range_matches_legacy(
         rules,
@@ -300,10 +300,10 @@ def test_layer9_marker_suppress_rules_match_legacy():
 def test_layer9_alu_rules_total_unit_count_is_3405():
     """The composite rule list must total 3405 units."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_alu_rules,
+        _alu_rules,
     )
 
-    rules = _layer9_alu_rules(100.0)
+    rules = _alu_rules(100.0)
     # 512 * 5 (ADD/LEA/ADJ/SUB/ENT hi) + 272 (CMP) + 256 * 2 (carry/borrow)
     # + 32 (ALU clear) + 16 (BP+8) + 6 (ADDR_B1 + cascade) + 7 (marker
     # suppress) = 3405.
@@ -315,13 +315,13 @@ def test_layer9_alu_full_ir_matches_legacy_helper():
     the legacy ``_set_layer9_alu`` + ``_set_layer9_marker_suppress``
     bake byte-for-byte across all 3405 units."""
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_alu_rules,
+        _alu_rules,
     )
 
     actual = _StubFFN(hidden_dim=3600)
     expected = _legacy_l9_with_marker_suppress()
 
-    rules = _layer9_alu_rules(100.0)
+    rules = _alu_rules(100.0)
     dim_positions = Primitives.dim_positions_from_bd(
         _SetDim,
         Primitives.ffn_rule_dim_names(rules),
@@ -358,7 +358,7 @@ def test_layer9_alu_op_exposes_compiler_ir():
     assert len(op.compiler_ir.layer(0).ffn.rules) == 3405
 
     # Efficient mode skips the compiler_ir publication because the
-    # imperative ``_suppress_l9_legacy_addsub_writes`` post-pass mutates
+    # imperative ``_suppress_legacy_addsub_writes`` post-pass mutates
     # the lowered weights in a way the IR does not model.
     op_eff = make_layer9_alu_op(alu_mode="efficient")
     assert op_eff.compiler_ir is None
@@ -375,10 +375,10 @@ def test_layer9_alu_full_ir_structural_check():
     are checked separately via the per-sub-stage tests above.
     """
     from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
-        _layer9_alu_ir,
+        _alu_ir,
     )
 
-    ir = _layer9_alu_ir(100.0)
+    ir = _alu_ir(100.0)
     dim_positions = Primitives.dim_positions_from_bd(
         _SetDim,
         Primitives.ffn_rule_dim_names(ir.layer(0).ffn.rules),

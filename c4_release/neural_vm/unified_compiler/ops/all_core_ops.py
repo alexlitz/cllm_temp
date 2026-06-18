@@ -248,15 +248,15 @@ def all_core_ops(
         # L9+ consumers without disturbing earlier-phase bakes.
         make_layer8_sp_gathered_sentinel_op(),
         make_layer9_alu_op(alu_mode=alu_mode),
-        make_layer9_lev_addr_relay_op(),
-        make_layer9_lev_bp_to_pc_relay_op(),
+        make_lev_addr_relay_op(),
+        make_lev_bp_to_pc_relay_op(),
         # ALiBi-based memory propagation attention head (phase=9.2).
         # PROOF-OF-CONCEPT for replacing _inject_mem_store / runner shadow
         # memory with attention. Registered always so the dep graph and
         # layer_idx gates see it; bake is a no-op by default (`enable=False`)
         # so existing tests are byte-identical. See l9_ops.py docstring
         # for the full design and slope-tuning analysis.
-        make_layer9_alibi_mem_attn_op(enable=False),
+        make_alibi_mem_attn_op(enable=False),
         # Wave A v2 (2026-06-10): register-tagged STEP_END operand
         # relay. Two declarative attn heads in L9 attn that mirror raw
         # ALU_LO/HI / AX_CARRY_LO/HI / CMP / OP_<cmp> from MARK_AX to
@@ -565,7 +565,7 @@ def all_core_ops(
         # Critical additional ops (M3+ continuation)
         make_binary_pop_sp_increment_op(),
         make_layer10_stack0_byte_relay_op(),
-        make_layer9_marker_suppress_op(),
+        make_marker_suppress_op(),
         # L8 ALU ADD/SUB flatten (5 ops replacing the monolithic ALUAddSub)
         make_l8_alu_addsub_bdtoge_op(),
         make_l8_alu_addsub_stage1_op(),

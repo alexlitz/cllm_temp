@@ -32,11 +32,11 @@ import torch
 
 from c4_release.neural_vm.unified_compiler.ops.l9_ops import (
     make_format_string_fetch_head_op,
-    make_layer9_alibi_mem_attn_op,
+    make_alibi_mem_attn_op,
     make_layer9_alu_op,
-    make_layer9_lev_addr_relay_op,
-    make_layer9_lev_bp_to_pc_relay_op,
-    make_layer9_marker_suppress_op,
+    make_lev_addr_relay_op,
+    make_lev_bp_to_pc_relay_op,
+    make_marker_suppress_op,
 )
 from c4_release.tests._per_op_audit import (
     StubBlock,
@@ -93,7 +93,7 @@ def test_layer9_alu_bake_fires():
 def test_layer9_lev_addr_relay_bake_fires():
     layout = compile_compact_layout()
     changed = assert_fires_during_bake(
-        make_layer9_lev_addr_relay_op(),
+        make_lev_addr_relay_op(),
         layout.dim_positions,
         d_model=layout.d_model,
     )
@@ -108,7 +108,7 @@ def test_layer9_lev_addr_relay_bake_fires():
 def test_layer9_lev_bp_to_pc_relay_bake_fires():
     layout = compile_compact_layout()
     changed = assert_fires_during_bake(
-        make_layer9_lev_bp_to_pc_relay_op(),
+        make_lev_bp_to_pc_relay_op(),
         layout.dim_positions,
         d_model=layout.d_model,
     )
@@ -122,7 +122,7 @@ def test_layer9_alibi_mem_attn_bake_inert_when_disabled():
     """Default ``enable=False`` -> bake is a documented no-op."""
     layout = compile_compact_layout()
     assert_fires_during_bake(
-        make_layer9_alibi_mem_attn_op(enable=False),
+        make_alibi_mem_attn_op(enable=False),
         layout.dim_positions,
         d_model=layout.d_model,
         expect_inert=True,
@@ -147,7 +147,7 @@ def test_layer9_marker_suppress_topology_anchor_is_inert():
     """
     layout = compile_compact_layout()
     assert_fires_during_bake(
-        make_layer9_marker_suppress_op(),
+        make_marker_suppress_op(),
         layout.dim_positions,
         d_model=layout.d_model,
         expect_inert=True,
@@ -174,7 +174,7 @@ def test_layer9_lev_addr_relay_symbolic_bp_to_addr_b0_at_sp_marker():
     BD = layout.dim_positions
     stub = StubBlock(layout.d_model)
     with torch.no_grad():
-        make_layer9_lev_addr_relay_op().bake_fn(stub, BD, 100.0)
+        make_lev_addr_relay_op().bake_fn(stub, BD, 100.0)
 
     # Two-position sequence: pos 0 = prior BP byte 0; pos 1 = current SP
     # marker on a LEV step.

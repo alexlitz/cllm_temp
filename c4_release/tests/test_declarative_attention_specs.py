@@ -30,8 +30,8 @@ from neural_vm.unified_compiler.ops.l8_ops import (  # noqa: E402
     _layer8_sp_gather_head_specs,
 )
 from neural_vm.unified_compiler.ops.l9_ops import (  # noqa: E402
-    _layer9_lev_addr_relay_head_spec,
-    _layer9_lev_bp_to_pc_relay_head_spec,
+    _lev_addr_relay_head_spec,
+    _lev_bp_to_pc_relay_head_spec,
 )
 from neural_vm.unified_compiler.primitives import Primitives  # noqa: E402
 from neural_vm.setup_helpers import (  # noqa: E402
@@ -306,7 +306,7 @@ def test_layer9_lev_addr_relay_declarative_byte_identical_to_legacy_helper():
         _set_layer9_lev_addr_relay(legacy, 100.0, _SetDim, hd)
         Primitives.generate_attention_head(
             generated,
-            _layer9_lev_addr_relay_head_spec(_SetDim),
+            _lev_addr_relay_head_spec(_SetDim),
             hd,
         )
 
@@ -332,7 +332,7 @@ def test_layer9_lev_bp_to_pc_relay_declarative_byte_identical_to_legacy_helper()
         _set_layer9_lev_bp_to_pc_relay(legacy, 100.0, _SetDim, hd)
         Primitives.generate_attention_head(
             generated,
-            _layer9_lev_bp_to_pc_relay_head_spec(_SetDim),
+            _lev_bp_to_pc_relay_head_spec(_SetDim),
             hd,
         )
 

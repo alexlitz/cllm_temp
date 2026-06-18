@@ -139,13 +139,13 @@ _L8_LEV_RELAYED: Tuple[str, ...] = (
     "BP_FRAME_BYTE0", "BP_FRAME_BYTE1", "BP_FRAME_BYTE2",
     "OP_LEV",
 )
-_L9_CMP_RELAYED: Tuple[str, ...] = (
+_CMP_RELAYED: Tuple[str, ...] = (
     "CMP",
     "ALU_LO", "ALU_HI",
     "AX_CARRY_LO", "AX_CARRY_HI",
     "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
 )
-_L9_BP_PLUS8_RELAYED: Tuple[str, ...] = (
+_BP_PLUS8_RELAYED: Tuple[str, ...] = (
     "BP_FRAME_BYTE0", "BP_FRAME_BYTE1",
     "OP_ENT", "OP_LEV",
 )
@@ -327,14 +327,14 @@ _CLUSTER_MANIFEST: Tuple[RuleSpec, ...] = (
         cluster=3,
         factory_module="neural_vm.unified_compiler.ops.l9_ops",
         factory_name="_layer9_cmp_rules",
-        relayed_dims=_L9_CMP_RELAYED,
+        relayed_dims=_CMP_RELAYED,
         notes="L9 rows 1-4: hi_eq / lo_eq / hi_lt / lo_lt branches",
     ),
     RuleSpec(
         cluster=3,
         factory_module="neural_vm.unified_compiler.ops.l9_ops",
         factory_name="_layer9_bp_plus8_shift_rules",
-        relayed_dims=_L9_BP_PLUS8_RELAYED,
+        relayed_dims=_BP_PLUS8_RELAYED,
         notes="Gates on MARK_BP/SP/PC, not MARK_AX — needs helper",
     ),
     # ---------- Cluster 4: L11/L12 (2 rules; 2 factories) ---------------
