@@ -177,7 +177,7 @@ def _nested_jsr_pc_fix_enabled() -> bool:
 # PC decode -> reserved JSR TEMP[0] blank -> TEMP[1..31] clear at PC ->
 # all-step PC decode). Changing any helper's unit count requires
 # updating this table in lock-step.
-_L5_FFN_UNIT_LAYOUT = (
+_FETCH_FFN_UNIT_LAYOUT = (
     # (sub-stage name, legacy_start (docs only), n_units)
     # 34 main per-opcode AX rules (one unit per opcode in the table at
     # ``_opcode_decode_main_rules``). Unit 3 writes TEMP+0 (JSR's IS_JSR
@@ -204,20 +204,20 @@ _L5_FFN_UNIT_LAYOUT = (
 # Total = 34 + 18 + 1 + 31 + 5 = 89 units (final cursor lands at 89;
 # highest used unit index is 88, matching the 5/ffn_W_down/88 claim on
 # OP_JMP+0 in ``make_opcode_decode_ffn_op``).
-_L5_FFN_BASE_UNITS = 89
+_FETCH_FFN_BASE_UNITS = 89
 
 
-def _l5_ffn_total_units() -> int:
+def _fetch_ffn_total_units() -> int:
     """89 base units, +1 (unit 89, all-step JSR TEMP+0 decode) when the
     Root B nested-JSR fix flag is on. Flag-off => 89 (byte-identical)."""
-    return _L5_FFN_BASE_UNITS + (1 if _nested_jsr_pc_fix_enabled() else 0)
+    return _FETCH_FFN_BASE_UNITS + (1 if _nested_jsr_pc_fix_enabled() else 0)
 
 
-def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
+def _allocate_fetch_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L5 FFN sub-stages.
 
     Phase 7.B.2: ``pin=`` is dropped from every entry in
-    :data:`_L5_FFN_UNIT_LAYOUT`. The allocator's default first-fit
+    :data:`_FETCH_FFN_UNIT_LAYOUT`. The allocator's default first-fit
     strategy walks the layout in declaration order and lands each
     sub-stage at the lowest free gap large enough to hold it. Because
     the layout is fully contiguous (every entry starts exactly where
@@ -235,7 +235,7 @@ def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
     future L5 op claims a free range past unit 89).
     """
     allocator = FFNUnitAllocator()
-    for name, _legacy_start, n_units in _L5_FFN_UNIT_LAYOUT:
+    for name, _legacy_start, n_units in _FETCH_FFN_UNIT_LAYOUT:
         allocator.alloc(name, n_units)
     if _nested_jsr_pc_fix_enabled():
         # Root B: one extra all-step JSR TEMP+0 decode unit at index 89.
@@ -243,7 +243,7 @@ def _allocate_layer5_ffn_units() -> FFNUnitAllocator:
     return allocator
 
 
-def make_layer5_fetch_op() -> Operation:
+def make_fetch_op() -> Operation:
     """L5 attention: instruction-fetch heads (8 heads).
 
     Dispatched as a block op pinned to layer_idx=5 so the bake hits the same
@@ -265,7 +265,7 @@ def make_layer5_fetch_op() -> Operation:
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_heads(
             attn,
-            _layer5_fetch_head_specs(BD),
+            _fetch_head_specs(BD),
             HD,
         )
 
@@ -321,7 +321,7 @@ def make_layer5_fetch_op() -> Operation:
         # compiler places the anchor at.
         target_op_name="_layer5_fetch_dep_anchor",
         declarative_bake_fn=bake,
-        compiler_ir_factory=_layer5_fetch_ir,
+        compiler_ir_factory=_fetch_ir,
         migrated=True,
         claims=_claims,
         # Phase 8.A targeted (SCC audit step 7): pin the ADDR_KEY reader to
@@ -342,10 +342,10 @@ def make_layer5_fetch_op() -> Operation:
     )
 
 
-def _layer5_fetch_ir(dim_positions, HD) -> CompilerIR:
+def _fetch_ir(dim_positions, HD) -> CompilerIR:
     BD = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.extend(_layer5_fetch_head_specs(BD))
+    ir.layer(0).attention.extend(_fetch_head_specs(BD))
     return ir
 
 
@@ -372,7 +372,7 @@ def _code_fetch_v_writes(BD, weight: float = 1.0):
     )
 
 
-def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+def _fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     """Declarative replacement for ``setup_helpers._set_layer5_fetch``.
 
     Attention-gate audit (docs/Q_SIDE_GATE_AUDIT_2026_06_07.md,
@@ -569,7 +569,7 @@ def _layer5_fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     return tuple(specs)
 
 
-def make_layer5_fetch_dep_anchor_op() -> Operation:
+def make_fetch_dep_anchor_op() -> Operation:
     """No-op companion for layer5_fetch: declares identical reads/writes so
     the LayerCompiler's dep graph reserves a layer slot for it. The actual
     bake happens in `layer5_fetch` (kind="block", layer_idx=5); this op's
@@ -627,7 +627,7 @@ def make_opcode_decode_ffn_op() -> Operation:
         # claiming a free gap past unit 89). Mirrors the L9 pattern in
         # ``make_layer9_alu_op`` and the L4 pattern in
         # ``make_layer4_ffn_op``.
-        allocator = _allocate_layer5_ffn_units()
+        allocator = _allocate_fetch_ffn_units()
         block.ffn._l5_unit_allocator = allocator
 
         # Phase 8.C inline cut: lower the ``_opcode_decode_ffn_rules`` IR
@@ -648,9 +648,9 @@ def make_opcode_decode_ffn_op() -> Operation:
         # at the allocator's declared footprint. If the layout table
         # drifts from the helper's writes, this assertion fires before
         # any weight surgery happens.
-        assert final_unit == _l5_ffn_total_units(), (
+        assert final_unit == _fetch_ffn_total_units(), (
             f"L5 FFN unit cursor drift: helper returned {final_unit}, "
-            f"allocator expected {_l5_ffn_total_units()}"
+            f"allocator expected {_fetch_ffn_total_units()}"
         )
 
     # Dim-ownership claims (W_down output cells). The bake programs four
@@ -1022,7 +1022,7 @@ def _opcode_decode_jsr_temp0_blank_rule() -> FFNRule:
 def _opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     """Full ordered ``FFNRule`` sequence for ``opcode_decode_ffn``.
 
-    Matches the 89-unit layout declared in ``_L5_FFN_UNIT_LAYOUT``:
+    Matches the 89-unit layout declared in ``_FETCH_FFN_UNIT_LAYOUT``:
 
       * units 0..33  — main per-opcode AX decode (34 rules)
       * units 34..51 — first-step PC-marker decode (18 rules)
@@ -1058,7 +1058,7 @@ def _opcode_decode_ffn_ir(S: float = 100.0) -> CompilerIR:
     return ir
 
 
-def _lower_l5_opcode_rules(ffn, rules, BD, *, unit: int, S: float) -> int:
+def _lower_opcode_rules(ffn, rules, BD, *, unit: int, S: float) -> int:
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
         Primitives.ffn_rule_dim_names(rules),
@@ -1076,7 +1076,7 @@ def _bake_opcode_decode_ffn(ffn, S, BD) -> int:
     """Declarative L5 FFN spec: opcode-byte one-hot decode.
 
     Returns the post-bake unit cursor (must equal
-    :data:`_L5_FFN_TOTAL_UNITS` for byte-identity with the historical
+    :data:`_FETCH_FFN_TOTAL_UNITS` for byte-identity with the historical
     89-unit footprint). The caller asserts this in
     ``make_opcode_decode_ffn_op``.
 
@@ -1088,7 +1088,7 @@ def _bake_opcode_decode_ffn(ffn, S, BD) -> int:
     op exposes via ``compiler_ir=`` for symbolic / verifier tooling.
     """
 
-    return _lower_l5_opcode_rules(
+    return _lower_opcode_rules(
         ffn,
         _opcode_decode_ffn_rules(S),
         BD,
@@ -1134,7 +1134,7 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         spec_section=None,
         # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): L5's
         # opcode_decode_ffn bake claims 89 fetch / opcode-decode units
-        # via ``_l5_ffn_total_units()`` (90 with the Root B nested-JSR fix
+        # via ``_fetch_ffn_total_units()`` (90 with the Root B nested-JSR fix
         # flag on; 89 off). The audit reported 88 non-zero rows post-bake
         # (one reserved blank slot has empty W_up/W_gate) but the allocator
         # footprint and the bake's monotonic cursor both walk the full
@@ -1143,7 +1143,7 @@ def make_opcode_decode_ffn_dep_anchor_op() -> Operation:
         # historical 4096 fallback, eliminating ~4007 dead rows. The rule
         # lowering uses a monotonic cursor independent of the layer max so
         # byte-identity is preserved.
-        ffn_units_used=_l5_ffn_total_units(),
+        ffn_units_used=_fetch_ffn_total_units(),
     )
 
 
@@ -1255,7 +1255,7 @@ def _lookahead_opcode_fetch_head_spec(
 ) -> DeclarativeAttentionHeadSpec:
     """Lookahead fetch head: Q=PC+8 address, K=ADDR_KEY, V=CLEAN_EMBED.
 
-    GENERATED by ``consumer_lookahead_gate``. Mirrors ``_layer5_fetch_head_specs``
+    GENERATED by ``consumer_lookahead_gate``. Mirrors ``_fetch_head_specs``
     head 1 (non-first-step opcode fetch at AX) but the Q address is
     ``LOOKAHEAD_PC`` (PC+8) instead of the current PC (EMBED). The matched CODE
     position is op2's slot; its CLEAN_EMBED nibbles (the opcode byte) are copied
@@ -1294,7 +1294,7 @@ def make_lookahead_opcode_fetch_op() -> Operation:
             return
         attn = block.attn
         allocator = _allocate_lookahead_fetch_heads()
-        attn._l5_lookahead_fetch_head_allocator = allocator
+        attn._lookahead_fetch_head_allocator = allocator
         head_idx = allocator.heads()[-1].head_idx
         HD = attn.W_q.shape[0] // attn.num_heads
         spec = _lookahead_opcode_fetch_head_spec(dim_positions, head_idx)

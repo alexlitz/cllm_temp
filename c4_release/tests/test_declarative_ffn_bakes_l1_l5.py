@@ -22,7 +22,7 @@ from c4_release.neural_vm.unified_compiler.ops.l5_ops import (
     _opcode_decode_ffn_ir,
     _opcode_decode_ffn_rules,
     _opcode_decode_jsr_temp0_blank_rule,
-    _lower_l5_opcode_rules,
+    _lower_opcode_rules,
     _opcode_decode_first_step_rules,
     _opcode_decode_main_rules,
     _opcode_decode_temp_clear_rules,
@@ -112,7 +112,7 @@ def test_opcode_decode_main_ir_rules_match_legacy_units():
     expected = _StubFFN(hidden_dim=128)
 
     rules = _opcode_decode_main_rules(100.0)
-    end = _lower_l5_opcode_rules(actual, rules, _SetDim, unit=0, S=100.0)
+    end = _lower_opcode_rules(actual, rules, _SetDim, unit=0, S=100.0)
     _set_opcode_decode_ffn(expected, 100.0, _SetDim)
 
     assert end == 34
@@ -124,7 +124,7 @@ def test_opcode_decode_first_step_ir_rules_match_legacy_units():
     expected = _StubFFN(hidden_dim=128)
 
     rules = _opcode_decode_first_step_rules(100.0)
-    end = _lower_l5_opcode_rules(actual, rules, _SetDim, unit=34, S=100.0)
+    end = _lower_opcode_rules(actual, rules, _SetDim, unit=34, S=100.0)
     _set_opcode_decode_ffn(expected, 100.0, _SetDim)
 
     assert end == 52
@@ -136,7 +136,7 @@ def test_opcode_decode_temp_clear_ir_rules_match_legacy_units():
     expected = _StubFFN(hidden_dim=128)
 
     rules = _opcode_decode_temp_clear_rules(100.0)
-    end = _lower_l5_opcode_rules(actual, rules, _SetDim, unit=53, S=100.0)
+    end = _lower_opcode_rules(actual, rules, _SetDim, unit=53, S=100.0)
     _set_opcode_decode_ffn(expected, 100.0, _SetDim)
 
     assert end == 84
@@ -153,7 +153,7 @@ def test_opcode_decode_all_step_pc_ir_rules_match_legacy_units():
     expected = _StubFFN(hidden_dim=128)
 
     rules = _opcode_decode_all_step_pc_rules(100.0)
-    end = _lower_l5_opcode_rules(actual, rules, _SetDim, unit=84, S=100.0)
+    end = _lower_opcode_rules(actual, rules, _SetDim, unit=84, S=100.0)
     _set_opcode_decode_ffn(expected, 100.0, _SetDim)
 
     assert end == 89

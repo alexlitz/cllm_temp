@@ -128,8 +128,8 @@ def all_core_ops(
         # survives without the emitted STACK0 token. With the flag off, L7's
         # declarative STACK0 gather owns binary-pop operand 2 unchanged.
         make_layer4_sp_to_addr_key_op(enable=operand_from_memsp_enabled()),
-        make_layer5_fetch_op(),
-        make_layer5_fetch_dep_anchor_op(),
+        make_fetch_op(),
+        make_fetch_dep_anchor_op(),
         # Consumer-opcode LOOKAHEAD (#221 framing-drift fix; flag-gated
         # C4_STACK0_NEXT_ARITH, DEFAULT-OFF). The C4_STACK0_B0_DUMP over-fires
         # on arithmetic-intermediate operand frames (expr a*b/c) but is needed

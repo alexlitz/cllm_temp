@@ -17,8 +17,8 @@ from neural_vm.unified_compiler.ops.l3_ops import (  # noqa: E402
     _stack0_carry_head_spec,
 )
 from neural_vm.unified_compiler.ops.l5_ops import (  # noqa: E402
-    _layer5_fetch_head_specs,
-    make_layer5_fetch_op,
+    _fetch_head_specs,
+    make_fetch_op,
 )
 from neural_vm.unified_compiler.ops.l6_ops import (  # noqa: E402
     _bake_layer6_attn_spec,
@@ -202,7 +202,7 @@ def test_layer5_fetch_declarative_byte_identical_to_legacy_helper():
         _set_layer5_fetch(legacy, 100.0, _SetDim, hd)
         Primitives.generate_attention_heads(
             generated,
-            _layer5_fetch_head_specs(_SetDim),
+            _fetch_head_specs(_SetDim),
             hd,
         )
 
@@ -219,7 +219,7 @@ def test_layer5_fetch_pc_opcode_head_uses_exact_address_without_recency_bias():
         d_model, num_heads=num_heads, layer_idx=5, use_flash_attention=False
     )
 
-    make_layer5_fetch_op().declarative_bake_fn(
+    make_fetch_op().declarative_bake_fn(
         SimpleNamespace(attn=attn),
         _setdim_positions(),
         100.0,

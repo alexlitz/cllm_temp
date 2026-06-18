@@ -9,7 +9,7 @@ callers do not need to change.
 New code should import directly from the per-layer modules:
 
     from c4_release.neural_vm.unified_compiler.ops.l5_ops import (
-        make_layer5_fetch_op,
+        make_fetch_op,
     )
 
 See ``ops/__init__.py`` for the full list of available submodules.
