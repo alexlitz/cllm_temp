@@ -85,18 +85,28 @@ from .symbolic_forward import _OPCODE_NAMES, decode_instr  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
-# 35-token VM-step window layout (mirrors dim_oracle / DraftVM.draft_tokens).
+# VM-step window layout (mirrors dim_oracle / DraftVM.draft_tokens).
+#
+# DEFAULT 35-token layout: PC@0+4, AX@5+4, SP@10+4, BP@15+4, STACK0@20+4,
+# MEM@25 (+4 addr +4 val), STEP_END@34. Under ``C4_NO_STACK0_EMIT`` the STACK0
+# register block is dropped -> 30 tokens, MEM marker 25->20, STEP_END 34->29,
+# and POS_STACK0_MARKER is None. The register markers stay at {0,5,10,15}.
+# ``Token.STEP_TOKENS`` is the single authority (env flag resolved once at
+# import); flag-OFF values are byte-identical to the historical hardcodes.
 # ---------------------------------------------------------------------------
 
-STEP_TOKENS = 35
+from ..vm_step import Token
+
+STEP_TOKENS = Token.STEP_TOKENS
+_NO_STACK0_EMIT = STEP_TOKENS == 30
 
 POS_PC_MARKER = 0
 POS_AX_MARKER = 5
 POS_SP_MARKER = 10
 POS_BP_MARKER = 15
-POS_STACK0_MARKER = 20
-POS_MEM_MARKER = 25
-POS_STEP_END = 34
+POS_STACK0_MARKER = None if _NO_STACK0_EMIT else 20
+POS_MEM_MARKER = 20 if _NO_STACK0_EMIT else 25
+POS_STEP_END = STEP_TOKENS - 1
 
 
 # ---------------------------------------------------------------------------
@@ -993,9 +1003,11 @@ def step_token_positions(n_steps: int, prompt_len: int = 0) -> Dict[int, str]:
     roles = {
         POS_PC_MARKER: "PC_MARK", POS_AX_MARKER: "AX_MARK",
         POS_SP_MARKER: "SP_MARK", POS_BP_MARKER: "BP_MARK",
-        POS_STACK0_MARKER: "STACK0_MARK", POS_MEM_MARKER: "MEM_MARK",
-        POS_STEP_END: "STEP_END",
+        POS_MEM_MARKER: "MEM_MARK", POS_STEP_END: "STEP_END",
     }
+    # STACK0 marker only exists in the 35-token layout (None under the flag).
+    if POS_STACK0_MARKER is not None:
+        roles[POS_STACK0_MARKER] = "STACK0_MARK"
     out: Dict[int, str] = {}
     for step in range(n_steps):
         base = prompt_len + step * STEP_TOKENS

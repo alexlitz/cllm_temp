@@ -348,8 +348,12 @@ def oracle_tape_and_steps(
 # Fixed-offset per-step decode (markers re-anchored, as production does).
 # ---------------------------------------------------------------------------
 
-# Register marker offset inside a 35-token step (DraftVM.draft_tokens layout).
-_REG_OFFSETS = {"PC": 0, "AX": 5, "SP": 10, "BP": 15, "STACK0": 20}
+# Register marker offset inside a step (DraftVM.draft_tokens layout). The
+# PC/AX/SP/BP markers are fixed at {0,5,10,15} in both layouts; STACK0 is at 20
+# ONLY in the 35-token layout (dropped under C4_NO_STACK0_EMIT => STEP_TOKENS=30).
+_REG_OFFSETS = {"PC": 0, "AX": 5, "SP": 10, "BP": 15}
+if STEP_TOKENS != 30:
+    _REG_OFFSETS["STACK0"] = 20
 
 
 def _decode_reg_fixed(slice_tokens: Sequence[int], marker_off: int) -> int:
@@ -397,17 +401,24 @@ def _decode_reg_fixed(slice_tokens: Sequence[int], marker_off: int) -> int:
 # ---------------------------------------------------------------------------
 
 # Step-relative offsets that carry a REGISTER VALUE byte the model re-emits on a
-# later step (PC 1..4, AX 6..9, SP 11..14, BP 16..19, STACK0 21..24). The MEM
-# addr/val offsets 26..33 are the ``_UNSAFE_OFFSETS`` (DraftVM-trusted, never a
-# model correction); the marker offsets 0/5/10/15/20/25/34 are re-anchored.
+# later step. 35-token: PC 1..4, AX 6..9, SP 11..14, BP 16..19, STACK0 21..24.
+# 30-token (C4_NO_STACK0_EMIT): the STACK0 block is dropped, so the value bytes
+# are PC 1..4, AX 6..9, SP 11..14, BP 16..19 only. The MEM addr/val offsets are
+# the ``_UNSAFE_OFFSETS`` (DraftVM-trusted, never a model correction); the marker
+# offsets {0,5,10,15,(20),MEM_marker,STEP_END} are re-anchored.
 _VALUE_OFFSETS = frozenset(
     list(range(1, 5)) + list(range(6, 10)) + list(range(11, 15))
-    + list(range(16, 20)) + list(range(21, 25))
+    + list(range(16, 20))
+    + (list(range(21, 25)) if STEP_TOKENS != 30 else [])
 )
 # MEM addr/val bytes the DraftVM is trusted for (production never reads a model
 # correction here — the embedding's MEM-metadata injection makes them disagree
-# with the flat argmax for EVERY program). Mirrors batched_pure_neural._UNSAFE_OFFSETS.
-_UNSAFE_OFFSETS = frozenset(range(26, 34))
+# with the flat argmax for EVERY program). Mirrors batched_pure_neural._UNSAFE_OFFSETS:
+# 35-token MEM addr/val = 26..33; 30-token (STACK0 dropped) = 21..28.
+if STEP_TOKENS == 30:
+    _UNSAFE_OFFSETS = frozenset(range(21, 29))
+else:
+    _UNSAFE_OFFSETS = frozenset(range(26, 34))
 
 
 def _value_correction_step(

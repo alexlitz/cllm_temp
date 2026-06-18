@@ -88,8 +88,16 @@ from .symbolic_forward import (
 )
 
 
-# Token layout — every step emits 35 tokens. See neural_vm/token_layout.py.
-TOKENS_PER_STEP = 35
+# Token layout — every step emits ``Token.STEP_TOKENS`` tokens. The DEFAULT is
+# 35 (PC/AX/SP/BP/STACK0 + MEM + SE); under ``C4_NO_STACK0_EMIT`` the STACK0
+# register block is dropped -> 30, and MEM/STEP_END shift 5 earlier. Parametrize
+# on ``Token.STEP_TOKENS`` (the single authority — it reads the env flag once at
+# import). Flag-OFF values are byte-identical to the historical hardcodes.
+# See neural_vm/token_layout.py.
+from ..vm_step import Token
+
+TOKENS_PER_STEP = Token.STEP_TOKENS
+_NO_STACK0_EMIT = TOKENS_PER_STEP == 30
 
 # Position of each marker / byte slot within a single step's token window.
 POS_PC_MARKER = 0
@@ -104,24 +112,29 @@ POS_SP_BYTE0 = 11
 POS_BP_MARKER = 15
 POS_BP_BYTE0 = 16
 
-POS_STACK0_MARKER = 20
-POS_STACK0_BYTE0 = 21
+# STACK0 block: present only in the 35-token layout (dropped under the flag).
+POS_STACK0_MARKER = None if _NO_STACK0_EMIT else 20
+POS_STACK0_BYTE0 = None if _NO_STACK0_EMIT else 21
 
-POS_MEM_MARKER = 25
-POS_MEM_ADDR_BYTE0 = 26
-POS_MEM_VAL_BYTE0 = 30
+# MEM section + STEP_END shift 5 earlier when STACK0 is dropped.
+POS_MEM_MARKER = 20 if _NO_STACK0_EMIT else 25
+POS_MEM_ADDR_BYTE0 = POS_MEM_MARKER + 1
+POS_MEM_VAL_BYTE0 = POS_MEM_ADDR_BYTE0 + 4
 
-POS_STEP_END = 34
+POS_STEP_END = TOKENS_PER_STEP - 1
 
 
-# Map register name -> (marker_pos, byte0_pos). Used for projection.
+# Map register name -> (marker_pos, byte0_pos). Used for projection. STACK0 is
+# only a slot in the 35-token layout; omit it entirely under the flag so the
+# projection emits no STACK0 marker / byte-index / nibble cells.
 _REGISTER_SLOTS: Dict[str, Tuple[int, int]] = {
     "PC":     (POS_PC_MARKER, POS_PC_BYTE0),
     "AX":     (POS_AX_MARKER, POS_AX_BYTE0),
     "SP":     (POS_SP_MARKER, POS_SP_BYTE0),
     "BP":     (POS_BP_MARKER, POS_BP_BYTE0),
-    "STACK0": (POS_STACK0_MARKER, POS_STACK0_BYTE0),
 }
+if not _NO_STACK0_EMIT:
+    _REGISTER_SLOTS["STACK0"] = (POS_STACK0_MARKER, POS_STACK0_BYTE0)
 
 
 # Dim families the oracle currently models. The right-hand-side names a
@@ -728,10 +741,14 @@ def _project_per_token(state, base: int) -> Dict[Tuple[int, str], float]:
     for tok in range(TOKENS_PER_STEP):
         out[(base + tok, "CONST+0")] = 1.0
 
+    # STACK0 marker is absent (None) under the 30-token flag — drop it from the
+    # marker set so its slot is not flagged IS_MARK.
     marker_positions = {
         POS_PC_MARKER, POS_AX_MARKER, POS_SP_MARKER, POS_BP_MARKER,
-        POS_STACK0_MARKER, POS_MEM_MARKER, POS_STEP_END,
+        POS_MEM_MARKER, POS_STEP_END,
     }
+    if POS_STACK0_MARKER is not None:
+        marker_positions.add(POS_STACK0_MARKER)
     for tok in range(TOKENS_PER_STEP):
         if tok in marker_positions:
             out[(base + tok, "IS_MARK+0")] = 1.0
@@ -742,7 +759,8 @@ def _project_per_token(state, base: int) -> Dict[Tuple[int, str], float]:
     out[(base + POS_AX_MARKER,     "MARK_AX+0")] = 1.0
     out[(base + POS_SP_MARKER,     "MARK_SP+0")] = 1.0
     out[(base + POS_BP_MARKER,     "MARK_BP+0")] = 1.0
-    out[(base + POS_STACK0_MARKER, "MARK_STACK0+0")] = 1.0
+    if POS_STACK0_MARKER is not None:
+        out[(base + POS_STACK0_MARKER, "MARK_STACK0+0")] = 1.0
     out[(base + POS_MEM_MARKER,    "MARK_MEM+0")] = 1.0
     out[(base + POS_STEP_END,      "MARK_SE+0")] = 1.0
 
@@ -758,13 +776,17 @@ def _project_per_token(state, base: int) -> Dict[Tuple[int, str], float]:
         "AX":     state.ax,
         "SP":     state.sp,
         "BP":     state.bp,
-        "STACK0": state.stack0,
     }
+    if "STACK0" in _REGISTER_SLOTS:
+        reg_values["STACK0"] = state.stack0
     for reg_name, value in reg_values.items():
         _, byte0_pos = _REGISTER_SLOTS[reg_name]
         _emit_register_nibbles(out, base, byte0_pos, value)
 
+    # STACK0_BYTE_VAL_h one-hots — only when the STACK0 block is emitted.
     for h in range(1, 4):
+        if POS_STACK0_BYTE0 is None:
+            break
         byte_val = (state.stack0 >> (h * 8)) & 0xFF
         lo = byte_val & 0x0F
         hi = (byte_val >> 4) & 0x0F

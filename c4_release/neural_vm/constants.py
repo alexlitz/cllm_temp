@@ -57,19 +57,37 @@ def immediate_address(pc):
 # Token Format Constants (Autoregressive Output)
 # =============================================================================
 
-# Each VM step generates 35 tokens in a fixed format
-TOKENS_PER_STEP = 35     # Total tokens per VM step
+# Each VM step generates 35 tokens in a fixed format (the DEFAULT layout):
+# PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1).
+#
+# PROTOTYPE (``C4_NO_STACK0_EMIT=1``): the STACK0 register block (marker + 4
+# value bytes) is dropped from the emitted step -> 30 tokens. STACK0 == mem[SP]
+# is recoverable from memory state, so its emission carries no decoder-read
+# information (full_trace checks PC + AX only); dropping it removes the Root #2
+# framing-drift class. ``Token.STEP_TOKENS`` (vm_step.py) is the authority; we
+# can't import it here (it imports this module — circular), so this mirrors the
+# SAME env-flag read so the two never diverge. Resolved once at import.
+import os as _os_const
+_NO_STACK0_EMIT = _os_const.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+del _os_const
+
+# Number of register blocks emitted per step. Default 5 (PC, AX, SP, BP,
+# STACK0); under C4_NO_STACK0_EMIT the STACK0 block is dropped -> 4.
+N_REGISTER_BLOCKS = 4 if _NO_STACK0_EMIT else 5
 
 # Token field sizes
 TOKENS_PER_REGISTER = 5  # Marker + 4 value bytes (for PC, AX, SP, BP, STACK0)
 TOKENS_FOR_MEM = 9       # Marker + 4 addr bytes + 4 value bytes
 TOKENS_FOR_TERMINATOR = 1  # STEP_END or HALT
 
-# Validate token count
-assert (TOKENS_PER_REGISTER * 5  # PC, AX, SP, BP, STACK0
-        + TOKENS_FOR_MEM         # MEM field
-        + TOKENS_FOR_TERMINATOR  # Terminator
-        ) == TOKENS_PER_STEP, "Token count mismatch"
+TOKENS_PER_STEP = (
+    TOKENS_PER_REGISTER * N_REGISTER_BLOCKS  # PC, AX, SP, BP, (STACK0)
+    + TOKENS_FOR_MEM                          # MEM field
+    + TOKENS_FOR_TERMINATOR                   # Terminator
+)
+
+# Validate token count (35 flag-OFF, 30 flag-ON)
+assert TOKENS_PER_STEP == (30 if _NO_STACK0_EMIT else 35), "Token count mismatch"
 
 # =============================================================================
 # Data Type Sizes
