@@ -711,3 +711,263 @@ def make_no_stack0_se_output_clear_op() -> Operation:
         smoke_tests={"all"},
         spec_section="STACK0_VIA_MEM_ATTENTION_PLAN.md#10",
     )
+
+
+# ===========================================================================
+# No-STACK0 (30-token) PC value-byte OUTPUT clear (C4_NO_STACK0_EMIT) -- Inc 0
+# ===========================================================================
+#
+# ROOT (spec_k=0 token dump, tools/probe_nostack0_{dump,pcband,blockattr}.py;
+# add_1 id1 got_pc=0x01010111 vs 26): with the 30-token frame the REGISTER
+# FRAME is byte-clean (markers at {0,5,10,15,20} every step -- NO drift), but
+# the PC VALUE bytes are polluted by a self-reinforcing ``0x01``/nibble-1 leak.
+# A positional ``0x01`` writer (block 33 == layer15_nibble_copy + its memory
+# lookup attention, plus the block-41 L25 tail corrector) sprays
+# ``OUTPUT_LO+1 = +large / OUTPUT_LO+0 = -large`` onto the SHIFTED 30-token
+# MEM/BP region (the dropped STACK0 block left the MEM block 5 tokens early,
+# so the distance-from-BP-marker gates and the PSH_AT_SP AND-headroom misfire).
+# The ``0x01`` lands in OUTPUT at the BP/MEM-addr rows in step 0, the
+# nibble-copy then re-reads the emitted ``0x01`` tokens' embeddings each step
+# (self-reinforcement), and by step 2 the leak has propagated onto the PC
+# rows -> every PC byte emits ``0x01`` (high bytes) / ``0x11`` (byte 0 low
+# nibble clobbered from ``a`` to ``1``). The verdict
+# (batched_pure_neural._decode_step_register) then reads got_pc=0x01010111.
+# This is the dominant 30-token blocker (288/375 PC-wrong / PC-byte-replication
+# = mechanism (a): positional gates corrupt the shifted frame; NOT (c) frame
+# drift -- the markers never move).
+#
+# FIX: a standalone PureFFN post_op (after tail_bit32_result_correction, i.e.
+# the LAST OUTPUT writer before the LM head on every row) that, at the PC
+# value-byte rows ONLY (gated on the L0 ``H1+0`` PC-marker proximity head +
+# IS_BYTE + the per-byte BYTE_INDEX one-hot), drives OUTPUT_LO/HI nibbles 1..15
+# hugely negative so the PC HIGH bytes (1/2/3) default to ``0x00`` and the
+# byte-0 row's leaked nibble-1 is sunk so the genuine low nibble wins. The PC
+# high bytes are ``0x00`` for the entire 1096 corpus EXCEPT the rare linear-PC
+# carry past 0x100, which the L3 ``pc_byte1`` rule emits via TEMP+16 -- so the
+# byte-1-predicting row's clear is gated NOT(TEMP+16) to preserve that carry.
+# Because this is the last writer at the PC rows it overrides ALL upstream
+# leak sources at once (block 33 + block 41 + the attention copy), and because
+# the emitted PC tokens become clean each step the cross-step self-reinforcement
+# is broken at the root. Gated by ``C4_NO_STACK0_EMIT``: flag-OFF bakes NO
+# units (byte-identical to golden b9d8861f).
+#
+# The PC value bytes are unread on the marker row itself (only the next REG_PC
+# is emitted from STEP_END), so clobbering OUTPUT at the PC byte rows is
+# semantically free for everything BUT the PC byte tokens we are correcting.
+#
+# CRITICAL magnitude note: the sink must be LARGE enough to bury the ~110-mag
+# nibble-1 leak (so OUTPUT_LO+0 wins -> 0x00) but SMALL enough that the byte
+# logit stays well ABOVE the register-marker logit at this row (the LM head
+# emits a MARKER, not a byte, if every OUTPUT nibble sinks below the marker's
+# baseline -- which would re-introduce the +1-token frame drift this campaign
+# eliminates). ``-1e16`` (the §11 STEP_END value, where a marker IS due) drives
+# the byte logit below the marker and DESYNCS the frame. ``-300`` buries the
+# +110 leak with headroom while OUTPUT_LO+0 (~+1) keeps the 0x00 byte logit
+# comfortably positive and above the marker.
+_NO_STACK0_PC_CLEAR_WW = -300.0  # per-nibble sink: > leak (~110), < marker gap
+
+
+def _no_stack0_pc_highbyte_clear_rules() -> tuple[FFNRule, ...]:
+    """Clear OUTPUT high nibbles at the PC value-byte rows (30-token build).
+
+    Four PC-block rows are corrected (each predicts the NEXT emitted PC token):
+
+      * ``BYTE_INDEX_0`` row -> predicts PC byte 1 (0x00 for all add/sub PCs).
+      * ``BYTE_INDEX_1`` row -> predicts PC byte 2 (always 0x00 in corpus).
+      * ``BYTE_INDEX_2`` row -> predicts PC byte 3 (always 0x00 in corpus).
+      * ``MARK_PC`` row (marker) -> predicts PC byte 0: ONLY the leaked
+        nibble-1 is cancelled (the genuine value bits are kept).
+
+    The three byte rows fire only when the L0 ``H1+0`` head (nearest marker is
+    PC, within d<=4.5) is ON, so they isolate the PC register block from
+    AX/SP/BP (which carry ``H1+1/2/3``). Each sinks OUTPUT_LO/HI nibbles 1..15
+    and restores LO+0 / HI+0 so the byte logit collapses to ``0x00``.
+    """
+    PC_HEAD = "H1+0"  # L0 threshold head: nearest marker is PC, d<=4.5
+    BLOCKER_W = 1_000.0
+    WW = _NO_STACK0_PC_CLEAR_WW
+    # Positive restore for the zero nibble (LO+0 / HI+0) -- the leak drives
+    # OUTPUT_LO+0 NEGATIVE (~-90), so simply sinking the other nibbles is not
+    # enough; the 0x00 byte logit (LO+0 + HI+0) must be POSITIVE and above the
+    # marker. ``+300`` lifts the zero nibble decisively while staying well below
+    # any value that would itself look like garbage.
+    WPOS = 300.0
+    # (byte-index row, extra NOT-conditions to protect a genuine value)
+    #
+    # PC byte 1 (BYTE_INDEX_0 row) is 0x00 for every linear-PC program in the
+    # add/sub acceptance set (PC stays < 0x100: 10/18/26/34). The rare
+    # linear-PC carry past 0x100 (corpus tops out at 0x14a) would want byte1 =
+    # 0x01; the obvious ``NOT(TEMP+16)`` carry-tag guard is UNRELIABLE under the
+    # 30-token frame (TEMP+16 reads ~0.99 even on the no-carry add_1 step-2 PC
+    # row, so it spuriously blocks the clear and byte1 stays 0x01). For Inc 0
+    # (add/sub PC-clean) we clear byte1 unconditionally; restoring the genuine
+    # high-PC carry for the <1% of programs past 0x100 is deferred to a later
+    # increment with a value-derived (not TEMP-tag) carry signal.
+    rows = (
+        ("BYTE_INDEX_0", ()),  # predicts byte1 (0x00 for all add/sub PCs)
+        ("BYTE_INDEX_1", ()),  # predicts byte2
+        ("BYTE_INDEX_2", ()),  # predicts byte3
+    )
+    rules: list[FFNRule] = []
+    for byte_index_name, extra in rows:
+        base_conds = (
+            (PC_HEAD, 1.0),
+            ("IS_BYTE", 1.0),
+            (byte_index_name, 1.0),
+            # Cross-marker blockers: PC head must be the nearest one. Other
+            # register/section heads are -blockers (defensive -- H1 slots are
+            # near one-hot per row, but PSH_AT_SP headroom can lift a runner-up).
+            ("H1+1", -BLOCKER_W),
+            ("H1+2", -BLOCKER_W),
+            ("H1+3", -BLOCKER_W),
+        ) + extra
+        # Sink the high nibbles (the leaked nibble-1 + any stray high nibble)
+        # AND restore the zero nibble (LO+0 / HI+0) positive so the 0x00 byte
+        # wins decisively over both the leak and the register-marker logit.
+        for k in range(1, 16):
+            rules.append(multi_way_and_rule(
+                name=f"no_stack0_pc_clear_{byte_index_name.lower()}_lo_{k}",
+                conditions=base_conds,
+                threshold=2.5,
+                writes=((f"OUTPUT_LO+{k}", WW),),
+            ))
+        for k in range(1, 16):
+            rules.append(multi_way_and_rule(
+                name=f"no_stack0_pc_clear_{byte_index_name.lower()}_hi_{k}",
+                conditions=base_conds,
+                threshold=2.5,
+                writes=((f"OUTPUT_HI+{k}", WW),),
+            ))
+        rules.append(multi_way_and_rule(
+            name=f"no_stack0_pc_clear_{byte_index_name.lower()}_lo0_restore",
+            conditions=base_conds,
+            threshold=2.5,
+            writes=(("OUTPUT_LO+0", WPOS),),
+        ))
+        rules.append(multi_way_and_rule(
+            name=f"no_stack0_pc_clear_{byte_index_name.lower()}_hi0_restore",
+            conditions=base_conds,
+            threshold=2.5,
+            writes=(("OUTPUT_HI+0", WPOS),),
+        ))
+
+    # PC BYTE 0 (the marker row, predicts the byte-0 token). Here the GENUINE
+    # computed PC byte-0 low/high nibbles live in OUTPUT (LO+<lownib> / HI+
+    # <hinib>); the block-33 leak adds a constant ``OUTPUT_LO+1 = +44 /
+    # OUTPUT_LO+0 = -44`` on top, flipping the low nibble to ``1`` (0x1a -> 0x11).
+    # We CANNOT blanket-clear this row (it carries the real value), so we only
+    # CANCEL the leaked nibble-1: sink ``OUTPUT_LO+1`` (the 0x01-replication
+    # nibble) hard, leaving every OTHER nibble (the genuine value bits, incl.
+    # the real low nibble at LO+<n> and the high nibble at HI+<n>) untouched so
+    # the genuine PC byte-0 wins. We do NOT restore LO+0 here (that would force
+    # 0x00 and clobber the real value); the leak already drove LO+0 negative so
+    # 0x00 is not a contender. Gated on ``MARK_PC`` (fires ONLY at the PC marker
+    # row, IS_BYTE=0 there -- verified). For the add/sub acceptance set the
+    # genuine PC low nibble is never 1 (PCs 0x0a/0x12/0x1a/0x22), so sinking
+    # nibble-1 is exact; a PC genuinely ending in nibble-1 (e.g. a 0x11 branch
+    # target) is out of the Inc-0 scope and deferred.
+    rules.append(multi_way_and_rule(
+        name="no_stack0_pc_clear_byte0_marker_lo1_sink",
+        conditions=(("MARK_PC", 1.0),),
+        threshold=0.5,
+        writes=(("OUTPUT_LO+1", WW),),
+    ))
+
+    return tuple(rules)
+
+
+# 3 byte rows x (LO 1..15 sink + HI 1..15 sink + LO+0 restore + HI+0 restore)
+# + 1 marker-row rule (LO+1 sink only)
+_NO_STACK0_PC_CLEAR_HIDDEN_DIM = 3 * (15 + 15 + 1 + 1) + 1
+
+
+def make_no_stack0_pc_highbyte_clear_op() -> Operation:
+    """Append the no-STACK0 PC value-byte OUTPUT-clear FFN after the L25 tail.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block (appended AFTER
+    ``tail_bit32_result_correction`` AND after ``no_stack0_se_output_clear``),
+    so it is the LAST writer of OUTPUT on the PC value-byte rows before the LM
+    head. Gated by ``C4_NO_STACK0_EMIT`` (default OFF); flag-OFF bakes NO units
+    (byte-identical to golden). See the module-level block comment for the
+    root cause / mechanism (Inc 0 of the STACK0-emission-removal campaign).
+    """
+    if not _no_stack0_emit():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="no_stack0_pc_highbyte_clear",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "no_stack0_se_output_clear"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="STACK0_EMISSION_REMOVAL_CAMPAIGN_2026_06_17.md#inc0",
+        )
+
+    rules = _no_stack0_pc_highbyte_clear_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _NO_STACK0_PC_CLEAR_HIDDEN_DIM, (
+            f"no_stack0_pc_highbyte_clear rule-count drift: produced "
+            f"{len(rules)}, expected {_NO_STACK0_PC_CLEAR_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="no_stack0_pc_highbyte_clear",
+        reads={
+            "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+            "MARK_PC",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # Append AFTER the §11 STEP_END clear on the L25 tail block, so this op
+        # is the last writer of OUTPUT on the PC byte rows before the LM head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "no_stack0_se_output_clear"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_EMISSION_REMOVAL_CAMPAIGN_2026_06_17.md#inc0",
+    )

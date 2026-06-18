@@ -687,6 +687,17 @@ def all_core_ops(
         # Gated by C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
         # See l0_ops.make_no_stack0_se_output_clear_op.
         make_no_stack0_se_output_clear_op(),
+        # No-STACK0 (30-token) PC value-byte OUTPUT-clear FFN (Inc 0): at the
+        # PC value-byte rows (H1+0 PC-marker proximity + IS_BYTE + per-byte
+        # BYTE_INDEX one-hot) sinks OUTPUT high nibbles so the PC HIGH bytes
+        # default to 0x00 and the byte-0 nibble-1 leak is cleared, killing the
+        # self-reinforcing 0x01 PC-replication that is the dominant 30-token
+        # blocker (288/375 PC-wrong). Appended AFTER no_stack0_se_output_clear
+        # (LAST OUTPUT writer at the PC rows), so it overrides every upstream
+        # leak source (block 33 L15 nibble_copy + block 41 L25 tail). Gated by
+        # C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
+        # See l0_ops.make_no_stack0_pc_highbyte_clear_op.
+        make_no_stack0_pc_highbyte_clear_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).
