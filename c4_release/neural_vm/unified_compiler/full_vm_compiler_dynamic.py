@@ -2326,6 +2326,14 @@ def compile_full_vm_dynamic(
             "C4_BP_SAVE_DUMP_MARKER_REQ": (
                 os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
             ),
+            # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
+            # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit):
+            # the ON / OFF builds bake the byte_39_from_e8_addr rule with
+            # different conditions/threshold, so they must never share a memo
+            # entry. See l10_ops.py ``mul_stack0_byte39_guard_enabled``.
+            "C4_MUL_STACK0_BYTE39_GUARD": (
+                os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2929,6 +2937,14 @@ def _bake_from_scheduled_ops(
         # ``_bp_save_dump_marker_req_enabled``.
         "C4_BP_SAVE_DUMP_MARKER_REQ": (
             os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
+        ),
+        # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
+        # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit): the
+        # ON / OFF builds bake the byte_39_from_e8_addr rule with different
+        # conditions/threshold, so they must never share a serialised entry.
+        # See l10_ops.py ``mul_stack0_byte39_guard_enabled``.
+        "C4_MUL_STACK0_BYTE39_GUARD": (
+            os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

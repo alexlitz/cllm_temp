@@ -1,8 +1,10 @@
 # width=2 MUL byte-1 emit: FlattenedALUMul AX_FULL re-stage corruptor — 2026-06-15
 
 Status: **ROOT 1 LANDED (commit 22bae24f). mul full_trace 28 -> 46/50 (+18).
-smoke 51/0. add/sub/div/mod guards unchanged.** Root 2 (operand-A
-high-nibble gather) documented as the remaining wall.
+smoke 51/0. add/sub/div/mod guards unchanged.** **ROOT 2 RESOLVED 2026-06-18
+(flag `C4_MUL_STACK0_BYTE39_GUARD`): mul 46 -> 50/50; the remaining 4 fails were
+a single L10 tail rule (`byte_39_from_e8_addr`) misfiring on operand-A low
+nibble 9, NOT an embedding wall — see the ROOT 2 section below.**
 
 ## The symptom
 
@@ -78,17 +80,45 @@ SHL/SHR/DIV/MOD keep their AX_FULL byte-1 re-stage unchanged.
 * Guards unchanged: add 40/50, sub 44/50, div 47/50, mod ~48/50.
 * `expr_paren` 18 -> 19.
 
-## ROOT 2 — the remaining 4 mul fails (operand-A high-nibble gather)
+## ROOT 2 — RESOLVED 2026-06-18 (single L10 tail rule, NOT an embedding wall)
 
-`mul_20 (9*98)`, `mul_29 (89*26)`, `mul_36 (9*44)`, `mul_43 (9*5)` still fail.
-These are the documented operand-gather hybrid-encoding Wall-1: operand A's
-STACK0 byte-0 HIGH nibble is corrupted upstream (89=0x59 -> 0x39, 9=0x09 ->
-0x39 high nibble 3), so the MUL computes the wrong product before the byte-1
-chain even runs. The corrupt nibble is present at the TOKEN/embedding level on
-the STACK0 value row, i.e. the PSH'd value's high nibble is mis-emitted — the
-same surface as `project_operand_gather_hybrid_encoding_is_cmp_alu_root` and
-`project_ax_byte1_dump_is_h1_onehot_wall`. NOT a single-rule fix; a separate
-multi-session wall.
+`mul_20 (9*98)`, `mul_29 (89*26)`, `mul_36 (9*44)`, `mul_43 (9*5)` — all
+operand-A **low nibble 9** — were attributed above to an operand-gather /
+embedding-level high-nibble corruption ("a separate multi-session wall"). That
+attribution was WRONG: the corrupt STACK0 byte-0 (0x39 = 57) is produced by a
+SINGLE L10 tail FFN rule, surgically fixable.
+
+Root (spec_k=0 GPU full_trace, BUILT dims): the rule
+`tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr`
+(`ops/l10_ops.py::stack0_store_top_e8_from_e0_output_rules`) restores the
+stored byte `0x39` at the e8/e0 local-store address transition (load-bearing
+for genuine `0x39` store-pops). Its activation is driven almost entirely by the
+UNBOUNDED `("OUTPUT_LO+9", 100.0)` term: at a binary-op STACK0 byte-0 emit row
+the operand's low nibble 9 lands in OUTPUT_LO+9 at magnitude ~3654, so
+`100 * 3654 = 365428` ALONE trips the `threshold=20000` even though every
+store-pop witness (MEM_STORE / EMBED_LO+8 / EMBED_HI+14 / MEM_ADDR_SRC) is COLD.
+The rule then forces the byte to 0x39 — corrupting the STACK0 byte-0 of EVERY
+binary op whose operand-A low nibble is 9 (low nibble 9 by accident matches the
+operand, so ALU_LO is right; high nibble 3 is the phantom that breaks the
+width=2 MUL's operand-A high nibble). Verified by sweeping operand-A 1..255: the
+step-3 STACK0 byte-0 is byte-correct for EVERY low nibble except 9, where it is
+universally 0x39.
+
+The genuine e8->e0 store-pop the rule exists for is a MEMORY restore that
+carries `MEM_ADDR_SRC`; the binary-op false-fire never does (probed: false-fires
+have `MEM_ADDR_SRC == 0` AND `ADDR_B0_HI+14 == -2`). Fix = require MEM_ADDR_SRC
+as a HARD gate (a -1e6 baseline only the +2e6 MEM_ADDR_SRC witness lifts above
+zero), so the arithmetic-result row can never trip the rule no matter how large
+its single OUTPUT nibble is.
+
+Flag: `C4_MUL_STACK0_BYTE39_GUARD` (DEFAULT OFF, byte-identical flag-OFF;
+`shared.mul_stack0_byte39_guard_enabled` + the L10 rule + the cache-key
+disambiguation in `full_vm_compiler_dynamic.py`). Verified GPU full_trace
+spec_k=0: **mul 46 -> 50/50**; ids 0-299 flag-ON vs flag-OFF **0 regressions,
+15 flips** (the 4 mul + 11 ADD/SUB/DIV/MOD that shared the low-nibble-9 root —
+this rule was a CROSS-CLUSTER corruptor, not MUL-specific); tripwire (112-prog,
+all 56 clusters) 0 regressions / 11 flips; smoke 51/0; flag-OFF model param hash
+identical to base e3f80da3.
 
 ## expr-with-mul cascades (expr_add_mul/expr_mul_div/expr_mod)
 

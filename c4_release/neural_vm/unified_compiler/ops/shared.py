@@ -83,6 +83,55 @@ def mul_w2_thresh_fix_enabled() -> bool:
     return os.environ.get("C4_MUL_W2_THRESH_FIX", "1") != "0"
 
 
+def mul_stack0_byte39_guard_enabled() -> bool:
+    """Return True iff the L10 tail ``byte_39_from_e8_addr`` STACK0 restore rule
+    is hardened to require its full store-pop context (DEFAULT OFF — opt-in via
+    ``C4_MUL_STACK0_BYTE39_GUARD=1``).
+
+    The bug this lifts (root-caused spec_k=0 GPU full_trace, 2026-06-18):
+    the L10 tail-correction rule
+    ``tail_stack0_store_top_e8_from_e0_byte_39_from_e8_addr``
+    (``ops/l10_ops.py`` ``stack0_store_top_e8_from_e0_output_rules``) restores
+    the stored byte value ``0x39`` (= 57) at the e8/e0 local-store address
+    transition (load-bearing for genuine ``0x39`` store-pops:
+    ``func_identity(57)``, ``func_add(.., 57)``, ...). Its activation is driven
+    almost entirely by the UNBOUNDED ``("OUTPUT_LO+9", 100.0)`` term: at the
+    binary-op STACK0 byte-0 emission row OUTPUT_LO+9 carries the operand's low
+    nibble at magnitude ~3654, so ``100 * 3654 = 365428`` alone blows past the
+    ``threshold=20000`` even though EVERY store-pop witness (MEM_STORE,
+    EMBED_LO+8, EMBED_HI+14, MEM_ADDR_SRC) is COLD on that row. The rule then
+    forces the byte to ``0x39``, corrupting the STACK0 byte-0 token to 57
+    (low nibble 9 — coincidentally matching the operand — high nibble 3) for
+    EVERY binary op whose operand-A low nibble is 9.
+
+    For MUL specifically the downstream width=2 lookup reads that corrupted
+    STACK0 byte-0 as operand A: ALU_LO=9 (right by accident), ALU_HI=3 (the
+    phantom 0x39 high nibble), so the 16-bit product is computed against the
+    wrong high nibble. That is the SOLE remaining root behind the 4 GPU
+    full_trace ``mul_*`` fails — exactly the a_lo=9 cases ``mul_20 (9*98)``,
+    ``mul_29 (89*26)``, ``mul_36 (9*44)``, ``mul_43 (9*5)`` (``9*9`` is a_lo=9
+    too but its byte-0 is right by accident so it passes). ADD/SUB read the
+    same corrupted ALU_HI but tolerate it (the byte-0 add only needs ALU_LO),
+    which is why only MUL surfaces it. Verified: sweeping operand-A 1..255
+    with B=5, step-3 STACK0 byte-0 is byte-correct for EVERY low nibble except
+    9, where it is universally 0x39.
+
+    The genuine ``0x39`` store-pop the rule was built for has the value's HIGH
+    nibble ALSO present in OUTPUT (``OUTPUT_HI_THIS_STEP+3`` hot) — it is
+    restoring 0x39, so both nibbles evidence 0x39. The binary-op false-fire has
+    ONLY the low nibble (``OUTPUT_HI_THIS_STEP+3 == 0``). When enabled this
+    guard rebalances the rule so the byte's HIGH nibble (``OUTPUT_HI_THIS_STEP+3``)
+    is a load-bearing co-requirement at the same weight as the low nibble, and
+    a hard negative blocker suppresses the rule when ``OUTPUT_LO+9`` is hot but
+    ``OUTPUT_HI_THIS_STEP+3`` is cold (the binary-op-result signature). The
+    genuine 0x39 store-pop (both nibbles hot) is unaffected.
+
+    DEFAULT OFF so the flag-off build stays byte-identical to golden
+    ``b9d8861f``. Opt-in via ``C4_MUL_STACK0_BYTE39_GUARD=1``.
+    """
+    return os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") == "1"
+
+
 def div_multibyte_enabled() -> bool:
     """Return True iff the multi-byte-dividend DIV/MOD relay is active
     (DEFAULT ON — opt-out via ``C4_DIV_MULTIBYTE=0``; +51: div 21->48/50,

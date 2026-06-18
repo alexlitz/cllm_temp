@@ -206,7 +206,7 @@ from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .residual_band_registry import register_residual_band
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, mul_stack0_byte39_guard_enabled
 
 
 # Non-first-PSH SP byte-0 fix scratch band (flag-gated; default ON via
@@ -5781,6 +5781,48 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                         writes=byte_writes(value, strength=5000.0),
                     )
                 )
+        # The byte-0x39 store-pop restore is driven by the (unbounded)
+        # ``OUTPUT_LO+9`` term: at a binary-op STACK0 byte-0 emit row the
+        # operand/result byte's low nibble 9 lands in OUTPUT_LO+9 at magnitude
+        # ~3654, so ``100 * 3654`` alone trips the 20000 threshold even though
+        # NONE of the rule's store-pop witnesses are present — corrupting the
+        # STACK0 byte to 0x39 for every op whose byte-0 low nibble is 9 (the 4
+        # ``mul_*`` full_trace fails ``mul_20/29/36/43``, all operand-A low
+        # nibble 9). The genuine e8->e0 store-pop the rule restores 0x39 for is
+        # a MEMORY restore: it carries ``MEM_ADDR_SRC`` and the 0xE8/0xE0
+        # address shape (``ADDR_B0_HI+14`` POSITIVE). Probed spec_k=0 at the
+        # rule's MARK_STACK0 firing row: BOTH binary-op false-fires (9*5 low
+        # nibble, 48*98 high nibble) have ``MEM_ADDR_SRC == 0`` AND
+        # ``ADDR_B0_HI+14 == -2`` (the arithmetic-result row never carries the
+        # memory address source). Requiring MEM_ADDR_SRC as a HARD gate (a
+        # large negative baseline only the memory-restore witness overcomes)
+        # therefore suppresses the binary-op false-fire while leaving the
+        # genuine memory-restore path untouched. Flag-gated (DEFAULT OFF,
+        # byte-identical flag-OFF) — see
+        # ``shared.mul_stack0_byte39_guard_enabled``.
+        if mul_stack0_byte39_guard_enabled():
+            # Add a -1e6 baseline that ONLY ``MEM_ADDR_SRC`` (the memory-
+            # restore witness, +2e6) can lift back above zero; an arithmetic
+            # STACK0 emit row (MEM_ADDR_SRC == 0) stays >=1e6 below threshold no
+            # matter how large its single OUTPUT nibble is.
+            byte39_context_conditions = (
+                ("CONST", -1_000_000.0),
+                ("MEM_ADDR_SRC", 2_000_000.0),
+                ("ADDR_B0_LO+8", 100.0),
+                ("ADDR_B0_HI+14", 100.0),
+                ("OUTPUT_LO+9", 100.0),
+                ("OUTPUT_HI_THIS_STEP+3", 1.0),
+            )
+            byte39_threshold = 1_020_000.0
+        else:
+            byte39_context_conditions = (
+                ("MEM_ADDR_SRC", 100.0),
+                ("ADDR_B0_LO+8", 100.0),
+                ("ADDR_B0_HI+14", 100.0),
+                ("OUTPUT_LO+9", 100.0),
+                ("OUTPUT_HI_THIS_STEP+3", 1.0),
+            )
+            byte39_threshold = 20000.0
         rules.append(
             multi_way_and_rule(
                 name=(
@@ -5788,14 +5830,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ),
                 scope="mark == STACK0",
                 dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                conditions=base_conditions + (
-                    ("MEM_ADDR_SRC", 100.0),
-                    ("ADDR_B0_LO+8", 100.0),
-                    ("ADDR_B0_HI+14", 100.0),
-                    ("OUTPUT_LO+9", 100.0),
-                    ("OUTPUT_HI_THIS_STEP+3", 1.0),
-                ),
-                threshold=20000.0,
+                conditions=base_conditions + byte39_context_conditions,
+                threshold=byte39_threshold,
                 writes=byte_writes(0x39, strength=5000.0),
             )
         )
