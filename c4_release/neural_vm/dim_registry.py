@@ -156,6 +156,8 @@ class DimRegistry:
         name: str,
         category: str,
         role: str,
+        *,
+        alias: bool = False,
     ) -> None:
         """Attach a ``(category, role)`` label to an already-allocated slot.
 
@@ -166,10 +168,27 @@ class DimRegistry:
 
         The slot itself is updated in place so
         :attr:`DimSlot.category`/``.role`` reflect the registration.
+
+        ``alias=True`` registers an ADDITIONAL ``(category, role) -> name``
+        index entry for a slot that already carries a (different) PRIMARY
+        tag, WITHOUT overwriting ``DimSlot.category``/``.role``. This is the
+        Phase 7.E.0 Bug-A path: an aliasing slot (e.g. ``AX_FULL_LO``, the
+        AX value bus) is the resolution target for several semantically
+        distinct ``(category, role)`` keys (``(register_lo, AX)`` AND
+        ``(register_lo, PC)``, since the PC value bus aliases the AX one in
+        the built layout). The slot keeps its first/canonical primary tag;
+        the extra keys resolve to the same dim. Resolving a key always works
+        regardless of which binding is "primary".
         """
         if name not in self.slots:
             raise KeyError(f"Unknown dim: {name!r}")
         slot = self.slots[name]
+        if alias:
+            # Additional index entry only; do not touch the slot's primary
+            # tag. ``_index_category`` still rejects mapping this pair to a
+            # DIFFERENT slot (a genuine collision).
+            self._index_category(name, category, role)
+            return
         if slot.category is not None or slot.role is not None:
             # Re-registration with identical pair is a no-op; conflicting
             # pair is an error.
@@ -177,7 +196,9 @@ class DimRegistry:
                 return
             raise ValueError(
                 f"Slot {name!r} already has category=({slot.category!r}, "
-                f"{slot.role!r}); cannot re-tag as ({category!r}, {role!r})"
+                f"{slot.role!r}); cannot re-tag as ({category!r}, {role!r}). "
+                f"Pass alias=True to add an additional (category, role) key "
+                f"that resolves to this same dim."
             )
         slot.category = category
         slot.role = role
@@ -1392,16 +1413,19 @@ def _register_default_categories(reg: 'DimRegistry') -> None:
         # into their own ax_carry_* category; register_* refers to the
         # value-bus view at AX positions). The compiler-IR consumers
         # use ``AX_FULL_LO`` / ``AX_FULL_HI`` (471/487) for the AX
-        # value bus; SP/BP/PC analogues are POST_PRTF_PC_LO/HI and
-        # POST_PRTF_SP_LO/HI which alias those ranges. ----
+        # value bus; the PC/SP analogues are POST_PRTF_PC_LO/HI and
+        # POST_PRTF_SP_LO/HI, which ALIAS the AX value-bus / carry ranges.
+        #
+        # Phase 7.E.0 Bug-A fix: the POST_PRTF_* and SP_OLD_* alias NAMEs
+        # are DROPPED by the dim-liveness allocator in the BUILT layout
+        # (each shares a residual slot with an active owner and never re-
+        # emerges under its own name), so dim_ref'ing them would KeyError
+        # at lowering. The PC/SP keys are re-pointed to the SURVIVING
+        # alias via ``_ALIAS_BINDINGS`` below (AX_FULL_*/AX_CARRY_*); the
+        # ADJ-only ``(register_*, SP_OLD)`` keys are DROPPED entirely
+        # (see the note at ``_ALIAS_BINDINGS``).
         ("AX_FULL_LO",     "register_lo", "AX"),
         ("AX_FULL_HI",     "register_hi", "AX"),
-        ("POST_PRTF_PC_LO", "register_lo", "PC"),
-        ("POST_PRTF_PC_HI", "register_hi", "PC"),
-        ("POST_PRTF_SP_LO", "register_lo", "SP"),
-        ("POST_PRTF_SP_HI", "register_hi", "SP"),
-        ("SP_OLD_LO",      "register_lo", "SP_OLD"),
-        ("SP_OLD_HI",      "register_hi", "SP_OLD"),
 
         # ---- ax_carry_lo / ax_carry_hi ----
         ("AX_CARRY_LO", "ax_carry_lo", "AX"),
@@ -1412,8 +1436,15 @@ def _register_default_categories(reg: 'DimRegistry') -> None:
         ("ALU_HI", "alu_hi", "result"),
 
         # ---- carry (inter-byte cascades) ----
+        # Phase 7.E.0 Bug-A fix: the ``("carry", "adj")`` -> ADJ_CARRY
+        # binding is DROPPED. ADJ_CARRY (static 313) is an ADJ-only band
+        # the dim-liveness allocator merges away in the built layout (no
+        # surviving alias of the same concept), so dim_ref'ing it would
+        # KeyError at lowering — and there is no honest re-point target.
+        # An ADJ op that needs its multi-byte carry band back must re-
+        # collect it into the build and tag it via
+        # ``register_band_category`` (the Bug-B path).
         ("CARRY",     "carry", "alu"),
-        ("ADJ_CARRY", "carry", "adj"),
 
         # ---- cmp_flag ----
         ("CMP",       "cmp_flag", "cascade"),
@@ -1448,6 +1479,32 @@ def _register_default_categories(reg: 'DimRegistry') -> None:
     for slot_name, cat, role in bindings:
         reg.register_category(slot_name, cat, role)
 
+    # ---- Phase 7.E.0 Bug-A: PC/SP aliasing re-points ----
+    # The PC value-bus and SP carry-staging views ALIAS the AX value bus
+    # (471/487) and AX carry band (328/344) respectively. The dedicated
+    # POST_PRTF_PC_*/POST_PRTF_SP_* alias NAMEs are dropped by the dim-
+    # liveness allocator in the built layout, so ``(register_*, PC|SP)``
+    # is re-pointed onto the SURVIVING ``AX_FULL_*`` / ``AX_CARRY_*`` slot.
+    # ``alias=True`` adds the extra ``(category, role)`` index entry without
+    # disturbing each slot's PRIMARY (register_lo/AX, ax_carry_lo/AX) tag.
+    #
+    # The ADJ-only ``(register_lo|register_hi, SP_OLD)`` and ``(carry, adj)``
+    # keys are intentionally ABSENT here: their dims (SP_OLD_*/ADJ_CARRY,
+    # static 297/305/313) have no surviving alias of the same concept in the
+    # built layout (their positions are owned by the unrelated L1H4 /
+    # CMP_GROUP slots), so resolving them would either KeyError at lowering
+    # OR silently return a threshold/cmp dim — both worse than dropping the
+    # binding. An ADJ op that needs the old-SP / adj-carry band back must
+    # re-collect it into the build and tag it via ``register_band_category``.
+    _ALIAS_BINDINGS = (
+        ("AX_FULL_LO",  "register_lo", "PC"),
+        ("AX_FULL_HI",  "register_hi", "PC"),
+        ("AX_CARRY_LO", "register_lo", "SP"),
+        ("AX_CARRY_HI", "register_hi", "SP"),
+    )
+    for slot_name, cat, role in _ALIAS_BINDINGS:
+        reg.register_category(slot_name, cat, role, alias=True)
+
     # ---- opcode_flag (one role per opcode, role is the opcode mnemonic) ----
     _OPCODE_ROLES = [
         "LEA", "IMM", "JMP", "JSR", "BZ", "BNZ", "ENT", "ADJ", "LEV",
@@ -1457,6 +1514,26 @@ def _register_default_categories(reg: 'DimRegistry') -> None:
     ]
     for op in _OPCODE_ROLES:
         reg.register_category(f"OP_{op}", "opcode_flag", op)
+
+    # ---- Phase 7.E.0 Bug-B: op-local / over-width band category tags ----
+    # The shared base-registry slots are tagged above. Op-local over-width
+    # bands (``STACK0_BYTE_VAL_*`` etc.) declare their ``(category, role)``
+    # NEXT TO the band via ``register_band_category`` and are collected here,
+    # so rules can ``dim_ref`` them. Pure name-table application (no dim
+    # moves), so byte-identity is preserved. Each tagged NAME must survive
+    # into the built layout — ``verify_categories_resolve_in_built_layout``
+    # enforces that, the same audit that guards Bug A.
+    from neural_vm.unified_compiler.ops.residual_band_registry import (
+        collect_registered_band_categories,
+    )
+
+    for slot_name, cat, role in collect_registered_band_categories():
+        # Skip names not present in THIS registry (e.g. a flag-gated band
+        # whose dim isn't pinned in the default layout) — the slot can't be
+        # tagged if it doesn't exist, and the audit only requires that the
+        # tags we DO apply resolve in the built layout.
+        if slot_name in reg.slots:
+            reg.register_category(slot_name, cat, role)
 
 
 # ============================================================================

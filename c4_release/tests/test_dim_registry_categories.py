@@ -74,8 +74,17 @@ def test_resolve_dim_alu_carry_cmp():
     assert reg.resolve_dim("alu_lo", "result") == 360
     assert reg.resolve_dim("alu_hi", "result") == 376
     assert reg.resolve_dim("carry", "alu") == 392
-    assert reg.resolve_dim("carry", "adj") == 313
     assert reg.resolve_dim("cmp_flag", "cascade") == 396
+
+    # Phase 7.E.0 Bug-A: the ``("carry", "adj")`` -> ADJ_CARRY binding was
+    # DROPPED. ADJ_CARRY (static 313) is an ADJ-only band the dim-liveness
+    # allocator merges away in the BUILT layout (no surviving alias of the
+    # same concept), so resolving it would either KeyError at lowering or
+    # silently return an unrelated slot. The binding is intentionally absent
+    # now — an ADJ op that needs the band back must re-collect it into the
+    # build and tag it via ``register_band_category`` (the Bug-B path).
+    with pytest.raises(KeyError):
+        reg.resolve_dim("carry", "adj")
 
 
 def test_resolve_dim_memory_addr_key():

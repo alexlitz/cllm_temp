@@ -68,6 +68,74 @@ def test_allocator_byte_identical_to_static():
 
 
 # ---------------------------------------------------------------------------
+# 1b. (category, role) bindings all resolve in the BUILT layout
+# ---------------------------------------------------------------------------
+def test_verify_categories_resolve_in_built_layout():
+    """Every ``(category, role)`` in the default registry's category index
+    must resolve to a slot NAME that is present in the BUILT layout's
+    ``dim_positions``.
+
+    This is the permanent guard for the Phase 7.E.0 Bug-A class: the static
+    registry pins an alias NAME (e.g. ``POST_PRTF_PC_LO``, ``SP_OLD_LO``,
+    ``ADJ_CARRY``) that the dim-liveness allocator MERGES AWAY in the built
+    layout — so a rule that ``dim_ref``'d that ``(category, role)`` would
+    ``KeyError`` at lowering even though the static registry "knows" the
+    name. The widen repack moves dims; probing the static registry reads the
+    wrong cell. This test codifies "every category we expose must survive
+    into the build", catching both the original Bug-A bindings AND any
+    future ``register_band_category`` (Bug-B) tag whose name is dropped.
+
+    Slow (compiles the full VM on CPU, ``disk_cache=False`` so the env is
+    observed fresh); kept here next to the byte-identity gate because it is
+    the same static-vs-built consistency contract.
+    """
+    verify_categories_resolve_in_built_layout()
+
+
+def verify_categories_resolve_in_built_layout():
+    """Assert every default-registry ``(category, role)`` resolves to a NAME
+    present in ``compile_full_vm_dynamic(disk_cache=False)[1].dim_positions``.
+
+    Importable as a standalone audit (callers other than pytest can invoke
+    it directly). Raises ``AssertionError`` listing each ``(category, role)``
+    whose bound NAME is absent from the built layout.
+    """
+    # Local imports keep the fast allocator unit tests above free of the
+    # heavy compiler import when this audit is deselected.
+    from neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=DeprecationWarning)
+        reg = build_default_registry()
+        _model, layout = compile_full_vm_dynamic(disk_cache=False)
+
+    built_names = set(layout.dim_positions)
+
+    # ``reg._category_index`` maps every registered (category, role) -> the
+    # slot NAME it resolves to (both the primary tags AND the alias= entries
+    # for the re-pointed PC/SP keys, AND the register_band_category tags).
+    unresolved = [
+        (cat, role, name)
+        for (cat, role), name in reg._category_index.items()
+        if name not in built_names
+    ]
+
+    assert not unresolved, (
+        "category/role bindings resolve to a NAME absent from the BUILT "
+        "layout (would KeyError at lowering — the Phase 7.E.0 Bug-A class):\n"
+        + "\n".join(
+            f"  ({cat!r}, {role!r}) -> {name!r}"
+            for cat, role, name in sorted(unresolved)
+        )
+        + "\nRe-point the binding onto a surviving alias NAME in "
+        "_register_default_categories (or register_band_category), or drop "
+        "it if no honest target exists."
+    )
+
+
+# ---------------------------------------------------------------------------
 # 2. Pinned-collision behaviour
 # ---------------------------------------------------------------------------
 def test_pinned_allocation_respects_collision():

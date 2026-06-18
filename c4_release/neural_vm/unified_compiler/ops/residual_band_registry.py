@@ -46,13 +46,15 @@ Public API
     register_residual_band(name, size, *, owner, flag=None, never_share=False)
     collect_registered_residual_bands() -> Dict[str, int]
     collect_never_share_band_names() -> Set[str]
+    register_band_category(name, category, role)        # Phase 7.E.0 Bug-B
+    collect_registered_band_categories() -> List[Tuple[str, str, str]]
 
 See ``docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md`` and ``c4_release/CLAUDE.md``.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass
 
 
@@ -223,3 +225,104 @@ def collect_alibi_base_residual_bands() -> Dict[str, int]:
 def registered_band_specs() -> "List[_BandSpec]":
     """Return the raw registered specs (diagnostics / tests only)."""
     return list(_REGISTRY)
+
+
+# ============================================================================
+# Phase 7.E.0 Bug-B — (category, role) tags for op-local / over-width bands
+# ----------------------------------------------------------------------------
+# ``_register_default_categories`` (dim_registry.py) only tags the SHARED
+# base-registry slots. Op-local over-width bands (``STACK0_BYTE_VAL_*`` and
+# the ``register_residual_band`` families) live OUTSIDE that block, so they
+# have no ``(category, role)`` and therefore cannot be ``dim_ref``'d. This
+# thin wrapper lets a band owner attach a semantic tag NEXT TO the band /
+# dim it owns; ``build_default_registry`` collects every tag and applies it
+# to the default registry (after the static bindings) so ``dim_ref`` can
+# resolve the band by family.
+#
+# This is a NAME-TABLE-ONLY registration (it never moves a dim or touches a
+# weight), so it is byte-identity-safe. A tag whose NAME is absent from the
+# built layout would be caught by ``verify_categories_resolve_in_built_layout``
+# (tests/test_dim_allocator.py) — the same audit that guards Bug A.
+# ============================================================================
+@dataclass(frozen=True)
+class _BandCategory:
+    name: str
+    category: str
+    role: str
+
+
+# Insertion-ordered so the applied tags are deterministic. Populated at
+# import time of this module (the STACK0_BYTE_VAL tags below) and of any op
+# module that calls :func:`register_band_category`.
+_CATEGORY_REGISTRY: "List[_BandCategory]" = []
+_CATEGORY_KEYS_SEEN: Dict[Tuple[str, str], str] = {}
+
+
+def register_band_category(name: str, category: str, role: str) -> None:
+    """Tag an op-local band / dim ``name`` with a ``(category, role)`` pair.
+
+    Call at MODULE IMPORT TIME (next to the band/dim the tag describes).
+    :func:`build_default_registry` collects every tag via
+    :func:`collect_registered_band_categories` and applies it to the default
+    registry through ``DimRegistry.register_category``, so rule authors can
+    then resolve the band with ``dim_ref(category, role, offset)``.
+
+    Pure name-table registration — no dim is allocated or moved, so this is
+    byte-identity-safe. The tagged ``name`` MUST be a dim that survives into
+    the BUILT layout (the ``verify_categories_resolve_in_built_layout`` audit
+    enforces this); tagging a liveness-merged alias would re-introduce the
+    Bug-A landmine this whole change exists to remove.
+
+    Re-registering the SAME (name, category, role) triple is idempotent
+    (supports module reload under test). Mapping the same (category, role) to
+    a DIFFERENT name, or re-tagging the same name's pair to a different one,
+    raises ``ValueError`` — a genuine collision (the very class of bug the
+    registry surfaces early).
+    """
+    if not isinstance(name, str) or not name:
+        raise ValueError(
+            f"register_band_category: name must be a non-empty str (got {name!r})"
+        )
+    if not isinstance(category, str) or not category:
+        raise ValueError(
+            f"register_band_category({name!r}): category must be a non-empty "
+            f"str (got {category!r})"
+        )
+    if not isinstance(role, str) or not role:
+        raise ValueError(
+            f"register_band_category({name!r}): role must be a non-empty str "
+            f"(got {role!r})"
+        )
+    key = (category, role)
+    existing_name = _CATEGORY_KEYS_SEEN.get(key)
+    if existing_name is not None:
+        if existing_name == name:
+            return  # Idempotent re-registration.
+        raise ValueError(
+            f"register_band_category: (category={category!r}, role={role!r}) "
+            f"already maps to {existing_name!r}; cannot re-map to {name!r}."
+        )
+    _CATEGORY_REGISTRY.append(_BandCategory(name=name, category=category, role=role))
+    _CATEGORY_KEYS_SEEN[key] = name
+
+
+def collect_registered_band_categories() -> "List[Tuple[str, str, str]]":
+    """Return ``[(name, category, role), ...]`` for every registered tag.
+
+    Insertion order is preserved so the tags apply deterministically.
+    Consumed by ``build_default_registry`` (dim_registry.py).
+    """
+    return [(c.name, c.category, c.role) for c in _CATEGORY_REGISTRY]
+
+
+# ---- STACK0_BYTE_VAL_h_LO/HI (Wave-1 A1 family, dim_registry.py:734..829) ----
+# Read by 100+ L10/L13/L14 rules; the highest-value band for the STACK0
+# campaign (see ``project_var_fulltrace_stack0_frame_desync`` memory note).
+# These are value-bus nibbles broadcast from MARK_AX to the matching STACK0
+# byte row during PSH, so they belong to the ``memory_lo`` / ``memory_hi``
+# value-bus families (alongside ``MEM_VAL_B*``). Role names the STACK0 byte
+# index the band carries.
+for _h in (1, 2, 3):
+    register_band_category(f"STACK0_BYTE_VAL_{_h}_LO", "memory_lo", f"stack0_b{_h}")
+    register_band_category(f"STACK0_BYTE_VAL_{_h}_HI", "memory_hi", f"stack0_b{_h}")
+del _h
