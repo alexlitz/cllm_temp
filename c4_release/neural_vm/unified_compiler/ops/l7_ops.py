@@ -12,10 +12,31 @@ from ..isa_semantics_dsl import (
 )
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
+from .residual_band_registry import register_residual_band
 from .shared import (  # noqa: F401
     _as_setdim_proxy,
     _empty_compiler_ir_factory,
     operand_from_memsp_enabled,
+)
+
+
+# === STACK0 campaign Inc-1 store-commit relay band (2026-06-18) ===
+#
+# ``MEM_STORE_AT_VAL`` is the per-value-row store-commit bit that closes the
+# byte-0 ``mem[SP]`` operand-A delivery (``C4_OPERAND_FROM_MEMSP``). The L6
+# relay (head 6) writes ``MEM_STORE`` only at a MEM section's MARK_MEM marker
+# row; it is NOT present on the section's value-byte rows until block 11
+# (AFTER the L8 head-5 mem-to-ALU CAM reads its K). So at head-5's read time
+# every MEM value-byte-0 row looks identical (MEM_VAL_B1=1, MEM_STORE=0) and
+# ALiBi recency picks the most-recent step's PHANTOM value row (mem byte=0)
+# over the real PSH store's value row (== mem[SP]). ``make_layer7_mem_store_
+# relay_op`` broadcasts MEM_STORE FORWARD from the marker row to the same
+# section's value-byte-0 row into THIS band (at L7, block 9, before L8 attn),
+# so head-5's K can gate on a per-value-row store bit. Flag-gated so a
+# flag-OFF build omits the band entirely (smaller d_model, byte-identical).
+register_residual_band(
+    "MEM_STORE_AT_VAL", 1, owner="make_layer7_mem_store_relay_op",
+    flag=operand_from_memsp_enabled, never_share=True,
 )
 
 
@@ -523,6 +544,113 @@ def _layer7_memory_heads_ir(dim_positions, HD) -> CompilerIR:
     ir = CompilerIR()
     ir.layer(0).attention.extend(_layer7_memory_head_specs(BD))
     return ir
+
+
+def make_layer7_mem_store_relay_op(enable: bool = False) -> Operation:
+    """L7 attn head 8: relay the store-commit bit MARK_MEM-row → value rows.
+
+    STACK0 campaign Inc-1 closing fix (2026-06-18). Flag-gated by
+    ``C4_OPERAND_FROM_MEMSP`` (DEFAULT OFF = byte-identical; the band is also
+    flag-gated so a flag-OFF build omits the dim).
+
+    The L8 head-5 mem-to-ALU CAM (``make_layer8_mem_to_alu_op``) reads its K
+    from the L8-attn block (block 11) INPUT, where every MEM value-byte-0 row
+    is indistinguishable: (MEM_VAL_B1=1, MEM_STORE=0). The store-commit bit
+    ``MEM_STORE`` is only present on the section's MARK_MEM marker row (set by
+    the L6 head-6 relay, available from block 7 onward) — never on the value
+    rows until block 11 (too late). So head-5's ALiBi recency picks the most
+    recent step's PHANTOM value row (mem byte=0) over the real PSH store's
+    value row (== mem[SP]); operand-A is delivered as 0.
+
+    This head broadcasts MEM_STORE FORWARD from the marker row to the same
+    MEM section's value-byte-0 row into the fresh ``MEM_STORE_AT_VAL`` band,
+    at L7 (block 9 — BEFORE the L8 attn block), so head-5's K can gate on a
+    PER-VALUE-ROW store bit:
+
+      - Q fires at the MEM value-byte-0 row (gate ``MEM_VAL_B1``).
+      - K matches the MARK_MEM marker row (the store-bit carrier). ALiBi
+        recency (slope 0.5, set by the L7 op's ``alibi_slopes.fill_(0.5)``)
+        selects the NEAREST preceding MARK_MEM — i.e. the value row's OWN
+        section marker (+5 tokens earlier) — not an older section's marker.
+      - V copies ``MEM_STORE`` from that marker row; O writes it to
+        ``MEM_STORE_AT_VAL`` at the value-byte-0 row.
+
+    GPU-confirmed (tools/probe_mem_store_rows.py): add_9/sub_17 step3, the
+    real PSH store's value-byte-0 row (pos 110) attends its marker (pos 105,
+    MEM_STORE=1.0) → MEM_STORE_AT_VAL=1.0; the step0/step3 phantom value rows
+    (pos 74/146) attend their own markers (pos 69/141, MEM_STORE=0) → 0.0.
+
+    Disabled by default (``enable=False``); bake is a guard-clause no-op.
+    """
+    HEAD_IDX = 8  # free L7 head (layout declares 0..7; num_heads=11)
+
+    def bake(block, dim_positions, S):
+        if not enable:
+            return
+        BD = _as_setdim_proxy(dim_positions)
+        attn = block.attn
+        HD = attn.W_q.shape[0] // attn.num_heads
+        base = HEAD_IDX * HD
+        # The L7 operand_gather op fills ALL L7 head slopes to 0.5, so this
+        # head inherits recency favoring the nearest preceding MARK_MEM. Set
+        # it explicitly too (op order is not guaranteed and this op may bake
+        # before operand_gather, which fills the whole buffer).
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[HEAD_IDX] = 0.5
+
+        L = 50.0
+        # Q: fire ONLY at the MEM value-byte-0 row (MEM_VAL_B1=1). A strong
+        # negative const baseline keeps non-value rows from firing the head
+        # (their softmax over MARK_MEM keys would still copy a store bit, but
+        # the O target MEM_STORE_AT_VAL is only read by head-5 at value rows,
+        # so over-firing elsewhere is inert — restricting Q keeps it clean).
+        attn.W_q[base, BD.MEM_VAL_B1] = L
+        attn.W_q[base, BD.CONST] = -L / 2
+        # K: match the MARK_MEM marker row (where MEM_STORE lives). CONST
+        # baseline keeps non-marker rows below the marker; ALiBi recency then
+        # picks the nearest preceding marker = this value row's own section.
+        attn.W_k[base, BD.MARK_MEM] = L
+        attn.W_k[base, BD.CONST] = -L / 2
+        # V/O: copy MEM_STORE from the attended marker row into
+        # MEM_STORE_AT_VAL at the firing value-byte-0 row.
+        attn.W_v[base + 1, BD.MEM_STORE] = 1.0
+        attn.W_o[BD.MEM_STORE_AT_VAL, base + 1] = 1.0
+
+    _claims = set()
+    if enable:
+        _claims.add((7, "attn_W_v", f"{HEAD_IDX}_1", "MEM_STORE+0"))
+        _claims.add((7, "attn_W_o", "MEM_STORE_AT_VAL+0", f"{HEAD_IDX}_1"))
+
+    # reads/writes reference MEM_STORE_AT_VAL, which is a flag-gated residual
+    # band (omitted from dim_positions when C4_OPERAND_FROM_MEMSP is off). The
+    # bake is a no-op when disabled, so declare the band-referencing reads/
+    # writes only when enabled — otherwise the dep-graph validator rejects the
+    # undeclared dim on a flag-OFF build.
+    _reads = {"MEM_VAL_B1", "MARK_MEM", "MEM_STORE", "CONST"} if enable else set()
+    _writes = {"MEM_STORE_AT_VAL"} if enable else set()
+
+    return Operation(
+        name="layer7_mem_store_relay",
+        reads=_reads,
+        writes=_writes,
+        kind="block",
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        # Bind to ``layer8_multibyte_fetch`` — the LOGICAL-L7 attn anchor
+        # (block 9) — NOT ``layer8_sp_gather`` (logical L8, block 11, where
+        # head-5 itself bakes and reads its K from the block INPUT). The
+        # relay MUST land STRICTLY BEFORE block 11 so MEM_STORE_AT_VAL is
+        # present on the value rows at head-5's read time. (The "L7" ops that
+        # anchor to layer8_sp_gather are physically at logical L8 / block 11
+        # despite the legacy naming; layer8_multibyte_fetch is the genuine
+        # logical-L7 attn op, block 9, which runs before block 11.)
+        target_op_name="layer8_multibyte_fetch",
+        migrated=True,
+        claims=_claims,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
+        compiler_ir=CompilerIR(),
+    )
 
 
 def _band_projection_writes(slot_base: int, dim_base: int, weight: float = 1.0):

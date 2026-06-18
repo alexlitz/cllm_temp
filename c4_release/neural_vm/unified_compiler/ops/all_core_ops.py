@@ -182,6 +182,14 @@ def all_core_ops(
         make_layer6_bz_bnz_relay_bake_op(),
         make_layer7_operand_gather_op(),
         make_layer7_memory_heads_op(),
+        # STACK0 campaign Inc-1 store-commit relay (phase=7, L7 block 9).
+        # Flag-gated by C4_OPERAND_FROM_MEMSP (DEFAULT OFF = byte-identical).
+        # When on, broadcasts MEM_STORE from a MEM section's MARK_MEM marker
+        # row to its value-byte-0 row into MEM_STORE_AT_VAL, BEFORE the L8
+        # attn block, so the L8 head-5 mem-to-ALU CAM can discriminate the
+        # real PSH store's value row from phantom IMM-step MEM value rows.
+        # See make_layer7_mem_store_relay_op + make_layer8_mem_to_alu_op.
+        make_layer7_mem_store_relay_op(enable=operand_from_memsp_enabled()),
         # Convo-I/O L7 attn bake (phase=7.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. See docstring for
         # phase/ordering rationale.

@@ -2672,6 +2672,46 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_q[base + 3, BD.MARK_AX] = 100.0
         attn.W_k[base + 3, BD.MARK_AX] = -VR * 20
 
+        # === Dim 4: STORE-COMMIT GATE — the Inc-1 closing fix (2026-06-18) ===
+        #
+        # The blocker the prior rebuild left open: dims 1/2 select EVERY MEM
+        # value-byte-0 row equally (all have MEM_VAL_B1=1 / L2H0[MEM]=1,
+        # H1[MEM]=0), so on the PSH;IMM;ADD pattern ALiBi recency picked the
+        # most-recent step's PHANTOM value row (mem byte=0) over the real PSH
+        # store's value row (== mem[SP]); operand-A delivered as 0.
+        #
+        # GPU diagnosis (tools/probe_mem_store_rows / probe_head5_attn) found
+        # the store-commit bit IS recoverable but is NOT on the value row at
+        # head-5's read time: MEM_STORE sits ONLY on the section's MARK_MEM
+        # marker row (set by the L6 head-6 relay, present from block 7) and is
+        # not broadcast to the value rows until block 11 (AFTER this head's K
+        # read). So ``make_layer7_mem_store_relay_op`` (L7, block 9) relays it
+        # FORWARD marker-row → value-byte-0 row into the fresh per-value-row
+        # band MEM_STORE_AT_VAL. add_9/sub_17 step3: pos 110 (real mem[SP])
+        # gets MEM_STORE_AT_VAL=1.0; the phantom value rows (pos 74/146) get
+        # 0.0.
+        #
+        # This dim adds a large positive boost to value-byte-0 rows that carry
+        # the relayed store bit and a large negative penalty to value-byte-0
+        # rows without it, so among the (otherwise equal, dims-1/2) value rows
+        # only store rows survive softmax1's zero anchor; ALiBi recency then
+        # picks the most-recent store (== current mem[SP]). The boost is sized
+        # well above the worst-case ALiBi recency penalty (~-23.5 at the
+        # 47-token store-to-query distance on the gate programs). Because
+        # MEM_STORE_AT_VAL is a clean per-value-row 0/1 (no marker ±2 magnitude
+        # to fight), a single signed K dim suffices (Q@MARK_AX=1):
+        #   K = B·MEM_STORE_AT_VAL - C·CONST
+        #   store value row (relay=1): B - C   = +400  (attend, beats recency)
+        #   phantom value row (relay=0): -C     = -400  (suppress)
+        # Non-value rows never reach here positive: dims 1/2 drive markers
+        # (-420) and addr/register rows (-180) deeply negative, and they carry
+        # MEM_STORE_AT_VAL=0 so dim 4 only deepens them (-400).
+        STORE_B = 800.0  # MEM_STORE_AT_VAL boost
+        STORE_C = 400.0  # CONST penalty (phantom value rows -> -400)
+        attn.W_q[base + 4, BD.MARK_AX] = 1.0
+        attn.W_k[base + 4, BD.MEM_STORE_AT_VAL] = STORE_B
+        attn.W_k[base + 4, BD.CONST] = -STORE_C
+
         # === V/O: copy CLEAN_EMBED bytes → ALU_LO/HI at AX marker ===
         # This mirrors L7 head 0 (vm_step.py:_set_layer7_operand_gather)
         # which writes ALU_LO/HI from STACK0_BYTE0's CLEAN_EMBED. The L8
@@ -2800,6 +2840,12 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
             _claims.add((8, "attn_W_v", f"7_{1 + k}", f"CLEAN_EMBED_LO+{k}"))
             _claims.add((8, "attn_W_v", f"7_{17 + k}", f"CLEAN_EMBED_HI+{k}"))
 
+    # MEM_STORE_AT_VAL (read by head-5 dim 4, the store-commit gate) is a
+    # flag-gated residual band — it is omitted from dim_positions on a
+    # flag-OFF build. Declare it in the read set only when the op is enabled
+    # so the dep-graph validator does not reject the undeclared dim flag-OFF.
+    _store_at_val_read = {"MEM_STORE_AT_VAL"} if enable else set()
+
     return Operation(
         name="layer8_mem_to_alu",
         # Phase 8.45 places this after layer8_op_imm_relay (8.4) and BEFORE
@@ -2831,12 +2877,13 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR",
                "OP_SI", "OP_SC", "OP_LI", "OP_LC", "OP_IMM", "OP_LEA",
                "OP_PSH", "OP_JSR", "OP_ENT", "OP_LEV", "OP_JMP", "OP_ADJ",
-               "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE", "MEM_VAL_B2", "L2H0",
+               "OP_BZ", "OP_BNZ", "OP_EXIT", "MEM_STORE",
+               "MEM_VAL_B2", "L2H0",
                "H1", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
                "MARK_STACK0", "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1",
                "ADDR_B1_LO.*.-1", "ADDR_B1_HI.*.-1",
                "ADDR_B2_LO.*.-1", "ADDR_B2_HI.*.-1",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"},
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"} | _store_at_val_read,
         writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
         kind="block",
         declarative_bake_fn=bake,
