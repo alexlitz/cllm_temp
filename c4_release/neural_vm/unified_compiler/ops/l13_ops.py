@@ -7,7 +7,11 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy, _empty_compiler_ir_factory
+from .shared import (
+    _as_setdim_proxy,
+    _empty_compiler_ir_factory,
+    operand_from_memsp_enabled,
+)
 
 
 # === L13 attention-head layout (pinned indices) =====================
@@ -839,7 +843,18 @@ def _layer13_add_addend_relay_head_specs(BD) -> tuple:
     # STACK0_BYTE_VAL_1 (the 1096 add corpus is all 2-byte; result byte 1
     # is the high byte and is predicted at the BYTE_INDEX_0 row).
     emit_bi_dim = BD.BYTE_INDEX_0
-    src_flag_dim = BD.STACK0_BYTE1
+    # STACK0 campaign Part B (2026-06-18): under C4_OPERAND_FROM_MEMSP the
+    # pushed operand's STACK0 byte-1 row is gone (STACK0 dropped + the
+    # layer10_psh_ax_broadcast STACK0-row producer starved), so the legacy
+    # K-match on the STACK0_BYTE1 position flag finds no row and the relay
+    # delivers nothing -> 16-bit ADD byte 1 stays 0. The L8 head-7 byte-1 CAM
+    # (make_layer8_mem_to_alu_op) now deposits operand-A byte 1 (from mem[SP])
+    # into STACK0_BYTE_VAL_1 at the SAME step's AX marker; re-point the relay
+    # K to that row (MARK_AX) so this head carries it forward to the ADD
+    # byte-1 emit row. Flag-OFF keeps the STACK0_BYTE1 source (byte-identical).
+    src_flag_dim = (
+        BD.MARK_AX if operand_from_memsp_enabled() else BD.STACK0_BYTE1
+    )
     val_lo = BD.STACK0_BYTE_VAL_1_LO
     val_hi = BD.STACK0_BYTE_VAL_1_HI
     # Q slot 0: gate STRICTLY on the ADD byte-emit selector TEMP+8 (1.0
@@ -922,8 +937,17 @@ def make_layer13_add_addend_relay_op() -> Operation:
         # original operand-A PSH frame). The K source-flag match dominates
         # the alibi penalty so only STACK0_BYTE1 rows are candidates; the
         # slope breaks the tie toward the oldest among them.
+        #
+        # STACK0 campaign Part B: when the K source is re-pointed to MARK_AX
+        # (C4_OPERAND_FROM_MEMSP), the source row is the SAME step's AX marker
+        # (a FEW tokens before the ADD byte-1 emit row), NOT a distant prior
+        # PSH frame. A POSITIVE slope rewards proximity so the CURRENT step's
+        # AX marker (where head-7 just deposited operand-A byte 1) wins over any
+        # older step's AX marker.
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes[5] = -1.0
+            attn.alibi_slopes[5] = (
+                1.0 if operand_from_memsp_enabled() else -1.0
+            )
         Primitives.generate_attention_head(
             attn,
             _layer13_add_addend_relay_head_specs(proxy)[0],
@@ -939,7 +963,7 @@ def make_layer13_add_addend_relay_op() -> Operation:
 
     return Operation(
         name="layer13_add_addend_relay",
-        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_0", "STACK0_BYTE1",
+        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_0", "STACK0_BYTE1", "MARK_AX",
                "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI", "CONST"},
         writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"},
         kind="block",

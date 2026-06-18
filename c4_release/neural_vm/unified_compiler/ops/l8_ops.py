@@ -2734,19 +2734,18 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_o[BD.ALU_LO + 0, base + 0] = -SCALE_O
         attn.W_o[BD.ALU_HI + 0, base + 0] = -SCALE_O
 
-        # Head 7: stack byte 1 staging for wide ALU ops. SHL/MUL need the
-        # full generic pipeline result byte 1 later; SHR by a full byte needs
-        # stack byte 1 available at the marker before the shift pipeline runs.
-        # Stage the historical MEM value byte 1 into AX_FULL_* at the AX
-        # marker. GE conversion consumes AX_FULL_* as operand-A positions 2/3.
+        # Head 7: operand-A BYTE 1 staging for multi-byte ALU ops (16-bit
+        # ADD/SUB, SHL/SHR/MUL wide). Delivers mem[SP] byte 1 to the AX marker
+        # so the multi-byte adders/relays can compute byte 1 of the result.
         #
         # ONLY needed when the STACK0 emission is dropped (C4_NO_STACK0_EMIT):
-        # in the 35-token build the wide-ALU byte-1 path already reads stack
-        # byte 1 from the emitted STACK0 byte-1 token, so this memory-sourced
-        # AX_FULL write would DOUBLE-WRITE / conflict with that path and
-        # corrupts SHL/SHR/MUL/16-bit (observed Step A: operand flag ON but
-        # STACK0 still emitted). Gate head 7 on no_stack0_emit so it only
-        # supplies byte-1 from memory when the emitted token is gone.
+        # in the 35-token build the wide-ALU byte-1 path reads stack byte 1
+        # from the emitted STACK0 byte-1 token + STACK0_BYTE_VAL_1 (written by
+        # layer10_psh_ax_broadcast at the STACK0 byte-1 row), so this
+        # memory-sourced write would DOUBLE-WRITE / conflict and corrupt
+        # SHL/SHR/MUL/16-bit. Gate head 7 on no_stack0_emit so it only supplies
+        # byte 1 from memory when the emitted STACK0 token (and its
+        # STACK0_BYTE_VAL_1 producer) are gone.
         if not no_stack0_emit_enabled():
             return
         head = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_7"]
@@ -2754,72 +2753,111 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes[head] = 0.5
 
+        # === STACK0 campaign Part B (2026-06-18): rebuilt K to mirror the
+        # WORKING head-5 byte-0 CAM ===
+        #
+        # The prior head-7 used the OLD address-match design (L4 ADDR_KEY
+        # staging, disabled by the Inc-1 rebuild) + MEM_STORE row gating
+        # (MEM_STORE is on the MARK_MEM marker row, NEVER on the value-byte
+        # rows where this head reads K). So it delivered NOTHING under the flag
+        # (AX_FULL_LO=-1 at the ADD step, GPU-confirmed). Rebuild it on the
+        # same value-row + MEM_STORE_AT_VAL recency CAM head-5 uses for byte 0,
+        # selecting the value-byte-1 row (MEM_VAL_B2) instead of byte-0.
+        #
+        # === Dim 0: bias — fire only at AX marker on binary-pop opcodes ===
         attn.W_q[base, BD.CONST] = -2000.0
         attn.W_q[base, BD.MARK_AX] = 2000.0
-        for op_dim in (BD.OP_MUL, BD.OP_SHL, BD.OP_SHR):
+        for op_dim in (BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
+                       BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+                       BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_SHL, BD.OP_SHR,
+                       BD.OP_SI, BD.OP_SC):
             attn.W_q[base, op_dim] = 500.0
         for op_dim in (BD.OP_LI, BD.OP_LC, BD.OP_IMM, BD.OP_LEA,
                        BD.OP_PSH, BD.OP_JSR, BD.OP_ENT, BD.OP_LEV,
                        BD.OP_JMP, BD.OP_ADJ, BD.OP_BZ, BD.OP_BNZ,
                        BD.OP_EXIT):
             attn.W_q[base, op_dim] = -2000.0
-        for marker_dim in (BD.MARK_PC, BD.MARK_SP, BD.MARK_BP,
-                           BD.MARK_MEM, BD.MARK_STACK0):
-            attn.W_q[base, marker_dim] = -2000.0
+        attn.W_q[base, BD.MARK_PC] = -2000.0
+        attn.W_q[base, BD.MARK_SP] = -2000.0
+        attn.W_q[base, BD.MARK_BP] = -2000.0
+        attn.W_q[base, BD.MARK_MEM] = -2000.0
+        attn.W_q[base, BD.MARK_STACK0] = -2000.0
         attn.W_k[base, BD.CONST] = 10.0
 
         AX_K_EXCLUDE = 28
         attn.W_q[base + AX_K_EXCLUDE, BD.MARK_AX] = 100.0
         attn.W_k[base + AX_K_EXCLUDE, BD.MARK_AX] = -2000.0
 
-        attn.W_q[base + 1, BD.MARK_AX] = 50.0
-        attn.W_k[base + 1, BD.MEM_STORE] = 100.0
-        attn.W_k[base + 1, BD.CONST] = -50.0
+        # Dim 27: MARK_MEM K-exclusion (dedicated, strong). The section's
+        # MARK_MEM marker row carries the relayed MEM_STORE_AT_VAL (the bit
+        # originates there) AND a large dim-0 CONST/Q-gate component, so it
+        # out-scores the value-byte rows on the bias dim alone. A dedicated
+        # exclusion dim (large Q at the firing AX query, large -K at any
+        # MARK_MEM row) drives the marker row deeply negative without touching
+        # the value-byte rows (MARK_MEM=0 there). Mirrors the AX_K_EXCLUDE
+        # pattern. Slot 27 is free on head 7 (dims 4-27 were the retired
+        # address-match band).
+        MEM_K_EXCLUDE = 27
+        attn.W_q[base + MEM_K_EXCLUDE, BD.MARK_AX] = 100.0
+        attn.W_k[base + MEM_K_EXCLUDE, BD.MARK_MEM] = -2000.0
 
-        attn.W_q[base + 2, BD.CONST] = -96.0
-        attn.W_k[base + 2, BD.MEM_STORE] = 50.0
+        # Dim 1/2: value-byte-1 row select. MEM_VAL_B2 marks value byte 1 in
+        # the autoregressive MEM layout (MEM_VAL_B1 marks byte 0). Strong
+        # positive on the byte-1 value row; negative CONST baseline buries
+        # every other row below softmax1's zero anchor. HARD MARK_MEM / MARK_*
+        # K-exclusion: the section's MARK_MEM marker row ALSO carries the
+        # relayed MEM_STORE_AT_VAL (it is the bit's origin), so without a K-side
+        # marker exclusion the dim-4 store gate would pull head-7 onto the
+        # marker row (CLEAN_EMBED empty -> byte 1 = 0) instead of the value
+        # row. Burying the marker (and the register markers) here keeps the
+        # MEM_VAL_B2 value row the only positive candidate.
+        VR = 120.0
+        attn.W_q[base + 1, BD.MARK_AX] = 1.0
+        attn.W_k[base + 1, BD.MEM_VAL_B2] = VR
+        attn.W_k[base + 1, BD.CONST] = -VR / 2
+        attn.W_k[base + 1, BD.MARK_MEM] = -VR * 20
+        attn.W_k[base + 1, BD.MARK_PC] = -VR * 20
+        attn.W_k[base + 1, BD.MARK_AX] = -VR * 20
+        attn.W_k[base + 1, BD.MARK_SP] = -VR * 20
+        attn.W_k[base + 1, BD.MARK_BP] = -VR * 20
 
-        # Select MEM value byte 1. In the autoregressive MEM layout,
-        # MEM_VAL_B1 marks value byte 0 and MEM_VAL_B2 marks value byte 1.
-        BS = 60.0
-        attn.W_q[base + 3, BD.MARK_AX] = BS
-        attn.W_k[base + 3, BD.MEM_VAL_B2] = BS
+        attn.W_q[base + 2, BD.MARK_AX] = 1.0
+        attn.W_k[base + 2, BD.MEM_VAL_B2] = VR * 2
+        attn.W_k[base + 2, BD.CONST] = -VR
 
-        VAL_GATE = 29
-        VG = 200.0
-        attn.W_q[base + VAL_GATE, BD.MARK_AX] = VG
-        attn.W_k[base + VAL_GATE, BD.CONST] = -100.0
-        attn.W_k[base + VAL_GATE, BD.MEM_VAL_B2] = 300.0
+        # Dim 3: AX-marker self-exclusion (mirror head-5 dim 3).
+        attn.W_q[base + 3, BD.MARK_AX] = 100.0
+        attn.W_k[base + 3, BD.MARK_AX] = -VR * 20
 
-        STORE_GATE = 30
-        SG = 100.0
-        attn.W_q[base + STORE_GATE, BD.MARK_AX] = SG
-        attn.W_k[base + STORE_GATE, BD.MEM_STORE] = SG
-        attn.W_k[base + STORE_GATE, BD.CONST] = -SG / 2
+        # Dim 4: STORE-COMMIT GATE — same relayed per-value-row store bit
+        # head-5 uses. make_layer7_mem_store_relay_op now broadcasts
+        # MEM_STORE_AT_VAL onto ALL value-byte rows (B0..B3), so the byte-1
+        # row carries it for a real store; recency then picks the most-recent
+        # store == current mem[SP]. The marker row (where the bit originates) is
+        # already buried by dim-1's MARK_MEM exclusion, so this gate only ranks
+        # among the value-byte rows.
+        STORE_B = 800.0
+        STORE_C = 400.0
+        attn.W_q[base + 4, BD.MARK_AX] = 1.0
+        attn.W_k[base + 4, BD.MEM_STORE_AT_VAL] = STORE_B
+        attn.W_k[base + 4, BD.CONST] = -STORE_C
 
-        addr_dim = 4
-        scale = 10.0
-        addr_bases = [
-            (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
-            (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
-            (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
-        ]
-        for ab_lo, ab_hi in addr_bases:
-            for nibble_base in [ab_lo, ab_hi]:
-                for bit in range(4):
-                    for k in range(16):
-                        bit_val = 2 * ((k >> bit) & 1) - 1
-                        attn.W_q[base + addr_dim, nibble_base + k] = scale * bit_val
-                        attn.W_k[base + addr_dim, nibble_base + k] = scale * bit_val
-                    addr_dim += 1
-
+        # === V/O: copy CLEAN_EMBED bytes → STACK0_BYTE_VAL_1 + AX_FULL ===
+        # STACK0_BYTE_VAL_1 is the band the L13 add/sub minuend/addend relays +
+        # the L10 high-byte adder + BDToGEConverter read for operand-A byte 1.
+        # Also keep the AX_FULL write (the wide-ALU / GE-convert path consumes
+        # AX_FULL_* as operand-A positions 2/3).
         for k in range(16):
             attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
             attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
         attn.W_v[base + 0, BD.CONST] = 1.0
         for k in range(16):
+            attn.W_o[BD.STACK0_BYTE_VAL_1_LO + k, base + 1 + k] = SCALE_O
+            attn.W_o[BD.STACK0_BYTE_VAL_1_HI + k, base + 17 + k] = SCALE_O
             attn.W_o[BD.AX_FULL_LO + k, base + 1 + k] = SCALE_O
             attn.W_o[BD.AX_FULL_HI + k, base + 17 + k] = SCALE_O
+        attn.W_o[BD.STACK0_BYTE_VAL_1_LO + 0, base + 0] = -SCALE_O
+        attn.W_o[BD.STACK0_BYTE_VAL_1_HI + 0, base + 0] = -SCALE_O
         attn.W_o[BD.AX_FULL_LO + 0, base + 0] = -SCALE_O
         attn.W_o[BD.AX_FULL_HI + 0, base + 0] = -SCALE_O
 
@@ -2845,6 +2883,17 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
     # flag-OFF build. Declare it in the read set only when the op is enabled
     # so the dep-graph validator does not reject the undeclared dim flag-OFF.
     _store_at_val_read = {"MEM_STORE_AT_VAL"} if enable else set()
+
+    # STACK0 campaign Part B: head 7 writes STACK0_BYTE_VAL_1 (operand-A byte 1
+    # from mem[SP]) ONLY when the STACK0 emission is dropped (the byte-1 head
+    # bakes under no_stack0_emit). Declare the write conditionally so the
+    # dep-graph validator sees the producer only in that config. The band is a
+    # production dim (always in dim_positions), so this is purely a graph hint.
+    _byte1_write = (
+        {"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"}
+        if (enable and no_stack0_emit_enabled())
+        else set()
+    )
 
     return Operation(
         name="layer8_mem_to_alu",
@@ -2884,7 +2933,7 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "ADDR_B1_LO.*.-1", "ADDR_B1_HI.*.-1",
                "ADDR_B2_LO.*.-1", "ADDR_B2_HI.*.-1",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"} | _store_at_val_read,
-        writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"},
+        writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"} | _byte1_write,
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
