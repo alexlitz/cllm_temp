@@ -274,7 +274,7 @@ _BP_SAVE_CARRY_BUNDLE = cross_step_carry(_BP_SAVE_CARRY_SPEC)
 #
 # The ``layer11_mul_partial`` op owns the entire L11 FFN. As of Wave 4D
 # the weight writes are fully declarative: a 4096-rule ``FFNRule`` IR
-# (see ``_layer11_mul_partial_rules`` / ``_layer11_mul_partial_ir``)
+# (see ``_mul_partial_rules`` / ``_mul_partial_ir``)
 # walks a schoolbook ``(a_lo, b_lo, b_hi)`` triple-loop and fills all
 # 4096 hidden units (16^3) via ``Primitives.lower_ffn_rules``.
 #
@@ -296,24 +296,24 @@ _BP_SAVE_CARRY_BUNDLE = cross_step_carry(_BP_SAVE_CARRY_SPEC)
 # slab.
 #
 # The offsets below mirror the rule order in
-# ``_layer11_mul_partial_rules`` (and the legacy
+# ``_mul_partial_rules`` (and the legacy
 # ``setup_helpers._set_layer11_mul_partial`` cursor walk it replaces).
 # The outer loop is over ``a_lo in range(16)``; each iteration writes
 # ``16 (b_lo) * 16 (b_hi) = 256`` units at offset ``a_lo * 256``.
 # Changing the rule loop structure requires updating this table in
 # lock-step.
-_L11_MUL_PARTIAL_UNIT_LAYOUT = tuple(
+_MUL_PARTIAL_UNIT_LAYOUT = tuple(
     # (sub-stage name, legacy_start (docs only), n_units)
     (f"layer11_mul_partial.a_lo_{a_lo:02d}", a_lo * 256, 256)
     for a_lo in range(16)
 )
 
 
-def _allocate_layer11_mul_partial_units() -> FFNUnitAllocator:
+def _allocate_mul_partial_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` for the L11 MUL partial.
 
     Phase 7.B.4: ``pin=`` is dropped from every entry in
-    :data:`_L11_MUL_PARTIAL_UNIT_LAYOUT`. The allocator's default
+    :data:`_MUL_PARTIAL_UNIT_LAYOUT`. The allocator's default
     first-fit strategy walks the layout in declaration order and lands
     each ``a_lo`` slab at the lowest free gap large enough to hold it
     (256 units). Because the layout is fully contiguous (slab ``a_lo``
@@ -334,15 +334,15 @@ def _allocate_layer11_mul_partial_units() -> FFNUnitAllocator:
     range past unit 4096).
     """
     allocator = FFNUnitAllocator()
-    for name, _legacy_start, n_units in _L11_MUL_PARTIAL_UNIT_LAYOUT:
+    for name, _legacy_start, n_units in _MUL_PARTIAL_UNIT_LAYOUT:
         allocator.alloc(name, n_units)
     return allocator
 
 
 # Total unit footprint the helper is expected to consume. Computed from
 # the layout table so a change to either side is loudly inconsistent.
-_L11_MUL_PARTIAL_TOTAL_UNITS = sum(
-    n_units for _, _, n_units in _L11_MUL_PARTIAL_UNIT_LAYOUT
+_MUL_PARTIAL_TOTAL_UNITS = sum(
+    n_units for _, _, n_units in _MUL_PARTIAL_UNIT_LAYOUT
 )
 
 
@@ -378,7 +378,7 @@ _L11_MUL_PARTIAL_TOTAL_UNITS = sum(
 # for-byte on the migrated unit ranges.
 
 
-def _layer11_mul_partial_rules_for_a_lo(
+def _mul_partial_rules_for_a_lo(
     a_lo: int, S: float
 ) -> tuple[FFNRule, ...]:
     """Return the 256 ``FFNRule``s for one ``a_lo`` slab.
@@ -435,20 +435,20 @@ def _layer11_mul_partial_rules_for_a_lo(
     return tuple(rules)
 
 
-def _layer11_mul_partial_rules(S: float) -> tuple[FFNRule, ...]:
+def _mul_partial_rules(S: float) -> tuple[FFNRule, ...]:
     """Return the full 4096-rule ``FFNRule`` sequence for the L11 MUL partial.
 
-    Concatenates ``_layer11_mul_partial_rules_for_a_lo`` for ``a_lo`` in
+    Concatenates ``_mul_partial_rules_for_a_lo`` for ``a_lo`` in
     ``range(16)`` so the lowering cursor walks 0..4096 with no gap, matching
     the historical ``_set_layer11_mul_partial`` unit numbering.
     """
     rules: list[FFNRule] = []
     for a_lo in range(16):
-        rules.extend(_layer11_mul_partial_rules_for_a_lo(a_lo, S))
+        rules.extend(_mul_partial_rules_for_a_lo(a_lo, S))
     return tuple(rules)
 
 
-def _layer11_mul_partial_ir(S: float = 100.0) -> CompilerIR:
+def _mul_partial_ir(S: float = 100.0) -> CompilerIR:
     """Build the declarative ``CompilerIR`` for the L11 MUL partial.
 
     Exposed via the op's ``compiler_ir=`` so symbolic execution,
@@ -456,11 +456,11 @@ def _layer11_mul_partial_ir(S: float = 100.0) -> CompilerIR:
     can read the rules without going through the bake.
     """
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer11_mul_partial_rules(S))
+    ir.layer(0).ffn.rules.extend(_mul_partial_rules(S))
     return ir
 
 
-def _lower_layer11_mul_partial_rules(
+def _lower_mul_partial_rules(
     ffn,
     S: float,
     BD,
@@ -471,11 +471,11 @@ def _lower_layer11_mul_partial_rules(
 
     Returns the post-bake unit cursor (``start_unit + 4096``). The bake
     asserts ``start_unit == 0`` via the cursor-drift guard in
-    ``make_layer11_mul_partial_op``; this signature keeps a ``start_unit``
+    ``make_mul_partial_op``; this signature keeps a ``start_unit``
     knob in case a future op family extends the L11 pool past unit
     4096.
     """
-    rules = _layer11_mul_partial_rules(S)
+    rules = _mul_partial_rules(S)
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
         Primitives.ffn_rule_dim_names(rules),
@@ -489,7 +489,7 @@ def _lower_layer11_mul_partial_rules(
     )
 
 
-def make_layer11_ffn_dep_anchor_op() -> Operation:
+def make_mul_partial_dep_anchor_op() -> Operation:
     """No-op companion for ``layer11_mul_partial``: declares identical
     reads/writes so the LayerCompiler's dep graph reserves a layer slot
     for L11. Mirrors ``_layer3_ffn_dep_anchor`` /
@@ -534,7 +534,7 @@ def make_layer11_ffn_dep_anchor_op() -> Operation:
     )
 
 
-def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
+def make_mul_partial_op(alu_mode: str = "lookup") -> Operation:
     """L11 FFN: MUL partial product accumulation.
 
     Pinned to ``layer_idx=11`` via ``kind="block"``: dep-graph layer
@@ -564,7 +564,7 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # not just a monotonic int. Downstream tools (e.g. a future L11
         # op family widening ``layer_max_units=``) can introspect or
         # extend it here.
-        allocator = _allocate_layer11_mul_partial_units()
+        allocator = _allocate_mul_partial_units()
         block.ffn._l11_unit_allocator = allocator
 
         # Fully declarative bake: all 16 a_lo slabs (4096 units) are
@@ -575,9 +575,9 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # and direct ``W_up`` / ``b_up`` / ``W_gate`` / ``b_gate`` /
         # ``W_down`` tensor equality.
         # Phase 8.C inline: lower the rule list directly (was
-        # ``_lower_layer11_mul_partial_rules``) so census v2 classifies
+        # ``_lower_mul_partial_rules``) so census v2 classifies
         # this op as ``declarative`` rather than ``declarative_via_helper``.
-        rules = _layer11_mul_partial_rules(S)
+        rules = _mul_partial_rules(S)
         rule_dim_positions = Primitives.dim_positions_from_bd(
             proxy, Primitives.ffn_rule_dim_names(rules),
         )
@@ -588,10 +588,10 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # allocator's total footprint. If the layout table drifts from
         # the rule list, this assertion fires before any weight surgery
         # propagates downstream.
-        assert next_unit == _L11_MUL_PARTIAL_TOTAL_UNITS, (
+        assert next_unit == _MUL_PARTIAL_TOTAL_UNITS, (
             f"L11 MUL partial unit cursor drift: bake returned "
             f"{next_unit}, allocator expected "
-            f"{_L11_MUL_PARTIAL_TOTAL_UNITS}"
+            f"{_MUL_PARTIAL_TOTAL_UNITS}"
         )
 
     return Operation(
@@ -612,11 +612,11 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         # Declarative ``CompilerIR`` exposed for symbolic execution,
         # ``compare_symbolic_to_lowered_ffn`` / declarative verifier
         # tooling, and the F-7 ``verify_rule_scopes`` checks. The bake
-        # itself still goes through ``_lower_layer11_mul_partial_rules``
+        # itself still goes through ``_lower_mul_partial_rules``
         # so the per-bake allocator and byte-identity cursor guard wrap
         # the lowering -- ``_dispatch_operation_ir`` would otherwise
         # bypass the allocator bookkeeping.
-        compiler_ir=_layer11_mul_partial_ir(),
+        compiler_ir=_mul_partial_ir(),
         declarative_authority="spec_generated",
         # Phase 8.A.4 retry: layer_idx=11 literal dropped. ``target_op_name``
         # binds this block op to the layer of ``_layer11_ffn_dep_anchor``
@@ -1166,7 +1166,7 @@ _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT = (
 )
 
 
-def _allocate_layer13_ax_byte1_dump_carry_heads() -> AttentionHeadAllocator:
+def _allocate_ax_byte1_dump_carry_heads() -> AttentionHeadAllocator:
     """Per-bake head allocator for the AX byte-1 DUMP carry head (L13 host)."""
     allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
     for (op_name, head_idx) in _AX_BYTE1_DUMP_CARRY_HEAD_LAYOUT:
@@ -1348,7 +1348,7 @@ _AX_BYTE1_CARRY_SPEC = CrossStepCarrySpec(
 _AX_BYTE1_CARRY_BUNDLE = cross_step_carry(_AX_BYTE1_CARRY_SPEC)
 
 
-def _layer13_ax_byte1_dump_carry_head_spec(
+def _ax_byte1_dump_carry_head_spec(
     dim_positions: dict,
     head_idx: int,
     *,
@@ -1465,20 +1465,20 @@ def make_layer11_ax_byte1_dump_carry_op(enable: bool = True) -> Operation:
             return
         proxy = _as_setdim_proxy(dim_positions)  # noqa: F841 (parity w/ peers)
         attn = block.attn
-        allocator = _allocate_layer13_ax_byte1_dump_carry_heads()
+        allocator = _allocate_ax_byte1_dump_carry_heads()
         attn._l13_ax_byte1_dump_carry_head_allocator = allocator
         head_idx = allocator.heads()[-1].head_idx
         HD = attn.W_q.shape[0] // attn.num_heads
-        spec = _layer13_ax_byte1_dump_carry_head_spec(
+        spec = _ax_byte1_dump_carry_head_spec(
             dim_positions, head_idx,
         )
         Primitives.generate_attention_head(attn, spec, HD)
 
     def _ir(dim_positions, HD) -> CompilerIR:
         del HD
-        allocator = _allocate_layer13_ax_byte1_dump_carry_heads()
+        allocator = _allocate_ax_byte1_dump_carry_heads()
         head_idx = allocator.heads()[-1].head_idx
-        spec = _layer13_ax_byte1_dump_carry_head_spec(dim_positions, head_idx)
+        spec = _ax_byte1_dump_carry_head_spec(dim_positions, head_idx)
         ir = CompilerIR()
         if enable:
             ir.layer(0).attention.append(
@@ -2386,7 +2386,7 @@ def _stack0_byte0_dump_carry_head_spec(
 ) -> DeclarativeAttentionHeadSpec:
     """Carry head: copy the prev step's STACK0-marker H1/H3 one-hot forward.
 
-    Mirrors ``_layer13_ax_byte1_dump_carry_head_spec``. The head attends the
+    Mirrors ``_ax_byte1_dump_carry_head_spec``. The head attends the
     PREVIOUS step's STACK0-marker row (the row that held the clean byte-0 H1/H3
     one-hot) and copies that one-hot into the dedicated ``STACK0_B0_H1_PREV`` /
     ``STACK0_B0_H3_PREV`` bands via the ``H1.*.-1`` / ``H3.*.-1`` SSA cross-step

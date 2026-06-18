@@ -333,8 +333,8 @@ def all_core_ops(
         # is owned by ``layer11_mul_partial`` (kind="block", target_op_name=
         # ``_layer11_ffn_dep_anchor``); this no-op companion gives the
         # scheduler a layer-resident ffn op so the block op resolves to L11.
-        make_layer11_ffn_dep_anchor_op(),
-        make_layer11_mul_partial_op(alu_mode=alu_mode),
+        make_mul_partial_dep_anchor_op(),
+        make_mul_partial_op(alu_mode=alu_mode),
         # Wave A (docs/STEP_END_COMPUTE_ARCHITECTURE_2026_06_10.md):
         # two-head attention relay broadcasting OP_<NAME>, AX_CARRY,
         # ALU_LO/HI, CMP, and STACK0_BYTE0..3 from MARK_AX -> MARK_SE

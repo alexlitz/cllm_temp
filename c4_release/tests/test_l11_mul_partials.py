@@ -43,7 +43,7 @@ from c4_release.neural_vm.unified_compiler.layer_compiler import LayerCompiler
 from c4_release.neural_vm.unified_compiler.migrated_ops import (
     all_core_ops,
     declare_setdim_compat_dims,
-    make_layer11_mul_partial_op,
+    make_mul_partial_op,
 )
 from c4_release.neural_vm.vm_step import _SetDim as BD
 
@@ -198,7 +198,7 @@ def test_l11_mul_partial_no_fire_when_gate_missing(
 @pytest.mark.xfail(
     reason=(
         "Declaration drift surfaced by audit harness: "
-        "(1) make_layer11_mul_partial_op() no longer accepts alu_mode kwarg; "
+        "(1) make_mul_partial_op() no longer accepts alu_mode kwarg; "
         "(2) the op declares produces={'MUL_ACCUM': 'AX_byte0'} but the bake "
         "_set_layer11_mul_partial actually writes BD.TEMP+partial (slot 480+), "
         "not BD.MUL_ACCUM (slot 420). The 'MUL_ACCUM' alias-to-TEMP claim in "
@@ -214,7 +214,7 @@ def test_l11_mul_partial_op_declares_temp_production_at_ax_byte0():
     the same marker. Pinning the contract here makes a regression in the
     declaration unambiguous.
     """
-    op = make_layer11_mul_partial_op(alu_mode="lookup")
+    op = make_mul_partial_op(alu_mode="lookup")
     assert op.produces == {"TEMP": "AX_byte0"}
     assert op.consumes_fresh == {
         "ALU_LO": "AX_byte0",

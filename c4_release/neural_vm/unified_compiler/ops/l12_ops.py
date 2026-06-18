@@ -200,7 +200,7 @@ def make_mul_combine_op(alu_mode: str = "lookup") -> Operation:
     """L12 FFN: combine MUL partial products into final result.
 
     Pinned to ``layer_idx=12`` via ``kind="block"``. See
-    ``make_layer11_mul_partial_op``.
+    ``make_mul_partial_op``.
 
     Declarations-only note: this migrated owner is now exposed through the
     declarations-only dispatcher so strict builds do not fall back to legacy

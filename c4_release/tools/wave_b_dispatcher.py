@@ -341,7 +341,7 @@ _CLUSTER_MANIFEST: Tuple[RuleSpec, ...] = (
     RuleSpec(
         cluster=4,
         factory_module="neural_vm.unified_compiler.ops.l11_ops",
-        factory_name="_layer11_mul_partial_rules",
+        factory_name="_mul_partial_rules",
         relayed_dims=_L11_MUL_PARTIAL_RELAYED,
         allow_step_end_writes_to=("MUL_PARTIAL_LO", "MUL_PARTIAL_HI"),
     ),
