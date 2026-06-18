@@ -11,6 +11,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
 from .shared import _as_setdim_proxy
 from .residual_band_registry import register_residual_band
+from ...dim_registry import dim_ref
 
 
 _IO_PUTCHAR_ROUTING_START_UNIT = 1500
@@ -255,7 +256,7 @@ def _function_call_jsr_stack0_marker_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale_cancel = -2.0 / S
     write_scale_writeback = 2.0 / S
     conditions = (
-        ("CMP+4", 1.0),
+        (dim_ref("cmp_flag", "cascade", 4), 1.0),
         ("MARK_STACK0", 1.0),
         ("MARK_PC", JSR_S0_BLOCK),
         ("MARK_AX", JSR_S0_BLOCK),
@@ -445,7 +446,7 @@ def _function_call_ent_stack0_rules(S: float) -> tuple[FFNRule, ...]:
     """
     T_ent_s0 = 1.5
     write_scale = 2.0 / S
-    conditions = (("CMP+2", 1.0), ("MARK_STACK0", 1.0))
+    conditions = ((dim_ref("cmp_flag", "cascade", 2), 1.0), ("MARK_STACK0", 1.0))
     rules: list[FFNRule] = []
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -488,7 +489,7 @@ def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
     T_ent_bp = 1.5
     write_scale = 2.0 / S
     base_conditions = (
-        ("CMP+2", 1.0),
+        (dim_ref("cmp_flag", "cascade", 2), 1.0),
         ("MARK_BP", 1.0),
     )
     borrow_blockers = tuple(
@@ -2434,7 +2435,7 @@ _AX_BYTE1_HINIB_SRC_OFFSET = 4       # high-nibble one-hot at H3_PREV_STEP+(4+hi
 _AX_B1_HINIB_SRC_W = 1.0
 _AX_B1_HINIB_ISBYTE_W = 1.0
 _AX_B1_HINIB_AXPRESENT_W = 4.0       # SE_REG_AX_PRESENT (AX~4 vs SP~1.48/BP~.54)
-_AX_B1_HINIB_BYTEIDX_GATE = "BYTE_INDEX_0+0"   # multiplicative row selector
+_AX_B1_HINIB_BYTEIDX_GATE = dim_ref("byte_index", "0", 0)   # multiplicative row selector
 _AX_B1_HINIB_MARKER_BLOCK = 1000.0
 # AND threshold. Reachable sums (BYTE_INDEX_0+0 ~1 multiplies the silu output):
 #   AX byte1, hi MATCH:    src~12 + AXP 4*4=16 + IS_BYTE 1   = ~29   -> CLEAR
