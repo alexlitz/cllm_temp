@@ -7,7 +7,6 @@ from ..isa_semantics_dsl import (
     CamConfirmSlot,
     CamKeyMatch,
     CamLookupSpec,
-    CamRowBias,
     CamValueBand,
     cam_lookup,
 )
@@ -17,7 +16,6 @@ from .shared import (  # noqa: F401
     _as_setdim_proxy,
     _empty_compiler_ir_factory,
     operand_from_memsp_enabled,
-    operand_gather_psh_rowselect_enabled,
 )
 
 
@@ -172,20 +170,6 @@ def make_layer7_operand_gather_op() -> Operation:
         _claims.add((7, "attn_W_v", f"1_{1 + k}", f"OUTPUT_LO+{k}"))
         _claims.add((7, "attn_W_v", f"1_{17 + k}", f"OUTPUT_HI+{k}"))
 
-    # CONTENT/POSITION PSH-row preference (C4_OPERAND_GATHER_PSH_ROWSELECT,
-    # DEFAULT OFF): head 0 adds a SECOND K signature reading PSH_AT_SP +
-    # CLEAN_EMBED_HI (guard) gated on OP_ADD/OP_SUB. Declare those extra reads
-    # ONLY when the flag is on so flag-off leaves the dep graph (and weights)
-    # byte-identical.
-    _reads = {"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
-              "OP_IMM",  # head 1 Q: per-step actual-IMM suppression gate
-              "CONST",
-              "MARK_BP", "MARK_SP",
-              "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
-              "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1"}
-    if operand_gather_psh_rowselect_enabled():
-        _reads |= {"PSH_AT_SP", "OP_ADD", "OP_SUB"}
-
     return Operation(
         name="layer7_operand_gather",
         # Phase 8.A targeted: head 1's V slots read BP/SP OUTPUT_LO via
@@ -211,7 +195,12 @@ def make_layer7_operand_gather_op() -> Operation:
         # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — add
         # MARK_BP, MARK_SP (head 1 K reads ``BD.MARK_BP`` + ``BD.MARK_SP``
         # at slot 0; BP/SP marker self-attention gate for LEA/ADJ/ENT).
-        reads=_reads,
+        reads={"MARK_AX", "STACK0_BYTE0", "OP_LEA", "OP_ADJ", "OP_ENT",
+               "OP_IMM",  # head 1 Q: per-step actual-IMM suppression gate
+               "CONST",
+               "MARK_BP", "MARK_SP",
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+               "OUTPUT_LO.*.-1", "OUTPUT_HI.*.-1"},
         writes={"ALU_LO", "ALU_HI"},
         kind="block",
         declarative_bake_fn=bake,
@@ -283,49 +272,6 @@ def _operand_gather_head0_cam_spec() -> CamLookupSpec:
     is untouched — STACK0_VIA_MEM_ATTENTION_PLAN.md Phase 1 step 3.
     """
     L = 15.0
-    # CONTENT/POSITION PSH-row preference (C4_OPERAND_GATHER_PSH_ROWSELECT,
-    # DEFAULT OFF). When ON, a SECOND structured K signature on slot 34 (gated
-    # on OP_ADD/OP_SUB) prefers the genuine PSH-output STACK0 row (PSH_AT_SP=1
-    # with a NON-default CLEAN_EMBED_HI) over the spurious recency re-stamp,
-    # fixing the byte-0 high-nibble cluster. The CLEAN_EMBED_HI guard keeps a
-    # CORRUPTED preferred row (the IMM hi-nibble-D/E/F decode bug zeroes its
-    # high nibble) on the recency fallback so the byte-1/carry controls stay
-    # correct. The bias touches no V/O. OFF => row_bias=None => byte-identical.
-    #   Q[34] = c * (OP_ADD + OP_SUB)         (add/sub compute rows only)
-    #   K[34] = pref_w*PSH_AT_SP + guard_w*(nonzero CLEAN_EMBED_HI)
-    # pref_w < guard_w is LOAD-BEARING: a clean preferred row earns
-    # pref_w+guard_w and out-scores recency by pref_w; a corrupted preferred row
-    # (hi nibble zeroed) earns only pref_w and LOSES to its clean-hi recency row
-    # (guard_w) -> recency holds for the IMM-corrupted operands.
-    row_bias = None
-    if operand_gather_psh_rowselect_enabled():
-        row_bias = CamRowBias(
-            slot=34,
-            # Q[34] = c*(OP_ADD + OP_SUB): fires ONLY on the binary ADD/SUB
-            # compute AX markers (the cluster in scope) and is exactly ZERO on
-            # every other op's AX marker (PSH/IMM/CMP/bitwise/LEA/...), where
-            # the recency heuristic is already correct. No MARK_AX / CONST term
-            # (those are nonzero on EVERY AX row and would mis-fire the bias on
-            # non-add/sub steps).
-            query_dim="OP_ADD",
-            query_weight=L * 0.5,
-            query_blockers=(("OP_SUB", L * 0.5),),
-            # Restrict the bias to STACK0 rows: pref/guard are nonzero on EVERY
-            # value-bearing token, so without this the slot-34 boost could lift
-            # a non-operand row (e.g. a stray 0xFF carrier) into the winner —
-            # the id24 0x70c regression. key_gate makes slot-34 K ~0 on STACK0
-            # rows and a large NEGATIVE elsewhere, so the bias only RE-RANKS the
-            # operand-candidate STACK0 rows.
-            key_gate_dim="STACK0_BYTE0",
-            key_gate_weight=L * 5,
-            const_dim="CONST",
-            pref_dim="PSH_AT_SP",
-            pref_weight=L * 0.7,
-            guard_band="CLEAN_EMBED_HI",
-            guard_lo=1,          # skip cell 0 (the default/zeroed high nibble)
-            guard_width=16,
-            guard_weight=L * 1.5,
-        )
     return CamLookupSpec(
         name="layer7_operand_gather_head0",
         key_match=CamKeyMatch(
@@ -347,7 +293,6 @@ def _operand_gather_head0_cam_spec() -> CamLookupSpec:
         ),
         const_dim="CONST",
         value_active=not operand_from_memsp_enabled(),
-        row_bias=row_bias,
     )
 
 
@@ -364,10 +309,6 @@ def _operand_gather_head0_dim_map(BD) -> dict:
     names = {
         "MARK_AX", "STACK0_BYTE0", "CONST", "OP_LEA", "OP_ADJ", "OP_ENT",
         "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "ALU_LO", "ALU_HI",
-        # CONTENT/POSITION PSH-row preference (C4_OPERAND_GATHER_PSH_ROWSELECT)
-        # dims. Resolved unconditionally so the dim_map is stable regardless of
-        # the flag (the spec only references them when the flag is on).
-        "PSH_AT_SP", "OP_ADD", "OP_SUB",
     }
     return {n: int(getattr(BD, n)) for n in names}
 

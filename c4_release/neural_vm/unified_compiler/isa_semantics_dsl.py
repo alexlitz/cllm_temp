@@ -1956,89 +1956,6 @@ class CamConfirmSlot:
 
 
 @dataclass(frozen=True)
-class CamRowBias:
-    """An optional CONTENT/POSITION row-preference bias (a SECOND key MATCH).
-
-    The base :class:`CamKeyMatch` selects the row by a single signature
-    (``STACK0_BYTE0`` for L7), but when MULTIPLE rows carry that signature the
-    head falls back to the ALiBi recency tiebreak — and a SPURIOUS later row
-    can out-recency the genuine one (the L7 operand-gather byte-0 high-nibble
-    bug: the gather picks a later STACK0 re-stamp whose low nibble aliases the
-    operand but whose high nibble differs). This bias adds a SECOND, structured
-    K signature on a fresh slot that prefers the CONTENT-correct row.
-
-    Shape (all on :attr:`slot`):
-      Q ``AP(slot, query_dim, query_weight)`` re-asserts the marker so the bias
-        fires only at the query row, PLUS the :attr:`query_blockers` opcode gate
-        (so the bias is inert on ops it must not touch — L7: fire only on
-        OP_ADD / OP_SUB).
-      K ``AP(slot, pref_dim, pref_weight)`` boosts rows carrying the primary
-        preference flag (L7: ``PSH_AT_SP`` — the genuine PSH-output row), PLUS
-        an optional :attr:`guard_band` that boosts rows whose value band is
-        NON-DEFAULT (L7: ``CLEAN_EMBED_HI`` cells :attr:`guard_lo`..15 — a
-        nonzero high nibble). The guard is what keeps the bias from anchoring a
-        CORRUPTED preferred row: a preferred row whose value high nibble was
-        zeroed upstream (the IMM hi-nibble decode bug) gets only the
-        ``pref_weight`` term while the recency row gets the ``guard_weight``
-        term, so as long as ``guard_weight >= pref_weight`` the recency row
-        still wins for those (the byte-1/carry-safe fallback). A preferred row
-        whose value IS clean gets BOTH terms and out-scores recency by
-        ``pref_weight`` — flipping the byte-0 high-nibble cases.
-
-    The score added on this slot for ``(query_row, key_row)`` is
-    ``query_weight * (pref_weight*pref(key) + guard_weight*nonzero_guard(key))``
-    (after the opcode gate). It is PURE row-selection structure — it touches no
-    V/O, so the value RELAY (and therefore the byte-1/carry pathway, which is a
-    SEPARATE mechanism) is unchanged; only WHICH row the existing relay reads
-    moves.
-
-    Attributes:
-        slot: head-local bias slot (distinct from the key-match / confirm slots).
-        query_dim: the marker dim re-asserted on the bias slot (L7: ``MARK_AX``).
-        query_weight: the marker Q write (the constant ``c`` above).
-        pref_dim: the primary K preference flag (L7: ``PSH_AT_SP``).
-        pref_weight: the K boost for rows carrying ``pref_dim``.
-        guard_band: optional value band whose NON-DEFAULT cells counter-boost
-            the recency rows (L7: ``CLEAN_EMBED_HI``). ``None`` => no guard.
-        guard_lo: first guard-band cell that counts as non-default (L7: ``1`` —
-            skip the cell-0 default so a zeroed/corrupted value does NOT earn
-            the guard boost).
-        guard_width: guard-band cell count (L7: ``16``).
-        guard_weight: the K boost per non-default guard cell.
-        query_blockers: opcode-reject Q writes on the bias slot — ``(opcode_dim,
-            weight)`` with NEGATIVE weight (L7: reject every non-ADD/SUB op) OR
-            POSITIVE weight to REQUIRE an op. These narrow when the bias fires.
-        key_gate_dim: optional K-side ROW-RESTRICTION signature (L7:
-            ``STACK0_BYTE0``). The pref/guard K terms are nonzero on EVERY
-            value-bearing row (any row carrying ``pref_dim`` or a non-default
-            guard cell), which would let a non-target row win the bias. Adding
-            ``+key_gate_weight*key_gate_dim - key_gate_weight*const_dim`` to the
-            bias K makes the slot's K BASELINE zero on the target rows (which
-            carry ``key_gate_dim``) and a LARGE NEGATIVE on every other row
-            (which carry only ``const_dim``), so the bias only re-ranks the
-            target rows and cannot lift a non-target row into the winner.
-            ``None`` => no restriction.
-        key_gate_weight: the K-restriction weight (must be >> pref/guard so
-            non-target rows are pushed out of the softmax).
-        const_dim: the always-on CONST dim used by the key-gate subtraction.
-    """
-
-    slot: int
-    query_dim: str
-    query_weight: float
-    pref_dim: str
-    pref_weight: float
-    guard_band: Optional[str] = None
-    guard_lo: int = 1
-    guard_width: int = 16
-    guard_weight: float = 0.0
-    query_blockers: Tuple[Tuple[str, float], ...] = ()
-    key_gate_dim: Optional[str] = None
-    key_gate_weight: float = 0.0
-    const_dim: str = "CONST"
-
-
-@dataclass(frozen=True)
 class CamValueBand:
     """One ``source_band -> target_band`` value-relay block.
 
@@ -2107,11 +2024,6 @@ class CamLookupSpec:
         extra_reads: extra dim names the head's Operation should declare as
             reads beyond the auto-derived set (e.g. a cross-step ``X.*.-1``
             alias the source band is read through).
-        row_bias: an optional CONTENT/POSITION row-preference bias
-            (:class:`CamRowBias`) — a SECOND structured K signature that breaks
-            the recency tie toward the genuine row when multiple rows share the
-            base key signature. ``None`` => no bias (byte-identical: no extra
-            Q/K writes). Touches NO V/O, so the value relay is unchanged.
     """
 
     name: str
@@ -2123,7 +2035,6 @@ class CamLookupSpec:
     const_dim: str = "CONST"
     value_active: bool = True
     extra_reads: Tuple[str, ...] = ()
-    row_bias: Optional[CamRowBias] = None
 
     def __post_init__(self) -> None:
         if not self.value_bands:
@@ -2178,7 +2089,6 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
     """
     km = spec.key_match
     confirm = spec.confirm
-    row_bias = spec.row_bias
 
     def head_spec_builder(
         dim_positions: Dict[str, int], head_idx: int
@@ -2211,36 +2121,6 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
                 q.append(AP(confirm.slot, _P(op_dim), w))
             k.append(AP(confirm.slot, const, confirm.const_k_weight))
 
-        # (3b) The optional CONTENT/POSITION row-preference bias slot — a SECOND
-        #      structured K signature that breaks the recency tie toward the
-        #      genuine row. Q re-asserts the marker (+ opcode gate); K boosts
-        #      rows carrying the preference flag PLUS (optionally) a non-default
-        #      guard band so a CORRUPTED preferred row falls back to recency.
-        #      Touches NO V/O — only the row select moves. Omitted (None) =>
-        #      byte-identical.
-        if row_bias is not None:
-            q.append(AP(row_bias.slot, _P(row_bias.query_dim),
-                        row_bias.query_weight))
-            for (op_dim, w) in row_bias.query_blockers:
-                q.append(AP(row_bias.slot, _P(op_dim), w))
-            # Row-restriction: +gate*key_gate_dim - gate*const so the bias K is
-            # ~0 on rows carrying key_gate_dim (the target rows) and a large
-            # NEGATIVE on every other row -> the pref/guard re-rank ONLY the
-            # target rows and cannot lift a non-target value row into the
-            # winner.
-            if (row_bias.key_gate_dim is not None
-                    and row_bias.key_gate_weight != 0.0):
-                k.append(AP(row_bias.slot, _P(row_bias.key_gate_dim),
-                            row_bias.key_gate_weight))
-                k.append(AP(row_bias.slot, _P(row_bias.const_dim),
-                            -row_bias.key_gate_weight))
-            k.append(AP(row_bias.slot, _P(row_bias.pref_dim),
-                        row_bias.pref_weight))
-            if row_bias.guard_band is not None and row_bias.guard_weight != 0.0:
-                gbase = _P(row_bias.guard_band)
-                for j in range(row_bias.guard_lo, row_bias.guard_width):
-                    k.append(AP(row_bias.slot, gbase + j, row_bias.guard_weight))
-
         # (4) The value relay blocks: V copies source_band -> V slots; O writes
         #     those slots into target_band. Omitted when value_active is False
         #     (the row-select gates stay, the relay is suppressed).
@@ -2271,17 +2151,6 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
         if confirm.marker_dim is not None:
             head_reads.add(confirm.marker_dim)
         for (op_dim, _w) in confirm.blockers:
-            head_reads.add(op_dim)
-    if row_bias is not None:
-        head_reads.add(row_bias.query_dim)
-        head_reads.add(row_bias.pref_dim)
-        if row_bias.guard_band is not None and row_bias.guard_weight != 0.0:
-            head_reads.add(row_bias.guard_band)
-        if (row_bias.key_gate_dim is not None
-                and row_bias.key_gate_weight != 0.0):
-            head_reads.add(row_bias.key_gate_dim)
-            head_reads.add(row_bias.const_dim)
-        for (op_dim, _w) in row_bias.query_blockers:
             head_reads.add(op_dim)
     head_writes: Set[str] = set()
     if spec.value_active:
