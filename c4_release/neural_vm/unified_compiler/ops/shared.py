@@ -156,6 +156,39 @@ def addsub_output_boost_enabled() -> bool:
     return os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
 
 
+def operand_gather_psh_rowselect_enabled() -> bool:
+    """Return True iff the L7 operand-gather head 0 adds a CONTENT/POSITION
+    PSH-row preference bias to its CAM row-select (DEFAULT OFF — opt-in via
+    ``C4_OPERAND_GATHER_PSH_ROWSELECT=1``).
+
+    The bug this lifts (verified spec_k=0, BUILT dims, authoritative
+    autoregressive emission on CPU): the operand-A gather head 0 (a faithful
+    identity copy of whatever STACK0_BYTE0 row it attends) keys ONLY on
+    ``STACK0_BYTE0`` and tiebreaks the MULTIPLE matching rows by ALiBi recency.
+    A SPURIOUS later STACK0 re-stamp whose LOW nibble aliases the operand but
+    whose HIGH nibble differs out-recencies the genuine PSH-output row, so the
+    relayed byte-0 HIGH nibble is silently wrong (the operand-A-low-nibble=9
+    cluster: add ids 1/2/7/14, sub 13/16, ...). The genuine PSH-output row
+    carries ``PSH_AT_SP=1.0`` (and a NON-zero ``CLEAN_EMBED_HI`` high nibble
+    when its value is clean); the spurious rows carry neither flag.
+
+    When enabled, ``_operand_gather_head0_cam_spec`` adds a ``CamRowBias`` (a
+    SECOND structured K signature on a fresh slot, gated on OP_ADD/OP_SUB):
+    boost rows carrying ``PSH_AT_SP`` PLUS a non-default ``CLEAN_EMBED_HI``
+    guard. The guard is what keeps a CORRUPTED preferred row (the IMM
+    hi-nibble-D/E/F decode bug zeroes the PSH row's high nibble → 0x04) from
+    being anchored: such a row earns only the ``PSH_AT_SP`` term while the
+    recency row earns the guard term, so recency still wins for it (the
+    byte-1/carry control 980+781 stays byte-identical). A clean preferred row
+    earns BOTH terms and out-scores recency, fixing the byte-0 high-nibble
+    cases. The bias touches NO V/O — only WHICH row the existing relay reads
+    moves, so the byte-1/carry pathway (a SEPARATE L14 borrow-cascade
+    mechanism) is unchanged. Flag-OFF emits ZERO extra Q/K writes
+    (byte-identical to the golden ``state_dict`` hash).
+    """
+    return os.environ.get("C4_OPERAND_GATHER_PSH_ROWSELECT", "0") != "0"
+
+
 def addsub_declarative_enabled() -> bool:
     """Return True iff efficient-mode L8 ADD/SUB uses the DECLARATIVE wrap
     (DEFAULT OFF — opt-in via ``C4_ADDSUB_DECLARATIVE=1``).

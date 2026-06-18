@@ -43,6 +43,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     CamKeyMatch,
     CamLookupBundle,
     CamLookupSpec,
+    CamRowBias,
     CamValueBand,
     ConsumerLookaheadGateBundle,
     ConsumerLookaheadGateSpec,
@@ -1179,6 +1180,106 @@ def test_cam_lookup_zero_width_band_rejected():
     with pytest.raises(ValueError, match="width must be"):
         _operand_gather_cam_spec(value_bands=(
             CamValueBand("CLEAN_EMBED_LO", "ALU_LO", 0, 1, 6.0),))
+
+
+# --- CamRowBias: the CONTENT/POSITION row-preference second key signature ---
+
+
+def _row_bias_dim_positions() -> dict:
+    dp = dict(_cam_dim_positions())
+    dp.update({"PSH_AT_SP": 50, "OP_ADD": 51, "OP_SUB": 52})
+    return dp
+
+
+def _bias_spec(**bias_overrides) -> CamLookupSpec:
+    bias_base = dict(
+        slot=34, query_dim="MARK_AX", query_weight=30.0,
+        query_blockers=(("OP_ADD", 15.0), ("OP_SUB", 15.0)),
+        pref_dim="PSH_AT_SP", pref_weight=15.0,
+        guard_band="CLEAN_EMBED_HI", guard_lo=1, guard_width=16,
+        guard_weight=15.0,
+    )
+    bias_base.update(bias_overrides)
+    return _operand_gather_cam_spec(row_bias=CamRowBias(**bias_base))
+
+
+def test_cam_row_bias_none_is_byte_identical():
+    """row_bias=None (the default) emits ZERO extra Q/K writes — the flag-off
+    byte-identity contract for C4_OPERAND_GATHER_PSH_ROWSELECT."""
+    base = cam_lookup(_operand_gather_cam_spec())
+    dp = _row_bias_dim_positions()
+    g = base.head_spec_builder(dp, head_idx=0)
+    # The settled head uses only the match slot (0) and the confirm slot (33).
+    assert sorted({w.slot for w in g.q}) == [0, 33]
+    assert sorted({w.slot for w in g.k}) == [0, 33]
+    assert "PSH_AT_SP" not in base.head_reads
+
+
+def test_cam_row_bias_adds_one_extra_slot():
+    """A CamRowBias adds Q/K writes on its OWN slot only (no V/O), so the value
+    relay — and therefore the byte-1/carry pathway it does NOT touch — is
+    unchanged; only the row selection moves."""
+    base = cam_lookup(_operand_gather_cam_spec())
+    biased = cam_lookup(_bias_spec())
+    dp = _row_bias_dim_positions()
+    gb = base.head_spec_builder(dp, head_idx=0)
+    gx = biased.head_spec_builder(dp, head_idx=0)
+    # V/O are IDENTICAL (the relay is untouched).
+    assert gx.v == gb.v
+    assert gx.o == gb.o
+    # The bias adds exactly slot 34 on Q and K.
+    assert sorted({w.slot for w in gx.q}) == [0, 33, 34]
+    assert sorted({w.slot for w in gx.k}) == [0, 33, 34]
+    # K slot 34 carries the pref flag + the guard band (cells 1..15, skipping
+    # the cell-0 default), so a row whose guard value is the default does NOT
+    # earn the guard counter-boost.
+    k34 = {w.dim: w.weight for w in gx.k if w.slot == 34}
+    assert dp["PSH_AT_SP"] in k34
+    assert (dp["CLEAN_EMBED_HI"] + 0) not in k34   # cell 0 skipped
+    assert (dp["CLEAN_EMBED_HI"] + 1) in k34
+    assert (dp["CLEAN_EMBED_HI"] + 15) in k34
+
+
+def test_cam_row_bias_declares_reads():
+    biased = cam_lookup(_bias_spec())
+    assert "PSH_AT_SP" in biased.head_reads
+    assert "CLEAN_EMBED_HI" in biased.head_reads
+    assert "OP_ADD" in biased.head_reads and "OP_SUB" in biased.head_reads
+
+
+def test_cam_row_bias_guard_optional():
+    """guard_band=None (or guard_weight=0) emits only the pref K term."""
+    biased = cam_lookup(_bias_spec(guard_band=None, guard_weight=0.0))
+    dp = _row_bias_dim_positions()
+    gx = biased.head_spec_builder(dp, head_idx=0)
+    k34 = [w for w in gx.k if w.slot == 34]
+    assert len(k34) == 1 and k34[0].dim == dp["PSH_AT_SP"]
+
+
+def test_cam_row_bias_key_gate_restricts_to_target_rows():
+    """key_gate adds +gate*key_gate_dim - gate*const so the bias K is ~0 on the
+    target rows (which carry key_gate_dim) and a large NEGATIVE on every other
+    row — so the pref/guard re-rank ONLY the target rows."""
+    biased = cam_lookup(_bias_spec(
+        key_gate_dim="STACK0_BYTE0", key_gate_weight=75.0, const_dim="CONST"))
+    dp = _row_bias_dim_positions()
+    gx = biased.head_spec_builder(dp, head_idx=0)
+    k34 = {w.dim: w.weight for w in gx.k if w.slot == 34}
+    assert k34[dp["STACK0_BYTE0"]] == 75.0
+    assert k34[dp["CONST"]] == -75.0
+    # The gate dims are declared as reads.
+    assert "STACK0_BYTE0" in biased.head_reads
+    assert "CONST" in biased.head_reads
+
+
+def test_cam_row_bias_key_gate_optional():
+    """key_gate_dim=None (or weight 0) emits no row-restriction K terms."""
+    biased = cam_lookup(_bias_spec())  # default: no key_gate
+    dp = _row_bias_dim_positions()
+    gx = biased.head_spec_builder(dp, head_idx=0)
+    k34 = {w.dim: w.weight for w in gx.k if w.slot == 34}
+    # Only pref + guard, no CONST subtraction.
+    assert dp["CONST"] not in k34
 
 
 def test_cam_lookup_head_write_for_write_matches_handbuilt():
