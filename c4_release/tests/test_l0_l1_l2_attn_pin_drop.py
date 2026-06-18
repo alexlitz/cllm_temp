@@ -35,8 +35,8 @@ from neural_vm.unified_compiler.ops.l0_ops import (  # noqa: E402
     make_layer0_threshold_attn_op,
 )
 from neural_vm.unified_compiler.ops.l1_ops import (  # noqa: E402
-    _L1_HEAD_LAYOUT,
-    make_layer1_threshold_attn_op,
+    _THRESHOLD_HEAD_LAYOUT,
+    make_threshold_attn_op,
 )
 from neural_vm.unified_compiler.ops.l2_ops import (  # noqa: E402
     _L2_HEAD_LAYOUT,
@@ -247,7 +247,7 @@ def test_l1_threshold_attn_byte_identical_after_pin_drop():
     """L1 ``layer1_threshold_attn`` bakes byte-identically to the
     pinned reference after the Phase 7.B.2-attn pin drop."""
 
-    live = _bake_via_op(make_layer1_threshold_attn_op, layer_idx=1)
+    live = _bake_via_op(make_threshold_attn_op, layer_idx=1)
     ref = _new_attention(layer_idx=1)
     _bake_l1_reference(ref)
     _assert_attn_equal(live, ref, "L1 layer1_threshold_attn")
@@ -281,7 +281,7 @@ def test_l0_head_layout_has_no_pins():
 def test_l1_head_layout_has_no_pins():
     """Same constraint for L1 attention heads."""
 
-    for entry in _L1_HEAD_LAYOUT:
+    for entry in _THRESHOLD_HEAD_LAYOUT:
         assert len(entry) == 1, (
             f"L1 layout entry {entry!r} still carries a pinned head_idx; "
             f"expected a bare (op_name,) tuple."

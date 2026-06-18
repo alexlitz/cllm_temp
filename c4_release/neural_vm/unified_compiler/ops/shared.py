@@ -236,7 +236,7 @@ def no_stack0_emit_enabled() -> bool:
     the d=6-from-BP slot that used to be STACK0 byte 0 is now MEM addr byte 0.
     The ``STACK0_BYTE0`` positional flag (L1 FFN unit 0, fired at d=6 from BP)
     must therefore be neutralized so it does not misfire onto the MEM addr
-    byte — see ``l1_ops._layer1_ffn_rules``.
+    byte — see ``l1_ops._threshold_ffn_rules``.
 
     This flag does NOT itself drop the emission (that machinery — the L0
     marker-transition chain, ``Token.STEP_TOKENS``, the DraftVM oracle, the

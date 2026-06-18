@@ -21,7 +21,7 @@ import torch
 
 from c4_release.neural_vm.vm_step import AutoregressiveAttention, _SetDim
 from c4_release.neural_vm.unified_compiler.ops.l1_ops import (
-    make_layer1_threshold_attn_op,
+    make_threshold_attn_op,
 )
 from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
@@ -49,7 +49,7 @@ def _build_attn_at_l1_layout():
         for name in dir(_SetDim)
         if not name.startswith("_") and isinstance(getattr(_SetDim, name), int)
     }
-    op = make_layer1_threshold_attn_op()
+    op = make_threshold_attn_op()
     with torch.no_grad():
         attn.W_q.zero_()
         attn.W_k.zero_()

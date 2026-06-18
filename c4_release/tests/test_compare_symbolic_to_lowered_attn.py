@@ -144,7 +144,7 @@ def test_compare_symbolic_to_lowered_attn_accepts_attention_head_ir_wrapper():
 def _l1_threshold_ir():
     from c4_release.neural_vm.vm_step import _SetDim
     from c4_release.neural_vm.unified_compiler.ops.l1_ops import (
-        _layer1_threshold_ir,
+        _threshold_attn_ir,
     )
 
     dim_positions = {
@@ -152,7 +152,7 @@ def _l1_threshold_ir():
         for name in dir(_SetDim)
         if not name.startswith("_") and isinstance(getattr(_SetDim, name), int)
     }
-    return _layer1_threshold_ir(dim_positions, HD=64)
+    return _threshold_attn_ir(dim_positions, HD=64)
 
 
 def test_compare_symbolic_to_lowered_attn_l1_threshold_attn_all_heads_pass():

@@ -81,7 +81,7 @@ def all_core_ops(
         # literals. Mirrors the L3/L4/L5/L6/L11 dep-anchor pattern.
         make_layer0_threshold_attn_dep_anchor_op(),
         make_layer0_threshold_attn_op(),
-        make_layer1_threshold_attn_op(),
+        make_threshold_attn_op(),
         make_layer2_threshold_attn_op(),
         # Conversational-I/O L2 lookback head: phase=2.1 so it bakes after
         # the L2 threshold attention (phase=2). Body is a no-op unless
@@ -91,7 +91,7 @@ def all_core_ops(
         ),
         make_layer3_carry_forward_attn_op(),
         make_phase_a_ffn_op(),
-        make_layer1_ffn_op(),
+        make_threshold_ffn_op(),
         make_layer2_mem_byte_flags_op(),
         # Cancels the REG_PC token-embedding initial-PC bake at step-1+ PC
         # markers (MARK_PC AND HAS_SE). Runs at L2 (phase=2.5) so L3 FFN's

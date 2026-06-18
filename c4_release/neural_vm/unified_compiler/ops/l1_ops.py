@@ -13,7 +13,7 @@ from .shared import _as_setdim_proxy, no_stack0_emit_enabled
 # === L1 FFN unit layout (auto-fit offsets, Phase 7.B.1) =============
 #
 # The ``layer1_ffn`` op owns the entire L1 FFN. The weight writes happen
-# via ``_layer1_ffn_rules`` (a list of :class:`FFNRule` declarations)
+# via ``_threshold_ffn_rules`` (a list of :class:`FFNRule` declarations)
 # which is lowered by ``Primitives.lower_ffn_rules`` through
 # ``CompilerIR.lower_ffn``. Each rule consumes one hidden unit and they
 # are appended monotonically starting at ``start_unit=0`` -- so the 5
@@ -30,10 +30,10 @@ from .shared import _as_setdim_proxy, no_stack0_emit_enabled
 # future L1 op family can claim a free range past unit 5 via
 # ``allocator.alloc(name, n)`` without a pin.
 #
-# The order below mirrors the rule order in ``_layer1_ffn_rules``
+# The order below mirrors the rule order in ``_threshold_ffn_rules``
 # (STACK0_BYTE0 followed by the four BYTE_INDEX_i thresholds).
 # Changing the rule list requires updating this table in lock-step.
-_L1_FFN_UNIT_LAYOUT = (
+_THRESHOLD_FFN_UNIT_LAYOUT = (
     # (sub-stage name, n_units) -- ``pin=None`` everywhere; offsets are
     # picked by the FFNUnitAllocator in ``dynamic_first_fit`` mode.
     ("layer1_ffn.stack0_byte0",   1),  # STACK0_BYTE0 from L1H4 + IS_BYTE
@@ -44,7 +44,7 @@ _L1_FFN_UNIT_LAYOUT = (
 )
 
 
-def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
+def _allocate_threshold_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L1 FFN sub-stages.
 
     Phase 7.B.1 auto-fit: the allocator is built in
@@ -52,7 +52,7 @@ def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
     is allocated in declaration order; first-fit picks the lowest free
     unit each call, so the 5 single-unit sub-stages land at indices
     0..4 -- byte-identical to the legacy pinned offsets. The
-    ``_layer1_ffn_rules`` lowering still drives weight writes at
+    ``_threshold_ffn_rules`` lowering still drives weight writes at
     ``start_unit=0`` via ``Primitives.lower_ffn_rules`` so the
     allocator's pick is bookkeeping only.
 
@@ -60,12 +60,12 @@ def _allocate_layer1_ffn_units() -> FFNUnitAllocator:
     future L1 op claims a free range past unit 5).
     """
     allocator = FFNUnitAllocator(strategy="dynamic_first_fit")
-    for name, n_units in _L1_FFN_UNIT_LAYOUT:
+    for name, n_units in _THRESHOLD_FFN_UNIT_LAYOUT:
         allocator.alloc(name, n_units)
     return allocator
 
 
-def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+def _threshold_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for the L1 FFN (STACK0_BYTE0 + BYTE_INDEX_0..3).
 
     Mirrors the legacy ``_set_layer1_ffn`` helper one-for-one:
@@ -164,20 +164,20 @@ def _layer1_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer1_ffn_ir(S: float = 100.0) -> CompilerIR:
+def _threshold_ffn_ir(S: float = 100.0) -> CompilerIR:
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer1_ffn_rules(S))
+    ir.layer(0).ffn.rules.extend(_threshold_ffn_rules(S))
     return ir
 
 
 def _bake_layer1_ffn(ffn, S, BD) -> int:
     """Bake L1 FFN via :class:`FFNRule` lowering (byte-identical helper).
 
-    Used both by the migrated :func:`make_layer1_ffn_op` bake path and as
+    Used both by the migrated :func:`make_threshold_ffn_op` bake path and as
     a standalone entry-point for callers wanting to drive the L1 weight
     writes without constructing a full ``Operation``.
     """
-    rules = _layer1_ffn_rules(S)
+    rules = _threshold_ffn_rules(S)
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
         Primitives.ffn_rule_dim_names(rules),
@@ -185,7 +185,7 @@ def _bake_layer1_ffn(ffn, S, BD) -> int:
     return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
 
 
-def make_layer1_ffn_op() -> Operation:
+def make_threshold_ffn_op() -> Operation:
     """L1 FFN: STACK0_BYTE0 flag + BYTE_INDEX flags from threshold differences.
 
     Originally: `_set_layer1_ffn` at vm_step.py:2922. Migrated to
@@ -204,15 +204,15 @@ def make_layer1_ffn_op() -> Operation:
         # so downstream tools (e.g. a future L1 op family claiming a free
         # gap) can inspect or extend the layout. Mirrors the L9 convention
         # from ca775eb.
-        allocator = _allocate_layer1_ffn_units()
+        allocator = _allocate_threshold_ffn_units()
         ffn._l1_unit_allocator = allocator
 
-        # Phase 8.C inline cut: lower the ``_layer1_ffn_rules`` IR
+        # Phase 8.C inline cut: lower the ``_threshold_ffn_rules`` IR
         # directly here so census v2 classifies this op as
         # ``declarative`` rather than ``declarative_via_helper`` (which
         # routed through the ``_bake_layer1_ffn`` trampoline).
         # Byte-identical to the prior ``_bake_layer1_ffn(ffn, S, proxy)``.
-        rules = _layer1_ffn_rules(S)
+        rules = _threshold_ffn_rules(S)
         rule_dim_positions = Primitives.dim_positions_from_bd(
             proxy,
             Primitives.ffn_rule_dim_names(rules),
@@ -221,7 +221,7 @@ def make_layer1_ffn_op() -> Operation:
         # Byte-identity guard: the FFNRule lowering MUST write exactly the
         # number of hidden units the allocator table declares. Mirrors the
         # L0 phase_a_ffn assertion in ``_bake_phase_a_ffn``.
-        expected_total = sum(n for _, n in _L1_FFN_UNIT_LAYOUT)
+        expected_total = sum(n for _, n in _THRESHOLD_FFN_UNIT_LAYOUT)
         assert n0 == expected_total, (
             f"L1 layer1_ffn unit cursor drift: rules wrote {n0} units, "
             f"allocator declared {expected_total}"
@@ -264,7 +264,7 @@ def make_layer1_ffn_op() -> Operation:
         # against layer0_threshold_attn), so the explicit layer pin is
         # redundant.
         declarative_bake_fn=bake,
-        compiler_ir=_layer1_ffn_ir(),
+        compiler_ir=_threshold_ffn_ir(),
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
@@ -285,7 +285,7 @@ def make_layer1_ffn_op() -> Operation:
     )
 
 
-_L1_HEAD_LAYOUT = (
+_THRESHOLD_HEAD_LAYOUT = (
     # (op_name,)  -- no pinned head_idx; allocator first-fits in
     # declaration order, landing at 0..6 byte-identically (Phase 7.B.2 attn).
     #
@@ -311,7 +311,7 @@ _L1_HEAD_LAYOUT = (
 )
 
 
-def _allocate_layer1_attn_heads() -> AttentionHeadAllocator:
+def _allocate_threshold_attn_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` for the L1 heads.
 
     Phase 7.B.2 attn auto-fit: the allocator is built in
@@ -326,12 +326,12 @@ def _allocate_layer1_attn_heads() -> AttentionHeadAllocator:
     Returns the allocator so callers can inspect or extend it.
     """
     allocator = AttentionHeadAllocator(strategy="dynamic_first_fit")
-    for (op_name,) in _L1_HEAD_LAYOUT:
+    for (op_name,) in _THRESHOLD_HEAD_LAYOUT:
         allocator.alloc(op_name, layer_idx=1)
     return allocator
 
 
-def make_layer1_threshold_attn_op() -> Operation:
+def make_threshold_attn_op() -> Operation:
     """L1 attention: 3 fine threshold heads + STEP_END + L1H4 + IN_STEP_FRESH.
 
     Head 5 (B7-1) emits ``IN_STEP_FRESH``: a positive in-step lifecycle bit
@@ -353,8 +353,8 @@ def make_layer1_threshold_attn_op() -> Operation:
         # byte-identically. Stashed on the attention module so downstream
         # tools (e.g. a future L1 op claiming a free gap past head 6) can
         # inspect or extend the layout. Mirrors the ``_l1_unit_allocator``
-        # FFN convention from ``make_layer1_ffn_op``.
-        head_allocator = _allocate_layer1_attn_heads()
+        # FFN convention from ``make_threshold_ffn_op``.
+        head_allocator = _allocate_threshold_attn_heads()
         attn._l1_head_allocator = head_allocator
         h_l1h0 = head_allocator.heads()[0].head_idx
         h_l1h1 = head_allocator.heads()[1].head_idx
@@ -547,7 +547,7 @@ def make_layer1_threshold_attn_op() -> Operation:
         # = layer0_threshold_attn`` (below) is the structural pin: the
         # dep edge forces this attn to land at L1 (one after L0).
         declarative_bake_fn=bake,
-        compiler_ir_factory=_layer1_threshold_ir,
+        compiler_ir_factory=_threshold_attn_ir,
         migrated=True,
         claims=_claims,
         # B12 backfill (wave 1b): pin strictly after L0's threshold-attn
@@ -667,10 +667,10 @@ def _step_end_reg_present_head_spec(
     )
 
 
-def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
+def _threshold_attn_ir(dim_positions, HD) -> CompilerIR:
     """``compiler_ir_factory`` for ``layer1_threshold_attn``.
 
-    Resolves head indices via :func:`_allocate_layer1_attn_heads` so the
+    Resolves head indices via :func:`_allocate_threshold_attn_heads` so the
     IR and the bake share a single source of truth. After the Phase
     7.B.2-attn pin drop the allocator runs in ``dynamic_first_fit``
     mode; with no other claimants on the L1 attention pool the 7
@@ -682,7 +682,7 @@ def _layer1_threshold_ir(dim_positions, HD) -> CompilerIR:
 
     proxy = _as_setdim_proxy(dim_positions)
     ALIBI_S = 10.0
-    allocator = _allocate_layer1_attn_heads()
+    allocator = _allocate_threshold_attn_heads()
     # Resolve each L1 head index by op-name so the spec walk follows
     # the allocator across any future reshuffle.
     by_name = {rec.op_name: rec.head_idx for rec in allocator.heads()}

@@ -680,7 +680,7 @@ def make_layer11_mul_partial_op(alu_mode: str = "lookup") -> Operation:
 # back from the current MARK_SE Q) wins by ~35 nats over the previous
 # step's MARK_AX K (64 rows back), so the relay reads the current
 # step's operand state, not a stale value. Mirrors the L1 IN_STEP_FRESH
-# slope convention (see ``make_layer1_threshold_attn_op``).
+# slope convention (see ``make_threshold_attn_op``).
 _STEP_END_OPERAND_RELAY_OPCODES = (
     "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
     "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",

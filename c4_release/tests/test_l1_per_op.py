@@ -57,8 +57,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.base_layers import PureAttention, PureFFN  # noqa: E402
 from neural_vm.unified_compiler.ops.l1_ops import (  # noqa: E402
-    make_layer1_ffn_op,
-    make_layer1_threshold_attn_op,
+    make_threshold_ffn_op,
+    make_threshold_attn_op,
 )
 from neural_vm.vm_step import _SetDim  # noqa: E402
 
@@ -144,7 +144,7 @@ def _build_layer1_ffn(d_model: int = 512, hidden_dim: int = 16) -> PureFFN:
             if not name.startswith("_")
             and isinstance(getattr(_SetDim, name), int)
         }
-        make_layer1_ffn_op().bake_fn(ffn, dim_positions, 100.0)
+        make_threshold_ffn_op().bake_fn(ffn, dim_positions, 100.0)
     return ffn
 
 
@@ -274,7 +274,7 @@ def _build_layer1_threshold_attn(
             if not name.startswith("_")
             and isinstance(getattr(_SetDim, name), int)
         }
-        make_layer1_threshold_attn_op().bake_fn(attn, dim_positions, 100.0)
+        make_threshold_attn_op().bake_fn(attn, dim_positions, 100.0)
     return attn
 
 
