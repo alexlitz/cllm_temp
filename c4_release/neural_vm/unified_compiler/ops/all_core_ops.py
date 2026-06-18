@@ -118,16 +118,17 @@ def all_core_ops(
         make_layer4_pc_relay_op(),
         make_layer4_ffn_op(),
         make_layer4_ffn_dep_anchor_op(),
-        # STACK0 via mem attention: Q-side staging for the mem[SP] operand-A
-        # read. Flag-gated by C4_OPERAND_FROM_MEMSP (DEFAULT OFF =
-        # byte-identical). When on, this stages the live SP value into the
-        # ADDR_KEY band at the AX marker so the L8 mem-to-ALU head (below)
-        # can match mem[SP] by address. This is the STACK0-emission-drop
-        # prerequisite (docs/STACK0_VIA_MEM_ATTENTION_PLAN.md Phase 1):
-        # flip on TOGETHER with C4_NO_STACK0_EMIT so the binary-op operand
-        # survives without the emitted STACK0 token. With the flag off, L7's
-        # declarative STACK0 gather owns binary-pop operand 2 unchanged.
-        make_layer4_sp_to_addr_key_op(enable=operand_from_memsp_enabled()),
+        # STACK0 via mem attention: Q-side SP->ADDR_KEY staging.
+        #
+        # REBUILD (Inc-1, 2026-06-18): DISABLED. GPU diagnosis showed this op
+        # is the dominant `C4_OPERAND_FROM_MEMSP` blocker: staging SP into the
+        # ADDR_KEY band at the AX marker pollutes that row in a way the
+        # downstream L19 FFN reacts to by CRUSHING OUTPUT to 0 on EVERY step
+        # (PSH included) -> step-1 AX=0 -> 0/4 on the gate. The rebuilt L8
+        # head-5 mem-to-ALU CAM (below) no longer matches on address; it picks
+        # the most-recent pushed value via ALiBi recency on the MEM value-byte
+        # row, so it needs no ADDR_KEY staging. enable=False (no L19 pollution).
+        make_layer4_sp_to_addr_key_op(enable=False),
         make_fetch_op(),
         make_fetch_dep_anchor_op(),
         # Consumer-opcode LOOKAHEAD (#221 framing-drift fix; flag-gated

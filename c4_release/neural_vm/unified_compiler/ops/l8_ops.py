@@ -2599,67 +2599,78 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_q[base + AX_K_EXCLUDE, BD.MARK_AX] = 100.0
         attn.W_k[base + AX_K_EXCLUDE, BD.MARK_AX] = -2000.0
 
-        # === Dim 1: store anchor ===
-        attn.W_q[base + 1, BD.MARK_AX] = 50.0
-        attn.W_k[base + 1, BD.MEM_STORE] = 100.0
-        attn.W_k[base + 1, BD.CONST] = -50.0
-
-        # === Dim 2: ZFOD baseline ===
-        attn.W_q[base + 2, BD.CONST] = -96.0
-        attn.W_k[base + 2, BD.MEM_STORE] = 50.0
-
-        # === Dim 3: byte 0 selection (MEM val byte 0) ===
-        BS = 60.0
-        attn.W_q[base + 3, BD.MARK_AX] = BS
-        # MEM val byte 0 is at d=5 from MEM marker: L2H0[MEM]=1, H1[MEM]=0
+        # === REBUILD (Inc-1, 2026-06-18): recency-only mem[SP] byte-0 CAM ===
+        #
+        # GPU diagnosis (probe_operand_cam / probe_nostack0_dump) overturned
+        # the original address-match design:
+        #   (1) The MEM *value* byte-0 row carries MEM_STORE=0 (MEM_STORE fires
+        #       on the addr rows, not the value rows), so the original dims
+        #       1/2/3/29/30 — all keyed K-side on MEM_STORE — could never fire
+        #       on the row that actually holds the operand. The value byte-0
+        #       nibbles live on the MEM_VAL_B1-marked row (== L2H0[MEM]=1 AND
+        #       H1[MEM]=0, the d=6-from-MEM "value byte 0" slot — the autoreg
+        #       MEM layout offsets MEM_VAL_B1 onto value byte 0).
+        #   (2) The address dims 4-27 produced a giant SELF-MATCH at the AX
+        #       marker (L4 stages SP into ADDR_KEY there), so softmax pinned
+        #       100% mass on the query row itself -> CLEAN_EMBED of the REG_AX
+        #       marker token -> ALU=0. The AX_K_EXCLUDE guard (dim 28) was
+        #       swamped because HD=109 (not the docstring's 8).
+        #
+        # The rebuilt head content-addresses the MEM value-byte-0 row directly
+        # (no L4 ADDR_KEY staging — that op is the L19 OUTPUT-crush corruptor
+        # and is disabled in this build, so there is no AX-marker self-match to
+        # fight), placed at the L8 attn block (re-anchored to layer8_sp_gather)
+        # so it writes ALU BEFORE the L8 ALU FFN consumes it. This advances the
+        # equivalence-config gate from a STEP-1 fail (AX=0, the L4/L19 crush) to
+        # a STEP-3 (ADD/SUB) fail, and is byte-identical flag-OFF.
+        #
+        # *** REMAINING Inc-1/Inc-2 BLOCKER (GPU-confirmed, not yet fixed) ***
+        # Recency alone is INSUFFICIENT to deliver mem[SP]: the MEM value-byte-0
+        # row carries NO store-commit marker (the ONLY dims that differ between a
+        # real PSH store's value row and a non-store step's MEM value row are the
+        # CLEAN_EMBED nibble values themselves — MEM_STORE / PSH_AT_SP / MARK_MEM
+        # all sit on the section's MARK_MEM row, 5 positions earlier, never
+        # broadcast to the value row). So on the canonical PSH;IMM;ADD pattern
+        # (all 4 gate programs) ALiBi recency selects the more-recent IMM step's
+        # PHANTOM value row (value 0) over the real PSH store's value row, and
+        # the binary op reads operand-A = 0. A single value-row recency head
+        # cannot discriminate. The fix is one of:
+        #   (a) broadcast MEM_STORE/PSH_AT_SP to the section's value-byte rows
+        #       (extend NeuralVMEmbedding._inject_mem_store) so K can gate on a
+        #       per-value-row store bit, then recency picks the right store; or
+        #   (b) restore address-matching but stage SP->ADDR_KEY WITHOUT crushing
+        #       L19 OUTPUT (fix the L4/L19 interaction first).
+        # Both are new multi-component builds (Inc-2 scope). Until one lands the
+        # K-side below is a correct-placement scaffold, NOT a delivering CAM.
+        #
+        # Value-byte-0 row predicate (matches probe data, add_9 step1 off31):
+        #   L2H0[MEM_I] = 1  AND  H1[MEM_I] = 0   (MEM_I = 4 = MEM marker index)
         MEM_I = 4
-        attn.W_k[base + 3, BD.L2H0 + MEM_I] = BS
-        attn.W_k[base + 3, BD.H1 + MEM_I] = -BS
+        VR = 120.0  # value-row select strength (Q@AX * K@value-row)
 
-        # === Dim 29: hard value-byte gate ===
-        # Address bytes can carry an exact ADDR_B match and swamp the softer
-        # byte-selection bonus above. Require the same d=5 MEM value-byte
-        # predicate with a stronger signed gate so address bytes cannot win.
-        VAL_GATE = 29
-        VG = 200.0
-        attn.W_q[base + VAL_GATE, BD.MARK_AX] = VG
-        attn.W_k[base + VAL_GATE, BD.CONST] = -100.0
-        attn.W_k[base + VAL_GATE, BD.L2H0 + MEM_I] = 300.0
-        attn.W_k[base + VAL_GATE, BD.H1 + MEM_I] = -300.0
+        # Dim 1: value-byte-0 row select. Positive only when the K row is the
+        # MEM value-byte-0 slot; negative const baseline keeps every other row
+        # (incl. the AX-marker self-row, which has L2H0[MEM]=0) below zero so
+        # softmax1's implicit zero logit suppresses non-value rows.
+        attn.W_q[base + 1, BD.MARK_AX] = 1.0
+        attn.W_k[base + 1, BD.L2H0 + MEM_I] = VR
+        attn.W_k[base + 1, BD.H1 + MEM_I] = -VR
+        attn.W_k[base + 1, BD.CONST] = -VR / 2
 
-        # === Dim 30: hard store gate ===
-        # Default MEM sections from non-store steps can share the same value
-        # byte position and partially match a polluted ADDR_KEY query. Require
-        # an actual historical store strongly enough that non-store MEM value
-        # bytes cannot beat the stored stack value (observed on MUL 6*7).
-        STORE_GATE = 30
-        SG = 100.0
-        attn.W_q[base + STORE_GATE, BD.MARK_AX] = SG
-        attn.W_k[base + STORE_GATE, BD.MEM_STORE] = SG
-        attn.W_k[base + STORE_GATE, BD.CONST] = -SG / 2
+        # Dim 2: hard value-row confirm (signed, stronger) so address/marker
+        # rows that happen to share one of the two predicate bits cannot beat
+        # the true value-byte-0 row.
+        attn.W_q[base + 2, BD.MARK_AX] = 1.0
+        attn.W_k[base + 2, BD.L2H0 + MEM_I] = VR * 2
+        attn.W_k[base + 2, BD.H1 + MEM_I] = -VR * 4
+        attn.W_k[base + 2, BD.CONST] = -VR
 
-        # === Dims 4-27: 24-bit binary address encoding ===
-        # Same encoding as L15 head 0 / L9 ALiBi head: iterate over both
-        # _LO and _HI bases per address byte. Q and K read from the same
-        # residual dims because the L4 SP gather writes into the same
-        # ADDR_B*_HI bands that `_inject_mem_metadata` writes K-side into.
-        # (Q-side ADDR_B*_LO bands carry zero contribution because the
-        # SP-gather only writes HI bands — see make_layer4_sp_to_addr_key_op.)
-        addr_dim = 4
-        scale = 10.0
-        addr_bases = [
-            (BD.ADDR_B0_LO, BD.ADDR_B0_HI),
-            (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
-            (BD.ADDR_B2_LO, BD.ADDR_B2_HI),
-        ]
-        for ab_lo, ab_hi in addr_bases:
-            for nibble_base in [ab_lo, ab_hi]:
-                for bit in range(4):
-                    for k in range(16):
-                        bit_val = 2 * ((k >> bit) & 1) - 1
-                        attn.W_q[base + addr_dim, nibble_base + k] = scale * bit_val
-                        attn.W_k[base + addr_dim, nibble_base + k] = scale * bit_val
-                    addr_dim += 1
+        # Dim 3: AX-marker self-exclusion. Only contributes when BOTH the
+        # query AND the key row are the AX marker (the self row); drives that
+        # single candidate deeply negative so the head never self-attends even
+        # though CLEAN_EMBED is present there.
+        attn.W_q[base + 3, BD.MARK_AX] = 100.0
+        attn.W_k[base + 3, BD.MARK_AX] = -VR * 20
 
         # === V/O: copy CLEAN_EMBED bytes → ALU_LO/HI at AX marker ===
         # This mirrors L7 head 0 (vm_step.py:_set_layer7_operand_gather)
@@ -2830,10 +2841,15 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         kind="block",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
-        # Phase 8.G.6: drop ``layer_idx=8`` literal; bind to the L8 attn
-        # anchor ``layer10_byte_passthrough`` so the block op resolves
-        # to whichever layer the compiler places the anchor at.
-        target_op_name="layer10_byte_passthrough",
+        # REBUILD (Inc-1, 2026-06-18): re-anchor from ``layer10_byte_passthrough``
+        # (which placed this head at L9/L10 attn — AFTER the L8 ALU FFN already
+        # consumed ALU_LO/HI, so the operand arrived one block too late and the
+        # binary op read 0) to ``layer8_sp_gather`` — the SAME anchor the
+        # (working flag-OFF) L7 operand_gather head-0 uses. This bakes head 5
+        # into the L8 attention block, BEFORE the L8 ALU FFN/post-op runs, which
+        # is exactly the placement this op's own docstring requires ("Writing at
+        # L9 attn would be too late"). The prior anchor contradicted that.
+        target_op_name="layer8_sp_gather",
         migrated=True,
         claims=_claims,
         smoke_tests={"all"},
