@@ -9,7 +9,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, operand_from_memsp_enabled
 
 
 def _ent_sp_byte1_ismark_blocker_on() -> bool:
@@ -2084,6 +2084,26 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # are zero. L14 value heads can see tiny MEM_STORE residue and leak the
     # current AX byte into those positions, so zero MEM value bytes again after
     # L14 unless a real store has asserted MEM_STORE.
+    #
+    # STACK0 campaign Part A (2026-06-18): under C4_NO_STACK0_EMIT the operand-A
+    # read is sourced from mem[SP] (the EMITTED MEM value byte), so these zero
+    # guards must NOT crush the REAL PSH store's value byte. The discriminator
+    # MEM_STORE sits ONLY on the section's MARK_MEM marker row, never on the
+    # value-byte rows where this rule fires (the value row carries MEM_STORE=0
+    # even for a real store), so the -100*MEM_STORE blocker is INERT on the
+    # firing row and the rule zeros the real store's value -> operand-A delivered
+    # as 0 (GPU full_trace add/sub ids 9,67,84,88 = 0/4 with the byte emitted as
+    # 0x00). ``make_layer7_mem_store_relay_op`` (Inc-1 / Part A) relays the store
+    # bit FORWARD from the marker row to the value-byte rows into the fresh
+    # per-value-row band MEM_STORE_AT_VAL; gate these zero guards on it (a strong
+    # NOT-blocker) so a relayed real store vetoes the zero and the value byte
+    # survives to the emission. Flag-gated on C4_OPERAND_FROM_MEMSP (the band
+    # only exists then) -> byte-identical flag-OFF.
+    nonstore_mem_value_store_at_val_blocker = (
+        (("MEM_STORE_AT_VAL", -100.0),)
+        if operand_from_memsp_enabled()
+        else ()
+    )
     for idx, mem_val_dim in enumerate(
         ("MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3")
     ):
@@ -2105,7 +2125,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 # the last 3 IMM_STAGING ↔ MEM_VAL_B{0,1,2} dim-alias
                 # violations (DIM_ALIAS_RESIDUAL_2026_06_10.md).
                 ("MARK_PC", -1e6),
-            ),
+            ) + nonstore_mem_value_store_at_val_blocker,
             threshold=2.5,
             writes=tuple(
                 (f"OUTPUT_LO+{k}", (100.0 / S) if k == 0 else (-100.0 / S))

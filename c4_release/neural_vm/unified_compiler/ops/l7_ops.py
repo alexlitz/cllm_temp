@@ -599,12 +599,19 @@ def make_layer7_mem_store_relay_op(enable: bool = False) -> Operation:
             attn.alibi_slopes[HEAD_IDX] = 0.5
 
         L = 50.0
-        # Q: fire ONLY at the MEM value-byte-0 row (MEM_VAL_B1=1). A strong
-        # negative const baseline keeps non-value rows from firing the head
-        # (their softmax over MARK_MEM keys would still copy a store bit, but
-        # the O target MEM_STORE_AT_VAL is only read by head-5 at value rows,
-        # so over-firing elsewhere is inert — restricting Q keeps it clean).
-        attn.W_q[base, BD.MEM_VAL_B1] = L
+        # Q: fire at EVERY MEM value-byte row (MEM_VAL_B0..B3 each mark one of
+        # the section's four value-byte positions). Originally this head fired
+        # only at the value-byte-0 row (MEM_VAL_B1) because head-5's byte-0 read
+        # was the only consumer. STACK0 campaign Part A added a SECOND consumer:
+        # the L16/L20 ``l16_nonstore_mem_value{0..3}_zero`` write-side guards
+        # crush the MEM value byte unless a store is asserted on the value row,
+        # and (like head-5) they fire on the value-byte PREDICTOR rows, which
+        # carry MEM_VAL_B0..B3 (NOT just B1). Relaying the store bit to all four
+        # value-byte rows lets those zero guards veto on the real store so the
+        # PSH'd value survives to the emitted MEM value byte. A strong negative
+        # CONST baseline keeps non-value rows from firing the head.
+        for vb in (BD.MEM_VAL_B0, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3):
+            attn.W_q[base, vb] = L
         attn.W_q[base, BD.CONST] = -L / 2
         # K: match the MARK_MEM marker row (where MEM_STORE lives). CONST
         # baseline keeps non-marker rows below the marker; ALiBi recency then
@@ -626,7 +633,11 @@ def make_layer7_mem_store_relay_op(enable: bool = False) -> Operation:
     # bake is a no-op when disabled, so declare the band-referencing reads/
     # writes only when enabled — otherwise the dep-graph validator rejects the
     # undeclared dim on a flag-OFF build.
-    _reads = {"MEM_VAL_B1", "MARK_MEM", "MEM_STORE", "CONST"} if enable else set()
+    _reads = (
+        {"MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+         "MARK_MEM", "MEM_STORE", "CONST"}
+        if enable else set()
+    )
     _writes = {"MEM_STORE_AT_VAL"} if enable else set()
 
     return Operation(
