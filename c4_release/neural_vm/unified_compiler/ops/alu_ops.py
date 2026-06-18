@@ -747,6 +747,7 @@ def _build_addsub_wrap_rules(S: float):
     emitted rules by lane so each lane lowers into its own FFN pass.
     """
     from ..wide_alu_dsl import wide_add_rules, wide_sub_rules
+    from ...dim_registry import dim_ref
 
     kw = dict(
         operand_a_base="ALU_LO",
@@ -776,8 +777,9 @@ def _build_addsub_wrap_rules(S: float):
         borrow_base="CARRY",  # nibble borrow CARRY+0
         opcode_gate="OP_SUB",
         # Byte-0 SUB borrow -> CARRY+2 (the downstream CarryPropagation SUB
-        # input), not CARRY+1 (= ADD's overflow dim).
-        final_borrow_dim="CARRY+2",
+        # input), not CARRY+1 (= ADD's overflow dim). CARRY+2 = byte-2 of the
+        # inter-byte ALU carry cascade, the ``(carry, alu)`` semantic family.
+        final_borrow_dim=dim_ref("carry", "alu", 2),
         **kw,
     )
     all_rules = tuple(add_rules) + tuple(sub_rules)
