@@ -824,8 +824,8 @@ def _null_terminator_detection_rules(S: float) -> tuple[FFNRule, ...]:
         multi_way_and_rule(
             name="null_terminator_detection",
             conditions=(
-                ("OUTPUT_BYTE_LO+0", 1.0),
-                ("OUTPUT_BYTE_HI+0", 1.0),
+                (dim_ref("output_lo", "byte", 0), 1.0),
+                (dim_ref("output_hi", "byte", 0), 1.0),
                 ("IO_IN_OUTPUT_MODE", 1.0),
             ),
             threshold=2.5,
