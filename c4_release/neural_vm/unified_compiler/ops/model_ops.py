@@ -2396,12 +2396,12 @@ def make_ax_byte1_full_width_fill_op() -> Operation:
 # fill MISSED (it fixed only the fresh IMM step; the faithful gate showed
 # edge_literal still failing at step=1). This unified source fixes both.
 #
-# Default-OFF (``C4_AX_BYTE1_HINIB`` opt-in): flag-off omits the band (smaller
-# d_model) + bakes zero columns / zero rules -> byte-identical to the pre-feature
-# build (the legacy emission already covers byte1<16; this only ADDS byte1>=16).
+# Default-ON (GPU-confirmed +11: edge_literal 5->15, smoke 51/0, zero arith
+# regression; commit 1f0403f9 verified). Set ``C4_AX_BYTE1_HINIB=0`` to omit the
+# band -> the pre-feature build (legacy emission covers byte1<16; this ADDS byte1>=16).
 def _ax_byte1_hinib_enabled() -> bool:
     import os as _os
-    return _os.environ.get("C4_AX_BYTE1_HINIB", "0") != "0"
+    return _os.environ.get("C4_AX_BYTE1_HINIB", "1") != "0"
 
 
 _AX_BYTE1_HINIB_BAND = "AX_BYTE1_HINIB"
