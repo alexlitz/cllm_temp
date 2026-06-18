@@ -19,9 +19,9 @@ _PC_I, _AX_I, _SP_I, _BP_I, _MEM_I = 0, 1, 2, 3, 4
 #
 # The ``layer3_ffn`` op owns the L3 FFN's marker-default + PC-increment
 # bands. The 134-unit prefix is produced by the declarative
-# :func:`_layer3_ffn_rules` rule list, lowered via
+# :func:`_register_default_ffn_rules` rule list, lowered via
 # :func:`Primitives.lower_ffn_rules`; the trailing 2 PC-byte1 writers
-# come from :func:`_add_layer3_pc_byte1_output_rules`.
+# come from :func:`_add_pc_byte1_output_rules`.
 #
 # Phase 7.B.2: every entry below is auto-placed by
 # :class:`FFNUnitAllocator` first-fit. Because the layout is fully
@@ -29,15 +29,15 @@ _PC_I, _AX_I, _SP_I, _BP_I, _MEM_I = 0, 1, 2, 3, 4
 # pinned offsets bit-for-bit -- so byte-identity with the legacy
 # ``vm_step._set_layer3_ffn`` helper survives the pin drop. The
 # ``legacy_start`` column is kept purely as documentation (matches the
-# unit-counter walk in :func:`_layer3_ffn_rules`).
+# unit-counter walk in :func:`_register_default_ffn_rules`).
 #
-# The offsets below mirror the rule order in :func:`_layer3_ffn_rules`
+# The offsets below mirror the rule order in :func:`_register_default_ffn_rules`
 # (PC default / SP default / BP default / marker bytes-1..3 defaults /
 # STACK0 carry / NEXT_STACK0 locality / PC increment + carry) followed
-# by :func:`_add_layer3_pc_byte1_output_rules` (2 PC byte1 = 1 writers).
+# by :func:`_add_pc_byte1_output_rules` (2 PC byte1 = 1 writers).
 # Changing any rule's unit count requires updating this table in
 # lock-step.
-_L3_FFN_UNIT_LAYOUT = (
+_REGISTER_DEFAULT_FFN_UNIT_LAYOUT = (
     # (sub-stage name, legacy_start (docs only), n_units)
     ("layer3_ffn.pc_first_step_default_lo",     0,   2),  # PC FIRST-STEP default LO (set + undo)
     ("layer3_ffn.pc_first_step_default_hi",     2,   2),  # PC FIRST-STEP default HI (set + undo)
@@ -60,15 +60,15 @@ _L3_FFN_UNIT_LAYOUT = (
     ("layer3_ffn.pc_increment_lo",             86,  16),  # PC INCREMENT lo nibble (k+8)%16
     ("layer3_ffn.pc_increment_hi",            102,  16),  # PC INCREMENT hi nibble copy
     ("layer3_ffn.pc_carry_correction",        118,  16),  # PC carry: lo>=8 -> hi+=1
-    ("layer3_ffn.pc_byte1_output_rules",      134,   2),  # _add_layer3_pc_byte1_output_rules
+    ("layer3_ffn.pc_byte1_output_rules",      134,   2),  # _add_pc_byte1_output_rules
 )
 
 
-def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
+def _allocate_register_default_ffn_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with all L3 FFN sub-stages.
 
     Phase 7.B.2: ``pin=`` is dropped from every entry in
-    :data:`_L3_FFN_UNIT_LAYOUT`. The allocator's default first-fit
+    :data:`_REGISTER_DEFAULT_FFN_UNIT_LAYOUT`. The allocator's default first-fit
     strategy walks the layout in declaration order and lands each
     sub-stage at the lowest free gap large enough to hold it. Because
     the layout is fully contiguous (every entry starts exactly where
@@ -79,7 +79,7 @@ def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
     layout table is kept as a documentation column only (no longer
     consumed by the allocator).
 
-    The trailing ``_add_layer3_pc_byte1_output_rules`` writer is also
+    The trailing ``_add_pc_byte1_output_rules`` writer is also
     auto-placed; first-fit lands it at unit 134, matching the value
     ``_next_free_ffn_unit(ffn)`` would have returned immediately after
     the main rule lowering. The 32
@@ -91,7 +91,7 @@ def _allocate_layer3_ffn_units() -> FFNUnitAllocator:
     future L3 op claims a free range past unit 136).
     """
     allocator = FFNUnitAllocator()
-    for name, _legacy_pin, n_units in _L3_FFN_UNIT_LAYOUT:
+    for name, _legacy_pin, n_units in _REGISTER_DEFAULT_FFN_UNIT_LAYOUT:
         allocator.alloc(name, n_units)
     return allocator
 
@@ -119,7 +119,7 @@ def _no_op_placeholder_rule(name: str) -> FFNRule:
     )
 
 
-def _layer3_ffn_rules(S: float) -> tuple:
+def _register_default_ffn_rules(S: float) -> tuple:
     """Declarative L3 FFN rule list -- replaces ``vm_step._set_layer3_ffn``.
 
     Produces 134 :class:`FFNRule` instances covering:
@@ -136,7 +136,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
     * units 48-49 -- STACK0 first-step default.
     * units 50-81 -- STACK0 carry projection (32 write-less suppressor
       units; this is the declarative replacement for the legacy
-      ``_suppress_layer3_stack0_marker_carry_projection`` post-pass).
+      ``_suppress_stack0_marker_carry_projection`` post-pass).
     * units 82-85 -- NEXT_STACK0 locality clears (marker, byte_idx 1/2/3).
     * units 86-101 -- PC INCREMENT lo nibble (k+INSTR_WIDTH)%16.
     * units 102-117 -- PC INCREMENT hi nibble copy.
@@ -443,7 +443,7 @@ def _layer3_ffn_rules(S: float) -> tuple:
     # --- STACK0 carry projection -- SUPPRESSED writes (units 50-81) ---
     # Imperative bake wrote ``W_down[OUTPUT_LO/HI+k] = 2/S`` for these
     # 32 units, then
-    # ``_suppress_layer3_stack0_marker_carry_projection`` zeroed those
+    # ``_suppress_stack0_marker_carry_projection`` zeroed those
     # columns. Express directly as write-less ``gated_write`` rules so
     # the suppressor is no longer needed; the W_up / W_gate / b_up
     # writes are still emitted (preserving unit ownership) but
@@ -553,32 +553,32 @@ def _layer3_ffn_rules(S: float) -> tuple:
     return tuple(rules)
 
 
-def _layer3_ffn_ir(S: float = 100.0) -> CompilerIR:
+def _register_default_ffn_ir(S: float = 100.0) -> CompilerIR:
     """Build a single-layer :class:`CompilerIR` carrying the L3 FFN rules.
 
     Exposed as :attr:`Operation.compiler_ir` so the declarative
     verifier / dominance auditor can read the rule list without bake
     execution. Matches the pattern established by ``_phase_a_ffn_ir``
     (L0) and similar helpers. The IR carries all 136 units the
-    ``layer3_ffn`` op writes: 134 from :func:`_layer3_ffn_rules`
+    ``layer3_ffn`` op writes: 134 from :func:`_register_default_ffn_rules`
     (PC/SP/BP defaults + STACK0 carry suppression + NEXT_STACK0
     locality + PC increment / carry) followed by 2 from
-    :func:`_layer3_pc_byte1_output_rules` (PC byte1 emission).
+    :func:`_pc_byte1_output_rules` (PC byte1 emission).
     """
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer3_ffn_rules(S))
-    ir.layer(0).ffn.rules.extend(_layer3_pc_byte1_output_rules(S))
+    ir.layer(0).ffn.rules.extend(_register_default_ffn_rules(S))
+    ir.layer(0).ffn.rules.extend(_pc_byte1_output_rules(S))
     return ir
 
 
-def _lower_layer3_ffn_ir(ffn, S: float, BD) -> int:
-    """Lower :func:`_layer3_ffn_rules` into ``ffn`` and return next free unit.
+def _lower_register_default_ffn_ir(ffn, S: float, BD) -> int:
+    """Lower :func:`_register_default_ffn_rules` into ``ffn`` and return next free unit.
 
     Thin wrapper around :func:`Primitives.lower_ffn_rules` that builds the
     rule list, resolves dim names through ``BD``, and lowers at
-    ``start_unit=0``. Used by :func:`make_layer3_ffn_op`'s bake closure.
+    ``start_unit=0``. Used by :func:`make_register_default_ffn_op`'s bake closure.
     """
-    rules = _layer3_ffn_rules(S)
+    rules = _register_default_ffn_rules(S)
     dim_names = Primitives.ffn_rule_dim_names(rules)
     dim_positions = Primitives.dim_positions_from_bd(BD, dim_names)
     return Primitives.lower_ffn_rules(
@@ -586,15 +586,15 @@ def _lower_layer3_ffn_ir(ffn, S: float, BD) -> int:
     )
 
 
-def make_layer3_ffn_op() -> Operation:
+def make_register_default_ffn_op() -> Operation:
     """L3 FFN: PC/SP/BP first-step defaults + PC byte-0 increment.
 
     Originally: `_set_layer3_ffn` at vm_step.py:2929. Migrated to
-    declarative :class:`FFNRule` lowering via :func:`_layer3_ffn_rules`
+    declarative :class:`FFNRule` lowering via :func:`_register_default_ffn_rules`
     + :func:`Primitives.lower_ffn_rules` (134 units); the trailing 2
     PC-byte1 emission units come from
-    :func:`_add_layer3_pc_byte1_output_rules`. The legacy in-place
-    suppressor ``_suppress_layer3_stack0_marker_carry_projection`` is
+    :func:`_add_pc_byte1_output_rules`. The legacy in-place
+    suppressor ``_suppress_stack0_marker_carry_projection`` is
     no longer needed -- the 32 STACK0 carry-projection rules now emit
     zero W_down writes directly.
 
@@ -619,9 +619,9 @@ def make_layer3_ffn_op() -> Operation:
         # Per-bake FFN-unit allocator. Each L3 FFN sub-stage is pinned to
         # its existing offset so the rule lowering below lands
         # byte-identically. The ``pc_byte1_output_rules`` range gives the
-        # start-unit for the trailing ``_add_layer3_pc_byte1_output_rules``
+        # start-unit for the trailing ``_add_pc_byte1_output_rules``
         # writer, replacing the implicit ``_next_free_ffn_unit`` probe.
-        allocator = _allocate_layer3_ffn_units()
+        allocator = _allocate_register_default_ffn_units()
         pc_byte1_range = next(
             r for r in allocator.ranges()
             if r.op_name == "layer3_ffn.pc_byte1_output_rules"
@@ -636,17 +636,17 @@ def make_layer3_ffn_op() -> Operation:
         block.ffn._l3_unit_allocator = allocator
 
         # Lower the 134-rule declarative spec at unit 0.
-        next_free = _lower_layer3_ffn_ir(block.ffn, S, proxy)
+        next_free = _lower_register_default_ffn_ir(block.ffn, S, proxy)
         # Byte-identity guard: rule count MUST equal the
         # ``pc_byte1_output_rules`` start (134). If a rule is added or
-        # removed without updating ``_L3_FFN_UNIT_LAYOUT`` in lock-step,
+        # removed without updating ``_REGISTER_DEFAULT_FFN_UNIT_LAYOUT`` in lock-step,
         # this assertion fires before any further weight surgery
         # happens.
         assert next_free == pc_byte1_start, (
             f"L3 FFN unit cursor drift: rule lowering wrote {next_free} "
             f"units, allocator expected {pc_byte1_start}"
         )
-        _add_layer3_pc_byte1_output_rules(block.ffn, S, proxy)
+        _add_pc_byte1_output_rules(block.ffn, S, proxy)
 
     # Dim-ownership claims (W_down output cells; partial-claims subset). The
     # bake writes 136 hidden units; their W_down output projections fall into
@@ -659,7 +659,7 @@ def make_layer3_ffn_op() -> Operation:
     #                  blocks, each writing a single OUTPUT_LO+0 or
     #                  OUTPUT_HI+0 cell (alternating; see
     #                  _set_layer3_ffn in vm_step.py and the suppressor
-    #                  ``_suppress_layer3_stack0_marker_carry_projection``).
+    #                  ``_suppress_stack0_marker_carry_projection``).
     #   unit 12:       BP default emits OUTPUT_LO+1 (one-byte default).
     #   unit 20:       SP default emits OUTPUT_LO+1.
     #   units 82..85:  STACK0 NEXT_STACK0 carry chain.
@@ -670,7 +670,7 @@ def make_layer3_ffn_op() -> Operation:
     #   units 118..133: PC byte1 carry pairs; unit (118+k) writes
     #                   OUTPUT_HI+k and OUTPUT_HI+(k+1) — adjacent-nibble
     #                   carry. Unit 133 wraps and writes OUTPUT_HI+0/+15.
-    #   units 134/135: byte1 ones from _add_layer3_pc_byte1_output_rules
+    #   units 134/135: byte1 ones from _add_pc_byte1_output_rules
     #                  (write OUTPUT_LO+0/+1 and OUTPUT_HI+0).
     _claims = set()
     # PC default residue carries (units 0-3).
@@ -714,7 +714,7 @@ def make_layer3_ffn_op() -> Operation:
     _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI+0"))
     _claims.add((3, "ffn_W_down", "133", "OUTPUT_HI+15"))
     # Units 134/135: PC byte1 = 1 emission (added by
-    # _add_layer3_pc_byte1_output_rules at the end of the bake).
+    # _add_pc_byte1_output_rules at the end of the bake).
     for unit in ("134", "135"):
         _claims.add((3, "ffn_W_down", unit, "OUTPUT_LO+0"))
         _claims.add((3, "ffn_W_down", unit, "OUTPUT_LO+1"))
@@ -759,7 +759,7 @@ def make_layer3_ffn_op() -> Operation:
         target_op_name="layer3_carry_forward_attn",
         requires={"after": "layer3_carry_forward_attn"},
         declarative_bake_fn=bake,
-        compiler_ir=_layer3_ffn_ir(),
+        compiler_ir=_register_default_ffn_ir(),
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
@@ -790,7 +790,7 @@ def _next_free_ffn_unit(ffn) -> int:
     return int(used[-1].item() + 1) if len(used) else 0
 
 
-def _suppress_layer3_stack0_marker_carry_projection(ffn, S: float, BD) -> int:
+def _suppress_stack0_marker_carry_projection(ffn, S: float, BD) -> int:
     """Disable stale previous-STACK0 projection at the STACK0 marker.
 
     L3 head 4 carries the previous step's ``STACK0_byte0`` into
@@ -832,7 +832,7 @@ def _suppress_layer3_stack0_marker_carry_projection(ffn, S: float, BD) -> int:
     return suppressed
 
 
-def _rewrite_layer3_initial_sp_byte2_to_zero(ffn, S: float, BD) -> int:
+def _rewrite_initial_sp_byte2_to_zero(ffn, S: float, BD) -> int:
     """Materialize the emitted initial SP as ``0x0000fff8``.
 
     The legacy L3 default was authored for the constructor value
@@ -871,7 +871,7 @@ def _rewrite_layer3_initial_sp_byte2_to_zero(ffn, S: float, BD) -> int:
     return rewritten
 
 
-def _rewrite_layer3_initial_sp_marker_to_f8(
+def _rewrite_initial_sp_marker_to_f8(
     ffn, S: float, BD, *, jsr_prologue: bool = False
 ) -> int:
     """Materialize initial emitted ``SP_byte0`` as ``0xf8`` at the SP marker.
@@ -922,7 +922,7 @@ def _rewrite_layer3_initial_sp_marker_to_f8(
     return rewritten
 
 
-def _layer3_pc_byte1_output_rules(S: float) -> tuple:
+def _pc_byte1_output_rules(S: float) -> tuple:
     """Declarative L3 FFN units 134-135 -- PC byte1 emission rules.
 
     Two ``constant_write`` rules that make PC byte1 equal one either
@@ -980,16 +980,16 @@ def _layer3_pc_byte1_output_rules(S: float) -> tuple:
     return (wrap, preserve)
 
 
-def _lower_layer3_pc_byte1_output_rules_ir(
+def _lower_pc_byte1_output_rules_ir(
     ffn, S: float, BD, *, start_unit: int,
 ) -> int:
-    """Lower :func:`_layer3_pc_byte1_output_rules` into ``ffn``.
+    """Lower :func:`_pc_byte1_output_rules` into ``ffn``.
 
     Returns the next free unit index. The two PC-byte1 rules occupy
     units ``start_unit`` and ``start_unit + 1`` -- callers pass the
     cursor returned by the main L3 FFN rule lowering (134).
     """
-    rules = _layer3_pc_byte1_output_rules(S)
+    rules = _pc_byte1_output_rules(S)
     dim_names = Primitives.ffn_rule_dim_names(rules)
     dim_positions = Primitives.dim_positions_from_bd(BD, dim_names)
     return Primitives.lower_ffn_rules(
@@ -997,7 +997,7 @@ def _lower_layer3_pc_byte1_output_rules_ir(
     )
 
 
-def _add_layer3_pc_byte1_output_rules(ffn, S, BD) -> None:
+def _add_pc_byte1_output_rules(ffn, S, BD) -> None:
     """Emit PC byte1 for programs whose linear PC crosses 0x100.
 
     Legacy L3 owns ordinary PC emission but only increments byte 0 and then
@@ -1010,8 +1010,8 @@ def _add_layer3_pc_byte1_output_rules(ffn, S, BD) -> None:
     prior high byte.
 
     Migrated to :class:`FFNRule` lowering via
-    :func:`_layer3_pc_byte1_output_rules` and
-    :func:`_lower_layer3_pc_byte1_output_rules_ir`; the
+    :func:`_pc_byte1_output_rules` and
+    :func:`_lower_pc_byte1_output_rules_ir`; the
     ``_next_free_ffn_unit`` probe remains for legacy back-compat (the
     main bake's cursor assertion guarantees it returns 134).
     """
@@ -1019,12 +1019,12 @@ def _add_layer3_pc_byte1_output_rules(ffn, S, BD) -> None:
     start_unit = _next_free_ffn_unit(ffn)
     if start_unit + 2 > ffn.W_up.shape[0]:
         raise RuntimeError("L3 FFN has no room for PC byte1 carry repair")
-    _lower_layer3_pc_byte1_output_rules_ir(
+    _lower_pc_byte1_output_rules_ir(
         ffn, S, BD, start_unit=start_unit,
     )
 
 
-def make_layer3_ffn_dep_anchor_op() -> Operation:
+def make_register_default_ffn_dep_anchor_op() -> Operation:
     """No-op companion for ``layer3_ffn``: declares identical reads/writes so
     the LayerCompiler's dep graph reserves a layer slot for it. Mirrors
     ``_layer5_fetch_dep_anchor``: the actual bake happens in
@@ -1077,7 +1077,7 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
         # Dead-unit budget (docs/DEAD_UNIT_AUDIT_2026_06_05.md): L3's
         # actual FFN bake (``layer3_ffn`` block op) writes 134 PC/SP/BP
         # default-rule units plus 2 trailing byte-1 emission units from
-        # ``_add_layer3_pc_byte1_output_rules`` -- total 136. Prior to
+        # ``_add_pc_byte1_output_rules`` -- total 136. Prior to
         # annotation, the layer fell through to ``DEFAULT_LAYER_MAX_UNITS
         # = 4096`` and ``_right_size_ffns`` trimmed post-bake. Declaring
         # the budget here lets the dynamic-FFN allocator pre-size
@@ -1100,9 +1100,9 @@ def make_layer3_ffn_dep_anchor_op() -> Operation:
 # first-fit picks 0..7 in declaration order, which matches the legacy
 # layout bit-for-bit. The ``legacy_head_idx`` column below is now
 # documentation only; the load-bearing copy is
-# :data:`_L3_HEAD_LAYOUT_BY_NAME`, consumed by the head-spec
+# :data:`_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME`, consumed by the head-spec
 # factories that write Q/K/V/O weights at the resolved ``head_idx``.
-_L3_HEAD_LAYOUT = (
+_CARRY_FORWARD_HEAD_LAYOUT = (
     # (op_name, legacy_head_idx (docs only))
     ("layer3_carry_forward_attn.head_0", 0),  # PC carry-forward
     ("layer3_carry_forward_attn.head_1", 1),  # AX carry-forward -> AX_CARRY band
@@ -1113,29 +1113,29 @@ _L3_HEAD_LAYOUT = (
     ("layer3_carry_forward_attn.head_6", 6),  # LEV BP->PC (CLEAN_EMBED relay)
     ("layer3_carry_forward_attn.head_7", 7),  # PC byte1 prev -> TEMP
 )
-_L3_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L3_HEAD_LAYOUT}
+_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _CARRY_FORWARD_HEAD_LAYOUT}
 
 
-def _allocate_layer3_heads() -> AttentionHeadAllocator:
+def _allocate_carry_forward_heads() -> AttentionHeadAllocator:
     """Build a per-bake :class:`AttentionHeadAllocator` with all L3 heads.
 
     Phase 7.B.2: ``pin=`` is dropped from every entry. The allocator's
     first-fit picks the lowest free head index in declaration order;
-    because :data:`_L3_HEAD_LAYOUT` is contiguous (0..7) and ordered,
+    because :data:`_CARRY_FORWARD_HEAD_LAYOUT` is contiguous (0..7) and ordered,
     first-fit reproduces the legacy ``head_idx`` values bit-for-bit.
     The actual weight-write head indices are still looked up via
-    :data:`_L3_HEAD_LAYOUT_BY_NAME` inside the head-spec factories
+    :data:`_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME` inside the head-spec factories
     below, so byte-identity with the legacy bake is preserved
     regardless of allocator order. Returns the allocator so callers
     can attach it to the ``attn`` module for inspection.
     """
     allocator = AttentionHeadAllocator(layer_max_heads=8)
-    for name, _legacy_head_idx in _L3_HEAD_LAYOUT:
+    for name, _legacy_head_idx in _CARRY_FORWARD_HEAD_LAYOUT:
         allocator.alloc(name, 3)
     return allocator
 
 
-def make_layer3_carry_forward_attn_op() -> Operation:
+def make_carry_forward_attn_op() -> Operation:
     """L3 attention: 8 carry-forward heads (PC, AX, SP, BP, STACK0 + relays).
 
     Heads 0-3 are declarative carry-forward heads (PC, AX, SP, BP) that
@@ -1151,14 +1151,14 @@ def make_layer3_carry_forward_attn_op() -> Operation:
 
         # Per-bake attention-head allocator. Pins every L3 head_idx at
         # its existing slot so byte-identity is preserved.
-        head_allocator = _allocate_layer3_heads()
+        head_allocator = _allocate_carry_forward_heads()
         attn._l3_head_allocator = head_allocator
 
         if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
             attn.alibi_slopes.fill_(0.5)
         HD = attn.W_q.shape[0] // attn.num_heads
         Primitives.generate_attention_heads(
-            attn, _layer3_carry_forward_head_specs(proxy), HD,
+            attn, _carry_forward_head_specs(proxy), HD,
         )
 
     # Dim-ownership claims: 7 carry-forward attention heads.
@@ -1216,7 +1216,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
         # OP_LEV. Breaks back-edge L5 → layer3_carry_forward_attn on OP_LEV.
         # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — add
         # MARK_STACK0 (head 6 Q at slot 0 / 33 via
-        # ``_lev_bp_to_pc_head_spec`` in ``_layer3_carry_forward_attn_ir``);
+        # ``_lev_bp_to_pc_head_spec`` in ``_carry_forward_attn_ir``);
         # was missing from declared reads though baked.
         reads={"MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0",
                "L1H0", "L1H1", "STACK0_BYTE0", "OP_LEV.*.-1", "HAS_SE",
@@ -1257,7 +1257,7 @@ def make_layer3_carry_forward_attn_op() -> Operation:
                 "TEMP", "ADDR_KEY"},
         kind="attn",
         declarative_bake_fn=bake,
-        compiler_ir_factory=_layer3_carry_forward_attn_ir,
+        compiler_ir_factory=_carry_forward_attn_ir,
         declarative_authority="spec_generated",
         migrated=True,
         claims=_claims,
@@ -1334,7 +1334,7 @@ def _carry_forward_head_spec(
     )
 
 
-def _layer3_carry_forward_head_specs(
+def _carry_forward_head_specs(
     BD,
 ) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     """All 8 L3 carry-forward attention heads as declarative specs.
@@ -1349,7 +1349,7 @@ def _layer3_carry_forward_head_specs(
     specs = (
         _carry_forward_head_spec(
             BD,
-            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_0"],
+            head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_0"],
             marker_dim=BD.MARK_PC,
             l1h1_idx=PC_I,
             l1h0_idx=PC_I,
@@ -1360,7 +1360,7 @@ def _layer3_carry_forward_head_specs(
         ),
         _carry_forward_head_spec(
             BD,
-            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_1"],
+            head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_1"],
             marker_dim=BD.MARK_AX,
             l1h1_idx=AX_I,
             l1h0_idx=AX_I,
@@ -1371,7 +1371,7 @@ def _layer3_carry_forward_head_specs(
         ),
         _carry_forward_head_spec(
             BD,
-            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_2"],
+            head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_2"],
             marker_dim=BD.MARK_SP,
             l1h1_idx=SP_I,
             l1h0_idx=SP_I,
@@ -1382,7 +1382,7 @@ def _layer3_carry_forward_head_specs(
         ),
         _carry_forward_head_spec(
             BD,
-            head_idx=_L3_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_3"],
+            head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_3"],
             marker_dim=BD.MARK_BP,
             l1h1_idx=BP_I,
             l1h0_idx=BP_I,
@@ -1399,7 +1399,7 @@ def _layer3_carry_forward_head_specs(
     return specs
 
 
-def _layer3_carry_forward_attn_ir(dim_positions, HD) -> CompilerIR:
+def _carry_forward_attn_ir(dim_positions, HD) -> CompilerIR:
     """CompilerIR factory for ``layer3_carry_forward_attn``.
 
     Resolves dim names through ``_as_setdim_proxy`` so the lowering
@@ -1409,7 +1409,7 @@ def _layer3_carry_forward_attn_ir(dim_positions, HD) -> CompilerIR:
     del HD  # head specs are dim-only; HD is encoded in the lowering call.
     BD = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.extend(_layer3_carry_forward_head_specs(BD))
+    ir.layer(0).attention.extend(_carry_forward_head_specs(BD))
     return ir
 
 
@@ -1593,7 +1593,7 @@ def _pc_byte1_prev_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     )
 
 
-def make_layer3_convo_io_state_init_op(
+def make_convo_io_state_init_op(
     enable_conversational_io: bool = False,
 ) -> Operation:
     """L3 FFN addition: initialize output mode when LAST_WAS_THINKING_END.
@@ -1604,7 +1604,7 @@ def make_layer3_convo_io_state_init_op(
 
     Migrated as ``kind="block"`` pinned to ``layer_idx=3`` with
     ``migrated=True``. Phase=3.1 so this runs AFTER
-    ``make_layer3_ffn_op`` (phase=3) and writes into a distinct FFN
+    ``make_register_default_ffn_op`` (phase=3) and writes into a distinct FFN
     unit range (starts at unit 1034, above the L3 / L6-routing unit
     counters), so the writes layer cleanly on top.
 
@@ -1617,7 +1617,7 @@ def make_layer3_convo_io_state_init_op(
         if not enable_conversational_io:
             return
         proxy = _as_setdim_proxy(dim_positions)
-        _lower_layer3_convo_io_state_init_ir(block.ffn, S, proxy)
+        _lower_convo_io_state_init_ir(block.ffn, S, proxy)
 
     return Operation(
         name="layer3_convo_io_state_init",
@@ -1628,7 +1628,7 @@ def make_layer3_convo_io_state_init_op(
         # edges are needed.
         reads=set(),
         # UNDECLARED_DIM_AUDIT_2026_06_09: declare actual write to
-        # IO_IN_OUTPUT_MODE from ``_layer3_convo_io_state_init_rules``
+        # IO_IN_OUTPUT_MODE from ``_convo_io_state_init_rules``
         # (step_function_rule fires on LAST_WAS_THINKING_END).
         writes={"IO_IN_OUTPUT_MODE"},
         kind="block",
@@ -1637,7 +1637,7 @@ def make_layer3_convo_io_state_init_op(
         # to whichever layer the L3 carry-forward attn lands at.
         target_op_name="layer3_carry_forward_attn",
         declarative_bake_fn=bake,
-        compiler_ir=_layer3_convo_io_state_init_ir(),
+        compiler_ir=_convo_io_state_init_ir(),
         declarative_authority="spec_generated",
         migrated=True,
         ffn_units_used=1035 if enable_conversational_io else None,
@@ -1663,7 +1663,7 @@ def make_layer3_convo_io_state_init_op(
     )
 
 
-def _layer3_convo_io_state_init_rules(S: float) -> tuple[FFNRule, ...]:
+def _convo_io_state_init_rules(S: float) -> tuple[FFNRule, ...]:
     return (
         step_function_rule(
             name="convo_io_enter_output_mode",
@@ -1677,7 +1677,7 @@ def _layer3_convo_io_state_init_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
-def _layer3_convo_io_state_init_ir(S: float = 100.0) -> CompilerIR:
+def _convo_io_state_init_ir(S: float = 100.0) -> CompilerIR:
     """Build a :class:`CompilerIR` exposing the convo-IO state-init rule.
 
     Pinned to :attr:`Operation.compiler_ir` so the declarative verifier
@@ -1685,15 +1685,15 @@ def _layer3_convo_io_state_init_ir(S: float = 100.0) -> CompilerIR:
     the bake body lowers it at start_unit=1034 (above the L3 main
     rule range). The IR-level lowering uses start_unit=0; the actual
     bake body uses the production offset via
-    :func:`_lower_layer3_convo_io_state_init_ir`.
+    :func:`_lower_convo_io_state_init_ir`.
     """
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer3_convo_io_state_init_rules(S))
+    ir.layer(0).ffn.rules.extend(_convo_io_state_init_rules(S))
     return ir
 
 
-def _lower_layer3_convo_io_state_init_ir(ffn, S: float, BD) -> int:
-    rules = _layer3_convo_io_state_init_rules(S)
+def _lower_convo_io_state_init_ir(ffn, S: float, BD) -> int:
+    rules = _convo_io_state_init_rules(S)
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
         Primitives.ffn_rule_dim_names(rules),

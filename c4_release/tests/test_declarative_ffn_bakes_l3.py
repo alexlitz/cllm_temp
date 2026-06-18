@@ -2,8 +2,8 @@
 
 Covers:
 - ``layer3_ffn`` -- migrated from ``vm_step._set_layer3_ffn`` +
-  ``_suppress_layer3_stack0_marker_carry_projection`` +
-  ``_add_layer3_pc_byte1_output_rules`` to a 136-rule
+  ``_suppress_stack0_marker_carry_projection`` +
+  ``_add_pc_byte1_output_rules`` to a 136-rule
   :class:`c4_release.neural_vm.unified_compiler.ir.FFNRule` list lowered via
   :func:`Primitives.lower_ffn_rules`.
 - ``layer3_convo_io_state_init`` and ``convo_io_step_resume`` -- already
@@ -15,13 +15,13 @@ import torch
 
 from c4_release.neural_vm.vm_step import _SetDim, _set_layer3_ffn
 from c4_release.neural_vm.unified_compiler.ops.l3_ops import (
-    _layer3_convo_io_state_init_ir,
-    _layer3_ffn_ir,
-    _layer3_ffn_rules,
-    _layer3_pc_byte1_output_rules,
-    _lower_layer3_ffn_ir,
-    _lower_layer3_pc_byte1_output_rules_ir,
-    _suppress_layer3_stack0_marker_carry_projection,
+    _convo_io_state_init_ir,
+    _register_default_ffn_ir,
+    _register_default_ffn_rules,
+    _pc_byte1_output_rules,
+    _lower_register_default_ffn_ir,
+    _lower_pc_byte1_output_rules_ir,
+    _suppress_stack0_marker_carry_projection,
 )
 from c4_release.neural_vm.unified_compiler.ops.flag_gated_ops import (
     _convo_io_step_resume_ir,
@@ -51,13 +51,13 @@ def _assert_same_ffn(actual: _StubFFN, expected: _StubFFN):
 
 def _legacy_set_layer3_ffn_full(ffn, S, BD):
     """Run the full legacy bake stack: ``_set_layer3_ffn`` +
-    suppressor + ``_add_layer3_pc_byte1_output_rules`` (inlined here to
+    suppressor + ``_add_pc_byte1_output_rules`` (inlined here to
     avoid coupling to the now-migrated production helper).
     """
     _set_layer3_ffn(ffn, S, BD)
-    _suppress_layer3_stack0_marker_carry_projection(ffn, S, BD)
+    _suppress_stack0_marker_carry_projection(ffn, S, BD)
 
-    # Inlined pre-migration _add_layer3_pc_byte1_output_rules body
+    # Inlined pre-migration _add_pc_byte1_output_rules body
     # (so this test pins the exact legacy weights, not whatever the
     # migrated helper now produces).
     PC_I = 0
@@ -96,11 +96,11 @@ def _legacy_set_layer3_ffn_full(ffn, S, BD):
 
 def test_layer3_ffn_rule_count_is_136():
     """Pin the rule count so accidental adds/removes are caught."""
-    main = _layer3_ffn_rules(100.0)
-    trailing = _layer3_pc_byte1_output_rules(100.0)
+    main = _register_default_ffn_rules(100.0)
+    trailing = _pc_byte1_output_rules(100.0)
     assert len(main) == 134
     assert len(trailing) == 2
-    ir = _layer3_ffn_ir()
+    ir = _register_default_ffn_ir()
     assert len(ir.layer(0).ffn.rules) == 136
 
 
@@ -108,16 +108,16 @@ def test_layer3_ffn_declarative_matches_legacy_helper():
     """Byte-identity: 136-rule declarative lowering produces exactly the
     same ``W_up`` / ``b_up`` / ``W_gate`` / ``b_gate`` / ``W_down``
     tensors as ``_set_layer3_ffn`` + suppressor + legacy
-    ``_add_layer3_pc_byte1_output_rules``.
+    ``_add_pc_byte1_output_rules``.
     """
     actual = _StubFFN(hidden_dim=200)
     expected = _StubFFN(hidden_dim=200)
 
-    next_free = _lower_layer3_ffn_ir(actual, 100.0, _SetDim)
+    next_free = _lower_register_default_ffn_ir(actual, 100.0, _SetDim)
     assert next_free == 134, (
         f"main rule lowering wrote {next_free} units, expected 134"
     )
-    _lower_layer3_pc_byte1_output_rules_ir(
+    _lower_pc_byte1_output_rules_ir(
         actual, 100.0, _SetDim, start_unit=next_free,
     )
 
@@ -130,10 +130,10 @@ def test_layer3_ffn_stack0_carry_projection_writes_are_suppressed():
     """The 32 STACK0 carry-projection rules (units 50..81) must emit
     *zero* ``W_down`` writes -- that is the declarative replacement for
     the legacy
-    ``_suppress_layer3_stack0_marker_carry_projection`` post-pass.
+    ``_suppress_stack0_marker_carry_projection`` post-pass.
     """
     ffn = _StubFFN(hidden_dim=200)
-    _lower_layer3_ffn_ir(ffn, 100.0, _SetDim)
+    _lower_register_default_ffn_ir(ffn, 100.0, _SetDim)
 
     for unit in range(50, 82):
         # W_up / W_gate / b_up survive (the rule still fires).
@@ -149,7 +149,7 @@ def test_layer3_ffn_stack0_carry_projection_writes_are_suppressed():
 
 
 def test_layer3_convo_io_state_init_ir_pins_single_rule():
-    ir = _layer3_convo_io_state_init_ir()
+    ir = _convo_io_state_init_ir()
     rules = ir.layer(0).ffn.rules
     assert len(rules) == 1
     rule = rules[0]

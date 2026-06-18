@@ -368,16 +368,16 @@ class TestMigratedOps:
         from neural_vm.unified_compiler.migrated_ops import (
             make_phase_a_ffn_op,
             make_threshold_ffn_op,
-            make_layer3_ffn_op,
-            make_layer3_ffn_dep_anchor_op,
+            make_register_default_ffn_op,
+            make_register_default_ffn_dep_anchor_op,
             declare_setdim_compat_dims,
         )
 
         c = LayerCompiler()
         declare_setdim_compat_dims(c)
         # Add in arbitrary order — compiler should still produce a valid layout.
-        c.add_op(make_layer3_ffn_op())
-        c.add_op(make_layer3_ffn_dep_anchor_op())
+        c.add_op(make_register_default_ffn_op())
+        c.add_op(make_register_default_ffn_dep_anchor_op())
         c.add_op(make_phase_a_ffn_op())
         c.add_op(make_threshold_ffn_op())
 

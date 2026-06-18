@@ -11,7 +11,7 @@ Layer 3 owns the residual-stream book-keeping for register evolution:
   ``claims=`` (224 cells across V slots for heads 0-3, 5, 6, 7).
 * ``layer3_ffn`` — block-pinned FFN that handles PC / SP / BP
   first-step defaults plus PC byte-0 increment plus the byte-1 carry
-  repair (see ``_add_layer3_pc_byte1_output_rules``).
+  repair (see ``_add_pc_byte1_output_rules``).
 * ``_layer3_ffn_dep_anchor`` — no-op companion ``kind="ffn"`` op that
   reserves a dep-graph layer slot.
 * ``layer3_convo_io_state_init`` — conversational-I/O state init FFN,
@@ -35,8 +35,8 @@ import torch
 
 from neural_vm.constants import INSTR_WIDTH, PC_OFFSET
 from neural_vm.unified_compiler.ops.l3_ops import (
-    make_layer3_carry_forward_attn_op,
-    make_layer3_ffn_op,
+    make_carry_forward_attn_op,
+    make_register_default_ffn_op,
 )
 from neural_vm.vm_step import _SetDim
 
@@ -200,7 +200,7 @@ def test_l3_ffn_first_step_emits_pc_offset_plus_instr_width_at_pc_marker():
     so L4 can relay the AX marker for L5 fetch.
     """
     block = _StubBlock()
-    make_layer3_ffn_op().bake_fn(block, {}, 100.0)
+    make_register_default_ffn_op().bake_fn(block, {}, 100.0)
 
     first_pc = PC_OFFSET + INSTR_WIDTH
     pc_lo = first_pc & 0xF
@@ -231,7 +231,7 @@ def test_l3_ffn_subsequent_step_cancels_first_step_default_at_pc_marker():
     drive the byte.
     """
     block = _StubBlock()
-    make_layer3_ffn_op().bake_fn(block, {}, 100.0)
+    make_register_default_ffn_op().bake_fn(block, {}, 100.0)
 
     first_pc = PC_OFFSET + INSTR_WIDTH
     pc_lo = first_pc & 0xF
@@ -288,7 +288,7 @@ def test_l3_carry_forward_attn_head0_propagates_prev_step_pc_embed():
     nibble pair, the current-step PC marker token should pick it up.
     """
     attn = _StubAttn()
-    make_layer3_carry_forward_attn_op().bake_fn(attn, {}, 100.0)
+    make_carry_forward_attn_op().bake_fn(attn, {}, 100.0)
 
     # Pick a non-zero nibble pair to make sure we are propagating
     # values rather than zeros.
@@ -345,7 +345,7 @@ def test_l3_carry_forward_attn_head1_propagates_prev_step_ax_to_ax_carry():
     reads EMBED_LO/HI from the previous AX byte 0 row.
     """
     attn = _StubAttn()
-    make_layer3_carry_forward_attn_op().bake_fn(attn, {}, 100.0)
+    make_carry_forward_attn_op().bake_fn(attn, {}, 100.0)
 
     src_lo_nibble = 3
     src_hi_nibble = 14

@@ -89,7 +89,7 @@ def all_core_ops(
         make_layer2_lookback_detection_head_op(
             enable_conversational_io=enable_conversational_io,
         ),
-        make_layer3_carry_forward_attn_op(),
+        make_carry_forward_attn_op(),
         make_phase_a_ffn_op(),
         make_threshold_ffn_op(),
         make_layer2_mem_byte_flags_op(),
@@ -106,13 +106,13 @@ def all_core_ops(
         # migrated=True) below; this kind="ffn" entry is skipped at dispatch
         # because legacy_bake is present and migrated=False.
         make_nibble_copy_ffn_op(),
-        make_layer3_ffn_op(),
-        make_layer3_ffn_dep_anchor_op(),
+        make_register_default_ffn_op(),
+        make_register_default_ffn_dep_anchor_op(),
         # Conversational-I/O L3 state init: phase=3.1 so it bakes after
         # the L3 FFN (phase=3) and writes into FFN units above the L3 /
         # L6-routing unit ranges. Body is a no-op unless
         # ``enable_conversational_io`` is True.
-        make_layer3_convo_io_state_init_op(
+        make_convo_io_state_init_op(
             enable_conversational_io=enable_conversational_io,
         ),
         make_layer4_pc_relay_op(),

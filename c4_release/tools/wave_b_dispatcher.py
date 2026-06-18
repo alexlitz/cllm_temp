@@ -368,7 +368,7 @@ _CLUSTER_MANIFEST: Tuple[RuleSpec, ...] = (
     RuleSpec(
         cluster=5,
         factory_module="neural_vm.unified_compiler.ops.l3_ops",
-        factory_name="_layer3_ffn_rules",
+        factory_name="_register_default_ffn_rules",
         relayed_dims=(),
         notes=(
             "Lint FP: byte_1_first_step_lo/hi for SP+BP gate on "
