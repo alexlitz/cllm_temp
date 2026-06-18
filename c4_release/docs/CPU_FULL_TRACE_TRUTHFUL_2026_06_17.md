@@ -127,3 +127,52 @@ just != GPU neural at those saturated ties. (Confirmation:
 KV cache). The deep `gcd 904` (97 steps) ran in ~182s (it early-diverges at
 step 0). Fine for self-checking specific framing programs in ~minutes instead of
 a ~30-min GPU run; use `run_1096_canonical` on GPU for the full corpus.
+
+## Full-corpus CPU loop: `--spec-k` + `--workers` (2026-06-18)
+
+`cpu_full_trace.py` gained two flags to make the full_trace corpus loop run
+**GPU-independently** (not faster — the point is no GPU at all):
+
+- **`--spec-k`** (default 32 for back-compat; pass `0` for the GPU-gate
+  effective K). Flows straight to `run_batch_fail_fast`, which clamps `<=0` to
+  `eff_spec_k=1` (one VM step verified per forward). The per-step (PC, AX)
+  verdict is K-independent by construction, so the pass set is identical for any
+  K **except** at the saturated-tie positions discussed below.
+- **`--workers N`** (default `min(cpu-2, 16)`) — a `spawn` `multiprocessing`
+  Pool. The runnable programs are split into `N` step²-balanced chunks; each
+  worker bakes once (`torch.set_num_threads(1)`) and decodes its chunk. The
+  parent WARMS the on-disk compile cache before spawning (10s) so workers
+  `torch.load` (~3s) instead of all baking at once (16 simultaneous bakes
+  thrashed to ~6 min). `--all` runs the whole corpus; `--max-steps-cap 40`
+  (default) matches the GPU gate's skip set (846 passable programs are <=39
+  steps, so it drops no pass; 233 deep diverging programs are skipped).
+- **serial vs parallel parity verified** (ids 0,3,4,1031 → identical verdicts).
+- **Full-corpus wall** (measured-anchored, fail-fast early-stop): ~2.5-3h on 16
+  cores for the 863 runnable programs (vs ~30 min on a dedicated GPU). This buys
+  GPU-INDEPENDENCE, not speed.
+
+### CORRECTION to the "4 saturated ties resolve at spec_k=0" hypothesis
+
+The earlier table listed ids 1, 2, 825, 850 as the GPU-pass/CPU-fail ties and
+conjectured `spec_k=0` would resolve them. **The 2026-06-18 data refutes that:**
+
+1. The GPU `run_batch_fail_fast` verdict is **identical** at spec_k=32 and
+   spec_k=0 (eff=1) for all of {1, 2, 825, 850} — spec_k does not move them.
+2. Under the **full_trace** criterion (not exit_code) ids 1 and 2 are GPU-FAIL
+   (div_step 3, the ALU high-byte carry), so they **agree** with the CPU tool
+   (both fail). They were never genuine ties.
+3. The genuine mismatches are 825 (`expr_paren`) / 850 (`expr_mul_div`) — plus
+   the `mul` band (100-102) found in the 40-program sample — where the GPU AND
+   the real CPU `model.forward` both PASS, but the `cpu_full_trace` faithful
+   forward FAILS with `got_ax = 0xF0F0F0??` (a 0xF0 byte-fill, not a clean
+   wrong byte). Confirmed: `run_1096_canonical --ids 1,2,825,850
+   CUDA_VISIBLE_DEVICES=""` (real `model.forward` on CPU) PASSES 825/850.
+
+So the residual is a **`CachedFaithfulForward` recovery divergence** from the
+dense `model.forward` at saturated-result positions (mul/expr_paren/expr_mul_div
+clusters), NOT a spec_k drafting artifact. It is therefore **not closed by
+`--spec-k 0`** and lives in `faithful_interpreter.py`, outside the runner. The
+CPU tool stays SAFE as an over-claim guard (it FAILs where GPU passes; it never
+PASSes a GPU-fail). 40-program sample agreement at spec_k=0: **33/40 (82.5%)**,
+the 7 disagreements all the 0xF0 faithful-forward divergence (GPU/CPU-neural
+pass, faithful-tool fail).
