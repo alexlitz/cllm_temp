@@ -12,7 +12,7 @@ from c4_release.neural_vm.unified_compiler.migrated_ops import (
     all_core_ops,
     declare_setdim_compat_dims,
     make_layer11_mul_partial_op,
-    make_layer12_mul_combine_op,
+    make_mul_combine_op,
 )
 from c4_release.neural_vm.vm_step import _SetDim
 

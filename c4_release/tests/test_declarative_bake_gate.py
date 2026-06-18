@@ -12,7 +12,7 @@ from c4_release.neural_vm.unified_compiler.ops.l11_ops import (
     make_layer11_mul_partial_op,
 )
 from c4_release.neural_vm.unified_compiler.ops.l12_ops import (
-    make_layer12_mul_combine_op,
+    make_mul_combine_op,
 )
 
 
@@ -170,7 +170,7 @@ def test_efficient_alu_disables_legacy_lookup_mul_bakes():
 
     for op in (
         make_layer11_mul_partial_op(alu_mode="efficient"),
-        make_layer12_mul_combine_op(alu_mode="efficient"),
+        make_mul_combine_op(alu_mode="efficient"),
     ):
         dispatch_operation_bake(
             op,

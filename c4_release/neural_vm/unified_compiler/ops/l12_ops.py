@@ -12,7 +12,7 @@ from .shared import _as_setdim_proxy
 # === L12 FFN unit layout (auto-fit) =================================
 #
 # The ``layer12_mul_combine`` op owns the entire L12 FFN. The weight
-# writes happen via ``_layer12_mul_combine_rules`` (a list of
+# writes happen via ``mul_combine_rules`` (a list of
 # :class:`FFNRule` declarations) which is lowered by
 # ``Primitives.lower_ffn_rules`` through ``CompilerIR.lower_ffn``. The
 # rules walk a ``(partial, a_hi, b_lo)`` triple-loop and fill all 4096
@@ -25,16 +25,16 @@ from .shared import _as_setdim_proxy
 # turns the layout table into an audit-only declaration of name and
 # size; the allocator owns the offset.
 #
-# The rule order in ``_layer12_mul_combine_rules`` determines the per-unit
+# The rule order in ``mul_combine_rules`` determines the per-unit
 # write semantics. Changing the rule list requires updating this table
 # entry's ``n_units`` in lock-step.
-_L12_MUL_COMBINE_UNIT_LAYOUT = (
+_MUL_COMBINE_UNIT_LAYOUT = (
     # (sub-stage name, n_units)  -- pin dropped (Phase 7.B.5, auto-fit)
     ("layer12_mul_combine.partials", 4096),  # 16 partial x 16 a_hi x 16 b_lo
 )
 
 
-def _allocate_layer12_mul_combine_units() -> FFNUnitAllocator:
+def allocate_mul_combine_units() -> FFNUnitAllocator:
     """Build a per-bake :class:`FFNUnitAllocator` with L12's MUL combine range.
 
     Phase 7.B.5: the partials sub-stage is now auto-fit (``pin=None``);
@@ -50,12 +50,12 @@ def _allocate_layer12_mul_combine_units() -> FFNUnitAllocator:
     pool, or claims a sub-range if the rule list is split).
     """
     allocator = FFNUnitAllocator()
-    for name, n_units in _L12_MUL_COMBINE_UNIT_LAYOUT:
+    for name, n_units in _MUL_COMBINE_UNIT_LAYOUT:
         allocator.alloc(name, n_units)
     return allocator
 
 
-def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
+def mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for the L12 MUL combine sub-stage (4096 units).
 
     Mirrors the legacy ``_set_layer12_mul_combine`` helper one-for-one:
@@ -131,21 +131,21 @@ def _layer12_mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _layer12_mul_combine_ir(S: float = 100.0) -> CompilerIR:
+def mul_combine_ir(S: float = 100.0) -> CompilerIR:
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer12_mul_combine_rules(S))
+    ir.layer(0).ffn.rules.extend(mul_combine_rules(S))
     return ir
 
 
-def _bake_layer12_mul_combine(ffn, S, BD) -> int:
+def bake_mul_combine(ffn, S, BD) -> int:
     """Bake L12 MUL combine via :class:`FFNRule` lowering (byte-identical helper).
 
-    Used both by the migrated :func:`make_layer12_mul_combine_op` bake path
+    Used both by the migrated :func:`make_mul_combine_op` bake path
     and as a standalone entry-point for callers wanting to drive the L12
     weight writes without constructing a full ``Operation``. Mirrors the
     L1 ``_bake_layer1_ffn`` convention.
     """
-    rules = _layer12_mul_combine_rules(S)
+    rules = mul_combine_rules(S)
     dim_positions = Primitives.dim_positions_from_bd(
         BD,
         Primitives.ffn_rule_dim_names(rules),
@@ -153,7 +153,7 @@ def _bake_layer12_mul_combine(ffn, S, BD) -> int:
     return Primitives.lower_ffn_rules(ffn, rules, dim_positions, S=S)
 
 
-def make_layer12_ffn_dep_anchor_op() -> Operation:
+def make_mul_combine_dep_anchor_op() -> Operation:
     """No-op companion for ``layer12_mul_combine``: declares mirrored
     reads/writes so the LayerCompiler's dep graph reserves an L12 slot
     for it. Mirrors ``_layer11_ffn_dep_anchor`` / ``_layer3_ffn_dep_anchor``:
@@ -196,7 +196,7 @@ def make_layer12_ffn_dep_anchor_op() -> Operation:
     )
 
 
-def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
+def make_mul_combine_op(alu_mode: str = "lookup") -> Operation:
     """L12 FFN: combine MUL partial products into final result.
 
     Pinned to ``layer_idx=12`` via ``kind="block"``. See
@@ -208,9 +208,9 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
 
     Migration (Phase 6 wave 4E): the imperative
     ``setup_helpers._set_layer12_mul_combine`` triple-loop is now declared
-    via :func:`_layer12_mul_combine_rules` and attached as
+    via :func:`mul_combine_rules` and attached as
     ``compiler_ir``; the bake lowers through :meth:`CompilerIR.lower_ffn`
-    via :func:`_bake_layer12_mul_combine`.
+    via :func:`bake_mul_combine`.
     """
     def bake(block, dim_positions, S):
         if alu_mode == "efficient":
@@ -222,7 +222,7 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         # byte-identically. Exposed on the block for downstream tools
         # (e.g. a future L12 op family claiming a free gap), mirroring
         # the L9 convention introduced in ca775eb.
-        allocator = _allocate_layer12_mul_combine_units()
+        allocator = allocate_mul_combine_units()
         partials_range = next(
             r for r in allocator.ranges()
             if r.op_name == "layer12_mul_combine.partials"
@@ -230,9 +230,9 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         block.ffn._l12_unit_allocator = allocator
 
         # Phase 8.C inline: lower the rule list directly (was
-        # ``_bake_layer12_mul_combine``) so census v2 classifies this op
+        # ``bake_mul_combine``) so census v2 classifies this op
         # as ``declarative`` rather than ``declarative_via_helper``.
-        rules = _layer12_mul_combine_rules(S)
+        rules = mul_combine_rules(S)
         rule_dim_positions = Primitives.dim_positions_from_bd(
             proxy, Primitives.ffn_rule_dim_names(rules),
         )
@@ -297,7 +297,7 @@ def make_layer12_mul_combine_op(alu_mode: str = "lookup") -> Operation:
         writes={"OUTPUT_HI_THIS_STEP"},
         kind="block",
         declarative_bake_fn=bake,
-        compiler_ir=_layer12_mul_combine_ir(),
+        compiler_ir=mul_combine_ir(),
         declarative_authority="spec_generated",
         # Phase 8.G.6: drop ``layer_idx=12`` literal; bind to the L12
         # ffn dep anchor so the block op resolves to whichever layer

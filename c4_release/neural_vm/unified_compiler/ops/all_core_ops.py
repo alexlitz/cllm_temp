@@ -426,8 +426,8 @@ def all_core_ops(
         # Phase 8.G.6: L12 ffn dep anchor — gives L12 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=12`` literals.
-        make_layer12_ffn_dep_anchor_op(),
-        make_layer12_mul_combine_op(alu_mode=alu_mode),
+        make_mul_combine_dep_anchor_op(),
+        make_mul_combine_op(alu_mode=alu_mode),
         # Phase 8.G.6: L13 attn dep anchor — gives L13 block ops a
         # stable ``target_op_name`` to bind to so they can drop
         # ``layer_idx=13`` literals.

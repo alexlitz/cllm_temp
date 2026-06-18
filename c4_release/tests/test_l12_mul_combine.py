@@ -46,7 +46,7 @@ from c4_release.neural_vm.unified_compiler.layer_compiler import LayerCompiler
 from c4_release.neural_vm.unified_compiler.migrated_ops import (
     all_core_ops,
     declare_setdim_compat_dims,
-    make_layer12_mul_combine_op,
+    make_mul_combine_op,
 )
 from c4_release.neural_vm.vm_step import _SetDim as BD
 
@@ -254,7 +254,7 @@ def test_l12_mul_combine_no_fire_when_gate_missing(
 @pytest.mark.xfail(
     reason=(
         "Drift surfaced by audit harness: "
-        "(1) make_layer12_mul_combine_op() no longer accepts alu_mode kwarg; "
+        "(1) make_mul_combine_op() no longer accepts alu_mode kwarg; "
         "(2) the op STILL declares consumes_fresh={..., 'MUL_ACCUM': "
         "'AX_byte0'} -- the prior STALENESS VIOLATION the test sentinel was "
         "written to pin against. It must be corrected to 'TEMP' since the "
@@ -278,7 +278,7 @@ def test_l12_mul_combine_op_consumes_temp_not_mul_accum():
     in the MUL path). This test pins the corrected declaration so a
     revert is caught at test time, not via the warning log.
     """
-    op = make_layer12_mul_combine_op(alu_mode="lookup")
+    op = make_mul_combine_op(alu_mode="lookup")
     assert "TEMP" in op.consumes_fresh, (
         f"L12 must consume_fresh TEMP@AX_byte0; got {op.consumes_fresh!r}"
     )
@@ -299,7 +299,7 @@ def test_l12_mul_combine_op_consumes_temp_not_mul_accum():
 
 @pytest.mark.xfail(
     reason=(
-        "make_layer12_mul_combine_op() no longer accepts alu_mode kwarg. "
+        "make_mul_combine_op() no longer accepts alu_mode kwarg. "
         "Additionally, the op declares writes={'OUTPUT_LO', 'OUTPUT_HI'} "
         "(both) at the Operation level even though produces={'OUTPUT_HI': "
         "'AX_byte0'} is single-sided. Until the factory signature is "
@@ -313,7 +313,7 @@ def test_l12_mul_combine_op_produces_output_hi_not_output_lo():
     nibble was already populated by L10's MUL units. The op's
     ``produces`` declaration MUST reflect that single-side write.
     """
-    op = make_layer12_mul_combine_op(alu_mode="lookup")
+    op = make_mul_combine_op(alu_mode="lookup")
     assert op.produces == {"OUTPUT_HI": "AX_byte0"}, (
         f"L12 produces drift: {op.produces!r} (expected {{OUTPUT_HI: AX_byte0}})"
     )

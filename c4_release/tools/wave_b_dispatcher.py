@@ -348,7 +348,7 @@ _CLUSTER_MANIFEST: Tuple[RuleSpec, ...] = (
     RuleSpec(
         cluster=4,
         factory_module="neural_vm.unified_compiler.ops.l12_ops",
-        factory_name="_layer12_mul_combine_rules",
+        factory_name="mul_combine_rules",
         relayed_dims=_L12_MUL_COMBINE_RELAYED,
         allow_step_end_writes_to=(
             "MUL_ACCUM_LO", "MUL_ACCUM_HI",
