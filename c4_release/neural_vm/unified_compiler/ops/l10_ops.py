@@ -197,64 +197,6 @@ def _psh_stack0_byte3_relay_darken_enabled() -> bool:
     """
     return os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
 
-
-def _output_selfreinforce_decouple_on() -> bool:
-    """DEFAULT-OFF umbrella flag for THE OUTPUT-band self-reinforcement
-    decoupling sweep (``C4_OUTPUT_SELFREINFORCE_DECOUPLE=1``).
-
-    Root (project_output_band_self_reinforcement_megaroot, triple-evidenced by
-    the var/expr/if-bool CPU lanes): ~4 STACK0/AX rule families each read the
-    ``OUTPUT_LO/HI`` value band INSIDE their silu gate AND re-write the same
-    OUTPUT byte at strength 2000-5000. A tiny leaked OUTPUT residue (e.g. an ALU
-    operand 0x23 projected onto an empty-stack STACK0 marker, or a transient
-    block-33 attention flood of ~+5400 onto the OUTPUT_HI band of a depth-2 MUL
-    AX row) is read by the silu gate, amplified, re-written, re-read by the next
-    family -> bootstraps to ~5e29 -> STACK0 byte-0 / AX byte-0 decodes the
-    leaked byte instead of the clean default -> the production fixed-35-token
-    slicer re-anchors wrong -> next-step PC misread (CROSS-STEP framing desync).
-    This single root gates the failure-map step-5 (expr ~30), step-7/10
-    (var ~115) and step-3 (if/bool ~14 + nested_quad ~25) bands.
-
-    The sweep makes EACH family's gate LOAD-BEARING on a STRUCTURAL signal
-    (NOT the OUTPUT value) and moves the OUTPUT value-match to the MULTIPLICATIVE
-    ``gate_terms`` so an off-frame / non-overflow row gives ``silu(up) ~= 0``
-    (inert), not a negative write (a negative multiplicative gate ALONE is
-    zero-sum -- it inverts the ``byte_value_writes`` competitor penalties and
-    re-selects the leaked byte; the structural silu-AND-gate is the load-bearing
-    part). The families:
-      #1 l16_stack0_e8_output_authoritative_* (l16_ops.py, 254 rules) -- already
-         decoupled by C4_L16_STACK0_E8_ADDR_GATE; this umbrella flag ALSO enables
-         it (see ``_stack0_e8_authoritative_addr_gate_on`` in l16_ops.py).
-      #2 tail_stack0_store_loaded_byte_* (this file, ``stack0_store_loaded_output_rules``,
-         255 rules in the width-sensitive L25 tail bank) -- silu reads
-         ``OUTPUT_LO+{lo}``/``OUTPUT_HI_THIS_STEP+{hi}`` at 1.0 with threshold 25
-         and NO structural address requirement; ANY OUTPUT residue >25 fires it
-         on a STACK0 row. FIX: promote ``ADDR_B0_HI+14`` (the e8-frame high
-         nibble: ~+8.9 at a genuine 0xffe8 frame, <=0 at every if/bool/empty
-         STACK0 row) to a HARD silu requirement and move the OUTPUT match to
-         ``gate_terms``. Rule COUNT stays 255 (repurpose in place; the bank is
-         width-sensitive, project_l10_tail_bank_width_sensitive).
-      #3 l16_stack0_e0_marker_from_alu_* (l16_ops.py e0 materializer) -- the
-         address requirement (``ADDR_B0_HI+14`` at 1.0) is too WEAK; it admits
-         empty/if-bool STACK0 rows and projects a tiny ALU operand residue.
-         FIX (in l16_ops.py): promote ``ADDR_B0_HI+14`` to a hard requirement.
-      #4 tail_shr_marker_byte0_01 (this file, the block-41 unit-1790 overflow
-         guard) -- silu reads ``OUTPUT_HI_THIS_STEP+0`` at 1.0 with threshold
-         5005; on a non-SHR step (OP_SHR==0) a +5400 OUTPUT_HI flood crosses
-         threshold ALONE (substituting for the missing OP_SHR structural gate)
-         and ``W_down[OUTPUT_LO+0]=-100`` crushes byte 0 -> stray 0x01 wins the
-         AX byte-0 dump on the depth-2 expr/var MUL AX row. FIX: drop the
-         positive ``OUTPUT_HI_THIS_STEP+0`` term from the silu conditions (so the
-         OUTPUT flood can no longer substitute for OP_SHR) and move it to
-         ``gate_terms`` as a multiplicative selector; OP_SHR (+1000, the only
-         large structural positive on a genuine SHR step) becomes load-bearing.
-
-    DEFAULT-OFF: with the flag unset every family takes its UNCHANGED
-    constant_write/silu branch so HEAD is byte-identical to golden
-    88b52dfa8c7c521b. The parent runs the authoritative GPU full_trace.
-    """
-    return os.environ.get("C4_OUTPUT_SELFREINFORCE_DECOUPLE", "0") == "1"
-
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -5885,56 +5827,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+3", -1_000_000_000.0),
             ("H1+4", -1_000_000_000.0),
         )
-        # OUTPUT-self-reinforcement decouple (family #2,
-        # C4_OUTPUT_SELFREINFORCE_DECOUPLE). DEFAULT-OFF path below is
-        # byte-identical (threshold 25, OUTPUT terms in the silu). Bug: the silu
-        # threshold is 25 with the OUTPUT match at weight 1.0 and base structural
-        # positives summing to only ~2.5 -- so ANY STACK0 row whose OUTPUT band
-        # carries the byte's nibbles at magnitude >=~22 fires the rule and
-        # reinforces that byte at strength 5000. On an if/bool comparison /
-        # var-non-frame STACK0 row the leaked AX operand floods OUTPUT to
-        # thousands, so the family makes the LEAK authoritative (0x23 -> the
-        # STACK0 byte-0 high-nibble framing drift). FIX (mirrors the l16 e8
-        # family #1 gate): promote ``ADDR_B0_HI+14`` (the 0xE_ high nibble of a
-        # genuine 0xffe8/0xffe0 frame: +8.7..+20.9 at a real var/func local
-        # frame, <=0 at every if/bool / var-non-frame STACK0 row -- CPU-verified
-        # var_simple/var_mul vs if_gt) to the LOAD-BEARING silu requirement
-        # (weight 1000, threshold +4000 so up>0 iff ADDR_B0_HI+14 > ~4) and move
-        # the OUTPUT byte-value match to the MULTIPLICATIVE gate_terms. Off-frame
-        # -> silu(up) ~= 0 -> inert -> the clean default survives. NOTE this
-        # makes the family fire ONLY on a genuine LOCAL FRAME load; heap stores
-        # (si_li at 0x200, ADDR_B0_HI+14<=0) are handled by the sibling
-        # stack0_store_top_* materializers, not this generic reinforcer.
-        if _output_selfreinforce_decouple_on():
-            rules = []
-            for lo in range(16):
-                for hi in range(16):
-                    if lo == 0 and hi == 0:
-                        continue
-                    value = lo | (hi << 4)
-                    rules.append(
-                        multi_way_and_rule(
-                            name=f"tail_stack0_store_loaded_byte_{value:02x}",
-                            scope="mark == STACK0",
-                            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                            conditions=base_conditions + (
-                                # e8/e0 frame high nibble promoted to a HARD silu
-                                # requirement; up>0 iff ADDR_B0_HI+14 > ~4.
-                                ("ADDR_B0_HI+14", 1000.0),
-                            ),
-                            threshold=4002.5,
-                            gate=gate_mark_stack0,
-                            # OUTPUT byte-value match becomes the multiplicative
-                            # selector (was a silu condition / the flood vector).
-                            gate_terms=(
-                                (f"OUTPUT_LO+{lo}", 1.0),
-                                (f"OUTPUT_HI_THIS_STEP+{hi}", 1.0),
-                            ),
-                            gate_bias=0.0,
-                            writes=byte_writes(value, strength=5000.0),
-                        )
-                    )
-            return tuple(rules)
         rules = []
         for lo in range(16):
             for hi in range(16):
@@ -8573,92 +8465,30 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         # SHR by 8 currently computes byte 0 as 0x06 at the AX marker. OP_SHR
         # is still visible at the marker, so correct the marker prediction
         # before byte generation proceeds.
-        #
-        # OUTPUT-self-reinforcement decouple (family #4, the block-41 unit-1790
-        # overflow guard; C4_OUTPUT_SELFREINFORCE_DECOUPLE). DEFAULT-OFF path
-        # below is byte-identical. Bug: the positive ``OUTPUT_HI_THIS_STEP+0``
-        # silu term (weight 1.0) was a near-binary tie-breaker calibrated for a
-        # one-hot OUTPUT (~1.0), but the block-33 attention floods OUTPUT_HI to
-        # ~+5400 on a depth-2 MUL AX row. With threshold 5005 that flood ALONE
-        # (OP_SHR==0 on a non-SHR step) crosses the silu gate -> the unit fires
-        # spuriously and ``W_down[OUTPUT_LO+0]=-100`` crushes byte 0 by ~-3.2M
-        # -> a stray 0x01 wins the AX byte-0 dump (expr/var step-5 framing
-        # desync). FIX: drop the positive ``OUTPUT_HI_THIS_STEP+0`` term from the
-        # silu conditions (so the OUTPUT flood can no longer substitute for the
-        # missing OP_SHR structural gate). It is NOT relocated to gate_terms --
-        # the gate multiplies the write strength, so a +5400 flood there would
-        # over-scale the genuine-SHR 0x01 write; dropping it and letting OP_SHR
-        # carry the gate is the byte-safe move. OP_SHR (+1000; resid +5.0 on a
-        # genuine SHR step, 0 elsewhere -- the ONLY large structural positive)
-        # becomes the load-bearing requirement. Threshold lowered by the term's
-        # genuine-SHR contribution (~2.5) so the real SHR-by-8 (test_shr_8bit
-        # 0x100>>8=1) still fires and emits 0x01; off-SHR rows stay deeply
-        # negative (inert) no matter how high the OUTPUT_HI band is flooded.
-        (
-            multi_way_and_rule(
-                name="tail_shr_marker_byte0_01",
-                scope="mark == AX",
-                dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
-                conditions=(
-                    ("MARK_AX", 1.0),
-                    ("MARK_PC", -10000.0),
-                    ("MARK_SP", -10000.0),
-                    ("MARK_BP", -10000.0),
-                    ("MARK_STACK0", -10000.0),
-                    ("MARK_MEM", -10000.0),
-                    ("IS_BYTE", -100.0),
-                    ("H1+1", 1.0),
-                    ("TEMP+7", 1.0),
-                    ("OP_SHR", 1000.0),
-                    ("OP_IMM", -100.0),
-                    ("OP_LEA", -1000000.0),
-                    # OUTPUT_HI_THIS_STEP+0 (the +1.0 flood vector) is REMOVED
-                    # from the silu entirely -- it cannot be relocated to
-                    # gate_terms without scaling the genuine-SHR write strength
-                    # (the gate multiplies the write), so the safe move is to
-                    # drop it and let OP_SHR carry the gate. The two NEGATIVE
-                    # OUTPUT terms stay (they can only suppress, never bootstrap
-                    # a spurious positive fire).
-                    ("OUTPUT_HI_THIS_STEP+2", -1.0),
-                    ("OUTPUT_LO+10", -1.0),
-                ),
-                # 5005 - 2.5 (the genuine-SHR OUTPUT_HI_THIS_STEP+0 contribution,
-                # resid ~+2.6 at the real SHR row, now absent from the silu sum).
-                # OP_SHR(+5000)+markers(+3) keeps the real SHR-by-8 firing;
-                # without OP_SHR (every non-SHR step) the silu sum is ~+3 <<
-                # threshold so the unit-1790 overflow guard stays inert no matter
-                # how high the OUTPUT_HI band is flooded. gate stays MARK_AX-only
-                # (unchanged) so the genuine-SHR write strength is byte-identical.
-                threshold=5002.5,
-                gate=gate_mark_ax,
-                writes=byte_writes(0x01),
-            )
-            if _output_selfreinforce_decouple_on()
-            else multi_way_and_rule(
-                name="tail_shr_marker_byte0_01",
-                scope="mark == AX",
-                dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
-                conditions=(
-                    ("MARK_AX", 1.0),
-                    ("MARK_PC", -10000.0),
-                    ("MARK_SP", -10000.0),
-                    ("MARK_BP", -10000.0),
-                    ("MARK_STACK0", -10000.0),
-                    ("MARK_MEM", -10000.0),
-                    ("IS_BYTE", -100.0),
-                    ("H1+1", 1.0),
-                    ("TEMP+7", 1.0),
-                    ("OP_SHR", 1000.0),
-                    ("OP_IMM", -100.0),
-                    ("OP_LEA", -1000000.0),
-                    ("OUTPUT_HI_THIS_STEP+0", 1.0),
-                    ("OUTPUT_HI_THIS_STEP+2", -1.0),
-                    ("OUTPUT_LO+10", -1.0),
-                ),
-                threshold=5005.0,
-                gate=gate_mark_ax,
-                writes=byte_writes(0x01),
-            )
+        multi_way_and_rule(
+            name="tail_shr_marker_byte0_01",
+            scope="mark == AX",
+            dominates_at={"OUTPUT_LO": "mark == AX", "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+                ("IS_BYTE", -100.0),
+                ("H1+1", 1.0),
+                ("TEMP+7", 1.0),
+                ("OP_SHR", 1000.0),
+                ("OP_IMM", -100.0),
+                ("OP_LEA", -1000000.0),
+                ("OUTPUT_HI_THIS_STEP+0", 1.0),
+                ("OUTPUT_HI_THIS_STEP+2", -1.0),
+                ("OUTPUT_LO+10", -1.0),
+            ),
+            threshold=5005.0,
+            gate=gate_mark_ax,
+            writes=byte_writes(0x01),
         ),
         multi_way_and_rule(
             name="tail_lea_local_ax_marker_byte0_e8",
