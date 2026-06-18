@@ -11,20 +11,37 @@ step emits 34 or 37 tokens instead of 35 and the fixed-35-token slice misreads
 the NEXT step's PC. Because those verdicts can only be reproduced by the REAL
 autoregressive decode, the gate currently DEFERS them to a GPU run.
 
-This module closes that gap on CPU. It runs the byte-identical
-:func:`~neural_vm.unified_compiler.faithful_interpreter.run_faithful_blocks`
-forward (validated max-argmax-diff = 0 vs the neural model) inside an
-autoregressive loop that reuses the PRODUCTION decode machinery of
+This module closes that gap on CPU. It runs the BIT-EXACT
+:class:`~neural_vm.unified_compiler.faithful_interpreter.ModelExactForward`
+forward (the REAL block ``nn.Module``s — i.e. ``model.forward`` over one row, so
+the residual + argmax are byte-identical to the neural model, not merely
+argmax-*close*) inside an autoregressive loop that reuses the PRODUCTION decode
+machinery of
 :class:`~neural_vm.batched_pure_neural.BatchedPureNeuralRunner` verbatim:
 the SAME argmax (``logits.argmax(-1)``, torch's first-max tie-break), the SAME
 fixed-35-token slice + ``_UNSAFE_OFFSETS``, the SAME ``_step_one`` /
 ``_dispatch_pure_neural`` STEP_END / HALT / early-EXIT handling, the SAME
 ``_ff_check_new_steps`` per-step ``(PC, AX)`` compare, and the SAME DraftVM
 oracle (``_oracle_pc_ax_steps``). The ONLY thing swapped is the source of the
-next-token argmax: the faithful CPU forward instead of the batched GPU model
-forward. NO re-anchoring — emitted tokens are fed back as the next step's input,
-so the 34/37-token miscount is reproduced exactly when the neural model would
-miscount.
+next-token argmax: the per-row CPU ``model.forward`` instead of the batched GPU
+model forward. NO re-anchoring — emitted tokens are fed back as the next step's
+input, so the 34/37-token miscount is reproduced exactly when the neural model
+would miscount.
+
+Why ``ModelExactForward`` and not the recovered-weight ``CachedFaithfulForward``
+--------------------------------------------------------------------------------
+The earlier implementation used ``CachedFaithfulForward`` — a recovered-weight
+REIMPLEMENTATION of the attention/FFN math (per-head spec loops + manual
+softmax1). That is argmax-*close* but NOT bit-exact: it accumulates in a
+different order than the real modules and (on CPU) runs a manual softmax1 where
+the model runs the SDPA softmax1 sink kernel, so at the documented
+SATURATED-TIE decode positions (~1e22 logits, true gap ~1e14-15) it collapsed
+the two top logits to an exact tie and torch's first-max tie-break picked the
+WRONG (lower-index) token — the ``expr_paren`` / ``expr_mul_div`` / ``mul``
+"0xF0-fill" full_trace FALSE-FAIL where the GPU and the real CPU
+``model.forward`` both PASS. ``ModelExactForward`` runs the real modules, so the
+CPU verdict matches ``model.forward`` (and thus the GPU gate at spec_k=0)
+bit-for-bit, including those saturated ties.
 
 Design: subclass, override one method
 --------------------------------------
@@ -41,8 +58,8 @@ Everything else (``run_batch_fail_fast`` -> ``_build_element`` ->
 ``_oracle_pc_ax_steps`` -> the per-step verdict, and ``run_batch`` -> the
 exit-code verdict) is the UNMODIFIED production code path. That is what makes
 the CPU verdict byte-identical to the neural verdict by construction: the only
-substitution is mathematically argmax-equivalent (proven by
-``faithful_interpreter_validate``).
+substitution (``ModelExactForward``) IS ``model.forward`` over one row, so the
+per-token argmax is bit-identical to the neural model.
 
 This module is TOOLING ONLY. It is never imported by ``compile_full_vm_dynamic``
 or any build path, so the model stays byte-identical (golden ``ce9bf9616f3379c4``
@@ -58,17 +75,31 @@ from typing import List, Optional, Sequence, Tuple
 
 import torch
 
-from .faithful_interpreter import CachedFaithfulForward
+from .faithful_interpreter import ModelExactForward
 
 
 def build_cpu_model(*, disk_cache: bool = True):
     """Build the real baked ``AutoregressiveVM`` on CPU (cached compile).
 
-    Identical to ``tools/faithful_interpreter_validate.build_model`` — the SAME
-    baked weights the smoke-gate / canonical runner uses, just pinned to CPU and
-    with the dim-integrity / gate checks skipped (they do not affect weights).
-    Returns ``(model, layout)``. ``layout.dim_positions`` is the BUILT layout —
-    use it (not the static registry) to resolve any residual dim.
+    The SAME baked weights the smoke-gate / canonical runner uses, pinned to CPU
+    and with the dim-integrity / gate checks skipped (they do not affect
+    weights). Returns ``(model, layout)``. ``layout.dim_positions`` is the BUILT
+    layout — use it (not the static registry) to resolve any residual dim.
+
+    ALU MODE — the load-bearing detail
+    ----------------------------------
+    The production decode runner (``tools/run_1096_canonical`` ->
+    ``BatchedPureNeuralRunner`` -> ``AutoregressiveVMRunner(trust_neural_alu=
+    True)``) compiles the model with ``alu_mode="efficient"`` (the real neural
+    ALU composites: ``FlattenedALUMul`` / ``FlattenedDivMod`` / etc.). The bare
+    ``compile_full_vm_dynamic()`` default is ``alu_mode="lookup"`` — a DIFFERENT
+    arithmetic model whose MUL/DIV blocks produce a different residual. On the
+    saturated-tie decode positions (``expr_mul_div`` / ``expr_paren`` / ``mul``,
+    ~1e22 logits) that residual difference flips the argmax to the "0xF0-fill"
+    AX, which is the full_trace FALSE-FAIL this tool exhibited (the GPU gate +
+    the real CPU ``model.forward`` both PASS). We therefore pin
+    ``alu_mode="efficient"`` and ``max_seq_len=4096`` here so the CPU verdict
+    builds the EXACT model the gate runs — bit-exact by construction.
     """
     os.environ.setdefault("C4_SKIP_DIM_INTEGRITY", "1")
     os.environ.setdefault("C4_SKIP_GATE_CHECK", "1")
@@ -77,7 +108,16 @@ def build_cpu_model(*, disk_cache: bool = True):
     from .full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     with contextlib.redirect_stdout(io.StringIO()):
-        model, layout = compile_full_vm_dynamic(disk_cache=disk_cache)
+        # Match the production decode runner's compile args exactly
+        # (BatchedPureNeuralRunner -> AutoregressiveVMRunner: trust_neural_alu=
+        # True => alu_mode="efficient", max_seq_len=4096). The remaining
+        # compile_full_vm_dynamic defaults (n_heads=8, ffn_hidden=4096) already
+        # match the runner's DEFAULT_N_HEADS / DEFAULT_FFN_HIDDEN.
+        model, layout = compile_full_vm_dynamic(
+            alu_mode="efficient",
+            max_seq_len=4096,
+            disk_cache=disk_cache,
+        )
     model = model.to("cpu")
     model.eval()
     return model, layout
@@ -193,10 +233,15 @@ def _make_faithful_subclass(base):
             self._spec_stats = {}
             self.faithful_forward_count = 0
             self._reset_spec_stats()
-            # The faithful CPU forward with the per-block recovery cached ONCE
-            # (recovery is tape-independent; caching it makes the per-token
-            # forward ~15x faster than re-recovering every call).
-            self._faithful = CachedFaithfulForward(model)
+            # The CPU per-token forward. ``ModelExactForward`` runs the REAL
+            # block ``nn.Module``s (``model.forward`` over one row), so the
+            # decode is BIT-EXACT to the neural model — including the
+            # saturated-tie argmax winners that a recovered-weight
+            # reimplementation (``CachedFaithfulForward``) collapses to a tie and
+            # mis-decodes (the ``expr_paren`` / ``expr_mul_div`` / ``mul``
+            # "0xF0-fill" full_trace false-fail). This is the closing gap to a
+            # GPU-bit-exact CPU verdict; see ``ModelExactForward``'s docstring.
+            self._faithful = ModelExactForward(model)
             # A serial-runner shim for ``_build_context`` (the prompt prefix
             # builder). Build one CPU runner lazily — it shares the SAME model.
             self._serial = _ContextShim(model)

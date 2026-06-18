@@ -45,7 +45,9 @@ for back-compat with the earlier validation runs.
 GPU-INDEPENDENCE, not speed: the full corpus on ~16 CPU workers is ~1-2h vs
 ~30min on a dedicated GPU. The point is to make the full_trace corpus loop run
 with NO GPU at all (the bake is ~15-40s one-time per worker; the per-token
-CachedFaithfulForward is ~1.7x ``model.forward``).
+forward is the real CPU ``model.forward`` over one row via
+``ModelExactForward`` — bit-exact to the neural model, including the saturated
+ties the old recovered-weight forward mis-decoded).
 
 Pass criterion (identical to ``run_1096_canonical.py --criterion full_trace``)
 ------------------------------------------------------------------------------
@@ -216,8 +218,8 @@ def _split_over_cap(
 # ---------------------------------------------------------------------------
 # Parallel CPU execution. Each worker process bakes the faithful runner ONCE
 # (the ~15-40s cold bake), then decodes its whole chunk. The bake is the only
-# cold cost; the per-program decode is the CachedFaithfulForward (~1.7x
-# model.forward, O(steps^2), no KV cache). We split the runnable programs into
+# cold cost; the per-program decode is the real per-row ``model.forward``
+# (ModelExactForward, O(steps^2), no KV cache). We split the runnable programs into
 # ``workers`` chunks and Pool-map ``_worker_run_chunk`` over them.
 # ---------------------------------------------------------------------------
 

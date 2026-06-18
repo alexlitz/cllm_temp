@@ -790,6 +790,83 @@ class CachedFaithfulForward:
 
 
 # ---------------------------------------------------------------------------
+# ModelExactForward — the BIT-EXACT autoregressive verdict forward.
+#
+# ``CachedFaithfulForward`` and ``IRBlockForward`` reproduce the model with a
+# RECOVERED-WEIGHT reimplementation (per-head spec loops + manual softmax1 + a
+# fresh SwiGLU matmul). That reimplementation is *mathematically* equivalent to
+# the deployed model, but it is NOT numerically bit-identical: it accumulates in
+# a different order than the real ``nn.Module`` forward, and on CPU the real
+# attention runs through ``F.scaled_dot_product_attention`` (the SDPA softmax1
+# sink-column kernel) whereas the recovered path runs a manual softmax1. Over 53
+# blocks those tiny per-op differences compound, and at the documented
+# SATURATED-TIE decode positions (~1e22 logits, the model's true gap is ~1e14-15
+# — well below fp32 resolution at that magnitude) the recovered forward collapses
+# the two top logits to an EXACT tie and torch's first-max tie-break then picks
+# the WRONG (lower-index) token. That is the ``expr_paren`` / ``expr_mul_div`` /
+# ``mul`` "0xF0-fill" full_trace FALSE-FAIL: the recovered forward, not the
+# model, is wrong (validated against an fp64 reference — fp64 ``model.forward``
+# agrees with fp32 ``model.forward``, both pick the higher-index winner the
+# recovered path drops).
+#
+# To make the CPU autoregressive verdict BIT-EXACT to ``model.forward`` (and thus
+# to the GPU gate at spec_k=0), the per-token forward must run the REAL block
+# ``nn.Module``s in the SAME order as ``AutoregressiveVM.forward`` — i.e. it IS
+# ``model.forward`` over one sequence, with NO recovery and NO reimplemented
+# numerics. ``model.forward`` over a single ``[1, S]`` row is exactly the
+# autoregressive decoder's per-row compute (causal + per-row positional → a row's
+# argmax is independent of batch-mates / padding), so this is the most direct,
+# least-surface bit-exact substitution. It is also the SAME accumulation order the
+# GPU gate uses, so the verdict matches the GPU at the saturated ties too.
+#
+# (Kept as a thin class with the ``forward(tape)`` signature so it is a drop-in
+# for ``CachedFaithfulForward`` in the autoregressive runner; the recovery-based
+# classes stay for the IR-ATTRIBUTION path, where per-rule attribution — not
+# bit-exactness — is the goal.)
+# ---------------------------------------------------------------------------
+
+
+class ModelExactForward:
+    """Per-token forward that runs the REAL block modules: bit-exact to model.forward.
+
+    Construct once from a baked model; call :meth:`forward(tape)` per
+    autoregressive step. Unlike :class:`CachedFaithfulForward` (which reimplements
+    the attention/FFN math from recovered weights and is therefore only argmax-
+    *close*), this runs ``model.embed`` -> every ``block(...)`` -> ``model.head``
+    verbatim, so it reproduces ``model.forward`` BIT-FOR-BIT — including the
+    saturated-tie argmax winners the recovered path collapses. This is the forward
+    the GPU-bit-exact CPU full_trace verdict needs.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.d_model = int(model.d_model)
+        self.device = next(model.parameters()).device
+
+    @torch.no_grad()
+    def forward(self, tape: Sequence[int], *, return_logits: bool = True) -> torch.Tensor:
+        """Return ``[S, vocab]`` logits (or ``[S, d_model]`` residual).
+
+        Runs the model's own ``embed -> blocks -> head`` on a single ``[1, S]``
+        row (no KV cache; ``x_is_new_only=False``) — the exact compute path of
+        ``AutoregressiveVM.forward``, so the result is byte-identical to
+        ``model.forward(torch.tensor([tape]))[0]``.
+        """
+        token_ids = torch.tensor([list(tape)], dtype=torch.long, device=self.device)
+        x = self.model.embed(token_ids)
+        for block in self.model.blocks:
+            x = block(x, kv_cache=None, x_is_new_only=False)
+        if not return_logits:
+            return x[0]
+        head = self.model.head
+        if head.weight.is_sparse:
+            from ..vm_step import sparse_linear
+
+            return sparse_linear(x, head.weight, head.bias)[0]
+        return head(x)[0]
+
+
+# ---------------------------------------------------------------------------
 # IRBlockForward — the DSL-interpreter verdict vehicle.
 #
 # Drives a :class:`FaithfulInterpreter` over a per-physical-block IR so the
@@ -935,6 +1012,7 @@ __all__ = [
     "op_is_ir_executable",
     "run_faithful_blocks",
     "CachedFaithfulForward",
+    "ModelExactForward",
     "IRBlockForward",
     "COMPOSITE_ALU_FFN",
     "step_token_positions",
