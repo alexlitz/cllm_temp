@@ -138,6 +138,45 @@ Run these BEFORE committing any new op or rule change:
 - `verify_claims_static` — `(layer, scope, identifier, column)` claims
   must match every observed weight write. See
   [`docs/DIM_OWNERSHIP_REGISTRY.md`](docs/DIM_OWNERSHIP_REGISTRY.md).
+- **`tools/cpu_full_trace.py --ids <list>` — MANDATORY CPU self-check for
+  any framing / full_trace fix.** It runs the byte-identical CPU
+  *autoregressive* decode (`FaithfulAutoregressiveRunner`) and reports the
+  SAME per-program pass/fail verdict as `tools/run_1096_canonical.py
+  --criterion full_trace`, on CPU, in ~85s/program, no GPU. **DO NOT** use
+  `interp_oracle_gate.py` / a re-anchored single forward to self-check a
+  framing fix: it decodes each step independently and CANNOT see the
+  production fixed-35-token-slice cumulative desync (the 34/37-token
+  miscount), so it OVER-CLAIMS PASS for the `var_*` / `func_identity` /
+  `nested_*` / `if_var` / `expr_*` framing-drift clusters the GPU fails (the
+  canonical `func_identity` "passes step 9" on CPU → 0/150 GPU false
+  positive). `cpu_full_trace` reproduces every framing FAIL byte-for-byte
+  (validated 6/6 vs GPU on current main, golden `b9d8861f` flag-OFF). The
+  only CPU-vs-GPU disagreements are the documented SATURATED-TIE handful
+  (`add` high-byte / `expr_paren` / `expr_mul_div`) where the MODEL itself is
+  fp-accumulation-order divergent (~1e22 logits, gap=0) — and there CPU is
+  conservatively STRICTER (FAILs a GPU-pass), never the dangerous direction
+  (it never PASSes a GPU-fail). `interp_oracle_gate.py` stays the tool for
+  RULE ATTRIBUTION (which FFN rule owns a wrong byte), NOT framing verdicts.
+  Tooling only (not on any build path → model byte-identical). Validation
+  table:
+  [`docs/CPU_FULL_TRACE_TRUTHFUL_2026_06_17.md`](docs/CPU_FULL_TRACE_TRUTHFUL_2026_06_17.md).
+- **`tools/lint_cross_op_attention.py` — MANDATORY for any op that
+  modifies a SHARED / pre-existing attention head.** `compare_symbolic_to_lowered_attn`
+  only checks one op in isolation (single query, hardmax), so it CANNOT
+  see that adding a Q/K/V/O slot to a shared head changes the GLOBAL
+  softmax output for OTHER ops/contexts served by that head — the exact
+  blind spot that let the byte-0 fix (`C4_OPERAND_GATHER_PSH_ROWSELECT`)
+  look like +8 when the full run was −39 (it broke `var_simple` +
+  `expr_mod` via the shared L7 operand-gather head's softmax1
+  normalization). This lint builds the model flag-OFF/flag-ON (CPU,
+  `disk_cache=False`), auto-detects modified shared heads, and asserts the
+  post-softmax head OUTPUT is unchanged at a battery of OTHER-op /
+  OTHER-context probe rows. It is the authoring-time counterpart to the
+  GPU tripwire (`tools/gpu_tripwire.py`). Run
+  `python tools/lint_cross_op_attention.py --flag C4_MY_FIX --expect <rows>`;
+  the `--demo` flag proves it discriminates byte-0 (flagged) from a clean
+  band/LM-head fix (passed). Design:
+  [`docs/CROSS_OP_ATTENTION_LINT_2026_06_17.md`](docs/CROSS_OP_ATTENTION_LINT_2026_06_17.md).
 
 ## Tests
 
