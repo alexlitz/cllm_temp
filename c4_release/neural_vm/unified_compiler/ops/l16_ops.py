@@ -9,7 +9,11 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
-from .shared import _as_setdim_proxy, operand_from_memsp_enabled
+from .shared import (
+    _as_setdim_proxy,
+    no_stack0_emit_enabled,
+    operand_from_memsp_enabled,
+)
 
 
 def _ent_sp_byte1_ismark_blocker_on() -> bool:
@@ -137,9 +141,35 @@ def _lev_stack0_preserve_se_blocker_on() -> bool:
 # The total here mirrors ``ffn_units_used=792`` on the op. Changing
 # the rule-list length in ``_layer16_lev_routing_rules`` requires
 # updating this table in lock-step.
+# STACK0-EMISSION-DROP campaign (Inc-3): when ``C4_NO_STACK0_EMIT=1`` the
+# rule bank grows by the 30-token-frame AX byte-1 sign-extension re-target
+# (``l16_memsp_lea_local_ax_byte1_ff_{lo,hi}_after_{e8,e0,d8}``): 3 frame-address
+# values × 2 bands (LO + HI) = 6 extra units. The L16 FFN width is hard-pinned
+# from this layout total AND ``Operation.ffn_units_used`` (the right-sizer
+# pre-sizes the PureFFN hidden_dim from it — there is NO append slack), so BOTH
+# must track the rule count. Flag-OFF the count is 827 (byte-identical golden).
+_L16_NO_STACK0_EMIT_EXTRA_UNITS = 6
+
+
+def _layer16_lev_routing_unit_total() -> int:
+    """Total L16 LEV-routing FFN units, flag-aware.
+
+    The rule bank is monolithic (one hidden unit per rule), so the FFN width
+    equals ``len(_layer16_lev_routing_rules)``. Under ``C4_NO_STACK0_EMIT=1`` the
+    Inc-3 30-token AX byte-1 re-target appends 6 rules; flag-OFF it is the
+    legacy 827 (byte-identical golden).
+    """
+    base = 827
+    if no_stack0_emit_enabled():
+        return base + _L16_NO_STACK0_EMIT_EXTRA_UNITS
+    return base
+
+
 _L16_FFN_UNIT_LAYOUT = (
     # (sub-stage name, legacy_start (docs only), n_units)
-    ("layer16_lev_routing", 0, 827),  # full LEV routing rule bank (+32 for AX_FULL siblings, 2026-06-09; +3 l16_ent_frame_sp_byte{1_ff,2_zero,3_zero}, 2026-06-11)
+    # n_units is resolved flag-aware in ``_allocate_layer16_units`` so the
+    # campaign-config rule-count growth pre-sizes the FFN correctly.
+    ("layer16_lev_routing", 0, None),  # full LEV routing rule bank (+32 for AX_FULL siblings, 2026-06-09; +3 l16_ent_frame_sp_byte{1_ff,2_zero,3_zero}, 2026-06-11; +6 Inc-3 30-tok AX byte-1 under C4_NO_STACK0_EMIT)
 )
 
 
@@ -158,6 +188,10 @@ def _allocate_layer16_units() -> FFNUnitAllocator:
     """
     allocator = FFNUnitAllocator()
     for name, _legacy_start, n_units in _L16_FFN_UNIT_LAYOUT:
+        if n_units is None:
+            # Single monolithic LEV-routing range; size flag-aware so the
+            # campaign-config rule growth lands without overflowing the FFN.
+            n_units = _layer16_lev_routing_unit_total()
         allocator.alloc(name, n_units)
     return allocator
 
@@ -2221,6 +2255,117 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ),
     ))
 
+    # STACK0-EMISSION-DROP campaign (Inc-3, the framing recovery). In the 30-token
+    # layout (C4_NO_STACK0_EMIT=1) the step is 5 tokens shorter, so the L7 head-7
+    # LEA relay (``CMP+7``) -- which keys the byte-1=0xff sign-extension rule above
+    # -- no longer reaches the AX byte rows: spec_k=0 GPU residual probe
+    # (tools/probe_inc3_blockscan.py / probe_cmp7.py, var_simple_0 id 250) shows
+    # CMP+7 == 1.0 at the AX byte-1 predictor row in the 35-tok frame but EXACTLY
+    # 0.0 on EVERY step of the 30-tok frame. The other gate signals (HAS_SE / H1+1
+    # / IS_BYTE / BYTE_INDEX_0) are intact, so the rule's score drops from ~5.0 to
+    # ~4.0 (< 4.5 threshold) and the LEA-local frame address (e.g. var x=990 ->
+    # AX=0xffe8) emits byte-1=0x00 instead of 0xff: the dominant ~90 AX_wrong
+    # framing fail (0xffe8 -> 0x00e8). The byte-1 RECOVERS one step later (the
+    # carried-AX H1_PREV/dump path works), confirming only the FRESH-LEA emitter
+    # is broken by the relay loss.
+    #
+    # FIX (flag-gated on C4_NO_STACK0_EMIT, byte-identical flag-OFF -> the legacy
+    # CMP+7-gated rule above is the sole owner when the flag is off): re-key the
+    # discriminator on the LEA-local frame-address byte-0 value (0xe8 / 0xe0 /
+    # 0xd8 = BP-8 / BP-16 / BP-24), which IS present in the 30-tok frame
+    # (CLEAN_EMBED_LO/HI on the byte-1 predictor row carry the just-emitted
+    # byte-0). This mirrors the l10 sibling tail_ax_lea_local_addr_byte1_ff_after_
+    # {e8,e0,d8} which already keys on this exact CLEAN_EMBED signature. The
+    # EXACT non-target nibble blockers (-100 on every CLEAN_EMBED nibble != the
+    # target) keep it off non-frame-address AX byte rows (e.g. step-4 STORE
+    # result 0xde, which differs in both nibbles -> below threshold).
+    if no_stack0_emit_enabled():
+        for value in (0xE8, 0xE0, 0xD8):
+            lo = value & 0xF
+            hi = value >> 4
+            # BLOCKER-MAGNITUDE FIX (Inc-3, GPU-residual-probed
+            # tools/probe_inc3_axb1_rowsig.py): on the 30-tok AX[0] byte-1
+            # predictor row the gate dims are clean (CLEAN_EMBED_LO+8 /
+            # CLEAN_EMBED_HI+14 / H1+1 / IS_BYTE = 1.0, BYTE_INDEX_0 = 0.97)
+            # EXCEPT a tiny BYTE_INDEX_1 = +0.0133 residual leak. With the
+            # -1000 byte-index blocker that 0.0133 leak alone subtracted 13.3
+            # from the score (95 positive -> 81.5 < 85), so the re-target
+            # SILENTLY did not fire and AX byte-1 stayed 0x00 (the bug). The
+            # MARK / CLEAN_EMBED blockers do NOT leak here (all 0) and are the
+            # real value/row discriminators, so they keep their strong weight.
+            # The byte-index / H1 / MEM_VAL blockers are sized at -50: still
+            # decisively excludes a genuine byte-1/2/3 row (dim ~ 1.0 -> -50,
+            # vs a ~94 positive base) and an MEM value-byte row, but the 0.013
+            # AX[0] leak now only costs 0.65. Full-row sweep (every step/off,
+            # blockers=-50): the three frame-address AX[0] rows (step 2/3/6,
+            # the FRESH-LEA + carried-AX byte-1 rows where 0xff is the correct
+            # high byte) all score ~94.2; the next non-AX[0] row (SP[0] / MEM
+            # value) tops out at ~44, so threshold 85 fires the 0xff exactly on
+            # the right rows with a >50-pt margin.
+            memsp_lea_ax_byte1_conditions = (
+                ("HAS_SE", 5.0),
+                ("H1+1", 20.0),
+                ("H1+0", -50.0),
+                ("H1+2", -50.0),
+                ("H1+3", -50.0),
+                ("IS_BYTE", 5.0),
+                ("BYTE_INDEX_0", 5.0),
+                ("BYTE_INDEX_1", -50.0),
+                ("BYTE_INDEX_2", -50.0),
+                ("BYTE_INDEX_3", -50.0),
+                (f"CLEAN_EMBED_LO+{lo}", 30.0),
+                (f"CLEAN_EMBED_HI+{hi}", 30.0),
+                *(
+                    (f"CLEAN_EMBED_LO+{k}", -100.0)
+                    for k in range(16)
+                    if k != lo
+                ),
+                *(
+                    (f"CLEAN_EMBED_HI+{k}", -100.0)
+                    for k in range(16)
+                    if k != hi
+                ),
+                # MEM value-byte rows carry the same byte-0 shape on a store of a
+                # frame address; keep this AX-only (the genuine AX byte-1 row has
+                # MEM_VAL_B* == 0).
+                ("MEM_VAL_B0", -50.0),
+                ("MEM_VAL_B1", -50.0),
+                ("MEM_VAL_B2", -50.0),
+                ("MEM_VAL_B3", -50.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_AX", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+            )
+            rules.append(multi_way_and_rule(
+                name=f"l16_memsp_lea_local_ax_byte1_ff_lo_after_{value:02x}",
+                conditions=memsp_lea_ax_byte1_conditions,
+                threshold=85.0,
+                writes=tuple(
+                    (
+                        f"OUTPUT_LO+{k}",
+                        lea_ax_byte1_ff_strength if k == 15
+                        else -lea_ax_byte1_ff_strength,
+                    )
+                    for k in range(16)
+                ),
+            ))
+            rules.append(multi_way_and_rule(
+                name=f"l16_memsp_lea_local_ax_byte1_ff_hi_after_{value:02x}",
+                conditions=memsp_lea_ax_byte1_conditions,
+                threshold=85.0,
+                writes=tuple(
+                    (
+                        f"OUTPUT_HI_THIS_STEP+{k}",
+                        lea_ax_byte1_ff_strength if k == 15
+                        else -lea_ax_byte1_ff_strength,
+                    )
+                    for k in range(16)
+                ),
+            ))
+
     # LEA BP-8 materializes AX byte 0 as 0xe8 at the AX marker. Earlier ALU
     # layers compute the low nibble strongly, but the high-nibble lanes can
     # tie at residual scale and let 0x08 win by a few thousandths.  Nudge only
@@ -2458,7 +2603,10 @@ def make_layer16_lev_routing_op() -> Operation:
         # (l16_lev_stack0_byte0_preserve_lo/hi_{k}) that keep the just-popped
         # stack-top byte stable through LEV (fixes step6:STACK0_byte0 50-row
         # cluster from the same triage).
-        ffn_units_used=827,
+        # Flag-aware: +6 under C4_NO_STACK0_EMIT (Inc-3 30-tok AX byte-1
+        # re-target). The right-sizer pre-sizes the PureFFN hidden_dim from
+        # this, so it MUST match the actual rule count or the bake overflows.
+        ffn_units_used=_layer16_lev_routing_unit_total(),
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
     )
