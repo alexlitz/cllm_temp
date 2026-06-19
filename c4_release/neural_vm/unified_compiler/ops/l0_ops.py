@@ -571,10 +571,22 @@ def make_layer0_threshold_attn_op() -> Operation:
 # (byte-identical to HEAD).
 _NO_STACK0_SE_OUTPUT_CLEAR_HIDDEN_DIM = 32  # OUTPUT_LO[0..15] + OUTPUT_HI[0..15]
 # Per-nibble negative write weight. The post-tail PureFFN's balanced-AND silu
-# saturates large (S=100) on a MARK_SE_ONLY fire; ``-1e16`` per nibble lands an
-# OUTPUT delta far below -(the +5e16 garbage), making every byte logit
-# ((OUTPUT_*+nibble)*5) hugely negative so REG_PC (NEXT_PC*20) wins the argmax.
-_NO_STACK0_SE_OUTPUT_CLEAR_WW = -1.0e16
+# saturates large (S=100) on a MARK_SE_ONLY fire; this lands an OUTPUT delta far
+# below -(the garbage), making every byte logit ((OUTPUT_*+nibble)*5) hugely
+# negative so REG_PC (NEXT_PC*20) wins the argmax at the STEP_END row.
+#
+# Inc 3 (if_gt step-4 branch, corruptor A — the leading stray ``0x02``): the GT
+# comparison step's STEP_END row leaves a HUGE positive OUTPUT (~+3.7e18, ~100x
+# bigger than the ~5e16 the original ``-1e16`` sink was tuned for — the L25 tail
+# explodes ``OUTPUT_LO+1`` to +4.2e18 on the branch-taken comparison), so the old
+# ``-1e16`` only knocks it to +3.7e18 and the STEP_END row still emits a stray
+# byte (``0x02``) instead of yielding to the next step's REG_PC marker, shifting
+# the whole next step's frame by one token. ``-1e20`` dominates the +3.7e18
+# explosion, restoring the clean STEP_END -> next-REG_PC transition. The sink is
+# only applied on the bounded ``MARK_SE_ONLY`` STEP_END one-hot (OUTPUT there is
+# semantically dead — only the next REG_PC is emitted), so the larger magnitude
+# is free. Gated by ``C4_NO_STACK0_EMIT`` (flag-OFF bakes NO units).
+_NO_STACK0_SE_OUTPUT_CLEAR_WW = -1.0e20
 
 
 def _no_stack0_se_output_clear_rules() -> tuple[FFNRule, ...]:
@@ -866,9 +878,26 @@ def _no_stack0_pc_highbyte_clear_rules() -> tuple[FFNRule, ...]:
     # genuine PC low nibble is never 1 (PCs 0x0a/0x12/0x1a/0x22), so sinking
     # nibble-1 is exact; a PC genuinely ending in nibble-1 (e.g. a 0x11 branch
     # target) is out of the Inc-0 scope and deferred.
+    #
+    # Inc 3 (if_gt step-4 branch target, corruptor B): the BZ/BNZ branch step's
+    # PC-marker row carries a GENUINE branch-target byte-0 whose LOW nibble is
+    # NOT 1 (e.g. 0x3a -> low nibble 0xa). Worse, sinking ``OUTPUT_LO+1`` to a
+    # large NEGATIVE here is SELF-DEFEATING: the L26 tail-amplify block
+    # (``OP_BZ``-gated) MAGNIFIES the -15000 sink into a large POSITIVE
+    # ``OUTPUT_LO+1 = +6685`` leak (a silu/amplify nonlinearity), which makes the
+    # spurious byte ``0x?1`` (0x31) out-vote the real branch target (0x3a). So on
+    # the BRANCH step (``OP_BZ``/``OP_BNZ`` active, ~+5 at the marker row, ~0 on
+    # every add/sub PC row) the lo1_sink must NOT fire: leave ``OUTPUT_LO+1 = 0``
+    # so the L26 amplify produces the genuine low nibble (0xa) and ``0x3a`` wins.
+    # ``OP_BZ``/``OP_BNZ`` are 0.00 at every add/sub MARK_PC row (probe-verified),
+    # so the -BLOCKER_W guards are inert for the Inc-0 add/sub acceptance set.
     rules.append(multi_way_and_rule(
         name="no_stack0_pc_clear_byte0_marker_lo1_sink",
-        conditions=(("MARK_PC", 1.0),),
+        conditions=(
+            ("MARK_PC", 1.0),
+            ("OP_BZ", -BLOCKER_W),
+            ("OP_BNZ", -BLOCKER_W),
+        ),
         threshold=0.5,
         writes=(("OUTPUT_LO+1", WW),),
     ))
@@ -877,7 +906,7 @@ def _no_stack0_pc_highbyte_clear_rules() -> tuple[FFNRule, ...]:
 
 
 # 3 byte rows x (LO 1..15 sink + HI 1..15 sink + LO+0 restore + HI+0 restore)
-# + 1 marker-row rule (LO+1 sink only)
+# + 1 PC marker-row rule (LO+1 sink only)
 _NO_STACK0_PC_CLEAR_HIDDEN_DIM = 3 * (15 + 15 + 1 + 1) + 1
 
 
@@ -957,6 +986,8 @@ def make_no_stack0_pc_highbyte_clear_op() -> Operation:
         reads={
             "H1", "IS_BYTE", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
             "MARK_PC",
+            # Inc 3 corruptor-B gate: BZ/BNZ branch-step detect for the lo1_sink.
+            "OP_BZ", "OP_BNZ",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
