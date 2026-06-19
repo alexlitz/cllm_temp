@@ -206,7 +206,12 @@ from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .residual_band_registry import register_residual_band
-from .shared import _as_setdim_proxy, mul_stack0_byte39_guard_enabled
+from .shared import (
+    _as_setdim_proxy,
+    mul_stack0_byte39_guard_enabled,
+    no_stack0_emit_enabled,
+    operand_from_memsp_enabled,
+)
 
 
 # Non-first-PSH SP byte-0 fix scratch band (flag-gated; default ON via
@@ -2198,6 +2203,63 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
         AP(81, BD.BYTE_INDEX_1, STORE_AX_BYTE1_SELECT),
         AP(81, BD.OP_IMM, STORE_AX_BYTE1_SELECT),
     )
+
+    # === STACK0-campaign (Inc-3 ROOT A): re-deliver the LI-reload AX byte-1 ===
+    # In the 30-tok campaign frame (``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``)
+    # the per-step opcode markers (OP_SI/OP_LI/OP_LI_RELAY) DROP off the AX-byte
+    # PREDICTOR rows (they survive only on the AX_marker row), so the existing
+    # ``store_ax_byte1`` slot 81 -- gated on OP_SI -- goes dead at the step5
+    # ``return x`` byte-1 predictor row. The head then defaults to the step's
+    # PC-marker row (the only row that still carries the broadcast MEM_STORE) whose
+    # CLEAN_EMBED=0 -> AX byte-1 emits 0x00 (e.g. x=990=0x03DE -> 0x00DE). The byte-1
+    # VALUE (0x03) is fully present and stride-stable: it lives on the PRIOR step's
+    # AX byte-1 register row (the IMM/SI source step), which carries
+    # IS_BYTE + H1+AX + BYTE_INDEX_1 + OP_IMM and NO MEM_STORE. This flag-gated
+    # companion (slot 82, never the legacy path off-flag) re-selects that row using
+    # ONLY signals confirmed present on the campaign predictor row (H1+AX, IS_BYTE,
+    # BYTE_INDEX_0) -> the existing CLEAN_EMBED->OUTPUT value path copies 0x03.
+    # ALiBi slope 1.0 (set in ``_bake_layer10_byte_passthrough_head``) breaks ties
+    # toward the most-recent matching AX byte-1 row (the immediately-prior step).
+    # Byte-identical OFF: the slot is omitted unless both campaign flags are set.
+    MEMAX_B1_SELECT = 20.0 * S
+    memax_byte1_query = ()
+    memax_byte1_key = ()
+    # ``C4_INC3_MEMAX_B1_OFF=1`` is an A/B kill-switch (campaign-config regression
+    # differential only); it leaves the flag-OFF golden untouched either way.
+    _memax_b1_on = (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_INC3_MEMAX_B1_OFF", "0") == "0"
+    )
+    if _memax_b1_on:
+        memax_byte1_query = (
+            # Fire on the AX[0] byte row (the byte-1 PREDICTOR) of the current step.
+            AP(82, BD.IS_BYTE, MEMAX_B1_SELECT),
+            AP(82, BD.H1 + AX_IDX, MEMAX_B1_SELECT),
+            AP(82, BD.BYTE_INDEX_0, MEMAX_B1_SELECT),
+            # Suppress on non-AX-byte-0 predictor rows / the originating IMM step
+            # (OP_IMM is present on the IMM step's own byte rows; the LI-reload
+            # predictor has OP_IMM=0, so this veto keeps the slot LI-step-only).
+            AP(82, BD.MARK_AX, -5.0 * MEMAX_B1_SELECT),
+            AP(82, BD.H1 + PC_IDX, -5.0 * MEMAX_B1_SELECT),
+            AP(82, BD.H1 + SP_IDX, -5.0 * MEMAX_B1_SELECT),
+            AP(82, BD.H1 + BP_IDX, -5.0 * MEMAX_B1_SELECT),
+            AP(82, BD.MEM_STORE, -5.0 * MEMAX_B1_SELECT),
+            AP(82, BD.OP_IMM, -5.0 * MEMAX_B1_SELECT),
+            AP(82, BD.BYTE_INDEX_1, -10.0 * MEMAX_B1_SELECT),
+            AP(82, BD.BYTE_INDEX_2, -10.0 * MEMAX_B1_SELECT),
+            AP(82, BD.BYTE_INDEX_3, -10.0 * MEMAX_B1_SELECT),
+        )
+        memax_byte1_key = (
+            # Select the prior step's AX byte-1 register row (CLEAN_EMBED carries
+            # the byte-1 value); hard MEM_STORE veto excludes the PC-marker leak row.
+            AP(82, BD.IS_BYTE, MEMAX_B1_SELECT),
+            AP(82, BD.H1 + AX_IDX, MEMAX_B1_SELECT),
+            AP(82, BD.BYTE_INDEX_1, MEMAX_B1_SELECT),
+            AP(82, BD.OP_IMM, MEMAX_B1_SELECT),
+            AP(82, BD.MEM_STORE, -10.0 * MEMAX_B1_SELECT),
+        )
+
     return replace(
         spec,
         q=(
@@ -2213,6 +2275,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             + byte2_store_query
             + marker_addr_source_query
             + store_ax_byte1_query
+            + memax_byte1_query
         ),
         k=spec.k + (
             AP(39, BD.MEM_VAL_B0, VALUE_SELECT),
@@ -2231,7 +2294,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(47, BD.MEM_STORE, STORE_SELECT),
             AP(47, BD.MEM_ADDR_SRC, 1.0),
             AP(48, BD.MEM_ADDR_SRC, 1.0),
-        ) + store_ax_byte1_key,
+        ) + store_ax_byte1_key + memax_byte1_key,
     )
 
 
