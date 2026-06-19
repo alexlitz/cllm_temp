@@ -120,6 +120,61 @@ def _lev_stack0_preserve_se_blocker_on() -> bool:
     return os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
 
 
+def _stack0_marker_isbyte_hardening_on() -> bool:
+    """Inc-3 ROOT B (campaign config): harden the ``IS_BYTE`` up-path blocker of
+    the ``l16_stack0_{e8,e0,f8}_marker_from_alu_*`` ALU->OUTPUT materializers so
+    their ``silu(up)`` is INERT on every ``IS_BYTE`` row, regardless of the
+    ADDR_B0_LO+8 broadcast magnitude.
+
+    Default tracks ``no_stack0_emit_enabled()``: ON in the 30-token campaign
+    config, OFF (byte-identical golden) otherwise. Force with
+    ``C4_STACK0_MARKER_ISBYTE_HARDEN=0/1``.
+
+    Root (GPU-residual-attributed, tools/probe_inc3_bp_explosion_trace.py +
+    probe_inc3_bp_blk34_units.py + probe_inc3_unit236.py, var_simple ``return x``):
+    in the 30-token frame the BP byte-1 emission collapses INSIDE step 6 at the
+    BP[0]-predictor row. That row is an ``IS_BYTE`` row but the e8 marker
+    materializer's ``silu(up)`` path STILL FIRES (+25.85) because the e8-frame
+    address signature ``ADDR_B0_LO+8`` broadcasts to ~+1.945 there (golden ~+0.13)
+    and overpowers the ``IS_BYTE * -10`` up-blocker (calibrated for a one-hot
+    ADDR_B0_LO+8~1.0). The materializer's ``gate_terms = (IS_BYTE, -1e6)`` then
+    multiply the FIRING ``silu`` by ``-1e6`` -> OUTPUT_LO/HI+15 = -1.29e7 at blk34
+    (L20), which the L25 tail bank amplifies to -6.5e13 -> the ``l16_bp_frame_byte1_ff``
+    +0.5 0xff emitter is swamped -> BP byte-1 decodes the HALT token (2) -> the
+    whole step floods -> got_pc/got_ax = None at step 7 (the dominant 55-fail
+    step-7 band). The gate_terms design ASSUMES the silu is ~0 on IS_BYTE rows
+    ("byte-identical: -1e6 * 0 == 0 at intended firing positions"); the 30-token
+    frame breaks that assumption by raising the silu. The fix restores the
+    invariant by hardening the up-side ``IS_BYTE`` blocker to a hard NOT-blocker
+    (-1e6), so ``silu(up)`` is ~0 on any IS_BYTE row and ``gate_terms`` can no
+    longer multiply a nonzero silu. At the GENUINE STACK0-marker firing positions
+    IS_BYTE == 0 by VM construction, so ``-1e6 * 0 == 0`` -> byte-identical.
+    """
+    forced = os.environ.get("C4_STACK0_MARKER_ISBYTE_HARDEN")
+    if forced is not None:
+        return forced != "0"
+    return no_stack0_emit_enabled()
+
+
+def _harden_isbyte_blocker(conditions):
+    """Return ``conditions`` with the ``IS_BYTE`` up-path blocker promoted to a
+    hard NOT-blocker (-1e6) when the Inc-3 ROOT-B hardening is active.
+
+    Only the ``IS_BYTE`` entry is rewritten; every other condition (markers,
+    address nibbles, opcode blockers, MEM_STORE) is preserved verbatim. At the
+    intended firing positions IS_BYTE == 0, so the math is byte-identical when
+    the rule legitimately fires; the harden only removes the broadcast-driven
+    spurious fire on IS_BYTE rows. No-op (returns the input tuple) when the
+    hardening is off, so the golden build is bit-for-bit unchanged.
+    """
+    if not _stack0_marker_isbyte_hardening_on():
+        return conditions
+    return tuple(
+        (name, -1e6) if name == "IS_BYTE" else (name, weight)
+        for name, weight in conditions
+    )
+
+
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer16_lev_routing`` op currently owns the entire L16 FFN. Its
@@ -802,7 +857,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _add_stack0_x0_alu_materializer(
         rules,
         family="e8",
-        conditions=stack0_e8_marker_conditions,
+        conditions=_harden_isbyte_blocker(stack0_e8_marker_conditions),
         threshold=stack0_e8_marker_threshold,
         S=S,
     )
@@ -891,7 +946,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _add_stack0_x0_alu_materializer(
         rules,
         family="e0",
-        conditions=stack0_e0_marker_conditions,
+        conditions=_harden_isbyte_blocker(stack0_e0_marker_conditions),
         threshold=stack0_e0_marker_threshold,
         S=S,
     )
@@ -926,7 +981,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _add_stack0_x0_alu_materializer(
         rules,
         family="f8",
-        conditions=stack0_f8_marker_conditions,
+        conditions=_harden_isbyte_blocker(stack0_f8_marker_conditions),
         threshold=3.5,
         S=S,
     )
