@@ -2582,6 +2582,40 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_q[base, BD.MARK_MEM] = -2000.0
         attn.W_q[base, BD.MARK_STACK0] = -2000.0
         attn.W_k[base, BD.CONST] = 10.0
+        # === Inc-3 (2026-06-19): kill the negative×negative cross-step
+        # spurious attractor on the LI/PSH step (nested_quad, var, expr).
+        #
+        # GPU diagnosis (tools/probe_inc3_li_l8_perhead.py, campaign config,
+        # spec_k=0): on a NON-firing step (e.g.
+        # nested_quad step3 where the AX marker carries OP_PSH, head 5 is
+        # gated OFF by the OP_PSH/OP_LI/OP_IMM Q-blockers), head 5's dim-0
+        # K column carries a LATENT cross-op collision — a stale
+        # ``MARK_AX=+30`` / ``OP_IMM=-30`` write from another L8 attn op
+        # baked into the SAME physical column (head_idx 5 * HD). At a
+        # PREVIOUS step's IMM AX-marker that K dim-0 evaluates to
+        #   K[0] = MARK_AX*30 + CONST*10 + OP_IMM*(-30) = 30 + 10 - 150 = -110
+        # and the suppressed query (off=AX[0], MARK_AX=0) gives
+        #   Q[0] = CONST*(-2000) = -1985.
+        # The product (-1985)*(-110) = +218,350 — a HUGE positive — pins
+        # head 5's softmax onto that prior IMM AX-marker, and its V/O copies
+        # the marker's CLEAN_EMBED garbage into ALU (0x0A -> 0xAA = 170),
+        # corrupting the upstream-delivered LI byte-0. (35-tok golden does
+        # not hit this: the IMM opcode flag does not sit on the prior AX
+        # marker at the same cross-step distance, so the K dim-0 stays
+        # non-negative and head 5's max score is ~449 instead of 218k.)
+        #
+        # FIX: explicitly clear head 5's dim-0 K column to its INTENDED
+        # content (CONST=10 only). The colliding MARK_AX/OP_IMM writes are
+        # not part of head 5's design (its row-select / store-gate lives on
+        # dims 1-4); zeroing them makes K[0] >= 0 everywhere, so a
+        # suppressed (negative) query can never produce a positive product.
+        # head 5 bakes at phase 8.45, after the colliding 8.0-8.4 ops, so
+        # this clear is order-safe; it is also a no-op flag-OFF (head 5 only
+        # exists under enable=True/operand_from_memsp). Forceable kill-switch
+        # C4_INC3_H5_DIM0_CLEAN=0 for an A/B differential.
+        if _os_l8.environ.get("C4_INC3_H5_DIM0_CLEAN", "1") != "0":
+            attn.W_k[base, BD.MARK_AX] = 0.0
+            attn.W_k[base, BD.OP_IMM] = 0.0
         # === Dim 28: K-side AX marker exclusion (self-attention guard) ===
         # The L4 SP gather writes scale-10 ADDR_KEY content at the AX
         # marker. At head 5's firing Q position (AX marker), the address
