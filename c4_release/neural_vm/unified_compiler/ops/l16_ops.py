@@ -175,6 +175,72 @@ def _harden_isbyte_blocker(conditions):
     )
 
 
+def _stack0_marker_axmark_hardening_on() -> bool:
+    """Inc-3 ROOT A (campaign config, the ~140-program shared lever): harden the
+    register-marker (``MARK_PC/AX/SP/BP``) up-path blockers of the
+    ``l16_stack0_{e8,e0,f8}_marker_from_alu_*`` ALU->OUTPUT materializers so their
+    ``silu(up)`` is INERT on every register-MARKER row, regardless of the
+    ADDR_B0_LO+0 broadcast magnitude.
+
+    Default tracks ``no_stack0_emit_enabled()``: ON in the 30-token campaign
+    config, OFF (byte-identical golden) otherwise. Force with
+    ``C4_STACK0_MARKER_AXMARK_HARDEN=0/1``.
+
+    Root (GPU-residual-attributed, tools/probe_inc3_ifgt_axcrush.py +
+    probe_inc3_ifgt_axunit.py + probe_inc3_ifgt_e0gate.py, if_gt ``35 > 43``):
+    at the BRANCH step (BZ, AX==0 / branch-not-taken), the AX-marker row (off=5,
+    the predictor of the AX value-byte 0x00) gets OUTPUT_LO+0 / OUTPUT_HI+0
+    slammed to ~-4300 at blk34 (L20) by unit 254 =
+    ``l16_stack0_e0_marker_from_alu_lo_0``. That row is a register-MARKER row
+    (MARK_AX==1, MARK_STACK0==0) but the e0 materializer's ``silu(up)`` path STILL
+    FIRES because in the 30-token frame ``ADDR_B0_LO+0`` broadcasts to ~+2.29
+    there (×10 weight = +22.9), overpowering the ``MARK_AX * -10`` up-blocker
+    (calibrated for a one-hot ADDR_B0_LO+0~1.0 at a genuine STACK0 marker). The
+    materializer's gate dim ``ALU_LO+0`` carries a NEGATIVE residue (-45) on that
+    row, so ``silu(up=+191) * gate(-45) = -8608`` -> ``W_down*0.5 = -4304`` crushes
+    OUTPUT_LO/HI+0 -> the AX value-byte 0x00 (LM-head logit -42995) loses to a
+    stray REG_PC marker (-10) -> the branch step over-emits -> got_ax garbage,
+    blocking the if_gt verdict (and the var step-9/10/11 / if-bool 0xff-leak band,
+    same crush family). The -10 register-marker blockers ASSUME the ADDR_B0_LO+0
+    broadcast is ~one-hot; the 30-token frame breaks that. The fix restores the
+    invariant by hardening the up-side ``MARK_PC/AX/SP/BP`` blockers to hard
+    NOT-blockers (-1e6), so ``silu(up)`` is ~0 on any register-marker row and the
+    materializer no longer crushes the AX value-byte. At the GENUINE STACK0-marker
+    firing positions MARK_PC/AX/SP/BP == 0 by VM construction (the materializer
+    fires only at MARK_STACK0 rows), so ``-1e6 * 0 == 0`` -> byte-identical, and
+    the load-bearing si/li/sc/lc memory smoke (which fire the materializer at real
+    STACK0 marker rows) is unchanged.
+    """
+    forced = os.environ.get("C4_STACK0_MARKER_AXMARK_HARDEN")
+    if forced is not None:
+        return forced != "0"
+    return no_stack0_emit_enabled()
+
+
+_STACK0_MARKER_REG_BLOCKERS = ("MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP")
+
+
+def _harden_axmark_blocker(conditions):
+    """Return ``conditions`` with the register-marker (``MARK_PC/AX/SP/BP``)
+    up-path blockers promoted to hard NOT-blockers (-1e6) when the Inc-3 ROOT-A
+    hardening is active.
+
+    Only the four register-marker entries are rewritten; every other condition
+    (MARK_STACK0/MEM, address nibbles, opcode blockers, MEM_STORE) is preserved
+    verbatim. At the intended firing positions (genuine STACK0 markers) all four
+    register markers == 0, so the math is byte-identical when the rule
+    legitimately fires; the harden only removes the broadcast-driven spurious fire
+    on register-marker rows. No-op (returns the input tuple) when the hardening is
+    off, so the golden build is bit-for-bit unchanged.
+    """
+    if not _stack0_marker_axmark_hardening_on():
+        return conditions
+    return tuple(
+        (name, -1e6) if name in _STACK0_MARKER_REG_BLOCKERS else (name, weight)
+        for name, weight in conditions
+    )
+
+
 # === L16 FFN unit layout (auto-fit; legacy offsets retained as docs) ==
 #
 # The ``layer16_lev_routing`` op currently owns the entire L16 FFN. Its
@@ -857,7 +923,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _add_stack0_x0_alu_materializer(
         rules,
         family="e8",
-        conditions=_harden_isbyte_blocker(stack0_e8_marker_conditions),
+        conditions=_harden_axmark_blocker(
+            _harden_isbyte_blocker(stack0_e8_marker_conditions)),
         threshold=stack0_e8_marker_threshold,
         S=S,
     )
@@ -946,7 +1013,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _add_stack0_x0_alu_materializer(
         rules,
         family="e0",
-        conditions=_harden_isbyte_blocker(stack0_e0_marker_conditions),
+        conditions=_harden_axmark_blocker(
+            _harden_isbyte_blocker(stack0_e0_marker_conditions)),
         threshold=stack0_e0_marker_threshold,
         S=S,
     )
@@ -981,7 +1049,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _add_stack0_x0_alu_materializer(
         rules,
         family="f8",
-        conditions=_harden_isbyte_blocker(stack0_f8_marker_conditions),
+        conditions=_harden_axmark_blocker(
+            _harden_isbyte_blocker(stack0_f8_marker_conditions)),
         threshold=3.5,
         S=S,
     )
