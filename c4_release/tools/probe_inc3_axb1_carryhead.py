@@ -4,8 +4,30 @@ AX byte-1 deliverer) at the step5 AX[0]-predictor row for var_simple x=990, in
 EITHER config. Finds the head by op name (layer13_ax_byte1_dump_carry.head_7) so
 it is robust to the physical-index reshuffle between widths.
 
-Prints which row the carry head attends and the K-score dim breakdown, plus the
-prev-step AX[1] row position + its H1 one-hot (the byte-1=3 source).
+ROOT A CHARACTERIZATION (2026-06-19, this session — ROOT A is NOT a clean
+single-head re-key; it is downstream of a pervasive 30-tok MEM_STORE broadcast):
+The byte-1 (0x03) for `return x` is delivered in GOLDEN at block-16/L11 head-1 =
+``layer10_byte_passthrough_bake.head_1`` (the L10 AX byte_passthrough head,
+_layer10_ax_byte_passthrough_head_spec, l10_ops.py:2085) — NOT this dump-carry
+head (which attends step1, irrelevant). That AX byte_passthrough head carries the
+prior AX[1] (golden +2.0 to OUTPUT_HI[0], attends step4 AX[1] via the AX-carry
+slots 0-5, source H1+AX).
+
+In CAMPAIGN the head's MEM_STORE store-select slots (44-47, K = MEM_STORE*500)
+PIN it on the wrong row: in the 30-token frame MEM_STORE is BROADCAST onto ~every
+register-byte + PC-marker + MEM-store row (the SI/SC store-bit relay over-fires at
+the shorter stride), so the 500-weight store-select overwhelms the 100-weight
+AX-carry on every candidate row and the head attends a MEM_STORE row (PC marker /
+step3 MEM marker) -> byte-1 -> 0. A K-side MARK_PC/AX/SP/BP veto on slots 44-47
+only moves the leak (PC marker -> the MARK_MEM store row, which legitimately
+carries MEM_STORE) -> still byte-1=0 (tested + reverted this session). The prior
+AX[1] source row ITSELF carries the MEM_STORE leak, so the head cannot cleanly
+select ANY row. => ROOT A's real lever is the 30-tok MEM_STORE BROADCAST (route
+the head's store-select onto the Inc-2 MEM_STORE_AT_VAL discriminator, OR fix the
+store-bit relay's over-broadcast in the 30-token frame, OR build a NEW flag-gated
+AX-byte1 carry head immune to MEM_STORE), NOT an in-place veto. The MEM_STORE
+broadcast also likely gates the step-9/10/11 var_three/var_update/nested clusters
+the ROOT-B advance exposed. Multi-session; do NOT force a single-head patch.
 
 Run TWICE (clear cache between):
   C4_NO_STACK0_EMIT=0  python tools/probe_inc3_axb1_carryhead.py
