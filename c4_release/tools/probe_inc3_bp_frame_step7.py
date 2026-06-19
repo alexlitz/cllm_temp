@@ -14,13 +14,17 @@ got_pc/got_ax = None at step 7. (x>=256 hits the step-5 byte-1 wall FIRST; fixin
 step-5 advances them to THIS step-7 wall -> step-5 fix nets 0 program passes alone.)
 
 ROOT (GPU-residual-probed, this session): at the BP[0] predictor row (off16, which
-predicts the BP byte-1 token) the ``l16_bp_frame_byte1_ff`` emitter's gate dims
-are PRESENT in golden (H1+3=1.0, BYTE_INDEX_0=0.97, CLEAN_EMBED_HI+15=1.0 ->
-OUTPUT_LO+15=+48 -> 0xff) but ABSENT in campaign (H1+3=0, BYTE_INDEX_0=0,
-CLEAN_EMBED_HI+15=0) AND the OUTPUT band has EXPLODED to ~4.27e21 (the documented
-OUTPUT-band self-reinforcement megaroot). So this is NOT a single-rule re-key like
-the Inc-3 step-2 AX byte-1 fix -- the 30-tok BP frame loses its marker-distance
-(H1+3) signature AND suffers an upstream OUTPUT-band explosion. Two-part build.
+predicts the BP byte-1 token) in GOLDEN the ``l16_bp_frame_byte1_ff`` emitter fires
+clean (H1+3=1.0, BYTE_INDEX_0=0.97, CLEAN_EMBED_HI+15=1.0 -> OUTPUT_LO+15=+48 ->
+0xff). In CAMPAIGN the gate dims are STILL present but the OUTPUT band has EXPLODED
+to ~1e13..1e21 (the documented OUTPUT-band self-reinforcement megaroot) -> the
+emitter's +-0.5 write (the rule's own FIXME flags it as too weak vs wide L15/tail
+writers) is swamped -> BP byte-1 emits the HALT token (2) -> the frame floods. So
+this is NOT a single-rule re-key like the Inc-3 step-2 AX byte-1 fix; it is the
+30-tok BP frame triggering the OUTPUT explosion + the too-weak emitter. Two-part
+build (tame the OUTPUT explosion AND/OR strengthen the BP byte-1 emitter). The
+exact magnitudes vary with the (collapsed) autoregressive context; the consistent
+signal is pred_next=2 (halt) + OUTPUT band >> the +-0.5 emitter write.
 
 Run TWICE (clear cache between):
   C4_NO_STACK0_EMIT=0  python tools/probe_inc3_bp_frame_step7.py
