@@ -638,6 +638,70 @@ def _layer13_sub_minuend_relay_head_specs(BD) -> tuple:
         (2, BD.BYTE_INDEX_2, BD.STACK0_BYTE3,
          BD.STACK0_BYTE_VAL_3_LO, BD.STACK0_BYTE_VAL_3_HI),
     )
+    if operand_from_memsp_enabled():
+        # === STACK0 campaign Part C (Inc-3 claw-back, 2026-06-19): SUB
+        # byte-1 minuend RESULT delivery, mirror of the ADD head-5 re-key. ===
+        #
+        # The dropped STACK0 byte rows + the un-delivered TEMP+9 selector
+        # (GPU-confirmed: TEMP+9 lands only at the MARK_AX marker row in the
+        # 30-token frame, not the BYTE_INDEX_0 emit row) make the legacy
+        # STACK0_BYTE1-keyed / TEMP+9-Q-gated relay dark. Re-cast it as the
+        # same intra-step cross-row copy the ADD head 5 uses: Q fires at the
+        # BYTE_INDEX_0 emit row (BYTE_INDEX_0 + HAS_SE), K selects the current
+        # step's AX marker via MARK_AX AND OP_SUB (the SUB discriminator lives
+        # on the SOURCE marker row), so head 4 gathers the minuend byte-1
+        # carrier (STACK0_BYTE_VAL_1, deposited by the L8 head-7 mem[SP] CAM)
+        # ONLY on SUB steps and stays dark on ADD/bitwise. The 1096 sub corpus
+        # is all 2-byte (subtrahend byte1 = 0x00), so byte 1 alone is needed.
+        OP_W = 40.0
+        q = [
+            AP(0, BD.BYTE_INDEX_0, L),
+            AP(0, BD.HAS_SE, L),
+            AP(0, BD.CONST, -L / 2),
+            AP(0, BD.MARK_AX, -L * 10),
+            AP(0, BD.MARK_PC, -L * 10),
+            AP(0, BD.BYTE_INDEX_1, -L * 10),
+            AP(0, BD.BYTE_INDEX_2, -L * 10),
+            AP(0, BD.BYTE_INDEX_3, -L * 10),
+            AP(33, BD.BYTE_INDEX_0, L),
+            AP(33, BD.CONST, -L / 2),
+        ]
+        k = [AP(33, BD.CONST, L)]
+        v = []
+        o = []
+        # TRUE AND of MARK_AX and OP_SUB (see head 5's note): a non-SUB AX
+        # marker must score NEGATIVE so the head stays dark off-SUB and never
+        # corrupts STACK0_BYTE_VAL_1 on var stores / other ops.
+        sel = 1
+        q.append(AP(sel, BD.BYTE_INDEX_0, L))
+        q.append(AP(sel, BD.HAS_SE, L))
+        q.append(AP(sel, BD.CONST, -L))
+        k.append(AP(sel, BD.MARK_AX, K_FLAG))
+        k.append(AP(sel, BD.OP_SUB, OP_W))
+        k.append(AP(sel, BD.OP_ADD, -K_FLAG))
+        k.append(AP(sel, BD.CONST, -K_FLAG * 1.3))
+        base = 3
+        val_lo = BD.STACK0_BYTE_VAL_1_LO
+        val_hi = BD.STACK0_BYTE_VAL_1_HI
+        for kk in range(16):
+            v.append(AP(base + kk, val_lo + kk, 1.0))
+            v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
+            o.append(AO(val_lo + kk, base + kk, 1.0))
+            o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
+        # Discriminator delivery: stamp TEMP+9 (the SUB byte-row selector)
+        # onto the BYTE_INDEX_0 emit row. The L10 borrow cascade gates the
+        # SUB byte-1 rule on TEMP+9 AT the emit row; in the 30-token frame the
+        # L7 head-5 broadcast leaves TEMP+9 at the MARKER row only (and even
+        # mis-stamps TEMP+8 on a SUB), so the cascade stays dark. V reads
+        # OP_SUB (=5.0 ONLY at the matched SUB marker -> ~0 elsewhere, so the
+        # stamp is clean and SUB-exclusive); the 0.2 scale yields TEMP+9 ~= 1.0.
+        v.append(AP(base + 32, BD.OP_SUB, 0.2))
+        o.append(AO(BD.TEMP + 9, base + 32, 1.0))
+        return (
+            DeclarativeAttentionHeadSpec(
+                head_idx=4, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),
+            ),
+        )
     # Q slot 0: gate STRICTLY on the SUB byte-emit selector. TEMP+9 is
     # the cascade's SUB discriminator (1.0 ONLY on SUB byte rows; 0 on
     # ADD/bitwise/everything else). The slot-0 score must be POSITIVE
@@ -740,35 +804,51 @@ def make_layer13_sub_minuend_relay_op() -> Operation:
         # are candidates; the negative slope then breaks the tie toward
         # the oldest among them. (Verified spec_k=0: sub_16bit PSH frame
         # = 0x01; SUB-step frame = 0x00.)
+        # Campaign Part C: re-pointed to the current step's nearby AX marker
+        # (one row before the byte-1 emit row), so a POSITIVE slope rewards
+        # proximity and the CURRENT SUB step's marker wins over older markers.
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes[4] = -1.0
+            attn.alibi_slopes[4] = (
+                1.0 if operand_from_memsp_enabled() else -1.0
+            )
         Primitives.generate_attention_head(
             attn,
             _layer13_sub_minuend_relay_head_specs(proxy)[0],
             HD,
         )
 
+    _campaign = operand_from_memsp_enabled()
     _claims = set()
-    for j, (lo_name, hi_name) in enumerate(
+    _byte_routes = (
+        (("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"),)
+        if _campaign else
         (("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"),
          ("STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"),
          ("STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"))
-    ):
+    )
+    for j, (lo_name, hi_name) in enumerate(_byte_routes):
         base = 3 + j * 32
         for k in range(16):
             _claims.add((13, "attn_W_v", f"4_{base + k}", f"{lo_name}+{k}"))
             _claims.add((13, "attn_W_v", f"4_{base + 16 + k}", f"{hi_name}+{k}"))
 
+    _reads = {"IS_BYTE", "TEMP", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+              "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
+              "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+              "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+              "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI", "CONST"}
+    _writes = {"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+               "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
+               "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"}
+    if _campaign:
+        _reads |= {"HAS_SE", "OP_ADD", "OP_SUB", "MARK_AX", "BYTE_INDEX_3"}
+        _writes |= {"TEMP"}
+        _claims.add((13, "attn_W_v", "4_35", "OP_SUB"))
+
     return Operation(
         name="layer13_sub_minuend_relay",
-        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
-               "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
-               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
-               "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
-               "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI", "CONST"},
-        writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
-                "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI",
-                "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"},
+        reads=_reads,
+        writes=_writes,
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer13_sub_minuend_relay_ir,
@@ -857,6 +937,80 @@ def _layer13_add_addend_relay_head_specs(BD) -> tuple:
     )
     val_lo = BD.STACK0_BYTE_VAL_1_LO
     val_hi = BD.STACK0_BYTE_VAL_1_HI
+    if operand_from_memsp_enabled():
+        # === STACK0 campaign Part C (Inc-3 claw-back, 2026-06-19): the
+        # byte-1 RESULT delivery. ===
+        #
+        # The 30-token campaign frame breaks the legacy TEMP+8 gating
+        # (GPU-confirmed, tools/probe_inc3_addsub_b1_trace.py):
+        #   * The ADD/SUB byte-row selectors TEMP+8/TEMP+9 are delivered
+        #     ONLY at the MARK_AX marker row (the L7 head-5 broadcast Q
+        #     fires at MARK_AX) and are not spread to the BYTE_INDEX_0
+        #     emit row in the collapsed frame -- so a Q gated on TEMP+8 at
+        #     the emit row scores ~0 and the relay never fires.
+        #   * The carrier STACK0_BYTE_VAL_1 (operand-A byte 1, deposited by
+        #     the L8 head-7 mem[SP] CAM) sits at the MARK_AX marker row.
+        #
+        # Re-cast the relay as a clean intra-step cross-row copy that needs
+        # NEITHER the dropped STACK0 row NOR the un-delivered TEMP selector:
+        #   Q fires at the BYTE_INDEX_0 emit row (BYTE_INDEX_0 + HAS_SE,
+        #   both present there), K selects the current step's AX marker via
+        #   MARK_AX AND OP_ADD (the ADD discriminator lives on the SOURCE
+        #   marker row -- OP_ADD ~= 5 there, 0 on a SUB/bitwise marker), so
+        #   head 5 gathers the carrier ONLY on ADD steps and stays dark on
+        #   SUB/bitwise (keeps the FORMAT_PTR/LEV_DETECTOR-aliased
+        #   STACK0_BYTE_VAL band untouched off-ADD). The positive alibi
+        #   slope (set in the bake) rewards proximity so the SAME step's AX
+        #   marker (one row back) wins over any older ADD step's marker.
+        OP_W = 40.0
+        q = [
+            AP(0, emit_bi_dim, L),
+            AP(0, BD.HAS_SE, L),
+            AP(0, BD.CONST, -L / 2),
+            AP(0, BD.MARK_AX, -L * 10),
+            AP(0, BD.MARK_PC, -L * 10),
+            AP(0, BD.BYTE_INDEX_1, -L * 10),
+            AP(0, BD.BYTE_INDEX_2, -L * 10),
+            AP(0, BD.BYTE_INDEX_3, -L * 10),
+            AP(33, emit_bi_dim, L),
+            AP(33, BD.CONST, -L / 2),
+        ]
+        k = [AP(33, BD.CONST, L)]
+        v = []
+        o = []
+        # Per-byte K-select slot 1: gather the carrier from the ADD AX
+        # marker -- a TRUE AND of MARK_AX and OP_ADD. A non-ADD AX marker
+        # (e.g. an SI/LI/var step's marker) must score NEGATIVE so the head
+        # stays dark off-ADD (else it corrupts STACK0_BYTE_VAL_1 on var stores
+        # -- GPU-measured var_simple regression). With MARK_AX=1, OP_ADD in
+        # {0, ~5}: an ADD marker scores K_FLAG + 5*OP_W - 1.3*K_FLAG = +large;
+        # a non-ADD marker scores K_FLAG - 1.3*K_FLAG = -0.3*K_FLAG < 0; byte
+        # rows (no MARK_AX) score -1.3*K_FLAG < 0. The CONST baseline keeps
+        # only the ADD marker above softmax1's zero anchor.
+        sel = 1
+        q.append(AP(sel, emit_bi_dim, L))
+        q.append(AP(sel, BD.HAS_SE, L))
+        q.append(AP(sel, BD.CONST, -L))
+        k.append(AP(sel, BD.MARK_AX, K_FLAG))
+        k.append(AP(sel, BD.OP_ADD, OP_W))
+        k.append(AP(sel, BD.OP_SUB, -K_FLAG))
+        k.append(AP(sel, BD.CONST, -K_FLAG * 1.3))
+        base = 3
+        for kk in range(16):
+            v.append(AP(base + kk, val_lo + kk, 1.0))
+            v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
+            o.append(AO(val_lo + kk, base + kk, 1.0))
+            o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
+        # NOTE: unlike the SUB head 4, the ADD path does NOT stamp TEMP+8 here
+        # -- TEMP+8 already reaches the ADD byte rows via the in-step spread
+        # well enough for the L25 high-byte adder, and an extra stamp REGRESSES
+        # ADD (24->14, GPU-measured): it over-fires the TEMP+8-gated L14 add
+        # byte-1 cleanup / cascade rules. The carrier delivery alone is the win.
+        return (
+            DeclarativeAttentionHeadSpec(
+                head_idx=5, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),
+            ),
+        )
     # Q slot 0: gate STRICTLY on the ADD byte-emit selector TEMP+8 (1.0
     # ONLY on ADD byte rows; 0 on SUB/bitwise/everything else). Mirrors
     # head 4's TEMP+9 gate -- positive only when TEMP+8 fires, negative
@@ -961,11 +1115,20 @@ def make_layer13_add_addend_relay_op() -> Operation:
         _claims.add((13, "attn_W_v", f"5_{base + 16 + k}",
                      f"STACK0_BYTE_VAL_1_HI+{k}"))
 
+    _campaign = operand_from_memsp_enabled()
+    _reads = {"IS_BYTE", "TEMP", "BYTE_INDEX_0", "STACK0_BYTE1", "MARK_AX",
+              "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI", "CONST"}
+    _writes = {"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"}
+    if _campaign:
+        # Campaign Part C: K gates on OP_ADD/OP_SUB + MARK_AX (source marker
+        # discriminator); Q gates on HAS_SE + BYTE_INDEX_* (emit row).
+        _reads |= {"HAS_SE", "OP_ADD", "OP_SUB", "BYTE_INDEX_1",
+                   "BYTE_INDEX_2", "BYTE_INDEX_3"}
+
     return Operation(
         name="layer13_add_addend_relay",
-        reads={"IS_BYTE", "TEMP", "BYTE_INDEX_0", "STACK0_BYTE1", "MARK_AX",
-               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI", "CONST"},
-        writes={"STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"},
+        reads=_reads,
+        writes=_writes,
         kind="block",
         declarative_bake_fn=bake,
         compiler_ir_factory=_layer13_add_addend_relay_ir,
