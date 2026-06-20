@@ -204,6 +204,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
+from ..positional_invariant import invariant_threshold, marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .residual_band_registry import register_residual_band
 from .shared import (
@@ -2386,8 +2387,17 @@ def _layer10_sp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
 
 
 def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
-    BP_IDX = 3
-    AX_IDX = 1
+    # Marker-bank slot indices via the positional-invariant mechanism (Class-1
+    # marker-relative). ``BD.H1 + BP_IDX`` / ``BD.H1 + AX_IDX`` read the
+    # marker-TYPE slot of the fixed-width threshold-head bank
+    # (PC=0 AX=1 SP=2 BP=3 MEM=4 SE=5), which is frame-INVARIANT — the bank
+    # order does NOT change when the STACK0 value block is dropped
+    # (STEP_TOKENS 35->30). ``marker_bank_index`` is the single source of truth
+    # and lets the positional audit recognise these as declared marker-relative
+    # rather than UNGUARDED bare offsets. Byte-identical in both frames (returns
+    # the same integers the literals encoded). See positional_invariant.py.
+    BP_IDX = marker_bank_index("BP")
+    AX_IDX = marker_bank_index("AX")
     spec = _byte_passthrough_chain_spec(
         BD,
         head_idx=_l10_head_idx("layer10_bp_byte_passthrough_bake.head_7"),
@@ -2435,22 +2445,29 @@ def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
     TOP_STORE_CMP = 5.0 * S
     TOP_STORE_HAS_SE = 5.0 * S
 
-    def top_store_query(slot: int, target_dim: int) -> tuple:
+    def top_store_query(
+        slot: int, target_dim: int, target_strength: float = M
+    ) -> tuple:
         return (
             AP(slot, BD.CONST, TOP_STORE_BIAS),
             AP(slot, BD.MEM_STORE, M),
             AP(slot, BD.MEM_ADDR_SRC, M),
             AP(slot, BD.CMP + 3, TOP_STORE_CMP),
             AP(slot, BD.HAS_SE, TOP_STORE_HAS_SE),
-            AP(slot, target_dim, M),
+            AP(slot, target_dim, target_strength),
             AP(slot, BD.ADDR_B0_LO + 0, TOP_STORE_ADDR),
             AP(slot, BD.ADDR_B0_HI + 14, TOP_STORE_ADDR),
             AP(slot, BD.ADDR_B0_LO + 8, TOP_STORE_ADDR_BLOCK),
             AP(slot, BD.ADDR_B0_HI + 15, TOP_STORE_ADDR_BLOCK),
-            AP(slot, BD.H1 + 0, -3.0 * M),
-            AP(slot, BD.H1 + 1, -3.0 * M),
-            AP(slot, BD.H1 + 2, -3.0 * M),
-            AP(slot, BD.H1 + 3, -3.0 * M),
+            # Marker-proximity blockers PC/AX/SP/BP (Class-1 marker-relative
+            # bank slots, frame-INVARIANT). ``BD.H1 + marker_bank_index(...)``
+            # resolves to the same 0/1/2/3 integers the literals encoded in both
+            # frames; declared marker-relative so the audit no longer reads them
+            # as bare offsets. See positional_invariant.py.
+            AP(slot, BD.H1 + marker_bank_index("PC"), -3.0 * M),
+            AP(slot, BD.H1 + marker_bank_index("AX"), -3.0 * M),
+            AP(slot, BD.H1 + marker_bank_index("SP"), -3.0 * M),
+            AP(slot, BD.H1 + marker_bank_index("BP"), -3.0 * M),
             # H1+4 (L0 head 1 "MEM marker within dist 4.5") blocker: the
             # top_store_query aux block was designed for STACK0-store contexts;
             # at the MEM-addr0 input position of step 0 the residual carries
@@ -2465,7 +2482,27 @@ def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             # hypothesis option 1" (the brief named the dim MARK_MEM; the
             # actual residual leak is via the H1+4 proximity output, which is
             # what the existing -3.0*M block applies to for H1+0..3).
-            AP(slot, BD.H1 + 4, -3.0 * M),
+            AP(slot, BD.H1 + marker_bank_index("MEM"), -3.0 * M),
+        )
+
+    # Class-2 absolute-slot anchors: the STACK0-byte target discriminators
+    # (``BD.STACK0_BYTE0..2``) are the d=6..8-from-BP byte-POSITION flags that
+    # VANISH (alias onto MEM addr bytes) when the STACK0 block is dropped
+    # (STEP_TOKENS 35->30). This is the stack-source top-store route that
+    # updates STACK0 from the current AX byte; under C4_NO_STACK0_EMIT there is
+    # no STACK0 to update, so the route is structurally moot — and worse, the
+    # STACK0_BYTE0 input flag misfires onto a MEM-addr row. ``invariant_threshold``
+    # drives the target-discriminator Q strength to 0 in the dropped frame
+    # (live=M at 35-tok -> byte-identical; suppressed=0 at 30-tok -> the
+    # misfiring flag's contribution is killed and the route can't spuriously
+    # boost head 7 at a MEM-addr row). The MARK_STACK0 slots (40/41) are a
+    # marker-TYPE dim, not a byte-position flag — under the campaign the STACK0
+    # marker token simply isn't emitted so the flag is naturally 0 with no
+    # row-alias misfire, so they need no shift. See positional_invariant.py.
+    def stack0_byte_target_strength(byte_k: int) -> float:
+        # STACK0 byte N sits at d=(6+N)-from-BP in the full frame.
+        return invariant_threshold(
+            live=M, suppressed=0.0, marker="BP", k=6 + byte_k,
         )
 
     return replace(
@@ -2473,12 +2510,12 @@ def _layer10_bp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
         q=spec.q + (
             *top_store_query(40, BD.MARK_STACK0),
             *top_store_query(41, BD.MARK_STACK0),
-            *top_store_query(42, BD.STACK0_BYTE0),
-            *top_store_query(43, BD.STACK0_BYTE0),
-            *top_store_query(44, BD.STACK0_BYTE1),
-            *top_store_query(45, BD.STACK0_BYTE1),
-            *top_store_query(46, BD.STACK0_BYTE2),
-            *top_store_query(47, BD.STACK0_BYTE2),
+            *top_store_query(42, BD.STACK0_BYTE0, stack0_byte_target_strength(0)),
+            *top_store_query(43, BD.STACK0_BYTE0, stack0_byte_target_strength(0)),
+            *top_store_query(44, BD.STACK0_BYTE1, stack0_byte_target_strength(1)),
+            *top_store_query(45, BD.STACK0_BYTE1, stack0_byte_target_strength(1)),
+            *top_store_query(46, BD.STACK0_BYTE2, stack0_byte_target_strength(2)),
+            *top_store_query(47, BD.STACK0_BYTE2, stack0_byte_target_strength(2)),
         ),
         k=spec.k + (
             AP(40, BD.H1 + AX_IDX, M),

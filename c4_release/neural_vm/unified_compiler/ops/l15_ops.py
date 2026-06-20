@@ -272,6 +272,7 @@ from ..ir import (
     StructuralOp,
 )
 from ..layer_compiler import Operation
+from ..positional_invariant import invariant_threshold, marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 
@@ -731,11 +732,20 @@ def _layer15_memory_lookup_heads_0_3_specs(
     ``2*((k>>bit)&1)-1`` bit-encoding across all 16 nibble values).
     """
 
-    PC_I = 0
-    AX_I = 1
-    SP_I = 2
-    BP_I = 3
-    MEM_I = 4
+    # Marker-bank slot indices, resolved through the positional-invariant
+    # mechanism (Class-1 marker-relative anchors). ``BD.H1 + PC_I`` etc. read
+    # the marker-TYPE slot of the fixed-width threshold-head bank (PC=0 AX=1
+    # SP=2 BP=3 MEM=4 SE=5), which is frame-INVARIANT — its order does NOT
+    # change when the STACK0 *value* block is dropped (STEP_TOKENS 35->30).
+    # ``marker_bank_index`` is the single source of truth and lets the
+    # positional audit reclassify these refs as declared-invariant instead of
+    # UNGUARDED bare offsets. Byte-identical in both frames (returns the same
+    # integers the literals encoded). See positional_invariant.py.
+    PC_I = marker_bank_index("PC")
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
+    MEM_I = marker_bank_index("MEM")
 
     specs: list[DeclarativeAttentionHeadSpec] = []
 
@@ -895,11 +905,16 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
     ``CLEAN_EMBED_HI+15`` -> ``OUTPUT_HI+15`` cell).
     """
 
-    PC_I = 0
-    AX_I = 1
-    SP_I = 2
-    BP_I = 3
-    MEM_I = 4
+    # Marker-bank slot indices via the positional-invariant mechanism
+    # (Class-1 marker-relative). Frame-INVARIANT bank-TYPE order; byte-identical
+    # in both frames. Replaces the hand-coded ``MEM_I = 4`` etc. so the audit
+    # recognises these ``BD.H1 + MEM_I`` / ``BD.L2H0 + MEM_I`` reads as declared
+    # marker-relative. See positional_invariant.py.
+    PC_I = marker_bank_index("PC")
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
+    MEM_I = marker_bank_index("MEM")
 
     base_specs = _layer15_memory_lookup_heads_0_3_specs(BD)
     merged: list[DeclarativeAttentionHeadSpec] = []
@@ -1027,7 +1042,20 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             q_map[(row, BD.MEM_STORE)] = -5.0 * preserve_e8_s
             k_map[(row, BD.ADDR_B0_LO + 8)] = preserve_e8_s
             k_map[(row, BD.ADDR_B0_HI + 14)] = preserve_e8_s
-            k_map[(row, BD.STACK0_BYTE0)] = 5.0 * preserve_e8_s
+            # Class-2 absolute-slot read: the K-side STACK0_BYTE0 discriminator
+            # boosts attention to the historical STACK0 byte-0 token when
+            # preserving the 0xffe8 stack top. STACK0_BYTE0 is the canonical
+            # d=6-from-BP positional flag that VANISHES under C4_NO_STACK0_EMIT
+            # (its L1 producer is auto-neutralized so the flag never fires, and
+            # no STACK0 token is emitted to attend to). Drive the weight to 0 in
+            # the dropped frame via invariant_threshold so the declared
+            # invariance is explicit — a no-op behaviourally in BOTH frames (at
+            # 35-tok returns 5.0*preserve_e8_s, byte-identical; at 30-tok the
+            # input flag is already constant-0 so the score contribution is
+            # zero either way). See positional_invariant.py.
+            k_map[(row, BD.STACK0_BYTE0)] = invariant_threshold(
+                live=5.0 * preserve_e8_s, suppressed=0.0, marker="BP", k=6,
+            )
 
             # Row 61: AX LI/LC e8 value discriminator.
             ax_li_e8_s = 10.0
@@ -1239,7 +1267,8 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
 
         # === sp_byte_blocker (slot 62) ===
         sp_byte_blocker = 62
-        q_map[(sp_byte_blocker, BD.H1 + 2)] = 100000.0
+        # ``BD.H1 + SP_I`` (marker-bank SP slot); was the bare ``BD.H1 + 2``.
+        q_map[(sp_byte_blocker, BD.H1 + SP_I)] = 100000.0
         q_map[(sp_byte_blocker, BD.MARK_BP)] = 100000.0
         q_map[(sp_byte_blocker, BD.TEMP + 10)] = 100000.0
         q_map[(sp_byte_blocker, BD.TEMP + 24)] = 100000.0
@@ -1521,8 +1550,13 @@ def _layer15_memory_lookup_lev_heads_4_11_specs(
     pre-overwrite snapshot byte-identical with the legacy bake.
     """
 
-    AX_I = 1
-    BP_I = 3
+    # Marker-bank slot indices via the positional-invariant mechanism (Class-1
+    # marker-relative). Frame-INVARIANT bank-TYPE order; byte-identical in both
+    # frames. Replaces the hand-coded ``AX_I = 1`` / ``BP_I = 3`` so the audit
+    # recognises the ``BD.H1 + AX_I`` / ``BD.L1H1 + BP_I`` / ``BD.H0 + BP_I``
+    # reads as declared marker-relative. See positional_invariant.py.
+    AX_I = marker_bank_index("AX")
+    BP_I = marker_bank_index("BP")
 
     specs: list[DeclarativeAttentionHeadSpec] = []
 
@@ -2085,7 +2119,10 @@ def _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
     conflicts.
     """
 
-    MEM_I = 4
+    # Marker-bank MEM slot via the positional-invariant mechanism (Class-1
+    # marker-relative). Frame-INVARIANT; byte-identical in both frames. Was the
+    # hand-coded ``MEM_I = 4``. See positional_invariant.py.
+    MEM_I = marker_bank_index("MEM")
 
     base_specs = _layer15_memory_lookup_lev_heads_4_11_specs(BD)
     merged: list[DeclarativeAttentionHeadSpec] = []
@@ -2146,7 +2183,10 @@ def _layer15_memory_lookup_lev_blockers_only_specs(
     ``max_head = 4`` and this returns an empty tuple.
     """
 
-    MEM_I = 4
+    # Marker-bank MEM slot via the positional-invariant mechanism (Class-1
+    # marker-relative). Frame-INVARIANT; byte-identical. Was ``MEM_I = 4``.
+    # See positional_invariant.py.
+    MEM_I = marker_bank_index("MEM")
     specs: list[DeclarativeAttentionHeadSpec] = []
     for head in range(4, min(max_head, 12)):
         q: list[AP] = []
@@ -2688,11 +2728,20 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
     bake. Carried as a :class:`RuntimeAttentionFragment` in
     ``layer15_memory_lookup``'s CompilerIR.
     """
-    pc_i = 0
-    ax_i = 1
-    mem_i = 4
-    sp_i = 2
-    bp_i = 3
+    # Marker-bank slot indices via the positional-invariant mechanism
+    # (Class-1 marker-relative). Frame-INVARIANT bank-TYPE order; byte-identical
+    # in both frames. Replaces the hand-coded ``mem_i = 4`` etc. so the audit
+    # recognises the ``BD.H1 + mem_i`` / ``BD.L2H0 + mem_i`` reads as declared
+    # marker-relative. This imperative writer is the one that ACTUALLY lands
+    # (make_l15_attention_resize_op re-runs it after the declarative bake), so
+    # it must carry the same declared invariance as the declarative mirror
+    # ``_layer15_memory_lookup_heads_0_3_specs_with_overrides``. See
+    # positional_invariant.py.
+    pc_i = marker_bank_index("PC")
+    ax_i = marker_bank_index("AX")
+    mem_i = marker_bank_index("MEM")
+    sp_i = marker_bank_index("SP")
+    bp_i = marker_bank_index("BP")
     for head in range(4):
         base = head * HD
         # Local stack slots commonly differ only in byte 0 (BP-8, BP-16,
@@ -2834,7 +2883,18 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
             attn.W_q.data[base + preserve_e8_row, BD.MEM_STORE] = -5.0 * preserve_e8_s
             attn.W_k.data[base + preserve_e8_row, BD.ADDR_B0_LO + 8] = preserve_e8_s
             attn.W_k.data[base + preserve_e8_row, BD.ADDR_B0_HI + 14] = preserve_e8_s
-            attn.W_k.data[base + preserve_e8_row, BD.STACK0_BYTE0] = 5.0 * preserve_e8_s
+            # Class-2 absolute-slot read (mirrors the declarative
+            # ``_with_overrides`` slot-59 K-write): STACK0_BYTE0 is the
+            # d=6-from-BP flag that VANISHES under C4_NO_STACK0_EMIT. Drive the
+            # weight to 0 in the dropped frame via invariant_threshold —
+            # byte-identical at 35-tok, behaviourally a no-op at 30-tok (input
+            # flag already constant-0). See positional_invariant.py.
+            attn.W_k.data[base + preserve_e8_row, BD.STACK0_BYTE0] = (
+                invariant_threshold(
+                    live=5.0 * preserve_e8_s, suppressed=0.0,
+                    marker="BP", k=6,
+                )
+            )
 
             # AX LI/LC marker loads at 0xffe8 also need an exact e8 value-row
             # discriminator, but row 59's K side intentionally likes STACK0.
@@ -3078,7 +3138,8 @@ def _suppress_l15_lookup_heads_0_3(attn, BD, HD) -> None:
         # historical stack values when setup residue is large, overwriting
         # L3/L10's register bytes.
         sp_byte_blocker = 62
-        attn.W_q.data[base + sp_byte_blocker, BD.H1 + 2] = 100000.0
+        # ``BD.H1 + sp_i`` (marker-bank SP slot); was the bare ``BD.H1 + 2``.
+        attn.W_q.data[base + sp_byte_blocker, BD.H1 + sp_i] = 100000.0
         attn.W_q.data[base + sp_byte_blocker, BD.MARK_BP] = 100000.0
         attn.W_q.data[base + sp_byte_blocker, BD.TEMP + 10] = 100000.0
         attn.W_q.data[base + sp_byte_blocker, BD.TEMP + 24] = 100000.0
@@ -3367,7 +3428,11 @@ def _suppress_l15_lookup_lev_blockers_4_11(attn, BD, HD) -> None:
     the IR's runtime-shape intent ("these are heads 4+ blocker rows")
     visible at the builder site.
     """
-    mem_i = 4
+    # Marker-bank MEM slot via the positional-invariant mechanism (Class-1
+    # marker-relative). Frame-INVARIANT; byte-identical. Mirrors the declarative
+    # ``_layer15_memory_lookup_lev_blockers_only_specs`` MEM_I. Was ``mem_i = 4``.
+    # See positional_invariant.py.
+    mem_i = marker_bank_index("MEM")
     for head in range(4, min(getattr(attn, "num_heads", 4), 12)):
         base = head * HD
         for row in (0, 36, 37):
