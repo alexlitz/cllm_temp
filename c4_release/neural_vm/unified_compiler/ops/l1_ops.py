@@ -7,7 +7,8 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy, no_stack0_emit_enabled
+from .shared import _as_setdim_proxy
+from ..positional_invariant import invariant_threshold, marker_bank_index
 
 
 # === L1 FFN unit layout (auto-fit offsets, Phase 7.B.1) =============
@@ -93,7 +94,13 @@ def _threshold_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     position into a fixed-width threshold-head bank, not a
     role-meaningful byte index).
     """
-    BP_I = 3
+    # Marker-bank slot index, resolved through the positional-invariant
+    # mechanism (Class-1 marker-relative anchor) instead of the literal
+    # ``BP_I = 3``. ``marker_bank_index`` proves the slot is frame-INVARIANT
+    # (the threshold-head bank is keyed on marker TYPE, whose order does not
+    # change when the STACK0 *value* block is dropped) and is the single
+    # source of truth the audit recognises as declared-invariant.
+    BP_I = marker_bank_index("BP")
     NM = 7  # NUM_MARKERS — fixed-width threshold-head bank
     write_scale = 2.0 / S
 
@@ -111,9 +118,21 @@ def _threshold_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     # to mem[SP] (C4_OPERAND_FROM_MEMSP) and the STACK0 emission gone, nothing
     # legitimately needs this flag, so neutralize it: keep the unit allocated
     # (5-unit byte-count guard) but raise the AND threshold unreachably high so
-    # it never fires. STACK0_BYTE0 then reads 0 everywhere (the STACK0 consumers
-    # go dark cleanly). Flag-off => threshold 1.5 => byte-identical to HEAD.
-    _stack0_byte0_threshold = 1.0e9 if no_stack0_emit_enabled() else 1.5
+    # it never fires.
+    #
+    # Class-2 ABSOLUTE-SLOT anchor: this flag's target (STACK0 byte 0, d=6 from
+    # BP) is the canonical anchor whose row VANISHES when STACK0 is dropped.
+    # ``invariant_threshold`` AUTO-COMPUTES the live-vs-suppressed threshold
+    # from ``Token.STEP_TOKENS`` — no per-op ``no_stack0_emit_enabled()``
+    # branch. At STEP_TOKENS=35 it returns 1.5 (byte-identical to HEAD/golden);
+    # at STEP_TOKENS=30 it auto-returns 1e9 (the make-unreachable suppress),
+    # reproducing the prior hand-coded fix with ZERO hand-tuning. This is the
+    # systematic mechanism replacing the cluster-by-cluster re-anchor; see
+    # ``neural_vm/unified_compiler/positional_invariant.py`` +
+    # ``docs/POSITIONAL_INVARIANT_MECHANISM_2026_06_20.md``.
+    _stack0_byte0_threshold = invariant_threshold(
+        live=1.5, suppressed=1.0e9, marker="BP", k=6,
+    )
     rules.append(multi_way_and_rule(
         name="stack0_byte0_flag",
         conditions=(
