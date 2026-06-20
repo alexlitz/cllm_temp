@@ -11,6 +11,10 @@ from .l3_ops import *  # noqa: F401,F403
 from .l4_ops import *  # noqa: F401,F403
 from .l5_ops import *  # noqa: F401,F403
 from .l5_ops import _stack0_next_arith_enabled  # noqa: F401 (underscore name)
+from .shared import (  # noqa: F401 — cross-op FFN-lint demo flags (tooling-only)
+    ffn_lint_clean_demo_enabled,
+    ffn_lint_mull14_demo_enabled,
+)
 from .l6_ops import *  # noqa: F401,F403
 from .l7_ops import *  # noqa: F401,F403
 from .l8_ops import *  # noqa: F401,F403
@@ -498,6 +502,17 @@ def all_core_ops(
         make_layer14_temp_clear_op(),
         make_layer14_clear_addr_key_pollution_op(),
         make_layer14_clear_output_corruption_op(),
+        # Cross-op FFN-lint demo fixtures (tools/lint_cross_op_ffn.py --demo).
+        # Registered ONLY when their flag is on so a flag-off / production build
+        # is byte-identical to golden 4958b35b. See l14_ops.py module banner.
+        *(
+            [make_ffn_lint_mull14_demo_op()]
+            if ffn_lint_mull14_demo_enabled() else []
+        ),
+        *(
+            [make_ffn_lint_clean_demo_op()]
+            if ffn_lint_clean_demo_enabled() else []
+        ),
         make_layer14_clear_mem_marker_output_op(),
         # var-cluster follow-up (2026-06-05): cancel the L3
         # mem_byte_0_default +0.940 baseline at MEM marker / addr-byte

@@ -177,6 +177,33 @@ Run these BEFORE committing any new op or rule change:
   the `--demo` flag proves it discriminates byte-0 (flagged) from a clean
   band/LM-head fix (passed). Design:
   [`docs/CROSS_OP_ATTENTION_LINT_2026_06_17.md`](docs/CROSS_OP_ATTENTION_LINT_2026_06_17.md).
+- **`tools/lint_cross_op_ffn.py` — MANDATORY for any op that modifies a
+  SHARED FFN region / residual band** (the l14 ALU block, where
+  ADD/SUB/MUL/DIV/MOD/SHL all write+read overlapping `OUTPUT_LO/HI` +
+  `ALU_LO/HI` dims; the l16 materializers; any shared `OUTPUT`/`ALU` band).
+  `compare_symbolic_to_lowered_ffn` verifies ONE op in ISOLATION (single
+  query, hardmax), so it CANNOT see that two ops sharing a residual band /
+  FFN region interact — the exact blind spot that let a "MUL-only" l14 fix's
+  smooth-`silu` firing silently shift what add/sub/div READ in the shared l14
+  ALU band one block later → a −60 regression that BOTH golden byte-identity
+  AND the isolated-op check missed (silu is non-zero for OTHER inputs too, and
+  an attention `W_o` write is re-weighted by a GLOBAL softmax). This lint is
+  the FFN counterpart to `lint_cross_op_attention.py`: it builds the model
+  flag-OFF/flag-ON (CPU, `disk_cache=False`, own cache dir), auto-detects the
+  blocks whose FFN / attn-`W_o` changed and the SHARED OUTPUT/ALU band they
+  write (which OTHER ops read downstream), and asserts the post-FFN residual
+  at those shared dims is UNCHANGED at a battery of OTHER-op / OTHER-context
+  probe rows (ADD/SUB/DIV/MOD/SHL/SHR operand frames with several competing
+  STACK0/ALU candidate rows, so both the softmax normalization and the silu
+  firing are exercised). Run
+  `python tools/lint_cross_op_ffn.py --flag C4_MY_FIX --expect OP_MUL`; the
+  `--demo` flag proves it discriminates the mul-l14 entanglement (flagged:
+  perturbs add/sub/div's OUTPUT read band) from a clean band-separable fix
+  (passed: writes a private TEMP dim only). CPU, ~the time of two builds
+  (~40s for the full `--demo`), runs BEFORE a GPU ever sees the fix. The two
+  `--demo` fixtures (`C4_FFN_LINT_MULL14_DEMO` / `C4_FFN_LINT_CLEAN_DEMO` in
+  `ops/l14_ops.py`) are flag-gated tooling, both DEFAULT OFF → production build
+  byte-identical to golden.
 
 ## Tests
 

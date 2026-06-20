@@ -9,7 +9,11 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import (
+    _as_setdim_proxy,
+    ffn_lint_clean_demo_enabled,
+    ffn_lint_mull14_demo_enabled,
+)
 
 
 def _psh_arg_val_ax_enabled() -> bool:
@@ -171,6 +175,16 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # OUTPUT residual is unchanged -- so its sole purpose is to prove the
     # declare-only flow end to end. See ``make_layer14_demo_phase6_wave7_op``.
     "layer14_demo_phase6_wave7":             (None,    1),
+    # Cross-op FFN-lint demo fixtures (tools/lint_cross_op_ffn.py --demo).
+    # TOOLING-ONLY, both DEFAULT OFF (C4_FFN_LINT_MULL14_DEMO /
+    # C4_FFN_LINT_CLEAN_DEMO). These are the LAST entries in the chain: when a
+    # demo flag is off the op is not registered and ``_l14_chain_alloc`` never
+    # claims its slot, so a flag-off / production build is byte-identical to
+    # golden 4958b35b (the chain alloc loop breaks at the requested op, so a
+    # trailing entry can never shift a real op's start_unit). See
+    # ``make_ffn_lint_mull14_demo_op`` / ``make_ffn_lint_clean_demo_op``.
+    "ffn_lint_mull14_demo":                  (None,    1),
+    "ffn_lint_clean_demo":                   (None,    1),
 }
 
 
@@ -4306,4 +4320,187 @@ def make_layer14_addr_key_neural_decode_op(enable: bool = False) -> Operation:
         requires={"after": "layer14_mem_generation"},
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
+    )
+
+
+# ===========================================================================
+# CROSS-OP FFN-LINT DEMO OPS (tooling-only; both DEFAULT OFF).
+# ---------------------------------------------------------------------------
+# These two ops are the discrimination fixtures for tools/lint_cross_op_ffn.py
+# --demo. Each lowers ONE leaky-silu FFNRule into the l14 ALU block's live
+# PureFFN via the CLEANUP-CHAIN allocator (_l14_chain_alloc + CompilerIR.
+# lower_ffn — the SAME robust path as make_layer14_demo_phase6_wave7_op, so the
+# unit is registered and survives _right_size_ffns). Both are registered ONLY
+# when their flag is on (the trailing chain-layout entries), so a flag-off /
+# production build is byte-identical to golden 4958b35b. The single authored
+# FFNRule pins the silu spillover exactly. (A hardcoded high unit slot does NOT
+# work: it collides with an allocator-managed unit and is merged/renumbered by
+# the build's FFN compaction, and a post-trim hand-write has no free slot — the
+# right-sized l14 FFN is 100% packed.)
+#
+#   * make_ffn_lint_mull14_demo_op  (C4_FFN_LINT_MULL14_DEMO) — the ENTANGLEMENT.
+#     A unit AUTHORED as "MUL-only" (W_up reads OP_MUL strongly) but with a
+#     POSITIVE b_up so silu(up) is non-zero even when OP_MUL==0. It writes the
+#     SHARED OUTPUT_LO band -> on ADD/SUB/DIV rows the leaked silu firing
+#     perturbs the band other ops read (the exact -60). The lint must FLAG it.
+#   * make_ffn_lint_clean_demo_op   (C4_FFN_LINT_CLEAN_DEMO) — the CLEAN control.
+#     IDENTICAL silu spillover, but its W_down writes a PRIVATE TEMP scratch dim
+#     (no OUTPUT/ALU band). Because no downstream op reads TEMP as an ALU result
+#     the shared-band probe sees ZERO change -> the lint must PASS it.
+# ===========================================================================
+def _ffn_lint_demo_rule(write_dim_name: str) -> FFNRule:
+    """One leaky-silu OP_MUL :class:`FFNRule` for the cross-op FFN-lint demo.
+
+    Authored as a "MUL-only" unit whose pre-silu activation
+    ``up = S*(0.04*OP_MUL) - S*(-0.006) = 0.6 + 4.0*OP_MUL`` is:
+
+      * ``silu(0.6) ~= 0.39`` at the OP_MUL==0 BASELINE — the smooth-nonlinearity
+        LEAK that perturbs OTHER opcodes' rows, AND
+      * ``silu(4.6) ~= 4.55`` when OP_MUL fires — the intended write.
+
+    ``gate=None, gate_bias=1.0`` makes the multiplicative gate a constant 1.0 so
+    the product ``silu(up)*gate`` is just ``silu(up)``. ``writes`` routes that
+    activation into ``write_dim_name+0`` — ``OUTPUT_LO+0`` (the SHARED l14 ALU
+    band every binary-ALU op reads) for the ENTANGLEMENT fixture, or ``TEMP+0``
+    (a PRIVATE scratch dim no downstream op reads as an ALU result) for the
+    CLEAN control. Lowered via :meth:`CompilerIR.lower_ffn`, so the unit is a
+    real, registered hidden unit that survives ``_right_size_ffns`` (its W_up /
+    W_down are non-zero) — unlike a post-trim hand-write, which has no free slot
+    to land in (the trimmed l14 FFN is 100% packed).
+    """
+    return FFNRule.gated_write(
+        name=f"ffn_lint_demo_leaky_mul_{write_dim_name.lower()}",
+        conditions=(("OP_MUL", 0.04),),
+        threshold=-0.006,
+        gate=None,
+        gate_bias=1.0,
+        writes=((f"{write_dim_name}+0", 1.0),),
+        scope="__never_fires__",
+    )
+
+
+def _ffn_lint_demo_ir(write_dim_name: str) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.append(_ffn_lint_demo_rule(write_dim_name))
+    return ir
+
+
+def _ffn_lint_demo_bake(block, dim_positions, S, *, chain_op_name: str,
+                        write_dim_name: str):
+    """Lower the leaky-silu OP_MUL demo unit into the l14 block's live FFN.
+
+    Mirrors :func:`make_layer14_demo_phase6_wave7_op`'s bake EXACTLY: take the
+    chain-allocated start unit (:func:`_l14_chain_alloc`) and lower the single
+    :class:`FFNRule` via :meth:`CompilerIR.lower_ffn`. This is the ONLY robust
+    path: a hardcoded slot (the original 1000/1001 attempt) collides with an
+    allocator-managed unit and is silently merged/renumbered by the build's FFN
+    compaction (its ``b_up`` gets clobbered to a neighbour's, killing the leak),
+    and a post-trim hand-write has NO free slot (the right-sized l14 FFN is 100%
+    packed). The chain layout entry is the LAST in
+    :data:`_L14_CLEANUP_CHAIN_LAYOUT`, so when the demo flag is OFF the op is
+    never registered, ``_l14_chain_alloc`` never claims its slot, and no real
+    op's start_unit shifts -> a flag-off build is byte-identical to golden.
+    """
+    ffn = getattr(block, "ffn", None)
+    if ffn is None or not hasattr(ffn, "W_up"):
+        return
+
+    start_unit = _l14_chain_alloc(chain_op_name)
+    ir = _ffn_lint_demo_ir(write_dim_name)
+    rules = ir.layer(0).ffn.rules
+    dim_map = Primitives.dim_positions_from_bd(
+        _as_setdim_proxy(dim_positions),
+        Primitives.ffn_rule_dim_names(rules),
+    )
+    next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
+    ffn._l14_unit_counter = next_unit
+
+
+def make_ffn_lint_mull14_demo_op() -> Operation:
+    """Tooling-only ENTANGLEMENT fixture (DEFAULT OFF, C4_FFN_LINT_MULL14_DEMO).
+
+    See the module banner above. Writes the SHARED OUTPUT_LO band with a leaky
+    OP_MUL silu unit so the lint's ADD/SUB/DIV probe rows see a non-local change.
+    """
+    enabled = ffn_lint_mull14_demo_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        _ffn_lint_demo_bake(
+            block, dim_positions, S,
+            chain_op_name="ffn_lint_mull14_demo",
+            write_dim_name="OUTPUT_LO",
+        )
+
+    return Operation(
+        name="ffn_lint_mull14_demo",
+        slot_share=("ffn_units",),
+        reads={"OP_MUL", "CONST"} if enabled else set(),
+        writes={"OUTPUT_LO"} if enabled else set(),
+        kind="block",
+        target_op_name="layer14_mem_generation",
+        requires={"after": [
+            "layer14_demo_phase6_wave7",
+            "layer14_mem_generation",
+        ]} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=_ffn_lint_demo_ir("OUTPUT_LO"),
+        migrated=True,
+        declarative_authority="spec_generated",
+        # Chain tail: after ``layer14_demo_phase6_wave7`` (unit 1906), this op's
+        # auto-fit lands at 1907 -> cumulative max 1908. Only reserved when the
+        # flag is on; flag-off the op is not registered at all (byte-identical).
+        ffn_units_used=1908 if enabled else 0,
+        smoke_tests={"all"},
+        spec_section="tools/lint_cross_op_ffn.py",
+    )
+
+
+def make_ffn_lint_clean_demo_op() -> Operation:
+    """Tooling-only CLEAN-CONTROL fixture (DEFAULT OFF, C4_FFN_LINT_CLEAN_DEMO).
+
+    See the module banner above. IDENTICAL leaky OP_MUL silu unit, but routes
+    its W_down to a PRIVATE TEMP scratch dim (no OUTPUT/ALU band), so the lint's
+    shared-band probe sees no change and PASSES.
+    """
+    enabled = ffn_lint_clean_demo_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        _ffn_lint_demo_bake(
+            block, dim_positions, S,
+            chain_op_name="ffn_lint_clean_demo",
+            write_dim_name="TEMP",
+        )
+
+    return Operation(
+        name="ffn_lint_clean_demo",
+        slot_share=("ffn_units",),
+        reads={"OP_MUL", "CONST"} if enabled else set(),
+        writes={"TEMP"} if enabled else set(),
+        kind="block",
+        target_op_name="layer14_mem_generation",
+        # Only depend on always-registered ops (``ffn_lint_mull14_demo`` may be
+        # absent when only the clean flag is on). The chain allocator still
+        # pre-claims ``ffn_lint_mull14_demo``'s layout slot deterministically,
+        # so clean lands at unit 1908 whether or not mull14 is registered.
+        requires={"after": [
+            "layer14_demo_phase6_wave7",
+            "layer14_mem_generation",
+        ]} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=_ffn_lint_demo_ir("TEMP"),
+        migrated=True,
+        declarative_authority="spec_generated",
+        # Chain tail after ``ffn_lint_mull14_demo`` (unit 1907) -> unit 1908,
+        # cumulative max 1909. Only reserved when the flag is on; the
+        # ``mull14_demo`` predecessor in ``requires`` is only present when ITS
+        # flag is on, so when clean runs solo the chain alloc still pre-claims
+        # ``ffn_lint_mull14_demo``'s layout slot (1907) deterministically and
+        # clean lands at 1908 regardless. Flag-off -> not registered.
+        ffn_units_used=1909 if enabled else 0,
+        smoke_tests={"all"},
+        spec_section="tools/lint_cross_op_ffn.py",
     )
