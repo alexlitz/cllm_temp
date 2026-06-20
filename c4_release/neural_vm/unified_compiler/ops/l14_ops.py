@@ -15,6 +15,7 @@ from .shared import (
     ffn_lint_mull14_demo_enabled,
     no_stack0_emit_enabled,
 )
+from ..positional_invariant import marker_bank_index
 
 
 def _psh_arg_val_ax_enabled() -> bool:
@@ -480,11 +481,18 @@ def _layer14_mem_generation_head_specs(
     """
 
     L = 15.0
-    PC_I = 0
-    AX_I = 1
-    SP_I = 2
-    BP_I = 3
-    MEM_I = 4
+    # Class-1 marker-relative anchors. ``H<k>+<marker>_I`` / ``L1H*+<marker>_I``
+    # / ``L2H0+MEM_I`` are offsets into the fixed-width 7-slot threshold-head
+    # bank keyed on marker TYPE (PC/AX/SP/BP/MEM/SE), NOT token distances. The
+    # L0/L1/L2 ALiBi distance attention TRACKS each marker as the frame shrinks,
+    # so these bank-slot indices are frame-INVARIANT. Resolve them through the
+    # positional-invariant mechanism (single source of truth, declares the
+    # invariance to the audit) instead of the literals ``PC_I=0 .. MEM_I=4``.
+    PC_I = marker_bank_index("PC")
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
+    MEM_I = marker_bank_index("MEM")
 
     # Position flags: threshold-difference pairs selecting distance from
     # MEM. To predict addr_bJ (at d=J+1), L14 fires at d=J.
@@ -752,11 +760,15 @@ def _layer14_mem_generation_head_specs_with_overrides(
     the returned specs matches :data:`_L14_HEAD_LAYOUT`.
     """
 
-    pc_i = 0
-    ax_i = 1
-    sp_i = 2
-    bp_i = 3
-    mem_i = 4
+    # Class-1 marker-relative anchors (see _layer14_mem_generation_head_specs):
+    # frame-invariant threshold-bank slot indices resolved through the
+    # positional-invariant mechanism rather than the literals ``pc_i=0 ..
+    # mem_i=4``. Byte-identical (the helper returns the same integers).
+    pc_i = marker_bank_index("PC")
+    ax_i = marker_bank_index("AX")
+    sp_i = marker_bank_index("SP")
+    bp_i = marker_bank_index("BP")
+    mem_i = marker_bank_index("MEM")
 
     base_specs = _layer14_mem_generation_head_specs(BD)
     merged: list[DeclarativeAttentionHeadSpec] = []
@@ -786,10 +798,12 @@ def _layer14_mem_generation_head_specs_with_overrides(
         for key in slot33_keys:
             q_map[key] = q_map[key] * 2.0
         q_map[(33, BD.H1 + sp_i)] = 0.0
-        # Slot 35: MEM-source exclusion row (sign-stable).
+        # Slot 35: MEM-source exclusion row (sign-stable). ``BD.H3 + mem_i`` is
+        # the H3 distance-bank read at the MEM slot (Class-1 marker-relative;
+        # the bare literal ``+ 4`` re-expressed through ``marker_bank_index``).
         q_map[(35, BD.CONST)] = 40.0
         k_map[(35, BD.MARK_MEM)] = -40.0
-        k_map[(35, BD.H3 + 4)] = -40.0
+        k_map[(35, BD.H3 + mem_i)] = -40.0
         # Slot 38: shared non-MEM target blocker (override strength 5000
         # supersedes the base spec's 2000).
         target_block_s = 5000.0
