@@ -124,8 +124,23 @@ _SKIP_DIR_SEGMENTS = {
     "tests", "test_archive",
 }
 
-# The campaign guard. A function (or module) that calls this is campaign-aware.
+# The campaign guard. A function (or module) that calls this is campaign-aware
+# (the legacy hand-coded ``1e9 if no_stack0_emit_enabled() else ...`` branch).
 _CAMPAIGN_GUARD = "no_stack0_emit_enabled"
+
+# The systematic positional-invariant mechanism
+# (``neural_vm/unified_compiler/positional_invariant.py``). A function that
+# resolves its anchors through one of these helpers has DECLARED its frame
+# assumption to the compiler — the Class-1 marker-bank slot (``marker_bank_index``)
+# or the Class-2 absolute-slot auto-shift (``invariant_threshold`` /
+# ``frame_byte_is_emitted``). This is the preferred replacement for the
+# hand-coded campaign branch, so such refs are tagged DECLARED_INVARIANT (a
+# cleaner status than CAMPAIGN_AWARE) rather than UNGUARDED.
+_POSINV_HELPERS = frozenset({
+    "marker_bank_index",
+    "invariant_threshold",
+    "frame_byte_is_emitted",
+})
 
 # ---------------------------------------------------------------------------
 # Positional-frame dim set
@@ -278,11 +293,11 @@ _DIM_RECEIVERS = {"BD", "bd", "proxy", "self", "_bd", "BD_", "BDc"}
 
 class _Ref:
     __slots__ = ("lineno", "dim", "has_offset", "form", "func", "op",
-                 "guarded", "snippet")
+                 "guarded", "declared", "snippet")
 
     def __init__(self, lineno: int, dim: str, has_offset: bool, form: str,
                  func: str, op: Optional[str], guarded: bool,
-                 snippet: str) -> None:
+                 snippet: str, declared: bool = False) -> None:
         self.lineno = lineno
         self.dim = dim
         self.has_offset = has_offset
@@ -290,10 +305,17 @@ class _Ref:
         self.func = func
         self.op = op
         self.guarded = guarded
+        # Resolves its anchors through the positional-invariant mechanism.
+        self.declared = declared
         self.snippet = snippet
 
     @property
     def risk(self) -> str:
+        # The mechanism (DECLARED_INVARIANT) is the preferred, frame-correct
+        # status; the hand-coded campaign branch (CAMPAIGN_AWARE) is the legacy
+        # one; UNGUARDED is the shift-risk surface.
+        if self.declared:
+            return "DECLARED_INVARIANT"
         return "CAMPAIGN_AWARE" if self.guarded else "UNGUARDED"
 
     def as_dict(self, rel: str) -> Dict[str, object]:
@@ -307,6 +329,7 @@ class _Ref:
             "op": self.op,
             "risk": self.risk,
             "campaign_guarded": self.guarded,
+            "declared_invariant": self.declared,
             "snippet": self.snippet,
         }
 
@@ -326,6 +349,10 @@ class _FuncIndex:
         self._spans: List[Tuple[int, int, str, bool]] = []
         # function name -> calls no_stack0_emit_enabled() anywhere in its body
         self._func_guarded: Dict[str, bool] = {}
+        # function name -> resolves anchors via the positional-invariant
+        # mechanism (marker_bank_index / invariant_threshold / ...) anywhere in
+        # its body
+        self._func_declared: Dict[str, bool] = {}
         self._module_guarded = module_guarded
         self._index(tree)
 
@@ -341,16 +368,22 @@ class _FuncIndex:
                     (node.lineno, end, node.name, self._is_op_factory(node.name))
                 )
                 # Does this function (directly in its own body, incl nested
-                # bake closures) call the campaign guard?
+                # bake closures) call the campaign guard, or resolve its anchors
+                # through the positional-invariant mechanism?
                 guarded = False
+                declared = False
                 for sub in ast.walk(node):
-                    if (
-                        isinstance(sub, ast.Call)
-                        and self._call_name(sub) == _CAMPAIGN_GUARD
-                    ):
+                    if not isinstance(sub, ast.Call):
+                        continue
+                    cn = self._call_name(sub)
+                    if cn == _CAMPAIGN_GUARD:
                         guarded = True
+                    elif cn in _POSINV_HELPERS:
+                        declared = True
+                    if guarded and declared:
                         break
                 self._func_guarded[node.name] = guarded
+                self._func_declared[node.name] = declared
         # Narrowest span first when we search.
         self._spans.sort(key=lambda s: (s[1] - s[0]))
 
@@ -394,6 +427,18 @@ class _FuncIndex:
         if self._func_guarded.get(inner):
             return True
         if op is not None and self._func_guarded.get(op):
+            return True
+        return False
+
+    def declared(self, lineno: int) -> bool:
+        """Declared-invariant iff the innermost func or owning op resolves its
+        anchors through the positional-invariant mechanism
+        (``marker_bank_index`` / ``invariant_threshold`` /
+        ``frame_byte_is_emitted``)."""
+        inner, op = self.enclosing(lineno)
+        if self._func_declared.get(inner):
+            return True
+        if op is not None and self._func_declared.get(op):
             return True
         return False
 
@@ -479,8 +524,9 @@ def scan_file(path: Path, positional_dims: Set[str]) -> List[_Ref]:
 
         inner, op = findex.enclosing(lineno)
         guarded = findex.guarded(lineno)
+        declared = findex.declared(lineno)
         refs.append(_Ref(lineno, dim, has_offset, form, inner, op, guarded,
-                         snippet))
+                         snippet, declared=declared))
     refs.sort(key=lambda r: r.lineno)
     return refs
 
@@ -523,10 +569,14 @@ def collect(
     return by_file
 
 
+_RISK_RANK = {"UNGUARDED": 0, "CAMPAIGN_AWARE": 1, "DECLARED_INVARIANT": 2}
+
+
 def _rank_key(ref: _Ref) -> Tuple[int, int]:
-    # Lower sorts first. UNGUARDED before CAMPAIGN_AWARE; within each,
-    # distance-offset (doubly frame-dependent) before bare flag.
-    return (0 if not ref.guarded else 1, 0 if ref.has_offset else 1)
+    # Lower sorts first. UNGUARDED before CAMPAIGN_AWARE before
+    # DECLARED_INVARIANT; within each, distance-offset (doubly frame-dependent)
+    # before bare flag.
+    return (_RISK_RANK[ref.risk], 0 if ref.has_offset else 1)
 
 
 def _flatten(by_file: Dict[str, List[_Ref]]) -> List[Tuple[str, _Ref]]:
@@ -549,12 +599,13 @@ def _print_catalog(
     if dim_filter:
         flat = [(rel, r) for rel, r in flat if r.dim == dim_filter]
     if unguarded_only:
-        flat = [(rel, r) for rel, r in flat if not r.guarded]
+        flat = [(rel, r) for rel, r in flat if r.risk == "UNGUARDED"]
 
-    n_unguarded = sum(1 for _, r in flat if not r.guarded)
-    n_aware = sum(1 for _, r in flat if r.guarded)
+    n_unguarded = sum(1 for _, r in flat if r.risk == "UNGUARDED")
+    n_aware = sum(1 for _, r in flat if r.risk == "CAMPAIGN_AWARE")
+    n_declared = sum(1 for _, r in flat if r.risk == "DECLARED_INVARIANT")
     n_unguarded_offset = sum(
-        1 for _, r in flat if not r.guarded and r.has_offset
+        1 for _, r in flat if r.risk == "UNGUARDED" and r.has_offset
     )
 
     print("=" * 78)
@@ -568,7 +619,8 @@ def _print_catalog(
     print(
         f"references: {len(flat)} total | "
         f"{n_unguarded} UNGUARDED ({n_unguarded_offset} with a distance "
-        f"offset) | {n_aware} CAMPAIGN_AWARE"
+        f"offset) | {n_aware} CAMPAIGN_AWARE | "
+        f"{n_declared} DECLARED_INVARIANT"
     )
     print(
         "\nUNGUARDED = references a positional-frame dim AND the enclosing op "
@@ -715,12 +767,15 @@ def main(argv: List[str]) -> int:
         if args.dim:
             flat = [(rel, r) for rel, r in flat if r.dim == args.dim]
         if args.unguarded_only:
-            flat = [(rel, r) for rel, r in flat if not r.guarded]
+            flat = [(rel, r) for rel, r in flat if r.risk == "UNGUARDED"]
         payload = {
             "positional_dims": sorted(positional_dims),
             "n_refs": len(flat),
-            "n_unguarded": sum(1 for _, r in flat if not r.guarded),
-            "n_campaign_aware": sum(1 for _, r in flat if r.guarded),
+            "n_unguarded": sum(1 for _, r in flat if r.risk == "UNGUARDED"),
+            "n_campaign_aware": sum(
+                1 for _, r in flat if r.risk == "CAMPAIGN_AWARE"),
+            "n_declared_invariant": sum(
+                1 for _, r in flat if r.risk == "DECLARED_INVARIANT"),
             "references": [r.as_dict(rel) for rel, r in flat],
         }
         print(json.dumps(payload, indent=2))

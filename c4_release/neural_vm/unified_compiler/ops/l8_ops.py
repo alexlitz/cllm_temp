@@ -9,6 +9,7 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstraint
 from ..layer_compiler import Operation
+from ..positional_invariant import marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, no_stack0_emit_enabled
 
@@ -1121,12 +1122,23 @@ def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
     Both use ``b_gate = 1.0`` (no explicit W_gate) so they're
     constant_write rules.
     """
+    # Class-1 marker-relative anchor: ``H1+AX_I`` reads "nearest L1 threshold-bank
+    # marker is AX". The ``+AX_I`` is the frame-invariant marker-TYPE bank slot
+    # (``marker_bank_index`` resolves it from Token.STEP_TOKENS, byte-identical to
+    # the literal 1 at STEP_TOKENS=35) so the audit recognises the ref — and the
+    # mirrored ``scope`` / ``dominates_at`` claim strings — as declared-invariant
+    # rather than an UNGUARDED bare offset.
+    AX_I = marker_bank_index("AX")
+    H1_AX = f"H1+{AX_I}"
+    _scope = (
+        f"CMP+7 and {H1_AX} and IS_BYTE and BYTE_INDEX_1 and not HAS_SE"
+    )
     return (
         multi_way_and_rule(
             name="l8_alu_lea_axb2_lo",
             conditions=(
                 ("CMP+7", 1.0),
-                ("H1+1", 1.0),
+                (H1_AX, 1.0),
                 ("IS_BYTE", 1.0),
                 ("BYTE_INDEX_1", 1.0),
                 ("HAS_SE", -1.0),
@@ -1136,29 +1148,26 @@ def _layer8_alu_lea_axb2_rules(S: float) -> tuple[FFNRule, ...]:
                 ("OUTPUT_LO+1", 4.0 / S),
                 ("OUTPUT_LO+0", -4.0 / S),
             ),
-            scope="CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            scope=_scope,
             dominates_at={
-                "OUTPUT_LO+1":
-                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
-                "OUTPUT_LO+0":
-                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+                "OUTPUT_LO+1": _scope,
+                "OUTPUT_LO+0": _scope,
             },
         ),
         multi_way_and_rule(
             name="l8_alu_lea_axb2_hi",
             conditions=(
                 ("CMP+7", 1.0),
-                ("H1+1", 1.0),
+                (H1_AX, 1.0),
                 ("IS_BYTE", 1.0),
                 ("BYTE_INDEX_1", 1.0),
                 ("HAS_SE", -1.0),
             ),
             threshold=3.5,
             writes=(("OUTPUT_HI+0", 2.0 / S),),
-            scope="CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+            scope=_scope,
             dominates_at={
-                "OUTPUT_HI+0":
-                    "CMP+7 and H1+1 and IS_BYTE and BYTE_INDEX_1 and not HAS_SE",
+                "OUTPUT_HI+0": _scope,
             },
         ),
     )
@@ -1678,7 +1687,13 @@ def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Declarative replacement for ``vm_step._set_layer8_multibyte_fetch``."""
 
     L = 20.0
-    AX_I = 1
+    # Class-1 marker-relative anchor: ``H1+AX_I`` reads "nearest marker is the
+    # AX register" via the L1 threshold-head distance bank. The ``+AX_I`` is the
+    # marker-TYPE bank slot (frame-invariant), not a token distance —
+    # ``marker_bank_index`` resolves it from Token.STEP_TOKENS (byte-identical to
+    # the literal 1 at STEP_TOKENS=35) so the audit recognises the ref as
+    # declared-invariant rather than an UNGUARDED bare offset.
+    AX_I = marker_bank_index("AX")
     TOP = 36
     # Removal-1 (2026-06-06): Q-side MARK_AX gate + K-side HAS_SE blocker
     # on slot 52. Per docs/REMOVAL_1_REAL_SURFACE_2026_06_06.md Option A,
@@ -1839,9 +1854,13 @@ def _layer8_multibyte_routing_rules(S: float) -> tuple[FFNRule, ...]:
     """Declarative L8 multibyte IMM routing extension after the ALU units."""
 
     rules = []
+    # Class-1 marker-relative anchor: ``H1+AX_I`` keys on the AX-register
+    # threshold-bank slot (frame-invariant; ``marker_bank_index`` resolves it
+    # from Token.STEP_TOKENS, byte-identical to the literal 1 at STEP_TOKENS=35).
+    AX_I = marker_bank_index("AX")
     conditions = (
         ("IS_BYTE", 1.0),
-        ("H1+1", 1.0),
+        (f"H1+{AX_I}", 1.0),
         ("OP_IMM", 1.0),
         ("MARK_AX", -4.0),
     )
@@ -2080,10 +2099,18 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
     """Declarative replacement for ``vm_step._set_layer8_sp_gather``."""
 
     L = 15.0
-    AX_I = 1
-    SP_I = 2
-    BP_I = 3
-    MEM_I = 4
+    # Class-1 marker-relative anchors: ``H<k>+<marker_I>`` indexes the
+    # marker-TYPE slot in the fixed-width 7-slot threshold-head bank (PC=0 AX=1
+    # SP=2 BP=3 MEM=4 SE=5), a structural position keyed on marker TYPE whose
+    # order is identical in both the 35- and 30-token frames (STACK0 is a
+    # transition target, never a bank slot) — frame-INVARIANT by construction.
+    # ``marker_bank_index`` is the single source of truth (byte-identical at
+    # STEP_TOKENS=35, unchanged at 30) so the audit recognises these as
+    # declared-invariant rather than bare UNGUARDED offsets.
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
+    MEM_I = marker_bank_index("MEM")
 
     specs: list[DeclarativeAttentionHeadSpec] = []
     _sp_gather_main_names = (
@@ -2438,7 +2465,9 @@ def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     used by the L9 ALiBi relay heads (l9_ops.py:1375+).
     """
 
-    AX_I = 1
+    # Class-1 marker-relative anchor (see ``_layer8_multibyte_fetch_head_spec``):
+    # ``H1+AX_I`` keys on the AX-register threshold-bank slot, frame-invariant.
+    AX_I = marker_bank_index("AX")
     L8_relay = 20.0
     return DeclarativeAttentionHeadSpec(
         head_idx=_L8_HEAD_LAYOUT_BY_NAME["layer8_op_imm_relay.head_4"],
@@ -2678,8 +2707,12 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         # K-side below is a correct-placement scaffold, NOT a delivering CAM.
         #
         # Value-byte-0 row predicate (matches probe data, add_9 step1 off31):
-        #   L2H0[MEM_I] = 1  AND  H1[MEM_I] = 0   (MEM_I = 4 = MEM marker index)
-        MEM_I = 4
+        #   L2H0[MEM_I] = 1  AND  H1[MEM_I] = 0   (MEM_I = MEM marker index = 4)
+        # Class-1 marker-relative: MEM_I is the MEM slot in the threshold-head
+        # bank (frame-invariant — same in the 35- and 30-token frames), resolved
+        # through ``marker_bank_index`` instead of the literal 4 so the audit
+        # recognises ``L2H0 + MEM_I`` / ``H1 + MEM_I`` as declared-invariant.
+        MEM_I = marker_bank_index("MEM")
         VR = 120.0  # value-row select strength (Q@AX * K@value-row)
 
         # Dim 1: value-byte-0 row select. Positive only when the K row is the
