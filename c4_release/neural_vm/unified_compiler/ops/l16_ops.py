@@ -120,6 +120,42 @@ def _lev_stack0_preserve_se_blocker_on() -> bool:
     return os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
 
 
+def _lev_pc_top_return_opcode_gate_on() -> bool:
+    """DEFAULT-OFF guard (opt in with ``C4_L16_LEV_PC_TOP_OPCODE_GATE=1``): add a
+    PER-STEP ``OPCODE_BYTE_LO+8`` (== LEV) multiplicative gate to the
+    ``l16_lev_pc_top_return_0a`` rule so the top-level return-address default
+    (PC=0x0a) is written ONLY at a genuine LEV step and never bleeds into the
+    step AFTER the LEV.
+
+    ROOT (spec_k=0, BUILT dims, func_identity_0 id550, 2026-06-20, the C4_L15_LEV
+    func chain ON): the ``l16_lev_pc_top_return_0a`` rule (block 34 / logical L20
+    lev_routing) writes the bootstrap return address 0x0a into the PC OUTPUT,
+    gated on ``OP_LEV AND MARK_PC AND HAS_SE AND H1+0``. ``OP_LEV`` is a
+    CROSS-STEP DURABLE opcode broadcast, so it PERSISTS into the step AFTER the
+    LEV. For ``func_identity`` the LEV is step 8 (``pc 50->90``, restored by the
+    L15 head-14 PC-restore) and the very next instruction is ``ADJ 8``
+    (``pc 90->98``); at the step-9 ``ADJ`` PC marker ``OP_LEV`` is STILL +6.5 and
+    ``MARK_PC``/``HAS_SE``/``H1+0`` all hold, so this rule RE-FIRES and crushes
+    the CORRECT step-9 PC (98, computed by the normal advance through block 32)
+    down to 0x0a=10 -> full_trace diverges at step 9 (got_pc=10 vs expected 98).
+    Traced: step-9 PC OUTPUT is 0x62(98) through block 33 and becomes 0x0a(10) at
+    block 34 (this rule).
+
+    THE CLEAN DISCRIMINATOR (same as the L15 head-14 opcode gate): the per-step
+    FETCHED opcode lives in ``OPCODE_BYTE_LO/HI`` as a sharp one-hot. LEV (opcode
+    8 = 0x08) -> ``OPCODE_BYTE_LO+8 == 1.0`` ONLY at the genuine LEV step; the
+    post-LEV ``ADJ`` step (opcode 7) is ``OPCODE_BYTE_LO+7``. A genuine TOP-LEVEL
+    LEV (where 0x0a IS the correct return) is itself a LEV step, so the gate
+    preserves the legitimate firing case and only vetoes the post-LEV residue.
+
+    FIX: a multiplicative ``gate="OPCODE_BYTE_LO+8"`` on the rule -> the write is
+    scaled by ~1.0 at the genuine LEV step (unchanged) and ~0 at every other step
+    (the residue step writes nothing). DEFAULT-OFF so HEAD is byte-identical;
+    ships with the C4_L15_LEV func chain.
+    """
+    return os.environ.get("C4_L16_LEV_PC_TOP_OPCODE_GATE", "0") == "1"
+
+
 def _stack0_marker_isbyte_hardening_on() -> bool:
     """Inc-3 ROOT B (campaign config): harden the ``IS_BYTE`` up-path blocker of
     the ``l16_stack0_{e8,e0,f8}_marker_from_alu_*`` ALU->OUTPUT materializers so
@@ -690,6 +726,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # top-level LEV marker because OP_LEV + MARK_PC alone crosses their old
     # threshold. Keep the byte-identical legacy prefix, then make the proven
     # top-level return address (0x0a) authoritative.
+    # The ``OP_LEV`` gate is a CROSS-STEP durable broadcast that persists into the
+    # step AFTER the LEV, so on the post-LEV ADJ PC marker this rule re-fires and
+    # crushes the correct advanced PC to 0x0a. ``C4_L16_LEV_PC_TOP_OPCODE_GATE``
+    # adds a per-step ``OPCODE_BYTE_LO+8`` (== LEV fetched opcode) multiplicative
+    # gate so the write lands ONLY at a genuine LEV step (see the flag docstring).
+    # Default-OFF -> byte-identical to HEAD (no gate, pure-threshold write).
+    _lev_pc_top_gate = (
+        "OPCODE_BYTE_LO+8" if _lev_pc_top_return_opcode_gate_on() else None
+    )
     rules.append(multi_way_and_rule(
         name="l16_lev_pc_top_return_0a",
         conditions=(
@@ -705,6 +750,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_MEM", -10.0),
         ),
         threshold=7.5,
+        gate=_lev_pc_top_gate,
         writes=Primitives.byte_value_writes(0x0A, strength=20.0),
     ))
 

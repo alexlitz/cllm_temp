@@ -217,6 +217,46 @@ def _l15_lev_pc_only_on() -> bool:
     return _os_l15.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0"
 
 
+def _l15_lev_opcode_gate_on() -> bool:
+    """DEFAULT-OFF flag (``C4_L15_LEV_OPCODE_GATE``): hard-gate the LEV PC-restore
+    head 14 on the *per-step fetched opcode* (``OPCODE_BYTE_LO+8`` == LEV) so it
+    fires STRICTLY at the genuine LEV step and never bleeds into the NEXT step.
+
+    ROOT (spec_k=0, BUILT dims, func_identity_0 id550, 2026-06-20): the existing
+    PC-ONLY gate (slots 67/69) requires ``MARK_PC AND OP_LEV``. But ``OP_LEV`` is
+    a CROSS-STEP DURABLE opcode broadcast ("the last-executed opcode was LEV"),
+    so it PERSISTS into the step AFTER the LEV. For ``func_identity`` the LEV is
+    step 8 (``pc 50->90``) and the very next instruction is ``ADJ 8``
+    (``pc 90->98``); at the step-9 ``ADJ`` PC marker ``OP_LEV`` is STILL +6.5
+    (even HIGHER than step 8's +5.2) and ``MARK_PC`` is +1.0, so head 14 fires
+    again (w=1.0 on the return store p269, v=0x5a=90) and PINS the step-9 PC to
+    90 instead of letting it advance to 98 -> full_trace diverges at step 9
+    (``got_pc=90 expected_pc=98``, and the wrong PC further desyncs AX 70->72).
+
+    THE CLEAN DISCRIMINATOR: ``OPCODE_BYTE_LO/HI`` carries the per-step FETCHED
+    opcode (not the broadcast residue). It is a sharp one-hot at every PC marker:
+    LEV (opcode 8 = 0x08) -> ``OPCODE_BYTE_LO+8 == 1.0`` ONLY at the genuine LEV
+    step; the post-LEV ``ADJ`` step (opcode 7) is ``OPCODE_BYTE_LO+7``. Measured
+    across func_identity (LEV@8) AND func_add (LEV@14): ``OPCODE_BYTE_LO+8`` is
+    1.0 exactly at the LEV step and ~0 at every other step including the next.
+    (The two other low-nibble-8 opcodes -- SHR 0x18, POP 0x28 -- are already
+    excluded by the slot-69 ``OP_LEV`` requirement: their own step broadcasts
+    OP_SHR/OP_POP, not OP_LEV.)
+
+    FIX: a single fail-closed HARD-DARK slot mirroring slots 67/69 but keyed on
+    ``OPCODE_BYTE_LO+8`` -- ``q = HARD*CONST - HARD*(OPCODE_BYTE_LO+8)`` (=> 0 at
+    the LEV step where that cell is 1.0, ``+HARD`` everywhere else) paired with
+    ``k = -CONST`` at every key. On a non-LEV-opcode row this drives every real
+    key's score to ~-1e9 so softmax1 collapses to the zero sink and head 14
+    writes ~nothing; on the genuine LEV step it contributes exactly 0 so the
+    address slots + STACK0-byte0 selector still decide the genuine return-store
+    gather. Only emitted when BOTH ``C4_L15_LEV_ADDR_WIDEN`` and this flag are on
+    (it folds into the widen build's cache key); flag-off omits the slot so the
+    build is byte-identical to the widen/pc-only build.
+    """
+    return _os_l15.environ.get("C4_L15_LEV_OPCODE_GATE", "0") != "0"
+
+
 _L15_LEV_PC_RESTORE_HEAD_IDX = 14
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
@@ -1840,6 +1880,26 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
         q.append(AP(69, BD.CONST, HARD))
         q.append(AP(69, BD.OP_LEV, -HARD / 4.0))
         k.append(AP(69, BD.CONST, -1.0))
+
+    # === Slot 70: PER-STEP LEV-opcode firing gate (C4_L15_LEV_OPCODE_GATE). ===
+    # The slot-69 OP_LEV requirement is a CROSS-STEP DURABLE broadcast and so
+    # PERSISTS into the step AFTER the LEV (e.g. func_identity LEV@step8 then
+    # ADJ@step9, where OP_LEV is still +6.5 and MARK_PC=1 -> head 14 re-fires and
+    # pins the step-9 PC to 90 instead of 98). The per-step FETCHED opcode lives
+    # in OPCODE_BYTE_LO/HI as a sharp one-hot (LEV = 0x08 -> OPCODE_BYTE_LO+8 =
+    # 1.0 ONLY at the genuine LEV step; the post-LEV ADJ step is +7). This slot
+    # mirrors the slot-67/69 fail-closed design but keyed on OPCODE_BYTE_LO+8:
+    #   q = HARD*CONST - HARD*(OPCODE_BYTE_LO+8)  (=> 0 at the LEV step, +HARD
+    #                                              everywhere else)
+    #   k = -CONST (present, value 1, at every real key; sink stays 0)
+    # so a non-LEV-opcode row is driven to ~-1e9 (softmax1 -> zero sink, head
+    # writes ~nothing) while the genuine LEV step contributes exactly 0 and the
+    # address slots + STACK0-byte0 selector decide the genuine gather unchanged.
+    if _widen and _l15_lev_opcode_gate_on():
+        HARD = 5_000_000.0
+        q.append(AP(70, BD.CONST, HARD))
+        q.append(AP(70, BD.OPCODE_BYTE_LO + 8, -HARD))
+        k.append(AP(70, BD.CONST, -1.0))
 
     # === Slot 64: OP_JSR return-store discriminator (ADDRESS-WIDENING). ===
     # The deepest CAM-aliasing layer (after byte-0 separates 0xFFF0 from the
