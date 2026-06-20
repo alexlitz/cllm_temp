@@ -612,6 +612,16 @@ def all_core_ops(
         # (byte-identical).
         make_l10_nonfirst_psh_sp_helper_op(),
         make_tail_bit32_result_correction_op(),
+        # L10 EXIT/no-clean-opcode AX_CARRY -> OUTPUT source fix (flag
+        # C4_L10_EXIT_AXCARRY, default OFF): a post_op attached AFTER
+        # tail_bit32_result_correction that, on the post-LEV EXIT step (MARK_AX
+        # + LEAKED OP_LEA + no OUTPUT-owning opcode + no MEM_ADDR_SRC), routes
+        # the (correct, uncorrupted) AX_CARRY byte into OUTPUT, out-voting the
+        # spurious LEA effective-address materializer that otherwise stamps the
+        # stale frame-pointer high nibble (0xF0 instead of 42). Ships
+        # test_simple_function under the 6 LEV flags. Flag-off => no rules, no
+        # post_op (byte-identical to HEAD).
+        make_l10_exit_axcarry_op(),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =
         # a1 + b1 + carry at the ADD byte-1 row, completing the multi-byte
