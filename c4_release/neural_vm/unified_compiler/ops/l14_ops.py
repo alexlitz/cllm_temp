@@ -9,7 +9,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, no_stack0_emit_enabled
 
 
 def _psh_arg_val_ax_enabled() -> bool:
@@ -1346,6 +1346,22 @@ def _layer14_alu_high_byte_relay_spec(BD) -> DeclarativeAttentionHeadSpec:
         AP(36, BD.MARK_MEM, -6000.0),
         AP(36, BD.STACK0_BYTE0, -6000.0),
     ]
+    if no_stack0_emit_enabled() and _os.environ.get("C4_MUL_BLK33_CLAWBACK") == "1":
+        # === DEMO REGRESSION (re-applied ba06deaa, 2026-06-20) ===
+        # This is the salvaged-but-UNVERIFIED mul byte-1 "claw-back": it
+        # hard-excludes the MARK_AX marker row from being a Q-firing row of
+        # the high-byte relay, intending to stop a spurious marker-row write
+        # for MUL in the 30-token campaign frame. It is byte-identical golden
+        # (this block only exists in the campaign config AND only when the
+        # C4_MUL_BLK33_CLAWBACK kill-switch is set), but it REGRESSES
+        # add/sub/div in the campaign config (the marker-row exclusion starves
+        # their byte-1 relay) — the EXACT flag-OFF-clean-yet-campaign-regression
+        # blind spot tools/flag_regression_gate.py exists to catch. Gated behind
+        # its own kill-switch so the gate can toggle it ON vs OFF.
+        q.append(AP(0, BD.MARK_AX, -100000.0))
+        q.append(AP(1, BD.MARK_AX, -100000.0))
+        q.append(AP(33, BD.MARK_AX, -100000.0))
+        q.append(AP(35, BD.MARK_AX, -100000.0))
     # 16-bit OR/XOR byte-1 fix (2026-06-11): widen the K-gate from
     # OP_MUL/OP_SHL to also fire on OP_OR/OP_XOR. The L13
     # ``layer13_bitwise_byte1_gather`` head stages operand-A byte 1 into
