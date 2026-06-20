@@ -213,6 +213,54 @@ def divmod_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_DIVMOD_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def divmod_axcarry_clear_enabled() -> bool:
+    """Return True iff the divmod writeback CLEARS the AX_CARRY (divisor) band
+    at the divmod AX row (DEFAULT ON in the campaign config — opt-out via
+    ``C4_DIVMOD_AXCARRY_CLEAR=0``; only takes effect when the STACK0 emission
+    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; ~10 div/mod fails of the
+    "got_ax == divisor" pattern, e.g. 1162/37 -> 37, 2009/43 -> 43, 106/4 ->
+    4, 794/49 -> 49):
+
+    The ``FlattenedDivMod`` (block 28 / logical L14) computes the CORRECT
+    quotient/remainder into OUTPUT_LO/HI at +2.0 (the long-division compute is
+    bit-exact for every residual operand — there is NO divider arch-wall). But
+    for a MULTI-BYTE dividend the L10 ALU-clear crushes ALU_LO/HI all-negative
+    at the divmod row (probe ``tools/probe_divmod_l20_src.py``: 1162/37 ->
+    ALU == -45 uniform). The downstream L20 ``layer16_lev_routing`` frame-relay
+    then MIS-FIRES on that crushed-ALU divmod row and MATERIALIZES the
+    AX_CARRY band (the DIVISOR, e.g. 0x25 == 37) into OUTPUT at +4.4, out-
+    voting the +2.0 quotient — so the emitted AX byte is the divisor, not the
+    quotient. (The PASSING divmod rows keep a clean positive ALU one-hot and
+    the L20 relay stays silent — verified pass-vs-fail discriminator.)
+
+    The divmod has already CONSUMED the divisor (operand-B byte 0 read from
+    AX_CARRY_LO/HI into GE NIB_B by ``BDToGEConverter`` at the divmod block
+    input) by the time the writeback runs, so the AX_CARRY band is dead at the
+    divmod AX row from L14 onward. Clearing it removes the divisor source the
+    L20 relay leaks, so the +2.0 quotient survives to the AX emit. Verified
+    (hook ``tools/probe_divmod_alurestore_test.py MODE=clearaxc``): 1162/37,
+    106/4, 2009/43, 794/49 -> CORRECT quotient; PASSING rows (843/31, 176/4,
+    54/7) UNCHANGED. The 0xE8 (744) and L18 slam patterns are SEPARATE
+    downstream-tail corruptors (out of the divmod writeback's reach).
+
+    AX_CARRY is only read downstream by opcode-gated ops (OP_MUL at L12,
+    OP_LI/LC/SI/SC at L13/L15) whose gates are inactive on a divmod row, and
+    by the L14 ``AX_CARRY_HI+15`` NOT-blocker (cleared band == "not 15" ==
+    safe), so the divmod-row clear touches no other op/config.
+
+    DEFAULT ON. Opt-out via ``C4_DIVMOD_AXCARRY_CLEAR=0`` restores the raw
+    AX_CARRY passthrough (the byte-identical-OFF path: flag-OFF or
+    ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden ``4958b35b``).
+    Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_DIVMOD_AXCARRY_CLEAR`` can A/B it
+    inside the campaign config.
+    """
+    return os.environ.get("C4_DIVMOD_AXCARRY_CLEAR", "1") != "0"
+
+
 def addsub_output_boost_enabled() -> bool:
     """Return True iff the imperative AddSub5StageBlock writes its byte-0
     OUTPUT_LO/HI at a DOMINANT amplitude (DEFAULT ON — opt-out via

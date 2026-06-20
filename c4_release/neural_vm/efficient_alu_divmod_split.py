@@ -240,6 +240,42 @@ class _DivModGEToBDStage(nn.Module):
             opcode_mask=opcode_mask,
             emit_carry=False,
         )
+
+        # === STACK0 campaign (2026-06-20): divmod AX_CARRY (divisor) clear ===
+        #
+        # Under the campaign config the correct quotient written above (+2.0 in
+        # OUTPUT) is out-voted on the divmod AX row by the downstream L20
+        # ``layer16_lev_routing`` frame-relay, which MIS-FIRES on the multi-byte
+        # divmod row (its ALU band was crushed all-negative by the L10 clear)
+        # and materializes the AX_CARRY band — the DIVISOR — into OUTPUT at
+        # +4.4, so the emitted AX byte becomes the divisor instead of the
+        # quotient (the "got_ax == divisor" residual, ~10 div/mod fails). The
+        # divmod has already consumed operand-B byte 0 from AX_CARRY (read into
+        # GE NIB_B by ``BDToGEConverter`` at the divmod block input), so the
+        # band is dead at this row from L14 onward. Clear it here, gated on the
+        # SAME divmod-AX ``opcode_mask`` used for the OUTPUT write, so the L20
+        # relay has no divisor to leak and the quotient survives to the emit.
+        # See ``shared.divmod_axcarry_clear_enabled`` for the full rationale +
+        # the byte-identity envelope. Flag-OFF / ``C4_NO_STACK0_EMIT=0`` leave
+        # AX_CARRY untouched (byte-identical to golden ``4958b35b``).
+        from .unified_compiler.ops.shared import (
+            no_stack0_emit_enabled,
+            divmod_axcarry_clear_enabled,
+        )
+        if (
+            no_stack0_emit_enabled()
+            and divmod_axcarry_clear_enabled()
+            and hasattr(BD, "AX_CARRY_LO")
+            and hasattr(BD, "AX_CARRY_HI")
+        ):
+            keep = (1.0 - opcode_mask)[:, :, None].to(dtype=x_bd_out.dtype)
+            x_bd_out[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16] = (
+                x_bd_out[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16] * keep
+            )
+            x_bd_out[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] = (
+                x_bd_out[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] * keep
+            )
+
         return x_bd_out
 
 
