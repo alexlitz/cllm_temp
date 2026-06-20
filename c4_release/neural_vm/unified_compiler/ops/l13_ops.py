@@ -1006,6 +1006,25 @@ def _layer13_add_addend_relay_head_specs(BD) -> tuple:
         # well enough for the L25 high-byte adder, and an extra stamp REGRESSES
         # ADD (24->14, GPU-measured): it over-fires the TEMP+8-gated L14 add
         # byte-1 cleanup / cascade rules. The carrier delivery alone is the win.
+        #
+        # === STACK0 campaign Inc-4 (2026-06-20): ADD byte-1 RESULT delivery. ===
+        # The Inc-3 relay delivers a1 (operand-A byte 1) into STACK0_BYTE_VAL_1
+        # at the emit row, but the downstream ``l10_add_high_byte_adder`` (the
+        # Part-2 op that computes OUTPUT byte 1 = a1 + b1 + carry) is gated on
+        # TEMP+8 AT the emit row -- and GPU-confirmed (probe_inc3_addsub_b1_trace)
+        # the 30-token campaign frame leaves TEMP+8 = 0 at the BYTE_INDEX_0 emit
+        # row (it lands only on the MARK_AX marker). So the adder never fires:
+        # byte 1 stays b1-only, dropping a1 AND the byte-0 carry (add_1 0x310 ->
+        # 0x210, add_6 0x5BF -> 0x2BF). Stamp a DEDICATED campaign discriminator
+        # TEMP+12 onto the emit row (a free TEMP slot the L14 add cleanup does
+        # NOT read -- so it cannot reproduce the TEMP+8 over-fire above). V reads
+        # OP_ADD (= 5.0 ONLY at the matched ADD marker -> ~0 elsewhere, clean and
+        # ADD-exclusive); 0.2 scale yields TEMP+12 ~= 1.0 at the emit row for
+        # EVERY ADD step (including a1 = 0, where the carrier collapses to 0 but
+        # the carry-in still must be summed). The campaign-gated branch of
+        # ``l10_add_high_byte_adder`` reads TEMP+12 instead of TEMP+8.
+        v.append(AP(base + 32, BD.OP_ADD, 0.2))
+        o.append(AO(BD.TEMP + 12, base + 32, 1.0))
         return (
             DeclarativeAttentionHeadSpec(
                 head_idx=5, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),

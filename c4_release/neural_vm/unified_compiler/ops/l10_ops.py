@@ -9141,6 +9141,32 @@ def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
     # Per-condition gate weight. Each one-hot positive condition scores
     # ~GATE; the threshold sits between all-on and missing-one.
     GATE = 1000.0
+    # ADD byte-row selector. Legacy (35-token) frame spreads TEMP+8 to the
+    # BYTE_INDEX_0 emit row, so the adder gates on it there. STACK0 campaign
+    # Inc-4 (2026-06-20): the 30-token frame leaves TEMP+8 = 0 at the emit row
+    # (GPU-confirmed), so the L13 add relay (head 5) instead stamps a dedicated
+    # campaign discriminator TEMP+12 onto the emit row (a free slot the L14 add
+    # cleanup does NOT read, so no TEMP+8-style over-fire). Re-gate the adder on
+    # TEMP+12 in the campaign config so it fires at the emit row and computes
+    # OUTPUT byte 1 = a1 + b1 + carry. Flag-OFF keeps TEMP+8 (byte-identical).
+    GATE_DIM = "TEMP+12" if operand_from_memsp_enabled() else "TEMP+8"
+    # GATE_DIM weight + threshold bump. The discriminator dim MUST be a HARD
+    # gate: its absence has to sink the rule below threshold. In the campaign
+    # config (a1=0 CONST path) the other terms can sum high on a NON-ADD emit
+    # row (var return: IS_BYTE+HAS_SE+H1+1+BYTE_INDEX_0+CONST + an INFLATED
+    # ADDR_B1_LO+0 ~= 2.95 -> 7592 > 6400), so a +1000 TEMP+12 gate is too weak
+    # -- the rule false-fires when TEMP+12 = 0, corrupting var_simple byte 1
+    # (GPU-confirmed -6 regression). Weight TEMP+12 at 1e5 and bump every
+    # threshold by 1e5 so a genuine ADD row (TEMP+12 = 1) is UNCHANGED in
+    # margin while a non-ADD row (TEMP+12 = 0) loses the full 1e5 and is hard-
+    # blocked regardless of any inflated operand term. Flag-OFF keeps the
+    # legacy +GATE weight / no bump (byte-identical).
+    if operand_from_memsp_enabled():
+        GATE_DIM_W = 3_000.0
+        THR_BUMP = 3_000.0
+    else:
+        GATE_DIM_W = GATE
+        THR_BUMP = 0.0
     # The relay deposits a1 into STACK0_BYTE_VAL_1_LO with magnitude ~3.0
     # (the L13 head 5 V/O copy scale), not a unit one-hot. Weight that
     # condition GATE/3 so its contribution (~3.0 * GATE/3 = GATE) matches
@@ -9156,8 +9182,21 @@ def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
     # stabiliser (0x00 / 0x88-leak crush). This op one-hots the correct
     # (a1+b1+carry) byte at 5e6 so it OVER-writes the carry-only result and
     # wins the argmax, while the tail's stabiliser keeps the band bounded.
-    STRENGTH = 5_000_000.0     # target-cell boost (overrides the tail)
-    COMPETITOR = 5_000_000.0   # symmetric suppression of non-target cells
+    #
+    # STACK0 campaign Inc-4 (2026-06-20): the 30-token frame's OUTPUT_LO band
+    # is driven MUCH harder than the 35-token tail -- GPU-confirmed a ~6e9
+    # competing write at the WRONG byte-1 cell (the L9 ALU_LO->OUTPUT_LO
+    # operand-low-nibble leak, amplified in the collapsed frame). At 5e6 the
+    # adder's correct-byte write is invisible against it (25+759 stayed 0x210).
+    # Lift the campaign adder strength to 5e10 so the (a1+b1+carry) cell wins
+    # the argmax over the 6e9 leak. Flag-OFF keeps 5e6 (byte-identical; the
+    # 35-token band is bounded and 5e6 already dominates there).
+    if operand_from_memsp_enabled():
+        STRENGTH = 5.0e10
+        COMPETITOR = 5.0e10
+    else:
+        STRENGTH = 5_000_000.0     # target-cell boost (overrides the tail)
+        COMPETITOR = 5_000_000.0   # symmetric suppression of non-target cells
 
     # Marker / opcode / transition blockers are EXACTLY 0 at the ADD AX
     # byte-1 row (markers off, opcode bits decayed, NEXT_* off), so a large
@@ -9171,67 +9210,107 @@ def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
     # spec_k0, add_18 ``828+890``), so a -1e6 TEMP+6 blocker amplifies that
     # leak to -30e6 and over-blocks the genuine ADD adder. The positive
     # TEMP+8 gate is the load-bearing ADD discriminator.
+    #
+    # STACK0 campaign Inc-4 (2026-06-20): the 30-token frame leaves VARIABLE
+    # in-step opcode-broadcast residues at the emit row (GPU-measured OP_SI
+    # ~0.22, OP_ENT ~0.044 on some ADD programs -- the documented in-step
+    # broadcast corruptor). At -1e6 those amplify to -220k/-44k and VETO the
+    # genuine ADD adder (25+759, 665+718, 825+163 stayed wrong). Use a MODEST
+    # -1000 blocker in the campaign config: a 0.22 OP_SI residue -> -221 (at
+    # -3000 it was -660, which still left the tight a1=0/carry threshold 187
+    # short on add_1 25+759); and a REAL off-ADD marker/opcode is irrelevant
+    # here because the load-bearing discriminator is the positive TEMP+12 gate
+    # -- stamped by the L13 add relay ONLY on genuine ADD emit rows -- so the
+    # adder is already dark on every non-ADD row regardless of these blockers.
+    # Flag-OFF keeps -1e6 (byte-identical; the 35-token frame has no such
+    # residue here).
+    BLK = -1_000.0 if operand_from_memsp_enabled() else -1_000_000.0
     marker_blockers = (
-        ("MARK_AX", -1_000_000.0),
-        ("MARK_PC", -1_000_000.0),
-        ("MARK_SP", -1_000_000.0),
-        ("MARK_BP", -1_000_000.0),
-        ("MARK_STACK0", -1_000_000.0),
-        ("MARK_MEM", -1_000_000.0),
-        ("H1+0", -1_000_000.0),
-        ("H1+2", -1_000_000.0),
-        ("H1+3", -1_000_000.0),
-        ("H1+4", -1_000_000.0),
+        ("MARK_AX", BLK),
+        ("MARK_PC", BLK),
+        ("MARK_SP", BLK),
+        ("MARK_BP", BLK),
+        ("MARK_STACK0", BLK),
+        ("MARK_MEM", BLK),
+        ("H1+0", BLK),
+        ("H1+2", BLK),
+        ("H1+3", BLK),
+        ("H1+4", BLK),
         ("BYTE_INDEX_1", -3_000.0),
         ("BYTE_INDEX_2", -3_000.0),
         ("BYTE_INDEX_3", -3_000.0),
     )
     non_add_blockers = (
-        ("OP_IMM", -1_000_000.0),
-        ("OP_LEA", -1_000_000.0),
-        ("OP_SUB", -1_000_000.0),
-        ("OP_DIV", -1_000_000.0),
-        ("OP_MOD", -1_000_000.0),
-        ("OP_AND", -1_000_000.0),
-        ("OP_OR", -1_000_000.0),
-        ("OP_XOR", -1_000_000.0),
-        ("OP_EQ", -1_000_000.0),
-        ("OP_NE", -1_000_000.0),
-        ("OP_LT", -1_000_000.0),
-        ("OP_GT", -1_000_000.0),
-        ("OP_LE", -1_000_000.0),
-        ("OP_GE", -1_000_000.0),
-        ("OP_SHL", -1_000_000.0),
-        ("OP_SHR", -1_000_000.0),
-        ("OP_SI", -1_000_000.0),
-        ("OP_SC", -1_000_000.0),
-        ("OP_LI", -1_000_000.0),
-        ("OP_LC", -1_000_000.0),
-        ("OP_ENT", -1_000_000.0),
-        ("MEM_STORE", -1_000_000.0),
+        ("OP_IMM", BLK),
+        ("OP_LEA", BLK),
+        ("OP_SUB", BLK),
+        ("OP_DIV", BLK),
+        ("OP_MOD", BLK),
+        ("OP_AND", BLK),
+        ("OP_OR", BLK),
+        ("OP_XOR", BLK),
+        ("OP_EQ", BLK),
+        ("OP_NE", BLK),
+        ("OP_LT", BLK),
+        ("OP_GT", BLK),
+        ("OP_LE", BLK),
+        ("OP_GE", BLK),
+        ("OP_SHL", BLK),
+        ("OP_SHR", BLK),
+        ("OP_SI", BLK),
+        ("OP_SC", BLK),
+        ("OP_LI", BLK),
+        ("OP_LC", BLK),
+        ("OP_ENT", BLK),
+        ("MEM_STORE", BLK),
     )
     transition_blockers = (
-        ("NEXT_PC", -1_000_000.0),
-        ("NEXT_AX", -1_000_000.0),
-        ("NEXT_SP", -1_000_000.0),
-        ("NEXT_BP", -1_000_000.0),
-        ("NEXT_STACK0", -1_000_000.0),
-        ("NEXT_MEM", -1_000_000.0),
-        ("NEXT_SE", -1_000_000.0),
+        ("NEXT_PC", BLK),
+        ("NEXT_AX", BLK),
+        ("NEXT_SP", BLK),
+        ("NEXT_BP", BLK),
+        ("NEXT_STACK0", BLK),
+        ("NEXT_MEM", BLK),
+        ("NEXT_SE", BLK),
     )
 
+    # STACK0 campaign Inc-4 (2026-06-20): a1 condition. The L13 relay deposits
+    # a1 into STACK0_BYTE_VAL_1_LO as a clean one-hot at the a1 nibble for
+    # a1 > 0 (magnitude ~6.0), but for a1 == 0 the carrier COLLAPSES TO ALL-ZERO
+    # in the 30-token frame (the -6/+6 cancel at nibble 0 -> nothing lit), so
+    # the legacy ``STACK0_BYTE_VAL_1_LO+0`` positive is absent and the a1=0
+    # rules lose their ~1000-pt term (GPU-confirmed: 25+759 a1=0/b1=2/carry=1
+    # stayed 0x210). For a1 == 0 in the campaign config, supply that term via a
+    # CONST baseline and AND in negative guards on SBV1+1..7 so the rule fires
+    # ONLY when no high a1 nibble is lit (a genuine a1 == 0), never stealing an
+    # a1 in 1..7 row. Flag-OFF keeps the original one-hot a1 term (byte-id).
+    _campaign = operand_from_memsp_enabled()
     rules: list[FFNRule] = []
     for carry in (0, 1):
         for a1 in range(8):
             for b1 in range(8):
                 v = a1 + b1 + carry  # <= 15 -> single nibble
+                if _campaign and a1 == 0:
+                    # CONST at 2*GATE so the a1=0 CONST baseline matches the
+                    # a1>0 path's one-hot SBV1 contribution (~6.0 * A1_W =
+                    # 2*GATE), keeping the a1=0 rule's firing margin in step
+                    # with the thresholds (the +THR_BUMP hard gate would
+                    # otherwise leave a1=0/carry ~500 short -> 203+733 missed).
+                    a1_conditions = (("CONST", 2.0 * GATE),) + tuple(
+                        (f"STACK0_BYTE_VAL_1_LO+{nib}", -GATE)
+                        for nib in range(1, 8)
+                    )
+                else:
+                    a1_conditions = (
+                        (f"STACK0_BYTE_VAL_1_LO+{a1}", A1_W),  # a1 (~3.0*A1_W)
+                    )
                 base_conditions = (
                     ("IS_BYTE", GATE),
                     ("HAS_SE", GATE),
                     (f"H1+{AX_I}", GATE),
                     ("BYTE_INDEX_0", GATE),
-                    ("TEMP+8", GATE),
-                    (f"STACK0_BYTE_VAL_1_LO+{a1}", A1_W),  # a1 (~3.0 * A1_W)
+                    (GATE_DIM, GATE_DIM_W),
+                ) + a1_conditions + (
                     (f"ADDR_B1_LO+{b1}", GATE),            # b1
                 ) + marker_blockers + non_add_blockers + transition_blockers
                 if carry:
@@ -9243,9 +9322,12 @@ def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
                     # ~= 7970; missing ANY single gate (incl. a wrong a1/b1
                     # -> that cell = 0) -> <= 6970; missing carry -> 6970.
                     # Threshold 7400 fires only on the exact (a1,b1,carry).
-                    threshold = 7400.0
+                    # Campaign: +THR_BUMP matches the 1e5 TEMP+12 hard gate so
+                    # a genuine ADD row's margin is unchanged while a non-ADD
+                    # row (TEMP+12=0) falls 1e5 short.
+                    threshold = 7400.0 + THR_BUMP
                     scope = (
-                        "is_byte and TEMP+8 and BYTE_INDEX_0 and CARRY+1"
+                        f"is_byte and {GATE_DIM} and BYTE_INDEX_0 and CARRY+1"
                     )
                 else:
                     conditions = base_conditions + (
@@ -9254,9 +9336,11 @@ def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
                     # all-on (a1 + 6 one-hot gates, no carry) ~= 6970; a real
                     # carry adds -100000 -> hard block; missing any single
                     # gate -> <= 5970. Threshold 6400 fires only all-on.
-                    threshold = 6400.0
+                    # Campaign: +THR_BUMP pairs with the 1e5 TEMP+12 hard gate.
+                    threshold = 6400.0 + THR_BUMP
                     scope = (
-                        "is_byte and TEMP+8 and BYTE_INDEX_0 and not CARRY+1"
+                        f"is_byte and {GATE_DIM} and BYTE_INDEX_0 "
+                        "and not CARRY+1"
                     )
                 rules.append(
                     multi_way_and_rule(
