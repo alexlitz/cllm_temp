@@ -129,11 +129,60 @@ class BDToGEConverter(nn.Module):
         k_coeffs = torch.arange(16, device=x_bd.device, dtype=x_bd.dtype)
 
         alu_lo = x_bd_clamped[:, :, BD.ALU_LO:BD.ALU_LO + 16]
+        alu_hi = x_bd_clamped[:, :, BD.ALU_HI:BD.ALU_HI + 16]
+
+        # === STACK0 campaign (2026-06-20): divmod dividend byte-0 recovery ===
+        #
+        # Under ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` operand-A byte 0
+        # is delivered from ``mem[SP]`` into ALU_LO/HI by L8 head 5 at block 11.
+        # For a MULTI-BYTE dividend the L10 ALU-clear (block 14) then crushes
+        # ALU_LO/HI all-negative (probe: 1162/37 -> ALU_LO==-39 at the divmod
+        # input block 27), so the FlattenedDivMod (block 28) reconstructs byte 0
+        # as 0x00 -> wrong quotient. Single-byte dividends are unaffected
+        # (ALU_LO survives at +6.0). The byte-1 (positions 2/3) path is already
+        # correct here via AX_FULL/STACK0_BYTE_VAL_1 (L8 head 7).
+        #
+        # The L9 ``step_end_operand_relay`` head mirrors ALU_LO/HI into
+        # SE_ALU_LO/HI at block 13 — BEFORE the L10 clear — and that mirror
+        # SURVIVES to the divmod block (probe: SE_ALU_LO==0xA, SE_ALU_HI==0x8
+        # at block 27 for 1162/37; and the same nibbles as ALU_LO for the
+        # single-byte 100/7). Recover the dividend byte-0 one-hot from SE_ALU
+        # by OR-ing it onto the (possibly crushed) ALU band, gated on the
+        # campaign flag + the divmod opcode + the AX marker so it touches NO
+        # other op / config. Flag-OFF leaves the ALU read byte-identical.
+        from .unified_compiler.ops.shared import (
+            no_stack0_emit_enabled,
+            divmod_byte0_se_recover_enabled,
+        )
+        if (
+            no_stack0_emit_enabled()
+            and divmod_byte0_se_recover_enabled()
+            and hasattr(BD, "SE_ALU_LO")
+            and hasattr(BD, "SE_ALU_HI")
+        ):
+            divmod_recover = (
+                ((x_bd[:, :, BD.OP_DIV] > 0.5) | (x_bd[:, :, BD.OP_MOD] > 0.5))
+                & (x_bd[:, :, BD.MARK_AX] > 0.5)
+            )[:, :, None].to(dtype=x_bd.dtype)
+            se_alu_lo = _clean_onehot(
+                x_bd[:, :, BD.SE_ALU_LO:BD.SE_ALU_LO + 16]
+            )
+            se_alu_hi = _clean_onehot(
+                x_bd[:, :, BD.SE_ALU_HI:BD.SE_ALU_HI + 16]
+            )
+            # OR the SE mirror in only on divmod AX rows; clamp back to a clean
+            # 0/1 one-hot so the k-weighted sum stays an exact nibble scalar.
+            alu_lo = torch.clamp(
+                alu_lo + se_alu_lo * divmod_recover, max=1.0
+            )
+            alu_hi = torch.clamp(
+                alu_hi + se_alu_hi * divmod_recover, max=1.0
+            )
+
         ax_lo = x_bd_clamped[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16]
         x_ge[:, :, 0, self.ge.NIB_A] = (alu_lo * k_coeffs).sum(dim=-1)
         x_ge[:, :, 0, self.ge.NIB_B] = (ax_lo * k_coeffs).sum(dim=-1)
 
-        alu_hi = x_bd_clamped[:, :, BD.ALU_HI:BD.ALU_HI + 16]
         ax_hi = x_bd_clamped[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16]
         x_ge[:, :, 1, self.ge.NIB_A] = (alu_hi * k_coeffs).sum(dim=-1)
         x_ge[:, :, 1, self.ge.NIB_B] = (ax_hi * k_coeffs).sum(dim=-1)

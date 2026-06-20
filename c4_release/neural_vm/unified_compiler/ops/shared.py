@@ -175,6 +175,44 @@ def div_multibyte_enabled() -> bool:
     return os.environ.get("C4_DIV_MULTIBYTE", "1") != "0"
 
 
+def divmod_byte0_se_recover_enabled() -> bool:
+    """Return True iff the divmod DIVIDEND byte-0 SE_ALU recovery is active
+    (DEFAULT ON in the campaign config — opt-out via
+    ``C4_DIVMOD_BYTE0_SE_RECOVER=0``; only takes effect when the STACK0
+    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``):
+
+    operand-A byte 0 (the dividend low byte) is delivered from ``mem[SP]``
+    into ALU_LO/HI by the L8 ``make_layer8_mem_to_alu_op`` head 5 at block
+    11. For a MULTI-BYTE dividend the L10 ALU-clear (block 14) then crushes
+    ALU_LO/HI all-negative (probe ``tools/probe_div_ge_positions.py``,
+    1162/37: ALU_LO == -39 at the divmod-input block 27), so the
+    ``FlattenedDivMod`` (block 28) reconstructs dividend byte 0 as 0x00 and
+    divides ``high_byte(dividend)*256 / divisor`` -> wrong quotient. The
+    SINGLE-byte case is unaffected (ALU_LO survives at +6.0). The byte-1
+    (positions 2/3) path is already correct here via AX_FULL /
+    STACK0_BYTE_VAL_1 (L8 head 7, Part B) — this fix is the byte-0 half.
+
+    The L9 ``step_end_operand_relay`` head mirrors ALU_LO/HI into
+    SE_ALU_LO/HI at block 13 — BEFORE the L10 clear — and that mirror
+    SURVIVES to the divmod block (probe: SE_ALU == 0xA/0x8 at block 27 for
+    1162/37, == the same nibbles as ALU_LO for single-byte 100/7). When
+    enabled, ``BDToGEConverter`` OR-recovers the dividend byte-0 one-hot
+    from SE_ALU_LO/HI onto the (possibly crushed) ALU band, gated on the
+    divmod opcode + the AX marker so it touches no other op/config.
+
+    DEFAULT ON. Opt-out via ``C4_DIVMOD_BYTE0_SE_RECOVER=0`` restores the
+    raw ALU_LO/HI read (the byte-identical-OFF path: flag-OFF or
+    ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden
+    ``4958b35b``). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_DIVMOD_BYTE0_SE_RECOVER`` can
+    A/B it inside the campaign config.
+    """
+    return os.environ.get("C4_DIVMOD_BYTE0_SE_RECOVER", "1") != "0"
+
+
 def addsub_output_boost_enabled() -> bool:
     """Return True iff the imperative AddSub5StageBlock writes its byte-0
     OUTPUT_LO/HI at a DOMINANT amplitude (DEFAULT ON — opt-out via
