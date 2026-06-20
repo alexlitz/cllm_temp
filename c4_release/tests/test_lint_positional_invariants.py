@@ -115,6 +115,40 @@ def test_classifier_unguarded_vs_campaign_aware(tmp_path):
     assert by_func["make_guarded_op"].risk == "CAMPAIGN_AWARE"
 
 
+def test_classifier_declared_invariant(tmp_path):
+    """A positional ref inside a function that resolves its anchors through a
+    positional-invariant helper (marker_bank_index / invariant_threshold /
+    frame_byte_is_emitted) is DECLARED_INVARIANT — out of the UNGUARDED
+    shift-risk surface by construction, a stronger guarantee than the
+    per-op campaign guard."""
+    src = (
+        "from ..positional_invariant import (\n"
+        "    marker_bank_index, invariant_threshold,\n"
+        ")\n"
+        "\n"
+        "def make_declared_marker_op(BD):\n"
+        "    MEM_I = marker_bank_index('MEM')\n"
+        "    return BD.L2H0 + MEM_I\n"
+        "\n"
+        "def make_declared_threshold_op():\n"
+        "    t = invariant_threshold(1.5, 1.0e9, 'BP', 6)\n"
+        "    rules = [('STACK0_BYTE0', t)]\n"
+        "    return rules\n"
+    )
+    f = tmp_path / "declared_ops.py"
+    f.write_text(src)
+    dims = {"L2H0", "STACK0_BYTE0"}
+    refs = L.scan_file(f, dims)
+    by_func = {r.func: r for r in refs}
+    assert "make_declared_marker_op" in by_func
+    assert "make_declared_threshold_op" in by_func
+    assert by_func["make_declared_marker_op"].risk == "DECLARED_INVARIANT"
+    assert by_func["make_declared_threshold_op"].risk == "DECLARED_INVARIANT"
+    # The marker-relative ref still records its distance offset (BD.L2H0 + MEM_I)
+    # — declared-invariant does not erase the structural classification.
+    assert by_func["make_declared_marker_op"].has_offset is True
+
+
 def test_distance_offset_flag(tmp_path):
     """A ``+offset`` into a distance bank is flagged DISTANCE_OFFSET in both
     the string and the attribute reference form."""
