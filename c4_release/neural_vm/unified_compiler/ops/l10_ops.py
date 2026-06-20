@@ -197,6 +197,43 @@ def _psh_stack0_byte3_relay_darken_enabled() -> bool:
     """
     return os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
 
+
+def _l10_exit_axcarry_enabled() -> bool:
+    """Flag for the L10 EXIT/no-clean-opcode AX-materialization source fix.
+
+    DEFAULT-OFF (opt in with ``C4_L10_EXIT_AXCARRY=1``). Ships the
+    ``test_simple_function`` win (``JSR 3; EXIT; NOP; ENT 0; IMM 42; LEV`` ->
+    42) under the 6 LEV flags, the last blocker after the func_identity +25.
+
+    ROOT (spec_k=0, softmax1-with-sink, 6 LEV flags ON; probes
+    tools/_probe_l10_exit_root.py + _probe_output_across_blocks.py):
+    On the POST-LEV EXIT step the opcode decode resolves NO clean opcode at the
+    AX marker (OP_EXIT/OP_LEV/OP_IMM/OP_ENT all ~0) but ``OP_LEA`` LEAKS to
+    ~1.71 (a dead/spurious value -- it is 0.00 on EVERY healthy AX row of
+    lea_basic / func_identity / add / mul / mod). That leaked OP_LEA both (a)
+    SUPPRESSES the L10 ``_layer10_alu_ax_passthrough`` (OP_LEA is in its
+    suppressed-ops list) so AX_CARRY is NOT routed to OUTPUT, and (b) TRIGGERS
+    the L10 LEA effective-address high-nibble materializer (block-14 ffn unit
+    gated on OP_LEA, reads FETCH_HI -> writes OUTPUT_HI), which stamps the stale
+    frame-pointer high nibble 0xF into OUTPUT_HI. Result: OUTPUT = 0xF0 instead
+    of the correct 0x2A=42. ``AX_CARRY`` carries the correct 0x2A (hi nibble 2,
+    lo nibble A) UNCORRUPTED from block 3 through the final block 52 -- this is a
+    source-SELECT fix, not a value fix.
+
+    FIX: a flag-gated standalone ``PureFFN`` post_op on the L25 tail block (after
+    ``tail_bit32_result_correction``, where OP_LEA / AX_CARRY / MARK_AX all
+    persist) that fires ONLY on this signature -- ``MARK_AX`` AND a LEAKED
+    ``OP_LEA`` (>= ~1.0, never present on a healthy AX row) AND no
+    OUTPUT-owning opcode (IMM/ADD/SUB/bitwise/cmp/MUL/DIV/MOD/SHL/SHR) AND no
+    live ``MEM_ADDR_SRC`` (which a GENUINE LEA address-eval row carries) -- and
+    routes ``AX_CARRY_LO[k] -> OUTPUT_LO[k]`` / ``AX_CARRY_HI[k] ->
+    OUTPUT_HI[k]`` at a magnitude that DOMINATES the ~12 materializer, clearing
+    the competing OUTPUT cells. Flag-off => zero rules appended, no post_op,
+    byte-identical to HEAD. See ``_l10_exit_axcarry_rules`` /
+    ``make_l10_exit_axcarry_op``.
+    """
+    return os.environ.get("C4_L10_EXIT_AXCARRY", "0") == "1"
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -9516,6 +9553,200 @@ def make_l10_nonfirst_psh_sp_helper_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+# Opcodes that own the AX-marker OUTPUT byte through their own lane (the
+# arithmetic/bitwise/compare ALU, IMM dispatch, and the shift shortcuts). On a
+# row where any of these is the live opcode, OUTPUT is already correct and the
+# EXIT/no-clean-opcode AX_CARRY override must stay silent. Mirrors the spirit
+# of ``_L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS`` but for the LATE override.
+# NOTE: OP_ENT is intentionally NOT in this list. On the post-LEV EXIT row
+# OP_ENT leaks a small ~0.16 residue (from the prior ENT-0 frame), and a hard
+# NOT-block on it would veto the legitimate override there. ENT does not own a
+# computed AX-marker OUTPUT byte, so excluding it is safe.
+_L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS = (
+    "OP_IMM", "OP_ADD", "OP_SUB", "OP_OR", "OP_XOR", "OP_AND",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_MUL", "OP_DIV", "OP_MOD", "OP_SHL", "OP_SHR",
+    "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+)
+
+
+def _l10_exit_axcarry_rules() -> tuple[FFNRule, ...]:
+    """Route AX_CARRY -> OUTPUT on the EXIT/no-clean-opcode AX row (32 units).
+
+    See ``_l10_exit_axcarry_enabled`` for the full root. Per nibble k (0..15)
+    one AND unit fires iff:
+
+      * ``MARK_AX`` (the AX marker row) is present, AND
+      * ``OP_LEA`` is LEAKED (>= ~1.0 -- it is 0.00 on every healthy AX row, so
+        this term is the discriminator that isolates the post-LEV EXIT step),
+        AND
+      * the matching ``AX_CARRY_{LO,HI}[k]`` one-hot is present, AND
+      * NO OUTPUT-owning opcode is live (each contributes a hard -1e6
+        NOT-block), AND
+      * ``MEM_ADDR_SRC`` is cold (a GENUINE LEA address-eval row carries it; the
+        spurious leak does not) -- another hard NOT-block, AND
+      * we are not on any non-AX marker row (PC/SP/BP/STACK0/MEM all -1e6).
+
+    Each unit writes ``OUTPUT_{LO,HI}[k] = +DOM`` and every competing nibble
+    ``OUTPUT_{LO,HI}[j!=k] = -DOM`` at a magnitude that dominates the ~12.3
+    LEA-materializer write so the correct AX_CARRY byte wins the LM-head argmax.
+    The gate term uses ``AX_CARRY_{LO,HI}[k]`` as the firing selector so the
+    routing is data-dependent (carry nibble -> out nibble).
+    """
+
+    # Dominating magnitude: the leaked LEA materializer contributes ~+12.3 to
+    # OUTPUT_HI+15. The firing hidden activation is large (~3850: the AND clears
+    # threshold with a big margin and ``_suppress_ffn_on_step_boundary`` leaves
+    # a ~+4000 MARK_AX residual on the pre-activation), so a small per-cell
+    # W_down weight already DOMINATES: +DOM on the matching cell, -DOM on every
+    # competitor. DOM=0.02 -> contribution ~+77 vs the ~+12.3 materializer (a
+    # decisive ~6x margin) without an O(1e7) runaway in the OUTPUT band.
+    DOM = 0.02
+    # Margin budget (raw, pre-S). The CLEAN one-hot signals (MARK_*,
+    # MEM_ADDR_SRC) are ~1.0 when present and ~0 when absent, so they can use a
+    # hard -1e6 NOT-block. The OPCODE flags, however, LEAK a small residue
+    # (OP_JSR ~0.02, OP_ENT ~0.16) onto unrelated rows; a hard -1e6 block there
+    # would be tripped by the leak. So the opcode NOT-blocks use a MODERATE
+    # weight (-OPC_BLOCK) sized so a CLEAN opcode (>= ~0.5) decisively vetoes
+    # while the residue leak (<= ~0.3) is absorbed by a wide positive margin:
+    #   present  : MARK_AX(100) + OP_LEA(60 * ~1.79 = ~107) + gate(~0.94) ~= 208
+    #   threshold: 150  ->  margin ~+58
+    #   leak veto: 0.3 * OPC_BLOCK(500) = -150 (survives a single leaked op),
+    #              a clean op 0.5 * 500 = -250 (vetoes decisively).
+    OPC_BLOCK = 500.0
+    rules: list[FFNRule] = []
+    for nibble_label, carry_dim, out_dim in (
+        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            conditions: list[tuple[str, float]] = [
+                ("MARK_AX", 100.0),
+                # Leaked-OP_LEA discriminator: the leak is ~1.7-1.8 on the bug
+                # row and EXACTLY 0.00 on every healthy AX row, so weight 60
+                # makes it the load-bearing required term (~107 here).
+                ("OP_LEA", 60.0),
+                # OUTPUT-owning opcode NOT-blocks (real ALU/IMM/branch rows).
+                # Moderate weight: a clean opcode (>= ~0.5) vetoes; a residue
+                # leak (<= ~0.3) is absorbed by the +58 positive margin.
+                *((op, -OPC_BLOCK) for op in _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS),
+                # A genuine LEA address-eval row carries MEM_ADDR_SRC (~1.0); the
+                # spurious post-LEV leak does not (~0.0). Clean one-hot -> hard
+                # NOT-block.
+                ("MEM_ADDR_SRC", -1_000_000.0),
+                # Non-AX marker rows are off-limits (clean one-hot markers).
+                ("MARK_PC", -1_000_000.0),
+                ("MARK_SP", -1_000_000.0),
+                ("MARK_BP", -1_000_000.0),
+                ("MARK_STACK0", -1_000_000.0),
+                ("MARK_MEM", -1_000_000.0),
+            ]
+            writes: list[tuple[str, float]] = []
+            for j in range(16):
+                writes.append((f"{out_dim}+{j}", (DOM if j == k else -DOM)))
+            rules.append(multi_way_and_rule(
+                name=f"l10_exit_axcarry_{nibble_label}_{k}",
+                conditions=tuple(conditions),
+                threshold=150.0,
+                gate=f"{carry_dim}+{k}",
+                gate_weight=1.0,
+                writes=tuple(writes),
+            ))
+    return tuple(rules)
+
+
+def make_l10_exit_axcarry_op() -> Operation:
+    """Flag-gated L10 EXIT/no-clean-opcode AX_CARRY -> OUTPUT override op.
+
+    Standalone ``PureFFN`` post_op attached to the L25 tail block AFTER
+    ``tail_bit32_result_correction`` (it reads OUTPUT_LO/HI which that op
+    writes, so the produces/consumes dep orders it last). Flag-off (default)
+    produces ZERO rules and appends NO post_op -> byte-identical to HEAD. Flag
+    ON ships ``test_simple_function`` (-> 42) under the 6 LEV flags. See
+    ``_l10_exit_axcarry_enabled`` / ``_l10_exit_axcarry_rules``.
+    """
+    if not _l10_exit_axcarry_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_exit_axcarry",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#function-call",
+        )
+
+    rules = _l10_exit_axcarry_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        _suppress_ffn_on_step_boundary(ffn, dim_map, S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_exit_axcarry",
+        reads={
+            "MARK_AX", "OP_LEA", "MEM_ADDR_SRC",
+            "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
+            "AX_CARRY_LO", "AX_CARRY_HI",
+            # Read OUTPUT so the scheduler orders this AFTER
+            # tail_bit32_result_correction (the OUTPUT producer it overrides).
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+            *_L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS,
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        # Must run AFTER tail_bit32_result_correction (the OUTPUT producer it
+        # overrides), mirroring make_l10_add_high_byte_adder_op's ordering.
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#function-call",
     )
 
 
