@@ -11,6 +11,7 @@ from ..isa_semantics_dsl import (
     cam_lookup,
 )
 from ..layer_compiler import Operation
+from ..positional_invariant import marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .residual_band_registry import register_residual_band
 from .shared import (  # noqa: F401
@@ -345,7 +346,6 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
     """
 
     L = 15.0
-    AX_I = 1
 
     head0_idx = _L7_HEAD_LAYOUT_BY_NAME["layer7_operand_gather.head_0"]
     head0_cam = cam_lookup(_operand_gather_head0_cam_spec())
@@ -681,10 +681,20 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     """
 
     L = 15.0
-    MEM_I = 4
-    AX_I = 1
-    SP_I = 2
-    BP_I = 3
+    # Class-1 marker-relative anchors: ``H<k>+<marker_I>`` is a marker-TYPE slot
+    # index into the fixed-width 7-slot threshold-head bank (PC=0 AX=1 SP=2 BP=3
+    # MEM=4 SE=5), NOT a token distance. The bank is keyed on marker TYPE, whose
+    # order is identical in the 35- and 30-token frames (STACK0 is a transition
+    # target, never a bank slot), so these indices are frame-INVARIANT by
+    # construction. ``marker_bank_index`` resolves them from Token.STEP_TOKENS as
+    # the single source of truth (byte-identical to the literals at STEP_TOKENS=35
+    # and unchanged at 30) so the audit recognises them as declared-invariant
+    # instead of bare UNGUARDED offsets. See positional_invariant.py +
+    # docs/POSITIONAL_INVARIANT_MECHANISM_2026_06_20.md.
+    MEM_I = marker_bank_index("MEM")
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
 
     specs: list[DeclarativeAttentionHeadSpec] = [
         # Head 7: MEM flag broadcast (MEM marker -> MEM byte positions).
