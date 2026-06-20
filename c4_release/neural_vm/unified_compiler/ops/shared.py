@@ -295,6 +295,38 @@ def no_stack0_emit_enabled() -> bool:
     return os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
 
 
+def ffn_lint_mull14_demo_enabled() -> bool:
+    """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
+
+    DEFAULT OFF — opt-in via ``C4_FFN_LINT_MULL14_DEMO=1``. TOOLING-ONLY: a
+    faithful, reaches-the-build reproduction of the −60 mul-l14 entanglement
+    class for ``tools/lint_cross_op_ffn.py --demo``. It registers ONE PureFFN
+    post-op unit on the l14 ALU block, AUTHORED as "MUL-only" (its W_up reads
+    ``OP_MUL`` strongly) but with a positive ``b_up`` bias so ``silu(up)`` is
+    NON-ZERO even when ``OP_MUL==0`` — the smooth-nonlinearity leak that writes
+    the SHARED ``OUTPUT_LO`` band on ADD/SUB/DIV rows too (the exact −60
+    mechanism the lint exists to catch). The whole op is registered ONLY when
+    the flag is on (lookahead-chain pattern), so a flag-off / production build
+    is byte-identical to golden ``4958b35b``.
+    """
+    return os.environ.get("C4_FFN_LINT_MULL14_DEMO", "0") == "1"
+
+
+def ffn_lint_clean_demo_enabled() -> bool:
+    """Return True iff the cross-op FFN-lint CLEAN-CONTROL branch is on.
+
+    DEFAULT OFF — opt-in via ``C4_FFN_LINT_CLEAN_DEMO=1``. This flag is
+    TOOLING-ONLY: it exists so ``tools/lint_cross_op_ffn.py --demo`` has a
+    same-layout, in-place modification of a SHARED l14 ALU attention head that
+    nonetheless writes ONLY a PRIVATE scratch dim (``TEMP``), touching no
+    OUTPUT/ALU residual band any downstream op reads. The lint must PASS it
+    (the clean side of the discrimination contract) exactly as it FLAGS the
+    band-perturbing mul-l14 change (``C4_NO_STACK0_EMIT``). DEFAULT OFF keeps
+    every production build byte-identical to golden ``4958b35b``.
+    """
+    return os.environ.get("C4_FFN_LINT_CLEAN_DEMO", "0") == "1"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
