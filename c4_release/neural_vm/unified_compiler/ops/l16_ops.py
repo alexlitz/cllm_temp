@@ -9,10 +9,29 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
+from .residual_band_registry import register_residual_band
 from .shared import (
     _as_setdim_proxy,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
+)
+
+
+# mega-root #2 Phase-1 prototype: PHYSICALLY-DISTINCT prev-step OUTPUT bands for
+# the TRUE decouple (gate reads the stable prior value, not the live bootstrap).
+# Flag-gated on C4_OUTBAND_DECOUPLE_PROTO=decouple so a flag-off / alias build
+# stays byte-identical (the band is not collected -> smaller d_model). The
+# cross-step COPY op that populates these (an attn KV-relay, H1_PREV_STEP
+# template) is the multi-block hand-off; see OUTPUT_BAND_DECOUPLE_DESIGN.
+register_residual_band(
+    "OUTPUT_LO_PREVSTEP", 16, owner="l16_lev_stack0_byte0_preserve",
+    flag=lambda: _os.environ.get("C4_OUTBAND_DECOUPLE_PROTO", "") == "decouple",
+    never_share=True,
+)
+register_residual_band(
+    "OUTPUT_HI_PREVSTEP", 16, owner="l16_lev_stack0_byte0_preserve",
+    flag=lambda: _os.environ.get("C4_OUTBAND_DECOUPLE_PROTO", "") == "decouple",
+    never_share=True,
 )
 
 
@@ -118,6 +137,39 @@ def _lev_stack0_preserve_se_blocker_on() -> bool:
     DEFAULT-OFF so HEAD is byte-identical; ships with the C4_L15_LEV func chain.
     """
     return os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
+
+
+def _outband_decouple_proto_mode() -> str:
+    """OUTPUT-band self-reinforcement DECOUPLE prototype (mega-root #2 Phase 1).
+
+    DEFAULT-OFF ("") so HEAD is byte-identical. Re-gates the gate-read of the
+    ``l16_lev_stack0_byte0_preserve_*`` family (the cleanest confirmed-blocked
+    self-reinforcing emitter from ``tools/lint_output_selfreinforce.py``) off the
+    LIVE OUTPUT band. Three modes, each isolating one hypothesis:
+
+    ``alias`` (``C4_OUTBAND_DECOUPLE_PROTO=alias``):
+        Rename the GATE read from ``OUTPUT_LO+k`` -> the SSA prev-step alias
+        ``OUTPUT_LO.layer16_lev_routing.-1+k``. Per ssa_dim.py + LayerCompiler
+        (the SSA form is declared as an ALIAS of the base => SAME numeric slot),
+        this resolves to the IDENTICAL physical column. Hypothesis: byte-identical
+        golden AND structurally inert (the gate still reads the live slot) — the
+        mechanistic explanation for the GPU-refuted coordinated sweep.
+
+    ``decouple`` (``C4_OUTBAND_DECOUPLE_PROTO=decouple``):
+        Gate-read a PHYSICALLY-DISTINCT prev-step band ``OUTPUT_LO_PREVSTEP`` /
+        ``OUTPUT_HI_PREVSTEP`` (registered + cross-step-populated by a copy op).
+        This is the TRUE decoupling: the gate reads the prior step's STABLE value,
+        not the live bootstrapping one. NOT byte-identical (writes a new band) —
+        a campaign-config-only experiment. Hypothesis: kills the bootstrap.
+
+    ``1`` is accepted as a synonym for ``alias`` so the generic flag tooling
+    (``tools/lint_cross_op_ffn.py``, which sets the ON value to ``"1"``) can
+    exercise the byte-identical inert-rename mode.
+
+    See ``docs/OUTPUT_BAND_DECOUPLE_DESIGN_2026_06_18.md``.
+    """
+    mode = os.environ.get("C4_OUTBAND_DECOUPLE_PROTO", "")
+    return "alias" if mode == "1" else mode
 
 
 def _lev_pc_top_return_opcode_gate_on() -> bool:
@@ -663,12 +715,35 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # zero-default but not so strong that we clobber legitimate L14/L15
     # store writes (which carry MEM_STORE and are excluded above).
     lev_stack0_preserve_strength = 50.0 / S
+    # mega-root #2 Phase-1 prototype: optionally DECOUPLE the gate read of this
+    # family from the LIVE OUTPUT band (see _outband_decouple_proto_mode).
+    _decouple = _outband_decouple_proto_mode()
+
+    def _proto_gate_lo(k: int) -> str:
+        if _decouple == "alias":
+            # OUTPUT_HI_THIS_STEP and OUTPUT_HI alias the SAME slot (85); the LO
+            # band has no this/prev split, so the inert-rename proof uses the HI
+            # band where a distinct NAME provably resolves to the same column.
+            return f"OUTPUT_LO+{k}"
+        if _decouple == "decouple":
+            return f"OUTPUT_LO_PREVSTEP+{k}"
+        return f"OUTPUT_LO+{k}"
+
+    def _proto_gate_hi(k: int) -> str:
+        if _decouple == "alias":
+            # DISTINCT name, SAME physical slot 85 (OUTPUT_HI == OUTPUT_HI_THIS_STEP).
+            # Proves an alias rename is byte-identical AND structurally inert.
+            return f"OUTPUT_HI+{k}"
+        if _decouple == "decouple":
+            return f"OUTPUT_HI_PREVSTEP+{k}"
+        return f"OUTPUT_HI_THIS_STEP+{k}"
+
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_stack0_byte0_preserve_lo_{k}",
             conditions=lev_stack0_preserve_conditions,
             threshold=7.5,
-            gate=f"OUTPUT_LO+{k}",
+            gate=_proto_gate_lo(k),
             writes=((f"OUTPUT_LO+{k}", lev_stack0_preserve_strength),),
         ))
     for k in range(16):
@@ -676,7 +751,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
             conditions=lev_stack0_preserve_conditions,
             threshold=7.5,
-            gate=f"OUTPUT_HI_THIS_STEP+{k}",
+            gate=_proto_gate_hi(k),
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", lev_stack0_preserve_strength),),
         ))
 
