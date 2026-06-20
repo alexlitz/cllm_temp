@@ -62,6 +62,49 @@ def _lea_local_e8_multilocal_guard_enabled() -> bool:
     return os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
 
 
+def _tail_lea_e8_divmod_guard_enabled() -> bool:
+    """Flag for the 0xE8/744 sentinel-slam guard on DIV/MOD result rows
+    (DEFAULT ON in the campaign config — opt-out via
+    ``C4_TAIL_LEA_E8_DIVMOD_GUARD=0``; only active when the STACK0 emission is
+    dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; the bulk of the residual
+    div/mod fails of the ``got_ax == 744`` pattern, e.g. ``462/13 -> 744``,
+    ``390 % 19 -> 744`` -- the "0xE8 (744) slam" the
+    ``divmod_axcarry_clear_enabled`` note explicitly flags as a SEPARATE
+    downstream-tail corruptor):
+
+    ``tail_lea_local_ax_marker_byte0_e8`` (the L25 tail bank, this module)
+    hardcodes the BP-8 effective-address low byte 0xE8 onto a LEA AX-marker
+    row, gated on ``MARK_AX + HAS_SE + OP_LEA + CMP+7 + FETCH_LO+8 +
+    MEM_ADDR_SRC`` (threshold 7). In the 30-token campaign layout the DIV/MOD
+    RESULT AX-marker row also carries ``MARK_AX=1 + HAS_SE=1 + MEM_ADDR_SRC=1``
+    (BUILT-dim probe ``tools/probe_outband2_blk41_attrib.py``), which clears the
+    rule's effective threshold even though ``OP_LEA ~= 0`` (the lowered AND uses
+    a 1e9 ``MARK_AX`` / ``CONST`` pair so the small ``OP_LEA`` term cannot veto).
+    The 1e6-strength 0xE8 writer then SIGN-INVERTS OUTPUT_LO[0] to ~-6.8e7 on
+    the DIV/MOD result row -> the emitted AX byte 0 is 0xE8 (744) instead of the
+    quotient/remainder.
+
+    The fix adds ``OP_DIV`` / ``OP_MOD`` as HARD NOT-blockers (-1e9) so the
+    sentinel writer can never fire on a DIV/MOD result row. On the legit LEA
+    byte-0 0xE8 emit (OP_DIV == OP_MOD == 0) the rule is byte-identical.
+
+    DEFAULT ON. Opt-out via ``C4_TAIL_LEA_E8_DIVMOD_GUARD=0`` (the byte-identical
+    path: flag-OFF or ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden
+    ``4958b35b``). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_TAIL_LEA_E8_DIVMOD_GUARD`` can A/B
+    it inside the campaign config.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    return (
+        os.environ.get("C4_TAIL_LEA_E8_DIVMOD_GUARD", "1") != "0"
+        and no_stack0_emit_enabled()
+    )
+
+
 def _psh_stack0_highbyte_darken_enabled() -> bool:
     """Flag for the PSH-STACK0-passthrough high-byte (byte2/byte3) darkening.
 
@@ -8701,7 +8744,20 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # ``_lea_local_e8_multilocal_guard_enabled`` + diag 18365452.
                 ("FETCH_LO+0", -10.0),
                 ("FETCH_HI+14", -10.0),
-            ) if _lea_local_e8_multilocal_guard_enabled() else ()),
+            ) if _lea_local_e8_multilocal_guard_enabled() else ()) + ((
+                # DIV/MOD result-row 0xE8 (744) sentinel-slam guard
+                # (campaign config). The DIV/MOD result AX-marker row carries
+                # MARK_AX + HAS_SE + MEM_ADDR_SRC, which clears this rule's
+                # effective threshold (OP_LEA ~= 0 there but the 1e9 MARK_AX
+                # term dominates the lowered AND). Hard NOT-blockers on the
+                # real opcode keep the 1e6 0xE8 writer off the DIV/MOD result
+                # so the quotient/remainder survives. Legit LEA byte-0 emit
+                # (OP_DIV == OP_MOD == 0) is byte-identical. See
+                # ``_tail_lea_e8_divmod_guard_enabled`` (only active in the
+                # C4_NO_STACK0_EMIT campaign config).
+                ("OP_DIV", -1_000_000_000.0),
+                ("OP_MOD", -1_000_000_000.0),
+            ) if _tail_lea_e8_divmod_guard_enabled() else ()),
             threshold=7.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
