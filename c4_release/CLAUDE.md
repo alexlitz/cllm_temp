@@ -204,6 +204,32 @@ Run these BEFORE committing any new op or rule change:
   `--demo` fixtures (`C4_FFN_LINT_MULL14_DEMO` / `C4_FFN_LINT_CLEAN_DEMO` in
   `ops/l14_ops.py`) are flag-gated tooling, both DEFAULT OFF → production build
   byte-identical to golden.
+- **`tools/flag_regression_gate.py` — MANDATORY flag-ON cross-cluster gate
+  for any campaign-config fix.** The byte-identity gates
+  (`compare_symbolic_to_lowered_ffn`, `tools/_isa_golden_hash.py`) only
+  verify the **flag-OFF** golden (35-token) model. A change can be
+  byte-identical OFF yet silently **regress a whole cluster FLAG-ON** in the
+  30-token *campaign* config (`C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`)
+  — the exact blind spot that let a mul `l14` fix pass golden byte-identity
+  while crushing add/sub/div ~−60 in the campaign config. This gate runs a
+  per-cluster REPRESENTATIVE sample (`tools/flag_regression_sample.json`: 72
+  ids across ALL 56 clusters, 4 each for add/sub/mul/div/mod, the four
+  MEM-SMOKE `var_*` clusters always included) in BOTH states (fix ON vs OFF)
+  **within the campaign config**, scores each with the validated bit-exact
+  `cpu_full_trace` verdict (`--spec-k 0`, `--workers 2`), and reports any
+  cluster that goes `ok -> fail` (a REGRESSION — non-zero exit, BLOCK) or
+  `fail -> ok` (a flip — gain). The MEM-SMOKE clusters get an explicit tag so
+  a campaign fix can never silently break the SI/LI store-load path. Run
+  `python tools/flag_regression_gate.py --flag C4_MY_FIX` (the fix's
+  kill-switch; OFF leaves it unset, ON sets it, both inside the campaign env)
+  or `--base <commit>` (HEAD vs base via a throwaway `git worktree`, no
+  stash). It is the CPU automated form of the by-hand "cross-cluster verify"
+  and runs in a few minutes (`--clusters add,sub,div,mul` to narrow). PROVEN:
+  it CATCHES the re-applied mul-`l14` regression (commit `ba06deaa`, behind
+  `C4_MUL_BLK33_CLAWBACK`) flagging add/sub/div `ok->fail`, and passes CLEAN
+  on a no-op flag. Memory discipline: `--workers 2` max, dedicated
+  `C4_VM_CACHE_DIR=/tmp/c4cache_reggate`, ~1 bake per state. Tooling only
+  (golden `4958b35b` unchanged).
 
 ## Tests
 

@@ -1,0 +1,265 @@
+{
+ "note": "flag_regression_gate per-cluster sample (1 representative per cluster, 4 for the arith demo clusters add/sub/mul/div/mod, 2 for var_simple). The four memory-smoke var_* clusters (var_simple/var_mul/var_three/var_update) are always included so a campaign fix cannot silently break the SI/LI store-load path. Cheapest member per cluster, preferring tripwire_baseline.json ids (which span pass+fail). Deep clusters whose cheapest member exceeds the gate --max-steps-cap (default 18) are decoded as SKIPPED (free, still tracked); pass --max-steps-cap 40 --clusters <c> to deep-verify one. Regenerate with `python tools/flag_regression_gate.py --regen-sample`.",
+ "sample_build_cap": 40,
+ "gate_default_max_steps_cap": 18,
+ "per_cluster": {
+  "add": [
+   0,
+   1,
+   2,
+   3
+  ],
+  "sub": [
+   50,
+   51,
+   63,
+   66
+  ],
+  "mul": [
+   100,
+   101,
+   120,
+   129
+  ],
+  "div": [
+   150,
+   151,
+   167,
+   170
+  ],
+  "mod": [
+   200,
+   201,
+   202,
+   203
+  ],
+  "var_simple": [
+   250,
+   251
+  ],
+  "var_mul": [
+   275
+  ],
+  "var_three": [
+   300
+  ],
+  "var_update": [
+   325
+  ],
+  "if_gt": [
+   350
+  ],
+  "if_lt": [
+   375
+  ],
+  "if_eq": [
+   400
+  ],
+  "if_var": [
+   425
+  ],
+  "loop_sum": [
+   462
+  ],
+  "loop_countdown": [
+   484
+  ],
+  "loop_mul": [
+   508
+  ],
+  "loop_pow": [
+   529
+  ],
+  "func_identity": [
+   550
+  ],
+  "func_add": [
+   575
+  ],
+  "func_mul": [
+   600
+  ],
+  "func_square": [
+   625
+  ],
+  "func_max": [
+   650
+  ],
+  "func_min": [
+   675
+  ],
+  "rec_factorial": [
+   700
+  ],
+  "rec_fib": [
+   733
+  ],
+  "rec_sum": [
+   765
+  ],
+  "rec_power": [
+   785
+  ],
+  "expr_add_mul": [
+   800
+  ],
+  "expr_paren": [
+   825
+  ],
+  "expr_mul_div": [
+   850
+  ],
+  "expr_mod": [
+   875
+  ],
+  "gcd": [
+   940
+  ],
+  "nested_quad": [
+   950
+  ],
+  "nested_sumsq": [
+   975
+  ],
+  "edge_zero_add": [
+   1000
+  ],
+  "edge_zero_mul": [
+   1001
+  ],
+  "edge_mul_zero": [
+   1002
+  ],
+  "edge_zero_div": [
+   1003
+  ],
+  "edge_zero_mod": [
+   1004
+  ],
+  "edge_add_zero": [
+   1005
+  ],
+  "edge_mul_one": [
+   1006
+  ],
+  "edge_div_one": [
+   1007
+  ],
+  "edge_1plus": [
+   1008
+  ],
+  "edge_2minus": [
+   1009
+  ],
+  "edge_1times": [
+   1010
+  ],
+  "edge_1div": [
+   1011
+  ],
+  "edge_pow": [
+   1012
+  ],
+  "edge": [
+   1022
+  ],
+  "edge_if_zero": [
+   1026
+  ],
+  "edge_if_one": [
+   1027
+  ],
+  "edge_if_hundred": [
+   1028
+  ],
+  "edge_loop_never": [
+   1029
+  ],
+  "edge_loop_once_skip": [
+   1030
+  ],
+  "edge_literal": [
+   1031
+  ],
+  "absdiff": [
+   1046
+  ],
+  "bool_and": [
+   1071
+  ]
+ },
+ "ids": [
+  0,
+  1,
+  2,
+  3,
+  50,
+  51,
+  63,
+  66,
+  100,
+  101,
+  120,
+  129,
+  150,
+  151,
+  167,
+  170,
+  200,
+  201,
+  202,
+  203,
+  250,
+  251,
+  275,
+  300,
+  325,
+  350,
+  375,
+  400,
+  425,
+  462,
+  484,
+  508,
+  529,
+  550,
+  575,
+  600,
+  625,
+  650,
+  675,
+  700,
+  733,
+  765,
+  785,
+  800,
+  825,
+  850,
+  875,
+  940,
+  950,
+  975,
+  1000,
+  1001,
+  1002,
+  1003,
+  1004,
+  1005,
+  1006,
+  1007,
+  1008,
+  1009,
+  1010,
+  1011,
+  1012,
+  1022,
+  1026,
+  1027,
+  1028,
+  1029,
+  1030,
+  1031,
+  1046,
+  1071
+ ]
+}
