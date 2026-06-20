@@ -127,6 +127,18 @@ _SKIP_DIR_SEGMENTS = {
 # The campaign guard. A function (or module) that calls this is campaign-aware.
 _CAMPAIGN_GUARD = "no_stack0_emit_enabled"
 
+# The positional-invariant mechanism (``neural_vm/unified_compiler/
+# positional_invariant.py``). A function that resolves its anchors through any
+# of these helpers has DECLARED its frame assumption to the compiler — the
+# STACK0 drop is a no-op for it BY CONSTRUCTION (``marker_bank_index`` for
+# Class-1 marker-relative anchors, ``invariant_threshold`` /
+# ``frame_byte_is_emitted`` for Class-2 absolute-slot anchors). Such refs are
+# reclassified out of UNGUARDED into DECLARED_INVARIANT — a stronger guarantee
+# than the per-op ``no_stack0_emit_enabled()`` branch (CAMPAIGN_AWARE).
+_POSINV_HELPERS = frozenset(
+    {"marker_bank_index", "invariant_threshold", "frame_byte_is_emitted"}
+)
+
 # ---------------------------------------------------------------------------
 # Positional-frame dim set
 # ---------------------------------------------------------------------------
@@ -278,10 +290,10 @@ _DIM_RECEIVERS = {"BD", "bd", "proxy", "self", "_bd", "BD_", "BDc"}
 
 class _Ref:
     __slots__ = ("lineno", "dim", "has_offset", "form", "func", "op",
-                 "guarded", "snippet")
+                 "guarded", "declared", "snippet")
 
     def __init__(self, lineno: int, dim: str, has_offset: bool, form: str,
-                 func: str, op: Optional[str], guarded: bool,
+                 func: str, op: Optional[str], guarded: bool, declared: bool,
                  snippet: str) -> None:
         self.lineno = lineno
         self.dim = dim
@@ -290,10 +302,13 @@ class _Ref:
         self.func = func
         self.op = op
         self.guarded = guarded
+        self.declared = declared
         self.snippet = snippet
 
     @property
     def risk(self) -> str:
+        if self.declared:
+            return "DECLARED_INVARIANT"
         return "CAMPAIGN_AWARE" if self.guarded else "UNGUARDED"
 
     def as_dict(self, rel: str) -> Dict[str, object]:
@@ -307,6 +322,7 @@ class _Ref:
             "op": self.op,
             "risk": self.risk,
             "campaign_guarded": self.guarded,
+            "posinv_declared": self.declared,
             "snippet": self.snippet,
         }
 
@@ -326,6 +342,9 @@ class _FuncIndex:
         self._spans: List[Tuple[int, int, str, bool]] = []
         # function name -> calls no_stack0_emit_enabled() anywhere in its body
         self._func_guarded: Dict[str, bool] = {}
+        # function name -> resolves anchors through a positional-invariant
+        # helper (marker_bank_index / invariant_threshold / frame_byte_is_emitted)
+        self._func_declared: Dict[str, bool] = {}
         self._module_guarded = module_guarded
         self._index(tree)
 
@@ -341,16 +360,20 @@ class _FuncIndex:
                     (node.lineno, end, node.name, self._is_op_factory(node.name))
                 )
                 # Does this function (directly in its own body, incl nested
-                # bake closures) call the campaign guard?
+                # bake closures) call the campaign guard, or resolve its anchors
+                # through a positional-invariant helper?
                 guarded = False
+                declared = False
                 for sub in ast.walk(node):
-                    if (
-                        isinstance(sub, ast.Call)
-                        and self._call_name(sub) == _CAMPAIGN_GUARD
-                    ):
+                    if not isinstance(sub, ast.Call):
+                        continue
+                    cn = self._call_name(sub)
+                    if cn == _CAMPAIGN_GUARD:
                         guarded = True
-                        break
+                    elif cn in _POSINV_HELPERS:
+                        declared = True
                 self._func_guarded[node.name] = guarded
+                self._func_declared[node.name] = declared
         # Narrowest span first when we search.
         self._spans.sort(key=lambda s: (s[1] - s[0]))
 
@@ -394,6 +417,19 @@ class _FuncIndex:
         if self._func_guarded.get(inner):
             return True
         if op is not None and self._func_guarded.get(op):
+            return True
+        return False
+
+    def declared(self, lineno: int) -> bool:
+        """Declared frame-invariant iff the innermost func or owning op
+        resolves its anchors through a positional-invariant helper
+        (``marker_bank_index`` / ``invariant_threshold`` /
+        ``frame_byte_is_emitted``). The STACK0 drop is a no-op for such a ref
+        by construction — a stronger guarantee than the campaign guard."""
+        inner, op = self.enclosing(lineno)
+        if self._func_declared.get(inner):
+            return True
+        if op is not None and self._func_declared.get(op):
             return True
         return False
 
@@ -479,8 +515,9 @@ def scan_file(path: Path, positional_dims: Set[str]) -> List[_Ref]:
 
         inner, op = findex.enclosing(lineno)
         guarded = findex.guarded(lineno)
+        declared = findex.declared(lineno)
         refs.append(_Ref(lineno, dim, has_offset, form, inner, op, guarded,
-                         snippet))
+                         declared, snippet))
     refs.sort(key=lambda r: r.lineno)
     return refs
 
@@ -524,9 +561,17 @@ def collect(
 
 
 def _rank_key(ref: _Ref) -> Tuple[int, int]:
-    # Lower sorts first. UNGUARDED before CAMPAIGN_AWARE; within each,
-    # distance-offset (doubly frame-dependent) before bare flag.
-    return (0 if not ref.guarded else 1, 0 if ref.has_offset else 1)
+    # Lower sorts first. UNGUARDED (the shift-risk surface) before
+    # CAMPAIGN_AWARE before DECLARED_INVARIANT (resolved through the
+    # positional-invariant mechanism); within each, distance-offset (doubly
+    # frame-dependent) before bare flag.
+    if ref.declared:
+        tier = 2
+    elif ref.guarded:
+        tier = 1
+    else:
+        tier = 0
+    return (tier, 0 if ref.has_offset else 1)
 
 
 def _flatten(by_file: Dict[str, List[_Ref]]) -> List[Tuple[str, _Ref]]:
@@ -549,12 +594,14 @@ def _print_catalog(
     if dim_filter:
         flat = [(rel, r) for rel, r in flat if r.dim == dim_filter]
     if unguarded_only:
-        flat = [(rel, r) for rel, r in flat if not r.guarded]
+        flat = [(rel, r) for rel, r in flat
+                if not r.guarded and not r.declared]
 
-    n_unguarded = sum(1 for _, r in flat if not r.guarded)
-    n_aware = sum(1 for _, r in flat if r.guarded)
+    n_unguarded = sum(1 for _, r in flat if not r.guarded and not r.declared)
+    n_aware = sum(1 for _, r in flat if r.guarded and not r.declared)
+    n_declared = sum(1 for _, r in flat if r.declared)
     n_unguarded_offset = sum(
-        1 for _, r in flat if not r.guarded and r.has_offset
+        1 for _, r in flat if not r.guarded and not r.declared and r.has_offset
     )
 
     print("=" * 78)
@@ -568,7 +615,8 @@ def _print_catalog(
     print(
         f"references: {len(flat)} total | "
         f"{n_unguarded} UNGUARDED ({n_unguarded_offset} with a distance "
-        f"offset) | {n_aware} CAMPAIGN_AWARE"
+        f"offset) | {n_aware} CAMPAIGN_AWARE | "
+        f"{n_declared} DECLARED_INVARIANT"
     )
     print(
         "\nUNGUARDED = references a positional-frame dim AND the enclosing op "
@@ -715,12 +763,18 @@ def main(argv: List[str]) -> int:
         if args.dim:
             flat = [(rel, r) for rel, r in flat if r.dim == args.dim]
         if args.unguarded_only:
-            flat = [(rel, r) for rel, r in flat if not r.guarded]
+            flat = [(rel, r) for rel, r in flat
+                    if not r.guarded and not r.declared]
         payload = {
             "positional_dims": sorted(positional_dims),
             "n_refs": len(flat),
-            "n_unguarded": sum(1 for _, r in flat if not r.guarded),
-            "n_campaign_aware": sum(1 for _, r in flat if r.guarded),
+            "n_unguarded": sum(
+                1 for _, r in flat if not r.guarded and not r.declared
+            ),
+            "n_campaign_aware": sum(
+                1 for _, r in flat if r.guarded and not r.declared
+            ),
+            "n_declared_invariant": sum(1 for _, r in flat if r.declared),
             "references": [r.as_dict(rel) for rel, r in flat],
         }
         print(json.dumps(payload, indent=2))
