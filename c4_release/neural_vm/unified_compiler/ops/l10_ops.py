@@ -164,6 +164,69 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     )
 
 
+def _sp_pop_marker_cmp3_hardgate_enabled() -> bool:
+    """Flag for the campaign-config CMP+3 HARD-gate on the binary-pop SP-marker
+    ``e0 -> e8`` correction (#315 — the SP/BP cross-step tracking drift).
+
+    The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the
+    ``tail_sp_pop_marker_e0_to_e8`` rule (this module's
+    ``sp_pop_marker_increment_rules``) corrects the binary-pop ``SP += 8``
+    marker from 0xE0 to 0xE8 when the pop relay ``CMP+3`` is active. Its base
+    ``CMP+3`` term is a WEAK +1.5 positive, and its corruption-veto terms
+    (``OUTPUT_HI_THIS_STEP+13`` with weight -10) were tuned for a 0/1 nibble
+    indicator. In BOTH the 35-tok golden AND the 30-tok campaign frame the
+    block-26/L14 OUTPUT-band#2 corruption drives ``OUTPUT_HI_THIS_STEP+13``
+    to ~-1.0e4 (and ``+14`` to ~+1.0e4); the -10 * -1.0e4 = +1.0e5 term then
+    SWAMPS the +9.0 threshold, so the rule fires on EVERY SP marker row, even
+    on non-pop steps where ``CMP+3 == 0`` (e.g. the IMM / STORE-value step).
+
+    On var_simple/var_update/if_var the model's per-step SP byte-0 then jumps
+    +8 one step EARLY (at the IMM step instead of the SI/STORE pop step). The
+    drifted SP byte-0 shifts the next LI query's ``ADDR_B0`` nibbles, the L15
+    read-CAM ties and loses to a spurious BP-register row, and the LI returns
+    the wrong value -> the `var`/`if_var` LI step diverges. (Autoregressive
+    only — teacher-forcing the SP token HIDES this; #315 ablation proven.)
+
+    The fix promotes ``CMP+3`` to a HARD gate: it adds ``("CMP+3", 1e6)`` and
+    raises the threshold by ``3.5 * 1e6`` so the rule can ONLY clear threshold
+    when the genuine binary-pop relay (``CMP+3 >= 4``) is present. On a non-pop
+    SP marker row (``CMP+3 == 0``) the +1.0e5 corruption term is now ~1.5e6
+    below threshold -> the rule is vetoed and SP byte-0 carries forward
+    unchanged. On the real pop step (``CMP+3 == 4``) the +4e6 hard term clears
+    the +3.5e6 offset AND overpowers the residual ``OP_SI`` veto (SI/STORE IS
+    a valid pop of the just-stored address), so e0 -> e8 still applies on the
+    correct step.
+
+    DEFAULT **OFF** (opt-in via ``C4_SP_POP_MARKER_CMP3_HARDGATE=1``) — see the
+    measured-impact note below. The byte-identical path (flag unset, flag=0, or
+    ``C4_NO_STACK0_EMIT=0``) is bit-for-bit golden ``7aefc860``.
+
+    Why DEFAULT OFF (measured 2026-06-21, GPU autoregressive, campaign config):
+    this hard-gate CORRECTLY removes the SP byte-0 off-by-one drift — the
+    probe-confirmed ``e0/e8`` swap at the IMM/STORE steps of var_simple /
+    var_update / if_var is gone, and the autoregressive SP byte-0 then matches
+    the DraftVM oracle at every step. BUT the SP/BP drift turned out NOT to be
+    the gating root for the var/if_var full_trace VERDICT: a clean
+    autoregressive ablation (patch SP+BP value tokens to oracle in the AR loop)
+    shows the LI step's AX is STILL wrong (``0x00`` byte-0) — the
+    ``var_simple`` blocker is the **LI value-load byte-0 = 0x00** (the L13/L15
+    multi-local value-load CAM not delivering byte-0 in the 30-tok AR frame; see
+    tasks #313/#289), independent of SP. So with the LI value-load still broken,
+    this SP fix flips 0 programs and, by shifting the if_var comparison-step
+    framing, REGRESSES if_var 13/25 -> 11/25 (GPU full_trace, ids 425-449). Kept
+    in-tree DEFAULT OFF so it can ride along (it should net positive) the moment
+    the LI value-load root lands. Flip ON for A/B via
+    ``tools/flag_regression_gate.py --flag C4_SP_POP_MARKER_CMP3_HARDGATE``.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    return (
+        os.environ.get("C4_SP_POP_MARKER_CMP3_HARDGATE", "0") == "1"
+        and no_stack0_emit_enabled()
+    )
+
+
 def _psh_stack0_highbyte_darken_enabled() -> bool:
     """Flag for the PSH-STACK0-passthrough high-byte (byte2/byte3) darkening.
 
@@ -5373,6 +5436,22 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MEM_STORE", -100000.0),
                 ("IS_BYTE", -100.0),
             )
+        # #315: in the 30-token campaign frame the block-26/L14 OUTPUT-band#2
+        # corruption (OUTPUT_HI_THIS_STEP+13 ~= -1e4) explodes the -10 veto term
+        # of this rule to +1e5, firing it on EVERY SP marker row regardless of
+        # CMP+3. Promote CMP+3 to a HARD gate so it can ONLY fire on a genuine
+        # binary-pop step (CMP+3 >= 4 -> +4e6 clears the +3.5e6 offset AND
+        # overpowers the OP_SI veto, so SI/STORE pops still apply e0 -> e8). On a
+        # non-pop SP marker row (IMM/LEA, CMP+3 == 0) the +1e5 corruption is now
+        # ~3.4e6 below threshold -> the spurious e0 -> e8 jump is vetoed and SP
+        # byte-0 carries forward unchanged. Flag-OFF (or golden 35-tok) ->
+        # byte-identical.
+        _e0e8_cmp3_hardgate = (
+            (("CMP+3", 1.0e6),) if _sp_pop_marker_cmp3_hardgate_enabled() else ()
+        )
+        _e0e8_thresh = (
+            9.0 + 3.5e6 if _sp_pop_marker_cmp3_hardgate_enabled() else 9.0
+        )
         return (
             multi_way_and_rule(
                 name="tail_sp_pop_marker_e0_to_e8",
@@ -5390,8 +5469,8 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     ("OP_MUL", -100.0),
                     ("OP_DIV", -100.0),
                     ("OP_MOD", -100.0),
-                ),
-                threshold=9.0,
+                ) + _e0e8_cmp3_hardgate,
+                threshold=_e0e8_thresh,
                 gate=gate_mark_sp,
                 writes=byte_writes(0xE8, strength=300.0),
             ),
