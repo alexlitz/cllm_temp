@@ -52,14 +52,28 @@ def _lea_local_e8_multilocal_guard_enabled() -> bool:
     correct 0xE0 / 0xD8 byte (produced by the L8 effective-address compute and
     relayed through OUTPUT) survives.
 
-    This is the load-bearing PER-STEP component the multi-local fix needs once the
-    cross-step BP-high-byte relay (the L15 nibble-copy BP blocker, commit eddad334,
-    + the L16 BP_byte1=0xff persistence) lands. Default ON. With
-    ``C4_LEA_LOCAL_E8_MULTILOCAL_GUARD=0`` the rule is byte-identical to the prior
-    build (the two FETCH NOT-blocker terms are omitted). The legit imm=-8 LEA
-    byte-0 0xE8 emit (FETCH_LO+0 ~= 0, FETCH_HI+14 ~= 0) is unaffected.
+    This is the load-bearing PER-STEP component the multi-local fix needs.
+    GPU-confirmed (campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``,
+    spec_k=0, #310): turning this ON moves var_mul's divergence step 6 -> 9 (the
+    step-6 &b LEA 0xFFE8->0xFFE0 alias is RESOLVED), i.e. the per-step LEA
+    disambiguator works; the residual step-9 LI value-load is the deeper
+    L13/L15 CAM root tracked separately. The ROOT-A axmark + ROOT-B isbyte
+    lev_routing hardens (already landed) removed the BP-byte1 framing desync, so
+    PC stays correct and this LEA value-byte fix is now the active per-step lever.
+
+    DEFAULT tracks ``no_stack0_emit_enabled()``: ON in the 30-token campaign
+    config (the multi-local LEA frame), byte-identical golden (the two FETCH
+    NOT-blocker terms omitted) otherwise. Force with
+    ``C4_LEA_LOCAL_E8_MULTILOCAL_GUARD=0/1``. The legit imm=-8 LEA byte-0 0xE8
+    emit (FETCH_LO+0 ~= 0, FETCH_HI+14 ~= 0) is unaffected; flag-OFF the golden
+    build is bit-for-bit unchanged (``4958b35b``).
     """
-    return os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
+    from .shared import no_stack0_emit_enabled
+
+    forced = os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD")
+    if forced is not None:
+        return forced != "0"
+    return no_stack0_emit_enabled()
 
 
 def _tail_lea_e8_divmod_guard_enabled() -> bool:

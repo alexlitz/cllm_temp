@@ -139,6 +139,42 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     )
 
 
+def _lea_local_e8_multilocal_guard_enabled() -> bool:
+    """Flag for the multi-local LEA 0xE high-nibble over-fire guard (var_three),
+    the L16 sibling of l10's ``tail_lea_local_ax_marker_byte0_e8`` low-byte guard
+    (``_lea_local_e8_multilocal_guard_enabled`` in l10_ops.py, #310).
+
+    ``l16_lea_local_ax_byte0_hi_e`` (block-34 / lev-routing) nudges
+    ``OUTPUT_HI_THIS_STEP+14`` (high nibble 0xE) onto a LEA local-address
+    AX-marker row, gated on ``MARK_AX + HAS_SE + OP_LEA + CMP+7 + FETCH_LO+8
+    (0.2) + FETCH_HI+15 (0.2)`` (threshold 8). The high nibble 0xE is correct for
+    the 1st local (&a = BP-8 = 0xffe8) AND the 2nd local (&b = BP-16 = 0xffe0) --
+    both have byte-0 high nibble 0xE. It is WRONG for the 3rd local
+    (&c = BP-24 = 0xffd8, high nibble 0xD): the FETCH_LO+8 broadcast (~40 -> 8)
+    clears threshold=8 even though FETCH_HI+15 ~= 0 there, so the rule stamps the
+    0xE high nibble and &c aliases to 0xffe8/0xffe0 instead of 0xffd8.
+
+    The per-LEA FETCH one-hot at the AX-marker row (probe_varml_lea_addr_pipeline,
+    oracle TF): &a = FETCH_LO+8 / FETCH_HI+15, &b = FETCH_LO+0 / FETCH_HI+15,
+    &c = FETCH_LO+8 / FETCH_HI+14. The DISCRIMINATING signal for &c is
+    ``FETCH_HI+14`` (the imm=-24 high-nibble), which carries the ~40 broadcast on
+    &c and ~0 on &a/&b. A ``-10`` NOT-blocker on ``FETCH_HI+14`` drives the &c
+    score well below threshold while leaving &a/&b byte-identical (their
+    FETCH_HI+14 ~= 0). NOTE we DO NOT add a ``FETCH_LO+0`` blocker here (unlike the
+    l10 low-byte guard): &b carries FETCH_LO+0 and genuinely needs the 0xE high
+    nibble, so blocking FETCH_LO+0 would corrupt &b's high nibble.
+
+    DEFAULT tracks ``no_stack0_emit_enabled()``: ON in the 30-token campaign
+    config, byte-identical golden (the FETCH_HI+14 NOT-blocker omitted) otherwise.
+    Force with ``C4_LEA_LOCAL_E8_MULTILOCAL_GUARD=0/1`` (shares the l10 kill-switch
+    so a single A/B toggles both the byte-0 low and high disambiguators).
+    """
+    forced = os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD")
+    if forced is not None:
+        return forced != "0"
+    return no_stack0_emit_enabled()
+
+
 def _lev_stack0_preserve_se_blocker_on() -> bool:
     """DEFAULT-OFF guard (opt in with ``C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER=1``):
     add a ``MARK_SE`` NOT-blocker to the ``l16_lev_stack0_byte0_preserve_*``
@@ -2691,7 +2727,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # byte-identical. See ``_tail_lea_e8_arith_guard_enabled``.
             ("OP_ADD", -1_000_000_000.0),
             ("OP_SUB", -1_000_000_000.0),
-        ) if _tail_lea_e8_arith_guard_enabled() else ()),
+        ) if _tail_lea_e8_arith_guard_enabled() else ()) + ((
+            # Multi-local LEA 0xE high-nibble over-fire guard (var_three, #310):
+            # the 3rd local (&c = BP-24 = 0xffd8, high nibble 0xD) carries the
+            # imm=-24 FETCH signature FETCH_LO+8 / FETCH_HI+14. The FETCH_LO+8
+            # broadcast (~40 -> 0.2*40 = 8) clears threshold=8 even though
+            # FETCH_HI+15 ~= 0 there, so this 0xE high-nibble nudge stamps E on
+            # &c and it aliases to 0xffe8/0xffe0 instead of 0xffd8. The
+            # discriminating signal is FETCH_HI+14 (the imm=-24 high-nibble): a
+            # -10 NOT-blocker drives the &c score below threshold while leaving
+            # &a (FETCH_HI+15) and &b (FETCH_HI+15) byte-identical (both have
+            # FETCH_HI+14 ~= 0 and genuinely need the 0xE high nibble). Do NOT
+            # block FETCH_LO+0 here -- &b carries it and needs 0xE. See
+            # ``_lea_local_e8_multilocal_guard_enabled`` (this module).
+            ("FETCH_HI+14", -10.0),
+        ) if _lea_local_e8_multilocal_guard_enabled() else ()),
         threshold=8.0,
         writes=(("OUTPUT_HI_THIS_STEP+14", 2.0),),
     ))
