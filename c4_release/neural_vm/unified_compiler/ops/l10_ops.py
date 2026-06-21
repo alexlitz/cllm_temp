@@ -105,6 +105,51 @@ def _tail_lea_e8_divmod_guard_enabled() -> bool:
     )
 
 
+def _tail_lea_e8_arith_guard_enabled() -> bool:
+    """Flag for the 0xE8/744 sentinel-slam guard on ADD/SUB/absdiff result
+    rows (#309). The arith extension of ``_tail_lea_e8_divmod_guard_enabled``:
+    DEFAULT ON in the campaign config — opt-out via
+    ``C4_TAIL_LEA_E8_ARITH_GUARD=0``; only active when the STACK0 emission is
+    dropped, i.e. ``C4_NO_STACK0_EMIT=1``.
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the residual ADD fails
+    of the ``0xE8`` byte-0 pattern (e.g. 744=0x2E8, 488=0x1E8), the SUB
+    residual, and absdiff (0/25, diverges step 11 on ax 0xFFE0 -> 0xFFE8 —
+    the ``|a-b|`` body is a SUB result row).
+
+    ``tail_lea_local_ax_marker_byte0_e8`` (the L25 tail bank, this module)
+    hardcodes the BP-8 effective-address low byte 0xE8 onto a LEA AX-marker
+    row, gated on ``MARK_AX + HAS_SE + OP_LEA + CMP+7 + FETCH_LO+8 +
+    MEM_ADDR_SRC`` (threshold 7). In the 30-token campaign layout the ADD/SUB
+    RESULT AX-marker row also carries ``MARK_AX=1 + HAS_SE=1 + MEM_ADDR_SRC=1``
+    (the same signature the DIV/MOD guard documents), which clears the rule's
+    effective threshold even though ``OP_LEA ~= 0`` (the lowered AND uses a
+    1e9 ``MARK_AX`` / ``CONST`` pair so the small ``OP_LEA`` term cannot veto).
+    The 1e6-strength 0xE8 writer then SIGN-INVERTS OUTPUT_LO[0] on the ADD/SUB
+    result row -> the emitted AX byte 0 is 0xE8 (744) instead of the sum /
+    difference.
+
+    The fix adds ``OP_ADD`` / ``OP_SUB`` as HARD NOT-blockers (-1e9) so the
+    sentinel writer can never fire on an ADD/SUB result row. absdiff is
+    covered by ``OP_SUB`` (its ``a > b ? a-b : b-a`` body is a SUB). On the
+    legit LEA byte-0 0xE8 emit (OP_ADD == OP_SUB == 0) the rule is
+    byte-identical.
+
+    DEFAULT ON. Opt-out via ``C4_TAIL_LEA_E8_ARITH_GUARD=0`` (the
+    byte-identical path: flag-OFF or ``C4_NO_STACK0_EMIT=0`` are both
+    byte-identical to golden ``4958b35b``). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_TAIL_LEA_E8_ARITH_GUARD`` can
+    A/B it inside the campaign config.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    return (
+        os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD", "1") != "0"
+        and no_stack0_emit_enabled()
+    )
+
+
 def _psh_stack0_highbyte_darken_enabled() -> bool:
     """Flag for the PSH-STACK0-passthrough high-byte (byte2/byte3) darkening.
 
@@ -8794,7 +8839,27 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # C4_NO_STACK0_EMIT campaign config).
                 ("OP_DIV", -1_000_000_000.0),
                 ("OP_MOD", -1_000_000_000.0),
-            ) if _tail_lea_e8_divmod_guard_enabled() else ()),
+            ) if _tail_lea_e8_divmod_guard_enabled() else ()) + ((
+                # ADD/SUB result-row 0xE8 (744) sentinel-slam guard (#309,
+                # campaign config) — the arith extension of the DIV/MOD guard
+                # above. The ADD/SUB/absdiff RESULT AX-marker row carries the
+                # SAME MARK_AX + HAS_SE + MEM_ADDR_SRC signature that clears
+                # this rule's effective threshold (OP_LEA ~= 0 but the 1e9
+                # MARK_AX term dominates the lowered AND), so the 1e6 0xE8
+                # writer SIGN-INVERTS OUTPUT_LO[0] on the result row and the
+                # emitted AX byte 0 becomes 0xE8 (744) instead of the sum /
+                # difference — the residual add fails (e.g. 744=0x2E8,
+                # 488=0x1E8), the sub residual, and absdiff (diverges step 11
+                # on ax 0xFFE0 -> 0xFFE8; the |a-b| body is a SUB row).
+                # Hard NOT-blockers (-1e9) on the real arith opcode keep the
+                # 0xE8 writer off the ADD/SUB result so the sum/difference
+                # survives. absdiff is covered by OP_SUB (its body is a-b/b-a).
+                # Legit LEA byte-0 emit (OP_ADD == OP_SUB == 0) is
+                # byte-identical. See ``_tail_lea_e8_arith_guard_enabled``
+                # (only active in the C4_NO_STACK0_EMIT campaign config).
+                ("OP_ADD", -1_000_000_000.0),
+                ("OP_SUB", -1_000_000_000.0),
+            ) if _tail_lea_e8_arith_guard_enabled() else ()),
             threshold=7.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),

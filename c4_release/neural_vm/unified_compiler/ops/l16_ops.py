@@ -108,6 +108,37 @@ def _ent_sp_byte1_ff_h1_hardening_enabled() -> bool:
     return os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
 
 
+def _tail_lea_e8_arith_guard_enabled() -> bool:
+    """Flag for the 0xE/0xE8 sentinel-slam guard on ADD/SUB/absdiff result
+    rows (#309) — the L16 sibling of l10's ``tail_lea_local_ax_marker_byte0_e8``
+    arith guard. DEFAULT ON in the campaign config — opt-out via
+    ``C4_TAIL_LEA_E8_ARITH_GUARD=0``; only active when the STACK0 emission is
+    dropped, i.e. ``C4_NO_STACK0_EMIT=1``.
+
+    ``l16_lea_local_ax_byte0_hi_e`` (block-34 / lev-routing) nudges
+    ``OUTPUT_HI_THIS_STEP+14`` (high nibble 0xE) onto a LEA local-address
+    AX-marker row, gated on ``MARK_AX + HAS_SE + OP_LEA + CMP+7`` (threshold
+    8). In the 30-token campaign layout the ADD/SUB/absdiff RESULT AX-marker
+    row also carries ``MARK_AX + HAS_SE`` strongly enough (with the residual
+    CMP+7 / FETCH broadcast) to clear the threshold even though ``OP_LEA ~= 0``,
+    spraying the 0xE high nibble that the L25 tail amplifies into the
+    0xE8 / 0xFFE8 sentinel on the result byte. Hard NOT-blockers (-1e9) on
+    ``OP_ADD`` / ``OP_SUB`` keep this 0xE writer off the arith result row;
+    absdiff is covered by ``OP_SUB``. The legit LEA local-address firing
+    (OP_ADD == OP_SUB == 0) is byte-identical.
+
+    DEFAULT ON. Opt-out via ``C4_TAIL_LEA_E8_ARITH_GUARD=0`` (the
+    byte-identical path: flag-OFF or ``C4_NO_STACK0_EMIT=0`` are both
+    byte-identical to golden ``4958b35b``). Shares the kill-switch with the
+    l10 arith guard so a single ``--flag C4_TAIL_LEA_E8_ARITH_GUARD`` A/Bs
+    both 0xE8-byte0 writers in lock-step.
+    """
+    return (
+        os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD", "1") != "0"
+        and no_stack0_emit_enabled()
+    )
+
+
 def _lev_stack0_preserve_se_blocker_on() -> bool:
     """DEFAULT-OFF guard (opt in with ``C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER=1``):
     add a ``MARK_SE`` NOT-blocker to the ``l16_lev_stack0_byte0_preserve_*``
@@ -2646,7 +2677,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MARK_BP", -10.0),
             ("MARK_STACK0", -10.0),
             ("MARK_MEM", -10.0),
-        ),
+        ) + ((
+            # ADD/SUB/absdiff result-row 0xE (0xE8) sentinel-slam guard (#309,
+            # campaign config). The arith result AX-marker row carries
+            # MARK_AX + HAS_SE strongly enough (with the residual CMP+7 /
+            # FETCH broadcast) to clear threshold=8 even though OP_LEA ~= 0,
+            # spraying the 0xE high nibble that the L25 tail amplifies into
+            # the 0xE8 / 0xFFE8 sentinel on the result byte (residual add
+            # 744=0x2E8 / 488=0x1E8, sub residual, absdiff step-11
+            # 0xFFE0->0xFFE8). Hard NOT-blockers keep this 0xE writer off the
+            # arith result; absdiff is covered by OP_SUB (its a-b/b-a body).
+            # Legit LEA local-address firing (OP_ADD == OP_SUB == 0) is
+            # byte-identical. See ``_tail_lea_e8_arith_guard_enabled``.
+            ("OP_ADD", -1_000_000_000.0),
+            ("OP_SUB", -1_000_000_000.0),
+        ) if _tail_lea_e8_arith_guard_enabled() else ()),
         threshold=8.0,
         writes=(("OUTPUT_HI_THIS_STEP+14", 2.0),),
     ))
