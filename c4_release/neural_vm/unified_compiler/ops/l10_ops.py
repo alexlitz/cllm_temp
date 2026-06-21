@@ -334,7 +334,7 @@ def _l10_exit_axcarry_enabled() -> bool:
     byte-identical to HEAD. See ``_l10_exit_axcarry_rules`` /
     ``make_l10_exit_axcarry_op``.
     """
-    return os.environ.get("C4_L10_EXIT_AXCARRY", "0") == "1"
+    return os.environ.get("C4_L10_EXIT_AXCARRY", "1") == "1"
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref

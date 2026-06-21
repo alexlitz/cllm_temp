@@ -2233,7 +2233,7 @@ def compile_full_vm_dynamic(
             # Output-affecting on ADJ AX rows, so ON / OFF builds must NEVER share
             # a memo / disk entry. Ships with the C4_L15_LEV func chain.
             "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
-                os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "0") == "1"
+                os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
             ),
             # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1): adds a
             # BYTE_INDEX_2-keyed Q/K NOT-blocker slot to the L10
@@ -2275,7 +2275,7 @@ def compile_full_vm_dynamic(
             # NEVER share a memo / disk entry. (Address-widen + the sub-tuning
             # env knobs only matter when this parent flag is on.)
             "C4_L15_LEV_PC_RESTORE": (
-                os.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+                os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
             ),
             # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
             # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
@@ -2283,11 +2283,11 @@ def compile_full_vm_dynamic(
             # AND (the wall) on LI/LC load rows, so the ON / OFF builds MUST
             # NEVER share a memo / disk entry. Sub-knobs fold into the same key.
             "C4_L15_LEV_ADDR_WIDEN": (
-                os.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0",
+                os.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0",
                 os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
                 os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
                 os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
-                os.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0",
+                os.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0",
             ),
             # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
             # opt out =0): adds a 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY
@@ -2874,7 +2874,7 @@ def _bake_from_scheduled_ops(
         # post-LEV ADJ AX rows): the ON / OFF builds must never share a
         # serialised entry. Ships with the C4_L15_LEV func chain.
         "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
-            os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "0") == "1"
+            os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
         ),
         # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1,
         # output-affecting on func/nested PSH steps): the ON / OFF builds must
@@ -2905,17 +2905,17 @@ def _bake_from_scheduled_ops(
         # W_q/W_k/W_v/W_o shapes), so the ON / OFF builds must never share a
         # serialised entry.
         "C4_L15_LEV_PC_RESTORE": (
-            os.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+            os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
         ),
         # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
         # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs
         # fold into the same key so any retune invalidates the entry.
         "C4_L15_LEV_ADDR_WIDEN": (
-            os.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0",
+            os.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0",
             os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
             os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
             os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
-            os.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0",
+            os.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0",
         ),
         # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
         # opt out =0, output-affecting on the func/nested/rec EXIT value): adds a

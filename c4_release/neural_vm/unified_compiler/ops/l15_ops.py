@@ -87,7 +87,7 @@ def _l15_lev_pc_restore_head_on() -> bool:
     ``W_q/W_k/W_v`` row count and ``W_o`` column count -- d_model is unchanged
     so every OTHER block is byte-identical regardless of the flag.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "0") != "0"
+    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
 
 
 def _l15_lev_addr_widen_on() -> bool:
@@ -121,7 +121,7 @@ def _l15_lev_addr_widen_on() -> bool:
     address scale, value_scale 1.0, original slot-31), so smoke stays at the
     HEAD baseline. Turn ON once the single-store framing fix lands.
     """
-    return _os_l15.environ.get("C4_L15_LEV_ADDR_WIDEN", "0") != "0"
+    return _os_l15.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0"
 
 
 def _l15_lev_b0_boost_factor() -> float:
@@ -214,7 +214,7 @@ def _l15_lev_pc_only_on() -> bool:
     load is no longer clobbered. Flag-off omits the slot (byte-identical to the
     widen build); consulted only when ``C4_L15_LEV_ADDR_WIDEN`` is on.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_ONLY", "0") != "0"
+    return _os_l15.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0"
 
 
 def _l15_lev_opcode_gate_on() -> bool:
@@ -254,7 +254,7 @@ def _l15_lev_opcode_gate_on() -> bool:
     (it folds into the widen build's cache key); flag-off omits the slot so the
     build is byte-identical to the widen/pc-only build.
     """
-    return _os_l15.environ.get("C4_L15_LEV_OPCODE_GATE", "0") != "0"
+    return _os_l15.environ.get("C4_L15_LEV_OPCODE_GATE", "1") != "0"
 
 
 _L15_LEV_PC_RESTORE_HEAD_IDX = 14

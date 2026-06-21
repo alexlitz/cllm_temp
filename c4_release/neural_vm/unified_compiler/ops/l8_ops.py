@@ -598,7 +598,7 @@ def _adj_lo_ax_marker_blocker_on() -> bool:
     C4_L15_LEV func chain. Same op-broadcast-corruptor family as the L16 LEV
     STACK0 preserve SE-blocker, now for the ADJ SP result on the AX row.
     """
-    return _os_l8.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "0") == "1"
+    return _os_l8.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
 
 
 def _layer8_alu_adj_lo_rules(S: float) -> tuple[FFNRule, ...]:

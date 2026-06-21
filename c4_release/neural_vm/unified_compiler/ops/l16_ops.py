@@ -272,7 +272,7 @@ def _lev_pc_top_return_opcode_gate_on() -> bool:
     (the residue step writes nothing). DEFAULT-OFF so HEAD is byte-identical;
     ships with the C4_L15_LEV func chain.
     """
-    return os.environ.get("C4_L16_LEV_PC_TOP_OPCODE_GATE", "0") == "1"
+    return os.environ.get("C4_L16_LEV_PC_TOP_OPCODE_GATE", "1") == "1"
 
 
 def _stack0_marker_isbyte_hardening_on() -> bool:
