@@ -2804,11 +2804,30 @@ def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
     # (opcode_flag, "JSR") semantic pair; byte-identical to the
     # legacy "OP_JSR" slot string via DimRef.parse.
     gate_jsr = dim_ref("opcode_flag", "JSR")
+    # CAMPAIGN re-anchor (var_three step-0 OUTPUT_HI leak, 2026-06-21):
+    # var_three step 0 IS a JSR (the call into main); AX must stay 0 (0x0000).
+    # The L7 head-5 OP_JSR broadcast onto the AX byte rows is a token-distance
+    # RAMP. In the golden 35-token frame OP_JSR lands ~6.6 on the AX byte rows,
+    # so this AX-zero floor's silu(OP_JSR*1.0) gate fires hard and pins
+    # OUTPUT_HI+0 (byte-1 high nibble -> 0). When C4_NO_STACK0_EMIT drops the
+    # 5-token STACK0 block (35->30), the ramp shifts so the AX byte rows fall in
+    # the broadcast DIP: OP_JSR collapses to ~0.2 there (GPU-probed, spec_k=0:
+    # AX byte rows 0.239/0.211/0.201/0.191, vs >5 on every OTHER marker's byte
+    # rows). silu(0.2)=0.13 -> the floor barely fires -> a competing block-32
+    # OUTPUT_HI broadcast wins high-nibble 1 -> AX=0x1000. This is the campaign
+    # POSITIONAL-SHIFT bug class. Re-anchor: amplify the OP_JSR gate WEIGHT in
+    # the 30-token frame so silu(OP_JSR*W) is strong at the dipped AX byte rows
+    # (0.19*40=7.6 -> silu~7.6, matching golden's ~6.6) while staying exactly 0
+    # where OP_JSR==0 (silu(0)==0) so NO non-JSR row is touched. The unit's
+    # IS_BYTE+H1+1 W_up scope already confines firing to AX byte rows, so the
+    # SP/BP/MEM rows (where OP_JSR is strong) are W_up-blocked regardless.
+    # Flag-OFF (golden 35-tok) keeps gate_weight=1.0 -> BYTE-IDENTICAL.
+    jsr_gate_weight = 40.0 if no_stack0_emit_enabled() else 1.0
     common_kwargs = dict(
         conditions=common_conditions,
         threshold=1.5,
         gate=gate_jsr,
-        gate_weight=1.0,
+        gate_weight=jsr_gate_weight,
         gate_bias=0.0,
         scope="OP_JSR and IS_BYTE and H1+1",
     )
