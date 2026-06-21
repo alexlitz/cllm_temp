@@ -1995,6 +1995,27 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
     # FAMILY to land every flag at ~1.1 at the decode row.
     FLAG_LT = 0.15  # hi_lt / lo_lt (margin ~1.4) -> ~1.1 at decode row
     FLAG_EQ = 0.30  # hi_eq / lo_eq (margin ~0.75) -> ~1.1 at decode row
+    # CMP-flag margin fix (2026-06-21): the (hi_eq AND lo_lt) 3-way override
+    # in the live ComparisonCombine never flipped the equal-high-nibble cases
+    # (if_gt 35>43 / 20>30, if_lt 86<87, ...) because the two flags landed too
+    # LOW at the decode row — hi_eq ~0.72 (below its own (0.75,1.5) window
+    # floor) and lo_lt ~0.88, summing to ~1.6 which only barely clears the
+    # 3-way override's 1.5 sum-threshold. After the silu+relay the resulting
+    # override write was too weak to out-vote the GT/LT default (and the L25
+    # tail band), so the boolean decoded on a ~1-3 logit OUTPUT_LO[0]-vs-[1]
+    # tie that fell the wrong way. Raising both writes lands each flag at
+    # ~1.05-1.10 at the decode row (verified GPU-autoregressive): the PAIR
+    # sums to ~2.1 (decisively > 1.5 -> the override fires hard) while a
+    # SINGLE flag stays < 1.5 (so hi_eq-alone does NOT flip GT-true 54>53,
+    # and lo_lt-alone does NOT flip LT-false 50<44). hi_lt (CMP+0) lands ~0.77
+    # alone and already trips its 2-way override (> 0.5), so its strength is
+    # left untouched — only the EQ flag and the lo_lt 3-way partner are
+    # boosted. Gated so flag-OFF is byte-identical to the golden bake.
+    if os.environ.get("C4_CMP_FLAG_MARGIN_FIX", "1") != "0":
+        FLAG_EQ = 0.45  # -> ~1.05 at decode row (was ~0.72)
+        FLAG_LT_LO_LT = 0.19  # lo_lt -> ~1.10 (was ~0.88); hi_lt unchanged
+    else:
+        FLAG_LT_LO_LT = FLAG_LT
 
     rules: list[FFNRule] = []
 
@@ -2032,7 +2053,7 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
                 ) + blocker,
                 threshold=13.22,
                 gate_terms=gate_cmp_terms,
-                writes=(("CMP+3", FLAG_LT / S),),
+                writes=(("CMP+3", FLAG_LT_LO_LT / S),),
                 scope="MARK_AX and (OP_EQ or OP_NE or OP_LT or OP_GT or OP_LE or OP_GE)",
             ))
 
