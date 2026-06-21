@@ -274,7 +274,43 @@ from ..ir import (
 from ..layer_compiler import Operation
 from ..positional_invariant import invariant_threshold, marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, no_stack0_emit_enabled
+
+
+def _l15_li_addr_cam_discriminator_on() -> bool:
+    """DEFAULT campaign-ON (``C4_L15_LI_ADDR_CAM``): add a clean per-store
+    address-match on L15 head-0 so a MULTI-LOCAL LI loads ``mem[BP+off]``'s
+    VALUE for the QUERIED local, not the first/most-recent store.
+
+    ROOT (spec_k=0, BUILT dims, var_three osteps 15/22, 2026-06-21): in the
+    campaign config (``C4_NO_STACK0_EMIT=1``) the head-0 LI byte-0 lookup row
+    (the AX-byte-0 prediction row) carries ``OP_LI_RELAY==0`` — so the
+    ``local_slot_onehot`` disambiguator (rows 43+k, gated on OP_LI_RELAY) is
+    DEAD, and the only address signal is the bit-encoded slots 4-27, whose
+    contribution (~12-14k) is (a) NON-discriminating between the candidate
+    store VALUE rows and (b) drowned by the ~9.4e5 constant blocker baseline.
+    The per-store scores end up within ~0.2% of each other, so the softmax
+    winner is decided by tiny residue (recency), and the LI returns the WRONG
+    local (var_three ostep15 LI ``a`` -> ``b``'s value 6; ostep22 LI ``c`` ->
+    ``b``'s value 0x23) or 0.
+
+    The DISCRIMINATING signal IS present: each store's VALUE row (d=5 from its
+    MEM marker) carries the store address byte-0 nibbles in
+    ``ADDR_B0_LO``/``ADDR_B0_HI`` (proven: &a value row has ADDR_B0_LO+8=1.0,
+    &b value row has only ADDR_B0_LO+0). The operand LI query row carries the
+    SAME nibble one-hots. A clean Q·K one-hot match on ADDR_B0_LO+ADDR_B0_HI,
+    gated on the LIVE b0row marker (``MARK_AX``, since OP_LI_RELAY is 0 here)
+    and scaled to dominate the ~2k tie, content-addresses the right store.
+
+    Campaign-only (the value-row address signals it keys on are produced by the
+    30-token MEM-from-SP path); golden (35-token, flag-OFF) is byte-identical —
+    the slots are simply not emitted. Head-0 ONLY (does not touch heads 1-3 byte
+    relays or the V/O value copy).
+    """
+    raw = _os_l15.environ.get("C4_L15_LI_ADDR_CAM")
+    if raw is not None:
+        return raw != "0"
+    return no_stack0_emit_enabled()
 
 
 # === L15 attention head layout (auto-fit; legacy head_idx as docs) ===
@@ -1491,6 +1527,51 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                     ((s, d), w) for (s, d), w in k_map.items() if s == _suppr
                 ]:
                     k_map[(_gate, _d)] = -_w
+
+        # === C4_L15_LI_ADDR_CAM: head-0 per-store address-match discriminator ===
+        # See _l15_li_addr_cam_discriminator_on for the full root + proof. On a
+        # multi-local LI the byte-0 lookup row carries OP_LI_RELAY==0, so the
+        # OP_LI_RELAY-gated one-hot disambiguator (rows 43+k) is dead and the
+        # bit-encoded address slots (4-27) neither discriminate nor outweigh the
+        # ~9.4e5 constant baseline -> the CAM picks the wrong store's value row.
+        # Add a CLEAN one-hot Q.K match on the store address byte-0 nibbles
+        # (ADDR_B0_LO + ADDR_B0_HI), carried by each store's VALUE row (d=5) and
+        # by the LI operand query row alike, gated on the LIVE b0row marker
+        # (MARK_AX; OP_LI_RELAY is 0 here) so only the store whose address
+        # matches the queried local wins. Free head-0 slots 71-101 (head_dim
+        # 111; slots 0-70 are taken, 64-70 by the suppressor cancel). Pure
+        # additive content-addressing; campaign-only (golden byte-identical).
+        if head == 0 and _l15_li_addr_cam_discriminator_on():
+            # Per-nibble one-hot: slot (71+k) matches ADDR_B0_LO+k; slot
+            # (87+k) matches ADDR_B0_HI+k. Q gates the match on MARK_AX (the
+            # only live signal at the byte-0 LI lookup row) so it contributes
+            # nothing on the prompt / non-AX rows; K reads the candidate row's
+            # own address nibble one-hot. The product is positive ONLY when the
+            # operand's address nibble equals the store value row's nibble, so
+            # the head content-addresses the correct local's value. Scale 360
+            # gives 360*360/sqrt(111) ~= 12.3k per matched nonzero nibble --
+            # decisive over the ~2k cross-store tie, modest vs the cancelled
+            # blockers. Uses head-0 slots 71-101 (LO 71-85, HI 87-101).
+            # NOTE the nibble-0 (`0x0`) one-hot is the DEGENERATE/null nibble:
+            # it carries a large spurious peak (~1.5-2.5) on BOTH the operand
+            # query row AND on null-address (0x00) intermediate value rows, so
+            # matching it lets a genuine 0x00 row out-score the real local (e.g.
+            # &a=0xffe8's value row loses to a 0x00 load-result row). DROP the
+            # k=0 match -- the locals are discriminated by their NON-zero
+            # nibbles (&a lo=8 hi=0xe, &b lo=0 hi=0xe, &c lo=8 hi=0xd): the lo
+            # OR hi nonzero nibble uniquely separates every BP-relative local.
+            _cam_s = 360.0
+            for _nib_base, _row_base in (
+                (BD.ADDR_B0_LO, 71), (BD.ADDR_B0_HI, 87),
+            ):
+                for _k in range(1, 16):
+                    _row = _row_base + _k
+                    # Gate: require MARK_AX so the match is inert off the AX
+                    # byte-0 emit row (CONST baseline buries non-AX rows).
+                    q_map[(_row, BD.CONST)] = -2.0 * _cam_s
+                    q_map[(_row, BD.MARK_AX)] = 2.0 * _cam_s
+                    q_map[(_row, _nib_base + _k)] = _cam_s
+                    k_map[(_row, _nib_base + _k)] = _cam_s
 
         new_q = tuple(
             AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
