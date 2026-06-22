@@ -213,6 +213,66 @@ def divmod_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_DIVMOD_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def mul_byte0_se_recover_enabled() -> bool:
+    """Return True iff the MUL operand-A byte-0 SE_ALU recovery + the L11/L15
+    MUL OUTPUT-flood cap are active (DEFAULT ON in the campaign config — opt-out
+    via ``C4_MUL_BYTE0_SE_RECOVER=0``; only takes effect when the STACK0
+    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, ~16 of 23 mul fails whose
+    product decodes to 0, e.g. mul_2 93*34, mul_3 65*98, mul_28 97*94):
+
+    This is the MUL analog of :func:`divmod_byte0_se_recover_enabled` —
+    operand-A byte 0 is delivered from ``mem[SP]`` into ALU_LO/HI by the L8
+    ``make_layer8_mem_to_alu_op`` head 5 at block 11 (CLEAN one-hot, +6.0 at
+    the true nibble; spec_k=0 ALU-band block trace). The L10
+    ALU-clear (block 14) then crushes ALU_LO/HI all-negative (~-39 at the true
+    nibble, ~-45 elsewhere) — the SAME crush the divmod path hits. The
+    ``BDToGEConverter._clean_onehot`` thresholds those negative cells to 0, so
+    operand A reconstructs as 0x00 and the ``FlattenedALUMul`` (block 29 /
+    logical L15) computes ``0 * b == 0``. (Operand B byte 0 is read CLEAN from
+    AX_CARRY_LO/HI at +0.996 — only operand A is crushed.)
+
+    Two coupled effects in the campaign config:
+
+      (1) BYTE-0 RECOVER. The L9 ``step_end_operand_relay`` head mirrors
+          ALU_LO/HI into SE_ALU_LO/HI at block 13 — BEFORE the L10 clear — and
+          that mirror SURVIVES to the FlattenedALUMul block (spec_k=0:
+          SE_ALU_LO==0xD/SE_ALU_HI==5 at +0.78/
+          +0.69 across blocks 14..29 for 93*34, == the operand-A nibbles).
+          ``BDToGEConverter`` OR-recovers the operand-A byte-0 one-hot from
+          SE_ALU_LO/HI onto the (crushed) ALU band on OP_MUL+MARK_AX rows, so
+          FlattenedALUMul multiplies the REAL operand A.
+
+      (2) OUTPUT-FLOOD CAP. The L11 ``efficient_l11_alumul_wrap`` (block 16 /
+          logical L11) wide_mul FFN reads the RAW crushed ALU_LO (its own
+          threshold-AND rules, NOT through ``_clean_onehot``) and — driven by
+          the ~-39 uniform-negative band — FLOODS OUTPUT_LO/HI + MUL_RESULT_HI
+          to ~2.4e9 (spec_k=0 OUTPUT-band block trace: OUTPUT_HI sum
+          0 -> 2.42e9 at block 16, self-amplified to 6.9e9 by L14, 1.2e20 by
+          L20, +inf by L25). This flood (a) trips the ``_MulCombineStage``
+          ``already_fired`` guard (OUTPUT_HI band > 1.5) so the CORRECT
+          FlattenedALUMul product is NEVER written, and (b) out-votes the +2.0
+          product one-hot at the LM-head argmax. When enabled, the
+          ``_MulCombineStage`` CLEARS the OUTPUT_LO/HI band on the OP_MUL+
+          MARK_AX row before the clean product write and IGNORES the
+          ``already_fired`` veto on those rows, so the SE-recovered product
+          survives. (The golden 35-token config keeps clean POSITIVE operand
+          one-hots through L11, so the wide_mul never floods and this cap is a
+          no-op there — but the flag is gated on ``C4_NO_STACK0_EMIT`` so it
+          can never touch the golden path.)
+
+    DEFAULT ON. Opt-out via ``C4_MUL_BYTE0_SE_RECOVER=0`` restores the raw
+    ALU_LO/HI read + the raw OUTPUT-flood path (the byte-identical-OFF path:
+    flag-OFF or ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden).
+    Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_MUL_BYTE0_SE_RECOVER`` can A/B it
+    inside the campaign config.
+    """
+    return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
+
+
 def divmod_axcarry_clear_enabled() -> bool:
     """Return True iff the divmod writeback CLEARS the AX_CARRY (divisor) band
     at the divmod AX row (DEFAULT ON in the campaign config — opt-out via

@@ -153,16 +153,32 @@ class BDToGEConverter(nn.Module):
         from .unified_compiler.ops.shared import (
             no_stack0_emit_enabled,
             divmod_byte0_se_recover_enabled,
+            mul_byte0_se_recover_enabled,
         )
         if (
             no_stack0_emit_enabled()
-            and divmod_byte0_se_recover_enabled()
             and hasattr(BD, "SE_ALU_LO")
             and hasattr(BD, "SE_ALU_HI")
+            and (
+                divmod_byte0_se_recover_enabled()
+                or mul_byte0_se_recover_enabled()
+            )
         ):
-            divmod_recover = (
-                ((x_bd[:, :, BD.OP_DIV] > 0.5) | (x_bd[:, :, BD.OP_MOD] > 0.5))
-                & (x_bd[:, :, BD.MARK_AX] > 0.5)
+            # OP-gated recover: divmod (DIV/MOD) and/or MUL operand-A byte 0.
+            # Both opcodes hit the SAME L10 ALU-crush in the campaign config;
+            # recover the byte-0 one-hot from the SE_ALU mirror (written by the
+            # L9 step_end_operand_relay BEFORE the crush, survives to the ALU
+            # block). Each opcode is independently flag-gated so a kill-switch
+            # restores its raw read in isolation.
+            recover_op = torch.zeros_like(x_bd[:, :, BD.MARK_AX], dtype=torch.bool)
+            if divmod_byte0_se_recover_enabled():
+                recover_op = recover_op | (x_bd[:, :, BD.OP_DIV] > 0.5) | (
+                    x_bd[:, :, BD.OP_MOD] > 0.5
+                )
+            if mul_byte0_se_recover_enabled():
+                recover_op = recover_op | (x_bd[:, :, BD.OP_MUL] > 0.5)
+            byte0_recover = (
+                recover_op & (x_bd[:, :, BD.MARK_AX] > 0.5)
             )[:, :, None].to(dtype=x_bd.dtype)
             se_alu_lo = _clean_onehot(
                 x_bd[:, :, BD.SE_ALU_LO:BD.SE_ALU_LO + 16]
@@ -170,13 +186,13 @@ class BDToGEConverter(nn.Module):
             se_alu_hi = _clean_onehot(
                 x_bd[:, :, BD.SE_ALU_HI:BD.SE_ALU_HI + 16]
             )
-            # OR the SE mirror in only on divmod AX rows; clamp back to a clean
-            # 0/1 one-hot so the k-weighted sum stays an exact nibble scalar.
+            # OR the SE mirror in only on the recover AX rows; clamp back to a
+            # clean 0/1 one-hot so the k-weighted sum stays an exact nibble.
             alu_lo = torch.clamp(
-                alu_lo + se_alu_lo * divmod_recover, max=1.0
+                alu_lo + se_alu_lo * byte0_recover, max=1.0
             )
             alu_hi = torch.clamp(
-                alu_hi + se_alu_hi * divmod_recover, max=1.0
+                alu_hi + se_alu_hi * byte0_recover, max=1.0
             )
 
         ax_lo = x_bd_clamped[:, :, BD.AX_CARRY_LO:BD.AX_CARRY_LO + 16]
@@ -213,6 +229,35 @@ class BDToGEConverter(nn.Module):
             ax_full_hi = _clean_onehot(
                 x_bd[:, :, BD.AX_FULL_HI:BD.AX_FULL_HI + 16],
             )
+
+            # Campaign MUL operand-A byte-1 flood guard (2026-06-21). In the
+            # 30-token campaign config the L11 wide_mul floods MUL_RESULT_HI ->
+            # the L13 relay stages a near-UNIFORM flood across ALL 16 AX_FULL
+            # cells (spec_k=0 probe: every AX_FULL cell ~1e8). The
+            # ``_clean_onehot`` clamp then makes EVERY cell hot, so operand-A
+            # byte 1 reconstructs as sum(0..15)=0x78 instead of 0x00 -> the
+            # FlattenedALUMul schoolbook multiplies a bogus 2-byte operand A and
+            # the product byte-1 high nibble decodes to 0xF garbage. A genuine
+            # AX_FULL byte stage is a 1-2 cell one-hot (sum <= ~2); a flood lights
+            # >2 cells. On OP_MUL+MARK_AX rows with the recover flag, treat a
+            # flooded AX_FULL as operand-A byte 1 == 0 (every mul-cluster operand
+            # is single-byte, so byte 1 IS 0). Gated on no_stack0_emit + the mul
+            # recover flag -> golden byte-identical.
+            from .unified_compiler.ops.shared import (
+                no_stack0_emit_enabled as _no_s0,
+                mul_byte0_se_recover_enabled as _mul_rec,
+            )
+            if _no_s0() and _mul_rec():
+                ax_full_cells = ax_full_lo.sum(dim=-1) + ax_full_hi.sum(dim=-1)
+                mul_flood = (
+                    (x_bd[:, :, BD.OP_MUL] > 0.5)
+                    & (x_bd[:, :, BD.MARK_AX] > 0.5)
+                    & (ax_full_cells > 2.5)
+                )[:, :, None].to(dtype=x_bd.dtype)
+                keep = 1.0 - mul_flood
+                ax_full_lo = ax_full_lo * keep
+                ax_full_hi = ax_full_hi * keep
+
             ax_full_present = (
                 (ax_full_lo.sum(dim=-1) + ax_full_hi.sum(dim=-1)) > 0.5
             ).to(dtype=x_bd.dtype)
@@ -451,8 +496,33 @@ class GEToBDConverter(nn.Module):
             # MUL row stays 0x23 across blocks 15..30. With C4_MUL_WIDTH2=0
             # (flag off) OP_MUL is kept in the mask -> byte-identical to HEAD
             # (no MUL_RESULT_HI band exists in that build).
-            from .unified_compiler.ops.shared import mul_width2_enabled
-            _suppress_mul_b1_restage = mul_width2_enabled()
+            from .unified_compiler.ops.shared import (
+                mul_width2_enabled,
+                no_stack0_emit_enabled,
+                mul_byte0_se_recover_enabled,
+            )
+            # Campaign MUL byte-1 recovery (2026-06-21). In the 30-token
+            # campaign config the L11 wide_mul reads the L10-crushed ALU and
+            # FLOODS MUL_RESULT_HI to garbage (~2e8 at cell 0), which the L13
+            # ``layer13_mul_result_hi_relay`` then stages into AX_FULL as
+            # garbage -> the byte-1 emit truncates the product (e.g. 93*34 ->
+            # 0x5A, missing byte 1 0x0C). With the SE-recover flag on, THIS
+            # FlattenedALUMul composite now multiplies the REAL operand A (the
+            # byte-0 SE recovery above), so ITS OWN GE high-byte result is the
+            # CORRECT product byte 1. Re-INCLUDE OP_MUL in the AX_FULL byte-1
+            # restage so this composite OVERWRITES the flooded MUL_RESULT_HI
+            # relay (the restage is a ``*(1-mask)+new*mask`` replace, so it both
+            # clears the flood AND writes the clean byte 1). Golden (35-token)
+            # path is unaffected: the flag is gated on no_stack0_emit, so the
+            # documented golden re-stage suppression (where MUL_RESULT_HI is the
+            # CORRECT source and this composite would clobber it with 0xFD)
+            # still holds.
+            _campaign_mul_b1 = (
+                no_stack0_emit_enabled() and mul_byte0_se_recover_enabled()
+            )
+            _suppress_mul_b1_restage = (
+                mul_width2_enabled() and not _campaign_mul_b1
+            )
             wide_op = (
                 ((x_bd[:, :, BD.OP_MUL] > 0.5) if not _suppress_mul_b1_restage
                  else torch.zeros_like(x_bd[:, :, BD.OP_MUL], dtype=torch.bool))
@@ -765,6 +835,7 @@ class _MulPipelineState:
     __slots__ = (
         'x_bd_in', 'x_ge_flat', 'x_mul',
         'x_ge_out', 'opcode_mask', 'x_bd_out',
+        'output_clear_mask',
     )
 
     def __init__(self):
@@ -774,6 +845,11 @@ class _MulPipelineState:
         self.x_ge_out = None
         self.opcode_mask = None
         self.x_bd_out = None
+        # Campaign MUL OUTPUT-flood cap: [B, seq_len] mask of rows whose
+        # OUTPUT_LO/HI band must be CLEARED before the product write (set by
+        # _MulCombineStage when the L11 wide_mul flood is detected, applied by
+        # _GEToBDStage). None outside the campaign config -> no clear.
+        self.output_clear_mask = None
 
 
 class _BDToGEStage(nn.Module):
@@ -885,10 +961,44 @@ class _MulCombineStage(nn.Module):
         # only matters when this stage would otherwise have fired.
         output_hi_band = x_bd[:, :, BD.OUTPUT_HI:BD.OUTPUT_HI + 16].sum(dim=-1)
         already_fired = (output_hi_band > 1.5).float()
+
+        # Campaign MUL OUTPUT-flood cap (2026-06-21). In the 30-token campaign
+        # config (C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1) the L11
+        # efficient_l11_alumul_wrap wide_mul reads the L10-crushed (all-
+        # negative) ALU_LO and FLOODS OUTPUT_LO/HI to ~2.4e9..+inf on the
+        # OP_MUL+MARK_AX row (spec_k=0 block-trace: OUTPUT_HI 0->2.4e9 at
+        # block 16, self-amplified to 6.9e9/L14, 1.2e20/L20, +inf/L25). That
+        # flood trips ``already_fired`` (band >> 1.5) so the SE-recovered
+        # FlattenedALUMul product is vetoed AND it out-votes the +2.0 product
+        # at the LM-head argmax. When the recover flag is on we (a) IGNORE the
+        # ``already_fired`` veto on the MUL+AX row (the band is the flood, NOT a
+        # legitimate prior MUL fire) and (b) mark the row for an OUTPUT-band
+        # CLEAR in _GEToBDStage so the flood is wiped before the clean product
+        # is written. Gated on no_stack0_emit so the golden 35-token path
+        # (clean positive operand one-hots, no flood) is byte-identical.
+        output_clear_mask = None
+        from .unified_compiler.ops.shared import (
+            no_stack0_emit_enabled,
+            mul_byte0_se_recover_enabled,
+        )
+        if no_stack0_emit_enabled() and mul_byte0_se_recover_enabled():
+            # The cap fires only on rows where THIS composite is the MUL writer
+            # (op_mul & MARK_AX) AND a flood is present (band far above the
+            # ~2.0 legitimate single-fire signal). Use a high threshold so a
+            # genuine prior MUL fire (~2.0) is NOT treated as a flood.
+            mul_ax_row = (op_mul.view(B, seq_len) > 0.5) & (mark_ax > 0.5)
+            flood_row = output_hi_band > 100.0
+            cap_row = mul_ax_row & flood_row
+            # Where we cap: do NOT veto via already_fired (let the product
+            # write), and clear the flooded OUTPUT band before the write.
+            already_fired = already_fired * (~cap_row).float()
+            output_clear_mask = cap_row.float()
+
         opcode_mask = opcode_mask * (1.0 - already_fired)
 
         state.x_ge_out = x_ge_out
         state.opcode_mask = opcode_mask
+        state.output_clear_mask = output_clear_mask
         return state
 
 
@@ -907,9 +1017,25 @@ class _GEToBDStage(nn.Module):
         self.ge_to_bd = GEToBDConverter(BD, ge, S)
 
     def forward(self, state: _MulPipelineState) -> _MulPipelineState:
+        BD = self.BD
+        x_bd_in = state.x_bd_in
+        # Campaign MUL OUTPUT-flood cap: zero the flooded OUTPUT_LO/HI band on
+        # the marked MUL+AX rows BEFORE the GE->BD writeback adds the clean
+        # product one-hot (GEToBDConverter does ``OUTPUT += indicator*2.0`` on a
+        # clone of x_bd_in, so the flood would otherwise survive and drown the
+        # +2.0 product). Outside the campaign config output_clear_mask is None
+        # and x_bd_in is passed through unchanged (byte-identical).
+        if state.output_clear_mask is not None:
+            clear = state.output_clear_mask[:, :, None]  # [B, seq_len, 1]
+            keep = 1.0 - clear
+            x_bd_in = x_bd_in.clone()
+            lo = slice(BD.OUTPUT_LO, BD.OUTPUT_LO + 16)
+            hi = slice(BD.OUTPUT_HI, BD.OUTPUT_HI + 16)
+            x_bd_in[:, :, lo] = x_bd_in[:, :, lo] * keep
+            x_bd_in[:, :, hi] = x_bd_in[:, :, hi] * keep
         state.x_bd_out = self.ge_to_bd(
             state.x_ge_out,
-            state.x_bd_in,
+            x_bd_in,
             opcode_mask=state.opcode_mask,
             emit_carry=False,
         )
