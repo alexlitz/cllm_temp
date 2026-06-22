@@ -355,6 +355,33 @@ def _l15_li_addr_cam_discriminator_on() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _l15_li_byte0_valsel_on() -> bool:
+    """DEFAULT campaign-ON (``C4_L15_LI_B0_VALSEL``): re-establish L15 head-0's
+    byte-0 VALUE-row selector via the SURVIVING ``MEM_VAL_B0`` dim (#318).
+
+    ROOT (a52fd42c, spec_k=0, BUILT dims): in the base head-0 spec the slot-3
+    byte-0 selector keys the candidate row on ``(L2H0+MEM, -H1+MEM)`` and gates
+    the query on ``MARK_STACK0`` (l15:862-866). The 30-token campaign layout
+    DROPS the STACK0 value block and auto-neutralizes its L1 producer, so
+    ``MARK_STACK0`` never fires -> head-0's byte-0 value-row selection collapses
+    and it self-attends the AX-marker row (CLEAN_EMBED_LO=0) -> AX byte-0 = 0x00
+    (var_simple s7 / var_update s9 / if_var s7). Heads 1-3 select bytes 1-3 via
+    ``MEM_VAL_B1/B2/B3`` (which survive the 30-tok path), so the high bytes stay
+    correct -- the byte0-wrong/byte1-ok asymmetry is the fingerprint.
+
+    The fix adds a slot-3 K on ``MEM_VAL_B0`` (mirroring heads 1-3) inside the
+    head-0 campaign override; the base slot-3 Q already carries the head-0
+    byte_q_flag (``MARK_AX``), so the bilinear is positive only on the
+    value-byte-0 store row. Campaign-only (golden 35-tok flag-OFF byte-identical;
+    this branch is not taken there). Own kill-switch so the cross-op attention +
+    flag-regression gates can toggle just this change.
+    """
+    raw = _os_l15.environ.get("C4_L15_LI_B0_VALSEL")
+    if raw is not None:
+        return raw != "0"
+    return no_stack0_emit_enabled()
+
+
 # === L15 attention head layout (auto-fit; legacy head_idx as docs) ===
 #
 # L15 attention is the load-side memory pipeline. The block is structurally
@@ -1626,6 +1653,36 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                     q_map[(_row, BD.MARK_AX)] = 2.0 * _cam_s
                     q_map[(_row, _nib_base + _k)] = _cam_s
                     k_map[(_row, _nib_base + _k)] = _cam_s
+
+        # === #318: head-0 byte-0 VALUE-row selector via the SURVIVING MEM_VAL_B0 ===
+        # Root (a52fd42c, spec_k=0, BUILT dims): head-0's slot-3 byte-0 value-row
+        # selector keys on (L2H0+MEM, -H1+MEM) for the d=4-from-MEM value-byte-0
+        # row AND gates the query on MARK_STACK0 (base spec l15:862-866). The
+        # 30-tok campaign layout DROPS the STACK0 value block and auto-neutralizes
+        # its L1 producer, so MARK_STACK0 never fires -> head-0's byte-0 value-row
+        # selection collapses and it self-attends the AX-marker row
+        # (CLEAN_EMBED_LO=0) -> AX byte-0 = 0x00 (var_simple s7 / var_update s9 /
+        # if_var s7). Heads 1-3 select bytes 1-3 via MEM_VAL_B1/B2/B3 (which
+        # SURVIVE the 30-tok path -> their high bytes stay correct: the
+        # byte0-wrong/byte1-ok asymmetry is the fingerprint). The #313 address CAM
+        # above only picks the right store ROW; it does NOT re-establish the dead
+        # byte-0 selector.
+        #
+        # FIX: mirror heads 1-3 by adding a slot-3 K on MEM_VAL_B0 (dim 461 --
+        # "mark == MEM OR (is_byte AND byte_index == 0)", asserted at the
+        # value-byte-0 row of every store, and the proven correct byte-0
+        # store-value selector at the LEV-override l15:1687). The base slot-3 Q
+        # already carries the head-0 byte_q_flag (MARK_AX), which fires at the AX
+        # byte-0 emit/lookup row, so the bilinear is positive ONLY on the
+        # value-byte-0 store row -> head-0 selects the correct byte. Additive on
+        # the existing slot 3 (the same slot the dead selector used); the existing
+        # (L2H0+MEM, -H1+MEM) keys are kept (byte-identical at 35-tok, summing
+        # harmlessly with MEM_VAL_B0 on the SAME value-byte-0 row at 30-tok).
+        # Campaign-only via its own kill-switch (_l15_li_byte0_valsel_on): golden
+        # 35-tok flag-OFF is byte-identical -- this branch is not taken there.
+        if head == 0 and _l15_li_byte0_valsel_on():
+            _bs_b0 = 60.0  # mirrors the base spec slot-3 BS (l15:860)
+            k_map[(3, BD.MEM_VAL_B0)] = _bs_b0
 
         new_q = tuple(
             AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
