@@ -229,6 +229,104 @@ def _lea_byte0_memsp_relay_enabled() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _lea_byte0_alu_amplify_enabled() -> bool:
+    """Flag for the PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER
+    (ROOT 1 sibling — the func_square / func_max / func_min re-read LEAs).
+
+    The wall this lifts (verified TEACHER-FORCED + AR spec_k=0, BUILT dims,
+    campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): on the
+    multi-param / multi-local RE-READ LEAs (a second reference to ``&a`` /
+    ``&b`` inside an ``if`` body or a second use of a param) the keystone's
+    ``ALU_HI+15`` magnitude is ~0 AND the FETCH band is genuinely AMBIGUOUS
+    (func encodes the LEA imm as FETCH_HI nib 1 with FETCH_LO nib 0 for BOTH
+    BP-8 ``&x`` and BP-16 ``&b`` — operand 16 maps to 0xE8 in a 1-param frame
+    but 0xE0 in a 2-param frame), so NONE of the keystone's three per-frame
+    discriminators survive. func_square step-9 (``&x`` re-read, want 0xE8),
+    func_max / func_min step-11/15 (``&b`` re-read, want 0xE0) all keep a stale
+    operand leak (got 0x08 / 0x24 / 0x00).
+
+    THE ROOT (probe ``tools/_probe_multilea_tf.py`` + block-trace): the
+    L8 ``lea_lo`` ALU + the downstream byte-1 0xFF/0xFE band DO compute the
+    CORRECT effective-address byte-0 on the re-read LEAs — by physical block
+    14 the OUTPUT band already carries 0xE0 / 0xE8 (HI nib 0xE one-hot, LO nib
+    the offset). The L25 tail bank (block 41) PRESERVES it. But the L25
+    POST-OP (physical block 42 — an opcode-gated cross-step OUTPUT relay that
+    does NOT read OP_LEA) stamps a ~370-magnitude fixed pattern that OVERWRITES
+    the correct byte whenever the upstream residual is WEAK (~50 on the re-read
+    rows). On the var multi-local LEAs the keystone's 1e6-strength write leaves
+    a ~1.8e9 residual that survives block 42 untouched; the func re-reads only
+    have the L8 ALU's native ~50 magnitude, so block 42 wins.
+
+    THE BUILD — a self-reinforcing AMPLIFIER in the L25 tail bank that
+    re-asserts the ALU-computed byte at 1e6 strength so it survives block 42.
+    For each lo nibble ``k`` in {0x0, 0x8} (frame-local addresses are 8-byte
+    int-aligned so byte-0 is always 0xE0/0xE8/0xD0/0xD8) and each frame-address
+    HI nibble ``h`` in {0xE (14), 0xD (13)} a rule fires iff (multiplicative
+    ``OP_LEA`` gate) ``MARK_AX + HAS_SE + OUTPUT_HI_THIS_STEP+h + OUTPUT_LO+k``
+    are all present, and re-writes the byte ``(h<<4)|k`` at 1e6 (4 rules).
+    Restricting ``k`` to {0,8} keeps the amplifier from matching a DRIFTED LI
+    AX row whose loaded value carries a 0xE-/0xD- high nibble with an arbitrary
+    low nibble — the wider 16-nibble form was measured to shift the func_square
+    step-7 PC; {0,8} restores it (PC 66 == oracle). The ``OUTPUT_HI+h`` requirement
+    (h in {13,14}, i.e. the ALU produced a COMPLETE 0xFE-/0xFD- frame address)
+    is the DISCRIMINATOR that survives where FETCH/ALU_HI+15 don't: it is the
+    presence of the already-computed high nibble. The FIRST LEA in a frame
+    (func_identity / func_square step-6, func_max step-8, nested) has HI nib 0
+    (the ALU only did the low nibble; the magnitude path / rule (1) supplies
+    0xE there) so the OUTPUT_HI+{13,14} requirement EXCLUDES it — no conflict
+    with the keystone ALU_HI+15 rule. NO frame-offset discriminator is needed:
+    the amplifier preserves WHATEVER the ALU correctly computed, per frame
+    depth. Carries the same hard NOT-blockers as the keystone (OP_IMM/ADD/SUB/
+    DIV/MOD, IS_BYTE, the five competing markers) and a hard ``OUTPUT_HI+0``
+    NOT-block so it can never fire on the incomplete first-LEA row.
+
+    DEFAULT **OFF** (opt-in via ``C4_LEA_BYTE0_ALU_AMPLIFY=1``; only active in
+    the campaign config, ``C4_NO_STACK0_EMIT=1``). The byte-identical path
+    (flag unset / =0 / ``C4_NO_STACK0_EMIT=0``) is bit-for-bit golden
+    ``7f6f2e5d``.
+
+    Why DEFAULT OFF (measured 2026-06-22, CPU ``cpu_full_trace`` spec_k=0,
+    campaign config): the amplifier CORRECTLY delivers the multi-param re-read
+    LEA byte-0 — teacher-forced, func_square step-9 ``&x`` 0x08->0xE8,
+    func_max/min step-11/15 ``&b`` 0x24/0x00->0xE0 (gate 3/3). BUT the
+    func_max / func_min / func_square autoregressive VERDICT is gated by an
+    EARLIER root, the **LI value-load at step 7/9** (the param value loads as
+    AX byte-0 = 0x00 instead of the argument; e.g. func_max OFF
+    ``div_step=9 got=(pc=50,ax=0) oracle=(pc=50,ax=36)`` — PC correct, the LI
+    AX is wrong), which sits BEFORE the re-read LEAs (steps 11/15) — so the
+    amplifier's fix is never reached. This is the L13/L15 multi-local LI
+    value-load CAM (tasks #313/#318), not a LEA byte. Worse, with the LI
+    still drifting, the amplifier's OUTPUT_HI-nib{13,14} discriminator can
+    match a DRIFTED LI AX row (its loaded value leaks 0xD-/0xE- high nibble
+    while OP_LEA leaks ~0.05+) and shift the step-9 PC (func_max ON
+    ``got pc=66`` vs OFF ``pc=50``) — a framing regression. So flipped ON now
+    it nets 0 flips and risks a func PC regression. Kept in-tree DEFAULT OFF
+    as VALIDATED, golden-safe, campaign-ready infra: the LEA byte-0 delivery
+    is correct and rides along the moment the LI value-load root lands (it
+    should then net positive on func_max/min/square + nested re-reads). A/B
+    via ``tools/flag_regression_gate.py --flag C4_LEA_BYTE0_ALU_AMPLIFY``.
+
+    UPDATE 2026-06-22 (PHASE-2 LI blocker RESOLVED): the gating LI value-load
+    root is now FIXED by ``C4_L15_LI_VALROW_B1`` (the L15 head-0 MEM_VAL_B1
+    value-row lift; see ``ops/l15_ops.py:_l15_li_valrow_b1_on``). With the LI
+    fix ON the first-param LI resolves (teacher-forced gate 4/4) and the
+    interp-oracle divergence ADVANCES: amplify-OFF the func targets stall at
+    step 11 (the &b re-read LEA); amplify-ON they advance to step 13/19 — the
+    actual ADD/MUL/GT compute or the return PC (func_add s11->s13 exp=0x44,
+    func_square s9->s11 exp=0x40, func_max s11->s13, func_max_1 / func_min
+    s11->s19 PC) with NO func PC regression (the prior step-9 PC=66 shift was
+    the LI-drift artifact this fix removes). So flipped ON WITH the LI fix the
+    amplifier now rides along as designed. It is kept DEFAULT OFF here pending
+    a clean cross-cluster ``flag_regression_gate`` pass; flip it together with
+    ``C4_L15_LI_VALROW_B1`` once that gate is green under an uncontended fleet.
+    """
+    forced = os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY")
+    if forced is not None:
+        from .shared import no_stack0_emit_enabled
+        return forced != "0" and no_stack0_emit_enabled()
+    return False
+
+
 def _sp_pop_marker_cmp3_hardgate_enabled() -> bool:
     """Flag for the campaign-config CMP+3 HARD-gate on the binary-pop SP-marker
     ``e0 -> e8`` correction (#315 — the SP/BP cross-step tracking drift).
@@ -1308,7 +1406,14 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # so the expected count is 2059 (flag-OFF, golden byte-identical) or 2062
     # (flag-ON campaign). The layout's single tenant range widens by the same
     # +3. See ``_lea_byte0_memsp_relay_enabled``.
+    #
+    # PHASE-2 multi-param ALU-AMPLIFIER (ROOT 1 sibling, GOLDEN-SAFE): adds 4
+    # extra tail rules (lo nibbles {0,8} x 2 frame-address HI nibbles 0xE/0xD)
+    # when enabled (opt-in, campaign only), so flag-ON the count widens by a
+    # further +4. flag-OFF (the default, incl golden 35-token) it adds 0 —
+    # bit-for-bit unchanged. See ``_lea_byte0_alu_amplify_enabled``.
     extra = 3 if _lea_byte0_memsp_relay_enabled() else 0
+    extra += 4 if _lea_byte0_alu_amplify_enabled() else 0
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -9433,7 +9538,65 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             threshold=20.0,
             writes=byte_writes(0xD8, strength=1_000_000.0),
         ),
-    ) if _lea_byte0_memsp_relay_enabled() else ()) + sp_pop_carry_rules()
+    ) if _lea_byte0_memsp_relay_enabled() else ()) + (tuple(
+        # PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER (ROOT 1
+        # sibling). The L8 ``lea_lo`` ALU already computes the CORRECT
+        # effective-address byte-0 (0xE0/0xE8 etc.) for the re-read LEAs and
+        # delivers it into the block-41 tail-bank input (HI nib 0xE/0xD one-hot,
+        # LO nib the offset). The block-42 L25 post-op (an opcode-gated OUTPUT
+        # relay that does NOT read OP_LEA) overwrites it with a ~370-magnitude
+        # default whenever the upstream residual is weak (~50 on re-read rows).
+        # These rules re-assert the ALU-computed byte at 1e6 strength so it
+        # survives block 42 — no frame-offset discriminator needed, the
+        # OUTPUT_HI+{14,13} (complete-frame-address) presence IS the
+        # discriminator that survives where FETCH / ALU_HI+15 die. The FIRST
+        # LEA in a frame (HI nib 0, handled by the ALU_HI+15 rule (1) above) is
+        # hard-excluded via the OUTPUT_HI+0 NOT-block. See
+        # ``_lea_byte0_alu_amplify_enabled``.
+        multi_way_and_rule(
+            name=f"tail_lea_local_ax_byte0_amplify_h{h}_lo{k}",
+            scope="mark == AX",
+            dominates_at={"OUTPUT_LO": "mark == AX",
+                          "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            gate="OP_LEA",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("HAS_SE", 1.0),
+                ("OP_LEA", 1.0),
+                # The complete-frame-address discriminator: the ALU produced a
+                # 0xFE-/0xFD- frame address (HI nib 0xE/0xD one-hot, ~50) on the
+                # re-read LEA. Each is REQUIRED at weight 8 so its ABSENCE drops
+                # the score below threshold (this excludes the first-LEA row
+                # where HI nib == 0).
+                (f"OUTPUT_HI_THIS_STEP+{h}", 8.0),
+                (f"OUTPUT_LO+{k}", 8.0),
+                # Hard NOT-block the incomplete first-LEA row (HI nib 0) so the
+                # amplifier can never lock in a wrong byte before rule (1) /
+                # the ALU_HI+15 magnitude path supplies the 0xE high nibble.
+                ("OUTPUT_HI_THIS_STEP+0", -1_000.0),
+                ("OP_IMM", -1_000_000.0),
+                ("OP_ADD", -1_000_000_000.0),
+                ("OP_SUB", -1_000_000_000.0),
+                ("OP_DIV", -1_000_000_000.0),
+                ("OP_MOD", -1_000_000_000.0),
+                ("IS_BYTE", -10.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+            ),
+            threshold=20.0,
+            writes=byte_writes((h << 4) | k, strength=1_000_000.0),
+        )
+        for h in (14, 13)
+        # Frame-local addresses are 8-byte (int) aligned, so the effective-
+        # address byte-0 low nibble is always 0x0 or 0x8 (0xE0/0xE8/0xD0/0xD8).
+        # Restricting to {0, 8} keeps the amplifier from matching a drifted LI
+        # AX row whose loaded value happens to carry a 0xE-/0xD- high nibble
+        # with an arbitrary low nibble (the func step-9 LI false-fire surface).
+        for k in (0, 8)
+    ) if _lea_byte0_alu_amplify_enabled() else ()) + sp_pop_carry_rules()
     return step_end_transition_blocked(
         pc_byte_span_blocked(
             stack0_span_blocked_tail_rules(

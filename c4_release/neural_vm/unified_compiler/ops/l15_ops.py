@@ -382,6 +382,52 @@ def _l15_li_byte0_valsel_on() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _l15_li_valrow_b1_on() -> bool:
+    """DEFAULT campaign-ON (``C4_L15_LI_VALROW_B1``): lift the genuine store
+    VALUE row over the spurious ADDR-byte cluster on the FIRST-PARAM LI
+    (func_add/square/max/min + nested re-read chain — PHASE-2 root).
+
+    ROOT (CPU-first, spec_k=0, BUILT dims; tools/_probe_func_li_tf.py +
+    _probe_func_valrow_disc.py, campaign config): interp_oracle_gate classifies
+    func_add/square/max/min CROSS-STEP at **step 9 AX[0]** — the LI that loads
+    the FIRST parameter (``a``), UPSTREAM of the ``&b`` re-read LEA (step 11)
+    the keystone amplifier targets. The first-param LI returns the WRONG byte-0
+    because L15 head-0's value-row attention TIES: the queried local's address
+    is ``&a`` = 0xE8, so the #313 ADDR_B0 CAM keys ``ADDR_B0_LO+8`` +
+    ``ADDR_B0_HI+14``, but the spurious code/frame byte rows JUST PAST the ``a``
+    store (e.g. func_add pos 292-295) carry the SAME ``ADDR_B0_LO+8`` AND
+    ``ADDR_B0_HI+14`` one-hots (they inherit the store frame's address), so the
+    ADDR CAM gives them IDENTICAL credit and they out-score the genuine value
+    row (pos 271) by ~0.2% on the ~648k CONST baseline. The #318 ``MEM_VAL_B0``
+    selector does NOT rescue ``a`` because ``a``'s value row carries
+    ``MEM_VAL_B1`` (=0.97) but ``MEM_VAL_B0`` = -0.0 (the value's low byte is on
+    the B1 dim in the 30-tok path for this frame). The SECOND param ``b`` (step
+    12) already resolves: its address is ``&b`` = 0xE0 (``ADDR_B0_LO+0``) and no
+    spurious lo-0 cluster competes.
+
+    THE DISCRIMINATOR that survives where ADDR_B0 ties (measured): genuine
+    store VALUE rows carry the materialized value byte on ``MEM_VAL_B1`` (~0.97);
+    the spurious ADDR-byte rows carry ``MEM_VAL_B1`` ~ -0.0. A positive head-0 K
+    on ``MEM_VAL_B1`` (gated MARK_AX on the Q so it fires only at the LI byte-0
+    lookup row) lifts the genuine value row decisively. Simulated over the exact
+    head-0 bilinear (tools/_probe_func_b1_sim.py): with the lift the func_add
+    step-9 winner flips 292(CLEAN_LO=0)->271(CLEAN_LO=9=0x39 lo) and func_max
+    step-9 flips 340(0)->319(CLEAN_LO=4=0x24 lo); the already-correct ``b`` LI
+    (step 12) is UNCHANGED (b's value row carries MEM_VAL_B1 too -> same lift,
+    no competing row) -- stable across lift strength 5e4..5e5.
+
+    Uses a DEDICATED free head-0 slot (102; head_dim 111, slots 0-70 base,
+    71-101 the #313 CAM) so it is independently A/B-toggleable and does not
+    perturb the existing selectors. Campaign-only (golden 35-tok flag-OFF
+    byte-identical; this branch is not taken there). Own kill-switch so the
+    cross-op attention + flag-regression gates can toggle just this change.
+    """
+    raw = _os_l15.environ.get("C4_L15_LI_VALROW_B1")
+    if raw is not None:
+        return raw != "0"
+    return no_stack0_emit_enabled()
+
+
 # === L15 attention head layout (auto-fit; legacy head_idx as docs) ===
 #
 # L15 attention is the load-side memory pipeline. The block is structurally
@@ -1683,6 +1729,29 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
         if head == 0 and _l15_li_byte0_valsel_on():
             _bs_b0 = 60.0  # mirrors the base spec slot-3 BS (l15:860)
             k_map[(3, BD.MEM_VAL_B0)] = _bs_b0
+
+        # === PHASE-2: head-0 MEM_VAL_B1 VALUE-row lift (first-param LI) ===
+        # The #313 ADDR_B0 CAM TIES the genuine first-param value row against
+        # the spurious code/frame byte rows just past the store (both carry the
+        # SAME ADDR_B0_LO+8/ADDR_B0_HI+14 one-hots), and #318's MEM_VAL_B0 key
+        # misses ``a`` (its value lands on MEM_VAL_B1, B0=-0.0). Add a dedicated
+        # free-slot (102) positive K on MEM_VAL_B1 -- the materialized value
+        # byte carried ONLY by genuine store VALUE rows (~0.97), ~0 on the
+        # spurious ADDR-byte rows -- gated MARK_AX on the Q so it is inert off
+        # the LI byte-0 lookup row. The lift flips func_add s9 271(0x39 lo) and
+        # func_max s9 319(0x24 lo) without disturbing the already-correct ``b``
+        # LI (s12) or var (b's/var's value rows carry MEM_VAL_B1 too -> same
+        # lift, no competing row). Scale 800: 800*800*0.97/sqrt(111) ~= 56k,
+        # inside the proven 5e4..5e5 flip band (_probe_func_b1_sim.py). See
+        # ``_l15_li_valrow_b1_on``.
+        if head == 0 and _l15_li_valrow_b1_on():
+            _vr_s = 800.0
+            # Q fires ONLY at an AX (the LI byte-0 lookup) row: MARK_AX is 1
+            # there and 0 elsewhere, so off-AX rows contribute nothing. The K
+            # (MEM_VAL_B1) is itself ~0 except on genuine store VALUE rows, so
+            # the product is nonzero only at (AX-lookup-row x value-row).
+            q_map[(102, BD.MARK_AX)] = _vr_s
+            k_map[(102, BD.MEM_VAL_B1)] = _vr_s
 
         new_q = tuple(
             AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
