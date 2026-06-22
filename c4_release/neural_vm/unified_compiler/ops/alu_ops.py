@@ -1131,7 +1131,51 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # Stage 1 (cleanup + EQ engine) owns block.ffn; Stage 2 (lookup)
         # is a post_op expanded into its own passthrough block AFTER
         # block.ffn so the bitwise lookup reads the cleaned operands.
-        block.ffn = cleanup_ffn
+        #
+        # === STACK0 campaign (2026-06-22): comparison operand-A SE recover ===
+        # Under ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` the L10
+        # ALU-clear crushes operand A all-negative for a value-dependent subset
+        # of cmp rows; the ordering/eq engines (merged into ``cleanup_ffn``)
+        # then read a -45 floor and their index-0 BLOCKERS flip positive ->
+        # every nibble unit fires -> CMP saturates to garbage -> mis-decode
+        # (bool_and + cmp low-nibble). The clean operand survives in SE_ALU;
+        # wrap ``cleanup_ffn`` in a forward-pass recover that restores the
+        # ALU band from SE_ALU on the cmp+MARK_AX row BEFORE the engines read.
+        # It runs as the SAME block (it IS block.ffn) so the physical block
+        # count is unchanged (lea contract). Flag-OFF / non-campaign leaves
+        # ``block.ffn = cleanup_ffn`` exactly (byte-identical to golden). See
+        # ``shared.cmp_byte0_se_recover_enabled`` for the full rationale.
+        from .shared import (
+            no_stack0_emit_enabled,
+            cmp_byte0_se_recover_enabled,
+        )
+        block_ffn = cleanup_ffn
+        if no_stack0_emit_enabled() and cmp_byte0_se_recover_enabled():
+            from ...efficient_alu_neural import CmpOperandSeRecoverFFN
+            # Resolve the operand / marker / cmp-opcode dims via the BUILT
+            # dim_positions (NOT the static registry) so a widen repack can't
+            # mis-point the read. ``_as_setdim_proxy`` exposes them by name.
+            cmp_op_dims = [
+                getattr(bd_proxy, nm) for nm in (
+                    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+                )
+            ]
+            # Only install when the SE_ALU mirror dims exist in this layout
+            # (they are campaign over-width dims; absent in narrow golden).
+            if (
+                hasattr(bd_proxy, "SE_ALU_LO")
+                and hasattr(bd_proxy, "SE_ALU_HI")
+            ):
+                block_ffn = CmpOperandSeRecoverFFN(
+                    cleanup_ffn,
+                    alu_lo=bd_proxy.ALU_LO,
+                    alu_hi=bd_proxy.ALU_HI,
+                    se_alu_lo=bd_proxy.SE_ALU_LO,
+                    se_alu_hi=bd_proxy.SE_ALU_HI,
+                    mark_ax=bd_proxy.MARK_AX,
+                    cmp_op_dims=cmp_op_dims,
+                )
+        block.ffn = block_ffn
         block.post_ops.append(lookup_ffn)
 
     return Operation(

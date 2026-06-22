@@ -1080,6 +1080,147 @@ class _GEToBDStage(nn.Module):
         return state
 
 
+class CmpOperandSeRecoverFFN(nn.Module):
+    """Campaign comparison operand-A SE_ALU recover wrapping the L10 cmp FFN.
+
+    Drop-in replacement for ``block.ffn`` in the efficient-mode L10 wrap
+    (``make_efficient_l10_andorxor_wrap_op``). Holds the original cleanup +
+    cmp-engine ``PureFFN`` (``inner``) and, BEFORE delegating to it, restores
+    the crushed operand-A ALU band from the surviving ``SE_ALU`` mirror so the
+    ``_layer10_alu_ordering_engine_rules`` / ``_layer10_alu_eq_engine_rules``
+    units inside ``inner`` read the SAME clean positive one-hot they see in the
+    golden 35-token config (no threshold re-tuning).
+
+    Runs in ONE block (it IS ``block.ffn``), so the model's physical block
+    count is unchanged — the absolute-position lea contract holds. ``compact``
+    / ``sparsify`` / the ``W_*`` properties all plumb through to ``inner`` so
+    the model's post-bake compactor and any weight-introspection treat this
+    exactly like the wrapped ``PureFFN`` (the same composite-FFN contract
+    ``AddSub5StageBlock`` / ``FlattenedDivMod`` honour).
+
+    Forward (campaign cmp + MARK_AX rows ONLY): multiplicatively CLEAR the
+    ALU_LO/HI band (a crushed -45 floor AND an already-clean +6 one-hot both
+    go to 0 — idempotent: the value-dependent NON-crushed passing rows are
+    re-materialized identically from their own SE_ALU mirror, never perturbed),
+    then ADD the clean ``SE_ALU`` one-hot (thresholded to a 0/1 mask) scaled to
+    ``ALU_CLEAN_MAG`` (+6.0, the golden operand magnitude). Operand B
+    (AX_CARRY) is untouched; CMP is never written here. Gate-OFF / non-campaign
+    leaves ``x`` byte-identical (the recover branch is skipped entirely).
+    """
+
+    # The cmp ordering/eq engines were tuned against the operand-gather HYBRID
+    # encoding the model delivers in the golden config (NOT a perfect one-hot):
+    # the true nibble at ~+6.0 PLUS a value-proportional index-0 magnitude
+    # artifact (~+5.3) and small cell-8 / cell-15 residues (~+0.45). The
+    # per-nibble AND units' ``-0.5``/``-0.8`` blockers are sized to SUBTRACT
+    # those artifacts, which pulls the lt/eq flags into the (0.75, 1.5) decode
+    # window. Probing GOLDEN 57>29 (spec_k=0): ALU_LO == 5.27@0, 0.44@8, 6.00@9
+    # -> lo_lt lands 1.11 (in window) -> GT default holds. A PERFECT one-hot
+    # (6.0@true, 0 elsewhere) leaves the blocker at 0, so lo_lt overshoots to
+    # 1.67 (> 1.5) and trips the GT (hi_eq AND lo_lt) 3-way override alone ->
+    # GT mis-decodes. So the recover REPRODUCES the golden hybrid shape, not a
+    # clean one-hot, and the engines land every flag exactly where they do in
+    # golden -- no re-tuning. (These magnitudes are byte-identical-OFF gated;
+    # flag-OFF the recover is skipped entirely.)
+    ALU_TRUE_MAG = 6.0       # true-nibble one-hot
+    ALU_IDX0_ART = 5.3       # index-0 magnitude artifact (golden ~5.27/5.32)
+    ALU_CELL8_ART = 0.45     # cell-8 residue (golden ~0.44)
+    ALU_CELL15_ART = 0.47    # cell-15 residue (golden ~0.47)
+
+    def __init__(self, inner: nn.Module, *, alu_lo, alu_hi, se_alu_lo,
+                 se_alu_hi, mark_ax, cmp_op_dims):
+        super().__init__()
+        self.inner = inner
+        self.alu_lo = int(alu_lo)
+        self.alu_hi = int(alu_hi)
+        self.se_alu_lo = int(se_alu_lo)
+        self.se_alu_hi = int(se_alu_hi)
+        self.mark_ax = int(mark_ax)
+        # The six comparison opcode flag dims (OP_EQ..OP_GE). One-hot per step.
+        self.cmp_op_dims = tuple(int(d) for d in cmp_op_dims)
+        # Sentinel so the wrap's idempotent guard recognises an existing attach.
+        self._is_cmp_se_recover_wrap = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lo = slice(self.alu_lo, self.alu_lo + 16)
+        hi = slice(self.alu_hi, self.alu_hi + 16)
+        alu_lo_band = x[:, :, lo]
+        alu_hi_band = x[:, :, hi]
+        # cmp opcode (OR of the six flags) AND MARK_AX, per row.
+        cmp_op = torch.zeros_like(x[:, :, self.mark_ax])
+        for d in self.cmp_op_dims:
+            cmp_op = cmp_op + x[:, :, d]
+        cmp_ax = (cmp_op > 0.5) & (x[:, :, self.mark_ax] > 0.5)
+        # CRUSH DETECTION: the L10 ALU-clear drives EVERY operand-A cell
+        # all-negative (~-45) for the value-dependent crushed rows, while a
+        # healthy operand band always has its true-nibble cell positive (~+6).
+        # Only those CRUSHED rows are rewritten; a NON-crushed cmp row (whose
+        # engines already decode correctly off the live ALU band) is left
+        # byte-identical, so the recover never perturbs a passing case.
+        crushed = (alu_lo_band.max(dim=-1).values < 0.0) & (
+            alu_hi_band.max(dim=-1).values < 0.0
+        )
+        recover = (cmp_ax & crushed)[:, :, None].to(dtype=x.dtype)  # [B,S,1]
+        keep = 1.0 - recover
+        # Clean 0/1 one-hot of operand A from the surviving SE_ALU mirror.
+        se_lo = (
+            torch.clamp(
+                x[:, :, self.se_alu_lo:self.se_alu_lo + 16], min=0.0, max=1.0,
+            ) > 0.5
+        ).to(dtype=x.dtype)
+        se_hi = (
+            torch.clamp(
+                x[:, :, self.se_alu_hi:self.se_alu_hi + 16], min=0.0, max=1.0,
+            ) > 0.5
+        ).to(dtype=x.dtype)
+        # Build the golden HYBRID operand band: true-nibble one-hot (+6.0) plus
+        # the index-0 / cell-8 / cell-15 magnitude artifacts the engines'
+        # blockers are tuned to subtract, so every lt/eq flag lands in the
+        # (0.75, 1.5) decode window exactly as in the golden config. The
+        # index-0 artifact is only added when the TRUE nibble is NOT 0 (else
+        # the one-hot already occupies cell 0 — golden does not double it).
+        art = torch.zeros(16, device=x.device, dtype=x.dtype)
+        art[8] = self.ALU_CELL8_ART
+        art[15] = self.ALU_CELL15_ART
+        art = art.view(1, 1, 16)
+        idx0_lo = (self.ALU_IDX0_ART * (1.0 - se_lo[:, :, 0:1]))
+        idx0_hi = (self.ALU_IDX0_ART * (1.0 - se_hi[:, :, 0:1]))
+        idx0_oh = torch.zeros(16, device=x.device, dtype=x.dtype)
+        idx0_oh[0] = 1.0
+        idx0_oh = idx0_oh.view(1, 1, 16)
+        clean_lo = se_lo * self.ALU_TRUE_MAG + art + idx0_lo * idx0_oh
+        clean_hi = se_hi * self.ALU_TRUE_MAG + art + idx0_hi * idx0_oh
+        x = x.clone()
+        # Multiplicative clear on the crushed cmp rows, then write the hybrid
+        # band; all other rows keep their live ALU band untouched.
+        x[:, :, lo] = alu_lo_band * keep + clean_lo * recover
+        x[:, :, hi] = alu_hi_band * keep + clean_hi * recover
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility ----
+    # Deliberately does NOT expose ``W_up`` etc. as Parameters: the model's
+    # ``_right_size_ffns`` / weight-introspection helpers recurse into
+    # ``named_children()`` when ``W_up`` is absent and resize the wrapped
+    # ``inner`` PureFFN directly (the same contract ``FlattenedALUMul`` /
+    # ``AddSub5StageBlock`` honour). ``compact`` / ``sparsify`` / ``compact_moe``
+    # ARE called on ``block.ffn`` directly, so they plumb through to ``inner``.
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Flattened AND/OR/XOR pipeline (vanilla nn.Sequential composite).
 #

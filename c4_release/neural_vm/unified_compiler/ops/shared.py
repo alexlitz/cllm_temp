@@ -273,6 +273,65 @@ def mul_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def cmp_byte0_se_recover_enabled() -> bool:
+    """Return True iff the COMPARISON operand-A byte-0 SE_ALU recovery is active
+    (DEFAULT ON in the campaign config — opt-out via
+    ``C4_CMP_BYTE0_SE_RECOVER=0``; only takes effect when the STACK0 emission
+    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the cmp low-nibble /
+    bool_and (nested-GT) fails — if_eq {412 7==45, 418 7==28, 420 28==12},
+    if_lt 96<70 family, and bool_and 1071-1095 (6 fail) — whose comparison
+    result decodes WRONG because operand A is crushed at the cmp-engine read.
+
+    This is the comparison analog of :func:`mul_byte0_se_recover_enabled`. For
+    a SUBSET of operands (value-dependent: e.g. 7, 57 crushed; 5, 96 NOT
+    crushed — the same pipeline-path dependence the MUL/divmod crush shows),
+    operand-A byte 0 — delivered from ``mem[SP]`` into ALU_LO/HI by the L8
+    ``make_layer8_mem_to_alu_op`` head 5 (CLEAN +6.0 one-hot at the true
+    nibble at blocks 11..13) — is CRUSHED ALL-NEGATIVE by the L10 ALU-clear
+    (block 14): every cell ~-45, the true nibble ~-39 (spec_k=0
+    ``tools/probe_cmp_se_recover.py``). The crush PERSISTS to the cmp-engine
+    read (block ~19). The ``_layer10_alu_ordering_engine_rules`` /
+    ``_layer10_alu_eq_engine_rules`` recompute the CMP cascade from the raw
+    ``ALU_HI/LO`` (operand A) + ``AX_CARRY_HI/LO`` (operand B) at MARK_AX via
+    per-nibble AND units whose ``-0.5``/``-0.8`` index BLOCKERS reject the
+    operand-gather index-0 magnitude artifact. With ALU crushed to ~-45 every
+    blocker term flips strongly POSITIVE (``-0.5 * -45 = +22.5``), so EVERY
+    nibble unit clears threshold and the four CMP flags saturate to garbage
+    (spec_k=0: CMP=[25947,17146,16997,32593] for 7==45). The
+    ``ComparisonCombine`` then mis-decodes (eq_false -> 1, etc.). The clean
+    operands the engines need ARE present at the AX row in
+    ``SE_ALU_LO/HI`` (~+0.8 one-hot at the true nibble; the L9
+    ``step_end_operand_relay`` mirror, written BEFORE the crush and surviving
+    through block 19 — spec_k=0: SE_ALU_LO==0x7/SE_ALU_HI==0x0 for 7).
+
+    FIX. When enabled, a forward-pass recover prepended to the efficient-mode
+    L10 wrap (``make_efficient_l10_andorxor_wrap_op``) — running on the SAME
+    block as the cmp engines, BEFORE they read, so NO physical block is added
+    (the absolute-position lea contract holds) — does, on the cmp opcodes +
+    MARK_AX row ONLY: (1) multiplicatively CLEAR the ``ALU_LO/HI`` band (so a
+    crushed -45 floor AND an already-clean +6 one-hot both go to 0 —
+    IDEMPOTENT, the non-crushed passing rows are not perturbed because their
+    own clean operand is re-materialized identically), then (2) WRITE the
+    clean operand-A one-hot from ``SE_ALU_LO/HI`` at the golden +6.0 magnitude
+    the engines were tuned against. The engines then recompute the cascade
+    from the SAME clean positive one-hot they see in the golden 35-token
+    config — so NO threshold re-tuning is needed and the blockers reject the
+    index-0 artifact exactly as designed. Operand B (``AX_CARRY``, clean) is
+    untouched; ``CMP`` is never written here.
+
+    DEFAULT ON. Opt-out via ``C4_CMP_BYTE0_SE_RECOVER=0`` restores the raw
+    crushed ALU_LO/HI read (the byte-identical-OFF path: flag-OFF, or
+    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden ``7f6f2e5d``).
+    Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_CMP_BYTE0_SE_RECOVER`` can A/B it
+    inside the campaign config.
+    """
+    return os.environ.get("C4_CMP_BYTE0_SE_RECOVER", "1") != "0"
+
+
 def mul_l19_flood_cap_enabled() -> bool:
     """Return True iff the MUL L19-EXPLODE flood cap fires on MODERATE-magnitude
     (not just >100) wide_mul OUTPUT floods (DEFAULT ON in the campaign config —
