@@ -941,6 +941,32 @@ def _l10_carry_propagation_rules(
             conds.append(("TEMP+8", -10.0))
         else:
             conds.append((add_carry_in_name, -10.0))
+        # CAMPAIGN (30-token) byte-1 hand-off (2026-06-21). In the campaign
+        # config the byte-1 minuend is delivered by the L8 head-7 mem[SP] CAM
+        # as a ``+/-6`` STACK0_BYTE_VAL_1_LO encoding (not the clean ``+3``
+        # one-hot the golden psh_ax_broadcast delivers), AND it lands too late
+        # (block 18, AFTER this L10 cascade) so the LOW nibble matches but the
+        # HIGH nibble cannot. With the L14 output step-boundary guard
+        # amplifying every IS_BYTE unit to ~+1e9, the (lo, hi) HI match is
+        # washed out, so ALL (matched-lo, *) SUB cells fire and spray
+        # OUTPUT_HI uniformly (1537-87 -> 0x65AA not 0x05AA). Rather than fight
+        # the guard, gate the byte_idx=0 non-cascade SUB cells OFF on the
+        # SUB byte-1 emit row (TEMP+9) in the campaign config and let
+        # ``layer14_sub_borrow_high_byte_passthrough`` (a clean ±0.08 op that
+        # works because the cascade is then quiet, mirroring the no-borrow
+        # passthrough) own the byte 1. byte_idx=0 only (the byte-0->1 stage),
+        # TEMP+9-gated (the SUB byte-1 selector), campaign-only -> GOLDEN
+        # byte-identical and the byte-2/3 cascade stages untouched.
+        if (
+            not cascade
+            and byte_idx == 0
+            and operand_from_memsp_enabled()
+        ):
+            # HARD off: the L14 output step-boundary guard amplifies the
+            # IS_BYTE term ~+1e7, so a small TEMP+9 blocker is swamped. Use a
+            # blocker on the SAME order as the guard so the SUB byte-1 cell is
+            # driven below the silu floor on the TEMP+9 row regardless.
+            conds.append(("TEMP+9", -1.0e8))
         # SUB minuend match: the relayed STACK0_BYTE_VAL_{byte_idx+1}
         # band (see the ``sub_minuend_lo/hi`` note above), not OUTPUT.
         conds.append((f"{sub_minuend_lo}+{lo}", output_weight))

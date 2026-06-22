@@ -14,6 +14,7 @@ from .shared import (
     ffn_lint_clean_demo_enabled,
     ffn_lint_mull14_demo_enabled,
     no_stack0_emit_enabled,
+    operand_from_memsp_enabled,
 )
 from ..positional_invariant import marker_bank_index
 
@@ -169,8 +170,15 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # predictor row when there is NO byte-0 borrow (CARRY+2 absent).
     # Completes the multi-byte SUB result that the borrow-gated L14 carry
     # cascade cannot reach on the no-borrow path (sub_0 ``827-26``-class).
-    # See ``make_layer14_sub_noborrow_high_byte_passthrough_op``.
-    "layer14_sub_noborrow_high_byte_passthrough": (None, 16),
+    # See ``make_layer14_sub_noborrow_high_byte_passthrough_op``. The
+    # campaign (30-token) config adds 16 BORROW-path rules in the SAME op
+    # (the L10 cascade byte-1 SUB cells are gated OFF on TEMP+9 there, so
+    # this op owns the borrow byte 1 -- see the op's comment), so it claims
+    # 32 units; GOLDEN claims 16 and is byte-identical. The two trailing
+    # entries below are the demo fixtures (both DEFAULT OFF), so growing
+    # this op never shifts a real op's start_unit.
+    "layer14_sub_noborrow_high_byte_passthrough":
+        (None, 32 if operand_from_memsp_enabled() else 16),
     # Phase 6 Wave 7 demo: pure-declaration corrective op. The op's single
     # rule is byte-identically a no-op on the live corpus -- it carries the
     # impossible condition ``CONST=-100`` so SiLU collapses to 0 and the
@@ -3356,6 +3364,89 @@ def _layer14_sub_noborrow_high_byte_passthrough_rules(
     return tuple(rules)
 
 
+def _layer14_sub_borrow_high_byte_passthrough_rules(
+    S: float,
+) -> tuple[FFNRule, ...]:
+    """16 rules: OUTPUT byte 1 = (relayed minuend byte 1) - 1 on borrow SUB.
+
+    The CAMPAIGN-only sibling of
+    :func:`_layer14_sub_noborrow_high_byte_passthrough_rules`. In the
+    30-token frame the L10 borrow cascade's byte_idx=0 SUB cells cannot
+    discriminate the byte-1 high nibble (the L8 mem[SP] CAM delivers a
+    ``+/-6`` LOW-nibble encoding that lands AFTER the cascade, and the L14
+    step-boundary guard amplifies every cell so the HI match is washed
+    out -> all matched-lo SUB cells spray OUTPUT_HI; 1537-87 -> 0x65AA).
+    Those cascade cells are therefore gated OFF on the SUB byte-1 emit row
+    (TEMP+9) in the campaign config (``_l10_carry_propagation_rules.
+    sub_rule_for``), leaving the field clean for this op -- the same reason
+    the ±0.08 no-borrow sibling works.
+
+    One rule per minuend-byte1 nibble value ``v``: fires at the SUB byte-1
+    predictor row (``TEMP+9`` + ``H1[AX]`` + ``IS_BYTE`` + ``BYTE_INDEX_0``)
+    when ``STACK0_BYTE_VAL_1_LO == v`` AND there IS a byte-0 borrow
+    (``CARRY+2`` present, +2.0). Emits OUTPUT byte 1 = ``(v - 1) & 0xFF``.
+    The subtrahend's byte 1 is 0x00 for every 1096 sub case, so
+    result_byte1 = minuend_byte1 - 1 on the borrow path. minuend byte1 is
+    <= 0x07 (operands < 2000) so v-1 fits the low nibble and OUTPUT_HI
+    byte 1 = 0 (v=0 -> 0xFF never occurs for a valid sub but is emitted
+    correctly anyway).
+
+    CAMPAIGN-only (gated by the IR builder on
+    ``operand_from_memsp_enabled()``): GOLDEN keeps the cascade-owned
+    borrow path byte-identical (these rules are not lowered there).
+    """
+    AX_I = 1
+    # HARD borrow partition: the no-borrow sibling keys ``not CARRY+2`` with a
+    # -10 blocker so borrow rows go deeply negative (no silu leak). We need the
+    # MIRROR -- a HARD floor for no-borrow rows. CARRY+2 cannot be keyed
+    # "absent" (it is 0 there), so floor with a -10 CONST baseline and lift the
+    # borrow row back with CARRY+2*+10 (=+20 since CARRY+2=2.0).
+    #   borrow    row: 4 (one-hots) + 20 (CARRY+2) - 10 (CONST) = +14  (fires)
+    #   no-borrow row: 4 (one-hots) +  0          - 10 (CONST) =  -6  (dark,
+    #     silu(-6-4.5)=silu(-10.5) ~= 0 -- no leak onto the no-borrow result)
+    CONST_FLOOR = -10.0
+    BORROW_REQ = 10.0  # CARRY+2 (=2.0) -> +20 lift on the borrow row
+    rules: list[FFNRule] = []
+    for v in range(16):
+        new_v = (v - 1) & 0xFF
+        new_lo = new_v & 0xF
+        new_hi = (new_v >> 4) & 0xF
+        conditions = (
+            ("IS_BYTE", 1.0),
+            (f"H1+{AX_I}", 1.0),
+            ("BYTE_INDEX_0", 1.0),
+            (f"STACK0_BYTE_VAL_1_LO+{v}", 1.0),
+            # No-borrow HARD floor (CONST is always 1.0).
+            ("CONST", CONST_FLOOR),
+            # Borrow gate: byte-0 borrow-out rides CARRY+2 (=2.0) here.
+            ("CARRY+2", BORROW_REQ),
+        )
+        writes: list[tuple[str, float]] = []
+        for k in range(16):
+            writes.append((f"OUTPUT_LO+{k}", -3.0 / S))
+            writes.append((f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S))
+        writes.append((f"OUTPUT_LO+{new_lo}", 8.0 / S))
+        writes.append((f"OUTPUT_HI_THIS_STEP+{new_hi}", 8.0 / S))
+        rules.append(
+            multi_way_and_rule(
+                name=f"l14_sub_borrow_high_byte_v{v:x}",
+                conditions=conditions,
+                # borrow row +14 >= 4.5 (fires); no-borrow row -6 (dark, no
+                # silu leak -- the CONST floor is the load-bearing partition).
+                threshold=4.5,
+                gate="TEMP+9",
+                gate_weight=1.0,
+                gate_bias=0.0,
+                writes=tuple(writes),
+                scope=(
+                    "TEMP+9 and IS_BYTE and H1+1 and BYTE_INDEX_0 "
+                    "and CARRY+2"
+                ),
+            )
+        )
+    return tuple(rules)
+
+
 def _layer14_sub_noborrow_high_byte_passthrough_ir(
     S: float = 100.0,
 ) -> CompilerIR:
@@ -3363,6 +3454,13 @@ def _layer14_sub_noborrow_high_byte_passthrough_ir(
     ir.layer(0).ffn.rules.extend(
         _layer14_sub_noborrow_high_byte_passthrough_rules(S)
     )
+    # Campaign-only borrow path (30-token frame): the L10 cascade byte-1 SUB
+    # cells are gated OFF on TEMP+9 there, so this op owns the borrow byte 1.
+    # GOLDEN keeps the cascade owner and is byte-identical (rules omitted).
+    if operand_from_memsp_enabled():
+        ir.layer(0).ffn.rules.extend(
+            _layer14_sub_borrow_high_byte_passthrough_rules(S)
+        )
     return ir
 
 
@@ -3572,8 +3670,12 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         # Multi-byte SUB follow-up (2026-06-12) added
         # ``layer14_sub_noborrow_high_byte_passthrough`` (16 units) after
         # ``layer14_ent_ax_bytes_zero``, shifting demo from 1890 to 1906
-        # → tail = 1907.
-        ffn_units_used=1907,
+        # → tail = 1907. Campaign (30-token) SUB-borrow follow-up
+        # (2026-06-21) grows that passthrough to 32 units (+16 BORROW-path
+        # rules), shifting the demo +16 (1906 → 1922) → tail = 1923 in the
+        # campaign config; GOLDEN keeps 1907 byte-identical. This sizes the
+        # L14 mem_generation block FFN wide enough for the extra units.
+        ffn_units_used=1923 if operand_from_memsp_enabled() else 1907,
         smoke_tests=set(),
         spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
     )
