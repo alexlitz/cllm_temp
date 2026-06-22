@@ -980,6 +980,7 @@ class _MulCombineStage(nn.Module):
         from .unified_compiler.ops.shared import (
             no_stack0_emit_enabled,
             mul_byte0_se_recover_enabled,
+            mul_l19_flood_cap_enabled,
         )
         if no_stack0_emit_enabled() and mul_byte0_se_recover_enabled():
             # The cap fires only on rows where THIS composite is the MUL writer
@@ -989,6 +990,43 @@ class _MulCombineStage(nn.Module):
             mul_ax_row = (op_mul.view(B, seq_len) > 0.5) & (mark_ax > 0.5)
             flood_row = output_hi_band > 100.0
             cap_row = mul_ax_row & flood_row
+
+            # L19-EXPLODE fix (2026-06-22, C4_MUL_L19_FLOOD_CAP). SINGLE-BYTE
+            # products (3*15=45, 11*11=121, 1*10=10, 8*30=240) write the CORRECT
+            # byte-0 product but at a MODERATE ~41 OUTPUT band — BELOW the 100.0
+            # flood threshold — which the block-33 (logical L19) attention then
+            # AMPLIFIES to ~555 (spec_k=0: ATTN in_LO=40.7 -> out_LO=555.6),
+            # spreading the band so the argmax flips to OUTPUT cell 0 == 0x00 and
+            # the AX high bytes pick up the flood -> a HUGE garbage AX (e.g.
+            # 11*11 -> 2752768). The existing cap misses them (band < 100).
+            #
+            # Extend the cap to these moderate floods, but ONLY when the PRODUCT
+            # is single-byte (byte 1 == 0). That is the exact L19-EXPLODE class
+            # (product < 256), and gating on it leaves the MULTI-byte products
+            # untouched: for those, clearing OUTPUT and re-firing the GEToBD
+            # product write would ALSO re-stage this composite's byte 1 into
+            # AX_FULL, which is WRONG for the campaign config (the FlattenedALUMul
+            # operand-A byte 1 is the flooded reconstruction, e.g. 21*59 ->
+            # 0xf0d7) and would CLOBBER the correct byte-1 relay -> regressing the
+            # passing multi-byte muls (21*59, 65*98, 97*94). Single-byte products
+            # have byte 1 == 0 so the re-stage writes 0 == correct. The byte-1
+            # zero test reads the GE result positions 2/3 (byte-1 lo/hi nibbles)
+            # the schoolbook multiply just computed. Gated on no_stack0_emit + the
+            # mul recover flag -> golden byte-identical; opt-out via the flag.
+            if mul_l19_flood_cap_enabled():
+                # Product byte-1 nibbles live at GE result positions 2 and 3.
+                res_b1 = (
+                    x_ge_out[:, :, 2, ge.RESULT].abs()
+                    + x_ge_out[:, :, 3, ge.RESULT].abs()
+                )
+                single_byte = (res_b1 < 0.5)
+                moderate_flood = (
+                    (output_hi_band > 10.0)
+                    & (op_mul.view(B, seq_len) > 0.5)
+                    & (mark_ax > 0.5)
+                    & single_byte
+                )
+                cap_row = cap_row | moderate_flood
             # Where we cap: do NOT veto via already_fired (let the product
             # write), and clear the flooded OUTPUT band before the write.
             already_fired = already_fired * (~cap_row).float()

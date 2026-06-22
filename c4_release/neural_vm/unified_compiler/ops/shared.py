@@ -273,6 +273,50 @@ def mul_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def mul_l19_flood_cap_enabled() -> bool:
+    """Return True iff the MUL L19-EXPLODE flood cap fires on MODERATE-magnitude
+    (not just >100) wide_mul OUTPUT floods (DEFAULT ON in the campaign config —
+    opt-out via ``C4_MUL_L19_FLOOD_CAP=0``; only takes effect when the STACK0
+    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1`` AND the MUL byte-0
+    SE-recover is on, since it reuses that path's clear+rewrite machinery).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; the 4 "L19-EXPLODE" mul
+    fails 3*15, 11*11, 1*10, 8*30 whose product decodes to a HUGE garbage AX
+    (e.g. 11*11 -> 2752768)):
+
+    For a SMALL product the L11 ``efficient_l11_alumul_wrap`` wide_mul writes the
+    CORRECT byte-0 product into OUTPUT_LO/HI but at a MODERATE flood magnitude
+    (spec_k=0 block trace, 11*11: OUTPUT band sum ~41 at block 16 — the correct
+    0x79 one-hot, but inflated). That ~41 band is BELOW the existing
+    ``mul_byte0_se_recover`` flood-cap threshold (``output_hi_band > 100.0``), so
+    the cap does NOT fire and the inflated raw OUTPUT survives. The downstream
+    block-33 (logical L19) attention then AMPLIFIES that ~41 band to ~555
+    (spec_k=0: ATTN in_LO=40.7 -> out_LO=555.6 at the MUL-AX row), spreading the
+    band so the LM-head argmax flips to OUTPUT cell 0 == byte 0x00 and the AX
+    high bytes pick up the flood -> the huge garbage AX. (Passing muls whose
+    product writes a low ~14 band, e.g. 21*59, stay below the L19 amplification
+    onset and decode correctly.)
+
+    FIX. When this flag is on, the ``_MulCombineStage`` flood-cap threshold is
+    LOWERED from ``> 100.0`` to ``> 4.0`` (well above the legitimate single-fire
+    ``+2.0`` product write, below the ~41 small-product wide_mul flood) so the
+    cap ALSO fires for the moderate-magnitude floods: it clears the inflated raw
+    OUTPUT band on the OP_MUL+MARK_AX row and lets the clean ``+2.0`` byte-0
+    product (the FlattenedALUMul schoolbook result, which is byte-0-correct for
+    every mul-cluster operand — verified spec_k=0) survive. The normalized
+    ``+2.0`` byte-0 product is below the L19 amplification onset, so the L19
+    attention no longer explodes it. OUTPUT is byte-0 ONLY (byte 1 rides
+    AX_FULL), so clearing+rewriting it never disturbs the byte-1 relay.
+
+    DEFAULT ON. Opt-out via ``C4_MUL_L19_FLOOD_CAP=0`` restores the ``> 100.0``
+    threshold (the byte-identical-OFF path: flag-OFF, or ``C4_NO_STACK0_EMIT=0``,
+    or ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden). Kept as a
+    dedicated kill-switch for ``tools/flag_regression_gate.py``.
+    """
+    return os.environ.get("C4_MUL_L19_FLOOD_CAP", "1") != "0"
+
+
 def divmod_axcarry_clear_enabled() -> bool:
     """Return True iff the divmod writeback CLEARS the AX_CARRY (divisor) band
     at the divmod AX row (DEFAULT ON in the campaign config — opt-out via
