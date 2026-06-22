@@ -390,6 +390,68 @@ def _sp_pop_marker_cmp3_hardgate_enabled() -> bool:
     )
 
 
+def _sp_pop_carry_byte0_dominate_enabled() -> bool:
+    """Flag for the campaign-config binary-pop SP byte-0 CARRY-case dominator
+    (#319 — the expr_mod SP-tracking desync, ~17 programs IDs 875-899).
+
+    The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; probes
+    ``tools/probe_exprmod_sp_carry.py`` + ``probe_exprmod_sp_logits.py`` +
+    ``probe_exprmod_sp_dims.py``): on the binary-pop ``SP += 8`` step whose input
+    SP byte-0 is exactly ``0xF8`` (stack at ``0x00fff8``), the oracle carries
+    byte-0 ``0xf8 -> 0x00`` (``0x00fff8 + 8 = 0x010000``). The SP byte-0 VALUE is
+    computed at the SP MARKER row (the row whose FFN OUTPUT band drives the
+    byte-0 LM-head argmax). The marker-correction family
+    (``sp_pop_marker_increment_rules``) has ``e0->e8`` / ``d0->d8`` / ``f0->f8``
+    / ``d8->e0`` -- but is MISSING the ``f8->00`` carry case, the most common
+    stack-pop boundary. On most programs the L6 binary-pop nibble rotation
+    delivers ``0x00`` cleanly, but on certain MOD/ADD results (e.g. id876
+    ``46%6+6``) a value-dependent OUTPUT-band leak stamps ``OUTPUT_LO+8`` /
+    ``OUTPUT_HI_THIS_STEP+15`` (= ``0xF8``) at the SP marker row (``~+73`` at
+    step3, ``~+2.9e4`` at step6) -- so the stale ``0xF8`` wins the byte-0 argmax,
+    the drifted SP byte-0 feeds back AR, the next step misframes, and the run
+    desyncs at the HALT step (``got pc=None``). On a PASSING expr_mod (id875
+    ``55%8+1``) the marker-row OUTPUT already resolves to ``0x00`` cleanly
+    (``OUTPUT_LO+0`` ``+0.996`` vs ``OUTPUT_LO+8`` ``-0.006``) -- i.e. the
+    failure is purely value-dependent: same EMBED input ``0xF8``, same
+    ``CMP+3``, only the OUTPUT leak differs.
+
+    The fix adds a SINGLE campaign-gated marker-row rule
+    (``tail_sp_pop_marker_f8_to_00``, the missing carry sibling) that fires ONLY
+    on the genuine binary-pop CARRY signature -- ``MARK_SP`` + ``CMP+3``
+    HARD-gated (the ``SP += 8`` relay, ``== +4`` on the pop step, ``0`` on the
+    PUSH/decrement step) + the input SP byte-0 proven exactly ``0xF8`` via
+    ``EMBED_LO+8`` + ``EMBED_HI+15`` (both ``~+1.0`` on the marker row). It
+    writes ``0x00`` at strength ``5.0e5`` (``byte_writes`` also drives ``-5.0e5``
+    onto the competing ``LO+8`` / ``HI+15`` nibbles), DOMINATING the ``~3e4``
+    corruption -> the marker-row OUTPUT byte-0 resolves to ``0x00``.
+
+    WHY IT IS LOAD-BEARING-SAFE (the SP band gates var/if_var/SI/SC/var_simple):
+    the ``0xF8`` input requirement makes this VALUE-CORRECT, not a blanket
+    ``CMP+3 -> 0x00``. ``0xF8 + 8`` is the ONLY binary-pop input that carries to
+    ``0x00``; a deeper-frame pop whose input byte-0 is ``0xF0`` (-> ``0xF8``,
+    EMBED_LO nibble 0 -> excluded by the ``EMBED_LO+0`` blocker) or ``0xE8``
+    (-> ``0xF0``, EMBED_HI nibble E=14 -> excluded by the ``EMBED_HI+14``
+    blocker) fails the AND and is handled by the existing ``f0->f8`` / e-family
+    rules. The PUSH/decrement step (whose input byte-0 IS ``0xF8`` but must emit
+    ``0xF8``) is excluded by the ``CMP+3`` hard gate (it carries ``CMP+0`` /
+    ``PSH_AT_SP``, not ``CMP+3``). And on the already-correct passing rows
+    (id875) the input IS ``0xF8`` and ``CMP+3`` IS set, so the rule ALSO fires
+    there and writes the SAME ``0x00`` the model already produces -> no change.
+
+    DEFAULT **OFF** (opt-in via ``C4_SP_POP_CARRY_BYTE0_DOMINATE=1`` AND the
+    campaign ``C4_NO_STACK0_EMIT=1``). Flag unset / ``=0`` / golden 35-tok build
+    -> ZERO rules appended -> bit-for-bit golden ``7f6f2e5d``. Cross-cluster A/B
+    via ``tools/flag_regression_gate.py --flag C4_SP_POP_CARRY_BYTE0_DOMINATE``.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    return (
+        os.environ.get("C4_SP_POP_CARRY_BYTE0_DOMINATE", "0") == "1"
+        and no_stack0_emit_enabled()
+    )
+
+
 def _psh_stack0_highbyte_darken_enabled() -> bool:
     """Flag for the PSH-STACK0-passthrough high-byte (byte2/byte3) darkening.
 
@@ -1407,13 +1469,18 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # (flag-ON campaign). The layout's single tenant range widens by the same
     # +3. See ``_lea_byte0_memsp_relay_enabled``.
     #
-    # PHASE-2 multi-param ALU-AMPLIFIER (ROOT 1 sibling, GOLDEN-SAFE): adds 4
-    # extra tail rules (lo nibbles {0,8} x 2 frame-address HI nibbles 0xE/0xD)
-    # when enabled (opt-in, campaign only), so flag-ON the count widens by a
-    # further +4. flag-OFF (the default, incl golden 35-token) it adds 0 —
-    # bit-for-bit unchanged. See ``_lea_byte0_alu_amplify_enabled``.
-    extra = 3 if _lea_byte0_memsp_relay_enabled() else 0
-    extra += 4 if _lea_byte0_alu_amplify_enabled() else 0
+    # PHASE-2 multi-param ALU-AMPLIFIER (+4) + the #319 SP byte-0 f8->00 carry
+    # dominator (+1) -- both DEFAULT-OFF campaign flags appended to this width-
+    # sensitive tail bank; flag-OFF (incl golden 35-token) each adds 0 ->
+    # bit-for-bit unchanged. See _lea_byte0_alu_amplify_enabled /
+    # _sp_pop_carry_byte0_dominate_enabled.
+    extra = 0
+    if _lea_byte0_memsp_relay_enabled():
+        extra += 3
+    if _lea_byte0_alu_amplify_enabled():
+        extra += 4
+    if _sp_pop_carry_byte0_dominate_enabled():
+        extra += 1
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -5654,6 +5721,98 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
         _e0e8_thresh = (
             9.0 + 3.5e6 if _sp_pop_marker_cmp3_hardgate_enabled() else 9.0
         )
+        # #319: the MISSING binary-pop SP byte-0 CARRY case. The marker family
+        # above has e0->e8 / d0->d8 / f0->f8 / d8->e0 but NO f8->00 -- yet the
+        # most common stack-pop boundary is exactly 0x00fff8 + 8 => 0x010000
+        # (input SP byte-0 0xF8 -> output 0x00). On 875-899 the L6 binary-pop
+        # rotation usually delivers 0x00 cleanly, but on certain MOD/ADD results
+        # (e.g. id876 46%6+6) a value-dependent OUTPUT-band leak stamps
+        # OUTPUT_LO+8 / OUTPUT_HI+15 (= 0xF8) at the SP MARKER row (~+73 at
+        # step3, ~+2.9e4 at step6; probe ``tools/probe_exprmod_sp_dims.py``),
+        # which wins the byte-0 LM argmax -> SP byte-0 stays 0xF8 -> the AR run
+        # desyncs at the HALT step. This rule (campaign-flag-gated) writes 0x00
+        # at the marker row on the genuine carry signature -- ``MARK_SP`` +
+        # ``CMP+3`` (binary-pop SP+=8 relay) + input proven 0xF8
+        # (``EMBED_LO+8`` + ``EMBED_HI+15``) -- at strength 5e5 to DOMINATE the
+        # ~3e4 corruption. The ``EMBED_LO+8`` + ``EMBED_HI+15`` AND makes it
+        # VALUE-CORRECT and LOAD-BEARING-SAFE (the SP band gates
+        # var/if_var/SI/SC): 0xF8+8 is the ONLY pop input that carries to 0x00;
+        # a deeper-frame pop input 0xF0 (-> 0xF8, EMBED_LO nib 0) or 0xE8
+        # (-> 0xF0, EMBED_HI nib E) fails the AND and is handled by the existing
+        # f0->f8 / e-family rules; the PUSH/decrement step carries CMP+0 not
+        # CMP+3 and is vetoed. On already-correct rows (id875) the input IS 0xF8
+        # so this also fires there, writing the SAME 0x00 it already produces ->
+        # no change. Mirrors ``tail_sp_pop_marker_f0_to_f8`` (small condition
+        # weights, gate_mark_sp) -- the SAME shape the existing marker family
+        # uses -- but for the missing 0xF8 -> 0x00 carry. Flag-OFF / golden
+        # 35-tok -> not appended -> byte-identical. CRITICAL: NO
+        # OP_MUL/OP_DIV/OP_MOD veto here. The expr_mod pop step occurs right
+        # after the MOD compute, so a small ``OP_MOD`` residue (~+0.18) PERSISTS
+        # on this SP marker row; an arithmetic veto (even at -100) would sink the
+        # rule precisely on the MOD cluster this fix targets (measured: an early
+        # large-weight draft with an ``OP_MOD`` veto fired NEGATIVELY because the
+        # 0.18 residue x the rescaled veto drove the pre-activation < 0). The
+        # CMP+3 (binary-pop relay) + EMBED 0xF8 proof is already a value-correct
+        # AND; the 0x00 write at strength 5e5 dominates the ~3e4 corruption.
+        _carry_f8_to_00 = (
+            (
+                multi_way_and_rule(
+                    name="tail_sp_pop_marker_f8_to_00",
+                    scope="mark == SP",
+                    dominates_at={
+                        "OUTPUT_LO": "mark == SP",
+                        "OUTPUT_HI_THIS_STEP": "mark == SP",
+                    },
+                    conditions=(
+                        ("MARK_SP", 1.0),
+                        ("HAS_SE", 1.0),
+                        # Binary-pop SP+=8 relay. HARD requirement: weight 2.0 x
+                        # activation +4 = +8 on the pop step (CMP+3); the
+                        # PUSH/decrement step (CMP+0) AND a NO-OP step where SP is
+                        # unchanged but EMBED still reads 0xF8 (e.g. 876 step 2,
+                        # CMP+3==0) BOTH have CMP+3==0, so without this +8 the
+                        # remaining MARK_SP+HAS_SE+EMBED-proofs (~6) stay below
+                        # threshold -> the rule fires ONLY on the genuine SP+=8
+                        # carry step.
+                        ("CMP+3", 2.0),
+                        # Input SP byte-0 proven == 0xF8 (lo nibble 8, hi
+                        # nibble F): the ONLY pop input that carries to 0x00.
+                        ("EMBED_LO+8", 2.0),
+                        ("EMBED_HI+15", 2.0),
+                        # Exclude near-look-alike inputs handled by other
+                        # marker rules: 0xF0 (EMBED_LO nib 0 -> f0->f8), 0xE8
+                        # (EMBED_HI nib E=14 -> e-family), 0xD8 (EMBED_HI
+                        # nib D=13 -> d8->e0).
+                        ("EMBED_LO+0", -10.0),
+                        ("EMBED_HI+14", -10.0),
+                        ("EMBED_HI+13", -10.0),
+                        # Marker / push / store vetoes (mirror the f0->f8
+                        # family). NO arithmetic-opcode veto (see note above).
+                        ("MARK_AX", -100.0),
+                        ("MARK_PC", -100.0),
+                        ("MARK_BP", -100.0),
+                        ("MARK_STACK0", -100.0),
+                        ("MARK_MEM", -100.0),
+                        ("OP_ENT", -1000000.0),
+                        ("OP_LEV", -1000000.0),
+                        ("PSH_AT_SP", -1000000.0),
+                        ("MEM_STORE", -100000.0),
+                        ("IS_BYTE", -100.0),
+                    ),
+                    # Genuine carry: MARK_SP(1)+HAS_SE(1)+CMP+3(2x4=8)+
+                    # EMBED_LO+8(2x~1)+EMBED_HI+15(2x~1) ~= 14 > 9. A NON-pop /
+                    # no-op SP marker row (CMP+3==0) reaches only ~6 < 9; a
+                    # missing 0xF8 nibble (input 0xF0/0xE8) drops by 2 AND trips a
+                    # -10 EMBED look-alike veto -> well below 9. So both CMP+3 AND
+                    # the exact 0xF8 input are REQUIRED.
+                    threshold=9.0,
+                    gate=gate_mark_sp,
+                    writes=byte_writes(0x00, strength=5.0e5),
+                ),
+            )
+            if _sp_pop_carry_byte0_dominate_enabled()
+            else ()
+        )
         return (
             multi_way_and_rule(
                 name="tail_sp_pop_marker_e0_to_e8",
@@ -5762,7 +5921,7 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 gate=gate_mark_sp,
                 writes=byte_writes(0xE0, strength=500.0),
             ),
-        )
+        ) + _carry_f8_to_00
 
     def sp_pop_byte1_preserve_rules() -> tuple[FFNRule, ...]:
         """Preserve SP byte 1 after the marker-lane ``e0 -> e8`` correction.
