@@ -420,11 +420,13 @@ def _harden_axmark_blocker(conditions):
 # STACK0-EMISSION-DROP campaign (Inc-3): when ``C4_NO_STACK0_EMIT=1`` the
 # rule bank grows by the 30-token-frame AX byte-1 sign-extension re-target
 # (``l16_memsp_lea_local_ax_byte1_ff_{lo,hi}_after_{e8,e0,d8}``): 3 frame-address
-# values × 2 bands (LO + HI) = 6 extra units. The L16 FFN width is hard-pinned
-# from this layout total AND ``Operation.ffn_units_used`` (the right-sizer
-# pre-sizes the PureFFN hidden_dim from it — there is NO append slack), so BOTH
-# must track the rule count. Flag-OFF the count is 827 (byte-identical golden).
-_L16_NO_STACK0_EMIT_EXTRA_UNITS = 6
+# values × 2 bands (LO + HI) = 6 extra units, PLUS the PSH AX-carry materializer
+# (``l16_psh_ax_carry_{lo,hi}_{k}``, func-arg delivery): 16 LO + 16 HI = 32
+# extra units. Total 6 + 32 = 38. The L16 FFN width is hard-pinned from this
+# layout total AND ``Operation.ffn_units_used`` (the right-sizer pre-sizes the
+# PureFFN hidden_dim from it — there is NO append slack), so BOTH must track the
+# rule count. Flag-OFF the count is 827 (byte-identical golden).
+_L16_NO_STACK0_EMIT_EXTRA_UNITS = 6 + 32
 
 
 def _layer16_lev_routing_unit_total() -> int:
@@ -1482,6 +1484,73 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             gate=f"AX_CARRY_HI+{k}",
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
+
+    # === STACK0 campaign (2026-06-22): PSH AX-carry materializer (func-arg) ===
+    #
+    # PSH preserves AX while pushing it to mem[SP] (the C4 calling convention's
+    # argument-passing path: caller does IMM <arg>; PSH; JSR <fn>). In the
+    # 35-token golden frame the PSH step's AX bytes are carried by the emitted
+    # STACK0 register block; under ``C4_NO_STACK0_EMIT`` that block is GONE, so
+    # nothing materializes the carried AX value into OUTPUT at the PSH step's AX
+    # marker. The per-step decode then reads AX=0 at the PSH step — the
+    # argument value (e.g. quad(10)'s 10) is lost, and the whole nested-call
+    # trace diverges from there.
+    #
+    # ROOT (GPU-equivalent CPU AR probe, campaign config, spec_k=0,
+    # tools/probe_nestarg_ar_residual.py): nested_quad id950 step 3 (PSH, arg=10)
+    # has AX_CARRY byte0 = 0x0a (CORRECT — L3 head-1 carried it forward) but
+    # OUTPUT byte0 = 0x00 (NOT materialized) -> emitted AX=[0,0,0,0]. cpu_full_trace
+    # confirms div_step=3 got=(pc=186,ax=0) oracle=(pc=186,ax=10) (PC correct,
+    # only AX wrong). The fix mirrors the SI/SC ``store_ax_carry`` and the
+    # IMM-then-EXIT ``stale_imm_ax_carry`` materializers above: write the carried
+    # AX (AX_CARRY_LO/HI) back into OUTPUT at the PSH AX marker before the AX
+    # bytes are generated. OP_PSH at the AX marker probes at ~+5.2 (opcode flag
+    # broadcast); MARK_AX=+1.0; MARK_PC/IS_BYTE/OP_EXIT/OP_JMP all 0 there. A
+    # threshold of 1.5 fires on (OP_PSH AND MARK_AX) and stays below the bar at
+    # any non-PSH AX marker (OP_PSH~=0 there -> only MARK_AX=1.0 < 1.5) and at
+    # the PSH byte/marker rows (IS_BYTE=-10 / MARK_PC=-8 drive the sum negative).
+    # PSH ALWAYS preserves AX, so materializing AX_CARRY at every PSH AX marker
+    # is unconditionally correct (no over-fire risk). Campaign-gated on
+    # ``no_stack0_emit_enabled()``: flag-OFF the rule bank is unchanged (827)
+    # so the 35-token golden stays byte-identical.
+    if no_stack0_emit_enabled():
+        psh_ax_conditions = (
+            ("OP_PSH", 1.0),
+            ("MARK_AX", 1.0),
+            ("MARK_PC", -8.0),
+            ("IS_BYTE", -10.0),
+            ("OP_EXIT", -20.0),
+            ("OP_JMP", -20.0),
+        )
+        # The PSH AX marker carries a STRONG zero-byte default at the LO band
+        # (probe: OUTPUT_LO+0 ~= +8.6 vs the carried nibble ~= +0.4 baseline) —
+        # unlike the SI/SC store-AX marker, so a bare additive 2.0/S write loses.
+        # Mirror ``l16_psh_mem_addr0_restore`` / ``l16_top_store_restore``: write
+        # ``+W`` to the carried LO nibble AND ``-W`` to OUTPUT_LO+0 so a NONZERO
+        # carried low nibble overrides the zero default (k==0 self-cancels, so a
+        # genuinely-zero low byte is left at its zero default). HI carries no such
+        # competing default (OUTPUT_HI+0 ~= +22 IS the correct high nibble for the
+        # common small-arg case), so the HI band keeps the plain additive form.
+        psh_ax_restore = 30.0 / S
+        for k in range(16):
+            lo_writes = ((f"OUTPUT_LO+{k}", psh_ax_restore),)
+            if k != 0:
+                lo_writes = lo_writes + (("OUTPUT_LO+0", -psh_ax_restore),)
+            rules.append(multi_way_and_rule(
+                name=f"l16_psh_ax_carry_lo_{k}",
+                conditions=psh_ax_conditions,
+                threshold=1.5,
+                gate=f"AX_CARRY_LO+{k}",
+                writes=lo_writes,
+            ))
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"l16_psh_ax_carry_hi_{k}",
+                conditions=psh_ax_conditions,
+                threshold=1.5,
+                gate=f"AX_CARRY_HI+{k}",
+                writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
+            ))
 
     # LC is an 8-bit load. L15 head 0 writes the loaded byte and can leave
     # that byte replicated at subsequent AX byte positions; clear bytes 1-3
