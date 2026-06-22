@@ -164,6 +164,71 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     )
 
 
+def _lea_byte0_memsp_relay_enabled() -> bool:
+    """Flag for the PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay
+    (ROOT 1, gates func_identity step-6 + var_mul/three multi-local + nested).
+
+    The wall this lifts (verified TEACHER-FORCED spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): in the 30-token
+    frame the LEA effective-address byte-0 (the BP-relative local address
+    0xE8/0xE0/0xD8) is NOT delivered onto the AX-marker OUTPUT row. The legacy
+    ``tail_lea_local_ax_marker_byte0_e8`` corrector keys on ``CMP+7`` and the
+    ``FETCH``/``MEM_ADDR_SRC`` bands, but in the 30-tok frame ``CMP+7 == 0``,
+    ``MEM_ADDR_SRC == 0``, and on ``func_identity``'s ``&x`` LEA the FETCH band
+    is empty too — so the rule never fires and the AX-marker OUTPUT byte-0 keeps
+    the stale ``AX_CARRY`` leak (``func_identity`` step-6 ``got ax=0x46`` instead
+    of ``0xFFE8``). var_mul/three's 2nd/3rd locals (``&b`` BP-16, ``&c`` BP-24)
+    are likewise never corrected to 0xE0/0xD8 (the multilocal-guard correctly
+    SILENCES the 0xE8 stamp but nothing writes the right byte).
+
+    THE BUILD — three campaign-only AX-marker OUTPUT byte-0 writers, each keyed
+    on the clean per-frame discriminator measured at the LEA AX-marker row
+    entering the L25 tail block (probe ``tools/_probe_learelay_tf.py``,
+    teacher-forced so the rows are drift-free):
+
+      * ``&x`` / ``&a`` (BP-8, want 0xE8): on ``func_identity`` the FETCH band is
+        DEAD so the only surviving discriminator is the AUTOREGRESSIVE
+        ``ALU_HI+15`` MAGNITUDE — it is ~+73..+90 on the BP-8 effective-address
+        compute and ~+5.5 on the BP-16/BP-24 frames and ~-45 on every non-LEA AX
+        row (the golden ROOT-1 discriminator, branch ``opcam-funcmax-attack``
+        ``acf2be0d``). The 0xE8 writer keys on ``OP_LEA`` (multiplicative gate,
+        ~5.23 on LEA / <=0.05 elsewhere) + ``0.2*ALU_HI+15``: BP-8 sum ~25.4
+        crosses, BP-16/24 ~8.3 and non-LEA <0 stay silent. On the var first-LEA
+        (ALU_HI+15 ~73, already 0xE8 upstream) it re-writes 0xE8 — a no-op; on
+        the var ``&a`` re-read (small ALU_HI+15, already 0xE8 upstream) it stays
+        silent (no correction needed).
+      * ``&b`` (BP-16, want 0xE0): the multi-local re-read LEA carries small
+        ``ALU_HI+15`` indistinguishably from ``&a`` re-read, so the RELIABLE
+        discriminator is the FETCH IMMEDIATE (the LEA imm). imm=-16 = 0xF0 lights
+        ``FETCH_LO+0`` + ``FETCH_HI+15`` (NOT ``FETCH_LO+8`` / ``FETCH_HI+14``);
+        the 0xE0 writer REQUIRES ``FETCH_LO+0`` and ``FETCH_HI+15`` (each weight
+        8 so their ABSENCE drops the score below threshold — this defeats the
+        non-LEA ``-0.x*ALU_HI+15`` × negative-residual trap, since FETCH is 0 on
+        every non-LEA AX row) and NOT-blocks ``FETCH_LO+8`` / ``FETCH_HI+14``.
+        func_identity's ``&x`` (``FETCH_HI+15 == 0``) is excluded.
+      * ``&c`` (BP-24, want 0xD8): imm=-24 = 0xE8 lights ``FETCH_LO+8`` +
+        ``FETCH_HI+14`` (NOT ``FETCH_HI+15``); the 0xD8 writer mirrors the 0xE0
+        rule on those nibbles.
+
+    All three gate MULTIPLICATIVELY on ``OP_LEA`` (the only LEA-specific signal
+    that is ~0 on non-LEA rows; ``CMP+7`` is dead in this frame) and carry the
+    same hard NOT-blockers as the legacy e8 corrector (``OP_IMM`` -1e6,
+    ``OP_ADD/SUB/DIV/MOD`` -1e9, ``IS_BYTE`` -10, the five competing markers
+    -1e4) so a non-AX / non-LEA / arith-result row can never satisfy them.
+
+    DEFAULT tracks ``no_stack0_emit_enabled()``: ON in the 30-token campaign
+    config, ABSENT (the three rules omitted, tail bank count 2059) otherwise so
+    the golden 35-token build is bit-for-bit unchanged. Force with
+    ``C4_LEA_BYTE0_MEMSP_RELAY=0/1``.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    forced = os.environ.get("C4_LEA_BYTE0_MEMSP_RELAY")
+    if forced is not None:
+        return forced != "0"
+    return no_stack0_emit_enabled()
+
+
 def _sp_pop_marker_cmp3_hardgate_enabled() -> bool:
     """Flag for the campaign-config CMP+3 HARD-gate on the binary-pop SP-marker
     ``e0 -> e8`` correction (#315 — the SP/BP cross-step tracking drift).
@@ -1238,15 +1303,21 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     (MUL/LEA tail rules) is unaffected because those rules consume
     layout-by-name, not by pin offset.
     """
-    if n_rules != _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL:
+    # PHASE-2 KEYSTONE (ROOT 1, GOLDEN-SAFE): the campaign LEA byte-0 address
+    # relay adds THREE extra tail rules (0xE8/0xE0/0xD8 writers) when enabled,
+    # so the expected count is 2059 (flag-OFF, golden byte-identical) or 2062
+    # (flag-ON campaign). The layout's single tenant range widens by the same
+    # +3. See ``_lea_byte0_memsp_relay_enabled``.
+    extra = 3 if _lea_byte0_memsp_relay_enabled() else 0
+    expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
+    if n_rules != expected:
         raise ValueError(
             f"tail_bit32_result_correction rule count drift: helper "
-            f"produced {n_rules} rules, allocator expects "
-            f"{_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL}"
+            f"produced {n_rules} rules, allocator expects {expected}"
         )
     allocator = FFNUnitAllocator()
     for name, _legacy_start, n_units in _L10_FFN_UNIT_LAYOUT_TAIL_BIT32:
-        allocator.alloc(name, n_units)
+        allocator.alloc(name, n_units + extra)
     return allocator
 
 
@@ -9243,7 +9314,126 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             gate="NEXT_SE",
             writes=clear_output_writes(strength=100_000_000.0),
         ),
-    ) + sp_pop_carry_rules()
+    ) + ((
+        # PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay (ROOT 1).
+        # Three AX-marker OUTPUT byte-0 writers that deliver the BP-relative
+        # local effective-address low byte (0xE8 BP-8 / 0xE0 BP-16 / 0xD8 BP-24)
+        # onto the LEA AX-marker row in the 30-token frame, where the legacy
+        # ``tail_lea_local_ax_marker_byte0_e8`` corrector dies (CMP+7 == 0,
+        # MEM_ADDR_SRC == 0, FETCH empty on func_identity's ``&x``). All gate
+        # MULTIPLICATIVELY on ``OP_LEA`` (~5.23 on LEA AX rows, <=0.05 on every
+        # non-LEA row — the only LEA-specific signal that survives this frame).
+        # Measured teacher-forced (tools/_probe_learelay_tf.py). See
+        # ``_lea_byte0_memsp_relay_enabled``.
+        #
+        # (1) BP-8 -> 0xE8. On func_identity the FETCH band is DEAD, so the only
+        # discriminator is the AUTOREGRESSIVE ``ALU_HI+15`` MAGNITUDE: ~+73..+90
+        # on the BP-8 effective-address compute, ~+5.5 on BP-16/BP-24, ~-45 on
+        # non-LEA AX rows (the golden ROOT-1 discriminator, acf2be0d). 0.2 *
+        # ALU_HI+15 makes the BP-8 conditions sum ~25 (>= threshold 17) while
+        # BP-16/24 (~8.3) and non-LEA (<0) stay silent; the OP_LEA gate zeroes
+        # any residual non-LEA leak. On the var first-LEA (already 0xE8) this is
+        # a byte-identical re-write; on the var ``&a`` re-read (small ALU_HI+15,
+        # already 0xE8) it stays silent.
+        multi_way_and_rule(
+            name="tail_lea_local_ax_byte0_e8_alubp_memsp",
+            scope="mark == AX",
+            dominates_at={"OUTPUT_LO": "mark == AX",
+                          "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            gate="OP_LEA",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("HAS_SE", 1.0),
+                ("OP_LEA", 1.0),
+                ("ALU_HI+15", 0.2),
+                ("OP_IMM", -1_000_000.0),
+                ("OP_ADD", -1_000_000_000.0),
+                ("OP_SUB", -1_000_000_000.0),
+                ("OP_DIV", -1_000_000_000.0),
+                ("OP_MOD", -1_000_000_000.0),
+                ("IS_BYTE", -10.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+            ),
+            threshold=17.0,
+            writes=byte_writes(0xE8, strength=1_000_000.0),
+        ),
+        # (2) BP-16 -> 0xE0. The multi-local re-read LEA carries small ALU_HI+15
+        # indistinguishably from ``&a`` re-read, so the reliable discriminator is
+        # the FETCH IMMEDIATE. imm=-16 = 0xF0 lights ``FETCH_LO+0`` +
+        # ``FETCH_HI+15`` (NOT ``FETCH_LO+8`` / ``FETCH_HI+14``). Both FETCH
+        # requirements carry weight 8 so their ABSENCE drops the score below
+        # threshold — this is what defeats the non-LEA ``ALU_HI+15`` × negative
+        # residual trap (FETCH is identically 0 on every non-LEA AX row, so the
+        # 16-pt FETCH floor can never be reached there). func_identity's ``&x``
+        # (FETCH_HI+15 == 0) and the var ``&a`` re-read (FETCH_LO+0 == 0) are
+        # both excluded.
+        multi_way_and_rule(
+            name="tail_lea_local_ax_byte0_e0_fetch_memsp",
+            scope="mark == AX",
+            dominates_at={"OUTPUT_LO": "mark == AX",
+                          "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            gate="OP_LEA",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("HAS_SE", 1.0),
+                ("OP_LEA", 1.0),
+                ("FETCH_LO+0", 8.0),
+                ("FETCH_HI+15", 8.0),
+                ("FETCH_LO+8", -10.0),
+                ("FETCH_HI+14", -10.0),
+                ("OP_IMM", -1_000_000.0),
+                ("OP_ADD", -1_000_000_000.0),
+                ("OP_SUB", -1_000_000_000.0),
+                ("OP_DIV", -1_000_000_000.0),
+                ("OP_MOD", -1_000_000_000.0),
+                ("IS_BYTE", -10.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+            ),
+            threshold=20.0,
+            writes=byte_writes(0xE0, strength=1_000_000.0),
+        ),
+        # (3) BP-24 -> 0xD8. imm=-24 = 0xE8 lights ``FETCH_LO+8`` +
+        # ``FETCH_HI+14`` (NOT ``FETCH_HI+15``). Mirrors the 0xE0 rule on those
+        # nibbles; the var ``&a`` (FETCH_HI+14 == 0) and ``&b`` (FETCH_HI+15 ==
+        # 1, hard-blocked) frames are excluded.
+        multi_way_and_rule(
+            name="tail_lea_local_ax_byte0_d8_fetch_memsp",
+            scope="mark == AX",
+            dominates_at={"OUTPUT_LO": "mark == AX",
+                          "OUTPUT_HI_THIS_STEP": "mark == AX"},
+            gate="OP_LEA",
+            conditions=(
+                ("MARK_AX", 1.0),
+                ("HAS_SE", 1.0),
+                ("OP_LEA", 1.0),
+                ("FETCH_LO+8", 8.0),
+                ("FETCH_HI+14", 8.0),
+                ("FETCH_LO+0", -10.0),
+                ("FETCH_HI+15", -10.0),
+                ("OP_IMM", -1_000_000.0),
+                ("OP_ADD", -1_000_000_000.0),
+                ("OP_SUB", -1_000_000_000.0),
+                ("OP_DIV", -1_000_000_000.0),
+                ("OP_MOD", -1_000_000_000.0),
+                ("IS_BYTE", -10.0),
+                ("MARK_PC", -10000.0),
+                ("MARK_SP", -10000.0),
+                ("MARK_BP", -10000.0),
+                ("MARK_STACK0", -10000.0),
+                ("MARK_MEM", -10000.0),
+            ),
+            threshold=20.0,
+            writes=byte_writes(0xD8, strength=1_000_000.0),
+        ),
+    ) if _lea_byte0_memsp_relay_enabled() else ()) + sp_pop_carry_rules()
     return step_end_transition_blocked(
         pc_byte_span_blocked(
             stack0_span_blocked_tail_rules(
