@@ -257,7 +257,49 @@ def _l15_lev_opcode_gate_on() -> bool:
     return _os_l15.environ.get("C4_L15_LEV_OPCODE_GATE", "1") != "0"
 
 
+def _l15_savedra_head_on() -> bool:
+    """Campaign-gated flag (``C4_L15_SAVEDRA_HEAD``): add a 16th L15 head that
+    delivers the JSR return address (= JSR_PC + INSTR_WIDTH) into PC at the LEV
+    step *in the 30-token campaign frame* (``C4_NO_STACK0_EMIT=1``).
+
+    ROOT (CPU-first, campaign config, spec_k=0; tools/_probe_lev_findval90.py +
+    tools/_probe_savedra_dims.py, func_identity id550): in the golden 35-token
+    frame the JSR return address (90 = 0x5a) is materialized EXCLUSIVELY onto the
+    emitted STACK0 push token (pos 269, STACK0_BYTE0=1, CLEAN_EMBED=0x5a). The
+    existing head 14 LEV-CAM gathers it there by the BP+8 address key. Under
+    ``C4_NO_STACK0_EMIT`` that STACK0 push is DROPPED: token 90 is never emitted,
+    NO memory store row carries the return addr (every addr-0xfff0 store row holds
+    the ENT-pushed saved-BP word 0xf0=240), so head 14's CAM starves and gathers
+    the saved-BP word (got pc=240, want 90). A head re-key is impossible -- the
+    value 90 does not exist on ANY persistent row in the campaign frame.
+
+    BUT 90 IS available LIVE at the JSR step: the ``LOOKAHEAD_PC_LO/HI`` band
+    (= current_PC + INSTR_WIDTH(8), built default-ON by ``C4_STACK0_NEXT_ARITH``)
+    is a sharp one-hot at the JSR step's AX-marker row (step 4, OP_JSR present,
+    MARK_AX=1): for func_identity id550 ``LOOKAHEAD_PC = 0x5a = 90`` there exactly
+    (JSR_PC 82 + 8). The genuine LEV return PC = the most-recent JSR's PC+8.
+
+    FIX (this head): a NEW dedicated head (index 15) that, at the LEV PC marker
+    (query OP_LEV + MARK_PC), content-addresses the most-recent JSR AX-marker row
+    (key OP_JSR + MARK_AX) and copies its ``LOOKAHEAD_PC_LO/HI`` -> OUTPUT_LO/HI,
+    delivering the return PC byte. It is fully ISOLATED from the load-bearing
+    head 14 CAM (head 14 keeps its golden +25 / SI-SC-LI-LC path untouched);
+    flag-OFF (the default OUTSIDE the campaign) omits the head entirely so L15
+    stays num_heads<=15 and the build is byte-identical to golden.
+
+    DEFAULT tracks ``no_stack0_emit_enabled()`` (campaign-only ON), AND the
+    parent head-14 flag must be on (the resize must already be widening L15).
+    Force with ``C4_L15_SAVEDRA_HEAD=0/1``.
+    """
+    forced = _os_l15.environ.get("C4_L15_SAVEDRA_HEAD")
+    if forced is not None:
+        return forced != "0"
+    from .shared import no_stack0_emit_enabled
+    return no_stack0_emit_enabled() and _l15_lev_pc_restore_head_on()
+
+
 _L15_LEV_PC_RESTORE_HEAD_IDX = 14
+_L15_SAVEDRA_HEAD_IDX = 15
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     attention_head_extension,
@@ -373,10 +415,22 @@ if _l15_lev_pc_restore_head_on():
     _L15_HEAD_LAYOUT = _L15_HEAD_LAYOUT + (
         ("layer15_memory_lookup.lev_pc_restore", _L15_LEV_PC_RESTORE_HEAD_IDX),
     )
+# head 15 (campaign flag C4_L15_SAVEDRA_HEAD): saved-RA delivery into PC at LEV in
+# the 30-token campaign frame. Appended only when on so flag-off keeps the head
+# count byte-identical to the golden (15-head LEV) build.
+if _l15_savedra_head_on():
+    _L15_HEAD_LAYOUT = _L15_HEAD_LAYOUT + (
+        ("layer15_memory_lookup.savedra_pc", _L15_SAVEDRA_HEAD_IDX),
+    )
 _L15_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L15_HEAD_LAYOUT}
-# Widest configured L15 head count: 15 when the LEV PC-restore head is on,
-# else 14 (the legacy LEV build).
-_L15_MAX_HEADS = 15 if _l15_lev_pc_restore_head_on() else 14
+# Widest configured L15 head count: 16 with the campaign saved-RA head, 15 with
+# the LEV PC-restore head, else 14 (the legacy LEV build).
+if _l15_savedra_head_on():
+    _L15_MAX_HEADS = 16
+elif _l15_lev_pc_restore_head_on():
+    _L15_MAX_HEADS = 15
+else:
+    _L15_MAX_HEADS = 14
 
 
 def _allocate_layer15_attention_heads() -> AttentionHeadAllocator:
@@ -2173,6 +2227,151 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     )
 
 
+def _layer15_savedra_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """L15 head 15: campaign saved-RA delivery into PC at the LEV step.
+
+    In the 30-token campaign frame (``C4_NO_STACK0_EMIT=1``) the JSR return
+    address is never materialized on any persistent row (the STACK0 push that
+    carried it is dropped), so head 14's BP+8 address-CAM has nothing to gather
+    (it picks the saved-BP word -> pc=240 instead of 90). This head bypasses the
+    starved CAM: it reads the LIVE ``LOOKAHEAD_PC`` band (= current_PC + 8 = the
+    return address) off the most-recent JSR step's AX-marker row and copies it to
+    OUTPUT at the LEV PC marker.
+
+    DESIGN (mirrors the head-14 firing/suppressor scaffold but with a DIFFERENT
+    gather target):
+      * Query fires ONLY at the LEV PC marker (OP_LEV + MARK_PC); every other row
+        is darkened so the head writes ~nothing elsewhere.
+      * Key rewards the JSR AX-marker row (OP_JSR + MARK_AX): the JSR's AX marker
+        is the UNIQUE row carrying both, and it is the row where ``LOOKAHEAD_PC``
+        is a live one-hot (= JSR_PC + INSTR_WIDTH). Recency (ALiBi) selects the
+        MOST-RECENT JSR for nested/recursive calls; a CONST sink anchors the
+        softmax1 so a no-JSR LEV (top-level) writes nothing.
+      * V reads ``LOOKAHEAD_PC_LO/HI`` -> O writes OUTPUT_LO/HI (value_scale 40,
+        the same strong-write the LI/LC load + head-14 use to land a sharp byte).
+
+    Campaign-gated (``C4_L15_SAVEDRA_HEAD``); flag-off omits the head so the
+    golden (15-head) build is byte-identical.
+    """
+    q: list[AP] = []
+    k: list[AP] = []
+
+    # The head is a content-addressable gather: the query (at the LEV PC marker)
+    # rewards the UNIQUE row that carries BOTH OP_JSR and MARK_AX (the JSR step's
+    # AX marker, where LOOKAHEAD_PC = JSR_PC + 8 = the return PC is a live
+    # one-hot). Recency (ALiBi) selects the most-recent JSR for nested/recursive
+    # calls; a CONST sink anchors softmax1 so a no-JSR LEV writes ~nothing.
+    #
+    # Scoring is kept to MODERATE magnitudes (a clean per-byte one-hot is ~1.0 but
+    # the opcode/marker residuals are 0.9..7, so a 1e6-scale HARD gate would blow
+    # the softmax up on a 0.92 opcode one-hot -- the empirical -3.7e4 uniform sink
+    # that buried the first cut). The genuine JSR-AX row must score strongly
+    # POSITIVE so it beats the zero sink; every other row stays <= 0.
+
+    # === Slot 0: fire ONLY at the LEV PC marker (the query gate). ===
+    # q is positive only when OP_LEV (~5 at the LEV PC marker) AND MARK_PC are
+    # present; a CONST baseline keeps the head dark on non-LEV rows. Suppress the
+    # LEV step's own AX/SP/BP/STACK0/MEM marker + byte rows so the head only
+    # *queries* from the PC marker (it must not fire as a query at, e.g., the LEV
+    # AX marker and gather there). k=CONST so this is a uniform per-query gate.
+    q.append(AP(0, BD.CONST, -3.0))
+    q.append(AP(0, BD.OP_LEV, 1.0))
+    q.append(AP(0, BD.MARK_PC, 1.0))
+    q.append(AP(0, BD.MARK_AX, -1000.0))
+    q.append(AP(0, BD.MARK_SP, -1000.0))
+    q.append(AP(0, BD.MARK_BP, -1000.0))
+    q.append(AP(0, BD.MARK_STACK0, -1000.0))
+    q.append(AP(0, BD.MARK_MEM, -1000.0))
+    q.append(AP(0, BD.IS_BYTE, -1000.0))
+    k.append(AP(0, BD.CONST, 30.0))
+
+    # === Slot 1: JSR-step AX-marker selector (the gather target reward). ===
+    # On a firing query (q positive only at the LEV PC marker) reward keys by
+    # OP_JSR (~5 on the JSR step's rows, ~0.1..1.2 broadcast residue elsewhere)
+    # gated by MARK_AX (1.0 only on the AX marker). OP_JSR is the DOMINANT term so
+    # the JSR-step AX row (OP_JSR~5) decisively beats other steps' AX markers
+    # (OP_JSR~0.1..1.2 -> score collapses) -- those carry MARK_AX too but their
+    # OP_JSR residue is small, so a large OP_JSR coefficient separates them. A
+    # MARK_AX requirement (added as a positive gate, removed below as a hard
+    # not-blocker via slot 2 for the non-AX JSR rows) keeps the gather on the AX
+    # row where LOOKAHEAD_PC is live.
+    SEL = 40.0
+    q.append(AP(1, BD.OP_LEV, 1.0))
+    q.append(AP(1, BD.MARK_PC, 1.0))
+    q.append(AP(1, BD.CONST, -2.0))
+    k.append(AP(1, BD.OP_JSR, SEL))
+    k.append(AP(1, BD.MARK_AX, 0.5 * SEL))
+    k.append(AP(1, BD.CONST, -0.7 * SEL))
+
+    # === Slot 2: require MARK_AX (reject the JSR step's NON-AX rows). ===
+    # OP_JSR also broadcasts onto the JSR step's PC/SP/BP/MEM-store/byte rows
+    # (where LOOKAHEAD_PC is 0). A strong NOT-MARK_AX penalty drives every non-AX
+    # key far negative so the gather lands on the AX marker. The JSR AX row has
+    # MARK_AX=1 -> the (1 - MARK_AX) penalty is 0 there.
+    REJ = 200.0
+    q.append(AP(2, BD.OP_LEV, 1.0))
+    q.append(AP(2, BD.MARK_PC, 1.0))
+    q.append(AP(2, BD.CONST, -2.0))
+    k.append(AP(2, BD.CONST, -REJ))
+    k.append(AP(2, BD.MARK_AX, REJ))
+
+    # === Slot 3: per-step LEV-opcode firing gate (fail-closed, the ADJ guard). ===
+    # OP_LEV is a CROSS-STEP DURABLE broadcast ("last-executed opcode was LEV") so
+    # it PERSISTS into the step AFTER the LEV (func_identity LEV@8 -> ADJ@9, where
+    # OP_LEV is still ~6.5 and MARK_PC=1). Without this the head re-fires at the
+    # post-LEV ADJ PC marker and PINS step-9 PC to 90 instead of advancing to 98.
+    # OPCODE_BYTE_LO+8 (the per-step FETCHED opcode) is a sharp one-hot == 1.0
+    # EXACTLY at the genuine LEV step and 0 at every other step (measured: LEV
+    # opcode 0x08 -> OPCODE_BYTE_LO+8 == 1.0 at row 348; the post-LEV ADJ step is
+    # OPCODE_BYTE_LO+7). This is the SAME discriminator head 14 uses (slot 70).
+    #   q = GATE*CONST - GATE*(OPCODE_BYTE_LO+8)  (=> 0 at LEV step, +GATE else)
+    #   k = -CONST at every real key (sink stays 0)
+    # so a non-LEV-opcode row is driven GATE below the sink -> head writes nothing.
+    # GATE must dominate AFTER the head_dim^-0.5 score scale (~0.095): the winning
+    # JSR-AX score is ~90, so GATE*0.095 must be >> 90 -> GATE >= ~1e4. Use 1e6
+    # (mirrors head-14's slot-70 HARD) so the post-LEV ADJ step (OPCODE_BYTE_LO+8
+    # == 0, measured) is driven ~-1e5 below the sink and the head writes nothing
+    # there; at the genuine LEV step (OPCODE_BYTE_LO+8 == 1.0, measured) q[3] == 0
+    # so the gather proceeds unchanged.
+    GATE = 1_000_000.0
+    q.append(AP(3, BD.CONST, GATE))
+    q.append(AP(3, BD.OPCODE_BYTE_LO + 8, -GATE))
+    k.append(AP(3, BD.CONST, -1.0))
+
+    # === V/O: copy the matched JSR AX row's LOOKAHEAD_PC to OUTPUT. ===
+    # value_scale 80 (vs the LI/LC + head-14's 40): the LEV PC marker already
+    # carries a STRONG 0xF high-nibble default (the LEV sign-extension of the
+    # saved-BP word 0xfff0 -> OUTPUT_HI+15 ~= 40 at the L15 block). The delivered
+    # return-PC high nibble (0x5) must out-write that existing 0xF, so push the
+    # value 2x harder than a plain load.
+    value_scale = 80.0
+    v: list[AP] = []
+    o: list[AO] = []
+    for kk in range(16):
+        v.append(AP(32 + kk, BD.LOOKAHEAD_PC_LO + kk, 1.0))
+        v.append(AP(48 + kk, BD.LOOKAHEAD_PC_HI + kk, 1.0))
+        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
+        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=_L15_SAVEDRA_HEAD_IDX,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+        # Strong per-head ALiBi recency so the MOST-RECENT JSR's AX row wins over
+        # an identical earlier JSR-AX row (the prelude / a prior call's AX marker
+        # also carries OP_JSR + MARK_AX). slope 0.1 over the 30-token step stride
+        # gives ~3 logits/step of recency -- enough to break a same-program
+        # duplicate at >=1 step away while still reaching the JSR several steps
+        # before the LEV (nested/recursive calls return to the innermost JSR).
+        alibi_slope=0.1,
+        # The return addr (LOOKAHEAD_PC) was computed on the JSR step; the LEV
+        # gather reads it across step boundaries by design -> ANY_STEP.
+        step_window=StepWindowConstraint.ANY_STEP,
+    )
+
+
 def _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
     BD,
 ) -> tuple[DeclarativeAttentionHeadSpec, ...]:
@@ -2411,6 +2610,17 @@ def _layer15_memory_lookup_ir(
             _layer15_lev_pc_restore_head_spec(proxy),
             name="layer15_memory_lookup.lev_pc_restore",
             metadata={"role": "lev_pc_restore", "shape": "num_heads >= 15"},
+        )
+    # Head 15: campaign saved-RA delivery (flag C4_L15_SAVEDRA_HEAD, campaign).
+    # Emitted when the resize has allocated a 16th head (num_heads >= 16) or on
+    # the declarations-only audit path when the flag is on.
+    if _l15_savedra_head_on() and (
+        num_heads is None or int(num_heads) >= 16
+    ):
+        attn_op.append(
+            _layer15_savedra_pc_head_spec(proxy),
+            name="layer15_memory_lookup.savedra_pc",
+            metadata={"role": "savedra_pc", "shape": "num_heads >= 16"},
         )
     return ir
 
@@ -3844,6 +4054,17 @@ def _l15_attention_resize_follow_up(block, dim_positions, S) -> None:
         Primitives.generate_attention_head(
             attn,
             _layer15_lev_pc_restore_head_spec(_as_setdim_proxy(dim_positions)),
+            int(head_dim),
+        )
+    # Head 15: campaign saved-RA delivery (flag C4_L15_SAVEDRA_HEAD). Lower its
+    # body after the resize has grown the attn to >=16 heads. Flag-off keeps the
+    # resize target at <=15 and skips this -> byte-identical with the golden build.
+    if _l15_savedra_head_on() and getattr(
+        attn, "num_heads", 0
+    ) > _L15_SAVEDRA_HEAD_IDX:
+        Primitives.generate_attention_head(
+            attn,
+            _layer15_savedra_pc_head_spec(_as_setdim_proxy(dim_positions)),
             int(head_dim),
         )
 
