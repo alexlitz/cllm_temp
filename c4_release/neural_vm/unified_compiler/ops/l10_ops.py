@@ -447,7 +447,7 @@ def _sp_pop_carry_byte0_dominate_enabled() -> bool:
     from .shared import no_stack0_emit_enabled
 
     return (
-        os.environ.get("C4_SP_POP_CARRY_BYTE0_DOMINATE", "0") == "1"
+        os.environ.get("C4_SP_POP_CARRY_BYTE0_DOMINATE", "1") != "0"
         and no_stack0_emit_enabled()
     )
 
