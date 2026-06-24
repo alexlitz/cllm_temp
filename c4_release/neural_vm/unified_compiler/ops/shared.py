@@ -551,6 +551,53 @@ def mul_l19_product_boost_enabled() -> bool:
     return os.environ.get("C4_MUL_L19_PRODUCT_BOOST", "1") != "0"
 
 
+def mul_se_recover_strict_onehot_enabled() -> bool:
+    """Return True iff the ``MulOperandSeRecoverFFN`` rebuilds the recovered
+    operand-A one-hot as a STRICT SINGLE-ARGMAX (one cell only) rather than the
+    ``clamp(0,1) > 0.5`` multi-cell threshold (DEFAULT ON in the campaign config
+    — opt-out via ``C4_MUL_SE_RECOVER_STRICT_ONEHOT=0``; only takes effect under
+    ``C4_NO_STACK0_EMIT=1`` + ``C4_MUL_BYTE0_SE_RECOVER=1``, since the recover
+    branch is campaign-only and crush-gated).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; var_mul 275-299 = 0/25, the
+    MULTI-LOCAL ``a*b`` frame — DECISIVE control: the literal mul of the same
+    values PASSES, var FAILS):
+
+    In the deep multi-local var frame the L9 ``step_end_operand_relay`` SE_ALU
+    mirror accumulates a SPURIOUS extra operand-A HIGH-nibble cell. Probed at the
+    block-16 (logical L11) MUL row for var_mul 275 (23*47, a=23=0x17 so the true
+    A high nibble is cell 1): ``SE_ALU_HI`` reads ``hot=[(1,0.7),(15,0.6)]`` — the
+    true cell 1 (0.7) AND a stale cell 15 (0.6) — whereas the PASSING literal mul
+    reads a clean ``hot=[(1,0.7)]``. The ``MulOperandSeRecoverFFN`` rebuilds the
+    recovered one-hot with ``clamp(SE_ALU_HI,0,1) > 0.5``, which keeps BOTH cells
+    (0.7>0.5 AND 0.6>0.5) -> the recovered ``ALU_HI`` becomes ``[(1,6.0),(15,6.0)]``
+    (TWO non-zero A high-nibble cells). The width=2 wide_mul's per-rule operand-A
+    artifact BLOCKER (``operand_a_artifact_blocker_weight=3.0`` on every OTHER
+    non-zero A cell) then TRIPS on the true rule: the 5-way AND drops below its
+    19.0 threshold and the wide_mul fires on NO rule -> ``MUL_RESULT_HI``/OUTPUT
+    stay 0 (probed: var block-16 OUTPUT band == 0 vs lit == 41.6). The only thing
+    left is the downstream ``+2.0`` GEToBD/L16 default at the WRONG nibble, so the
+    product decodes to garbage (id275 23*47=1081 -> neural 73).
+
+    FIX. When this flag is on, the recover rebuilds the operand-A one-hot from the
+    SE mirror as a STRICT single-argmax (the single largest cell only). cell 1
+    (0.7) beats the stale cell 15 (0.6) so the recovered ``ALU_HI`` is a clean
+    ``[(1,6.0)]`` one-hot -> the wide_mul fires on the true rule -> the correct
+    product band (41.6) is computed and survives. This is byte-IDENTICAL to the
+    current ``clamp>0.5`` behaviour for any case whose SE mirror is already a
+    single cell (the literal mul + every PASSING crushed mul), and only changes
+    the multi-cell var-frame case the blocker was silently eating.
+
+    DEFAULT ON. Opt-out via ``C4_MUL_SE_RECOVER_STRICT_ONEHOT=0`` restores the
+    ``clamp>0.5`` rebuild (flag-OFF, or ``C4_NO_STACK0_EMIT=0``, or
+    ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden — the recover
+    path is campaign-only). Kept as a dedicated kill-switch for
+    ``tools/flag_regression_gate.py``.
+    """
+    return os.environ.get("C4_MUL_SE_RECOVER_STRICT_ONEHOT", "1") != "0"
+
+
 def divmod_axcarry_clear_enabled() -> bool:
     """Return True iff the divmod writeback CLEARS the AX_CARRY (divisor) band
     at the divmod AX row (DEFAULT ON in the campaign config — opt-out via

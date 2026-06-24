@@ -1353,6 +1353,42 @@ class MulOperandSeRecoverFFN(nn.Module):
                 x[:, :, self.se_alu_hi:self.se_alu_hi + 16], min=0.0, max=1.0,
             ) > 0.5
         ).to(dtype=x.dtype)
+        # Campaign STRICT single-argmax recover (2026-06-24). In the DEEP
+        # multi-local var_mul frame the L9 step_end_operand_relay SE_ALU mirror
+        # accumulates a SPURIOUS second operand-A nibble cell (probed: var_mul 275
+        # SE_ALU_HI hot=[(1,0.7),(15,0.6)] vs the passing literal mul's clean
+        # [(1,0.7)]). The ``clamp>0.5`` rebuild keeps BOTH cells -> the recovered
+        # ALU_HI carries TWO non-zero high-nibble cells -> the width=2 wide_mul's
+        # operand-A artifact blocker (weight 3.0 on every OTHER non-zero A cell)
+        # TRIPS the true rule's 5-way AND below the 19.0 threshold -> the wide_mul
+        # fires on NO rule -> MUL_RESULT_HI/OUTPUT stay 0 (var block-16 OUTPUT==0
+        # vs lit==41.6) -> the product decodes to garbage. Collapse the SE one-hot
+        # to its SINGLE largest cell so the stale cell is dropped before the
+        # wide_mul reads it. Byte-IDENTICAL to ``clamp>0.5`` whenever the SE band
+        # is already a single cell (the literal mul + every PASSING crushed mul),
+        # so it only repairs the multi-cell var-frame case. Preserves the empty-
+        # band-stays-empty contract (mask by the original >0.5 indicator, so an
+        # all-zero SE band yields an all-zero one-hot, never a spurious argmax-0).
+        from .unified_compiler.ops.shared import (
+            mul_se_recover_strict_onehot_enabled,
+        )
+
+        def _strict_onehot(band01, raw):
+            # band01: 0/1 indicator (>0.5). raw: the underlying SE values, so
+            # the argmax breaks the (rare) two-cells-equal tie on real signal.
+            has_cell = band01.sum(dim=-1, keepdim=True) > 0.5
+            idx = raw.argmax(dim=-1, keepdim=True)
+            strict = torch.zeros_like(band01)
+            strict.scatter_(-1, idx, 1.0)
+            # Only where the original band had >=1 active cell; else stay 0.
+            return strict * has_cell.to(dtype=band01.dtype)
+
+        _strict = mul_se_recover_strict_onehot_enabled()
+        if _strict:
+            se_lo = _strict_onehot(
+                se_lo, x[:, :, self.se_alu_lo:self.se_alu_lo + 16])
+            se_hi = _strict_onehot(
+                se_hi, x[:, :, self.se_alu_hi:self.se_alu_hi + 16])
         # Build the CLEAN operand-A one-hot (+6.0 at the true nibble, 0
         # elsewhere) — exactly the band the width=2 wide_mul fires on for a
         # passing (non-crushed) mul row, so its 5-way AND clears the 19.0
@@ -1364,6 +1400,49 @@ class MulOperandSeRecoverFFN(nn.Module):
         # one-hot; all other rows keep their live ALU band untouched.
         x[:, :, lo] = alu_lo_band * keep + clean_lo * recover
         x[:, :, hi] = alu_hi_band * keep + clean_hi * recover
+
+        # Campaign LIVE-band stale-cell suppression (2026-06-24). The crush-gated
+        # recover above ONLY fixes the rows where the L10 ALU-clear drove
+        # operand-A all-negative. But a SECOND var_mul failure class never
+        # crushes: in the deep multi-local frame the L9 relay writes the LIVE ALU
+        # band with the TRUE nibble (+6.0) AND a SPURIOUS LARGE stale cell-15
+        # (~+5.5) — both positive, so ``crushed`` (max<0) is False and the live
+        # band is kept verbatim (probed: id279 37*13 ALU_HI=[(2,6.0),(15,5.49)],
+        # id276 21*28 ALU_HI=[(1,6.05),(15,5.49)]). The wide_mul reads that
+        # two-LARGE-cell A nibble DIRECTLY and its operand-A artifact blocker
+        # (weight 3.0) trips the true rule -> fires on NO rule -> OUTPUT 0 -> +2.0
+        # default garbage (the neural=0 / wrong-nibble residual class).
+        #
+        # FIX: zero ONLY the LARGE non-argmax cells (the stale ~+5.5) on the
+        # NON-crushed mul+AX rows, while PRESERVING the small magnitude artifacts
+        # (~+0.45 at cell-8/15) the width=2 wide_mul's per-rule artifact blocker
+        # was TUNED against. A plain strict one-hot stripped those artifacts too
+        # and that BROKE a passing literal mul whose wide_mul rule NEEDS them
+        # (84*48 ALU_HI=[(5,6.0),(15,0.45)] -> stripping cell-15's +0.45 zeroed the
+        # product). The threshold ``STALE_CELL_MIN`` = 2.0 cleanly separates the
+        # stale cell (~+5.5) from the legitimate artifacts (~+0.45): keep the
+        # argmax and every cell <= 2.0, zero every OTHER cell > 2.0. So a clean
+        # band (true cell + only small artifacts) is byte-IDENTICAL, and only a
+        # genuine two-LARGE-cell var-frame band is repaired.
+        if _strict:
+            live_row = (mul_ax & (~crushed))[:, :, None].to(dtype=x.dtype)
+            STALE_CELL_MIN = 2.0
+
+            def _suppress_stale(band):
+                # band: [B,seq,16] live ALU values. Keep the argmax cell and any
+                # cell with |value| <= STALE_CELL_MIN; zero every other LARGE cell.
+                idx = band.argmax(dim=-1, keepdim=True)
+                is_argmax = torch.zeros_like(band)
+                is_argmax.scatter_(-1, idx, 1.0)
+                large = (band.abs() > STALE_CELL_MIN).to(dtype=band.dtype)
+                # zero where large AND not argmax
+                zero_mask = large * (1.0 - is_argmax)
+                return band * (1.0 - zero_mask)
+
+            sup_lo = _suppress_stale(x[:, :, lo])
+            sup_hi = _suppress_stale(x[:, :, hi])
+            x[:, :, lo] = x[:, :, lo] * (1.0 - live_row) + sup_lo * live_row
+            x[:, :, hi] = x[:, :, hi] * (1.0 - live_row) + sup_hi * live_row
         return self.inner(x)
 
     # ---- composite-FFN compatibility ----
