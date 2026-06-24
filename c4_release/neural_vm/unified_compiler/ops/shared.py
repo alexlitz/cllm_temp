@@ -273,6 +273,56 @@ def mul_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def mul_l11_se_recover_enabled() -> bool:
+    """Return True iff the L11 wide_mul operand-A SE_ALU recovery is active
+    (DEFAULT ON in the campaign config — opt-out via ``C4_MUL_L11_SE_RECOVER=0``;
+    only takes effect when the STACK0 emission is dropped, i.e.
+    ``C4_NO_STACK0_EMIT=1`` AND the MUL byte-0 SE recovery is on).
+
+    The wall this lifts (#321, root aa52e1c9, verified spec_k=0 / BUILT dims,
+    campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the
+    campaign mul byte-1 DROP fails (104/106/124/138, plus the a_lo=7 family) —
+    the decode is correct for the LOW byte only, the product's high byte (byte
+    1) is dropped at the emit token.
+
+    Distinct from :func:`mul_byte0_se_recover_enabled` effect (2). That flag's
+    OUTPUT-flood cap (``_MulCombineStage``) treats the L11 wide_mul flood
+    AFTER it has happened — it CLEARS the flooded OUTPUT band so the
+    SE-recovered ``FlattenedALUMul`` (block 29 / logical L15) product survives
+    at the LM-head argmax. But the wide_mul ALSO computes the product's BYTE 1
+    into the dedicated ``MUL_RESULT_HI`` band (block 16 / logical L11), and the
+    ``_layer14_alu_high_byte_relay`` (l14_ops.py:1330, OP_MUL-gated) EMITs that
+    byte 1 at the emit token. Because the L11 wide_mul reads the L10-CRUSHED
+    operand-A (``ALU_LO/HI`` all-negative for the failing rows), its byte-1
+    write is the FLOOD, NOT the true product byte 1 — and the flood drowns the
+    +20-scaled byte-1 emit relay write, so the emit token decodes only the low
+    byte. The L15 ``FlattenedALUMul`` already gets a clean byte-0 recovery (via
+    ``BDToGEConverter``), but the L11 wide_mul one block EARLIER does NOT.
+
+    FIX. When enabled, the efficient-mode L11 wrap
+    (``make_efficient_l11_alumul_wrap_op``) installs ``MulOperandSeRecoverFFN``
+    as ``block.ffn`` — a drop-in wrapper holding the rule-lowered wide_mul
+    ``PureFFN`` (``inner``) that, on the OP_MUL + MARK_AX row ONLY, restores the
+    crushed operand-A ``ALU_LO/HI`` band from the surviving ``SE_ALU_LO/HI``
+    mirror BEFORE the wide_mul rules read it. It reproduces the SAME golden
+    hybrid operand band (true-nibble one-hot + the index-0 / cell-8 / cell-15
+    magnitude artifacts) the width=2 wide_mul AND-threshold + artifact-blocker
+    were tuned against, so the wide_mul computes the CORRECT ``MUL_RESULT_HI``
+    (no flood) and the byte-1 emit relay propagates. It runs in ONE block (it
+    IS ``block.ffn``) so the physical block count is unchanged (the lea
+    absolute-position contract holds). Exactly the byte-0 SE-recovery precedent
+    (``CmpOperandSeRecoverFFN`` at L10), applied one block earlier at L11.
+
+    DEFAULT ON. Opt-out via ``C4_MUL_L11_SE_RECOVER=0`` restores the raw crushed
+    ``ALU_LO/HI`` read at the L11 wide_mul (the byte-identical-OFF path: flag-OFF,
+    or ``C4_NO_STACK0_EMIT=0``, or ``C4_MUL_BYTE0_SE_RECOVER=0`` are all
+    byte-identical to golden ``7f6f2e5d``). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_MUL_L11_SE_RECOVER`` can A/B it
+    inside the campaign config.
+    """
+    return os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
+
+
 def cmp_byte0_se_recover_enabled() -> bool:
     """Return True iff the COMPARISON operand-A byte-0 SE_ALU recovery is active
     (DEFAULT ON in the campaign config — opt-out via

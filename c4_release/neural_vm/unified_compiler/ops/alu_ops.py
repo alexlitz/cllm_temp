@@ -1429,7 +1429,50 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         assert end == len(rules), (
             f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
         )
-        block.ffn = new_ffn
+
+        # === STACK0 campaign (#321): L11 wide_mul operand-A SE recover ===
+        # Under ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` the L10
+        # ALU-clear crushes operand A all-negative for a value-dependent subset
+        # of mul rows; the L11 wide_mul (this ``new_ffn``) then reads the ~-39
+        # floor and FLOODS ``MUL_RESULT_HI`` -> the OP_MUL-gated
+        # ``_layer14_alu_high_byte_relay`` EMITs that flooded byte 1 (the
+        # 104/106/124/138 + a_lo=7 byte-1 DROP family). The clean operand
+        # survives in ``SE_ALU``; wrap ``new_ffn`` in a forward-pass recover that
+        # restores the ALU band from ``SE_ALU`` on the OP_MUL + MARK_AX row
+        # BEFORE the wide_mul reads it, so it computes the CORRECT
+        # ``MUL_RESULT_HI`` (no flood) and the byte-1 emit propagates. It runs as
+        # the SAME block (it IS ``block.ffn``) so the physical block count is
+        # unchanged (lea contract). Flag-OFF / non-campaign / width=1 leaves
+        # ``block.ffn = new_ffn`` exactly (byte-identical to golden). Only width=2
+        # has a ``MUL_RESULT_HI`` byte-1 band to repair; gating on
+        # ``mul_byte0_se_recover_enabled`` keeps the L11 recovery consistent with
+        # the L15 ``BDToGEConverter`` byte-0 recovery. See
+        # ``shared.mul_l11_se_recover_enabled`` for the full rationale.
+        from .shared import (
+            no_stack0_emit_enabled,
+            mul_byte0_se_recover_enabled,
+            mul_l11_se_recover_enabled,
+        )
+        block_ffn = new_ffn
+        if (
+            mul_width2_enabled()
+            and no_stack0_emit_enabled()
+            and mul_byte0_se_recover_enabled()
+            and mul_l11_se_recover_enabled()
+            and hasattr(bd_proxy, "SE_ALU_LO")
+            and hasattr(bd_proxy, "SE_ALU_HI")
+        ):
+            from ...efficient_alu_neural import MulOperandSeRecoverFFN
+            block_ffn = MulOperandSeRecoverFFN(
+                new_ffn,
+                alu_lo=bd_proxy.ALU_LO,
+                alu_hi=bd_proxy.ALU_HI,
+                se_alu_lo=bd_proxy.SE_ALU_LO,
+                se_alu_hi=bd_proxy.SE_ALU_HI,
+                mark_ax=bd_proxy.MARK_AX,
+                op_mul=bd_proxy.OP_MUL,
+            )
+        block.ffn = block_ffn
 
     return Operation(
         name="efficient_l11_alumul_wrap",

@@ -1221,6 +1221,145 @@ class CmpOperandSeRecoverFFN(nn.Module):
         return None
 
 
+class MulOperandSeRecoverFFN(nn.Module):
+    """Campaign MUL operand-A SE_ALU recover wrapping the L11 wide_mul FFN.
+
+    Drop-in replacement for ``block.ffn`` in the efficient-mode L11 wrap
+    (``make_efficient_l11_alumul_wrap_op``). Holds the rule-lowered width=2
+    wide_mul ``PureFFN`` (``inner``, baked from ``wide_mul_rules``) and, BEFORE
+    delegating to it, restores the crushed operand-A ``ALU_LO/HI`` band from the
+    surviving ``SE_ALU_LO/HI`` mirror so the wide_mul's per-nibble AND units
+    (``operand_a_base="ALU_LO"`` low + ``ALU_HI`` high nibble, with the index-0
+    artifact blocker) read the SAME hybrid operand band they see in the golden
+    35-token config — no threshold re-tuning.
+
+    This is the byte-0 SE-recovery precedent (``CmpOperandSeRecoverFFN`` at L10,
+    ``BDToGEConverter`` at the L15 FlattenedALUMul) applied ONE BLOCK EARLIER, at
+    the L11 wide_mul (block 16 / logical L11). Why it is needed even though the
+    L15 FlattenedALUMul already recovers byte 0: the L11 wide_mul reads the raw
+    L10-crushed ALU and, driven by the ~-39 uniform-negative band, FLOODS
+    ``MUL_RESULT_HI`` (and OUTPUT) to ~2.4e9. That flooded ``MUL_RESULT_HI`` is
+    what the ``_layer14_alu_high_byte_relay`` (OP_MUL-gated) EMITs as the
+    product's BYTE 1 at the emit token — and the flood drowns the +20-scaled
+    byte-1 emit relay write, so the emit decodes only the low byte (#321: the
+    104/106/124/138 + a_lo=7 byte-1 DROP family). Recovering operand A HERE makes
+    the wide_mul compute the CORRECT ``MUL_RESULT_HI`` so the byte-1 emit relay
+    propagates the true high byte. (The existing
+    ``mul_byte0_se_recover_enabled`` OUTPUT-flood cap in ``_MulCombineStage``
+    only fixes the OUTPUT/byte-0 argmax AFTER the flood — it never repairs the
+    flooded ``MUL_RESULT_HI`` byte-1 the emit relay reads.)
+
+    Runs in ONE block (it IS ``block.ffn``), so the model's physical block count
+    is unchanged — the absolute-position lea contract holds. ``compact`` /
+    ``sparsify`` / ``compact_moe`` plumb through to ``inner`` so the model's
+    post-bake compactor and any weight-introspection treat this exactly like the
+    wrapped ``PureFFN`` (the same composite-FFN contract ``FlattenedALUMul`` /
+    ``AddSub5StageBlock`` / ``CmpOperandSeRecoverFFN`` honour).
+
+    Forward (campaign OP_MUL + MARK_AX rows ONLY): multiplicatively CLEAR the
+    ``ALU_LO/HI`` band (a crushed -39 floor AND an already-clean +6 one-hot both
+    go to 0 — idempotent: a NON-crushed mul row is re-materialized identically
+    from its own SE_ALU mirror, never perturbed), then ADD the golden HYBRID
+    operand band (true-nibble one-hot + the index-0 / cell-8 / cell-15 magnitude
+    artifacts) the wide_mul's 5-way AND + artifact blocker were tuned against.
+    Operand B (``AX_CARRY``) is untouched; no result band is written here.
+    Gate-OFF / non-campaign leaves ``x`` byte-identical (the recover branch is
+    skipped entirely).
+    """
+
+    # The L11 wide_mul fires on a CLEAN operand-A one-hot (NOT the hybrid the
+    # cmp engines need). Probed spec_k=0 at the block-16 input for the PASSING
+    # (non-crushed) campaign mul rows: ``ALU_LO``/``ALU_HI`` are a near-perfect
+    # one-hot at the true nibble (+6.0, band sum ~5.93 — a tiny ~-0.07 residue,
+    # NO index-0 magnitude artifact). The width=2 wide_mul's per-rule artifact
+    # BLOCKER (``operand_a_artifact_blocker_weight=3.0`` on every OTHER non-zero
+    # A cell) is sized to REJECT a spurious cell, so adding the cmp-style hybrid
+    # artifacts here would TRIP that blocker on the true rule and push the 5-way
+    # AND below its 19.0 threshold — the wide_mul would fire on NO rule (probed:
+    # MUL_RESULT_HI stays 0). So the recover writes a CLEAN one-hot, exactly the
+    # band the wide_mul sees for a passing mul.
+    ALU_TRUE_MAG = 6.0       # true-nibble one-hot (golden passing-mul ~6.0)
+
+    def __init__(self, inner: nn.Module, *, alu_lo, alu_hi, se_alu_lo,
+                 se_alu_hi, mark_ax, op_mul):
+        super().__init__()
+        self.inner = inner
+        self.alu_lo = int(alu_lo)
+        self.alu_hi = int(alu_hi)
+        self.se_alu_lo = int(se_alu_lo)
+        self.se_alu_hi = int(se_alu_hi)
+        self.mark_ax = int(mark_ax)
+        self.op_mul = int(op_mul)
+        # Sentinel so an idempotent re-wrap guard recognises an existing attach.
+        self._is_mul_se_recover_wrap = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lo = slice(self.alu_lo, self.alu_lo + 16)
+        hi = slice(self.alu_hi, self.alu_hi + 16)
+        alu_lo_band = x[:, :, lo]
+        alu_hi_band = x[:, :, hi]
+        # OP_MUL AND MARK_AX, per row.
+        mul_ax = (x[:, :, self.op_mul] > 0.5) & (x[:, :, self.mark_ax] > 0.5)
+        # CRUSH DETECTION: the L10 ALU-clear drives EVERY operand-A cell
+        # all-negative (~-39) for the value-dependent crushed rows, while a
+        # healthy operand band always has its true-nibble cell positive (~+6).
+        # Only those CRUSHED rows are rewritten; a NON-crushed mul row (whose
+        # wide_mul already computes the correct product off the live ALU band)
+        # is left byte-identical, so the recover never perturbs a passing case.
+        crushed = (alu_lo_band.max(dim=-1).values < 0.0) & (
+            alu_hi_band.max(dim=-1).values < 0.0
+        )
+        recover = (mul_ax & crushed)[:, :, None].to(dtype=x.dtype)  # [B,S,1]
+        keep = 1.0 - recover
+        # Clean 0/1 one-hot of operand A from the surviving SE_ALU mirror.
+        se_lo = (
+            torch.clamp(
+                x[:, :, self.se_alu_lo:self.se_alu_lo + 16], min=0.0, max=1.0,
+            ) > 0.5
+        ).to(dtype=x.dtype)
+        se_hi = (
+            torch.clamp(
+                x[:, :, self.se_alu_hi:self.se_alu_hi + 16], min=0.0, max=1.0,
+            ) > 0.5
+        ).to(dtype=x.dtype)
+        # Build the CLEAN operand-A one-hot (+6.0 at the true nibble, 0
+        # elsewhere) — exactly the band the width=2 wide_mul fires on for a
+        # passing (non-crushed) mul row, so its 5-way AND clears the 19.0
+        # threshold and its artifact blocker stays inert.
+        clean_lo = se_lo * self.ALU_TRUE_MAG
+        clean_hi = se_hi * self.ALU_TRUE_MAG
+        x = x.clone()
+        # Multiplicative clear on the crushed mul rows, then write the clean
+        # one-hot; all other rows keep their live ALU band untouched.
+        x[:, :, lo] = alu_lo_band * keep + clean_lo * recover
+        x[:, :, hi] = alu_hi_band * keep + clean_hi * recover
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility ----
+    # Deliberately does NOT expose ``W_up`` etc. as Parameters: the model's
+    # ``_right_size_ffns`` / weight-introspection helpers recurse into
+    # ``named_children()`` when ``W_up`` is absent and resize the wrapped
+    # ``inner`` PureFFN directly (the same contract ``FlattenedALUMul`` /
+    # ``AddSub5StageBlock`` / ``CmpOperandSeRecoverFFN`` honour). ``compact`` /
+    # ``sparsify`` / ``compact_moe`` ARE called on ``block.ffn`` directly, so
+    # they plumb through to ``inner``.
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Flattened AND/OR/XOR pipeline (vanilla nn.Sequential composite).
 #

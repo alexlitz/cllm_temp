@@ -2334,6 +2334,14 @@ def compile_full_vm_dynamic(
             "C4_MUL_STACK0_BYTE39_GUARD": (
                 os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") != "0"
             ),
+            # L11 wide_mul operand-A SE recover (#321, DEFAULT-ON in campaign,
+            # opt out =0, BAKE-affecting): when active the L11 wide_mul block.ffn
+            # is wrapped in MulOperandSeRecoverFFN, otherwise it is the bare
+            # PureFFN. The two builds STRUCTURALLY differ so they must never
+            # share a memo entry. See shared.mul_l11_se_recover_enabled.
+            "C4_MUL_L11_SE_RECOVER": (
+                os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2945,6 +2953,14 @@ def _bake_from_scheduled_ops(
         # See l10_ops.py ``mul_stack0_byte39_guard_enabled``.
         "C4_MUL_STACK0_BYTE39_GUARD": (
             os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") != "0"
+        ),
+        # L11 wide_mul operand-A SE recover (#321, DEFAULT-ON in campaign, opt
+        # out =0, BAKE-affecting): when active the L11 wide_mul block.ffn is
+        # wrapped in MulOperandSeRecoverFFN, otherwise it is the bare PureFFN.
+        # The two builds STRUCTURALLY differ so they must never share a
+        # serialised entry. See shared.mul_l11_se_recover_enabled.
+        "C4_MUL_L11_SE_RECOVER": (
+            os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
