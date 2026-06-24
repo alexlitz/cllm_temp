@@ -2064,6 +2064,35 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
     W_ALU_LO = 0.2
     W_AXC_LO = 1.5
     THRESH = 4.0
+    # HIGH-NIBBLE artifact-veto (#319, 2026-06-23). The weights above can
+    # confirm A's nibble is PRESENT (``W_ALU_HI``/``W_ALU_LO`` small) but
+    # cannot VETO a nibble MISMATCH, so for operands that SHARE the low nibble
+    # but DIFFER on the high nibble (``if_eq_20: 28 == 12``, ``30 == 28``,
+    # ``40 == 35``) the EQ engine's ``(h, l)`` unit fires on B's high nibble
+    # while A's high nibble differs -- the index-0 magnitude artifact
+    # (``ALU_HI+0 ~ +5.3``) HELPS the wrong h=0 unit clear threshold -- so the
+    # ``eq_one`` 0x01 push mis-decodes EQ-false to 1. The fix copies the proven
+    # ``_layer10_alu_ordering_engine_rules`` hi_eq/lo_eq index blocker into the
+    # EQ engine's units: a per-cell negative weight on every OTHER non-zero
+    # ``ALU_HI``/``ALU_LO`` index. When A's true nibble is genuinely non-zero
+    # its ``+6.0`` one-hot is subtracted (``-BLK * 6.0``) on every unit whose
+    # h/l does NOT match A, so ONLY the unit matching BOTH A's and B's nibbles
+    # (A == B) survives. Weights/threshold locked offline against the SAME
+    # golden HYBRID band the campaign ``CmpOperandSeRecoverFFN`` reconstructs
+    # (true nibble +6.0 + index-0 artifact +5.3 + cell-8/15 residues
+    # +0.45/+0.47); exhaustively verified over 0..99 x 0..99: every equal pair
+    # fires (margin +0.40) and every unequal pair is vetoed (worst-false on the
+    # if_eq corpus -0.87). No CMP flag is touched -> lt/le/gt/ge/ne untouched.
+    # Campaign-gated via ``no_stack0_emit_enabled()`` so golden (non-campaign)
+    # is byte-identical to ``7f6f2e5d``; kill-switch ``C4_CMP_EQ_HINIB_VETO=0``.
+    from .shared import no_stack0_emit_enabled, cmp_eq_hinib_veto_enabled
+    eq_hinib_veto = no_stack0_emit_enabled() and cmp_eq_hinib_veto_enabled()
+    if eq_hinib_veto:
+        W_ALU_HI = 0.2
+        W_ALU_LO = 0.2
+        THRESH = 4.1
+        EQ_BLK_HI = 1.0   # blocker on every ALU_HI+j, j != h (and j >= 1)
+        EQ_BLK_LO = 0.3   # blocker on every ALU_LO+j, j != l (and j >= 1)
     # RECONCILE (2026-06-12): this engine NO LONGER writes the CMP+1/CMP+2
     # (hi_eq/lo_eq) flags. The general ``_layer10_alu_ordering_engine_rules``
     # is now the SOLE writer of CMP+0..3 for all six comparison opcodes; its
@@ -2115,6 +2144,20 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
     rules: list[FFNRule] = []
     for h in range(16):
         for l in range(16):
+            # High/low-nibble artifact-veto: a negative weight on every OTHER
+            # non-zero operand-A nibble cell (campaign-gated; absent OFF so the
+            # golden bake is byte-identical). Subtracts A's +6.0 one-hot from
+            # every unit whose h/l does not match A, so a high-nibble (or
+            # low-nibble) mismatch can no longer fire spuriously.
+            blocker: tuple[tuple[str, float], ...] = ()
+            if eq_hinib_veto:
+                blocker = tuple(
+                    (f"ALU_HI+{j}", -EQ_BLK_HI)
+                    for j in range(1, 16) if j != h
+                ) + tuple(
+                    (f"ALU_LO+{j}", -EQ_BLK_LO)
+                    for j in range(1, 16) if j != l
+                )
             rules.append(multi_way_and_rule(
                 name=f"l10_eq_engine_h{h:x}_l{l:x}",
                 conditions=(
@@ -2123,7 +2166,7 @@ def _layer10_alu_eq_engine_rules(S: float) -> tuple[FFNRule, ...]:
                     (f"AX_CARRY_HI+{h}", W_AXC_HI),
                     (f"ALU_LO+{l}", W_ALU_LO),
                     (f"AX_CARRY_LO+{l}", W_AXC_LO),
-                ),
+                ) + blocker,
                 threshold=THRESH,
                 gate=gate_eq,
                 gate_weight=1.0,

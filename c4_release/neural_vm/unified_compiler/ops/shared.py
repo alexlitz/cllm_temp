@@ -382,6 +382,51 @@ def cmp_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_CMP_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def cmp_eq_hinib_veto_enabled() -> bool:
+    """Return True iff the EQ engine's HIGH-nibble artifact-veto is active
+    (DEFAULT ON in the campaign config — opt-out via
+    ``C4_CMP_EQ_HINIB_VETO=0``; only takes effect when the STACK0 emission is
+    dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is
+    byte-identical to golden ``7f6f2e5d``).
+
+    The residual cmp wall this lifts (the NON-crushed operand-gather index-0
+    artifact, ``project_operand_gather_hybrid_encoding_is_cmp_alu_root``): the
+    per-nibble EQ engine (:func:`_layer10_alu_eq_engine_rules`) writes the
+    decisive ``eq_one`` 0x01 OUTPUT decode-margin push at the AX row for EQUAL
+    operands. Its 4-way AND weighted ``ALU_HI`` at only ``0.1`` so the
+    high-nibble term cannot VETO a mismatch: for ``if_eq_20: 28 == 12`` (A=0x1C
+    / B=0x0C, sharing low nibble 0xC) the unit ``(h=0, l=0xC)`` fires on B's
+    high nibble 0 even though A's high nibble is 1 — the index-0 magnitude
+    artifact (``ALU_HI+0 ≈ +5.3``) HELPS the wrong unit clear threshold — so
+    the 0x01 push lands and ``28 == 12`` mis-decodes to 1 (and the same for
+    ``30 == 28``, ``40 == 35``, the documented residual EQ-false band).
+
+    FIX (CONSUMER-SIDE, the lower-risk lever): copy the proven
+    ``_layer10_alu_ordering_engine_rules`` ``hi_eq``/``lo_eq`` index-blocker
+    pattern into the EQ engine's ``(h, l)`` units — a per-cell negative weight
+    on every OTHER non-zero ``ALU_HI``/``ALU_LO`` index. When operand A's true
+    high (or low) nibble is genuinely non-zero its strong ``+6.0`` one-hot is
+    subtracted by the blocker (``-BLK * 6.0``) on every unit whose ``h``/``l``
+    does NOT match A's nibble, so only the unit matching BOTH A's AND B's
+    nibbles (i.e. A == B) survives. The weights/threshold were locked offline
+    against the SAME golden HYBRID operand band the
+    :class:`CmpOperandSeRecoverFFN` reconstructs in campaign (true nibble
+    ``+6.0`` + index-0 artifact ``+5.3`` + cell-8/15 residues ``+0.45/+0.47``),
+    exhaustively verified over the full ``0..99 × 0..99`` operand space: EVERY
+    equal pair fires (margin ``+0.40``) and EVERY unequal pair is vetoed
+    (worst-false margin on the if_eq corpus ``-0.87``). No ``CMP`` flag is
+    touched (the ordering engine remains the sole CMP-flag writer), so
+    lt/le/gt/ge/ne are structurally untouched; only the EQ ``eq_one`` OUTPUT
+    push gains the high-nibble discrimination it lacked.
+
+    DEFAULT ON. Opt-out via ``C4_CMP_EQ_HINIB_VETO=0`` restores the
+    low-nibble-only EQ engine (byte-identical-OFF). Kept as a dedicated
+    kill-switch so ``tools/flag_regression_gate.py --flag C4_CMP_EQ_HINIB_VETO``
+    can A/B it inside the campaign config.
+    """
+    return os.environ.get("C4_CMP_EQ_HINIB_VETO", "1") != "0"
+
+
 def mul_l19_flood_cap_enabled() -> bool:
     """Return True iff the MUL L19-EXPLODE flood cap fires on MODERATE-magnitude
     (not just >100) wide_mul OUTPUT floods (DEFAULT ON in the campaign config —
