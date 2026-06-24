@@ -1077,6 +1077,37 @@ class _GEToBDStage(nn.Module):
             opcode_mask=state.opcode_mask,
             emit_carry=False,
         )
+        # Campaign MUL L19 product BOOST (2026-06-23). The cap above cleared the
+        # L11 wide_mul flood and ``ge_to_bd`` re-wrote the clean byte-0 product
+        # one-hot at the +2.0 default. But the downstream block-33 (logical L19)
+        # attention UNCONDITIONALLY adds +40 into OUTPUT_LO[0]/OUTPUT_HI[0] (a
+        # broad "OUTPUT zero-byte default" copy that fires on the MUL emit row in
+        # the depth>=1 stack contexts — expr_add_mul/paren/mul_div + some
+        # single-byte standalone muls); at +2.0 that +40 cell-0 add out-votes the
+        # true product cell -> the byte decodes to 0x00. BOOST the capped-row
+        # OUTPUT band (which now holds ONLY the clean GEToBD product one-hot — the
+        # flood was cleared, so a uniform scale leaves cell-0 at ~0 and lifts the
+        # true product cell) to a DOMINANT magnitude (> the +40 L19 add) so the
+        # product survives. byte-0 ONLY; the byte-1 AX_FULL relay is untouched.
+        # Gated on no_stack0_emit + mul_byte0_se_recover (the cap is only set in
+        # that config) so the golden 35-token path is byte-identical (the cap
+        # mask is None there -> this branch is a no-op).
+        if state.output_clear_mask is not None:
+            from .unified_compiler.ops.shared import (
+                mul_l19_product_boost_enabled,
+            )
+            if mul_l19_product_boost_enabled():
+                # 50.0 product band > the +40 L19 zero-default; the +2.0 GEToBD
+                # write scales by 25x. Applied ONLY on the cap rows.
+                MUL_L19_PRODUCT_BOOST = 25.0
+                boost = state.output_clear_mask[:, :, None]  # [B,seq,1] 0/1
+                scale = 1.0 + boost * (MUL_L19_PRODUCT_BOOST - 1.0)
+                lo = slice(BD.OUTPUT_LO, BD.OUTPUT_LO + 16)
+                hi = slice(BD.OUTPUT_HI, BD.OUTPUT_HI + 16)
+                x_bd_out = state.x_bd_out.clone()
+                x_bd_out[:, :, lo] = x_bd_out[:, :, lo] * scale
+                x_bd_out[:, :, hi] = x_bd_out[:, :, hi] * scale
+                state.x_bd_out = x_bd_out
         return state
 
 

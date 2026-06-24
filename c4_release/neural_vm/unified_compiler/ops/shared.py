@@ -471,6 +471,48 @@ def mul_l19_flood_cap_enabled() -> bool:
     return os.environ.get("C4_MUL_L19_FLOOD_CAP", "1") != "0"
 
 
+def mul_l19_product_boost_enabled() -> bool:
+    """Return True iff the capped-MUL byte-0 product is re-written at a DOMINANT
+    OUTPUT amplitude that out-votes the block-33 (logical L19) zero-default add
+    (DEFAULT ON in the campaign config — opt-out via
+    ``C4_MUL_L19_PRODUCT_BOOST=0``; only takes effect under
+    ``C4_NO_STACK0_EMIT=1`` + ``C4_MUL_BYTE0_SE_RECOVER=1``, since it rides the
+    same ``_MulCombineStage`` cap path).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; the expr_add_mul cluster
+    0/25 + the single-byte standalone-mul fails ``11*11`` etc.):
+
+    ``mul_l19_flood_cap`` clears the L11 wide_mul OUTPUT flood on the
+    OP_MUL+MARK_AX row and lets ``GEToBDConverter`` re-write the byte-0 product
+    one-hot at the default ``+2.0`` amplitude. That fixed the explosion (band ->
+    555) but NOT the SECOND L19 mechanism: the block-33 (logical L19) attention
+    UNCONDITIONALLY ADDS ``+40`` into ``OUTPUT_LO[0]`` / ``OUTPUT_HI[0]`` (a
+    broad "OUTPUT zero-byte default" copy, present on the MUL emit row in the
+    depth>=1 stack contexts — expr_add_mul / expr_paren / expr_mul_div AND some
+    standalone single-byte muls like ``11*11``). With the product at only ``+2.0``
+    that ``+40`` cell-0 add OUT-VOTES the true product cell at the LM-head argmax,
+    so the byte decodes to ``0x00`` (expr_add_mul ``5*2`` -> 0) or a stale value.
+    Multi-byte products are NOT capped (band ~41 survives), so they already beat
+    the ``+40`` add — only the capped single-byte products are starved.
+
+    FIX. When this flag is on, the ``_GEToBDStage`` re-writes the freshly-cleared
+    capped-row OUTPUT band (which by construction now holds ONLY the clean
+    GEToBD product one-hot, the flood having been cleared) scaled to a DOMINANT
+    magnitude (``MUL_L19_PRODUCT_BOOST`` = 50.0, > the L19 ``+40`` zero-default)
+    so the true product cell beats the cell-0 add. Scoped to the cap rows ONLY
+    (``output_clear_mask``), byte-0 ONLY (byte 1 rides AX_FULL, untouched), so it
+    cannot disturb the byte-1 relay or any non-capped (multi-byte / non-MUL) row.
+
+    DEFAULT ON. Opt-out via ``C4_MUL_L19_PRODUCT_BOOST=0`` restores the ``+2.0``
+    re-write (flag-OFF, or ``C4_NO_STACK0_EMIT=0``, or
+    ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden — the cap path
+    is campaign-only). Kept as a dedicated kill-switch for
+    ``tools/flag_regression_gate.py``.
+    """
+    return os.environ.get("C4_MUL_L19_PRODUCT_BOOST", "1") != "0"
+
+
 def divmod_axcarry_clear_enabled() -> bool:
     """Return True iff the divmod writeback CLEARS the AX_CARRY (divisor) band
     at the divmod AX row (DEFAULT ON in the campaign config — opt-out via
