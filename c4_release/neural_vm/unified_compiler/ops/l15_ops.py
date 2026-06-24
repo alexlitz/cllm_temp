@@ -445,14 +445,15 @@ def _l15_li_zeroaddr_cam_on() -> bool:
     content-addressing on free slots; own kill-switch for the cross-op /
     flag-regression gates.
     """
-    # DEFAULT-OFF: explicit opt-in only (not auto-ON in the campaign config),
-    # because the AR decode cannot flip var_simple without regressing func --
-    # see the BLOCKER section above. Both golden and the default campaign config
-    # are byte-identical with this OFF.
+    # CAMPAIGN-DEFAULT-ON: the FFN 3-way-AND indicator (make_layer14_li_zeroaddr_indicator_op
+    # + the head-0 slot-103 key) FLIPS var_simple 0->25/25 on GPU AR full_trace while
+    # func_identity HOLDS 25/25 -- the "cannot flip without regressing func" above was the
+    # earlier BILINEAR-head variant; putting the 3-way AND in the FFN resolved it. Golden
+    # (no_stack0_emit OFF) stays byte-identical (band/op/head-slot all flag-gated).
     raw = _os_l15.environ.get("C4_L15_LI_ZEROADDR_CAM")
     if raw is not None:
         return raw != "0"
-    return False
+    return no_stack0_emit_enabled()
 
 
 def _l15_li_byte0_valsel_on() -> bool:

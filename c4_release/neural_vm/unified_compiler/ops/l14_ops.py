@@ -42,10 +42,11 @@ def _li_zeroaddr_indicator_on() -> bool:
     campaign-only; golden (35-token, flag-OFF) is byte-identical (the op is not
     registered and the band is not collected).
     """
+    from .shared import no_stack0_emit_enabled
     raw = _os.environ.get("C4_L15_LI_ZEROADDR_CAM")
     if raw is not None:
         return raw != "0"
-    return False
+    return no_stack0_emit_enabled()
 
 
 # Fresh over-width residual band carrying the (committed AND zero-address)
