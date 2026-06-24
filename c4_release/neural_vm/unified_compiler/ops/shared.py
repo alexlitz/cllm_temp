@@ -646,6 +646,58 @@ def divmod_axcarry_clear_enabled() -> bool:
     return os.environ.get("C4_DIVMOD_AXCARRY_CLEAR", "1") != "0"
 
 
+def divmod_stack0_byte1_clear_enabled() -> bool:
+    """Return True iff the divmod writeback CLEARS the STACK0_BYTE_VAL_1
+    (dividend byte-1 carrier) band at the divmod AX row (DEFAULT ON in the
+    campaign config — opt-out via ``C4_DIVMOD_STACK0_BYTE1_CLEAR=0``; only
+    takes effect when the STACK0 emission is dropped, i.e.
+    ``C4_NO_STACK0_EMIT=1``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; the residual ~4 div/mod
+    fails of the "L18 slam" pattern the ``divmod_axcarry_clear_enabled`` note
+    explicitly flags as a SEPARATE downstream-tail corruptor, e.g. 364/14 ->
+    1, 1132/33 -> 4, 268%17 -> 1, 428%16 -> 1):
+
+    The ``FlattenedDivMod`` (block 28 / logical L14) computes the CORRECT
+    quotient/remainder into OUTPUT_LO/HI at +2.0 (the long-division compute is
+    bit-exact — verified blk28 OUTPUT == the right answer for every fail). But
+    for a MULTI-BYTE dividend the divmod AX row still carries the dividend's
+    byte-1 in the ``STACK0_BYTE_VAL_1_LO/HI`` carrier (the band the
+    ``BDToGEConverter`` cummax-gathers operand-A byte 1 from). The L18 (block
+    32) ``layer14_mem_generation`` ADDRESS head 1 — whose V/O slots 32+/48+
+    read ``STACK0_BYTE_VAL_1`` into OUTPUT_LO/HI to generate the SI/SC store
+    address byte 1 — MIS-FIRES on that crushed divmod AX row and MATERIALIZES
+    the dividend byte 1 into OUTPUT at +13.9, overwriting the +2.0 quotient ->
+    the emitted AX byte is ``hi(dividend)`` (e.g. 0x04 for 1132, 0x01 for 364),
+    not the quotient. (PASSING divmod rows have ``STACK0_BYTE_VAL_1 == 0`` —
+    single-byte dividend, e.g. 89%10 hi=0 — so head 1 reads zeros and stays
+    silent: the clean pass-vs-fail discriminator, verified
+    ``tools/probe_divmod_fast.py``.)
+
+    The divmod has already CONSUMED the dividend byte 1 (the
+    ``BDToGEConverter`` cummax-gathered it into GE operand-A positions 2/3 at
+    the divmod block INPUT, BEFORE this writeback runs) by the time the
+    writeback executes, so the ``STACK0_BYTE_VAL_1`` band is dead at the divmod
+    AX row from this block onward. Clearing it here — gated on the SAME
+    divmod-AX ``opcode_mask`` the OUTPUT write + the AX_CARRY clear use —
+    removes the byte-1 source the L18 mem-gen head 1 leaks, so the +2.0
+    quotient survives to the emit. (The L18 head reads ``STACK0_BYTE_VAL_1``
+    only for SI/SC store-address byte-1 generation, whose opcode rows are not
+    DIV/MOD, so the divmod-row clear touches no other op/config — exactly the
+    ``divmod_axcarry_clear`` precedent applied to the byte-1 carrier instead of
+    AX_CARRY.)
+
+    DEFAULT ON. Opt-out via ``C4_DIVMOD_STACK0_BYTE1_CLEAR=0`` restores the raw
+    ``STACK0_BYTE_VAL_1`` passthrough (the byte-identical-OFF path: flag-OFF or
+    ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden ``7f6f2e5d``).
+    Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_DIVMOD_STACK0_BYTE1_CLEAR`` can
+    A/B it inside the campaign config.
+    """
+    return os.environ.get("C4_DIVMOD_STACK0_BYTE1_CLEAR", "1") != "0"
+
+
 def addsub_output_boost_enabled() -> bool:
     """Return True iff the imperative AddSub5StageBlock writes its byte-0
     OUTPUT_LO/HI at a DOMINANT amplitude (DEFAULT ON — opt-out via

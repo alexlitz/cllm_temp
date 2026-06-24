@@ -261,6 +261,7 @@ class _DivModGEToBDStage(nn.Module):
         from .unified_compiler.ops.shared import (
             no_stack0_emit_enabled,
             divmod_axcarry_clear_enabled,
+            divmod_stack0_byte1_clear_enabled,
         )
         if (
             no_stack0_emit_enabled()
@@ -274,6 +275,41 @@ class _DivModGEToBDStage(nn.Module):
             )
             x_bd_out[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] = (
                 x_bd_out[:, :, BD.AX_CARRY_HI:BD.AX_CARRY_HI + 16] * keep
+            )
+
+        # === STACK0 campaign (2026-06-24): divmod STACK0_BYTE_VAL_1 clear ===
+        #
+        # The SEPARATE "L18 slam" residual the AX_CARRY-clear note flagged:
+        # the L18 (block 32) ``layer14_mem_generation`` address head 1 reads
+        # ``STACK0_BYTE_VAL_1`` (the dividend byte-1 carrier) into OUTPUT to
+        # generate the SI/SC store-address byte 1 — and MIS-FIRES on the
+        # multi-byte divmod AX row, materializing ``hi(dividend)`` into OUTPUT
+        # at +13.9, overwriting the +2.0 quotient computed at block 28 (the
+        # "got_ax == hi(dividend)" residual: 364/14 -> 1, 1132/33 -> 4,
+        # 268%17 -> 1, 428%16 -> 1; ~4 div/mod fails). The divmod has already
+        # CONSUMED the dividend byte 1 (cummax-gathered into GE operand-A
+        # positions 2/3 at the divmod block INPUT), so the carrier is dead at
+        # this row from L14 onward. Clear it here on the SAME divmod-AX
+        # ``opcode_mask``, so the L18 mem-gen head has no byte-1 to leak and the
+        # quotient survives to the emit. PASSING (single-byte-dividend) rows
+        # have ``STACK0_BYTE_VAL_1 == 0`` so this clear is a no-op there.
+        # See ``shared.divmod_stack0_byte1_clear_enabled`` for the full
+        # rationale + byte-identity envelope. Flag-OFF / ``C4_NO_STACK0_EMIT=0``
+        # leave the band untouched (byte-identical to golden ``7f6f2e5d``).
+        if (
+            no_stack0_emit_enabled()
+            and divmod_stack0_byte1_clear_enabled()
+            and hasattr(BD, "STACK0_BYTE_VAL_1_LO")
+            and hasattr(BD, "STACK0_BYTE_VAL_1_HI")
+        ):
+            keep = (1.0 - opcode_mask)[:, :, None].to(dtype=x_bd_out.dtype)
+            x_bd_out[:, :, BD.STACK0_BYTE_VAL_1_LO:BD.STACK0_BYTE_VAL_1_LO + 16] = (
+                x_bd_out[:, :, BD.STACK0_BYTE_VAL_1_LO:BD.STACK0_BYTE_VAL_1_LO + 16]
+                * keep
+            )
+            x_bd_out[:, :, BD.STACK0_BYTE_VAL_1_HI:BD.STACK0_BYTE_VAL_1_HI + 16] = (
+                x_bd_out[:, :, BD.STACK0_BYTE_VAL_1_HI:BD.STACK0_BYTE_VAL_1_HI + 16]
+                * keep
             )
 
         return x_bd_out
