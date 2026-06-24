@@ -1148,6 +1148,7 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         from .shared import (
             no_stack0_emit_enabled,
             cmp_byte0_se_recover_enabled,
+            bitwise_byte0_se_recover_enabled,
         )
         block_ffn = cleanup_ffn
         if no_stack0_emit_enabled() and cmp_byte0_se_recover_enabled():
@@ -1176,7 +1177,41 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
                     cmp_op_dims=cmp_op_dims,
                 )
         block.ffn = block_ffn
-        block.post_ops.append(lookup_ffn)
+
+        # === STACK0 campaign (2026-06-24): bitwise operand-A SE recover ===
+        # Under the campaign config the SAME L14 ALU-clear that crushes the cmp
+        # operand also crushes the BITWISE operand-A byte-0 — but for the bitwise
+        # lookup the crush bites at the LOOKUP block (a downstream post_op block),
+        # not at ``cleanup_ffn``. So the cmp recover above (wrapping ``block.ffn``)
+        # does NOT reach the lookup. Wrap the lookup post_op itself with a recover
+        # that restores ALU_LO/HI from SE_ALU on the OR/XOR/AND + MARK_AX + crushed
+        # row BEFORE the lookup reads it. ``or_16bit`` / ``xor_16bit`` lose byte-0
+        # EXACTLY when operand A's nibble is 0; ``and_16bit`` passes coincidentally
+        # (its nibbles 0xF survive the cell-0 crush). One block — the lookup's own —
+        # so the physical block count is unchanged (lea contract). Flag-OFF /
+        # non-campaign appends the bare ``lookup_ffn`` (byte-identical to golden).
+        # See ``shared.bitwise_byte0_se_recover_enabled`` for the full rationale.
+        lookup_op = lookup_ffn
+        if (
+            no_stack0_emit_enabled()
+            and bitwise_byte0_se_recover_enabled()
+            and hasattr(bd_proxy, "SE_ALU_LO")
+            and hasattr(bd_proxy, "SE_ALU_HI")
+        ):
+            from ...efficient_alu_neural import BitwiseOperandSeRecoverFFN
+            bitwise_op_dims = [
+                getattr(bd_proxy, nm) for nm in ("OP_AND", "OP_OR", "OP_XOR")
+            ]
+            lookup_op = BitwiseOperandSeRecoverFFN(
+                lookup_ffn,
+                alu_lo=bd_proxy.ALU_LO,
+                alu_hi=bd_proxy.ALU_HI,
+                se_alu_lo=bd_proxy.SE_ALU_LO,
+                se_alu_hi=bd_proxy.SE_ALU_HI,
+                mark_ax=bd_proxy.MARK_AX,
+                bitwise_op_dims=bitwise_op_dims,
+            )
+        block.post_ops.append(lookup_op)
 
     return Operation(
         name="efficient_l10_andorxor_wrap",

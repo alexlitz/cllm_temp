@@ -382,6 +382,54 @@ def cmp_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_CMP_BYTE0_SE_RECOVER", "1") != "0"
 
 
+def bitwise_byte0_se_recover_enabled() -> bool:
+    """Return True iff the BITWISE (OR/XOR/AND) operand-A byte-0 SE_ALU recovery
+    is active (DEFAULT ON in the campaign config — opt-out via
+    ``C4_BITWISE_BYTE0_SE_RECOVER=0``; only takes effect when the STACK0 emission
+    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is
+    byte-identical to golden ``7f6f2e5d``).
+
+    The wall this lifts (GPU-confirmed spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the 16-bit ``or_16bit`` /
+    ``xor_16bit`` (and the per-nibble ``or``/``xor`` cases) byte-0 result is LOST
+    EXACTLY when operand A's nibble == 0. ``and_16bit`` passes only because its
+    nibbles are 0xF (the result then == operand A's surviving cell). The chain:
+    operand A is delivered from ``mem[SP]`` into ``ALU_LO/HI`` by the L8
+    ``make_layer8_mem_to_alu_op`` head 5 at the AX marker, but the L14 ALU-clear
+    (block 19 of the campaign 55-block layout) CRUSHES ``ALU_LO/HI+0`` to ~0 —
+    destroying the LEGIT A==0 one-hot. (Golden survives because its A==0
+    magnitude ~11 >> the ~5.5 cell-0 artifact; the campaign mem-CAM delivers the
+    legit A==0 at only ~5.5 ≈ the artifact, so the cleanup + L14 clear net it to
+    zero.) The bitwise lookup post_op (``bitwise_rules``, gated on MARK_AX + the
+    op flag, reading ``ALU`` × ``AX_CARRY``) then reads the crushed ALU at its
+    own downstream block: the A==0 nibble is absent, the rule for that nibble
+    never fires, and OUTPUT_LO/HI stays empty → the byte-0 token decodes 0x00.
+
+    The clean operand A IS present at the bitwise compute row in
+    ``SE_ALU_LO/HI`` (the L9 ``step_end_operand_relay`` mirror, written BEFORE
+    the crush and surviving to the lookup block — spec_k=0: for ``or_16bit``
+    ``SE_ALU_LO+0 == SE_ALU_HI+0 == ~0.85`` = operand A byte0 0x00; for
+    ``xor_16bit`` ``SE_ALU_LO+15`` / ``SE_ALU_HI+0`` = 0x0F).
+
+    FIX (the MUL/CMP byte-0 SE-recover precedent applied to the bitwise lookup):
+    a forward-pass recover WRAPS the bitwise lookup post_op so it runs in the
+    SAME block, BEFORE the lookup reads ``ALU`` (NO physical block is added — the
+    absolute-position lea contract holds). On the OR/XOR/AND opcode + MARK_AX +
+    crushed row ONLY it (1) multiplicatively CLEARS the ``ALU_LO/HI`` band (a
+    crushed floor AND an already-clean one-hot both go to 0 — idempotent, the
+    non-crushed passing rows are re-materialized identically), then (2) WRITES
+    the clean operand-A one-hot from ``SE_ALU_LO/HI`` at the cleaned ~5.82
+    magnitude the rescaled lookup cond weight (``30/5.82``) was tuned against.
+    Operand B (``AX_CARRY``, clean) and the result band are untouched.
+
+    DEFAULT ON. Opt-out via ``C4_BITWISE_BYTE0_SE_RECOVER=0`` restores the raw
+    crushed ALU read. Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_BITWISE_BYTE0_SE_RECOVER`` can A/B
+    it inside the campaign config.
+    """
+    return os.environ.get("C4_BITWISE_BYTE0_SE_RECOVER", "1") != "0"
+
+
 def cmp_eq_hinib_veto_enabled() -> bool:
     """Return True iff the EQ engine's HIGH-nibble artifact-veto is active
     (DEFAULT ON in the campaign config — opt-out via

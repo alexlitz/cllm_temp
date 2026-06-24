@@ -1470,6 +1470,136 @@ class MulOperandSeRecoverFFN(nn.Module):
         return None
 
 
+class BitwiseOperandSeRecoverFFN(nn.Module):
+    """Campaign BITWISE operand-A SE_ALU recover wrapping the L10 bitwise lookup.
+
+    Drop-in replacement for the bitwise lookup ``post_op`` in the efficient-mode
+    L10 wrap (``make_efficient_l10_andorxor_wrap_op``). Holds the rule-lowered
+    ``bitwise_rules`` ``PureFFN`` (``inner``, the 1536-unit AND/OR/XOR lookup over
+    ``ALU`` × ``AX_CARRY``) and, BEFORE delegating to it, restores the crushed
+    operand-A ``ALU_LO/HI`` band from the surviving ``SE_ALU_LO/HI`` mirror so the
+    lookup's per-(a,b) 3-way AND units read the SAME clean one-hot they see in the
+    golden 35-token config — no threshold re-tuning.
+
+    This is the byte-0 SE-recovery precedent (``CmpOperandSeRecoverFFN`` /
+    ``MulOperandSeRecoverFFN``) applied to the bitwise lookup. The lookup reads
+    ``ALU`` and writes ``OUTPUT`` in its OWN downstream block; by the time it runs,
+    the L14 ALU-clear (block 19) has crushed ``ALU_LO/HI+0`` to ~0, destroying the
+    legit A==0 nibble one-hot (golden survives — its A==0 magnitude ~11 dwarfs the
+    cell-0 artifact; the campaign mem-CAM delivers ~5.5 ≈ the artifact, so the
+    cleanup + clear net it to 0). So ``or_16bit`` / ``xor_16bit`` lose the byte-0
+    result EXACTLY when operand A's nibble is 0; ``and_16bit`` passes coincidentally
+    (its nibbles are 0xF, surviving at cell 15). The clean operand A is present at
+    the lookup row in ``SE_ALU_LO/HI`` (the L9 ``step_end_operand_relay`` mirror,
+    written before the crush).
+
+    Runs in ONE block (it IS the lookup post_op block), so the model's physical
+    block count is unchanged — the absolute-position lea contract holds. ``compact``
+    / ``sparsify`` / ``compact_moe`` plumb through to ``inner``.
+
+    Forward (campaign OP_AND/OP_OR/OP_XOR + MARK_AX + crushed rows ONLY):
+    multiplicatively CLEAR the ``ALU_LO/HI`` band (a crushed floor AND an
+    already-clean one-hot both go to 0 — idempotent: a NON-crushed bitwise row is
+    re-materialized identically from its own SE_ALU mirror, never perturbed), then
+    ADD the clean operand-A one-hot from ``SE_ALU`` scaled to ``ALU_CLEAN_MAG``
+    (the ~5.82 cleaned magnitude the rescaled lookup cond weight ``30/5.82`` was
+    tuned against). Operand B (``AX_CARRY``) is untouched; the lookup itself owns
+    the OUTPUT write. Gate-OFF / non-campaign leaves ``x`` byte-identical.
+    """
+
+    # The lookup's ``operand_a_cw = 30/5.82`` expects the cleanup-cleaned operand
+    # one-hot at ~5.82, so a matched cell contributes ~30 and the 3-way AND clears
+    # the 80 threshold (40 marker + 30 A + 30 B = 100). Write the recovered cell
+    # at that magnitude so the lookup fires exactly as it does in golden.
+    ALU_CLEAN_MAG = 5.82
+
+    # CRUSH detection threshold. Unlike the cmp/mul crush (which drives operand A
+    # all-NEGATIVE, ~-45), the L14 ALU-clear nets the A==0 nibble cell to ~0 (a
+    # tiny +0.004, NOT strongly negative). A healthy operand band has its true
+    # nibble cell at ~+5.5; a crushed band's max cell is ~0. So detect "lost"
+    # operand by a low-magnitude max (no clean one-hot present), threshold midway
+    # (~2.0) between the ~0 crushed value and the ~5.5 healthy one-hot.
+    HEALTHY_ONEHOT_MIN = 2.0
+
+    def __init__(self, inner: nn.Module, *, alu_lo, alu_hi, se_alu_lo,
+                 se_alu_hi, mark_ax, bitwise_op_dims):
+        super().__init__()
+        self.inner = inner
+        self.alu_lo = int(alu_lo)
+        self.alu_hi = int(alu_hi)
+        self.se_alu_lo = int(se_alu_lo)
+        self.se_alu_hi = int(se_alu_hi)
+        self.mark_ax = int(mark_ax)
+        # The three bitwise opcode flag dims (OP_AND/OP_OR/OP_XOR). One-hot/step.
+        self.bitwise_op_dims = tuple(int(d) for d in bitwise_op_dims)
+        # Sentinel so an idempotent re-wrap guard recognises an existing attach.
+        self._is_bitwise_se_recover_wrap = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lo = slice(self.alu_lo, self.alu_lo + 16)
+        hi = slice(self.alu_hi, self.alu_hi + 16)
+        alu_lo_band = x[:, :, lo]
+        alu_hi_band = x[:, :, hi]
+        # bitwise opcode (OR of the three flags) AND MARK_AX, per row.
+        op = torch.zeros_like(x[:, :, self.mark_ax])
+        for d in self.bitwise_op_dims:
+            op = op + x[:, :, d]
+        op_ax = (op > 0.5) & (x[:, :, self.mark_ax] > 0.5)
+        # CRUSH DETECTION: the L14 ALU-clear nets the A==0 nibble cell to ~0 (a
+        # tiny +0.004, NOT strongly negative like the cmp/mul crush). A healthy
+        # operand band has its true-nibble cell at ~+5.5; a crushed band's max
+        # cell is ~0. Recover the rows where operand A has NO healthy one-hot
+        # (max < HEALTHY_ONEHOT_MIN) in EITHER nibble band: a bitwise byte-0
+        # operand needs BOTH nibbles present, so if either band lost its one-hot
+        # the lookup's byte-0 rule for that nibble cannot fire -> recover BOTH
+        # from the surviving clean SE_ALU mirror.
+        lo_lost = alu_lo_band.max(dim=-1).values < self.HEALTHY_ONEHOT_MIN
+        hi_lost = alu_hi_band.max(dim=-1).values < self.HEALTHY_ONEHOT_MIN
+        crushed = lo_lost | hi_lost
+        recover = (op_ax & crushed)[:, :, None].to(dtype=x.dtype)  # [B,S,1]
+        keep = 1.0 - recover
+        # Clean 0/1 one-hot of operand A from the surviving SE_ALU mirror.
+        se_lo = (
+            torch.clamp(
+                x[:, :, self.se_alu_lo:self.se_alu_lo + 16], min=0.0, max=1.0,
+            ) > 0.5
+        ).to(dtype=x.dtype)
+        se_hi = (
+            torch.clamp(
+                x[:, :, self.se_alu_hi:self.se_alu_hi + 16], min=0.0, max=1.0,
+            ) > 0.5
+        ).to(dtype=x.dtype)
+        # Build the CLEAN operand-A one-hot (cleanup-cleaned magnitude, no
+        # artifacts) — exactly the band the rescaled bitwise lookup fires on for a
+        # passing row, so each matched (a,b) unit clears the 80 threshold and no
+        # spurious cell trips a competing unit.
+        clean_lo = se_lo * self.ALU_CLEAN_MAG
+        clean_hi = se_hi * self.ALU_CLEAN_MAG
+        x = x.clone()
+        # Multiplicative clear on the crushed bitwise rows, then write the clean
+        # one-hot; all other rows keep their live ALU band untouched.
+        x[:, :, lo] = alu_lo_band * keep + clean_lo * recover
+        x[:, :, hi] = alu_hi_band * keep + clean_hi * recover
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility (mirrors CmpOperandSeRecoverFFN) ----
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Flattened AND/OR/XOR pipeline (vanilla nn.Sequential composite).
 #
