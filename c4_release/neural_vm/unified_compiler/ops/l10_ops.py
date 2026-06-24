@@ -2391,6 +2391,38 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
         FLAG_LT_LO_LT = 0.19  # lo_lt -> ~1.10 (was ~0.88); hi_lt unchanged
     else:
         FLAG_LT_LO_LT = FLAG_LT
+    # CMP equal-high-nibble GT lo-margin fix (#322, 2026-06-23, CAMPAIGN only).
+    # ROOT (isolated CPU-autoregressive, campaign config
+    # ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims, spec_k=0,
+    # ``tools/probe_gt_lo_margin.py``): in the CAMPAIGN config the
+    # ``CmpOperandSeRecoverFFN`` re-materializes a STRONGER operand-A one-hot
+    # than the golden 35-token frame, so the ``C4_CMP_FLAG_MARGIN_FIX``
+    # ``FLAG_EQ=0.45`` lands ``hi_eq`` at ~1.86 at the decode row -- ABOVE its
+    # own (0.75, 1.5) single-flag CEILING. The live ComparisonCombine's
+    # ``(hi_eq AND lo_lt) -> GT=0`` 3-way override fires iff
+    # ``MARK_AX + hi_eq + lo_lt > 2.5``; with ``hi_eq = 1.86`` ALONE the sum
+    # ``1 + 1.86 + 0 = 2.86 > 2.5`` so the override SPURIOUSLY flips the
+    # equal-high-nibble GT-TRUE cases (``if_gt 54>53 / 60>54 / 54>50``, where
+    # ``lo_lt = 0`` because A.lo > B.lo) to GT=0 (probed OUTPUT_LO@blk26 =
+    # [25.5@0, -15.9@1] -> result byte low-nibble 0 -> GT=0 WRONG). The golden
+    # config's weaker operand amplification keeps ``hi_eq`` in-window, so this
+    # is a campaign-only over-shoot -- hence a campaign-gated knock-down, NOT a
+    # change to the golden ``FLAG_EQ`` (golden bake stays byte-identical to
+    # ``7f6f2e5d``). Lowering the campaign ``FLAG_EQ`` to 0.30 lands
+    # ``hi_eq = 1.24`` (comfortably in-window): the spurious single-flag trip is
+    # gone (``1 + 1.24 + 0 = 2.24 < 2.5`` -> override OFF -> GT stays default=1,
+    # probed OUTPUT_LO = [0.6@0, 8.9@1] -> GT=1) while the INTENDED
+    # ``(hi_eq AND lo_lt)`` pairs STILL fire decisively (53>54 / 86<87:
+    # ``1 + 1.24 + 1.45 = 3.69 > 2.5`` -> override ON, probed [29.7@0,-20.2@1] /
+    # [-19.9@0,29.4@1]) and ``lo_lt``-alone STILL does NOT trip (50<44:
+    # ``1 + 0 + 1.45 = 2.45 < 2.5``). DISCRIMINATING: every equal-high-nibble
+    # GT-true now wins AND every (hi_eq AND lo_lt) override still fires -- no
+    # zero-sum trade. ``lo_lt`` (CMP+3) write strength is UNTOUCHED so lt/le/ge
+    # margins are unchanged. Kill-switch ``C4_CMP_GT_LO_MARGIN=0`` restores the
+    # 0.45 campaign value; flag-OFF / non-campaign is byte-identical to golden.
+    from .shared import no_stack0_emit_enabled, cmp_gt_lo_margin_enabled
+    if no_stack0_emit_enabled() and cmp_gt_lo_margin_enabled():
+        FLAG_EQ = 0.30  # campaign: -> hi_eq ~1.24 (was 1.86 at 0.45)
 
     rules: list[FFNRule] = []
 
