@@ -17,6 +17,47 @@ from .shared import (
     operand_from_memsp_enabled,
 )
 from ..positional_invariant import marker_bank_index
+from .residual_band_registry import register_residual_band
+
+
+def _li_zeroaddr_indicator_on() -> bool:
+    """PHASE-2 KEYSTONE indicator dim for var_simple zero-address LI (#318).
+
+    Materializes ONE FFN dim (``LI_ZEROADDR_COMMITTED``) that fires ≈1 ONLY on a
+    store VALUE row that is BOTH **committed** (``MEM_STORE_AT_VAL`` ≈ 1) AND at a
+    **zero address** (both ``ADDR_B0_LO+0`` and ``ADDR_B0_HI+0`` ≈ 1) — the
+    3-way AND ``silu(MSAV + ADDR_B0_LO+0 + ADDR_B0_HI+0 - 2.5)``. L15 head-0 then
+    keys K on this SINGLE dim (the AND lives in the FFN, not the bilinear head),
+    so the committed BP+0 local's value row out-scores a non-committed
+    zero-address operand-frame row WITHOUT the linear-K over-sharpening that
+    desynced the AR frame (see ``l15_ops._l15_li_zeroaddr_cam_on`` BLOCKER).
+
+    Shares the ``C4_L15_LI_ZEROADDR_CAM`` kill-switch with the head-0 keying so
+    the indicator + the consumer are one coordinated campaign feature. The
+    indicator reads ``ADDR_B0_LO/HI`` (gathered by L13 ``mem_addr_gather``) and
+    ``MEM_STORE_AT_VAL`` (produced by L7 ``mem_store_relay``) — both settled by
+    L13 output (present at the L14 input) — and writes the fresh
+    ``LI_ZEROADDR_COMMITTED`` band, available at L15's input. ``MEM_STORE_AT_VAL``
+    only exists on the campaign (``C4_OPERAND_FROM_MEMSP``) path, so this is
+    campaign-only; golden (35-token, flag-OFF) is byte-identical (the op is not
+    registered and the band is not collected).
+    """
+    raw = _os.environ.get("C4_L15_LI_ZEROADDR_CAM")
+    if raw is not None:
+        return raw != "0"
+    return False
+
+
+# Fresh over-width residual band carrying the (committed AND zero-address)
+# store indicator. ``never_share=True`` keeps it in a private slot (it is a
+# value-row one-hot that L15 head-0 reads one block downstream). Flag-gated on
+# the campaign keystone switch so a flag-OFF build omits it entirely (smaller
+# d_model, golden byte-identical). Sized 1 (a single indicator scalar).
+register_residual_band(
+    "LI_ZEROADDR_COMMITTED", 1,
+    owner="make_layer14_li_zeroaddr_indicator_op",
+    flag=_li_zeroaddr_indicator_on, never_share=True,
+)
 
 
 def _psh_arg_val_ax_enabled() -> bool:
@@ -195,6 +236,14 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # ``make_ffn_lint_mull14_demo_op`` / ``make_ffn_lint_clean_demo_op``.
     "ffn_lint_mull14_demo":                  (None,    1),
     "ffn_lint_clean_demo":                   (None,    1),
+    # PHASE-2 KEYSTONE (#318): the (committed AND zero-address) store indicator.
+    # ONE FFN unit, campaign-flag-gated (C4_L15_LI_ZEROADDR_CAM). The LAST
+    # entry in the chain so it can never shift a real op's start_unit: when the
+    # flag is OFF the op is not registered and ``_l14_chain_alloc`` never claims
+    # its slot -> a flag-off / golden build is byte-identical. When ON it
+    # pre-claims every (deterministic, fixed-size) preceding layout slot and
+    # lands at the first free gap. See ``make_layer14_li_zeroaddr_indicator_op``.
+    "layer14_li_zeroaddr_indicator":         (None,    1),
 }
 
 
@@ -3678,6 +3727,138 @@ def make_layer14_demo_phase6_wave7_op() -> Operation:
         ffn_units_used=1923 if operand_from_memsp_enabled() else 1907,
         smoke_tests=set(),
         spec_section="docs/HOW_TO_ADD_A_CORRECTIVE_OP.md",
+    )
+
+
+def _layer14_li_zeroaddr_indicator_rules(S: float) -> tuple[FFNRule, ...]:
+    """ONE FFNRule: the (committed AND zero-address) store indicator (#318).
+
+    The 3-way AND of (committed) AND (zero-address LO nibble) AND (zero-address
+    HI nibble), but factored as a MULTIPLICATIVE committedness GATE over a
+    zero-address silu — NOT an additive 3-condition sum. The additive form
+    ``silu(MSAV + ADDR_B0_LO+0 + ADDR_B0_HI+0 - 2.5)`` from the blueprint FALSE
+    FIRES, because the value-row address-nibble one-hots are NOT clean unit
+    one-hots: a NON-committed operand-frame row (probe #250 row 297) carries
+    its zero-address nibbles at amplitude ~2.46 EACH, so the two nibble terms
+    alone (2.46 + 2.46 = 4.92) clear 2.5 WITHOUT the MSAV term -> MSAV is not
+    load-bearing in the additive threshold. (Verified on the built model:
+    additive form fires on rows 297/327/357, all MSAV=0.)
+
+    THE FACTORED FORM (the AND that actually holds):
+
+        output = MEM_STORE_AT_VAL * silu(S*(ADDR_B0_LO+0 + ADDR_B0_HI+0) - S*thr)
+
+    The SwiGLU gate (``gate=MEM_STORE_AT_VAL``) multiplies the silu, so a
+    NON-committed row (MSAV=0) is forced to 0 REGARDLESS of its address
+    amplitude (kills the row-297 false fire). The silu side then needs only the
+    two-nibble zero-address AND: threshold ``thr=1.5`` fires when BOTH +0 cells
+    are present (committed x-store row 267: 1.46 + 1.46 = 2.92 > 1.5) but not on
+    a committed store with only ONE zero nibble (rows 147/207: a 0xX0 / 0x0X
+    address gives 1.0 + 0 = 1.0 < 1.5) nor a non-zero-address store (0xF8 row
+    117: 0 + 0 = 0). Only a genuine 0x00-address committed store clears it.
+
+    Output goes to the private ``LI_ZEROADDR_COMMITTED`` band so L15 head-0 can
+    key K on this SINGLE dim (the AND is done HERE in the FFN, not in the
+    bilinear head — which cannot AND three conditions in one slot). Write
+    magnitude ``1.0/S`` makes the output ≈1 at S=100 (silu(S*~0.9) ≈ 0.9*S,
+    times 1/S, times MSAV=1 -> ≈0.9); the consumer head only needs a positive
+    sign, so the exact magnitude is not load-bearing.
+    """
+    return (
+        multi_way_and_rule(
+            name="l14_li_zeroaddr_committed_indicator",
+            conditions=(
+                ("ADDR_B0_LO+0", 1.0),
+                ("ADDR_B0_HI+0", 1.0),
+            ),
+            threshold=1.5,
+            gate="MEM_STORE_AT_VAL",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("LI_ZEROADDR_COMMITTED+0", 1.0 / S),),
+            scope=("MEM_STORE_AT_VAL and ADDR_B0_LO+0 and ADDR_B0_HI+0"),
+        ),
+    )
+
+
+def _layer14_li_zeroaddr_indicator_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_li_zeroaddr_indicator_rules(S))
+    return ir
+
+
+def make_layer14_li_zeroaddr_indicator_op() -> Operation:
+    """L14 FFN: materialize the (committed AND zero-address) store indicator.
+
+    PHASE-2 KEYSTONE (#318) — the FFN half of the var_simple zero-address LI
+    fix. One :class:`FFNRule` (:func:`_layer14_li_zeroaddr_indicator_rules`)
+    fires ≈1 ONLY on a committed zero-address store VALUE row, writing the fresh
+    private ``LI_ZEROADDR_COMMITTED`` band. L15 head-0
+    (``_l15_li_zeroaddr_cam_on``) keys K on that single dim so the committed
+    BP+0 local out-scores a non-committed zero-address operand-frame row WITHOUT
+    the linear-K over-sharpening that desynced the AR frame.
+
+    Campaign-flag-gated (``C4_L15_LI_ZEROADDR_CAM``, shared with the head): the
+    op is registered ONLY when the flag is on (see ``all_core_ops``), so a
+    flag-OFF / golden build never sees it. The reads (``MEM_STORE_AT_VAL`` from
+    L7, ``ADDR_B0_LO/HI`` from L13) only exist on the campaign
+    (``C4_OPERAND_FROM_MEMSP``) path; ``LI_ZEROADDR_COMMITTED`` is a flag-gated
+    residual band (omitted otherwise), so the op is a no-op outside the campaign
+    config too.
+
+    LAST entry in the L14 cleanup chain (``_L14_CLEANUP_CHAIN_LAYOUT``): it
+    pre-claims every deterministic, fixed-size preceding slot and lands at the
+    first free gap. Because it is the chain tail, growing it can never shift a
+    real op's start_unit; flag-OFF it is not registered, so the chain is
+    byte-identical to golden.
+    """
+    enabled = _li_zeroaddr_indicator_on()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        ffn = getattr(block, "ffn", None)
+        if ffn is None or not hasattr(ffn, "W_up"):
+            return
+        start_unit = _l14_chain_alloc("layer14_li_zeroaddr_indicator")
+        ir = _layer14_li_zeroaddr_indicator_ir(S)
+        rules = ir.layer(0).ffn.rules
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_li_zeroaddr_indicator",
+        slot_share=("ffn_units",),
+        reads={"MEM_STORE_AT_VAL", "ADDR_B0_LO", "ADDR_B0_HI", "CONST"}
+        if enabled else set(),
+        writes={"LI_ZEROADDR_COMMITTED"} if enabled else set(),
+        kind="block",
+        target_op_name="layer14_mem_generation",
+        # Order after the two demo fixtures (so the chain alloc pre-claims their
+        # deterministic 1-unit slots) AND after mem_generation (the L14 attn op
+        # this block targets). The demos are default-OFF, but the chain alloc
+        # pre-claims their layout slots regardless, so the landing unit is
+        # deterministic whether or not they are registered.
+        requires={"after": [
+            "layer14_demo_phase6_wave7",
+            "layer14_mem_generation",
+        ]} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=_layer14_li_zeroaddr_indicator_ir(),
+        declarative_authority="spec_generated",
+        migrated=True,
+        # Chain tail: prior real ops + the two demo slots fill the pool; this
+        # single-unit op lands at the next free gap (unit 1925 in the campaign
+        # config), so the block must be sized to 1926 (a half-open [0,1926)
+        # pool). Only reserved when the flag is on; OFF => not registered, so the
+        # demo op's sizing (1923) governs (golden byte-identical).
+        ffn_units_used=1926 if enabled else 0,
+        smoke_tests=set(),
+        spec_section="project_campaign_savedra_chain_flip (#318)",
     )
 
 

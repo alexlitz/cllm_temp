@@ -355,6 +355,106 @@ def _l15_li_addr_cam_discriminator_on() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _l15_li_zeroaddr_cam_on() -> bool:
+    """DEFAULT-OFF building block (``C4_L15_LI_ZEROADDR_CAM=1`` to enable):
+    restore the k=0 (zero-nibble) address match on L15 head-0, gated on
+    committed stores, so a local whose BP-relative address is 0x00 gets address
+    discrimination among its same-address committed stores (#301/#318
+    zero-address blind spot).
+
+    *** DEFAULT-OFF -- DOES NOT FLIP var_simple IN THE AR DECODE WITHOUT
+    REGRESSING func (the documented multi-session operand-CAM blocker). ***
+    Kept as a flag-gated building block (golden + campaign-config baseline
+    byte-identical when OFF) for the next session. See the BLOCKER section
+    below for the exact AR-framing wall and the blueprint.
+
+    BLOCKER (CPU-first, spec_k=0, BUILT dims; tools/_probe_zeroaddr_cam.py +
+    tools/cpu_full_trace.py, campaign config). The TF probe is SOLVABLE -- with
+    this slot pair head-0 at var_simple #250 step-7 correctly selects the
+    committed x-store row 267 (valbyte 0xde) over the non-committed
+    operand-frame row 297, AND func_identity #550's nonzero-address LIs are
+    untouched (all 11 TF steps byte-correct). But the AUTHORITATIVE
+    *autoregressive* cpu_full_trace verdict is exquisitely, non-monotonically
+    sensitive to the head-0 boost magnitude in a way the re-anchored TF probe
+    CANNOT see (a 34/37-token framing desync, not a value error):
+      * _msav_w = 1.5*_zc_s : var_simple #250 AR FAIL, func #550 AR FAIL
+      * _msav_w = 5.0*_zc_s : var_simple #250 AR FAIL (over-sharp head-0 ->
+                              framing desync), func #550 AR PASS
+      * a separate MARK_AX/CONST-gated slot-103 (K=MSAV): var_simple #250 AR
+                              PASS, but func #550 AR FAIL (the negative-Q
+                              penalty on func's nonzero-addr committed stores).
+    Root of the wall: attention is BILINEAR per head-dim slot, so "fire only
+    when (zero-address QUERY) AND (committed CANDIDATE)" cannot be expressed in
+    one slot -- the query-side zero-address gate (Q on ADDR_B0_LO/HI+0) ALSO
+    fires on var's OWN SI store-step rows (breaks var's AR framing), while the
+    emit-row gate (Q on MARK_AX) fires on EVERY LI incl. func's (breaks func).
+    And on the CANDIDATE side the non-committed operand row 297 carries the
+    zero-address nibbles at HIGHER amplitude (2.46 vs the committed store's
+    1.46), so committedness (MSAV) must out-weigh the address amplitude -- but
+    K is LINEAR per slot, so K = zero-nibble + MSAV cannot AND them, and any
+    MSAV weight large enough to flip 297->267 over-sharpens head-0 and desyncs
+    the var AR frame. This is the brief's anticipated multi-session wall.
+
+    BLUEPRINT (next session): the clean fix needs a signal that is positive
+    ONLY on a (committed AND zero-address) value row -- i.e. an FFN-materialized
+    "committed-zero-address-store" indicator dim (one L13/L14 FFN unit:
+    silu(MSAV + ADDR_B0_LO+0 + ADDR_B0_HI+0 - 2.5)) so head-0 can key K on that
+    SINGLE dim (the AND is done in the FFN, not the bilinear head). Then a
+    MARK_AX-gated Q (emit-row-only -> var-store-safe) x that-dim K (zero-address
+    committed only -> func-safe, no penalty) flips var without touching func.
+    The L15 attention layer alone cannot AND three conditions; the materialized
+    indicator dim is the missing piece.
+
+    ROOT (CPU-first, campaign config, spec_k=0, BUILT dims; var_simple #250
+    x=990, tools/_probe_zeroaddr_cam.py): ``x`` lives at ``BP+0`` -> its store
+    address byte-0 is ``0x00``. The #313 ADDR-CAM DROPS the ``k=0`` match (loop
+    ``range(1,16)``), so a zero-address local gets NO per-store address
+    discrimination and an OLD wrong-address committed store out-scores the
+    right latest x-store in the AR decode (#301/#318).
+
+    ROOT (CPU-first, campaign config, spec_k=0, BUILT dims; var_simple #250
+    x=990, tools/_probe_zeroaddr_cam.py): ``x`` lives at ``BP+0`` -> its store
+    address byte-0 is ``0x00`` (BOTH the lo AND hi nibble are 0). The #313
+    ADDR-CAM (slots 71-101) DELIBERATELY DROPS the ``k=0`` match (loop
+    ``range(1,16)``) because, taken naively, the zero-nibble one-hot peaks on
+    BOTH the operand query row AND on stray null-address load-result/code rows,
+    so a genuine non-zero-address local (``&a=0xffe8``) could lose to a 0x00
+    intermediate row. CONSEQUENCE: a zero-address local gets ZERO per-store
+    address discrimination -> in the AUTOREGRESSIVE decode (TF passes; this is
+    an AR-emit-only failure) an OLD wrong-address committed store (``0xF8``,
+    pos 117, nonzero nibbles -> slot-79/95 keys) out-scores the right latest
+    x-store (``0x00``, pos 267) and the ALiBi recency slope 0.05 over the ~150
+    position gap adds only ~7 -- far short of the ~744 deficit.
+
+    THE FIX (recency-among-same-address-committed): re-instate the k=0 match on
+    BOTH ``ADDR_B0_LO+0`` and ``ADDR_B0_HI+0`` -- the candidate's OWN zero
+    nibble one-hot (slots 71/87, the natural k=0 positions the #313 loop left
+    free) -- but GATE the match to GENUINE committed stores via an additive
+    ``MEM_STORE_AT_VAL`` (MSAV) requirement so stray null-address load-result /
+    code rows (MSAV=0) never collect it. With the k=0 boost the latest
+    zero-address committed store now leads its address class, and the existing
+    0.05 recency slope cleanly resolves the (rare) multiple-same-zero-address
+    case (var_update's x-reassign) to the most-recent write. The brief's
+    ``&a=0xffe8`` objection is null because that store's nibbles are nonzero
+    (lo=8/hi=14) and already match k=8/k=14; the k=0 boost it cannot collect,
+    and a 0x00 load-result row is MSAV=0 so it cannot collect it either.
+
+    Campaign-only (the value-row address + MSAV signals are produced by the
+    30-token MEM-from-SP path); golden (35-token, flag-OFF) is byte-identical --
+    the slots are simply not emitted. Head-0 ONLY; pure additive
+    content-addressing on free slots; own kill-switch for the cross-op /
+    flag-regression gates.
+    """
+    # DEFAULT-OFF: explicit opt-in only (not auto-ON in the campaign config),
+    # because the AR decode cannot flip var_simple without regressing func --
+    # see the BLOCKER section above. Both golden and the default campaign config
+    # are byte-identical with this OFF.
+    raw = _os_l15.environ.get("C4_L15_LI_ZEROADDR_CAM")
+    if raw is not None:
+        return raw != "0"
+    return False
+
+
 def _l15_li_byte0_valsel_on() -> bool:
     """DEFAULT campaign-ON (``C4_L15_LI_B0_VALSEL``): re-establish L15 head-0's
     byte-0 VALUE-row selector via the SURVIVING ``MEM_VAL_B0`` dim (#318).
@@ -1699,6 +1799,99 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                     q_map[(_row, BD.MARK_AX)] = 2.0 * _cam_s
                     q_map[(_row, _nib_base + _k)] = _cam_s
                     k_map[(_row, _nib_base + _k)] = _cam_s
+
+        # === #301/#318: head-0 ZERO-ADDRESS (k=0) committed-store match ===
+        # See _l15_li_zeroaddr_cam_on for the full root + proof. The #313 CAM
+        # above DROPS the k=0 (zero-nibble) match, so a local at BP+0 (address
+        # 0x00, BOTH nibbles 0) gets NO per-store address discrimination and an
+        # OLD wrong-address committed store (0xF8, pos 117) out-scores the right
+        # latest x-store (0x00, pos 267) in the AR decode (the 0.05 recency
+        # slope over ~150 positions adds only ~7, far short of the ~744
+        # deficit). Re-instate the k=0 match on the NATURAL free k=0 slots
+        # (71 for ADDR_B0_LO+0, 87 for ADDR_B0_HI+0) -- the candidate's OWN
+        # zero nibble -- combined with an additive committed-store gate on
+        # MEM_STORE_AT_VAL (MSAV). Softmax over the SUM of the two terms peaks
+        # ONLY on a committed-AND-zero-address row: a committed NONZERO-address
+        # store (0xF8) collects the MSAV term but not the zero-nibble term (it
+        # already has its k=8/k=15 nonzero match instead), and a stray
+        # null-address load-result/code row collects the zero-nibble term but
+        # is MSAV=0 so it never collects the gate -- so neither alternative gets
+        # BOTH, and the genuine x-store (committed + 0x00) leads its class. The
+        # existing 0.05 recency slope then resolves the (rare) same-zero-address
+        # multiple-write case (var_update's x-reassign) to the latest store.
+        # Pure additive; campaign-only (golden byte-identical: slots not emitted
+        # -- the ADDR_B0/MSAV value-row signals are produced only by the 30-tok
+        # MEM-from-SP path). Mirrors the #313 _cam_s magnitude so the k=0 boost
+        # is the same per-nibble weight as the k=1..15 matches.
+        if head == 0 and _l15_li_zeroaddr_cam_on():
+            # === PHASE-2 KEYSTONE (#318): FFN-indicator head-0 zero-address match.
+            # The #313 CAM DROPS the k=0 (zero-nibble) match, so a local at BP+0
+            # (address 0x00, BOTH nibbles 0) gets NO per-store address
+            # discrimination and an OLD wrong-address committed store out-scores
+            # the right latest x-store in the AR decode -> AX byte-0 = 0x00.
+            #
+            # The k=0 match cannot be expressed bilinearly in the head: the
+            # committed x-store (probe #250 row 267: zero nibbles @1.46, MSAV=1)
+            # must beat a NON-committed zero-address operand-frame row (row 297:
+            # zero nibbles @2.46, MSAV=0) -- but K is LINEAR per slot, so any
+            # committedness (MSAV) weight large enough to flip 297->267 over the
+            # higher nibble amplitude also OVER-SHARPENS head-0 and desyncs the
+            # var AR frame (the documented multi-session blocker; the prior
+            # K = zero_nibble + MSAV*w variant was AR-non-monotonic and could not
+            # flip var without regressing func).
+            #
+            # THE FIX (the 3-way AND lives in the FFN, not the head): L14
+            # ``make_layer14_li_zeroaddr_indicator_op`` materializes ONE dim,
+            # ``LI_ZEROADDR_COMMITTED``, that is ≈1 ONLY on a (committed AND
+            # zero-address) store value row -- silu(MSAV + ADDR_B0_LO+0 +
+            # ADDR_B0_HI+0 - 2.5). Head-0 keys K on that SINGLE dim, so the
+            # committed x-store (267, indicator≈1) gets the boost and the
+            # non-committed operand row (297, MSAV=0 -> indicator=0) gets NOTHING
+            # -- a clean separation with NO amplitude competition, hence no
+            # over-sharpening. ONE DEDICATED free head-0 slot (103): slots 0-63
+            # are the base spec, 64-70 the suppressor cancel, 71-102 the #313
+            # ADDR-CAM (LO 72-86, HI 88-102) + slot 102 the byte0_valsel, so
+            # 103-110 (head_dim 111) are free -- 103 keeps this slot fully
+            # separate from the #313 nibble matches:
+            #
+            # (Q) OP_LI-GATED, penalty-free. The slot opens ONLY on an LI EMIT
+            #     row: OP_LI (the LI opcode marker, ~5.2 at the byte-0 emit row
+            #     r307) is the sole Q term. var's OWN SI/ENT/JSR store steps
+            #     carry OP_ENT/OP_JSR but NOT OP_LI (probe #250 r127), so the
+            #     slot is INERT on var's store framing rows -> var-store safe.
+            #     Q is never negative -> it can never penalize any store.
+            # (K) the single committed-zero-address indicator dim. ALL of the
+            #     candidate-side discrimination lives here: the indicator is ≈1
+            #     ONLY on a (committed AND zero-address) store value row (267),
+            #     and 0 on the non-committed operand row (297, MSAV=0) AND on
+            #     committed NONZERO-address stores (indicator=0 there). So at
+            #     func's LIs (nonzero address) NO store row carries the indicator
+            #     (func #550: closest committed store is lo=0/hi=15 -- hi nibble
+            #     not 0 -> indicator never fires) -> the slot contributes nothing
+            #     -> func is untouched. The 3-way AND is done in the FFN, so the
+            #     head needs only this ONE linear K term (no over-sharpening).
+            #
+            # Among multiple committed zero-address stores (var_update's
+            # x-reassign) the existing 0.05 ALiBi recency slope picks the latest.
+            # Campaign-only (golden 35-tok flag-OFF byte-identical: the band +
+            # op are flag-gated and the ADDR_B0/MSAV value-row signals only exist
+            # on the 30-tok MEM-from-SP path).
+            _opli_q = 360.0   # OP_LI emit-row gate weight (mirrors #313 _cam_s)
+            _ind_w = 50.0     # indicator K weight. The slot score on row 267 is
+            #                   Q*K/sqrt(hd) = (360*OP_LI~5.2)*(50*IND~1.41)
+            #                   /sqrt(111) ≈ 12.5k -- ONE #313-nibble-match scale
+            #                   (the proven-decisive-but-not-over-sharp regime):
+            #                   decisive over the ~2k cross-store tie, modest vs
+            #                   the cancelled ~1e6 blockers, so head-0 is NOT
+            #                   over-sharpened (the AR-frame-safe regime that the
+            #                   linear-K MSAV variant could not reach).
+            _row = 103
+            # Q: OP_LI emit-row gate only. K: the committed-zero-address
+            # indicator. The slot boosts the committed-BP+0-local value row at
+            # every LI emit; it is inert on non-LI rows (Q=0) and on every LI
+            # whose locals are all nonzero-address (no indicator candidate).
+            q_map[(_row, BD.OP_LI)] = _opli_q
+            k_map[(_row, BD.LI_ZEROADDR_COMMITTED)] = _ind_w
 
         # === #318: head-0 byte-0 VALUE-row selector via the SURVIVING MEM_VAL_B0 ===
         # Root (a52fd42c, spec_k=0, BUILT dims): head-0's slot-3 byte-0 value-row

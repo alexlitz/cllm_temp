@@ -24,6 +24,7 @@ from .l11_ops import *  # noqa: F401,F403
 from .l12_ops import *  # noqa: F401,F403
 from .l13_ops import *  # noqa: F401,F403
 from .l14_ops import *  # noqa: F401,F403
+from .l14_ops import _li_zeroaddr_indicator_on  # noqa: F401
 from .l15_ops import *  # noqa: F401,F403
 from .l16_ops import *  # noqa: F401,F403
 from .alu_ops import *  # noqa: F401,F403
@@ -583,6 +584,17 @@ def all_core_ops(
         # the END-TO-END FLOW (declare -> byte-identity gate -> compile
         # -> corpus check) per docs/HOW_TO_ADD_A_CORRECTIVE_OP.md.
         make_layer14_demo_phase6_wave7_op(),
+        # PHASE-2 KEYSTONE (#318): the (committed AND zero-address) store
+        # indicator. Registered ONLY when the campaign keystone flag is on
+        # (C4_L15_LI_ZEROADDR_CAM) so a flag-off / golden build is byte-identical
+        # (the op is not registered, the chain alloc never claims its slot, and
+        # the LI_ZEROADDR_COMMITTED band is not collected). Materializes the
+        # FFN 3-way AND that L15 head-0 keys K on. See l14_ops.py
+        # make_layer14_li_zeroaddr_indicator_op + l15_ops _l15_li_zeroaddr_cam_on.
+        *(
+            [make_layer14_li_zeroaddr_indicator_op()]
+            if _li_zeroaddr_indicator_on() else []
+        ),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
         make_layer16_lev_routing_op(),
