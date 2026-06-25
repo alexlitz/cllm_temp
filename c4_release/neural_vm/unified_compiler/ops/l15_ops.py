@@ -529,6 +529,43 @@ def _l15_li_valrow_b1_on() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _l15_sclc_byte0_on() -> bool:
+    """DEFAULT campaign-ON (``C4_SCLC_LC_B0``): mirror the #318 zero-address
+    committed-store byte-0 boost onto the ``OP_LC`` (load-char) opcode so the
+    SC/LC single-byte store-load roundtrip delivers its byte-0 reload value
+    (``test_sc_lc_roundtrip``: store char 42 @ 0x200, load char -> 42).
+
+    ROOT (GPU bit-exact, spec_k=0, BUILT dims; campaign config, runner block-33
+    head-0 attention-score decomposition tools/probe_lc_byte0.py +
+    probe_b33h0_qcontrib.py):  L15 head-0's ``#318`` keystone slot (row 103)
+    boosts the committed-AND-zero-address store-value row via the
+    ``LI_ZEROADDR_COMMITTED`` indicator K, but its Q opens ONLY on ``OP_LI``
+    (the LI emit-row marker). ``sc_lc`` stores at 0x200, whose byte-0 (0x00) is
+    a ZERO-address byte-0, so the ``#313`` ADDR_B0 CAM -- which DROPS the k=0
+    (zero-nibble) match -- gives NO per-store discrimination, and the genuine
+    SC store-value row (CLEAN=42) TIES the spurious address-IMM step row (the
+    next step's ``IMM 0x200`` byte-0, CLEAN=0). For the ``LI`` path slot 103
+    breaks the tie by +33860 (the OP_LI-gated indicator boost) so the right row
+    wins; for the ``LC`` path slot 103 is dead (Q[OP_LC]=0) -> the two rows tie
+    and the 0.05 ALiBi recency slope picks the WRONG (more-recent address-IMM)
+    row -> byte-0 = 0x00 (``test_sc_lc_roundtrip`` got 0, want 42).
+
+    THE FIX: add ``OP_LC`` to the row-103 Q gate (same +360 weight as ``OP_LI``)
+    so the slot opens on an LC EMIT row too and applies the IDENTICAL committed
+    store-value boost. ``OP_LC`` fires ONLY on LC opcode rows (var/func/SI/LI
+    programs never emit it), so the slot stays inert on every non-LC frame --
+    var_simple / func / si_li are UNTOUCHED (no OP_LC marker anywhere). GPU
+    patch-verified: LC 0x00 -> 42 with LI unchanged (probe_patch_b33.py).
+    Campaign-only via its own kill-switch (golden 35-tok flag-OFF byte-identical
+    -- the row-103 slot is only emitted under ``_l15_li_zeroaddr_cam_on``, which
+    is itself campaign-gated; off the campaign the OP_LC term is never written).
+    """
+    raw = _os_l15.environ.get("C4_SCLC_LC_B0")
+    if raw is not None:
+        return raw != "0"
+    return no_stack0_emit_enabled()
+
+
 # === L15 attention head layout (auto-fit; legacy head_idx as docs) ===
 #
 # L15 attention is the load-side memory pipeline. The block is structurally
@@ -1892,6 +1929,18 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # every LI emit; it is inert on non-LI rows (Q=0) and on every LI
             # whose locals are all nonzero-address (no indicator candidate).
             q_map[(_row, BD.OP_LI)] = _opli_q
+            # sc_lc roundtrip: mirror the committed-zero-address byte-0 boost
+            # onto the OP_LC (load-char) emit row. The SC store @0x200 has a
+            # ZERO-address byte-0 (0x00), so the #313 ADDR CAM (k=0 dropped)
+            # cannot discriminate the genuine SC store-value row from the next
+            # step's address-IMM row -> they TIE and ALiBi recency picks the
+            # wrong (more-recent) row -> LC byte-0 = 0x00. The OP_LI slot above
+            # breaks this exact tie for the LI path (+33860); the OP_LC term
+            # below applies the IDENTICAL boost on the LC path. OP_LC fires ONLY
+            # on LC opcode rows (var/func/SI/LI programs never emit it) so the
+            # slot stays inert on every non-LC frame. See _l15_sclc_byte0_on.
+            if _l15_sclc_byte0_on():
+                q_map[(_row, BD.OP_LC)] = _opli_q
             k_map[(_row, BD.LI_ZEROADDR_COMMITTED)] = _ind_w
 
         # === #318: head-0 byte-0 VALUE-row selector via the SURVIVING MEM_VAL_B0 ===

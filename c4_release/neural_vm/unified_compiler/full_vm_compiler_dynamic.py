@@ -2357,6 +2357,19 @@ def compile_full_vm_dynamic(
             "C4_SILI_B1_RESTORE": (
                 os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
             ),
+            # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
+            # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
+            # ON / OFF builds bake a different W_q row and must never share a
+            # memo entry. See l15_ops._l15_sclc_byte0_on. Default mirrors
+            # C4_NO_STACK0_EMIT; the explicit-override A/B (C4_SCLC_LC_B0=0 with
+            # the campaign on) needs its own key so it doesn't reuse the ON bake.
+            "C4_SCLC_LC_B0": (
+                os.environ.get(
+                    "C4_SCLC_LC_B0",
+                    "1" if os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+                    else "0",
+                ) != "0"
+            ),
             # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in
             # campaign, opt out =0, BAKE-affecting): when active the L13
             # ALUShiftComposite block.ffn is wrapped in ShiftOutputClearFFN,
@@ -2999,6 +3012,17 @@ def _bake_from_scheduled_ops(
         # shared.sili_b1_restore_enabled.
         "C4_SILI_B1_RESTORE": (
             os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
+        ),
+        # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
+        # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF
+        # builds must never share a serialised entry. See
+        # l15_ops._l15_sclc_byte0_on.
+        "C4_SCLC_LC_B0": (
+            os.environ.get(
+                "C4_SCLC_LC_B0",
+                "1" if os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+                else "0",
+            ) != "0"
         ),
         # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in campaign,
         # opt out =0, BAKE-affecting): when active the L13 ALUShiftComposite
