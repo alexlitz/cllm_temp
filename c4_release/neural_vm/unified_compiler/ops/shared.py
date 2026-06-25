@@ -914,6 +914,47 @@ def no_stack0_emit_enabled() -> bool:
     return os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
 
 
+def sili_cam_b1_enabled() -> bool:
+    """Return True iff the si/li LOAD byte-1 address-leak discriminator (Inc-2)
+    is active. DEFAULT campaign-ON (``C4_SILI_CAM_B1=1``), opt out with
+    ``C4_SILI_CAM_B1=0``; gated behind the two campaign flags so the flag-OFF
+    golden (35-tok) build is byte-identical (the slot is never written off the
+    campaign).
+
+    ROOT (measured, faithful real-runner probes tools/probe_sili_scores.py +
+    probe_var_scores.py, GPU bit-exact, campaign config):
+    the LI-reload AX byte-1 is delivered by the shared L10 head-1 slot 82
+    (``memax_byte1``), which selects the most-recent OP_IMM AX byte-1 REGISTER
+    row by ALiBi recency. The slot-82 K-side scores the value-IMM step and the
+    address-IMM step IDENTICALLY (both carry IS_BYTE + H1+AX + BYTE_INDEX_1 +
+    OP_IMM with the same CLEAN signature); the ONLY thing separating them is
+    ALiBi recency (the addr-IMM step is later -> wins by ~60). For
+    ``IMM addr; LI`` (si/li/sc/lc) that later OP_IMM row is the LOAD-ADDRESS
+    IMM (0x200 byte-1 = 0x02) so the reload LEAKS the address byte-1
+    (roundtrip 42->0x22A, 16bit 0x1234->0x0234). For ``return x`` (var_simple,
+    LEA-addressed) there is NO competing IMM-address row, so slot 82 picks the
+    value-IMM (load-bearing; var_simple 25/25).
+
+    THE DISCRIMINATOR (slot 83, Q-side gated -> softmax-safe): the address-IMM
+    register row is the gathered LOAD ADDRESS, so it carries a STRONG
+    ``ADDR_B1`` one-hot (HI/LO cell sums ~3.0) staged by the L13 address-gather
+    chain; the genuine value-IMM register row carries only the weak residual
+    ``ADDR_B1`` (sums ~1.0). Slot 83 fires its Q on the SAME byte-1 predictor
+    row as slot 82 (so it contributes to NO other query -> the byte-0 reload
+    softmax is untouched, NOT the K-side ADDR-veto blind spot), and its K
+    DOWN-weights candidates by their ADDR_B1 magnitude. The penalty is ~3x on
+    the leaky addr-IMM row and ~1x on the value-IMM row, a net margin that
+    out-votes the ~60-point ALiBi recency gap and re-points the byte-1 reload
+    at the value-IMM register (var_simple's winner, sum ~1.0, keeps its huge
+    OP_IMM margin so it is unaffected).
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_SILI_CAM_B1", "1") != "0"
+    )
+
+
 def ffn_lint_mull14_demo_enabled() -> bool:
     """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
 

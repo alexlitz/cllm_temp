@@ -2342,6 +2342,13 @@ def compile_full_vm_dynamic(
             "C4_MUL_L11_SE_RECOVER": (
                 os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
             ),
+            # si/li LOAD byte-1 ADDRESS-leak discriminator (Inc-2, campaign-ON,
+            # opt out =0): adds L10 head-1 slot 83 (an ADDR_B1-magnitude
+            # anti-recency K term on the byte-1 predictor row) so the ON / OFF
+            # builds must never share a memo entry. See shared.sili_cam_b1_enabled.
+            "C4_SILI_CAM_B1": (
+                os.environ.get("C4_SILI_CAM_B1", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2961,6 +2968,12 @@ def _bake_from_scheduled_ops(
         # serialised entry. See shared.mul_l11_se_recover_enabled.
         "C4_MUL_L11_SE_RECOVER": (
             os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
+        ),
+        # si/li LOAD byte-1 ADDRESS-leak discriminator (Inc-2, campaign-ON, opt
+        # out =0): adds L10 head-1 slot 83 so ON / OFF builds must never share a
+        # serialised entry. See shared.sili_cam_b1_enabled.
+        "C4_SILI_CAM_B1": (
+            os.environ.get("C4_SILI_CAM_B1", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

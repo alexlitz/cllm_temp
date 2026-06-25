@@ -639,6 +639,7 @@ from .shared import (
     mul_stack0_byte39_guard_enabled,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
+    sili_cam_b1_enabled,
 )
 
 
@@ -2828,6 +2829,61 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(82, BD.MEM_STORE, -10.0 * MEMAX_B1_SELECT),
         )
 
+    # === STACK0-campaign (Inc-2): si/li LOAD byte-1 ADDRESS-leak discriminator ===
+    # Slot 83 fixes the slot-82 LI-reload byte-1 LEAK for IMM-addressed loads
+    # (si/li/sc/lc). Slot 82 picks the most-recent OP_IMM AX byte-1 register row
+    # by ALiBi recency; the value-IMM and address-IMM rows score IDENTICALLY on
+    # slot 82 (same CLEAN/OP_IMM/H1+AX signature) so recency alone leaks the
+    # later address-IMM (e.g. 0x200 byte-1 = 0x02). The DISCRIMINATOR is that the
+    # address-IMM register row is the gathered LOAD ADDRESS: it carries a STRONG
+    # ``ADDR_B1`` one-hot (HI+LO cell sums ~3.0 each, staged by the L13 gather)
+    # whereas the genuine value-IMM row carries only the weak residual ADDR_B1
+    # (sums ~1.0). Measured: tools/probe_sili_scores.py (addr-IMM ADDR_B1_HI
+    # sum=3.0, value-IMM sum=1.0) + probe_var_scores.py (var990's selected
+    # value-IMM winner sum=1.0, so it is unaffected).
+    #
+    # Slot 83 fires its Q on the SAME byte-1 PREDICTOR row as slot 82 (so it
+    # contributes to NO other query -> the byte-0 reload softmax is untouched;
+    # this is NOT the K-side ADDR-veto blind spot, the K term is only weighted
+    # through slot 83's predictor-only Q) and its K DOWN-weights each candidate
+    # in proportion to its ADDR_B1 magnitude. The penalty is ~3x heavier on the
+    # leaky addr-IMM row than the value-IMM row, a net margin (~12*W*P per
+    # ADDR_B1 cell-sum unit) that out-votes the ~60-point ALiBi recency gap and
+    # re-points the byte-1 reload at the value-IMM register. The value-IMM row's
+    # absolute penalty (~6*W*P) is negligible vs its >50M lead over the
+    # non-OP_IMM rows, so it keeps winning. Own kill-switch ``C4_SILI_CAM_B1``
+    # (default campaign-ON). Byte-identical OFF (slot omitted off the campaign).
+    sili_disc_query = ()
+    sili_disc_key = ()
+    if sili_cam_b1_enabled():
+        SILI_DISC_Q = 20.0 * S       # predictor-row Q gate (mirrors slot 82)
+        SILI_DISC_K = 1.0            # per-cell ADDR_B1 down-weight
+        sili_disc_query = (
+            # Fire ONLY on the LI-reload byte-1 PREDICTOR row (AX byte-0 row);
+            # mirror slot 82's predictor gating so it contributes to no other
+            # query.
+            AP(83, BD.IS_BYTE, SILI_DISC_Q),
+            AP(83, BD.H1 + AX_IDX, SILI_DISC_Q),
+            AP(83, BD.BYTE_INDEX_0, SILI_DISC_Q),
+            AP(83, BD.MARK_AX, -5.0 * SILI_DISC_Q),
+            AP(83, BD.H1 + PC_IDX, -5.0 * SILI_DISC_Q),
+            AP(83, BD.H1 + SP_IDX, -5.0 * SILI_DISC_Q),
+            AP(83, BD.H1 + BP_IDX, -5.0 * SILI_DISC_Q),
+            AP(83, BD.MEM_STORE, -5.0 * SILI_DISC_Q),
+            AP(83, BD.OP_IMM, -5.0 * SILI_DISC_Q),
+            AP(83, BD.BYTE_INDEX_1, -10.0 * SILI_DISC_Q),
+            AP(83, BD.BYTE_INDEX_2, -10.0 * SILI_DISC_Q),
+            AP(83, BD.BYTE_INDEX_3, -10.0 * SILI_DISC_Q),
+        )
+        # K: subtract SILI_DISC_K from the score for every active ADDR_B1 one-hot
+        # cell on the candidate -> the gathered-load-address rows (sum ~3) are
+        # penalized ~3x the value rows (sum ~1).
+        sili_disc_key = tuple(
+            AP(83, BD.ADDR_B1_HI + c, -SILI_DISC_K) for c in range(16)
+        ) + tuple(
+            AP(83, BD.ADDR_B1_LO + c, -SILI_DISC_K) for c in range(16)
+        )
+
     return replace(
         spec,
         q=(
@@ -2844,6 +2900,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             + marker_addr_source_query
             + store_ax_byte1_query
             + memax_byte1_query
+            + sili_disc_query
         ),
         k=spec.k + (
             AP(39, BD.MEM_VAL_B0, VALUE_SELECT),
@@ -2862,7 +2919,7 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
             AP(47, BD.MEM_STORE, STORE_SELECT),
             AP(47, BD.MEM_ADDR_SRC, 1.0),
             AP(48, BD.MEM_ADDR_SRC, 1.0),
-        ) + store_ax_byte1_key + memax_byte1_key,
+        ) + store_ax_byte1_key + memax_byte1_key + sili_disc_key,
     )
 
 
