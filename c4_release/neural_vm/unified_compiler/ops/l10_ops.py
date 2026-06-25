@@ -164,6 +164,98 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     )
 
 
+def _tail_lea_e8_arith_guard_sharp_enabled() -> bool:
+    """SHARP per-step replacement for the ADD/SUB arith-guard NOT-blockers
+    (#325, the var_update LEA-after-store byte-0 staleness root).
+
+    The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; tools/
+    probe_pcframe_tokdump.py + probe_sistore_lea_ar.py on var_update id325
+    ``x=50; x=x+7; return x``): the ``return x`` body's ``LEA -8`` (step 14, the
+    address-of-x) IMMEDIATELY FOLLOWS the ``x = x + 7`` ADD+SI store. Its AX
+    register-dump byte-0 should be the local frame address 0xE8 (0xFFE8), but it
+    comes out as the STALE stored value 0x39 (57) -> full_trace diverges at
+    step 14. NOT a framing/pc desync (the 30-tok frame is intact: every
+    inter-PC gap == 30, PC decodes at every step); it is an AX-VALUE root.
+
+    Root (block-by-block residual scan, ``tools/probe_sistore_lea_axdiverge.py``
+    -> ``probe_opadd.py``): the L25-tail 0xE8 byte-0 writer family
+    (``tail_lea_local_ax_marker_byte0_e8`` + the campaign keystone
+    ``tail_lea_local_ax_byte0_e8_alubp_memsp`` + the amplifier
+    ``tail_lea_local_ax_byte0_amplify_*``, and the l16 sibling
+    ``l16_lea_local_ax_byte0_hi_e``) carries an ``("OP_ADD", -1e9)`` /
+    ``("OP_SUB", -1e9)`` NOT-blocker (the #309 arith-result sentinel guard). On
+    the var_update step-14 LEA AX-marker row the prior ADD's ``OP_ADD`` opcode
+    broadcast PERSISTS at ~+0.0116 (opcode markers are NOT one-hot in-step — the
+    ``op_ent_in_step_broadcast`` corruptor family). ``-1e9 * 0.0116 = -1.16e7``
+    single-handedly VETOES the legitimate 0xE8 writer even though ``OP_LEA`` is a
+    strong +5.23 -> the byte-0 OUTPUT defaults to the stale 0x39 that a competing
+    relay stamps. Confirmed causal: ``C4_TAIL_LEA_E8_ARITH_GUARD=0`` (the
+    blockers removed) flips step-14 byte-0 0x39 -> 0xE8 (got_ax 57 -> 232) AND
+    leaves the genuine ADD result row (step 12) byte-identical (the
+    multiplicative ``OP_LEA`` gate alone keeps it off).
+
+    THE CLEAN DISCRIMINATOR (measured BUILT dims, blocks 40/41): the per-step
+    FETCHED opcode lives in ``OPCODE_BYTE_LO/HI`` as a SHARP one-hot that does
+    NOT persist cross-step. A genuine ADD result row (opcode 25 = 0x19) has
+    ``OPCODE_BYTE_LO+9 == 1.0`` EXACTLY; the LEA-after-ADD row (opcode 0 = 0x00)
+    has ``OPCODE_BYTE_LO+9 == 0.0`` EXACTLY (whereas the legacy ``OP_ADD`` flag
+    leaks +0.0116 there). SUB (opcode 26 = 0x1A) is ``OPCODE_BYTE_LO+10``. So
+    swapping the leaky ``("OP_ADD"/"OP_SUB", -1e9)`` blockers for
+    ``("OPCODE_BYTE_LO+9"/"+10", -1e9)`` keeps the genuine-arith-row protection
+    (full -1e9 veto when the step IS an ADD/SUB) while NEVER vetoing a LEA row
+    that merely FOLLOWS an arith step. Same fix pattern as the l15 head-14 /
+    l16 LEV ``OPCODE_BYTE_LO+8 == LEV`` per-step opcode gate.
+
+    DEFAULT tracks ``_tail_lea_e8_arith_guard_enabled()``: ON in the 30-token
+    campaign config (where the guard itself is active), so the byte-identical
+    paths are preserved -- flag-OFF (``=0``), ``C4_NO_STACK0_EMIT=0``, or the
+    parent guard OFF are all byte-identical to the pre-fix default (and to golden
+    ``4958b35b``: the SHARP variant only differs INSIDE the campaign
+    arith-guard-ON branch, which the 35-token golden never enters). Dedicated
+    kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_TAIL_LEA_E8_ARITH_GUARD_SHARP`` can A/B it inside the campaign config.
+    """
+    forced = os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD_SHARP")
+    if forced is not None:
+        return forced != "0" and _tail_lea_e8_arith_guard_enabled()
+    # Default ON wherever the parent arith guard is active (campaign config).
+    return _tail_lea_e8_arith_guard_enabled()
+
+
+# Per-step ADD/SUB opcode low-nibble one-hots (OPCODE_BYTE_LO offsets). ADD is
+# C4 opcode 25 = 0x19 -> low nibble 0x9; SUB is 26 = 0x1A -> low nibble 0xA(10).
+# Sharp (non-cross-step-persistent) replacements for the leaky OP_ADD / OP_SUB
+# residue flags in the L25-tail 0xE8 byte-0 writer arith guard. See
+# ``_tail_lea_e8_arith_guard_sharp_enabled``.
+_ARITH_GUARD_ADD_OPCODE_LO = "OPCODE_BYTE_LO+9"
+_ARITH_GUARD_SUB_OPCODE_LO = "OPCODE_BYTE_LO+10"
+
+
+def _arith_guard_addsub_blockers() -> tuple:
+    """Return the ADD/SUB NOT-blocker condition pair for the L25-tail 0xE8
+    byte-0 writer family.
+
+    Both forms keep the genuine-arith-result-row protection (the #309 sentinel
+    slam guard). The SHARP form (default, campaign config) keys on the per-step
+    fetched opcode (``OPCODE_BYTE_LO+9`` ADD / ``+10`` SUB) instead of the leaky
+    cross-step ``OP_ADD`` / ``OP_SUB`` broadcast, so a LEA row that merely
+    FOLLOWS an arith step is no longer spuriously vetoed (#325, var_update). The
+    LEGACY form (``C4_TAIL_LEA_E8_ARITH_GUARD_SHARP=0``) is byte-identical to the
+    pre-fix default. Caller must already be inside an
+    ``_tail_lea_e8_arith_guard_enabled()`` branch.
+    """
+    if _tail_lea_e8_arith_guard_sharp_enabled():
+        return (
+            (_ARITH_GUARD_ADD_OPCODE_LO, -1_000_000_000.0),
+            (_ARITH_GUARD_SUB_OPCODE_LO, -1_000_000_000.0),
+        )
+    return (
+        ("OP_ADD", -1_000_000_000.0),
+        ("OP_SUB", -1_000_000_000.0),
+    )
+
+
 def _lea_byte0_memsp_relay_enabled() -> bool:
     """Flag for the PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay
     (ROOT 1, gates func_identity step-6 + var_mul/three multi-local + nested).
@@ -9464,8 +9556,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # Legit LEA byte-0 emit (OP_ADD == OP_SUB == 0) is
                 # byte-identical. See ``_tail_lea_e8_arith_guard_enabled``
                 # (only active in the C4_NO_STACK0_EMIT campaign config).
-                ("OP_ADD", -1_000_000_000.0),
-                ("OP_SUB", -1_000_000_000.0),
+                #
+                # #325 (var_update LEA-after-ADD): the SHARP variant keys these
+                # blockers on the per-step OPCODE_BYTE_LO one-hot instead of the
+                # leaky cross-step OP_ADD/OP_SUB broadcast so a LEA that FOLLOWS
+                # an arith step is no longer spuriously vetoed. See
+                # ``_arith_guard_addsub_blockers`` /
+                # ``_tail_lea_e8_arith_guard_sharp_enabled``.
+                *_arith_guard_addsub_blockers(),
             ) if _tail_lea_e8_arith_guard_enabled() else ()),
             threshold=7.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
@@ -9743,8 +9841,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("OP_LEA", 1.0),
                 ("ALU_HI+15", 0.2),
                 ("OP_IMM", -1_000_000.0),
-                ("OP_ADD", -1_000_000_000.0),
-                ("OP_SUB", -1_000_000_000.0),
+                # #325: SHARP per-step ADD/SUB NOT-blockers (OPCODE_BYTE_LO+9/+10)
+                # replace the leaky cross-step OP_ADD/OP_SUB broadcast so a LEA
+                # that FOLLOWS an arith step is not spuriously vetoed (var_update
+                # step-14). See ``_arith_guard_addsub_blockers``.
+                *_arith_guard_addsub_blockers(),
                 ("OP_DIV", -1_000_000_000.0),
                 ("OP_MOD", -1_000_000_000.0),
                 ("IS_BYTE", -10.0),
@@ -9782,8 +9883,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("FETCH_LO+8", -10.0),
                 ("FETCH_HI+14", -10.0),
                 ("OP_IMM", -1_000_000.0),
-                ("OP_ADD", -1_000_000_000.0),
-                ("OP_SUB", -1_000_000_000.0),
+                # #325: SHARP per-step ADD/SUB NOT-blockers. See
+                # ``_arith_guard_addsub_blockers``.
+                *_arith_guard_addsub_blockers(),
                 ("OP_DIV", -1_000_000_000.0),
                 ("OP_MOD", -1_000_000_000.0),
                 ("IS_BYTE", -10.0),
@@ -9815,8 +9917,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("FETCH_LO+0", -10.0),
                 ("FETCH_HI+15", -10.0),
                 ("OP_IMM", -1_000_000.0),
-                ("OP_ADD", -1_000_000_000.0),
-                ("OP_SUB", -1_000_000_000.0),
+                # #325: SHARP per-step ADD/SUB NOT-blockers. See
+                # ``_arith_guard_addsub_blockers``.
+                *_arith_guard_addsub_blockers(),
                 ("OP_DIV", -1_000_000_000.0),
                 ("OP_MOD", -1_000_000_000.0),
                 ("IS_BYTE", -10.0),
@@ -9866,8 +9969,11 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # the ALU_HI+15 magnitude path supplies the 0xE high nibble.
                 ("OUTPUT_HI_THIS_STEP+0", -1_000.0),
                 ("OP_IMM", -1_000_000.0),
-                ("OP_ADD", -1_000_000_000.0),
-                ("OP_SUB", -1_000_000_000.0),
+                # #325: SHARP per-step ADD/SUB NOT-blockers (OPCODE_BYTE_LO+9/+10)
+                # replace the leaky cross-step OP_ADD/OP_SUB broadcast so a re-read
+                # LEA that FOLLOWS an arith step is not spuriously vetoed. See
+                # ``_arith_guard_addsub_blockers``.
+                *_arith_guard_addsub_blockers(),
                 ("OP_DIV", -1_000_000_000.0),
                 ("OP_MOD", -1_000_000_000.0),
                 ("IS_BYTE", -10.0),

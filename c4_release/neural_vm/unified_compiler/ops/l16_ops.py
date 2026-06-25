@@ -139,6 +139,39 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     )
 
 
+def _arith_guard_addsub_blockers() -> tuple:
+    """SHARP per-step ADD/SUB NOT-blockers for the L16 lea_local 0xE writer
+    arith guard — the l16 sibling of l10's ``_arith_guard_addsub_blockers``
+    (#325, var_update LEA-after-ADD byte-0 staleness).
+
+    The leaky ``("OP_ADD"/"OP_SUB", -1e9)`` blockers (the #309 arith-result
+    sentinel guard) over-veto a LEA that merely FOLLOWS an arith step because the
+    prior ADD's ``OP_ADD`` opcode broadcast PERSISTS (~+0.0116) into the next
+    step (``op_ent_in_step_broadcast``). The SHARP variant keys on the per-step
+    fetched opcode one-hot (ADD = opcode 25 = 0x19 -> ``OPCODE_BYTE_LO+9``; SUB =
+    26 = 0x1A -> ``OPCODE_BYTE_LO+10``), which is 1.0 EXACTLY on a genuine
+    ADD/SUB result row and 0.0 EXACTLY on a LEA row — so genuine-arith-row
+    protection is preserved while the LEA-after-arith over-veto is removed.
+
+    DEFAULT ON wherever the parent arith guard is active (campaign config);
+    ``C4_TAIL_LEA_E8_ARITH_GUARD_SHARP=0`` restores the LEGACY ``OP_ADD/OP_SUB``
+    form (byte-identical to the pre-fix default). Caller must already be inside an
+    ``_tail_lea_e8_arith_guard_enabled()`` branch. Shares the kill-switch with the
+    l10 helper so a single ``--flag C4_TAIL_LEA_E8_ARITH_GUARD_SHARP`` A/Bs both.
+    """
+    forced = os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD_SHARP")
+    sharp = (forced != "0") if forced is not None else True
+    if sharp and _tail_lea_e8_arith_guard_enabled():
+        return (
+            ("OPCODE_BYTE_LO+9", -1_000_000_000.0),
+            ("OPCODE_BYTE_LO+10", -1_000_000_000.0),
+        )
+    return (
+        ("OP_ADD", -1_000_000_000.0),
+        ("OP_SUB", -1_000_000_000.0),
+    )
+
+
 def _lea_local_e8_multilocal_guard_enabled() -> bool:
     """Flag for the multi-local LEA 0xE high-nibble over-fire guard (var_three),
     the L16 sibling of l10's ``tail_lea_local_ax_marker_byte0_e8`` low-byte guard
@@ -2794,8 +2827,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # arith result; absdiff is covered by OP_SUB (its a-b/b-a body).
             # Legit LEA local-address firing (OP_ADD == OP_SUB == 0) is
             # byte-identical. See ``_tail_lea_e8_arith_guard_enabled``.
-            ("OP_ADD", -1_000_000_000.0),
-            ("OP_SUB", -1_000_000_000.0),
+            #
+            # #325: the SHARP variant keys on the per-step OPCODE_BYTE_LO one-hot
+            # (not the leaky cross-step OP_ADD/OP_SUB broadcast) so a LEA that
+            # FOLLOWS an arith step is not spuriously vetoed (var_update step-14).
+            # See ``_arith_guard_addsub_blockers``.
+            *_arith_guard_addsub_blockers(),
         ) if _tail_lea_e8_arith_guard_enabled() else ()) + ((
             # Multi-local LEA 0xE high-nibble over-fire guard (var_three, #310):
             # the 3rd local (&c = BP-24 = 0xffd8, high nibble 0xD) carries the
