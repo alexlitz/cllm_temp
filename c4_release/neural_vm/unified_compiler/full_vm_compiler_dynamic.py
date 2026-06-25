@@ -3071,6 +3071,17 @@ def _bake_from_scheduled_ops(
         "C4_SHIFT_OUTPUT_B0_CLEAR": (
             os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
         ),
+        # Multilocal-ENT AX byte-0 source fix (DEFAULT-ON in campaign, opt out
+        # =0, BAKE-affecting): when active ``make_l10_ent_axcarry_op`` appends a
+        # PureFFN post_op to the L25 tail block that re-asserts the carried AX
+        # over the leaked-LEA materializer on the multilocal main-ENT step, so
+        # the ON / OFF builds STRUCTURALLY differ (extra post_op / FFN units)
+        # and must never share a serialised entry. See
+        # l10_ops._l10_ent_axcarry_enabled.
+        "C4_L10_ENT_AXCARRY": (
+            os.environ.get("C4_L10_ENT_AXCARRY", "1") != "0"
+            and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+        ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
         # baseline (or with a different requested band set).

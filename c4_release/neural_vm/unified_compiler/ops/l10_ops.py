@@ -10562,6 +10562,222 @@ _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS = (
 )
 
 
+def _l10_ent_axcarry_enabled() -> bool:
+    """Flag for the multilocal-ENT AX byte-0 (ENT-immediate leak) source fix.
+
+    DEFAULT-ON in the campaign config (``C4_NO_STACK0_EMIT=1``); opt-out via
+    ``C4_L10_ENT_AXCARRY=0``. Flag-off OR non-campaign build is bit-for-bit
+    golden (``f2b040aa``) — the op then registers ZERO rules and appends NO
+    post_op.
+
+    ROOT (teacher-forced + AR spec_k=0, BUILT dims, campaign config; probes
+    ``tools/_probe_loopent_tf.py`` / ``_probe_loopent_block.py`` /
+    ``_probe_loopent_disc.py``): on the ``loop_sum`` / ``loop_mul`` /
+    ``loop_pow2`` **multilocal** main-ENT step (frame size 16, i.e. >= 2
+    locals) the opcode decode at the AX marker resolves NO clean ENT
+    (``OP_ENT == 0``, where var_simple's 1-local ENT-8 cleanly decodes
+    ``OP_ENT == 5``) but ``OP_LEA`` LEAKS to ~0.81. That leaked OP_LEA TRIGGERS
+    the same L10 LEA effective-address high-nibble materializer that the
+    post-LEV ``_l10_exit_axcarry`` fix targets (gated on OP_LEA, reads
+    ``FETCH_HI`` -> writes ``OUTPUT_HI``). The ENT frame-size immediate's high
+    nibble (16 -> ``FETCH_HI+1``) is stamped into ``OUTPUT_HI+1`` -> AX byte-0
+    emits ``0x10`` (= the ENT immediate) instead of the carried prior AX
+    (``AX_CARRY``, byte-0 = 0x00 here, the value ENT must preserve). var_simple
+    (ENT-8) passes because its imm high nibble is 0, so the same materializer
+    write lands on the (already-zero) ``OUTPUT_HI+0`` — invisible. The leak is
+    therefore only visible at frame size >= 16 (>= 2 locals): the
+    loop_sum/loop_mul/loop_pow2 cluster (~75 programs).
+
+    WHY ``_l10_exit_axcarry`` does NOT already cover it: that op REQUIRES
+    ``OP_LEA >= ~0.83`` (``MARK_AX*100 + OP_LEA*60 >= 150``) and HARD-blocks
+    ``OP_JSR`` (-500). The multilocal-ENT leak row has ``OP_LEA == 0.81``
+    (just under) AND ``OP_JSR == 1.19`` (a JSR residue, since the main ENT
+    follows the bootstrap JSR), so the EXIT op's OP_JSR block vetoes it. This
+    sibling lowers the OP_LEA bar (threshold 145) and drops the OP_JSR block
+    (a clean JSR step has ``OP_LEA == 0`` so it never satisfies the required
+    OP_LEA term regardless), while keeping the SAME proven exclusions: the
+    hard ``MEM_ADDR_SRC`` NOT-block (a GENUINE LEA address-eval row carries it;
+    the spurious leak does not) and the hard non-AX-marker blocks. On a clean
+    ENT step (``OP_LEA == 0``) the score is 100 < 145 -> no fire (byte-
+    identical), so this never disturbs the var_simple / nested-callee ENT path
+    where ``ent_ax_passthrough`` already delivers the carried AX correctly.
+
+    FIX: mirror ``_l10_exit_axcarry_rules`` — a flag-gated ``PureFFN`` post_op
+    on the L25 tail block (after ``tail_bit32_result_correction``) that routes
+    ``AX_CARRY_{LO,HI}[k] -> OUTPUT_{LO,HI}[k]`` at a magnitude (DOM=0.02) that
+    dominates the ~9.6 materializer write, re-asserting the carried prior AX.
+    A genuine LEA AX row (``OP_LEA == 5.2``) is excluded by the MEM_ADDR_SRC
+    block; even were it reached, its keystone 0xE8 materializer writes at
+    ~4.4e9 so DOM=0.02 cannot perturb it.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    if os.environ.get("C4_L10_ENT_AXCARRY", "1") == "0":
+        return False
+    return no_stack0_emit_enabled()
+
+
+def _l10_ent_axcarry_rules() -> tuple[FFNRule, ...]:
+    """Route AX_CARRY -> OUTPUT on the multilocal-ENT leaked-LEA AX row.
+
+    Sibling of :func:`_l10_exit_axcarry_rules` (see
+    :func:`_l10_ent_axcarry_enabled` for the full root). 32 units (16 LO + 16
+    HI). Each fires iff:
+
+      * ``MARK_AX`` (the AX marker row) is present, AND
+      * ``OP_LEA`` is LEAKED (~0.81 on the multilocal-ENT row; EXACTLY 0.00 on
+        every clean ENT / non-LEA AX row, so it is the required discriminator),
+        AND
+      * NO clean OUTPUT-owning opcode is live (IMM/ADD/SUB/bitwise/cmp/MUL/DIV/
+        MOD/SHL/SHR/JMP/BZ/BNZ -- each a moderate -OPC_BLOCK NOT-block), AND
+      * ``MEM_ADDR_SRC`` is cold (a GENUINE LEA address-eval row carries it; the
+        spurious ENT leak does not) -- hard NOT-block, AND
+      * we are not on any non-AX marker row (PC/SP/BP/STACK0/MEM -1e6).
+
+    Threshold 145 (vs the EXIT sibling's 150) so the slightly weaker ENT-step
+    OP_LEA leak (~0.81 -> ~149 score) fires while a clean ENT (OP_LEA 0 -> 100)
+    does not. ``OP_JSR`` is intentionally NOT a NOT-block here: the post-JSR
+    main ENT carries a ~1.19 OP_JSR residue, and a clean JSR step never
+    satisfies the required OP_LEA term anyway.
+    """
+    DOM = 0.02
+    OPC_BLOCK = 500.0
+    # Same OUTPUT-owning opcode set as the EXIT sibling MINUS OP_JSR (the
+    # multilocal-ENT leak row carries a JSR residue; OP_LEA already gates out
+    # a clean JSR).
+    owning_ops = tuple(
+        op for op in _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS if op != "OP_JSR"
+    )
+    rules: list[FFNRule] = []
+    for nibble_label, carry_dim, out_dim in (
+        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            conditions: list[tuple[str, float]] = [
+                ("MARK_AX", 100.0),
+                # Leaked-OP_LEA discriminator: the ENT leak is ~0.81 and is
+                # EXACTLY 0.00 on every clean ENT / non-LEA AX row, so weight
+                # 60 (-> ~49) makes it the load-bearing required term.
+                ("OP_LEA", 60.0),
+                *((op, -OPC_BLOCK) for op in owning_ops),
+                # Genuine LEA address-eval rows carry MEM_ADDR_SRC; the spurious
+                # ENT leak does not. Clean one-hot -> hard NOT-block.
+                ("MEM_ADDR_SRC", -1_000_000.0),
+                ("MARK_PC", -1_000_000.0),
+                ("MARK_SP", -1_000_000.0),
+                ("MARK_BP", -1_000_000.0),
+                ("MARK_STACK0", -1_000_000.0),
+                ("MARK_MEM", -1_000_000.0),
+            ]
+            writes: list[tuple[str, float]] = []
+            for j in range(16):
+                writes.append((f"{out_dim}+{j}", (DOM if j == k else -DOM)))
+            rules.append(multi_way_and_rule(
+                name=f"l10_ent_axcarry_{nibble_label}_{k}",
+                conditions=tuple(conditions),
+                threshold=145.0,
+                gate=f"{carry_dim}+{k}",
+                gate_weight=1.0,
+                writes=tuple(writes),
+            ))
+    return tuple(rules)
+
+
+def make_l10_ent_axcarry_op() -> Operation:
+    """Flag-gated L10 multilocal-ENT AX_CARRY -> OUTPUT override op.
+
+    Standalone ``PureFFN`` post_op attached to the L25 tail block AFTER
+    ``tail_bit32_result_correction`` (mirrors ``make_l10_exit_axcarry_op``).
+    Flag-off (or non-campaign) produces ZERO rules and appends NO post_op ->
+    byte-identical to golden ``f2b040aa``. Flag-ON (campaign default) keeps the
+    ENT frame-size immediate out of the AX byte-0 dump on the multilocal ENT
+    step (loop_sum/loop_mul/loop_pow2). See ``_l10_ent_axcarry_enabled`` /
+    ``_l10_ent_axcarry_rules``.
+    """
+    if not _l10_ent_axcarry_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_ent_axcarry",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#function-call",
+        )
+
+    rules = _l10_ent_axcarry_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        _suppress_ffn_on_step_boundary(ffn, dim_map, S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_ent_axcarry",
+        reads={
+            "MARK_AX", "OP_LEA", "MEM_ADDR_SRC",
+            "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
+            "AX_CARRY_LO", "AX_CARRY_HI",
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+            *(op for op in _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS if op != "OP_JSR"),
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        # Run AFTER tail_bit32_result_correction (the OUTPUT producer it
+        # overrides) AND after the EXIT sibling so the two overrides compose
+        # deterministically (they target disjoint rows — EXIT requires
+        # OP_LEA>=0.83+OP_JSR-clean, ENT fires on the OP_LEA~0.81/OP_JSR-residue
+        # row — but a fixed order keeps the bake reproducible).
+        requires={"after": "l10_exit_axcarry"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#function-call",
+    )
+
+
 def _l10_exit_axcarry_rules() -> tuple[FFNRule, ...]:
     """Route AX_CARRY -> OUTPUT on the EXIT/no-clean-opcode AX row (32 units).
 

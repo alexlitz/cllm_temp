@@ -658,6 +658,17 @@ def all_core_ops(
         # test_simple_function under the 6 LEV flags. Flag-off => no rules, no
         # post_op (byte-identical to HEAD).
         make_l10_exit_axcarry_op(),
+        # L10 multilocal-ENT AX byte-0 source fix (flag C4_L10_ENT_AXCARRY,
+        # default ON in the campaign config): a post_op attached AFTER
+        # l10_exit_axcarry that, on the multilocal main-ENT step (MARK_AX +
+        # LEAKED OP_LEA ~0.81 + no OUTPUT-owning opcode + no MEM_ADDR_SRC),
+        # routes the carried prior AX (AX_CARRY) into OUTPUT, out-voting the
+        # spurious LEA effective-address materializer that otherwise stamps the
+        # ENT frame-size immediate's high nibble (16 -> AX byte-0 = 0x10).
+        # Fixes loop_sum step-1 / loop_mul/loop_pow2 step-0 (~75 programs).
+        # Flag-off / non-campaign => no rules, no post_op (byte-identical to
+        # golden f2b040aa).
+        make_l10_ent_axcarry_op(),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =
         # a1 + b1 + carry at the ADD byte-1 row, completing the multi-byte
