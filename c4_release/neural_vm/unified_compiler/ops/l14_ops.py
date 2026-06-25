@@ -15,6 +15,7 @@ from .shared import (
     ffn_lint_mull14_demo_enabled,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
+    sub_full_borrow_enabled,
 )
 from ..positional_invariant import marker_bank_index
 from .residual_band_registry import register_residual_band
@@ -58,6 +59,20 @@ register_residual_band(
     "LI_ZEROADDR_COMMITTED", 1,
     owner="make_layer14_li_zeroaddr_indicator_op",
     flag=_li_zeroaddr_indicator_on, never_share=True,
+)
+
+
+# Fresh over-width residual band carrying the SUB full-borrow (minuend byte1==0
+# AND borrow-in) indicator. ``never_share=True`` keeps it in a private slot: it
+# is a bounded 0/1 flag written at an EARLY L14 block (where STACK0_BYTE_VAL_1
+# is still fresh) and read MUCH later by the L25-tail 0xFF writer, so it must
+# survive every intervening block at the SUB byte-1 emit row. Flag-gated on the
+# campaign config so a golden (flag-OFF) build omits it entirely (smaller
+# d_model, byte-identical). Sized 1 (a single indicator scalar).
+register_residual_band(
+    "SUB_FULL_BORROW", 1,
+    owner="make_layer14_sub_full_borrow_flag_op",
+    flag=sub_full_borrow_enabled, never_share=True,
 )
 
 
@@ -245,6 +260,16 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # pre-claims every (deterministic, fixed-size) preceding layout slot and
     # lands at the first free gap. See ``make_layer14_li_zeroaddr_indicator_op``.
     "layer14_li_zeroaddr_indicator":         (None,    1),
+    # SUB full-borrow (minuend byte1==0 AND borrow) flag precursor
+    # (CAMPAIGN-ONLY, C4_SUB_FULL_BORROW). ONE FFN unit writing the private
+    # ``SUB_FULL_BORROW`` band on the SUB byte-1 emit row. A chain TAIL entry so
+    # it can never shift a real op's start_unit: flag-OFF the op is not
+    # registered and ``_l14_chain_alloc`` never claims its slot (golden
+    # byte-identical). Runs at the EARLY L14 block where STACK0_BYTE_VAL_1 is
+    # still fresh (the band is cleared by the block-32 L18 slam), so the
+    # empty-band underflow detector reads a live operand. See
+    # ``make_layer14_sub_full_borrow_flag_op``.
+    "layer14_sub_full_borrow_flag":          (None,    1),
 }
 
 
@@ -3558,6 +3583,298 @@ def make_layer14_sub_noborrow_high_byte_passthrough_op() -> Operation:
         target_op_name="layer14_mem_generation",
         migrated=True,
         requires={"after": "layer14_mem_generation"},
+        spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+    )
+
+
+# === L14 SUB full-borrow (minuend byte1 == 0) multi-byte 0xFF completion ===
+# (CAMPAIGN-ONLY, gated on ``sub_full_borrow_enabled``.) Closes the
+# ``sub_borrow_cascade`` (``0 - 1 = 0xFFFFFFFF``) wall the per-byte cascade
+# rules cannot reach in the 30-token campaign frame.
+#
+# See ``shared.sub_full_borrow_enabled`` for the full three-layer root. The
+# discriminator (minuend byte1 == 0 WITH a byte-0 borrow) exists ONLY at the
+# SUB byte-1 emit row (``TEMP+9`` + ``BYTE_INDEX_0`` + ``H1[AX]`` + ``CARRY+2``)
+# and ONLY as the ABSENCE of a STACK0_BYTE_VAL_1 one-hot (the L8 mem[SP] CAM
+# delivers only a NON-zero nibble; the v==0 band is empty). The
+# STACK0_BYTE_VAL_1 band is CLEARED by block ~32, so the detector must run at an
+# EARLY L14 block (where it is fresh) and write a persistent flag; the 0xFF
+# writer (the L25-tail op below) reads that flag AFTER the block-32 (L18) slam.
+
+_SUB_FULL_BORROW_FLAG_HIDDEN_DIM = 1  # single empty-band AND unit
+
+
+def _layer14_sub_full_borrow_flag_rules(S: float = 100.0) -> tuple[FFNRule, ...]:
+    """One FFNRule: ``SUB_FULL_BORROW = 1`` on the SUB byte-1 full-underflow row.
+
+    Fires at the SUB byte-1 emit row (``TEMP+9`` SUB byte selector + ``IS_BYTE``
+    + ``H1[AX]`` + ``BYTE_INDEX_0``) when there IS a byte-0 borrow (``CARRY+2``
+    == 2.0) AND the minuend byte 1 == 0 (so the SUB byte-1 result is the 0xFF
+    full-underflow, NOT ``minuend_byte1 - 1``).
+
+    The L8 mem[SP] CAM encodes the minuend byte-1 nibble ``v`` as a SIGNED
+    one-hot: ``+6`` at cell ``v`` and ``-6`` at cell 0 (spec_k=0, BUILT dims,
+    campaign, block 18, SUB byte-1 row):
+      * full underflow (``0-1``,    v=0): every cell ~0
+      * non-zero byte1 (``0x100-1``, v=1): cell0 = -6, cell1 = +6
+      * non-zero byte1 (``0x200-1``, v=2): cell0 = -6, cell2 = +6
+    so a RAW SUM over all cells is ~0 for BOTH v=0 and v>=1 (the +6/-6 cancel).
+    The clean discriminator is "no POSITIVE cell in 1..15": for v>=1 a +6 sits
+    at cell ``v in 1..15``; for v=0 there is none (and the -6 lives at cell 0).
+    So the empty-band veto weights cells 1..15 only (NOT cell 0), with enough
+    magnitude that a single +6 sinks the silu below threshold.
+
+    Discriminator outcome:
+      * full underflow (``0-1``):     CARRY+2 = 2.0, no +6 in 1..15 -> FIRES
+      * non-zero byte1 (``0x100/200-1``): +6 at cell v in 1..15      -> blocked
+      * no borrow (``50-8``):         CARRY+2 = 0.0                  -> blocked
+    """
+    del S
+    SV1_BLOCK = -2.0  # per-cell (1..15) blocker: a +6 nibble -> -12 (veto)
+    conditions: list[tuple[str, float]] = [
+        ("IS_BYTE", 1.0),
+        ("H1+1", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+        # byte-0 borrow-out rides CARRY+2 (=2.0) at the byte-1 row.
+        ("CARRY+2", 0.5),
+    ]
+    # Empty-band detector: any lit STACK0_BYTE_VAL_1 nibble v>=1 (+6) vetoes the
+    # flag. Cell 0 is EXCLUDED (it carries the -6 sign marker on EVERY v>=1, and
+    # is 0 on the v=0 underflow -- including it would not discriminate).
+    for k in range(1, 16):
+        conditions.append((f"STACK0_BYTE_VAL_1_LO+{k}", SV1_BLOCK))
+        conditions.append((f"STACK0_BYTE_VAL_1_HI+{k}", SV1_BLOCK))
+    return (
+        multi_way_and_rule(
+            name="l14_sub_full_borrow_flag",
+            conditions=tuple(conditions),
+            # full underflow: 1+1+1+1 = 4.0 >= 3.5 (fires); a lit SV1 cell (+6)
+            # subtracts 12 (dark); no-borrow loses the CARRY+2 term -> 3.0
+            # < 3.5 (dark). TEMP+9 gates so it never fires off the SUB byte row.
+            threshold=3.5,
+            gate="TEMP+9",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("SUB_FULL_BORROW", 1.0),),
+            scope=(
+                "TEMP+9 and IS_BYTE and H1+1 and BYTE_INDEX_0 and CARRY+2 "
+                "and not STACK0_BYTE_VAL_1"
+            ),
+        ),
+    )
+
+
+def _make_standalone_pure_ffn_post_op_bake(rules):
+    """Return a ``bake(block, dim_positions, S)`` that appends a standalone
+    ``PureFFN`` post_op lowering ``rules`` with a dim_map resolved entirely from
+    the declarative ``dim_positions`` layout. Mirrors the L25-tail / flag-
+    precursor bakes (``make_ax_byte23_dump_zero_op`` etc.)."""
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    return bake
+
+
+def _layer14_sub_full_borrow_flag_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_sub_full_borrow_flag_rules(S))
+    return ir
+
+
+def make_layer14_sub_full_borrow_flag_op() -> Operation:
+    """Precursor FFN (L14 cleanup chain tail): writes the bounded
+    ``SUB_FULL_BORROW`` flag (CAMPAIGN-ONLY, ``C4_SUB_FULL_BORROW``).
+
+    Bakes ONE FFN unit INTO the L14 mem-generation block FFN (via
+    ``_l14_chain_alloc``) — the EARLY block where ``STACK0_BYTE_VAL_1`` is still
+    fresh (it is cleared by the block-32 L18 slam). The single rule fires on the
+    SUB byte-1 full-underflow row and writes the private ``SUB_FULL_BORROW``
+    band; the L25-tail 0xFF writer (``make_sub_full_borrow_byte1_ff_op``) reads
+    the persisted flag AFTER the slam.
+
+    Mirrors ``make_layer14_li_zeroaddr_indicator_op`` (the other campaign-gated
+    chain-tail flag op): a TAIL entry in ``_L14_CLEANUP_CHAIN_LAYOUT`` so growing
+    it can never shift a real op's start_unit; flag-OFF the op is not registered
+    and ``_l14_chain_alloc`` never claims its slot -> golden byte-identical (the
+    band is also flag-gated, so it is omitted from the layout entirely).
+    """
+    enabled = sub_full_borrow_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        ffn = getattr(block, "ffn", None)
+        if ffn is None or not hasattr(ffn, "W_up"):
+            return
+        start_unit = _l14_chain_alloc("layer14_sub_full_borrow_flag")
+        ir = _layer14_sub_full_borrow_flag_ir(S)
+        rules = ir.layer(0).ffn.rules
+        assert len(rules) == _SUB_FULL_BORROW_FLAG_HIDDEN_DIM, (
+            f"sub_full_borrow_flag rule-count drift: {len(rules)} "
+            f"!= {_SUB_FULL_BORROW_FLAG_HIDDEN_DIM} (the chain layout reserves "
+            f"{_SUB_FULL_BORROW_FLAG_HIDDEN_DIM} unit)"
+        )
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_sub_full_borrow_flag",
+        slot_share=("ffn_units",),
+        reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_0", "CARRY",
+               "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"}
+        if enabled else set(),
+        writes={"SUB_FULL_BORROW"} if enabled else set(),
+        kind="block",
+        target_op_name="layer14_mem_generation",
+        # Order after the li_zeroaddr indicator (the prior chain-tail flag op) so
+        # the chain alloc pre-claims its deterministic slot, and after
+        # mem_generation (the L14 attn op this block targets).
+        requires={"after": [
+            "layer14_li_zeroaddr_indicator",
+            "layer14_mem_generation",
+        ]} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=_layer14_sub_full_borrow_flag_ir(),
+        declarative_authority="spec_generated",
+        migrated=True,
+        # Chain tail (after li_zeroaddr's unit 1925): this single-unit op lands
+        # at unit 1926 in the campaign config, so the block must be sized to 1927
+        # (a half-open [0,1927) pool). Only reserved when the flag is on; OFF =>
+        # not registered, so li_zeroaddr's 1926 governs (golden byte-identical).
+        ffn_units_used=1927 if enabled else 0,
+        spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+    )
+
+
+# --- The L25-tail 0xFF writer (reads the persisted SUB_FULL_BORROW flag) ----
+# Runs AFTER ``tail_bit32_result_correction`` (the last OUTPUT writer before the
+# LM head), so it DOMINATES the block-32 (L18) OUTPUT_HI slam additively. On the
+# flag row it overwrites OUTPUT byte 1 = 0xFF: cancel the slam's OUTPUT_HI cell-0
+# (the 0x00 hi default ~+664) and OUTPUT_LO cell-0, and boost OUTPUT_LO/HI cell
+# 15 so both nibbles decode 0xF.
+
+_SUB_FULL_BORROW_FF_HIDDEN_DIM = 1
+
+
+def _sub_full_borrow_byte1_ff_rules() -> tuple[FFNRule, ...]:
+    """One FFNRule: overwrite OUTPUT byte 1 = 0xFF on the persisted flag row.
+
+    Fires where ``SUB_FULL_BORROW`` (written by the L14 precursor, persisted at
+    the SUB byte-1 emit row) is lit. The write magnitudes must DOMINATE the
+    block-32 (L18) slam, which left OUTPUT_HI cell-0 ~+664 and every other HI
+    cell ~-434, OUTPUT_LO cells ~-348..-362. To flip the argmax of both nibbles
+    to cell 15 we cancel the cell-0 hi peak and boost cell 15 in both bands.
+
+    The balanced silu saturates to ~``S * (SUB_FULL_BORROW*FLAG_W - thr)`` on a
+    fire (flag ~1.0). With ``FLAG_W = 6.0`` / ``thr = 4.5`` the silu output is
+    ~``S*1.5 = 150``; the write weights below scale that to OUTPUT deltas of
+    ~+1500 (cell 15) / ~-1500 (cell 0), decisively beating the ~+664/-434 slam.
+    """
+    FLAG_W = 6.0
+    THRESHOLD = 4.5
+    # OUTPUT delta ~= silu(~150) * WW. WW=10 -> ~+1500 / -1500.
+    WW = 10.0
+    writes = (
+        # Low nibble -> 0xF: cancel cell 0, boost cell 15.
+        ("OUTPUT_LO+0", -WW),
+        ("OUTPUT_LO+15", WW),
+        # High nibble -> 0xF: cancel the slam's cell-0 peak, boost cell 15.
+        ("OUTPUT_HI+0", -WW),
+        ("OUTPUT_HI+15", WW),
+    )
+    return (
+        multi_way_and_rule(
+            name="sub_full_borrow_byte1_ff",
+            conditions=(("SUB_FULL_BORROW", FLAG_W),),
+            threshold=THRESHOLD,
+            writes=writes,
+            scope="SUB_FULL_BORROW",
+        ),
+    )
+
+
+def make_sub_full_borrow_byte1_ff_op() -> Operation:
+    """L25-tail FFN: overwrite OUTPUT byte 1 = 0xFF on the SUB full-borrow row.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block, appended AFTER
+    ``tail_bit32_result_correction`` so it is the LAST OUTPUT writer before the
+    LM head and therefore beats the block-32 (L18) slam (which runs earlier).
+    Reads the persisted ``SUB_FULL_BORROW`` flag. CAMPAIGN-ONLY: a no-op when
+    ``sub_full_borrow_enabled`` is False (golden byte-identical).
+    """
+    if not sub_full_borrow_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="sub_full_borrow_byte1_ff",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "tail_bit32_result_correction"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+        )
+
+    rules = _sub_full_borrow_byte1_ff_rules()
+    assert len(rules) == _SUB_FULL_BORROW_FF_HIDDEN_DIM, (
+        f"sub_full_borrow_byte1_ff rule-count drift: {len(rules)} "
+        f"!= {_SUB_FULL_BORROW_FF_HIDDEN_DIM}"
+    )
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+    return Operation(
+        name="sub_full_borrow_byte1_ff",
+        reads={"SUB_FULL_BORROW"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=_make_standalone_pure_ffn_post_op_bake(rules),
+        compiler_ir=ir,
+        declarative_authority="spec_generated",
+        migrated=True,
+        smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#multibyte-arithmetic",
     )
 

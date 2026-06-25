@@ -36,6 +36,7 @@ from .user_input_ops import (  # noqa: F401
 )
 from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
 from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
+from .shared import sub_full_borrow_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -578,6 +579,19 @@ def all_core_ops(
         # borrow-out) is absent. Byte-identical on 8-bit SUB; fixes the
         # ~38 no-borrow 1096 ``sub`` cases (e.g. ``827 - 26``).
         make_layer14_sub_noborrow_high_byte_passthrough_op(),
+        # SUB full-borrow (minuend byte1==0) flag precursor (CAMPAIGN-ONLY,
+        # C4_SUB_FULL_BORROW): writes the bounded SUB_FULL_BORROW flag on the
+        # SUB byte-1 emit row when the STACK0_BYTE_VAL_1 band is EMPTY (the
+        # 0-1=0xFFFFFFFF full-underflow case the cascade/passthrough rules can't
+        # key on -- there's no minuend-byte1 one-hot to match). Runs at this
+        # EARLY L14 block where STACK0_BYTE_VAL_1 is still fresh (it is cleared
+        # by the block-32 L18 slam). Golden byte-identical (band+op omitted
+        # flag-OFF: registered ONLY when sub_full_borrow_enabled, like the
+        # li_zeroaddr indicator below). See l14_ops.make_layer14_sub_full_borrow_flag_op.
+        *(
+            [make_layer14_sub_full_borrow_flag_op()]
+            if sub_full_borrow_enabled() else []
+        ),
         # Phase 6 Wave 7 demo: pure-declaration corrective op. One
         # ``FFNRule`` + ``pin=None`` auto-fit + slim ``bake_fn`` wrapper.
         # Byte-identically a no-op on the live corpus -- the demo proves
@@ -668,6 +682,18 @@ def all_core_ops(
         # Gated by C4_AX_BYTE23_DUMP (default ON). See
         # l11_ops.make_ax_byte23_dump_zero_op.
         make_ax_byte23_dump_zero_op(),
+        # SUB full-borrow byte-1 0xFF writer (CAMPAIGN-ONLY, C4_SUB_FULL_BORROW):
+        # the POST-SLAM half of the sub_borrow_cascade fix. On the row where the
+        # L14 precursor lit SUB_FULL_BORROW, overwrites OUTPUT byte 1 = 0xFF.
+        # Appended AFTER tail_bit32_result_correction so it is the LAST OUTPUT
+        # writer before the LM head and DOMINATES the block-32 (L18) OUTPUT_HI
+        # slam (which adds +664 to the 0x00 hi default). Golden byte-identical
+        # (registered ONLY when sub_full_borrow_enabled; reads the flag band that
+        # is itself flag-gated). See l14_ops.make_sub_full_borrow_byte1_ff_op.
+        *(
+            [make_sub_full_borrow_byte1_ff_op()]
+            if sub_full_borrow_enabled() else []
+        ),
         # STACK0 byte-0 carried-step flag precursor (Root 2): writes the BOUNDED
         # ``STACK0_B0_CARRIED`` gate flag at an EARLY block (L7 anchor) where the
         # same-step H3 byte-0 one-hot is still bounded (fresh ~3.3 present,

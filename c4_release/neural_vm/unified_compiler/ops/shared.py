@@ -323,6 +323,54 @@ def mul_l11_se_recover_enabled() -> bool:
     return os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
 
 
+def sub_full_borrow_enabled() -> bool:
+    """Return True iff the SUB full-borrow multi-byte 0xFF completion is active
+    (DEFAULT ON in the campaign config — opt-out via ``C4_SUB_FULL_BORROW=0``;
+    only takes effect when the operand is sourced from ``mem[SP]``, i.e. the
+    campaign ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` config).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config):
+    ``sub_borrow_cascade`` (``0 - 1`` should = ``0xFFFFFFFF``) emits only
+    ``0x000000FF`` — byte 0 (0xFF) is correct, but bytes 1-3 stay 0x00. It is a
+    three-layer wall the per-byte cascade rules cannot reach in the 30-token
+    campaign frame:
+
+      1. The minuend byte 1 == 0x00 has NO ``STACK0_BYTE_VAL_1`` one-hot in the
+         campaign (the L8 mem[SP] CAM delivers only the NON-zero nibble: ``+6``
+         at cell ``v``, nothing for ``v == 0``). So the band is EMPTY and the
+         ``_layer14_sub_borrow_high_byte_passthrough`` ``v==0`` rule — keyed on
+         ``STACK0_BYTE_VAL_1_LO+0`` being lit — never fires.
+      2. The byte-1 result is 0xFF = lo nibble 0xF AND hi nibble 0xF; the v>=1
+         cascade rules only set OUTPUT_LO (assuming the hi nibble is 0).
+      3. The block-32 (L18) OUTPUT_HI slam adds ``+664`` to OUTPUT_HI cell 0
+         (the 0x00 hi default) and ``-434`` elsewhere — additively crushing any
+         pre-slam OUTPUT_HI cell-15 write, so the high nibble can never win
+         pre-slam.
+
+    The fix is a two-part build, both campaign-gated:
+      * a PRECURSOR FFN at an EARLY L14 block (where the STACK0_BYTE_VAL_1 band
+        is still fresh) writes the bounded ``SUB_FULL_BORROW`` flag on the SUB
+        byte-1 emit row (``TEMP+9`` + ``IS_BYTE`` + ``H1+1`` + ``BYTE_INDEX_0``
+        + ``CARRY+2`` borrow) ONLY when the STACK0_BYTE_VAL_1 band is EMPTY (the
+        minuend byte 1 == 0 full-underflow case);
+      * a POST-SLAM writer on the L25 tail block (after
+        ``tail_bit32_result_correction``, the last OUTPUT writer before the LM
+        head) reads the persisted flag and overwrites OUTPUT byte 1 = 0xFF
+        (cancel OUTPUT_HI cell-0, boost OUTPUT_LO/HI cell 15), which DOMINATES
+        the slam because it runs after it.
+
+    DEFAULT ON. Opt-out via ``C4_SUB_FULL_BORROW=0`` restores the byte-identical
+    pre-fix path (flag-OFF or ``C4_OPERAND_FROM_MEMSP=0`` are both byte-identical
+    to golden ``7f6f2e5d``: the band is flag-gated so a flag-off build omits it
+    entirely → smaller d_model). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_SUB_FULL_BORROW`` can A/B it inside
+    the campaign config.
+    """
+    if not operand_from_memsp_enabled():
+        return False
+    return os.environ.get("C4_SUB_FULL_BORROW", "1") != "0"
+
+
 def cmp_byte0_se_recover_enabled() -> bool:
     """Return True iff the COMPARISON operand-A byte-0 SE_ALU recovery is active
     (DEFAULT ON in the campaign config — opt-out via
