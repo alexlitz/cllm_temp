@@ -256,6 +256,94 @@ def _arith_guard_addsub_blockers() -> tuple:
     )
 
 
+def _ax_byte1_signext_lea_enabled() -> bool:
+    """Flag for the AX byte-1 sign-extension delivery on a negative LEA-local
+    frame address (#343 — the #325 byte-0 follow-up). DEFAULT ON wherever the
+    campaign STACK0 emission is dropped (``C4_NO_STACK0_EMIT=1``); opt-out via
+    ``C4_AX_BYTE1_SIGNEXT_LEA=0``.
+
+    The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; tools/
+    probe_axff_signext.py + probe_axff_nuke.py + probe_axff_adder.py on
+    var_update id325 ``x=50; x=x+7; return x``): after the #325 byte-0 fix the
+    ``return x`` body's ``LEA -8`` (step 14, immediately following the
+    ``x = x + 7`` ADD+SI store) emits AX byte-0 = 0xE8 CORRECTLY, but byte-1 = 0x00
+    instead of 0xFF -> got_ax 232 (0x000000E8) vs the oracle's 65512 (0xFFE8, the
+    sign-extension of the negative stack address). full_trace diverges at step 14.
+
+    ROOT (block-by-block residual scan): the byte-1 OUTPUT is sign-extended to
+    0xFF CORRECTLY at physical block 35 (OUTPUT_LO+15/HI+15 ~+4585) and survives
+    through block 44 -- EXACTLY as it does on the WORKING negative-LEA dumps
+    (steps 2/6/8, all emit byte-1 = 0xFF). But at block 45 the
+    ``l10_add_high_byte_adder`` (the multi-byte ADD high-byte completer, 128
+    units) FALSE-FIRES: on the step-14 LEA-after-ADD byte-1 row the L13 add relay
+    has spuriously stamped ``TEMP+12`` = 1.0 (the campaign ADD emit discriminator
+    -- the LEA immediately follows the ``x+7`` ADD, the same cross-step opcode
+    residue family as #325). With ``STACK0_BYTE_VAL_1_LO`` empty (a1=0),
+    ``ADDR_B1_LO+0`` lit (b1=0) and no ``CARRY+1`` the adder's ``a0_b0_c0`` rule
+    fires and OVER-writes byte-1 = 0x00 at ~2e16 strength, nuking the sign-ext
+    0xFF. On the WORKING dumps (steps 2/6/8) ``TEMP+12`` is ABSENT so the adder is
+    dark and the block-35 0xFF survives -- the crisp fire/no-fire discriminator.
+
+    THE CLEAN, SAFE DISCRIMINATOR (measured BUILT dims at the byte-1 predictor
+    row, block 44, tools/probe_axff_addsafe.py over 7 multi-byte ADD programs):
+    the negative-LEA sign-ext byte-1 row carries ``AX_CARRY_LO+15`` ~3.0 AND
+    ``AX_CARRY_HI+15`` ~3.0 (the sign-extension carry -- the SAME 0xFF flag the
+    existing ``l14_add_byte1_high_zero_cleanup`` already keys its ``AX_CARRY_HI+15``
+    NOT-blocker on) AND ``OP_LEA`` ~0.22 (the LEA opcode residue). On EVERY genuine
+    ADD byte-1 emit row (``TEMP+12`` = 1.0, the rows the adder MUST fire on)
+    ``AX_CARRY_LO+15 == AX_CARRY_HI+15 == OP_LEA == 0.0`` EXACTLY -- so the triple
+    conjunction is present ONLY on the sign-ext LEA dump, never on a real ADD
+    result (incl. operand-B-nibble-0xF cases like 4095+1: the genuine ADD emit row
+    has AX_CARRY+15 == 0; the only AX_CARRY+15-lit rows there are NON-ADD with
+    TEMP+12 == 0, where the adder is already dark).
+
+    FIX (mirrors the #325 SHARP-guard philosophy + the existing
+    ``l14_add_byte1_high_zero_cleanup`` AX_CARRY_HI+15 sign-ext guard): add a
+    sign-ext NOT-blocker pair (``AX_CARRY_LO+15`` / ``AX_CARRY_HI+15``, strong
+    negative) to EVERY ADD high-byte adder rule (campaign config only). On a
+    genuine ADD row both are 0 -> ZERO contribution (byte-identical to the current
+    adder firing margin). On the sign-ext LEA dump row each is ~3.0 -> a large
+    negative term hard-sinks the adder below threshold, so it never fires and the
+    upstream block-35 0xFF sign-extension survives to the LM head -> byte-1 = 0xFF.
+    This PREVENTS the 2e16 nuke (rather than out-writing it), so no astronomical
+    write magnitude is needed.
+
+    DEFAULT tracks ``operand_from_memsp_enabled()`` (the adder's own campaign
+    branch): the blockers are added ONLY in the 30-token campaign config and ONLY
+    when this flag is on, so flag-OFF (``=0``), ``C4_NO_STACK0_EMIT=0``, or the
+    35-token golden build are all byte-identical to the pre-fix default (golden
+    ``4958b35b`` never enters the campaign adder branch). Dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_AX_BYTE1_SIGNEXT_LEA`` can A/B it.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    return (
+        os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
+        and no_stack0_emit_enabled()
+    )
+
+
+def _ax_byte1_signext_lea_blockers() -> tuple:
+    """Return the sign-ext NOT-blocker pair for the ADD high-byte adder rules.
+
+    Empty (no extra conditions) unless the campaign sign-ext fix is active, so
+    the flag-OFF / golden adder is byte-identical. When active, returns the
+    ``AX_CARRY_LO+15`` / ``AX_CARRY_HI+15`` sign-extension hard-blockers (each
+    ~3.0 on the negative-LEA dump row, 0.0 on a genuine ADD result row). See
+    ``_ax_byte1_signext_lea_enabled`` for the full root + safety analysis.
+    """
+    if not _ax_byte1_signext_lea_enabled():
+        return ()
+    # Each AX_CARRY_*+15 reads ~3.0 on the sign-ext row -> -5000*3.0 = -15000
+    # per dim (-30000 combined), decisively sinking the adder's ~570-pt firing
+    # margin; reads 0.0 on every genuine ADD emit row -> no effect there.
+    return (
+        ("AX_CARRY_LO+15", -5_000.0),
+        ("AX_CARRY_HI+15", -5_000.0),
+    )
+
+
 def _lea_byte0_memsp_relay_enabled() -> bool:
     """Flag for the PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay
     (ROOT 1, gates func_identity step-6 + var_mul/three multi-local + nested).
@@ -10360,7 +10448,18 @@ def _l10_add_high_byte_adder_rules() -> tuple[FFNRule, ...]:
                     (GATE_DIM, GATE_DIM_W),
                 ) + a1_conditions + (
                     (f"ADDR_B1_LO+{b1}", GATE),            # b1
-                ) + marker_blockers + non_add_blockers + transition_blockers
+                ) + marker_blockers + non_add_blockers + transition_blockers + (
+                    # #343: sign-ext NOT-blocker pair (campaign only). On a
+                    # negative-LEA-local AX dump byte-1 row (var_update step-14,
+                    # the ``return &x`` LEA after the ``x+7`` ADD+SI store) the
+                    # L13 add relay spuriously stamps TEMP+12 -> the adder would
+                    # FALSE-FIRE and nuke the upstream block-35 0xFF sign-extension
+                    # to 0x00. AX_CARRY_LO/HI+15 (~3.0 on that row, 0.0 on every
+                    # genuine ADD emit row) hard-sink the adder so the 0xFF
+                    # survives. Empty tuple flag-OFF (byte-identical). See
+                    # ``_ax_byte1_signext_lea_blockers``.
+                    _ax_byte1_signext_lea_blockers()
+                )
                 if carry:
                     conditions = base_conditions + (
                         ("CARRY+1", CARRY_REQ_W),
@@ -10483,6 +10582,9 @@ def make_l10_add_high_byte_adder_op() -> Operation:
             "OP_GE", "OP_SHL", "OP_SHR", "OP_SI", "OP_SC", "OP_LI", "OP_LC",
             "OP_ENT", "MEM_STORE", "TEMP", "CARRY",
             "STACK0_BYTE_VAL_1_LO", "ADDR_B1_LO",
+            # #343: sign-ext NOT-blocker dims (campaign only; see
+            # ``_ax_byte1_signext_lea_blockers``).
+            "AX_CARRY_LO", "AX_CARRY_HI",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="block",

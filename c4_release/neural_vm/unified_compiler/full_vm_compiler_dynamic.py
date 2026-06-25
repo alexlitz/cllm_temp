@@ -2184,6 +2184,15 @@ def compile_full_vm_dynamic(
             "C4_AX_BYTE23_DUMP": (
                 os.environ.get("C4_AX_BYTE23_DUMP", "1") != "0"
             ),
+            # AX byte-1 sign-extension delivery on a negative LEA-local frame
+            # address (#343; DEFAULT-ON in the campaign config, opt out =0,
+            # output-affecting on the var_update step-14 LEA AX byte-1 row): adds
+            # the AX_CARRY_LO/HI+15 sign-ext NOT-blocker pair to the L10 ADD
+            # high-byte adder so it cannot nuke the block-35 0xFF. The ON / OFF
+            # builds must NEVER share a memo / disk entry.
+            "C4_AX_BYTE1_SIGNEXT_LEA": (
+                os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
+            ),
             # STACK0 byte-0 register-dump emission flag (Root 2; DEFAULT-ON, opt
             # out with =0): toggles the LM-head ``STACK0_B0_DUMP_{H1,H3}``
             # columns (output-affecting, no source change), so the ON and OFF
@@ -2895,6 +2904,13 @@ def _bake_from_scheduled_ops(
         # L25 tail). The ON / OFF builds must never share a serialised entry.
         "C4_AX_BYTE23_DUMP": (
             os.environ.get("C4_AX_BYTE23_DUMP", "1") != "0"
+        ),
+        # AX byte-1 sign-extension delivery on a negative LEA-local frame address
+        # (#343; DEFAULT-ON in the campaign config, opt out =0, output-affecting,
+        # no source change): the L10 ADD high-byte adder sign-ext NOT-blocker pair.
+        # The ON / OFF builds must never share a serialised entry.
+        "C4_AX_BYTE1_SIGNEXT_LEA": (
+            os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
         ),
         # STACK0 byte-0 register-dump emission flag (Root 2; DEFAULT-ON, opt out
         # with =0, output-affecting, no source change): the ON / OFF builds must
