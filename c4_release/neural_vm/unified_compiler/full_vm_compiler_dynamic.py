@@ -2349,6 +2349,15 @@ def compile_full_vm_dynamic(
             "C4_SILI_CAM_B1": (
                 os.environ.get("C4_SILI_CAM_B1", "1") != "0"
             ),
+            # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in
+            # campaign, opt out =0, BAKE-affecting): when active the L13
+            # ALUShiftComposite block.ffn is wrapped in ShiftOutputClearFFN,
+            # otherwise it is the bare composite. The two builds STRUCTURALLY
+            # differ so they must never share a memo entry. See
+            # shared.shift_output_byte0_clear_enabled.
+            "C4_SHIFT_OUTPUT_B0_CLEAR": (
+                os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -2974,6 +2983,14 @@ def _bake_from_scheduled_ops(
         # serialised entry. See shared.sili_cam_b1_enabled.
         "C4_SILI_CAM_B1": (
             os.environ.get("C4_SILI_CAM_B1", "1") != "0"
+        ),
+        # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in campaign,
+        # opt out =0, BAKE-affecting): when active the L13 ALUShiftComposite
+        # block.ffn is wrapped in ShiftOutputClearFFN, otherwise it is the bare
+        # composite. The two builds STRUCTURALLY differ so they must never share
+        # a serialised entry. See shared.shift_output_byte0_clear_enabled.
+        "C4_SHIFT_OUTPUT_B0_CLEAR": (
+            os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

@@ -2342,6 +2342,83 @@ class ALUShiftComposite(nn.Module):
         pass
 
 
+class ShiftOutputClearFFN(nn.Module):
+    """Campaign SHIFT (SHL/SHR) consumer OUTPUT byte-0 zero-default clear.
+
+    Drop-in replacement for ``block.ffn`` in the efficient-mode L13 install
+    (``l13_alu_shift_install``). Holds the inner ``ALUShiftComposite`` and, on
+    the OP_SHL/OP_SHR + MARK_AX row ONLY, ZEROES the ``OUTPUT_LO``/``OUTPUT_HI``
+    band BEFORE delegating to the composite — so a SPURIOUS upstream byte-0
+    zero-default (written at block 16 / logical L11 by the campaign OUTPUT-band
+    leak) is removed and the composite's own ``+2.0`` result one-hot stands
+    unopposed.
+
+    The wall this lifts (GPU spec_k=0, campaign ``C4_NO_STACK0_EMIT=1
+    C4_OPERAND_FROM_MEMSP=1``): ``test_shr`` (``84 >> 1 == 42``) decodes 0x00.
+    The shift lookup CORRECTLY computes ``OUTPUT_LO+10 += 2.0`` /
+    ``OUTPUT_HI+2 += 2.0`` = 0x2A, but a stale ``OUTPUT_LO+0 = 2.0`` /
+    ``OUTPUT_HI+0 = 2.0`` from block 16 SURVIVES (``GEToBDConverter`` ADDS its
+    one-hot instead of overwriting) and TIES it — the LM-head argmax breaks the
+    tie toward the lower index (cell-0), so both bytes decode 0x00. ``test_shl``
+    is clean (its block-16 OUTPUT band is empty), so the clear is a no-op for it
+    (an empty band zeroed is still empty; the composite then writes the SAME
+    0x2A). See ``shared.shift_output_byte0_clear_enabled`` for the full
+    rationale.
+
+    Runs in ONE block (it IS ``block.ffn``), so the model's physical block count
+    is unchanged — the absolute-position lea contract holds. ``compact`` /
+    ``sparsify`` / ``compact_moe`` plumb through to ``inner`` so the model's
+    post-bake compactor and weight-introspection treat this exactly like the
+    wrapped composite (the same contract ``FlattenedALUMul`` /
+    ``MulOperandSeRecoverFFN`` honour). Gate-OFF / non-campaign leaves ``x``
+    byte-identical (the clear branch is skipped entirely) — the install only
+    installs this wrapper when ``no_stack0_emit_enabled() and
+    shift_output_byte0_clear_enabled()``.
+    """
+
+    def __init__(self, inner: nn.Module, *, output_lo, output_hi, mark_ax,
+                 op_shl, op_shr):
+        super().__init__()
+        self.inner = inner
+        self.output_lo = int(output_lo)
+        self.output_hi = int(output_hi)
+        self.mark_ax = int(mark_ax)
+        self.op_shl = int(op_shl)
+        self.op_shr = int(op_shr)
+        # Sentinel so an idempotent re-wrap guard recognises an existing attach.
+        self._is_shift_output_clear_wrap = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        lo = slice(self.output_lo, self.output_lo + 16)
+        hi = slice(self.output_hi, self.output_hi + 16)
+        # OP_SHL or OP_SHR, AND MARK_AX, per row.
+        op = x[:, :, self.op_shl] + x[:, :, self.op_shr]
+        shift_ax = (op > 0.5) & (x[:, :, self.mark_ax] > 0.5)
+        # keep=1 on non-shift rows (untouched), 0 on the shift+AX rows we clear.
+        keep = (~shift_ax)[:, :, None].to(dtype=x.dtype)  # [B,S,1]
+        x = x.clone()
+        x[:, :, lo] = x[:, :, lo] * keep
+        x[:, :, hi] = x[:, :, hi] * keep
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility (mirrors MulOperandSeRecoverFFN) ----
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 class ALUDivMod(PureNeuralALU):
     """Neural DIV/MOD."""
     def __init__(self, S, BD):
