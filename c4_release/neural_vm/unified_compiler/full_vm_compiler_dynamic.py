@@ -2370,6 +2370,19 @@ def compile_full_vm_dynamic(
                     else "0",
                 ) != "0"
             ),
+            # Multi-arg first-param LI JSR-phantom value-row penalty (campaign-ON,
+            # opt out =0): adds L15 head-0 slot 104 (a MARK_AX-gated -OP_JSR K
+            # penalty) so the genuine PSH'd-arg store row out-scores the callee
+            # JSR/ENT-step phantom MEM rows (func_add/mul step-9 a-LI). The ON /
+            # OFF builds bake a different W_q/W_k row and must never share a memo
+            # entry. See l15_ops._l15_li_jsr_phantom_penalty_on.
+            "C4_L15_LI_JSR_PHANTOM": (
+                os.environ.get(
+                    "C4_L15_LI_JSR_PHANTOM",
+                    "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                    else "0",
+                ) != "0"
+            ),
             # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in
             # campaign, opt out =0, BAKE-affecting): when active the L13
             # ALUShiftComposite block.ffn is wrapped in ShiftOutputClearFFN,
@@ -3020,6 +3033,18 @@ def _bake_from_scheduled_ops(
         "C4_SCLC_LC_B0": (
             os.environ.get(
                 "C4_SCLC_LC_B0",
+                "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                else "0",
+            ) != "0"
+        ),
+        # Multi-arg first-param LI JSR-phantom value-row penalty (campaign-ON, opt
+        # out =0): adds L15 head-0 slot 104 (a MARK_AX-gated -OP_JSR K penalty) so
+        # the genuine PSH'd-arg store row out-scores the callee JSR/ENT-step
+        # phantom MEM rows. ON / OFF builds bake a different W_q/W_k row and must
+        # never share a serialised entry. See l15_ops._l15_li_jsr_phantom_penalty_on.
+        "C4_L15_LI_JSR_PHANTOM": (
+            os.environ.get(
+                "C4_L15_LI_JSR_PHANTOM",
                 "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 else "0",
             ) != "0"

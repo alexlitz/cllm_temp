@@ -529,6 +529,55 @@ def _l15_li_valrow_b1_on() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _l15_li_jsr_phantom_penalty_on() -> bool:
+    """DEFAULT campaign-ON (``C4_L15_LI_JSR_PHANTOM``): break the multi-arg
+    first-param LI value-row tie by penalising the JSR/ENT-step PHANTOM MEM
+    rows that share the queried address but carry no stored value
+    (func_add/func_mul step-9 first-param ``a`` LI -- POST-FLIP root).
+
+    ROOT (GPU spec_k=0, BUILT dims; tools/_probe_func_li_value.py + the
+    head-0 score decomposition in this lane, campaign config): func_add/mul
+    diverge at **step 9 = LI** -- the load of the FIRST argument ``a`` returns
+    AX=0. The arg was PSH'd at the CALL SITE (e.g. value 57 stored @ mem[0xE8],
+    func_add pos 271, ``CLEAN_EMBED``=57, ``OP_JSR``~=0). L15 head-0's address
+    CAM (slots 4-27) correctly matches the queried byte-0 = 0xE8, and the
+    genuine value row (271) even EDGES the raw QK score -- but the callee's
+    JSR/ENT step re-uses the SAME stack slot, so its PHANTOM MEM value rows
+    (func_add pos 360-363, ``CLEAN_EMBED``=0, ADDR byte-0 = 0xE8 too) also
+    match the address, carry ``MEM_VAL_B1``~=0.97 (so #313 + ``_l15_li_valrow_b1``
+    boost them EQUALLY), and -- being MORE RECENT -- WIN the 0.05 ALiBi recency
+    tie-break by ~5 (probed: phantom 361 score 709951 vs genuine 271 709946).
+    Result: head-0 attends a value-0 phantom and the LI returns 0. This is the
+    #313/#318/B1-lift blind spot: those discriminate by ADDRESS and by
+    ``MEM_VAL_B1`` presence, but the phantom matches BOTH, so only the
+    store-PROVENANCE distinguishes them.
+
+    THE DISCRIMINATOR (measured): a genuine PSH/SI store value row carries
+    ``OP_JSR``~=0 (func_add 271: 0.02; func_identity 223: 0.02; every clean
+    si_li store), while the callee's JSR/ENT-step phantom MEM rows carry the
+    JSR opcode residue ``OP_JSR``~=1.5-1.7 (func_add 360-363). A K-side
+    ``-OP_JSR`` penalty (gated on the Q by ``MARK_AX`` -- the only LIVE signal
+    at the byte-0 LI lookup row; ``OP_LI_RELAY``==0 there, the #313 blind spot)
+    subtracts ~5.6k from every JSR-phantom and ~0 from the genuine store, so
+    the genuine value row leads its address class. Simulated over the exact
+    head-0 bilinear (this lane): func_add s9 flips 361(cl0)->271(cl57) and
+    func_mul s9 flips 361(cl0)->271(cl49); func_max/min/square/identity s9/s7
+    LIs (which already win) and var_simple 250-270 (no JSR competitor) are
+    UNCHANGED (OFF==ON).
+
+    Uses a DEDICATED free head-0 slot (104; head_dim 111, slots 0-103 taken:
+    0-63 base, 64-70 suppressor-cancel, 71-101 #313 CAM, 102 B1-lift, 103 #318)
+    so it is independently A/B-toggleable. Campaign-only (golden 35-tok
+    flag-OFF byte-identical; this branch is not taken there, and ``OP_JSR`` only
+    competes a value row in the 30-tok MEM-from-SP path). Own kill-switch so the
+    cross-op attention + flag-regression gates can toggle just this change.
+    """
+    raw = _os_l15.environ.get("C4_L15_LI_JSR_PHANTOM")
+    if raw is not None:
+        return raw != "0"
+    return no_stack0_emit_enabled()
+
+
 def _l15_sclc_byte0_on() -> bool:
     """DEFAULT campaign-ON (``C4_SCLC_LC_B0``): mirror the #318 zero-address
     committed-store byte-0 boost onto the ``OP_LC`` (load-char) opcode so the
@@ -1996,6 +2045,31 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             q_map[(102, BD.MARK_AX)] = _vr_s
             k_map[(102, BD.MEM_VAL_B1)] = _vr_s
 
+        # === POST-FLIP: head-0 JSR-phantom value-row PENALTY (first-param LI) ===
+        # See _l15_li_jsr_phantom_penalty_on for the full root + proof. On the
+        # multi-arg first-param LI (func_add/mul step 9), the genuine PSH'd-arg
+        # store value row (e.g. func_add 271, CLEAN=57, OP_JSR~0) and the
+        # callee's JSR/ENT-step PHANTOM MEM rows (360-363, CLEAN=0, OP_JSR~1.66)
+        # BOTH match the queried address (byte-0 0xE8) AND carry MEM_VAL_B1~0.97,
+        # so the #313 ADDR CAM and the slot-102 B1 lift boost them EQUALLY; the
+        # phantom -- being MORE RECENT -- wins the 0.05 ALiBi tie by ~5 and the LI
+        # returns 0. The ONLY surviving discriminator is store PROVENANCE: a real
+        # store row carries OP_JSR~0, the callee-frame phantom rows carry the JSR
+        # opcode residue OP_JSR~1.5-1.7. Subtract a K-side OP_JSR penalty, gated on
+        # the Q by MARK_AX (the live byte-0 LI lookup-row signal -- OP_LI_RELAY is
+        # 0 there, the #313 blind spot). The genuine store (OP_JSR~0) is
+        # untouched; each phantom drops ~5.6k -> the genuine value row leads its
+        # address class. Inert on every clean store (OP_JSR~0) and on non-AX rows
+        # (Q gate). Dedicated free head-0 slot 104 (slots 0-103 taken). Scale
+        # 360*100*1.66/sqrt(111) ~= 5.6k -- decisive over the ~5 recency tie,
+        # modest vs the ~1e6 cancelled blockers (no over-sharpening).
+        # Campaign-only (golden 35-tok flag-OFF byte-identical: branch not taken).
+        if head == 0 and _l15_li_jsr_phantom_penalty_on():
+            _jp_q = 360.0   # MARK_AX byte-0-lookup-row gate (mirrors #313 _cam_s)
+            _jp_k = 100.0   # OP_JSR penalty K weight
+            q_map[(104, BD.MARK_AX)] = _jp_q
+            k_map[(104, BD.OP_JSR)] = -_jp_k
+
         new_q = tuple(
             AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
         )
@@ -3112,6 +3186,9 @@ def make_layer15_memory_lookup_op() -> Operation:
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "MARK_STACK0", "IS_BYTE",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "H1", "H2", "H3", "L2H0", "TEMP.*.-1",
+               # OP_JSR: read by the campaign head-0 JSR-phantom value-row
+               # penalty (slot 104, _l15_li_jsr_phantom_penalty_on).
+               "OP_JSR",
                "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "CMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
