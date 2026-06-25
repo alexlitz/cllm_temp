@@ -947,6 +947,31 @@ def sili_cam_b1_enabled() -> bool:
     out-votes the ~60-point ALiBi recency gap and re-points the byte-1 reload
     at the value-IMM register (var_simple's winner, sum ~1.0, keeps its huge
     OP_IMM margin so it is unaffected).
+
+    STATUS: flips 4/6 TestSmokeMemory (roundtrip / zero / multiple / overwrite);
+    those have a value byte-1 == 0x00 so once the slot-83 selection picks the
+    value-IMM the reload is correct. The remaining 2 are part-c (the SI-store
+    byte-1 / downstream OUTPUT_HI corruptor), still open:
+      * test_si_li_16bit_value (0x1234): slot 83 DOES re-point the L10 head-1
+        byte-1 to the value-IMM (0x12 lands in OUTPUT at block 16, GPU-traced);
+        but a DOWNSTREAM L18 (runner block 32) op SLAMS OUTPUT_HI on the
+        LI-reload AX byte-1 row -- cell 0 -> +18, cells 1..15 -> -1700 -> hi
+        nibble forced to 0 -> 0x12 -> 0x02. The L14 *_ax_bytes_zero FFN rules
+        (jsr/lc/alu_nocarry/ent) are NOT the cause (their OP_LC_RELAY / TEMP+7
+        gates read 0 on this row); the slam is the layer14_mem_generation
+        ADDRESS head (heads 1..3, MEM addr byte) whose addr_b1 position-distance
+        ALIASES the LI-reload AX byte-1 row in the 30-tok frame and copies the
+        store ADDRESS byte-1 into OUTPUT. FIX (part-c): sharpen its slot-34
+        MEM_STORE gate in campaign (move CONST down + MEM_STORE up by the SAME
+        delta so STORE rows score identically and non-store rows fall to the
+        softmax1 sink) so the head stays silent on the non-store LI row -- but
+        wire it through ``_layer14_mem_generation_head_specs_with_overrides``
+        (the override q_map is the BAKED path; a base-spec-only edit is inert),
+        then re-run the flag_regression_gate (the store-address head is
+        load-bearing for ALL SI/SC/PSH stores).
+      * test_sc_lc_roundtrip: byte-1 IS now fixed (0x02 -> 0x00); the residual
+        fail is a SEPARATE pre-existing LC byte-0 reload bug (got 0, want 42)
+        outside this byte-1 scope.
     """
     return (
         no_stack0_emit_enabled()
