@@ -1026,6 +1026,61 @@ def sili_cam_b1_enabled() -> bool:
     )
 
 
+def sili_b1_restore_enabled() -> bool:
+    """Return True iff the si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c)
+    is active. DEFAULT campaign-ON (``C4_SILI_B1_RESTORE=1``), opt out with
+    ``C4_SILI_B1_RESTORE=0``; gated behind the campaign config so the flag-OFF
+    golden (35-tok) build is byte-identical (the band + both ops are omitted off
+    the campaign).
+
+    ROOT (measured spec_k=0, BUILT dim_positions, campaign config; GPU
+    block-trace ``tools/probe_sili_slam32.py`` / ``probe_sili_real.py``):
+    the slot-83 discriminator (``sili_cam_b1_enabled``) correctly re-points the
+    L10 head-1 byte-1 to the value-IMM register, so the loaded byte-1 (0x12 for
+    ``si 0x1234; li``) lands in OUTPUT at runner block 16. A DOWNSTREAM op then
+    SLAMS OUTPUT_HI on the LI-reload AX byte-1 predictor row at runner BLOCK 32
+    (logical L18): the FFN unit that forces the AX byte-1 HIGH nibble to 0 (the
+    "AX byte-1 == 0 default" — ``OUTPUT_HI+1..15 = -50`` gated on
+    ``H1+1``/``BYTE_INDEX_0``). That default is INTENTIONALLY suppressed on
+    register rows whose AX legitimately has a high byte via the ``AX_CARRY``
+    cross-step band, but on the LI-reload step that suppression band is empty, so
+    the default fires and crushes the loaded 0x12 -> 0x02 (final reload 0x0234,
+    smoke want 0x1234). The attn at block 32 is NOT the source (zeroing its
+    ``W_o`` leaves the slam); the slam is FFN unit 3 of block 32 (ablating it
+    restores 0x12) — so a head-spec edit cannot reach it.
+
+    THE FIX (two PureFFN ops mirroring the ``C4_SUB_FULL_BORROW`` precedent: an
+    early CAPTURE + an L25-tail RESTORE that DOMINATES the slam). On the
+    LI-reload byte-1 predictor row (the AX byte-0 row of an LI step — discriminated
+    by ``IS_BYTE + H1[AX]+1 + BYTE_INDEX_0 + ADDR_B1`` and NOT
+    ``OP_IMM``/``MARK_AX``/``MEM_STORE``/``BYTE_INDEX_1..3``; ``ADDR_B1`` is the
+    gathered LOAD-address one-hot, strong on LI-reload rows and ~0 on
+    PSH/SI/IMM register rows, so the row is LOAD-specific):
+      1. CAPTURE (``make_layer14_sili_b1_capture_op``, a standalone PureFFN at the
+         EARLY L14 mem-gen block, BEFORE the block-32 slam, where OUTPUT byte-1 is
+         still the loaded value): gate-copy the 16 ``OUTPUT_LO`` + 16 ``OUTPUT_HI``
+         nibble cells into the private ``LI_RELOAD_B1_{LO,HI}`` band. The silu
+         factor is uniform across the 16 cells so the byte-1 nibble argmax is
+         preserved.
+      2. RESTORE (``make_sili_b1_restore_op``, a standalone PureFFN on the L25 tail
+         block AFTER ``tail_bit32_result_correction`` — the LAST OUTPUT writer
+         before the LM head): gate-write ``OUTPUT_{LO,HI}`` back from
+         ``LI_RELOAD_B1_{LO,HI}`` at a DOMINANT magnitude, so the restored 0x12
+         out-votes the block-32 slam (~+18/-1700) additively.
+    On the 4 already-passing si/li cases (value byte-1 == 0x00) the captured band
+    is the 0x00 one-hot, so the restore re-asserts 0x00 (no-op). var_simple
+    (LEA-addressed, no ADDR_B1 on its byte-1 row) and PSH/SI register rows are not
+    matched by the discriminator, so they are untouched. Output-affecting only
+    inside the campaign; flag OFF (or off-campaign) omits the band + both ops
+    (golden ``7f6f2e5d`` byte-identical).
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
+    )
+
+
 def ffn_lint_mull14_demo_enabled() -> bool:
     """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
 

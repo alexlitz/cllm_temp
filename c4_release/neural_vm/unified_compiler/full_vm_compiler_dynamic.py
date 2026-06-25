@@ -2349,6 +2349,14 @@ def compile_full_vm_dynamic(
             "C4_SILI_CAM_B1": (
                 os.environ.get("C4_SILI_CAM_B1", "1") != "0"
             ),
+            # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON,
+            # opt out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the
+            # capture (block 16) / restore (L25 tail) PureFFN ops, so the ON / OFF
+            # builds STRUCTURALLY differ (different d_model + extra blocks) and
+            # must never share a memo entry. See shared.sili_b1_restore_enabled.
+            "C4_SILI_B1_RESTORE": (
+                os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
+            ),
             # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in
             # campaign, opt out =0, BAKE-affecting): when active the L13
             # ALUShiftComposite block.ffn is wrapped in ShiftOutputClearFFN,
@@ -2983,6 +2991,14 @@ def _bake_from_scheduled_ops(
         # serialised entry. See shared.sili_cam_b1_enabled.
         "C4_SILI_CAM_B1": (
             os.environ.get("C4_SILI_CAM_B1", "1") != "0"
+        ),
+        # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
+        # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /
+        # restore PureFFN ops so ON / OFF builds STRUCTURALLY differ (d_model +
+        # extra blocks) and must never share a serialised entry. See
+        # shared.sili_b1_restore_enabled.
+        "C4_SILI_B1_RESTORE": (
+            os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
         ),
         # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in campaign,
         # opt out =0, BAKE-affecting): when active the L13 ALUShiftComposite

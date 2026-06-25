@@ -37,6 +37,7 @@ from .user_input_ops import (  # noqa: F401
 from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
 from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
 from .shared import sub_full_borrow_enabled  # noqa: F401
+from .shared import sili_b1_restore_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -592,6 +593,15 @@ def all_core_ops(
             [make_layer14_sub_full_borrow_flag_op()]
             if sub_full_borrow_enabled() else []
         ),
+        # si/li 16-bit LOAD byte-1 value CAPTURE (CAMPAIGN-ONLY,
+        # C4_SILI_B1_RESTORE): a standalone PureFFN post_op on the block-16
+        # mem-addr anchor that snapshots the freshly-delivered loaded AX byte-1
+        # nibbles into the private LI_RELOAD_B1 band BEFORE the block-32 (L18)
+        # OUTPUT_HI slam crushes them. Self-gates to a no-op (empty reads/writes,
+        # band omitted) when the flag is off -> golden 7f6f2e5d byte-identical.
+        # The L25-tail RESTORE half (make_sili_b1_restore_op) re-supplies the
+        # captured byte-1 AFTER the slam. See l14_ops.make_layer14_sili_b1_capture_op.
+        make_layer14_sili_b1_capture_op(),
         # Phase 6 Wave 7 demo: pure-declaration corrective op. One
         # ``FFNRule`` + ``pin=None`` auto-fit + slim ``bake_fn`` wrapper.
         # Byte-identically a no-op on the live corpus -- the demo proves
@@ -694,6 +704,15 @@ def all_core_ops(
             [make_sub_full_borrow_byte1_ff_op()]
             if sub_full_borrow_enabled() else []
         ),
+        # si/li 16-bit LOAD byte-1 value RESTORE (CAMPAIGN-ONLY,
+        # C4_SILI_B1_RESTORE): the POST-SLAM half of the si_li_16bit fix. A
+        # standalone PureFFN post_op appended AFTER tail_bit32_result_correction
+        # (the LAST OUTPUT writer before the LM head) that re-supplies the
+        # captured loaded byte-1 from LI_RELOAD_B1 into OUTPUT, DOMINATING the
+        # block-32 (L18) OUTPUT_HI slam additively. Self-gates to a no-op when the
+        # flag is off (golden 7f6f2e5d byte-identical). See
+        # l14_ops.make_sili_b1_restore_op (+ the CAPTURE half above).
+        make_sili_b1_restore_op(),
         # STACK0 byte-0 carried-step flag precursor (Root 2): writes the BOUNDED
         # ``STACK0_B0_CARRIED`` gate flag at an EARLY block (L7 anchor) where the
         # same-step H3 byte-0 one-hot is still bounded (fresh ~3.3 present,

@@ -15,6 +15,7 @@ from .shared import (
     ffn_lint_mull14_demo_enabled,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
+    sili_b1_restore_enabled,
     sub_full_borrow_enabled,
 )
 from ..positional_invariant import marker_bank_index
@@ -73,6 +74,21 @@ register_residual_band(
     "SUB_FULL_BORROW", 1,
     owner="make_layer14_sub_full_borrow_flag_op",
     flag=sub_full_borrow_enabled, never_share=True,
+)
+
+
+# Fresh over-width residual band carrying the si/li 16-bit LOAD byte-1 value
+# (Inc-2 part-c). ``never_share=True`` keeps it in a private slot: a 32-wide
+# band (16 OUTPUT_LO + 16 OUTPUT_HI nibble cells) snapshotting the loaded AX
+# byte-1 nibble one-hots at an EARLY L14 block (before the block-32/L18 OUTPUT_HI
+# slam) and read at the L25 tail to RESTORE OUTPUT byte-1 after the slam. It must
+# survive every intervening block at the LI-reload byte-1 predictor row.
+# Flag-gated on the campaign config so a golden (flag-OFF) build omits it
+# entirely (smaller d_model, byte-identical). Sized 32 (LO 0..15 then HI 0..15).
+register_residual_band(
+    "LI_RELOAD_B1", 32,
+    owner="make_layer14_sili_b1_capture_op",
+    flag=sili_b1_restore_enabled, never_share=True,
 )
 
 
@@ -3876,6 +3892,278 @@ def make_sub_full_borrow_byte1_ff_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#multibyte-arithmetic",
+    )
+
+
+# ===========================================================================
+# si/li 16-bit LOAD byte-1 CAPTURE + RESTORE (Inc-2 part-c, C4_SILI_B1_RESTORE)
+# ===========================================================================
+#
+# Mirrors the SUB_FULL_BORROW capture/restore precedent for a DATA-DEPENDENT
+# byte (the loaded AX byte-1) rather than the constant 0xFF. Two standalone
+# PureFFN ops, both campaign-gated on ``sili_b1_restore_enabled``:
+#
+#   * CAPTURE (``make_layer14_sili_b1_capture_op``): a post_op on the L13/L10
+#     mem-addr anchor block (block 16, where the L10 head-1 slot-83 fix has just
+#     delivered the loaded byte-1 into OUTPUT), BEFORE the block-32/L18 OUTPUT_HI
+#     slam. 32 gate-copy rules snapshot the 16 OUTPUT_LO + 16 OUTPUT_HI byte-1
+#     nibble cells into the private ``LI_RELOAD_B1`` band (cells 0..15 = LO,
+#     16..31 = HI). The silu factor is UNIFORM across the 16 cells of each
+#     nibble, so the byte-1 nibble argmax is preserved into the band.
+#
+#   * RESTORE (``make_sili_b1_restore_op``): a post_op on the L25 tail block
+#     AFTER ``tail_bit32_result_correction`` (the LAST OUTPUT writer before the
+#     LM head). 32 gate-write rules re-supply ``OUTPUT_{LO,HI}`` from the carried
+#     ``LI_RELOAD_B1`` band at a DOMINANT magnitude (``_SILI_B1_RESTORE_WS``), so
+#     the restored byte-1 out-votes the block-32 slam (~+18/-1700) additively.
+#
+# Both ops fire ONLY on the LI-reload byte-1 PREDICTOR row (the AX byte-0 row of
+# an LI step): the discriminator AND is ``IS_BYTE + H1[AX]+1 + BYTE_INDEX_0 +
+# Σ ADDR_B1`` MINUS hard ``OP_IMM`` / ``MARK_AX`` / ``MEM_STORE`` /
+# ``BYTE_INDEX_1..3`` blockers. ``ADDR_B1`` (the gathered LOAD-address one-hot)
+# is the LOAD-specific term: it is ~6.0 on an LI-reload byte-1 row and ~0 on
+# PSH/SI/IMM register rows and on LEA-addressed var_simple loads, so the
+# discriminator is mandatory-ADDR_B1 and the op never touches a non-LI-reload
+# AX byte-1 row. On the 4 already-passing si/li cases (loaded byte-1 == 0x00)
+# the band snapshots the 0x00 one-hot and the restore re-asserts 0x00 (no-op).
+
+# Restore write scale: the slam left OUTPUT_HI cell-0 ~+18 and cells 1..15 ~-1700
+# (and crushed OUTPUT_LO similarly at the L25 tail). The restore is ADDITIVE, so
+# the re-supply must net POSITIVE at the loaded nibble cell. ``silu(S*(disc-thr))``
+# is ~O(100s) on the firing row and ``LI_RELOAD_B1`` carries the (already
+# silu-scaled) one-hot, so a modest WS makes the product dominate the slam.
+_SILI_B1_RESTORE_WS = 20.0
+
+# Discriminator weights (shared by capture + restore). ADDR_B1 is split into 32
+# per-cell terms so any single active address-byte-1 nibble contributes; the sum
+# is ~6 on an LI-reload row, 0 elsewhere.
+_SILI_B1_DISC_BASE = (
+    ("IS_BYTE", 1.0),
+    ("H1+1", 1.0),
+    ("BYTE_INDEX_0", 1.0),
+    ("OP_IMM", -5.0),
+    ("MARK_AX", -5.0),
+    ("MEM_STORE", -5.0),
+    ("BYTE_INDEX_1", -5.0),
+    ("BYTE_INDEX_2", -5.0),
+    ("BYTE_INDEX_3", -5.0),
+)
+# ADDR_B1 (32 cells, weight 1.0 each) makes the rule LOAD-context-specific: it
+# is ~2..6 on an LI-reload/store byte-1 row and 0 on a fresh-IMM/PSH register row.
+_SILI_B1_DISC_ADDR = tuple(
+    (f"ADDR_B1_LO+{c}", 1.0) for c in range(16)
+) + tuple(
+    (f"ADDR_B1_HI+{c}", 1.0) for c in range(16)
+)
+# The DECISIVE 16-bit term: Σ OUTPUT_HI cells 1..15 (the nonzero-HIGH-nibble
+# mass of the loaded byte-1). It is ~2 on a genuine 16-bit LI-reload (high nibble
+# 0x1x) and ~0 on a byte-1 == 0x00 load (the high nibble sits in cell 0, which is
+# EXCLUDED). Measured at the block-16 capture point BEFORE the block-32 slam:
+# 16bit LI-reload Σ[1..15] = 2.0; every byte-1 == 0 load (roundtrip / zero /
+# multiple / overwrite, single- AND multi-store) Σ[1..15] ~ 0. So this term makes
+# the CAPTURE fire ONLY when the loaded byte-1 genuinely has a high nibble -- the
+# exact rows the slam corrupts -- and leaves all already-passing si/li cases (and
+# every store byte-1 row) untouched.
+_SILI_B1_DISC_HINZ = tuple(
+    (f"OUTPUT_HI+{c}", 1.0) for c in range(1, 16)
+)
+# CAPTURE conditions: base + ADDR_B1 (load context) + the OUTPUT_HI[1..15] 16-bit
+# term. threshold tuned so a genuine 16-bit LI-reload (base ~3 + ADDR ~6 + HInz
+# ~2 = ~11) clears it while a byte-1 == 0 load (base ~3 + ADDR ~6 + HInz ~0 = ~9)
+# and any IMM-emit row (-5 OP_IMM) stay BELOW.
+_SILI_B1_CAPTURE_CONDS = _SILI_B1_DISC_BASE + _SILI_B1_DISC_ADDR + _SILI_B1_DISC_HINZ
+_SILI_B1_CAPTURE_THRESHOLD = 10.0
+# RESTORE conditions: base + ADDR_B1 only (the OUTPUT_HI[1..15] term is unusable
+# at the L25 tail -- the slam has already crushed it). The restore is self-gating
+# instead: it gate-WRITES from the carried LI_RELOAD_B1 band, which is EMPTY (all
+# 0) on every row except the genuine 16-bit LI-reload that the strict CAPTURE
+# wrote. An empty band -> gate_terms == 0 -> the restore adds 0 to OUTPUT (a
+# no-op), so it is harmless on byte-1 == 0 loads and store byte-1 rows even though
+# the looser discriminator may fire there.
+_SILI_B1_RESTORE_CONDS = _SILI_B1_DISC_BASE + _SILI_B1_DISC_ADDR
+_SILI_B1_RESTORE_THRESHOLD = 5.0
+
+_SILI_B1_CAPTURE_HIDDEN_DIM = 32   # 16 LO + 16 HI gate-copy units
+_SILI_B1_RESTORE_HIDDEN_DIM = 32
+
+
+def _sili_b1_capture_rules() -> tuple[FFNRule, ...]:
+    """32 rules: ``LI_RELOAD_B1[j] = OUTPUT_{LO,HI}[nib]`` on the 16-bit LI row.
+
+    For each nibble cell ``nib`` (0..15), one gate-copy unit writes the LOW
+    nibble (``LI_RELOAD_B1+nib = silu(disc) * OUTPUT_LO+nib``) and one writes the
+    HIGH nibble (``LI_RELOAD_B1+(16+nib) = silu(disc) * OUTPUT_HI+nib``). The
+    ``gate_terms`` carry the per-cell ``OUTPUT_*`` value; the silu pre-activation
+    is the shared CAPTURE discriminator (which requires a NONZERO high nibble via
+    ``OUTPUT_HI[1..15]``), so the firing factor is identical for all 32 cells and
+    the byte-1 nibble argmax is preserved into the band. On a byte-1 == 0 load the
+    discriminator stays below threshold, so the band is left EMPTY (the restore is
+    then a no-op there).
+    """
+    rules: list[FFNRule] = []
+    for nib in range(16):
+        rules.append(
+            multi_way_and_rule(
+                name=f"sili_b1_capture_lo_{nib}",
+                conditions=_SILI_B1_CAPTURE_CONDS,
+                threshold=_SILI_B1_CAPTURE_THRESHOLD,
+                gate_terms=((f"OUTPUT_LO+{nib}", 1.0),),
+                writes=((f"LI_RELOAD_B1+{nib}", 1.0),),
+                scope="LI_RELOAD_B1",
+            )
+        )
+    for nib in range(16):
+        rules.append(
+            multi_way_and_rule(
+                name=f"sili_b1_capture_hi_{nib}",
+                conditions=_SILI_B1_CAPTURE_CONDS,
+                threshold=_SILI_B1_CAPTURE_THRESHOLD,
+                gate_terms=((f"OUTPUT_HI+{nib}", 1.0),),
+                writes=((f"LI_RELOAD_B1+{16 + nib}", 1.0),),
+                scope="LI_RELOAD_B1",
+            )
+        )
+    return tuple(rules)
+
+
+def make_layer14_sili_b1_capture_op() -> Operation:
+    """CAPTURE FFN: snapshot the loaded AX byte-1 into ``LI_RELOAD_B1``.
+
+    Standalone ``PureFFN`` post_op on the L13/L10 mem-addr anchor block (block
+    16), where the loaded byte-1 is fresh in OUTPUT and BEFORE the block-32 slam.
+    CAMPAIGN-ONLY: a no-op when ``sili_b1_restore_enabled`` is False (the band is
+    omitted and this op is not registered, golden ``7f6f2e5d`` byte-identical).
+    """
+    if not sili_b1_restore_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="layer14_sili_b1_capture",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="_layer13_mem_addr_anchor",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md",
+        )
+
+    rules = _sili_b1_capture_rules()
+    assert len(rules) == _SILI_B1_CAPTURE_HIDDEN_DIM, (
+        f"sili_b1_capture rule-count drift: {len(rules)} "
+        f"!= {_SILI_B1_CAPTURE_HIDDEN_DIM}"
+    )
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+    return Operation(
+        name="layer14_sili_b1_capture",
+        reads={"IS_BYTE", "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_3", "OP_IMM", "MARK_AX", "MEM_STORE",
+               "ADDR_B1_LO", "ADDR_B1_HI", "OUTPUT_LO", "OUTPUT_HI"},
+        writes={"LI_RELOAD_B1"},
+        kind="block",
+        # Block 16 (the L10 head-1 byte-1 delivery / L13 mem-addr anchor host);
+        # the loaded byte-1 is present in OUTPUT here, BEFORE the block-32 slam.
+        target_op_name="_layer13_mem_addr_anchor",
+        declarative_bake_fn=_make_standalone_pure_ffn_post_op_bake(rules),
+        compiler_ir=ir,
+        declarative_authority="spec_generated",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md",
+    )
+
+
+def _sili_b1_restore_rules() -> tuple[FFNRule, ...]:
+    """32 rules: ``OUTPUT_{LO,HI}[nib] = LI_RELOAD_B1[j]`` on the LI-reload row.
+
+    Re-supplies the captured loaded byte-1 nibbles into OUTPUT at a DOMINANT
+    magnitude (``_SILI_B1_RESTORE_WS``) so the restored byte-1 out-votes the
+    block-32 slam. The gate carries the carried-band cell. The conditions use the
+    looser ADDR_B1 discriminator (the OUTPUT_HI 16-bit term is unusable post-slam);
+    the restore is self-gating via the EMPTY ``LI_RELOAD_B1`` band -> a byte-1 == 0
+    load (or a store byte-1 row) has an empty band -> the gate-write is 0 (no-op).
+    """
+    rules: list[FFNRule] = []
+    for nib in range(16):
+        rules.append(
+            multi_way_and_rule(
+                name=f"sili_b1_restore_lo_{nib}",
+                conditions=_SILI_B1_RESTORE_CONDS,
+                threshold=_SILI_B1_RESTORE_THRESHOLD,
+                gate_terms=((f"LI_RELOAD_B1+{nib}", _SILI_B1_RESTORE_WS),),
+                writes=((f"OUTPUT_LO+{nib}", 1.0),),
+                scope="LI_RELOAD_B1",
+            )
+        )
+    for nib in range(16):
+        rules.append(
+            multi_way_and_rule(
+                name=f"sili_b1_restore_hi_{nib}",
+                conditions=_SILI_B1_RESTORE_CONDS,
+                threshold=_SILI_B1_RESTORE_THRESHOLD,
+                gate_terms=((f"LI_RELOAD_B1+{16 + nib}", _SILI_B1_RESTORE_WS),),
+                writes=((f"OUTPUT_HI+{nib}", 1.0),),
+                scope="LI_RELOAD_B1",
+            )
+        )
+    return tuple(rules)
+
+
+def make_sili_b1_restore_op() -> Operation:
+    """RESTORE FFN: re-supply the loaded AX byte-1 into OUTPUT after the slam.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block, appended AFTER
+    ``tail_bit32_result_correction`` so it is the LAST OUTPUT writer before the
+    LM head and therefore DOMINATES the block-32 (L18) slam additively. Reads the
+    carried ``LI_RELOAD_B1`` band. CAMPAIGN-ONLY: a no-op when
+    ``sili_b1_restore_enabled`` is False (golden ``7f6f2e5d`` byte-identical).
+    """
+    if not sili_b1_restore_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="sili_b1_restore",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "tail_bit32_result_correction"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md",
+        )
+
+    rules = _sili_b1_restore_rules()
+    assert len(rules) == _SILI_B1_RESTORE_HIDDEN_DIM, (
+        f"sili_b1_restore rule-count drift: {len(rules)} "
+        f"!= {_SILI_B1_RESTORE_HIDDEN_DIM}"
+    )
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+    return Operation(
+        name="sili_b1_restore",
+        reads={"IS_BYTE", "H1", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+               "BYTE_INDEX_3", "OP_IMM", "MARK_AX", "MEM_STORE",
+               "ADDR_B1_LO", "ADDR_B1_HI", "LI_RELOAD_B1"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=_make_standalone_pure_ffn_post_op_bake(rules),
+        compiler_ir=ir,
+        declarative_authority="spec_generated",
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="FUNC_LEV_IS_LI_FROM_FRAME_37TOKEN_DESYNC_2026_06_14.md",
     )
 
 
