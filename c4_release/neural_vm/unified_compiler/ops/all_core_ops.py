@@ -778,6 +778,19 @@ def all_core_ops(
         # Gated by C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
         # See l0_ops.make_no_stack0_se_output_clear_op.
         make_no_stack0_se_output_clear_op(),
+        # No-STACK0 (30-token) MEM-MARKER-row OUTPUT-clear FFN: drives OUTPUT_LO/HI
+        # hugely negative at the bounded NEXT_MEM one-hot row (the BP-byte3 row
+        # whose logits decide the MEM marker) so the LM head emits Token.MEM (not
+        # a stray ALU-result value byte) -> the NEXT_MEM->NEXT_SE->NEXT_PC marker
+        # chain fires and the next step's REG_PC is emitted. Fixes the
+        # var_update SI-store / if_var BZ-branch SILENCE collapse (the model went
+        # quiet after the store/branch because the leaked result byte broke the
+        # marker chain). Standalone PureFFN post_op on the L25 tail block after
+        # no_stack0_se_output_clear (LAST OUTPUT writer at the MEM-marker row).
+        # Gated by C4_NO_STACK0_EMIT + C4_MEM_MARKER_OUTPUT_CLEAR (default ON);
+        # flag-OFF bakes NO units (byte-identical to HEAD's 35-token golden).
+        # See l0_ops.make_no_stack0_mem_marker_output_clear_op.
+        make_no_stack0_mem_marker_output_clear_op(),
         # No-STACK0 (30-token) PC value-byte OUTPUT-clear FFN (Inc 0): at the
         # PC value-byte rows (H1+0 PC-marker proximity + IS_BYTE + per-byte
         # BYTE_INDEX one-hot) sinks OUTPUT high nibbles so the PC HIGH bytes

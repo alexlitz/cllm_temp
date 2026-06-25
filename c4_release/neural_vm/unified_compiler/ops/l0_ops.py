@@ -726,6 +726,205 @@ def make_no_stack0_se_output_clear_op() -> Operation:
 
 
 # ===========================================================================
+# No-STACK0 (30-token) MEM-MARKER-row OUTPUT clear (C4_NO_STACK0_EMIT)
+# ===========================================================================
+#
+# ROOT (spec_k=0, GPU1 full_trace; tools/probe_pcframe_tokdump.py +
+# probe_memrow_output_nibbles.py): the var_update / if_var "PC-framing wall"
+# (var_update step 13 SI store, if_var step 11 BZ branch -> got pc=None) is a
+# SILENCE collapse, NOT a marker-shift desync (inter-PC gaps are all exactly
+# 30). The STORE/branch step emits a CLEAN register frame through BP (REG_PC,
+# REG_AX=correct, REG_SP, REG_BP), then at the MEM-marker-emitting row (off19,
+# the BP-byte3 row whose logits decide the MEM marker at off20) the model emits
+# a STRAY VALUE BYTE instead of the MEM marker -> the NEXT_MEM -> NEXT_SE ->
+# NEXT_PC marker chain never fires -> NEXT_PC=0 at the (would-be) STEP_END row
+# -> the LM head's REG_PC logit (20*NEXT_PC) collapses and token 0 wins for
+# EVERY remaining step (the model goes silent). The decoder then reads pc=None.
+#
+# WHY the stray byte wins (proven per-nibble): the L0 marker chain DOES fire
+# NEXT_MEM=+1.37 at off19 (correct -- the MEM marker SHOULD emit). The MEM
+# marker logit is head[MEM,NEXT_MEM]*1.37 - 10 = +17.4. But the L20/L25 tail
+# FFN SPRAYS the ALU store-result into OUTPUT at the MEM-section rows: when the
+# stored value comes from the ALU (e.g. var_update's x=x+7 -> 57 -> OUTPUT_LO[9]
+# = OUTPUT_HI[3] = +8e14) the byte-57 head logit = 5*OUTPUT_LO[9]+5*OUTPUT_HI[3]
+# - 80*NEXT_MEM ~= +8e15, blowing past the +17.4 MEM marker so byte 57 wins. For
+# the PASSING var_simple store (immediate value, no ALU spray) OUTPUT at off19 is
+# uniformly NEGATIVE (~-7e9 every nibble) so the MEM marker wins -- which is why
+# var_simple passes and var_update / if_var fail. The existing
+# ``_no_stack0_se_output_clear`` only sinks OUTPUT at the MARK_SE_ONLY (STEP_END)
+# row; it does NOT cover this MEM-marker row.
+#
+# FIX (this op): at the MEM-marker-predicting row ONLY -- gated on the bounded
+# ``NEXT_MEM`` one-hot (~1.37 at off19, ~0 at every value-byte row; the MEM
+# addr/val bytes live at off20..28 where NEXT_MEM=0, so a sink here CANNOT
+# corrupt a real address/value byte) -- drive OUTPUT_LO/HI hugely negative so the
+# byte-token logits sink far below the MEM marker (NEXT_MEM*20) and the marker
+# wins, restoring the NEXT_MEM->NEXT_SE->NEXT_PC chain and the next step's
+# REG_PC. OUTPUT at the MEM-marker row is semantically dead (the only token
+# emitted there is Token.MEM), so clobbering it is free -- exactly the
+# ``_no_stack0_se_output_clear`` design, one register row earlier. Standalone
+# ``PureFFN`` post_op appended AFTER the SE clear on the L25 tail block, so it is
+# the LAST OUTPUT writer before the LM head. Gated by ``C4_NO_STACK0_EMIT`` AND
+# the kill-switch ``C4_MEM_MARKER_OUTPUT_CLEAR`` (default ON under the campaign
+# flag); flag-OFF bakes NO units (byte-identical to HEAD's 35-token golden).
+_NO_STACK0_MEM_MARKER_OUTPUT_CLEAR_HIDDEN_DIM = 32  # OUTPUT_LO[0..15]+HI[0..15]
+# Same magnitude as the SE clear's ``-1e20``: it must dominate the ALU-result
+# spray (~+8e14..+3e20 measured) so every byte logit goes hugely negative and
+# the MEM marker (NEXT_MEM*20) wins the argmax at the MEM-marker row.
+_NO_STACK0_MEM_MARKER_OUTPUT_CLEAR_WW = -1.0e20
+
+
+def _mem_marker_output_clear_enabled() -> bool:
+    """Kill-switch for the MEM-marker OUTPUT clear (campaign-gated).
+
+    ON iff ``C4_NO_STACK0_EMIT`` is set AND ``C4_MEM_MARKER_OUTPUT_CLEAR`` is
+    not explicitly disabled (default ON under the campaign flag). The explicit
+    switch lets ``tools/flag_regression_gate.py --flag C4_MEM_MARKER_OUTPUT_CLEAR``
+    toggle the op ON/OFF inside the campaign config without disturbing the rest
+    of the no-STACK0 build.
+    """
+    if not _no_stack0_emit():
+        return False
+    return _os_l0.environ.get("C4_MEM_MARKER_OUTPUT_CLEAR", "1") != "0"
+
+
+def _no_stack0_mem_marker_output_clear_rules() -> tuple[FFNRule, ...]:
+    """32 AND rules sinking OUTPUT_LO/HI hugely negative at the MEM-marker row.
+
+    Each unit fires on the bounded ``NEXT_MEM`` one-hot (~1.37 at the row that
+    emits Token.MEM, ~0 elsewhere) with the register/section markers ANDed in as
+    -1000 blockers (defensive -- NEXT_MEM is already exclusive to that row), and
+    writes a large-negative value into one OUTPUT nibble. On a fire the
+    balanced-AND silu saturates; the write sinks OUTPUT well below the L20/L25
+    ALU-result spray so the LM head's byte logits (head[byte, OUTPUT_*+k]=+5) go
+    hugely negative and the MEM marker (head[MEM, NEXT_MEM]=+20, NEXT_MEM fired
+    here) wins -> the NEXT_MEM->NEXT_SE->NEXT_PC chain proceeds.
+    """
+    BLOCKER_W = 1_000.0
+    conditions = (
+        ("NEXT_MEM", 1.0),
+        ("MARK_PC", -BLOCKER_W),
+        ("MARK_AX", -BLOCKER_W),
+        ("MARK_SP", -BLOCKER_W),
+        ("MARK_BP", -BLOCKER_W),
+        ("MARK_MEM", -BLOCKER_W),
+        ("MARK_SE_ONLY", -BLOCKER_W),
+    )
+    WW = _NO_STACK0_MEM_MARKER_OUTPUT_CLEAR_WW
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"no_stack0_mem_marker_output_clear_lo_{k}",
+            conditions=conditions,
+            threshold=0.5,
+            writes=((f"OUTPUT_LO+{k}", WW),),
+        ))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"no_stack0_mem_marker_output_clear_hi_{k}",
+            conditions=conditions,
+            threshold=0.5,
+            writes=((f"OUTPUT_HI+{k}", WW),),
+        ))
+    return tuple(rules)
+
+
+def make_no_stack0_mem_marker_output_clear_op() -> Operation:
+    """Append the no-STACK0 MEM-marker OUTPUT-clear FFN after the SE clear.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block (appended AFTER
+    ``no_stack0_se_output_clear``), so it is the LAST writer of OUTPUT on the
+    MEM-marker row before the LM head. Gated by ``C4_NO_STACK0_EMIT`` +
+    ``C4_MEM_MARKER_OUTPUT_CLEAR`` (default ON under the campaign flag); flag-OFF
+    bakes NO units (byte-identical to HEAD). See the module-level block comment
+    above for the root cause / mechanism.
+    """
+    if not _mem_marker_output_clear_enabled():
+        # OFF: register a no-op so the dep graph / op list is stable but no
+        # weights change (byte-identical to the pre-flag build).
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="no_stack0_mem_marker_output_clear",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "no_stack0_se_output_clear"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="STACK0_VIA_MEM_ATTENTION_PLAN.md#10",
+        )
+
+    rules = _no_stack0_mem_marker_output_clear_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _NO_STACK0_MEM_MARKER_OUTPUT_CLEAR_HIDDEN_DIM, (
+            f"no_stack0_mem_marker_output_clear rule-count drift: produced "
+            f"{len(rules)}, expected "
+            f"{_NO_STACK0_MEM_MARKER_OUTPUT_CLEAR_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="no_stack0_mem_marker_output_clear",
+        reads={
+            "NEXT_MEM", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+            "MARK_MEM", "MARK_SE_ONLY",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # Append AFTER the SE clear on the L25 block, so this op is the last
+        # writer of OUTPUT on the MEM-marker row before the LM head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "no_stack0_se_output_clear"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="STACK0_VIA_MEM_ATTENTION_PLAN.md#10",
+    )
+
+
+# ===========================================================================
 # No-STACK0 (30-token) PC value-byte OUTPUT clear (C4_NO_STACK0_EMIT) -- Inc 0
 # ===========================================================================
 #
