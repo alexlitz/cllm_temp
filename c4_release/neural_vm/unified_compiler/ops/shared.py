@@ -524,6 +524,66 @@ def shift_output_byte0_clear_enabled() -> bool:
     return os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
 
 
+def mul_multibyte_l19_boost_enabled() -> bool:
+    """Return True iff the NARROWED MULTI-byte MUL byte-0 product is BOOSTED on
+    the LITERAL-mul ``MUL+MARK_AX`` product row so it survives the block-34
+    (logical L19) OUTPUT-byte-0 overwrite (DEFAULT ON in the campaign config —
+    opt-out via ``C4_MUL_MULTIBYTE_L19_BOOST=0``; only takes effect under
+    ``C4_NO_STACK0_EMIT=1`` + ``C4_MUL_BYTE0_SE_RECOVER=1``, so flag-OFF /
+    non-campaign is byte-identical to golden ``7f6f2e5d``).
+
+    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
+    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the 6 multi-byte
+    LITERAL-mul fails ``{127,130,134,139,141,144}`` = ``28*70, 92*40, 58*16,
+    76*29, 91*81, 43*10`` — the byte-0 of a product whose byte 1 != 0. The
+    ``mul_l19_product_boost`` cap handles the SINGLE-byte products (byte 1 ==
+    0); these multi-byte ones keep a CLEAN byte-0 one-hot (mag ~14.3 through
+    block 32) but at block 34 (logical L19) a PureFFN ADDS the BYTE-1 value into
+    ``OUTPUT_LO`` at a DOMINANT magnitude (~180.8 at the byte-1 cell) on the
+    MARK_AX row, so the LM-head argmax flips the byte-0 LOW nibble to the byte-1
+    value (``1960 -> 1799 = 0x0707``).
+
+    THE NARROWING (vs the dropped 2026-06-24 version, which gated only on
+    ``res_b1 >= 0.5`` and so ALSO fired on ``var_mul``'s multi-byte MUL row —
+    where the L11 wide_mul has ALREADY mis-fired on the crushed multi-local
+    operand band so the boosted OUTPUT is garbage, REGRESSING ``var_mul``): the
+    boost is gated to fire ONLY on the LITERAL-mul product row. The
+    DISCRIMINATOR (probed spec_k=0 READING the EXACT ``state.x_bd_in`` the
+    FlattenedALUMul composite receives, BUILT dims, on the MUL+MARK_AX
+    first-fire row): the ``STACK0_B0_H1_PREV`` + ``STACK0_B0_H3_PREV`` cross-step
+    carry band SUM (the ``C4_STACK0_B0_DUMP`` re-supply that only runs in a
+    MULTI-step / multi-local frame) is
+
+      * LITERAL mul (``return N*M;`` -> IMM/PSH/IMM/MUL, no ENT frame): 55..667
+      * ``var_mul`` (``int a;int b;a=N;b=M;return a*b;`` -> ENT frame +
+        LI-loaded operands -> cross-step STACK0 carry active): 7379 (rock-solid
+        UNIFORM across var_mul_0..23).
+
+    The band is NON-ZERO on the literal row at the COMPOSITE INPUT (block-30
+    attention adds it) even though it is ~0 at the block-29 OUTPUT — so the gate
+    reads ``x_bd_in`` and splits on MAGNITUDE: ``var_frame_carry < 2000`` (a >3x
+    margin on BOTH sides: 667 << 2000 << 7379) marks the literal frame. So the
+    narrowed gate adds that test to the multi-byte test -> the boost fires on
+    the 6 literal fails ONLY and leaves every ``var_mul`` row untouched.
+
+    FIX. ``_MulCombineStage`` marks the LITERAL multi-byte MUL+MARK_AX rows
+    (``res_b1 >= 0.5`` AND ``var_frame_carry < 2000`` AND NOT the single-byte
+    cap row); ``_GEToBDStage`` SCALES (25x, NO clear — the band is a clean
+    one-hot, not a flood) the byte-0 ``OUTPUT_LO/HI`` band there so the true
+    product LOW nibble out-votes the L19 add. byte-0 (``OUTPUT_LO/HI``) ONLY ->
+    the byte-1 ``AX_FULL`` relay (a different emit row) is untouched; a uniform
+    scale of a single-cell one-hot is argmax-invariant so the PASSING multi-byte
+    literal muls (21*59, 65*98, ...) are byte-identical.
+
+    DEFAULT ON. Opt-out via ``C4_MUL_MULTIBYTE_L19_BOOST=0`` restores the
+    unboosted byte-0 (flag-OFF, or ``C4_NO_STACK0_EMIT=0``, or
+    ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden — the boost
+    path is campaign-only). Kept as a dedicated kill-switch for
+    ``tools/flag_regression_gate.py``.
+    """
+    return os.environ.get("C4_MUL_MULTIBYTE_L19_BOOST", "1") != "0"
+
+
 def cmp_eq_hinib_veto_enabled() -> bool:
     """Return True iff the EQ engine's HIGH-nibble artifact-veto is active
     (DEFAULT ON in the campaign config — opt-out via

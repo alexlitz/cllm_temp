@@ -835,7 +835,7 @@ class _MulPipelineState:
     __slots__ = (
         'x_bd_in', 'x_ge_flat', 'x_mul',
         'x_ge_out', 'opcode_mask', 'x_bd_out',
-        'output_clear_mask',
+        'output_clear_mask', 'multibyte_boost_mask',
     )
 
     def __init__(self):
@@ -850,6 +850,13 @@ class _MulPipelineState:
         # _MulCombineStage when the L11 wide_mul flood is detected, applied by
         # _GEToBDStage). None outside the campaign config -> no clear.
         self.output_clear_mask = None
+        # Campaign NARROWED MUL MULTI-byte L19 byte-0 boost: [B, seq_len] mask
+        # of the LITERAL-mul MULTI-byte (byte 1 != 0, var-frame carry absent)
+        # MUL+MARK_AX rows whose CLEAN byte-0 OUTPUT_LO/HI band must be SCALED UP
+        # (NOT cleared) so it survives the block-34 / logical-L19 byte-0
+        # overwrite (set by _MulCombineStage, applied by _GEToBDStage). None
+        # outside the campaign config -> no boost.
+        self.multibyte_boost_mask = None
 
 
 class _BDToGEStage(nn.Module):
@@ -977,10 +984,12 @@ class _MulCombineStage(nn.Module):
         # is written. Gated on no_stack0_emit so the golden 35-token path
         # (clean positive operand one-hots, no flood) is byte-identical.
         output_clear_mask = None
+        multibyte_boost_mask = None
         from .unified_compiler.ops.shared import (
             no_stack0_emit_enabled,
             mul_byte0_se_recover_enabled,
             mul_l19_flood_cap_enabled,
+            mul_multibyte_l19_boost_enabled,
         )
         if no_stack0_emit_enabled() and mul_byte0_se_recover_enabled():
             # The cap fires only on rows where THIS composite is the MUL writer
@@ -1032,11 +1041,71 @@ class _MulCombineStage(nn.Module):
             already_fired = already_fired * (~cap_row).float()
             output_clear_mask = cap_row.float()
 
+            # NARROWED MULTI-byte L19 byte-0 boost (2026-06-25,
+            # C4_MUL_MULTIBYTE_L19_BOOST). The single-byte cap above leaves the
+            # MULTI-byte products (byte 1 != 0) on the default ~14.3 byte-0 band.
+            # The block-34 / logical-L19 PureFFN then ADDS the byte-1 value into
+            # OUTPUT_LO at ~180 on the MARK_AX row of the 6 LITERAL multi-byte
+            # fails {127,130,134,139,141,144}, so the byte-0 LOW nibble argmax
+            # flips to the byte-1 value (1960 -> 1799 = 0x0707). The byte-0 band
+            # is a CLEAN one-hot here (mag ~14.3, NOT a flood), so we mark these
+            # rows for a byte-0-only OUTPUT SCALE (no clear) in _GEToBDStage so
+            # the true product cell out-votes the L19 add.
+            #
+            # NARROWING vs the dropped res_b1-only version (which fired on
+            # var_mul's multi-byte MUL too and REGRESSED it -> its L11 wide_mul
+            # has already mis-fired on the crushed multi-local operand band so
+            # the boosted OUTPUT is garbage). DISCRIMINATOR (probed spec_k=0
+            # READING the EXACT ``state.x_bd_in`` the composite receives, BUILT
+            # dims, on the MUL+MARK_AX first-fire row): the STACK0_B0_H1_PREV +
+            # STACK0_B0_H3_PREV cross-step carry band sum (the C4_STACK0_B0_DUMP
+            # re-supply that only runs in a MULTI-step / multi-local frame) is
+            #   * LITERAL mul (return N*M; single step, no ENT frame):  55..667
+            #   * var_mul (ENT frame + LI-loaded multi-local operands): 7379
+            #     (rock-solid UNIFORM across var_mul_0..23).
+            # The threshold VAR_FRAME_CARRY_MIN = 2000 sits with a >3x margin on
+            # BOTH sides (667 << 2000 << 7379) -> the boost fires on the 6
+            # literal fails ONLY and leaves every var_mul row untouched (its
+            # carry is 7379 >> 2000 -> NOT a literal frame). Excludes the capped
+            # (single-byte) rows so the two paths never double-apply.
+            #
+            # NOTE: the carry band is NON-ZERO on the literal row at the COMPOSITE
+            # INPUT (block-30 attention adds it) even though it is ~0 at the
+            # block-29 OUTPUT — so the gate MUST read x_bd_in (this residual) and
+            # use the 2000 magnitude split, NOT a near-zero threshold.
+            if mul_multibyte_l19_boost_enabled():
+                # Product byte-1 nibbles live at GE result positions 2 and 3.
+                res_b1_mb = (
+                    x_ge_out[:, :, 2, ge.RESULT].abs()
+                    + x_ge_out[:, :, 3, ge.RESULT].abs()
+                )
+                # Var-frame discriminator: the cross-step STACK0 byte-0 dump
+                # carry band — LARGE (~7379) in the multi-local var_mul frame,
+                # MODERATE (<=667) for the single-step literal mul.
+                BD = self.BD
+                h1p = int(BD.STACK0_B0_H1_PREV)
+                h3p = int(BD.STACK0_B0_H3_PREV)
+                var_frame_carry = (
+                    x_bd[:, :, h1p:h1p + 16].abs().sum(dim=-1)
+                    + x_bd[:, :, h3p:h3p + 16].abs().sum(dim=-1)
+                )
+                VAR_FRAME_CARRY_MIN = 2000.0
+                literal_frame = var_frame_carry < VAR_FRAME_CARRY_MIN
+                multibyte_row = (
+                    (op_mul.view(B, seq_len) > 0.5)
+                    & (mark_ax > 0.5)
+                    & (res_b1_mb >= 0.5)
+                    & (~cap_row)
+                    & literal_frame
+                )
+                multibyte_boost_mask = multibyte_row.float()
+
         opcode_mask = opcode_mask * (1.0 - already_fired)
 
         state.x_ge_out = x_ge_out
         state.opcode_mask = opcode_mask
         state.output_clear_mask = output_clear_mask
+        state.multibyte_boost_mask = multibyte_boost_mask
         return state
 
 
@@ -1102,6 +1171,38 @@ class _GEToBDStage(nn.Module):
                 MUL_L19_PRODUCT_BOOST = 25.0
                 boost = state.output_clear_mask[:, :, None]  # [B,seq,1] 0/1
                 scale = 1.0 + boost * (MUL_L19_PRODUCT_BOOST - 1.0)
+                lo = slice(BD.OUTPUT_LO, BD.OUTPUT_LO + 16)
+                hi = slice(BD.OUTPUT_HI, BD.OUTPUT_HI + 16)
+                x_bd_out = state.x_bd_out.clone()
+                x_bd_out[:, :, lo] = x_bd_out[:, :, lo] * scale
+                x_bd_out[:, :, hi] = x_bd_out[:, :, hi] * scale
+                state.x_bd_out = x_bd_out
+
+        # NARROWED MUL MULTI-byte L19 byte-0 BOOST (2026-06-25). The single-byte
+        # cap (output_clear_mask) handles products with byte 1 == 0. The
+        # LITERAL multi-byte products {127,130,134,139,141,144} keep a CLEAN
+        # byte-0 one-hot (mag ~14.3, NOT a flood -> never cleared), but the
+        # block-34 / logical-L19 PureFFN ADDS the byte-1 value into OUTPUT_LO at
+        # ~180 on the MARK_AX row, so the byte-0 LOW nibble argmax flips to the
+        # byte-1 value (1960 -> 1799 = 0x0707). SCALE the byte-0 OUTPUT_LO/HI
+        # band on those rows so the true product cell beats the L19 add. NO
+        # clear: the band is already a clean single-cell one-hot, so a uniform
+        # scale only lifts the true cell (a one-hot's argmax is scale-invariant
+        # -> the PASSING multi-byte literal muls are byte-identical). byte-0
+        # (OUTPUT_LO/HI) ONLY -> the byte-1 AX_FULL relay (a different emit row)
+        # is untouched. The mask is var-frame-GATED (set only on the literal
+        # multi-byte rows in _MulCombineStage), so var_mul is NOT boosted -> the
+        # var_mul-regressing failure mode of the dropped res_b1-only fix is
+        # avoided. Gated on no_stack0_emit + mul_byte0_se_recover (the mask is
+        # None otherwise) so the golden 35-token path is byte-identical.
+        if state.multibyte_boost_mask is not None:
+            from .unified_compiler.ops.shared import (
+                mul_multibyte_l19_boost_enabled,
+            )
+            if mul_multibyte_l19_boost_enabled():
+                MUL_MULTIBYTE_L19_BOOST = 25.0
+                boost = state.multibyte_boost_mask[:, :, None]  # [B,seq,1] 0/1
+                scale = 1.0 + boost * (MUL_MULTIBYTE_L19_BOOST - 1.0)
                 lo = slice(BD.OUTPUT_LO, BD.OUTPUT_LO + 16)
                 hi = slice(BD.OUTPUT_HI, BD.OUTPUT_HI + 16)
                 x_bd_out = state.x_bd_out.clone()
