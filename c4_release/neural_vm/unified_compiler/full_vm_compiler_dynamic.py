@@ -77,6 +77,7 @@ from .layer_compiler import (
 from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
 from .ir import ModelArchitectureSpec
 from . import _legacy_redirect as _static
+from .ops.shared import operand_from_memsp_enabled
 from ..kv_eviction import KVEvictionPolicy
 
 
@@ -2366,6 +2367,17 @@ def compile_full_vm_dynamic(
             "C4_SILI_B1_RESTORE": (
                 os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
             ),
+            # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2,
+            # DEFAULT-OFF building block, opt in =1, BAKE-affecting): registers
+            # the LEA_REREAD_B0 band + the capture / restore PureFFN ops, so the
+            # ON / OFF builds STRUCTURALLY differ (different d_model + extra FFN
+            # units) and must never share a memo entry. Gated on
+            # ``operand_from_memsp_enabled()``. ZERO-SUM vs the func_identity HOLD
+            # gate, so default-OFF. See shared.func_lea_b0_restore_enabled.
+            "C4_FUNC_LEA_B0_RESTORE": (
+                operand_from_memsp_enabled()
+                and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
+            ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
             # ON / OFF builds bake a different W_q row and must never share a
@@ -2408,6 +2420,20 @@ def compile_full_vm_dynamic(
             # a memo entry. See shared.l15_lookup_cmp_veto_enabled.
             "C4_L15_LOOKUP_CMP_VETO": (
                 os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
+            ),
+            # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/
+            # max/min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): when
+            # active it adds a Q/K scoring slot (OP_LEA x OP_ENT) to the SHARED
+            # L7 operand-gather head 1, re-pinning the re-read LEA's gather onto
+            # the live ENT-frame BP row. The ON / OFF builds differ in W_q/W_k
+            # so they must NEVER share a memo entry. Gated on
+            # ``operand_from_memsp_enabled()`` (the campaign prerequisite is
+            # DEFAULT-ON post-flip; reading the raw env ``== "1"`` here would
+            # default OFF and let the campaign ON bake collide with a non-campaign
+            # cache entry). See shared.func_lea_reread_bp_resharpen_enabled.
+            "C4_FUNC_LEA_REREAD_BP_RESHARPEN": (
+                operand_from_memsp_enabled()
+                and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -3056,6 +3082,17 @@ def _bake_from_scheduled_ops(
         "C4_SILI_B1_RESTORE": (
             os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
         ),
+        # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2, DEFAULT-OFF
+        # building block, opt in =1, BAKE-affecting): registers the LEA_REREAD_B0
+        # band + the capture / restore PureFFN ops so ON / OFF builds STRUCTURALLY
+        # differ (d_model + extra FFN units) and must never share a serialised
+        # entry. Gated on ``operand_from_memsp_enabled()``. ZERO-SUM vs the
+        # func_identity HOLD gate, so default-OFF. See
+        # shared.func_lea_b0_restore_enabled.
+        "C4_FUNC_LEA_B0_RESTORE": (
+            operand_from_memsp_enabled()
+            and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
+        ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF
         # builds must never share a serialised entry. See
@@ -3097,6 +3134,18 @@ def _bake_from_scheduled_ops(
         "C4_L10_ENT_AXCARRY": (
             os.environ.get("C4_L10_ENT_AXCARRY", "1") != "0"
             and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+        ),
+        # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/max/
+        # min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): adds a Q/K
+        # scoring slot to the SHARED L7 operand-gather head 1. The ON / OFF
+        # builds differ in W_q/W_k so they must NEVER share a serialised entry.
+        # Gated on ``operand_from_memsp_enabled()`` (DEFAULT-ON post-flip;
+        # reading the raw env ``== "1"`` would default OFF and let the campaign
+        # ON bake collide with a non-campaign cache entry). See
+        # shared.func_lea_reread_bp_resharpen_enabled.
+        "C4_FUNC_LEA_REREAD_BP_RESHARPEN": (
+            operand_from_memsp_enabled()
+            and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

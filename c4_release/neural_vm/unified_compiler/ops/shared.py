@@ -667,6 +667,69 @@ def cmp_gt_lo_margin_enabled() -> bool:
     return os.environ.get("C4_CMP_GT_LO_MARGIN", "1") != "0"
 
 
+def func_lea_reread_bp_resharpen_enabled() -> bool:
+    """Return True iff the L7 head-1 re-read-LEA BP-frame re-sharpen is active
+    (DEFAULT ON in the campaign config — opt-out via
+    ``C4_FUNC_LEA_REREAD_BP_RESHARPEN=0``; only takes effect when the operand
+    read is re-routed to ``mem[SP]`` i.e. ``C4_OPERAND_FROM_MEMSP=1``, so
+    flag-OFF / non-campaign builds are byte-identical to golden ``7f6f2e5d``).
+
+    The wall this lifts (GPU-confirmed, agent adc27e branch ``worktree-agent-
+    adc27e4fcbefaa6fd`` commit ``57363ac4``; re-verified spec_k=0, BUILT dims,
+    campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``;
+    ``tools/_probe_lea_head1_attn.py``): the func_add/mul/square/max/min
+    clusters (575-699) fail at the **re-read LEA** (the 2nd ``LEA n`` for a
+    callee's later parameter — e.g. ``func_add`` step 11 ``LEA 16`` for &b,
+    want ax=0xFFE0; value-INDEPENDENT).
+
+    L7 head-1 (``layer7_operand_gather.head_1``) gathers the live frame BP/SP
+    OUTPUT into the ALU at the LEA AX marker (operand-A address relay). Its K
+    attends to BP/SP MARKER rows recency-ordered by the head's ALiBi slope
+    (0.5). The BP marker row that actually CARRIES the live frame value is the
+    one emitted on the frame-establishing ``ENT`` step (probed: ``OP_ENT=5.0``
+    and ``OUTPUT_LO[0]~=14.9`` on that row ONLY; every other BP marker row is
+    EMPTY — ``OP_ENT~=0``, ``OUTPUT_LO[0]~=1.0``). The FIRST LEA after the ENT
+    works because the ENT-frame BP row is still the most-recent BP marker (it
+    wins ALiBi recency). By the RE-READ LEA, three+ EMPTY BP marker rows
+    (emitted by the intervening LI/PSH/LEA steps) sit between the query and the
+    ENT-frame row, so ALiBi recency picks an EMPTY recent BP marker over the
+    value-carrying ENT-frame row (probed: re-read row 471 raw 205 EMPTY beats
+    value row 381 raw 160). The L8 LEA ALU is then EMPTY on the re-read → the
+    address relay collapses to background residue (~15x attenuated).
+
+    FIX (campaign-only, this flag): add ONE Q/K scoring slot to head-1, gated
+    on the QUERY side by ``OP_LEA`` and on the KEY side by ``OP_ENT``. The slot
+    contributes ``qw*kw * resid[q,OP_LEA] * resid[k,OP_ENT] * scale`` to the
+    attention score, so it fires ONLY when the query is a LEA step AND the key
+    is an ENT-frame BP row — re-pinning the re-read LEA's gather onto the LIVE
+    ENT-frame BP row (it out-scores the empty recent markers). ALiBi recency
+    breaks the tie between the two ENT-frame rows (caller `main` vs callee)
+    toward the more-recent INNER frame, which is exactly the frame the callee's
+    re-read LEA wants. On ADJ/ENT/non-LEA queries ``resid[q,OP_LEA]~=0`` so the
+    slot is inert (ADJ's SP gather is untouched); on EMPTY BP / SP / non-ENT
+    rows ``resid[k,OP_ENT]~=0`` so the slot adds nothing. This MIRRORS the
+    first-LEA-after-ENT behaviour for the re-read LEA without disturbing any
+    other gather.
+
+    SHARED-HEAD DISCIPLINE: ``layer7_operand_gather.head_1`` is a golden head
+    shared by ALL LEA/ADJ/ENT operand-A relays. The new Q/K writes land in a
+    FRESH scoring slot (head_dim is 111; slots 0/1 are the only ones used by
+    the head's Q/K scoring) and are ONLY emitted when this flag is on, so a
+    flag-OFF build never touches ``W_q``/``W_k`` → byte-identical golden.
+    ``tools/lint_cross_op_attention.py`` (MANDATORY for shared-head edits)
+    gates the post-softmax head OUTPUT at OTHER-op / OTHER-context probe rows.
+
+    DEFAULT ON. Opt-out via ``C4_FUNC_LEA_REREAD_BP_RESHARPEN=0`` (the
+    byte-identical-OFF path: flag-OFF, or ``C4_OPERAND_FROM_MEMSP=0``, are both
+    byte-identical to golden ``7f6f2e5d``). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_FUNC_LEA_REREAD_BP_RESHARPEN`` can
+    A/B it inside the campaign config.
+    """
+    if not operand_from_memsp_enabled():
+        return False
+    return os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
+
+
 def mul_l19_flood_cap_enabled() -> bool:
     """Return True iff the MUL L19-EXPLODE flood cap fires on MODERATE-magnitude
     (not just >100) wide_mul OUTPUT floods (DEFAULT ON in the campaign config —
@@ -1213,6 +1276,81 @@ def sili_b1_restore_enabled() -> bool:
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
         and os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
+    )
+
+
+def func_lea_b0_restore_enabled() -> bool:
+    """Return True iff the func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE
+    (Bug #2) is active. DEFAULT **OFF** (opt-in via ``C4_FUNC_LEA_B0_RESTORE=1``);
+    gated behind ``operand_from_memsp`` so the flag-OFF / non-campaign build is
+    byte-identical to golden ``cd54bfc0`` (the band + both ops are omitted).
+
+    *** DEFAULT-OFF: this building block FLIPS func_add (575) full_trace ON but
+    is ZERO-SUM vs the func_identity HOLD gate (550) — see WHY below. It is
+    committed as a working, byte-identity-safe building block (the
+    capture/restore machinery + the GPU localization) for the eventual upstream
+    fix, NOT enabled in the campaign default. ***
+
+    ROOT (measured spec_k=0, BUILT dim_positions, campaign config; GPU
+    block-trace ``tools/_probe_lea_addr_trace.py``): with the L7 head-1 re-read
+    re-sharpen (``func_lea_reread_bp_resharpen_enabled``, Bug #1) the func_add
+    re-read LEA (step 11 ``LEA 16`` for &b) computes its address byte-0 to
+    ``OUTPUT_LO`` LO-nibble cell **0** (0xE0, CORRECT) through physical block 41,
+    and a ``PureFFN`` in the L21 post-op chain (physical **block 42**) then
+    stamps LO-nibble cell **8** (+4.13e9 → 0xE8, WRONG). This op CAPTUREs the
+    pre-slam byte-0 LO one-hot into a private band at an early block and RESTOREs
+    it at the L25 tail via a winner-take-all that dominates the slam, flipping
+    func_add 575 step 11 → PASS (GPU-verified, ``run_1096_canonical --ids 575
+    --spec-k 0 --criterion full_trace`` 1/1).
+
+    WHY IT IS ZERO-SUM (the blueprint was incomplete): the block-42 stamp is NOT
+    a pure cross-step corruptor — it is a LOAD-BEARING byte-0 default that is
+    CORRECT for some LEAs and WRONG for others, and the two cases are NOT locally
+    separable. Measured (Bug-#1-only build, probe at block 20):
+
+      * func_add &a (FIRST LEA, step 8):  pre-slam cell-8 (0xE8) CORRECT, stamp 8 → no-op.
+      * func_add &b (RE-READ LEA, step 11): pre-slam cell-0 (0xE0) CORRECT, stamp 8 → WRONG.
+      * func_identity LEA (step 6):         pre-slam cell-0 (0xE0) **WRONG**, stamp 8 → 0xE8 CORRECT.
+
+    So func_identity RELIES on the block-42 stamp (its genuine pre-slam LEA
+    byte-0 is itself wrong = cell-0); func_add &b is BROKEN by it. At the LEA AX
+    row func_add's re-read LEA (row 491) and func_identity's LEA (row 293) are
+    BIT-IDENTICAL in every probed dim (only ``OP_LEA=5`` + ``MARK_AX=1``; the
+    desired addresses 0xFFE0 vs 0xFFE8 differ ONLY in the byte-0 LO nibble, with
+    identical byte-1/high-nibble), so NO local discriminator separates them.
+    Capturing+restoring the pre-slam value therefore FLIPS func_add (575→pass)
+    but REGRESSES func_identity (550 step 6 0xE8→0xE0). The TRUE fix is upstream
+    where the BP-frame LEA byte-0 is actually computed (so func_identity computes
+    0xE8 genuinely and the block-42 default is no longer load-bearing) — a deeper
+    build than a tail capture/restore. Full localization +
+    blueprint: ``docs/FUNC_LEA_BUG2_BLK42_ZEROSUM_2026_06_25.md``.
+
+    THE MACHINERY (two PureFFN ops, the SILI / ENT-AXCARRY precedent):
+
+      1. CAPTURE (``make_func_lea_b0_capture_op``): a PureFFN post_op on the
+         ``_layer13_mem_addr_anchor`` host, BEFORE the block-42 slam. 16 units AND
+         the LEA row discriminator (``MARK_AX + OP_LEA`` minus
+         ``OP_IMM``/``MEM_STORE``/non-AX marker rows) with ``OUTPUT_LO[k]`` at a
+         threshold BETWEEN the argmax (809.6) and runner-up (609.6) LO cells, so
+         the captured ``LEA_REREAD_B0`` band is a CLEAN one-hot at the address
+         nibble cell.
+
+      2. RESTORE (``make_func_lea_b0_restore_op``): a PureFFN post_op on the L25
+         tail AFTER ``tail_bit32_result_correction``. 16 winner-take-all units,
+         each gated by the clean one-hot band cell ``LEA_REREAD_B0+k`` and writing
+         ``+DOM`` at ``OUTPUT_LO+k`` and ``-DOM`` elsewhere (``DOM=50`` so
+         ``DOM * silu * band`` dominates the +4.13e9 slam). Exactly ONE cell rule
+         fires per captured LEA row (clean band), and the band is EMPTY on every
+         non-captured row → no-op there.
+
+    Self-gating: the band is EMPTY (all 0) on every non-captured row.
+    ``lint_cross_op_ffn`` gates the shared OUTPUT band at OTHER-op probe rows.
+    DEFAULT OFF; flag OFF (or off-campaign) omits the band + both ops (golden
+    ``cd54bfc0`` byte-identical).
+    """
+    return (
+        operand_from_memsp_enabled()
+        and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
     )
 
 

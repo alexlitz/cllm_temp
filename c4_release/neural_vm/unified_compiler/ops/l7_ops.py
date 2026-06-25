@@ -17,6 +17,7 @@ from .residual_band_registry import register_residual_band
 from .shared import (  # noqa: F401
     _as_setdim_proxy,
     _empty_compiler_ir_factory,
+    func_lea_reread_bp_resharpen_enabled,
     operand_from_memsp_enabled,
 )
 
@@ -353,6 +354,25 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
         _operand_gather_head0_dim_map(BD), head0_idx
     )
 
+    # CAMPAIGN re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/max/min,
+    # ids 575-699). See ``shared.func_lea_reread_bp_resharpen_enabled`` for the
+    # GPU-confirmed root: on the RE-READ LEA, ALiBi recency picks an EMPTY
+    # recent BP marker over the value-carrying ENT-frame BP row, so the L8 LEA
+    # ALU is empty and the address relay collapses. ONE fresh Q/K scoring slot
+    # (slot 2, otherwise unused by this head's Q/K) gated on OP_LEA (query) x
+    # OP_ENT (key) re-pins the gather onto the live ENT-frame BP row. The slot
+    # contributes ``Q2*K2 = (L*resid[q,OP_LEA]) * (L*resid[k,OP_ENT])`` to the
+    # pre-scale score, firing ONLY for a LEA query attending an ENT-frame row.
+    # ``L*L*5(OP_ENT)*0.0949(scale) ~= 107`` clears the measured ~45 raw-score
+    # gap by which the empty recent marker beats the value row. Campaign-gated +
+    # own kill-switch → flag-OFF writes NOTHING to W_q/W_k (byte-identical
+    # golden). Both sides use ``L`` so the slot's product stays well above the
+    # gap while staying inert on ADJ (OP_LEA~=0) and on empty BP/SP rows
+    # (OP_ENT~=0).
+    _reread = func_lea_reread_bp_resharpen_enabled()
+    _reread_q = (AP(2, BD.OP_LEA, L),) if _reread else ()
+    _reread_k = (AP(2, BD.OP_ENT, L),) if _reread else ()
+
     return (
         head0,
         DeclarativeAttentionHeadSpec(
@@ -387,12 +407,12 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
                 AP(0, BD.OP_IMM, -L * 30),
                 AP(1, BD.CONST, -L * 2),
                 AP(1, BD.MARK_AX, L * 3),
-            ),
+            ) + _reread_q,
             k=(
                 AP(0, BD.MARK_BP, L),
                 AP(0, BD.MARK_SP, L),
                 AP(1, BD.CONST, 1.0),
-            ),
+            ) + _reread_k,
             v=(
                 _band_projection_writes(1, BD.OUTPUT_LO)
                 + _band_projection_writes(17, BD.OUTPUT_HI)

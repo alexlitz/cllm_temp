@@ -602,6 +602,16 @@ def all_core_ops(
         # The L25-tail RESTORE half (make_sili_b1_restore_op) re-supplies the
         # captured byte-1 AFTER the slam. See l14_ops.make_layer14_sili_b1_capture_op.
         make_layer14_sili_b1_capture_op(),
+        # func re-read-LEA byte-0 LO-nibble CAPTURE (Bug #2, CAMPAIGN-ONLY,
+        # C4_FUNC_LEA_B0_RESTORE): a standalone PureFFN post_op on the block-16
+        # mem-addr anchor that snapshots the freshly-computed re-read LEA byte-0
+        # LO one-hot into the private LEA_REREAD_B0 band BEFORE the block-42 (L21)
+        # slam stamps the prior LEA's lo nibble. Self-gates to a no-op (empty
+        # reads/writes, band omitted) when the flag is off -> golden d0619711
+        # byte-identical. The L25-tail RESTORE half (make_func_lea_b0_restore_op)
+        # re-establishes the captured nibble AFTER the slam. See
+        # l14_ops.make_func_lea_b0_capture_op.
+        make_func_lea_b0_capture_op(),
         # Phase 6 Wave 7 demo: pure-declaration corrective op. One
         # ``FFNRule`` + ``pin=None`` auto-fit + slim ``bake_fn`` wrapper.
         # Byte-identically a no-op on the live corpus -- the demo proves
@@ -724,6 +734,16 @@ def all_core_ops(
         # flag is off (golden 7f6f2e5d byte-identical). See
         # l14_ops.make_sili_b1_restore_op (+ the CAPTURE half above).
         make_sili_b1_restore_op(),
+        # func re-read-LEA byte-0 LO-nibble RESTORE (Bug #2, CAMPAIGN-ONLY,
+        # C4_FUNC_LEA_B0_RESTORE): the POST-SLAM half. A standalone PureFFN post_op
+        # appended AFTER tail_bit32_result_correction (the LAST OUTPUT writer
+        # before the LM head) that re-establishes the captured re-read LEA byte-0
+        # LO nibble from LEA_REREAD_B0 into OUTPUT_LO via a per-cell
+        # winner-take-all that DOMINATES the block-42 (L21) ~4.13e9 LO slam.
+        # Self-gates to a no-op when the flag is off (golden d0619711
+        # byte-identical). See l14_ops.make_func_lea_b0_restore_op (+ the CAPTURE
+        # half above).
+        make_func_lea_b0_restore_op(),
         # STACK0 byte-0 carried-step flag precursor (Root 2): writes the BOUNDED
         # ``STACK0_B0_CARRIED`` gate flag at an EARLY block (L7 anchor) where the
         # same-step H3 byte-0 one-hot is still bounded (fresh ~3.3 present,
