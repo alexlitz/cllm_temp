@@ -75,6 +75,38 @@ def _ent_sp_byte1_ismark_blocker_on() -> bool:
     return _os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
 
 
+def _ent_frame_sp_byte0_psh_blocker_enabled() -> bool:
+    """Flag (DEFAULT ON): block the L20 ``l16_ent_frame_sp_byte0_*`` family from
+    misfiring on the PSH-at-SP step (the deepest nested/loop SP-decrement root).
+
+    ROOT (autoregressive + teacher-forced, BUILT dims, campaign config; id950
+    nested_quad step3): the L20 ``l16_ent_frame_sp_byte0_hi_lo0_0`` rule computes
+    the genuine-ENT SP byte0 high nibble (SP = 0xfff0 - 8 - imm) gated on
+    ``MARK_SP*10 + HAS_SE + OP_ENT*0.2`` plus the imm-matching ``FETCH_LO/HI``
+    nibble (threshold 20). On a PSH step the L6 PSH-decrement ALREADY produced the
+    correct deeper SP byte0 (0xfff0 - 8 = 0xffe8, HI nibble 0xE, intact through
+    block 34), but the ENT-frame rule MIS-FIRES there: the in-step ``OP_ENT``
+    broadcast residue (~0.2..9.8, opcode markers are NOT one-hot one VM step after
+    an ENT) plus the stale-zero ``FETCH_LO+0 / FETCH_HI+0`` (imm=0 signature)
+    clears the threshold, and ``result_hi = (15 - 0) = 0xF`` forces the SP byte0
+    high nibble 0xE -> 0xF (0xe8 -> 0xf8) at block 35. This is the documented
+    depth-blind SP byte0 reset: the live SP never tracks below 0xffe8, starving
+    the ENT-BP materializer + every LEA-local address in nested/loop frames.
+
+    FIX: add hard ``PSH_AT_SP`` AND ``CMP+4`` (JSR-bootstrap flag) NOT-blockers
+    to the ENT-frame SP byte0 conditions. Both flags == 2.0 on their respective
+    misfire step (PSH-at-SP / JSR) and == 0 on a genuine ENT step (where OP_ENT
+    carries the firing), so the blockers veto the misfire and are byte-identical
+    at every genuine ENT SP-marker row. Confirmed (teacher-forced, BUILT dims,
+    id950 nested_quad): step3 PSH 0xf8->0xe8, step4 JSR 0xe8->0xe0, and once the
+    upstream depth is preserved the genuine ENT step5 finally computes 0xd8 (was
+    0xf0) -- the full nested SP-decrement chain now tracks frame depth. Default
+    ON; ``C4_ENT_FRAME_SP_BYTE0_PSH_BLOCKER=0`` restores the legacy tuple
+    (byte-identical golden ``cd54bfc0``).
+    """
+    return _os.environ.get("C4_ENT_FRAME_SP_BYTE0_PSH_BLOCKER", "1") != "0"
+
+
 def _ent_sp_byte1_ff_h1_hardening_enabled() -> bool:
     """Flag for the ``l16_ent_frame_sp_byte1_ff`` H1+2 hard-requirement.
 
@@ -2011,6 +2043,23 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_BP", -1_000_000.0),
         ("MARK_STACK0", -1_000_000.0),
         ("MARK_MEM", -1_000_000.0),
+    ) + (
+        # PSH/JSR-step misfire blockers (default ON; see
+        # ``_ent_frame_sp_byte0_psh_blocker_enabled``). On a PSH-at-SP step OR a
+        # JSR-bootstrap step the L6 PSH/JSR-decrement already produced the
+        # correct deeper SP byte0 (e.g. 0xffe8 / 0xffe0), but this ENT-frame rule
+        # mis-fires under the OP_ENT broadcast residue + stale-zero FETCH and
+        # forces the high nibble back to 0xF (0xe8 -> 0xf8 on PSH; 0xe0 -> 0xf0
+        # on JSR), the depth-blind SP reset that starves nested/loop frames.
+        #   * PSH_AT_SP == 2.0 on the PSH-at-SP step, == 0 on a genuine ENT step.
+        #   * CMP+4 (the JSR-bootstrap flag) == 2.0 on the JSR step, == 0 on a
+        #     genuine ENT step (OP_ENT carries the ENT firing instead).
+        # A hard -100 blocker on each (-200 on the misfire) drives the ~22-pt
+        # misfire score below the 20 threshold while leaving the genuine ENT SP
+        # marker firing byte-identical (both dims are 0 there). Flag-off restores
+        # the legacy tuple.
+        ((("PSH_AT_SP", -100.0), ("CMP+4", -100.0)))
+        if _ent_frame_sp_byte0_psh_blocker_enabled() else ()
     )
     ent_frame_strength = 5000.0 / S
     for imm_lo, result_lo in ((0, 0), (8, 8)):
