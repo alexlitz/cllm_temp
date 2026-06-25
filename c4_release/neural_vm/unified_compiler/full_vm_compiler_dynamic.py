@@ -2392,6 +2392,14 @@ def compile_full_vm_dynamic(
             "C4_SHIFT_OUTPUT_B0_CLEAR": (
                 os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
             ),
+            # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
+            # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
+            # head-0 slot-0 Q discriminator gains six OP_<cmp> * -1e6 veto cells,
+            # so the ON / OFF builds bake a different W_q row and must never share
+            # a memo entry. See shared.l15_lookup_cmp_veto_enabled.
+            "C4_L15_LOOKUP_CMP_VETO": (
+                os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (

@@ -316,7 +316,11 @@ from ..ir import (
 from ..layer_compiler import Operation
 from ..positional_invariant import invariant_threshold, marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy, no_stack0_emit_enabled
+from .shared import (
+    _as_setdim_proxy,
+    no_stack0_emit_enabled,
+    l15_lookup_cmp_veto_enabled,
+)
 
 
 def _l15_li_addr_cam_discriminator_on() -> bool:
@@ -1329,6 +1333,24 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             q_map[(0, BD.OP_ENT)] = non_load_suppression
             q_map[(0, BD.OP_LEA)] = non_load_suppression
             q_map[(0, BD.OP_IMM)] = non_load_suppression
+            if l15_lookup_cmp_veto_enabled():
+                # COMPARISON-STEP VETO (bool_and id=1087, 2026-06-25).
+                # CMP+3 (above) is overloaded: it is BOTH the POP-group flag
+                # this head keys on AND the L9 low-nibble-less-than cmp flag.
+                # On a comparison step (OP_GT/OP_LT/... one-hot at MARK_AX,
+                # CMP+3 also hot) the slot-0 discriminator MIS-FIRES and dumps
+                # +40 CLEAN_EMBED -> OUTPUT_LO+0, burying the cmp result byte.
+                # A real LI/LC/POP load never has a comparison opcode hot at
+                # its own marker, so extend the SAME non_load veto to the six
+                # comparison opcodes: OP_<cmp> * -1e6 dominates CMP+3 * 50000,
+                # keeping the head silent on cmp rows and byte-identical on
+                # every load row. Kill-switch: ``C4_L15_LOOKUP_CMP_VETO=0``.
+                q_map[(0, BD.OP_GT)] = non_load_suppression
+                q_map[(0, BD.OP_LT)] = non_load_suppression
+                q_map[(0, BD.OP_GE)] = non_load_suppression
+                q_map[(0, BD.OP_LE)] = non_load_suppression
+                q_map[(0, BD.OP_EQ)] = non_load_suppression
+                q_map[(0, BD.OP_NE)] = non_load_suppression
 
             q_map[(0, BD.MARK_STACK0)] = 75000.0
             q_map[(0, BD.HAS_SE)] = 75000.0
