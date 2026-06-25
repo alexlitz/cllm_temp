@@ -20,7 +20,7 @@ def _no_stack0_emit() -> bool:
     ``Token.STEP_TOKENS == 30`` and the DraftVM oracle). Default-off =
     byte-identical 35-token build.
     """
-    return _os_l0.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+    return _os_l0.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 
 # L0 threshold-attention configuration shared between the bake_fn and the
 # declarative ``compiler_ir_factory``. The two lists are positional siblings:

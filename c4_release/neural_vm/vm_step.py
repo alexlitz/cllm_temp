@@ -122,7 +122,7 @@ class Token:
     # fixed-stride framing). Resolved once at import; the runner sets the env
     # before importing this module and bakes a fresh model per process.
     import os as _os_step
-    if _os_step.environ.get("C4_NO_STACK0_EMIT", "0") != "0":
+    if _os_step.environ.get("C4_NO_STACK0_EMIT", "1") != "0":
         STEP_TOKENS = 30  # PC(5)+AX(5)+SP(5)+BP(5)+MEM(9)+SE(1) -- STACK0 dropped
     else:
         STEP_TOKENS = 35

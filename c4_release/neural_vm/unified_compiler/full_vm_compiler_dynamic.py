@@ -2366,7 +2366,7 @@ def compile_full_vm_dynamic(
             "C4_SCLC_LC_B0": (
                 os.environ.get(
                     "C4_SCLC_LC_B0",
-                    "1" if os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+                    "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                     else "0",
                 ) != "0"
             ),
@@ -3020,7 +3020,7 @@ def _bake_from_scheduled_ops(
         "C4_SCLC_LC_B0": (
             os.environ.get(
                 "C4_SCLC_LC_B0",
-                "1" if os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+                "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 else "0",
             ) != "0"
         ),

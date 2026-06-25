@@ -68,7 +68,7 @@ def immediate_address(pc):
 # can't import it here (it imports this module — circular), so this mirrors the
 # SAME env-flag read so the two never diverge. Resolved once at import.
 import os as _os_const
-_NO_STACK0_EMIT = _os_const.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+_NO_STACK0_EMIT = _os_const.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 del _os_const
 
 # Number of register blocks emitted per step. Default 5 (PC, AX, SP, BP,

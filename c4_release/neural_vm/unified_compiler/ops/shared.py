@@ -936,7 +936,7 @@ def operand_from_memsp_enabled() -> bool:
     emitted) it is a no-regression equivalence check (operand now read from
     ``mem[SP]`` instead of the still-emitted token).
     """
-    return os.environ.get("C4_OPERAND_FROM_MEMSP", "0") == "1"
+    return os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
 
 
 def no_stack0_emit_enabled() -> bool:
@@ -957,7 +957,7 @@ def no_stack0_emit_enabled() -> bool:
     decode offsets — lives on the ``proto/drop-stack0-emit-measure`` branch).
     It is the per-op consultation point so flag-off is byte-identical.
     """
-    return os.environ.get("C4_NO_STACK0_EMIT", "0") != "0"
+    return os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 
 
 def sili_cam_b1_enabled() -> bool:
