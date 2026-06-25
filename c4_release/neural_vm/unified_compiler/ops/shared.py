@@ -960,6 +960,41 @@ def no_stack0_emit_enabled() -> bool:
     return os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 
 
+def loaded_operand_add_hi15_clear_enabled() -> bool:
+    """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
+    clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),
+    opt out with ``C4_LOADED_OPERAND_ADD_HI15_CLEAR=0``; gated behind the
+    ``no_stack0_emit`` campaign flag so the flag-OFF golden (35-tok) build is
+    byte-identical (the wrap is never installed off the campaign).
+
+    ROOT (GPU full_trace + oracle-tape probe, campaign default, spec_k=0, BUILT
+    dims, ``tools/probe_varupd_add_survival.py``): ``var_update`` (ids 325-349,
+    0/25) diverges at step 12 = the ``x = x + k`` ADD, neural ``got = expected +
+    240 (0xF0)`` for ALL 25. Operand A is the LOADED variable ``x`` (``LI`` ->
+    ``PSH`` -> ``mem[SP]``); the L8 head-5 mem-to-ALU value copy leaks the ``0xF``
+    high nibble of the SP-relative store address (``0xFFE8``/``0xFFF8``) into
+    ``ALU_HI+15`` (~+5.5) on top of the clean byte-0 one-hot, so the block-12
+    AddSub high-nibble add reads a TWO-hot and the result gains ``0xF0``.
+    IMMEDIATE operands have no such leak (so the immediate ``add`` cluster
+    PASSES).
+
+    THE FIX (``LoadedOperandAddHi15ClearFFN`` wrapping the L8 main FFN): on the
+    ``OP_ADD`` MARK_AX rows ONLY, zero ``ALU_HI+15`` when it is in the
+    contaminant window (``(0.5, 5.85)``) — a true ``0xF`` operand one-hot
+    (~+6.0) is preserved, an immediate operand's ``@15`` (~0) is untouched.
+
+    DELIBERATELY ADD-ONLY (narrower than the dropped broad
+    ``C4_LOADED_OPERAND_HI15_CLEAR``, which also gated on ``OP_SUB`` + the six
+    cmp opcodes and cleared ``ALU_LO+15`` — that broad form was DROPPED for
+    regressing ``var_mul``). ``var_mul`` (``a*b``) has NO ADD step (its
+    operand-delivery rows carry only ``OP_MUL``/``OP_LI``/``OP_PSH``; the MUL
+    row's true operand value 0xF legitimately lands ``ALU+15 ~6.0``), so gating
+    on ``OP_ADD`` makes the wrap PROVABLY INERT on ``var_mul``. Verified
+    ``tools/probe_varmul_alu15.py``.
+    """
+    return os.environ.get("C4_LOADED_OPERAND_ADD_HI15_CLEAR", "1") != "0"
+
+
 def sili_cam_b1_enabled() -> bool:
     """Return True iff the si/li LOAD byte-1 address-leak discriminator (Inc-2)
     is active. DEFAULT campaign-ON (``C4_SILI_CAM_B1=1``), opt out with

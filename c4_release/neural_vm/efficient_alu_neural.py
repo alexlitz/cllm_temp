@@ -1111,6 +1111,99 @@ class _GEToBDStage(nn.Module):
         return state
 
 
+class LoadedOperandAddHi15ClearFFN(nn.Module):
+    """Campaign loaded-operand ADD high-nibble cell-15 address-leak clear.
+
+    Drop-in replacement for ``block.ffn`` of the L8 main block (the operand
+    delivery block: physical block 11, where ``make_layer8_mem_to_alu_op`` head
+    5 writes ALU_LO/HI from ``mem[SP]`` at the binary-op MARK_AX row). Holds the
+    original L8 ALU ``PureFFN`` (``inner``) and, BEFORE delegating to it, zeros
+    the spurious ``ALU_HI+15`` contaminant on the ``OP_ADD`` MARK_AX rows whose
+    operand A came from the loaded (``mem[SP]``) path.
+
+    THE ROOT (GPU full_trace + oracle-tape probe, campaign default config,
+    spec_k=0, BUILT dims, ``tools/probe_varupd_add_survival.py``): in
+    ``var_update`` (``int x; x = a; x = x + k; return x``, ids 325-349, 0/25)
+    the first divergence is step 12 = the ``x = x + k`` ADD, and the neural
+    result is ``got = expected + 240 (0xF0)`` for ALL 25. Operand A of that ADD
+    is the LOADED variable ``x`` (``LI`` -> ``PSH`` -> ``mem[SP]``); the L8
+    head-5 mem-to-ALU delivery copies the true byte-0 nibbles cleanly (e.g.
+    x=50 -> ALU_LO@2, ALU_HI@3) BUT also leaks a ``~+5.5`` one-hot into
+    ``ALU_HI+15`` — the ``0xF`` high nibble of the SP-relative store address
+    (``0xFFE8`` / ``0xFFF8``) bleeding through head 5's value copy. IMMEDIATE
+    operands (``IMM`` -> ``PSH``) have NO ``@15`` leak (verified: ``50+7``
+    immediate ADD's ALU_HI is a clean one-hot), which is why ``add`` (immediate)
+    PASSES while ``var_update`` (loaded) FAILS.
+
+    CONSEQUENCE: at the block-12 AddSub the high-nibble add reads ALU_HI as a
+    TWO-hot (true@h + the ``0xF`` leak@15) -> result += ``0xF0`` -> got =
+    expected + 240 for all 25 var_update (GPU step-12).
+
+    FIX (this wrap, campaign-default, gated OFF byte-identical): on the
+    ``OP_ADD`` MARK_AX rows ONLY, zero ``ALU_HI+15`` when the cell is in the
+    contaminant magnitude window (``> 0.5`` and ``< CLEAN_MAX``). A true ``0xF``
+    high-nibble operand one-hot is ``~+6.0`` (above ``CLEAN_MAX``) so it is
+    PRESERVED; an immediate operand's ``@15`` is ``0`` (below ``0.5``) so it is
+    untouched. Runs in ONE block (it IS ``block.ffn`` of the L8 main block) so
+    the physical block count is unchanged.
+
+    DELIBERATELY ADD-ONLY (narrower than the dropped
+    ``LoadedOperandHi15ClearFFN``, which also gated on ``OP_SUB`` + the six cmp
+    opcodes and zeroed ``ALU_LO+15`` as well — that broader form was DROPPED for
+    regressing ``var_mul``). ``var_mul`` (``a={a}; b={b}; return a*b``) has NO
+    ADD step — its operand-delivery rows carry only ``OP_MUL`` / ``OP_LI`` /
+    ``OP_PSH`` markers (verified ``tools/probe_varmul_alu15.py``: the MUL row's
+    operand value 0xF legitimately lands ``ALU_LO/HI@15 ~6.0`` and must NOT be
+    cleared) — so gating on ``OP_ADD`` alone makes this wrap PROVABLY INERT on
+    ``var_mul``. ``ALU_LO+15`` is left untouched (the var_update ADD leak rides
+    only ``ALU_HI+15``; the byte-0 lane @15 is a true operand value for the
+    0xF-low-nibble case).
+
+    Gate-OFF / non-campaign leaves ``block.ffn = inner`` exactly (byte-identical
+    to golden ``f2b040aa`` flag-OFF); the wrap is installed only when
+    ``no_stack0_emit_enabled() and loaded_operand_add_hi15_clear_enabled()``.
+    """
+
+    # A true 0xF high-nibble operand lands ALU_HI+15 at ~+6.0 (SCALE_O); the
+    # address-leak contaminant lands at ~+5.5. Use a window that catches the
+    # 5.5 leak but spares the 6.0 true one-hot.
+    CLEAN_MAX = 5.85
+
+    def __init__(self, inner: nn.Module, *, alu_hi, mark_ax, add_dim):
+        super().__init__()
+        self.inner = inner
+        self.alu_hi = int(alu_hi)
+        self.mark_ax = int(mark_ax)
+        self.add_dim = int(add_dim)
+        self._is_loaded_operand_add_hi15_clear_wrap = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        add_ax = (x[:, :, self.add_dim] > 0.5) & (x[:, :, self.mark_ax] > 0.5)
+        hi15 = x[:, :, self.alu_hi + 15]
+        contam_hi = add_ax & (hi15 > 0.5) & (hi15 < self.CLEAN_MAX)
+        x = x.clone()
+        z = torch.zeros((), device=x.device, dtype=x.dtype)
+        x[:, :, self.alu_hi + 15] = torch.where(contam_hi, z, hi15)
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility (plumb through to inner) ----
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 class CmpOperandSeRecoverFFN(nn.Module):
     """Campaign comparison operand-A SE_ALU recover wrapping the L10 cmp FFN.
 

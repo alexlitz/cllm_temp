@@ -2757,6 +2757,12 @@ def _collect_ops_for_compile(
         ops.append(_static.make_l12_alu_mul_finalcorrection_op())
         ops.append(_static.make_l12_alu_mul_getobd_op())
         ops.append(_static.make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
+        # Campaign loaded-operand ADD ALU cell-15 contaminant clear
+        # (var_update). Must come AFTER efficient_l8_addsub_wrap (whose d_model
+        # read sees the raw L8 PureFFN before this wrap is applied).
+        # Campaign-gated; flag-OFF leaves block.ffn untouched (golden
+        # byte-identical).
+        ops.append(_static.make_loaded_operand_add_hi15_clear_op())
         ops.append(_static.make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
         ops.append(_static.make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
 

@@ -945,6 +945,67 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
     )
 
 
+def make_loaded_operand_add_hi15_clear_op() -> Operation:
+    """Campaign loaded-operand ADD ALU cell-15 contaminant clear (var_update).
+
+    Wraps ``model.blocks[8].ffn`` (the L8 main FFN, physical block 11 — the
+    operand-delivery block where ``make_layer8_mem_to_alu_op`` head 5 writes
+    ALU_LO/HI from ``mem[SP]``) with :class:`LoadedOperandAddHi15ClearFFN`,
+    which zeros the spurious ``ALU_HI+15`` address-nibble leak on the ``OP_ADD``
+    MARK_AX rows so the var_update ``x = x + k`` ADD (block 12 AddSub) reads a
+    clean operand-A high nibble (no ``+0xF0``). See
+    ``shared.loaded_operand_add_hi15_clear_enabled`` for the full rationale.
+
+    DELIBERATELY ADD-ONLY (narrower than the dropped broad clear that also gated
+    on SUB + the six cmp opcodes and cleared ALU_LO+15 — that form was DROPPED
+    for regressing var_mul). ``var_mul`` has no ADD step, so this wrap is
+    provably inert on it.
+
+    Campaign-only: installed only when ``no_stack0_emit_enabled() and
+    loaded_operand_add_hi15_clear_enabled()``. Flag-OFF / non-campaign leaves
+    ``block.ffn`` exactly (byte-identical to golden ``f2b040aa`` flag-OFF). Runs
+    AFTER ``efficient_l8_addsub_wrap`` so that op's ``d_model`` read sees the raw
+    L8 PureFFN (this wrap deliberately does NOT expose ``W_up``, mirroring
+    ``CmpOperandSeRecoverFFN``).
+    """
+    def bake(model, dim_positions, S):
+        from .shared import (
+            no_stack0_emit_enabled,
+            loaded_operand_add_hi15_clear_enabled,
+        )
+        if not (no_stack0_emit_enabled()
+                and loaded_operand_add_hi15_clear_enabled()):
+            return
+        from ...efficient_alu_neural import LoadedOperandAddHi15ClearFFN
+        BD = _as_setdim_proxy(dim_positions)
+        block = model.blocks[8]
+        # Idempotent guard.
+        if getattr(block.ffn, "_is_loaded_operand_add_hi15_clear_wrap", False):
+            return
+        block.ffn = LoadedOperandAddHi15ClearFFN(
+            block.ffn,
+            alu_hi=BD.ALU_HI,
+            mark_ax=BD.MARK_AX,
+            add_dim=BD.OP_ADD,
+        )
+
+    return Operation(
+        name="loaded_operand_add_hi15_clear",
+        requires={"after": ("efficient_l8_addsub_wrap",)},
+        reads=set(),
+        writes=set(),
+        kind="model",
+        declarative_bake_fn=bake,
+        declarative_authority="structural_model",
+        migrated=True,
+        claims=set(),
+        produces={'__module_replacement':
+                  'L8.ffn[LoadedOperandAddHi15ClearFFN]'},
+        spec_section="BLOG_SPEC.md#binary-ALU",
+        opcodes={"OP_ADD"},
+    )
+
+
 def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
     """Replace L10 ``block.ffn`` with a rule-lowered bitwise FFN (= bitwise neural ALU).
 
