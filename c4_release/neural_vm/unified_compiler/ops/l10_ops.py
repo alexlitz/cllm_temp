@@ -2605,12 +2605,39 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
     if no_stack0_emit_enabled() and cmp_gt_lo_margin_enabled():
         FLAG_EQ = 0.30  # campaign: -> hi_eq ~1.24 (was 1.86 at 0.45)
 
+    # if_var GT-FALSE 0xF-leak guard (#339, 2026-06-25, CAMPAIGN only).
+    # ROOT (GPU full_trace + isolated intervention, campaign config
+    # ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims, spec_k=0,
+    # ``tools/probe_ifvar_result_step.py`` + ``probe_ifvar_alu15_intervene.py``):
+    # the if_var GT-FALSE of a LOADED variable (id430 ``23>62`` / id433 ``35>76``,
+    # both ``A.hi < B.hi``) decoded GT=1 because the result step's operand-A
+    # ``ALU_HI`` carries a SPURIOUS ``+6.5`` at cell 15 (the 0xF address-high-nibble
+    # leak from the LI-load relay). The ``hi_lt`` blocker's ``-0.5 * 6.5 = -3.25``
+    # cell-15 term drops the unit's pre-activation to ``6 + 3 + 6 - 3.25 - 0.2 =
+    # 11.55`` -- below the ``13.22`` threshold -- so ``hi_lt`` (CMP+0) does NOT fire
+    # and the GT-FALSE override never lands (GT defaults to 1). The passing LITERAL
+    # ``23>62`` has a clean ``ALU_HI[15] ~= 0.5`` (blocker ``-0.25``, sum ``14.55``)
+    # so its ``hi_lt`` fires. Cell 15 (``A.hi == 0xF`` == operand >= 240) is
+    # UNREACHABLE for the 0..99 corpus operands, so the cell-15 veto only ever
+    # fires on the spurious leak. FIX: campaign-only, DROP the ``ALU_HI+15`` term
+    # from the ``hi_lt`` blocker -> the FAIL sum recovers to ``14.8 > 13.22`` ->
+    # GT-FALSE override lands -> result 0. INTERVENTION-VERIFIED discriminating:
+    # zeroing ``ALU_HI[15]`` flips id430/433 to 0 while GT-TRUE ``85>48`` holds at 1
+    # and the GT-FALSE literal holds at 0 (no zero-sum). Only ``hi_lt`` is touched;
+    # lo_lt / hi_eq / lo_eq are untouched. Kill-switch ``C4_CMP_HI_LT_ALU15_GUARD=0``
+    # restores the full cell-15 blocker; flag-OFF / non-campaign is byte-identical
+    # to golden.
+    from .shared import cmp_hi_lt_alu15_leak_guard_enabled
+    _hi_lt_drop_cell15 = cmp_hi_lt_alu15_leak_guard_enabled()
+
     rules: list[FFNRule] = []
 
     # ---- hi_lt -> CMP+0 : 120 units (a < b) -------------------------------
     for a in range(16):
         blocker = tuple(
-            (f"ALU_HI+{j}", -0.5) for j in range(1, 16) if j != a
+            (f"ALU_HI+{j}", -0.5)
+            for j in range(1, 16)
+            if j != a and not (_hi_lt_drop_cell15 and j == 15)
         )
         for b in range(a + 1, 16):
             rules.append(multi_way_and_rule(

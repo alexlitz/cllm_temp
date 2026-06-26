@@ -667,6 +667,61 @@ def cmp_gt_lo_margin_enabled() -> bool:
     return os.environ.get("C4_CMP_GT_LO_MARGIN", "1") != "0"
 
 
+def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
+    """Return True iff the L10 ordering-engine ``hi_lt`` (CMP+0) blocker DROPS its
+    ``ALU_HI+15`` (0xF address-high-nibble) veto term in the campaign config
+    (DEFAULT ON — opt-out via ``C4_CMP_HI_LT_ALU15_GUARD=0``; only takes effect
+    when the STACK0 emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF
+    / non-campaign is byte-identical to golden).
+
+    The residual cmp wall this lifts (#339, GPU full_trace + isolated
+    intervention, campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``,
+    BUILT dims, spec_k=0, ``tools/probe_ifvar_result_step.py`` +
+    ``tools/probe_ifvar_alu15_intervene.py``): the if_var GT-FALSE comparisons of
+    a LOADED variable -- ``if_var 23>62`` (id430), ``35>76`` (id433), both
+    ``A.hi < B.hi`` so the genuine ``hi_lt`` GT-FALSE override must fire -- decoded
+    GT=1 (returns 1 instead of 0).
+
+    ROOT. On the LOADED-variable path the result step's operand-A ``ALU_HI``
+    carries a SPURIOUS ``+6.5`` at cell 15 (the 0xF address-high-nibble leak from
+    the ``LI``-load relay; IMPOSSIBLE for the corpus operands, which are 0..99 so
+    ``A.hi <= 6``). The ``hi_lt`` unit is a balanced AND
+    ``MARK_AX(6.0) + ALU_HI[a](0.5) + AX_CARRY_HI[b](6.0)`` with a ``-0.5`` blocker
+    on every OTHER ``ALU_HI`` cell. The ``-0.5 * 6.5 = -3.25`` cell-15 blocker term
+    drops the unit's pre-activation to ``6 + 3 + 6 - 3.25 - 0.2 = 11.55`` -- BELOW
+    its ``13.22`` threshold -- so ``hi_lt`` (CMP+0) does NOT fire and the GT result
+    defaults to 1. The PASSING LITERAL path (``ifGT 23>62``) has a clean
+    ``ALU_HI[15] ~= 0.5`` (blocker ``-0.25``), so its ``hi_lt`` sum ``14.55`` clears
+    threshold and GT decodes 0. (Probed: FAIL result-step AX-row
+    ``OUTPUT_LO=[0.3@0, 9.4@1]`` -> byte 1 WRONG; literal ``[15.1@0, -5.3@1]`` ->
+    byte 0 correct. CMP cascade at that row: FAIL ``[1.2@3]`` (lo_lt only, no
+    hi_lt); literal ``[1.0@0, 1.2@3]`` (hi_lt AND lo_lt).)
+
+    FIX. Campaign-only: DROP the ``ALU_HI+15`` term from the ``hi_lt`` blocker.
+    Cell 15 (``A.hi == 0xF``, i.e. operand-A high byte >= 0xF0 == value >= 240) is
+    UNREACHABLE for every single-byte comparison in the corpus, so the cell-15
+    veto only ever fires on the spurious 0xF leak -- never on a legitimate
+    operand. With cell 15 excluded the leak no longer penalizes ``hi_lt``: the
+    FAIL sum recovers to ``6 + 3 + 6 - 0.2 = 14.8 > 13.22`` -> ``hi_lt`` fires ->
+    GT-FALSE override lands -> result 0. INTERVENTION-VERIFIED to be DISCRIMINATING
+    (``probe_ifvar_alu15_intervene.py``): zeroing ``ALU_HI[15]`` FLIPS id430/433 to
+    0 (FIXED) while the GT-TRUE ``85>48`` (id427) HOLDS at 1 and the GT-FALSE
+    literal HOLDS at 0 -- no zero-sum trade. Only the ``hi_lt`` (CMP+0) blocker is
+    touched; ``lo_lt`` / ``hi_eq`` / ``lo_eq`` (CMP+3/+1/+2) write strengths and
+    blockers are UNTOUCHED, so lt/le/ge/eq/ne margins are unchanged. Band-local to
+    the CMP engine (no shared OUTPUT/ALU read perturbed).
+
+    DEFAULT ON. Opt-out via ``C4_CMP_HI_LT_ALU15_GUARD=0`` restores the full
+    cell-15 blocker (the byte-identical-OFF path: flag-OFF, or
+    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden). Kept as a
+    dedicated kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_CMP_HI_LT_ALU15_GUARD`` can A/B it inside the campaign config.
+    """
+    if not no_stack0_emit_enabled():
+        return False
+    return os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
+
+
 def func_lea_reread_bp_resharpen_enabled() -> bool:
     """Return True iff the L7 head-1 re-read-LEA BP-frame re-sharpen is active
     (DEFAULT ON in the campaign config — opt-out via

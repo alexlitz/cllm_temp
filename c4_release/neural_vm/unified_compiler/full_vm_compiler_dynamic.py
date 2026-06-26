@@ -2421,6 +2421,18 @@ def compile_full_vm_dynamic(
             "C4_L15_LOOKUP_CMP_VETO": (
                 os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
             ),
+            # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
+            # BAKE-affecting): when active the L10 ordering-engine ``hi_lt``
+            # (CMP+0) blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF
+            # builds bake different FFN weights and must never share a memo entry.
+            # Gated on the campaign prerequisite ``C4_NO_STACK0_EMIT`` so the
+            # non-campaign / flag-OFF build is byte-identical to golden (and never
+            # collides with a non-campaign cache entry). See
+            # shared.cmp_hi_lt_alu15_leak_guard_enabled.
+            "C4_CMP_HI_LT_ALU15_GUARD": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
+            ),
             # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/
             # max/min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): when
             # active it adds a Q/K scoring slot (OP_LEA x OP_ENT) to the SHARED
@@ -3123,6 +3135,17 @@ def _bake_from_scheduled_ops(
         # a serialised entry. See shared.shift_output_byte0_clear_enabled.
         "C4_SHIFT_OUTPUT_B0_CLEAR": (
             os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
+        ),
+        # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
+        # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)
+        # blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF builds bake
+        # different FFN weights and must never share a serialised entry. Gated on
+        # the campaign prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign /
+        # flag-OFF build is byte-identical to golden. See
+        # shared.cmp_hi_lt_alu15_leak_guard_enabled.
+        "C4_CMP_HI_LT_ALU15_GUARD": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
         ),
         # Multilocal-ENT AX byte-0 source fix (DEFAULT-ON in campaign, opt out
         # =0, BAKE-affecting): when active ``make_l10_ent_axcarry_op`` appends a
