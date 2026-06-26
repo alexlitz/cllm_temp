@@ -2378,6 +2378,19 @@ def compile_full_vm_dynamic(
                 operand_from_memsp_enabled()
                 and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
             ),
+            # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
+            # campaign-ON, opt out =0, BAKE-affecting): registers the
+            # l10_loop_lea_b0_e0 PureFFN post_op so the ON / OFF builds
+            # STRUCTURALLY differ (an extra FFN op + block) and must never share
+            # a memo entry. Gated on the campaign prerequisites
+            # (``C4_NO_STACK0_EMIT`` + ``C4_OPERAND_FROM_MEMSP``) so the
+            # non-campaign / golden build is byte-identical. See
+            # shared.loop_lea_b0_e0_restore_enabled.
+            "C4_LOOP_LEA_B0_E0": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+                and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
+            ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
             # ON / OFF builds bake a different W_q row and must never share a
@@ -3124,6 +3137,17 @@ def _bake_from_scheduled_ops(
         "C4_FUNC_LEA_B0_RESTORE": (
             operand_from_memsp_enabled()
             and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
+        ),
+        # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
+        # campaign-ON, opt out =0, BAKE-affecting): registers the
+        # l10_loop_lea_b0_e0 PureFFN post_op so ON / OFF builds STRUCTURALLY
+        # differ (an extra FFN op + block) and must never share a serialised
+        # entry. Gated on the campaign prerequisites so the non-campaign /
+        # golden build is byte-identical. See shared.loop_lea_b0_e0_restore_enabled.
+        "C4_LOOP_LEA_B0_E0": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+            and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF

@@ -39,6 +39,7 @@ from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
 from .shared import sub_full_borrow_enabled  # noqa: F401
 from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
+from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
 
 
@@ -718,6 +719,25 @@ def all_core_ops(
         *(
             [make_l10_loop_lea_b0_e8_op()]
             if loop_lea_b0_e8_restore_enabled() else []
+        ),
+        # L10 in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (flag
+        # C4_LOOP_LEA_B0_E0, default ON in the campaign config): a post_op
+        # attached AFTER l10_loop_lea_b0_e8 that re-stamps byte-0 = 0xE0 on the
+        # loop in-loop 2nd-local ``LEA &sum`` AX row. After the step-2 e8 fix
+        # advances loop_sum to step 6, that row wants 0xE0 but the post-tail
+        # block-44 LEA effective-address materializer slams it to 0x01 (the
+        # e8-restore op DEFERS here via its FETCH_LO+0 NOT-block). Gated on the
+        # genuine-LEA + imm=-16 FETCH_LO+0-dominant signature + MEM_ADDR_SRC-cold
+        # + no-owning-opcode discriminator (the inverse-FETCH of the e8 op), so
+        # it is a no-op on every genuine address-eval LEA, the 1st-local &i
+        # (FETCH_LO+8) and 3rd-local &c (FETCH_HI+14) LEAs, and every non-LEA AX
+        # row. Flips loop_sum step-6 (~the loop_* cluster). REGISTERED ONLY when
+        # the flag is on (lookahead-chain pattern) so a flag-off / golden build
+        # is byte-identical. See _l10_loop_lea_b0_e0_rules /
+        # loop_lea_b0_e0_restore_enabled.
+        *(
+            [make_l10_loop_lea_b0_e0_op()]
+            if loop_lea_b0_e0_restore_enabled() else []
         ),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =

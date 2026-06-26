@@ -1617,6 +1617,59 @@ def loop_lea_b0_e8_restore_enabled() -> bool:
     )
 
 
+def loop_lea_b0_e0_restore_enabled() -> bool:
+    """Return True iff the loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0
+    RESTORE (``C4_LOOP_LEA_B0_E0``) is active.
+
+    DEFAULT **ON** in the campaign config (``C4_NO_STACK0_EMIT=1`` +
+    ``C4_OPERAND_FROM_MEMSP=1``); opt-out via ``C4_LOOP_LEA_B0_E0=0``. Flag-off OR
+    a non-campaign / golden build registers NO rules and appends NO post_op, so
+    the model is bit-for-bit identical to golden ``fd60f5f4``.
+
+    ROOT (measured spec_k=0, BUILT dim_positions, campaign config; GPU AR-trace
+    ``tools/_probe_loopsum_lea_b0.py`` 450 6 + ``_probe_loopsum_blk43_attrib.py``
+    450 6 44): after the merged step-2 fix (``C4_LOOP_LEA_B0_E8``) advances
+    ``loop_sum`` to step 6, the in-loop ``sum = sum + i`` body issues a 2nd-local
+    ``LEA &sum`` whose AX-marker wants byte-0 = 0xE0 (the full AX = 0xFFE0 =
+    65504 sign-extended local address). It instead emits 0x01 because:
+
+      1. The 0xE8 keystone / e8-restore op DEFERS here (its ``FETCH_LO+0``
+         NOT-block) -- correctly, since this is the 2nd local, not ``&i``.
+         Through the L25 tail (block 43, the post-block-43 residual) OUTPUT_LO
+         byte-0 carries cell-0 ~49.5 (the correct LO nibble for 0xE0) but no
+         keystone has stamped the 0xE high nibble.
+      2. The post-tail block-44 LEA effective-address materializer (a 32-unit
+         standalone PureFFN, gated MARK_AX + OP_LEA*60 + IS_BYTE) then WTA-slams
+         OUTPUT_LO -> cell **1** and OUTPUT_HI_THIS_STEP -> cell 0 on this row,
+         deriving byte-0 = 0x01 (its in-loop 2nd-local effective-address compute
+         is wrong). The e8-restore op (which DOMINATES this slam for ``&i`` at a
+         LATER post-op block) does not fire here, so the 0x01 ships.
+
+    The 2nd-local is distinguished from the 1st (``&i`` -> 0xE8) and 3rd
+    (``&c`` -> 0xD8) locals by WHICH FETCH cell dominates: the 2nd local carries
+    ``FETCH_LO+0`` argmax (=1.0; ``FETCH_LO+8`` / ``FETCH_HI+14`` cold) -- the
+    EXACT inverse of the e8 op's ``FETCH_LO+8``-dominant signature.
+
+    FIX (mirrors ``C4_LOOP_LEA_B0_E8`` / ``_l10_loop_lea_b0_e8_rules``): a
+    flag-gated ``PureFFN`` post_op appended AFTER ``l10_loop_lea_b0_e8`` (so it
+    is the LAST OUTPUT writer at the 2nd-local LEA row and DOMINATES the block-44
+    slam) that -- gated on the in-loop ``LEA &sum`` discriminator (genuine
+    ``OP_LEA`` + imm=-16 ``FETCH_LO+0``-dominant signature + ``MEM_ADDR_SRC``
+    cold + no owning opcode + the multi-local FETCH NOT-blocks) -- writes byte-0
+    = 0xE0 (``OUTPUT_LO+0`` HIGH, ``OUTPUT_HI_THIS_STEP+14`` HIGH, all other
+    nibble cells driven ``-DOM``) via a per-cell winner-take-all. The
+    ``FETCH_LO+8`` / ``FETCH_HI+14`` NOT-blocks keep it OFF the 1st/3rd-local
+    LEAs, the ``MEM_ADDR_SRC`` NOT-block keeps it OFF every genuine
+    address-eval LEA, and the ``IS_BYTE`` + non-AX marker NOT-blocks keep it OFF
+    every value-byte / non-AX row.
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
+    )
+
+
 def ffn_lint_mull14_demo_enabled() -> bool:
     """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
 
