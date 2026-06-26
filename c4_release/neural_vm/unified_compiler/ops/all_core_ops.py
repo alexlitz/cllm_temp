@@ -713,6 +713,16 @@ def all_core_ops(
         # Gated by C4_AX_BYTE23_DUMP (default ON). See
         # l11_ops.make_ax_byte23_dump_zero_op.
         make_ax_byte23_dump_zero_op(),
+        # AX byte-2/3 LI-LOAD zero cap (THE if_var/var LI-load high-byte blocker):
+        # on an ``LI x`` LOAD step the AX dump leaks 0x01 into byte 2 (id425 x=96
+        # -> ax=0x010060) because OUTPUT_LO+1 narrowly beats OUTPUT_LO+0 at the
+        # byte-2 dump row for x=0x60 (value-dependent ~+1.0 swap). Restores byte=0
+        # on the byte-2/3 dump rows gated on OP_LI (the clean, value/address-
+        # invariant load-step discriminator; MARK_AX blocks the byte-0 OP_LI
+        # spike). Standalone PureFFN post_op on the L25 tail block after the ENT
+        # cap. Gated by C4_AX_LI_BYTE23_ZERO (default ON). See
+        # l11_ops.make_ax_li_byte23_zero_op.
+        make_ax_li_byte23_zero_op(),
         # SUB full-borrow byte-1 0xFF writer (CAMPAIGN-ONLY, C4_SUB_FULL_BORROW):
         # the POST-SLAM half of the sub_borrow_cascade fix. On the row where the
         # L14 precursor lit SUB_FULL_BORROW, overwrites OUTPUT byte 1 = 0xFF.
