@@ -886,6 +886,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .residual_band_registry import register_residual_band
 from .shared import (
     _as_setdim_proxy,
+    loop_lea_b0_e8_restore_enabled,
     mul_stack0_byte39_guard_enabled,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
@@ -11088,6 +11089,213 @@ def make_l10_ent_axcarry_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#function-call",
+    )
+
+
+# ===========================================================================
+# loop_sum in-loop ``LEA &i`` byte-0 0xE8 RESTORE (#330, campaign config).
+#
+# See ``shared.loop_lea_b0_e8_restore_enabled`` for the full two-part root. The
+# in-loop ``LEA &i`` AX row wants byte-0 = 0xE8 but (1) the e8 keystone can't
+# fire (needs CMP+7 + MEM_ADDR_SRC, both 0 here) so byte-0 is DEAD through the
+# tail, and (2) ``_l10_ent_axcarry`` then slams it to 0x00. This op runs AFTER
+# ent_axcarry and re-stamps 0xE8 on exactly that row.
+#
+# DISCRIMINATOR (measured spec_k=0, BUILT dims, campaign): MARK_AX=1 +
+# OP_LEA=5.24 (a GENUINE LEA, not the 0.81 ENT leak) + imm=-8 FETCH signature
+# (FETCH_LO+8 / FETCH_HI+15 lit, FETCH_LO+0 / FETCH_HI+14 cold) + MEM_ADDR_SRC
+# cold + no owning opcode. The MEM_ADDR_SRC NOT-block keeps it off every genuine
+# address-eval LEA (those carry MEM_ADDR_SRC=1, already 0xE8-correct via the
+# keystone); the imm=-8 FETCH AND-gate (FETCH_LO+0 / FETCH_HI+14 NOT-blocks)
+# keeps it off the 2nd/3rd-local LEAs (var_mul / var_three, want 0xE0 / 0xD8)
+# and off every non-LEA AX row.
+_LOOP_LEA_E8_DOM = 0.1           # per-cell winner-take-all magnitude. WITHOUT
+#                                  the _suppress_ffn_on_step_boundary 1e9 gate
+#                                  inflation the firing-row silu is ~3e4, so the
+#                                  per-cell write is ~3e3 — enough to flip cell-8
+#                                  above cell-0 over the ~1e3 ent_axcarry slam
+#                                  (need > slam ~1033), but SMALL enough that the
+#                                  fraction of this write copied to the PC
+#                                  value-byte rows (via the late attention copy)
+#                                  stays under the no_stack0_pc_highbyte_clear
+#                                  -300 sink, so the PC high bytes still default
+#                                  to 0x00 (a larger write leaks 0xE8 into PC
+#                                  bytes 1-3).
+_LOOP_LEA_E8_THRESHOLD = 500.0   # the imm=-8 row scores base(MARK_AX*100 +
+#                                  OP_LEA*60 ~414) + FETCH(~160) = ~574 > 500;
+#                                  the 2nd/3rd-local LEAs score base - 1000 < 0;
+#                                  a clean non-LEA AX row scores 100. So only the
+#                                  imm=-8 (1st-local &i) LEA crosses.
+_LOOP_LEA_E8_LO_NIBBLE = 8       # 0xE8 low nibble
+_LOOP_LEA_E8_HI_NIBBLE = 14      # 0xE8 high nibble (0xE)
+
+
+def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
+    """32 winner-take-all rules: re-stamp byte-0 = 0xE8 on the in-loop LEA row.
+
+    16 LO units drive ``OUTPUT_LO`` to nibble 8 (``+DOM`` at cell 8, ``-DOM``
+    elsewhere) and 16 HI units drive ``OUTPUT_HI_THIS_STEP`` to nibble E
+    (``+DOM`` at cell 14, ``-DOM`` elsewhere). Every unit shares the same in-loop
+    ``LEA &i`` discriminator, so the whole op is a no-op on every other row.
+    """
+    OPC_BLOCK = 500.0
+    # OP_JSR is intentionally EXCLUDED (mirrors _l10_ent_axcarry): the in-loop
+    # LEA row carries an ~0.27 OP_JSR residue, and a clean JSR step has OP_LEA==0
+    # so the required OP_LEA term gates it out regardless.
+    owning_ops = tuple(
+        op for op in _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS if op != "OP_JSR"
+    )
+    disc: tuple[tuple[str, float], ...] = (
+        ("MARK_AX", 100.0),
+        # GENUINE LEA (OP_LEA ~5.24): weight 60 -> ~314.
+        ("OP_LEA", 60.0),
+        # imm=-8 DISCRIMINATOR (the LOAD-BEARING term). FETCH is a NON-one-hot
+        # broadcast (the imm-low-nibble cell ~0.4-1.0, the rest ~0), and the only
+        # thing that distinguishes the 1st local (imm=-8 -> 0xE8, FETCH_LO+8
+        # dominant) from the 2nd local (imm=-16 -> 0xE0, FETCH_LO+0 dominant) and
+        # 3rd local (imm=-24 -> 0xD8, FETCH_HI+14 dominant) is WHICH FETCH cell
+        # dominates. So we score (FETCH_LO+8) - (FETCH_LO+0) - (FETCH_HI+14) at a
+        # LARGE weight: measured step2 (&i) = 0.58 - 0.42 - 0 = +0.16 (-> +160);
+        # step6 (&sum) = 0.00 - 1.00 - 0 = -1.00 (-> -1000); a 3rd local =
+        # -1.00 (FETCH_HI+14). With threshold 500 the &i row (base 414 + 160 =
+        # 574) FIRES while &sum / &c (base 414 - 1000 = -586) stay SILENT, and a
+        # clean non-LEA AX row (base 100, no FETCH) is far below 500. The big
+        # symmetric weights make the imm=-8 signature a GENUINE requirement
+        # (additive FETCH_LO+8 alone could not separate it from a soft broadcast).
+        ("FETCH_LO+8", 1000.0),
+        ("FETCH_LO+0", -1000.0),
+        ("FETCH_HI+14", -1000.0),
+        # Genuine address-eval LEA rows carry MEM_ADDR_SRC (a clean one-hot, and
+        # are already 0xE8-correct via the keystone); the in-loop LEA does not.
+        # Hard NOT-block so this op touches ONLY the keystone-starved in-loop row.
+        ("MEM_ADDR_SRC", -1_000_000.0),
+        # HARD NOT-block IS_BYTE: the PC/AX VALUE-byte rows carry IS_BYTE=1 AND
+        # the same OP_LEA / FETCH broadcast (OP_LEA*60 ~314 + FETCH alone clears
+        # the threshold there), so WITHOUT this block the op fires on the PC value
+        # bytes 1-3 and stamps 0xE8 into the PC high bytes (PC=0x..E8E8E8). The
+        # AX-MARKER row has IS_BYTE=0, so this gate isolates the marker row.
+        ("IS_BYTE", -1_000_000.0),
+        # No owning opcode may be live (IMM/ADD/.../JMP/BZ/BNZ; OP_JSR excluded).
+        *((op, -OPC_BLOCK) for op in owning_ops),
+        # Never any non-AX marker row.
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
+    )
+    rules: list[FFNRule] = []
+    for out_dim, tgt in (
+        ("OUTPUT_LO", _LOOP_LEA_E8_LO_NIBBLE),
+        ("OUTPUT_HI_THIS_STEP", _LOOP_LEA_E8_HI_NIBBLE),
+    ):
+        for k in range(16):
+            writes = tuple(
+                (f"{out_dim}+{j}", (_LOOP_LEA_E8_DOM if j == tgt else -_LOOP_LEA_E8_DOM))
+                for j in range(16)
+            )
+            rules.append(multi_way_and_rule(
+                name=f"l10_loop_lea_b0_e8_{out_dim.lower()}_{k}",
+                conditions=disc,
+                threshold=_LOOP_LEA_E8_THRESHOLD,
+                writes=writes,
+            ))
+    return tuple(rules)
+
+
+def make_l10_loop_lea_b0_e8_op() -> Operation:
+    """Flag-gated L10 in-loop ``LEA &i`` byte-0 0xE8 RESTORE op.
+
+    Standalone ``PureFFN`` post_op attached to the L25 tail block AFTER
+    ``l10_ent_axcarry`` (so it is the LAST OUTPUT writer at the in-loop LEA row
+    and DOMINATES the ent_axcarry 0x00 slam). Flag-off (or non-campaign /
+    golden) produces ZERO rules and appends NO post_op -> byte-identical to
+    golden ``7f6f2e5d``. See ``loop_lea_b0_e8_restore_enabled`` /
+    ``_l10_loop_lea_b0_e8_rules``.
+    """
+    if not loop_lea_b0_e8_restore_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_loop_lea_b0_e8",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#registers",
+        )
+
+    rules = _l10_loop_lea_b0_e8_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        # NOTE: deliberately NOT calling _suppress_ffn_on_step_boundary here.
+        # That helper adds IS_BYTE as an ALTERNATIVE structural gate (OR'd with
+        # the MARK_* dims), which would let this op ALSO fire on the PC/AX
+        # VALUE-BYTE rows (IS_BYTE=1) — leaking the 0xE8 stamp into the PC high
+        # bytes (PC=0x..E8E8E8). Our discriminator already REQUIRES MARK_AX and
+        # HARD-blocks every non-AX marker, so the op fires ONLY on the AX-marker
+        # LEA row; the boundary gate is both unnecessary and harmful here.
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_loop_lea_b0_e8",
+        reads={
+            "MARK_AX", "OP_LEA", "MEM_ADDR_SRC",
+            "FETCH_LO", "FETCH_HI",
+            "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+            *_L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS,
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        # Run AFTER l10_ent_axcarry (the slammer it overrides) so this is the
+        # LAST OUTPUT writer at the in-loop LEA row.
+        requires={"after": "l10_ent_axcarry"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
     )
 
 

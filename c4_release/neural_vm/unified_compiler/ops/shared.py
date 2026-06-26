@@ -1489,6 +1489,65 @@ def func_lea_b0_restore_enabled() -> bool:
     )
 
 
+def loop_lea_b0_e8_restore_enabled() -> bool:
+    """Return True iff the loop_sum in-loop ``LEA &i`` byte-0 0xE8 RESTORE
+    (``C4_LOOP_LEA_B0_E8``) is active.
+
+    DEFAULT **ON** in the campaign config (``C4_NO_STACK0_EMIT=1`` +
+    ``C4_OPERAND_FROM_MEMSP=1``); opt-out via ``C4_LOOP_LEA_B0_E8=0``. Flag-off OR
+    a non-campaign / golden build registers NO rules and appends NO post_op, so
+    the model is bit-for-bit identical to golden ``7f6f2e5d``.
+
+    ROOT (measured spec_k=0, BUILT dim_positions, campaign config; GPU AR-trace
+    ``tools/_probe_loopsum_lea_b0.py`` 450 2 + ``_probe_loopsum_blk43_attrib.py``
+    + ``_probe_loopsum_entax_gate.py``): on the ``loop_sum`` (and loop_mul /
+    loop_pow2 / loop_fact family) IN-LOOP comparison step the ``LEA &i`` (the
+    1st-local address, want byte-0 = 0xE8) emits 0x00 because of a TWO-part
+    failure:
+
+      1. The ``tail_lea_local_ax_marker_byte0_e8`` keystone (block 42) does NOT
+         fire on this row: it REQUIRES ``CMP+7`` AND ``MEM_ADDR_SRC`` (each 1.0 on
+         a genuine address-eval LEA), but the in-loop LEA row carries
+         ``CMP+7 == 0`` and ``MEM_ADDR_SRC == 0`` (its in-loop base is lower than
+         the keystone was tuned for). So OUTPUT_LO byte-0 stays DEAD (~0.0)
+         through block 42 — the 0xE8 stamp never lands.
+      2. The ``_l10_ent_axcarry`` override op (block 43) THEN WRONGLY fires on
+         this GENUINE LEA row and slams byte-0 to 0x00. That op's discriminator
+         is ``MARK_AX + OP_LEA(>=4) + no-owning-opcode + MEM_ADDR_SRC cold``; it
+         was designed for the multilocal MAIN-ENT step (where OP_LEA LEAKS ~0.81
+         and ``MEM_ADDR_SRC == 0``) and EXCLUDES genuine address-eval LEAs via
+         the ``MEM_ADDR_SRC`` NOT-block. But this in-loop ``LEA &i`` is a genuine
+         LEA (``OP_LEA == 5.24``) that ALSO carries ``MEM_ADDR_SRC == 0``, so the
+         exclusion fails — ent_axcarry routes ``AX_CARRY`` (byte-0 = 0x00) into
+         OUTPUT, winner-take-all to cell 0. Final emitted AX byte-0 = 0x00.
+
+    FETCH on this row carries the imm=-8 signature (``FETCH_LO+8`` argmax,
+    ``FETCH_HI+15`` argmax, ``FETCH_LO+0`` / ``FETCH_HI+14`` cold) — the EXACT
+    pattern the e8 keystone keys on for a 0xE8 byte-0, and DISTINCT from the
+    multi-local 2nd local (``FETCH_LO+0``, want 0xE0) and 3rd local
+    (``FETCH_HI+14``, want 0xD8).
+
+    FIX (mirrors the ``C4_FUNC_LEA_B0_RESTORE`` / ``_l10_ent_axcarry`` precedent):
+    a flag-gated ``PureFFN`` post_op on the L25 tail block, appended AFTER
+    ``l10_ent_axcarry`` (so it is the LAST OUTPUT writer at this row and DOMINATES
+    the slam), that — gated on the in-loop ``LEA &i`` discriminator (genuine
+    ``OP_LEA`` + imm=-8 FETCH signature + ``MEM_ADDR_SRC`` cold + no owning opcode
+    + the multi-local FETCH NOT-blocks) — writes byte-0 = 0xE8 (``OUTPUT_LO+8``
+    HIGH, ``OUTPUT_HI_THIS_STEP+14`` HIGH, all other nibble cells driven
+    ``-DOM``) via a per-cell winner-take-all. The ``MEM_ADDR_SRC`` NOT-block keeps
+    it OFF every genuine address-eval LEA (those carry ``MEM_ADDR_SRC == 1`` and
+    are already correct via the keystone), and the imm=-8 FETCH AND-gate keeps it
+    off the 2nd/3rd-local LEAs (``var_mul`` / ``var_three``) and every non-LEA AX
+    row, so the whole op is a no-op everywhere except the loop in-loop ``LEA &i``
+    row it targets.
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_LOOP_LEA_B0_E8", "1") != "0"
+    )
+
+
 def ffn_lint_mull14_demo_enabled() -> bool:
     """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
 

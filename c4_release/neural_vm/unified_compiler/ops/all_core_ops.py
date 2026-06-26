@@ -39,6 +39,7 @@ from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
 from .shared import sub_full_borrow_enabled  # noqa: F401
 from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
+from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -698,6 +699,26 @@ def all_core_ops(
         # Flag-off / non-campaign => no rules, no post_op (byte-identical to
         # golden f2b040aa).
         make_l10_ent_axcarry_op(),
+        # L10 in-loop ``LEA &i`` byte-0 0xE8 RESTORE (flag C4_LOOP_LEA_B0_E8,
+        # default ON in the campaign config): a post_op attached AFTER
+        # l10_ent_axcarry that re-stamps byte-0 = 0xE8 on the loop in-loop
+        # ``LEA &i`` AX row. That row wants 0xE8 but the e8 keystone can't fire
+        # (needs CMP+7 + MEM_ADDR_SRC, both 0 here) so byte-0 is DEAD through the
+        # tail, and l10_ent_axcarry THEN wrongly slams it to 0x00 (its
+        # MEM_ADDR_SRC exclusion fails because this genuine in-loop LEA also
+        # carries MEM_ADDR_SRC=0). Gated on the genuine-LEA + imm=-8 FETCH
+        # signature + MEM_ADDR_SRC-cold + no-owning-opcode discriminator, so it
+        # is a no-op on every genuine address-eval LEA (MEM_ADDR_SRC=1, already
+        # correct), every 2nd/3rd-local LEA (var_mul/var_three), and every
+        # non-LEA AX row. Flips loop_sum step-2 (~the loop_* cluster).
+        # REGISTERED ONLY when the flag is on (lookahead-chain pattern) so a
+        # flag-off / golden build is byte-identical (the op is not in the list,
+        # so it never perturbs op-ordering / dim-liveness). See
+        # _l10_loop_lea_b0_e8_rules / loop_lea_b0_e8_restore_enabled.
+        *(
+            [make_l10_loop_lea_b0_e8_op()]
+            if loop_lea_b0_e8_restore_enabled() else []
+        ),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =
         # a1 + b1 + carry at the ADD byte-1 row, completing the multi-byte
