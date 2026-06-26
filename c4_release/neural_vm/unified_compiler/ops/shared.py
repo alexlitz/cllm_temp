@@ -371,6 +371,86 @@ def sub_full_borrow_enabled() -> bool:
     return os.environ.get("C4_SUB_FULL_BORROW", "1") != "0"
 
 
+def l8_operand_sp_disc_enabled() -> bool:
+    """Return True iff the L8 head-5 operand-A SP-frame discriminator is active
+    (DEFAULT ON in the campaign config — opt-out via ``C4_L8_OPERAND_SP_DISC=0``;
+    only takes effect when the operand-A read is routed to ``mem[SP]``, i.e. the
+    campaign ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` config).
+
+    The wall this lifts (validated GPU spec_k=0, BUILT dims, campaign config —
+    tools/probe_addmul_head5_cam.py id816 4+5*2): ``expr_add_mul`` (``a+b*c``) is
+    the only depth-2 expr cluster with TWO live stack stores at once (PSH a,
+    PSH b, IMM c, MUL pops b, ADD pops a). The ADD's operand-A = mem[SP] = a (the
+    FIRST push; top-of-stack after the MUL popped b). The recency-only L8 head-5
+    ``mem[SP]`` CAM (``make_layer8_mem_to_alu_op``) picks the more-recent matching
+    STORE row (the popped b push) over the live a store — the two store value
+    rows are byte-identical (MEM_STORE_AT_VAL=1, MEM_VAL_B1=1 on BOTH; ADDR_B0/1/2
+    = 0; emitted mem address byte = 0xE0 for BOTH). So AX = b + b*c (id816:
+    5+10=15 vs 14).
+
+    The ONLY real discriminator is the SP at push time: store a was pushed at
+    SP=0xF8, store b at SP=0xF0; after the MUL pop SP returns to 0xF8, so the
+    ADD's operand address is 0xF8 == a's frame. The SP low-byte is a clean
+    one-hot in OUTPUT_LO at the MARK_SP marker row (id816: SP rows 108->8 (0xF8),
+    168->0 (0xF0), 228 (post-MUL)->8 (0xF8)).
+
+    When this flag is on:
+      * ``make_layer7_sp_addr_relay_op`` (L7, block 9 — BEFORE head-5 reads at
+        block 11) relays the push-time SP low byte into the fresh per-row band
+        ``SP_ADDR_LO``: Q fires at MEM store value rows + binary-op AX query
+        rows; K matches MARK_SP; steep ALiBi recency (0.5) picks the NEAREST
+        PRIOR MARK_SP; V copies its OUTPUT_LO one-hot. add-step query@253
+        SP_ADDR_LO=8; store@123 (a=4) =8 (MATCH); store@183 (b=5) =0 (MISMATCH).
+      * ``make_layer8_mem_to_alu_op`` head-5 adds an OP_*-gated SP-mismatch
+        penalty (anti-complement form): K[base+30+i]=SP_ADDR_LO+i (store side),
+        Q[base+30+i]=G*SP_ADDR_LO+i (query side) + one const dim K=1/Q=-G, so the
+        head-5 score gains ``G*(match - 1)`` = 0 on a frame MATCH and ``-G`` on a
+        MISMATCH. The popped (mismatched) store is demoted by G; recency then
+        picks the live (matched) store. match==0 keeps single-store ops
+        (mul_div/mod/paren/standalone add/sub) byte-identical (their live store
+        SP-matches its query so the penalty is 0 there).
+
+    DEFAULT ON. Opt-out via ``C4_L8_OPERAND_SP_DISC=0`` restores the byte-
+    identical pre-fix path (flag-OFF or ``C4_OPERAND_FROM_MEMSP=0`` are both
+    byte-identical to golden ``f2b040aa``: the SP_ADDR_LO band is flag-gated so a
+    flag-off build omits it entirely → smaller d_model, and the head-5 penalty
+    dims only bake under the flag). Kept as a dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_L8_OPERAND_SP_DISC`` can A/B it
+    inside the campaign config.
+
+    *** DEFAULT ON (2026-06-26) — BLOCKER-1 RESOLVED, +9 expr_add_mul. ***
+    The DISCRIMINATOR CORE was GPU-validated 2026-06-25 (at the depth-2 expr_add_
+    mul ADD step it demotes the popped-``b`` store and head-5 delivers operand-A =
+    the live ``a``: probe_addmul_head5_cam.py id816 ALU_LO 5->4, AX 15->14) but
+    shipped OFF pending BLOCKER-1. BLOCKER-1 is now FIXED by the block-10
+    WINNER-TAKE-ALL sharpener (``make_layer7_sp_addr_sharpen_op``): it saturating-
+    clamps each relayed SP_ADDR_LO cell to [0,1] (-> SP_ADDR_LO_SHARP /
+    SP_ADDR_PRESENT_SHARP, which head-5's penalty now reads), so the bilinear
+    G*(<q,k> - PRESENT_q*PRESENT_k) penalty stays bounded (~few hundred, was ~+80k)
+    and cancels EXACTLY at the matched winner for ALL ops. var_simple no longer
+    regresses. GPU full_trace 250-274,800-899 (campaign, spec_k=0): flag-ON
+    85/125 vs flag-OFF 76/125 = +9 -- expr_add_mul 0/25 -> 9/25 with NO regression
+    (var_simple 25/25, expr_mod 25/25, expr_mul_div 10/10, expr_paren 16/16 all
+    HOLD). lint_cross_op_attention PASS (no shared-head softmax hazard). Flag-OFF
+    and non-campaign builds stay byte-identical (the SP_ADDR* bands are flag-gated,
+    omitted -> smaller d_model -> golden ``2d227d48`` unchanged), so this default
+    flip only takes effect INSIDE the campaign config where it was validated.
+
+    BLOCKER-2 (downstream expr_add_mul roots) is INDEPENDENT and remains: the 16
+    still-failing expr_add_mul diverge later at step-5 (MUL large-value corruption)
+    / step-7 (framing on small-value progs; id816 4+5*2 reaches neural=14=expected
+    but mis-frames an intermediate step) -- the discriminator+sharpener is now net
+    +9 on its own and BLOCKER-2 is the remaining headroom (0/25 -> 9/25 done).
+
+    Opt-out: ``C4_L8_OPERAND_SP_DISC=0`` restores the byte-identical pre-fix path
+    (kept as a kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_L8_OPERAND_SP_DISC`` can still A/B it inside the campaign).
+    """
+    if not operand_from_memsp_enabled():
+        return False
+    return os.environ.get("C4_L8_OPERAND_SP_DISC", "1") != "0"
+
+
 def cmp_byte0_se_recover_enabled() -> bool:
     """Return True iff the COMPARISON operand-A byte-0 SE_ALU recovery is active
     (DEFAULT ON in the campaign config — opt-out via

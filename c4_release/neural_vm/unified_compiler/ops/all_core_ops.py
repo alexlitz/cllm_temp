@@ -37,6 +37,7 @@ from .user_input_ops import (  # noqa: F401
 from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
 from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
 from .shared import sub_full_borrow_enabled  # noqa: F401
+from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
 
 
@@ -197,6 +198,24 @@ def all_core_ops(
         # real PSH store's value row from phantom IMM-step MEM value rows.
         # See make_layer7_mem_store_relay_op + make_layer8_mem_to_alu_op.
         make_layer7_mem_store_relay_op(enable=operand_from_memsp_enabled()),
+        # expr_add_mul operand-A SP-frame discriminator relay (phase=7, L7
+        # block 9). Flag-gated by C4_L8_OPERAND_SP_DISC (DEFAULT-OFF blueprint;
+        # flag-OFF / non-campaign = byte-identical, the SP_ADDR_LO band is
+        # omitted). When on, relays the push-time SP low byte (OUTPUT_LO one-hot
+        # at the nearest prior MARK_SP) onto the MEM store value rows + binary-op
+        # AX query rows into SP_ADDR_LO, BEFORE the L8 attn block, so the L8
+        # head-5 mem-to-ALU CAM can demote a POPPED store (SP-frame mismatch)
+        # vs the LIVE store on the depth-2 expr_add_mul (a+b*c) cluster. See
+        # make_layer7_sp_addr_relay_op + make_layer8_mem_to_alu_op.
+        make_layer7_sp_addr_relay_op(enable=l8_operand_sp_disc_enabled()),
+        # BLOCKER-1 fix (block-10 SHARPENER): winner-take-all clamp of the
+        # relayed SP_ADDR_LO one-hot (threshold each cell at 0.5 -> clean 0/1
+        # cells in SP_ADDR_LO_SHARP + a bounded PRESENT in {0,1}). Runs at the L7
+        # FFN AFTER the relay attention (requires after=layer7_sp_addr_relay) and
+        # BEFORE the L8 head-5 read, so head-5's bilinear SP-mismatch penalty
+        # cancels EXACTLY on a frame MATCH for ALL ops -> kills the var_simple
+        # PRESENT blow-up that kept the discriminator default-OFF. Flag-gated.
+        make_layer7_sp_addr_sharpen_op(enable=l8_operand_sp_disc_enabled()),
         # Convo-I/O L7 attn bake (phase=7.5). Always registered; bake is a
         # no-op when enable_conversational_io is False. See docstring for
         # phase/ordering rationale.

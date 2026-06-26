@@ -11,7 +11,11 @@ from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstrain
 from ..layer_compiler import Operation
 from ..positional_invariant import marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy, no_stack0_emit_enabled
+from .shared import (
+    _as_setdim_proxy,
+    l8_operand_sp_disc_enabled,
+    no_stack0_emit_enabled,
+)
 
 
 # === L8 attention head layout (auto-fit; legacy head_idx as docs) ====
@@ -2779,6 +2783,77 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn.W_k[base + 4, BD.MEM_STORE_AT_VAL] = STORE_B
         attn.W_k[base + 4, BD.CONST] = -STORE_C
 
+        # === Dims 30-46: SP-FRAME MISMATCH PENALTY — expr_add_mul discriminator
+        # (2026-06-25, C4_L8_OPERAND_SP_DISC, DEFAULT-OFF blueprint) ===
+        #
+        # ⚠ BLOCKER (default-OFF reason): the exact-cancel below holds only when
+        # the relayed SP frame is a CLEAN one-hot (true for expr programs). For
+        # var_simple the source OUTPUT_LO@MARK_SP is NOISY (sum -12.8, 7 cells),
+        # so SP_ADDR_PRESENT (=SUM SP_ADDR_LO) blows up and PRESENT_q*PRESENT_k
+        # explodes (~+80k), perturbing single-store steps (var_simple -20). A
+        # WINNER-TAKE-ALL one-hot sharpener on SP_ADDR_LO (block 10) is needed to
+        # bound PRESENT to [0,1] so the cancel is exact for ALL ops. See the
+        # ``l8_operand_sp_disc_enabled`` docstring (shared.py) for the full
+        # blueprint + the SECOND blocker (expr_add_mul step-5/step-7 downstream
+        # roots that keep the cluster at 0/25 even with operand-A correct).
+        #
+        # The dim-4 store gate ranks among the (otherwise byte-identical) MEM
+        # store value rows by ALiBi recency alone. On the only depth-2 expr
+        # cluster (``a+b*c``: PSH a, PSH b, IMM c, MUL pops b, ADD pops a) TWO
+        # stores are live at the ADD step, and recency wrongly picks the more-
+        # recent POPPED ``b`` store over the LIVE ``a`` store (== mem[SP]). The
+        # only discriminator is the SP at push time: a@0xF8, b@0xF0; after the
+        # MUL pop SP returns to 0xF8 == a's frame. ``make_layer7_sp_addr_relay_op``
+        # (L7 block 9) relays that push-time SP low byte into the SP_ADDR_LO
+        # one-hot band at BOTH the store value rows (K side) and the binary-op AX
+        # query row (Q side). GPU spec_k=0 (id816 4+5*2): query@253 SP_ADDR_LO=8;
+        # store@123 (a) =8 (MATCH); store@183 (b) =0 (MISMATCH).
+        #
+        # EXACT-CANCELLING bilinear mismatch penalty (magnitude-robust). The
+        # relayed one-hots are NOT exactly 1.0 (SP_ADDR_LO/PRESENT deliver ~0.98:
+        # softmax1 zero-anchor leakage + the source OUTPUT_LO one-hot ~0.98). A
+        # naive  G*(<q,k> - 1)  or  G*(<q,k> - PRESENT)  form leaves a ~-0.5
+        # residual on the MATCHED store (because q̂*k̂ != 1 and != PRESENT), which
+        # flips the saturated-tie single-store expr verdicts. The fix uses the SUM
+        # of the SP_ADDR_LO one-hot as PRESENT (so PRESENT == the one-hot's own
+        # active-cell magnitude) and the bilinear form
+        #
+        #   contribution(row) = G * ( SUM_i q̂_i k̂_i  -  PRESENT_q * PRESENT_k )
+        #
+        # where q̂/k̂ are the query/store SP_ADDR_LO one-hots and PRESENT_q/k are
+        # their sums. For a one-hot, PRESENT == the active-cell magnitude, so:
+        #   MATCH (same active cell c): SUM q̂k̂ = q̂_c k̂_c ;  PRESENT_q PRESENT_k =
+        #     q̂_c k̂_c  ->  contribution = 0  EXACTLY (any magnitude) -- but ONLY
+        #     for a true one-hot. The matched (= correct operand) store is then
+        #     bit-untouched -> CLEAN-SP-frame single-store ops (expr_paren/mul_div/
+        #     mod) HOLD. (Noisy-frame var_simple does NOT -- see the BLOCKER note.)
+        #   MISMATCH (different cells): SUM q̂k̂ = 0 ;  PRESENT_q PRESENT_k = q̂_c
+        #     k̂_c' ~= 0.96  ->  contribution = -0.96 G. After /sqrt(HD)~10.5,
+        #     G=420 => ~-38 demotion, above the ~30-token recency gap (probe -35
+        #     vs -65), so the popped (frame-mismatched) store loses to the live one.
+        #   NON-SP row (PRESENT=0, k̂=0): contribution = 0 (inert -> no softmax
+        #     normalization shift on IMM/non-firing/single-store steps).
+        #
+        # Slots: 30..45 = per-cell  +G*q̂_i k̂_i ; slot 46 = -G*PRESENT_q*PRESENT_k.
+        # Flag-gated; flag-OFF omits SP_ADDR_LO_SHARP/PRESENT_SHARP and none of
+        # this bakes -> golden byte-identical.
+        #
+        # BLOCKER-1 fix (2026-06-26): READ THE SHARPENED BANDS, not the raw relay
+        # output. The block-10 ``make_layer7_sp_addr_sharpen_op`` thresholds each
+        # SP_ADDR_LO cell at 0.5 -> clean 0/1 cells in SP_ADDR_LO_SHARP and a
+        # bounded SP_ADDR_PRESENT_SHARP in {0,1}. With every surviving cell EXACTLY
+        # 1.0, the MATCH cancel (SUM q̂k̂ - PRESENT_q*PRESENT_k = 1-1 = 0) is exact
+        # for ALL ops, not just clean-SP-frame expr programs -- so the var_simple
+        # raw-PRESENT blow-up (~3.9 -> ~+80k penalty -> -20 regression) is gone.
+        if l8_operand_sp_disc_enabled():
+            G = float(_os_l8.environ.get("C4_SP_DISC_G", "420"))  # A/B knob (tooling)
+            SP_PEN_BASE = 30      # slots 30..45 (cells) + 46 (PRESENT product baseline)
+            for i in range(16):
+                attn.W_q[base + SP_PEN_BASE + i, BD.SP_ADDR_LO_SHARP + i] = 1.0
+                attn.W_k[base + SP_PEN_BASE + i, BD.SP_ADDR_LO_SHARP + i] = G
+            attn.W_q[base + SP_PEN_BASE + 16, BD.SP_ADDR_PRESENT_SHARP] = 1.0
+            attn.W_k[base + SP_PEN_BASE + 16, BD.SP_ADDR_PRESENT_SHARP] = -G
+
         # === V/O: copy CLEAN_EMBED bytes → ALU_LO/HI at AX marker ===
         # This mirrors L7 head 0 (vm_step.py:_set_layer7_operand_gather)
         # which writes ALU_LO/HI from STACK0_BYTE0's CLEAN_EMBED. The L8
@@ -2951,6 +3026,19 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
     # so the dep-graph validator does not reject the undeclared dim flag-OFF.
     _store_at_val_read = {"MEM_STORE_AT_VAL"} if enable else set()
 
+    # SP_ADDR_LO_SHARP (read by head-5 dims 30-46, the SP-frame mismatch penalty)
+    # is a flag-gated residual band, present only under C4_L8_OPERAND_SP_DISC
+    # (which itself requires the campaign). Declared in the read set only when both
+    # this op is enabled AND the SP-disc flag is on, so the dep-graph validator
+    # does not reject the undeclared dim on a build where the band is omitted. The
+    # SP_ADDR_LO_SHARP band is written by make_layer7_sp_addr_sharpen_op at the L7
+    # FFN (block 10, an EARLIER block — it sharpens make_layer7_sp_addr_relay_op's
+    # block-9 SP_ADDR_LO write), so this is a plain same-step read (no PREV_STEP).
+    _sp_addr_read = (
+        {"SP_ADDR_LO_SHARP", "SP_ADDR_PRESENT_SHARP"}
+        if (enable and l8_operand_sp_disc_enabled()) else set()
+    )
+
     # STACK0 campaign Part B: head 7 writes STACK0_BYTE_VAL_1 (operand-A byte 1
     # from mem[SP]) ONLY when the STACK0 emission is dropped (the byte-1 head
     # bakes under no_stack0_emit). Declare the write conditionally so the
@@ -2999,7 +3087,8 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
                "MARK_STACK0", "ADDR_B0_LO.*.-1", "ADDR_B0_HI.*.-1",
                "ADDR_B1_LO.*.-1", "ADDR_B1_HI.*.-1",
                "ADDR_B2_LO.*.-1", "ADDR_B2_HI.*.-1",
-               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"} | _store_at_val_read,
+               "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "CONST"}
+              | _store_at_val_read | _sp_addr_read,
         writes={"ALU_LO", "ALU_HI", "AX_FULL_LO", "AX_FULL_HI"} | _byte1_write,
         kind="block",
         declarative_bake_fn=bake,

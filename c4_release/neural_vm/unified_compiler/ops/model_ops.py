@@ -9,7 +9,7 @@ from ..isa_semantics_dsl import (
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 import torch.nn as nn
-from .shared import _as_setdim_proxy
+from .shared import _as_setdim_proxy, l8_operand_sp_disc_enabled
 from .residual_band_registry import register_residual_band
 from ...dim_registry import dim_ref
 
@@ -2467,6 +2467,59 @@ register_residual_band(
     _AX_BYTE1_HINIB_BAND, _AX_BYTE1_HINIB_WIDTH,
     owner="make_ax_byte1_hinib_emission_op",
     flag=_ax_byte1_hinib_enabled, never_share=True,
+)
+
+
+# === expr_add_mul operand-A SP-frame discriminator bands (2026-06-25) ===
+#
+# Registered HERE (model_ops imports LAST) — NOT in l7_ops next to the relay op
+# that owns them — DELIBERATELY: these are flag-gated over-width bands, and a
+# band registered at L7's early import position re-packs EVERY later flag-ON band
+# (BP_SAVE_PREV, MUL_RESULT_HI, AX_BYTE1_HINIB, ...) by its width in the campaign
+# build, which breaks a static-position consumer (observed: a step-0 AX byte-1
+# replication regression across expr_paren/mul_div/mod). Appending them after the
+# last existing band keeps every other band's dim position byte-stable, so the
+# campaign build is unchanged except for the appended SP_ADDR_* slots.
+#
+# ``SP_ADDR_LO`` (16-cell one-hot): the push-time SP LOW byte, relayed by
+# ``make_layer7_sp_addr_relay_op`` (L7 block 9) from the nearest prior MARK_SP's
+# OUTPUT_LO onto the MEM store value rows + binary-op AX query rows, so the L8
+# head-5 mem[SP] CAM can tell a LIVE store from a POPPED store on the only
+# depth-2 expr cluster (``expr_add_mul`` ``a+b*c``: two live stack stores;
+# a@0xF8, b@0xF0, post-MUL SP back to 0xF8 == a's frame).
+# ``SP_ADDR_PRESENT`` (scalar): 1.0 exactly on rows carrying a relayed SP frame;
+# gates head-5's ``-G`` penalty baseline so it is 0 on every non-SP row (a CONST
+# baseline would shift head-5's per-query softmax normalization at saturated byte
+# ties and regress the single-store expr clusters).
+# Flag-gated by ``C4_L8_OPERAND_SP_DISC`` (DEFAULT-OFF blueprint) so a flag-OFF
+# build omits both bands → smaller d_model, byte-identical to golden.
+register_residual_band(
+    "SP_ADDR_LO", 16, owner="make_layer7_sp_addr_relay_op",
+    flag=l8_operand_sp_disc_enabled, never_share=True,
+)
+register_residual_band(
+    "SP_ADDR_PRESENT", 1, owner="make_layer7_sp_addr_relay_op",
+    flag=l8_operand_sp_disc_enabled, never_share=True,
+)
+# ``SP_ADDR_LO_SHARP`` / ``SP_ADDR_PRESENT_SHARP`` (BLOCKER-1 fix, 2026-06-26):
+# the WINNER-TAKE-ALL one-hot SHARPENER of the relayed SP_ADDR_LO band. A
+# block-10 SwiGLU FFN (``make_layer7_sp_addr_sharpen_op``, between the L7 relay
+# at block 9 and the L8 head-5 read at block 11) thresholds each SP_ADDR_LO cell
+# at 0.5 and writes a clean 0/1 cell into ``SP_ADDR_LO_SHARP``; the SAME units
+# also sum into ``SP_ADDR_PRESENT_SHARP``. Because every surviving cell is
+# exactly 1.0 and the relay delivers a near-one-hot (>=0.98 on real SP frames,
+# <0.5 noise floor elsewhere — measured tools/_probe_sp_addr_lo_vals.py), PRESENT
+# is bounded to {0,1} so the head-5 bilinear penalty cancels EXACTLY on a MATCH
+# for ALL ops (not just clean-SP-frame expr programs). This kills the var_simple
+# PRESENT blow-up (raw PRESENT reached ~3.9 -> +80k penalty -> -20 regression).
+# Same flag-gating so a flag-OFF build omits them too.
+register_residual_band(
+    "SP_ADDR_LO_SHARP", 16, owner="make_layer7_sp_addr_sharpen_op",
+    flag=l8_operand_sp_disc_enabled, never_share=True,
+)
+register_residual_band(
+    "SP_ADDR_PRESENT_SHARP", 1, owner="make_layer7_sp_addr_sharpen_op",
+    flag=l8_operand_sp_disc_enabled, never_share=True,
 )
 
 
