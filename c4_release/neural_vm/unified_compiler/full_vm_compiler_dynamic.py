@@ -2330,6 +2330,16 @@ def compile_full_vm_dynamic(
             "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
                 os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
             ),
+            # ENT-step AX-dump 0xE8/0x02 (744) sentinel-slam guard (#311;
+            # DEFAULT-ON in the campaign config, opt out =0; output-affecting on
+            # the main-ENT-step AX byte-0/byte-1 dump rows): adds NOT-blockers to
+            # the L10-tail 0xE8 byte-0 + 0x02 byte-1 writers so the carried AX
+            # survives the ENT step. The ON / OFF builds must NEVER share a memo
+            # entry. See l10_ops._tail_lea_e8_ent_guard_enabled.
+            "C4_TAIL_LEA_E8_ENT_GUARD": (
+                os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
+                and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            ),
             # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1,
             # output-affecting on the BP-byte1 OUTPUT crush): the ON / OFF
             # builds must never share a memo entry.
@@ -3097,6 +3107,14 @@ def _bake_from_scheduled_ops(
         # ``_lea_local_e8_multilocal_guard_enabled``.
         "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
             os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
+        ),
+        # ENT-step AX-dump 0xE8/0x02 (744) sentinel-slam guard (#311; DEFAULT-ON
+        # in the campaign config, opt out =0; output-affecting on the main-ENT
+        # AX byte-0/byte-1 dump rows): the ON / OFF builds must never share a
+        # serialised entry. See l10_ops.py ``_tail_lea_e8_ent_guard_enabled``.
+        "C4_TAIL_LEA_E8_ENT_GUARD": (
+            os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
+            and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
         ),
         # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1, output-
         # affecting on the BP-byte1 OUTPUT crush): the ON / OFF builds must never

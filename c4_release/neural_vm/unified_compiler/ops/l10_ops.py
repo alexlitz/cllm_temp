@@ -344,6 +344,104 @@ def _ax_byte1_signext_lea_blockers() -> tuple:
     )
 
 
+def _tail_lea_e8_ent_guard_enabled() -> bool:
+    """Flag for the ENT-step AX-dump 0xE8/0x02 (744) sentinel-slam guard (#311).
+
+    The wall this lifts (verified spec_k=0 + bit-exact cpu_full_trace, BUILT
+    dims, the DEFAULT 30-token config ``C4_NO_STACK0_EMIT=1
+    C4_OPERAND_FROM_MEMSP=1``; tools/_probe_ifvar436_ent.py on var_simple id250
+    ``x=990`` and if_var id436 ``x=66; if(x>24)``): on the **main ENT step**
+    (step 1, the function prologue ``ENT 8`` that immediately follows the
+    bootstrap ``JSR main``) the AX register MUST preserve the carried prior AX
+    (``AX_CARRY`` == 0 here), but the AX dump emits **744 = 0x02E8** — byte-0 =
+    0xE8 + byte-1 = 0x02 — so the per-step ``full_trace`` verdict diverges at
+    step 1 with ``got_ax=744`` vs ``oracle_ax=0``. This gates the ENTIRE
+    var_simple / if_var / (and every ``main``-ENT) cluster at the FIRST step.
+
+    ROOT (two L25-tail ``_tail_bit32_result_correction_rules`` writers fire on
+    the ENT-step AX rows where ``AX_CARRY`` is live):
+      * ``tail_lea_local_ax_marker_byte0_e8`` (the BP-8 LEA byte-0 0xE8 writer,
+        strength 1e6) fires on the ENT AX-marker row: it is ``scope="mark ==
+        AX"`` so the lowered 1e9 ``MARK_AX`` term dominates and the ``OP_LEA``
+        (== 0 on the ENT step) cannot veto — exactly the same threshold-clear
+        the DIV/MOD and ADD/SUB (#309) sentinel guards already document.
+      * ``tail_ax_add_byte1_missing_stack_high_02`` (a constant-0x02 byte-1
+        materializer, strength 5000) fires on the ENT AX byte-1 row, driven by
+        its ``FETCH_HI+1`` term (the fetched ENT instruction's high byte). It
+        has no live ADD use (its own comment: "no live ADD smoke test exercises
+        this" — byte-1 low nibble is 0 for every ADD target), so suppressing it
+        on the carried-AX row is safe.
+
+    THE FIX (mirrors the DIV/MOD + ADD/SUB sentinel guards — NOT-blockers
+    appended to the EXISTING rules, so the width-sensitive 2059-rule tail bank
+    keeps its rule count and is byte-identical when the guard is off):
+      * 0xE8 byte-0 writer: add ``OPCODE_BYTE_LO+6`` (the per-step FETCHED ENT
+        opcode low-nibble one-hot; ENT = C4 opcode 6 = 0x06) as a hard
+        NOT-blocker. Measured CRISP at the AX-marker row (== 1.0 on the ENT
+        step, == 0.0 on a genuine LEA step, which has ``OPCODE_BYTE_LO+0``), so
+        the legit BP-8 LEA byte-0 0xE8 emit is byte-identical.
+      * 0x02 byte-1 writer: add ``AX_CARRY_LO+0`` / ``AX_CARRY_HI+0`` (the
+        carried-prior-AX-present signal; both ~3.0 on the ENT byte-1 row where
+        AX_CARRY holds the preserved value 0, and 0.0 on every genuine
+        freshly-computed value byte-1 row — measured on the LEA-0xff and IMM-0x02
+        byte-1 rows, both cold) as hard NOT-blockers, so the writer cannot stamp
+        0x02 over the carried AX.
+
+    With both writers vetoed the upstream ``ent_ax_passthrough``
+    (``AX_CARRY -> OUTPUT`` on the ENT AX row) survives to the LM head and the
+    AX dump emits the carried 0 -> step-1 ``got_ax`` 744 -> 0.
+
+    DEFAULT ON in the 30-token config. Opt-out via ``C4_TAIL_LEA_E8_ENT_GUARD=0``
+    (the byte-identical path: flag-OFF or ``C4_NO_STACK0_EMIT=0`` are both
+    byte-identical to the pre-fix build). Dedicated kill-switch so
+    ``tools/flag_regression_gate.py --flag C4_TAIL_LEA_E8_ENT_GUARD`` can A/B it.
+    """
+    from .shared import no_stack0_emit_enabled
+
+    return (
+        os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
+        and no_stack0_emit_enabled()
+    )
+
+
+# ENT is C4 opcode 6 = 0x06 -> low nibble 0x6. The per-step FETCHED opcode
+# low-nibble one-hot ``OPCODE_BYTE_LO+6`` is +1.0 EXACTLY on the ENT AX-marker
+# row and 0.0 on a genuine LEA AX-marker row (which is ``OPCODE_BYTE_LO+0``) --
+# the SAME sharp (non-cross-step-persistent) discriminator the #325 var_update
+# arith guard uses for ADD/SUB.
+_ENT_GUARD_OPCODE_LO = "OPCODE_BYTE_LO+6"
+
+
+def _tail_lea_e8_ent_byte0_blockers() -> tuple:
+    """ENT NOT-blocker for the 0xE8 byte-0 writer (marker row).
+
+    Empty unless the ENT guard is active (byte-identical off). When active,
+    hard-blocks the writer on the per-step FETCHED ENT opcode one-hot so it
+    cannot stamp the BP-8 0xE8 on the carried-AX ENT-marker row. See
+    ``_tail_lea_e8_ent_guard_enabled``.
+    """
+    if not _tail_lea_e8_ent_guard_enabled():
+        return ()
+    return ((_ENT_GUARD_OPCODE_LO, -1_000_000_000.0),)
+
+
+def _tail_lea_e8_ent_byte1_blockers() -> tuple:
+    """ENT NOT-blockers for the constant-0x02 byte-1 materializer (byte row).
+
+    Empty unless the ENT guard is active (byte-identical off). When active,
+    hard-blocks the writer when the carried prior AX is present
+    (``AX_CARRY_LO+0`` / ``AX_CARRY_HI+0`` both ~3.0 on the ENT byte-1 row, 0.0
+    on every genuine freshly-computed value byte-1), so it cannot stamp 0x02
+    over the carried AX. See ``_tail_lea_e8_ent_guard_enabled``.
+    """
+    if not _tail_lea_e8_ent_guard_enabled():
+        return ()
+    return (
+        ("AX_CARRY_LO+0", -1_000_000_000.0),
+        ("AX_CARRY_HI+0", -1_000_000_000.0),
+    )
+
+
 def _lea_e0d8_fetch_dominate_enabled() -> bool:
     """Flag for boosting the campaign ``e0_fetch_memsp`` (BP-16 0xE0) /
     ``d8_fetch_memsp`` (BP-24 0xD8) LEA byte-0 writers' strength so they DOMINATE
@@ -9778,7 +9876,18 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # ``_arith_guard_addsub_blockers`` /
                 # ``_tail_lea_e8_arith_guard_sharp_enabled``.
                 *_arith_guard_addsub_blockers(),
-            ) if _tail_lea_e8_arith_guard_enabled() else ()),
+            ) if _tail_lea_e8_arith_guard_enabled() else ())
+            # ENT-step AX-marker row 0xE8 (744) sentinel-slam guard (#311). The
+            # main ENT step's AX dump must preserve the carried prior AX
+            # (AX_CARRY == 0), but this 1e6 0xE8 writer fires on the ENT
+            # AX-marker row (MARK_AX scope dominates; OP_LEA == 0 cannot veto)
+            # and stamps byte-0 = 0xE8 -> the var_simple / if_var cluster
+            # diverges at step 1 (got_ax 0x_2E8 vs oracle 0). The per-step
+            # FETCHED ENT opcode one-hot ``OPCODE_BYTE_LO+6`` (== 1.0 on the ENT
+            # marker row, == 0.0 on a genuine LEA marker row which is
+            # ``OPCODE_BYTE_LO+0``) hard-blocks the writer ONLY on a real ENT
+            # step. See ``_tail_lea_e8_ent_guard_enabled``.
+            + _tail_lea_e8_ent_byte0_blockers(),
             threshold=7.0,
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
@@ -9815,7 +9924,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("H1+2", -100000000.0),
                 ("H1+3", -100000000.0),
                 ("H1+4", -100000000.0),
-            ),
+            )
+            # ENT-step AX byte-1 row 0x02 (744) sentinel-slam guard (#311). On
+            # the main ENT step this constant-0x02 byte-1 materializer fires
+            # (driven by its FETCH_HI+1 term = the fetched ENT instruction) and
+            # stamps byte-1 = 0x02 over the carried prior AX (0) -> the AX dump
+            # decodes 0x02E8 = 744. The carried-AX-present signal
+            # (``AX_CARRY_LO+0`` / ``AX_CARRY_HI+0`` both ~3.0 on the carried-AX
+            # ENT byte-1 row, 0.0 on every genuine freshly-computed value byte-1)
+            # hard-blocks it ONLY where AX is being PRESERVED, never on a real
+            # ADD/value byte-1. See ``_tail_lea_e8_ent_guard_enabled``.
+            + _tail_lea_e8_ent_byte1_blockers(),
             threshold=130000.0,
             writes=byte_writes(0x02, strength=5000.0),
         ),
@@ -11211,7 +11330,15 @@ def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
         ("MARK_BP", -1_000_000.0),
         ("MARK_STACK0", -1_000_000.0),
         ("MARK_MEM", -1_000_000.0),
-    )
+    ) + _tail_lea_e8_ent_byte0_blockers()
+    # ^^ ENT-step guard (#311): the main ENT step's frame-size immediate ``ENT 8``
+    # ALSO lights ``FETCH_LO+8`` (the imm=-8 LEA signature), so the
+    # ``FETCH_LO+8 * 1000`` term clears threshold 500 here even though
+    # ``OP_LEA == 0`` -> this op spuriously re-stamps 0xE8 onto the carried-AX
+    # ENT AX dump (var_simple / if_var step-1 got_ax 744). The per-step FETCHED
+    # ENT opcode one-hot ``OPCODE_BYTE_LO+6`` hard-blocks it on a real ENT step
+    # while leaving every genuine in-loop LEA row (OPCODE_BYTE_LO+6 == 0)
+    # byte-identical. See ``_tail_lea_e8_ent_guard_enabled``.
     rules: list[FFNRule] = []
     for out_dim, tgt in (
         ("OUTPUT_LO", _LOOP_LEA_E8_LO_NIBBLE),
