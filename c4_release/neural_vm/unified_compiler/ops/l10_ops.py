@@ -344,6 +344,76 @@ def _ax_byte1_signext_lea_blockers() -> tuple:
     )
 
 
+def _lea_e0d8_fetch_dominate_enabled() -> bool:
+    """Flag for boosting the campaign ``e0_fetch_memsp`` (BP-16 0xE0) /
+    ``d8_fetch_memsp`` (BP-24 0xD8) LEA byte-0 writers' strength so they DOMINATE
+    the BP-8 ``e8_alubp_memsp`` (0xE8) writer on the rows where they fire (the
+    var_three multi-local 2nd/3rd-local LEA byte-0 root). DEFAULT ON wherever the
+    campaign LEA byte-0 relay is active; opt-out via
+    ``C4_LEA_E0D8_FETCH_DOMINATE=0``.
+
+    The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; tools/
+    _probe_vt_step6_tail.py + GPU full_trace on var_three id300 / var_mul id275):
+    var_three full_trace diverges at **step 6** — the ``LEA &b`` (BP-16, imm=-16,
+    correct AX byte-0 = 0xE0) emits 0xE8 (= &a, BP-8) so the 2nd local ALIASES the
+    1st (got_ax 0xFFE8 vs oracle 0xFFE0). var_mul id275 has the SAME bug (baseline
+    GPU FAIL step 6, 0xFFE8 vs 0xFFE0). The block-by-block residual scan shows
+    OUTPUT byte-0 is the correct **0xE0 through block 41** then FLIPS to 0xE8 at
+    **block 42** (the L25 tail bank): OUTPUT_LO[0] +758 -> -829M, OUTPUT_LO[8]
+    +558 -> +829M.
+
+    ROOT: the ``e8_alubp_memsp`` 0xE8 writer keys ONLY on ``0.2 * ALU_HI+15``,
+    which the keystone (``_lea_byte0_memsp_relay_enabled``) assumed was ~+5.5 on
+    BP-16/BP-24 frames. In var_three's DEEPER 3-local frame the ``&b`` LEA's
+    ``ALU_HI+15`` is ~+72.92 (NOT +5.5), so ``0.2*72.92 + ~3 = ~17.6 >= threshold
+    17``: the 0xE8 writer (strength 1e6) FIRES on the ``&b`` row and — being a TIE
+    at 1e6 with the CORRECT ``e0_fetch_memsp`` 0xE0 writer — the 0xE8 wins the
+    block-42 argmax.
+
+    THE FIX — a strength DOMINANCE rather than a blocker. The e0/d8 writers
+    ALREADY carry the precise multi-local FETCH discriminator that EXCLUDES
+    func_identity: ``e0_fetch_memsp`` REQUIRES ``FETCH_LO+0`` AND ``FETCH_HI+15``
+    (each weight 8, ABSENCE drops below threshold), and func_identity's ``&x``
+    carries ``FETCH_HI`` nibble **1** (NOT 15) so e0_fetch is dark there (the
+    keystone doc's own exclusion). So raising ONLY the e0/d8 write strength
+    (1e6 -> 4e6) makes 0xE0/0xD8 out-vote the 0xE8 tie on var&b/&c WITHOUT
+    touching any row where e0/d8 don't already fire:
+
+      * var ``&a`` (imm=-8): e0/d8 dark (FETCH_LO+0 absent), only e8_alubp fires
+        -> 0xE8 byte-identical.
+      * var ``&b`` (imm=-16): e0_fetch (4e6) + e8_alubp (1e6) -> 0xE0 WINS.
+      * var ``&c`` (imm=-24): d8_fetch (4e6) + e8_alubp (1e6) -> 0xD8 WINS.
+      * func_identity ``&x`` (imm=-8, FETCH_HI nib 1): e0/d8 DARK (require
+        FETCH_HI+15) -> only e8_alubp fires -> 0xE8 byte-identical (no regression
+        — the earlier FETCH_LO+0 NOT-blocker approach FAILED here because func's
+        ``&x`` ALSO carries FETCH_LO+0; keying off the e0/d8 FIRE condition,
+        which needs FETCH_HI+15, is the func-safe discriminator).
+
+    DEFAULT tracks ``_lea_byte0_memsp_relay_enabled()`` (the e0/d8 writers' own
+    campaign branch): the strength bump is applied ONLY in the 30-token campaign
+    config and ONLY when this flag is on, so flag-OFF (``=0``),
+    ``C4_NO_STACK0_EMIT=0``, or the 35-token golden build are all byte-identical
+    to the pre-fix default (golden ``4958b35b`` never emits these writers).
+    Dedicated kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_LEA_E0D8_FETCH_DOMINATE`` can A/B it inside the campaign config.
+    """
+    forced = os.environ.get("C4_LEA_E0D8_FETCH_DOMINATE")
+    if forced is not None:
+        return forced != "0" and _lea_byte0_memsp_relay_enabled()
+    return _lea_byte0_memsp_relay_enabled()
+
+
+def _lea_e0d8_fetch_strength() -> float:
+    """Return the OUTPUT-write strength for the campaign ``e0_fetch_memsp`` /
+    ``d8_fetch_memsp`` LEA byte-0 writers. 4e6 when the dominance fix is active
+    (so 0xE0/0xD8 out-vote the BP-8 0xE8 ``e8_alubp_memsp`` writer's 1e6 tie on
+    the multi-local 2nd/3rd-local LEA), else the pre-fix 1e6 (byte-identical).
+    See ``_lea_e0d8_fetch_dominate_enabled`` for the full root + safety analysis.
+    """
+    return 4_000_000.0 if _lea_e0d8_fetch_dominate_enabled() else 1_000_000.0
+
+
 def _lea_byte0_memsp_relay_enabled() -> bool:
     """Flag for the PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay
     (ROOT 1, gates func_identity step-6 + var_mul/three multi-local + nested).
@@ -10011,7 +10081,12 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_MEM", -10000.0),
             ),
             threshold=20.0,
-            writes=byte_writes(0xE0, strength=1_000_000.0),
+            # var_three multi-local: out-vote the BP-8 0xE8 ``e8_alubp_memsp``
+            # writer's 1e6 tie on the ``&b`` row (its ALU_HI+15 over-fires in a
+            # deeper 3-local frame). func-safe — e0_fetch needs FETCH_HI+15 which
+            # func's ``&x`` (FETCH_HI nib 1) lacks. See
+            # ``_lea_e0d8_fetch_dominate_enabled``.
+            writes=byte_writes(0xE0, strength=_lea_e0d8_fetch_strength()),
         ),
         # (3) BP-24 -> 0xD8. imm=-24 = 0xE8 lights ``FETCH_LO+8`` +
         # ``FETCH_HI+14`` (NOT ``FETCH_HI+15``). Mirrors the 0xE0 rule on those
@@ -10045,7 +10120,10 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_MEM", -10000.0),
             ),
             threshold=20.0,
-            writes=byte_writes(0xD8, strength=1_000_000.0),
+            # var_three multi-local: out-vote the BP-8 0xE8 ``e8_alubp_memsp``
+            # writer's 1e6 tie on the ``&c`` row. See
+            # ``_lea_e0d8_fetch_dominate_enabled``.
+            writes=byte_writes(0xD8, strength=_lea_e0d8_fetch_strength()),
         ),
     ) if _lea_byte0_memsp_relay_enabled() else ()) + (tuple(
         # PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER (ROOT 1
