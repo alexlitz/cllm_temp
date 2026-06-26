@@ -2367,6 +2367,14 @@ def compile_full_vm_dynamic(
             "C4_SILI_B1_RESTORE": (
                 os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
             ),
+            # SI/SC store-AX byte-0 OUTPUT zero-default OVERRIDE (var_mul step-9,
+            # campaign-ON, opt out =0, BAKE-affecting): rewrites the
+            # l16_store_ax_carry_lo write tuples (override vs bare additive) so
+            # the ON / OFF builds bake different L16 FFN weights and must never
+            # share a memo entry. See shared.store_ax_b0_override_enabled.
+            "C4_STORE_AX_B0_OVERRIDE": (
+                os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
+            ),
             # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2,
             # DEFAULT-OFF building block, opt in =1, BAKE-affecting): registers
             # the LEA_REREAD_B0 band + the capture / restore PureFFN ops, so the
@@ -3126,6 +3134,14 @@ def _bake_from_scheduled_ops(
         # shared.sili_b1_restore_enabled.
         "C4_SILI_B1_RESTORE": (
             os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
+        ),
+        # SI/SC store-AX byte-0 OUTPUT zero-default OVERRIDE (var_mul step-9,
+        # campaign-ON, opt out =0, BAKE-affecting): rewrites the
+        # l16_store_ax_carry_lo write tuples so ON / OFF builds bake different
+        # L16 FFN weights and must never share a serialised entry. See
+        # shared.store_ax_b0_override_enabled.
+        "C4_STORE_AX_B0_OVERRIDE": (
+            os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
         ),
         # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2, DEFAULT-OFF
         # building block, opt in =1, BAKE-affecting): registers the LEA_REREAD_B0

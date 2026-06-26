@@ -14,6 +14,7 @@ from .shared import (
     _as_setdim_proxy,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
+    store_ax_b0_override_enabled,
 )
 
 
@@ -1533,13 +1534,28 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_EXIT", -20.0),
         ("OP_JMP", -20.0),
     )
+    # var_mul step-9 fix (campaign-ON, opt out C4_STORE_AX_B0_OVERRIDE=0): the
+    # SI/SC store-AX marker carries a STRONG OUTPUT byte-0 zero-default (the
+    # L19/block-33 ~+26/+40 on OUTPUT_LO+0) that out-votes the bare additive
+    # +2.0/S write, so a store value whose byte-0 HIGH nibble is zero (e.g.
+    # b<=15: the carried LOW nibble is the only nonzero cell) decodes 0 and the
+    # store delivers 0. Mirror the campaign l16_psh_ax_carry_lo override: write
+    # +W to the carried LO nibble cell k AND -W to OUTPUT_LO+0 for k!=0 so a
+    # nonzero low nibble overrides the zero default (k==0 self-cancels -> a
+    # genuinely-zero low byte stays at the zero default). Flag-OFF keeps the
+    # bare additive 2.0/S write (rule count unchanged -> golden byte-identical).
+    _store_ax_override = store_ax_b0_override_enabled()
+    _store_ax_lo_w = (30.0 / S) if _store_ax_override else (2.0 / S)
     for k in range(16):
+        lo_writes = ((f"OUTPUT_LO+{k}", _store_ax_lo_w),)
+        if _store_ax_override and k != 0:
+            lo_writes = lo_writes + (("OUTPUT_LO+0", -_store_ax_lo_w),)
         rules.append(multi_way_and_rule(
             name=f"l16_store_ax_carry_lo_{k}",
             conditions=store_ax_conditions,
             threshold=4.0,
             gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+            writes=lo_writes,
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
