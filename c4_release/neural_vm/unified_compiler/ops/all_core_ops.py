@@ -41,6 +41,7 @@ from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
+from .shared import loop_si_byterow_marker_clear_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -678,6 +679,31 @@ def all_core_ops(
         # exactness writer on non-first pushes. Flag-off => no-op + no band
         # (byte-identical).
         make_l10_nonfirst_psh_sp_helper_op(),
+        # L10 loop back-edge SI-step value-byte-row MARKER-residue clear (flag
+        # C4_LOOP_SI_BYTEROW_CLEAR, default ON in the campaign config). THE FIRST
+        # loop back-edge control-flow desync fix. On the in-loop ``SI`` (store)
+        # step the ``MEM_STORE`` / ``OP_SI`` opcode dims carry a tiny NEGATIVE
+        # residue on the value-byte rows where they should be 0; the L25 tail
+        # bank reads them at -1e8 (NOT-blockers assuming 0), the residue * -1e8
+        # flips the bank's silu gate ON, the OUTPUT-decode band explodes to
+        # ~-7e11, the LM byte head is crushed, and a register-MARKER token wins
+        # by default -> the SI step emits 41 tokens not 30 -> the fixed-30 slicer
+        # mis-frames the next step (loop-condition LEA &i reads PC=114 not 106,
+        # the +16 PC advance). This op ADDs a small +0.02 bias to MEM_STORE/OP_SI
+        # on every value-byte row (IS_BYTE), swamping the residue so the bank
+        # stays OFF -- small enough NOT to perturb the AX sign-extension / ADD
+        # high-byte materializers that read the same dims (verified: no add/sub
+        # /AX regression on the campaign cross-cluster sample).
+        # Scheduled BEFORE tail_bit32 via the produces/consumes dep (tail_bit32
+        # reads MEM_STORE/OP_SI). REGISTERED ONLY when the flag is on
+        # (lookahead-chain pattern) so a flag-off / golden build is byte-identical
+        # to golden 5acb3d23. Fixes loop_sum step-9 framing + step-10 PC (the loop
+        # back-edge; ~the loop_* cluster). See _l10_loop_si_byterow_marker_clear_*
+        # / loop_si_byterow_marker_clear_enabled.
+        *(
+            [make_l10_loop_si_byterow_marker_clear_op()]
+            if loop_si_byterow_marker_clear_enabled() else []
+        ),
         make_tail_bit32_result_correction_op(),
         # L10 EXIT/no-clean-opcode AX_CARRY -> OUTPUT source fix (flag
         # C4_L10_EXIT_AXCARRY, default OFF): a post_op attached AFTER

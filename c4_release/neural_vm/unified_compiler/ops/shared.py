@@ -1710,6 +1710,73 @@ def loop_lea_b0_e0_restore_enabled() -> bool:
     )
 
 
+def loop_si_byterow_marker_clear_enabled() -> bool:
+    """Return True iff the loop back-edge SI-step value-byte-row MARKER-residue
+    clear (``C4_LOOP_SI_BYTEROW_CLEAR``) is active.
+
+    DEFAULT **ON** in the campaign config (``C4_NO_STACK0_EMIT=1`` +
+    ``C4_OPERAND_FROM_MEMSP=1``); opt-out via ``C4_LOOP_SI_BYTEROW_CLEAR=0``.
+    Flag-off OR a non-campaign / golden build registers NO rules and appends NO
+    post_op, so the model is bit-for-bit identical to golden ``5acb3d23``.
+
+    ROOT — THE FIRST LOOP BACK-EDGE CONTROL-FLOW DESYNC (loop_sum id450,
+    measured spec_k=0, BUILT dim_positions, campaign config; GPU AR-trace
+    ``tools/_probe_loopsum_backedge.py`` + ``_probe_loopsum_spdrift.py`` +
+    ``_probe_loopsum_explosion.py``):
+
+    After the step-2 / step-6 in-loop LEA byte-0 fixes (``C4_LOOP_LEA_B0_E8`` /
+    ``C4_LOOP_LEA_B0_E0``) advance ``loop_sum`` to step 9, the ``sum = 0`` store
+    (step 9 = ``SI``) DESYNCS the 30-token frame: it emits **41 tokens not 30**.
+    The over-run begins at the SP value-byte-0 row (the row whose input token is
+    the just-emitted SP byte-0 = 0xE8). At that row the LM-head BYTE logits
+    collapse to ~ -5.8e11 so a register-MARKER token (``REG_PC`` = 257) wins by
+    DEFAULT, injecting a spurious PC/AX/SP block (+11 tokens). The fixed-30-token
+    slicer then mis-reads the NEXT step: step 10 (the loop-condition ``LEA &i``,
+    oracle ``pc_after`` = 106) is decoded as ``pc_after`` = 114 — the PC appears
+    to advance +16 not +8, the brief's reported symptom.
+
+    WHY the byte logits collapse (per-block + per-unit attribution): at the SI
+    step's value-byte rows ``MEM_STORE`` (born ~block 11) and ``OP_SI`` (born
+    ~block 31) carry a small NEGATIVE residue (~ -2.4e-3 / -4.2e-4) that SHOULD be
+    exactly 0 on a value-byte row (markers/opcodes belong on the marker row). The
+    L25 tail bank (``tail_bit32_result_correction``, block 43) reads these dims at
+    ``-1e8`` as NOT-blockers ASSUMING they are 0. ``MEM_STORE * -1e8 = +2.4e5``
+    (plus ``OP_SI * -1e8 = +4.2e4``) is enough to flip the bank's silu gate from
+    ``up`` ~ -1.4e4 (OFF, the clean-row value) to ``up`` ~ +6.8e4 (ON): a whole
+    band of OUTPUT-decode units fires asymmetrically -> the OUTPUT_LO/HI decode
+    band explodes to ~ -7.4e11 -> the LM byte head (each band cell drives a byte
+    token at +5.0) is crushed all-negative -> marker token. On a clean (PSH/IMM)
+    step those residues are ~0 so the bank stays OFF and the band decodes a real
+    byte (+14.3, the SP value).
+
+    FIX: a flag-gated ``PureFFN`` block scheduled IMMEDIATELY BEFORE the L25 tail
+    bank that, on EVERY value-byte row (``IS_BYTE`` gate), ADDS a small POSITIVE
+    bias (effective +0.02) to ``MEM_STORE`` and ``OP_SI`` so their residue can no
+    longer flip the tail bank's ``-1e8`` silu gate positive (``+0.02 * -1e8 =
+    -2e6`` keeps ``up`` deeply negative -> bank OFF -> OUTPUT band decodes the
+    real byte). The +0.02 magnitude is CRITICAL: it must be SMALL enough that it
+    does not also flip the AX HIGH-BYTE sign-extension materializer (at +0.5 the
+    AX byte 2/3 over-sign-extend to 0xFF) NOR the multi-byte ADD high-byte adder
+    (at the unscaled FFN-saturated +100 the ADD high byte is lost, 768 -> 256) --
+    both read the same MEM_STORE / OP_SI dims; the AX-safe window is ~0.005..0.1
+    so 0.02 is the robust middle (calibrated via the deterministic ~5000 silu
+    saturation, W_down = 0.02/5000 = 4e-6). It fires ONLY on value-byte rows
+    (``IS_BYTE`` AND every marker NOT-blocked) so it never perturbs the marker
+    rows the tail's MEM-store address materializers legitimately use. Verified
+    (``_probe_loopsum_backedge.py`` + canonical id450 + a 72-id cross-cluster
+    campaign sample, ZERO regressions): the SI step re-emits 30 tokens, step-10
+    PC is 106 (correct), and steps 0-10 are PC+AX byte-correct. The remaining
+    loop_sum residual (step-11 in-loop ``LI &i`` returning AX=0 not 1) is a
+    DISTINCT downstream value-load / operand-CAM root (task #342 family), out of
+    scope for the back-edge desync.
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_LOOP_SI_BYTEROW_CLEAR", "1") != "0"
+    )
+
+
 def ffn_lint_mull14_demo_enabled() -> bool:
     """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
 

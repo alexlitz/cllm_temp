@@ -986,6 +986,7 @@ from .shared import (
     _as_setdim_proxy,
     loop_lea_b0_e0_restore_enabled,
     loop_lea_b0_e8_restore_enabled,
+    loop_si_byterow_marker_clear_enabled,
     mul_stack0_byte39_guard_enabled,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
@@ -11664,6 +11665,174 @@ def make_l10_loop_lea_b0_e0_op() -> Operation:
         # so this is the LAST OUTPUT writer at the 2nd-local LEA row, dominating
         # the block-44 0x01 slam.
         requires={"after": "l10_loop_lea_b0_e8"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+# ===========================================================================
+# loop back-edge SI-step value-byte-row MARKER-residue clear (THE FIRST loop
+# back-edge control-flow desync; campaign).
+#
+# See ``shared.loop_si_byterow_marker_clear_enabled`` for the full root + GPU
+# AR-trace attribution. In one line: at the in-loop ``SI`` (store) step the
+# ``MEM_STORE`` / ``OP_SI`` opcode dims carry a tiny NEGATIVE residue (~ -2.4e-3
+# / -4.2e-4) on the SP/PC VALUE-BYTE rows where they SHOULD be exactly 0. The
+# L25 tail bank (``tail_bit32_result_correction``) reads those dims at ``-1e8``
+# (NOT-blockers assuming 0); the residue * -1e8 flips the bank's silu gate
+# positive -> the whole OUTPUT-decode band fires asymmetrically and explodes to
+# ~ -7.4e11 -> the LM byte head is crushed all-negative -> a register-MARKER
+# token wins by default -> the SI step emits 41 tokens not 30 -> the fixed-30
+# slicer mis-frames the next step (loop-condition ``LEA &i``: PC reads 114 not
+# 106 == a +16 instead of +8 PC advance, the brief's symptom).
+#
+# FIX: ADD a small POSITIVE bias (+0.5) to ``MEM_STORE`` and ``OP_SI`` on EVERY
+# value-byte row (``IS_BYTE``), scheduled IMMEDIATELY BEFORE the tail bank. The
+# bias swamps the residue so ``residue + 0.5`` * -1e8 = ~ -5e7 keeps the bank's
+# ``up`` deeply NEGATIVE (silu ~ 0 == OFF), exactly as on a clean (PSH/IMM) step.
+# It fires ONLY on value-byte rows (``IS_BYTE`` AND every marker hard-blocked),
+# so the tail's MEM-store ADDRESS materializers (which fire on MARK_MEM/MARK_SP
+# MARKER rows, IS_BYTE=0) are untouched.
+# EFFECTIVE residual bias landed on MEM_STORE / OP_SI when the IS_BYTE unit
+# fires. CRITICAL MAGNITUDE: large vs the ~2.4e-3 SI residue (so ``residue +
+# bias`` * -1e8 = ~ -2e6 swamps the +2.4e5 that flips the SP-row tail bank ON),
+# yet SMALL enough that it does NOT flip the AX HIGH-BYTE sign-extension
+# materializer NOR the multi-byte ADD high-byte adder (BOTH read MEM_STORE /
+# OP_SI) -- at an effective bias 0.5 the AX byte 2/3 over-sign-extend to 0xFF
+# and at 100 the ADD high byte is lost (768 -> 256). Measured safe window is
+# ~0.005..0.1 (``_probe_loopsum_backedge`` bias sweep, hook form); 0.02 is the
+# robust middle.
+#
+# The FFN unit's silu(up) SATURATES to ~5000 on a fired (IS_BYTE) value-byte row
+# (the IS_BYTE*100 condition * S=100 step margin), and that saturation value is
+# STABLE for every value-byte row (IS_BYTE is exactly 1 there). So the LANDED
+# residual is ``silu(up) * W_down = 5000 * _LOOP_SI_CLEAR_WDOWN``; we choose
+# W_down = 0.02 / 5000 = 4e-6 to land the effective +0.02 bias.
+_LOOP_SI_CLEAR_SILU_SAT = 5000.0  # measured saturated silu(up) of the fired
+#                                   IS_BYTE step unit (deterministic: IS_BYTE==1
+#                                   on every value-byte row).
+_LOOP_SI_CLEAR_EFFECTIVE_BIAS = 0.02
+_LOOP_SI_CLEAR_WDOWN = _LOOP_SI_CLEAR_EFFECTIVE_BIAS / _LOOP_SI_CLEAR_SILU_SAT
+_LOOP_SI_CLEAR_MARKER_BLOCK = 1_000_000.0
+
+
+def _l10_loop_si_byterow_marker_clear_rules() -> tuple[FFNRule, ...]:
+    """2 rules: bias MEM_STORE / OP_SI by +0.5 on value-byte rows.
+
+    Each is a one-condition AND gated on ``IS_BYTE`` with every register MARKER
+    hard NOT-blocked, so the op fires ONLY on a value-byte row (never a marker
+    row, never a STEP_END boundary). The write is a constant POSITIVE bias into
+    the shared opcode dim that the L25 tail bank reads at ``-1e8`` -- enough to
+    keep the bank's silu gate OFF (the clean-step behaviour) regardless of the
+    sign/size of the upstream SI residue.
+    """
+    disc: tuple[tuple[str, float], ...] = (
+        ("IS_BYTE", 100.0),
+        ("MARK_PC", -_LOOP_SI_CLEAR_MARKER_BLOCK),
+        ("MARK_AX", -_LOOP_SI_CLEAR_MARKER_BLOCK),
+        ("MARK_SP", -_LOOP_SI_CLEAR_MARKER_BLOCK),
+        ("MARK_BP", -_LOOP_SI_CLEAR_MARKER_BLOCK),
+        ("MARK_STACK0", -_LOOP_SI_CLEAR_MARKER_BLOCK),
+        ("MARK_MEM", -_LOOP_SI_CLEAR_MARKER_BLOCK),
+    )
+    rules: list[FFNRule] = []
+    for target in ("MEM_STORE", "OP_SI"):
+        rules.append(multi_way_and_rule(
+            name=f"l10_loop_si_byterow_clear_{target.lower()}",
+            conditions=disc,
+            threshold=50.0,  # IS_BYTE(100) alone (-> 100) crosses; any marker
+            #                  row drops by 1e6 and is excluded.
+            writes=((target, _LOOP_SI_CLEAR_WDOWN),),
+        ))
+    return tuple(rules)
+
+
+def make_l10_loop_si_byterow_marker_clear_op() -> Operation:
+    """Flag-gated L10 loop back-edge value-byte-row MEM_STORE/OP_SI bias op.
+
+    Standalone ``PureFFN`` post_op attached to the L25 tail block; the scheduler
+    orders it BEFORE ``tail_bit32_result_correction`` because that op READS
+    ``MEM_STORE`` / ``OP_SI`` (producer-before-consumer). Flag-off (or
+    non-campaign / golden) produces ZERO rules and appends NO post_op ->
+    byte-identical to golden ``5acb3d23``. See
+    ``loop_si_byterow_marker_clear_enabled`` /
+    ``_l10_loop_si_byterow_marker_clear_rules``.
+    """
+    if not loop_si_byterow_marker_clear_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_loop_si_byterow_marker_clear",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#registers",
+        )
+
+    rules = _l10_loop_si_byterow_marker_clear_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        # NOTE: deliberately NOT calling _suppress_ffn_on_step_boundary here: the
+        # op is INTENDED to fire on value-byte rows (IS_BYTE=1); the boundary
+        # suppressor would gate exactly those rows off. The IS_BYTE gate + the
+        # hard marker NOT-blocks already restrict it to value-byte rows.
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_loop_si_byterow_marker_clear",
+        reads={
+            "IS_BYTE", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+            "MARK_STACK0", "MARK_MEM",
+        },
+        # Writes the shared opcode dims the tail bank reads; the produces/consumes
+        # dep (tail_bit32 reads MEM_STORE / OP_SI) orders this op BEFORE the tail
+        # bank so the bias lands before the -1e8 NOT-blocker reads it.
+        writes={"MEM_STORE", "OP_SI"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=ir,
