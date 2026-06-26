@@ -2433,6 +2433,15 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
             ),
+            # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
+            # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
+            # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target
+            # index >= 16 keeps byte-0's high nibble (BZ 16 -> PC 130, not 2).
+            # The ON / OFF builds bake different FFN weights and must never share
+            # a memo entry. See l6_ops._ifvar_bz_hi_nibble_enabled.
+            "C4_IFVAR_BZ_HI_NIBBLE": (
+                os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
+            ),
             # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/
             # max/min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): when
             # active it adds a Q/K scoring slot (OP_LEA x OP_ENT) to the SHARED
@@ -3146,6 +3155,15 @@ def _bake_from_scheduled_ops(
         "C4_CMP_HI_LT_ALU15_GUARD": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
+        ),
+        # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
+        # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
+        # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target index
+        # >= 16 keeps byte-0's high nibble (BZ 16 -> PC 130, not 2). The ON / OFF
+        # builds bake different FFN weights and must never share a serialised
+        # entry. See l6_ops._ifvar_bz_hi_nibble_enabled.
+        "C4_IFVAR_BZ_HI_NIBBLE": (
+            os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
         ),
         # Multilocal-ENT AX byte-0 source fix (DEFAULT-ON in campaign, opt out
         # =0, BAKE-affecting): when active ``make_l10_ent_axcarry_op`` appends a

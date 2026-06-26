@@ -4697,6 +4697,108 @@ def make_open_clos_tool_call_op(
 # ============================================================================
 
 
+def _ifvar_bz_hi_nibble_enabled() -> bool:
+    """BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (DEFAULT-ON, opt out
+    with ``C4_IFVAR_BZ_HI_NIBBLE=0``).
+
+    Root (if_var id430 ``x=23, x>62`` step 11): the post-L9 BZ/BNZ PC override
+    converts the branch immediate to a PC byte address via
+    ``_append_pc_byte0_imm_to_byte_addr_rules``, which gates ONLY on
+    ``FETCH_LO+k`` (the instruction-index LOW nibble) and writes
+    ``byte0 = (k*8 + PC_OFFSET) & 0xff``. That helper IGNORES ``FETCH_HI``
+    (the instruction-index HIGH nibble), so a BZ/BNZ whose target index is
+    >= 16 loses the high nibble: ``BZ 16`` (target PC ``16*8+2 = 130 = 0x82``)
+    decodes as ``0*8+2 = 0x02`` (the model emits PC=2 instead of 130).
+
+    The fix mirrors the JSR all-step override's
+    ``l6_jsr_all_step_target_hi_odd_imm_hi_correction`` (line ~702): for an
+    instruction index ``imm = lo + hi*16``, ``imm*8 = lo*8 + hi*128`` and
+    ``hi*128 mod 256 == (hi & 1)*128`` -> byte-0 HIGH nibble gains ``+8``
+    exactly when the FETCH_HI (index-hi) nibble is ODD. (An EVEN-but-nonzero
+    FETCH_HI nibble carries entirely into byte 1, already handled by the
+    ``_layer6_branch_pc_byte1_override_rules`` ``imm >> 5`` path.)
+
+    Flag-OFF returns no rules -> the golden (non-campaign) build is
+    byte-identical to HEAD; flag-ON appends 48 correction units (16 BZ, plus
+    16 BNZ per ``lo_nonzero``/``hi_nonzero`` group = 32 BNZ) to
+    ``post_l9_bz_bnz_pc_override``.
+    """
+    return _os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
+
+
+def _append_branch_pc_byte0_odd_imm_hi_correction_rules(
+    rules: list[FFNRule],
+    *,
+    name_prefix: str,
+    base_conditions: tuple[tuple[str, float], ...],
+    threshold: float,
+    write_scale: float,
+) -> None:
+    """Add ``+8`` to PC byte-0 HIGH nibble when the FETCH_HI index nibble is ODD.
+
+    Mirrors ``_layer6_all_step_jsr_pc_override_rules``'s odd-imm-hi correction
+    for the BZ/BNZ post-L9 override. ``base_conditions`` are the BZ/BNZ taken
+    conditions (MARK_PC + OP_B(N)Z + CMP gate + IS_BYTE blocker + HAS_SE step-0
+    guard, optionally + MARK_STACK0 blocker). One correction unit per FETCH_LO
+    index-lo nibble ``k`` (0..15): it fires only when the index-lo nibble is
+    ``k`` (``FETCH_LO+k`` condition + the other FETCH_LO lanes blocked) AND an
+    ODD FETCH_HI nibble is present (the gate). On firing it SUBTRACTS the base
+    byte-0 hi write at ``_pc_target_hi_from_index(k)`` and ADDS the corrected
+    one at ``_pc_target_hi_plus_odd_imm_hi_from_index(k)`` (== base + 8).
+    """
+
+    if not _ifvar_bz_hi_nibble_enabled():
+        return
+    # The SwiGLU gate is LINEAR (``gate*gate_weight + Σgate_terms + gate_bias``),
+    # NOT clamped -- so a NEGATIVE gate value would write garbage on every row
+    # whose AND-``conditions`` fire (the BZ-taken row IS one). The AND must
+    # therefore be encoded ENTIRELY in the additive ``conditions`` (the SiLU
+    # term), and the multiplicative gate must stay >= 0 (here ``FETCH_LO+k``,
+    # value 0 or ~_FETCH_PC_MARKER_AMP).
+    #
+    # FETCH_LO / FETCH_HI are one-hot at ~_FETCH_PC_MARKER_AMP on the PC marker
+    # row, so each FETCH condition uses weight ``1/AMP`` to contribute ~1.0 per
+    # active lane. The correction fires iff: BZ/BNZ taken (base_conditions) AND
+    # index-lo nibble == k (``FETCH_LO+k``) AND an ODD index-hi nibble is present
+    # (``odd_imm_hi_require`` with EVEN lanes blocked). FETCH_LO+k +
+    # odd-FETCH_HI add ~+2.0 to the AND on EVERY PC-marker row that has them, so
+    # the threshold is bumped by +2.0 to preserve the EXACT base BZ-vs-non-BZ
+    # firing margin (base BZ-taken sum ~14.25 vs IMM/LEA ~10.95 at threshold
+    # 13.5 -> +2.0 keeps the 0.75/2.55 margins). The even-but-nonzero index-hi
+    # carry (-> byte 1) is handled by the byte-1 override's imm>>5 path.
+    fetch_norm = 1.0 / _FETCH_PC_MARKER_AMP
+    odd_imm_hi_require = tuple(
+        (f"FETCH_HI+{j}", fetch_norm)
+        for j in range(1, 16, 2)
+    )
+    even_imm_hi_blockers = tuple(
+        (f"FETCH_HI+{j}", -10.0 * fetch_norm)
+        for j in range(0, 16, 2)
+    )
+    # +2.0 absorbs the FETCH_LO+k (~1.0) + odd-FETCH_HI (~1.0) additions so the
+    # BZ-vs-non-BZ AND margin is identical to the base rule.
+    corrected_threshold = threshold + 2.0
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"{name_prefix}_target_hi_odd_imm_hi_correction_{k}",
+            conditions=base_conditions
+            + ((f"FETCH_LO+{k}", fetch_norm),)
+            + odd_imm_hi_require
+            + even_imm_hi_blockers,
+            threshold=corrected_threshold,
+            gate=f"FETCH_LO+{k}",
+            writes=(
+                (f"OUTPUT_HI_THIS_STEP+{_pc_target_hi_from_index(k)}",
+                 -write_scale),
+                (
+                    f"OUTPUT_HI_THIS_STEP+"
+                    f"{_pc_target_hi_plus_odd_imm_hi_from_index(k)}",
+                    write_scale,
+                ),
+            ),
+        ))
+
+
 def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     """Same-step-CMP variant of `_layer6_bz_pc_override_rules`.
 
@@ -4786,6 +4888,19 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         lo_source="FETCH_LO",
         write_scale=write_scale,
     )
+    # if_var BZ byte-0 HIGH-NIBBLE fix (DEFAULT-ON, C4_IFVAR_BZ_HI_NIBBLE): the
+    # byte-addr helper above drops the FETCH_HI index-hi nibble, so a BZ target
+    # index >= 16 emits PC = (lo*8+2) & 0xff instead of (imm*8+2) & 0xff. Add the
+    # +8 byte-0 high-nibble correction for an ODD FETCH_HI nibble (the byte-1
+    # override handles the even-but-nonzero carry into byte 1). See
+    # _ifvar_bz_hi_nibble_enabled.
+    _append_branch_pc_byte0_odd_imm_hi_correction_rules(
+        rules,
+        name_prefix="post_l9_bz",
+        base_conditions=target_conditions,
+        threshold=3.5 + step0_guard_weight,
+        write_scale=write_scale,
+    )
     # C5 BZ re-fire fix: write ``BZ_TARGET_FRESH = 1`` on this BZ-taken
     # step so the NEXT step's KV-cache lookup of ``BZ_TARGET_FRESH.*.-1``
     # at the MARK_PC row returns 1. The cancel band above uses that bit
@@ -4863,6 +4978,17 @@ def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=conditions,
             threshold=threshold,
             lo_source="FETCH_LO",
+            write_scale=write_scale,
+        )
+        # if_var BNZ byte-0 HIGH-NIBBLE fix (DEFAULT-ON, C4_IFVAR_BZ_HI_NIBBLE):
+        # same root as the BZ override -- the byte-addr helper drops the
+        # FETCH_HI index-hi nibble, so a BNZ target index >= 16 loses byte-0's
+        # high nibble. Add the +8 correction for an ODD FETCH_HI nibble.
+        _append_branch_pc_byte0_odd_imm_hi_correction_rules(
+            rules,
+            name_prefix=f"post_l9_bnz_{group}",
+            base_conditions=conditions,
+            threshold=threshold,
             write_scale=write_scale,
         )
     return tuple(rules)
@@ -5084,5 +5210,15 @@ def make_post_l9_bz_bnz_pc_override_op() -> Operation:
         # suppressor (default OFF) appends 32 more (16 OUTPUT_LO + 16
         # OUTPUT_HI) only when C4_POST_ENT_SE_SUPPRESS=1. Default (off) ->
         # 0 extra -> 193 -> byte-identical with HEAD.
-        ffn_units_used=193 + (32 if _post_ent_se_value_suppressor_on() else 0),
+        #
+        # if_var BZ/BNZ byte-0 high-nibble correction (DEFAULT-ON,
+        # C4_IFVAR_BZ_HI_NIBBLE): appends 48 more units when ON -- 16 BZ
+        # (one group) + 32 BNZ (16 per lo_nonzero/hi_nonzero group). The
+        # ffn_units_used count is derived directly from the bake's rule
+        # list so it stays exact for any flag combination.
+        ffn_units_used=len(
+            _post_l9_bz_pc_override_rules(100.0)
+            + _post_l9_bnz_pc_override_rules(100.0)
+            + _post_ent_se_value_suppressor_rules(100.0)
+        ),
     )
