@@ -1414,6 +1414,46 @@ def sili_b1_restore_enabled() -> bool:
     )
 
 
+def store_ax_b0_override_enabled() -> bool:
+    """Return True iff the SI/SC store-AX byte-0 OUTPUT materializer uses the
+    zero-default OVERRIDE write form. DEFAULT campaign-ON
+    (``C4_STORE_AX_B0_OVERRIDE=1``), opt out with ``C4_STORE_AX_B0_OVERRIDE=0``;
+    gated behind the two campaign flags so the flag-OFF golden (35-tok) build is
+    byte-identical (the ``l16_store_ax_carry_lo`` rules keep their bare additive
+    ``2.0/S`` write off the campaign).
+
+    ROOT (var_mul step-9 store, GPU/CPU full_trace; the ``var_mul`` 2nd-local
+    SI store of ``b``): on the SI step's AX marker the store value is carried in
+    ``AX_CARRY_LO/HI`` (correct), but the OUTPUT byte-0 LO band carries a STRONG
+    zero-byte default (the L19 / block-33 OUTPUT-zero-default, ~+26/+40 on
+    ``OUTPUT_LO+0``) that out-votes the weak additive ``+2.0/S`` write of
+    ``l16_store_ax_carry_lo``. When the stored value's HIGH nibble of byte-0 is
+    zero (``b <= 15``: var_mul ids 279/280/287/290/296) the carried LOW nibble
+    is the only nonzero cell, and the bare additive write loses to the
+    zero-default -> OUTPUT byte-0 = 0 -> ``SI`` stores 0 -> ``LI b`` reads 0 ->
+    ``a * 0``.
+
+    THE FIX (mirrors the campaign ``l16_psh_ax_carry_lo`` materializer added for
+    the PSH func-arg path, which solved the IDENTICAL zero-default-out-votes
+    problem): switch the ``l16_store_ax_carry_lo`` write to the OVERRIDE form —
+    write ``+W`` to the carried LO nibble cell ``k`` AND ``-W`` to ``OUTPUT_LO+0``
+    for ``k != 0`` so a NONZERO carried low nibble overrides the zero default.
+    ``k == 0`` self-cancels (a genuinely-zero low byte stays at its zero
+    default). The HI band keeps the plain additive form (no competing default on
+    ``OUTPUT_HI``). The rule COUNT is unchanged (the 16 LO rules' write tuples
+    are rewritten in place), so the flag-OFF golden bake is byte-identical and
+    the L16 unit allocator's fixed-range assertion still holds.
+
+    Output-affecting only inside the campaign; flag OFF (or off-campaign) keeps
+    the bare additive ``2.0/S`` write (golden ``7f6f2e5d`` byte-identical).
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
+    )
+
+
 def func_lea_b0_restore_enabled() -> bool:
     """Return True iff the func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE
     (Bug #2) is active. DEFAULT **OFF** (opt-in via ``C4_FUNC_LEA_B0_RESTORE=1``);
