@@ -759,7 +759,8 @@ class ComparisonCombine(PureFFN):
             self.W_down.data[BD.OUTPUT_LO + from_result, unit] = -4.0 / S
             unit += 1
 
-        def _cmp_override_3way(op_dim, cmp_dim1, cmp_dim2, to_result, from_result):
+        def _cmp_override_3way(op_dim, cmp_dim1, cmp_dim2, to_result,
+                               from_result, *, threshold=2.5):
             nonlocal unit
             self.W_up.data[unit, BD.MARK_AX] = S
             self.W_up.data[unit, cmp_dim1] = S
@@ -786,11 +787,29 @@ class ComparisonCombine(PureFFN):
             # docs/REMOVAL_4_DEEP_FIX_2026_06_06.md for the Shape A/B
             # diagnosis that drove this fix.
             self.W_up.data[unit, BD.CMP + 0] = -S * 0.1
-            self.b_up.data[unit] = -S * 2.5
+            self.b_up.data[unit] = -S * threshold
             self.W_gate.data[unit, op_dim] = 1.0
             self.W_down.data[BD.OUTPUT_LO + to_result, unit] = 4.0 / S
             self.W_down.data[BD.OUTPUT_LO + from_result, unit] = -4.0 / S
             unit += 1
+
+        # if_var GT-TRUE lo_lt-leak guard (campaign-only). RAISE the GT/GE
+        # (hi_eq AND lo_lt) -> 0 override threshold 2.5 -> 2.75 so a spurious
+        # lo_lt (CMP+3 ~= 1.67) alone (hi_eq absent, A.hi > B.hi) can no longer
+        # trip the GT-result flip on the loaded-var GT-TRUE path (if_var 425/
+        # 436/440/441/445/448), while the genuine hi_eq+lo_lt GT-FALSE override
+        # (CMP+1 ~= 1.24 AND CMP+3 ~= 1.46, sum 3.70) still fires. The live GT
+        # decoder is THIS ComparisonCombine (lowered into the L14 post-op
+        # expansion, block 28, reading raw CMP at the result row). Symmetric
+        # companion to the GT-FALSE cmp_hi_lt_alu15_leak_guard. Flag-OFF /
+        # non-campaign -> 2.5 -> golden byte-identical. See
+        # ``unified_compiler/ops/shared.cmp_gt_lo_lt_hieq_guard_enabled``.
+        from neural_vm.unified_compiler.ops.shared import (
+            cmp_gt_lo_lt_hieq_guard_enabled,
+        )
+        _gt_lo_lt_thresh = (
+            2.75 if cmp_gt_lo_lt_hieq_guard_enabled() else 2.5
+        )
 
         _cmp_default(BD.OP_EQ, 0)
         _cmp_override_3way(BD.OP_EQ, BD.CMP + 1, BD.CMP + 2, 1, 0)
@@ -804,7 +823,8 @@ class ComparisonCombine(PureFFN):
 
         _cmp_default(BD.OP_GT, 1)
         _cmp_override_2way(BD.OP_GT, BD.CMP + 0, 0, 1)
-        _cmp_override_3way(BD.OP_GT, BD.CMP + 1, BD.CMP + 3, 0, 1)
+        _cmp_override_3way(BD.OP_GT, BD.CMP + 1, BD.CMP + 3, 0, 1,
+                           threshold=_gt_lo_lt_thresh)
         _cmp_override_3way(BD.OP_GT, BD.CMP + 1, BD.CMP + 2, 0, 1)
 
         _cmp_default(BD.OP_LE, 0)
@@ -814,7 +834,8 @@ class ComparisonCombine(PureFFN):
 
         _cmp_default(BD.OP_GE, 1)
         _cmp_override_2way(BD.OP_GE, BD.CMP + 0, 0, 1)
-        _cmp_override_3way(BD.OP_GE, BD.CMP + 1, BD.CMP + 3, 0, 1)
+        _cmp_override_3way(BD.OP_GE, BD.CMP + 1, BD.CMP + 3, 0, 1,
+                           threshold=_gt_lo_lt_thresh)
 
 
 class BinaryOpByteZeroingPostOp(PureFFN):

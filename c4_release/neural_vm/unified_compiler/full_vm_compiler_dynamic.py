@@ -2433,6 +2433,17 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
             ),
+            # if_var GT-TRUE lo_lt-leak guard (DEFAULT-ON, opt out =0,
+            # BAKE-affecting): when active the ComparisonCombine GT/GE
+            # ``(hi_eq AND lo_lt)`` override threshold is RAISED 2.5 -> 2.75, so
+            # the ON / OFF builds bake different ``b_up`` and must never share a
+            # memo entry. Gated on the campaign prerequisite ``C4_NO_STACK0_EMIT``
+            # so the non-campaign / flag-OFF build is byte-identical to golden.
+            # See shared.cmp_gt_lo_lt_hieq_guard_enabled.
+            "C4_CMP_GT_LO_LT_HIEQ_GUARD": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
+            ),
             # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
             # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
             # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target
@@ -3155,6 +3166,17 @@ def _bake_from_scheduled_ops(
         "C4_CMP_HI_LT_ALU15_GUARD": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
+        ),
+        # if_var GT-TRUE lo_lt-leak guard (DEFAULT-ON, opt out =0,
+        # BAKE-affecting): when active the ComparisonCombine GT/GE
+        # ``(hi_eq AND lo_lt)`` override threshold is RAISED 2.5 -> 2.75, so the
+        # ON / OFF builds bake different ``b_up`` and must never share a
+        # serialised entry. Gated on the campaign prerequisite
+        # ``C4_NO_STACK0_EMIT`` so the non-campaign / flag-OFF build is
+        # byte-identical to golden. See shared.cmp_gt_lo_lt_hieq_guard_enabled.
+        "C4_CMP_GT_LO_LT_HIEQ_GUARD": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
         ),
         # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
         # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI

@@ -802,6 +802,75 @@ def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
     return os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
 
 
+def cmp_gt_lo_lt_hieq_guard_enabled() -> bool:
+    """Return True iff the ``GT``/``GE`` ``(hi_eq AND lo_lt) -> 0`` override
+    RAISES its firing threshold from 2.5 to 2.75 in the campaign config so a
+    spurious ``lo_lt`` (CMP+3) alone can no longer trip the GT-result flip
+    (DEFAULT ON; opt-out via ``C4_CMP_GT_LO_LT_HIEQ_GUARD=0``; only takes
+    effect when the STACK0 emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``,
+    so flag-OFF / non-campaign is byte-identical to golden).
+
+    The residual cmp wall this lifts (the last 6 if_var fails 425/436/440/441/
+    445/448 -- the SYMMETRIC GT-TRUE companion to the GT-FALSE
+    ``cmp_hi_lt_alu15_leak_guard``; GPU full_trace + isolated CMP+3 intervention,
+    campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims,
+    spec_k=0, ``tools/probe_ifvar_gt_true.py`` /
+    ``probe_ifvar_gt_true_intervene.py`` / ``probe_gt_cmp_values.py``): the
+    if_var GT-TRUE of a LOADED variable whose operands satisfy ``A.hi > B.hi``
+    but ``A.lo < B.lo`` (e.g. ``66 > 24`` id436: ``A=0x42`` so ``A.lo=2 <
+    B.lo=8`` while ``A.hi=4 > B.hi=1``) decoded GT=0 instead of 1.
+
+    ROOT. GT is true (high nibble already orders ``A > B``) so the result must
+    default to 1. But on the LOADED-variable path the campaign
+    ``CmpOperandSeRecoverFFN`` re-materializes the operand-A one-hot strongly
+    enough that the genuine ``lo_lt`` (``A.lo < B.lo``) flag lands at the
+    GT-result-step AX row as ``CMP+3 ~= 1.67`` (clean GT-TRUE id427 ``85>48``
+    has ``A.lo=5 > B.lo=0`` so NO lo_lt -> CMP+3 ~= 0). The live GT decoder is
+    the ``ComparisonCombine`` ``(hi_eq AND lo_lt) -> 0`` 3-way override (block
+    28 unit 9, OP_GT-gated, reading raw CMP at the result row): it fires iff
+    ``marker(1) + CMP+1 + CMP+3 - 0.1*CMP+0 - 2.5 > 0``. With ``CMP+1`` (hi_eq)
+    == 0 (A.hi != B.hi) and ``CMP+3`` == 1.67 alone the sum ``1 + 0 + 1.67 -
+    2.5 = 0.17 > 0`` SPURIOUSLY trips the override -> GT flips to 0 (probed
+    OUTPUT_LO@AX-row = ``[9.1@0, 0.6@1]`` -> result byte low-nibble 0 -> GT=0
+    WRONG; clean GT-TRUE / GT-FALSE refs ``[0.1@0, 9.6@1]`` / ``[18.7@0,
+    -9.0@1]``). The GENUINE ``(hi_eq AND lo_lt)`` GT-FALSE -- e.g. literal eq-hi
+    ``35>43`` (id350), ``A.hi==B.hi`` so ``CMP+1 ~= 1.24`` AND ``CMP+3 ~=
+    1.46`` -- sums ``1 + 1.24 + 1.46 = 3.70``, well above threshold, and MUST
+    still fire (GT=0 correct).
+
+    FIX. Campaign-only: RAISE the GT (and the symmetric GE) ``(CMP+1, CMP+3)``
+    override threshold from 2.5 to 2.75 -- the SMALLEST raise that rejects the
+    spurious lo_lt-alone trip (the loaded-var GT-TRUE result-step firing sum is
+    just above 2.5; 2.75 drops it below) while the genuine hi_eq+lo_lt
+    GT-FALSE override (firing sum ~3.7) STILL fires. A larger raise (3.0) ALSO
+    works on the result-step decode but its bigger ``b_up`` shift (-0.5*S vs
+    -0.25*S) perturbs the fp-accumulation at the saturated-tie step-0 operand
+    leak of two ALREADY-MARGINAL GT-FALSE programs (``if_gt 8>27`` id360,
+    ``bool_and`` id1074, both decided by hi_lt) and FLIPS their exit-code;
+    2.75 leaves the hi_lt-decided cases' 3-way override firing UNCHANGED (no
+    residual perturbation) so if_gt/if_lt/if_eq/bool_and all HOLD 25/25.
+    INTERVENTION + REBUILD-VERIFIED discriminating
+    (``probe_gt_combine_threshold_patch.py`` + ``run_1096_canonical
+    --criterion exit_code``): 2.75 flips the 6 loaded-var GT-TRUE
+    425/436/440/441/445/448 to GT=1 (FIXED, isolated 6/6) while the GT-TRUE
+    pass id427, the GT-FALSE pass id430, the genuine eq-hi GT-FALSE
+    id350/353/365/368, the eq-hi GT-TRUE id357/359/361, the hi_lt GT-FALSE
+    id360, and bool_and all HOLD -- no zero-sum trade.
+    Only the GT/GE ``(CMP+1, CMP+3)`` overrides are touched; the GT/GE 2-way
+    (hi_lt) override and EQ/NE/LT/LE overrides are UNTOUCHED, so lt/le/eq/ne and
+    the hi_lt-driven GT/GE-false margins are unchanged.
+
+    DEFAULT ON. Opt-out via ``C4_CMP_GT_LO_LT_HIEQ_GUARD=0`` restores the 2.5
+    threshold (the byte-identical-OFF path: flag-OFF, or
+    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden). Kept as a
+    dedicated kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_CMP_GT_LO_LT_HIEQ_GUARD`` can A/B it inside the campaign config.
+    """
+    if not no_stack0_emit_enabled():
+        return False
+    return os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
+
+
 def func_lea_reread_bp_resharpen_enabled() -> bool:
     """Return True iff the L7 head-1 re-read-LEA BP-frame re-sharpen is active
     (DEFAULT ON in the campaign config — opt-out via

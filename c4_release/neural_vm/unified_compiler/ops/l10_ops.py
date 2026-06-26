@@ -1567,6 +1567,19 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
 
     MARK_PC_BLOCK = -50.0
 
+    # if_var GT-TRUE lo_lt-leak guard (the symmetric companion to the GT-FALSE
+    # ``cmp_hi_lt_alu15_leak_guard``). Campaign-only: RAISE the GT/GE
+    # ``(hi_eq AND lo_lt) -> 0`` 3-way override threshold 2.5 -> 2.75 so a
+    # spurious ``lo_lt`` (CMP+3 ~= 1.67) alone (``hi_eq`` absent, A.hi > B.hi)
+    # can no longer trip the GT-result flip, while the genuine hi_eq+lo_lt
+    # GT-FALSE override (CMP+1 ~= 1.24 AND CMP+3 ~= 1.46, sum 3.70) still fires.
+    # Flag-OFF / non-campaign -> 2.5 -> golden byte-identical.
+    # See ``shared.cmp_gt_lo_lt_hieq_guard_enabled``.
+    from .shared import cmp_gt_lo_lt_hieq_guard_enabled
+    _gt_gtge_3way_thresh = (
+        2.75 if cmp_gt_lo_lt_hieq_guard_enabled() else 2.5
+    )
+
     def cmp_default(op_name: str, default_result: int, *, idx: int) -> FFNRule:
         # DSL v4b: 3-condition AND with explicit threshold 1.5; MARK_PC
         # blocker uses negative weight. constant_write style (no gate).
@@ -1620,9 +1633,12 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     def cmp_override_3way(
         op_name: str, cmp_name1: str, cmp_name2: str,
         to_result: int, from_result: int, *, idx: int,
+        threshold: float = 2.5,
     ) -> FFNRule:
         # DSL v4b: 4-condition AND (MARK_AX + 2 CMP cells + MARK_PC
-        # blocker) with explicit threshold 2.5, gated on opcode.
+        # blocker) with explicit threshold 2.5 (2.75 for the campaign-gated
+        # GT/GE (hi_eq AND lo_lt) override -- see
+        # ``cmp_gt_lo_lt_hieq_guard_enabled``), gated on opcode.
         #
         # Shape B CMP fix (2026-06-07, removal-4): add CMP+0 blocker at
         # weight -0.1 to suppress this override when hi_lt is hot. The
@@ -1651,7 +1667,7 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 ("MARK_PC", MARK_PC_BLOCK),
                 ("CMP+0", -0.1),
             ),
-            threshold=2.5,
+            threshold=threshold,
             gate=op_name,
             gate_weight=1.0,
             writes=(
@@ -1683,7 +1699,13 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     # GT: default 1, override CMP+0 -> 0, two 3-way overrides -> 0
     rules.append(cmp_default("OP_GT", 1, idx=7))
     rules.append(cmp_override_2way("OP_GT", "CMP+0", 0, 1, idx=8))
-    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9))
+    # idx=9 (hi_eq AND lo_lt): campaign-gated 2.75 threshold rejects the
+    # spurious lo_lt-alone trip on the loaded-var GT-TRUE path (if_var 425/436/
+    # 440/441/445/448). See ``cmp_gt_lo_lt_hieq_guard_enabled``.
+    rules.append(cmp_override_3way(
+        "OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9,
+        threshold=_gt_gtge_3way_thresh,
+    ))
     rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+2", 0, 1, idx=10))
 
     # LE: default 0, override CMP+0 -> 1, two 3-way overrides -> 1
@@ -1695,7 +1717,12 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     # GE: default 1, override CMP+0 -> 0, override (CMP+1,CMP+3 -> 0)
     rules.append(cmp_default("OP_GE", 1, idx=15))
     rules.append(cmp_override_2way("OP_GE", "CMP+0", 0, 1, idx=16))
-    rules.append(cmp_override_3way("OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17))
+    # idx=17 (hi_eq AND lo_lt): symmetric campaign-gated 2.75 threshold so the
+    # loaded-var GE result is not flipped to 0 by a spurious lo_lt alone.
+    rules.append(cmp_override_3way(
+        "OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17,
+        threshold=_gt_gtge_3way_thresh,
+    ))
 
     return tuple(rules)
 
