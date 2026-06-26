@@ -388,17 +388,43 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             gate=f"FETCH_LO+{k}",
             writes=((f"OUTPUT_LO+{target_lo}", write_scale),),
         ))
-    # FETCH_HI reserved band: gate is wired but no down write. Legacy
-    # bake writes ``ffn6.W_gate[unit, FETCH_HI+k] = 1.0`` and no down
-    # assignment because JSR fixtures target instruction indexes < 16.
+    # FETCH_HI band. Legacy: reserved no-op (no down write). With
+    # C4_JSR_PC_BYTE1 on: STAGE byte-1 = (k>>1) into JSR_PC_B1 from FETCH_HI+k.
+    # FETCH_HI holds the high nibble of the JSR target idx (verified spec_k=0:
+    # idx=33 -> FETCH_HI dominant index 2; idx=7 -> index 0). PC byte-1 =
+    # (idx*8+2)>>8 = (16*FETCH_HI_nib*8)>>8 = FETCH_HI_nib>>1 (the +2 and the
+    # FETCH_LO*8 < 128 never carry into bit 8). The write is JSR-gated by the
+    # shared override conditions (TEMP[0]+blockers) so JSR_PC_B1 is nonzero
+    # ONLY on a real JSR step; on a small-target JSR (idx<32 -> k in {0,1} ->
+    # byte1 0) it writes JSR_PC_B1+0 which the emit FFN treats as "no byte-1".
+    # Staging fires when MARK_PC(1) + TEMP[0](IS_JSR) clears ``T_jsr_pc_stage``.
+    # The override's T_jsr_pc=4.0 is TOO HIGH for some JSR steps: gcd id900's
+    # step-0 marker carries IS_JSR(TEMP[0]) ~1.2 (vs ~10.0 on most JSRs), so the
+    # marker sum 1.0+1.2=2.2 < 4.0 and the byte1 stage never fired (the byte-0
+    # target band fires from a separate, higher-margin unit). A dedicated lower
+    # threshold (1.5) fires the stage at MARK_PC+TEMP[0]>=2.2 while still
+    # blocking every non-JSR PC marker (TEMP[0]=0 -> sum 1.0 < 1.5) and the
+    # opcode blockers (-4 each) keep it off other-opcode steps. (Verified
+    # spec_k=0: gcd TEMP[0]=1.2, rec_fib 10.0, add/sub 0.0 at the step-0 marker.)
+    T_jsr_pc_stage = 1.5
     for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"jsr_pc_fetch_hi_reserved_{k}",
-            conditions=conditions,
-            threshold=T_jsr_pc,
-            gate=f"FETCH_HI+{k}",
-            writes=(),
-        ))
+        if stage_byte1:
+            byte1_nib = k >> 1
+            rules.append(multi_way_and_rule(
+                name=f"jsr_pc_byte1_stage_{k}",
+                conditions=conditions,
+                threshold=T_jsr_pc_stage,
+                gate=f"FETCH_HI+{k}",
+                writes=((f"JSR_PC_B1+{byte1_nib}", write_scale),),
+            ))
+        else:
+            rules.append(multi_way_and_rule(
+                name=f"jsr_pc_fetch_hi_reserved_{k}",
+                conditions=conditions,
+                threshold=T_jsr_pc,
+                gate=f"FETCH_HI+{k}",
+                writes=(),
+            ))
     for k in range(16):
         target_hi_from_lo = ((k * INSTR_WIDTH) + PC_OFFSET) >> 4
         rules.append(multi_way_and_rule(
@@ -890,6 +916,28 @@ def make_function_call_weights_op() -> Operation:
             S=S,
         )
 
+        # JSR-target PC byte-1 delivery RELAY (flag C4_JSR_PC_BYTE1, default OFF).
+        # The byte-1 nibble is STAGED into JSR_PC_B1 at the PC MARKER by the
+        # override FFN above (``jsr_pc_byte1_stage_*``). The MARKER write only
+        # becomes visible in the residual AFTER this block's FFN runs, so the
+        # relay attention head (which copies MARKER -> PC byte-0 row) MUST live
+        # on the NEXT block (``model.blocks[7]`` here resolves to the physical
+        # block just past the override FFN block); a same-block attention head
+        # runs BEFORE the FFN and would read JSR_PC_B1=0. The relay's
+        # JSR_PC_B1_AT_B0 write then PERSISTS in the residual to the tail, where
+        # ``make_jsr_pc_byte1_emit_op`` (a post-tail-corruptor FFN) reads it and
+        # writes the PC byte-1 OUTPUT. Off -> JSR_PC_B1 band omitted -> skipped
+        # -> golden byte-identical.
+        if _jsr_pc_byte1_enabled() and len(model.blocks) > 7:
+            relay_block = model.blocks[7]
+            relay_attn = relay_block.attn
+            relay_HD = relay_attn.W_q.shape[0] // relay_attn.num_heads
+            allocator = _allocate_jsr_pc_byte1_relay_head()
+            relay_attn._jsr_pc_byte1_relay_head_allocator = allocator
+            relay_head_idx = allocator.heads()[-1].head_idx
+            relay_spec = _jsr_pc_byte1_relay_head_spec(proxy, relay_head_idx)
+            Primitives.generate_attention_head(relay_attn, relay_spec, relay_HD)
+
     # Dim-ownership claims (see c4_release/docs/DIM_OWNERSHIP_REGISTRY.md).
     # `_set_function_call_weights` programs three ENT/JSR relay attention
     # heads. Each head writes V slots [base+1..base+16] (low-nibble path)
@@ -946,6 +994,21 @@ def make_function_call_weights_op() -> Operation:
             (6, "attn_W_v", f"7_{17 + k}", f"OUTPUT_HI+{k}")
         )
 
+    # JSR-target PC byte-1 delivery (flag C4_JSR_PC_BYTE1): the override FFN
+    # STAGES JSR_PC_B1 (FETCH_HI), the relay head (next block) reads FETCH-staged
+    # JSR_PC_B1 + IS_BYTE/H1/BYTE_INDEX_0/HAS_SE/MARK_PC and writes
+    # JSR_PC_B1_AT_B0, the emit FFN reads JSR_PC_B1_AT_B0 and writes OUTPUT_LO.
+    # Declared only when the flag is on so the OMITTED bands are never referenced
+    # off (which would fail dim validation).
+    _jsr_b1_reads = (
+        {"IS_BYTE", "H1", "BYTE_INDEX_0", "HAS_SE", "FETCH_HI",
+         "JSR_PC_B1", "JSR_PC_B1_AT_B0"}
+        if _jsr_pc_byte1_enabled() else set()
+    )
+    _jsr_b1_writes = (
+        {"JSR_PC_B1", "JSR_PC_B1_AT_B0"}
+        if _jsr_pc_byte1_enabled() else set()
+    )
     return Operation(
         name="function_call_weights",
         # Phase: docs/DIM_LIVENESS_FINDINGS_2026_06_05.md audit — declare
@@ -958,7 +1021,7 @@ def make_function_call_weights_op() -> Operation:
                "CONST", "OP_JSR", "OP_ENT",
                "OP_IMM",  # ent_ax_passthrough per-step actual-IMM blocker
                "EMBED_LO", "EMBED_HI",
-               "OUTPUT_LO", "OUTPUT_HI"},
+               "OUTPUT_LO", "OUTPUT_HI"} | _jsr_b1_reads,
         # UNDECLARED_DIM_AUDIT_2026_06_09: added ALU_HI/LO, OUTPUT_HI/LO,
         # TEMP to match the actual write footprint of the L6 FFN rules
         # produced by ``_function_call_l6_ffn_rules`` (LEA / JSR / ENT /
@@ -966,7 +1029,7 @@ def make_function_call_weights_op() -> Operation:
         writes={"AX_CARRY_LO", "AX_CARRY_HI",
                 "ALU_HI", "ALU_LO",
                 "OUTPUT_HI", "OUTPUT_LO",
-                "TEMP"},
+                "TEMP"} | _jsr_b1_writes,
         # Wave 6 (docs/PRODUCES_CONSUMES_MIGRATION.md). Model-level FFN
         # routing bake into L6 FFN units 1700..2158 (function-call dispatch
         # table). Writes target FFN weights, not per-step residual dims,
@@ -997,6 +1060,212 @@ def make_function_call_weights_op() -> Operation:
         spec_section="BLOG_SPEC.md#function-calls",
         compaction_safe=False,
         semantic_label="function-call routing",
+    )
+
+
+# Free L6 attention head for the JSR PC byte-1 marker->byte0 relay. Heads 0..7
+# are the named _L6_HEAD_LAYOUT owners; the production L6 attn block is widened
+# (>=11 heads, head_dim 111) and heads 8+ are free padding. We pin the FIRST
+# free padding slot via a per-bake AttentionHeadAllocator (layer_max_heads
+# raised) so the head is DECLARED in the layout IR and survives the post-bake
+# right-size / norm passes (a raw model-bake write into an undeclared padding
+# head is silently zeroed; mirrors l11_ops bp_save_prev_carry head 8).
+_JSR_PC_BYTE1_RELAY_HEAD_PIN = 8
+_JSR_PC_BYTE1_RELAY_HEAD_LAYOUT = (
+    ("jsr_pc_byte1_relay.head", _JSR_PC_BYTE1_RELAY_HEAD_PIN),
+)
+
+
+def _allocate_jsr_pc_byte1_relay_head() -> "_AttnHeadAlloc":
+    """Per-bake head allocator pinning the JSR PC byte-1 relay head on L6.
+
+    Head 8 is a widen-padding slot on the L6 attn block (heads 0..7 are the
+    named owners). Pinning it through the allocator (``layer_max_heads`` raised
+    past the default 8) DECLARES the head so the compiler preserves it.
+    """
+    allocator = _AttnHeadAlloc(strategy="dynamic_first_fit", layer_max_heads=12)
+    for (op_name, head_idx) in _JSR_PC_BYTE1_RELAY_HEAD_LAYOUT:
+        allocator.alloc(op_name, layer_idx=6, pin=head_idx)
+    return allocator
+
+
+def _jsr_pc_byte1_relay_head_spec(BD, head_idx: int) -> DeclarativeAttentionHeadSpec:
+    """L6 relay head: copy the staged JSR PC byte-1 nibble MARKER -> byte0 row.
+
+    Q fires at the PC byte-0 token (IS_BYTE + H1[PC] + BYTE_INDEX_0 + HAS_SE,
+    explicitly NOT the marker), K matches the same step's PC MARKER row
+    (MARK_PC). V copies the staged ``JSR_PC_B1`` band; O writes the relayed
+    ``JSR_PC_B1_AT_B0`` band. JSR_PC_B1 is nonzero ONLY on a real JSR step (the
+    marker stage is gated by the override's TEMP[0] + opcode blockers), so the
+    relay is inert on every non-JSR PC byte-0 row even though the Q/K pattern
+    fires there. Mirrors the L3 head-7 marker->byte0 relay pattern + the head-5
+    ``branch_pc_byte0_relay`` slot-52 gate (Q row that attends MARK_PC from the
+    PC byte-0 token).
+    """
+    L = 15.0
+    PC_I = 0
+    GATE = 40  # anti-leakage Q/K-only gate slot (beyond the value-copy slots)
+    v = []
+    o = []
+    for j in range(_JSR_PC_B1_WIDTH):
+        v.append(AP(1 + j, BD.JSR_PC_B1 + j, 1.0))
+        o.append(AO(BD.JSR_PC_B1_AT_B0 + j, 1 + j, 1.0))
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        # ALiBi slope 0: the relay attends a FIXED 1-token-back offset
+        # (byte0 -> the same step's marker), positionally local, and the
+        # strong Q/K marker gates dominate the small position bias anyway.
+        alibi_slope=0.0,
+        q=(
+            AP(0, BD.IS_BYTE, L),
+            AP(0, BD.H1 + PC_I, L),
+            AP(0, BD.BYTE_INDEX_0, L),
+            AP(0, BD.HAS_SE, L),
+            AP(0, BD.MARK_PC, -3.0 * L),  # not the marker itself
+            AP(0, BD.CONST, -3.0 * L),
+            # Anti-leakage gate: only the PC byte-0 token attends.
+            AP(GATE, BD.IS_BYTE, 500.0),
+            AP(GATE, BD.H1 + PC_I, 500.0),
+            AP(GATE, BD.BYTE_INDEX_0, 500.0),
+            AP(GATE, BD.CONST, -1000.0),
+        ),
+        k=(
+            AP(0, BD.MARK_PC, L * 10.0),  # attend the step's PC MARKER row
+            AP(GATE, BD.MARK_PC, 50.0),
+        ),
+        v=tuple(v),
+        o=tuple(o),
+    )
+
+
+# OUTPUT re-supply write scale for the tail emit. The PC byte-0 row's OUTPUT is
+# OVERWRITTEN by the L25 tail corruptor BEFORE the emit runs (~5e4 on gcd). The
+# emit HARD-SETS the byte-0 row's OUTPUT_LO (+2*WS at the byte1 nibble, -WS at
+# every other nibble) so the argmax is the byte1 nibble. WS must dominate the
+# corruptor but stay BELOW the fp32-accumulation-instability band (~1e8+): a
+# WS=5e7 emit produced OUTPUT_LO ~9e11, where the GPU and CPU W_down @ hidden
+# accumulation orders DIVERGE and flip a nibble (the documented saturated-tie
+# class) -> gcd PASSed on CPU but the GPU canonical decoded a leaked byte. Match
+# l11_ops ``bp_save_dump`` (WS=2e5): the per-unit gain silu(cond)~relayed(~90) *
+# 2*WS gives OUTPUT_LO ~3.6e7, dominating the ~5e4 nuke by >700x while staying
+# in the stable fp band so GPU == CPU.
+_JSR_PC_BYTE1_EMIT_WS = float(
+    __import__("os").environ.get("C4_JSR_PC_BYTE1_EMIT_WS", "2e5")
+)
+
+
+def _jsr_pc_byte1_emit_rules(S: float, *, write_scale: float | None = None) -> tuple[FFNRule, ...]:
+    """Emit PC byte-1 at the PC byte-0 row from the relayed band (tail FFN).
+
+    The PC byte-0 token's OUTPUT predicts byte-1 (autoregressive shift). For each
+    byte-1 value v in 1..7, when ``JSR_PC_B1_AT_B0+v`` is hot (relayed from the
+    marker by the L6+1 relay head, and PERSISTING in the residual to the tail),
+    write the value's low nibble into OUTPUT_LO and CANCEL OUTPUT_LO+0 (the byte-0
+    nibble the L3 default + tail corruptor left high). High nibble of PC byte-1 is
+    0 for every 1096 first-JSR target so OUTPUT_HI stays. Gated on the PC byte-0
+    row (IS_BYTE + H1[PC] + BYTE_INDEX_0) so it never touches the marker or other
+    byte positions; the relayed band is itself JSR-exclusive (nonzero only on a
+    real JSR-to-idx>=32 step). The default ``write_scale`` is tuned to dominate
+    the tail corruptor when this FFN runs AFTER it.
+    """
+    if write_scale is None:
+        write_scale = _JSR_PC_BYTE1_EMIT_WS
+    PC_I = 0
+    rules: list[FFNRule] = []
+    base_conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{PC_I}", 1.0),
+        ("BYTE_INDEX_0", 1.0),
+    )
+    for v in range(1, _JSR_PC_B1_WIDTH):
+        lo = v & 0xF
+        # HARD-SET OUTPUT_LO at the PC byte-0 row: write +2*WS at the byte1
+        # nibble and -WS at EVERY OTHER nibble, so the argmax is the byte1
+        # nibble regardless of which OTHER nibble the tail corruptor left high
+        # (rec_fib id725 has a ~2e10 SENTINEL at OUTPUT_LO+2 — the byte0 value
+        # 0x02 leaking into the byte1 prediction — which a single OUTPUT_LO+0
+        # cancel could not beat). The net at the target nibble is +2*WS, at all
+        # others -WS; with WS dominating the corruptor magnitude the byte1
+        # nibble wins cleanly. OUTPUT_HI stays (PC byte-1 high nibble = 0).
+        writes = [(f"OUTPUT_LO+{lo}", 2.0 * write_scale)]
+        for j in range(16):
+            if j == lo:
+                continue
+            writes.append((f"OUTPUT_LO+{j}", -1.0 * write_scale))
+        rules.append(multi_way_and_rule(
+            name=f"jsr_pc_byte1_emit_{v}",
+            conditions=base_conditions + ((f"JSR_PC_B1_AT_B0+{v}", 1.0),),
+            threshold=3.5,  # IS_BYTE(1)+H1(1)+BYTE_INDEX_0(1)+relay(>=~0.8)
+            writes=tuple(writes),
+        ))
+    return tuple(rules)
+
+
+def make_jsr_pc_byte1_emit_op() -> Operation:
+    """Append the JSR PC byte-1 emit FFN as a POST-TAIL-CORRUPTOR post_op.
+
+    The relay head (baked inside ``make_function_call_weights_op`` on the block
+    just past the override FFN) delivers the staged byte-1 nibble into
+    ``JSR_PC_B1_AT_B0`` at the PC byte-0 row, where it PERSISTS in the residual.
+    This emit re-supplies it into ``OUTPUT_LO`` at the PC byte-0 row so the LM
+    head emits the correct PC byte-1 token (autoregressive shift). It runs as a
+    standalone ``PureFFN`` post_op on the L25 tail block AFTER
+    ``tail_bit32_result_correction`` (the 0xFF SENTINEL-magnitude corruptor that
+    re-zeros the PC byte-0 OUTPUT ~block 42, flipping byte-1 back to 0), so it is
+    the LAST writer of OUTPUT before the LM head — exactly the position +
+    mechanism of ``l11_ops.bp_save_dump_repopulate`` (a large write_scale that
+    dominates the ~5e4 nuke). Gated on the PC byte-0 row (IS_BYTE + H1[PC] +
+    BYTE_INDEX_0) AND the JSR-exclusive relayed band, so it fires ONLY on a real
+    JSR-to-idx>=32 step-0 byte-0 row. Off -> 0 rules -> inert -> golden
+    byte-identical (the JSR_PC_B1_AT_B0 band is omitted too).
+    """
+    enabled = _jsr_pc_byte1_enabled()
+    rules = _jsr_pc_byte1_emit_rules(100.0) if enabled else ()
+
+    def bake(block, dim_positions, S):
+        if not rules:
+            return
+        from ...base_layers import PureFFN
+        # Resolve d_model from the block's attn / ffn.
+        attn = getattr(block, "attn", None)
+        d_model = None
+        if attn is not None and hasattr(attn, "W_q"):
+            d_model = attn.W_q.shape[0]
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            d_model = block.ffn.W_up.shape[1]
+        if d_model is None:
+            d_model = max(int(v) for v in dim_positions.values()) + 1
+        real_rules = _jsr_pc_byte1_emit_rules(S)
+        ffn = PureFFN(d_model, len(real_rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(real_rules),
+        )
+        Primitives.lower_ffn_rules(ffn, real_rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    _reads = (
+        {"IS_BYTE", "H1", "BYTE_INDEX_0", "JSR_PC_B1_AT_B0", "OUTPUT_LO"}
+        if enabled else set()
+    )
+    _writes = {"OUTPUT_LO"} if enabled else set()
+    return Operation(
+        name="jsr_pc_byte1_emit",
+        reads=_reads,
+        writes=_writes,
+        audited_empty_produces=not enabled,
+        kind="block",
+        # Append AFTER the tail correction on the L25 tail block, so this op is
+        # the LAST writer of OUTPUT_LO before the LM head (it runs after the
+        # block-42 corruptor that re-zeros the PC byte-0 OUTPUT). Mirrors
+        # ``l11_ops.bp_save_dump_repopulate`` (same host + ordering).
+        target_op_name="l10_post_ops_combined",
+        requires={"after": ("tail_bit32_result_correction",)},
+        declarative_bake_fn=bake,
+        compiler_ir=CompilerIR(),
+        declarative_authority="structural_model",
+        migrated=True,
+        semantic_label="jsr-pc-byte1 emit",
     )
 
 

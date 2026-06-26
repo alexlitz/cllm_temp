@@ -925,6 +925,15 @@ def all_core_ops(
         # (byte-identical). Standalone PureFFN post_op on the L25 tail block after
         # tail_bit32. See l11_ops.make_bp_save_dump_repopulate_op.
         make_bp_save_dump_repopulate_op(),
+        # JSR-target PC byte-1 EMIT (flag C4_JSR_PC_BYTE1, default OFF): the
+        # LAST writer of OUTPUT_LO at the PC byte-0 row. The relay head (baked in
+        # function_call_weights, one block past the override FFN) delivered the
+        # staged byte-1 nibble into JSR_PC_B1_AT_B0; this re-supplies it into
+        # OUTPUT_LO AFTER the tail corruptor re-zeros the PC byte-0 OUTPUT, so a
+        # high-JSR-target (idx>=32 -> PC>=256) program emits the nonzero PC
+        # byte-1 (gcd/rec_fib step-0). Off -> inert -> golden byte-identical.
+        # Standalone PureFFN post_op on the L25 tail block after tail_bit32.
+        make_jsr_pc_byte1_emit_op(),
         # No-STACK0 (30-token) STEP_END OUTPUT-clear FFN: drives OUTPUT_LO/HI
         # hugely negative at the MARK_SE_ONLY row so the LM head emits REG_PC (not
         # a stray byte) after STEP_END, killing the +1-token/step frame drift that
@@ -966,6 +975,13 @@ def all_core_ops(
         make_layer15_si_mem_addr0_from_stack0_op(),
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # FFN unit writes survive the rightsize pass at end of legacy_bake.
+        # The JSR-target PC byte-1 delivery (flag C4_JSR_PC_BYTE1, default OFF)
+        # is now baked INSIDE make_function_call_weights_op: the override FFN
+        # STAGES JSR_PC_B1 at the PC marker, then the relay attention head + emit
+        # FFN are baked onto the NEXT physical block (model.blocks[7]) so they
+        # run AFTER the marker stage is visible in the residual. A same-block
+        # relay reads JSR_PC_B1=0 (attention precedes the staging FFN). Off ->
+        # golden byte-identical.
         make_function_call_weights_op(),
         # Model-level bake that runs BEFORE legacy_bake (phase 998) so its
         # L6 FFN unit writes survive the rightsize pass at end of legacy_bake.
