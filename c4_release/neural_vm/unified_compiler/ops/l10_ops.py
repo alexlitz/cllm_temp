@@ -1043,6 +1043,7 @@ from .shared import (
     _as_setdim_proxy,
     loop_lea_b0_e0_restore_enabled,
     loop_lea_b0_e8_restore_enabled,
+    loop_li_opcode_fetch_addrkey_clamp_enabled,
     loop_si_byterow_marker_clear_enabled,
     mul_stack0_byte39_guard_enabled,
     no_stack0_emit_enabled,
@@ -11905,6 +11906,178 @@ def make_l10_loop_si_byterow_marker_clear_op() -> Operation:
         migrated=True,
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+# ===========================================================================
+# In-loop opcode-fetch ADDR_KEY top-byte over-count clamp
+# (flag C4_LOOP_LI_FETCH_ADDRKEY_CLAMP, default ON in the campaign config).
+# Despite the l10_ file home (alongside the loop_* family) this op binds to the
+# L4 FFN dep anchor (block 4) so it runs AFTER the L3 doubling (block 3) and
+# BEFORE the L5 opcode fetch (block 6). See
+# ``shared.loop_li_opcode_fetch_addrkey_clamp_enabled`` for the full root + GPU
+# trace attribution. In one line: the L3 ``_pc_byte1_prev_head_spec`` stages a
+# CLEAN_EMBED nibble into ``ADDR_KEY+32`` (the 3rd code-address nibble, for the
+# 12-bit fetch match) ON TOP of the positional ADDR_KEY one-hot at certain zero
+# prompt code bytes -> that cell reads 2.0 not 1.0 -> in the L5 opcode fetch
+# CAM (head 1) the doubled cell's slot-35 contribution (~803 vs ~402) lets a
+# WRONG zero code byte win a razor-thin tie (112.94 vs 112.71) over the true SI
+# opcode byte for the in-loop store PCs (58/90, low nibble 0xa) -> OPCODE_BYTE
+# decodes 0x00 not 0x0B -> OP_SI dead -> MEM_STORE never set on the SI store ->
+# the in-loop LI value-load CAM (L15) finds no store and returns 0.
+#
+# FIX: clamp ``ADDR_KEY+32+k`` back to 1.0 on prompt code-byte rows by
+# SUBTRACTING the over-count. Per cell k a unit fires iff the cell is DOUBLED
+# (>= ~1.5) on an ``IS_BYTE`` row with every register MARKER hard NOT-blocked
+# (so PROMPT code bytes only -- never an emitted PC/AX/SP value byte where the
+# L3 head legitimately SINGLE-stages the nibble at 1.0, which stays < 1.5 and so
+# never fires). A clean single cell is untouched -> short programs + the
+# legitimate 12-bit code-address match are byte-identical; only the doubled
+# stray-zero-byte cells are restored, after which the true SI opcode row wins
+# the fetch p=1.000.
+#
+# CALIBRATION: like ``_l10_loop_si_byterow_marker_clear_*`` the fired unit's
+# silu(up) SATURATES to a stable value on a fired row (the IS_BYTE*100 + doubled
+# -cell*100 AND margin * S=100). The landed residual is ``silu(up) * W_down``;
+# we choose W_down to subtract an effective ~ -1.5 from the doubled cell. The
+# clamp is one-sided-safe: even a 2x miscalibration lands the cell in
+# [-2.0, 0.5], all of which leave it BELOW the correct (non-doubled, 2-nibble-
+# matching) SI row, so the fetch still resolves correctly. ``ADDR_KEY+32`` on a
+# stray zero code byte is consumed ONLY by the L5 fetch K (making that row less
+# attractive == the intended effect), so over-subtraction has no other reader.
+_LOOP_LI_CLAMP_SILU_SAT = 5000.0  # measured saturated silu(up) of a fired
+#                                   IS_BYTE-gated L4 step unit (deterministic).
+_LOOP_LI_CLAMP_EFFECTIVE_SUB = 1.5  # effective amount subtracted from the
+#                                     doubled ADDR_KEY+32 cell (restores ~1.0).
+_LOOP_LI_CLAMP_WDOWN = -_LOOP_LI_CLAMP_EFFECTIVE_SUB / _LOOP_LI_CLAMP_SILU_SAT
+_LOOP_LI_CLAMP_MARKER_BLOCK = 1_000_000.0
+
+
+def _l10_loop_li_opcode_fetch_addrkey_clamp_rules() -> tuple[FFNRule, ...]:
+    """16 rules: clamp each ``ADDR_KEY+32+k`` cell back to ~1.0 on doubled
+    prompt code-byte rows.
+
+    Per cell k an AND fires iff (the cell is DOUBLED to >= ~1.5) AND (IS_BYTE)
+    AND (no register marker). The cell condition weight (100) means a clean
+    single cell (1.0 -> +100) plus IS_BYTE (+100) totals 200 (< threshold 250),
+    while a doubled cell (2.0 -> +200) plus IS_BYTE (+100) totals 300 (>= 250)
+    -> fires. Every register MARKER carries a hard -1e6 NOT-block so an emitted
+    PC/AX/SP/.. value byte (where the L3 head single-stages the nibble) can never
+    be clamped. The write subtracts the over-count from the SAME cell.
+    """
+    rules: list[FFNRule] = []
+    for k in range(16):
+        cell = f"ADDR_KEY+{32 + k}"
+        disc: tuple[tuple[str, float], ...] = (
+            # The cell value gates firing: clean=1.0 -> +100, doubled=2.0 ->
+            # +200. Threshold 250 (below) admits only the doubled case.
+            (cell, 100.0),
+            ("IS_BYTE", 100.0),
+            ("MARK_PC", -_LOOP_LI_CLAMP_MARKER_BLOCK),
+            ("MARK_AX", -_LOOP_LI_CLAMP_MARKER_BLOCK),
+            ("MARK_SP", -_LOOP_LI_CLAMP_MARKER_BLOCK),
+            ("MARK_BP", -_LOOP_LI_CLAMP_MARKER_BLOCK),
+            ("MARK_STACK0", -_LOOP_LI_CLAMP_MARKER_BLOCK),
+            ("MARK_MEM", -_LOOP_LI_CLAMP_MARKER_BLOCK),
+        )
+        rules.append(multi_way_and_rule(
+            name=f"l10_loop_li_fetch_addrkey_clamp_{k}",
+            conditions=disc,
+            # cell=1 + IS_BYTE = 200 (NO fire); cell=2 + IS_BYTE = 300 (fire);
+            # any marker drops by 1e6 (excluded).
+            threshold=250.0,
+            writes=((cell, _LOOP_LI_CLAMP_WDOWN),),
+        ))
+    return tuple(rules)
+
+
+def make_l10_loop_li_opcode_fetch_addrkey_clamp_op() -> Operation:
+    """Flag-gated L4 in-loop opcode-fetch ADDR_KEY top-byte over-count clamp.
+
+    Standalone ``PureFFN`` post_op bound to the L4 FFN dep anchor; it runs AFTER
+    the L3 doubling (block 3) and BEFORE the L5 opcode fetch (block 6). Flag-off
+    (or non-campaign / golden) produces ZERO rules and appends NO post_op ->
+    byte-identical to golden. See ``loop_li_opcode_fetch_addrkey_clamp_enabled``
+    / ``_l10_loop_li_opcode_fetch_addrkey_clamp_rules``.
+    """
+    if not loop_li_opcode_fetch_addrkey_clamp_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_loop_li_fetch_addrkey_clamp",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="layer3_carry_forward_attn",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#memory",
+        )
+
+    rules = _l10_loop_li_opcode_fetch_addrkey_clamp_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        # Fires on prompt code-byte rows (IS_BYTE=1, no marker); do NOT call
+        # _suppress_ffn_on_step_boundary (it would gate exactly those rows).
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_loop_li_fetch_addrkey_clamp",
+        reads={
+            "IS_BYTE", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+            "MARK_STACK0", "MARK_MEM", "ADDR_KEY",
+        },
+        writes={"ADDR_KEY"},
+        kind="block",
+        # Bind to the L3 carry_forward attention op (block 3) -- the HOME of the
+        # ``_pc_byte1_prev_head_spec`` head that creates the ADDR_KEY+32 doubling.
+        # A block post_op here runs at block 3 AFTER that head, so the clamp lands
+        # in the residual stream BEFORE the L5 opcode fetch (block 6) reads it.
+        # (The L4 FFN dep anchor resolves to block 6 in the dynamic schedule, so
+        # an L4-anchored post_op would run AFTER the fetch -- too late.)
+        target_op_name="layer3_carry_forward_attn",
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#memory",
     )
 
 

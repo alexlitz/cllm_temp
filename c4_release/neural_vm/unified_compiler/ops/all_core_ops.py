@@ -42,6 +42,7 @@ from .shared import sili_b1_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
 from .shared import loop_si_byterow_marker_clear_enabled  # noqa: F401
+from .shared import loop_li_opcode_fetch_addrkey_clamp_enabled  # noqa: F401
 
 
 def all_core_ops(
@@ -703,6 +704,33 @@ def all_core_ops(
         *(
             [make_l10_loop_si_byterow_marker_clear_op()]
             if loop_si_byterow_marker_clear_enabled() else []
+        ),
+        # In-loop opcode-fetch ADDR_KEY top-byte over-count clamp (flag
+        # C4_LOOP_LI_FETCH_ADDRKEY_CLAMP, default ON in the campaign config).
+        # Binds to ``layer3_carry_forward_attn`` (the head that creates the
+        # doubling) so the clamp post_op lands at block 4, AFTER the L3 ADDR_KEY
+        # +32 doubling (block 3) and BEFORE the L5 opcode fetch (block 6). The
+        # doubling lets a WRONG zero code byte win the in-loop store-step fetch
+        # tie -> OPCODE_BYTE=0x00 not 0x0B -> OP_SI dead -> MEM_STORE never set
+        # on the in-loop SI stores -> the in-loop LI value-load CAM (L15) loses
+        # the genuine store from its candidate set. The clamp restores the
+        # doubled cell to ~1.0 so the true SI opcode row wins the fetch
+        # p=1.000, OP_SI fires, and MEM_STORE=1 on the in-loop SI stores again
+        # (loop_sum id450 steps 0-10 PC+AX byte-correct; teacher-forced LI now
+        # returns the correct value). NOTE: this is a NECESSARY building block,
+        # not yet a full flip of id450 -- the in-loop LI still returns 0 in the
+        # autoregressive path because the SI store's address is never
+        # materialized into ADDR_KEY at the MEM store row (every store row has
+        # ADDR_KEY_set=[]), so the LI falls back to ALiBi recency and cannot
+        # discriminate the i-store from the later sum-store. That store-ADDR_KEY
+        # materialization is the documented downstream root (#342 operand-CAM
+        # family). REGISTERED ONLY when the flag is on (lookahead-chain pattern)
+        # so a flag-off / golden build is byte-identical. See
+        # _l10_loop_li_opcode_fetch_addrkey_clamp_rules /
+        # loop_li_opcode_fetch_addrkey_clamp_enabled.
+        *(
+            [make_l10_loop_li_opcode_fetch_addrkey_clamp_op()]
+            if loop_li_opcode_fetch_addrkey_clamp_enabled() else []
         ),
         make_tail_bit32_result_correction_op(),
         # L10 EXIT/no-clean-opcode AX_CARRY -> OUTPUT source fix (flag

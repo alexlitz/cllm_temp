@@ -1777,6 +1777,92 @@ def loop_si_byterow_marker_clear_enabled() -> bool:
     )
 
 
+def loop_li_opcode_fetch_addrkey_clamp_enabled() -> bool:
+    """Return True iff the in-loop opcode-fetch ADDR_KEY top-byte over-count
+    clamp (``C4_LOOP_LI_FETCH_ADDRKEY_CLAMP``) is active.
+
+    DEFAULT **ON** in the campaign config (``C4_NO_STACK0_EMIT=1`` +
+    ``C4_OPERAND_FROM_MEMSP=1``); opt-out via ``C4_LOOP_LI_FETCH_ADDRKEY_CLAMP=0``.
+    Flag-off OR a non-campaign / golden build registers NO rules and appends NO
+    post_op, so the model is bit-for-bit identical to golden.
+
+    ROOT — THE IN-LOOP ``LI`` VALUE-LOAD RETURNS 0 IS AN UPSTREAM OPCODE-FETCH
+    MISS ON THE STORE (loop_sum id450 step 11, measured spec_k=0, BUILT
+    dim_positions, campaign config; GPU teacher-forced trace
+    ``tools/_probe_loopsum_li_cam.py`` + ``_probe_loopsum_memstore_chain.py`` +
+    ``_probe_loopsum_pcfetch.py`` + ``_probe_loopsum_fetchattn.py``):
+
+    After the back-edge desync fix (``C4_LOOP_SI_BYTEROW_CLEAR``) advances
+    ``loop_sum`` to step 11, the in-loop ``LI &i`` (loop-condition variable load,
+    pc 106->114) returns AX=0 not 1. The L15 ``memory_lookup`` CAM (head 0) that
+    content-addresses the load only attends to MEM rows carrying ``MEM_STORE=1``.
+    But the two genuine in-frame ``SI`` stores -- step 5 (``i = 1`` -> 0xFFE8) and
+    step 9 (``sum = 0`` -> 0xFFE0) -- carry ``MEM_STORE = -0.0`` on their MARK_MEM
+    marker (only the prologue JSR + an in-loop PSH show ``MEM_STORE = 1``). So the
+    LI CAM's candidate set is EMPTY of the real store and the load reads garbage.
+
+    WHY ``MEM_STORE`` is missing on the SI stores: ``MEM_STORE`` is the relayed OR
+    of ``OP_SI/OP_SC/OP_PSH/OP_JSR/OP_ENT`` (L6 head 6 broadcasts it from the AX
+    marker to the MARK_MEM marker). At the SI steps the opcode dim ``OP_SI`` is
+    DEAD (~0) because the L5 opcode-fetch (block 6) reads the WRONG opcode byte:
+    OPCODE_BYTE decodes to 0x00 (LEA) instead of 0x0B (SI). The fetch is a content
+    -addressed match of the relayed PC (``EMBED_LO/HI`` nibbles, head 1 Q) against
+    each code byte's positional ``ADDR_KEY`` (head 1 K). For the SI PCs (58, 90 --
+    low nibble 0xa) the correct code row (the SI opcode byte) and a STRAY zero
+    high-byte code row sit in a RAZOR-THIN tie (score 112.71 vs 112.94); the wrong
+    zero byte wins by 0.23 and its V copies 0x00 into OPCODE_BYTE.
+
+    The 0.23 margin is created by a DOUBLED ``ADDR_KEY+32`` (3rd address nibble,
+    top byte) on the wrong row: it carries 2.0 not 1.0, so its head-1 slot-35
+    contribution is ~803 (vs the correct row's ~402), exactly enough to overcome
+    its missing mid-nibble match. The doubling is an aliasing collision produced
+    at block 3 (L3 ``_pc_byte1_prev_head_spec`` stages ``CLEAN_EMBED`` ->
+    ``ADDR_KEY+32`` for the 12-bit code-address match) landing ON TOP of the
+    positional ``ADDR_KEY+32`` one-hot (both index 0 for PC < 256) at certain
+    zero code bytes (e.g. id450 pos 233). Short programs (var_simple id250, same
+    SI PC=58) have NO such colliding zero byte, so their SI fetch wins cleanly and
+    OP_SI/MEM_STORE are correct -- this is a LONG-PROGRAM / loop-body root.
+
+    FIX: a flag-gated ``PureFFN`` block scheduled inside L4 (block 4, AFTER the L3
+    doubling at block 3, BEFORE the L5 opcode fetch at block 6) that CLAMPS the
+    over-counted ``ADDR_KEY+32`` band back to 1.0 on prompt code-byte rows. Per
+    cell k a step-function unit fires iff ``ADDR_KEY+32+k >= 1.5`` (i.e. the cell
+    was doubled to ~2.0) on an ``IS_BYTE`` row with every register MARKER hard
+    NOT-blocked (so only PROMPT code bytes, never an emitted PC/AX/SP/.. value
+    byte where L3 head 7 legitimately single-stages the nibble), and subtracts
+    1.0 from that cell. A clean single-staged cell (1.0 < 1.5) never fires, so the
+    legitimate 12-bit code-address match and every short program are byte-
+    identical. With the doubling removed the correct SI code row wins the fetch
+    p=1.000 -> OP_SI fires -> MEM_STORE=1 on the in-loop SI stores again
+    (verified GPU AR: loop_sum id450 steps 0-10 PC+AX byte-correct; the L15 CAM
+    candidate set now contains the genuine stores; teacher-forced LI returns the
+    correct value).
+
+    SCOPE / BLUEPRINT (NOT a full flip of id450 yet): this op is the NECESSARY
+    upstream half. The in-loop LI still returns 0 in the AUTOREGRESSIVE path
+    because the SI store's ADDRESS is never materialized into ``ADDR_KEY`` at the
+    MEM store row -- in the AR run EVERY store row has ``ADDR_KEY_set=[]`` (the
+    store's emitted MEM address bytes are 0x00000000, identical for the PASSING
+    var_simple), so the L15 value-load lookup falls back to ALiBi recency. A
+    single-store program (var_simple) is fine on recency; a LOOP has multiple
+    intervening stores between the i-store (step 5) and the in-loop LI (step 11)
+    so recency picks the wrong (later) store and the load returns 0. The
+    downstream lever is to MATERIALIZE the store address into ``ADDR_KEY`` at the
+    in-loop MEM store row (the #342 operand-CAM / value-load-CAM family) so the
+    L15 CAM can content-address the correct store -- then this op's restored
+    MEM_STORE flag (which gates the candidate set) lets the load land. Byte-
+    identical flag-OFF (golden ``928e49ec`` / campaign ``53118713`` both UNCHANGED
+    vs base bafc16b6). var_simple HOLDS (PASS); func_identity id550 fails
+    IDENTICALLY flag-ON and flag-OFF (a pre-existing base failure, not a
+    regression).
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_LOOP_LI_FETCH_ADDRKEY_CLAMP", "1") != "0"
+    )
+
+
 def ffn_lint_mull14_demo_enabled() -> bool:
     """Return True iff the cross-op FFN-lint MUL-L14-ENTANGLEMENT demo op is on.
 
