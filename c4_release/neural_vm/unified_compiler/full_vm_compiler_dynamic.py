@@ -2409,6 +2409,18 @@ def compile_full_vm_dynamic(
                 and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
                 and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
             ),
+            # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt
+            # out =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60
+            # threshold bump to the L10 ``e8_alubp_memsp`` writer so the ON / OFF
+            # builds bake different L25-tail FFN weights and must never share a
+            # memo entry. Gated on the campaign LEA byte-0 relay so the
+            # non-campaign / golden build is byte-identical. See
+            # l10_ops._lea_e8_first_ent_gate_enabled.
+            "C4_LEA_E8_FIRST_ENT_GATE": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+                and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
+            ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
             # ON / OFF builds bake a different W_q row and must never share a
@@ -3182,6 +3194,17 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
             and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
+        ),
+        # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt out
+        # =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60 threshold bump
+        # to the L10 ``e8_alubp_memsp`` writer so ON / OFF builds bake different
+        # L25-tail FFN weights and must never share a serialised entry. Gated on
+        # the campaign prerequisites so the non-campaign / golden build is
+        # byte-identical. See l10_ops._lea_e8_first_ent_gate_enabled.
+        "C4_LEA_E8_FIRST_ENT_GATE": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+            and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF

@@ -512,6 +512,63 @@ def _lea_e0d8_fetch_strength() -> float:
     return 4_000_000.0 if _lea_e0d8_fetch_dominate_enabled() else 1_000_000.0
 
 
+def _lea_e8_first_ent_gate_enabled() -> bool:
+    """Flag for the func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX — gate the
+    ``e8_alubp_memsp`` BP-8 0xE8 writer on the FIRST-LEA-after-ENT signal
+    (``OP_ENT`` residue), so it stops slamming 0xE8 onto the SECOND-local re-read
+    LEA (``&b``, BP-16, want 0xE0) in func_add / func_mul / func_max / func_min /
+    absdiff (~125, the func/absdiff step-11 0xFFE0->0xFFE8 cluster).
+
+    The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
+    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; tools/
+    _probe_lea_opent_cluster.py + run_1096_canonical full_trace on ids 575/600/
+    650/675/1046): the func body reads a 2nd local ``&b`` (``LEA 16`` in a
+    2-param frame, BP-16, effective-address byte-0 = 0xE0). The L8 ``lea_lo`` ALU
+    ALREADY computes the CORRECT 0xE0 (pre-slam OUTPUT_LO argmax = cell 0 through
+    block 43). But the ``e8_alubp_memsp`` writer keys only on ``0.2*ALU_HI+15``,
+    which on func's ``&b`` is ~+86.9 (IDENTICAL to ``&a`` — NOT the assumed ~+5.5),
+    so the 0xE8 writer (strength 1e6) FIRES on ``&b`` and stamps 0xE8 over the
+    genuine 0xE0 -> step-11 ``got ax=0xFFE8`` vs oracle ``0xFFE0``. The
+    ``e0_fetch_memsp`` 0xE0 writer does NOT rescue it because func encodes ``LEA
+    16`` as ``FETCH_HI`` nibble **1** (NOT 15), so e0_fetch is DARK on func's
+    ``&b`` (it was tuned for var's ``&b`` which carries FETCH_HI+15).
+
+    THE DISCRIMINATOR (the func-safe key the FETCH band lacks): ``OP_ENT`` residue
+    at the LEA AX-marker row separates the FIRST-LEA-after-ENT from the later
+    re-read LEAs CLEANLY across the whole cluster (probe block-43 input):
+
+      * FIRST LEA after an ENT (``&a`` / ``&x`` / nested first-LEA): OP_ENT ~+1.19
+        (the in-step ENT-broadcast residue one VM step after the prologue ENT).
+        These are exactly the rows where the 0xE8 slam is CORRECT (BP-8) or
+        load-bearing (func_identity ``&x``: genuine 0xE0 lifted to 0xE8).
+      * SECOND / re-read LEA (func ``&b``, var ``&a``/``&b`` re-reads): OP_ENT
+        ~+0.013 (the residue has decayed). These are exactly the rows where the
+        0xE8 slam is WRONG (func ``&b`` genuine 0xE0) or a no-op (var re-read
+        already 0xE8 / handled by e0_fetch).
+
+    THE FIX: add ``("OP_ENT", W)`` to the e8 writer's conditions and raise the
+    threshold by ``0.6*W`` (the cut sits at the ~0.6 midpoint between the +1.19
+    fire and the +0.013 veto). With ``W = 100`` the first-LEA score gains ~+59
+    over threshold and the re-read score loses ~-59 -> vetoed. The genuine 0xE0
+    survives on func ``&b``; func_identity ``&x`` / var first-LEA / nested
+    first-LEA keep the slam (OP_ENT ~1.19). The var / func_square re-read rows the
+    slam is silenced on are byte-identical (their pre-slam value is already 0xE8
+    or, for var ``&b``, delivered by e0_fetch).
+
+    DEFAULT tracks ``_lea_byte0_memsp_relay_enabled()`` (the e8 writer's own
+    campaign branch): the OP_ENT gate is applied ONLY in the 30-token campaign
+    config and ONLY when this flag is on, so flag-OFF (``=0``),
+    ``C4_NO_STACK0_EMIT=0``, or the 35-token golden build are all byte-identical
+    to the pre-fix default (golden never emits this writer). Dedicated
+    kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_LEA_E8_FIRST_ENT_GATE`` can A/B it inside the campaign config.
+    """
+    forced = os.environ.get("C4_LEA_E8_FIRST_ENT_GATE")
+    if forced is not None:
+        return forced != "0" and _lea_byte0_memsp_relay_enabled()
+    return _lea_byte0_memsp_relay_enabled()
+
+
 def _lea_byte0_memsp_relay_enabled() -> bool:
     """Flag for the PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay
     (ROOT 1, gates func_identity step-6 + var_mul/three multi-local + nested).
@@ -10188,8 +10245,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_BP", -10000.0),
                 ("MARK_STACK0", -10000.0),
                 ("MARK_MEM", -10000.0),
-            ),
-            threshold=17.0,
+            ) + ((
+                # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX: gate on the
+                # FIRST-LEA-after-ENT ``OP_ENT`` residue (~+1.19 on the first LEA,
+                # ~+0.013 on the re-read LEA) so this 0xE8 writer stops slamming
+                # 0xE8 over the genuine 0xE0 on func / absdiff ``&b`` (BP-16). The
+                # +0.6*W threshold bump (matched below) cuts at the ~0.6 midpoint:
+                # first-LEA fires (margin ~+0.59W), re-read vetoed (~-0.587W). See
+                # ``_lea_e8_first_ent_gate_enabled``.
+                ("OP_ENT", 100.0),
+            ) if _lea_e8_first_ent_gate_enabled() else ()),
+            threshold=17.0 + (60.0 if _lea_e8_first_ent_gate_enabled() else 0.0),
             writes=byte_writes(0xE8, strength=1_000_000.0),
         ),
         # (2) BP-16 -> 0xE0. The multi-local re-read LEA carries small ALU_HI+15
