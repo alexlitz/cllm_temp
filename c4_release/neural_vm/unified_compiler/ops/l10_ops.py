@@ -1042,6 +1042,7 @@ from .residual_band_registry import register_residual_band
 from .shared import (
     _as_setdim_proxy,
     loop_lea_b0_e0_restore_enabled,
+    loop_lea_b0_e8_oplea_req_enabled,
     loop_lea_b0_e8_restore_enabled,
     loop_li_opcode_fetch_addrkey_clamp_enabled,
     loop_si_byterow_marker_clear_enabled,
@@ -11360,10 +11361,28 @@ def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
     owning_ops = tuple(
         op for op in _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS if op != "OP_JSR"
     )
-    disc: tuple[tuple[str, float], ...] = (
+    # OP_LEA HARD-REQUIREMENT narrowing (POST-FLIP func_identity step-9 LI fix,
+    # flag C4_LOOP_LEA_B0_E8_OPLEA_REQ, default ON). The pre-fix discriminator
+    # made OP_LEA NON-load-bearing (weight 60 -> ~314, but FETCH_LO+8*1000 alone
+    # cleared threshold 500), so on func_identity's ``LI`` row -- which carries
+    # FETCH_LO+8==1.0 but OP_LEA==0 -- the op FALSE-FIRED and stamped 0xE8 over
+    # the loaded value (got_ax 0xFFE8 vs oracle 70). Bump OP_LEA 60->200 and add
+    # a CONST -650 bias so the genuine in-loop ``LEA &i`` (OP_LEA 5.24) still
+    # FIRES (100 + 1048 + 160 - 650 = 658 > 500, 158-pt margin) while the LI row
+    # (OP_LEA 0) is VETOED (100 + 0 + 1000 - 650 = 450 < 500). The 2nd/3rd-local
+    # LEAs (FETCH net -1000) stay silent (-502). OFF reverts to the regressed
+    # weights for A/B. See ``shared.loop_lea_b0_e8_oplea_req_enabled``.
+    _oplea_req = loop_lea_b0_e8_oplea_req_enabled()
+    _op_lea_w = 200.0 if _oplea_req else 60.0
+    _const_bias: tuple[tuple[str, float], ...] = (
+        (("CONST", -650.0),) if _oplea_req else ()
+    )
+    disc: tuple[tuple[str, float], ...] = _const_bias + (
         ("MARK_AX", 100.0),
-        # GENUINE LEA (OP_LEA ~5.24): weight 60 -> ~314.
-        ("OP_LEA", 60.0),
+        # GENUINE LEA (OP_LEA ~5.24): HARD requirement when the OPLEA_REQ
+        # narrowing is on (weight 200 + CONST -650 -> OP_LEA load-bearing),
+        # else the pre-fix weight 60 (~314, NON-load-bearing — the regression).
+        ("OP_LEA", _op_lea_w),
         # imm=-8 DISCRIMINATOR (the LOAD-BEARING term). FETCH is a NON-one-hot
         # broadcast (the imm-low-nibble cell ~0.4-1.0, the rest ~0), and the only
         # thing that distinguishes the 1st local (imm=-8 -> 0xE8, FETCH_LO+8
@@ -11501,7 +11520,7 @@ def make_l10_loop_lea_b0_e8_op() -> Operation:
     return Operation(
         name="l10_loop_lea_b0_e8",
         reads={
-            "MARK_AX", "OP_LEA", "MEM_ADDR_SRC",
+            "CONST", "MARK_AX", "OP_LEA", "MEM_ADDR_SRC",
             "FETCH_LO", "FETCH_HI",
             "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
             "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",

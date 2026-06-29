@@ -1657,6 +1657,52 @@ def loop_lea_b0_e8_restore_enabled() -> bool:
     )
 
 
+def loop_lea_b0_e8_oplea_req_enabled() -> bool:
+    """Return True iff the ``C4_LOOP_LEA_B0_E8`` discriminator's ``OP_LEA``
+    HARD-REQUIREMENT narrowing is active (POST-FLIP func_identity step-9 LI
+    regression fix).
+
+    DEFAULT **ON** wherever the e8-restore op itself is active; opt-out via
+    ``C4_LOOP_LEA_B0_E8_OPLEA_REQ=0`` (which reverts to the pre-fix
+    ``OP_LEA`` weight 60 / no CONST bias, reproducing the regression — kept as a
+    dedicated kill-switch so ``tools/flag_regression_gate.py`` can A/B JUST the
+    narrowing). Inert (and therefore byte-identical) whenever the e8-restore op
+    is OFF, since the discriminator is only emitted then.
+
+    ROOT (GPU spec_k=0, BUILT dims, campaign config; ``tools/_probe_funcid_loope8.py``
+    on ``func_identity`` id550 ``identity(70)``): the e8-restore op's discriminator
+    (``MARK_AX*100 + OP_LEA*60 + FETCH_LO+8*1000 - FETCH_LO+0*1000
+    - FETCH_HI+14*1000`` > threshold 500) was MEANT to fire only on a GENUINE
+    in-loop ``LEA &i`` (``OP_LEA == 5.24``), but ``OP_LEA`` is NOT load-bearing:
+    the ``FETCH_LO+8 * 1000`` term ALONE clears threshold 500. ``func_identity``'s
+    ``return x`` body issues ``LEA &x`` (step 8, fires correctly) THEN ``LI``
+    (step 9, loads value 70 = 0x46). The LI's FETCHED-instruction byte carries
+    ``FETCH_LO+8 == 1.00`` (the LI opcode encodes to FETCH low-nibble 8) while
+    ``OP_LEA == 0`` and ``OP_LI == 0.01`` (cold) — so the op scores
+    100 + 0 + 1000 = 1100 > 500 and FALSE-FIRES on the LI row, stamping 0xE8 over
+    the loaded 0x46 (got_ax 0xFFE8 = sign-extended 0xE8, oracle 70). The bug was
+    introduced by ``C4_LOOP_LEA_B0_E8`` (commit ``fd60f5f4``, the first post-flip
+    bad commit for id550; bisect-confirmed) and is INVISIBLE to ``OP_LI`` /
+    ``OP_LI_RELAY`` NOT-blocks (both ~0 at the LI byte-0 lookup row).
+
+    THE FIX: make ``OP_LEA`` a HARD requirement. The genuine in-loop ``LEA &i``
+    carries ``OP_LEA == 5.24``; the LI carries ``OP_LEA == 0`` EXACTLY. Bump the
+    ``OP_LEA`` condition weight 60 -> 200 and add a ``CONST -650`` bias so the
+    score needs the genuine LEA's OP_LEA term to cross threshold 500:
+
+      * genuine ``&i`` LEA: 100 + 5.24*200 + 160(FETCH) - 650 = 658 > 500 -> FIRES
+        (158-pt margin, up from the pre-fix 74).
+      * ``func_identity`` LI: 100 + 0 + 1000(FETCH) - 650 = 450 < 500 -> VETOED.
+      * 2nd/3rd-local LEAs (``var_mul`` / ``var_three``, FETCH net -1000):
+        100 + 1048 - 1000 - 650 = -502 -> still SILENT.
+      * clean non-LEA AX row (no FETCH, OP_LEA 0): 100 - 650 = -550 -> SILENT.
+
+    OFF leaves the discriminator at the pre-fix weights (byte-identical to the
+    regressed build).
+    """
+    return os.environ.get("C4_LOOP_LEA_B0_E8_OPLEA_REQ", "1") != "0"
+
+
 def loop_lea_b0_e0_restore_enabled() -> bool:
     """Return True iff the loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0
     RESTORE (``C4_LOOP_LEA_B0_E0``) is active.
