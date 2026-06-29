@@ -1270,21 +1270,36 @@ class LoadedOperandAddHi15ClearFFN(nn.Module):
     # 5.5 leak but spares the 6.0 true one-hot.
     CLEAN_MAX = 5.85
 
-    def __init__(self, inner: nn.Module, *, alu_hi, mark_ax, add_dim):
+    def __init__(self, inner: nn.Module, *, alu_hi, mark_ax, add_dim,
+                 contam_cells=(15,)):
         super().__init__()
         self.inner = inner
         self.alu_hi = int(alu_hi)
         self.mark_ax = int(mark_ax)
         self.add_dim = int(add_dim)
+        # Which ALU_HI nibble cells carry the SP/BP-address high-nibble leak on
+        # the loaded-operand ADD MARK_AX row. var_update (frame ``0xFFE8`` /
+        # ``0xFFF8``) leaks the ``0xF`` nibble -> cell 15. func_add/mul/max/min
+        # (single-level call frame, load address high nibble ``0xD``) leak cell
+        # 13. Both are address nibbles that are NEVER a real func/var operand
+        # high nibble (operands are <= 100 -> hi nibble <= 6), so clearing them
+        # in the contaminant window is provably value-safe. See
+        # ``shared.funcadd_alu_hi13_clear_enabled``.
+        self.contam_cells = tuple(int(c) for c in contam_cells)
         self._is_loaded_operand_add_hi15_clear_wrap = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         add_ax = (x[:, :, self.add_dim] > 0.5) & (x[:, :, self.mark_ax] > 0.5)
-        hi15 = x[:, :, self.alu_hi + 15]
-        contam_hi = add_ax & (hi15 > 0.5) & (hi15 < self.CLEAN_MAX)
         x = x.clone()
         z = torch.zeros((), device=x.device, dtype=x.dtype)
-        x[:, :, self.alu_hi + 15] = torch.where(contam_hi, z, hi15)
+        for c in self.contam_cells:
+            cell = x[:, :, self.alu_hi + c]
+            # A true operand one-hot is >= CLEAN_MAX (~6.0); the address-nibble
+            # leak is ~5.5 (< CLEAN_MAX). Zero only the in-window leak so a
+            # genuine 0xD/0xF high-nibble operand (out of func-arg range, but
+            # safe by construction) is preserved.
+            contam = add_ax & (cell > 0.5) & (cell < self.CLEAN_MAX)
+            x[:, :, self.alu_hi + c] = torch.where(contam, z, cell)
         return self.inner(x)
 
     # ---- composite-FFN compatibility (plumb through to inner) ----

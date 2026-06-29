@@ -1362,6 +1362,40 @@ def loaded_operand_add_hi15_clear_enabled() -> bool:
     return os.environ.get("C4_LOADED_OPERAND_ADD_HI15_CLEAR", "1") != "0"
 
 
+def funcadd_alu_hi13_clear_enabled() -> bool:
+    """Return True iff the loaded-operand ADD high-nibble cell-13 address-leak
+    clear is active. DEFAULT campaign-ON (``C4_FUNCADD_ALU_HI13_CLEAR=1``), opt
+    out with ``C4_FUNCADD_ALU_HI13_CLEAR=0``; gated behind the same
+    ``no_stack0_emit`` + ``loaded_operand_add_hi15_clear_enabled`` campaign
+    chain so the flag-OFF golden (35-tok) build is byte-identical (the wider
+    contaminant cell set is never installed off the campaign).
+
+    ROOT (GPU full_trace id 575 + teacher-forced argmax probe, campaign default,
+    spec_k=0, BUILT dims, ``tools/probe_funcadd_leak.py``): ``func_add``
+    (``int add(int a,int b){return a+b;}``, id 575 = add(57,11), 0/25) diverges
+    at step 13 = the ``a + b`` ADD. With the LEA ``&b`` fix (cc2ec2a8) the func
+    args are delivered (step-9 LI) and addresses correct (step-11 LEA), so step
+    13 IS the arithmetic. The operand-A high nibble (``a`` loaded from
+    ``mem[BP+off]``) arrives in ALU_HI as a TWO-hot: the true nibble cell
+    (``a//16`` <= 6, ~6-7) PLUS a CONSTANT ``~+5.49`` leak at **cell 13** — the
+    ``0xD`` high nibble of the single-level call-frame load address (cf.
+    var_update's ``0xF``/cell-15 leak). The block-12 AddSub high-nibble add then
+    reads the two-hot and writes OUT_HI at the WRONG cell (``add(57,11)``:
+    OUT_HI@1 instead of @4 -> AX byte0 = ``0x1B`` not ``0x44``). Sweep across 10
+    operand pairs (``probe_funcadd_leak.py``) confirms the leak is ALWAYS cell
+    13, ~5.49, and NEVER the true operand cell (func/var operands <= 100 ->
+    hi nibble <= 6 << 13).
+
+    THE FIX: add cell 13 to ``LoadedOperandAddHi15ClearFFN``'s contaminant cell
+    set (alongside the existing cell 15). The same contaminant window
+    (``(0.5, CLEAN_MAX=5.85)``) discriminates the ~5.49 leak from a true
+    one-hot (~6-7), so it is value-safe. Flips ``func_add`` and rides to
+    ``func_mul`` / ``func_max`` / ``func_min`` (same single-level frame, same
+    cell-13 leak on their loaded operand-A ADD/compare steps).
+    """
+    return os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
+
+
 def sili_cam_b1_enabled() -> bool:
     """Return True iff the si/li LOAD byte-1 address-leak discriminator (Inc-2)
     is active. DEFAULT campaign-ON (``C4_SILI_CAM_B1=1``), opt out with

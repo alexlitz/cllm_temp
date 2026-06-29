@@ -976,17 +976,28 @@ def make_loaded_operand_add_hi15_clear_op() -> Operation:
         if not (no_stack0_emit_enabled()
                 and loaded_operand_add_hi15_clear_enabled()):
             return
+        from .shared import funcadd_alu_hi13_clear_enabled
         from ...efficient_alu_neural import LoadedOperandAddHi15ClearFFN
         BD = _as_setdim_proxy(dim_positions)
         block = model.blocks[8]
         # Idempotent guard.
         if getattr(block.ffn, "_is_loaded_operand_add_hi15_clear_wrap", False):
             return
+        # var_update's frame-address leak rides ALU_HI cell 15 (0xF nibble of
+        # 0xFFE8/0xFFF8); func_add/mul/max/min's single-level-frame leak rides
+        # cell 13 (0xD nibble). Both NEVER a real <=100 operand high nibble, so
+        # the contaminant-window clear is value-safe. The cell-13 add is gated
+        # so it can be A/B'd independently of the original cell-15 var_update
+        # fix; flag-OFF keeps the cell set == (15,) byte-identical.
+        contam_cells = (15,)
+        if funcadd_alu_hi13_clear_enabled():
+            contam_cells = (13, 15)
         block.ffn = LoadedOperandAddHi15ClearFFN(
             block.ffn,
             alu_hi=BD.ALU_HI,
             mark_ax=BD.MARK_AX,
             add_dim=BD.OP_ADD,
+            contam_cells=contam_cells,
         )
 
     return Operation(
