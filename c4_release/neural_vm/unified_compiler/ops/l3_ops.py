@@ -15,6 +15,17 @@ from .shared import _as_setdim_proxy
 _PC_I, _AX_I, _SP_I, _BP_I, _MEM_I = 0, 1, 2, 3, 4
 
 
+def _jsr_pc_byte1_enabled() -> bool:
+    """True when the JSR-target PC byte-1 delivery flag is on (default OFF).
+
+    Mirrors ``model_ops._jsr_pc_byte1_enabled`` (defined locally to avoid an
+    import cycle — model_ops imports LAST). When ON, the L3 sequential-carry
+    staging rule (:func:`_jsr_pc_byte1_seq_carry_stage_rules`) is appended.
+    """
+    import os
+    return os.environ.get("C4_JSR_PC_BYTE1", "0") != "0"
+
+
 # === L3 FFN unit layout (auto-fit; legacy offsets retained as docs) ===
 #
 # The ``layer3_ffn`` op owns the L3 FFN's marker-default + PC-increment
@@ -568,6 +579,8 @@ def _register_default_ffn_ir(S: float = 100.0) -> CompilerIR:
     ir = CompilerIR()
     ir.layer(0).ffn.rules.extend(_register_default_ffn_rules(S))
     ir.layer(0).ffn.rules.extend(_pc_byte1_output_rules(S))
+    # Flag-gated sequential PC byte-1 carry staging (empty off -> IR unchanged).
+    ir.layer(0).ffn.rules.extend(_jsr_pc_byte1_seq_carry_stage_rules(S))
     return ir
 
 
@@ -647,6 +660,18 @@ def make_register_default_ffn_op() -> Operation:
             f"units, allocator expected {pc_byte1_start}"
         )
         _add_pc_byte1_output_rules(block.ffn, S, proxy)
+        # Flag-gated (C4_JSR_PC_BYTE1): stage the sequential PC byte-1 carry into
+        # the post-tail-survivable JSR_PC_B1_AT_B0 band (unit 136). OFF -> 0 rules
+        # appended -> byte-identical. ON -> appended at the next free unit after
+        # the 134/135 pc_byte1 pair.
+        _seq_rules = _jsr_pc_byte1_seq_carry_stage_rules(S)
+        if _seq_rules:
+            _seq_start = _next_free_ffn_unit(block.ffn)
+            _seq_names = Primitives.ffn_rule_dim_names(_seq_rules)
+            _seq_dims = Primitives.dim_positions_from_bd(proxy, _seq_names)
+            Primitives.lower_ffn_rules(
+                block.ffn, _seq_rules, _seq_dims, start_unit=_seq_start, S=S,
+            )
 
     # Dim-ownership claims (W_down output cells; partial-claims subset). The
     # bake writes 136 hidden units; their W_down output projections fall into
@@ -751,7 +776,9 @@ def make_register_default_ffn_op() -> Operation:
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "NEXT_STACK0"},
         writes={"OUTPUT_LO", "OUTPUT_HI", "EMBED_LO", "EMBED_HI",
-                "NEXT_STACK0"},
+                "NEXT_STACK0"} | (
+                    {"JSR_PC_B1_AT_B0"} if _jsr_pc_byte1_enabled() else set()
+                ),
         kind="block",
         # Phase 8.G.6: drop ``layer_idx=3`` literal; bind to the L3 attn
         # anchor ``layer3_carry_forward_attn`` so the block op resolves
@@ -980,6 +1007,67 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     return (wrap, preserve)
 
 
+def _jsr_pc_byte1_seq_carry_stage_rules(S: float) -> tuple:
+    """Flag-gated L3 rule: stage the sequential PC byte-1 carry into a band that
+    SURVIVES the L25 tail OUTPUT corruptor (flag C4_JSR_PC_BYTE1).
+
+    The L3 ``pc_byte1_preserve`` rule DOES write the correct PC byte-1=1 into
+    OUTPUT while the previous byte-1 was 1, but the L25
+    ``tail_bit32_result_correction`` corruptor re-zeros the PC byte-0 row's
+    OUTPUT before the LM head, so the byte-1 is lost on the SEQUENTIAL high-PC
+    steps that follow a JSR landing at a high PC (gcd id900: main at 0x10a, then
+    0x112/0x11a/... by +increment). The JSR-target emit re-supplies OUTPUT
+    POST-tail but only on the JSR step itself; the carry tag (``TEMP+16``) the
+    preserve rule reads is WIPED by the L4 ``temp_clear_pc`` pass, so it can't
+    reach the post-tail emit on its own.
+
+    This rule mirrors the production ``pc_byte1_preserve`` gate EXACTLY but
+    writes ``JSR_PC_B1_AT_B0+1`` — the SAME persistent never-share band the
+    post-tail emit reads — so the emit's dominant-index discriminator re-supplies
+    OUTPUT_LO+1 post-tail on every sequential high-PC step, and self-terminates
+    when the PC returns to the low region (carry tag clears -> nothing staged ->
+    emit OFF -> byte-1=0).
+
+    PRESERVE-ONLY (no wrap): the ``wrap`` gate fires on byte0==0x02, which is
+    TRUE at PC=2 (step-0 of EVERY program) and would over-fire byte-1 on low-PC
+    arithmetic programs. The preserve gate requires the ``TEMP+16`` carry tag,
+    which is set ONLY after a step whose PC byte-1 was already 1 (a real high-PC
+    region) — never on a fresh low-PC program. Empty when the flag is off.
+    """
+    if not _jsr_pc_byte1_enabled():
+        return ()
+    # MODERATE write_scale (30/S): the L3 carry must out-vote the ~0 baseline on
+    # a NON-JSR sequential high-PC step (relayed +1 ~= 13 vs +0 ~= 1 -> the emit's
+    # dominant-index discriminator fires byte-1=1) yet LOSE to the override on a
+    # JSR-TO-LOW-TARGET step where the carry tag is ALSO set (the previous high-PC
+    # step). On that JSR step the override stages JSR_PC_B1+0 gated by FETCH_HI+0
+    # (~40x), so the relayed +0 cell (~161) dominates this +1 (~17) and the emit
+    # correctly stays OFF (gcd id900 inner JSR-to-0x1a -> 0x1a, not 0x11a).
+    # Tuning landmarks (spec_k=0, gcd id900): 2/S -> too weak (sequential steps
+    # don't fire); 500/S -> too strong (crushes the override on the JSR step ->
+    # spurious 0x11a); 30/S -> both correct. Configurable via C4_JSR_SEQ_WS.
+    import os as _os
+    write_scale = float(_os.environ.get("C4_JSR_SEQ_WS", "30.0")) / S
+    common_conds = (
+        (f"H1+{_PC_I}", 1.0),
+        (dim_ref("byte_index", "0"), 1.0),
+        ("IS_BYTE", 1.0),
+        ("HAS_SE", 1.0),
+    )
+    preserve_conds = list(common_conds)
+    preserve_conds.append(("TEMP+1", 1.0))
+    preserve_conds.append(("TEMP+16", 1.0))
+    for hi in range(5):
+        preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
+    preserve = multi_way_and_rule(
+        name="layer3_ffn.jsr_pc_byte1_seq_carry_preserve",
+        conditions=tuple(preserve_conds),
+        threshold=6.5,
+        writes=(("JSR_PC_B1_AT_B0+1", write_scale),),
+    )
+    return (preserve,)
+
+
 def _lower_pc_byte1_output_rules_ir(
     ffn, S: float, BD, *, start_unit: int,
 ) -> int:
@@ -1085,7 +1173,10 @@ def make_register_default_ffn_dep_anchor_op() -> Operation:
         # rows from the pre-rightsize footprint. The rule lowering uses
         # a monotonic cursor independent of the layer max, so byte-
         # identity is preserved.
-        ffn_units_used=136,
+        # Flag-gated (C4_JSR_PC_BYTE1): +1 unit for the sequential PC byte-1
+        # carry staging (``_jsr_pc_byte1_seq_carry_stage_rules``, unit 136).
+        # OFF -> 136 -> byte-identical.
+        ffn_units_used=(137 if _jsr_pc_byte1_enabled() else 136),
     )
 
 

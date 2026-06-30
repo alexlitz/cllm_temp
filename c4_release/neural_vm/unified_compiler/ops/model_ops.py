@@ -12,9 +12,50 @@ import torch.nn as nn
 from .shared import _as_setdim_proxy, l8_operand_sp_disc_enabled
 from .residual_band_registry import register_residual_band
 from ...dim_registry import dim_ref
+from ...attention_head_allocator import (
+    AttentionHeadAllocator as _AttnHeadAlloc,
+)
 
 
 _IO_PUTCHAR_ROUTING_START_UNIT = 1500
+
+
+# === JSR-target PC byte-1 delivery (flag C4_JSR_PC_BYTE1, default OFF) ===
+#
+# A JSR to instruction idx>=32 jumps to PC=idx*8+2>=256, so PC byte-1 must be
+# NONZERO. The model emitted 0 and diverged at step 0 (gcd 900-949 / rec_fib
+# 725-749 deep-loop wall). This feature STAGEs byte-1 = FETCH_HI_nib>>1 into the
+# ``JSR_PC_B1`` band at the PC marker (override FFN), the L6+1 relay head copies
+# it to ``JSR_PC_B1_AT_B0`` at the PC byte-0 row, and the post-tail emit FFN
+# re-supplies it into ``OUTPUT_LO`` so the LM head emits the correct token.
+# All three stages are gated on this flag; OFF -> the bands are omitted, the
+# override stages nothing (legacy reserved no-op), and the relay/emit produce
+# zero rules -> golden byte-identical.
+#
+# Width 8: the staged value is ``FETCH_HI_nib >> 1`` (k in 0..15 -> 0..7), and
+# every 1096 first-JSR target's PC byte-1 low nibble is in 1..7 (high nibble 0).
+_JSR_PC_B1_WIDTH = 8
+
+
+def _jsr_pc_byte1_enabled() -> bool:
+    """True when the JSR-target PC byte-1 delivery flag is on (default OFF)."""
+    import os as _os
+    return _os.environ.get("C4_JSR_PC_BYTE1", "0") != "0"
+
+
+# Flag-gated over-width bands for the JSR PC byte-1 relay (collected only when
+# the flag is on -> flag-OFF d_model is byte-identical to golden). JSR_PC_B1 is
+# the marker-staged nibble; JSR_PC_B1_AT_B0 is the relayed copy at the PC byte-0
+# row that the post-tail emit FFN reads. never_share: both carry a JSR-exclusive
+# one-hot that must not be liveness-merged onto another op's dim.
+register_residual_band(
+    "JSR_PC_B1", _JSR_PC_B1_WIDTH, owner="make_function_call_weights_op",
+    flag=_jsr_pc_byte1_enabled, never_share=True,
+)
+register_residual_band(
+    "JSR_PC_B1_AT_B0", _JSR_PC_B1_WIDTH, owner="make_jsr_pc_byte1_emit_op",
+    flag=_jsr_pc_byte1_enabled, never_share=True,
+)
 
 
 def _io_putchar_routing_rules(S: float) -> tuple[FFNRule, ...]:
@@ -359,6 +400,10 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     T_jsr_pc = 4.0
     write_scale = 2.0 / S
     conditions = _function_call_jsr_pc_override_conditions()
+    # Flag-gated: stage PC byte-1 into JSR_PC_B1 (FETCH_HI_nib>>1) on a real JSR.
+    # OFF -> the FETCH_HI block stays a legacy reserved no-op (no down write) so
+    # the override is golden byte-identical.
+    stage_byte1 = _jsr_pc_byte1_enabled()
 
     rules: list[FFNRule] = []
     for k in range(16):
@@ -398,15 +443,19 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     # ONLY on a real JSR step; on a small-target JSR (idx<32 -> k in {0,1} ->
     # byte1 0) it writes JSR_PC_B1+0 which the emit FFN treats as "no byte-1".
     # Staging fires when MARK_PC(1) + TEMP[0](IS_JSR) clears ``T_jsr_pc_stage``.
-    # The override's T_jsr_pc=4.0 is TOO HIGH for some JSR steps: gcd id900's
-    # step-0 marker carries IS_JSR(TEMP[0]) ~1.2 (vs ~10.0 on most JSRs), so the
-    # marker sum 1.0+1.2=2.2 < 4.0 and the byte1 stage never fired (the byte-0
-    # target band fires from a separate, higher-margin unit). A dedicated lower
-    # threshold (1.5) fires the stage at MARK_PC+TEMP[0]>=2.2 while still
-    # blocking every non-JSR PC marker (TEMP[0]=0 -> sum 1.0 < 1.5) and the
-    # opcode blockers (-4 each) keep it off other-opcode steps. (Verified
-    # spec_k=0: gcd TEMP[0]=1.2, rec_fib 10.0, add/sub 0.0 at the step-0 marker.)
-    T_jsr_pc_stage = 1.5
+    # The staging MUST use the SAME strict threshold as the byte-0 PC target
+    # (``T_jsr_pc=4.0``): a lower value (the prior 1.5) fires on EVERY non-JSR PC
+    # marker where ``TEMP+0`` carries L6-head BZ/BNZ-relay POLLUTION (>=~0.5) and
+    # the executing opcode is not in the negative-blocker list (ADD/SUB/MUL/...),
+    # so the staging spuriously writes ``JSR_PC_B1+(FETCH_HI_residue>>1)`` and the
+    # post-tail emit over-fires PC byte-1 on low-PC arithmetic programs (add_0 ->
+    # PC 794, if_eq_0 -> 282, func_max_0 -> 938 -- a whole-corpus regression). At
+    # 4.0 the blockers (-4) + the polluted TEMP+0 (<~2) keep the sum below
+    # threshold on non-JSR markers, while gcd's / rec_fib's real JSR markers
+    # (TEMP+0 ~5-10, verified spec_k=0) clear it. This is the SAME margin the
+    # byte-0 target band already relies on, so a JSR whose byte-0 target fires
+    # ALSO stages byte-1.
+    T_jsr_pc_stage = T_jsr_pc
     for k in range(16):
         if stage_byte1:
             byte1_nib = k >> 1
@@ -1112,10 +1161,19 @@ def _jsr_pc_byte1_relay_head_spec(BD, head_idx: int) -> DeclarativeAttentionHead
         o.append(AO(BD.JSR_PC_B1_AT_B0 + j, 1 + j, 1.0))
     return DeclarativeAttentionHeadSpec(
         head_idx=head_idx,
-        # ALiBi slope 0: the relay attends a FIXED 1-token-back offset
-        # (byte0 -> the same step's marker), positionally local, and the
-        # strong Q/K marker gates dominate the small position bias anyway.
-        alibi_slope=0.0,
+        # STEEP positive ALiBi slope (5.0): the relay MUST attend ONLY the
+        # SAME-STEP PC marker (exactly 1 token back from the PC byte-0 row).
+        # ``MARK_PC`` is hot on EVERY step's marker, so with slope 0 the relay's
+        # softmax spreads across ALL prior markers and step-0's staged
+        # ``JSR_PC_B1`` (the main-JSR target's byte-1 nibble) LEAKS into every
+        # later step's ``JSR_PC_B1_AT_B0`` -> the emit over-fires PC byte-1=1 on
+        # every non-(small-target-JSR) step (gcd id900 stepped to PC 282 instead
+        # of 26). The production attention applies ``-slope*dist`` (dist = q_pos
+        # - k_pos), so a steep positive slope penalises the distant step-0 marker
+        # (dist >= 35) by >=175 while the same-step marker (dist=1) keeps the
+        # full Q/K score (~150) -- isolating the 1-token-back marker the comment
+        # always intended. Matches the L6 head-5 steep-ALiBi convention (5.0).
+        alibi_slope=5.0,
         q=(
             AP(0, BD.IS_BYTE, L),
             AP(0, BD.H1 + PC_I, L),
@@ -1194,7 +1252,22 @@ def _jsr_pc_byte1_emit_rules(S: float, *, write_scale: float | None = None) -> t
             writes.append((f"OUTPUT_LO+{j}", -1.0 * write_scale))
         rules.append(multi_way_and_rule(
             name=f"jsr_pc_byte1_emit_{v}",
-            conditions=base_conditions + ((f"JSR_PC_B1_AT_B0+{v}", 1.0),),
+            # DOMINANT-index discriminator: fire ONLY when the relayed byte-1
+            # nibble v EXCEEDS the index-0 ("no byte-1") cell. The staging is a
+            # SwiGLU gate=FETCH_HI+k, so a small FETCH_HI residue at a non-dominant
+            # nibble (e.g. gcd id900 step-6's JSR-to-idx-3 leaves FETCH_HI+3~1.0
+            # alongside the dominant FETCH_HI+0~40) stages a WEAK JSR_PC_B1+1 that
+            # the bare ``+v >= 0.8`` gate would treat as "byte1=1" and the hard-set
+            # emit would amplify to a spurious PC=282. For a small-target JSR the
+            # TRUE byte-1 is 0, so JSR_PC_B1_AT_B0+0 is the DOMINANT cell (~360 vs
+            # the ~9 leak); subtracting it (weight -1.0) keeps the emit OFF unless
+            # nibble v genuinely dominates (step-0 main-JSR: +1=1228 >> +0=78 ->
+            # still fires). The relay copies JSR_PC_B1 -> JSR_PC_B1_AT_B0 1:1 so
+            # the +0 cell carries the index-0 magnitude faithfully.
+            conditions=base_conditions + (
+                (f"JSR_PC_B1_AT_B0+{v}", 1.0),
+                ("JSR_PC_B1_AT_B0+0", -1.0),
+            ),
             threshold=3.5,  # IS_BYTE(1)+H1(1)+BYTE_INDEX_0(1)+relay(>=~0.8)
             writes=tuple(writes),
         ))
