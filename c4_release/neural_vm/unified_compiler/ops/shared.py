@@ -1553,7 +1553,7 @@ def store_ax_b0_override_enabled() -> bool:
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
+        and os.environ.get("C4_STORE_AX_B0_OVERRIDE", "0") != "0"
     )
 
 
