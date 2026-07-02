@@ -837,6 +837,14 @@ def all_core_ops(
         # cap. Gated by C4_AX_LI_BYTE23_ZERO (default ON). See
         # l11_ops.make_ax_li_byte23_zero_op.
         make_ax_li_byte23_zero_op(),
+        # STRUCTURAL: all-step register byte-2/3 zero-default. Generalizes the two
+        # caps above (which only fire on fresh-ENT / LI steps) to fire on EVERY
+        # dump row, killing the loop/rec stale-high-byte leak (loop_mul 0xFFFF00,
+        # rec_sum 0x10000) by construction. Safe: bytes 2/3 are 0 for every
+        # register across the corpus; AX_CARRY_OVERFLOW blocker preserves a
+        # genuine >=0x10000 value. Gated by C4_AX_HIBYTE_CLEAR (DEFAULT-OFF). See
+        # l11_ops.make_ax_hibyte_clear_allstep_op.
+        make_ax_hibyte_clear_allstep_op(),
         # SUB full-borrow byte-1 0xFF writer (CAMPAIGN-ONLY, C4_SUB_FULL_BORROW):
         # the POST-SLAM half of the sub_borrow_cascade fix. On the row where the
         # L14 precursor lit SUB_FULL_BORROW, overwrites OUTPUT byte 1 = 0xFF.

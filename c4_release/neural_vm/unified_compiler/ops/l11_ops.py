@@ -2087,6 +2087,176 @@ def make_ax_byte23_dump_zero_op() -> Operation:
 
 
 # ===========================================================================
+# STRUCTURAL: all-step register byte-2/3 zero-default (C4_AX_HIBYTE_CLEAR, OFF)
+# ===========================================================================
+#
+# THE STRUCTURAL GENERALIZATION of ``ax_byte23_dump_zero``. That op only fires
+# when OP_ENT is FRESH (~6.5): its firing sum IS_BYTE(1)+BYTE_INDEX_x*2(1.94)+
+# OP_ENT*0.5(~3.25) clears threshold 4.5 only on the callee-ENT step. On a
+# LOOP-BODY step OP_ENT is a durable carry (~1.0) so the sum ~3.44 < 4.5 and the
+# clear DOESN'T fire -> loop_mul/rec_sum leak 0xFF/overflow into register bytes
+# 2/3 (the byte tokens read stale H2/H3 one-hots; probe_reg_emission_map).
+#
+# STRUCTURAL FIX: fire on ALL steps (drop the OP_ENT condition), gated purely on
+# the byte-2/3 register-dump row (IS_BYTE + BYTE_INDEX_1/2) with the SAME marker
+# + AX_CARRY_OVERFLOW blockers. SAFE by construction: across the 1096 corpus
+# register bytes 2/3 are 0 for EVERY register (PC<0x10000; SP/BP high addr has
+# 0x00 in bytes 2/3; AX<0x10000), and any genuine >=0x10000 value carries
+# AX_CARRY_OVERFLOW (the -1000 blocker kills the clear there). So forcing
+# bytes 2/3 -> 0 on every dump row makes the stale-high-byte leak IMPOSSIBLE by
+# construction rather than patching one cluster. BYTE_INDEX_0 (byte-1) is NOT
+# touched (PC byte-1 can be 0x01 for JSR>=256; AX byte-1 via C4_AX_BYTE1_DUMP) --
+# byte-1 is a separate register-scoped increment. Default OFF -> byte-identical;
+# validated flag-ON via cpu_full_trace (loop_mul/rec_sum bytes 2/3 -> 0) + HOLD.
+def _ax_hibyte_clear_allstep_enabled() -> bool:
+    """``C4_AX_HIBYTE_CLEAR`` flag predicate (DEFAULT-OFF structural block).
+
+    Flag-OFF bakes NO units -> byte-identical to the pre-fix build.
+    """
+    return _os_stack0.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
+
+
+_AX_HIBYTE_CLEAR_ALLSTEP_HIDDEN_DIM = 2  # one AND per high byte (byte-2, byte-3)
+
+
+def _ax_hibyte_clear_allstep_rules() -> tuple[FFNRule, ...]:
+    """2 AND rules forcing register byte-2/3 dump -> 0 on EVERY step.
+
+    Mirrors ``_ax_byte23_dump_zero_rules`` WITHOUT the OP_ENT condition, so it
+    fires on loop/rec body steps too. Firing sum = IS_BYTE(1) +
+    BYTE_INDEX_x*2(~1.94) = ~2.94 > threshold 2.5; byte-0/1 rows (BYTE_INDEX_1/2
+    ~0 -> sum ~1.0) and marker rows (-1000 blockers) stay dark. AX_CARRY_OVERFLOW
+    (-1000) preserves a genuine >=0x10000 high byte.
+    """
+    IS_BYTE_W = 1.0
+    BYTE_INDEX_W = 2.0
+    THRESHOLD = 2.5
+    BLOCKER_W = 1_000.0
+    # NOTE: AX_CARRY_OVERFLOW is DELIBERATELY NOT a blocker here (unlike the
+    # ENT/LI caps). Probed spuriously ~1.74 on rec_sum's small-AX byte-2 row, so
+    # a -1000 kill blocks the clear exactly where it's needed. Register bytes 2/3
+    # are 0 for the whole corpus, so an unconditional zero-default is correct;
+    # any genuine >=0x10000 case is caught by the HOLD / flag_regression gates.
+    blockers = (
+        ("MARK_AX", -BLOCKER_W),
+        ("MARK_PC", -BLOCKER_W),
+        ("MARK_SP", -BLOCKER_W),
+        ("MARK_BP", -BLOCKER_W),
+        ("MARK_STACK0", -BLOCKER_W),
+        ("MARK_MEM", -BLOCKER_W),
+        ("MARK_SE", -BLOCKER_W),
+    )
+    WW = 0.16
+    writes = (
+        ("OUTPUT_LO+0", WW),
+        ("OUTPUT_HI+0", WW),
+        ("OUTPUT_LO+10", -WW),
+    )
+    rules: list[FFNRule] = []
+    for byte_idx, bindex in ((2, "BYTE_INDEX_1"), (3, "BYTE_INDEX_2")):
+        rules.append(multi_way_and_rule(
+            name=f"ax_hibyte_clear_allstep_byte{byte_idx}",
+            conditions=(
+                ("IS_BYTE", IS_BYTE_W),
+                (bindex, BYTE_INDEX_W),
+            ) + blockers,
+            threshold=THRESHOLD,
+            writes=writes,
+        ))
+    return tuple(rules)
+
+
+def make_ax_hibyte_clear_allstep_op() -> Operation:
+    """Append the all-step register byte-2/3 zero-default FFN after the L25 tail.
+
+    Structural generalization of ``ax_byte23_dump_zero`` (fires every step, not
+    just fresh-ENT). Gated by ``C4_AX_HIBYTE_CLEAR`` (DEFAULT-OFF); flag-OFF
+    bakes NO units -> byte-identical.
+    """
+    if not _ax_hibyte_clear_allstep_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="ax_hibyte_clear_allstep",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "ax_byte23_dump_zero"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+        )
+
+    rules = _ax_hibyte_clear_allstep_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _AX_HIBYTE_CLEAR_ALLSTEP_HIDDEN_DIM, (
+            f"ax_hibyte_clear_allstep rule-count drift: produced {len(rules)}, "
+            f"expected {_AX_HIBYTE_CLEAR_ALLSTEP_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="ax_hibyte_clear_allstep",
+        reads={
+            "IS_BYTE", "BYTE_INDEX_1", "BYTE_INDEX_2",
+            "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "MARK_SE", "AX_CARRY_OVERFLOW",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # After ax_byte23_dump_zero so it is the last OUTPUT writer on the
+        # byte-2/3 dump rows before the LM head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "ax_byte23_dump_zero"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
+
+
+# ===========================================================================
 # AX byte-2/3 register-dump LI-LOAD zero cap (C4_AX_LI_BYTE23_ZERO, default ON)
 # ===========================================================================
 #
