@@ -241,6 +241,7 @@ building blocks — conservative hold).
 | `C4_STACK0_B0_POPPED` | `0` (off) | campaign | **BORDERLINE (review)** — band + L9 latch head + dump condition; part of the ACTIVE if/bool/expr OUTPUT-band megaroot family. Held pending that multi-part fix. |
 | `C4_SP_POP_MARKER_CMP3_HARDGATE` | `0` (off) | campaign | **BORDERLINE (review)** — verified SP-drift fix, currently net −2 (if_var 13→11) but a staged prerequisite that "should net positive the moment the LI value-load root lands" (#313/#289). |
 | `C4_JSR_PC_BYTE1` | `0` (off) | campaign | **BORDERLINE (review)** — large multi-file feature (bands + relay head + allocator + staging/emit FFN across `model_ops`/`l3_ops`/`all_core_ops`); high blast-radius, conservative hold. |
+| `C4_SP_BYTE2_CARRY` | `0` (off) | any | **CONVERGENT (merge candidate)** — collapses the `sp_pop_carry_rules` byte-2 pop-carry enumeration from `range(256)` (256 FFN units, `tail_sp_pop_carry_byte2_00..ff`) to `range(2)` (`old in {0x00,0x01}`), deleting 254 provably-dead FFN units (model 43071→42817 units). SP stays in `[0x0FE10,0x10000]` corpus-wide so byte-2 is only ever 0x00/0x01 and only `0x00→0x01` fires; the 2 kept rules are byte-for-byte identical to the OFF bank members. Flag-OFF byte-identical to golden `b4d2ab27`; flag-ON golden `716a66c1`. See `_sp_byte2_carry_computed_enabled` in `l10_ops.py`. |
 
 ---
 
