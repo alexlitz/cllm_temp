@@ -962,7 +962,7 @@ def _l10_exit_axcarry_enabled() -> bool:
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import byte_route_rules, multi_way_and_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
@@ -2282,26 +2282,26 @@ def _layer10_alu_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
     hi nibble via ``AX_CARRY_HI[k]`` and ``OUTPUT_HI[k]``.
     """
 
-    rules: list[FFNRule] = []
-    for nibble_label, carry_dim, out_dim in (
-        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
-        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
-    ):
-        for k in range(16):
-            conditions = [("MARK_AX", 1.0)]
-            for op_dim in _L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS:
-                conditions.append((op_dim, -1.0))
-            # DSL v4b: explicit-threshold AND. The gate dim is the
-            # AX_CARRY_*+k one-hot so the rule routes carry[k] -> out[k].
-            rules.append(multi_way_and_rule(
-                name=f"l10_ax_passthrough_{nibble_label}_{k}",
-                conditions=tuple(conditions),
-                threshold=0.5,
-                gate=f"{carry_dim}+{k}",
-                gate_weight=1.0,
-                writes=((f"{out_dim}+{k}", 2.0 / S),),
-            ))
-    return tuple(rules)
+    # Reduction map ⑥: this is the shared cross-layer BYTE-ROUTE primitive
+    # (per-cell gate on ``{carry}+k`` -> write ``{out}+k``); delegate to
+    # ``byte_route_rules``. Byte-identical: band-major then cell-major rule
+    # order, shared ``(MARK_AX, *suppressed-op NOT-terms)`` AND at threshold
+    # 0.5, ``2.0 / S`` route write, legacy ``l10_ax_passthrough_{lo,hi}_{k}``
+    # names via ``name_prefix`` + the "lo"/"hi" band labels.
+    conditions = (("MARK_AX", 1.0),) + tuple(
+        (op_dim, -1.0) for op_dim in _L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS
+    )
+    return byte_route_rules(
+        band_specs=(
+            ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+            ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conditions,
+        threshold=0.5,
+        write_value=2.0,
+        S=S,
+        name_prefix="l10_ax_passthrough",
+    )
 
 
 def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
