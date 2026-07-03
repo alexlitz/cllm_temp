@@ -2989,56 +2989,6 @@ def _set_threshold_attn(attn, thresholds, out_bases, slope, HD, heads=None, BD=N
             attn.W_o[out_bases[i] + m, base + 1 + m] = 1.0
 
 
-def _set_phase_a_ffn(ffn, S, BD):
-    """Step structure FFN: detect marker transitions for 35-token step.
-
-    35-token step: PC(5)+AX(5)+SP(5)+BP(5)+STACK0(5)+MEM(9)+SE(1)
-    Transitions detected via threshold head differences:
-      SE→PC:     SE at d=0, NEXT_PC fires
-      PC→AX:     at d=4 from PC marker (H1_PC - H0_PC pattern)
-      AX→SP:     at d=4 from AX
-      SP→BP:     at d=4 from SP
-      BP→STACK0: at d=4 from BP
-      STACK0→MEM: at d=9 from BP (STACK0 not IS_MARK, so BP is nearest)
-      MEM→SE:    at d=8 from MEM
-
-    Uses 8 threshold heads with distances:
-      H0=3.5, H1=4.5, H2=7.5, H3=8.5, H4=9.5, H5=14.5, H6=19.5, H7=24.5
-    """
-    # Marker indices in MARKS array: PC=0, AX=1, SP=2, BP=3, MEM=4, SE=5, CS=6
-    PC_I, AX_I, SP_I, BP_I, MEM_I, SE_I = 0, 1, 2, 3, 4, 5
-    # Note: STACK0 is NOT IS_MARK and NOT in the MARKS array.
-
-    transitions = [
-        # (up_dim, gate_dim, out_dim)
-        # SE → PC: SE is nearest marker at d<=3.5
-        (BD.H0 + SE_I, None, BD.NEXT_PC),
-        # PC → AX: PC at d<=4.5 (H1) but not d<=3.5 (H0)
-        (BD.H1 + PC_I, BD.H0 + PC_I, BD.NEXT_AX),
-        # AX → SP: AX at d<=4.5 but not d<=3.5
-        (BD.H1 + AX_I, BD.H0 + AX_I, BD.NEXT_SP),
-        # SP → BP: SP at d<=4.5 but not d<=3.5
-        (BD.H1 + SP_I, BD.H0 + SP_I, BD.NEXT_BP),
-        # BP → STACK0: BP at d<=4.5 but not d<=3.5
-        (BD.H1 + BP_I, BD.H0 + BP_I, BD.NEXT_STACK0),
-        # STACK0 → MEM: STACK0 not IS_MARK, so nearest IS_MARK is BP at d=9.
-        # H4(9.5) sees BP, H3(8.5) doesn't → d in (8.5, 9.5] = d=9 only.
-        (BD.H4 + BP_I, BD.H3 + BP_I, BD.NEXT_MEM),
-        # MEM → SE: MEM at d<=8.5 (H3) but not d<=7.5 (H2).
-        # d in (7.5, 8.5] = d=8 only (MEM marker + 4 addr + 4 val = 8 bytes).
-        (BD.H3 + MEM_I, BD.H2 + MEM_I, BD.NEXT_SE),
-    ]
-    for i, (up_dim, gate_dim, out_dim) in enumerate(transitions):
-        ffn.W_up[i, up_dim] = S
-        ffn.b_up[i] = -S * 0.3
-        if gate_dim is not None:
-            ffn.W_gate[i, gate_dim] = -1.0
-            ffn.b_gate[i] = 1.0
-        else:
-            ffn.b_gate[i] = 1.0
-        ffn.W_down[out_dim, i] = 2.0 / S
-
-
 # =============================================================================
 # Backward-compat re-exports for helpers moved to setup_helpers.py
 # =============================================================================
