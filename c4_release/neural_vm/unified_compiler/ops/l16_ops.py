@@ -23,7 +23,7 @@ import os as _os
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import byte_route_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -52,6 +52,17 @@ register_residual_band(
     flag=lambda: _os.environ.get("C4_OUTBAND_DECOUPLE_PROTO", "") == "decouple",
     never_share=True,
 )
+
+
+def _dim_base(category: str, role: str) -> str:
+    """Bare base dim NAME for ``(category, role)`` (no ``+offset`` suffix).
+
+    ``dim_ref(category, role)`` returns ``"NAME+0"``; the per-cell band
+    factories (:func:`byte_route_rules` etc.) rebuild each cell as
+    ``f"{base}+{k}"``, so they need the bare ``NAME``. This strips the
+    ``+0`` while keeping the semantic ``(category, role)`` authoring form.
+    """
+    return dim_ref(category, role).rsplit("+", 1)[0]
 
 
 def _ent_sp_byte1_ismark_blocker_on() -> bool:
@@ -778,22 +789,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         (dim_ref('opcode_flag', 'JMP'), -20.0),
         ("HAS_SE", step0_guard_weight),
     )
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_ax_carry_lo_{k}",
-            conditions=lev_ax_carry_conditions,
-            threshold=1.5 + step0_guard_weight,
-            gate=dim_ref('ax_carry_lo', 'AX', k),
-            writes=((dim_ref('output_lo', 'nibble', k), 2.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_ax_carry_hi_{k}",
-            conditions=lev_ax_carry_conditions,
-            threshold=1.5 + step0_guard_weight,
-            gate=dim_ref('ax_carry_hi', 'AX', k),
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
-        ))
+    # Reduction map ⑥: per-cell BYTE-ROUTE band (gate on AX_CARRY_{LO,HI}+k
+    # -> OUTPUT_{LO,HI}+k); delegate to ``byte_route_rules``. Byte-identical:
+    # band-major then cell-major, ``2.0 / S`` per cell, dim_ref bases resolve
+    # to the same "NAME+k" strings the inline loop produced.
+    rules.extend(byte_route_rules(
+        band_specs=(
+            ("lo", _dim_base('ax_carry_lo', 'AX'), _dim_base('output_lo', 'nibble')),
+            ("hi", _dim_base('ax_carry_hi', 'AX'), "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=lev_ax_carry_conditions,
+        threshold=1.5 + step0_guard_weight,
+        write_value=2.0,
+        S=S,
+        name_prefix="l16_lev_ax_carry",
+    ))
 
     # 2026-06-09 Wave C7 surface #2: AX_FULL → OUTPUT relay on LEV.
     # Per docs/NESTED_ATTRIBUTION_2026_06_09.md, the dim_flow_audit on
@@ -816,22 +826,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # agree (most non-MUL LEVs) the parallel writes add to 4.0/S which
     # is still in the materializer band. The gate uses AX_FULL_LO+k
     # directly (one-hot per nibble) so only the correct nibble fires.
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_ax_full_lo_{k}",
-            conditions=lev_ax_carry_conditions,
-            threshold=1.5 + step0_guard_weight,
-            gate=dim_ref('register_lo', 'AX', k),
-            writes=((dim_ref('output_lo', 'nibble', k), 2.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_ax_full_hi_{k}",
-            conditions=lev_ax_carry_conditions,
-            threshold=1.5 + step0_guard_weight,
-            gate=dim_ref('register_hi', 'AX', k),
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
-        ))
+    # Reduction map ⑥: per-cell BYTE-ROUTE band (gate on AX_FULL_{LO,HI}+k
+    # -> OUTPUT_{LO,HI}+k); delegate to ``byte_route_rules``. Byte-identical.
+    rules.extend(byte_route_rules(
+        band_specs=(
+            ("lo", _dim_base('register_lo', 'AX'), _dim_base('output_lo', 'nibble')),
+            ("hi", _dim_base('register_hi', 'AX'), "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=lev_ax_carry_conditions,
+        threshold=1.5 + step0_guard_weight,
+        write_value=2.0,
+        S=S,
+        name_prefix="l16_lev_ax_full",
+    ))
 
     # Companion preservation: the same triage row sees step6:STACK0_byte0
     # corruption (50-row cluster) because no LEV-aware rule keeps the freed
@@ -1531,22 +1538,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         (dim_ref('opcode_flag', 'EXIT'), -20.0),
         (dim_ref('opcode_flag', 'JMP'), -20.0),
     )
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_stale_imm_ax_carry_lo_{k}",
-            conditions=stale_imm_ax_conditions,
-            threshold=1.5,
-            gate=dim_ref('ax_carry_lo', 'AX', k),
-            writes=((dim_ref('output_lo', 'nibble', k), 2.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_stale_imm_ax_carry_hi_{k}",
-            conditions=stale_imm_ax_conditions,
-            threshold=1.5,
-            gate=dim_ref('ax_carry_hi', 'AX', k),
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
-        ))
+    # Reduction map ⑥: per-cell BYTE-ROUTE band (gate on AX_CARRY_{LO,HI}+k
+    # -> OUTPUT_{LO,HI}+k); delegate to ``byte_route_rules``. Byte-identical.
+    rules.extend(byte_route_rules(
+        band_specs=(
+            ("lo", _dim_base('ax_carry_lo', 'AX'), _dim_base('output_lo', 'nibble')),
+            ("hi", _dim_base('ax_carry_hi', 'AX'), "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=stale_imm_ax_conditions,
+        threshold=1.5,
+        write_value=2.0,
+        S=S,
+        name_prefix="l16_stale_imm_ax_carry",
+    ))
 
     # SI/SC preserve AX while using STACK0 as the memory address source. The
     # store generation later in the same autoregressive step reads the emitted
@@ -1871,22 +1875,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         (dim_ref('opcode_flag', 'ENT'), -2.0),
         (dim_ref('opcode_flag', 'LEV'), -2.0),
     )
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_bp_marker_passthrough_lo_{k}",
-            conditions=bp_marker_passthrough_conditions,
-            threshold=1.5,
-            gate=f"EMBED_LO+{k}",
-            writes=((dim_ref('output_lo', 'nibble', k), 10.0 / S),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_bp_marker_passthrough_hi_{k}",
-            conditions=bp_marker_passthrough_conditions,
-            threshold=1.5,
-            gate=f"EMBED_HI+{k}",
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", 10.0 / S),),
-        ))
+    # Reduction map ⑥: per-cell BYTE-ROUTE band (gate on EMBED_{LO,HI}+k
+    # -> OUTPUT_{LO,HI}+k); delegate to ``byte_route_rules``. Byte-identical.
+    rules.extend(byte_route_rules(
+        band_specs=(
+            ("lo", "EMBED_LO", _dim_base('output_lo', 'nibble')),
+            ("hi", "EMBED_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=bp_marker_passthrough_conditions,
+        threshold=1.5,
+        write_value=10.0,
+        S=S,
+        name_prefix="l16_bp_marker_passthrough",
+    ))
 
     # Once a frame is established at BP=0x0000fff0, ordinary local-frame
     # opcodes must keep BP byte1 at 0xff. The marker passthrough above only
