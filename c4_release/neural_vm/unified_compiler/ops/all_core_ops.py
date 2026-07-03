@@ -422,31 +422,18 @@ def all_core_ops(
         # attempt. See l11_ops.make_layer11_ax_byte1_dump_carry_op and
         # docs/AX_BYTE1_DUMP_CARRY_H1_WRITE_CYCLE_2026_06_13.md.
         make_layer11_ax_byte1_dump_carry_op(enable=True),
-        # STACK0 byte-0 DUMP carry (Root 2 — the if/bool/expr framing drift).
-        # The CARRY HEAD half (mirror of the AX byte-1 carry above): copies the
-        # PREVIOUS step's STACK0-marker ``H1``/``H3`` byte-0 one-hot into the
-        # fresh ``STACK0_B0_H1_PREV``/``STACK0_B0_H3_PREV`` bands (via
-        # ``H1.*.-1``/``H3.*.-1`` SSA cross-step reads -> no same-step
-        # back-edge). The byte-0 emission one-hot is decoded fresh at the PSH
-        # step but ABSENT (then smeared+nuked to ~-289M by the L21/L25
-        # correctors) on the carried comparison step -> a marker wins and the
-        # model emits a spurious extra register block (57-token step) that the
-        # fixed-35 slicer misreads. The carried-vs-fresh gate + LM-head re-supply
-        # live in the partner ``stack0_byte0_dump_repopulate`` FFN +
-        # ``stack0_byte0_dump_head_bake`` below. See
-        # l11_ops.make_stack0_byte0_dump_carry_op.
+        # STACK0 byte-0 cross-step carry HEAD (L9 head 5). KEPT — it is the SOLE
+        # survivor of the former STACK0-b0 register-dump machinery. It copies the
+        # prev step's STACK0-marker ``H1``/``H3`` byte-0 one-hot into the
+        # ``STACK0_B0_H1_PREV``/``STACK0_B0_H3_PREV`` bands, which are read LIVE by
+        # the campaign MUL multi-byte L19 boost as the literal-vs-var_mul frame
+        # discriminator (``efficient_alu_neural._MulCombineStage.var_frame_carry``).
+        # The dump-repopulate FFN, the four bounded flag precursors, the POP
+        # discriminator latch, and the LM-head DUMP columns were DELETED (2026-07)
+        # as provably-dead in the 30-token frame (STACK0 is never emitted -> no
+        # carried STACK0-marker row -> the dump gate never fires). See l11_ops
+        # (deletion note) + docs/STACK0_B0_DUMP_DEAD_MACHINERY_DELETION.
         make_stack0_byte0_dump_carry_op(enable=True),
-        # STACK0 byte-0 POP discriminator (if_gt/if_lt/if_eq/bool_and fix). The
-        # carry above re-supplies the STALE operand byte-0 on EVERY carried
-        # STACK0 row, including the rows AFTER the comparison/branch popped it
-        # (id 350 emits 35 on the post-pop steps instead of the oracle's 0). This
-        # L9 head-8 CAUSAL LATCH fires on a STACK0 row from the consuming cmp/
-        # branch opcode step ONWARD and the L25 dump reads ``STACK0_B0_POPPED``
-        # as a HARD blocker -> it stops re-supplying the popped operand. FLAG-
-        # GATED (``C4_STACK0_B0_POPPED``, default-OFF): off = no band, no op, no
-        # dump condition -> byte-identical. See
-        # l11_ops.make_stack0_byte0_popped_latch_op.
-        make_stack0_byte0_popped_latch_op(),
         # ENT saved-BP store DUMP carry (BP_SAVE_PREV — the func/nested/rec/var
         # LI-from-frame 37-token desync). The CARRY HEAD half (mirror of the AX
         # byte-1 / STACK0 byte-0 carries above): the callee's saved-BP store (the
@@ -847,52 +834,13 @@ def all_core_ops(
         # flag is off (golden 7f6f2e5d byte-identical). See
         # l14_ops.make_sili_b1_restore_op (+ the CAPTURE half above).
         make_sili_b1_restore_op(),
-        # STACK0 byte-0 carried-step flag precursor (Root 2): writes the BOUNDED
-        # ``STACK0_B0_CARRIED`` gate flag at an EARLY block (L7 anchor) where the
-        # same-step H3 byte-0 one-hot is still bounded (fresh ~3.3 present,
-        # carried ~0 absent) -- BEFORE the L25 corruptor nukes H1/H3 to ~-289M.
-        # The flag persists to the L25 tail where the dump FFN gates on it (a
-        # raw H1/H3 read there would drive the dump's silu gate to ~+10^9). See
-        # l11_ops.make_stack0_byte0_carried_flag_op.
-        make_stack0_byte0_carried_flag_op(),
-        # STACK0 byte-0 PREV-sharpness flag precursor (Root 2 re-point gate):
-        # writes the BOUNDED ``STACK0_B0_SHARP`` flag on the L25 tail, reading the
-        # PREV band the carry head populated. SHARP=1 only when PREV is a CLEAN
-        # single-slot one-hot (the framing-drift case) and 0 on a SMEAR (a
-        # multi-byte arithmetic result). The dump's DIRECT H1/H3 re-point ANDs
-        # this flag so it fires ONLY on the genuinely-corrupted rows and stays a
-        # no-op on healthy emissions. See l11_ops.make_stack0_byte0_sharp_flag_op.
-        make_stack0_byte0_sharp_flag_op(),
-        # STACK0 byte-0 RATIO-based PREV-dominant flag precursor (Root 2 smear
-        # gate): writes ``STACK0_B0_PREV_DOM`` = 1 when ONE PREV slot dominates (a
-        # clean carried one-hot of ANY magnitude). Unlike SHARP (absolute per-slot
-        # margin -> misses a small clean one-hot like the comparison-result byte
-        # 0x01) this RATIO test is magnitude-independent, so the NON-COMPARISON
-        # blocker's smear rule darkens the add_16bit smear WITHOUT darkening small
-        # comparison results. See l11_ops.make_stack0_byte0_prev_dom_flag_op.
-        make_stack0_byte0_prev_dom_flag_op(),
-        # STACK0 byte-0 NON-COMPARISON blocker precursor (Root 2 DEFAULT-ON gate):
-        # writes the BOUNDED ``STACK0_B0_NOT_CMP`` flag on the L25 tail. NOT_CMP = 1
-        # on an arithmetic-result / JMP STACK0 row (rule 1: per-step arith/JMP
-        # opcode) OR a SMEARED-PREV row (rule 2: the add_16bit over-fire), and 0 on
-        # the genuine comparison drift rows. Reads the WIDENED-layout opcode bands
-        # (the static registry mismaps them — the same dim-map error Root 3
-        # corrected). The dump's re-point reads this flag as a -1000 BLOCKER so it
-        # darkens the add_16bit + jmp_forward over-fire while leaving the if/bool/
-        # expr drift rows firing -> the carry ships DEFAULT-ON. See
-        # l11_ops.make_stack0_byte0_not_cmp_flag_op.
-        make_stack0_byte0_not_cmp_flag_op(),
-        # STACK0 byte-0 DUMP repopulate FFN (Root 2): the carried-vs-fresh GATE
-        # half. On carried STACK0-marker rows (gated on the bounded
-        # ``STACK0_B0_CARRIED`` flag AND, for the re-point path, ``STACK0_B0_SHARP``)
-        # it re-supplies the prev-step byte-0 one-hot from ``STACK0_B0_{H1,H3}_PREV``
-        # (filled by ``stack0_byte0_dump_carry``). Flag OFF: into the inert
-        # ``STACK0_B0_DUMP_{H1,H3}`` bands (byte-identical). Flag ON: DIRECTLY into
-        # the byte's own ``H1``/``H3`` LM-head emission cells (the re-point fix --
-        # reaches the byte token THROUGH the block-38 corruption it runs after).
-        # Standalone PureFFN post_op on the L25 tail block after tail_bit32. See
-        # l11_ops.make_stack0_byte0_dump_repopulate_op.
-        make_stack0_byte0_dump_repopulate_op(),
+        # STACK0 byte-0 DUMP gate precursors + repopulate FFN (Root 2 —
+        # carried / sharp / prev_dom / not_cmp flags + the L25 re-point dump) —
+        # DELETED (2026-07). PROVABLY DEAD in the default 30-token frame: STACK0
+        # is never emitted, so no carried STACK0-marker row exists, the dump gate
+        # never fires, and neither the flag bands nor the re-point ever touch a
+        # decoded token. Removed as verdict-neutral geometry weight. See l11_ops
+        # (deletion note) + docs/STACK0_B0_DUMP_DEAD_MACHINERY_DELETION.
         # ENT saved-BP store DUMP repopulate FFN: the OP_ENT gate + OUTPUT
         # re-supply half. On the ENT-store val-byte predictor rows (gated on the
         # high OP_ENT broadcast ~10.7 + the MEM_VAL_B markers, so SI/SC/PSH/JSR
@@ -1098,13 +1046,12 @@ def all_core_ops(
         # L25-tail block FFN; gated by C4_AX_BYTE1_HINIB (flag-off => zero rules
         # => byte-identical). See model_ops.make_ax_byte1_hinib_fill_op.
         make_ax_byte1_hinib_fill_op(),
-        # STACK0 byte-0 DUMP emission columns (Root 2): mirrors the byte-value
-        # H1/H3 one-hot columns onto STACK0_B0_DUMP_{H1,H3} so the LM head
-        # re-emits the carried STACK0 byte-0 on carried steps. Phase=1002
-        # (additive, AFTER head_bake). Byte-identical on fresh steps (DUMP bands
-        # == 0). Gated by C4_STACK0_B0_DUMP (default-on). See
-        # model_ops.make_stack0_byte0_dump_head_bake_op.
-        make_stack0_byte0_dump_head_bake_op(),
+        # STACK0 byte-0 DUMP emission columns (Root 2 LM-head bake) — DELETED
+        # (2026-07). PROVABLY DEAD in the default 30-token frame: the DUMP bands
+        # are only populated on carried STACK0-marker rows, which never exist
+        # because STACK0 is never emitted, so these additive LM-head columns
+        # never contribute to a decoded token. Removed with the rest of the
+        # STACK0-b0 dump machinery. See docs/STACK0_B0_DUMP_DEAD_MACHINERY_DELETION.
         make_embedding_bake_op(),
         # Initial-PC bake: writes the PC_OFFSET pattern into the REG_PC
         # token-embedding row (replaces the runtime `_inject_initial_pc`).

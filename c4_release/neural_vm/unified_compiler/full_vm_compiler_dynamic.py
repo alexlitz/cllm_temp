@@ -1562,24 +1562,20 @@ CROSS_STEP_DOCUMENTED_SAFE: Dict[Tuple[str, str], str] = {
         "band (read by nobody upstream). See ops/l11_ops.py "
         "make_layer11_ax_byte1_dump_carry_op.",
     ('stack0_byte0_dump_carry', 'H1.*.-1'):
-        "STACK0 byte-0 cross-step emission carry (Root 2). The carry head's "
-        "purpose is to read the PREVIOUS VM step's STACK0-marker ``H1`` (high "
-        "nibble) one-hot (decoded fresh at L6 on the PSH/producing step, held "
-        "through the tail via the KV cache) and copy it forward into "
-        "``STACK0_B0_H1_PREV`` so the carried-step byte-0 dump can re-emit it. "
-        "The clean one-hot is ABSENT on the carried comparison step (L6 does "
-        "not re-decode it) and is then smeared+nuked to ~-289M by the L21/L25 "
-        "correctors, so the same-step dim is exactly the value we must NOT "
-        "read. The ``.*.-1`` SSA alias resolves to the prior step's value via "
-        "the KV cache. The head WRITES the distinct band ``STACK0_B0_H1_PREV`` "
-        "(read by nobody upstream) -> no back-edge. See "
-        "ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
+        "STACK0 byte-0 cross-step carry (the SOLE survivor of the deleted Root 2 "
+        "register-dump machinery). The carry head reads the PREVIOUS VM step's "
+        "STACK0-marker ``H1`` (high nibble) one-hot and copies it forward into "
+        "``STACK0_B0_H1_PREV``. The ``.*.-1`` SSA alias resolves to the prior "
+        "step's value via the KV cache; the head WRITES the distinct band "
+        "``STACK0_B0_H1_PREV`` (read by nobody upstream) -> no back-edge. Kept "
+        "because ``STACK0_B0_H1_PREV`` + ``STACK0_B0_H3_PREV`` are read LIVE by "
+        "the campaign MUL multi-byte L19 boost as the literal-vs-var_mul "
+        "discriminator. See ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
     ('stack0_byte0_dump_carry', 'H3.*.-1'):
-        "STACK0 byte-0 cross-step emission carry (Root 2): the LOW-nibble "
-        "partner of the ``H1.*.-1`` read above. Copies the prev step's "
-        "STACK0-marker ``H3`` (low nibble) one-hot into ``STACK0_B0_H3_PREV``. "
-        "Same rationale: the clean low-nibble one-hot is absent/corrupted on "
-        "the carried step. See ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
+        "STACK0 byte-0 cross-step carry: the LOW-nibble partner of the "
+        "``H1.*.-1`` read above. Copies the prev step's STACK0-marker ``H3`` "
+        "(low nibble) one-hot into ``STACK0_B0_H3_PREV``. Same rationale. See "
+        "ops/l11_ops.py make_stack0_byte0_dump_carry_op.",
     ('bp_save_prev_carry', 'CLEAN_EMBED_LO.*.-1'):
         "ENT saved-BP store cross-step carry (BP_SAVE_PREV — the func/nested/"
         "rec/var LI-from-frame 37-token desync). The carry head reads the "
@@ -2186,13 +2182,10 @@ def compile_full_vm_dynamic(
             "C4_AX_BYTE1_SIGNEXT_LEA": (
                 os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
             ),
-            # STACK0 byte-0 register-dump emission flag (Root 2; DEFAULT-ON, opt
-            # out with =0): toggles the LM-head ``STACK0_B0_DUMP_{H1,H3}``
-            # columns (output-affecting, no source change), so the ON and OFF
-            # builds must NEVER share a memo / disk entry.
-            "C4_STACK0_B0_DUMP": (
-                os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
-            ),
+            # (C4_STACK0_B0_DUMP removed 2026-07: the STACK0-b0 dump machinery it
+            # gated was deleted as provably-dead in the 30-token frame, so the
+            # flag no longer affects the build and is no longer part of the memo /
+            # disk cache key.)
             # Consumer-opcode LOOKAHEAD (#221; DEFAULT-ON, opt out =0): adds the
             # PC+8 chain + lookahead fetch head + arith-decode flag + AX->STACK0
             # relay + prior-arith latch + dump-block flag bands AND the dump's
@@ -2986,12 +2979,9 @@ def _bake_from_scheduled_ops(
         "C4_AX_BYTE1_SIGNEXT_LEA": (
             os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
         ),
-        # STACK0 byte-0 register-dump emission flag (Root 2; DEFAULT-ON, opt out
-        # with =0, output-affecting, no source change): the ON / OFF builds must
-        # never share a serialised entry.
-        "C4_STACK0_B0_DUMP": (
-            os.environ.get("C4_STACK0_B0_DUMP", "1") != "0"
-        ),
+        # (C4_STACK0_B0_DUMP removed 2026-07: the STACK0-b0 dump machinery it
+        # gated was deleted as provably-dead in the 30-token frame, so the flag
+        # no longer affects the build and is no longer part of the cache key.)
         # Declarative L8 ADD/SUB wrap flag (DEFAULT-OFF; opt in with =1,
         # swaps the imperative AddSub5StageBlock for the DeclarativeAddSubBlock
         # composite, output-affecting, no source change): the ON / OFF builds
