@@ -7957,35 +7957,6 @@ def _set_layer16_lev_routing(ffn, S, BD):
     # We'll handle increment in L8 FFN.
 
 
-def _set_format_position_counter(ffn, S, BD):
-    """L8 FFN addition: Increment format string position counter.
-
-    When LAST_WAS_BYTE AND IO_IN_OUTPUT_MODE (just emitted output byte):
-    - Increment IO_FORMAT_POS by 1
-    - Uses nibble arithmetic (same pattern as PC increment)
-
-    IO_FORMAT_POS starts at 0 and increments after each byte emission.
-    For now, we only support single-nibble positions (0-15), which is
-    enough for format strings up to 15 bytes.
-
-    Starts at unit 600 to avoid conflicts with existing L8 FFN logic.
-    """
-    unit = 600
-
-    # Detect: just emitted a byte (LAST_WAS_BYTE AND IO_IN_OUTPUT_MODE)
-    # Increment IO_FORMAT_POS lo nibble by 1
-    # Pattern: rotate nibble by +1 (k → (k+1)%16)
-    for k in range(16):
-        next_k = (k + 1) % 16
-        ffn.W_up[unit, BD.LAST_WAS_BYTE] = S
-        ffn.W_up[unit, BD.IO_IN_OUTPUT_MODE] = S
-        ffn.b_up[unit] = -S * 1.5  # need both active
-        ffn.W_gate[unit, BD.IO_FORMAT_POS + k] = 1.0  # current position = k
-        ffn.W_down[BD.IO_FORMAT_POS + k, unit] = -2.0 / S  # clear old
-        ffn.W_down[BD.IO_FORMAT_POS + next_k, unit] = 2.0 / S  # set new
-        unit += 1
-
-
 def _set_format_string_fetch_head(attn, S, BD, HD):
     """L9 attention head: Fetch byte from format string at FORMAT_PTR + FORMAT_POS.
 
