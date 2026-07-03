@@ -34,7 +34,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT.parent))
     sys.path.insert(0, str(ROOT))
 
-from neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from neural_vm.verification.decl_verifier import (  # noqa: E402
     _build_layout_only,
     _KNOWN_C4_OPCODES,
 )

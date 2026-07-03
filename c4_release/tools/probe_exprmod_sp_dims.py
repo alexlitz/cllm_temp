@@ -28,7 +28,7 @@ if _PKG not in sys.path:
 os.environ.setdefault("C4_SMOKE_SPEC_K", "0")
 os.environ.setdefault("C4_TEST_SPEC_K", "0")
 
-from neural_vm.unified_compiler.faithful_autoregressive import (  # noqa: E402
+from neural_vm.verification.faithful_autoregressive import (  # noqa: E402
     FaithfulAutoregressiveRunner,
 )
 from neural_vm.batched_pure_neural import Token  # noqa: E402

@@ -3,7 +3,7 @@
 
 THIS is the tool a lane MUST use to self-check a framing / full_trace fix on
 CPU. It runs the byte-identical CPU *autoregressive* decode
-(:class:`neural_vm.unified_compiler.faithful_autoregressive.FaithfulAutoregressiveRunner`)
+(:class:`neural_vm.verification.faithful_autoregressive.FaithfulAutoregressiveRunner`)
 and reports the SAME per-program pass/fail verdict as
 ``tools/run_1096_canonical.py --criterion full_trace`` — but on CPU, in ~85s
 per ~10-step program, with NO GPU.
@@ -242,7 +242,7 @@ def _get_worker_runner():
             torch.set_num_threads(1)
         except Exception:  # noqa: BLE001
             pass
-        from neural_vm.unified_compiler.faithful_autoregressive import (
+        from neural_vm.verification.faithful_autoregressive import (
             FaithfulAutoregressiveRunner,
         )
 
@@ -301,7 +301,7 @@ def _run_serial(
     ``(results, n_forwards, wall_seconds)``."""
     print("[cpu-full-trace] building CPU faithful autoregressive runner "
           "(cold model bake)...", file=sys.stderr, flush=True)
-    from neural_vm.unified_compiler.faithful_autoregressive import (
+    from neural_vm.verification.faithful_autoregressive import (
         FaithfulAutoregressiveRunner,
     )
 
@@ -357,7 +357,7 @@ def _run_parallel(
           file=sys.stderr, flush=True)
     t_warm = time.monotonic()
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    from neural_vm.unified_compiler.faithful_autoregressive import build_cpu_model
+    from neural_vm.verification.faithful_autoregressive import build_cpu_model
 
     build_cpu_model(disk_cache=True)  # populates the disk cache; result dropped
     print(f"[cpu-full-trace] cache warm in {time.monotonic() - t_warm:.1f}s.",

@@ -2,7 +2,7 @@
 import pytest
 from neural_vm.dim_registry import DimRegistry
 from neural_vm.unified_compiler.ir import FFNRule, FFNOp
-from neural_vm.unified_compiler.decl_verifier import verify_rule_strength
+from neural_vm.verification.decl_verifier import verify_rule_strength
 
 
 class _FakeOp:

@@ -16,7 +16,7 @@ os.environ["C4_SMOKE_SPEC_K"] = "0"; os.environ["C4_TEST_SPEC_K"] = "0"
 _HERE = os.path.dirname(os.path.abspath(__file__)); _PKG = os.path.dirname(_HERE)
 if _PKG not in sys.path: sys.path.insert(0, _PKG)
 import contextlib, io, torch  # noqa
-from neural_vm.unified_compiler.faithful_autoregressive import build_cpu_model  # noqa
+from neural_vm.verification.faithful_autoregressive import build_cpu_model  # noqa
 from neural_vm.batched_pure_neural import Token  # noqa
 from tests.test_suite_1000 import generate_test_programs  # noqa
 from src.compiler import compile_c  # noqa

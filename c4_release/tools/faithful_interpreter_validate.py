@@ -67,7 +67,7 @@ warnings.filterwarnings("ignore")
 
 import torch  # noqa: E402
 
-from neural_vm.unified_compiler.faithful_interpreter import (  # noqa: E402
+from neural_vm.verification.faithful_interpreter import (  # noqa: E402
     FaithfulInterpreter, OpTrace, STEP_TOKENS,
 )
 from neural_vm.speculative import DraftVM  # noqa: E402
@@ -586,7 +586,7 @@ def attribution_demo(model, layout, bytecode, data, expected_exit: int,
     ax_marker_pos = (n_steps - 1) * STEP_TOKENS + POS_AX_MARKER
     resid_pre_head = _faithful_residual_pre_head(model, tape)[ax_marker_pos]
 
-    from neural_vm.unified_compiler.faithful_interpreter import FaithfulInterpreter
+    from neural_vm.verification.faithful_interpreter import FaithfulInterpreter
     interp = FaithfulInterpreter(
         dim_positions=dim_positions, ops_per_block=[],
         d_model=model.d_model, num_heads=model.blocks[0].attn.num_heads,
@@ -610,7 +610,7 @@ def attribution_demo(model, layout, bytecode, data, expected_exit: int,
     print()
 
 
-from neural_vm.unified_compiler.faithful_interpreter import POS_AX_MARKER  # noqa: E402
+from neural_vm.verification.faithful_interpreter import POS_AX_MARKER  # noqa: E402
 
 
 @torch.no_grad()

@@ -157,7 +157,7 @@ def static_claims_report():
     at session scope keeps the audit's wall-clock cost flat regardless
     of how many per-layer modules are added.
     """
-    from neural_vm.unified_compiler.decl_verifier import verify_claims_static
+    from neural_vm.verification.decl_verifier import verify_claims_static
     return verify_claims_static()
 
 

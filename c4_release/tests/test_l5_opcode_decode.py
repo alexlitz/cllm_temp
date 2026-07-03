@@ -111,7 +111,7 @@ def l5_opcode_decode_ffn():
     """
     import torch
 
-    from neural_vm.unified_compiler.decl_verifier import _build_layout_only
+    from neural_vm.verification.decl_verifier import _build_layout_only
     from neural_vm.unified_compiler.ops.l5_ops import make_opcode_decode_ffn_op
     from neural_vm.vm_step import AutoregressiveVM
 

@@ -286,7 +286,7 @@ def _check_claims_static(
     n_heads: int,
 ) -> CheckResult:
     """Mode A: ``verify_claims_static``."""
-    from neural_vm.unified_compiler.decl_verifier import verify_claims_static
+    from neural_vm.verification.decl_verifier import verify_claims_static
 
     report = verify_claims_static(
         alu_mode=alu_mode,
@@ -321,7 +321,7 @@ def _check_produces_consumes_dynamic(
     *, alu_mode: str, enable_conversational_io: bool, n_heads: int,
 ) -> CheckResult:
     """Mode B: ``verify_produces_consumes_dynamic``."""
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         verify_produces_consumes_dynamic,
     )
 
@@ -349,7 +349,7 @@ def _check_produces_consumes_dynamic(
 
 
 def _check_alibi_consistency(model, layout) -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import verify_alibi_consistency
+    from neural_vm.verification.decl_verifier import verify_alibi_consistency
 
     report = verify_alibi_consistency(model=model, layout=layout)
     findings = len(report.entries)
@@ -382,7 +382,7 @@ def _check_alibi_consistency(model, layout) -> CheckResult:
 
 
 def _check_postconditions(model, layout) -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import verify_postconditions
+    from neural_vm.verification.decl_verifier import verify_postconditions
 
     report = verify_postconditions(model=model, layout=layout)
     findings = len(report.drift)
@@ -410,7 +410,7 @@ def _check_postconditions(model, layout) -> CheckResult:
 
 
 def _check_step_idx_gating(model, layout) -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import verify_step_idx_gating
+    from neural_vm.verification.decl_verifier import verify_step_idx_gating
 
     report = verify_step_idx_gating(model=model, layout=layout)
     findings = len(report.drift)
@@ -439,7 +439,7 @@ def _check_step_idx_gating(model, layout) -> CheckResult:
 
 
 def _check_produces_consumes_multistep(model, layout) -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         verify_produces_consumes_multistep,
     )
 
@@ -463,7 +463,7 @@ def _check_produces_consumes_multistep(model, layout) -> CheckResult:
 
 
 def _check_smoke_coverage() -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import audit_smoke_coverage
+    from neural_vm.verification.decl_verifier import audit_smoke_coverage
 
     report = audit_smoke_coverage()
     findings = len(report.untested_ops)
@@ -482,7 +482,7 @@ def _check_smoke_coverage() -> CheckResult:
 
 
 def _check_spec_coverage() -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import audit_spec_coverage
+    from neural_vm.verification.decl_verifier import audit_spec_coverage
 
     report = audit_spec_coverage()
     findings = len(report.undocumented_ops)
@@ -503,7 +503,7 @@ def _check_spec_coverage() -> CheckResult:
 
 
 def _check_compaction_safety() -> CheckResult:
-    from neural_vm.unified_compiler.decl_verifier import verify_compaction_safety
+    from neural_vm.verification.decl_verifier import verify_compaction_safety
 
     report = verify_compaction_safety()
     findings = len(report.mismatches)

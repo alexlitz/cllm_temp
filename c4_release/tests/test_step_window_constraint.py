@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from neural_vm.verification.decl_verifier import (  # noqa: E402
     StepWindowConstraintIssue,
     StepWindowConstraintReport,
     verify_step_window_constraint,

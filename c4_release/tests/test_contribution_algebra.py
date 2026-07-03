@@ -1,7 +1,7 @@
 """S-2: tests for contribution_algebra."""
 import pytest
 from neural_vm.unified_compiler.ir import FFNRule
-from neural_vm.unified_compiler.contribution_algebra import (
+from neural_vm.verification.contribution_algebra import (
     max_contribution,
     signed_contribution_bound,
     write_dims,

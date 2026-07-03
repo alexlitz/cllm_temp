@@ -1339,7 +1339,7 @@ def test_layer16_jsr_mem_addr0_materializes_e0_when_l14_evidence_wins():
 @pytest.mark.lowering
 def test_layer16_jsr_mem_addr0_teacher_forced_f8_and_e0_paths():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         build_teacher_forced_symbolic_trace,
         verify_teacher_forced_token_support,
     )
@@ -1385,7 +1385,7 @@ def test_layer16_jsr_mem_addr0_teacher_forced_f8_and_e0_paths():
 @pytest.mark.lowering
 def test_layer16_id250_mem_addr0_paths_survive_final_tail():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         build_teacher_forced_symbolic_trace,
         verify_teacher_forced_token_support,
     )
@@ -1416,7 +1416,7 @@ def test_layer16_id250_mem_addr0_paths_survive_final_tail():
 @pytest.mark.lowering
 def test_layer16_ent_mem_addr0_teacher_forced_f0_path():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         build_teacher_forced_symbolic_trace,
         verify_teacher_forced_token_support,
     )

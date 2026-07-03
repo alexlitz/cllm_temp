@@ -23,8 +23,8 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from neural_vm.dim_registry import DimRegistry
-from neural_vm.unified_compiler.contribution_algebra import max_contribution
-from neural_vm.unified_compiler.effective_predicate import effective_predicate
+from neural_vm.verification.contribution_algebra import max_contribution
+from neural_vm.verification.effective_predicate import effective_predicate
 from neural_vm.unified_compiler.ir import FFNOp, FFNRule
 from neural_vm.unified_compiler.predicates import Predicate
 

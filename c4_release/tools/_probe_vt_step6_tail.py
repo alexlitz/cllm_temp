@@ -19,7 +19,7 @@ if _ROOT not in sys.path:
 import torch  # noqa: E402
 from src.compiler import compile_c  # noqa: E402
 from neural_vm.batched_pure_neural import Token  # noqa: E402
-from neural_vm.unified_compiler.faithful_autoregressive import (  # noqa: E402
+from neural_vm.verification.faithful_autoregressive import (  # noqa: E402
     build_cpu_model, FaithfulAutoregressiveRunner,
 )
 

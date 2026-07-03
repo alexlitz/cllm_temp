@@ -80,7 +80,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 
-from .ir import CompilerIR
+from ..unified_compiler.ir import CompilerIR
 from .symbolic_forward import _OPCODE_NAMES, decode_instr  # noqa: F401
 
 
@@ -559,7 +559,7 @@ def _recover_attn_head_specs(attn, d_model: int) -> list:
     Recovers the exact head-spec the block was baked from, so the faithful
     pure-IR attention math over these specs reproduces the block exactly.
     """
-    from .primitives import (
+    from ..unified_compiler.primitives import (
         DeclarativeAttentionHeadSpec,
         AttentionProjectionWrite,
         AttentionOutputWrite,
@@ -908,7 +908,7 @@ class IRBlockForward:
     """
 
     def __init__(self, model, *, use_softmax1: Optional[bool] = None):
-        from .ir import CompilerIR  # local import to avoid an import cycle
+        from ..unified_compiler.ir import CompilerIR  # local import to avoid an import cycle
 
         self.model = model
         self.d_model = int(model.d_model)

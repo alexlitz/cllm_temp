@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neural_vm.constants import IMMEDIATE_SIZE, PADDING_SIZE
 from neural_vm.embedding import Opcode
 from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
-from neural_vm.unified_compiler.symbolic_program import (
+from neural_vm.verification.symbolic_program import (
     SymbolicDeclarativeProgramRunner,
 )
 from neural_vm.vm_step import Token, _SetDim

@@ -38,7 +38,7 @@ from c4_release.neural_vm.setup_helpers import (
     _set_layer11_mul_partial,
     _set_layer12_mul_combine,
 )
-from c4_release.neural_vm.unified_compiler.decl_verifier import (
+from c4_release.neural_vm.verification.decl_verifier import (
     verify_claims_static,
     verify_produces_consumes_dynamic,
 )

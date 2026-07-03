@@ -28,7 +28,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from neural_vm.dim_registry import build_default_registry  # noqa: E402
-from neural_vm.unified_compiler.attention_verifier import (  # noqa: E402
+from neural_vm.verification.attention_verifier import (  # noqa: E402
     verify_attention_head,
 )
 from neural_vm.unified_compiler.ops.all_core_ops import all_core_ops  # noqa: E402

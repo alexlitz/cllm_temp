@@ -32,7 +32,7 @@ from tools.faithful_interpreter_validate import (
     _attn_block_to_specs, _faithful_attn_forward, _faithful_ffn_forward,
     _COMPOSITE_FFN,
 )
-from neural_vm.unified_compiler.faithful_interpreter import FaithfulInterpreter
+from neural_vm.verification.faithful_interpreter import FaithfulInterpreter
 
 
 def main(idx, ent_step, crush_block, marker_off=15, byte_k=1):

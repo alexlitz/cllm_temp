@@ -29,7 +29,7 @@ from neural_vm.batched_pure_neural import Token  # noqa: E402
 from neural_vm.embedding import E, Opcode  # noqa: E402
 from tests.test_suite_1000 import generate_test_programs  # noqa: E402
 from src.compiler import compile_c  # noqa: E402
-from neural_vm.unified_compiler.symbolic_program import (  # noqa: E402
+from neural_vm.verification.symbolic_program import (  # noqa: E402
     SymbolicDeclarativeProgramRunner,
 )
 

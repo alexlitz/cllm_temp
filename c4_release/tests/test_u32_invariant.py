@@ -33,7 +33,7 @@ sys.path.insert(
 )
 
 
-from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from c4_release.neural_vm.verification.decl_verifier import (  # noqa: E402
     _u32_scan_dim_registry,
     _u32_scan_fp64_in_source,
     _u32_scan_model_params,
@@ -227,7 +227,7 @@ class TestOversizeLane:
         (fake_root / "neural_vm" / "dim_registry.py").write_text(
             synthetic, encoding="utf-8",
         )
-        from c4_release.neural_vm.unified_compiler import decl_verifier
+        from c4_release.neural_vm.verification import decl_verifier
         monkeypatch.setattr(
             decl_verifier, "_u32_repo_root", lambda: str(fake_root),
         )
@@ -252,7 +252,7 @@ class TestOversizeLane:
         (fake_root / "neural_vm" / "dim_registry.py").write_text(
             synthetic, encoding="utf-8",
         )
-        from c4_release.neural_vm.unified_compiler import decl_verifier
+        from c4_release.neural_vm.verification import decl_verifier
         monkeypatch.setattr(
             decl_verifier, "_u32_repo_root", lambda: str(fake_root),
         )
@@ -276,7 +276,7 @@ class TestOversizeLane:
         (fake_root / "neural_vm" / "dim_registry.py").write_text(
             synthetic, encoding="utf-8",
         )
-        from c4_release.neural_vm.unified_compiler import decl_verifier
+        from c4_release.neural_vm.verification import decl_verifier
         monkeypatch.setattr(
             decl_verifier, "_u32_repo_root", lambda: str(fake_root),
         )
@@ -329,7 +329,7 @@ class TestWidening:
         for sub in ("alu", "alu/ops", "unified_compiler"):
             init = fake_root / "neural_vm" / sub / "__init__.py"
             init.write_text("", encoding="utf-8")
-        from c4_release.neural_vm.unified_compiler import decl_verifier
+        from c4_release.neural_vm.verification import decl_verifier
         monkeypatch.setattr(
             decl_verifier, "_u32_repo_root", lambda: str(fake_root),
         )
@@ -348,7 +348,7 @@ class TestWidening:
         (fake_root / "neural_vm" / "alu" / "ops" / "cast.py").write_text(
             bad, encoding="utf-8",
         )
-        from c4_release.neural_vm.unified_compiler import decl_verifier
+        from c4_release.neural_vm.verification import decl_verifier
         monkeypatch.setattr(
             decl_verifier, "_u32_repo_root", lambda: str(fake_root),
         )

@@ -90,7 +90,7 @@ def main():
 
     print(f"L15={L15} seq={seq} pl={pl} STEP={STEP}")
     print("step | pc(before) | instr | MEM_STORE | addr(b0..3) | val(b0..3) | MEM_VAL_B")
-    from neural_vm.unified_compiler.symbolic_forward import decode_instr, _OPCODE_NAMES
+    from neural_vm.verification.symbolic_forward import decode_instr, _OPCODE_NAMES
     for si in range(len(steps)):
         base = pl + si * STEP
         # find MEM marker row in this step window

@@ -2,7 +2,7 @@
 
 import torch
 
-from neural_vm.unified_compiler.band_contracts import (
+from neural_vm.verification.band_contracts import (
     ACTIVE_MARGIN_LOW,
     AMBIGUOUS_WINNER,
     INACTIVE_TOO_HIGH,

@@ -339,7 +339,7 @@ def _build_symbolic_expected_execution(
     bytecode: Sequence[int],
     data: Sequence[int] | bytes,
 ) -> SymbolicExpectedExecution:
-    from neural_vm.unified_compiler.symbolic_program import (
+    from neural_vm.verification.symbolic_program import (
         SymbolicDeclarativeProgramRunner,
     )
 
@@ -533,7 +533,7 @@ def _band_contract_report_for_token(
     if not 0 <= token < 256:
         return None
 
-    from neural_vm.unified_compiler.band_contracts import (
+    from neural_vm.verification.band_contracts import (
         verify_declared_output_nibble_bands,
     )
 

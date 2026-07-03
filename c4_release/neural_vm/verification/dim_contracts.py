@@ -56,7 +56,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
-from .layer_compiler import ModelLayout, Operation
+from ..unified_compiler.layer_compiler import ModelLayout, Operation
 
 
 # ---------------------------------------------------------------------------

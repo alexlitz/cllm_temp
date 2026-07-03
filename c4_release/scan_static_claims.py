@@ -12,7 +12,7 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print(f"[t={time.time():.1f}] start", flush=True)
 
-from neural_vm.unified_compiler.decl_verifier import verify_claims_static
+from neural_vm.verification.decl_verifier import verify_claims_static
 print(f"[t={time.time():.1f}] import done; calling verify_claims_static()", flush=True)
 
 t0 = time.time()

@@ -326,8 +326,8 @@ def build_layout_bundle(
     and assemble the writer index over them.
     """
     from neural_vm.dim_registry import DimRegistry
-    from neural_vm.unified_compiler.decl_verifier import _build_layout_only
-    from neural_vm.unified_compiler.writer_index import (
+    from neural_vm.verification.decl_verifier import _build_layout_only
+    from neural_vm.verification.writer_index import (
         _collect_ffn_rules_from_op,
         build_writer_index,
     )

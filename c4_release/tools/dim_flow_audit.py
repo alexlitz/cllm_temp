@@ -47,7 +47,7 @@ if _PKG not in sys.path:
 
 
 def _build_layout(args):
-    from neural_vm.unified_compiler.decl_verifier import _build_layout_only
+    from neural_vm.verification.decl_verifier import _build_layout_only
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -114,7 +114,7 @@ def main(argv=None) -> int:
 
     layout = _build_layout(args)
 
-    from neural_vm.unified_compiler.dim_flow import (
+    from neural_vm.verification.dim_flow import (
         enumerate_dim_readers,
         enumerate_dim_writers,
         find_zeroing_writers,

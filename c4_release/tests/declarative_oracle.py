@@ -42,7 +42,7 @@ def declarative_oracle_for_program(
     """
 
     if runner is None:
-        from neural_vm.unified_compiler.symbolic_program import (
+        from neural_vm.verification.symbolic_program import (
             SymbolicDeclarativeProgramRunner,
         )
 

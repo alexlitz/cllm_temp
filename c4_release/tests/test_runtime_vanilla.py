@@ -29,7 +29,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic  # noqa: E402
-from neural_vm.unified_compiler.runtime_audit import (  # noqa: E402
+from neural_vm.verification.runtime_audit import (  # noqa: E402
     verify_runtime_is_vanilla,
 )
 

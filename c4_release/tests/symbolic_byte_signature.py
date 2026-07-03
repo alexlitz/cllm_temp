@@ -128,7 +128,7 @@ def symbolic_byte_signatures(
     expected to emit.
     """
 
-    from neural_vm.unified_compiler.symbolic_program import (
+    from neural_vm.verification.symbolic_program import (
         SymbolicDeclarativeProgramRunner,
     )
     from neural_vm.vm_step import Token

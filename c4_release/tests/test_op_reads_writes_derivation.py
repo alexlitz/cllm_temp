@@ -1,6 +1,6 @@
 """Tests for ``Operation.reads`` / ``Operation.writes`` derivation infra.
 
-Covers ``c4_release.neural_vm.unified_compiler.op_introspect``: the
+Covers ``c4_release.neural_vm.verification.op_introspect``: the
 ``derive_op_reads_writes_from_rules`` walker, the
 ``assert_declared_matches_derived`` contract check, and the
 ``Operation.derive_reads_writes`` method.
@@ -22,7 +22,7 @@ from c4_release.neural_vm.unified_compiler.layer_compiler import (
     LayerCompiler,
     Operation,
 )
-from c4_release.neural_vm.unified_compiler.op_introspect import (
+from c4_release.neural_vm.verification.op_introspect import (
     DerivationMismatch,
     DerivedReadsWrites,
     assert_declared_matches_derived,
@@ -344,7 +344,7 @@ def test_assert_declared_matches_derived_alias_canon_collapses_aliases():
 @pytest.fixture(scope="module")
 def _full_layout():
     """Real compiled layout for end-to-end derivation parity checks."""
-    from c4_release.neural_vm.unified_compiler.decl_verifier import (
+    from c4_release.neural_vm.verification.decl_verifier import (
         _build_layout_only,
     )
 
@@ -359,7 +359,7 @@ def _full_layout():
 
 
 def _find_op(layout, name: str):
-    from c4_release.neural_vm.unified_compiler.dim_flow import (
+    from c4_release.neural_vm.verification.dim_flow import (
         _walk_ops_with_layers,
     )
 

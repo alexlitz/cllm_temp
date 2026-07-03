@@ -30,7 +30,7 @@ def main():
         (Opcode.IMM, 42),
         Opcode.LEV,
     ])
-    from neural_vm.unified_compiler.dsl_interpreter_verdict import (
+    from neural_vm.verification.dsl_interpreter_verdict import (
         DSLInterpreterVerdictRunner,
     )
     t0 = time.time()

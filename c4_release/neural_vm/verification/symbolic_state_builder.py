@@ -23,7 +23,7 @@ gate accepts the same dict shape via its ``state`` parameter).
 API at a glance
 ---------------
 
->>> from c4_release.neural_vm.unified_compiler.symbolic_state_builder import (
+>>> from c4_release.neural_vm.verification.symbolic_state_builder import (
 ...     Instruction, IMM, PSH, EQ, EXIT, state_after_program, to_tensor,
 ... )
 >>> state = state_after_program([IMM(5), PSH, IMM(5), EQ, EXIT], step=3)

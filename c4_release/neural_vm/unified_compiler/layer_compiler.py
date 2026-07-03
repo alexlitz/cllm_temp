@@ -702,7 +702,7 @@ class Operation:
         the maps are not supplied — pure-FFN ops have no attention
         spec to walk).
         """
-        from .op_introspect import derive_operation
+        from ..verification.op_introspect import derive_operation
 
         return derive_operation(
             self,
@@ -1522,7 +1522,7 @@ class LayerCompiler:
         # written by any op. Surfaced by the L8 sp_gather STACK0 audit
         # (``docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md``). Opt out
         # via ``C4_SKIP_DIM_INTEGRITY=1``.
-        from .dim_integrity import run_dim_integrity_check
+        from ..verification.dim_integrity import run_dim_integrity_check
         self._last_dim_integrity = run_dim_integrity_check(self)
 
         # Block ops are pinned to layer_idx and skip dep analysis.
@@ -1588,7 +1588,7 @@ class LayerCompiler:
         #
         # Opt out via ``C4_SKIP_GATE_CHECK=1``; promote to a hard error
         # via ``C4_STRICT_GATE_CHECK=1``.
-        from .dsl_interpreter import run_attention_gate_audit
+        from ..verification.dsl_interpreter import run_attention_gate_audit
         self._last_attention_gate_audit = run_attention_gate_audit(
             self, dim_positions,
         )

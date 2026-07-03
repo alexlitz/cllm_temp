@@ -22,7 +22,7 @@ from src.compiler import compile_c
 from tests.test_suite_1000 import generate_test_programs
 from neural_vm.batched_pure_neural import Token
 from neural_vm.speculative import DraftVM
-from neural_vm.unified_compiler.symbolic_program import (
+from neural_vm.verification.symbolic_program import (
     idx_to_pc, _decode_static_instruction,
 )
 
@@ -52,7 +52,7 @@ def main():
     pc_imm = {idx_to_pc(i): _decode_static_instruction(instr)[1]
               for i, instr in enumerate(bc)
               if _decode_static_instruction(instr)[0] == 0}
-    from neural_vm.unified_compiler.symbolic_program import (
+    from neural_vm.verification.symbolic_program import (
         SymbolicDeclarativeProgramRunner)
     tr = SymbolicDeclarativeProgramRunner().run(list(bc), data, max_steps=40).trace
     lea_steps = [t.step for t in tr if t.name == "LEA"]

@@ -19,11 +19,11 @@ os.environ["C4_SMOKE_SPEC_K"] = "0"; os.environ["C4_TEST_SPEC_K"] = "0"
 _HERE = os.path.dirname(os.path.abspath(__file__)); _PKG = os.path.dirname(_HERE)
 if _PKG not in sys.path: sys.path.insert(0, _PKG)
 import contextlib, io, torch  # noqa
-from neural_vm.unified_compiler.faithful_autoregressive import build_cpu_model  # noqa
+from neural_vm.verification.faithful_autoregressive import build_cpu_model  # noqa
 from neural_vm.batched_pure_neural import Token, DraftVM  # noqa
 from tests.test_suite_1000 import generate_test_programs  # noqa
 from src.compiler import compile_c  # noqa
-from neural_vm.unified_compiler.symbolic_forward import decode_instr, _OPCODE_NAMES  # noqa
+from neural_vm.verification.symbolic_forward import decode_instr, _OPCODE_NAMES  # noqa
 
 SE = int(Token.STEP_END); STEP = int(Token.STEP_TOKENS)
 REGS = {int(Token.REG_PC): "PC", int(Token.REG_AX): "AX", int(Token.REG_SP): "SP",

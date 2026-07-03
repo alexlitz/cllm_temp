@@ -1,4 +1,4 @@
-from c4_release.neural_vm.unified_compiler.symbolic_program import (
+from c4_release.neural_vm.verification.symbolic_program import (
     SymbolicDeclarativeProgramRunner,
     build_default_opcode_declarations,
 )

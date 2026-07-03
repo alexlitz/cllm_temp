@@ -361,7 +361,7 @@ def derive_operation(
     with no IR has no derivation surface, and silently retaining the
     manual annotation would mask the missing IR.
     """
-    from .layer_compiler import Operation  # local import: avoid cycle
+    from ..unified_compiler.layer_compiler import Operation  # local import: avoid cycle
 
     if not isinstance(op, Operation):
         raise TypeError(

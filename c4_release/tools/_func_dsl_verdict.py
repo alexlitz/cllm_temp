@@ -37,7 +37,7 @@ def main():
     spec_k = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     alu_mode = sys.argv[3] if len(sys.argv) > 3 else "lookup"
     progs = generate_test_programs()
-    from neural_vm.unified_compiler.dsl_interpreter_verdict import (
+    from neural_vm.verification.dsl_interpreter_verdict import (
         DSLInterpreterVerdictRunner,
     )
     import time as _t

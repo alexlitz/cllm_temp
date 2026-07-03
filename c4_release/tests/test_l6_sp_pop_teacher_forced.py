@@ -1,7 +1,7 @@
 """Focused teacher-forced probes for L6 stack-pop SP high-byte handling."""
 
 from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-from neural_vm.unified_compiler.decl_verifier import (
+from neural_vm.verification.decl_verifier import (
     build_teacher_forced_symbolic_trace,
     verify_teacher_forced_token_support,
 )

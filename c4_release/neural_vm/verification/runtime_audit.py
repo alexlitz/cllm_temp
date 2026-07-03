@@ -16,7 +16,7 @@ post-op family `BinaryOpByteZeroingPostOp`, `CarryPropagationPostOp`,
 `BDToGEConverter` / `GEToBDConverter` format adapters).
 
 Usage:
-    from neural_vm.unified_compiler.runtime_audit import (
+    from neural_vm.verification.runtime_audit import (
         verify_runtime_is_vanilla,
         RuntimeAuditReport,
     )

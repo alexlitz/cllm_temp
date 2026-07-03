@@ -3,7 +3,7 @@ import pytest
 from neural_vm.dim_registry import DimRegistry
 from neural_vm.unified_compiler.ir import FFNRule
 from neural_vm.unified_compiler.predicates import parse, entails, satisfiable
-from neural_vm.unified_compiler.effective_predicate import effective_predicate
+from neural_vm.verification.effective_predicate import effective_predicate
 
 
 @pytest.fixture

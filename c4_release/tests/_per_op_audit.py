@@ -93,7 +93,7 @@ def assert_rule_scopes_satisfied(op, registry=None, *, require_scope=False):
         from neural_vm.dim_registry import build_default_registry
         registry = build_default_registry()
 
-    from neural_vm.unified_compiler.decl_verifier import verify_rule_scopes
+    from neural_vm.verification.decl_verifier import verify_rule_scopes
     issues = verify_rule_scopes(op, registry, require_scope=require_scope)
     if issues:
         msgs = [
@@ -131,7 +131,7 @@ def assert_rule_strength_dominance(
         from neural_vm.unified_compiler.backbone_bounds import load_default_bounds
         bounds = load_default_bounds()
 
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         _collect_ffn_rules_from_op,
         verify_rule_strength,
     )

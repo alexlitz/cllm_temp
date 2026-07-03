@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("C4_SKIP_DIM_INTEGRITY", "1")
 os.environ.setdefault("C4_SKIP_GATE_CHECK", "1")
 
-from neural_vm.unified_compiler.symbolic_forward import (  # noqa: E402
+from neural_vm.verification.symbolic_forward import (  # noqa: E402
     OP_DIV,
     OP_EXIT,
     OP_IMM,
@@ -86,7 +86,7 @@ def test_branch_program_classifies(ctx):
     # JMP over a dead IMM, then IMM 42; EXIT. The dim_oracle ReferenceOracle
     # loops on this; the gate uses the real oracle trace, so it must classify
     # cleanly (regression guard for the branch fix).
-    from neural_vm.unified_compiler.symbolic_forward import OP_JMP
+    from neural_vm.verification.symbolic_forward import OP_JMP
     prog = _prog((OP_JMP, 2), (OP_IMM, 99), (OP_IMM, 42), (OP_EXIT, 0))
     r = gate.classify_program(ctx, "jmp", prog)
     assert r.classification in (gate.PASS, gate.AUTHORING_MISMATCH)

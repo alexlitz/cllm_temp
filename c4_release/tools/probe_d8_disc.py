@@ -38,7 +38,7 @@ read = {
 
 def find_ent_step(bc):
     # first step whose opcode is ENT, in oracle order
-    from neural_vm.unified_compiler.symbolic_program import SymbolicDeclarativeProgramRunner
+    from neural_vm.verification.symbolic_program import SymbolicDeclarativeProgramRunner
     st = SymbolicDeclarativeProgramRunner().run(list(bc), b"", max_steps=2000)
     for tr in st.trace:
         if tr.name == "ENT":

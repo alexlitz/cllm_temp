@@ -3,7 +3,7 @@ import pytest
 
 from neural_vm.dim_registry import DimRegistry
 from neural_vm.unified_compiler.ir import FFNOp, FFNRule
-from neural_vm.unified_compiler.writer_index import (
+from neural_vm.verification.writer_index import (
     WriterEntry,
     build_writer_index,
 )
