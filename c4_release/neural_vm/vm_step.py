@@ -7935,48 +7935,6 @@ def _set_layer16_lev_routing(ffn, S, BD):
 # =============================================================================
 
 
-def _set_io_putchar_routing(ffn, S, BD):
-    """L6 FFN addition: detect PUTCHAR and route AX → OUTPUT.
-
-    When OP_PUTCHAR is active at AX marker:
-    1. Set IO_IS_PUTCHAR flag
-    2. Route AX_CARRY → OUTPUT_LO/HI (same pattern as EXIT/NOP routing)
-
-    The model produces the correct output byte autoregressively.
-    The runner reads generated AX bytes and accumulates the output string.
-
-    GETCHAR is handled entirely runner-side (see run_vm.py).
-
-    Starts at unit 1500 to avoid overlap with _set_layer6_routing_ffn (units 0-1033).
-    """
-    unit = 1500
-
-    # OP_PUTCHAR AND MARK_AX → IO_IS_PUTCHAR
-    T = 4.0
-    ffn.W_up[unit, BD.OP_PUTCHAR] = S
-    ffn.W_up[unit, BD.MARK_AX] = S
-    ffn.b_up[unit] = -S * T
-    ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.IO_IS_PUTCHAR, unit] = 2.0 / S
-    unit += 1
-
-    # PUTCHAR: AX_CARRY → OUTPUT (same as EXIT/NOP routing)
-    for k in range(16):
-        ffn.W_up[unit, BD.OP_PUTCHAR] = S
-        ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_LO + k] = 1.0
-        ffn.W_down[BD.OUTPUT_LO + k, unit] = 2.0 / S
-        unit += 1
-    for k in range(16):
-        ffn.W_up[unit, BD.OP_PUTCHAR] = S
-        ffn.W_up[unit, BD.MARK_AX] = S
-        ffn.b_up[unit] = -S * T
-        ffn.W_gate[unit, BD.AX_CARRY_HI + k] = 1.0
-        ffn.W_down[BD.OUTPUT_HI + k, unit] = 2.0 / S
-        unit += 1
-
-
 # =============================================================================
 # L6 Opcode Relay Head (AX → SP/STACK0 marker positions)
 # =============================================================================
