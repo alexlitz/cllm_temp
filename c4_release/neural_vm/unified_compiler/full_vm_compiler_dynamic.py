@@ -2203,13 +2203,6 @@ def compile_full_vm_dynamic(
             "C4_STACK0_NEXT_ARITH": (
                 os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
             ),
-            # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
-            # opt in with =1): adds a NOT-blocker condition to
-            # l16_ent_frame_sp_byte1_ff (output-affecting), so the ON / OFF builds
-            # must NEVER share a memo / disk entry.
-            "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
-                os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
-            ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
             # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
@@ -2217,16 +2210,6 @@ def compile_full_vm_dynamic(
             # ON / OFF builds must NEVER share a memo / disk entry.
             "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
                 os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
-            ),
-            # L16 LEV STACK0-byte0-preserve MARK_SE blocker (framing-recovery;
-            # DEFAULT-OFF, opt in with =1): adds a -100*MARK_SE NOT-blocker to the
-            # l16_lev_stack0_byte0_preserve_* family so the post-LEV OP_LEV
-            # broadcast residue (~4.1) cannot solo-fire the OUTPUT-preserve nudge
-            # on the next-step STEP_END row (the step-9 stray-0 over-emit root).
-            # Output-affecting on that STEP_END row, so ON / OFF builds must NEVER
-            # share a memo / disk entry. Ships with the C4_L15_LEV func chain.
-            "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
-                os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
             ),
             # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1): adds a MARK_AX
             # NOT-blocker to the l8_alu_adj_lo_*_step_end ADJ low-nibble ALU rules
@@ -2236,24 +2219,6 @@ def compile_full_vm_dynamic(
             # a memo / disk entry. Ships with the C4_L15_LEV func chain.
             "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
                 os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
-            ),
-            # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1): adds a
-            # BYTE_INDEX_2-keyed Q/K NOT-blocker slot to the L10
-            # psh_stack0_passthrough head so the PSH-arg byte-3 relay does not
-            # crush the value-byte OUTPUT (the post-ENT 34-token desync root),
-            # output-affecting on func/nested PSH steps -> ON / OFF builds must
-            # NEVER share a memo / disk entry. Held off (HEAD-identical) as a
-            # verified framing building block -- net -1 exit_code trade, see
-            # _psh_stack0_byte3_relay_darken_enabled.
-            "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
-                os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
-            ),
-            # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
-            # DEFAULT-OFF, opt in with =1): adds 32 MARK_SE_ONLY-gated OUTPUT
-            # suppressor units to post_l9_bz_bnz_pc_override (output-affecting),
-            # so the ON / OFF builds must NEVER share a memo / disk entry.
-            "C4_POST_ENT_SE_SUPPRESS": (
-                os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
             ),
             # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0):
             # adds a MEM_STORE-gated AX-row boost slot to L14/L18 value head 4
@@ -2338,12 +2303,6 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
                 and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             ),
-            # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1,
-            # output-affecting on the BP-byte1 OUTPUT crush): the ON / OFF
-            # builds must never share a memo entry.
-            "C4_BP_SAVE_DUMP_MARKER_REQ": (
-                os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
-            ),
             # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
             # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit):
             # the ON / OFF builds bake the byte_39_from_e8_addr rule with
@@ -2382,17 +2341,6 @@ def compile_full_vm_dynamic(
             # share a memo entry. See shared.store_ax_b0_override_enabled.
             "C4_STORE_AX_B0_OVERRIDE": (
                 os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
-            ),
-            # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2,
-            # DEFAULT-OFF building block, opt in =1, BAKE-affecting): registers
-            # the LEA_REREAD_B0 band + the capture / restore PureFFN ops, so the
-            # ON / OFF builds STRUCTURALLY differ (different d_model + extra FFN
-            # units) and must never share a memo entry. Gated on
-            # ``operand_from_memsp_enabled()``. ZERO-SUM vs the func_identity HOLD
-            # gate, so default-OFF. See shared.func_lea_b0_restore_enabled.
-            "C4_FUNC_LEA_B0_RESTORE": (
-                operand_from_memsp_enabled()
-                and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
             ),
             # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
             # campaign-ON, opt out =0, BAKE-affecting): registers the
@@ -3066,41 +3014,17 @@ def _bake_from_scheduled_ops(
         "C4_AX_BYTE1_FULL_WIDTH": (
             os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
         ),
-        # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
-        # opt in with =1, output-affecting): the ON / OFF builds must never
-        # share a serialised entry.
-        "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
-            os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
-        ),
         # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
         # opt out with =0, output-affecting): the ON / OFF builds must never
         # share a serialised entry.
         "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
             os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
         ),
-        # L16 LEV STACK0-byte0-preserve MARK_SE blocker (framing-recovery;
-        # DEFAULT-OFF, opt in with =1, output-affecting on the post-LEV STEP_END
-        # row): the ON / OFF builds must never share a serialised entry.
-        "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
-            os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
-        ),
         # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1, output-affecting on
         # post-LEV ADJ AX rows): the ON / OFF builds must never share a
         # serialised entry. Ships with the C4_L15_LEV func chain.
         "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
             os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
-        ),
-        # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1,
-        # output-affecting on func/nested PSH steps): the ON / OFF builds must
-        # never share a serialised entry.
-        "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
-            os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
-        ),
-        # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
-        # DEFAULT-OFF, opt in with =1, output-affecting): the ON / OFF builds
-        # must never share a serialised entry.
-        "C4_POST_ENT_SE_SUPPRESS": (
-            os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
         ),
         # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0,
         # output-affecting on the call-arg PSH store value): the ON / OFF
@@ -3160,13 +3084,6 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
             and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
         ),
-        # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1, output-
-        # affecting on the BP-byte1 OUTPUT crush): the ON / OFF builds must never
-        # share a serialised entry. See l11_ops.py
-        # ``_bp_save_dump_marker_req_enabled``.
-        "C4_BP_SAVE_DUMP_MARKER_REQ": (
-            os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
-        ),
         # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
         # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit): the
         # ON / OFF builds bake the byte_39_from_e8_addr rule with different
@@ -3204,17 +3121,6 @@ def _bake_from_scheduled_ops(
         # shared.store_ax_b0_override_enabled.
         "C4_STORE_AX_B0_OVERRIDE": (
             os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
-        ),
-        # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2, DEFAULT-OFF
-        # building block, opt in =1, BAKE-affecting): registers the LEA_REREAD_B0
-        # band + the capture / restore PureFFN ops so ON / OFF builds STRUCTURALLY
-        # differ (d_model + extra FFN units) and must never share a serialised
-        # entry. Gated on ``operand_from_memsp_enabled()``. ZERO-SUM vs the
-        # func_identity HOLD gate, so default-OFF. See
-        # shared.func_lea_b0_restore_enabled.
-        "C4_FUNC_LEA_B0_RESTORE": (
-            operand_from_memsp_enabled()
-            and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
         ),
         # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
         # campaign-ON, opt out =0, BAKE-affecting): registers the

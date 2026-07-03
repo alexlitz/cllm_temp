@@ -65,46 +65,6 @@ def _dim_base(category: str, role: str) -> str:
     return dim_ref(category, role).rsplit("+", 1)[0]
 
 
-def _ent_sp_byte1_ismark_blocker_on() -> bool:
-    """DEFAULT-OFF guard (opt in with ``C4_ENT_SP_BYTE1_ISMARK_BLOCKER=1``): add
-    an ``IS_MARK`` NOT-blocker to ``l16_ent_frame_sp_byte1_ff`` so the OP_ENT
-    broadcast (~10, not one-hot in the step AFTER an ENT) cannot solo-fire the
-    SP-byte1=0xff override on the post-ENT STEP_END / marker rows.
-
-    This is a CORRECT-but-INSUFFICIENT partial fix kept default-OFF (so HEAD is
-    byte-identical) for the next agent who tackles the full multi-emitter
-    post-ENT framing fix. See
-    ``docs/POST_ENT_37TOKEN_SENTINEL_CASCADE_2026_06_14.md``.
-
-    Background (spec_k=0, tools/_probe_sentinel_block.py + _probe_sp_byte1_gate.py
-    + _probe_ismark_check.py, 2026-06-14): the SP-byte1=0xff override is gated on
-    {OP_ENT, IS_BYTE, HAS_SE, H1+2, BYTE_INDEX_0}. OP_ENT*S alone (residual ~10 *
-    100 = +980) clears the +450 threshold even when IS_BYTE/BYTE_INDEX_0/H1+2 are
-    ~0, so the rule MIS-FIRES on the leading STEP_END/marker rows of the step
-    immediately after an ENT, decoding 0xFF (low-nib-15 AND hi-nib-15) at logit
-    ~4.7e4. The rule's OWN comments already flag this misfire; the clean
-    separator it was looking for is:
-
-    Discriminator: IS_MARK (dim 7) == 1.000 EXACTLY on every spurious post-ENT
-    marker/STEP_END misfire row (func/add/var/rec/nested all confirmed) and
-    == 0.000 EXACTLY on every genuine SP-byte0 row where the 0xff override SHOULD
-    fire. A -10*S IS_MARK blocker therefore vetoes the misfire and is
-    byte-identical on the legitimate firing rows.
-
-    WHY DEFAULT-OFF (the negative result): suppressing THIS one emitter does NOT
-    restore the 35-token step. The post-ENT STEP_END row is corrupted by a CASCADE
-    of THREE stacked byte-default emitters — block 31/L20 (this rule, +4.7e4),
-    block 41/L25 (token-0 via dim 882, defeated MARK_SE=-1e5 veto by a runaway
-    dim-344=3626 input), and block 38/L25 (0xff via units 49/50, amplifies to
-    4.49e10 by reading the OUTPUT-nibble dims 84/100 it is meant to correct). With
-    only this rule blocked the next emitter wins, so the step stays 37 tokens and
-    NO program advances (func/var/rec/nested 0/55 with flag ON == OFF; smoke 51/0;
-    guard add/mul/if 29/43 ON == OFF). The real fix is the project-level multi-part
-    build, not a solo corrector.
-    """
-    return _os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
-
-
 def _ent_frame_sp_byte0_psh_blocker_enabled() -> bool:
     """Flag (DEFAULT ON): block the L20 ``l16_ent_frame_sp_byte0_*`` family from
     misfiring on the PSH-at-SP step (the deepest nested/loop SP-decrement root).
@@ -268,37 +228,6 @@ def _lea_local_e8_multilocal_guard_enabled() -> bool:
     if forced is not None:
         return forced != "0"
     return no_stack0_emit_enabled()
-
-
-def _lev_stack0_preserve_se_blocker_on() -> bool:
-    """DEFAULT-OFF guard (opt in with ``C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER=1``):
-    add a ``MARK_SE`` NOT-blocker to the ``l16_lev_stack0_byte0_preserve_*``
-    family so the OP_LEV broadcast residue cannot solo-fire the OUTPUT-preserve
-    nudge on the post-LEV STEP_END row.
-
-    Root (spec_k=0, tools/_probe_lev_step9_overemit.py, func_identity_0 id 550
-    with the C4_L15_LEV chain ON): the LEV epilogue (step 8) leaves an OP_LEV
-    residue ~4.1 on the next step's STEP_END row (opcode markers are NOT one-hot
-    in-step). The preserve rule's only strong positive gate is ``OP_LEV``
-    (weight 5.0); ``5.0 * 4.13 = 20.6`` alone clears the 7.5 threshold even
-    though ``MARK_STACK0`` and ``BYTE_INDEX_0`` are BOTH 0 on that STEP_END row.
-    The rule then MIS-FIRES with ``gate=OUTPUT_LO`` (already ~-240 from the
-    normal STEP_END family) and ``silu(up=1414)*gate*0.5`` drives the OUTPUT
-    band to ~-1.7e5 -> block-41/L25 tail amplifies to ~1.1e16 -> the LM head's
-    ``head.weight[byte0x00, OUTPUT_LO+0]`` spikes a stray leading ``0`` token at
-    the start of the next step (36-token over-emit -> fixed-35-slice frame
-    desync -> AX 70->72, wrong exit_code).
-
-    Clean discriminator: ``MARK_SE`` (the STEP_END-row marker) == 1.0 EXACTLY on
-    the spurious STEP_END misfire row and == 0.0 EXACTLY on the genuine LEV-step
-    STACK0 marker (pos 408) and STACK0 byte-0 (pos 409) rows where the preserve
-    SHOULD fire. A ``-100*MARK_SE`` blocker therefore vetoes the misfire and is
-    byte-identical on the legitimate firing rows. Same op_ent_in_step_broadcast
-    corruptor family as ``_ent_sp_byte1_ff_h1_hardening``, now for OP_LEV.
-
-    DEFAULT-OFF so HEAD is byte-identical; ships with the C4_L15_LEV func chain.
-    """
-    return os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
 
 
 def _outband_decouple_proto_mode() -> str:
@@ -870,15 +799,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", -10.0),
         ("MEM_STORE", -10.0),
     )
-    if _lev_stack0_preserve_se_blocker_on():
-        # OP_LEV broadcast residue (~4.1) on the post-LEV STEP_END row clears
-        # the 7.5 threshold solo (5.0*4.1=20.6) with MARK_STACK0/BYTE_INDEX_0=0.
-        # MARK_SE==1 ONLY on that STEP_END row (==0 on genuine STACK0 rows), so a
-        # large NOT-blocker vetoes the misfire without touching legitimate fires.
-        lev_stack0_preserve_conditions = (
-            *lev_stack0_preserve_conditions,
-            (dim_ref('marker', 'SE'), -100.0),
-        )
     # Use nudge-strength (50/S) to match the sibling stack0_e0/e8/f8 marker
     # materializer families; this is enough to overcome the residual
     # zero-default but not so strong that we clobber legitimate L14/L15
@@ -2387,19 +2307,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("STACK0_BYTE2", -100.0),
         ("STACK0_BYTE3", -100.0),
     ) + ((("CONST", -_h1_harden_w),) if _h1_harden_w else ())
-    # OP_ENT-broadcast post-ENT framing fix (2026-06-14, the func/var/rec/nested
-    # 37-token desync). The five register-marker blockers above guard the PC/AX/
-    # SP/BP/MEM byte rows, but NOT the STEP_END / marker rows -- and the OP_ENT
-    # broadcast (~10) alone clears the +4.5*S threshold there, mis-firing the
-    # 0xff override on the leading STEP_END row of the step after an ENT (the 2
-    # extra 0xFF tokens -> 37-token step -> slicer desync). IS_MARK == 1.0 on
-    # every such misfire row and == 0.0 on every genuine SP byte row, so a hard
-    # IS_MARK NOT-blocker vetoes the misfire and is byte-identical on the
-    # legitimate firing. See _ent_sp_byte1_ismark_blocker_on (default ON).
-    if _ent_sp_byte1_ismark_blocker_on():
-        sp_frame_byte1_ff_conditions = sp_frame_byte1_ff_conditions + (
-            ("IS_MARK", -10.0),
-        )
     rules.append(multi_way_and_rule(
         name="l16_ent_frame_sp_byte1_ff",
         threshold=4.5,

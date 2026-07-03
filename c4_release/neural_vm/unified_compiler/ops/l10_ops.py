@@ -923,76 +923,6 @@ def _stack0_pop_loaded_shallow_crush_enabled() -> bool:
     return os.environ.get("C4_STACK0_POP_LOADED_SHALLOW_CRUSH", "1") != "0"
 
 
-def _psh_stack0_byte3_relay_darken_enabled() -> bool:
-    """Suppress the PSH STACK0 byte-3 relay's poisoned OUTPUT routing.
-
-    DEFAULT-OFF (opt in with ``C4_PSH_STACK0_BYTE3_RELAY_DARKEN=1``). This is
-    the correctly-localized FRAMING half of the post-ENT desync fix, kept
-    flag-gated-off as a verified building block (mirrors the prior
-    ``C4_POST_ENT_SE_SUPPRESS`` negative-result pattern) because it is a TRADE
-    on the strict exit_code gate, not yet a net win -- see THE TRADE below.
-
-    Post-ENT 34-token desync root (2026-06-16 -- SUPERSEDES the 37-token
-    over-emit model in POST_ENT_DESYNC_REAL_PRODUCER_2026_06_14.md; the
-    building blocks landed since then INVERTED the failure mode from over-emit
-    to under-emit). The PSH-of-argument store step (func_identity/func_add/
-    nested step 3) emits only 34 tokens, not 35 -- the 4th STACK0 value byte
-    (BYTE_INDEX_3) is dropped and the MEM marker is emitted one position early,
-    desyncing the fixed-35-token slicer (``got pc=None`` at the next checked
-    step). Root (spec_k=0, BUILT dims, d_model=1090 / 52-block efficient build):
-
-    * The STACK0 byte-3 value token is predicted at the byte-2 query row
-      (``BYTE_INDEX_2`` ~0.97) of the PSH step. ``layer10_psh_stack0_passthrough``
-      head 3 (physical block 16 / logical L11) fires there (gated on
-      ``PSH_AT_SP`` + ``IS_BYTE`` at slot 33) and relays the AX byte-3 source
-      row's OUTPUT band (net effect = 3x source OUTPUT) into that row's OUTPUT.
-    * BUT the AX byte-3 source row (off9, BYTE_INDEX_3) is the row right before
-      the SP register marker, so the L10 ``NEXT_SP`` OUTPUT-darkening unit
-      (block 14 / logical L10 unit 3400, ``W_down[OUTPUT_*+k]=-1`` gated on
-      ``NEXT_SP``) has driven its entire OUTPUT band to ~-218 (uniform). Head 3
-      relays this ~-654 into the STACK0 byte-3 decode row, crushing the value-0
-      token (logit -5325) so the MEM marker (logit -9.6) wins prematurely.
-
-    For a PSH-of-argument the pushed value's byte-3 is the high byte (0 for the
-    small call args; the value already arrives in the OUTPUT default at +0.94).
-    Suppressing head 3's firing ONLY on the byte-2 query row (the byte-3-relay
-    row) lets the clean OUTPUT default survive so the value-byte token wins and
-    the step re-emits 35 tokens. Keyed on ``BYTE_INDEX_2`` via a hard
-    subtractive NOT-blocker on a fully-free Q/K slot (mirrors the slot-7
-    register-marker darkening already in this head). On non-PSH rows the head is
-    already softmax1-zero (PSH_AT_SP gate); the byte-1/byte-2 VALUE relays
-    (written at the byte-0/byte-1 query rows) are untouched. Flag-off appends no
-    Q/K terms -> byte-identical to HEAD (param-hash verified).
-
-    EFFECT (flag ON, measured 2026-06-16, criterion full_trace):
-      * func_add (575): divergence step 4 (``got pc=None``) -> step 11
-        (pc=66 CORRECT, only AX value wrong). func_identity step-3 desync fixed
-        (34->35 tokens); func_identity exit_code stays 10/10.
-      * nested_quad (950-974): all step-3/8/13 34-token SHORT steps -> 35;
-        PC now correct (186) across the cluster; remaining ``ax=0`` is the
-        downstream LI-from-frame VALUE wall (separate root).
-
-    THE TRADE (why DEFAULT-OFF): on the strict exit_code gate this is net -1.
-    ``var_simple_11`` (id 261, ``x = 961``) PASSES exit_code at HEAD purely by
-    FRAMING LUCK: its store ALSO 34-token-SHORTs at step 3, but a SEPARATE
-    multi-byte step-4 mega-over-emit (56 tokens -- a duplicated register block
-    triggered by the multi-byte stored value) happens to re-align the exit
-    readback to 961. Fixing the step-3 SHORT exposes that step-4 wall and the
-    exit mis-aligns (961 -> 65512). The byte-2 query row is BYTE-IDENTICAL
-    between a func-arg PSH and a var SI/SC store in every local marker dim
-    (BYTE_INDEX_2, PSH_AT_SP, IS_BYTE, MARK_STACK0, OP_*); the ONLY separator is
-    the L10 store-value thermometer ``STACK0_B0_H1_PREV`` (~+2876 for an SI
-    store vs ~+40 for a func PSH), but a thermometer-cancel Q term leaks onto
-    other rows and broke 261 worse (step-2 -> 245 tokens). So the byte-3 relay
-    cannot be cleanly separated func-vs-var at this head; the var-store step-4
-    multi-byte over-emit must be fixed first (the documented wall). Until then
-    this framing fix is held flag-off (HEAD-identical) for the next agent.
-
-    See docs/POST_ENT_DESYNC_BYTE3_SHORT_STEP_2026_06_16.md.
-    """
-    return os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
-
-
 def _l10_exit_axcarry_enabled() -> bool:
     """Flag for the L10 EXIT/no-clean-opcode AX-materialization source fix.
 
@@ -3818,21 +3748,6 @@ def _layer10_psh_stack0_passthrough_head_spec(BD, S) -> DeclarativeAttentionHead
         # darkens; a STACK0-frame byte query row scores 0 (Q[7]=0) -> no effect.
         AP(7, BD.CONST, 1.0),
     ]
-    if _psh_stack0_byte3_relay_darken_enabled():
-        # === STACK0 byte-3-relay (BYTE_INDEX_2 query row) hard darkening ===
-        # See _psh_stack0_byte3_relay_darken_enabled. On the byte-2 query row
-        # (which predicts the STACK0 byte-3 value token) this head relays the
-        # AX byte-3 source row's NEXT_SP-darkened OUTPUT (~-654), crushing the
-        # value-0 token so the MEM marker is emitted one byte early (34-token
-        # post-ENT desync). Slot 8: Q = -2e9 * BYTE_INDEX_2, K = CONST (present
-        # everywhere), so a BYTE_INDEX_2 query row scores -2e9 across all keys
-        # -> softmax1 output 0 -> the clean OUTPUT default survives and the
-        # byte-3 value token wins. BYTE_INDEX_2 ~= 0 on the byte-0/byte-1 query
-        # rows that carry the legitimate byte-1/byte-2 relays, so those are
-        # byte-identical; the head already softmax1-zeros on non-PSH rows.
-        #
-        q.append(AP(8, BD.BYTE_INDEX_2, -2000000000.0))
-        k.append(AP(8, BD.CONST, 1.0))
     v = []
     o = []
     for k_idx in range(16):

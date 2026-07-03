@@ -50,8 +50,8 @@ def _l15_lev_pc_restore_head_on() -> bool:
     head that content-addressably restores the saved return address into PC at
     the LEV step. (Flipped to default-OFF on integration: the head is
     output-affecting and only delivers the return PC once the post-ENT framing
-    desync is fixed -- see C4_PSH_STACK0_BYTE3_RELAY_DARKEN -- so it ships
-    flag-off / byte-identical and is turned on together with the framing flag.)
+    desync is fixed, so it ships flag-off / byte-identical and is turned on
+    together with the framing flag.)
 
     ROOT (spec_k=0, BUILT dims, func_identity_0 id550 step-8 LEV, 2026-06-15):
     LEV must set ``pc = mem[BP+8]`` (the return address pushed by JSR). The L9
