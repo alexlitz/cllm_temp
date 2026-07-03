@@ -7950,44 +7950,6 @@ def _set_layer16_lev_routing(ffn, S, BD):
 # =============================================================================
 
 
-def _set_lookback_detection_head(attn, S, BD, HD):
-    """L2 attention head 1: Detect previous token type for conversational I/O.
-
-    Looks back at t-1 to detect:
-    - THINKING_START (token 272, has MARK_THINKING_START=1.0 in embedding)
-    - THINKING_END (token 273, has MARK_THINKING_END=1.0 in embedding)
-    - Byte (tokens 0-255, have IS_BYTE embedding)
-
-    Q: CONST (always query from current position)
-    K: CONST (attend to all previous positions, ALiBi will favor t-1)
-    V: Copy markers (MARK_THINKING_START, MARK_THINKING_END, IS_BYTE)
-    O: Write to lookback flags (LAST_WAS_THINKING_START, etc.)
-
-    With ALiBi slope = 10.0, the most recent token (t-1) will have highest score.
-
-    NOTE: Uses dedicated MARK_THINKING_* dimensions (506-507) instead of
-    TEMP+1/+2 (481-482) to avoid overlap with OUTPUT_BYTE_LO (480-495).
-    """
-    L = 20.0
-    base = 1 * HD  # head 1
-
-    # Q: active at all positions (CONST)
-    attn.W_q[base, BD.CONST] = L
-
-    # K: match all positions (CONST)
-    attn.W_k[base, BD.CONST] = L
-
-    # V: copy markers from previous token
-    attn.W_v[base + 1, BD.MARK_THINKING_START] = 1.0  # THINKING_START marker
-    attn.W_v[base + 2, BD.MARK_THINKING_END] = 1.0  # THINKING_END marker
-    attn.W_v[base + 3, BD.IS_BYTE] = 1.0  # Byte marker
-
-    # O: write to lookback flags
-    attn.W_o[BD.LAST_WAS_THINKING_START, base + 1] = 1.0
-    attn.W_o[BD.LAST_WAS_THINKING_END, base + 2] = 1.0
-    attn.W_o[BD.LAST_WAS_BYTE, base + 3] = 1.0
-
-
 def _set_conversational_io_state_init(ffn, S, BD):
     """L3 FFN addition: Initialize output mode when LAST_WAS_THINKING_END detected.
 
