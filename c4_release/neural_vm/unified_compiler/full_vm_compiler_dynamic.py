@@ -2248,13 +2248,6 @@ def compile_full_vm_dynamic(
             "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
                 os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
             ),
-            # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
-            # DEFAULT-OFF, opt in with =1): adds 32 MARK_SE_ONLY-gated OUTPUT
-            # suppressor units to post_l9_bz_bnz_pc_override (output-affecting),
-            # so the ON / OFF builds must NEVER share a memo / disk entry.
-            "C4_POST_ENT_SE_SUPPRESS": (
-                os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
-            ),
             # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0):
             # adds a MEM_STORE-gated AX-row boost slot to L14/L18 value head 4
             # (output-affecting on the call-arg PSH store value), so the ON /
@@ -3095,12 +3088,6 @@ def _bake_from_scheduled_ops(
         # never share a serialised entry.
         "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
             os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
-        ),
-        # post-ENT STEP_END OUTPUT-band value suppressor (framing-recovery;
-        # DEFAULT-OFF, opt in with =1, output-affecting): the ON / OFF builds
-        # must never share a serialised entry.
-        "C4_POST_ENT_SE_SUPPRESS": (
-            os.environ.get("C4_POST_ENT_SE_SUPPRESS", "0") == "1"
         ),
         # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0,
         # output-affecting on the call-arg PSH store value): the ON / OFF
