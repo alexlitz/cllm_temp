@@ -2112,8 +2112,18 @@ def _ax_hibyte_clear_allstep_enabled() -> bool:
     """``C4_AX_HIBYTE_CLEAR`` flag predicate (DEFAULT-OFF structural block).
 
     Flag-OFF bakes NO units -> byte-identical to the pre-fix build.
+
+    Architectural-refactor increment 3: ``C4_B1_TO_OUTPUT`` (the byte-1
+    DUMP->OUTPUT master flag) ALSO activates this byte-2/3 zero-default. With
+    ``C4_B1_TO_OUTPUT`` ON, OUTPUT byte-2/3 -> 0 so the AX byte-2/3 emit from
+    the canonical OUTPUT nibbles alone (the H2/H3_DUMP_OUT LM-head columns are
+    dropped in ``make_ax_byte1_dump_head_bake_op`` under the same flag). Enabled
+    if EITHER flag is set.
     """
-    return _os_stack0.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
+    return (
+        _os_stack0.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
+        or _os_stack0.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
+    )
 
 
 _AX_HIBYTE_CLEAR_ALLSTEP_HIDDEN_DIM = 2  # one AND per high byte (byte-2, byte-3)
@@ -2300,23 +2310,45 @@ def _b1_to_output_enabled() -> bool:
     return _os_stack0.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
 
 
-# H1_DUMP_OUT is 7 wide; the byte-1 one-hot lives at H1_DUMP_OUT+(v+2) for the
-# carried value v in 0..4 (model_ops ``_ax_byte1_dump_band_for_value``). One AND
-# per carried value.
-_B1_TO_OUTPUT_HIDDEN_DIM = 5  # v in 0..4
+# The carried byte-1 one-hot lives at ``H<k>_DUMP_OUT+off`` per the LM-head
+# H-band map (model_ops ``_ax_byte1_dump_band_for_value``): v in 0..4 ->
+# H1_DUMP_OUT+(v+2); v in 5..11 -> H2_DUMP_OUT+(v-5); v in 12..15 ->
+# H3_DUMP_OUT+(v-12). Increment 3 decodes the FULL byte-1 value range 0..15
+# (was 0..4/H1-only in increment 1) so the H2/H3_DUMP_OUT LM-head columns can be
+# dropped and byte-1 emits from OUTPUT alone across its whole corpus range (high
+# byte 0..7 -> the H2 band). One AND per carried value.
+_B1_TO_OUTPUT_HIDDEN_DIM = 16  # v in 0..15 (H1: 0..4, H2: 5..11, H3: 12..15)
+
+
+def _b1_to_output_band_for_value(v: int) -> tuple[str, int]:
+    """``(H<k>_DUMP_OUT band, one-hot offset)`` for carried byte-1 value ``v``.
+
+    Mirrors model_ops ``_ax_byte1_dump_band_for_value`` EXACTLY (the LM-head
+    H-band positional map the repopulate FFN fills): v 0..4 -> H1_DUMP_OUT+(v+2),
+    v 5..11 -> H2_DUMP_OUT+(v-5), v 12..15 -> H3_DUMP_OUT+(v-12). The decode
+    reads whichever DUMP slot the dump lit for that value.
+    """
+    if v <= 4:
+        return "H1_DUMP_OUT", v + 2
+    if v <= 11:
+        return "H2_DUMP_OUT", v - 5
+    return "H3_DUMP_OUT", v - 12
 
 
 def _b1_to_output_rules() -> tuple[FFNRule, ...]:
-    """5 AND rules decoding ``H1_DUMP_OUT+(v+2)`` -> ``OUTPUT_LO+v`` (v in 0..4).
+    """16 AND rules decoding ``H<k>_DUMP_OUT+off`` -> ``OUTPUT`` (v in 0..15).
 
     Each unit fires on the byte-1-predictor-row signature (``IS_BYTE +
     ADDR_B1_HI+8 AX-register + ADDR_B0_LO+5 byte-1 row``) AND the lit carried
-    one-hot slot ``H1_DUMP_OUT+(v+2)`` (weighted so it is a HARD requirement:
-    on a carried row exactly ONE slot is lit; on a fresh/non-AX row ALL slots
-    are 0 so the AND is dark and the byte-1 emission stays byte-identical to the
-    normal H1 path). On a fire it writes ``OUTPUT_LO+v`` (v<=4 -> low nibble v)
-    + ``OUTPUT_HI+0`` (byte-1 high nibble 0) strongly and KILLS the leaked
-    byte-0 default ``OUTPUT_LO+0`` so the byte emits v, not 0. Marker +
+    one-hot slot ``H<k>_DUMP_OUT+off`` for value ``v`` (weighted so it is a HARD
+    requirement: on a carried row exactly ONE slot is lit; on a fresh/non-AX row
+    ALL slots are 0 so the AND is dark and the byte-1 emission stays
+    byte-identical to the normal H-band path). On a fire it writes the canonical
+    byte-1 nibbles ``OUTPUT_LO+(v & 0xF)`` + ``OUTPUT_HI+(v >> 4)`` strongly and
+    KILLS the leaked byte-0 default ``OUTPUT_LO+0`` so the byte emits v, not 0.
+    (byte-1 value v in 0..15 -> low nibble v, high nibble 0.) Increment 3
+    extends increment 1's H1-only (v 0..4) decode to the whole H1/H2/H3 dump
+    range so the H2/H3_DUMP_OUT LM-head columns can be dropped. Marker +
     AX_CARRY_OVERFLOW blockers mirror the dump gate.
     """
     # Condition weights. The byte-1-row signature (IS_BYTE ~1.0 + ADDR_B1_HI+8
@@ -2328,7 +2360,7 @@ def _b1_to_output_rules() -> tuple[FFNRule, ...]:
     IS_BYTE_W = 1.0
     AX_REG_W = 1.0          # ADDR_B1_HI+8 AX-register scope
     SIG_W = 2.0            # ADDR_B0_LO+5 byte-1 row signature
-    DUMP_SLOT_W = 20.0     # H1_DUMP_OUT+(v+2) HARD requirement (the value select)
+    DUMP_SLOT_W = 20.0     # H<k>_DUMP_OUT+off HARD requirement (the value select)
     THRESHOLD = 12.0       # above signature-only (~6.9); needs the dump slot lit
     BLOCKER_W = 1_000.0
     OVERFLOW_KILL_W = 1_000.0
@@ -2343,20 +2375,23 @@ def _b1_to_output_rules() -> tuple[FFNRule, ...]:
         ("AX_CARRY_OVERFLOW", -OVERFLOW_KILL_W),
     )
     # Write magnitudes mirror ax_hibyte_clear_allstep (WW=0.16 -> ~+/-10 OUTPUT
-    # delta on a saturated fire): push OUTPUT_LO+v / OUTPUT_HI+0 UP and kill the
-    # leaked byte-0 default OUTPUT_LO+0 so the LM head emits v (v<=4 -> hi=0).
+    # delta on a saturated fire): push OUTPUT_LO+(v&0xF) / OUTPUT_HI+(v>>4) UP and
+    # kill the leaked byte-0 default OUTPUT_LO+0 so the LM head emits v (byte-1
+    # value v in 0..15 -> low nibble v, high nibble 0).
     WW = 0.16
     rules: list[FFNRule] = []
     for v in range(_B1_TO_OUTPUT_HIDDEN_DIM):
-        slot = v + 2  # H1_DUMP_OUT+(v+2)
+        band, slot = _b1_to_output_band_for_value(v)  # H<k>_DUMP_OUT+slot
+        lo_nib = v & 0xF
+        hi_nib = v >> 4
         writes = [
-            (f"OUTPUT_LO+{v}", WW),
-            ("OUTPUT_HI+0", WW),
+            (f"OUTPUT_LO+{lo_nib}", WW),
+            (f"OUTPUT_HI+{hi_nib}", WW),
         ]
-        # Kill the leaked byte-0 low default so the byte emits v, not 0. For v==0
-        # the target IS OUTPUT_LO+0 (no kill — we are writing it UP), so skip the
-        # negative to avoid self-cancel.
-        if v != 0:
+        # Kill the leaked byte-0 low default so the byte emits v, not 0. When the
+        # target low nibble IS OUTPUT_LO+0 (v==0) skip the negative to avoid
+        # self-cancel (we are writing OUTPUT_LO+0 UP for that value).
+        if lo_nib != 0:
             writes.append(("OUTPUT_LO+0", -WW))
         rules.append(multi_way_and_rule(
             name=f"b1_to_output_v{v}",
@@ -2364,7 +2399,7 @@ def _b1_to_output_rules() -> tuple[FFNRule, ...]:
                 ("IS_BYTE", IS_BYTE_W),
                 ("ADDR_B1_HI+8", AX_REG_W),
                 ("ADDR_B0_LO+5", SIG_W),
-                (f"H1_DUMP_OUT+{slot}", DUMP_SLOT_W),
+                (f"{band}+{slot}", DUMP_SLOT_W),
             ) + blockers,
             threshold=THRESHOLD,
             writes=tuple(writes),
@@ -2448,15 +2483,16 @@ def make_b1_to_output_op() -> Operation:
     return Operation(
         name="b1_to_output",
         reads={
-            "IS_BYTE", "ADDR_B1_HI", "ADDR_B0_LO", "H1_DUMP_OUT",
+            "IS_BYTE", "ADDR_B1_HI", "ADDR_B0_LO",
+            "H1_DUMP_OUT", "H2_DUMP_OUT", "H3_DUMP_OUT",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
             "MARK_MEM", "MARK_SE", "AX_CARRY_OVERFLOW",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         # After ax_hibyte_clear_allstep (which is after ax_byte1_dump_repopulate
-        # -> H1_DUMP_OUT is filled) so this is among the last OUTPUT writers on
-        # the AX byte-1 dump row before the LM head.
+        # -> H1/H2/H3_DUMP_OUT are filled) so this is among the last OUTPUT
+        # writers on the AX byte-1 dump row before the LM head.
         target_op_name="l10_post_ops_combined",
         requires={"after": "ax_hibyte_clear_allstep"},
         declarative_bake_fn=bake,
