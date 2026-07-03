@@ -3,6 +3,7 @@
 import os as _os_l0
 
 from ...attention_head_allocator import AttentionHeadAllocator
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
@@ -604,14 +605,19 @@ def _no_stack0_se_output_clear_rules() -> tuple[FFNRule, ...]:
     # the other markers as -1000 blockers (defensive — MARK_SE_ONLY is already
     # exclusive). Threshold 0.5 fires on the lone MARK_SE_ONLY=1.
     BLOCKER_W = 1_000.0
+    # Phase 7.E sem-dim: the marker gate NAMEs resolve from the ``marker``
+    # family (role = register/section id); the ``+k`` OUTPUT write offset is
+    # the raw nibble value (a structural value-bus index) so only the base
+    # NAME is family-resolved. dim_ref returns a ``"NAME+offset"`` string
+    # byte-identical to the legacy bare/``+k`` form.
     conditions = (
-        ("MARK_SE_ONLY", 1.0),
-        ("MARK_PC", -BLOCKER_W),
-        ("MARK_AX", -BLOCKER_W),
-        ("MARK_SP", -BLOCKER_W),
-        ("MARK_BP", -BLOCKER_W),
-        ("MARK_STACK0", -BLOCKER_W),
-        ("MARK_MEM", -BLOCKER_W),
+        (dim_ref("marker", "SE_ONLY"), 1.0),
+        (dim_ref("marker", "PC"), -BLOCKER_W),
+        (dim_ref("marker", "AX"), -BLOCKER_W),
+        (dim_ref("marker", "SP"), -BLOCKER_W),
+        (dim_ref("marker", "BP"), -BLOCKER_W),
+        (dim_ref("marker", "STACK0"), -BLOCKER_W),
+        (dim_ref("marker", "MEM"), -BLOCKER_W),
     )
     WW = _NO_STACK0_SE_OUTPUT_CLEAR_WW
     rules: list[FFNRule] = []
@@ -620,14 +626,14 @@ def _no_stack0_se_output_clear_rules() -> tuple[FFNRule, ...]:
             name=f"no_stack0_se_output_clear_lo_{k}",
             conditions=conditions,
             threshold=0.5,
-            writes=((f"OUTPUT_LO+{k}", WW),),
+            writes=((dim_ref("output_lo", "nibble", k), WW),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"no_stack0_se_output_clear_hi_{k}",
             conditions=conditions,
             threshold=0.5,
-            writes=((f"OUTPUT_HI+{k}", WW),),
+            writes=((dim_ref("output_hi", "nibble", k), WW),),
         ))
     return tuple(rules)
 
@@ -801,14 +807,18 @@ def _no_stack0_mem_marker_output_clear_rules() -> tuple[FFNRule, ...]:
     here) wins -> the NEXT_MEM->NEXT_SE->NEXT_PC chain proceeds.
     """
     BLOCKER_W = 1_000.0
+    # Phase 7.E sem-dim: ``NEXT_MEM`` is a slot-level singleton transition
+    # flag with no ``(category, role)`` binding, so it stays a bare NAME; the
+    # marker blockers resolve from the ``marker`` family and the ``+k`` OUTPUT
+    # write offset stays the raw nibble value (structural value-bus index).
     conditions = (
         ("NEXT_MEM", 1.0),
-        ("MARK_PC", -BLOCKER_W),
-        ("MARK_AX", -BLOCKER_W),
-        ("MARK_SP", -BLOCKER_W),
-        ("MARK_BP", -BLOCKER_W),
-        ("MARK_MEM", -BLOCKER_W),
-        ("MARK_SE_ONLY", -BLOCKER_W),
+        (dim_ref("marker", "PC"), -BLOCKER_W),
+        (dim_ref("marker", "AX"), -BLOCKER_W),
+        (dim_ref("marker", "SP"), -BLOCKER_W),
+        (dim_ref("marker", "BP"), -BLOCKER_W),
+        (dim_ref("marker", "MEM"), -BLOCKER_W),
+        (dim_ref("marker", "SE_ONLY"), -BLOCKER_W),
     )
     WW = _NO_STACK0_MEM_MARKER_OUTPUT_CLEAR_WW
     rules: list[FFNRule] = []
@@ -817,14 +827,14 @@ def _no_stack0_mem_marker_output_clear_rules() -> tuple[FFNRule, ...]:
             name=f"no_stack0_mem_marker_output_clear_lo_{k}",
             conditions=conditions,
             threshold=0.5,
-            writes=((f"OUTPUT_LO+{k}", WW),),
+            writes=((dim_ref("output_lo", "nibble", k), WW),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"no_stack0_mem_marker_output_clear_hi_{k}",
             conditions=conditions,
             threshold=0.5,
-            writes=((f"OUTPUT_HI+{k}", WW),),
+            writes=((dim_ref("output_hi", "nibble", k), WW),),
         ))
     return tuple(rules)
 
@@ -1014,17 +1024,27 @@ def _no_stack0_pc_highbyte_clear_rules() -> tuple[FFNRule, ...]:
     # (add/sub PC-clean) we clear byte1 unconditionally; restoring the genuine
     # high-PC carry for the <1% of programs past 0x100 is deferred to a later
     # increment with a value-derived (not TEMP-tag) carry signal.
+    # Phase 7.E sem-dim: each row's byte-index gate NAME resolves from the
+    # ``byte_index`` family (role = the byte position "0"/"1"/"2"); the
+    # human-readable ``byte_index_name`` legacy string is kept alongside so
+    # the generated rule names stay unchanged. ``PC_HEAD`` / ``H1+1..3`` are
+    # structural threshold-head bank slot indices (NOT role-meaningful byte
+    # positions), and ``IS_BYTE`` is an unbound token-class flag, so all
+    # three stay bare. The OUTPUT ``+k`` write offset is the raw nibble value.
     rows = (
-        ("BYTE_INDEX_0", ()),  # predicts byte1 (0x00 for all add/sub PCs)
-        ("BYTE_INDEX_1", ()),  # predicts byte2
-        ("BYTE_INDEX_2", ()),  # predicts byte3
+        # (byte_index role, legacy NAME for rule naming, extra NOT-conditions)
+        ("0", "BYTE_INDEX_0", ()),  # predicts byte1 (0x00 for all add/sub PCs)
+        ("1", "BYTE_INDEX_1", ()),  # predicts byte2
+        ("2", "BYTE_INDEX_2", ()),  # predicts byte3
     )
+    output_lo0 = dim_ref("output_lo", "nibble", 0)
+    output_hi0 = dim_ref("output_hi", "nibble", 0)
     rules: list[FFNRule] = []
-    for byte_index_name, extra in rows:
+    for byte_index_role, byte_index_name, extra in rows:
         base_conds = (
             (PC_HEAD, 1.0),
             ("IS_BYTE", 1.0),
-            (byte_index_name, 1.0),
+            (dim_ref("byte_index", byte_index_role), 1.0),
             # Cross-marker blockers: PC head must be the nearest one. Other
             # register/section heads are -blockers (defensive -- H1 slots are
             # near one-hot per row, but PSH_AT_SP headroom can lift a runner-up).
@@ -1040,26 +1060,26 @@ def _no_stack0_pc_highbyte_clear_rules() -> tuple[FFNRule, ...]:
                 name=f"no_stack0_pc_clear_{byte_index_name.lower()}_lo_{k}",
                 conditions=base_conds,
                 threshold=2.5,
-                writes=((f"OUTPUT_LO+{k}", WW),),
+                writes=((dim_ref("output_lo", "nibble", k), WW),),
             ))
         for k in range(1, 16):
             rules.append(multi_way_and_rule(
                 name=f"no_stack0_pc_clear_{byte_index_name.lower()}_hi_{k}",
                 conditions=base_conds,
                 threshold=2.5,
-                writes=((f"OUTPUT_HI+{k}", WW),),
+                writes=((dim_ref("output_hi", "nibble", k), WW),),
             ))
         rules.append(multi_way_and_rule(
             name=f"no_stack0_pc_clear_{byte_index_name.lower()}_lo0_restore",
             conditions=base_conds,
             threshold=2.5,
-            writes=(("OUTPUT_LO+0", WPOS),),
+            writes=((output_lo0, WPOS),),
         ))
         rules.append(multi_way_and_rule(
             name=f"no_stack0_pc_clear_{byte_index_name.lower()}_hi0_restore",
             conditions=base_conds,
             threshold=2.5,
-            writes=(("OUTPUT_HI+0", WPOS),),
+            writes=((output_hi0, WPOS),),
         ))
 
     # PC BYTE 0 (the marker row, predicts the byte-0 token). Here the GENUINE
@@ -1093,12 +1113,15 @@ def _no_stack0_pc_highbyte_clear_rules() -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="no_stack0_pc_clear_byte0_marker_lo1_sink",
         conditions=(
-            ("MARK_PC", 1.0),
-            ("OP_BZ", -BLOCKER_W),
-            ("OP_BNZ", -BLOCKER_W),
+            # Phase 7.E sem-dim: PC marker gate + BZ/BNZ branch-step blockers
+            # resolve from the ``marker`` / ``opcode_flag`` families; the
+            # OUTPUT ``+1`` write offset is the raw nibble value.
+            (dim_ref("marker", "PC"), 1.0),
+            (dim_ref("opcode_flag", "BZ"), -BLOCKER_W),
+            (dim_ref("opcode_flag", "BNZ"), -BLOCKER_W),
         ),
         threshold=0.5,
-        writes=(("OUTPUT_LO+1", WW),),
+        writes=((dim_ref("output_lo", "nibble", 1), WW),),
     ))
 
     return tuple(rules)
