@@ -1433,6 +1433,42 @@ def funcadd_alu_hi13_clear_enabled() -> bool:
     return os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
 
 
+def operand_cam_fix_enabled() -> bool:
+    """Return True iff the operand-CAM address-leak clear is WIDENED past OP_ADD
+    to the loaded-operand SUB / MUL / MOD / DIV + six-CMP operand-delivery rows
+    (DEFAULT OFF — opt in via ``C4_OPERAND_CAM_FIX=1``). Gated behind the
+    ``no_stack0_emit`` campaign flag so the flag-OFF golden (35-tok) build is
+    byte-identical (the wider opcode gate is never installed off the campaign).
+
+    ROOT (BUILT-layout survey, campaign default, spec_k=0,
+    ``tools/probe_operand_cam_leak_survey.py``): the L8 head-5 mem-to-ALU
+    operand-A read (``LI`` -> ``PSH`` -> ``mem[SP]``) delivers the LOADED value
+    into ``ALU_HI`` as a TWO-HOT on EVERY consumer op, not just ADD: the true
+    value hi-nibble one-hot (~+6.0, cell = value//16 <= 6 for corpus operands)
+    PLUS a spurious ``~+5.49`` frame-address high-nibble leak at cell 13 (0xD,
+    single-level call frame) or cell 15 (0xF, direct ``0xFFF8`` frame). The
+    ``LoadedOperandAddHi15ClearFFN`` already discriminates + clears this leak on
+    the ``OP_ADD`` rows (window ``(0.5, CLEAN_MAX=5.85)``); the leak is IDENTICAL
+    in shape on the loaded-operand SUB (``absdiff``), MUL (``var_mul``), and the
+    comparison ops (``if_var`` GT/LT, ``absdiff`` GT), but those rows are NOT
+    cleared (the wrap is deliberately ADD-only). The block-12 ALU / L10 cmp
+    engine then reads the two-hot and gains the leaked hi-nibble.
+
+    THE FIX: widen the wrap's opcode gate to the loaded-operand binary + cmp
+    consumer set, keeping the SAME ALU_HI-only, same-cell (13/15), same-window
+    discriminator. This is provably narrower than the DROPPED broad clear
+    (``C4_LOADED_OPERAND_HI15_CLEAR``) that regressed ``var_mul``: that form also
+    cleared ``ALU_LO+15`` (which IS a true value cell for a low-nibble-0xF
+    operand). The measured leak is ``ALU_HI``-ONLY on every op (survey:
+    ``ALU_LO`` is a clean single one-hot at every operand-delivery row), and the
+    ``(0.5, 5.85)`` window spares any genuine 0xD/0xF hi-nibble operand
+    (immediate operands land ~+6.0 > CLEAN_MAX; the leak is ~5.49). So the
+    widen is value-safe by the same construction that makes the ADD case safe.
+    """
+    return (no_stack0_emit_enabled()
+            and os.environ.get("C4_OPERAND_CAM_FIX", "0") != "0")
+
+
 def sili_cam_b1_enabled() -> bool:
     """Return True iff the si/li LOAD byte-1 address-leak discriminator (Inc-2)
     is active. DEFAULT campaign-ON (``C4_SILI_CAM_B1=1``), opt out with

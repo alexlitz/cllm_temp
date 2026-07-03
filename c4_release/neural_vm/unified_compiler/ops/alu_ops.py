@@ -992,12 +992,26 @@ def make_loaded_operand_add_hi15_clear_op() -> Operation:
         contam_cells = (15,)
         if funcadd_alu_hi13_clear_enabled():
             contam_cells = (13, 15)
+        # C4_OPERAND_CAM_FIX (default-OFF): widen the ADD-only ALU_HI clear to
+        # the other loaded-operand consumers (SUB/MUL/MOD/DIV + six CMP). The
+        # ALU_HI-only, same-cell (13/15), same-window discriminator is
+        # unchanged, so flag-OFF the gate is ``(OP_ADD,)`` and this bake is
+        # byte-identical to the existing ADD-only wrap. See
+        # ``shared.operand_cam_fix_enabled``.
+        from .shared import operand_cam_fix_enabled
+        gate_dims = None
+        if operand_cam_fix_enabled():
+            gate_dims = (
+                BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_MOD, BD.OP_DIV,
+                BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
+            )
         block.ffn = LoadedOperandAddHi15ClearFFN(
             block.ffn,
             alu_hi=BD.ALU_HI,
             mark_ax=BD.MARK_AX,
             add_dim=BD.OP_ADD,
             contam_cells=contam_cells,
+            gate_dims=gate_dims,
         )
 
     return Operation(
