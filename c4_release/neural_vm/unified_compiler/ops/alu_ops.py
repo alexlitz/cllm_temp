@@ -592,24 +592,6 @@ def make_l10_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     )
 
 
-def make_l11_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
-    # Dim-ownership claims: empty. ``bake`` inserts a fully-baked
-    # ``FlattenedALUMul`` (= ``ALUMul``) into
-    # ``model.blocks[11].post_ops`` -- module attach. Sentinel below
-    # documents the structural effect.
-    return _annotate_module_replacement(
-        _mark_structural_declarations(
-            _make_alu_postop_attach_op(
-                "l11_alu_postop_attach", 11, "ALUMul", alu_mode,
-                same_layer_as="layer11_mul_partial",
-                # layer11_mul_partial binds to ``_layer11_ffn_dep_anchor``.
-                target_op_name="_layer11_ffn_dep_anchor",
-            )
-        ),
-        'L11.post_ops[FlattenedALUMul]',
-    )
-
-
 def make_l12_alu_postop_attach_op(alu_mode: str = 'lookup') -> Operation:
     # Dim-ownership claims: empty. ``bake`` inserts a fully-baked
     # ``FlattenedALUMul`` (= ``ALUMul``) into
