@@ -2,7 +2,13 @@
 """Probe the AX high-byte carry-forward truncation (id 0 canonical repro).
 
 Reproduces the add_0 (654+114) per-step AX dump and inspects the byte-1
-dump-row residual across blocks. spec_k=0, hook-free (uses GroundTruthProbe).
+dump-row residual across blocks. spec_k=0, hook-free.
+
+PORTED to ``tools/probe_lib`` — dims are resolved from the BUILT
+``model.dim_positions`` via ``probe_lib.resolve`` (the old ``_pos`` read the
+STALE ``build_default_registry_dynamic`` static slots, which point at the wrong
+cell after the widen repack) and the REG_AX markers via
+``probe_lib.register_marker_rows``.
 
 Run: CUDA_VISIBLE_DEVICES=0 python tools/probe_ax_carry.py
 """
@@ -11,25 +17,20 @@ from __future__ import annotations
 import os
 import sys
 
-os.environ.setdefault("C4_SMOKE_SPEC_K", "0")
-os.environ["C4_TEST_SPEC_K"] = "0"
-
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PKG = os.path.dirname(_HERE)
 if _PKG not in sys.path:
     sys.path.insert(0, _PKG)
 
 from src.compiler import compile_c  # noqa: E402
-from tools.probe_groundtruth import GroundTruthProbe  # noqa: E402
-from neural_vm.batched_pure_neural import Token  # noqa: E402
-from neural_vm.dim_registry_dynamic import build_default_registry_dynamic  # noqa: E402
-
-_REG = build_default_registry_dynamic()
+from tools import probe_lib as P  # noqa: E402
 
 
-def _pos(name):
-    slot = _REG.slots.get(name)
-    return None if slot is None else int(slot.start)
+def _pos(model, name):
+    """BUILT-layout start dim for a band, or None if the band is absent."""
+    dp = P.dim_positions(model)
+    v = dp.get(name)
+    return None if v is None else int(v)
 
 
 SRC = {
@@ -48,12 +49,10 @@ def decode_step_bytes(probe, bytecode, max_steps):
     ``ax_marker_pos + b``.
     """
     trace = probe.probe(bytecode, max_steps=max_steps)
-    RAX = int(Token.REG_AX)
-    positions = sorted(trace.keys())
-    markers = [p for p in positions if trace[p]["token"] == RAX]
+    markers = P.register_marker_rows(trace, "REG_AX")
     out = {}
     for s, m in enumerate(markers):
-        bs = [trace.get(m + 1 + b, {}).get("token") for b in range(4)]
+        bs = P.decode_register(trace, m)
         out[s] = (bs, m)
     return out
 
@@ -68,7 +67,9 @@ def _nib_decode(res, lo_n, hi_n):
 
 
 def main():
-    probe = GroundTruthProbe.build()
+    from neural_vm.batched_pure_neural import Token
+    probe = P.build_probe()
+    model = probe.model
     print("STEP_TOKENS =", int(Token.STEP_TOKENS))
 
     markers = {}
@@ -94,13 +95,13 @@ def main():
     dim_names = {}
     for lo_n, hi_n in PAIRS:
         for nm in (lo_n, hi_n):
-            base = _pos(nm)
+            base = _pos(model, nm)
             if base is None:
                 continue
             for k in range(16):
                 dim_names[f"{nm}+{k}"] = base + k
     for nm in SINGLE:
-        base = _pos(nm)
+        base = _pos(model, nm)
         if base is not None:
             dim_names[nm] = base
 
