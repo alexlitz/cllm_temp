@@ -2382,18 +2382,28 @@ def _ax_byte1_dump_band_for_value(v: int) -> tuple[str, int]:
     return "H3_DUMP_OUT", v - 12
 
 
-def _ax_byte1_dump_head_bake_rules(vocab_size: int) -> tuple:
+def _ax_byte1_dump_head_bake_rules(vocab_size: int, skip_h1: bool = False) -> tuple:
     """``head.weight[token v, H<k>_DUMP_OUT+off] += 5.0`` for v in 0..15.
 
     Value-general byte-1 register-dump emission columns. Mirrors the LM head's
     own H1/H2/H3 byte-1 one-hot layout onto the private ``H<k>_DUMP_OUT`` bands
     the carry FFN fills on carried steps (see ``_ax_byte1_dump_band_for_value``).
+
+    ``skip_h1`` (architectural-refactor increment 2, ``C4_B1_TO_OUTPUT`` ON):
+    OMIT the ``H1_DUMP_OUT`` columns (v in 0..4). Increment 1's L25
+    ``b1_to_output`` FFN already decodes the carried byte-1 out of
+    ``H1_DUMP_OUT`` into the canonical ``OUTPUT_LO/HI`` nibbles, so the byte-1
+    emits from OUTPUT ONLY and the H1_DUMP_OUT LM-head columns are redundant.
+    Only H1 is skipped — H2/H3 (v in 5..15) are a later increment and are baked
+    exactly as before.
     """
     rules: list[TokenEmbeddingRule] = []
     for v in range(_AX_BYTE1_DUMP_HEAD_MAX_VALUE + 1):
         if v >= vocab_size:
             break
         band, off = _ax_byte1_dump_band_for_value(v)
+        if skip_h1 and band == "H1_DUMP_OUT":
+            continue
         rules.append(TokenEmbeddingRule.head_weight_write(
             token_ids=[v],
             writes=((f"{band}+{off}", 5.0),),
@@ -2411,6 +2421,13 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     head re-emits the carried high byte once the ``ax_byte1_dump_repopulate``
     FFN fills ``H1_DUMP_OUT`` on carried steps. Byte-identical on fresh steps
     (``H1_DUMP_OUT == 0`` -> these columns contribute nothing).
+
+    Architectural-refactor increment 2: when ``C4_B1_TO_OUTPUT`` is ON the
+    ``H1_DUMP_OUT`` columns (v in 0..4) are OMITTED — increment 1's L25
+    ``b1_to_output`` decode already routes the carried byte-1 through the
+    canonical ``OUTPUT_LO/HI`` nibbles, so byte-1 emits from OUTPUT ONLY. The
+    ``H2/H3_DUMP_OUT`` columns (v in 5..15) are unchanged (a later increment).
+    Flag-OFF (default) bakes ALL columns -> byte-identical golden.
     """
     # The byte-1 register-dump EMISSION (the LM-head ``H1_DUMP_OUT`` columns) is
     # gated by ``C4_AX_BYTE1_DUMP``, which is now DEFAULT-ON (opt out with
@@ -2431,6 +2448,15 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     # ``docs/AX_BYTE1_DUMP_CARRY_LANDED_2026_06_13.md``.
     import os as _os
     _emission_on = _os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
+    # Architectural-refactor increment 2: when ``C4_B1_TO_OUTPUT`` is ON,
+    # increment 1's L25 ``b1_to_output`` FFN decodes the carried byte-1 out of
+    # ``H1_DUMP_OUT`` into the canonical ``OUTPUT_LO/HI`` nibbles, so the byte-1
+    # emits from OUTPUT ONLY and the ``H1_DUMP_OUT`` LM-head columns are
+    # REDUNDANT. Omit ONLY the H1 columns (H2/H3 are a later increment). The
+    # flag predicate is read via the SAME env var as ``l11_ops`` (default-OFF ->
+    # byte-identical golden). Evaluated lazily so a per-process env flip is
+    # honoured and reflected in the compile cache key.
+    _skip_h1 = _os.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
 
     def _bake(model, dim_positions, S):
         del S
@@ -2439,7 +2465,7 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
         from ...vm_step import Token
         ir = CompilerIR()
         ir.embeddings.extend(
-            _ax_byte1_dump_head_bake_rules(Token.VOCAB_SIZE)
+            _ax_byte1_dump_head_bake_rules(Token.VOCAB_SIZE, skip_h1=_skip_h1)
         )
         ir.lower_token_embeddings(model, dim_positions)
 
@@ -2449,7 +2475,7 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
         ir = CompilerIR()
         if _emission_on:
             ir.embeddings.extend(
-                _ax_byte1_dump_head_bake_rules(Token.VOCAB_SIZE)
+                _ax_byte1_dump_head_bake_rules(Token.VOCAB_SIZE, skip_h1=_skip_h1)
             )
         return ir
 
