@@ -237,9 +237,9 @@ def all_core_ops(
         # ``produces`` annotation participates in the in-step producer
         # check that guards the L8 ALU's ``consumes_fresh AX_CARRY_LO``
         # contract. Bake body is no-op (``enable=False``) until the full
-        # production wiring is validated end-to-end; the active head-6
-        # bake currently lives in ``unified_compiler/compiler.py`` (the
-        # UnifiedVMCompiler path, see commit 3d1b700).
+        # production wiring is validated end-to-end. (The historical head-6
+        # bake lived in the now-removed legacy ``UnifiedVMCompiler`` path,
+        # commit 3d1b700.)
         make_layer8_head6_ax_carry_refresh_op(enable=False),
         # V2/G7 LEV detector attention head (phase=8.06). Detects that
         # the prior instruction-step's opcode was LEV and materialises the
