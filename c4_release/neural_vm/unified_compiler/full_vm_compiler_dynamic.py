@@ -2211,16 +2211,6 @@ def compile_full_vm_dynamic(
             "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
                 os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
             ),
-            # L16 LEV STACK0-byte0-preserve MARK_SE blocker (framing-recovery;
-            # DEFAULT-OFF, opt in with =1): adds a -100*MARK_SE NOT-blocker to the
-            # l16_lev_stack0_byte0_preserve_* family so the post-LEV OP_LEV
-            # broadcast residue (~4.1) cannot solo-fire the OUTPUT-preserve nudge
-            # on the next-step STEP_END row (the step-9 stray-0 over-emit root).
-            # Output-affecting on that STEP_END row, so ON / OFF builds must NEVER
-            # share a memo / disk entry. Ships with the C4_L15_LEV func chain.
-            "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
-                os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
-            ),
             # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1): adds a MARK_AX
             # NOT-blocker to the l8_alu_adj_lo_*_step_end ADJ low-nibble ALU rules
             # so the SP-adjustment result cannot leak into the AX register dump on
@@ -3057,12 +3047,6 @@ def _bake_from_scheduled_ops(
         # share a serialised entry.
         "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
             os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
-        ),
-        # L16 LEV STACK0-byte0-preserve MARK_SE blocker (framing-recovery;
-        # DEFAULT-OFF, opt in with =1, output-affecting on the post-LEV STEP_END
-        # row): the ON / OFF builds must never share a serialised entry.
-        "C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER": (
-            os.environ.get("C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER", "0") == "1"
         ),
         # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1, output-affecting on
         # post-LEV ADJ AX rows): the ON / OFF builds must never share a
