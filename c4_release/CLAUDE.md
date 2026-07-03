@@ -133,12 +133,14 @@ eliminates the cross-lane merge conflict. Full API + the legacy
 Run these BEFORE committing any new op or rule change:
 
 - **`tools/_isa_golden_hash.py` — the authoritative flag-OFF byte-identity
-  gate.** The current golden (default, non-campaign, 35-token build) is
-  `state_dict_sha256 =
-  b4d2ab273438b3b2fa1bd024b48d0b06a15e63a81f66dec2812ada580b3ec70e`
-  (short `b4d2ab27`). Any docs/analysis change must leave this unchanged;
-  any weight-affecting change must intend the hash it produces. Use
-  `b4d2ab27` for all future flag-OFF byte-identity checks.
+  gate.** The current golden (default build) is `state_dict_sha256 =
+  81557d21422f3eada0a87c677b00dced41cc26c3ee3bfb094c5eeb71c9b4d3cb`
+  (short `81557d21`) after the STACK0-b0 dead-dump-machinery deletion
+  (2026-07; verdict-neutral geometry cut, was `b4d2ab27`). Any
+  docs/analysis change must leave this unchanged; any weight-affecting
+  change must intend the hash it produces. Use `81557d21` for all future
+  flag-OFF byte-identity checks (historical `b4d2ab27` builds predate the
+  STACK0-b0 dump deletion).
 - **`tools/lint_dim_resolution.py` — MANDATORY ratchet for any tool/op that
   resolves a residual-dim POSITION.** The blessed resolution path is
   `neural_vm.unified_compiler.dim_resolver.DimResolver` over the BUILT

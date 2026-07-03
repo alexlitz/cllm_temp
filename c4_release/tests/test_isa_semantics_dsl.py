@@ -598,15 +598,8 @@ def _carry_dim_positions():
     return dp
 
 
-def test_migrated_stack0_carry_head_byte_identical():
-    from c4_release.neural_vm.unified_compiler.ops import l11_ops
-    dp = _carry_dim_positions()
-    head = l11_ops._STACK0_B0_CARRY_BUNDLE.carry_head_spec_builder(dp, 5)
-    # the slot-1 presence loop is ALL on one K row (the slot_stride=0 invariant)
-    assert all(w.slot == 1 for w in head.k if w.weight == 6.0)
-    report = compare_symbolic_to_lowered_attn(
-        head, head_dim=140, num_heads=10, dim=1400)
-    assert report.ok, report
+# (test_migrated_stack0_carry_head_byte_identical removed 2026-07: the
+# STACK0-b0 dump carry head was deleted as provably-dead in the 30-token frame.)
 
 
 def test_migrated_ax_carry_head_byte_identical():
@@ -621,18 +614,9 @@ def test_migrated_ax_carry_head_byte_identical():
     assert report.ok, report
 
 
-def test_migrated_stack0_dump_rule_count_and_repoint():
-    """STACK0 dump: 14 rules (7 H3 + 7 H1), flag-ON repoints into H3/H1, flag-OFF
-    into the inert DUMP bands."""
-    from c4_release.neural_vm.unified_compiler.ops import l11_ops
-    bundle = l11_ops._STACK0_B0_CARRY_BUNDLE
-    on = bundle.dump_rules_builder(True)
-    off = bundle.dump_rules_builder(False)
-    assert len(on) == 14 and len(off) == 14
-    on_bands = {r.writes[0].dim.name for r in on}
-    off_bands = {r.writes[0].dim.name for r in off}
-    assert "H1" in on_bands and "H3" in on_bands  # repoint into the emission cells
-    assert "STACK0_B0_DUMP_H1" in off_bands  # inert band when off
+# (test_migrated_stack0_dump_rule_count_and_repoint removed 2026-07: the
+# STACK0-b0 dump repopulate FFN was deleted as provably-dead in the 30-token
+# frame.)
 
 
 def test_migrated_ax_dump_rule_count_and_bands():
@@ -649,14 +633,11 @@ def test_migrated_ax_dump_rule_count_and_bands():
 
 
 def test_migrated_carries_have_precursors():
-    """STACK0 carries the CARRIED flag precursor; AX the AX_CARRY_OVERFLOW
-    two-stage KILL precursor."""
+    """AX carries the AX_CARRY_OVERFLOW two-stage KILL precursor. (The STACK0-b0
+    CARRIED-flag precursor was deleted 2026-07 as provably-dead machinery.)"""
     from c4_release.neural_vm.unified_compiler.ops import l11_ops
-    s_ops = l11_ops._STACK0_B0_CARRY_BUNDLE.precursor_ops_builder()
     a_ops = l11_ops._AX_BYTE1_CARRY_BUNDLE.precursor_ops_builder()
-    assert [o.name for o in s_ops] == ["stack0_byte0_carried_flag"]
     assert [o.name for o in a_ops] == ["ax_byte1_carry_overflow_flag"]
-    assert s_ops[0].writes == {"STACK0_B0_CARRIED"}
     assert a_ops[0].writes == {"AX_CARRY_OVERFLOW"}
 
 
