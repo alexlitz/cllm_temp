@@ -300,6 +300,9 @@ def _l15_savedra_head_on() -> bool:
 
 _L15_LEV_PC_RESTORE_HEAD_IDX = 14
 _L15_SAVEDRA_HEAD_IDX = 15
+# Head 16 (flag C4_SI_STORE_ADDR, campaign, DEFAULT-OFF): SI/SC store
+# address-provenance CAM — resolves the var_mul / multilocal-LI two-root wall.
+_L15_SI_STORE_ADDR_HEAD_IDX = 16
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     attention_head_extension,
@@ -320,6 +323,7 @@ from .shared import (
     _as_setdim_proxy,
     no_stack0_emit_enabled,
     l15_lookup_cmp_veto_enabled,
+    si_store_addr_enabled,
 )
 
 
@@ -686,10 +690,22 @@ if _l15_savedra_head_on():
     _L15_HEAD_LAYOUT = _L15_HEAD_LAYOUT + (
         ("layer15_memory_lookup.savedra_pc", _L15_SAVEDRA_HEAD_IDX),
     )
+# head 16 (campaign flag C4_SI_STORE_ADDR, DEFAULT-OFF): SI/SC store
+# address-provenance CAM. Appended only when the flag is on so flag-OFF keeps
+# the L15 head count byte-identical to the golden (campaign 16-head) build.
+if si_store_addr_enabled():
+    _L15_HEAD_LAYOUT = _L15_HEAD_LAYOUT + (
+        ("layer15_memory_lookup.si_store_addr_cam", _L15_SI_STORE_ADDR_HEAD_IDX),
+    )
 _L15_HEAD_LAYOUT_BY_NAME = {name: head_idx for name, head_idx in _L15_HEAD_LAYOUT}
-# Widest configured L15 head count: 16 with the campaign saved-RA head, 15 with
-# the LEV PC-restore head, else 14 (the legacy LEV build).
-if _l15_savedra_head_on():
+# Widest configured L15 head count: 17 with the SI-store-addr CAM (campaign,
+# flag on), 16 with the campaign saved-RA head, 15 with the LEV PC-restore
+# head, else 14 (the legacy LEV build).
+if si_store_addr_enabled():
+    # The SI-store CAM head requires the campaign saved-RA head to already be
+    # widening L15 to 16; head 16 is the 17th slot.
+    _L15_MAX_HEADS = 17
+elif _l15_savedra_head_on():
     _L15_MAX_HEADS = 16
 elif _l15_lev_pc_restore_head_on():
     _L15_MAX_HEADS = 15
@@ -2837,6 +2853,190 @@ def _layer15_savedra_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     )
 
 
+def _layer15_si_store_addr_cam_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """L15 head 16: SI/SC store address-provenance CAM (campaign, DEFAULT-OFF).
+
+    Resolves the ``var_mul`` / multilocal-LI store-provenance TWO-ROOT wall
+    (``int a;int b;a=23;b=47;return a*b;`` id275: ``LI a`` returns b's 47 not
+    a's 23). See :func:`shared.si_store_addr_enabled` for the full root + proof.
+
+    THE LEVER (built-layout probe ``tools/_probe_si_store_addr.py`` +
+    ``tools/_probe_si_marker_disc.py``, campaign config, id275): the clean store
+    ADDRESS and the clean stored VALUE both live on each store's AX-MARKER row
+    (a-marker @281: ``ADDR_B0=0xE8`` + ``AX_CARRY=0x17``=23; b-marker @401:
+    ``ADDR_B0=0xE0`` + ``AX_CARRY=0x2F``=47), and the ``LI a`` byte-0 lookup row
+    (@491) carries its TARGET address in ``AX_CARRY=0xE8`` (its ``ADDR_B0`` is
+    0x00 there — Root 1's address-blindness). The existing head-0 CAM reads the
+    recency-tied store VALUE rows (which are address-blind AND carry an
+    address-like ``CLEAN_EMBED``, NOT the value — Root 2), so it delivers the
+    wrong local. This head bypasses BOTH roots with a DIRECT address-keyed CAM:
+
+      * Q (the LI byte-0 lookup row): fire ONLY at an LI emit row — gated on
+        ``OP_LI`` (~5.2 at the byte-0 emit row, ~0.05 residue elsewhere) — and
+        key on the row's OWN ``AX_CARRY_LO/HI`` nibbles (the target address,
+        e.g. 0xE8 for ``LI a``). A CONST sink anchors softmax1 so a non-LI row
+        writes ~nothing.
+      * K (candidate store markers): match the store address by keying on the
+        candidate's ``ADDR_B0_LO/HI`` nibbles (the store address 0xE8 / 0xE0)
+        against the Q's ``AX_CARRY``. A ``-OP_PSH`` penalty rejects the
+        address-COMPUTATION push row (@251: ``ADDR_B0=0xE8`` too, but
+        ``AX_CARRY=0xE8``=address and ``OP_PSH~5.2``) so the CAM lands on the
+        genuine store-value marker (@281: ``OP_PSH~0.05``, ``AX_CARRY``=value).
+      * V copies the selected marker's ``AX_CARRY_LO/HI`` (the CLEAN stored
+        value 0x17=23) -> O writes it into OUTPUT_LO/HI at value_scale 60, which
+        DOMINATES head-0's wrong ``value_scale=40`` CLEAN copy at the argmax.
+
+    Recency (ALiBi slope 0.05, matching the load heads) resolves a re-store to
+    the SAME local (var_update) to the latest store. Campaign-gated
+    (``C4_SI_STORE_ADDR``); flag-off omits the head (num_heads<17) so the golden
+    campaign (16-head) build is byte-identical.
+    """
+    _cam_s = 360.0    # per-nibble address-match scale (mirrors #313 head-0 CAM).
+    _sink = 30.0      # softmax1 CONST sink (mirrors the savedra head).
+    _psh_rej = 400.0  # K-side OP_PSH penalty (reject the address-push row).
+    value_scale = 60.0
+
+    q: list[AP] = []
+    k: list[AP] = []
+
+    # === Slot 0: CONST sink (softmax1 anchor). ===
+    # A uniform positive K on every real row's CONST, matched by a small Q, so
+    # that when NO candidate scores positive (the slot-59 darkener below fires)
+    # the softmax mass lands on this sink and the head writes ~nothing.
+    q.append(AP(0, BD.OP_LI, 1.0))
+    k.append(AP(0, BD.CONST, _sink))
+
+    # === Slot 59: fire ONLY at the byte-0 AX-marker QUERY row (MARK_AX). ===
+    # The head must write OUTPUT ONLY at the LI byte-0 emit row (the AX marker,
+    # MARK_AX=1), NOT at the byte-1/2/3 value rows (492-494: MARK_AX=0, IS_BYTE=1)
+    # -- those rows ALSO carry an AX_CARRY residue (~3.1) so the pure address
+    # match would fire there and copy the store value into byte 1/2/3, corrupting
+    # the high bytes (the 0x1717 fingerprint). This slot is a QUERY-side gate: on
+    # a non-MARK_AX query row it drives EVERY real candidate's score far negative
+    # (K=CONST is 1 on all rows) so the softmax1 sink wins and the head writes ~0;
+    # on the byte-0 AX-marker query row (MARK_AX=1) Q[59]=0 so the address match
+    # proceeds unchanged. Q = DARK*(MARK_AX - CONST): 0 at the marker, -DARK at
+    # every byte/non-marker query row. DARK must dominate AFTER the head_dim^-0.5
+    # score scale: the byte rows carry AX_CARRY at ~3x amplitude so their address
+    # match scores ~3e5; a HARD 1e7 gate drives a non-marker query ~-1e6 below
+    # the sink (mirrors the savedra head's slot-3 1e6 HARD gate).
+    _dark = 10_000_000.0
+    q.append(AP(59, BD.MARK_AX, _dark))
+    q.append(AP(59, BD.CONST, -_dark))
+    k.append(AP(59, BD.CONST, 1.0))
+
+    # === Slot 57: fire ONLY on an LI/LC EMIT QUERY row (require OP_LI). ===
+    # MARK_AX alone (slot 59) is NOT enough: EVERY step emits an AX marker
+    # (MARK_AX=1), including the step-0 ENT prologue, and those markers carry an
+    # AX_CARRY residue too -- so without an OP_LI requirement the head fires on
+    # every step's AX marker and copies a stray store value into that step's AX
+    # byte (the AR step-0 ax=3 divergence). This slot darkens any query row whose
+    # OP_LI is below the LI-emit threshold (~5.2 at a real LI, ~0 elsewhere):
+    # Q = DARK*(OP_LI - 2.5*CONST) -> +DARK*2.7 at an LI row (NO darkening),
+    # -DARK*2.5 at a non-LI marker (HARD darken -> sink wins). K=CONST=1.
+    q.append(AP(57, BD.OP_LI, _dark))
+    q.append(AP(57, BD.CONST, -2.5 * _dark))
+    k.append(AP(57, BD.CONST, 1.0))
+
+    # === Slots 1..16: address-match Q(AX_CARRY) . K(ADDR_B0), LOW nibble. ===
+    # The LI-query row carries its TARGET address in AX_CARRY_LO (nibble n); the
+    # store marker carries its STORE address in ADDR_B0_LO (nibble n). A PURE
+    # per-nibble one-hot match (Q on AX_CARRY_LO+n, K on ADDR_B0_LO+n) scores
+    # ~_cam_s^2/sqrt(hd) ONLY on the store marker whose nibble n EQUALS the
+    # queried nibble. CRITICAL: the match slots carry NO OP_LI/CONST baseline --
+    # a per-slot constant Q would multiply EVERY candidate's ADDR_B0 residue
+    # (rewarding address MASS, not the specific nibble MATCH) and let a wrong
+    # store's stray ADDR_B0 residue out-score the exact match. The OP_LI firing
+    # gate lives on the dedicated slots 59/60 instead. INCLUDE the k=0 (null)
+    # nibble: unlike the head-0 #313 CAM (which reads the address-blind VALUE
+    # rows where a stray 0x00 out-scores the local), this head's tight MARK_AX +
+    # OP_PSH/OP_LI reject gates restrict candidates to genuine store markers, so
+    # a target address ending in nibble 0 (e.g. &b=0xE0, LO nibble 0) MUST be
+    # matchable to discriminate it from a same-high-nibble sibling (&a=0xE8).
+    for _k in range(0, 16):
+        # LO band: slot k for k=1..15, slot 16 for the k=0 (null) LO nibble
+        # (slot 0 is the CONST sink; keep k=0 off it).
+        _row = _k if _k >= 1 else 16
+        q.append(AP(_row, BD.AX_CARRY_LO + _k, _cam_s))
+        k.append(AP(_row, BD.ADDR_B0_LO + _k, _cam_s))
+
+    # === Slots 17..31 + 58: address-match Q(AX_CARRY) . K(ADDR_B0), HIGH nibble.
+    for _k in range(0, 16):
+        # HI band: slot 16+k for k=1..15, slot 58 for the k=0 (null) HI nibble.
+        _row = (16 + _k) if _k >= 1 else 58
+        q.append(AP(_row, BD.AX_CARRY_HI + _k, _cam_s))
+        k.append(AP(_row, BD.ADDR_B0_HI + _k, _cam_s))
+
+    # === Slot 62: reject the address-COMPUTATION push row. ===
+    # For a BP-local whose address byte-0 nibbles equal the loaded local's
+    # address (id275 ``&a``: the LEA/PSH row @251 carries ADDR_B0=0xE8 AND
+    # AX_CARRY=0xE8=address, OP_PSH~5.2), the address match ALSO fires on that
+    # push row. The genuine store-value marker (@281) carries OP_PSH~0.05, so a
+    # K-side -OP_PSH penalty (gated on the OP_LI firing query) drives the push
+    # row's score far below the store marker's. Slot 62 (head_dim 111; the base
+    # spec does not use this head so all slots are free — pick high slots to
+    # stay clear of any generate_attention_head scaffolding).
+    q.append(AP(62, BD.OP_LI, _psh_rej))
+    q.append(AP(62, BD.CONST, -0.05 * _psh_rej))
+    k.append(AP(62, BD.OP_PSH, -_psh_rej))
+
+    # === Slot 61: reject the LI-query row ITSELF (self-attention guard). ===
+    # The LI byte-0 lookup row (@491) carries an address-like ADDR_B0 (its OWN
+    # target address 0xE8), so the Q(AX_CARRY) . K(ADDR_B0) match ALSO fires on
+    # the query row itself -- and self-attending copies its OWN AX_CARRY (=the
+    # target address 0xE8=232, WRONG) into OUTPUT, out-scoring the genuine store
+    # marker. The query row is the UNIQUE candidate carrying OP_LI~5.2 (the store
+    # markers have OP_LI~0.05), so a K-side -OP_LI penalty (gated on the firing
+    # query) drives the self-row far below the store marker.
+    q.append(AP(61, BD.OP_LI, _psh_rej))
+    q.append(AP(61, BD.CONST, -0.05 * _psh_rej))
+    k.append(AP(61, BD.OP_LI, -_psh_rej))
+
+    # === Slot 60: REQUIRE MARK_AX (reject the store VALUE BYTE rows). ===
+    # THE key candidate filter. The store's clean value lives on its AX-MARKER
+    # (MARK_AX=1, IS_BYTE=0), but the store's VALUE-BYTE rows (MARK_AX=0,
+    # IS_BYTE=1, MEM_STORE=1) carry an ADDR_B0 one-hot at DOUBLE amplitude (2.0
+    # vs the marker's 1.0) so the raw Q(AX_CARRY).K(ADDR_B0) match fires HARDER
+    # on the byte rows and self-attends the wrong (address-blind) value. Drive
+    # every non-MARK_AX row far negative so only the store's AX-marker (where
+    # the clean AX_CARRY value lives) can win. K = REJ*(MARK_AX) - REJ*CONST:
+    # 0 on a marker (MARK_AX=1), -REJ on every byte/prompt row (MARK_AX=0).
+    # The Q side is OP_LI-gated at LARGE magnitude (2*_cam_s, like the
+    # address-match slots) so the reject score DOMINATES the raw ADDR_B0 match:
+    # a non-marker byte row (MARK_AX=0) scores ~(2*360*5.2)*(-2000)/sqrt(111)
+    # ~= -7e5, decisively below any ADDR_B0 match (~4e5), while a genuine store
+    # marker (MARK_AX=1) gets exactly 0 from this slot.
+    _ax_req = 2000.0
+    q.append(AP(60, BD.OP_LI, 2.0 * _cam_s))
+    q.append(AP(60, BD.CONST, -0.05 * 2.0 * _cam_s))
+    k.append(AP(60, BD.MARK_AX, _ax_req))
+    k.append(AP(60, BD.CONST, -_ax_req))
+
+    # === V/O: copy the matched store marker's AX_CARRY (clean value) to OUTPUT.
+    v: list[AP] = []
+    o: list[AO] = []
+    for kk in range(16):
+        v.append(AP(32 + kk, BD.AX_CARRY_LO + kk, 1.0))
+        v.append(AP(48 + kk, BD.AX_CARRY_HI + kk, 1.0))
+        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
+        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
+
+    return DeclarativeAttentionHeadSpec(
+        head_idx=_L15_SI_STORE_ADDR_HEAD_IDX,
+        q=tuple(q),
+        k=tuple(k),
+        v=tuple(v),
+        o=tuple(o),
+        # Recency (matching the L15 load heads' 0.05 slope) resolves a re-store
+        # to the SAME local (var_update x-reassign) to the latest store, while
+        # still reaching the store several steps before the LI.
+        alibi_slope=0.05,
+        # The store's AX-marker was written on the SI step; the LI gather reads
+        # its AX_CARRY across step boundaries by design -> ANY_STEP.
+        step_window=StepWindowConstraint.ANY_STEP,
+    )
+
+
 def _layer15_memory_lookup_lev_heads_4_11_specs_with_overrides(
     BD,
 ) -> tuple[DeclarativeAttentionHeadSpec, ...]:
@@ -3087,6 +3287,18 @@ def _layer15_memory_lookup_ir(
             name="layer15_memory_lookup.savedra_pc",
             metadata={"role": "savedra_pc", "shape": "num_heads >= 16"},
         )
+    # Head 16: SI/SC store address-provenance CAM (flag C4_SI_STORE_ADDR,
+    # campaign, DEFAULT-OFF). Emitted when the resize has allocated a 17th head
+    # (num_heads >= 17) or on the declarations-only audit path when the flag is
+    # on. Flag-off omits the head so the golden campaign build is byte-identical.
+    if si_store_addr_enabled() and (
+        num_heads is None or int(num_heads) >= 17
+    ):
+        attn_op.append(
+            _layer15_si_store_addr_cam_head_spec(proxy),
+            name="layer15_memory_lookup.si_store_addr_cam",
+            metadata={"role": "si_store_addr_cam", "shape": "num_heads >= 17"},
+        )
     return ir
 
 
@@ -3211,6 +3423,11 @@ def make_layer15_memory_lookup_op() -> Operation:
                # OP_JSR: read by the campaign head-0 JSR-phantom value-row
                # penalty (slot 104, _l15_li_jsr_phantom_penalty_on).
                "OP_JSR",
+               # ADDR_B0_LO/HI + OP_PSH: read by the campaign head-16 SI/SC
+               # store address-provenance CAM (_layer15_si_store_addr_cam_head_spec,
+               # C4_SI_STORE_ADDR). ADDR_B0 keys the store-address match; OP_PSH
+               # penalizes the address-computation push row.
+               "ADDR_B0_LO", "ADDR_B0_HI", "OP_PSH",
                "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3", "CMP", "CONST"},
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
         kind="attn",
@@ -4533,6 +4750,21 @@ def _l15_attention_resize_follow_up(block, dim_positions, S) -> None:
         Primitives.generate_attention_head(
             attn,
             _layer15_savedra_pc_head_spec(_as_setdim_proxy(dim_positions)),
+            int(head_dim),
+        )
+    # Head 16: SI/SC store address-provenance CAM (flag C4_SI_STORE_ADDR,
+    # campaign, DEFAULT-OFF). Like heads 14/15, the production
+    # ``layer15_memory_lookup`` bake runs at the pre-widen head count (BEFORE
+    # this resize), so a head gated on the resized count never gets its body
+    # there. Lower head 16's Q/K/V/O cells HERE, after the resize has grown the
+    # attn to >=17 heads. Flag-off keeps the resize target at <=16 and skips
+    # this -> byte-identical with the golden campaign build.
+    if si_store_addr_enabled() and getattr(
+        attn, "num_heads", 0
+    ) > _L15_SI_STORE_ADDR_HEAD_IDX:
+        Primitives.generate_attention_head(
+            attn,
+            _layer15_si_store_addr_cam_head_spec(_as_setdim_proxy(dim_positions)),
             int(head_dim),
         )
 

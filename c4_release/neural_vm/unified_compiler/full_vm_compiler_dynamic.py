@@ -2279,6 +2279,12 @@ def compile_full_vm_dynamic(
             "C4_L15_LEV_PC_RESTORE": (
                 os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
             ),
+            # L15 head-16 SI/SC store address-provenance CAM (DEFAULT-OFF, opt in
+            # =1). CHANGES num_heads (16->17) and the L15 W_q/W_k/W_v/W_o shapes,
+            # so the ON / OFF builds MUST NEVER share a memo / disk entry.
+            "C4_SI_STORE_ADDR": (
+                os.environ.get("C4_SI_STORE_ADDR") == "1"
+            ),
             # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
             # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
             # value_scale=40 V/O delivery. Output-affecting on the LEV PC marker
@@ -3093,6 +3099,13 @@ def _bake_from_scheduled_ops(
         # serialised entry.
         "C4_L15_LEV_PC_RESTORE": (
             os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
+        ),
+        # L15 head-16 SI/SC store address-provenance CAM (DEFAULT-OFF, opt in
+        # =1): grows L15 memory-lookup attention 16 -> 17 heads (changes
+        # num_heads + the L15 W_q/W_k/W_v/W_o shapes), so the ON / OFF builds
+        # must never share a serialised entry.
+        "C4_SI_STORE_ADDR": (
+            os.environ.get("C4_SI_STORE_ADDR") == "1"
         ),
         # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
         # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs

@@ -1327,6 +1327,43 @@ def no_stack0_emit_enabled() -> bool:
     return os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 
 
+def si_store_addr_enabled() -> bool:
+    """Return True iff the SI/SC store address-provenance CAM head is active
+    (DEFAULT OFF — opt in via ``C4_SI_STORE_ADDR=1``; only meaningful in the
+    30-token campaign config).
+
+    ROOT (the ``var_mul``/multilocal-LI store-provenance TWO-ROOT wall, verified
+    2026-06-18 by built-layout probe + hook-inject; ``var_mul`` id275
+    ``int a;int b;a=23;b=47;return a*b;`` fails: ``LI a`` returns b's 47 not a's
+    23). The existing L15 head-0 LI value-load CAM (``C4_L15_LI_ADDR_CAM``)
+    discriminates two same-frame locals by matching ``ADDR_B0_LO/HI`` on each
+    store's VALUE row and copies that row's ``CLEAN_EMBED`` into OUTPUT. But
+    (Root 1) the SI/SC store VALUE rows carry ``ADDR_B0==0x00`` (address-blind)
+    so the candidates tie and ALiBi recency picks the last store (b); AND (Root
+    2) even with the correct ``ADDR_B0`` injected the value rows carry an
+    address-like ``CLEAN_EMBED`` pattern, NOT the clean value 23. Provenance is
+    missing on BOTH axes on the exact rows the CAM reads.
+
+    THE LEVER (built-layout probe, ``tools/_probe_si_store_addr.py``, campaign
+    config, id275): the clean address AND clean value BOTH live on the store's
+    AX-MARKER row (a-marker: ``ADDR_B0=0xE8`` + ``AX_CARRY=0x17``=23; b-marker:
+    ``ADDR_B0=0xE0`` + ``AX_CARRY=0x2F``=47), and the ``LI a`` query row carries
+    its target address in ``AX_CARRY=0xE8`` (NOT in ``ADDR_B0``, which is 0x00
+    there). So a DIRECT address-keyed CAM bypasses BOTH roots: LI-query row Q
+    keyed on its ``AX_CARRY`` (target addr) -> SI/SC store AX-marker K keyed on
+    the marker's ``ADDR_B0`` (store addr) -> V copies the marker's ``AX_CARRY``
+    (the clean stored value) -> O writes the LI result into OUTPUT.
+
+    Implemented as a dedicated flag-gated L15 attention head
+    (``layer15_si_store_addr_cam``) appended to the L15 head layout only when the
+    flag is on, so flag-OFF keeps the L15 head count + weights byte-identical to
+    golden (the CAM never installs). Campaign-only: the ``AX_CARRY``/``ADDR_B0``
+    marker signals it keys on are produced by the 30-token MEM-from-SP path;
+    golden (35-token, flag-OFF) is byte-identical.
+    """
+    return os.environ.get("C4_SI_STORE_ADDR") == "1"
+
+
 def loaded_operand_add_hi15_clear_enabled() -> bool:
     """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
     clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),
