@@ -141,12 +141,16 @@ _DEFAULT_FULL_TRACE_SPEC_K = 32
 # Skip (count as 'skipped', NEVER pass) any program whose declarative oracle
 # step count exceeds this cap. Identical default + rationale to
 # ``run_1096_canonical._DEFAULT_MAX_STEPS_CAP``: all 846 passable
-# (non-diverging) programs are <=39 steps, so the default 40 drops NO pass; it
-# only skips the deep diverging loop/gcd/rec band that runs its full horizon at
-# O(steps^2). On CPU (no KV cache) each of those is MINUTES, so the cap matters
-# even more here. Pass ``--max-steps-cap 0`` to disable (runs the whole
-# horizon of the deepest rec_fib — hours on CPU).
-_DEFAULT_MAX_STEPS_CAP = 40
+# (non-diverging) short programs are <=39 steps, so the default 1000 drops NO
+# pass; it folds the WHOLE deep diverging loop/gcd/rec band (233 programs at
+# 41..8369 steps) into the run so each gets a real pass/fail verdict. The model
+# forward has no position ceiling (ALiBi relative-distance; a 5000-token forward
+# runs with no mask ceiling, validated 2026-07-03), so a deep program that does
+# not hit an unfixed per-step root PASSES. On CPU (no KV cache) each deep member
+# is MINUTES (O(steps^2)); use ``--max-steps-cap 40`` for the fast short-only
+# run, or ``--max-steps-cap 0`` to disable the cap (the deepest rec_fib is hours
+# on CPU). Programs above 1000 steps stay skipped so a full run never OOMs.
+_DEFAULT_MAX_STEPS_CAP = 1000
 
 # A "prepared" program entry (the tuple ``_compile_and_oracle`` yields):
 #   (idx, suite_expected, description, decl_exit, decl_steps, bytecode, data)
@@ -445,8 +449,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help=f"skip (count as 'skipped', NEVER pass) any program "
                          f"whose declarative oracle step count exceeds this cap. "
                          f"Default {_DEFAULT_MAX_STEPS_CAP} matches the GPU gate "
-                         f"and drops NO pass (all 846 passable programs are <=39 "
-                         f"steps). Pass 0 to disable (hours on CPU for deep rec).")
+                         f"and drops NO pass (all 846 short programs are <=39 "
+                         f"steps); it folds in the 233 deep loop/gcd/rec programs "
+                         f"so each gets a real verdict. Pass 40 for the fast "
+                         f"short-only run; 0 to disable (hours on CPU for deep rec).")
     ap.add_argument("--criterion", default="full_trace",
                     choices=["full_trace", "strict_trace"],
                     help="verdict criterion (default: full_trace)")
