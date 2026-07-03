@@ -24,10 +24,18 @@ that pulls it back → byte-identity gate it → commit.
 
 ## Declarative IR is the primary weight-authoring path
 
-All new ops MUST be declarative. Imperative `block.ffn.W_*[...] = X`
-or `attn.W_q[...] = Y` writes are legacy; Phase 6 migrated them
-into `compiler_ir=` + `compiler_ir_factory=` and Phase 7 finishes the
-cut. The pattern guides are mandatory reading before writing any op:
+All ops ARE declarative. The model is now **100% live-declarative**:
+every production weight is written by the IR lowering pipeline
+(`compile_full_vm_dynamic`), and a `settrace` census confirms **zero**
+live `_set_layer*` imperative writers on the build path. The legacy
+`vm_step.set_vm_weights()` entry point has been REMOVED (see
+`weight_setter.py:111`); the `_set_layer*` functions still present in
+`vm_step.py` / `setup_helpers_*.py` are now orphaned dead fixtures kept
+only for their docstring cross-references and legacy byte-identity tests
+(prune target — see [`docs/TEST_PRUNE_MAP.md`](docs/TEST_PRUNE_MAP.md)).
+Imperative `block.ffn.W_*[...] = X` or `attn.W_q[...] = Y` writes are
+legacy and MUST NOT be added. The pattern guides are mandatory reading
+before writing any op:
 
 - [`docs/FFN_RULE_MIGRATION_PATTERN.md`](docs/FFN_RULE_MIGRATION_PATTERN.md)
   — FFN DSL: `FFNRule.constant_write` / `FFNRule.gated_write`,
@@ -124,6 +132,20 @@ eliminates the cross-lane merge conflict. Full API + the legacy
 
 Run these BEFORE committing any new op or rule change:
 
+- **`tools/_isa_golden_hash.py` — the authoritative flag-OFF byte-identity
+  gate.** The current golden (default, non-campaign, 35-token build) is
+  `state_dict_sha256 =
+  b4d2ab273438b3b2fa1bd024b48d0b06a15e63a81f66dec2812ada580b3ec70e`
+  (short `b4d2ab27`). Any docs/analysis change must leave this unchanged;
+  any weight-affecting change must intend the hash it produces. Use
+  `b4d2ab27` for all future flag-OFF byte-identity checks.
+- **`tools/lint_dim_resolution.py` — MANDATORY ratchet for any tool/op that
+  resolves a residual-dim POSITION.** The blessed resolution path is
+  `neural_vm.unified_compiler.dim_resolver.DimResolver` over the BUILT
+  `layout.dim_positions` (NOT the static registry, which the widen-repack
+  moves ~93% of dims off of — the documented false-"dead-signal" trap). The
+  lint flags static-registry `.start` / `.resolve_dim()` / `.slots[...]`
+  positional reads; opt out per-line with `# dim-resolution-lint: allow`.
 - `compare_symbolic_to_lowered_ffn(ir, dim_positions, S=100.0)` /
   `compare_symbolic_to_lowered_attn(...)` /
   `compare_symbolic_to_lowered_embedding(...)` — byte-identity gate.
@@ -150,7 +172,7 @@ Run these BEFORE committing any new op or rule change:
   `nested_*` / `if_var` / `expr_*` framing-drift clusters the GPU fails (the
   canonical `func_identity` "passes step 9" on CPU → 0/150 GPU false
   positive). `cpu_full_trace` reproduces every framing FAIL byte-for-byte
-  (validated 6/6 vs GPU on current main, golden `b9d8861f` flag-OFF). The
+  (validated 6/6 vs GPU on current main, golden `b4d2ab27` flag-OFF). The
   only CPU-vs-GPU disagreements are the documented SATURATED-TIE handful
   (`add` high-byte / `expr_paren` / `expr_mul_div`) where the MODEL itself is
   fp-accumulation-order divergent (~1e22 logits, gap=0) — and there CPU is
@@ -229,7 +251,7 @@ Run these BEFORE committing any new op or rule change:
   `C4_MUL_BLK33_CLAWBACK`) flagging add/sub/div `ok->fail`, and passes CLEAN
   on a no-op flag. Memory discipline: `--workers 2` max, dedicated
   `C4_VM_CACHE_DIR=/tmp/c4cache_reggate`, ~1 bake per state. Tooling only
-  (golden `4958b35b` unchanged).
+  (golden `b4d2ab27` unchanged).
 
 ## Tests
 
@@ -262,35 +284,60 @@ Run these BEFORE committing any new op or rule change:
 
 ## Where the work lives
 
-- `neural_vm/unified_compiler/` — declarative compiler. Subdir `ops/`
-  contains the per-layer `lN_ops.py` files; each exports `make_*` op
-  factories.
-- `neural_vm/vm_step.py` — legacy imperative bake hooks. Migration
-  target: shrink toward zero as Phase 7.C cuts the last `_set_layerN_*`
-  helpers.
-- `neural_vm/setup_helpers.py` — legacy `_set_layerN_*` weight writers.
-  Same target as `vm_step.py`.
+- `neural_vm/unified_compiler/` — THE declarative compiler (sole live
+  weight-authoring path; entry `compile_full_vm_dynamic` in
+  `full_vm_compiler_dynamic.py`). Subdir `ops/` contains the per-layer
+  `lN_ops.py` files; each exports `make_*` op factories. The old
+  standalone `unified_compiler/compiler.py` (`UnifiedVMCompiler`, ~3.8k
+  LOC) is DELETED (commit `0bb9c5af`); a couple of docstrings still
+  cross-reference it historically.
+- `neural_vm/vm_step.py` / `neural_vm/setup_helpers_l*.py` — **dead**
+  legacy `_set_layerN_*` weight writers. `set_vm_weights()` (the only
+  entry that called them) has been removed, so NOTHING on the build path
+  invokes them. Kept for legacy byte-identity tests + docstring
+  cross-refs; prune target (see [`docs/TEST_PRUNE_MAP.md`](docs/TEST_PRUNE_MAP.md)).
 - `tools/` — sweep + audit scripts. Self-contained Python; no model
   bake side effects.
 - `docs/` — design docs, migration guides, phase plans. New designs
-  always land here first.
+  always land here first. Flag inventory:
+  [`docs/FLAG_REGISTRY.md`](docs/FLAG_REGISTRY.md).
 
-## Phase status (as of June 2026)
+## Phase status (as of July 2026, golden `b4d2ab27`)
 
-- **Phase 6 (declarative authoring)**: ~complete for FFN ops + most
-  attention heads. L6 `routing_ffn` and L15 `memory_lookup` cut via
-  Phase 7.C.
+- **Model is 100% live-declarative.** The imperative→declarative cut is
+  COMPLETE: `settrace` confirms ZERO live `_set_layer*` writers on the
+  build path, and `set_vm_weights()` is removed. The last live imperative
+  writer (L8 `_set_layer8_alu`) was migrated. The old `UnifiedVMCompiler`
+  (`compiler.py`, ~3.8k LOC) is DELETED.
+- **Phase 6 (declarative authoring)**: COMPLETE for FFN ops + attention
+  heads. L6 `routing_ffn` and L15 `memory_lookup` cut via Phase 7.C.
+- **AX byte-emission consolidation**: DONE. AX byte-1/2/3 now emit from
+  the canonical `OUTPUT_LO/HI` nibbles (the L25 `b1_to_output` decode);
+  the per-value H-band (`H*_DUMP_OUT`) LM-head emission patchwork is
+  removed and the `C4_B1_TO_OUTPUT` flag is DELETED (OUTPUT-canonical is
+  the sole unconditional byte-1 path, commit `1866d62f`). The dead
+  `ax_li_byte23_zero` / `ax_byte23_dump_zero` correctors were removed.
 - **Phase 7.A (scheduler cycle decomposition)**: in progress;
-  `OUTPUT_HI` split into `OUTPUT_HI_PREV_STEP` for cross-step reads
-  landed (commits 1eff091, 7afb953, 7291034).
+  `OUTPUT_HI` split into `OUTPUT_HI_PREV_STEP` for cross-step reads.
 - **Phase 7.B (pin removal)**: pending; `pin=` is still corpus-wide.
 - **Phase 7.C (partial-migration cuts)**: L6 routing, L15 memory_lookup
-  landed (commits 2813324, 18c1725).
-- **Phase 7.D (model-level bakes)**: `TokenEmbeddingRule` exists;
-  `head_bake` / `embedding_bake` migration pending.
-- **Phase 7.E (semantic dim refs)**: pending — rules still use `+N`
-  offsets instead of `(category, role)`.
+  landed.
+- **Phase 7.D (model-level bakes)**: `TokenEmbeddingRule` exists and is
+  in production use (`head_bake` / `embedding_bake` model-level bakes);
+  further migration continues.
+- **Phase 7.E (semantic dim refs)**: PARTIALLY LANDED — `dim_ref("category",
+  "role")` authoring (from `dim_registry.py`) is in production across many
+  layers (l1/l2/l3/l4/l5/l6/l8/l9/l11/l12/l13/l14 + model/alu ops); the
+  remaining `+N`-offset refs are being ported byte-identically (`l0/l7/l16`
+  in flight). A canonical `DimResolver`
+  (`unified_compiler/dim_resolver.py`) + the `tools/lint_dim_resolution.py`
+  ratchet now enforce BUILT-layout dim resolution.
 - **Phase 7.F (KV eviction)**: blocked on 7.A + 7.D.
+
+**Config entry point:** `C4_CAMPAIGN=1` is the single flag that flips the
+30-token campaign config (the fix fleet's DEFAULT); the golden flag-OFF
+(35-token) build is byte-identical. Every runtime `C4_*` flag is
+inventoried in [`docs/FLAG_REGISTRY.md`](docs/FLAG_REGISTRY.md).
 
 When in doubt, check
 [`docs/PHASE_7_FULLY_DYNAMIC_PLAN.md`](docs/PHASE_7_FULLY_DYNAMIC_PLAN.md)
