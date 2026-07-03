@@ -2307,7 +2307,7 @@ def _b1_to_output_enabled() -> bool:
     build. Evaluated lazily (compile time) so a per-process env flip is honoured
     and the compile cache key reflects it.
     """
-    return _os_stack0.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
+    return _os_stack0.environ.get("C4_B1_TO_OUTPUT", "1") != "0"
 
 
 # The carried byte-1 one-hot lives at ``H<k>_DUMP_OUT+off`` per the LM-head
