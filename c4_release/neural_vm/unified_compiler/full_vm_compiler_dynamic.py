@@ -2220,17 +2220,6 @@ def compile_full_vm_dynamic(
             "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
                 os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
             ),
-            # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1): adds a
-            # BYTE_INDEX_2-keyed Q/K NOT-blocker slot to the L10
-            # psh_stack0_passthrough head so the PSH-arg byte-3 relay does not
-            # crush the value-byte OUTPUT (the post-ENT 34-token desync root),
-            # output-affecting on func/nested PSH steps -> ON / OFF builds must
-            # NEVER share a memo / disk entry. Held off (HEAD-identical) as a
-            # verified framing building block -- net -1 exit_code trade, see
-            # _psh_stack0_byte3_relay_darken_enabled.
-            "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
-                os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
-            ),
             # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0):
             # adds a MEM_STORE-gated AX-row boost slot to L14/L18 value head 4
             # (output-affecting on the call-arg PSH store value), so the ON /
@@ -3053,12 +3042,6 @@ def _bake_from_scheduled_ops(
         # serialised entry. Ships with the C4_L15_LEV func chain.
         "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
             os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
-        ),
-        # PSH STACK0 byte-3 relay darkening (DEFAULT-OFF, opt in =1,
-        # output-affecting on func/nested PSH steps): the ON / OFF builds must
-        # never share a serialised entry.
-        "C4_PSH_STACK0_BYTE3_RELAY_DARKEN": (
-            os.environ.get("C4_PSH_STACK0_BYTE3_RELAY_DARKEN", "0") == "1"
         ),
         # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0,
         # output-affecting on the call-arg PSH store value): the ON / OFF
