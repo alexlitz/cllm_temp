@@ -7957,42 +7957,6 @@ def _set_layer16_lev_routing(ffn, S, BD):
     # We'll handle increment in L8 FFN.
 
 
-def _set_format_pointer_extraction(attn, S, BD, HD):
-    """L7 attention: Extract format string pointer from STACK0 when entering output mode.
-
-    When IO_IN_OUTPUT_MODE just activated (after THINKING_END):
-    - Attend back to previous step's STACK0 marker position
-    - Copy EMBED_LO and EMBED_HI (format string pointer byte 0)
-    - Write to FORMAT_PTR_LO and FORMAT_PTR_HI
-
-    For simplicity, we only extract byte 0 of the pointer, supporting format
-    strings at addresses < 256. Full 32-bit pointer extraction requires
-    gathering all 4 STACK0 bytes, which is more complex.
-
-    Uses Head 7 (last available head in L7).
-    """
-    L = 20.0
-    base = 7 * HD  # head 7
-
-    # Q: active when IO_IN_OUTPUT_MODE (just entered output mode)
-    attn.W_q[base, BD.IO_IN_OUTPUT_MODE] = L
-
-    # K: match STACK0 marker from previous step
-    attn.W_k[base, BD.MARK_STACK0] = L
-
-    # V: copy EMBED_LO and EMBED_HI (pointer byte 0)
-    for k in range(16):
-        attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
-        attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
-
-    # O: write to FORMAT_PTR_LO and FORMAT_PTR_HI
-    # Note: FORMAT_PTR_LO is defined as a range (467-482) for 16 nibbles
-    # but we only use the first 16 dims for lo nibble
-    for k in range(16):
-        attn.W_o[BD.FORMAT_PTR_LO + k, base + 1 + k] = 1.0
-        attn.W_o[BD.FORMAT_PTR_HI + k, base + 17 + k] = 1.0
-
-
 def _set_format_position_counter(ffn, S, BD):
     """L8 FFN addition: Increment format string position counter.
 
