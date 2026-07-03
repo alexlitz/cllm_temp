@@ -3,7 +3,7 @@
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -839,8 +839,6 @@ def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     units at non-ALU positions; the clear band cancels them.
     """
 
-    rules: list[FFNRule] = []
-
     # Conditions = MARK_AX + OR over the 15 non-ALU opcodes (all unit weights).
     # Threshold 1.5 implements "MARK_AX AND any one non-ALU opcode" semantics:
     # MARK_AX(=1) + exactly one OP_*(=1) sums to 2.0 > 1.5 while OP_* alone
@@ -876,25 +874,21 @@ def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_MEM", -1e6),
     )
 
-    # ALU_LO clear: 16 units.
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"alu_lo_clear_{k}",
-            conditions=common_conditions,
-            threshold=1.5,
-            writes=((f"ALU_LO+{k}", -10.0 / S),),
-        ))
-
-    # ALU_HI clear: 16 units.
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"alu_hi_clear_{k}",
-            conditions=common_conditions,
-            threshold=1.5,
-            writes=((f"ALU_HI+{k}", -10.0 / S),),
-        ))
-
-    return tuple(rules)
+    # ALU_LO clear (16 units) then ALU_HI clear (16 units).
+    #
+    # Reduction map ⑥: this per-cell BYTE-CLEAR band is the shared
+    # cross-layer primitive (mirrors the l14 OUTPUT-clear bands); delegate
+    # to ``byte_clear_rules``. Byte-identical: band-major then cell-major
+    # rule order, ``-10.0 / S`` per cell, legacy names preserved via
+    # ``name_by_band``.
+    return byte_clear_rules(
+        bands=("ALU_LO", "ALU_HI"),
+        conditions=common_conditions,
+        threshold=1.5,
+        write_value=-10.0,
+        S=S,
+        name_by_band={"ALU_LO": "alu_lo_clear", "ALU_HI": "alu_hi_clear"},
+    )
 
 
 def _layer9_bp_plus8_shift_rules(S: float) -> tuple[FFNRule, ...]:
