@@ -845,6 +845,17 @@ def all_core_ops(
         # genuine >=0x10000 value. Gated by C4_AX_HIBYTE_CLEAR (DEFAULT-OFF). See
         # l11_ops.make_ax_hibyte_clear_allstep_op.
         make_ax_hibyte_clear_allstep_op(),
+        # ARCHITECTURAL REFACTOR increment 1: AX byte-1 DUMP -> OUTPUT decode.
+        # Decodes the carried byte-1 one-hot out of ``H1_DUMP_OUT`` (filled by
+        # ax_byte1_dump_repopulate on carried steps) back into the CANONICAL
+        # ``OUTPUT_LO/HI`` nibbles, so the SAME byte-1 emits from OUTPUT that
+        # currently emits from the H-band (the base the LM head reads for ALL
+        # bytes). Appended AFTER ax_hibyte_clear_allstep so H1_DUMP_OUT is filled
+        # and it is among the last OUTPUT writers on the AX byte-1 dump row.
+        # Gated by C4_B1_TO_OUTPUT (DEFAULT-OFF); flag-OFF bakes NO units ->
+        # byte-identical. Step 1 of consolidating AX byte emission onto OUTPUT.
+        # See l11_ops.make_b1_to_output_op.
+        make_b1_to_output_op(),
         # SUB full-borrow byte-1 0xFF writer (CAMPAIGN-ONLY, C4_SUB_FULL_BORROW):
         # the POST-SLAM half of the sub_borrow_cascade fix. On the row where the
         # L14 precursor lit SUB_FULL_BORROW, overwrites OUTPUT byte 1 = 0xFF.

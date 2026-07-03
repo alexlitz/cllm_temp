@@ -2307,6 +2307,15 @@ def compile_full_vm_dynamic(
             "C4_LEV_AX_BYTE1_KILL": (
                 os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
             ),
+            # AX byte-1 DUMP -> OUTPUT decode (architectural refactor increment 1;
+            # DEFAULT-OFF, opt in =1): appends the b1_to_output FFN on the L25 tail
+            # that decodes the carried byte-1 one-hot out of ``H1_DUMP_OUT`` into
+            # ``OUTPUT_LO/HI`` (output-affecting on the AX byte-1 dump row). The
+            # ON / OFF builds must NEVER share a memo entry. See
+            # l11_ops._b1_to_output_enabled.
+            "C4_B1_TO_OUTPUT": (
+                os.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
+            ),
             # Imperative AddSub byte-0 OUTPUT dominant-amplitude write
             # (DEFAULT-ON, opt out =0, output-affecting): out-votes the
             # downstream L9 ALU_LO->OUTPUT_LO leak. The ON / OFF builds must
@@ -3124,6 +3133,15 @@ def _bake_from_scheduled_ops(
         # builds must never share a serialised entry.
         "C4_LEV_AX_BYTE1_KILL": (
             os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
+        ),
+        # AX byte-1 DUMP -> OUTPUT decode (architectural refactor increment 1;
+        # DEFAULT-OFF, opt in =1): appends the b1_to_output FFN on the L25 tail
+        # that decodes the carried byte-1 one-hot out of ``H1_DUMP_OUT`` into
+        # ``OUTPUT_LO/HI`` (output-affecting on the AX byte-1 dump row). The ON /
+        # OFF builds must never share a serialised entry. See l11_ops.py
+        # ``_b1_to_output_enabled``.
+        "C4_B1_TO_OUTPUT": (
+            os.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
         ),
         # LEA-local multi-local E8 guard (DEFAULT-OFF, opt in =1, output-
         # affecting on the var multi-local LEA-from-frame address): the ON / OFF

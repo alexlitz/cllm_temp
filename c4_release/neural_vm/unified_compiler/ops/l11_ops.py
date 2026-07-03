@@ -2257,6 +2257,218 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
 
 
 # ===========================================================================
+# AX byte-1 DUMP -> OUTPUT decode (C4_B1_TO_OUTPUT, DEFAULT-OFF)
+# ===========================================================================
+#
+# ARCHITECTURAL REFACTOR increment 1 of "consolidate AX byte emission onto
+# OUTPUT, then delete the H-band patchwork". The LM head reads EVERY byte token
+# ``b`` from the CANONICAL nibble one-hots ``head.weight[b, OUTPUT_LO+(b&0xF)]``
+# / ``head.weight[b, OUTPUT_HI+(b>>4)]`` (see model_ops ``_head_bake_rules``).
+# The H1/H2/H3 ``*_DUMP_OUT`` bands that ALSO drive the AX byte-1 emission are
+# EXTRA LM-head columns stacked on top by the ``C4_AX_BYTE1_DUMP`` machinery
+# (``make_ax_byte1_dump_head_bake_op`` bakes ``head.weight[v, H1_DUMP_OUT+(v+2)]
+# = 5.0``); the carry FFN ``_ax_byte1_dump_repopulate_rules`` fills
+# ``H1_DUMP_OUT`` on carried (non-AX-writing) steps.
+#
+# This op DECODES the carried byte-1 one-hot back out of ``H1_DUMP_OUT`` into
+# the canonical ``OUTPUT_LO/HI`` nibbles so the SAME byte-1 emits from OUTPUT
+# that currently emits from the H-band. ``H1_DUMP_OUT`` is 7 wide (v in 0..4, a
+# one-hot at ``H1_DUMP_OUT+(v+2)`` — see model_ops ``_ax_byte1_dump_band_for_
+# value``). For each carried value v the op fires an AND on the byte-1-row
+# signature AND the lit ``H1_DUMP_OUT+(v+2)`` slot and writes ``OUTPUT_LO+v``
+# (v<=4 so the low nibble IS v) strongly + ``OUTPUT_HI+0`` (byte-1 high nibble
+# is 0 for v<=4), AND KILLS the leaked byte-0 default ``OUTPUT_LO+0`` so the
+# emitted byte is v, not 0. The gate mirrors the repopulate op's byte-1-row
+# signature (``ADDR_B1_HI+8`` AX-register scope + ``ADDR_B0_LO+5`` byte-1 row +
+# ``IS_BYTE``) so it fires ONLY where the H1 dump legitimately carries a byte-1.
+#
+# On a FRESH-AX step ``H1_DUMP_OUT`` is all-zero (the dump only fills it on
+# carried steps) -> every AND's ``H1_DUMP_OUT+(v+2)`` gate is 0 -> the units are
+# DARK -> the fresh byte-1 emission (from the normal H1 path) is byte-identical.
+# On PC/SP/BP/STACK0/MEM/marker rows the marker blockers + AX_CARRY_OVERFLOW
+# kill (mirrored from the dump) hold the op dark. DEFAULT-OFF (bakes NO units ->
+# byte-identical); increment 2 removes the ``H1_DUMP_OUT`` LM-head column once
+# this proves OUTPUT can carry the byte-1.
+def _b1_to_output_enabled() -> bool:
+    """``C4_B1_TO_OUTPUT`` flag predicate (DEFAULT-OFF architectural refactor).
+
+    Gates the AX byte-1 DUMP->OUTPUT decode FFN. Flag-OFF
+    (``C4_B1_TO_OUTPUT=0``) bakes NO units -> byte-identical to the pre-refactor
+    build. Evaluated lazily (compile time) so a per-process env flip is honoured
+    and the compile cache key reflects it.
+    """
+    return _os_stack0.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
+
+
+# H1_DUMP_OUT is 7 wide; the byte-1 one-hot lives at H1_DUMP_OUT+(v+2) for the
+# carried value v in 0..4 (model_ops ``_ax_byte1_dump_band_for_value``). One AND
+# per carried value.
+_B1_TO_OUTPUT_HIDDEN_DIM = 5  # v in 0..4
+
+
+def _b1_to_output_rules() -> tuple[FFNRule, ...]:
+    """5 AND rules decoding ``H1_DUMP_OUT+(v+2)`` -> ``OUTPUT_LO+v`` (v in 0..4).
+
+    Each unit fires on the byte-1-predictor-row signature (``IS_BYTE +
+    ADDR_B1_HI+8 AX-register + ADDR_B0_LO+5 byte-1 row``) AND the lit carried
+    one-hot slot ``H1_DUMP_OUT+(v+2)`` (weighted so it is a HARD requirement:
+    on a carried row exactly ONE slot is lit; on a fresh/non-AX row ALL slots
+    are 0 so the AND is dark and the byte-1 emission stays byte-identical to the
+    normal H1 path). On a fire it writes ``OUTPUT_LO+v`` (v<=4 -> low nibble v)
+    + ``OUTPUT_HI+0`` (byte-1 high nibble 0) strongly and KILLS the leaked
+    byte-0 default ``OUTPUT_LO+0`` so the byte emits v, not 0. Marker +
+    AX_CARRY_OVERFLOW blockers mirror the dump gate.
+    """
+    # Condition weights. The byte-1-row signature (IS_BYTE ~1.0 + ADDR_B1_HI+8
+    # ~4.02 * 1.0 + ADDR_B0_LO+5 ~0.97 * 2.0) contributes ~6.9 on the AX byte-1
+    # row; the lit H1_DUMP_OUT slot is the DISCRIMINATOR (large weight so it is a
+    # hard requirement — an unlit slot cannot clear threshold). Threshold sits
+    # ABOVE the signature-only sum so a carried row with the WRONG slot lit (or a
+    # fresh row with NO slot lit) stays dark.
+    IS_BYTE_W = 1.0
+    AX_REG_W = 1.0          # ADDR_B1_HI+8 AX-register scope
+    SIG_W = 2.0            # ADDR_B0_LO+5 byte-1 row signature
+    DUMP_SLOT_W = 20.0     # H1_DUMP_OUT+(v+2) HARD requirement (the value select)
+    THRESHOLD = 12.0       # above signature-only (~6.9); needs the dump slot lit
+    BLOCKER_W = 1_000.0
+    OVERFLOW_KILL_W = 1_000.0
+    blockers = (
+        ("MARK_AX", -BLOCKER_W),
+        ("MARK_PC", -BLOCKER_W),
+        ("MARK_SP", -BLOCKER_W),
+        ("MARK_BP", -BLOCKER_W),
+        ("MARK_STACK0", -BLOCKER_W),
+        ("MARK_MEM", -BLOCKER_W),
+        ("MARK_SE", -BLOCKER_W),
+        ("AX_CARRY_OVERFLOW", -OVERFLOW_KILL_W),
+    )
+    # Write magnitudes mirror ax_hibyte_clear_allstep (WW=0.16 -> ~+/-10 OUTPUT
+    # delta on a saturated fire): push OUTPUT_LO+v / OUTPUT_HI+0 UP and kill the
+    # leaked byte-0 default OUTPUT_LO+0 so the LM head emits v (v<=4 -> hi=0).
+    WW = 0.16
+    rules: list[FFNRule] = []
+    for v in range(_B1_TO_OUTPUT_HIDDEN_DIM):
+        slot = v + 2  # H1_DUMP_OUT+(v+2)
+        writes = [
+            (f"OUTPUT_LO+{v}", WW),
+            ("OUTPUT_HI+0", WW),
+        ]
+        # Kill the leaked byte-0 low default so the byte emits v, not 0. For v==0
+        # the target IS OUTPUT_LO+0 (no kill — we are writing it UP), so skip the
+        # negative to avoid self-cancel.
+        if v != 0:
+            writes.append(("OUTPUT_LO+0", -WW))
+        rules.append(multi_way_and_rule(
+            name=f"b1_to_output_v{v}",
+            conditions=(
+                ("IS_BYTE", IS_BYTE_W),
+                ("ADDR_B1_HI+8", AX_REG_W),
+                ("ADDR_B0_LO+5", SIG_W),
+                (f"H1_DUMP_OUT+{slot}", DUMP_SLOT_W),
+            ) + blockers,
+            threshold=THRESHOLD,
+            writes=tuple(writes),
+        ))
+    return tuple(rules)
+
+
+def make_b1_to_output_op() -> Operation:
+    """Append the AX byte-1 DUMP->OUTPUT decode FFN after the L25 tail block.
+
+    Standalone ``PureFFN`` post_op on the L25 tail block, appended AFTER
+    ``tail_bit32_result_correction``, the ENT/LI caps, ``ax_hibyte_clear_allstep``
+    AND ``ax_byte1_dump_repopulate`` (which FILLS ``H1_DUMP_OUT``) so it reads
+    the freshly-filled dump band and is among the LAST writers of OUTPUT on the
+    AX byte-1 dump row before the LM head. Gated by ``C4_B1_TO_OUTPUT``
+    (DEFAULT-OFF); flag-OFF bakes NO units -> byte-identical. ALL gate + target
+    dims resolve from the declarative ``dim_positions`` layout (no legacy-registry
+    split).
+    """
+    if not _b1_to_output_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="b1_to_output",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "ax_hibyte_clear_allstep"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+        )
+
+    rules = _b1_to_output_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _B1_TO_OUTPUT_HIDDEN_DIM, (
+            f"b1_to_output rule-count drift: produced {len(rules)}, "
+            f"expected {_B1_TO_OUTPUT_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="b1_to_output",
+        reads={
+            "IS_BYTE", "ADDR_B1_HI", "ADDR_B0_LO", "H1_DUMP_OUT",
+            "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "MARK_SE", "AX_CARRY_OVERFLOW",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # After ax_hibyte_clear_allstep (which is after ax_byte1_dump_repopulate
+        # -> H1_DUMP_OUT is filled) so this is among the last OUTPUT writers on
+        # the AX byte-1 dump row before the LM head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "ax_hibyte_clear_allstep"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
+
+
+# ===========================================================================
 # AX byte-2/3 register-dump LI-LOAD zero cap (C4_AX_LI_BYTE23_ZERO, default ON)
 # ===========================================================================
 #
