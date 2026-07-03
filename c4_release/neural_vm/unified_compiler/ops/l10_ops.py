@@ -5997,6 +5997,89 @@ def _suppress_l10_addsub_on_wide_alu(post_op, BD, S: float) -> None:
     del post_op, BD, S
 
 
+def _byte_value_writeback_rules(
+    *,
+    name_for,
+    base_conditions,
+    threshold: float,
+    strength: float,
+    lo_base: str = "OUTPUT_LO",
+    hi_base: str = "OUTPUT_HI_THIS_STEP",
+    lo_match_weight: float = 1.0,
+    hi_match_weight: float = 1.0,
+    competitor_strength: Optional[float] = None,
+    gate: Optional[object] = None,
+    scope: Optional[str] = None,
+    dominates_at: Optional[Mapping[str, str]] = None,
+    skip=None,
+):
+    """Evidence-keyed byte-value writeback engine (Tier-3 tail-bank pattern).
+
+    The ~40 hand-authored sub-generators inside
+    :func:`_tail_bit32_result_correction_rules` are 40 variations of ONE
+    shape: *"under a fixed structural evidence gate ``base_conditions``, for
+    each byte value ``v = lo | (hi << 4)`` observed in a (nibble-low, nibble-
+    high) source lane, guarantee OUTPUT byte = v"*.  Concretely each is a
+    16x16 nibble loop that, per byte value, appends a per-value match
+    condition ``(f"{lo_base}+{lo}", lo_match_weight)`` +
+    ``(f"{hi_base}+{hi}", hi_match_weight)`` to the shared evidence and emits
+    a :func:`Primitives.byte_value_writes` write of that byte.
+
+    This helper parametrizes exactly those axes so a family collapses from a
+    ~40-line nested loop to a single keyword-argument call, while emitting the
+    byte-IDENTICAL ``FFNRule`` tuple (same order, same weights, same
+    threshold, same gate) — a count-preserving AUTHORING refactor only.
+
+    Args:
+        name_for: ``value -> rule_name`` callable (the family's f-string).
+        base_conditions: the shared per-family evidence gate tuple, emitted
+            verbatim ahead of the per-value nibble match terms.
+        threshold: per-rule AND threshold (uniform across the family).
+        strength: ``byte_value_writes`` positive/negative write strength.
+        lo_base / hi_base: the source-lane residual band names whose one-hot
+            nibble encodes the observed byte value (default the L10 OUTPUT
+            band; ``ALU_LO`` / ``ALU_HI`` families pass those instead).
+        lo_match_weight / hi_match_weight: the per-value match condition
+            weights (families vary between 1.0 and 0.05 / 0.001).
+        competitor_strength: forwarded to ``byte_value_writes`` for families
+            that soften the losing-channel suppression (e.g. the shallow
+            pop-loaded crush).
+        gate / scope / dominates_at: passed through to ``multi_way_and_rule``.
+        skip: optional ``(lo, hi) -> bool`` predicate; a value whose nibbles
+            satisfy it is omitted (e.g. ``lo == 0 and hi == 0`` for the
+            "already-zero is ambiguous" families, or ``value == 0xE0``).
+
+    Returns:
+        The family's ``FFNRule`` tuple, in ``value``-ascending order.
+    """
+
+    rules = []
+    for lo in range(16):
+        for hi in range(16):
+            if skip is not None and skip(lo, hi):
+                continue
+            value = lo | (hi << 4)
+            rules.append(
+                multi_way_and_rule(
+                    name=name_for(value),
+                    scope=scope,
+                    dominates_at=dominates_at,
+                    conditions=tuple(base_conditions) + (
+                        (f"{lo_base}+{lo}", lo_match_weight),
+                        (f"{hi_base}+{hi}", hi_match_weight),
+                    ),
+                    threshold=threshold,
+                    gate=gate,
+                    writes=Primitives.byte_value_writes(
+                        value,
+                        strength=strength,
+                        competitor_strength=competitor_strength,
+                    ),
+                )
+            )
+    return tuple(rules)
+
+
 def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
     """Late FFN correction rules after the dependency-assigned post-op tail.
 
@@ -7159,27 +7242,29 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+3", -1_000_000_000.0),
             ("H1+4", -1_000_000_000.0),
         )
-        rules = []
-        for lo in range(16):
-            for hi in range(16):
-                if lo == 0 and hi == 0:
-                    continue
-                value = lo | (hi << 4)
-                rules.append(
-                    multi_way_and_rule(
-                        name=f"tail_stack0_store_loaded_byte_{value:02x}",
-                        scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                        conditions=base_conditions + (
-                            (f"OUTPUT_LO+{lo}", 1.0),
-                            (f"OUTPUT_HI_THIS_STEP+{hi}", 1.0),
-                        ),
-                        threshold=25.0,
-                        gate=gate_mark_stack0,
-                        writes=byte_writes(value, strength=5000.0),
-                    )
-                )
-        return tuple(rules)
+        # Tier-3 tail-bank consolidation (task J5): this 16x16 nibble loop is
+        # the canonical evidence-keyed byte-value writeback pattern shared by
+        # ~40 sibling generators.  Authored via ``_byte_value_writeback_rules``
+        # so the shape lives in one place; it emits the byte-IDENTICAL rule
+        # tuple this loop used to build by hand (same order, same weights,
+        # same threshold/gate) — a count-preserving authoring refactor only.
+        return _byte_value_writeback_rules(
+            name_for=lambda value: f"tail_stack0_store_loaded_byte_{value:02x}",
+            base_conditions=base_conditions,
+            threshold=25.0,
+            strength=5000.0,
+            lo_base="OUTPUT_LO",
+            hi_base="OUTPUT_HI_THIS_STEP",
+            lo_match_weight=1.0,
+            hi_match_weight=1.0,
+            gate=gate_mark_stack0,
+            scope="mark == STACK0",
+            dominates_at={
+                "OUTPUT_LO": "mark == STACK0",
+                "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+            },
+            skip=lambda lo, hi: lo == 0 and hi == 0,
+        )
 
     def stack0_store_top_value_from_alu_rules() -> tuple[FFNRule, ...]:
         """Materialize current top-store values when only ALU residue remains."""
