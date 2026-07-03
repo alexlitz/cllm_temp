@@ -18,6 +18,40 @@ from ..layer_compiler import Operation
 # Feature flags
 # ---------------------------------------------------------------------------
 
+def campaign_enabled() -> bool:
+    """Return True iff the single CAMPAIGN-CONFIG entry point is set
+    (``C4_CAMPAIGN=1``). DEFAULT OFF.
+
+    This is the one flag that turns on the coherent 30-token *campaign* set
+    without the caller having to juggle the growing pile of individual campaign
+    flags (``C4_NO_STACK0_EMIT`` ``C4_OPERAND_FROM_MEMSP`` ``C4_SI_STORE_ADDR``
+    ``C4_OPERAND_CAM_FIX`` ...). It is wired in by having each campaign-gating
+    predicate OR-in ``campaign_enabled()``:
+
+      * ``no_stack0_emit_enabled()``     -- STACK0 register block dropped (30-tok)
+      * ``operand_from_memsp_enabled()`` -- operand-A read from ``mem[SP]``
+      * ``si_store_addr_enabled()``      -- SI/SC store address-provenance CAM
+      * ``operand_cam_fix_enabled()``    -- widened operand-CAM address-leak clear
+
+    So ``C4_CAMPAIGN=1`` ALONE reproduces the full campaign config, and it is
+    exactly equivalent to setting each of those explicit flags to its campaign
+    value. The two predicates that ALREADY default ON in a bare env
+    (``no_stack0_emit`` / ``operand_from_memsp``, both ``!= "0"``) are unchanged
+    by the OR-in; the two that default OFF (``si_store_addr`` / ``operand_cam_fix``)
+    are the ones ``C4_CAMPAIGN`` flips on.
+
+    An explicit per-flag override still wins for the two default-ON predicates
+    (setting ``C4_NO_STACK0_EMIT=0`` opts that one op out even under the
+    campaign): the OR-in only supplies a default-ON floor for the normally-OFF
+    campaign fixes; the default-ON predicates keep reading their own env first.
+    DEFAULT OFF -> the golden (35-tok) build is byte-identical (``C4_CAMPAIGN``
+    unset -> every predicate keeps its exact pre-existing value). Registered in
+    BOTH cache-key snapshots in ``full_vm_compiler_dynamic.py`` so a campaign
+    build never shares a memo / disk cache entry with a golden build.
+    """
+    return os.environ.get("C4_CAMPAIGN", "0") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
@@ -1302,7 +1336,12 @@ def operand_from_memsp_enabled() -> bool:
     starving the operand read. With ``C4_NO_STACK0_EMIT=0`` (STACK0 still
     emitted) it is a no-regression equivalence check (operand now read from
     ``mem[SP]`` instead of the still-emitted token).
+
+    Campaign entry point: ``C4_CAMPAIGN=1`` supplies the ON floor (see
+    ``campaign_enabled``); an explicit ``C4_OPERAND_FROM_MEMSP=0`` still opts out.
     """
+    if os.environ.get("C4_OPERAND_FROM_MEMSP") is None and campaign_enabled():
+        return True
     return os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
 
 
@@ -1323,7 +1362,12 @@ def no_stack0_emit_enabled() -> bool:
     marker-transition chain, ``Token.STEP_TOKENS``, the DraftVM oracle, the
     decode offsets — lives on the ``proto/drop-stack0-emit-measure`` branch).
     It is the per-op consultation point so flag-off is byte-identical.
+
+    Campaign entry point: ``C4_CAMPAIGN=1`` supplies the ON floor (see
+    ``campaign_enabled``); an explicit ``C4_NO_STACK0_EMIT=0`` still opts out.
     """
+    if os.environ.get("C4_NO_STACK0_EMIT") is None and campaign_enabled():
+        return True
     return os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 
 
@@ -1360,8 +1404,15 @@ def si_store_addr_enabled() -> bool:
     golden (the CAM never installs). Campaign-only: the ``AX_CARRY``/``ADDR_B0``
     marker signals it keys on are produced by the 30-token MEM-from-SP path;
     golden (35-token, flag-OFF) is byte-identical.
+
+    Campaign entry point: ``C4_CAMPAIGN=1`` supplies the ON floor (see
+    ``campaign_enabled``); an explicit ``C4_SI_STORE_ADDR`` value wins (so
+    ``C4_SI_STORE_ADDR=0`` opts out even under the campaign).
     """
-    return os.environ.get("C4_SI_STORE_ADDR") == "1"
+    explicit = os.environ.get("C4_SI_STORE_ADDR")
+    if explicit is None and campaign_enabled():
+        return True
+    return explicit == "1"
 
 
 def loaded_operand_add_hi15_clear_enabled() -> bool:
@@ -1464,9 +1515,15 @@ def operand_cam_fix_enabled() -> bool:
     ``(0.5, 5.85)`` window spares any genuine 0xD/0xF hi-nibble operand
     (immediate operands land ~+6.0 > CLEAN_MAX; the leak is ~5.49). So the
     widen is value-safe by the same construction that makes the ADD case safe.
+
+    Campaign entry point: ``C4_CAMPAIGN=1`` supplies the ON floor (see
+    ``campaign_enabled``, which also turns on the ``no_stack0_emit`` prerequisite);
+    an explicit ``C4_OPERAND_CAM_FIX=0`` still opts out even under the campaign.
     """
-    return (no_stack0_emit_enabled()
-            and os.environ.get("C4_OPERAND_CAM_FIX", "0") != "0")
+    explicit = os.environ.get("C4_OPERAND_CAM_FIX")
+    if explicit is None and campaign_enabled():
+        return no_stack0_emit_enabled()
+    return no_stack0_emit_enabled() and (explicit is not None and explicit != "0")
 
 
 def sili_cam_b1_enabled() -> bool:
