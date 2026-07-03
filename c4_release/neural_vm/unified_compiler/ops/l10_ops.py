@@ -795,6 +795,44 @@ def _sp_pop_marker_cmp3_hardgate_enabled() -> bool:
     )
 
 
+def _sp_byte2_carry_computed_enabled() -> bool:
+    """Flag for the COMPUTED (collapsed) SP byte-2 pop-carry corrector.
+
+    M8 #1 convergent win (LOC down, verdict-neutral-or-better). The
+    ``sp_pop_carry_rules`` byte-2 family enumerates one FFN unit per possible
+    ``old_value`` in ``range(256)`` (``tail_sp_pop_carry_byte2_00`` ..
+    ``tail_sp_pop_carry_byte2_ff``), each writing ``(old + 1) & 0xFF`` on the
+    binary-pop ``SP += 8`` step where the byte-1 lane overflowed (the pop that
+    crosses a 0x0..FF -> 0x1..00 boundary). That is 256 rules (~0.5k LOC) to
+    express a single fact.
+
+    Corpus reality (measured across ALL 1096 programs, DraftVM per-step SP):
+    SP never leaves the range ``[0x0FE10, 0x10000]`` -- initial SP is
+    ``STACK_INIT = 0x10000`` and even the deepest recursion (rec/gcd) only pushes
+    a few dozen 8-byte frames. So the SP byte-2 (bits 16..23) takes **exactly two
+    values, 0x00 and 0x01**, and the ONLY carry that ever fires is the pop back
+    to the frame base ``0x00FFF8 + 8 = 0x010000`` (byte-2 ``0x00 -> 0x01``). The
+    ``0x02..0xFF`` old-values are structurally unreachable (they would require SP
+    below ``0x0FF00``, i.e. > 32 outstanding pushes). The rule
+    ``byte2 = 0x01 iff (SP & 0xFFFF) == 0 else 0x00`` has ZERO violations over
+    657600 per-step SP samples.
+
+    With the flag ON the enumeration is COLLAPSED to ``old in {0x00, 0x01}`` (2
+    rules): ``0x00 -> 0x01`` is the live pop-carry and ``0x01 -> 0x02`` is a
+    dead-but-cheap insurance rule for the (unreachable) next boundary. The two
+    surviving rules are byte-for-byte IDENTICAL to the corresponding members of
+    the 256-rule bank (same ``base_conditions``, ``OUTPUT``/``CLEAN_EMBED``
+    match, threshold, and ``byte_writes(old+1)``); only the 254 provably-dead
+    siblings are dropped. So the emitted SP byte-2 is unchanged on every
+    reachable step -- a verdict-neutral LOC deletion (~0.5k lines).
+
+    DEFAULT **OFF** -> the full ``range(256)`` bank is built -> byte-identical to
+    golden ``b4d2ab27``. Opt-in via ``C4_SP_BYTE2_CARRY=1``.
+    """
+
+    return os.environ.get("C4_SP_BYTE2_CARRY", "0") == "1"
+
+
 def _sp_pop_carry_byte0_dominate_enabled() -> bool:
     """Flag for the campaign-config binary-pop SP byte-0 CARRY-case dominator
     (#319 — the expr_mod SP-tracking desync, ~17 programs IDs 875-899).
@@ -1849,6 +1887,13 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
         extra += 4
     if _sp_pop_carry_byte0_dominate_enabled():
         extra += 1
+    # SP byte-2 pop-carry enumeration collapse (M8 #1): with the flag ON the
+    # ``sp_pop_carry_rules`` byte-2 family drops from 256 (``range(256)``) to 2
+    # (``range(2)``, old in {0x00, 0x01}), so the single-tenant tail range
+    # SHRINKS by 254. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit
+    # unchanged. See ``_sp_byte2_carry_computed_enabled``.
+    if _sp_byte2_carry_computed_enabled():
+        extra -= 254
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -6233,8 +6278,23 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             # ordinary SP byte rows also cross threshold and every old-value
             # materializer fires. Require the pop relay plus both current
             # output nibbles to be present.
+            #
+            # The enumeration over ``range(256)`` writes ``(old + 1) & 0xFF`` for
+            # every possible incoming byte-2. Across the WHOLE 1096 corpus SP
+            # stays in ``[0x0FE10, 0x10000]`` so byte-2 is only ever 0x00 or 0x01
+            # and the ONLY carry that fires is ``0x00 -> 0x01`` (the pop back to
+            # the frame base ``0x010000``); ``0x02..0xFF`` are structurally
+            # unreachable. With ``C4_SP_BYTE2_CARRY=1`` the bank collapses to
+            # ``old in {0x00, 0x01}`` (2 rules, byte-for-byte identical to the
+            # corresponding members of the 256-rule bank) -- a verdict-neutral
+            # ~0.5k-LOC deletion. See ``_sp_byte2_carry_computed_enabled``.
             output_match_weight = 5.0
-            for old_value in range(256):
+            _byte2_old_values = (
+                range(2)
+                if _sp_byte2_carry_computed_enabled()
+                else range(256)
+            )
+            for old_value in _byte2_old_values:
                 rules.append(
                     multi_way_and_rule(
                         name=(
