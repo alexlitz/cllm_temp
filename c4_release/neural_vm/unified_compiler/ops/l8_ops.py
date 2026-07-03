@@ -2232,8 +2232,9 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
 def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
     """L8 attn head 6: refresh AX_CARRY_LO/HI from prev step's AX marker OUTPUT.
 
-    Mirrors the head-6 bake added to ``UnifiedVMCompiler._compile_l8_attention``
-    in commit ``3d1b700`` (2026-05-12, fix-phase2-ax-carry-refresh). The bake
+    Mirrors the head-6 bake added to the now-removed legacy
+    ``UnifiedVMCompiler._compile_l8_attention`` in commit ``3d1b700``
+    (2026-05-12, fix-phase2-ax-carry-refresh). The bake
     reads ``OUTPUT_LO/HI`` from the previous step's AX marker (excluding the
     *current* AX marker via anti-OP_* gates) and writes the result to the
     current step's ``AX_CARRY_LO/HI``.
