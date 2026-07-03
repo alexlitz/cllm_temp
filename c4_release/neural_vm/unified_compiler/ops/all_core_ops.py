@@ -825,20 +825,16 @@ def all_core_ops(
         # AX_CARRY_OVERFLOW blocker preserves a genuine >=0x10000 value. This
         # SUBSUMES the two former narrower caps (ax_byte23_dump_zero on OP_ENT,
         # ax_li_byte23_zero on OP_LI), which have been DELETED as redundant.
-        # Active whenever C4_AX_HIBYTE_CLEAR OR C4_B1_TO_OUTPUT is set
-        # (C4_B1_TO_OUTPUT is DEFAULT-ON). See
+        # UNCONDITIONAL (OUTPUT-canonical byte emission is the sole path). See
         # l11_ops.make_ax_hibyte_clear_allstep_op.
         make_ax_hibyte_clear_allstep_op(),
-        # ARCHITECTURAL REFACTOR increment 1: AX byte-1 DUMP -> OUTPUT decode.
+        # AX byte-1 DUMP -> OUTPUT decode (OUTPUT-canonical, UNCONDITIONAL).
         # Decodes the carried byte-1 one-hot out of ``H1_DUMP_OUT`` (filled by
-        # ax_byte1_dump_repopulate on carried steps) back into the CANONICAL
-        # ``OUTPUT_LO/HI`` nibbles, so the SAME byte-1 emits from OUTPUT that
-        # currently emits from the H-band (the base the LM head reads for ALL
-        # bytes). Appended AFTER ax_hibyte_clear_allstep so H1_DUMP_OUT is filled
-        # and it is among the last OUTPUT writers on the AX byte-1 dump row.
-        # Gated by C4_B1_TO_OUTPUT (DEFAULT-OFF); flag-OFF bakes NO units ->
-        # byte-identical. Step 1 of consolidating AX byte emission onto OUTPUT.
-        # See l11_ops.make_b1_to_output_op.
+        # ax_byte1_dump_repopulate on carried steps) into the CANONICAL
+        # ``OUTPUT_LO/HI`` nibbles (the base the LM head reads for ALL bytes), so
+        # byte-1 emits from OUTPUT alone. Appended AFTER ax_hibyte_clear_allstep
+        # so H1_DUMP_OUT is filled and it is among the last OUTPUT writers on the
+        # AX byte-1 dump row. See l11_ops.make_b1_to_output_op.
         make_b1_to_output_op(),
         # SUB full-borrow byte-1 0xFF writer (CAMPAIGN-ONLY, C4_SUB_FULL_BORROW):
         # the POST-SLAM half of the sub_borrow_cascade fix. On the row where the

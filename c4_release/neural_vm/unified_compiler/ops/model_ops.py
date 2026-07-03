@@ -2391,21 +2391,17 @@ def _ax_byte1_dump_head_bake_rules(
     own H1/H2/H3 byte-1 one-hot layout onto the private ``H<k>_DUMP_OUT`` bands
     the carry FFN fills on carried steps (see ``_ax_byte1_dump_band_for_value``).
 
-    ``skip_h1`` (architectural-refactor increment 2, ``C4_B1_TO_OUTPUT`` ON):
-    OMIT the ``H1_DUMP_OUT`` columns (v in 0..4). Increment 1's L25
-    ``b1_to_output`` FFN already decodes the carried byte-1 out of
-    ``H1_DUMP_OUT`` into the canonical ``OUTPUT_LO/HI`` nibbles, so the byte-1
-    emits from OUTPUT ONLY and the H1_DUMP_OUT LM-head columns are redundant.
+    ``skip_h1`` (opt-in): OMIT the ``H1_DUMP_OUT`` columns (v in 0..4) — the L25
+    ``b1_to_output`` FFN (the OUTPUT-canonical byte-1 decode) already routes the
+    carried byte-1 out of ``H1_DUMP_OUT`` into the canonical ``OUTPUT_LO/HI``
+    nibbles, so the H1_DUMP_OUT LM-head columns are redundant.
 
-    ``skip_h23`` (architectural-refactor increment 3, ``C4_B1_TO_OUTPUT`` ON):
-    ALSO OMIT the ``H2_DUMP_OUT`` (v in 5..11) + ``H3_DUMP_OUT`` (v in 12..15)
-    columns. Increment 3 extends the L25 ``b1_to_output`` OUTPUT decode to
-    cover the whole byte-1 range (v 0..15) out of H1/H2/H3_DUMP_OUT into the
-    canonical ``OUTPUT_LO/HI`` nibbles, so byte-1 emits from OUTPUT ONLY across
-    its full value range and ALL H*_DUMP_OUT LM-head columns are redundant.
-    Combined with the byte-2/3 zero-default (``ax_hibyte_clear_allstep``, also
-    activated by ``C4_B1_TO_OUTPUT``), ALL 4 AX bytes then emit from OUTPUT
-    alone. ``skip_h1`` and ``skip_h23`` are set TOGETHER under the same flag.
+    ``skip_h23`` (opt-in): ALSO OMIT the ``H2_DUMP_OUT`` (v in 5..11) +
+    ``H3_DUMP_OUT`` (v in 12..15) columns — the L25 decode covers the whole
+    byte-1 range (v 0..15) out of H1/H2/H3_DUMP_OUT, so ALL H*_DUMP_OUT LM-head
+    columns are redundant. ``skip_h1`` and ``skip_h23`` are set TOGETHER (both
+    gated by ``C4_AX_HIBYTE_CLEAR``). Default (neither set) bakes ALL columns ->
+    byte-identical golden.
     """
     rules: list[TokenEmbeddingRule] = []
     for v in range(_AX_BYTE1_DUMP_HEAD_MAX_VALUE + 1):
@@ -2434,12 +2430,11 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     FFN fills ``H1_DUMP_OUT`` on carried steps. Byte-identical on fresh steps
     (``H1_DUMP_OUT == 0`` -> these columns contribute nothing).
 
-    Architectural-refactor increment 2: when ``C4_B1_TO_OUTPUT`` is ON the
-    ``H1_DUMP_OUT`` columns (v in 0..4) are OMITTED — increment 1's L25
-    ``b1_to_output`` decode already routes the carried byte-1 through the
-    canonical ``OUTPUT_LO/HI`` nibbles, so byte-1 emits from OUTPUT ONLY. The
-    ``H2/H3_DUMP_OUT`` columns (v in 5..15) are unchanged (a later increment).
-    Flag-OFF (default) bakes ALL columns -> byte-identical golden.
+    When ``C4_AX_HIBYTE_CLEAR`` is ON the L25 ``b1_to_output`` decode +
+    byte-2/3 zero-default route ALL AX bytes through the canonical OUTPUT
+    nibbles, so ALL H*_DUMP_OUT LM-head columns are redundant and are OMITTED
+    (``skip_h1`` + ``skip_h23``). Default (flag OFF) bakes ALL columns ->
+    byte-identical golden.
     """
     # The byte-1 register-dump EMISSION (the LM-head ``H1_DUMP_OUT`` columns) is
     # gated by ``C4_AX_BYTE1_DUMP``, which is now DEFAULT-ON (opt out with
@@ -2460,22 +2455,20 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     # ``docs/AX_BYTE1_DUMP_CARRY_LANDED_2026_06_13.md``.
     import os as _os
     _emission_on = _os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
-    # Architectural-refactor increment 2 + 3: when ``C4_B1_TO_OUTPUT`` is ON,
-    # the L25 ``b1_to_output`` FFN decodes the carried byte-1 out of the
-    # ``H1/H2/H3_DUMP_OUT`` bands into the canonical ``OUTPUT_LO/HI`` nibbles, so
-    # the byte-1 emits from OUTPUT ONLY across THIS op's value range (0..15) and
-    # this op's ``H*_DUMP_OUT`` LM-head columns are REDUNDANT. Increment 2
-    # omitted the H1 columns (v 0..4); increment 3 ALSO omits the H2/H3 columns
-    # (v 5..15), after extending the L25 decode to cover H2/H3. Both are gated on
-    # the SAME ``C4_B1_TO_OUTPUT`` flag (default-OFF -> byte-identical golden).
+    # When ``C4_AX_HIBYTE_CLEAR`` is ON, the L25 ``b1_to_output`` FFN decodes the
+    # carried byte-1 out of the ``H1/H2/H3_DUMP_OUT`` bands into the canonical
+    # ``OUTPUT_LO/HI`` nibbles across THIS op's value range (0..15), and the
+    # byte-2/3 zero-default routes bytes 2/3 through OUTPUT too, so ALL of this
+    # op's ``H*_DUMP_OUT`` LM-head columns are REDUNDANT and are OMITTED (both
+    # ``skip_h1`` and ``skip_h23``). Default-OFF -> byte-identical golden.
     # Evaluated lazily so a per-process env flip is honoured and reflected in the
     # compile cache key. NOTE: this op only owns byte-1 tokens 0..15; tokens
     # 16..255 (byte-1 high nibble >= 1) get their own H*_DUMP_OUT low-nibble
     # mirror columns from ``make_ax_byte1_hinib_emission_op`` (flag
     # ``C4_AX_BYTE1_HINIB``), which is NOT touched here — the whole-corpus byte-1
-    # carry is 0..15 (add/sub high byte 0..7) so this increment removes the
+    # carry is 0..15 (add/sub high byte 0..7) so OUTPUT-canonical removes the
     # H*_DUMP_OUT dependence for the entire carried range in practice.
-    _skip_all_hbands = _os.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
+    _skip_all_hbands = _os.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
     _skip_h1 = _skip_all_hbands
     _skip_h23 = _skip_all_hbands
 

@@ -1867,7 +1867,7 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
 
 
 # ===========================================================================
-# STRUCTURAL: all-step register byte-2/3 zero-default (C4_AX_HIBYTE_CLEAR, OFF)
+# STRUCTURAL: all-step register byte-2/3 zero-default (UNCONDITIONAL)
 # ===========================================================================
 #
 # THE all-step register byte-2/3 zero-default. Fires on EVERY byte-2/3 register-
@@ -1892,19 +1892,12 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
 def _ax_hibyte_clear_allstep_enabled() -> bool:
     """``C4_AX_HIBYTE_CLEAR`` flag predicate (DEFAULT-OFF structural block).
 
-    Flag-OFF bakes NO units -> byte-identical to the pre-fix build.
-
-    Architectural-refactor increment 3: ``C4_B1_TO_OUTPUT`` (the byte-1
-    DUMP->OUTPUT master flag) ALSO activates this byte-2/3 zero-default. With
-    ``C4_B1_TO_OUTPUT`` ON, OUTPUT byte-2/3 -> 0 so the AX byte-2/3 emit from
-    the canonical OUTPUT nibbles alone (the H2/H3_DUMP_OUT LM-head columns are
-    dropped in ``make_ax_byte1_dump_head_bake_op`` under the same flag). Enabled
-    if EITHER flag is set.
+    Flag-OFF bakes NO units -> byte-identical to the pre-fix build (the default
+    golden). Opt in with ``C4_AX_HIBYTE_CLEAR=1`` to force register byte-2/3 ->
+    0 on every dump row (kills the stale-high-byte leak class); the emitted
+    byte-2/3 then come from the canonical OUTPUT nibbles.
     """
-    return (
-        _os_stack0.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
-        or _os_stack0.environ.get("C4_B1_TO_OUTPUT", "0") != "0"
-    )
+    return _os_stack0.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
 
 
 _AX_HIBYTE_CLEAR_ALLSTEP_HIDDEN_DIM = 2  # one AND per high byte (byte-2, byte-3)
@@ -1962,9 +1955,8 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
     """Append the all-step register byte-2/3 zero-default FFN after the L25 tail.
 
     Fires on EVERY byte-2/3 register-dump row (no OP_ENT / OP_LI gate), covering
-    the callee-ENT, LI-load and loop/rec body steps in one op. Gated by
-    ``C4_AX_HIBYTE_CLEAR`` OR ``C4_B1_TO_OUTPUT`` (see the enabled predicate);
-    when neither is set it bakes NO units -> byte-identical.
+    the callee-ENT, LI-load and loop/rec body steps in one op. Now UNCONDITIONAL
+    (OUTPUT-canonical emission is the sole path; see the enabled predicate).
     """
     if not _ax_hibyte_clear_allstep_enabled():
         def _noop_bake(block, dim_positions, S):
@@ -2050,7 +2042,7 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
 
 
 # ===========================================================================
-# AX byte-1 DUMP -> OUTPUT decode (C4_B1_TO_OUTPUT, DEFAULT-OFF)
+# AX byte-1 DUMP -> OUTPUT decode (UNCONDITIONAL, OUTPUT-canonical)
 # ===========================================================================
 #
 # ARCHITECTURAL REFACTOR increment 1 of "consolidate AX byte emission onto
@@ -2079,18 +2071,9 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
 # carried steps) -> every AND's ``H1_DUMP_OUT+(v+2)`` gate is 0 -> the units are
 # DARK -> the fresh byte-1 emission (from the normal H1 path) is byte-identical.
 # On PC/SP/BP/STACK0/MEM/marker rows the marker blockers + AX_CARRY_OVERFLOW
-# kill (mirrored from the dump) hold the op dark. DEFAULT-OFF (bakes NO units ->
-# byte-identical); increment 2 removes the ``H1_DUMP_OUT`` LM-head column once
-# this proves OUTPUT can carry the byte-1.
-def _b1_to_output_enabled() -> bool:
-    """``C4_B1_TO_OUTPUT`` flag predicate (DEFAULT-OFF architectural refactor).
-
-    Gates the AX byte-1 DUMP->OUTPUT decode FFN. Flag-OFF
-    (``C4_B1_TO_OUTPUT=0``) bakes NO units -> byte-identical to the pre-refactor
-    build. Evaluated lazily (compile time) so a per-process env flip is honoured
-    and the compile cache key reflects it.
-    """
-    return _os_stack0.environ.get("C4_B1_TO_OUTPUT", "1") != "0"
+# kill (mirrored from the dump) hold the op dark. UNCONDITIONAL: this decode is
+# the OUTPUT-canonical byte-1 emission path (the H*_DUMP_OUT LM-head columns are
+# dropped in ``make_ax_byte1_dump_head_bake_op``).
 
 
 # The carried byte-1 one-hot lives at ``H<k>_DUMP_OUT+off`` per the LM-head
@@ -2197,30 +2180,10 @@ def make_b1_to_output_op() -> Operation:
     ``tail_bit32_result_correction``, the ENT/LI caps, ``ax_hibyte_clear_allstep``
     AND ``ax_byte1_dump_repopulate`` (which FILLS ``H1_DUMP_OUT``) so it reads
     the freshly-filled dump band and is among the LAST writers of OUTPUT on the
-    AX byte-1 dump row before the LM head. Gated by ``C4_B1_TO_OUTPUT``
-    (DEFAULT-OFF); flag-OFF bakes NO units -> byte-identical. ALL gate + target
-    dims resolve from the declarative ``dim_positions`` layout (no legacy-registry
-    split).
+    AX byte-1 dump row before the LM head. UNCONDITIONAL: this is the
+    OUTPUT-canonical byte-1 emission path. ALL gate + target dims resolve from
+    the declarative ``dim_positions`` layout (no legacy-registry split).
     """
-    if not _b1_to_output_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="b1_to_output",
-            reads=set(),
-            writes=set(),
-            audited_empty_produces=True,
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            requires={"after": "ax_hibyte_clear_allstep"},
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
-        )
-
     rules = _b1_to_output_rules()
 
     def bake(block, dim_positions, S):
