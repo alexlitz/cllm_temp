@@ -1,4 +1,25 @@
-"""Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
+"""Auto-extracted per-layer factories. See ../migrated_ops.py for history.
+
+Phase 7.E (sem-dim authoring): the role-meaningful base-slot NAME refs in
+this module's FFNRule authoring (the ``make_l15_psh_stack_ir`` /
+``make_l15_nibble_copy_ir`` ``multi_way_and_rule`` conditions / writes) are
+authored via :func:`neural_vm.dim_registry.dim_ref` —
+``dim_ref(category, role, offset)`` resolves the base slot NAME from its
+semantic family at compile time and returns the byte-identical
+``"NAME+offset"`` string. The ``+offset`` (nibble value / one-hot cell index)
+stays a raw structural index; only the base NAME is family-resolved, killing
+the repack-fragility class. PORTED families: ``byte_index`` (BYTE_INDEX_*),
+``output_lo`` (OUTPUT_LO+k), ``cmp_flag`` (CMP+7), ``marker`` (MARK_BP), and
+``opcode_flag`` (OP_ENT). LEFT RAW: the H1+i / H4+i threshold-head bank slots,
+``PSH_AT_SP`` / ``IS_BYTE`` / ``MEM_STORE`` / ``HAS_SE`` unbound flags,
+``EMBED_LO/HI+k`` embed nibbles, ``OUTPUT_HI_THIS_STEP+k`` (a this-step-only
+band, NOT the registry ``output_hi`` family), the attention-head ``dp[...]``
+positional (name -> BD attr) resolvers used by the Q/K/V/O ``AP``/``AO``
+writers, and the ``reads=/writes=`` op-metadata sets. l15 has NO ``_harden_*``
+condition-string filter that matches a bare slot NAME (unlike l16), so no
+``name.split("+", 1)[0]`` base-name fix is needed here. Byte-identical to
+golden ``b4d2ab27``.
+"""
 
 import os as _os_l15
 import torch
@@ -303,6 +324,7 @@ _L15_SAVEDRA_HEAD_IDX = 15
 # Head 16 (flag C4_SI_STORE_ADDR, campaign, DEFAULT-OFF): SI/SC store
 # address-provenance CAM — resolves the var_mul / multilocal-LI two-root wall.
 _L15_SI_STORE_ADDR_HEAD_IDX = 16
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     attention_head_extension,
@@ -839,8 +861,8 @@ def make_l15_psh_stack_ir() -> CompilerIR:
     bp_i = 3
     threshold = 3.5
 
-    all_byte_indices = ("BYTE_INDEX_0", "BYTE_INDEX_1",
-                        "BYTE_INDEX_2", "BYTE_INDEX_3")
+    all_byte_indices = (dim_ref("byte_index", "0"), dim_ref("byte_index", "1"),
+                        dim_ref("byte_index", "2"), dim_ref("byte_index", "3"))
 
     def psh_byte_conditions(marker_index, byte_index_name):
         conds = [
@@ -889,33 +911,34 @@ def make_l15_psh_stack_ir() -> CompilerIR:
         # genuine BP byte row in either trace (PSH_AT_SP=0 there), so this is
         # a pure leak suppression.
         if marker_index == bp_i:
-            conds.append(("OP_ENT", -2.0))
+            conds.append((dim_ref("opcode_flag", "ENT"), -2.0))
         return tuple(conds)
 
     # SP byte 0 position predicts SP byte 1 = 0xff after SP -= 8.
     rules.append(multi_way_and_rule(
         name="psh_sp_byte1_lo_ff",
-        conditions=psh_byte_conditions(sp_i, "BYTE_INDEX_0"),
+        conditions=psh_byte_conditions(sp_i, dim_ref("byte_index", "0")),
         threshold=threshold,
-        writes=(("OUTPUT_LO+15", 4.0), ("OUTPUT_LO+0", -4.0)),
+        writes=((dim_ref("output_lo", "nibble", 15), 4.0),
+                (dim_ref("output_lo", "nibble", 0), -4.0)),
     ))
     rules.append(multi_way_and_rule(
         name="psh_sp_byte1_hi_ff",
-        conditions=psh_byte_conditions(sp_i, "BYTE_INDEX_0"),
+        conditions=psh_byte_conditions(sp_i, dim_ref("byte_index", "0")),
         threshold=threshold,
         writes=(("OUTPUT_HI_THIS_STEP+15", 4.0), ("OUTPUT_HI_THIS_STEP+0", -4.0)),
     ))
 
     # SP byte 1 and byte 2 positions predict zero for the following bytes.
     for byte_index_name, predicted_byte in (
-        ("BYTE_INDEX_1", "byte2"),
-        ("BYTE_INDEX_2", "byte3"),
+        (dim_ref("byte_index", "1"), "byte2"),
+        (dim_ref("byte_index", "2"), "byte3"),
     ):
         rules.append(multi_way_and_rule(
             name=f"psh_sp_{predicted_byte}_lo_00",
             conditions=psh_byte_conditions(sp_i, byte_index_name),
             threshold=threshold,
-            writes=(("OUTPUT_LO+0", 2.0),),
+            writes=((dim_ref("output_lo", "nibble", 0), 2.0),),
         ))
         rules.append(multi_way_and_rule(
             name=f"psh_sp_{predicted_byte}_hi_00",
@@ -927,13 +950,14 @@ def make_l15_psh_stack_ir() -> CompilerIR:
     # PSH leaves BP unchanged; preserve STACK_INIT byte 2 = 0x01.
     rules.append(multi_way_and_rule(
         name="psh_bp_byte2_lo_01",
-        conditions=psh_byte_conditions(bp_i, "BYTE_INDEX_1"),
+        conditions=psh_byte_conditions(bp_i, dim_ref("byte_index", "1")),
         threshold=threshold,
-        writes=(("OUTPUT_LO+1", 4.0), ("OUTPUT_LO+0", -4.0)),
+        writes=((dim_ref("output_lo", "nibble", 1), 4.0),
+                (dim_ref("output_lo", "nibble", 0), -4.0)),
     ))
     rules.append(multi_way_and_rule(
         name="psh_bp_byte2_hi_00",
-        conditions=psh_byte_conditions(bp_i, "BYTE_INDEX_1"),
+        conditions=psh_byte_conditions(bp_i, dim_ref("byte_index", "1")),
         threshold=threshold,
         writes=(("OUTPUT_HI_THIS_STEP+0", 4.0),),
     ))
@@ -970,15 +994,19 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
         # (50.0/S strength) is swamped and if_var_* (IDs 425-449) regress
         # to BP_byte1=0xf0.
         ("H1+3", -1_000_000.0),
-        ("MARK_BP", -1_000_000.0),
+        (dim_ref("marker", "BP"), -1_000_000.0),
     )
+    # Bare base NAMEs for the per-nibble copy loops: ``dim_ref`` returns
+    # ``"OUTPUT_LO+0"``, so strip the ``+0`` to rebuild each cell as
+    # ``f"{base}+{k}"`` (the ``+k`` is a structural nibble index, kept raw).
+    output_lo_base = dim_ref("output_lo", "nibble").rsplit("+", 1)[0]
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"nibble_copy_lo_{k}",
             conditions=copy_conditions,
             threshold=0.5,
             gate=f"EMBED_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 2.0),),
+            writes=((f"{output_lo_base}+{k}", 2.0),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -992,17 +1020,18 @@ def make_l15_nibble_copy_ir() -> CompilerIR:
     rules.rules.extend(make_l15_psh_stack_ir().layer(0).ffn.rules)
 
     lea_conditions = (
-        ("CMP+7", 1.0),
+        (dim_ref("cmp_flag", "cascade", 7), 1.0),
         (f"H1+{ax_i}", 1.0),
         ("IS_BYTE", 1.0),
-        ("BYTE_INDEX_1", 1.0),
+        (dim_ref("byte_index", "1"), 1.0),
         ("HAS_SE", -1.0),
     )
     rules.append(multi_way_and_rule(
         name="lea_first_step_ax_byte2_lo_01",
         conditions=lea_conditions,
         threshold=4.5,
-        writes=(("OUTPUT_LO+1", 4.0), ("OUTPUT_LO+0", -4.0)),
+        writes=((dim_ref("output_lo", "nibble", 1), 4.0),
+                (dim_ref("output_lo", "nibble", 0), -4.0)),
     ))
     rules.append(multi_way_and_rule(
         name="lea_first_step_ax_byte2_hi_00",

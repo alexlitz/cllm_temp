@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Ratchet lint: flag static-registry dim RESOLUTION in tools / ops.
 
+COMPANION: this lint guards the dim-*resolution* trap (reading a dim POSITION
+through the static registry). The Phase 7.E dim-*authoring* trap — an
+``FFNRule`` hard-coding a role-meaningful base-slot NAME instead of authoring
+it via ``dim_registry.dim_ref(category, role, offset)`` — is guarded by the
+companion ``tools/lint_semantic_dim_ref.py`` ratchet.
+
 THE TRAP (memory ``feedback_probe_dims_use_built_layout_not_static_registry``):
 the widen-repack MOVES ~93% of residual dims relative to the static registry
 (``build_default_registry_dynamic`` / ``build_default_registry``). Resolving a
