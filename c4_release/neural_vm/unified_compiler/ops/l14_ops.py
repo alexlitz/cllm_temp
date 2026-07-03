@@ -5,7 +5,7 @@ import os as _os
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
+from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -2131,22 +2131,27 @@ def _layer14_clear_addr_key_pollution_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", suppress_weight),
         ("MARK_SP", suppress_weight),
     )
-    rules = tuple(
-        multi_way_and_rule(
-            name=f"l14_clear_addr_key_pollution_{k}",
-            conditions=common_conditions,
-            threshold=-0.5,  # imperative: b_up = +S * 0.5 == -S * (-0.5)
-            gate="CONST",
-            gate_weight=1.0,
-            gate_bias=0.0,
-            writes=((f"ADDR_KEY+{k}", -4.0 / S),),
-            scope=("not MEM_VAL_B0 and not MEM_VAL_B1 and not MEM_VAL_B2 "
-                   "and not MEM_VAL_B3 and not MARK_PC and not MARK_BP "
-                   "and not MARK_AX and not MARK_STACK0 and not MARK_SP"),
-        )
-        for k in range(48)
+    # Reduction map ⑥: shared per-cell BYTE-CLEAR primitive (mirrors the
+    # l9 ALU-clear band) -> ``byte_clear_rules``. Byte-identical (48/48
+    # FFNRules, field-for-field). SAFE to consolidate: ADDR_KEY is a
+    # PRIVATE address-key band read by the L15 memory lookup, NOT the L14
+    # ALU OUTPUT/carry cascade.
+    return byte_clear_rules(
+        bands=("ADDR_KEY",),
+        conditions=common_conditions,
+        threshold=-0.5,  # imperative: b_up = +S * 0.5 == -S * (-0.5)
+        write_value=-4.0,
+        S=S,
+        lo=0,
+        hi=47,
+        gate="CONST",
+        gate_weight=1.0,
+        gate_bias=0.0,
+        name_prefix="l14_clear_addr_key_pollution",
+        scope=("not MEM_VAL_B0 and not MEM_VAL_B1 and not MEM_VAL_B2 "
+               "and not MEM_VAL_B3 and not MARK_PC and not MARK_BP "
+               "and not MARK_AX and not MARK_STACK0 and not MARK_SP"),
     )
-    return rules
 
 
 def _layer14_clear_addr_key_pollution_ir(S: float = 100.0) -> CompilerIR:
