@@ -7957,50 +7957,6 @@ def _set_layer16_lev_routing(ffn, S, BD):
     # We'll handle increment in L8 FFN.
 
 
-def _set_format_string_fetch_head(attn, S, BD, HD):
-    """L9 attention head: Fetch byte from format string at FORMAT_PTR + FORMAT_POS.
-
-    Similar to L5 code fetch, but queries memory at FORMAT_PTR + FORMAT_POS.
-    When IO_IN_OUTPUT_MODE:
-    - Q: FORMAT_PTR_LO/HI + FORMAT_POS (address to fetch)
-    - K: ADDR_KEY (memory address keys)
-    - V: EMBED_LO/HI (byte value at that address)
-    - O: OUTPUT_BYTE_LO/HI (byte to emit)
-
-    For simplicity, FORMAT_PTR only uses byte 0 (addresses < 256) and
-    FORMAT_POS is a single nibble (positions 0-15).
-
-    Uses Head 0 in L9.
-    """
-    L = 15.0
-    base = 0 * HD  # head 0
-
-    # Q: active when in output mode, query = FORMAT_PTR + FORMAT_POS
-    attn.W_q[base, BD.IO_IN_OUTPUT_MODE] = L
-    # Query nibbles: FORMAT_PTR_LO + FORMAT_POS
-    # For addresses < 256, we have lo nibble = (PTR_lo + POS) % 16, hi nibble = PTR_hi
-    # But addition is complex... let's simplify: just use FORMAT_PTR for now
-    # and ignore FORMAT_POS (always fetch byte 0). We'll fix this later.
-    for k in range(16):
-        attn.W_q[base + 1 + k, BD.FORMAT_PTR_LO + k] = 1.0
-        attn.W_q[base + 17 + k, BD.FORMAT_PTR_HI + k] = 1.0
-
-    # K: match ADDR_KEY (address keys in memory/data section)
-    for k in range(16):
-        attn.W_k[base + 1 + k, BD.ADDR_KEY + k] = L  # lo nibble
-        attn.W_k[base + 17 + k, BD.ADDR_KEY + 16 + k] = L  # hi nibble
-
-    # V: copy byte value (EMBED_LO/HI)
-    for k in range(16):
-        attn.W_v[base + 1 + k, BD.EMBED_LO + k] = 1.0
-        attn.W_v[base + 17 + k, BD.EMBED_HI + k] = 1.0
-
-    # O: write to OUTPUT_BYTE_LO/HI
-    for k in range(16):
-        attn.W_o[BD.OUTPUT_BYTE_LO + k, base + 1 + k] = 1.0
-        attn.W_o[BD.OUTPUT_BYTE_HI + k, base + 17 + k] = 1.0
-
-
 # =============================================================================
 # Binary Pop SP Increment (SP += 8 for all binary pop ops)
 # =============================================================================
