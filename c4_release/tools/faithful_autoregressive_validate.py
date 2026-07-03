@@ -2,7 +2,7 @@
 """Validate the CPU faithful autoregressive decode against neural ground-truth.
 
 The headline question this tool answers: does the CPU faithful autoregressive
-decoder (:class:`neural_vm.unified_compiler.faithful_autoregressive.FaithfulAutoregressiveRunner`)
+decoder (:class:`neural_vm.verification.faithful_autoregressive.FaithfulAutoregressiveRunner`)
 reproduce the NEURAL full_trace verdict BYTE-FOR-BYTE for EVERY cluster —
 including the autoregressive framing-drift bucket (``var_*`` / ``func_identity``
 / ``nested_*`` / ``if_var``) that ``tools/interp_oracle_gate.py`` currently
@@ -223,7 +223,7 @@ def _run_faithful(
     CPU verdict disagree with neural even though the per-token argmax is identical.
     """
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    from neural_vm.unified_compiler.faithful_autoregressive import (
+    from neural_vm.verification.faithful_autoregressive import (
         FaithfulAutoregressiveRunner,
     )
 

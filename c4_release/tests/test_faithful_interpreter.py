@@ -21,7 +21,7 @@ import math
 import pytest
 import torch
 
-from c4_release.neural_vm.unified_compiler.faithful_interpreter import (
+from c4_release.neural_vm.verification.faithful_interpreter import (
     FaithfulInterpreter,
 )
 from c4_release.neural_vm.unified_compiler.ir import (
@@ -259,5 +259,5 @@ def test_opaque_op_is_flagged_not_executed():
 
 
 def _trace():
-    from c4_release.neural_vm.unified_compiler.faithful_interpreter import OpTrace
+    from c4_release.neural_vm.verification.faithful_interpreter import OpTrace
     return OpTrace(name="t", kind="ffn", layer_idx=0)

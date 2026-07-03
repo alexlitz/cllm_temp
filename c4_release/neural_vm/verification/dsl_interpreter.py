@@ -36,7 +36,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .ir import (
+from ..unified_compiler.ir import (
     CompilerIR,
     DimRef,
     FFNOp,

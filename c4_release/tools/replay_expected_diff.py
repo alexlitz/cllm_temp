@@ -36,19 +36,19 @@ _ROOT = os.path.dirname(os.path.dirname(_HERE))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from c4_release.neural_vm.unified_compiler.dim_diff import (
+from c4_release.neural_vm.verification.dim_diff import (
     diff_actual_vs_expected,
     find_first_divergent_block,
     first_writer_block_for_dim,
     format_divergence,
 )
-from c4_release.neural_vm.unified_compiler.dim_oracle import (
+from c4_release.neural_vm.verification.dim_oracle import (
     DEFERRED_DIM_FAMILIES,
     SUPPORTED_DIM_FAMILIES,
     ReferenceOracle,
     is_supported_dim,
 )
-from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+from c4_release.neural_vm.verification.symbolic_forward import (
     SymbolicForwardRunner,
     encode_instr,
     OP_ADD,

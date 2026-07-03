@@ -42,10 +42,10 @@ import warnings
 from collections import defaultdict
 from typing import TYPE_CHECKING, Dict, Iterable, List, Set
 
-from .ssa_dim import is_ssa_form, parse_ssa_name
+from ..unified_compiler.ssa_dim import is_ssa_form, parse_ssa_name
 
 if TYPE_CHECKING:
-    from .layer_compiler import LayerCompiler, Operation
+    from ..unified_compiler.layer_compiler import LayerCompiler, Operation
 
 
 _ENV_SKIP = "C4_SKIP_DIM_INTEGRITY"

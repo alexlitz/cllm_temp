@@ -10,7 +10,7 @@ from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
     one_hot_indicator_rule,
     step_function_rule,
 )
-from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+from c4_release.neural_vm.verification.dsl_interpreter import (
     DSLInterpreter,
     InterpreterResult,
     InterpreterStep,

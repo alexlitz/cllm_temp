@@ -32,7 +32,7 @@ from typing import List
 
 import pytest
 
-from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+from c4_release.neural_vm.verification.dsl_interpreter import (
     GATE_AUDIT_SKIP_ENV,
     GATE_AUDIT_STRICT_ENV,
     GateAuditEntry,
@@ -539,7 +539,7 @@ def test_production_softmax1_reduces_flagged_count():
     ``no_op`` than the legacy softmax-mode audit, because the canonical
     GATE=33 pattern is effective under softmax1.
     """
-    from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+    from c4_release.neural_vm.verification.dsl_interpreter import (
         audit_compiler_attention_gates,
     )
 

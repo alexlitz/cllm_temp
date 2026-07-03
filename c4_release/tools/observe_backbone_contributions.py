@@ -205,7 +205,7 @@ def _build_symbolic_context(
 ) -> List[int]:
     """Run the declarative symbolic interpreter to produce the
     teacher-forced token sequence for one program."""
-    from neural_vm.unified_compiler.symbolic_program import (
+    from neural_vm.verification.symbolic_program import (
         SymbolicDeclarativeProgramRunner,
     )
 

@@ -42,7 +42,7 @@ not in a single forward pass without needing a runtime smoke. The dynamic
 axis which is value-shaped rather than weight-shaped.
 
 Usage:
-    from c4_release.neural_vm.unified_compiler.decl_verifier import (
+    from c4_release.neural_vm.verification.decl_verifier import (
         verify_claims_static,
     )
     report = verify_claims_static()  # uses compile_full_vm_dynamic defaults
@@ -62,7 +62,7 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import torch
 import torch.nn as nn
 
-from .layer_compiler import LayerCompiler, Operation, operation_display_label
+from ..unified_compiler.layer_compiler import LayerCompiler, Operation, operation_display_label
 
 
 _LEGACY_HELPER_CALL_RE = re.compile(r"\b_set_[A-Za-z0-9_]+\(")
@@ -1805,7 +1805,7 @@ def _build_layout_only(
     """Same op-registration logic as ``compile_full_vm_dynamic`` but returns ONLY the
     compiled layout. Skips the model build + bake pass.
     """
-    from .migrated_ops import (
+    from ..unified_compiler.migrated_ops import (
         all_core_ops,
         declare_setdim_compat_dims,
         make_alu_divmod_composite_ops,
@@ -1953,7 +1953,7 @@ def verify_produces_consumes_dynamic(
     test, not a synthetic 1-instruction probe. The verifier surfaces
     discrepancies via per-op notes; callers decide how to escalate.
     """
-    from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+    from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     report = DynamicVerificationReport()
 
@@ -2505,7 +2505,7 @@ def verify_produces_consumes_multistep(
     )
 
     if model is None or layout is None:
-        from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+        from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
         try:
             model, layout = compile_full_vm_dynamic(
                 S=S,
@@ -2876,7 +2876,7 @@ def verify_alibi_consistency(
                 else:
                     layout = built
             else:
-                from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+                from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
                 model, layout = compile_full_vm_dynamic(
                     S=S,
                     alu_mode=alu_mode,
@@ -3081,7 +3081,7 @@ def verify_postconditions(
         program = list(_ADD_CASCADE_PROGRAM)
     if model is None or layout is None:
         try:
-            from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+            from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
             model, layout = compile_full_vm_dynamic(
                 S=S,
                 alu_mode=alu_mode,
@@ -3218,7 +3218,7 @@ def verify_step_idx_gating(
         program = list(_ADD_CASCADE_PROGRAM)
     if model is None or layout is None:
         try:
-            from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+            from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
             model, layout = compile_full_vm_dynamic(
                 S=S,
                 alu_mode=alu_mode,
@@ -3773,7 +3773,7 @@ def verify_rule_scopes(
     silently skipped (opt-in adoption).
     """
     from neural_vm.unified_compiler.predicates import parse, entails, explain_failure
-    from neural_vm.unified_compiler.effective_predicate import effective_predicate
+    from neural_vm.verification.effective_predicate import effective_predicate
 
     issues: List[Dict] = []
 
@@ -3850,9 +3850,9 @@ def verify_rule_strength(
     attention writer, or an L10 tail rule competing against an L16
     materializer). If None, only ``op`` is used (V1 behavior).
     """
-    from neural_vm.unified_compiler.writer_index import build_writer_index
-    from neural_vm.unified_compiler.contribution_algebra import max_contribution
-    from neural_vm.unified_compiler.effective_predicate import effective_predicate
+    from neural_vm.verification.writer_index import build_writer_index
+    from neural_vm.verification.contribution_algebra import max_contribution
+    from neural_vm.verification.effective_predicate import effective_predicate
     from neural_vm.unified_compiler.predicates import parse, overlaps
 
     issues: List[Dict] = []
@@ -4160,7 +4160,7 @@ def _has_step_boundary_suppressor(
     back to names; otherwise we accept any negative K read because
     dim resolution would require building a model.
     """
-    from .ir import STEP_BOUNDARY_K_SUPPRESSOR_DIMS
+    from ..unified_compiler.ir import STEP_BOUNDARY_K_SUPPRESSOR_DIMS
 
     if dim_positions:
         # Build a reverse lookup once.
@@ -4256,7 +4256,7 @@ def verify_step_window_constraint(
         the head's structure matches its declaration.
     """
 
-    from .ir import (
+    from ..unified_compiler.ir import (
         StepWindowConstraint,
         STEP_WINDOW_MIN_ALIBI_SLOPE,
     )

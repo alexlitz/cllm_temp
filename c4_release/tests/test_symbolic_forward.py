@@ -27,7 +27,7 @@ from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
     step_function_rule,
 )
 from c4_release.neural_vm.unified_compiler.ir import CompilerIR
-from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+from c4_release.neural_vm.verification.symbolic_forward import (
     OP_EXIT,
     OP_IMM,
     OP_PSH,

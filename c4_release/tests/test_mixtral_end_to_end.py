@@ -270,7 +270,7 @@ def test_model_shape_constraint_rejects_default_shaped_vm():
     allocator-native Path A is live and the pad-export path should be
     promoted from "primary" to "fallback / oversize-target" only.
     """
-    from c4_release.neural_vm.unified_compiler.model_shape_constraint import (
+    from c4_release.neural_vm.verification.model_shape_constraint import (
         ModelShapeConstraint,
         validate_against_shape,
     )

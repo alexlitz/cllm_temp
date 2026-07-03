@@ -35,7 +35,7 @@ import torch
 
 from c4_release.neural_vm.base_layers import PureFFN
 from c4_release.neural_vm.setup_helpers import _set_layer11_mul_partial
-from c4_release.neural_vm.unified_compiler.decl_verifier import (
+from c4_release.neural_vm.verification.decl_verifier import (
     verify_claims_static,
     verify_produces_consumes_dynamic,
 )

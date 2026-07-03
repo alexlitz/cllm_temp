@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from c4_release.neural_vm.unified_compiler.dim_contracts import (
+from c4_release.neural_vm.verification.dim_contracts import (
     ContractValidation,
     DimContract,
     OpRef,

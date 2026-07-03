@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from neural_vm.verification.decl_verifier import (  # noqa: E402
     audit_teacher_forced_trace_final_support,
     build_teacher_forced_symbolic_trace,
     verify_teacher_forced_token_support,

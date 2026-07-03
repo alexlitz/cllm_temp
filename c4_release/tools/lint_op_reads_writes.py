@@ -101,7 +101,7 @@ _BASELINE: Dict[str, Tuple[int, int]] = {
 
 
 def _build_layout(args):
-    from c4_release.neural_vm.unified_compiler.decl_verifier import (
+    from c4_release.neural_vm.verification.decl_verifier import (
         _build_layout_only,
     )
 
@@ -149,10 +149,10 @@ def lint_layout(
       - ``removed_baselined``: baselined op_names not seen this run.
       - ``clean_baselined``: baselined ops that now have (0, 0) counts.
     """
-    from c4_release.neural_vm.unified_compiler.dim_flow import (
+    from c4_release.neural_vm.verification.dim_flow import (
         _walk_ops_with_layers,
     )
-    from c4_release.neural_vm.unified_compiler.op_introspect import (
+    from c4_release.neural_vm.verification.op_introspect import (
         assert_declared_matches_derived,
     )
 

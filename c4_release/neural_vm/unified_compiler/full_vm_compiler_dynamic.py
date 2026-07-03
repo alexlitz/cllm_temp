@@ -2625,7 +2625,7 @@ def compile_full_vm_dynamic(
     # (Mixtral, Llama) without changing the VM's allocator-derived
     # natural shape.
     if target_shape_overrides is not None:
-        from .model_shape_constraint import ModelShapeConstraint as _MSC
+        from ..verification.model_shape_constraint import ModelShapeConstraint as _MSC
         if not isinstance(target_shape_overrides, _MSC):
             raise TypeError(
                 "target_shape_overrides must be a ModelShapeConstraint instance, "
@@ -2649,7 +2649,7 @@ def compile_full_vm_dynamic(
     # the allocator emitted (Phase 8.O.1/8.O.2 dynamic heads + GQA), not
     # just the caller's intent.
     if model_shape_constraint is not None:
-        from .model_shape_constraint import (
+        from ..verification.model_shape_constraint import (
             ModelShapeConstraint as _MSC,
             ModelShapeMismatchError,
             validate_against_shape,

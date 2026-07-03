@@ -118,7 +118,7 @@ warnings.filterwarnings("ignore")
 
 import torch  # noqa: E402
 
-from neural_vm.unified_compiler.faithful_interpreter import (  # noqa: E402
+from neural_vm.verification.faithful_interpreter import (  # noqa: E402
     FaithfulInterpreter, STEP_TOKENS,
 )
 from neural_vm.speculative import DraftVM  # noqa: E402

@@ -27,7 +27,7 @@ from typing import Any, List, Optional
 
 import pytest
 
-from c4_release.neural_vm.unified_compiler.model_shape_constraint import (
+from c4_release.neural_vm.verification.model_shape_constraint import (
     ModelShapeConstraint,
     ModelShapeMismatchError,
     validate_against_shape,

@@ -89,13 +89,13 @@ os.environ.setdefault("C4_SKIP_DIM_INTEGRITY", "1")
 os.environ.setdefault("C4_SKIP_GATE_CHECK", "1")
 warnings.filterwarnings("ignore")
 
-from neural_vm.unified_compiler.dsl_interpreter import (  # noqa: E402
+from neural_vm.verification.dsl_interpreter import (  # noqa: E402
     DSLInterpreter,
 )
-from neural_vm.unified_compiler.symbolic_forward import (  # noqa: E402
+from neural_vm.verification.symbolic_forward import (  # noqa: E402
     default_embedding_for_instruction,
 )
-from neural_vm.unified_compiler.symbolic_program import (  # noqa: E402
+from neural_vm.verification.symbolic_program import (  # noqa: E402
     SymbolicDeclarativeProgramRunner,
 )
 from tests.declarative_oracle import (  # noqa: E402

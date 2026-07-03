@@ -49,7 +49,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neural_vm.batched_pure_neural import BatchedPureNeuralRunner  # noqa: E402
-from neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from neural_vm.verification.decl_verifier import (  # noqa: E402
     TeacherForcedTraceAuditFailure,
     TeacherForcedSymbolicTrace,
     audit_teacher_forced_trace_final_support,

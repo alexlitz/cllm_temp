@@ -48,7 +48,7 @@ from typing import List, Optional
 
 def _demo_imm_psh_exit() -> List[int]:
     """The canonical 3-step demo: IMM 0x200; PSH; EXIT."""
-    from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+    from c4_release.neural_vm.verification.symbolic_forward import (
         OP_EXIT,
         OP_IMM,
         OP_PSH,
@@ -119,7 +119,7 @@ def _print_trace(entries, dim_name: str) -> None:
 
 
 def _print_program_summary(program: List[int]) -> None:
-    from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+    from c4_release.neural_vm.verification.symbolic_forward import (
         decode_instr,
     )
 
@@ -168,7 +168,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_arg_parser().parse_args(argv)
-    from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+    from c4_release.neural_vm.verification.symbolic_forward import (
         SymbolicForwardRunner,
     )
 

@@ -31,13 +31,13 @@ import pytest
 from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
     step_function_rule,
 )
-from c4_release.neural_vm.unified_compiler.dim_diff import (
+from c4_release.neural_vm.verification.dim_diff import (
     diff_actual_vs_expected,
     find_first_divergent_block,
     first_writer_block_for_dim,
     format_divergence,
 )
-from c4_release.neural_vm.unified_compiler.dim_oracle import (
+from c4_release.neural_vm.verification.dim_oracle import (
     DEFERRED_DIM_FAMILIES,
     SUPPORTED_DIM_FAMILIES,
     TOKENS_PER_STEP,
@@ -47,7 +47,7 @@ from c4_release.neural_vm.unified_compiler.dim_oracle import (
     project_state_to_residual,
 )
 from c4_release.neural_vm.unified_compiler.ir import CompilerIR
-from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+from c4_release.neural_vm.verification.symbolic_forward import (
     OP_ADD,
     OP_AND,
     OP_DIV,
@@ -314,7 +314,7 @@ def test_apply_attention_specs_propagates_v_to_o_via_int_string_bridge():
     — i.e. exactly the L10 PSH-AX-broadcast head's V/O channel shape.
     """
 
-    from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+    from c4_release.neural_vm.verification.dsl_interpreter import (
         DSLInterpreter,
     )
     from c4_release.neural_vm.unified_compiler.primitives import (
@@ -374,7 +374,7 @@ def test_apply_attention_specs_skips_propagation_without_dim_positions():
     a regression that returns an empty list silently is caught.
     """
 
-    from c4_release.neural_vm.unified_compiler.dsl_interpreter import (
+    from c4_release.neural_vm.verification.dsl_interpreter import (
         DSLInterpreter,
     )
     from c4_release.neural_vm.unified_compiler.primitives import (
@@ -1143,7 +1143,7 @@ def test_default_embedding_indicator_for_extended_opcodes():
     families the embedding bake emits.
     """
 
-    from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+    from c4_release.neural_vm.verification.symbolic_forward import (
         default_embedding_for_instruction,
     )
 

@@ -27,7 +27,7 @@ import pytest
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 from neural_vm.dim_registry import DimRegistry
-from neural_vm.unified_compiler.attention_verifier import (
+from neural_vm.verification.attention_verifier import (
     build_attention_writer_index,
     effective_attention_q_scope,
     effective_attention_scope,

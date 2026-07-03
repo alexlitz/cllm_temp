@@ -1,7 +1,7 @@
 """DSL-interpreter verdict authority — non-re-anchored CPU faithful decode.
 
 The VEHICLE is the DSL interpreter: every per-token argmax that drives the
-production decode comes from :class:`~neural_vm.unified_compiler.faithful_interpreter.IRBlockForward`,
+production decode comes from :class:`~neural_vm.verification.faithful_interpreter.IRBlockForward`,
 which runs the :class:`FaithfulInterpreter` engine over the per-physical-block
 **IR** (attention executed via ``_apply_attention_op`` over
 ``DeclarativeAttentionHeadSpec`` IR objects; FFN via the engine's SwiGLU). It is
@@ -63,7 +63,7 @@ def build_cpu_model(*, alu_mode: str = "efficient", disk_cache: bool = True):
     os.environ.setdefault("C4_SKIP_GATE_CHECK", "1")
     os.environ.setdefault("C4_TEST_SPEC_K", "0")
     os.environ.setdefault("C4_SMOKE_SPEC_K", "0")
-    from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+    from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     with contextlib.redirect_stdout(io.StringIO()):
         model, layout = compile_full_vm_dynamic(

@@ -16,7 +16,7 @@ CLI
         --dim CMP+0,CMP+1,CMP+2,ALU_LO+0
 
 Optional ``--compare-against oracle`` flag attaches the
-:class:`~c4_release.neural_vm.unified_compiler.dim_oracle.ReferenceOracle`
+:class:`~c4_release.neural_vm.verification.dim_oracle.ReferenceOracle`
 state at the same step and prints the per-dim drift alongside the
 observed residual values.
 
@@ -77,7 +77,7 @@ from c4_release.neural_vm.run_vm import AutoregressiveVMRunner  # noqa: E402
 from c4_release.neural_vm.vm_step import Token  # noqa: E402
 
 try:  # Oracle is optional; the import is heavy.
-    from c4_release.neural_vm.unified_compiler.dim_oracle import (  # noqa: E402
+    from c4_release.neural_vm.verification.dim_oracle import (  # noqa: E402
         ReferenceOracle,
         project_state_to_residual,
     )

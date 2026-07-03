@@ -54,7 +54,7 @@ if _REPO_ROOT not in sys.path:
 
 
 def _build_layout(args):
-    from c4_release.neural_vm.unified_compiler.decl_verifier import (
+    from c4_release.neural_vm.verification.decl_verifier import (
         _build_layout_only,
     )
 
@@ -96,7 +96,7 @@ def _build_alias_groups(dim_positions, dim_sizes) -> Dict[str, str]:
 def _ir_dim_sets(op, dim_positions, dim_sizes, head_dim: int = 64
                  ) -> Tuple[Set[str], Set[str]]:
     """Return (actual_reads, actual_writes) by walking the op's IR."""
-    from c4_release.neural_vm.unified_compiler.dim_flow import (
+    from c4_release.neural_vm.verification.dim_flow import (
         _materialize_op_ir,
         _ffn_rules_from_ir,
         _attention_heads_from_ir,
@@ -159,7 +159,7 @@ def audit_layout(layout, *, kinds: Optional[Set[str]] = None
     ``kinds`` (optional): if set, only audit ops whose ``kind`` is in this
     set (e.g. ``{"ffn", "attn"}`` to focus on layer ops).
     """
-    from c4_release.neural_vm.unified_compiler.dim_flow import (
+    from c4_release.neural_vm.verification.dim_flow import (
         _walk_ops_with_layers,
     )
 

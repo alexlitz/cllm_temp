@@ -1,4 +1,4 @@
-"""Tests for :mod:`neural_vm.unified_compiler.dim_alias_verifier`.
+"""Tests for :mod:`neural_vm.verification.dim_alias_verifier`.
 
 The verifier catches a class of bug invisible to the existing scope
 checker: an FFNRule reading an aliased dim (one whose byte range is
@@ -19,7 +19,7 @@ import pytest
 
 from neural_vm.dim_registry import DimRegistry, build_default_registry
 from neural_vm.unified_compiler.ir import FFNOp, FFNRule
-from neural_vm.unified_compiler.dim_alias_verifier import (
+from neural_vm.verification.dim_alias_verifier import (
     AliasGroup,
     AliasViolation,
     enumerate_dim_aliases,
@@ -275,7 +275,7 @@ def test_production_registry_does_not_crash():
 def test_verify_collects_violations_on_production_ops():
     """Smoke: running the verifier over the curated authored ops returns
     a deterministic, JSON-serialisable list of issues."""
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         collect_all_authored_ops,
     )
     reg = build_default_registry()
@@ -454,7 +454,7 @@ def test_opcode_in_step_overlapping_does_not_suppress():
     include PUTCHAR. Restoring afterwards keeps the table immutable in
     user code.
     """
-    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    from neural_vm.verification import dim_alias_verifier as _dav
     reg = _make_opcode_aliasing_registry()
     # Override the static table: POST_PRTF_SP_LO is owned by {PUTCHAR}
     # in this test world, matching the rule's opcode set -> the
@@ -618,7 +618,7 @@ def test_phase2_intersection_collapses_to_empty_returns_none():
     exclusive positive references), the rule's opcode set must be
     treated as UNKNOWN rather than vacuously disjoint. The conservative
     choice: keep the violation."""
-    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    from neural_vm.verification import dim_alias_verifier as _dav
     reg = _make_extended_opcode_aliasing_registry()
     # Add a second non-OP_ slot whose owners disjoint from CMP_GROUP_LIKE
     # owners. Borrow the static table for a deterministic test.
@@ -943,7 +943,7 @@ def test_displaced_ambient_slot_suppresses_violation():
     ``_SLOT_DISPLACED_BY`` table with displacer ⊇ rule's opcode set
     is suppressed. At PRTF rows the byte carries the displacer's
     content, not the sibling's."""
-    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    from neural_vm.verification import dim_alias_verifier as _dav
     reg = DimRegistry(d_model=128)
     reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
     # A slot pinned to PRTF (via static owner table entry below).
@@ -1074,7 +1074,7 @@ def test_eff_disjoint_from_read_dim_helper():
     (``test_raw_factory_corpus_has_zero_dim_alias_violations``), where the
     real L14 ``ADDR_B1_LO <-> OPCODE_BYTE_HI`` family is suppressed by K.
     """
-    from neural_vm.unified_compiler.dim_alias_verifier import (
+    from neural_vm.verification.dim_alias_verifier import (
         _eff_disjoint_from_read_dim,
     )
     from neural_vm.unified_compiler.predicates import parse
@@ -1183,7 +1183,7 @@ def test_equivalent_same_signal_does_not_collapse_distinct_owners():
     their owner sets DIFFER (one pinned to {PRTF}, the other agnostic) —
     that asymmetry marks them as distinct time-shared signals
     (AX_CARRY_LO <-> POST_PRTF_SP_LO style)."""
-    from neural_vm.unified_compiler import dim_alias_verifier as _dav
+    from neural_vm.verification import dim_alias_verifier as _dav
     reg = DimRegistry(d_model=128)
     reg.alloc("MARK_AX", 0, 1, "AX marker", semantics="mark == AX")
     reg.alloc(

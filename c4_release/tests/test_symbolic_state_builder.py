@@ -35,7 +35,7 @@ from c4_release.neural_vm.unified_compiler.ir import (
     CompilerIR,
     compare_symbolic_to_lowered_ffn,
 )
-from c4_release.neural_vm.unified_compiler.symbolic_state_builder import (
+from c4_release.neural_vm.verification.symbolic_state_builder import (
     ADD,
     EQ,
     EXIT,
@@ -141,7 +141,7 @@ def test_step_index_out_of_range_raises():
 def test_accepts_raw_tuple_and_encoded_int():
     """Mixed list of ``Instruction`` / ``(op, imm)`` / encoded int all
     decode to the same state."""
-    from c4_release.neural_vm.unified_compiler.symbolic_forward import (
+    from c4_release.neural_vm.verification.symbolic_forward import (
         OP_IMM,
         encode_instr,
     )
@@ -411,7 +411,7 @@ def test_step_end_after_lt_relays_partial_flags():
     hi_eq fires (0==0), lo_lt fires (3<7), hi_lt doesn't (0<0 false),
     lo_eq doesn't (3==7 false). At step 4's STEP_END the relay carries
     these partials forward."""
-    from c4_release.neural_vm.unified_compiler.symbolic_state_builder import (
+    from c4_release.neural_vm.verification.symbolic_state_builder import (
         LT,
     )
     program = [IMM(3), PSH, IMM(7), LT, EXIT]

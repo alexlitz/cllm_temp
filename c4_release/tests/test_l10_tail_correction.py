@@ -858,7 +858,7 @@ def test_layer10_ax_byte_passthrough_has_li_reload_mem_value_route():
 
 def test_id250_teacher_forced_critical_bytes_survive_l10_tail():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         build_teacher_forced_symbolic_trace,
         verify_teacher_forced_token_support,
     )
@@ -969,7 +969,7 @@ def test_tail_sp_initial_stack_exact_blocks_stack0_marker_residue():
 
 def test_id550_stack0_byte1_high_nibble_survives_l10_tail():
     from neural_vm.batched_pure_neural import BatchedPureNeuralRunner
-    from neural_vm.unified_compiler.decl_verifier import (
+    from neural_vm.verification.decl_verifier import (
         build_teacher_forced_symbolic_trace,
         verify_teacher_forced_token_support,
     )

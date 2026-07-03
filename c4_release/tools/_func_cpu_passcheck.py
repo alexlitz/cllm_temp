@@ -40,7 +40,7 @@ def main():
     ids = parse_ids(sys.argv[1])
     alu_mode = sys.argv[2] if len(sys.argv) > 2 else "lookup"
     progs = generate_test_programs()
-    from neural_vm.unified_compiler.dsl_interpreter_verdict import (
+    from neural_vm.verification.dsl_interpreter_verdict import (
         DSLInterpreterVerdictRunner,
     )
     _b0 = time.time()

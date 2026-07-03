@@ -53,7 +53,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .ir import CompilerIR, FFNOp, FFNRule
+from ..unified_compiler.ir import CompilerIR, FFNOp, FFNRule
 
 
 __all__ = [

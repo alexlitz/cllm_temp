@@ -353,7 +353,7 @@ def _collect_heads_from_op(op) -> List[Any]:
     directly, lists/tuples, and bare ``AttentionHeadIR``s.
     """
     try:
-        from .ir import AttentionHeadIR, AttentionOp, CompilerIR
+        from ..unified_compiler.ir import AttentionHeadIR, AttentionOp, CompilerIR
     except Exception:
         AttentionHeadIR = AttentionOp = CompilerIR = None   # type: ignore
 

@@ -332,7 +332,7 @@ def test_packed_layout_satisfies_model_shape_constraint():
     """
     import torch  # noqa: F401  (imported for parameter materialisation)
     from neural_vm.vm_step import AutoregressiveVM
-    from neural_vm.unified_compiler.model_shape_constraint import (
+    from neural_vm.verification.model_shape_constraint import (
         ModelShapeConstraint,
         validate_against_shape,
     )

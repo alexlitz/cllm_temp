@@ -224,7 +224,7 @@ class TestValidateOnCompileToggle:
                               verbose: str | None = None):
         """Replay the C4_VALIDATE_ON_COMPILE block from
         full_vm_compiler.compile_full_vm in isolation."""
-        from neural_vm.unified_compiler import decl_verifier
+        from neural_vm.verification import decl_verifier
 
         called = {"count": 0, "verbose": False}
 
@@ -257,7 +257,7 @@ class TestValidateOnCompileToggle:
         # its bracket-condition (the only behavior the toggle controls).
         import warnings
         if os.environ.get("C4_VALIDATE_ON_COMPILE") == "1":
-            from neural_vm.unified_compiler.decl_verifier import (
+            from neural_vm.verification.decl_verifier import (
                 verify_claims_static,
             )
             report = verify_claims_static()

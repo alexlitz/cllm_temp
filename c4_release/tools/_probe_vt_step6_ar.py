@@ -22,7 +22,7 @@ if _ROOT not in sys.path:
 import torch  # noqa: E402
 from src.compiler import compile_c  # noqa: E402
 from neural_vm.batched_pure_neural import Token  # noqa: E402
-from neural_vm.unified_compiler.faithful_autoregressive import build_cpu_model  # noqa
+from neural_vm.verification.faithful_autoregressive import build_cpu_model  # noqa
 
 SRC = "int main() { int a; int b; int c; a = 29; b = 6; c = 20; return a + b + c; }"
 # step -> (label, want_ax)
@@ -47,7 +47,7 @@ def main():
         return h * 16 + l, lv, hv
 
     # ---- AR-decode to collect emitted windows (the production tape) ----
-    from neural_vm.unified_compiler.faithful_autoregressive import (
+    from neural_vm.verification.faithful_autoregressive import (
         FaithfulAutoregressiveRunner,
     )
     runner = FaithfulAutoregressiveRunner(model=model, layout=layout)

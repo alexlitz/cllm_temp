@@ -12,7 +12,7 @@ the NEXT step's PC. Because those verdicts can only be reproduced by the REAL
 autoregressive decode, the gate currently DEFERS them to a GPU run.
 
 This module closes that gap on CPU. It runs the BIT-EXACT
-:class:`~neural_vm.unified_compiler.faithful_interpreter.ModelExactForward`
+:class:`~neural_vm.verification.faithful_interpreter.ModelExactForward`
 forward (the REAL block ``nn.Module``s — i.e. ``model.forward`` over one row, so
 the residual + argmax are byte-identical to the neural model, not merely
 argmax-*close*) inside an autoregressive loop that reuses the PRODUCTION decode
@@ -105,7 +105,7 @@ def build_cpu_model(*, disk_cache: bool = True):
     os.environ.setdefault("C4_SKIP_GATE_CHECK", "1")
     os.environ.setdefault("C4_TEST_SPEC_K", "0")
     os.environ.setdefault("C4_SMOKE_SPEC_K", "0")
-    from .full_vm_compiler_dynamic import compile_full_vm_dynamic
+    from ..unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
 
     with contextlib.redirect_stdout(io.StringIO()):
         # Match the production decode runner's compile args exactly

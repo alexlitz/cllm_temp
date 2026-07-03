@@ -124,7 +124,7 @@ def test_irblockforward_argmax_identical_to_cached(built_model):
     """The DSL-interpreter IR forward must equal the recovered-weight forward
     at EVERY token position (byte-for-byte) — this is the proof the IR-execution
     path is faithful."""
-    from neural_vm.unified_compiler.faithful_interpreter import (
+    from neural_vm.verification.faithful_interpreter import (
         IRBlockForward, CachedFaithfulForward,
     )
     from src.compiler import compile_c
@@ -156,7 +156,7 @@ def test_irblockforward_logits_close_to_real_model(built_model):
     """The DSL-interpreter IR forward logits must be numerically close to the
     real ``model.forward`` (the residual diff is fp32 accumulation noise, not a
     structural divergence)."""
-    from neural_vm.unified_compiler.faithful_interpreter import IRBlockForward
+    from neural_vm.verification.faithful_interpreter import IRBlockForward
     from src.compiler import compile_c
 
     model, _layout = built_model

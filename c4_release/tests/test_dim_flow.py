@@ -15,7 +15,7 @@ import warnings
 
 import pytest
 
-from c4_release.neural_vm.unified_compiler.dim_flow import (
+from c4_release.neural_vm.verification.dim_flow import (
     DimFlow,
     DimReader,
     DimWriter,
@@ -242,7 +242,7 @@ def test_zeroing_writer_attention_v_mag_zero():
 def _full_vm_layout():
     """Compile the full VM layout once for the production-shape tests."""
 
-    from c4_release.neural_vm.unified_compiler.decl_verifier import (
+    from c4_release.neural_vm.verification.decl_verifier import (
         _build_layout_only,
     )
     with warnings.catch_warnings():

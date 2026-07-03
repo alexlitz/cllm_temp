@@ -19,7 +19,7 @@ import torch
 from src.compiler import compile_c
 from neural_vm.token_layout import Token
 from neural_vm.unified_compiler.full_vm_compiler_dynamic import compile_full_vm_dynamic
-from neural_vm.unified_compiler.faithful_autoregressive import (
+from neural_vm.verification.faithful_autoregressive import (
     FaithfulAutoregressiveRunner, _ContextShim,
 )
 from tools.faithful_interpreter_validate import _faithful_residual_pre_head

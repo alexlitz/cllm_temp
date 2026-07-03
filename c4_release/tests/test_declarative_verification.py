@@ -25,7 +25,7 @@ sys.path.insert(
 )
 
 
-from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from c4_release.neural_vm.verification.decl_verifier import (  # noqa: E402
     CompactionSafetyReport,
     DeclarativeAuthorityReport,
     MultistepDriftEntry,
@@ -65,7 +65,7 @@ class TestUnitDecoding:
 
     def test_decode_attn_w_v(self):
         """W_v row encodes (head, slot); col -> input dim."""
-        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+        from c4_release.neural_vm.verification.decl_verifier import (
             _build_dim_lookup,
             _decode_attn_cell,
         )
@@ -82,7 +82,7 @@ class TestUnitDecoding:
 
     def test_decode_attn_w_o_reversed(self):
         """W_o: row is OUTPUT dim, col is (head, slot)."""
-        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+        from c4_release.neural_vm.verification.decl_verifier import (
             _build_dim_lookup,
             _decode_attn_cell,
         )
@@ -99,7 +99,7 @@ class TestUnitDecoding:
 
     def test_decode_ffn_w_up(self):
         """W_up: row=unit, col=input dim."""
-        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+        from c4_release.neural_vm.verification.decl_verifier import (
             _build_dim_lookup,
             _decode_ffn_cell,
         )
@@ -114,7 +114,7 @@ class TestUnitDecoding:
 
     def test_decode_ffn_w_down_reversed(self):
         """W_down: row=output dim, col=unit."""
-        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+        from c4_release.neural_vm.verification.decl_verifier import (
             _build_dim_lookup,
             _decode_ffn_cell,
         )
@@ -317,7 +317,7 @@ class TestSyntheticDriftDetection:
 
     def test_declared_but_not_written_flagged(self):
         """Inject a claim the bake_fn does NOT write; verifier must flag it."""
-        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+        from c4_release.neural_vm.verification.decl_verifier import (
             OpVerificationResult,
         )
 
@@ -332,7 +332,7 @@ class TestSyntheticDriftDetection:
         assert not r.ok
 
     def test_strict_mode_catches_undeclared_writes(self):
-        from c4_release.neural_vm.unified_compiler.decl_verifier import (
+        from c4_release.neural_vm.verification.decl_verifier import (
             OpVerificationResult,
             StaticVerificationReport,
         )
@@ -582,7 +582,7 @@ class TestMultistepProbe:
 # ----------------------------------------------------------------------
 
 
-from c4_release.neural_vm.unified_compiler.decl_verifier import (  # noqa: E402
+from c4_release.neural_vm.verification.decl_verifier import (  # noqa: E402
     AlibiConsistencyReport,
     _eval_postcondition,
     _op_step_idx_allowed,

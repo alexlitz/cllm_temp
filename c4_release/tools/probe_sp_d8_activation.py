@@ -45,7 +45,7 @@ THRESH = 70.0
 
 
 def find_ent_steps(bc):
-    from neural_vm.unified_compiler.symbolic_program import SymbolicDeclarativeProgramRunner
+    from neural_vm.verification.symbolic_program import SymbolicDeclarativeProgramRunner
     st = SymbolicDeclarativeProgramRunner().run(list(bc), b"", max_steps=2000)
     return [tr.step for tr in st.trace if tr.name == "ENT"]
 

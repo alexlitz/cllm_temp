@@ -95,7 +95,7 @@ def collect_all_rules():
     """Import every ops module, call each ``make_*`` factory, collect rules.
 
     Returns list of (module, factory_name, FFNRule)."""
-    from neural_vm.unified_compiler.decl_verifier import _collect_ffn_rules_from_op
+    from neural_vm.verification.decl_verifier import _collect_ffn_rules_from_op
     from neural_vm.unified_compiler.ir import FFNRule, FFNOp, CompilerIR
 
     ops_dir = os.path.join(_PKG, "neural_vm", "unified_compiler", "ops")

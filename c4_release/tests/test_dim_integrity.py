@@ -15,7 +15,7 @@ from typing import Dict, List
 
 import pytest
 
-from c4_release.neural_vm.unified_compiler.dim_integrity import (
+from c4_release.neural_vm.verification.dim_integrity import (
     find_dead_consumers,
     format_report,
     run_dim_integrity_check,

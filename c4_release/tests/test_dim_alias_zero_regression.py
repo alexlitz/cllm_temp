@@ -2,7 +2,7 @@
 the FULL raw-factory corpus == 0.
 
 The dim-alias verifier
-(:mod:`neural_vm.unified_compiler.dim_alias_verifier`) flags FFNRules that
+(:mod:`neural_vm.verification.dim_alias_verifier`) flags FFNRules that
 read an aliased residual slot at positions where the alias could carry a
 *different* semantic value (the textbook ``OPCODE_BYTE_LO`` read at a
 ``mark == MEM`` row that actually carries ``ADDR_B0_LO``'s address byte).
@@ -35,10 +35,10 @@ If this test starts failing:
 from __future__ import annotations
 
 from neural_vm.dim_registry import build_default_registry
-from neural_vm.unified_compiler.decl_verifier import (
+from neural_vm.verification.decl_verifier import (
     collect_all_authored_ops,
 )
-from neural_vm.unified_compiler.dim_alias_verifier import (
+from neural_vm.verification.dim_alias_verifier import (
     format_violations,
     verify_dim_aliases_for_ops,
 )

@@ -31,10 +31,10 @@ import argparse
 import sys
 from typing import List
 
-from c4_release.neural_vm.unified_compiler.decl_verifier import (
+from c4_release.neural_vm.verification.decl_verifier import (
     _build_layout_only,
 )
-from c4_release.neural_vm.unified_compiler.dim_contracts import (
+from c4_release.neural_vm.verification.dim_contracts import (
     registered_dim_contracts,
     verify_all_registered_contracts,
 )
@@ -85,7 +85,7 @@ def main(argv: List[str]) -> int:
     if not contracts:
         print(
             "No contracts registered. Import "
-            "c4_release.neural_vm.unified_compiler.dim_contracts to "
+            "c4_release.neural_vm.verification.dim_contracts to "
             "trigger the starter set."
         )
         return 0

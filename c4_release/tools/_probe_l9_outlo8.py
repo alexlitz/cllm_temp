@@ -36,7 +36,7 @@ def main():
     model = ctx.model
     dp = ctx.dim_positions
     LO = dp["OUTPUT_LO"]; col = LO + nib
-    from neural_vm.unified_compiler.faithful_autoregressive import FaithfulAutoregressiveRunner
+    from neural_vm.verification.faithful_autoregressive import FaithfulAutoregressiveRunner
     with contextlib.redirect_stdout(io.StringIO()):
         ar = FaithfulAutoregressiveRunner(model=model, layout=ctx.layout)
     tape = list(ar._inner._serial._build_context(bc, [], []))

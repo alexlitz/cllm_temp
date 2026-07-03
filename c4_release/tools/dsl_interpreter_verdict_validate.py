@@ -2,9 +2,9 @@
 """Validate the DSL-INTERPRETER verdict path vs the REAL CPU-neural decode.
 
 The VEHICLE is the DSL interpreter:
-``neural_vm.unified_compiler.dsl_interpreter_verdict.DSLInterpreterVerdictRunner``
+``neural_vm.verification.dsl_interpreter_verdict.DSLInterpreterVerdictRunner``
 drives the production fail-fast decode with the per-token argmax coming from
-:class:`~neural_vm.unified_compiler.faithful_interpreter.IRBlockForward` (the
+:class:`~neural_vm.verification.faithful_interpreter.IRBlockForward` (the
 ``FaithfulInterpreter`` engine executing the per-physical-block IR). It is
 NON-re-anchored (unlike ``tools/interp_oracle_gate.py``), so it reproduces the
 autoregressive framing-drift verdict (a step emitting 34/37 tokens) at the spec
@@ -205,7 +205,7 @@ def _run_dsl_interp(progs: List[_Prog], criterion: str, spec_k: int = 32
                     ) -> Tuple[List[dict], float, int]:
     """Run the DSL-interpreter verdict path; return (results, secs, n_fwd)."""
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    from neural_vm.unified_compiler.dsl_interpreter_verdict import (
+    from neural_vm.verification.dsl_interpreter_verdict import (
         DSLInterpreterVerdictRunner,
     )
 

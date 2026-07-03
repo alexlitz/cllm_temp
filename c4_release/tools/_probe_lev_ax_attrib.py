@@ -41,7 +41,7 @@ def main():
     LO = dp["OUTPUT_LO"]; HI = dp["OUTPUT_HI"]
 
     # Real autoregressive decoded tape (reproduces poisoning)
-    from neural_vm.unified_compiler.faithful_autoregressive import FaithfulAutoregressiveRunner
+    from neural_vm.verification.faithful_autoregressive import FaithfulAutoregressiveRunner
     with contextlib.redirect_stdout(io.StringIO()):
         ar = FaithfulAutoregressiveRunner(model=ctx.model, layout=ctx.layout)
     # Build the full decoded context by replaying the spec_k=0 free run.

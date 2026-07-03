@@ -11,7 +11,7 @@ if PKG not in sys.path:
     sys.path.insert(0, PKG)
 
 from neural_vm.dim_registry import build_default_registry
-from neural_vm.unified_compiler.decl_verifier import (
+from neural_vm.verification.decl_verifier import (
     verify_rule_strength,
     verify_rule_scopes,
     _collect_ffn_rules_from_op,
