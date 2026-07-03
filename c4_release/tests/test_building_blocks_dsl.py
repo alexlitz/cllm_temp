@@ -1799,3 +1799,44 @@ def test_l16_byte_route_ported_call_sites_are_byte_identical():
         bp_marker_passthrough_conditions, 1.5, 10.0)
     _assert_rules_equal(
         _rules_by_prefix(live, ("l16_bp_marker_passthrough_",)), hand)
+
+
+def test_l10_ax_passthrough_ported_call_site_is_byte_identical():
+    """The live l10 AX-passthrough byte-route band still emits the original
+    rule tuple field-for-field after the reduction-map ⑥ port.
+
+    ``_layer10_alu_ax_passthrough_rules`` (part of the width-locked
+    ``layer10_alu`` FFN) was delegated to :func:`byte_route_rules`: two
+    per-cell BYTE-ROUTE bands (``AX_CARRY_{LO,HI}+k`` gate -> route
+    ``OUTPUT_{LO,HI}+k`` at ``2.0/S``) under the shared ``(MARK_AX,
+    *suppressed-op NOT-terms)`` AND at threshold 0.5. The live output
+    must equal the pre-refactor inline
+    ``for nibble_label, carry_dim, out_dim / for k in range(16)`` loop.
+    """
+    from c4_release.neural_vm.unified_compiler.ops.l10_ops import (
+        _L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS,
+        _layer10_alu_ax_passthrough_rules,
+    )
+
+    S = 100.0
+    live = _layer10_alu_ax_passthrough_rules(S)
+
+    hand = []
+    for nibble_label, carry_dim, out_dim in (
+        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            conditions = [("MARK_AX", 1.0)]
+            for op_dim in _L10_ALU_AX_PASSTHROUGH_SUPPRESSED_OPS:
+                conditions.append((op_dim, -1.0))
+            hand.append(multi_way_and_rule(
+                name=f"l10_ax_passthrough_{nibble_label}_{k}",
+                conditions=tuple(conditions),
+                threshold=0.5,
+                gate=f"{carry_dim}+{k}",
+                gate_weight=1.0,
+                writes=((f"{out_dim}+{k}", 2.0 / S),),
+            ))
+    assert len(live) == 32
+    _assert_rules_equal(live, hand)
