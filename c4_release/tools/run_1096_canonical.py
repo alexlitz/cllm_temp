@@ -171,21 +171,28 @@ _SUITE_SPEC_K = 0
 # So any cap >= 39 keeps EVERY potential pass. The cap only decides how many
 # guaranteed-FAIL diverging programs get a real ``fail`` verdict vs ``skipped``.
 #
-# The default cap 40 keeps all 846 passable programs PLUS the few shallow
-# diverging programs (16..40 steps), and skips the deeper diverging band
-# (~210 programs > 40 steps) that is slow (minutes each) and OOM-prone when
-# batched. With the conservative bucket widths below, the runnable set is both
-# fast (~few minutes) and memory-safe. The skipped ids/clusters are printed
-# and recorded in ``--output``, NEVER counted as pass.
+# The default cap 1000 folds the WHOLE deep diverging band (loop_* / gcd /
+# rec_*, the 233 programs at 41..8369 steps) back into the run so it gets a
+# real pass/fail verdict instead of ``skipped``. The premise "the model passes
+# NONE of them" above is stale: there is NO position ceiling (the model forward
+# is ALiBi relative-distance — a 5000-token forward runs with no mask ceiling,
+# validated 2026-07-03), and the deep clusters share the SAME per-step roots as
+# the short ones, so once the cap is raised the deep programs that DON'T hit an
+# unfixed per-step root PASS outright. 1000 keeps every one of the 846 passable
+# short programs unchanged (all <=39 steps) and only adds the deep band, whose
+# members either pass (a win) or fail at a concrete divergence step (a debugging
+# goldmine for the per-step root-fix agents). The handful of pathological rec_fib
+# programs above 1000 steps (a ~290k-token O(steps^2) forward at 8369) stay
+# skipped so a full run never OOMs; ``--max-steps-cap 0`` disables the cap
+# entirely (WILL OOM the deepest rec_fib) and any explicit value overrides it.
 #
-# Raise ``--max-steps-cap`` to fold more of the diverging tail back in — but
-# those programs run their full horizon at ``O(steps^2)`` (MINUTES each) and
-# must run nearly SOLO (the bucket table forces width 1 above 80 steps) because
-# batching them OOMs a 24 GB GPU (a 12-wide ~45-step batch already hit 24 GB;
-# a 6-wide ~150-step batch climbs past 23 GB). Useful higher caps add slow,
-# all-failing programs only. Pass 0 to disable the cap (WILL OOM on the deepest
-# rec_fib, 8369 steps ~= a 290k-token forward tensor).
-_DEFAULT_MAX_STEPS_CAP = 40
+# COST (measured, un-windowed context): a program costs ``O(horizon^2)`` forward
+# FLOPs and ``O(horizon)`` activation memory; a ~450-step diverging member runs
+# nearly SOLO (the bucket table below forces width 1 above 80 steps) because
+# batching deep programs OOMs a 24 GB GPU. So a full corpus run at this cap is
+# SLOW (deep members are minutes each); narrow with ``--ids`` for the deep
+# clusters or drop the cap to 40 for the fast short-only run.
+_DEFAULT_MAX_STEPS_CAP = 1000
 
 # Memory-safety scale on the per-bucket batch widths below. The widths were
 # tuned for a dedicated 24 GB GPU; ``--mem-step-scale 0.5`` halves every width
@@ -785,12 +792,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--max-steps-cap", type=int, default=_DEFAULT_MAX_STEPS_CAP,
         help=f"Skip (count as 'skipped', NEVER pass) any program whose "
              f"declarative oracle step count exceeds this cap. Default "
-             f"{_DEFAULT_MAX_STEPS_CAP} keeps the run FAST and memory-safe: all "
-             f"846 passable (non-diverging) programs are <=39 steps, so this "
-             f"drops NO pass; it only skips the deeper diverging loop/gcd/rec "
-             f"band that runs its full horizon at O(steps^2) (minutes each, "
-             f"OOM-prone when batched) and fails anyway. Raise it to fold more "
-             f"of that band in (slower; runs solo). Pass 0 to disable (WILL OOM).",
+             f"{_DEFAULT_MAX_STEPS_CAP} folds the WHOLE deep diverging "
+             f"loop/gcd/rec band (the 233 programs at 41..8369 steps) into the "
+             f"run so it gets a real pass/fail verdict instead of 'skipped'. "
+             f"All 846 short programs are <=39 steps so this drops NO pass; the "
+             f"deep members either PASS (the model forward has no position "
+             f"ceiling) or fail at a concrete divergence step. Pass 40 for the "
+             f"FAST short-only run (skips the deep band, ~minutes); the deep "
+             f"band runs its full horizon at O(steps^2) SOLO (minutes each). "
+             f"Pass 0 to disable the cap entirely (WILL OOM the deepest rec_fib).",
     )
     parser.add_argument(
         "--mem-step-scale", type=float, default=_DEFAULT_MEM_STEP_SCALE,
