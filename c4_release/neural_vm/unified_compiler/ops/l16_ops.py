@@ -1,8 +1,26 @@
-"""Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
+"""Auto-extracted per-layer factories. See ../migrated_ops.py for history.
+
+Phase 7.E (sem-dim authoring): every role-meaningful base-slot NAME ref in
+this module's FFNRule conditions / gates / writes is authored via
+:func:`neural_vm.dim_registry.dim_ref` — ``dim_ref(category, role, offset)``
+resolves the base slot NAME from its semantic family at compile time and
+returns the byte-identical ``"NAME+offset"`` string. The ``+offset`` (nibble
+value / one-hot cell index) stays a raw structural index; only the base NAME
+is family-resolved, killing the repack-fragility class. LEFT RAW: the H1+i
+threshold-head bank slots, IS_BYTE / HAS_SE / NEXT_* / CONST unbound flags,
+OUTPUT_HI_THIS_STEP / OPCODE_BYTE_LO / SP_ADDR_* non-family slots, positional
+args to Primitives byte/nibble helpers, scope / dominates_at predicate strings
+and the reads=/writes= op metadata. NOTE: the three name-string filters that
+post-process conditions (``_harden_isbyte_blocker``, ``_harden_axmark_blocker``,
+and the ``lev_sp_stack0_cancel`` MARK_STACK0 drop) now match on the BASE slot
+name (``name.split("+", 1)[0]``) so a ``dim_ref`` "NAME+0" ref is treated
+identically to the legacy bare "NAME" — byte-identical (golden b4d2ab27).
+"""
 
 import os
 import os as _os
 
+from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
 from ..building_blocks_dsl import multi_way_and_rule
@@ -200,8 +218,8 @@ def _arith_guard_addsub_blockers() -> tuple:
             ("OPCODE_BYTE_LO+10", -1_000_000_000.0),
         )
     return (
-        ("OP_ADD", -1_000_000_000.0),
-        ("OP_SUB", -1_000_000_000.0),
+        (dim_ref('opcode_flag', 'ADD'), -1_000_000_000.0),
+        (dim_ref('opcode_flag', 'SUB'), -1_000_000_000.0),
     )
 
 
@@ -390,8 +408,12 @@ def _harden_isbyte_blocker(conditions):
     """
     if not _stack0_marker_isbyte_hardening_on():
         return conditions
+    # Match on the BASE slot name so a semantic ``dim_ref`` ref ("IS_BYTE+0")
+    # hardens identically to the legacy bare "IS_BYTE" string (Phase 7.E:
+    # conditions may now be authored via dim_ref, which appends a "+0"). The
+    # returned name string is preserved verbatim, so lowering is byte-identical.
     return tuple(
-        (name, -1e6) if name == "IS_BYTE" else (name, weight)
+        (name, -1e6) if name.split("+", 1)[0] == "IS_BYTE" else (name, weight)
         for name, weight in conditions
     )
 
@@ -456,8 +478,13 @@ def _harden_axmark_blocker(conditions):
     """
     if not _stack0_marker_axmark_hardening_on():
         return conditions
+    # Match on the BASE slot name so a semantic ``dim_ref`` ref ("MARK_PC+0")
+    # hardens identically to the legacy bare "MARK_PC" string (Phase 7.E:
+    # conditions may now be authored via dim_ref, which appends a "+0"). The
+    # returned name string is preserved verbatim, so lowering is byte-identical.
     return tuple(
-        (name, -1e6) if name in _STACK0_MARKER_REG_BLOCKERS else (name, weight)
+        (name, -1e6) if name.split("+", 1)[0] in _STACK0_MARKER_REG_BLOCKERS
+        else (name, weight)
         for name, weight in conditions
     )
 
@@ -576,15 +603,15 @@ def _add_stack0_x0_alu_materializer(
     # is disjoint from OPCODE_BYTE_LO's full semantics. Byte-identical at
     # intended firing positions (MARK_STACK0 rows have MARK_MEM == 0 and
     # IS_BYTE == 0 by VM construction).
-    gate_terms = (("MARK_MEM", -1e6), ("IS_BYTE", -1e6))
+    gate_terms = ((dim_ref('marker', 'MEM'), -1e6), ("IS_BYTE", -1e6))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_{family}_marker_from_alu_lo_{k}",
             conditions=conditions,
             threshold=threshold,
-            gate=f"ALU_LO+{k}",
+            gate=dim_ref('alu_lo', 'result', k),
             gate_terms=gate_terms,
-            writes=((f"OUTPUT_LO+{k}", 50.0 / S),),
+            writes=((dim_ref('output_lo', 'nibble', k), 50.0 / S),),
             scope=scope,
             dominates_at=dominates_at,
         ))
@@ -593,7 +620,7 @@ def _add_stack0_x0_alu_materializer(
             name=f"l16_stack0_{family}_marker_from_alu_hi_{k}",
             conditions=conditions,
             threshold=threshold,
-            gate=f"ALU_HI+{k}",
+            gate=dim_ref('alu_hi', 'result', k),
             gate_terms=gate_terms,
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 50.0 / S),),
             scope=scope,
@@ -608,11 +635,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     write_scale = 2.0 / S
     first_step_gate = 30.0
     sp_cancel_conditions = (
-        ("OP_LEV", 0.2),
-        ("MARK_SP", 1.0),
-        ("MARK_PC", -1.0),
-        ("MARK_AX", -1.0),
-        ("MARK_BP", -1.0),
+        (dim_ref('opcode_flag', 'LEV'), 0.2),
+        (dim_ref('marker', 'SP'), 1.0),
+        (dim_ref('marker', 'PC'), -1.0),
+        (dim_ref('marker', 'AX'), -1.0),
+        (dim_ref('marker', 'BP'), -1.0),
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
@@ -628,23 +655,23 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ))
 
     sp_value_base_conditions = (
-        ("OP_LEV", 1.0),
-        ("MARK_SP", 1.0),
-        ("MARK_BP", -15.0),
-        ("MARK_PC", -15.0),
-        ("MARK_AX", -50.0),
-        ("MARK_STACK0", -15.0),
+        (dim_ref('opcode_flag', 'LEV'), 1.0),
+        (dim_ref('marker', 'SP'), 1.0),
+        (dim_ref('marker', 'BP'), -15.0),
+        (dim_ref('marker', 'PC'), -15.0),
+        (dim_ref('marker', 'AX'), -50.0),
+        (dim_ref('marker', 'STACK0'), -15.0),
         # MARK_MEM bumped from -15 to -1e6 (HARD_BLOCKER_THRESHOLD) so
         # the dim_alias_verifier treats it as a hard NOT-blocker. Bake
         # math unchanged at intended firing positions (MARK_MEM == 0
         # at MARK_SP rows).
-        ("MARK_MEM", -1e6),
+        (dim_ref('marker', 'MEM'), -1e6),
         ("H3+4", -15.0),
-        ("MARK_SE", -15.0),
-        ("BYTE_INDEX_0", -10.0),
-        ("BYTE_INDEX_1", -10.0),
-        ("BYTE_INDEX_2", -10.0),
-        ("BYTE_INDEX_3", -10.0),
+        (dim_ref('marker', 'SE'), -15.0),
+        (dim_ref('byte_index', '0'), -10.0),
+        (dim_ref('byte_index', '1'), -10.0),
+        (dim_ref('byte_index', '2'), -10.0),
+        (dim_ref('byte_index', '3'), -10.0),
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
@@ -652,33 +679,33 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # to mark==MEM (because ADDR_B0_LO has mark==MEM semantics and the
     # gate is parsed as positive), the gate-fallback would over-admit MEM
     # rows. The gate-side blocker forces the fallback to exclude MEM rows.
-    sp_bp_plus16_gate_terms = (("MARK_MEM", -1e6),)
+    sp_bp_plus16_gate_terms = ((dim_ref('marker', 'MEM'), -1e6),)
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_sp_bp_plus16_lo_{k}",
-            conditions=sp_value_base_conditions + ((f"ADDR_B0_LO+{k}", 1.0),),
+            conditions=sp_value_base_conditions + ((dim_ref('memory_lo', 'addr_b0', k), 1.0),),
             threshold=40.0,
-            gate=f"ADDR_B0_LO+{k}",
+            gate=dim_ref('memory_lo', 'addr_b0', k),
             gate_terms=sp_bp_plus16_gate_terms,
-            writes=((f"OUTPUT_LO+{k}", write_scale),),
+            writes=((dim_ref('output_lo', 'nibble', k), write_scale),),
         ))
     for k in range(16):
         result = (k + 1) % 16
         rules.append(multi_way_and_rule(
             name=f"l16_lev_sp_bp_plus16_hi_{k}",
-            conditions=sp_value_base_conditions + ((f"ADDR_B0_HI+{k}", 1.0),),
+            conditions=sp_value_base_conditions + ((dim_ref('memory_hi', 'addr_b0', k), 1.0),),
             threshold=40.0,
-            gate=f"ADDR_B0_HI+{k}",
+            gate=dim_ref('memory_hi', 'addr_b0', k),
             gate_terms=sp_bp_plus16_gate_terms,
             writes=((f"OUTPUT_HI_THIS_STEP+{result}", write_scale),),
         ))
 
     pc_cancel_hi_conditions = (
-        ("OP_LEV", 0.2),
-        ("MARK_PC", 1.0),
-        ("MARK_AX", -1.0),
-        ("MARK_SP", -1.0),
-        ("MARK_BP", -1.0),
+        (dim_ref('opcode_flag', 'LEV'), 0.2),
+        (dim_ref('marker', 'PC'), 1.0),
+        (dim_ref('marker', 'AX'), -1.0),
+        (dim_ref('marker', 'SP'), -1.0),
+        (dim_ref('marker', 'BP'), -1.0),
     )
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -693,21 +720,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_lev_pc_temp_lo_{k}",
             conditions=(
-                ("OP_LEV", 1.0),
-                ("MARK_PC", 1.0),
-                (f"TEMP+{k}", 1.0),
+                (dim_ref('opcode_flag', 'LEV'), 1.0),
+                (dim_ref('marker', 'PC'), 1.0),
+                (dim_ref('temp_scratch', 'general', k), 1.0),
             ),
             threshold=3.5,
             gate="CONST",
-            writes=((f"OUTPUT_LO+{k}", write_scale),),
+            writes=((dim_ref('output_lo', 'nibble', k), write_scale),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_pc_temp_hi_{k}",
             conditions=(
-                ("OP_LEV", 1.0),
-                ("MARK_PC", 1.0),
-                (f"TEMP+{16 + k}", 1.0),
+                (dim_ref('opcode_flag', 'LEV'), 1.0),
+                (dim_ref('marker', 'PC'), 1.0),
+                (dim_ref('temp_scratch', 'general', 16 + k), 1.0),
             ),
             threshold=3.5,
             gate="CONST",
@@ -739,16 +766,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # still works.  HAS_SE already declared in the op's reads set.
     step0_guard_weight = 10.0
     lev_ax_carry_conditions = (
-        ("OP_LEV", 1.0),
-        ("MARK_AX", 1.0),
-        ("MARK_PC", -8.0),
-        ("MARK_SP", -8.0),
-        ("MARK_BP", -8.0),
-        ("MARK_STACK0", -8.0),
-        ("MARK_MEM", -8.0),
+        (dim_ref('opcode_flag', 'LEV'), 1.0),
+        (dim_ref('marker', 'AX'), 1.0),
+        (dim_ref('marker', 'PC'), -8.0),
+        (dim_ref('marker', 'SP'), -8.0),
+        (dim_ref('marker', 'BP'), -8.0),
+        (dim_ref('marker', 'STACK0'), -8.0),
+        (dim_ref('marker', 'MEM'), -8.0),
         ("IS_BYTE", -10.0),
-        ("OP_EXIT", -20.0),
-        ("OP_JMP", -20.0),
+        (dim_ref('opcode_flag', 'EXIT'), -20.0),
+        (dim_ref('opcode_flag', 'JMP'), -20.0),
         ("HAS_SE", step0_guard_weight),
     )
     for k in range(16):
@@ -756,15 +783,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_lev_ax_carry_lo_{k}",
             conditions=lev_ax_carry_conditions,
             threshold=1.5 + step0_guard_weight,
-            gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+            gate=dim_ref('ax_carry_lo', 'AX', k),
+            writes=((dim_ref('output_lo', 'nibble', k), 2.0 / S),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_ax_carry_hi_{k}",
             conditions=lev_ax_carry_conditions,
             threshold=1.5 + step0_guard_weight,
-            gate=f"AX_CARRY_HI+{k}",
+            gate=dim_ref('ax_carry_hi', 'AX', k),
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
@@ -794,15 +821,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_lev_ax_full_lo_{k}",
             conditions=lev_ax_carry_conditions,
             threshold=1.5 + step0_guard_weight,
-            gate=f"AX_FULL_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+            gate=dim_ref('register_lo', 'AX', k),
+            writes=((dim_ref('output_lo', 'nibble', k), 2.0 / S),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_lev_ax_full_hi_{k}",
             conditions=lev_ax_carry_conditions,
             threshold=1.5 + step0_guard_weight,
-            gate=f"AX_FULL_HI+{k}",
+            gate=dim_ref('register_hi', 'AX', k),
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
@@ -822,17 +849,17 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # (5+1+1+1=8 at LEV step, 0+1+1+1=3 at IMM step). Explicit OP_IMM and
     # OP_PSH blockers add belt-and-braces against the cascade self-feedback.
     lev_stack0_preserve_conditions = (
-        ("OP_LEV", 5.0),
-        ("MARK_STACK0", 1.0),
+        (dim_ref('opcode_flag', 'LEV'), 5.0),
+        (dim_ref('marker', 'STACK0'), 1.0),
         ("HAS_SE", 1.0),
-        ("BYTE_INDEX_0", 1.0),
-        ("OP_IMM", -10.0),
-        ("OP_PSH", -10.0),
-        ("MARK_PC", -8.0),
-        ("MARK_AX", -8.0),
-        ("MARK_SP", -8.0),
-        ("MARK_BP", -8.0),
-        ("MARK_MEM", -8.0),
+        (dim_ref('byte_index', '0'), 1.0),
+        (dim_ref('opcode_flag', 'IMM'), -10.0),
+        (dim_ref('opcode_flag', 'PSH'), -10.0),
+        (dim_ref('marker', 'PC'), -8.0),
+        (dim_ref('marker', 'AX'), -8.0),
+        (dim_ref('marker', 'SP'), -8.0),
+        (dim_ref('marker', 'BP'), -8.0),
+        (dim_ref('marker', 'MEM'), -8.0),
         ("IS_BYTE", -10.0),
         ("MEM_STORE", -10.0),
     )
@@ -843,7 +870,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # large NOT-blocker vetoes the misfire without touching legitimate fires.
         lev_stack0_preserve_conditions = (
             *lev_stack0_preserve_conditions,
-            ("MARK_SE", -100.0),
+            (dim_ref('marker', 'SE'), -100.0),
         )
     # Use nudge-strength (50/S) to match the sibling stack0_e0/e8/f8 marker
     # materializer families; this is enough to overcome the residual
@@ -879,7 +906,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=lev_stack0_preserve_conditions,
             threshold=7.5,
             gate=_proto_gate_lo(k),
-            writes=((f"OUTPUT_LO+{k}", lev_stack0_preserve_strength),),
+            writes=((dim_ref('output_lo', 'nibble', k), lev_stack0_preserve_strength),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -891,14 +918,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ))
 
     byte_zero_base = (
-        ("OP_LEV", 0.5),
-        ("MARK_PC", -1.5),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
-        ("MARK_SE", -10.0),
+        (dim_ref('opcode_flag', 'LEV'), 0.5),
+        (dim_ref('marker', 'PC'), -1.5),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -10.0),
+        (dim_ref('marker', 'MEM'), -10.0),
+        (dim_ref('marker', 'SE'), -10.0),
         ("H1+1", -10.0),
         ("NEXT_AX", -1.5),
         ("NEXT_SP", -1.5),
@@ -913,7 +940,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=byte_zero_base + ((byte_idx, 1.0),),
             threshold=4.0,
             gate="CONST",
-            writes=(("OUTPUT_LO+10", -10.0 / S),),
+            writes=((dim_ref('output_lo', 'nibble', 10), -10.0 / S),),
         ))
     for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
         rules.append(multi_way_and_rule(
@@ -921,7 +948,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=byte_zero_base + ((byte_idx, 1.0),),
             threshold=4.0,
             gate="CONST",
-            writes=(("OUTPUT_LO+0", 5.0 / S),),
+            writes=((dim_ref('output_lo', 'nibble', 0), 5.0 / S),),
         ))
     for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
         rules.append(multi_way_and_rule(
@@ -948,16 +975,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_lev_pc_top_return_0a",
         conditions=(
-            ("OP_LEV", 1.0),
-            ("MARK_PC", 1.0),
+            (dim_ref('opcode_flag', 'LEV'), 1.0),
+            (dim_ref('marker', 'PC'), 1.0),
             ("HAS_SE", 1.0),
             ("H1+0", 1.0),
             ("IS_BYTE", -300.0),
-            ("MARK_AX", -10.0),
-            ("MARK_SP", -10.0),
-            ("MARK_BP", -10.0),
-            ("MARK_STACK0", -100.0),  # don't write 0x0a at STACK0 emit positions (var_* cluster)
-            ("MARK_MEM", -10.0),
+            (dim_ref('marker', 'AX'), -10.0),
+            (dim_ref('marker', 'SP'), -10.0),
+            (dim_ref('marker', 'BP'), -10.0),
+            (dim_ref('marker', 'STACK0'), -100.0),  # don't write 0x0a at STACK0 emit positions (var_* cluster)
+            (dim_ref('marker', 'MEM'), -10.0),
         ),
         threshold=7.5,
         gate=_lev_pc_top_gate,
@@ -975,21 +1002,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_jsr_mem_addr0_f8",
         conditions=(
-            ("OP_JSR", 1.0),
-            ("OP_ENT", -10.0),
-            ("MARK_MEM", 1.0),
+            (dim_ref('opcode_flag', 'JSR'), 1.0),
+            (dim_ref('opcode_flag', 'ENT'), -10.0),
+            (dim_ref('marker', 'MEM'), 1.0),
             ("MEM_STORE", 1.0),
             ("HAS_SE", -20.0),
             ("IS_BYTE", -1_000_000_000_000.0),
-            ("MARK_PC", -1_000_000.0),
-            ("MARK_AX", -1_000_000.0),
-            ("MARK_SP", -1_000_000.0),
-            ("MARK_BP", -1_000_000.0),
-            ("MARK_STACK0", -1_000_000.0),
+            (dim_ref('marker', 'PC'), -1_000_000.0),
+            (dim_ref('marker', 'AX'), -1_000_000.0),
+            (dim_ref('marker', 'SP'), -1_000_000.0),
+            (dim_ref('marker', 'BP'), -1_000_000.0),
+            (dim_ref('marker', 'STACK0'), -1_000_000.0),
         ),
         threshold=7.5,
         writes=Primitives.byte_value_writes(0xF8, strength=5.0) + (
-            ("ALU_LO+14", -30.0),
+            (dim_ref('alu_lo', 'result', 14), -30.0),
         ),
     ))
     # JSR->ENT prologue link (SEVENTH link, var/func/loop/rec ~525 programs):
@@ -1043,20 +1070,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_jsr_mem_addr0_e0_from_l14_evidence",
         conditions=(
-            ("OP_JSR", 30.0),
-            ("OP_ENT", -10.0),
+            (dim_ref('opcode_flag', 'JSR'), 30.0),
+            (dim_ref('opcode_flag', 'ENT'), -10.0),
             ("PSH_AT_SP", -100_000.0),
-            ("MARK_MEM", 300.0),
+            (dim_ref('marker', 'MEM'), 300.0),
             ("MEM_STORE", 150.0),
             ("HAS_SE", 1.0),
             ("IS_BYTE", -1_000_000_000_000.0),
-            ("MARK_PC", -1_000_000.0),
-            ("MARK_AX", -1_000_000.0),
-            ("MARK_SP", -1_000_000.0),
-            ("MARK_BP", -1_000_000.0),
-            ("MARK_STACK0", -1_000_000.0),
-            ("OUTPUT_LO+0", 1.0),
-            ("OUTPUT_LO+8", -1.0),
+            (dim_ref('marker', 'PC'), -1_000_000.0),
+            (dim_ref('marker', 'AX'), -1_000_000.0),
+            (dim_ref('marker', 'SP'), -1_000_000.0),
+            (dim_ref('marker', 'BP'), -1_000_000.0),
+            (dim_ref('marker', 'STACK0'), -1_000_000.0),
+            (dim_ref('output_lo', 'nibble', 0), 1.0),
+            (dim_ref('output_lo', 'nibble', 8), -1.0),
             ("OUTPUT_HI_THIS_STEP+14", 1.0),
             ("OUTPUT_HI_THIS_STEP+15", -1.0),
         ),
@@ -1088,16 +1115,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_jsr_initial_stack0_marker_0a",
         conditions=(
-            ("OP_JSR", 50.0),
-            ("OP_ENT", -1000.0),
-            ("CMP+4", 0.2),
-            ("MARK_STACK0", 20.0),
+            (dim_ref('opcode_flag', 'JSR'), 50.0),
+            (dim_ref('opcode_flag', 'ENT'), -1000.0),
+            (dim_ref('cmp_flag', 'cascade', 4), 0.2),
+            (dim_ref('marker', 'STACK0'), 20.0),
             ("HAS_SE", -1000.0),
             ("MEM_STORE", -100.0),
-            ("ADDR_B0_LO+8", 20.0),
-            ("ADDR_B0_LO+0", -20.0),
-            ("ADDR_B0_HI+14", -20.0),
-            ("ADDR_B0_HI+15", 20.0),
+            (dim_ref('memory_lo', 'addr_b0', 8), 20.0),
+            (dim_ref('memory_lo', 'addr_b0', 0), -20.0),
+            (dim_ref('memory_hi', 'addr_b0', 14), -20.0),
+            (dim_ref('memory_hi', 'addr_b0', 15), 20.0),
             # var/func JSR-prologue leak fix (2026-06-11): the non-STACK0
             # marker / byte blockers were -300, calibrated for a one-hot
             # OP_JSR ~1.0. OP_JSR is the in-step opcode broadcast and reaches
@@ -1114,11 +1141,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # unchanged. See docs/VAR_BASELINE_ATTRIBUTION_2026_06_11.md and
             # probe_var_l20ffn.py.
             ("IS_BYTE", -1_000_000.0),
-            ("MARK_PC", -1_000_000.0),
-            ("MARK_AX", -1_000_000.0),
-            ("MARK_SP", -1_000_000.0),
-            ("MARK_BP", -1_000_000.0),
-            ("MARK_MEM", -1_000_000.0),
+            (dim_ref('marker', 'PC'), -1_000_000.0),
+            (dim_ref('marker', 'AX'), -1_000_000.0),
+            (dim_ref('marker', 'SP'), -1_000_000.0),
+            (dim_ref('marker', 'BP'), -1_000_000.0),
+            (dim_ref('marker', 'MEM'), -1_000_000.0),
         ),
         threshold=320.0,
         writes=Primitives.byte_value_writes(0x0A, strength=20.0),
@@ -1131,23 +1158,23 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # exact preserved e8 stack-top marker, leaving JSR/ENT/current-store rows
     # to their own owners.
     stack0_e8_marker_base_conditions = (
-        ("MARK_STACK0", 1.0),
+        (dim_ref('marker', 'STACK0'), 1.0),
         ("HAS_SE", 1.0),
-        ("ADDR_B0_LO+8", 10.0),
-        ("ADDR_B0_HI+14", 1.0),
-        ("ADDR_B0_HI+15", -2.0),
+        (dim_ref('memory_lo', 'addr_b0', 8), 10.0),
+        (dim_ref('memory_hi', 'addr_b0', 14), 1.0),
+        (dim_ref('memory_hi', 'addr_b0', 15), -2.0),
         ("IS_BYTE", -10.0),
-        ("OP_JSR", -10.0),
-        ("OP_ENT", -100.0),
-        ("OP_LEV", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
+        (dim_ref('opcode_flag', 'JSR'), -10.0),
+        (dim_ref('opcode_flag', 'ENT'), -100.0),
+        (dim_ref('opcode_flag', 'LEV'), -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
         # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
         # dim_alias_verifier treats it as a hard NOT-blocker; runtime
         # firing positions have MARK_MEM == 0 so bake math is unchanged.
-        ("MARK_MEM", -1e6),
+        (dim_ref('marker', 'MEM'), -1e6),
     )
     stack0_e8_marker_conditions = stack0_e8_marker_base_conditions + (
         # Current SI/SC top-store markers carry residual MEM_STORE around 0.4;
@@ -1208,22 +1235,22 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_stack0_e0_marker_e8_from_alu_exact",
         conditions=(
-            ("MARK_STACK0", 1.0),
+            (dim_ref('marker', 'STACK0'), 1.0),
             ("HAS_SE", 1.0),
-            ("ADDR_B0_LO+0", 1.0),
-            ("ADDR_B0_HI+14", 1.0),
-            ("ALU_LO+8", 1.0),
-            ("ALU_HI+14", 1.0),
+            (dim_ref('memory_lo', 'addr_b0', 0), 1.0),
+            (dim_ref('memory_hi', 'addr_b0', 14), 1.0),
+            (dim_ref('alu_lo', 'result', 8), 1.0),
+            (dim_ref('alu_hi', 'result', 14), 1.0),
             ("MEM_STORE", -20.0),
             ("IS_BYTE", -10.0),
-            ("OP_JSR", -10.0),
-            ("OP_ENT", -10.0),
-            ("OP_LEV", -10.0),
-            ("MARK_PC", -1_000_000.0),
-            ("MARK_AX", -1_000_000.0),
-            ("MARK_SP", -1_000_000.0),
-            ("MARK_BP", -1_000_000.0),
-            ("MARK_MEM", -1_000_000.0),
+            (dim_ref('opcode_flag', 'JSR'), -10.0),
+            (dim_ref('opcode_flag', 'ENT'), -10.0),
+            (dim_ref('opcode_flag', 'LEV'), -10.0),
+            (dim_ref('marker', 'PC'), -1_000_000.0),
+            (dim_ref('marker', 'AX'), -1_000_000.0),
+            (dim_ref('marker', 'SP'), -1_000_000.0),
+            (dim_ref('marker', 'BP'), -1_000_000.0),
+            (dim_ref('marker', 'MEM'), -1_000_000.0),
         ),
         threshold=19.0,
         writes=Primitives.byte_value_writes(0xE8, strength=50.0 / S),
@@ -1237,25 +1264,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # the e8 lookalike via the ADDR_B0_LO+8 negative weight so PSH/SI rows at
     # 0xffe8 do not co-fire.
     stack0_e0_marker_conditions = (
-        ("MARK_STACK0", 1.0),
+        (dim_ref('marker', 'STACK0'), 1.0),
         ("HAS_SE", 1.0),
-        ("ADDR_B0_LO+0", 10.0),
-        ("ADDR_B0_LO+8", -2.0),
-        ("ADDR_B0_HI+14", 1.0),
-        ("ADDR_B0_HI+15", -2.0),
+        (dim_ref('memory_lo', 'addr_b0', 0), 10.0),
+        (dim_ref('memory_lo', 'addr_b0', 8), -2.0),
+        (dim_ref('memory_hi', 'addr_b0', 14), 1.0),
+        (dim_ref('memory_hi', 'addr_b0', 15), -2.0),
         ("IS_BYTE", -10.0),
-        ("OP_JSR", -10.0),
-        ("OP_ENT", -100.0),
-        ("OP_LEV", -10.0),
+        (dim_ref('opcode_flag', 'JSR'), -10.0),
+        (dim_ref('opcode_flag', 'ENT'), -100.0),
+        (dim_ref('opcode_flag', 'LEV'), -10.0),
         ("MEM_STORE", -20.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
         # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
         # dim_alias_verifier treats it as a hard NOT-blocker; runtime
         # firing positions have MARK_MEM == 0 so bake math is unchanged.
-        ("MARK_MEM", -1e6),
+        (dim_ref('marker', 'MEM'), -1e6),
     )
     stack0_e0_marker_threshold = 12.0
     # NOTE(L16-e0-marker-scope-honest): same shape as the e8 family above --
@@ -1276,24 +1303,24 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
     stack0_f8_marker_conditions = (
-        ("MARK_STACK0", 1.0),
+        (dim_ref('marker', 'STACK0'), 1.0),
         ("HAS_SE", 1.0),
-        ("ADDR_B0_LO+8", 1.0),
-        ("ADDR_B0_HI+15", 1.0),
-        ("ADDR_B0_HI+14", -2.0),
+        (dim_ref('memory_lo', 'addr_b0', 8), 1.0),
+        (dim_ref('memory_hi', 'addr_b0', 15), 1.0),
+        (dim_ref('memory_hi', 'addr_b0', 14), -2.0),
         ("IS_BYTE", -10.0),
-        ("OP_JSR", -10.0),
-        ("OP_ENT", -10.0),
-        ("OP_LEV", -10.0),
+        (dim_ref('opcode_flag', 'JSR'), -10.0),
+        (dim_ref('opcode_flag', 'ENT'), -10.0),
+        (dim_ref('opcode_flag', 'LEV'), -10.0),
         ("MEM_STORE", -20.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
         # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
         # dim_alias_verifier treats it as a hard NOT-blocker; runtime
         # firing positions have MARK_MEM == 0 so bake math is unchanged.
-        ("MARK_MEM", -1e6),
+        (dim_ref('marker', 'MEM'), -1e6),
     )
     # NOTE(L16-f8-marker-scope-honest): same shape as the e8/e0 families
     # above -- the verifier-inferred effective predicate is the gate-only
@@ -1312,21 +1339,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
     stack0_e8_output_authoritative_conditions = (
-        ("MARK_STACK0", 1_000_000_000.0),
+        (dim_ref('marker', 'STACK0'), 1_000_000_000.0),
         ("HAS_SE", 10.0),
-        ("ADDR_B0_LO+8", 10.0),
-        ("ADDR_B0_HI+14", 10.0),
-        ("ADDR_B0_HI+15", -20.0),
+        (dim_ref('memory_lo', 'addr_b0', 8), 10.0),
+        (dim_ref('memory_hi', 'addr_b0', 14), 10.0),
+        (dim_ref('memory_hi', 'addr_b0', 15), -20.0),
         ("IS_BYTE", -1_000_000_000.0),
-        ("OP_JSR", -1_000_000_000.0),
-        ("OP_ENT", -1_000_000_000.0),
-        ("OP_LEV", -1_000_000_000.0),
+        (dim_ref('opcode_flag', 'JSR'), -1_000_000_000.0),
+        (dim_ref('opcode_flag', 'ENT'), -1_000_000_000.0),
+        (dim_ref('opcode_flag', 'LEV'), -1_000_000_000.0),
         ("MEM_STORE", -1_000_000_000.0),
-        ("MARK_PC", -1_000_000_000.0),
-        ("MARK_AX", -1_000_000_000.0),
-        ("MARK_SP", -1_000_000_000.0),
-        ("MARK_BP", -1_000_000_000.0),
-        ("MARK_MEM", -1_000_000_000.0),
+        (dim_ref('marker', 'PC'), -1_000_000_000.0),
+        (dim_ref('marker', 'AX'), -1_000_000_000.0),
+        (dim_ref('marker', 'SP'), -1_000_000_000.0),
+        (dim_ref('marker', 'BP'), -1_000_000_000.0),
+        (dim_ref('marker', 'MEM'), -1_000_000_000.0),
     )
 
     # If the load/preserve path has already produced a non-zero OUTPUT byte
@@ -1343,7 +1370,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_e8_output_authoritative_{byte:02x}",
             conditions=stack0_e8_output_authoritative_conditions + (
-                (f"OUTPUT_LO+{lo}", 100.0),
+                (dim_ref('output_lo', 'nibble', lo), 100.0),
                 (f"OUTPUT_HI_THIS_STEP+{hi}", 100.0),
             ),
             threshold=stack0_e8_output_authoritative_threshold,
@@ -1358,16 +1385,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         value_dim="ALU_LO+14",
         expected_value=0.0,
         activation_conditions=(
-            ("OP_ENT", 1.0),
-            ("MARK_MEM", 1.0),
+            (dim_ref('opcode_flag', 'ENT'), 1.0),
+            (dim_ref('marker', 'MEM'), 1.0),
             ("MEM_STORE", 1.0),
             ("HAS_SE", 1.0),
             ("IS_BYTE", -20.0),
-            ("MARK_PC", -20.0),
-            ("MARK_AX", -20.0),
-            ("MARK_SP", -20.0),
-            ("MARK_BP", -20.0),
-            ("MARK_STACK0", -20.0),
+            (dim_ref('marker', 'PC'), -20.0),
+            (dim_ref('marker', 'AX'), -20.0),
+            (dim_ref('marker', 'SP'), -20.0),
+            (dim_ref('marker', 'BP'), -20.0),
+            (dim_ref('marker', 'STACK0'), -20.0),
         ),
         condition_threshold=3.5,
         max_abs_weight=20.0,
@@ -1381,17 +1408,17 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # address; if the true nibble is zero, these rules stay inactive.
     psh_mem_addr0_conditions = (
         ("PSH_AT_SP", 1.0),
-        ("OP_JSR", -1000.0),
-        ("OP_ENT", -1000.0),
-        ("MARK_MEM", 1.0),
+        (dim_ref('opcode_flag', 'JSR'), -1000.0),
+        (dim_ref('opcode_flag', 'ENT'), -1000.0),
+        (dim_ref('marker', 'MEM'), 1.0),
         ("MEM_STORE", 1.0),
         ("HAS_SE", 0.5),
         ("IS_BYTE", -1_000_000.0),
-        ("MARK_PC", -1_000_000.0),
-        ("MARK_AX", -1_000_000.0),
-        ("MARK_SP", -1_000_000.0),
-        ("MARK_BP", -1_000_000.0),
-        ("MARK_STACK0", -1_000_000.0),
+        (dim_ref('marker', 'PC'), -1_000_000.0),
+        (dim_ref('marker', 'AX'), -1_000_000.0),
+        (dim_ref('marker', 'SP'), -1_000_000.0),
+        (dim_ref('marker', 'BP'), -1_000_000.0),
+        (dim_ref('marker', 'STACK0'), -1_000_000.0),
     )
     psh_mem_addr0_restore = 10_000_000.0 / S
     # Stack slots are 8-byte aligned, so the only nonzero byte-0 low nibble
@@ -1405,11 +1432,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # full position lattice.
     rules.append(multi_way_and_rule(
         name="l16_psh_mem_addr0_restore_lo_8",
-        conditions=psh_mem_addr0_conditions + (("OUTPUT_LO+8", 1.0),),
+        conditions=psh_mem_addr0_conditions + ((dim_ref('output_lo', 'nibble', 8), 1.0),),
         threshold=5.9,
         writes=(
-            ("OUTPUT_LO+8", psh_mem_addr0_restore),
-            ("OUTPUT_LO+0", -psh_mem_addr0_restore),
+            (dim_ref('output_lo', 'nibble', 8), psh_mem_addr0_restore),
+            (dim_ref('output_lo', 'nibble', 0), -psh_mem_addr0_restore),
         ),
         scope="mark == MEM",
         dominates_at={"OUTPUT_LO": "mark == MEM"},
@@ -1430,12 +1457,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         name="l16_psh_mem_addr0_force_d8_from_l14_evidence",
         conditions=psh_mem_addr0_conditions + (
             ("H1+4", 1.0),
-            ("OUTPUT_LO+8", 1.0),
+            (dim_ref('output_lo', 'nibble', 8), 1.0),
             ("OUTPUT_HI_THIS_STEP+13", 1.0),
         ),
         threshold=8.0,
         writes=(
-            ("OUTPUT_LO+8", 1_000_000.0),
+            (dim_ref('output_lo', 'nibble', 8), 1_000_000.0),
             ("OUTPUT_HI_THIS_STEP+13", 1_000_000.0),
         ),
         scope="mark == MEM",
@@ -1448,8 +1475,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         name="l16_psh_mem_addr0_e0_from_addr_b0",
         conditions=psh_mem_addr0_conditions + (
             ("MEM_ADDR_SRC", 1.0),
-            ("ADDR_B0_LO+0", 1.0),
-            ("ADDR_B0_HI+14", 1.0),
+            (dim_ref('memory_lo', 'addr_b0', 0), 1.0),
+            (dim_ref('memory_hi', 'addr_b0', 14), 1.0),
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=20.0),
@@ -1460,11 +1487,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             ("MEM_ADDR_SRC", -1000.0),
             ("H1+4", 1.0),
             ("H1+11", 1.0),
-            ("CMP+0", 1.0),
-            ("ALU_LO+8", 2.0),
-            ("ALU_LO+7", -10.0),
-            ("ALU_LO+10", -10.0),
-            ("ALU_LO+14", -10.0),
+            (dim_ref('cmp_flag', 'cascade', 0), 1.0),
+            (dim_ref('alu_lo', 'result', 8), 2.0),
+            (dim_ref('alu_lo', 'result', 7), -10.0),
+            (dim_ref('alu_lo', 'result', 10), -10.0),
+            (dim_ref('alu_lo', 'result', 14), -10.0),
             # Shared psh_mem_addr0_conditions only blocks OP_ENT at -1000;
             # ENT-main relays OP_ENT to the MEM marker position with
             # attenuated activation (~1e-3) via L7/L14 broadcast, so the
@@ -1474,13 +1501,13 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # which has OP_ENT:-1e6 to discriminate ENT-main 0xF0 push from
             # PSH 0xE0 push. Targets +97 rows of func_*/nested_*/expr_mod_*
             # neural=None failures from wide-ALU triage 2026-06-01.
-            ("OP_ENT", -1_000_000.0),
-            ("OP_LEV", -1_000_000.0),
+            (dim_ref('opcode_flag', 'ENT'), -1_000_000.0),
+            (dim_ref('opcode_flag', 'LEV'), -1_000_000.0),
             # Strengthened from -1M to -1e9 because IMM at MARK_AX attenuates
             # to ~1e-3 via upstream broadcast, so -1M × 1e-3 = -1000 was
             # insufficient to block. -1e9 × 1e-3 = -1e6 dominates the +5
             # positive signal sum. See EDGE_POW2_OP_IMM_LEAK.md.
-            ("OP_IMM", -1e9),
+            (dim_ref('opcode_flag', 'IMM'), -1e9),
         ),
         threshold=8.5,
         writes=Primitives.byte_value_writes(0xE0, strength=200_000.0),
@@ -1497,27 +1524,27 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # declarative route materializes that carried value into OUTPUT so the
     # following EXIT observes the neural return value instead of a zero token.
     stale_imm_ax_conditions = (
-        ("OP_IMM", 1.0),
-        ("MARK_AX", 1.0),
-        ("MARK_PC", -8.0),
+        (dim_ref('opcode_flag', 'IMM'), 1.0),
+        (dim_ref('marker', 'AX'), 1.0),
+        (dim_ref('marker', 'PC'), -8.0),
         ("IS_BYTE", -10.0),
-        ("OP_EXIT", -20.0),
-        ("OP_JMP", -20.0),
+        (dim_ref('opcode_flag', 'EXIT'), -20.0),
+        (dim_ref('opcode_flag', 'JMP'), -20.0),
     )
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stale_imm_ax_carry_lo_{k}",
             conditions=stale_imm_ax_conditions,
             threshold=1.5,
-            gate=f"AX_CARRY_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 2.0 / S),),
+            gate=dim_ref('ax_carry_lo', 'AX', k),
+            writes=((dim_ref('output_lo', 'nibble', k), 2.0 / S),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stale_imm_ax_carry_hi_{k}",
             conditions=stale_imm_ax_conditions,
             threshold=1.5,
-            gate=f"AX_CARRY_HI+{k}",
+            gate=dim_ref('ax_carry_hi', 'AX', k),
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
@@ -1526,13 +1553,13 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # current AX bytes, so the neural path must materialize AX_CARRY back into
     # OUTPUT at the AX marker before those bytes are generated.
     store_ax_conditions = (
-        ("OP_SI", 1.0),
-        ("OP_SC", 1.0),
-        ("MARK_AX", 1.0),
-        ("MARK_PC", -8.0),
+        (dim_ref('opcode_flag', 'SI'), 1.0),
+        (dim_ref('opcode_flag', 'SC'), 1.0),
+        (dim_ref('marker', 'AX'), 1.0),
+        (dim_ref('marker', 'PC'), -8.0),
         ("IS_BYTE", -10.0),
-        ("OP_EXIT", -20.0),
-        ("OP_JMP", -20.0),
+        (dim_ref('opcode_flag', 'EXIT'), -20.0),
+        (dim_ref('opcode_flag', 'JMP'), -20.0),
     )
     # var_mul step-9 fix (campaign-ON, opt out C4_STORE_AX_B0_OVERRIDE=0): the
     # SI/SC store-AX marker carries a STRONG OUTPUT byte-0 zero-default (the
@@ -1547,14 +1574,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _store_ax_override = store_ax_b0_override_enabled()
     _store_ax_lo_w = (30.0 / S) if _store_ax_override else (2.0 / S)
     for k in range(16):
-        lo_writes = ((f"OUTPUT_LO+{k}", _store_ax_lo_w),)
+        lo_writes = ((dim_ref('output_lo', 'nibble', k), _store_ax_lo_w),)
         if _store_ax_override and k != 0:
-            lo_writes = lo_writes + (("OUTPUT_LO+0", -_store_ax_lo_w),)
+            lo_writes = lo_writes + ((dim_ref('output_lo', 'nibble', 0), -_store_ax_lo_w),)
         rules.append(multi_way_and_rule(
             name=f"l16_store_ax_carry_lo_{k}",
             conditions=store_ax_conditions,
             threshold=4.0,
-            gate=f"AX_CARRY_LO+{k}",
+            gate=dim_ref('ax_carry_lo', 'AX', k),
             writes=lo_writes,
         ))
     for k in range(16):
@@ -1562,7 +1589,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_store_ax_carry_hi_{k}",
             conditions=store_ax_conditions,
             threshold=4.0,
-            gate=f"AX_CARRY_HI+{k}",
+            gate=dim_ref('ax_carry_hi', 'AX', k),
             writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
         ))
 
@@ -1596,12 +1623,12 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # so the 35-token golden stays byte-identical.
     if no_stack0_emit_enabled():
         psh_ax_conditions = (
-            ("OP_PSH", 1.0),
-            ("MARK_AX", 1.0),
-            ("MARK_PC", -8.0),
+            (dim_ref('opcode_flag', 'PSH'), 1.0),
+            (dim_ref('marker', 'AX'), 1.0),
+            (dim_ref('marker', 'PC'), -8.0),
             ("IS_BYTE", -10.0),
-            ("OP_EXIT", -20.0),
-            ("OP_JMP", -20.0),
+            (dim_ref('opcode_flag', 'EXIT'), -20.0),
+            (dim_ref('opcode_flag', 'JMP'), -20.0),
         )
         # The PSH AX marker carries a STRONG zero-byte default at the LO band
         # (probe: OUTPUT_LO+0 ~= +8.6 vs the carried nibble ~= +0.4 baseline) —
@@ -1614,14 +1641,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # common small-arg case), so the HI band keeps the plain additive form.
         psh_ax_restore = 30.0 / S
         for k in range(16):
-            lo_writes = ((f"OUTPUT_LO+{k}", psh_ax_restore),)
+            lo_writes = ((dim_ref('output_lo', 'nibble', k), psh_ax_restore),)
             if k != 0:
-                lo_writes = lo_writes + (("OUTPUT_LO+0", -psh_ax_restore),)
+                lo_writes = lo_writes + ((dim_ref('output_lo', 'nibble', 0), -psh_ax_restore),)
             rules.append(multi_way_and_rule(
                 name=f"l16_psh_ax_carry_lo_{k}",
                 conditions=psh_ax_conditions,
                 threshold=1.5,
-                gate=f"AX_CARRY_LO+{k}",
+                gate=dim_ref('ax_carry_lo', 'AX', k),
                 writes=lo_writes,
             ))
         for k in range(16):
@@ -1629,7 +1656,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 name=f"l16_psh_ax_carry_hi_{k}",
                 conditions=psh_ax_conditions,
                 threshold=1.5,
-                gate=f"AX_CARRY_HI+{k}",
+                gate=dim_ref('ax_carry_hi', 'AX', k),
                 writes=((f"OUTPUT_HI_THIS_STEP+{k}", 2.0 / S),),
             ))
 
@@ -1640,13 +1667,13 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("OP_LC_RELAY", 1.0),
         ("IS_BYTE", 1.0),
         ("H1+1", 1.0),
-        ("BYTE_INDEX_3", -4.0),
+        (dim_ref('byte_index', '3'), -4.0),
     )
     rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_clear_lo",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
-        writes=tuple((f"OUTPUT_LO+{k}", -300.0 / S) for k in range(16)),
+        writes=tuple((dim_ref('output_lo', 'nibble', k), -300.0 / S) for k in range(16)),
     ))
     rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_clear_hi",
@@ -1658,7 +1685,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         name="l16_lc_ax_bytes_1_3_zero_lo",
         conditions=lc_ax_byte_conditions,
         threshold=2.5,
-        writes=(("OUTPUT_LO+0", 500.0 / S),),
+        writes=((dim_ref('output_lo', 'nibble', 0), 500.0 / S),),
     ))
     rules.append(multi_way_and_rule(
         name="l16_lc_ax_bytes_1_3_zero_hi",
@@ -1674,17 +1701,17 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # store residue, make the already-staged non-zero nibble authoritative
     # again and cancel the stale zero lane that L15 most commonly contributes.
     top_store_stack0_conditions = (
-        ("MARK_STACK0", 1.0),
+        (dim_ref('marker', 'STACK0'), 1.0),
         ("HAS_SE", 1.0),
-        ("CMP+3", 1.0),
+        (dim_ref('cmp_flag', 'cascade', 3), 1.0),
         ("MEM_STORE", 1.0),
         ("EMBED_LO+0", 1.0),
         ("IS_BYTE", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_MEM", -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'MEM'), -10.0),
     )
     top_store_restore = 50.0 / S
     for k in range(1, 16):
@@ -1692,10 +1719,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_top_store_stack0_restore_lo_{k}",
             conditions=top_store_stack0_conditions,
             threshold=7.0,
-            gate=f"OUTPUT_LO+{k}",
+            gate=dim_ref('output_lo', 'nibble', k),
             writes=(
-                (f"OUTPUT_LO+{k}", top_store_restore),
-                ("OUTPUT_LO+0", -top_store_restore),
+                (dim_ref('output_lo', 'nibble', k), top_store_restore),
+                (dim_ref('output_lo', 'nibble', 0), -top_store_restore),
             ),
         ))
 
@@ -1707,20 +1734,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", 1.0),
         ("STACK0_BYTE0", 1.0),
         ("HAS_SE", 1.0),
-        ("CMP+3", 1.0),
-        ("ADDR_B0_LO+0", 1.0),
-        ("ADDR_B0_HI+14", 1.0),
+        (dim_ref('cmp_flag', 'cascade', 3), 1.0),
+        (dim_ref('memory_lo', 'addr_b0', 0), 1.0),
+        (dim_ref('memory_hi', 'addr_b0', 14), 1.0),
         ("CLEAN_EMBED_LO+1", 1.0),
         ("CLEAN_EMBED_HI+0", 1.0),
         ("MEM_STORE", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -10.0),
         # MARK_MEM bumped to HARD_BLOCKER_THRESHOLD (-1e6) so the
         # dim_alias_verifier treats it as a hard NOT-blocker.
-        ("MARK_MEM", -1e6),
+        (dim_ref('marker', 'MEM'), -1e6),
     )
     stack0_byte1_zero = 1000.0 / S
     rules.append(multi_way_and_rule(
@@ -1744,9 +1771,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # `is_byte AND NOT (is_byte AND byte_index == 0)`, disjoint from
         # OPCODE_BYTE_LO's `is_byte AND byte_index == 0` disjunct.
         # Byte-identical at intended firing positions.
-        gate_terms=(("BYTE_INDEX_0", -1e6),),
+        gate_terms=((dim_ref('byte_index', '0'), -1e6),),
         writes=tuple(
-            (f"OUTPUT_LO+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
+            (dim_ref('output_lo', 'nibble', k), stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
             for k in range(16)
         ) + tuple(
             (f"OUTPUT_HI_THIS_STEP+{k}", stack0_byte1_zero if k == 0 else -stack0_byte1_zero)
@@ -1764,21 +1791,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     jsr_return_addr_byte1_conditions = (
         ("IS_BYTE", 1.0),
         ("HAS_SE", 1.0),
-        ("OP_JSR", 0.2),
-        ("CMP+4", 0.2),
+        (dim_ref('opcode_flag', 'JSR'), 0.2),
+        (dim_ref('cmp_flag', 'cascade', 4), 0.2),
         ("STACK0_BYTE0", 1.0),
-        ("BYTE_INDEX_0", 1.0),
+        (dim_ref('byte_index', '0'), 1.0),
         ("CLEAN_EMBED_LO+2", 1.0),
         ("CLEAN_EMBED_HI+2", 2.0),
-        ("OP_ENT", -2.0),
-        ("OP_LEV", -2.0),
-        ("OP_PSH", -2.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
+        (dim_ref('opcode_flag', 'ENT'), -2.0),
+        (dim_ref('opcode_flag', 'LEV'), -2.0),
+        (dim_ref('opcode_flag', 'PSH'), -2.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -10.0),
+        (dim_ref('marker', 'MEM'), -10.0),
     )
     jsr_return_addr_byte1_strength = 500.0 / S
     rules.append(multi_way_and_rule(
@@ -1786,8 +1813,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         conditions=jsr_return_addr_byte1_conditions,
         threshold=9.0,
         writes=(
-            ("OUTPUT_LO+1", jsr_return_addr_byte1_strength),
-            ("OUTPUT_LO+0", -jsr_return_addr_byte1_strength),
+            (dim_ref('output_lo', 'nibble', 1), jsr_return_addr_byte1_strength),
+            (dim_ref('output_lo', 'nibble', 0), -jsr_return_addr_byte1_strength),
         ),
     ))
 
@@ -1796,14 +1823,14 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # nibble is still present at low strength; when it is different from the
     # fetched nibble, boost that staged value and cancel the fetched lanes.
     jmp_ax_preserve_conditions = (
-        ("OP_JMP", 0.2),
-        ("MARK_AX", 1.0),
+        (dim_ref('opcode_flag', 'JMP'), 0.2),
+        (dim_ref('marker', 'AX'), 1.0),
         ("IS_BYTE", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -10.0),
+        (dim_ref('marker', 'MEM'), -10.0),
     )
     jmp_ax_preserve = 50.0 / S
     for k in range(16):
@@ -1812,21 +1839,21 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # The REG_AX marker row can carry a weak low-11 artifact through
             # TEMP[11]. Do not treat that marker residue as the preserved AX
             # value when JMP is merely preserving the prior AX byte.
-            extra_conditions.append(("TEMP+11", -2.0))
+            extra_conditions.append((dim_ref('temp_scratch', 'general', 11), -2.0))
         rules.append(multi_way_and_rule(
             name=f"l16_jmp_ax_preserve_lo_{k}",
             conditions=jmp_ax_preserve_conditions + tuple(extra_conditions),
             threshold=1.5,
-            gate=f"OUTPUT_LO+{k}",
+            gate=dim_ref('output_lo', 'nibble', k),
             writes=tuple(
                 (
-                    f"OUTPUT_LO+{j}",
+                    dim_ref('output_lo', 'nibble', j),
                     jmp_ax_preserve if j == k else -jmp_ax_preserve,
                 )
                 for j in range(16)
             ) + tuple(
                 (
-                    f"AX_CARRY_LO+{j}",
+                    dim_ref('ax_carry_lo', 'AX', j),
                     jmp_ax_preserve if j == k else -jmp_ax_preserve,
                 )
                 for j in range(16)
@@ -1838,11 +1865,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # residual scale after JSR/ENT. Re-materialize BP marker byte 0 from EMBED
     # during ordinary post-prologue steps so LEA/LOAD/STORE preserve BP.
     bp_marker_passthrough_conditions = (
-        ("MARK_BP", 1.0),
+        (dim_ref('marker', 'BP'), 1.0),
         ("HAS_SE", 1.0),
         ("IS_BYTE", -10.0),
-        ("OP_ENT", -2.0),
-        ("OP_LEV", -2.0),
+        (dim_ref('opcode_flag', 'ENT'), -2.0),
+        (dim_ref('opcode_flag', 'LEV'), -2.0),
     )
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -1850,7 +1877,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             conditions=bp_marker_passthrough_conditions,
             threshold=1.5,
             gate=f"EMBED_LO+{k}",
-            writes=((f"OUTPUT_LO+{k}", 10.0 / S),),
+            writes=((dim_ref('output_lo', 'nibble', k), 10.0 / S),),
         ))
     for k in range(16):
         rules.append(multi_way_and_rule(
@@ -1893,15 +1920,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", 1.0),
         ("HAS_SE", 1.0),
         ("H1+3", 1.0),
-        ("BYTE_INDEX_0", 1.0),
+        (dim_ref('byte_index', '0'), 1.0),
         ("CLEAN_EMBED_LO+0", 1.0),
         ("CLEAN_EMBED_HI+15", 1.0),
-        ("MARK_AX", -1.0),
-        ("MARK_PC", -1.0),
-        ("MARK_SP", -1.0),
-        ("MARK_BP", -1.0),
-        ("MARK_STACK0", -1.0),
-        ("MARK_MEM", -1.0),
+        (dim_ref('marker', 'AX'), -1.0),
+        (dim_ref('marker', 'PC'), -1.0),
+        (dim_ref('marker', 'SP'), -1.0),
+        (dim_ref('marker', 'BP'), -1.0),
+        (dim_ref('marker', 'STACK0'), -1.0),
+        (dim_ref('marker', 'MEM'), -1.0),
     )
     # NOTE(L16-bp-frame-byte1-ff-scope-honest): the rule's INTENDED firing
     # set is BP byte-1 lanes in established local-frame programs
@@ -1923,9 +1950,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         conditions=bp_frame_byte1_ff_conditions,
         threshold=5.0,
         writes=(
-            ("OUTPUT_LO+15", 50.0 / S),
+            (dim_ref('output_lo', 'nibble', 15), 50.0 / S),
             ("OUTPUT_HI_THIS_STEP+15", 50.0 / S),
-            ("OUTPUT_LO+0", -50.0 / S),
+            (dim_ref('output_lo', 'nibble', 0), -50.0 / S),
             ("OUTPUT_HI_THIS_STEP+0", -50.0 / S),
         ),
     ))
@@ -1940,22 +1967,22 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("H1+1", -100.0),
         ("H1+2", -100.0),
         ("H3+4", -100.0),
-        ("BYTE_INDEX_1", 1.0),
+        (dim_ref('byte_index', '1'), 1.0),
         ("CLEAN_EMBED_LO+15", 1.0),
         ("CLEAN_EMBED_HI+15", 1.0),
-        ("MARK_AX", -100.0),
-        ("MARK_PC", -100.0),
-        ("MARK_SP", -100.0),
-        ("MARK_BP", -100.0),
-        ("MARK_STACK0", -100.0),
-        ("MARK_MEM", -100.0),
+        (dim_ref('marker', 'AX'), -100.0),
+        (dim_ref('marker', 'PC'), -100.0),
+        (dim_ref('marker', 'SP'), -100.0),
+        (dim_ref('marker', 'BP'), -100.0),
+        (dim_ref('marker', 'STACK0'), -100.0),
+        (dim_ref('marker', 'MEM'), -100.0),
     )
     rules.append(multi_way_and_rule(
         name="l16_bp_after_ent_byte2_zero",
         conditions=bp_after_ent_byte2_zero_conditions,
         threshold=14.5,
         writes=tuple(
-            (f"OUTPUT_LO+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            (dim_ref('output_lo', 'nibble', k), (10000.0 / S) if k == 0 else (-10000.0 / S))
             for k in range(16)
         ) + tuple(
             (f"OUTPUT_HI_THIS_STEP+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
@@ -1978,20 +2005,20 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # Use a heavy weight so it dominates the score and excludes nearby
         # SP/BP/STACK0_byte0 positions whose OP_ENT relay is also large.
         ("STACK0_BYTE1", 30.0),
-        ("OP_ENT", 2.0),
+        (dim_ref('opcode_flag', 'ENT'), 2.0),
         ("CLEAN_EMBED_LO+0", 8.0),
         ("CLEAN_EMBED_HI+0", 8.0),
         # If ENT allocated a local frame, the new stack top is below the saved
         # BP slot (for example 0xffe8) and STACK0 is zero-filled, not the
         # saved initial BP value.
-        ("ADDR_B0_HI+14", -10.0),
+        (dim_ref('memory_hi', 'addr_b0', 14), -10.0),
         ("MEM_STORE", -2.0),
-        ("MARK_AX", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -10.0),
+        (dim_ref('marker', 'MEM'), -10.0),
     )
     # OUTPUT_HI at this row is already +1 from the L3 STACK0 byte default
     # (saved BP byte 2 high nibble is 0x0). Only redirect OUTPUT_LO from
@@ -2003,8 +2030,8 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         conditions=ent_initial_stack0_byte2_conditions,
         threshold=49.5,
         writes=(
-            ("OUTPUT_LO+1", ent_initial_stack0_byte2_strength),
-            ("OUTPUT_LO+0", -ent_initial_stack0_byte2_strength),
+            (dim_ref('output_lo', 'nibble', 1), ent_initial_stack0_byte2_strength),
+            (dim_ref('output_lo', 'nibble', 0), -ent_initial_stack0_byte2_strength),
         ),
     ))
 
@@ -2016,24 +2043,24 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("IS_BYTE", 0.1),
         ("HAS_SE", 0.1),
         ("STACK0_BYTE1", 0.1),
-        ("BYTE_INDEX_1", 0.1),
+        (dim_ref('byte_index', '1'), 0.1),
         ("CLEAN_EMBED_LO+0", 0.1),
         ("CLEAN_EMBED_HI+0", 0.1),
-        ("ADDR_B0_LO+0", 0.1),
-        ("ADDR_B0_HI+15", 0.1),
+        (dim_ref('memory_lo', 'addr_b0', 0), 0.1),
+        (dim_ref('memory_hi', 'addr_b0', 15), 0.1),
         ("MEM_STORE", -1.0),
-        ("OP_ENT", -1.0),
-        ("OP_LEV", -1.0),
-        ("MARK_AX", -1.0),
-        ("MARK_PC", -1.0),
-        ("MARK_SP", -1.0),
-        ("MARK_BP", -1.0),
-        ("MARK_STACK0", -1.0),
-        ("MARK_MEM", -1.0),
+        (dim_ref('opcode_flag', 'ENT'), -1.0),
+        (dim_ref('opcode_flag', 'LEV'), -1.0),
+        (dim_ref('marker', 'AX'), -1.0),
+        (dim_ref('marker', 'PC'), -1.0),
+        (dim_ref('marker', 'SP'), -1.0),
+        (dim_ref('marker', 'BP'), -1.0),
+        (dim_ref('marker', 'STACK0'), -1.0),
+        (dim_ref('marker', 'MEM'), -1.0),
     )
     for value_dim, expected_value in (
-        ("OUTPUT_LO+0", 0.0),
-        ("OUTPUT_LO+1", 1.0),
+        (dim_ref('output_lo', 'nibble', 0), 0.0),
+        (dim_ref('output_lo', 'nibble', 1), 1.0),
     ):
         rules.extend(scalar_value_guarantee_rules(
             value_dim=value_dim,
@@ -2050,15 +2077,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # rules make that dynamic frame size authoritative for byte 0. C4 stack
     # frames are 8-byte aligned, so the low nibble is either 0 or 8.
     ent_sp_frame_conditions = (
-        ("MARK_SP", 10.0),
+        (dim_ref('marker', 'SP'), 10.0),
         ("HAS_SE", 1.0),
-        ("OP_ENT", 0.2),
+        (dim_ref('opcode_flag', 'ENT'), 0.2),
         ("IS_BYTE", -1000.0),
-        ("MARK_AX", -1_000_000.0),
-        ("MARK_PC", -1_000_000.0),
-        ("MARK_BP", -1_000_000.0),
-        ("MARK_STACK0", -1_000_000.0),
-        ("MARK_MEM", -1_000_000.0),
+        (dim_ref('marker', 'AX'), -1_000_000.0),
+        (dim_ref('marker', 'PC'), -1_000_000.0),
+        (dim_ref('marker', 'BP'), -1_000_000.0),
+        (dim_ref('marker', 'STACK0'), -1_000_000.0),
+        (dim_ref('marker', 'MEM'), -1_000_000.0),
     ) + (
         # PSH/JSR-step misfire blockers (default ON; see
         # ``_ent_frame_sp_byte0_psh_blocker_enabled``). On a PSH-at-SP step OR a
@@ -2074,7 +2101,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # misfire score below the 20 threshold while leaving the genuine ENT SP
         # marker firing byte-identical (both dims are 0 there). Flag-off restores
         # the legacy tuple.
-        ((("PSH_AT_SP", -100.0), ("CMP+4", -100.0)))
+        ((("PSH_AT_SP", -100.0), (dim_ref('cmp_flag', 'cascade', 4), -100.0)))
         if _ent_frame_sp_byte0_psh_blocker_enabled() else ()
     )
     ent_frame_strength = 5000.0 / S
@@ -2088,7 +2115,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             gate=f"FETCH_LO+{imm_lo}",
             writes=tuple(
                 (
-                    f"OUTPUT_LO+{k}",
+                    dim_ref('output_lo', 'nibble', k),
                     ent_frame_strength if k == result_lo else -ent_frame_strength,
                 )
                 for k in range(16)
@@ -2181,15 +2208,15 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_sp_byte0_d8",
         conditions=ent_sp_frame_conditions + (
-            ("OP_ENT", 9.8),
+            (dim_ref('opcode_flag', 'ENT'), 9.8),
             ("FETCH_LO+0", 1.0),
             ("FETCH_HI+0", 1.0),
             ("OUTPUT_HI_THIS_STEP+15", 5.0),
         ),
         threshold=70.0,
         writes=(
-            ("OUTPUT_LO+8", 10.0),
-            ("OUTPUT_LO+0", -10.0),
+            (dim_ref('output_lo', 'nibble', 8), 10.0),
+            (dim_ref('output_lo', 'nibble', 0), -10.0),
             ("OUTPUT_HI_THIS_STEP+13", 10.0),
             ("OUTPUT_HI_THIS_STEP+15", -10.0),
         ),
@@ -2258,25 +2285,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_bp_byte0_d8",
         conditions=(
-            ("OP_ENT", 100.0),
-            ("MARK_BP", 1.0),
+            (dim_ref('opcode_flag', 'ENT'), 100.0),
+            (dim_ref('marker', 'BP'), 1.0),
             ("HAS_SE", 1.0),
             ("OUTPUT_HI_THIS_STEP+0", 100.0),
             # L6 0xf0-frame-signature veto: only present on the initial/main
             # ENT (saved BP = 0xfff0), absent on a genuine nested ENT (0xffd8).
-            ("OUTPUT_LO+0", -5.0),
+            (dim_ref('output_lo', 'nibble', 0), -5.0),
             ("OUTPUT_HI_THIS_STEP+15", -5.0),
             ("IS_BYTE", -1_000_000_000.0),
-            ("MARK_PC", -1e11),
-            ("MARK_AX", -1e11),
-            ("MARK_SP", -1e11),
-            ("MARK_STACK0", -1e11),
-            ("MARK_MEM", -1e11),
+            (dim_ref('marker', 'PC'), -1e11),
+            (dim_ref('marker', 'AX'), -1e11),
+            (dim_ref('marker', 'SP'), -1e11),
+            (dim_ref('marker', 'STACK0'), -1e11),
+            (dim_ref('marker', 'MEM'), -1e11),
         ),
         threshold=2000.0,
         writes=(
-            ("OUTPUT_LO+8", 1.0),
-            ("OUTPUT_LO+0", -1.0),
+            (dim_ref('output_lo', 'nibble', 8), 1.0),
+            (dim_ref('output_lo', 'nibble', 0), -1.0),
             ("OUTPUT_HI_THIS_STEP+13", 1.0),
             ("OUTPUT_HI_THIS_STEP+15", -1.0),
         ),
@@ -2334,26 +2361,26 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # legacy tuple (H1+2 weight 1.0, no CONST term) => byte-identical build.
     _h1_harden_w = 20.0 if _ent_sp_byte1_ff_h1_hardening_enabled() else 0.0
     sp_frame_byte1_ff_conditions = (
-        ("OP_ENT", 1.0),
+        (dim_ref('opcode_flag', 'ENT'), 1.0),
         ("IS_BYTE", 1.0),
         ("HAS_SE", 1.0),
         ("H1+2", 1.0 + _h1_harden_w),
-        ("BYTE_INDEX_0", 1.0),
-        ("BYTE_INDEX_1", -10.0),
-        ("BYTE_INDEX_2", -10.0),
-        ("BYTE_INDEX_3", -10.0),
+        (dim_ref('byte_index', '0'), 1.0),
+        (dim_ref('byte_index', '1'), -10.0),
+        (dim_ref('byte_index', '2'), -10.0),
+        (dim_ref('byte_index', '3'), -10.0),
         # H1+2 already selects the SP byte rows, but assert the other register
         # marker-distance hints are off so the +0xff override cannot leak onto
         # PC/AX/BP byte rows under the OP_ENT broadcast.
         ("H1+0", -10.0),
         ("H1+1", -10.0),
         ("H1+3", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_PC", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -100.0),
-        ("MARK_MEM", -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -100.0),
+        (dim_ref('marker', 'MEM'), -10.0),
         ("STACK0_BYTE0", -100.0),
         ("STACK0_BYTE1", -100.0),
         ("STACK0_BYTE2", -100.0),
@@ -2382,9 +2409,9 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         # large write destabilises the downstream byte2/byte3 framing). 800/S =
         # 8 per nibble flips OUTPUT_{LO,HI}+15 just above the +0 default.
         writes=(
-            ("OUTPUT_LO+15", 800.0 / S),
+            (dim_ref('output_lo', 'nibble', 15), 800.0 / S),
             ("OUTPUT_HI_THIS_STEP+15", 800.0 / S),
-            ("OUTPUT_LO+0", -800.0 / S),
+            (dim_ref('output_lo', 'nibble', 0), -800.0 / S),
             ("OUTPUT_HI_THIS_STEP+0", -800.0 / S),
         ),
     ))
@@ -2398,29 +2425,29 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_ent_frame_sp_byte2_zero",
         conditions=(
-            ("OP_ENT", 1.0),
+            (dim_ref('opcode_flag', 'ENT'), 1.0),
             ("IS_BYTE", 1.0),
             ("HAS_SE", 1.0),
             ("H1+2", 10.0),
             ("H1+0", -100.0),
             ("H1+1", -100.0),
             ("H1+3", -100.0),
-            ("BYTE_INDEX_1", 1.0),
-            ("BYTE_INDEX_0", -100.0),
-            ("BYTE_INDEX_2", -100.0),
-            ("BYTE_INDEX_3", -100.0),
+            (dim_ref('byte_index', '1'), 1.0),
+            (dim_ref('byte_index', '0'), -100.0),
+            (dim_ref('byte_index', '2'), -100.0),
+            (dim_ref('byte_index', '3'), -100.0),
             ("CLEAN_EMBED_LO+15", 1.0),
             ("CLEAN_EMBED_HI+15", 1.0),
-            ("MARK_AX", -100.0),
-            ("MARK_PC", -100.0),
-            ("MARK_SP", -100.0),
-            ("MARK_BP", -100.0),
-            ("MARK_STACK0", -100.0),
-            ("MARK_MEM", -100.0),
+            (dim_ref('marker', 'AX'), -100.0),
+            (dim_ref('marker', 'PC'), -100.0),
+            (dim_ref('marker', 'SP'), -100.0),
+            (dim_ref('marker', 'BP'), -100.0),
+            (dim_ref('marker', 'STACK0'), -100.0),
+            (dim_ref('marker', 'MEM'), -100.0),
         ),
         threshold=14.5,
         writes=tuple(
-            (f"OUTPUT_LO+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            (dim_ref('output_lo', 'nibble', k), (10000.0 / S) if k == 0 else (-10000.0 / S))
             for k in range(16)
         ) + tuple(
             (f"OUTPUT_HI_THIS_STEP+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
@@ -2430,29 +2457,29 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_ent_frame_sp_byte3_zero",
         conditions=(
-            ("OP_ENT", 1.0),
+            (dim_ref('opcode_flag', 'ENT'), 1.0),
             ("IS_BYTE", 1.0),
             ("HAS_SE", 1.0),
             ("H1+2", 10.0),
             ("H1+0", -100.0),
             ("H1+1", -100.0),
             ("H1+3", -100.0),
-            ("BYTE_INDEX_2", 1.0),
-            ("BYTE_INDEX_0", -100.0),
-            ("BYTE_INDEX_1", -100.0),
-            ("BYTE_INDEX_3", -100.0),
+            (dim_ref('byte_index', '2'), 1.0),
+            (dim_ref('byte_index', '0'), -100.0),
+            (dim_ref('byte_index', '1'), -100.0),
+            (dim_ref('byte_index', '3'), -100.0),
             ("CLEAN_EMBED_LO+0", 1.0),
             ("CLEAN_EMBED_HI+0", 1.0),
-            ("MARK_AX", -100.0),
-            ("MARK_PC", -100.0),
-            ("MARK_SP", -100.0),
-            ("MARK_BP", -100.0),
-            ("MARK_STACK0", -100.0),
-            ("MARK_MEM", -100.0),
+            (dim_ref('marker', 'AX'), -100.0),
+            (dim_ref('marker', 'PC'), -100.0),
+            (dim_ref('marker', 'SP'), -100.0),
+            (dim_ref('marker', 'BP'), -100.0),
+            (dim_ref('marker', 'STACK0'), -100.0),
+            (dim_ref('marker', 'MEM'), -100.0),
         ),
         threshold=14.5,
         writes=tuple(
-            (f"OUTPUT_LO+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
+            (dim_ref('output_lo', 'nibble', k), (10000.0 / S) if k == 0 else (-10000.0 / S))
             for k in range(16)
         ) + tuple(
             (f"OUTPUT_HI_THIS_STEP+{k}", (10000.0 / S) if k == 0 else (-10000.0 / S))
@@ -2485,25 +2512,25 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_ent_nested_stack0_saved_bp_byte0_f0",
         conditions=(
-            ("OP_ENT", 10.0),
-            ("MARK_STACK0", 10.0),
+            (dim_ref('opcode_flag', 'ENT'), 10.0),
+            (dim_ref('marker', 'STACK0'), 10.0),
             ("HAS_SE", 1.0),
             ("MEM_STORE", 0.2),
-            ("ADDR_B0_LO+8", -1.0),
-            ("ADDR_B0_HI+14", -1.0),
+            (dim_ref('memory_lo', 'addr_b0', 8), -1.0),
+            (dim_ref('memory_hi', 'addr_b0', 14), -1.0),
             ("IS_BYTE", -1000.0),
-            ("MARK_PC", -1000.0),
-            ("MARK_AX", -1000.0),
-            ("MARK_SP", -1000.0),
-            ("MARK_BP", -1000.0),
-            ("MARK_MEM", -1000.0),
+            (dim_ref('marker', 'PC'), -1000.0),
+            (dim_ref('marker', 'AX'), -1000.0),
+            (dim_ref('marker', 'SP'), -1000.0),
+            (dim_ref('marker', 'BP'), -1000.0),
+            (dim_ref('marker', 'MEM'), -1000.0),
         ),
         threshold=2000.0,
         writes=(
             ("OUTPUT_HI_THIS_STEP+15", 5.0),
             ("OUTPUT_HI_THIS_STEP+0", -5.0),
-            ("OUTPUT_LO+0", 1.0),
-            ("OUTPUT_LO+15", -1.0),
+            (dim_ref('output_lo', 'nibble', 0), 1.0),
+            (dim_ref('output_lo', 'nibble', 15), -1.0),
         ),
     ))
     rules.append(multi_way_and_rule(
@@ -2511,28 +2538,28 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         conditions=(
             ("IS_BYTE", 1.0),
             ("HAS_SE", 1.0),
-            ("OP_ENT", 1.0),
+            (dim_ref('opcode_flag', 'ENT'), 1.0),
             ("STACK0_BYTE0", 30.0),
-            ("BYTE_INDEX_0", 1.0),
-            ("BYTE_INDEX_1", -10.0),
-            ("BYTE_INDEX_2", -10.0),
-            ("BYTE_INDEX_3", -10.0),
+            (dim_ref('byte_index', '0'), 1.0),
+            (dim_ref('byte_index', '1'), -10.0),
+            (dim_ref('byte_index', '2'), -10.0),
+            (dim_ref('byte_index', '3'), -10.0),
             ("CLEAN_EMBED_LO+0", 1.0),
-            ("OP_LEV", -2.0),
-            ("OP_JSR", -2.0),
-            ("MARK_PC", -10.0),
-            ("MARK_AX", -10.0),
-            ("MARK_SP", -10.0),
-            ("MARK_BP", -10.0),
-            ("MARK_STACK0", -10.0),
-            ("MARK_MEM", -10.0),
+            (dim_ref('opcode_flag', 'LEV'), -2.0),
+            (dim_ref('opcode_flag', 'JSR'), -2.0),
+            (dim_ref('marker', 'PC'), -10.0),
+            (dim_ref('marker', 'AX'), -10.0),
+            (dim_ref('marker', 'SP'), -10.0),
+            (dim_ref('marker', 'BP'), -10.0),
+            (dim_ref('marker', 'STACK0'), -10.0),
+            (dim_ref('marker', 'MEM'), -10.0),
         ),
         threshold=35.0,
         gate="CLEAN_EMBED_HI+15",
         writes=(
-            ("OUTPUT_LO+15", 50.0 / S),
+            (dim_ref('output_lo', 'nibble', 15), 50.0 / S),
             ("OUTPUT_HI_THIS_STEP+15", 50.0 / S),
-            ("OUTPUT_LO+0", -50.0 / S),
+            (dim_ref('output_lo', 'nibble', 0), -50.0 / S),
             ("OUTPUT_HI_THIS_STEP+0", -50.0 / S),
         ),
     ))
@@ -2541,28 +2568,28 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         conditions=(
             ("IS_BYTE", 1.0),
             ("HAS_SE", 1.0),
-            ("OP_ENT", 1.0),
+            (dim_ref('opcode_flag', 'ENT'), 1.0),
             ("STACK0_BYTE0", 30.0),
-            ("BYTE_INDEX_0", 1.0),
-            ("BYTE_INDEX_1", -10.0),
-            ("BYTE_INDEX_2", -10.0),
-            ("BYTE_INDEX_3", -10.0),
+            (dim_ref('byte_index', '0'), 1.0),
+            (dim_ref('byte_index', '1'), -10.0),
+            (dim_ref('byte_index', '2'), -10.0),
+            (dim_ref('byte_index', '3'), -10.0),
             ("CLEAN_EMBED_LO+0", 1.0),
-            ("OP_LEV", -2.0),
-            ("OP_JSR", -2.0),
-            ("MARK_PC", -10.0),
-            ("MARK_AX", -10.0),
-            ("MARK_SP", -10.0),
-            ("MARK_BP", -10.0),
-            ("MARK_STACK0", -10.0),
-            ("MARK_MEM", -10.0),
+            (dim_ref('opcode_flag', 'LEV'), -2.0),
+            (dim_ref('opcode_flag', 'JSR'), -2.0),
+            (dim_ref('marker', 'PC'), -10.0),
+            (dim_ref('marker', 'AX'), -10.0),
+            (dim_ref('marker', 'SP'), -10.0),
+            (dim_ref('marker', 'BP'), -10.0),
+            (dim_ref('marker', 'STACK0'), -10.0),
+            (dim_ref('marker', 'MEM'), -10.0),
         ),
         threshold=35.0,
         gate="CLEAN_EMBED_HI+0",
         writes=(
-            ("OUTPUT_LO+0", 50.0 / S),
+            (dim_ref('output_lo', 'nibble', 0), 50.0 / S),
             ("OUTPUT_HI_THIS_STEP+0", 50.0 / S),
-            ("OUTPUT_LO+15", -50.0 / S),
+            (dim_ref('output_lo', 'nibble', 15), -50.0 / S),
             ("OUTPUT_HI_THIS_STEP+15", -50.0 / S),
         ),
     ))
@@ -2627,7 +2654,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 ("H3+4", 1.0),
                 (mem_val_dim, 1.0),
                 ("MEM_STORE", -100.0),
-                ("MARK_MEM", -100.0),
+                (dim_ref('marker', 'MEM'), -100.0),
                 # MARK_PC hard blocker: tightens the rule against the
                 # IMM_STAGING ↔ MEM_VAL_B* alias at the byte-0..3 rows of
                 # the FETCH-phase window. IS_BYTE already excludes the PC
@@ -2637,11 +2664,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 # owner set so the alias is provably not live here. Closes
                 # the last 3 IMM_STAGING ↔ MEM_VAL_B{0,1,2} dim-alias
                 # violations (DIM_ALIAS_RESIDUAL_2026_06_10.md).
-                ("MARK_PC", -1e6),
+                (dim_ref('marker', 'PC'), -1e6),
             ) + nonstore_mem_value_store_at_val_blocker,
             threshold=2.5,
             writes=tuple(
-                (f"OUTPUT_LO+{k}", (100.0 / S) if k == 0 else (-100.0 / S))
+                (dim_ref('output_lo', 'nibble', k), (100.0 / S) if k == 0 else (-100.0 / S))
                 for k in range(16)
             ) + tuple(
                 (f"OUTPUT_HI_THIS_STEP+{k}", (100.0 / S) if k == 0 else (-100.0 / S))
@@ -2663,7 +2690,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             name=f"l16_psh_sp_no_borrow_hi_{hi}",
             conditions=(
                 ("PSH_AT_SP", 1.0),
-                ("MARK_SP", 1.0),
+                (dim_ref('marker', 'SP'), 1.0),
                 ("HAS_SE", 1.0),
                 ("IS_BYTE", -10.0),
                 (f"EMBED_HI+{hi}", 1.0),
@@ -2685,17 +2712,17 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # declarative write to 0xff. Gate on HAS_SE so the existing first-step LEA
     # bootstrap remains the owner for the initial BP=0x10000 case.
     lea_ax_byte1_conditions = (
-        ("CMP+7", 1.0),
+        (dim_ref('cmp_flag', 'cascade', 7), 1.0),
         ("HAS_SE", 1.0),
         ("H1+1", 1.0),
         ("IS_BYTE", 1.0),
-        ("BYTE_INDEX_0", 1.0),
-        ("MARK_PC", -10.0),
-        ("MARK_AX", -10.0),
-        ("MARK_SP", -10.0),
-        ("MARK_BP", -10.0),
-        ("MARK_STACK0", -10.0),
-        ("MARK_MEM", -10.0),
+        (dim_ref('byte_index', '0'), 1.0),
+        (dim_ref('marker', 'PC'), -10.0),
+        (dim_ref('marker', 'AX'), -10.0),
+        (dim_ref('marker', 'SP'), -10.0),
+        (dim_ref('marker', 'BP'), -10.0),
+        (dim_ref('marker', 'STACK0'), -10.0),
+        (dim_ref('marker', 'MEM'), -10.0),
     )
     # WEAK-WRITER FIX (2026-06-11, var_simple_12 / id 262): the gate FIRES
     # correctly (score 4.96 >= 4.5) but the original 20/S = 0.2 per-nibble write
@@ -2715,7 +2742,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=4.5,
         writes=tuple(
             (
-                f"OUTPUT_LO+{k}",
+                dim_ref('output_lo', 'nibble', k),
                 lea_ax_byte1_ff_strength if k == 15 else -lea_ax_byte1_ff_strength,
             )
             for k in range(16)
@@ -2788,10 +2815,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 ("H1+2", -50.0),
                 ("H1+3", -50.0),
                 ("IS_BYTE", 5.0),
-                ("BYTE_INDEX_0", 5.0),
-                ("BYTE_INDEX_1", -50.0),
-                ("BYTE_INDEX_2", -50.0),
-                ("BYTE_INDEX_3", -50.0),
+                (dim_ref('byte_index', '0'), 5.0),
+                (dim_ref('byte_index', '1'), -50.0),
+                (dim_ref('byte_index', '2'), -50.0),
+                (dim_ref('byte_index', '3'), -50.0),
                 (f"CLEAN_EMBED_LO+{lo}", 30.0),
                 (f"CLEAN_EMBED_HI+{hi}", 30.0),
                 *(
@@ -2807,16 +2834,16 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 # MEM value-byte rows carry the same byte-0 shape on a store of a
                 # frame address; keep this AX-only (the genuine AX byte-1 row has
                 # MEM_VAL_B* == 0).
-                ("MEM_VAL_B0", -50.0),
-                ("MEM_VAL_B1", -50.0),
-                ("MEM_VAL_B2", -50.0),
-                ("MEM_VAL_B3", -50.0),
-                ("MARK_PC", -10000.0),
-                ("MARK_AX", -10000.0),
-                ("MARK_SP", -10000.0),
-                ("MARK_BP", -10000.0),
-                ("MARK_STACK0", -10000.0),
-                ("MARK_MEM", -10000.0),
+                (dim_ref('memory_lo', 'val_b0'), -50.0),
+                (dim_ref('memory_lo', 'val_b1'), -50.0),
+                (dim_ref('memory_lo', 'val_b2'), -50.0),
+                (dim_ref('memory_lo', 'val_b3'), -50.0),
+                (dim_ref('marker', 'PC'), -10000.0),
+                (dim_ref('marker', 'AX'), -10000.0),
+                (dim_ref('marker', 'SP'), -10000.0),
+                (dim_ref('marker', 'BP'), -10000.0),
+                (dim_ref('marker', 'STACK0'), -10000.0),
+                (dim_ref('marker', 'MEM'), -10000.0),
             )
             rules.append(multi_way_and_rule(
                 name=f"l16_memsp_lea_local_ax_byte1_ff_lo_after_{value:02x}",
@@ -2824,7 +2851,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 threshold=85.0,
                 writes=tuple(
                     (
-                        f"OUTPUT_LO+{k}",
+                        dim_ref('output_lo', 'nibble', k),
                         lea_ax_byte1_ff_strength if k == 15
                         else -lea_ax_byte1_ff_strength,
                     )
@@ -2867,19 +2894,19 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules.append(multi_way_and_rule(
         name="l16_lea_local_ax_byte0_hi_e",
         conditions=(
-            ("MARK_AX", 1.0),
+            (dim_ref('marker', 'AX'), 1.0),
             ("HAS_SE", 1.0),
-            ("OP_LEA", 1.0),
-            ("CMP+7", 1.0),
+            (dim_ref('opcode_flag', 'LEA'), 1.0),
+            (dim_ref('cmp_flag', 'cascade', 7), 1.0),
             ("FETCH_LO+8", 0.2),
             ("FETCH_HI+15", 0.2),
-            ("OP_IMM", -1_000_000.0),
+            (dim_ref('opcode_flag', 'IMM'), -1_000_000.0),
             ("IS_BYTE", -10.0),
-            ("MARK_PC", -10.0),
-            ("MARK_SP", -10.0),
-            ("MARK_BP", -10.0),
-            ("MARK_STACK0", -10.0),
-            ("MARK_MEM", -10.0),
+            (dim_ref('marker', 'PC'), -10.0),
+            (dim_ref('marker', 'SP'), -10.0),
+            (dim_ref('marker', 'BP'), -10.0),
+            (dim_ref('marker', 'STACK0'), -10.0),
+            (dim_ref('marker', 'MEM'), -10.0),
         ) + ((
             # ADD/SUB/absdiff result-row 0xE (0xE8) sentinel-slam guard (#309,
             # campaign config). The arith result AX-marker row carries
@@ -2926,9 +2953,13 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     lev_sp_stack0_cancel_conditions = tuple(
         condition
         for condition in sp_value_base_conditions
-        if condition[0] != "MARK_STACK0"
+        # Match on the BASE slot name: ``sp_value_base_conditions`` is now
+        # authored with ``dim_ref`` refs ("MARK_STACK0+0"), so compare against
+        # the base name to drop the inherited STACK0 blocker before re-adding
+        # the +50 STACK0 positive (Phase 7.E; byte-identical).
+        if condition[0].split("+", 1)[0] != "MARK_STACK0"
     ) + (
-        ("MARK_STACK0", 50.0),
+        (dim_ref('marker', 'STACK0'), 50.0),
     )
     lev_sp_stack0_cancel_threshold = 105.0
     # Gate-side MARK_MEM hard blocker — the gate dim ADDR_B0_LO/HI carries
@@ -2948,27 +2979,27 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # MARK_MEM == 0; the gate's positive contribution at those rows is
     # the same as before (gate_terms only attenuate via the W_gate matrix
     # at positions where MARK_MEM == 1, which the rule never fires at).
-    cancel_lev_sp_gate_terms = (("MARK_MEM", -1e6),)
+    cancel_lev_sp_gate_terms = ((dim_ref('marker', 'MEM'), -1e6),)
     for k in range(16):
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_cancel_lev_sp_lo_{k}",
             conditions=lev_sp_stack0_cancel_conditions + (
-                (f"ADDR_B0_LO+{k}", 1.0),
+                (dim_ref('memory_lo', 'addr_b0', k), 1.0),
             ),
             threshold=lev_sp_stack0_cancel_threshold,
-            gate=f"ADDR_B0_LO+{k}",
+            gate=dim_ref('memory_lo', 'addr_b0', k),
             gate_terms=cancel_lev_sp_gate_terms,
-            writes=((f"OUTPUT_LO+{k}", -write_scale),),
+            writes=((dim_ref('output_lo', 'nibble', k), -write_scale),),
         ))
     for k in range(16):
         result = (k + 1) % 16
         rules.append(multi_way_and_rule(
             name=f"l16_stack0_cancel_lev_sp_hi_{k}",
             conditions=lev_sp_stack0_cancel_conditions + (
-                (f"ADDR_B0_HI+{k}", 1.0),
+                (dim_ref('memory_hi', 'addr_b0', k), 1.0),
             ),
             threshold=lev_sp_stack0_cancel_threshold,
-            gate=f"ADDR_B0_HI+{k}",
+            gate=dim_ref('memory_hi', 'addr_b0', k),
             gate_terms=cancel_lev_sp_gate_terms,
             writes=((f"OUTPUT_HI_THIS_STEP+{result}", -write_scale),),
         ))
