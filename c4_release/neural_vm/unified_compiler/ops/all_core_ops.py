@@ -827,16 +827,6 @@ def all_core_ops(
         # Gated by C4_AX_BYTE23_DUMP (default ON). See
         # l11_ops.make_ax_byte23_dump_zero_op.
         make_ax_byte23_dump_zero_op(),
-        # AX byte-2/3 LI-LOAD zero cap (THE if_var/var LI-load high-byte blocker):
-        # on an ``LI x`` LOAD step the AX dump leaks 0x01 into byte 2 (id425 x=96
-        # -> ax=0x010060) because OUTPUT_LO+1 narrowly beats OUTPUT_LO+0 at the
-        # byte-2 dump row for x=0x60 (value-dependent ~+1.0 swap). Restores byte=0
-        # on the byte-2/3 dump rows gated on OP_LI (the clean, value/address-
-        # invariant load-step discriminator; MARK_AX blocks the byte-0 OP_LI
-        # spike). Standalone PureFFN post_op on the L25 tail block after the ENT
-        # cap. Gated by C4_AX_LI_BYTE23_ZERO (default ON). See
-        # l11_ops.make_ax_li_byte23_zero_op.
-        make_ax_li_byte23_zero_op(),
         # STRUCTURAL: all-step register byte-2/3 zero-default. Generalizes the two
         # caps above (which only fire on fresh-ENT / LI steps) to fire on EVERY
         # dump row, killing the loop/rec stale-high-byte leak (loop_mul 0xFFFF00,
