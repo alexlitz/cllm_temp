@@ -20,6 +20,14 @@ from .compiler import UnifiedVMCompiler
 from .verification import Verifier
 from .layer_compiler import LayerCompiler, Operation, ModelLayout, build_model_from_layout
 
+# Canonical dim-resolution helper — the ONE blessed way to turn a dim NAME
+# into its BUILT residual column (via ``layout.dim_positions``), instead of
+# the widen-repack-broken static registry. Tooling-only; never on a bake path.
+try:
+    from .dim_resolver import DimResolver, UnknownDimError  # noqa: F401
+except ImportError:
+    pass
+
 # B11: hybrid dynamic-layer compile path (byte-identical to the static
 # ``compile_full_vm_dynamic`` on today's op set). Lazy-imported guard keeps the
 # package importable on branches that don't ship this module yet.
@@ -62,6 +70,7 @@ __all__ = [
 
 # Extend __all__ with optionally-imported names if they were successfully bound.
 for _name in (
+    'DimResolver', 'UnknownDimError',
     'BuilderConfig', 'PruningConfig', 'IRBuilder',
     'CompilerIR', 'AttentionOp', 'FFNOp', 'LayerSpec',
     'compile_full_vm_dynamic', 'compute_dynamic_schedule',
