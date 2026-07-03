@@ -164,9 +164,47 @@ def _layer13_shifts_substage_rules(
     ``"OP_SHR"`` form for the human-readable ``scope`` string. When
     ``gate is None`` (legacy callers) it falls back to ``op_dim_name``
     so existing behaviour is preserved.
+
+    Phase 7.E (sem-dim pilot, 2026-07-03): every remaining condition /
+    write dim ref is now a semantic ``(category, role)`` lookup via
+    :func:`dim_ref`, so this substage — and therefore the whole L13
+    shifts FFN (SHL + SHR, 4096 rules) — no longer hard-codes ANY base
+    slot NAME. The ``+N`` suffix carries the *value-bus index* (a nibble
+    value / shift amount), which is genuinely structural and stays a raw
+    offset; the base slot NAME is resolved from its semantic family at
+    compile time. This is the repack-fragility fix: if the dim allocator
+    RENAMES or re-tags a family (e.g. an over-width band re-homes
+    ``ALU_LO``), a hard-coded ``"ALU_LO+a_lo"`` string would silently read
+    the wrong cell, whereas the ``(category, role)`` binding is the single
+    source of truth. The refs used here:
+
+    * position marker ``MARK_AX`` -> ``dim_ref("marker", "AX")``
+    * ``ALU_LO[a_lo]`` (operand a lo nibble) ->
+      ``dim_ref("alu_lo", "result", a_lo)``
+    * ``ALU_HI[a_hi]`` (operand a hi nibble) ->
+      ``dim_ref("alu_hi", "result", a_hi)``
+    * ``AX_CARRY_LO[s]`` (one-hot shift amount) ->
+      ``dim_ref("ax_carry_lo", "AX", s)``
+    * ``AX_CARRY_HI[0]`` (shift-active flag) ->
+      ``dim_ref("ax_carry_hi", "AX", 0)``
+    * ``OUTPUT_LO[result_lo]`` / ``OUTPUT_HI[result_hi]`` (result byte
+      nibbles) -> ``dim_ref("output_lo"/"output_hi", "nibble", result_*)``
+
+    All resolve byte-identically to the pre-pilot ``"NAME+offset"`` strings
+    (verified via ``compare_symbolic_to_lowered_ffn`` +
+    ``tools/_isa_golden_hash.py``). The ``scope`` string keeps the legacy
+    ``op_dim_name`` form: it feeds the human-readable predicate auditor,
+    not the weight lowering, so it is NOT repack-sensitive.
     """
     write_scale = 2.0 / S
     gate_ref = gate if gate is not None else op_dim_name
+    # Phase 7.E pilot: resolve the position marker + the shift-active flag
+    # once (they are loop-invariant). ``dim_ref`` returns a ``"NAME+offset"``
+    # string that ``DimRef.parse`` reads identically to the bare name, so
+    # ``dim_ref("marker", "AX")`` == ``"MARK_AX+0"`` lowers to the same
+    # weight the legacy bare ``"MARK_AX"`` did.
+    mark_ax = dim_ref("marker", "AX")
+    ax_carry_active = dim_ref("ax_carry_hi", "AX", 0)
     rules: list[FFNRule] = []
     for s in range(8):
         for a_hi in range(16):
@@ -175,24 +213,31 @@ def _layer13_shifts_substage_rules(
                 result = shift_fn(value, s)
                 result_lo = result & 0xF
                 result_hi = (result >> 4) & 0xF
+                # Value-bus reads/writes: NAME resolved from the semantic
+                # family, ``offset`` = the raw nibble value / shift amount.
+                alu_lo_a = dim_ref("alu_lo", "result", a_lo)
+                alu_hi_a = dim_ref("alu_hi", "result", a_hi)
+                ax_carry_lo_s = dim_ref("ax_carry_lo", "AX", s)
+                output_lo_result = dim_ref("output_lo", "nibble", result_lo)
+                output_hi_result = dim_ref("output_hi", "nibble", result_hi)
                 rules.append(multi_way_and_rule(
                     name=(
                         f"{name_prefix}_s{s}_ahi{a_hi}_alo{a_lo}"
                     ),
                     conditions=(
-                        ("MARK_AX", 1.0),
-                        (f"ALU_LO+{a_lo}", 1.0),
-                        (f"ALU_HI+{a_hi}", 1.0),
-                        (f"AX_CARRY_LO+{s}", 1.0),
-                        ("AX_CARRY_HI+0", 1.0),
+                        (mark_ax, 1.0),
+                        (alu_lo_a, 1.0),
+                        (alu_hi_a, 1.0),
+                        (ax_carry_lo_s, 1.0),
+                        (ax_carry_active, 1.0),
                     ),
                     threshold=4.5,
                     gate=gate_ref,
                     gate_weight=1.0,
                     gate_bias=0.0,
                     writes=(
-                        (f"OUTPUT_LO+{result_lo}", write_scale),
-                        (f"OUTPUT_HI+{result_hi}", write_scale),
+                        (output_lo_result, write_scale),
+                        (output_hi_result, write_scale),
                     ),
                     scope=f"MARK_AX and {op_dim_name}",
                 ))
