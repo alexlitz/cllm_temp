@@ -3700,7 +3700,7 @@ def _make_standalone_pure_ffn_post_op_bake(rules):
     """Return a ``bake(block, dim_positions, S)`` that appends a standalone
     ``PureFFN`` post_op lowering ``rules`` with a dim_map resolved entirely from
     the declarative ``dim_positions`` layout. Mirrors the L25-tail / flag-
-    precursor bakes (``make_ax_byte23_dump_zero_op`` etc.)."""
+    precursor bakes (``make_ax_hibyte_clear_allstep_op`` etc.)."""
 
     def bake(block, dim_positions, S):
         from ...base_layers import PureFFN

@@ -1867,235 +1867,16 @@ def make_ax_byte1_dump_repopulate_op() -> Operation:
 
 
 # ===========================================================================
-# AX byte-2/3 register-dump ENT-frame zero cap (C4_AX_BYTE23_DUMP, default ON)
-# ===========================================================================
-#
-# THE callee-ENT prologue blocker (func/nested/rec/var). On the callee ENT step
-# the AX register dump leaks GARBAGE into AX bytes 2/3: func_identity_0 (id 550)
-# step-1 dumps ``ax=0x0a0a0000`` -- byte-0/1 = 0 (CORRECT) but bytes 2/3 = 0x0a
-# (WRONG; the callee's AX is 0). Exact LM-head logit attribution (no final norm,
-# spec_k=0, tools/probe_ax_byte23_func.py + probe_ax_b23_div.py):
-#
-#   * The LM head emits the AX byte-2/3 token from ``OUTPUT_LO+nibble`` /
-#     ``OUTPUT_HI+nibble`` (the byte-value one-hot, +5.0 columns). On the func
-#     ENT byte-2/3 predictor rows ``OUTPUT_LO+10 = 2.0`` / ``OUTPUT_HI+0 = 1.94``
-#     -> low nibble 0xA, high nibble 0 -> 0x0a.
-#   * GENESIS is block 29 / logical L18 (the L14/L18 mem-generation block FFN).
-#     Through block 28 the dump rows hold the clean ~+0.94 zero default
-#     (``OUTPUT_LO+0``); at block 29 FFN units 79/111 (gated on ``CONST`` with
-#     ``NEXT_*`` exclusions) ASSERT the PC-byte-0 default ``OUTPUT_LO+10`` (= the
-#     PC low-nibble carry, value 0x?A) AND the L18 value-head writers zero the
-#     ``OUTPUT_LO+0`` default (-0.06) -> the stale ``OUTPUT_LO+10`` wins.
-#   * On the WORKING add/sub/16bit steps the L9 AX-result writer puts a STRONG
-#     ``OUTPUT_LO+0 = +14.8`` / ``OUTPUT_HI+0 = +19.2`` zero-byte default on the
-#     high-byte rows that the L18 PC-default cannot overcome. That L9 writer
-#     fires on the IMM/ADD AX-write opcode context; on the ENT step it does NOT
-#     (the opcode is ENT, OP_IMM/OP_ADD = 0), so the high-byte default decays to
-#     the weak ~+0.94 L3 default that block-29 overrides.
-#
-# THE DISCRIMINATOR (program-stable, spec_k=0, last block, probe_axdump_rowsig):
-#   leaking func byte-2/3 rows: IS_BYTE=1, BYTE_INDEX_{1,2}~0.97, OP_ENT~6.5,
-#     AX_CARRY_OVERFLOW~0.
-#   working add/big/16bit byte-2/3 rows: IS_BYTE=1, BYTE_INDEX_{1,2}~0.97,
-#     OP_ENT~0 (OP_IMM/OP_ADD instead).
-# ``OP_ENT`` is the clean, program-stable discriminator: high (>=2) ONLY in the
-# ENT-frame, ~0 on every legit-high-byte step. On the ENT step the callee AX IS
-# 0 (a fresh frame), so forcing bytes 2/3 -> 0 there is ALWAYS correct.
-#
-# THE FIX (declarative, mirrors the a375d917 tail-NOT-blocker precedent + the
-# H1-cap band-pass-kill): a late corrective FFN (appended to the L25 tail block,
-# AFTER tail_bit32_result_correction so nothing downstream overrides OUTPUT
-# before the LM head). Two AND units (byte-2 -> BYTE_INDEX_1, byte-3 ->
-# BYTE_INDEX_2) that fire on ``IS_BYTE + BYTE_INDEX_x + OP_ENT`` (with
-# marker/overflow blockers) and RESTORE the byte=0 default: strong-positive
-# ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` + strong-negative ``OUTPUT_LO+10`` (kill the
-# stale PC default). Byte-identical on every non-ENT step (OP_ENT~0 -> AND dark
-# -> writes nothing) and on the byte-0/1 rows (BYTE_INDEX_0/3 not gated). The
-# ``OUTPUT_LO``/``OUTPUT_HI``/``OP_ENT``/``BYTE_INDEX``/``IS_BYTE``/
-# ``AX_CARRY_OVERFLOW`` gate+target dims ALL resolve from the declarative
-# ``dim_positions`` layout (verified by probe_ax_b23_div.py reading them at the
-# layout positions), so NO legacy-registry split (unlike the H1-cap dump).
-def _ax_byte23_dump_enabled() -> bool:
-    """``C4_AX_BYTE23_DUMP`` flag predicate (DEFAULT-ON).
-
-    Gates the AX byte-2/3 ENT-frame zero-cap corrective FFN. Flag-OFF
-    (``C4_AX_BYTE23_DUMP=0``) bakes NO corrective units -> byte-identical to the
-    pre-fix build. Evaluated lazily (compile time) so a per-process env flip is
-    honoured and the compile cache key reflects it.
-    """
-    return _os_stack0.environ.get("C4_AX_BYTE23_DUMP", "1") != "0"
-
-
-_AX_BYTE23_DUMP_ZERO_HIDDEN_DIM = 2  # one AND per high byte (byte-2, byte-3)
-
-
-def _ax_byte23_dump_zero_rules() -> tuple[FFNRule, ...]:
-    """2 AND rules forcing the AX byte-2/3 dump to 0 on the callee ENT step.
-
-    Each unit fires on ``IS_BYTE + BYTE_INDEX_x + OP_ENT`` (byte-2 -> x=1,
-    byte-3 -> x=2) with marker + AX_CARRY_OVERFLOW blockers, and writes a strong
-    ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` byte=0 default plus a strong-negative
-    ``OUTPUT_LO+10`` (killing the stale L18 PC-byte default). On a fire the
-    balanced-AND silu saturates large (S=100); the write weights below give an
-    OUTPUT delta of ~+10 (LO+0/HI+0) and ~-10 (LO+10) -- decisively beating the
-    leaked +2.0 at LO+10 so the LM head (reading OUTPUT_*+nibble at +5.0) emits
-    byte 0x00.
-    """
-    # Condition weights: IS_BYTE (~1.0) + BYTE_INDEX_x (~0.97, weighted x2 ->
-    # ~1.94) + OP_ENT (~6.5 in the ENT frame, weighted x0.5 -> ~3.25). The
-    # firing sum (~6.19) clears threshold 4.5; the WORKING (OP_ENT~0) sum
-    # (~2.94) sinks below it -> dark. Marker blockers (-1000 each) sink the unit
-    # on any register/section-marker row; AX_CARRY_OVERFLOW (-1000) is a
-    # defensive kill if a genuine high-byte carry ever co-occurred with OP_ENT.
-    IS_BYTE_W = 1.0
-    BYTE_INDEX_W = 2.0
-    OP_ENT_W = 0.5
-    THRESHOLD = 4.5
-    BLOCKER_W = 1_000.0
-    OVERFLOW_KILL_W = 1_000.0
-    blockers = (
-        ("MARK_AX", -BLOCKER_W),
-        ("MARK_PC", -BLOCKER_W),
-        ("MARK_SP", -BLOCKER_W),
-        ("MARK_BP", -BLOCKER_W),
-        ("MARK_STACK0", -BLOCKER_W),
-        ("MARK_MEM", -BLOCKER_W),
-        ("MARK_SE", -BLOCKER_W),
-        ("AX_CARRY_OVERFLOW", -OVERFLOW_KILL_W),
-    )
-    # Write magnitudes. The balanced-AND silu(S*(score-thr)) saturates to ~the
-    # active condition sum on a clean fire; with write_weight 0.16 the OUTPUT
-    # delta lands at ~+10 / -10 (probe-tuned to dominate the +2.0 leak without
-    # blowing up the residual). Restore byte=0: push OUTPUT_LO+0/HI+0 UP, kill
-    # the stale OUTPUT_LO+10.
-    WW = 0.16
-    writes = (
-        ("OUTPUT_LO+0", WW),
-        ("OUTPUT_HI+0", WW),
-        ("OUTPUT_LO+10", -WW),
-    )
-    rules: list[FFNRule] = []
-    for byte_idx, bindex in ((2, "BYTE_INDEX_1"), (3, "BYTE_INDEX_2")):
-        rules.append(multi_way_and_rule(
-            name=f"ax_byte23_dump_zero_byte{byte_idx}",
-            conditions=(
-                ("IS_BYTE", IS_BYTE_W),
-                (bindex, BYTE_INDEX_W),
-                ("OP_ENT", OP_ENT_W),
-            ) + blockers,
-            threshold=THRESHOLD,
-            writes=writes,
-        ))
-    return tuple(rules)
-
-
-def make_ax_byte23_dump_zero_op() -> Operation:
-    """Append the AX byte-2/3 ENT-frame zero-cap FFN after the L25 tail block.
-
-    Standalone ``PureFFN`` post_op on the L25 tail block (appended AFTER
-    ``tail_bit32_result_correction``), so it is the last writer of OUTPUT on the
-    AX byte-2/3 dump rows before the LM head. ALL gate + target dims resolve from
-    the declarative ``dim_positions`` layout (no legacy-registry split). The
-    whole op is gated by ``C4_AX_BYTE23_DUMP`` (default ON); flag-OFF bakes NO
-    units (byte-identical pre-fix build, smoke unchanged).
-    """
-    if not _ax_byte23_dump_enabled():
-        # Flag OFF: register a no-op so the dep graph / op list is stable but no
-        # weights change (byte-identical to the pre-fix build).
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="ax_byte23_dump_zero",
-            reads=set(),
-            writes=set(),
-            audited_empty_produces=True,
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            requires={"after": "tail_bit32_result_correction"},
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
-        )
-
-    rules = _ax_byte23_dump_zero_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        assert len(rules) == _AX_BYTE23_DUMP_ZERO_HIDDEN_DIM, (
-            f"ax_byte23_dump_zero rule-count drift: produced {len(rules)}, "
-            f"expected {_AX_BYTE23_DUMP_ZERO_HIDDEN_DIM}"
-        )
-        ffn = PureFFN(d_model, len(rules))
-        # ALL dims (gate + target) live in the declarative layout -> resolve
-        # every name from dim_positions (no legacy-registry split).
-        dim_map = {}
-        for _nm in Primitives.ffn_rule_dim_names(rules):
-            _base = _nm.split("+", 1)[0]
-            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
-            dim_map[_nm] = int(dim_positions[_base]) + _off
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
-        name="ax_byte23_dump_zero",
-        reads={
-            "IS_BYTE", "BYTE_INDEX_1", "BYTE_INDEX_2", "OP_ENT",
-            "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
-            "MARK_MEM", "MARK_SE", "AX_CARRY_OVERFLOW",
-        },
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="block",
-        # Append AFTER the tail correction on the L25 block, so this op is the
-        # last writer of OUTPUT on the AX byte-2/3 dump rows before the LM head.
-        target_op_name="l10_post_ops_combined",
-        requires={"after": "tail_bit32_result_correction"},
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
-        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
-    )
-
-
-# ===========================================================================
 # STRUCTURAL: all-step register byte-2/3 zero-default (C4_AX_HIBYTE_CLEAR, OFF)
 # ===========================================================================
 #
-# THE STRUCTURAL GENERALIZATION of ``ax_byte23_dump_zero``. That op only fires
-# when OP_ENT is FRESH (~6.5): its firing sum IS_BYTE(1)+BYTE_INDEX_x*2(1.94)+
-# OP_ENT*0.5(~3.25) clears threshold 4.5 only on the callee-ENT step. On a
-# LOOP-BODY step OP_ENT is a durable carry (~1.0) so the sum ~3.44 < 4.5 and the
-# clear DOESN'T fire -> loop_mul/rec_sum leak 0xFF/overflow into register bytes
-# 2/3 (the byte tokens read stale H2/H3 one-hots; probe_reg_emission_map).
+# THE all-step register byte-2/3 zero-default. Fires on EVERY byte-2/3 register-
+# dump row (no OP_ENT / OP_LI gate), so it covers the callee-ENT frame, the LI
+# load step, AND the LOOP-BODY / recursion steps in one op. (Historically this
+# generalized two narrower caps -- ax_byte23_dump_zero gated on OP_ENT and
+# ax_li_byte23_zero gated on OP_LI -- which only fired on the fresh-ENT / LI
+# steps and left loop_mul/rec_sum leaking 0xFF/overflow into bytes 2/3; both are
+# now DELETED as fully subsumed by this all-step clear.)
 #
 # STRUCTURAL FIX: fire on ALL steps (drop the OP_ENT condition), gated purely on
 # the byte-2/3 register-dump row (IS_BYTE + BYTE_INDEX_1/2) with the SAME marker
@@ -2132,8 +1913,9 @@ _AX_HIBYTE_CLEAR_ALLSTEP_HIDDEN_DIM = 2  # one AND per high byte (byte-2, byte-3
 def _ax_hibyte_clear_allstep_rules() -> tuple[FFNRule, ...]:
     """2 AND rules forcing register byte-2/3 dump -> 0 on EVERY step.
 
-    Mirrors ``_ax_byte23_dump_zero_rules`` WITHOUT the OP_ENT condition, so it
-    fires on loop/rec body steps too. Firing sum = IS_BYTE(1) +
+    Gated purely on the byte-2/3 register-dump row (IS_BYTE + BYTE_INDEX_1/2,
+    no OP_ENT / OP_LI condition), so it fires on the callee-ENT, LI-load AND
+    loop/rec body steps in one op. Firing sum = IS_BYTE(1) +
     BYTE_INDEX_x*2(~1.94) = ~2.94 > threshold 2.5; byte-0/1 rows (BYTE_INDEX_1/2
     ~0 -> sum ~1.0) and marker rows (-1000 blockers) stay dark. AX_CARRY_OVERFLOW
     (-1000) preserves a genuine >=0x10000 high byte.
@@ -2179,9 +1961,10 @@ def _ax_hibyte_clear_allstep_rules() -> tuple[FFNRule, ...]:
 def make_ax_hibyte_clear_allstep_op() -> Operation:
     """Append the all-step register byte-2/3 zero-default FFN after the L25 tail.
 
-    Structural generalization of ``ax_byte23_dump_zero`` (fires every step, not
-    just fresh-ENT). Gated by ``C4_AX_HIBYTE_CLEAR`` (DEFAULT-OFF); flag-OFF
-    bakes NO units -> byte-identical.
+    Fires on EVERY byte-2/3 register-dump row (no OP_ENT / OP_LI gate), covering
+    the callee-ENT, LI-load and loop/rec body steps in one op. Gated by
+    ``C4_AX_HIBYTE_CLEAR`` OR ``C4_B1_TO_OUTPUT`` (see the enabled predicate);
+    when neither is set it bakes NO units -> byte-identical.
     """
     if not _ax_hibyte_clear_allstep_enabled():
         def _noop_bake(block, dim_positions, S):
@@ -2194,7 +1977,7 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
             audited_empty_produces=True,
             kind="block",
             target_op_name="l10_post_ops_combined",
-            requires={"after": "ax_byte23_dump_zero"},
+            requires={"after": "tail_bit32_result_correction"},
             declarative_bake_fn=_noop_bake,
             declarative_authority="spec_generated",
             migrated=True,
@@ -2253,10 +2036,10 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
         },
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
-        # After ax_byte23_dump_zero so it is the last OUTPUT writer on the
-        # byte-2/3 dump rows before the LM head.
+        # After tail_bit32_result_correction so it is the last OUTPUT writer on
+        # the byte-2/3 dump rows before the LM head.
         target_op_name="l10_post_ops_combined",
-        requires={"after": "ax_byte23_dump_zero"},
+        requires={"after": "tail_bit32_result_correction"},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=ir,

@@ -2177,14 +2177,6 @@ def compile_full_vm_dynamic(
             "C4_AX_BYTE1_DUMP": (
                 os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
             ),
-            # AX byte-2/3 ENT-frame zero cap (DEFAULT-ON, opt out =0): the
-            # callee-ENT prologue blocker. Adds the ax_byte23_dump_zero
-            # corrective FFN on the L25 tail (output-affecting on the AX byte-2/3
-            # dump rows under OP_ENT), so the ON / OFF builds must NEVER share a
-            # memo / disk entry.
-            "C4_AX_BYTE23_DUMP": (
-                os.environ.get("C4_AX_BYTE23_DUMP", "1") != "0"
-            ),
             # AX byte-1 sign-extension delivery on a negative LEA-local frame
             # address (#343; DEFAULT-ON in the campaign config, opt out =0,
             # output-affecting on the var_update step-14 LEA AX byte-1 row): adds
@@ -3020,12 +3012,6 @@ def _bake_from_scheduled_ops(
         # share a serialised entry.
         "C4_AX_BYTE1_DUMP": (
             os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
-        ),
-        # AX byte-2/3 ENT-frame zero cap (DEFAULT-ON, opt out =0, output-
-        # affecting): the callee-ENT prologue blocker (ax_byte23_dump_zero on the
-        # L25 tail). The ON / OFF builds must never share a serialised entry.
-        "C4_AX_BYTE23_DUMP": (
-            os.environ.get("C4_AX_BYTE23_DUMP", "1") != "0"
         ),
         # AX byte-1 sign-extension delivery on a negative LEA-local frame address
         # (#343; DEFAULT-ON in the campaign config, opt out =0, output-affecting,

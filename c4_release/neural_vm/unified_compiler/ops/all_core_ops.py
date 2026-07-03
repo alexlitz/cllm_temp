@@ -816,23 +816,17 @@ def all_core_ops(
         # PureFFN post_op on the L25 tail block after tail_bit32. See
         # l11_ops.make_ax_byte1_dump_repopulate_op.
         make_ax_byte1_dump_repopulate_op(),
-        # AX byte-2/3 ENT-frame zero cap (THE callee-ENT prologue blocker for
-        # func/nested/rec/var): on the callee ENT step the AX dump leaks garbage
-        # into bytes 2/3 (func_identity_0 step-1 ax=0x0a0a0000) because the L18
-        # PC-byte default (OUTPUT_LO+10) wins on the high-byte rows when the L9
-        # AX-result zero default does not fire (opcode is ENT, not IMM/ADD).
-        # Restores byte=0 on the byte-2/3 dump rows gated on OP_ENT (the clean,
-        # program-stable ENT-frame discriminator; callee AX is always 0 there).
-        # Standalone PureFFN post_op on the L25 tail block after tail_bit32.
-        # Gated by C4_AX_BYTE23_DUMP (default ON). See
-        # l11_ops.make_ax_byte23_dump_zero_op.
-        make_ax_byte23_dump_zero_op(),
-        # STRUCTURAL: all-step register byte-2/3 zero-default. Generalizes the two
-        # caps above (which only fire on fresh-ENT / LI steps) to fire on EVERY
-        # dump row, killing the loop/rec stale-high-byte leak (loop_mul 0xFFFF00,
-        # rec_sum 0x10000) by construction. Safe: bytes 2/3 are 0 for every
-        # register across the corpus; AX_CARRY_OVERFLOW blocker preserves a
-        # genuine >=0x10000 value. Gated by C4_AX_HIBYTE_CLEAR (DEFAULT-OFF). See
+        # STRUCTURAL: all-step register byte-2/3 zero-default. Fires on EVERY
+        # byte-2/3 register-dump row (no OP_ENT / OP_LI gate), so it covers the
+        # callee-ENT frame, the LI load step AND the loop/rec body steps in one
+        # op, killing the stale-high-byte leak (func_identity_0 0x0a0a0000,
+        # id425 LI 0x010060, loop_mul 0xFFFF00, rec_sum 0x10000) by construction.
+        # Safe: bytes 2/3 are 0 for every register across the corpus;
+        # AX_CARRY_OVERFLOW blocker preserves a genuine >=0x10000 value. This
+        # SUBSUMES the two former narrower caps (ax_byte23_dump_zero on OP_ENT,
+        # ax_li_byte23_zero on OP_LI), which have been DELETED as redundant.
+        # Active whenever C4_AX_HIBYTE_CLEAR OR C4_B1_TO_OUTPUT is set
+        # (C4_B1_TO_OUTPUT is DEFAULT-ON). See
         # l11_ops.make_ax_hibyte_clear_allstep_op.
         make_ax_hibyte_clear_allstep_op(),
         # ARCHITECTURAL REFACTOR increment 1: AX byte-1 DUMP -> OUTPUT decode.
