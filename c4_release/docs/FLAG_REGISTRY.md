@@ -3,9 +3,14 @@
 Canonical inventory of every `C4_*` environment flag consulted at runtime
 (`os.environ.get` / `.setdefault` / `os.environ[...]`) across `neural_vm/` and
 `tools/`. Generated 2026-07-03 (golden `b4d2ab27...`, campaign is DEFAULT for
-the fix fleet). 152 real flags (147 read via a literal `environ.get("C4_...")` /
-`getenv` / `_env_int("C4_...")`, plus 5 read indirectly via an `_ENV`-name
-constant — see the STRUCTURAL / RUNTIME table).
+the fix fleet). Originally 152 real flags; the I2 dead-flag sweep (2026-07-03)
+DELETED 6 default-OFF dead-end held-off building blocks — `C4_POST_ENT_SE_SUPPRESS`,
+`C4_ENT_SP_BYTE1_ISMARK_BLOCKER`, `C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER`,
+`C4_PSH_STACK0_BYTE3_RELAY_DARKEN`, `C4_FUNC_LEA_B0_RESTORE`,
+`C4_BP_SAVE_DUMP_MARKER_REQ` (all byte-identity-safe, golden `b4d2ab27`
+unchanged) — leaving 146. The remaining flags are read via a literal
+`environ.get("C4_...")` / `getenv` / `_env_int("C4_...")`, plus 5 read
+indirectly via an `_ENV`-name constant (see the STRUCTURAL / RUNTIME table).
 
 **Columns**
 - **DEFAULT** — the value read when the flag is unset (the 2nd arg to
@@ -193,40 +198,49 @@ the flag-regression / cross-op gates.
 
 ---
 
-## VESTIGIAL-CANDIDATES (for I2 — held-off / demo / superseded / A-B knobs)
+## VESTIGIAL-CANDIDATES (I2 dead-flag sweep — resolved 2026-07-03)
 
-**Not removed here.** Several are load-bearing kill-switches for the
-flag-regression / cross-op gates — verify with those gates before deleting.
+The dead-flag sweep classified all 28 candidates. **DELETED** entries were
+default-OFF **dead-end** held-off building blocks (a documented net-zero /
+net-negative result, never enabled by `C4_CAMPAIGN` or any live config, no
+test/gate consuming them); each removal was byte-identity gated
+(`_isa_golden_hash.py` == `b4d2ab27`, since the op never baked in golden) and
+committed one-per-commit. **KEEP** entries are load-bearing gate fixtures, A/B
+override knobs / kill-switches on **live campaign correctors** (they fall
+through to a live default when unset — deleting the flag would delete the
+corrector), or verified real fixes held for an imminent landing. **BORDERLINE**
+entries were left for review (large multi-file features or active-megaroot
+building blocks — conservative hold).
 
-| Flag | Default | Track | Why candidate |
-|------|---------|-------|---------------|
-| `C4_MY_FIX` | n/a | tooling | Placeholder convention name in `flag_regression_gate.py` docstring — the *fix's kill-switch* passed as `--flag`, not a real runtime flag. Keep as documented convention. |
-| `C4_FFN_LINT_MULL14_DEMO` | `0` (off) | tooling | Demo fixture for `lint_cross_op_ffn --demo` (mul-l14 entanglement). Held-off; delete only if the demo is retired. |
-| `C4_FFN_LINT_CLEAN_DEMO` | `0` (off) | tooling | Demo fixture for `lint_cross_op_ffn --demo` (clean band). Held-off; pair of the above. |
-| `C4_OUTBAND_DECOUPLE_PROTO` | `""` (`=="decouple"`) | campaign | OUTPUT-band decouple PROTOTYPE (l16); prototype flag, not on a landed path. |
-| `C4_PSH_STACK0_BYTE3_RELAY_DARKEN` | `0` (off) | campaign | Verified building block held OFF (net −1 exit_code trade — see `_psh_stack0_byte3_relay_darken_enabled`). |
-| `C4_POST_ENT_SE_SUPPRESS` | `0` (off) | campaign | Framing-recovery building block, DEFAULT-OFF (held). |
-| `C4_ENT_SP_BYTE1_ISMARK_BLOCKER` | `0` (off) | campaign | Framing-recovery building block, DEFAULT-OFF (held). |
-| `C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER` | `0` (off) | campaign | Framing building block held OFF (ships with L15_LEV chain). |
-| `C4_FUNC_LEA_B0_RESTORE` | `0` (off) | campaign | Held-OFF LEA byte-0 restore building block. |
-| `C4_BP_SAVE_DUMP_MARKER_REQ` | `0` (off) | campaign | Held-OFF BP-save marker-required variant. |
-| `C4_MUL_STACK0_BYTE39_GUARD` | `0` (off) | campaign | Held-OFF MUL STACK0 byte-39 guard variant (default-on form is `shared._mul_stack0_byte39_guard`). |
-| `C4_MUL_BLK33_CLAWBACK` | unset→off | campaign | Re-applied mul-l14 regression, CAUGHT by flag-regression gate; kept as the gate's proof fixture (commit ba06deaa). Do not enable. |
-| `C4_ADDSUB_DECLARATIVE` | `0` (off) | golden | Declarative AddSub path (held OFF; imperative `ADDSUB_DUMP_BOOST` is live). |
-| `C4_AX_BYTE1_FULL_WIDTH` | `0` (off) | golden | Full-width AX byte-1 variant (held OFF; `AX_BYTE1_HINIB`/`DUMP` are live). |
-| `C4_AX_HIBYTE_CLEAR` | `0` (off) | golden | AX hi-byte skip-all-H-bands variant (held OFF). |
-| `C4_LEA_LOCAL_E8_MULTILOCAL_GUARD` | `0` (off) | campaign | Held-OFF LEA-local multilocal guard (landed but 0 verdict change per memory). |
-| `C4_INC3_MEMAX_B1_OFF` | `0` (`==0` gate) | campaign | Inc-3 MEMAX-B1 OFF override (A/B). |
-| `C4_STACK0_B0_POPPED` | `0` (off) | campaign | STACK0 byte-0 popped teacher probe knob (held; `l11_ops`). |
-| `C4_SP_POP_MARKER_CMP3_HARDGATE` | `0` (off) | campaign | Held-OFF SP-pop marker CMP3 hard-gate variant. |
-| `C4_STACK0_MARKER_ISBYTE_HARDEN` | forced-override | campaign | A/B override knob (`forced = get(...)`, else derived). |
-| `C4_STACK0_MARKER_AXMARK_HARDEN` | forced-override | campaign | A/B override knob (`forced = get(...)`, else derived). |
-| `C4_TAIL_LEA_E8_ARITH_GUARD_SHARP` | forced-override | campaign | A/B override knob (sharpness). |
-| `C4_LEA_E0D8_FETCH_DOMINATE` | forced-override | campaign | A/B override knob. |
-| `C4_LEA_BYTE0_MEMSP_RELAY` | forced-override | campaign | A/B override knob. |
-| `C4_LEA_BYTE0_ALU_AMPLIFY` | forced-override | campaign | A/B override knob. |
-| `C4_L15_SAVEDRA_HEAD` | forced-override | campaign | A/B override knob (saved-RA head). |
-| `C4_JSR_PC_BYTE1` | `0` (off) | campaign | Held-OFF JSR PC byte-1 variant (`l3_ops`/`model_ops`). |
+| Flag | Default | Track | Verdict — reason |
+|------|---------|-------|------------------|
+| `C4_MY_FIX` | n/a | tooling | **KEEP** — not a real runtime flag; documented `--flag` convention in the gate docstring. |
+| `C4_FFN_LINT_MULL14_DEMO` | `0` (off) | tooling | **KEEP** — `lint_cross_op_ffn --demo` fixture (protected). |
+| `C4_FFN_LINT_CLEAN_DEMO` | `0` (off) | tooling | **KEEP** — `lint_cross_op_ffn --demo` fixture (protected). |
+| `C4_OUTBAND_DECOUPLE_PROTO` | `""` (`=="decouple"`) | campaign | **KEEP** — active OUTPUT-band megaroot WIP (protected). |
+| `C4_MUL_BLK33_CLAWBACK` | unset→off | campaign | **KEEP** — flag-regression-gate proof fixture (protected). |
+| `C4_MUL_STACK0_BYTE39_GUARD` | `0` (off) | campaign | **KEEP (load-bearing real fix)** — commit `4cadc90e`: mul cluster 46→50/50, +15 flips, 0 regressions, smoke 51/0. A verified fix held DEFAULT-OFF pending campaign integration, NOT a dead-end. |
+| `C4_LEA_LOCAL_E8_MULTILOCAL_GUARD` | tracks `no_stack0_emit` | campaign | **KEEP (live campaign corrector)** — default = `no_stack0_emit_enabled()` (ON in campaign); the GPU-confirmed per-step LEA disambiguator (var_mul step-6). The registry's "0 verdict change" was stale. |
+| `C4_INC3_MEMAX_B1_OFF` | `0` (`==0` kill-switch) | campaign | **KEEP (kill-switch)** — A/B kill-switch for the campaign-default-ON Inc-3 MEMAX-B1 corrector. |
+| `C4_STACK0_MARKER_ISBYTE_HARDEN` | tracks `no_stack0_emit` | campaign | **KEEP (A/B knob on live corrector)** — Inc-3 ROOT-B, ON in campaign; `forced` override else `no_stack0_emit_enabled()`. |
+| `C4_STACK0_MARKER_AXMARK_HARDEN` | tracks `no_stack0_emit` | campaign | **KEEP (A/B knob on live corrector)** — Inc-3 ROOT-A (~140-prog lever), ON in campaign. |
+| `C4_TAIL_LEA_E8_ARITH_GUARD_SHARP` | forced→True | campaign | **KEEP (A/B knob on live corrector)** — shapes the default-ON golden `C4_TAIL_LEA_E8_ARITH_GUARD`. |
+| `C4_LEA_E0D8_FETCH_DOMINATE` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — falls through to `_lea_byte0_memsp_relay_enabled()`. |
+| `C4_LEA_BYTE0_MEMSP_RELAY` | forced→live | campaign | **KEEP (A/B knob on live corrector)**. |
+| `C4_LEA_BYTE0_ALU_AMPLIFY` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — falls through to a `no_stack0_emit` default. |
+| `C4_L15_SAVEDRA_HEAD` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — L15 head-15 saved-RA delivery. |
+| `C4_POST_ENT_SE_SUPPRESS` | `0` (off) | campaign | **DELETED** (commit `2043ff4d`) — dead-end framing building block. |
+| `C4_ENT_SP_BYTE1_ISMARK_BLOCKER` | `0` (off) | campaign | **DELETED** (commit `10d7b876`) — docstring records NEGATIVE RESULT (0 programs advance; "the real fix is the project-level multi-part build, not a solo corrector"). |
+| `C4_L16_LEV_STACK0_PRESERVE_SE_BLOCKER` | `0` (off) | campaign | **DELETED** (commit `1466958c`) — dead-end framing MARK_SE NOT-blocker. |
+| `C4_PSH_STACK0_BYTE3_RELAY_DARKEN` | `0` (off) | campaign | **DELETED** (commit `4267cfb3`) — net −1 exit_code TRADE with a documented "cannot be cleanly separated func-vs-var" wall. |
+| `C4_FUNC_LEA_B0_RESTORE` | `0` (off) | campaign | **DELETED** (commit `ad2a3f25`) — ZERO-SUM (flips func_add, regresses func_identity; the two LEA rows are bit-identical → not separable). Removed the band + capture/restore ops. |
+| `C4_BP_SAVE_DUMP_MARKER_REQ` | `0` (off) | campaign | **DELETED** (commit `67f536e4`) — dead-end BP-dump gate-rewrite variant. |
+| `C4_ADDSUB_DECLARATIVE` | `0` (off) | golden | **BORDERLINE (KEEP)** — selects the in-flight `DeclarativeAddSubBlock` migration path (docs/ADDSUB_DSL_MIGRATION_*, probe tool). Migration WIP, not a dead corrector. |
+| `C4_AX_BYTE1_FULL_WIDTH` | `0` (off) | golden | **BORDERLINE (review)** — alternate full-width AX byte-1 structural variant (17 refs, band + LM-head columns). |
+| `C4_AX_HIBYTE_CLEAR` | `0` (off) | golden | **BORDERLINE (review)** — alternate structural op coupled to the completed AX-emission H-band bake in `model_ops.py`; entangled with a sensitive done-refactor. |
+| `C4_STACK0_B0_POPPED` | `0` (off) | campaign | **BORDERLINE (review)** — band + L9 latch head + dump condition; part of the ACTIVE if/bool/expr OUTPUT-band megaroot family. Held pending that multi-part fix. |
+| `C4_SP_POP_MARKER_CMP3_HARDGATE` | `0` (off) | campaign | **BORDERLINE (review)** — verified SP-drift fix, currently net −2 (if_var 13→11) but a staged prerequisite that "should net positive the moment the LI value-load root lands" (#313/#289). |
+| `C4_JSR_PC_BYTE1` | `0` (off) | campaign | **BORDERLINE (review)** — large multi-file feature (bands + relay head + allocator + staging/emit FFN across `model_ops`/`l3_ops`/`all_core_ops`); high blast-radius, conservative hold. |
 
 ---
 
