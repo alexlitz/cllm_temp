@@ -1271,12 +1271,25 @@ class LoadedOperandAddHi15ClearFFN(nn.Module):
     CLEAN_MAX = 5.85
 
     def __init__(self, inner: nn.Module, *, alu_hi, mark_ax, add_dim,
-                 contam_cells=(15,)):
+                 contam_cells=(15,), gate_dims=None):
         super().__init__()
         self.inner = inner
         self.alu_hi = int(alu_hi)
         self.mark_ax = int(mark_ax)
         self.add_dim = int(add_dim)
+        # Opcode gate dims. Default = the single ``add_dim`` (var_update ADD;
+        # byte-identical to the original ADD-only wrap). When ``gate_dims`` is
+        # supplied (campaign ``C4_OPERAND_CAM_FIX``) the SAME ALU_HI-only,
+        # same-cell, same-window clear also fires on the loaded-operand
+        # SUB/MUL/MOD/DIV + six-CMP consumer rows. An operand-delivery row
+        # carries exactly ONE consumer opcode flag, so widening the gate never
+        # double-fires the clear; it just extends the ADD-safe discriminator to
+        # the other loaded-operand consumers (see
+        # ``shared.operand_cam_fix_enabled`` for the value-safety argument).
+        self.gate_dims = (
+            (self.add_dim,) if gate_dims is None
+            else tuple(int(g) for g in gate_dims)
+        )
         # Which ALU_HI nibble cells carry the SP/BP-address high-nibble leak on
         # the loaded-operand ADD MARK_AX row. var_update (frame ``0xFFE8`` /
         # ``0xFFF8``) leaks the ``0xF`` nibble -> cell 15. func_add/mul/max/min
@@ -1289,7 +1302,13 @@ class LoadedOperandAddHi15ClearFFN(nn.Module):
         self._is_loaded_operand_add_hi15_clear_wrap = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        add_ax = (x[:, :, self.add_dim] > 0.5) & (x[:, :, self.mark_ax] > 0.5)
+        # Fire on any gated consumer opcode at the AX marker. A single row
+        # carries at most one such opcode flag, so the OR over gate_dims picks
+        # exactly the loaded-operand-delivery row for that op.
+        gate = x[:, :, self.gate_dims[0]] > 0.5
+        for g in self.gate_dims[1:]:
+            gate = gate | (x[:, :, g] > 0.5)
+        add_ax = gate & (x[:, :, self.mark_ax] > 0.5)
         x = x.clone()
         z = torch.zeros((), device=x.device, dtype=x.dtype)
         for c in self.contam_cells:

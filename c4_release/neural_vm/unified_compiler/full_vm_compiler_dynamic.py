@@ -2425,6 +2425,18 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
             ),
+            # Operand-CAM address-leak clear WIDEN (campaign OFF by default,
+            # opt in =1, MODULE-affecting): widens the ADD-only
+            # LoadedOperandAddHi15ClearFFN opcode gate to the loaded-operand
+            # SUB/MUL/MOD/DIV + six-CMP consumer rows so the wrap MODULE (its
+            # ``gate_dims`` attribute) differs ON vs OFF and the two serialised
+            # models must never share a memo entry. Gated on the campaign
+            # prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign / golden
+            # build is byte-identical. See shared.operand_cam_fix_enabled.
+            "C4_OPERAND_CAM_FIX": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_OPERAND_CAM_FIX", "0") != "0"
+            ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
             # ON / OFF builds bake a different W_q row and must never share a
@@ -3214,6 +3226,17 @@ def _bake_from_scheduled_ops(
         "C4_FUNCADD_ALU_HI13_CLEAR": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
+        ),
+        # Operand-CAM address-leak clear WIDEN (campaign OFF by default, opt in
+        # =1, MODULE-affecting): widens the ADD-only LoadedOperandAddHi15ClearFFN
+        # opcode gate to the loaded-operand SUB/MUL/MOD/DIV + six-CMP consumer
+        # rows so the wrap MODULE (its ``gate_dims``) differs ON vs OFF and the
+        # two serialised models must never share a serialised entry. Gated on the
+        # campaign prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign /
+        # golden build is byte-identical. See shared.operand_cam_fix_enabled.
+        "C4_OPERAND_CAM_FIX": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_OPERAND_CAM_FIX", "0") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF
