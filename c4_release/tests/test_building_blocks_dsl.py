@@ -1705,3 +1705,97 @@ def test_byte_band_factories_ported_call_sites_are_byte_identical():
                 gate_terms=((f"{eb}+{k}", -1.0), (f"{cb}+{k}", 1.0)),
                 writes=((f"{out}+{k}", 2.0 / S),)))
     _assert_rules_equal(l6_ops._layer6_adj_sp_writeback_rules(S), hand)
+
+
+def _rules_by_prefix(rules, prefixes):
+    """Extract, in emission order, the rules whose name starts with one of
+    ``prefixes`` (each prefix is a ``(name_prefix,)`` band identifier)."""
+    out = []
+    for r in rules:
+        if r.name is not None and any(r.name.startswith(p) for p in prefixes):
+            out.append(r)
+    return out
+
+
+def test_l16_byte_route_ported_call_sites_are_byte_identical():
+    """The live l16 LEV-routing byte-route bands still emit the original
+    rule tuples field-for-field after the reduction-map ⑥ port.
+
+    Four per-cell BYTE-ROUTE bands inside ``_layer16_lev_routing_rules``
+    were delegated to :func:`byte_route_rules`:
+      * ``l16_lev_ax_carry_{lo,hi}``       (AX_CARRY -> OUTPUT, 2.0/S)
+      * ``l16_lev_ax_full_{lo,hi}``        (AX_FULL  -> OUTPUT, 2.0/S)
+      * ``l16_stale_imm_ax_carry_{lo,hi}`` (AX_CARRY -> OUTPUT, 2.0/S)
+      * ``l16_bp_marker_passthrough_{lo,hi}`` (EMBED -> OUTPUT, 10.0/S)
+    Each ported band's live output must equal the pre-refactor inline
+    loop (gate on ``SOURCE+k``, single write to ``DEST+k``).
+    """
+    from c4_release.neural_vm.unified_compiler.ops.l16_ops import (
+        _layer16_lev_routing_rules,
+    )
+
+    S = 100.0
+    live = _layer16_lev_routing_rules(S)
+
+    def _hand_route(name_prefix, band_specs, conditions, threshold, write):
+        hand = []
+        for band, src, out in band_specs:
+            for k in range(16):
+                hand.append(multi_way_and_rule(
+                    name=f"{name_prefix}_{band}_{k}",
+                    conditions=conditions,
+                    threshold=threshold,
+                    gate=f"{src}+{k}",
+                    writes=((f"{out}+{k}", write / S),),
+                ))
+        return hand
+
+    step0_guard_weight = 10.0
+    lev_ax_carry_conditions = (
+        ("OP_LEV", 1.0), ("MARK_AX", 1.0),
+        ("MARK_PC", -8.0), ("MARK_SP", -8.0), ("MARK_BP", -8.0),
+        ("MARK_STACK0", -8.0), ("MARK_MEM", -8.0),
+        ("IS_BYTE", -10.0), ("OP_EXIT", -20.0), ("OP_JMP", -20.0),
+        ("HAS_SE", step0_guard_weight),
+    )
+    # l16_lev_ax_carry
+    hand = _hand_route(
+        "l16_lev_ax_carry",
+        (("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+         ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP")),
+        lev_ax_carry_conditions, 1.5 + step0_guard_weight, 2.0)
+    _assert_rules_equal(_rules_by_prefix(live, ("l16_lev_ax_carry_",)), hand)
+
+    # l16_lev_ax_full
+    hand = _hand_route(
+        "l16_lev_ax_full",
+        (("lo", "AX_FULL_LO", "OUTPUT_LO"),
+         ("hi", "AX_FULL_HI", "OUTPUT_HI_THIS_STEP")),
+        lev_ax_carry_conditions, 1.5 + step0_guard_weight, 2.0)
+    _assert_rules_equal(_rules_by_prefix(live, ("l16_lev_ax_full_",)), hand)
+
+    # l16_stale_imm_ax_carry
+    stale_imm_ax_conditions = (
+        ("OP_IMM", 1.0), ("MARK_AX", 1.0), ("MARK_PC", -8.0),
+        ("IS_BYTE", -10.0), ("OP_EXIT", -20.0), ("OP_JMP", -20.0),
+    )
+    hand = _hand_route(
+        "l16_stale_imm_ax_carry",
+        (("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+         ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP")),
+        stale_imm_ax_conditions, 1.5, 2.0)
+    _assert_rules_equal(
+        _rules_by_prefix(live, ("l16_stale_imm_ax_carry_",)), hand)
+
+    # l16_bp_marker_passthrough
+    bp_marker_passthrough_conditions = (
+        ("MARK_BP", 1.0), ("HAS_SE", 1.0), ("IS_BYTE", -10.0),
+        ("OP_ENT", -2.0), ("OP_LEV", -2.0),
+    )
+    hand = _hand_route(
+        "l16_bp_marker_passthrough",
+        (("lo", "EMBED_LO", "OUTPUT_LO"),
+         ("hi", "EMBED_HI", "OUTPUT_HI_THIS_STEP")),
+        bp_marker_passthrough_conditions, 1.5, 10.0)
+    _assert_rules_equal(
+        _rules_by_prefix(live, ("l16_bp_marker_passthrough_",)), hand)
