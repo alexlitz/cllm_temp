@@ -2203,13 +2203,6 @@ def compile_full_vm_dynamic(
             "C4_STACK0_NEXT_ARITH": (
                 os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
             ),
-            # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
-            # opt in with =1): adds a NOT-blocker condition to
-            # l16_ent_frame_sp_byte1_ff (output-affecting), so the ON / OFF builds
-            # must NEVER share a memo / disk entry.
-            "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
-                os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
-            ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
             # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
@@ -3058,12 +3051,6 @@ def _bake_from_scheduled_ops(
         # band-FILL FFN. The ON / OFF builds must never share a serialised entry.
         "C4_AX_BYTE1_FULL_WIDTH": (
             os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
-        ),
-        # post-ENT SP-byte1=0xff IS_MARK blocker (framing-recovery; DEFAULT-OFF,
-        # opt in with =1, output-affecting): the ON / OFF builds must never
-        # share a serialised entry.
-        "C4_ENT_SP_BYTE1_ISMARK_BLOCKER": (
-            os.environ.get("C4_ENT_SP_BYTE1_ISMARK_BLOCKER", "0") == "1"
         ),
         # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
         # opt out with =0, output-affecting): the ON / OFF builds must never
