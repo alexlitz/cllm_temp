@@ -917,6 +917,259 @@ def fetch_byte_attention(
 
 
 # ===========================================================================
+# Per-nibble byte-band factories (reduction map ⑥ — cross-layer dedup)
+# ===========================================================================
+#
+# Three families of 16-cell-per-band FFN loops are re-authored per layer
+# across l6/l9/l10/l14 (and mirrored in l11/l13/l15/l16):
+#
+#   * BYTE-CLEAR    — an N-way AND on marker/opcode conditions writes a
+#                     fixed (usually negative) value to every cell of one
+#                     or more one-hot bands, scrubbing residue. Examples:
+#                     l9 ``_alu_clear_rules`` (ALU_LO/HI clear),
+#                     l9 ``_marker_suppress_rules`` (OUTPUT suppress under
+#                     NEXT_*), l14 ``_layer14_clear_mem_marker_output``.
+#   * BYTE-ROUTE    — an N-way AND, per-cell **gated** on ``SOURCE+k``,
+#                     writes ``value`` to ``DEST+k``: it routes a stored
+#                     one-hot value forward. Examples: l6
+#                     ``_layer6_ax_output_route_rules`` (AX_CARRY->OUTPUT),
+#                     l6 ``_layer6_imm_fetch_route_rules`` (FETCH->OUTPUT).
+#   * CARRY-RELAY   — an N-way AND, per-cell gated by the difference
+#                     ``(EMBED+k, -1) + (CARRY+k, +1)``, writes ``value``
+#                     to ``DEST+k``: it emits only where the relayed carry
+#                     value differs from the embed residual. Example: l6
+#                     ``_layer6_stack_writeback_rules``.
+#
+# Each factory returns the SAME ``FFNRule`` tuple the hand-authored loop
+# produced, so porting a call site is byte-identical. The per-band spec is
+# a ``(band_label, ...)`` tuple so a call site can drive lo/hi (or an
+# arbitrary set of bands) in one call while preserving rule order.
+# ===========================================================================
+
+
+def byte_clear_rules(
+    *,
+    bands: Sequence[str],
+    conditions: Sequence[Tuple[str, float]],
+    threshold: float,
+    write_value: float,
+    S: float = 100.0,
+    lo: int = 0,
+    hi: int = 15,
+    gate: Optional[str] = None,
+    gate_weight: float = 1.0,
+    gate_bias: Optional[float] = None,
+    gate_terms: Sequence[Tuple[str, float]] = (),
+    name_prefix: Optional[str] = None,
+    name_by_band: Optional[Mapping[str, str]] = None,
+    scope: Optional[str] = None,
+    write_scale_by_S: bool = True,
+) -> Tuple[FFNRule, ...]:
+    """Emit a per-cell BYTE-CLEAR band: one rule per cell writes
+    ``write_value`` to ``{band}+k`` for every ``band`` and every ``k`` in
+    ``[lo, hi]``, gated by the shared N-way AND ``conditions``.
+
+    This is the discrete "scrub a one-hot band" primitive shared by the
+    l9 ALU-clear / marker-suppress bands and the l14 OUTPUT-clear bands.
+    Each cell's rule is a :func:`multi_way_and_rule` with the same
+    ``conditions`` + ``threshold`` and a single write ``({band}+k,
+    write_value / S)`` (or ``write_value`` verbatim when
+    ``write_scale_by_S=False``).
+
+    Rule ORDER is band-major then cell-major: for ``bands=("A", "B")`` the
+    rules are ``A+lo .. A+hi, B+lo .. B+hi`` — matching the imperative
+    cursor walk the legacy helpers used.
+
+    Args:
+        bands: ordered band base names to clear (e.g. ``("ALU_LO",
+            "ALU_HI")`` or a single ``("OUTPUT_LO",)``).
+        conditions: shared N-way AND ``(dim, weight)`` conditions.
+        threshold: shared AND threshold.
+        write_value: the value written per cell. Typically negative for a
+            scrub. Lowered as ``write_value / S`` unless
+            ``write_scale_by_S=False``.
+        S: SwiGLU scale.
+        lo / hi: inclusive cell-index bounds (default full 16-cell band).
+        gate / gate_weight / gate_bias / gate_terms: optional shared gate
+            threaded to every cell rule (e.g. ``gate="NEXT_PC"`` for the
+            marker-suppress band). ``None`` gate + empty terms => a plain
+            ``constant_write``.
+        name_prefix: rule-name prefix; the per-cell name is
+            ``f"{name_prefix}_{k}"``. Ignored for bands covered by
+            ``name_by_band``.
+        name_by_band: optional ``{band: prefix}`` overriding
+            ``name_prefix`` per band (used when the legacy names differ by
+            band, e.g. ``alu_lo_clear`` vs ``alu_hi_clear``).
+        scope: optional shared predicate-DSL scope.
+        write_scale_by_S: divide ``write_value`` by ``S`` (default). Set
+            ``False`` when the legacy loop wrote the raw value (e.g. the
+            marker-suppress ``-1.0`` cells).
+
+    Returns:
+        Tuple of ``len(bands) * (hi - lo + 1)`` ``FFNRule``s.
+    """
+    if lo > hi:
+        raise ValueError(f"byte_clear_rules: lo ({lo}) > hi ({hi})")
+    cond = tuple(conditions)
+    rules: list[FFNRule] = []
+    for band in bands:
+        prefix = None
+        if name_by_band is not None and band in name_by_band:
+            prefix = name_by_band[band]
+        elif name_prefix is not None:
+            prefix = name_prefix
+        for k in range(lo, hi + 1):
+            value = _ww(write_value, S) if write_scale_by_S else write_value
+            rules.append(multi_way_and_rule(
+                name=f"{prefix}_{k}" if prefix else None,
+                conditions=cond,
+                threshold=threshold,
+                gate=gate,
+                gate_weight=gate_weight,
+                gate_bias=gate_bias,
+                gate_terms=tuple(gate_terms),
+                writes=((f"{band}+{k}", value),),
+                scope=scope,
+            ))
+    return tuple(rules)
+
+
+def byte_route_rules(
+    *,
+    band_specs: Sequence[Tuple[str, str, str]],
+    conditions: Sequence[Tuple[str, float]],
+    threshold: float,
+    write_value: float = _DEFAULT_WRITE,
+    S: float = 100.0,
+    lo: int = 0,
+    hi: int = 15,
+    name_prefix: Optional[str] = None,
+    scope_by_band: Optional[Mapping[str, str]] = None,
+    dominates_at_by_band: Optional[Mapping[str, Mapping[str, str]]] = None,
+) -> Tuple[FFNRule, ...]:
+    """Emit a per-cell BYTE-ROUTE band: for each ``(band_label,
+    source_base, dest_base)`` spec, one rule per cell fires under the
+    shared N-way AND ``conditions`` **gated on ``{source_base}+k``** and
+    writes ``write_value`` to ``{dest_base}+k``.
+
+    This routes a stored one-hot value forward one cell at a time — the
+    shared shape behind l6's opcode AX_CARRY->OUTPUT routes and the IMM
+    FETCH->OUTPUT route. The gate is the source cell, so the rule only
+    contributes where that source one-hot is set.
+
+    Rule ORDER is spec-major then cell-major, matching the legacy
+    ``for band, source, output`` / ``for k`` nesting.
+
+    Args:
+        band_specs: ordered ``(band_label, source_base, dest_base)``
+            triples. ``band_label`` (e.g. ``"lo"`` / ``"hi"``) is used to
+            key per-band ``scope_by_band`` / ``dominates_at_by_band`` and
+            to build the rule name.
+        conditions: shared N-way AND ``(dim, weight)`` conditions.
+        threshold: shared AND threshold.
+        write_value: raw write numerator; lowered as ``write_value / S``.
+            Default ``2.0`` matches the codebase's route scale.
+        S: SwiGLU scale.
+        lo / hi: inclusive cell-index bounds.
+        name_prefix: per-cell name is ``f"{name_prefix}_{band_label}_{k}"``.
+        scope_by_band: optional ``{band_label: scope}`` predicate scope
+            applied to that band's cells (e.g. only the HI band annotated).
+        dominates_at_by_band: optional ``{band_label: {dim: scope}}``
+            dominates_at map applied to that band's cells.
+
+    Returns:
+        Tuple of ``len(band_specs) * (hi - lo + 1)`` ``FFNRule``s.
+    """
+    if lo > hi:
+        raise ValueError(f"byte_route_rules: lo ({lo}) > hi ({hi})")
+    cond = tuple(conditions)
+    write_scale = _ww(write_value, S)
+    rules: list[FFNRule] = []
+    for band_label, source_base, dest_base in band_specs:
+        scope = None
+        if scope_by_band is not None:
+            scope = scope_by_band.get(band_label)
+        dominates_at = None
+        if dominates_at_by_band is not None:
+            dominates_at = dominates_at_by_band.get(band_label)
+        for k in range(lo, hi + 1):
+            name = (
+                f"{name_prefix}_{band_label}_{k}" if name_prefix else None
+            )
+            rules.append(multi_way_and_rule(
+                name=name,
+                conditions=cond,
+                threshold=threshold,
+                gate=f"{source_base}+{k}",
+                writes=((f"{dest_base}+{k}", write_scale),),
+                scope=scope,
+                dominates_at=dominates_at,
+            ))
+    return tuple(rules)
+
+
+def carry_relay_rules(
+    *,
+    band_specs: Sequence[Tuple[str, str, str, str]],
+    conditions: Sequence[Tuple[str, float]],
+    threshold: float,
+    write_value: float = _DEFAULT_WRITE,
+    S: float = 100.0,
+    lo: int = 0,
+    hi: int = 15,
+    name_prefix: Optional[str] = None,
+) -> Tuple[FFNRule, ...]:
+    """Emit a per-cell CARRY-RELAY band: for each ``(band_label,
+    embed_base, carry_base, dest_base)`` spec, one rule per cell fires
+    under the shared N-way AND ``conditions`` with per-cell **gate_terms**
+    ``[({embed_base}+k, -1.0), ({carry_base}+k, +1.0)]`` and writes
+    ``write_value`` to ``{dest_base}+k``.
+
+    The gate is the signed difference "relayed carry value minus embed
+    residual", so the write only fires where the two one-hots disagree —
+    the shape of l6's stack-writeback band (emit OUTPUT = relayed
+    AX_CARRY only where it differs from the natural EMBED value).
+
+    Rule ORDER is spec-major then cell-major.
+
+    Args:
+        band_specs: ordered ``(band_label, embed_base, carry_base,
+            dest_base)`` tuples (e.g. ``("lo", "EMBED_LO", "AX_CARRY_LO",
+            "OUTPUT_LO")``).
+        conditions: shared N-way AND ``(dim, weight)`` conditions.
+        threshold: shared AND threshold.
+        write_value: raw write numerator; lowered as ``write_value / S``.
+        S: SwiGLU scale.
+        lo / hi: inclusive cell-index bounds.
+        name_prefix: per-cell name is ``f"{name_prefix}_{band_label}_{k}"``.
+
+    Returns:
+        Tuple of ``len(band_specs) * (hi - lo + 1)`` ``FFNRule``s.
+    """
+    if lo > hi:
+        raise ValueError(f"carry_relay_rules: lo ({lo}) > hi ({hi})")
+    cond = tuple(conditions)
+    write_scale = _ww(write_value, S)
+    rules: list[FFNRule] = []
+    for band_label, embed_base, carry_base, dest_base in band_specs:
+        for k in range(lo, hi + 1):
+            name = (
+                f"{name_prefix}_{band_label}_{k}" if name_prefix else None
+            )
+            rules.append(multi_way_and_rule(
+                name=name,
+                conditions=cond,
+                threshold=threshold,
+                gate_terms=(
+                    (f"{embed_base}+{k}", -1.0),
+                    (f"{carry_base}+{k}", 1.0),
+                ),
+                writes=((f"{dest_base}+{k}", write_scale),),
+            ))
+    return tuple(rules)
+
+
+# ===========================================================================
 # §566 — Mixture-of-Experts wrapper (opcode-gated rule batches)
 # ===========================================================================
 
@@ -1289,6 +1542,9 @@ __all__ = [
     "multi_way_and_rule",
     "multi_way_or_rules",
     "cancel_residual_rule",
+    "byte_clear_rules",
+    "byte_route_rules",
+    "carry_relay_rules",
     "lookup_table_rules",
     "efficient_exp_attention",
     "memory_load_attention",

@@ -29,7 +29,10 @@ from c4_release.neural_vm.unified_compiler.building_blocks_dsl import (
     attention_head_extension,
     band_range_check_rules,
     binary_address_lookup_attention,
+    byte_clear_rules,
+    byte_route_rules,
     cancel_residual_rule,
+    carry_relay_rules,
     efficient_exp_attention,
     fetch_byte_attention,
     lookup_table_rules,
@@ -1439,3 +1442,266 @@ def test_v21_primitive_plus_extension_byte_identical_to_full_imperative_l15_head
     assert torch.equal(attn_spec.W_o.data, attn_imp.W_o.data), (
         "W_o differs at full L15 head-0 surface"
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-nibble byte-band factories (reduction map ⑥ — cross-layer dedup)
+#
+# These three factories collapse the byte-clear / byte-route / carry-relay
+# 16-cell loops re-authored per layer (l6/l9/l14/...). The dedup contract
+# is that each factory emits the EXACT rule tuple the hand-authored
+# ``multi_way_and_rule`` loop produced, so porting a call site is
+# byte-identical. Each test reconstructs the pre-refactor inline loop and
+# asserts field-for-field equality of the resulting ``FFNRule`` tuple.
+# ---------------------------------------------------------------------------
+
+
+def _rule_key(rule: FFNRule):
+    """Canonical, order-preserving comparison key for one FFNRule."""
+    return (
+        rule.name,
+        tuple((str(t.dim), t.weight) for t in rule.conditions),
+        rule.threshold,
+        None if rule.gate is None else str(rule.gate),
+        rule.gate_weight,
+        rule.gate_bias,
+        tuple((str(t.dim), t.weight) for t in rule.gate_terms),
+        tuple((str(w.dim), w.weight) for w in rule.writes),
+        rule.scope,
+        tuple(sorted(rule.dominates_at.items())) if rule.dominates_at else None,
+    )
+
+
+def _assert_rules_equal(factory_rules, hand_rules):
+    fk = [_rule_key(r) for r in factory_rules]
+    hk = [_rule_key(r) for r in hand_rules]
+    assert len(fk) == len(hk), f"length mismatch {len(fk)} vs {len(hk)}"
+    for i, (a, b) in enumerate(zip(fk, hk)):
+        assert a == b, f"rule {i} differs:\n  factory={a!r}\n  hand   ={b!r}"
+
+
+def test_byte_clear_rules_matches_hand_authored_loop():
+    """``byte_clear_rules`` reproduces the l9 ALU-clear 16-cell loop."""
+    S = 100.0
+    conds = (
+        ("MARK_AX", 1.0),
+        ("OP_IMM", 1.0),
+        ("MARK_PC", -1e6),
+    )
+    factory = byte_clear_rules(
+        bands=("ALU_LO", "ALU_HI"),
+        conditions=conds,
+        threshold=1.5,
+        write_value=-10.0,
+        S=S,
+        name_by_band={"ALU_LO": "alu_lo_clear", "ALU_HI": "alu_hi_clear"},
+    )
+    hand = []
+    for band, prefix in (("ALU_LO", "alu_lo_clear"), ("ALU_HI", "alu_hi_clear")):
+        for k in range(16):
+            hand.append(multi_way_and_rule(
+                name=f"{prefix}_{k}",
+                conditions=conds,
+                threshold=1.5,
+                writes=((f"{band}+{k}", -10.0 / S),),
+            ))
+    assert len(factory) == 32
+    _assert_rules_equal(factory, hand)
+
+
+def test_byte_clear_rules_raw_write_and_gate():
+    """``byte_clear_rules`` supports a raw (un-S-scaled) gated scrub."""
+    S = 100.0
+    factory = byte_clear_rules(
+        bands=("OUTPUT_LO",),
+        conditions=(("NEXT_PC", 100.0 / S),),
+        threshold=80.0 / S,
+        write_value=-1.0,
+        write_scale_by_S=False,
+        gate="NEXT_PC",
+        gate_weight=5.0,
+        gate_bias=-3.0,
+        name_prefix="scrub",
+    )
+    hand = [
+        multi_way_and_rule(
+            name=f"scrub_{k}",
+            conditions=(("NEXT_PC", 100.0 / S),),
+            threshold=80.0 / S,
+            gate="NEXT_PC",
+            gate_weight=5.0,
+            gate_bias=-3.0,
+            writes=((f"OUTPUT_LO+{k}", -1.0),),
+        )
+        for k in range(16)
+    ]
+    assert len(factory) == 16
+    _assert_rules_equal(factory, hand)
+
+
+def test_byte_route_rules_matches_hand_authored_loop():
+    """``byte_route_rules`` reproduces the l6 AX_CARRY->OUTPUT route loop."""
+    S = 100.0
+    conds = (("OP_EXIT", 1.0), ("MARK_AX", 1.0), ("MARK_PC", -8.0))
+    factory = byte_route_rules(
+        band_specs=(
+            ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+            ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conds,
+        threshold=4.0,
+        write_value=2.0,
+        S=S,
+        name_prefix="route",
+    )
+    hand = []
+    for band, src, out in (
+        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            hand.append(multi_way_and_rule(
+                name=f"route_{band}_{k}",
+                conditions=conds,
+                threshold=4.0,
+                gate=f"{src}+{k}",
+                writes=((f"{out}+{k}", 2.0 / S),),
+            ))
+    assert len(factory) == 32
+    _assert_rules_equal(factory, hand)
+
+
+def test_byte_route_rules_per_band_scope_and_dominates():
+    """Per-band scope / dominates_at extras are threaded correctly."""
+    S = 100.0
+    conds = (("OP_IMM", 1.0), ("MARK_AX", 1.0))
+    hi_scope = "mark == AX AND opcode_at_AX == IMM"
+    factory = byte_route_rules(
+        band_specs=(
+            ("lo", "FETCH_LO", "OUTPUT_LO"),
+            ("hi", "FETCH_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conds,
+        threshold=4.0,
+        write_value=2.0,
+        S=S,
+        name_prefix="fetch",
+        scope_by_band={"hi": hi_scope},
+        dominates_at_by_band={"hi": {"OUTPUT_HI_THIS_STEP": hi_scope}},
+    )
+    # LO band: no scope. HI band: scope + dominates_at set.
+    lo_rules = factory[:16]
+    hi_rules = factory[16:]
+    assert all(r.scope is None for r in lo_rules)
+    assert all(r.dominates_at is None for r in lo_rules)
+    assert all(r.scope == hi_scope for r in hi_rules)
+    assert all(
+        r.dominates_at == {"OUTPUT_HI_THIS_STEP": hi_scope} for r in hi_rules
+    )
+
+
+def test_carry_relay_rules_matches_hand_authored_loop():
+    """``carry_relay_rules`` reproduces the l6 stack-writeback loop."""
+    S = 100.0
+    conds = (("OP_ADJ", 1.0), ("MARK_SP", 1.0), ("IS_BYTE", -1e6))
+    factory = carry_relay_rules(
+        band_specs=(
+            ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
+            ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conds,
+        threshold=1.5,
+        write_value=2.0,
+        S=S,
+        name_prefix="wb",
+    )
+    hand = []
+    for band, eb, cb, out in (
+        ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            hand.append(multi_way_and_rule(
+                name=f"wb_{band}_{k}",
+                conditions=conds,
+                threshold=1.5,
+                gate_terms=(
+                    (f"{eb}+{k}", -1.0),
+                    (f"{cb}+{k}", 1.0),
+                ),
+                writes=((f"{out}+{k}", 2.0 / S),),
+            ))
+    assert len(factory) == 32
+    _assert_rules_equal(factory, hand)
+
+
+def test_byte_band_factories_reject_inverted_range():
+    with pytest.raises(ValueError):
+        byte_clear_rules(bands=("A",), conditions=(("X", 1.0),),
+                         threshold=0.5, write_value=-1.0, lo=5, hi=2)
+    with pytest.raises(ValueError):
+        byte_route_rules(band_specs=(("lo", "S", "D"),),
+                         conditions=(("X", 1.0),), threshold=0.5, lo=5, hi=2)
+    with pytest.raises(ValueError):
+        carry_relay_rules(band_specs=(("lo", "E", "C", "D"),),
+                          conditions=(("X", 1.0),), threshold=0.5, lo=5, hi=2)
+
+
+def test_byte_band_factories_ported_call_sites_are_byte_identical():
+    """The live l6/l9 ported helpers still emit the original rule tuples.
+
+    This pins the reduction-map ⑥ dedup: the two piloted layers (l6, l9)
+    delegate to the factories, and their output must equal the
+    pre-refactor inline loops field-for-field.
+    """
+    from c4_release.neural_vm.unified_compiler.ops import l6_ops, l9_ops
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import _NON_ALU_OPCODES
+
+    S = 100.0
+
+    # l9 _alu_clear_rules
+    cc = [("MARK_AX", 1.0)] + [(d, 1.0) for d in _NON_ALU_OPCODES]
+    cc = tuple(cc) + (
+        ("MARK_PC", -1e6), ("MARK_SP", -1e6), ("MARK_BP", -1e6),
+        ("MARK_STACK0", -1e6), ("MARK_MEM", -1e6),
+    )
+    hand = []
+    for k in range(16):
+        hand.append(multi_way_and_rule(
+            name=f"alu_lo_clear_{k}", conditions=cc, threshold=1.5,
+            writes=((f"ALU_LO+{k}", -10.0 / S),)))
+    for k in range(16):
+        hand.append(multi_way_and_rule(
+            name=f"alu_hi_clear_{k}", conditions=cc, threshold=1.5,
+            writes=((f"ALU_HI+{k}", -10.0 / S),)))
+    _assert_rules_equal(l9_ops._alu_clear_rules(S), hand)
+
+    # l6 _layer6_exit_ax_route_rules (byte-route)
+    conds = (("OP_EXIT", 1.0), ("OP_IMM", -20.0), ("MARK_AX", 1.0),
+             ("MARK_PC", -8.0), ("IS_BYTE", -1.0))
+    hand = []
+    for band, src, out in (("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+                           ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP")):
+        for k in range(16):
+            hand.append(multi_way_and_rule(
+                name=f"l6_exit_ax_to_output_{band}_{k}", conditions=conds,
+                threshold=4.0, gate=f"{src}+{k}",
+                writes=((f"{out}+{k}", 2.0 / S),)))
+    _assert_rules_equal(l6_ops._layer6_exit_ax_route_rules(S), hand)
+
+    # l6 _layer6_adj_sp_writeback_rules (carry-relay)
+    conds = (("OP_ADJ", 1.0), ("MARK_SP", 1.0), ("IS_BYTE", -1e6),
+             ("MARK_PC", -1e6), ("MARK_AX", -1e6), ("MARK_BP", -1e6),
+             ("MARK_STACK0", -1e6), ("MARK_MEM", -1e6))
+    hand = []
+    for band, eb, cb, out in (
+        ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
+        ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+    ):
+        for k in range(16):
+            hand.append(multi_way_and_rule(
+                name=f"l6_adj_sp_writeback_{band}_{k}", conditions=conds,
+                threshold=1.5,
+                gate_terms=((f"{eb}+{k}", -1.0), (f"{cb}+{k}", 1.0)),
+                writes=((f"{out}+{k}", 2.0 / S),)))
+    _assert_rules_equal(l6_ops._layer6_adj_sp_writeback_rules(S), hand)

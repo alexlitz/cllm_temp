@@ -7,7 +7,9 @@ from ...constants import INSTR_WIDTH, PC_OFFSET
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
+    byte_route_rules,
     cancel_residual_rule,
+    carry_relay_rules,
     multi_way_and_rule,
 )
 from ..layer_compiler import Operation
@@ -553,7 +555,6 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
 
     # N-way AND on opcode/marker conditions, gated by the FETCH band cell,
     # routes the immediate fetch into OUTPUT at AX marker rows.
-    rules = []
     conditions = (
         ("OP_IMM", 1.0),
         ("OP_EXIT", -20.0),
@@ -562,7 +563,6 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_PC", -8.0),
         ("IS_BYTE", -10.0),
     )
-    write_scale = 2.0 / S
     # Predicate-DSL scope for the 16 HI rules. The rule fires at the
     # AX-marker row during OP_IMM, routing the FETCH_HI+k one-hot into
     # OUTPUT_HI_THIS_STEP+k. ``mark == AX AND opcode_at_AX == IMM`` is
@@ -575,27 +575,25 @@ def _layer6_imm_fetch_route_rules(S: float) -> tuple[FFNRule, ...]:
     # band intentionally left unannotated for now — only the HI band is
     # implicated by the L6 EQ(17)/EQ(42) failure mode per
     # docs/L6_EQ_VERIFIER_BLIND_2026_06_04.md.)
+    #
+    # Reduction map ⑥: delegate the per-cell BYTE-ROUTE loop to
+    # ``byte_route_rules``; the per-band scope/dominates_at extras are
+    # threaded via ``scope_by_band`` / ``dominates_at_by_band`` on the HI
+    # band. Byte-identical.
     hi_scope = "mark == AX AND opcode_at_AX == IMM"
-    for band, source_base, output_base in (
-        ("lo", "FETCH_LO", "OUTPUT_LO"),
-        ("hi", "FETCH_HI", "OUTPUT_HI_THIS_STEP"),
-    ):
-        for k in range(16):
-            extra_kwargs = {}
-            if band == "hi":
-                extra_kwargs["scope"] = hi_scope
-                extra_kwargs["dominates_at"] = {
-                    "OUTPUT_HI_THIS_STEP": hi_scope,
-                }
-            rules.append(multi_way_and_rule(
-                name=f"l6_imm_fetch_to_output_{band}_{k}",
-                conditions=conditions,
-                threshold=4.0,
-                gate=f"{source_base}+{k}",
-                writes=((f"{output_base}+{k}", write_scale),),
-                **extra_kwargs,
-            ))
-    return tuple(rules)
+    return byte_route_rules(
+        band_specs=(
+            ("lo", "FETCH_LO", "OUTPUT_LO"),
+            ("hi", "FETCH_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conditions,
+        threshold=4.0,
+        write_value=2.0,
+        S=S,
+        name_prefix="l6_imm_fetch_to_output",
+        scope_by_band={"hi": hi_scope},
+        dominates_at_by_band={"hi": {"OUTPUT_HI_THIS_STEP": hi_scope}},
+    )
 
 
 def _layer6_imm_carry_refresh_rules(S: float) -> tuple[FFNRule, ...]:
@@ -1957,24 +1955,21 @@ def _layer6_stack_writeback_rules(
     # N-way AND on marker conditions, gated by (AX_CARRY - EMBED) for each
     # nibble lane — emits OUTPUT = stack-writeback when the AND fires and
     # the relayed AX_CARRY differs from the EMBED residual.
-    rules = []
-    write_scale = 2.0 / S
-    for band, embed_base, carry_base, output_base in (
-        ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
-        ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
-    ):
-        for k in range(16):
-            rules.append(multi_way_and_rule(
-                name=f"{name_prefix}_{band}_{k}",
-                conditions=conditions,
-                threshold=threshold,
-                gate_terms=(
-                    (f"{embed_base}+{k}", -1.0),
-                    (f"{carry_base}+{k}", 1.0),
-                ),
-                writes=((f"{output_base}+{k}", write_scale),),
-            ))
-    return tuple(rules)
+    #
+    # Reduction map ⑥: this per-cell CARRY-RELAY loop is the shared
+    # cross-layer primitive; delegate to ``carry_relay_rules``.
+    # Byte-identical.
+    return carry_relay_rules(
+        band_specs=(
+            ("lo", "EMBED_LO", "AX_CARRY_LO", "OUTPUT_LO"),
+            ("hi", "EMBED_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conditions,
+        threshold=threshold,
+        write_value=2.0,
+        S=S,
+        name_prefix=name_prefix,
+    )
 
 
 def _layer6_ax_output_route_rules(
@@ -1986,21 +1981,21 @@ def _layer6_ax_output_route_rules(
 ) -> tuple[FFNRule, ...]:
     # Each rule is an N-way AND across opcode/marker conditions, gated by
     # the AX_CARRY band cell, routing the AX_CARRY value into OUTPUT.
-    rules = []
-    write_scale = 2.0 / S
-    for band, source_base, output_base in (
-        ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
-        ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
-    ):
-        for k in range(16):
-            rules.append(multi_way_and_rule(
-                name=f"{name_prefix}_{band}_{k}",
-                conditions=conditions,
-                threshold=threshold,
-                gate=f"{source_base}+{k}",
-                writes=((f"{output_base}+{k}", write_scale),),
-            ))
-    return tuple(rules)
+    #
+    # Reduction map ⑥: this per-cell BYTE-ROUTE loop is the shared
+    # cross-layer primitive; delegate to ``byte_route_rules`` so the
+    # lo/hi AX_CARRY -> OUTPUT structure lives in one place. Byte-identical.
+    return byte_route_rules(
+        band_specs=(
+            ("lo", "AX_CARRY_LO", "OUTPUT_LO"),
+            ("hi", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
+        ),
+        conditions=conditions,
+        threshold=threshold,
+        write_value=2.0,
+        S=S,
+        name_prefix=name_prefix,
+    )
 
 
 def _lower_layer6_ffn_rules(
