@@ -146,6 +146,20 @@ Run these BEFORE committing any new op or rule change:
   moves ~93% of dims off of — the documented false-"dead-signal" trap). The
   lint flags static-registry `.start` / `.resolve_dim()` / `.slots[...]`
   positional reads; opt out per-line with `# dim-resolution-lint: allow`.
+- **`tools/lint_semantic_dim_ref.py` — Phase 7.E authoring ratchet (companion
+  to `lint_dim_resolution.py`).** Flags a RAW role-meaningful base-slot NAME
+  in ops `FFNRule` authoring (a `(NAME, weight)` condition / gate / write
+  tuple whose NAME is one of the 78 category-registered slots — markers,
+  `byte_index`, `output_lo/hi`, `alu_*`, `ax_carry_*`, `cmp_flag`, memory
+  families, `opcode_flag`, tagged STACK0 bands) instead of authoring it via
+  `dim_registry.dim_ref(category, role, offset)`. `reads=`/`writes=` metadata
+  SETs, `dp["NAME"]` attention resolvers, and unbound/non-family flags
+  (`PSH_AT_SP`, `IS_BYTE`, `H1+i`, `EMBED_LO+k`, `OUTPUT_HI_THIS_STEP+k`) are
+  NOT flagged. WARNs + prints the current-offender count by default (baseline
+  **1883** across 26 ops files at golden `b4d2ab27`; l0-l16's FFN authoring
+  is ported → 0). `--max N` / `--strict` FAIL when the count grows (CI
+  ratchet); per-line opt-out `# sem-dim-ref-lint: allow`; `--demo` proves it
+  discriminates a raw ref from a `dim_ref` one.
 - `compare_symbolic_to_lowered_ffn(ir, dim_positions, S=100.0)` /
   `compare_symbolic_to_lowered_attn(...)` /
   `compare_symbolic_to_lowered_embedding(...)` — byte-identity gate.
