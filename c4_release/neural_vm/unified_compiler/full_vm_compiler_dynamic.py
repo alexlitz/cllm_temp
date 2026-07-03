@@ -77,7 +77,7 @@ from .layer_compiler import (
 from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
 from .ir import ModelArchitectureSpec
 from . import _legacy_redirect as _static
-from .ops.shared import operand_from_memsp_enabled
+from .ops.shared import operand_from_memsp_enabled, campaign_enabled
 from ..kv_eviction import KVEvictionPolicy
 
 
@@ -2532,6 +2532,15 @@ def compile_full_vm_dynamic(
                 operand_from_memsp_enabled()
                 and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
             ),
+            # Single CAMPAIGN-CONFIG entry point (DEFAULT-OFF; opt in with =1):
+            # ``C4_CAMPAIGN=1`` OR-ins the ON floor for the coherent 30-token
+            # campaign set (no_stack0_emit + operand_from_memsp + si_store_addr +
+            # operand_cam_fix — see ops.shared.campaign_enabled). Turning it on
+            # STRUCTURALLY changes the build (drops the STACK0 emission band,
+            # installs the SI-store CAM head, widens the operand-CAM clear), so
+            # the ON / OFF builds MUST NEVER share a memo / disk entry. DEFAULT-OFF
+            # -> golden (35-tok) build is byte-identical (key unchanged when unset).
+            "C4_CAMPAIGN": campaign_enabled(),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -3336,6 +3345,14 @@ def _bake_from_scheduled_ops(
             operand_from_memsp_enabled()
             and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
         ),
+        # Single CAMPAIGN-CONFIG entry point (DEFAULT-OFF; opt in with =1):
+        # ``C4_CAMPAIGN=1`` OR-ins the ON floor for the coherent 30-token
+        # campaign set (no_stack0_emit + operand_from_memsp + si_store_addr +
+        # operand_cam_fix — see ops.shared.campaign_enabled). Turning it on
+        # STRUCTURALLY changes the build, so the ON / OFF builds MUST NEVER
+        # share a serialised entry. DEFAULT-OFF -> golden (35-tok) build is
+        # byte-identical (key unchanged when unset).
+        "C4_CAMPAIGN": campaign_enabled(),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
         # baseline (or with a different requested band set).
