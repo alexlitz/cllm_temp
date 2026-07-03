@@ -7950,26 +7950,6 @@ def _set_layer16_lev_routing(ffn, S, BD):
 # =============================================================================
 
 
-def _set_conversational_io_state_init(ffn, S, BD):
-    """L3 FFN addition: Initialize output mode when LAST_WAS_THINKING_END detected.
-
-    When previous token was THINKING_END:
-    - Set IO_IN_OUTPUT_MODE = 1 (enter output mode)
-    - Initialize IO_FORMAT_POS = 0 (start at beginning of format string)
-
-    This prepares the model to start emitting output bytes from the format string.
-
-    Starts at unit 1034 to avoid overlap with _set_layer6_routing_ffn (units 0-1033).
-    """
-    unit = 1034
-
-    # Detect LAST_WAS_THINKING_END and activate output mode
-    ffn.W_up[unit, BD.LAST_WAS_THINKING_END] = S
-    ffn.b_up[unit] = -S * 0.5  # threshold: LAST_WAS_THINKING_END ≈ 1.0
-    ffn.b_gate[unit] = 1.0
-    ffn.W_down[BD.IO_IN_OUTPUT_MODE, unit] = 2.0 / S  # set flag
-    unit += 1
-
     # Initialize format position to 0 (nibble encoding: all nibbles zero except set [0]=1)
     # Actually, we want FORMAT_POS to START at 0, which means all nibbles are 0.
     # The position will be incremented AFTER fetching each byte.
