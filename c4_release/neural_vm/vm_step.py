@@ -3011,7 +3011,6 @@ from .setup_helpers import (
     _set_layer11_mul_partial,
     _set_layer12_mul_combine,
     _set_layer13_mem_addr_gather,
-    _set_layer13_shifts,
     _set_layer14_jsr_mem_default_suppress,
     _set_layer14_mem_addr_src_default_suppress,
     _set_layer1_ffn,
