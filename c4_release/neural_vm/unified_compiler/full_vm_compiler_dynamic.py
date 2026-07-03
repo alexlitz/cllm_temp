@@ -2303,12 +2303,6 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
                 and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             ),
-            # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1,
-            # output-affecting on the BP-byte1 OUTPUT crush): the ON / OFF
-            # builds must never share a memo entry.
-            "C4_BP_SAVE_DUMP_MARKER_REQ": (
-                os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
-            ),
             # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
             # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit):
             # the ON / OFF builds bake the byte_39_from_e8_addr rule with
@@ -3089,13 +3083,6 @@ def _bake_from_scheduled_ops(
         "C4_TAIL_LEA_E8_ENT_GUARD": (
             os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
             and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-        ),
-        # BP-save dump MARK_MEM-required gate (DEFAULT-OFF, opt in =1, output-
-        # affecting on the BP-byte1 OUTPUT crush): the ON / OFF builds must never
-        # share a serialised entry. See l11_ops.py
-        # ``_bp_save_dump_marker_req_enabled``.
-        "C4_BP_SAVE_DUMP_MARKER_REQ": (
-            os.environ.get("C4_BP_SAVE_DUMP_MARKER_REQ", "0") != "0"
         ),
         # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
         # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit): the
