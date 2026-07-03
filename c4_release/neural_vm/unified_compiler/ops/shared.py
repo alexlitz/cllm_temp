@@ -1687,81 +1687,6 @@ def store_ax_b0_override_enabled() -> bool:
     )
 
 
-def func_lea_b0_restore_enabled() -> bool:
-    """Return True iff the func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE
-    (Bug #2) is active. DEFAULT **OFF** (opt-in via ``C4_FUNC_LEA_B0_RESTORE=1``);
-    gated behind ``operand_from_memsp`` so the flag-OFF / non-campaign build is
-    byte-identical to golden ``cd54bfc0`` (the band + both ops are omitted).
-
-    *** DEFAULT-OFF: this building block FLIPS func_add (575) full_trace ON but
-    is ZERO-SUM vs the func_identity HOLD gate (550) — see WHY below. It is
-    committed as a working, byte-identity-safe building block (the
-    capture/restore machinery + the GPU localization) for the eventual upstream
-    fix, NOT enabled in the campaign default. ***
-
-    ROOT (measured spec_k=0, BUILT dim_positions, campaign config; GPU
-    block-trace ``tools/_probe_lea_addr_trace.py``): with the L7 head-1 re-read
-    re-sharpen (``func_lea_reread_bp_resharpen_enabled``, Bug #1) the func_add
-    re-read LEA (step 11 ``LEA 16`` for &b) computes its address byte-0 to
-    ``OUTPUT_LO`` LO-nibble cell **0** (0xE0, CORRECT) through physical block 41,
-    and a ``PureFFN`` in the L21 post-op chain (physical **block 42**) then
-    stamps LO-nibble cell **8** (+4.13e9 → 0xE8, WRONG). This op CAPTUREs the
-    pre-slam byte-0 LO one-hot into a private band at an early block and RESTOREs
-    it at the L25 tail via a winner-take-all that dominates the slam, flipping
-    func_add 575 step 11 → PASS (GPU-verified, ``run_1096_canonical --ids 575
-    --spec-k 0 --criterion full_trace`` 1/1).
-
-    WHY IT IS ZERO-SUM (the blueprint was incomplete): the block-42 stamp is NOT
-    a pure cross-step corruptor — it is a LOAD-BEARING byte-0 default that is
-    CORRECT for some LEAs and WRONG for others, and the two cases are NOT locally
-    separable. Measured (Bug-#1-only build, probe at block 20):
-
-      * func_add &a (FIRST LEA, step 8):  pre-slam cell-8 (0xE8) CORRECT, stamp 8 → no-op.
-      * func_add &b (RE-READ LEA, step 11): pre-slam cell-0 (0xE0) CORRECT, stamp 8 → WRONG.
-      * func_identity LEA (step 6):         pre-slam cell-0 (0xE0) **WRONG**, stamp 8 → 0xE8 CORRECT.
-
-    So func_identity RELIES on the block-42 stamp (its genuine pre-slam LEA
-    byte-0 is itself wrong = cell-0); func_add &b is BROKEN by it. At the LEA AX
-    row func_add's re-read LEA (row 491) and func_identity's LEA (row 293) are
-    BIT-IDENTICAL in every probed dim (only ``OP_LEA=5`` + ``MARK_AX=1``; the
-    desired addresses 0xFFE0 vs 0xFFE8 differ ONLY in the byte-0 LO nibble, with
-    identical byte-1/high-nibble), so NO local discriminator separates them.
-    Capturing+restoring the pre-slam value therefore FLIPS func_add (575→pass)
-    but REGRESSES func_identity (550 step 6 0xE8→0xE0). The TRUE fix is upstream
-    where the BP-frame LEA byte-0 is actually computed (so func_identity computes
-    0xE8 genuinely and the block-42 default is no longer load-bearing) — a deeper
-    build than a tail capture/restore. Full localization +
-    blueprint: ``docs/FUNC_LEA_BUG2_BLK42_ZEROSUM_2026_06_25.md``.
-
-    THE MACHINERY (two PureFFN ops, the SILI / ENT-AXCARRY precedent):
-
-      1. CAPTURE (``make_func_lea_b0_capture_op``): a PureFFN post_op on the
-         ``_layer13_mem_addr_anchor`` host, BEFORE the block-42 slam. 16 units AND
-         the LEA row discriminator (``MARK_AX + OP_LEA`` minus
-         ``OP_IMM``/``MEM_STORE``/non-AX marker rows) with ``OUTPUT_LO[k]`` at a
-         threshold BETWEEN the argmax (809.6) and runner-up (609.6) LO cells, so
-         the captured ``LEA_REREAD_B0`` band is a CLEAN one-hot at the address
-         nibble cell.
-
-      2. RESTORE (``make_func_lea_b0_restore_op``): a PureFFN post_op on the L25
-         tail AFTER ``tail_bit32_result_correction``. 16 winner-take-all units,
-         each gated by the clean one-hot band cell ``LEA_REREAD_B0+k`` and writing
-         ``+DOM`` at ``OUTPUT_LO+k`` and ``-DOM`` elsewhere (``DOM=50`` so
-         ``DOM * silu * band`` dominates the +4.13e9 slam). Exactly ONE cell rule
-         fires per captured LEA row (clean band), and the band is EMPTY on every
-         non-captured row → no-op there.
-
-    Self-gating: the band is EMPTY (all 0) on every non-captured row.
-    ``lint_cross_op_ffn`` gates the shared OUTPUT band at OTHER-op probe rows.
-    DEFAULT OFF; flag OFF (or off-campaign) omits the band + both ops (golden
-    ``cd54bfc0`` byte-identical).
-    """
-    return (
-        operand_from_memsp_enabled()
-        and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
-    )
-
-
 def loop_lea_b0_e8_restore_enabled() -> bool:
     """Return True iff the loop_sum in-loop ``LEA &i`` byte-0 0xE8 RESTORE
     (``C4_LOOP_LEA_B0_E8``) is active.
@@ -1800,7 +1725,7 @@ def loop_lea_b0_e8_restore_enabled() -> bool:
     multi-local 2nd local (``FETCH_LO+0``, want 0xE0) and 3rd local
     (``FETCH_HI+14``, want 0xD8).
 
-    FIX (mirrors the ``C4_FUNC_LEA_B0_RESTORE`` / ``_l10_ent_axcarry`` precedent):
+    FIX (mirrors the ``C4_SILI_B1_RESTORE`` / ``_l10_ent_axcarry`` precedent):
     a flag-gated ``PureFFN`` post_op on the L25 tail block, appended AFTER
     ``l10_ent_axcarry`` (so it is the LAST OUTPUT writer at this row and DOMINATES
     the slam), that — gated on the in-loop ``LEA &i`` discriminator (genuine

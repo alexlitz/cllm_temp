@@ -2348,17 +2348,6 @@ def compile_full_vm_dynamic(
             "C4_STORE_AX_B0_OVERRIDE": (
                 os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
             ),
-            # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2,
-            # DEFAULT-OFF building block, opt in =1, BAKE-affecting): registers
-            # the LEA_REREAD_B0 band + the capture / restore PureFFN ops, so the
-            # ON / OFF builds STRUCTURALLY differ (different d_model + extra FFN
-            # units) and must never share a memo entry. Gated on
-            # ``operand_from_memsp_enabled()``. ZERO-SUM vs the func_identity HOLD
-            # gate, so default-OFF. See shared.func_lea_b0_restore_enabled.
-            "C4_FUNC_LEA_B0_RESTORE": (
-                operand_from_memsp_enabled()
-                and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
-            ),
             # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
             # campaign-ON, opt out =0, BAKE-affecting): registers the
             # l10_loop_lea_b0_e0 PureFFN post_op so the ON / OFF builds
@@ -3145,17 +3134,6 @@ def _bake_from_scheduled_ops(
         # shared.store_ax_b0_override_enabled.
         "C4_STORE_AX_B0_OVERRIDE": (
             os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
-        ),
-        # func re-read-LEA byte-0 LO-nibble CAPTURE+RESTORE (Bug #2, DEFAULT-OFF
-        # building block, opt in =1, BAKE-affecting): registers the LEA_REREAD_B0
-        # band + the capture / restore PureFFN ops so ON / OFF builds STRUCTURALLY
-        # differ (d_model + extra FFN units) and must never share a serialised
-        # entry. Gated on ``operand_from_memsp_enabled()``. ZERO-SUM vs the
-        # func_identity HOLD gate, so default-OFF. See
-        # shared.func_lea_b0_restore_enabled.
-        "C4_FUNC_LEA_B0_RESTORE": (
-            operand_from_memsp_enabled()
-            and os.environ.get("C4_FUNC_LEA_B0_RESTORE", "0") != "0"
         ),
         # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
         # campaign-ON, opt out =0, BAKE-affecting): registers the
