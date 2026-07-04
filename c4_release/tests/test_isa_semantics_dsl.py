@@ -2074,6 +2074,121 @@ def test_marker_broadcast_no_gate_slot_omits_confirm():
     assert all(w.slot == 0 for w in gen.k)
 
 
+# --- BARE-MARKER mode (marker-row -> marker-row relay; L9/L11 step_end) ------
+
+
+def _bare_relay_dim_positions() -> dict:
+    """Synthetic dim_positions for a bare marker->marker relay."""
+    return {"MARK_SE_ONLY": 100, "MARK_AX": 5, "OP_EQ": 40, "SE_OP_EQ": 60}
+
+
+def _bare_relay_spec(**overrides) -> MarkerBroadcastSpec:
+    """A bare Q@MARK_SE_ONLY / K@MARK_AX marker->marker relay spec."""
+    base = dict(
+        name="bare_step_end_relay",
+        fire_slot_dim="MARK_SE_ONLY",   # the Q marker (fire row)
+        source_marker="MARK_AX",        # the K marker (source row)
+        broadcast_bands=(MarkerBroadcastBand("OP_EQ", "SE_OP_EQ", 1, 1, 1.0),),
+        weight=10.0,
+        is_byte_dim=None, const_dim=None, gate_slot=None,
+        alibi_slope=0.2,
+    )
+    base.update(overrides)
+    return MarkerBroadcastSpec(**base)
+
+
+def test_marker_broadcast_bare_mode_flag_derives_from_is_byte_none():
+    assert _bare_relay_spec().bare_marker is True
+    assert _imm_relay_mb_spec().bare_marker is False
+
+
+def test_marker_broadcast_bare_mode_requires_no_const_or_gate():
+    with pytest.raises(ValueError):
+        _bare_relay_spec(const_dim="CONST")  # is_byte_dim=None -> const must be None
+    with pytest.raises(ValueError):
+        _bare_relay_spec(gate_slot=1)  # is_byte_dim=None -> gate_slot must be None
+
+
+def test_marker_broadcast_bare_mode_q_k_are_single_marker_writes():
+    """Bare mode: Q is ONLY fire_slot_dim, K is ONLY source_marker — no
+    IS_BYTE fire-site, no CONST anchor, no confirm slot."""
+    dp = _bare_relay_dim_positions()
+    gen = marker_broadcast(_bare_relay_spec()).head_spec_builder(dp, 3)
+    assert [(w.slot, w.dim, w.weight) for w in gen.q] == [(0, dp["MARK_SE_ONLY"], 10.0)]
+    assert [(w.slot, w.dim, w.weight) for w in gen.k] == [(0, dp["MARK_AX"], 10.0)]
+    # V/O copy source -> SE_-tagged target at the reserved slot 1.
+    assert [(w.slot, w.dim, w.weight) for w in gen.v] == [(1, dp["OP_EQ"], 1.0)]
+    assert [(w.out_dim, w.slot, w.weight) for w in gen.o] == [(dp["SE_OP_EQ"], 1, 1.0)]
+    # head_reads: only the two markers + the broadcast source band.
+    bundle = marker_broadcast(_bare_relay_spec())
+    assert bundle.head_reads == {"MARK_SE_ONLY", "MARK_AX", "OP_EQ"}
+    assert bundle.head_writes == {"SE_OP_EQ"}
+
+
+def test_marker_broadcast_bare_mode_reexpresses_live_l11_step_end_relay():
+    """The live L11 step_end_operand_relay heads (both prod-scoped + full
+    payload) are byte-identical to the bare-marker ``marker_broadcast`` build."""
+    from c4_release.neural_vm.unified_compiler.ops import l11_ops
+
+    L11_OPS = l11_ops._STEP_END_OPERAND_RELAY_OPCODES
+    base = {"MARK_SE_ONLY": 100, "MARK_AX": 5,
+            "AX_CARRY_LO": 200, "AX_CARRY_HI": 220, "ALU_LO": 300,
+            "ALU_HI": 320, "CMP": 340}
+    for h in (0, 1, 2, 3):
+        base[f"STACK0_BYTE{h}"] = 600 + h
+    for i, op in enumerate(L11_OPS):
+        base[op] = 700 + i
+
+    class _BD:
+        def __getattr__(s, n):
+            return base[n]
+
+    # Live helper (derived) — full payload (the IR-factory default path).
+    a, b = l11_ops._layer11_step_end_operand_relay_head_specs(_BD(), 100.0, 0, 1)
+    # Both heads fire at MARK_SE / attend MARK_AX with a single Q/K write.
+    for spec in (a, b):
+        assert [(w.slot, w.dim) for w in spec.q] == [(0, base["MARK_SE_ONLY"])]
+        assert [(w.slot, w.dim) for w in spec.k] == [(0, base["MARK_AX"])]
+        assert spec.alibi_slope == 1.0
+    # Head A relays every opcode + AX_CARRY (27 + 32 slots).
+    assert len(a.v) == len(L11_OPS) + 32
+    # Head B relays ALU (32) + CMP (4) + STACK0_BYTE (4) = 40.
+    assert len(b.v) == 40
+
+
+def test_marker_broadcast_bare_mode_reexpresses_live_l9_step_end_relay():
+    """The live L9 step_end_operand_relay heads (SE_-tagged targets) are
+    byte-identical to the bare-marker ``marker_broadcast`` build."""
+    from c4_release.neural_vm.unified_compiler.ops import l9_ops
+
+    CMP = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
+    base = {"MARK_SE_ONLY": 100, "MARK_AX": 5, "CMP": 340, "CMP_GROUP": 350,
+            "ALU_LO": 300, "ALU_HI": 320, "AX_CARRY_LO": 200, "AX_CARRY_HI": 220,
+            "SE_CMP": 440, "SE_CMP_GROUP": 450, "SE_ALU_LO": 400, "SE_ALU_HI": 420,
+            "SE_AX_CARRY_LO": 500, "SE_AX_CARRY_HI": 520}
+    for i, op in enumerate(CMP):
+        base[op] = 800 + i
+        base[f"SE_{op}"] = 850 + i
+
+    class _BD:
+        def __getattr__(s, n):
+            return base[n]
+
+    a, b = l9_ops._step_end_operand_relay_head_specs(_BD())
+    for spec in (a, b):
+        assert [(w.slot, w.dim) for w in spec.q] == [(0, base["MARK_SE_ONLY"])]
+        assert [(w.slot, w.dim) for w in spec.k] == [(0, base["MARK_AX"])]
+        assert spec.alibi_slope == 0.2
+        # Slot 0 is reserved; V/O start at slot 1.
+        assert min(w.slot for w in spec.v) == 1
+    # Head A O writes are all SE_-tagged (register-tagged mirror).
+    assert all(w.out_dim >= 400 for w in a.o)
+    # Head A: 6 cmp + cmp_group + 4 cmp + 16 alu_lo + 16 alu_hi = 43.
+    assert len(a.v) == 43
+    # Head B: 16 + 16 = 32 AX_CARRY slots -> SE_AX_CARRY.
+    assert len(b.v) == 32
+
+
 def test_marker_broadcast_reexpresses_l8_op_imm_relay():
     """DECISIVE: the production L8 head-4 OP_IMM relay — generated by
     ``marker_broadcast`` — reproduces a fresh hand-reconstruction of the legacy

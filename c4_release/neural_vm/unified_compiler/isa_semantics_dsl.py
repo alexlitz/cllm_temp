@@ -3274,8 +3274,8 @@ class MarkerBroadcastSpec:
     broadcast_bands: Tuple["MarkerBroadcastBand", ...]
     weight: float
     marker_bank: str = "AX"
-    is_byte_dim: str = "IS_BYTE"
-    const_dim: str = "CONST"
+    is_byte_dim: Optional[str] = "IS_BYTE"
+    const_dim: Optional[str] = "CONST"
     gate_slot: Optional[int] = 1
     gate_is_byte_weight: float = 500.0
     gate_const_q_weight: float = -500.0
@@ -3284,7 +3284,47 @@ class MarkerBroadcastSpec:
     query_slot: int = 0
     step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
 
+    # ---- BARE-MARKER mode (marker-row -> marker-row relay) ------------------
+    # The IMM relay above fires at BYTE POSITIONS (``IS_BYTE`` + the op's
+    # marker-bank ``H1`` slot) and attends BACK to its step's marker row. A
+    # DISTINCT relay family fires at a MARKER row directly and copies bands to
+    # ANOTHER marker row of the same step: the L9 / L11 ``step_end_operand_relay``
+    # heads (Q@MARK_SE_ONLY, K@MARK_AX, a plain 2-dim relay with NO IS_BYTE
+    # fire-site and NO CONST confirm slot). Set ``is_byte_dim=None`` (and
+    # ``const_dim=None``, ``gate_slot=None``) to select this bare mode:
+    #
+    #   * Q slot ``query_slot``: ``fire_slot_dim`` @ ``weight`` — fire at the
+    #     TARGET marker row (``MARK_SE_ONLY``). ``fire_slot_dim`` is the marker
+    #     dim itself (not an ``H1`` byte-position anchor).
+    #   * K slot ``query_slot``: ``source_marker`` @ ``weight`` — attend to the
+    #     SOURCE marker row (``MARK_AX``). No IS_BYTE reject, no CONST.
+    #   * broadcast V/O: identical to the byte-position mode.
+    #
+    # Recency across steps is pinned by ``alibi_slope`` alone (the within-step
+    # SOURCE marker beats the prior step's by the ALiBi gap), exactly as the
+    # hand-built relays relied on. ``bare_marker`` is derived (``is_byte_dim is
+    # None``); the explicit property documents the contract for callers.
+
+    @property
+    def bare_marker(self) -> bool:
+        """True when this is a bare marker-row -> marker-row relay (no IS_BYTE
+        fire-site / no CONST confirm slot)."""
+        return self.is_byte_dim is None
+
     def __post_init__(self) -> None:
+        if self.bare_marker:
+            if self.const_dim is not None:
+                raise ValueError(
+                    f"MarkerBroadcastSpec({self.name!r}): bare-marker mode "
+                    "(is_byte_dim=None) requires const_dim=None (no CONST "
+                    "anchor on a marker->marker relay)"
+                )
+            if self.gate_slot is not None:
+                raise ValueError(
+                    f"MarkerBroadcastSpec({self.name!r}): bare-marker mode "
+                    "(is_byte_dim=None) requires gate_slot=None (no CONST "
+                    "confirm slot on a marker->marker relay)"
+                )
         if not self.broadcast_bands:
             raise ValueError(
                 f"MarkerBroadcastSpec({self.name!r}): broadcast_bands must be "
@@ -3359,8 +3399,10 @@ def marker_broadcast(spec: MarkerBroadcastSpec) -> MarkerBroadcastBundle:
     residual band (the relay copies into an EXISTING opcode/flag band, so there
     is no import-time side effect).
 
-    The head structure is fixed; the varying data is the spec fields:
+    The head structure is fixed; the varying data is the spec fields. Two
+    fire-site modes:
 
+    BYTE-POSITION mode (``is_byte_dim`` set — the IMM relay):
       * fire-site Q (slot ``query_slot``): ``IS_BYTE`` @ ``weight``,
         ``fire_slot_dim`` @ ``weight``, ``CONST`` @ ``-weight*1.5`` — fire at
         THIS op's byte positions.
@@ -3370,8 +3412,17 @@ def marker_broadcast(spec: MarkerBroadcastSpec) -> MarkerBroadcastBundle:
       * optional confirm slot (``gate_slot``): Q ``IS_BYTE`` @
         ``gate_is_byte_weight`` + ``CONST`` @ ``gate_const_q_weight``; K
         ``CONST`` @ ``gate_const_k_weight`` — pins the softmax winner.
-      * broadcast V/O: each :class:`MarkerBroadcastBand` copies its flag band
-        from the marker row onto the byte positions.
+
+    BARE-MARKER mode (``is_byte_dim=None`` — the L9/L11 step_end relays):
+      * Q (slot ``query_slot``): ``fire_slot_dim`` @ ``weight`` — fire at the
+        TARGET marker row (``fire_slot_dim`` IS the marker dim).
+      * K (slot ``query_slot``): ``source_marker`` @ ``weight`` — attend to the
+        SOURCE marker row. No IS_BYTE / CONST / confirm slot; recency is pinned
+        by ``alibi_slope`` alone.
+
+    In BOTH modes:
+      * broadcast V/O: each :class:`MarkerBroadcastBand` copies its band from
+        the SOURCE marker row into ``target_band`` at the fire row.
     """
     w = spec.weight
 
@@ -3383,27 +3434,36 @@ def marker_broadcast(spec: MarkerBroadcastSpec) -> MarkerBroadcastBundle:
 
         qs = spec.query_slot
 
-        # (1) Fire-site Q: fire at THIS op's byte positions (IS_BYTE + the
-        #     op's marker-bank slot), biased against the CONST anchor.
-        q: list = [
-            AP(qs, _P(spec.is_byte_dim), w),
-            AP(qs, _P(spec.fire_slot_dim), w),
-            AP(qs, _P(spec.const_dim), -w * 1.5),
-        ]
-        # (2) Source-select K: attend BACK to the step's own marker row; the
-        #     IS_BYTE reject keeps the K mass off the byte positions.
-        k: list = [
-            AP(qs, _P(spec.source_marker), w),
-            AP(qs, _P(spec.is_byte_dim), -w * 10),
-            AP(qs, _P(spec.const_dim), w * 0.5),
-        ]
+        if spec.bare_marker:
+            # BARE-MARKER mode: a plain marker-row -> marker-row relay. Q fires
+            # at the TARGET marker (``fire_slot_dim`` IS the marker dim), K
+            # selects the SOURCE marker. No IS_BYTE fire-site / reject, no CONST
+            # anchor, no confirm slot — the whole discriminator is the two
+            # single-dim marker projections + the ALiBi recency slope.
+            q: list = [AP(qs, _P(spec.fire_slot_dim), w)]
+            k: list = [AP(qs, _P(spec.source_marker), w)]
+        else:
+            # (1) Fire-site Q: fire at THIS op's byte positions (IS_BYTE + the
+            #     op's marker-bank slot), biased against the CONST anchor.
+            q = [
+                AP(qs, _P(spec.is_byte_dim), w),
+                AP(qs, _P(spec.fire_slot_dim), w),
+                AP(qs, _P(spec.const_dim), -w * 1.5),
+            ]
+            # (2) Source-select K: attend BACK to the step's own marker row; the
+            #     IS_BYTE reject keeps the K mass off the byte positions.
+            k = [
+                AP(qs, _P(spec.source_marker), w),
+                AP(qs, _P(spec.is_byte_dim), -w * 10),
+                AP(qs, _P(spec.const_dim), w * 0.5),
+            ]
 
-        # (3) Optional CONST-anchored confirm/gate slot (sharpen the winner).
-        if spec.gate_slot is not None:
-            g = spec.gate_slot
-            q.append(AP(g, _P(spec.is_byte_dim), spec.gate_is_byte_weight))
-            q.append(AP(g, _P(spec.const_dim), spec.gate_const_q_weight))
-            k.append(AP(g, _P(spec.const_dim), spec.gate_const_k_weight))
+            # (3) Optional CONST-anchored confirm/gate slot (sharpen the winner).
+            if spec.gate_slot is not None:
+                g = spec.gate_slot
+                q.append(AP(g, _P(spec.is_byte_dim), spec.gate_is_byte_weight))
+                q.append(AP(g, _P(spec.const_dim), spec.gate_const_q_weight))
+                k.append(AP(g, _P(spec.const_dim), spec.gate_const_k_weight))
 
         # (4) Flag-band broadcast: V copies source_band -> V slots; O writes
         #     those slots into target_band (usually the SAME band).
@@ -3426,11 +3486,13 @@ def marker_broadcast(spec: MarkerBroadcastSpec) -> MarkerBroadcastBundle:
             step_window=spec.step_window,
         )
 
-    # Operation dep-graph dim sets (structural derivation).
-    head_reads: Set[str] = {
-        spec.is_byte_dim, spec.fire_slot_dim, spec.const_dim,
-        spec.source_marker,
-    }
+    # Operation dep-graph dim sets (structural derivation). In bare-marker mode
+    # ``is_byte_dim`` / ``const_dim`` are ``None`` (no IS_BYTE / CONST reads).
+    head_reads: Set[str] = {spec.fire_slot_dim, spec.source_marker}
+    if spec.is_byte_dim is not None:
+        head_reads.add(spec.is_byte_dim)
+    if spec.const_dim is not None:
+        head_reads.add(spec.const_dim)
     head_writes: Set[str] = set()
     for bb in spec.broadcast_bands:
         head_reads.add(bb.source_band)
