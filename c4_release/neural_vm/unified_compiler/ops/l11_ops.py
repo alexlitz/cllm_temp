@@ -19,7 +19,7 @@ from ..isa_semantics_dsl import (
     marker_broadcast,
 )
 from ..layer_compiler import Operation
-from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
+from ..primitives import AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
 from .residual_band_registry import register_residual_band
 

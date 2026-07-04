@@ -6,9 +6,12 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..isa_semantics_dsl import (
+    MarkerBroadcastBand,
+    MarkerBroadcastSpec,
     RegisterDeltaSpec,
     RuntimeAddDelta,
     control_op,
+    marker_broadcast,
 )
 from ..wide_alu_dsl import (
     amplified_nibble_adder_rules,
@@ -1922,87 +1925,69 @@ def _step_end_operand_relay_head_specs(
     the score is ``L^2/sqrt(HD) - 0.2*29 ≈ 6.7``; the prior step's
     MARK_AX sits at distance ~64 (loses by ~exp(7) ≈ 1100 in softmax).
     Mirrors the L1 head 6 / L11 step_end_relay shape.
+
+    DERIVED via the generic :func:`marker_broadcast` BARE-MARKER mode
+    (``is_byte_dim=None``): a plain Q@MARK_SE_ONLY / K@MARK_AX
+    marker-row -> marker-row relay with NO IS_BYTE fire-site and NO
+    CONST confirm slot — identical structure to the L11 step_end relay,
+    the ONLY differences being the ``SE_``-tagged ``target_band`` (each
+    band's O writes the register-tagged sister dim, not the source dim)
+    and the reserved slot 0 (``v_slot_base`` starts at 1). Byte-identical
+    to the hand-built heads (proof: ``tools/_isa_golden_hash.py``
+    unchanged).
     """
     L = 10.0
+    _CMP_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
 
-    # Per-head Q/K bands: Q anchors on MARK_SE_ONLY (slot 0 only when
-    # the row is a STEP_END marker), K anchors on MARK_AX (slot 0 only
-    # at the same-step AX marker row). Slot 0 is RESERVED for the Q-K
-    # score; V/O writes start at slot 1 to avoid the leak shape where
-    # softmax over -ALiBi penalties at non-SE Q rows attends to the
-    # local K row, and V slot 0 carries the source dim value into the
-    # SE_<NAME> output dim at non-SE rows. Mirrors the L1 head 6
-    # design (``_step_end_reg_present_head_spec``).
-    q_band = (
-        AP(0, BD.MARK_SE_ONLY, L),
-    )
-    k_band = (
-        AP(0, BD.MARK_AX, L),
-    )
+    # Resolve dim names -> positions through the same ``BD`` proxy the
+    # hand-built head used (identical ``_SetDim`` fallback for undeclared
+    # names).
+    class _DimView:
+        def __getitem__(self, name):
+            return getattr(BD, name)
+    dim_view = _DimView()
+
+    def _relay_spec(name, bands, head_idx):
+        return marker_broadcast(MarkerBroadcastSpec(
+            name=name,
+            fire_slot_dim="MARK_SE_ONLY",      # Q fires at the STEP_END marker
+            source_marker="MARK_AX",           # K selects the in-step AX marker
+            broadcast_bands=tuple(bands),
+            weight=L,
+            is_byte_dim=None, const_dim=None, gate_slot=None,  # BARE marker mode
+            alibi_slope=0.2,
+        )).head_spec_builder(dim_view, head_idx)
 
     # --- Head A: SE_OP_<cmp> + SE_CMP_GROUP + SE_CMP + SE_ALU_LO/HI ---
-    # V/O slots 1..43 (slot 0 reserved for Q-K score).
-    _CMP_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
-    v_a: list = []
-    o_a: list = []
+    # Slot 0 RESERVED for the Q-K score; broadcast bands start at slot 1.
+    bands_a: list = []
     slot = 1
     for op_name in _CMP_OPS:
-        src_dim = getattr(BD, op_name)
-        out_dim = getattr(BD, f"SE_{op_name}")
-        v_a.append(AP(slot, src_dim, 1.0))
-        o_a.append(AO(out_dim, slot, 1.0))
+        bands_a.append(MarkerBroadcastBand(op_name, f"SE_{op_name}", 1, slot, 1.0))
         slot += 1
-    # CMP_GROUP -> SE_CMP_GROUP
-    v_a.append(AP(slot, BD.CMP_GROUP, 1.0))
-    o_a.append(AO(BD.SE_CMP_GROUP, slot, 1.0))
+    bands_a.append(MarkerBroadcastBand("CMP_GROUP", "SE_CMP_GROUP", 1, slot, 1.0))
     slot += 1
-    # CMP+0..3 -> SE_CMP+0..3
-    for k_idx in range(4):
-        v_a.append(AP(slot, BD.CMP + k_idx, 1.0))
-        o_a.append(AO(BD.SE_CMP + k_idx, slot, 1.0))
-        slot += 1
-    # ALU_LO+0..15 -> SE_ALU_LO+0..15
-    for k_idx in range(16):
-        v_a.append(AP(slot, BD.ALU_LO + k_idx, 1.0))
-        o_a.append(AO(BD.SE_ALU_LO + k_idx, slot, 1.0))
-        slot += 1
-    # ALU_HI+0..15 -> SE_ALU_HI+0..15
-    for k_idx in range(16):
-        v_a.append(AP(slot, BD.ALU_HI + k_idx, 1.0))
-        o_a.append(AO(BD.SE_ALU_HI + k_idx, slot, 1.0))
-        slot += 1
-
-    spec_a = DeclarativeAttentionHeadSpec(
-        head_idx=_alu_head_idx("layer9_step_end_operand_relay"),
-        q=q_band,
-        k=k_band,
-        v=tuple(v_a),
-        o=tuple(o_a),
-        alibi_slope=0.2,
+    bands_a.append(MarkerBroadcastBand("CMP", "SE_CMP", 4, slot, 1.0))
+    slot += 4
+    bands_a.append(MarkerBroadcastBand("ALU_LO", "SE_ALU_LO", 16, slot, 1.0))
+    slot += 16
+    bands_a.append(MarkerBroadcastBand("ALU_HI", "SE_ALU_HI", 16, slot, 1.0))
+    slot += 16
+    head_a_idx = _alu_head_idx("layer9_step_end_operand_relay")
+    spec_a = _relay_spec(
+        "layer9_step_end_operand_relay.head_a", bands_a, head_a_idx,
     )
 
     # --- Head B: SE_AX_CARRY_LO + SE_AX_CARRY_HI ---
-    # V/O slots 1..32 (slot 0 reserved for Q-K score).
-    v_b: list = []
-    o_b: list = []
+    # Slot 0 RESERVED for the Q-K score; broadcast bands start at slot 1.
+    bands_b: list = []
     slot = 1
-    for k_idx in range(16):
-        v_b.append(AP(slot, BD.AX_CARRY_LO + k_idx, 1.0))
-        o_b.append(AO(BD.SE_AX_CARRY_LO + k_idx, slot, 1.0))
-        slot += 1
-    for k_idx in range(16):
-        v_b.append(AP(slot, BD.AX_CARRY_HI + k_idx, 1.0))
-        o_b.append(AO(BD.SE_AX_CARRY_HI + k_idx, slot, 1.0))
-        slot += 1
-
-    head_a_idx = _alu_head_idx("layer9_step_end_operand_relay")
-    spec_b = DeclarativeAttentionHeadSpec(
-        head_idx=head_a_idx + 1,
-        q=q_band,
-        k=k_band,
-        v=tuple(v_b),
-        o=tuple(o_b),
-        alibi_slope=0.2,
+    bands_b.append(MarkerBroadcastBand("AX_CARRY_LO", "SE_AX_CARRY_LO", 16, slot, 1.0))
+    slot += 16
+    bands_b.append(MarkerBroadcastBand("AX_CARRY_HI", "SE_AX_CARRY_HI", 16, slot, 1.0))
+    slot += 16
+    spec_b = _relay_spec(
+        "layer9_step_end_operand_relay.head_b", bands_b, head_a_idx + 1,
     )
 
     return spec_a, spec_b
