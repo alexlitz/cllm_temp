@@ -245,6 +245,100 @@ class FFNOp:
         return len(self.rules)
 
 
+@dataclass
+class FFNPass:
+    """One pass of a :class:`MultiPassOp` — a named ``FFNOp``.
+
+    A pass is a single SwiGLU forward: its rules read the residual state as
+    left by the PRIOR pass (its conditions may reference a *workspace* band
+    written by earlier passes) and write into the workspace or the result
+    bands. The pass boundary is the mechanism that expresses a cross-pass
+    carry chain: a rule in pass ``k`` can read a carry dim that a rule in
+    pass ``k-1`` wrote, which a single-forward FFN lookup fundamentally
+    cannot (a lane cannot read a carry its own forward emits).
+    """
+
+    name: str
+    ffn: FFNOp = field(default_factory=FFNOp)
+
+    @property
+    def hidden_units(self) -> int:
+        return self.ffn.hidden_units
+
+
+@dataclass
+class MultiPassOp:
+    """Declarative multi-pass FFN cascade — the ``multi_pass_rules`` IR.
+
+    A sequence of :class:`FFNPass` stages applied to the SAME residual
+    state in order. Each pass is a full SwiGLU forward that reads the
+    residual left by the previous pass (including a *workspace* band the
+    earlier passes populate) and accumulates its writes back into the
+    residual. This is the construct the single-pass ``FFNRule`` lowering
+    cannot express: the cross-pass CARRY CHAIN of wide MUL (schoolbook
+    partial-product + column-carry passes) and wide DIV (long-division
+    shift-subtract iterations) needs a lane in pass ``k`` to read a value a
+    lane in pass ``k-1`` computed — a data dependency that only a staged
+    sequence of forwards realizes.
+
+    The workspace band (an op-local residual band, e.g. ``MUL_WS``) is a
+    scratch region that lives only across the passes of one op; passes
+    write partial sums / carries there and the final pass reads it to
+    assemble the result. See ``docs/DSL_W5_MULDIV_LIMIT.md`` Path 1 and
+    ``docs/semantic_spec_ALU.md`` G3/G4.
+    """
+
+    passes: List[FFNPass] = field(default_factory=list)
+    workspace_band: Optional[str] = None
+    name: Optional[str] = None
+
+    def add_pass(self, name: str, rules: Iterable[FFNRule] = ()) -> "FFNPass":
+        p = FFNPass(name=name, ffn=FFNOp(list(rules)))
+        self.passes.append(p)
+        return p
+
+    @property
+    def hidden_units(self) -> int:
+        """Total FFN units across every pass (one per rule)."""
+        return sum(p.hidden_units for p in self.passes)
+
+    @property
+    def num_passes(self) -> int:
+        return len(self.passes)
+
+    def as_flat_ir(self) -> "CompilerIR":
+        """Lower each pass onto its own :class:`CompilerIR` layer.
+
+        Pass ``k`` becomes layer ``k`` so the existing
+        ``CompilerIR.lower_ffn`` / ``symbolic_ffn`` per-layer machinery
+        drives each pass; the caller applies the layers in order (each a
+        stacked SwiGLU forward over the running residual). This keeps the
+        multi-pass construct a THIN layer over the proven single-pass
+        lowering — no new lowering backend, just N stacked FFN passes.
+        """
+        ir = CompilerIR()
+        for idx, p in enumerate(self.passes):
+            ir.layer(idx).ffn.rules.extend(p.ffn.rules)
+        return ir
+
+    def run_symbolic(
+        self, state: Mapping[str, float]
+    ) -> Dict[str, float]:
+        """Apply every pass in order to ``state``, threading the residual.
+
+        Returns the residual-state map after the final pass. Each pass sees
+        the writes of all prior passes (this is where the cross-pass carry
+        chain resolves). Uses the same ``symbolic_ffn`` per-layer executor
+        the single-pass path uses, so the symbolic result is the exact
+        contract the lowered stacked-FFN forward must reproduce.
+        """
+        ir = self.as_flat_ir()
+        cur: Dict[str, float] = dict(state)
+        for idx in range(len(self.passes)):
+            cur = ir.symbolic_ffn(cur, layer_idx=idx)
+        return cur
+
+
 @dataclass(frozen=True)
 class FFNComparisonIssue:
     """One classified symbolic-vs-lowered FFN comparison failure."""
@@ -1537,6 +1631,45 @@ class CompilerIR:
 
     def required_ffn_units(self, *, layer_idx: int = 0) -> int:
         return self.layer(layer_idx).ffn.hidden_units
+
+    def lower_multi_pass(
+        self,
+        multi_pass: "MultiPassOp",
+        ffn_passes: Sequence[object],
+        dim_positions: Mapping[str, int],
+        *,
+        S: float = 100.0,
+        write_scale: float = 1.0,
+    ) -> List[int]:
+        """Lower a :class:`MultiPassOp` into one ``PureFFN`` per pass.
+
+        ``ffn_passes[k]`` receives the rules of pass ``k`` (via the same
+        per-layer ``lower_ffn`` used by the single-pass path). Returns the
+        per-pass end-unit cursor list. The caller applies the passes in
+        order over the running residual (each a stacked SwiGLU forward), so
+        pass ``k`` reads the workspace band pass ``k-1`` wrote — the
+        cross-pass carry chain. No new lowering backend: this is N stacked
+        applications of the proven single-pass FFN lowering.
+        """
+        if len(ffn_passes) != multi_pass.num_passes:
+            raise ValueError(
+                "lower_multi_pass: got "
+                f"{len(ffn_passes)} PureFFN targets for "
+                f"{multi_pass.num_passes} passes"
+            )
+        flat = multi_pass.as_flat_ir()
+        ends: List[int] = []
+        for idx, ffn in enumerate(ffn_passes):
+            end = flat.lower_ffn(
+                ffn,
+                dim_positions,
+                layer_idx=idx,
+                start_unit=0,
+                S=S,
+                write_scale=write_scale,
+            )
+            ends.append(end)
+        return ends
 
     def lower_attention(
         self,
