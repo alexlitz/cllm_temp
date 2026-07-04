@@ -1,10 +1,21 @@
 # Decisive core→20k pilot — ONE opcode 100%-derivable (task #391)
 
-**Status:** LANDED (increment 1: DECODE stage 100% derived, golden-held).
-**Flag:** `C4_DERIVE_DECODE` (default OFF).
+**Status:** LANDED + FLIPPED TO SOLE PATH (increment 2: `decode_band` is now
+the ONLY L5 decode path; the `C4_DERIVE_DECODE` flag AND the hand-authored
+decode builders are DELETED — the first real ops-core LOC deletion via the
+100%-derivable architecture).
+**Flag:** `C4_DERIVE_DECODE` — **REMOVED** (was default OFF; derivation is now
+unconditional). No env toggle; `_opcode_decode_ffn_rules` always derives.
 **Golden gate:** `tools/_isa_golden_hash.py` ==
 `81557d21422f3eada0a87c677b00dced41cc26c3ee3bfb094c5eeb71c9b4d3cb` (`81557d21`)
-— UNCHANGED both flag-OFF **and** flag-ON.
+— UNCHANGED (the derivation == the deleted hand-authored weights, so the
+sole-path build is byte-identical to golden). The `~250` LOC of hand-authored
+builders in `l5_ops.py` (`_opcode_decode_main_rules`,
+`_opcode_decode_first_step_rules`, `_opcode_decode_temp_clear_rules`,
+`_opcode_decode_all_step_pc_rules`, `_opcode_decode_all_step_jsr_rules`,
+`_opcode_decode_jsr_temp0_blank_rule`) are deleted; only the
+`_derived_decode_spec` + `decode_band` call remain. This proves the
+derive→sole-path→delete rollout template for every opcode family.
 
 ## The pilot claim + what was proven
 

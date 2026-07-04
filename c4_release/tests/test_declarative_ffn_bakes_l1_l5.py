@@ -18,23 +18,14 @@ from c4_release.neural_vm.unified_compiler.ops.l2_ops import (
 from c4_release.neural_vm.unified_compiler.ops.l4_ops import _bake_layer4_ffn
 from c4_release.neural_vm.unified_compiler.ops.l5_ops import _bake_opcode_decode_ffn
 from c4_release.neural_vm.unified_compiler.ops.l5_ops import (
-    _opcode_decode_all_step_pc_rules,
     _opcode_decode_ffn_ir,
     _opcode_decode_ffn_rules,
-    _opcode_decode_jsr_temp0_blank_rule,
-    _lower_opcode_rules,
-    _opcode_decode_first_step_rules,
-    _opcode_decode_main_rules,
-    _opcode_decode_temp_clear_rules,
     make_opcode_decode_ffn_op,
 )
 from c4_release.neural_vm.unified_compiler.ir import (
     compare_symbolic_to_lowered_ffn,
 )
 from c4_release.neural_vm.unified_compiler.primitives import Primitives
-
-
-_SILU_ONE_INPUT = 1.278464542761074
 
 
 class _StubFFN:
@@ -105,123 +96,6 @@ def test_opcode_decode_ffn_declarative_matches_legacy_helper(monkeypatch):
     _set_opcode_decode_ffn(expected, 100.0, _SetDim)
 
     _assert_same_ffn(actual, expected)
-
-
-def test_opcode_decode_main_ir_rules_match_legacy_units():
-    actual = _StubFFN(hidden_dim=128)
-    expected = _StubFFN(hidden_dim=128)
-
-    rules = _opcode_decode_main_rules(100.0)
-    end = _lower_opcode_rules(actual, rules, _SetDim, unit=0, S=100.0)
-    _set_opcode_decode_ffn(expected, 100.0, _SetDim)
-
-    assert end == 34
-    _assert_same_ffn_units(actual, expected, 0, end)
-
-
-def test_opcode_decode_first_step_ir_rules_match_legacy_units():
-    actual = _StubFFN(hidden_dim=128)
-    expected = _StubFFN(hidden_dim=128)
-
-    rules = _opcode_decode_first_step_rules(100.0)
-    end = _lower_opcode_rules(actual, rules, _SetDim, unit=34, S=100.0)
-    _set_opcode_decode_ffn(expected, 100.0, _SetDim)
-
-    assert end == 52
-    _assert_same_ffn_units(actual, expected, 34, end)
-
-
-def test_opcode_decode_temp_clear_ir_rules_match_legacy_units():
-    actual = _StubFFN(hidden_dim=128)
-    expected = _StubFFN(hidden_dim=128)
-
-    rules = _opcode_decode_temp_clear_rules(100.0)
-    end = _lower_opcode_rules(actual, rules, _SetDim, unit=53, S=100.0)
-    _set_opcode_decode_ffn(expected, 100.0, _SetDim)
-
-    assert end == 84
-    assert not actual.W_up[52].any()
-    assert not actual.b_up[52].any()
-    assert not actual.W_gate[52].any()
-    assert not actual.b_gate[52].any()
-    assert not actual.W_down[:, 52].any()
-    _assert_same_ffn_units(actual, expected, 53, end)
-
-
-def test_opcode_decode_all_step_pc_ir_rules_match_legacy_units():
-    actual = _StubFFN(hidden_dim=128)
-    expected = _StubFFN(hidden_dim=128)
-
-    rules = _opcode_decode_all_step_pc_rules(100.0)
-    end = _lower_opcode_rules(actual, rules, _SetDim, unit=84, S=100.0)
-    _set_opcode_decode_ffn(expected, 100.0, _SetDim)
-
-    assert end == 89
-    _assert_same_ffn_units(actual, expected, 84, end)
-
-
-def test_opcode_decode_temp_clear_ir_symbolic_matches_lowered():
-    rule = _opcode_decode_temp_clear_rules(1.0)[0]
-    report = compare_symbolic_to_lowered_ffn(
-        rule,
-        {"MARK_PC": 0, "TEMP": 4},
-        {
-            "MARK_PC": 0.5 + _SILU_ONE_INPUT,
-            "TEMP+1": 3.0,
-        },
-        S=1.0,
-        atol=1e-5,
-    )
-
-    assert report.ok, report.format()
-    assert report.symbolic_state["TEMP+1"] == -3.0
-    assert abs(report.lowered_state["TEMP+1"] + 3.0) < 1e-5
-
-
-def test_opcode_decode_all_step_pc_ir_symbolic_matches_lowered():
-    rule = _opcode_decode_all_step_pc_rules(1.0)[0]
-    report = compare_symbolic_to_lowered_ffn(
-        rule,
-        {
-            "OPCODE_BYTE_LO": 0,
-            "OPCODE_BYTE_HI": 16,
-            "MARK_PC": 32,
-            "OP_BZ": 40,
-        },
-        {
-            "OPCODE_BYTE_LO+4": 1.0,
-            "OPCODE_BYTE_HI+0": 1.0,
-            "MARK_PC": 0.5 + _SILU_ONE_INPUT,
-        },
-        S=1.0,
-        atol=1e-5,
-    )
-
-    assert report.ok, report.format()
-    assert report.symbolic_state["OP_BZ+0"] == 10.0
-    assert abs(report.lowered_state["OP_BZ+0"] - 10.0) < 1e-5
-
-
-def test_opcode_decode_jsr_temp0_blank_rule_is_no_op_lowering():
-    """The unit-52 blank placeholder must lower to an all-zero FFN row."""
-
-    rule = _opcode_decode_jsr_temp0_blank_rule()
-    assert rule.conditions == ()
-    assert rule.writes == ()
-    assert rule.gate is None
-    assert rule.threshold == 0.0
-    assert rule.gate_bias == 0.0
-
-    # Synthetic dim_positions: a single dim is enough since the rule has
-    # zero conditions / writes / gate references.
-    report = compare_symbolic_to_lowered_ffn(
-        rule,
-        {"TEMP": 0},
-        {"TEMP+0": 0.0},
-        S=100.0,
-        atol=1e-5,
-    )
-    assert report.ok, report.format()
 
 
 def test_opcode_decode_ffn_rules_total_unit_count(monkeypatch):
