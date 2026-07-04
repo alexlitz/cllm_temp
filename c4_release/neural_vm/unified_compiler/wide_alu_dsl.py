@@ -559,6 +559,101 @@ def amplified_nibble_adder_rules(
     return tuple(rules)
 
 
+def const_delta_nibble_shift_rules(
+    *,
+    conditions: Sequence[Tuple[str, float]],
+    threshold: float,
+    amount: int,
+    src_lo: str,
+    src_hi: str,
+    dst_lo: str,
+    dst_hi: str,
+    write_scale: float,
+    name_prefix: str,
+    hi_borrow_blocker_dims: Sequence[str] = (),
+    hi_borrow_blocker_weight: float = 1.0,
+) -> Tuple[FFNRule, ...]:
+    """Emit the ``register += const`` two-byte nibble shift with source-cancel.
+
+    This is the L6 SP-decrement / frame-adjust adder shape: a compile-time
+    constant ``amount`` is added to a register value that ARRIVES ON THE VALUE
+    BUS (the ``src_lo``/``src_hi`` one-hot bands, e.g. ``EMBED_LO``/``EMBED_HI``)
+    and the result is written into ``dst_lo``/``dst_hi`` (``OUTPUT_LO``/
+    ``OUTPUT_HI_THIS_STEP``). Where :func:`amplified_nibble_adder_rules` adds a
+    LIVE operand band (``reg + FETCH_HI``) and :class:`SequentialAddDelta`'s
+    lowering carries a first-step-default + a SEPARATE carry band, THIS
+    generator emits the pure marker-gated **cancel-source** shift the L6 bank
+    uses:
+
+      * LO band (16 units): for each arriving nibble ``k``, gated by ``src_lo+k``
+        under the ``conditions`` AND, write ``+dst_lo[(k + amount) % 16]`` and
+        cancel the source lane ``-dst_lo[k]``.
+      * HI band (16 units): for each arriving nibble ``k``, gated by ``src_hi+k``
+        under ``conditions`` PLUS the borrow blockers, write
+        ``+dst_hi[(k + carry) % 16]`` and cancel ``-dst_hi[k]``, where
+        ``carry = amount // 16`` (Python floor-division → the signed inter-byte
+        borrow/carry of the low-byte constant). The ``hi_borrow_blocker_dims``
+        are appended as ``(dim, -hi_borrow_blocker_weight)`` so the borrow only
+        propagates when the low nibble sits in the band that actually rolls over
+        (the L6 bank blocks ``src_lo[8..15]`` so a ``-8`` low-byte subtract only
+        borrows into the high byte when the low byte is in ``[0, 7]``).
+
+    ``amount`` is SIGNED and reduced mod 16 per byte via Python ``%`` (so a
+    ``-8`` amount yields ``(k - 8) % 16`` on the low nibble and ``carry =
+    -8 // 16 = -1`` → ``(k - 1) % 16`` on the high nibble — exactly the L6
+    ``SP -= 8`` frame decrement). ``conditions`` are the marker/opcode AND terms
+    shared by both bands (e.g. ``((PSH_AT_SP, 1.0), (MARK_SP, 1.0))``).
+
+    Args:
+        conditions: the marker/opcode AND terms both bands share.
+        threshold: the AND threshold (both bands).
+        amount: the SIGNED compile-time constant to add to the two-byte value.
+        src_lo / src_hi: the arriving-value one-hot bands (``EMBED_LO/HI``).
+        dst_lo / dst_hi: the result bands (``OUTPUT_LO`` /
+            ``OUTPUT_HI_THIS_STEP``).
+        write_scale: the write / cancel magnitude (``2.0/S``).
+        name_prefix: rule-name prefix (byte-identity names
+            ``{prefix}_lo_{k}`` / ``{prefix}_hi_{k}``).
+        hi_borrow_blocker_dims / hi_borrow_blocker_weight: the HI-band borrow
+            blockers, appended as ``(dim, -weight)``.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` — 16 lo + 16 hi rules, in the SAME order as the
+        hand-authored loop (all lo, then all hi).
+    """
+    cond_tuple = tuple(conditions)
+    carry = amount // 16  # signed inter-byte carry/borrow of the low-byte const
+    rules: list[FFNRule] = []
+    for k in range(16):
+        new_k = (k + amount) % 16
+        rules.append(multi_way_and_rule(
+            name=f"{name_prefix}_lo_{k}",
+            conditions=cond_tuple,
+            threshold=threshold,
+            gate=f"{src_lo}+{k}",
+            writes=(
+                (f"{dst_lo}+{new_k}", write_scale),
+                (f"{dst_lo}+{k}", -write_scale),
+            ),
+        ))
+    hi_conditions = cond_tuple + tuple(
+        (dim, -hi_borrow_blocker_weight) for dim in hi_borrow_blocker_dims
+    )
+    for k in range(16):
+        new_k = (k + carry) % 16
+        rules.append(multi_way_and_rule(
+            name=f"{name_prefix}_hi_{k}",
+            conditions=hi_conditions,
+            threshold=threshold,
+            gate=f"{src_hi}+{k}",
+            writes=(
+                (f"{dst_hi}+{new_k}", write_scale),
+                (f"{dst_hi}+{k}", -write_scale),
+            ),
+        ))
+    return tuple(rules)
+
+
 # ---------------------------------------------------------------------------
 # Nibble comparator lane (L9 CMP condition-flag combine).
 # ---------------------------------------------------------------------------

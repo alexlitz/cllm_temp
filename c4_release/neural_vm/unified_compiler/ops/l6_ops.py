@@ -21,6 +21,7 @@ from ..isa_semantics_dsl import (
     pc_mux,
 )
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
+from ..wide_alu_dsl import const_delta_nibble_shift_rules
 from .shared import _as_setdim_proxy
 
 
@@ -854,40 +855,29 @@ def _layer6_sp_decrement_rules(
     threshold: float,
     S: float,
 ) -> tuple[FFNRule, ...]:
-    # SP -= 8 per nibble: N-way AND on marker conditions, gated by the
-    # EMBED nibble cell, writes the shifted nibble lane and cancels the
-    # source lane. Hi-byte rules add EMBED_LO[8..15] blockers so borrow
-    # only propagates when the low byte sits in [0, 7].
-    rules = []
-    write_scale = 2.0 / S
-    for k in range(16):
-        new_k = (k - 8) % 16
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_lo_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"EMBED_LO+{k}",
-            writes=(
-                (f"OUTPUT_LO+{new_k}", write_scale),
-                (f"OUTPUT_LO+{k}", -write_scale),
-            ),
-        ))
-    for k in range(16):
-        new_k_borrow = (k - 1) % 16
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_hi_{k}",
-            conditions=conditions + tuple(
-                (f"EMBED_LO+{lo_bit}", -1.0)
-                for lo_bit in range(8, 16)
-            ),
-            threshold=threshold,
-            gate=f"EMBED_HI+{k}",
-            writes=(
-                (f"OUTPUT_HI_THIS_STEP+{new_k_borrow}", write_scale),
-                (f"OUTPUT_HI_THIS_STEP+{k}", -write_scale),
-            ),
-        ))
-    return tuple(rules)
+    # SP -= 8 per nibble: the ``register += const`` two-byte nibble shift with
+    # source-cancel + inter-byte borrow (the frame-adjust adder shape). Derived
+    # from ``wide_alu_dsl.const_delta_nibble_shift_rules`` — the SP value arrives
+    # on the EMBED value bus, ``amount = -8`` rotates the low nibble by ``-8``
+    # (``(k - 8) % 16``) and floor-carries ``-8 // 16 = -1`` into the high byte
+    # (``(k - 1) % 16``). The hi-byte borrow only propagates when the low byte is
+    # in ``[0, 7]``, so ``EMBED_LO[8..15]`` are the hi-band borrow blockers.
+    # Byte-identical to the prior hand-authored loop (golden hash 91f55411).
+    return const_delta_nibble_shift_rules(
+        conditions=conditions,
+        threshold=threshold,
+        amount=-8,
+        src_lo="EMBED_LO",
+        src_hi="EMBED_HI",
+        dst_lo="OUTPUT_LO",
+        dst_hi="OUTPUT_HI_THIS_STEP",
+        write_scale=2.0 / S,
+        name_prefix=name_prefix,
+        hi_borrow_blocker_dims=tuple(
+            f"EMBED_LO+{lo_bit}" for lo_bit in range(8, 16)
+        ),
+        hi_borrow_blocker_weight=1.0,
+    )
 
 
 def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
