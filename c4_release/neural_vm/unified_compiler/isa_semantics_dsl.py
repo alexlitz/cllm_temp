@@ -2397,6 +2397,16 @@ class CamBinaryAddressBlock:
         return 1 << self.width_bits
 
 
+# Sentinel weight: an OVERLAY discriminator cell whose weight is ``CAM_DROP``
+# REMOVES that ``(slot, dim)`` cell from the merged map instead of setting it —
+# the DATA form of a hand-authored ``q_map.pop((slot, dim))`` / a wiped V/O row.
+# Because the lowerer writes into a PRE-ZEROED weight matrix, an absent cell and
+# an explicit ``0.0`` produce the SAME lowered weight; ``CAM_DROP`` exists so the
+# emitted spec TUPLES also match a hand-built head that popped the cell (the
+# byte-identity tests compare tuple SETS, not just lowered weights).
+CAM_DROP = object()
+
+
 @dataclass(frozen=True)
 class CamDiscriminatorSlot:
     """One HETEROGENEOUS discriminator row of a binary-address CAM, as DATA.
@@ -2468,6 +2478,16 @@ class CamBinaryAddressMatch:
             head binds address→value at the marker.
         extra_reads: extra dim names to declare as reads beyond the auto set.
         step_window: the step-scope contract the verifier enforces.
+        overlay: a SECOND tuple of :class:`CamDiscriminatorSlot`, merged
+            last-write-wins AFTER the base discriminators AND after the value
+            bands. Unlike :attr:`discriminators` the overlay MAY reuse a base
+            slot (it is the DATA form of the campaign OVERRIDE layer that used to
+            dict-merge cells over the fully-built base head), and a cell whose
+            weight is :data:`CAM_DROP` REMOVES that ``(slot, dim)`` from the
+            merged map (the DATA form of a ``q_map.pop`` / wiped V-O row). The
+            overlay is the flag-conditioned-discriminator surface: an op appends
+            only the cells whose gating flag is on, so flag-OFF (empty overlay)
+            is byte-identical to the plain base CAM.
     """
 
     name: str
@@ -2479,6 +2499,7 @@ class CamBinaryAddressMatch:
     direction: str = "load"
     extra_reads: Tuple[str, ...] = ()
     step_window: StepWindowConstraint = StepWindowConstraint.ANY_STEP
+    overlay: Tuple[CamDiscriminatorSlot, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.address.nibble_bands and not self.discriminators:
@@ -2554,7 +2575,13 @@ def cam_binary_address_match(
     def head_spec_builder(
         dim_positions: Dict[str, int], head_idx: int
     ) -> DeclarativeAttentionHeadSpec:
-        def _P(name: str) -> int:
+        def _P(name) -> int:
+            # An overlay cell may carry an ALREADY-RESOLVED integer position
+            # (the campaign OVERRIDE layer computes positions via a live
+            # dim-proxy, e.g. ``BD.OP_JSR``); pass ints through unchanged. String
+            # tokens ("BASE" / "BASE+offset") resolve through ``dim_positions``.
+            if isinstance(name, int):
+                return name
             return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
 
         # Merge every write into per-(slot, dim) maps. The lowerer applies
@@ -2606,6 +2633,30 @@ def cam_binary_address_match(
                     v_map[(vb.v_slot_base + j, src + j)] = 1.0
                     o_map[(tgt + j, vb.v_slot_base + j)] = vb.o_scale
 
+        # (4) The OVERLAY discriminators (the flag-conditioned OVERRIDE layer as
+        #     DATA). Merged LAST — after the base discriminators and the value
+        #     bands — so an overlay cell wins the last-write-wins over ANY base
+        #     write (incl. a value-band O cell). A cell whose weight is CAM_DROP
+        #     REMOVES that (slot, dim) from the merged map (the DATA form of the
+        #     hand-authored q_map.pop / wiped V-O row). Overlay slots MAY reuse
+        #     base slots by design (that IS the override), so no duplicate-slot
+        #     guard applies here.
+        def _apply(mp, key, w):
+            if w is CAM_DROP:
+                mp.pop(key, None)
+            else:
+                mp[key] = float(w)
+
+        for d in spec.overlay:
+            for (dim, w) in d.q:
+                _apply(q_map, (d.slot, _P(dim)), w)
+            for (dim, w) in d.k:
+                _apply(k_map, (d.slot, _P(dim)), w)
+            for (dim, w) in d.v:
+                _apply(v_map, (d.slot, _P(dim)), w)
+            for (out_dim, w) in d.o:
+                _apply(o_map, (_P(out_dim), d.slot), w)
+
         q = tuple(AP(s, d, w) for (s, d), w in q_map.items())
         k = tuple(AP(s, d, w) for (s, d), w in k_map.items())
         v = tuple(AP(s, d, w) for (s, d), w in v_map.items())
@@ -2617,13 +2668,18 @@ def cam_binary_address_match(
             step_window=spec.step_window,
         )
 
-    def _base(name: str) -> str:
+    def _base(name):
+        # Overlay cells may carry ALREADY-RESOLVED integer positions (no name to
+        # recover); they contribute no NAMED read/write (the base discriminators,
+        # address block, and value bands already declare the semantic bands).
+        if isinstance(name, int):
+            return None
         return name.split("+", 1)[0]
 
     head_reads: Set[str] = set()
     for band in addr.nibble_bands:
         head_reads.add(_base(band))
-    for d in spec.discriminators:
+    for d in (*spec.discriminators, *spec.overlay):
         for (dim, _w) in d.q:
             head_reads.add(_base(dim))
         for (dim, _w) in d.k:
@@ -2631,13 +2687,15 @@ def cam_binary_address_match(
         for (dim, _w) in d.v:
             head_reads.add(_base(dim))
     head_writes: Set[str] = set()
-    for d in spec.discriminators:
+    for d in (*spec.discriminators, *spec.overlay):
         for (out_dim, _w) in d.o:
             head_writes.add(_base(out_dim))
     if spec.value_active:
         for vb in spec.value_bands:
             head_reads.add(_base(vb.source_band))
             head_writes.add(_base(vb.target_band))
+    head_reads.discard(None)
+    head_writes.discard(None)
     head_reads.update(spec.extra_reads)
 
     return CamBinaryAddressBundle(
