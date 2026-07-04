@@ -5,6 +5,7 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
+from ..wide_alu_dsl import nibble_alu_lane_rules
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (  # noqa: F401
@@ -248,46 +249,26 @@ def _add_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     inter-byte ALU carry cascade (the same semantic position that
     ``_layer8_alu_add_carry_rules`` *writes*). Byte-identical: the
     helper returns the legacy ``"CARRY+0"`` string verbatim.
-    """
 
-    gate_add = dim_ref("opcode_flag", "ADD")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    rules: list[FFNRule] = []
-    # 5-way AND with mixed weights at the AX marker: MARK_AX(+1), MARK_PC(-2)
-    # blocker, two operand-nibble one-hots(+1 each), and carry-in
-    # discrimination at +/-2.0 (carry_byte0). Threshold 2.5 (no carry_in) /
-    # 4.5 (carry_in) is explicit; the default derivation wouldn't handle the
-    # negative MARK_PC weight nor the sign-flipped CARRY discrimination.
-    for carry_in in (0, 1):
-        for a in range(16):
-            for b in range(16):
-                result = (a + b + carry_in) % 16
-                if carry_in == 0:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, -2.0),
-                    )
-                    threshold = 2.5
-                else:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, 2.0),
-                    )
-                    threshold = 4.5
-                rules.append(multi_way_and_rule(
-                    name=f"l9_add_hi_c{carry_in}_a{a}_b{b}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=gate_add,
-                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
-                ))
-    return tuple(rules)
+    DERIVED (2026-07): the hi-nibble ADD lookup with carry-IN from the
+    L8-generated CARRY+0 (`result=(a+b+cin)%16`) is a computed-lookup
+    member of the ALU derivable regime (docs/semantic_spec_ALU.md §G2 --
+    the inter-nibble carry cascade). The per-value loop is deleted and
+    routed through ``wide_alu_dsl.nibble_alu_lane_rules``: byte 0's high
+    nibble reads the carry-in dim (thr 2.5 no-carry / 4.5 with-carry,
+    +/-2.0 CARRY+0 discrimination). Byte-identity gated by
+    ``tools/verify_l8l9_addsub_derived.py`` (and the golden hash).
+    """
+    return nibble_alu_lane_rules(
+        op="add", emit="result",
+        operand_a_band="ALU_HI", operand_b_band="AX_CARRY_HI",
+        marker_gate="MARK_AX", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=dim_ref("opcode_flag", "ADD"),
+        threshold_no_carry=2.5, threshold_with_carry=4.5,
+        carry_in_dim=dim_ref("carry", "alu", 0), carry_in_weight=2.0,
+        result_band="OUTPUT_HI_THIS_STEP", write_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"l9_add_hi_c{c}_a{a}_b{b}",
+    )
 
 
 def _lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
@@ -432,45 +413,22 @@ def _sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 7.E.3: gate uses :func:`dim_ref` for the
     ``(opcode_flag, SUB)`` semantic pair.
-    """
 
-    gate_sub = dim_ref("opcode_flag", "SUB")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    rules: list[FFNRule] = []
-    # Same 5-way AND shape as _add_hi_nibble_rules but gated on OP_SUB
-    # and writing ``(a - b - borrow_in) % 16``. carry_byte0 carries the borrow-in
-    # bit with the same +/- 2.0 sign-flipped discrimination at threshold
-    # 2.5 (no borrow) / 4.5 (with borrow).
-    for borrow_in in (0, 1):
-        for a in range(16):
-            for b in range(16):
-                result = (a - b - borrow_in) % 16
-                if borrow_in == 0:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, -2.0),
-                    )
-                    threshold = 2.5
-                else:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, 2.0),
-                    )
-                    threshold = 4.5
-                rules.append(multi_way_and_rule(
-                    name=f"sub_hi_b{borrow_in}_a{a}_b{b}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=gate_sub,
-                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
-                ))
-    return tuple(rules)
+    DERIVED (2026-07): the hi-nibble SUB lookup with borrow-IN from
+    CARRY+0 (`result=(a-b-bin)%16`) routed through
+    ``wide_alu_dsl.nibble_alu_lane_rules`` (mirror of add_hi, op="sub");
+    byte-identity gated by ``tools/verify_l8l9_addsub_derived.py``.
+    """
+    return nibble_alu_lane_rules(
+        op="sub", emit="result",
+        operand_a_band="ALU_HI", operand_b_band="AX_CARRY_HI",
+        marker_gate="MARK_AX", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=dim_ref("opcode_flag", "SUB"),
+        threshold_no_carry=2.5, threshold_with_carry=4.5,
+        carry_in_dim=dim_ref("carry", "alu", 0), carry_in_weight=2.0,
+        result_band="OUTPUT_HI_THIS_STEP", write_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"sub_hi_b{c}_a{a}_b{b}",
+    )
 
 
 def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
@@ -699,48 +657,23 @@ def _add_carry_out_rules(S: float) -> tuple[FFNRule, ...]:
     ``(opcode_flag, ADD)`` and ``(carry, alu, byte_index=1)`` pairs.
     The carry-output offset 1 is role-meaningful (byte 1 of the
     inter-byte ALU carry cascade); operand reads stay structural.
-    """
 
-    gate_add = dim_ref("opcode_flag", "ADD")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    carry_byte1 = dim_ref("carry", "alu", 1)
-    rules: list[FFNRule] = []
-    # Same 5-way AND shape as _add_hi_nibble_rules but with weaker
-    # carry_byte0 discrimination (raw +/- 0.01/S) and relaxed thresholds
-    # (2.5 / 2.9); the threshold itself does most of the discrimination
-    # work since the raw stack-top carry signal isn't amplified here.
-    # Writes to carry_byte1 (byte-level carry for inter-byte propagation).
-    for carry_in in (0, 1):
-        for a in range(16):
-            for b in range(16):
-                if a + b + carry_in < 16:
-                    continue  # no carry-out
-                if carry_in == 0:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, -0.01 / S),
-                    )
-                    threshold = 2.5
-                else:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, 0.01 / S),
-                    )
-                    threshold = 2.9
-                rules.append(multi_way_and_rule(
-                    name=f"add_carry_out_c{carry_in}_a{a}_b{b}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=gate_add,
-                    writes=((carry_byte1, 2.0 / S),),
-                ))
-    return tuple(rules)
+    DERIVED (2026-07): the byte-LEVEL ADD carry-out lookup
+    (`a+b+cin>=16` -> CARRY+1) routed through
+    ``wide_alu_dsl.nibble_alu_lane_rules`` (emit="carry_flag"). Weak
+    +/-0.01/S CARRY+0 discrimination + relaxed thresholds (2.5/2.9);
+    byte-identity gated by ``tools/verify_l8l9_addsub_derived.py``.
+    """
+    return nibble_alu_lane_rules(
+        op="add", emit="carry_flag",
+        operand_a_band="ALU_HI", operand_b_band="AX_CARRY_HI",
+        marker_gate="MARK_AX", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=dim_ref("opcode_flag", "ADD"),
+        threshold_no_carry=2.5, threshold_with_carry=2.9,
+        carry_in_dim=dim_ref("carry", "alu", 0), carry_in_weight=0.01 / S,
+        carry_flag_dim=dim_ref("carry", "alu", 1), carry_flag_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"add_carry_out_c{c}_a{a}_b{b}",
+    )
 
 
 def _sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
@@ -756,52 +689,25 @@ def _sub_borrow_out_rules(S: float) -> tuple[FFNRule, ...]:
     ``(opcode_flag, SUB)`` and ``(carry, alu, byte_index=2)`` pairs.
     The ``+2`` offset is the byte-2 position of the inter-byte ALU
     carry cascade.
-    """
 
-    gate_sub = dim_ref("opcode_flag", "SUB")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    carry_byte2 = dim_ref("carry", "alu", 2)
-    rules: list[FFNRule] = []
-    # Mirror of _add_carry_out_rules: same 5-way AND shape with weak
-    # +/- 0.01/S carry discrimination and relaxed thresholds, gated on
-    # OP_SUB and writing to carry_byte2 (byte-2 of the inter-byte ALU carry
-    # cascade). Pair-filter selects only (a, b) combinations that produce
-    # a borrow: a < b (no borrow_in) or a <= b (with borrow_in).
-    for borrow_in in (0, 1):
-        for a in range(16):
-            for b in range(16):
-                if borrow_in == 0:
-                    if a >= b:
-                        continue  # no borrow-out when ALU >= AX_CARRY
-                else:
-                    if a > b:
-                        continue  # no borrow-out when ALU > AX_CARRY (a - b - 1 >= 0)
-                if borrow_in == 0:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, -0.01 / S),
-                    )
-                    threshold = 2.5
-                else:
-                    conditions = (
-                        ("MARK_AX", 1.0),
-                        ("MARK_PC", -2.0),
-                        (f"ALU_HI+{a}", 1.0),
-                        (f"AX_CARRY_HI+{b}", 1.0),
-                        (carry_byte0, 0.01 / S),
-                    )
-                    threshold = 2.9
-                rules.append(multi_way_and_rule(
-                    name=f"sub_borrow_out_b{borrow_in}_a{a}_b{b}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=gate_sub,
-                    writes=((carry_byte2, 2.0 / S),),
-                ))
-    return tuple(rules)
+    DERIVED (2026-07): the byte-LEVEL SUB borrow-out lookup routed
+    through ``wide_alu_dsl.nibble_alu_lane_rules`` (emit="carry_flag",
+    op="sub"). The pair-filter `a<b (bin=0) / a<=b (bin=1)` == the
+    op="sub" overflow `(a-b-bin)<0`. Writes CARRY+2 (byte-2 of the
+    inter-byte cascade, the downstream CarryPropagation SUB input); weak
+    +/-0.01/S CARRY+0 discrimination + relaxed thresholds (2.5/2.9);
+    byte-identity gated by ``tools/verify_l8l9_addsub_derived.py``.
+    """
+    return nibble_alu_lane_rules(
+        op="sub", emit="carry_flag",
+        operand_a_band="ALU_HI", operand_b_band="AX_CARRY_HI",
+        marker_gate="MARK_AX", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=dim_ref("opcode_flag", "SUB"),
+        threshold_no_carry=2.5, threshold_with_carry=2.9,
+        carry_in_dim=dim_ref("carry", "alu", 0), carry_in_weight=0.01 / S,
+        carry_flag_dim=dim_ref("carry", "alu", 2), carry_flag_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"sub_borrow_out_b{c}_a{a}_b{b}",
+    )
 
 
 # Opcodes that don't need ALU operand gather; the ALU clear units fire

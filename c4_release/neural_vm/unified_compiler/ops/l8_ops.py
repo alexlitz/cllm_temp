@@ -8,6 +8,7 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstraint
+from ..wide_alu_dsl import nibble_alu_lane_rules
 from ..isa_semantics_dsl import (
     MarkerBroadcastBand,
     MarkerBroadcastSpec,
@@ -394,32 +395,26 @@ def _layer8_alu_add_lo_rules(S: float) -> tuple[FFNRule, ...]:
     one-hot lookups). OUTPUT_LO+result writes stay structural too --
     the per-nibble result is a value-bus lookup, not a role-meaningful
     byte position.
+
+    DERIVED (2026-07): the `for a: for b: result=(a+b)%16` compute is a
+    computed-lookup member of the ALU derivable regime (docs/
+    semantic_spec_ALU.md §G1). The per-value loop is deleted and routed
+    through the compact-spec ``wide_alu_dsl.nibble_alu_lane_rules``; the
+    `(op, bands, marker, weights, threshold)` DATA below IS the spec.
+    Byte-identity vs the deleted hand-authored form is proven field-for-
+    field by ``tools/verify_l8l9_addsub_derived.py`` (and the golden hash).
     """
-    write_scale = 2.0 / S
-    gate_add = dim_ref("opcode_flag", "ADD")
-    rules = []
-    for a in range(16):
-        for b in range(16):
-            result = (a + b) % 16
-            rules.append(multi_way_and_rule(
-                name=f"l8_alu_add_lo_a{a}_b{b}_step_end",
-                conditions=(
-                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
-                    # the Wave A step_end_operand_relay (10ca51a7).
-                    ("MARK_SE_ONLY", 1.0),
-                    ("MARK_PC", -4.0),
-                    (f"ALU_LO+{a}", 1.0),
-                    (f"AX_CARRY_LO+{b}", 1.0),
-                ),
-                threshold=2.5,
-                gate=gate_add,
-                writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_SE_ONLY and OP_ADD",
-                dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_ADD",
-                },
-            ))
-    return tuple(rules)
+    return nibble_alu_lane_rules(
+        op="add", emit="result",
+        # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under the Wave A
+        # step_end_operand_relay (10ca51a7). MARK_SE_ONLY is mirrored back
+        # to MARK_AX by _l8_alu_add_mark_ax_mirror in _layer8_alu_rules.
+        operand_a_band="ALU_LO", operand_b_band="AX_CARRY_LO",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-4.0,
+        gate=dim_ref("opcode_flag", "ADD"), threshold_no_carry=2.5,
+        result_band="OUTPUT_LO", write_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"l8_alu_add_lo_a{a}_b{b}_step_end",
+    )
 
 
 def _layer8_alu_lea_lo_rules(S: float) -> tuple[FFNRule, ...]:
@@ -470,32 +465,19 @@ def _layer8_alu_sub_lo_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 8.D: the OP_SUB gate resolves through ``dim_ref("opcode_flag",
     "SUB")``.
+
+    DERIVED (2026-07): `result=(a-b)%16` computed lookup routed through
+    ``wide_alu_dsl.nibble_alu_lane_rules`` (ALU derivable regime, §G1);
+    byte-identity gated by ``tools/verify_l8l9_addsub_derived.py``.
     """
-    write_scale = 2.0 / S
-    gate_sub = dim_ref("opcode_flag", "SUB")
-    rules = []
-    for a in range(16):
-        for b in range(16):
-            result = (a - b) % 16
-            rules.append(multi_way_and_rule(
-                name=f"l8_alu_sub_lo_a{a}_b{b}_step_end",
-                conditions=(
-                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
-                    # the Wave A step_end_operand_relay (10ca51a7).
-                    ("MARK_SE_ONLY", 1.0),
-                    ("MARK_PC", -4.0),
-                    (f"ALU_LO+{a}", 1.0),
-                    (f"AX_CARRY_LO+{b}", 1.0),
-                ),
-                threshold=2.5,
-                gate=gate_sub,
-                writes=((f"OUTPUT_LO+{result}", write_scale),),
-                scope="MARK_SE_ONLY and OP_SUB",
-                dominates_at={
-                    f"OUTPUT_LO+{result}": "MARK_SE_ONLY and OP_SUB",
-                },
-            ))
-    return tuple(rules)
+    return nibble_alu_lane_rules(
+        op="sub", emit="result",
+        operand_a_band="ALU_LO", operand_b_band="AX_CARRY_LO",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-4.0,
+        gate=dim_ref("opcode_flag", "SUB"), threshold_no_carry=2.5,
+        result_band="OUTPUT_LO", write_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"l8_alu_sub_lo_a{a}_b{b}_step_end",
+    )
 
 
 def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
@@ -514,32 +496,20 @@ def _layer8_alu_add_carry_rules(S: float) -> tuple[FFNRule, ...]:
     are now explicit in the rule definition. The ``ALU_LO+a`` /
     ``AX_CARRY_LO+b`` reads stay as ``+N`` because those offsets are
     structural per-nibble one-hot lookups, not byte-index roles.
+
+    DERIVED (2026-07): the carry-out lookup (`a+b>=16` -> CARRY+0) routed
+    through ``wide_alu_dsl.nibble_alu_lane_rules`` (emit="carry_flag");
+    byte-identity gated by ``tools/verify_l8l9_addsub_derived.py``.
     """
-    carry_scale = 2.0 / (S * 5.0)
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    gate_add = dim_ref("opcode_flag", "ADD")
-    rules = []
-    for a in range(16):
-        for b in range(16):
-            if a + b < 16:
-                continue
-            rules.append(multi_way_and_rule(
-                name=f"l8_alu_add_carry_a{a}_b{b}_step_end",
-                conditions=(
-                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
-                    # the Wave A step_end_operand_relay (10ca51a7).
-                    ("MARK_SE_ONLY", 1.0),
-                    ("MARK_PC", -4.0),
-                    (f"ALU_LO+{a}", 1.0),
-                    (f"AX_CARRY_LO+{b}", 1.0),
-                ),
-                threshold=2.5,
-                gate=gate_add,
-                writes=((carry_byte0, carry_scale),),
-                scope="MARK_SE_ONLY and OP_ADD",
-                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_ADD"},
-            ))
-    return tuple(rules)
+    return nibble_alu_lane_rules(
+        op="add", emit="carry_flag",
+        operand_a_band="ALU_LO", operand_b_band="AX_CARRY_LO",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-4.0,
+        gate=dim_ref("opcode_flag", "ADD"), threshold_no_carry=2.5,
+        carry_flag_dim=dim_ref("carry", "alu", 0),
+        carry_flag_scale=2.0 / (S * 5.0),
+        name_fn=lambda c, a, b: f"l8_alu_add_carry_a{a}_b{b}_step_end",
+    )
 
 
 def _layer8_alu_lea_carry_rules(S: float) -> tuple[FFNRule, ...]:
@@ -706,32 +676,21 @@ def _layer8_alu_sub_borrow_rules(S: float) -> tuple[FFNRule, ...]:
     Phase 7.E.2: gate + carry-output refs use ``dim_ref`` (mirrors the
     add_carry / lea_carry pilots). ALU_LO+a / AX_CARRY_LO+b operand
     reads stay structural.
+
+    DERIVED (2026-07): the borrow-out lookup (`a<b` -> CARRY+0) routed
+    through ``wide_alu_dsl.nibble_alu_lane_rules`` (emit="carry_flag");
+    byte-identity gated by ``tools/verify_l8l9_addsub_derived.py``. Note
+    the borrow filter `a<b` == the `op="sub"` overflow `(a-b-0)<0`.
     """
-    carry_scale = 2.0 / (S * 5.0)
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    gate_sub = dim_ref("opcode_flag", "SUB")
-    rules = []
-    for a in range(16):
-        for b in range(16):
-            if a >= b:
-                continue
-            rules.append(multi_way_and_rule(
-                name=f"l8_alu_sub_borrow_a{a}_b{b}_step_end",
-                conditions=(
-                    # Wave B Cluster 2: MARK_AX -> MARK_SE_ONLY under
-                    # the Wave A step_end_operand_relay (10ca51a7).
-                    ("MARK_SE_ONLY", 1.0),
-                    ("MARK_PC", -4.0),
-                    (f"ALU_LO+{a}", 1.0),
-                    (f"AX_CARRY_LO+{b}", 1.0),
-                ),
-                threshold=2.5,
-                gate=gate_sub,
-                writes=((carry_byte0, carry_scale),),
-                scope="MARK_SE_ONLY and OP_SUB",
-                dominates_at={carry_byte0: "MARK_SE_ONLY and OP_SUB"},
-            ))
-    return tuple(rules)
+    return nibble_alu_lane_rules(
+        op="sub", emit="carry_flag",
+        operand_a_band="ALU_LO", operand_b_band="AX_CARRY_LO",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-4.0,
+        gate=dim_ref("opcode_flag", "SUB"), threshold_no_carry=2.5,
+        carry_flag_dim=dim_ref("carry", "alu", 0),
+        carry_flag_scale=2.0 / (S * 5.0),
+        name_fn=lambda c, a, b: f"l8_alu_sub_borrow_a{a}_b{b}_step_end",
+    )
 
 
 def _layer8_alu_ent_lo_rules(S: float) -> tuple[FFNRule, ...]:
