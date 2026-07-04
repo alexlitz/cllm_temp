@@ -1,10 +1,18 @@
-"""Byte-identity gate: derived (wide_alu_dsl) add/sub == hand-authored L8/L9.
+"""Spec-consistency gate: wide_alu_dsl compact spec == the L8/L9 add/sub ops.
 
-Proves the compact-spec ``nibble_alu_lane_rules`` generator reproduces each of
-the 8 hand-authored L8/L9 add/sub FFNRule builders FIELD-FOR-FIELD (name,
-conditions, threshold, gate, writes). This is the authoring-time gate that the
-DERIVED add/sub is byte-identical to the DELETED hand-authored form; the golden
-hash (tools/_isa_golden_hash.py) is the whole-model gate.
+Proves the compact-spec ``nibble_alu_lane_rules`` generator (driven by the
+per-lane spec authored INDEPENDENTLY here) reproduces each of the 8 L8/L9
+add/sub FFNRule builders FIELD-FOR-FIELD (name, conditions, threshold, gate,
+writes). Since the 2026-07 derivation the ops builders THEMSELVES call the
+generator, so this asserts the spec kwargs the ops file passes match the
+independent spec here -- a regression tripwire if either side drifts.
+
+HISTORY: this tool was authored against the ORIGINAL hand-authored per-value
+loops (add_lo/sub_lo/... with inline conditions) and proved the generator
+reproduced them byte-for-byte (8/8) BEFORE the loops were deleted (commits
+e16a46df -> 67010669). That byte-identity vs the DELETED hand-authored form is
+now permanently gated by the WHOLE-MODEL golden hash
+(``tools/_isa_golden_hash.py`` == 91f55411, unchanged across the derivation).
 
 READ-only (no bake). Exit 0 iff every builder matches.
 """
