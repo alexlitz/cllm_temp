@@ -2,10 +2,10 @@
 
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import Primitives
+from ..wide_alu_dsl import nibble_fused_madd_combine_rules
 from .shared import _as_setdim_proxy
 
 
@@ -99,36 +99,43 @@ def mul_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """
     write_scale = 2.0 / S
     gate_mul = dim_ref("opcode_flag", "MUL")
-    rules: list[FFNRule] = []
 
-    for partial in range(16):
-        for a_hi in range(16):
-            for b_lo in range(16):
-                result_hi = (partial + a_hi * b_lo) % 16
-                rules.append(multi_way_and_rule(
-                    name=f"l12_mul_combine_p{partial:02d}_ah{a_hi:02d}_bl{b_lo:02d}",
-                    conditions=(
-                        # Wave B Cluster 4: MARK_AX -> MARK_SE_ONLY
-                        # under Wave A step_end_operand_relay
-                        # (10ca51a7). The L11-staged TEMP[partial]
-                        # carries to STEP_END via the intra-step
-                        # residual; ALU_HI / AX_CARRY_LO / OP_MUL ride
-                        # the relay.
-                        ("MARK_SE_ONLY", 1.0),
-                        (f"TEMP+{partial}", 1.0),
-                        (f"ALU_HI+{a_hi}", 1.0),
-                        (f"AX_CARRY_LO+{b_lo}", 1.0),
-                    ),
-                    threshold=7.5,
-                    gate=gate_mul,
-                    writes=((f"OUTPUT_HI+{result_hi}", write_scale),),
-                    scope="MARK_SE_ONLY and OP_MUL",
-                    dominates_at={
-                        f"OUTPUT_HI+{result_hi}": "MARK_SE_ONLY and OP_MUL",
-                    },
-                ))
-
-    return tuple(rules)
+    # DERIVED (COVERAGE-first): the inline ``for partial: for a_hi: for
+    # b_lo:`` triple-loop is now a compact call into the SHARED
+    # :func:`nibble_fused_madd_combine_rules` generator (wide_alu_dsl.py) —
+    # the schoolbook nibble fused-multiply-accumulate combine lane the L11
+    # ``mul_partial`` bank also derives from. This L12 instance reads the
+    # L11-staged partial directly (``accum_fn`` default = identity), the a_hi
+    # operand off ``ALU_HI`` and the b_lo operand off ``AX_CARRY_LO``, so the
+    # generator computes ``result_hi = (partial + a_hi * b_lo) % 16`` at BUILD
+    # TIME and emits one marker-gated 4-way AND per triple.
+    #
+    # Wave B Cluster 4 (2026-06-10): marker migrated MARK_AX -> MARK_SE_ONLY
+    # under the Wave A ``step_end_operand_relay`` head (10ca51a7); the
+    # L11-staged TEMP[partial] carries to STEP_END via the intra-step
+    # residual, and ALU_HI / AX_CARRY_LO / OP_MUL ride the relay. Emission
+    # order (``partial`` outer, ``a_hi`` middle, ``b_lo`` inner) mirrors the
+    # legacy ``_set_layer12_mul_combine`` unit walk so the lowering cursor
+    # lands byte-identically. ``scope`` / ``dominates_at`` reproduce the
+    # verifier annotations. Byte-identity vs the prior inline loop is proven
+    # by ``tools/_isa_golden_hash.py`` (91f55411) + the DSL unit test.
+    return nibble_fused_madd_combine_rules(
+        accum_band="TEMP",
+        factor_a_band="ALU_HI",
+        factor_b_band="AX_CARRY_LO",
+        result_band="OUTPUT_HI",
+        marker_gate="MARK_SE_ONLY",
+        gate=gate_mul,
+        threshold=7.5,
+        write_scale=write_scale,
+        name_fn=lambda partial, a_hi, b_lo: (
+            f"l12_mul_combine_p{partial:02d}_ah{a_hi:02d}_bl{b_lo:02d}"
+        ),
+        scope="MARK_SE_ONLY and OP_MUL",
+        dominates_at_fn=lambda result_hi: {
+            f"OUTPUT_HI+{result_hi}": "MARK_SE_ONLY and OP_MUL",
+        },
+    )
 
 
 def mul_combine_ir(S: float = 100.0) -> CompilerIR:
