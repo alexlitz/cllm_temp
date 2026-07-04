@@ -5,7 +5,7 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
-from ..wide_alu_dsl import nibble_alu_lane_rules
+from ..wide_alu_dsl import nibble_alu_lane_rules, nibble_compare_lane_rules
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (  # noqa: F401
@@ -544,13 +544,11 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     cmp_byte1 = dim_ref("cmp_flag", "cascade", 1)
     cmp_byte2 = dim_ref("cmp_flag", "cascade", 2)
     cmp_byte3 = dim_ref("cmp_flag", "cascade", 3)
-    rules: list[FFNRule] = []
-
     # Each CMP rule is a 4-way AND at the AX marker: MARK_AX(+1) +
     # MARK_PC(-2) blocker + two operand-nibble one-hots(+1 each), gated
     # on CMP_GROUP. The MARK_PC negative weight prevents the rule firing
-    # at PC marker positions where MARK_AX might leak in. multi_way_and_rule
-    # takes the explicit threshold=2.5 (the default derivation requires all
+    # at PC marker positions where MARK_AX might leak in. The explicit
+    # threshold=2.5 is passed (the default derivation requires all
     # positive weights and would not pass the negative MARK_PC blocker).
 
     # Wave B Cluster 3 rows 1-4 + Wave A v2 (2026-06-10): the CMP
@@ -570,68 +568,59 @@ def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
     # structurally inert but preserves the AND threshold arithmetic.
     # See ``step_end_migration.py`` for the helper and
     # ``WAVE_B_CLUSTER_3_PLAN_2026_06_10.md`` for the migration recipe.
+    #
+    # DERIVED (2026-07): the four CMP lanes are NIBBLE COMPARATORS —
+    # ``a == b`` equality (hi_eq / lo_eq) and ``a < b`` less-than (hi_lt /
+    # lo_lt) over the SE_-tagged operand mirrors. The per-value loops are
+    # deleted and routed through
+    # ``wide_alu_dsl.nibble_compare_lane_rules`` (the comparator sibling of
+    # ``nibble_alu_lane_rules``). Byte-identity gated by
+    # ``tools/verify_l9_cmp_derived.py`` (and the golden hash). This does NOT
+    # hit the MARK_AX-vs-MARK_SE_ONLY wall from
+    # ``project_wave_b_cmp_needs_l9_internal_relay.md``: that wall was already
+    # closed by the ``layer9_step_end_operand_relay`` head, and the generator
+    # simply consumes the SE_-tagged mirror bands it produces.
+    rules: list[FFNRule] = []
 
-    # hi_eq: 16 units -> CMP+1
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l9_cmp_hi_eq_{k}_step_end",
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                ("MARK_PC", -2.0),
-                (f"SE_ALU_HI+{k}", 1.0),
-                (f"SE_AX_CARRY_HI+{k}", 1.0),
-            ),
-            threshold=2.5,
-            gate=gate_cmp_group,
-            writes=((cmp_byte1, 2.0 / S),),
-        ))
+    # hi_eq: 16 units -> CMP+1 (a == b for hi nibble)
+    rules.extend(nibble_compare_lane_rules(
+        mode="equal",
+        operand_a_band="SE_ALU_HI", operand_b_band="SE_AX_CARRY_HI",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=gate_cmp_group, threshold=2.5,
+        flag_dim=cmp_byte1, flag_scale=2.0 / S,
+        name_fn=lambda a, b: f"l9_cmp_hi_eq_{a}_step_end",
+    ))
 
-    # lo_eq: 16 units -> CMP+2
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l9_cmp_lo_eq_{k}_step_end",
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                ("MARK_PC", -2.0),
-                (f"SE_ALU_LO+{k}", 1.0),
-                (f"SE_AX_CARRY_LO+{k}", 1.0),
-            ),
-            threshold=2.5,
-            gate=gate_cmp_group,
-            writes=((cmp_byte2, 8.0 / S),),
-        ))
+    # lo_eq: 16 units -> CMP+2 (a == b for lo nibble)
+    rules.extend(nibble_compare_lane_rules(
+        mode="equal",
+        operand_a_band="SE_ALU_LO", operand_b_band="SE_AX_CARRY_LO",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=gate_cmp_group, threshold=2.5,
+        flag_dim=cmp_byte2, flag_scale=8.0 / S,
+        name_fn=lambda a, b: f"l9_cmp_lo_eq_{a}_step_end",
+    ))
 
     # hi_lt: 120 units -> CMP+0 (a < b for hi nibble)
-    for a in range(16):
-        for b in range(a + 1, 16):
-            rules.append(multi_way_and_rule(
-                name=f"l9_cmp_hi_lt_a{a}_b{b}_step_end",
-                conditions=(
-                    ("MARK_SE_ONLY", 1.0),
-                    ("MARK_PC", -2.0),
-                    (f"SE_ALU_HI+{a}", 1.0),
-                    (f"SE_AX_CARRY_HI+{b}", 1.0),
-                ),
-                threshold=2.5,
-                gate=gate_cmp_group,
-                writes=((cmp_byte0, 2.0 / S),),
-            ))
+    rules.extend(nibble_compare_lane_rules(
+        mode="less_than",
+        operand_a_band="SE_ALU_HI", operand_b_band="SE_AX_CARRY_HI",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=gate_cmp_group, threshold=2.5,
+        flag_dim=cmp_byte0, flag_scale=2.0 / S,
+        name_fn=lambda a, b: f"l9_cmp_hi_lt_a{a}_b{b}_step_end",
+    ))
 
     # lo_lt: 120 units -> CMP+3 (a < b for lo nibble)
-    for a in range(16):
-        for b in range(a + 1, 16):
-            rules.append(multi_way_and_rule(
-                name=f"l9_cmp_lo_lt_a{a}_b{b}_step_end",
-                conditions=(
-                    ("MARK_SE_ONLY", 1.0),
-                    ("MARK_PC", -2.0),
-                    (f"SE_ALU_LO+{a}", 1.0),
-                    (f"SE_AX_CARRY_LO+{b}", 1.0),
-                ),
-                threshold=2.5,
-                gate=gate_cmp_group,
-                writes=((cmp_byte3, 2.0 / S),),
-            ))
+    rules.extend(nibble_compare_lane_rules(
+        mode="less_than",
+        operand_a_band="SE_ALU_LO", operand_b_band="SE_AX_CARRY_LO",
+        marker_gate="MARK_SE_ONLY", marker_weight=1.0, mark_pc_weight=-2.0,
+        gate=gate_cmp_group, threshold=2.5,
+        flag_dim=cmp_byte3, flag_scale=2.0 / S,
+        name_fn=lambda a, b: f"l9_cmp_lo_lt_a{a}_b{b}_step_end",
+    ))
 
     # ``_CMP_RELAYED`` documents the Wave A dims this factory depends
     # on; the constant is read by audit tooling / future relay
