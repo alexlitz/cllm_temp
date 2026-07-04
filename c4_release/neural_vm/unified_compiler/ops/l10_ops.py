@@ -657,10 +657,11 @@ def _stack0_store_loaded_computed_enabled() -> bool:
     argmax / winner-margin is preserved), so this is BYTE-IDENTITY-BREAKING but
     VERDICT-validated: proving the enumerated->computed collapse.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_STORE_LOADED_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
+    weight-changing but field-identical, new golden).  Kill-switch with
+    ``C4_STACK0_STORE_LOADED_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
 
 
 def _stack0_pop_loaded_computed_enabled() -> bool:
@@ -680,10 +681,11 @@ def _stack0_pop_loaded_computed_enabled() -> bool:
     0 argmax mismatch across all 255 non-zero bytes for BOTH competitor values.
     BYTE-IDENTITY-BREAKING -> verdict-validated.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_POP_LOADED_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
+    weight-changing but field-identical, new golden).  Kill-switch with
+    ``C4_STACK0_POP_LOADED_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
 
 
 def _stack0_store_e8_computed_enabled() -> bool:
@@ -703,10 +705,11 @@ def _stack0_store_e8_computed_enabled() -> bool:
     0 argmax mismatch across all 255 non-zero bytes.  BYTE-IDENTITY-BREAKING ->
     verdict-validated.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_STORE_E8_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
+    weight-changing but field-identical, new golden).  Kill-switch with
+    ``C4_STACK0_STORE_E8_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
 def _stack0_store_top_e0_computed_enabled() -> bool:
     """Flag for GAP-PRIMITIVE #3 pilot — CROSS-LANE COMPUTED ALU->OUTPUT copy.
 
@@ -732,10 +735,11 @@ def _stack0_store_top_e0_computed_enabled() -> bool:
     delta magnitude differs (winner-margin preserved).  BYTE-IDENTITY-BREAKING
     -> VERDICT-validated.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_STORE_TOP_E0_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral cross-lane enumerated->computed collapse
+    realized; weight-changing but field-identical, new golden).  Kill-switch
+    with ``C4_STACK0_STORE_TOP_E0_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
 
 
 def _lea_byte0_alu_amplify_enabled() -> bool:
