@@ -29,6 +29,23 @@ register_residual_band(
     flag=mul_width2_enabled,
 )
 
+# ---------------------------------------------------------------------------
+# GAP-PRIMITIVE #2: multi_pass MUL cascade workspace band.
+# ---------------------------------------------------------------------------
+# When ``C4_MUL_MULTIPASS=1`` (opt-in), the L11 ``mul_partial`` block is
+# replaced by the 7-pass schoolbook cascade (``multi_pass_mul_rules``). The
+# cascade's intermediate passes stage partial products + column carries in a
+# scratch band (15 lanes x 16-wide value one-hots = 240 dims). Op-local,
+# flag-gated: a flag-off build omits the band (byte-identical to golden).
+# ``never_share`` — the workspace is written+read WITHIN one block's staged
+# Sequential (the 7 passes), so it must keep a private liveness slot that no
+# other op's dim-liveness merge can alias.
+from .shared import mul_multipass_enabled  # noqa: E402
+register_residual_band(
+    "MUL_MULTIPASS_WS", 240, owner="make_mul_partial_op",
+    flag=mul_multipass_enabled, never_share=True,
+)
+
 
 def _mark_structural_declarations(op: Operation) -> Operation:
     """Mark module-assembly ops as safe for declarations-only dispatch."""

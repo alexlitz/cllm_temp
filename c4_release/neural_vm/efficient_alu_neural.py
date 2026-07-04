@@ -1698,6 +1698,61 @@ class MulOperandSeRecoverFFN(nn.Module):
         return None
 
 
+class MultiPassMulBlock(nn.Module):
+    """GAP-PRIMITIVE #2: the 7-pass schoolbook MUL cascade as ONE block FFN.
+
+    Drop-in ``block.ffn`` replacement for the L11 ``mul_partial`` lookup when
+    ``C4_MUL_MULTIPASS=1``. Holds the 7 lowered ``PureFFN`` passes of
+    ``multi_pass_mul_rules`` (partial products + column-carry chain) as an
+    ordered ``nn.Sequential`` and runs them in a SINGLE block forward — exactly
+    the ``FlattenedALUMul`` pattern (a multi-stage pipeline collapsed into one
+    ``model.blocks[i].ffn`` call), so the model's physical block count is
+    unchanged and the absolute-position lea contract holds.
+
+    Each pass is ``PureFFN.forward(x) = x + swiglu(x)`` (residual add), so the
+    Sequential threads the running residual through every pass: pass ``k``
+    reads the workspace band (``MUL_MULTIPASS_WS``) that pass ``k-1`` wrote —
+    the cross-pass carry chain a single-forward FFN lookup cannot express. This
+    is the neural realization of ``MultiPassOp.run_symbolic``.
+
+    The passes are opcode-gated (``OP_MUL``) and marker-gated (``MARK_AX``) at
+    build time, so on a non-MUL / non-marker row every pass's SwiGLU is dark and
+    the module is a pure residual identity — the same disjoint-gating contract
+    the lookup mul_partial honoured.
+
+    ``compact`` / ``sparsify`` / ``compact_moe`` plumb through to each pass so
+    the model's post-bake compactor and any weight-introspection treat this like
+    a stack of ``PureFFN``.
+    """
+
+    def __init__(self, passes):
+        super().__init__()
+        self.pipeline = nn.Sequential(*passes)
+        self._is_multipass_mul_block = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.pipeline(x)
+
+    def compact(self, block_size=1):
+        for p in self.pipeline:
+            if hasattr(p, "compact"):
+                p.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        for p in self.pipeline:
+            if hasattr(p, "sparsify"):
+                p.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        for p in self.pipeline:
+            fn = getattr(p, "compact_moe", None)
+            if fn is not None:
+                fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 class BitwiseOperandSeRecoverFFN(nn.Module):
     """Campaign BITWISE operand-A SE_ALU recover wrapping the L10 bitwise lookup.
 

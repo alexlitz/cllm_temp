@@ -2530,6 +2530,16 @@ def compile_full_vm_dynamic(
             "C4_STACK0_STORE_TOP_E0_COMPUTED": (
                 os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
             ),
+            # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11
+            # mul-partial / L12 mul-combine lookup (DEFAULT-OFF, opt in =1).
+            # Adds the MUL_MULTIPASS_WS 240-dim workspace band (changes
+            # d_model / n_heads) AND swaps block.ffn for the 7-pass cascade
+            # (changes weights + emitted product byte 1), so the ON / OFF
+            # builds have different state_dicts and MUST NEVER share a memo /
+            # disk entry. See ops/shared.mul_multipass_enabled.
+            "C4_MUL_MULTIPASS": (
+                os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -3340,6 +3350,14 @@ def _bake_from_scheduled_ops(
         # l10_ops._stack0_store_top_e0_computed_enabled.
         "C4_STACK0_STORE_TOP_E0_COMPUTED": (
             os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
+        ),
+        # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11 mul-partial
+        # / L12 mul-combine lookup (DEFAULT-OFF, opt in =1). Adds the
+        # MUL_MULTIPASS_WS 240-dim workspace band AND swaps block.ffn for the
+        # 7-pass cascade, so the ON / OFF builds have different state_dicts and
+        # MUST NEVER share a serialised entry. See ops/shared.mul_multipass_enabled.
+        "C4_MUL_MULTIPASS": (
+            os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

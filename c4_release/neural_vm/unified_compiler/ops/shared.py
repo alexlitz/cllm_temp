@@ -109,6 +109,41 @@ def mul_width2_enabled() -> bool:
     return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
 
 
+def mul_multipass_enabled() -> bool:
+    """Return True iff the multi_pass (schoolbook cascade) MUL compute replaces
+    the L11 mul-partial / L12 mul-combine lookup chain (DEFAULT OFF — opt in via
+    ``C4_MUL_MULTIPASS=1``).
+
+    GAP-PRIMITIVE #2 install. The live default (``alu_mode='lookup'``) MUL
+    computes only the product's BYTE 0 across three lookup blocks:
+
+      * L10 ``_layer10_alu_mul_lo`` (256 units) -> ``OUTPUT_LO`` nib0 = (a0*b0)%16
+      * L11 ``mul_partial`` (4096 units)         -> ``TEMP[partial]``
+      * L12 ``mul_combine`` (4096 units)         -> ``OUTPUT_HI`` nib1
+
+    Byte 1 (bits 8..15) is never computed on the lookup path, so wide_mul
+    programs cross-contaminate byte-0/byte-1 (#334). When this flag is on,
+    ``make_mul_partial_op`` replaces ``block.ffn`` with a
+    :class:`~neural_vm.efficient_alu_neural.MultiPassMulBlock` — the 7 lowered
+    ``PureFFN`` passes of ``multi_pass_mul_rules`` packed into ONE physical
+    block (like ``FlattenedALUMul``, so the absolute-position lea contract
+    holds). The cascade computes the FULL 16-bit product from a compact
+    schoolbook spec (2848 units vs the 4096+4096 lookup), routing byte 0 to
+    ``OUTPUT_LO/OUTPUT_HI`` and byte 1 to the ``MUL_RESULT_HI_LO/HI`` band that
+    the L13 relay stages into AX_FULL for the byte-1 emit.
+
+    The redundant L10 mul_lo + L12 mul_combine byte-0 writers are gated OFF
+    when this flag is on (the cascade owns every result nibble); the L11
+    ``mul_partial`` TEMP band is no longer produced. Needs
+    :func:`mul_width2_enabled` (the ``MUL_RESULT_HI_*`` byte-1 band + the L13
+    relay) — implies it.
+
+    DEFAULT OFF: flag-off is byte-identical to golden ``91f55411`` (the lookup
+    chain is untouched). Opt in with ``C4_MUL_MULTIPASS=1``.
+    """
+    return os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
+
+
 def mul_w2_thresh_fix_enabled() -> bool:
     """Return True iff the width=2 MUL 5-way-AND threshold is lowered to fire
     the clean-operand wide-product cases the default 19.5 just barely blocks
