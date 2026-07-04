@@ -663,6 +663,52 @@ def _stack0_store_loaded_computed_enabled() -> bool:
     return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
 
 
+def _stack0_pop_loaded_computed_enabled() -> bool:
+    """Flag for the ``stack0_pop_loaded`` ENUMERATED->COMPUTED collapse.
+
+    Sibling of the M8 pilot (``_stack0_store_loaded_computed_enabled``) on the
+    ``stack0_pop_loaded_output_rules`` bank — a 16x16 nibble loop of 255
+    per-value AND rules (skipping ``0x00``) that reinforces a STACK0 byte a
+    strong upstream load relayed into the OUTPUT band.  Its READ lane
+    (``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP`` at match weight ``0.05``) == its
+    WRITE lane (OUTPUT), so it is a same-lane identity copy gated by structural
+    evidence and collapses to 32 per-nibble ROUTE units (16 LO + 16 HI) via
+    :func:`_computed_byte_writeback_route_rules` (``match_weight=0.05``,
+    ``threshold=12.0``, same ``competitor`` — softened to 5 under the shallow
+    crush flag).  Numeric proof
+    (``tools/_probe_computed_writeback_banks.py``): identical firing region +
+    0 argmax mismatch across all 255 non-zero bytes for BOTH competitor values.
+    BYTE-IDENTITY-BREAKING -> verdict-validated.
+
+    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
+    ``C4_STACK0_POP_LOADED_COMPUTED=1``.
+    """
+    return os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+
+
+def _stack0_store_e8_computed_enabled() -> bool:
+    """Flag for the ``stack0_store_top_e8_from_e0`` ENUMERATED->COMPUTED collapse.
+
+    Sibling of the M8 pilot on the NIBBLE-LOOP part of
+    ``stack0_store_top_e8_from_e0_output_rules`` — 255 per-value AND rules
+    (skipping ``0x00``) restoring a top-store value for the e0->e8 local-store
+    transition.  Its READ lane (``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP`` at match
+    weight ``0.001``) == its WRITE lane (OUTPUT), so it collapses to 32
+    per-nibble ROUTE units via :func:`_computed_byte_writeback_route_rules`
+    (``match_weight=0.001``, ``threshold=4300.0``).  The trailing special
+    ``byte_39_from_e8_addr`` rule is NOT part of the nibble loop (its own
+    MEM_ADDR_SRC-keyed context) and is emitted UNCHANGED, so the family drops
+    255 -> 33 (32 route + 1 byte-39).  Numeric proof
+    (``tools/_probe_computed_writeback_banks.py``): identical firing region +
+    0 argmax mismatch across all 255 non-zero bytes.  BYTE-IDENTITY-BREAKING ->
+    verdict-validated.
+
+    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
+    ``C4_STACK0_STORE_E8_COMPUTED=1``.
+    """
+    return os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+
+
 def _lea_byte0_alu_amplify_enabled() -> bool:
     """Flag for the PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER
     (ROOT 1 sibling — the func_square / func_max / func_min re-read LEAs).
@@ -1930,6 +1976,20 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # by 223. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit unchanged.
     # See ``_stack0_store_loaded_computed_enabled``.
     if _stack0_store_loaded_computed_enabled():
+        extra -= 223
+    # STACK0 pop-loaded byte-writeback enumerated->COMPUTED collapse: with the
+    # flag ON the ``stack0_pop_loaded_output_rules`` family drops from 255
+    # (16x16 per-value AND, minus the lo==hi==0 skip) to 32 (16 LO + 16 HI
+    # per-nibble route) -> tail range SHRINKS by 223. Flag-OFF -> 0.
+    # See ``_stack0_pop_loaded_computed_enabled``.
+    if _stack0_pop_loaded_computed_enabled():
+        extra -= 223
+    # STACK0 store-top e8-from-e0 byte-writeback enumerated->COMPUTED collapse:
+    # with the flag ON the NIBBLE-LOOP part of
+    # ``stack0_store_top_e8_from_e0_output_rules`` drops from 255 to 32 (the
+    # trailing byte_39 special rule is UNCHANGED) -> tail range SHRINKS by 223.
+    # Flag-OFF -> 0. See ``_stack0_store_e8_computed_enabled``.
+    if _stack0_store_e8_computed_enabled():
         extra -= 223
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
@@ -6085,6 +6145,7 @@ def _computed_byte_writeback_route_rules(
     strength: float,
     lo_base: str = "OUTPUT_LO",
     hi_base: str = "OUTPUT_HI_THIS_STEP",
+    match_weight: float = 1.0,
     competitor_strength: Optional[float] = None,
     gate: Optional[object] = None,
     scope: Optional[str] = None,
@@ -6092,21 +6153,27 @@ def _computed_byte_writeback_route_rules(
 ):
     """COMPUTED counterpart to :func:`_byte_value_writeback_rules` (M8 pilot).
 
-    Where the enumerated engine emits 255 per-VALUE AND units (one per byte,
-    each reading BOTH nibbles and writing that whole byte), this emits 32
+    Where the enumerated engine emits up to 255 per-VALUE AND units (one per
+    byte, each reading BOTH nibbles and writing that whole byte), this emits 32
     per-NIBBLE-CHANNEL ROUTE units: 16 for ``lo_base`` + 16 for ``hi_base``.
     Each channel-``k`` unit:
 
       * FIRES iff the shared ``base_conditions`` structural evidence holds AND
-        this channel's one-hot (``{band}+{k}``, weight 1.0) is on AND the OTHER
-        band carries a one-hot (the 16 ``{other}+{j}`` terms, weight 1.0 each;
-        exactly one is on for a valid byte).  Summing the other band keeps the
-        firing decision on the SAME 2-channel evidence magnitude and threshold
-        the enumerated per-value AND used, so the route fires on exactly the
-        same production contexts (verified in
-        ``tools/_probe_m8_computed_writeback.py``: identical firing region on
-        the gate-off / IS_BYTE-block cases, 0 argmax mismatch across all 256
-        bytes).
+        this channel's one-hot (``{band}+{k}``, weight ``match_weight``) is on
+        AND the OTHER band carries a one-hot (the 16 ``{other}+{j}`` terms,
+        weight ``match_weight`` each; exactly one is on for a valid byte).
+        Summing the other band keeps the firing decision on the SAME 2-channel
+        evidence magnitude and threshold the enumerated per-value AND used, so
+        the route fires on exactly the same production contexts.  Because the
+        OTHER band is one-hot in production (only the observed nibble carries a
+        large magnitude), ``match_weight * sum_j other[j]`` reduces to
+        ``match_weight * other[observed]`` — i.e. the route's channel-``k`` unit
+        has the IDENTICAL firing predicate to the enumerated per-value unit for
+        the byte whose LO (resp. HI) nibble is ``k``.  Verified numerically in
+        ``tools/_probe_m8_computed_writeback.py`` (pilot, ``match_weight=1``)
+        and ``tools/_probe_computed_writeback_banks.py`` (the 0.05 / 0.001
+        weight banks): identical firing region + 0 argmax mismatch across all
+        256 bytes.
       * WRITES ``nibble_value_writes(band, k)`` — ``+strength`` to channel ``k``
         and ``-competitor_strength`` to the 15 competitors of ITS band.
 
@@ -6114,12 +6181,20 @@ def _computed_byte_writeback_route_rules(
     they reconstruct the same OUTPUT byte the single enumerated unit wrote —
     a COMPUTED copy, not a 256-way lookup.  Same order (LO band then HI band,
     channel-ascending), same gate / scope / dominates_at.
+
+    ``match_weight`` must equal the enumerated bank's per-value nibble match
+    weight (1.0 for the pilot, 0.05 for ``stack0_pop_loaded``, 0.001 for
+    ``stack0_store_top_e8_from_e0``) so the firing threshold algebra is
+    preserved; ``competitor_strength`` is forwarded to
+    ``nibble_value_writes`` (banks that soften the losing-channel suppression,
+    e.g. the shallow pop-loaded crush, pass it explicitly).
     """
 
-    del competitor_strength  # nibble_value_writes reuses ``strength`` for both.
     rules = []
     for band, other in ((lo_base, hi_base), (hi_base, lo_base)):
-        other_terms = tuple((f"{other}+{j}", 1.0) for j in range(16))
+        other_terms = tuple(
+            (f"{other}+{j}", match_weight) for j in range(16)
+        )
         for k in range(16):
             rules.append(
                 multi_way_and_rule(
@@ -6127,12 +6202,13 @@ def _computed_byte_writeback_route_rules(
                     scope=scope,
                     dominates_at=dominates_at,
                     conditions=tuple(base_conditions)
-                    + ((f"{band}+{k}", 1.0),)
+                    + ((f"{band}+{k}", match_weight),)
                     + other_terms,
                     threshold=threshold,
                     gate=gate,
                     writes=Primitives.nibble_value_writes(
                         band, k, strength=strength,
+                        competitor_strength=competitor_strength,
                     ),
                 )
             )
@@ -7109,6 +7185,32 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_LE", -1000000.0),
             ("OP_GE", -1000000.0),
         )
+        # ENUMERATED->COMPUTED collapse (C4_STACK0_POP_LOADED_COMPUTED,
+        # DEFAULT-OFF): replace the 255-rule per-value lookup with a 32-rule
+        # per-nibble route.  Same READ==WRITE lane (OUTPUT); the route
+        # reproduces the winning byte (argmax) + firing region byte-for-byte
+        # at match_weight=0.05 / threshold=12 for BOTH competitor values
+        # (proof: tools/_probe_computed_writeback_banks.py).  BYTE-IDENTITY-
+        # BREAKING -> verdict-validated.
+        if _stack0_pop_loaded_computed_enabled():
+            return _computed_byte_writeback_route_rules(
+                name_for=lambda band, k: (
+                    f"tail_stack0_pop_loaded_route_{band}_{k}"
+                ),
+                base_conditions=base_conditions,
+                threshold=12.0,
+                strength=500.0,
+                match_weight=0.05,
+                competitor_strength=competitor,
+                lo_base="OUTPUT_LO",
+                hi_base="OUTPUT_HI_THIS_STEP",
+                gate=gate_mark_stack0,
+                scope="mark == STACK0",
+                dominates_at={
+                    "OUTPUT_LO": "mark == STACK0",
+                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+                },
+            )
         rules = []
         for lo in range(16):
             for hi in range(16):
@@ -7211,29 +7313,56 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+2", -1000.0),
             ("H1+3", -1000.0),
         )
-        rules = []
-        for lo in range(16):
-            for hi in range(16):
-                if lo == 0 and hi == 0:
-                    continue
-                value = lo | (hi << 4)
-                rules.append(
-                    multi_way_and_rule(
-                        name=(
-                            "tail_stack0_store_top_e8_from_e0_byte_"
-                            f"{value:02x}"
-                        ),
-                        scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                        conditions=base_conditions + (
-                            (f"OUTPUT_LO+{lo}", 0.001),
-                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
-                        ),
-                        threshold=4300.0,
-                        gate=gate_mark_stack0,
-                        writes=byte_writes(value, strength=5000.0),
+        # ENUMERATED->COMPUTED collapse (C4_STACK0_STORE_E8_COMPUTED,
+        # DEFAULT-OFF): replace the 255-rule per-value NIBBLE LOOP with a
+        # 32-rule per-nibble route (same READ==WRITE lane, OUTPUT; match_weight
+        # 0.001 / threshold 4300).  The trailing byte_39 special rule below is
+        # NOT part of the loop and is emitted UNCHANGED.  The route reproduces
+        # the winning byte (argmax) + firing region byte-for-byte (proof:
+        # tools/_probe_computed_writeback_banks.py).  BYTE-IDENTITY-BREAKING ->
+        # verdict-validated.
+        if _stack0_store_e8_computed_enabled():
+            rules = list(_computed_byte_writeback_route_rules(
+                name_for=lambda band, k: (
+                    f"tail_stack0_store_top_e8_from_e0_route_{band}_{k}"
+                ),
+                base_conditions=base_conditions,
+                threshold=4300.0,
+                strength=5000.0,
+                match_weight=0.001,
+                lo_base="OUTPUT_LO",
+                hi_base="OUTPUT_HI_THIS_STEP",
+                gate=gate_mark_stack0,
+                scope="mark == STACK0",
+                dominates_at={
+                    "OUTPUT_LO": "mark == STACK0",
+                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+                },
+            ))
+        else:
+            rules = []
+            for lo in range(16):
+                for hi in range(16):
+                    if lo == 0 and hi == 0:
+                        continue
+                    value = lo | (hi << 4)
+                    rules.append(
+                        multi_way_and_rule(
+                            name=(
+                                "tail_stack0_store_top_e8_from_e0_byte_"
+                                f"{value:02x}"
+                            ),
+                            scope="mark == STACK0",
+                            dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
+                            conditions=base_conditions + (
+                                (f"OUTPUT_LO+{lo}", 0.001),
+                                (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
+                            ),
+                            threshold=4300.0,
+                            gate=gate_mark_stack0,
+                            writes=byte_writes(value, strength=5000.0),
+                        )
                     )
-                )
         # The byte-0x39 store-pop restore is driven by the (unbounded)
         # ``OUTPUT_LO+9`` term: at a binary-op STACK0 byte-0 emit row the
         # operand/result byte's low nibble 9 lands in OUTPUT_LO+9 at magnitude

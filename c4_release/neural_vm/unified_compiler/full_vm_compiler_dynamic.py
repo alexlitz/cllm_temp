@@ -2499,6 +2499,19 @@ def compile_full_vm_dynamic(
             "C4_STACK0_STORE_LOADED_COMPUTED": (
                 os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
             ),
+            # STACK0 pop-loaded / store-top-e8 byte-writeback ENUMERATED (255
+            # per-value AND) -> COMPUTED (32 per-nibble route) collapses (siblings
+            # of the M8 pilot, DEFAULT-OFF). Each changes the L10-tail FFN
+            # hidden_dim AND the emitted OUTPUT delta magnitude, so the ON / OFF
+            # builds have different state_dicts and MUST NEVER share a memo / disk
+            # entry. See l10_ops._stack0_pop_loaded_computed_enabled /
+            # _stack0_store_e8_computed_enabled.
+            "C4_STACK0_POP_LOADED_COMPUTED": (
+                os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+            ),
+            "C4_STACK0_STORE_E8_COMPUTED": (
+                os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -3280,6 +3293,19 @@ def _bake_from_scheduled_ops(
         # a serialised entry. See l10_ops._stack0_store_loaded_computed_enabled.
         "C4_STACK0_STORE_LOADED_COMPUTED": (
             os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+        ),
+        # STACK0 pop-loaded / store-top-e8 byte-writeback ENUMERATED (255
+        # per-value AND) -> COMPUTED (32 per-nibble route) collapses (siblings of
+        # the M8 pilot, DEFAULT-OFF). Each changes the L10-tail FFN hidden_dim AND
+        # the emitted OUTPUT delta, so the ON / OFF builds have different
+        # state_dicts and MUST NEVER share a serialised entry. See
+        # l10_ops._stack0_pop_loaded_computed_enabled /
+        # _stack0_store_e8_computed_enabled.
+        "C4_STACK0_POP_LOADED_COMPUTED": (
+            os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+        ),
+        "C4_STACK0_STORE_E8_COMPUTED": (
+            os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
