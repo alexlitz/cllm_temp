@@ -1797,7 +1797,7 @@ class MultiPassDivBlock(nn.Module):
                  q_lo, q_hi, r_lo, r_hi, op_div, op_mod, mark_ax,
                  ax_carry_lo=None, ax_carry_hi=None,
                  stack0_b1_lo=None, stack0_b1_hi=None,
-                 campaign_clear=False):
+                 campaign_clear=False, scratch_bands=None):
         super().__init__()
         self.pipeline = nn.Sequential(*passes)
         self._is_multipass_div_block = True
@@ -1815,6 +1815,16 @@ class MultiPassDivBlock(nn.Module):
         self.stack0_b1_lo = None if stack0_b1_lo is None else int(stack0_b1_lo)
         self.stack0_b1_hi = None if stack0_b1_hi is None else int(stack0_b1_hi)
         self.campaign_clear = bool(campaign_clear)
+        # (base, width) op-local scratch/result bands the cascade populates
+        # with intermediate one-hots. They live OUTSIDE the 30/35-token step
+        # frame, so if left hot they persist into the residual + KV of the
+        # NEXT autoregressive step and corrupt its decode (observed as a
+        # step-2 pc=None frame collapse). Zero them on the div/mod-AX rows
+        # AFTER the OUTPUT routing has consumed them — the block is a leaf
+        # scratchpad, nothing downstream reads these bands.
+        self.scratch_bands = tuple(
+            (int(base), int(width)) for base, width in (scratch_bands or ())
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 1) run the compute cascade (residual threaded through all passes).
@@ -1868,6 +1878,23 @@ class MultiPassDivBlock(nn.Module):
                     x[:, :, lo:lo + 16] = x[:, :, lo:lo + 16] * keep_dm
                 if hi is not None:
                     x[:, :, hi:hi + 16] = x[:, :, hi:hi + 16] * keep_dm
+
+        # 4) scratchpad clear: zero the cascade's workspace + gate + result
+        #    lanes on the div/mod-AX rows. The 43 passes leave ~110 stale
+        #    one-hots (99 in the 1728-dim workspace, plus the OR-gate and the
+        #    Q/R result lanes) at residual ~1.0. These op-local bands are not
+        #    part of the per-step token frame and are read by NOTHING
+        #    downstream (the OUTPUT routing above already consumed the result),
+        #    so left hot they only leak into the NEXT step's residual/KV and
+        #    frame-collapse its decode. Gate on any_dm so non-div/mod rows are
+        #    a pure identity (byte-identity-safe: on a flag-OFF build this
+        #    module never installs).
+        if self.scratch_bands:
+            keep_dm = (1.0 - any_dm)[:, :, None].to(dtype=x.dtype)
+            for base, width in self.scratch_bands:
+                x[:, :, base:base + width] = (
+                    x[:, :, base:base + width] * keep_dm
+                )
 
         return x
 

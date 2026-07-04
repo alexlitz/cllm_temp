@@ -2322,6 +2322,23 @@ def _build_multipass_div_post_op(block, dim_positions, S):
     campaign_clear = (
         no_stack0_emit_enabled() and divmod_axcarry_clear_enabled()
     )
+    # Op-local scratch/result bands the 43-pass cascade populates with
+    # intermediate one-hots. They are NOT part of the per-step token frame and
+    # nothing downstream reads them (the OUTPUT routing consumes q/r), so the
+    # block zeros them on the div/mod-AX rows after routing — otherwise ~110
+    # stale one-hots (99 in the 1728-dim workspace + the gate + Q/R lanes) leak
+    # into the NEXT autoregressive step's residual/KV and collapse its frame
+    # (observed step-2 pc=None). The clear is gated on the div/mod-AX mask, so
+    # a non-div/mod row is untouched (and flag-OFF the block never installs, so
+    # byte-identity holds).
+    scratch_bands = [
+        (proxy.DIV_MULTIPASS_WS, 108 * 16),
+        (proxy.DIV_MP_GATE, 2),
+        (proxy.DIV_MP_Q_LO, 16),
+        (proxy.DIV_MP_Q_HI, 16),
+        (proxy.DIV_MP_R_LO, 16),
+        (proxy.DIV_MP_R_HI, 16),
+    ]
     return MultiPassDivBlock(
         lowered,
         output_lo=proxy.OUTPUT_LO, output_hi=proxy.OUTPUT_HI,
@@ -2333,6 +2350,7 @@ def _build_multipass_div_post_op(block, dim_positions, S):
         stack0_b1_lo=getattr(proxy, "STACK0_BYTE_VAL_1_LO", None),
         stack0_b1_hi=getattr(proxy, "STACK0_BYTE_VAL_1_HI", None),
         campaign_clear=campaign_clear,
+        scratch_bands=scratch_bands,
     )
 
 
