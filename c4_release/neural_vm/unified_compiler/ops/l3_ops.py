@@ -192,10 +192,11 @@ def _register_default_ffn_rules(S: float) -> tuple:
     # --- PC SEQUENTIAL adder — DERIVED via the register_delta primitive ---
     # ``PC_next = PC + INSTR_WIDTH`` (the L3 default every op starts from) is a
     # ``SEQUENTIAL_ADD`` register delta (docs/semantic_spec_CONTROL.md §2c). The
-    # primitive splits into a FIRST-STEP CONSTANT default band (units 0-3,
-    # emitted here) and the nibble-rotation adder + carry band (units 86-133,
-    # emitted below at :func:`_seq_pc_adder_bundle`) — one spec, placed at its
-    # two legacy FFN unit positions. Byte-identical to the hand-authored bands
+    # primitive (built by :func:`_seq_pc_register_delta`) splits into a
+    # FIRST-STEP CONSTANT default band (units 0-3, emitted here) and the
+    # nibble-rotation adder + carry band (units 86-133, emitted below via the
+    # bundle's ``sub_builders["adder"]``) — one spec, placed at its two legacy
+    # FFN unit positions. Byte-identical to the hand-authored bands
     # (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
     _seq_pc_bundle = _seq_pc_register_delta(S)
 
