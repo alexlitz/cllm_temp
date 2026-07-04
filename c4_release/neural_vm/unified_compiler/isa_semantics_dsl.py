@@ -3460,3 +3460,479 @@ def pc_mux(
         reads=reads,
         writes=writes,
     )
+
+
+# ===========================================================================
+# REGISTER-DELTA / FRAME-STEP — the CONTROL-family per-step register updates,
+# derived GENERICALLY as DATA
+# ===========================================================================
+#
+# ``docs/semantic_spec_CONTROL.md`` §2a models every CONTROL op as a tuple of
+# per-step register updates: a ``PcNextSpec`` (WHERE the next PC comes from) +
+# an ordered ``FrameDeltaSpec[]`` (the SP/BP/STACK0 mutations). ``pc_mux`` above
+# derives the branch-target PC OVERRIDES (the L6 cancel-then-write idiom). This
+# section derives the OTHER half of the frame step — the register updates that
+# the pc_mux agent left hand-authored in L3 + model_ops because they were
+# "entangled with SP/BP/STACK0 frame defaults":
+#
+#   * the L3 SEQUENTIAL PC-next adder — ``PC_next = PC + INSTR_WIDTH`` — the
+#     default every op starts from (``_register_default_ffn_rules`` units 0-3 +
+#     86-133: a first-step CONSTANT default + a nibble-rotation ``reg + const``
+#     adder with a lo->hi carry, gated ``MARK_PC ∧ HAS_SE ∧ ¬OP_LEV``);
+#   * the model_ops JSR PC OVERRIDE — ``PC = imm*INSTR_WIDTH + PC_OFFSET`` — the
+#     JSR branch-target, a cancel-then-write override that reads the raw
+#     instruction INDEX from ``FETCH_LO`` (§1d).
+#
+# Both are *per-step register updates over the OUTPUT/EMBED bands*, expressed
+# here as compact DATA:
+#
+#   RegisterDelta {
+#     kind:       SEQUENTIAL_ADD | BRANCH_TARGET   # HOW the next value is formed
+#     amount:     INSTR_WIDTH                       # the +const for SEQUENTIAL_ADD
+#     ...gate + band + write-scale data...
+#   }
+#
+# A ``frame_step`` groups the ordered deltas of ONE opcode's step (§2b's
+# ``ControlOp.frame_delta``) and lowers them TOGETHER — the generic "apply
+# these register deltas this step" the directive asks for. ``register_delta``
+# lowers a single delta; ``frame_step`` concatenates a spec's deltas in
+# declaration order (the same ordering §2a/§G5 requires for LEV's 4-way
+# teardown, expressed as data rather than hand-sequenced FFN banks).
+#
+# NO compiler machinery — every delta lowers through the ordinary
+# ``multi_way_and_rule`` / ``FFNRule`` shapes, so the compiler sees an ordinary
+# FFN op. The byte-identity proof re-expresses the L3 sequential adder + the
+# JSR PC override and gates the whole-model ``state_dict`` hash unchanged
+# (``tools/_isa_golden_hash.py`` == ``91f55411``).
+
+
+@dataclass(frozen=True)
+class SequentialAddDelta:
+    """``register + const`` per-step update as a nibble-rotation adder + carry.
+
+    This is the L3 sequential PC-next: ``PC_next = PC + INSTR_WIDTH``. The old
+    value's nibbles arrive in ``src_lo``/``src_hi`` (``EMBED_LO``/``EMBED_HI``);
+    the update writes the new value's nibbles to ``dst_lo``/``dst_hi``
+    (``OUTPUT_LO``/``OUTPUT_HI``). Three bands:
+
+      * a FIRST-STEP CONSTANT default (``value = PC_OFFSET + INSTR_WIDTH``) —
+        the register's step-0 value before any prior PC exists — as a
+        marker-gated ``set`` + a ``fresh_key``-keyed ``undo`` pair (LO + HI).
+        The set ALSO writes the same nibble into ``src_lo``/``src_hi`` so the
+        downstream adder sees a consistent old-value band.
+      * the INCREMENT band: 16 lo units ``new_lo = (k + amount) % 16`` gated on
+        ``src_lo+k`` + 16 hi units copying ``src_hi+k -> dst_hi+k``.
+      * the CARRY band: when the old lo nibble >= ``16 - amount`` a carry rolls
+        into the hi nibble (``dst_hi+k -= v ; dst_hi+(k+1)%16 += v``).
+
+    ``amount`` is the ISA ``INSTR_WIDTH`` (8); ``const_value`` is
+    ``PC_OFFSET + INSTR_WIDTH`` (the first-step landing). ``suppress_op`` names
+    the opcode that supplies its OWN next value so the increment must NOT fire
+    (``OP_LEV`` — LEV pops the return-PC, §1a).
+    """
+
+    amount: int
+    const_value: int
+    src_lo: str = "EMBED_LO"
+    src_hi: str = "EMBED_HI"
+    dst_lo: str = "OUTPUT_LO"
+    dst_hi: str = "OUTPUT_HI"
+    # First-step default gate (a marker one-hot, e.g. MARK_PC) + the fresh key
+    # that undoes the constant once a real prior value exists.
+    default_marker: str = "MARK_PC"
+    fresh_key: str = "HAS_SE"
+    # The increment/carry gate: (marker, weight) + (fresh_key, weight) +
+    # (suppress_op, weight). Kept as explicit weights so the derived rules
+    # reproduce the hand tuning (OP_LEV at -1/5 for the increment, -1 for the
+    # strict carry) byte-for-byte.
+    suppress_op: str = "OP_LEV"
+    incr_marker_weight: float = 1.0
+    incr_fresh_weight: float = 1.0
+    incr_suppress_weight: float = -1.0 / 5.0
+    incr_threshold: float = 1.5
+    carry_marker_weight: float = 4.0
+    carry_fresh_weight: float = 1.0
+    carry_suppress_weight: float = -1.0
+    carry_threshold: float = 5.5
+
+
+@dataclass(frozen=True)
+class BranchTargetDelta:
+    """A PC-source OVERRIDE that materializes ``PC = imm*INSTR_WIDTH+PC_OFFSET``.
+
+    The model_ops JSR PC override (§1d): cancel the L3 sequential default in the
+    OUTPUT bank (16 ``-OUTPUT_LO[k]`` + 16 ``-OUTPUT_HI[k]`` same-step self-gated
+    units) then WRITE the branch target from the raw instruction INDEX carried in
+    ``index_source`` (``FETCH_LO``): ``target_lo = (i*w+off)&0xF``,
+    ``target_hi = (i*w+off)>>4`` per nibble. Between the two target bands a
+    RESERVED index-hi band (16 units gated on ``index_hi_source`` with no
+    down-write) keeps the unit cursor aligned with the legacy JSR layout (the
+    >=0x100 byte-1 path is a SEPARATE flagged wall, §G3 — this delta emits the
+    reserved no-op units, NOT the byte-1 stage).
+
+    This is the SAME ``idx_to_pc`` encoder ``pc_mux``'s ``imm_to_byte_addr`` mode
+    uses; it lives here (not in ``pc_mux``) because JSR's override writes the
+    NON-cross-step ``OUTPUT_HI`` band (same-step self-gated cancel) and is part
+    of the JSR opcode's full FRAME step (return-addr push + SP decrement), so it
+    reads more naturally as one of JSR's ordered ``register_delta``s.
+    """
+
+    index_source: str = "FETCH_LO"
+    index_hi_source: str = "FETCH_HI"
+    dst_lo: str = "OUTPUT_LO"
+    dst_hi: str = "OUTPUT_HI"
+    reserved_hi_units: int = 16
+
+
+@dataclass(frozen=True)
+class RegisterDeltaSpec:
+    """One per-step register update, tagged by ``kind``.
+
+    Exactly one of ``sequential_add`` / ``branch_target`` is set (matching
+    ``kind``). ``name`` is the rule-name prefix (matches the hand builder's).
+    ``conditions`` is the shared AND gate (opcode + marker + step guard) for the
+    override kinds; SEQUENTIAL_ADD builds its own gate from the delta's marker /
+    fresh-key / suppress-op weights so its multi-band tuning is self-contained.
+    ``threshold`` / ``write_scale`` are the override gate threshold and the
+    per-write ``2.0 / S`` scale.
+    """
+
+    name: str
+    kind: str  # "sequential_add" | "branch_target"
+    write_scale: float
+    sequential_add: Optional[SequentialAddDelta] = None
+    branch_target: Optional[BranchTargetDelta] = None
+    # Only the override kinds (branch_target) use these shared-gate fields.
+    conditions: Tuple[Tuple[str, float], ...] = ()
+    threshold: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("sequential_add", "branch_target"):
+            raise ValueError(
+                f"RegisterDeltaSpec({self.name!r}): kind must be "
+                f"'sequential_add' | 'branch_target'; got {self.kind!r}"
+            )
+        if self.kind == "sequential_add" and self.sequential_add is None:
+            raise ValueError(
+                f"RegisterDeltaSpec({self.name!r}): kind='sequential_add' "
+                "requires sequential_add=SequentialAddDelta(...)"
+            )
+        if self.kind == "branch_target" and self.branch_target is None:
+            raise ValueError(
+                f"RegisterDeltaSpec({self.name!r}): kind='branch_target' "
+                "requires branch_target=BranchTargetDelta(...)"
+            )
+
+
+@dataclass(frozen=True)
+class RegisterDeltaBundle:
+    """Result of :func:`register_delta` / :func:`frame_step`.
+
+    Attributes:
+        specs: the originating :class:`RegisterDeltaSpec` tuple (one for
+            :func:`register_delta`, N for :func:`frame_step`).
+        rules_builder: ``() -> Tuple[FFNRule, ...]`` — the derived rules,
+            byte-identical to the hand-authored builders, in delta order.
+        sub_builders: named sub-band builders for a SEQUENTIAL_ADD delta whose
+            bands are placed at NON-contiguous FFN unit positions (the L3 case:
+            the first-step default at unit 0-3, the adder at 86-133). Keys
+            ``"default"`` and ``"adder"``; empty for other kinds. Each maps to a
+            ``() -> Tuple[FFNRule, ...]``.
+        reads / writes: dep-graph dims the op factory declares (base names).
+    """
+
+    specs: Tuple[RegisterDeltaSpec, ...]
+    rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    reads: Set[str]
+    writes: Set[str]
+    sub_builders: Dict[str, Callable[[], Tuple[FFNRule, ...]]] = None  # type: ignore[assignment]
+
+
+def _seq_add_default_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
+    """The SEQUENTIAL_ADD FIRST-STEP CONSTANT default band (4 units: LO/HI set +
+    fresh_key-keyed undo). Split out so the L3 op can place it at its legacy
+    unit position (0-3) independently of the adder band (86-133) — the two are
+    ONE derived spec but separated in the L3 FFN unit layout."""
+
+    d = spec.sequential_add
+    assert d is not None
+    ws = spec.write_scale
+    rules: list[FFNRule] = []
+    const_lo = d.const_value & 0xF
+    const_hi = (d.const_value >> 4) & 0xF
+    for band, dst, src, val in (
+        ("lo", d.dst_lo, d.src_lo, const_lo),
+        ("hi", d.dst_hi, d.src_hi, const_hi),
+    ):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_first_step_default_{band}_set",
+            conditions=((d.default_marker, 1.0),),
+            threshold=0.5,
+            writes=((f"{dst}+{val}", ws), (f"{src}+{val}", ws)),
+            scope=f"{d.default_marker} and not {d.fresh_key}",
+        ))
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_first_step_default_{band}_undo",
+            conditions=((d.fresh_key, 1.0),),
+            threshold=0.5,
+            gate=d.default_marker,
+            writes=((f"{dst}+{val}", -ws), (f"{src}+{val}", -ws)),
+            scope=f"{d.default_marker} and {d.fresh_key}",
+        ))
+    return rules
+
+
+def _seq_add_adder_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
+    """The SEQUENTIAL_ADD nibble-rotation adder band (48 units: increment lo/hi +
+    carry). The ``reg + const`` core (§2c) — placed at the L3 unit position
+    86-133."""
+
+    d = spec.sequential_add
+    assert d is not None
+    ws = spec.write_scale
+    rules: list[FFNRule] = []
+
+    # --- INCREMENT lo nibble: new_k = (k + amount) % 16 ---
+    incr_conds = (
+        (d.fresh_key, d.incr_fresh_weight),
+        (d.default_marker, d.incr_marker_weight),
+        (d.suppress_op, d.incr_suppress_weight),
+    )
+    incr_scope = (
+        f"{d.default_marker} and {d.fresh_key} and not {d.suppress_op}"
+    )
+    for k in range(16):
+        new_k = (k + d.amount) % 16
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_increment_lo_{k}",
+            conditions=incr_conds,
+            threshold=d.incr_threshold,
+            gate=f"{d.src_lo}+{k}",
+            writes=((f"{d.dst_lo}+{new_k}", ws),),
+            scope=incr_scope,
+        ))
+
+    # --- INCREMENT hi nibble: copy src_hi[k] -> dst_hi[k] ---
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_increment_hi_{k}",
+            conditions=incr_conds,
+            threshold=d.incr_threshold,
+            gate=f"{d.src_hi}+{k}",
+            writes=((f"{d.dst_hi}+{k}", ws),),
+            scope=incr_scope,
+        ))
+
+    # --- CARRY correction: old lo nibble >= 16 - amount -> hi += 1 ---
+    carry_threshold_lo = 16 - d.amount
+    carry_conds = [
+        (d.default_marker, d.carry_marker_weight),
+        (d.fresh_key, d.carry_fresh_weight),
+        (d.suppress_op, d.carry_suppress_weight),
+    ]
+    for lo_bit in range(carry_threshold_lo, 16):
+        carry_conds.append((f"{d.src_lo}+{lo_bit}", 1.0))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_carry_correction_{k}",
+            conditions=tuple(carry_conds),
+            threshold=d.carry_threshold,
+            gate=f"{d.src_hi}+{k}",
+            writes=((f"{d.dst_hi}+{k}", -ws),
+                    (f"{d.dst_hi}+{(k + 1) % 16}", ws)),
+            scope=incr_scope,
+        ))
+
+    return rules
+
+
+def _seq_add_rules(
+    spec: RegisterDeltaSpec, instr_width: int, pc_offset: int,
+) -> list[FFNRule]:
+    """Derive the WHOLE SEQUENTIAL_ADD band (default + adder), contiguous.
+
+    Reproduces the L3 sequential PC+8 bands byte-for-byte in one sequence.
+    For the L3 op (which places the default at unit 0-3 and the adder at
+    86-133) call :func:`_seq_add_default_rules` / :func:`_seq_add_adder_rules`
+    via the bundle's ``sub_builders``.
+    """
+
+    return _seq_add_default_rules(spec) + _seq_add_adder_rules(spec)
+
+
+def _branch_target_rules(
+    spec: RegisterDeltaSpec, instr_width: int, pc_offset: int,
+) -> list[FFNRule]:
+    """Derive the BRANCH_TARGET PC override (cancel + idx_to_pc encoder) rules.
+
+    Reproduces the model_ops JSR PC override byte-for-byte: 16 same-step
+    self-gated OUTPUT_LO cancel + 16 OUTPUT_HI cancel + 16 idx->byte-addr LO
+    target + 16 RESERVED index-hi no-op + 16 idx->byte-addr HI carry.
+    """
+
+    d = spec.branch_target
+    assert d is not None  # guarded by RegisterDeltaSpec.__post_init__
+    conds = spec.conditions
+    thr = spec.threshold
+    ws = spec.write_scale
+    rules: list[FFNRule] = []
+
+    # 16 OUTPUT_LO cancel: gate = -dst_lo[k], write dst_lo[k] (subtract the
+    # L3 sequential default from the SAME-step OUTPUT bank).
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_cancel_output_lo_{k}",
+            conditions=conds,
+            threshold=thr,
+            gate=f"{d.dst_lo}+{k}",
+            gate_weight=-1.0,
+            writes=((f"{d.dst_lo}+{k}", ws),),
+        ))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_cancel_output_hi_{k}",
+            conditions=conds,
+            threshold=thr,
+            gate=f"{d.dst_hi}+{k}",
+            gate_weight=-1.0,
+            writes=((f"{d.dst_hi}+{k}", ws),),
+        ))
+    # 16 index->byte-addr LO target.
+    for k in range(16):
+        target_lo = ((k * instr_width) + pc_offset) & 0xF
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_target_lo_{k}",
+            conditions=conds,
+            threshold=thr,
+            gate=f"{d.index_source}+{k}",
+            writes=((f"{d.dst_lo}+{target_lo}", ws),),
+        ))
+    # 16 RESERVED index-hi no-op (legacy layout alignment; the >=0x100 byte-1
+    # stage is a SEPARATE flagged path, §G3, NOT emitted here).
+    for k in range(d.reserved_hi_units):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_index_hi_reserved_{k}",
+            conditions=conds,
+            threshold=thr,
+            gate=f"{d.index_hi_source}+{k}",
+            writes=(),
+        ))
+    # 16 index->byte-addr HI carry.
+    for k in range(16):
+        target_hi = ((k * instr_width) + pc_offset) >> 4
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_target_hi_from_lo_{k}",
+            conditions=conds,
+            threshold=thr,
+            gate=f"{d.index_source}+{k}",
+            writes=((f"{d.dst_hi}+{target_hi}", ws),),
+        ))
+    return rules
+
+
+def _register_delta_rules(
+    spec: RegisterDeltaSpec, instr_width: int, pc_offset: int,
+) -> list[FFNRule]:
+    if spec.kind == "sequential_add":
+        return _seq_add_rules(spec, instr_width, pc_offset)
+    return _branch_target_rules(spec, instr_width, pc_offset)
+
+
+def _register_delta_reads_writes(
+    spec: RegisterDeltaSpec,
+) -> Tuple[Set[str], Set[str]]:
+    reads: Set[str] = set()
+    writes: Set[str] = set()
+
+    def _base(name: str) -> str:
+        return name.split("+", 1)[0]
+
+    if spec.kind == "sequential_add":
+        d = spec.sequential_add
+        assert d is not None
+        reads.update({d.default_marker, d.fresh_key, d.suppress_op,
+                      d.src_lo, d.src_hi})
+        writes.update({d.dst_lo, d.dst_hi, d.src_lo, d.src_hi})
+    else:
+        d = spec.branch_target
+        assert d is not None
+        for (dim, _w) in spec.conditions:
+            reads.add(_base(dim))
+        reads.update({d.index_source, d.index_hi_source, d.dst_lo, d.dst_hi})
+        writes.update({d.dst_lo, d.dst_hi})
+    return reads, writes
+
+
+def register_delta(
+    spec: RegisterDeltaSpec,
+    *,
+    instr_width: int,
+    pc_offset: int,
+) -> RegisterDeltaBundle:
+    """Derive ONE per-step register update's FFN rules from ``spec``.
+
+    SEQUENTIAL_ADD emits the first-step constant default + the nibble-rotation
+    ``reg + const`` adder (increment lo/hi + carry). BRANCH_TARGET emits the
+    cancel-then-write PC override (same-step OUTPUT cancel + ``idx_to_pc``
+    encoder + reserved index-hi band). Reproduces the hand-authored L3
+    sequential adder / model_ops JSR override byte-for-byte (proof:
+    ``tools/_isa_golden_hash.py`` unchanged with the derived form live).
+
+    ``instr_width`` / ``pc_offset`` are the ISA constants (``constants.py``:
+    ``INSTR_WIDTH=8``, ``PC_OFFSET=2``) — the adder amount + the encoder's
+    numeric inputs. No compiler machinery: the rules lower through the ordinary
+    ``multi_way_and_rule`` / ``FFNRule`` shapes.
+    """
+
+    return frame_step((spec,), instr_width=instr_width, pc_offset=pc_offset)
+
+
+def frame_step(
+    specs: Sequence[RegisterDeltaSpec],
+    *,
+    instr_width: int,
+    pc_offset: int,
+) -> RegisterDeltaBundle:
+    """Derive an ORDERED group of per-step register updates ("apply these
+    register deltas this step").
+
+    ``specs`` is the opcode's ordered ``frame_delta`` list (§2a/§2b). Each
+    delta lowers via :func:`register_delta`'s single-delta path and the rules
+    concatenate in declaration order — the generic "frame step" the CONTROL
+    directive asks for (the same ordering §G5's LEV 4-way teardown needs,
+    expressed as data instead of hand-sequenced FFN banks). Reproduces the
+    hand-authored builders byte-for-byte.
+    """
+
+    specs_t = tuple(specs)
+
+    def rules_builder() -> Tuple[FFNRule, ...]:
+        out: list[FFNRule] = []
+        for spec in specs_t:
+            out.extend(_register_delta_rules(spec, instr_width, pc_offset))
+        return tuple(out)
+
+    reads: Set[str] = set()
+    writes: Set[str] = set()
+    for spec in specs_t:
+        r, w = _register_delta_reads_writes(spec)
+        reads |= r
+        writes |= w
+
+    # Expose split sub-band builders for a lone SEQUENTIAL_ADD whose default +
+    # adder bands land at NON-contiguous FFN unit positions (the L3 case).
+    sub_builders: Dict[str, Callable[[], Tuple[FFNRule, ...]]] = {}
+    if len(specs_t) == 1 and specs_t[0].kind == "sequential_add":
+        only = specs_t[0]
+        sub_builders = {
+            "default": lambda: tuple(_seq_add_default_rules(only)),
+            "adder": lambda: tuple(_seq_add_adder_rules(only)),
+        }
+
+    return RegisterDeltaBundle(
+        specs=specs_t,
+        rules_builder=rules_builder,
+        reads=reads,
+        writes=writes,
+        sub_builders=sub_builders,
+    )
