@@ -2319,6 +2319,336 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
 
 
 # ===========================================================================
+# CAM-BINARY-ADDRESS-MATCH — the multi-slot BINARY-address CAM (L15 LI/LC load,
+# L14 mem-generation store), derived GENERICALLY
+# ===========================================================================
+#
+# The G1(a) ``CamKeyMatch`` multi-dim signature lands EVERY extra Q/K write on
+# ONE ``query_slot`` — the degenerate "24-bit comparator collapses to one slot"
+# case the docstring names. That is exact for the L13 addr-byte gather (a
+# two-dim ``+L1H/-L1H`` marker signature) but it CANNOT express the L15 LI/LC
+# load head, whose address comparator is a BINARY per-bit encoding spanning 24
+# SEPARATE match slots (3 addr bytes × 2 nibbles × 4 bits, slots 4-27): each
+# slot ``s`` scores ``±scale`` per nibble cell by bit ``s`` of the cell index
+# (``2*((k>>bit)&1)-1``), so the head-dim dot product peaks on the K row whose
+# address nibbles EQUAL the queried address. A single-slot signature cannot
+# carry a per-bit encoding — the bits must live on independent head-dim slots so
+# their contributions ADD in the score.
+#
+# On TOP of that binary block the L15 head layers ~40 HETEROGENEOUS
+# discriminator slots (opcode gates, marker blockers, per-store address
+# one-hots, VALID/pop lifecycle rows, the campaign-gated suppressor cancels) —
+# each a bespoke ``(slot, Q-writes, K-writes)`` row that is row-SELECTION
+# structure, not a free projection. They are DATA: a list of
+# :class:`CamDiscriminatorSlot`.
+#
+# :class:`CamBinaryAddressMatch` unifies the two into ONE structural CAM: a
+# :class:`CamBinaryAddressBlock` (the per-bit comparator) + a tuple of
+# :class:`CamDiscriminatorSlot` (the declared discriminator rows) + a tuple of
+# :class:`CamValueBand` value relays. Its builder merges every write into
+# per-``(slot, dim)`` maps (last-write-wins, exactly the lowerer's indexed
+# assignment) so the produced head is byte-identical to the hand-authored L15
+# LI/LC head. It is GENERAL: the SAME shape addresses the L14 mem-generation
+# STORE (``direction="store"``) — a binary-addressed CAM in the emit direction.
+#
+# Like :func:`cam_lookup` the generator returns a pure builder bundle
+# (``head_spec_builder(dim_positions, head_idx)``); no compiler change, it lowers
+# through ``Primitives.generate_attention_head``.
+
+
+@dataclass(frozen=True)
+class CamBinaryAddressBlock:
+    """The BINARY per-bit address comparator (the multi-slot CAM invariant).
+
+    Unlike the single-slot ``CamKeyMatch`` signature, a binary-address block
+    spans ``len(nibble_bands) * width_bits`` CONSECUTIVE head-dim slots starting
+    at :attr:`slot_base`. For nibble band ``base`` (a 16-cell one-hot of a
+    nibble value) and bit ``b`` in ``[0, width_bits)``, the slot
+    ``slot_base + band_index*width_bits + b`` writes ``+scale`` on Q AND K at
+    cell ``base + k`` when bit ``b`` of ``k`` is 1, and ``-scale`` when it is 0
+    (``scale * (2*((k>>b)&1)-1)``). The head-dim dot product therefore peaks on
+    the K row whose address nibbles EQUAL the queried address — the CAM select.
+
+    This is the STRUCTURAL binary-CAM invariant: the address occupies exactly
+    ``len(nibble_bands) * width_bits`` slots, each a declared per-bit ``±scale``
+    comparator, with NO free Q/K writes.
+
+    Attributes:
+        nibble_bands: ordered nibble-band base dim names (each a
+            ``2**width_bits``-cell one-hot). L15's 24-bit address:
+            ``("ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO", "ADDR_B1_HI",
+              "ADDR_B2_LO", "ADDR_B2_HI")``.
+        scale: per-bit ``±scale`` Q/K weight (L15: ``10.0``).
+        slot_base: head-local slot where the address block starts (L15: ``4``).
+        width_bits: bits per nibble band (L15: ``4`` — a 16-cell nibble). Each
+            band consumes ``width_bits`` slots.
+    """
+
+    nibble_bands: Tuple[str, ...]
+    scale: float
+    slot_base: int = 4
+    width_bits: int = 4
+
+    def slot_extent(self) -> int:
+        """First slot index PAST the address block."""
+        return self.slot_base + len(self.nibble_bands) * self.width_bits
+
+    def cells_per_band(self) -> int:
+        return 1 << self.width_bits
+
+
+@dataclass(frozen=True)
+class CamDiscriminatorSlot:
+    """One HETEROGENEOUS discriminator row of a binary-address CAM, as DATA.
+
+    The L15 LI/LC head layers ~40 bespoke discriminator rows on top of the
+    binary-address block: opcode gates (``OP_LI_RELAY``/``OP_LC_RELAY`` restore),
+    marker blockers (``MARK_PC``/``MARK_SP`` suppress), the per-store address
+    one-hots, the VALID/pop lifecycle rows, the sink bias. Each is a
+    row-SELECTION structure — a declared ``(slot, Q-writes, K-writes)`` — not a
+    free projection. Declaring them as DATA (a tuple of these) makes the whole
+    head derivable without hand-authored per-cell ``W_q``/``W_k`` writes.
+
+    A discriminator MAY also carry V/K value writes (the byte-select /
+    per-head value-lane rows the L15 head interleaves into its slot range) via
+    :attr:`v` / :attr:`o`; most carry only Q/K row-select.
+
+    Each ``(dim, weight)`` name supports the ``BASE+offset`` token form (e.g.
+    ``"CMP+3"``, ``"ADDR_B0_LO+8"``) resolved exactly like :func:`cam_lookup`.
+
+    Attributes:
+        slot: head-local slot the row lands on.
+        q: ``(dim_name, weight)`` Q-side writes on ``slot``.
+        k: ``(dim_name, weight)`` K-side writes on ``slot``.
+        v: ``(dim_name, weight)`` V-side writes on ``slot`` (value-lane rows).
+        o: ``(out_dim_name, weight)`` O-side writes FROM ``slot`` (value relay).
+    """
+
+    slot: int
+    q: Tuple[Tuple[str, float], ...] = ()
+    k: Tuple[Tuple[str, float], ...] = ()
+    v: Tuple[Tuple[str, float], ...] = ()
+    o: Tuple[Tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class CamBinaryAddressMatch:
+    """A binary-addressed CAM head: per-bit address comparator + discriminators.
+
+    The multi-slot generalization of :class:`CamLookupSpec` for heads whose row
+    select is a BINARY per-bit address encoding (the L15 LI/LC value-load head,
+    the L14 mem-generation store) rather than a single content-address key. The
+    head is ONE structural CAM:
+
+      * a :class:`CamBinaryAddressBlock` — the ``±scale`` per-bit comparator
+        across ``len(nibble_bands) * width_bits`` slots (the binary address);
+      * a tuple of :class:`CamDiscriminatorSlot` — the heterogeneous
+        opcode/marker/lifecycle discriminator rows, declared as DATA;
+      * a tuple of :class:`CamValueBand` — the matched row's value relay
+        (``CLEAN_EMBED_{LO,HI} -> OUTPUT_{LO,HI}`` for L15).
+
+    The builder merges every Q/K/V/O write into per-``(slot, dim)`` maps
+    (last-write-wins) so the produced head is BYTE-IDENTICAL to a hand-authored
+    head with the same final cell set — the lowerer is indexed assignment, so
+    only the final set matters. The primitive is GENERAL: reuse it for any
+    binary-addressed CAM.
+
+    Attributes:
+        name: head family name (rule-name / diagnostic prefix).
+        address: the binary per-bit address comparator block.
+        discriminators: the heterogeneous discriminator rows (DATA).
+        value_bands: the matched row's value relay blocks.
+        alibi_slope: per-head ALiBi slope. ``None`` => the op sets its own.
+        value_active: when ``False`` the value relay is omitted (row-select
+            gates + discriminators kept). Mirrors :attr:`CamLookupSpec.value_active`.
+        direction: ``"load"`` (read-by-address, L15 LI/LC) or ``"store"`` (the
+            emit direction, L14 mem-generation). A SEMANTIC tag on the same
+            machinery (recorded so a generic engine knows the data flow); the
+            builder LOWERS both — the store direction merely records that the
+            head binds address→value at the marker.
+        extra_reads: extra dim names to declare as reads beyond the auto set.
+        step_window: the step-scope contract the verifier enforces.
+    """
+
+    name: str
+    address: CamBinaryAddressBlock
+    discriminators: Tuple[CamDiscriminatorSlot, ...]
+    value_bands: Tuple[CamValueBand, ...]
+    alibi_slope: Optional[float] = None
+    value_active: bool = True
+    direction: str = "load"
+    extra_reads: Tuple[str, ...] = ()
+    step_window: StepWindowConstraint = StepWindowConstraint.ANY_STEP
+
+    def __post_init__(self) -> None:
+        if not self.address.nibble_bands and not self.discriminators:
+            raise ValueError(
+                f"CamBinaryAddressMatch({self.name!r}): must declare at least "
+                "an address block or a discriminator slot"
+            )
+        if self.address.width_bits <= 0:
+            raise ValueError(
+                f"CamBinaryAddressMatch({self.name!r}): address width_bits must "
+                f"be positive, got {self.address.width_bits}"
+            )
+        for vb in self.value_bands:
+            if vb.width <= 0:
+                raise ValueError(
+                    f"CamBinaryAddressMatch({self.name!r}): value band "
+                    f"{vb.source_band!r}->{vb.target_band!r} width must be "
+                    f"positive, got {vb.width}"
+                )
+        if self.direction not in ("load", "store"):
+            raise ValueError(
+                f"CamBinaryAddressMatch({self.name!r}): direction must be "
+                f"'load' or 'store', got {self.direction!r}"
+            )
+        # Guard against two discriminators claiming the same slot (a silent
+        # last-write-wins collision the caller almost never intends). A
+        # discriminator MAY intentionally re-write an ADDRESS-block cell (the
+        # L15 local_slot_scale rescale of slots 4..11 is exactly that
+        # last-write-wins override), so address-slot overlap is NOT an error —
+        # only duplicate discriminator slots are.
+        seen: Set[int] = set()
+        for d in self.discriminators:
+            if d.slot in seen:
+                raise ValueError(
+                    f"CamBinaryAddressMatch({self.name!r}): duplicate "
+                    f"discriminator slot {d.slot}"
+                )
+            seen.add(d.slot)
+
+
+@dataclass(frozen=True)
+class CamBinaryAddressBundle:
+    """The artifacts :func:`cam_binary_address_match` generates for one head.
+
+    Attributes:
+        spec: the originating :class:`CamBinaryAddressMatch`.
+        head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. Reproduces the hand-built binary-CAM
+            head EXACTLY (same Q/K/V/O writes at the resolved dim positions).
+        head_reads / head_writes: dim-name sets for the head's Operation.
+    """
+
+    spec: CamBinaryAddressMatch
+    head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    head_reads: Set[str]
+    head_writes: Set[str]
+
+
+def cam_binary_address_match(
+    spec: CamBinaryAddressMatch,
+) -> CamBinaryAddressBundle:
+    """Generate the binary-addressed CAM head for ``spec``.
+
+    Returns a :class:`CamBinaryAddressBundle` whose ``head_spec_builder``
+    reproduces the hand-authored binary-address CAM head byte-identically. Like
+    :func:`cam_lookup` this registers NO residual band (a CAM head relays into
+    EXISTING bands).
+    """
+    addr = spec.address
+
+    def head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
+
+        # Merge every write into per-(slot, dim) maps. The lowerer applies
+        # indexed assignment (last-write-wins), so the produced weights depend
+        # ONLY on the final cell set — an ordered emit list would be equally
+        # byte-identical, but the map makes the last-write-wins semantics
+        # STRUCTURAL (a discriminator can legitimately re-write an address-block
+        # cell, e.g. the L15 local_slot_scale rescale of slots 4..11).
+        q_map: Dict[Tuple[int, int], float] = {}
+        k_map: Dict[Tuple[int, int], float] = {}
+        v_map: Dict[Tuple[int, int], float] = {}
+        o_map: Dict[Tuple[int, int], float] = {}  # keyed (out_dim, slot)
+
+        # (1) The BINARY per-bit address comparator block. Each nibble band
+        #     consumes ``width_bits`` consecutive slots; slot ``+bit`` scores
+        #     ``±scale`` per cell by bit ``bit`` of the cell index.
+        cells = addr.cells_per_band()
+        slot = addr.slot_base
+        for band in addr.nibble_bands:
+            base = _P(band)
+            for bit in range(addr.width_bits):
+                for k in range(cells):
+                    bit_val = 2 * ((k >> bit) & 1) - 1
+                    w = addr.scale * bit_val
+                    q_map[(slot, base + k)] = w
+                    k_map[(slot, base + k)] = w
+                slot += 1
+
+        # (2) The heterogeneous discriminator rows (DATA). Merged AFTER the
+        #     address block so a discriminator can legitimately re-write an
+        #     address cell (the last-write-wins override the L15 head uses).
+        for d in spec.discriminators:
+            for (dim, w) in d.q:
+                q_map[(d.slot, _P(dim))] = float(w)
+            for (dim, w) in d.k:
+                k_map[(d.slot, _P(dim))] = float(w)
+            for (dim, w) in d.v:
+                v_map[(d.slot, _P(dim))] = float(w)
+            for (out_dim, w) in d.o:
+                o_map[(_P(out_dim), d.slot)] = float(w)
+
+        # (3) The value relay blocks: V copies source_band -> V slots; O writes
+        #     those slots into target_band. Omitted when value_active is False.
+        if spec.value_active:
+            for vb in spec.value_bands:
+                src = _P(vb.source_band)
+                tgt = _P(vb.target_band)
+                for j in range(vb.width):
+                    v_map[(vb.v_slot_base + j, src + j)] = 1.0
+                    o_map[(tgt + j, vb.v_slot_base + j)] = vb.o_scale
+
+        q = tuple(AP(s, d, w) for (s, d), w in q_map.items())
+        k = tuple(AP(s, d, w) for (s, d), w in k_map.items())
+        v = tuple(AP(s, d, w) for (s, d), w in v_map.items())
+        o = tuple(AO(od, s, w) for (od, s), w in o_map.items())
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=q, k=k, v=v, o=o,
+            alibi_slope=spec.alibi_slope,
+            step_window=spec.step_window,
+        )
+
+    def _base(name: str) -> str:
+        return name.split("+", 1)[0]
+
+    head_reads: Set[str] = set()
+    for band in addr.nibble_bands:
+        head_reads.add(_base(band))
+    for d in spec.discriminators:
+        for (dim, _w) in d.q:
+            head_reads.add(_base(dim))
+        for (dim, _w) in d.k:
+            head_reads.add(_base(dim))
+        for (dim, _w) in d.v:
+            head_reads.add(_base(dim))
+    head_writes: Set[str] = set()
+    for d in spec.discriminators:
+        for (out_dim, _w) in d.o:
+            head_writes.add(_base(out_dim))
+    if spec.value_active:
+        for vb in spec.value_bands:
+            head_reads.add(_base(vb.source_band))
+            head_writes.add(_base(vb.target_band))
+    head_reads.update(spec.extra_reads)
+
+    return CamBinaryAddressBundle(
+        spec=spec,
+        head_spec_builder=head_spec_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
+    )
+
+
+# ===========================================================================
 # MARKER-BROADCAST — copy an opcode/flag band from the STEP's marker row to
 # THIS op's own multi-byte byte-position rows, derived GENERICALLY
 # ===========================================================================

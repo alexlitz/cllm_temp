@@ -39,7 +39,11 @@ from c4_release.neural_vm.unified_compiler.ir import (
     compare_symbolic_to_lowered_ffn,
 )
 from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
+    CamBinaryAddressBlock,
+    CamBinaryAddressBundle,
+    CamBinaryAddressMatch,
     CamConfirmSlot,
+    CamDiscriminatorSlot,
     CamKeyMatch,
     CamLookupBundle,
     CamLookupSpec,
@@ -64,6 +68,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     ValueRouteBundle,
     ValueRouteChannel,
     ValueRouteSpec,
+    cam_binary_address_match,
     cam_lookup,
     consumer_lookahead_gate,
     cross_step_carry,
@@ -1465,6 +1470,220 @@ def test_l13_mem_addr_gather_derived_is_byte_identical_to_handbuilt():
         assert _canon(derived[i]) == _canon(legacy), (
             f"L13 mem_addr_gather head {i} derived != legacy")
         assert derived[i].head_idx == head_idx
+
+
+# ===========================================================================
+# cam_binary_address_match — the MULTI-SLOT binary-address CAM (L15 LI/LC load,
+# L14 mem-generation store). The per-bit comparator spans 24 SEPARATE match
+# slots (which single-slot CamKeyMatch cannot express) + heterogeneous
+# discriminator slots declared as DATA + the L15 byte-identity DERIVE proof.
+# ===========================================================================
+
+
+def test_cam_binary_address_block_is_per_bit_multislot_comparator():
+    """The binary-address block spans width_bits SEPARATE slots per nibble band;
+    each slot scores +scale when its bit is set in the cell index, -scale when
+    clear (the ±scale per-bit encoding that peaks on the equal-address row)."""
+    dp = {"ADDR_B0_LO": 100, "ADDR_B0_HI": 116, "SRC": 200, "TGT": 300}
+    spec = CamBinaryAddressMatch(
+        name="addr",
+        address=CamBinaryAddressBlock(
+            nibble_bands=("ADDR_B0_LO", "ADDR_B0_HI"),
+            scale=10.0, slot_base=4, width_bits=4),
+        discriminators=(),
+        value_bands=(CamValueBand("SRC", "TGT", 4, 32, 1.0),),
+    )
+    head = cam_binary_address_match(spec).head_spec_builder(dp, 0)
+    # 2 bands * 4 bits = 8 slots (4..11), 16 cells each = 128 Q and 128 K writes.
+    addr_q = [w for w in head.q if 4 <= w.slot <= 11]
+    assert len(addr_q) == 128
+    # Slot 4 = ADDR_B0_LO bit 0: -scale on even cells, +scale on odd cells.
+    s4 = {w.dim: w.weight for w in head.q if w.slot == 4}
+    assert s4[100] == -10.0 and s4[101] == 10.0  # cell 0 (even), cell 1 (odd)
+    # Slot 5 = bit 1: +scale on cells 2,3 (bit1 set), -scale on 0,1.
+    s5 = {w.dim: w.weight for w in head.q if w.slot == 5}
+    assert s5[100] == -10.0 and s5[102] == 10.0
+    # Q == K (a symmetric comparator).
+    assert {(w.slot, w.dim, w.weight) for w in head.q if w.slot <= 11} == \
+        {(w.slot, w.dim, w.weight) for w in head.k}
+
+
+def test_cam_binary_address_match_declares_discriminators_as_data():
+    """The heterogeneous opcode/marker discriminator rows are DATA — a tuple of
+    CamDiscriminatorSlot, each a declared (slot, Q, K, V, O), resolved with the
+    BASE+offset token form. They merge OVER the address block (last-write-wins),
+    so a discriminator may legitimately re-write an address cell."""
+    dp = {"ADDR_B0_LO": 100, "CONST": 0, "OP_LI_RELAY": 7, "CMP": 20,
+          "SRC": 200, "TGT": 300, "VALID": 400}
+    spec = CamBinaryAddressMatch(
+        name="disc",
+        address=CamBinaryAddressBlock(
+            nibble_bands=("ADDR_B0_LO",), scale=10.0, slot_base=4, width_bits=4),
+        discriminators=(
+            CamDiscriminatorSlot(
+                slot=0,
+                q=(("CONST", -2000.0), ("OP_LI_RELAY", 2000.0), ("CMP+3", 50.0)),
+                k=(("CONST", 10.0),)),
+            # A discriminator re-writing an address-block cell (slot 4, cell 0).
+            CamDiscriminatorSlot(
+                slot=4, q=(("ADDR_B0_LO+0", 99.0),)),
+            # A value-lane discriminator (V/O on its own slot).
+            CamDiscriminatorSlot(
+                slot=28, v=(("SRC", 1.0),), o=(("VALID", 1.0),)),
+        ),
+        value_bands=(CamValueBand("SRC", "TGT", 4, 32, 1.0),),
+    )
+    head = cam_binary_address_match(spec).head_spec_builder(dp, 0)
+    s0q = {w.dim: w.weight for w in head.q if w.slot == 0}
+    assert s0q[0] == -2000.0 and s0q[7] == 2000.0 and s0q[23] == 50.0  # CMP+3
+    # Discriminator OVERRIDES the address cell at (slot 4, ADDR_B0_LO+0).
+    s4c0 = [w.weight for w in head.q if w.slot == 4 and w.dim == 100]
+    assert s4c0 == [99.0]
+    # The value-lane discriminator's V/O land on slot 28.
+    assert (28, 200, 1.0) in {(w.slot, w.dim, w.weight) for w in head.v}
+    assert (400, 28, 1.0) in {(w.out_dim, w.slot, w.weight) for w in head.o}
+
+
+def test_cam_binary_address_match_direction_and_validation():
+    """direction records the data flow ('load' L15 LI/LC, 'store' L14 emit);
+    dup slots + address/discriminator slot collisions are rejected."""
+    blk = CamBinaryAddressBlock(
+        nibble_bands=("ADDR_B0_LO",), scale=10.0, slot_base=4, width_bits=4)
+    vb = (CamValueBand("SRC", "TGT", 4, 32, 1.0),)
+    assert CamBinaryAddressMatch(
+        name="s", address=blk, discriminators=(), value_bands=vb).direction \
+        == "load"
+    assert CamBinaryAddressMatch(
+        name="s", address=blk, discriminators=(), value_bands=vb,
+        direction="store").direction == "store"
+    with pytest.raises(ValueError, match="direction must be"):
+        CamBinaryAddressMatch(
+            name="s", address=blk, discriminators=(), value_bands=vb,
+            direction="bogus")
+    with pytest.raises(ValueError, match="duplicate discriminator"):
+        CamBinaryAddressMatch(
+            name="s", address=blk, value_bands=vb,
+            discriminators=(CamDiscriminatorSlot(slot=0),
+                            CamDiscriminatorSlot(slot=0)))
+    # A discriminator MAY overlap an address-block slot (the intended
+    # last-write-wins override the L15 local_slot_scale rescale relies on).
+    ok = CamBinaryAddressMatch(
+        name="s", address=blk, value_bands=vb,
+        discriminators=(CamDiscriminatorSlot(slot=4),))
+    assert ok.discriminators[0].slot == 4
+
+
+def test_l15_li_lc_load_derived_is_byte_identical_to_handbuilt():
+    """DERIVE->PROVE->FLIP->DELETE: the four L15 LI/LC + STACK0 load heads
+    produced by ``cam_binary_address_match`` (the sole live path) match a fresh
+    hand-reconstruction of the DELETED legacy Q/K/V/O writes, byte-for-byte.
+    This is the byte-identity proof behind the golden-hash-neutral flip."""
+    from c4_release.neural_vm.dim_registry_dynamic import (
+        build_default_registry_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.shared import (
+        _as_setdim_proxy,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.l15_ops import (
+        _layer15_memory_lookup_heads_0_3_specs,
+        _L15_HEAD_LAYOUT_BY_NAME,
+    )
+    from c4_release.neural_vm.unified_compiler.positional_invariant import (
+        marker_bank_index,
+    )
+    from c4_release.neural_vm.unified_compiler.primitives import (
+        AO, AP, DeclarativeAttentionHeadSpec,
+    )
+
+    reg = build_default_registry_dynamic()
+    dp = {name: int(slot.start) for name, slot in reg.slots.items()}
+    BD = _as_setdim_proxy(dp)
+    PC_I = marker_bank_index("PC")
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
+    MEM_I = marker_bank_index("MEM")
+
+    def legacy_head(h):
+        byte_q_flag = [BD.MARK_AX, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1,
+                       BD.BYTE_INDEX_2][h]
+        MEM_VAL_DIMS = [None, BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3]
+        q, k = [], []
+        q += [AP(0, BD.CONST, -2000.0), AP(0, BD.OP_LI_RELAY, 2000.0)]
+        if h == 0:
+            q += [AP(0, BD.OP_LC_RELAY, 2000.0), AP(0, BD.CMP + 3, 2000.0)]
+        else:
+            q.append(AP(0, BD.L1H4 + BP_I, 2000.0))
+        q += [AP(0, BD.CMP + 0, -2000.0), AP(0, BD.OP_LEV, -1000.0),
+              AP(0, BD.MARK_PC, -25000.0), AP(0, BD.MARK_SP, -100000.0),
+              AP(0, BD.H1 + SP_I, -50000.0), AP(0, BD.H1 + BP_I, -50000.0)]
+        k.append(AP(0, BD.CONST, 10.0))
+        q.append(AP(29, BD.H1 + PC_I, -20000.0)); k.append(AP(29, BD.CONST, 5.0))
+        q.append(AP(30, BD.H1 + AX_I, -20000.0)); k.append(AP(30, BD.CONST, 5.0))
+        q.append(AP(31, BD.OP_LI_RELAY, 20000.0))
+        if h == 0:
+            q.append(AP(31, BD.OP_LC_RELAY, 20000.0))
+        k.append(AP(31, BD.MEM_STORE, 5.0))
+        q.append(AP(32, BD.MARK_AX, -20000.0)); k.append(AP(32, BD.CONST, 5.0))
+        if h == 0:
+            q += [AP(33, BD.OP_LI_RELAY, 20000.0),
+                  AP(33, BD.OP_LC_RELAY, 20000.0)]
+            k.append(AP(33, BD.MEM_STORE, 5.0))
+        q.append(AP(1, BD.OP_LI_RELAY, 50.0))
+        if h == 0:
+            q += [AP(1, BD.OP_LC_RELAY, 50.0), AP(1, BD.CMP + 3, 50.0)]
+        else:
+            q += [AP(1, BD.L1H4 + BP_I, 50.0), AP(1, BD.H1 + BP_I, -50.0)]
+        q.append(AP(1, BD.CMP + 0, -50.0))
+        k += [AP(1, BD.MEM_STORE, 100.0), AP(1, BD.CONST, -50.0)]
+        q.append(AP(2, BD.CONST, -96.0)); k.append(AP(2, BD.MEM_STORE, 50.0))
+        BS = 60.0
+        q.append(AP(3, byte_q_flag, BS))
+        if h == 0:
+            q.append(AP(3, BD.MARK_STACK0, BS))
+            k += [AP(3, BD.L2H0 + MEM_I, BS), AP(3, BD.H1 + MEM_I, -BS)]
+        else:
+            k.append(AP(3, MEM_VAL_DIMS[h], BS))
+        addr_dim = 4
+        for ab_lo, ab_hi in ((BD.ADDR_B0_LO, BD.ADDR_B0_HI),
+                             (BD.ADDR_B1_LO, BD.ADDR_B1_HI),
+                             (BD.ADDR_B2_LO, BD.ADDR_B2_HI)):
+            for nibble_base in (ab_lo, ab_hi):
+                for bit in range(4):
+                    for nk in range(16):
+                        bv = 2 * ((nk >> bit) & 1) - 1
+                        q.append(AP(addr_dim, nibble_base + nk, 10.0 * bv))
+                        k.append(AP(addr_dim, nibble_base + nk, 10.0 * bv))
+                    addr_dim += 1
+        q += [AP(28, BD.CONST, -500.0), AP(28, byte_q_flag, 500.0)]
+        if h == 0:
+            q.append(AP(28, BD.MARK_STACK0, 500.0))
+        k.append(AP(28, BD.CONST, 5.0))
+        v, o = [], []
+        for kk in range(16):
+            v += [AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0),
+                  AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0)]
+            o += [AO(BD.OUTPUT_LO + kk, 32 + kk, 1.0),
+                  AO(BD.OUTPUT_HI + kk, 48 + kk, 1.0)]
+        hi = _L15_HEAD_LAYOUT_BY_NAME[
+            f"layer15_memory_lookup.li_lc_stack0_h{h}"]
+        return DeclarativeAttentionHeadSpec(
+            head_idx=hi, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o))
+
+    def _canon(spec):
+        return (
+            sorted((w.slot, w.dim, w.weight) for w in spec.q),
+            sorted((w.slot, w.dim, w.weight) for w in spec.k),
+            sorted((w.slot, w.dim, w.weight) for w in spec.v),
+            sorted((w.out_dim, w.slot, w.weight) for w in spec.o),
+        )
+
+    derived = _layer15_memory_lookup_heads_0_3_specs(BD)
+    for h in range(4):
+        legacy = legacy_head(h)
+        assert _canon(derived[h]) == _canon(legacy), (
+            f"L15 LI/LC load head {h} derived != legacy")
+        assert derived[h].head_idx == legacy.head_idx
 
 
 # ===========================================================================
