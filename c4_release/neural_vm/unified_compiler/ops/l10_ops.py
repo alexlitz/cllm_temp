@@ -657,10 +657,11 @@ def _stack0_store_loaded_computed_enabled() -> bool:
     argmax / winner-margin is preserved), so this is BYTE-IDENTITY-BREAKING but
     VERDICT-validated: proving the enumerated->computed collapse.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_STORE_LOADED_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
+    weight-changing but field-identical, new golden).  Kill-switch with
+    ``C4_STACK0_STORE_LOADED_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
 
 
 def _stack0_pop_loaded_computed_enabled() -> bool:
@@ -680,10 +681,11 @@ def _stack0_pop_loaded_computed_enabled() -> bool:
     0 argmax mismatch across all 255 non-zero bytes for BOTH competitor values.
     BYTE-IDENTITY-BREAKING -> verdict-validated.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_POP_LOADED_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
+    weight-changing but field-identical, new golden).  Kill-switch with
+    ``C4_STACK0_POP_LOADED_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
 
 
 def _stack0_store_e8_computed_enabled() -> bool:
@@ -703,10 +705,11 @@ def _stack0_store_e8_computed_enabled() -> bool:
     0 argmax mismatch across all 255 non-zero bytes.  BYTE-IDENTITY-BREAKING ->
     verdict-validated.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_STORE_E8_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
+    weight-changing but field-identical, new golden).  Kill-switch with
+    ``C4_STACK0_STORE_E8_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
 def _stack0_store_top_e0_computed_enabled() -> bool:
     """Flag for GAP-PRIMITIVE #3 pilot — CROSS-LANE COMPUTED ALU->OUTPUT copy.
 
@@ -732,10 +735,11 @@ def _stack0_store_top_e0_computed_enabled() -> bool:
     delta magnitude differs (winner-margin preserved).  BYTE-IDENTITY-BREAKING
     -> VERDICT-validated.
 
-    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
-    ``C4_STACK0_STORE_TOP_E0_COMPUTED=1``.
+    DEFAULT-ON (verdict-neutral cross-lane enumerated->computed collapse
+    realized; weight-changing but field-identical, new golden).  Kill-switch
+    with ``C4_STACK0_STORE_TOP_E0_COMPUTED=0``.
     """
-    return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
+    return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
 
 
 def _lea_byte0_alu_amplify_enabled() -> bool:
@@ -7151,46 +7155,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             )
         return tuple(rules)
 
-    def stack0_store_nonzero_pair_rules() -> tuple[FFNRule, ...]:
-        """Late STACK0 store correction for nonzero ALU byte pairs.
-
-        Store steps can leave the STACK0 marker carrying SP byte-0 residue
-        even though the current ALU bands still contain the stored byte. Limit
-        this correction to CMP[3] store rows and byte values with nonzero low
-        and high nibbles; zero-nibble cases need a stronger disambiguator
-        because ALU zero pollution is also present on these rows.
-        """
-
-        base_conditions = (
-            ("MARK_STACK0", 1.0),
-            ("HAS_SE", 1.0),
-            ("CMP+3", 0.5),
-            ("MEM_STORE", 1.0),
-            ("IS_BYTE", -100.0),
-            ("MARK_AX", -100.0),
-            ("MARK_PC", -100.0),
-            ("MARK_SP", -100.0),
-            ("MARK_BP", -100.0),
-            ("MARK_MEM", -100.0),
-        )
-        rules = []
-        for lo in range(1, 16):
-            for hi in range(1, 16):
-                value = lo | (hi << 4)
-                rules.append(
-                    multi_way_and_rule(
-                        name=f"tail_stack0_store_byte_{value:02x}",
-                        scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                        conditions=base_conditions + (
-                            (f"ALU_LO+{lo}", 1.0),
-                            (f"ALU_HI+{hi}", 1.0),
-                        ),
-                        threshold=5.5,
-                        writes=byte_writes(value, strength=1000.0),
-                    )
-                )
-        return tuple(rules)
+    # NOTE: ``stack0_store_nonzero_pair_rules`` (a 15x15=225-way ENUMERATED
+    # cross-lane ALU->OUTPUT byte-writeback bank) was DELETED here as DEAD
+    # code: the closure was defined but NEVER splatted into the ``rules = (...)``
+    # assembly below (unlike its ``stack0_*_output_rules`` siblings), so it
+    # emitted ZERO FFN units on the build path. Weight-neutral removal (golden
+    # hash unchanged); confirmed uncalled repo-wide. It was NOT a candidate for
+    # the enumerated->computed collapse because its firing region skipped ALL
+    # zero-nibble bytes (``range(1, 16)`` on BOTH nibbles — "zero-nibble cases
+    # need a stronger disambiguator because ALU zero pollution is also present")
+    # which the generic per-nibble ``byte_copy_computed_rules`` route (sums the
+    # full 16-way other band, incl. j=0) does not reproduce.
 
     def stack0_pop_loaded_output_rules() -> tuple[FFNRule, ...]:
         """Let strong L15 STACK0 memory loads beat stale pop-marker cleanup."""

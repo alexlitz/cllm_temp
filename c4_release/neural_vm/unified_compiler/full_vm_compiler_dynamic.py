@@ -2498,29 +2498,29 @@ def compile_full_vm_dynamic(
             # ON / OFF builds have different state_dicts and MUST NEVER share a
             # memo / disk entry. See l10_ops._stack0_store_loaded_computed_enabled.
             "C4_STACK0_STORE_LOADED_COMPUTED": (
-                os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+                os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
             ),
             # STACK0 pop-loaded / store-top-e8 byte-writeback ENUMERATED (255
             # per-value AND) -> COMPUTED (32 per-nibble route) collapses (siblings
-            # of the M8 pilot, DEFAULT-OFF). Each changes the L10-tail FFN
+            # of the M8 pilot, DEFAULT-ON). Each changes the L10-tail FFN
             # hidden_dim AND the emitted OUTPUT delta magnitude, so the ON / OFF
             # builds have different state_dicts and MUST NEVER share a memo / disk
             # entry. See l10_ops._stack0_pop_loaded_computed_enabled /
             # _stack0_store_e8_computed_enabled.
             "C4_STACK0_POP_LOADED_COMPUTED": (
-                os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+                os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
             ),
             "C4_STACK0_STORE_E8_COMPUTED": (
-                os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+                os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
             ),
             # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
             # materializer ENUMERATED (254 per-value AND) -> COMPUTED (32
-            # per-nibble route) collapse (DEFAULT-OFF, opt in =1). Changes the
+            # per-nibble route) collapse (DEFAULT-ON, kill-switch =0). Changes the
             # L10-tail FFN hidden_dim (254 -> 32) AND the OUTPUT delta magnitude,
             # so ON / OFF builds have different state_dicts and MUST NEVER share
             # a memo / disk entry. See l10_ops._stack0_store_top_e0_computed_enabled.
             "C4_STACK0_STORE_TOP_E0_COMPUTED": (
-                os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
+                os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -3298,34 +3298,34 @@ def _bake_from_scheduled_ops(
         # byte-identical (key unchanged when unset).
         "C4_CAMPAIGN": campaign_enabled(),
         # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255 per-value
-        # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-OFF, opt in
-        # =1). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,
+        # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-ON, kill-switch
+        # =0). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,
         # so the ON / OFF builds have different state_dicts and MUST NEVER share
         # a serialised entry. See l10_ops._stack0_store_loaded_computed_enabled.
         "C4_STACK0_STORE_LOADED_COMPUTED": (
-            os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+            os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
         ),
         # STACK0 pop-loaded / store-top-e8 byte-writeback ENUMERATED (255
         # per-value AND) -> COMPUTED (32 per-nibble route) collapses (siblings of
-        # the M8 pilot, DEFAULT-OFF). Each changes the L10-tail FFN hidden_dim AND
+        # the M8 pilot, DEFAULT-ON). Each changes the L10-tail FFN hidden_dim AND
         # the emitted OUTPUT delta, so the ON / OFF builds have different
         # state_dicts and MUST NEVER share a serialised entry. See
         # l10_ops._stack0_pop_loaded_computed_enabled /
         # _stack0_store_e8_computed_enabled.
         "C4_STACK0_POP_LOADED_COMPUTED": (
-            os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "0") != "0"
+            os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
         ),
         "C4_STACK0_STORE_E8_COMPUTED": (
-            os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+            os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
         ),
         # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
         # ENUMERATED (254 per-value AND) -> COMPUTED (32 per-nibble route)
-        # collapse (DEFAULT-OFF, opt in =1). Changes the L10-tail FFN hidden_dim
+        # collapse (DEFAULT-ON, kill-switch =0). Changes the L10-tail FFN hidden_dim
         # AND the emitted OUTPUT delta, so the ON / OFF builds have different
         # state_dicts and MUST NEVER share a serialised entry. See
         # l10_ops._stack0_store_top_e0_computed_enabled.
         "C4_STACK0_STORE_TOP_E0_COMPUTED": (
-            os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
+            os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
