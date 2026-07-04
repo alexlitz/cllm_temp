@@ -2536,54 +2536,21 @@ def _op_imm_relay_dim_map(BD) -> dict:
 def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Declarative replacement for the L8 head-4 OP_IMM relay bake.
 
-    ALiBi recency (slope 0.5) discriminates the slot-0 K signal across
-    multiple prior MARK_AX rows. Without it, softmax averages OP_IMM
-    across ALL prior MARK_AX positions; for multi-IMM programs (e.g.
-    ``IMM 0x200; PSH; IMM 0x1234``) this dilutes the 3rd IMM's relay
-    value below the L8 multibyte_routing threshold (6.5). Slope 0.5
-    pulls the most-recent matching MARK_AX to the front and lets the
-    IMM step's AX byte 0 land on the correct token. Matches the slope
-    used by the L9 ALiBi relay heads (l9_ops.py:1375+).
+    DERIVED (sole path) by the generic :func:`marker_broadcast` head generator
+    (``isa_semantics_dsl.py``): fire at AX byte positions (``IS_BYTE`` +
+    ``H1[AX_I]``), attend BACK to the step's own AX marker row (``MARK_AX``,
+    ALiBi recency slope 0.5), and broadcast ``OP_IMM`` onto the byte positions.
+    ZERO hand-authored relay code; byte-identical to the retired hand path
+    (proof: golden hash held under both C4_DERIVE_IMM states; the flag now only
+    gates the L5/L8 IMM DECODE/routing FFN derivation, not this head).
 
-    Task #392: when ``C4_DERIVE_IMM=1`` this head is DERIVED by the generic
-    :func:`marker_broadcast` head generator (``isa_semantics_dsl.py``) with
-    ZERO hand-authored relay code; byte-identical to the hand path below.
+    ALiBi recency (slope 0.5) discriminates the slot-0 K signal across multiple
+    prior MARK_AX rows so multi-IMM programs (``IMM 0x200; PSH; IMM 0x1234``) do
+    not dilute the relay value below the L8 multibyte_routing threshold (6.5).
     """
     head_idx = _L8_HEAD_LAYOUT_BY_NAME["layer8_op_imm_relay.head_4"]
-
-    if derive_imm_enabled():
-        bundle = marker_broadcast(_op_imm_relay_marker_broadcast_spec())
-        return bundle.head_spec_builder(_op_imm_relay_dim_map(BD), head_idx)
-
-    # Class-1 marker-relative anchor (see ``_layer8_multibyte_fetch_head_spec``):
-    # ``H1+AX_I`` keys on the AX-register threshold-bank slot, frame-invariant.
-    AX_I = marker_bank_index("AX")
-    L8_relay = 20.0
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=(
-            AP(0, BD.IS_BYTE, L8_relay),
-            AP(0, BD.H1 + AX_I, L8_relay),
-            AP(0, BD.CONST, -L8_relay * 1.5),
-            AP(1, BD.IS_BYTE, 500.0),
-            AP(1, BD.CONST, -500.0),
-        ),
-        k=(
-            AP(0, BD.MARK_AX, L8_relay),
-            AP(0, BD.IS_BYTE, -L8_relay * 10),
-            AP(0, BD.CONST, L8_relay * 0.5),
-            AP(1, BD.CONST, 5.0),
-        ),
-        v=(AP(0, BD.OP_IMM, 1.0),),
-        o=(AO(BD.OP_IMM, 0, 1.0),),
-        alibi_slope=0.5,
-        # b23f818c: the ALiBi slope keeps OP_IMM relay mass on the
-        # CURRENT step's MARK_AX. CURRENT_STEP_ONLY makes this contract
-        # explicit so the verifier flags any future regression that
-        # drops the slope back to None (the pre-b23f818c IMM dilution
-        # bug) at decl-time rather than waiting for a smoke failure.
-        step_window=StepWindowConstraint.CURRENT_STEP_ONLY,
-    )
+    bundle = marker_broadcast(_op_imm_relay_marker_broadcast_spec())
+    return bundle.head_spec_builder(_op_imm_relay_dim_map(BD), head_idx)
 
 
 def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
