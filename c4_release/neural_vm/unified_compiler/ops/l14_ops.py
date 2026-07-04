@@ -5,7 +5,11 @@ import os as _os
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
+from ..building_blocks_dsl import (
+    byte_clear_rules,
+    byte_copy_computed_rules,
+    multi_way_and_rule,
+)
 from ..ir import CompilerIR, FFNRule
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -121,6 +125,61 @@ def _psh_arg_val_ax_enabled() -> bool:
     return _os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
 
 
+def _l14_byte_computed_enabled() -> bool:
+    """L14 ADDR_KEY nibble-decode ENUMERATED -> COMPUTED collapse (DEFAULT-OFF).
+
+    Apply the M8 enumerated->computed collapse (proven in L10's
+    ``byte_copy_computed_rules`` / ``_computed_byte_writeback_route_rules``) to
+    the ``_layer14_addr_key_neural_decode`` load-query lo+hi bank: the two
+    16x16 = 256-way ENUMERATED per-(lo,hi) AND banks (one per LI/LC op gate)
+    that copy the AX-marker address nibbles ``ADDR_B0_LO/HI`` straight into
+    ``ADDR_KEY[0..15] / ADDR_KEY[16..31]`` (``byte_off == 0`` -> a PURE
+    per-nibble copy, ``new_lo == lo`` / ``new_hi == hi``) collapse to a 2x16 =
+    32-way per-NIBBLE COMPUTED route each.  512 -> 64 units (-448).
+
+    Each route unit for dest channel ``k`` fires on the shared structural gate
+    (``op_gate + MARK_AX``) AND its own source nibble one-hot (``ADDR_B0_*+k``,
+    weight 1.0) AND the SUM of the OTHER source band's 16 one-hot terms (weight
+    1.0 each; exactly one is on for a valid address byte).  That reconstructs
+    the SAME 2-channel evidence magnitude / ``threshold=3.5`` the enumerated
+    per-(lo,hi) AND used, so the route fires on exactly the same production
+    contexts, then ADDITIVELY writes ``+2/S`` into ``ADDR_KEY+k`` (resp.
+    ``+16+k``) — matching the enumerated bank's positive-only CAM-key write
+    (L15 keys per-nibble equality-match on ADDR_KEY, so there is NO argmax
+    suppression to reproduce; ``additive=True``).
+
+    Only the ``byte_off == 0`` load-query bank is a pure per-nibble copy: the
+    ``value_gates`` lo+hi bank (substage 1) does a ``+byte_off`` add whose HI
+    nibble depends on the LO->HI carry (NOT per-nibble separable) and the
+    common-/carry-top banks (substages 2/3) are single-nibble/carry-correction
+    forms, so those are left enumerated.
+
+    BYTE-IDENTITY-BREAKING when ON (the L14 FFN hidden_dim shrinks 512 -> 64 at
+    this op AND the ADDR_KEY firing/write is recomputed) -> verdict-validated,
+    NOT default-flipped.  Flag OFF -> byte-identical to golden ``91f55411``.
+    """
+    return _os.environ.get("C4_L14_BYTE_COMPUTED", "0") != "0"
+
+
+def _addr_key_neural_decode_unit_count() -> int:
+    """FFN units the ``layer14_addr_key_neural_decode`` op emits.
+
+    OFF (golden): 1024 lo+hi + 64 common-top + 96 carry-top + 544 load-query
+    (2 x (256 lo+hi + 16 top)) = 1728.
+
+    ON (``C4_L14_BYTE_COMPUTED``): the load-query lo+hi ENUMERATED banks (2 x
+    256) collapse to 2 x 32 COMPUTED per-nibble routes, so the load-query block
+    becomes 2 x (32 + 16) = 96 -> total 1024 + 64 + 96 + 96 = 1280 (-448).
+
+    Threaded into ``_L14_CLEANUP_CHAIN_LAYOUT`` so the pinned successor ops
+    (jsr/lc/ent/alu ax-bytes-zero) shift DOWN by 448 when ON and the total L14
+    FFN hidden_dim actually shrinks (a REAL -FFN-unit reduction, not dead
+    slots), exactly as ``layer14_sub_noborrow_high_byte_passthrough`` sizes its
+    entry on ``operand_from_memsp_enabled()``.
+    """
+    return 1280 if _l14_byte_computed_enabled() else 1728
+
+
 # === L14 attention-head layout (pinned indices) =====================
 #
 # ``layer14_mem_generation`` owns heads 0-7 of the L14 attention block:
@@ -230,7 +289,12 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # before addr_key_neural_decode (14.5). See
     # ``make_layer14_jsr_mem_default_suppress_op``.
     "layer14_jsr_mem_default_suppress":      (None,    4),
-    "layer14_addr_key_neural_decode":        (None, 1728),
+    # 1728 (golden) or 1280 when C4_L14_BYTE_COMPUTED collapses the load-query
+    # lo+hi ENUMERATED banks (512 -> 64). Sizing the entry on the flag shifts
+    # the pinned successors DOWN by 448 so the L14 FFN hidden_dim actually
+    # shrinks (a REAL -FFN reduction, not dead slots). Flag OFF -> 1728 ->
+    # golden byte-identical. See _addr_key_neural_decode_unit_count.
+    "layer14_addr_key_neural_decode":        (None, _addr_key_neural_decode_unit_count()),
     "layer14_jsr_ax_bytes_zero":             (None,    4),
     "layer14_lc_ax_bytes_zero":              (None,    4),
     "layer14_alu_nocarry_ax_bytes_zero":     (None,    4),
@@ -5069,30 +5133,61 @@ def _layer14_addr_key_neural_decode_load_query_rules(
         if b1_lo != 0:
             ffn.W_down[ADDR_KEY + 32, unit] = -2.0 / S
     """
+    computed = _l14_byte_computed_enabled()
     rules: list[FFNRule] = []
     for op_gate_name, op_label in _ADDR_KEY_LOAD_QUERY_OPS:
-        # --- (a) lo+hi nibble units (256 per op) ---
-        for hi in range(16):
-            for lo in range(16):
-                rules.append(_addr_key_make_rule(
-                    name=(
-                        f"l14_addr_key_lq_lohi_{op_label}"
-                        f"_hi{hi:x}_lo{lo:x}"
-                    ),
-                    conditions=(
-                        (op_gate_name, 1.0),
-                        ("MARK_AX", 1.0),
-                        (f"ADDR_B0_LO+{lo}", 1.0),
-                        (f"ADDR_B0_HI+{hi}", 1.0),
-                    ),
-                    threshold=3.5,
-                    writes=(
-                        (f"ADDR_KEY+{lo}", 2.0 / S),
-                        (f"ADDR_KEY+{16 + hi}", 2.0 / S),
-                    ),
-                    blocker_dim_name=None,
-                    scope=None,
-                ))
+        if computed:
+            # --- (a') COMPUTED lo+hi route (32 per op, was 256) ---
+            # byte_off == 0 -> new_lo == lo, new_hi == hi: a PURE per-nibble
+            # copy ADDR_B0_LO/HI -> ADDR_KEY[0..15] / [16..31].  Each dest
+            # channel-k unit fires on (op_gate + MARK_AX) AND its own source
+            # nibble AND the SUM of the other source band's one-hot (weight 1
+            # each; one is on for a valid byte) -> SAME 2-channel evidence /
+            # threshold=3.5 the enumerated per-(lo,hi) AND used.  ADDITIVE
+            # +2/S write into ADDR_KEY (positive-only CAM key; L15 keys a
+            # per-nibble equality-match, no argmax suppression to reproduce).
+            rules.extend(byte_copy_computed_rules(
+                src_lo="ADDR_B0_LO",
+                src_hi="ADDR_B0_HI",
+                dst_lo="ADDR_KEY",
+                dst_hi="ADDR_KEY",
+                dst_hi_offset=16,
+                base_conditions=(
+                    (op_gate_name, 1.0),
+                    ("MARK_AX", 1.0),
+                ),
+                threshold=3.5,
+                strength=2.0 / S,
+                additive=True,
+                name_for=(
+                    lambda dst_band, ch, _op=op_label: (
+                        f"l14_addr_key_lq_lohi_route_{_op}_{dst_band}_{ch}"
+                    )
+                ),
+            ))
+        else:
+            # --- (a) lo+hi nibble units (256 per op) ---
+            for hi in range(16):
+                for lo in range(16):
+                    rules.append(_addr_key_make_rule(
+                        name=(
+                            f"l14_addr_key_lq_lohi_{op_label}"
+                            f"_hi{hi:x}_lo{lo:x}"
+                        ),
+                        conditions=(
+                            (op_gate_name, 1.0),
+                            ("MARK_AX", 1.0),
+                            (f"ADDR_B0_LO+{lo}", 1.0),
+                            (f"ADDR_B0_HI+{hi}", 1.0),
+                        ),
+                        threshold=3.5,
+                        writes=(
+                            (f"ADDR_KEY+{lo}", 2.0 / S),
+                            (f"ADDR_KEY+{16 + hi}", 2.0 / S),
+                        ),
+                        blocker_dim_name=None,
+                        scope=None,
+                    ))
         # --- (b) top nibble units (16 per op) ---
         for b1_lo in range(16):
             writes: list[tuple[str, float]] = [

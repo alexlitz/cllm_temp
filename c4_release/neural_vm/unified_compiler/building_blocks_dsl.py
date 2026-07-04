@@ -1114,6 +1114,8 @@ def byte_copy_computed_rules(
     src_hi: str,
     dst_lo: str = "OUTPUT_LO",
     dst_hi: str = "OUTPUT_HI_THIS_STEP",
+    dst_lo_offset: int = 0,
+    dst_hi_offset: int = 0,
     base_conditions: Sequence[Tuple[str, float]],
     threshold: float,
     strength: float,
@@ -1121,6 +1123,7 @@ def byte_copy_computed_rules(
     gate: Optional[object] = None,
     scope: Optional[str] = None,
     dominates_at: Optional[Mapping[str, str]] = None,
+    additive: bool = False,
 ) -> Tuple[FFNRule, ...]:
     """GENERAL cross-lane COMPUTED byte-copy: ``byte_copy(src_lane, dst_lane)``.
 
@@ -1156,6 +1159,12 @@ def byte_copy_computed_rules(
         src_lo / src_hi: SOURCE lane low/high nibble one-hot bases (e.g.
             ``"ALU_LO"`` / ``"ALU_HI"`` for an ALU->OUTPUT materializer).
         dst_lo / dst_hi: DESTINATION lane nibble bases (default OUTPUT).
+        dst_lo_offset / dst_hi_offset: constant base offset added to each
+            dest channel index. Lets a band that PACKS both nibbles into one
+            dim (e.g. ADDR_KEY: lo at ``+0..+15``, hi at ``+16..+31``) pass
+            ``dst_lo=dst_hi="ADDR_KEY"``, ``dst_hi_offset=16`` — the write key
+            stays a single-``+`` form (``ADDR_KEY+16``.. not ``ADDR_KEY+16+..``,
+            which ``DimRef.parse`` would mis-split). Default 0 (separate dims).
         base_conditions: shared structural-evidence gate, emitted verbatim
             ahead of the per-channel source one-hot terms.
         threshold: per-rule AND threshold (matches the enumerated bank's).
@@ -1163,6 +1172,15 @@ def byte_copy_computed_rules(
         name_for: ``(dst_band, k) -> name`` callable; a default is used if
             ``None``.
         gate / scope / dominates_at: threaded to ``multi_way_and_rule``.
+        additive: when ``True``, each route unit writes ONLY ``+strength`` to
+            its own dest channel ``k`` (no ``-strength`` competitor suppression
+            of the other 15). This exactly reproduces an enumerated bank whose
+            per-value unit does an ADDITIVE positive-only write into a CAM /
+            one-hot key band (e.g. the L14 ADDR_KEY nibble decode, which feeds
+            L15's per-nibble equality-match key: the enumerated form writes only
+            ``+2/S`` per matched cell and never suppresses the losers). The
+            default (``False``) keeps the L10 one-hot form (``+strength`` /
+            ``-strength``) used for an OUTPUT-argmax destination.
 
     Returns:
         A ``2 * 16`` (== 32) ``FFNRule`` tuple.
@@ -1173,20 +1191,36 @@ def byte_copy_computed_rules(
     base = tuple(base_conditions)
     write_scale = strength
     rules: list[FFNRule] = []
-    for src_band, src_other, dst_band in (
-        (src_lo, src_hi, dst_lo),
-        (src_hi, src_lo, dst_hi),
+    for src_band, src_other, dst_band, dst_off in (
+        (src_lo, src_hi, dst_lo, dst_lo_offset),
+        (src_hi, src_lo, dst_hi, dst_hi_offset),
     ):
         other_terms = tuple((f"{src_other}+{j}", 1.0) for j in range(16))
         for k in range(16):
-            # One-hot nibble write into the DEST band: +strength to channel
-            # k, -strength to the 15 competitors.
-            dst_writes = tuple(
-                (f"{dst_band}+{j}", write_scale if j == k else -write_scale)
-                for j in range(16)
-            )
+            # ``dst_off`` lets a band that PACKS lo+hi into one dim address the
+            # hi nibbles (e.g. ADDR_KEY hi at ``+16..+31``) without a double
+            # ``+`` in the write key (``DimRef.parse`` rsplits on the LAST ``+``).
+            if additive:
+                # ADDITIVE positive-only write into the DEST band: +strength to
+                # channel k, nothing to the losers (matches an enumerated CAM /
+                # one-hot key materializer that only ever ADDS to matched cells).
+                dst_writes = ((f"{dst_band}+{dst_off + k}", write_scale),)
+            else:
+                # One-hot nibble write into the DEST band: +strength to channel
+                # k, -strength to the 15 competitors.
+                dst_writes = tuple(
+                    (
+                        f"{dst_band}+{dst_off + j}",
+                        write_scale if j == k else -write_scale,
+                    )
+                    for j in range(16)
+                )
             rules.append(multi_way_and_rule(
-                name=name_for(dst_band, k),
+                # Name by the ACTUAL in-band channel index (``dst_off + k``) so
+                # a lo+hi-packed band (offset 0 lo / offset 16 hi) yields unique
+                # names across the two routes; offset-0 callers see ``(band, k)``
+                # unchanged.
+                name=name_for(dst_band, dst_off + k),
                 scope=scope,
                 dominates_at=dominates_at,
                 conditions=base + ((f"{src_band}+{k}", 1.0),) + other_terms,
