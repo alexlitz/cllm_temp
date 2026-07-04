@@ -26,7 +26,13 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
 from ..building_blocks_dsl import byte_route_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
-from ..isa_semantics_dsl import PopCamDelta, RegisterDeltaSpec, register_delta
+from ..isa_semantics_dsl import (
+    PopCamCancel,
+    PopCamCancelBand,
+    PopCamDelta,
+    RegisterDeltaSpec,
+    register_delta,
+)
 from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .residual_band_registry import register_residual_band
@@ -576,6 +582,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     rules = []
     write_scale = 2.0 / S
     first_step_gate = 30.0
+    # LEV ``SP := BP`` teardown is a CANCEL-then-write POP-CAM (docs §G5): the
+    # cancel band (below, ``sp_cancel_conditions``) subtracts the stale SP OUTPUT
+    # residual before the pop writes the freed-BP address. Both bands are derived
+    # by the ONE POP-CAM ``register_delta`` via its ``PopCamCancel``.
     sp_cancel_conditions = (
         (dim_ref('opcode_flag', 'LEV'), 0.2),
         (dim_ref('marker', 'SP'), 1.0),
@@ -585,16 +595,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
-        for k in range(16):
-            rules.append(multi_way_and_rule(
-                name=f"l16_lev_sp_cancel_{band}_{k}",
-                conditions=sp_cancel_conditions,
-                threshold=31.5,
-                gate=f"{output_base}+{k}",
-                gate_weight=-1.0,
-                writes=((f"{output_base}+{k}", write_scale),),
-            ))
 
     sp_value_base_conditions = (
         (dim_ref('opcode_flag', 'LEV'), 1.0),
@@ -643,12 +643,33 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 gate_mode="band_cell",
                 gate_terms=((dim_ref('marker', 'MEM'), -1e6),),
                 threshold=40.0,
+                cancel=PopCamCancel(
+                    name="l16_lev_sp_cancel",
+                    conditions=sp_cancel_conditions,
+                    threshold=31.5,
+                    bands=(
+                        PopCamCancelBand(
+                            band="lo",
+                            output_base="OUTPUT_LO",
+                            output_gate="OUTPUT_LO",
+                        ),
+                        PopCamCancelBand(
+                            band="hi",
+                            output_base="OUTPUT_HI_THIS_STEP",
+                            output_gate="OUTPUT_HI_THIS_STEP",
+                        ),
+                    ),
+                ),
             ),
         ),
         instr_width=INSTR_WIDTH,
         pc_offset=PC_OFFSET,
     ).rules_builder())
 
+    # LEV ``PC := return-addr`` teardown is a CANCEL-then-write POP-CAM (docs §G5):
+    # the HI-band cancel (``pc_cancel_hi_conditions``) subtracts the stale PC
+    # high-byte OUTPUT residual before the pop writes the saved return PC. Derived
+    # by the ONE POP-CAM ``register_delta`` via its ``PopCamCancel``.
     pc_cancel_hi_conditions = (
         (dim_ref('opcode_flag', 'LEV'), 0.2),
         (dim_ref('marker', 'PC'), 1.0),
@@ -656,15 +677,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         (dim_ref('marker', 'SP'), -1.0),
         (dim_ref('marker', 'BP'), -1.0),
     )
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_pc_cancel_hi_{k}",
-            conditions=pc_cancel_hi_conditions,
-            threshold=1.5,
-            gate=f"OUTPUT_HI_THIS_STEP+{k}",
-            gate_weight=-1.0,
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
-        ))
     # LEV ``PC := return-addr`` pop — DERIVED via the POP-CAM register-delta
     # primitive (docs/semantic_spec_CONTROL.md §G5). The saved return PC was
     # relayed by the L9 CAM head into ``TEMP`` (LO nibbles ``0..15``, HI nibbles
@@ -691,6 +703,18 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
                 gate_mode="const",
                 const_gate="CONST",
                 threshold=3.5,
+                cancel=PopCamCancel(
+                    name="l16_lev_pc_cancel",
+                    conditions=pc_cancel_hi_conditions,
+                    threshold=1.5,
+                    bands=(
+                        PopCamCancelBand(
+                            band="hi",
+                            output_base="OUTPUT_HI_THIS_STEP",
+                            output_gate="OUTPUT_HI_THIS_STEP",
+                        ),
+                    ),
+                ),
             ),
         ),
         instr_width=INSTR_WIDTH,
@@ -2904,29 +2928,36 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # the same as before (gate_terms only attenuate via the W_gate matrix
     # at positions where MARK_MEM == 1, which the rule never fires at).
     cancel_lev_sp_gate_terms = ((dim_ref('marker', 'MEM'), -1e6),)
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_stack0_cancel_lev_sp_lo_{k}",
-            conditions=lev_sp_stack0_cancel_conditions + (
-                (dim_ref('memory_lo', 'addr_b0', k), 1.0),
+    # STACK0-side inverse of the LEV ``SP := BP`` pop — DERIVED via the POP-CAM
+    # register-delta primitive (the same ``ADDR_B0_{LO,HI}`` value band + MARK_MEM
+    # gate-blocker + ``hi_shift=1`` low-byte carry as the SP:=BP pop above), but with
+    # a NEGATED ``write_scale`` so each per-nibble unit SUBTRACTS the freed-BP
+    # address the SP materializers leaked onto the STACK0 OUTPUT byte. band_cell
+    # mode folds the band cell into BOTH the AND conditions and the multiplicative
+    # gate; ``lo_shift=0`` / ``hi_shift=1`` match the pop's LO no-shift / HI +16
+    # carry. Byte-identical to the hand-authored inverse loop.
+    rules.extend(register_delta(
+        RegisterDeltaSpec(
+            name="l16_stack0_cancel_lev_sp",
+            kind="pop_cam",
+            write_scale=-write_scale,
+            conditions=lev_sp_stack0_cancel_conditions,
+            pop_cam=PopCamDelta(
+                value_src_lo=_dim_base('memory_lo', 'addr_b0'),
+                value_src_hi=_dim_base('memory_hi', 'addr_b0'),
+                value_hi_offset=0,
+                dst_lo=_dim_base('output_lo', 'nibble'),
+                dst_hi="OUTPUT_HI_THIS_STEP",
+                lo_shift=0,
+                hi_shift=1,
+                gate_mode="band_cell",
+                gate_terms=cancel_lev_sp_gate_terms,
+                threshold=lev_sp_stack0_cancel_threshold,
             ),
-            threshold=lev_sp_stack0_cancel_threshold,
-            gate=dim_ref('memory_lo', 'addr_b0', k),
-            gate_terms=cancel_lev_sp_gate_terms,
-            writes=((dim_ref('output_lo', 'nibble', k), -write_scale),),
-        ))
-    for k in range(16):
-        result = (k + 1) % 16
-        rules.append(multi_way_and_rule(
-            name=f"l16_stack0_cancel_lev_sp_hi_{k}",
-            conditions=lev_sp_stack0_cancel_conditions + (
-                (dim_ref('memory_hi', 'addr_b0', k), 1.0),
-            ),
-            threshold=lev_sp_stack0_cancel_threshold,
-            gate=dim_ref('memory_hi', 'addr_b0', k),
-            gate_terms=cancel_lev_sp_gate_terms,
-            writes=((f"OUTPUT_HI_THIS_STEP+{result}", -write_scale),),
-        ))
+        ),
+        instr_width=INSTR_WIDTH,
+        pc_offset=PC_OFFSET,
+    ).rules_builder())
     return tuple(rules)
 
 

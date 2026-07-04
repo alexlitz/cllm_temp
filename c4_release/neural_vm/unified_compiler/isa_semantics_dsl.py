@@ -4044,6 +4044,51 @@ class AssignDelta:
 
 
 @dataclass(frozen=True)
+class PopCamCancelBand:
+    """One ``-<output_base>[k]`` cancel band of a POP-CAM teardown.
+
+    The LEV pops are a **cancel-then-write** idiom (same shape as the PC-mux
+    override, :class:`PcMuxCancelBand`): before the popped value is written onto
+    ``OUTPUT`` the stale sequential/residual OUTPUT byte at the register slot is
+    subtracted. Each band emits 16 units named ``{cancel.name}_{band}_{k}``
+    that gate on ``output_gate+k`` with ``gate_weight=-1`` and write
+    ``+write_scale`` back onto ``output_base+k`` — the SwiGLU cancel that nets the
+    residual to zero. ``band`` is the rule-name tag (``"lo"`` / ``"hi"``);
+    ``output_base`` is the OUTPUT dim the cancel WRITES; ``output_gate`` is the
+    dim it READS as its ``-1`` gate (the LEV cancels read the SAME-band OUTPUT
+    cell, unlike the PC-mux LO cross-step read).
+    """
+
+    band: str
+    output_base: str
+    output_gate: str
+
+
+@dataclass(frozen=True)
+class PopCamCancel:
+    """The optional cancel half of a POP-CAM teardown (LEV SP/PC pops).
+
+    A POP-CAM pop clears the register's stale OUTPUT residual before writing the
+    popped value. That clear is its OWN AND gate (``conditions`` / ``threshold``,
+    distinct from the pop's value gate) over one or more :class:`PopCamCancelBand`.
+    The LEV ``SP := BP`` pop cancels BOTH bands (``sp_cancel_conditions``,
+    threshold 31.5) with a same-band gate; the LEV ``PC := return-addr`` pop
+    cancels only the HI band (``pc_cancel_hi_conditions``, threshold 1.5). Emitted
+    BEFORE the pop's value rules (matching the hand-authored cancel-then-write
+    order). ``write_scale`` defaults to the enclosing spec's when ``None``;
+    ``name`` is the cancel rule-name prefix (the hand-authored cancel family name,
+    e.g. ``"l16_lev_sp_cancel"`` / ``"l16_lev_pc_cancel"``, which differs from the
+    pop's own ``spec.name``) — each band emits ``{name}_{band}_{k}``.
+    """
+
+    name: str
+    conditions: Tuple[Tuple[str, float], ...]
+    threshold: float
+    bands: Tuple[PopCamCancelBand, ...]
+    write_scale: Optional[float] = None
+
+
+@dataclass(frozen=True)
 class PopCamDelta:
     """A ``register := pop(CAM)`` teardown: gate on a CAM/relay value band and
     write the popped value onto the register's ``OUTPUT`` slot.
@@ -4080,6 +4125,10 @@ class PopCamDelta:
     const_gate: str = "CONST"
     gate_terms: Tuple[Tuple[str, float], ...] = ()
     threshold: float = 40.0
+    # Optional cancel-then-write cancel band (LEV SP/PC pops clear the register's
+    # stale OUTPUT residual before writing the popped value). ``None`` => no
+    # cancel band (a pure additive pop). Emitted BEFORE the value rules.
+    cancel: Optional[PopCamCancel] = None
 
 
 @dataclass(frozen=True)
@@ -4435,6 +4484,22 @@ def _pop_cam_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
     ws = spec.write_scale
     conds = spec.conditions
     rules: list[FFNRule] = []
+    # CANCEL-then-write: the LEV pops clear the register's stale OUTPUT residual
+    # before writing the popped value. Emitted FIRST (matching the hand-authored
+    # cancel loop → pop order).
+    if d.cancel is not None:
+        cancel = d.cancel
+        cws = cancel.write_scale if cancel.write_scale is not None else ws
+        for cb in cancel.bands:
+            for k in range(16):
+                rules.append(multi_way_and_rule(
+                    name=f"{cancel.name}_{cb.band}_{k}",
+                    conditions=cancel.conditions,
+                    threshold=cancel.threshold,
+                    gate=f"{cb.output_gate}+{k}",
+                    gate_weight=-1.0,
+                    writes=((f"{cb.output_base}+{k}", cws),),
+                ))
     for band, dst, src, shift in (
         ("lo", d.dst_lo, d.value_src_lo, d.lo_shift),
         ("hi", d.dst_hi, d.value_src_hi, d.hi_shift),
@@ -4517,6 +4582,12 @@ def _register_delta_reads_writes(
         if cd.gate_mode == "const":
             reads.add(_base(cd.const_gate))
         writes.update({cd.dst_lo, cd.dst_hi})
+        if cd.cancel is not None:
+            for (dim, _w) in cd.cancel.conditions:
+                reads.add(_base(dim))
+            for cb in cd.cancel.bands:
+                reads.add(_base(cb.output_gate))
+                writes.add(_base(cb.output_base))
     else:
         bd = spec.branch_target
         assert bd is not None
