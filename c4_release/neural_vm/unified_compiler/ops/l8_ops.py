@@ -10,10 +10,14 @@ from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstraint
 from ..wide_alu_dsl import nibble_alu_lane_rules
 from ..isa_semantics_dsl import (
+    BandMagnitudeBoost,
+    CamValueBand,
+    FrameRelaySpec,
     MarkerBroadcastBand,
     MarkerBroadcastSpec,
     ValueRouteChannel,
     ValueRouteSpec,
+    frame_relay,
     marker_broadcast,
     value_route,
 )
@@ -2119,133 +2123,125 @@ def _layer8_sp_gather_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
-def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
-    """Declarative replacement for ``vm_step._set_layer8_sp_gather``."""
+def _layer8_sp_gather_dim_map(BD) -> dict:
+    """Resolve every dim name the L8 SP-gather frame-relay heads touch via ``BD``.
 
+    ``frame_relay.head_spec_builder`` needs a name->int dict; the ``H<k>+<I>``
+    threshold-bank tokens + the ``CMP+3`` gate resolve from the BASE name plus
+    the parsed offset inside the generator, so only the BASE names go in the
+    dict. Byte-identical to the hand-built ``BD.NAME`` / ``BD.NAME + offset``
+    lookups.
+    """
+    names = {
+        "MARK_STACK0", "MARK_SP", "MARK_BP",
+        "H1", "H3", "H4", "CMP", "CONST",
+        "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
+        "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO", "ADDR_B1_HI",
+        "ADDR_B2_LO", "ADDR_B2_HI",
+    }
+    return {n: int(getattr(BD, n)) for n in names}
+
+
+def _layer8_sp_gather_frame_bundles():
+    """Build the DSL bundles for the L8 SP-gather heads 0/1/2 + mirrors 6/7.
+
+    Every SP-gather head is a :func:`frame_relay`: it fires at a frame byte-row
+    marker (``MARK_STACK0`` for the main heads, ``MARK_SP`` for the mirrors),
+    narrowed by the L1 threshold-bank discriminators (``H4[BP]`` + ``-H1[AX]`` +
+    ``-H1[SP]`` + ``-H3[MEM]`` + ``-MARK_BP``), its K selects the byte-index row
+    (``BYTE_INDEX_j`` + the ``H1[SP]`` frame confirm) suppressed on the
+    just-branched step (``-CMP+3``), a CONST-anchored confirm slot 33, and it
+    relays ``CLEAN_EMBED_{LO,HI} -> ADDR_Bj_{LO,HI}``. The ``ADDR_B*`` bands
+    carry the verifier-magnitude ``±`` cancel pair (:class:`BandMagnitudeBoost`,
+    slots 34/35 @ 3.0) that lifts them over the L15 same-dim competitor without
+    changing the value.
+
+    Returns ``[(head_layout_name, byte_idx, addr_lo, addr_hi, is_mirror), ...]``
+    → bundle order preserved for a clean diff (order is NOT load-bearing for the
+    lowered weights). ``marker_bank_index`` resolves the frame-invariant
+    threshold-bank slots (byte-identical at STEP_TOKENS=35, unchanged at 30).
+    """
     L = 15.0
-    # Class-1 marker-relative anchors: ``H<k>+<marker_I>`` indexes the
-    # marker-TYPE slot in the fixed-width 7-slot threshold-head bank (PC=0 AX=1
-    # SP=2 BP=3 MEM=4 SE=5), a structural position keyed on marker TYPE whose
-    # order is identical in both the 35- and 30-token frames (STACK0 is a
-    # transition target, never a bank slot) — frame-INVARIANT by construction.
-    # ``marker_bank_index`` is the single source of truth (byte-identical at
-    # STEP_TOKENS=35, unchanged at 30) so the audit recognises these as
-    # declared-invariant rather than bare UNGUARDED offsets.
     AX_I = marker_bank_index("AX")
     SP_I = marker_bank_index("SP")
     BP_I = marker_bank_index("BP")
     MEM_I = marker_bank_index("MEM")
+    MB = _ADDR_MAG_BOOST_WEIGHT
+    MB_P = _ADDR_MAG_BOOST_SLOT_PLUS
+    MB_M = _ADDR_MAG_BOOST_SLOT_MINUS
 
-    specs: list[DeclarativeAttentionHeadSpec] = []
-    _sp_gather_main_names = (
-        "layer8_sp_gather_bake.head_0",
-        "layer8_sp_gather_bake.head_1",
-        "layer8_sp_gather_bake.head_2",
+    # (layout_name, byte_index_dim, addr_lo, addr_hi, marker_dim, marker_weight)
+    _heads = (
+        ("layer8_sp_gather_bake.head_0", "BYTE_INDEX_0",
+         "ADDR_B0_LO", "ADDR_B0_HI", "MARK_STACK0", L),
+        ("layer8_sp_gather_bake.head_1", "BYTE_INDEX_1",
+         "ADDR_B1_LO", "ADDR_B1_HI", "MARK_STACK0", L),
+        ("layer8_sp_gather_bake.head_2", "BYTE_INDEX_2",
+         "ADDR_B2_LO", "ADDR_B2_HI", "MARK_STACK0", L),
+        # D3 mirrors: MARK_SP fire (×2) so ADDR_B0/B1 carry a fresh in-step
+        # SP-derived address on MARK_SP rows without bleeding into the
+        # heads-0-2 MARK_STACK0-only Q semantics.
+        ("layer8_sp_gather_bake.head_6_mark_sp_mirror", "BYTE_INDEX_0",
+         "ADDR_B0_LO", "ADDR_B0_HI", "MARK_SP", 2 * L),
+        ("layer8_sp_gather_bake.head_7_mark_sp_mirror", "BYTE_INDEX_1",
+         "ADDR_B1_LO", "ADDR_B1_HI", "MARK_SP", 2 * L),
     )
-    for j in range(3):
-        byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][j]
-        addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][j]
-        addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][j]
-        specs.append(
-            DeclarativeAttentionHeadSpec(
-                head_idx=_L8_HEAD_LAYOUT_BY_NAME[_sp_gather_main_names[j]],
-                q=(
-                    AP(0, BD.MARK_STACK0, L),
-                    AP(0, BD.H4 + BP_I, L),
-                    AP(0, BD.H1 + AX_I, -L),
-                    AP(0, BD.H1 + SP_I, -L),
-                    AP(0, BD.H3 + MEM_I, -L),
-                    AP(0, BD.MARK_BP, -L),
-                    AP(33, BD.MARK_STACK0, L),
-                    AP(33, BD.CONST, -L / 2),
-                ),
-                k=(
-                    AP(0, byte_idx_dim, L),
-                    AP(0, BD.H1 + SP_I, L),
-                    # Phase 9.C: read from CMP at the same numeric position
-                    # (396+3=399). The cross-step semantics are captured by
-                    # the SSA ``reads={... "CMP.*.-1" ...}`` + ``requires=
-                    # {"after": "layer9_alu"}`` block in
-                    # ``make_layer8_sp_gather_bake_op``; the PREV_STEP alias
-                    # was retired now that SSA spellings own the dep-graph
-                    # contract.
-                    AP(0, BD.CMP + 3, -L),
-                    AP(33, BD.CONST, L),
-                ),
-                v=(
-                    _band_projection_writes(1, BD.CLEAN_EMBED_LO)
-                    + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
-                    + _addr_mag_boost_v(BD)
-                ),
-                o=(
-                    _band_output_writes(addr_lo_out, 1)
-                    + _band_output_writes(addr_hi_out, 17)
-                    + _addr_mag_boost_o(addr_lo_out)
-                    + _addr_mag_boost_o(addr_hi_out)
-                ),
-            )
-        )
 
-    # D3: dedicated MARK_SP mirror heads. The original B7-3 fix added
-    # ``MARK_SP`` firing to heads 0-2 so ADDR_B0/B1 would carry a fresh
-    # in-step SP-derived address at MARK_SP rows (feeding IN_STEP_FRESH /
-    # SP_BYTE0_IS_F8 / ADDR_B0_VALID consumers). That bled into L10/L16
-    # consumers authored against the MARK_STACK0-only Q semantics,
-    # doubling SP_byte0 fatals across the 1096 suite. D3 relocates the
-    # MARK_SP firing onto dedicated heads 6 and 7 (mirrors of j=0/j=1
-    # respectively) so the heads-0-2 Q semantics revert to MARK_STACK0
-    # only. Heads 6 and 7 are otherwise reserved for the
-    # ``make_layer8_head6_ax_carry_refresh_op`` and ``make_layer8_mem_to_alu_op``
-    # bakes, both ``enable=False`` by default so the physical head slots
-    # are free in the production build.
-    _sp_gather_mirror_names = {
-        0: "layer8_sp_gather_bake.head_6_mark_sp_mirror",
-        1: "layer8_sp_gather_bake.head_7_mark_sp_mirror",
-    }
-    for mirror_j in (0, 1):
-        mirror_name = _sp_gather_mirror_names[mirror_j]
-        head_idx = _L8_HEAD_LAYOUT_BY_NAME[mirror_name]
-        byte_idx_dim = [BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2][mirror_j]
-        addr_lo_out = [BD.ADDR_B0_LO, BD.ADDR_B1_LO, BD.ADDR_B2_LO][mirror_j]
-        addr_hi_out = [BD.ADDR_B0_HI, BD.ADDR_B1_HI, BD.ADDR_B2_HI][mirror_j]
-        specs.append(
-            DeclarativeAttentionHeadSpec(
-                head_idx=head_idx,
-                q=(
-                    AP(0, BD.MARK_SP, 2 * L),
-                    AP(0, BD.H4 + BP_I, L),
-                    AP(0, BD.H1 + AX_I, -L),
-                    AP(0, BD.H1 + SP_I, -L),
-                    AP(0, BD.H3 + MEM_I, -L),
-                    AP(0, BD.MARK_BP, -L),
-                    AP(33, BD.MARK_SP, L),
-                    AP(33, BD.CONST, -L / 2),
+    bundles = []
+    for (layout_name, byte_idx, addr_lo, addr_hi, mk, mk_w) in _heads:
+        bundles.append((
+            layout_name,
+            frame_relay(FrameRelaySpec(
+                name=layout_name,
+                q_gates=(
+                    (0, mk, mk_w),
+                    (0, f"H4+{BP_I}", L),
+                    (0, f"H1+{AX_I}", -L),
+                    (0, f"H1+{SP_I}", -L),
+                    (0, f"H3+{MEM_I}", -L),
+                    (0, "MARK_BP", -L),
+                    (33, mk, L),
+                    (33, "CONST", -L / 2),
                 ),
-                k=(
-                    AP(0, byte_idx_dim, L),
-                    AP(0, BD.H1 + SP_I, L),
-                    # Phase 9.C: read from CMP at the same numeric position
-                    # (396+3=399). Mirror of head 0-2 above; SSA
-                    # ``"CMP.*.-1"`` + ``requires["after"]`` carries the
-                    # cross-step semantics that the PREV_STEP alias used to
-                    # express.
-                    AP(0, BD.CMP + 3, -L),
-                    AP(33, BD.CONST, L),
+                k_gates=(
+                    (0, byte_idx, L),
+                    (0, f"H1+{SP_I}", L),
+                    # Phase 9.C: read from CMP+3 (numeric 399). Cross-step
+                    # semantics live in the op's ``CMP.*.-1`` read +
+                    # ``requires["after"]=layer9_alu``.
+                    (0, "CMP+3", -L),
+                    (33, "CONST", L),
                 ),
-                v=(
-                    _band_projection_writes(1, BD.CLEAN_EMBED_LO)
-                    + _band_projection_writes(17, BD.CLEAN_EMBED_HI)
-                    + _addr_mag_boost_v(BD)
+                value_bands=(
+                    CamValueBand("CLEAN_EMBED_LO", addr_lo, 16, 1, 1.0),
+                    CamValueBand("CLEAN_EMBED_HI", addr_hi, 16, 17, 1.0),
                 ),
-                o=(
-                    _band_output_writes(addr_lo_out, 1)
-                    + _band_output_writes(addr_hi_out, 17)
-                    + _addr_mag_boost_o(addr_lo_out)
-                    + _addr_mag_boost_o(addr_hi_out)
+                mag_boosts=(
+                    BandMagnitudeBoost(addr_lo, 16, MB_P, MB_M, MB),
+                    BandMagnitudeBoost(addr_hi, 16, MB_P, MB_M, MB),
                 ),
-            )
-        )
+            )),
+        ))
+    return bundles
 
+
+def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
+    """Declarative replacement for ``vm_step._set_layer8_sp_gather``.
+
+    Every SP-gather head (0/1/2 main + 6/7 MARK_SP mirrors) is DERIVED by the
+    generic :func:`frame_relay` head generator (``isa_semantics_dsl``) — the
+    multi-slot frame-lookup value relay of which the L7 head-1 BP/SP relay is a
+    sibling. No head is hand-authored. The ``ADDR_B*`` verifier-magnitude cancel
+    pair rides the value relay via the new :class:`BandMagnitudeBoost` DSL DATA.
+    Byte-identity is gated by the whole-model state_dict hash (CPU,
+    disk_cache=False) staying unchanged.
+    """
+    dim_map = _layer8_sp_gather_dim_map(BD)
+    specs = []
+    for layout_name, bundle in _layer8_sp_gather_frame_bundles():
+        head_idx = _L8_HEAD_LAYOUT_BY_NAME[layout_name]
+        specs.append(bundle.head_spec_builder(dim_map, head_idx))
     return tuple(specs)
 
 
