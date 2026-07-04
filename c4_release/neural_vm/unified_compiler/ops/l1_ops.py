@@ -422,21 +422,14 @@ def make_threshold_attn_op() -> Operation:
             heads=[h_l1h0, h_l1h1, h_l1h2],
             bd=proxy,
         )
-        # Head 3: STEP_END existence detection (global)
+        # Head 3: STEP_END existence detection (global). The spec is built
+        # by the single-source ``_has_se_head_spec`` helper so the bake and
+        # ``_threshold_attn_ir`` paths never drift (mirrors the shared
+        # ``threshold_attention_head_specs`` + ``_step_end_reg_present_head_spec``
+        # convention already used in this op).
         Primitives.generate_attention_head(
             attn,
-            DeclarativeAttentionHeadSpec(
-                head_idx=h_has_se,
-                q=(AP(0, proxy.CONST, 10.0),),
-                k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
-                v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
-                o=(AO(proxy.HAS_SE, 1, 1.0),),
-                # ANY_STEP: HAS_SE is a global STEP_END existence flag —
-                # by design it fires across every prior step's SE marker
-                # (alibi_slopes[h_has_se] is pinned to 0.0 below to opt
-                # out of the L1-wide ALiBi decay).
-                step_window=StepWindowConstraint.ANY_STEP,
-            ),
+            _has_se_head_spec(proxy, head_idx=h_has_se),
             HD,
         )
         # Head 4: threshold 6.5 for STACK0 byte 0 identification
@@ -448,22 +441,12 @@ def make_threshold_attn_op() -> Operation:
         # weight on the most-recent MARK_SE_ONLY (or MARK_CS at program
         # start) decays as the query position moves further from it. The
         # softmax1 ZFOD anchor produces output ~0 when no SE/CS lies
-        # within ALiBi range.
+        # within ALiBi range. Built by the single-source
+        # ``_in_step_fresh_head_spec`` helper so the bake and IR paths
+        # share one definition.
         Primitives.generate_attention_head(
             attn,
-            DeclarativeAttentionHeadSpec(
-                head_idx=h_in_step_fresh,
-                q=(AP(0, proxy.CONST, 10.0),),
-                k=(
-                    AP(0, proxy.MARK_SE_ONLY, 10.0),
-                    AP(0, proxy.MARK_CS, 10.0),
-                ),
-                v=(
-                    AP(1, proxy.MARK_SE_ONLY, 1.0),
-                    AP(1, proxy.MARK_CS, 1.0),
-                ),
-                o=(AO(proxy.IN_STEP_FRESH, 1, 1.0),),
-            ),
+            _in_step_fresh_head_spec(proxy, head_idx=h_in_step_fresh),
             HD,
         )
         # Head 6 (2026-06-10): STEP_END all-register-presence broadcast.
@@ -585,6 +568,63 @@ def make_threshold_attn_op() -> Operation:
         # in-step register-slot surface.
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _has_se_head_spec(
+    proxy, *, head_idx: int,
+) -> DeclarativeAttentionHeadSpec:
+    """L1 head 3: global STEP_END existence detector (HAS_SE).
+
+    Q anchors on ``CONST`` (fires at every row); K/V anchor on
+    ``MARK_SE_ONLY``; O lifts the copied V slot into ``HAS_SE``.
+    ``step_window=ANY_STEP`` because HAS_SE is a global existence flag
+    that fires across every prior step's SE marker (the bake pins
+    ``alibi_slopes[h_has_se] = 0.0`` so this head opts out of the L1-wide
+    ALiBi decay).
+
+    Single source of truth for both the bake path
+    (:func:`make_threshold_attn_op`) and the ``compiler_ir_factory``
+    (:func:`_threshold_attn_ir`) -- mirrors the
+    ``threshold_attention_head_specs`` / ``_step_end_reg_present_head_spec``
+    convention so the two paths cannot drift.
+    """
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=(AP(0, proxy.CONST, 10.0),),
+        k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
+        v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
+        o=(AO(proxy.HAS_SE, 1, 1.0),),
+        step_window=StepWindowConstraint.ANY_STEP,
+    )
+
+
+def _in_step_fresh_head_spec(
+    proxy, *, head_idx: int,
+) -> DeclarativeAttentionHeadSpec:
+    """L1 head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay.
+
+    Same Q/K/V/O shape as :func:`_has_se_head_spec` but the K/V bank is
+    the OR of ``MARK_SE_ONLY`` and ``MARK_CS`` (the program-start anchor),
+    and the bake pins a POSITIVE ALiBi slope (``IN_STEP_FRESH_ALIBI_S =
+    0.5``) so the attention weight on the most-recent SE/CS decays as the
+    query row moves further from it. The softmax1 ZFOD anchor yields
+    output ~0 when no SE/CS lies within ALiBi range.
+
+    Single source of truth for both the bake path and the IR factory.
+    """
+    return DeclarativeAttentionHeadSpec(
+        head_idx=head_idx,
+        q=(AP(0, proxy.CONST, 10.0),),
+        k=(
+            AP(0, proxy.MARK_SE_ONLY, 10.0),
+            AP(0, proxy.MARK_CS, 10.0),
+        ),
+        v=(
+            AP(1, proxy.MARK_SE_ONLY, 1.0),
+            AP(1, proxy.MARK_CS, 1.0),
+        ),
+        o=(AO(proxy.IN_STEP_FRESH, 1, 1.0),),
     )
 
 
@@ -721,35 +761,12 @@ def _threshold_attn_ir(dim_positions, HD) -> CompilerIR:
         heads=[h_l1h0, h_l1h1, h_l1h2],
         bd=proxy,
     ))
-    specs.append(DeclarativeAttentionHeadSpec(
-        head_idx=h_has_se,
-        q=(AP(0, proxy.CONST, 10.0),),
-        k=(AP(0, proxy.MARK_SE_ONLY, 10.0),),
-        v=(AP(1, proxy.MARK_SE_ONLY, 1.0),),
-        o=(AO(proxy.HAS_SE, 1, 1.0),),
-        # ANY_STEP: HAS_SE is a global STEP_END existence flag — fires
-        # across every prior step's SE marker (alibi_slopes[h_has_se]
-        # is pinned to 0.0 in the bake to opt out of the L1-wide
-        # ALiBi decay).
-        step_window=StepWindowConstraint.ANY_STEP,
-    ))
+    specs.append(_has_se_head_spec(proxy, head_idx=h_has_se))
     specs.extend(Primitives.threshold_attention_head_specs(
         [6.5], [proxy.L1H4], ALIBI_S, HD, heads=[h_l1h4], bd=proxy,
     ))
     # Head 5 (B7-1): IN_STEP_FRESH recency-to-SE/CS decay.
-    specs.append(DeclarativeAttentionHeadSpec(
-        head_idx=h_in_step_fresh,
-        q=(AP(0, proxy.CONST, 10.0),),
-        k=(
-            AP(0, proxy.MARK_SE_ONLY, 10.0),
-            AP(0, proxy.MARK_CS, 10.0),
-        ),
-        v=(
-            AP(1, proxy.MARK_SE_ONLY, 1.0),
-            AP(1, proxy.MARK_CS, 1.0),
-        ),
-        o=(AO(proxy.IN_STEP_FRESH, 1, 1.0),),
-    ))
+    specs.append(_in_step_fresh_head_spec(proxy, head_idx=h_in_step_fresh))
     # Head 6 (2026-06-10): STEP_END register-presence broadcast.
     specs.append(_step_end_reg_present_head_spec(
         proxy, head_idx=h_step_end_reg,
