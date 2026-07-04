@@ -339,6 +339,7 @@ from ..ir import (
     StructuralOp,
 )
 from ..isa_semantics_dsl import (
+    CAM_DROP,
     CamBinaryAddressBlock,
     CamBinaryAddressMatch,
     CamDiscriminatorSlot,
@@ -1194,106 +1195,7 @@ def _layer15_memory_lookup_heads_0_3_specs(
 
     specs: list[DeclarativeAttentionHeadSpec] = []
     for h in range(4):
-        byte_q_flag = byte_q_flags[h]
-
-        discs: list[CamDiscriminatorSlot] = []
-
-        # === Slot 0: Bias -- suppress non-target Q positions ===
-        s0_q: list = [("CONST", -2000.0), ("OP_LI_RELAY", 2000.0)]
-        if h == 0:
-            s0_q.append(("OP_LC_RELAY", 2000.0))
-            s0_q.append(("CMP+3", 2000.0))  # POP group -> stack memory read
-        else:
-            # L1H4[BP] gate active over STACK0 area. The legacy helper also
-            # wrote H1[BP_I] = -2000 here, but the SP/BP byte blocker below
-            # (-50000) overwrites that cell; emit only the final value.
-            s0_q.append((f"L1H4+{BP_I}", 2000.0))
-        s0_q.append(("CMP+0", -2000.0))
-        # LEV suppression and PC/SP marker blockers.
-        s0_q.append(("OP_LEV", -1000.0))
-        s0_q.append(("MARK_PC", -25000.0))
-        s0_q.append(("MARK_SP", -100000.0))
-        # SP/BP byte blocker -- last write wins on (slot=0, H1+BP_I).
-        s0_q.append((f"H1+{SP_I}", -50000.0))
-        s0_q.append((f"H1+{BP_I}", -50000.0))
-        discs.append(CamDiscriminatorSlot(
-            slot=0, q=tuple(s0_q), k=(("CONST", 10.0),)))
-
-        # === Slot 29: PC byte position blocker ===
-        discs.append(CamDiscriminatorSlot(
-            slot=29, q=((f"H1+{PC_I}", -20000.0),), k=(("CONST", 5.0),)))
-
-        # === Slot 30: AX byte position default blocker ===
-        discs.append(CamDiscriminatorSlot(
-            slot=30, q=((f"H1+{AX_I}", -20000.0),), k=(("CONST", 5.0),)))
-
-        # === Slot 31: restore AX-byte score for real LI loads against
-        # stored MEM entries (head 0 also LC). ===
-        s31_q: list = [("OP_LI_RELAY", 20000.0)]
-        if h == 0:
-            s31_q.append(("OP_LC_RELAY", 20000.0))
-        discs.append(CamDiscriminatorSlot(
-            slot=31, q=tuple(s31_q), k=(("MEM_STORE", 5.0),)))
-
-        # === Slot 32: AX marker default blocker ===
-        discs.append(CamDiscriminatorSlot(
-            slot=32, q=(("MARK_AX", -20000.0),), k=(("CONST", 5.0),)))
-
-        # === Slot 33: restore AX-marker score for head 0 LI/LC loads ===
-        if h == 0:
-            discs.append(CamDiscriminatorSlot(
-                slot=33,
-                q=(("OP_LI_RELAY", 20000.0), ("OP_LC_RELAY", 20000.0)),
-                k=(("MEM_STORE", 5.0),)))
-
-        # === Slot 1: Store anchor -- suppress non-store K at target Q ===
-        s1_q: list = [("OP_LI_RELAY", 50.0)]
-        if h == 0:
-            s1_q.append(("OP_LC_RELAY", 50.0))
-            s1_q.append(("CMP+3", 50.0))  # POP group (matches slot 0)
-        else:
-            s1_q.append((f"L1H4+{BP_I}", 50.0))
-            s1_q.append((f"H1+{BP_I}", -50.0))
-        s1_q.append(("CMP+0", -50.0))
-        discs.append(CamDiscriminatorSlot(
-            slot=1, q=tuple(s1_q),
-            k=(("MEM_STORE", 100.0), ("CONST", -50.0))))
-
-        # === Slot 2: ZFOD negative offset for store entries ===
-        discs.append(CamDiscriminatorSlot(
-            slot=2, q=(("CONST", -96.0),), k=(("MEM_STORE", 50.0),)))
-
-        # === Slot 3: Byte selection ===
-        s3_q: list = [(byte_q_flag, BS)]
-        if h == 0:
-            s3_q.append(("MARK_STACK0", BS))
-            # Head 0 -> val byte 0 at d=5: L2H0[MEM]=1, H1[MEM]=0.
-            s3_k = ((f"L2H0+{MEM_I}", BS), (f"H1+{MEM_I}", -BS))
-        else:
-            # Heads 1-3 -> val bytes 1,2,3 via MEM_VAL_B1/B2/B3.
-            s3_k = ((MEM_VAL_DIMS[h], BS),)
-        discs.append(CamDiscriminatorSlot(slot=3, q=tuple(s3_q), k=s3_k))
-
-        # === Slot 28: Per-head position gate ===
-        s28_q: list = [("CONST", -500.0), (byte_q_flag, 500.0)]
-        if h == 0:
-            s28_q.append(("MARK_STACK0", 500.0))
-        discs.append(CamDiscriminatorSlot(
-            slot=28, q=tuple(s28_q), k=(("CONST", 5.0),)))
-
-        cam = CamBinaryAddressMatch(
-            name=f"layer15_memory_lookup.li_lc_stack0_h{h}",
-            address=addr_block,
-            discriminators=tuple(discs),
-            value_bands=value_bands,
-            direction="load",
-            # STEP_WINDOW_AUDIT_2026_06_10: LI/LC + STACK0 load heads read
-            # MARK_MEM tokens by address -- memory persists across step
-            # boundaries by design (runtime slope=0.05 keeps the most-recent
-            # write dominant). Declares the cross-step intent the verifier
-            # would otherwise misclassify as CURRENT_STEP_ONLY.
-            step_window=StepWindowConstraint.ANY_STEP,
-        )
+        cam = _l15_li_lc_load_cam(h, addr_block, value_bands, BS, MEM_VAL_DIMS)
         head_idx = _L15_HEAD_LAYOUT_BY_NAME[
             f"layer15_memory_lookup.li_lc_stack0_h{h}"
         ]
@@ -1301,6 +1203,135 @@ def _layer15_memory_lookup_heads_0_3_specs(
         specs.append(bundle.head_spec_builder(dim_map, head_idx))
 
     return tuple(specs)
+
+
+def _l15_li_lc_load_cam(
+    h: int,
+    addr_block: CamBinaryAddressBlock,
+    value_bands: tuple,
+    BS: float,
+    MEM_VAL_DIMS: tuple,
+    overlay: tuple = (),
+) -> CamBinaryAddressMatch:
+    """Build the head-``h`` L15 LI/LC + STACK0 load :class:`CamBinaryAddressMatch`.
+
+    The BASE binary-address CAM (address comparator + the ~10 heterogeneous
+    opcode/marker/byte-select discriminator rows). ``overlay`` supplies the
+    flag-conditioned OVERRIDE-layer discriminators (see
+    :func:`_layer15_memory_lookup_heads_0_3_specs_with_overrides`); at
+    ``overlay=()`` this is the golden byte-identical base head.
+
+    Marker-bank slot indices resolved through the positional-invariant mechanism
+    (frame-INVARIANT bank-TYPE order; byte-identical in both frames).
+    """
+    PC_I = marker_bank_index("PC")
+    AX_I = marker_bank_index("AX")
+    SP_I = marker_bank_index("SP")
+    BP_I = marker_bank_index("BP")
+    MEM_I = marker_bank_index("MEM")
+
+    byte_q_flags = ("MARK_AX", "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2")
+    byte_q_flag = byte_q_flags[h]
+
+    discs: list[CamDiscriminatorSlot] = []
+
+    # === Slot 0: Bias -- suppress non-target Q positions ===
+    s0_q: list = [("CONST", -2000.0), ("OP_LI_RELAY", 2000.0)]
+    if h == 0:
+        s0_q.append(("OP_LC_RELAY", 2000.0))
+        s0_q.append(("CMP+3", 2000.0))  # POP group -> stack memory read
+    else:
+        # L1H4[BP] gate active over STACK0 area. The legacy helper also
+        # wrote H1[BP_I] = -2000 here, but the SP/BP byte blocker below
+        # (-50000) overwrites that cell; emit only the final value.
+        s0_q.append((f"L1H4+{BP_I}", 2000.0))
+    s0_q.append(("CMP+0", -2000.0))
+    # LEV suppression and PC/SP marker blockers.
+    s0_q.append(("OP_LEV", -1000.0))
+    s0_q.append(("MARK_PC", -25000.0))
+    s0_q.append(("MARK_SP", -100000.0))
+    # SP/BP byte blocker -- last write wins on (slot=0, H1+BP_I).
+    s0_q.append((f"H1+{SP_I}", -50000.0))
+    s0_q.append((f"H1+{BP_I}", -50000.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=0, q=tuple(s0_q), k=(("CONST", 10.0),)))
+
+    # === Slot 29: PC byte position blocker ===
+    discs.append(CamDiscriminatorSlot(
+        slot=29, q=((f"H1+{PC_I}", -20000.0),), k=(("CONST", 5.0),)))
+
+    # === Slot 30: AX byte position default blocker ===
+    discs.append(CamDiscriminatorSlot(
+        slot=30, q=((f"H1+{AX_I}", -20000.0),), k=(("CONST", 5.0),)))
+
+    # === Slot 31: restore AX-byte score for real LI loads against
+    # stored MEM entries (head 0 also LC). ===
+    s31_q: list = [("OP_LI_RELAY", 20000.0)]
+    if h == 0:
+        s31_q.append(("OP_LC_RELAY", 20000.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=31, q=tuple(s31_q), k=(("MEM_STORE", 5.0),)))
+
+    # === Slot 32: AX marker default blocker ===
+    discs.append(CamDiscriminatorSlot(
+        slot=32, q=(("MARK_AX", -20000.0),), k=(("CONST", 5.0),)))
+
+    # === Slot 33: restore AX-marker score for head 0 LI/LC loads ===
+    if h == 0:
+        discs.append(CamDiscriminatorSlot(
+            slot=33,
+            q=(("OP_LI_RELAY", 20000.0), ("OP_LC_RELAY", 20000.0)),
+            k=(("MEM_STORE", 5.0),)))
+
+    # === Slot 1: Store anchor -- suppress non-store K at target Q ===
+    s1_q: list = [("OP_LI_RELAY", 50.0)]
+    if h == 0:
+        s1_q.append(("OP_LC_RELAY", 50.0))
+        s1_q.append(("CMP+3", 50.0))  # POP group (matches slot 0)
+    else:
+        s1_q.append((f"L1H4+{BP_I}", 50.0))
+        s1_q.append((f"H1+{BP_I}", -50.0))
+    s1_q.append(("CMP+0", -50.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=1, q=tuple(s1_q),
+        k=(("MEM_STORE", 100.0), ("CONST", -50.0))))
+
+    # === Slot 2: ZFOD negative offset for store entries ===
+    discs.append(CamDiscriminatorSlot(
+        slot=2, q=(("CONST", -96.0),), k=(("MEM_STORE", 50.0),)))
+
+    # === Slot 3: Byte selection ===
+    s3_q: list = [(byte_q_flag, BS)]
+    if h == 0:
+        s3_q.append(("MARK_STACK0", BS))
+        # Head 0 -> val byte 0 at d=5: L2H0[MEM]=1, H1[MEM]=0.
+        s3_k = ((f"L2H0+{MEM_I}", BS), (f"H1+{MEM_I}", -BS))
+    else:
+        # Heads 1-3 -> val bytes 1,2,3 via MEM_VAL_B1/B2/B3.
+        s3_k = ((MEM_VAL_DIMS[h], BS),)
+    discs.append(CamDiscriminatorSlot(slot=3, q=tuple(s3_q), k=s3_k))
+
+    # === Slot 28: Per-head position gate ===
+    s28_q: list = [("CONST", -500.0), (byte_q_flag, 500.0)]
+    if h == 0:
+        s28_q.append(("MARK_STACK0", 500.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=28, q=tuple(s28_q), k=(("CONST", 5.0),)))
+
+    return CamBinaryAddressMatch(
+        name=f"layer15_memory_lookup.li_lc_stack0_h{h}",
+        address=addr_block,
+        discriminators=tuple(discs),
+        value_bands=value_bands,
+        direction="load",
+        # STEP_WINDOW_AUDIT_2026_06_10: LI/LC + STACK0 load heads read
+        # MARK_MEM tokens by address -- memory persists across step
+        # boundaries by design (runtime slope=0.05 keeps the most-recent
+        # write dominant). Declares the cross-step intent the verifier
+        # would otherwise misclassify as CURRENT_STEP_ONLY.
+        step_window=StepWindowConstraint.ANY_STEP,
+        overlay=tuple(overlay),
+    )
 
 
 def _l15_li_lc_load_dim_map(BD) -> dict:
@@ -1328,20 +1359,34 @@ def _l15_li_lc_load_dim_map(BD) -> dict:
 def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
     BD,
 ) -> tuple[DeclarativeAttentionHeadSpec, ...]:
-    """L15 heads 0-3 base + ``_suppress_l15_lookup_heads_0_3`` merged.
+    """L15 heads 0-3 base CAM + the flag-conditioned OVERRIDE layer as DATA.
 
-    Declarative replacement for the legacy post-bake patch
-    :func:`_suppress_l15_lookup_heads_0_3`. The override cells are
-    dict-merged into the per-head ``q``/``k``/``v``/``o`` maps so the
-    lowered weights are byte-identical with running the suppress
-    helper after :func:`_layer15_memory_lookup_heads_0_3_specs`.
+    DERIVE->PROVE->FLIP->DELETE (2026-07-04): the legacy dict-merge OVERRIDE
+    (``_suppress_l15_lookup_heads_0_3`` post-bake patch) is LIFTED into
+    flag-conditioned :class:`CamDiscriminatorSlot` DATA appended to the base
+    :class:`CamBinaryAddressMatch` via its ``overlay`` field. Instead of building
+    the base head, converting to per-cell maps, and dict-merging override cells
+    over them, we now compute ONLY the override cells (into empty per-slot maps),
+    group them into an ``overlay`` tuple, and let ``cam_binary_address_match``
+    merge them last-write-wins over the base head. The whole L15 memory-lookup
+    family is therefore DERIVED — the value-load is fully expressible as
+    binary-address-CAM DATA (address comparator + base discriminators + value
+    relay + a flag-conditioned discriminator overlay).
 
-    Row wipes (``attn.W_q.data[base + row, :] = 0.0`` etc.) at
-    rows 35-43, 58-63 in the legacy helper are no-ops here because
-    the base spec does not write Q/K at those slots, except for V
-    slot 63 and O column 63 (head 0 only, where the
+    Byte-identity: the primitive's builder merges the overlay AFTER the base
+    discriminators AND value bands (last-write-wins, matching the lowerer's
+    indexed assignment), so the produced head is byte-identical with the old
+    build-then-dict-merge. The two legacy V/O ``.pop`` wipes at slot 63 (the
+    ``nonpop_stack0_marker_blocker`` row) become :data:`CAM_DROP` overlay cells.
+    Every ``if head == 0 and _l15_..._on()`` block is emitted into the overlay
+    ONLY when its flag is on, so flag-OFF (golden 35-tok) is byte-identical to
+    the plain base CAM and each flag's ON weights are unchanged from the lift.
+
+    Row wipes (``attn.W_q.data[base + row, :] = 0.0`` etc.) at rows 35-43, 58-63
+    in the legacy helper are no-ops here because the base spec does not write Q/K
+    at those slots, except V slot 63 and O column 63 (all heads, the
     ``nonpop_stack0_marker_blocker`` wipe drops the base spec's
-    ``CLEAN_EMBED_HI+15`` -> ``OUTPUT_HI+15`` cell).
+    ``CLEAN_EMBED_HI+15`` -> ``OUTPUT_HI+15`` value cell).
     """
 
     # Marker-bank slot indices via the positional-invariant mechanism
@@ -1355,25 +1400,37 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
     BP_I = marker_bank_index("BP")
     MEM_I = marker_bank_index("MEM")
 
-    base_specs = _layer15_memory_lookup_heads_0_3_specs(BD)
+    # Base-CAM constructor inputs (mirror _layer15_memory_lookup_heads_0_3_specs).
+    addr_block = CamBinaryAddressBlock(
+        nibble_bands=(
+            "ADDR_B0_LO", "ADDR_B0_HI",
+            "ADDR_B1_LO", "ADDR_B1_HI",
+            "ADDR_B2_LO", "ADDR_B2_HI",
+        ),
+        scale=10.0, slot_base=4, width_bits=4,
+    )
+    value_bands = (
+        CamValueBand("CLEAN_EMBED_LO", "OUTPUT_LO", 16, 32, 1.0),
+        CamValueBand("CLEAN_EMBED_HI", "OUTPUT_HI", 16, 48, 1.0),
+    )
+    base_BS = 60.0
+    MEM_VAL_DIMS = (None, "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3")
+    dim_map = _l15_li_lc_load_dim_map(BD)
+
     merged: list[DeclarativeAttentionHeadSpec] = []
 
     byte_q_flags = [None, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]
 
-    for spec in base_specs:
-        head = spec.head_idx
-        q_map: dict[tuple[int, int], float] = {
-            (w.slot, w.dim): w.weight for w in spec.q
-        }
-        k_map: dict[tuple[int, int], float] = {
-            (w.slot, w.dim): w.weight for w in spec.k
-        }
-        v_map: dict[tuple[int, int], float] = {
-            (w.slot, w.dim): w.weight for w in spec.v
-        }
-        o_map: dict[tuple[int, int], float] = {
-            (w.out_dim, w.slot): w.weight for w in spec.o
-        }
+    for head in range(4):
+        # OVERRIDE cells only (the base head's cells are supplied by the base
+        # CAM; the overlay is merged over them last-write-wins by the primitive).
+        # Dims are ALREADY-RESOLVED integer positions (``BD.X``) that the CAM
+        # builder's int-tolerant resolver passes through unchanged. A CAM_DROP
+        # value REMOVES the (slot, dim) cell (the legacy V/O ``.pop`` wipe).
+        q_map: dict[tuple[int, int], object] = {}
+        k_map: dict[tuple[int, int], object] = {}
+        v_map: dict[tuple[int, int], object] = {}
+        o_map: dict[tuple[int, int], object] = {}
 
         # === local_slot_scale: byte-0 nibble bit rows (slots 4..11) ===
         local_slot_scale = 100.0
@@ -1842,17 +1899,13 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
         # === nonpop_stack0_marker_blocker (slot 63) ===
         # Legacy: ``attn.W_v[base+63, :] = 0`` then explicit Q/K writes,
         # then ``attn.W_o[:, base+63] = 0`` (wipe V row and O column 63).
-        # In the dict-merged form: drop V at slot 63 and any O writes
-        # targeting slot 63 (base has V (63, CLEAN_EMBED_HI+15)=1 and
-        # O (OUTPUT_HI+15, 63)=1; rescaled to 40.0 above).
+        # As overlay DATA: DROP the BASE value band's V (63, CLEAN_EMBED_HI+15)=1
+        # and O (OUTPUT_HI+15, 63) cells via CAM_DROP, then write the Q/K blocker.
+        # The overlay's O-rescale-to-40 above set (OUTPUT_HI+15, 63)=40; the DROP
+        # removes it (merged after the rescale), matching the legacy pop.
         nonpop_stack0_marker_blocker = 63
-        v_map.pop((nonpop_stack0_marker_blocker, BD.CLEAN_EMBED_HI + 15), None)
-        # Drop any O cell with slot=63 (we just set OUTPUT_HI+15 -> 63 = 40)
-        for out_dim_key in [
-            key for key in o_map
-            if key[1] == nonpop_stack0_marker_blocker
-        ]:
-            o_map.pop(out_dim_key, None)
+        v_map[(nonpop_stack0_marker_blocker, BD.CLEAN_EMBED_HI + 15)] = CAM_DROP
+        o_map[(BD.OUTPUT_HI + 15, nonpop_stack0_marker_blocker)] = CAM_DROP
         q_map[(nonpop_stack0_marker_blocker, BD.MARK_STACK0)] = 60000.0
         q_map[(nonpop_stack0_marker_blocker, BD.CMP + 3)] = -15000.0
         q_map[(nonpop_stack0_marker_blocker, BD.IS_BYTE)] = 60000.0
@@ -2198,32 +2251,35 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             q_map[(104, BD.MARK_AX)] = _jp_q
             k_map[(104, BD.OP_JSR)] = -_jp_k
 
-        new_q = tuple(
-            AP(slot, dim, weight) for (slot, dim), weight in q_map.items()
+        # Group the OVERRIDE cells (int-keyed maps) into per-slot overlay
+        # discriminators (DATA). The CAM builder merges these last-write-wins
+        # over the base head (after the value bands), and a CAM_DROP weight
+        # removes that (slot, dim) cell (the legacy V/O slot-63 wipe).
+        overlay_slots = sorted(
+            {s for (s, _d) in q_map}
+            | {s for (s, _d) in k_map}
+            | {s for (s, _d) in v_map}
+            | {s for (_d, s) in o_map}
         )
-        new_k = tuple(
-            AP(slot, dim, weight) for (slot, dim), weight in k_map.items()
-        )
-        new_v = tuple(
-            AP(slot, dim, weight) for (slot, dim), weight in v_map.items()
-        )
-        new_o = tuple(
-            AO(out_dim, slot, weight)
-            for (out_dim, slot), weight in o_map.items()
-        )
+        overlay: list[CamDiscriminatorSlot] = []
+        for s in overlay_slots:
+            overlay.append(CamDiscriminatorSlot(
+                slot=s,
+                q=tuple((d, w) for (sl, d), w in q_map.items() if sl == s),
+                k=tuple((d, w) for (sl, d), w in k_map.items() if sl == s),
+                v=tuple((d, w) for (sl, d), w in v_map.items() if sl == s),
+                o=tuple((od, w) for (od, sl), w in o_map.items() if sl == s),
+            ))
 
-        merged.append(DeclarativeAttentionHeadSpec(
-            head_idx=head,
-            q=new_q,
-            k=new_k,
-            v=new_v,
-            o=new_o,
-            # STEP_WINDOW_AUDIT_2026_06_10: propagate the base spec's
-            # step-window declaration so the override pass doesn't drop
-            # the ANY_STEP annotation on heads 0-3 (LI/LC + STACK0 load).
-            step_window=spec.step_window,
-            alibi_slope=spec.alibi_slope,
-        ))
+        cam = _l15_li_lc_load_cam(
+            head, addr_block, value_bands, base_BS, MEM_VAL_DIMS,
+            overlay=tuple(overlay),
+        )
+        head_idx = _L15_HEAD_LAYOUT_BY_NAME[
+            f"layer15_memory_lookup.li_lc_stack0_h{head}"
+        ]
+        bundle = cam_binary_address_match(cam)
+        merged.append(bundle.head_spec_builder(dim_map, head_idx))
 
     return tuple(merged)
 
