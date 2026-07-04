@@ -2264,6 +2264,63 @@ def _layer8_sp_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]
     return tuple(specs)
 
 
+# Anti-op gate bank for the head-6 AX_CARRY refresh (excludes the CURRENT AX
+# marker from K so only PAST AX markers match). Order is the imperative list's
+# order (slot 34 + j); order is NOT load-bearing for the lowered weights.
+_HEAD6_ANTI_OPS = (
+    "OP_IMM", "OP_EXIT", "OP_NOP", "OP_JMP", "OP_JSR", "OP_LEV",
+    "OP_BZ", "OP_BNZ", "OP_PSH", "OP_ADJ", "OP_ENT",
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_AND", "OP_OR", "OP_XOR",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_SHL", "OP_SHR", "OP_LI", "OP_LC", "OP_LEA",
+)
+
+
+def _layer8_head6_ax_carry_dim_map(BD) -> dict:
+    """Resolve every dim the head-6 AX_CARRY-refresh frame relay touches via ``BD``."""
+    names = {
+        "MARK_AX", "HAS_SE", "CONST",
+        "OUTPUT_LO", "OUTPUT_HI", "AX_CARRY_LO", "AX_CARRY_HI",
+    }
+    names.update(_HEAD6_ANTI_OPS)
+    return {n: int(getattr(BD, n)) for n in names}
+
+
+def _layer8_head6_ax_carry_frame_spec(HD: int) -> FrameRelaySpec:
+    """Build the head-6 AX_CARRY-refresh frame-relay spec (names only).
+
+    Fires at the current step's AX marker (slot 0: MARK_AX + HAS_SE + CONST bias
+    blocking first-step fires), K matches the AX marker at any past position, a
+    CONST-anchored anti-leak gate (slot 33) suppresses non-AX-marker queries, and
+    the anti-op gate bank (slots 34+) excludes the CURRENT AX marker from K via
+    anti-OP_*. The matched past AX marker's OUTPUT relays into AX_CARRY.
+    """
+    L = 50.0
+    q_gates = [
+        (0, "MARK_AX", L), (0, "HAS_SE", L), (0, "CONST", -L * 1.5),
+        (33, "MARK_AX", L), (33, "CONST", -L / 2),
+    ]
+    k_gates = [
+        (0, "MARK_AX", L), (33, "CONST", L),
+    ]
+    for j, op_dim in enumerate(_HEAD6_ANTI_OPS):
+        slot = 34 + j
+        if slot >= HD:
+            break
+        q_gates.append((slot, op_dim, -L))
+        k_gates.append((slot, op_dim, L))
+    return FrameRelaySpec(
+        name="layer8_head6_ax_carry_refresh",
+        q_gates=tuple(q_gates),
+        k_gates=tuple(k_gates),
+        value_bands=(
+            CamValueBand("OUTPUT_LO", "AX_CARRY_LO", 16, 1, 1.0),
+            CamValueBand("OUTPUT_HI", "AX_CARRY_HI", 16, 17, 1.0),
+        ),
+    )
+
+
 def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
     """L8 attn head 6: refresh AX_CARRY_LO/HI from prev step's AX marker OUTPUT.
 
@@ -2296,53 +2353,22 @@ def make_layer8_head6_ax_carry_refresh_op(enable: bool = False) -> Operation:
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
         # Per-bake attention-head allocator. Head 6 is pinned at its
-        # existing slot so the hand-rolled weight writes below land
-        # byte-identically. Stashed on the attention module so
-        # downstream tooling can inspect the layout. See
-        # :data:`_L8_HEAD_LAYOUT`.
+        # existing slot so the DSL-generated head spec lands byte-identically.
+        # Stashed on the attention module so downstream tooling can inspect the
+        # layout. See :data:`_L8_HEAD_LAYOUT`.
         attn._l8_head_allocator = _allocate_layer8_attn_heads(
             ("layer8_head6_ax_carry_refresh.head_6",)
         )
         head = _L8_HEAD_LAYOUT_BY_NAME["layer8_head6_ax_carry_refresh.head_6"]
-        base = head * HD
-        AX_CARRY_L = 50.0  # head-local Q/K scale
-        # Q[base+0]: fire only at current step's AX marker on subsequent
-        # steps (HAS_SE = 1). The CONST baseline blocks first-step fires.
-        attn.W_q.data[base, BD.MARK_AX] = AX_CARRY_L
-        attn.W_q.data[base, BD.HAS_SE] = AX_CARRY_L
-        attn.W_q.data[base, BD.CONST] = -AX_CARRY_L * 1.5
-        # K[base+0]: match AX marker at any past position.
-        attn.W_k.data[base, BD.MARK_AX] = AX_CARRY_L
-        # V copies OUTPUT_LO/HI from the matched AX marker.
-        for k in range(16):
-            attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 1.0
-            attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 1.0
-        # O writes to AX_CARRY_LO/HI at the query position (current AX marker).
-        for k in range(16):
-            attn.W_o.data[BD.AX_CARRY_LO + k, base + 1 + k] = 1.0
-            attn.W_o.data[BD.AX_CARRY_HI + k, base + 17 + k] = 1.0
-        # Anti-leakage gate (dim 33): suppress at non-AX-marker queries.
-        GATE = 33
-        attn.W_q.data[base + GATE, BD.MARK_AX] = AX_CARRY_L
-        attn.W_q.data[base + GATE, BD.CONST] = -AX_CARRY_L / 2
-        attn.W_k.data[base + GATE, BD.CONST] = AX_CARRY_L
-        # Anti-op gates: exclude the current AX marker from K via anti-OP_*.
-        anti_ops = [
-            BD.OP_IMM, BD.OP_EXIT, BD.OP_NOP, BD.OP_JMP, BD.OP_JSR, BD.OP_LEV,
-            BD.OP_BZ, BD.OP_BNZ, BD.OP_PSH, BD.OP_ADJ, BD.OP_ENT,
-            BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-            BD.OP_AND, BD.OP_OR, BD.OP_XOR,
-            BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-            BD.OP_SHL, BD.OP_SHR,
-            BD.OP_LI, BD.OP_LC, BD.OP_LEA,
-        ]
-        ANTI_OP_SLOT_START = 34
-        for j, op_dim in enumerate(anti_ops):
-            slot = ANTI_OP_SLOT_START + j
-            if slot >= HD:
-                break
-            attn.W_q.data[base + slot, op_dim] = -AX_CARRY_L
-            attn.W_k.data[base + slot, op_dim] = AX_CARRY_L
+        # DERIVED by frame_relay: fire at the current step's AX marker (slot 0:
+        # MARK_AX + HAS_SE + CONST bias so first-step fires are blocked), K
+        # matches the AX marker at any past position, a CONST-anchored anti-leak
+        # gate (slot 33), and the anti-op gate bank (slots 34+) that excludes the
+        # CURRENT AX marker from K via anti-OP_*. Value relay OUTPUT -> AX_CARRY.
+        bundle = frame_relay(_layer8_head6_ax_carry_frame_spec(HD))
+        head_spec = bundle.head_spec_builder(
+            _layer8_head6_ax_carry_dim_map(BD), head)
+        Primitives.generate_attention_head(attn, head_spec, HD)
 
     return Operation(
         name="layer8_head6_ax_carry_refresh",
