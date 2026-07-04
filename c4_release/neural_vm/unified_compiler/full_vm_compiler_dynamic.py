@@ -2196,6 +2196,15 @@ def compile_full_vm_dynamic(
             "C4_STACK0_NEXT_ARITH": (
                 os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
             ),
+            # IMM full-derivation (task #392, DEFAULT-OFF): derives the ENTIRE
+            # IMM opcode from spec — decode (decode_band) + marker_broadcast
+            # relay + value_route copy — with zero hand-authored IMM rules.
+            # Implies C4_DERIVE_DECODE. Byte-identical to the hand path, but the
+            # two builds derive from DIFFERENT source so they must never share a
+            # memo / disk entry.
+            "C4_DERIVE_IMM": (
+                os.environ.get("C4_DERIVE_IMM", "0") != "0"
+            ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
             # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
@@ -3104,6 +3113,14 @@ def _bake_from_scheduled_ops(
         # serialised entry. See shared.sili_cam_b1_enabled.
         "C4_SILI_CAM_B1": (
             os.environ.get("C4_SILI_CAM_B1", "1") != "0"
+        ),
+        # IMM full-derivation (task #392, DEFAULT-OFF): whole IMM opcode from
+        # spec — decode + marker_broadcast relay + value_route (zero
+        # hand-authored IMM rules). Implies C4_DERIVE_DECODE. Byte-identical to
+        # the hand path, different source. ON / OFF must never share a
+        # serialised entry. See shared.derive_imm_enabled.
+        "C4_DERIVE_IMM": (
+            os.environ.get("C4_DERIVE_IMM", "0") != "0"
         ),
         # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
         # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /

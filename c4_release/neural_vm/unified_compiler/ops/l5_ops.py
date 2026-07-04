@@ -8,7 +8,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy, _opcode_name_map
+from .shared import _as_setdim_proxy, _opcode_name_map, derive_imm_enabled
 from ..isa_semantics_dsl import (
     BlankUnit,
     ConsumerLookaheadGateSpec,
