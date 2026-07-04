@@ -2482,6 +2482,15 @@ def compile_full_vm_dynamic(
             # the ON / OFF builds MUST NEVER share a memo / disk entry. DEFAULT-OFF
             # -> golden (35-tok) build is byte-identical (key unchanged when unset).
             "C4_CAMPAIGN": campaign_enabled(),
+            # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255
+            # per-value AND) -> COMPUTED (32 per-nibble route) collapse
+            # (DEFAULT-OFF, opt in =1). Changes the L10-tail FFN hidden_dim
+            # (255 -> 32 units) AND the emitted OUTPUT delta magnitude, so the
+            # ON / OFF builds have different state_dicts and MUST NEVER share a
+            # memo / disk entry. See l10_ops._stack0_store_loaded_computed_enabled.
+            "C4_STACK0_STORE_LOADED_COMPUTED": (
+                os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -3249,6 +3258,14 @@ def _bake_from_scheduled_ops(
         # share a serialised entry. DEFAULT-OFF -> golden (35-tok) build is
         # byte-identical (key unchanged when unset).
         "C4_CAMPAIGN": campaign_enabled(),
+        # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255 per-value
+        # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-OFF, opt in
+        # =1). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,
+        # so the ON / OFF builds have different state_dicts and MUST NEVER share
+        # a serialised entry. See l10_ops._stack0_store_loaded_computed_enabled.
+        "C4_STACK0_STORE_LOADED_COMPUTED": (
+            os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+        ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
         # baseline (or with a different requested band set).

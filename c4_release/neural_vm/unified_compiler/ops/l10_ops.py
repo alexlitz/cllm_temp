@@ -634,6 +634,35 @@ def _lea_byte0_memsp_relay_enabled() -> bool:
     return no_stack0_emit_enabled()
 
 
+def _stack0_store_loaded_computed_enabled() -> bool:
+    """Flag for the M8 pilot — COMPUTED (route) STACK0-store byte-writeback.
+
+    The ``stack0_store_loaded_output_rules`` family is a 16x16 nibble loop that
+    ENUMERATES 255 per-value AND rules: for each byte value ``v = lo|(hi<<4)``
+    one FFN unit fires iff (structural evidence) AND ``OUTPUT_LO+lo`` AND
+    ``OUTPUT_HI_THIS_STEP+hi`` are on, and writes byte ``v`` back to the OUTPUT
+    nibbles.  Because the READ lane == the WRITE lane (OUTPUT), the whole bank is
+    an *identity copy* of the OUTPUT byte gated by structural evidence.
+
+    The COMPUTED replacement collapses those 255 per-value AND units into 32
+    per-nibble ROUTE units (16 for ``OUTPUT_LO`` + 16 for
+    ``OUTPUT_HI_THIS_STEP``).  Each route unit fires on ITS channel's one-hot
+    (plus the sum of the OTHER band's one-hot, so the firing decision keeps the
+    same 2-channel evidence magnitude / threshold=25 as the enumerated bank)
+    and writes ``nibble_value_writes`` for that channel.  Isolated numeric proof
+    (``tools/_probe_m8_computed_writeback.py``): the route reproduces the
+    enumerated bank's WINNING byte (argmax) byte-for-byte across all 256 input
+    values AND matches its firing region on the gate-off / IS_BYTE-block
+    contexts.  The only difference is the raw silu-scaled delta magnitude (the
+    argmax / winner-margin is preserved), so this is BYTE-IDENTITY-BREAKING but
+    VERDICT-validated: proving the enumerated->computed collapse.
+
+    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
+    ``C4_STACK0_STORE_LOADED_COMPUTED=1``.
+    """
+    return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
+
+
 def _lea_byte0_alu_amplify_enabled() -> bool:
     """Flag for the PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER
     (ROOT 1 sibling — the func_square / func_max / func_min re-read LEAs).
@@ -1894,6 +1923,14 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # unchanged. See ``_sp_byte2_carry_computed_enabled``.
     if _sp_byte2_carry_computed_enabled():
         extra -= 254
+    # STACK0 store-loaded byte-writeback enumerated->COMPUTED collapse (M8
+    # pilot): with the flag ON the ``stack0_store_loaded_output_rules`` family
+    # drops from 255 (16x16 per-value AND, minus the lo==hi==0 skip) to 32
+    # (16 LO + 16 HI per-nibble route), so the single-tenant tail range SHRINKS
+    # by 223. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit unchanged.
+    # See ``_stack0_store_loaded_computed_enabled``.
+    if _stack0_store_loaded_computed_enabled():
+        extra -= 223
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -6040,6 +6077,68 @@ def _byte_value_writeback_rules(
     return tuple(rules)
 
 
+def _computed_byte_writeback_route_rules(
+    *,
+    name_for,
+    base_conditions,
+    threshold: float,
+    strength: float,
+    lo_base: str = "OUTPUT_LO",
+    hi_base: str = "OUTPUT_HI_THIS_STEP",
+    competitor_strength: Optional[float] = None,
+    gate: Optional[object] = None,
+    scope: Optional[str] = None,
+    dominates_at: Optional[Mapping[str, str]] = None,
+):
+    """COMPUTED counterpart to :func:`_byte_value_writeback_rules` (M8 pilot).
+
+    Where the enumerated engine emits 255 per-VALUE AND units (one per byte,
+    each reading BOTH nibbles and writing that whole byte), this emits 32
+    per-NIBBLE-CHANNEL ROUTE units: 16 for ``lo_base`` + 16 for ``hi_base``.
+    Each channel-``k`` unit:
+
+      * FIRES iff the shared ``base_conditions`` structural evidence holds AND
+        this channel's one-hot (``{band}+{k}``, weight 1.0) is on AND the OTHER
+        band carries a one-hot (the 16 ``{other}+{j}`` terms, weight 1.0 each;
+        exactly one is on for a valid byte).  Summing the other band keeps the
+        firing decision on the SAME 2-channel evidence magnitude and threshold
+        the enumerated per-value AND used, so the route fires on exactly the
+        same production contexts (verified in
+        ``tools/_probe_m8_computed_writeback.py``: identical firing region on
+        the gate-off / IS_BYTE-block cases, 0 argmax mismatch across all 256
+        bytes).
+      * WRITES ``nibble_value_writes(band, k)`` — ``+strength`` to channel ``k``
+        and ``-competitor_strength`` to the 15 competitors of ITS band.
+
+    When the LO and HI route units for the observed byte both fire, together
+    they reconstruct the same OUTPUT byte the single enumerated unit wrote —
+    a COMPUTED copy, not a 256-way lookup.  Same order (LO band then HI band,
+    channel-ascending), same gate / scope / dominates_at.
+    """
+
+    del competitor_strength  # nibble_value_writes reuses ``strength`` for both.
+    rules = []
+    for band, other in ((lo_base, hi_base), (hi_base, lo_base)):
+        other_terms = tuple((f"{other}+{j}", 1.0) for j in range(16))
+        for k in range(16):
+            rules.append(
+                multi_way_and_rule(
+                    name=name_for(band, k),
+                    scope=scope,
+                    dominates_at=dominates_at,
+                    conditions=tuple(base_conditions)
+                    + ((f"{band}+{k}", 1.0),)
+                    + other_terms,
+                    threshold=threshold,
+                    gate=gate,
+                    writes=Primitives.nibble_value_writes(
+                        band, k, strength=strength,
+                    ),
+                )
+            )
+    return tuple(rules)
+
+
 def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
     """Late FFN correction rules after the dependency-assigned post-op tail.
 
@@ -7217,6 +7316,30 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+3", -1_000_000_000.0),
             ("H1+4", -1_000_000_000.0),
         )
+        # M8 PILOT (C4_STACK0_STORE_LOADED_COMPUTED, DEFAULT-OFF): replace the
+        # 255-rule per-value ENUMERATED lookup with a 32-rule per-nibble
+        # COMPUTED route.  Since this bank's READ lane (OUTPUT) == its WRITE
+        # lane, the enumerated form is an identity-copy of the OUTPUT byte; the
+        # route reproduces the winning byte (argmax) + firing region
+        # byte-for-byte (proof: tools/_probe_m8_computed_writeback.py).
+        # BYTE-IDENTITY-BREAKING -> verdict-validated (see gate below).
+        if _stack0_store_loaded_computed_enabled():
+            return _computed_byte_writeback_route_rules(
+                name_for=lambda band, k: (
+                    f"tail_stack0_store_loaded_route_{band}_{k}"
+                ),
+                base_conditions=base_conditions,
+                threshold=25.0,
+                strength=5000.0,
+                lo_base="OUTPUT_LO",
+                hi_base="OUTPUT_HI_THIS_STEP",
+                gate=gate_mark_stack0,
+                scope="mark == STACK0",
+                dominates_at={
+                    "OUTPUT_LO": "mark == STACK0",
+                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+                },
+            )
         # Tier-3 tail-bank consolidation (task J5): this 16x16 nibble loop is
         # the canonical evidence-keyed byte-value writeback pattern shared by
         # ~40 sibling generators.  Authored via ``_byte_value_writeback_rules``
