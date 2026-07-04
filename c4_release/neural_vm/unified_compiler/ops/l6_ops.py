@@ -1690,92 +1690,18 @@ def _layer6_ent_after_jsr_sp_byte0_fixup_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
-def _layer6_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
-    """CompilerIR rules for L6 BZ PC override units 878..941."""
-
-    rules = []
-    cancel_conditions = (
-        ("MARK_PC", 1.0),
-        ("OP_BZ", 0.2),
-        ("CMP+4", 1.0),
-        ("CMP+5", 1.0),
-        ("IS_BYTE", -10.0),
-    )
-    target_conditions = cancel_conditions + (("MARK_STACK0", -10.0),)
-    write_scale = 2.0 / S
-    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
-    for band, output_base, output_gate_base in (
-        ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
-        ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
-    ):
-        for k in range(16):
-            rules.append(multi_way_and_rule(
-                name=f"l6_bz_cancel_{band}_{k}",
-                conditions=cancel_conditions,
-                threshold=3.5,
-                gate=f"{output_gate_base}+{k}",
-                gate_weight=-1.0,
-                writes=((f"{output_base}+{k}", write_scale),),
-            ))
-    _append_pc_byte0_direct_copy_rules(
-        rules,
-        name_prefix="l6_bz",
-        conditions=target_conditions,
-        threshold=3.5,
-        lo_source="FETCH_LO",
-        hi_source="FETCH_HI",
-        write_scale=write_scale,
-    )
-    return tuple(rules)
-
-
-def _layer6_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
-    """CompilerIR rules for L6 BNZ PC override units 942..1069."""
-
-    rules = []
-    write_scale = 2.0 / S
-    groups = (
-        (
-            "lo_nonzero",
-            (("MARK_PC", 1.0), ("OP_BNZ", 0.2), ("CMP+4", -1.0)),
-            1.5,
-        ),
-        (
-            "hi_nonzero",
-            (
-                ("MARK_PC", 1.0),
-                ("OP_BNZ", 0.2),
-                ("CMP+4", 1.0),
-                ("CMP+5", -1.0),
-            ),
-            2.5,
-        ),
-    )
-    # Phase 8.A.7: OUTPUT_LO cancel gate -> OUTPUT_LO_PREV_STEP alias.
-    for group, conditions, threshold in groups:
-        for band, output_base, output_gate_base in (
-            ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
-            ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
-        ):
-            for k in range(16):
-                rules.append(multi_way_and_rule(
-                    name=f"l6_bnz_{group}_cancel_{band}_{k}",
-                    conditions=conditions,
-                    threshold=threshold,
-                    gate=f"{output_gate_base}+{k}",
-                    gate_weight=-1.0,
-                    writes=((f"{output_base}+{k}", write_scale),),
-                ))
-        _append_pc_byte0_direct_copy_rules(
-            rules,
-            name_prefix=f"l6_bnz_{group}",
-            conditions=conditions,
-            threshold=threshold,
-            lo_source="FETCH_LO",
-            hi_source="FETCH_HI",
-            write_scale=write_scale,
-        )
-    return tuple(rules)
+# NOTE (CONTROL family cleanup, 2026-07): the pre-L9 ``_layer6_bz_pc_override_rules``
+# / ``_layer6_bnz_pc_override_rules`` builders + their ``_lower_layer6_branch_pc_override_ir``
+# lowerer were DELETED here. They were dead code: the L6 BZ/BNZ PC-override band
+# (units 878..1070) is CLEARED to zero by ``_clear_ffn_unit_band`` in
+# ``_lower_layer6_routing_ffn`` and NEVER re-lowered with those rules — the taken
+# BZ/BNZ override lives entirely in the post-L9 FFN
+# (``_post_l9_bz_pc_override_rules`` / ``_post_l9_bnz_pc_override_rules``) so the
+# CMP flag it reads is same-step-fresh (see docs/CMP_PATH_AUDIT.md, spec G7). The
+# ``L6_BZ/BNZ_PC_OVERRIDE_{START,END}_UNIT`` constants + the layout-table entries +
+# the clear remain (the band stays a reserved zeroed region). Removing the builders
+# is golden byte-identical (the lowerer was never called → no weight was ever written
+# by these rules). The post-L9 override is the live BZ/BNZ taken-branch path.
 
 
 def _layer6_branch_pc_byte1_override_rules(S: float) -> tuple[FFNRule, ...]:
@@ -2350,26 +2276,6 @@ def make_layer6_ent_after_jsr_sp_byte0_fixup_ir(S: float = 100.0) -> CompilerIR:
     ir = CompilerIR()
     ir.layer(0).ffn.rules.extend(_layer6_ent_after_jsr_sp_byte0_fixup_rules(S))
     return ir
-
-
-def _lower_layer6_branch_pc_override_ir(ffn, S: float, BD) -> tuple[int, int]:
-    """Lower IR-authored BZ/BNZ PC override bands."""
-
-    bz_end = _lower_layer6_ffn_rules(
-        ffn,
-        _layer6_bz_pc_override_rules(S),
-        S,
-        BD,
-        unit=L6_BZ_PC_OVERRIDE_START_UNIT,
-    )
-    bnz_end = _lower_layer6_ffn_rules(
-        ffn,
-        _layer6_bnz_pc_override_rules(S),
-        S,
-        BD,
-        unit=L6_BNZ_PC_OVERRIDE_START_UNIT,
-    )
-    return bz_end, bnz_end
 
 
 def _lower_layer6_branch_pc_byte1_override_ir(

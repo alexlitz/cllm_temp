@@ -15,16 +15,12 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_ALL_STEP_JSR_PC_OVERRIDE_START_UNIT,
     L6_BNZ_AX_ROUTE_END_UNIT,
     L6_BNZ_AX_ROUTE_START_UNIT,
-    L6_BNZ_PC_OVERRIDE_END_UNIT,
-    L6_BNZ_PC_OVERRIDE_START_UNIT,
     L6_BINARY_POP_SP_INCREMENT_END_UNIT,
     L6_BINARY_POP_SP_INCREMENT_START_UNIT,
     L6_BRANCH_PC_BYTE1_OVERRIDE_END_UNIT,
     L6_BRANCH_PC_BYTE1_OVERRIDE_START_UNIT,
     L6_BZ_AX_ROUTE_END_UNIT,
     L6_BZ_AX_ROUTE_START_UNIT,
-    L6_BZ_PC_OVERRIDE_END_UNIT,
-    L6_BZ_PC_OVERRIDE_START_UNIT,
     L6_DELAYED_JMP_PC_OVERRIDE_END_UNIT,
     L6_DELAYED_JMP_PC_OVERRIDE_START_UNIT,
     L6_EXIT_AX_ROUTE_END_UNIT,
@@ -84,11 +80,9 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _layer6_adj_ax_route_rules,
     _layer6_adj_sp_writeback_rules,
     _layer6_bnz_ax_route_rules,
-    _layer6_bnz_pc_override_rules,
     _layer6_binary_pop_sp_increment_rules,
     _layer6_branch_pc_byte1_override_rules,
     _layer6_bz_ax_route_rules,
-    _layer6_bz_pc_override_rules,
     _layer6_cmp3_cleanup_rules,
     _layer6_delayed_jmp_pc_override_rules,
     _layer6_exit_ax_route_rules,
@@ -121,7 +115,6 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _lower_layer6_halt_detect_ir,
     _lower_layer6_imm_carry_refresh_ir,
     _lower_layer6_late_ax_output_route_ir,
-    _lower_layer6_branch_pc_override_ir,
     _lower_layer6_branch_pc_byte1_override_ir,
     _lower_layer6_ent_first_step_ir,
     _lower_layer6_ent_after_jsr_sp_byte0_fixup_ir,
@@ -940,31 +933,12 @@ def test_layer6_ent_after_jsr_stack0_byte0_fixup_emits_00():
     assert out["OUTPUT_HI_THIS_STEP+1"] < 0.0
 
 
-def test_layer6_branch_pc_override_copies_encoded_pc_byte():
-    actual = _StubFFN()
-
-    route_ends = _lower_layer6_branch_pc_override_ir(actual, 100.0, _SetDim)
-
-    assert route_ends == (L6_BZ_PC_OVERRIDE_END_UNIT, L6_BNZ_PC_OVERRIDE_END_UNIT)
-    assert len(_layer6_bz_pc_override_rules(100.0)) == 64
-    assert len(_layer6_bnz_pc_override_rules(100.0)) == 128
-
-    x = torch.zeros(1, 1, 512)
-    x[..., _SetDim.MARK_PC] = 1.0
-    x[..., _SetDim.OP_BZ] = 5.0
-    x[..., _SetDim.CMP + 4] = 1.0
-    x[..., _SetDim.CMP + 5] = 1.0
-    x[..., _SetDim.FETCH_LO + 10] = 40.0
-    x[..., _SetDim.FETCH_HI + 2] = 40.0
-    x[..., _SetDim.OUTPUT_LO + 2] = 1.0
-    x[..., _SetDim.OUTPUT_HI + 5] = 1.0
-
-    y = _apply_stub_ffn(actual, x)[0, 0]
-
-    assert y[_SetDim.OUTPUT_LO + 10] > 0.9
-    assert y[_SetDim.OUTPUT_HI + 2] > 0.9
-    assert y[_SetDim.OUTPUT_LO + 2] < 0.5
-    assert y[_SetDim.OUTPUT_HI + 5] < 0.5
+# NOTE (CONTROL family cleanup, 2026-07): the fossil test
+# ``test_layer6_branch_pc_override_copies_encoded_pc_byte`` was DELETED here — it
+# only exercised the dead pre-L9 ``_lower_layer6_branch_pc_override_ir`` lowerer
+# (never called on the build path; the L6 BZ/BNZ override band is cleared to zero
+# and the taken-branch override lives in the post-L9 FFN). Live coverage of the
+# post-L9 BZ/BNZ override is in ``test_post_l9_bz_bnz_pc_override_*``.
 
 
 def test_layer6_branch_pc_byte1_override_symbolically_emits_target_high_byte():
