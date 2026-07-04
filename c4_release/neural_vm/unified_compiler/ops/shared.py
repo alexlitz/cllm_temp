@@ -105,7 +105,15 @@ def mul_width2_enabled() -> bool:
     Opt-OUT with ``C4_MUL_WIDTH2=0`` to restore the pre-width2 build
     (d_model 920, width=1 lo-byte MUL, ``mul_overflow`` decodes 20). Any
     other value (or unset) keeps the width=2 default ON.
+
+    ``C4_MUL_MULTIPASS=1`` IMPLIES width=2: the multipass cascade routes the
+    product's byte 1 into the ``MUL_RESULT_HI_LO/HI`` band, so that band (and
+    the L13 relay that stages it into AX_FULL) MUST be present even if
+    ``C4_MUL_WIDTH2=0`` was passed. OR-in the multipass flag so the band is
+    always collected when the cascade is installed.
     """
+    if os.environ.get("C4_MUL_MULTIPASS", "0") == "1":
+        return True
     return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
 
 
