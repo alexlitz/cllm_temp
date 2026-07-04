@@ -215,6 +215,25 @@ def make_mul_combine_op(alu_mode: str = "lookup") -> Operation:
     def bake(block, dim_positions, S):
         if alu_mode == "efficient":
             return None
+
+        # GAP-PRIMITIVE #2 (``C4_MUL_MULTIPASS=1``): the multi_pass cascade at
+        # L11 computes the FULL product (incl. byte-0 high nibble -> OUTPUT_HI)
+        # and no longer writes the ``TEMP[partial]`` band this combine reads.
+        # With TEMP empty, every one of these 4096 4-way-AND units is DEAD
+        # (its ``MARK_AX + TEMP[partial] + ALU_HI + AX_CARRY_LO`` AND never
+        # fires). Skip the lowering entirely so the block contributes 0 units
+        # (the extra −4096 on top of the L11 −1248). Flag-off is unchanged.
+        from .shared import mul_multipass_enabled
+        if mul_multipass_enabled():
+            from ...base_layers import PureFFN
+            d_model = (
+                int(block.ffn.W_up.shape[1])
+                if hasattr(block.ffn, "W_up") and block.ffn.W_up is not None
+                else int(block.attn.dim)
+            )
+            block.ffn = PureFFN(dim=d_model, hidden_dim=1)
+            return
+
         proxy = _as_setdim_proxy(dim_positions)
 
         # Per-bake FFN-unit allocator. The L12 MUL combine sub-stage is
