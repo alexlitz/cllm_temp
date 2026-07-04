@@ -4674,6 +4674,139 @@ def frame_step(
 
 
 # ===========================================================================
+# CONTROL-OP FRAME DESCRIPTOR — name EACH opcode's ordered frame_delta as DATA
+# ===========================================================================
+#
+# ``docs/semantic_spec_CONTROL.md`` §2b models every CONTROL opcode as a
+# ``ControlOp`` whose ``frame_delta`` is the ORDERED list of per-step register
+# updates its step performs (the running-SP teardown/setup order §2a/§G5
+# require). :func:`frame_step` already lowers such an ordered list TOGETHER;
+# ``ControlOp`` is the DATA layer above it — it NAMES the opcode + its ordered
+# ``frame_delta`` list once (as data, not a hand-sequenced FFN bank) and lowers
+# the WHOLE opcode through ONE :func:`frame_step` call.
+#
+# The descriptor tables (§2b) are:
+#
+#   * ENT = [PUSH(saved-BP), ASSIGN(BP := SP - INSTR_WIDTH)]  (running-SP order:
+#     the caller's BP is pushed onto the fresh STACK0 slot, then BP is re-linked
+#     to the new frame base SP - w).
+#   * LEV = [ASSIGN(SP := BP), POP-CAM(BP), POP-CAM(PC), POP-CAM(AX)]  (the 4-way
+#     teardown in running-SP order — restore SP to the frame base, then pop the
+#     three saved registers back off the freed slots).
+#   * ADJ = [SpDelta(± imm)]  (a single stack-pointer adjustment).
+#
+# A ``ControlOp`` collapses the previously hand-sequenced per-band ``register_
+# delta`` calls (one per delta) into ONE ``frame_step`` group — exercising
+# ``frame_step``'s ordered-group grouping in PRODUCTION, not just in the unit
+# tests. Each delta still lowers through the ordinary ``multi_way_and_rule`` /
+# ``FFNRule`` shapes; the byte-identity proof (``tools/_isa_golden_hash.py`` ==
+# ``91f55411``) holds because the concatenated rule sequence is identical to the
+# hand-authored bank.
+#
+# Some opcodes carry a small CORRECTIVE band after (or interleaved with) the
+# frame deltas (the ENT/LEV AX-passthrough + JSR STACK0-preserve bands, LEV's
+# same-step OUTPUT cancels) that is NOT itself a register-delta primitive kind
+# (an unconditional value passthrough / same-step cancel, not a
+# PUSH/ASSIGN/POP-CAM/SEQUENTIAL_ADD/BRANCH_TARGET). ``ControlOp`` carries those
+# as ORDERED ``bands`` — each either a ``RegisterDeltaSpec`` (lowered via the
+# frame primitive) or a plain ``() -> FFNRule[]`` builder — so the descriptor
+# names the WHOLE opcode's L6/L16 FFN band as one ordered datum while keeping
+# the delta primitives pure and the emitted rule sequence byte-identical to the
+# hand-sequenced bank.
+
+
+@dataclass(frozen=True)
+class ControlOpBundle:
+    """Result of :func:`control_op` — the whole opcode's ordered FFN band.
+
+    Attributes:
+        opcode: the opcode name (``"ENT"`` / ``"LEV"`` / ``"ADJ"`` / …) — DATA
+            identifying which CONTROL op this descriptor lowers.
+        frame_delta: the ordered :class:`RegisterDeltaSpec` tuple — the opcode's
+            ``frame_delta`` (§2b), the register-delta primitives among ``bands``.
+        rules_builder: ``() -> Tuple[FFNRule, ...]`` — the WHOLE opcode band, in
+            ``bands`` declaration order (each ``RegisterDeltaSpec`` lowered via
+            the frame primitive, each corrective builder inlined). Byte-identical
+            to the hand-sequenced bank.
+        reads / writes: dep-graph dims the frame deltas declare (union over the
+            ``RegisterDeltaSpec`` bands; corrective builders declare their own
+            reads/writes at the op site as before).
+    """
+
+    opcode: str
+    frame_delta: Tuple[RegisterDeltaSpec, ...]
+    rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    reads: Set[str]
+    writes: Set[str]
+
+
+def control_op(
+    opcode: str,
+    bands: Sequence[object],
+    *,
+    instr_width: int,
+    pc_offset: int,
+) -> ControlOpBundle:
+    """Lower a WHOLE CONTROL opcode from its ordered ``bands`` DATA.
+
+    ``opcode`` names the op (``"ENT"`` etc.). ``bands`` is the opcode's ordered
+    band list (§2b): each entry is either a :class:`RegisterDeltaSpec` (a frame
+    ``frame_delta`` — a PUSH/ASSIGN/POP-CAM/… register update) or a plain
+    ``() -> Sequence[FFNRule]`` corrective-band builder (an AX-passthrough /
+    same-step-cancel band that is not a register-delta primitive kind).
+
+    The CONTIGUOUS runs of ``RegisterDeltaSpec`` bands are lowered TOGETHER via
+    ONE :func:`frame_step` call each (the generic "apply these register deltas
+    this step" — so ``frame_step``'s ordered-group grouping is exercised in
+    production, NOT one ``register_delta`` per band). Corrective builders are
+    inlined at their declared position. The concatenation preserves ``bands``
+    order exactly, so the emitted rule sequence is byte-identical to the
+    hand-sequenced opcode FFN bank (proof: ``tools/_isa_golden_hash.py`` ==
+    ``91f55411``).
+    """
+    frame_delta = tuple(b for b in bands if isinstance(b, RegisterDeltaSpec))
+
+    # Group contiguous RegisterDeltaSpec runs so each maximal run lowers through
+    # ONE frame_step (ordered-group grouping); corrective builders stay inline.
+    def rules_builder() -> Tuple[FFNRule, ...]:
+        out: list[FFNRule] = []
+        run: list[RegisterDeltaSpec] = []
+
+        def _flush_run() -> None:
+            if run:
+                out.extend(frame_step(
+                    tuple(run), instr_width=instr_width, pc_offset=pc_offset,
+                ).rules_builder())
+                run.clear()
+
+        for band in bands:
+            if isinstance(band, RegisterDeltaSpec):
+                run.append(band)
+            else:
+                _flush_run()
+                out.extend(band())
+        _flush_run()
+        return tuple(out)
+
+    reads: Set[str] = set()
+    writes: Set[str] = set()
+    if frame_delta:
+        fb = frame_step(
+            frame_delta, instr_width=instr_width, pc_offset=pc_offset,
+        )
+        reads |= fb.reads
+        writes |= fb.writes
+
+    return ControlOpBundle(
+        opcode=opcode,
+        frame_delta=frame_delta,
+        rules_builder=rules_builder,
+        reads=reads,
+        writes=writes,
+    )
+
+
+# ===========================================================================
 # REGISTER BYTE-DEFAULT WRITER — the marker-gated SP/BP/STACK0 byte defaults
 # ===========================================================================
 #

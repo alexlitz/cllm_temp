@@ -6,9 +6,11 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..isa_semantics_dsl import (
     AssignDelta,
     BranchTargetDelta,
+    ControlOpBundle,
     FullWidthByteEmissionSpec,
     PushDelta,
     RegisterDeltaSpec,
+    control_op,
     full_width_byte_emission,
     register_delta,
 )
@@ -487,91 +489,77 @@ def _function_call_jsr_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _function_call_ent_stack0_rules(S: float) -> tuple[FFNRule, ...]:
-    """ENT STACK0 = old_BP at STACK0 marker (32 units) — DERIVED via PUSH.
+def _ent_control_op(S: float) -> ControlOpBundle:
+    """The ENT opcode's whole L6 FFN band as ONE :func:`control_op` descriptor.
 
-    The ENT ``push saved-BP`` frame delta (docs/semantic_spec_CONTROL.md §G10):
-    at the STACK0 marker on an ENT step (CMP[2]=1, MARK_STACK0=1) the caller's BP
-    — relayed into ``TEMP`` per-nibble by L5 head 5 — is written onto OUTPUT while
-    the arriving EMBED identity is cancelled in the SAME hidden unit. L6 attn head
-    6 broadcasts OP_ENT through CMP[2] (see ``layer6_relay_heads_bake``), which is
-    the opcode gate.
+    ``ControlOp(ENT)`` names ENT's ordered ``frame_delta`` list as DATA
+    (docs/semantic_spec_CONTROL.md §2b/§G10) and lowers the WHOLE opcode through
+    one :func:`control_op` call:
 
-    Expressed as one ``PUSH`` :class:`RegisterDeltaSpec`
-    (``isa_semantics_dsl.PushDelta``): the copy-with-cancel value band (TEMP,
-    LO/HI split at ``+16``) + the identity source (EMBED_LO/HI) + the STACK0
-    marker gate are the varying data; the 16-unit-per-band copy-with-cancel is the
-    fixed shape. Byte-identical to the hand-authored bank (proof:
-    ``tools/_isa_golden_hash.py`` == 91f55411).
+      * PUSH(saved-BP) — at the STACK0 marker on an ENT step (CMP[2]=1,
+        MARK_STACK0=1) the caller's BP (relayed into ``TEMP`` per-nibble by L5
+        head 5) is written onto OUTPUT while the arriving EMBED identity is
+        cancelled in the SAME hidden unit (copy-with-cancel, TEMP LO/HI split at
+        ``+16``). L6 attn head 6 broadcasts OP_ENT through CMP[2].
+      * ASSIGN(BP := SP - INSTR_WIDTH) — at the BP marker the caller's SP
+        (relayed into ``TEMP``) is copied into BP with the frame-link constant
+        subtracted (``lo_shift = (-INSTR_WIDTH) % 16 = 8``, ``hi_shift = -1``,
+        ``borrow_blocker_range = (INSTR_WIDTH, 16)`` — the nibble-shift-with-
+        borrow adder).
+
+    Both are ``RegisterDeltaSpec`` frame deltas → they lower TOGETHER via one
+    ``frame_step`` (ordered-group grouping in production). The ENT AX-passthrough
+    band (:func:`_function_call_ent_ax_passthrough_rules`) is the opcode's
+    trailing CORRECTIVE band — not a register-delta kind — so it rides as the
+    third ``bands`` entry, inlined after the two frame deltas. Byte-identical to
+    the hand-sequenced ENT bank (proof: ``tools/_isa_golden_hash.py`` ==
+    91f55411).
     """
-    bundle = register_delta(
-        RegisterDeltaSpec(
-            name="ent_stack0",
-            kind="push",
-            write_scale=2.0 / S,
-            conditions=(
-                (dim_ref("cmp_flag", "cascade", 2), 1.0),
-                ("MARK_STACK0", 1.0),
+    return control_op(
+        "ENT",
+        [
+            RegisterDeltaSpec(
+                name="ent_stack0",
+                kind="push",
+                write_scale=2.0 / S,
+                conditions=(
+                    (dim_ref("cmp_flag", "cascade", 2), 1.0),
+                    ("MARK_STACK0", 1.0),
+                ),
+                push=PushDelta(
+                    value_src="TEMP",
+                    value_hi_offset=16,
+                    identity_src_lo="EMBED_LO",
+                    identity_src_hi="EMBED_HI",
+                    dst_lo="OUTPUT_LO",
+                    dst_hi="OUTPUT_HI",
+                    threshold=1.5,
+                ),
             ),
-            push=PushDelta(
-                value_src="TEMP",
-                value_hi_offset=16,
-                identity_src_lo="EMBED_LO",
-                identity_src_hi="EMBED_HI",
-                dst_lo="OUTPUT_LO",
-                dst_hi="OUTPUT_HI",
-                threshold=1.5,
+            RegisterDeltaSpec(
+                name="ent_bp",
+                kind="assign",
+                write_scale=2.0 / S,
+                conditions=(
+                    (dim_ref("cmp_flag", "cascade", 2), 1.0),
+                    ("MARK_BP", 1.0),
+                ),
+                assign=AssignDelta(
+                    value_src="TEMP",
+                    value_hi_offset=16,
+                    dst_lo="OUTPUT_LO",
+                    dst_hi="OUTPUT_HI",
+                    lo_shift=(-INSTR_WIDTH) % 16,
+                    hi_shift=(-1) % 16,
+                    borrow_blocker_range=(INSTR_WIDTH, 16),
+                    threshold=1.5,
+                ),
             ),
-        ),
+            lambda: _function_call_ent_ax_passthrough_rules(S),
+        ],
         instr_width=INSTR_WIDTH,
         pc_offset=PC_OFFSET,
     )
-    return bundle.rules_builder()
-
-
-def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
-    """ENT BP = SP - 8 at BP marker (32 units) — DERIVED via ASSIGN.
-
-    The ENT ``BP := SP - INSTR_WIDTH`` frame delta
-    (docs/semantic_spec_CONTROL.md §G10): at the BP marker on an ENT step the
-    caller's SP — relayed into ``TEMP`` per-nibble — is copied into the BP OUTPUT
-    slot with the frame-link constant subtracted. Each LO unit writes
-    ``OUTPUT_LO[(k - 8) % 16] += 2/S`` while cancelling ``OUTPUT_LO[k] -= 2/S``
-    (the assign REPLACES the slot). Each HI unit writes the borrowed-down high
-    nibble ``(k - 1) % 16`` and cancels at ``k``; the borrow is vetoed on the
-    no-borrow half (``TEMP[8..15]`` hot => old SP lo >= 8) via the
-    ``borrow_blocker_range``.
-
-    Expressed as one ``ASSIGN`` :class:`RegisterDeltaSpec`
-    (``isa_semantics_dsl.AssignDelta``): ``lo_shift = (-INSTR_WIDTH) % 16 = 8``,
-    ``hi_shift = (-1) % 16 = 15``, ``borrow_blocker_range = (INSTR_WIDTH, 16)`` —
-    the nibble-shift-with-borrow adder the SP/PC deltas also use. Byte-identical
-    to the hand-authored bank (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
-    """
-    bundle = register_delta(
-        RegisterDeltaSpec(
-            name="ent_bp",
-            kind="assign",
-            write_scale=2.0 / S,
-            conditions=(
-                (dim_ref("cmp_flag", "cascade", 2), 1.0),
-                ("MARK_BP", 1.0),
-            ),
-            assign=AssignDelta(
-                value_src="TEMP",
-                value_hi_offset=16,
-                dst_lo="OUTPUT_LO",
-                dst_hi="OUTPUT_HI",
-                lo_shift=(-INSTR_WIDTH) % 16,
-                hi_shift=(-1) % 16,
-                borrow_blocker_range=(INSTR_WIDTH, 16),
-                threshold=1.5,
-            ),
-        ),
-        instr_width=INSTR_WIDTH,
-        pc_offset=PC_OFFSET,
-    )
-    return bundle.rules_builder()
 
 
 def _function_call_ent_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
@@ -705,9 +693,12 @@ def _function_call_l6_ffn_rules(S: float) -> tuple[FFNRule, ...]:
       * units 2022..2101  - JSR PC override (80 units; 16+16 cancel +
                             16 LO target + 16 FETCH_HI reserved + 16 HI carry)
       * units 2102..2133  - JSR AX passthrough (32 units)
-      * units 2134..2165  - ENT STACK0 = old_BP (32 units)
-      * units 2166..2197  - ENT BP = SP - 8 (32 units)
-      * units 2198..2229  - ENT AX passthrough (32 units)
+      * units 2134..2229  - ENT band (96 units), emitted as ONE ControlOp
+                            frame-descriptor (``_ent_control_op``): STACK0 =
+                            old_BP PUSH (2134..2165), BP = SP - 8 ASSIGN
+                            (2166..2197) — the two frame deltas via one
+                            frame_step — then the AX-passthrough corrective
+                            band (2198..2229)
       * units 2230..2261  - LEV AX passthrough at AX marker (32 units)
       * units 2262..2293  - LEV AX byte positions (32 units)
 
@@ -737,9 +728,10 @@ def _function_call_l6_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     )
     rules.extend(_function_call_jsr_pc_override_rules(S))
     rules.extend(_function_call_jsr_ax_passthrough_rules(S))
-    rules.extend(_function_call_ent_stack0_rules(S))
-    rules.extend(_function_call_ent_bp_rules(S))
-    rules.extend(_function_call_ent_ax_passthrough_rules(S))
+    # ENT: the whole opcode band (PUSH saved-BP + ASSIGN BP:=SP-w frame deltas
+    # via one frame_step, then the AX-passthrough corrective band) named as ONE
+    # ControlOp frame-descriptor.
+    rules.extend(_ent_control_op(S).rules_builder())
     rules.extend(_function_call_lev_ax_passthrough_rules(S))
     rules.extend(_function_call_lev_ax_byte_rules(S))
 

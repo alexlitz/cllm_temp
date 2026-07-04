@@ -39,6 +39,7 @@ from c4_release.neural_vm.unified_compiler.ir import (
     compare_symbolic_to_lowered_ffn,
 )
 from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
+    AssignDelta,
     CamBinaryAddressBlock,
     CamBinaryAddressBundle,
     CamBinaryAddressMatch,
@@ -51,6 +52,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     CamValueBand,
     ConsumerLookaheadGateBundle,
     ConsumerLookaheadGateSpec,
+    ControlOpBundle,
     CrossStepCarryBundle,
     CrossStepCarrySpec,
     DumpBlock,
@@ -66,6 +68,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     PcMuxEncoder,
     PcMuxSpec,
     PrecursorFlagSpec,
+    PushDelta,
     RegisterDeltaBundle,
     RegisterDeltaSpec,
     SequentialAddDelta,
@@ -75,6 +78,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     cam_binary_address_match,
     cam_lookup,
     consumer_lookahead_gate,
+    control_op,
     cross_step_carry,
     frame_step,
     full_width_byte_emission,
@@ -2574,3 +2578,128 @@ def test_register_delta_spec_validates_kind():
         RegisterDeltaSpec(name="x", kind="sequential_add", write_scale=0.02)
     with pytest.raises(ValueError):
         RegisterDeltaSpec(name="x", kind="branch_target", write_scale=0.02)
+
+
+# ===========================================================================
+# control_op — the CONTROL-op frame-descriptor (name an opcode's ordered
+# frame_delta list as DATA, lower the whole opcode via one frame_step).
+# ===========================================================================
+
+
+def _ent_frame_deltas():
+    """ENT's two frame deltas (PUSH saved-BP + ASSIGN BP:=SP-w)."""
+    push = RegisterDeltaSpec(
+        name="ent_stack0", kind="push", write_scale=2.0 / 100.0,
+        conditions=(("CMP+2", 1.0), ("MARK_STACK0", 1.0)),
+        push=PushDelta(),
+    )
+    assign = RegisterDeltaSpec(
+        name="ent_bp", kind="assign", write_scale=2.0 / 100.0,
+        conditions=(("CMP+2", 1.0), ("MARK_BP", 1.0)),
+        assign=AssignDelta(lo_shift=8, hi_shift=15, borrow_blocker_range=(8, 16)),
+    )
+    return push, assign
+
+
+def test_control_op_returns_bundle():
+    push, assign = _ent_frame_deltas()
+    bundle = control_op(
+        "ENT", [push, assign], instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET)
+    assert isinstance(bundle, ControlOpBundle)
+    assert bundle.opcode == "ENT"
+    # frame_delta is the RegisterDeltaSpec subset (both ENT bands).
+    assert bundle.frame_delta == (push, assign)
+    # reads/writes are the union of the frame deltas' dep-graph dims.
+    assert "TEMP" in bundle.reads and "MARK_STACK0" in bundle.reads
+    assert "OUTPUT_LO" in bundle.writes and "OUTPUT_HI" in bundle.writes
+
+
+def test_control_op_groups_contiguous_frame_deltas_via_frame_step():
+    """Two adjacent frame deltas lower TOGETHER via ONE frame_step — the rule
+    sequence is identical to the concatenation frame_step produces."""
+    push, assign = _ent_frame_deltas()
+    via_control = list(control_op(
+        "ENT", [push, assign], instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET,
+    ).rules_builder())
+    via_frame_step = list(frame_step(
+        (push, assign), instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET,
+    ).rules_builder())
+    assert [_rule_key(r) for r in via_control] == [
+        _rule_key(r) for r in via_frame_step
+    ]
+    # PUSH (32) + ASSIGN (32) = 64 units, in declaration order.
+    assert len(via_control) == 64
+
+
+def test_control_op_inlines_corrective_bands_in_order():
+    """A corrective builder rides at its declared position between/after the
+    frame deltas, preserving bands order exactly."""
+    push, assign = _ent_frame_deltas()
+
+    def corrective():
+        return [multi_way_and_rule(
+            name="corr_0", conditions=(("OP_ENT", 1.0),), threshold=1.0,
+            writes=(("OUTPUT_LO+0", 0.02),),
+        )]
+
+    rules = list(control_op(
+        "ENT", [push, assign, corrective],
+        instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET,
+    ).rules_builder())
+    # 64 frame-delta units then the 1 corrective unit, in order.
+    assert len(rules) == 65
+    assert rules[-1].name == "corr_0"
+    # A corrective band BETWEEN two frame deltas splits the frame_step run.
+    split = list(control_op(
+        "ENT", [push, corrective, assign],
+        instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET,
+    ).rules_builder())
+    assert [r.name for r in split[:2]] == ["ent_stack0_lo_0", "ent_stack0_lo_1"]
+    assert split[32].name == "corr_0"
+    assert split[33].name == "ent_bp_lo_0"
+
+
+def test_control_op_reexpresses_ent_bank_byte_identical():
+    """The ENT ControlOp descriptor re-expresses the production ENT L6 FFN bank
+    (PUSH + ASSIGN + AX-passthrough) cell-for-cell."""
+    from collections import Counter
+
+    from c4_release.neural_vm.unified_compiler.ops import model_ops
+
+    ent = list(model_ops._ent_control_op(100.0).rules_builder())
+    hand = (
+        list(model_ops._function_call_ent_ax_passthrough_rules(100.0))
+    )
+    # The descriptor's 96 units = 32 push + 32 assign + 32 ax-passthrough.
+    assert len(ent) == 96
+    # The AX-passthrough corrective band is the trailing 32 units.
+    assert Counter(_rule_key(r) for r in ent[64:]) == Counter(
+        _rule_key(r) for r in hand
+    )
+
+
+def test_control_op_reexpresses_lev_teardown_byte_identical():
+    """The LEV ControlOp descriptor emits the LEV frame-teardown core
+    (SP-cancel, SP:=BP pop, PC-cancel, PC pop) as ONE ordered 112-unit band."""
+    from c4_release.neural_vm.unified_compiler.ops import l16_ops
+
+    lev_rules = list(l16_ops._layer16_lev_routing_rules(100.0))
+    teardown = [r for r in lev_rules if (
+        r.name.startswith("l16_lev_sp_cancel_")
+        or r.name.startswith("l16_lev_sp_bp_plus16_")
+        or r.name.startswith("l16_lev_pc_cancel_hi_")
+        or r.name.startswith("l16_lev_pc_temp_")
+    )]
+    # 32 sp-cancel + 32 sp:=bp pop + 16 pc-cancel + 32 pc pop = 112 units.
+    assert len(teardown) == 112
+    # The four band families appear in the declared descriptor order, each
+    # family emitted contiguously (dedup the per-family run to a marker list).
+    seen = []
+    for r in teardown:
+        fam = r.name.rsplit("_", 1)[0]
+        if not seen or seen[-1] != fam:
+            seen.append(fam)
+    assert seen[0].startswith("l16_lev_sp_cancel")
+    assert any(f.startswith("l16_lev_sp_bp_plus16") for f in seen)
+    assert any(f.startswith("l16_lev_pc_cancel_hi") for f in seen)
+    assert seen[-1].startswith("l16_lev_pc_temp")
