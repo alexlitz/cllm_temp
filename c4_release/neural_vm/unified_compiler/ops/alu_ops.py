@@ -2735,7 +2735,22 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
         # with the assembled composite — exactly how lookup mode has always
         # placed it. The single-byte GE-format lookup path (flag-off
         # efficient) keeps the byte-identical ``layer_idx=10`` pin.
-        if _use_longdiv_composite():
+        # GAP-PRIMITIVE #2 (DIV): the multipass cascade must install at the SAME
+        # physical position the composite it replaces occupies. In the campaign
+        # config ``div_multibyte_enabled()`` is floored ON, so flag-OFF the
+        # composite binds to the ``layer10_carry_relay`` anchor (after getobd)
+        # and expands onto physical block ~30 — AFTER the L14 ALU cascade + the
+        # L16/L18/L20 memory + byte-relay machinery. ``_use_longdiv_composite()``
+        # returns False when multipass is on (to no-op the composite ASSEMBLY),
+        # which would otherwise flip the placement to the earlier
+        # ``layer_idx=10`` anchor (physical block ~18) — 12 blocks too early.
+        # At block 18 the div block computes q/r correctly, but the downstream
+        # blocks 19..30 then re-process the residual and corrupt the cross-step
+        # state, collapsing the NEXT step's frame (observed div/mod -> 0/0,
+        # step-2 pc=None). So bind to the composite anchor whenever multipass OR
+        # the longdiv composite is in play.
+        from .shared import div_multipass_enabled as _dmp
+        if _use_longdiv_composite() or _dmp():
             _install_placement = dict(
                 target_op_name="layer10_carry_relay",
                 requires={"after": "l10_alu_divmod_getobd"},
