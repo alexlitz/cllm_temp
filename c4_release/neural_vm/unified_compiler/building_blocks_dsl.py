@@ -1108,6 +1108,95 @@ def byte_route_rules(
     return tuple(rules)
 
 
+def byte_copy_computed_rules(
+    *,
+    src_lo: str,
+    src_hi: str,
+    dst_lo: str = "OUTPUT_LO",
+    dst_hi: str = "OUTPUT_HI_THIS_STEP",
+    base_conditions: Sequence[Tuple[str, float]],
+    threshold: float,
+    strength: float,
+    name_for=None,
+    gate: Optional[object] = None,
+    scope: Optional[str] = None,
+    dominates_at: Optional[Mapping[str, str]] = None,
+) -> Tuple[FFNRule, ...]:
+    """GENERAL cross-lane COMPUTED byte-copy: ``byte_copy(src_lane, dst_lane)``.
+
+    The COMPUTED (32-unit) counterpart of an ENUMERATED (256-unit per-VALUE
+    AND) cross-lane materializer that reads a byte one-hot from a SOURCE lane
+    ``(src_lo, src_hi)`` and copies it to a DESTINATION lane ``(dst_lo,
+    dst_hi)`` (default the L10 OUTPUT band).  Generalises the M8 same-lane
+    per-nibble route (``l10_ops._computed_byte_writeback_route_rules``, which
+    hardwired READ==WRITE==OUTPUT) to the SOURCE!=DEST case.
+
+    The subtle point (flagged by agent #389): for a cross-lane copy the firing
+    evidence must sum the **SOURCE** lane's other-band one-hot, NOT the
+    destination's.  The enumerated per-value rule fires on ``src_lo+lo AND
+    src_hi+hi`` (a 2-channel AND on the source byte).  Each route unit for dest
+    channel ``k`` therefore fires on:
+
+      * its own source channel ``{src_band}+k`` (weight 1.0), AND
+      * the SUM of the OTHER source band's one-hot (the 16 ``{src_other}+j``
+        terms, weight 1.0 each — exactly one is on for a valid byte).
+
+    That reconstructs the SAME 2-channel evidence magnitude / ``threshold`` the
+    enumerated AND used, so the route fires on exactly the same production
+    contexts.  It then WRITES to the DEST band: ``+strength`` to ``{dst_band}+k``
+    and ``-strength`` to that dest band's other 15 channels (a one-hot nibble
+    write).  When the LO and HI route units for the observed SOURCE byte both
+    fire, together they reconstruct that byte in the DEST band — a computed
+    copy, not a 256-way lookup.
+
+    Order: dest-LO band then dest-HI band, channel-ascending (matches the
+    enumerated ``byte_value_writes`` LO-then-HI convention).
+
+    Args:
+        src_lo / src_hi: SOURCE lane low/high nibble one-hot bases (e.g.
+            ``"ALU_LO"`` / ``"ALU_HI"`` for an ALU->OUTPUT materializer).
+        dst_lo / dst_hi: DESTINATION lane nibble bases (default OUTPUT).
+        base_conditions: shared structural-evidence gate, emitted verbatim
+            ahead of the per-channel source one-hot terms.
+        threshold: per-rule AND threshold (matches the enumerated bank's).
+        strength: one-hot nibble write ``+/-`` magnitude.
+        name_for: ``(dst_band, k) -> name`` callable; a default is used if
+            ``None``.
+        gate / scope / dominates_at: threaded to ``multi_way_and_rule``.
+
+    Returns:
+        A ``2 * 16`` (== 32) ``FFNRule`` tuple.
+    """
+    if name_for is None:
+        def name_for(dst_band, k):  # noqa: E306
+            return f"byte_copy_{dst_band}_{k}"
+    base = tuple(base_conditions)
+    write_scale = strength
+    rules: list[FFNRule] = []
+    for src_band, src_other, dst_band in (
+        (src_lo, src_hi, dst_lo),
+        (src_hi, src_lo, dst_hi),
+    ):
+        other_terms = tuple((f"{src_other}+{j}", 1.0) for j in range(16))
+        for k in range(16):
+            # One-hot nibble write into the DEST band: +strength to channel
+            # k, -strength to the 15 competitors.
+            dst_writes = tuple(
+                (f"{dst_band}+{j}", write_scale if j == k else -write_scale)
+                for j in range(16)
+            )
+            rules.append(multi_way_and_rule(
+                name=name_for(dst_band, k),
+                scope=scope,
+                dominates_at=dominates_at,
+                conditions=base + ((f"{src_band}+{k}", 1.0),) + other_terms,
+                threshold=threshold,
+                gate=gate,
+                writes=dst_writes,
+            ))
+    return tuple(rules)
+
+
 def carry_relay_rules(
     *,
     band_specs: Sequence[Tuple[str, str, str, str]],

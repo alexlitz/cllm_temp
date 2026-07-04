@@ -2512,6 +2512,14 @@ def compile_full_vm_dynamic(
             ),
             "C4_STACK0_STORE_E8_COMPUTED": (
                 os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+            # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
+            # materializer ENUMERATED (254 per-value AND) -> COMPUTED (32
+            # per-nibble route) collapse (DEFAULT-OFF, opt in =1). Changes the
+            # L10-tail FFN hidden_dim (254 -> 32) AND the OUTPUT delta magnitude,
+            # so ON / OFF builds have different state_dicts and MUST NEVER share
+            # a memo / disk entry. See l10_ops._stack0_store_top_e0_computed_enabled.
+            "C4_STACK0_STORE_TOP_E0_COMPUTED": (
+                os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -3308,6 +3316,14 @@ def _bake_from_scheduled_ops(
         ),
         "C4_STACK0_STORE_E8_COMPUTED": (
             os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+        # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
+        # ENUMERATED (254 per-value AND) -> COMPUTED (32 per-nibble route)
+        # collapse (DEFAULT-OFF, opt in =1). Changes the L10-tail FFN hidden_dim
+        # AND the emitted OUTPUT delta, so the ON / OFF builds have different
+        # state_dicts and MUST NEVER share a serialised entry. See
+        # l10_ops._stack0_store_top_e0_computed_enabled.
+        "C4_STACK0_STORE_TOP_E0_COMPUTED": (
+            os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
