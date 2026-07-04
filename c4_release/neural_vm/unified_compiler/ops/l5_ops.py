@@ -10,8 +10,13 @@ from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy, _opcode_name_map
 from ..isa_semantics_dsl import (
+    BlankUnit,
     ConsumerLookaheadGateSpec,
+    DecodeContext,
+    DecodeSpec,
+    ScratchClearBand,
     consumer_lookahead_gate,
+    decode_band,
 )
 
 
@@ -122,6 +127,23 @@ _ARITH_CONSUMER_SPEC = ConsumerLookaheadGateSpec(
 # Generate the bundle (registers the six feature bands at import scope, exactly
 # where the hand-built register_residual_band calls sat).
 _ARITH_CONSUMER_GATE = consumer_lookahead_gate(_ARITH_CONSUMER_SPEC)
+
+
+def _derive_decode_enabled() -> bool:
+    """Flag for the GENERIC decode-derivation pilot (task #391). Default OFF.
+
+    When ``C4_DERIVE_DECODE=1``, the L5 opcode-decode FFN rule sequence is
+    produced by the generic :func:`decode_band` engine
+    (``isa_semantics_dsl.py``) — derived from the ISA ``Opcode`` table + a
+    small band-context table with ZERO hand-authored per-opcode rules —
+    instead of the hand-authored ``_opcode_decode_main/first_step/...`` rule
+    builders. The derived tuple is byte-for-byte identical to the hand path
+    (proof: ``tools/_isa_golden_hash.py`` unchanged under
+    ``C4_DERIVE_DECODE=1``), so this is the STEP-3 generic engine + STEP-4
+    100%-derivation proof for the DECODE family. Default OFF => the
+    hand-authored path stays the golden build.
+    """
+    return os.environ.get("C4_DERIVE_DECODE", "0") != "0"
 
 
 def _nested_jsr_pc_fix_enabled() -> bool:
@@ -1019,6 +1041,136 @@ def _opcode_decode_jsr_temp0_blank_rule() -> FFNRule:
     )
 
 
+def _derived_decode_spec(S: float) -> DecodeSpec:
+    """Build the :class:`DecodeSpec` the generic engine lowers (task #391).
+
+    Every per-opcode field is DATA: ``(opcode_value, NAME)`` from the ISA
+    ``Opcode`` table, ``lo/hi`` derived by the engine, and the per-context
+    constants (gate / threshold / extra conditions / opcode subset) carried on
+    the :class:`DecodeContext` band descriptors. The single per-(opcode,
+    context) quirk — JSR writes ``TEMP+0`` at the PC contexts instead of
+    ``OP_JSR`` (docs G3) — is the one ``write_override`` cell. There is ZERO
+    per-opcode branch: the spec is pure data + the shared engine.
+    """
+    from ...embedding import Opcode
+
+    # (byte, "OP_<NAME>") in the exact main-band emit order.
+    op_names = _opcode_name_map()
+    main_vals = [
+        Opcode.LEA, Opcode.IMM, Opcode.JMP, Opcode.JSR, Opcode.BZ, Opcode.BNZ,
+        Opcode.ENT, Opcode.ADJ, Opcode.LEV, Opcode.LI, Opcode.LC, Opcode.SI,
+        Opcode.SC, Opcode.PSH, Opcode.OR, Opcode.XOR, Opcode.AND,
+        Opcode.EQ, Opcode.NE, Opcode.LT, Opcode.GT, Opcode.LE, Opcode.GE,
+        Opcode.SHL, Opcode.SHR, Opcode.ADD, Opcode.SUB, Opcode.MUL,
+        Opcode.DIV, Opcode.MOD, Opcode.EXIT, Opcode.NOP,
+        Opcode.PUTCHAR, Opcode.GETCHAR,
+    ]
+    opcode_table = tuple((int(v), op_names[v]) for v in main_vals)
+    write_scale = 10.0 / S
+
+    # --- main-at-AX (units 0..33): the full table, gated MARK_AX -----------
+    main_ctx = DecodeContext(
+        name="main_at_ax",
+        rule_name_fn=lambda name, out: f"l5_decode_{name.lower()}_at_ax",
+        threshold=1.5,
+        write_scale=write_scale,
+        gate=dim_ref("marker", "AX"),
+        opcodes=None,  # full ISA table
+    )
+
+    # --- first-step-at-PC (units 34..51): 18-op subset, HAS_SE==0 ----------
+    #     JSR here writes TEMP+0 (IS_JSR scratch), not OP_JSR (docs G3).
+    first_step_vals = (
+        Opcode.JMP, Opcode.JSR, Opcode.IMM, Opcode.LEA, Opcode.EXIT,
+        Opcode.NOP, Opcode.ADD, Opcode.SUB, Opcode.MUL, Opcode.DIV,
+        Opcode.MOD, Opcode.OR, Opcode.XOR, Opcode.AND, Opcode.EQ,
+        Opcode.LT, Opcode.SHL, Opcode.SHR,
+    )
+
+    def _first_step_name(name: str, out: str) -> str:
+        # Legacy quirk (mirrors ``_opcode_decode_first_step_rules``): the rule
+        # name derives from the WRITE dim — JSR's TEMP+0 override gives
+        # ``l5_first_step_decode_temp_0``; every marker gives
+        # ``l5_first_step_decode_op_<name>``.
+        if out.startswith("TEMP"):
+            return f"l5_first_step_decode_{out.lower().replace('+', '_')}"
+        return f"l5_first_step_decode_{out.split('+', 1)[0].lower()}"
+
+    first_step_ctx = DecodeContext(
+        name="first_step_at_pc",
+        rule_name_fn=_first_step_name,
+        threshold=2.5,
+        write_scale=write_scale,
+        extra_conditions=(("MARK_PC", 1.0), ("HAS_SE", -1.0)),
+        opcodes=tuple(int(v) for v in first_step_vals),
+        write_override={int(Opcode.JSR): "TEMP+0"},
+    )
+
+    # --- reserved blank unit 52 (JSR TEMP[0] slot; docs G5) ----------------
+    blank = BlankUnit(name="opcode_decode_jsr_temp0_blank")
+
+    # --- TEMP[1..31] clear at PC (units 53..83; docs G4 — NOT decode) ------
+    temp_clear = ScratchClearBand(
+        name="l5_temp_clear",
+        slot_band="TEMP",
+        lo=1,
+        hi=31,
+        marker_cond=("MARK_PC", 1.0),
+        threshold=0.5,
+        write_scale=2.0 / S,
+        gate_weight=-1.0,
+        rule_name_fn=lambda k: f"l5_temp_clear_{k}_at_pc",
+    )
+
+    # --- all-step-at-PC (units 84..88): 5-op subset, MARK_PC only ----------
+    all_step_vals = (Opcode.BZ, Opcode.BNZ, Opcode.LEV, Opcode.EXIT, Opcode.JMP)
+    all_step_ctx = DecodeContext(
+        name="all_step_at_pc",
+        rule_name_fn=lambda name, out: f"l5_all_step_decode_{name.lower()}_at_pc",
+        threshold=2.5,
+        write_scale=write_scale,
+        extra_conditions=(("MARK_PC", 1.0),),
+        opcodes=tuple(int(v) for v in all_step_vals),
+    )
+
+    # --- all-step-JSR-at-PC (unit 89): flag-gated Root-B, JSR->TEMP+0 ------
+    all_step_jsr_ctx = DecodeContext(
+        name="all_step_jsr_at_pc",
+        rule_name_fn=lambda n, out: "all_step_decode_jsr_temp0_at_pc",
+        threshold=2.5,
+        write_scale=write_scale,
+        extra_conditions=(("MARK_PC", 1.0),),
+        opcodes=(int(Opcode.JSR),),
+        write_override={int(Opcode.JSR): "TEMP+0"},
+        enabled=_nested_jsr_pc_fix_enabled,
+    )
+
+    return DecodeSpec(
+        name="l5_opcode_decode",
+        opcode_table=opcode_table,
+        bands=(
+            main_ctx,
+            first_step_ctx,
+            blank,
+            temp_clear,
+            all_step_ctx,
+            all_step_jsr_ctx,
+        ),
+        opcode_flag_ref=lambda name: dim_ref("opcode_flag", name),
+    )
+
+
+def _derived_opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
+    """Generic-engine DERIVED decode rules (task #391, C4_DERIVE_DECODE).
+
+    Routes the ISA opcode table through :func:`decode_band` — ZERO
+    hand-authored per-opcode rules. Byte-for-byte identical to
+    :func:`_opcode_decode_ffn_rules` (the hand path); proven by
+    ``tools/_isa_golden_hash.py`` unchanged under ``C4_DERIVE_DECODE=1``.
+    """
+    return decode_band(_derived_decode_spec(S)).rules_builder()
+
+
 def _opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     """Full ordered ``FFNRule`` sequence for ``opcode_decode_ffn``.
 
@@ -1035,7 +1187,14 @@ def _opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     lets the op expose its full ``compiler_ir`` for symbolic execution /
     ``compare_symbolic_to_lowered_ffn`` validation / declarative
     verifier tooling.
+
+    Task #391: when ``C4_DERIVE_DECODE=1`` the entire sequence is DERIVED by
+    the generic :func:`decode_band` engine from the ISA opcode table (zero
+    hand-authored per-opcode rules); byte-identical to the hand path below.
     """
+
+    if _derive_decode_enabled():
+        return _derived_opcode_decode_ffn_rules(S)
 
     return (
         _opcode_decode_main_rules(S)

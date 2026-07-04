@@ -67,6 +67,7 @@ model. Opt-out with `=0`.
 | `C4_AX_BYTE1_SIGNEXT_LEA` | `1` | active | AX byte-1 sign-extension delivery on negative LEA-local frame addresses (#343). |
 | `C4_STACK0_B0_DUMP` | `1` | active | STACK0 byte-0 register-dump LM-head columns (Root 2). |
 | `C4_STACK0_NEXT_ARITH` | `1` | active | Consumer-opcode lookahead bands + dump-block gate (#221). |
+| `C4_DERIVE_DECODE` | `0` (off) | active | DECODE derivation pilot (#391): route the L5 opcode-decode FFN through the generic `decode_band` engine (derived from the ISA `Opcode` table, ZERO hand-authored per-opcode rules). Byte-identical to the hand path (golden `81557d21` held flag-ON). Registered in BOTH cache-key snapshots. See `docs/DERIVE_DECODE_PILOT_2026_07_03.md`. |
 | `C4_BP_SAVE_DUMP` | `1` | active | BP-save register dump (the `_isa_golden_hash` reference flag). |
 | `C4_MUL_WIDTH2` | `1` | active | Width-2 (16-bit) MUL path + MUL_RESULT_HI band (d_model 872→981). |
 | `C4_MUL_W2_THRESH_FIX` | `1` | active | Width-2 MUL threshold correction. |
