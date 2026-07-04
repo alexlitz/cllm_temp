@@ -2850,3 +2850,462 @@ def decode_band(spec: DecodeSpec) -> DecodeBundle:
         reads=reads,
         writes=writes,
     )
+
+
+# ===========================================================================
+# PC-MUX — the CONTROL-family PC-source mux, derived GENERICALLY
+# ===========================================================================
+#
+# ``docs/semantic_spec_CONTROL.md`` §2/§G1/§G2 shows the whole PC-next machine
+# is a **source mux**: L3 writes the SEQUENTIAL default (``PC + INSTR_WIDTH``)
+# unconditionally; each branch op OVERRIDES it with a uniform
+# **cancel-then-write** idiom — 16 ``-OUTPUT_LO[k]`` cancel units + 16
+# ``-OUTPUT_HI[k]`` cancel units (subtract the sequential default), then a
+# 16-per-band target ENCODER that writes ``PC = <source>``. The six live
+# hand-authored override builders (``_layer6_all_step_jmp_pc_override_rules``,
+# ``_layer6_first_step_jmp``, ``_layer6_delayed_jmp``,
+# ``_layer6_all_step_jsr``, ``_post_l9_bz``, ``_post_l9_bnz``) differ ONLY in:
+#
+#   * the GATE (opcode + condition + step guard) — a ``conditions`` tuple +
+#     ``threshold``;
+#   * the per-band cancel gate source (``OUTPUT_LO.*.-1`` cross-step vs the
+#     same-step ``OUTPUT_HI_THIS_STEP``) + an optional extra cross-step gate
+#     term (the BZ ``BZ_TARGET_FRESH`` re-fire suppressor, §G8);
+#   * the target ENCODER:
+#       - ``DIRECT_COPY``  — copy an already-encoded PC byte from a source band
+#         (JMP first-step / delayed / all-step: ``AX_CARRY_*`` or ``FETCH_*``);
+#       - ``IMM_TO_BYTE_ADDR`` — convert a raw instruction-INDEX immediate into
+#         the encoded byte address ``imm*INSTR_WIDTH + PC_OFFSET`` (§G2's
+#         ``idx_to_pc`` encoder; BZ/BNZ/JSR read the index from ``FETCH_LO``);
+#   * an optional byte-0 HIGH-nibble ``+INSTR_WIDTH`` correction for an ODD
+#     index-hi nibble (the ``imm*8`` shift's ``hi&1`` carry — two authoring
+#     flavors, JSR ``gate_terms`` vs BZ/BNZ ``conditions``, both derived here);
+#   * an optional cross-step "target fresh" writer bit (BZ, §G8).
+#
+# ``pc_mux(PcMuxSpec)`` takes that per-op DATA and emits the IDENTICAL
+# ``FFNRule`` tuple the hand builders produce. It adds NO compiler machinery —
+# it lowers through the same ``multi_way_and_rule`` / ``FFNRule`` shapes, so the
+# compiler sees an ordinary FFN op. The byte-identity proof re-expresses all six
+# live builders and gates the whole-model ``state_dict`` hash unchanged
+# (``tools/_isa_golden_hash.py`` == ``91f55411``). It is the CONTROL analogue of
+# :func:`decode_band` (the DECODE-family generic lowering).
+
+
+@dataclass(frozen=True)
+class PcMuxCancelBand:
+    """One PC-override cancel band (``lo`` or ``hi``).
+
+    Emits 16 ``-<output_base>[k]`` units gated by ``<output_gate>+k`` with
+    ``gate_weight=-1`` — subtracting the SEQUENTIAL default (L3's ``PC+8``)
+    from the OUTPUT bank before the encoder writes the branch target.
+
+    Args:
+        band: the band tag used in the rule name (``"lo"`` / ``"hi"``).
+        output_base: the OUTPUT dim the cancel WRITES into (with the
+            per-step ``write_scale``). ``OUTPUT_LO`` for the low band,
+            ``OUTPUT_HI_THIS_STEP`` for the high band.
+        output_gate: the OUTPUT dim the cancel READS as its ``-1`` gate.
+            Cross-step ``OUTPUT_LO.*.-1`` for the LO band (subtract the
+            PREVIOUS step's residual), same-step ``OUTPUT_HI_THIS_STEP`` for
+            the HI band (already step-local).
+        extra_gate_terms: additional multiplicative gate terms folded into the
+            cancel (e.g. the BZ ``("BZ_TARGET_FRESH.*.-1", 1.0)`` re-fire
+            suppressor, §G8) — cross-step bookkeeping only present on some ops.
+    """
+
+    band: str
+    output_base: str
+    output_gate: str
+    extra_gate_terms: Tuple[Tuple[str, float], ...] = ()
+
+
+# The two standard cancel bands every PC override uses (LO cross-step, HI
+# same-step). Ops that add extra gate terms (BZ) build their own tuple.
+_PC_MUX_STANDARD_CANCEL_BANDS: Tuple[PcMuxCancelBand, ...] = (
+    PcMuxCancelBand("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
+    PcMuxCancelBand("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+)
+
+
+@dataclass(frozen=True)
+class PcMuxEncoder:
+    """The target ENCODER for a PC override — WHERE the next PC comes from.
+
+    Two modes cover every live branch op:
+
+      * ``mode="direct_copy"`` — the PC byte is ALREADY encoded in a source
+        band; copy nibble ``k`` straight through. ``lo_source``/``hi_source``
+        name the two source bands (``AX_CARRY_LO``/``AX_CARRY_HI`` for the
+        first-step/delayed JMP AX-route, ``FETCH_LO``/``FETCH_HI`` for the
+        all-step JMP). ``gate_weight`` is the per-source one-hot scale (1.0 for
+        the register bands).
+
+      * ``mode="imm_to_byte_addr"`` — the source band carries a raw instruction
+        INDEX ``i`` (BZ/BNZ/JSR read it from ``FETCH_LO``); write the encoded
+        byte address ``target = i*INSTR_WIDTH + PC_OFFSET`` per nibble
+        (§G2's ``idx_to_pc``). Only ``lo_source`` is used (the byte-0 hi nibble
+        is determined entirely by ``i>>1`` via the SAME gate). ``gate_weight``
+        is ``1/FETCH_PC_MARKER_AMP`` for the amplified JSR FETCH band, 1.0 for
+        the BZ/BNZ FETCH band.
+
+    ``odd_hi_correction`` optionally appends the byte-0 HIGH-nibble
+    ``+INSTR_WIDTH`` fix for an ODD index-hi nibble (only meaningful for
+    ``imm_to_byte_addr``): ``"jsr"`` reproduces the JSR authoring (odd-hi in
+    ``gate_terms``, EVEN-hi blockers in ``conditions``, threshold ``+0.5``),
+    ``"branch"`` reproduces the BZ/BNZ authoring (odd-hi + even-hi blockers in
+    ``conditions`` at ``fetch_norm`` weight, threshold ``+2.0``). ``None``
+    emits no correction (byte-0-only; the ``>=0x100`` byte-1 path is a SEPARATE
+    known wall, §G3, left untouched).
+    """
+
+    mode: str  # "direct_copy" | "imm_to_byte_addr"
+    lo_source: str
+    hi_source: Optional[str] = None
+    gate_weight: float = 1.0
+    odd_hi_correction: Optional[str] = None  # None | "jsr" | "branch"
+    # For the ``odd_hi_correction`` bands: the one-hot amplitude of the FETCH_HI
+    # index-hi band (``jsr`` uses the raw 1.0 gate, ``branch`` normalizes by
+    # 1/AMP). Set from the op's ``fetch_pc_marker_amp``.
+    fetch_pc_marker_amp: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("direct_copy", "imm_to_byte_addr"):
+            raise ValueError(
+                f"PcMuxEncoder: mode must be 'direct_copy' | "
+                f"'imm_to_byte_addr'; got {self.mode!r}"
+            )
+        if self.mode == "direct_copy" and self.hi_source is None:
+            raise ValueError(
+                "PcMuxEncoder(direct_copy): hi_source is required "
+                "(the already-encoded PC byte-0 high nibble source)"
+            )
+        if self.odd_hi_correction not in (None, "jsr", "branch"):
+            raise ValueError(
+                f"PcMuxEncoder: odd_hi_correction must be None|'jsr'|'branch'; "
+                f"got {self.odd_hi_correction!r}"
+            )
+        if self.odd_hi_correction is not None and self.mode != "imm_to_byte_addr":
+            raise ValueError(
+                "PcMuxEncoder: odd_hi_correction only applies to the "
+                "imm_to_byte_addr encoder (the imm*8 shift's hi&1 carry)"
+            )
+
+
+@dataclass(frozen=True)
+class PcMuxSpec:
+    """Compact per-op description of one PC-source override.
+
+    The whole hand-authored override collapses to: a name, a GATE
+    (``conditions`` + ``threshold``), the cancel bands, the target encoder,
+    and an optional cross-step "fresh" writer. ``pc_mux(spec)`` derives the
+    ``FFNRule`` tuple byte-for-byte.
+
+    Args:
+        name: rule-name prefix (matches the hand builder's, e.g.
+            ``"l6_jmp_all_step"``, ``"post_l9_bz"``).
+        conditions: the AND gate (opcode + marker + step guard). Shared by the
+            cancel + encoder bands.
+        threshold: the AND threshold for the cancel + encoder bands.
+        write_scale: the per-write output scale (``2.0 / S``).
+        encoder: the :class:`PcMuxEncoder` (target source + optional odd-hi).
+        cancel_bands: the :class:`PcMuxCancelBand` tuple (defaults to the
+            standard LO cross-step / HI same-step pair).
+        target_conditions: OPTIONAL distinct conditions for the encoder/target
+            + odd-hi bands (BZ/BNZ add a ``MARK_STACK0`` blocker on the target
+            band that the cancel band omits). Defaults to ``conditions``.
+        odd_hi_conditions: OPTIONAL distinct base conditions for the odd-hi
+            correction band (the JSR correction re-lists a fresh conditions
+            tuple with a different opcode-nibble blocker weight). Defaults to
+            ``target_conditions``.
+        odd_hi_threshold: OPTIONAL explicit threshold for the odd-hi band
+            (JSR uses ``threshold + 0.5``; branch uses ``threshold + 2.0``,
+            derived when ``None``).
+        fresh_writer: OPTIONAL ``(dim, extra_conditions)`` for a cross-step
+            "this step took the branch" bit (BZ ``BZ_TARGET_FRESH``). Written
+            at the cancel gate.
+    """
+
+    name: str
+    conditions: Tuple[Tuple[str, float], ...]
+    threshold: float
+    write_scale: float
+    encoder: PcMuxEncoder
+    cancel_bands: Tuple[PcMuxCancelBand, ...] = _PC_MUX_STANDARD_CANCEL_BANDS
+    target_conditions: Optional[Tuple[Tuple[str, float], ...]] = None
+    odd_hi_conditions: Optional[Tuple[Tuple[str, float], ...]] = None
+    odd_hi_threshold: Optional[float] = None
+    fresh_writer: Optional[Tuple[str, Tuple[Tuple[str, float], ...]]] = None
+
+    @property
+    def effective_target_conditions(self) -> Tuple[Tuple[str, float], ...]:
+        return (
+            self.conditions
+            if self.target_conditions is None
+            else self.target_conditions
+        )
+
+    @property
+    def effective_odd_hi_conditions(self) -> Tuple[Tuple[str, float], ...]:
+        if self.odd_hi_conditions is not None:
+            return self.odd_hi_conditions
+        return self.effective_target_conditions
+
+
+@dataclass(frozen=True)
+class PcMuxBundle:
+    """Result of :func:`pc_mux`.
+
+    Attributes:
+        spec: the originating :class:`PcMuxSpec`.
+        rules_builder: ``() -> Tuple[FFNRule, ...]`` — the derived override
+            rules, byte-identical to the hand-authored builder.
+        reads / writes: dep-graph dims the op factory declares (base names).
+    """
+
+    spec: PcMuxSpec
+    rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    reads: Set[str]
+    writes: Set[str]
+
+
+def _pc_encoder_target_lo(k: int, instr_width: int, pc_offset: int) -> int:
+    return (k * instr_width + pc_offset) & 0xF
+
+
+def _pc_encoder_target_hi(k: int, instr_width: int, pc_offset: int) -> int:
+    return ((k * instr_width + pc_offset) >> 4) & 0xF
+
+
+def _pc_mux_cancel_rules(spec: PcMuxSpec) -> list[FFNRule]:
+    """The 16-per-band ``-OUTPUT[k]`` cancel units (subtract the seq default)."""
+
+    rules: list[FFNRule] = []
+    for cb in spec.cancel_bands:
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_cancel_{cb.band}_{k}",
+                conditions=spec.conditions,
+                threshold=spec.threshold,
+                gate=f"{cb.output_gate}+{k}",
+                gate_weight=-1.0,
+                gate_terms=cb.extra_gate_terms,
+                writes=((f"{cb.output_base}+{k}", spec.write_scale),),
+            ))
+    return rules
+
+
+def _pc_mux_encoder_rules(
+    spec: PcMuxSpec, instr_width: int, pc_offset: int,
+) -> list[FFNRule]:
+    """The 16-per-band target ENCODER units (WHERE the next PC comes from)."""
+
+    enc = spec.encoder
+    conds = spec.effective_target_conditions
+    rules: list[FFNRule] = []
+    if enc.mode == "direct_copy":
+        # Copy the already-encoded PC byte nibble straight through.
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_target_lo_{k}",
+                conditions=conds,
+                threshold=spec.threshold,
+                gate=f"{enc.lo_source}+{k}",
+                gate_weight=enc.gate_weight,
+                writes=((f"OUTPUT_LO+{k}", spec.write_scale),),
+            ))
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_target_hi_{k}",
+                conditions=conds,
+                threshold=spec.threshold,
+                gate=f"{enc.hi_source}+{k}",
+                gate_weight=enc.gate_weight,
+                writes=((f"OUTPUT_HI_THIS_STEP+{k}", spec.write_scale),),
+            ))
+    else:  # imm_to_byte_addr
+        # Convert the raw instruction INDEX k -> encoded byte address nibbles.
+        for k in range(16):
+            target_lo = _pc_encoder_target_lo(k, instr_width, pc_offset)
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_byteaddr_lo_{k}",
+                conditions=conds,
+                threshold=spec.threshold,
+                gate=f"{enc.lo_source}+{k}",
+                gate_weight=enc.gate_weight,
+                writes=((f"OUTPUT_LO+{target_lo}", spec.write_scale),),
+            ))
+        for k in range(16):
+            target_hi = _pc_encoder_target_hi(k, instr_width, pc_offset)
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_byteaddr_hi_{k}",
+                conditions=conds,
+                threshold=spec.threshold,
+                gate=f"{enc.lo_source}+{k}",
+                gate_weight=enc.gate_weight,
+                writes=((f"OUTPUT_HI_THIS_STEP+{target_hi}", spec.write_scale),),
+            ))
+    return rules
+
+
+def _pc_mux_odd_hi_rules(
+    spec: PcMuxSpec, instr_width: int, pc_offset: int,
+) -> list[FFNRule]:
+    """The optional byte-0 HIGH-nibble ``+INSTR_WIDTH`` odd-index-hi fix.
+
+    ``imm*INSTR_WIDTH mod 256`` gains ``+INSTR_WIDTH*8/16`` in byte-0's high
+    nibble exactly when the index-hi nibble is ODD (``hi&1``). Two authoring
+    flavors, both derived here (JSR ``gate_terms`` vs BZ/BNZ ``conditions``).
+    """
+
+    enc = spec.encoder
+    if enc.odd_hi_correction is None:
+        return []
+    rules: list[FFNRule] = []
+    amp = enc.fetch_pc_marker_amp
+    base_hi = spec.effective_odd_hi_conditions
+    ws = spec.write_scale
+
+    def base_target_hi(k: int) -> int:
+        return _pc_encoder_target_hi(k, instr_width, pc_offset)
+
+    def corrected_target_hi(k: int) -> int:
+        # +INSTR_WIDTH on the byte-0 high nibble (== base + 8 for INSTR_WIDTH=8).
+        return (base_target_hi(k) + instr_width) & 0xF
+
+    if enc.odd_hi_correction == "jsr":
+        odd_imm_hi_gate = tuple(
+            (f"FETCH_HI+{k}", 1.0) for k in range(1, 16, 2)
+        )
+        even_imm_hi_blockers = tuple(
+            (f"FETCH_HI+{k}", -10.0) for k in range(0, 16, 2)
+        )
+        thr = (
+            spec.odd_hi_threshold
+            if spec.odd_hi_threshold is not None
+            else spec.threshold + 0.5
+        )
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_target_hi_odd_imm_hi_correction_{k}",
+                conditions=base_hi
+                + ((f"FETCH_LO+{k}", 1.0),)
+                + even_imm_hi_blockers,
+                threshold=thr,
+                gate_terms=odd_imm_hi_gate,
+                writes=(
+                    (f"OUTPUT_HI_THIS_STEP+{base_target_hi(k)}", -ws),
+                    (f"OUTPUT_HI_THIS_STEP+{corrected_target_hi(k)}", ws),
+                ),
+            ))
+    else:  # "branch"
+        fetch_norm = 1.0 / amp
+        odd_imm_hi_require = tuple(
+            (f"FETCH_HI+{j}", fetch_norm) for j in range(1, 16, 2)
+        )
+        even_imm_hi_blockers = tuple(
+            (f"FETCH_HI+{j}", -10.0 * fetch_norm) for j in range(0, 16, 2)
+        )
+        thr = (
+            spec.odd_hi_threshold
+            if spec.odd_hi_threshold is not None
+            else spec.threshold + 2.0
+        )
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_target_hi_odd_imm_hi_correction_{k}",
+                conditions=base_hi
+                + ((f"FETCH_LO+{k}", fetch_norm),)
+                + odd_imm_hi_require
+                + even_imm_hi_blockers,
+                threshold=thr,
+                gate=f"FETCH_LO+{k}",
+                writes=(
+                    (f"OUTPUT_HI_THIS_STEP+{base_target_hi(k)}", -ws),
+                    (f"OUTPUT_HI_THIS_STEP+{corrected_target_hi(k)}", ws),
+                ),
+            ))
+    return rules
+
+
+def _pc_mux_fresh_writer_rules(spec: PcMuxSpec) -> list[FFNRule]:
+    """The optional cross-step 'branch taken this step' bit (BZ, §G8)."""
+
+    if spec.fresh_writer is None:
+        return []
+    dim, extra = spec.fresh_writer
+    return [multi_way_and_rule(
+        name=f"{spec.name}_target_fresh_write",
+        conditions=spec.conditions + extra,
+        threshold=spec.threshold,
+        writes=((dim, spec.write_scale),),
+    )]
+
+
+def pc_mux(
+    spec: PcMuxSpec,
+    *,
+    instr_width: int,
+    pc_offset: int,
+) -> PcMuxBundle:
+    """Derive one PC-source override's FFN rules from ``spec``.
+
+    Emits, in order: the cancel bands (subtract the SEQUENTIAL default), the
+    target ENCODER (direct-copy OR imm->byte-addr), the optional odd-index-hi
+    byte-0 correction, then the optional cross-step 'fresh' writer. Reproduces
+    the six hand-authored override builders byte-for-byte (proof:
+    ``tools/_isa_golden_hash.py`` unchanged with the derived form live).
+
+    ``instr_width`` / ``pc_offset`` are the ISA constants (``constants.py``:
+    ``INSTR_WIDTH=8``, ``PC_OFFSET=2``) — the encoder's only numeric inputs
+    (``idx_to_pc(i) = i*INSTR_WIDTH + PC_OFFSET``). No compiler machinery: the
+    rules lower through the ordinary ``multi_way_and_rule`` / ``FFNRule``
+    shapes.
+    """
+
+    def rules_builder() -> Tuple[FFNRule, ...]:
+        out: list[FFNRule] = []
+        out.extend(_pc_mux_cancel_rules(spec))
+        out.extend(_pc_mux_encoder_rules(spec, instr_width, pc_offset))
+        out.extend(_pc_mux_odd_hi_rules(spec, instr_width, pc_offset))
+        out.extend(_pc_mux_fresh_writer_rules(spec))
+        return tuple(out)
+
+    # Dep-graph derivation: reads = the gate + cancel gate + encoder source
+    # dims; writes = the OUTPUT bands (+ the fresh bit).
+    reads: Set[str] = set()
+    writes: Set[str] = set()
+
+    def _base(name: str) -> str:
+        # Strip a trailing ``+k`` offset and any ``.*.-1`` cross-step alias.
+        return name.split("+", 1)[0]
+
+    for (dim, _w) in spec.conditions:
+        reads.add(_base(dim))
+    for cb in spec.cancel_bands:
+        reads.add(_base(cb.output_gate))
+        writes.add(_base(cb.output_base))
+        for (dim, _w) in cb.extra_gate_terms:
+            reads.add(_base(dim))
+    for (dim, _w) in spec.effective_target_conditions:
+        reads.add(_base(dim))
+    reads.add(_base(spec.encoder.lo_source))
+    if spec.encoder.hi_source is not None:
+        reads.add(_base(spec.encoder.hi_source))
+    writes.add("OUTPUT_LO")
+    writes.add("OUTPUT_HI_THIS_STEP")
+    if spec.encoder.odd_hi_correction is not None:
+        reads.add("FETCH_HI")
+        for (dim, _w) in spec.effective_odd_hi_conditions:
+            reads.add(_base(dim))
+    if spec.fresh_writer is not None:
+        dim, extra = spec.fresh_writer
+        writes.add(_base(dim))
+        for (d, _w) in extra:
+            reads.add(_base(d))
+
+    return PcMuxBundle(
+        spec=spec,
+        rules_builder=rules_builder,
+        reads=reads,
+        writes=writes,
+    )
