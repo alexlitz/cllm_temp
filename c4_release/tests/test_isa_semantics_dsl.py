@@ -1399,14 +1399,37 @@ def test_cam_valid_slot_stamps_row_found_bit():
 
 def test_cam_lookup_direction_load_is_default_store_needs_value():
     """direction records the CAM data-flow (G1(b)): 'load' (default) reads by
-    address; 'store' is the emit direction and must relay its value bands."""
+    address; 'store' is the emit direction and is built from the STORE fields
+    (fire gate + per-byte route bank), NOT the single load key_match."""
+    from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
+        CamStoreRoute,
+    )
     assert _operand_gather_cam_spec().direction == "load"
     with pytest.raises(ValueError, match="direction must be"):
         _operand_gather_cam_spec(direction="bogus")
     with pytest.raises(ValueError, match="must relay its emit value"):
         _operand_gather_cam_spec(direction="store", value_active=False)
-    # A store spec that relays its value bands is accepted (the semantic tag).
-    assert _operand_gather_cam_spec(direction="store").direction == "store"
+    # A store spec must declare a fire gate + at least one per-byte route.
+    with pytest.raises(ValueError, match="store_route"):
+        _operand_gather_cam_spec(direction="store")
+    with pytest.raises(ValueError, match="store_gate"):
+        _operand_gather_cam_spec(
+            direction="store",
+            store_routes=(CamStoreRoute(
+                slot=1, fire_dim="BYTE_INDEX_0", key_dim="MARK_AX",
+                key_weight=200.0,
+                value_bands=(CamValueBand("ALU_LO", "ALU_LO", 4, 1, 1.0),)),))
+    # store fields on a load spec are rejected (guard against a mixed spec).
+    with pytest.raises(ValueError, match="only valid with direction='store'"):
+        _operand_gather_cam_spec(store_gate=("BYTE_INDEX_0", 15.0))
+    # A store spec with a gate + a route is accepted.
+    spec = _operand_gather_cam_spec(
+        direction="store",
+        store_gate=("BYTE_INDEX_0", 15.0),
+        store_routes=(CamStoreRoute(
+            slot=1, fire_dim="BYTE_INDEX_0", key_dim="MARK_AX", key_weight=200.0,
+            value_bands=(CamValueBand("ALU_LO", "ALU_LO", 4, 1, 1.0),)),))
+    assert spec.direction == "store"
 
 
 def test_l13_mem_addr_gather_derived_is_byte_identical_to_handbuilt():
@@ -1480,6 +1503,188 @@ def test_l13_mem_addr_gather_derived_is_byte_identical_to_handbuilt():
         assert _canon(derived[i]) == _canon(legacy), (
             f"L13 mem_addr_gather head {i} derived != legacy")
         assert derived[i].head_idx == head_idx
+
+
+def test_cam_lookup_store_direction_emit_gather_structure():
+    """The store-direction lowering builds a fire gate (slot 0 + confirm) + a
+    per-byte route bank (each binds a K-signature at K_FLAG + relays a value band
+    into a store band) + an optional TEMP stamp — with NO single load key_match."""
+    from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
+        CamStoreRoute, CamStoreStamp,
+    )
+    dp = {"CONST": 0, "TEMP": 100, "MARK_AX": 5, "MARK_PC": 6,
+          "BYTE_INDEX_0": 10, "BYTE_INDEX_3": 13, "STACK0_BYTE1": 20,
+          "OP_SUB": 30, "SVAL_LO": 200, "SVAL_HI": 300}
+    spec = CamLookupSpec(
+        name="store",
+        key_match=CamKeyMatch(query_dim="BYTE_INDEX_0", key_dim="CONST",
+                              weight=15.0),
+        value_bands=(CamValueBand("SVAL_LO", "SVAL_LO", 4, 3, 1.0),),
+        direction="store",
+        store_gate=("TEMP+9", 15.0),
+        store_rejects=(("MARK_AX", -150.0), ("MARK_PC", -150.0)),
+        confirm=CamConfirmSlot(slot=33, marker_weight=15.0, const_q_weight=-7.5,
+                               const_k_weight=15.0, marker_dim="TEMP+9"),
+        store_routes=(CamStoreRoute(
+            slot=1, fire_dim="BYTE_INDEX_0", key_dim="STACK0_BYTE1",
+            key_weight=200.0, key_baseline=("CONST", -100.0),
+            fire_extra=(("TEMP+9", 15.0),),
+            value_bands=(CamValueBand("SVAL_LO", "SVAL_LO", 4, 3, 1.0),
+                         CamValueBand("SVAL_HI", "SVAL_HI", 4, 19, 1.0))),),
+        store_stamp=CamStoreStamp(v_slot=35, read_dim="OP_SUB", read_scale=0.2,
+                                  write_dim="TEMP+9", o_scale=1.0),
+    )
+    bundle = cam_lookup(spec)
+    head = bundle.head_spec_builder(dp, 4)
+    q = {(w.slot, w.dim, w.weight) for w in head.q}
+    k = {(w.slot, w.dim, w.weight) for w in head.k}
+    o = {(w.out_dim, w.slot, w.weight) for w in head.o}
+    # Fire gate on slot 0: gate dim (TEMP+9 = 100+9) + CONST baseline + rejects.
+    assert (0, 109, 15.0) in q and (0, 0, -7.5) in q
+    assert (0, 5, -150.0) in q and (0, 6, -150.0) in q
+    # Confirm slot 33 re-asserts the gate dim + anchors CONST.
+    assert (33, 109, 15.0) in q and (33, 0, 15.0) in k
+    # The route binds STACK0_BYTE1 @ K_FLAG on slot 1 + a CONST baseline.
+    assert (1, 20, 200.0) in k and (1, 0, -100.0) in k
+    # Route Q: fire dim + CONST baseline + the fire_extra co-fire (TEMP+9).
+    assert (1, 10, 15.0) in q and (1, 0, -15.0) in q and (1, 109, 15.0) in q
+    # The TEMP stamp: O writes the TEMP selector (100+9) from the stamp V slot.
+    assert (109, 35, 1.0) in o
+    # NO free load key-match K on slot 0 (the store head has no single key_dim).
+    assert not any(w.slot == 0 for w in head.k if (0, 0) != (w.slot, w.dim))
+    # Deps: reads the gate/reject/route/stamp dims; writes the store value bands.
+    assert {"SVAL_LO", "SVAL_HI"}.issubset(bundle.head_writes)
+    assert {"TEMP", "STACK0_BYTE1", "OP_SUB"}.issubset(bundle.head_reads)
+
+
+def test_l13_sub_add_relay_derived_is_byte_identical_to_handbuilt():
+    """DERIVE->PROVE->FLIP->DELETE: the L13 SUB minuend relay (head 4) + ADD
+    addend relay (head 5) produced by ``cam_lookup`` (``direction="store"``, the
+    sole live path) match a fresh hand-reconstruction of the DELETED legacy
+    Q/K/V/O writes, byte-for-byte, in the current config. The golden-hash-neutral
+    flip's byte-identity proof (both configs covered by the standalone probe
+    ``tools/_probe_l13_store_cam_derive.py``)."""
+    from c4_release.neural_vm.dim_registry_dynamic import (
+        build_default_registry_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.shared import (
+        _as_setdim_proxy, operand_from_memsp_enabled,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.l13_ops import (
+        _layer13_sub_minuend_relay_head_specs,
+        _layer13_add_addend_relay_head_specs,
+    )
+    from c4_release.neural_vm.unified_compiler.primitives import (
+        AO, AP, DeclarativeAttentionHeadSpec,
+    )
+
+    reg = build_default_registry_dynamic()
+    dp = {name: int(slot.start) for name, slot in reg.slots.items()}
+    BD = _as_setdim_proxy(dp)
+    campaign = operand_from_memsp_enabled()
+    L, K_FLAG, OP_W = 15.0, 200.0, 40.0
+
+    def _canon(spec):
+        return (
+            sorted((w.slot, w.dim, w.weight) for w in spec.q),
+            sorted((w.slot, w.dim, w.weight) for w in spec.k),
+            sorted((w.slot, w.dim, w.weight) for w in spec.v),
+            sorted((w.out_dim, w.slot, w.weight) for w in spec.o),
+        )
+
+    # --- Legacy SUB head 4 (verbatim from the DELETED code) ---
+    if campaign:
+        q = [AP(0, BD.BYTE_INDEX_0, L), AP(0, BD.HAS_SE, L),
+             AP(0, BD.CONST, -L / 2), AP(0, BD.MARK_AX, -L * 10),
+             AP(0, BD.MARK_PC, -L * 10), AP(0, BD.BYTE_INDEX_1, -L * 10),
+             AP(0, BD.BYTE_INDEX_2, -L * 10), AP(0, BD.BYTE_INDEX_3, -L * 10),
+             AP(33, BD.BYTE_INDEX_0, L), AP(33, BD.CONST, -L / 2)]
+        k = [AP(33, BD.CONST, L)]
+        v, o, sel, base = [], [], 1, 3
+        q += [AP(sel, BD.BYTE_INDEX_0, L), AP(sel, BD.HAS_SE, L),
+              AP(sel, BD.CONST, -L)]
+        k += [AP(sel, BD.MARK_AX, K_FLAG), AP(sel, BD.OP_SUB, OP_W),
+              AP(sel, BD.OP_ADD, -K_FLAG), AP(sel, BD.CONST, -K_FLAG * 1.3)]
+        vlo, vhi = BD.STACK0_BYTE_VAL_1_LO, BD.STACK0_BYTE_VAL_1_HI
+        for kk in range(16):
+            v += [AP(base + kk, vlo + kk, 1.0),
+                  AP(base + 16 + kk, vhi + kk, 1.0)]
+            o += [AO(vlo + kk, base + kk, 1.0),
+                  AO(vhi + kk, base + 16 + kk, 1.0)]
+        v.append(AP(base + 32, BD.OP_SUB, 0.2))
+        o.append(AO(BD.TEMP + 9, base + 32, 1.0))
+    else:
+        _routes = (
+            (0, BD.BYTE_INDEX_0, BD.STACK0_BYTE1,
+             BD.STACK0_BYTE_VAL_1_LO, BD.STACK0_BYTE_VAL_1_HI),
+            (1, BD.BYTE_INDEX_1, BD.STACK0_BYTE2,
+             BD.STACK0_BYTE_VAL_2_LO, BD.STACK0_BYTE_VAL_2_HI),
+            (2, BD.BYTE_INDEX_2, BD.STACK0_BYTE3,
+             BD.STACK0_BYTE_VAL_3_LO, BD.STACK0_BYTE_VAL_3_HI),
+        )
+        q = [AP(0, BD.TEMP + 9, L), AP(0, BD.CONST, -L / 2),
+             AP(0, BD.MARK_AX, -L * 10), AP(0, BD.MARK_PC, -L * 10),
+             AP(0, BD.TEMP + 8, -L * 10), AP(0, BD.BYTE_INDEX_3, -L * 10),
+             AP(33, BD.TEMP + 9, L), AP(33, BD.CONST, -L / 2)]
+        k = [AP(33, BD.CONST, L)]
+        v, o = [], []
+        for j, (h, emit, src, vlo, vhi) in enumerate(_routes):
+            sel = 1 + j
+            q += [AP(sel, emit, L), AP(sel, BD.TEMP + 9, L),
+                  AP(sel, BD.CONST, -L)]
+            k += [AP(sel, src, K_FLAG), AP(sel, BD.CONST, -K_FLAG / 2)]
+            base = 3 + j * 32
+            for kk in range(16):
+                v += [AP(base + kk, vlo + kk, 1.0),
+                      AP(base + 16 + kk, vhi + kk, 1.0)]
+                o += [AO(vlo + kk, base + kk, 1.0),
+                      AO(vhi + kk, base + 16 + kk, 1.0)]
+    legacy4 = DeclarativeAttentionHeadSpec(
+        head_idx=4, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o))
+    derived4 = _layer13_sub_minuend_relay_head_specs(BD)[0]
+    assert _canon(derived4) == _canon(legacy4), "L13 SUB head 4 derived != legacy"
+    assert derived4.head_idx == 4
+
+    # --- Legacy ADD head 5 (verbatim) ---
+    emit, vlo, vhi = (BD.BYTE_INDEX_0, BD.STACK0_BYTE_VAL_1_LO,
+                      BD.STACK0_BYTE_VAL_1_HI)
+    if campaign:
+        q = [AP(0, emit, L), AP(0, BD.HAS_SE, L), AP(0, BD.CONST, -L / 2),
+             AP(0, BD.MARK_AX, -L * 10), AP(0, BD.MARK_PC, -L * 10),
+             AP(0, BD.BYTE_INDEX_1, -L * 10), AP(0, BD.BYTE_INDEX_2, -L * 10),
+             AP(0, BD.BYTE_INDEX_3, -L * 10), AP(33, emit, L),
+             AP(33, BD.CONST, -L / 2)]
+        k = [AP(33, BD.CONST, L)]
+        v, o, sel, base = [], [], 1, 3
+        q += [AP(sel, emit, L), AP(sel, BD.HAS_SE, L), AP(sel, BD.CONST, -L)]
+        k += [AP(sel, BD.MARK_AX, K_FLAG), AP(sel, BD.OP_ADD, OP_W),
+              AP(sel, BD.OP_SUB, -K_FLAG), AP(sel, BD.CONST, -K_FLAG * 1.3)]
+        for kk in range(16):
+            v += [AP(base + kk, vlo + kk, 1.0),
+                  AP(base + 16 + kk, vhi + kk, 1.0)]
+            o += [AO(vlo + kk, base + kk, 1.0),
+                  AO(vhi + kk, base + 16 + kk, 1.0)]
+        v.append(AP(base + 32, BD.OP_ADD, 0.2))
+        o.append(AO(BD.TEMP + 12, base + 32, 1.0))
+    else:
+        q = [AP(0, BD.TEMP + 8, L), AP(0, BD.CONST, -L / 2),
+             AP(0, BD.MARK_AX, -L * 10), AP(0, BD.MARK_PC, -L * 10),
+             AP(0, BD.TEMP + 9, -L * 10), AP(0, BD.BYTE_INDEX_3, -L * 10),
+             AP(33, BD.TEMP + 8, L), AP(33, BD.CONST, -L / 2)]
+        k = [AP(33, BD.CONST, L)]
+        v, o, sel, base = [], [], 1, 3
+        q += [AP(sel, emit, L), AP(sel, BD.TEMP + 8, L), AP(sel, BD.CONST, -L)]
+        k += [AP(sel, BD.STACK0_BYTE1, K_FLAG), AP(sel, BD.CONST, -K_FLAG / 2)]
+        for kk in range(16):
+            v += [AP(base + kk, vlo + kk, 1.0),
+                  AP(base + 16 + kk, vhi + kk, 1.0)]
+            o += [AO(vlo + kk, base + kk, 1.0),
+                  AO(vhi + kk, base + 16 + kk, 1.0)]
+    legacy5 = DeclarativeAttentionHeadSpec(
+        head_idx=5, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o))
+    derived5 = _layer13_add_addend_relay_head_specs(BD)[0]
+    assert _canon(derived5) == _canon(legacy5), "L13 ADD head 5 derived != legacy"
+    assert derived5.head_idx == 5
 
 
 # ===========================================================================
