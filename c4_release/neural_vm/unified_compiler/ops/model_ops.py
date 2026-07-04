@@ -231,8 +231,8 @@ def _function_call_blank_rule(name: str) -> FFNRule:
       * ``gate=None`` and ``gate_bias=0.0`` -> ``b_gate[u] = 0``
       * ``writes=()`` -> ``W_down[:, u] = 0``
 
-    Mirrors ``l5_ops._opcode_decode_jsr_temp0_blank_rule`` (the same
-    pattern is used by ``opcode_decode_ffn`` for its unit-52 blank).
+    Mirrors the ``BlankUnit`` band the L5 ``decode_band`` engine lowers for
+    ``opcode_decode_ffn``'s unit-52 blank (same zero-row pattern).
     """
     return FFNRule(
         conditions=(),
@@ -356,8 +356,9 @@ def _function_call_jsr_pc_override_conditions() -> tuple[tuple[str, float], ...]
     Gates on MARK_PC + TEMP[0] (IS_JSR flag). On a step-0 JSR the
     HAS_SE-gated L5 first-step decode supplies ``TEMP+0 = +5``; on a
     NESTED JSR (after an ENT) the all-step JSR IS_JSR decode
-    (:func:`l5_ops._opcode_decode_all_step_jsr_rules`, flag
-    ``C4_NESTED_JSR_PC_FIX``) supplies the same ``+5`` from the clean
+    (the ``all_step_jsr_at_pc`` derived decode context in
+    ``l5_ops._derived_decode_spec``, flag ``C4_NESTED_JSR_PC_FIX``)
+    supplies the same ``+5`` from the clean
     per-step JSR opcode byte. Strong negative blockers for every other
     opcode (NOP, EXIT, JMP, BZ, BNZ, IMM, LEV, ENT) prevent spurious firing
     on non-JSR steps where TEMP[0] is polluted by L6 head 4 (BZ/BNZ relay).

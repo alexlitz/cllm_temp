@@ -129,23 +129,6 @@ _ARITH_CONSUMER_SPEC = ConsumerLookaheadGateSpec(
 _ARITH_CONSUMER_GATE = consumer_lookahead_gate(_ARITH_CONSUMER_SPEC)
 
 
-def _derive_decode_enabled() -> bool:
-    """Flag for the GENERIC decode-derivation pilot (task #391). Default OFF.
-
-    When ``C4_DERIVE_DECODE=1``, the L5 opcode-decode FFN rule sequence is
-    produced by the generic :func:`decode_band` engine
-    (``isa_semantics_dsl.py``) — derived from the ISA ``Opcode`` table + a
-    small band-context table with ZERO hand-authored per-opcode rules —
-    instead of the hand-authored ``_opcode_decode_main/first_step/...`` rule
-    builders. The derived tuple is byte-for-byte identical to the hand path
-    (proof: ``tools/_isa_golden_hash.py`` unchanged under
-    ``C4_DERIVE_DECODE=1``), so this is the STEP-3 generic engine + STEP-4
-    100%-derivation proof for the DECODE family. Default OFF => the
-    hand-authored path stays the golden build.
-    """
-    return os.environ.get("C4_DERIVE_DECODE", "0") != "0"
-
-
 def _nested_jsr_pc_fix_enabled() -> bool:
     """Flag for the nested-JSR (JSR-after-ENT) IS_JSR decode. Default ON.
 
@@ -201,9 +184,10 @@ def _nested_jsr_pc_fix_enabled() -> bool:
 # updating this table in lock-step.
 _FETCH_FFN_UNIT_LAYOUT = (
     # (sub-stage name, legacy_start (docs only), n_units)
-    # 34 main per-opcode AX rules (one unit per opcode in the table at
-    # ``_opcode_decode_main_rules``). Unit 3 writes TEMP+0 (JSR's IS_JSR
-    # flag); the other 33 units each write the matching OP_* dim.
+    # 34 main per-opcode AX rules (one unit per opcode in the ISA table;
+    # derived by the ``main_at_ax`` context in ``_derived_decode_spec``).
+    # Unit 3 writes TEMP+0 (JSR's IS_JSR flag); the other 33 units each
+    # write the matching OP_* dim.
     ("opcode_decode_ffn.main_at_ax",          0, 34),
     # 18 first-step PC-marker decode rules (``HAS_SE == 0`` gates the
     # initial step). Unit 35 writes TEMP+0 (first-step JSR's IS_JSR
@@ -691,7 +675,7 @@ def make_opcode_decode_ffn_op() -> Operation:
     #                  TEMP+k.
     #   units 84..88:  all-step PC-marker decode (BZ, BNZ, LEV, EXIT, JMP).
     _claims = set()
-    # Main per-opcode units at MARK_AX, in the order from _opcode_decode_main_rules.
+    # Main per-opcode units at MARK_AX, in the derived ISA-table emit order.
     _main_outputs = [
         "OP_LEA", "OP_IMM", "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
         "OP_ENT", "OP_ADJ", "OP_LEV", "OP_LI", "OP_LC", "OP_SI",
@@ -785,262 +769,6 @@ def make_opcode_decode_ffn_op() -> Operation:
     )
 
 
-def _opcode_decode_main_rules(S):
-    """CompilerIR rules for opcode byte decode at the AX marker.
-
-    Phase 8.D: the per-opcode write targets resolve through
-    :func:`dim_ref` for the ``(opcode_flag, <op_name>)`` semantic
-    family lookup -- each rule's output dim names the opcode-flag
-    role it asserts. The ``MARK_AX`` gate also moves to
-    ``dim_ref("marker", "AX")``. Structural ``OPCODE_BYTE_LO/HI+<lo|hi>``
-    operand reads stay as ``+N`` (per-nibble one-hot lookup indices
-    on the opcode byte's nibble decomposition).
-    """
-
-    from ...embedding import Opcode
-
-    opcodes = [
-        (Opcode.LEA, 0, 0),
-        (Opcode.IMM, 1, 0),
-        (Opcode.JMP, 2, 0),
-        (Opcode.JSR, 3, 0),
-        (Opcode.BZ, 4, 0),
-        (Opcode.BNZ, 5, 0),
-        (Opcode.ENT, 6, 0),
-        (Opcode.ADJ, 7, 0),
-        (Opcode.LEV, 8, 0),
-        (Opcode.LI, 9, 0),
-        (Opcode.LC, 10, 0),
-        (Opcode.SI, 11, 0),
-        (Opcode.SC, 12, 0),
-        (Opcode.PSH, 13, 0),
-        (Opcode.OR, 14, 0),
-        (Opcode.XOR, 15, 0),
-        (Opcode.AND, 0, 1),
-        (Opcode.EQ, 1, 1),
-        (Opcode.NE, 2, 1),
-        (Opcode.LT, 3, 1),
-        (Opcode.GT, 4, 1),
-        (Opcode.LE, 5, 1),
-        (Opcode.GE, 6, 1),
-        (Opcode.SHL, 7, 1),
-        (Opcode.SHR, 8, 1),
-        (Opcode.ADD, 9, 1),
-        (Opcode.SUB, 10, 1),
-        (Opcode.MUL, 11, 1),
-        (Opcode.DIV, 12, 1),
-        (Opcode.MOD, 13, 1),
-        (Opcode.EXIT, 6, 2),
-        (Opcode.NOP, 7, 2),
-        (Opcode.PUTCHAR, 1, 4),
-        (Opcode.GETCHAR, 0, 4),
-    ]
-    op_names = _opcode_name_map()
-    gate_mark_ax = dim_ref("marker", "AX")
-    return tuple(
-        multi_way_and_rule(
-            name=f"l5_decode_{op_names[op_val].lower()}_at_ax",
-            conditions=(
-                (f"OPCODE_BYTE_LO+{lo}", 1.0),
-                (f"OPCODE_BYTE_HI+{hi}", 1.0),
-            ),
-            threshold=1.5,
-            gate=gate_mark_ax,
-            # ``op_names[op_val]`` is the ``"OP_<NAME>"`` slot string;
-            # rewriting it via dim_ref names the (opcode_flag, NAME)
-            # role lookup.
-            writes=((dim_ref("opcode_flag", op_names[op_val][3:]), 10.0 / S),),
-        )
-        for op_val, lo, hi in opcodes
-    )
-
-
-def _opcode_decode_first_step_rules(S):
-    """CompilerIR rules for first-step PC-marker opcode decode.
-
-    Phase 8.D: ``OP_<NAME>`` write targets use :func:`dim_ref` for the
-    ``(opcode_flag, <NAME>)`` semantic pair. The single ``TEMP+0``
-    write (JSR's first-step IS_JSR flag) stays structural -- ``TEMP+0``
-    is a scratch-slot offset, not a role-meaningful byte position
-    or opcode-flag family member.
-    """
-
-    # Each entry is ``(opcode_lo_nibble, opcode_hi_nibble, out_dim)`` where
-    # ``out_dim`` is either ``dim_ref("opcode_flag", NAME)`` (the
-    # decoded opcode-flag family member) or the bare ``"TEMP+0"`` slot
-    # (JSR's first-step IS_JSR flag, owned by the temp_scratch family
-    # but without a dedicated role binding).
-    first_step_opcodes = [
-        (2, 0, dim_ref("opcode_flag", "JMP")),
-        (3, 0, "TEMP+0"),
-        (1, 0, dim_ref("opcode_flag", "IMM")),
-        (0, 0, dim_ref("opcode_flag", "LEA")),
-        (6, 2, dim_ref("opcode_flag", "EXIT")),
-        (7, 2, dim_ref("opcode_flag", "NOP")),
-        (9, 1, dim_ref("opcode_flag", "ADD")),
-        (10, 1, dim_ref("opcode_flag", "SUB")),
-        (11, 1, dim_ref("opcode_flag", "MUL")),
-        (12, 1, dim_ref("opcode_flag", "DIV")),
-        (13, 1, dim_ref("opcode_flag", "MOD")),
-        (14, 0, dim_ref("opcode_flag", "OR")),
-        (15, 0, dim_ref("opcode_flag", "XOR")),
-        (0, 1, dim_ref("opcode_flag", "AND")),
-        (1, 1, dim_ref("opcode_flag", "EQ")),
-        (3, 1, dim_ref("opcode_flag", "LT")),
-        (7, 1, dim_ref("opcode_flag", "SHL")),
-        (8, 1, dim_ref("opcode_flag", "SHR")),
-    ]
-    return tuple(
-        multi_way_and_rule(
-            # Preserve the legacy rule-name suffix shape by stripping
-            # the ``+0`` produced by ``dim_ref`` (turning ``OP_JMP+0``
-            # back into ``op_jmp``).
-            name=(
-                f"l5_first_step_decode_"
-                f"{out_dim.lower().replace('+', '_')}"
-                if out_dim.startswith("TEMP")
-                else f"l5_first_step_decode_"
-                     f"{out_dim.split('+', 1)[0].lower()}"
-            ),
-            conditions=(
-                (f"OPCODE_BYTE_LO+{lo}", 1.0),
-                (f"OPCODE_BYTE_HI+{hi}", 1.0),
-                ("MARK_PC", 1.0),
-                ("HAS_SE", -1.0),
-            ),
-            threshold=2.5,
-            writes=((out_dim, 10.0 / S),),
-        )
-        for lo, hi, out_dim in first_step_opcodes
-    )
-
-
-def _opcode_decode_temp_clear_rules(S):
-    """CompilerIR rules for TEMP[1..31] clearing at the PC marker.
-
-    TEMP[0] is reserved for the first-step JSR flag, so the caller must leave
-    one blank hidden unit before lowering these rules to preserve legacy unit
-    numbering.
-    """
-
-    # No role-meaningful refs here: the ``gate=f"TEMP+{k}"`` / write target
-    # use ``k`` as a structural scratch-slot index (not a role), and the
-    # ``MARK_PC`` condition appears as an up-branch guard term (the L8 pilot
-    # preserved that convention).
-    return tuple(
-        multi_way_and_rule(
-            name=f"l5_temp_clear_{k}_at_pc",
-            conditions=(("MARK_PC", 1.0),),
-            threshold=0.5,
-            gate=f"TEMP+{k}",
-            gate_weight=-1.0,
-            writes=((f"TEMP+{k}", 2.0 / S),),
-        )
-        for k in range(1, 32)
-    )
-
-
-def _opcode_decode_all_step_pc_rules(S):
-    """CompilerIR rules for all-step PC-marker opcode decode.
-
-    Phase 8.D: the per-opcode write target resolves through
-    :func:`dim_ref` for the ``(opcode_flag, <NAME>)`` semantic pair.
-    Structural ``OPCODE_BYTE_LO/HI+<lo|hi>`` operand reads stay as
-    ``+N`` and the ``MARK_PC`` up-branch guard condition stays bare
-    (the L8 pilot kept marker-on-up-branch terms structural).
-    """
-
-    from ...embedding import Opcode
-
-    all_step_opcodes = [
-        (Opcode.BZ, 4, 0),
-        (Opcode.BNZ, 5, 0),
-        (Opcode.LEV, 8, 0),
-        (Opcode.EXIT, 6, 2),
-        (Opcode.JMP, 2, 0),
-    ]
-    op_names = _opcode_name_map()
-    return tuple(
-        multi_way_and_rule(
-            name=f"l5_all_step_decode_{op_names[op_val].lower()}_at_pc",
-            conditions=(
-                (f"OPCODE_BYTE_LO+{lo}", 1.0),
-                (f"OPCODE_BYTE_HI+{hi}", 1.0),
-                ("MARK_PC", 1.0),
-            ),
-            threshold=2.5,
-            # ``op_names[op_val]`` is the ``"OP_<NAME>"`` slot string;
-            # ``dim_ref("opcode_flag", NAME)`` names the role.
-            writes=((dim_ref("opcode_flag", op_names[op_val][3:]), 10.0 / S),),
-        )
-        for op_val, lo, hi in all_step_opcodes
-    )
-
-
-def _opcode_decode_all_step_jsr_rules(S):
-    """All-step JSR IS_JSR (TEMP+0) decode at the PC marker. Root B fix.
-
-    The legacy first-step JSR decode (:func:`_opcode_decode_first_step_rules`)
-    writes ``TEMP+0`` only when ``HAS_SE == 0`` (the program's first step), so
-    a NESTED JSR (inside a call frame, after an ENT) gets no clean IS_JSR and
-    the model_ops JSR PC-override never fires. This rule mirrors the all-step
-    BZ/BNZ/LEV/EXIT/JMP decode (:func:`_opcode_decode_all_step_pc_rules`) for
-    JSR (opcode ``0x03`` = ``OPCODE_BYTE_LO+3`` AND ``OPCODE_BYTE_HI+0``),
-    with NO ``HAS_SE`` gate, so it writes ``TEMP+0`` on every JSR step. The
-    two-nibble AND at threshold 2.5 (each nibble +1, MARK_PC +1) is
-    JSR-exclusive: a single matching nibble scores 2.0 < 2.5. Flag-gated
-    (:func:`_nested_jsr_pc_fix_enabled`); empty tuple when off so the L5 FFN
-    footprint stays at the legacy 89 units (byte-identical).
-    """
-    if not _nested_jsr_pc_fix_enabled():
-        return ()
-    return (
-        multi_way_and_rule(
-            name="all_step_decode_jsr_temp0_at_pc",
-            conditions=(
-                ("OPCODE_BYTE_LO+3", 1.0),
-                ("OPCODE_BYTE_HI+0", 1.0),
-                ("MARK_PC", 1.0),
-            ),
-            threshold=2.5,
-            writes=(("TEMP+0", 10.0 / S),),
-        ),
-    )
-
-
-def _opcode_decode_jsr_temp0_blank_rule() -> FFNRule:
-    """Blank-unit placeholder for the reserved unit-52 JSR TEMP[0] slot.
-
-    The legacy ``_set_opcode_decode_ffn`` increments its hidden-unit cursor
-    past unit 52 without writing any weights there ("preserve legacy unit
-    numbering for the TEMP-clear band that follows"). To carry the same
-    layout through a single declarative ``CompilerIR`` lower, we emit one
-    no-op ``FFNRule`` whose lowering matches a zero-initialised PureFFN row
-    byte-for-byte:
-
-      * ``conditions=()`` → ``W_up[52, :] = 0``
-      * ``threshold=0.0`` → ``b_up[52] = -S * 0 = 0``
-      * ``gate=None`` and ``gate_bias=0.0`` → ``b_gate[52] = 0`` (note:
-        ``FFNRule.constant_write`` defaults ``gate_bias=1.0``, so we
-        construct the rule directly to override the default to 0.0)
-      * ``writes=()`` → ``W_down[:, 52] = 0``
-
-    ``right_size_ffns`` correctly prunes this unit because every weight
-    column / row remains all-zero. Symbolic execution and lowered forward
-    both produce no state change for this rule (score=0 >= threshold=0
-    fires but ``gate_value = 0`` plus empty ``writes`` is a no-op).
-    """
-
-    return FFNRule(
-        conditions=(),
-        threshold=0.0,
-        writes=(),
-        gate=None,
-        gate_bias=0.0,
-        name="opcode_decode_jsr_temp0_blank",
-    )
-
-
 def _derived_decode_spec(S: float) -> DecodeSpec:
     """Build the :class:`DecodeSpec` the generic engine lowers (task #391).
 
@@ -1088,8 +816,8 @@ def _derived_decode_spec(S: float) -> DecodeSpec:
     )
 
     def _first_step_name(name: str, out: str) -> str:
-        # Legacy quirk (mirrors ``_opcode_decode_first_step_rules``): the rule
-        # name derives from the WRITE dim — JSR's TEMP+0 override gives
+        # Legacy quirk (the first-step decode context): the rule name
+        # derives from the WRITE dim — JSR's TEMP+0 override gives
         # ``l5_first_step_decode_temp_0``; every marker gives
         # ``l5_first_step_decode_op_<name>``.
         if out.startswith("TEMP"):
@@ -1160,53 +888,38 @@ def _derived_decode_spec(S: float) -> DecodeSpec:
     )
 
 
-def _derived_opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
-    """Generic-engine DERIVED decode rules (task #391, C4_DERIVE_DECODE).
-
-    Routes the ISA opcode table through :func:`decode_band` — ZERO
-    hand-authored per-opcode rules. Byte-for-byte identical to
-    :func:`_opcode_decode_ffn_rules` (the hand path); proven by
-    ``tools/_isa_golden_hash.py`` unchanged under ``C4_DERIVE_DECODE=1``.
-    """
-    return decode_band(_derived_decode_spec(S)).rules_builder()
-
-
 def _opcode_decode_ffn_rules(S: float) -> tuple[FFNRule, ...]:
     """Full ordered ``FFNRule`` sequence for ``opcode_decode_ffn``.
 
-    Matches the 89-unit layout declared in ``_FETCH_FFN_UNIT_LAYOUT``:
+    DERIVED — zero hand-authored per-opcode rules. The ISA opcode table +
+    the per-context band descriptors (:func:`_derived_decode_spec`) are
+    lowered by the generic :func:`decode_band` engine
+    (``isa_semantics_dsl.py``) into the exact 89-unit layout declared in
+    ``_FETCH_FFN_UNIT_LAYOUT``:
 
       * units 0..33  — main per-opcode AX decode (34 rules)
       * units 34..51 — first-step PC-marker decode (18 rules)
       * unit 52      — reserved blank for JSR TEMP[0] (1 no-op rule)
       * units 53..83 — TEMP[1..31] clear at PC marker (31 rules)
       * units 84..88 — all-step PC-marker decode (5 rules)
+      * unit 89      — all-step JSR TEMP[0] (flag C4_NESTED_JSR_PC_FIX, ON)
 
-    Concatenating them into a single ``FFNRule`` tuple lets the bake lower
-    via one ``Primitives.lower_ffn_rules`` call (cursor walks 0..89) and
-    lets the op expose its full ``compiler_ir`` for symbolic execution /
-    ``compare_symbolic_to_lowered_ffn`` validation / declarative
-    verifier tooling.
+    Concatenated into a single ``FFNRule`` tuple, the bake lowers via one
+    ``Primitives.lower_ffn_rules`` call (cursor walks 0..89) and the op
+    exposes its full ``compiler_ir`` for symbolic execution /
+    ``compare_symbolic_to_lowered_ffn`` validation / declarative verifier
+    tooling.
 
-    Task #391: when ``C4_DERIVE_DECODE=1`` the entire sequence is DERIVED by
-    the generic :func:`decode_band` engine from the ISA opcode table (zero
-    hand-authored per-opcode rules); byte-identical to the hand path below.
+    Task #391 (SOLE PATH): the derivation is the only decode path. It was
+    proven byte-for-byte identical to the retired hand-authored builders
+    (``tools/_isa_golden_hash.py`` == golden ``81557d21`` before and after
+    the flip); the ``C4_DERIVE_DECODE`` flag and the hand-authored
+    ``_opcode_decode_main/first_step/temp_clear/all_step_*`` builders are
+    now deleted. This is the DECODE-family instance of the derive→sole-path
+    →delete rollout template for the 100%-derivable ops core.
     """
 
-    if _derive_decode_enabled():
-        return _derived_opcode_decode_ffn_rules(S)
-
-    return (
-        _opcode_decode_main_rules(S)
-        + _opcode_decode_first_step_rules(S)
-        + (_opcode_decode_jsr_temp0_blank_rule(),)
-        + _opcode_decode_temp_clear_rules(S)
-        + _opcode_decode_all_step_pc_rules(S)
-        # Root B (flag C4_NESTED_JSR_PC_FIX, default ON): one extra all-step
-        # JSR IS_JSR (TEMP+0) decode at unit 89. Empty tuple when the flag is
-        # off => 89-unit footprint, byte-identical to the prior build.
-        + _opcode_decode_all_step_jsr_rules(S)
-    )
+    return decode_band(_derived_decode_spec(S)).rules_builder()
 
 
 def _opcode_decode_ffn_ir(S: float = 100.0) -> CompilerIR:
@@ -1240,11 +953,12 @@ def _bake_opcode_decode_ffn(ffn, S, BD) -> int:
     ``make_opcode_decode_ffn_op``.
 
     Lowers the single ``_opcode_decode_ffn_rules`` tuple through
-    ``Primitives.lower_ffn_rules`` -- the rule list embeds the unit-52
-    blank placeholder (see :func:`_opcode_decode_jsr_temp0_blank_rule`)
-    so the cursor walks 0..89 with no per-sub-stage cursor surgery. This
-    matches the IR returned by :func:`_opcode_decode_ffn_ir`, which the
-    op exposes via ``compiler_ir=`` for symbolic / verifier tooling.
+    ``Primitives.lower_ffn_rules`` -- the derived rule list embeds the
+    unit-52 blank placeholder (the ``BlankUnit`` band in
+    :func:`_derived_decode_spec`) so the cursor walks 0..89 with no
+    per-sub-stage cursor surgery. This matches the IR returned by
+    :func:`_opcode_decode_ffn_ir`, which the op exposes via
+    ``compiler_ir=`` for symbolic / verifier tooling.
     """
 
     return _lower_opcode_rules(

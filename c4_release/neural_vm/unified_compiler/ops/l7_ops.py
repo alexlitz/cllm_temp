@@ -405,8 +405,8 @@ def _layer7_operand_gather_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec,
                 # under the frame value and L8 emits the ENT frame constant 8;
                 # this is the `ENT 0; IMM 42` -> 8 bug and the func / 150-fail
                 # cluster). The per-step opcode decode at the L5 main-AX path
-                # (``_opcode_decode_main_rules``) produces a CLEAN per-step
-                # ``OP_IMM`` one-hot at the AX marker that survives intact to
+                # (the ``main_at_ax`` derived decode context) produces a CLEAN
+                # per-step ``OP_IMM`` one-hot at the AX marker that survives to
                 # this block's input (probed spec_k=0: OP_IMM = +5.0 ONLY on
                 # real IMM steps, ~0 on ENT/ADJ/LEA/PSH/OR steps -- the
                 # discriminator the prior "OP_ENT is a constant" analyses
@@ -1119,8 +1119,8 @@ def _layer7_memory_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     #
     # Source opcodes routed by head 5 (12 total): OP_LI, OP_LC, OP_LEA,
     # OP_AND, OP_OR, OP_XOR, OP_JSR, OP_SHR, OP_SI, OP_SC, OP_ADD, OP_SUB.
-    # None of these can coexist with OP_IMM at the same AX position (L5
-    # ``_opcode_decode_main_rules`` is strictly one-hot by construction), so
+    # None of these can coexist with OP_IMM at the same AX position (the L5
+    # ``main_at_ax`` derived decode is strictly one-hot by construction), so
     # a negative term on ``OP_IMM`` only suppresses IMM-dispatch AX positions
     # and is byte-identical at every real source position for the 12 relays.
     specs.append(
