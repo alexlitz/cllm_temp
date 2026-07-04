@@ -430,6 +430,119 @@ def nibble_alu_lane_rules(
 
 
 # ---------------------------------------------------------------------------
+# Nibble comparator lane (L9 CMP condition-flag combine).
+# ---------------------------------------------------------------------------
+#
+# The L9 CMP combine is a NIBBLE COMPARATOR: for a pair of one-hot operand
+# nibbles ``a`` (operand-A band) and ``b`` (operand-B band), one hidden unit
+# per surviving ``(a, b)`` combination fires a marker-gated N-way AND and
+# writes a fixed condition-flag dim. Two comparator modes span all four L9
+# CMP lanes (hi_eq / lo_eq / hi_lt / lo_lt):
+#
+#   * ``mode="equal"``    -> one rule per ``a == b`` pair (the 16 diagonal
+#     ``a == k AND b == k`` combinations), writing the equality-flag dim.
+#   * ``mode="less_than"`` -> one rule per ``a < b`` pair (the 120 upper-
+#     triangular combinations), writing the less-than-flag dim.
+#
+# This is the comparator sibling of :func:`nibble_alu_lane_rules` (which
+# covers the ADD/SUB arithmetic lanes). Both share the same lowering path
+# (``multi_way_and_rule`` -> ``Primitives.lower_ffn_rules``); the DATA that
+# distinguishes each caller is entirely in the kwargs — zero per-value
+# hand-tuning. Byte-identity vs the prior hand-authored CMP loops is proven
+# by ``tools/verify_l9_cmp_derived.py`` and the whole-model golden hash.
+#
+# NOTE on the MARK_AX-vs-MARK_SE_ONLY wall: the memory note
+# ``project_wave_b_cmp_needs_l9_internal_relay.md`` records that the L9 CMP
+# operands live at MARK_AX, but the CMP combine has to gate at
+# MARK_SE_ONLY. That wall was already resolved by the
+# ``layer9_step_end_operand_relay`` attention head (Wave A v2), which mirrors
+# the raw operand bands into the ``SE_``-tagged mirror dims at the STEP_END
+# row. This comparator generator therefore reads whatever operand bands the
+# caller supplies (the SE_-tagged mirrors in production) and gates at the
+# caller's marker; it does NOT re-introduce the wall.
+
+
+def nibble_compare_lane_rules(
+    *,
+    mode: Literal["equal", "less_than"],
+    operand_a_band: str,
+    operand_b_band: str,
+    marker_gate: str,
+    marker_weight: float,
+    mark_pc_weight: float,
+    gate: str,
+    threshold: float,
+    flag_dim: str,
+    flag_scale: float,
+    name_fn: Callable[[int, int], str],
+) -> Tuple[FFNRule, ...]:
+    """Emit the L9 CMP nibble-comparator lane rules from a compact spec.
+
+    ONE generator for the four hand-authored L9 CMP builders (hi_eq, lo_eq,
+    hi_lt, lo_lt). Each is a ``for a: for b:`` walk over the 16x16 nibble
+    cross-product that keeps only the combinations satisfying the comparator
+    predicate and emits one ``multi_way_and_rule`` per survivor. The DATA
+    that distinguishes the four callers is entirely in the kwargs.
+
+    Each emitted rule is a 4-way AND at the marker row:
+    ``(marker_gate, marker_weight)`` + ``(MARK_PC, mark_pc_weight)`` NOT-blocker
+    + ``(operand_a_band+a, 1.0)`` + ``(operand_b_band+b, 1.0)``, gated on
+    ``gate`` (the CMP-group opcode flag) at the explicit ``threshold``, writing
+    ``(flag_dim, flag_scale)``.
+
+    Two comparator modes:
+
+      * ``mode="equal"``: emit one rule per ``a == b`` pair. The a/b bands are
+        read at the SAME index ``k`` (the diagonal ``a == k AND b == k``
+        detector), so the walk collapses to ``for k in range(16)`` — 16 rules.
+      * ``mode="less_than"``: emit one rule per ``a < b`` pair (``b`` ranges
+        over ``a+1..15``) — 120 rules.
+
+    Args:
+        mode: ``"equal"`` (16 diagonal rules) or ``"less_than"`` (120 upper-
+            triangular rules).
+        operand_a_band / operand_b_band: per-nibble one-hot bands for A / B.
+        marker_gate / marker_weight: the STEP_END-style marker condition.
+        mark_pc_weight: the ``MARK_PC`` NOT-blocker weight (negative).
+        gate: the CMP-group opcode-flag gate.
+        threshold: explicit AND threshold (the ``MARK_PC`` negative blocker
+            rules out the default positive-weight derivation).
+        flag_dim / flag_scale: the condition-flag dim written per firing.
+        name_fn: ``(a, b) -> name``. For ``mode="equal"`` it is called with
+            ``(k, k)``; the byte-identity rule names encode the sub-stage +
+            index.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` in the SAME order as the hand-authored loops.
+    """
+    if mode not in ("equal", "less_than"):
+        raise ValueError(
+            f"nibble_compare_lane_rules: mode must be equal/less_than; got {mode!r}"
+        )
+
+    if mode == "equal":
+        pairs = ((k, k) for k in range(16))
+    else:
+        pairs = ((a, b) for a in range(16) for b in range(a + 1, 16))
+
+    rules: list[FFNRule] = []
+    for a, b in pairs:
+        rules.append(multi_way_and_rule(
+            name=name_fn(a, b),
+            conditions=(
+                (marker_gate, marker_weight),
+                ("MARK_PC", mark_pc_weight),
+                (f"{operand_a_band}+{a}", 1.0),
+                (f"{operand_b_band}+{b}", 1.0),
+            ),
+            threshold=threshold,
+            gate=gate,
+            writes=((flag_dim, flag_scale),),
+        ))
+    return tuple(rules)
+
+
+# ---------------------------------------------------------------------------
 # Wave W3: Wide ADD/SUB — stubs.
 # ---------------------------------------------------------------------------
 
@@ -2306,6 +2419,7 @@ def multi_pass_mul_rules(
 __all__ = [
     "bitwise_rules",
     "nibble_alu_lane_rules",
+    "nibble_compare_lane_rules",
     "wide_add_rules",
     "wide_sub_rules",
     "wide_ge_add_rules",
