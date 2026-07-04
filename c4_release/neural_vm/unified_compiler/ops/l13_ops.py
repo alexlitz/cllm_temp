@@ -5,6 +5,14 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
+from ..isa_semantics_dsl import (
+    CamConfirmSlot,
+    CamKeyMatch,
+    CamLookupSpec,
+    CamValidSlot,
+    CamValueBand,
+    cam_lookup,
+)
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (
@@ -328,99 +336,128 @@ def _l13_addr_bn_valid_positions(BD):
     return addr_b1_valid_pos, addr_b2_valid_pos
 
 
+# === L13 mem_addr_gather -- DERIVED from cam_lookup (the addressed-load CAM) ==
+#
+# DERIVE -> PROVE -> FLIP -> DELETE (2026-07-04, golden 91f55411): the three
+# hand-authored L13 addr-byte gather heads are the FIRST MEMORY-family heads
+# re-expressed byte-identically through the ``cam_lookup`` primitive. Each is a
+# canonical content-addressable relay: fire at the MEM val-byte positions,
+# content-match the MEM addr-byte-J row via its ``+L1H(j)/-L1H(j-1)`` marker
+# signature, relay that row's CLEAN_EMBED nibbles into ADDR_BJ_LO/HI, and stamp
+# the ADDR_BJ_VALID "row found" lifecycle bit. The multi-dim query signature
+# (MEM_VAL_B0..B3), the two-dim +/- key comparator, the slot-33 CONST anti-leak
+# confirm, and the slot-34 VALID lifecycle are exactly the ``CamKeyMatch``
+# (query_extra/key_extra) + ``CamConfirmSlot`` + ``CamValidSlot`` API. The
+# hand-authored per-head Q/K/V/O directive construction is DELETED; the compact
+# spec list below is the sole path. Proof:
+# ``test_isa_semantics_dsl.py::test_l13_mem_addr_gather_derived_is_byte_identical_to_handbuilt``
+# (3/3 heads == the legacy writes) + the whole-model golden hash unchanged.
+#
+# Per-head K signature (the addr-byte-J MARKER-RELATIVE comparator, MEM_I=4):
+#   head 0 (ADDR_B0): K[+L1H1+4, -L1H0+4] -- addr byte 0 at marker distance 1.
+#   head 1 (ADDR_B1): K[+L1H2+4, -L1H1+4] -- addr byte 1 at marker distance 2.
+#   head 2 (ADDR_B2): K[+H0+4,   -L1H2+4] -- addr byte 2 at marker distance 3.
+_L13_MEM_I = 4
+
+# (op-name, addr_lo_band, addr_hi_band, valid_band, K_pos_signature, K_neg_reject)
+_L13_MEM_ADDR_GATHER_LAYOUT = (
+    ("layer13_mem_addr_gather.head_0", "ADDR_B0_LO", "ADDR_B0_HI",
+     "ADDR_B0_VALID", f"L1H1+{_L13_MEM_I}", f"L1H0+{_L13_MEM_I}"),
+    ("layer13_mem_addr_gather.head_1", "ADDR_B1_LO", "ADDR_B1_HI",
+     "ADDR_B1_VALID", f"L1H2+{_L13_MEM_I}", f"L1H1+{_L13_MEM_I}"),
+    ("layer13_mem_addr_gather.head_2", "ADDR_B2_LO", "ADDR_B2_HI",
+     "ADDR_B2_VALID", f"H0+{_L13_MEM_I}", f"L1H2+{_L13_MEM_I}"),
+)
+
+
+def _l13_mem_addr_gather_cam_specs() -> tuple:
+    """The three ``CamLookupSpec`` for the L13 addr-byte gather heads.
+
+    Names only -- resolved to positions at bake/IR time by :func:`cam_lookup`.
+    ``direction="load"`` records the addressed-read semantics (G1(b)); the
+    ``CamValidSlot`` carries the ADDR_BJ_VALID "row found" lifecycle bit (G1
+    VALID lifecycle).
+    """
+    L = 15.0
+    specs = []
+    for (name, addr_lo, addr_hi, valid_dim, k_pos, k_neg) in \
+            _L13_MEM_ADDR_GATHER_LAYOUT:
+        specs.append(CamLookupSpec(
+            name=name,
+            key_match=CamKeyMatch(
+                # Fire at the MEM val-byte positions; content-match the MEM
+                # addr-byte-J row via its +L1H(j)/-L1H(j-1) marker signature.
+                query_dim="MEM_VAL_B0", key_dim=k_pos, weight=L, query_slot=0,
+                query_extra=(("MEM_VAL_B1", L), ("MEM_VAL_B2", L),
+                             ("MEM_VAL_B3", L)),
+                key_extra=((k_neg, -L),),
+            ),
+            # Slot-33 CONST anti-leak confirm (Q MEM_VAL_B0@+L + CONST@-L/2,
+            # K CONST@+L) -- pins the row select when the signature is weak.
+            confirm=CamConfirmSlot(
+                slot=33, marker_weight=L, const_q_weight=-L / 2,
+                const_k_weight=L, marker_dim="MEM_VAL_B0",
+            ),
+            # Relay the matched addr-byte row's CLEAN_EMBED nibbles.
+            value_bands=(
+                CamValueBand("CLEAN_EMBED_LO", addr_lo, 16, 1, 1.0),
+                CamValueBand("CLEAN_EMBED_HI", addr_hi, 16, 17, 1.0),
+            ),
+            # Slot-34 VALID lifecycle: re-declare the key-match signature; V
+            # reads the +K signature dim (delivers 1.0 on the matched row) and
+            # O stamps ADDR_BJ_VALID.
+            valid_slots=(
+                CamValidSlot(slot=34, valid_read_dim=k_pos,
+                             valid_write_dim=valid_dim, o_scale=1.0),
+            ),
+            const_dim="CONST",
+            direction="load",
+        )
+        )
+    return tuple(specs)
+
+
+def _l13_mem_addr_gather_dim_map(BD) -> dict:
+    """Resolve every dim NAME the L13 CAM specs touch to an int via ``BD``.
+
+    ``cam_lookup``'s builder wants a name->int dict (with ``+offset`` tokens
+    resolved through :func:`isa_semantics_dsl._resolve_dim_token`). ``BD`` is a
+    ``_SetDim``-like proxy whose ``.NAME`` attributes are the allocated
+    positions and which resolves ``BD.L1H1 + 4`` arithmetically. Build the dict
+    of BASE names the specs reference; the ADDR_B{1,2}_VALID destinations may
+    ALIAS H5 cells (positions 99/100) when the compiler has not learned the new
+    names, so resolve them via :func:`_l13_addr_bn_valid_positions`.
+    """
+    addr_b1_valid_pos, addr_b2_valid_pos = _l13_addr_bn_valid_positions(BD)
+    base_names = {
+        "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
+        "L1H0", "L1H1", "L1H2", "H0", "CONST",
+        "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B0_VALID",
+        "ADDR_B1_LO", "ADDR_B1_HI",
+        "ADDR_B2_LO", "ADDR_B2_HI",
+    }
+    dim_map = {n: int(getattr(BD, n)) for n in base_names}
+    dim_map["ADDR_B1_VALID"] = int(addr_b1_valid_pos)
+    dim_map["ADDR_B2_VALID"] = int(addr_b2_valid_pos)
+    return dim_map
+
+
 def _layer13_mem_addr_gather_head_specs(BD) -> tuple:
     """Declarative L13 heads 0-2: MEM addr-byte gather + B7-4/B8-A VALID bits.
 
-    Mirrors ``setup_helpers._set_layer13_mem_addr_gather`` (heads 0-2 slot 0
-    + slot 33 anti-leak, slot 1..32 V/O CLEAN_EMBED -> ADDR_BJ_LO/HI, plus
-    head 0 slot 34 ADDR_B0_VALID lifecycle) AND
-    ``_l13_addr_bn_valid_extension`` (heads 1/2 slot 34 ADDR_B{1,2}_VALID
-    extension). Per-head K rows pick the MEM addr-byte ``j`` row:
-
-      - head 0 (ADDR_B0): K[+L1H1+MEM_I, -L1H0+MEM_I] -- addr byte 0 at d=1.
-      - head 1 (ADDR_B1): K[+L1H2+MEM_I, -L1H1+MEM_I] -- addr byte 1 at d=2.
-      - head 2 (ADDR_B2): K[+H0+MEM_I,   -L1H2+MEM_I] -- addr byte 2 at d=3.
-
-    The VALID lifecycle V reads the K+ threshold dim so the attended
-    addr-byte-J row delivers V=1.0 (and unrelated rows V=0) -- same logic
-    as the head-0 slot-34 ADDR_B0_VALID producer (B7-4) extended to
-    ADDR_B1_VALID / ADDR_B2_VALID (B8-A).
+    DERIVED from :func:`cam_lookup` -- see the ``_l13_mem_addr_gather_cam_specs``
+    module comment for the full byte-identity provenance. The hand-authored
+    Q/K/V/O construction that mirrored ``setup_helpers._set_layer13_mem_addr_gather``
+    + ``_l13_addr_bn_valid_extension`` is DELETED; the three ``CamLookupSpec``
+    are lowered through the shared CAM generator here.
     """
-    L = 15.0
-    MEM_I = 4
-    VALID_SLOT = 34
-    addr_b1_valid_pos, addr_b2_valid_pos = _l13_addr_bn_valid_positions(BD)
-
-    # Per-head wiring tables: layout for the J-th MEM addr byte gather head.
-    # (head_idx, addr_lo_out, addr_hi_out, K_pos_dim, K_neg_dim,
-    #  valid_v_read_dim, valid_o_dest)
-    head_layout = (
-        (
-            _l13_head_idx("layer13_mem_addr_gather.head_0"),
-            BD.ADDR_B0_LO, BD.ADDR_B0_HI,
-            BD.L1H1 + MEM_I, BD.L1H0 + MEM_I,
-            BD.L1H1 + MEM_I, BD.ADDR_B0_VALID,
-        ),
-        (
-            _l13_head_idx("layer13_mem_addr_gather.head_1"),
-            BD.ADDR_B1_LO, BD.ADDR_B1_HI,
-            BD.L1H2 + MEM_I, BD.L1H1 + MEM_I,
-            BD.L1H2 + MEM_I, addr_b1_valid_pos,
-        ),
-        (
-            _l13_head_idx("layer13_mem_addr_gather.head_2"),
-            BD.ADDR_B2_LO, BD.ADDR_B2_HI,
-            BD.H0 + MEM_I, BD.L1H2 + MEM_I,
-            BD.H0 + MEM_I, addr_b2_valid_pos,
-        ),
-    )
-
+    dim_map = _l13_mem_addr_gather_dim_map(BD)
     specs = []
-    for (head_idx, addr_lo_out, addr_hi_out,
-         k_pos, k_neg, valid_v_read, valid_o_dest) in head_layout:
-        # Q slot 0: fires at MEM val byte positions (d=5..8 from MEM)
-        q = [
-            AP(0, BD.MEM_VAL_B0, L),
-            AP(0, BD.MEM_VAL_B1, L),
-            AP(0, BD.MEM_VAL_B2, L),
-            AP(0, BD.MEM_VAL_B3, L),
-            # Slot 33 anti-leakage gate
-            AP(33, BD.MEM_VAL_B0, L),
-            AP(33, BD.CONST, -L / 2),
-            # Slot 34 VALID lifecycle Q mirrors slot 0 (fires at MEM val bytes)
-            AP(VALID_SLOT, BD.MEM_VAL_B0, L),
-            AP(VALID_SLOT, BD.MEM_VAL_B1, L),
-            AP(VALID_SLOT, BD.MEM_VAL_B2, L),
-            AP(VALID_SLOT, BD.MEM_VAL_B3, L),
-        ]
-        # K slot 0: fires at MEM addr byte J position; slot 33 const anti-leak;
-        # slot 34 mirrors slot 0 (picks the MEM addr byte J row).
-        k = [
-            AP(0, k_pos, L),
-            AP(0, k_neg, -L),
-            AP(33, BD.CONST, L),
-            AP(VALID_SLOT, k_pos, L),
-            AP(VALID_SLOT, k_neg, -L),
-        ]
-        # V slots 1..32 copy CLEAN_EMBED nibbles (addr byte value).
-        # V slot 34 reads valid_v_read so the attended addr-byte-J row
-        # delivers V=1.0 and unrelated rows deliver 0.
-        v = [AP(1 + kk, BD.CLEAN_EMBED_LO + kk, 1.0) for kk in range(16)]
-        v += [AP(17 + kk, BD.CLEAN_EMBED_HI + kk, 1.0) for kk in range(16)]
-        v.append(AP(VALID_SLOT, valid_v_read, 1.0))
-        # O slots 1..32 route gathered nibbles to ADDR_BJ_LO/HI; slot 34
-        # routes the VALID lifecycle bit into ADDR_BJ_VALID.
-        o = [AO(addr_lo_out + kk, 1 + kk, 1.0) for kk in range(16)]
-        o += [AO(addr_hi_out + kk, 17 + kk, 1.0) for kk in range(16)]
-        o.append(AO(valid_o_dest, VALID_SLOT, 1.0))
-
-        specs.append(DeclarativeAttentionHeadSpec(
-            head_idx=head_idx,
-            q=tuple(q),
-            k=tuple(k),
-            v=tuple(v),
-            o=tuple(o),
-        ))
+    for spec in _l13_mem_addr_gather_cam_specs():
+        head_idx = _l13_head_idx(spec.name)
+        bundle = cam_lookup(spec)
+        specs.append(bundle.head_spec_builder(dim_map, head_idx))
     return tuple(specs)
 
 
