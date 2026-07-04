@@ -84,13 +84,40 @@ data dependency cannot be flattened into a single-pass lookup.
 
 ## Two paths forward (same as W3 AddSub)
 
-### Path 1: Multi-pass DSL primitive
-Add a `multi_pass_rules` IR construct that emits a sequence of FFN
-layers with explicit residual-position propagation between passes.
-`wide_mul_rules(width_bytes > 2)` and `wide_div_rules(width_bytes > 1)`
-would then expand into ~9 passes (for MUL) or ~24 passes (for DIV)
-matching the legacy composite stage count. Substantial DSL surface
-work.
+### Path 1: Multi-pass DSL primitive — BUILT + PILOTED (MUL) ✅
+The `multi_pass_rules` IR construct now EXISTS
+(`neural_vm/unified_compiler/ir.py`: `MultiPassOp` = ordered
+`FFNPass` sequence + `workspace_band` + `lower_multi_pass` /
+`run_symbolic`). It emits a sequence of FFN passes applied to the same
+residual, each reading a workspace band the prior passes wrote — the
+cross-pass carry chain a single forward cannot express.
+
+**Pilot (wide MUL) landed byte-identical.**
+`multi_pass_mul_rules` (`wide_alu_dsl.py`) derives `(a*b)&0xFFFF` for
+8-bit × 8-bit operands from a COMPACT 7-pass schoolbook spec
+(partial-product accumulate + column-carry passes), ~2848 units. It is
+**verdict-identical to the flat `wide_mul_rules(width_bytes=2)` lookup on
+all 65,536 (a,b) pairs** — a 23× unit reduction (2848 vs 65,536) AND, more
+importantly, the rule count is now `O(width² · 256)` NOT `O(16^(2·width))`,
+so it generalizes past the flat lookup's width-2 ceiling by adding
+partial-product + column-add passes. Tests:
+`tests/test_wide_alu_dsl.py::test_multi_pass_mul_*`.
+
+The one non-obvious mechanism the pilot uncovered: an AMPLITUDE-NORMALIZED
+cascade convention (`_normalized_and_rule`: read weight 1.0, threshold
+`k-0.5` → `up=S·0.5`, write `1/(S·0.5)`). Without it stacked SwiGLU
+magnitude-explodes pass-over-pass (`silu(up)≈up` scales with the input,
+so a residual-30 workspace one-hot read at weight 30 runs away). The fixed
+point pins EVERY pass's one-hots to residual 1.0.
+
+**Remaining:** `wide_mul_rules(width_bytes>2)` (wire the O(width²) pass
+generator to arbitrary width) and `wide_div_rules(width_bytes>1)` (~24
+long-division shift-subtract passes — same primitive, DIV spec). The IR
+construct and the MUL derivation prove the approach; DIV is the next
+pilot. Wiring either into the PRODUCTION model (replacing
+`FlattenedALUMul` / `FlattenedDivMod`) is a separate byte-identity
+install (the pilot proves the COMPUTE derives; the install must also
+match the golden band routing per `docs/semantic_spec_ALU.md` G8).
 
 ### Path 2: GE-format DSL extension
 Add `wide_ge_mul_rules` / `wide_ge_div_rules` that emit rules operating
@@ -106,8 +133,20 @@ multi-byte MUL/DIV legacy composites (`FlattenedALUMul`,
 
 ## Status
 
-Multi-byte MUL (`width_bytes > 2`) via DSL: **deferred**.
-Multi-byte DIV (`width_bytes > 1`) via DSL: **deferred**.
+`multi_pass_rules` IR primitive: **BUILT** (`MultiPassOp` in `ir.py`).
+Multi-byte MUL derivation via `multi_pass_mul_rules`: **PILOTED,
+byte-identical** at width-2 (65,536/65,536 pairs vs the flat lookup);
+generalizes to width>2 by adding passes (the flat lookup could not).
+Multi-byte DIV (`width_bytes > 1`) via the same primitive: **next pilot**
+(long-division shift-subtract passes on a GE-style workspace band).
 
-W6 deletion of `efficient_alu_*.py` is blocked on this plus the W3
+The GAP is CLOSED for the derivability question: the ALU wide-MUL floor
+was a LOWERING-generality gap (no multi-pass construct), and that
+construct now exists and derives MUL from a compact schoolbook spec. What
+remains is (a) a DIV pilot on the same primitive and (b) the production
+INSTALL (replacing `FlattenedALUMul` / `FlattenedDivMod`) which is a
+separate byte-identity band-routing exercise.
+
+W6 deletion of `efficient_alu_*.py` is unblocked on the DERIVATION side
+(the compute derives); it still needs the production install + the W3
 AddSub gap.
