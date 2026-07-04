@@ -5,7 +5,11 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
-from ..wide_alu_dsl import nibble_alu_lane_rules, nibble_compare_lane_rules
+from ..wide_alu_dsl import (
+    amplified_nibble_adder_rules,
+    nibble_alu_lane_rules,
+    nibble_compare_lane_rules,
+)
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (  # noqa: F401
@@ -289,43 +293,28 @@ def _lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     inter-byte ALU carry cascade). Structural reads
     (``ALU_HI+a`` / ``FETCH_HI+b``) and the result-nibble write stay as
     ``+N`` (value-bus one-hot lookups).
-    """
 
-    gate_lea = dim_ref("opcode_flag", "LEA")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    rules: list[FFNRule] = []
-    # 10-way amplified AND: MARK_AX(+20) + seven non-AX marker blockers(-1000
-    # each) + ALU_HI nibble(+1) + FETCH_HI nibble(+20) + CARRY+0 carry-in
-    # discrimination (+/- 8.0). Explicit threshold 40.5 (no carry) / 48.5
-    # (with carry) — the non-AX blockers' -1000 magnitudes would derail any
-    # automatic threshold derivation, and the negative MARK_PC-like
-    # blockers similarly can't be passed through multi_way_and_rule's
-    # default. Passed as explicit threshold to keep the structural cell
-    # layout identical to the legacy bake.
-    for carry_in in (0, 1):
-        for a in range(16):
-            for b in range(16):
-                result = (a + b + carry_in) % 16
-                conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
-                conditions.extend(
-                    (dim, -1000.0) for dim in _NON_AX_BLOCKERS
-                )
-                conditions.append((f"ALU_HI+{a}", 1.0))
-                conditions.append((f"FETCH_HI+{b}", 20.0))
-                if carry_in == 0:
-                    conditions.append((carry_byte0, -8.0))
-                    threshold = 40.5
-                else:
-                    conditions.append((carry_byte0, 8.0))
-                    threshold = 48.5
-                rules.append(multi_way_and_rule(
-                    name=f"lea_hi_c{carry_in}_a{a}_b{b}",
-                    conditions=tuple(conditions),
-                    threshold=threshold,
-                    gate=gate_lea,
-                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
-                ))
-    return tuple(rules)
+    DERIVED (2026-07): the 10-way amplified AND (MARK_AX(+20) + the seven
+    non-AX marker blockers(-1000) + ALU_HI nibble(+1) + FETCH_HI immediate
+    nibble(+20) + CARRY+0 carry-in discrimination(+/-8), thresholds 40.5 /
+    48.5, writing ``(a+b+carry_in)%16``) is THE shared ``reg + live-operand``
+    adder ADJ/ENT also use. The per-value loop is routed through
+    ``wide_alu_dsl.amplified_nibble_adder_rules``; ADJ's SP-add is derived
+    from this same generator via the ``SpDelta`` (``runtime_add``)
+    ``RegisterDeltaSpec`` kind (``isa_semantics_dsl.control_op``). Byte-identity
+    gated by the whole-model golden hash.
+    """
+    return amplified_nibble_adder_rules(
+        op="add",
+        operand_a_band="ALU_HI", operand_b_band="FETCH_HI",
+        marker_gate="MARK_AX", blocker_dims=_NON_AX_BLOCKERS,
+        blocker_weight=1000.0,
+        gate=dim_ref("opcode_flag", "LEA"),
+        carry_in_dim=dim_ref("carry", "alu", 0), carry_in_weight=8.0,
+        threshold_no_carry=40.5, threshold_with_carry=48.5,
+        result_band="OUTPUT_HI_THIS_STEP", write_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"lea_hi_c{c}_a{a}_b{b}",
+    )
 
 
 def _adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:

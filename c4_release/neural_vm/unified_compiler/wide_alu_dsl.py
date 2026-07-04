@@ -430,6 +430,136 @@ def nibble_alu_lane_rules(
 
 
 # ---------------------------------------------------------------------------
+# Amplified nibble adder lane (L9 LEA / ADJ / ENT hi-nibble, live operand-B).
+# ---------------------------------------------------------------------------
+#
+# The L9 LEA / ADJ / ENT hi-nibble bands are the SAME amplified 16x16 nibble
+# adder: operand-A is a per-nibble one-hot band (``ALU_HI``) and operand-B is a
+# LIVE OPERAND BAND (``FETCH_HI`` — the instruction immediate's high nibble),
+# summed with a carry/borrow-IN read from ``CARRY+0`` into
+# ``OUTPUT_HI_THIS_STEP`` at ``2.0/S``. Unlike :func:`nibble_alu_lane_rules`
+# (the unit-weight ``MARK_PC``-blocked ADD/SUB lane), this shape uses the
+# AMPLIFIED marker AND: ``marker(+20)`` + the seven non-AX blocker dims at
+# ``-1000`` each (so PC/SP/BP/STACK0/MEM/SE/byte rows never fire even when the
+# FETCH gate is high) + ``ALU_HI[a](+1)`` + operand-B ``[b](+20)`` + the
+# ``CARRY+0`` carry-in discrimination (``+/-8``). It is THE shared ALU adder the
+# CONTROL/MEMORY families reuse for a ``reg + live-operand`` update — the same
+# generator LEA (``imm`` into an address), ADJ (``SP += imm``), and ENT
+# (``SP -= imm``) all call, differing only by the DATA tuple (opcode gate,
+# marker, thresholds, add-vs-subtract, an optional extra blocker, rule names).
+#
+# ``op="sub"`` mirrors ADD with ``result = (a - b - carry_in) % 16`` (ENT's
+# ``SP - imm`` borrow adder). Byte-identity vs the prior hand-authored LEA/ADJ/
+# ENT loops is proven by the whole-model golden hash.
+
+
+def amplified_nibble_adder_rules(
+    *,
+    op: Literal["add", "sub"],
+    operand_a_band: str,
+    operand_b_band: str,
+    marker_gate: str,
+    blocker_dims: Sequence[str],
+    blocker_weight: float,
+    gate: str,
+    carry_in_dim: str,
+    carry_in_weight: float,
+    threshold_no_carry: float,
+    threshold_with_carry: float,
+    result_band: str,
+    write_scale: float,
+    name_fn: Callable[[int, int, int], str],
+    marker_weight: float = 20.0,
+    operand_a_weight: float = 1.0,
+    operand_b_weight: float = 20.0,
+    extra_conditions: Tuple[Tuple[str, float], ...] = (),
+) -> Tuple[FFNRule, ...]:
+    """Emit the L9 amplified ``reg + live-operand`` nibble-adder lane rules.
+
+    ONE generator for the L9 LEA / ADJ / ENT hi-nibble bands. Each is a
+    ``for carry_in in (0, 1): for a: for b:`` walk over the 16x16 nibble
+    cross-product that evaluates ``f(a, b, carry_in)`` at BUILD TIME and emits
+    one ``multi_way_and_rule`` per combination. The distinguishing DATA is
+    entirely in the kwargs; there is zero per-value hand-tuning.
+
+    Each emitted rule is the amplified marker AND: ``(marker_gate,
+    marker_weight)`` + one ``(dim, -blocker_weight)`` per ``blocker_dims`` entry
+    (the non-AX marker/byte blockers) + ``extra_conditions`` +
+    ``(operand_a_band+a, operand_a_weight)`` + ``(operand_b_band+b,
+    operand_b_weight)``, plus the carry-in discrimination on ``carry_in_dim``:
+
+      * ``carry_in=0``: append ``(carry_in_dim, -carry_in_weight)`` (repel) at
+        ``threshold_no_carry``.
+      * ``carry_in=1``: append ``(carry_in_dim, +carry_in_weight)`` (require) at
+        ``threshold_with_carry``.
+
+    gated on ``gate`` (the opcode flag), writing ``(result_band+result,
+    write_scale)`` where ``result = (a + b + carry_in) % 16`` for ``op="add"``
+    or ``(a - b - carry_in) % 16`` for ``op="sub"``.
+
+    Args:
+        op: ``"add"`` (``result=(a+b+cin)%16``, LEA/ADJ) or ``"sub"``
+            (``result=(a-b-cin)%16``, ENT's ``SP - imm`` borrow adder).
+        operand_a_band / operand_b_band: per-nibble one-hot bands for A / B.
+            operand-B is the LIVE operand (``FETCH_HI``, the immediate).
+        marker_gate / marker_weight: the amplified marker condition (``+20``).
+        blocker_dims / blocker_weight: the non-AX marker/byte blockers, each
+            appended as ``(dim, -blocker_weight)`` (``-1000``).
+        gate: the opcode-flag gate (``OP_LEA`` / ``OP_ADJ`` / ``OP_ENT``).
+        carry_in_dim / carry_in_weight: the ``CARRY+0`` carry/borrow-in dim +
+            its discrimination weight (``+/-8``).
+        threshold_no_carry / threshold_with_carry: the carry_in=0 / carry_in=1
+            AND thresholds (the explicit values the ``-1000`` blockers require).
+        result_band / write_scale: the result-nibble write.
+        name_fn: ``(carry_in, a, b) -> name`` (the byte-identity rule names).
+        operand_a_weight / operand_b_weight: per-cell operand condition weights
+            (default 1.0 / 20.0).
+        extra_conditions: extra fixed condition terms appended verbatim, in the
+            SAME position the hand-authored loops used (right after the blocker
+            band) — e.g. ENT's ``(HAS_SE, -1000)`` first-step blocker.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` in the SAME order as the hand-authored loops
+        (outer ``carry_in``, then ``a``, then ``b``) — 512 rules.
+    """
+    if op not in ("add", "sub"):
+        raise ValueError(
+            f"amplified_nibble_adder_rules: op must be add/sub; got {op!r}"
+        )
+    rules: list[FFNRule] = []
+    for carry_in in (0, 1):
+        for a in range(16):
+            for b in range(16):
+                if op == "add":
+                    result = (a + b + carry_in) % 16
+                else:
+                    result = (a - b - carry_in) % 16
+                conditions: list[Tuple[str, float]] = [
+                    (marker_gate, marker_weight),
+                ]
+                conditions.extend(
+                    (dim, -blocker_weight) for dim in blocker_dims
+                )
+                conditions.extend(extra_conditions)
+                conditions.append((f"{operand_a_band}+{a}", operand_a_weight))
+                conditions.append((f"{operand_b_band}+{b}", operand_b_weight))
+                if carry_in == 0:
+                    conditions.append((carry_in_dim, -carry_in_weight))
+                    threshold = threshold_no_carry
+                else:
+                    conditions.append((carry_in_dim, carry_in_weight))
+                    threshold = threshold_with_carry
+                rules.append(multi_way_and_rule(
+                    name=name_fn(carry_in, a, b),
+                    conditions=tuple(conditions),
+                    threshold=threshold,
+                    gate=gate,
+                    writes=((f"{result_band}+{result}", write_scale),),
+                ))
+    return tuple(rules)
+
+
+# ---------------------------------------------------------------------------
 # Nibble comparator lane (L9 CMP condition-flag combine).
 # ---------------------------------------------------------------------------
 #
