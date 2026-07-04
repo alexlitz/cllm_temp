@@ -9,6 +9,8 @@ from ..isa_semantics_dsl import (
     CamConfirmSlot,
     CamKeyMatch,
     CamLookupSpec,
+    CamStoreRoute,
+    CamStoreStamp,
     CamValidSlot,
     CamValueBand,
     cam_lookup,
@@ -535,8 +537,18 @@ def _l13_relay_dim_map(BD, spec: CamLookupSpec) -> dict:
     a ``_SetDim``-like proxy whose ``.NAME`` attributes are the allocated
     positions.
     """
+    names: set[str] = {spec.const_dim}
+    if spec.direction == "store":
+        # A ``direction="store"`` spec (the SUB minuend / ADD addend relay,
+        # heads 4/5) draws its dims from the store fire gate + per-byte route
+        # bank + stamp; the ``cam_lookup`` bundle's read/write sets already give
+        # the BASE band names (offset-free), so union them here. The store head's
+        # builder adds the per-nibble ``+k`` / ``TEMP+N`` offsets itself.
+        bundle = cam_lookup(spec)
+        names |= bundle.head_reads | bundle.head_writes
+        return {n: int(getattr(BD, n)) for n in names}
     km = spec.key_match
-    names: set[str] = {km.query_dim, km.key_dim, spec.const_dim}
+    names |= {km.query_dim, km.key_dim}
     for (dim, _w) in km.query_extra:
         names.add(dim.split("+", 1)[0])
     for (dim, _w) in km.key_extra:
@@ -728,173 +740,123 @@ def make_layer13_bitwise_byte1_gather_op() -> Operation:
 # head 3 = bitwise_byte1_gather; this claims the free slot 4. A negative
 # ALiBi slope (mirrors the bitwise gather) skips the empty current-step
 # STACK0 frame and lands on the populated PSH frame.
+def _l13_sub_minuend_store_spec(BD) -> CamLookupSpec:
+    """The ``direction="store"`` :class:`CamLookupSpec` for L13 head 4.
+
+    DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): the SUB minuend
+    relay is a STORE / emit-direction CAM — a byte-emit FIRE row (gated on the
+    SUB byte selector) attends BACK to the addressed source row (the PSH-frame
+    ``STACK0_BYTE{h}`` value row in flag-OFF; the current step's SUB ``MARK_AX``
+    marker in the campaign frame) whose signature matches at ``K_FLAG``, and
+    writes the gathered minuend byte back into ``STACK0_BYTE_VAL_h`` at the emit
+    row. Lowered through :func:`cam_lookup` with ``direction="store"``: a shared
+    fire gate + per-byte :class:`CamStoreRoute` bank + (campaign) a
+    :class:`CamStoreStamp` re-delivering the TEMP+9 selector. See the module
+    comment block above for the root cause and the byte-identity property.
+    """
+    L = 15.0
+    # K source-flag match weight. See the legacy note: the post-scale Q*K score
+    # for a matched source row must DOMINATE the ALiBi distance penalty so only
+    # source rows are candidates; the slope then breaks the tie.
+    K_FLAG = 200.0
+    if operand_from_memsp_enabled():
+        # === STACK0 campaign Part C (Inc-3 claw-back): SUB byte-1 minuend
+        # RESULT delivery. Q fires at the BYTE_INDEX_0 emit row (BYTE_INDEX_0 +
+        # HAS_SE), K selects the current step's AX marker via MARK_AX AND OP_SUB
+        # (a non-SUB AX marker scores NEGATIVE so the head stays dark off-SUB),
+        # so it gathers the minuend byte-1 carrier ONLY on SUB steps. A stamp
+        # re-delivers the TEMP+9 selector onto the emit row (the L10 borrow
+        # cascade gates on it there but the 30-token frame drops it). ===
+        OP_W = 40.0
+        return CamLookupSpec(
+            name="layer13_sub_minuend_relay.head_4",
+            key_match=CamKeyMatch(
+                query_dim="BYTE_INDEX_0", key_dim="CONST", weight=L),
+            value_bands=(
+                CamValueBand("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_LO",
+                             16, 3, 1.0),
+            ),
+            direction="store",
+            store_gate=("BYTE_INDEX_0", L),
+            store_slot0_extra=(("HAS_SE", L),),
+            store_rejects=(
+                ("MARK_AX", -L * 10), ("MARK_PC", -L * 10),
+                ("BYTE_INDEX_1", -L * 10), ("BYTE_INDEX_2", -L * 10),
+                ("BYTE_INDEX_3", -L * 10),
+            ),
+            confirm=CamConfirmSlot(
+                slot=33, marker_weight=L, const_q_weight=-L / 2,
+                const_k_weight=L, marker_dim="BYTE_INDEX_0"),
+            store_routes=(
+                CamStoreRoute(
+                    slot=1, fire_dim="BYTE_INDEX_0", key_dim="MARK_AX",
+                    key_weight=K_FLAG,
+                    key_extra=(("OP_SUB", OP_W), ("OP_ADD", -K_FLAG),
+                               ("CONST", -K_FLAG * 1.3)),
+                    fire_extra=(("HAS_SE", L),),
+                    value_bands=(
+                        CamValueBand("STACK0_BYTE_VAL_1_LO",
+                                     "STACK0_BYTE_VAL_1_LO", 16, 3, 1.0),
+                        CamValueBand("STACK0_BYTE_VAL_1_HI",
+                                     "STACK0_BYTE_VAL_1_HI", 16, 19, 1.0),
+                    ),
+                ),
+            ),
+            store_stamp=CamStoreStamp(
+                v_slot=35, read_dim="OP_SUB", read_scale=0.2,
+                write_dim="TEMP+9", o_scale=1.0),
+        )
+    # Flag-OFF (golden 35-token) path: gate on the SUB byte selector TEMP+9;
+    # each byte route fires at BYTE_INDEX_h + TEMP+9 and K-matches the PSH-frame
+    # STACK0_BYTE{h+1} value row, relaying STACK0_BYTE_VAL_{h+1} back into itself.
+    routes = []
+    for j, (src_flag, vlo, vhi) in enumerate((
+        ("STACK0_BYTE1", "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI"),
+        ("STACK0_BYTE2", "STACK0_BYTE_VAL_2_LO", "STACK0_BYTE_VAL_2_HI"),
+        ("STACK0_BYTE3", "STACK0_BYTE_VAL_3_LO", "STACK0_BYTE_VAL_3_HI"),
+    )):
+        base = 3 + j * 32
+        routes.append(CamStoreRoute(
+            slot=1 + j, fire_dim=f"BYTE_INDEX_{j}", key_dim=src_flag,
+            key_weight=K_FLAG, key_baseline=("CONST", -K_FLAG / 2),
+            fire_extra=(("TEMP+9", L),),
+            value_bands=(
+                CamValueBand(vlo, vlo, 16, base, 1.0),
+                CamValueBand(vhi, vhi, 16, base + 16, 1.0),
+            ),
+        ))
+    return CamLookupSpec(
+        name="layer13_sub_minuend_relay.head_4",
+        key_match=CamKeyMatch(
+            query_dim="TEMP+9", key_dim="CONST", weight=L),
+        value_bands=(
+            CamValueBand("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_LO",
+                         16, 3, 1.0),
+        ),
+        direction="store",
+        store_gate=("TEMP+9", L),
+        store_rejects=(
+            ("MARK_AX", -L * 10), ("MARK_PC", -L * 10),
+            ("TEMP+8", -L * 10), ("BYTE_INDEX_3", -L * 10),
+        ),
+        confirm=CamConfirmSlot(
+            slot=33, marker_weight=L, const_q_weight=-L / 2,
+            const_k_weight=L, marker_dim="TEMP+9"),
+        store_routes=tuple(routes),
+    )
+
+
 def _layer13_sub_minuend_relay_head_specs(BD) -> tuple:
     """L13 head 4: relay SUB minuend bytes 1/2/3 to STACK0_BYTE_VAL_h.
 
-    One spec firing simultaneously on the byte-1/2 SUB emit rows. The
-    per-byte routing uses two Q/K slot pairs (one per byte index):
-    Q selects the emit row via BYTE_INDEX_h, K selects the PSH-frame
-    STACK0 byte-h value row via STACK0_BYTE{1,2}; the matching V/O
-    nibble copy runs in parallel for both bytes. ALiBi recency
-    (negative slope, set in the bake) picks the most-recent populated
-    PSH frame over older frames / the empty current-step frame.
+    DERIVED from :func:`cam_lookup` (``direction="store"``, see
+    :func:`_l13_sub_minuend_store_spec` and the module comment block for the
+    byte-identity provenance). ALiBi recency (slope set in the bake) picks the
+    populated PSH frame (flag-OFF) / the current step's AX marker (campaign).
     """
-    L = 15.0
-    # K source-flag match weight. The post-scale Q*K score for a
-    # STACK0_BYTE{h} row must DOMINATE the ALiBi distance penalty
-    # (-slope * |q_pos - k_pos|, scale ~= 0.096): the populated PSH
-    # frame sits ~90 rows back from the SUB emit row, so with the
-    # default L=15 match (~211 raw -> ~20 scaled) the alibi penalty
-    # (~90) swamps the K score and the softmax drifts to nearby
-    # non-STACK0 rows. A large source-flag weight (15 * 200 * 0.94 ~=
-    # 2820 raw -> ~270 scaled) makes every STACK0_BYTE{h} row beat
-    # every non-STACK0 row by a margin no alibi distance can overcome,
-    # leaving the (gentle) negative slope to pick the OLDEST STACK0
-    # frame (the original PSH) among them.
-    K_FLAG = 200.0
-    # Per-byte route: (emit BYTE_INDEX_k dim, source STACK0_BYTE{k+1}
-    # flag dim, source STACK0_BYTE_VAL_{k+1} value band). The L14 borrow
-    # cascade is an INTER-byte stage: the rule scoped on BYTE_INDEX_k
-    # (the row that, autoregressively, PREDICTS output byte k+1)
-    # computes the byte-(k+1) difference and needs the MINUEND's byte
-    # k+1. So BYTE_INDEX_0 row needs operand byte 1 = STACK0_BYTE_VAL_1,
-    # BYTE_INDEX_1 row needs byte 2 = STACK0_BYTE_VAL_2, BYTE_INDEX_2 row
-    # needs byte 3 = STACK0_BYTE_VAL_3. (Verified spec_k=0: output byte 1
-    # is decoded by the LM head from the BYTE_INDEX_0 predictor row.)
-    _BYTE_ROUTES = (
-        (0, BD.BYTE_INDEX_0, BD.STACK0_BYTE1,
-         BD.STACK0_BYTE_VAL_1_LO, BD.STACK0_BYTE_VAL_1_HI),
-        (1, BD.BYTE_INDEX_1, BD.STACK0_BYTE2,
-         BD.STACK0_BYTE_VAL_2_LO, BD.STACK0_BYTE_VAL_2_HI),
-        (2, BD.BYTE_INDEX_2, BD.STACK0_BYTE3,
-         BD.STACK0_BYTE_VAL_3_LO, BD.STACK0_BYTE_VAL_3_HI),
-    )
-    if operand_from_memsp_enabled():
-        # === STACK0 campaign Part C (Inc-3 claw-back, 2026-06-19): SUB
-        # byte-1 minuend RESULT delivery, mirror of the ADD head-5 re-key. ===
-        #
-        # The dropped STACK0 byte rows + the un-delivered TEMP+9 selector
-        # (GPU-confirmed: TEMP+9 lands only at the MARK_AX marker row in the
-        # 30-token frame, not the BYTE_INDEX_0 emit row) make the legacy
-        # STACK0_BYTE1-keyed / TEMP+9-Q-gated relay dark. Re-cast it as the
-        # same intra-step cross-row copy the ADD head 5 uses: Q fires at the
-        # BYTE_INDEX_0 emit row (BYTE_INDEX_0 + HAS_SE), K selects the current
-        # step's AX marker via MARK_AX AND OP_SUB (the SUB discriminator lives
-        # on the SOURCE marker row), so head 4 gathers the minuend byte-1
-        # carrier (STACK0_BYTE_VAL_1, deposited by the L8 head-7 mem[SP] CAM)
-        # ONLY on SUB steps and stays dark on ADD/bitwise. The 1096 sub corpus
-        # is all 2-byte (subtrahend byte1 = 0x00), so byte 1 alone is needed.
-        OP_W = 40.0
-        q = [
-            AP(0, BD.BYTE_INDEX_0, L),
-            AP(0, BD.HAS_SE, L),
-            AP(0, BD.CONST, -L / 2),
-            AP(0, BD.MARK_AX, -L * 10),
-            AP(0, BD.MARK_PC, -L * 10),
-            AP(0, BD.BYTE_INDEX_1, -L * 10),
-            AP(0, BD.BYTE_INDEX_2, -L * 10),
-            AP(0, BD.BYTE_INDEX_3, -L * 10),
-            AP(33, BD.BYTE_INDEX_0, L),
-            AP(33, BD.CONST, -L / 2),
-        ]
-        k = [AP(33, BD.CONST, L)]
-        v = []
-        o = []
-        # TRUE AND of MARK_AX and OP_SUB (see head 5's note): a non-SUB AX
-        # marker must score NEGATIVE so the head stays dark off-SUB and never
-        # corrupts STACK0_BYTE_VAL_1 on var stores / other ops.
-        sel = 1
-        q.append(AP(sel, BD.BYTE_INDEX_0, L))
-        q.append(AP(sel, BD.HAS_SE, L))
-        q.append(AP(sel, BD.CONST, -L))
-        k.append(AP(sel, BD.MARK_AX, K_FLAG))
-        k.append(AP(sel, BD.OP_SUB, OP_W))
-        k.append(AP(sel, BD.OP_ADD, -K_FLAG))
-        k.append(AP(sel, BD.CONST, -K_FLAG * 1.3))
-        base = 3
-        val_lo = BD.STACK0_BYTE_VAL_1_LO
-        val_hi = BD.STACK0_BYTE_VAL_1_HI
-        for kk in range(16):
-            v.append(AP(base + kk, val_lo + kk, 1.0))
-            v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
-            o.append(AO(val_lo + kk, base + kk, 1.0))
-            o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
-        # Discriminator delivery: stamp TEMP+9 (the SUB byte-row selector)
-        # onto the BYTE_INDEX_0 emit row. The L10 borrow cascade gates the
-        # SUB byte-1 rule on TEMP+9 AT the emit row; in the 30-token frame the
-        # L7 head-5 broadcast leaves TEMP+9 at the MARKER row only (and even
-        # mis-stamps TEMP+8 on a SUB), so the cascade stays dark. V reads
-        # OP_SUB (=5.0 ONLY at the matched SUB marker -> ~0 elsewhere, so the
-        # stamp is clean and SUB-exclusive); the 0.2 scale yields TEMP+9 ~= 1.0.
-        v.append(AP(base + 32, BD.OP_SUB, 0.2))
-        o.append(AO(BD.TEMP + 9, base + 32, 1.0))
-        return (
-            DeclarativeAttentionHeadSpec(
-                head_idx=4, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),
-            ),
-        )
-    # Q slot 0: gate STRICTLY on the SUB byte-emit selector. TEMP+9 is
-    # the cascade's SUB discriminator (1.0 ONLY on SUB byte rows; 0 on
-    # ADD/bitwise/everything else). The slot-0 score must be POSITIVE
-    # only when TEMP+9 fires and NEGATIVE otherwise, so the relay never
-    # writes STACK0_BYTE_VAL on non-SUB rows (those dims alias
-    # FORMAT_PTR / LEV_DETECTOR -- writing them off-SUB risks
-    # regression). With CONST=1.0 everywhere: SUB byte row scores
-    # TEMP+9*L - L/2 = +L/2; every non-SUB row scores 0 - L/2 = -L/2.
-    # IS_BYTE/MARK/BYTE_INDEX terms only sharpen; the load-bearing gate
-    # is TEMP+9 minus the CONST baseline. The slot-33 anti-leak mirrors
-    # the same TEMP+9-gated bias so the slot-0 softmax routes positively
-    # only at SUB byte rows.
-    q = [
-        AP(0, BD.TEMP + 9, L),
-        AP(0, BD.CONST, -L / 2),
-        AP(0, BD.MARK_AX, -L * 10),
-        AP(0, BD.MARK_PC, -L * 10),
-        AP(0, BD.TEMP + 8, -L * 10),
-        AP(0, BD.BYTE_INDEX_3, -L * 10),
-        # slot 33 anti-leak: require TEMP+9 so the slot-0 softmax only
-        # routes positively on the SUB byte-h emit rows.
-        AP(33, BD.TEMP + 9, L),
-        AP(33, BD.CONST, -L / 2),
-    ]
-    k = [AP(33, BD.CONST, L)]
-    v = []
-    o = []
-    # Per-byte K-select slots and V/O nibble copies. Slot indices:
-    #   byte route j uses Q/K slot (1 + j) as the byte-index selector,
-    #   V/O slots [base .. base+31] for the 32 nibble copies.
-    for j, (h, emit_bi_dim, src_flag_dim, val_lo, val_hi) in enumerate(_BYTE_ROUTES):
-        sel = 1 + j  # 1, 2
-        # The per-byte Q selector folds in the SUB discriminator TEMP+9
-        # so the (large) K source-flag match only contributes on a SUB
-        # byte-h row: Q[sel] = BYTE_INDEX_h + TEMP+9 - CONST, which is
-        # ~+L on a SUB byte-h emit row (1+1-1) but ~0 on a non-SUB
-        # byte-h row (1+0-1=0) -- so on ADD/OR/XOR/AND byte rows the
-        # STACK0_BYTE_h K-match multiplies a ~0 query and the head does
-        # NOT gather (keeps STACK0_BYTE_VAL / its FORMAT_PTR alias
-        # untouched off-SUB). On a SUB row the K_FLAG-scaled match then
-        # dominates the alibi penalty and selects the PSH frame.
-        q.append(AP(sel, emit_bi_dim, L))
-        q.append(AP(sel, BD.TEMP + 9, L))
-        q.append(AP(sel, BD.CONST, -L))
-        k.append(AP(sel, src_flag_dim, K_FLAG))
-        k.append(AP(sel, BD.CONST, -K_FLAG / 2))
-        base = 3 + j * 32  # 3.., 35..
-        for kk in range(16):
-            v.append(AP(base + kk, val_lo + kk, 1.0))
-            v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
-            o.append(AO(val_lo + kk, base + kk, 1.0))
-            o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
-
-    return (
-        DeclarativeAttentionHeadSpec(
-            head_idx=4,
-            q=tuple(q),
-            k=tuple(k),
-            v=tuple(v),
-            o=tuple(o),
-        ),
-    )
+    spec = _l13_sub_minuend_store_spec(BD)
+    dim_map = _l13_relay_dim_map(BD, spec)
+    return (cam_lookup(spec).head_spec_builder(dim_map, 4),)
 
 
 def _layer13_sub_minuend_relay_ir(dim_positions, HD) -> CompilerIR:
@@ -1036,177 +998,117 @@ def make_layer13_sub_minuend_relay_op() -> Operation:
 # computes 0 + b1 + carry unchanged. The STACK0_BYTE_VAL_1 band is
 # neither OUTPUT nor CARRY, so the existing ADD carry path is untouched
 # until the L10 adder reads it.
+def _l13_add_addend_store_spec(BD) -> CamLookupSpec:
+    """The ``direction="store"`` :class:`CamLookupSpec` for L13 head 5.
+
+    DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): the ADD addend
+    relay is the STORE-direction sibling of the SUB minuend relay (head 4). The
+    ADD byte-1 emit FIRE row attends BACK to the addressed source row (the
+    PSH-frame ``STACK0_BYTE1`` value row in flag-OFF; the current step's ADD
+    ``MARK_AX`` marker in the campaign frame) whose signature matches at
+    ``K_FLAG`` and writes operand-A byte 1 (``a1``) back into
+    ``STACK0_BYTE_VAL_1`` at the emit row. Lowered through :func:`cam_lookup`
+    with ``direction="store"``: a single-byte :class:`CamStoreRoute` + (campaign)
+    a :class:`CamStoreStamp` re-delivering TEMP+12 (the dedicated campaign
+    byte-1 adder selector). See the module comment block for the root cause and
+    the byte-identity property.
+    """
+    L = 15.0
+    K_FLAG = 200.0
+    if operand_from_memsp_enabled():
+        # === STACK0 campaign Part C/Inc-4: byte-1 RESULT delivery. Q fires at
+        # the BYTE_INDEX_0 emit row (BYTE_INDEX_0 + HAS_SE), K selects the ADD
+        # AX marker (MARK_AX AND OP_ADD; a non-ADD marker scores NEGATIVE so the
+        # head stays dark off-ADD), gathering the carrier ONLY on ADD steps. A
+        # stamp re-delivers TEMP+12 (a dedicated slot the L14 add cleanup does
+        # NOT read) onto the emit row so l10_add_high_byte_adder fires there. ===
+        OP_W = 40.0
+        return CamLookupSpec(
+            name="layer13_add_addend_relay.head_5",
+            key_match=CamKeyMatch(
+                query_dim="BYTE_INDEX_0", key_dim="CONST", weight=L),
+            value_bands=(
+                CamValueBand("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_LO",
+                             16, 3, 1.0),
+            ),
+            direction="store",
+            store_gate=("BYTE_INDEX_0", L),
+            store_slot0_extra=(("HAS_SE", L),),
+            store_rejects=(
+                ("MARK_AX", -L * 10), ("MARK_PC", -L * 10),
+                ("BYTE_INDEX_1", -L * 10), ("BYTE_INDEX_2", -L * 10),
+                ("BYTE_INDEX_3", -L * 10),
+            ),
+            confirm=CamConfirmSlot(
+                slot=33, marker_weight=L, const_q_weight=-L / 2,
+                const_k_weight=L, marker_dim="BYTE_INDEX_0"),
+            store_routes=(
+                CamStoreRoute(
+                    slot=1, fire_dim="BYTE_INDEX_0", key_dim="MARK_AX",
+                    key_weight=K_FLAG,
+                    key_extra=(("OP_ADD", OP_W), ("OP_SUB", -K_FLAG),
+                               ("CONST", -K_FLAG * 1.3)),
+                    fire_extra=(("HAS_SE", L),),
+                    value_bands=(
+                        CamValueBand("STACK0_BYTE_VAL_1_LO",
+                                     "STACK0_BYTE_VAL_1_LO", 16, 3, 1.0),
+                        CamValueBand("STACK0_BYTE_VAL_1_HI",
+                                     "STACK0_BYTE_VAL_1_HI", 16, 19, 1.0),
+                    ),
+                ),
+            ),
+            store_stamp=CamStoreStamp(
+                v_slot=35, read_dim="OP_ADD", read_scale=0.2,
+                write_dim="TEMP+12", o_scale=1.0),
+        )
+    # Flag-OFF (golden 35-token) path: gate on the ADD byte selector TEMP+8;
+    # the single route fires at BYTE_INDEX_0 + TEMP+8 and K-matches the PSH-frame
+    # STACK0_BYTE1 value row, relaying STACK0_BYTE_VAL_1 (operand-A byte 1) back
+    # into itself. No stamp (TEMP+8 already spreads to the ADD byte rows).
+    return CamLookupSpec(
+        name="layer13_add_addend_relay.head_5",
+        key_match=CamKeyMatch(
+            query_dim="TEMP+8", key_dim="CONST", weight=L),
+        value_bands=(
+            CamValueBand("STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_LO",
+                         16, 3, 1.0),
+        ),
+        direction="store",
+        store_gate=("TEMP+8", L),
+        store_rejects=(
+            ("MARK_AX", -L * 10), ("MARK_PC", -L * 10),
+            ("TEMP+9", -L * 10), ("BYTE_INDEX_3", -L * 10),
+        ),
+        confirm=CamConfirmSlot(
+            slot=33, marker_weight=L, const_q_weight=-L / 2,
+            const_k_weight=L, marker_dim="TEMP+8"),
+        store_routes=(
+            CamStoreRoute(
+                slot=1, fire_dim="BYTE_INDEX_0", key_dim="STACK0_BYTE1",
+                key_weight=K_FLAG, key_baseline=("CONST", -K_FLAG / 2),
+                fire_extra=(("TEMP+8", L),),
+                value_bands=(
+                    CamValueBand("STACK0_BYTE_VAL_1_LO",
+                                 "STACK0_BYTE_VAL_1_LO", 16, 3, 1.0),
+                    CamValueBand("STACK0_BYTE_VAL_1_HI",
+                                 "STACK0_BYTE_VAL_1_HI", 16, 19, 1.0),
+                ),
+            ),
+        ),
+    )
+
+
 def _layer13_add_addend_relay_head_specs(BD) -> tuple:
     """L13 head 5: relay ADD operand-A byte 1 (a1) to STACK0_BYTE_VAL_1.
 
-    One spec firing on the ADD byte-1 emit row (BYTE_INDEX_0 + TEMP+8).
-    Q selects that row; K selects the PSH-frame STACK0 byte-1 value row
-    via STACK0_BYTE1; the V/O nibble copy re-deposits STACK0_BYTE_VAL_1
-    into STACK0_BYTE_VAL_1 at the emit row. ALiBi recency (negative slope,
-    set in the bake) picks the oldest populated PSH frame (the original
-    operand-A PSH) over the current ADD step's empty STACK0 frame.
+    DERIVED from :func:`cam_lookup` (``direction="store"``, see
+    :func:`_l13_add_addend_store_spec` and the module comment block for the
+    byte-identity provenance). ALiBi recency (slope set in the bake) selects the
+    populated PSH frame (flag-OFF) / the current step's AX marker (campaign).
     """
-    L = 15.0
-    # K source-flag match weight -- see head 4's note: must dominate the
-    # ALiBi distance penalty so only STACK0_BYTE1 rows are candidates.
-    K_FLAG = 200.0
-    # Single route: emit BYTE_INDEX_0 row -> operand byte 1 (a1) in
-    # STACK0_BYTE_VAL_1 (the 1096 add corpus is all 2-byte; result byte 1
-    # is the high byte and is predicted at the BYTE_INDEX_0 row).
-    emit_bi_dim = BD.BYTE_INDEX_0
-    # STACK0 campaign Part B (2026-06-18): under C4_OPERAND_FROM_MEMSP the
-    # pushed operand's STACK0 byte-1 row is gone (STACK0 dropped + the
-    # layer10_psh_ax_broadcast STACK0-row producer starved), so the legacy
-    # K-match on the STACK0_BYTE1 position flag finds no row and the relay
-    # delivers nothing -> 16-bit ADD byte 1 stays 0. The L8 head-7 byte-1 CAM
-    # (make_layer8_mem_to_alu_op) now deposits operand-A byte 1 (from mem[SP])
-    # into STACK0_BYTE_VAL_1 at the SAME step's AX marker; re-point the relay
-    # K to that row (MARK_AX) so this head carries it forward to the ADD
-    # byte-1 emit row. Flag-OFF keeps the STACK0_BYTE1 source (byte-identical).
-    src_flag_dim = (
-        BD.MARK_AX if operand_from_memsp_enabled() else BD.STACK0_BYTE1
-    )
-    val_lo = BD.STACK0_BYTE_VAL_1_LO
-    val_hi = BD.STACK0_BYTE_VAL_1_HI
-    if operand_from_memsp_enabled():
-        # === STACK0 campaign Part C (Inc-3 claw-back, 2026-06-19): the
-        # byte-1 RESULT delivery. ===
-        #
-        # The 30-token campaign frame breaks the legacy TEMP+8 gating
-        # (GPU-confirmed, tools/probe_inc3_addsub_b1_trace.py):
-        #   * The ADD/SUB byte-row selectors TEMP+8/TEMP+9 are delivered
-        #     ONLY at the MARK_AX marker row (the L7 head-5 broadcast Q
-        #     fires at MARK_AX) and are not spread to the BYTE_INDEX_0
-        #     emit row in the collapsed frame -- so a Q gated on TEMP+8 at
-        #     the emit row scores ~0 and the relay never fires.
-        #   * The carrier STACK0_BYTE_VAL_1 (operand-A byte 1, deposited by
-        #     the L8 head-7 mem[SP] CAM) sits at the MARK_AX marker row.
-        #
-        # Re-cast the relay as a clean intra-step cross-row copy that needs
-        # NEITHER the dropped STACK0 row NOR the un-delivered TEMP selector:
-        #   Q fires at the BYTE_INDEX_0 emit row (BYTE_INDEX_0 + HAS_SE,
-        #   both present there), K selects the current step's AX marker via
-        #   MARK_AX AND OP_ADD (the ADD discriminator lives on the SOURCE
-        #   marker row -- OP_ADD ~= 5 there, 0 on a SUB/bitwise marker), so
-        #   head 5 gathers the carrier ONLY on ADD steps and stays dark on
-        #   SUB/bitwise (keeps the FORMAT_PTR/LEV_DETECTOR-aliased
-        #   STACK0_BYTE_VAL band untouched off-ADD). The positive alibi
-        #   slope (set in the bake) rewards proximity so the SAME step's AX
-        #   marker (one row back) wins over any older ADD step's marker.
-        OP_W = 40.0
-        q = [
-            AP(0, emit_bi_dim, L),
-            AP(0, BD.HAS_SE, L),
-            AP(0, BD.CONST, -L / 2),
-            AP(0, BD.MARK_AX, -L * 10),
-            AP(0, BD.MARK_PC, -L * 10),
-            AP(0, BD.BYTE_INDEX_1, -L * 10),
-            AP(0, BD.BYTE_INDEX_2, -L * 10),
-            AP(0, BD.BYTE_INDEX_3, -L * 10),
-            AP(33, emit_bi_dim, L),
-            AP(33, BD.CONST, -L / 2),
-        ]
-        k = [AP(33, BD.CONST, L)]
-        v = []
-        o = []
-        # Per-byte K-select slot 1: gather the carrier from the ADD AX
-        # marker -- a TRUE AND of MARK_AX and OP_ADD. A non-ADD AX marker
-        # (e.g. an SI/LI/var step's marker) must score NEGATIVE so the head
-        # stays dark off-ADD (else it corrupts STACK0_BYTE_VAL_1 on var stores
-        # -- GPU-measured var_simple regression). With MARK_AX=1, OP_ADD in
-        # {0, ~5}: an ADD marker scores K_FLAG + 5*OP_W - 1.3*K_FLAG = +large;
-        # a non-ADD marker scores K_FLAG - 1.3*K_FLAG = -0.3*K_FLAG < 0; byte
-        # rows (no MARK_AX) score -1.3*K_FLAG < 0. The CONST baseline keeps
-        # only the ADD marker above softmax1's zero anchor.
-        sel = 1
-        q.append(AP(sel, emit_bi_dim, L))
-        q.append(AP(sel, BD.HAS_SE, L))
-        q.append(AP(sel, BD.CONST, -L))
-        k.append(AP(sel, BD.MARK_AX, K_FLAG))
-        k.append(AP(sel, BD.OP_ADD, OP_W))
-        k.append(AP(sel, BD.OP_SUB, -K_FLAG))
-        k.append(AP(sel, BD.CONST, -K_FLAG * 1.3))
-        base = 3
-        for kk in range(16):
-            v.append(AP(base + kk, val_lo + kk, 1.0))
-            v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
-            o.append(AO(val_lo + kk, base + kk, 1.0))
-            o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
-        # NOTE: unlike the SUB head 4, the ADD path does NOT stamp TEMP+8 here
-        # -- TEMP+8 already reaches the ADD byte rows via the in-step spread
-        # well enough for the L25 high-byte adder, and an extra stamp REGRESSES
-        # ADD (24->14, GPU-measured): it over-fires the TEMP+8-gated L14 add
-        # byte-1 cleanup / cascade rules. The carrier delivery alone is the win.
-        #
-        # === STACK0 campaign Inc-4 (2026-06-20): ADD byte-1 RESULT delivery. ===
-        # The Inc-3 relay delivers a1 (operand-A byte 1) into STACK0_BYTE_VAL_1
-        # at the emit row, but the downstream ``l10_add_high_byte_adder`` (the
-        # Part-2 op that computes OUTPUT byte 1 = a1 + b1 + carry) is gated on
-        # TEMP+8 AT the emit row -- and GPU-confirmed (probe_inc3_addsub_b1_trace)
-        # the 30-token campaign frame leaves TEMP+8 = 0 at the BYTE_INDEX_0 emit
-        # row (it lands only on the MARK_AX marker). So the adder never fires:
-        # byte 1 stays b1-only, dropping a1 AND the byte-0 carry (add_1 0x310 ->
-        # 0x210, add_6 0x5BF -> 0x2BF). Stamp a DEDICATED campaign discriminator
-        # TEMP+12 onto the emit row (a free TEMP slot the L14 add cleanup does
-        # NOT read -- so it cannot reproduce the TEMP+8 over-fire above). V reads
-        # OP_ADD (= 5.0 ONLY at the matched ADD marker -> ~0 elsewhere, clean and
-        # ADD-exclusive); 0.2 scale yields TEMP+12 ~= 1.0 at the emit row for
-        # EVERY ADD step (including a1 = 0, where the carrier collapses to 0 but
-        # the carry-in still must be summed). The campaign-gated branch of
-        # ``l10_add_high_byte_adder`` reads TEMP+12 instead of TEMP+8.
-        v.append(AP(base + 32, BD.OP_ADD, 0.2))
-        o.append(AO(BD.TEMP + 12, base + 32, 1.0))
-        return (
-            DeclarativeAttentionHeadSpec(
-                head_idx=5, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),
-            ),
-        )
-    # Q slot 0: gate STRICTLY on the ADD byte-emit selector TEMP+8 (1.0
-    # ONLY on ADD byte rows; 0 on SUB/bitwise/everything else). Mirrors
-    # head 4's TEMP+9 gate -- positive only when TEMP+8 fires, negative
-    # otherwise, so the relay never writes STACK0_BYTE_VAL off-ADD (those
-    # dims alias FORMAT_PTR/LEV_DETECTOR; writing them off-ADD risks
-    # regression). slot 33 anti-leak mirrors the same TEMP+8-gated bias.
-    q = [
-        AP(0, BD.TEMP + 8, L),
-        AP(0, BD.CONST, -L / 2),
-        AP(0, BD.MARK_AX, -L * 10),
-        AP(0, BD.MARK_PC, -L * 10),
-        AP(0, BD.TEMP + 9, -L * 10),
-        AP(0, BD.BYTE_INDEX_3, -L * 10),
-        AP(33, BD.TEMP + 8, L),
-        AP(33, BD.CONST, -L / 2),
-    ]
-    k = [AP(33, BD.CONST, L)]
-    v = []
-    o = []
-    # Per-byte K-select slot 1 + V/O nibble copies (slots 3..34).
-    sel = 1
-    # Q[sel] = BYTE_INDEX_0 + TEMP+8 - CONST: ~+L on an ADD byte-1 row
-    # (1+1-1) but ~0 on a non-ADD byte-1 row (1+0-1=0), so on SUB/bitwise
-    # byte rows the STACK0_BYTE1 K-match multiplies a ~0 query and the
-    # head does NOT gather (keeps STACK0_BYTE_VAL untouched off-ADD).
-    q.append(AP(sel, emit_bi_dim, L))
-    q.append(AP(sel, BD.TEMP + 8, L))
-    q.append(AP(sel, BD.CONST, -L))
-    k.append(AP(sel, src_flag_dim, K_FLAG))
-    k.append(AP(sel, BD.CONST, -K_FLAG / 2))
-    base = 3
-    for kk in range(16):
-        v.append(AP(base + kk, val_lo + kk, 1.0))
-        v.append(AP(base + 16 + kk, val_hi + kk, 1.0))
-        o.append(AO(val_lo + kk, base + kk, 1.0))
-        o.append(AO(val_hi + kk, base + 16 + kk, 1.0))
-
-    return (
-        DeclarativeAttentionHeadSpec(
-            head_idx=5,
-            q=tuple(q),
-            k=tuple(k),
-            v=tuple(v),
-            o=tuple(o),
-        ),
-    )
+    spec = _l13_add_addend_store_spec(BD)
+    dim_map = _l13_relay_dim_map(BD, spec)
+    return (cam_lookup(spec).head_spec_builder(dim_map, 5),)
 
 
 def _layer13_add_addend_relay_ir(dim_positions, HD) -> CompilerIR:
