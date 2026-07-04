@@ -2928,29 +2928,36 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # the same as before (gate_terms only attenuate via the W_gate matrix
     # at positions where MARK_MEM == 1, which the rule never fires at).
     cancel_lev_sp_gate_terms = ((dim_ref('marker', 'MEM'), -1e6),)
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_stack0_cancel_lev_sp_lo_{k}",
-            conditions=lev_sp_stack0_cancel_conditions + (
-                (dim_ref('memory_lo', 'addr_b0', k), 1.0),
+    # STACK0-side inverse of the LEV ``SP := BP`` pop — DERIVED via the POP-CAM
+    # register-delta primitive (the same ``ADDR_B0_{LO,HI}`` value band + MARK_MEM
+    # gate-blocker + ``hi_shift=1`` low-byte carry as the SP:=BP pop above), but with
+    # a NEGATED ``write_scale`` so each per-nibble unit SUBTRACTS the freed-BP
+    # address the SP materializers leaked onto the STACK0 OUTPUT byte. band_cell
+    # mode folds the band cell into BOTH the AND conditions and the multiplicative
+    # gate; ``lo_shift=0`` / ``hi_shift=1`` match the pop's LO no-shift / HI +16
+    # carry. Byte-identical to the hand-authored inverse loop.
+    rules.extend(register_delta(
+        RegisterDeltaSpec(
+            name="l16_stack0_cancel_lev_sp",
+            kind="pop_cam",
+            write_scale=-write_scale,
+            conditions=lev_sp_stack0_cancel_conditions,
+            pop_cam=PopCamDelta(
+                value_src_lo=_dim_base('memory_lo', 'addr_b0'),
+                value_src_hi=_dim_base('memory_hi', 'addr_b0'),
+                value_hi_offset=0,
+                dst_lo=_dim_base('output_lo', 'nibble'),
+                dst_hi="OUTPUT_HI_THIS_STEP",
+                lo_shift=0,
+                hi_shift=1,
+                gate_mode="band_cell",
+                gate_terms=cancel_lev_sp_gate_terms,
+                threshold=lev_sp_stack0_cancel_threshold,
             ),
-            threshold=lev_sp_stack0_cancel_threshold,
-            gate=dim_ref('memory_lo', 'addr_b0', k),
-            gate_terms=cancel_lev_sp_gate_terms,
-            writes=((dim_ref('output_lo', 'nibble', k), -write_scale),),
-        ))
-    for k in range(16):
-        result = (k + 1) % 16
-        rules.append(multi_way_and_rule(
-            name=f"l16_stack0_cancel_lev_sp_hi_{k}",
-            conditions=lev_sp_stack0_cancel_conditions + (
-                (dim_ref('memory_hi', 'addr_b0', k), 1.0),
-            ),
-            threshold=lev_sp_stack0_cancel_threshold,
-            gate=dim_ref('memory_hi', 'addr_b0', k),
-            gate_terms=cancel_lev_sp_gate_terms,
-            writes=((f"OUTPUT_HI_THIS_STEP+{result}", -write_scale),),
-        ))
+        ),
+        instr_width=INSTR_WIDTH,
+        pc_offset=PC_OFFSET,
+    ).rules_builder())
     return tuple(rules)
 
 
