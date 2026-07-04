@@ -56,6 +56,10 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     MarkerBroadcastBand,
     MarkerBroadcastBundle,
     MarkerBroadcastSpec,
+    PcMuxBundle,
+    PcMuxCancelBand,
+    PcMuxEncoder,
+    PcMuxSpec,
     PrecursorFlagSpec,
     ValueRouteBundle,
     ValueRouteChannel,
@@ -65,6 +69,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     cross_step_carry,
     full_width_byte_emission,
     marker_broadcast,
+    pc_mux,
     value_route,
     _expand_head_writes,
     _make_position_resolver,
@@ -1864,3 +1869,239 @@ def test_whole_model_hash_derive_imm_byte_identical(monkeypatch):
         "rules vs the legacy _layer8_op_imm_relay_head_spec / "
         "_layer8_multibyte_routing_rules."
     )
+
+
+# ===========================================================================
+# pc_mux — the CONTROL PC-source override generator. These assert the derived
+# rules re-express the six hand-authored L6 branch-target overrides
+# byte-for-byte (the STEP-2 proof); the decisive whole-model hash gate is the
+# ``_isa_golden_hash.py`` == 91f55411 held by the flip (docs/semantic_spec_CONTROL.md).
+# ===========================================================================
+
+from c4_release.neural_vm.constants import INSTR_WIDTH, PC_OFFSET  # noqa: E402
+
+
+def _rule_key(r):
+    """Position-independent identity of an FFNRule (name-agnostic)."""
+    conds = tuple(sorted((c.dim.name, c.dim.offset, c.weight) for c in r.conditions))
+    writes = tuple(sorted((w.dim.name, w.dim.offset, w.weight) for w in r.writes))
+    gate = (r.gate.name, r.gate.offset) if r.gate is not None else None
+    gterms = tuple(sorted(
+        (g.dim.name, g.dim.offset, g.weight) for g in getattr(r, "gate_terms", ())
+    ))
+    return (conds, writes, gate, r.gate_weight, r.threshold, r.gate_bias, gterms)
+
+
+def _jmp_direct_spec(name, conditions, threshold, lo, hi):
+    return PcMuxSpec(
+        name=name, conditions=conditions, threshold=threshold, write_scale=2.0 / 100.0,
+        encoder=PcMuxEncoder(mode="direct_copy", lo_source=lo, hi_source=hi),
+    )
+
+
+def test_pc_mux_returns_bundle():
+    spec = _jmp_direct_spec(
+        "l6_jmp_all_step",
+        (("MARK_PC", 1.0), ("OP_JMP", 1.0), ("MARK_AX", -10.0)),
+        4.5, "FETCH_LO", "FETCH_HI")
+    bundle = pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET)
+    assert isinstance(bundle, PcMuxBundle)
+    assert bundle.spec is spec
+    # cancel LO reads OUTPUT_LO (cross-step alias base), writes OUTPUT_LO +
+    # OUTPUT_HI_THIS_STEP; the direct-copy encoder reads FETCH_LO/FETCH_HI.
+    assert "OUTPUT_LO" in bundle.writes and "OUTPUT_HI_THIS_STEP" in bundle.writes
+    assert "FETCH_LO" in bundle.reads and "FETCH_HI" in bundle.reads
+
+
+def test_pc_mux_has_no_head_gate_field():
+    """PC-mux gating lives ONLY in the per-op ``conditions`` — there is no
+    separate head/relay gate field (the cancel + target share the gate)."""
+    fields = set(PcMuxSpec.__dataclass_fields__)
+    for forbidden in ("head_gate", "target_gate", "cancel_gate"):
+        assert forbidden not in fields
+
+
+def test_pc_mux_direct_copy_counts_and_shape():
+    """A direct-copy JMP entry = 32 cancel + 32 target = 64 rules; no encoding."""
+    spec = _jmp_direct_spec(
+        "l6_jmp_all_step",
+        (("MARK_PC", 1.0), ("OP_JMP", 1.0), ("MARK_AX", -10.0)),
+        4.5, "FETCH_LO", "FETCH_HI")
+    rules = pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
+    assert len(rules) == 64
+    # target_lo cell k copies FETCH_LO+k -> OUTPUT_LO+k (identity, no imm*8+2).
+    tlo = [r for r in rules if r.name == "l6_jmp_all_step_target_lo_3"][0]
+    assert tlo.gate.name == "FETCH_LO" and tlo.gate.offset == 3
+    assert tlo.writes[0].dim.name == "OUTPUT_LO" and tlo.writes[0].dim.offset == 3
+
+
+def test_pc_mux_imm_to_byte_addr_encodes():
+    """The imm_to_byte_addr encoder writes imm*INSTR_WIDTH+PC_OFFSET per nibble."""
+    spec = PcMuxSpec(
+        name="post_l9_bz",
+        conditions=(("MARK_PC", 1.0), ("OP_BZ", 0.2), ("CMP+4", 1.0), ("CMP+5", 1.0)),
+        threshold=13.5, write_scale=2.0 / 100.0,
+        encoder=PcMuxEncoder(mode="imm_to_byte_addr", lo_source="FETCH_LO"),
+    )
+    rules = pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
+    # 32 cancel + 32 encoder = 64 (no odd-hi correction here).
+    assert len(rules) == 64
+    # index 3 -> byte addr 3*8+2 = 26 = 0x1A: lo nibble 0xA, hi nibble 0x1.
+    lo3 = [r for r in rules if r.name == "post_l9_bz_byteaddr_lo_3"][0]
+    assert lo3.gate.name == "FETCH_LO" and lo3.gate.offset == 3
+    assert lo3.writes[0].dim.name == "OUTPUT_LO" and lo3.writes[0].dim.offset == 0xA
+    hi3 = [r for r in rules if r.name == "post_l9_bz_byteaddr_hi_3"][0]
+    assert hi3.writes[0].dim.offset == 0x1
+
+
+def test_pc_mux_encoder_rejects_bad_mode():
+    with pytest.raises(ValueError, match="mode must be"):
+        PcMuxEncoder(mode="bogus", lo_source="FETCH_LO")
+    with pytest.raises(ValueError, match="hi_source is required"):
+        PcMuxEncoder(mode="direct_copy", lo_source="FETCH_LO")  # no hi_source
+    with pytest.raises(ValueError, match="odd_hi_correction only applies"):
+        PcMuxEncoder(mode="direct_copy", lo_source="A", hi_source="B",
+                     odd_hi_correction="branch")
+
+
+def test_pc_mux_reexpresses_all_six_l6_overrides_byte_identical():
+    """The DECISIVE STEP-2 proof: every one of the six live L6 branch-target
+    override builders (JMP all-step/first-step/delayed, BZ, BNZ, JSR all-step)
+    is now DERIVED via pc_mux and must reproduce the reference rule set exactly
+    (name-agnostic weight identity). Reconstructs the retired hand logic inline
+    (the hand builders were deleted in the flip)."""
+    from c4_release.neural_vm.unified_compiler.ops import l6_ops as L
+    AMP = L._FETCH_PC_MARKER_AMP
+    ws = 2.0 / 100.0
+
+    def _tlo(k):
+        return (k * INSTR_WIDTH + PC_OFFSET) & 0xF
+
+    def _thi(k):
+        return ((k * INSTR_WIDTH + PC_OFFSET) >> 4) & 0xF
+
+    def _thi8(k):
+        return (_thi(k) + INSTR_WIDTH) & 0xF
+
+    def _cancel(name, cc, thr, lo_egt=()):
+        r = []
+        for band, ob, ogb in (
+            ("lo", "OUTPUT_LO", "OUTPUT_LO.*.-1"),
+            ("hi", "OUTPUT_HI_THIS_STEP", "OUTPUT_HI_THIS_STEP"),
+        ):
+            egt = lo_egt if band == "lo" else ()
+            for k in range(16):
+                r.append(multi_way_and_rule(
+                    name=f"{name}_cancel_{band}_{k}", conditions=cc, threshold=thr,
+                    gate=f"{ogb}+{k}", gate_weight=-1.0, gate_terms=egt,
+                    writes=((f"{ob}+{k}", ws),)))
+        return r
+
+    def _direct(name, cc, thr, lo, hi):
+        r = []
+        for k in range(16):
+            r.append(multi_way_and_rule(
+                name=f"{name}_lo_{k}", conditions=cc, threshold=thr,
+                gate=f"{lo}+{k}", writes=((f"OUTPUT_LO+{k}", ws),)))
+        for k in range(16):
+            r.append(multi_way_and_rule(
+                name=f"{name}_hi_{k}", conditions=cc, threshold=thr,
+                gate=f"{hi}+{k}", writes=((f"OUTPUT_HI_THIS_STEP+{k}", ws),)))
+        return r
+
+    def _immaddr(name, cc, thr, lo, gw=1.0):
+        r = []
+        for k in range(16):
+            r.append(multi_way_and_rule(
+                name=f"{name}_lo_{k}", conditions=cc, threshold=thr,
+                gate=f"{lo}+{k}", gate_weight=gw,
+                writes=((f"OUTPUT_LO+{_tlo(k)}", ws),)))
+        for k in range(16):
+            r.append(multi_way_and_rule(
+                name=f"{name}_hi_{k}", conditions=cc, threshold=thr,
+                gate=f"{lo}+{k}", gate_weight=gw,
+                writes=((f"OUTPUT_HI_THIS_STEP+{_thi(k)}", ws),)))
+        return r
+
+    def _branch_corr(name, bc, thr):
+        fn = 1.0 / AMP
+        oreq = tuple((f"FETCH_HI+{j}", fn) for j in range(1, 16, 2))
+        eb = tuple((f"FETCH_HI+{j}", -10.0 * fn) for j in range(0, 16, 2))
+        return [multi_way_and_rule(
+            name=f"{name}_c_{k}",
+            conditions=bc + ((f"FETCH_LO+{k}", fn),) + oreq + eb,
+            threshold=thr + 2.0, gate=f"FETCH_LO+{k}",
+            writes=((f"OUTPUT_HI_THIS_STEP+{_thi(k)}", -ws),
+                    (f"OUTPUT_HI_THIS_STEP+{_thi8(k)}", ws)))
+            for k in range(16)]
+
+    def _jsr_corr(name, bc, thr):
+        oig = tuple((f"FETCH_HI+{k}", 1.0) for k in range(1, 16, 2))
+        eb = tuple((f"FETCH_HI+{k}", -10.0) for k in range(0, 16, 2))
+        return [multi_way_and_rule(
+            name=f"{name}_c_{k}",
+            conditions=bc + ((f"FETCH_LO+{k}", 1.0),) + eb,
+            threshold=thr + 0.5, gate_terms=oig,
+            writes=((f"OUTPUT_HI_THIS_STEP+{_thi(k)}", -ws),
+                    (f"OUTPUT_HI_THIS_STEP+{_thi8(k)}", ws)))
+            for k in range(16)]
+
+    sg = 10.0
+    jmp_cc = (("MARK_PC", 1.0), ("OP_JMP", 1.0), ("MARK_AX", -10.0))
+    d_cc = (("MARK_PC", 1.0), ("CMP+0", 1.0), ("MARK_AX", -10.0), ("CONST", -1000.0))
+    f_cc = (("MARK_PC", 1.0), ("OP_JMP", 1.0), ("HAS_SE", -1.0), ("MARK_AX", -10.0))
+    bz_cc = (("MARK_PC", 1.0), ("OP_BZ", 0.2), ("CMP+4", 1.0), ("CMP+5", 1.0),
+             ("IS_BYTE", -10.0), ("HAS_SE", sg))
+    bz_tc = bz_cc + (("MARK_STACK0", -10.0),)
+    bz_thr = 3.5 + sg
+    sgt = ("HAS_SE", sg)
+    bnz_groups = (
+        ("lo", (("MARK_PC", 1.0), ("OP_BNZ", 0.2), ("CMP+4", -1.0), sgt), 1.5 + sg),
+        ("hi", (("MARK_PC", 1.0), ("OP_BNZ", 0.2), ("CMP+4", 1.0), ("CMP+5", -1.0),
+                sgt), 2.5 + sg),
+    )
+    jc = ((("MARK_PC", 20.0),) + L._jsr_opcode_nibble_conditions()
+          + (("MARK_AX", -100.0), ("MARK_SP", -100.0), ("MARK_BP", -100.0),
+             ("MARK_STACK0", -100.0), ("MARK_MEM", -100.0), ("NEXT_SE", -100.0),
+             ("IS_BYTE", -100.0)))
+    jc100 = ((("MARK_PC", 20.0),) + L._jsr_opcode_nibble_conditions(blocker=-100.0)
+             + (("MARK_AX", -100.0), ("MARK_SP", -100.0), ("MARK_BP", -100.0),
+                ("MARK_STACK0", -100.0), ("MARK_MEM", -100.0), ("NEXT_SE", -100.0),
+                ("IS_BYTE", -100.0)))
+
+    h_bnz = []
+    for g, cc, t in bnz_groups:
+        h_bnz += _cancel(f"post_l9_bnz_{g}", cc, t) \
+            + _immaddr(f"post_l9_bnz_{g}", cc, t, "FETCH_LO") \
+            + _branch_corr(f"post_l9_bnz_{g}", cc, t)
+
+    reference = {
+        "JMP_all": _cancel("l6_jmp_all_step", jmp_cc, 4.5)
+        + _direct("l6_jmp_all_step", jmp_cc, 4.5, "FETCH_LO", "FETCH_HI"),
+        "delayed": _cancel("l6_delayed_jmp", d_cc, 5.5)
+        + _direct("l6_delayed_jmp", d_cc, 5.5, "AX_CARRY_LO", "AX_CARRY_HI"),
+        "first": _cancel("l6_first_step_jmp", f_cc, 5.0)
+        + _direct("l6_first_step_jmp", f_cc, 5.0, "AX_CARRY_LO", "AX_CARRY_HI"),
+        "BZ": _cancel("post_l9_bz", bz_cc, bz_thr,
+                      lo_egt=(("BZ_TARGET_FRESH.*.-1", 1.0),))
+        + _immaddr("post_l9_bz", bz_tc, bz_thr, "FETCH_LO")
+        + _branch_corr("post_l9_bz", bz_tc, bz_thr)
+        + [multi_way_and_rule(name="fresh", conditions=bz_cc, threshold=bz_thr,
+                              writes=(("BZ_TARGET_FRESH", ws),))],
+        "BNZ": h_bnz,
+        "JSR_all": _cancel("l6_jsr_all_step", jc, 21.5)
+        + _immaddr("l6_jsr_all_step", jc, 21.5, "FETCH_LO", gw=1.0 / AMP)
+        + _jsr_corr("l6_jsr_all_step", jc100, 21.5),
+    }
+    derived = {
+        "JMP_all": L._layer6_all_step_jmp_pc_override_rules(100.0),
+        "delayed": L._layer6_delayed_jmp_pc_override_rules(100.0),
+        "first": L._layer6_first_step_jmp_pc_override_rules(100.0),
+        "BZ": L._post_l9_bz_pc_override_rules(100.0),
+        "BNZ": L._post_l9_bnz_pc_override_rules(100.0),
+        "JSR_all": L._layer6_all_step_jsr_pc_override_rules(100.0),
+    }
+    for name in reference:
+        h = [_rule_key(r) for r in reference[name]]
+        n = [_rule_key(r) for r in derived[name]]
+        assert h == n, f"{name}: derived pc_mux rules differ from hand reference"
