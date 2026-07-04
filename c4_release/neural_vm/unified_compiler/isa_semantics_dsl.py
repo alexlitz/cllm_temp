@@ -4534,3 +4534,191 @@ def frame_step(
         writes=writes,
         sub_builders=sub_builders,
     )
+
+
+# ===========================================================================
+# REGISTER BYTE-DEFAULT WRITER — the marker-gated SP/BP/STACK0 byte defaults
+# ===========================================================================
+#
+# The OTHER half of the CONTROL frame-step the frame agent flagged (docs
+# §G5/§G10, alongside the ENT/LEV frame deltas): the SP/BP/STACK0 byte-default
+# bands in ``l3_ops._register_default_ffn_rules``. These are NOT per-step deltas
+# — they are the register's DEFAULT WRITER: at the register's marker/byte-index
+# rows on the FIRST step (before any prior value exists), predict the register's
+# constant default (mostly 0, with a small first-step landing for SP/BP byte-1).
+#
+# Every SP/BP/STACK0 default band is the SAME 4-sub-band shape expressed as DATA
+# (:class:`RegisterByteDefaultSpec`):
+#
+#   1. MARKER default (SP/BP): at ``(MARK_X ∧ ¬HAS_SE)`` write 0 to OUTPUT byte0.
+#   2. BYTE-INDEX defaults: at ``(select_conditions ∧ BYTE_INDEX_k)`` for each k
+#      in ``byte_idx_default`` write 0 to OUTPUT byte0. ``select_conditions`` is
+#      the register-selector AND (SP/BP: ``(H1+I, 1)``; STACK0: ``(H4+3, 1),
+#      (H1+3, -1)`` — the H4-through-STACK0 minus the BP-area exclusion).
+#   3. BYTE-1 FIRST-STEP (SP/BP): at ``(select_conditions ∧ BYTE_INDEX_1 ∧
+#      ¬HAS_SE)`` write the register's first-step landing (SP/BP byte-1 lo = 1).
+#   4. MARKER FIRST-STEP (STACK0): at ``(MARK_STACK0 ∧ ¬HAS_SE)`` write 0.
+#
+# The generator emits these bands in the SAME order + names the hand-authored
+# code used, so the derived form is byte-identical (proof:
+# ``tools/_isa_golden_hash.py`` == ``91f55411``).
+
+
+@dataclass(frozen=True)
+class RegisterByteDefaultSpec:
+    """Declarative description of one register's marker-gated byte-default band.
+
+    A register (SP / BP / STACK0) whose OUTPUT byte defaults to a constant on the
+    first step, before any prior value has been carried across the step boundary.
+    Every field is DATA; the fixed 4-sub-band shape is supplied by
+    :func:`register_byte_defaults`.
+
+    Attributes:
+        name_prefix: rule-name prefix (matches the hand builder's, e.g.
+            ``"layer3_ffn.sp"``). Sub-bands append ``_marker_default_{lo,hi}`` /
+            ``_byte_idx_{k}_default_{lo,hi}`` / ``_byte_1_first_step_{lo,hi}`` /
+            ``_first_step_default_{lo,hi}``.
+        select_conditions: the register-selector AND that PRECEDES the
+            ``BYTE_INDEX_k`` term in the byte-index / byte-1 sub-bands (SP/BP:
+            ``(("H1+2", 1.0),)``; STACK0: ``(("H4+3", 1.0),)``).
+        byte_idx_trailing_conditions: register-selector AND terms that FOLLOW the
+            ``BYTE_INDEX_k`` term (STACK0's BP-area exclusion sits AFTER the
+            byte-index in the hand layout: ``(("H1+3", -1.0),)``). Empty for
+            SP/BP. Order is load-bearing for the rule-tuple match (weights are
+            order-independent, but the derived rule reproduces the hand order).
+        byte_idx_name: the name infix for the byte-index sub-band rules (SP/BP:
+            ``"byte_idx"`` -> ``sp_byte_idx_0_default_lo``; STACK0: ``"byte"`` ->
+            ``stack0_byte_0_default_lo``).
+        dst_lo / dst_hi: OUTPUT bands the defaults write.
+        write_scale: per-write magnitude (``2.0 / S``).
+        marker: the register marker for the MARKER-default sub-band (SP/BP:
+            ``"MARK_SP"`` / ``"MARK_BP"``). ``None`` disables sub-band 1.
+        marker_first_step: the marker for the MARKER-FIRST-STEP sub-band (STACK0:
+            ``"MARK_STACK0"``). ``None`` disables sub-band 4.
+        fresh_key: the freshness one-hot subtracted on the ``¬HAS_SE`` gates
+            (``"HAS_SE"``).
+        byte_idx_default: the byte indices whose default is 0 (SP/BP: ``(0, 2)``;
+            STACK0: ``(0, 1, 2)``).
+        byte_idx_default_threshold: AND threshold for the byte-index defaults.
+        marker_threshold: AND threshold for the marker / marker-first-step bands.
+        byte1_first_step: emit the BYTE-1 FIRST-STEP sub-band (SP/BP: ``True``;
+            STACK0: ``False``). The landing is ``dst_lo[1] = ws`` (lo nibble 1),
+            ``dst_hi[0] = ws`` — the SP/BP frame's first-step byte-1 value.
+        byte1_index_dim: the byte-1 index one-hot for the first-step band
+            (``"BYTE_INDEX_1"``).
+    """
+
+    name_prefix: str
+    select_conditions: Tuple[Tuple[str, float], ...]
+    byte_idx_trailing_conditions: Tuple[Tuple[str, float], ...] = ()
+    byte_idx_name: str = "byte_idx"
+    dst_lo: str = "OUTPUT_LO"
+    dst_hi: str = "OUTPUT_HI"
+    write_scale: float = 0.02
+    marker: Optional[str] = None
+    marker_first_step: Optional[str] = None
+    fresh_key: str = "HAS_SE"
+    byte_idx_default: Tuple[int, ...] = (0, 2)
+    byte_idx_default_threshold: float = 1.5
+    marker_threshold: float = 0.5
+    byte1_first_step: bool = True
+    byte1_index_dim: str = "BYTE_INDEX_1"
+
+
+def _byte_default_marker_rules(
+    spec: RegisterByteDefaultSpec,
+    marker: str,
+    *,
+    name_infix: str,
+) -> list[FFNRule]:
+    """The MARKER (or MARKER-FIRST-STEP) default: at ``(marker ∧ ¬fresh_key)``
+    write 0 to OUTPUT byte 0 (LO + HI). Scope ``"{marker} and not {fresh_key}"``.
+    """
+    ws = spec.write_scale
+    rules: list[FFNRule] = []
+    for band, dst in (("lo", spec.dst_lo), ("hi", spec.dst_hi)):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name_prefix}_{name_infix}_{band}",
+            conditions=((marker, 1.0), (spec.fresh_key, -1.0)),
+            threshold=spec.marker_threshold,
+            writes=((f"{dst}+0", ws),),
+            scope=f"{marker} and not {spec.fresh_key}",
+        ))
+    return rules
+
+
+def _byte_default_index_rules(spec: RegisterByteDefaultSpec) -> list[FFNRule]:
+    """The BYTE-INDEX defaults: for each k in ``byte_idx_default`` at
+    ``(select_conditions ∧ BYTE_INDEX_k ∧ byte_idx_trailing_conditions)`` write
+    0 to OUTPUT byte 0 (LO + HI). The byte-index term is placed BETWEEN the
+    leading + trailing selector conditions to match the STACK0 hand layout."""
+    ws = spec.write_scale
+    rules: list[FFNRule] = []
+    for byte_idx in spec.byte_idx_default:
+        conds = (
+            spec.select_conditions
+            + ((f"BYTE_INDEX_{byte_idx}", 1.0),)
+            + spec.byte_idx_trailing_conditions
+        )
+        for band, dst in (("lo", spec.dst_lo), ("hi", spec.dst_hi)):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name_prefix}_{spec.byte_idx_name}_{byte_idx}"
+                     f"_default_{band}",
+                conditions=conds,
+                threshold=spec.byte_idx_default_threshold,
+                writes=((f"{dst}+0", ws),),
+            ))
+    return rules
+
+
+def _byte_default_byte1_first_step_rules(
+    spec: RegisterByteDefaultSpec,
+) -> list[FFNRule]:
+    """The BYTE-1 FIRST-STEP band (SP/BP): at ``(select_conditions ∧
+    BYTE_INDEX_1 ∧ ¬fresh_key)`` write the first-step landing — ``dst_lo[1]``
+    (lo nibble 1), ``dst_hi[0]`` (hi nibble 0)."""
+    ws = spec.write_scale
+    conds = spec.select_conditions + (
+        (spec.byte1_index_dim, 1.0), (spec.fresh_key, -1.0),
+    )
+    return [
+        multi_way_and_rule(
+            name=f"{spec.name_prefix}_byte_1_first_step_lo",
+            conditions=conds,
+            threshold=spec.byte_idx_default_threshold,
+            writes=((f"{spec.dst_lo}+1", ws),),
+        ),
+        multi_way_and_rule(
+            name=f"{spec.name_prefix}_byte_1_first_step_hi",
+            conditions=conds,
+            threshold=spec.byte_idx_default_threshold,
+            writes=((f"{spec.dst_hi}+0", ws),),
+        ),
+    ]
+
+
+def register_byte_defaults(spec: RegisterByteDefaultSpec) -> Tuple[FFNRule, ...]:
+    """Derive one register's marker-gated byte-default band from ``spec``.
+
+    Emits the 4 sub-bands (marker default, byte-index defaults, byte-1
+    first-step, marker first-step) in the SAME order + names the hand-authored
+    ``l3_ops._register_default_ffn_rules`` code used, so the derived form is
+    byte-identical (proof: ``tools/_isa_golden_hash.py`` == ``91f55411``).
+
+    Sub-bands are emitted only when their spec field is set (SP/BP use marker +
+    byte-index + byte-1-first-step; STACK0 uses byte-index + marker-first-step),
+    matching the two hand-authored layouts. This is the DATA the frame agent
+    flagged: the SP/BP/STACK0 default-writer expressed as a table, not
+    hand-sequenced FFN banks.
+    """
+    rules: list[FFNRule] = []
+    if spec.marker is not None:
+        rules.extend(_byte_default_marker_rules(
+            spec, spec.marker, name_infix="marker_default"))
+    rules.extend(_byte_default_index_rules(spec))
+    if spec.byte1_first_step:
+        rules.extend(_byte_default_byte1_first_step_rules(spec))
+    if spec.marker_first_step is not None:
+        rules.extend(_byte_default_marker_rules(
+            spec, spec.marker_first_step, name_infix="first_step_default"))
+    return tuple(rules)
