@@ -552,7 +552,42 @@ def _install_multipass_mul(block, dim_positions, S):
         )
         passes.append(ffn)
 
-    block.ffn = MultiPassMulBlock(passes)
+    mp_block = MultiPassMulBlock(passes)
+
+    # Campaign operand-A SE recovery (same as the width=2 wide_mul lookup
+    # path, ``make_efficient_l11_alumul_wrap_op``): under the campaign L10
+    # ALU-clear, operand A's ALU_LO/HI band is crushed all-negative for a
+    # value-dependent subset of MUL rows, so the cascade's P0 partial-product
+    # AND units read the wrong (or empty) operand and the product byte 0/1 is
+    # wrong. The clean operand survives in SE_ALU_LO/HI (the L9
+    # step_end_operand_relay mirror). Wrap the cascade so it restores the
+    # crushed operand from SE_ALU BEFORE the passes read it — the byte-0
+    # SE-recovery precedent applied to the multipass cascade. Gate-OFF /
+    # non-campaign leaves ``block.ffn = mp_block`` untouched.
+    from .shared import (
+        no_stack0_emit_enabled,
+        mul_byte0_se_recover_enabled,
+        mul_l11_se_recover_enabled,
+    )
+    block_ffn = mp_block
+    if (
+        no_stack0_emit_enabled()
+        and mul_byte0_se_recover_enabled()
+        and mul_l11_se_recover_enabled()
+        and hasattr(proxy, "SE_ALU_LO")
+        and hasattr(proxy, "SE_ALU_HI")
+    ):
+        from ...efficient_alu_neural import MulOperandSeRecoverFFN
+        block_ffn = MulOperandSeRecoverFFN(
+            mp_block,
+            alu_lo=proxy.ALU_LO,
+            alu_hi=proxy.ALU_HI,
+            se_alu_lo=proxy.SE_ALU_LO,
+            se_alu_hi=proxy.SE_ALU_HI,
+            mark_ax=proxy.MARK_AX,
+            op_mul=proxy.OP_MUL,
+        )
+    block.ffn = block_ffn
 
 
 def make_mul_partial_op(alu_mode: str = "lookup") -> Operation:
