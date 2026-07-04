@@ -5791,3 +5791,185 @@ def register_byte_defaults(spec: RegisterByteDefaultSpec) -> Tuple[FFNRule, ...]
         rules.extend(_byte_default_marker_rules(
             spec, spec.marker_first_step, name_infix="first_step_default"))
     return tuple(rules)
+
+
+# ---------------------------------------------------------------------------
+# LEV-routing corrective byte-write primitives (the L16-lev residual)
+# ---------------------------------------------------------------------------
+#
+# Three L16 LEV-gated families sit OUTSIDE the register_delta / POP-CAM shape:
+# they are not register pops (no CAM source, no cancel-then-write), they are
+# *corrective byte writes* that reinforce / default / override an OUTPUT byte
+# under a gate. Each is a distinct micro-pattern with its own API below. All
+# three are byte-identity-gated against golden ``91f55411`` (the same discipline
+# as :func:`register_byte_defaults`).
+
+
+@dataclass(frozen=True)
+class SelfPreserveBandSpec:
+    """A per-cell OUTPUT ``self-preserve`` band: a FIXPOINT, not a pop.
+
+    The distinguishing shape (vs a POP-CAM :func:`register_delta`): each cell's
+    multiplicative GATE reads the SAME ``OUTPUT_{LO,HI}[k]`` slot the cell
+    WRITES. There is no external value source and no cancel — the band merely
+    *reinforces whatever OUTPUT already holds* at cell ``k`` under the shared AND
+    ``conditions``. It is silent on a default-zero cell (gate ≈ 0) and nudges an
+    already-staged nibble to stay put. This is the ``l16_lev_stack0_byte0_preserve``
+    family: after LEV pops the saved AX, keep the freed stack-top byte stable
+    rather than letting the generic STACK0 materializer collapse it to zero.
+
+    The GATE slot is resolved per-cell by :attr:`gate_lo_for` / :attr:`gate_hi_for`
+    (callables ``k -> dim_name``) so a caller can DECOUPLE the gate read from the
+    live band (the mega-root #2 prev-step-alias / prevstep-band experiment)
+    without changing the write. The WRITE lands on ``dst_lo[k]`` (LO band) /
+    ``dst_hi[k]`` (HI band).
+
+    Attributes:
+        name_prefix: rule-name prefix; LO cells are ``{prefix}_lo_{k}``, HI cells
+            ``{prefix}_hi_{k}``.
+        conditions: shared N-way AND ``(dim, weight)`` conditions.
+        threshold: shared AND threshold.
+        write_scale: per-cell write magnitude (already ``/S``).
+        dst_lo: LO-band destination base (write ``{dst_lo}+{k}``).
+        dst_hi: HI-band destination base (write ``{dst_hi}+{k}``).
+        gate_lo_for: ``k -> gate_dim_name`` for the LO band (the self-read slot).
+        gate_hi_for: ``k -> gate_dim_name`` for the HI band.
+        width: number of nibble cells (16).
+    """
+
+    name_prefix: str
+    conditions: Tuple[Tuple[str, float], ...]
+    threshold: float
+    write_scale: float
+    dst_lo: str
+    dst_hi: str
+    gate_lo_for: Callable[[int], str]
+    gate_hi_for: Callable[[int], str]
+    width: int = 16
+
+
+def self_preserve_band(spec: SelfPreserveBandSpec) -> Tuple[FFNRule, ...]:
+    """Derive a self-preserving OUTPUT band (fixpoint reinforcement) from ``spec``.
+
+    Emits ``2 * width`` rules — the LO band (cells ``0..width-1``) then the HI
+    band — in the SAME order + names the hand loop used, so the derived form is
+    byte-identical (proof: ``tools/_isa_golden_hash.py`` == ``91f55411``). Each
+    cell fires under ``spec.conditions`` gated on its own OUTPUT slot and writes
+    ``spec.write_scale`` back to that slot.
+    """
+    rules: list[FFNRule] = []
+    for k in range(spec.width):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name_prefix}_lo_{k}",
+            conditions=spec.conditions,
+            threshold=spec.threshold,
+            gate=spec.gate_lo_for(k),
+            writes=((f"{spec.dst_lo}+{k}", spec.write_scale),),
+        ))
+    for k in range(spec.width):
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name_prefix}_hi_{k}",
+            conditions=spec.conditions,
+            threshold=spec.threshold,
+            gate=spec.gate_hi_for(k),
+            writes=((f"{spec.dst_hi}+{k}", spec.write_scale),),
+        ))
+    return tuple(rules)
+
+
+@dataclass(frozen=True)
+class ConstByteDefaultSpec:
+    """A CONST-gated fixed OUTPUT write, replicated across a set of byte-index rows.
+
+    The distinguishing shape: a single ``(dim, value)`` write applied at a FIXED
+    OUTPUT slot, gated by the sentinel ``CONST`` (always-on) multiplicative gate,
+    under ``base_conditions`` extended with a per-row ``BYTE_INDEX_k`` one-hot.
+    One rule is emitted per ``byte_index`` in :attr:`byte_indices`. This is the
+    ``l16_lev_clear_output_lo10`` / ``set_output_lo0`` / ``set_output_hi0``
+    family: on the non-byte-0 rows of a top-level LEV, force the OUTPUT nibble to
+    its constant default (clear the 0xa nibble; set the byte-0 low/high nibble to
+    0) so the return frame is clean.
+
+    Attributes:
+        name_prefix: rule-name prefix; each row is ``{prefix}_{byte_index_dim}``.
+        base_conditions: the shared AND ``(dim, weight)`` conditions that PRECEDE
+            the per-row byte-index term.
+        byte_indices: the ``BYTE_INDEX_*`` one-hot dim names, one rule each.
+        threshold: shared AND threshold.
+        write_dim: the fixed OUTPUT slot written (e.g. ``OUTPUT_LO+10``).
+        write_value: the fixed write magnitude (already ``/S``).
+        gate: the multiplicative gate name (``"CONST"``).
+        byte_index_weight: the per-row byte-index one-hot weight (1.0).
+    """
+
+    name_prefix: str
+    base_conditions: Tuple[Tuple[str, float], ...]
+    byte_indices: Tuple[str, ...]
+    threshold: float
+    write_dim: str
+    write_value: float
+    gate: str = "CONST"
+    byte_index_weight: float = 1.0
+
+
+def const_byte_default(spec: ConstByteDefaultSpec) -> Tuple[FFNRule, ...]:
+    """Derive a CONST-gated fixed-write byte-default band from ``spec``.
+
+    Emits one rule per ``byte_index`` (row order = ``spec.byte_indices`` order),
+    with the SAME name / conditions / write the hand loop used, so the derived
+    form is byte-identical (proof: ``tools/_isa_golden_hash.py`` == ``91f55411``).
+    """
+    rules: list[FFNRule] = []
+    for byte_idx in spec.byte_indices:
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name_prefix}_{byte_idx}",
+            conditions=spec.base_conditions + ((byte_idx, spec.byte_index_weight),),
+            threshold=spec.threshold,
+            gate=spec.gate,
+            writes=((spec.write_dim, spec.write_value),),
+        ))
+    return rules
+
+
+@dataclass(frozen=True)
+class ConstValueOverrideSpec:
+    """A single authoritative fixed-VALUE OUTPUT override, gated by an AND.
+
+    The distinguishing shape: ONE rule that, under the AND ``conditions`` (plus an
+    optional per-step multiplicative ``gate``), writes an entire fixed byte VALUE
+    onto OUTPUT — the caller supplies the exact ``writes`` tuple (typically
+    ``Primitives.byte_value_writes(value, strength=...)``). This is the
+    ``l16_lev_pc_top_return_0a`` rule: at a genuine top-level LEV the return PC is
+    the bootstrap constant 0x0a, so this makes that value authoritative.
+
+    Attributes:
+        name: the rule name.
+        conditions: the AND ``(dim, weight)`` conditions.
+        threshold: the AND threshold.
+        writes: the fixed value writes (the byte-value one-hot pair, from the
+            caller — kept as DATA so the primitive is value-agnostic).
+        gate: optional multiplicative gate dim (per-step opcode gate); ``None``
+            for a pure-threshold write.
+    """
+
+    name: str
+    conditions: Tuple[Tuple[str, float], ...]
+    threshold: float
+    writes: Tuple[Tuple[str, float], ...]
+    gate: Optional[str] = None
+
+
+def const_value_override(spec: ConstValueOverrideSpec) -> FFNRule:
+    """Derive the single authoritative fixed-value OUTPUT override from ``spec``.
+
+    Reproduces the hand-authored ``multi_way_and_rule`` exactly (same name /
+    conditions / threshold / gate / writes), so the derived form is byte-identical
+    (proof: ``tools/_isa_golden_hash.py`` == ``91f55411``).
+    """
+    return multi_way_and_rule(
+        name=spec.name,
+        conditions=spec.conditions,
+        threshold=spec.threshold,
+        gate=spec.gate,
+        writes=spec.writes,
+    )
