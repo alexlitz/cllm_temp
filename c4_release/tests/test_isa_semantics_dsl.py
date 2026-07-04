@@ -56,20 +56,26 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     MarkerBroadcastBand,
     MarkerBroadcastBundle,
     MarkerBroadcastSpec,
+    BranchTargetDelta,
     PcMuxBundle,
     PcMuxCancelBand,
     PcMuxEncoder,
     PcMuxSpec,
     PrecursorFlagSpec,
+    RegisterDeltaBundle,
+    RegisterDeltaSpec,
+    SequentialAddDelta,
     ValueRouteBundle,
     ValueRouteChannel,
     ValueRouteSpec,
     cam_lookup,
     consumer_lookahead_gate,
     cross_step_carry,
+    frame_step,
     full_width_byte_emission,
     marker_broadcast,
     pc_mux,
+    register_delta,
     value_route,
     _expand_head_writes,
     _make_position_resolver,
@@ -2105,3 +2111,133 @@ def test_pc_mux_reexpresses_all_six_l6_overrides_byte_identical():
         h = [_rule_key(r) for r in reference[name]]
         n = [_rule_key(r) for r in derived[name]]
         assert h == n, f"{name}: derived pc_mux rules differ from hand reference"
+
+
+# ===========================================================================
+# register_delta / frame_step — the CONTROL per-step register-update generator.
+# These assert the derived rules re-express the hand-authored L3 sequential
+# PC+8 adder + the model_ops JSR PC override byte-for-byte; the decisive
+# whole-model gate is ``_isa_golden_hash.py`` == 91f55411 held by the flip.
+# ===========================================================================
+
+
+def _seq_pc_spec():
+    return RegisterDeltaSpec(
+        name="l3_seq_pc",
+        kind="sequential_add",
+        write_scale=2.0 / 100.0,
+        sequential_add=SequentialAddDelta(
+            amount=INSTR_WIDTH, const_value=PC_OFFSET + INSTR_WIDTH,
+        ),
+    )
+
+
+def test_register_delta_returns_bundle():
+    bundle = register_delta(
+        _seq_pc_spec(), instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET)
+    assert isinstance(bundle, RegisterDeltaBundle)
+    # SEQUENTIAL_ADD reads the old-value EMBED bands + the gate; writes the new
+    # OUTPUT bands (and re-writes the EMBED source for the first-step default).
+    assert "EMBED_LO" in bundle.reads and "MARK_PC" in bundle.reads
+    assert "OUTPUT_LO" in bundle.writes and "OUTPUT_HI" in bundle.writes
+    # sub_builders expose the two non-contiguous L3 bands.
+    assert set(bundle.sub_builders) == {"default", "adder"}
+
+
+def test_register_delta_seq_add_band_shapes():
+    bundle = register_delta(
+        _seq_pc_spec(), instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET)
+    default = bundle.sub_builders["default"]()
+    adder = bundle.sub_builders["adder"]()
+    # 4 first-step default units (LO/HI set + undo); 48 adder units (incr
+    # lo/hi + carry). Together == the whole 52-unit sequential PC+8 band.
+    assert len(default) == 4
+    assert len(adder) == 48
+    whole = list(bundle.rules_builder())
+    assert len(whole) == 52
+    assert [_rule_key(r) for r in whole] == [
+        _rule_key(r) for r in list(default) + list(adder)
+    ]
+
+
+def test_register_delta_reexpresses_l3_seq_pc_byte_identical():
+    """The derived SEQUENTIAL_ADD rules re-express the hand-authored L3
+    sequential PC+8 bands (first-step default + increment + carry) cell-for-cell
+    (name-agnostic multiset)."""
+    from collections import Counter
+
+    from c4_release.neural_vm.unified_compiler.ops import l3_ops
+
+    hand_all = list(l3_ops._register_default_ffn_rules(100.0))
+    # The derived L3 op names them ``layer3_ffn.pc_*``; match the
+    # sequential-adder subset by the shared band-role tokens.
+    band_tokens = ("first_step_default", "increment_lo", "increment_hi",
+                   "carry_correction")
+    hand_seq = [r for r in hand_all
+                if any(t in r.name for t in band_tokens) and "pc" in r.name]
+    derived = list(register_delta(
+        _seq_pc_spec(), instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET,
+    ).rules_builder())
+    assert len(hand_seq) == 52, f"expected 52 seq-PC units, got {len(hand_seq)}"
+    assert Counter(_rule_key(r) for r in derived) == Counter(
+        _rule_key(r) for r in hand_seq
+    ), "derived SEQUENTIAL_ADD rules differ from hand L3 seq PC+8"
+
+
+def test_register_delta_reexpresses_jsr_pc_override_byte_identical():
+    """The derived BRANCH_TARGET rules re-express the model_ops JSR PC override
+    (cancel + idx_to_pc encoder + reserved band) cell-for-cell, flag-OFF."""
+    from collections import Counter
+
+    from c4_release.neural_vm.unified_compiler.ops import model_ops
+
+    conditions = model_ops._function_call_jsr_pc_override_conditions()
+    derived = list(register_delta(
+        RegisterDeltaSpec(
+            name="jsr_pc", kind="branch_target", write_scale=2.0 / 100.0,
+            conditions=conditions, threshold=4.0,
+            branch_target=BranchTargetDelta(),
+        ),
+        instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET,
+    ).rules_builder())
+    # Compare against the flag-OFF hand override (the golden byte-0 path).
+    import os
+    prev = os.environ.get("C4_JSR_PC_BYTE1")
+    os.environ["C4_JSR_PC_BYTE1"] = "0"
+    try:
+        hand = list(model_ops._function_call_jsr_pc_override_rules(100.0))
+    finally:
+        if prev is None:
+            os.environ.pop("C4_JSR_PC_BYTE1", None)
+        else:
+            os.environ["C4_JSR_PC_BYTE1"] = prev
+    assert len(derived) == 80
+    assert Counter(_rule_key(r) for r in derived) == Counter(
+        _rule_key(r) for r in hand
+    ), "derived BRANCH_TARGET rules differ from hand JSR PC override"
+
+
+def test_frame_step_orders_deltas():
+    """frame_step concatenates its deltas in declaration order (the generic
+    'apply these register deltas this step')."""
+    a = RegisterDeltaSpec(
+        name="pc_a", kind="branch_target", write_scale=2.0 / 100.0,
+        conditions=(("MARK_PC", 1.0),), threshold=1.0,
+        branch_target=BranchTargetDelta(),
+    )
+    b = _seq_pc_spec()
+    bundle = frame_step((a, b), instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET)
+    rules = list(bundle.rules_builder())
+    # 80 (branch_target) + 52 (sequential_add) in order.
+    assert len(rules) == 80 + 52
+    # A multi-delta frame_step does NOT expose per-band sub_builders.
+    assert bundle.sub_builders == {}
+
+
+def test_register_delta_spec_validates_kind():
+    with pytest.raises(ValueError):
+        RegisterDeltaSpec(name="x", kind="bogus", write_scale=0.02)
+    with pytest.raises(ValueError):
+        RegisterDeltaSpec(name="x", kind="sequential_add", write_scale=0.02)
+    with pytest.raises(ValueError):
+        RegisterDeltaSpec(name="x", kind="branch_target", write_scale=0.02)
