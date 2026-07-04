@@ -2978,3 +2978,256 @@ def test_runtime_add_reads_writes_cover_operand_bands():
     assert "FETCH_HI" in bundle.reads  # the LIVE operand amount source
     assert "MARK_SE_ONLY" in bundle.reads
     assert "OUTPUT_HI_THIS_STEP" in bundle.writes
+
+
+def _l15_head_sig_sets(spec):
+    """Q/K/V/O tuple SETS of a ``DeclarativeAttentionHeadSpec`` (order-free,
+    the lowerer applies indexed assignment so only the final cell set matters)."""
+    return (
+        frozenset((w.slot, w.dim, round(w.weight, 9)) for w in spec.q),
+        frozenset((w.slot, w.dim, round(w.weight, 9)) for w in spec.k),
+        frozenset((w.slot, w.dim, round(w.weight, 9)) for w in spec.v),
+        frozenset((w.out_dim, w.slot, round(w.weight, 9)) for w in spec.o),
+    )
+
+
+def test_l15_attention_heads_12_16_derived_are_byte_identical_to_handbuilt():
+    """DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): the five L15
+    hand-authored attention heads 12-16 re-expressed through the shared DSL
+    primitives (``scalar_relay`` + ``NibbleRelay`` for the store-address relay
+    heads 12/13; ``cam_binary_address_match`` for the LEV/savedra/SI-store CAM
+    heads 14/15/16) match a fresh hand-reconstruction of the DELETED direct
+    ``AP``/``AO`` build, cell-for-cell, across the head-14 address-widening flag
+    matrix. This is the byte-identity proof behind the golden-hash-neutral flip.
+
+    Uses the BUILT layout ``dim_positions`` (the blessed resolution path — the
+    over-width ``LOOKAHEAD_PC_*`` band head 15 reads is not in the static
+    registry). The head-14/15/16 shape flags are forced ON so the heads exist.
+    """
+    os.environ["C4_L15_LEV_PC_RESTORE"] = "1"
+    os.environ["C4_L15_SAVEDRA_HEAD"] = "1"
+    os.environ["C4_SI_STORE_ADDR"] = "1"
+
+    from c4_release.neural_vm.unified_compiler.full_vm_compiler_dynamic import (
+        compile_full_vm_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.shared import _as_setdim_proxy
+    from c4_release.neural_vm.unified_compiler.ops import l15_ops as L
+    from c4_release.neural_vm.unified_compiler.primitives import AO, AP
+
+    _, layout = compile_full_vm_dynamic(disk_cache=False)
+    BD = _as_setdim_proxy(layout.dim_positions)
+
+    # --- Hand-reconstruction of the DELETED direct AP/AO directives. ---
+    def hand12():
+        q = (AP(0, BD.MARK_STACK0, 300.0), AP(0, BD.HAS_SE, 300.0),
+             AP(33, BD.MEM_STORE, 10000.0), AP(33, BD.CONST, -50000.0))
+        k = (AP(0, BD.MARK_SP, 100.0), AP(33, BD.CONST, 1.0))
+        v = [AP(0, BD.CONST, 1.0)]
+        o = []
+        for idx in range(16):
+            v.append(AP(1 + idx, BD.OUTPUT_LO + idx, 1.0))
+            v.append(AP(17 + idx, BD.OUTPUT_HI + idx, 1.0))
+            o.append(AO(BD.ADDR_B0_LO + idx, 0, -2.0))
+            o.append(AO(BD.ADDR_B0_HI + idx, 0, -2.0))
+            o.append(AO(BD.ADDR_B0_LO + idx, 1 + idx, 3.0))
+            o.append(AO(BD.ADDR_B0_HI + idx, 17 + idx, 3.0))
+        return q, k, tuple(v), tuple(o)
+
+    def hand13():
+        q = (AP(0, BD.MARK_MEM, 100.0), AP(0, BD.MEM_STORE, 20.0),
+             AP(0, BD.MEM_ADDR_SRC, 50.0), AP(0, BD.CONST, -140.0),
+             AP(33, BD.MARK_MEM, 40000.0), AP(33, BD.MEM_STORE, 5000.0),
+             AP(33, BD.MEM_ADDR_SRC, 10000.0), AP(33, BD.CONST, -55000.0),
+             AP(37, BD.IS_BYTE, 50000.0))
+        k = (AP(0, BD.STACK0_BYTE0, 100.0), AP(0, BD.MEM_STORE, -400.0),
+             AP(33, BD.CONST, 5.0), AP(37, BD.CONST, -20.0))
+        v = [AP(0, BD.CONST, 1.0)]
+        o = []
+        for idx in range(16):
+            v.append(AP(1 + idx, BD.CLEAN_EMBED_LO + idx, 1.0))
+            v.append(AP(17 + idx, BD.CLEAN_EMBED_HI + idx, 1.0))
+            o.append(AO(BD.OUTPUT_LO + idx, 0, -10.0))
+            o.append(AO(BD.OUTPUT_HI + idx, 0, -10.0))
+            o.append(AO(BD.OUTPUT_LO + idx, 1 + idx, 20.0))
+            o.append(AO(BD.OUTPUT_HI + idx, 17 + idx, 20.0))
+        return q, k, tuple(v), tuple(o)
+
+    def hand14():
+        PC_I, AX_I, SP_I, BP_I, MEM_I = 0, 1, 2, 3, 4
+        _widen = L._l15_lev_addr_widen_on()
+        q, k = [], []
+        q += [AP(0, BD.CONST, -2000.0), AP(0, BD.OP_LEV, 2000.0),
+              AP(0, BD.MARK_PC, 2000.0), AP(0, BD.MARK_AX, -25000.0),
+              AP(0, BD.MARK_SP, -100000.0), AP(0, BD.MARK_BP, -100000.0),
+              AP(0, BD.H1 + SP_I, -50000.0), AP(0, BD.H1 + BP_I, -50000.0)]
+        k.append(AP(0, BD.CONST, 10.0))
+        q.append(AP(29, BD.H1 + PC_I, -20000.0)); k.append(AP(29, BD.CONST, 5.0))
+        q.append(AP(30, BD.H1 + AX_I, -20000.0)); k.append(AP(30, BD.CONST, 5.0))
+        suppress = 2000.0 if _widen else 200.0
+        q.append(AP(31, BD.CONST, suppress))
+        k += [AP(31, BD.MARK_PC, -suppress), AP(31, BD.MARK_AX, -suppress),
+              AP(31, BD.MARK_SP, -suppress), AP(31, BD.MARK_BP, -suppress),
+              AP(31, BD.H1 + PC_I, -suppress)]
+        if _widen:
+            dark = 5000.0
+            q += [AP(66, BD.OP_LEV, 1.0), AP(66, BD.MARK_PC, 1.0),
+                  AP(66, BD.CONST, -1.5)]
+            k.append(AP(66, BD.MEM_STORE, dark))
+        if _widen and L._l15_lev_pc_only_on():
+            HARD = 5_000_000.0
+            q += [AP(67, BD.CONST, HARD), AP(67, BD.MARK_PC, -HARD)]
+            k.append(AP(67, BD.CONST, -1.0))
+            q += [AP(69, BD.CONST, HARD), AP(69, BD.OP_LEV, -HARD / 4.0)]
+            k.append(AP(69, BD.CONST, -1.0))
+        if _widen and L._l15_lev_opcode_gate_on():
+            HARD = 5_000_000.0
+            q += [AP(70, BD.CONST, HARD), AP(70, BD.OPCODE_BYTE_LO + 8, -HARD)]
+            k.append(AP(70, BD.CONST, -1.0))
+        JSR_DISC = float(L._l15_lev_jsr_disc_strength())
+        if _widen and JSR_DISC > 0.0:
+            q += [AP(64, BD.OP_LEV, 1.0), AP(64, BD.MARK_PC, 1.0),
+                  AP(64, BD.CONST, -1.0)]
+            k += [AP(64, BD.OP_JSR, JSR_DISC), AP(64, BD.OP_ENT, -JSR_DISC)]
+        if _widen and JSR_DISC > 0.0:
+            BSEL = float(L._l15_lev_byte0_select_strength())
+            q += [AP(65, BD.OP_LEV, 1.0), AP(65, BD.MARK_PC, 1.0),
+                  AP(65, BD.CONST, -1.0)]
+            k += [AP(65, BD.BYTE_INDEX_0, BSEL), AP(65, BD.BYTE_INDEX_1, -BSEL),
+                  AP(65, BD.BYTE_INDEX_2, -BSEL), AP(65, BD.BYTE_INDEX_3, -BSEL)]
+        if _widen and L._l15_lev_pc_only_on():
+            STK0_SEL = 40000.0
+            q += [AP(68, BD.OP_LEV, 1.0), AP(68, BD.MARK_PC, 1.0),
+                  AP(68, BD.CONST, -1.0)]
+            k.append(AP(68, BD.STACK0_BYTE0, STK0_SEL))
+        q += [AP(1, BD.OP_LEV, 50.0), AP(1, BD.MARK_PC, 50.0)]
+        k += [AP(1, BD.MEM_STORE, 100.0), AP(1, BD.CONST, -50.0)]
+        q.append(AP(2, BD.CONST, -96.0)); k.append(AP(2, BD.MEM_STORE, 50.0))
+        BS = 60.0
+        q += [AP(3, BD.MARK_STACK0, BS), AP(3, BD.BYTE_INDEX_0, BS)]
+        k += [AP(3, BD.L2H0 + MEM_I, BS), AP(3, BD.H1 + MEM_I, -BS)]
+        q += [AP(28, BD.CONST, -500.0), AP(28, BD.OP_LEV, 500.0),
+              AP(28, BD.MARK_PC, 500.0)]
+        k.append(AP(28, BD.CONST, 5.0))
+        scale = 10.0
+        b0_scale = scale * (L._l15_lev_b0_boost_factor() if _widen else 1.0)
+        addr_dim = 4
+        addr_bases = [(BD.ADDR_B0_LO, BD.ADDR_B0_HI, b0_scale),
+                      (BD.ADDR_B1_LO, BD.ADDR_B1_HI, scale),
+                      (BD.ADDR_B2_LO, BD.ADDR_B2_HI, scale)]
+        for ab_lo, ab_hi, byte_scale in addr_bases:
+            for nibble_base in (ab_lo, ab_hi):
+                for bit in range(4):
+                    for nk in range(16):
+                        bv = 2 * ((nk >> bit) & 1) - 1
+                        q.append(AP(addr_dim, nibble_base + nk, byte_scale * bv))
+                        k.append(AP(addr_dim, nibble_base + nk, byte_scale * bv))
+                    addr_dim += 1
+        value_scale = 40.0 if _widen else 1.0
+        v, o = [], []
+        for kk in range(16):
+            v.append(AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
+            v.append(AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
+            o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
+            o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
+        return tuple(q), tuple(k), tuple(v), tuple(o)
+
+    def hand15():
+        q, k = [], []
+        q += [AP(0, BD.CONST, -3.0), AP(0, BD.OP_LEV, 1.0), AP(0, BD.MARK_PC, 1.0),
+              AP(0, BD.MARK_AX, -1000.0), AP(0, BD.MARK_SP, -1000.0),
+              AP(0, BD.MARK_BP, -1000.0), AP(0, BD.MARK_STACK0, -1000.0),
+              AP(0, BD.MARK_MEM, -1000.0), AP(0, BD.IS_BYTE, -1000.0)]
+        k.append(AP(0, BD.CONST, 30.0))
+        SEL = 40.0
+        q += [AP(1, BD.OP_LEV, 1.0), AP(1, BD.MARK_PC, 1.0), AP(1, BD.CONST, -2.0)]
+        k += [AP(1, BD.OP_JSR, SEL), AP(1, BD.MARK_AX, 0.5 * SEL),
+              AP(1, BD.CONST, -0.7 * SEL)]
+        REJ = 200.0
+        q += [AP(2, BD.OP_LEV, 1.0), AP(2, BD.MARK_PC, 1.0), AP(2, BD.CONST, -2.0)]
+        k += [AP(2, BD.CONST, -REJ), AP(2, BD.MARK_AX, REJ)]
+        GATE = 1_000_000.0
+        q += [AP(3, BD.CONST, GATE), AP(3, BD.OPCODE_BYTE_LO + 8, -GATE)]
+        k.append(AP(3, BD.CONST, -1.0))
+        value_scale = 80.0
+        v, o = [], []
+        for kk in range(16):
+            v.append(AP(32 + kk, BD.LOOKAHEAD_PC_LO + kk, 1.0))
+            v.append(AP(48 + kk, BD.LOOKAHEAD_PC_HI + kk, 1.0))
+            o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
+            o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
+        return tuple(q), tuple(k), tuple(v), tuple(o)
+
+    def hand16():
+        _cam_s, _sink, _psh_rej, value_scale = 360.0, 30.0, 400.0, 60.0
+        _dark, _ax_req = 10_000_000.0, 2000.0
+        q, k = [], []
+        q.append(AP(0, BD.OP_LI, 1.0)); k.append(AP(0, BD.CONST, _sink))
+        q += [AP(59, BD.MARK_AX, _dark), AP(59, BD.CONST, -_dark)]
+        k.append(AP(59, BD.CONST, 1.0))
+        q += [AP(57, BD.OP_LI, _dark), AP(57, BD.CONST, -2.5 * _dark)]
+        k.append(AP(57, BD.CONST, 1.0))
+        for _kk in range(0, 16):
+            _row = _kk if _kk >= 1 else 16
+            q.append(AP(_row, BD.AX_CARRY_LO + _kk, _cam_s))
+            k.append(AP(_row, BD.ADDR_B0_LO + _kk, _cam_s))
+        for _kk in range(0, 16):
+            _row = (16 + _kk) if _kk >= 1 else 58
+            q.append(AP(_row, BD.AX_CARRY_HI + _kk, _cam_s))
+            k.append(AP(_row, BD.ADDR_B0_HI + _kk, _cam_s))
+        q += [AP(62, BD.OP_LI, _psh_rej), AP(62, BD.CONST, -0.05 * _psh_rej)]
+        k.append(AP(62, BD.OP_PSH, -_psh_rej))
+        q += [AP(61, BD.OP_LI, _psh_rej), AP(61, BD.CONST, -0.05 * _psh_rej)]
+        k.append(AP(61, BD.OP_LI, -_psh_rej))
+        q += [AP(60, BD.OP_LI, 2.0 * _cam_s), AP(60, BD.CONST, -0.05 * 2.0 * _cam_s)]
+        k += [AP(60, BD.MARK_AX, _ax_req), AP(60, BD.CONST, -_ax_req)]
+        v, o = [], []
+        for kk in range(16):
+            v.append(AP(32 + kk, BD.AX_CARRY_LO + kk, 1.0))
+            v.append(AP(48 + kk, BD.AX_CARRY_HI + kk, 1.0))
+            o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
+            o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
+        return tuple(q), tuple(k), tuple(v), tuple(o)
+
+    def hand_sets(qkvo):
+        q, k, v, o = qkvo
+        return (
+            frozenset((w.slot, w.dim, round(w.weight, 9)) for w in q),
+            frozenset((w.slot, w.dim, round(w.weight, 9)) for w in k),
+            frozenset((w.slot, w.dim, round(w.weight, 9)) for w in v),
+            frozenset((w.out_dim, w.slot, round(w.weight, 9)) for w in o),
+        )
+
+    cases = [
+        ("head12", L._layer15_store_stack0_sp_byte0_addr_spec, hand12),
+        ("head13", L._layer15_si_mem_addr0_from_stack0_spec, hand13),
+        ("head14", L._layer15_lev_pc_restore_head_spec, hand14),
+        ("head15", L._layer15_savedra_pc_head_spec, hand15),
+        ("head16", L._layer15_si_store_addr_cam_head_spec, hand16),
+    ]
+
+    # Exercise the head-14 address-widening flag matrix (the other heads are
+    # flag-invariant in shape).
+    import itertools
+    flags14 = ["C4_L15_LEV_ADDR_WIDEN", "C4_L15_LEV_PC_ONLY",
+               "C4_L15_LEV_OPCODE_GATE"]
+    saved = {f: os.environ.get(f) for f in (*flags14, "C4_L15_LEV_JSR_DISC")}
+    try:
+        for combo in itertools.product(["0", "1"], repeat=len(flags14)):
+            for f, val in zip(flags14, combo):
+                os.environ[f] = val
+            for jsr in ("0", "100"):
+                os.environ["C4_L15_LEV_JSR_DISC"] = jsr
+                for name, derived_fn, hand_fn in cases:
+                    derived = _l15_head_sig_sets(derived_fn(BD))
+                    reference = hand_sets(hand_fn())
+                    assert derived == reference, (
+                        f"{name} derived != hand-reconstruction at "
+                        f"widen-combo={combo} jsr={jsr}"
+                    )
+    finally:
+        for f, val in saved.items():
+            if val is None:
+                os.environ.pop(f, None)
+            else:
+                os.environ[f] = val
