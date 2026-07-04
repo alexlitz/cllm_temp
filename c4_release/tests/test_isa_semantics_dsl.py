@@ -43,6 +43,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     CamKeyMatch,
     CamLookupBundle,
     CamLookupSpec,
+    CamValidSlot,
     CamValueBand,
     ConsumerLookaheadGateBundle,
     ConsumerLookaheadGateSpec,
@@ -1291,6 +1292,174 @@ def test_cam_lookup_reexpresses_l7_operand_gather_head0():
         [(w.slot, w.dim, w.weight) for w in legacy.v]
     assert [(w.out_dim, w.slot, w.weight) for w in gen.o] == \
         [(w.out_dim, w.slot, w.weight) for w in legacy.o]
+
+
+# ===========================================================================
+# cam_lookup MEMORY-family extensions (G1(a) multi-dim comparator, G1(b)
+# direction, VALID lifecycle, +offset marker-relative signature) + the L13
+# mem_addr_gather DERIVE->PROVE->FLIP->DELETE byte-identity proof.
+# ===========================================================================
+
+
+def test_cam_key_match_multi_dim_signature_on_one_slot():
+    """query_extra / key_extra span MULTIPLE dims on the SAME query slot — the
+    G1(a) multi-nibble comparator. All extra Q/K writes land on query_slot so
+    the row select stays ONE structural signature."""
+    dp = {"MARK_AX": 5, "A1": 6, "A2": 7, "K0": 9, "K1": 10, "K2": 11,
+          "CONST": 0, "SRC": 100, "TGT": 200}
+    spec = CamLookupSpec(
+        name="multidim",
+        key_match=CamKeyMatch(
+            query_dim="MARK_AX", key_dim="K0", weight=15.0, query_slot=0,
+            query_extra=(("A1", 15.0), ("A2", 15.0)),
+            key_extra=(("K1", -15.0), ("K2", 15.0)),
+        ),
+        value_bands=(CamValueBand("SRC", "TGT", 4, 1, 1.0),),
+    )
+    head = cam_lookup(spec).head_spec_builder(dp, 0)
+    # Every Q/K signature write is on slot 0 (one match slot).
+    assert all(w.slot == 0 for w in head.q)
+    assert all(w.slot == 0 for w in head.k)
+    assert {(w.dim, w.weight) for w in head.q} == {
+        (5, 15.0), (6, 15.0), (7, 15.0)}
+    assert {(w.dim, w.weight) for w in head.k} == {
+        (9, 15.0), (10, -15.0), (11, 15.0)}
+
+
+def test_cam_lookup_resolves_offset_signature_dims():
+    """A ``BASE+offset`` signature token (the L13 marker-relative addr-byte
+    comparator, e.g. ``L1H1+4``) resolves to ``dim_positions[BASE]+offset`` —
+    plain names are unchanged (byte-identical to the L7 single-dim head)."""
+    dp = {"MARK_AX": 5, "L1H1": 123, "L1H0": 116, "CONST": 0,
+          "SRC": 100, "TGT": 200}
+    spec = CamLookupSpec(
+        name="offset",
+        key_match=CamKeyMatch(
+            query_dim="MARK_AX", key_dim="L1H1+4", weight=15.0,
+            key_extra=(("L1H0+4", -15.0),),
+        ),
+        value_bands=(CamValueBand("SRC", "TGT", 4, 1, 1.0),),
+    )
+    head = cam_lookup(spec).head_spec_builder(dp, 0)
+    key = {(w.dim, w.weight) for w in head.k}
+    assert (127, 15.0) in key      # L1H1(123) + 4
+    assert (120, -15.0) in key     # L1H0(116) + 4
+    # The dep graph tracks the BASE band names (offset is a within-bank cell).
+    reads = cam_lookup(spec).head_reads
+    assert "L1H1" in reads and "L1H0" in reads
+    assert not any("+" in r for r in reads)
+
+
+def test_cam_valid_slot_stamps_row_found_bit():
+    """The VALID-lifecycle slot re-declares the key-match signature on its own
+    slot and copies a single 1.0 'row found' bit from the matched row into the
+    VALID band (the G1 CAM lifecycle datum)."""
+    dp = {"MARK_AX": 5, "K0": 9, "K1": 10, "CONST": 0, "SRC": 100, "TGT": 200,
+          "VALID": 300}
+    spec = CamLookupSpec(
+        name="valid",
+        key_match=CamKeyMatch(
+            query_dim="MARK_AX", key_dim="K0", weight=15.0,
+            key_extra=(("K1", -15.0),),
+        ),
+        value_bands=(CamValueBand("SRC", "TGT", 4, 1, 1.0),),
+        valid_slots=(CamValidSlot(slot=34, valid_read_dim="K0",
+                                  valid_write_dim="VALID", o_scale=1.0),),
+    )
+    head = cam_lookup(spec).head_spec_builder(dp, 0)
+    # Slot 34 re-declares the fire dim + key signature (independent row select).
+    assert (34, 5, 15.0) in {(w.slot, w.dim, w.weight) for w in head.q}
+    slot34_k = {(w.dim, w.weight) for w in head.k if w.slot == 34}
+    assert slot34_k == {(9, 15.0), (10, -15.0)}
+    # One V/O pair copies the 1.0 VALID bit into the VALID band.
+    assert (34, 9, 1.0) in {(w.slot, w.dim, w.weight) for w in head.v}
+    assert (300, 34, 1.0) in {(w.out_dim, w.slot, w.weight) for w in head.o}
+    assert "VALID" in cam_lookup(spec).head_writes
+
+
+def test_cam_lookup_direction_load_is_default_store_needs_value():
+    """direction records the CAM data-flow (G1(b)): 'load' (default) reads by
+    address; 'store' is the emit direction and must relay its value bands."""
+    assert _operand_gather_cam_spec().direction == "load"
+    with pytest.raises(ValueError, match="direction must be"):
+        _operand_gather_cam_spec(direction="bogus")
+    with pytest.raises(ValueError, match="must relay its emit value"):
+        _operand_gather_cam_spec(direction="store", value_active=False)
+    # A store spec that relays its value bands is accepted (the semantic tag).
+    assert _operand_gather_cam_spec(direction="store").direction == "store"
+
+
+def test_l13_mem_addr_gather_derived_is_byte_identical_to_handbuilt():
+    """DERIVE->PROVE->FLIP->DELETE: the three L13 mem_addr_gather heads produced
+    by ``cam_lookup`` (the sole live path) match a fresh hand-reconstruction of
+    the DELETED legacy Q/K/V/O writes, byte-for-byte. This is the byte-identity
+    proof behind the golden-hash-neutral flip."""
+    from c4_release.neural_vm.dim_registry_dynamic import (
+        build_default_registry_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.shared import (
+        _as_setdim_proxy,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.l13_ops import (
+        _layer13_mem_addr_gather_head_specs,
+        _l13_addr_bn_valid_positions,
+    )
+    from c4_release.neural_vm.unified_compiler.primitives import (
+        AO, AP, DeclarativeAttentionHeadSpec,
+    )
+
+    reg = build_default_registry_dynamic()
+    dp = {name: int(slot.start) for name, slot in reg.slots.items()}
+    proxy = _as_setdim_proxy(dp)
+    b1v, b2v = _l13_addr_bn_valid_positions(proxy)
+
+    L = 15.0
+    MEM_I = 4
+    VALID_SLOT = 34
+    # The legacy hand-authored per-head layout (verbatim from the pre-flip code).
+    layout = (
+        (0, dp["ADDR_B0_LO"], dp["ADDR_B0_HI"],
+         dp["L1H1"] + MEM_I, dp["L1H0"] + MEM_I,
+         dp["L1H1"] + MEM_I, dp["ADDR_B0_VALID"]),
+        (1, dp["ADDR_B1_LO"], dp["ADDR_B1_HI"],
+         dp["L1H2"] + MEM_I, dp["L1H1"] + MEM_I,
+         dp["L1H2"] + MEM_I, int(b1v)),
+        (2, dp["ADDR_B2_LO"], dp["ADDR_B2_HI"],
+         dp["H0"] + MEM_I, dp["L1H2"] + MEM_I,
+         dp["H0"] + MEM_I, int(b2v)),
+    )
+
+    def _canon(spec):
+        return (
+            sorted((w.slot, w.dim, w.weight) for w in spec.q),
+            sorted((w.slot, w.dim, w.weight) for w in spec.k),
+            sorted((w.slot, w.dim, w.weight) for w in spec.v),
+            sorted((w.out_dim, w.slot, w.weight) for w in spec.o),
+        )
+
+    derived = _layer13_mem_addr_gather_head_specs(proxy)
+    for i, (head_idx, addr_lo, addr_hi, k_pos, k_neg,
+            valid_v_read, valid_o_dest) in enumerate(layout):
+        q = [AP(0, dp["MEM_VAL_B0"], L), AP(0, dp["MEM_VAL_B1"], L),
+             AP(0, dp["MEM_VAL_B2"], L), AP(0, dp["MEM_VAL_B3"], L),
+             AP(33, dp["MEM_VAL_B0"], L), AP(33, dp["CONST"], -L / 2),
+             AP(VALID_SLOT, dp["MEM_VAL_B0"], L),
+             AP(VALID_SLOT, dp["MEM_VAL_B1"], L),
+             AP(VALID_SLOT, dp["MEM_VAL_B2"], L),
+             AP(VALID_SLOT, dp["MEM_VAL_B3"], L)]
+        k = [AP(0, k_pos, L), AP(0, k_neg, -L), AP(33, dp["CONST"], L),
+             AP(VALID_SLOT, k_pos, L), AP(VALID_SLOT, k_neg, -L)]
+        v = [AP(1 + kk, dp["CLEAN_EMBED_LO"] + kk, 1.0) for kk in range(16)]
+        v += [AP(17 + kk, dp["CLEAN_EMBED_HI"] + kk, 1.0) for kk in range(16)]
+        v.append(AP(VALID_SLOT, valid_v_read, 1.0))
+        o = [AO(addr_lo + kk, 1 + kk, 1.0) for kk in range(16)]
+        o += [AO(addr_hi + kk, 17 + kk, 1.0) for kk in range(16)]
+        o.append(AO(valid_o_dest, VALID_SLOT, 1.0))
+        legacy = DeclarativeAttentionHeadSpec(
+            head_idx=head_idx, q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o))
+        assert _canon(derived[i]) == _canon(legacy), (
+            f"L13 mem_addr_gather head {i} derived != legacy")
+        assert derived[i].head_idx == head_idx
 
 
 # ===========================================================================

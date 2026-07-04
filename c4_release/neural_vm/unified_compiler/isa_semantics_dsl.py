@@ -1907,21 +1907,50 @@ class CamKeyMatch:
     weight)`` on K. Expressing the match as a single declared pair — rather
     than free Q/K writes — is what makes the "attend to the row whose signature
     matches" semantics a structural contract: a CAM head has EXACTLY one key
-    match.
+    match slot.
+
+    **Multi-nibble / multi-dim signature (G1(a) extension).** The L7
+    operand-gather head is a SINGLE-DIM match (one query dim, one key dim). The
+    MEMORY family heads that gate on a WIDER address signature — the L13
+    ``mem_addr_gather`` addr-byte-J marker signature (``+L1H{n}[MEM]`` AND
+    ``-L1H{n-1}[MEM]``, a two-dim positive/negative row signature) and the L15
+    LI/LC load head's 24-bit binary address comparator (3 addr bytes × 2 nibbles
+    × 4 bits, each a ``±scale`` per-nibble bit-encoding) — need the match to
+    span MULTIPLE dims on the SAME query slot. :attr:`query_extra` /
+    :attr:`key_extra` carry those extra ``(dim, weight)`` pairs so the row
+    select stays ONE structural signature (still exactly one match SLOT), not a
+    free Q/K field. A single-dim match leaves both empty (byte-identical to the
+    L7 head). The 24-bit comparator is the degenerate case where the SAME dim
+    list appears on both Q and K with matching ``±scale`` per-nibble weights
+    (the bit-encoding makes the score peak on the row whose nibbles equal the
+    queried address); express it by supplying the identical
+    ``query_extra == key_extra`` tuple.
 
     Attributes:
         query_dim: the QUERY-MARKER residual dim (the row the head fires on;
-            L7: ``MARK_AX``).
+            L7: ``MARK_AX``; L13 head 0: ``MEM_VAL_B0``).
         key_dim: the KEY-SIGNATURE residual dim the matched K row must carry
-            (the content address; L7: ``STACK0_BYTE0``).
-        weight: the shared Q/K projection weight (L7: ``15.0``).
-        query_slot: head-local slot the match lands on (L7: ``0``).
+            (the content address; L7: ``STACK0_BYTE0``; L13 head 0:
+            ``L1H1[MEM]`` at ``+weight``).
+        weight: the shared Q/K projection weight for the primary pair (L7/L13:
+            ``15.0``).
+        query_slot: head-local slot the match lands on (L7/L13: ``0``).
+        query_extra: additional ``(dim, weight)`` Q writes on the SAME
+            ``query_slot`` (the multi-dim query signature — L13 head 0's
+            ``MEM_VAL_B1/B2/B3`` fire dims; L15's 24-bit address Q block).
+            Empty => single-dim query (L7).
+        key_extra: additional ``(dim, weight)`` K writes on the SAME
+            ``query_slot`` (the multi-dim key signature — L13 head 0's
+            ``-L1H0[MEM]`` negative reject; L15's 24-bit address K block).
+            Empty => single-dim key (L7).
     """
 
     query_dim: str
     key_dim: str
     weight: float
     query_slot: int = 0
+    query_extra: Tuple[Tuple[str, float], ...] = ()
+    key_extra: Tuple[Tuple[str, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1953,6 +1982,43 @@ class CamConfirmSlot:
     const_k_weight: float
     blockers: Tuple[Tuple[str, float], ...] = ()
     marker_dim: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CamValidSlot:
+    """The VALID-lifecycle bit slot (the addressed-load's "row found" flag).
+
+    The L13 ``mem_addr_gather`` heads carry a THIRD gate slot (slot 34) that
+    MIRRORS the key-match's fire + signature (so it selects the same row) and
+    relays a SINGLE ``1.0`` VALID bit: V reads a ``valid_read_dim`` on the
+    matched row (a dim guaranteed present on the addr-byte-J row and absent
+    elsewhere, so the softmax-weighted V is ``1.0`` on a hit and ``0`` on a
+    miss) and O writes it into ``valid_write_dim`` (``ADDR_BJ_VALID``). This is
+    the CAM lifecycle datum G1 names: "did the address gather find its row".
+
+    Structurally the slot re-declares the SAME query/key signature as the
+    :class:`CamKeyMatch` (fire dims on Q at ``+weight``, the key signature on K)
+    on its own ``slot`` so the match is independent of the value relay. The
+    single V/O pair copies the VALID bit.
+
+    Attributes:
+        slot: head-local slot the VALID lifecycle lands on (L13: ``34``).
+        valid_read_dim: the dim V reads on the matched row (delivers ``1.0`` on
+            a hit; L13 head 0: ``L1H1[MEM]`` — the same signature dim).
+        valid_write_dim: the VALID band O writes the bit into (L13 head 0:
+            ``ADDR_B0_VALID``).
+        v_slot: the head-local V/O slot for the bit copy (L13: reuses ``slot``).
+        o_scale: O-write magnitude (L13: ``1.0``).
+    """
+
+    slot: int
+    valid_read_dim: str
+    valid_write_dim: str
+    v_slot: Optional[int] = None
+    o_scale: float = 1.0
+
+    def resolved_v_slot(self) -> int:
+        return self.slot if self.v_slot is None else self.v_slot
 
 
 @dataclass(frozen=True)
@@ -2024,6 +2090,21 @@ class CamLookupSpec:
         extra_reads: extra dim names the head's Operation should declare as
             reads beyond the auto-derived set (e.g. a cross-step ``X.*.-1``
             alias the source band is read through).
+        direction: the CAM data-flow DIRECTION (G1(b)). ``"load"`` (default) =
+            read-by-address: attend to the row whose signature matches and RELAY
+            its value into the target band (LI/LC, L7 operand gather, L13 addr
+            gather — every hand-built CAM head today). ``"store"`` = the
+            emit-with-address direction (SI/SC/PSH gather addr+value from the
+            AX/SP frame INTO a MEM token). ``"store"`` is a SEMANTIC-INTENT tag
+            on the same head machinery: the L14 mem-generation emit heads are
+            still hand-built, so ``cam_lookup`` only LOWERS ``"load"`` today; a
+            ``"store"`` spec raises unless :attr:`value_bands` is supplied with
+            the emit routing (reserved for the L14 port). Recording the
+            direction lets a generic engine know a store binds address→value at
+            the marker (G2) vs a load reads it back.
+        valid_slots: the VALID-lifecycle bit slots (:class:`CamValidSlot`) — the
+            "row found" flags an addressed gather relays alongside its value
+            (L13 ``ADDR_BJ_VALID``). Empty => no lifecycle bit (L7).
     """
 
     name: str
@@ -2035,6 +2116,8 @@ class CamLookupSpec:
     const_dim: str = "CONST"
     value_active: bool = True
     extra_reads: Tuple[str, ...] = ()
+    direction: str = "load"
+    valid_slots: Tuple[CamValidSlot, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.value_bands:
@@ -2048,6 +2131,21 @@ class CamLookupSpec:
                     f"CamLookupSpec({self.name!r}): value band "
                     f"{vb.source_band!r}->{vb.target_band!r} width must be "
                     f"positive, got {vb.width}"
+                )
+        if self.direction not in ("load", "store"):
+            raise ValueError(
+                f"CamLookupSpec({self.name!r}): direction must be "
+                f"'load' or 'store', got {self.direction!r}"
+            )
+        if self.direction == "store":
+            # The store/emit lowering (L14 mem-generation) is not yet ported to
+            # cam_lookup; a store spec is accepted as a SEMANTIC tag only when
+            # the caller also supplies the emit value routing. Guard against a
+            # silent no-op store head.
+            if not self.value_active:
+                raise ValueError(
+                    f"CamLookupSpec({self.name!r}): a 'store' direction head "
+                    "must relay its emit value bands (value_active=True)"
                 )
 
 
@@ -2093,13 +2191,32 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
     def head_spec_builder(
         dim_positions: Dict[str, int], head_idx: int
     ) -> DeclarativeAttentionHeadSpec:
+        # Resolve a ``BASE`` or ``BASE+offset`` dim token. The L7 operand-gather
+        # head is single-dim / no-offset (``STACK0_BYTE0``, ``ALU_LO``), so
+        # every token there resolves plainly. The MEMORY-family CAM signatures
+        # address a MARKER-RELATIVE row byte via an OFFSET into a marker bank —
+        # the L13 addr-byte-J key signature is ``L1H1+MEM_I`` / ``-L1H0+MEM_I``
+        # (``MEM_I=4``), and the VALID read taps the same offset dim. Parsing the
+        # ``+offset`` here (via the module-level :func:`_resolve_dim_token`) lets
+        # a ``CamKeyMatch`` express the multi-nibble marker-relative comparator
+        # without contorting the caller into pre-adding the offset — the offset
+        # stays visible in the declared signature. Plain names are unchanged
+        # (byte-identical to the L7 head).
         def _P(name: str) -> int:
-            return int(dim_positions[name])
+            return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
 
         # (1) The content-address row MATCH on the query slot: Q@query_dim,
-        #     K@key_dim — the CAM invariant. ONE pair.
+        #     K@key_dim — the CAM invariant. ONE match SLOT. The primary
+        #     (query_dim, key_dim) pair plus any multi-dim signature extras
+        #     (query_extra/key_extra) — the L13 addr-byte-J +L1H/-L1H signature
+        #     and the L15 24-bit binary address comparator. All land on the SAME
+        #     query_slot so the row select stays one declared signature.
         q: list = [AP(km.query_slot, _P(km.query_dim), km.weight)]
         k: list = [AP(km.query_slot, _P(km.key_dim), km.weight)]
+        for (q_dim, q_w) in km.query_extra:
+            q.append(AP(km.query_slot, _P(q_dim), q_w))
+        for (k_dim, k_w) in km.key_extra:
+            k.append(AP(km.query_slot, _P(k_dim), k_w))
 
         # (2) The opcode-blocker overlay on the SAME query slot (narrow which
         #     marker rows fire — negative weights reject wrong-op rows).
@@ -2134,6 +2251,25 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
                     v.append(AP(vb.v_slot_base + j, src + j, 1.0))
                     o.append(AO(tgt + j, vb.v_slot_base + j, vb.o_scale))
 
+        # (5) The VALID-lifecycle bit slots: each re-declares the key-match
+        #     signature on its own slot (so it selects the same row independently
+        #     of the value relay) and copies a single "row found" 1.0 bit from
+        #     the matched row into the VALID band. Q mirrors the fire dims, K
+        #     mirrors the key signature; V reads the valid_read_dim (present on
+        #     the matched row), O writes valid_write_dim.
+        for vs in spec.valid_slots:
+            slot = vs.slot
+            q.append(AP(slot, _P(km.query_dim), km.weight))
+            for (q_dim, q_w) in km.query_extra:
+                q.append(AP(slot, _P(q_dim), q_w))
+            k.append(AP(slot, _P(km.key_dim), km.weight))
+            for (k_dim, k_w) in km.key_extra:
+                k.append(AP(slot, _P(k_dim), k_w))
+            if spec.value_active:
+                vslot = vs.resolved_v_slot()
+                v.append(AP(vslot, _P(vs.valid_read_dim), 1.0))
+                o.append(AO(_P(vs.valid_write_dim), vslot, vs.o_scale))
+
         return DeclarativeAttentionHeadSpec(
             head_idx=head_idx,
             q=tuple(q),
@@ -2143,20 +2279,35 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
             alibi_slope=spec.alibi_slope,
         )
 
-    # Operation dep-graph dim sets (structural derivation).
-    head_reads: Set[str] = {km.query_dim, km.key_dim, spec.const_dim}
+    # Operation dep-graph dim sets (structural derivation). A ``BASE+offset``
+    # signature token (the L13 marker-relative addr-byte comparator) contributes
+    # its BASE band name to the dep graph — the residual band is tracked by base
+    # name, and the offset is a within-bank cell selector, not a separate dim.
+    def _base(name: str) -> str:
+        return name.split("+", 1)[0]
+
+    head_reads: Set[str] = {_base(km.query_dim), _base(km.key_dim), spec.const_dim}
+    for (q_dim, _w) in km.query_extra:
+        head_reads.add(_base(q_dim))
+    for (k_dim, _w) in km.key_extra:
+        head_reads.add(_base(k_dim))
     for (op_dim, _w) in spec.query_blockers:
-        head_reads.add(op_dim)
+        head_reads.add(_base(op_dim))
     if confirm is not None:
         if confirm.marker_dim is not None:
-            head_reads.add(confirm.marker_dim)
+            head_reads.add(_base(confirm.marker_dim))
         for (op_dim, _w) in confirm.blockers:
-            head_reads.add(op_dim)
+            head_reads.add(_base(op_dim))
     head_writes: Set[str] = set()
     if spec.value_active:
         for vb in spec.value_bands:
-            head_reads.add(vb.source_band)
-            head_writes.add(vb.target_band)
+            head_reads.add(_base(vb.source_band))
+            head_writes.add(_base(vb.target_band))
+        # The VALID lifecycle bit reads its "row found" dim and writes the
+        # VALID band; only active alongside the value relay.
+        for vs in spec.valid_slots:
+            head_reads.add(_base(vs.valid_read_dim))
+            head_writes.add(_base(vs.valid_write_dim))
     head_reads.update(spec.extra_reads)
 
     return CamLookupBundle(
