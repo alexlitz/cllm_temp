@@ -2252,6 +2252,14 @@ def compile_full_vm_dynamic(
             "C4_SI_STORE_ADDR": (
                 os.environ.get("C4_SI_STORE_ADDR") == "1"
             ),
+            # L15 head-0 OP_SI/OP_SC store-row veto (DEFAULT-OFF, opt in =1):
+            # adds two slot-0 Q writes to head 0 so it self-fires on SI/SC store
+            # rows carrying a stray OP_LI_RELAY (var_three ``SI b``). Same head
+            # shape, different W_q values, so the ON / OFF builds MUST NOT share
+            # a memo / disk entry.
+            "C4_VAR_THREE_LI": (
+                os.environ.get("C4_VAR_THREE_LI") == "1"
+            ),
             # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
             # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
             # value_scale=40 V/O delivery. Output-affecting on the LEV PC marker
@@ -3081,6 +3089,12 @@ def _bake_from_scheduled_ops(
         # must never share a serialised entry.
         "C4_SI_STORE_ADDR": (
             os.environ.get("C4_SI_STORE_ADDR") == "1"
+        ),
+        # L15 head-0 OP_SI/OP_SC store-row veto (DEFAULT-OFF, opt in =1): two
+        # extra slot-0 Q writes on head 0 (var_three ``SI b`` stray OP_LI_RELAY).
+        # Same head shape, different W_q, so ON / OFF must never share an entry.
+        "C4_VAR_THREE_LI": (
+            os.environ.get("C4_VAR_THREE_LI") == "1"
         ),
         # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
         # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs

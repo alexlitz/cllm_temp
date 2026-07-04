@@ -239,6 +239,47 @@ adding the *store/emit* direction to the generator (today `cam_lookup` only
 models the read/relay direction; the L14 mem_generation emit side is still
 hand-built). Both are additive API work, not a semantic gap.
 
+#### DERIVE→FLIP→DELETE audit (2026-07-04, golden `81557d21`)
+
+Auditing every MEMORY-family attention head against the CURRENT `cam_lookup`
+API for a *byte-identical* flip (`grep cam_lookup(` = 1 site; `marker_broadcast(`
+= 1 site):
+
+- **L7 `layer7_operand_gather` head 0 — ALREADY FLIPPED + DELETED.** It is the
+  sole `cam_lookup(...)` call (`l7_ops.py:365`); its hand-authored form
+  (`_set_layer7_operand_gather`) survives ONLY in the dead `vm_step.py.current`
+  backup — NOT on the build path. Nothing left to flip or delete here.
+- **L13 `layer13_mem_addr_gather` heads 0-2 — NOT byte-identically
+  cam_lookup-expressible.** These are a per-byte MARKER-RELATIVE positional
+  gather (Q@`MEM_VAL_B{0..3}`, K@`L1H{1,2}/H0[MEM_I]` addr-byte-j signature,
+  NOT a value/address content key) PLUS a slot-34 `ADDR_Bj_VALID` lifecycle
+  bit + a two-band V/O relay. `cam_lookup`'s single `CamKeyMatch` (one
+  query/key dim-pair) + `CamValueBand` shape cannot express the positional
+  marker match or the VALID-bit slot. This is the closer relative of
+  `MarkerBroadcastSpec` (a positional relay), not the address CAM.
+- **L15 `li_lc_stack0_h{0..3}` (the LI/LC load heads) — NOT byte-identically
+  cam_lookup-expressible.** The row select is the 24-bit binary address MATCH
+  hand-unrolled across slots 4-27 (3 addr bytes × 2 nibbles × 4 bits), which
+  the `CamKeyMatch` single-dim-pair API cannot model (the G1(a) lowering gap);
+  head 0 further carries ~40 heterogeneous discriminator slots (the
+  campaign-gated `_l15_li_*` families) far beyond one key-match + blocker
+  overlay.
+- **L15 `layer15_si_store_addr_cam` head 16 (`C4_SI_STORE_ADDR`), L8
+  `layer8_mem_to_alu` head 5 — cam_lookup-SHAPED but not a byte-identical
+  flip** (head 16 keys a 2-nibble address match with 5 tight veto slots; L8
+  head 5 needs the store/emit direction, G1(b)).
+
+**Bottom line:** the ONE MEMORY head byte-identically re-expressible via the
+present `cam_lookup` API (L7 operand-gather head 0) is already the sole derived
+path and its hand-authored rules are already gone. Every other l7/l13/l15
+memory head requires the ADDITIVE DSL work catalogued here (24-bit `CamKeyMatch`
+comparator, store/emit direction, VALID lifecycle, positional marker match) —
+flipping them TODAY would NOT be byte-identical and would break golden. The
+"derive → prove → flip → delete" template is validated end-to-end (L7 head 0 +
+the L8 IMM `marker_broadcast` `derive_imm_enabled` gate); the remaining
+MEMORY-head LOC reduction is BLOCKED on the G1 API extension, not on flipping
+work.
+
 ### G2. Store provenance = a two-axis address+value binding, not just a CAM. **[SPEC, partially closed]**
 Per `project_si_store_provenance_two_root_wall`: the naive load CAM reads the
 store *value rows*, which are provenance-blind on BOTH axes — they carry neither
