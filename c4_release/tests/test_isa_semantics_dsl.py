@@ -1692,6 +1692,120 @@ def test_l15_li_lc_load_derived_is_byte_identical_to_handbuilt():
         assert derived[h].head_idx == legacy.head_idx
 
 
+def test_l14_store_generation_derived_is_byte_identical_to_handbuilt():
+    """DERIVE->PROVE->FLIP->DELETE (golden 91f55411): the L14 mem-generation
+    STORE head lowered via ``cam_binary_address_match`` (``direction="store"``,
+    EMPTY address block) matches a fresh hand-reconstruction of the DELETED direct
+    ``DeclarativeAttentionHeadSpec`` build from the SAME folded (base+override)
+    cell maps, byte-for-byte. This is the byte-identity proof behind the
+    golden-hash-neutral flip of :func:`_l14_store_head_from_maps`.
+
+    The fixture exercises every structural case the CAM derivation must reproduce:
+    the CLEAN_EMBED payload value band (``v_scale`` 1.0 addr / 2.0 value), the
+    addr-head OUTPUT self-read band (``v_scale`` 1.0 head 0 / 0.0 heads 1-3), the
+    addr heads 1-3 ``STACK0_BYTE_VAL_h`` relay (V slots 32/48, overlapping the
+    CLEAN_EMBED_HI band's last slot 32), the byte-0 default cancel (V slot-0
+    CONST + O slot-0 -0.5), and arbitrary Q/K discriminator rows.
+    """
+    from c4_release.neural_vm.dim_registry_dynamic import (
+        build_default_registry_dynamic,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.shared import (
+        _as_setdim_proxy,
+    )
+    from c4_release.neural_vm.unified_compiler.ops.l14_ops import (
+        _l14_store_head_from_maps,
+    )
+    from c4_release.neural_vm.unified_compiler.primitives import (
+        AO, AP, DeclarativeAttentionHeadSpec,
+    )
+
+    reg = build_default_registry_dynamic()
+    dp = {name: int(slot.start) for name, slot in reg.slots.items()}
+    BD = _as_setdim_proxy(dp)
+
+    def build_maps(head_idx):
+        """Folded (base+override) cell maps for one store head, covering every
+        structural case the pre-flip direct build produced."""
+        is_value = head_idx >= 4
+        v_scale = 2.0 if is_value else 1.0
+        # OUTPUT self-read scale: addr head 0 keeps 1.0, addr heads 1-3 zero it,
+        # value heads have no OUTPUT read at all.
+        out_read = 1.0 if head_idx == 0 else 0.0
+
+        q_map, k_map, v_map, o_map = {}, {}, {}, {}
+        # Arbitrary Q/K position/source/blocker discriminator rows.
+        q_map[(0, BD.MARK_MEM)] = 15.0
+        q_map[(0, BD.H1 + 2)] = -15.0
+        q_map[(33, BD.CONST)] = -1000.0
+        q_map[(33, BD.MARK_MEM)] = 1000.0
+        q_map[(34, BD.MEM_STORE)] = 500.0
+        q_map[(38, BD.MARK_PC)] = -5000.0
+        q_map[(38, BD.MARK_AX)] = -5000.0
+        k_map[(0, BD.MARK_SP)] = 15.0
+        k_map[(0, BD.STACK0_BYTE0)] = 15.0
+        k_map[(33, BD.CONST)] = 5.0
+        k_map[(34, BD.CONST)] = 5.0
+        k_map[(38, BD.CONST)] = 5.0
+
+        # V slot 0 CONST + O slot-0 -0.5 byte-0 cancel.
+        v_map[(0, BD.CONST)] = v_scale
+        o_map[(BD.OUTPUT_LO + 0, 0)] = -0.5
+        o_map[(BD.OUTPUT_HI + 0, 0)] = -0.5
+
+        # CLEAN_EMBED payload band (V 1..16 / 17..32, O 1.0).
+        for kk in range(16):
+            v_map[(1 + kk, BD.CLEAN_EMBED_LO + kk)] = v_scale
+            v_map[(17 + kk, BD.CLEAN_EMBED_HI + kk)] = v_scale
+            o_map[(BD.OUTPUT_LO + kk, 1 + kk)] = 1.0
+            o_map[(BD.OUTPUT_HI + kk, 17 + kk)] = 1.0
+
+        # OUTPUT self-read band (addr heads only).
+        if not is_value:
+            for kk in range(16):
+                v_map[(1 + kk, BD.OUTPUT_LO + kk)] = out_read
+                v_map[(17 + kk, BD.OUTPUT_HI + kk)] = out_read
+
+        # STACK0_BYTE_VAL_h relay (addr heads 1-3).
+        if head_idx in (1, 2, 3):
+            sv_lo = int(getattr(BD, f"STACK0_BYTE_VAL_{head_idx}_LO"))
+            sv_hi = int(getattr(BD, f"STACK0_BYTE_VAL_{head_idx}_HI"))
+            for kk in range(16):
+                v_map[(32 + kk, sv_lo + kk)] = 1.0
+                v_map[(48 + kk, sv_hi + kk)] = 1.0
+                o_map[(BD.OUTPUT_LO + kk, 32 + kk)] = 1.0
+                o_map[(BD.OUTPUT_HI + kk, 48 + kk)] = 1.0
+
+        return q_map, k_map, v_map, o_map
+
+    def legacy_direct(head_idx, q_map, k_map, v_map, o_map):
+        """The DELETED direct-spec build: DeclarativeAttentionHeadSpec straight
+        from the folded maps (pre-flip code)."""
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(AP(s, d, w) for (s, d), w in q_map.items()),
+            k=tuple(AP(s, d, w) for (s, d), w in k_map.items()),
+            v=tuple(AP(s, d, w) for (s, d), w in v_map.items()),
+            o=tuple(AO(od, s, w) for (od, s), w in o_map.items()),
+        )
+
+    def _canon(spec):
+        return (
+            sorted((w.slot, w.dim, w.weight) for w in spec.q),
+            sorted((w.slot, w.dim, w.weight) for w in spec.k),
+            sorted((w.slot, w.dim, w.weight) for w in spec.v),
+            sorted((w.out_dim, w.slot, w.weight) for w in spec.o),
+        )
+
+    for head_idx in range(8):
+        maps = build_maps(head_idx)
+        derived = _l14_store_head_from_maps(BD, head_idx, *maps)
+        legacy = legacy_direct(head_idx, *maps)
+        assert derived.head_idx == legacy.head_idx == head_idx
+        assert _canon(derived) == _canon(legacy), (
+            f"L14 store head {head_idx} CAM-derived != direct build")
+
+
 # ===========================================================================
 # MARKER-BROADCAST — the OP_IMM->byte-positions relay head generator (#392)
 # ===========================================================================

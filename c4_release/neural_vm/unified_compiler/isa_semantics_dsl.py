@@ -2025,9 +2025,9 @@ class CamValidSlot:
 class CamValueBand:
     """One ``source_band -> target_band`` value-relay block.
 
-    V copies ``source_band[0..width-1]`` into head-local V slots
-    ``v_slot_base..v_slot_base+width-1``; O writes those slots into
-    ``target_band[0..width-1]`` at ``o_scale``. The L7 operand-gather head
+    V copies ``source_band[0..width-1]`` (scaled by :attr:`v_scale`) into
+    head-local V slots ``v_slot_base..v_slot_base+width-1``; O writes those slots
+    into ``target_band[0..width-1]`` at ``o_scale``. The L7 operand-gather head
     relays TWO bands: ``CLEAN_EMBED_LO -> ALU_LO`` (slots 1..16) and
     ``CLEAN_EMBED_HI -> ALU_HI`` (slots 17..32), both at ``o_scale=6.0``.
 
@@ -2037,6 +2037,13 @@ class CamValueBand:
         width: cell count (L7: ``16`` — a byte's nibble one-hot).
         v_slot_base: head-local V slot base (L7: ``1`` and ``17``).
         o_scale: O-write magnitude (L7: ``6.0``).
+        v_scale: V-read magnitude on ``source_band`` (default ``1.0`` — the load
+            direction reads the matched value at unit scale). The L14
+            mem-generation STORE value-emit heads read ``CLEAN_EMBED`` at
+            ``v_scale=2.0`` (their override doubled the clean payload so it
+            dominates the byte-0 default cancel), so the store value-emit band
+            must parameterize the V-read scale, not fix it at 1.0. LOAD callers
+            (L7/L13/L15) keep the default and stay byte-identical.
     """
 
     source_band: str
@@ -2044,6 +2051,7 @@ class CamValueBand:
     width: int
     v_slot_base: int
     o_scale: float
+    v_scale: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -2248,7 +2256,7 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
                 src = _P(vb.source_band)
                 tgt = _P(vb.target_band)
                 for j in range(vb.width):
-                    v.append(AP(vb.v_slot_base + j, src + j, 1.0))
+                    v.append(AP(vb.v_slot_base + j, src + j, vb.v_scale))
                     o.append(AO(tgt + j, vb.v_slot_base + j, vb.o_scale))
 
         # (5) The VALID-lifecycle bit slots: each re-declares the key-match
@@ -2630,7 +2638,7 @@ def cam_binary_address_match(
                 src = _P(vb.source_band)
                 tgt = _P(vb.target_band)
                 for j in range(vb.width):
-                    v_map[(vb.v_slot_base + j, src + j)] = 1.0
+                    v_map[(vb.v_slot_base + j, src + j)] = vb.v_scale
                     o_map[(tgt + j, vb.v_slot_base + j)] = vb.o_scale
 
         # (4) The OVERLAY discriminators (the flag-conditioned OVERRIDE layer as

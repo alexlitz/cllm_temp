@@ -19,6 +19,13 @@ from .shared import (
     sub_full_borrow_enabled,
 )
 from ..positional_invariant import marker_bank_index
+from ..isa_semantics_dsl import (
+    CamBinaryAddressBlock,
+    CamBinaryAddressMatch,
+    CamDiscriminatorSlot,
+    CamValueBand,
+    cam_binary_address_match,
+)
 from .residual_band_registry import register_residual_band
 
 
@@ -1228,19 +1235,143 @@ def _layer14_mem_generation_head_specs_with_overrides(
         o_map[(BD.OUTPUT_LO + 0, 0)] = -0.5
         o_map[(BD.OUTPUT_HI + 0, 0)] = -0.5
 
-        new_q = tuple(AP(slot, dim, w) for (slot, dim), w in q_map.items())
-        new_k = tuple(AP(slot, dim, w) for (slot, dim), w in k_map.items())
-        new_v = tuple(AP(slot, dim, w) for (slot, dim), w in v_map.items())
-        new_o = tuple(AO(out_dim, slot, w) for (out_dim, slot), w in o_map.items())
-        merged.append(DeclarativeAttentionHeadSpec(
-            head_idx=spec.head_idx,
-            q=new_q,
-            k=new_k,
-            v=new_v,
-            o=new_o,
-        ))
+        # DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): lower the
+        # merged (base + override) cell maps for THIS store head through the SAME
+        # binary-address CAM primitive the L15 LOAD side uses, with
+        # ``direction="store"`` (the emit direction). The hand-authored per-head
+        # ``DeclarativeAttentionHeadSpec(q=.., k=.., v=.., o=..)`` construction is
+        # DELETED; :func:`_l14_store_head_from_maps` is the sole lowering path.
+        merged.append(_l14_store_head_from_maps(
+            BD, spec.head_idx, q_map, k_map, v_map, o_map))
 
     return tuple(merged)
+
+
+def _l14_store_head_from_maps(
+    BD,
+    head_idx: int,
+    q_map: dict,
+    k_map: dict,
+    v_map: dict,
+    o_map: dict,
+) -> DeclarativeAttentionHeadSpec:
+    """DERIVE one L14 mem-generation STORE head via ``cam_binary_address_match``.
+
+    DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): the L14
+    mem-generation STORE heads (SI/SC/PSH/JSR/ENT emit-with-address: gather the
+    stored value from the AX/SP/STACK0 frame INTO the addressed MEM token) are
+    re-expressed byte-identically through the SAME binary-address CAM primitive
+    the L15 LOAD side uses (:func:`isa_semantics_dsl.cam_binary_address_match`),
+    with ``direction="store"`` — the emit direction.
+
+    Unlike the L15 LOAD head, the store head has NO binary-address comparator: it
+    fires at exactly ONE MEM byte position via threshold-difference POSITION gates
+    (slots 0/33/34) and selects the value SOURCE (SP/STACK0/AX) via slots 1/2/36
+    plus the ENT overrides (slots 39-47). So the derivation uses an EMPTY
+    :class:`CamBinaryAddressBlock` (``nibble_bands=()``); the
+    ``CamBinaryAddressMatch`` machinery is otherwise identical (heterogeneous
+    discriminator rows + value relay). Structure:
+
+      * every Q/K position/source/blocker row is a :class:`CamDiscriminatorSlot`
+        (DATA), grouped by slot — the position gates, MEM_STORE gate, non-MEM
+        target blockers, SP/STACK0/AX source selectors, and all the ENT / PSH-arg
+        overrides. The maps are the base + override folded last-write-wins by the
+        caller, so the derived discriminators carry the FINAL per-(slot,dim) cell.
+      * the STORE VALUE-EMIT bands are :class:`CamValueBand` relays: the
+        ``CLEAN_EMBED_{LO,HI} -> OUTPUT_{LO,HI}`` payload (V slots 1..16 / 17..32,
+        ``v_scale`` 1.0 for addr heads / 2.0 for value heads — the new
+        ``CamValueBand.v_scale`` field carries the override's value-head payload
+        doubling), the addr-head OUTPUT self-read band (``OUTPUT_{LO,HI}`` at the
+        same slots; ``v_scale`` 1.0 for head 0, 0.0 for heads 1-3), and the addr
+        heads 1-3 ``STACK0_BYTE_VAL_h_{LO,HI} -> OUTPUT_{LO,HI}`` relay (V slots
+        32..47 / 48..63).
+      * the byte-0 default cancel (V slot 0 ``CONST``; O slot 0
+        ``OUTPUT_{LO,HI}+0`` at -0.5) is a single :class:`CamDiscriminatorSlot`
+        with V/O writes (it is NOT a value relay — it subtracts a constant from
+        the byte-0 nibble, breaking the L3 all-zero default).
+
+    PROOF: ``tools/_probe_l14_store_cam_derive.py`` +
+    ``test_isa_semantics_dsl.py::test_l14_store_generation_derived_is_byte_identical_to_handbuilt``
+    assert the CAM output equals the folded maps cell-for-cell; the whole-model
+    golden hash is unchanged (``tools/_isa_golden_hash.py`` == 91f55411).
+    """
+    output_lo = int(BD.OUTPUT_LO)
+    output_hi = int(BD.OUTPUT_HI)
+    clean_lo = int(BD.CLEAN_EMBED_LO)
+    clean_hi = int(BD.CLEAN_EMBED_HI)
+
+    # Group the folded cell maps by slot.
+    q_by_slot: dict[int, list] = {}
+    for (slot, dim), w in q_map.items():
+        q_by_slot.setdefault(slot, []).append((dim, w))
+    k_by_slot: dict[int, list] = {}
+    for (slot, dim), w in k_map.items():
+        k_by_slot.setdefault(slot, []).append((dim, w))
+    v_by_slot: dict[int, list] = {}
+    for (slot, dim), w in v_map.items():
+        v_by_slot.setdefault(slot, []).append((dim, w))
+    o_by_slot: dict[int, list] = {}
+    for (out_dim, slot), w in o_map.items():
+        o_by_slot.setdefault(slot, []).append((out_dim, w))
+
+    # V-read scale of the CLEAN_EMBED payload band (1.0 addr / 2.0 value): read
+    # it off the band's first V slot's CLEAN_EMBED_LO cell.
+    v_scale = dict(v_by_slot[1])[clean_lo]
+
+    # (1) CLEAN_EMBED payload -> OUTPUT (V slots 1..16 / 17..32, O scale 1.0).
+    value_bands: list[CamValueBand] = [
+        CamValueBand(clean_lo, output_lo, 16, 1, 1.0, v_scale=v_scale),
+        CamValueBand(clean_hi, output_hi, 16, 17, 1.0, v_scale=v_scale),
+    ]
+
+    # (2) OUTPUT self-read band (ADDR heads only). The base addr head also sums
+    #     the source row's OWN OUTPUT into the relay (V ``OUTPUT_{LO,HI}`` at the
+    #     SAME slots 1..16 / 17..32 as CLEAN_EMBED); the override KEEPS it at 1.0
+    #     for head 0 (PSH addr byte 0) but ZEROES it for heads 1-3 (so the source
+    #     byte row's OUTPUT does not bleed into the next-byte prediction). Value
+    #     heads never read OUTPUT. The 0.0 rows are no-ops in the lowered weight
+    #     but MUST be emitted to match the hand-authored tuple set.
+    if head_idx < 4:
+        out_read_scale = dict(v_by_slot[1]).get(output_lo, 0.0)
+        value_bands.append(CamValueBand(
+            output_lo, output_lo, 16, 1, 1.0, v_scale=out_read_scale))
+        value_bands.append(CamValueBand(
+            output_hi, output_hi, 16, 17, 1.0, v_scale=out_read_scale))
+
+    # (3) STACK0_BYTE_VAL_h relay (addr heads 1-3): V slots 32..47 / 48..63. The
+    #     LO band's slot 32 overlaps the CLEAN_EMBED_HI band's last slot (32); the
+    #     two write DIFFERENT (slot,dim) keys, so both survive the merge.
+    if head_idx in (1, 2, 3):
+        sv_lo = int(getattr(BD, f"STACK0_BYTE_VAL_{head_idx}_LO"))
+        sv_hi = int(getattr(BD, f"STACK0_BYTE_VAL_{head_idx}_HI"))
+        value_bands.append(CamValueBand(sv_lo, output_lo, 16, 32, 1.0))
+        value_bands.append(CamValueBand(sv_hi, output_hi, 16, 48, 1.0))
+
+    # Discriminator rows: every Q/K slot + the byte-0-cancel V/O row (slot 0:
+    # V CONST read (v_scale) and O -0.5 into OUTPUT_{LO,HI}+0).
+    all_slots = sorted(set(q_by_slot) | set(k_by_slot) | {0})
+    discs: list[CamDiscriminatorSlot] = []
+    for slot in all_slots:
+        discs.append(CamDiscriminatorSlot(
+            slot=slot,
+            q=tuple(q_by_slot.get(slot, ())),
+            k=tuple(k_by_slot.get(slot, ())),
+            v=tuple(v_by_slot.get(slot, ())) if slot == 0 else (),
+            o=tuple(o_by_slot.get(slot, ())) if slot == 0 else (),
+        ))
+
+    cam = CamBinaryAddressMatch(
+        name=f"layer14_mem_generation.head_{head_idx}",
+        address=CamBinaryAddressBlock(
+            nibble_bands=(), scale=0.0, slot_base=4, width_bits=4,
+        ),
+        discriminators=tuple(discs),
+        value_bands=tuple(value_bands),
+        direction="store",
+    )
+    # Discriminators/value_bands carry resolved integer dims; the builder's
+    # int-tolerant ``_P`` passes them through, so an empty dim_map suffices.
+    return cam_binary_address_match(cam).head_spec_builder({}, head_idx)
 
 
 def _layer14_mem_generation_ir(dim_positions, HD) -> CompilerIR:
