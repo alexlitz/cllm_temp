@@ -2512,6 +2512,7 @@ def compile_full_vm_dynamic(
             ),
             "C4_STACK0_STORE_E8_COMPUTED": (
                 os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+            ),
             # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
             # materializer ENUMERATED (254 per-value AND) -> COMPUTED (32
             # per-nibble route) collapse (DEFAULT-OFF, opt in =1). Changes the
@@ -3316,6 +3317,7 @@ def _bake_from_scheduled_ops(
         ),
         "C4_STACK0_STORE_E8_COMPUTED": (
             os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "0") != "0"
+        ),
         # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
         # ENUMERATED (254 per-value AND) -> COMPUTED (32 per-nibble route)
         # collapse (DEFAULT-OFF, opt in =1). Changes the L10-tail FFN hidden_dim
