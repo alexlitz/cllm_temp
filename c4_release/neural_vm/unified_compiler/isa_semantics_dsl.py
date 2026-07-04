@@ -2952,6 +2952,43 @@ class CamBinaryAddressBlock:
         return 1 << self.width_bits
 
 
+@dataclass(frozen=True)
+class CamNibbleComparator:
+    """An IDENTITY per-cell (one-hot) address comparator across ``cells`` slots.
+
+    The binary :class:`CamBinaryAddressBlock` peaks a K row by a ``±scale``
+    per-BIT encoding on a band Q and K BOTH read. The L8 multibyte-fetch head
+    uses a DIFFERENT comparator family: a plain per-NIBBLE IDENTITY match where
+    the Q side and K side read DIFFERENT bands. For each cell ``k`` in
+    ``[0, cells)`` the slot ``slot_base + k`` writes ``+scale`` on Q at
+    ``q_band + k`` and ``+scale`` on K at ``k_band + k``, so the head-dim dot
+    product peaks when the SAME nibble-cell is active on both the queried
+    (``q_band``) and the addressed (``k_band``) nibble one-hots — a cross-band
+    identity CAM select (``FETCH_LO`` on Q vs ``ADDR_KEY`` on K).
+
+    This is the STRUCTURAL identity-CAM invariant: the comparator occupies
+    exactly ``cells`` consecutive slots, each a declared ``+scale`` identity
+    cell match, with NO free Q/K writes. Multiple comparators chain (the
+    multibyte-fetch head has three: FETCH_LO, FETCH_HI, and the ADDR_KEY high
+    nibble self-match) at distinct ``slot_base`` values.
+
+    Attributes:
+        q_band: the QUERY-side nibble one-hot band base (``FETCH_LO``).
+        k_band: the KEY-side nibble one-hot band base (``ADDR_KEY`` slice). When
+            equal to ``q_band`` this is a self-match (the ADDR_KEY high-nibble
+            comparator).
+        cells: cell count (16 for a nibble one-hot).
+        scale: the per-cell ``+scale`` Q/K weight (L8: ``20.0``).
+        slot_base: head-local slot the comparator block starts at.
+    """
+
+    q_band: str
+    k_band: str
+    cells: int
+    scale: float
+    slot_base: int
+
+
 # Sentinel weight: an OVERLAY discriminator cell whose weight is ``CAM_DROP``
 # REMOVES that ``(slot, dim)`` cell from the merged map instead of setting it —
 # the DATA form of a hand-authored ``q_map.pop((slot, dim))`` / a wiped V/O row.
@@ -3055,12 +3092,18 @@ class CamBinaryAddressMatch:
     extra_reads: Tuple[str, ...] = ()
     step_window: StepWindowConstraint = StepWindowConstraint.ANY_STEP
     overlay: Tuple[CamDiscriminatorSlot, ...] = ()
+    # Additional IDENTITY per-cell (cross-band) comparators — the L8
+    # multibyte-fetch head's FETCH_LO/HI + ADDR_KEY-high nibble matches. Empty
+    # for a pure binary-address CAM (L15) so byte-identity is preserved.
+    comparators: Tuple[CamNibbleComparator, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.address.nibble_bands and not self.discriminators:
+        if (not self.address.nibble_bands and not self.discriminators
+                and not self.comparators):
             raise ValueError(
                 f"CamBinaryAddressMatch({self.name!r}): must declare at least "
-                "an address block or a discriminator slot"
+                "an address block, an identity comparator, or a discriminator "
+                "slot"
             )
         if self.address.width_bits <= 0:
             raise ValueError(
@@ -3165,6 +3208,17 @@ def cam_binary_address_match(
                     k_map[(slot, base + k)] = w
                 slot += 1
 
+        # (1b) The IDENTITY per-cell (cross-band) comparators. Each cell ``k``
+        #      lands ``+scale`` on Q at ``q_band + k`` and K at ``k_band + k``
+        #      on slot ``slot_base + k`` — the L8 multibyte-fetch FETCH vs
+        #      ADDR_KEY nibble match. Merged into the same maps.
+        for cmp in spec.comparators:
+            qb = _P(cmp.q_band)
+            kb = _P(cmp.k_band)
+            for k in range(cmp.cells):
+                q_map[(cmp.slot_base + k, qb + k)] = cmp.scale
+                k_map[(cmp.slot_base + k, kb + k)] = cmp.scale
+
         # (2) The heterogeneous discriminator rows (DATA). Merged AFTER the
         #     address block so a discriminator can legitimately re-write an
         #     address cell (the last-write-wins override the L15 head uses).
@@ -3234,6 +3288,9 @@ def cam_binary_address_match(
     head_reads: Set[str] = set()
     for band in addr.nibble_bands:
         head_reads.add(_base(band))
+    for cmp in spec.comparators:
+        head_reads.add(_base(cmp.q_band))
+        head_reads.add(_base(cmp.k_band))
     for d in (*spec.discriminators, *spec.overlay):
         for (dim, _w) in d.q:
             head_reads.add(_base(dim))

@@ -11,12 +11,17 @@ from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstrain
 from ..wide_alu_dsl import nibble_alu_lane_rules
 from ..isa_semantics_dsl import (
     BandMagnitudeBoost,
+    CamBinaryAddressBlock,
+    CamBinaryAddressMatch,
+    CamDiscriminatorSlot,
+    CamNibbleComparator,
     CamValueBand,
     FrameRelaySpec,
     MarkerBroadcastBand,
     MarkerBroadcastSpec,
     ValueRouteChannel,
     ValueRouteSpec,
+    cam_binary_address_match,
     frame_relay,
     marker_broadcast,
     value_route,
@@ -1659,83 +1664,97 @@ def _layer8_multibyte_fetch_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
-def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
-    """Declarative replacement for ``vm_step._set_layer8_multibyte_fetch``."""
+def _layer8_multibyte_fetch_dim_map(BD) -> dict:
+    """Resolve every dim name the multibyte-fetch binary-CAM head touches via ``BD``.
 
+    ``cam_binary_address_match.head_spec_builder`` needs a name->int dict; the
+    ``BASE+offset`` tokens (``ADDR_KEY+16/32``, ``H1+AX_I``) resolve from the
+    BASE name + parsed offset inside the generator, so only the BASE names go in
+    the dict. Byte-identical to the hand-built ``BD.NAME`` / ``BD.NAME+offset``.
+    """
+    names = {
+        "FETCH_LO", "FETCH_HI", "ADDR_KEY", "IS_BYTE", "H1", "CONST",
+        "HAS_SE", "MARK_AX", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "AX_CARRY_LO", "AX_CARRY_HI",
+    }
+    return {n: int(getattr(BD, n)) for n in names}
+
+
+def _layer8_multibyte_fetch_cam_spec() -> CamBinaryAddressMatch:
+    """Build the binary-address-CAM spec for the L8 multibyte-fetch head (names).
+
+    The head is DERIVED by :func:`cam_binary_address_match` — a per-nibble
+    IDENTITY address CAM (three :class:`CamNibbleComparator` cross-band matches:
+    FETCH_LO vs ADDR_KEY[0:16], FETCH_HI vs ADDR_KEY[16:32], and the ADDR_KEY
+    high-nibble self-match ADDR_KEY[32:48]) plus heterogeneous discriminator
+    rows (:class:`CamDiscriminatorSlot`): the IS_BYTE fire gate + CONST-anchored
+    confirms + the AX-register K exclusion + the slot-36 CONST/HAS_SE bias + the
+    Removal-1 MARK_AX/HAS_SE branch gate. The matched byte's CLEAN_EMBED nibbles
+    relay into AX_CARRY_{LO,HI}.
+
+    Class-1 marker-relative anchor: ``H1+AX_I`` reads "nearest marker is the AX
+    register" via the L1 threshold bank (``marker_bank_index`` resolves the
+    frame-invariant slot; byte-identical at STEP_TOKENS=35, unchanged at 30).
+
+    Removal-1 (2026-06-06): the slot-52 Q-side MARK_AX gate + K-side HAS_SE
+    blocker disambiguate the IMM byte at PC+1 from the opcode byte at PC+0. The
+    gate is a no-op structural improvement on top of the ADDR_KEY+FETCH
+    discriminator (HAS_SE is not row-specific to opcode bytes); the
+    batched_pure_neural.py b5cf7099 override remains the load-bearing path.
+    """
     L = 20.0
-    # Class-1 marker-relative anchor: ``H1+AX_I`` reads "nearest marker is the
-    # AX register" via the L1 threshold-head distance bank. The ``+AX_I`` is the
-    # marker-TYPE bank slot (frame-invariant), not a token distance —
-    # ``marker_bank_index`` resolves it from Token.STEP_TOKENS (byte-identical to
-    # the literal 1 at STEP_TOKENS=35) so the audit recognises the ref as
-    # declared-invariant rather than an UNGUARDED bare offset.
     AX_I = marker_bank_index("AX")
+    H1_AX = f"H1+{AX_I}"
     TOP = 36
-    # Removal-1 (2026-06-06): Q-side MARK_AX gate + K-side HAS_SE blocker
-    # on slot 52. Per docs/REMOVAL_1_REAL_SURFACE_2026_06_06.md Option A,
-    # this is intended to disambiguate the IMM byte at PC+1 from the
-    # opcode byte at PC+0 for high-bit IMM values where the ADDR_KEY
-    # nibble pattern aliased. Empirically (smoke 2026-06-06): this gate
-    # alone does not recover the override-removed regression because
-    # HAS_SE is set on every bytecode row once a STEP_END exists, not
-    # row-specific to opcode bytes; the K-side blocker therefore
-    # penalises the IMM byte at PC+1 just as much as the opcode byte at
-    # PC+0. The gate stays as a no-op structural improvement on top of
-    # the existing ADDR_KEY+ FETCH discriminator; the override at
-    # batched_pure_neural.py b5cf7099 remains the load-bearing path
-    # pending Option B (an L9/L10 position-addressed corrective rule
-    # that writes AX_CARRY_LO/HI from CLEAN_EMBED at PC+1 directly).
     MARK_GATE = 52
-    return DeclarativeAttentionHeadSpec(
-        head_idx=_L8_HEAD_LAYOUT_BY_NAME["layer8_multibyte_fetch_bake.head_3"],
-        q=(
-            tuple(AP(k, BD.FETCH_LO + k, L) for k in range(16))
-            + tuple(AP(16 + k, BD.FETCH_HI + k, L) for k in range(16))
-            + tuple(AP(TOP + k, BD.ADDR_KEY + 32 + k, L) for k in range(16))
-            + (
-                AP(32, BD.IS_BYTE, L),
-                AP(33, BD.IS_BYTE, 500.0),
-                AP(33, BD.CONST, -500.0),
-                AP(34, BD.H1 + AX_I, 500.0),
-                AP(34, BD.CONST, -500.0),
-                # AX register K exclusion added after the original helper.
-                # The byte-position queries can carry staged ADDR_KEY, so
-                # without blocking AX byte K candidates they self-attend to
-                # the old AX byte value and pollute AX_CARRY before routing.
-                AP(35, BD.H1 + AX_I, 100.0),
-                AP(35, BD.IS_BYTE, 100.0),
-                AP(35, BD.CONST, -150.0),
-                AP(TOP, BD.CONST, L),
-                AP(TOP, BD.HAS_SE, -L),
-                # Q-side MARK_AX gate (slot 52): only AX-marker query
-                # positions activate the K-side HAS_SE penalty below.
-                AP(MARK_GATE, BD.MARK_AX, L),
-            )
+    return CamBinaryAddressMatch(
+        name="layer8_multibyte_fetch",
+        address=CamBinaryAddressBlock(nibble_bands=(), scale=L, slot_base=0),
+        comparators=(
+            CamNibbleComparator("FETCH_LO", "ADDR_KEY", 16, L, 0),
+            CamNibbleComparator("FETCH_HI", "ADDR_KEY+16", 16, L, 16),
+            CamNibbleComparator("ADDR_KEY+32", "ADDR_KEY+32", 16, L, TOP),
         ),
-        k=(
-            tuple(AP(k, BD.ADDR_KEY + k, L) for k in range(16))
-            + tuple(AP(16 + k, BD.ADDR_KEY + 16 + k, L) for k in range(16))
-            + tuple(AP(TOP + k, BD.ADDR_KEY + 32 + k, L) for k in range(16))
-            + (
-                AP(33, BD.CONST, 5.0),
-                AP(34, BD.CONST, 5.0),
-                AP(35, BD.MARK_AX, -50.0),
-                AP(35, BD.H1 + AX_I, -50.0),
-                # K-side HAS_SE blocker (slot 52): paired with Q-side
-                # MARK_AX gate; subtracts -2L^2 from any key position
-                # carrying HAS_SE when the query is at the AX marker.
-                AP(MARK_GATE, BD.HAS_SE, -L * 2.0),
-            )
+        discriminators=(
+            CamDiscriminatorSlot(slot=32, q=(("IS_BYTE", L),)),
+            CamDiscriminatorSlot(
+                slot=33, q=(("IS_BYTE", 500.0), ("CONST", -500.0)),
+                k=(("CONST", 5.0),)),
+            CamDiscriminatorSlot(
+                slot=34, q=((H1_AX, 500.0), ("CONST", -500.0)),
+                k=(("CONST", 5.0),)),
+            # AX register K exclusion: the byte-position queries can carry
+            # staged ADDR_KEY, so without blocking AX byte K candidates they
+            # self-attend to the old AX byte value and pollute AX_CARRY.
+            CamDiscriminatorSlot(
+                slot=35, q=((H1_AX, 100.0), ("IS_BYTE", 100.0),
+                            ("CONST", -150.0)),
+                k=(("MARK_AX", -50.0), (H1_AX, -50.0))),
+            # Slot TOP=36 CONST/HAS_SE bias rides on the SAME slot as the third
+            # identity comparator (distinct dims, merged into the map).
+            CamDiscriminatorSlot(slot=TOP, q=(("CONST", L), ("HAS_SE", -L))),
+            # Removal-1 slot 52 branch gate.
+            CamDiscriminatorSlot(
+                slot=MARK_GATE, q=(("MARK_AX", L),),
+                k=(("HAS_SE", -L * 2.0),)),
         ),
-        v=(
-            _band_projection_writes(32, BD.CLEAN_EMBED_LO, 3.0)
-            + _band_projection_writes(48, BD.CLEAN_EMBED_HI, 3.0)
-        ),
-        o=(
-            _band_output_writes(BD.AX_CARRY_LO, 32)
-            + _band_output_writes(BD.AX_CARRY_HI, 48)
+        value_bands=(
+            CamValueBand("CLEAN_EMBED_LO", "AX_CARRY_LO", 16, 32, 1.0, 3.0),
+            CamValueBand("CLEAN_EMBED_HI", "AX_CARRY_HI", 16, 48, 1.0, 3.0),
         ),
     )
+
+
+def _layer8_multibyte_fetch_head_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Declarative replacement for ``vm_step._set_layer8_multibyte_fetch``.
+
+    DERIVED by :func:`cam_binary_address_match` (the binary-address CAM
+    generalized with cross-band IDENTITY comparators). No hand-authored Q/K/V/O.
+    Byte-identity gated by the whole-model state_dict hash.
+    """
+    head_idx = _L8_HEAD_LAYOUT_BY_NAME["layer8_multibyte_fetch_bake.head_3"]
+    bundle = cam_binary_address_match(_layer8_multibyte_fetch_cam_spec())
+    return bundle.head_spec_builder(_layer8_multibyte_fetch_dim_map(BD), head_idx)
 
 
 def make_layer8_multibyte_routing_op() -> Operation:
