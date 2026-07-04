@@ -663,6 +663,37 @@ def _stack0_store_loaded_computed_enabled() -> bool:
     return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "0") != "0"
 
 
+def _stack0_store_top_e0_computed_enabled() -> bool:
+    """Flag for GAP-PRIMITIVE #3 pilot — CROSS-LANE COMPUTED ALU->OUTPUT copy.
+
+    ``stack0_store_top_e0_output_rules`` is a 16x16 nibble loop that ENUMERATES
+    254 per-value AND rules (256 minus 0x00 minus 0xE0): for each byte value
+    ``v = lo|(hi<<4)`` one FFN unit fires iff (structural evidence) AND
+    ``ALU_LO+lo`` AND ``ALU_HI+hi`` (the SOURCE lane one-hots, weight 1.0 — the
+    tiny ``OUTPUT+*`` 0.001 terms are negligible tie-breakers) and writes byte
+    ``v`` to the OUTPUT nibbles.  Because the READ lane (ALU) != the WRITE lane
+    (OUTPUT), this is a CROSS-LANE materializer — the exact class agent #389
+    flagged the same-lane M8 route could not cover.
+
+    The COMPUTED replacement collapses those 254 per-value AND units into 32
+    per-nibble ROUTE units via :func:`byte_copy_computed_rules` (16 for
+    ``OUTPUT_LO`` + 16 for ``OUTPUT_HI_THIS_STEP``).  Each route unit fires on
+    ITS SOURCE channel's one-hot (``ALU_LO/ALU_HI+k``) plus the sum of the OTHER
+    SOURCE band's one-hot — reconstructing the enumerated 2-channel AND
+    magnitude / threshold=25 — and writes a one-hot nibble into OUTPUT.
+    Isolated numeric proof (``tools/_probe_crosslane_bytecopy.py``): the route
+    reproduces the enumerated ALU->OUTPUT bank's WINNING byte (argmax)
+    byte-for-byte across all 256 source bytes AND matches its firing region on
+    the gate-off / IS_BYTE-block non-firing contexts; only the raw silu-scaled
+    delta magnitude differs (winner-margin preserved).  BYTE-IDENTITY-BREAKING
+    -> VERDICT-validated.
+
+    DEFAULT-OFF (golden 35-token build byte-identical).  Force with
+    ``C4_STACK0_STORE_TOP_E0_COMPUTED=1``.
+    """
+    return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "0") != "0"
+
+
 def _lea_byte0_alu_amplify_enabled() -> bool:
     """Flag for the PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER
     (ROOT 1 sibling — the func_square / func_max / func_min re-read LEAs).
@@ -1029,7 +1060,11 @@ def _l10_exit_axcarry_enabled() -> bool:
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
-from ..building_blocks_dsl import byte_route_rules, multi_way_and_rule
+from ..building_blocks_dsl import (
+    byte_copy_computed_rules,
+    byte_route_rules,
+    multi_way_and_rule,
+)
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
@@ -1931,6 +1966,15 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # See ``_stack0_store_loaded_computed_enabled``.
     if _stack0_store_loaded_computed_enabled():
         extra -= 223
+    # STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT enumerated->COMPUTED collapse
+    # (GAP-PRIMITIVE #3 pilot): with the flag ON the
+    # ``stack0_store_top_e0_output_rules`` family drops from 254 (16x16
+    # per-value AND, minus the lo==hi==0 and value==0xE0 skips) to 32 (16 LO +
+    # 16 HI per-nibble cross-lane route), so the single-tenant tail range
+    # SHRINKS by 222. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit
+    # unchanged. See ``_stack0_store_top_e0_computed_enabled``.
+    if _stack0_store_top_e0_computed_enabled():
+        extra -= 222
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -7154,6 +7198,36 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+2", -1000.0),
             ("H1+3", -1000.0),
         )
+        # GAP-PRIMITIVE #3 pilot (C4_STACK0_STORE_TOP_E0_COMPUTED, DEFAULT-OFF):
+        # replace the 254-rule per-value ENUMERATED ALU->OUTPUT materializer with
+        # a 32-rule per-nibble CROSS-LANE COMPUTED copy.  READ lane (ALU) !=
+        # WRITE lane (OUTPUT): the route fires on the SOURCE (ALU) one-hot + the
+        # summed OTHER source band (reconstructing the 2-channel AND magnitude /
+        # threshold=25) and writes the byte into OUTPUT.  Reproduces the winning
+        # byte (argmax) + firing region byte-for-byte (proof:
+        # tools/_probe_crosslane_bytecopy.py).  BYTE-IDENTITY-BREAKING ->
+        # verdict-validated.  The tiny 0.001 OUTPUT tie-breaker terms of the
+        # enumerated form are dropped (negligible: 0.001*mag << the 5.8 ALU
+        # one-hot that carries the decision).
+        if _stack0_store_top_e0_computed_enabled():
+            return byte_copy_computed_rules(
+                src_lo="ALU_LO",
+                src_hi="ALU_HI",
+                dst_lo="OUTPUT_LO",
+                dst_hi="OUTPUT_HI_THIS_STEP",
+                base_conditions=base_conditions,
+                threshold=25.0,
+                strength=2000.0,
+                name_for=lambda band, k: (
+                    f"tail_stack0_store_top_e0_route_{band}_{k}"
+                ),
+                gate=gate_mark_stack0,
+                scope="mark == STACK0",
+                dominates_at={
+                    "OUTPUT_LO": "mark == STACK0",
+                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+                },
+            )
         rules = []
         for lo in range(16):
             for hi in range(16):
