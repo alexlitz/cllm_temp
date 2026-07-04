@@ -3915,42 +3915,155 @@ class BranchTargetDelta:
 
 
 @dataclass(frozen=True)
+class PushDelta:
+    """A ``PUSH(register)`` store: write a relayed register value onto a slot,
+    cancelling the slot's arriving identity in the SAME hidden unit.
+
+    This is the ENT ``push saved-BP`` frame delta (docs §G10 / §G5): at the
+    STACK0 marker on an ENT step, the caller's BP (relayed by the L5 head into
+    ``value_src``, a per-nibble TEMP one-hot band) is written onto ``OUTPUT``,
+    while the ``identity_src`` (``EMBED``) copy that would otherwise pass through
+    is subtracted in the same unit's gate. Both effects live in ONE
+    ``multi_way_and_rule``: the AND ``conditions`` are the opcode+marker gate; the
+    ``gate_terms`` carry the cancel-vs-write pair ``(identity_src+k, -1),
+    (value_src+k, +1)`` so the unit fires on the arriving identity nibble and
+    emits the relayed value nibble instead.
+
+    LO band copies ``value_src[0..15] -> dst_lo`` with ``identity_src_lo`` cancel;
+    HI band copies ``value_src[value_hi_offset + 0..15] -> dst_hi`` with
+    ``identity_src_hi`` cancel. The value/identity offsets + the marker gate are
+    the varying params; the 16-unit-per-band copy-with-cancel is the fixed shape.
+    """
+
+    value_src: str = "TEMP"
+    value_hi_offset: int = 16
+    identity_src_lo: str = "EMBED_LO"
+    identity_src_hi: str = "EMBED_HI"
+    dst_lo: str = "OUTPUT_LO"
+    dst_hi: str = "OUTPUT_HI"
+    threshold: float = 1.5
+
+
+@dataclass(frozen=True)
+class AssignDelta:
+    """A ``register := other_register (± const)`` copy as a nibble-shift adder.
+
+    This is the ENT ``BP := SP - 8`` frame delta (docs §G10): at the BP marker on
+    an ENT step, the caller's SP (relayed into ``value_src`` per-nibble) is copied
+    into the BP ``OUTPUT`` slot with the frame-link constant subtracted. Each LO
+    unit gates on ``value_src+k`` and writes ``dst_lo[(k + lo_shift) % 16] += ws``
+    while cancelling the arriving identity ``dst_lo[k] -= ws`` (so the assign
+    REPLACES the slot rather than adding). Each HI unit gates on
+    ``value_src[value_hi_offset + k]``, writes ``dst_hi[(k + hi_shift) % 16] += ws``
+    and cancels ``dst_hi[k] -= ws``, guarded by ``borrow_blockers`` — a set of
+    ``(value_src+lo_bit, -1)`` terms that veto the HI carry on the no-borrow half
+    of the low nibble range (BP=SP-8: the top-8 low nibbles need no borrow, so the
+    HI shift only applies when the low nibble is in ``[0, 8)``).
+
+    ``lo_shift`` / ``hi_shift`` are ``(-amount) % 16`` and ``(-borrow) % 16`` for a
+    subtract-by-``amount`` assign (``BP=SP-8`` => ``lo_shift=8, hi_shift=15``); a
+    pure register copy uses ``lo_shift=hi_shift=0`` and empty ``borrow_blockers``.
+    ``borrow_blocker_range`` is the ``[lo, hi)`` low-nibble range whose bits veto
+    the HI carry (BP=SP-8: ``(8, 16)``); empty ``()`` disables the guard.
+    """
+
+    value_src: str = "TEMP"
+    value_hi_offset: int = 16
+    dst_lo: str = "OUTPUT_LO"
+    dst_hi: str = "OUTPUT_HI"
+    lo_shift: int = 8
+    hi_shift: int = 15
+    borrow_blocker_range: Tuple[int, int] = (8, 16)
+    threshold: float = 1.5
+
+
+@dataclass(frozen=True)
+class PopCamDelta:
+    """A ``register := pop(CAM)`` teardown: gate on a CAM/relay value band and
+    write the popped value onto the register's ``OUTPUT`` slot.
+
+    This is the LEV ``SP := BP`` / ``PC := return-addr`` frame deltas (docs §G5):
+    the freed-stack-slot value has already been relayed (by an L9 CAM head) into a
+    per-nibble one-hot band (``ADDR_B0_{LO,HI}`` for the SP=BP pop; ``TEMP`` for
+    the PC pop). Each LO unit gates on ``value_src_lo+k`` and writes
+    ``dst_lo[(k + lo_shift) % 16] += ws``; each HI unit gates on ``value_src_hi+k``
+    (``value_src_hi`` may equal ``value_src_lo`` with a ``value_hi_offset``) and
+    writes ``dst_hi[(k + hi_shift) % 16] += ws``. The pop is UNCONDITIONAL on the
+    band cell (the CAM relay already selected the right slot); the opcode+marker
+    gate is the shared ``conditions`` AND.
+
+    ``gate_terms`` optionally carries a per-cell gate-side blocker (the LEV SP=BP
+    pop's ``MARK_MEM`` hard blocker). ``value_gate`` selects whether the band cell
+    is a positive AND condition folded into ``conditions`` (the SP=BP pop appends
+    ``(value_src+k, +1)`` to conditions AND uses the same cell as the multiplicative
+    gate) or ONLY the multiplicative gate (the PC pop uses ``gate="CONST"`` with the
+    band cell as a plain condition). See :func:`_pop_cam_rules`.
+    """
+
+    value_src_lo: str = "ADDR_B0_LO"
+    value_src_hi: str = "ADDR_B0_HI"
+    value_hi_offset: int = 0
+    dst_lo: str = "OUTPUT_LO"
+    dst_hi: str = "OUTPUT_HI_THIS_STEP"
+    lo_shift: int = 0
+    hi_shift: int = 0
+    # Gate mode: "band_cell" folds the band cell into BOTH the AND conditions and
+    # the multiplicative gate (LEV SP=BP); "const" uses gate=const_gate with the
+    # band cell as a plain condition (LEV PC pop).
+    gate_mode: str = "band_cell"
+    const_gate: str = "CONST"
+    gate_terms: Tuple[Tuple[str, float], ...] = ()
+    threshold: float = 40.0
+
+
+@dataclass(frozen=True)
 class RegisterDeltaSpec:
     """One per-step register update, tagged by ``kind``.
 
-    Exactly one of ``sequential_add`` / ``branch_target`` is set (matching
-    ``kind``). ``name`` is the rule-name prefix (matches the hand builder's).
-    ``conditions`` is the shared AND gate (opcode + marker + step guard) for the
-    override kinds; SEQUENTIAL_ADD builds its own gate from the delta's marker /
-    fresh-key / suppress-op weights so its multi-band tuning is self-contained.
-    ``threshold`` / ``write_scale`` are the override gate threshold and the
-    per-write ``2.0 / S`` scale.
+    Exactly one of ``sequential_add`` / ``branch_target`` / ``push`` / ``assign``
+    / ``pop_cam`` is set (matching ``kind``). ``name`` is the rule-name prefix
+    (matches the hand builder's). ``conditions`` is the shared AND gate (opcode +
+    marker + step guard) for the override / push / assign / pop-CAM kinds;
+    SEQUENTIAL_ADD builds its own gate from the delta's marker / fresh-key /
+    suppress-op weights so its multi-band tuning is self-contained. ``threshold``
+    / ``write_scale`` are the override gate threshold and the per-write ``2.0 / S``
+    scale (for PUSH/ASSIGN/POP-CAM the per-delta dataclass carries its own
+    threshold, so the spec ``threshold`` is unused for those).
     """
 
     name: str
-    kind: str  # "sequential_add" | "branch_target"
+    kind: str  # "sequential_add"|"branch_target"|"push"|"assign"|"pop_cam"
     write_scale: float
     sequential_add: Optional[SequentialAddDelta] = None
     branch_target: Optional[BranchTargetDelta] = None
-    # Only the override kinds (branch_target) use these shared-gate fields.
+    push: Optional[PushDelta] = None
+    assign: Optional[AssignDelta] = None
+    pop_cam: Optional[PopCamDelta] = None
+    # The shared AND gate (opcode + marker + step guard). The override kind
+    # (branch_target) uses it as the whole gate; PUSH/ASSIGN/POP-CAM use it as
+    # the base conditions ANDed with the per-cell band term.
     conditions: Tuple[Tuple[str, float], ...] = ()
     threshold: float = 0.0
 
+    _KIND_FIELD = {
+        "sequential_add": "sequential_add",
+        "branch_target": "branch_target",
+        "push": "push",
+        "assign": "assign",
+        "pop_cam": "pop_cam",
+    }
+
     def __post_init__(self) -> None:
-        if self.kind not in ("sequential_add", "branch_target"):
+        if self.kind not in self._KIND_FIELD:
             raise ValueError(
-                f"RegisterDeltaSpec({self.name!r}): kind must be "
-                f"'sequential_add' | 'branch_target'; got {self.kind!r}"
+                f"RegisterDeltaSpec({self.name!r}): kind must be one of "
+                f"{sorted(self._KIND_FIELD)}; got {self.kind!r}"
             )
-        if self.kind == "sequential_add" and self.sequential_add is None:
+        field = self._KIND_FIELD[self.kind]
+        if getattr(self, field) is None:
             raise ValueError(
-                f"RegisterDeltaSpec({self.name!r}): kind='sequential_add' "
-                "requires sequential_add=SequentialAddDelta(...)"
-            )
-        if self.kind == "branch_target" and self.branch_target is None:
-            raise ValueError(
-                f"RegisterDeltaSpec({self.name!r}): kind='branch_target' "
-                "requires branch_target=BranchTargetDelta(...)"
+                f"RegisterDeltaSpec({self.name!r}): kind={self.kind!r} "
+                f"requires {field}=... to be set"
             )
 
 
@@ -4160,11 +4273,141 @@ def _branch_target_rules(
     return rules
 
 
+def _push_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
+    """Derive the PUSH (store relayed register onto slot) frame delta.
+
+    Reproduces the ENT ``push saved-BP`` band (model_ops
+    ``_function_call_ent_stack0_rules``) byte-for-byte: 16 LO + 16 HI
+    copy-with-cancel units. Each unit's AND is ``spec.conditions`` (opcode +
+    marker); the ``gate_terms`` carry ``(identity_src+k, -1), (value_src+k, +1)``
+    so the arriving identity nibble is subtracted and the relayed value nibble
+    written in one hidden unit.
+    """
+    d = spec.push
+    assert d is not None  # guarded by RegisterDeltaSpec.__post_init__
+    ws = spec.write_scale
+    conds = spec.conditions
+    rules: list[FFNRule] = []
+    for band, dst, ident_src, val_off in (
+        ("lo", d.dst_lo, d.identity_src_lo, 0),
+        ("hi", d.dst_hi, d.identity_src_hi, d.value_hi_offset),
+    ):
+        for k in range(16):
+            rules.append(multi_way_and_rule(
+                name=f"{spec.name}_{band}_{k}",
+                conditions=conds,
+                threshold=d.threshold,
+                gate_terms=(
+                    (f"{ident_src}+{k}", -1.0),
+                    (f"{d.value_src}+{val_off + k}", 1.0),
+                ),
+                writes=((f"{dst}+{k}", ws),),
+            ))
+    return rules
+
+
+def _assign_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
+    """Derive the ASSIGN (``dst := src ± const`` register copy) frame delta.
+
+    Reproduces the ENT ``BP := SP - 8`` band (model_ops
+    ``_function_call_ent_bp_rules``) byte-for-byte: 16 LO + 16 HI shift-with-
+    identity-cancel units. LO gates on ``value_src+k`` and writes
+    ``dst_lo[(k+lo_shift)%16] += ws`` while cancelling ``dst_lo[k] -= ws``. HI
+    gates on ``value_src[value_hi_offset+k]`` with the ``borrow_blocker_range``
+    veto terms appended to the conditions, writing ``dst_hi[(k+hi_shift)%16]``
+    and cancelling ``dst_hi[k]``.
+    """
+    d = spec.assign
+    assert d is not None
+    ws = spec.write_scale
+    conds = spec.conditions
+    lo_bl, hi_bl = d.borrow_blocker_range if d.borrow_blocker_range else (0, 0)
+    borrow_blockers = tuple(
+        (f"{d.value_src}+{lo_bit}", -1.0) for lo_bit in range(lo_bl, hi_bl)
+    )
+    rules: list[FFNRule] = []
+    for k in range(16):
+        new_k = (k + d.lo_shift) % 16
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_lo_{k}",
+            conditions=conds,
+            threshold=d.threshold,
+            gate=f"{d.value_src}+{k}",
+            writes=(
+                (f"{d.dst_lo}+{new_k}", ws),
+                (f"{d.dst_lo}+{k}", -ws),
+            ),
+        ))
+    for k in range(16):
+        new_k = (k + d.hi_shift) % 16
+        rules.append(multi_way_and_rule(
+            name=f"{spec.name}_hi_{k}",
+            conditions=conds + borrow_blockers,
+            threshold=d.threshold,
+            gate=f"{d.value_src}+{d.value_hi_offset + k}",
+            writes=(
+                (f"{d.dst_hi}+{new_k}", ws),
+                (f"{d.dst_hi}+{k}", -ws),
+            ),
+        ))
+    return rules
+
+
+def _pop_cam_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
+    """Derive the POP-CAM (``dst := pop(CAM/relay band)``) frame delta.
+
+    Reproduces the LEV ``SP := BP`` (l16 ``l16_lev_sp_bp_plus16_*``, gate_mode
+    ``band_cell``) and ``PC := return-addr`` (l16 ``l16_lev_pc_temp_*``,
+    gate_mode ``const``) pops byte-for-byte: 16 LO + 16 HI units gating on the
+    relayed value band. In ``band_cell`` mode the band cell is folded into BOTH
+    the AND conditions and the multiplicative gate (with an optional per-cell
+    ``gate_terms`` blocker); in ``const`` mode the band cell is a plain
+    condition and the gate is ``const_gate``.
+    """
+    d = spec.pop_cam
+    assert d is not None
+    ws = spec.write_scale
+    conds = spec.conditions
+    rules: list[FFNRule] = []
+    for band, dst, src, shift in (
+        ("lo", d.dst_lo, d.value_src_lo, d.lo_shift),
+        ("hi", d.dst_hi, d.value_src_hi, d.hi_shift),
+    ):
+        for k in range(16):
+            new_k = (k + shift) % 16
+            cell = f"{src}+{d.value_hi_offset + k}" if band == "hi" else f"{src}+{k}"
+            if d.gate_mode == "band_cell":
+                rules.append(multi_way_and_rule(
+                    name=f"{spec.name}_{band}_{k}",
+                    conditions=conds + ((cell, 1.0),),
+                    threshold=d.threshold,
+                    gate=cell,
+                    gate_terms=d.gate_terms,
+                    writes=((f"{dst}+{new_k}", ws),),
+                ))
+            else:  # "const"
+                rules.append(multi_way_and_rule(
+                    name=f"{spec.name}_{band}_{k}",
+                    conditions=conds + ((cell, 1.0),),
+                    threshold=d.threshold,
+                    gate=d.const_gate,
+                    gate_terms=d.gate_terms,
+                    writes=((f"{dst}+{new_k}", ws),),
+                ))
+    return rules
+
+
 def _register_delta_rules(
     spec: RegisterDeltaSpec, instr_width: int, pc_offset: int,
 ) -> list[FFNRule]:
     if spec.kind == "sequential_add":
         return _seq_add_rules(spec, instr_width, pc_offset)
+    if spec.kind == "push":
+        return _push_rules(spec)
+    if spec.kind == "assign":
+        return _assign_rules(spec)
+    if spec.kind == "pop_cam":
+        return _pop_cam_rules(spec)
     return _branch_target_rules(spec, instr_width, pc_offset)
 
 
@@ -4178,18 +4421,43 @@ def _register_delta_reads_writes(
         return name.split("+", 1)[0]
 
     if spec.kind == "sequential_add":
-        d = spec.sequential_add
-        assert d is not None
-        reads.update({d.default_marker, d.fresh_key, d.suppress_op,
-                      d.src_lo, d.src_hi})
-        writes.update({d.dst_lo, d.dst_hi, d.src_lo, d.src_hi})
-    else:
-        d = spec.branch_target
-        assert d is not None
+        sd = spec.sequential_add
+        assert sd is not None
+        reads.update({sd.default_marker, sd.fresh_key, sd.suppress_op,
+                      sd.src_lo, sd.src_hi})
+        writes.update({sd.dst_lo, sd.dst_hi, sd.src_lo, sd.src_hi})
+    elif spec.kind == "push":
+        pd = spec.push
+        assert pd is not None
         for (dim, _w) in spec.conditions:
             reads.add(_base(dim))
-        reads.update({d.index_source, d.index_hi_source, d.dst_lo, d.dst_hi})
-        writes.update({d.dst_lo, d.dst_hi})
+        reads.update({pd.value_src, pd.identity_src_lo, pd.identity_src_hi})
+        writes.update({pd.dst_lo, pd.dst_hi})
+    elif spec.kind == "assign":
+        ad = spec.assign
+        assert ad is not None
+        for (dim, _w) in spec.conditions:
+            reads.add(_base(dim))
+        reads.add(ad.value_src)
+        writes.update({ad.dst_lo, ad.dst_hi})
+    elif spec.kind == "pop_cam":
+        cd = spec.pop_cam
+        assert cd is not None
+        for (dim, _w) in spec.conditions:
+            reads.add(_base(dim))
+        for (dim, _w) in cd.gate_terms:
+            reads.add(_base(dim))
+        reads.update({cd.value_src_lo, cd.value_src_hi})
+        if cd.gate_mode == "const":
+            reads.add(_base(cd.const_gate))
+        writes.update({cd.dst_lo, cd.dst_hi})
+    else:
+        bd = spec.branch_target
+        assert bd is not None
+        for (dim, _w) in spec.conditions:
+            reads.add(_base(dim))
+        reads.update({bd.index_source, bd.index_hi_source, bd.dst_lo, bd.dst_hi})
+        writes.update({bd.dst_lo, bd.dst_hi})
     return reads, writes
 
 
