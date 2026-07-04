@@ -95,8 +95,8 @@ def test_l5_unclaimed_op_remains_absent_from_default_report(
 # transposed OPCODE_BYTE_LO/HI mapping for OP_ADD). The symbolic checks
 # below complement the absent-from-report gate: they construct the L5
 # FFN directly via the production factory, then run one-token forwards
-# with the (OPCODE_BYTE_LO, OPCODE_BYTE_HI) encodings from
-# ``_opcode_decode_main_rules`` under MARK_AX gating, and assert the
+# with the (OPCODE_BYTE_LO, OPCODE_BYTE_HI) encodings from the derived
+# ``main_at_ax`` decode context under MARK_AX gating, and assert the
 # named OP_* residual lights up. Two distinct (lo, hi) pairs are
 # exercised so a transposed-axis regression is caught regardless of
 # which axis flipped.
@@ -138,7 +138,7 @@ def l5_opcode_decode_ffn():
 @pytest.mark.parametrize(
     "op_name, lo, hi",
     [
-        # See ``_opcode_decode_main_rules`` in ``l5_ops.py`` for the table.
+        # See ``_derived_decode_spec`` in ``l5_ops.py`` for the ISA table.
         ("OP_ADD", 9, 1),
         ("OP_EXIT", 6, 2),
     ],
@@ -164,6 +164,6 @@ def test_l5_opcode_decode_symbolic_forward(l5_opcode_decode_ffn, op_name, lo, hi
     assert delta > 0.0, (
         f"L5 opcode_decode_ffn did not light up {op_name} for "
         f"(OPCODE_BYTE_LO={lo}, OPCODE_BYTE_HI={hi}, MARK_AX=1); "
-        f"{op_name} delta = {delta:.4f}. Either the opcode table in "
-        f"_opcode_decode_main_rules drifted or MARK_AX gating broke."
+        f"{op_name} delta = {delta:.4f}. Either the derived opcode table "
+        f"(_derived_decode_spec) drifted or MARK_AX gating broke."
     )
