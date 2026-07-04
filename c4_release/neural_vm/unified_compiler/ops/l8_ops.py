@@ -2553,6 +2553,189 @@ def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     return bundle.head_spec_builder(_op_imm_relay_dim_map(BD), head_idx)
 
 
+# Dim-0 gate opcode sets shared by the head-5 / head-7 mem[SP] CAM fire gate.
+_MEM_TO_ALU_POS_OPS = (
+    "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_OR", "OP_XOR", "OP_AND", "OP_SHL", "OP_SHR", "OP_SI", "OP_SC",
+)
+_MEM_TO_ALU_NEG_OPS = (
+    "OP_LI", "OP_LC", "OP_IMM", "OP_LEA", "OP_PSH", "OP_JSR", "OP_ENT",
+    "OP_LEV", "OP_JMP", "OP_ADJ", "OP_BZ", "OP_BNZ", "OP_EXIT",
+)
+_MEM_TO_ALU_MARK_SUPPRESS = (
+    "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM", "MARK_STACK0",
+)
+
+
+def _mem_to_alu_dim_map(BD) -> dict:
+    """Resolve every dim the head-5/head-7 mem[SP] CAM touches via ``BD``.
+
+    ``cam_binary_address_match`` needs a name->int dict; the ``L2H0+MEM_I`` /
+    ``H1+MEM_I`` / ``SP_ADDR_LO_SHARP+i`` offset tokens resolve from the BASE
+    name + parsed offset inside the generator. The flag-gated bands
+    (``MEM_STORE_AT_VAL`` / ``SP_ADDR_*_SHARP``) are always resolvable via ``BD``
+    on an enabled build; only the cells that actually reference them are emitted.
+    Byte-identical to the hand-built ``BD.NAME`` / ``BD.NAME+offset`` lookups.
+    """
+    names = {
+        "CONST", "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_MEM",
+        "MARK_STACK0", "OP_IMM", "L2H0", "H1",
+        "MEM_STORE_AT_VAL", "MEM_VAL_B2", "SP_ADDR_LO_SHARP",
+        "SP_ADDR_PRESENT_SHARP",
+        "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "ALU_LO", "ALU_HI", "STACK0_BYTE_VAL_1_LO", "STACK0_BYTE_VAL_1_HI",
+        "AX_FULL_LO", "AX_FULL_HI",
+    }
+    names.update(_MEM_TO_ALU_POS_OPS)
+    names.update(_MEM_TO_ALU_NEG_OPS)
+    return {n: int(getattr(BD, n)) for n in names}
+
+
+def _mem_to_alu_head5_cam_spec(inc3_clean: bool, sp_disc: bool,
+                               G: float) -> CamBinaryAddressMatch:
+    """Build the head-5 mem[SP]->ALU CAM spec (names only) for the given flags.
+
+    Discriminator-only binary-address CAM (no per-bit address block): the dim-0
+    fire gate (AX marker + binary-pop opcode positives + LI/LC/IMM/... rejects +
+    marker suppressors, K CONST baseline + optional Inc-3 clear), the dim-28
+    AX self-attention guard, the dims-1/2/3 MEM value-byte-0 row select + AX
+    self-exclusion, the dim-4 MEM_STORE_AT_VAL store-commit gate, the optional
+    dims-30..46 SP-frame mismatch penalty, and the CLEAN_EMBED->ALU value relay
+    with the slot-0 byte-0 default cancel. Reproduces the hand-authored head
+    byte-for-byte on an enabled build.
+    """
+    L = 50.0
+    VR = 120.0
+    STORE_B, STORE_C = 800.0, 400.0
+    SCALE_O = 6.0
+    MEM_I = marker_bank_index("MEM")
+    SP_PEN_BASE = 30
+
+    # Slot 0: the fire gate (Q), the CONST K baseline (+ optional Inc-3 clear),
+    # the V byte-0 default read (CONST) and the O byte-0 default cancel.
+    slot0_q = [("CONST", -2000.0), ("MARK_AX", 2000.0)]
+    slot0_q += [(op, 500.0) for op in _MEM_TO_ALU_POS_OPS]
+    slot0_q += [(op, -2000.0) for op in _MEM_TO_ALU_NEG_OPS]
+    slot0_q += [(m, -2000.0) for m in _MEM_TO_ALU_MARK_SUPPRESS]
+    slot0_k = [("CONST", 10.0)]
+    if inc3_clean:
+        # Explicit clear of the stale cross-op MARK_AX/OP_IMM writes in this
+        # physical column (byte-identical to the imperative ``= 0.0``).
+        slot0_k += [("MARK_AX", 0.0), ("OP_IMM", 0.0)]
+
+    discriminators = [
+        CamDiscriminatorSlot(
+            slot=0, q=tuple(slot0_q), k=tuple(slot0_k),
+            v=(("CONST", 1.0),),
+            o=(("ALU_LO", -SCALE_O), ("ALU_HI", -SCALE_O))),
+        # Dim 28: AX self-attention guard.
+        CamDiscriminatorSlot(
+            slot=28, q=(("MARK_AX", 100.0),), k=(("MARK_AX", -2000.0),)),
+        # Dim 1/2: MEM value-byte-0 row select. Dim 3: AX self-exclusion.
+        CamDiscriminatorSlot(
+            slot=1, q=(("MARK_AX", 1.0),),
+            k=((f"L2H0+{MEM_I}", VR), (f"H1+{MEM_I}", -VR),
+               ("CONST", -VR / 2))),
+        CamDiscriminatorSlot(
+            slot=2, q=(("MARK_AX", 1.0),),
+            k=((f"L2H0+{MEM_I}", VR * 2), (f"H1+{MEM_I}", -VR * 4),
+               ("CONST", -VR))),
+        CamDiscriminatorSlot(
+            slot=3, q=(("MARK_AX", 100.0),), k=(("MARK_AX", -VR * 20),)),
+        # Dim 4: MEM_STORE_AT_VAL store-commit gate.
+        CamDiscriminatorSlot(
+            slot=4, q=(("MARK_AX", 1.0),),
+            k=(("MEM_STORE_AT_VAL", STORE_B), ("CONST", -STORE_C))),
+    ]
+
+    # Dims 30..46: SP-frame mismatch penalty (flag-gated).
+    if sp_disc:
+        for i in range(16):
+            discriminators.append(CamDiscriminatorSlot(
+                slot=SP_PEN_BASE + i,
+                q=((f"SP_ADDR_LO_SHARP+{i}", 1.0),),
+                k=((f"SP_ADDR_LO_SHARP+{i}", G),)))
+        discriminators.append(CamDiscriminatorSlot(
+            slot=SP_PEN_BASE + 16,
+            q=(("SP_ADDR_PRESENT_SHARP", 1.0),),
+            k=(("SP_ADDR_PRESENT_SHARP", -G),)))
+
+    return CamBinaryAddressMatch(
+        name="layer8_mem_to_alu_head5",
+        address=CamBinaryAddressBlock(nibble_bands=(), scale=L, slot_base=0),
+        discriminators=tuple(discriminators),
+        value_bands=(
+            CamValueBand("CLEAN_EMBED_LO", "ALU_LO", 16, 1, SCALE_O),
+            CamValueBand("CLEAN_EMBED_HI", "ALU_HI", 16, 17, SCALE_O),
+        ),
+    )
+
+
+def _mem_to_alu_head7_cam_spec(inc3_clean: bool) -> CamBinaryAddressMatch:
+    """Build the head-7 mem[SP] byte-1 CAM spec (names only), no_stack0_emit path.
+
+    Mirrors head-5's fire gate + AX guard, adds the dedicated MARK_MEM K
+    exclusion (dim 27), selects the MEM value-byte-1 row (MEM_VAL_B2) with a hard
+    marker exclusion, and relays CLEAN_EMBED -> STACK0_BYTE_VAL_1 + AX_FULL with
+    the byte-0 default cancel. The head-7 bake does NOT clear dim-0 K (the
+    imperative version has no Inc-3 clear on head 7); ``inc3_clean`` is accepted
+    for signature symmetry but only the head-5 path clears.
+    """
+    del inc3_clean  # head 7 has no Inc-3 clear (byte-identical to the imperative)
+    VR = 120.0
+    STORE_B, STORE_C = 800.0, 400.0
+    SCALE_O = 6.0
+
+    slot0_q = [("CONST", -2000.0), ("MARK_AX", 2000.0)]
+    slot0_q += [(op, 500.0) for op in _MEM_TO_ALU_POS_OPS]
+    slot0_q += [(op, -2000.0) for op in _MEM_TO_ALU_NEG_OPS]
+    slot0_q += [(m, -2000.0) for m in _MEM_TO_ALU_MARK_SUPPRESS]
+
+    discriminators = (
+        CamDiscriminatorSlot(
+            slot=0, q=tuple(slot0_q), k=(("CONST", 10.0),),
+            v=(("CONST", 1.0),),
+            o=(("STACK0_BYTE_VAL_1_LO", -SCALE_O),
+               ("STACK0_BYTE_VAL_1_HI", -SCALE_O),
+               ("AX_FULL_LO", -SCALE_O), ("AX_FULL_HI", -SCALE_O))),
+        # Dim 28: AX self-attention guard. Dim 27: dedicated MARK_MEM exclusion.
+        CamDiscriminatorSlot(
+            slot=28, q=(("MARK_AX", 100.0),), k=(("MARK_AX", -2000.0),)),
+        CamDiscriminatorSlot(
+            slot=27, q=(("MARK_AX", 100.0),), k=(("MARK_MEM", -2000.0),)),
+        # Dim 1/2: MEM value-byte-1 row select with hard marker K exclusion.
+        CamDiscriminatorSlot(
+            slot=1, q=(("MARK_AX", 1.0),),
+            k=(("MEM_VAL_B2", VR), ("CONST", -VR / 2),
+               ("MARK_MEM", -VR * 20), ("MARK_PC", -VR * 20),
+               ("MARK_AX", -VR * 20), ("MARK_SP", -VR * 20),
+               ("MARK_BP", -VR * 20))),
+        CamDiscriminatorSlot(
+            slot=2, q=(("MARK_AX", 1.0),),
+            k=(("MEM_VAL_B2", VR * 2), ("CONST", -VR))),
+        # Dim 3: AX self-exclusion.
+        CamDiscriminatorSlot(
+            slot=3, q=(("MARK_AX", 100.0),), k=(("MARK_AX", -VR * 20),)),
+        # Dim 4: MEM_STORE_AT_VAL store-commit gate.
+        CamDiscriminatorSlot(
+            slot=4, q=(("MARK_AX", 1.0),),
+            k=(("MEM_STORE_AT_VAL", STORE_B), ("CONST", -STORE_C))),
+    )
+
+    return CamBinaryAddressMatch(
+        name="layer8_mem_to_alu_head7",
+        address=CamBinaryAddressBlock(nibble_bands=(), scale=50.0, slot_base=0),
+        discriminators=discriminators,
+        value_bands=(
+            CamValueBand("CLEAN_EMBED_LO", "STACK0_BYTE_VAL_1_LO", 16, 1, SCALE_O),
+            CamValueBand("CLEAN_EMBED_HI", "STACK0_BYTE_VAL_1_HI", 16, 17, SCALE_O),
+            CamValueBand("CLEAN_EMBED_LO", "AX_FULL_LO", 16, 1, SCALE_O),
+            CamValueBand("CLEAN_EMBED_HI", "AX_FULL_HI", 16, 17, SCALE_O),
+        ),
+    )
+
+
 def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
     """L8 attention head 5: mem-attention reading mem[SP] → ALU_LO/HI at AX.
 
@@ -2610,451 +2793,62 @@ def make_layer8_mem_to_alu_op(enable: bool = False) -> Operation:
         attn = block.attn
         HD = attn.W_q.shape[0] // attn.num_heads
         # Per-bake attention-head allocator. Heads 5 and 7 are pinned
-        # at their existing slots so the hand-rolled weight writes
-        # below land byte-identically. Stashed on the attention module
-        # so downstream tooling can inspect the layout. See
-        # :data:`_L8_HEAD_LAYOUT`.
+        # at their existing slots so the DSL-generated head specs land
+        # byte-identically. Stashed on the attention module so downstream
+        # tooling can inspect the layout. See :data:`_L8_HEAD_LAYOUT`.
         attn._l8_head_allocator = _allocate_layer8_attn_heads((
             "layer8_mem_to_alu.head_5",
             "layer8_mem_to_alu.head_7",
         ))
-        head = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_5"]
-        base = head * HD
+        head5 = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_5"]
 
         # Slope tuned to favor most-recent matching MEM_STORE.
-        # 1 VM step = 35 tokens; slope 0.5 → 17.5 score margin per step.
-        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes[head] = 0.5
+        # 1 VM step = 35 tokens; slope 0.5 -> 17.5 score margin per step.
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes[head5] = 0.5
 
-        L = 50.0
-
-        # === Dim 0: bias — fire only at AX marker on binary-pop opcodes ===
-        # Coordination with L8 multibyte_fetch (head 3): that head reads
-        # ADDR_KEY across all K positions for multi-byte IMM fetch. With
-        # L4 SP-to-ADDR_KEY staging the AX marker carries ADDR_KEY content
-        # equal to SP, which would otherwise alias as a spurious K-match
-        # candidate for multibyte_fetch. To keep the two heads disjoint
-        # we restrict head 5 to fire only on the binary-pop opcode set
-        # (the same set CMP[3] relays via L6 head 6) and add negative
-        # blockers on OP_LI / OP_LC / OP_IMM / OP_LEA / OP_PSH / OP_JSR /
-        # OP_ENT / OP_LEV / OP_JMP / OP_ADJ / OP_BZ / OP_BNZ / OP_EXIT so
-        # head 5 stays silent on non-binary-pop steps. OP_* flags are
-        # written at the AX marker by L5 FFN (opcode decode) so they are
-        # available here as direct Q-side gates.
-        attn.W_q[base, BD.CONST] = -2000.0
-        attn.W_q[base, BD.MARK_AX] = 2000.0     # require AX marker
-        # Positive gates: any binary-pop opcode at the AX marker. Each
-        # flag is ~1.0 when active, so a single +500 gate gives Q[0] = 500
-        # when any one fires, comfortably above the -2000 baseline.
-        for op_dim in (BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                       BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                       BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_SHL, BD.OP_SHR,
-                       BD.OP_SI, BD.OP_SC):
-            attn.W_q[base, op_dim] = 500.0
-        # Negative blockers — guarantee head 5 stays off when LI/LC/IMM/LEA/
-        # PSH/etc. is active even if a binary-pop residual leaks. These
-        # opcodes have their own ADDR_KEY/ALU paths and must not collide.
-        for op_dim in (BD.OP_LI, BD.OP_LC, BD.OP_IMM, BD.OP_LEA,
-                       BD.OP_PSH, BD.OP_JSR, BD.OP_ENT, BD.OP_LEV,
-                       BD.OP_JMP, BD.OP_ADJ, BD.OP_BZ, BD.OP_BNZ,
-                       BD.OP_EXIT):
-            attn.W_q[base, op_dim] = -2000.0
-        # Suppress at PC/SP/BP/STACK0/MEM markers — at these positions the
-        # ADDR_KEY band carries other information (code addresses, mem
-        # addresses) that would alias into this head's address match.
-        attn.W_q[base, BD.MARK_PC] = -2000.0
-        attn.W_q[base, BD.MARK_SP] = -2000.0
-        attn.W_q[base, BD.MARK_BP] = -2000.0
-        attn.W_q[base, BD.MARK_MEM] = -2000.0
-        attn.W_q[base, BD.MARK_STACK0] = -2000.0
-        attn.W_k[base, BD.CONST] = 10.0
-        # === Inc-3 (2026-06-19): kill the negative×negative cross-step
-        # spurious attractor on the LI/PSH step (nested_quad, var, expr).
+        # === Head 5: mem[SP] byte-0 CAM -> ALU_LO/HI at the AX marker ===
+        # DERIVED by cam_binary_address_match (discriminator-only binary CAM):
+        # the dim-0 fire gate (binary-pop opcodes + rejects + marker suppressors,
+        # optional Inc-3 K clear), the dim-28 AX self-attention guard, the
+        # dims-1/2/3 MEM value-byte-0 row select + AX self-exclusion, the dim-4
+        # MEM_STORE_AT_VAL store-commit gate, the optional dims-30..46 SP-frame
+        # mismatch penalty (C4_L8_OPERAND_SP_DISC), and the CLEAN_EMBED -> ALU
+        # value relay with the slot-0 byte-0 default cancel. Zero hand-authored
+        # Q/K/V/O; byte-identical to the retired imperative bake.
         #
-        # GPU diagnosis (tools/probe_inc3_li_l8_perhead.py, campaign config,
-        # spec_k=0): on a NON-firing step (e.g.
-        # nested_quad step3 where the AX marker carries OP_PSH, head 5 is
-        # gated OFF by the OP_PSH/OP_LI/OP_IMM Q-blockers), head 5's dim-0
-        # K column carries a LATENT cross-op collision — a stale
-        # ``MARK_AX=+30`` / ``OP_IMM=-30`` write from another L8 attn op
-        # baked into the SAME physical column (head_idx 5 * HD). At a
-        # PREVIOUS step's IMM AX-marker that K dim-0 evaluates to
-        #   K[0] = MARK_AX*30 + CONST*10 + OP_IMM*(-30) = 30 + 10 - 150 = -110
-        # and the suppressed query (off=AX[0], MARK_AX=0) gives
-        #   Q[0] = CONST*(-2000) = -1985.
-        # The product (-1985)*(-110) = +218,350 — a HUGE positive — pins
-        # head 5's softmax onto that prior IMM AX-marker, and its V/O copies
-        # the marker's CLEAN_EMBED garbage into ALU (0x0A -> 0xAA = 170),
-        # corrupting the upstream-delivered LI byte-0. (35-tok golden does
-        # not hit this: the IMM opcode flag does not sit on the prior AX
-        # marker at the same cross-step distance, so the K dim-0 stays
-        # non-negative and head 5's max score is ~449 instead of 218k.)
-        #
-        # FIX: explicitly clear head 5's dim-0 K column to its INTENDED
-        # content (CONST=10 only). The colliding MARK_AX/OP_IMM writes are
-        # not part of head 5's design (its row-select / store-gate lives on
-        # dims 1-4); zeroing them makes K[0] >= 0 everywhere, so a
-        # suppressed (negative) query can never produce a positive product.
-        # head 5 bakes at phase 8.45, after the colliding 8.0-8.4 ops, so
-        # this clear is order-safe; it is also a no-op flag-OFF (head 5 only
-        # exists under enable=True/operand_from_memsp). Forceable kill-switch
+        # Inc-3 (2026-06-19): the dim-0 K MARK_AX/OP_IMM clear kills a stale
+        # cross-op collision (a MARK_AX=+30 / OP_IMM=-30 write from another L8
+        # attn op in the SAME physical column) that otherwise pins head 5's
+        # softmax onto a prior IMM AX-marker on a NON-firing step. The clear is
+        # emitted as an explicit K=0.0 spec cell so it overwrites the stale value
+        # via generate_attention_heads' indexed assignment. Kill-switch
         # C4_INC3_H5_DIM0_CLEAN=0 for an A/B differential.
-        if _os_l8.environ.get("C4_INC3_H5_DIM0_CLEAN", "1") != "0":
-            attn.W_k[base, BD.MARK_AX] = 0.0
-            attn.W_k[base, BD.OP_IMM] = 0.0
-        # === Dim 28: K-side AX marker exclusion (self-attention guard) ===
-        # The L4 SP gather writes scale-10 ADDR_KEY content at the AX
-        # marker. At head 5's firing Q position (AX marker), the address
-        # encoding dims (4-27) match that staged content exactly, which
-        # would otherwise drive softmax to self-attend to the AX marker
-        # instead of the MEM val byte we want. The self-match contributes
-        # up to 12 dims * (10 * 10)^2 = 120,000 raw score (= 15,000 after
-        # /sqrt(HD)=8) at AX marker. Q[28]*K[28] = 100 * -2000 = -200,000
-        # raw (= -25,000 after /sqrt(HD)=8) cleanly overwhelms it. This
-        # dim only contributes when BOTH Q-side AND K-side are at AX
-        # marker — i.e. only when head 5 would otherwise self-attend —
-        # giving a clean negative penalty without leaking into non-firing
-        # Q positions or non-AX K positions.
-        AX_K_EXCLUDE = 28
-        attn.W_q[base + AX_K_EXCLUDE, BD.MARK_AX] = 100.0
-        attn.W_k[base + AX_K_EXCLUDE, BD.MARK_AX] = -2000.0
+        _inc3 = _os_l8.environ.get("C4_INC3_H5_DIM0_CLEAN", "1") != "0"
+        # SP-frame mismatch discriminator gain (A/B knob, tooling).
+        _G = float(_os_l8.environ.get("C4_SP_DISC_G", "420"))
+        dim_map = _mem_to_alu_dim_map(BD)
+        specs = [
+            cam_binary_address_match(
+                _mem_to_alu_head5_cam_spec(
+                    _inc3, l8_operand_sp_disc_enabled(), _G)
+            ).head_spec_builder(dim_map, head5),
+        ]
 
-        # === REBUILD (Inc-1, 2026-06-18): recency-only mem[SP] byte-0 CAM ===
-        #
-        # GPU diagnosis (probe_operand_cam / probe_nostack0_dump) overturned
-        # the original address-match design:
-        #   (1) The MEM *value* byte-0 row carries MEM_STORE=0 (MEM_STORE fires
-        #       on the addr rows, not the value rows), so the original dims
-        #       1/2/3/29/30 — all keyed K-side on MEM_STORE — could never fire
-        #       on the row that actually holds the operand. The value byte-0
-        #       nibbles live on the MEM_VAL_B1-marked row (== L2H0[MEM]=1 AND
-        #       H1[MEM]=0, the d=6-from-MEM "value byte 0" slot — the autoreg
-        #       MEM layout offsets MEM_VAL_B1 onto value byte 0).
-        #   (2) The address dims 4-27 produced a giant SELF-MATCH at the AX
-        #       marker (L4 stages SP into ADDR_KEY there), so softmax pinned
-        #       100% mass on the query row itself -> CLEAN_EMBED of the REG_AX
-        #       marker token -> ALU=0. The AX_K_EXCLUDE guard (dim 28) was
-        #       swamped because HD=109 (not the docstring's 8).
-        #
-        # The rebuilt head content-addresses the MEM value-byte-0 row directly
-        # (no L4 ADDR_KEY staging — that op is the L19 OUTPUT-crush corruptor
-        # and is disabled in this build, so there is no AX-marker self-match to
-        # fight), placed at the L8 attn block (re-anchored to layer8_sp_gather)
-        # so it writes ALU BEFORE the L8 ALU FFN consumes it. This advances the
-        # equivalence-config gate from a STEP-1 fail (AX=0, the L4/L19 crush) to
-        # a STEP-3 (ADD/SUB) fail, and is byte-identical flag-OFF.
-        #
-        # *** REMAINING Inc-1/Inc-2 BLOCKER (GPU-confirmed, not yet fixed) ***
-        # Recency alone is INSUFFICIENT to deliver mem[SP]: the MEM value-byte-0
-        # row carries NO store-commit marker (the ONLY dims that differ between a
-        # real PSH store's value row and a non-store step's MEM value row are the
-        # CLEAN_EMBED nibble values themselves — MEM_STORE / PSH_AT_SP / MARK_MEM
-        # all sit on the section's MARK_MEM row, 5 positions earlier, never
-        # broadcast to the value row). So on the canonical PSH;IMM;ADD pattern
-        # (all 4 gate programs) ALiBi recency selects the more-recent IMM step's
-        # PHANTOM value row (value 0) over the real PSH store's value row, and
-        # the binary op reads operand-A = 0. A single value-row recency head
-        # cannot discriminate. The fix is one of:
-        #   (a) broadcast MEM_STORE/PSH_AT_SP to the section's value-byte rows
-        #       (extend NeuralVMEmbedding._inject_mem_store) so K can gate on a
-        #       per-value-row store bit, then recency picks the right store; or
-        #   (b) restore address-matching but stage SP->ADDR_KEY WITHOUT crushing
-        #       L19 OUTPUT (fix the L4/L19 interaction first).
-        # Both are new multi-component builds (Inc-2 scope). Until one lands the
-        # K-side below is a correct-placement scaffold, NOT a delivering CAM.
-        #
-        # Value-byte-0 row predicate (matches probe data, add_9 step1 off31):
-        #   L2H0[MEM_I] = 1  AND  H1[MEM_I] = 0   (MEM_I = MEM marker index = 4)
-        # Class-1 marker-relative: MEM_I is the MEM slot in the threshold-head
-        # bank (frame-invariant — same in the 35- and 30-token frames), resolved
-        # through ``marker_bank_index`` instead of the literal 4 so the audit
-        # recognises ``L2H0 + MEM_I`` / ``H1 + MEM_I`` as declared-invariant.
-        MEM_I = marker_bank_index("MEM")
-        VR = 120.0  # value-row select strength (Q@AX * K@value-row)
+        # === Head 7: mem[SP] byte-1 CAM -> STACK0_BYTE_VAL_1 + AX_FULL ===
+        # ONLY under no_stack0_emit (the emitted STACK0 byte-1 token + its
+        # STACK0_BYTE_VAL_1 producer are gone, so byte 1 must come from memory).
+        if no_stack0_emit_enabled():
+            head7 = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_7"]
+            if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+                attn.alibi_slopes[head7] = 0.5
+            specs.append(
+                cam_binary_address_match(
+                    _mem_to_alu_head7_cam_spec(_inc3)
+                ).head_spec_builder(dim_map, head7)
+            )
 
-        # Dim 1: value-byte-0 row select. Positive only when the K row is the
-        # MEM value-byte-0 slot; negative const baseline keeps every other row
-        # (incl. the AX-marker self-row, which has L2H0[MEM]=0) below zero so
-        # softmax1's implicit zero logit suppresses non-value rows.
-        attn.W_q[base + 1, BD.MARK_AX] = 1.0
-        attn.W_k[base + 1, BD.L2H0 + MEM_I] = VR
-        attn.W_k[base + 1, BD.H1 + MEM_I] = -VR
-        attn.W_k[base + 1, BD.CONST] = -VR / 2
-
-        # Dim 2: hard value-row confirm (signed, stronger) so address/marker
-        # rows that happen to share one of the two predicate bits cannot beat
-        # the true value-byte-0 row.
-        attn.W_q[base + 2, BD.MARK_AX] = 1.0
-        attn.W_k[base + 2, BD.L2H0 + MEM_I] = VR * 2
-        attn.W_k[base + 2, BD.H1 + MEM_I] = -VR * 4
-        attn.W_k[base + 2, BD.CONST] = -VR
-
-        # Dim 3: AX-marker self-exclusion. Only contributes when BOTH the
-        # query AND the key row are the AX marker (the self row); drives that
-        # single candidate deeply negative so the head never self-attends even
-        # though CLEAN_EMBED is present there.
-        attn.W_q[base + 3, BD.MARK_AX] = 100.0
-        attn.W_k[base + 3, BD.MARK_AX] = -VR * 20
-
-        # === Dim 4: STORE-COMMIT GATE — the Inc-1 closing fix (2026-06-18) ===
-        #
-        # The blocker the prior rebuild left open: dims 1/2 select EVERY MEM
-        # value-byte-0 row equally (all have MEM_VAL_B1=1 / L2H0[MEM]=1,
-        # H1[MEM]=0), so on the PSH;IMM;ADD pattern ALiBi recency picked the
-        # most-recent step's PHANTOM value row (mem byte=0) over the real PSH
-        # store's value row (== mem[SP]); operand-A delivered as 0.
-        #
-        # GPU diagnosis (tools/probe_mem_store_rows / probe_head5_attn) found
-        # the store-commit bit IS recoverable but is NOT on the value row at
-        # head-5's read time: MEM_STORE sits ONLY on the section's MARK_MEM
-        # marker row (set by the L6 head-6 relay, present from block 7) and is
-        # not broadcast to the value rows until block 11 (AFTER this head's K
-        # read). So ``make_layer7_mem_store_relay_op`` (L7, block 9) relays it
-        # FORWARD marker-row → value-byte-0 row into the fresh per-value-row
-        # band MEM_STORE_AT_VAL. add_9/sub_17 step3: pos 110 (real mem[SP])
-        # gets MEM_STORE_AT_VAL=1.0; the phantom value rows (pos 74/146) get
-        # 0.0.
-        #
-        # This dim adds a large positive boost to value-byte-0 rows that carry
-        # the relayed store bit and a large negative penalty to value-byte-0
-        # rows without it, so among the (otherwise equal, dims-1/2) value rows
-        # only store rows survive softmax1's zero anchor; ALiBi recency then
-        # picks the most-recent store (== current mem[SP]). The boost is sized
-        # well above the worst-case ALiBi recency penalty (~-23.5 at the
-        # 47-token store-to-query distance on the gate programs). Because
-        # MEM_STORE_AT_VAL is a clean per-value-row 0/1 (no marker ±2 magnitude
-        # to fight), a single signed K dim suffices (Q@MARK_AX=1):
-        #   K = B·MEM_STORE_AT_VAL - C·CONST
-        #   store value row (relay=1): B - C   = +400  (attend, beats recency)
-        #   phantom value row (relay=0): -C     = -400  (suppress)
-        # Non-value rows never reach here positive: dims 1/2 drive markers
-        # (-420) and addr/register rows (-180) deeply negative, and they carry
-        # MEM_STORE_AT_VAL=0 so dim 4 only deepens them (-400).
-        STORE_B = 800.0  # MEM_STORE_AT_VAL boost
-        STORE_C = 400.0  # CONST penalty (phantom value rows -> -400)
-        attn.W_q[base + 4, BD.MARK_AX] = 1.0
-        attn.W_k[base + 4, BD.MEM_STORE_AT_VAL] = STORE_B
-        attn.W_k[base + 4, BD.CONST] = -STORE_C
-
-        # === Dims 30-46: SP-FRAME MISMATCH PENALTY — expr_add_mul discriminator
-        # (2026-06-25, C4_L8_OPERAND_SP_DISC, DEFAULT-OFF blueprint) ===
-        #
-        # ⚠ BLOCKER (default-OFF reason): the exact-cancel below holds only when
-        # the relayed SP frame is a CLEAN one-hot (true for expr programs). For
-        # var_simple the source OUTPUT_LO@MARK_SP is NOISY (sum -12.8, 7 cells),
-        # so SP_ADDR_PRESENT (=SUM SP_ADDR_LO) blows up and PRESENT_q*PRESENT_k
-        # explodes (~+80k), perturbing single-store steps (var_simple -20). A
-        # WINNER-TAKE-ALL one-hot sharpener on SP_ADDR_LO (block 10) is needed to
-        # bound PRESENT to [0,1] so the cancel is exact for ALL ops. See the
-        # ``l8_operand_sp_disc_enabled`` docstring (shared.py) for the full
-        # blueprint + the SECOND blocker (expr_add_mul step-5/step-7 downstream
-        # roots that keep the cluster at 0/25 even with operand-A correct).
-        #
-        # The dim-4 store gate ranks among the (otherwise byte-identical) MEM
-        # store value rows by ALiBi recency alone. On the only depth-2 expr
-        # cluster (``a+b*c``: PSH a, PSH b, IMM c, MUL pops b, ADD pops a) TWO
-        # stores are live at the ADD step, and recency wrongly picks the more-
-        # recent POPPED ``b`` store over the LIVE ``a`` store (== mem[SP]). The
-        # only discriminator is the SP at push time: a@0xF8, b@0xF0; after the
-        # MUL pop SP returns to 0xF8 == a's frame. ``make_layer7_sp_addr_relay_op``
-        # (L7 block 9) relays that push-time SP low byte into the SP_ADDR_LO
-        # one-hot band at BOTH the store value rows (K side) and the binary-op AX
-        # query row (Q side). GPU spec_k=0 (id816 4+5*2): query@253 SP_ADDR_LO=8;
-        # store@123 (a) =8 (MATCH); store@183 (b) =0 (MISMATCH).
-        #
-        # EXACT-CANCELLING bilinear mismatch penalty (magnitude-robust). The
-        # relayed one-hots are NOT exactly 1.0 (SP_ADDR_LO/PRESENT deliver ~0.98:
-        # softmax1 zero-anchor leakage + the source OUTPUT_LO one-hot ~0.98). A
-        # naive  G*(<q,k> - 1)  or  G*(<q,k> - PRESENT)  form leaves a ~-0.5
-        # residual on the MATCHED store (because q̂*k̂ != 1 and != PRESENT), which
-        # flips the saturated-tie single-store expr verdicts. The fix uses the SUM
-        # of the SP_ADDR_LO one-hot as PRESENT (so PRESENT == the one-hot's own
-        # active-cell magnitude) and the bilinear form
-        #
-        #   contribution(row) = G * ( SUM_i q̂_i k̂_i  -  PRESENT_q * PRESENT_k )
-        #
-        # where q̂/k̂ are the query/store SP_ADDR_LO one-hots and PRESENT_q/k are
-        # their sums. For a one-hot, PRESENT == the active-cell magnitude, so:
-        #   MATCH (same active cell c): SUM q̂k̂ = q̂_c k̂_c ;  PRESENT_q PRESENT_k =
-        #     q̂_c k̂_c  ->  contribution = 0  EXACTLY (any magnitude) -- but ONLY
-        #     for a true one-hot. The matched (= correct operand) store is then
-        #     bit-untouched -> CLEAN-SP-frame single-store ops (expr_paren/mul_div/
-        #     mod) HOLD. (Noisy-frame var_simple does NOT -- see the BLOCKER note.)
-        #   MISMATCH (different cells): SUM q̂k̂ = 0 ;  PRESENT_q PRESENT_k = q̂_c
-        #     k̂_c' ~= 0.96  ->  contribution = -0.96 G. After /sqrt(HD)~10.5,
-        #     G=420 => ~-38 demotion, above the ~30-token recency gap (probe -35
-        #     vs -65), so the popped (frame-mismatched) store loses to the live one.
-        #   NON-SP row (PRESENT=0, k̂=0): contribution = 0 (inert -> no softmax
-        #     normalization shift on IMM/non-firing/single-store steps).
-        #
-        # Slots: 30..45 = per-cell  +G*q̂_i k̂_i ; slot 46 = -G*PRESENT_q*PRESENT_k.
-        # Flag-gated; flag-OFF omits SP_ADDR_LO_SHARP/PRESENT_SHARP and none of
-        # this bakes -> golden byte-identical.
-        #
-        # BLOCKER-1 fix (2026-06-26): READ THE SHARPENED BANDS, not the raw relay
-        # output. The block-10 ``make_layer7_sp_addr_sharpen_op`` thresholds each
-        # SP_ADDR_LO cell at 0.5 -> clean 0/1 cells in SP_ADDR_LO_SHARP and a
-        # bounded SP_ADDR_PRESENT_SHARP in {0,1}. With every surviving cell EXACTLY
-        # 1.0, the MATCH cancel (SUM q̂k̂ - PRESENT_q*PRESENT_k = 1-1 = 0) is exact
-        # for ALL ops, not just clean-SP-frame expr programs -- so the var_simple
-        # raw-PRESENT blow-up (~3.9 -> ~+80k penalty -> -20 regression) is gone.
-        if l8_operand_sp_disc_enabled():
-            G = float(_os_l8.environ.get("C4_SP_DISC_G", "420"))  # A/B knob (tooling)
-            SP_PEN_BASE = 30      # slots 30..45 (cells) + 46 (PRESENT product baseline)
-            for i in range(16):
-                attn.W_q[base + SP_PEN_BASE + i, BD.SP_ADDR_LO_SHARP + i] = 1.0
-                attn.W_k[base + SP_PEN_BASE + i, BD.SP_ADDR_LO_SHARP + i] = G
-            attn.W_q[base + SP_PEN_BASE + 16, BD.SP_ADDR_PRESENT_SHARP] = 1.0
-            attn.W_k[base + SP_PEN_BASE + 16, BD.SP_ADDR_PRESENT_SHARP] = -G
-
-        # === V/O: copy CLEAN_EMBED bytes → ALU_LO/HI at AX marker ===
-        # This mirrors L7 head 0 (vm_step.py:_set_layer7_operand_gather)
-        # which writes ALU_LO/HI from STACK0_BYTE0's CLEAN_EMBED. The L8
-        # FFN (lookup ALU or AddSub5StageBlock in efficient mode) consumes
-        # ALU_LO/HI as binary-op operand 2.
-        SCALE_O = 6.0  # match L7 head 0 amplification (overcomes L4 ALU clear)
-        for k in range(16):
-            attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
-            attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
-        # Matched default cancel: the upstream ALU clear leaves ALU_LO[0] and
-        # ALU_HI[0] positive. Adding a fetched nonzero nibble without canceling
-        # that default makes legacy L9 nibble gates see two active values
-        # (0 and the real nibble), which can create false SUB byte borrows.
-        # When the fetched nibble really is zero, the CLEAN_EMBED[0] write below
-        # restores the zero slot by the same amount this cancel subtracts.
-        attn.W_v[base + 0, BD.CONST] = 1.0
-        for k in range(16):
-            attn.W_o[BD.ALU_LO + k, base + 1 + k] = SCALE_O
-            attn.W_o[BD.ALU_HI + k, base + 17 + k] = SCALE_O
-        attn.W_o[BD.ALU_LO + 0, base + 0] = -SCALE_O
-        attn.W_o[BD.ALU_HI + 0, base + 0] = -SCALE_O
-
-        # Head 7: operand-A BYTE 1 staging for multi-byte ALU ops (16-bit
-        # ADD/SUB, SHL/SHR/MUL wide). Delivers mem[SP] byte 1 to the AX marker
-        # so the multi-byte adders/relays can compute byte 1 of the result.
-        #
-        # ONLY needed when the STACK0 emission is dropped (C4_NO_STACK0_EMIT):
-        # in the 35-token build the wide-ALU byte-1 path reads stack byte 1
-        # from the emitted STACK0 byte-1 token + STACK0_BYTE_VAL_1 (written by
-        # layer10_psh_ax_broadcast at the STACK0 byte-1 row), so this
-        # memory-sourced write would DOUBLE-WRITE / conflict and corrupt
-        # SHL/SHR/MUL/16-bit. Gate head 7 on no_stack0_emit so it only supplies
-        # byte 1 from memory when the emitted STACK0 token (and its
-        # STACK0_BYTE_VAL_1 producer) are gone.
-        if not no_stack0_emit_enabled():
-            return
-        head = _L8_HEAD_LAYOUT_BY_NAME["layer8_mem_to_alu.head_7"]
-        base = head * HD
-        if hasattr(attn, 'alibi_slopes') and attn.alibi_slopes is not None:
-            attn.alibi_slopes[head] = 0.5
-
-        # === STACK0 campaign Part B (2026-06-18): rebuilt K to mirror the
-        # WORKING head-5 byte-0 CAM ===
-        #
-        # The prior head-7 used the OLD address-match design (L4 ADDR_KEY
-        # staging, disabled by the Inc-1 rebuild) + MEM_STORE row gating
-        # (MEM_STORE is on the MARK_MEM marker row, NEVER on the value-byte
-        # rows where this head reads K). So it delivered NOTHING under the flag
-        # (AX_FULL_LO=-1 at the ADD step, GPU-confirmed). Rebuild it on the
-        # same value-row + MEM_STORE_AT_VAL recency CAM head-5 uses for byte 0,
-        # selecting the value-byte-1 row (MEM_VAL_B2) instead of byte-0.
-        #
-        # === Dim 0: bias — fire only at AX marker on binary-pop opcodes ===
-        attn.W_q[base, BD.CONST] = -2000.0
-        attn.W_q[base, BD.MARK_AX] = 2000.0
-        for op_dim in (BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_DIV, BD.OP_MOD,
-                       BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-                       BD.OP_OR, BD.OP_XOR, BD.OP_AND, BD.OP_SHL, BD.OP_SHR,
-                       BD.OP_SI, BD.OP_SC):
-            attn.W_q[base, op_dim] = 500.0
-        for op_dim in (BD.OP_LI, BD.OP_LC, BD.OP_IMM, BD.OP_LEA,
-                       BD.OP_PSH, BD.OP_JSR, BD.OP_ENT, BD.OP_LEV,
-                       BD.OP_JMP, BD.OP_ADJ, BD.OP_BZ, BD.OP_BNZ,
-                       BD.OP_EXIT):
-            attn.W_q[base, op_dim] = -2000.0
-        attn.W_q[base, BD.MARK_PC] = -2000.0
-        attn.W_q[base, BD.MARK_SP] = -2000.0
-        attn.W_q[base, BD.MARK_BP] = -2000.0
-        attn.W_q[base, BD.MARK_MEM] = -2000.0
-        attn.W_q[base, BD.MARK_STACK0] = -2000.0
-        attn.W_k[base, BD.CONST] = 10.0
-
-        AX_K_EXCLUDE = 28
-        attn.W_q[base + AX_K_EXCLUDE, BD.MARK_AX] = 100.0
-        attn.W_k[base + AX_K_EXCLUDE, BD.MARK_AX] = -2000.0
-
-        # Dim 27: MARK_MEM K-exclusion (dedicated, strong). The section's
-        # MARK_MEM marker row carries the relayed MEM_STORE_AT_VAL (the bit
-        # originates there) AND a large dim-0 CONST/Q-gate component, so it
-        # out-scores the value-byte rows on the bias dim alone. A dedicated
-        # exclusion dim (large Q at the firing AX query, large -K at any
-        # MARK_MEM row) drives the marker row deeply negative without touching
-        # the value-byte rows (MARK_MEM=0 there). Mirrors the AX_K_EXCLUDE
-        # pattern. Slot 27 is free on head 7 (dims 4-27 were the retired
-        # address-match band).
-        MEM_K_EXCLUDE = 27
-        attn.W_q[base + MEM_K_EXCLUDE, BD.MARK_AX] = 100.0
-        attn.W_k[base + MEM_K_EXCLUDE, BD.MARK_MEM] = -2000.0
-
-        # Dim 1/2: value-byte-1 row select. MEM_VAL_B2 marks value byte 1 in
-        # the autoregressive MEM layout (MEM_VAL_B1 marks byte 0). Strong
-        # positive on the byte-1 value row; negative CONST baseline buries
-        # every other row below softmax1's zero anchor. HARD MARK_MEM / MARK_*
-        # K-exclusion: the section's MARK_MEM marker row ALSO carries the
-        # relayed MEM_STORE_AT_VAL (it is the bit's origin), so without a K-side
-        # marker exclusion the dim-4 store gate would pull head-7 onto the
-        # marker row (CLEAN_EMBED empty -> byte 1 = 0) instead of the value
-        # row. Burying the marker (and the register markers) here keeps the
-        # MEM_VAL_B2 value row the only positive candidate.
-        VR = 120.0
-        attn.W_q[base + 1, BD.MARK_AX] = 1.0
-        attn.W_k[base + 1, BD.MEM_VAL_B2] = VR
-        attn.W_k[base + 1, BD.CONST] = -VR / 2
-        attn.W_k[base + 1, BD.MARK_MEM] = -VR * 20
-        attn.W_k[base + 1, BD.MARK_PC] = -VR * 20
-        attn.W_k[base + 1, BD.MARK_AX] = -VR * 20
-        attn.W_k[base + 1, BD.MARK_SP] = -VR * 20
-        attn.W_k[base + 1, BD.MARK_BP] = -VR * 20
-
-        attn.W_q[base + 2, BD.MARK_AX] = 1.0
-        attn.W_k[base + 2, BD.MEM_VAL_B2] = VR * 2
-        attn.W_k[base + 2, BD.CONST] = -VR
-
-        # Dim 3: AX-marker self-exclusion (mirror head-5 dim 3).
-        attn.W_q[base + 3, BD.MARK_AX] = 100.0
-        attn.W_k[base + 3, BD.MARK_AX] = -VR * 20
-
-        # Dim 4: STORE-COMMIT GATE — same relayed per-value-row store bit
-        # head-5 uses. make_layer7_mem_store_relay_op now broadcasts
-        # MEM_STORE_AT_VAL onto ALL value-byte rows (B0..B3), so the byte-1
-        # row carries it for a real store; recency then picks the most-recent
-        # store == current mem[SP]. The marker row (where the bit originates) is
-        # already buried by dim-1's MARK_MEM exclusion, so this gate only ranks
-        # among the value-byte rows.
-        STORE_B = 800.0
-        STORE_C = 400.0
-        attn.W_q[base + 4, BD.MARK_AX] = 1.0
-        attn.W_k[base + 4, BD.MEM_STORE_AT_VAL] = STORE_B
-        attn.W_k[base + 4, BD.CONST] = -STORE_C
-
-        # === V/O: copy CLEAN_EMBED bytes → STACK0_BYTE_VAL_1 + AX_FULL ===
-        # STACK0_BYTE_VAL_1 is the band the L13 add/sub minuend/addend relays +
-        # the L10 high-byte adder + BDToGEConverter read for operand-A byte 1.
-        # Also keep the AX_FULL write (the wide-ALU / GE-convert path consumes
-        # AX_FULL_* as operand-A positions 2/3).
-        for k in range(16):
-            attn.W_v[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 1.0
-            attn.W_v[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 1.0
-        attn.W_v[base + 0, BD.CONST] = 1.0
-        for k in range(16):
-            attn.W_o[BD.STACK0_BYTE_VAL_1_LO + k, base + 1 + k] = SCALE_O
-            attn.W_o[BD.STACK0_BYTE_VAL_1_HI + k, base + 17 + k] = SCALE_O
-            attn.W_o[BD.AX_FULL_LO + k, base + 1 + k] = SCALE_O
-            attn.W_o[BD.AX_FULL_HI + k, base + 17 + k] = SCALE_O
-        attn.W_o[BD.STACK0_BYTE_VAL_1_LO + 0, base + 0] = -SCALE_O
-        attn.W_o[BD.STACK0_BYTE_VAL_1_HI + 0, base + 0] = -SCALE_O
-        attn.W_o[BD.AX_FULL_LO + 0, base + 0] = -SCALE_O
-        attn.W_o[BD.AX_FULL_HI + 0, base + 0] = -SCALE_O
+        Primitives.generate_attention_heads(attn, specs, HD)
 
     # Dim-ownership claims: L8 attn head 5 mem-to-ALU.
     # Only claim load-bearing V/O slot/column pairs (not the dense Q/K gates
