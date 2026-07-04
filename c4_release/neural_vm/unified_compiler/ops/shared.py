@@ -1443,6 +1443,50 @@ def si_store_addr_enabled() -> bool:
     return explicit == "1"
 
 
+def var_three_li_enabled() -> bool:
+    """Return True iff the L15 head-0 OP_SI/OP_SC store-row VETO is active
+    (DEFAULT OFF — opt in via ``C4_VAR_THREE_LI=1``; only meaningful in the
+    30-token campaign config where the stray relay flag appears).
+
+    ROOT (verified spec_k=0, BUILT dims, campaign config, teacher-forced oracle
+    tape, ``tools/_probe_vt_head0_sistore.py``; var_three id300
+    ``int a;int b;int c;a=29;b=6;c=20;return a+b+c;`` diverges at the ``SI b``
+    store step): the ``SI b`` store's AX byte-0 emit row carries a STRAY
+    ``OP_LI_RELAY==1.0`` alongside ``OP_SI==5.23`` (unlike the ``SI a`` / ``SI c``
+    store rows, which carry ``OP_SI`` alone). The L15 memory-lookup head 0
+    (``li_lc_stack0_h0``, value_scale=40) slot-0 discriminator fires the lookup
+    on ``OP_LI_RELAY`` (Q weight ``lookup_bias``=2e5) and already VETOES the
+    non-load opcodes ``OP_JSR/OP_ENT/OP_LEA/OP_IMM`` at ``-1e6`` — but NOT the
+    STORE opcodes ``OP_SI``/``OP_SC``. So on the ``SI b`` row the stray relay
+    clears the veto, head 0 fires OFF-self (attends a cross-step ``CLEAN_EMBED``
+    row whose value is 0), and copies ``+0`` into ``OUTPUT``: the store value
+    byte 6 decodes ``0`` instead of ``6`` -> the frame desyncs at ``SI b`` and
+    the whole var_three program drifts (probe: ``SI b`` row got=0x0000 want
+    0x0006; the ``SI a``/``SI c`` rows head0 self_p=1.000, correct).
+
+    FIX. A genuine LI/LC LOAD never has ``OP_SI``/``OP_SC`` hot at its own
+    marker (the opcode is OP_LI/OP_LC), whereas an SI/SC store step has exactly
+    one of ``OP_SI``/``OP_SC`` one-hot at MARK_AX. Extend the SAME slot-0
+    ``non_load_suppression`` veto (already covering OP_JSR/ENT/LEA/IMM and — via
+    ``C4_L15_LOOKUP_CMP_VETO`` — the six comparison opcodes) to ``OP_SI`` and
+    ``OP_SC``: ``OP_SI*-1e6`` dominates the stray ``OP_LI_RELAY*2e5``, keeping
+    head 0 silent (self-firing) on every store row so the store value survives.
+    Scoped to head 0's slot-0 Q only; no V/O / scale change, so the LI/LC/POP
+    delivery on real load rows is untouched (byte-identical there —
+    OP_SI==OP_SC==0 on every load row). Additive slot-0 Q writes, gated by the
+    flag, so flag-OFF omits them entirely -> byte-identical to golden.
+
+    DEFAULT OFF. Reads its OWN env var (NOT floored ON by ``C4_CAMPAIGN``) so
+    the campaign default set stays untouched until this fix is proven
+    net-positive + HOLD-clean; opt in via ``C4_VAR_THREE_LI=1`` (only takes
+    effect under the campaign / MEM-from-SP path, since the stray relay flag is
+    produced only by the 30-token frame — flag-ON at golden 35-tok is
+    byte-identical). Kept as a dedicated kill-switch for
+    ``tools/flag_regression_gate.py`` and the flag-OFF golden byte-identity gate.
+    """
+    return os.environ.get("C4_VAR_THREE_LI", "0") == "1"
+
+
 def loaded_operand_add_hi15_clear_enabled() -> bool:
     """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
     clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),

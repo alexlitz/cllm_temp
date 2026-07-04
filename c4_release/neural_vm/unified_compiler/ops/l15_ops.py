@@ -346,6 +346,7 @@ from .shared import (
     no_stack0_emit_enabled,
     l15_lookup_cmp_veto_enabled,
     si_store_addr_enabled,
+    var_three_li_enabled,
 )
 
 
@@ -1396,6 +1397,27 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                 q_map[(0, BD.OP_LE)] = non_load_suppression
                 q_map[(0, BD.OP_EQ)] = non_load_suppression
                 q_map[(0, BD.OP_NE)] = non_load_suppression
+
+            if var_three_li_enabled():
+                # STORE-STEP VETO (var_three id300, 2026-07-04). The ``SI b``
+                # store's AX byte-0 emit row carries a STRAY ``OP_LI_RELAY==1.0``
+                # (alongside ``OP_SI==5.23``; the ``SI a``/``SI c`` store rows
+                # carry OP_SI ALONE — probe ``tools/_probe_vt_head0_sistore.py``).
+                # The stray relay clears the slot-0 discriminator's threshold
+                # (OP_LI_RELAY Q weight ``lookup_bias``=2e5), head 0 fires
+                # OFF-self on that store row, attends a cross-step CLEAN_EMBED
+                # row whose value is 0, and copies +0 into OUTPUT -> the store
+                # value byte 6 decodes 0 not 6 -> the var_three frame desyncs at
+                # ``SI b``. A real LI/LC/POP load NEVER has OP_SI/OP_SC hot at
+                # its own marker (the opcode is OP_LI/OP_LC), so extend the SAME
+                # non_load veto to the two store opcodes: OP_SI*-1e6 dominates
+                # the stray OP_LI_RELAY*2e5, keeping head 0 self-firing on every
+                # store row (byte-identical on every real load row, where
+                # OP_SI==OP_SC==0). Campaign-only + own kill-switch
+                # ``C4_VAR_THREE_LI`` (DEFAULT OFF; flag-OFF omits these two
+                # writes -> byte-identical to golden).
+                q_map[(0, BD.OP_SI)] = non_load_suppression
+                q_map[(0, BD.OP_SC)] = non_load_suppression
 
             q_map[(0, BD.MARK_STACK0)] = 75000.0
             q_map[(0, BD.HAS_SE)] = 75000.0
