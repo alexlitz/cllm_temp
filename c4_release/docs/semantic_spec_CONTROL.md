@@ -469,6 +469,21 @@ existing adder + store/copy generators; the ENT frame-size `imm` recovery
 use. No new mechanism; the residue is the SP marker firmware inherited from
 MEMORY G4 (the `e0→e8`/`0xF8` byte-0 fixups on the ENT-after-JSR prologue link).
 
+**Landed (2026-07):** the ADJ `SP_DELTA(+, imm)` / `SpDeltaSpec` is now a
+first-class DSL kind. `SP += imm` adds a RUNTIME operand (the immediate in
+`FETCH_HI`), which the compile-time `SequentialAddDelta` (`reg + const` nibble
+rotation) cannot express, so the L9 ADJ hi-nibble band was a hand-authored
+512-unit amplified adder shared-in-shape with LEA/ADD. The new
+`RuntimeAddDelta` / `RegisterDeltaSpec(kind="runtime_add")` — the `SpDelta`
+runtime adder — names the amount as a LIVE operand band and DELEGATES to the
+shared L9 amplified nibble adder (`wide_alu_dsl.amplified_nibble_adder_rules`,
+the same generator LEA/ENT call). `l9_ops._adj_control_op` expresses the whole
+ADJ hi-nibble band as ONE `control_op` frame descriptor with a single
+`RuntimeAddDelta` row; the hand-authored 512-unit cross-product loop is DELETED.
+Byte-identical (golden hash unchanged at `91f55411`). The LEA/ADD-shared portion
+of the amplified adder stays intact (LEA routes through the same shared
+generator directly). `op="sub"` covers the ENT/JSR SP-DECREMENT-by-runtime case.
+
 ---
 
 ## 4. Bottom line — does CONTROL derive from a generic primitive?
