@@ -110,14 +110,78 @@ magnitude-explodes pass-over-pass (`silu(up)≈up` scales with the input,
 so a residual-30 workspace one-hot read at weight 30 runs away). The fixed
 point pins EVERY pass's one-hots to residual 1.0.
 
+**DIV pilot (`multi_pass_div_rules`) landed — same primitive, DIV spec.**
+`multi_pass_div_rules` (`wide_alu_dsl.py`) derives `a // b` (quotient) +
+`a % b` (remainder) for 8-bit operands from a COMPACT binary long-division
+spec — bit-serial shift-subtract with a cross-pass RUNNING-REMAINDER carry
+(bit i's remainder feeds bit i-1's shift), 43 passes / ~11.7k units. It is
+**verdict-identical to Python `divmod` (with the `b==0 → q=0, r=a`
+convention) on all 65,536 (a,b) pairs** via the neural PureFFN forward
+(test `test_multi_pass_div_byte_identity_full`; `tools/_div_multipass_verify.py
+--full`). Rule count is `O(width·256)` per bit NOT `O(256^width)`, so it
+generalizes past the flat `wide_div_rules_ge_format` lookup's 8-bit ceiling
+by adding bit iterations. The b==0 case is handled by mutually-exclusive
+`BZERO`/`BNONZERO` gating (clean single-hot result lane).
+
+**DIV install (`C4_DIV_MULTIPASS`, DEFAULT-OFF) landed.** The L10 divmod
+install (`make_alu_divmod_composite_ops`) appends a `MultiPassDivBlock`
+(`efficient_alu_neural.py`) — the 43 lowered `PureFFN` passes + an OR-gate
+seed packed into ONE post_op (like `MultiPassMulBlock`, so the physical block
+count is unchanged at 59 and the absolute-position lea contract holds). It
+reads the dividend from `ALU_LO/HI`, divisor from `AX_CARRY_LO/HI` (the SAME
+operand bands the composite / GE-format lookup consume), computes q/r on
+dedicated result lanes, then routes q→OUTPUT (OP_DIV) / r→OUTPUT (OP_MOD) at
+MARK_AX and replays the campaign divisor / dividend-byte-1 clears. Flag-OFF is
+byte-identical to golden `91f55411`; flag-ON computes a//b + a%b correctly
+through OUTPUT on a direct-operand sweep (`tools/_div_multipass_live_probe.py`).
+
+**⚠ DIV install flag-ON 1096 VERDICT: NOT landed — regresses div/mod (framing
+desync wall).** The compute is byte-perfect (65,536/65,536 pairs vs Python
+`divmod` through the neural PureFFN forward; isolated live block 30/30) and the
+install is byte-identity-safe (flag-OFF `91f55411`, ZERO HOLD regression:
+add/sub/mul held 9/9/46 flag-ON identical to flag-OFF). But the flag-ON 1096
+verdict (`run_1096_canonical --ids 150-199,200-249,0-9,50-59,100-149
+--criterion full_trace --spec-k 0`, campaign config) REGRESSES **div 44→0 and
+mod 47→0**: every div/mod program frame-collapses at **step 2 with `pc=None`**
+— the classic fixed-slice framing desync (`docs/cpu_full_trace` class: the div
+step emits the wrong token count, so the next step's fixed-30/35-token slice
+reads a shifted PC). The div compute at step 1 MATCHES (the fail is step 2), so
+the cascade produces the right AX but delivers it through a residual footprint
+the step emitter cannot frame like the composite it replaces.
+
+Three byte-identity-safe structural fixes were landed but did NOT resolve the
+desync (each verified: golden `91f55411` unchanged, live probe 30/30, div/mod
+still 0):
+  1. **scratchpad clear** — the 43 passes left ~110 stale one-hots (99 in the
+     1728-dim `DIV_MULTIPASS_WS` workspace + gate + Q/R lanes) that leaked into
+     the next step's residual/KV; the block now zeros them on div/mod-AX rows
+     after routing (workspace hot 99→0). Necessary hygiene, not the root.
+  2. **install placement** — `_use_longdiv_composite()` returns False when
+     multipass is on (to no-op the composite assembly), which had also flipped
+     the install PLACEMENT to `layer_idx=10` (physical block ~18) instead of the
+     composite's `layer10_carry_relay` anchor (block ~30, after the L14 ALU +
+     L16/L18/L20 memory machinery). Fixed to co-locate at block 30 (verified).
+  3. **additive OUTPUT delivery** — switched from a destructive overwrite-clear
+     to the composite's additive `OUTPUT += indicator*2.0` (GEToBDConverter
+     convention) so the byte-1/2/3 emission state survives.
+
+The desync is IDENTICAL with campaign on (30-tok) AND off (35-tok), so it is
+NOT an emitter-config interaction — it is fundamental to the monolithic block's
+per-band residual footprint at the AX emission row. The composite delivers a
+byte-accurate multi-band GE→BD writeback (touching the exact OUTPUT byte-0/1/2/3
++ GE-workspace dims the step emitter reads to count its tokens); the multipass
+block computes the right byte-0 argmax but does not reproduce that full
+footprint. **The residual is a multi-session integration wall, not a
+delivery-mechanic tune** — closing it needs the block to reconstruct the
+composite's exact emission-row residual (or the campaign multibyte STACK0
+reroute the composite uses for dividend > 255), not just the byte-0 result.
+The DERIVATION goal (a wide-DIV DSL primitive that computes correctly) is MET;
+the live-install verdict-match is the open work.
+
 **Remaining:** `wide_mul_rules(width_bytes>2)` (wire the O(width²) pass
-generator to arbitrary width) and `wide_div_rules(width_bytes>1)` (~24
-long-division shift-subtract passes — same primitive, DIV spec). The IR
-construct and the MUL derivation prove the approach; DIV is the next
-pilot. Wiring either into the PRODUCTION model (replacing
-`FlattenedALUMul` / `FlattenedDivMod`) is a separate byte-identity
-install (the pilot proves the COMPUTE derives; the install must also
-match the golden band routing per `docs/semantic_spec_ALU.md` G8).
+generator to arbitrary width) and `multi_pass_div_rules(width_bytes>1)`
+(multi-byte dividend — same primitive, more bit iterations + a wider
+running-remainder lane).
 
 ### Path 2: GE-format DSL extension
 Add `wide_ge_mul_rules` / `wide_ge_div_rules` that emit rules operating

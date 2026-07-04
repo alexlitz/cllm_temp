@@ -2540,6 +2540,16 @@ def compile_full_vm_dynamic(
             "C4_MUL_MULTIPASS": (
                 os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
             ),
+            # GAP-PRIMITIVE #2 (DIV): multi_pass long-division cascade replacing
+            # the L10 FlattenedDivMod composite (DEFAULT-OFF, opt in =1). Adds
+            # the DIV_MULTIPASS_WS 1728-dim workspace + result-lane bands
+            # (changes d_model / n_heads) AND swaps the divmod post_op for the
+            # 43-pass cascade (changes weights), so ON / OFF builds have
+            # different state_dicts and MUST NEVER share a memo / disk entry.
+            # See ops/shared.div_multipass_enabled.
+            "C4_DIV_MULTIPASS": (
+                os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
+            ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
             "extra_residual_dims": (
@@ -3358,6 +3368,15 @@ def _bake_from_scheduled_ops(
         # MUST NEVER share a serialised entry. See ops/shared.mul_multipass_enabled.
         "C4_MUL_MULTIPASS": (
             os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
+        ),
+        # GAP-PRIMITIVE #2 (DIV): multi_pass long-division cascade replacing the
+        # L10 FlattenedDivMod composite (DEFAULT-OFF, opt in =1). Adds the
+        # DIV_MULTIPASS_WS 1728-dim workspace + result-lane bands AND swaps the
+        # divmod post_op for the 43-pass cascade, so the ON / OFF builds have
+        # different state_dicts and MUST NEVER share a serialised entry. See
+        # ops/shared.div_multipass_enabled.
+        "C4_DIV_MULTIPASS": (
+            os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the

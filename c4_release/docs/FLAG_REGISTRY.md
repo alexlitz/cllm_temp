@@ -71,6 +71,8 @@ model. Opt-out with `=0`.
 | `C4_MUL_WIDTH2` | `1` | active | Width-2 (16-bit) MUL path + MUL_RESULT_HI band (d_model 872→981). |
 | `C4_MUL_W2_THRESH_FIX` | `1` | active | Width-2 MUL threshold correction. |
 | `C4_DIV_MULTIBYTE` | `1` | active | Multi-byte DIV/MOD result path. |
+| `C4_MUL_MULTIPASS` | `0` (off) | active | GAP-PRIMITIVE #2: replace the L11 mul-partial / L12 mul-combine lookup with the 7-pass schoolbook `multi_pass_mul_rules` cascade (one block, `MUL_MULTIPASS_WS` band). DEFAULT OFF ⇒ golden byte-identical. Registered in BOTH cache-key snapshots. See `ops/shared.mul_multipass_enabled`. |
+| `C4_DIV_MULTIPASS` | `0` (off) | active | GAP-PRIMITIVE #2 (DIV): replace the L10 `FlattenedDivMod` composite with the 43-pass binary long-division `multi_pass_div_rules` cascade (`MultiPassDivBlock`, one post_op; `DIV_MULTIPASS_WS` + `DIV_MP_*` bands). Computes `a//b`+`a%b` from a compact bit-serial shift-subtract spec, routes q→OUTPUT (DIV) / r→OUTPUT (MOD) at MARK_AX. DEFAULT OFF ⇒ golden byte-identical (`91f55411`). Registered in BOTH cache-key snapshots. See `ops/shared.div_multipass_enabled`. |
 | `C4_SUB_FULL_BORROW` | `1` | active | Full SUB borrow-cascade. |
 | `C4_ADDSUB_DUMP_BOOST` | `1` | active | Imperative AddSub byte-0 OUTPUT dominant-amplitude write. |
 | `C4_CMP_FLAG_MARGIN_FIX` | `1` | active | CMP equal-high-nibble GT flag margin (if_gt 357/359/361). |

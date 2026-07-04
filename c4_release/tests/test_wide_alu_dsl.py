@@ -1981,3 +1981,130 @@ def test_multi_pass_mul_byte_identity_full(lowered_multi_pass_mul_ffns):
     else:
         detail = ""
     assert n_bad == 0, f"multi_pass_mul mismatches {n_bad}/65536: {detail}"
+
+
+# ---------------------------------------------------------------------------
+# GAP-PRIMITIVE #2 (DIV pilot): multi_pass_div_rules — binary long division.
+#
+# The flat wide_div_rules_ge_format(width_bytes=1) is a 65,536-rule
+# cross-product lookup per opcode (byte-accurate but O(256^width), does not
+# generalize). multi_pass_div_rules derives the SAME single-byte quotient /
+# remainder from a COMPACT bit-serial shift-subtract spec staged across FFN
+# passes via the MultiPassOp IR, with a cross-pass running-remainder carry the
+# single-forward lookup cannot express. This test lowers the passes into a
+# stack of PureFFNs and proves the decoded (q, r) is byte-identical to Python
+# divmod (with the b==0 -> q=0,r=a convention) for EVERY (a, b) in
+# 0..255 x 0..255.
+# ---------------------------------------------------------------------------
+
+from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
+    multi_pass_div_rules,
+)
+
+_MP_DIV_POS = {}
+_MP_DIV_DIM = 0
+for _nm, _w in (
+    ("MARK", 1), ("OP_DIV", 1), ("A", 32), ("B", 32),
+    ("QLO", 16), ("QHI", 16), ("RLO", 16), ("RHI", 16),
+    ("WS", 108 * 16),
+):
+    _MP_DIV_POS[_nm] = _MP_DIV_DIM
+    _MP_DIV_DIM += _w
+
+
+def _build_mp_div(S: float = 100.0):
+    return multi_pass_div_rules(
+        dividend_a_base="A", divisor_b_base="B",
+        quotient_lane_bases=("QLO", "QHI"),
+        remainder_lane_bases=("RLO", "RHI"),
+        workspace_base="WS", opcode_gate="OP_DIV", marker_gate="MARK",
+        S=S, width_bytes=1,
+    )
+
+
+def _lowered_multi_pass_div(S: float = 100.0):
+    mp = _build_mp_div(S)
+    flat = mp.as_flat_ir()
+    ffns = []
+    for i, p in enumerate(mp.passes):
+        f = PureFFN(dim=_MP_DIV_DIM, hidden_dim=max(1, p.hidden_units))
+        flat.lower_ffn(f, _MP_DIV_POS, layer_idx=i, S=S)
+        ffns.append(f)
+    return ffns
+
+
+@pytest.fixture(scope="module")
+def lowered_multi_pass_div_ffns():
+    return _lowered_multi_pass_div()
+
+
+def test_multi_pass_div_pass_structure():
+    """The long-division cascade is O(width*256) units — NOT the flat
+    wide_div_rules_ge_format 65,536-rule cross-product per opcode. width>1
+    is the pilot boundary."""
+    mp = _build_mp_div()
+    # 8 bits x 4 passes + seed + assemble + bzero = 43 passes.
+    assert mp.num_passes == 43, mp.num_passes
+    # Far below the flat 65,536-rule lookup.
+    assert mp.hidden_units < 20000, mp.hidden_units
+    with pytest.raises(NotImplementedError):
+        multi_pass_div_rules(
+            dividend_a_base="A", divisor_b_base="B",
+            quotient_lane_bases=("QLO", "QHI"),
+            remainder_lane_bases=("RLO", "RHI"),
+            workspace_base="WS", opcode_gate="OP_DIV", marker_gate="MARK",
+            S=100.0, width_bytes=2,
+        )
+
+
+def _mp_div_batch_inputs():
+    N = 65536
+    X = torch.zeros(N, 1, _MP_DIV_DIM)
+    ab = []
+    idx = 0
+    for a in range(256):
+        for b in range(256):
+            X[idx, 0, _MP_DIV_POS["MARK"]] = 1.0
+            X[idx, 0, _MP_DIV_POS["OP_DIV"]] = 1.0
+            X[idx, 0, _MP_DIV_POS["A"] + (a & 0xF)] = 1.0
+            X[idx, 0, _MP_DIV_POS["A"] + 16 + ((a >> 4) & 0xF)] = 1.0
+            X[idx, 0, _MP_DIV_POS["B"] + (b & 0xF)] = 1.0
+            X[idx, 0, _MP_DIV_POS["B"] + 16 + ((b >> 4) & 0xF)] = 1.0
+            ab.append((a, b))
+            idx += 1
+    return X, ab
+
+
+def test_multi_pass_div_byte_identity_full(lowered_multi_pass_div_ffns):
+    """The long-division cascade decodes (a // b, a % b) for EVERY (a, b) in
+    0..255 x 0..255 — with the b==0 -> (q=0, r=a) zero-divide convention.
+
+    GAP-PRIMITIVE #2 DIV pilot gate: proves the multi_pass_rules IR
+    (MultiPassOp) can express the cross-pass running-remainder chain of binary
+    long division, which a single-forward FFN lookup fundamentally cannot.
+    """
+    X, ab = _mp_div_batch_inputs()
+    with torch.no_grad():
+        Y = X
+        for f in lowered_multi_pass_div_ffns:
+            Y = f(Y)
+
+    def dec(base):
+        return Y[:, 0, _MP_DIV_POS[base]:_MP_DIV_POS[base] + 16].argmax(dim=-1)
+
+    q = (dec("QHI").long() << 4) | dec("QLO").long()
+    r = (dec("RHI").long() << 4) | dec("RLO").long()
+    exp_q = torch.tensor([0 if b == 0 else a // b for a, b in ab])
+    exp_r = torch.tensor([a if b == 0 else a % b for a, b in ab])
+    mismatch = (q != exp_q) | (r != exp_r)
+    n_bad = int(mismatch.sum())
+    if n_bad:
+        bad = mismatch.nonzero().flatten()[:10]
+        detail = ", ".join(
+            f"a={ab[int(i)][0]} b={ab[int(i)][1]} "
+            f"got=({int(q[i])},{int(r[i])}) exp=({int(exp_q[i])},{int(exp_r[i])})"
+            for i in bad
+        )
+    else:
+        detail = ""
+    assert n_bad == 0, f"multi_pass_div mismatches {n_bad}/65536: {detail}"

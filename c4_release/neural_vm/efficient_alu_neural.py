@@ -1753,6 +1753,171 @@ class MultiPassMulBlock(nn.Module):
         return None
 
 
+class MultiPassDivBlock(nn.Module):
+    """GAP-PRIMITIVE #2 (DIV pilot): the binary long-division cascade as ONE post_op.
+
+    Drop-in ``post_op`` replacement for the L10 ``FlattenedDivMod`` composite when
+    ``C4_DIV_MULTIPASS=1``. Holds the lowered ``PureFFN`` passes of
+    ``multi_pass_div_rules`` (bit-serial shift-subtract with a cross-pass
+    running-remainder carry) as an ordered ``nn.Sequential`` and runs them in a
+    SINGLE post_op forward — exactly the ``MultiPassMulBlock`` / ``FlattenedALUMul``
+    pattern (a multi-stage pipeline collapsed into one block call), so the model's
+    physical block count is unchanged (both the composite and this are ONE
+    ``post_ops`` entry) and the absolute-position lea contract holds.
+
+    Each pass is ``PureFFN.forward(x) = x + swiglu(x)`` (residual add), so the
+    Sequential threads the running residual through every pass: pass ``k`` reads
+    the workspace band (``DIV_MULTIPASS_WS``) pass ``k-1`` wrote — the cross-pass
+    running-remainder chain a single-forward FFN lookup cannot express.
+
+    The cascade fires on ``OP_DIV OR OP_MOD`` via a 2-cell OR-gate scratch band
+    (``DIV_MP_GATE`` cell 1) that a seed rule sets when EITHER opcode is present,
+    and marker-gated (``MARK_AX``), so on a non-div/mod / non-marker row every
+    pass's SwiGLU is dark and the compute is a pure residual identity. It writes
+    the quotient (``a // b``) to ``DIV_MP_Q_LO/HI`` and remainder (``a % b``) to
+    ``DIV_MP_R_LO/HI`` on dedicated result lanes.
+
+    After the compute Sequential, this module IMPERATIVELY routes the result to
+    OUTPUT — the counterpart of ``_DivModGEToBDStage``:
+
+      * OP_DIV rows (at MARK_AX): OUTPUT_LO/HI <- quotient nibbles (Q_LO/Q_HI).
+      * OP_MOD rows (at MARK_AX): OUTPUT_LO/HI <- remainder nibbles (R_LO/R_HI).
+
+    and replicates the campaign divisor / dividend-byte-1 clears the live
+    ``FlattenedDivMod`` GE->BD stage does (so the downstream L20 lev-routing / L18
+    mem-gen leaks have no AX_CARRY / STACK0_BYTE_VAL_1 to materialize over the
+    quotient). Those clears are gated on the SAME div/mod-AX mask.
+
+    ``compact`` / ``sparsify`` / ``compact_moe`` plumb through to each pass so the
+    model's post-bake compactor and any weight-introspection treat this like a
+    stack of ``PureFFN``.
+    """
+
+    def __init__(self, passes, *, output_lo, output_hi,
+                 q_lo, q_hi, r_lo, r_hi, op_div, op_mod, mark_ax,
+                 ax_carry_lo=None, ax_carry_hi=None,
+                 stack0_b1_lo=None, stack0_b1_hi=None,
+                 campaign_clear=False, scratch_bands=None):
+        super().__init__()
+        self.pipeline = nn.Sequential(*passes)
+        self._is_multipass_div_block = True
+        self.output_lo = int(output_lo)
+        self.output_hi = int(output_hi)
+        self.q_lo = int(q_lo)
+        self.q_hi = int(q_hi)
+        self.r_lo = int(r_lo)
+        self.r_hi = int(r_hi)
+        self.op_div = int(op_div)
+        self.op_mod = int(op_mod)
+        self.mark_ax = int(mark_ax)
+        self.ax_carry_lo = None if ax_carry_lo is None else int(ax_carry_lo)
+        self.ax_carry_hi = None if ax_carry_hi is None else int(ax_carry_hi)
+        self.stack0_b1_lo = None if stack0_b1_lo is None else int(stack0_b1_lo)
+        self.stack0_b1_hi = None if stack0_b1_hi is None else int(stack0_b1_hi)
+        self.campaign_clear = bool(campaign_clear)
+        # (base, width) op-local scratch/result bands the cascade populates
+        # with intermediate one-hots. They live OUTSIDE the 30/35-token step
+        # frame, so if left hot they persist into the residual + KV of the
+        # NEXT autoregressive step and corrupt its decode (observed as a
+        # step-2 pc=None frame collapse). Zero them on the div/mod-AX rows
+        # AFTER the OUTPUT routing has consumed them — the block is a leaf
+        # scratchpad, nothing downstream reads these bands.
+        self.scratch_bands = tuple(
+            (int(base), int(width)) for base, width in (scratch_bands or ())
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1) run the compute cascade (residual threaded through all passes).
+        x = self.pipeline(x)
+
+        # 2) route the computed quotient/remainder into OUTPUT at div/mod-AX
+        #    rows — the GE->BD writeback counterpart. Per-position masks.
+        mark = (x[:, :, self.mark_ax] > 0.5).float()
+        div = (x[:, :, self.op_div] > 0.1).float() * mark    # [B, seq]
+        mod = (x[:, :, self.op_mod] > 0.1).float() * mark
+        any_dm = ((div + mod) > 0.5).float()
+
+        def _argmax_onehot(base):
+            band = x[:, :, base:base + 16]
+            idx = band.argmax(dim=-1, keepdim=True)   # [B, seq, 1]
+            oh = torch.zeros_like(band)
+            oh.scatter_(-1, idx, 1.0)
+            return oh
+
+        q_lo_oh = _argmax_onehot(self.q_lo)
+        q_hi_oh = _argmax_onehot(self.q_hi)
+        r_lo_oh = _argmax_onehot(self.r_lo)
+        r_hi_oh = _argmax_onehot(self.r_hi)
+
+        # Selected result nibble one-hots: quotient for DIV, remainder for MOD.
+        sel_lo = q_lo_oh * div[:, :, None] + r_lo_oh * mod[:, :, None]
+        sel_hi = q_hi_oh * div[:, :, None] + r_hi_oh * mod[:, :, None]
+
+        # Route the result into OUTPUT with the SAME ADDITIVE convention the
+        # composite it replaces uses (``GEToBDConverter``: OUTPUT +=
+        # indicator*2.0, NEVER a destructive clear). The additive +2.0 out-votes
+        # the upstream ALU_LO->OUTPUT relay at the div/mod-AX row while LEAVING
+        # the rest of the OUTPUT emission state (byte-1/2/3 nibble structure the
+        # 30-token frame emits) intact. An earlier destructive overwrite-clear
+        # ERASED that state and desynced the emitted token count -> the next
+        # step's fixed-slice decode read a shifted PC (step-2 pc=None). ``div`` /
+        # ``mod`` are already the [B, seq]-broadcast div/mod-AX masks, so the
+        # write only lands on those rows.
+        x = x.clone()
+        x[:, :, self.output_lo:self.output_lo + 16] += sel_lo * 2.0
+        x[:, :, self.output_hi:self.output_hi + 16] += sel_hi * 2.0
+
+        # 3) campaign divisor / dividend-byte-1 clears (same as FlattenedDivMod
+        #    GE->BD stage) so the downstream L20/L18 leaks have nothing to
+        #    materialize over the quotient. Gated on the div/mod-AX mask.
+        if self.campaign_clear:
+            keep_dm = (1.0 - any_dm)[:, :, None].to(dtype=x.dtype)
+            for lo, hi in ((self.ax_carry_lo, self.ax_carry_hi),
+                           (self.stack0_b1_lo, self.stack0_b1_hi)):
+                if lo is not None:
+                    x[:, :, lo:lo + 16] = x[:, :, lo:lo + 16] * keep_dm
+                if hi is not None:
+                    x[:, :, hi:hi + 16] = x[:, :, hi:hi + 16] * keep_dm
+
+        # 4) scratchpad clear: zero the cascade's workspace + gate + result
+        #    lanes on the div/mod-AX rows. The 43 passes leave ~110 stale
+        #    one-hots (99 in the 1728-dim workspace, plus the OR-gate and the
+        #    Q/R result lanes) at residual ~1.0. These op-local bands are not
+        #    part of the per-step token frame and are read by NOTHING
+        #    downstream (the OUTPUT routing above already consumed the result),
+        #    so left hot they only leak into the NEXT step's residual/KV and
+        #    frame-collapse its decode. Gate on any_dm so non-div/mod rows are
+        #    a pure identity (byte-identity-safe: on a flag-OFF build this
+        #    module never installs).
+        if self.scratch_bands:
+            keep_dm = (1.0 - any_dm)[:, :, None].to(dtype=x.dtype)
+            for base, width in self.scratch_bands:
+                x[:, :, base:base + width] = (
+                    x[:, :, base:base + width] * keep_dm
+                )
+
+        return x
+
+    def compact(self, block_size=1):
+        for p in self.pipeline:
+            if hasattr(p, "compact"):
+                p.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        for p in self.pipeline:
+            if hasattr(p, "sparsify"):
+                p.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        for p in self.pipeline:
+            fn = getattr(p, "compact_moe", None)
+            if fn is not None:
+                fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 class BitwiseOperandSeRecoverFFN(nn.Module):
     """Campaign BITWISE operand-A SE_ALU recover wrapping the L10 bitwise lookup.
 

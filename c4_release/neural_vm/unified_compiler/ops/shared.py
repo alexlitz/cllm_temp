@@ -152,6 +152,33 @@ def mul_multipass_enabled() -> bool:
     return os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
 
 
+def div_multipass_enabled() -> bool:
+    """Return True iff the multi_pass (binary long-division cascade) DIV/MOD
+    compute replaces the live L10 ``FlattenedDivMod`` composite (DEFAULT OFF —
+    opt in via ``C4_DIV_MULTIPASS=1``).
+
+    GAP-PRIMITIVE #2 DIV install (the DIV analogue of ``mul_multipass_enabled``).
+    The live default (``alu_mode='lookup'``) computes DIV/MOD via the
+    hand-authored ``FlattenedDivMod`` — an 8-outer x 3-inner GE-workspace long
+    division (BD->GE, DIV pipeline, MOD pipeline, GE->BD). When this flag is on,
+    the L10 divmod install (``make_alu_divmod_composite_ops`` -> install op)
+    appends a :class:`~neural_vm.efficient_alu_neural.MultiPassDivBlock` instead
+    — the lowered ``PureFFN`` passes of ``multi_pass_div_rules`` (bit-serial
+    shift-subtract with a cross-pass running-remainder carry) packed into ONE
+    physical block (like ``MultiPassMulBlock``, so the absolute-position lea
+    contract holds). The cascade computes ``a // b`` (quotient) + ``a % b``
+    (remainder) from a compact spec on dedicated result lanes, then routes
+    q -> OUTPUT for OP_DIV and r -> OUTPUT for OP_MOD at MARK_AX. It reads the
+    dividend from ``ALU_LO/HI`` (byte 0) and divisor from ``AX_CARRY_LO/HI``,
+    the SAME operand bands the GE-format lookup / ``FlattenedDivMod`` consume.
+
+    DEFAULT OFF: flag-off is byte-identical to golden ``91f55411`` (the
+    ``FlattenedDivMod`` composite is untouched). Opt in with
+    ``C4_DIV_MULTIPASS=1``.
+    """
+    return os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
+
+
 def mul_w2_thresh_fix_enabled() -> bool:
     """Return True iff the width=2 MUL 5-way-AND threshold is lowered to fire
     the clean-operand wide-product cases the default 19.5 just barely blocks

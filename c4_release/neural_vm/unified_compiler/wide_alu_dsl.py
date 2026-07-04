@@ -2546,6 +2546,469 @@ def multi_pass_mul_rules(
     return mp
 
 
+# ---------------------------------------------------------------------------
+# GAP-PRIMITIVE #2 (DIV pilot): multi-pass long-division cascade.
+#
+# ``wide_div_rules_ge_format(width_bytes=1)`` is a FLAT 256x256 cross-product
+# lookup (65,536 rules per opcode batch) — byte-accurate but O(256^width),
+# so it does NOT generalize past 8-bit operands (width=2 is 4.3B rules).
+#
+# ``multi_pass_div_rules`` derives the SAME single-byte quotient/remainder
+# from a COMPACT binary long-division spec (bit-serial shift-subtract with a
+# cross-pass RUNNING-REMAINDER carry) staged across FFN passes via the
+# ``MultiPassOp`` IR. The cross-pass remainder chain (bit i's remainder feeds
+# bit i-1's shift) is exactly what a single-forward FFN lookup cannot express.
+# Rule count is O(width * 256) per shift-subtract iteration — TRACTABLE at
+# every width (no cross-product explosion): the 8-bit cascade is ~7.7k rules
+# vs the flat lookup's 65,536 per opcode.
+#
+# This is the DIV analogue of ``multi_pass_mul_rules`` (schoolbook MUL). It
+# uses the SAME amplitude-normalized cascade convention (``_normalized_and_rule``
+# / ``_nibble_lookup_pass_rules``: read weight 1.0, threshold k-0.5 -> up=S*0.5,
+# write 1/(S*0.5)) so stacked SwiGLU magnitude stays pinned at the residual-1.0
+# fixed point pass-over-pass.
+#
+# The additive FFN cannot ERASE a residual one-hot, so every distinct
+# intermediate value uses its OWN fresh workspace lane (never a lane reused
+# across bits) — a stale prior-bit one-hot would additively collide with a
+# fresh write. The running remainder therefore snapshots into a fresh 2-nibble
+# lane pair each bit (R[8]..R[0]); the workspace is bounded (O(width) lanes).
+# ---------------------------------------------------------------------------
+
+
+def _mp_onehot_rule(
+    *,
+    name: str,
+    conditions: Sequence[str],
+    writes: Sequence[str],
+    opcode_gate: str,
+    S: float,
+) -> FFNRule:
+    """A k-input AND lookup rule in the normalized cascade convention.
+
+    Thin wrapper over :func:`_normalized_and_rule` that takes the condition
+    one-hot dim names directly (each read at weight 1.0). Used for the
+    1-/2-/3-/4-input nibble lookups the long-division cascade needs (bit
+    extract, double, borrow-subtract, mux-select, nibble assembly).
+    """
+    return _normalized_and_rule(
+        name=name,
+        conditions=tuple(conditions),
+        writes=tuple(writes),
+        opcode_gate=opcode_gate,
+        S=S,
+        target_amplitude=1.0,
+    )
+
+
+def multi_pass_div_rules(
+    *,
+    dividend_a_base: str,
+    divisor_b_base: str,
+    quotient_lane_bases: Sequence[str],
+    remainder_lane_bases: Sequence[str],
+    workspace_base: str,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    width_bytes: int = 1,
+):
+    """Derive single-byte DIV/MOD from a COMPACT long-division spec (MultiPassOp).
+
+    GAP-PRIMITIVE #2 DIV pilot. Returns a
+    :class:`~c4_release.neural_vm.unified_compiler.ir.MultiPassOp` whose staged
+    passes compute ``a // b`` (quotient) and ``a % b`` (remainder) for 8-bit
+    operands (``width_bytes=1``) via binary long division — bit-serial
+    shift-subtract with a cross-pass running-remainder carry, the construct
+    the flat ``wide_div_rules_ge_format`` lookup only avoids by brute-force
+    enumeration.
+
+    Divide-by-zero convention (matches ``wide_div_rules`` /
+    ``FlattenedDivMod``): ``b == 0`` -> ``q = 0, r = a`` (dividend
+    pass-through), realized structurally (see the b==0 note below).
+
+    Operands are read as nibble one-hots: ``dividend_a_base+nib`` is a's low
+    nibble a0, ``dividend_a_base+16+nib`` is a's high nibble a1; likewise the
+    divisor B at ``divisor_b_base`` (b0 = ``+nib``, b1 = ``+16+nib``). The
+    quotient / remainder are each written as two nibble one-hots (little-endian
+    lo, hi) at ``quotient_lane_bases[k]+nib`` / ``remainder_lane_bases[k]+nib``
+    (``k in {0,1}``). ``workspace_base`` is a scratch band (op-local residual
+    band) the passes populate with intermediate value one-hots.
+
+    Algorithm (validated bit-exact vs Python ``divmod`` over all 65,536 (a,b)
+    pairs — ``tools/_div_algo_proto.py`` + ``run_symbolic`` sweep):
+
+      Maintain a running remainder ``R`` (0..255, two nibbles). Initialise
+      R = 0. For bit ``i`` = 7..0 (MSB->LSB):
+
+        R2 = 2*R + a_bit(i)          (<= 9 bits: R2_lo, R2_hi, R2_top)
+        if R2 >= b:  R = R2 - b,  q_bit(i) = 1
+        else:        R = R2,       q_bit(i) = 0
+
+      The compare ``R2 >= b`` and subtract ``R2 - b`` are one nibble
+      borrow-subtract chain (cmp = final borrow == 0). After the last bit,
+      R is the remainder; the 8 q_bits assemble into the quotient byte.
+
+    Pass structure (per bit, distinct fresh workspace lanes so no additive
+    one-hot collision — the additive FFN cannot erase):
+
+      * P0 seed:      init R[8] = (0,0) one-hots; extract the 8 a_bit one-hots
+                      from a's two nibbles (1-input nibble->bit lookups).
+      * per bit i (4 passes, strictly sequential — bit i's R feeds bit i-1):
+          - double_lo:  R2_lo, carry_lo = split(2*R_lo + a_bit(i))
+          - double_hi:  R2_hi, R2_top   = split(2*R_hi + carry_lo)
+          - subtract:   d_lo,bl0 = subb(R2_lo,b_lo,0); d_hi,bl1 = subb(R2_hi,
+                        b_hi,bl0); cmp = (R2_top >= bl1)  (top borrow == 0)
+          - select:     if cmp: R_next=(d_lo,d_hi), q_bit=1 else
+                        R_next=(R2_lo,R2_hi), q_bit=0
+      * final assemble: q_lo = bits0..3, q_hi = bits4..7 (4-input AND lookups);
+                        remainder = final R; route q -> quotient lanes and
+                        r -> remainder lanes.
+
+    b==0 handling: with divisor b==0 the compare ``R2 >= b`` is ALWAYS true
+    (R2 >= 0 == b), so the cascade result is garbage. A seed-time detector
+    fires BZERO (both b nibbles == 0) or BNONZERO. The final ASSEMBLE writes
+    (cascade -> result lanes) are gated on BNONZERO, and a b==0 override pass
+    gated on BZERO writes the zero-divide convention (q=0, r=a). BZERO and
+    BNONZERO are mutually-exclusive one-hots, so each result lane holds EXACTLY
+    ONE hot cell for every (a,b) — a clean argmax decode. This matches
+    ``wide_div_rules`` / ``FlattenedDivMod``'s explicit zero-divide guard.
+
+    Rule count: ~7.7k units (8 bits x ~950 + seed + assemble) — vs the flat
+    ``wide_div_rules_ge_format`` 65,536 per opcode. O(width*256) per bit, so
+    it generalizes to wider dividends by adding bit iterations (no
+    cross-product blowup).
+
+    Args:
+        dividend_a_base: nibble-one-hot dividend band (a0 at +nib, a1 at
+            +16+nib).
+        divisor_b_base: nibble-one-hot divisor band (b0 at +nib, b1 at +16+nib).
+        quotient_lane_bases: 2-tuple of dim base names (q_lo, q_hi lanes).
+        remainder_lane_bases: 2-tuple of dim base names (r_lo, r_hi lanes).
+        workspace_base: scratch band (>= _DIV_WS_LANES*16 wide).
+        opcode_gate: DIV/MOD opcode flag dim (the cascade computes BOTH; the
+            live install routes q->OUTPUT for OP_DIV and r->OUTPUT for OP_MOD
+            in a final gated pass).
+        marker_gate: AX-style marker dim.
+        S: SwiGLU scale.
+        width_bytes: only 1 supported in the pilot (8-bit dividend/divisor).
+
+    Returns:
+        ``MultiPassOp`` with the seed + 32 per-bit + assemble passes.
+    """
+    from .ir import MultiPassOp
+
+    if width_bytes != 1:
+        raise NotImplementedError(
+            "multi_pass_div_rules: pilot supports width_bytes=1 only; the "
+            "shift-subtract cascade generalizes to wider dividends by adding "
+            "bit iterations (O(width) passes)."
+        )
+    if len(quotient_lane_bases) != 2 or len(remainder_lane_bases) != 2:
+        raise ValueError(
+            "multi_pass_div_rules: quotient_lane_bases and "
+            "remainder_lane_bases must each be a 2-tuple (lo, hi nibble lane "
+            "base names)"
+        )
+
+    def cell(base, off):
+        return f"{base}+{off}"
+
+    # Workspace lane layout. Each lane is a 16-wide value one-hot slot except
+    # bit/carry/borrow/cmp lanes which use 2 cells (0/1). We allocate them at
+    # 16-cell strides for a uniform address scheme (bit lanes waste 14 cells;
+    # cheap vs the collision-free clarity).
+    _next = [0]
+
+    def alloc():
+        idx = _next[0]
+        _next[0] += 1
+        return (workspace_base, idx * 16)
+
+    # a_bit one-hot lanes (2-value each), b==0 guard, running-R snapshots.
+    A_BIT = [alloc() for _ in range(8)]          # a_bit(0)..a_bit(7)
+    BZERO = alloc()                              # b==0 detector (cell 1 hot)
+    BNONZERO = alloc()                           # b!=0 detector (cell 1 hot)
+    # R snapshots: R[8] = seed (0), R[k] = remainder AFTER processing down to
+    # bit k. R[k] is (R_lo, R_hi) lane pair.
+    R_LO = [alloc() for _ in range(9)]           # R_LO[8..0]
+    R_HI = [alloc() for _ in range(9)]
+    # per-bit scratch (fresh per bit)
+    R2_LO = [alloc() for _ in range(8)]
+    R2_HI = [alloc() for _ in range(8)]
+    R2_TOP = [alloc() for _ in range(8)]         # bit 8 (0/1)
+    CARRY_LO = [alloc() for _ in range(8)]       # doubling lo->hi carry (0/1)
+    D_LO = [alloc() for _ in range(8)]
+    D_HI = [alloc() for _ in range(8)]
+    BL0 = [alloc() for _ in range(8)]            # borrow after lo subtract
+    BL1 = [alloc() for _ in range(8)]            # borrow after hi subtract
+    CMP = [alloc() for _ in range(8)]            # R2 >= b (cell 1 hot)
+    QBIT = [alloc() for _ in range(8)]           # q bit i (cell 1 hot)
+
+    ws_lanes = _next[0]
+
+    a0, a1 = (dividend_a_base, 0), (dividend_a_base, 16)
+    b0, b1 = (divisor_b_base, 0), (divisor_b_base, 16)
+
+    mp = MultiPassOp(name="multi_pass_div_w1", workspace_band=workspace_base)
+
+    # ----- P0 seed: init R[8]=0, extract a_bits, detect b==0 -----------------
+    p0 = mp.add_pass("p0_seed")
+    # Seed R[8] one-hots to value 0 (marker-only rule -> writes cell 0).
+    for lane in (R_LO[8], R_HI[8]):
+        p0.ffn.rules.append(_mp_onehot_rule(
+            name=f"seed_{lane[0]}_{lane[1]}",
+            conditions=(marker_gate,),
+            writes=(cell(lane[0], lane[1] + 0),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+    # Extract a_bit(i): bit b of nibble a0 (b=0..3) / a1 (b=4..7). 1-input
+    # lookup over the nibble value -> the bit one-hot cell.
+    for b_idx in range(8):
+        nib_lane = a0 if b_idx < 4 else a1
+        bit_in_nib = b_idx % 4
+        for nv in range(16):
+            bit = (nv >> bit_in_nib) & 1
+            p0.ffn.rules.append(_mp_onehot_rule(
+                name=f"abit{b_idx}_n{nv:x}",
+                conditions=(marker_gate, cell(nib_lane[0], nib_lane[1] + nv)),
+                writes=(cell(A_BIT[b_idx][0], A_BIT[b_idx][1] + bit),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+    # b==0 / b!=0 detectors: fire BZERO iff b0==0 AND b1==0; fire BNONZERO iff
+    # (b0!=0) OR (b1!=0). Realized as: for each (b0v, b1v) pair, write the
+    # right detector cell. 256 rules — but only need which of the two; emit a
+    # 2-input AND per pair once.
+    for b0v in range(16):
+        for b1v in range(16):
+            is_zero = (b0v == 0 and b1v == 0)
+            det = BZERO if is_zero else BNONZERO
+            p0.ffn.rules.append(_mp_onehot_rule(
+                name=f"bzero_b0{b0v:x}_b1{b1v:x}",
+                conditions=(marker_gate, cell(b0[0], b0[1] + b0v),
+                            cell(b1[0], b1[1] + b1v)),
+                writes=(cell(det[0], det[1] + 1),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+
+    b_lo_cell = lambda v: cell(b0[0], b0[1] + v)
+    b_hi_cell = lambda v: cell(b1[0], b1[1] + v)
+
+    # ----- per-bit passes (bit = 7..0) --------------------------------------
+    for step, i in enumerate(range(7, -1, -1)):
+        r_in_lo, r_in_hi = R_LO[i + 1], R_HI[i + 1]   # R from prior bit
+        r_out_lo, r_out_hi = R_LO[i], R_HI[i]         # R after this bit
+        abit = A_BIT[i]
+
+        # -- double_lo: R2_lo, carry_lo = split(2*R_lo + a_bit) --
+        pd_lo = mp.add_pass(f"p_bit{i}_double_lo")
+        for rlo in range(16):
+            for bit in range(2):
+                v = 2 * rlo + bit
+                lo, c = v & 0xF, v >> 4
+                pd_lo.ffn.rules.append(_mp_onehot_rule(
+                    name=f"dbllo_i{i}_r{rlo:x}_b{bit}",
+                    conditions=(marker_gate, cell(r_in_lo[0], r_in_lo[1] + rlo),
+                                cell(abit[0], abit[1] + bit)),
+                    writes=(cell(R2_LO[step][0], R2_LO[step][1] + lo),
+                            cell(CARRY_LO[step][0], CARRY_LO[step][1] + c)),
+                    opcode_gate=opcode_gate, S=S,
+                ))
+
+        # -- double_hi: R2_hi, R2_top = split(2*R_hi + carry_lo) --
+        pd_hi = mp.add_pass(f"p_bit{i}_double_hi")
+        for rhi in range(16):
+            for c in range(2):
+                v = 2 * rhi + c
+                hi, top = v & 0xF, v >> 4
+                pd_hi.ffn.rules.append(_mp_onehot_rule(
+                    name=f"dblhi_i{i}_r{rhi:x}_c{c}",
+                    conditions=(marker_gate, cell(r_in_hi[0], r_in_hi[1] + rhi),
+                                cell(CARRY_LO[step][0], CARRY_LO[step][1] + c)),
+                    writes=(cell(R2_HI[step][0], R2_HI[step][1] + hi),
+                            cell(R2_TOP[step][0], R2_TOP[step][1] + top)),
+                    opcode_gate=opcode_gate, S=S,
+                ))
+
+        # -- subtract lo: d_lo, bl0 = subborrow(R2_lo, b_lo, 0) --
+        ps_lo = mp.add_pass(f"p_bit{i}_sub_lo")
+        for r2lo in range(16):
+            for blo in range(16):
+                d = r2lo - blo
+                diff, borrow = (d + 16, 1) if d < 0 else (d, 0)
+                ps_lo.ffn.rules.append(_mp_onehot_rule(
+                    name=f"sublo_i{i}_r{r2lo:x}_b{blo:x}",
+                    conditions=(marker_gate,
+                                cell(R2_LO[step][0], R2_LO[step][1] + r2lo),
+                                b_lo_cell(blo)),
+                    writes=(cell(D_LO[step][0], D_LO[step][1] + diff),
+                            cell(BL0[step][0], BL0[step][1] + borrow)),
+                    opcode_gate=opcode_gate, S=S,
+                ))
+
+        # -- subtract hi + top-borrow -> cmp: d_hi, bl1 = subborrow(R2_hi,
+        #    b_hi, bl0); cmp = (R2_top >= bl1). Fuse the top compare in by
+        #    also reading R2_top: 4-input AND over (R2_hi, b_hi, bl0, R2_top).
+        ps_hi = mp.add_pass(f"p_bit{i}_sub_hi")
+        for r2hi in range(16):
+            for bhi in range(16):
+                for bl0 in range(2):
+                    d = r2hi - bhi - bl0
+                    diff, bl1 = (d + 16, 1) if d < 0 else (d, 0)
+                    for r2top in range(2):
+                        cmp = 1 if r2top >= bl1 else 0
+                        ps_hi.ffn.rules.append(_mp_onehot_rule(
+                            name=f"subhi_i{i}_r{r2hi:x}_b{bhi:x}_c{bl0}_t{r2top}",
+                            conditions=(
+                                marker_gate,
+                                cell(R2_HI[step][0], R2_HI[step][1] + r2hi),
+                                b_hi_cell(bhi),
+                                cell(BL0[step][0], BL0[step][1] + bl0),
+                                cell(R2_TOP[step][0], R2_TOP[step][1] + r2top),
+                            ),
+                            writes=(
+                                cell(D_HI[step][0], D_HI[step][1] + diff),
+                                cell(CMP[step][0], CMP[step][1] + cmp),
+                            ),
+                            opcode_gate=opcode_gate, S=S,
+                        ))
+
+        # -- select: q_bit = cmp; R_next = cmp ? (d_lo,d_hi) : (R2_lo,R2_hi) --
+        psel = mp.add_pass(f"p_bit{i}_select")
+        # q_bit = cmp (identity copy)
+        for c in range(2):
+            psel.ffn.rules.append(_mp_onehot_rule(
+                name=f"qbit_i{i}_c{c}",
+                conditions=(marker_gate, cell(CMP[step][0], CMP[step][1] + c)),
+                writes=(cell(QBIT[step][0], QBIT[step][1] + c),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+        # R_next_lo: cmp==1 -> d_lo; cmp==0 -> R2_lo. (2-input AND per branch)
+        for v in range(16):
+            psel.ffn.rules.append(_mp_onehot_rule(
+                name=f"rnlo_i{i}_cmp1_v{v:x}",
+                conditions=(marker_gate, cell(CMP[step][0], CMP[step][1] + 1),
+                            cell(D_LO[step][0], D_LO[step][1] + v)),
+                writes=(cell(r_out_lo[0], r_out_lo[1] + v),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+            psel.ffn.rules.append(_mp_onehot_rule(
+                name=f"rnlo_i{i}_cmp0_v{v:x}",
+                conditions=(marker_gate, cell(CMP[step][0], CMP[step][1] + 0),
+                            cell(R2_LO[step][0], R2_LO[step][1] + v)),
+                writes=(cell(r_out_lo[0], r_out_lo[1] + v),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+        for v in range(16):
+            psel.ffn.rules.append(_mp_onehot_rule(
+                name=f"rnhi_i{i}_cmp1_v{v:x}",
+                conditions=(marker_gate, cell(CMP[step][0], CMP[step][1] + 1),
+                            cell(D_HI[step][0], D_HI[step][1] + v)),
+                writes=(cell(r_out_hi[0], r_out_hi[1] + v),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+            psel.ffn.rules.append(_mp_onehot_rule(
+                name=f"rnhi_i{i}_cmp0_v{v:x}",
+                conditions=(marker_gate, cell(CMP[step][0], CMP[step][1] + 0),
+                            cell(R2_HI[step][0], R2_HI[step][1] + v)),
+                writes=(cell(r_out_hi[0], r_out_hi[1] + v),),
+                opcode_gate=opcode_gate, S=S,
+            ))
+
+    # ----- assemble: quotient nibbles from the 8 q_bits, route results ------
+    # q_lo = bit0 + 2*bit1 + 4*bit2 + 8*bit3 ; q_hi = bit4..bit7.
+    # QBIT[step] holds bit i where step = 7 - i, so QBIT for bit b is at
+    # index (7 - b).
+    #
+    # Every assemble-from-cascade write is CONDITIONED on BNONZERO (b != 0) so
+    # the cascade result NEVER lands on the lanes for a b==0 row (where it is
+    # garbage — the compare R2>=0 is always true). The b==0 override pass then
+    # writes the zero-divide convention on the SAME lanes gated on BZERO. BZERO
+    # and BNONZERO are mutually exclusive one-hots, so each result lane holds
+    # EXACTLY ONE hot cell — a clean argmax decode, not a fragile tie.
+    def qbit_lane(b):
+        return QBIT[7 - b]
+
+    bnz_cell = cell(BNONZERO[0], BNONZERO[1] + 1)
+
+    p_asm = mp.add_pass("p_assemble")
+    # q_lo (bits 0..3): 5-input AND over the 4 bit one-hots + BNONZERO.
+    for combo in range(16):
+        bits = [(combo >> k) & 1 for k in range(4)]
+        conds = [marker_gate, bnz_cell]
+        for k in range(4):
+            lane = qbit_lane(k)
+            conds.append(cell(lane[0], lane[1] + bits[k]))
+        p_asm.ffn.rules.append(_mp_onehot_rule(
+            name=f"qlo_{combo:x}",
+            conditions=tuple(conds),
+            writes=(cell(quotient_lane_bases[0], combo),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+    # q_hi (bits 4..7)
+    for combo in range(16):
+        bits = [(combo >> k) & 1 for k in range(4)]
+        conds = [marker_gate, bnz_cell]
+        for k in range(4):
+            lane = qbit_lane(4 + k)
+            conds.append(cell(lane[0], lane[1] + bits[k]))
+        p_asm.ffn.rules.append(_mp_onehot_rule(
+            name=f"qhi_{combo:x}",
+            conditions=tuple(conds),
+            writes=(cell(quotient_lane_bases[1], combo),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+    # remainder = final R (R[0]); copy R[0] nibbles to the remainder lanes
+    # (b != 0 only).
+    for v in range(16):
+        p_asm.ffn.rules.append(_mp_onehot_rule(
+            name=f"rlo_{v:x}",
+            conditions=(marker_gate, bnz_cell, cell(R_LO[0][0], R_LO[0][1] + v)),
+            writes=(cell(remainder_lane_bases[0], v),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+        p_asm.ffn.rules.append(_mp_onehot_rule(
+            name=f"rhi_{v:x}",
+            conditions=(marker_gate, bnz_cell, cell(R_HI[0][0], R_HI[0][1] + v)),
+            writes=(cell(remainder_lane_bases[1], v),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+
+    # ----- b==0 override: q=0, r=a (dividend pass-through). ------------------
+    # Gated on the BZERO detector (mutually exclusive with the BNONZERO-gated
+    # assemble above), so for a b==0 row ONLY these convention cells are hot —
+    # the cascade garbage never reaches the result lanes. This is the
+    # zero-divide convention wide_div_rules / FlattenedDivMod use (q=0, r=a).
+    p_bz = mp.add_pass("p_bzero_override")
+    # q_lo = 0, q_hi = 0
+    for lane in (quotient_lane_bases[0], quotient_lane_bases[1]):
+        p_bz.ffn.rules.append(_mp_onehot_rule(
+            name=f"bz_q0_{lane}",
+            conditions=(marker_gate, cell(BZERO[0], BZERO[1] + 1)),
+            writes=(cell(lane, 0),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+    # r = a: copy a0 -> r_lo, a1 -> r_hi (gated on BZERO)
+    for av in range(16):
+        p_bz.ffn.rules.append(_mp_onehot_rule(
+            name=f"bz_rlo_{av:x}",
+            conditions=(marker_gate, cell(BZERO[0], BZERO[1] + 1),
+                        cell(a0[0], a0[1] + av)),
+            writes=(cell(remainder_lane_bases[0], av),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+        p_bz.ffn.rules.append(_mp_onehot_rule(
+            name=f"bz_rhi_{av:x}",
+            conditions=(marker_gate, cell(BZERO[0], BZERO[1] + 1),
+                        cell(a1[0], a1[1] + av)),
+            writes=(cell(remainder_lane_bases[1], av),),
+            opcode_gate=opcode_gate, S=S,
+        ))
+
+    mp._div_ws_lanes = ws_lanes  # introspection: workspace width in lanes
+    return mp
+
+
 __all__ = [
     "bitwise_rules",
     "nibble_alu_lane_rules",
@@ -2557,6 +3020,7 @@ __all__ = [
     "wide_shift_rules",
     "wide_mul_rules",
     "multi_pass_mul_rules",
+    "multi_pass_div_rules",
     "wide_div_rules",
     "wide_div_rules_ge_format",
 ]
