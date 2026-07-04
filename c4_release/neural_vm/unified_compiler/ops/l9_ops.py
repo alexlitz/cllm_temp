@@ -5,6 +5,11 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import byte_clear_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
+from ..isa_semantics_dsl import (
+    RegisterDeltaSpec,
+    RuntimeAddDelta,
+    control_op,
+)
 from ..wide_alu_dsl import (
     amplified_nibble_adder_rules,
     nibble_alu_lane_rules,
@@ -317,78 +322,67 @@ def _lea_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     )
 
 
-def _adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
-    """ADJ hi-nibble cross-product (512 units).
+def _adj_control_op(S: float):
+    """The ADJ ``control_op`` frame descriptor — ADJ = ``SP += imm``.
 
-    Same structural shape as ``_lea_hi_nibble_rules`` (amplified
-    AX marker AND with ``ALU_HI`` and ``FETCH_HI``, non-AX blocker dims
-    at ``-S*1000``) but gates on ``OP_ADJ`` and uses slightly shifted
-    thresholds (42.0 / 50.0) so the carry/no-carry discrimination still
-    works after the ADJ opcode amplification. Writes
-    ``OUTPUT_HI_THIS_STEP+result`` where ``result = (a + b + carry_in)
-    % 16``.
+    ``docs/semantic_spec_CONTROL.md`` §2b: ``ADJ = ControlOp(pc_next=SEQUENTIAL,
+    frame_delta=[SP_DELTA(+, imm)])``. The single ``SP_DELTA(+, imm)`` is the
+    ``SpDelta`` runtime adder — ``SP += imm`` where ``imm`` is a LIVE operand
+    (the instruction immediate's high nibble in ``FETCH_HI``), NOT a compile-time
+    constant. It DELEGATES to the shared L9 amplified nibble adder (the same one
+    LEA/ENT use). The whole 512-unit ADJ hi-nibble band is now this ONE
+    ``RuntimeAddDelta`` DATA row.
 
-    Phase 7.E.3: gate uses :func:`dim_ref` for the
-    ``(opcode_flag, ADJ)`` semantic pair.
+    Byte-identical to the prior hand-authored ``_adj_hi_nibble_rules`` (proven
+    by the whole-model golden hash == ``91f55411``): the derived rules reproduce
+    the amplified MARK_SE_ONLY AND (``+20`` marker, the seven non-AX blockers at
+    ``-1000``, ``ALU_HI[a]`` ``+1``, ``FETCH_HI[b]`` ``+20``, ``CARRY+0``
+    carry-in ``+/-8``, thresholds 42.0 / 50.0) writing ``(a+b+carry_in)%16`` to
+    ``OUTPUT_HI_THIS_STEP`` — cell-for-cell.
 
-    Cluster 6 fix (2026-06-10): MARK_AX -> MARK_SE_ONLY (mirrors the
-    Wave B Cluster 2 migration applied to ``_layer8_alu_adj_lo_rules``
-    in commit b1e1f91e). The legacy MARK_AX-amplified units wrote
-    ``OUTPUT_HI_THIS_STEP+{result}`` at the AX marker row, which the LM
-    head reads as the AX byte 0 high nibble for the NEXT emitted token.
-    Because OP_ADJ persists into the post-ADJ step's MARK_AX row (via
-    Wave A's L11 ``step_end_operand_relay`` head, 10ca51a7) and the
-    unit's W_up reads ``ALU_HI.*.-1`` / ``CARRY.*.-1`` from the
-    previous step, the carry_in=0/a=0/b=0 unit (unit 1024) fired at
-    the post-ADJ REG_AX row and clobbered the preserved AX byte 0 high
-    nibble. Example: ``IMM 42; PSH; ADJ 8; EXIT`` returned 10 instead
-    of 42 because OUTPUT_HI+0 spiked from 3.14 to 34.99 at the L11
-    FFN, giving token 10 (low nibble 10 + high nibble 0) a higher
-    logit than token 42 (low nibble 10 + high nibble 2). Moving the
-    amplifier to MARK_SE_ONLY pushes the write into the STEP_END row
-    where the AX byte emit path does not consume it. See
+    Cluster 6 (2026-06-10) — the marker is ``MARK_SE_ONLY`` (not ``MARK_AX``):
+    the Wave A ``step_end_operand_relay`` head broadcasts ALU_HI/FETCH_HI/CARRY/
+    OP_ADJ into the STEP_END row so the amplified AND fires there over identical
+    operand state, keeping the write off the post-ADJ AX byte
+    (``IMM 42; PSH; ADJ 8; EXIT`` -> 42, not 10). See
     ``docs/SMOKE_TRIAGE_2026_06_10.md`` Cluster 6.
     """
-
     gate_adj = dim_ref("opcode_flag", "ADJ")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    rules: list[FFNRule] = []
-    # Same 10-way amplified AND shape as _lea_hi_nibble_rules but
-    # gated on OP_ADJ with slightly shifted thresholds (42.0 / 50.0) to
-    # accommodate the ADJ-side opcode amplification. Writes the same
-    # (a + b + carry_in) % 16 sum to OUTPUT_HI_THIS_STEP.
-    for carry_in in (0, 1):
-        for a in range(16):
-            for b in range(16):
-                result = (a + b + carry_in) % 16
-                # Cluster 6 fix: MARK_AX -> MARK_SE_ONLY (Wave B Cluster
-                # 2 pattern). The Wave A step_end_operand_relay head
-                # (10ca51a7) broadcasts ALU_HI/FETCH_HI/CARRY/OP_ADJ
-                # from MARK_AX to MARK_SE_ONLY within the same step, so
-                # the same 10-way AND fires at STEP_END over identical
-                # operand state without clobbering the post-ADJ AX byte.
-                conditions: list[tuple[str, float]] = [
-                    ("MARK_SE_ONLY", 20.0),
-                ]
-                conditions.extend(
-                    (dim, -1000.0) for dim in _NON_AX_BLOCKERS
-                )
-                conditions.append((f"ALU_HI+{a}", 1.0))
-                conditions.append((f"FETCH_HI+{b}", 20.0))
-                if carry_in == 0:
-                    conditions.append((carry_byte0, -8.0))
-                    threshold = 42.0
-                else:
-                    conditions.append((carry_byte0, 8.0))
-                    threshold = 50.0
-                rules.append(multi_way_and_rule(
-                    name=f"adj_hi_c{carry_in}_a{a}_b{b}_step_end",
-                    conditions=tuple(conditions),
-                    threshold=threshold,
-                    gate=gate_adj,
-                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
-                ))
-    return tuple(rules)
+    sp_delta = RegisterDeltaSpec(
+        name="adj_sp_delta",
+        kind="runtime_add",
+        write_scale=2.0 / S,
+        conditions=((gate_adj, 1.0),),
+        runtime_add=RuntimeAddDelta(
+            gate=gate_adj,
+            op="add",
+            operand_a_band="ALU_HI",
+            operand_b_band="FETCH_HI",
+            result_band="OUTPUT_HI_THIS_STEP",
+            marker_gate="MARK_SE_ONLY",
+            blocker_dims=tuple(_NON_AX_BLOCKERS),
+            carry_in_dim=dim_ref("carry", "alu", 0),
+            threshold_no_carry=42.0,
+            threshold_with_carry=50.0,
+            write_scale=2.0 / S,
+            name_fn=lambda c, a, b: f"adj_hi_c{c}_a{a}_b{b}_step_end",
+        ),
+    )
+    return control_op("ADJ", [sp_delta], instr_width=8, pc_offset=2)
+
+
+def _adj_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
+    """ADJ hi-nibble band (512 units) — DERIVED from the ADJ ``control_op``.
+
+    ADJ = ``SP += imm`` is a single ``SP_DELTA(+, imm)`` (§2b). That delta is
+    the ``SpDelta`` runtime adder (:class:`isa_semantics_dsl.RuntimeAddDelta`,
+    ``kind="runtime_add"``), whose amount comes from the LIVE ``FETCH_HI``
+    operand band and delegates to the shared L9 amplified nibble adder. The
+    previously hand-authored 512-unit ``for carry_in: for a: for b:``
+    cross-product is DELETED — this is now :func:`_adj_control_op`'s one derived
+    band. Byte-identical to the prior loop (golden hash == ``91f55411``).
+    """
+    return _adj_control_op(S).rules_builder()
 
 
 def _sub_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:

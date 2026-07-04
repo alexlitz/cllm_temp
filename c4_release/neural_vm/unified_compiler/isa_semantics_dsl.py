@@ -49,6 +49,7 @@ from .building_blocks_dsl import multi_way_and_rule
 from .ir import FFNRule, StepWindowConstraint, TokenEmbeddingRule
 from .primitives import AO, AP, DeclarativeAttentionHeadSpec
 from .ops.residual_band_registry import register_residual_band
+from .wide_alu_dsl import amplified_nibble_adder_rules
 
 
 # ---------------------------------------------------------------------------
@@ -3953,6 +3954,77 @@ class SequentialAddDelta:
 
 
 @dataclass(frozen=True)
+class RuntimeAddDelta:
+    """``register += live_operand`` per-step update — the ``SpDelta`` runtime adder.
+
+    Where :class:`SequentialAddDelta` adds a COMPILE-TIME constant (the
+    nibble-ROTATION adder, ``reg + amount``), this is the ``reg + RUNTIME
+    operand`` adder: the amount is a LIVE operand band read at build-of-model
+    time only as a dim NAME — its VALUE is supplied at inference by the model
+    (``operand_b_band``, e.g. ``FETCH_HI``, the instruction immediate's high
+    nibble). It DELEGATES to the shared L9 amplified nibble adder
+    (:func:`wide_alu_dsl.amplified_nibble_adder_rules`) — the SAME 16x16
+    cross-product LEA (``imm`` into an address) and ENT (``SP -= imm``) call —
+    so the ``control_op`` frame descriptor can express ADJ's ``SP += imm`` (and,
+    with ``op="sub"``, the JSR/ENT SP-DECREMENT by a runtime amount) as DATA
+    rather than a hand-authored 512-unit cross-product.
+
+    This is the runtime-operand generalization the ADJ residual named: the
+    hand-authored ``l9_ops._adj_hi_nibble_rules`` was an amplified 16x16 adder
+    shared-in-SHAPE with LEA/ADD but NOT expressible by ``SequentialAddDelta``
+    (which only does nibble rotation by a const). ``RuntimeAddDelta`` closes it
+    by naming the amount source as a band and routing to the shared adder.
+
+    The lowered rules are the L9 amplified-marker AND (marker(+20) + the non-AX
+    blocker dims at -1000 + operand-A/B nibble cells + the ``carry_in_dim``
+    discrimination), so a ``runtime_add`` :class:`RegisterDeltaSpec` reproduces
+    the hand-authored ADJ/LEA/ENT hi-nibble band byte-for-byte.
+
+    Attributes:
+        gate: the opcode-flag gate (``OP_ADJ`` / ``OP_LEA`` / ``OP_ENT``) — the
+            multiplicative gate the shared adder fires under.
+        op: ``"add"`` (``result=(a+b+cin)%16``, ADJ's ``SP += imm`` / LEA) or
+            ``"sub"`` (``result=(a-b-cin)%16``, ENT's ``SP -= imm``).
+        operand_a_band: the register's per-nibble one-hot band (``ALU_HI``).
+        operand_b_band: the LIVE operand band supplying the amount
+            (``FETCH_HI``, the immediate's high nibble).
+        result_band: where the summed nibble lands (``OUTPUT_HI_THIS_STEP``).
+        marker_gate: the amplified marker (``MARK_AX`` / ``MARK_SE_ONLY``).
+        blocker_dims: the non-AX marker/byte blockers (repelled at
+            ``-blocker_weight``).
+        carry_in_dim: the ``CARRY+0`` carry/borrow-in dim.
+        threshold_no_carry / threshold_with_carry: the carry_in=0 / =1 AND
+            thresholds (explicit; the -1000 blockers rule out auto-derivation).
+        write_scale: the result-nibble write magnitude (``2.0/S``).
+        name_fn: ``(carry_in, a, b) -> rule_name`` (byte-identity names).
+        marker_weight / operand_a_weight / operand_b_weight / blocker_weight /
+        carry_in_weight: the amplified-AND weights (defaults match the L9 bake).
+        extra_conditions: extra fixed condition terms in the hand-authored
+            position (right after the blocker band) — e.g. ENT's first-step
+            ``(HAS_SE, -1000)`` blocker.
+    """
+
+    gate: str
+    operand_a_band: str
+    operand_b_band: str
+    result_band: str
+    marker_gate: str
+    blocker_dims: Tuple[str, ...]
+    carry_in_dim: str
+    threshold_no_carry: float
+    threshold_with_carry: float
+    write_scale: float
+    name_fn: Callable[[int, int, int], str]
+    op: str = "add"
+    marker_weight: float = 20.0
+    operand_a_weight: float = 1.0
+    operand_b_weight: float = 20.0
+    blocker_weight: float = 1000.0
+    carry_in_weight: float = 8.0
+    extra_conditions: Tuple[Tuple[str, float], ...] = ()
+
+
+@dataclass(frozen=True)
 class BranchTargetDelta:
     """A PC-source OVERRIDE that materializes ``PC = imm*INSTR_WIDTH+PC_OFFSET``.
 
@@ -4147,21 +4219,25 @@ class RegisterDeltaSpec:
     """
 
     name: str
-    kind: str  # "sequential_add"|"branch_target"|"push"|"assign"|"pop_cam"
+    kind: str  # "sequential_add"|"runtime_add"|"branch_target"|"push"|"assign"|"pop_cam"
     write_scale: float
     sequential_add: Optional[SequentialAddDelta] = None
+    runtime_add: Optional[RuntimeAddDelta] = None
     branch_target: Optional[BranchTargetDelta] = None
     push: Optional[PushDelta] = None
     assign: Optional[AssignDelta] = None
     pop_cam: Optional[PopCamDelta] = None
     # The shared AND gate (opcode + marker + step guard). The override kind
     # (branch_target) uses it as the whole gate; PUSH/ASSIGN/POP-CAM use it as
-    # the base conditions ANDed with the per-cell band term.
+    # the base conditions ANDed with the per-cell band term. RUNTIME_ADD carries
+    # its whole amplified gate on the delta dataclass (opcode gate + marker +
+    # blockers + carry discrimination), so the spec ``conditions`` is unused.
     conditions: Tuple[Tuple[str, float], ...] = ()
     threshold: float = 0.0
 
     _KIND_FIELD = {
         "sequential_add": "sequential_add",
+        "runtime_add": "runtime_add",
         "branch_target": "branch_target",
         "push": "push",
         "assign": "assign",
@@ -4316,6 +4392,41 @@ def _seq_add_rules(
     """
 
     return _seq_add_default_rules(spec) + _seq_add_adder_rules(spec)
+
+
+def _runtime_add_rules(spec: RegisterDeltaSpec) -> list[FFNRule]:
+    """Derive the RUNTIME_ADD (``reg += live_operand``) band — the ``SpDelta``.
+
+    Delegates to the SHARED L9 amplified nibble adder
+    (:func:`wide_alu_dsl.amplified_nibble_adder_rules`) — the SAME 16x16
+    cross-product LEA/ENT use — so the ``control_op`` descriptor's ADJ
+    ``SP += imm`` (and, with ``op="sub"``, the ENT SP-decrement) reproduces the
+    hand-authored ADJ/ENT hi-nibble band byte-for-byte. The amount is a LIVE
+    operand band (``d.operand_b_band``), the runtime-operand generalization the
+    ADJ residual named (``SequentialAddDelta`` only does ``reg + const``).
+    """
+    d = spec.runtime_add
+    assert d is not None  # guarded by RegisterDeltaSpec.__post_init__
+    return list(amplified_nibble_adder_rules(
+        op=d.op,
+        operand_a_band=d.operand_a_band,
+        operand_b_band=d.operand_b_band,
+        marker_gate=d.marker_gate,
+        blocker_dims=d.blocker_dims,
+        blocker_weight=d.blocker_weight,
+        gate=d.gate,
+        carry_in_dim=d.carry_in_dim,
+        carry_in_weight=d.carry_in_weight,
+        threshold_no_carry=d.threshold_no_carry,
+        threshold_with_carry=d.threshold_with_carry,
+        result_band=d.result_band,
+        write_scale=spec.write_scale,
+        name_fn=d.name_fn,
+        marker_weight=d.marker_weight,
+        operand_a_weight=d.operand_a_weight,
+        operand_b_weight=d.operand_b_weight,
+        extra_conditions=d.extra_conditions,
+    ))
 
 
 def _branch_target_rules(
@@ -4533,6 +4644,8 @@ def _register_delta_rules(
 ) -> list[FFNRule]:
     if spec.kind == "sequential_add":
         return _seq_add_rules(spec, instr_width, pc_offset)
+    if spec.kind == "runtime_add":
+        return _runtime_add_rules(spec)
     if spec.kind == "push":
         return _push_rules(spec)
     if spec.kind == "assign":
@@ -4557,6 +4670,15 @@ def _register_delta_reads_writes(
         reads.update({sd.default_marker, sd.fresh_key, sd.suppress_op,
                       sd.src_lo, sd.src_hi})
         writes.update({sd.dst_lo, sd.dst_hi, sd.src_lo, sd.src_hi})
+    elif spec.kind == "runtime_add":
+        rd = spec.runtime_add
+        assert rd is not None
+        reads.update({rd.gate, rd.operand_a_band, rd.operand_b_band,
+                      rd.marker_gate, rd.carry_in_dim})
+        reads.update(rd.blocker_dims)
+        for (dim, _w) in rd.extra_conditions:
+            reads.add(_base(dim))
+        writes.add(rd.result_band)
     elif spec.kind == "push":
         pd = spec.push
         assert pd is not None
