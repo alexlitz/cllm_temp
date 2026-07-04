@@ -484,6 +484,112 @@ def make_mul_partial_dep_anchor_op() -> Operation:
     )
 
 
+def _install_multipass_mul(block, dim_positions, S):
+    """GAP-PRIMITIVE #2: bake the 7-pass schoolbook MUL cascade into this block.
+
+    Replaces the L11 mul-partial lookup ``block.ffn`` with a
+    :class:`~neural_vm.efficient_alu_neural.MultiPassMulBlock` — the 7 lowered
+    ``PureFFN`` passes of ``multi_pass_mul_rules`` packed into one block forward
+    (the ``FlattenedALUMul`` collapse pattern; the physical block count is
+    unchanged, so the absolute-position lea contract holds).
+
+    Band routing (proven byte-identical to ``(a*b)&0xFFFF`` over all 65,536
+    pairs against the live non-contiguous layout, ``/tmp/probe_mp_livebands``):
+
+      * operand A nibbles: ``ALU_LO`` (a0) + ``ALU_HI`` (a1, = ALU_LO+16)
+      * operand B nibbles: ``AX_CARRY_LO`` (b0) + ``AX_CARRY_HI`` (b1)
+      * marker + opcode gate: ``MARK_AX`` + ``OP_MUL``
+      * product little-endian nibble lanes ->
+          nib0 -> OUTPUT_LO, nib1 -> OUTPUT_HI (byte 0),
+          nib2 -> MUL_RESULT_HI_LO, nib3 -> MUL_RESULT_HI_HI (byte 1)
+      * scratch: ``MUL_MULTIPASS_WS`` (240-dim op-local band)
+
+    The marker gate is ``MARK_AX`` (not ``MARK_SE_ONLY``): the cascade's passes
+    1..6 read the workspace one-hots pass 0 wrote at the SAME row, so the
+    marker must be present at that row throughout the block — MARK_AX is stable
+    across the MUL emit blocks (the operand bands are gathered there).
+    """
+    from ...base_layers import PureFFN
+    from ...efficient_alu_neural import MultiPassMulBlock
+    from ..wide_alu_dsl import multi_pass_mul_rules
+
+    mp = multi_pass_mul_rules(
+        operand_a_base="ALU_LO",
+        operand_b_base="AX_CARRY_LO",
+        result_base="__multipass_unused__",
+        workspace_base="MUL_MULTIPASS_WS",
+        opcode_gate="OP_MUL",
+        marker_gate="MARK_AX",
+        S=S,
+        width_bytes=2,
+        result_lane_bases=(
+            "OUTPUT_LO", "OUTPUT_HI",
+            "MUL_RESULT_HI_LO", "MUL_RESULT_HI_HI",
+        ),
+    )
+
+    # Residual width from whatever the prior bake left on block.ffn (PureFFN
+    # W_up is [hidden, d_model]); fall back to the attention dim.
+    ffn_in = block.ffn
+    if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+        d_model = int(ffn_in.W_up.shape[1])
+    elif hasattr(block, "attn") and hasattr(block.attn, "dim"):
+        d_model = int(block.attn.dim)
+    else:
+        d_model = int(getattr(ffn_in, "dim", 512))
+
+    proxy = _as_setdim_proxy(dim_positions)
+    flat = mp.as_flat_ir()
+    passes = []
+    for idx, p in enumerate(mp.passes):
+        names = Primitives.ffn_rule_dim_names(p.ffn.rules)
+        dim_pos = Primitives.dim_positions_from_bd(proxy, names)
+        ffn = PureFFN(dim=d_model, hidden_dim=max(1, p.hidden_units))
+        end = flat.lower_ffn(ffn, dim_pos, layer_idx=idx, start_unit=0, S=S)
+        assert end == p.hidden_units, (
+            f"multi_pass MUL pass {idx}: lowered {end} units, "
+            f"expected {p.hidden_units}"
+        )
+        passes.append(ffn)
+
+    mp_block = MultiPassMulBlock(passes)
+
+    # Campaign operand-A SE recovery (same as the width=2 wide_mul lookup
+    # path, ``make_efficient_l11_alumul_wrap_op``): under the campaign L10
+    # ALU-clear, operand A's ALU_LO/HI band is crushed all-negative for a
+    # value-dependent subset of MUL rows, so the cascade's P0 partial-product
+    # AND units read the wrong (or empty) operand and the product byte 0/1 is
+    # wrong. The clean operand survives in SE_ALU_LO/HI (the L9
+    # step_end_operand_relay mirror). Wrap the cascade so it restores the
+    # crushed operand from SE_ALU BEFORE the passes read it — the byte-0
+    # SE-recovery precedent applied to the multipass cascade. Gate-OFF /
+    # non-campaign leaves ``block.ffn = mp_block`` untouched.
+    from .shared import (
+        no_stack0_emit_enabled,
+        mul_byte0_se_recover_enabled,
+        mul_l11_se_recover_enabled,
+    )
+    block_ffn = mp_block
+    if (
+        no_stack0_emit_enabled()
+        and mul_byte0_se_recover_enabled()
+        and mul_l11_se_recover_enabled()
+        and hasattr(proxy, "SE_ALU_LO")
+        and hasattr(proxy, "SE_ALU_HI")
+    ):
+        from ...efficient_alu_neural import MulOperandSeRecoverFFN
+        block_ffn = MulOperandSeRecoverFFN(
+            mp_block,
+            alu_lo=proxy.ALU_LO,
+            alu_hi=proxy.ALU_HI,
+            se_alu_lo=proxy.SE_ALU_LO,
+            se_alu_hi=proxy.SE_ALU_HI,
+            mark_ax=proxy.MARK_AX,
+            op_mul=proxy.OP_MUL,
+        )
+    block.ffn = block_ffn
+
+
 def make_mul_partial_op(alu_mode: str = "lookup") -> Operation:
     """L11 FFN: MUL partial product accumulation.
 
@@ -505,6 +611,19 @@ def make_mul_partial_op(alu_mode: str = "lookup") -> Operation:
         if alu_mode == "efficient":
             return None
         proxy = _as_setdim_proxy(dim_positions)
+
+        # GAP-PRIMITIVE #2 install (``C4_MUL_MULTIPASS=1``): replace the L11
+        # mul-partial lookup with the 7-pass schoolbook cascade packed into
+        # this one block (see ``_install_multipass_mul``). It computes the
+        # FULL 16-bit product from a compact spec, routing byte 0 to
+        # OUTPUT_LO/HI and byte 1 to the MUL_RESULT_HI_LO/HI band; the L10
+        # mul_lo + L12 mul_combine byte-0 writers are gated OFF (they double-
+        # write the same nibbles). Flag-off falls through to the byte-
+        # identical lookup bake below.
+        from .shared import mul_multipass_enabled
+        if mul_multipass_enabled():
+            _install_multipass_mul(block, dim_positions, S)
+            return
 
         # Per-bake FFN-unit allocator. Each L11 MUL partial slab (one per
         # ``a_lo``) is pinned to its existing offset so the lowering call

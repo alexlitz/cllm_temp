@@ -37,7 +37,7 @@ bit-for-bit on randomized input (see Section 4 of the design doc and
 from __future__ import annotations
 
 import operator
-from typing import Callable, Literal, Sequence, Tuple
+from typing import Callable, Literal, Optional, Sequence, Tuple
 
 from .building_blocks_dsl import multi_way_and_rule
 from .ir import FFNRule
@@ -2045,6 +2045,7 @@ def multi_pass_mul_rules(
     marker_gate: str,
     S: float,
     width_bytes: int = 2,
+    result_lane_bases: Optional[Sequence[str]] = None,
 ):
     """Derive wide MUL from a COMPACT schoolbook spec as a MultiPassOp.
 
@@ -2096,12 +2097,25 @@ def multi_pass_mul_rules(
 
     Args:
         operand_a_base / operand_b_base: nibble-one-hot operand bands.
-        result_base: 4-lane result band.
+        result_base: 4-lane result band (used only when
+            ``result_lane_bases`` is None — the 4 nibble lanes then land at
+            ``result_base + lane*16 + nib`` for a single CONTIGUOUS 64-wide
+            band).
         workspace_base: scratch band (>= 16*15 = 240 wide).
         opcode_gate: MUL opcode flag dim.
         marker_gate: AX-style marker dim.
         S: SwiGLU scale.
         width_bytes: only 2 supported in the pilot (8-bit x 8-bit).
+        result_lane_bases: optional 4-tuple of dim base names, one per
+            result nibble lane ``(nib0, nib1, nib2, nib3)``. When given, the
+            product's little-endian nibble ``lane`` is written to
+            ``result_lane_bases[lane] + nib`` — decoupling the 4 lanes so
+            they can route to NON-CONTIGUOUS live bands (the live MUL byte-0
+            lands in OUTPUT_LO/OUTPUT_HI, byte-1 in the separate
+            MUL_RESULT_HI_LO/HI band). ``result_base`` is ignored when this
+            is set. Byte-identity contract with the contiguous form:
+            passing ``(result_base+0, result_base+16, result_base+32,
+            result_base+48)`` reproduces the default lane routing exactly.
 
     Returns:
         ``MultiPassOp`` with 7 passes (P0..P6).
@@ -2113,6 +2127,13 @@ def multi_pass_mul_rules(
             "multi_pass_mul_rules: pilot supports width_bytes=2 only; the "
             "schoolbook cascade generalizes to width>2 by adding "
             "partial-product + column-add passes (O(width^2) passes)."
+        )
+
+    if result_lane_bases is not None and len(result_lane_bases) != 4:
+        raise ValueError(
+            "multi_pass_mul_rules: result_lane_bases must be a 4-tuple "
+            f"(one dim base per product nibble lane), got "
+            f"{len(result_lane_bases)}"
         )
 
     def split(v):
@@ -2142,6 +2163,12 @@ def multi_pass_mul_rules(
     L_carry2 = WS(14)
 
     def RES(lane_idx):
+        # Each result nibble lane is a 16-wide value one-hot slot. Default
+        # (contiguous) form: lanes 0..3 pack into ``result_base`` at
+        # ``lane*16``. Per-lane form: each lane routes to its own base at
+        # offset 0 (the live MUL byte-0/byte-1 non-contiguous band routing).
+        if result_lane_bases is not None:
+            return (result_lane_bases[lane_idx], 0)
         return (result_base, lane_idx * 16)
 
     mp = MultiPassOp(
