@@ -46,6 +46,46 @@ register_residual_band(
     flag=mul_multipass_enabled, never_share=True,
 )
 
+# ---------------------------------------------------------------------------
+# GAP-PRIMITIVE #2 (DIV pilot): multi_pass long-division cascade bands.
+# ---------------------------------------------------------------------------
+# When ``C4_DIV_MULTIPASS=1`` (opt-in), the live L10 ``FlattenedDivMod`` post_op
+# is replaced by the 43-pass binary long-division cascade
+# (``multi_pass_div_rules``). The cascade stages the running remainder + per-bit
+# scratch in a workspace band (108 lanes x 16 = 1728 dims), writes the quotient
+# and remainder each as two nibble one-hots to dedicated result lanes
+# (DIV_MP_Q_LO/HI + DIV_MP_R_LO/HI, 16 each), and uses a 2-cell OR scratch
+# (DIV_MP_GATE) so the whole cascade fires on OP_DIV OR OP_MOD from one gate
+# dim. All op-local + flag-gated: a flag-off build omits every band
+# (byte-identical to golden). ``never_share`` — the workspace + result lanes are
+# written+read WITHIN one block's staged Sequential (the 43 passes + routing),
+# so they must keep private liveness slots no other op's merge can alias.
+from .shared import div_multipass_enabled  # noqa: E402
+register_residual_band(
+    "DIV_MULTIPASS_WS", 108 * 16, owner="make_alu_divmod_composite_ops",
+    flag=div_multipass_enabled, never_share=True,
+)
+register_residual_band(
+    "DIV_MP_GATE", 2, owner="make_alu_divmod_composite_ops",
+    flag=div_multipass_enabled, never_share=True,
+)
+register_residual_band(
+    "DIV_MP_Q_LO", 16, owner="make_alu_divmod_composite_ops",
+    flag=div_multipass_enabled, never_share=True,
+)
+register_residual_band(
+    "DIV_MP_Q_HI", 16, owner="make_alu_divmod_composite_ops",
+    flag=div_multipass_enabled, never_share=True,
+)
+register_residual_band(
+    "DIV_MP_R_LO", 16, owner="make_alu_divmod_composite_ops",
+    flag=div_multipass_enabled, never_share=True,
+)
+register_residual_band(
+    "DIV_MP_R_HI", 16, owner="make_alu_divmod_composite_ops",
+    flag=div_multipass_enabled, never_share=True,
+)
+
 
 def _mark_structural_declarations(op: Operation) -> Operation:
     """Mark module-assembly ops as safe for declarations-only dispatch."""
@@ -2188,6 +2228,114 @@ def make_l12_alu_mul_getobd_op() -> Operation:
 from .shared import _FlattenedDivModBuilder
 
 
+def _build_multipass_div_post_op(block, dim_positions, S):
+    """GAP-PRIMITIVE #2 (DIV): build the long-division cascade as ONE post_op.
+
+    Returns a :class:`~neural_vm.efficient_alu_neural.MultiPassDivBlock` — the
+    lowered ``PureFFN`` passes of ``multi_pass_div_rules`` (bit-serial
+    shift-subtract with a cross-pass running-remainder carry) plus an OR-gate
+    seed pass, packed into one block forward that also routes q->OUTPUT (OP_DIV)
+    / r->OUTPUT (OP_MOD) at MARK_AX and replays the campaign divisor /
+    dividend-byte-1 clears. Installed in place of the ``FlattenedDivMod``
+    composite when ``C4_DIV_MULTIPASS=1``.
+
+    Band routing (the SAME operand bands the GE-format lookup / FlattenedDivMod
+    consume; ``ALU_HI == ALU_LO+16`` and ``AX_CARRY_HI == AX_CARRY_LO+16`` in the
+    live layout, verified, so the +16 nibble addressing holds):
+
+      * dividend A nibbles: ``ALU_LO`` (a0) + ``ALU_LO+16`` (=ALU_HI, a1)
+      * divisor  B nibbles: ``AX_CARRY_LO`` (b0) + ``AX_CARRY_LO+16`` (=..HI, b1)
+      * OR-gate: ``DIV_MP_GATE+1`` set to 1.0 on OP_DIV OR OP_MOD (the cascade's
+        multiplicative opcode gate — fires for both div and mod)
+      * quotient -> ``DIV_MP_Q_LO/HI``; remainder -> ``DIV_MP_R_LO/HI``
+      * result routing -> OUTPUT_LO/HI (q for DIV, r for MOD) at MARK_AX
+      * scratch: ``DIV_MULTIPASS_WS`` (1728-dim op-local band)
+    """
+    from ...base_layers import PureFFN
+    from ...efficient_alu_neural import MultiPassDivBlock
+    from ..wide_alu_dsl import multi_pass_div_rules, _mp_onehot_rule
+    from ..building_blocks_dsl import multi_way_and_rule
+    from ..primitives import Primitives
+
+    proxy = _as_setdim_proxy(dim_positions)
+
+    GATE = "DIV_MP_GATE+1"      # OR(OP_DIV, OP_MOD) gate cell
+    mp = multi_pass_div_rules(
+        dividend_a_base="ALU_LO",
+        divisor_b_base="AX_CARRY_LO",
+        quotient_lane_bases=("DIV_MP_Q_LO", "DIV_MP_Q_HI"),
+        remainder_lane_bases=("DIV_MP_R_LO", "DIV_MP_R_HI"),
+        workspace_base="DIV_MULTIPASS_WS",
+        opcode_gate=GATE,
+        marker_gate="MARK_AX",
+        S=S,
+        width_bytes=1,
+    )
+
+    # Prepend the OR-gate seed pass: set DIV_MP_GATE+1 = 1.0 on OP_DIV OR OP_MOD
+    # (marker-gated). Two rules, each gated on one opcode (mutually exclusive per
+    # step), producing the amplitude-1.0 gate the cascade's normalized passes
+    # read as their multiplicative opcode gate.
+    seed_rules = [
+        _mp_onehot_rule(
+            name="divmp_gate_from_div", conditions=("MARK_AX",),
+            writes=(GATE,), opcode_gate="OP_DIV", S=S,
+        ),
+        _mp_onehot_rule(
+            name="divmp_gate_from_mod", conditions=("MARK_AX",),
+            writes=(GATE,), opcode_gate="OP_MOD", S=S,
+        ),
+    ]
+    passes_ir = [("or_gate_seed", tuple(seed_rules))]
+    passes_ir += [(p.name, tuple(p.ffn.rules)) for p in mp.passes]
+
+    # d_model from the existing block.ffn (PureFFN W_up is [hidden, d_model]).
+    ffn_in = block.ffn
+    if hasattr(ffn_in, "W_up") and ffn_in.W_up is not None:
+        d_model = int(ffn_in.W_up.shape[1])
+    elif hasattr(block, "attn") and hasattr(block.attn, "dim"):
+        d_model = int(block.attn.dim)
+    else:
+        d_model = int(getattr(ffn_in, "dim", 512))
+
+    lowered = []
+    for name, rules in passes_ir:
+        names = Primitives.ffn_rule_dim_names(rules)
+        dim_pos = Primitives.dim_positions_from_bd(proxy, names)
+        ffn = PureFFN(dim=d_model, hidden_dim=max(1, len(rules)))
+        # Lower via a single-layer CompilerIR (the multi-pass lowering path).
+        from ..ir import CompilerIR
+        cir = CompilerIR()
+        cir.layer(0).ffn.rules.extend(rules)
+        end = cir.lower_ffn(ffn, dim_pos, layer_idx=0, start_unit=0, S=S)
+        assert end == len(rules), (
+            f"multipass DIV pass {name}: lowered {end} units, "
+            f"expected {len(rules)}"
+        )
+        lowered.append(ffn)
+
+    from .shared import (
+        no_stack0_emit_enabled,
+        divmod_axcarry_clear_enabled,
+        divmod_stack0_byte1_clear_enabled,
+    )
+    campaign_clear = (
+        no_stack0_emit_enabled() and divmod_axcarry_clear_enabled()
+    )
+    return MultiPassDivBlock(
+        lowered,
+        output_lo=proxy.OUTPUT_LO, output_hi=proxy.OUTPUT_HI,
+        q_lo=proxy.DIV_MP_Q_LO, q_hi=proxy.DIV_MP_Q_HI,
+        r_lo=proxy.DIV_MP_R_LO, r_hi=proxy.DIV_MP_R_HI,
+        op_div=proxy.OP_DIV, op_mod=proxy.OP_MOD, mark_ax=proxy.MARK_AX,
+        ax_carry_lo=getattr(proxy, "AX_CARRY_LO", None),
+        ax_carry_hi=getattr(proxy, "AX_CARRY_HI", None),
+        stack0_b1_lo=getattr(proxy, "STACK0_BYTE_VAL_1_LO", None),
+        stack0_b1_hi=getattr(proxy, "STACK0_BYTE_VAL_1_HI", None),
+        campaign_clear=campaign_clear,
+    )
+
+
 def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     """Build the 4 cooperating ops (3 stage + 1 install) for FlattenedDivMod.
 
@@ -2254,7 +2402,13 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     # feeds the high dividend byte from STACK0_BYTE_VAL_1 into GE positions
     # 2/3. Flag-off keeps the byte-identical single-byte GE-format lookup.
     def _use_longdiv_composite() -> bool:
-        from .shared import div_multibyte_enabled
+        from .shared import div_multibyte_enabled, div_multipass_enabled
+        # GAP-PRIMITIVE #2 (DIV): when the multipass long-division cascade is
+        # installed it REPLACES the FlattenedDivMod composite entirely, so the
+        # 3 stage bakes are no-ops (skip building the composite) and the install
+        # op appends the MultiPassDivBlock instead.
+        if div_multipass_enabled():
+            return False
         return alu_mode != 'efficient' or div_multibyte_enabled()
 
     def make_bdtoge():
@@ -2398,6 +2552,22 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
 
     def make_install():
         def bake(block, dim_positions, S):
+            from .shared import div_multipass_enabled
+            if div_multipass_enabled():
+                # GAP-PRIMITIVE #2 (DIV): install the binary long-division
+                # cascade (multi_pass_div_rules) as ONE post_op in place of the
+                # FlattenedDivMod composite / GE-format lookup. It computes the
+                # FULL byte-0 quotient + remainder from a COMPACT bit-serial
+                # shift-subtract spec (43 passes, cross-pass running-remainder
+                # carry), routes q->OUTPUT (OP_DIV) / r->OUTPUT (OP_MOD) at
+                # MARK_AX, and replays the campaign divisor / dividend-byte-1
+                # clears. Flag-off falls through to the byte-identical composite
+                # / lookup install below.
+                block.post_ops.append(
+                    _build_multipass_div_post_op(block, dim_positions, S)
+                )
+                return
+
             if alu_mode == 'efficient' and not _use_longdiv_composite():
                 # DSL Wave W6 (2026-06-11): install the BYTE-ACCURATE
                 # GE-format DIV/MOD lookup (``wide_div_rules_ge_format``)
