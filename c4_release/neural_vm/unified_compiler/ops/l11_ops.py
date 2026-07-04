@@ -12,8 +12,11 @@ from ..isa_semantics_dsl import (
     CrossStepCarrySpec,
     DumpBlock,
     HeadWrite,
+    MarkerBroadcastBand,
+    MarkerBroadcastSpec,
     PrecursorFlagSpec,
     cross_step_carry,
+    marker_broadcast,
 )
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -811,92 +814,98 @@ def _layer11_step_end_operand_relay_head_specs(
     narrower toggles to scope which downstream consumers see the
     relayed value at MARK_SE, e.g. omitting ``OP_<NAME>`` to keep
     BZ/BNZ / dispatch-gated rules MARK_AX-pure.
+
+    DERIVED via the generic :func:`marker_broadcast` BARE-MARKER mode
+    (``is_byte_dim=None``): a plain Q@MARK_SE_ONLY / K@MARK_AX
+    marker-row -> marker-row relay with the payload bands supplied as
+    :class:`MarkerBroadcastBand` s. Byte-identical to the hand-built
+    head (proof: ``tools/_isa_golden_hash.py`` unchanged). Each relayed
+    dim is a width-1 band except the contiguous ``AX_CARRY_LO/HI`` /
+    ``ALU_LO/HI`` (16-wide) and ``CMP`` (4-wide) blocks; ``v_slot_base``
+    is assigned sequentially so the slot layout matches exactly.
     """
-    L = float(S)
     HD_DEFAULT = 64  # default head_dim at L11 (d_model=512, num_heads=8)
 
-    # Per-head Q/K bands: select MARK_SE rows on Q side, MARK_AX rows
-    # on K side. The CONST anchor (Q slot 0 = -L) cancels at non-MARK_SE
-    # Q rows so the slot-0 score collapses to ~-L^2 / sqrt(HD).
-    q_band = (
-        AP(0, BD.MARK_SE_ONLY, L),
-    )
-    k_band = (
-        AP(0, BD.MARK_AX, L),
-    )
+    # Resolve dim names -> positions through the same ``BD`` proxy the
+    # hand-built head used (identical fallback to ``_SetDim`` for names
+    # like ``STACK0_BYTE0`` not in ``dim_positions``).
+    class _DimView:
+        def __getitem__(self, name):
+            return getattr(BD, name)
+    dim_view = _DimView()
 
-    # --- Head A: OP_<NAME> + AX_CARRY_LO/HI ---------------------------
-    v_a: list = []
-    o_a: list = []
+    L = float(S)
+
+    def _relay_spec(name, bands, head_idx):
+        if not bands:
+            # Degenerate head: every payload toggle off -> the relay fires at
+            # MARK_SE / attends MARK_AX but broadcasts NOTHING (the production
+            # scoping leaves head B empty). ``marker_broadcast`` requires >=1
+            # band, so emit the bare Q/K head directly (byte-identical to the
+            # empty-V/O hand-built spec).
+            return DeclarativeAttentionHeadSpec(
+                head_idx=head_idx,
+                q=(AP(0, getattr(BD, "MARK_SE_ONLY"), L),),
+                k=(AP(0, getattr(BD, "MARK_AX"), L),),
+                v=(),
+                o=(),
+                alibi_slope=1.0,
+            )
+        return marker_broadcast(MarkerBroadcastSpec(
+            name=name,
+            fire_slot_dim="MARK_SE_ONLY",      # Q fires at the STEP_END marker
+            source_marker="MARK_AX",           # K selects the in-step AX marker
+            broadcast_bands=tuple(bands),
+            weight=L,
+            is_byte_dim=None, const_dim=None, gate_slot=None,  # BARE marker mode
+            alibi_slope=1.0,
+        )).head_spec_builder(dim_view, head_idx)
+
+    # --- Head A: OP_<NAME> + AX_CARRY_LO/HI (each a broadcast band) ---
+    bands_a: list = []
     slot = 0
     if include_op_name:
         op_names_iter = (
             op_name_subset if op_name_subset else _STEP_END_OPERAND_RELAY_OPCODES
         )
         for op_name in op_names_iter:
-            dim = getattr(BD, op_name)
-            v_a.append(AP(slot, dim, 1.0))
-            o_a.append(AO(dim, slot, 1.0))
+            bands_a.append(MarkerBroadcastBand(op_name, op_name, 1, slot, 1.0))
             slot += 1
     if include_ax_carry:
-        for k_idx in range(16):
-            v_a.append(AP(slot, BD.AX_CARRY_LO + k_idx, 1.0))
-            o_a.append(AO(BD.AX_CARRY_LO + k_idx, slot, 1.0))
-            slot += 1
-        for k_idx in range(16):
-            v_a.append(AP(slot, BD.AX_CARRY_HI + k_idx, 1.0))
-            o_a.append(AO(BD.AX_CARRY_HI + k_idx, slot, 1.0))
-            slot += 1
+        bands_a.append(MarkerBroadcastBand("AX_CARRY_LO", "AX_CARRY_LO", 16, slot, 1.0))
+        slot += 16
+        bands_a.append(MarkerBroadcastBand("AX_CARRY_HI", "AX_CARRY_HI", 16, slot, 1.0))
+        slot += 16
     assert slot <= HD_DEFAULT, (
         f"step_end_operand_relay head A overflowed HD={HD_DEFAULT} "
         f"with {slot} slots"
     )
-
-    spec_a = DeclarativeAttentionHeadSpec(
-        head_idx=head_a_idx,
-        q=q_band,
-        k=k_band,
-        v=tuple(v_a),
-        o=tuple(o_a),
-        alibi_slope=1.0,
+    spec_a = _relay_spec(
+        "layer11_step_end_operand_relay.head_0", bands_a, head_a_idx,
     )
 
-    # --- Head B: ALU_LO/HI + CMP + STACK0_BYTE0..3 --------------------
-    v_b: list = []
-    o_b: list = []
+    # --- Head B: ALU_LO/HI + CMP + STACK0_BYTE0..3 -------------------
+    bands_b: list = []
     slot = 0
     if include_alu:
-        for k_idx in range(16):
-            v_b.append(AP(slot, BD.ALU_LO + k_idx, 1.0))
-            o_b.append(AO(BD.ALU_LO + k_idx, slot, 1.0))
-            slot += 1
-        for k_idx in range(16):
-            v_b.append(AP(slot, BD.ALU_HI + k_idx, 1.0))
-            o_b.append(AO(BD.ALU_HI + k_idx, slot, 1.0))
-            slot += 1
+        bands_b.append(MarkerBroadcastBand("ALU_LO", "ALU_LO", 16, slot, 1.0))
+        slot += 16
+        bands_b.append(MarkerBroadcastBand("ALU_HI", "ALU_HI", 16, slot, 1.0))
+        slot += 16
     if include_cmp:
-        for k_idx in range(4):  # CMP is 4 wide in the registry
-            v_b.append(AP(slot, BD.CMP + k_idx, 1.0))
-            o_b.append(AO(BD.CMP + k_idx, slot, 1.0))
-            slot += 1
+        bands_b.append(MarkerBroadcastBand("CMP", "CMP", 4, slot, 1.0))  # 4 wide
+        slot += 4
     if include_stack0_byte:
         for byte_h in (0, 1, 2, 3):
-            dim = getattr(BD, f"STACK0_BYTE{byte_h}")
-            v_b.append(AP(slot, dim, 1.0))
-            o_b.append(AO(dim, slot, 1.0))
+            dim_name = f"STACK0_BYTE{byte_h}"
+            bands_b.append(MarkerBroadcastBand(dim_name, dim_name, 1, slot, 1.0))
             slot += 1
     assert slot <= HD_DEFAULT, (
         f"step_end_operand_relay head B overflowed HD={HD_DEFAULT} "
         f"with {slot} slots"
     )
-
-    spec_b = DeclarativeAttentionHeadSpec(
-        head_idx=head_b_idx,
-        q=q_band,
-        k=k_band,
-        v=tuple(v_b),
-        o=tuple(o_b),
-        alibi_slope=1.0,
+    spec_b = _relay_spec(
+        "layer11_step_end_operand_relay.head_1", bands_b, head_b_idx,
     )
 
     return spec_a, spec_b
