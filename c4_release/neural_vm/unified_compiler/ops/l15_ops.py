@@ -1352,8 +1352,96 @@ def _l15_li_lc_load_dim_map(BD) -> dict:
         "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO", "ADDR_B1_HI",
         "ADDR_B2_LO", "ADDR_B2_HI",
         "CLEAN_EMBED_LO", "CLEAN_EMBED_HI", "OUTPUT_LO", "OUTPUT_HI",
+        # --- OVERRIDE-layer base names (the flag-conditioned overlay cells) ---
+        # The overlay in _layer15_memory_lookup_heads_0_3_specs_with_overrides
+        # is declared as NAMED offset-token CamDiscriminatorSlot literals; every
+        # base name they reference must resolve here.
+        "EMBED_LO", "EMBED_HI", "H2", "H3", "HAS_SE", "IS_BYTE",
+        "LI_ZEROADDR_COMMITTED", "MARK_BP", "MARK_MEM",
+        "MEM_ADDR_SRC", "MEM_VAL_B0",
+        "OP_ENT", "OP_EQ", "OP_GE", "OP_GT", "OP_IMM", "OP_JSR",
+        "OP_LC", "OP_LE", "OP_LEA", "OP_LI", "OP_LT", "OP_NE",
+        "OP_SC", "OP_SI",
+        "STACK0_BYTE0", "TEMP",
     )
     return {n: int(getattr(BD, n)) for n in base_names}
+
+
+class _L15OverlayAccumulator:
+    """Collects NAMED-token L15 override cells into overlay discriminators.
+
+    The L15 heads-0-3 OVERRIDE layer is authored as declarative
+    :class:`CamDiscriminatorSlot` DATA: a per-slot list of
+    ``(BASE`` / ``BASE+offset`` name, weight)`` Q/K/V/O cells. This accumulator
+    is the thin ordered store the authoring blocks write into. It preserves the
+    original flat-map LAST-WRITE-WINS semantics EXACTLY -- a later block's write
+    to the same ``(slot, dim-name)`` replaces the earlier one, in source order --
+    so lifting the procedural per-cell arithmetic into these declarative slot
+    literals is byte-identical. :meth:`discriminators` emits ONE
+    :class:`CamDiscriminatorSlot` per touched slot (the name tokens resolve
+    through the head's ``dim_map`` at build time), so the whole override is
+    DATA: no ``BD.X`` integer arithmetic, no separate re-grouping pass.
+
+    A ``CAM_DROP`` weight is preserved as-is (the DATA form of a wiped V/O cell).
+    """
+
+    __slots__ = ("_q", "_k", "_v", "_o")
+
+    def __init__(self) -> None:
+        # Ordered {slot: {dim_name: weight}} maps (insertion order == authoring
+        # order; dict preserves it, so the emitted cell tuples are stable).
+        self._q: dict[int, dict[str, object]] = {}
+        self._k: dict[int, dict[str, object]] = {}
+        self._v: dict[int, dict[str, object]] = {}
+        self._o: dict[int, dict[str, object]] = {}
+
+    def q(self, slot: int, dim: str, weight) -> None:
+        self._q.setdefault(slot, {})[dim] = weight
+
+    def k(self, slot: int, dim: str, weight) -> None:
+        self._k.setdefault(slot, {})[dim] = weight
+
+    def v(self, slot: int, dim: str, weight) -> None:
+        self._v.setdefault(slot, {})[dim] = weight
+
+    def o(self, v_slot: int, out_dim: str, weight) -> None:
+        # ``o`` cells are keyed (out_dim, v_slot) at lower time; store per v_slot.
+        self._o.setdefault(v_slot, {})[out_dim] = weight
+
+    def slot(self, slot: int, *, q=(), k=(), v=(), o=()) -> None:
+        """Write a batch of named cells onto ``slot`` (a compact slot literal)."""
+        for dim, weight in q:
+            self.q(slot, dim, weight)
+        for dim, weight in k:
+            self.k(slot, dim, weight)
+        for dim, weight in v:
+            self.v(slot, dim, weight)
+        for out_dim, weight in o:
+            self.o(slot, out_dim, weight)
+
+    def q_cells(self, slot: int):
+        """The current ``(dim, weight)`` Q cells on ``slot`` (for cancel copies)."""
+        return tuple(self._q.get(slot, {}).items())
+
+    def k_cells(self, slot: int):
+        """The current ``(dim, weight)`` K cells on ``slot`` (for cancel copies)."""
+        return tuple(self._k.get(slot, {}).items())
+
+    def discriminators(self) -> tuple:
+        slots = sorted(
+            set(self._q) | set(self._k) | set(self._v) | set(self._o)
+        )
+        out = []
+        for s in slots:
+            out.append(CamDiscriminatorSlot(
+                slot=s,
+                q=tuple(self._q.get(s, {}).items()),
+                k=tuple(self._k.get(s, {}).items()),
+                v=tuple(self._v.get(s, {}).items()),
+                # ``o`` cells lower as (out_dim, slot); emit (out_dim, weight).
+                o=tuple(self._o.get(s, {}).items()),
+            ))
+        return tuple(out)
 
 
 def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
@@ -1419,62 +1507,57 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
 
     merged: list[DeclarativeAttentionHeadSpec] = []
 
-    byte_q_flags = [None, BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2]
+    # byte_q_flags as NAMED tokens (resolved through dim_map by the CAM builder).
+    byte_q_flags = (None, "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2")
 
     for head in range(4):
-        # OVERRIDE cells only (the base head's cells are supplied by the base
-        # CAM; the overlay is merged over them last-write-wins by the primitive).
-        # Dims are ALREADY-RESOLVED integer positions (``BD.X``) that the CAM
-        # builder's int-tolerant resolver passes through unchanged. A CAM_DROP
-        # value REMOVES the (slot, dim) cell (the legacy V/O ``.pop`` wipe).
-        q_map: dict[tuple[int, int], object] = {}
-        k_map: dict[tuple[int, int], object] = {}
-        v_map: dict[tuple[int, int], object] = {}
-        o_map: dict[tuple[int, int], object] = {}
+        # OVERRIDE cells as NAMED, offset-token discriminator DATA. The base
+        # head's cells are supplied by the base CAM; these overlay slots are
+        # merged over them last-write-wins by ``cam_binary_address_match`` (each
+        # cell resolves its ``BASE`` / ``BASE+offset`` name through ``dim_map``).
+        # A CAM_DROP weight REMOVES the (slot, dim) cell (the legacy V/O ``.pop``
+        # wipe). Authoring blocks write into ``_OV`` in source order and the
+        # accumulator keeps last-write-wins per (slot, dim), so lifting the old
+        # ``BD.X``-int flat maps into these declarative slot literals is exact.
+        _OV = _L15OverlayAccumulator()
 
         # === local_slot_scale: byte-0 nibble bit rows (slots 4..11) ===
         local_slot_scale = 100.0
-        for nibble_offset, nibble_base in (
-            (0, BD.ADDR_B0_LO), (4, BD.ADDR_B0_HI),
-        ):
+        for nibble_offset, nibble_base in ((0, "ADDR_B0_LO"), (4, "ADDR_B0_HI")):
             for bit in range(4):
                 row = 4 + nibble_offset + bit
                 for k in range(16):
-                    bit_val = 2 * ((k >> bit) & 1) - 1
-                    q_map[(row, nibble_base + k)] = (
-                        local_slot_scale * bit_val
-                    )
-                    k_map[(row, nibble_base + k)] = (
-                        local_slot_scale * bit_val
-                    )
+                    w = local_slot_scale * (2 * ((k >> bit) & 1) - 1)
+                    _OV.q(row, f"{nibble_base}+{k}", w)
+                    _OV.k(row, f"{nibble_base}+{k}", w)
 
         # === one-hot rows 43+k: byte-0 lo nibble match ===
         local_slot_onehot_scale = 100.0
         for k in range(16):
             row = 43 + k
-            q_map[(row, BD.CONST)] = -local_slot_onehot_scale
-            q_map[(row, BD.ADDR_B0_LO + k)] = local_slot_onehot_scale
-            q_map[(row, BD.OP_LI_RELAY)] = local_slot_onehot_scale
+            _OV.q(row, "CONST", -local_slot_onehot_scale)
+            _OV.q(row, f"ADDR_B0_LO+{k}", local_slot_onehot_scale)
+            _OV.q(row, "OP_LI_RELAY", local_slot_onehot_scale)
             if head == 0:
-                q_map[(row, BD.OP_LC_RELAY)] = local_slot_onehot_scale
-            k_map[(row, BD.ADDR_B0_LO + k)] = local_slot_onehot_scale
+                _OV.q(row, "OP_LC_RELAY", local_slot_onehot_scale)
+            _OV.k(row, f"ADDR_B0_LO+{k}", local_slot_onehot_scale)
 
         if head == 0:
             # === Strong default blocker + explicit LI/LC/pop restores ===
             lookup_bias = 200000.0
-            q_map[(0, BD.CONST)] = -lookup_bias
-            q_map[(0, BD.OP_LI_RELAY)] = lookup_bias
-            q_map[(0, BD.OP_LC_RELAY)] = lookup_bias
-            q_map[(0, BD.OP_LI)] = lookup_bias
-            q_map[(0, BD.OP_LC)] = lookup_bias
-            q_map[(0, BD.CMP + 3)] = lookup_bias / 4.0
-            q_map[(1, BD.CMP + 3)] = 12.5
+            _OV.slot(0, q=[
+                ("CONST", -lookup_bias),
+                ("OP_LI_RELAY", lookup_bias), ("OP_LC_RELAY", lookup_bias),
+                ("OP_LI", lookup_bias), ("OP_LC", lookup_bias),
+                ("CMP+3", lookup_bias / 4.0),
+            ])
+            _OV.q(1, "CMP+3", 12.5)
 
             non_load_suppression = -1000000.0
-            q_map[(0, BD.OP_JSR)] = non_load_suppression
-            q_map[(0, BD.OP_ENT)] = non_load_suppression
-            q_map[(0, BD.OP_LEA)] = non_load_suppression
-            q_map[(0, BD.OP_IMM)] = non_load_suppression
+            _OV.slot(0, q=[
+                ("OP_JSR", non_load_suppression), ("OP_ENT", non_load_suppression),
+                ("OP_LEA", non_load_suppression), ("OP_IMM", non_load_suppression),
+            ])
             if l15_lookup_cmp_veto_enabled():
                 # COMPARISON-STEP VETO (bool_and id=1087, 2026-06-25).
                 # CMP+3 (above) is overloaded: it is BOTH the POP-group flag
@@ -1487,12 +1570,11 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                 # comparison opcodes: OP_<cmp> * -1e6 dominates CMP+3 * 50000,
                 # keeping the head silent on cmp rows and byte-identical on
                 # every load row. Kill-switch: ``C4_L15_LOOKUP_CMP_VETO=0``.
-                q_map[(0, BD.OP_GT)] = non_load_suppression
-                q_map[(0, BD.OP_LT)] = non_load_suppression
-                q_map[(0, BD.OP_GE)] = non_load_suppression
-                q_map[(0, BD.OP_LE)] = non_load_suppression
-                q_map[(0, BD.OP_EQ)] = non_load_suppression
-                q_map[(0, BD.OP_NE)] = non_load_suppression
+                _OV.slot(0, q=[
+                    ("OP_GT", non_load_suppression), ("OP_LT", non_load_suppression),
+                    ("OP_GE", non_load_suppression), ("OP_LE", non_load_suppression),
+                    ("OP_EQ", non_load_suppression), ("OP_NE", non_load_suppression),
+                ])
 
             if var_three_li_enabled():
                 # STORE-STEP VETO (var_three id300, 2026-07-04). The ``SI b``
@@ -1512,39 +1594,34 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                 # OP_SI==OP_SC==0). Campaign-only + own kill-switch
                 # ``C4_VAR_THREE_LI`` (DEFAULT OFF; flag-OFF omits these two
                 # writes -> byte-identical to golden).
-                q_map[(0, BD.OP_SI)] = non_load_suppression
-                q_map[(0, BD.OP_SC)] = non_load_suppression
+                _OV.slot(0, q=[
+                    ("OP_SI", non_load_suppression), ("OP_SC", non_load_suppression),
+                ])
 
-            q_map[(0, BD.MARK_STACK0)] = 75000.0
-            q_map[(0, BD.HAS_SE)] = 75000.0
-            q_map[(0, BD.ADDR_B0_LO + 8)] = 75000.0
-            q_map[(0, BD.ADDR_B0_HI + 14)] = 75000.0
-            q_map[(0, BD.ADDR_B0_HI + 15)] = -100000.0
-            q_map[(0, BD.IS_BYTE)] = -2000.0
-            q_map[(1, BD.IS_BYTE)] = -50.0
-            q_map[(1, BD.MARK_STACK0)] = 50.0
-            q_map[(1, BD.HAS_SE)] = 50.0
-            q_map[(1, BD.ADDR_B0_LO + 8)] = 50.0
-            q_map[(1, BD.ADDR_B0_HI + 14)] = 50.0
-            q_map[(1, BD.ADDR_B0_HI + 15)] = -150.0
-            q_map[(28, BD.IS_BYTE)] = -500.0
-            q_map[(28, BD.CONST)] = -20000.0
-            q_map[(28, BD.MARK_AX)] = 20000.0
-            q_map[(28, BD.MARK_STACK0)] = 20000.0
+            _OV.slot(0, q=[
+                ("MARK_STACK0", 75000.0), ("HAS_SE", 75000.0),
+                ("ADDR_B0_LO+8", 75000.0), ("ADDR_B0_HI+14", 75000.0),
+                ("ADDR_B0_HI+15", -100000.0), ("IS_BYTE", -2000.0),
+            ])
+            _OV.slot(1, q=[
+                ("IS_BYTE", -50.0), ("MARK_STACK0", 50.0), ("HAS_SE", 50.0),
+                ("ADDR_B0_LO+8", 50.0), ("ADDR_B0_HI+14", 50.0),
+                ("ADDR_B0_HI+15", -150.0),
+            ])
+            _OV.slot(28, q=[
+                ("IS_BYTE", -500.0), ("CONST", -20000.0),
+                ("MARK_AX", 20000.0), ("MARK_STACK0", 20000.0),
+            ])
 
             # Row 42: top-store e0 signature blocker.
             for row, low, high in ((42, 0, 14),):
-                q_map[(row, BD.CONST)] = -60000.0
-                q_map[(row, BD.MARK_STACK0)] = 10000.0
-                q_map[(row, BD.HAS_SE)] = 10000.0
-                q_map[(row, BD.MEM_STORE)] = 10000.0
-                q_map[(row, BD.EMBED_LO + low)] = 10000.0
-                q_map[(row, BD.EMBED_HI + high)] = 10000.0
-                q_map[(row, BD.ADDR_B0_LO + low)] = 10000.0
-                q_map[(row, BD.ADDR_B0_HI + high)] = 10000.0
-                q_map[(row, BD.OP_LI_RELAY)] = 50000.0
-                q_map[(row, BD.OP_LC_RELAY)] = 50000.0
-                k_map[(row, BD.CONST)] = 20.0
+                _OV.slot(row, q=[
+                    ("CONST", -60000.0), ("MARK_STACK0", 10000.0),
+                    ("HAS_SE", 10000.0), ("MEM_STORE", 10000.0),
+                    (f"EMBED_LO+{low}", 10000.0), (f"EMBED_HI+{high}", 10000.0),
+                    (f"ADDR_B0_LO+{low}", 10000.0), (f"ADDR_B0_HI+{high}", 10000.0),
+                    ("OP_LI_RELAY", 50000.0), ("OP_LC_RELAY", 50000.0),
+                ], k=[("CONST", 20.0)])
 
             # Rows 59, 60, 61: wipe Q/K (base has no writes here either).
             # The base spec writes V at (slot, dim)=(59, CLEAN_EMBED_HI+11),
@@ -1554,29 +1631,23 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # writes to drop.
 
             # Row 60: top-store e8 signature.
-            row = 60
-            q_map[(row, BD.CONST)] = -30000.0
-            q_map[(row, BD.MARK_STACK0)] = 10000.0
-            q_map[(row, BD.MARK_SP)] = -100000.0
-            q_map[(row, BD.HAS_SE)] = 10000.0
-            q_map[(row, BD.MEM_STORE)] = 150000.0
-            q_map[(row, BD.ADDR_B0_LO + 8)] = 10000.0
-            q_map[(row, BD.ADDR_B0_HI + 14)] = 10000.0
-            q_map[(row, BD.ADDR_B0_HI + 15)] = -20000.0
-            k_map[(row, BD.CONST)] = -20.0
+            _OV.slot(60, q=[
+                ("CONST", -30000.0), ("MARK_STACK0", 10000.0),
+                ("MARK_SP", -100000.0), ("HAS_SE", 10000.0),
+                ("MEM_STORE", 150000.0), ("ADDR_B0_LO+8", 10000.0),
+                ("ADDR_B0_HI+14", 10000.0), ("ADDR_B0_HI+15", -20000.0),
+            ], k=[("CONST", -20.0)])
 
             # Row 59: preserve e8 (STACK0 + HAS_SE + nibble match).
             preserve_e8_s = 5000.0
-            row = 59
-            q_map[(row, BD.CONST)] = -3.5 * preserve_e8_s
-            q_map[(row, BD.MARK_STACK0)] = preserve_e8_s
-            q_map[(row, BD.HAS_SE)] = preserve_e8_s
-            q_map[(row, BD.ADDR_B0_LO + 8)] = preserve_e8_s
-            q_map[(row, BD.ADDR_B0_HI + 14)] = preserve_e8_s
-            q_map[(row, BD.IS_BYTE)] = -4.0 * preserve_e8_s
-            q_map[(row, BD.MEM_STORE)] = -5.0 * preserve_e8_s
-            k_map[(row, BD.ADDR_B0_LO + 8)] = preserve_e8_s
-            k_map[(row, BD.ADDR_B0_HI + 14)] = preserve_e8_s
+            _OV.slot(59, q=[
+                ("CONST", -3.5 * preserve_e8_s), ("MARK_STACK0", preserve_e8_s),
+                ("HAS_SE", preserve_e8_s), ("ADDR_B0_LO+8", preserve_e8_s),
+                ("ADDR_B0_HI+14", preserve_e8_s),
+                ("IS_BYTE", -4.0 * preserve_e8_s),
+                ("MEM_STORE", -5.0 * preserve_e8_s),
+            ], k=[
+                ("ADDR_B0_LO+8", preserve_e8_s), ("ADDR_B0_HI+14", preserve_e8_s),
             # Class-2 absolute-slot read: the K-side STACK0_BYTE0 discriminator
             # boosts attention to the historical STACK0 byte-0 token when
             # preserving the 0xffe8 stack top. STACK0_BYTE0 is the canonical
@@ -1588,25 +1659,22 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # 35-tok returns 5.0*preserve_e8_s, byte-identical; at 30-tok the
             # input flag is already constant-0 so the score contribution is
             # zero either way). See positional_invariant.py.
-            k_map[(row, BD.STACK0_BYTE0)] = invariant_threshold(
-                live=5.0 * preserve_e8_s, suppressed=0.0, marker="BP", k=6,
-            )
+                ("STACK0_BYTE0", invariant_threshold(
+                    live=5.0 * preserve_e8_s, suppressed=0.0, marker="BP", k=6)),
+            ])
 
             # Row 61: AX LI/LC e8 value discriminator.
             ax_li_e8_s = 10.0
-            row = 61
-            q_map[(row, BD.CONST)] = -3.5 * ax_li_e8_s
-            q_map[(row, BD.MARK_AX)] = ax_li_e8_s
-            q_map[(row, BD.OP_LI_RELAY)] = ax_li_e8_s
-            q_map[(row, BD.OP_LC_RELAY)] = ax_li_e8_s
-            q_map[(row, BD.MARK_STACK0)] = 2.5 * ax_li_e8_s
-            q_map[(row, BD.ADDR_B0_LO + 8)] = ax_li_e8_s
-            q_map[(row, BD.ADDR_B0_HI + 14)] = ax_li_e8_s
-            q_map[(row, BD.IS_BYTE)] = -4.0 * ax_li_e8_s
-            q_map[(row, BD.MEM_STORE)] = -4.0 * ax_li_e8_s
-            k_map[(row, BD.MEM_VAL_B1)] = ax_li_e8_s
-            k_map[(row, BD.ADDR_B0_LO + 8)] = ax_li_e8_s
-            k_map[(row, BD.ADDR_B0_HI + 14)] = ax_li_e8_s
+            _OV.slot(61, q=[
+                ("CONST", -3.5 * ax_li_e8_s), ("MARK_AX", ax_li_e8_s),
+                ("OP_LI_RELAY", ax_li_e8_s), ("OP_LC_RELAY", ax_li_e8_s),
+                ("MARK_STACK0", 2.5 * ax_li_e8_s), ("ADDR_B0_LO+8", ax_li_e8_s),
+                ("ADDR_B0_HI+14", ax_li_e8_s), ("IS_BYTE", -4.0 * ax_li_e8_s),
+                ("MEM_STORE", -4.0 * ax_li_e8_s),
+            ], k=[
+                ("MEM_VAL_B1", ax_li_e8_s), ("ADDR_B0_LO+8", ax_li_e8_s),
+                ("ADDR_B0_HI+14", ax_li_e8_s),
+            ])
 
             # Row 58: early-ENT STACK0 discriminator.
             # The legacy helper wipes Q/K at slot 58 first; base spec
@@ -1632,36 +1700,31 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # unchanged.
             early_ent_stack0_q = 100000.0
             stack0_gate = 10000000000.0  # 1e10 >> 2e8 * OP_ENT_broadcast_max
-            row = 58
-            q_map[(row, BD.OP_ENT)] = 200000000.0
-            q_map[(row, BD.MARK_STACK0)] = early_ent_stack0_q + stack0_gate
-            q_map[(row, BD.CONST)] = -early_ent_stack0_q - stack0_gate
-            q_map[(row, BD.IS_BYTE)] = -2000000000.0
-            for marker_dim in (
-                BD.MARK_AX, BD.MARK_PC, BD.MARK_SP,
-                BD.MARK_BP, BD.MARK_MEM,
-            ):
-                q_map[(row, marker_dim)] = -2000000000.0
-            k_map[(row, BD.OP_ENT)] = 10000.0
+            _OV.slot(58, q=[
+                ("OP_ENT", 200000000.0),
+                ("MARK_STACK0", early_ent_stack0_q + stack0_gate),
+                ("CONST", -early_ent_stack0_q - stack0_gate),
+                ("IS_BYTE", -2000000000.0),
+                ("MARK_AX", -2000000000.0), ("MARK_PC", -2000000000.0),
+                ("MARK_SP", -2000000000.0), ("MARK_BP", -2000000000.0),
+                ("MARK_MEM", -2000000000.0),
+            ], k=[("OP_ENT", 10000.0)])
 
             # Row 34: pop_low8 nibble bias.
-            row = 34
-            q_map[(row, BD.CONST)] = -4000.0
-            q_map[(row, BD.MARK_STACK0)] = 2000.0
-            q_map[(row, BD.HAS_SE)] = 1000.0
-            q_map[(row, BD.CMP + 3)] = 1000.0
-            q_map[(row, BD.ADDR_B0_LO + 0)] = 1000.0
-            q_map[(row, BD.ADDR_B0_LO + 8)] = 1000.0
-            q_map[(row, BD.IS_BYTE)] = -10000.0
-            q_map[(row, BD.MARK_SP)] = -10000.0
-            q_map[(row, BD.MEM_STORE)] = -20000.0
-            k_map[(row, BD.ADDR_B0_LO + 8)] = 1000.0
+            _OV.slot(34, q=[
+                ("CONST", -4000.0), ("MARK_STACK0", 2000.0), ("HAS_SE", 1000.0),
+                ("CMP+3", 1000.0), ("ADDR_B0_LO+0", 1000.0),
+                ("ADDR_B0_LO+8", 1000.0), ("IS_BYTE", -10000.0),
+                ("MARK_SP", -10000.0), ("MEM_STORE", -20000.0),
+            ], k=[("ADDR_B0_LO+8", 1000.0)])
         else:
             # === Heads 1-3: byte_q_flags-gated overrides ===
-            q_map[(0, BD.MARK_STACK0)] = -100000.0
-            q_map[(0, BD.MARK_SP)] = -100000.0
-            q_map[(28, BD.CONST)] = -20000.0
-            q_map[(28, byte_q_flags[head])] = 20000.0
+            _OV.slot(0, q=[
+                ("MARK_STACK0", -100000.0), ("MARK_SP", -100000.0),
+            ])
+            _OV.slot(28, q=[
+                ("CONST", -20000.0), (byte_q_flags[head], 20000.0),
+            ])
 
             # === MARK_AX hard darkening (slot 64): var_simple_12 / id 262 ===
             # Heads 1-3 are the LI/LC AX byte-1/2/3 value relays; they fire on
@@ -1689,212 +1752,157 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # BYTE-IDENTICAL (verified spec_k=0: max|diff| = 0.0, head-0 LI
             # byte-0 value still 0x2a). Pure subtractive -- no net-zero
             # compensation -- so it cannot perturb any legit (MARK_AX=0) row.
-            mark_ax_dark_slot = 64
-            q_map[(mark_ax_dark_slot, BD.MARK_AX)] = -2000000000.0
-            k_map[(mark_ax_dark_slot, BD.CONST)] = 1.0
+            _OV.slot(64, q=[("MARK_AX", -2000000000.0)], k=[("CONST", 1.0)])
             # Slot 3 K-side per-head re-tuning.
-            for dim in (
-                BD.MEM_VAL_B1, BD.MEM_VAL_B2, BD.MEM_VAL_B3,
-                BD.H2 + MEM_I, BD.H3 + MEM_I,
-            ):
-                k_map[(3, dim)] = 0.0
+            _OV.slot(3, k=[
+                ("MEM_VAL_B1", 0.0), ("MEM_VAL_B2", 0.0), ("MEM_VAL_B3", 0.0),
+                (f"H2+{MEM_I}", 0.0), (f"H3+{MEM_I}", 0.0),
+            ])
             if head == 1:
-                k_map[(3, BD.MEM_VAL_B2)] = 60.0
+                _OV.k(3, "MEM_VAL_B2", 60.0)
             elif head == 2:
-                k_map[(3, BD.MEM_VAL_B3)] = 60.0
+                _OV.k(3, "MEM_VAL_B3", 60.0)
             elif head == 3:
-                k_map[(3, BD.H3 + MEM_I)] = 60.0
-                k_map[(3, BD.H2 + MEM_I)] = -60.0
+                _OV.slot(3, k=[(f"H3+{MEM_I}", 60.0), (f"H2+{MEM_I}", -60.0)])
 
         # === source_gate (slot 37): wipe K then re-author per head ===
         # Base has no Q/K at slot 37 -- wipe is a no-op.
         source_gate = 37
-        q_map[(source_gate, BD.CONST)] = 0.0
+        _OV.q(source_gate, "CONST", 0.0)
         if head == 0:
-            q_map[(source_gate, BD.MARK_STACK0)] = 3000.0
+            _OV.q(source_gate, "MARK_STACK0", 3000.0)
         else:
-            q_map[(source_gate, byte_q_flags[head])] = 3000.0
+            _OV.q(source_gate, byte_q_flags[head], 3000.0)
         source_key_s = 10.0
-        k_map[(source_gate, BD.CONST)] = -source_key_s
-        k_map[(source_gate, BD.MEM_STORE)] = 0.5 * source_key_s
+        _OV.slot(source_gate, k=[
+            ("CONST", -source_key_s), ("MEM_STORE", 0.5 * source_key_s),
+        ])
         if head == 0:
-            k_map[(source_gate, BD.L2H0 + MEM_I)] = source_key_s
-            k_map[(source_gate, BD.H1 + MEM_I)] = -70.0
+            _OV.slot(source_gate, k=[
+                (f"L2H0+{MEM_I}", source_key_s), (f"H1+{MEM_I}", -70.0),
+            ])
         else:
-            k_map[(source_gate, BD.H1 + MEM_I)] = -70.0
+            _OV.k(source_gate, f"H1+{MEM_I}", -70.0)
             if head == 1:
-                k_map[(source_gate, BD.MEM_VAL_B2)] = source_key_s
+                _OV.k(source_gate, "MEM_VAL_B2", source_key_s)
             elif head == 2:
-                k_map[(source_gate, BD.MEM_VAL_B3)] = source_key_s
+                _OV.k(source_gate, "MEM_VAL_B3", source_key_s)
             elif head == 3:
-                k_map[(source_gate, BD.H3 + MEM_I)] = source_key_s
-                k_map[(source_gate, BD.H2 + MEM_I)] = -source_key_s
+                _OV.slot(source_gate, k=[
+                    (f"H3+{MEM_I}", source_key_s), (f"H2+{MEM_I}", -source_key_s),
+                ])
         # SP/BP register byte blockers on source_gate K.
         for marker_i in (SP_I, BP_I):
-            for dim in (
-                BD.H1 + marker_i,
-                BD.H2 + marker_i,
-                BD.H3 + marker_i,
-                BD.L2H0 + marker_i,
-            ):
-                k_map[(source_gate, dim)] = -80.0
+            _OV.slot(source_gate, k=[
+                (f"H1+{marker_i}", -80.0), (f"H2+{marker_i}", -80.0),
+                (f"H3+{marker_i}", -80.0), (f"L2H0+{marker_i}", -80.0),
+            ])
 
         # === load_source_gate (slot 39): wipe Q/K then re-author ===
         load_source_gate = 39
         load_source_gate_s = 5000.0
         load_source_key_s = 30.0
         if head == 0:
-            q_map[(load_source_gate, BD.OP_LI_RELAY)] = load_source_gate_s
-            q_map[(load_source_gate, BD.OP_LC_RELAY)] = load_source_gate_s
-            q_map[(load_source_gate, BD.MARK_AX)] = load_source_gate_s
-            q_map[(load_source_gate, BD.CMP + 3)] = 2000.0
-            q_map[(load_source_gate, BD.CONST)] = -1.5 * load_source_gate_s
-            k_map[(load_source_gate, BD.MEM_VAL_B1)] = (
-                2.0 * load_source_key_s
-            )
-            k_map[(load_source_gate, BD.MEM_ADDR_SRC)] = 40.0
+            _OV.slot(load_source_gate, q=[
+                ("OP_LI_RELAY", load_source_gate_s),
+                ("OP_LC_RELAY", load_source_gate_s),
+                ("MARK_AX", load_source_gate_s), ("CMP+3", 2000.0),
+                ("CONST", -1.5 * load_source_gate_s),
+            ], k=[
+                ("MEM_VAL_B1", 2.0 * load_source_key_s),
+                ("MEM_ADDR_SRC", 40.0),
+            ])
         else:
-            q_map[(load_source_gate, BD.OP_LI_RELAY)] = load_source_gate_s
-            q_map[(load_source_gate, byte_q_flags[head])] = (
-                load_source_gate_s
-            )
-            q_map[(load_source_gate, BD.CONST)] = -1.5 * load_source_gate_s
+            _OV.slot(load_source_gate, q=[
+                ("OP_LI_RELAY", load_source_gate_s),
+                (byte_q_flags[head], load_source_gate_s),
+                ("CONST", -1.5 * load_source_gate_s),
+            ])
             if head == 1:
-                k_map[(load_source_gate, BD.MEM_VAL_B2)] = (
-                    2.0 * load_source_key_s
-                )
+                _OV.k(load_source_gate, "MEM_VAL_B2", 2.0 * load_source_key_s)
             elif head == 2:
-                k_map[(load_source_gate, BD.MEM_VAL_B3)] = (
-                    2.0 * load_source_key_s
-                )
+                _OV.k(load_source_gate, "MEM_VAL_B3", 2.0 * load_source_key_s)
             elif head == 3:
-                k_map[(load_source_gate, BD.H3 + MEM_I)] = (
-                    2.0 * load_source_key_s
-                )
-                k_map[(load_source_gate, BD.H2 + MEM_I)] = (
-                    -2.0 * load_source_key_s
-                )
-            k_map[(load_source_gate, BD.MEM_ADDR_SRC)] = 40.0
+                _OV.slot(load_source_gate, k=[
+                    (f"H3+{MEM_I}", 2.0 * load_source_key_s),
+                    (f"H2+{MEM_I}", -2.0 * load_source_key_s),
+                ])
+            _OV.k(load_source_gate, "MEM_ADDR_SRC", 40.0)
 
         # === marker_value_gate (slot 40): head-0 only ===
         if head == 0:
-            marker_value_gate = 40
             marker_value_gate_s = 1000.0
-            q_map[(marker_value_gate, BD.OP_LI)] = marker_value_gate_s
-            q_map[(marker_value_gate, BD.OP_LC)] = marker_value_gate_s
-            k_map[(marker_value_gate, BD.MEM_VAL_B1)] = 80.0
-            k_map[(marker_value_gate, BD.MEM_ADDR_SRC)] = 40.0
-            k_map[(marker_value_gate, BD.CONST)] = -60.0
+            _OV.slot(40, q=[
+                ("OP_LI", marker_value_gate_s), ("OP_LC", marker_value_gate_s),
+            ], k=[
+                ("MEM_VAL_B1", 80.0), ("MEM_ADDR_SRC", 40.0), ("CONST", -60.0),
+            ])
 
         # === O scaling: value_scale=40.0 for OUTPUT band ===
         # Replaces base spec's slot 32+k -> OUTPUT_LO+k weight=1.0
         # with weight=40.0; same for HI.
         value_scale = 40.0
         for k in range(16):
-            o_map[(BD.OUTPUT_LO + k, 32 + k)] = value_scale
-            o_map[(BD.OUTPUT_HI + k, 48 + k)] = value_scale
+            _OV.o(32 + k, f"OUTPUT_LO+{k}", value_scale)
+            _OV.o(48 + k, f"OUTPUT_HI+{k}", value_scale)
 
         # === addsub_blocker (slot 41) ===
-        addsub_blocker = 41
-        q_map[(addsub_blocker, BD.TEMP + 8)] = 10000.0
-        q_map[(addsub_blocker, BD.TEMP + 9)] = 10000.0
-        k_map[(addsub_blocker, BD.CONST)] = -20.0
+        _OV.slot(41, q=[("TEMP+8", 10000.0), ("TEMP+9", 10000.0)],
+                 k=[("CONST", -20.0)])
 
         # === sp_byte_blocker (slot 62) ===
-        sp_byte_blocker = 62
-        # ``BD.H1 + SP_I`` (marker-bank SP slot); was the bare ``BD.H1 + 2``.
-        q_map[(sp_byte_blocker, BD.H1 + SP_I)] = 100000.0
-        q_map[(sp_byte_blocker, BD.MARK_BP)] = 100000.0
-        q_map[(sp_byte_blocker, BD.TEMP + 10)] = 100000.0
-        q_map[(sp_byte_blocker, BD.TEMP + 24)] = 100000.0
-        q_map[(sp_byte_blocker, BD.IS_BYTE)] = 0.0
-        k_map[(sp_byte_blocker, BD.CONST)] = -300000.0
+        # ``H1+SP_I`` (marker-bank SP slot); was the bare ``BD.H1 + 2``.
+        _OV.slot(62, q=[
+            (f"H1+{SP_I}", 100000.0), ("MARK_BP", 100000.0),
+            ("TEMP+10", 100000.0), ("TEMP+24", 100000.0), ("IS_BYTE", 0.0),
+        ], k=[("CONST", -300000.0)])
         if head == 0:
-            q_map[(sp_byte_blocker, BD.IS_BYTE)] = 500000.0
-            q_map[(sp_byte_blocker, BD.OP_ENT)] = 500000.0
+            _OV.slot(62, q=[("IS_BYTE", 500000.0), ("OP_ENT", 500000.0)])
 
         # === pc_byte_blocker (slot 35) ===
-        pc_byte_blocker = 35
-        q_map[(pc_byte_blocker, BD.H1 + PC_I)] = 100000.0
-        q_map[(pc_byte_blocker, BD.MARK_PC)] = 100000000.0
-        q_map[(pc_byte_blocker, BD.IS_BYTE)] = 0.0
-        k_map[(pc_byte_blocker, BD.CONST)] = -100000.0
+        _OV.slot(35, q=[
+            (f"H1+{PC_I}", 100000.0), ("MARK_PC", 100000000.0),
+            ("IS_BYTE", 0.0),
+        ], k=[("CONST", -100000.0)])
         if head == 0:
-            q_map[(pc_byte_blocker, BD.MARK_STACK0)] = 10000.0
-            q_map[(pc_byte_blocker, BD.HAS_SE)] = 10000.0
-            q_map[(pc_byte_blocker, BD.CMP + 3)] = 10000.0
-            q_map[(pc_byte_blocker, BD.ADDR_B0_LO + 8)] = 10000.0
-            q_map[(pc_byte_blocker, BD.ADDR_B0_HI + 15)] = 10000.0
-            q_map[(pc_byte_blocker, BD.OP_LI_RELAY)] = -10000.0
-            q_map[(pc_byte_blocker, BD.OP_LC_RELAY)] = -10000.0
+            _OV.slot(35, q=[
+                ("MARK_STACK0", 10000.0), ("HAS_SE", 10000.0),
+                ("CMP+3", 10000.0), ("ADDR_B0_LO+8", 10000.0),
+                ("ADDR_B0_HI+15", 10000.0), ("OP_LI_RELAY", -10000.0),
+                ("OP_LC_RELAY", -10000.0),
+            ])
 
             # === stack0_preserve (slot 36): head-0 only ===
-            stack0_preserve_row = 36
             stack0_preserve_s = 1.0
-            q_map[(stack0_preserve_row, BD.CONST)] = (
-                -1.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MARK_STACK0)] = (
-                3.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.HAS_SE)] = (
-                1.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.CMP + 3)] = (
-                -5.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MEM_STORE)] = (
-                -10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.IS_BYTE)] = (
-                -10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MARK_AX)] = (
-                -10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.H1 + AX_I)] = (
-                10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.OP_LI_RELAY)] = (
-                10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.OP_LC_RELAY)] = (
-                10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MARK_PC)] = (
-                -10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MARK_SP)] = (
-                -10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MARK_BP)] = (
-                -10.0 * stack0_preserve_s
-            )
-            q_map[(stack0_preserve_row, BD.MARK_MEM)] = (
-                -10.0 * stack0_preserve_s
-            )
-            k_map[(stack0_preserve_row, BD.CONST)] = (
-                -2.0 * stack0_preserve_s
-            )
-            k_map[(stack0_preserve_row, BD.H1 + 10)] = (
-                2.0 * stack0_preserve_s
-            )
-            k_map[(stack0_preserve_row, BD.BYTE_INDEX_0)] = (
-                2.0 * stack0_preserve_s
-            )
-            k_map[(stack0_preserve_row, BD.OP_ENT)] = (
-                -0.25 * stack0_preserve_s
-            )
-            for marker_i in range(5):
-                k_map[(stack0_preserve_row, BD.H1 + marker_i)] = (
-                    -4.0 * stack0_preserve_s
-                )
+            _OV.slot(36, q=[
+                ("CONST", -1.0 * stack0_preserve_s),
+                ("MARK_STACK0", 3.0 * stack0_preserve_s),
+                ("HAS_SE", 1.0 * stack0_preserve_s),
+                ("CMP+3", -5.0 * stack0_preserve_s),
+                ("MEM_STORE", -10.0 * stack0_preserve_s),
+                ("IS_BYTE", -10.0 * stack0_preserve_s),
+                ("MARK_AX", -10.0 * stack0_preserve_s),
+                (f"H1+{AX_I}", 10.0 * stack0_preserve_s),
+                ("OP_LI_RELAY", 10.0 * stack0_preserve_s),
+                ("OP_LC_RELAY", 10.0 * stack0_preserve_s),
+                ("MARK_PC", -10.0 * stack0_preserve_s),
+                ("MARK_SP", -10.0 * stack0_preserve_s),
+                ("MARK_BP", -10.0 * stack0_preserve_s),
+                ("MARK_MEM", -10.0 * stack0_preserve_s),
+            ], k=[
+                ("CONST", -2.0 * stack0_preserve_s),
+                ("H1+10", 2.0 * stack0_preserve_s),
+                ("BYTE_INDEX_0", 2.0 * stack0_preserve_s),
+                ("OP_ENT", -0.25 * stack0_preserve_s),
+            ])
+            _OV.slot(36, k=[
+                (f"H1+{marker_i}", -4.0 * stack0_preserve_s)
+                for marker_i in range(5)
+            ])
 
         # === mem_addr_byte_blocker (slot 36) for heads 1-3 ===
         if head in (1, 2, 3):
-            mem_addr_byte_blocker = 36
-            q_map[(mem_addr_byte_blocker, BD.H1 + MEM_I)] = 100000.0
-            k_map[(mem_addr_byte_blocker, BD.CONST)] = -20.0
+            _OV.slot(36, q=[(f"H1+{MEM_I}", 100000.0)], k=[("CONST", -20.0)])
 
         # === nonpop_stack0_marker_blocker (slot 63) ===
         # Legacy: ``attn.W_v[base+63, :] = 0`` then explicit Q/K writes,
@@ -1903,70 +1911,59 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
         # and O (OUTPUT_HI+15, 63) cells via CAM_DROP, then write the Q/K blocker.
         # The overlay's O-rescale-to-40 above set (OUTPUT_HI+15, 63)=40; the DROP
         # removes it (merged after the rescale), matching the legacy pop.
-        nonpop_stack0_marker_blocker = 63
-        v_map[(nonpop_stack0_marker_blocker, BD.CLEAN_EMBED_HI + 15)] = CAM_DROP
-        o_map[(BD.OUTPUT_HI + 15, nonpop_stack0_marker_blocker)] = CAM_DROP
-        q_map[(nonpop_stack0_marker_blocker, BD.MARK_STACK0)] = 60000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.CMP + 3)] = -15000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.IS_BYTE)] = 60000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.OP_LI_RELAY)] = -60000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.OP_LC_RELAY)] = -60000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_LO + 8)] = -40000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_HI + 14)] = -30000.0
-        k_map[(nonpop_stack0_marker_blocker, BD.CONST)] = -20.0
+        # ``ADDR_B0_HI+14`` is written twice (last wins: -20000.0), mirroring the
+        # legacy flat-map ordering (the accumulator keeps last-write-wins).
         top_store_e8_from_e0_s = 10000.0
-        q_map[(nonpop_stack0_marker_blocker, BD.MEM_STORE)] = (
-            top_store_e8_from_e0_s
-        )
-        q_map[(nonpop_stack0_marker_blocker, BD.EMBED_LO + 8)] = (
-            top_store_e8_from_e0_s
-        )
-        q_map[(nonpop_stack0_marker_blocker, BD.EMBED_HI + 14)] = (
-            top_store_e8_from_e0_s
-        )
-        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_LO + 0)] = (
-            top_store_e8_from_e0_s
-        )
-        q_map[(nonpop_stack0_marker_blocker, BD.ADDR_B0_HI + 14)] = (
-            -2.0 * top_store_e8_from_e0_s
-        )
+        _OV.slot(63,
+            v=[("CLEAN_EMBED_HI+15", CAM_DROP)],
+            o=[("OUTPUT_HI+15", CAM_DROP)],
+            q=[
+                ("MARK_STACK0", 60000.0), ("CMP+3", -15000.0),
+                ("IS_BYTE", 60000.0), ("OP_LI_RELAY", -60000.0),
+                ("OP_LC_RELAY", -60000.0), ("ADDR_B0_LO+8", -40000.0),
+                ("ADDR_B0_HI+14", -30000.0),
+                ("MEM_STORE", top_store_e8_from_e0_s),
+                ("EMBED_LO+8", top_store_e8_from_e0_s),
+                ("EMBED_HI+14", top_store_e8_from_e0_s),
+                ("ADDR_B0_LO+0", top_store_e8_from_e0_s),
+                ("ADDR_B0_HI+14", -2.0 * top_store_e8_from_e0_s),
+            ],
+            k=[("CONST", -20.0)])
 
         # === current_store_blocker (slot 38) ===
-        current_store_blocker = 38
         current_store_block_s = 10000.0
-        q_map[(current_store_blocker, BD.MARK_MEM)] = current_store_block_s
-        q_map[(current_store_blocker, BD.H3 + MEM_I)] = current_store_block_s
-        k_map[(current_store_blocker, BD.CONST)] = -20.0
+        _OV.slot(38, q=[
+            ("MARK_MEM", current_store_block_s),
+            (f"H3+{MEM_I}", current_store_block_s),
+        ], k=[("CONST", -20.0)])
 
         # === Broad current-MEM-section blockers on slots 0, 28-33 ===
         for slot in (0, 28, 29, 30, 31, 32, 33):
-            q_map[(slot, BD.MARK_MEM)] = -100000.0
-            q_map[(slot, BD.H3 + MEM_I)] = -100000.0
+            _OV.slot(slot, q=[
+                ("MARK_MEM", -100000.0), (f"H3+{MEM_I}", -100000.0),
+            ])
         # Slot 29: extras (PC H1).
-        q_map[(29, BD.MARK_MEM)] = -100000.0
-        q_map[(29, BD.H3 + MEM_I)] = -100000.0
-        q_map[(29, BD.H1 + PC_I)] = -20000.0
-        k_map[(29, BD.CONST)] = 5.0
+        _OV.slot(29, q=[
+            ("MARK_MEM", -100000.0), (f"H3+{MEM_I}", -100000.0),
+            (f"H1+{PC_I}", -20000.0),
+        ], k=[("CONST", 5.0)])
         # Slot 30: AX H1 blocker.
-        q_map[(30, BD.H1 + AX_I)] = -20000.0
-        k_map[(30, BD.CONST)] = 5.0
+        _OV.slot(30, q=[(f"H1+{AX_I}", -20000.0)], k=[("CONST", 5.0)])
         # Slot 31: LI/LC restore (head 0 also AX blocker reverse).
-        q_map[(31, BD.OP_LI_RELAY)] = 20000.0
+        _OV.q(31, "OP_LI_RELAY", 20000.0)
         if head == 0:
-            q_map[(31, BD.OP_LC_RELAY)] = 20000.0
+            _OV.q(31, "OP_LC_RELAY", 20000.0)
         else:
-            q_map[(31, BD.MARK_AX)] = -20000.0
-        q_map[(31, BD.OP_SI)] = -20000.0
-        q_map[(31, BD.OP_SC)] = -20000.0
-        k_map[(31, BD.MEM_STORE)] = 5.0
+            _OV.q(31, "MARK_AX", -20000.0)
+        _OV.slot(31, q=[("OP_SI", -20000.0), ("OP_SC", -20000.0)],
+                 k=[("MEM_STORE", 5.0)])
 
         # Slot 32: AX marker default blocker.
-        q_map[(32, BD.MARK_AX)] = -20000.0
-        k_map[(32, BD.CONST)] = 5.0
+        _OV.slot(32, q=[("MARK_AX", -20000.0)], k=[("CONST", 5.0)])
         if head == 0:
-            q_map[(33, BD.OP_LI_RELAY)] = 20000.0
-            q_map[(33, BD.OP_LC_RELAY)] = 20000.0
-            k_map[(33, BD.MEM_STORE)] = 5.0
+            _OV.slot(33, q=[
+                ("OP_LI_RELAY", 20000.0), ("OP_LC_RELAY", 20000.0),
+            ], k=[("MEM_STORE", 5.0)])
 
         # === C4_L15_LI_SUPPR_INERT: un-bury the head-0 load on LI/LC rows ===
         # See _l15_li_load_suppressor_inert_on for the full root + proof. The
@@ -1997,31 +1994,28 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # so RESCALE slot 58 by 1e4 first (the cancel of two ~1e6 numbers is
             # precision-safe; a 1e10 cancel is not).
             _row58_rescale = 10000.0
-            for _d, _w in (
-                (BD.OP_ENT, 200000000.0 / _row58_rescale),
-                (BD.MARK_STACK0,
+            _OV.slot(58, q=[
+                ("OP_ENT", 200000000.0 / _row58_rescale),
+                ("MARK_STACK0",
                  (early_ent_stack0_q + stack0_gate) / _row58_rescale),
-                (BD.CONST,
+                ("CONST",
                  -(early_ent_stack0_q + stack0_gate) / _row58_rescale),
-                (BD.IS_BYTE, -2000000000.0 / _row58_rescale),
-                (BD.MARK_AX, -2000000000.0 / _row58_rescale),
-                (BD.MARK_PC, -2000000000.0 / _row58_rescale),
-                (BD.MARK_SP, -2000000000.0 / _row58_rescale),
-                (BD.MARK_BP, -2000000000.0 / _row58_rescale),
-                (BD.MARK_MEM, -2000000000.0 / _row58_rescale),
-            ):
-                q_map[(58, _d)] = _w
-            k_map[(58, BD.OP_ENT)] = 1.0
+                ("IS_BYTE", -2000000000.0 / _row58_rescale),
+                ("MARK_AX", -2000000000.0 / _row58_rescale),
+                ("MARK_PC", -2000000000.0 / _row58_rescale),
+                ("MARK_SP", -2000000000.0 / _row58_rescale),
+                ("MARK_BP", -2000000000.0 / _row58_rescale),
+                ("MARK_MEM", -2000000000.0 / _row58_rescale),
+            ], k=[("OP_ENT", 1.0)])
+            # Each cancel slot's Q copies the suppressor's FULL current Q and its
+            # K negates the suppressor's FULL current K, so suppressor+cancel == 0
+            # on every row (fully inert, expressed additively). The DATA copy
+            # reads the accumulator's current per-slot cells.
             _GATE = {34: 70, 35: 64, 58: 65, 59: 66, 60: 67, 61: 68, 62: 69}
             for _suppr, _gate in _GATE.items():
-                for (_s, _d), _w in [
-                    ((s, d), w) for (s, d), w in q_map.items() if s == _suppr
-                ]:
-                    q_map[(_gate, _d)] = _w
-                for (_s, _d), _w in [
-                    ((s, d), w) for (s, d), w in k_map.items() if s == _suppr
-                ]:
-                    k_map[(_gate, _d)] = -_w
+                _OV.slot(_gate,
+                    q=list(_OV.q_cells(_suppr)),
+                    k=[(_d, -_w) for (_d, _w) in _OV.k_cells(_suppr)])
 
         # === C4_L15_LI_ADDR_CAM: head-0 per-store address-match discriminator ===
         # See _l15_li_addr_cam_discriminator_on for the full root + proof. On a
@@ -2056,17 +2050,14 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # nibbles (&a lo=8 hi=0xe, &b lo=0 hi=0xe, &c lo=8 hi=0xd): the lo
             # OR hi nonzero nibble uniquely separates every BP-relative local.
             _cam_s = 360.0
-            for _nib_base, _row_base in (
-                (BD.ADDR_B0_LO, 71), (BD.ADDR_B0_HI, 87),
-            ):
+            for _nib_base, _row_base in (("ADDR_B0_LO", 71), ("ADDR_B0_HI", 87)):
                 for _k in range(1, 16):
-                    _row = _row_base + _k
                     # Gate: require MARK_AX so the match is inert off the AX
                     # byte-0 emit row (CONST baseline buries non-AX rows).
-                    q_map[(_row, BD.CONST)] = -2.0 * _cam_s
-                    q_map[(_row, BD.MARK_AX)] = 2.0 * _cam_s
-                    q_map[(_row, _nib_base + _k)] = _cam_s
-                    k_map[(_row, _nib_base + _k)] = _cam_s
+                    _OV.slot(_row_base + _k, q=[
+                        ("CONST", -2.0 * _cam_s), ("MARK_AX", 2.0 * _cam_s),
+                        (f"{_nib_base}+{_k}", _cam_s),
+                    ], k=[(f"{_nib_base}+{_k}", _cam_s)])
 
         # === #301/#318: head-0 ZERO-ADDRESS (k=0) committed-store match ===
         # See _l15_li_zeroaddr_cam_on for the full root + proof. The #313 CAM
@@ -2153,12 +2144,11 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             #                   the cancelled ~1e6 blockers, so head-0 is NOT
             #                   over-sharpened (the AR-frame-safe regime that the
             #                   linear-K MSAV variant could not reach).
-            _row = 103
             # Q: OP_LI emit-row gate only. K: the committed-zero-address
             # indicator. The slot boosts the committed-BP+0-local value row at
             # every LI emit; it is inert on non-LI rows (Q=0) and on every LI
             # whose locals are all nonzero-address (no indicator candidate).
-            q_map[(_row, BD.OP_LI)] = _opli_q
+            _OV.q(103, "OP_LI", _opli_q)
             # sc_lc roundtrip: mirror the committed-zero-address byte-0 boost
             # onto the OP_LC (load-char) emit row. The SC store @0x200 has a
             # ZERO-address byte-0 (0x00), so the #313 ADDR CAM (k=0 dropped)
@@ -2170,8 +2160,8 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # on LC opcode rows (var/func/SI/LI programs never emit it) so the
             # slot stays inert on every non-LC frame. See _l15_sclc_byte0_on.
             if _l15_sclc_byte0_on():
-                q_map[(_row, BD.OP_LC)] = _opli_q
-            k_map[(_row, BD.LI_ZEROADDR_COMMITTED)] = _ind_w
+                _OV.q(103, "OP_LC", _opli_q)
+            _OV.k(103, "LI_ZEROADDR_COMMITTED", _ind_w)
 
         # === #318: head-0 byte-0 VALUE-row selector via the SURVIVING MEM_VAL_B0 ===
         # Root (a52fd42c, spec_k=0, BUILT dims): head-0's slot-3 byte-0 value-row
@@ -2201,7 +2191,7 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
         # 35-tok flag-OFF is byte-identical -- this branch is not taken there.
         if head == 0 and _l15_li_byte0_valsel_on():
             _bs_b0 = 60.0  # mirrors the base spec slot-3 BS (l15:860)
-            k_map[(3, BD.MEM_VAL_B0)] = _bs_b0
+            _OV.k(3, "MEM_VAL_B0", _bs_b0)
 
         # === PHASE-2: head-0 MEM_VAL_B1 VALUE-row lift (first-param LI) ===
         # The #313 ADDR_B0 CAM TIES the genuine first-param value row against
@@ -2223,8 +2213,7 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
             # there and 0 elsewhere, so off-AX rows contribute nothing. The K
             # (MEM_VAL_B1) is itself ~0 except on genuine store VALUE rows, so
             # the product is nonzero only at (AX-lookup-row x value-row).
-            q_map[(102, BD.MARK_AX)] = _vr_s
-            k_map[(102, BD.MEM_VAL_B1)] = _vr_s
+            _OV.slot(102, q=[("MARK_AX", _vr_s)], k=[("MEM_VAL_B1", _vr_s)])
 
         # === POST-FLIP: head-0 JSR-phantom value-row PENALTY (first-param LI) ===
         # See _l15_li_jsr_phantom_penalty_on for the full root + proof. On the
@@ -2248,32 +2237,15 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
         if head == 0 and _l15_li_jsr_phantom_penalty_on():
             _jp_q = 360.0   # MARK_AX byte-0-lookup-row gate (mirrors #313 _cam_s)
             _jp_k = 100.0   # OP_JSR penalty K weight
-            q_map[(104, BD.MARK_AX)] = _jp_q
-            k_map[(104, BD.OP_JSR)] = -_jp_k
+            _OV.slot(104, q=[("MARK_AX", _jp_q)], k=[("OP_JSR", -_jp_k)])
 
-        # Group the OVERRIDE cells (int-keyed maps) into per-slot overlay
-        # discriminators (DATA). The CAM builder merges these last-write-wins
-        # over the base head (after the value bands), and a CAM_DROP weight
-        # removes that (slot, dim) cell (the legacy V/O slot-63 wipe).
-        overlay_slots = sorted(
-            {s for (s, _d) in q_map}
-            | {s for (s, _d) in k_map}
-            | {s for (s, _d) in v_map}
-            | {s for (_d, s) in o_map}
-        )
-        overlay: list[CamDiscriminatorSlot] = []
-        for s in overlay_slots:
-            overlay.append(CamDiscriminatorSlot(
-                slot=s,
-                q=tuple((d, w) for (sl, d), w in q_map.items() if sl == s),
-                k=tuple((d, w) for (sl, d), w in k_map.items() if sl == s),
-                v=tuple((d, w) for (sl, d), w in v_map.items() if sl == s),
-                o=tuple((od, w) for (od, sl), w in o_map.items() if sl == s),
-            ))
-
+        # Emit the accumulated OVERRIDE cells as overlay discriminators (DATA).
+        # The CAM builder merges them last-write-wins over the base head (after
+        # the value bands); a CAM_DROP weight removes that (slot, dim) cell (the
+        # legacy V/O slot-63 wipe). Name tokens resolve through ``dim_map``.
         cam = _l15_li_lc_load_cam(
             head, addr_block, value_bands, base_BS, MEM_VAL_DIMS,
-            overlay=tuple(overlay),
+            overlay=_OV.discriminators(),
         )
         head_idx = _L15_HEAD_LAYOUT_BY_NAME[
             f"layer15_memory_lookup.li_lc_stack0_h{head}"
