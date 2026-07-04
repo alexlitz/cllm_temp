@@ -511,61 +511,110 @@ def _layer13_mem_addr_gather_ir(dim_positions, HD) -> CompilerIR:
 # claims the free slot 3. A positive ALiBi slope keeps the gather
 # step-local / top-of-stack: the most-recent STACK0 byte-1 row (the
 # current OR/XOR's operand A) wins the softmax over older frames.
+#
+# DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): this head is a
+# canonical content-addressable relay, so it is now expressed byte-identically
+# through ``cam_lookup``: fire at the OR/XOR MARK_AX row (with the 29-opcode
+# rejection overlay = the ``query_blockers``), content-match the STACK0 byte-1
+# value row via ``STACK0_BYTE1``, relay that row's STACK0_BYTE_VAL_1 nibbles
+# into AX_FULL, with the slot-33 CONST-anchored confirm. The hand-authored
+# per-slot Q/K/V/O directive construction is DELETED; the compact spec below is
+# the sole path. Proof: ``tools/_probe_l13_relay_cam_derive.py`` (head 3
+# derived == the legacy writes) + the whole-model golden hash unchanged.
+
+def _l13_relay_dim_map(BD, spec: CamLookupSpec) -> dict:
+    """Resolve every dim NAME a plain (offset-free) L13 relay CAM spec touches.
+
+    The L13 relay heads (bitwise byte-1, mul result-hi) address rows by a
+    single-nibble marker/opcode signature and relay whole nibble bands -- there
+    are NO ``BASE+offset`` marker-relative tokens (unlike the mem-addr gather's
+    ``L1H1+MEM_I``). So the dim map is just ``{name: int(getattr(BD, name))}``
+    over the union of every base name the spec references (key match, blockers,
+    confirm, const, and the value-band source/target BASE bands -- the
+    ``cam_lookup`` builder adds the per-nibble ``+k`` offsets itself). ``BD`` is
+    a ``_SetDim``-like proxy whose ``.NAME`` attributes are the allocated
+    positions.
+    """
+    km = spec.key_match
+    names: set[str] = {km.query_dim, km.key_dim, spec.const_dim}
+    for (dim, _w) in km.query_extra:
+        names.add(dim.split("+", 1)[0])
+    for (dim, _w) in km.key_extra:
+        names.add(dim.split("+", 1)[0])
+    for (op_dim, _w) in spec.query_blockers:
+        names.add(op_dim.split("+", 1)[0])
+    if spec.confirm is not None:
+        if spec.confirm.marker_dim is not None:
+            names.add(spec.confirm.marker_dim.split("+", 1)[0])
+        for (op_dim, _w) in spec.confirm.blockers:
+            names.add(op_dim.split("+", 1)[0])
+    for vb in spec.value_bands:
+        names.add(vb.source_band)
+        names.add(vb.target_band)
+    for vs in spec.valid_slots:
+        names.add(vs.valid_read_dim.split("+", 1)[0])
+        names.add(vs.valid_write_dim.split("+", 1)[0])
+    return {n: int(getattr(BD, n)) for n in names}
+
+
+# The 29 non-OR/XOR opcodes rejected at the Q row so the head only fires on
+# OR/XOR steps (mirrors the L7 operand_gather exclusion pattern).
+_L13_BITWISE_EXCLUDE_OPCODES = (
+    "OP_AND", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
+    "OP_SHL", "OP_SHR", "OP_EQ", "OP_NE", "OP_LT", "OP_GT",
+    "OP_LE", "OP_GE", "OP_IMM", "OP_PSH", "OP_JSR", "OP_ENT",
+    "OP_LEV", "OP_LI", "OP_LC", "OP_SI", "OP_SC", "OP_LEA",
+    "OP_JMP", "OP_BZ", "OP_BNZ", "OP_ADJ", "OP_EXIT",
+)
+
+
+def _l13_bitwise_byte1_cam_spec(BD) -> CamLookupSpec:
+    """The ``CamLookupSpec`` for L13 head 3 (OR/XOR operand-A byte-1 gather).
+
+    Q fires at MARK_AX AND (OP_OR or OP_XOR) with the 29-opcode rejection
+    overlay (``query_blockers``) + a CONST anti-leak; K content-matches the
+    STACK0 byte-1 value row (``STACK0_BYTE1``); the value band relays
+    STACK0_BYTE_VAL_1 -> AX_FULL. The slot-33 CONST-anchored confirm pins the
+    OR/XOR MARK_AX row select. ``BD`` gates each blocker on the opcode dim being
+    present (mirrors the legacy ``getattr`` guard).
+    """
+    L = 15.0
+    blockers = tuple(
+        (opname, -L * 10)
+        for opname in _L13_BITWISE_EXCLUDE_OPCODES
+        if getattr(BD, opname, None) is not None
+    )
+    return CamLookupSpec(
+        name="layer13_bitwise_byte1_gather.head_3",
+        key_match=CamKeyMatch(
+            query_dim="MARK_AX", key_dim="STACK0_BYTE1", weight=L, query_slot=0,
+            query_extra=(("OP_OR", L), ("OP_XOR", L), ("CONST", -L / 2)),
+        ),
+        query_blockers=blockers,
+        confirm=CamConfirmSlot(
+            slot=33, marker_weight=L, const_q_weight=-L / 2,
+            const_k_weight=L, marker_dim="MARK_AX",
+        ),
+        value_bands=(
+            CamValueBand("STACK0_BYTE_VAL_1_LO", "AX_FULL_LO", 16, 1, 1.0),
+            CamValueBand("STACK0_BYTE_VAL_1_HI", "AX_FULL_HI", 16, 17, 1.0),
+        ),
+        const_dim="CONST",
+        direction="load",
+    )
+
+
 def _layer13_bitwise_byte1_gather_head_specs(BD) -> tuple:
     """L13 head 3: stage operand-A byte 1 into AX_FULL on OR/XOR.
 
-    Q fires at MARK_AX AND (OP_OR or OP_XOR); a CONST anti-leak penalty
-    plus per-opcode exclusions keep the head dark on every other step.
-    K fires at the STACK0 byte-1 value row (STACK0_BYTE1). V copies the
-    STACK0_BYTE_VAL_1_LO/HI nibble pair; O writes AX_FULL_LO/HI at the Q
-    (MARK_AX) row. ALiBi recency (slope set in the bake) selects the
-    most-recent STACK0 byte-1 row = current top of stack = operand A.
+    DERIVED from :func:`cam_lookup` (see ``_l13_bitwise_byte1_cam_spec`` and
+    the module comment block for the byte-identity provenance). ALiBi recency
+    (slope set in the bake) selects the most-recent STACK0 byte-1 row = current
+    top of stack = operand A.
     """
-    L = 15.0
-    # Exclude every non-OR/XOR opcode at the Q row so the head only fires
-    # on OR/XOR steps (mirrors the L7 operand_gather exclusion pattern).
-    _EXCLUDE_OPCODES = (
-        "OP_AND", "OP_ADD", "OP_SUB", "OP_MUL", "OP_DIV", "OP_MOD",
-        "OP_SHL", "OP_SHR", "OP_EQ", "OP_NE", "OP_LT", "OP_GT",
-        "OP_LE", "OP_GE", "OP_IMM", "OP_PSH", "OP_JSR", "OP_ENT",
-        "OP_LEV", "OP_LI", "OP_LC", "OP_SI", "OP_SC", "OP_LEA",
-        "OP_JMP", "OP_BZ", "OP_BNZ", "OP_ADJ", "OP_EXIT",
-    )
-    q = [
-        AP(0, BD.MARK_AX, L),
-        AP(0, BD.OP_OR, L),
-        AP(0, BD.OP_XOR, L),
-        AP(0, BD.CONST, -L / 2),
-    ]
-    for opname in _EXCLUDE_OPCODES:
-        op_dim = getattr(BD, opname, None)
-        if op_dim is not None:
-            q.append(AP(0, op_dim, -L * 10))
-    # Slot 33 anti-leak: require MARK_AX strongly so the slot-0 softmax
-    # only routes positively at the OR/XOR MARK_AX Q row.
-    q.append(AP(33, BD.MARK_AX, L))
-    q.append(AP(33, BD.CONST, -L / 2))
-
-    k = [
-        AP(0, BD.STACK0_BYTE1, L),
-        AP(33, BD.CONST, L),
-    ]
-    # V slots 1..32 copy the STACK0 byte-1 value nibbles.
-    v = [AP(1 + kk, BD.STACK0_BYTE_VAL_1_LO + kk, 1.0) for kk in range(16)]
-    v += [AP(17 + kk, BD.STACK0_BYTE_VAL_1_HI + kk, 1.0) for kk in range(16)]
-    # O slots 1..32 route the gathered nibbles into AX_FULL_LO/HI.
-    o = [AO(BD.AX_FULL_LO + kk, 1 + kk, 1.0) for kk in range(16)]
-    o += [AO(BD.AX_FULL_HI + kk, 17 + kk, 1.0) for kk in range(16)]
-
-    return (
-        DeclarativeAttentionHeadSpec(
-            head_idx=3,
-            q=tuple(q),
-            k=tuple(k),
-            v=tuple(v),
-            o=tuple(o),
-        ),
-    )
+    dim_map = _l13_relay_dim_map(BD, _l13_bitwise_byte1_cam_spec(BD))
+    bundle = cam_lookup(_l13_bitwise_byte1_cam_spec(BD))
+    return (bundle.head_spec_builder(dim_map, 3),)
 
 
 def _layer13_bitwise_byte1_gather_ir(dim_positions, HD) -> CompilerIR:
@@ -1279,45 +1328,56 @@ def make_layer13_add_addend_relay_op() -> Operation:
 # bytes correctly and bnz stays green -> smoke 50/1. width=2 is the
 # default (opt out C4_MUL_WIDTH2=0). See
 # docs/MUL_WIDTH2_WIDEN_2026_06_13.md.
+#
+# DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): this is a
+# canonical SAME-ROW CAM relay -- the source (MUL_RESULT_HI_*) and destination
+# (AX_FULL_*) both live at the MUL MARK_AX row, so ``cam_lookup`` expresses it
+# with a degenerate key match on ``CONST`` (K matches CONST at the firing row;
+# the recency softmax keeps the copy local). Fire at MARK_AX AND OP_MUL with a
+# CONST anti-leak (``query_extra``), relay MUL_RESULT_HI -> AX_FULL, slot-33
+# CONST-anchored confirm. The hand-authored Q/K/V/O construction is DELETED;
+# the compact spec below is the sole path. Proof:
+# ``tools/_probe_l13_relay_cam_derive.py`` (head 6 derived == the legacy writes)
+# + the whole-model golden hash unchanged.
+def _l13_mul_result_hi_cam_spec(BD) -> CamLookupSpec:
+    """The ``CamLookupSpec`` for L13 head 6 (width=2 MUL byte-1 result relay).
+
+    Same-row copy at the MUL MARK_AX row: Q fires at MARK_AX AND OP_MUL (with a
+    CONST anti-leak); K content-matches CONST at the firing row so the recency
+    softmax stays local; the value band relays MUL_RESULT_HI -> AX_FULL. The
+    slot-33 CONST-anchored confirm pins the MUL MARK_AX row select. ``BD`` is
+    unused here (the spec is dim-name only) but kept for a uniform call site.
+    """
+    del BD
+    L = 15.0
+    return CamLookupSpec(
+        name="layer13_mul_result_hi_relay.head_6",
+        key_match=CamKeyMatch(
+            query_dim="MARK_AX", key_dim="CONST", weight=L, query_slot=0,
+            query_extra=(("OP_MUL", L), ("CONST", -L / 2)),
+        ),
+        confirm=CamConfirmSlot(
+            slot=33, marker_weight=L, const_q_weight=-L / 2,
+            const_k_weight=L, marker_dim="MARK_AX",
+        ),
+        value_bands=(
+            CamValueBand("MUL_RESULT_HI_LO", "AX_FULL_LO", 16, 1, 1.0),
+            CamValueBand("MUL_RESULT_HI_HI", "AX_FULL_HI", 16, 17, 1.0),
+        ),
+        const_dim="CONST",
+        direction="load",
+    )
+
+
 def _layer13_mul_result_hi_relay_head_specs(BD) -> tuple:
     """L13 head 6: copy MUL byte-1 result (MUL_RESULT_HI_*) into AX_FULL.
 
-    Same-row copy at the MUL MARK_AX row. Q fires at MARK_AX AND OP_MUL
-    (with a CONST anti-leak penalty and a slot-33 MARK_AX requirement so
-    the slot-0 softmax only routes positively on the MUL MARK_AX row).
-    K matches CONST at the same row. V copies the MUL_RESULT_HI_LO/HI
-    nibble pair; O writes AX_FULL_LO/HI at the Q row.
+    DERIVED from :func:`cam_lookup` (see ``_l13_mul_result_hi_cam_spec`` and the
+    module comment block for the byte-identity provenance).
     """
-    L = 15.0
-    q = [
-        AP(0, BD.MARK_AX, L),
-        AP(0, BD.OP_MUL, L),
-        AP(0, BD.CONST, -L / 2),
-        # slot 33 anti-leak: require MARK_AX so the slot-0 softmax only
-        # routes positively at the MUL MARK_AX Q row.
-        AP(33, BD.MARK_AX, L),
-        AP(33, BD.CONST, -L / 2),
-    ]
-    k = [
-        AP(0, BD.CONST, L),
-        AP(33, BD.CONST, L),
-    ]
-    # V slots 1..32 copy the MUL byte-1 result nibbles.
-    v = [AP(1 + kk, BD.MUL_RESULT_HI_LO + kk, 1.0) for kk in range(16)]
-    v += [AP(17 + kk, BD.MUL_RESULT_HI_HI + kk, 1.0) for kk in range(16)]
-    # O slots 1..32 route the gathered nibbles into AX_FULL_LO/HI.
-    o = [AO(BD.AX_FULL_LO + kk, 1 + kk, 1.0) for kk in range(16)]
-    o += [AO(BD.AX_FULL_HI + kk, 17 + kk, 1.0) for kk in range(16)]
-
-    return (
-        DeclarativeAttentionHeadSpec(
-            head_idx=6,
-            q=tuple(q),
-            k=tuple(k),
-            v=tuple(v),
-            o=tuple(o),
-        ),
-    )
+    spec = _l13_mul_result_hi_cam_spec(BD)
+    dim_map = _l13_relay_dim_map(BD, spec)
+    return (cam_lookup(spec).head_spec_builder(dim_map, 6),)
 
 
 def _layer13_mul_result_hi_relay_ir(dim_positions, HD) -> CompilerIR:
