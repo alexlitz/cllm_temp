@@ -71,6 +71,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     PushDelta,
     RegisterDeltaBundle,
     RegisterDeltaSpec,
+    RuntimeAddDelta,
     SequentialAddDelta,
     ValueRouteBundle,
     ValueRouteChannel,
@@ -2703,3 +2704,72 @@ def test_control_op_reexpresses_lev_teardown_byte_identical():
     assert any(f.startswith("l16_lev_sp_bp_plus16") for f in seen)
     assert any(f.startswith("l16_lev_pc_cancel_hi") for f in seen)
     assert seen[-1].startswith("l16_lev_pc_temp")
+
+
+def test_runtime_add_kind_requires_runtime_add_field():
+    """A ``runtime_add`` RegisterDeltaSpec must carry a RuntimeAddDelta."""
+    with pytest.raises(ValueError, match="requires runtime_add"):
+        RegisterDeltaSpec(name="x", kind="runtime_add", write_scale=0.02)
+
+
+def _adj_runtime_add_spec():
+    """The ADJ ``SP += imm`` runtime-adder spec (matches ``l9_ops._adj_control_op``)."""
+    from c4_release.neural_vm.dim_registry import dim_ref
+    from c4_release.neural_vm.unified_compiler.ops.l9_ops import _NON_AX_BLOCKERS
+
+    gate_adj = dim_ref("opcode_flag", "ADJ")
+    return RegisterDeltaSpec(
+        name="adj_sp_delta",
+        kind="runtime_add",
+        write_scale=2.0 / 100.0,
+        conditions=((gate_adj, 1.0),),
+        runtime_add=RuntimeAddDelta(
+            gate=gate_adj,
+            op="add",
+            operand_a_band="ALU_HI",
+            operand_b_band="FETCH_HI",
+            result_band="OUTPUT_HI_THIS_STEP",
+            marker_gate="MARK_SE_ONLY",
+            blocker_dims=tuple(_NON_AX_BLOCKERS),
+            carry_in_dim=dim_ref("carry", "alu", 0),
+            threshold_no_carry=42.0,
+            threshold_with_carry=50.0,
+            write_scale=2.0 / 100.0,
+            name_fn=lambda c, a, b: f"adj_hi_c{c}_a{a}_b{b}_step_end",
+        ),
+    )
+
+
+def test_runtime_add_reexpresses_adj_hi_nibble_byte_identical():
+    """The ``runtime_add`` SpDelta re-expresses the ADJ ``SP += imm`` hi-nibble
+    band (512 units) cell-for-cell — the LIVE-operand (FETCH_HI) adder the
+    compile-time ``SequentialAddDelta`` cannot express."""
+    from collections import Counter
+
+    derived = list(
+        control_op(
+            "ADJ", [_adj_runtime_add_spec()], instr_width=8, pc_offset=2,
+        ).rules_builder()
+    )
+    # 512 units = 2 carry_in x 16 a x 16 b.
+    assert len(derived) == 512
+    # ``l9_ops._adj_hi_nibble_rules`` IS this derived band; the amplified adder
+    # generator produces the SAME 512 rules the hand-authored loop did.
+    from c4_release.neural_vm.unified_compiler.ops import l9_ops
+
+    live = list(l9_ops._adj_hi_nibble_rules(100.0))
+    assert Counter(_rule_key(r) for r in derived) == Counter(
+        _rule_key(r) for r in live
+    )
+
+
+def test_runtime_add_reads_writes_cover_operand_bands():
+    """The ``runtime_add`` delta's dep-graph declares its live operand + carry
+    reads and the result-band write."""
+    bundle = control_op(
+        "ADJ", [_adj_runtime_add_spec()], instr_width=8, pc_offset=2,
+    )
+    assert "ALU_HI" in bundle.reads
+    assert "FETCH_HI" in bundle.reads  # the LIVE operand amount source
+    assert "MARK_SE_ONLY" in bundle.reads
+    assert "OUTPUT_HI_THIS_STEP" in bundle.writes
