@@ -14,9 +14,11 @@ from ..isa_semantics_dsl import (
     ConsumerLookaheadGateSpec,
     DecodeContext,
     DecodeSpec,
+    FetchSpec,
     ScratchClearBand,
     consumer_lookahead_gate,
     decode_band,
+    fetch,
 )
 
 
@@ -426,153 +428,106 @@ def _fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     L14/L15 ADDR_KEY/MEM-generation rather than L5. See
     docs/Q_SIDE_GATE_AUDIT_2026_06_07.md sections 1, 4, 5 (l14/l10/l8
     HIGH/MEDIUM risk hotspots).
+
+    Task #392 (SOLE PATH): every head is DERIVED by the generic :func:`fetch`
+    head primitive (``isa_semantics_dsl.py``) from a :class:`FetchSpec` -- a
+    content-address copy (build a byte-address, match ``ADDR_KEY``, copy
+    ``CLEAN_EMBED`` into a target byte band). There is ZERO hand-authored
+    Q/K/V/O construction: the six ``_l5_fetch_specs()`` rows carry only the
+    varying data (address source, marker, top-nibble mode, per-step gate, target
+    band + scale). Proven byte-for-byte identical to the retired hand-authored
+    heads (``tools/_isa_golden_hash.py`` == golden ``91f55411`` +
+    ``tools/_probe_fetch_heads.py`` cell-for-cell). This is the FETCH-family
+    instance of the derive->sole-path->delete rollout (DECODE spec G6).
     """
 
+    dim_map = _fetch_dim_map(BD)
+    return tuple(
+        bundle.head_spec_builder(dim_map, head_idx)
+        for head_idx, bundle in enumerate(_derived_fetch_specs())
+    )
+
+
+def _fetch_dim_map(BD) -> dict:
+    """Resolve every dim name the fetch heads touch via ``BD`` into a name->int map.
+
+    :func:`fetch`'s ``head_spec_builder`` needs a ``{name: int}`` dict; the bake /
+    IR-factory hands us a ``_SetDim``-like proxy. Resolving through ``getattr``
+    works for both the compiler proxy and the raw ``_SetDim`` fallback, so the
+    derived heads land at the compiler-allocated positions byte-identically.
+    """
+    names = {
+        "ADDR_KEY", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "OPCODE_BYTE_LO", "OPCODE_BYTE_HI", "FETCH_LO", "FETCH_HI",
+        "TEMP", "EMBED_LO", "EMBED_HI",
+        "MARK_AX", "MARK_PC", "CONST", "HAS_SE",
+    }
+    return {nm: int(getattr(BD, nm)) for nm in names}
+
+
+# The 6 L5 instruction-fetch heads as FETCH-primitive DATA. Every head is a
+# content-address copy (build an address -> match ADDR_KEY -> copy CLEAN_EMBED);
+# the per-head rows below carry ONLY the varying fields (address source, marker,
+# top-nibble mode, per-step gate, target band + scale). Byte-identical to the
+# hand-built ``_fetch_head_specs`` (proof: golden hash held + cell-for-cell probe).
+#
+#   Head 0 — non-first-step immediate fetch @AX from TEMP(=PC+1)  -> FETCH_*
+#   Head 1 — non-first-step opcode fetch    @AX from relayed PC   -> OPCODE_BYTE_*
+#   Head 2 — first-step opcode fetch        @PC (static PC_OFFSET) -> OPCODE_BYTE_*
+#   Head 3 — dynamic immediate fetch        @PC from FETCH        -> FETCH_* (×40)
+#   Head 4 — first-step opcode fetch        @AX (static PC_OFFSET) -> OPCODE_BYTE_*
+#   Head 5 — non-first-step opcode fetch    @PC from relayed PC   -> OPCODE_BYTE_*
+def _l5_fetch_specs() -> tuple:
+    """The 6 L5 fetch heads as :class:`FetchSpec` DATA (index == head_idx).
+
+    ``PC_OFFSET`` (the compile-time first-step PC) fills the static heads'
+    ``static_offset`` at build time so the module carries no constant literal.
+    """
     from ...constants import PC_OFFSET
 
-    L = 20.0
-    ADDR_L = 20.0
-
-    def ax_gate(slot: int = 33):
-        return (
-            (AP(slot, BD.MARK_AX, 500.0), AP(slot, BD.CONST, -500.0)),
-            (AP(slot, BD.CONST, 5.0),),
-        )
-
-    def pc_gate(slot: int = 33):
-        return (
-            (AP(slot, BD.MARK_PC, 500.0), AP(slot, BD.CONST, -500.0)),
-            (AP(slot, BD.CONST, 5.0),),
-        )
-
-    ax_q_gate, ax_k_gate = ax_gate()
-    pc_q_gate, pc_k_gate = pc_gate()
-    pc_lo = PC_OFFSET & 0xF
-    pc_hi = (PC_OFFSET >> 4) & 0xF
-    pc_top = (PC_OFFSET >> 8) & 0xF
-    TOP = 35
-
-    def dynamic_top_q():
-        return tuple(AP(TOP + k, BD.ADDR_KEY + 32 + k, ADDR_L) for k in range(16))
-
-    def first_step_top0_q():
-        return (
-            AP(TOP, BD.CONST, ADDR_L),
-            AP(TOP, BD.HAS_SE, -ADDR_L),
-        )
-
-    specs = [
-        # Head 0: non-first-step immediate fetch at AX from TEMP=PC+1.
-        DeclarativeAttentionHeadSpec(
-            head_idx=0,
-            q=(
-                tuple(AP(k, BD.TEMP + k, ADDR_L) for k in range(16))
-                + tuple(AP(16 + k, BD.TEMP + 16 + k, ADDR_L) for k in range(16))
-                + (AP(32, BD.MARK_AX, L),)
-                + dynamic_top_q()
-                + ax_q_gate
-                + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
-            ),
-            k=_addr_key_match_writes(BD, ADDR_L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
-            v=_code_fetch_v_writes(BD),
-            o=(
-                _band_output_writes(BD.FETCH_LO, 32)
-                + _band_output_writes(BD.FETCH_HI, 48)
-            ),
+    return (
+        FetchSpec(
+            name="l5_fetch_imm_ax", marker="MARK_AX",
+            addr_mode="dynamic", addr_source_lo="TEMP", addr_source_hi="TEMP+16",
+            top_mode="dynamic", step_gate="non_first",
+            target_lo="FETCH_LO", target_hi="FETCH_HI",
         ),
-        # Head 1: non-first-step opcode fetch at AX from relayed PC.
-        DeclarativeAttentionHeadSpec(
-            head_idx=1,
-            q=(
-                tuple(AP(k, BD.EMBED_LO + k, ADDR_L) for k in range(16))
-                + tuple(AP(16 + k, BD.EMBED_HI + k, ADDR_L) for k in range(16))
-                + (AP(32, BD.MARK_AX, L),)
-                + dynamic_top_q()
-                + ax_q_gate
-                + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
-            ),
-            k=_addr_key_match_writes(BD, ADDR_L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
-            v=_code_fetch_v_writes(BD),
-            o=(
-                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
-                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
-            ),
+        FetchSpec(
+            name="l5_fetch_opcode_ax", marker="MARK_AX",
+            addr_mode="dynamic", addr_source_lo="EMBED_LO", addr_source_hi="EMBED_HI",
+            top_mode="dynamic", step_gate="non_first",
+            target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI",
         ),
-        # Head 2: first-step opcode fetch at PC marker.
-        DeclarativeAttentionHeadSpec(
-            head_idx=2,
-            q=(
-                AP(pc_lo, BD.CONST, ADDR_L),
-                AP(16 + pc_hi, BD.CONST, ADDR_L),
-                AP(32, BD.MARK_PC, L),
-                AP(TOP + pc_top, BD.CONST, ADDR_L),
-                *pc_q_gate,
-                AP(34, BD.HAS_SE, -500.0),
-            ),
-            k=_addr_key_match_writes(BD, ADDR_L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
-            v=_code_fetch_v_writes(BD),
-            o=(
-                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
-                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
-            ),
+        FetchSpec(
+            name="l5_fetch_opcode_first_pc", marker="MARK_PC",
+            addr_mode="static", static_offset=PC_OFFSET,
+            top_mode="static", step_gate="first",
+            target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI",
         ),
-        # Head 3: dynamic immediate fetch at PC marker.
-        DeclarativeAttentionHeadSpec(
-            head_idx=3,
-            q=(
-                tuple(AP(k, BD.FETCH_LO + k, ADDR_L) for k in range(16))
-                + tuple(AP(16 + k, BD.FETCH_HI + k, ADDR_L) for k in range(16))
-                + (AP(32, BD.MARK_PC, L),)
-                + dynamic_top_q()
-                + first_step_top0_q()
-                + pc_q_gate
-            ),
-            k=_addr_key_match_writes(BD, ADDR_L) + pc_k_gate,
-            v=_code_fetch_v_writes(BD),
-            o=(
-                _band_output_writes(BD.FETCH_LO, 32, 40.0)
-                + _band_output_writes(BD.FETCH_HI, 48, 40.0)
-            ),
+        FetchSpec(
+            name="l5_fetch_imm_pc", marker="MARK_PC",
+            addr_mode="dynamic", addr_source_lo="FETCH_LO", addr_source_hi="FETCH_HI",
+            top_mode="dynamic", first_step_top0=True, step_gate=None,
+            target_lo="FETCH_LO", target_hi="FETCH_HI", o_scale=40.0,
         ),
-        # Head 4: first-step opcode fetch at AX marker.
-        DeclarativeAttentionHeadSpec(
-            head_idx=4,
-            q=(
-                AP(pc_lo, BD.CONST, ADDR_L),
-                AP(16 + pc_hi, BD.CONST, ADDR_L),
-                AP(32, BD.MARK_AX, L),
-                AP(TOP + pc_top, BD.CONST, ADDR_L),
-                *ax_q_gate,
-                AP(34, BD.HAS_SE, -500.0),
-            ),
-            k=_addr_key_match_writes(BD, ADDR_L) + ax_k_gate + (AP(34, BD.CONST, 5.0),),
-            v=_code_fetch_v_writes(BD),
-            o=(
-                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
-                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
-            ),
+        FetchSpec(
+            name="l5_fetch_opcode_first_ax", marker="MARK_AX",
+            addr_mode="static", static_offset=PC_OFFSET,
+            top_mode="static", step_gate="first",
+            target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI",
         ),
-        # Head 5: non-first-step opcode fetch at PC marker.
-        DeclarativeAttentionHeadSpec(
-            head_idx=5,
-            q=(
-                tuple(AP(k, BD.EMBED_LO + k, ADDR_L) for k in range(16))
-                + tuple(AP(16 + k, BD.EMBED_HI + k, ADDR_L) for k in range(16))
-                + (AP(32, BD.MARK_PC, L),)
-                + dynamic_top_q()
-                + pc_q_gate
-                + (AP(34, BD.HAS_SE, 500.0), AP(34, BD.CONST, -500.0))
-            ),
-            k=_addr_key_match_writes(BD, ADDR_L) + pc_k_gate + (AP(34, BD.CONST, 5.0),),
-            v=_code_fetch_v_writes(BD),
-            o=(
-                _band_output_writes(BD.OPCODE_BYTE_LO, 32)
-                + _band_output_writes(BD.OPCODE_BYTE_HI, 48)
-            ),
+        FetchSpec(
+            name="l5_fetch_opcode_pc", marker="MARK_PC",
+            addr_mode="dynamic", addr_source_lo="EMBED_LO", addr_source_hi="EMBED_HI",
+            top_mode="dynamic", step_gate="non_first",
+            target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI",
         ),
-    ]
+    )
 
-    return tuple(specs)
+
+def _derived_fetch_specs() -> tuple:
+    """Return the 6 fetch-head :class:`FetchBundle`s (index == head_idx)."""
+    return tuple(fetch(spec) for spec in _l5_fetch_specs())
 
 
 def make_fetch_dep_anchor_op() -> Operation:

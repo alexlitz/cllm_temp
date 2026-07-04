@@ -48,8 +48,9 @@ default-ON `C4_NESTED_JSR_PC_FIX`). Layout table: `_FETCH_FFN_UNIT_LAYOUT`
 
 ### 1.a Fetch attention (produces the opcode byte) — `layer5_fetch`
 
-* **Op factory:** `make_fetch_op` (l5_ops.py:246); head specs in
-  `_fetch_head_specs` (l5_ops.py:375).
+* **Op factory:** `make_fetch_op`; head specs in `_fetch_head_specs`, now DERIVED
+  from `_l5_fetch_specs()` via the generic `fetch(FetchSpec(...))` FETCH primitive
+  (see gap-list G6 — RESOLVED). Zero hand-authored Q/K/V/O.
 * **8 attention heads (0..5 production + 6/7 deleted 2026-05-11).** Each head
   content-matches an address (PC or PC+K, per `ADDR_KEY`) against the immutable
   per-CODE-position `ADDR_KEY` and copies that CODE slot's `CLEAN_EMBED_LO/HI`
@@ -256,13 +257,37 @@ this order with the reserved blank at unit 52. This is a lowering constraint, no
 a spec-expressiveness gap — the *behavior* is order-independent (rules are gated
 disjointly), but the *weights* are not.
 
-### G6. Fetch attention is a separate (non-decode) primitive. [scoping]
+### G6. Fetch attention is a separate (non-decode) primitive. [scoping] — RESOLVED
 Producing `OPCODE_BYTE_LO/HI` (the byte the decode reads) is done by 6 fetch
 attention heads with per-role Q/K/V wiring (first-step vs non-first-step, PC vs
 AX marker, immediate vs opcode). These are NOT opcode-parameterized and are NOT
 derivable from the opcode table — they are addressing/fetch machinery shared by
 ALL opcodes. A DECODE engine should treat `OPCODE_BYTE_LO/HI` as a given INPUT
 and leave fetch to a separate "instruction fetch" spec family.
+
+**RESOLVED (FETCH primitive):** that separate "instruction fetch" spec family
+now EXISTS — `isa_semantics_dsl.fetch(FetchSpec(...))`. Every fetch head is a
+CONTENT-ADDRESS COPY: Q builds a byte-address (`addr_mode="dynamic"` from a
+per-nibble residual band, or `"static"` from the compile-time `PC_OFFSET`), K
+matches the immutable per-CODE-position `ADDR_KEY`, and V/O copy that slot's
+`CLEAN_EMBED` nibbles into a target byte band. The only VARYING data is the
+address source, the marker (`MARK_AX`/`MARK_PC`), the top-nibble match mode
+(`"dynamic"` / `"static"` / `"static_zero_single"`), the per-step `HAS_SE` gate
+(`"first"` / `"non_first"` / `None`), and the target band + O-scale — carried on
+`FetchSpec`. All 6 L5 fetch heads (`l5_ops._fetch_head_specs`, via
+`_l5_fetch_specs()`) are DERIVED from it with ZERO hand-authored Q/K/V/O
+construction, and the same primitive re-expresses the #221 consumer-lookahead
+opcode-fetch head (7 heads total, one primitive). Byte-identical: golden
+`91f55411` unchanged; standing test `test_fetch_reexpresses_live_l5_fetch_heads`
+(+ lookahead) in `tests/test_isa_semantics_dsl.py`.
+
+The L4 `pc_relay` heads (0/1) are NOT fetch heads and do NOT fit this primitive:
+they are a MARKER-TO-MARKER band relay (Q anchors the AX marker, K matches the PC
+marker positionally — NO `ADDR_KEY` content match, NO address projection), copying
+`EMBED_LO/HI` + `ADDR_KEY`-top from the PC row to the AX marker/byte rows. That is
+a distinct ISA-semantic family (a positional band relay, sibling to
+`marker_broadcast` but firing at a marker row rather than byte positions); L4 has
+no opcode-fetch / threshold / lookback attention head to derive via `fetch`.
 
 ### G7. Weight scalars are uniform constants. [spec-expressiveness: trivial]
 `write_weight = 10.0/S`, condition weight `1.0`, `threshold ∈ {1.5 (AX), 2.5

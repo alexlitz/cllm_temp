@@ -1663,57 +1663,30 @@ def consumer_lookahead_gate(
             scope=spec.pc_chain_gate_marker,
         )
 
-    # (3) Opcode-fetch head: Q = PC+offset address (lo 0..15, hi 16..31) +
-    #     marker gate + CONST top-nibble + hard MARK/HAS_SE gates; K = ADDR_KEY;
-    #     V/O = CLEAN_EMBED -> opcode band. Mirrors the production L5 fetch head.
-    def opcode_fetch_head_spec_builder(
-        dim_positions: Dict[str, int], head_idx: int
-    ) -> DeclarativeAttentionHeadSpec:
-        def _P(name: str) -> int:
-            return int(dim_positions[name])
-
-        ADDR_KEY = _P(spec.fetch_addr_key)
-        CLEAN_LO = _P(spec.fetch_clean_embed_lo)
-        CLEAN_HI = _P(spec.fetch_clean_embed_hi)
-        MARK = _P(spec.fetch_marker)
-        CONST = _P(spec.fetch_const)
-        HAS_SE = _P(spec.fetch_has_se)
-        la_lo = _P(spec.pc_band_lo)
-        la_hi = _P(spec.pc_band_hi)
-        next_lo = _P(spec.opcode_band_lo)
-        next_hi = _P(spec.opcode_band_hi)
-
-        ADDR_L = spec.fetch_addr_weight
-        L = spec.fetch_marker_weight
-        TOP = spec.fetch_top_slot
-        G = spec.fetch_gate_weight
-
-        q = (
-            tuple(AP(k, la_lo + k, ADDR_L) for k in range(16))
-            + tuple(AP(16 + k, la_hi + k, ADDR_L) for k in range(16))
-            + (AP(32, MARK, L),)
-            + (AP(TOP, CONST, ADDR_L),)
-            + (AP(33, MARK, G), AP(33, CONST, -G))
-            + (AP(34, HAS_SE, G), AP(34, CONST, -G))
-        )
-        k = (
-            tuple(AP(k_, ADDR_KEY + k_, ADDR_L) for k_ in range(16))
-            + tuple(AP(16 + k_, ADDR_KEY + 16 + k_, ADDR_L) for k_ in range(16))
-            + (AP(TOP, ADDR_KEY + 32, ADDR_L),)
-            + (AP(33, MARK, G), AP(33, CONST, -G))
-            + (AP(34, CONST, 5.0),)
-        )
-        v = (
-            tuple(AP(32 + k_, CLEAN_LO + k_, 1.0) for k_ in range(16))
-            + tuple(AP(48 + k_, CLEAN_HI + k_, 1.0) for k_ in range(16))
-        )
-        o = (
-            tuple(AO(next_lo + k_, 32 + k_, 1.0) for k_ in range(16))
-            + tuple(AO(next_hi + k_, 48 + k_, 1.0) for k_ in range(16))
-        )
-        return DeclarativeAttentionHeadSpec(
-            head_idx=head_idx, q=q, k=k, v=v, o=o, alibi_slope=0.0,
-        )
+    # (3) Opcode-fetch head: DERIVED by the generic :func:`fetch` FETCH primitive.
+    #     The PC+offset lookahead fetch is the SAME content-address copy as the
+    #     production L5 fetch heads — build the PC+offset address, match ADDR_KEY,
+    #     copy CLEAN_EMBED into the opcode band — with the ``static_zero_single``
+    #     top match (the low-address code prefix) and the ``symmetric`` marker
+    #     confirm. Byte-identical to the hand-built #221 fetch head.
+    _lookahead_fetch_spec = FetchSpec(
+        name=f"{spec.name}_opcode_fetch",
+        marker=spec.fetch_marker,
+        addr_mode="dynamic",
+        addr_source_lo=spec.pc_band_lo, addr_source_hi=spec.pc_band_hi,
+        top_mode="static_zero_single", marker_confirm_mode="symmetric",
+        step_gate="non_first",
+        target_lo=spec.opcode_band_lo, target_hi=spec.opcode_band_hi,
+        addr_key=spec.fetch_addr_key,
+        clean_embed_lo=spec.fetch_clean_embed_lo,
+        clean_embed_hi=spec.fetch_clean_embed_hi,
+        const_dim=spec.fetch_const, has_se_dim=spec.fetch_has_se,
+        addr_weight=spec.fetch_addr_weight,
+        marker_weight=spec.fetch_marker_weight,
+        gate_weight=spec.fetch_gate_weight,
+        alibi_slope=0.0,
+    )
+    opcode_fetch_head_spec_builder = fetch(_lookahead_fetch_spec).head_spec_builder
 
     # (4) Consumer-class flag rules: per-opcode two-nibble AND, OR'd into the
     #     bounded flag (1.0 per match).
@@ -3499,6 +3472,357 @@ def marker_broadcast(spec: MarkerBroadcastSpec) -> MarkerBroadcastBundle:
         head_writes.add(bb.target_band)
 
     return MarkerBroadcastBundle(
+        spec=spec,
+        head_spec_builder=head_spec_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
+    )
+
+
+# ===========================================================================
+# FETCH — the opcode-agnostic instruction-fetch attention head, derived
+# ===========================================================================
+#
+# The DECODE-family gap-list (docs/semantic_spec_DECODE.md §G6) names the
+# instruction FETCH attention as "a separate (non-decode) primitive": the L5
+# heads that produce ``OPCODE_BYTE_LO/HI`` (and ``FETCH_LO/HI`` for immediates)
+# by content-matching an ADDRESS against the immutable per-CODE-position
+# ``ADDR_KEY`` and copying that slot's ``CLEAN_EMBED`` are NOT opcode-parameterized
+# — they are addressing/fetch machinery shared by ALL opcodes. They were
+# hand-authored per head (``_fetch_head_specs``, l5_ops.py) with per-role Q/K/V/O
+# wiring; the SAME content-address-copy structure is ALSO hand-built inside the
+# #221 ``consumer_lookahead_gate`` (``opcode_fetch_head_spec_builder``) for the
+# PC+8 lookahead fetch. This is the FETCH family's generic engine.
+#
+# The head is a CONTENT-ADDRESS COPY: Q builds a byte-address (either DYNAMIC —
+# projected from a per-nibble residual band, or STATIC — a compile-time
+# ``PC_OFFSET`` constant), K is the immutable ``ADDR_KEY`` code-position key, and
+# V/O copy that matched slot's ``CLEAN_EMBED`` nibbles into a target byte band.
+# The ONLY varying data is: the address source (which band / static offset), the
+# marker the head fires under (``MARK_AX`` / ``MARK_PC``), the top-nibble match
+# mode (dynamic ADDR_KEY match vs a static top constant), the per-step gate
+# (fires on step>=1 vs step 0 via the ``HAS_SE`` slot), and the target band +
+# write scale. :func:`fetch` lowers the WHOLE head from a :class:`FetchSpec` with
+# ZERO hand-authored Q/K/V/O construction, byte-identical to the hand-built
+# fetch heads (proof: whole-model ``state_dict`` SHA256 unchanged, flag-on AND
+# flag-off).
+#
+# Like the sibling generators this returns a pure builder bundle
+# (``head_spec_builder(dim_positions, head_idx)``) the op factory installs; no
+# compiler change — it lowers through ``Primitives.generate_attention_head``.
+
+
+# Head-local slot layout of a fetch head (shared by every instance). The
+# ADDRESS match occupies slots 0..31 (lo nibbles 0..15, hi nibbles 16..31) with
+# the 12-bit "top" nibble at slots 35..50 (``TOP=35``); the marker fire lands on
+# slot 32; the marker/HAS_SE confirm gates on slots 33/34; the V/O CLEAN_EMBED
+# copy on slots 32..47 (lo) + 48..63 (hi). These are the EXACT slots the hand-
+# built ``_fetch_head_specs`` uses, so the derived head is byte-identical.
+_FETCH_MARKER_SLOT = 32
+_FETCH_MARKER_GATE_SLOT = 33
+_FETCH_HAS_SE_SLOT = 34
+_FETCH_TOP_SLOT = 35
+_FETCH_V_LO_SLOT = 32
+_FETCH_V_HI_SLOT = 48
+
+
+@dataclass(frozen=True)
+class FetchSpec:
+    """Declarative description of ONE opcode-agnostic instruction-fetch head.
+
+    A fetch head content-matches a byte-ADDRESS against the immutable per-CODE-
+    position ``addr_key`` and copies that slot's ``clean_embed`` nibbles into a
+    target byte band. Every field is a VARYING parameter; the IDENTICAL
+    content-address-copy structure (the address projection + ADDR_KEY match + the
+    marker/step confirm gates + the CLEAN_EMBED value copy) is supplied by
+    :func:`fetch`.
+
+    Attributes:
+        name: head family name (diagnostic).
+        marker: the marker dim the head fires under (``"MARK_AX"`` / ``"MARK_PC"``).
+        addr_key: the immutable per-CODE-position content key band (``"ADDR_KEY"``).
+        clean_embed_lo / clean_embed_hi: the matched slot's value nibble bands the
+            V side copies (``"CLEAN_EMBED_LO"`` / ``"CLEAN_EMBED_HI"``).
+        target_lo / target_hi: the byte bands the O writes the fetched nibbles into
+            (``"OPCODE_BYTE_LO/HI"`` for opcode fetch, ``"FETCH_LO/HI"`` for
+            immediate fetch).
+        const_dim: the CONST residual anchor (``"CONST"``).
+        addr_mode: ``"dynamic"`` (Q projects a 16+16 nibble ADDRESS from
+            ``addr_source_lo/hi``) or ``"static"`` (Q projects the compile-time
+            ``static_offset`` nibbles at CONST — the first-step PC=PC_OFFSET path).
+        addr_source_lo / addr_source_hi: the per-nibble residual band the DYNAMIC
+            address projects from (``"TEMP"`` split 0..15/16..31, or
+            ``"EMBED_LO"``/``"EMBED_HI"``, or ``"FETCH_LO"``/``"FETCH_HI"``).
+            Ignored for ``addr_mode="static"``.
+        static_offset: the compile-time byte address (``PC_OFFSET``) the STATIC
+            head matches. Ignored for ``addr_mode="dynamic"``.
+        top_mode: the 12-bit top-nibble match — ``"dynamic"`` (match ADDR_KEY's
+            top nibble bits 32..47 on slots 35..50) or ``"static"`` (anchor the
+            single top nibble of ``static_offset`` at CONST on slot 35+top).
+        first_step_top0: when True (head 3 only), add the ``first_step_top0``
+            overlay on the top slot (CONST +weight, HAS_SE -weight) so the top
+            nibble anchors to 0 on step 0. Composes with ``top_mode="dynamic"``.
+        step_gate: the per-step ``HAS_SE`` confirm slot — ``"non_first"``
+            (HAS_SE @ +gate, fires on step>=1), ``"first"`` (HAS_SE @ -gate, fires
+            on step 0), or ``None`` (no HAS_SE slot; the per-step selectivity is
+            carried by ``first_step_top0`` instead — head 3).
+        addr_weight: the address / top-match projection weight (``ADDR_L=20.0``).
+        marker_weight: the marker-fire slot weight (``L=20.0``).
+        gate_weight: the sharp marker/HAS_SE confirm weight (``500.0``).
+        o_scale: the O-write magnitude (``1.0`` for opcode/immediate fetch,
+            ``40.0`` for the head-3 dynamic immediate boost).
+        alibi_slope: per-head ALiBi slope. ``None`` => the op sets its own slope
+            (the L5 fetch op fills 0.0 for the whole block).
+        step_window: the step-scope contract the verifier enforces.
+    """
+
+    name: str
+    marker: str
+    target_lo: str
+    target_hi: str
+    addr_mode: str = "dynamic"
+    addr_source_lo: Optional[str] = None
+    addr_source_hi: Optional[str] = None
+    static_offset: Optional[int] = None
+    top_mode: str = "dynamic"
+    marker_confirm_mode: str = "const_anchor"
+    first_step_top0: bool = False
+    step_gate: Optional[str] = "non_first"
+    addr_key: str = "ADDR_KEY"
+    clean_embed_lo: str = "CLEAN_EMBED_LO"
+    clean_embed_hi: str = "CLEAN_EMBED_HI"
+    const_dim: str = "CONST"
+    has_se_dim: str = "HAS_SE"
+    addr_weight: float = 20.0
+    marker_weight: float = 20.0
+    gate_weight: float = 500.0
+    gate_const_k_weight: float = 5.0
+    o_scale: float = 1.0
+    alibi_slope: Optional[float] = None
+    step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
+
+    def __post_init__(self) -> None:
+        if self.addr_mode not in ("dynamic", "static"):
+            raise ValueError(
+                f"FetchSpec({self.name!r}): addr_mode must be 'dynamic' or "
+                f"'static', got {self.addr_mode!r}"
+            )
+        if self.top_mode not in ("dynamic", "static", "static_zero_single"):
+            raise ValueError(
+                f"FetchSpec({self.name!r}): top_mode must be 'dynamic' / 'static' "
+                f"/ 'static_zero_single', got {self.top_mode!r}"
+            )
+        if self.marker_confirm_mode not in ("const_anchor", "symmetric"):
+            raise ValueError(
+                f"FetchSpec({self.name!r}): marker_confirm_mode must be "
+                f"'const_anchor' or 'symmetric', got {self.marker_confirm_mode!r}"
+            )
+        if self.step_gate not in (None, "first", "non_first"):
+            raise ValueError(
+                f"FetchSpec({self.name!r}): step_gate must be None / 'first' / "
+                f"'non_first', got {self.step_gate!r}"
+            )
+        if self.addr_mode == "dynamic":
+            if self.addr_source_lo is None or self.addr_source_hi is None:
+                raise ValueError(
+                    f"FetchSpec({self.name!r}): addr_mode='dynamic' requires "
+                    "addr_source_lo and addr_source_hi"
+                )
+        else:  # static
+            if self.static_offset is None:
+                raise ValueError(
+                    f"FetchSpec({self.name!r}): addr_mode='static' requires "
+                    "static_offset"
+                )
+            if self.top_mode != "static":
+                raise ValueError(
+                    f"FetchSpec({self.name!r}): addr_mode='static' requires "
+                    "top_mode='static' (the static PC offset has a fixed top "
+                    "nibble)"
+                )
+
+
+@dataclass(frozen=True)
+class FetchBundle:
+    """The artifacts :func:`fetch` generates for one fetch head.
+
+    Attributes:
+        spec: the originating :class:`FetchSpec`.
+        head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. Reproduces the hand-built fetch head
+            EXACTLY (same Q/K/V/O writes at the resolved dim positions).
+        head_reads / head_writes: dim-name sets for the head's Operation. The
+            head READS the marker + CONST + (HAS_SE) + the address source band +
+            ADDR_KEY + CLEAN_EMBED; WRITES the target bands.
+    """
+
+    spec: FetchSpec
+    head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    head_reads: Set[str]
+    head_writes: Set[str]
+
+
+def fetch(spec: FetchSpec) -> FetchBundle:
+    """Generate the opcode-agnostic instruction-fetch attention head for ``spec``.
+
+    Returns a :class:`FetchBundle` whose ``head_spec_builder`` reproduces the
+    hand-built fetch head byte-identically. Registers NO residual band (the fetch
+    copies into an EXISTING OPCODE_BYTE / FETCH band — no import-time side effect).
+
+    The head structure is fixed; the varying data is the spec fields:
+
+      * ADDRESS Q (slots 0..15 lo + 16..31 hi): DYNAMIC => project
+        ``addr_source_lo/hi`` nibbles at ``addr_weight``; STATIC => anchor the
+        ``static_offset`` lo/hi nibbles at CONST.
+      * ADDR_KEY match K (slots 0..15, 16..31, 35..50): the immutable content key
+        (lo, hi, and the 12-bit top nibble) at ``addr_weight``.
+      * TOP-nibble Q (slots 35..50): DYNAMIC => match ADDR_KEY+32..47; STATIC =>
+        anchor the single ``static_offset`` top nibble at CONST. Optional
+        ``first_step_top0`` overlay pins top 0 on step 0.
+      * marker fire (slot 32): ``marker`` at ``marker_weight``.
+      * marker confirm (slot 33): Q ``marker`` @ +gate / CONST @ -gate; K
+        ``CONST`` @ ``gate_const_k_weight`` — pins the softmax winner.
+      * per-step confirm (slot 34): ``HAS_SE`` @ ±gate (+ / step>=1, - / step 0),
+        K ``CONST`` @ ``gate_const_k_weight``. Omitted when ``step_gate is None``.
+      * value copy V/O: CLEAN_EMBED lo (slots 32..47) + hi (slots 48..63) ->
+        target lo/hi at ``o_scale``.
+    """
+    def head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        # Resolve a ``BASE`` or ``BASE+offset`` token — the ``TEMP+16`` split-band
+        # hi source (head 0) resolves via the offset; plain names are unchanged.
+        def _P(name: str) -> int:
+            return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
+
+        ADDR_KEY = _P(spec.addr_key)
+        CLEAN_LO = _P(spec.clean_embed_lo)
+        CLEAN_HI = _P(spec.clean_embed_hi)
+        MARK = _P(spec.marker)
+        CONST = _P(spec.const_dim)
+        ADDR_L = spec.addr_weight
+        L = spec.marker_weight
+        G = spec.gate_weight
+        TOP = _FETCH_TOP_SLOT
+
+        q: list = []
+        k: list = []
+
+        # (1) ADDRESS match — Q side. DYNAMIC projects the per-nibble source band
+        #     (lo 0..15 / hi 16..31); STATIC anchors the compile-time offset's
+        #     lo/hi nibbles at CONST.
+        if spec.addr_mode == "dynamic":
+            src_lo = _P(spec.addr_source_lo)
+            src_hi = _P(spec.addr_source_hi)
+            for kk in range(16):
+                q.append(AP(kk, src_lo + kk, ADDR_L))
+                q.append(AP(16 + kk, src_hi + kk, ADDR_L))
+        else:
+            off = int(spec.static_offset)
+            q.append(AP(off & 0xF, CONST, ADDR_L))
+            q.append(AP(16 + ((off >> 4) & 0xF), CONST, ADDR_L))
+
+        # (1b) ADDR_KEY match — K side (lo, hi). The 12-bit TOP nibble K depends
+        #      on top_mode: the full 16-nibble match (dynamic/static) keys all top
+        #      slots 35..50; the ``static_zero_single`` variant keys ONLY the top-0
+        #      cell (ADDR_KEY+32 at slot 35), so it is emitted in block (3).
+        for kk in range(16):
+            k.append(AP(kk, ADDR_KEY + kk, ADDR_L))
+            k.append(AP(16 + kk, ADDR_KEY + 16 + kk, ADDR_L))
+        if spec.top_mode != "static_zero_single":
+            for kk in range(16):
+                k.append(AP(TOP + kk, ADDR_KEY + 32 + kk, ADDR_L))
+
+        # (2) marker fire (slot 32).
+        q.append(AP(_FETCH_MARKER_SLOT, MARK, L))
+
+        # (3) TOP-nibble match. DYNAMIC matches ADDR_KEY's full top nibble on Q;
+        #     STATIC anchors the single static-offset top nibble at CONST on Q;
+        #     STATIC_ZERO_SINGLE matches ONLY top-0 (Q@CONST + K@ADDR_KEY+32 on
+        #     slot 35 — the PC+8 lookahead / low-address code prefix).
+        if spec.top_mode == "dynamic":
+            for kk in range(16):
+                q.append(AP(TOP + kk, ADDR_KEY + 32 + kk, ADDR_L))
+        elif spec.top_mode == "static":
+            top_nib = (int(spec.static_offset) >> 8) & 0xF
+            q.append(AP(TOP + top_nib, CONST, ADDR_L))
+        else:  # static_zero_single
+            q.append(AP(TOP, CONST, ADDR_L))
+            k.append(AP(TOP, ADDR_KEY + 32, ADDR_L))
+
+        # (3b) Optional first-step top-0 anchor (head 3): pin the top nibble to 0
+        #      on step 0 (CONST +ADDR_L, HAS_SE -ADDR_L on the top slot).
+        if spec.first_step_top0:
+            HAS_SE = _P(spec.has_se_dim)
+            q.append(AP(TOP, CONST, ADDR_L))
+            q.append(AP(TOP, HAS_SE, -ADDR_L))
+
+        # (4) marker confirm slot (33): Q re-asserts the marker (+gate) against a
+        #     CONST anchor (-gate). CONST_ANCHOR (the L5 fetch pattern) anchors
+        #     CONST at gate_const_k_weight on K; SYMMETRIC (the #221 lookahead
+        #     fetch) mirrors the Q marker/-CONST pair on K.
+        q.append(AP(_FETCH_MARKER_GATE_SLOT, MARK, G))
+        q.append(AP(_FETCH_MARKER_GATE_SLOT, CONST, -G))
+        if spec.marker_confirm_mode == "const_anchor":
+            k.append(AP(_FETCH_MARKER_GATE_SLOT, CONST, spec.gate_const_k_weight))
+        else:  # symmetric
+            k.append(AP(_FETCH_MARKER_GATE_SLOT, MARK, G))
+            k.append(AP(_FETCH_MARKER_GATE_SLOT, CONST, -G))
+
+        # (5) per-step confirm slot (34): HAS_SE @ +gate (step>=1) / -gate (step0).
+        #     The NON-FIRST gate carries a CONST anchor (-gate) on the Q side (the
+        #     ``+HAS_SE / -CONST`` two-cell one-hot presence test); the FIRST-step
+        #     gate is a bare ``-HAS_SE`` (fires only when HAS_SE==0, no CONST
+        #     anchor). Both anchor CONST at ``gate_const_k_weight`` on the K side.
+        if spec.step_gate is not None:
+            HAS_SE = _P(spec.has_se_dim)
+            hs_sign = 1.0 if spec.step_gate == "non_first" else -1.0
+            q.append(AP(_FETCH_HAS_SE_SLOT, HAS_SE, hs_sign * G))
+            if spec.step_gate == "non_first":
+                q.append(AP(_FETCH_HAS_SE_SLOT, CONST, -G))
+            k.append(AP(_FETCH_HAS_SE_SLOT, CONST, spec.gate_const_k_weight))
+
+        # (6) value copy: CLEAN_EMBED lo/hi -> target lo/hi.
+        TGT_LO = _P(spec.target_lo)
+        TGT_HI = _P(spec.target_hi)
+        v: list = []
+        o: list = []
+        for kk in range(16):
+            v.append(AP(_FETCH_V_LO_SLOT + kk, CLEAN_LO + kk, 1.0))
+            v.append(AP(_FETCH_V_HI_SLOT + kk, CLEAN_HI + kk, 1.0))
+            o.append(AO(TGT_LO + kk, _FETCH_V_LO_SLOT + kk, spec.o_scale))
+            o.append(AO(TGT_HI + kk, _FETCH_V_HI_SLOT + kk, spec.o_scale))
+
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+            alibi_slope=spec.alibi_slope,
+            step_window=spec.step_window,
+        )
+
+    # Operation dep-graph dim sets (structural derivation). A ``BASE+offset``
+    # source token (``TEMP+16``) contributes its BASE band name; the offset is a
+    # within-bank cell selector, not a separate residual dim.
+    def _base(name: str) -> str:
+        return name.split("+", 1)[0]
+
+    head_reads: Set[str] = {
+        spec.marker, spec.const_dim, spec.addr_key,
+        spec.clean_embed_lo, spec.clean_embed_hi,
+    }
+    if spec.addr_mode == "dynamic":
+        head_reads.add(_base(spec.addr_source_lo))
+        head_reads.add(_base(spec.addr_source_hi))
+    if spec.step_gate is not None or spec.first_step_top0:
+        head_reads.add(spec.has_se_dim)
+    head_writes: Set[str] = {spec.target_lo, spec.target_hi}
+
+    return FetchBundle(
         spec=spec,
         head_spec_builder=head_spec_builder,
         head_reads=head_reads,
