@@ -1853,19 +1853,19 @@ class MultiPassDivBlock(nn.Module):
         sel_lo = q_lo_oh * div[:, :, None] + r_lo_oh * mod[:, :, None]
         sel_hi = q_hi_oh * div[:, :, None] + r_hi_oh * mod[:, :, None]
 
-        # OVERWRITE OUTPUT at div/mod-AX rows with the clean one-hot (clear the
-        # existing band first so a stale nibble from L10 head-1 passthrough does
-        # not co-exist), byte-identical convention to the GE->BD writeback.
-        keep = (1.0 - any_dm)[:, :, None].to(dtype=x.dtype)
+        # Route the result into OUTPUT with the SAME ADDITIVE convention the
+        # composite it replaces uses (``GEToBDConverter``: OUTPUT +=
+        # indicator*2.0, NEVER a destructive clear). The additive +2.0 out-votes
+        # the upstream ALU_LO->OUTPUT relay at the div/mod-AX row while LEAVING
+        # the rest of the OUTPUT emission state (byte-1/2/3 nibble structure the
+        # 30-token frame emits) intact. An earlier destructive overwrite-clear
+        # ERASED that state and desynced the emitted token count -> the next
+        # step's fixed-slice decode read a shifted PC (step-2 pc=None). ``div`` /
+        # ``mod`` are already the [B, seq]-broadcast div/mod-AX masks, so the
+        # write only lands on those rows.
         x = x.clone()
-        x[:, :, self.output_lo:self.output_lo + 16] = (
-            x[:, :, self.output_lo:self.output_lo + 16] * keep
-            + sel_lo * 2.0
-        )
-        x[:, :, self.output_hi:self.output_hi + 16] = (
-            x[:, :, self.output_hi:self.output_hi + 16] * keep
-            + sel_hi * 2.0
-        )
+        x[:, :, self.output_lo:self.output_lo + 16] += sel_lo * 2.0
+        x[:, :, self.output_hi:self.output_hi + 16] += sel_hi * 2.0
 
         # 3) campaign divisor / dividend-byte-1 clears (same as FlattenedDivMod
         #    GE->BD stage) so the downstream L20/L18 leaks have nothing to
