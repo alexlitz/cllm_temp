@@ -7,8 +7,10 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..isa_semantics_dsl import (
+    RegisterByteDefaultSpec,
     RegisterDeltaSpec,
     SequentialAddDelta,
+    register_byte_defaults,
     register_delta,
 )
 from ..layer_compiler import Operation
@@ -215,112 +217,34 @@ def _register_default_ffn_rules(S: float) -> tuple:
     rules.append(_no_op_placeholder_rule(
         "layer3_ffn.initial_pc_bake_cancel_hi"))
 
-    # --- SP DEFAULT (units 6-13) ---
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.sp_marker_default_lo",
-        conditions=(("MARK_SP", 1.0), ("HAS_SE", -1.0)),
-        threshold=0.5,
-        writes=(("OUTPUT_LO+0", 2.0 / S),),
-        scope="MARK_SP and not HAS_SE",
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.sp_marker_default_hi",
-        conditions=(("MARK_SP", 1.0), ("HAS_SE", -1.0)),
-        threshold=0.5,
-        writes=(("OUTPUT_HI+0", 2.0 / S),),
-        scope="MARK_SP and not HAS_SE",
-    ))
-    for byte_idx in (0, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_lo",
-            conditions=((f"H1+{_SP_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.sp_byte_idx_{byte_idx}_default_hi",
-            conditions=((f"H1+{_SP_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
-    # Wave B Cluster 5 (2026-06-10): inline ``dim_ref("byte_index", "1")``
-    # call instead of subscripting ``_BYTE_INDEX[1]``. Byte-identical
-    # (both resolve to the same ``"BYTE_INDEX_1+0"`` string), but the
-    # static-AST lint (tools/lint_position_role.py) can now resolve the
-    # ``BYTE_INDEX_1`` token through ``_resolve_dim_ref_call`` and stop
-    # flagging the HAS_SE-gated TOKEN_EMIT rule as missing a byte-index
-    # marker. See docs/WAVE_B_CLUSTER_5_PLAN_2026_06_10.md (Option A).
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.sp_byte_1_first_step_lo",
-        conditions=((f"H1+{_SP_I}", 1.0),
-                    (dim_ref("byte_index", "1"), 1.0),
-                    ("HAS_SE", -1.0)),
-        threshold=1.5,
-        writes=(("OUTPUT_LO+1", 2.0 / S),),
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.sp_byte_1_first_step_hi",
-        conditions=((f"H1+{_SP_I}", 1.0),
-                    (dim_ref("byte_index", "1"), 1.0),
-                    ("HAS_SE", -1.0)),
-        threshold=1.5,
-        writes=(("OUTPUT_HI+0", 2.0 / S),),
-    ))
+    # --- SP DEFAULT (units 6-13) — DERIVED via register_byte_defaults ---
+    # The SP register's marker-gated byte-default writer
+    # (docs/semantic_spec_CONTROL.md §G10): a MARKER default (0 at MARK_SP ∧
+    # ¬HAS_SE), byte-index defaults (0 at H1[SP] ∧ BYTE_INDEX_{0,2}), and the
+    # SP byte-1 first-step landing (lo=1 at H1[SP] ∧ BYTE_INDEX_1 ∧ ¬HAS_SE).
+    # Expressed as ONE :class:`RegisterByteDefaultSpec`; the identical 4-sub-band
+    # shape is supplied by :func:`register_byte_defaults`. Byte-identical to the
+    # hand-authored bank (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.sp",
+        select_conditions=((f"H1+{_SP_I}", 1.0),),
+        write_scale=2.0 / S,
+        marker="MARK_SP",
+        byte_idx_default=(0, 2),
+        byte1_first_step=True,
+    )))
 
-    # --- BP DEFAULT (units 14-21) ---
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.bp_marker_default_lo",
-        conditions=(("MARK_BP", 1.0), ("HAS_SE", -1.0)),
-        threshold=0.5,
-        writes=(("OUTPUT_LO+0", 2.0 / S),),
-        scope="MARK_BP and not HAS_SE",
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.bp_marker_default_hi",
-        conditions=(("MARK_BP", 1.0), ("HAS_SE", -1.0)),
-        threshold=0.5,
-        writes=(("OUTPUT_HI+0", 2.0 / S),),
-        scope="MARK_BP and not HAS_SE",
-    ))
-    for byte_idx in (0, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_lo",
-            conditions=((f"H1+{_BP_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.bp_byte_idx_{byte_idx}_default_hi",
-            conditions=((f"H1+{_BP_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
-    # Wave B Cluster 5 (2026-06-10): inline ``dim_ref("byte_index", "1")``
-    # call instead of subscripting ``_BYTE_INDEX[1]``. Byte-identical
-    # (both resolve to the same ``"BYTE_INDEX_1+0"`` string), but the
-    # static-AST lint can now resolve ``BYTE_INDEX_1`` through
-    # ``_resolve_dim_ref_call``. Mirrors the SP-byte-1 first-step pair
-    # above. See docs/WAVE_B_CLUSTER_5_PLAN_2026_06_10.md (Option A).
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.bp_byte_1_first_step_lo",
-        conditions=((f"H1+{_BP_I}", 1.0),
-                    (dim_ref("byte_index", "1"), 1.0),
-                    ("HAS_SE", -1.0)),
-        threshold=1.5,
-        writes=(("OUTPUT_LO+1", 2.0 / S),),
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.bp_byte_1_first_step_hi",
-        conditions=((f"H1+{_BP_I}", 1.0),
-                    (dim_ref("byte_index", "1"), 1.0),
-                    ("HAS_SE", -1.0)),
-        threshold=1.5,
-        writes=(("OUTPUT_HI+0", 2.0 / S),),
-    ))
+    # --- BP DEFAULT (units 14-21) — DERIVED via register_byte_defaults ---
+    # The BP register's byte-default writer — the exact mirror of SP (H1[BP]
+    # selector, MARK_BP marker). Same :class:`RegisterByteDefaultSpec` shape.
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.bp",
+        select_conditions=((f"H1+{_BP_I}", 1.0),),
+        write_scale=2.0 / S,
+        marker="MARK_BP",
+        byte_idx_default=(0, 2),
+        byte1_first_step=True,
+    )))
 
     # --- PC bytes 1-3 default (units 22-27) ---
     for byte_idx in (0, 1, 2):
@@ -393,42 +317,26 @@ def _register_default_ffn_rules(S: float) -> tuple:
             writes=(("OUTPUT_HI+0", 2.0 / S),),
         ))
 
-    # --- STACK0 bytes 1-3 default (units 42-47) ---
-    # H4[BP] covers BP through STACK0 (d<=9.5); subtract H1[BP] to
-    # exclude the BP-area positions and leave only STACK0.
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.stack0_byte_{byte_idx}_default_lo",
-            conditions=((f"H4+{_BP_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0),
-                        (f"H1+{_BP_I}", -1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.stack0_byte_{byte_idx}_default_hi",
-            conditions=((f"H4+{_BP_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0),
-                        (f"H1+{_BP_I}", -1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
-
-    # --- STACK0 first-step default (units 48-49) ---
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.stack0_first_step_default_lo",
-        conditions=(("MARK_STACK0", 1.0), ("HAS_SE", -1.0)),
-        threshold=0.5,
-        writes=(("OUTPUT_LO+0", 2.0 / S),),
-        scope="MARK_STACK0 and not HAS_SE",
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.stack0_first_step_default_hi",
-        conditions=(("MARK_STACK0", 1.0), ("HAS_SE", -1.0)),
-        threshold=0.5,
-        writes=(("OUTPUT_HI+0", 2.0 / S),),
-        scope="MARK_STACK0 and not HAS_SE",
-    ))
+    # --- STACK0 bytes 0-2 default + first-step (units 42-49) — DERIVED ---
+    # The STACK0 register's byte-default writer (docs/semantic_spec_CONTROL.md
+    # §G5/§G10). Its selector differs from SP/BP: ``H4[BP]`` covers BP through
+    # STACK0 (d<=9.5), so ``H1[BP]`` is subtracted (as a TRAILING condition,
+    # AFTER the byte-index) to exclude the BP-area positions and leave only
+    # STACK0. The byte-index sub-band names use the ``"byte"`` infix
+    # (``stack0_byte_0_default_lo``); there is NO byte-1 first-step, but a
+    # MARKER-FIRST-STEP band (0 at MARK_STACK0 ∧ ¬HAS_SE). One
+    # :class:`RegisterByteDefaultSpec`; byte-identical to the hand-authored bank.
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.stack0",
+        select_conditions=((f"H4+{_BP_I}", 1.0),),
+        byte_idx_trailing_conditions=((f"H1+{_BP_I}", -1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step="MARK_STACK0",
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
     # --- STACK0 carry projection -- SUPPRESSED writes (units 50-81) ---
     # Imperative bake wrote ``W_down[OUTPUT_LO/HI+k] = 2/S`` for these

@@ -1,10 +1,13 @@
 """Model-level and post-pass op factories. See ../migrated_ops.py for history."""
 
+from ...constants import INSTR_WIDTH, PC_OFFSET
 from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
 from ..building_blocks_dsl import multi_way_and_rule
 from ..isa_semantics_dsl import (
+    AssignDelta,
     BranchTargetDelta,
     FullWidthByteEmissionSpec,
+    PushDelta,
     RegisterDeltaSpec,
     full_width_byte_emission,
     register_delta,
@@ -485,91 +488,90 @@ def _function_call_jsr_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _function_call_ent_stack0_rules(S: float) -> tuple[FFNRule, ...]:
-    """ENT STACK0 = old_BP at STACK0 marker (32 units).
+    """ENT STACK0 = old_BP at STACK0 marker (32 units) — DERIVED via PUSH.
 
-    At STACK0 marker when ENT (CMP[2]=1, MARK_STACK0=1): cancel EMBED
-    identity (gate_terms[EMBED_*+k]=-1) and write TEMP (= old BP relayed
-    by L5 head 5 above). L6 attn head 6 broadcasts OP_ENT through CMP[2]
-    (see ``layer6_relay_heads_bake``), which is what these rules gate on.
+    The ENT ``push saved-BP`` frame delta (docs/semantic_spec_CONTROL.md §G10):
+    at the STACK0 marker on an ENT step (CMP[2]=1, MARK_STACK0=1) the caller's BP
+    — relayed into ``TEMP`` per-nibble by L5 head 5 — is written onto OUTPUT while
+    the arriving EMBED identity is cancelled in the SAME hidden unit. L6 attn head
+    6 broadcasts OP_ENT through CMP[2] (see ``layer6_relay_heads_bake``), which is
+    the opcode gate.
+
+    Expressed as one ``PUSH`` :class:`RegisterDeltaSpec`
+    (``isa_semantics_dsl.PushDelta``): the copy-with-cancel value band (TEMP,
+    LO/HI split at ``+16``) + the identity source (EMBED_LO/HI) + the STACK0
+    marker gate are the varying data; the 16-unit-per-band copy-with-cancel is the
+    fixed shape. Byte-identical to the hand-authored bank (proof:
+    ``tools/_isa_golden_hash.py`` == 91f55411).
     """
-    T_ent_s0 = 1.5
-    write_scale = 2.0 / S
-    conditions = ((dim_ref("cmp_flag", "cascade", 2), 1.0), ("MARK_STACK0", 1.0))
-    rules: list[FFNRule] = []
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"ent_stack0_lo_{k}",
-            conditions=conditions,
-            threshold=T_ent_s0,
-            gate_terms=(
-                (f"EMBED_LO+{k}", -1.0),
-                (f"TEMP+{k}", 1.0),
+    bundle = register_delta(
+        RegisterDeltaSpec(
+            name="ent_stack0",
+            kind="push",
+            write_scale=2.0 / S,
+            conditions=(
+                (dim_ref("cmp_flag", "cascade", 2), 1.0),
+                ("MARK_STACK0", 1.0),
             ),
-            writes=((f"OUTPUT_LO+{k}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"ent_stack0_hi_{k}",
-            conditions=conditions,
-            threshold=T_ent_s0,
-            gate_terms=(
-                (f"EMBED_HI+{k}", -1.0),
-                (f"TEMP+{16 + k}", 1.0),
+            push=PushDelta(
+                value_src="TEMP",
+                value_hi_offset=16,
+                identity_src_lo="EMBED_LO",
+                identity_src_hi="EMBED_HI",
+                dst_lo="OUTPUT_LO",
+                dst_hi="OUTPUT_HI",
+                threshold=1.5,
             ),
-            writes=((f"OUTPUT_HI+{k}", write_scale),),
-        ))
-    return tuple(rules)
+        ),
+        instr_width=INSTR_WIDTH,
+        pc_offset=PC_OFFSET,
+    )
+    return bundle.rules_builder()
 
 
 def _function_call_ent_bp_rules(S: float) -> tuple[FFNRule, ...]:
-    """ENT BP = SP - 8 at BP marker (32 units).
+    """ENT BP = SP - 8 at BP marker (32 units) — DERIVED via ASSIGN.
 
-    Each LO unit writes ``OUTPUT_LO[new_k] += 2/S`` AND
-    ``OUTPUT_LO[k] -= 2/S`` (cancels identity at source). new_k =
-    (k - 8) % 16. Each HI unit writes the borrowed-down high nibble
-    (new_k_borrow = (k - 1) % 16) and cancels identity at k.
+    The ENT ``BP := SP - INSTR_WIDTH`` frame delta
+    (docs/semantic_spec_CONTROL.md §G10): at the BP marker on an ENT step the
+    caller's SP — relayed into ``TEMP`` per-nibble — is copied into the BP OUTPUT
+    slot with the frame-link constant subtracted. Each LO unit writes
+    ``OUTPUT_LO[(k - 8) % 16] += 2/S`` while cancelling ``OUTPUT_LO[k] -= 2/S``
+    (the assign REPLACES the slot). Each HI unit writes the borrowed-down high
+    nibble ``(k - 1) % 16`` and cancels at ``k``; the borrow is vetoed on the
+    no-borrow half (``TEMP[8..15]`` hot => old SP lo >= 8) via the
+    ``borrow_blocker_range``.
 
-    Borrow detection: when ``old SP lo < 8`` (TEMP[8..15] not hot) the
-    HI unit must NOT fire on the borrow path. The legacy bake adds
-    ``ffn6.W_up[unit, BD.TEMP + lo_bit] = -S`` for lo_bit in 8..15 on
-    HI units only; mirrored here via the ``borrow_blockers`` term set.
+    Expressed as one ``ASSIGN`` :class:`RegisterDeltaSpec`
+    (``isa_semantics_dsl.AssignDelta``): ``lo_shift = (-INSTR_WIDTH) % 16 = 8``,
+    ``hi_shift = (-1) % 16 = 15``, ``borrow_blocker_range = (INSTR_WIDTH, 16)`` —
+    the nibble-shift-with-borrow adder the SP/PC deltas also use. Byte-identical
+    to the hand-authored bank (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
     """
-    T_ent_bp = 1.5
-    write_scale = 2.0 / S
-    base_conditions = (
-        (dim_ref("cmp_flag", "cascade", 2), 1.0),
-        ("MARK_BP", 1.0),
-    )
-    borrow_blockers = tuple(
-        (f"TEMP+{lo_bit}", -1.0) for lo_bit in range(8, 16)
-    )
-
-    rules: list[FFNRule] = []
-    for k in range(16):
-        new_k = (k - 8) % 16
-        rules.append(multi_way_and_rule(
-            name=f"ent_bp_lo_{k}",
-            conditions=base_conditions,
-            threshold=T_ent_bp,
-            gate=f"TEMP+{k}",
-            writes=(
-                (f"OUTPUT_LO+{new_k}", write_scale),
-                (f"OUTPUT_LO+{k}", -write_scale),
+    bundle = register_delta(
+        RegisterDeltaSpec(
+            name="ent_bp",
+            kind="assign",
+            write_scale=2.0 / S,
+            conditions=(
+                (dim_ref("cmp_flag", "cascade", 2), 1.0),
+                ("MARK_BP", 1.0),
             ),
-        ))
-    for k in range(16):
-        new_k_borrow = (k - 1) % 16
-        rules.append(multi_way_and_rule(
-            name=f"ent_bp_hi_{k}",
-            conditions=base_conditions + borrow_blockers,
-            threshold=T_ent_bp,
-            gate=f"TEMP+{16 + k}",
-            writes=(
-                (f"OUTPUT_HI+{new_k_borrow}", write_scale),
-                (f"OUTPUT_HI+{k}", -write_scale),
+            assign=AssignDelta(
+                value_src="TEMP",
+                value_hi_offset=16,
+                dst_lo="OUTPUT_LO",
+                dst_hi="OUTPUT_HI",
+                lo_shift=(-INSTR_WIDTH) % 16,
+                hi_shift=(-1) % 16,
+                borrow_blocker_range=(INSTR_WIDTH, 16),
+                threshold=1.5,
             ),
-        ))
-    return tuple(rules)
+        ),
+        instr_width=INSTR_WIDTH,
+        pc_offset=PC_OFFSET,
+    )
+    return bundle.rules_builder()
 
 
 def _function_call_ent_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
