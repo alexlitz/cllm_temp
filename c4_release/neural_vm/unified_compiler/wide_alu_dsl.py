@@ -72,14 +72,23 @@ def bitwise_rules(
     marker_cond_weight: float = 40.0,
     threshold: float = 80.0,
     result_write_value: float = 2.0,
+    name_prefix: str = "bitwise",
+    name_suffix: str = "",
+    gate_weight: float = 1.0,
+    emit_stale_cancel_band: bool = False,
+    stale_operand_weight: float = 1000.0,
+    stale_residual_factor: float = 1.02,
 ) -> Tuple[FFNRule, ...]:
     """Generate FFNRule list for a per-byte bitwise op (AND/OR/XOR).
 
     Emits 512 rules per op (256 low-nibble + 256 high-nibble cross-product),
     matching the structure of ``_layer10_alu_bitwise_rules`` in
-    ``ops/l10_ops.py`` — the existing rule-driven L10 bitwise bake.
+    ``ops/l10_ops.py`` — the existing rule-driven L10 bitwise bake. With
+    ``emit_stale_cancel_band=True`` it ALSO emits the L10 stale-ALU residue
+    cancel band INTERLEAVED per nibble (287 rules per nibble = 574 total),
+    so the L10 main-FFN bitwise builder is a pure call into this generator.
 
-    Each unit is a 3-way AND across (``marker_gate``, ``operand_*[a]``,
+    Each main unit is a 3-way AND across (``marker_gate``, ``operand_*[a]``,
     ``operand_*[b]``) gated on ``opcode_gate``. Weights (40, 30, 30) and
     threshold 80 implement the balanced 3-way AND used by the legacy bake:
 
@@ -88,6 +97,22 @@ def bitwise_rules(
 
     The output write is ``2.0 / S`` to ``result_*[op_fn(a, b)]``, matching
     the legacy ``OUTPUT_LO/HI_THIS_STEP`` writes (lookup-mode).
+
+    Stale-ALU residue cancel band (``emit_stale_cancel_band=True``): on
+    COLLAPSED IMM+OP steps the ``operand_a_*+0`` and ``operand_b_*+0``
+    channels carry ~1.04 stale residual from the prior sub-cycle. A plain
+    3-way AND at threshold 80 would fire on stale (1.04 vs the legit 1.0
+    one-hot) and write spurious mass. For each (legit-operand, stale-+0)
+    pair the generator emits one negative-write cancel unit gated on an
+    asymmetric-weight stale detector: weight ``stale_operand_weight`` on the
+    ``+0`` dim with threshold ``marker + stale_operand_weight *
+    stale_residual_factor + other_operand`` fires only when ``+0 >= 1.04``.
+    Two sub-bands per nibble, appended after that nibble's 256 main rules:
+      * stale-A0 (b in 0..15): cancels ``op_fn(0, b)``.
+      * stale-B0 (a in 1..15): cancels ``op_fn(a, 0)`` (a=0 skipped — the
+        stale-A0 b=0 unit already targets ``op_fn(0,0)``).
+    See ``_layer10_alu_bitwise_rules`` and
+    ``tests/test_l9_collapsed_imm_input_isolated.py``.
 
     Args:
         op: ``"and"``, ``"or"``, or ``"xor"``.
@@ -117,10 +142,25 @@ def bitwise_rules(
             the default-equivalent ``40 + 30 + 30 = 100 > 80`` math.
         result_write_value: numerator of the output write weight
             (default 2.0, lowered as ``result_write_value / S``).
+        name_prefix: rule-name prefix (default ``"bitwise"``; the L10
+            main-FFN caller passes ``"l10_bitwise"``).
+        name_suffix: rule-name suffix appended verbatim (default ``""``;
+            the L10 main-FFN caller passes ``"_step_end"``).
+        gate_weight: multiplicative gate weight (default 1.0).
+        emit_stale_cancel_band: when True, emit the interleaved stale-ALU
+            residue cancel band (see above). Default False preserves the
+            512-rule lookup-mode post-op shape.
+        stale_operand_weight: asymmetric-weight stale detector weight on the
+            ``+0`` operand dim (default 1000.0). Only used when
+            ``emit_stale_cancel_band`` is True.
+        stale_residual_factor: stale residual magnitude the threshold is
+            tuned against (default 1.02). Only used when
+            ``emit_stale_cancel_band`` is True.
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length 512 — same shape as
-        ``_layer10_alu_bitwise_rules(S, op_name=op.upper(), op_fn=op_fn)``.
+        ``tuple[FFNRule, ...]`` of length 512 (or 574 with the cancel band)
+        — same shape as ``_layer10_alu_bitwise_rules(S, op_name=op.upper(),
+        op_fn=op_fn)``.
 
     Raises:
         ValueError: if ``op`` is not one of ``"and"``, ``"or"``, ``"xor"``.
@@ -131,6 +171,7 @@ def bitwise_rules(
             f"bitwise_rules: op must be 'and'/'or'/'xor'; got {op!r}"
         )
 
+    write_value = result_write_value / S
     rules: list[FFNRule] = []
     nibble_iter = (
         # (label, operand_a_band, operand_b_band, output_band)
@@ -143,8 +184,8 @@ def bitwise_rules(
                 result = op_fn(a, b)
                 rules.append(multi_way_and_rule(
                     name=(
-                        f"bitwise_{op}_{nibble_label}_"
-                        f"a{a:x}_b{b:x}"
+                        f"{name_prefix}_{op}_{nibble_label}_"
+                        f"a{a:x}_b{b:x}{name_suffix}"
                     ),
                     conditions=(
                         (marker_gate, marker_cond_weight),
@@ -153,7 +194,57 @@ def bitwise_rules(
                     ),
                     threshold=threshold,
                     gate=opcode_gate,
-                    writes=((f"{out_band}+{result}", result_write_value / S),),
+                    gate_weight=gate_weight,
+                    writes=((f"{out_band}+{result}", write_value),),
+                ))
+        if emit_stale_cancel_band:
+            # Stale operand-A+0 detector: cancels ``op_fn(0, b)`` when the
+            # ``+0`` A channel is stale (>= stale_residual_factor) with a
+            # legit operand-B one-hot.
+            for b in range(16):
+                spurious = op_fn(0, b)
+                rules.append(multi_way_and_rule(
+                    name=(
+                        f"{name_prefix}_{op}_{nibble_label}_"
+                        f"cancel_stale_alu0_b{b:x}{name_suffix}"
+                    ),
+                    conditions=(
+                        (marker_gate, marker_cond_weight),
+                        (f"{a_band}+0", stale_operand_weight),
+                        (f"{b_band}+{b}", operand_b_cond_weight),
+                    ),
+                    threshold=(
+                        marker_cond_weight
+                        + stale_operand_weight * stale_residual_factor
+                        + operand_b_cond_weight
+                    ),
+                    gate=opcode_gate,
+                    gate_weight=gate_weight,
+                    writes=((f"{out_band}+{spurious}", -write_value),),
+                ))
+            # Stale operand-B+0 detector: mirror for operand B. Skip a=0 to
+            # avoid a duplicate cancel at ``op_fn(0, 0)`` (the stale-A0 b=0
+            # unit above already targets that cell).
+            for a in range(1, 16):
+                spurious = op_fn(a, 0)
+                rules.append(multi_way_and_rule(
+                    name=(
+                        f"{name_prefix}_{op}_{nibble_label}_"
+                        f"cancel_stale_a{a:x}_carry0{name_suffix}"
+                    ),
+                    conditions=(
+                        (marker_gate, marker_cond_weight),
+                        (f"{a_band}+{a}", operand_a_cond_weight),
+                        (f"{b_band}+0", stale_operand_weight),
+                    ),
+                    threshold=(
+                        marker_cond_weight
+                        + operand_a_cond_weight
+                        + stale_operand_weight * stale_residual_factor
+                    ),
+                    gate=opcode_gate,
+                    gate_weight=gate_weight,
+                    writes=((f"{out_band}+{spurious}", -write_value),),
                 ))
     return tuple(rules)
 
