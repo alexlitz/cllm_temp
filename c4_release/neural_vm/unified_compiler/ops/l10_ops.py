@@ -1573,6 +1573,28 @@ def _l10_carry_propagation_rules(
     collide, both writes when they don't). The CARRY+3 high-overflow
     write only fires at ``(15,15)`` for ADD and ``(0,0)`` for SUB,
     and only when ``byte_idx < 2``.
+
+    Bank-derivation status (M8 l10 survey, 2026-07): this bank is ALREADY a
+    fully COMPUTED generator (``add_rule_for`` / ``sub_rule_for`` evaluate
+    ``(lo + hi*16) +/- 1`` at build time over the 16x16 nibble cross-product)
+    authored through the canonical ``multi_way_and_rule`` DSL — it is NOT a
+    hand-written literal rule list. It does NOT route through
+    ``wide_alu_dsl.nibble_alu_lane_rules`` (the L8/L9 lane generator) because
+    it is a materially RICHER shape: (1) it is a whole-BYTE increment/decrement
+    (both output nibbles + the ``CARRY+3`` inter-byte overflow), not a single
+    ``f(a,b,cin) % 16`` result nibble; (2) the +1/-1 couples the two nibbles
+    (a low-nibble carry crosses into the high nibble, e.g. ``0x0F+1=0x10``), so
+    it does NOT factorise into the per-nibble route the M8 byte-writeback
+    collapse uses; (3) it carries the SUB-minuend-relay source swap
+    (``STACK0_BYTE_VAL_{k+1}`` for multi-byte) and the campaign-conditional
+    ``TEMP+9`` byte-1 hand-off gate. Re-expressing it via ``nibble_alu_lane_
+    rules`` would require extending that generator with byte-level (not
+    nibble-level) semantics + a second output nibble + the CARRY+3 write +
+    the minuend-source swap, risking the L8/L9 callers' byte-identity and
+    ADDING complexity, not removing it. It is width-locked to
+    ``_L10_CARRY_HIDDEN_DIM = 512`` (the ``PureFFN`` hidden_dim, hard-asserted
+    in ``_build_l10_carry_post_op``); a count-reducing collapse would break
+    that. Kept as the already-derived 2D nibble ALU cascade it is.
     """
 
     if byte_idx not in (0, 1, 2):
@@ -2496,6 +2518,23 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     ``OUTPUT_LO``. Weights and threshold reuse the (40, 30, 30) / 80
     balanced 3-way AND from the bitwise sub-stages above so a single
     spurious one-hot in either operand band cannot fire the unit.
+
+    Bank-derivation status (M8 l10 survey, 2026-07): this is a genuine
+    2-OPERAND multiplication lookup table (``result`` depends non-linearly
+    on BOTH operand nibbles ``a`` and ``b``), NOT a 1-operand identity /
+    increment / cross-lane copy — so the per-nibble byte-writeback ROUTE
+    collapse (``_computed_byte_writeback_route_rules`` / the M8
+    ``C4_STACK0_*_COMPUTED`` family) does NOT apply (that route factorises a
+    same-value nibble copy into two independent per-nibble channels; a 16x16
+    product table has no such factorisation). It is also NOT covered by
+    ``C4_MUL_MULTIPASS`` (which replaces the L11 mul-partial / L12
+    mul-combine LOOKUP at a DIFFERENT layer — see ``shared.mul_multipass_
+    enabled`` — leaving this L10 mul-lo nibble table untouched). It is
+    already authored through the canonical ``multi_way_and_rule`` DSL (not a
+    hand-written literal rule list) and is width-locked into
+    ``_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL`` (the byte-identical 1846-unit main
+    L10 ALU FFN). No count-preserving further collapse exists; kept as the
+    2-operand ``lookup_table_rules``-class product table it already is.
     """
 
     # Phase 8.D: OP_MUL gate -> (opcode_flag, MUL).
