@@ -32,8 +32,10 @@ from src.compiler import compile_c  # noqa: E402
 from neural_vm.batched_pure_neural import Token  # noqa: E402
 from neural_vm.speculative import DraftVM  # noqa: E402
 from tools.probe_groundtruth import build_groundtruth_probe  # noqa: E402
+from tests.test_suite_1000 import generate_test_programs  # noqa: E402
 
-SRC = "int main() { int a; int b; int c; a = 29; b = 6; c = 20; return a + b + c; }"
+_ID = int(os.environ.get("VT_PROBE_ID", "300"))
+SRC = generate_test_programs()[_ID][0]
 
 
 def oracle_windows(bc):
