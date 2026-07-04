@@ -52,6 +52,34 @@ def campaign_enabled() -> bool:
     return os.environ.get("C4_CAMPAIGN", "0") != "0"
 
 
+def derive_imm_enabled() -> bool:
+    """Flag for the FULLY-DERIVED IMM opcode (task #392). Default OFF.
+
+    When ``C4_DERIVE_IMM=1`` the ENTIRE IMM opcode is derived from its
+    declarative spec with ZERO hand-authored IMM rules, closing the last
+    LOWERING gap the DERIVE_DECODE pilot named (docs/DERIVE_DECODE_PILOT
+    §G-IMM-RELAY):
+
+      * decode -> ``OP_IMM``: routed through the generic :func:`decode_band`
+        engine (the same path ``C4_DERIVE_DECODE`` enables) — implied ON by
+        ``C4_DERIVE_IMM`` (see ``l5_ops._derive_decode_enabled``).
+      * relay ``OP_IMM`` -> AX byte positions: the L8 head-4 relay is
+        re-expressed by the new generic :func:`marker_broadcast` head
+        generator (``isa_semantics_dsl.py``) instead of the hand-built
+        ``_layer8_op_imm_relay_head_spec``.
+      * value route imm -> OUTPUT: the 32-rule per-nibble AX_CARRY->OUTPUT
+        copy is re-expressed by the generic value-route lowering
+        (``isa_semantics_dsl.value_route``) instead of the hand-built
+        ``_layer8_multibyte_routing_rules``.
+
+    All three derivations reproduce the hand-authored weights byte-for-byte
+    (proof: ``tools/_isa_golden_hash.py`` unchanged under ``C4_DERIVE_IMM=1``),
+    so IMM becomes the FIRST 100%-derived opcode. Default OFF => the
+    hand-authored path stays the golden build.
+    """
+    return os.environ.get("C4_DERIVE_IMM", "0") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 

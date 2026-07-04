@@ -8,11 +8,20 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StepWindowConstraint
+from ..isa_semantics_dsl import (
+    MarkerBroadcastBand,
+    MarkerBroadcastSpec,
+    ValueRouteChannel,
+    ValueRouteSpec,
+    marker_broadcast,
+    value_route,
+)
 from ..layer_compiler import Operation
 from ..positional_invariant import marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (
     _as_setdim_proxy,
+    derive_imm_enabled,
     l8_operand_sp_disc_enabled,
     no_stack0_emit_enabled,
 )
@@ -1854,8 +1863,60 @@ def make_layer8_multibyte_routing_ir(S: float = 100.0) -> CompilerIR:
     return ir
 
 
+def _layer8_multibyte_routing_value_route_spec(S: float) -> ValueRouteSpec:
+    """The generic value-route spec for the IMM value copy (task #392).
+
+    Re-expresses the hand-built L8 multibyte IMM routing (below) via the generic
+    :func:`value_route` lowering: fire at AX byte positions when ``OP_IMM`` is
+    relayed there, and copy each fetched nibble ``AX_CARRY_LO/HI[k]`` into
+    ``OUTPUT_LO / OUTPUT_HI_THIS_STEP[k]``. Byte-identical to the hand path
+    (proof: golden hash held under ``C4_DERIVE_IMM=1``).
+    """
+    # Class-1 marker-relative anchor: ``H1+AX_I`` keys on the AX-register
+    # threshold-bank slot (frame-invariant; ``marker_bank_index`` resolves it
+    # from Token.STEP_TOKENS, byte-identical to the literal 1 at STEP_TOKENS=35).
+    # Role-meaningful family slots (OP_IMM / MARK_AX) authored via ``dim_ref``
+    # (Phase 7.E) — the ``"NAME+0"`` string is byte-identical to the bare NAME.
+    AX_I = marker_bank_index("AX")
+    conditions = (
+        ("IS_BYTE", 1.0),
+        (f"H1+{AX_I}", 1.0),
+        (dim_ref("opcode_flag", "IMM"), 1.0),
+        (dim_ref("marker", "AX"), -4.0),
+    )
+    return ValueRouteSpec(
+        name="l8_multibyte_route",
+        conditions=conditions,
+        threshold=6.5,
+        channels=(
+            ValueRouteChannel(
+                source_band="AX_CARRY_LO",
+                target_band="OUTPUT_LO",
+                write_scale=8.0 / S,
+                width=16,
+                rule_name_fn=lambda k: f"l8_multibyte_route_lo_{k}",
+            ),
+            ValueRouteChannel(
+                source_band="AX_CARRY_HI",
+                target_band="OUTPUT_HI_THIS_STEP",
+                write_scale=8.0 / S,
+                width=16,
+                rule_name_fn=lambda k: f"l8_multibyte_route_hi_{k}",
+            ),
+        ),
+    )
+
+
 def _layer8_multibyte_routing_rules(S: float) -> tuple[FFNRule, ...]:
-    """Declarative L8 multibyte IMM routing extension after the ALU units."""
+    """Declarative L8 multibyte IMM routing extension after the ALU units.
+
+    Task #392: when ``C4_DERIVE_IMM=1`` the 32 per-nibble copy rules are DERIVED
+    by the generic :func:`value_route` lowering (``isa_semantics_dsl.py``) with
+    ZERO hand-authored per-cell code; byte-identical to the hand path below.
+    """
+
+    if derive_imm_enabled():
+        return value_route(_layer8_multibyte_routing_value_route_spec(S)).rules_builder()
 
     rules = []
     # Class-1 marker-relative anchor: ``H1+AX_I`` keys on the AX-register
@@ -2457,6 +2518,47 @@ def _layer8_op_imm_relay_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
+def _op_imm_relay_marker_broadcast_spec() -> MarkerBroadcastSpec:
+    """The generic marker-broadcast spec for the IMM opcode relay (task #392).
+
+    Re-expresses the hand-built L8 head-4 OP_IMM relay (below) via the generic
+    :func:`marker_broadcast` head generator: fire at AX byte positions
+    (``IS_BYTE`` + ``H1[AX_I]``), attend BACK to the step's own AX marker row
+    (``MARK_AX``), and broadcast ``OP_IMM`` onto the byte positions. The ALiBi
+    recency slope (0.5) + ``CURRENT_STEP_ONLY`` contract are carried on the
+    spec. Byte-identical to the hand path (proof: golden hash held under
+    ``C4_DERIVE_IMM=1``). Reused by every future multi-byte opcode relay.
+    """
+    AX_I = marker_bank_index("AX")
+    return MarkerBroadcastSpec(
+        name="layer8_op_imm_relay",
+        marker_bank="AX",
+        fire_slot_dim=f"H1+{AX_I}",
+        source_marker="MARK_AX",
+        broadcast_bands=(MarkerBroadcastBand("OP_IMM", "OP_IMM", 1, 0, 1.0),),
+        weight=20.0,
+        alibi_slope=0.5,
+        step_window=StepWindowConstraint.CURRENT_STEP_ONLY,
+    )
+
+
+def _op_imm_relay_dim_map(BD) -> dict:
+    """Resolve every dim the IMM relay marker-broadcast head touches via ``BD``.
+
+    ``marker_broadcast``'s ``head_spec_builder`` needs a name->int dict; the
+    bake receives a ``_SetDim``-like proxy. The ``H1+AX_I`` fire slot resolves
+    as ``BD.H1 + AX_I`` (byte-identical to the hand-built anchor).
+    """
+    AX_I = marker_bank_index("AX")
+    return {
+        "IS_BYTE": int(BD.IS_BYTE),
+        f"H1+{AX_I}": int(BD.H1) + AX_I,
+        "CONST": int(BD.CONST),
+        "MARK_AX": int(BD.MARK_AX),
+        "OP_IMM": int(BD.OP_IMM),
+    }
+
+
 def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """Declarative replacement for the L8 head-4 OP_IMM relay bake.
 
@@ -2468,14 +2570,23 @@ def _layer8_op_imm_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     pulls the most-recent matching MARK_AX to the front and lets the
     IMM step's AX byte 0 land on the correct token. Matches the slope
     used by the L9 ALiBi relay heads (l9_ops.py:1375+).
+
+    Task #392: when ``C4_DERIVE_IMM=1`` this head is DERIVED by the generic
+    :func:`marker_broadcast` head generator (``isa_semantics_dsl.py``) with
+    ZERO hand-authored relay code; byte-identical to the hand path below.
     """
+    head_idx = _L8_HEAD_LAYOUT_BY_NAME["layer8_op_imm_relay.head_4"]
+
+    if derive_imm_enabled():
+        bundle = marker_broadcast(_op_imm_relay_marker_broadcast_spec())
+        return bundle.head_spec_builder(_op_imm_relay_dim_map(BD), head_idx)
 
     # Class-1 marker-relative anchor (see ``_layer8_multibyte_fetch_head_spec``):
     # ``H1+AX_I`` keys on the AX-register threshold-bank slot, frame-invariant.
     AX_I = marker_bank_index("AX")
     L8_relay = 20.0
     return DeclarativeAttentionHeadSpec(
-        head_idx=_L8_HEAD_LAYOUT_BY_NAME["layer8_op_imm_relay.head_4"],
+        head_idx=head_idx,
         q=(
             AP(0, BD.IS_BYTE, L8_relay),
             AP(0, BD.H1 + AX_I, L8_relay),

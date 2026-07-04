@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Sequence, Set, Tuple
 
 from .building_blocks_dsl import multi_way_and_rule
-from .ir import FFNRule, TokenEmbeddingRule
+from .ir import FFNRule, StepWindowConstraint, TokenEmbeddingRule
 from .primitives import AO, AP, DeclarativeAttentionHeadSpec
 from .ops.residual_band_registry import register_residual_band
 
@@ -2164,6 +2164,394 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
         head_spec_builder=head_spec_builder,
         head_reads=head_reads,
         head_writes=head_writes,
+    )
+
+
+# ===========================================================================
+# MARKER-BROADCAST — copy an opcode/flag band from the STEP's marker row to
+# THIS op's own multi-byte byte-position rows, derived GENERICALLY
+# ===========================================================================
+#
+# The LOWERING gap docs/DERIVE_DECODE_PILOT §G-IMM-RELAY names: every
+# multi-byte opcode needs its per-step opcode marker (``OP_<NAME>``, set by
+# decode at the step's MARK_<M> marker row) BROADCAST forward to the op's own
+# byte-position rows so the later multi-byte routing / value-route FFN can gate
+# on it there. IMM's L8 head-4 (``layer8_op_imm_relay``) is the canonical
+# instance: it copies ``OP_IMM`` from the AX marker to the AX byte positions
+# (``IS_BYTE`` + ``H1[AX_I]``). This is NOT a :func:`cam_lookup` — there is no
+# content ADDRESS key; the head attends from a byte position to ITS OWN step's
+# marker row (a fixed marker-bank slot), so the "row select" is a POSITIONAL
+# marker match, not a value/address CAM. The relay is generic: the ONLY varying
+# data is (which marker, which byte-position bank slot, which flag band, the
+# ALiBi recency slope that pins the CURRENT step's marker).
+#
+# Like :func:`cam_lookup` this generator returns a pure builder bundle
+# (``head_spec_builder(dim_positions, head_idx)``) the op factory installs; no
+# compiler change — it lowers through ``Primitives.generate_attention_head``.
+# The byte-identity proof re-expresses the SETTLED L8 head-4 OP_IMM relay and
+# gates the whole-model state_dict hash unchanged.
+
+
+@dataclass(frozen=True)
+class MarkerBroadcastSpec:
+    """Declarative description of a marker-broadcast (flag-relay) attention head.
+
+    A marker-broadcast head fires at THIS op's multi-byte byte-position rows
+    (``IS_BYTE`` AND the op's ``marker_bank`` slot in the H1 threshold bank),
+    attends BACK to the step's own marker row (``source_marker``), and copies a
+    flag band (``broadcast_bands`` — e.g. ``OP_IMM``) from that row onto its own
+    byte positions. The row select is a POSITIONAL marker match (NOT a content
+    address like :func:`cam_lookup`): the Q anchors on the fixed marker-bank
+    slot, the K anchors on the source marker, and an ALiBi recency slope pins
+    the CURRENT step's marker so multi-instance programs (``IMM;PSH;IMM``) do
+    not dilute across prior marker rows.
+
+    Every field is a VARYING parameter; the IDENTICAL head structure — the
+    fire-site Q gate + the source-marker K select + the optional CONST-anchored
+    confirm slot + the flag-band V/O broadcast — is supplied by
+    :func:`marker_broadcast`.
+
+    Attributes:
+        name: head family name (rule-name / diagnostic prefix).
+        marker_bank: the marker whose H1 threshold-bank slot the byte-position
+            rows carry (``"AX"`` for the IMM relay). Resolved to a slot index
+            by ``marker_bank_index`` at build time; the ``H1+<slot>`` cell is
+            the fire-site anchor. NOTE: the resolved ``H1`` cell name is
+            supplied by the caller via ``fire_slot_dim`` (the DSL stays free of
+            the ``marker_bank_index`` import).
+        fire_slot_dim: the resolved fire-site H1 cell dim name
+            (``"H1+<AX_I>"``) — the byte-position marker-bank anchor. Supplied
+            resolved so the DSL does not import the positional helper.
+        source_marker: the marker dim the K side selects (the step's own marker
+            row the flag was decoded onto; ``"MARK_AX"`` for IMM).
+        broadcast_bands: the flag bands copied source-row -> byte positions.
+            Each is a :class:`MarkerBroadcastBand`. For IMM: one 1-wide band
+            ``OP_IMM -> OP_IMM``.
+        weight: the shared Q/K fire-site + source-select projection weight
+            (IMM: ``20.0``). The IS_BYTE reject / CONST sharpener weights are
+            derived from it by the fixed multipliers below (matching the
+            hand-built head exactly).
+        is_byte_dim: the ``IS_BYTE`` predicate dim (fire-site + K reject).
+        const_dim: the CONST residual dim (Q bias + K/confirm anchor).
+        gate_slot: the CONST-anchored confirm/gate sub-head slot (IMM: ``1``).
+            ``None`` => no confirm slot.
+        gate_is_byte_weight / gate_const_q_weight / gate_const_k_weight: the
+            confirm slot's Q ``IS_BYTE`` / Q ``CONST`` / K ``CONST`` writes
+            (IMM: ``500.0`` / ``-500.0`` / ``5.0``).
+        alibi_slope: per-head ALiBi recency slope pinning the CURRENT step's
+            marker (IMM: ``0.5``). ``None`` => the op sets its own slope.
+        query_slot: head-local slot the primary fire/select lands on (IMM: 0).
+        step_window: the step-scope contract the verifier enforces (IMM:
+            ``CURRENT_STEP_ONLY`` — the ALiBi slope keeps the relay mass on the
+            current step's marker).
+    """
+
+    name: str
+    fire_slot_dim: str
+    source_marker: str
+    broadcast_bands: Tuple["MarkerBroadcastBand", ...]
+    weight: float
+    marker_bank: str = "AX"
+    is_byte_dim: str = "IS_BYTE"
+    const_dim: str = "CONST"
+    gate_slot: Optional[int] = 1
+    gate_is_byte_weight: float = 500.0
+    gate_const_q_weight: float = -500.0
+    gate_const_k_weight: float = 5.0
+    alibi_slope: Optional[float] = 0.5
+    query_slot: int = 0
+    step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
+
+    def __post_init__(self) -> None:
+        if not self.broadcast_bands:
+            raise ValueError(
+                f"MarkerBroadcastSpec({self.name!r}): broadcast_bands must be "
+                "non-empty (a marker-broadcast relays at least one flag band)"
+            )
+        for bb in self.broadcast_bands:
+            if bb.width <= 0:
+                raise ValueError(
+                    f"MarkerBroadcastSpec({self.name!r}): broadcast band "
+                    f"{bb.source_band!r}->{bb.target_band!r} width must be "
+                    f"positive, got {bb.width}"
+                )
+
+
+@dataclass(frozen=True)
+class MarkerBroadcastBand:
+    """One ``source_band -> target_band`` flag-broadcast block.
+
+    V copies ``source_band[0..width-1]`` from the matched marker row into
+    head-local V slots ``v_slot_base..v_slot_base+width-1``; O writes those
+    slots into ``target_band[0..width-1]`` at ``o_scale``. For the IMM relay
+    this is one 1-wide band: ``OP_IMM -> OP_IMM`` at ``v_slot_base=0``,
+    ``o_scale=1.0`` (copy the flag onto its own byte positions).
+
+    Attributes:
+        source_band: the marker row's flag band the V slots read.
+        target_band: the band the O writes the broadcast flag into (usually the
+            SAME band — a flag broadcast to one's own byte positions).
+        width: cell count (IMM: ``1`` — a single flag bit).
+        v_slot_base: head-local V slot base (IMM: ``0``).
+        o_scale: O-write magnitude (IMM: ``1.0``).
+    """
+
+    source_band: str
+    target_band: str
+    width: int = 1
+    v_slot_base: int = 0
+    o_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class MarkerBroadcastBundle:
+    """The artifacts :func:`marker_broadcast` generates for one relay head.
+
+    The builder is pure (no global side effects) so the op factory can call it
+    at bake time and IR-factory time identically.
+
+    Attributes:
+        spec: the originating :class:`MarkerBroadcastSpec`.
+        head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. Reproduces the hand-built relay head
+            EXACTLY (same Q/K/V/O writes at the resolved dim positions).
+        head_reads / head_writes: dim-name sets for the head's Operation. The
+            head READS the fire-site marker-bank slot + IS_BYTE + CONST + the
+            source marker + the broadcast source bands; WRITES the broadcast
+            target bands.
+    """
+
+    spec: MarkerBroadcastSpec
+    head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    head_reads: Set[str]
+    head_writes: Set[str]
+
+
+def marker_broadcast(spec: MarkerBroadcastSpec) -> MarkerBroadcastBundle:
+    """Generate the marker-broadcast (flag-relay) attention head for ``spec``.
+
+    Returns a :class:`MarkerBroadcastBundle` whose ``head_spec_builder``
+    reproduces the hand-built relay head byte-identically. Registers NO
+    residual band (the relay copies into an EXISTING opcode/flag band, so there
+    is no import-time side effect).
+
+    The head structure is fixed; the varying data is the spec fields:
+
+      * fire-site Q (slot ``query_slot``): ``IS_BYTE`` @ ``weight``,
+        ``fire_slot_dim`` @ ``weight``, ``CONST`` @ ``-weight*1.5`` — fire at
+        THIS op's byte positions.
+      * source-select K (slot ``query_slot``): ``source_marker`` @ ``weight``,
+        ``IS_BYTE`` @ ``-weight*10``, ``CONST`` @ ``weight*0.5`` — attend BACK
+        to the step's own marker row (reject byte positions on the K side).
+      * optional confirm slot (``gate_slot``): Q ``IS_BYTE`` @
+        ``gate_is_byte_weight`` + ``CONST`` @ ``gate_const_q_weight``; K
+        ``CONST`` @ ``gate_const_k_weight`` — pins the softmax winner.
+      * broadcast V/O: each :class:`MarkerBroadcastBand` copies its flag band
+        from the marker row onto the byte positions.
+    """
+    w = spec.weight
+
+    def head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return int(dim_positions[name])
+
+        qs = spec.query_slot
+
+        # (1) Fire-site Q: fire at THIS op's byte positions (IS_BYTE + the
+        #     op's marker-bank slot), biased against the CONST anchor.
+        q: list = [
+            AP(qs, _P(spec.is_byte_dim), w),
+            AP(qs, _P(spec.fire_slot_dim), w),
+            AP(qs, _P(spec.const_dim), -w * 1.5),
+        ]
+        # (2) Source-select K: attend BACK to the step's own marker row; the
+        #     IS_BYTE reject keeps the K mass off the byte positions.
+        k: list = [
+            AP(qs, _P(spec.source_marker), w),
+            AP(qs, _P(spec.is_byte_dim), -w * 10),
+            AP(qs, _P(spec.const_dim), w * 0.5),
+        ]
+
+        # (3) Optional CONST-anchored confirm/gate slot (sharpen the winner).
+        if spec.gate_slot is not None:
+            g = spec.gate_slot
+            q.append(AP(g, _P(spec.is_byte_dim), spec.gate_is_byte_weight))
+            q.append(AP(g, _P(spec.const_dim), spec.gate_const_q_weight))
+            k.append(AP(g, _P(spec.const_dim), spec.gate_const_k_weight))
+
+        # (4) Flag-band broadcast: V copies source_band -> V slots; O writes
+        #     those slots into target_band (usually the SAME band).
+        v: list = []
+        o: list = []
+        for bb in spec.broadcast_bands:
+            src = _P(bb.source_band)
+            tgt = _P(bb.target_band)
+            for j in range(bb.width):
+                v.append(AP(bb.v_slot_base + j, src + j, 1.0))
+                o.append(AO(tgt + j, bb.v_slot_base + j, bb.o_scale))
+
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+            alibi_slope=spec.alibi_slope,
+            step_window=spec.step_window,
+        )
+
+    # Operation dep-graph dim sets (structural derivation).
+    head_reads: Set[str] = {
+        spec.is_byte_dim, spec.fire_slot_dim, spec.const_dim,
+        spec.source_marker,
+    }
+    head_writes: Set[str] = set()
+    for bb in spec.broadcast_bands:
+        head_reads.add(bb.source_band)
+        head_writes.add(bb.target_band)
+
+    return MarkerBroadcastBundle(
+        spec=spec,
+        head_spec_builder=head_spec_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
+    )
+
+
+# ===========================================================================
+# VALUE-ROUTE — gated per-nibble VALUE copy (fetched imm -> OUTPUT), derived
+# ===========================================================================
+#
+# The IMM value-route (docs/DERIVE_DECODE_PILOT §G-IMM-ROUTE): once decode set
+# ``OP_IMM`` and :func:`marker_broadcast` relayed it to the AX byte positions,
+# the fetched immediate (staged in ``AX_CARRY_LO/HI`` per nibble) is copied to
+# ``OUTPUT`` at those byte positions. It is a clean gated per-cell copy block:
+# a shared AND-context (fire at THIS op's byte positions when the opcode flag is
+# relayed there) times a per-cell GATE on the source nibble writing the
+# corresponding target nibble. The ONLY varying data is (the context, the
+# source/target band pair, the nibble count, the write scale). :func:`value_route`
+# lowers the whole block from a :class:`ValueRouteSpec` with ZERO hand-authored
+# per-cell branch, byte-identical to ``_layer8_multibyte_routing_rules``.
+
+
+@dataclass(frozen=True)
+class ValueRouteChannel:
+    """One ``source_band -> target_band`` per-nibble gated-copy channel.
+
+    For each ``k in range(width)`` the channel emits ONE ``multi_way_and_rule``
+    gated on ``source_band+k`` that writes ``target_band+k`` at ``write_scale``,
+    under the route's shared AND-context. The IMM route has TWO channels:
+    ``AX_CARRY_LO -> OUTPUT_LO`` (16 low nibbles) and ``AX_CARRY_HI ->
+    OUTPUT_HI_THIS_STEP`` (16 high nibbles).
+
+    Attributes:
+        source_band: the per-nibble source band the GATE reads.
+        target_band: the band each cell WRITES.
+        width: nibble-cell count (IMM: ``16`` per channel).
+        write_scale: the per-cell write magnitude (IMM: ``8.0 / S``).
+        rule_name_fn: ``(k) -> str`` legacy rule name for cell ``k``.
+    """
+
+    source_band: str
+    target_band: str
+    write_scale: float
+    width: int = 16
+    rule_name_fn: Optional[Callable[[int], str]] = None
+
+
+@dataclass(frozen=True)
+class ValueRouteSpec:
+    """Declarative description of a gated per-nibble value-route FFN block.
+
+    A value route copies a fetched multi-nibble VALUE (staged per nibble in a
+    source band) into a target OUTPUT band at THIS op's byte positions, gated on
+    the relayed opcode flag. Every field is a per-route CONSTANT; the per-cell
+    copy structure is supplied by :func:`value_route` with zero per-cell branch.
+
+    Attributes:
+        name: route family name (diagnostic).
+        conditions: the shared AND-context every cell folds in beyond the
+            per-cell gate — fire at THIS op's byte positions when the opcode
+            flag is relayed there (IMM: ``(("IS_BYTE",1), ("H1+AX_I",1),
+            ("OP_IMM",1), ("MARK_AX",-4))``). Supplied resolved (the
+            ``H1+<slot>`` cell already resolved by the caller).
+        threshold: the AND threshold (IMM: ``6.5``).
+        channels: the per-nibble copy channels (:class:`ValueRouteChannel`).
+    """
+
+    name: str
+    conditions: Tuple[Tuple[str, float], ...]
+    threshold: float
+    channels: Tuple[ValueRouteChannel, ...]
+
+    def __post_init__(self) -> None:
+        if not self.channels:
+            raise ValueError(
+                f"ValueRouteSpec({self.name!r}): channels must be non-empty"
+            )
+
+
+@dataclass(frozen=True)
+class ValueRouteBundle:
+    """The artifacts :func:`value_route` generates for one value-route block.
+
+    Attributes:
+        spec: the originating :class:`ValueRouteSpec`.
+        rules_builder: ``() -> tuple[FFNRule, ...]`` — the full ordered
+            per-cell copy rule sequence, DERIVED from the channels with zero
+            per-cell branch.
+        reads / writes: the block's Operation dep-graph dim sets, derived
+            structurally from the conditions + channels.
+    """
+
+    spec: ValueRouteSpec
+    rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    reads: Set[str]
+    writes: Set[str]
+
+
+def value_route(spec: ValueRouteSpec) -> ValueRouteBundle:
+    """Generate the gated per-nibble value-route FFN rule sequence for ``spec``.
+
+    Reproduces the hand-authored per-cell copy block byte-for-byte (proof:
+    ``tools/_isa_golden_hash.py`` unchanged under the flag-ON derived build).
+    Registers no residual band (the route writes into an existing OUTPUT band).
+    """
+
+    def rules_builder() -> Tuple[FFNRule, ...]:
+        rules: list[FFNRule] = []
+        for ch in spec.channels:
+            for k in range(ch.width):
+                name = (
+                    ch.rule_name_fn(k) if ch.rule_name_fn is not None
+                    else f"{spec.name}_{ch.target_band.lower()}_{k}"
+                )
+                rules.append(multi_way_and_rule(
+                    name=name,
+                    conditions=spec.conditions,
+                    threshold=spec.threshold,
+                    gate=f"{ch.source_band}+{k}",
+                    writes=((f"{ch.target_band}+{k}", ch.write_scale),),
+                ))
+        return tuple(rules)
+
+    reads: Set[str] = set()
+    for (dim, _w) in spec.conditions:
+        reads.add(dim.split("+", 1)[0])
+    writes: Set[str] = set()
+    for ch in spec.channels:
+        reads.add(ch.source_band)
+        writes.add(ch.target_band)
+
+    return ValueRouteBundle(
+        spec=spec,
+        rules_builder=rules_builder,
+        reads=reads,
+        writes=writes,
     )
 
 

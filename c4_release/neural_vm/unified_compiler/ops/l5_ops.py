@@ -8,7 +8,7 @@ from ..building_blocks_dsl import multi_way_and_rule
 from ..layer_compiler import Operation
 from ..ir import CompilerIR, FFNRule
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
-from .shared import _as_setdim_proxy, _opcode_name_map
+from .shared import _as_setdim_proxy, _opcode_name_map, derive_imm_enabled
 from ..isa_semantics_dsl import (
     BlankUnit,
     ConsumerLookaheadGateSpec,
@@ -142,8 +142,16 @@ def _derive_decode_enabled() -> bool:
     ``C4_DERIVE_DECODE=1``), so this is the STEP-3 generic engine + STEP-4
     100%-derivation proof for the DECODE family. Default OFF => the
     hand-authored path stays the golden build.
+
+    Task #392: ``C4_DERIVE_IMM=1`` (the fully-derived IMM opcode) IMPLIES the
+    derived decode path — IMM's decode -> ``OP_IMM`` stage is the FIRST of the
+    three IMM sub-machines and must derive from ``decode_band`` too. The derived
+    decode is byte-identical for the WHOLE ISA table, so ``C4_DERIVE_IMM``
+    turning it on for every opcode is still golden-hash-neutral.
     """
-    return os.environ.get("C4_DERIVE_DECODE", "0") != "0"
+    if os.environ.get("C4_DERIVE_DECODE", "0") != "0":
+        return True
+    return derive_imm_enabled()
 
 
 def _nested_jsr_pc_fix_enabled() -> bool:
