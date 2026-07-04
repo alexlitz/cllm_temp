@@ -2319,6 +2319,190 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
 
 
 # ===========================================================================
+# FRAME-RELAY — the multi-slot FRAME-lookup value relay (L7 head-1 LEA/ADJ/ENT
+# BP/SP OUTPUT -> ALU), derived GENERICALLY
+# ===========================================================================
+#
+# The L7 operand-gather HEAD 1 (``layer7_operand_gather.head_1``) is the sibling
+# of head 0: it gathers the LIVE frame BP/SP ``OUTPUT`` into the ALU at the AX
+# marker (operand-A ADDRESS relay for LEA/ADJ/ENT). It is a value relay like
+# :func:`cam_lookup`, but its ROW SELECT is NOT a single content-address key
+# match: it fires on a FRAME opcode set (``MARK_AX`` ×10 amplified + ``OP_LEA/
+# ADJ/ENT`` gates + an ``OP_IMM`` per-step suppressor + a ``CONST`` bias), its K
+# selects the frame MARKER by a TWO-MARKER OR (``MARK_BP`` + ``MARK_SP``, both
+# at the SAME weight, so the head attends to whichever frame marker is live),
+# and it carries a SECOND CONST-anchored gate slot (slot 1: ``MARK_AX`` re-assert
+# + ``CONST`` bias) plus an OPTIONAL campaign re-sharpen gate slot (slot 2:
+# ``OP_LEA`` query / ``OP_ENT`` key). None of that fits ``cam_lookup``'s single
+# shared-weight ``CamKeyMatch`` (the Q primary is ×10 the K primary; the key is a
+# two-marker OR, not one address).
+#
+# :func:`frame_relay` is the GENERAL frame-lookup value relay of which
+# :func:`cam_lookup` is the constrained content-address special case: a FREE
+# multi-slot Q/K GATE signature (row-selection structure — markers, opcode gates,
+# CONST anchors, per-step suppressors) drives the SAME :class:`CamValueBand`
+# value flow (source band -> V slots -> target band) with the SAME
+# ``value_active`` suppression semantics (keep the gates, drop the relay). The
+# gates are raw ``(slot, dim, weight)`` tuples because a frame select is genuine
+# row-selection structure, not a value projection — the CAM discipline (no free
+# V/O) is preserved: V/O is EXCLUSIVELY the declared value bands.
+#
+# Returns a pure builder bundle (``head_spec_builder(dim_positions, head_idx)``)
+# the op factory installs; no compiler change — lowers through
+# ``Primitives.generate_attention_head``. Byte-identity re-expresses the SETTLED
+# L7 head-1 frame relay and gates the whole-model state_dict hash unchanged.
+
+
+@dataclass(frozen=True)
+class FrameRelaySpec:
+    """Declarative description of a multi-slot frame-lookup value-relay head.
+
+    The head fires at a frame-op marker row (``q_gates``: a free multi-slot Q
+    signature of marker + opcode-gate + CONST-bias writes), its K selects the
+    frame marker (``k_gates``: a free multi-slot K signature — a two-marker OR,
+    CONST anchors), and it relays value bands (``value_bands``) from the attended
+    frame row into a target band. Every field is a VARYING parameter; the value
+    flow is the SAME :class:`CamValueBand` machinery as :func:`cam_lookup`.
+
+    Attributes:
+        name: head family name (rule-name / diagnostic prefix).
+        q_gates: the Q-projection ``(slot, dim, weight)`` writes (the row-select
+            fire signature — markers, opcode gates, CONST bias, per-step
+            suppressors). Each ``dim`` is a ``BASE`` or ``BASE+offset`` token.
+        k_gates: the K-projection ``(slot, dim, weight)`` writes (the frame
+            marker select — a two-marker OR, CONST anchors).
+        value_bands: the value-relay blocks (:class:`CamValueBand`) — the frame
+            row's OUTPUT band -> the ALU band, exactly as ``cam_lookup`` relays.
+        alibi_slope: per-head ALiBi slope. ``None`` => the op writes its own
+            ``alibi_slopes`` (L7 head-1's slope is set by the op bake, not the
+            spec, so the re-expression leaves this ``None``).
+        value_active: when ``False`` the value relay (V/O) is OMITTED while the
+            Q/K row-select gates are KEPT — the ``C4_OPERAND_FROM_MEMSP``
+            "disable the old operand source but keep the head slot/layout"
+            mode. Mirrors :attr:`CamLookupSpec.value_active`.
+        step_window: the step-scope contract the verifier enforces.
+        extra_reads: extra dim names the head's Operation should declare beyond
+            the auto-derived set (cross-step ``X.*.-1`` aliases the OUTPUT bands
+            are read through — L7 head-1 reads OUTPUT_LO/HI cross-step).
+    """
+
+    name: str
+    q_gates: Tuple[Tuple[int, str, float], ...]
+    k_gates: Tuple[Tuple[int, str, float], ...]
+    value_bands: Tuple[CamValueBand, ...]
+    alibi_slope: Optional[float] = None
+    value_active: bool = True
+    step_window: StepWindowConstraint = (
+        StepWindowConstraint.CURRENT_STEP_ONLY
+    )
+    extra_reads: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.q_gates:
+            raise ValueError(
+                f"FrameRelaySpec({self.name!r}): q_gates must be non-empty "
+                "(a frame relay fires at a marker row)"
+            )
+        if not self.k_gates:
+            raise ValueError(
+                f"FrameRelaySpec({self.name!r}): k_gates must be non-empty "
+                "(a frame relay selects a marker row)"
+            )
+        if not self.value_bands:
+            raise ValueError(
+                f"FrameRelaySpec({self.name!r}): value_bands must be non-empty "
+                "(a frame relay relays at least one value band)"
+            )
+        for vb in self.value_bands:
+            if vb.width <= 0:
+                raise ValueError(
+                    f"FrameRelaySpec({self.name!r}): value band "
+                    f"{vb.source_band!r}->{vb.target_band!r} width must be "
+                    f"positive, got {vb.width}"
+                )
+
+
+@dataclass(frozen=True)
+class FrameRelayBundle:
+    """The artifacts :func:`frame_relay` generates for one frame-relay head.
+
+    Attributes:
+        spec: the originating :class:`FrameRelaySpec`.
+        head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. Reproduces the hand-built frame-relay
+            head EXACTLY (same Q/K/V/O writes at the resolved dim positions).
+        head_reads / head_writes: dim-name sets for the head's Operation.
+    """
+
+    spec: FrameRelaySpec
+    head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    head_reads: Set[str]
+    head_writes: Set[str]
+
+
+def frame_relay(spec: FrameRelaySpec) -> FrameRelayBundle:
+    """Generate the multi-slot frame-lookup value-relay head for ``spec``.
+
+    Returns a :class:`FrameRelayBundle` whose ``head_spec_builder`` reproduces
+    the hand-built frame-relay head byte-identically. Registers NO residual band
+    (the relay copies into EXISTING ALU / OUTPUT bands).
+    """
+
+    def head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
+
+        q = [AP(slot, _P(d), w) for (slot, d, w) in spec.q_gates]
+        k = [AP(slot, _P(d), w) for (slot, d, w) in spec.k_gates]
+
+        v: list = []
+        o: list = []
+        if spec.value_active:
+            for vb in spec.value_bands:
+                src = _P(vb.source_band)
+                tgt = _P(vb.target_band)
+                for j in range(vb.width):
+                    v.append(AP(vb.v_slot_base + j, src + j, 1.0))
+                    o.append(AO(tgt + j, vb.v_slot_base + j, vb.o_scale))
+
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+            alibi_slope=spec.alibi_slope,
+            step_window=spec.step_window,
+        )
+
+    def _base(name: str) -> str:
+        return name.split("+", 1)[0]
+
+    head_reads: Set[str] = set()
+    for (_s, d, _w) in spec.q_gates:
+        head_reads.add(_base(d))
+    for (_s, d, _w) in spec.k_gates:
+        head_reads.add(_base(d))
+    head_writes: Set[str] = set()
+    if spec.value_active:
+        for vb in spec.value_bands:
+            head_reads.add(_base(vb.source_band))
+            head_writes.add(_base(vb.target_band))
+    head_reads.update(spec.extra_reads)
+
+    return FrameRelayBundle(
+        spec=spec,
+        head_spec_builder=head_spec_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
+    )
+
+
+# ===========================================================================
 # CAM-BINARY-ADDRESS-MATCH — the multi-slot BINARY-address CAM (L15 LI/LC load,
 # L14 mem-generation store), derived GENERICALLY
 # ===========================================================================
@@ -3091,6 +3275,209 @@ def value_route(spec: ValueRouteSpec) -> ValueRouteBundle:
         rules_builder=rules_builder,
         reads=reads,
         writes=writes,
+    )
+
+
+# ===========================================================================
+# SCALAR-RELAY — the marker-anchored opcode/flag relay bank, derived GENERICALLY
+# ===========================================================================
+#
+# The L7 "memory heads" 5/6/7 are NOT :func:`cam_lookup` value relays (no
+# content-address key + contiguous value band) nor :func:`marker_broadcast`
+# byte-position relays (they fire AT the marker row, not at byte positions
+# attending back). They are a THIRD, distinct ISA-semantic family: a
+# **marker-anchored scalar-relay bank**. The head fires at a MARKER row (its Q
+# signature is a fixed set of marker + threshold-bank discriminators), its K
+# selects the SAME (or a sibling) marker row (a self / marker match, optionally
+# doubled or with an opcode blocker), and it relays a BANK of INDIVIDUAL scalar
+# flags from that row: each relay reads one-or-more source dims into ONE V slot
+# and writes ONE target dim at a per-relay scale. This is exactly the L7 head-5
+# opcode-flag relay (OP_LI/LC/LEA/AND/OR/XOR/JSR/SHR/SI/SC/ADD/SUB/ENT ->
+# RELAY/CMP/TEMP/OP dims), head-6 PSH/CMP relay (CMP/PSH_AT_SP self-relay off
+# the STACK0|SP marker) and head-7 MEM flag broadcast (MEM_STORE/MEM_ADDR_SRC/
+# OP_JSR/OP_ENT self-relay off the MEM marker).
+#
+# The value flow a :class:`CamValueBand` cannot express and this family needs:
+#   * MULTIPLE source dims summed into ONE V slot (head-5 slot 4 reads
+#     OP_AND+OP_OR+OP_XOR — an OR-of-bitwise-opcode gate),
+#   * a per-relay O WRITE SCALE (head-5 relays the JSR/SI/SC/ENT flags at 5.0,
+#     the rest at 1.0),
+#   * a raw multi-dim Q/K signature (marker + H1/H3/H4 threshold-bank
+#     discriminators, a two-marker OR key, a K-side opcode blocker, a doubled
+#     K weight) — pure row-selection structure, not a content address.
+#
+# Like the sibling generators this returns a pure builder bundle
+# (``head_spec_builder(dim_positions, head_idx)``) the op factory installs; no
+# compiler change — it lowers through ``Primitives.generate_attention_head``.
+# The byte-identity proof re-expresses the SETTLED L7 memory heads 5/6/7 and
+# gates the whole-model state_dict hash unchanged.
+
+
+@dataclass(frozen=True)
+class ScalarRelay:
+    """One scalar (width-1) flag relay in a :class:`ScalarRelayBankSpec`.
+
+    Reads ``sources`` (one-or-more ``(dim, weight)`` V-projection writes, all
+    landing on the SAME head-local ``v_slot`` so their contributions SUM) from
+    the attended marker row, and writes the summed value into ``target_dim`` via
+    a single O write at ``o_scale``. A single-source relay is the common case
+    (``sources == ((dim, 0.2),)``); the multi-source case is head-5 slot 4's
+    ``OP_AND/OP_OR/OP_XOR`` OR-gate.
+
+    Attributes:
+        v_slot: head-local V/O slot the relay lands on.
+        sources: the ``(source_dim, v_weight)`` reads folded into ``v_slot``.
+        target_dim: the residual dim the O write targets (a ``BASE`` or
+            ``BASE+offset`` token; the offset is honoured via
+            :func:`_resolve_dim_token`).
+        o_scale: the O-write magnitude.
+    """
+
+    v_slot: int
+    sources: Tuple[Tuple[str, float], ...]
+    target_dim: str
+    o_scale: float = 1.0
+
+
+@dataclass(frozen=True)
+class ScalarRelayBankSpec:
+    """Declarative description of a marker-anchored scalar-relay attention head.
+
+    The head fires at a marker row (its ``query_sig`` is the marker + the
+    threshold-bank discriminators that pin WHICH marker rows fire), its K
+    selects the same/sibling marker row (``key_sig`` — a self/marker match,
+    optionally doubled or carrying an opcode blocker), and it relays a BANK of
+    individual scalar flags (``relays``) from that row. Every field is a
+    VARYING parameter; the IDENTICAL head structure (the raw Q/K signature on
+    the query slot + the per-relay V/O scalar copies) is supplied by
+    :func:`scalar_relay`.
+
+    Attributes:
+        name: head family name (rule-name / diagnostic prefix).
+        query_sig: the Q-projection ``(dim, weight)`` writes on ``query_slot``
+            — the marker fire-site + threshold-bank discriminators (row select).
+            Each ``dim`` is a ``BASE`` or ``BASE+offset`` token.
+        key_sig: the K-projection ``(dim, weight)`` writes on ``query_slot`` —
+            the marker self/sibling match + any doubled weight or opcode blocker.
+        relays: the scalar flag relays (:class:`ScalarRelay`).
+        query_slot: the head-local slot the Q/K signature lands on (L7: ``0``).
+        alibi_slope: per-head ALiBi slope. ``None`` => the op writes its own
+            ``alibi_slopes`` (the L7 memory heads' slopes are set by the op's
+            bake, not the spec, so the re-expression leaves this ``None``).
+        step_window: the step-scope contract the verifier enforces. The L7
+            head-7 MEM flag broadcast reads the MEM marker across steps
+            (memory persistence is by design) and declares ``ANY_STEP``; the
+            others default to ``CURRENT_STEP_ONLY``.
+    """
+
+    name: str
+    query_sig: Tuple[Tuple[str, float], ...]
+    key_sig: Tuple[Tuple[str, float], ...]
+    relays: Tuple[ScalarRelay, ...]
+    query_slot: int = 0
+    alibi_slope: Optional[float] = None
+    step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
+
+    def __post_init__(self) -> None:
+        if not self.query_sig:
+            raise ValueError(
+                f"ScalarRelayBankSpec({self.name!r}): query_sig must be "
+                "non-empty (a relay head fires at a marker row)"
+            )
+        if not self.key_sig:
+            raise ValueError(
+                f"ScalarRelayBankSpec({self.name!r}): key_sig must be "
+                "non-empty (a relay head selects a marker row)"
+            )
+        if not self.relays:
+            raise ValueError(
+                f"ScalarRelayBankSpec({self.name!r}): relays must be non-empty"
+            )
+        for r in self.relays:
+            if not r.sources:
+                raise ValueError(
+                    f"ScalarRelayBankSpec({self.name!r}): relay -> "
+                    f"{r.target_dim!r} must read at least one source"
+                )
+
+
+@dataclass(frozen=True)
+class ScalarRelayBundle:
+    """The artifacts :func:`scalar_relay` generates for one relay-bank head.
+
+    Attributes:
+        spec: the originating :class:`ScalarRelayBankSpec`.
+        head_spec_builder: ``(dim_positions, head_idx) ->
+            DeclarativeAttentionHeadSpec``. Reproduces the hand-built relay-bank
+            head EXACTLY (same Q/K/V/O writes at the resolved dim positions).
+        head_reads / head_writes: dim-name sets for the head's Operation. The
+            head READS the query/key signature dims + every relay source; WRITES
+            every relay target.
+    """
+
+    spec: ScalarRelayBankSpec
+    head_spec_builder: Callable[
+        [Dict[str, int], int], DeclarativeAttentionHeadSpec
+    ]
+    head_reads: Set[str]
+    head_writes: Set[str]
+
+
+def scalar_relay(spec: ScalarRelayBankSpec) -> ScalarRelayBundle:
+    """Generate the marker-anchored scalar-relay bank head for ``spec``.
+
+    Returns a :class:`ScalarRelayBundle` whose ``head_spec_builder`` reproduces
+    the hand-built relay head byte-identically. Registers NO residual band (the
+    relays copy into EXISTING opcode/flag/CMP/TEMP bands, so there is no
+    import-time side effect).
+    """
+
+    def head_spec_builder(
+        dim_positions: Dict[str, int], head_idx: int
+    ) -> DeclarativeAttentionHeadSpec:
+        def _P(name: str) -> int:
+            return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
+
+        qs = spec.query_slot
+        q = [AP(qs, _P(d), w) for (d, w) in spec.query_sig]
+        k = [AP(qs, _P(d), w) for (d, w) in spec.key_sig]
+
+        v: list = []
+        o: list = []
+        for r in spec.relays:
+            for (src, w) in r.sources:
+                v.append(AP(r.v_slot, _P(src), w))
+            o.append(AO(_P(r.target_dim), r.v_slot, r.o_scale))
+
+        return DeclarativeAttentionHeadSpec(
+            head_idx=head_idx,
+            q=tuple(q),
+            k=tuple(k),
+            v=tuple(v),
+            o=tuple(o),
+            alibi_slope=spec.alibi_slope,
+            step_window=spec.step_window,
+        )
+
+    def _base(name: str) -> str:
+        return name.split("+", 1)[0]
+
+    head_reads: Set[str] = set()
+    for (d, _w) in spec.query_sig:
+        head_reads.add(_base(d))
+    for (d, _w) in spec.key_sig:
+        head_reads.add(_base(d))
+    head_writes: Set[str] = set()
+    for r in spec.relays:
+        for (src, _w) in r.sources:
+            head_reads.add(_base(src))
+        head_writes.add(_base(r.target_dim))
+
+    return ScalarRelayBundle(
+        spec=spec,
+        head_spec_builder=head_spec_builder,
+        head_reads=head_reads,
+        head_writes=head_writes,
     )
 
 
