@@ -27,11 +27,17 @@ from ..band_guarantees import scalar_value_guarantee_rules
 from ..building_blocks_dsl import byte_route_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
 from ..isa_semantics_dsl import (
+    ConstByteDefaultSpec,
+    ConstValueOverrideSpec,
     PopCamCancel,
     PopCamCancelBand,
     PopCamDelta,
     RegisterDeltaSpec,
+    SelfPreserveBandSpec,
+    const_byte_default,
+    const_value_override,
     register_delta,
+    self_preserve_band,
 )
 from ..layer_compiler import Operation
 from ..primitives import Primitives
@@ -867,22 +873,23 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             return f"OUTPUT_HI_PREVSTEP+{k}"
         return f"OUTPUT_HI_THIS_STEP+{k}"
 
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_stack0_byte0_preserve_lo_{k}",
+    # DERIVED via the ``self_preserve_band`` primitive: a per-cell FIXPOINT
+    # (gate reads the SAME OUTPUT_{LO,HI}[k] it reinforces), NOT a POP-CAM. Each
+    # cell fires under the shared AND, gated on its own OUTPUT slot, and nudges
+    # that nibble to stay put. ``gate_{lo,hi}_for`` carry the ``_proto_gate``
+    # decouple hooks unchanged. Byte-identical (proof: _isa_golden_hash 91f55411).
+    rules.extend(self_preserve_band(
+        SelfPreserveBandSpec(
+            name_prefix="l16_lev_stack0_byte0_preserve",
             conditions=lev_stack0_preserve_conditions,
             threshold=7.5,
-            gate=_proto_gate_lo(k),
-            writes=((dim_ref('output_lo', 'nibble', k), lev_stack0_preserve_strength),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_stack0_byte0_preserve_hi_{k}",
-            conditions=lev_stack0_preserve_conditions,
-            threshold=7.5,
-            gate=_proto_gate_hi(k),
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", lev_stack0_preserve_strength),),
-        ))
+            write_scale=lev_stack0_preserve_strength,
+            dst_lo=_dim_base('output_lo', 'nibble'),
+            dst_hi="OUTPUT_HI_THIS_STEP",
+            gate_lo_for=_proto_gate_lo,
+            gate_hi_for=_proto_gate_hi,
+        )
+    ))
 
     byte_zero_base = (
         (dim_ref('opcode_flag', 'LEV'), 0.5),
@@ -901,30 +908,35 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("NEXT_MEM", -1.5),
         ("NEXT_SE", -1.5),
     )
-    for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_clear_output_lo10_{byte_idx}",
-            conditions=byte_zero_base + ((byte_idx, 1.0),),
-            threshold=4.0,
-            gate="CONST",
-            writes=((dim_ref('output_lo', 'nibble', 10), -10.0 / S),),
-        ))
-    for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_set_output_lo0_{byte_idx}",
-            conditions=byte_zero_base + ((byte_idx, 1.0),),
-            threshold=4.0,
-            gate="CONST",
-            writes=((dim_ref('output_lo', 'nibble', 0), 5.0 / S),),
-        ))
-    for byte_idx in ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3"):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_set_output_hi0_{byte_idx}",
-            conditions=byte_zero_base + ((byte_idx, 1.0),),
-            threshold=4.0,
-            gate="CONST",
-            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
-        ))
+    # DERIVED via the ``const_byte_default`` primitive: CONST-gated fixed writes
+    # replicated across the byte-index 1/2/3 rows of a top-level LEV. Three
+    # families (clear the 0xa low nibble; set byte-0 low nibble 0; set byte-0 high
+    # nibble 0) so the return frame is clean. Byte-identical (91f55411).
+    _lev_byte_default_indices = ("BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3")
+    rules.extend(const_byte_default(ConstByteDefaultSpec(
+        name_prefix="l16_lev_clear_output_lo10",
+        base_conditions=byte_zero_base,
+        byte_indices=_lev_byte_default_indices,
+        threshold=4.0,
+        write_dim=dim_ref('output_lo', 'nibble', 10),
+        write_value=-10.0 / S,
+    )))
+    rules.extend(const_byte_default(ConstByteDefaultSpec(
+        name_prefix="l16_lev_set_output_lo0",
+        base_conditions=byte_zero_base,
+        byte_indices=_lev_byte_default_indices,
+        threshold=4.0,
+        write_dim=dim_ref('output_lo', 'nibble', 0),
+        write_value=5.0 / S,
+    )))
+    rules.extend(const_byte_default(ConstByteDefaultSpec(
+        name_prefix="l16_lev_set_output_hi0",
+        base_conditions=byte_zero_base,
+        byte_indices=_lev_byte_default_indices,
+        threshold=4.0,
+        write_dim="OUTPUT_HI_THIS_STEP+0",
+        write_value=5.0 / S,
+    )))
 
     # The legacy TEMP->PC materializers above can fire for every nibble on the
     # top-level LEV marker because OP_LEV + MARK_PC alone crosses their old
@@ -939,7 +951,11 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     _lev_pc_top_gate = (
         "OPCODE_BYTE_LO+8" if _lev_pc_top_return_opcode_gate_on() else None
     )
-    rules.append(multi_way_and_rule(
+    # DERIVED via the ``const_value_override`` primitive: the single authoritative
+    # fixed-VALUE OUTPUT override (0x0a = the bootstrap top-level return PC). The
+    # value writes stay caller-supplied DATA (byte_value_writes), so the primitive
+    # is value-agnostic. Byte-identical (91f55411).
+    rules.append(const_value_override(ConstValueOverrideSpec(
         name="l16_lev_pc_top_return_0a",
         conditions=(
             (dim_ref('opcode_flag', 'LEV'), 1.0),
@@ -956,7 +972,7 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=7.5,
         gate=_lev_pc_top_gate,
         writes=Primitives.byte_value_writes(0x0A, strength=20.0),
-    ))
+    )))
 
     # The bootstrap JSR stores the return address at the freshly decremented
     # top-level stack pointer (0xfff8).  Later local/recursive JSR store rows
