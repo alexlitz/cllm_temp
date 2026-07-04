@@ -26,7 +26,11 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..band_guarantees import scalar_value_guarantee_rules
 from ..building_blocks_dsl import byte_route_rules, multi_way_and_rule
 from ..ir import CompilerIR, FFNRule
-from ..isa_semantics_dsl import PopCamDelta, RegisterDeltaSpec, register_delta
+from ..isa_semantics_dsl import (
+    PopCamDelta,
+    RegisterDeltaSpec,
+    control_op,
+)
 from ..layer_compiler import Operation
 from ..primitives import Primitives
 from .residual_band_registry import register_residual_band
@@ -585,17 +589,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
-    for band, output_base in (("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP")):
-        for k in range(16):
-            rules.append(multi_way_and_rule(
-                name=f"l16_lev_sp_cancel_{band}_{k}",
-                conditions=sp_cancel_conditions,
-                threshold=31.5,
-                gate=f"{output_base}+{k}",
-                gate_weight=-1.0,
-                writes=((f"{output_base}+{k}", write_scale),),
-            ))
-
     sp_value_base_conditions = (
         (dim_ref('opcode_flag', 'LEV'), 1.0),
         (dim_ref('marker', 'SP'), 1.0),
@@ -617,38 +610,6 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         ("HAS_SE", first_step_gate),
         ("PSH_AT_SP", -first_step_gate),
     )
-    # LEV ``SP := BP`` pop — DERIVED via the POP-CAM register-delta primitive
-    # (docs/semantic_spec_CONTROL.md §G5). The freed-BP address was relayed by an
-    # L9 CAM head into the ``ADDR_B0_{LO,HI}`` one-hot band; each per-nibble unit
-    # gates on that cell (folded into BOTH the AND conditions and the
-    # multiplicative gate — ``gate_mode="band_cell"``) and writes it onto OUTPUT.
-    # ``hi_shift=1`` = the +16 low-byte carry (``result = (k+1)%16``); the
-    # gate-side MARK_MEM hard blocker forces the gate-fallback to exclude MEM
-    # rows. Byte-identical to the hand-authored bank (proof:
-    # ``tools/_isa_golden_hash.py`` == 91f55411).
-    rules.extend(register_delta(
-        RegisterDeltaSpec(
-            name="l16_lev_sp_bp_plus16",
-            kind="pop_cam",
-            write_scale=write_scale,
-            conditions=sp_value_base_conditions,
-            pop_cam=PopCamDelta(
-                value_src_lo=_dim_base('memory_lo', 'addr_b0'),
-                value_src_hi=_dim_base('memory_hi', 'addr_b0'),
-                value_hi_offset=0,
-                dst_lo=_dim_base('output_lo', 'nibble'),
-                dst_hi="OUTPUT_HI_THIS_STEP",
-                lo_shift=0,
-                hi_shift=1,
-                gate_mode="band_cell",
-                gate_terms=((dim_ref('marker', 'MEM'), -1e6),),
-                threshold=40.0,
-            ),
-        ),
-        instr_width=INSTR_WIDTH,
-        pc_offset=PC_OFFSET,
-    ).rules_builder())
-
     pc_cancel_hi_conditions = (
         (dim_ref('opcode_flag', 'LEV'), 0.2),
         (dim_ref('marker', 'PC'), 1.0),
@@ -656,43 +617,102 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         (dim_ref('marker', 'SP'), -1.0),
         (dim_ref('marker', 'BP'), -1.0),
     )
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"l16_lev_pc_cancel_hi_{k}",
-            conditions=pc_cancel_hi_conditions,
-            threshold=1.5,
-            gate=f"OUTPUT_HI_THIS_STEP+{k}",
-            gate_weight=-1.0,
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
-        ))
-    # LEV ``PC := return-addr`` pop — DERIVED via the POP-CAM register-delta
-    # primitive (docs/semantic_spec_CONTROL.md §G5). The saved return PC was
-    # relayed by the L9 CAM head into ``TEMP`` (LO nibbles ``0..15``, HI nibbles
-    # ``16..31``); each per-nibble unit ANDs the TEMP cell into the OP_LEV+MARK_PC
-    # gate and copies it onto OUTPUT under a plain ``CONST`` multiplicative gate
-    # (``gate_mode="const"``). Byte-identical to the hand-authored bank.
-    rules.extend(register_delta(
-        RegisterDeltaSpec(
-            name="l16_lev_pc_temp",
-            kind="pop_cam",
-            write_scale=write_scale,
-            conditions=(
-                (dim_ref('opcode_flag', 'LEV'), 1.0),
-                (dim_ref('marker', 'PC'), 1.0),
+
+    # ---- LEV FRAME TEARDOWN as ONE ControlOp frame-descriptor ----
+    # The LEV opcode's ordered ``frame_delta`` (docs/semantic_spec_CONTROL.md
+    # §2b/§G5) is the 4-way running-SP teardown: restore SP to the frame base,
+    # then pop the saved registers back off the freed slots. Named here as ONE
+    # ``control_op("LEV", [...])`` whose ordered ``bands`` are:
+    #
+    #   1. SP-cancel corrective band (subtract the arriving OUTPUT so the pop
+    #      REPLACES the slot) — an unconditional same-step cancel, not a
+    #      register-delta kind, so it rides as a corrective builder;
+    #   2. POP-CAM(SP := BP) — the freed-BP address relayed by an L9 CAM head
+    #      into ``ADDR_B0_{LO,HI}`` (``gate_mode="band_cell"``, ``hi_shift=1``
+    #      for the +16 low-byte carry, gate-side MARK_MEM hard blocker);
+    #   3. PC-cancel corrective band (subtract the arriving OUTPUT_HI at MARK_PC);
+    #   4. POP-CAM(PC := return-addr) — the saved return PC relayed into ``TEMP``
+    #      (``gate_mode="const"``).
+    #
+    # The two POP-CAM deltas are separated by the PC-cancel corrective, so they
+    # lower as two single-delta ``frame_step`` runs at their declared positions;
+    # the AX pop (4th teardown step) is the downstream AX-carry/full byte-route
+    # materializer below. Byte-identical to the hand-sequenced bank (proof:
+    # ``tools/_isa_golden_hash.py`` == 91f55411).
+    def _lev_sp_cancel_band() -> list[FFNRule]:
+        out: list[FFNRule] = []
+        for band, output_base in (
+            ("lo", "OUTPUT_LO"), ("hi", "OUTPUT_HI_THIS_STEP"),
+        ):
+            for k in range(16):
+                out.append(multi_way_and_rule(
+                    name=f"l16_lev_sp_cancel_{band}_{k}",
+                    conditions=sp_cancel_conditions,
+                    threshold=31.5,
+                    gate=f"{output_base}+{k}",
+                    gate_weight=-1.0,
+                    writes=((f"{output_base}+{k}", write_scale),),
+                ))
+        return out
+
+    def _lev_pc_cancel_band() -> list[FFNRule]:
+        return [
+            multi_way_and_rule(
+                name=f"l16_lev_pc_cancel_hi_{k}",
+                conditions=pc_cancel_hi_conditions,
+                threshold=1.5,
+                gate=f"OUTPUT_HI_THIS_STEP+{k}",
+                gate_weight=-1.0,
+                writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
+            )
+            for k in range(16)
+        ]
+
+    rules.extend(control_op(
+        "LEV",
+        [
+            _lev_sp_cancel_band,
+            RegisterDeltaSpec(
+                name="l16_lev_sp_bp_plus16",
+                kind="pop_cam",
+                write_scale=write_scale,
+                conditions=sp_value_base_conditions,
+                pop_cam=PopCamDelta(
+                    value_src_lo=_dim_base('memory_lo', 'addr_b0'),
+                    value_src_hi=_dim_base('memory_hi', 'addr_b0'),
+                    value_hi_offset=0,
+                    dst_lo=_dim_base('output_lo', 'nibble'),
+                    dst_hi="OUTPUT_HI_THIS_STEP",
+                    lo_shift=0,
+                    hi_shift=1,
+                    gate_mode="band_cell",
+                    gate_terms=((dim_ref('marker', 'MEM'), -1e6),),
+                    threshold=40.0,
+                ),
             ),
-            pop_cam=PopCamDelta(
-                value_src_lo=_dim_base('temp_scratch', 'general'),
-                value_src_hi=_dim_base('temp_scratch', 'general'),
-                value_hi_offset=16,
-                dst_lo=_dim_base('output_lo', 'nibble'),
-                dst_hi="OUTPUT_HI_THIS_STEP",
-                lo_shift=0,
-                hi_shift=0,
-                gate_mode="const",
-                const_gate="CONST",
-                threshold=3.5,
+            _lev_pc_cancel_band,
+            RegisterDeltaSpec(
+                name="l16_lev_pc_temp",
+                kind="pop_cam",
+                write_scale=write_scale,
+                conditions=(
+                    (dim_ref('opcode_flag', 'LEV'), 1.0),
+                    (dim_ref('marker', 'PC'), 1.0),
+                ),
+                pop_cam=PopCamDelta(
+                    value_src_lo=_dim_base('temp_scratch', 'general'),
+                    value_src_hi=_dim_base('temp_scratch', 'general'),
+                    value_hi_offset=16,
+                    dst_lo=_dim_base('output_lo', 'nibble'),
+                    dst_hi="OUTPUT_HI_THIS_STEP",
+                    lo_shift=0,
+                    hi_shift=0,
+                    gate_mode="const",
+                    const_gate="CONST",
+                    threshold=3.5,
+                ),
             ),
-        ),
+        ],
         instr_width=INSTR_WIDTH,
         pc_offset=PC_OFFSET,
     ).rules_builder())
