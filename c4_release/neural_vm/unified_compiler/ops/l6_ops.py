@@ -392,16 +392,12 @@ def _clear_ffn_unit_band(ffn, start: int, end: int) -> None:
 _FETCH_PC_MARKER_AMP = 40.0
 
 
-def _pc_target_lo_from_index(k: int) -> int:
-    return (k * 8 + 2) & 0xF
-
-
-def _pc_target_hi_from_index(k: int) -> int:
-    return ((k * 8 + 2) >> 4) & 0xF
-
-
-def _pc_target_hi_plus_odd_imm_hi_from_index(k: int) -> int:
-    return (_pc_target_hi_from_index(k) + 8) & 0xF
+# NOTE: the ``_pc_target_{lo,hi}_from_index`` / ``_pc_target_hi_plus_odd_imm_hi``
+# index->byte-address helpers were DELETED in the CONTROL pc_mux flip — the
+# generic ``pc_mux`` engine computes ``imm*INSTR_WIDTH+PC_OFFSET`` internally
+# from the ISA constants. ``_pc_target_byte1_lo_from_imm_hi`` (below) is kept:
+# it is still used by the SEPARATE byte-1 (PC >= 0x100) override, a known wall
+# left untouched.
 
 
 def _jsr_opcode_nibble_conditions(
@@ -427,87 +423,12 @@ def _pc_target_byte1_lo_from_imm_hi(k: int) -> int:
     return (k >> 1) & 0xF
 
 
-def _append_pc_byte0_direct_copy_rules(
-    rules: list[FFNRule],
-    *,
-    name_prefix: str,
-    conditions: tuple[tuple[str, float], ...],
-    threshold: float,
-    lo_source: str,
-    hi_source: str,
-    write_scale: float,
-) -> None:
-    """Copy an already-encoded branch target byte into PC byte 0.
-
-    Compiler branch immediates are PC byte addresses, not instruction indexes.
-    Recomputing ``imm * 8 + PC_OFFSET`` from the low nibble aliases targets
-    whose byte addresses share a low nibble (for example 0x12 and 0x22).
-    """
-
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_target_lo_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"{lo_source}+{k}",
-            writes=((f"OUTPUT_LO+{k}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_target_hi_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"{hi_source}+{k}",
-            writes=((f"OUTPUT_HI_THIS_STEP+{k}", write_scale),),
-        ))
-
-
-def _append_pc_byte0_imm_to_byte_addr_rules(
-    rules: list[FFNRule],
-    *,
-    name_prefix: str,
-    conditions: tuple[tuple[str, float], ...],
-    threshold: float,
-    lo_source: str,
-    write_scale: float,
-) -> None:
-    """Convert an instruction-index immediate into PC byte 0 nibbles.
-
-    BZ/BNZ branch immediates emitted by L5 head 3 into ``FETCH_LO`` carry the
-    raw instruction-index low nibble (e.g. ``BZ 3`` → ``FETCH_LO+3 = 1``),
-    not the encoded PC byte address. The legacy ``vm_step._set_layer4_ffn``
-    BZ/BNZ override (lines 5086-5108) bakes the ``imm * 8 + PC_OFFSET``
-    conversion directly: gate on ``FETCH_LO+k`` (the instruction-index lo
-    nibble) and write into the matching byte-address nibble. This helper
-    mirrors that conversion for the post-L9 ffn block. Because every
-    immediate ``k * 8 + 2`` value has lo nibble ∈ {2, 10} and hi nibble = k>>1,
-    the conversion is exact for instruction indexes 0..15 (target byte
-    addresses up to 0x7A).
-
-    Both OUTPUT_LO (byte 0 low nibble) and OUTPUT_HI_THIS_STEP (byte 0 high
-    nibble) are driven from the same single ``FETCH_LO`` gate per k. The
-    ``hi_source`` parameter is unused for byte 0 because the byte-0 hi
-    nibble is determined entirely by ``k >> 1`` (== ((k*8+2) >> 4) & 0xF).
-    """
-
-    for k in range(16):
-        target_lo = (k * INSTR_WIDTH + PC_OFFSET) & 0xF
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_byteaddr_lo_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"{lo_source}+{k}",
-            writes=((f"OUTPUT_LO+{target_lo}", write_scale),),
-        ))
-    for k in range(16):
-        target_hi = ((k * INSTR_WIDTH + PC_OFFSET) >> 4) & 0xF
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_byteaddr_hi_{k}",
-            conditions=conditions,
-            threshold=threshold,
-            gate=f"{lo_source}+{k}",
-            writes=((f"OUTPUT_HI_THIS_STEP+{target_hi}", write_scale),),
-        ))
+# NOTE: the hand-authored branch-target byte-0 rule builders
+# ``_append_pc_byte0_direct_copy_rules`` (JMP direct-copy) and
+# ``_append_pc_byte0_imm_to_byte_addr_rules`` (BZ/BNZ/JSR imm*8+2 encoder) were
+# DELETED in the CONTROL pc_mux flip — the generic
+# ``isa_semantics_dsl.pc_mux`` engine now derives both encoder modes from the
+# per-op :class:`PcMuxSpec`. See ``_layer6_all_step_jmp_pc_override_rules`` etc.
 
 
 def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
@@ -4564,77 +4485,12 @@ def _ifvar_bz_hi_nibble_enabled() -> bool:
     return _os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
 
 
-def _append_branch_pc_byte0_odd_imm_hi_correction_rules(
-    rules: list[FFNRule],
-    *,
-    name_prefix: str,
-    base_conditions: tuple[tuple[str, float], ...],
-    threshold: float,
-    write_scale: float,
-) -> None:
-    """Add ``+8`` to PC byte-0 HIGH nibble when the FETCH_HI index nibble is ODD.
-
-    Mirrors ``_layer6_all_step_jsr_pc_override_rules``'s odd-imm-hi correction
-    for the BZ/BNZ post-L9 override. ``base_conditions`` are the BZ/BNZ taken
-    conditions (MARK_PC + OP_B(N)Z + CMP gate + IS_BYTE blocker + HAS_SE step-0
-    guard, optionally + MARK_STACK0 blocker). One correction unit per FETCH_LO
-    index-lo nibble ``k`` (0..15): it fires only when the index-lo nibble is
-    ``k`` (``FETCH_LO+k`` condition + the other FETCH_LO lanes blocked) AND an
-    ODD FETCH_HI nibble is present (the gate). On firing it SUBTRACTS the base
-    byte-0 hi write at ``_pc_target_hi_from_index(k)`` and ADDS the corrected
-    one at ``_pc_target_hi_plus_odd_imm_hi_from_index(k)`` (== base + 8).
-    """
-
-    if not _ifvar_bz_hi_nibble_enabled():
-        return
-    # The SwiGLU gate is LINEAR (``gate*gate_weight + Σgate_terms + gate_bias``),
-    # NOT clamped -- so a NEGATIVE gate value would write garbage on every row
-    # whose AND-``conditions`` fire (the BZ-taken row IS one). The AND must
-    # therefore be encoded ENTIRELY in the additive ``conditions`` (the SiLU
-    # term), and the multiplicative gate must stay >= 0 (here ``FETCH_LO+k``,
-    # value 0 or ~_FETCH_PC_MARKER_AMP).
-    #
-    # FETCH_LO / FETCH_HI are one-hot at ~_FETCH_PC_MARKER_AMP on the PC marker
-    # row, so each FETCH condition uses weight ``1/AMP`` to contribute ~1.0 per
-    # active lane. The correction fires iff: BZ/BNZ taken (base_conditions) AND
-    # index-lo nibble == k (``FETCH_LO+k``) AND an ODD index-hi nibble is present
-    # (``odd_imm_hi_require`` with EVEN lanes blocked). FETCH_LO+k +
-    # odd-FETCH_HI add ~+2.0 to the AND on EVERY PC-marker row that has them, so
-    # the threshold is bumped by +2.0 to preserve the EXACT base BZ-vs-non-BZ
-    # firing margin (base BZ-taken sum ~14.25 vs IMM/LEA ~10.95 at threshold
-    # 13.5 -> +2.0 keeps the 0.75/2.55 margins). The even-but-nonzero index-hi
-    # carry (-> byte 1) is handled by the byte-1 override's imm>>5 path.
-    fetch_norm = 1.0 / _FETCH_PC_MARKER_AMP
-    odd_imm_hi_require = tuple(
-        (f"FETCH_HI+{j}", fetch_norm)
-        for j in range(1, 16, 2)
-    )
-    even_imm_hi_blockers = tuple(
-        (f"FETCH_HI+{j}", -10.0 * fetch_norm)
-        for j in range(0, 16, 2)
-    )
-    # +2.0 absorbs the FETCH_LO+k (~1.0) + odd-FETCH_HI (~1.0) additions so the
-    # BZ-vs-non-BZ AND margin is identical to the base rule.
-    corrected_threshold = threshold + 2.0
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"{name_prefix}_target_hi_odd_imm_hi_correction_{k}",
-            conditions=base_conditions
-            + ((f"FETCH_LO+{k}", fetch_norm),)
-            + odd_imm_hi_require
-            + even_imm_hi_blockers,
-            threshold=corrected_threshold,
-            gate=f"FETCH_LO+{k}",
-            writes=(
-                (f"OUTPUT_HI_THIS_STEP+{_pc_target_hi_from_index(k)}",
-                 -write_scale),
-                (
-                    f"OUTPUT_HI_THIS_STEP+"
-                    f"{_pc_target_hi_plus_odd_imm_hi_from_index(k)}",
-                    write_scale,
-                ),
-            ),
-        ))
+# NOTE: the hand-authored ``_append_branch_pc_byte0_odd_imm_hi_correction_rules``
+# (the BZ/BNZ byte-0 HIGH-nibble +INSTR_WIDTH odd-index-hi correction) was DELETED
+# in the CONTROL pc_mux flip. The generic ``pc_mux`` engine's "branch"-flavor
+# ``odd_hi_correction`` derives it from the per-op :class:`PcMuxSpec`, gated by
+# ``_ifvar_bz_hi_nibble_enabled()`` at the call site (flag-OFF -> no correction,
+# golden byte-identical).
 
 
 def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
