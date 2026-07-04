@@ -134,9 +134,11 @@ Run these BEFORE committing any new op or rule change:
 
 - **`tools/_isa_golden_hash.py` — the authoritative flag-OFF byte-identity
   gate.** The current golden (default build) is `state_dict_sha256 =
-  81557d21422f3eada0a87c677b00dced41cc26c3ee3bfb094c5eeb71c9b4d3cb`
-  (short `81557d21`) after the STACK0-b0 dead-dump-machinery deletion
-  (2026-07; verdict-neutral geometry cut, was `b4d2ab27`). Any
+  91f5541100d9a9ec7081105a6bde83f9de5c65cc62317a62bf108bdc93aa56c1`
+  (short `91f55411`) after the enumerated→computed byte-writeback collapse
+  (2026-07; 4 `C4_STACK0_*_COMPUTED` flags now DEFAULT-ON, −891 FFN units,
+  verdict-neutral — kill-switch `=0` reproduces `81557d21`, which itself
+  followed the STACK0-b0 dump deletion from `b4d2ab27`). Any
   docs/analysis change must leave this unchanged; any weight-affecting
   change must intend the hash it produces. Use `81557d21` for all future
   flag-OFF byte-identity checks (historical `b4d2ab27` builds predate the
