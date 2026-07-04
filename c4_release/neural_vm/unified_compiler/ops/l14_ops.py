@@ -130,33 +130,40 @@ def _l14_byte_computed_enabled() -> bool:
 
     Apply the M8 enumerated->computed collapse (proven in L10's
     ``byte_copy_computed_rules`` / ``_computed_byte_writeback_route_rules``) to
-    the ``_layer14_addr_key_neural_decode`` load-query lo+hi bank: the two
-    16x16 = 256-way ENUMERATED per-(lo,hi) AND banks (one per LI/LC op gate)
-    that copy the AX-marker address nibbles ``ADDR_B0_LO/HI`` straight into
-    ``ADDR_KEY[0..15] / ADDR_KEY[16..31]`` (``byte_off == 0`` -> a PURE
-    per-nibble copy, ``new_lo == lo`` / ``new_hi == hi``) collapse to a 2x16 =
-    32-way per-NIBBLE COMPUTED route each.  512 -> 64 units (-448).
+    the ``_layer14_addr_key_neural_decode`` PURE per-nibble copy banks — every
+    ``byte_off == 0`` 16x16 = 256-way ENUMERATED per-(lo,hi) AND bank that
+    copies the address nibbles ``ADDR_B0_LO/HI`` straight into
+    ``ADDR_KEY[0..15] / ADDR_KEY[16..31]`` (``new_lo == lo`` /
+    ``new_hi == hi``) collapses to a 2x16 = 32-way per-NIBBLE COMPUTED route:
+
+      * substage-1 lo+hi ``MEM_VAL_B1`` gate (``byte_off==0``): 256 -> 32
+        (-224).
+      * load-query lo+hi, both LI/LC op_gates (``byte_off==0``): 512 -> 64
+        (-448).
+
+    Total -672 units (1728 -> 1056).
 
     Each route unit for dest channel ``k`` fires on the shared structural gate
-    (``op_gate + MARK_AX``) AND its own source nibble one-hot (``ADDR_B0_*+k``,
-    weight 1.0) AND the SUM of the OTHER source band's 16 one-hot terms (weight
-    1.0 each; exactly one is on for a valid address byte).  That reconstructs
-    the SAME 2-channel evidence magnitude / ``threshold=3.5`` the enumerated
-    per-(lo,hi) AND used, so the route fires on exactly the same production
-    contexts, then ADDITIVELY writes ``+2/S`` into ``ADDR_KEY+k`` (resp.
-    ``+16+k``) — matching the enumerated bank's positive-only CAM-key write
-    (L15 keys per-nibble equality-match on ADDR_KEY, so there is NO argmax
+    (``op_gate + MARK_AX`` for load-query; ``MEM_VAL_B1 + MARK_MEM``-block for
+    substage 1) AND its own source nibble one-hot (``ADDR_B0_*+k``, weight 1.0)
+    AND the SUM of the OTHER source band's 16 one-hot terms (weight 1.0 each;
+    exactly one is on for a valid address byte).  That reconstructs the SAME
+    2-channel evidence magnitude / ``threshold`` (3.5 load-query, 2.5 substage
+    1) the enumerated per-(lo,hi) AND used, so the route fires on exactly the
+    same production contexts, then ADDITIVELY writes ``+2/S`` into ``ADDR_KEY+k``
+    (resp. ``+16+k``) — matching the enumerated bank's positive-only CAM-key
+    write (L15 keys per-nibble equality-match on ADDR_KEY, so there is NO argmax
     suppression to reproduce; ``additive=True``).
 
-    Only the ``byte_off == 0`` load-query bank is a pure per-nibble copy: the
-    ``value_gates`` lo+hi bank (substage 1) does a ``+byte_off`` add whose HI
+    Only the ``byte_off == 0`` banks are pure per-nibble copies: the substage-1
+    ``value_gates`` for ``byte_off`` in {1,2,3} do a ``+byte_off`` add whose HI
     nibble depends on the LO->HI carry (NOT per-nibble separable) and the
     common-/carry-top banks (substages 2/3) are single-nibble/carry-correction
     forms, so those are left enumerated.
 
-    BYTE-IDENTITY-BREAKING when ON (the L14 FFN hidden_dim shrinks 512 -> 64 at
-    this op AND the ADDR_KEY firing/write is recomputed) -> verdict-validated,
-    NOT default-flipped.  Flag OFF -> byte-identical to golden ``91f55411``.
+    BYTE-IDENTITY-BREAKING when ON (the L14 FFN hidden_dim shrinks -672 at this
+    op AND the ADDR_KEY firing/write is recomputed) -> verdict-validated, NOT
+    default-flipped.  Flag OFF -> byte-identical to golden ``91f55411``.
     """
     return _os.environ.get("C4_L14_BYTE_COMPUTED", "0") != "0"
 
@@ -167,17 +174,25 @@ def _addr_key_neural_decode_unit_count() -> int:
     OFF (golden): 1024 lo+hi + 64 common-top + 96 carry-top + 544 load-query
     (2 x (256 lo+hi + 16 top)) = 1728.
 
-    ON (``C4_L14_BYTE_COMPUTED``): the load-query lo+hi ENUMERATED banks (2 x
-    256) collapse to 2 x 32 COMPUTED per-nibble routes, so the load-query block
-    becomes 2 x (32 + 16) = 96 -> total 1024 + 64 + 96 + 96 = 1280 (-448).
+    ON (``C4_L14_BYTE_COMPUTED``): two ENUMERATED->COMPUTED collapses of the
+    PURE per-nibble copy banks (``byte_off == 0`` -> ``new_lo == lo`` /
+    ``new_hi == hi``):
+
+      * substage 1 lo+hi, the ``MEM_VAL_B1`` (``byte_off==0``) gate: 256 -> 32
+        (-224).  The other three value_gates (``byte_off`` in {1,2,3}) carry a
+        lo->hi ADD carry and stay ENUMERATED: 1024 -> 800.
+      * load-query lo+hi, both op_gates (``byte_off==0`` load query): 2 x 256
+        -> 2 x 32 (-448).  The load-query block becomes 2 x (32 + 16) = 96.
+
+    Total 800 + 64 + 96 + 96 = 1056 (-672).
 
     Threaded into ``_L14_CLEANUP_CHAIN_LAYOUT`` so the pinned successor ops
-    (jsr/lc/ent/alu ax-bytes-zero) shift DOWN by 448 when ON and the total L14
+    (jsr/lc/ent/alu ax-bytes-zero) shift DOWN by 672 when ON and the total L14
     FFN hidden_dim actually shrinks (a REAL -FFN-unit reduction, not dead
     slots), exactly as ``layer14_sub_noborrow_high_byte_passthrough`` sizes its
     entry on ``operand_from_memsp_enabled()``.
     """
-    return 1280 if _l14_byte_computed_enabled() else 1728
+    return 1056 if _l14_byte_computed_enabled() else 1728
 
 
 # === L14 attention-head layout (pinned indices) =====================
@@ -289,9 +304,10 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # before addr_key_neural_decode (14.5). See
     # ``make_layer14_jsr_mem_default_suppress_op``.
     "layer14_jsr_mem_default_suppress":      (None,    4),
-    # 1728 (golden) or 1280 when C4_L14_BYTE_COMPUTED collapses the load-query
-    # lo+hi ENUMERATED banks (512 -> 64). Sizing the entry on the flag shifts
-    # the pinned successors DOWN by 448 so the L14 FFN hidden_dim actually
+    # 1728 (golden) or 1056 when C4_L14_BYTE_COMPUTED collapses the two PURE
+    # per-nibble copy banks (substage-1 byte_off==0 lo+hi 256->32 AND load-query
+    # lo+hi 512->64; total 672 fewer units). Sizing the entry on the flag shifts
+    # the pinned successors DOWN by 672 so the L14 FFN hidden_dim actually
     # shrinks (a REAL -FFN reduction, not dead slots). Flag OFF -> 1728 ->
     # golden byte-identical. See _addr_key_neural_decode_unit_count.
     "layer14_addr_key_neural_decode":        (None, _addr_key_neural_decode_unit_count()),
@@ -4826,13 +4842,17 @@ def make_layer14_lc_ax_bytes_zero_op() -> Operation:
 # imperative helper one-for-one; ``compare_symbolic_to_lowered_ffn`` validates
 # each substage byte-identically against the lowering contract.
 #
-# Substage layout (1728 units total):
+# Substage layout (1728 units OFF / 1056 units ON via C4_L14_BYTE_COMPUTED):
 #   (1) lo+hi nibble decode     : 4 value_gates x 16 hi x 16 lo  = 1024 units
+#                                 ON: the byte_off==0 gate (MEM_VAL_B1) 256->32
+#                                 COMPUTED route -> 800 units.
 #   (2) common top nibble       : 4 value_gates x 16 b1_lo       =   64 units
 #   (3) carry-correction top    : 4 value_gates x carry_los x 16 =   96 units
 #   (4) load-query decode       : 2 op_gates x (256 lo+hi + 16   =  544 units
 #                                 top), interleaved per op to
-#                                 preserve the legacy unit indices
+#                                 preserve the legacy unit indices.
+#                                 ON: each op's 256 lo+hi -> 32 COMPUTED
+#                                 route -> 2 x (32 + 16) = 96 units.
 #
 # Value-byte gating mirrors the imperative ``value_gates`` table: bytes
 # 0/1/2 are selected by ``MEM_VAL_B1/B2/B3`` (the L2 autoregressive flags;
@@ -4961,9 +4981,56 @@ def _layer14_addr_key_neural_decode_lo_hi_rules(
             ffn.W_gate[unit, blocker_dim]   = -1.0       # H2+4 blocker for byte 3
         ffn.W_down[ADDR_KEY + new_lo, unit]      = 2.0 / S
         ffn.W_down[ADDR_KEY + 16 + new_hi, unit] = 2.0 / S
+
+    M8 COLLAPSE (``C4_L14_BYTE_COMPUTED``): only the ``byte_off == 0`` gate
+    (``MEM_VAL_B1``) is a PURE per-nibble copy (``new_lo == lo``,
+    ``new_hi == hi``) -> its 256-way ENUMERATED per-(lo,hi) AND bank collapses
+    to a 2 x 16 = 32-way per-nibble COMPUTED route (``byte_copy_computed_rules``,
+    ``additive`` ADDR_KEY write, ``dst_hi_offset=16``), a -224 reduction.  The
+    ``byte_off`` in {1,2,3} gates carry a lo->hi ADD carry (``new_hi`` depends
+    on ``lo``), so they are NOT per-nibble separable and stay ENUMERATED.
     """
+    computed = _l14_byte_computed_enabled()
     rules: list[FFNRule] = []
     for gate_dim_name, blocker_dim_name, byte_off in _ADDR_KEY_VALUE_GATES:
+        if computed and byte_off == 0:
+            # --- COMPUTED lo+hi route (32, was 256) for the byte_off==0 gate.
+            # byte_off == 0 -> new_lo == lo, new_hi == hi: a PURE per-nibble
+            # copy ADDR_B0_LO/HI -> ADDR_KEY[0..15] / [16..31].  Each dest
+            # channel-k unit fires on (gate + MARK_MEM-block) AND its own source
+            # nibble AND the SUM of the other source band's one-hot (weight 1
+            # each; one is on for a valid byte) -> SAME 2-channel evidence /
+            # threshold=2.5 the enumerated per-(lo,hi) AND used.  ADDITIVE +2/S
+            # write into ADDR_KEY (positive-only CAM key; L15 keys a per-nibble
+            # equality-match, no argmax suppression to reproduce).  The
+            # byte_off==0 gate (MEM_VAL_B1) has blocker_dim_name is None, so no
+            # W_gate blocker to thread -> a plain constant_write AND, matching
+            # the enumerated form exactly.
+            rules.extend(byte_copy_computed_rules(
+                src_lo="ADDR_B0_LO",
+                src_hi="ADDR_B0_HI",
+                dst_lo="ADDR_KEY",
+                dst_hi="ADDR_KEY",
+                dst_hi_offset=16,
+                base_conditions=(
+                    (gate_dim_name, 1.0),
+                    # Hard MARK_MEM blocker: at MEM marker rows ADDR_B0_LO/HI
+                    # carry the *address* byte (aliased with OPCODE_BYTE_LO/HI),
+                    # so the dispatch atom would read garbage. Byte-identical at
+                    # intended firing positions (MARK_MEM == 0).
+                    # dim_alias_verifier HARD_BLOCKER_THRESHOLD = 1e6.
+                    ("MARK_MEM", -1e6),
+                ),
+                threshold=2.5,
+                strength=2.0 / S,
+                additive=True,
+                name_for=(
+                    lambda dst_band, ch, _off=byte_off: (
+                        f"l14_addr_key_lohi_route_off{_off}_{dst_band}_{ch}"
+                    )
+                ),
+            ))
+            continue
         for hi in range(16):
             for lo in range(16):
                 byte_addr = ((hi << 4) | lo) + byte_off
