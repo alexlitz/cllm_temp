@@ -2165,3 +2165,300 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
         head_reads=head_reads,
         head_writes=head_writes,
     )
+
+
+# ===========================================================================
+# DECODE — the ISA opcode table -> OP_<NAME> marker, derived GENERICALLY
+# ===========================================================================
+#
+# The DECODE family (docs/semantic_spec_DECODE.md) is the decisive
+# "opcode is a pure lookup" result: the L5 opcode-decode FFN sets each
+# ``OP_<NAME>`` marker by a two-nibble one-hot AND on the fetched opcode byte,
+# and EVERY per-opcode field except ``(opcode_byte, NAME)`` is a per-CONTEXT
+# constant. :func:`decode_band` DERIVES the entire ordered decode-FFN rule
+# tuple from:
+#
+#   * the ISA ``Opcode`` table (the sole source of ``(byte, NAME)``), and
+#   * a small tuple of :class:`DecodeContext` band descriptors (the 3 marker
+#     contexts + the scratch-clear band + the reserved blank), each carrying
+#     the CONSTANT gate/threshold/HAS_SE/subset data the docs' gap-list G2/G7
+#     say the engine must be TOLD (it cannot infer the first-step-vs-all-step
+#     asymmetry from the ISA table alone).
+#
+# There is ZERO per-opcode branch in the lowering: ``lo = byte & 0xF`` and
+# ``hi = (byte >> 4) & 0xF`` are computed from the scalar opcode value, and the
+# single genuine per-(opcode, context) quirk — JSR writes the ``TEMP+0`` IS_JSR
+# scratch flag instead of ``OP_JSR`` at the PC contexts (gap-list G3) — is
+# expressed as ONE optional ``write_override`` DATA cell on the context, not a
+# code path. This is the STEP-3 generic engine + STEP-4 100%-derivation proof
+# for DECODE: :func:`decode_band` reproduces ``_opcode_decode_ffn_rules``
+# byte-for-byte (flag-gated, golden-hash-held).
+
+
+@dataclass(frozen=True)
+class DecodeContext:
+    """One marker-context band of the opcode-decode FFN (a docs G2 band).
+
+    A context re-decodes a SUBSET of the ISA opcodes at ONE marker context
+    (AX, first-step-PC, all-step-PC, ...). Every field is a per-context
+    CONSTANT — the varying per-row data (``byte``, ``NAME``) comes from the
+    ISA table alone. The lowering loops over ``opcodes`` (or the full table
+    when ``opcodes is None``) and emits one ``multi_way_and_rule`` per opcode
+    with ``lo = byte & 0xF`` / ``hi = (byte >> 4) & 0xF`` — no per-opcode
+    branch.
+
+    Attributes:
+        name: context tag (diagnostic / rule-name prefix component).
+        rule_name_fn: ``(op_name, out_dim) -> str`` producing the legacy
+            rule name for a row (``op_name`` is the full ``"OP_<NAME>"`` slot
+            string; kept identical for a clean diff — the lowered WEIGHTS do
+            not depend on the name).
+        extra_conditions: the CONSTANT AND conditions folded into EVERY row
+            beyond the two opcode nibbles (e.g. ``(("MARK_PC", 1.0),
+            ("HAS_SE", -1.0))`` for first-step-PC). ``()`` for the pure
+            AX-marker main band.
+        threshold: the AND threshold (docs G7: 1.5 for the 2-cond AX band,
+            2.5 for the 3/4-cond PC bands).
+        gate: optional multiplicative gate dim (the main band's
+            ``dim_ref("marker","AX")``). ``None`` for the PC bands (they fold
+            ``MARK_PC`` into ``extra_conditions`` instead).
+        write_scale: the marker write magnitude (docs G7: ``10.0 / S``,
+            supplied by the caller already divided).
+        opcodes: the opcode-value SUBSET this context re-decodes, in emit
+            order. ``None`` => the FULL ISA table (the main-at-AX band).
+        write_override: optional ``{opcode_value: out_dim_name}`` — the ONE
+            per-(opcode, context) quirk (JSR @ PC -> ``TEMP+0``, docs G3).
+            An opcode absent from the map writes its uniform
+            ``dim_ref("opcode_flag", NAME)`` marker.
+        enabled: zero-arg predicate gating the WHOLE context (the Root-B
+            all-step-JSR band is flag-gated ``C4_NESTED_JSR_PC_FIX``). ``None``
+            => always present.
+    """
+
+    name: str
+    rule_name_fn: Callable[[str, str], str]
+    threshold: float
+    write_scale: float
+    extra_conditions: Tuple[Tuple[str, float], ...] = ()
+    gate: Optional[str] = None
+    opcodes: Optional[Tuple[int, ...]] = None
+    write_override: Optional[Dict[int, str]] = None
+    enabled: Optional[Callable[[], bool]] = None
+
+
+@dataclass(frozen=True)
+class ScratchClearBand:
+    """The TEMP[1..31]-clear hygiene band (docs G4 — NOT decode).
+
+    A separate generic primitive: per scratch slot ``k in range(lo..hi)`` emit
+    a ``multi_way_and_rule`` gated on ``{slot_band}+{k}`` (weight -1) that
+    clears the slot at ``marker_cond``. Opcode-independent — it shares the
+    decode FFN block (unit-order load-bearing, docs G5) but carries no opcode
+    data. Reserved slot 0 (JSR's IS_JSR flag) is skipped by starting at
+    ``lo``.
+    """
+
+    name: str
+    slot_band: str
+    lo: int
+    hi: int
+    marker_cond: Tuple[str, float]
+    threshold: float
+    write_scale: float
+    gate_weight: float = -1.0
+    rule_name_fn: Optional[Callable[[int], str]] = None
+
+
+@dataclass(frozen=True)
+class BlankUnit:
+    """A reserved-blank hidden unit (docs G5 unit-ordering constraint).
+
+    Emits ONE no-op ``FFNRule`` (all-zero lowering) so the reserved unit-52
+    JSR ``TEMP[0]`` slot keeps the legacy numbering. Not decode; a layout
+    placeholder the engine threads through the ordered rule tuple.
+    """
+
+    name: str
+
+
+@dataclass(frozen=True)
+class DecodeSpec:
+    """Declarative description of a full opcode-decode FFN block.
+
+    The ordered ``bands`` tuple reproduces the exact unit layout
+    (``_FETCH_FFN_UNIT_LAYOUT``): main-at-AX, first-step-PC, the reserved
+    blank, the scratch-clear band, all-step-PC, and the flag-gated
+    all-step-JSR. :func:`decode_band` lowers the whole tuple to a single
+    ordered ``FFNRule`` sequence with ZERO per-opcode branch.
+
+    Attributes:
+        name: decode-block family name (diagnostic).
+        opcode_table: the ISA table as ``((opcode_value, NAME), ...)`` in the
+            main-band emit order. The SOLE source of ``(byte, NAME)``; every
+            context's rows derive their nibbles from these values.
+        bands: the ordered tuple of context / scratch / blank bands.
+        nibble_lo_band / nibble_hi_band: the fetched-opcode nibble one-hot
+            band names the AND conditions read (``OPCODE_BYTE_LO`` /
+            ``OPCODE_BYTE_HI``).
+        opcode_flag_ref: ``NAME -> out_dim_str`` — the ``(opcode_flag, NAME)``
+            semantic-role resolver (``dim_ref("opcode_flag", NAME)``), injected
+            so the DSL stays free of the ``dim_registry`` import.
+    """
+
+    name: str
+    opcode_table: Tuple[Tuple[int, str], ...]
+    bands: Tuple[object, ...]
+    opcode_flag_ref: Callable[[str], str]
+    nibble_lo_band: str = "OPCODE_BYTE_LO"
+    nibble_hi_band: str = "OPCODE_BYTE_HI"
+
+
+@dataclass(frozen=True)
+class DecodeBundle:
+    """The artifacts :func:`decode_band` generates for one decode FFN.
+
+    Attributes:
+        spec: the originating :class:`DecodeSpec`.
+        rules_builder: ``() -> tuple[FFNRule, ...]`` — the full ordered
+            decode-FFN rule sequence, DERIVED from the ISA table + band data
+            with zero per-opcode branch. Re-evaluates ``DecodeContext.enabled``
+            each call so a flag-gated band (all-step-JSR) tracks its flag.
+        reads / writes: the decode FFN's Operation dep-graph dim sets, derived
+            structurally from the bands.
+    """
+
+    spec: DecodeSpec
+    rules_builder: Callable[[], Tuple[FFNRule, ...]]
+    reads: Set[str]
+    writes: Set[str]
+
+
+def _decode_context_rules(
+    ctx: "DecodeContext",
+    spec: DecodeSpec,
+) -> Tuple[FFNRule, ...]:
+    """Lower ONE :class:`DecodeContext` — the generic per-opcode loop.
+
+    For each opcode value in the context's subset (or the full table): compute
+    ``lo = byte & 0xF`` / ``hi = (byte >> 4) & 0xF``, AND the two nibble
+    one-hots with the context's constant ``extra_conditions``, and write the
+    opcode's marker (or the per-(opcode, context) ``write_override``). This is
+    the ONLY place opcode rows are produced, and it has NO per-opcode branch.
+    """
+    if ctx.enabled is not None and not ctx.enabled():
+        return ()
+    name_by_val = dict(spec.opcode_table)
+    if ctx.opcodes is None:
+        vals = tuple(v for (v, _n) in spec.opcode_table)
+    else:
+        vals = ctx.opcodes
+    override = ctx.write_override or {}
+    rules: list[FFNRule] = []
+    for op_val in vals:
+        lo = op_val & 0xF
+        hi = (op_val >> 4) & 0xF
+        name = name_by_val[op_val]
+        out_dim = override.get(op_val, spec.opcode_flag_ref(name[3:]))
+        conditions = (
+            (f"{spec.nibble_lo_band}+{lo}", 1.0),
+            (f"{spec.nibble_hi_band}+{hi}", 1.0),
+        ) + tuple(ctx.extra_conditions)
+        rules.append(multi_way_and_rule(
+            name=ctx.rule_name_fn(name, out_dim),
+            conditions=conditions,
+            threshold=ctx.threshold,
+            gate=ctx.gate,
+            writes=((out_dim, ctx.write_scale),),
+        ))
+    return tuple(rules)
+
+
+def _scratch_clear_rules(band: "ScratchClearBand") -> Tuple[FFNRule, ...]:
+    """Lower the TEMP-clear hygiene band (docs G4) — opcode-independent."""
+    rules: list[FFNRule] = []
+    for k in range(band.lo, band.hi + 1):
+        name = (
+            band.rule_name_fn(k) if band.rule_name_fn is not None
+            else f"{band.name}_{k}"
+        )
+        rules.append(multi_way_and_rule(
+            name=name,
+            conditions=(band.marker_cond,),
+            threshold=band.threshold,
+            gate=f"{band.slot_band}+{k}",
+            gate_weight=band.gate_weight,
+            writes=((f"{band.slot_band}+{k}", band.write_scale),),
+        ))
+    return tuple(rules)
+
+
+def decode_band(spec: DecodeSpec) -> DecodeBundle:
+    """Generate the full opcode-decode FFN rule sequence for ``spec``.
+
+    The ``rules_builder`` derives every OP-marker rule from the ISA opcode
+    table (``lo = byte & 0xF``, ``hi = (byte >> 4) & 0xF``) plus the constant
+    per-context band data — ZERO per-opcode branches. Reproduces the
+    hand-authored ``_opcode_decode_ffn_rules`` byte-for-byte when fed the
+    matching ``DecodeSpec`` (proof: ``tools/_isa_golden_hash.py`` unchanged
+    under the flag-ON derived build). Registers no residual band (decode
+    writes into existing OP_* / TEMP dims).
+    """
+
+    def rules_builder() -> Tuple[FFNRule, ...]:
+        out: list[FFNRule] = []
+        for band in spec.bands:
+            if isinstance(band, DecodeContext):
+                out.extend(_decode_context_rules(band, spec))
+            elif isinstance(band, ScratchClearBand):
+                out.extend(_scratch_clear_rules(band))
+            elif isinstance(band, BlankUnit):
+                out.append(FFNRule(
+                    conditions=(),
+                    threshold=0.0,
+                    writes=(),
+                    gate=None,
+                    gate_bias=0.0,
+                    name=band.name,
+                ))
+            else:  # pragma: no cover - guarded by the spec authoring
+                raise TypeError(
+                    f"decode_band({spec.name!r}): unknown band type "
+                    f"{type(band).__name__}"
+                )
+        return tuple(out)
+
+    # Structural dep-graph derivation: reads = the nibble bands + every
+    # context's extra-condition dims + gate + scratch marker/slot bands;
+    # writes = every marker the contexts emit + the scratch slots.
+    reads: Set[str] = set()
+    writes: Set[str] = set()
+    name_by_val = dict(spec.opcode_table)
+    for band in spec.bands:
+        if isinstance(band, DecodeContext):
+            reads.add(spec.nibble_lo_band)
+            reads.add(spec.nibble_hi_band)
+            for (dim, _w) in band.extra_conditions:
+                reads.add(dim.split("+", 1)[0])
+            if band.gate is not None:
+                reads.add(band.gate.split("+", 1)[0])
+            vals = (
+                tuple(v for (v, _n) in spec.opcode_table)
+                if band.opcodes is None else band.opcodes
+            )
+            override = band.write_override or {}
+            for op_val in vals:
+                out_dim = override.get(
+                    op_val, spec.opcode_flag_ref(name_by_val[op_val][3:])
+                )
+                writes.add(out_dim.split("+", 1)[0])
+        elif isinstance(band, ScratchClearBand):
+            reads.add(band.marker_cond[0].split("+", 1)[0])
+            reads.add(band.slot_band)
+            writes.add(band.slot_band)
+
+    return DecodeBundle(
+        spec=spec,
+        rules_builder=rules_builder,
+        reads=reads,
+        writes=writes,
+    )
