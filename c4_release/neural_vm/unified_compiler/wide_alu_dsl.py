@@ -37,7 +37,7 @@ bit-for-bit on randomized input (see Section 4 of the design doc and
 from __future__ import annotations
 
 import operator
-from typing import Callable, Literal, Tuple
+from typing import Callable, Literal, Sequence, Tuple
 
 from .building_blocks_dsl import multi_way_and_rule
 from .ir import FFNRule
@@ -1645,6 +1645,366 @@ def wide_ge_sub_rules(
     return tuple(rules)
 
 
+# ---------------------------------------------------------------------------
+# GAP-PRIMITIVE #2 (docs/DSL_W5_MULDIV_LIMIT.md Path 1): multi-pass MUL.
+#
+# ``wide_mul_rules(width_bytes=2)`` above is a FLAT 65,536-rule cross-product
+# lookup — it only exists because 8-bit x 8-bit is small enough to enumerate.
+# It does NOT generalize: width_bytes=3 is 16.8M rules, width_bytes=4 is 4.3B.
+#
+# ``multi_pass_mul_rules`` derives the SAME 16-bit product from a COMPACT
+# SCHOOLBOOK spec (per-partial-product accumulate with column carry) staged
+# across FFN passes via the ``MultiPassOp`` IR. The cross-pass carry chain
+# (a column's carry-out feeds the next column's pass) is exactly what a
+# single-forward FFN lookup cannot express. Rule count is O(width^2 * 256)
+# — TRACTABLE at every width (no cross-product explosion): width-2 is
+# ~2.8k rules vs the flat lookup's 65,536.
+# ---------------------------------------------------------------------------
+
+
+# AMPLITUDE-NORMALIZED cascade convention (GAP-PRIMITIVE #2).
+#
+# A multi-pass cascade needs a FIXED POINT: every pass must CONSUME one-hots
+# at a fixed residual amplitude and PRODUCE one-hots at the SAME amplitude,
+# or the SwiGLU magnitude explodes pass-over-pass (silu(up) ~= up scales with
+# the input, so weight-30 reads of a residual-30 workspace one-hot run away).
+#
+# Convention: read EVERY one-hot (marker + operands, all residual == 1.0) at
+# weight 1.0. A k-way AND with threshold ``k - 0.5`` gives
+# ``up = S * (k - (k-0.5)) = S * 0.5 = 50`` when all k fire, and
+# ``up = S * (k-1 - (k-0.5)) = -S*0.5`` when one is missing (silu ~= 0). The
+# gate (opcode) contributes 1.0, so ``output = silu(50) * 1.0 * W_down``.
+# Writing at ``W_down = 1.0 / 50`` pins EVERY fired one-hot back to residual
+# 1.0 — the stable fixed point (verified: all-on -> 1.0, miss-one -> 0.0).
+_MP_UP_AT_FIRE = 50.0  # = S * 0.5 with threshold k-0.5 (S=100)
+
+
+def _mp_write_scale(S: float, target_amplitude: float = 1.0) -> float:
+    """Write W_down that pins a fired one-hot to ``target_amplitude``."""
+    # up_at_fire = S * 0.5; output = up_at_fire * W_down (gate=1). Solve for
+    # W_down. Independent of S beyond the 0.5 margin (S cancels).
+    return target_amplitude / (S * 0.5)
+
+
+def _normalized_and_rule(
+    *,
+    name: str,
+    conditions: Sequence[Tuple[str, float]],
+    writes: Sequence[str],
+    opcode_gate: str,
+    S: float,
+    target_amplitude: float = 1.0,
+) -> FFNRule:
+    """A k-way AND in the amplitude-normalized cascade convention.
+
+    ``conditions`` is a list of one-hot dim names (each read at weight 1.0,
+    each at incoming residual == ``target_amplitude``). Threshold is
+    ``k - 0.5`` so the AND fires iff ALL k are hot; the write pins each
+    output back to ``target_amplitude``.
+    """
+    k = len(conditions)
+    cond_terms = tuple((c, 1.0) for c in conditions)
+    ws = _mp_write_scale(S, target_amplitude)
+    return multi_way_and_rule(
+        name=name,
+        conditions=cond_terms,
+        threshold=float(k) - 0.5,
+        gate=opcode_gate,
+        writes=tuple((dim, ws) for dim in writes),
+    )
+
+
+def _nibble_lookup_pass_rules(
+    *,
+    name: str,
+    x_lane: Tuple[str, int],
+    y_lane: Tuple[str, int],
+    f,
+    writes_fn,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    x_lanes: int = 16,
+    y_lanes: int = 16,
+    target_amplitude: float = 1.0,
+) -> Tuple[FFNRule, ...]:
+    """One pass = a 2-input nibble VALUE lookup over one-hot workspace lanes.
+
+    For every ``(x, y)`` in ``0..x_lanes-1 x 0..y_lanes-1`` emit ONE rule
+    that fires iff ``marker`` AND ``x_lane[x]`` AND ``y_lane[y]`` are hot
+    (each residual == ``target_amplitude``, an input one-hot OR a workspace
+    one-hot written by a PRIOR pass — verified identical amplitude under
+    the normalized convention), gated by ``opcode_gate``. The rule writes
+    the one-hot(s) ``writes_fn(f(x, y))`` back at ``target_amplitude``, so
+    the NEXT pass reads them at the SAME fixed amplitude — the cascade
+    fixed point.
+
+    ``x_lane`` / ``y_lane`` are ``(base_name, start_offset)`` tuples; the
+    cell for nibble ``k`` is the SINGLE-offset dim ``"base+(start+k)"``
+    (never a nested ``base+start+k``). This is the atom of the multi-pass
+    cascade: the partial-product pass and every pairwise-add column pass
+    are instances of it. ``f`` is the BUILD-TIME arithmetic (the compact
+    spec); ``writes_fn`` maps its result to workspace/result lanes.
+    """
+    def cell(lane, nib):
+        return f"{lane[0]}+{lane[1] + nib}"
+
+    rules: list[FFNRule] = []
+    for x in range(x_lanes):
+        for y in range(y_lanes):
+            res = f(x, y)
+            rules.append(_normalized_and_rule(
+                name=f"{name}_x{x:x}_y{y:x}",
+                conditions=(marker_gate, cell(x_lane, x), cell(y_lane, y)),
+                writes=tuple(writes_fn(res)),
+                opcode_gate=opcode_gate,
+                S=S,
+                target_amplitude=target_amplitude,
+            ))
+    return tuple(rules)
+
+
+def multi_pass_mul_rules(
+    *,
+    operand_a_base: str,
+    operand_b_base: str,
+    result_base: str,
+    workspace_base: str,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    width_bytes: int = 2,
+):
+    """Derive wide MUL from a COMPACT schoolbook spec as a MultiPassOp.
+
+    GAP-PRIMITIVE #2 pilot. Returns a
+    :class:`~c4_release.neural_vm.unified_compiler.ir.MultiPassOp` whose
+    staged passes compute ``(A * B) & 0xFFFF`` for 8-bit x 8-bit operands
+    (``width_bytes=2``) via schoolbook partial-product accumulation with a
+    cross-pass column-carry chain — the construct the flat
+    ``wide_mul_rules`` lookup only avoids by brute-force enumeration.
+
+    Operands are read as nibble one-hots: ``operand_a_base+nib`` is a0
+    (low nibble), ``operand_a_base+16+nib`` is a1 (high nibble); likewise
+    for B. The result is written as four nibble one-hots at
+    ``result_base + lane*16 + nib`` (lanes 0..3 = the 16-bit product,
+    little-endian). ``workspace_base`` is a scratch band (op-local
+    residual band) the passes populate with intermediate value one-hots.
+
+    Workspace lane layout (each a 16-wide value one-hot slot):
+
+      lane 0: pp00_hi      lane 6:  col1_partial (pp00_hi+pp01_lo)%16
+      lane 1: pp01_lo      lane 7:  col1_c_a     carry of that add
+      lane 2: pp01_hi      lane 8:  col2_ab      (pp01_hi+pp10_hi)%16
+      lane 3: pp10_lo      lane 9:  col2_c_ab    carry of that add
+      lane 4: pp10_hi      lane 10: carry1       col1 -> col2 carry (0..2)
+      lane 5: pp11_lo      lane 11: col2_abc     (+pp11_lo)%16
+      lane 12: pp11_hi     lane 13: col2_c_abc   carry
+      lane 14: carry2      col2 -> col3 carry (0..2)
+
+    Passes (each a tractable <=1024-rule nibble lookup, NOT a
+    cross-product):
+
+      P0  Partial products: 4 * 256 rules. Compute a_i*b_j (0..225) and
+          split into (lo, hi). nib0 (=pp00_lo) is FINAL -> result lane 0.
+          pp00_hi/pp01_lo/pp10_lo/pp01_hi/pp10_hi/pp11_lo/pp11_hi -> ws.
+      P1  Column 1 add #1: (pp00_hi + pp01_lo) -> (col1_partial, col1_c_a).
+      P2  Column 1 add #2: (col1_partial + pp10_lo) -> nib1 (result lane 1)
+          + col1_c_b; carry1 = col1_c_a + col1_c_b (0..2) -> ws lane 10.
+      P3  Column 2 add #1: (pp01_hi + pp10_hi) -> (col2_ab, col2_c_ab).
+      P4  Column 2 add #2: (col2_ab + pp11_lo) -> (col2_abc, col2_c_abc).
+      P5  Column 2 add #3: (col2_abc + carry1) -> nib2 (result lane 2)
+          + col2 final carry contribution; carry2 = col2_c_ab +
+          col2_c_abc + this add's carry -> ws lane 14.
+      P6  Column 3: (pp11_hi + carry2) -> nib3 (result lane 3).
+
+    The carry1/carry2 SUMMING across the pairwise adds is itself a small
+    lookup pass. The whole cascade is ~2.8k rules independent of the flat
+    lookup's 65,536, and generalizes to width>2 by adding more
+    partial-product + column passes (O(width^2) passes).
+
+    Args:
+        operand_a_base / operand_b_base: nibble-one-hot operand bands.
+        result_base: 4-lane result band.
+        workspace_base: scratch band (>= 16*15 = 240 wide).
+        opcode_gate: MUL opcode flag dim.
+        marker_gate: AX-style marker dim.
+        S: SwiGLU scale.
+        width_bytes: only 2 supported in the pilot (8-bit x 8-bit).
+
+    Returns:
+        ``MultiPassOp`` with 7 passes (P0..P6).
+    """
+    from .ir import MultiPassOp
+
+    if width_bytes != 2:
+        raise NotImplementedError(
+            "multi_pass_mul_rules: pilot supports width_bytes=2 only; the "
+            "schoolbook cascade generalizes to width>2 by adding "
+            "partial-product + column-add passes (O(width^2) passes)."
+        )
+
+    def split(v):
+        return (v & 0xF, (v >> 4) & 0xF)
+
+    # A "lane" is a (base_name, start_offset) pair addressing a 16-wide
+    # value one-hot slot. ``cell(lane, nib)`` emits a SINGLE-offset dim key
+    # ``"base+(start+nib)"`` — never a nested ``base+start+nib`` (which the
+    # DimRef.rsplit-on-"+" parser would mis-read). ``base(lane)`` is the
+    # cell at nib 0 (for use as an ``x_base``/``y_base`` the lookup helper
+    # then appends the nibble to).
+    def cell(lane, nib):
+        name, start = lane
+        return f"{name}+{start + nib}"
+
+    # Workspace lanes (each a 16-wide value one-hot slot).
+    def WS(lane_idx):
+        return (workspace_base, lane_idx * 16)
+
+    L_pp00_hi, L_pp01_lo, L_pp01_hi = WS(0), WS(1), WS(2)
+    L_pp10_lo, L_pp10_hi, L_pp11_lo = WS(3), WS(4), WS(5)
+    L_col1_partial, L_col1_c_a = WS(6), WS(7)
+    L_col2_ab, L_col2_c_ab = WS(8), WS(9)
+    L_carry1 = WS(10)
+    L_col2_abc, L_col2_c_abc = WS(11), WS(12)
+    L_pp11_hi = WS(13)
+    L_carry2 = WS(14)
+
+    def RES(lane_idx):
+        return (result_base, lane_idx * 16)
+
+    mp = MultiPassOp(
+        name="multi_pass_mul_w2",
+        workspace_band=workspace_base,
+    )
+
+    a0, a1 = (operand_a_base, 0), (operand_a_base, 16)
+    b0, b1 = (operand_b_base, 0), (operand_b_base, 16)
+
+    # ----- P0: partial products (4 nibble-pair lookups) -----------------
+    p0 = mp.add_pass("p0_partial_products")
+    # pp00 = a0*b0: low nibble is FINAL result lane 0; high -> ws.
+    p0.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="pp00", x_lane=a0, y_lane=b0, f=lambda x, y: x * y,
+        writes_fn=lambda v: (cell(RES(0), split(v)[0]), cell(L_pp00_hi, split(v)[1])),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+    p0.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="pp01", x_lane=a0, y_lane=b1, f=lambda x, y: x * y,
+        writes_fn=lambda v: (cell(L_pp01_lo, split(v)[0]), cell(L_pp01_hi, split(v)[1])),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+    p0.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="pp10", x_lane=a1, y_lane=b0, f=lambda x, y: x * y,
+        writes_fn=lambda v: (cell(L_pp10_lo, split(v)[0]), cell(L_pp10_hi, split(v)[1])),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+    p0.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="pp11", x_lane=a1, y_lane=b1, f=lambda x, y: x * y,
+        writes_fn=lambda v: (cell(L_pp11_lo, split(v)[0]), cell(L_pp11_hi, split(v)[1])),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+
+    # ----- P1: column 1 add #1: pp00_hi + pp01_lo -----------------------
+    p1 = mp.add_pass("p1_col1_add_a")
+    p1.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="c1a", x_lane=L_pp00_hi, y_lane=L_pp01_lo, f=lambda x, y: x + y,
+        writes_fn=lambda v: (cell(L_col1_partial, v & 0xF), cell(L_col1_c_a, v >> 4)),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+
+    # ----- P2: column 1 add #2: col1_partial + pp10_lo ------------------
+    # nib1 is FINAL (result lane 1); carry of THIS add + col1_c_a = carry1.
+    p2 = mp.add_pass("p2_col1_add_b")
+    p2.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="c1b", x_lane=L_col1_partial, y_lane=L_pp10_lo, f=lambda x, y: x + y,
+        writes_fn=lambda v: (cell(RES(1), v & 0xF),),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+    # carry1 = col1_c_a + (col1_partial + pp10_lo)//16. col1_c_a in 0..1,
+    # this add's carry in 0..1 -> carry1 in 0..2 (proven max_carry1=2). A
+    # 4-way AND over (col1_c_a, col1_partial, pp10_lo) reconstructs both
+    # the incoming carry and the fresh add-carry in one clean lookup pass
+    # (~512 units) -- still O(256), no cross-product blowup.
+    for ca in range(2):
+        for partial in range(16):
+            for plo in range(16):
+                c_add = (partial + plo) // 16
+                carry1 = ca + c_add
+                p2.ffn.rules.append(_normalized_and_rule(
+                    name=f"carry1_ca{ca}_p{partial:x}_l{plo:x}",
+                    conditions=(
+                        marker_gate,
+                        cell(L_col1_c_a, ca),
+                        cell(L_col1_partial, partial),
+                        cell(L_pp10_lo, plo),
+                    ),
+                    writes=(cell(L_carry1, carry1),),
+                    opcode_gate=opcode_gate,
+                    S=S,
+                ))
+
+    # ----- P3: column 2 add #1: pp01_hi + pp10_hi -----------------------
+    p3 = mp.add_pass("p3_col2_add_a")
+    p3.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="c2a", x_lane=L_pp01_hi, y_lane=L_pp10_hi, f=lambda x, y: x + y,
+        writes_fn=lambda v: (cell(L_col2_ab, v & 0xF), cell(L_col2_c_ab, v >> 4)),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+
+    # ----- P4: column 2 add #2: col2_ab + pp11_lo -----------------------
+    p4 = mp.add_pass("p4_col2_add_b")
+    p4.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="c2b", x_lane=L_col2_ab, y_lane=L_pp11_lo, f=lambda x, y: x + y,
+        writes_fn=lambda v: (cell(L_col2_abc, v & 0xF), cell(L_col2_c_abc, v >> 4)),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+    ))
+
+    # ----- P5: column 2 add #3: col2_abc + carry1 -----------------------
+    # nib2 FINAL (result lane 2); carry2 = col2_c_ab + col2_c_abc + this
+    # add's carry. col2_c_ab,col2_c_abc in 0..1; this add carry in 0..1;
+    # sum in 0..2 (proven: max_carry2=2).
+    p5 = mp.add_pass("p5_col2_add_c")
+    p5.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="c2c", x_lane=L_col2_abc, y_lane=L_carry1, f=lambda x, y: x + y,
+        writes_fn=lambda v: (cell(RES(2), v & 0xF),),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+        y_lanes=3,
+    ))
+    # carry2 = col2_c_ab + col2_c_abc + (col2_abc + carry1)//16.
+    for cab in range(2):
+        for cabc in range(2):
+            for abc in range(16):
+                for c1 in range(3):
+                    c_add = (abc + c1) // 16
+                    carry2 = cab + cabc + c_add
+                    p5.ffn.rules.append(_normalized_and_rule(
+                        name=f"carry2_ab{cab}_abc{cabc}_v{abc:x}_c{c1}",
+                        conditions=(
+                            marker_gate,
+                            cell(L_col2_c_ab, cab),
+                            cell(L_col2_c_abc, cabc),
+                            cell(L_col2_abc, abc),
+                            cell(L_carry1, c1),
+                        ),
+                        writes=(cell(L_carry2, carry2),),
+                        opcode_gate=opcode_gate,
+                        S=S,
+                    ))
+
+    # ----- P6: column 3: pp11_hi + carry2 -------------------------------
+    # nib3 FINAL (result lane 3). Any col-4 carry drops (product<65536).
+    p6 = mp.add_pass("p6_col3")
+    p6.ffn.rules.extend(_nibble_lookup_pass_rules(
+        name="c3", x_lane=L_pp11_hi, y_lane=L_carry2, f=lambda x, y: x + y,
+        writes_fn=lambda v: (cell(RES(3), v & 0xF),),
+        opcode_gate=opcode_gate, marker_gate=marker_gate, S=S,
+        y_lanes=3,
+    ))
+
+    return mp
+
+
 __all__ = [
     "bitwise_rules",
     "wide_add_rules",
@@ -1653,6 +2013,7 @@ __all__ = [
     "wide_ge_sub_rules",
     "wide_shift_rules",
     "wide_mul_rules",
+    "multi_pass_mul_rules",
     "wide_div_rules",
     "wide_div_rules_ge_format",
 ]

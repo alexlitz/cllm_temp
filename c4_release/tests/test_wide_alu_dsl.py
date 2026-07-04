@@ -1857,3 +1857,127 @@ def test_wide_div_rules_ge_format_byte_identity_randomized(
         f"({len(mismatches)}/{2 * n_trials}):\n  "
         + "\n  ".join(mismatches[:10])
     )
+
+
+# ---------------------------------------------------------------------------
+# GAP-PRIMITIVE #2 (docs/DSL_W5_MULDIV_LIMIT.md Path 1): multi_pass_mul_rules.
+#
+# The flat wide_mul_rules(width_bytes=2) is a 65,536-rule cross-product lookup
+# that does not generalize (width-3 = 16.8M rules). multi_pass_mul_rules
+# derives the SAME 16-bit product from a COMPACT schoolbook spec staged across
+# 7 FFN passes (~2.8k units) via the MultiPassOp IR, with a cross-pass column
+# carry chain the single-forward lookup cannot express. This test lowers the
+# passes into a stack of PureFFNs and proves the decoded product is byte-
+# identical to (a * b) & 0xFFFF for EVERY (a, b) in 0..255 x 0..255 — i.e.
+# verdict-identical to what the flat wide_mul_rules lookup computes.
+# ---------------------------------------------------------------------------
+
+from neural_vm.unified_compiler.wide_alu_dsl import (  # noqa: E402
+    multi_pass_mul_rules,
+)
+
+_MP_MUL_POS = {}
+_MP_MUL_DIM = 0
+for _nm, _w in (
+    ("MARK", 1), ("OP_MUL", 1), ("OPA", 32), ("OPB", 32),
+    ("RES", 64), ("WS", 240),
+):
+    _MP_MUL_POS[_nm] = _MP_MUL_DIM
+    _MP_MUL_DIM += _w
+
+
+def _lowered_multi_pass_mul(S: float = 100.0):
+    """Lower each pass of the multi-pass MUL into its own PureFFN.
+
+    Returns ``(ffns, positions)`` — the ordered PureFFN stack (one per
+    pass) and the ad-hoc dim layout.
+    """
+    mp = multi_pass_mul_rules(
+        operand_a_base="OPA", operand_b_base="OPB", result_base="RES",
+        workspace_base="WS", opcode_gate="OP_MUL", marker_gate="MARK",
+        S=S, width_bytes=2,
+    )
+    flat = mp.as_flat_ir()
+    ffns = []
+    for i, p in enumerate(mp.passes):
+        f = PureFFN(dim=_MP_MUL_DIM, hidden_dim=max(1, p.hidden_units))
+        flat.lower_ffn(f, _MP_MUL_POS, layer_idx=i, S=S)
+        ffns.append(f)
+    return ffns
+
+
+@pytest.fixture(scope="module")
+def lowered_multi_pass_mul_ffns():
+    return _lowered_multi_pass_mul()
+
+
+def test_multi_pass_mul_pass_structure():
+    """The schoolbook cascade is 7 passes and O(width^2*256) units —
+    NOT the flat lookup's 65,536 cross-product rules."""
+    mp = multi_pass_mul_rules(
+        operand_a_base="OPA", operand_b_base="OPB", result_base="RES",
+        workspace_base="WS", opcode_gate="OP_MUL", marker_gate="MARK",
+        S=100.0, width_bytes=2,
+    )
+    assert mp.num_passes == 7
+    # Total units must be far below the flat 65,536-rule lookup.
+    assert mp.hidden_units < 4000, mp.hidden_units
+    # width>2 pilot boundary.
+    with pytest.raises(NotImplementedError):
+        multi_pass_mul_rules(
+            operand_a_base="OPA", operand_b_base="OPB", result_base="RES",
+            workspace_base="WS", opcode_gate="OP_MUL", marker_gate="MARK",
+            S=100.0, width_bytes=3,
+        )
+
+
+def _mp_mul_batch_inputs():
+    N = 65536
+    X = torch.zeros(N, 1, _MP_MUL_DIM)
+    ab = []
+    idx = 0
+    for a in range(256):
+        for b in range(256):
+            X[idx, 0, _MP_MUL_POS["MARK"]] = 1.0
+            X[idx, 0, _MP_MUL_POS["OP_MUL"]] = 1.0
+            X[idx, 0, _MP_MUL_POS["OPA"] + (a & 0xF)] = 1.0
+            X[idx, 0, _MP_MUL_POS["OPA"] + 16 + ((a >> 4) & 0xF)] = 1.0
+            X[idx, 0, _MP_MUL_POS["OPB"] + (b & 0xF)] = 1.0
+            X[idx, 0, _MP_MUL_POS["OPB"] + 16 + ((b >> 4) & 0xF)] = 1.0
+            ab.append((a, b))
+            idx += 1
+    return X, ab
+
+
+def test_multi_pass_mul_byte_identity_full(lowered_multi_pass_mul_ffns):
+    """The multi-pass schoolbook cascade decodes (a * b) & 0xFFFF for
+    EVERY (a, b) in 0..255 x 0..255 — byte-identical to the function the
+    flat wide_mul_rules(width_bytes=2) lookup computes.
+
+    This is the GAP-PRIMITIVE #2 pilot gate: it proves the multi_pass_rules
+    IR (MultiPassOp) can express the cross-pass column-carry chain of
+    schoolbook MUL, which a single-forward FFN lookup fundamentally cannot.
+    """
+    X, ab = _mp_mul_batch_inputs()
+    with torch.no_grad():
+        Y = X
+        for f in lowered_multi_pass_mul_ffns:
+            Y = f(Y)
+    base = _MP_MUL_POS["RES"]
+    vals = torch.zeros(len(ab), dtype=torch.long)
+    for lane in range(4):
+        nib = Y[:, 0, base + lane * 16:base + lane * 16 + 16].argmax(dim=-1)
+        vals |= nib.long() << (4 * lane)
+    expected = torch.tensor([(a * b) & 0xFFFF for a, b in ab], dtype=torch.long)
+    mismatch = (vals != expected)
+    n_bad = int(mismatch.sum())
+    if n_bad:
+        bad = mismatch.nonzero().flatten()[:10]
+        detail = ", ".join(
+            f"a={ab[int(i)][0]} b={ab[int(i)][1]} "
+            f"got=0x{int(vals[i]):04X} exp=0x{int(expected[i]):04X}"
+            for i in bad
+        )
+    else:
+        detail = ""
+    assert n_bad == 0, f"multi_pass_mul mismatches {n_bad}/65536: {detail}"
