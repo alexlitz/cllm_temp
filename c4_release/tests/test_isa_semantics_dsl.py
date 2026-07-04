@@ -56,6 +56,8 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     CrossStepCarryBundle,
     CrossStepCarrySpec,
     DumpBlock,
+    FetchBundle,
+    FetchSpec,
     FullWidthByteEmissionBundle,
     FullWidthByteEmissionSpec,
     HeadWrite,
@@ -81,6 +83,7 @@ from c4_release.neural_vm.unified_compiler.isa_semantics_dsl import (
     consumer_lookahead_gate,
     control_op,
     cross_step_carry,
+    fetch,
     frame_step,
     full_width_byte_emission,
     marker_broadcast,
@@ -2148,6 +2151,108 @@ def test_marker_broadcast_reexpresses_live_l8_relay_spec():
         sorted((w.slot, w.dim, w.weight) for w in hand.v)
     assert sorted((w.out_dim, w.slot, w.weight) for w in gen.o) == \
         sorted((w.out_dim, w.slot, w.weight) for w in hand.o)
+
+
+# ===========================================================================
+# FETCH — the opcode-agnostic instruction-fetch head generator (DECODE G6)
+# ===========================================================================
+
+
+def _fetch_cells(spec):
+    """(q, k, v, o) cell maps for a head spec; raise on duplicate (slot,dim)."""
+    q = {(w.slot, w.dim): w.weight for w in spec.q}
+    k = {(w.slot, w.dim): w.weight for w in spec.k}
+    v = {(w.slot, w.dim): w.weight for w in spec.v}
+    o = {(w.out_dim, w.slot): w.weight for w in spec.o}
+    for tag, raw in (("q", spec.q), ("k", spec.k), ("v", spec.v)):
+        keys = [(w.slot, w.dim) for w in raw]
+        assert len(keys) == len(set(keys)), f"{tag} duplicate cells"
+    okeys = [(w.out_dim, w.slot) for w in spec.o]
+    assert len(okeys) == len(set(okeys)), "o duplicate cells"
+    return q, k, v, o
+
+
+_FETCH_DP = {
+    nm: (100 + 1000 * i) for i, nm in enumerate([
+        "TEMP", "EMBED_LO", "EMBED_HI", "FETCH_LO", "FETCH_HI",
+        "ADDR_KEY", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "OPCODE_BYTE_LO", "OPCODE_BYTE_HI",
+        "MARK_AX", "MARK_PC", "CONST", "HAS_SE",
+        "LOOKAHEAD_PC_LO", "LOOKAHEAD_PC_HI",
+        "NEXT_OPCODE_LO", "NEXT_OPCODE_HI",
+    ])
+}
+
+
+def test_fetch_returns_bundle_with_pure_builder():
+    bundle = fetch(FetchSpec(
+        name="t", marker="MARK_AX",
+        addr_mode="dynamic", addr_source_lo="EMBED_LO", addr_source_hi="EMBED_HI",
+        target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI",
+    ))
+    assert isinstance(bundle, FetchBundle)
+    head = bundle.head_spec_builder(_FETCH_DP, 1)
+    assert head.head_idx == 1
+    # head reads its address source + ADDR_KEY + CLEAN_EMBED, writes the target.
+    assert "EMBED_LO" in bundle.head_reads and "ADDR_KEY" in bundle.head_reads
+    assert bundle.head_writes == {"OPCODE_BYTE_LO", "OPCODE_BYTE_HI"}
+
+
+def test_fetch_rejects_bad_modes():
+    with pytest.raises(ValueError):
+        FetchSpec(name="t", marker="MARK_AX", addr_mode="bogus",
+                  target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI")
+    with pytest.raises(ValueError):
+        FetchSpec(name="t", marker="MARK_AX", top_mode="bogus",
+                  addr_mode="dynamic", addr_source_lo="EMBED_LO",
+                  addr_source_hi="EMBED_HI",
+                  target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI")
+    with pytest.raises(ValueError):
+        # dynamic requires both source bands.
+        FetchSpec(name="t", marker="MARK_AX", addr_mode="dynamic",
+                  target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI")
+    with pytest.raises(ValueError):
+        # static requires an offset.
+        FetchSpec(name="t", marker="MARK_AX", addr_mode="static",
+                  top_mode="static",
+                  target_lo="OPCODE_BYTE_LO", target_hi="OPCODE_BYTE_HI")
+
+
+def test_fetch_reexpresses_live_l5_fetch_heads():
+    """The live ``l5_ops`` FetchSpecs lower byte-identically against the hand-
+    built ``_fetch_head_specs`` heads (the FETCH-family sole-path proof)."""
+    from c4_release.neural_vm.unified_compiler.ops import l5_ops
+    from c4_release.neural_vm.unified_compiler.ops.shared import _as_setdim_proxy
+
+    BD = _as_setdim_proxy(_FETCH_DP)
+    hand = l5_ops._fetch_head_specs(BD)
+    derived = l5_ops._derived_fetch_specs()
+    assert len(hand) == len(derived) == 6
+    for h in hand:
+        d = derived[h.head_idx].head_spec_builder(_FETCH_DP, h.head_idx)
+        assert _fetch_cells(h) == _fetch_cells(d), f"head {h.head_idx} mismatch"
+        assert h.alibi_slope == d.alibi_slope
+
+
+def test_fetch_reexpresses_lookahead_opcode_fetch():
+    """The #221 consumer-lookahead opcode fetch head is DERIVED by ``fetch``
+    (top_mode='static_zero_single' + marker_confirm_mode='symmetric')."""
+    from c4_release.neural_vm.unified_compiler.ops import l5_ops
+
+    hand = l5_ops._ARITH_CONSUMER_GATE.opcode_fetch_head_spec_builder(
+        _FETCH_DP, 6,
+    )
+    derived = fetch(FetchSpec(
+        name="lookahead", marker="MARK_AX",
+        addr_mode="dynamic",
+        addr_source_lo="LOOKAHEAD_PC_LO", addr_source_hi="LOOKAHEAD_PC_HI",
+        top_mode="static_zero_single", marker_confirm_mode="symmetric",
+        step_gate="non_first",
+        target_lo="NEXT_OPCODE_LO", target_hi="NEXT_OPCODE_HI",
+        alibi_slope=0.0,
+    )).head_spec_builder(_FETCH_DP, 6)
+    assert _fetch_cells(hand) == _fetch_cells(derived)
+    assert hand.alibi_slope == derived.alibi_slope == 0.0
 
 
 # ===========================================================================
