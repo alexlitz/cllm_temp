@@ -693,9 +693,12 @@ def _function_call_l6_ffn_rules(S: float) -> tuple[FFNRule, ...]:
       * units 2022..2101  - JSR PC override (80 units; 16+16 cancel +
                             16 LO target + 16 FETCH_HI reserved + 16 HI carry)
       * units 2102..2133  - JSR AX passthrough (32 units)
-      * units 2134..2165  - ENT STACK0 = old_BP (32 units)
-      * units 2166..2197  - ENT BP = SP - 8 (32 units)
-      * units 2198..2229  - ENT AX passthrough (32 units)
+      * units 2134..2229  - ENT band (96 units), emitted as ONE ControlOp
+                            frame-descriptor (``_ent_control_op``): STACK0 =
+                            old_BP PUSH (2134..2165), BP = SP - 8 ASSIGN
+                            (2166..2197) — the two frame deltas via one
+                            frame_step — then the AX-passthrough corrective
+                            band (2198..2229)
       * units 2230..2261  - LEV AX passthrough at AX marker (32 units)
       * units 2262..2293  - LEV AX byte positions (32 units)
 
