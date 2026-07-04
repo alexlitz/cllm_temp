@@ -110,14 +110,35 @@ magnitude-explodes pass-over-pass (`silu(up)≈up` scales with the input,
 so a residual-30 workspace one-hot read at weight 30 runs away). The fixed
 point pins EVERY pass's one-hots to residual 1.0.
 
+**DIV pilot (`multi_pass_div_rules`) landed — same primitive, DIV spec.**
+`multi_pass_div_rules` (`wide_alu_dsl.py`) derives `a // b` (quotient) +
+`a % b` (remainder) for 8-bit operands from a COMPACT binary long-division
+spec — bit-serial shift-subtract with a cross-pass RUNNING-REMAINDER carry
+(bit i's remainder feeds bit i-1's shift), 43 passes / ~11.7k units. It is
+**verdict-identical to Python `divmod` (with the `b==0 → q=0, r=a`
+convention) on all 65,536 (a,b) pairs** via the neural PureFFN forward
+(test `test_multi_pass_div_byte_identity_full`; `tools/_div_multipass_verify.py
+--full`). Rule count is `O(width·256)` per bit NOT `O(256^width)`, so it
+generalizes past the flat `wide_div_rules_ge_format` lookup's 8-bit ceiling
+by adding bit iterations. The b==0 case is handled by mutually-exclusive
+`BZERO`/`BNONZERO` gating (clean single-hot result lane).
+
+**DIV install (`C4_DIV_MULTIPASS`, DEFAULT-OFF) landed.** The L10 divmod
+install (`make_alu_divmod_composite_ops`) appends a `MultiPassDivBlock`
+(`efficient_alu_neural.py`) — the 43 lowered `PureFFN` passes + an OR-gate
+seed packed into ONE post_op (like `MultiPassMulBlock`, so the physical block
+count is unchanged at 59 and the absolute-position lea contract holds). It
+reads the dividend from `ALU_LO/HI`, divisor from `AX_CARRY_LO/HI` (the SAME
+operand bands the composite / GE-format lookup consume), computes q/r on
+dedicated result lanes, then routes q→OUTPUT (OP_DIV) / r→OUTPUT (OP_MOD) at
+MARK_AX and replays the campaign divisor / dividend-byte-1 clears. Flag-OFF is
+byte-identical to golden `91f55411`; flag-ON computes a//b + a%b correctly
+through OUTPUT on a direct-operand sweep (`tools/_div_multipass_live_probe.py`).
+
 **Remaining:** `wide_mul_rules(width_bytes>2)` (wire the O(width²) pass
-generator to arbitrary width) and `wide_div_rules(width_bytes>1)` (~24
-long-division shift-subtract passes — same primitive, DIV spec). The IR
-construct and the MUL derivation prove the approach; DIV is the next
-pilot. Wiring either into the PRODUCTION model (replacing
-`FlattenedALUMul` / `FlattenedDivMod`) is a separate byte-identity
-install (the pilot proves the COMPUTE derives; the install must also
-match the golden band routing per `docs/semantic_spec_ALU.md` G8).
+generator to arbitrary width) and `multi_pass_div_rules(width_bytes>1)`
+(multi-byte dividend — same primitive, more bit iterations + a wider
+running-remainder lane).
 
 ### Path 2: GE-format DSL extension
 Add `wide_ge_mul_rules` / `wide_ge_div_rules` that emit rules operating
