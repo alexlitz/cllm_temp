@@ -6,6 +6,11 @@ from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
+from ..isa_semantics_dsl import (
+    RegisterDeltaSpec,
+    SequentialAddDelta,
+    register_delta,
+)
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import _as_setdim_proxy
@@ -173,10 +178,6 @@ def _register_default_ffn_rules(S: float) -> tuple:
     cell). Structural ``OUTPUT_LO/HI+<k>`` / ``EMBED_LO/HI+<k>`` /
     ``H<n>+<idx>`` offsets stay bare.
     """
-    first_pc = PC_OFFSET + INSTR_WIDTH
-    pc_lo = first_pc & 0xF
-    pc_hi = (first_pc >> 4) & 0xF
-    gate_mark_pc = dim_ref("marker", "PC")
     # Phase 8.D follow-up: pre-bind the four (byte_index, role) refs so
     # downstream rule conditions name the byte-position role lookup
     # instead of the bare ``BYTE_INDEX_<n>`` slot string.
@@ -188,45 +189,23 @@ def _register_default_ffn_rules(S: float) -> tuple:
     }
     rules = []
 
+    # --- PC SEQUENTIAL adder — DERIVED via the register_delta primitive ---
+    # ``PC_next = PC + INSTR_WIDTH`` (the L3 default every op starts from) is a
+    # ``SEQUENTIAL_ADD`` register delta (docs/semantic_spec_CONTROL.md §2c). The
+    # primitive (built by :func:`_seq_pc_register_delta`) splits into a
+    # FIRST-STEP CONSTANT default band (units 0-3, emitted here) and the
+    # nibble-rotation adder + carry band (units 86-133, emitted below via the
+    # bundle's ``sub_builders["adder"]``) — one spec, placed at its two legacy
+    # FFN unit positions. Byte-identical to the hand-authored bands
+    # (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
+    _seq_pc_bundle = _seq_pc_register_delta(S)
+
     # --- PC FIRST-STEP DEFAULT (units 0-3) ---
     # At MARK_PC AND NOT HAS_SE, predict PC = PC_OFFSET + INSTR_WIDTH.
     # Encoded as a "set" unit (ungated; fires on MARK_PC) plus a
     # HAS_SE-keyed "undo" unit gated by MARK_PC that subtracts the
     # same amount whenever HAS_SE is on.
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.pc_first_step_default_lo_set",
-        conditions=(("MARK_PC", 1.0),),
-        threshold=0.5,
-        writes=((f"OUTPUT_LO+{pc_lo}", 2.0 / S),
-                (f"EMBED_LO+{pc_lo}", 2.0 / S)),
-        scope="MARK_PC and not HAS_SE",
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.pc_first_step_default_lo_undo",
-        conditions=(("HAS_SE", 1.0),),
-        threshold=0.5,
-        gate=gate_mark_pc,
-        writes=((f"OUTPUT_LO+{pc_lo}", -2.0 / S),
-                (f"EMBED_LO+{pc_lo}", -2.0 / S)),
-        scope="MARK_PC and HAS_SE",
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.pc_first_step_default_hi_set",
-        conditions=(("MARK_PC", 1.0),),
-        threshold=0.5,
-        writes=((f"OUTPUT_HI+{pc_hi}", 2.0 / S),
-                (f"EMBED_HI+{pc_hi}", 2.0 / S)),
-        scope="MARK_PC and not HAS_SE",
-    ))
-    rules.append(multi_way_and_rule(
-        name="layer3_ffn.pc_first_step_default_hi_undo",
-        conditions=(("HAS_SE", 1.0),),
-        threshold=0.5,
-        gate=gate_mark_pc,
-        writes=((f"OUTPUT_HI+{pc_hi}", -2.0 / S),
-                (f"EMBED_HI+{pc_hi}", -2.0 / S)),
-        scope="MARK_PC and HAS_SE",
-    ))
+    rules.extend(_seq_pc_bundle.sub_builders["default"]())
 
     # --- INITIAL_PC_BAKE CANCEL placeholders (units 4-5) ---
     # Cancel logic moved to L2 (``make_layer2_initial_pc_bake_cancel_op``).
@@ -510,58 +489,43 @@ def _register_default_ffn_rules(S: float) -> tuple:
             writes=(("NEXT_STACK0", -3.0 / S),),
         ))
 
-    # --- PC INCREMENT lo nibble (units 86-101) ---
-    # MARK_PC AND HAS_SE AND NOT OP_LEV: new_k = (k + INSTR_WIDTH) % 16.
-    # OP_LEV ~ 5, so weight -1/5 makes its contribution to the score
-    # cancel the HAS_SE/MARK_PC pair (suppress on LEV opcodes).
-    for k in range(16):
-        new_k = (k + INSTR_WIDTH) % 16
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_increment_lo_{k}",
-            conditions=(("HAS_SE", 1.0), ("MARK_PC", 1.0),
-                        ("OP_LEV", -1.0 / 5.0)),
-            threshold=1.5,
-            gate=f"EMBED_LO+{k}",
-            writes=((f"OUTPUT_LO+{new_k}", 2.0 / S),),
-            scope="MARK_PC and HAS_SE and not OP_LEV",
-        ))
-
-    # --- PC INCREMENT hi nibble (units 102-117) ---
-    # Same condition; copies EMBED_HI[k] -> OUTPUT_HI[k].
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_increment_hi_{k}",
-            conditions=(("HAS_SE", 1.0), ("MARK_PC", 1.0),
-                        ("OP_LEV", -1.0 / 5.0)),
-            threshold=1.5,
-            gate=f"EMBED_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", 2.0 / S),),
-            scope="MARK_PC and HAS_SE and not OP_LEV",
-        ))
-
-    # --- PC carry correction (units 118-133) ---
-    # Fires when MARK_PC AND HAS_SE AND NOT OP_LEV AND any
-    # EMBED_LO[8..15] is set (old lo nibble >= 16 - INSTR_WIDTH).
-    # MARK_PC weight 4 strictly requires it (prevents false positive
-    # at byte positions where EMBED_LO is inflated). Output gate
-    # carries the EMBED_HI[k] nibble into OUTPUT_HI[(k+1)%16] (cancel
-    # old k, add to k+1).
-    carry_threshold = 16 - INSTR_WIDTH
-    for k in range(16):
-        conds = [("MARK_PC", 4.0), ("HAS_SE", 1.0), ("OP_LEV", -1.0)]
-        for lo_bit in range(carry_threshold, 16):
-            conds.append((f"EMBED_LO+{lo_bit}", 1.0))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_carry_correction_{k}",
-            conditions=tuple(conds),
-            threshold=5.5,
-            gate=f"EMBED_HI+{k}",
-            writes=((f"OUTPUT_HI+{k}", -2.0 / S),
-                    (f"OUTPUT_HI+{(k + 1) % 16}", 2.0 / S)),
-            scope="MARK_PC and HAS_SE and not OP_LEV",
-        ))
+    # --- PC INCREMENT + CARRY (units 86-133) — DERIVED via register_delta ---
+    # The nibble-rotation ``reg + const`` adder: increment lo nibble
+    # ``new_k = (k + INSTR_WIDTH) % 16`` (86-101), increment hi copy (102-117),
+    # and the lo>=16-INSTR_WIDTH -> hi carry (118-133), all gated
+    # ``MARK_PC ∧ HAS_SE ∧ ¬OP_LEV``. Emitted from the SAME ``_seq_pc_bundle``
+    # spec whose first-step default landed at units 0-3.
+    rules.extend(_seq_pc_bundle.sub_builders["adder"]())
 
     return tuple(rules)
+
+
+def _seq_pc_register_delta(S: float):
+    """Build the L3 SEQUENTIAL PC-next (``PC_next = PC + INSTR_WIDTH``) delta.
+
+    A single :func:`register_delta` (``SEQUENTIAL_ADD`` kind) whose
+    ``sub_builders`` yield the first-step constant default band (units 0-3) and
+    the nibble adder + carry band (units 86-133) — the CONTROL frame-step
+    primitive replacing the hand-authored L3 PC bands. The default
+    ``SequentialAddDelta`` field values reproduce the legacy tuning
+    (``EMBED_*`` old-value source, ``OUTPUT_*`` new-value dest, ``MARK_PC``
+    marker, ``HAS_SE`` freshness key, ``OP_LEV`` suppressor at -1/5 increment /
+    -1 carry, thresholds 1.5 / 5.5) — see
+    ``isa_semantics_dsl.SequentialAddDelta``.
+    """
+    return register_delta(
+        RegisterDeltaSpec(
+            name="layer3_ffn.pc",
+            kind="sequential_add",
+            write_scale=2.0 / S,
+            sequential_add=SequentialAddDelta(
+                amount=INSTR_WIDTH,
+                const_value=PC_OFFSET + INSTR_WIDTH,
+            ),
+        ),
+        instr_width=INSTR_WIDTH,
+        pc_offset=PC_OFFSET,
+    )
 
 
 def _register_default_ffn_ir(S: float = 100.0) -> CompilerIR:

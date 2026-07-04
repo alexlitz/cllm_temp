@@ -3,8 +3,11 @@
 from ..ir import CompilerIR, FFNRule, TokenEmbeddingRule
 from ..building_blocks_dsl import multi_way_and_rule
 from ..isa_semantics_dsl import (
+    BranchTargetDelta,
     FullWidthByteEmissionSpec,
+    RegisterDeltaSpec,
     full_width_byte_emission,
+    register_delta,
 )
 from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
@@ -383,7 +386,15 @@ def _function_call_jsr_pc_override_conditions() -> tuple[tuple[str, float], ...]
 def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     """JSR PC override: cancel OUTPUT (PC+5) + materialize target (80 units).
 
-    Layout (matches vm_step.py ~8718+):
+    DERIVED via the ``register_delta`` primitive
+    (``isa_semantics_dsl.register_delta``, kind ``branch_target``). The JSR
+    PC-next is the branch-target ``PC = imm*INSTR_WIDTH + PC_OFFSET`` register
+    delta (docs/semantic_spec_CONTROL.md §1d/§2b): the SAME ``idx_to_pc``
+    encoder JMP/BZ/BNZ use, cancelling the L3 sequential default in the
+    same-step OUTPUT bank then writing the byte-0 target from the raw
+    instruction INDEX in ``FETCH_LO``.
+
+    Layout (matches vm_step.py ~8718+), all emitted by the primitive:
 
       * 16 OUTPUT_LO cancel units: gate=-OUTPUT_LO[k], writes OUTPUT_LO[k]
       * 16 OUTPUT_HI cancel units: gate=-OUTPUT_HI[k], writes OUTPUT_HI[k]
@@ -395,96 +406,57 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     All units share the same conditions (MARK_PC + TEMP[0] + opcode
     blockers + IS_BYTE blocker). The reserved FETCH_HI block keeps the
     unit cursor aligned with the legacy layout.
+
+    The flag-gated ``C4_JSR_PC_BYTE1`` byte-1 stage (§G3, the known >=0x100
+    branch-target wall — NOT derivable from the byte-0 ISA encoder) SPLICES its
+    16 ``JSR_PC_B1`` staging units over the primitive's reserved band when ON;
+    OFF the derived reserved no-op band leaves the override golden
+    byte-identical. That branch stays hand-authored: it is the residual DSL gap
+    the frame primitive does not yet cover.
     """
     from ...constants import INSTR_WIDTH, PC_OFFSET
 
-    T_jsr_pc = 4.0
     write_scale = 2.0 / S
     conditions = _function_call_jsr_pc_override_conditions()
-    # Flag-gated: stage PC byte-1 into JSR_PC_B1 (FETCH_HI_nib>>1) on a real JSR.
-    # OFF -> the FETCH_HI block stays a legacy reserved no-op (no down write) so
-    # the override is golden byte-identical.
-    stage_byte1 = _jsr_pc_byte1_enabled()
 
-    rules: list[FFNRule] = []
+    derived = list(register_delta(
+        RegisterDeltaSpec(
+            name="jsr_pc",
+            kind="branch_target",
+            write_scale=write_scale,
+            conditions=conditions,
+            threshold=4.0,
+            branch_target=BranchTargetDelta(),
+        ),
+        instr_width=INSTR_WIDTH,
+        pc_offset=PC_OFFSET,
+    ).rules_builder())
+
+    if not _jsr_pc_byte1_enabled():
+        return tuple(derived)
+
+    # Flag C4_JSR_PC_BYTE1 (§G3, out-of-scope for the frame primitive): stage
+    # PC byte-1 = (k>>1) into JSR_PC_B1 from FETCH_HI+k over the reserved band
+    # (units 48-63). FETCH_HI holds the high nibble of the JSR target idx
+    # (verified spec_k=0: idx=33 -> FETCH_HI dominant index 2; idx=7 -> 0). PC
+    # byte-1 = (idx*8+2)>>8 = (16*FETCH_HI_nib*8)>>8 = FETCH_HI_nib>>1 (the +2
+    # and the FETCH_LO*8 < 128 never carry into bit 8). JSR-gated by the shared
+    # override conditions so JSR_PC_B1 is nonzero ONLY on a real JSR step. The
+    # staging MUST use the SAME strict threshold as the byte-0 PC target (4.0):
+    # a lower value fires on every non-JSR PC marker where TEMP+0 carries
+    # L6-head BZ/BNZ-relay pollution and over-fires PC byte-1 on low-PC
+    # arithmetic programs (a whole-corpus regression).
+    T_jsr_pc = 4.0
+    reserved_start = 3 * 16  # 2 cancel + 1 target-lo bands precede the reserved
     for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"jsr_pc_cancel_output_lo_{k}",
+        derived[reserved_start + k] = multi_way_and_rule(
+            name=f"jsr_pc_byte1_stage_{k}",
             conditions=conditions,
             threshold=T_jsr_pc,
-            gate=f"OUTPUT_LO+{k}",
-            gate_weight=-1.0,
-            writes=((f"OUTPUT_LO+{k}", write_scale),),
-        ))
-    for k in range(16):
-        rules.append(multi_way_and_rule(
-            name=f"jsr_pc_cancel_output_hi_{k}",
-            conditions=conditions,
-            threshold=T_jsr_pc,
-            gate=f"OUTPUT_HI+{k}",
-            gate_weight=-1.0,
-            writes=((f"OUTPUT_HI+{k}", write_scale),),
-        ))
-    for k in range(16):
-        target_lo = ((k * INSTR_WIDTH) + PC_OFFSET) & 0xF
-        rules.append(multi_way_and_rule(
-            name=f"jsr_pc_target_lo_{k}",
-            conditions=conditions,
-            threshold=T_jsr_pc,
-            gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_LO+{target_lo}", write_scale),),
-        ))
-    # FETCH_HI band. Legacy: reserved no-op (no down write). With
-    # C4_JSR_PC_BYTE1 on: STAGE byte-1 = (k>>1) into JSR_PC_B1 from FETCH_HI+k.
-    # FETCH_HI holds the high nibble of the JSR target idx (verified spec_k=0:
-    # idx=33 -> FETCH_HI dominant index 2; idx=7 -> index 0). PC byte-1 =
-    # (idx*8+2)>>8 = (16*FETCH_HI_nib*8)>>8 = FETCH_HI_nib>>1 (the +2 and the
-    # FETCH_LO*8 < 128 never carry into bit 8). The write is JSR-gated by the
-    # shared override conditions (TEMP[0]+blockers) so JSR_PC_B1 is nonzero
-    # ONLY on a real JSR step; on a small-target JSR (idx<32 -> k in {0,1} ->
-    # byte1 0) it writes JSR_PC_B1+0 which the emit FFN treats as "no byte-1".
-    # Staging fires when MARK_PC(1) + TEMP[0](IS_JSR) clears ``T_jsr_pc_stage``.
-    # The staging MUST use the SAME strict threshold as the byte-0 PC target
-    # (``T_jsr_pc=4.0``): a lower value (the prior 1.5) fires on EVERY non-JSR PC
-    # marker where ``TEMP+0`` carries L6-head BZ/BNZ-relay POLLUTION (>=~0.5) and
-    # the executing opcode is not in the negative-blocker list (ADD/SUB/MUL/...),
-    # so the staging spuriously writes ``JSR_PC_B1+(FETCH_HI_residue>>1)`` and the
-    # post-tail emit over-fires PC byte-1 on low-PC arithmetic programs (add_0 ->
-    # PC 794, if_eq_0 -> 282, func_max_0 -> 938 -- a whole-corpus regression). At
-    # 4.0 the blockers (-4) + the polluted TEMP+0 (<~2) keep the sum below
-    # threshold on non-JSR markers, while gcd's / rec_fib's real JSR markers
-    # (TEMP+0 ~5-10, verified spec_k=0) clear it. This is the SAME margin the
-    # byte-0 target band already relies on, so a JSR whose byte-0 target fires
-    # ALSO stages byte-1.
-    T_jsr_pc_stage = T_jsr_pc
-    for k in range(16):
-        if stage_byte1:
-            byte1_nib = k >> 1
-            rules.append(multi_way_and_rule(
-                name=f"jsr_pc_byte1_stage_{k}",
-                conditions=conditions,
-                threshold=T_jsr_pc_stage,
-                gate=f"FETCH_HI+{k}",
-                writes=((f"JSR_PC_B1+{byte1_nib}", write_scale),),
-            ))
-        else:
-            rules.append(multi_way_and_rule(
-                name=f"jsr_pc_fetch_hi_reserved_{k}",
-                conditions=conditions,
-                threshold=T_jsr_pc,
-                gate=f"FETCH_HI+{k}",
-                writes=(),
-            ))
-    for k in range(16):
-        target_hi_from_lo = ((k * INSTR_WIDTH) + PC_OFFSET) >> 4
-        rules.append(multi_way_and_rule(
-            name=f"jsr_pc_target_hi_from_lo_{k}",
-            conditions=conditions,
-            threshold=T_jsr_pc,
-            gate=f"FETCH_LO+{k}",
-            writes=((f"OUTPUT_HI+{target_hi_from_lo}", write_scale),),
-        ))
-    return tuple(rules)
+            gate=f"FETCH_HI+{k}",
+            writes=((f"JSR_PC_B1+{k >> 1}", write_scale),),
+        )
+    return tuple(derived)
 
 
 def _function_call_jsr_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:

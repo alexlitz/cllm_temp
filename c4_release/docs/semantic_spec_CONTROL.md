@@ -1,9 +1,35 @@
 # Semantic Spec — the CONTROL family (JMP, JSR, BZ, BNZ, ENT, LEV, ADJ, EXIT + CMP EQ/NE/LT/GT/LE/GE)
 
-**Status:** READ + DESIGN. No weights modified. Golden flag-OFF hash
+**Status:** READ + DESIGN. No weights modified by this doc. Golden flag-OFF hash
 `81557d21422f3eada0a87c677b00dced41cc26c3ee3bfb094c5eeb71c9b4d3cb` (`81557d21`)
-is unchanged by this doc (gate: `tools/_isa_golden_hash.py`) — this file only
-READS ops and WRITES documentation.
+is the historical flag-OFF this doc was written against; the current default
+golden is `91f55411` (gate: `tools/_isa_golden_hash.py`) — this doc only READS
+ops and WRITES documentation.
+
+**LANDED — the frame-step / register-delta primitive (2026-07).** The CONTROL
+per-step register updates now DERIVE from a compact spec via
+`isa_semantics_dsl.register_delta(RegisterDeltaSpec)` / `frame_step(specs)` (the
+CONTROL analogue of `pc_mux`), expressing §2a's `PcNextSpec` + `FrameDeltaSpec[]`
+as DATA:
+
+* **SEQUENTIAL_ADD** (`reg + const` nibble adder, §2c) — the L3 sequential
+  PC-next `PC + INSTR_WIDTH` (first-step CONSTANT default band + increment
+  lo/hi + carry) is DERIVED + the hand-authored `_register_default_ffn_rules`
+  PC bands (52 units) DELETED. G1 (default-writer) + G10 (frame `SP_DELTA` adder
+  shape) closed for the PC track.
+* **BRANCH_TARGET** (`idx_to_pc` encoder, §1d/§G2) — the model_ops JSR PC
+  override (80 units: cancel + `imm*8+2` encoder + reserved band) is DERIVED +
+  the hand loop DELETED. Same encoder `pc_mux`'s `imm_to_byte_addr` uses.
+
+Byte-identical: whole-model `state_dict` hash unchanged at `91f55411`; the JSR
+override holds flag-OFF AND flag-ON. **Residual DSL gap (still hand-authored):**
+the `C4_JSR_PC_BYTE1` byte-1 stage (G3, PC ≥ 0x100) is SPLICED over the derived
+reserved band — the frame primitive covers the byte-0 ISA encoder; the byte-1
+carry band (`pc_width = 2`) is the next DSL extension. The SP/BP/STACK0 frame
+DELTAS (ENT push/assign, LEV pops — G5) and their `_register_default_ffn_rules`
+byte-default bands are NOT yet routed through `frame_step` (a further
+extension: a `RegisterDelta` `PUSH`/`ASSIGN`/`POP-CAM` kind over the same
+ordered-delta lowering).
 
 **Purpose (100%-derivable-architecture prep):** map the hand-authored lowering
 for the CONTROL family, re-express each op's behaviour as *semantic-spec DATA*
