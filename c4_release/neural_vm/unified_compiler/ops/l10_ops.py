@@ -1118,6 +1118,7 @@ from ..layer_compiler import Operation
 from ..band_guarantees import expected_byte_guarantee_rules
 from ..positional_invariant import invariant_threshold, marker_bank_index
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
+from ..wide_alu_dsl import bitwise_rules
 from .residual_band_registry import register_residual_band
 from .shared import (
     _as_setdim_proxy,
@@ -2241,112 +2242,55 @@ def _layer10_alu_bitwise_rules(
     spurious lookup would have hit (``op_fn(0, b)`` for stale-A and
     ``op_fn(a, 0)`` for stale-B). Codified by the L9/L10 isolation
     test ``tests/test_l9_collapsed_imm_input_isolated.py``.
+
+    DSL derivation (2026-07): the byte-0 nibble bitwise LOOKUP is the
+    same ``for a: for b: op_fn(a, b)`` build-time computed table the ALU
+    derivable regime describes, so this builder is now a thin call into
+    the shared ``wide_alu_dsl.bitwise_rules`` generator (the SAME generator
+    the lookup-mode L10 post-op uses; ``ops/alu_ops.py``). The 574 rules
+    per op — 256 main + the 31-rule stale-cancel band, interleaved per
+    nibble — are emitted by the generator with ``emit_stale_cancel_band``.
+    Byte-identity vs the prior hand-authored loop is proven by
+    ``compare_symbolic_to_lowered_ffn`` + ``tools/_isa_golden_hash.py``.
+    The distinguishing L10-main-FFN DATA (``MARK_SE_ONLY`` marker under the
+    Wave A step_end_operand_relay broadcast, the separate LO/HI operand
+    bands, the ``_step_end`` rule-name suffix) is passed as kwargs — there
+    is zero per-value logic left here.
     """
 
-    # Phase 8.D: pre-bind the (opcode_flag, op_name) gate ref so
-    # the inner loop reuses one dim_ref call.
-    gate_op = dim_ref("opcode_flag", op_name)
-    rules: list[FFNRule] = []
-    for nibble_label, alu_dim, carry_dim, out_dim in (
-        ("lo", "ALU_LO", "AX_CARRY_LO", "OUTPUT_LO"),
-        ("hi", "ALU_HI", "AX_CARRY_HI", "OUTPUT_HI_THIS_STEP"),
-    ):
-        for a in range(16):
-            for b in range(16):
-                result = op_fn(a, b)
-                # DSL v4b: 3-way balanced AND across (MARK_AX, ALU_*[a],
-                # AX_CARRY_*[b]) at (40, 30, 30) > 80; gate=OP_<op>.
-                # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY
-                # under Wave A step_end_operand_relay (10ca51a7), which
-                # broadcasts ALU_LO/HI, AX_CARRY_LO/HI, OP_<bitwise>
-                # from MARK_AX into MARK_SE_ONLY in the same step.
-                rules.append(multi_way_and_rule(
-                    name=(
-                        f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
-                        f"a{a:x}_b{b:x}_step_end"
-                    ),
-                    conditions=(
-                        ("MARK_SE_ONLY", 40.0),
-                        (f"{alu_dim}+{a}", 30.0),
-                        (f"{carry_dim}+{b}", 30.0),
-                    ),
-                    threshold=80.0,
-                    gate=gate_op,
-                    gate_weight=1.0,
-                    writes=((f"{out_dim}+{result}", 2.0 / S),),
-                ))
-        # Stale-ALU residue cancel band (added 2026-06-10).
-        # See class docstring for the asymmetric-weight stale detector.
-        # Stale ALU_*+0: fires when ALU_*+0 >= 1.04 with legit AX_CARRY_*+b.
-        for b in range(16):
-            spurious = op_fn(0, b)
-            # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
-            # Wave A step_end_operand_relay (10ca51a7).
-            rules.append(multi_way_and_rule(
-                name=(
-                    f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
-                    f"cancel_stale_alu0_b{b:x}_step_end"
-                ),
-                conditions=(
-                    ("MARK_SE_ONLY", 40.0),
-                    (f"{alu_dim}+0", 1000.0),
-                    (f"{carry_dim}+{b}", 30.0),
-                ),
-                threshold=40.0 + 1000.0 * 1.02 + 30.0,
-                gate=gate_op,
-                gate_weight=1.0,
-                writes=((f"{out_dim}+{spurious}", -2.0 / S),),
-            ))
-        # Stale AX_CARRY_*+0: mirror of the ALU_*+0 cancel for operand B.
-        # Skip a=0 to avoid a duplicate cancel at op_fn(0, 0) -- the
-        # cancel_stale_alu0_b0 unit above already targets that cell.
-        # The double-firing matters most for XOR where op_fn(a, a) = 0
-        # collides with the spurious op_fn(0, 0) = 0 cell and would
-        # otherwise erase the legit a==b write.
-        for a in range(1, 16):
-            spurious = op_fn(a, 0)
-            # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
-            # Wave A step_end_operand_relay (10ca51a7).
-            rules.append(multi_way_and_rule(
-                name=(
-                    f"l10_bitwise_{op_name.lower()}_{nibble_label}_"
-                    f"cancel_stale_a{a:x}_carry0_step_end"
-                ),
-                conditions=(
-                    ("MARK_SE_ONLY", 40.0),
-                    (f"{alu_dim}+{a}", 30.0),
-                    (f"{carry_dim}+0", 1000.0),
-                ),
-                threshold=40.0 + 30.0 + 1000.0 * 1.02,
-                gate=gate_op,
-                gate_weight=1.0,
-                writes=((f"{out_dim}+{spurious}", -2.0 / S),),
-            ))
-    return tuple(rules)
+    return bitwise_rules(
+        op=op_name.lower(),
+        operand_a_lo="ALU_LO",
+        operand_a_hi="ALU_HI",
+        operand_b_lo="AX_CARRY_LO",
+        operand_b_hi="AX_CARRY_HI",
+        result_lo="OUTPUT_LO",
+        result_hi="OUTPUT_HI_THIS_STEP",
+        opcode_gate=dim_ref("opcode_flag", op_name),
+        marker_gate="MARK_SE_ONLY",
+        S=S,
+        name_prefix="l10_bitwise",
+        name_suffix="_step_end",
+        emit_stale_cancel_band=True,
+    )
 
 
 def _layer10_alu_bitwise_or_rules(S: float) -> tuple[FFNRule, ...]:
-    """L10 bitwise OR: 512 units (256 lo + 256 hi) gated on OP_OR."""
+    """L10 bitwise OR: 574 units (256 lo + 256 hi + cancel) gated on OP_OR."""
 
-    import operator
-
-    return _layer10_alu_bitwise_rules(S, op_name="OR", op_fn=operator.or_)
+    return _layer10_alu_bitwise_rules(S, op_name="OR", op_fn=None)
 
 
 def _layer10_alu_bitwise_xor_rules(S: float) -> tuple[FFNRule, ...]:
-    """L10 bitwise XOR: 512 units (256 lo + 256 hi) gated on OP_XOR."""
+    """L10 bitwise XOR: 574 units (256 lo + 256 hi + cancel) gated on OP_XOR."""
 
-    import operator
-
-    return _layer10_alu_bitwise_rules(S, op_name="XOR", op_fn=operator.xor)
+    return _layer10_alu_bitwise_rules(S, op_name="XOR", op_fn=None)
 
 
 def _layer10_alu_bitwise_and_rules(S: float) -> tuple[FFNRule, ...]:
-    """L10 bitwise AND: 512 units (256 lo + 256 hi) gated on OP_AND."""
+    """L10 bitwise AND: 574 units (256 lo + 256 hi + cancel) gated on OP_AND."""
 
-    import operator
-
-    return _layer10_alu_bitwise_rules(S, op_name="AND", op_fn=operator.and_)
+    return _layer10_alu_bitwise_rules(S, op_name="AND", op_fn=None)
 
 
 def _layer10_alu_shl_shr_zero_rules(S: float) -> tuple[FFNRule, ...]:
