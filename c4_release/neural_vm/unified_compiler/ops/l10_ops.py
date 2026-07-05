@@ -1387,6 +1387,19 @@ _L10_FFN_UNIT_LAYOUT_MAIN = (
 )
 _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL = 2560
 
+
+def _l10_main_cmp_margin_extra() -> int:
+    """Flag-conditional +6 for the C4_CMP_COMBINE_MARGIN OUTPUT-HI clamp bank.
+
+    The clamp bank (``_layer10_alu_cmp_hi_clamp_rules``) is appended LAST in
+    the L10-main FFN so it never shifts the shared cmp_combine / bitwise / ALU
+    banks. Flag-OFF (incl golden 35-token) -> 0 -> byte-identical. Flag-ON
+    (campaign) -> +6 (one clamp unit per comparison opcode).
+    See ``shared.cmp_combine_margin_enabled``.
+    """
+    from .shared import cmp_combine_margin_enabled
+    return 6 if cmp_combine_margin_enabled() else 0
+
 # Combined post-op FFN baked by ``make_l10_post_ops_combined`` (kind="ffn",
 # dependency-assigned). Each range maps 1:1 to a post-op class's
 # ``hidden_dim`` and lands at the offset the inline ``offset`` counter
@@ -1426,6 +1439,10 @@ def _allocate_l10_main_ffn_units() -> FFNUnitAllocator:
     allocator = FFNUnitAllocator()
     for name, _legacy_start, n_units in _L10_FFN_UNIT_LAYOUT_MAIN:
         allocator.alloc(name, n_units)
+    # C4_CMP_COMBINE_MARGIN campaign clamp bank (flag-OFF -> 0 -> not declared).
+    extra = _l10_main_cmp_margin_extra()
+    if extra:
+        allocator.alloc("layer10_alu.cmp_hi_clamp", extra)
     return allocator
 
 
@@ -1445,6 +1462,10 @@ def _allocate_l10_post_ops_combined_units() -> FFNUnitAllocator:
     """
     allocator = FFNUnitAllocator()
     for name, _legacy_start, n_units in _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED:
+        # C4_CMP_COMBINE_MARGIN campaign clamp: the comparison_combine bank is
+        # the LAST tenant, so grow it in place by +6 (flag-OFF -> +0 -> golden).
+        if name == "l10_post_ops_combined.comparison_combine":
+            n_units += _l10_main_cmp_margin_extra()
         allocator.alloc(name, n_units)
     return allocator
 
@@ -2051,6 +2072,32 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
         threshold=_gt_gtge_3way_thresh,
     ))
 
+    # C4_CMP_COMBINE_MARGIN (campaign-only, default-OFF): +6 OUTPUT_HI clamp
+    # units appended LAST so the 18-unit default+override footprint is
+    # UNCHANGED flag-OFF (byte-identical golden). A comparison result byte is
+    # provably in {0, 1} so its OUTPUT_HIGH nibble is invariantly 0; each clamp
+    # (same gate as this copy's default: MARK_SE_ONLY + OP_<cmp> + MARK_PC
+    # blocker) darkens every non-zero OUTPUT_HI_THIS_STEP+1..15 nibble and
+    # reinforces +0, out-voting a leaked operand (hi<<4) leak at the decode row.
+    # See ``shared.cmp_combine_margin_enabled``.
+    from .shared import cmp_combine_margin_enabled
+    if cmp_combine_margin_enabled():
+        for _op in ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"):
+            _writes = [("OUTPUT_HI_THIS_STEP+0", 60.0 / S)]
+            _writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -60.0 / S)
+                        for h in range(1, 16)]
+            rules.append(multi_way_and_rule(
+                conditions=(
+                    ("MARK_SE_ONLY", 1.0),
+                    (_op, 1.0),
+                    ("MARK_PC", MARK_PC_BLOCK),
+                ),
+                threshold=1.5,
+                writes=tuple(_writes),
+                name=f"l10_cmp_hi_clamp_{_op.lower()}_step_end",
+                scope=f"MARK_SE_ONLY and {_op} and not MARK_PC",
+            ))
+
     return tuple(rules)
 
 
@@ -2305,6 +2352,47 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
         _cmp_override_2way("GE", 0, 0, 1, "hi_lt"),
         _cmp_override_3way("GE", 1, 3, 0, 1, "hi_eq_lo_lt"),
     )
+
+
+def _layer10_alu_cmp_hi_clamp_rules(S: float) -> tuple[FFNRule, ...]:
+    """C4_CMP_COMBINE_MARGIN (campaign-only, default-OFF) OUTPUT-HIGH clamp.
+
+    Appended LAST in the L10-main FFN (so it never shifts the shared
+    cmp_combine / bitwise / ALU banks). Flag-OFF -> empty tuple ->
+    byte-identical golden. Flag-ON -> +6 units (one per comparison opcode).
+
+    A comparison RESULT byte is provably in {0, 1}, so its OUTPUT_HIGH nibble
+    is invariantly 0. Each clamp unit -- same gate as the ComparisonCombine
+    default (``MARK_SE_ONLY`` + relayed ``SE_OP_<cmp>`` + ``MARK_PC`` blocker)
+    -- DARKENS every non-zero ``OUTPUT_HI_THIS_STEP+1..15`` nibble and
+    reinforces ``OUTPUT_HI_THIS_STEP+0``, out-voting a leaked operand
+    ``(hi<<4)`` high nibble at the compare decode row so the emitted result
+    byte is the clean low-nibble result. Because a boolean high nibble is
+    always 0, this cannot alter any already-correct comparison; it only pulls
+    a leaked high nibble back to 0. See ``shared.cmp_combine_margin_enabled``.
+    """
+    from .shared import cmp_combine_margin_enabled
+    if not cmp_combine_margin_enabled():
+        return ()
+
+    def _clamp(op_name: str) -> FFNRule:
+        # Strong amplitudes (a comparison result HIGH nibble is invariantly 0,
+        # so OUTPUT_HI+0 can be driven decisively) so the clamp out-votes even
+        # a large leaked operand ``(hi<<4)`` (~13+ observed) at the decode row.
+        writes = [("OUTPUT_HI_THIS_STEP+0", 60.0 / S)]
+        writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -60.0 / S) for h in range(1, 16)]
+        return multi_way_and_rule(
+            name=f"l10_cmp_{op_name.lower()}_hi_clamp_step_end",
+            conditions=(
+                ("MARK_SE_ONLY", 1.0),
+                (f"SE_OP_{op_name}", 1.0),
+                ("MARK_PC", -50.0),
+            ),
+            threshold=1.5,
+            writes=tuple(writes),
+        )
+
+    return tuple(_clamp(op) for op in ("EQ", "NE", "LT", "GT", "LE", "GE"))
 
 
 def _layer10_alu_bitwise_rules(
@@ -3162,6 +3250,9 @@ def _layer10_alu_rules(S: float) -> tuple[FFNRule, ...]:
         + _layer10_alu_ax_passthrough_rules(S)
         + _layer10_alu_eq_engine_rules(S)
         + _layer10_alu_ordering_engine_rules(S)
+        # C4_CMP_COMBINE_MARGIN campaign clamp bank (LAST so it never shifts
+        # the shared banks above); flag-OFF -> empty -> byte-identical golden.
+        + _layer10_alu_cmp_hi_clamp_rules(S)
     )
 
 
@@ -5667,9 +5758,10 @@ def make_layer10_alu_op() -> Operation:
         # equal the total declared in ``_L10_FFN_UNIT_LAYOUT_MAIN``. If
         # any sub-stage rule generator drifts, this fires before the
         # mismatch propagates to downstream layers.
-        assert n10 == _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL, (
+        _main_expected = _L10_FFN_UNIT_LAYOUT_MAIN_TOTAL + _l10_main_cmp_margin_extra()
+        assert n10 == _main_expected, (
             f"L10 ALU unit cursor drift: rules lowered {n10} units, "
-            f"allocator expected {_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL}"
+            f"allocator expected {_main_expected}"
         )
 
     return Operation(
@@ -5738,7 +5830,9 @@ def make_layer10_alu_op() -> Operation:
         # 2288. See ``_layer10_alu_eq_engine_rules``.
         # Ordering engine (2026-06-12): +272 units reaching 2560. See
         # ``_layer10_alu_ordering_engine_rules``.
-        ffn_units_used=2560,
+        # C4_CMP_COMBINE_MARGIN campaign clamp bank appended last: +6 flag-ON,
+        # +0 flag-OFF (byte-identical golden).
+        ffn_units_used=2560 + _l10_main_cmp_margin_extra(),
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -5921,10 +6015,13 @@ def make_l10_post_ops_combined() -> Operation:
             start_unit=offset,
             S=S,
         )
-        assert offset == _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL, (
+        _pooc_expected = (
+            _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL
+            + _l10_main_cmp_margin_extra()
+        )
+        assert offset == _pooc_expected, (
             f"L10 post_ops_combined comparison cursor drift: helper "
-            f"ended at {offset}, allocator expected "
-            f"{_L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL}"
+            f"ended at {offset}, allocator expected {_pooc_expected}"
         )
         # The attached L10 post-op pipeline is now the authoritative carry
         # implementation. This late dependency-assigned copy sees very large
@@ -6091,7 +6188,9 @@ def make_l10_post_ops_combined() -> Operation:
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":
         # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
-        ffn_units_used=1562,
+        # C4_CMP_COMBINE_MARGIN campaign clamp grows the LAST tenant
+        # (comparison_combine) by +6; flag-OFF -> 1562 -> byte-identical golden.
+        ffn_units_used=1562 + _l10_main_cmp_margin_extra(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
