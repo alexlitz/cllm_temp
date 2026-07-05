@@ -344,7 +344,10 @@ from ..isa_semantics_dsl import (
     CamBinaryAddressMatch,
     CamDiscriminatorSlot,
     CamValueBand,
+    NibbleRelay,
+    ScalarRelayBankSpec,
     cam_binary_address_match,
+    scalar_relay,
 )
 from ..layer_compiler import Operation
 from ..positional_invariant import invariant_threshold, marker_bank_index
@@ -2505,6 +2508,25 @@ def _layer15_memory_lookup_lev_heads_4_11_specs(
     return tuple(specs)
 
 
+def _layer15_lev_pc_restore_dim_map(BD) -> dict:
+    """Resolve every dim NAME the L15 LEV PC-restore CAM head 14 touches.
+
+    :func:`cam_binary_address_match`'s builder wants a name->int dict; the
+    marker-bank anchors (``H1+SP_I`` etc.) and address nibble bands are supplied
+    as their BASE names, with the offset parsed from the token at build time.
+    """
+    base_names = (
+        "CONST", "OP_LEV", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+        "MARK_STACK0", "H1", "L2H0", "MEM_STORE", "OP_JSR", "OP_ENT",
+        "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+        "STACK0_BYTE0", "OPCODE_BYTE_LO",
+        "ADDR_B0_LO", "ADDR_B0_HI", "ADDR_B1_LO", "ADDR_B1_HI",
+        "ADDR_B2_LO", "ADDR_B2_HI", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
+        "OUTPUT_LO", "OUTPUT_HI",
+    )
+    return {n: int(getattr(BD, n)) for n in base_names}
+
+
 def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     """L15 head 14: LEV return-address content-addressable restore into PC.
 
@@ -2526,304 +2548,198 @@ def _layer15_lev_pc_restore_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     Only emitted when ``num_heads >= 15`` (flag ``C4_L15_LEV_PC_RESTORE`` on).
     """
 
+    # DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): head 14 is
+    # re-expressed byte-identically through the shared binary-address CAM
+    # primitive :func:`isa_semantics_dsl.cam_binary_address_match` (the same
+    # generator the L15 LI/LC LOAD head and the L14 mem-generation STORE head
+    # use). The 24-bit binary per-bit address comparator (slots 4..27, reading
+    # ADDR_B0/B1/B2 on Q AND K) is a :class:`CamBinaryAddressBlock`; every
+    # firing/suppressor/discriminator row is a :class:`CamDiscriminatorSlot`
+    # (DATA); the CLEAN_EMBED->OUTPUT return-byte relay is a pair of
+    # :class:`CamValueBand`. Each flag-conditioned widening slot (the b0 boost
+    # rescale of slots 4..11, the OP_JSR/-OP_ENT discriminator slot 64, the
+    # byte-0 selector slot 65, the store-dark slot 66, the hard PC-only gates
+    # 67/69, the opcode gate 70, the STACK0-byte0 selector 68) is appended
+    # to the discriminator DATA only when its flag is on, exactly mirroring the
+    # deleted hand-authored branches -- so flag-off collapses to the
+    # byte-identical uniform-scale scaffold. The whole-model golden hash + a
+    # cross-flag-matrix test gate byte-identity. The hand-authored per-cell
+    # W_q/W_k/W_v directive is deleted.
+    #
+    # HEAD-14 RESIZE RESIDUAL: expressing the address block via the shared CAM
+    # primitive (instead of an inline per-bit loop) makes the b0-boost slots
+    # 4..11 a clean last-write-wins DATA override on top of the uniform block --
+    # the resize-residual fix path the brief asked for.
     PC_I = 0
     AX_I = 1
     SP_I = 2
     BP_I = 3
     MEM_I = 4
 
-    # Master address-widening flag (default OFF). When OFF every widening term
-    # below collapses to the byte-identical scaffold value, so flag-off keeps
-    # head 14 == the committed scaffold (smoke-safe).
+    # Master address-widening flag. When OFF every widening term collapses to the
+    # byte-identical scaffold value (uniform address scale, value_scale 1.0,
+    # slot-31 suppressor 200, no slots 64..70), so flag-off keeps head 14 == the
+    # committed scaffold (smoke-safe).
     _widen = _l15_lev_addr_widen_on()
 
-    q: list[AP] = []
-    k: list[AP] = []
+    discs: list[CamDiscriminatorSlot] = []
 
-    # === Slot 0: Bias -- fire only at the LEV PC marker. ===
-    # Head 0 suppresses MARK_PC (-25000) and OP_LEV (-1000); we invert: the
-    # LEV PC marker is the ONLY firing row. Strong negative on CONST so a
-    # non-LEV / non-PC row never crosses the store-anchor threshold.
-    q.append(AP(0, BD.CONST, -2000.0))
-    q.append(AP(0, BD.OP_LEV, 2000.0))
-    q.append(AP(0, BD.MARK_PC, 2000.0))
-    # Keep the head dark on the AX marker / byte rows and on the BP/SP frame
-    # rows of the LEV step (those carry OP_LEV too but a different marker).
-    q.append(AP(0, BD.MARK_AX, -25000.0))
-    q.append(AP(0, BD.MARK_SP, -100000.0))
-    q.append(AP(0, BD.MARK_BP, -100000.0))
-    q.append(AP(0, BD.H1 + SP_I, -50000.0))
-    q.append(AP(0, BD.H1 + BP_I, -50000.0))
-    k.append(AP(0, BD.CONST, 10.0))
+    # === Slot 0: Bias -- fire only at the LEV PC marker (mirror-inverted head 0).
+    discs.append(CamDiscriminatorSlot(
+        slot=0,
+        q=(("CONST", -2000.0), ("OP_LEV", 2000.0), ("MARK_PC", 2000.0),
+           ("MARK_AX", -25000.0), ("MARK_SP", -100000.0), ("MARK_BP", -100000.0),
+           (f"H1+{SP_I}", -50000.0), (f"H1+{BP_I}", -50000.0)),
+        k=(("CONST", 10.0),),
+    ))
 
-    # === Slot 29: PC byte position blocker (mirror head 0). ===
-    # The LEV PC marker row is MARK_PC=1 but the PC *value* byte rows
-    # (H1+PC_I) must stay dark so the head only fires on the marker.
-    q.append(AP(29, BD.H1 + PC_I, -20000.0))
-    k.append(AP(29, BD.CONST, 5.0))
+    # === Slots 29/30: PC / AX byte-position blockers (mirror head 0). ===
+    discs.append(CamDiscriminatorSlot(
+        slot=29, q=((f"H1+{PC_I}", -20000.0),), k=(("CONST", 5.0),)))
+    discs.append(CamDiscriminatorSlot(
+        slot=30, q=((f"H1+{AX_I}", -20000.0),), k=(("CONST", 5.0),)))
 
-    # === Slot 30: AX byte position blocker (mirror head 0). ===
-    q.append(AP(30, BD.H1 + AX_I, -20000.0))
-    k.append(AP(30, BD.CONST, 5.0))
-
-    # === Slot 31: K-side marker-row suppressor (exclude self/marker rows). ===
-    # Unlike head 0 (whose query at the AX marker is never a perfect
-    # self-address-match against a store), the LEV query lives at the PC
-    # marker whose own ADDR_B0/B1/B2 = the gather target. Without this slot
-    # the marker row self-matches the 24-bit address block at maximal score
-    # and the head attends to itself instead of the return-addr store. Drive
-    # the query high (CONST) and the key strongly negative on the marker/
-    # frame rows (MARK_PC/MARK_AX/MARK_SP/MARK_BP) and on the just-emitted PC
-    # value bytes (H1+PC). Store tokens (MARK_STACK0/MARK_MEM) are untouched.
-    #
-    # The penalty MUST exceed the self-row 24-bit address-match score, which is
-    # ~2.1e5 (post head_dim^-0.5 scale) and GROWS with the byte-0 boost above.
-    # The original 200x-200 = -4e4 product is far too small (the self row still
-    # won at +2.1e5), so the head attended itself and delivered nothing. Use a
-    # 2000x-2000 = -4e6 product so the PC/AX/SP/BP marker rows are decisively
-    # excluded regardless of the byte-0 boost factor. Genuine store rows are
-    # MARK_STACK0 (no MARK_PC/AX/SP/BP), so they keep their full score.
-    # 200 (scaffold) keeps flag-off byte-identical; 2000 (widen on) is needed
-    # to beat the byte-0-boosted self-row 24-bit address-match (~2.1e5).
+    # === Slot 31: K-side marker-row self/frame suppressor. ===
+    # 200 (scaffold) keeps flag-off byte-identical; 2000 (widen on) beats the
+    # byte-0-boosted self-row 24-bit address-match (~2.1e5).
     suppress = 2000.0 if _widen else 200.0
-    q.append(AP(31, BD.CONST, suppress))
-    k.append(AP(31, BD.MARK_PC, -suppress))
-    k.append(AP(31, BD.MARK_AX, -suppress))
-    k.append(AP(31, BD.MARK_SP, -suppress))
-    k.append(AP(31, BD.MARK_BP, -suppress))
-    k.append(AP(31, BD.H1 + PC_I, -suppress))
+    discs.append(CamDiscriminatorSlot(
+        slot=31,
+        q=(("CONST", suppress),),
+        k=(("MARK_PC", -suppress), ("MARK_AX", -suppress), ("MARK_SP", -suppress),
+           ("MARK_BP", -suppress), (f"H1+{PC_I}", -suppress)),
+    ))
 
     # === Slot 66: store-key dark gate on non-LEV steps (CAM-load safety). ===
-    # value_scale=40 makes head 14 a STRONG OUTPUT writer; without a per-key
-    # gate the byte-0-boosted address self-match lets it fire on LI/LC/SI/SC
-    # steps too (the AX-marker query self-matches a stored address), clobbering
-    # the head-0 LI/LC load -> the SI/SC/LI/LC smoke CAM tests regress. This
-    # slot drives every STORE key (MEM_STORE>0) hugely NEGATIVE whenever the
-    # query is NOT a LEV PC marker, so on a non-LEV step the head attends only
-    # the zero-value prelude/sink rows and writes ~nothing to OUTPUT. On the LEV
-    # PC marker the query's OP_LEV makes q positive, so store keys keep their
-    # full (positive) score and the return-address gather proceeds normally.
-    # q = (OP_LEV+MARK_PC - 1.5*CONST) -> positive only at the LEV PC marker;
-    # k = MEM_STORE*BIG -> only store rows feel the gate. (Slots 32-63 are the
-    # V band, 64/65 the JSR/byte0 discriminators, so this uses slot 66.)
-    # Only emitted with the address-widening master flag (it is dead weight in
-    # the scaffold build and keeps flag-off byte-identical when omitted).
     if _widen:
         dark = 5000.0
-        q.append(AP(66, BD.OP_LEV, 1.0))
-        q.append(AP(66, BD.MARK_PC, 1.0))
-        q.append(AP(66, BD.CONST, -1.5))
-        k.append(AP(66, BD.MEM_STORE, dark))
+        discs.append(CamDiscriminatorSlot(
+            slot=66,
+            q=(("OP_LEV", 1.0), ("MARK_PC", 1.0), ("CONST", -1.5)),
+            k=(("MEM_STORE", dark),),
+        ))
 
-    # === Slots 67/69: HARD (MARK_PC AND OP_LEV) firing gate (C4_L15_LEV_PC_ONLY).
-    # The address-widened head must fire ONLY at the LEV *PC marker* row. Two
-    # leak classes the scaffold gates miss:
-    #   (a) non-LEV STACK0/MEM store rows: the byte-0-BOOSTED 24-bit address
-    #       self-match (~2.1e5) overwhelms slot 0's -2000 bias + slot 66's -7500
-    #       store-dark, so the value_scale=40 head self-fires and corrupts the
-    #       pushed func-arg store value (LI mem[0xFFE8] 70 -> 0).
-    #   (b) the LEV step's OWN AX/SP/BP marker rows: they carry OP_LEV (an
-    #       OP_LEV-only gate leaves them neutral) but NOT MARK_PC, and the head's
-    #       strong OUTPUT delivery of the return PC (90) bleeds onto the BP
-    #       marker -> BP restored as 90 -> the post-LEV main frame desyncs
-    #       (step-9 AX 70 -> 72, exit_code wrong).
-    # The fire row is the unique (MARK_PC=1 AND OP_LEV>0) row; every other row
-    # fails at least one condition. Two INDEPENDENT dark slots implement the AND:
-    # each fails-CLOSED (drives the query +HARD -> -HARD per key -> softmax1 sink
-    # wins) when its own condition is absent, and contributes ZERO (q=0) when
-    # present. A row missing EITHER condition is darkened by that slot; the LEV
-    # PC marker passes BOTH (q=0,0) so the address slots 4..27 + the STACK0-byte0
-    # selector decide the genuine return-store gather. A uniform additive on the
-    # passing rows would corrupt the softmax1 sink competition (forcing the head
-    # to fire on every PC marker), so the passing case MUST be exactly zero --
-    # hence the fail-closed-only (no negative-q firing-bonus) design.
-    #   slot 67: q = HARD*CONST - HARD*MARK_PC      (MARK_PC=1 -> 0 ; else +HARD)
-    #   slot 69: q = HARD*CONST - (HARD/5)*OP_LEV   (OP_LEV~5 -> 0 ; else +HARD)
-    #   both k = -CONST (present, value 1, at every real key; sink stays 0).
+    # === Slots 67/69: HARD (MARK_PC AND OP_LEV) fail-closed firing gate. ===
     if _widen and _l15_lev_pc_only_on():
         HARD = 5_000_000.0
-        q.append(AP(67, BD.CONST, HARD))
-        q.append(AP(67, BD.MARK_PC, -HARD))
-        k.append(AP(67, BD.CONST, -1.0))
-        q.append(AP(69, BD.CONST, HARD))
-        q.append(AP(69, BD.OP_LEV, -HARD / 4.0))
-        k.append(AP(69, BD.CONST, -1.0))
+        discs.append(CamDiscriminatorSlot(
+            slot=67, q=(("CONST", HARD), ("MARK_PC", -HARD)), k=(("CONST", -1.0),)))
+        discs.append(CamDiscriminatorSlot(
+            slot=69, q=(("CONST", HARD), ("OP_LEV", -HARD / 4.0)),
+            k=(("CONST", -1.0),)))
 
-    # === Slot 70: PER-STEP LEV-opcode firing gate (C4_L15_LEV_OPCODE_GATE). ===
-    # The slot-69 OP_LEV requirement is a CROSS-STEP DURABLE broadcast and so
-    # PERSISTS into the step AFTER the LEV (e.g. func_identity LEV@step8 then
-    # ADJ@step9, where OP_LEV is still +6.5 and MARK_PC=1 -> head 14 re-fires and
-    # pins the step-9 PC to 90 instead of 98). The per-step FETCHED opcode lives
-    # in OPCODE_BYTE_LO/HI as a sharp one-hot (LEV = 0x08 -> OPCODE_BYTE_LO+8 =
-    # 1.0 ONLY at the genuine LEV step; the post-LEV ADJ step is +7). This slot
-    # mirrors the slot-67/69 fail-closed design but keyed on OPCODE_BYTE_LO+8:
-    #   q = HARD*CONST - HARD*(OPCODE_BYTE_LO+8)  (=> 0 at the LEV step, +HARD
-    #                                              everywhere else)
-    #   k = -CONST (present, value 1, at every real key; sink stays 0)
-    # so a non-LEV-opcode row is driven to ~-1e9 (softmax1 -> zero sink, head
-    # writes ~nothing) while the genuine LEV step contributes exactly 0 and the
-    # address slots + STACK0-byte0 selector decide the genuine gather unchanged.
+    # === Slot 70: PER-STEP LEV-opcode fail-closed firing gate. ===
     if _widen and _l15_lev_opcode_gate_on():
         HARD = 5_000_000.0
-        q.append(AP(70, BD.CONST, HARD))
-        q.append(AP(70, BD.OPCODE_BYTE_LO + 8, -HARD))
-        k.append(AP(70, BD.CONST, -1.0))
+        discs.append(CamDiscriminatorSlot(
+            slot=70, q=(("CONST", HARD), ("OPCODE_BYTE_LO+8", -HARD)),
+            k=(("CONST", -1.0),)))
 
     # === Slot 64: OP_JSR return-store discriminator (ADDRESS-WIDENING). ===
-    # The deepest CAM-aliasing layer (after byte-0 separates 0xFFF0 from the
-    # wrong-frame 0xFFF8): the genuine return store and a SAME-ADDRESS stale
-    # store both sit at 0xFFF0. The stale store is the callee's saved-BP word,
-    # pushed by the ENT prologue (its token rows carry OP_ENT ~18, OP_JSR ~2);
-    # the GENUINE return-address word was pushed by the caller's JSR (its rows
-    # carry OP_JSR ~18, OP_ENT ~0). OP_JSR is therefore a clean, VALUE-
-    # INDEPENDENT key that distinguishes the return word from the saved-BP word
-    # at the same address -- the address-encoding "widening" the brief asked for
-    # (the store's writing-opcode tag makes its identity unique without changing
-    # its 24-bit address, so the BP+8 query still matches). The store anchor
-    # alone lets the higher-MEM_STORE saved-BP word win by ~705; boosting OP_JSR
-    # K by ~500 reverses that (probe tools/_probe_lev_realattn + the OP_JSR/
-    # BYTE_INDEX_0 re-score: pos164 saved-BP -> pos268 JSR-return).
     JSR_DISC = float(_l15_lev_jsr_disc_strength())
     if _widen and JSR_DISC > 0.0:
-        q.append(AP(64, BD.OP_LEV, 1.0))
-        q.append(AP(64, BD.MARK_PC, 1.0))
-        q.append(AP(64, BD.CONST, -1.0))
-        k.append(AP(64, BD.OP_JSR, JSR_DISC))
-        k.append(AP(64, BD.OP_ENT, -JSR_DISC))
+        discs.append(CamDiscriminatorSlot(
+            slot=64,
+            q=(("OP_LEV", 1.0), ("MARK_PC", 1.0), ("CONST", -1.0)),
+            k=(("OP_JSR", JSR_DISC), ("OP_ENT", -JSR_DISC)),
+        ))
 
     # === Slot 65: K-side byte-0 selection (reject byte-1/2/3 store rows). ===
-    # The OP_JSR boost on its own promotes the byte-1/2/3 rows of the SAME JSR
-    # store (they also carry OP_JSR ~18) over the byte-0 row. A strong K-side
-    # byte-0 selector keeps the gather on the byte-0 row (the one whose
-    # CLEAN_EMBED is the return-PC byte 0). Unlike the legacy slot-3 selector
-    # (Q-side, which never fires because the LEV query is a PC-marker not a
-    # STACK0 byte-0 row), this is purely K-side: reward BYTE_INDEX_0, punish
-    # BYTE_INDEX_1/2/3, so only the byte-0 store row survives.
     if _widen and JSR_DISC > 0.0:
         BSEL = float(_l15_lev_byte0_select_strength())
-        q.append(AP(65, BD.OP_LEV, 1.0))
-        q.append(AP(65, BD.MARK_PC, 1.0))
-        q.append(AP(65, BD.CONST, -1.0))
-        k.append(AP(65, BD.BYTE_INDEX_0, BSEL))
-        k.append(AP(65, BD.BYTE_INDEX_1, -BSEL))
-        k.append(AP(65, BD.BYTE_INDEX_2, -BSEL))
-        k.append(AP(65, BD.BYTE_INDEX_3, -BSEL))
+        discs.append(CamDiscriminatorSlot(
+            slot=65,
+            q=(("OP_LEV", 1.0), ("MARK_PC", 1.0), ("CONST", -1.0)),
+            k=(("BYTE_INDEX_0", BSEL), ("BYTE_INDEX_1", -BSEL),
+               ("BYTE_INDEX_2", -BSEL), ("BYTE_INDEX_3", -BSEL)),
+        ))
 
-    # === Slot 68: STACK0-byte0 return-store selector (C4_L15_LEV_PC_ONLY). ===
-    # Deepest LEV CAM aliasing: the saved-BP word's MEM-frame byte-0 row (e.g.
-    # func_identity_0 pos264, value 0xF0=240) and the GENUINE return store (the
-    # JSR-pushed STACK0 byte-0 row, pos269, value 0x5a=90) BOTH sit at addr
-    # 0xFFF0 AND BOTH carry BYTE_INDEX_0 + OP_JSR -- so slots 64/65 reward them
-    # equally and the higher-MEM_STORE saved-BP MEM rows (anchor slot 1) win by
-    # ~263 (probe tools/_probe_lev_head14_keys 550 8: pos267 558622 vs the
-    # genuine pos269 558359). The ONE clean separator is ``STACK0_BYTE0``: the
-    # return store is the live STACK0 push (STACK0_BYTE0~1.0) while every
-    # saved-BP / MEM-image row has STACK0_BYTE0~0. A strong K-side reward on
-    # STACK0_BYTE0, gated by the LEV PC query, pulls the gather onto the genuine
-    # return value byte-0 (90). Only emitted in the PC-ONLY decouple build (the
-    # base widen build is unchanged), so it folds into the same cache key.
+    # === Slot 68: STACK0-byte0 return-store selector (PC-ONLY decouple). ===
     if _widen and _l15_lev_pc_only_on():
         STK0_SEL = 40000.0
-        q.append(AP(68, BD.OP_LEV, 1.0))
-        q.append(AP(68, BD.MARK_PC, 1.0))
-        q.append(AP(68, BD.CONST, -1.0))
-        k.append(AP(68, BD.STACK0_BYTE0, STK0_SEL))
+        discs.append(CamDiscriminatorSlot(
+            slot=68,
+            q=(("OP_LEV", 1.0), ("MARK_PC", 1.0), ("CONST", -1.0)),
+            k=(("STACK0_BYTE0", STK0_SEL),),
+        ))
 
     # === Slot 1: Store anchor -- only store K cross the threshold. ===
-    q.append(AP(1, BD.OP_LEV, 50.0))
-    q.append(AP(1, BD.MARK_PC, 50.0))
-    k.append(AP(1, BD.MEM_STORE, 100.0))
-    k.append(AP(1, BD.CONST, -50.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=1, q=(("OP_LEV", 50.0), ("MARK_PC", 50.0)),
+        k=(("MEM_STORE", 100.0), ("CONST", -50.0))))
 
     # === Slot 2: ZFOD negative offset for store entries (mirror head 0). ===
-    q.append(AP(2, BD.CONST, -96.0))
-    k.append(AP(2, BD.MEM_STORE, 50.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=2, q=(("CONST", -96.0),), k=(("MEM_STORE", 50.0),)))
 
     # === Slot 3: Byte selection -- pick byte 0 of the matched store. ===
-    # The return-address store byte-0 sits at the STACK0 byte-0 row
-    # (L2H0[MEM]=1, H1[MEM]=0), exactly as head 0's byte-0 selection.
     BS = 60.0
-    q.append(AP(3, BD.MARK_STACK0, BS))
-    q.append(AP(3, BD.BYTE_INDEX_0, BS))
-    k.append(AP(3, BD.L2H0 + MEM_I, BS))
-    k.append(AP(3, BD.H1 + MEM_I, -BS))
-
-    # === Slots 4..27: 24-bit binary address encoding (mirror head 0). ===
-    #
-    # ADDRESS-WIDENING (C4_L15_LEV_B0_BOOST, default ON): the BYTE-0 address
-    # nibbles get a higher per-bit scale than byte-1/byte-2. The CAM-aliasing
-    # wall for the LEV return-address restore is that the genuine return store
-    # (e.g. func_identity_0 pos 268, mem[inner_BP+8]=0xFFF0, value 90) and the
-    # WRONG-FRAME return store (pos 129, mem[outer_BP+8]=0xFFF8, value 10)
-    # differ ONLY in address BYTE 0 (one stack slot, 0xF0 vs 0xF8) -- their
-    # byte-1/byte-2 keys are identical (0xFF/0x00) and they share the same real
-    # MEM_STORE anchor. At the uniform scale=10 the genuine store LOSES because
-    # (a) its byte-1 address one-hot is softer (residual pk ~1.74 vs 2.0, a
-    # store-time encoding accident) costing it ~3053 on the byte-1 bipolar bit
-    # match, while (b) the byte-0 bit it WINS on contributes only ~139 because
-    # the L9 BP+8 query key's byte-0 lo-nibble is weakly encoded (pk ~0.41).
-    # Amplifying ONLY the byte-0 bits makes the genuine same-byte-0 match
-    # dominate the byte-1 softness gap, so the head attends the correct
-    # return-address store. Re-score probe (tools/_probe_lev_rescore.py 550 8):
-    # the winner flips from pos 129 (wrong, 0xFFF8) to pos 268 (correct,
-    # 0xFFF0) at a byte-0 scale multiplier of 5; the default 8x gives a ~5857
-    # attention-logit margin (softmax ~1.0 on the genuine store). Byte-1/byte-2
-    # keep scale=10 so the address VALUE still gates (0x..F0 stores beat the
-    # 0x..00 MEM-image rows). The boost only ever lands when the head exists
-    # (parent flag C4_L15_LEV_PC_RESTORE on), so flag-off is byte-identical.
-    scale = 10.0
-    b0_scale = scale * (_l15_lev_b0_boost_factor() if _widen else 1.0)
-    addr_dim = 4
-    addr_bases = [
-        (BD.ADDR_B0_LO, BD.ADDR_B0_HI, b0_scale),
-        (BD.ADDR_B1_LO, BD.ADDR_B1_HI, scale),
-        (BD.ADDR_B2_LO, BD.ADDR_B2_HI, scale),
-    ]
-    for ab_lo, ab_hi, byte_scale in addr_bases:
-        for nibble_base in (ab_lo, ab_hi):
-            for bit in range(4):
-                for nk in range(16):
-                    bit_val = 2 * ((nk >> bit) & 1) - 1
-                    q.append(AP(addr_dim, nibble_base + nk, byte_scale * bit_val))
-                    k.append(AP(addr_dim, nibble_base + nk, byte_scale * bit_val))
-                addr_dim += 1
+    discs.append(CamDiscriminatorSlot(
+        slot=3, q=(("MARK_STACK0", BS), ("BYTE_INDEX_0", BS)),
+        k=((f"L2H0+{MEM_I}", BS), (f"H1+{MEM_I}", -BS))))
 
     # === Slot 28: Per-head position gate (fire at the LEV PC marker). ===
-    q.append(AP(28, BD.CONST, -500.0))
-    q.append(AP(28, BD.OP_LEV, 500.0))
-    q.append(AP(28, BD.MARK_PC, 500.0))
-    k.append(AP(28, BD.CONST, 5.0))
+    discs.append(CamDiscriminatorSlot(
+        slot=28, q=(("CONST", -500.0), ("OP_LEV", 500.0), ("MARK_PC", 500.0)),
+        k=(("CONST", 5.0),)))
+
+    # === Slots 4..27: 24-bit binary address encoding (mirror head 0). ===
+    # The base block scores every address bit at the uniform per-bit scale 10.0;
+    # the byte-0 nibbles (slots 4..11, bands ADDR_B0_LO/HI) are RE-WRITTEN at the
+    # boosted scale via last-write-wins discriminators when C4_L15_LEV_B0_BOOST
+    # is on (default 8x) -- the deepest CAM aliasing separator (0xFFF0 vs 0xFFF8
+    # differ only in address byte 0). Byte-1/2 keep scale=10.
+    scale = 10.0
+    addr = CamBinaryAddressBlock(
+        nibble_bands=("ADDR_B0_LO", "ADDR_B0_HI",
+                      "ADDR_B1_LO", "ADDR_B1_HI",
+                      "ADDR_B2_LO", "ADDR_B2_HI"),
+        scale=scale, slot_base=4, width_bits=4,
+    )
+    b0_factor = _l15_lev_b0_boost_factor() if _widen else 1.0
+    if b0_factor != 1.0:
+        b0_scale = scale * b0_factor
+        for band_i, base in enumerate(("ADDR_B0_LO", "ADDR_B0_HI")):
+            for bit in range(4):
+                slot = 4 + band_i * 4 + bit
+                qk = tuple(
+                    (f"{base}+{nk}", b0_scale * (2 * ((nk >> bit) & 1) - 1))
+                    for nk in range(16)
+                )
+                discs.append(CamDiscriminatorSlot(slot=slot, q=qk, k=qk))
 
     # === V/O: copy matched store byte value to OUTPUT (mirror head 0). ===
-    # value_scale=40.0 mirrors the working head-0 LI/LC load O scaling (see
-    # ``_layer15_memory_lookup_heads_0_3_specs_with_overrides``); the scaffold's
-    # original 1.0 left the delivered byte at residual magnitude ~1.0 at the
-    # L15 block, far too weak to register as a clean OUTPUT one-hot. At 40.0 the
-    # gathered return-address byte lands as a sharp OUTPUT_LO/HI one-hot exactly
-    # like an LI load. Only with the address-widening flag (the strong write is
-    # what makes the boosted head clobber LI/LC loads); flag-off keeps the
-    # byte-identical scaffold 1.0.
+    # value_scale=40.0 mirrors the head-0 LI/LC load O scaling; flag-off keeps
+    # the byte-identical scaffold 1.0.
     value_scale = 40.0 if _widen else 1.0
-    v: list[AP] = []
-    o: list[AO] = []
-    for kk in range(16):
-        v.append(AP(32 + kk, BD.CLEAN_EMBED_LO + kk, 1.0))
-        v.append(AP(48 + kk, BD.CLEAN_EMBED_HI + kk, 1.0))
-        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
-        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
+    value_bands = (
+        CamValueBand("CLEAN_EMBED_LO", "OUTPUT_LO", 16, 32, value_scale),
+        CamValueBand("CLEAN_EMBED_HI", "OUTPUT_HI", 16, 48, value_scale),
+    )
 
-    return DeclarativeAttentionHeadSpec(
-        head_idx=_L15_LEV_PC_RESTORE_HEAD_IDX,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-        # The return-address store was written on the JSR step; the LEV
-        # lookup reads it across step boundaries by design (memory
-        # persistence) -- ANY_STEP encodes that the verifier should not
-        # flag it as a CURRENT_STEP_ONLY violation.
+    cam = CamBinaryAddressMatch(
+        name="layer15_lev_pc_restore",
+        address=addr,
+        discriminators=tuple(discs),
+        value_bands=value_bands,
+        # The return-address store was written on the JSR step; the LEV lookup
+        # reads it across step boundaries by design (memory persistence).
         step_window=StepWindowConstraint.ANY_STEP,
     )
+    dim_map = _layer15_lev_pc_restore_dim_map(BD)
+    return cam_binary_address_match(cam).head_spec_builder(
+        dim_map, _L15_LEV_PC_RESTORE_HEAD_IDX
+    )
+
+
+def _layer15_savedra_pc_dim_map(BD) -> dict:
+    """Resolve every dim NAME the L15 savedra-PC opcode-gather head 15 touches."""
+    base_names = (
+        "CONST", "OP_LEV", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
+        "MARK_STACK0", "MARK_MEM", "IS_BYTE", "OP_JSR", "OPCODE_BYTE_LO",
+        "LOOKAHEAD_PC_LO", "LOOKAHEAD_PC_HI", "OUTPUT_LO", "OUTPUT_HI",
+    )
+    return {n: int(getattr(BD, n)) for n in base_names}
 
 
 def _layer15_savedra_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
@@ -2852,123 +2768,80 @@ def _layer15_savedra_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     Campaign-gated (``C4_L15_SAVEDRA_HEAD``); flag-off omits the head so the
     golden (15-head) build is byte-identical.
     """
-    q: list[AP] = []
-    k: list[AP] = []
+    # DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): head 15 is a
+    # small OPCODE-CONTENT gather (no binary address key) re-expressed
+    # byte-identically through :func:`isa_semantics_dsl.cam_binary_address_match`
+    # with an EMPTY :class:`CamBinaryAddressBlock` (``nibble_bands=()``) -- the
+    # same discriminator-only-CAM shape the L14 mem-generation STORE head uses.
+    # Every firing/selector/gate row is a :class:`CamDiscriminatorSlot` (DATA);
+    # the LOOKAHEAD_PC->OUTPUT relay is a pair of :class:`CamValueBand`. The
+    # hand-authored per-cell Q/K/V/O directive is deleted.
+    SEL = 40.0    # slot 1: JSR-step AX-marker selector reward (OP_JSR dominant).
+    REJ = 200.0   # slot 2: require MARK_AX (reject the JSR step's NON-AX rows).
+    GATE = 1_000_000.0  # slot 3: per-step LEV-opcode fail-closed firing gate.
+    value_scale = 80.0  # V/O: 2x the plain-load 40 to out-write the LEV 0xF default.
 
-    # The head is a content-addressable gather: the query (at the LEV PC marker)
-    # rewards the UNIQUE row that carries BOTH OP_JSR and MARK_AX (the JSR step's
-    # AX marker, where LOOKAHEAD_PC = JSR_PC + 8 = the return PC is a live
-    # one-hot). Recency (ALiBi) selects the most-recent JSR for nested/recursive
-    # calls; a CONST sink anchors softmax1 so a no-JSR LEV writes ~nothing.
-    #
-    # Scoring is kept to MODERATE magnitudes (a clean per-byte one-hot is ~1.0 but
-    # the opcode/marker residuals are 0.9..7, so a 1e6-scale HARD gate would blow
-    # the softmax up on a 0.92 opcode one-hot -- the empirical -3.7e4 uniform sink
-    # that buried the first cut). The genuine JSR-AX row must score strongly
-    # POSITIVE so it beats the zero sink; every other row stays <= 0.
-
-    # === Slot 0: fire ONLY at the LEV PC marker (the query gate). ===
-    # q is positive only when OP_LEV (~5 at the LEV PC marker) AND MARK_PC are
-    # present; a CONST baseline keeps the head dark on non-LEV rows. Suppress the
-    # LEV step's own AX/SP/BP/STACK0/MEM marker + byte rows so the head only
-    # *queries* from the PC marker (it must not fire as a query at, e.g., the LEV
-    # AX marker and gather there). k=CONST so this is a uniform per-query gate.
-    q.append(AP(0, BD.CONST, -3.0))
-    q.append(AP(0, BD.OP_LEV, 1.0))
-    q.append(AP(0, BD.MARK_PC, 1.0))
-    q.append(AP(0, BD.MARK_AX, -1000.0))
-    q.append(AP(0, BD.MARK_SP, -1000.0))
-    q.append(AP(0, BD.MARK_BP, -1000.0))
-    q.append(AP(0, BD.MARK_STACK0, -1000.0))
-    q.append(AP(0, BD.MARK_MEM, -1000.0))
-    q.append(AP(0, BD.IS_BYTE, -1000.0))
-    k.append(AP(0, BD.CONST, 30.0))
-
-    # === Slot 1: JSR-step AX-marker selector (the gather target reward). ===
-    # On a firing query (q positive only at the LEV PC marker) reward keys by
-    # OP_JSR (~5 on the JSR step's rows, ~0.1..1.2 broadcast residue elsewhere)
-    # gated by MARK_AX (1.0 only on the AX marker). OP_JSR is the DOMINANT term so
-    # the JSR-step AX row (OP_JSR~5) decisively beats other steps' AX markers
-    # (OP_JSR~0.1..1.2 -> score collapses) -- those carry MARK_AX too but their
-    # OP_JSR residue is small, so a large OP_JSR coefficient separates them. A
-    # MARK_AX requirement (added as a positive gate, removed below as a hard
-    # not-blocker via slot 2 for the non-AX JSR rows) keeps the gather on the AX
-    # row where LOOKAHEAD_PC is live.
-    SEL = 40.0
-    q.append(AP(1, BD.OP_LEV, 1.0))
-    q.append(AP(1, BD.MARK_PC, 1.0))
-    q.append(AP(1, BD.CONST, -2.0))
-    k.append(AP(1, BD.OP_JSR, SEL))
-    k.append(AP(1, BD.MARK_AX, 0.5 * SEL))
-    k.append(AP(1, BD.CONST, -0.7 * SEL))
-
-    # === Slot 2: require MARK_AX (reject the JSR step's NON-AX rows). ===
-    # OP_JSR also broadcasts onto the JSR step's PC/SP/BP/MEM-store/byte rows
-    # (where LOOKAHEAD_PC is 0). A strong NOT-MARK_AX penalty drives every non-AX
-    # key far negative so the gather lands on the AX marker. The JSR AX row has
-    # MARK_AX=1 -> the (1 - MARK_AX) penalty is 0 there.
-    REJ = 200.0
-    q.append(AP(2, BD.OP_LEV, 1.0))
-    q.append(AP(2, BD.MARK_PC, 1.0))
-    q.append(AP(2, BD.CONST, -2.0))
-    k.append(AP(2, BD.CONST, -REJ))
-    k.append(AP(2, BD.MARK_AX, REJ))
-
-    # === Slot 3: per-step LEV-opcode firing gate (fail-closed, the ADJ guard). ===
-    # OP_LEV is a CROSS-STEP DURABLE broadcast ("last-executed opcode was LEV") so
-    # it PERSISTS into the step AFTER the LEV (func_identity LEV@8 -> ADJ@9, where
-    # OP_LEV is still ~6.5 and MARK_PC=1). Without this the head re-fires at the
-    # post-LEV ADJ PC marker and PINS step-9 PC to 90 instead of advancing to 98.
-    # OPCODE_BYTE_LO+8 (the per-step FETCHED opcode) is a sharp one-hot == 1.0
-    # EXACTLY at the genuine LEV step and 0 at every other step (measured: LEV
-    # opcode 0x08 -> OPCODE_BYTE_LO+8 == 1.0 at row 348; the post-LEV ADJ step is
-    # OPCODE_BYTE_LO+7). This is the SAME discriminator head 14 uses (slot 70).
-    #   q = GATE*CONST - GATE*(OPCODE_BYTE_LO+8)  (=> 0 at LEV step, +GATE else)
-    #   k = -CONST at every real key (sink stays 0)
-    # so a non-LEV-opcode row is driven GATE below the sink -> head writes nothing.
-    # GATE must dominate AFTER the head_dim^-0.5 score scale (~0.095): the winning
-    # JSR-AX score is ~90, so GATE*0.095 must be >> 90 -> GATE >= ~1e4. Use 1e6
-    # (mirrors head-14's slot-70 HARD) so the post-LEV ADJ step (OPCODE_BYTE_LO+8
-    # == 0, measured) is driven ~-1e5 below the sink and the head writes nothing
-    # there; at the genuine LEV step (OPCODE_BYTE_LO+8 == 1.0, measured) q[3] == 0
-    # so the gather proceeds unchanged.
-    GATE = 1_000_000.0
-    q.append(AP(3, BD.CONST, GATE))
-    q.append(AP(3, BD.OPCODE_BYTE_LO + 8, -GATE))
-    k.append(AP(3, BD.CONST, -1.0))
-
-    # === V/O: copy the matched JSR AX row's LOOKAHEAD_PC to OUTPUT. ===
-    # value_scale 80 (vs the LI/LC + head-14's 40): the LEV PC marker already
-    # carries a STRONG 0xF high-nibble default (the LEV sign-extension of the
-    # saved-BP word 0xfff0 -> OUTPUT_HI+15 ~= 40 at the L15 block). The delivered
-    # return-PC high nibble (0x5) must out-write that existing 0xF, so push the
-    # value 2x harder than a plain load.
-    value_scale = 80.0
-    v: list[AP] = []
-    o: list[AO] = []
-    for kk in range(16):
-        v.append(AP(32 + kk, BD.LOOKAHEAD_PC_LO + kk, 1.0))
-        v.append(AP(48 + kk, BD.LOOKAHEAD_PC_HI + kk, 1.0))
-        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
-        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
-
-    return DeclarativeAttentionHeadSpec(
-        head_idx=_L15_SAVEDRA_HEAD_IDX,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
+    discs = (
+        # Slot 0: fire ONLY at the LEV PC marker (the query gate); suppress the
+        # LEV step's own AX/SP/BP/STACK0/MEM marker + byte rows.
+        CamDiscriminatorSlot(
+            slot=0,
+            q=(("CONST", -3.0), ("OP_LEV", 1.0), ("MARK_PC", 1.0),
+               ("MARK_AX", -1000.0), ("MARK_SP", -1000.0), ("MARK_BP", -1000.0),
+               ("MARK_STACK0", -1000.0), ("MARK_MEM", -1000.0),
+               ("IS_BYTE", -1000.0)),
+            k=(("CONST", 30.0),),
+        ),
+        # Slot 1: JSR-step AX-marker selector (OP_JSR dominant, MARK_AX gate).
+        CamDiscriminatorSlot(
+            slot=1,
+            q=(("OP_LEV", 1.0), ("MARK_PC", 1.0), ("CONST", -2.0)),
+            k=(("OP_JSR", SEL), ("MARK_AX", 0.5 * SEL), ("CONST", -0.7 * SEL)),
+        ),
+        # Slot 2: require MARK_AX (reject the JSR step's NON-AX rows).
+        CamDiscriminatorSlot(
+            slot=2,
+            q=(("OP_LEV", 1.0), ("MARK_PC", 1.0), ("CONST", -2.0)),
+            k=(("CONST", -REJ), ("MARK_AX", REJ)),
+        ),
+        # Slot 3: per-step LEV-opcode fail-closed firing gate (the ADJ guard;
+        # SAME discriminator head 14 uses at its slot 70).
+        CamDiscriminatorSlot(
+            slot=3,
+            q=(("CONST", GATE), ("OPCODE_BYTE_LO+8", -GATE)),
+            k=(("CONST", -1.0),),
+        ),
+    )
+    value_bands = (
+        CamValueBand("LOOKAHEAD_PC_LO", "OUTPUT_LO", 16, 32, value_scale),
+        CamValueBand("LOOKAHEAD_PC_HI", "OUTPUT_HI", 16, 48, value_scale),
+    )
+    cam = CamBinaryAddressMatch(
+        name="layer15_savedra_pc",
+        address=CamBinaryAddressBlock(
+            nibble_bands=(), scale=0.0, slot_base=4, width_bits=4),
+        discriminators=discs,
+        value_bands=value_bands,
         # Strong per-head ALiBi recency so the MOST-RECENT JSR's AX row wins over
-        # an identical earlier JSR-AX row (the prelude / a prior call's AX marker
-        # also carries OP_JSR + MARK_AX). slope 0.1 over the 30-token step stride
-        # gives ~3 logits/step of recency -- enough to break a same-program
-        # duplicate at >=1 step away while still reaching the JSR several steps
-        # before the LEV (nested/recursive calls return to the innermost JSR).
+        # an identical earlier JSR-AX row (nested/recursive calls).
         alibi_slope=0.1,
-        # The return addr (LOOKAHEAD_PC) was computed on the JSR step; the LEV
-        # gather reads it across step boundaries by design -> ANY_STEP.
+        # LOOKAHEAD_PC was computed on the JSR step; the LEV gather reads it
+        # across step boundaries by design -> ANY_STEP.
         step_window=StepWindowConstraint.ANY_STEP,
     )
+    dim_map = _layer15_savedra_pc_dim_map(BD)
+    return cam_binary_address_match(cam).head_spec_builder(
+        dim_map, _L15_SAVEDRA_HEAD_IDX
+    )
+
+
+def _layer15_si_store_addr_cam_dim_map(BD) -> dict:
+    """Resolve every dim NAME the L15 SI-store-addr CAM head 16 touches."""
+    base_names = (
+        "OP_LI", "CONST", "MARK_AX", "OP_PSH", "OUTPUT_LO", "OUTPUT_HI",
+        "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI",
+    )
+    return {n: int(getattr(BD, n)) for n in base_names}
 
 
 def _layer15_si_store_addr_cam_head_spec(BD) -> DeclarativeAttentionHeadSpec:
@@ -3009,149 +2882,77 @@ def _layer15_si_store_addr_cam_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     (``C4_SI_STORE_ADDR``); flag-off omits the head (num_heads<17) so the golden
     campaign (16-head) build is byte-identical.
     """
+    # DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): head 16 is a
+    # 12-bit ADDR_B0 content-addressable match (Q keys AX_CARRY, K keys ADDR_B0
+    # -- a per-nibble one-hot match, NOT the symmetric binary per-bit block), so
+    # it is re-expressed byte-identically through
+    # :func:`isa_semantics_dsl.cam_binary_address_match` with an EMPTY
+    # :class:`CamBinaryAddressBlock` (``nibble_bands=()``) and the per-nibble
+    # match + every firing/reject gate authored as :class:`CamDiscriminatorSlot`
+    # DATA. The AX_CARRY->OUTPUT relay is a pair of :class:`CamValueBand`. The
+    # hand-authored per-cell Q/K/V/O directive is deleted.
     _cam_s = 360.0    # per-nibble address-match scale (mirrors #313 head-0 CAM).
     _sink = 30.0      # softmax1 CONST sink (mirrors the savedra head).
     _psh_rej = 400.0  # K-side OP_PSH penalty (reject the address-push row).
     value_scale = 60.0
+    _dark = 10_000_000.0  # HARD fire-gate magnitude (MARK_AX + OP_LI query gates).
+    _ax_req = 2000.0  # slot 60: REQUIRE MARK_AX (reject the store VALUE BYTE rows).
 
-    q: list[AP] = []
-    k: list[AP] = []
-
-    # === Slot 0: CONST sink (softmax1 anchor). ===
-    # A uniform positive K on every real row's CONST, matched by a small Q, so
-    # that when NO candidate scores positive (the slot-59 darkener below fires)
-    # the softmax mass lands on this sink and the head writes ~nothing.
-    q.append(AP(0, BD.OP_LI, 1.0))
-    k.append(AP(0, BD.CONST, _sink))
-
-    # === Slot 59: fire ONLY at the byte-0 AX-marker QUERY row (MARK_AX). ===
-    # The head must write OUTPUT ONLY at the LI byte-0 emit row (the AX marker,
-    # MARK_AX=1), NOT at the byte-1/2/3 value rows (492-494: MARK_AX=0, IS_BYTE=1)
-    # -- those rows ALSO carry an AX_CARRY residue (~3.1) so the pure address
-    # match would fire there and copy the store value into byte 1/2/3, corrupting
-    # the high bytes (the 0x1717 fingerprint). This slot is a QUERY-side gate: on
-    # a non-MARK_AX query row it drives EVERY real candidate's score far negative
-    # (K=CONST is 1 on all rows) so the softmax1 sink wins and the head writes ~0;
-    # on the byte-0 AX-marker query row (MARK_AX=1) Q[59]=0 so the address match
-    # proceeds unchanged. Q = DARK*(MARK_AX - CONST): 0 at the marker, -DARK at
-    # every byte/non-marker query row. DARK must dominate AFTER the head_dim^-0.5
-    # score scale: the byte rows carry AX_CARRY at ~3x amplitude so their address
-    # match scores ~3e5; a HARD 1e7 gate drives a non-marker query ~-1e6 below
-    # the sink (mirrors the savedra head's slot-3 1e6 HARD gate).
-    _dark = 10_000_000.0
-    q.append(AP(59, BD.MARK_AX, _dark))
-    q.append(AP(59, BD.CONST, -_dark))
-    k.append(AP(59, BD.CONST, 1.0))
-
-    # === Slot 57: fire ONLY on an LI/LC EMIT QUERY row (require OP_LI). ===
-    # MARK_AX alone (slot 59) is NOT enough: EVERY step emits an AX marker
-    # (MARK_AX=1), including the step-0 ENT prologue, and those markers carry an
-    # AX_CARRY residue too -- so without an OP_LI requirement the head fires on
-    # every step's AX marker and copies a stray store value into that step's AX
-    # byte (the AR step-0 ax=3 divergence). This slot darkens any query row whose
-    # OP_LI is below the LI-emit threshold (~5.2 at a real LI, ~0 elsewhere):
-    # Q = DARK*(OP_LI - 2.5*CONST) -> +DARK*2.7 at an LI row (NO darkening),
-    # -DARK*2.5 at a non-LI marker (HARD darken -> sink wins). K=CONST=1.
-    q.append(AP(57, BD.OP_LI, _dark))
-    q.append(AP(57, BD.CONST, -2.5 * _dark))
-    k.append(AP(57, BD.CONST, 1.0))
-
-    # === Slots 1..16: address-match Q(AX_CARRY) . K(ADDR_B0), LOW nibble. ===
-    # The LI-query row carries its TARGET address in AX_CARRY_LO (nibble n); the
-    # store marker carries its STORE address in ADDR_B0_LO (nibble n). A PURE
-    # per-nibble one-hot match (Q on AX_CARRY_LO+n, K on ADDR_B0_LO+n) scores
-    # ~_cam_s^2/sqrt(hd) ONLY on the store marker whose nibble n EQUALS the
-    # queried nibble. CRITICAL: the match slots carry NO OP_LI/CONST baseline --
-    # a per-slot constant Q would multiply EVERY candidate's ADDR_B0 residue
-    # (rewarding address MASS, not the specific nibble MATCH) and let a wrong
-    # store's stray ADDR_B0 residue out-score the exact match. The OP_LI firing
-    # gate lives on the dedicated slots 59/60 instead. INCLUDE the k=0 (null)
-    # nibble: unlike the head-0 #313 CAM (which reads the address-blind VALUE
-    # rows where a stray 0x00 out-scores the local), this head's tight MARK_AX +
-    # OP_PSH/OP_LI reject gates restrict candidates to genuine store markers, so
-    # a target address ending in nibble 0 (e.g. &b=0xE0, LO nibble 0) MUST be
-    # matchable to discriminate it from a same-high-nibble sibling (&a=0xE8).
+    discs: list[CamDiscriminatorSlot] = []
+    # Slot 0: CONST sink (softmax1 anchor), gated on the OP_LI query.
+    discs.append(CamDiscriminatorSlot(slot=0, q=(("OP_LI", 1.0),), k=(("CONST", _sink),)))
+    # Slot 59: fire ONLY at the byte-0 AX-marker QUERY row (MARK_AX gate).
+    discs.append(CamDiscriminatorSlot(
+        slot=59, q=(("MARK_AX", _dark), ("CONST", -_dark)), k=(("CONST", 1.0),)))
+    # Slot 57: fire ONLY on an LI/LC EMIT QUERY row (require OP_LI).
+    discs.append(CamDiscriminatorSlot(
+        slot=57, q=(("OP_LI", _dark), ("CONST", -2.5 * _dark)), k=(("CONST", 1.0),)))
+    # Slots 1..16: per-nibble address match Q(AX_CARRY_LO) . K(ADDR_B0_LO). The
+    # k=0 (null) LO nibble uses slot 16 (slot 0 is the CONST sink).
     for _k in range(0, 16):
-        # LO band: slot k for k=1..15, slot 16 for the k=0 (null) LO nibble
-        # (slot 0 is the CONST sink; keep k=0 off it).
         _row = _k if _k >= 1 else 16
-        q.append(AP(_row, BD.AX_CARRY_LO + _k, _cam_s))
-        k.append(AP(_row, BD.ADDR_B0_LO + _k, _cam_s))
-
-    # === Slots 17..31 + 58: address-match Q(AX_CARRY) . K(ADDR_B0), HIGH nibble.
+        discs.append(CamDiscriminatorSlot(
+            slot=_row, q=((f"AX_CARRY_LO+{_k}", _cam_s),),
+            k=((f"ADDR_B0_LO+{_k}", _cam_s),)))
+    # Slots 17..31 + 58: HIGH-nibble match; the k=0 (null) HI nibble uses slot 58.
     for _k in range(0, 16):
-        # HI band: slot 16+k for k=1..15, slot 58 for the k=0 (null) HI nibble.
         _row = (16 + _k) if _k >= 1 else 58
-        q.append(AP(_row, BD.AX_CARRY_HI + _k, _cam_s))
-        k.append(AP(_row, BD.ADDR_B0_HI + _k, _cam_s))
+        discs.append(CamDiscriminatorSlot(
+            slot=_row, q=((f"AX_CARRY_HI+{_k}", _cam_s),),
+            k=((f"ADDR_B0_HI+{_k}", _cam_s),)))
+    # Slot 62: reject the address-COMPUTATION push row (-OP_PSH, OP_LI-gated).
+    discs.append(CamDiscriminatorSlot(
+        slot=62, q=(("OP_LI", _psh_rej), ("CONST", -0.05 * _psh_rej)),
+        k=(("OP_PSH", -_psh_rej),)))
+    # Slot 61: reject the LI-query row ITSELF (self-attention guard, -OP_LI).
+    discs.append(CamDiscriminatorSlot(
+        slot=61, q=(("OP_LI", _psh_rej), ("CONST", -0.05 * _psh_rej)),
+        k=(("OP_LI", -_psh_rej),)))
+    # Slot 60: REQUIRE MARK_AX (reject the store VALUE BYTE rows).
+    discs.append(CamDiscriminatorSlot(
+        slot=60, q=(("OP_LI", 2.0 * _cam_s), ("CONST", -0.05 * 2.0 * _cam_s)),
+        k=(("MARK_AX", _ax_req), ("CONST", -_ax_req))))
 
-    # === Slot 62: reject the address-COMPUTATION push row. ===
-    # For a BP-local whose address byte-0 nibbles equal the loaded local's
-    # address (id275 ``&a``: the LEA/PSH row @251 carries ADDR_B0=0xE8 AND
-    # AX_CARRY=0xE8=address, OP_PSH~5.2), the address match ALSO fires on that
-    # push row. The genuine store-value marker (@281) carries OP_PSH~0.05, so a
-    # K-side -OP_PSH penalty (gated on the OP_LI firing query) drives the push
-    # row's score far below the store marker's. Slot 62 (head_dim 111; the base
-    # spec does not use this head so all slots are free — pick high slots to
-    # stay clear of any generate_attention_head scaffolding).
-    q.append(AP(62, BD.OP_LI, _psh_rej))
-    q.append(AP(62, BD.CONST, -0.05 * _psh_rej))
-    k.append(AP(62, BD.OP_PSH, -_psh_rej))
-
-    # === Slot 61: reject the LI-query row ITSELF (self-attention guard). ===
-    # The LI byte-0 lookup row (@491) carries an address-like ADDR_B0 (its OWN
-    # target address 0xE8), so the Q(AX_CARRY) . K(ADDR_B0) match ALSO fires on
-    # the query row itself -- and self-attending copies its OWN AX_CARRY (=the
-    # target address 0xE8=232, WRONG) into OUTPUT, out-scoring the genuine store
-    # marker. The query row is the UNIQUE candidate carrying OP_LI~5.2 (the store
-    # markers have OP_LI~0.05), so a K-side -OP_LI penalty (gated on the firing
-    # query) drives the self-row far below the store marker.
-    q.append(AP(61, BD.OP_LI, _psh_rej))
-    q.append(AP(61, BD.CONST, -0.05 * _psh_rej))
-    k.append(AP(61, BD.OP_LI, -_psh_rej))
-
-    # === Slot 60: REQUIRE MARK_AX (reject the store VALUE BYTE rows). ===
-    # THE key candidate filter. The store's clean value lives on its AX-MARKER
-    # (MARK_AX=1, IS_BYTE=0), but the store's VALUE-BYTE rows (MARK_AX=0,
-    # IS_BYTE=1, MEM_STORE=1) carry an ADDR_B0 one-hot at DOUBLE amplitude (2.0
-    # vs the marker's 1.0) so the raw Q(AX_CARRY).K(ADDR_B0) match fires HARDER
-    # on the byte rows and self-attends the wrong (address-blind) value. Drive
-    # every non-MARK_AX row far negative so only the store's AX-marker (where
-    # the clean AX_CARRY value lives) can win. K = REJ*(MARK_AX) - REJ*CONST:
-    # 0 on a marker (MARK_AX=1), -REJ on every byte/prompt row (MARK_AX=0).
-    # The Q side is OP_LI-gated at LARGE magnitude (2*_cam_s, like the
-    # address-match slots) so the reject score DOMINATES the raw ADDR_B0 match:
-    # a non-marker byte row (MARK_AX=0) scores ~(2*360*5.2)*(-2000)/sqrt(111)
-    # ~= -7e5, decisively below any ADDR_B0 match (~4e5), while a genuine store
-    # marker (MARK_AX=1) gets exactly 0 from this slot.
-    _ax_req = 2000.0
-    q.append(AP(60, BD.OP_LI, 2.0 * _cam_s))
-    q.append(AP(60, BD.CONST, -0.05 * 2.0 * _cam_s))
-    k.append(AP(60, BD.MARK_AX, _ax_req))
-    k.append(AP(60, BD.CONST, -_ax_req))
-
-    # === V/O: copy the matched store marker's AX_CARRY (clean value) to OUTPUT.
-    v: list[AP] = []
-    o: list[AO] = []
-    for kk in range(16):
-        v.append(AP(32 + kk, BD.AX_CARRY_LO + kk, 1.0))
-        v.append(AP(48 + kk, BD.AX_CARRY_HI + kk, 1.0))
-        o.append(AO(BD.OUTPUT_LO + kk, 32 + kk, value_scale))
-        o.append(AO(BD.OUTPUT_HI + kk, 48 + kk, value_scale))
-
-    return DeclarativeAttentionHeadSpec(
-        head_idx=_L15_SI_STORE_ADDR_HEAD_IDX,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
+    value_bands = (
+        CamValueBand("AX_CARRY_LO", "OUTPUT_LO", 16, 32, value_scale),
+        CamValueBand("AX_CARRY_HI", "OUTPUT_HI", 16, 48, value_scale),
+    )
+    cam = CamBinaryAddressMatch(
+        name="layer15_si_store_addr_cam",
+        address=CamBinaryAddressBlock(
+            nibble_bands=(), scale=0.0, slot_base=4, width_bits=4),
+        discriminators=tuple(discs),
+        value_bands=value_bands,
         # Recency (matching the L15 load heads' 0.05 slope) resolves a re-store
-        # to the SAME local (var_update x-reassign) to the latest store, while
-        # still reaching the store several steps before the LI.
+        # to the SAME local (var_update x-reassign) to the latest store.
         alibi_slope=0.05,
         # The store's AX-marker was written on the SI step; the LI gather reads
         # its AX_CARRY across step boundaries by design -> ANY_STEP.
         step_window=StepWindowConstraint.ANY_STEP,
+    )
+    dim_map = _layer15_si_store_addr_cam_dim_map(BD)
+    return cam_binary_address_match(cam).head_spec_builder(
+        dim_map, _L15_SI_STORE_ADDR_HEAD_IDX
     )
 
 
@@ -3573,38 +3374,65 @@ def make_layer15_memory_lookup_op() -> Operation:
     )
 
 
-def _layer15_store_stack0_sp_byte0_addr_spec(BD) -> DeclarativeAttentionHeadSpec:
-    """Copy current post-pop SP byte0 into ADDR_B0 at store STACK0 markers."""
+def _layer15_store_addr_dim_map(BD) -> dict:
+    """Resolve every dim NAME the L15 store-address relay heads 12/13 touch.
 
-    q = (
-        AP(0, BD.MARK_STACK0, 300.0),
-        AP(0, BD.HAS_SE, 300.0),
-        AP(33, BD.MEM_STORE, 10000.0),
-        AP(33, BD.CONST, -50000.0),
+    :func:`isa_semantics_dsl.scalar_relay`'s builder wants a name->int dict; the
+    ``BASE+offset`` nibble-band tokens are resolved from the BASE name plus the
+    parsed offset by the generator, so only BASE names go in the dict.
+    """
+    base_names = (
+        "CONST", "MARK_STACK0", "HAS_SE", "MEM_STORE", "MARK_SP",
+        "MARK_MEM", "MEM_ADDR_SRC", "IS_BYTE", "STACK0_BYTE0",
+        "OUTPUT_LO", "OUTPUT_HI", "ADDR_B0_LO", "ADDR_B0_HI",
+        "CLEAN_EMBED_LO", "CLEAN_EMBED_HI",
     )
-    k = (
-        AP(0, BD.MARK_SP, 100.0),
-        AP(33, BD.CONST, 1.0),
+    return {n: int(getattr(BD, n)) for n in base_names}
+
+
+def _layer15_store_stack0_sp_byte0_addr_spec(BD) -> DeclarativeAttentionHeadSpec:
+    """Copy current post-pop SP byte0 into ADDR_B0 at store STACK0 markers.
+
+    DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): this
+    marker-anchored MULTI-nibble relay is re-expressed byte-identically through
+    the shared :func:`isa_semantics_dsl.scalar_relay` primitive (the L7 memory
+    relay banks' generator). The head fires at the store STACK0 marker
+    (Q ``MARK_STACK0``/``HAS_SE`` on slot 0 + the MEM_STORE store-gate on slot
+    33), selects the post-pop SP marker row (K ``MARK_SP``), and copies the
+    row's OUTPUT byte-0 nibbles into ``ADDR_B0`` via two :class:`NibbleRelay`
+    blocks (per-cell copy +3, per-cell CONST clear -2 sourced from ``const_v_slot``
+    0). The hand-authored per-cell Q/K/V/O directive is deleted. Byte-identity is
+    proven by ``test_isa_semantics_dsl.py`` and the whole-model golden hash.
+    """
+    dim_map = _layer15_store_addr_dim_map(BD)
+    spec = ScalarRelayBankSpec(
+        name="layer15_store_stack0_sp_byte0_addr",
+        # Marker fire-site + store-gate discriminators, spread across slots 0/33
+        # (3-tuple ``(slot, dim, weight)`` form).
+        query_sig=(
+            (0, "MARK_STACK0", 300.0),
+            (0, "HAS_SE", 300.0),
+            (33, "MEM_STORE", 10000.0),
+            (33, "CONST", -50000.0),
+        ),
+        key_sig=(
+            (0, "MARK_SP", 100.0),
+            (33, "CONST", 1.0),
+        ),
+        nibble_relays=(
+            NibbleRelay("OUTPUT_LO", "ADDR_B0_LO", 16, 1,
+                        copy_scale=3.0, clear_scale=2.0),
+            NibbleRelay("OUTPUT_HI", "ADDR_B0_HI", 16, 17,
+                        copy_scale=3.0, clear_scale=2.0),
+        ),
+        const_v_slot=0,
+        step_window=StepWindowConstraint.CURRENT_STEP_ONLY,
     )
-    v = [AP(0, BD.CONST, 1.0)]
-    o = []
-    for idx in range(16):
-        v.append(AP(1 + idx, BD.OUTPUT_LO + idx, 1.0))
-        v.append(AP(17 + idx, BD.OUTPUT_HI + idx, 1.0))
-        o.append(AO(BD.ADDR_B0_LO + idx, 0, -2.0))
-        o.append(AO(BD.ADDR_B0_HI + idx, 0, -2.0))
-        o.append(AO(BD.ADDR_B0_LO + idx, 1 + idx, 3.0))
-        o.append(AO(BD.ADDR_B0_HI + idx, 17 + idx, 3.0))
-    return DeclarativeAttentionHeadSpec(
-        # Pull the head index from the shared L15 layout rather than
-        # baking in a ``head_idx=12`` literal here. Both the bake and IR
-        # paths consult the same source of truth, so renumbering the
-        # layout in one place stays consistent across every consumer.
-        head_idx=_l15_head_idx("layer15_store_stack0_sp_byte0_addr"),
-        q=q,
-        k=k,
-        v=tuple(v),
-        o=tuple(o),
+    # Pull the head index from the shared L15 layout rather than baking in a
+    # ``head_idx=12`` literal here. Both the bake and IR paths consult the same
+    # source of truth, so renumbering the layout stays consistent everywhere.
+    return scalar_relay(spec).head_spec_builder(
+        dim_map, _l15_head_idx("layer15_store_stack0_sp_byte0_addr")
     )
 
 
@@ -3678,42 +3506,49 @@ def _layer15_si_mem_addr0_from_stack0_spec(BD) -> DeclarativeAttentionHeadSpec:
     CLEAN_EMBED from the pre-store STACK0 byte 0.
     """
 
-    q = (
-        AP(0, BD.MARK_MEM, 100.0),
-        AP(0, BD.MEM_STORE, 20.0),
-        AP(0, BD.MEM_ADDR_SRC, 50.0),
-        AP(0, BD.CONST, -140.0),
-        AP(33, BD.MARK_MEM, 40000.0),
-        AP(33, BD.MEM_STORE, 5000.0),
-        AP(33, BD.MEM_ADDR_SRC, 10000.0),
-        AP(33, BD.CONST, -55000.0),
-        AP(37, BD.IS_BYTE, 50000.0),
+    # DERIVE->PROVE->FLIP->DELETE (2026-07-04, golden 91f55411): re-expressed
+    # byte-identically through :func:`isa_semantics_dsl.scalar_relay`. The
+    # row-select signature spreads the SI/SC MEM-address opcode gate across
+    # slots 0/33 plus a byte-index gate on O (slot 37, ``IS_BYTE`` on Q /
+    # ``CONST`` reject on K -- the "optional byte-index gating on O" the survey
+    # flagged); the K side keys the pre-store STACK0 byte-0 row (``STACK0_BYTE0``,
+    # MEM_STORE reject). Two :class:`NibbleRelay` blocks copy ``CLEAN_EMBED`` ->
+    # ``OUTPUT`` (per-cell copy +20, per-cell CONST clear -10). The hand-authored
+    # per-cell Q/K/V/O directive is deleted.
+    dim_map = _layer15_store_addr_dim_map(BD)
+    spec = ScalarRelayBankSpec(
+        name="layer15_si_mem_addr0_from_stack0",
+        query_sig=(
+            (0, "MARK_MEM", 100.0),
+            (0, "MEM_STORE", 20.0),
+            (0, "MEM_ADDR_SRC", 50.0),
+            (0, "CONST", -140.0),
+            (33, "MARK_MEM", 40000.0),
+            (33, "MEM_STORE", 5000.0),
+            (33, "MEM_ADDR_SRC", 10000.0),
+            (33, "CONST", -55000.0),
+            # Byte-index gate on the value-write path (slot 37).
+            (37, "IS_BYTE", 50000.0),
+        ),
+        key_sig=(
+            (0, "STACK0_BYTE0", 100.0),
+            (0, "MEM_STORE", -400.0),
+            (33, "CONST", 5.0),
+            (37, "CONST", -20.0),
+        ),
+        nibble_relays=(
+            NibbleRelay("CLEAN_EMBED_LO", "OUTPUT_LO", 16, 1,
+                        copy_scale=20.0, clear_scale=10.0),
+            NibbleRelay("CLEAN_EMBED_HI", "OUTPUT_HI", 16, 17,
+                        copy_scale=20.0, clear_scale=10.0),
+        ),
+        const_v_slot=0,
+        step_window=StepWindowConstraint.CURRENT_STEP_ONLY,
     )
-    k = (
-        AP(0, BD.STACK0_BYTE0, 100.0),
-        AP(0, BD.MEM_STORE, -400.0),
-        AP(33, BD.CONST, 5.0),
-        AP(37, BD.CONST, -20.0),
-    )
-    v = [AP(0, BD.CONST, 1.0)]
-    o = []
-    for idx in range(16):
-        v.append(AP(1 + idx, BD.CLEAN_EMBED_LO + idx, 1.0))
-        v.append(AP(17 + idx, BD.CLEAN_EMBED_HI + idx, 1.0))
-        o.append(AO(BD.OUTPUT_LO + idx, 0, -10.0))
-        o.append(AO(BD.OUTPUT_HI + idx, 0, -10.0))
-        o.append(AO(BD.OUTPUT_LO + idx, 1 + idx, 20.0))
-        o.append(AO(BD.OUTPUT_HI + idx, 17 + idx, 20.0))
-    return DeclarativeAttentionHeadSpec(
-        # Pull the head index from the shared L15 layout rather than
-        # baking in a ``head_idx=13`` literal here. Both the bake and IR
-        # paths consult the same source of truth, so renumbering the
-        # layout in one place stays consistent across every consumer.
-        head_idx=_l15_head_idx("layer15_si_mem_addr0_from_stack0"),
-        q=q,
-        k=k,
-        v=tuple(v),
-        o=tuple(o),
+    # Pull the head index from the shared L15 layout rather than baking in a
+    # ``head_idx=13`` literal here.
+    return scalar_relay(spec).head_spec_builder(
+        dim_map, _l15_head_idx("layer15_si_mem_addr0_from_stack0")
     )
 
 

@@ -4154,6 +4154,46 @@ class ScalarRelay:
 
 
 @dataclass(frozen=True)
+class NibbleRelay:
+    """One ``source_band -> target_band`` MULTI-nibble (per-cell) byte relay.
+
+    Where a :class:`ScalarRelay` copies ONE scalar flag into ONE target dim, a
+    ``NibbleRelay`` copies a WHOLE nibble band (``width`` consecutive cells, a
+    byte's lo/hi nibble one-hot) cell-by-cell: V slot ``v_slot_base + idx``
+    reads ``source_band + idx`` (scaled :attr:`v_scale`); O writes it into
+    ``target_band + idx`` at :attr:`copy_scale`. This is the per-cell "copy the
+    matched marker's byte" pattern the L15 store-address heads use.
+
+    The optional per-cell CLEAR (:attr:`clear_scale` != 0) subtracts a uniform
+    ``clear_scale`` from every ``target_band + idx`` sourced from a shared
+    CONST V slot (:attr:`clear_slot`), so the relayed value OVER-WRITES an
+    existing residual default instead of merely adding to it (L15 head 12's
+    ``-2.0`` clear + ``+3.0`` copy; head 13's ``-10.0`` clear + ``+20.0`` copy).
+    ``clear_slot`` reads a CONST source (declared once on the head via the
+    bank's :attr:`ScalarRelayBankSpec.const_v_slot`).
+
+    Attributes:
+        source_band: the matched row's VALUE band the V cells read (a nibble
+            one-hot base dim name).
+        target_band: the band the O cells write the relayed value into.
+        width: cell count (16 for a nibble one-hot).
+        v_slot_base: head-local V slot base for the per-cell copy.
+        copy_scale: O-write magnitude for the per-cell copy.
+        clear_scale: per-cell CONST-sourced clear magnitude subtracted from
+            every target cell (``0.0`` => no clear).
+        v_scale: V-read magnitude on ``source_band`` (default ``1.0``).
+    """
+
+    source_band: str
+    target_band: str
+    width: int
+    v_slot_base: int
+    copy_scale: float
+    clear_scale: float = 0.0
+    v_scale: float = 1.0
+
+
+@dataclass(frozen=True)
 class ScalarRelayBankSpec:
     """Declarative description of a marker-anchored scalar-relay attention head.
 
@@ -4168,13 +4208,25 @@ class ScalarRelayBankSpec:
 
     Attributes:
         name: head family name (rule-name / diagnostic prefix).
-        query_sig: the Q-projection ``(dim, weight)`` writes on ``query_slot``
-            — the marker fire-site + threshold-bank discriminators (row select).
-            Each ``dim`` is a ``BASE`` or ``BASE+offset`` token.
-        key_sig: the K-projection ``(dim, weight)`` writes on ``query_slot`` —
-            the marker self/sibling match + any doubled weight or opcode blocker.
-        relays: the scalar flag relays (:class:`ScalarRelay`).
-        query_slot: the head-local slot the Q/K signature lands on (L7: ``0``).
+        query_sig: the Q-projection writes for the row-select signature. Each
+            entry is either a ``(dim, weight)`` 2-tuple (landing on
+            ``query_slot`` — the common single-slot case) OR a
+            ``(slot, dim, weight)`` 3-tuple pinning an EXPLICIT head-local slot
+            (the L15 store-address heads spread the marker + store-gate
+            discriminators across slots 0 and 33). Each ``dim`` is a ``BASE``
+            or ``BASE+offset`` token.
+        key_sig: the K-projection writes — same 2-/3-tuple form as ``query_sig``.
+        relays: the scalar flag relays (:class:`ScalarRelay`). MAY be empty when
+            the head carries only :attr:`nibble_relays`.
+        nibble_relays: MULTI-nibble (per-cell) byte relays (:class:`NibbleRelay`)
+            — the L15 store-address heads copy a whole OUTPUT / CLEAN_EMBED
+            nibble band cell-by-cell (with an optional per-cell clear). Empty for
+            the pure scalar-flag L7 heads.
+        const_v_slot: the head-local V slot the per-cell CLEAR of every
+            :class:`NibbleRelay` reads its CONST source from (L15: ``0``). Only
+            consulted when a nibble relay declares a nonzero clear.
+        query_slot: the default head-local slot a 2-tuple Q/K signature lands on
+            (L7: ``0``).
         alibi_slope: per-head ALiBi slope. ``None`` => the op writes its own
             ``alibi_slopes`` (the L7 memory heads' slopes are set by the op's
             bake, not the spec, so the re-expression leaves this ``None``).
@@ -4185,9 +4237,11 @@ class ScalarRelayBankSpec:
     """
 
     name: str
-    query_sig: Tuple[Tuple[str, float], ...]
-    key_sig: Tuple[Tuple[str, float], ...]
-    relays: Tuple[ScalarRelay, ...]
+    query_sig: Tuple[Tuple, ...]
+    key_sig: Tuple[Tuple, ...]
+    relays: Tuple[ScalarRelay, ...] = ()
+    nibble_relays: Tuple[NibbleRelay, ...] = ()
+    const_v_slot: int = 0
     query_slot: int = 0
     alibi_slope: Optional[float] = None
     step_window: StepWindowConstraint = StepWindowConstraint.CURRENT_STEP_ONLY
@@ -4203,15 +4257,23 @@ class ScalarRelayBankSpec:
                 f"ScalarRelayBankSpec({self.name!r}): key_sig must be "
                 "non-empty (a relay head selects a marker row)"
             )
-        if not self.relays:
+        if not self.relays and not self.nibble_relays:
             raise ValueError(
-                f"ScalarRelayBankSpec({self.name!r}): relays must be non-empty"
+                f"ScalarRelayBankSpec({self.name!r}): must declare at least "
+                "one scalar relay or nibble relay"
             )
         for r in self.relays:
             if not r.sources:
                 raise ValueError(
                     f"ScalarRelayBankSpec({self.name!r}): relay -> "
                     f"{r.target_dim!r} must read at least one source"
+                )
+        for nr in self.nibble_relays:
+            if nr.width <= 0:
+                raise ValueError(
+                    f"ScalarRelayBankSpec({self.name!r}): nibble relay "
+                    f"{nr.source_band!r}->{nr.target_band!r} width must be "
+                    f"positive, got {nr.width}"
                 )
 
 
@@ -4246,6 +4308,18 @@ def scalar_relay(spec: ScalarRelayBankSpec) -> ScalarRelayBundle:
     import-time side effect).
     """
 
+    def _sig_slot_dim_weight(entry, default_slot: int):
+        """Normalize a Q/K signature entry to ``(slot, dim, weight)``.
+
+        A 2-tuple ``(dim, weight)`` lands on ``default_slot`` (the common
+        single-slot L7 form); a 3-tuple ``(slot, dim, weight)`` pins an
+        explicit head-local slot (the L15 store-address heads spread Q/K
+        across slots 0 and 33).
+        """
+        if len(entry) == 3:
+            return entry[0], entry[1], entry[2]
+        return default_slot, entry[0], entry[1]
+
     def head_spec_builder(
         dim_positions: Dict[str, int], head_idx: int
     ) -> DeclarativeAttentionHeadSpec:
@@ -4253,8 +4327,14 @@ def scalar_relay(spec: ScalarRelayBankSpec) -> ScalarRelayBundle:
             return _resolve_dim_token(name, lambda n: int(dim_positions[n]))
 
         qs = spec.query_slot
-        q = [AP(qs, _P(d), w) for (d, w) in spec.query_sig]
-        k = [AP(qs, _P(d), w) for (d, w) in spec.key_sig]
+        q: list = []
+        k: list = []
+        for e in spec.query_sig:
+            s, d, w = _sig_slot_dim_weight(e, qs)
+            q.append(AP(s, _P(d), w))
+        for e in spec.key_sig:
+            s, d, w = _sig_slot_dim_weight(e, qs)
+            k.append(AP(s, _P(d), w))
 
         v: list = []
         o: list = []
@@ -4262,6 +4342,23 @@ def scalar_relay(spec: ScalarRelayBankSpec) -> ScalarRelayBundle:
             for (src, w) in r.sources:
                 v.append(AP(r.v_slot, _P(src), w))
             o.append(AO(_P(r.target_dim), r.v_slot, r.o_scale))
+
+        # MULTI-nibble (per-cell) byte relays: V copies the matched row's
+        # source-band cell into a per-cell V slot, O writes it into the target
+        # band. An optional per-cell CLEAR (CONST-sourced from ``const_v_slot``)
+        # subtracts a uniform magnitude so the relayed value OVER-writes an
+        # existing residual default.
+        need_const = any(nr.clear_scale != 0.0 for nr in spec.nibble_relays)
+        if need_const:
+            v.append(AP(spec.const_v_slot, _P("CONST"), 1.0))
+        for nr in spec.nibble_relays:
+            src = _P(nr.source_band)
+            tgt = _P(nr.target_band)
+            for idx in range(nr.width):
+                v.append(AP(nr.v_slot_base + idx, src + idx, nr.v_scale))
+                o.append(AO(tgt + idx, nr.v_slot_base + idx, nr.copy_scale))
+                if nr.clear_scale != 0.0:
+                    o.append(AO(tgt + idx, spec.const_v_slot, -nr.clear_scale))
 
         return DeclarativeAttentionHeadSpec(
             head_idx=head_idx,
@@ -4277,15 +4374,22 @@ def scalar_relay(spec: ScalarRelayBankSpec) -> ScalarRelayBundle:
         return name.split("+", 1)[0]
 
     head_reads: Set[str] = set()
-    for (d, _w) in spec.query_sig:
+    for e in spec.query_sig:
+        _s, d, _w = _sig_slot_dim_weight(e, spec.query_slot)
         head_reads.add(_base(d))
-    for (d, _w) in spec.key_sig:
+    for e in spec.key_sig:
+        _s, d, _w = _sig_slot_dim_weight(e, spec.query_slot)
         head_reads.add(_base(d))
     head_writes: Set[str] = set()
     for r in spec.relays:
         for (src, _w) in r.sources:
             head_reads.add(_base(src))
         head_writes.add(_base(r.target_dim))
+    for nr in spec.nibble_relays:
+        head_reads.add(_base(nr.source_band))
+        head_writes.add(_base(nr.target_band))
+    if any(nr.clear_scale != 0.0 for nr in spec.nibble_relays):
+        head_reads.add("CONST")
 
     return ScalarRelayBundle(
         spec=spec,
