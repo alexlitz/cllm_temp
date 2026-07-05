@@ -2626,6 +2626,50 @@ def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
 
 
 @dataclass(frozen=True)
+class BandMagnitudeBoost:
+    """A verifier-magnitude ``+N/-N`` cancel pair broadcast across a value band.
+
+    Some relay heads (the L8 SP-gather heads 0/1/2/6/7) must LIFT the V1
+    attention verifier's per-output magnitude bound on a band they write
+    (``ADDR_B*_LO/HI``) so they dominate a same-dim competitor (L15
+    ``store_stack0_sp_byte0_addr``, mag 5.0), WITHOUT changing the delivered
+    value. The trick is a SEMANTICALLY-NEUTRAL cancel pair: TWO head-local V
+    slots (``plus_slot`` / ``minus_slot``) each read a dim that is identically
+    ``1.0`` at every key position (``read_dim``, normally ``CONST``), and the O
+    projection writes ``+weight`` / ``-weight`` from those two slots into EVERY
+    cell of the ``width``-wide target band. Because ``softmax·(W_v·residual)``
+    delivers the SAME value through both slots (the read dim is constant across
+    keys and the softmax weights normalize to 1), the ``+weight`` and
+    ``-weight`` outputs cancel EXACTLY at the query-position output regardless
+    of attention sharpness — the band value is untouched, but the verifier's
+    magnitude bound rises to ``|O_old|·|V_old| + 2·weight``.
+
+    This is NOT a :class:`CamValueBand` (that is a width-PARALLEL copy: V slot
+    ``base+j`` reads ``source+j``, O writes ``target+j`` — cell ``j`` from cell
+    ``j``). A magnitude boost is a BROADCAST from ONE constant V slot to the
+    WHOLE band through a ± pair, so it needs its own DATA form. Multiple boosts
+    on the SAME head SHARE the two head-local slots (the L8 heads boost both
+    ``ADDR_B*_LO`` and ``ADDR_B*_HI`` off slots 34/35), so the slot indices live
+    on the boost and the builder de-duplicates the shared V writes.
+
+    Attributes:
+        target_band: the band whose verifier magnitude is lifted.
+        width: cell count of the band (16 for a nibble one-hot).
+        plus_slot: head-local V/O slot carrying the ``+weight`` write.
+        minus_slot: head-local V/O slot carrying the ``-weight`` write.
+        weight: the ``±weight`` O magnitude (L8: ``3.0`` → bound += 6.0).
+        read_dim: the always-``1.0`` dim both slots read (default ``CONST``).
+    """
+
+    target_band: str
+    width: int
+    plus_slot: int
+    minus_slot: int
+    weight: float
+    read_dim: str = "CONST"
+
+
+@dataclass(frozen=True)
 class FrameRelaySpec:
     """Declarative description of a multi-slot frame-lookup value-relay head.
 
@@ -2656,6 +2700,11 @@ class FrameRelaySpec:
         extra_reads: extra dim names the head's Operation should declare beyond
             the auto-derived set (cross-step ``X.*.-1`` aliases the OUTPUT bands
             are read through — L7 head-1 reads OUTPUT_LO/HI cross-step).
+        mag_boosts: verifier-magnitude ``±`` cancel pairs (:class:`BandMagnitudeBoost`)
+            broadcast across a written band WITHOUT changing its value — the L8
+            SP-gather heads lift the ``ADDR_B*`` bands above the L15 competitor
+            (see :class:`BandMagnitudeBoost`). Empty (L7 head-1) => no boost.
+            Only emitted when ``value_active`` (the boost rides the value relay).
     """
 
     name: str
@@ -2668,6 +2717,7 @@ class FrameRelaySpec:
         StepWindowConstraint.CURRENT_STEP_ONLY
     )
     extra_reads: Tuple[str, ...] = ()
+    mag_boosts: Tuple[BandMagnitudeBoost, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.q_gates:
@@ -2740,6 +2790,25 @@ def frame_relay(spec: FrameRelaySpec) -> FrameRelayBundle:
                 for j in range(vb.width):
                     v.append(AP(vb.v_slot_base + j, src + j, 1.0))
                     o.append(AO(tgt + j, vb.v_slot_base + j, vb.o_scale))
+            # Verifier-magnitude cancel pairs: each shared ± slot reads its
+            # constant dim ONCE (de-duplicated across boosts sharing the slots,
+            # matching the hand-built ``_addr_mag_boost_v`` single emit), and the
+            # O projection broadcasts +weight/-weight from those slots into every
+            # cell of each boosted band. The delivered value is unchanged (the
+            # ± writes cancel) — this only lifts the attention verifier's bound.
+            _boost_v_seen: Set[Tuple[int, int]] = set()
+            for mb in spec.mag_boosts:
+                rd = _P(mb.read_dim)
+                for slot in (mb.plus_slot, mb.minus_slot):
+                    key = (slot, rd)
+                    if key not in _boost_v_seen:
+                        _boost_v_seen.add(key)
+                        v.append(AP(slot, rd, 1.0))
+            for mb in spec.mag_boosts:
+                tgt = _P(mb.target_band)
+                for j in range(mb.width):
+                    o.append(AO(tgt + j, mb.plus_slot, mb.weight))
+                    o.append(AO(tgt + j, mb.minus_slot, -mb.weight))
 
         return DeclarativeAttentionHeadSpec(
             head_idx=head_idx,
@@ -2764,6 +2833,9 @@ def frame_relay(spec: FrameRelaySpec) -> FrameRelayBundle:
         for vb in spec.value_bands:
             head_reads.add(_base(vb.source_band))
             head_writes.add(_base(vb.target_band))
+        for mb in spec.mag_boosts:
+            head_reads.add(_base(mb.read_dim))
+            head_writes.add(_base(mb.target_band))
     head_reads.update(spec.extra_reads)
 
     return FrameRelayBundle(
@@ -2851,6 +2923,43 @@ class CamBinaryAddressBlock:
 
     def cells_per_band(self) -> int:
         return 1 << self.width_bits
+
+
+@dataclass(frozen=True)
+class CamNibbleComparator:
+    """An IDENTITY per-cell (one-hot) address comparator across ``cells`` slots.
+
+    The binary :class:`CamBinaryAddressBlock` peaks a K row by a ``±scale``
+    per-BIT encoding on a band Q and K BOTH read. The L8 multibyte-fetch head
+    uses a DIFFERENT comparator family: a plain per-NIBBLE IDENTITY match where
+    the Q side and K side read DIFFERENT bands. For each cell ``k`` in
+    ``[0, cells)`` the slot ``slot_base + k`` writes ``+scale`` on Q at
+    ``q_band + k`` and ``+scale`` on K at ``k_band + k``, so the head-dim dot
+    product peaks when the SAME nibble-cell is active on both the queried
+    (``q_band``) and the addressed (``k_band``) nibble one-hots — a cross-band
+    identity CAM select (``FETCH_LO`` on Q vs ``ADDR_KEY`` on K).
+
+    This is the STRUCTURAL identity-CAM invariant: the comparator occupies
+    exactly ``cells`` consecutive slots, each a declared ``+scale`` identity
+    cell match, with NO free Q/K writes. Multiple comparators chain (the
+    multibyte-fetch head has three: FETCH_LO, FETCH_HI, and the ADDR_KEY high
+    nibble self-match) at distinct ``slot_base`` values.
+
+    Attributes:
+        q_band: the QUERY-side nibble one-hot band base (``FETCH_LO``).
+        k_band: the KEY-side nibble one-hot band base (``ADDR_KEY`` slice). When
+            equal to ``q_band`` this is a self-match (the ADDR_KEY high-nibble
+            comparator).
+        cells: cell count (16 for a nibble one-hot).
+        scale: the per-cell ``+scale`` Q/K weight (L8: ``20.0``).
+        slot_base: head-local slot the comparator block starts at.
+    """
+
+    q_band: str
+    k_band: str
+    cells: int
+    scale: float
+    slot_base: int
 
 
 # Sentinel weight: an OVERLAY discriminator cell whose weight is ``CAM_DROP``
@@ -2956,12 +3065,18 @@ class CamBinaryAddressMatch:
     extra_reads: Tuple[str, ...] = ()
     step_window: StepWindowConstraint = StepWindowConstraint.ANY_STEP
     overlay: Tuple[CamDiscriminatorSlot, ...] = ()
+    # Additional IDENTITY per-cell (cross-band) comparators — the L8
+    # multibyte-fetch head's FETCH_LO/HI + ADDR_KEY-high nibble matches. Empty
+    # for a pure binary-address CAM (L15) so byte-identity is preserved.
+    comparators: Tuple[CamNibbleComparator, ...] = ()
 
     def __post_init__(self) -> None:
-        if not self.address.nibble_bands and not self.discriminators:
+        if (not self.address.nibble_bands and not self.discriminators
+                and not self.comparators):
             raise ValueError(
                 f"CamBinaryAddressMatch({self.name!r}): must declare at least "
-                "an address block or a discriminator slot"
+                "an address block, an identity comparator, or a discriminator "
+                "slot"
             )
         if self.address.width_bits <= 0:
             raise ValueError(
@@ -3066,6 +3181,17 @@ def cam_binary_address_match(
                     k_map[(slot, base + k)] = w
                 slot += 1
 
+        # (1b) The IDENTITY per-cell (cross-band) comparators. Each cell ``k``
+        #      lands ``+scale`` on Q at ``q_band + k`` and K at ``k_band + k``
+        #      on slot ``slot_base + k`` — the L8 multibyte-fetch FETCH vs
+        #      ADDR_KEY nibble match. Merged into the same maps.
+        for cmp in spec.comparators:
+            qb = _P(cmp.q_band)
+            kb = _P(cmp.k_band)
+            for k in range(cmp.cells):
+                q_map[(cmp.slot_base + k, qb + k)] = cmp.scale
+                k_map[(cmp.slot_base + k, kb + k)] = cmp.scale
+
         # (2) The heterogeneous discriminator rows (DATA). Merged AFTER the
         #     address block so a discriminator can legitimately re-write an
         #     address cell (the last-write-wins override the L15 head uses).
@@ -3135,6 +3261,9 @@ def cam_binary_address_match(
     head_reads: Set[str] = set()
     for band in addr.nibble_bands:
         head_reads.add(_base(band))
+    for cmp in spec.comparators:
+        head_reads.add(_base(cmp.q_band))
+        head_reads.add(_base(cmp.k_band))
     for d in (*spec.discriminators, *spec.overlay):
         for (dim, _w) in d.q:
             head_reads.add(_base(dim))
