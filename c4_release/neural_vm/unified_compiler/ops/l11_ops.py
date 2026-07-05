@@ -2238,12 +2238,14 @@ def _loop_ax_byte3_cap_rules() -> tuple[FFNRule, ...]:
 
 
 def make_loop_ax_byte3_cap_op() -> Operation:
-    """Append the loop AX byte-3 final-dump clamp FFN after the L25 tail.
+    """Append the loop AX high-byte (byte-2/byte-3) dump clamp FFN after L25 tail.
 
-    Fires on the byte-3 register-dump predictor row (``IS_BYTE`` +
-    ``BYTE_INDEX_2``) and clamps its OUTPUT emission -> 0x00, killing the
-    loop_mul/countdown/pow2 stale byte-3 (0x82) return-dump leak. Registered
-    ONLY when ``C4_LOOP_AX_BYTE3_CAP`` is on (see all_core_ops), so flag-OFF is
+    Fires on the two high-byte register-dump predictor rows (``IS_BYTE`` +
+    ``BYTE_INDEX_1`` = byte-2 predictor, and ``IS_BYTE`` + ``BYTE_INDEX_2`` =
+    byte-3 predictor) and STRONGLY clamps their OUTPUT emission -> 0x00, killing
+    the loop_mul/countdown/pow2 stale high-byte leak (the step-4 byte-2 0xFF /
+    the byte-3 stale-PC 0x82 return-dump leak). Registered ONLY when
+    ``C4_LOOP_AX_BYTE3_CAP`` is on (see all_core_ops), so flag-OFF is
     byte-identical to golden; the op assumes it is only constructed under the
     flag.
     """
