@@ -2165,27 +2165,45 @@ def _loop_ax_byte3_cap_enabled() -> bool:
     return _os_stack0.environ.get("C4_LOOP_AX_BYTE3_CAP", "0") != "0"
 
 
-_LOOP_AX_BYTE3_CAP_HIDDEN_DIM = 1  # one AND on the byte-3 predictor row
+# The two high-byte register-dump PREDICTOR rows (the residual at position ``p``
+# predicts token ``p+1``): the AX byte-2 token (``MARK_AX+3``) is predicted by
+# the byte-1 register row (carries ``BYTE_INDEX_1``, probed 0.97), and the AX
+# byte-3 token (``MARK_AX+4``) is predicted by the byte-2 register row (carries
+# ``BYTE_INDEX_2``, probed 0.97). One AND rule per high byte.
+_LOOP_AX_BYTE3_CAP_HIDDEN_DIM = 2  # byte-2 (BYTE_INDEX_1) + byte-3 (BYTE_INDEX_2)
+
+# STRONG-clamp write magnitude. The leak drives the emitted high byte via the
+# canonical OUTPUT nibbles: spec_k=0 attribution (probe_loop_step4_byte2.py,
+# loop_pow2_2 step-4 byte-2) shows ``OUTPUT_LO+15`` and ``OUTPUT_HI+15`` both at
+# +12.5 (== 0xF/0xF == 0xFF), OUT-VOTING the clean +0 nibbles (~4-5). The prior
+# hibyte clamp (WW=0.16, ~+10 delta, +0 nibbles ONLY) could NOT beat the +12.5
+# competitor and did NOT kill the +15 nibbles, so byte-2 stayed 0xFF. This cap
+# both KILLS every non-zero nibble (esp. +15) and boosts the +0 nibbles hard, so
+# the 0x00 byte wins the argmax unconditionally on a fire.
+_LOOP_CAP_WW_KILL = 0.5   # ~+/-30 OUTPUT delta on a saturated fire (kills +k>0)
+_LOOP_CAP_WW_ZERO = 0.5   # boost the 0x00 nibbles
 
 
 def _loop_ax_byte3_cap_rules() -> tuple[FFNRule, ...]:
-    """1 AND rule clamping the AX byte-3 register-dump emission -> 0.
+    """2 AND rules clamping the AX high-byte (byte-2/byte-3) dump emission -> 0.
 
-    Gated on the byte-3 predictor row (``IS_BYTE`` + ``BYTE_INDEX_2``, the row
-    whose residual predicts the 4th register byte at ``MARK_AX+4``), with the
-    SAME marker + ``AX_CARRY_OVERFLOW`` blockers as ``ax_hibyte_clear_allstep``.
-    Firing sum = IS_BYTE(1.0) + BYTE_INDEX_2*2(~1.94) = ~2.94 > threshold 2.5;
-    byte-0/1/2 rows (BYTE_INDEX_2 ~0 -> sum ~1.0) and marker rows (-1000
-    blockers) stay dark. Writes push the emitted byte to the 0x00 nibbles
-    (``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` up, the leaked ``OUTPUT_LO+10`` — the low
-    nibble of the 0x8_ leak — down), mirroring the hibyte clamp exactly.
-    ``AX_CARRY_OVERFLOW`` (-1000) preserves a genuine >= 0x1000000 top byte.
+    Fires on the byte-2 predictor row (``IS_BYTE`` + ``BYTE_INDEX_1``, predicts
+    ``MARK_AX+3``) and the byte-3 predictor row (``IS_BYTE`` + ``BYTE_INDEX_2``,
+    predicts ``MARK_AX+4``), with the SAME marker + ``AX_CARRY_OVERFLOW``
+    blockers as ``ax_hibyte_clear_allstep``. Firing sum = IS_BYTE(1.0) +
+    BYTE_INDEX_x*2(~1.94) = ~2.94 > threshold 2.5; other byte rows (BYTE_INDEX_x
+    ~0 -> sum ~1.0) and marker rows (-1000 blockers) stay dark.
+
+    STRONG clamp: writes a large NEGATIVE to every non-zero OUTPUT nibble
+    (``OUTPUT_LO+k`` / ``OUTPUT_HI+k`` for k=1..15 — this KILLS the leaked
+    ``OUTPUT_LO+15`` / ``OUTPUT_HI+15`` == 0xF the loop leak sets) and a large
+    POSITIVE to ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` so the emitted high byte is
+    0x00. ``AX_CARRY_OVERFLOW`` (-1000) preserves a genuine >= 0x1000000 byte.
     """
     IS_BYTE_W = 1.0
     BYTE_INDEX_W = 2.0
     THRESHOLD = 2.5
     BLOCKER_W = 1_000.0
-    WW = 0.16
     blockers = (
         ("MARK_AX", -BLOCKER_W),
         ("MARK_PC", -BLOCKER_W),
@@ -2196,22 +2214,27 @@ def _loop_ax_byte3_cap_rules() -> tuple[FFNRule, ...]:
         ("MARK_SE", -BLOCKER_W),
         ("AX_CARRY_OVERFLOW", -BLOCKER_W),
     )
-    writes = (
-        ("OUTPUT_LO+0", WW),
-        ("OUTPUT_HI+0", WW),
-        ("OUTPUT_LO+10", -WW),
+    # Kill every non-zero nibble in BOTH OUTPUT bands, then boost the 0x00 slot.
+    writes = tuple(
+        (f"OUTPUT_LO+{k}", -_LOOP_CAP_WW_KILL) for k in range(1, 16)
+    ) + tuple(
+        (f"OUTPUT_HI+{k}", -_LOOP_CAP_WW_KILL) for k in range(1, 16)
+    ) + (
+        ("OUTPUT_LO+0", _LOOP_CAP_WW_ZERO),
+        ("OUTPUT_HI+0", _LOOP_CAP_WW_ZERO),
     )
-    return (
-        multi_way_and_rule(
-            name="loop_ax_byte3_cap",
+    rules: list[FFNRule] = []
+    for byte_label, bindex in (("byte2", "BYTE_INDEX_1"), ("byte3", "BYTE_INDEX_2")):
+        rules.append(multi_way_and_rule(
+            name=f"loop_ax_byte3_cap_{byte_label}",
             conditions=(
                 ("IS_BYTE", IS_BYTE_W),
-                ("BYTE_INDEX_2", BYTE_INDEX_W),
+                (bindex, BYTE_INDEX_W),
             ) + blockers,
             threshold=THRESHOLD,
             writes=writes,
-        ),
-    )
+        ))
+    return tuple(rules)
 
 
 def make_loop_ax_byte3_cap_op() -> Operation:
@@ -2269,7 +2292,7 @@ def make_loop_ax_byte3_cap_op() -> Operation:
     return Operation(
         name="loop_ax_byte3_cap",
         reads={
-            "IS_BYTE", "BYTE_INDEX_2",
+            "IS_BYTE", "BYTE_INDEX_1", "BYTE_INDEX_2",
             "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
             "MARK_MEM", "MARK_SE", "AX_CARRY_OVERFLOW",
         },
