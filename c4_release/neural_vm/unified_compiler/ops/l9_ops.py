@@ -432,14 +432,19 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     ``(opcode_flag, ENT)`` semantic pair.
     """
 
-    gate_ent = dim_ref("opcode_flag", "ENT")
-    carry_byte0 = dim_ref("carry", "alu", 0)
-    rules: list[FFNRule] = []
     # Same 10-way amplified AND shape as _lea_hi_nibble_rules /
     # _adj_hi_nibble_rules but gated on OP_ENT, computing SP - imm
     # (a = SP's hi nibble via ALU_HI, b = imm's hi nibble via FETCH_HI).
     # Thresholds 42.0 / 50.0 match the ADJ tuning. Writes
     # (sp_hi - imm_hi - borrow_in) % 16 to OUTPUT_HI_THIS_STEP.
+    #
+    # DERIVED: this IS the shared L9 ``reg + live-operand`` adder
+    # (``op="sub"`` = ENT's SP - imm borrow adder) that LEA/ADJ also use;
+    # routed through ``wide_alu_dsl.amplified_nibble_adder_rules`` with the
+    # ``HAS_SE`` first-step blocker passed as an ``extra_conditions`` term
+    # (the generator threads it in the exact position the prior inline loop
+    # placed it — right after the non-AX blocker band). Byte-identical to
+    # the prior hand-authored loop (golden hash == ``91f55411``).
     #
     # BUG FIX 2026-06-11 (step-1 ENT-AX 0xf0 leak, genesis): this band
     # materializes the ENT SP hi nibble (SP - (8+imm)) into OUTPUT_HI at
@@ -458,39 +463,22 @@ def _layer9_ent_hi_nibble_rules(S: float) -> tuple[FFNRule, ...]:
     #
     # Fix (same class as the L16 JSR→BP prologue fix — neutralize the
     # genesis writer rather than fight its broadcast-amplified magnitude
-    # downstream): add a hard ``HAS_SE`` NOT-blocker so the band fires
-    # ONLY on the first ENT step. Subsequent-step ENT then keeps the clean
+    # downstream): a hard ``HAS_SE`` NOT-blocker so the band fires ONLY on
+    # the first ENT step. Subsequent-step ENT then keeps the clean
     # OUTPUT_HI[0] it already carries; step-0 ENT (test_lea_basic frame
     # setup) is byte-identical.
-    for borrow_in in (0, 1):
-        for sp_hi in range(16):
-            for imm_hi in range(16):
-                result = (sp_hi - imm_hi - borrow_in) % 16
-                conditions: list[tuple[str, float]] = [("MARK_AX", 20.0)]
-                conditions.extend(
-                    (dim, -1000.0) for dim in _NON_AX_BLOCKERS
-                )
-                # Subsequent-step ENT (HAS_SE) must NOT re-materialize the
-                # SP hi nibble onto the AX row; hard-block so the OP_ENT
-                # broadcast cannot reopen it. First-step ENT (HAS_SE=0)
-                # keeps the BP-cascade contribution.
-                conditions.append(("HAS_SE", -1000.0))
-                conditions.append((f"ALU_HI+{sp_hi}", 1.0))
-                conditions.append((f"FETCH_HI+{imm_hi}", 20.0))
-                if borrow_in == 0:
-                    conditions.append((carry_byte0, -8.0))
-                    threshold = 42.0
-                else:
-                    conditions.append((carry_byte0, 8.0))
-                    threshold = 50.0
-                rules.append(multi_way_and_rule(
-                    name=f"ent_hi_b{borrow_in}_sp{sp_hi}_imm{imm_hi}",
-                    conditions=tuple(conditions),
-                    threshold=threshold,
-                    gate=gate_ent,
-                    writes=((f"OUTPUT_HI_THIS_STEP+{result}", 2.0 / S),),
-                ))
-    return tuple(rules)
+    return amplified_nibble_adder_rules(
+        op="sub",
+        operand_a_band="ALU_HI", operand_b_band="FETCH_HI",
+        marker_gate="MARK_AX", blocker_dims=_NON_AX_BLOCKERS,
+        blocker_weight=1000.0,
+        gate=dim_ref("opcode_flag", "ENT"),
+        carry_in_dim=dim_ref("carry", "alu", 0), carry_in_weight=8.0,
+        threshold_no_carry=42.0, threshold_with_carry=50.0,
+        result_band="OUTPUT_HI_THIS_STEP", write_scale=2.0 / S,
+        name_fn=lambda c, a, b: f"ent_hi_b{c}_sp{a}_imm{b}",
+        extra_conditions=(("HAS_SE", -1000.0),),
+    )
 
 
 def _layer9_cmp_rules(S: float) -> tuple[FFNRule, ...]:
