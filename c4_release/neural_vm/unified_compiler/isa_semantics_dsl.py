@@ -2321,6 +2321,100 @@ class CamLookupBundle:
     head_writes: Set[str]
 
 
+def _store_spec_to_binary_cam(spec: "CamLookupSpec") -> "CamBinaryAddressMatch":
+    """Translate a ``direction="store"`` :class:`CamLookupSpec` into the general
+    :class:`CamBinaryAddressMatch` (the SINGLE store lowering).
+
+    DEDUP (2026-07-04, golden 91f55411): the store / emit direction is a
+    binary-addressed CAM with an EMPTY address block — a byte-emit FIRE row
+    attends BACK to the addressed source row and relays a value into a store
+    band, EXACTLY the shape :func:`cam_binary_address_match` already lowers for
+    the L14 mem-generation store heads. The bespoke fire-gate / confirm /
+    per-byte-route / stamp fields are just STRUCTURED ways of declaring the same
+    heterogeneous per-slot Q/K/V/O rows the general primitive takes as DATA. This
+    translator re-expresses them as :class:`CamDiscriminatorSlot` rows (the
+    Q/K row-select + the value-lane stamp) + :class:`CamValueBand` relays (the
+    byte value emit) so BOTH store call sites (L13 heads 4/5 via
+    :func:`cam_lookup`, L14 mem-generation via :func:`_l14_store_head_from_maps`)
+    share ONE lowering. Byte-identical: the store builder emitted NO duplicate
+    ``(slot, dim)`` cells, so the general primitive's per-``(slot, dim)``
+    last-write-wins map produces the identical final cell set.
+
+    Slot layout of the translated discriminators:
+      * slot 0 — the FIRE GATE (``store_gate`` + CONST baseline + the
+        ``store_slot0_extra`` co-fires + amplified ``store_rejects``; K carries
+        the optional ``store_slot0_key``).
+      * ``confirm.slot`` — the CONST-anchored CONFIRM row (re-assert the gate dim
+        + CONST bias on Q; anchor CONST on K) when a confirm is declared.
+      * each ``store_route`` slot — the per-byte fire (``fire_dim`` + CONST
+        baseline + ``fire_extra``) + K signature (``key_dim`` @ ``key_weight`` +
+        the optional ``key_baseline`` + ``key_extra``). Its value bands become
+        top-level :class:`CamValueBand` relays.
+      * the ``store_stamp`` slot — the single V(read op dim)/O(write TEMP
+        selector) re-delivery row, as a value-lane discriminator.
+    """
+    gate_dim, w = spec.store_gate
+    const = spec.const_dim
+    confirm = spec.confirm
+
+    discs: list = []
+
+    # slot 0: fire gate (Q gate/const/extras/rejects; K optional key).
+    slot0_q: list = [(gate_dim, w), (const, -w / 2)]
+    slot0_q.extend(spec.store_slot0_extra)
+    slot0_q.extend(spec.store_rejects)
+    slot0_k: tuple = ()
+    if spec.store_slot0_key is not None:
+        slot0_k = (spec.store_slot0_key,)
+    discs.append(CamDiscriminatorSlot(
+        slot=0, q=tuple(slot0_q), k=slot0_k))
+
+    # confirm slot: re-assert gate + CONST bias on Q, anchor CONST on K.
+    if confirm is not None:
+        confirm_q: list = [
+            (gate_dim, confirm.marker_weight),
+            (const, confirm.const_q_weight),
+        ]
+        confirm_q.extend(confirm.blockers)
+        discs.append(CamDiscriminatorSlot(
+            slot=confirm.slot, q=tuple(confirm_q),
+            k=((const, confirm.const_k_weight),)))
+
+    # per-byte routes: Q fire + K signature discriminators; value bands relayed.
+    value_bands: list = []
+    for r in spec.store_routes:
+        route_q: list = [(r.fire_dim, w), (const, -w)]
+        route_q.extend(r.fire_extra)
+        route_k: list = [(r.key_dim, r.key_weight)]
+        if r.key_baseline is not None:
+            route_k.append(r.key_baseline)
+        route_k.extend(r.key_extra)
+        discs.append(CamDiscriminatorSlot(
+            slot=r.slot, q=tuple(route_q), k=tuple(route_k)))
+        value_bands.extend(r.value_bands)
+
+    # optional TEMP-discriminator STAMP: a value-lane row (V read / O write).
+    if spec.store_stamp is not None:
+        st = spec.store_stamp
+        discs.append(CamDiscriminatorSlot(
+            slot=st.v_slot,
+            v=((st.read_dim, st.read_scale),),
+            o=((st.write_dim, st.o_scale),)))
+
+    # An EMPTY address block (nibble_bands=()) marks the store head as a
+    # binary-addressed CAM with no per-bit comparator — the row select lives
+    # entirely in the discriminators. direction="store" records the emit flow.
+    return CamBinaryAddressMatch(
+        name=spec.name,
+        address=CamBinaryAddressBlock(
+            nibble_bands=(), scale=0.0, slot_base=0, width_bits=1),
+        discriminators=tuple(discs),
+        value_bands=tuple(value_bands),
+        alibi_slope=spec.alibi_slope,
+        direction="store",
+    )
+
+
 def _store_head_spec_builder(
     spec: "CamLookupSpec",
     dim_positions: Dict[str, int],
@@ -2329,81 +2423,15 @@ def _store_head_spec_builder(
 ) -> DeclarativeAttentionHeadSpec:
     """Lower a ``direction="store"`` :class:`CamLookupSpec` into a head spec.
 
-    The emit-with-address shape (L13 heads 4/5): a shared FIRE GATE
-    (``store_gate`` + amplified ``store_rejects`` on slot 0, a CONST-anchored
-    confirm on the confirm slot) plus one per-byte :class:`CamStoreRoute` bank
-    binding a K-signature at ``K_FLAG`` and relaying into a store band, plus an
-    optional :class:`CamStoreStamp` TEMP re-delivery. Reproduces the
-    hand-authored store head byte-for-byte.
+    DEDUP: delegates to the ONE store lowering — translate the store fields to a
+    :class:`CamBinaryAddressMatch` (empty address block, ``direction="store"``)
+    and call :func:`cam_binary_address_match`. Byte-identical to the former
+    bespoke emit (the store builder produced no duplicate ``(slot, dim)`` cells).
     """
-    gate_dim, w = spec.store_gate
-    const = spec.const_dim
-    confirm = spec.confirm
-    q: list = []
-    k: list = []
-    v: list = []
-    o: list = []
-
-    # (1) The FIRE GATE on slot 0: the byte-row selector the head fires on, the
-    #     CONST baseline it rides over, the optional co-fire dims, and the
-    #     amplified opcode/marker/sibling rejects that narrow the fire to the
-    #     op's byte-emit rows only.
-    q.append(AP(0, _P(gate_dim), w))
-    q.append(AP(0, _P(const), -w / 2))
-    for (d, dw) in spec.store_slot0_extra:
-        q.append(AP(0, _P(d), dw))
-    for (d, dw) in spec.store_rejects:
-        q.append(AP(0, _P(d), dw))
-    if spec.store_slot0_key is not None:
-        (kd, kw) = spec.store_slot0_key
-        k.append(AP(0, _P(kd), kw))
-
-    # (2) The CONST-anchored CONFIRM slot: re-assert the gate dim + CONST bias on
-    #     Q and anchor a CONST key so the slot-0 softmax routes positively only
-    #     on the fire rows (mirrors the load confirm slot's shape).
-    if confirm is not None:
-        q.append(AP(confirm.slot, _P(gate_dim), confirm.marker_weight))
-        q.append(AP(confirm.slot, _P(const), confirm.const_q_weight))
-        for (op_dim, ow) in confirm.blockers:
-            q.append(AP(confirm.slot, _P(op_dim), ow))
-        k.append(AP(confirm.slot, _P(const), confirm.const_k_weight))
-
-    # (3) The per-byte emit ROUTES: each fires at its byte-emit row on its own
-    #     slot (with its declared co-fire dims — the SUB byte selector TEMP+9 in
-    #     flag-OFF, HAS_SE in the campaign frame), content-matches the addressed
-    #     source row at K_FLAG, and relays the matched value band into the store
-    #     band. The CONST at -w is the softmax1 baseline the fire rides over.
-    for r in spec.store_routes:
-        q.append(AP(r.slot, _P(r.fire_dim), w))
-        q.append(AP(r.slot, _P(const), -w))
-        for (d, dw) in r.fire_extra:
-            q.append(AP(r.slot, _P(d), dw))
-        k.append(AP(r.slot, _P(r.key_dim), r.key_weight))
-        if r.key_baseline is not None:
-            (bd, bw) = r.key_baseline
-            k.append(AP(r.slot, _P(bd), bw))
-        for (d, dw) in r.key_extra:
-            k.append(AP(r.slot, _P(d), dw))
-        for vb in r.value_bands:
-            src = _P(vb.source_band)
-            tgt = _P(vb.target_band)
-            for j in range(vb.width):
-                v.append(AP(vb.v_slot_base + j, src + j, vb.v_scale))
-                o.append(AO(tgt + j, vb.v_slot_base + j, vb.o_scale))
-
-    # (4) The optional TEMP-discriminator STAMP: V reads an op dim on the matched
-    #     source marker (clean/op-exclusive), O writes the TEMP selector onto the
-    #     fire row (re-delivers the byte-row selector the collapsed frame dropped).
-    if spec.store_stamp is not None:
-        st = spec.store_stamp
-        v.append(AP(st.v_slot, _P(st.read_dim), st.read_scale))
-        o.append(AO(_P(st.write_dim), st.v_slot, st.o_scale))
-
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=tuple(q), k=tuple(k), v=tuple(v), o=tuple(o),
-        alibi_slope=spec.alibi_slope,
-    )
+    del _P  # positions resolved inside cam_binary_address_match's builder
+    cam = _store_spec_to_binary_cam(spec)
+    return cam_binary_address_match(cam).head_spec_builder(
+        dim_positions, head_idx)
 
 
 def _store_head_dep_sets(
@@ -2411,34 +2439,13 @@ def _store_head_dep_sets(
 ) -> Tuple[Set[str], Set[str]]:
     """Derive the Operation read/write dim-name sets for a store-direction spec.
 
-    Reads: the gate dim, the CONST anchor, the slot-0 extras/rejects, each
-    route's fire/key/key-extra dims + value source band, and the stamp read dim.
-    Writes: each route's value target band + the stamp write dim.
+    DEDUP: delegates to the ONE store lowering — the translated
+    :class:`CamBinaryAddressMatch` bundle's ``head_reads`` / ``head_writes``
+    already cover the gate/reject/route/stamp read dims + the value bands.
     """
-    gate_dim, _w = spec.store_gate
-    reads: Set[str] = {_base(gate_dim), spec.const_dim}
-    for (d, _dw) in (*spec.store_slot0_extra, *spec.store_rejects):
-        reads.add(_base(d))
-    if spec.store_slot0_key is not None:
-        reads.add(_base(spec.store_slot0_key[0]))
-    if spec.confirm is not None:
-        for (d, _dw) in spec.confirm.blockers:
-            reads.add(_base(d))
-    writes: Set[str] = set()
-    for r in spec.store_routes:
-        reads.add(_base(r.fire_dim))
-        reads.add(_base(r.key_dim))
-        for (d, _dw) in (*r.fire_extra, *r.key_extra):
-            reads.add(_base(d))
-        if r.key_baseline is not None:
-            reads.add(_base(r.key_baseline[0]))
-        for vb in r.value_bands:
-            reads.add(_base(vb.source_band))
-            writes.add(_base(vb.target_band))
-    if spec.store_stamp is not None:
-        reads.add(_base(spec.store_stamp.read_dim))
-        writes.add(_base(spec.store_stamp.write_dim))
-    return reads, writes
+    del _base  # cam_binary_address_match derives its own base-name dep sets
+    bundle = cam_binary_address_match(_store_spec_to_binary_cam(spec))
+    return bundle.head_reads, bundle.head_writes
 
 
 def cam_lookup(spec: CamLookupSpec) -> CamLookupBundle:
