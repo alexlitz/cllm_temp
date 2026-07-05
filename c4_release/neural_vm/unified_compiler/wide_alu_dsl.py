@@ -37,7 +37,7 @@ bit-for-bit on randomized input (see Section 4 of the design doc and
 from __future__ import annotations
 
 import operator
-from typing import Callable, Literal, Optional, Sequence, Tuple
+from typing import Callable, Literal, Mapping, Optional, Sequence, Tuple
 
 from .building_blocks_dsl import multi_way_and_rule
 from .ir import FFNRule
@@ -1222,6 +1222,157 @@ def wide_sub_rules(
                 ),
             ))
 
+    return tuple(rules)
+
+
+# ---------------------------------------------------------------------------
+# Nibble fused multiply-accumulate combine (L11/L12 MUL nibble-combine lane).
+# ---------------------------------------------------------------------------
+#
+# The DEFAULT (non-multipass) byte-0 MUL path stages its result nibbles as a
+# pair of triple-loop nibble-COMBINE banks — the L11 ``mul_partial`` and the
+# L12 ``mul_combine`` FFNs. BOTH are the identical shape: a ``for c: for a:
+# for b:`` walk over three 16-wide one-hot bands that evaluates a fused
+# multiply-accumulate ``result = (accum(c, a, b) + a * b) % 16`` at BUILD TIME
+# and emits one marker-gated 4-way AND per (c, a, b) triple, writing a single
+# result-nibble one-hot gated on ``OP_MUL``. There is ZERO per-value
+# hand-tuning; the DATA that distinguishes L11 from L12 is entirely the
+# ``(bands, accum_fn, weights, threshold, write_scale, marker)`` tuple.
+#
+# ``nibble_fused_madd_combine_rules`` is that single generator (the
+# schoolbook-combine sibling of :func:`nibble_alu_lane_rules`). It lets the
+# L11/L12 op factories carry only the compact per-lane spec instead of an
+# inline hand-authored triple-loop, so the shape is deduplicated and the
+# COVERAGE-first "derive every op" contract is met by a SHARED derivation.
+# Byte-identity vs the prior inline loops is proven by the whole-model golden
+# hash (``tools/_isa_golden_hash.py``) and the DSL unit test.
+
+
+def nibble_fused_madd_combine_rules(
+    *,
+    accum_band: str,
+    factor_a_band: str,
+    factor_b_band: str,
+    result_band: str,
+    marker_gate: str,
+    gate: str,
+    threshold: float,
+    write_scale: float,
+    name_fn: Callable[[int, int, int], str],
+    accum_fn: Callable[[int, int, int], int] = lambda c, a, b: c,
+    marker_weight: float = 1.0,
+    accum_weight: float = 1.0,
+    factor_a_weight: float = 1.0,
+    factor_b_weight: float = 1.0,
+    outer: Literal["accum", "factor_a"] = "accum",
+    scope: Optional[str] = None,
+    dominates_at_fn: Optional[Callable[[int], Mapping[str, str]]] = None,
+) -> Tuple[FFNRule, ...]:
+    """Emit the byte-0 MUL nibble fused-multiply-accumulate combine lane.
+
+    ONE generator for the two DEFAULT-path MUL nibble-combine banks (L11
+    ``mul_partial`` and L12 ``mul_combine``). Each is a ``for c: for a: for
+    b:`` walk over the ``16 x 16 x 16`` one-hot cross-product that evaluates
+    the fused multiply-accumulate ``result = (accum_fn(c, a, b) + a * b) % 16``
+    at BUILD TIME and emits one ``multi_way_and_rule`` per triple. The
+    distinguishing DATA is entirely in the kwargs — zero per-value hand-tuning.
+
+    Each emitted rule is a marker-gated 4-way AND:
+    ``(marker_gate, marker_weight)`` + ``(accum_band+c, accum_weight)`` +
+    ``(factor_a_band+a, factor_a_weight)`` + ``(factor_b_band+b,
+    factor_b_weight)``, gated on ``gate`` (the ``OP_MUL`` flag) at the explicit
+    ``threshold``, writing ``(result_band+result, write_scale)``.
+
+    L12 ``mul_combine`` is the direct instance: ``accum_band=TEMP`` (the
+    L11-staged partial),  ``factor_a_band=ALU_HI`` (a_hi), ``factor_b_band=
+    AX_CARRY_LO`` (b_lo), ``accum_fn=lambda c, a, b: c`` (the partial is read
+    directly), so ``result = (partial + a_hi * b_lo) % 16``.
+
+    L11 ``mul_partial`` is the instance with a DERIVED accumulator:
+    ``accum_band=AX_CARRY_LO`` supplies b_lo, ``factor_a_band=ALU_LO`` supplies
+    a_lo, ``factor_b_band=AX_CARRY_HI`` supplies b_hi, and ``accum_fn=lambda
+    b_lo, a_lo, b_hi: (a_lo * b_lo) // 16`` (the low-nibble carry), so
+    ``result = ((a_lo * b_lo) // 16 + a_lo * b_hi) % 16``. Because L11's rule
+    ORDER is ``for a_lo: for b_lo: for b_hi`` (a_lo outer, so the lowering
+    cursor lands ``a_lo`` slabs contiguously), pass ``outer="factor_a"`` to
+    put ``factor_a`` (a_lo) on the outer loop and preserve byte-identity.
+
+    Args:
+        accum_band: one-hot band whose index is the ``c`` loop variable (the
+            L12 partial read, or the L11 b_lo used to derive the carry).
+        factor_a_band / factor_b_band: the two MULTIPLIED one-hot operand
+            bands (``a`` and ``b``); the product ``a * b`` is added to the
+            accumulator.
+        result_band: result-nibble one-hot band; the rule writes
+            ``result_band+result``.
+        marker_gate / marker_weight: the STEP_END-style marker condition.
+        gate: the ``OP_MUL`` opcode-flag gate.
+        threshold: explicit 4-way AND threshold (the caller's amplitude
+            contract — L11 uses 3.5, L12 uses 7.5).
+        write_scale: the result-nibble write weight (already ``value / S``).
+        name_fn: ``(c, a, b) -> name`` — the byte-identity rule names encode
+            the sub-stage + indices. Called with the loop variables in
+            ``(accum_idx, factor_a_idx, factor_b_idx)`` order regardless of
+            ``outer``.
+        accum_fn: ``(c, a, b) -> accumulator_value`` evaluated at build time.
+            Default ``lambda c, a, b: c`` reads the accumulator band directly
+            (the L12 case); L11 passes the low-nibble carry derivation.
+        accum_weight / factor_a_weight / factor_b_weight: per-cell condition
+            weights (default 1.0 — the unit-weight one-hot AND both banks use).
+        outer: ``"accum"`` (default; loop nesting ``for c: for a: for b:`` —
+            the L12 order) or ``"factor_a"`` (``for a: for c: for b:`` — the
+            L11 ``a_lo``-outer order). Controls ONLY the emission order (and
+            therefore the lowered hidden-unit indices), not the arithmetic.
+        scope: optional shared ``scope`` predicate string threaded verbatim
+            to every emitted rule (the L12 ``"MARK_SE_ONLY and OP_MUL"``
+            verifier annotation). Weight-neutral (metadata only).
+        dominates_at_fn: optional ``result_nibble -> Mapping`` callable that
+            builds the per-rule ``dominates_at`` verifier annotation from the
+            computed result nibble (the L12 ``{OUTPUT_HI+result_hi: ...}``
+            claim). Weight-neutral (metadata only).
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length 4096 (16 x 16 x 16), in the emission
+        order the ``outer`` kwarg selects.
+    """
+    if outer not in ("accum", "factor_a"):
+        raise ValueError(
+            f"nibble_fused_madd_combine_rules: outer must be "
+            f"accum/factor_a; got {outer!r}"
+        )
+
+    rules: list[FFNRule] = []
+
+    def emit(c: int, a: int, b: int) -> None:
+        result = (accum_fn(c, a, b) + a * b) % 16
+        rules.append(multi_way_and_rule(
+            name=name_fn(c, a, b),
+            conditions=(
+                (marker_gate, marker_weight),
+                (f"{accum_band}+{c}", accum_weight),
+                (f"{factor_a_band}+{a}", factor_a_weight),
+                (f"{factor_b_band}+{b}", factor_b_weight),
+            ),
+            threshold=threshold,
+            gate=gate,
+            writes=((f"{result_band}+{result}", write_scale),),
+            scope=scope,
+            dominates_at=(
+                dominates_at_fn(result) if dominates_at_fn is not None
+                else None
+            ),
+        ))
+
+    if outer == "accum":
+        for c in range(16):
+            for a in range(16):
+                for b in range(16):
+                    emit(c, a, b)
+    else:
+        for a in range(16):
+            for c in range(16):
+                for b in range(16):
+                    emit(c, a, b)
     return tuple(rules)
 
 
@@ -3108,6 +3259,7 @@ __all__ = [
     "bitwise_rules",
     "nibble_alu_lane_rules",
     "nibble_compare_lane_rules",
+    "nibble_fused_madd_combine_rules",
     "wide_add_rules",
     "wide_sub_rules",
     "wide_ge_add_rules",
