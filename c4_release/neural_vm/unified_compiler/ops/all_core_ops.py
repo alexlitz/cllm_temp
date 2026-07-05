@@ -893,6 +893,19 @@ def all_core_ops(
         # C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
         # See l0_ops.make_no_stack0_pc_highbyte_clear_op.
         make_no_stack0_pc_highbyte_clear_op(),
+        # CLEAN_EMITTER (flag C4_CLEAN_EMITTER, DEFAULT OFF): the generic
+        # all-marker-row OUTPUT sink. Gated on the 6-way OR of the marker-schedule
+        # flags (NEXT_PC|NEXT_AX|NEXT_SP|NEXT_BP|NEXT_MEM|NEXT_SE), it sinks
+        # OUTPUT_LO/HI hugely negative at EVERY marker-predicting row so the LM
+        # head emits the register MARKER (never a stray value byte) -> the frame is
+        # exactly N tokens BY CONSTRUCTION, so the =/=STEP_TOKENS framing megaroot
+        # cannot occur for ANY register. Subsumes the two per-row point-fixes above
+        # (SE-clear + MEM-marker-clear) and pre-empts the 3 unwritten AX/SP/BP-row
+        # copies. Standalone PureFFN post_op appended AFTER them on the L25 tail
+        # (LAST OUTPUT writer before the head). OFF -> bakes NO units ->
+        # byte-identical to golden 91f55411. See l0_ops.make_clean_emitter_op +
+        # docs/CLEAN_EMITTER_SCOPE_2026_07_04.md.
+        make_clean_emitter_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
         # the heads).
