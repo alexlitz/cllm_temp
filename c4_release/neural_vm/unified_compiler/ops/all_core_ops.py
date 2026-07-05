@@ -21,6 +21,9 @@ from .l8_ops import *  # noqa: F401,F403
 from .l9_ops import *  # noqa: F401,F403
 from .l10_ops import *  # noqa: F401,F403
 from .l11_ops import *  # noqa: F401,F403
+# Underscore-prefixed flag predicate: not exported by the wildcard import, so
+# pull it in explicitly for the flag-gated registration below.
+from .l11_ops import _loop_ax_byte3_cap_enabled  # noqa: F401
 from .l12_ops import *  # noqa: F401,F403
 from .l13_ops import *  # noqa: F401,F403
 from .l14_ops import *  # noqa: F401,F403
@@ -805,6 +808,19 @@ def all_core_ops(
         # UNCONDITIONAL (OUTPUT-canonical byte emission is the sole path). See
         # l11_ops.make_ax_hibyte_clear_allstep_op.
         make_ax_hibyte_clear_allstep_op(),
+        # LOOP AX byte-3 FINAL-DUMP CAP (C4_LOOP_AX_BYTE3_CAP, DEFAULT-OFF): the
+        # byte-3-only kill-switch for the survey-R8 loop byte-3 leak
+        # (loop_mul/countdown/pow2 leak a stale 0x82 == BZ-16 branch-target PC
+        # into the final LEA;LOAD;HALT AX return-dump byte-3). Clamps the byte-3
+        # predictor row (IS_BYTE + BYTE_INDEX_2) OUTPUT -> 0x00. Appended AFTER
+        # ax_hibyte_clear_allstep (and thus tail_bit32_result_correction) so it
+        # is a LAST OUTPUT writer on the byte-3 dump row. Registered ONLY when
+        # the flag is on -> flag-OFF is byte-identical to golden 91f55411. See
+        # l11_ops.make_loop_ax_byte3_cap_op.
+        *(
+            [make_loop_ax_byte3_cap_op()]
+            if _loop_ax_byte3_cap_enabled() else []
+        ),
         # AX byte-1 DUMP -> OUTPUT decode (OUTPUT-canonical, UNCONDITIONAL).
         # Decodes the carried byte-1 one-hot out of ``H1_DUMP_OUT`` (filled by
         # ax_byte1_dump_repopulate on carried steps) into the CANONICAL
