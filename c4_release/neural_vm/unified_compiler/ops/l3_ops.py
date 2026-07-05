@@ -1236,25 +1236,25 @@ def _carry_forward_head_spec(
     BD,
     *,
     head_idx: int,
-    marker_dim: int,
+    marker: str,
     l1h1_idx: int,
     l1h0_idx: int,
-    out_lo: int,
-    out_hi: int,
-    src_lo: int,
-    src_hi: int,
+    out_lo: str,
+    out_hi: str,
+    src_lo: str,
+    src_hi: str,
     L: float = 15.0,
 ) -> DeclarativeAttentionHeadSpec:
-    """Declarative replacement for ``Primitives.carry_forward_attention``.
+    """Declarative register carry-forward head — DERIVED via ``frame_relay``.
 
-    Mirrors the exact Q/K/V/O writes of the helper one-to-one so the
-    lowered matrices are byte-identical. The spec carries:
+    The register carry-forward relay (formerly ``Primitives.carry_forward_attention``)
+    is an instance of the generic :func:`frame_relay` value-relay pattern:
 
-    * ``Q[0] = marker_dim * L`` -- fires at the target marker.
+    * ``Q[0] = marker * L`` -- fires at the target register marker.
     * ``K[0] = L1H1+l1h1_idx * L``, ``K[0] = L1H0+l1h0_idx * -L`` --
-      fires at the previous step's byte 0 row.
-    * ``V[1+k] = src_lo+k``, ``V[17+k] = src_hi+k`` for k=0..15.
-    * ``O[out_lo+k] = V[1+k]``, ``O[out_hi+k] = V[17+k]`` for k=0..15.
+      selects the previous step's byte-0 row (the frame-select signature,
+      here an L1H1/L1H0 threshold-bank differential rather than a bare marker).
+    * value band ``src_{lo,hi}`` -> ``out_{lo,hi}`` (V slots 1..16 / 17..32).
     * Anti-leakage gate at slot 33: ``Q[33]=marker*L + CONST*-L/2``,
       ``K[33]=(L1H1+l1h1_idx)*0.1 + (L1H0+l1h0_idx)*-0.1 + CONST*L``.
       The K-side L1H1/L1H0 differential (at small weight 0.1) makes the
@@ -1264,35 +1264,41 @@ def _carry_forward_head_spec(
       a Q-gated slot softmax-cancels). The complement mirrors slot 0
       direction so the gate's K-side discriminator selects the same
       prev-step register byte-0 row already biased by slot 0.
+
+    Byte-identical to the hand-authored per-slot Q/K/V/O writes (proof:
+    ``tools/_isa_golden_hash.py`` == 91f55411).
     """
 
     GATE = 33
-    q = [
-        AP(0, marker_dim, L),
-        AP(GATE, marker_dim, L),
-        AP(GATE, BD.CONST, -L / 2),
-    ]
-    k = [
-        AP(0, BD.L1H1 + l1h1_idx, L),
-        AP(0, BD.L1H0 + l1h0_idx, -L),
-        AP(GATE, BD.L1H1 + l1h1_idx, 0.1),
-        AP(GATE, BD.L1H0 + l1h0_idx, -0.1),
-        AP(GATE, BD.CONST, L),
-    ]
-    v = []
-    o = []
-    for k_idx in range(16):
-        v.append(AP(1 + k_idx, src_lo + k_idx, 1.0))
-        v.append(AP(17 + k_idx, src_hi + k_idx, 1.0))
-        o.append(AO(out_lo + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(out_hi + k_idx, 17 + k_idx, 1.0))
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-    )
+    l1h1 = f"L1H1+{l1h1_idx}"
+    l1h0 = f"L1H0+{l1h0_idx}"
+    # ``frame_relay`` resolves ``BASE+offset`` tokens by looking up the BASE name,
+    # so only the base names go in the dim_map (matches the L8 SP-gather pattern).
+    dim_map = {
+        n: int(getattr(BD, n))
+        for n in (marker, "CONST", "L1H1", "L1H0",
+                  out_lo, out_hi, src_lo, src_hi)
+    }
+    bundle = frame_relay(FrameRelaySpec(
+        name=f"layer3_carry_forward_{marker}",
+        q_gates=(
+            (0, marker, L),
+            (GATE, marker, L),
+            (GATE, "CONST", -L / 2),
+        ),
+        k_gates=(
+            (0, l1h1, L),
+            (0, l1h0, -L),
+            (GATE, l1h1, 0.1),
+            (GATE, l1h0, -0.1),
+            (GATE, "CONST", L),
+        ),
+        value_bands=(
+            CamValueBand(src_lo, out_lo, 16, 1, 1.0),
+            CamValueBand(src_hi, out_hi, 16, 17, 1.0),
+        ),
+    ))
+    return bundle.head_spec_builder(dim_map, head_idx=head_idx)
 
 
 def _carry_forward_head_specs(
@@ -1311,46 +1317,46 @@ def _carry_forward_head_specs(
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_0"],
-            marker_dim=BD.MARK_PC,
+            marker="MARK_PC",
             l1h1_idx=PC_I,
             l1h0_idx=PC_I,
-            out_lo=BD.EMBED_LO,
-            out_hi=BD.EMBED_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="EMBED_LO",
+            out_hi="EMBED_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_1"],
-            marker_dim=BD.MARK_AX,
+            marker="MARK_AX",
             l1h1_idx=AX_I,
             l1h0_idx=AX_I,
-            out_lo=BD.AX_CARRY_LO,
-            out_hi=BD.AX_CARRY_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="AX_CARRY_LO",
+            out_hi="AX_CARRY_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_2"],
-            marker_dim=BD.MARK_SP,
+            marker="MARK_SP",
             l1h1_idx=SP_I,
             l1h0_idx=SP_I,
-            out_lo=BD.EMBED_LO,
-            out_hi=BD.EMBED_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="EMBED_LO",
+            out_hi="EMBED_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_3"],
-            marker_dim=BD.MARK_BP,
+            marker="MARK_BP",
             l1h1_idx=BP_I,
             l1h0_idx=BP_I,
-            out_lo=BD.EMBED_LO,
-            out_hi=BD.EMBED_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="EMBED_LO",
+            out_hi="EMBED_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _stack0_carry_head_spec(BD),
         _ax_full_relay_head_spec(BD),
