@@ -37,6 +37,7 @@ from .user_input_ops import (  # noqa: F401
 from .control_flow_heads import make_lev_detector_head_op  # noqa: F401
 from .shared import mul_width2_enabled, operand_from_memsp_enabled  # noqa: F401
 from .shared import sub_full_borrow_enabled  # noqa: F401
+from .shared import si_store_addr_enabled  # noqa: F401
 from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
@@ -628,6 +629,18 @@ def all_core_ops(
         *(
             [make_layer14_li_zeroaddr_indicator_op()]
             if _li_zeroaddr_indicator_on() else []
+        ),
+        # SI-store-addr CAM LI-QUERY zero-address VETO flag (CAMPAIGN-ONLY,
+        # C4_SI_STORE_ADDR). Registered ONLY when the SI-store CAM flag is on so a
+        # flag-off / golden build is byte-identical (the op is not registered, the
+        # chain alloc never claims its slot, and the LI_QUERY_ZEROADDR band is not
+        # collected). Materializes the FFN two-nibble zero-address AND that L15
+        # head-16 keys a NEGATIVE Q on to fail-closed on the abs-address path
+        # (LI 0x200 etc). See l14_ops.make_layer14_li_query_zeroaddr_op +
+        # l15_ops._layer15_si_store_addr_cam_head_spec.
+        *(
+            [make_layer14_li_query_zeroaddr_op()]
+            if si_store_addr_enabled() else []
         ),
         make_layer15_memory_lookup_op(),
         make_layer15_nibble_copy_op(),
