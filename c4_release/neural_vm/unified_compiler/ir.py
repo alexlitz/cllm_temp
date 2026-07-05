@@ -2097,7 +2097,7 @@ def compare_symbolic_to_lowered_ffn(
     )
 
     if ffn is None:
-        from c4_release.neural_vm.base_layers import PureFFN
+        from ..base_layers import PureFFN
 
         ffn = PureFFN(
             dim=resolved_dim,
@@ -2233,7 +2233,7 @@ def compare_symbolic_to_lowered_attn(
         return report
 
     if attn is None:
-        from c4_release.neural_vm.base_layers import PureAttention
+        from ..base_layers import PureAttention
 
         attn = PureAttention(
             dim=resolved_dim,
