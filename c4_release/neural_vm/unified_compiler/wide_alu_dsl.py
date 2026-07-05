@@ -2079,7 +2079,7 @@ def wide_div_rules_ge_format(
 
 
 # ---------------------------------------------------------------------------
-# Wave W3 (retry): GE-format wide ADD/SUB helpers.
+# Wave W3 (retry): GE-format wide ADD/SUB helpers — op-parameterized core.
 # ---------------------------------------------------------------------------
 #
 # These mirror ``wide_add_rules`` / ``wide_sub_rules`` semantically but
@@ -2109,10 +2109,16 @@ def wide_div_rules_ge_format(
 # (``marker_gate``, ``opcode_gate``). Callers supply a ``dim_positions``
 # map that resolves ``p{b}_NIB_A`` → ``b * POS_STRIDE + nib_a_offset``
 # for the flattened ``[seq, 8 * POS_STRIDE]`` workspace.
+#
+# As with the BD ``wide_add_rules`` / ``wide_sub_rules`` pair, ADD and SUB
+# are the SAME per-position cascade differing only in the per-nibble
+# arithmetic and rule-name tag; ``wide_ge_addsub_rules(op=...)`` is that
+# single core and the two public names are thin wrappers.
 
 
-def wide_ge_add_rules(
+def wide_ge_addsub_rules(
     *,
+    op: Literal["add", "sub"],
     width_bytes: int,
     opcode_gate: str,
     marker_gate: str,
@@ -2123,57 +2129,46 @@ def wide_ge_add_rules(
     carry_out_name: str = "CARRY_OUT",
     position_prefix: str = "p",
 ) -> Tuple[FFNRule, ...]:
-    """Emit FFN rules for wide multi-byte ADD on the GE workspace.
+    """Per-position GE-workspace nibble ADD/SUB cascade (shared core).
 
-    Mirrors :func:`wide_add_rules` semantically but routes each byte
-    row through a distinct GE-format position rather than offsetting
-    into a single 16-dim band. Each byte position ``b`` in
-    ``0..width_bytes-1`` references its own per-nibble one-hot bands
-    ``p{b}_NIB_A+{nib}`` (operand A), ``p{b}_NIB_B+{nib}`` (operand B),
-    ``p{b}_RESULT+{nib}`` (sum nibble), and a single per-position
-    carry-out flag ``p{b}_CARRY_OUT``. The inter-byte carry cascade
-    reads ``p{b-1}_CARRY_OUT`` for byte ``b > 0``.
+    The shared core behind :func:`wide_ge_add_rules` (``op="add"``) and
+    :func:`wide_ge_sub_rules` (``op="sub"``). Routes each byte row through a
+    distinct GE-format position (``p{b}_NIB_A``/``NIB_B``/``RESULT`` and the
+    per-position carry/borrow flag ``p{b}_{carry_out_name}``) rather than
+    offsetting into a single 16-dim band. Per-byte semantics:
 
-    Per-byte rule semantics are identical to :func:`wide_add_rules`:
+      * ADD: ``res = (a+b+carry_in) % 16``; carry_out when ``a+b+carry_in >= 16``.
+      * SUB: ``res = (a-b-carry_in) & 0xF``; borrow_out when ``a-b-carry_in < 0``.
 
-      * sum_nib  = (a_nib + b_nib + carry_in) % 16
-      * carry_out = (a_nib + b_nib + carry_in) >= 16
-
-    Byte 0 emits 256 rules (no carry-in). Byte ``b > 0`` emits 256+256
-    rules (separately gated for ``carry_in=0`` via the ``-50`` borrow-
-    suppression weight and ``carry_in=1`` via the ``+30`` cumulative
-    threshold-120 cascade) plus one carry-relay rule. Total:
-    ``256 + (width_bytes - 1) * (512 + 1)``.
-
-    The function is GE-only: it does NOT touch BD bands. Callers
-    pair it with a BD→GE projection upstream (BDToGEConverter) and a
-    GE→BD writeback downstream (GEToBDConverter), the same way the
-    ``AddSub5StageBlock`` does.
+    Byte 0 emits 256 rules (no carry-in). Byte ``b > 0`` emits 256+256 rules
+    (carry_in=0 via the ``-50`` suppression weight; carry_in=1 via the ``+30``
+    cumulative threshold-120 cascade) plus one carry/borrow-relay rule. Total:
+    ``256 + (width_bytes - 1) * (512 + 1)``. The only ``op``-dependent
+    differences are the per-nibble arithmetic above and the rule-name tag
+    (``wide_ge_add_b{b}_cin{...}`` / ``wide_ge_sub_b{b}_bin{...}``).
 
     Args:
-        width_bytes: number of nibble-wide bytes in the wide ADD
-            (1 for 4-bit, 2 for 8-bit, 4 for 16-bit, 8 for 32-bit).
-        opcode_gate: dim ref for the ``ADD`` opcode gate.
-        marker_gate: dim ref for the AX-style marker gate.
-        S: SwiGLU scale.
-        operand_a_name: slot suffix for operand A's per-position nibble
-            band. Default ``"NIB_A"``. Combined with ``position_prefix``
-            yields ``"p{b}_NIB_A"``.
-        operand_b_name: slot suffix for operand B's per-position band.
-        result_name: slot suffix for the per-position result band.
-        carry_out_name: slot suffix for the per-position 1-bit carry
-            flag.
-        position_prefix: prefix for the per-position slot names.
+        op: ``"add"`` or ``"sub"``.
+        carry_out_name: per-position 1-bit carry (ADD) / borrow (SUB) flag
+            suffix. The wrappers pass ``"CARRY_OUT"`` / ``"BORROW_OUT"``.
+        (all other args mirror :func:`wide_ge_add_rules`.)
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length
-        ``256 + (width_bytes - 1) * 513``.
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * 513``.
     """
+    if op not in ("add", "sub"):
+        raise ValueError(
+            f"wide_ge_addsub_rules: op must be 'add'/'sub'; got {op!r}"
+        )
     if width_bytes < 1:
         raise ValueError(
-            f"wide_ge_add_rules: width_bytes must be >= 1; "
+            f"wide_ge_addsub_rules: width_bytes must be >= 1; "
             f"got {width_bytes!r}"
         )
+
+    is_add = op == "add"
+    cin_tag = "cin" if is_add else "bin"
+    detect_tag = "carry" if is_add else "borrow"
 
     rules: list[FFNRule] = []
     write_amplitude = 2.0 / S
@@ -2192,12 +2187,17 @@ def wide_ge_add_rules(
         for carry_in in carry_in_cases:
             for a_nib in range(16):
                 for b_nib in range(16):
-                    total = a_nib + b_nib + carry_in
-                    sum_nib = total % 16
-                    carry_out = total >= 16
+                    if is_add:
+                        total = a_nib + b_nib + carry_in
+                        res_nib = total % 16
+                        carry_out = total >= 16
+                    else:
+                        raw = a_nib - b_nib - carry_in
+                        res_nib = raw & 0xF
+                        carry_out = raw < 0
 
                     writes: list[Tuple[str, float]] = [
-                        (f"{out_band}+{sum_nib}", write_amplitude),
+                        (f"{out_band}+{res_nib}", write_amplitude),
                     ]
                     if carry_out:
                         writes.append(
@@ -2230,7 +2230,7 @@ def wide_ge_add_rules(
 
                     rules.append(multi_way_and_rule(
                         name=(
-                            f"wide_ge_add_b{b}_cin{carry_in}_"
+                            f"wide_ge_{op}_b{b}_{cin_tag}{carry_in}_"
                             f"a{a_nib:x}_b{b_nib:x}"
                         ),
                         conditions=conditions,
@@ -2239,13 +2239,13 @@ def wide_ge_add_rules(
                         writes=tuple(writes),
                     ))
 
-        # Single carry-in detection / relay rule for byte > 0. Probes
-        # the prior byte's carry-out as a verification observable. The
-        # write is a no-op self-relay (amplitude 0) so the cascade is
-        # bit-stable across repeated lowerings.
+        # Single carry/borrow-in detection / relay rule for byte > 0. Probes
+        # the prior byte's carry-out as a verification observable. The write is
+        # a no-op self-relay (amplitude 0) so the cascade is bit-stable across
+        # repeated lowerings.
         if b > 0:
             rules.append(multi_way_and_rule(
-                name=f"wide_ge_add_b{b}_carry_in_detect",
+                name=f"wide_ge_{op}_b{b}_{detect_tag}_in_detect",
                 conditions=(
                     (marker_gate, 40.0),
                     (carry_in_dim, 60.0),
@@ -2258,6 +2258,41 @@ def wide_ge_add_rules(
             ))
 
     return tuple(rules)
+
+
+def wide_ge_add_rules(
+    *,
+    width_bytes: int,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    operand_a_name: str = "NIB_A",
+    operand_b_name: str = "NIB_B",
+    result_name: str = "RESULT",
+    carry_out_name: str = "CARRY_OUT",
+    position_prefix: str = "p",
+) -> Tuple[FFNRule, ...]:
+    """Emit FFN rules for wide multi-byte ADD on the GE workspace.
+
+    Thin wrapper: ADD is the ``op="add"`` instance of the shared
+    :func:`wide_ge_addsub_rules` core. Byte-identical. See the core docstring
+    for the per-position dim naming and cascade mechanics.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * 513``.
+    """
+    return wide_ge_addsub_rules(
+        op="add",
+        width_bytes=width_bytes,
+        opcode_gate=opcode_gate,
+        marker_gate=marker_gate,
+        S=S,
+        operand_a_name=operand_a_name,
+        operand_b_name=operand_b_name,
+        result_name=result_name,
+        carry_out_name=carry_out_name,
+        position_prefix=position_prefix,
+    )
 
 
 def wide_ge_sub_rules(
@@ -2274,118 +2309,26 @@ def wide_ge_sub_rules(
 ) -> Tuple[FFNRule, ...]:
     """Emit FFN rules for wide multi-byte SUB on the GE workspace.
 
-    Mirror of :func:`wide_ge_add_rules` for subtraction. Per-byte rule
-    semantics are identical to :func:`wide_sub_rules`:
-
-      * diff_nib   = (a_nib - b_nib - borrow_in) & 0xF
-      * borrow_out = (a_nib - b_nib - borrow_in) < 0
-
-    Per-position dim names ``p{b}_NIB_A``, ``p{b}_NIB_B``,
-    ``p{b}_RESULT``, ``p{b}_BORROW_OUT`` (the borrow flag is per
-    position; previous-byte borrow read via
-    ``p{b-1}_BORROW_OUT`` for ``b > 0``). Rule mechanics, condition
-    weights and thresholds match :func:`wide_ge_add_rules` modulo the
-    sub-specific arithmetic.
-
-    Args:
-        width_bytes: number of nibble-wide bytes in the wide SUB.
-        opcode_gate: dim ref for the ``SUB`` opcode gate.
-        marker_gate: dim ref for the AX-style marker gate.
-        S: SwiGLU scale.
-        operand_a_name, operand_b_name, result_name: per-position slot
-            suffixes (defaults match the ADD helper).
-        borrow_out_name: per-position 1-bit borrow flag suffix.
-        position_prefix: prefix for the per-position slot names.
+    Thin wrapper: SUB is the ``op="sub"`` instance of the shared
+    :func:`wide_ge_addsub_rules` core (``borrow_out_name`` -> the core's
+    ``carry_out_name``). Byte-identical. See the core docstring for the
+    per-position dim naming and cascade mechanics.
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length
-        ``256 + (width_bytes - 1) * 513``.
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * 513``.
     """
-    if width_bytes < 1:
-        raise ValueError(
-            f"wide_ge_sub_rules: width_bytes must be >= 1; "
-            f"got {width_bytes!r}"
-        )
-
-    rules: list[FFNRule] = []
-    write_amplitude = 2.0 / S
-
-    for b in range(width_bytes):
-        a_band = f"{position_prefix}{b}_{operand_a_name}"
-        b_band = f"{position_prefix}{b}_{operand_b_name}"
-        out_band = f"{position_prefix}{b}_{result_name}"
-        borrow_out_dim = f"{position_prefix}{b}_{borrow_out_name}"
-        borrow_in_dim = (
-            f"{position_prefix}{b - 1}_{borrow_out_name}" if b > 0 else None
-        )
-
-        borrow_in_cases = (0,) if b == 0 else (0, 1)
-
-        for borrow_in in borrow_in_cases:
-            for a_nib in range(16):
-                for b_nib in range(16):
-                    raw = a_nib - b_nib - borrow_in
-                    diff_nib = raw & 0xF
-                    borrow_out = raw < 0
-
-                    writes: list[Tuple[str, float]] = [
-                        (f"{out_band}+{diff_nib}", write_amplitude),
-                    ]
-                    if borrow_out:
-                        writes.append(
-                            (borrow_out_dim, write_amplitude)
-                        )
-
-                    if b == 0:
-                        conditions = (
-                            (marker_gate, 40.0),
-                            (f"{a_band}+{a_nib}", 30.0),
-                            (f"{b_band}+{b_nib}", 30.0),
-                        )
-                        threshold = 80.0
-                    elif borrow_in == 0:
-                        conditions = (
-                            (marker_gate, 40.0),
-                            (f"{a_band}+{a_nib}", 30.0),
-                            (f"{b_band}+{b_nib}", 30.0),
-                            (borrow_in_dim, -50.0),
-                        )
-                        threshold = 80.0
-                    else:
-                        conditions = (
-                            (marker_gate, 40.0),
-                            (f"{a_band}+{a_nib}", 30.0),
-                            (f"{b_band}+{b_nib}", 30.0),
-                            (borrow_in_dim, 30.0),
-                        )
-                        threshold = 120.0
-
-                    rules.append(multi_way_and_rule(
-                        name=(
-                            f"wide_ge_sub_b{b}_bin{borrow_in}_"
-                            f"a{a_nib:x}_b{b_nib:x}"
-                        ),
-                        conditions=conditions,
-                        threshold=threshold,
-                        gate=opcode_gate,
-                        writes=tuple(writes),
-                    ))
-
-        if b > 0:
-            rules.append(multi_way_and_rule(
-                name=f"wide_ge_sub_b{b}_borrow_in_detect",
-                conditions=(
-                    (marker_gate, 40.0),
-                    (borrow_in_dim, 60.0),
-                ),
-                threshold=80.0,
-                gate=opcode_gate,
-                writes=(
-                    (borrow_in_dim, 0.0),
-                ),
-            ))
-
-    return tuple(rules)
+    return wide_ge_addsub_rules(
+        op="sub",
+        width_bytes=width_bytes,
+        opcode_gate=opcode_gate,
+        marker_gate=marker_gate,
+        S=S,
+        operand_a_name=operand_a_name,
+        operand_b_name=operand_b_name,
+        result_name=result_name,
+        carry_out_name=borrow_out_name,
+        position_prefix=position_prefix,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3246,6 +3189,7 @@ __all__ = [
     "wide_addsub_rules",
     "wide_add_rules",
     "wide_sub_rules",
+    "wide_ge_addsub_rules",
     "wide_ge_add_rules",
     "wide_ge_sub_rules",
     "wide_shift_rules",
