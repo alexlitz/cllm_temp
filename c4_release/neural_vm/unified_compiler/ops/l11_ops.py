@@ -2120,6 +2120,201 @@ def make_ax_hibyte_clear_allstep_op() -> Operation:
 
 
 # ===========================================================================
+# LOOP AX byte-3 FINAL-DUMP CAP (flag C4_LOOP_AX_BYTE3_CAP, DEFAULT-OFF)
+# ===========================================================================
+#
+# THE loop AX byte-3 leak (survey R8, ~50 progs: loop_mul / loop_countdown /
+# loop_pow2). The step-4 IMM-0 initializer leak is a SEPARATE, already-handled
+# root; the RESIDUAL this cap targets is AX byte-3 (the MOST-significant, 4th
+# register byte, emitted at ``MARK_AX+4``) leaking a STALE value (e.g. 0x82 ==
+# 130 == the ``BZ 16`` branch-target PC) into the FINAL LEA;LOAD;HALT return
+# dump. PC is correct throughout — this is an AX-VALUE leak, not a framing
+# desync, so a targeted byte-3 OUTPUT clamp on the dump row is exactly right.
+#
+# PREDICTOR-ROW MAPPING (spec_k=0 BUILT-dim probe, tools/probe_loop_axbyte3_
+# final.py): the residual at token position ``p`` PREDICTS the token at ``p+1``,
+# so the AX byte-3 token (``MARK_AX+4``) is predicted by the residual one row
+# EARLIER (``MARK_AX+3``), which is the byte-2 register token — it carries
+# ``IS_BYTE`` + ``BYTE_INDEX_2`` (NOT BYTE_INDEX_3). Probed 0.970 on that exact
+# row for the loop clusters' final dump. So the cap fires on the
+# ``IS_BYTE + BYTE_INDEX_2`` register-dump row and clamps its emitted byte -> 0.
+#
+# RELATION to ``ax_hibyte_clear_allstep`` (C4_AX_HIBYTE_CLEAR, also default-OFF):
+# that op zeros BOTH the byte-2 (BYTE_INDEX_1) AND byte-3 (BYTE_INDEX_2) dump
+# rows in one bundle. This op is the BYTE-3-ONLY kill-switch the survey-R8 loop
+# lane asked for: same value-invariant signature + marker/overflow blockers, but
+# scoped to the SINGLE byte-3 predictor row so the loop byte-3 leak can be capped
+# independently (and audited / reverted) without touching the byte-2 emission.
+# Appended AFTER ``ax_hibyte_clear_allstep`` (and thus after
+# ``tail_bit32_result_correction``) so it is a LAST OUTPUT writer on the byte-3
+# row before the LM head. SAFE by construction: register byte-3 is 0x00 for
+# EVERY register across the 1096 corpus (PC/SP/BP/AX all < 0x1000000 with a 0x00
+# top byte; a genuine >= 0x1000000 value would carry AX_CARRY_OVERFLOW, whose
+# -1000 blocker kills the clamp there). DEFAULT-OFF -> registered ONLY when the
+# flag is on, so the flag-OFF build bakes NO units and is byte-identical to the
+# golden state_dict hash.
+def _loop_ax_byte3_cap_enabled() -> bool:
+    """``C4_LOOP_AX_BYTE3_CAP`` flag predicate (DEFAULT-OFF).
+
+    Flag-OFF: the op is NOT registered (see all_core_ops) so ZERO units bake ->
+    byte-identical to golden ``91f55411``. Opt in with
+    ``C4_LOOP_AX_BYTE3_CAP=1`` to clamp AX byte-3 -> 0 on the final-dump
+    (BYTE_INDEX_2) predictor row, killing the loop_mul/countdown/pow2 stale
+    byte-3 (0x82) return-dump leak.
+    """
+    return _os_stack0.environ.get("C4_LOOP_AX_BYTE3_CAP", "0") != "0"
+
+
+# The two high-byte register-dump PREDICTOR rows (the residual at position ``p``
+# predicts token ``p+1``): the AX byte-2 token (``MARK_AX+3``) is predicted by
+# the byte-1 register row (carries ``BYTE_INDEX_1``, probed 0.97), and the AX
+# byte-3 token (``MARK_AX+4``) is predicted by the byte-2 register row (carries
+# ``BYTE_INDEX_2``, probed 0.97). One AND rule per high byte.
+_LOOP_AX_BYTE3_CAP_HIDDEN_DIM = 2  # byte-2 (BYTE_INDEX_1) + byte-3 (BYTE_INDEX_2)
+
+# STRONG-clamp write magnitude. The leak drives the emitted high byte via the
+# canonical OUTPUT nibbles: spec_k=0 attribution (probe_loop_step4_byte2.py,
+# loop_pow2_2 step-4 byte-2) shows ``OUTPUT_LO+15`` and ``OUTPUT_HI+15`` both at
+# +12.5 (== 0xF/0xF == 0xFF), OUT-VOTING the clean +0 nibbles (~4-5). The prior
+# hibyte clamp (WW=0.16, ~+10 delta, +0 nibbles ONLY) could NOT beat the +12.5
+# competitor and did NOT kill the +15 nibbles, so byte-2 stayed 0xFF. This cap
+# both KILLS every non-zero nibble (esp. +15) and boosts the +0 nibbles hard, so
+# the 0x00 byte wins the argmax unconditionally on a fire.
+_LOOP_CAP_WW_KILL = 0.5   # ~+/-30 OUTPUT delta on a saturated fire (kills +k>0)
+_LOOP_CAP_WW_ZERO = 0.5   # boost the 0x00 nibbles
+
+
+def _loop_ax_byte3_cap_rules() -> tuple[FFNRule, ...]:
+    """2 AND rules clamping the AX high-byte (byte-2/byte-3) dump emission -> 0.
+
+    Fires on the byte-2 predictor row (``IS_BYTE`` + ``BYTE_INDEX_1``, predicts
+    ``MARK_AX+3``) and the byte-3 predictor row (``IS_BYTE`` + ``BYTE_INDEX_2``,
+    predicts ``MARK_AX+4``), with the SAME marker + ``AX_CARRY_OVERFLOW``
+    blockers as ``ax_hibyte_clear_allstep``. Firing sum = IS_BYTE(1.0) +
+    BYTE_INDEX_x*2(~1.94) = ~2.94 > threshold 2.5; other byte rows (BYTE_INDEX_x
+    ~0 -> sum ~1.0) and marker rows (-1000 blockers) stay dark.
+
+    STRONG clamp: writes a large NEGATIVE to every non-zero OUTPUT nibble
+    (``OUTPUT_LO+k`` / ``OUTPUT_HI+k`` for k=1..15 — this KILLS the leaked
+    ``OUTPUT_LO+15`` / ``OUTPUT_HI+15`` == 0xF the loop leak sets) and a large
+    POSITIVE to ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` so the emitted high byte is
+    0x00. ``AX_CARRY_OVERFLOW`` (-1000) preserves a genuine >= 0x1000000 byte.
+    """
+    IS_BYTE_W = 1.0
+    BYTE_INDEX_W = 2.0
+    THRESHOLD = 2.5
+    BLOCKER_W = 1_000.0
+    blockers = (
+        ("MARK_AX", -BLOCKER_W),
+        ("MARK_PC", -BLOCKER_W),
+        ("MARK_SP", -BLOCKER_W),
+        ("MARK_BP", -BLOCKER_W),
+        ("MARK_STACK0", -BLOCKER_W),
+        ("MARK_MEM", -BLOCKER_W),
+        ("MARK_SE", -BLOCKER_W),
+        ("AX_CARRY_OVERFLOW", -BLOCKER_W),
+    )
+    # Kill every non-zero nibble in BOTH OUTPUT bands, then boost the 0x00 slot.
+    writes = tuple(
+        (f"OUTPUT_LO+{k}", -_LOOP_CAP_WW_KILL) for k in range(1, 16)
+    ) + tuple(
+        (f"OUTPUT_HI+{k}", -_LOOP_CAP_WW_KILL) for k in range(1, 16)
+    ) + (
+        ("OUTPUT_LO+0", _LOOP_CAP_WW_ZERO),
+        ("OUTPUT_HI+0", _LOOP_CAP_WW_ZERO),
+    )
+    rules: list[FFNRule] = []
+    for byte_label, bindex in (("byte2", "BYTE_INDEX_1"), ("byte3", "BYTE_INDEX_2")):
+        rules.append(multi_way_and_rule(
+            name=f"loop_ax_byte3_cap_{byte_label}",
+            conditions=(
+                ("IS_BYTE", IS_BYTE_W),
+                (bindex, BYTE_INDEX_W),
+            ) + blockers,
+            threshold=THRESHOLD,
+            writes=writes,
+        ))
+    return tuple(rules)
+
+
+def make_loop_ax_byte3_cap_op() -> Operation:
+    """Append the loop AX high-byte (byte-2/byte-3) dump clamp FFN after L25 tail.
+
+    Fires on the two high-byte register-dump predictor rows (``IS_BYTE`` +
+    ``BYTE_INDEX_1`` = byte-2 predictor, and ``IS_BYTE`` + ``BYTE_INDEX_2`` =
+    byte-3 predictor) and STRONGLY clamps their OUTPUT emission -> 0x00, killing
+    the loop_mul/countdown/pow2 stale high-byte leak (the step-4 byte-2 0xFF /
+    the byte-3 stale-PC 0x82 return-dump leak). Registered ONLY when
+    ``C4_LOOP_AX_BYTE3_CAP`` is on (see all_core_ops), so flag-OFF is
+    byte-identical to golden; the op assumes it is only constructed under the
+    flag.
+    """
+    rules = _loop_ax_byte3_cap_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _LOOP_AX_BYTE3_CAP_HIDDEN_DIM, (
+            f"loop_ax_byte3_cap rule-count drift: produced {len(rules)}, "
+            f"expected {_LOOP_AX_BYTE3_CAP_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="loop_ax_byte3_cap",
+        reads={
+            "IS_BYTE", "BYTE_INDEX_1", "BYTE_INDEX_2",
+            "MARK_AX", "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0",
+            "MARK_MEM", "MARK_SE", "AX_CARRY_OVERFLOW",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # After ax_hibyte_clear_allstep (thus after tail_bit32_result_correction)
+        # so it is the last OUTPUT writer on the byte-3 dump row before the LM
+        # head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="AX_HIGH_BYTE_DUMP_ROOT_IS_H1_ONEHOT_2026_06_13.md",
+    )
+
+
+# ===========================================================================
 # AX byte-1 DUMP -> OUTPUT decode (UNCONDITIONAL, OUTPUT-canonical)
 # ===========================================================================
 #
