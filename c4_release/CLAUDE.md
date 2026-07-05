@@ -132,17 +132,19 @@ eliminates the cross-lane merge conflict. Full API + the legacy
 
 Run these BEFORE committing any new op or rule change:
 
-- **`tools/_isa_golden_hash.py` — the authoritative flag-OFF byte-identity
-  gate.** The current golden (default build) is `state_dict_sha256 =
-  91f5541100d9a9ec7081105a6bde83f9de5c65cc62317a62bf108bdc93aa56c1`
-  (short `91f55411`) after the enumerated→computed byte-writeback collapse
-  (2026-07; 4 `C4_STACK0_*_COMPUTED` flags now DEFAULT-ON, −891 FFN units,
-  verdict-neutral — kill-switch `=0` reproduces `81557d21`, which itself
-  followed the STACK0-b0 dump deletion from `b4d2ab27`). Any
-  docs/analysis change must leave this unchanged; any weight-affecting
-  change must intend the hash it produces. Use `81557d21` for all future
-  flag-OFF byte-identity checks (historical `b4d2ab27` builds predate the
-  STACK0-b0 dump deletion).
+- **`tools/_isa_golden_hash.py` — the authoritative byte-identity gate.**
+  The current golden (default build) is `state_dict_sha256 =
+  b1dcae630381bbe93ece7a53efbeadf4a6fefef0227db8fa17fba81d76ad53f5`
+  (short `b1dcae63`) after the `C4_CLEAN_EMITTER` DEFAULT-ON flip + the
+  deletion of the two subsumed point-fix correctors (2026-07;
+  `no_stack0_se_output_clear` + `no_stack0_mem_marker_output_clear` gone,
+  net FFN units 42149 → 42117). This is an INTENDED verdict-change (full
+  1096 516 → 525, +9), so the golden moved off the prior `91f55411`.
+  Because `C4_NO_STACK0_EMIT` defaults ON, the bare-env gate now bakes the
+  clean emitter; `C4_CLEAN_EMITTER=0` on the pre-deletion tree reproduced
+  `91f55411` (escape hatch retired once the correctors were deleted). Any
+  docs/analysis change must leave `b1dcae63` unchanged; any weight-affecting
+  change must intend the hash it produces.
 - **`tools/lint_dim_resolution.py` — MANDATORY ratchet for any tool/op that
   resolves a residual-dim POSITION.** The blessed resolution path is
   `neural_vm.unified_compiler.dim_resolver.DimResolver` over the BUILT
