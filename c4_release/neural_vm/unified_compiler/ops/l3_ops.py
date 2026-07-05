@@ -246,39 +246,37 @@ def _register_default_ffn_rules(S: float) -> tuple:
         byte1_first_step=True,
     )))
 
-    # --- PC bytes 1-3 default (units 22-27) ---
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_byte_{byte_idx}_default_lo",
-            conditions=((f"H1+{_PC_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_byte_{byte_idx}_default_hi",
-            conditions=((f"H1+{_PC_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
+    # --- PC bytes 1-3 default (units 22-27) — DERIVED via register_byte_defaults ---
+    # The PC register's byte-index-only default writer (docs/semantic_spec_CONTROL.md
+    # §G10): at ``H1[PC] ∧ BYTE_INDEX_{0,1,2}`` write 0 to OUTPUT byte 0 (LO+HI).
+    # No marker, first-step, or marker-first-step sub-band — only the byte-index
+    # band of the shared :class:`RegisterByteDefaultSpec` shape (the ``byte`` infix
+    # gives ``pc_byte_0_default_lo``). Byte-identical to the hand-authored bank
+    # (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.pc",
+        select_conditions=((f"H1+{_PC_I}", 1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step=None,
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
-    # --- AX bytes 1-3 default (units 28-33) ---
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.ax_byte_{byte_idx}_default_lo",
-            conditions=((f"H1+{_AX_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.ax_byte_{byte_idx}_default_hi",
-            conditions=((f"H1+{_AX_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
+    # --- AX bytes 1-3 default (units 28-33) — DERIVED via register_byte_defaults ---
+    # The AX register's byte-index-only default writer — the exact mirror of the PC
+    # bank (H1[AX] selector). Same :class:`RegisterByteDefaultSpec` shape.
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.ax",
+        select_conditions=((f"H1+{_AX_I}", 1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step=None,
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
     # --- MEM marker default (units 34-35) ---
     rules.append(step_function_rule(
@@ -300,22 +298,19 @@ def _register_default_ffn_rules(S: float) -> tuple:
         scope="MARK_MEM",
     ))
 
-    # --- MEM addr bytes 1-3 default (units 36-41) ---
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.mem_byte_{byte_idx}_default_lo",
-            conditions=((f"H1+{_MEM_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.mem_byte_{byte_idx}_default_hi",
-            conditions=((f"H1+{_MEM_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
+    # --- MEM addr bytes 1-3 default (units 36-41) — DERIVED via register_byte_defaults ---
+    # The MEM register's byte-index-only default writer — the exact mirror of the
+    # PC/AX banks (H1[MEM] selector). Same :class:`RegisterByteDefaultSpec` shape.
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.mem",
+        select_conditions=((f"H1+{_MEM_I}", 1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step=None,
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
     # --- STACK0 bytes 0-2 default + first-step (units 42-49) — DERIVED ---
     # The STACK0 register's byte-default writer (docs/semantic_spec_CONTROL.md
