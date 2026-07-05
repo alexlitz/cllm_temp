@@ -83,6 +83,9 @@ PROGRAMS = {
     "overwrite": (None, _OVERWRITE_BC, 55),
     # LI a -> want 23 (the relative-address case head-16 was built for).
     "var_mul": ("int main(){int a;int b;a=23;b=47;return a*b;}", None, 23),
+    # var_simple: single BP+0 local (LI query AX_CARRY=0x00 -> veto fires ->
+    # head-16 defers to head-0's zero-address CAM, which is the intended owner).
+    "var_simple": ("int main(){int x;x=7;return x;}", None, 7),
 }
 LI_STEPS = list(range(4, 24))
 HEAD16 = 16
