@@ -176,7 +176,7 @@ markers). So EQ..GE are **one comparator + a 6-row truth table**; the branch is
 | JSR host + relays | `make_function_call_weights_op` bakes the override FFN + the L6 H7 JSR-PC-OUTPUT relay + (flag) byte-1 relay head. | `model_ops.py:914-1067` | — |
 | JSR PC byte-1 (flag) | `_jsr_pc_byte1_relay_head_spec` + `make_jsr_pc_byte1_emit_op` (`C4_JSR_PC_BYTE1`, DEFAULT-OFF; delivers target ≥ 0x100 — gcd/rec). | `model_ops.py:1141-1342` | 0 off |
 | JSR SP decrement | L6 `_layer6_sp_decrement_rules` gated `CMP+4 ∧ MARK_SP` (shared with PSH). | `l6_ops.py:981-989` (per MEMORY §1b) | — |
-| JSR AX passthrough | `_function_call_jsr_ax_passthrough_rules` copies `AX_CARRY→OUTPUT` at MARK_AX on OP_JSR (UNCONDITIONAL). | `model_ops.py` | — |
+| JSR AX passthrough | `_function_call_jsr_ax_passthrough_rules` copies `AX_CARRY→OUTPUT` at MARK_AX on OP_JSR (UNCONDITIONAL). Flag `C4_JSR_AX_CLEAN` (DEFAULT-OFF, task #350) appends a matched negative-clear band that zeroes the copy on the JSR step — the entry `JSR main` (step 0) amplifies an undefined WEAK AX_CARRY into a confident garbage step-0 AX (the gcd/rec cluster wall); ABI-safe since a call replaces AX with the callee's RETURN value. | `model_ops.py` | — |
 
 JSR = **branch-target (same `imm*8+2` encoder as JMP/BZ)** + **push the
 return-PC** (the return-addr `PC+8` that L3's sequential increment already

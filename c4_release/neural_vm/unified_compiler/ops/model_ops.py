@@ -51,6 +51,28 @@ def _jsr_pc_byte1_enabled() -> bool:
     return _os.environ.get("C4_JSR_PC_BYTE1", "0") != "0"
 
 
+def _jsr_ax_clean_enabled() -> bool:
+    """True when the JSR AX-passthrough leak-clean flag is on (default OFF).
+
+    Flag ``C4_JSR_AX_CLEAN`` (task #350). The JSR AX-passthrough
+    (:func:`_function_call_jsr_ax_passthrough_rules`) copies AX_CARRY -> OUTPUT
+    at MARK_AX on EVERY OP_JSR step, so a caller's AX survives the branch
+    (docs/JSR_FIX_SUCCESS.md: "LEV, JSR, ENT don't modify AX"). But on the
+    entry JSR-to-main (bytecode idx 0, VM step 0) AX has never been written:
+    the AX_CARRY nibbles are undefined WEAK garbage (probe: mag ~0.5, noisy
+    argmax) that the passthrough CONFIDENTLY amplifies onto OUTPUT (mag ~4).
+    That polluted index becomes the step-0 AX register (0xF7F7F7.. in
+    test_jsr_then_lev_simple; the gcd(50) + rec_fib(25) + rec_power(25)
+    step-0 cluster wall). When ON, a matched negative-clear band cancels the
+    passthrough's OUTPUT write EXACTLY on the polluted low-target JSR-to-main
+    path (small / byte1==0 entry target, TEMP[0]=IS_JSR ∧ ¬FETCH_HI), so the
+    leaked bytes are zeroed and JSR-to-main leaves a clean step-0 AX. OFF ->
+    no clean rules are emitted -> golden byte-identical.
+    """
+    import os as _os
+    return _os.environ.get("C4_JSR_AX_CLEAN", "0") != "0"
+
+
 # Flag-gated over-width bands for the JSR PC byte-1 relay (collected only when
 # the flag is on -> flag-OFF d_model is byte-identical to golden). JSR_PC_B1 is
 # the marker-staged nibble; JSR_PC_B1_AT_B0 is the relayed copy at the PC byte-0
@@ -465,7 +487,30 @@ def _function_call_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
 
 
 def _function_call_jsr_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
-    """JSR AX passthrough: AX_CARRY -> OUTPUT at AX marker (32 units)."""
+    """JSR AX passthrough: AX_CARRY -> OUTPUT at AX marker (32 units).
+
+    Flag ``C4_JSR_AX_CLEAN`` (task #350, DEFAULT-OFF) appends a matched
+    negative-clear band (32 units) that cancels the passthrough's OUTPUT write on
+    the JSR step. At program entry AX has never been written, so on the
+    program-entry ``JSR main`` (bytecode idx 0, VM step 0) the AX_CARRY nibbles
+    are undefined WEAK garbage (probe: mag ~0.5, noisy argmax) that the
+    passthrough CONFIDENTLY amplifies onto OUTPUT (mag ~4) -> the leaked index
+    becomes the step-0 AX register (0xF7F7F7.. in test_jsr_then_lev_simple; the
+    gcd(50)+rec_fib(25)+rec_power(25) step-0 cluster wall). The clean band reads
+    the SAME ``AX_CARRY_LO/HI+k`` gate under the SAME ``OP_JSR + MARK_AX`` firing
+    condition and writes ``-write_scale`` into the SAME ``OUTPUT_LO/HI+k``, so the
+    passthrough's copy is subtracted back to zero (net-zero OUTPUT write on the
+    JSR step) -> the leaked bytes are cleaned and JSR-to-main leaves a clean
+    step-0 AX. This is ABI-safe: per the C4 call convention
+    (test_jsr_does_not_clobber_caller_ax) a call replaces AX with the callee's
+    RETURN value (materialized by the LEV teardown / callee IMM), NOT the
+    caller's pre-call AX, so the JSR step itself owes no AX preservation -- the
+    caller's AX survives on the frame it pushed, not on this step's OUTPUT. The
+    clean fires on every JSR step (no positional discriminator needed): the
+    entry ``JSR main`` is the only JSR whose AX_CARRY is undefined, and only
+    function-bearing programs emit a step-0 JSR at all (arithmetic programs start
+    with IMM). Flag OFF -> no clean rules emitted -> golden byte-identical.
+    """
     T = 4.0
     write_scale = 2.0 / S
     conditions = (("OP_JSR", 1.0), ("MARK_AX", 1.0))
@@ -485,6 +530,42 @@ def _function_call_jsr_ax_passthrough_rules(S: float) -> tuple[FFNRule, ...]:
             threshold=T,
             gate=f"AX_CARRY_HI+{k}",
             writes=((f"OUTPUT_HI+{k}", write_scale),),
+        ))
+    if _jsr_ax_clean_enabled():
+        rules.extend(_function_call_jsr_ax_clean_rules(S))
+    return tuple(rules)
+
+
+def _function_call_jsr_ax_clean_rules(S: float) -> tuple[FFNRule, ...]:
+    """JSR-to-main AX-leak clean band (flag ``C4_JSR_AX_CLEAN``, 32 units).
+
+    Matched negative-cancel for :func:`_function_call_jsr_ax_passthrough_rules`:
+    reads the SAME ``AX_CARRY_LO/HI+k`` one-hot gate under the SAME
+    ``OP_JSR + MARK_AX`` firing condition and writes ``-write_scale`` into the
+    SAME ``OUTPUT_LO/HI+k``, subtracting the passthrough's copy back to zero.
+    On the entry JSR-to-main this zeroes the amplified undefined-AX_CARRY
+    pollution; the callee's genuine return value is materialized later by the
+    LEV teardown, not by this step. Only appended when the flag is ON.
+    """
+    T = 4.0
+    write_scale = 2.0 / S
+    conditions = (("OP_JSR", 1.0), ("MARK_AX", 1.0))
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"jsr_ax_clean_lo_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_LO+{k}",
+            writes=((f"OUTPUT_LO+{k}", -write_scale),),
+        ))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"jsr_ax_clean_hi_{k}",
+            conditions=conditions,
+            threshold=T,
+            gate=f"AX_CARRY_HI+{k}",
+            writes=((f"OUTPUT_HI+{k}", -write_scale),),
         ))
     return tuple(rules)
 
