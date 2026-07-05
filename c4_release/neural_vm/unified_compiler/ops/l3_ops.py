@@ -8,10 +8,12 @@ from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..isa_semantics_dsl import (
     CamValueBand,
+    ConstValueOverrideSpec,
     FrameRelaySpec,
     RegisterByteDefaultSpec,
     RegisterDeltaSpec,
     SequentialAddDelta,
+    const_value_override,
     frame_relay,
     register_byte_defaults,
     register_delta,
@@ -836,6 +838,12 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     :func:`dim_ref` for the ``(byte_index, "0")`` family lookup so
     the rule names the byte-position role rather than the bare slot
     label. Byte-identical via DimRef.parse.
+
+    DERIVED via the :func:`const_value_override` primitive — each rule is a single
+    authoritative fixed-VALUE OUTPUT override (the PC byte-1 = 1 landing) gated by
+    an AND, exactly the primitive's shape (the same one that owns the L16 top-level
+    LEV return 0x0a). The value writes stay caller-supplied DATA. Byte-identical
+    (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
     """
     common_conds = (
         (f"H1+{_PC_I}", 1.0),
@@ -850,7 +858,7 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     )
     # Rule 0 (unit 134): wrap token -- new byte0 high nibble == 0 AND
     # new byte0 low nibble == 2 (i.e. PC just crossed 0x100).
-    wrap = multi_way_and_rule(
+    wrap = const_value_override(ConstValueOverrideSpec(
         name="layer3_ffn.pc_byte1_wrap_token",
         conditions=common_conds + (
             ("CLEAN_EMBED_LO+2", 1.0),
@@ -858,7 +866,7 @@ def _pc_byte1_output_rules(S: float) -> tuple:
         ),
         threshold=5.5,
         writes=common_writes,
-    )
+    ))
     # Rule 1 (unit 135): preserve when previous byte1 was already 1
     # (TEMP+1 from L3 head 7 carry low nibble) AND TEMP+16 (the carry
     # tag) AND CLEAN_EMBED_HI 0..4 (bound to byte0 high nibbles 0..4
@@ -868,12 +876,12 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     preserve_conds.append(("TEMP+16", 1.0))
     for hi in range(5):
         preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
-    preserve = multi_way_and_rule(
+    preserve = const_value_override(ConstValueOverrideSpec(
         name="layer3_ffn.pc_byte1_preserve",
         conditions=tuple(preserve_conds),
         threshold=6.5,
         writes=common_writes,
-    )
+    ))
     return (wrap, preserve)
 
 
@@ -929,12 +937,14 @@ def _jsr_pc_byte1_seq_carry_stage_rules(S: float) -> tuple:
     preserve_conds.append(("TEMP+16", 1.0))
     for hi in range(5):
         preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
-    preserve = multi_way_and_rule(
+    # DERIVED via const_value_override — same AND-gated fixed-write shape as the
+    # production pc_byte1 preserve rule, into the survivable JSR_PC_B1_AT_B0 band.
+    preserve = const_value_override(ConstValueOverrideSpec(
         name="layer3_ffn.jsr_pc_byte1_seq_carry_preserve",
         conditions=tuple(preserve_conds),
         threshold=6.5,
         writes=(("JSR_PC_B1_AT_B0+1", write_scale),),
-    )
+    ))
     return (preserve,)
 
 
