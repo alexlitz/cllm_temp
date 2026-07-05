@@ -7,9 +7,14 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..isa_semantics_dsl import (
+    CamValueBand,
+    ConstValueOverrideSpec,
+    FrameRelaySpec,
     RegisterByteDefaultSpec,
     RegisterDeltaSpec,
     SequentialAddDelta,
+    const_value_override,
+    frame_relay,
     register_byte_defaults,
     register_delta,
 )
@@ -246,39 +251,37 @@ def _register_default_ffn_rules(S: float) -> tuple:
         byte1_first_step=True,
     )))
 
-    # --- PC bytes 1-3 default (units 22-27) ---
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_byte_{byte_idx}_default_lo",
-            conditions=((f"H1+{_PC_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.pc_byte_{byte_idx}_default_hi",
-            conditions=((f"H1+{_PC_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
+    # --- PC bytes 1-3 default (units 22-27) — DERIVED via register_byte_defaults ---
+    # The PC register's byte-index-only default writer (docs/semantic_spec_CONTROL.md
+    # §G10): at ``H1[PC] ∧ BYTE_INDEX_{0,1,2}`` write 0 to OUTPUT byte 0 (LO+HI).
+    # No marker, first-step, or marker-first-step sub-band — only the byte-index
+    # band of the shared :class:`RegisterByteDefaultSpec` shape (the ``byte`` infix
+    # gives ``pc_byte_0_default_lo``). Byte-identical to the hand-authored bank
+    # (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.pc",
+        select_conditions=((f"H1+{_PC_I}", 1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step=None,
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
-    # --- AX bytes 1-3 default (units 28-33) ---
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.ax_byte_{byte_idx}_default_lo",
-            conditions=((f"H1+{_AX_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.ax_byte_{byte_idx}_default_hi",
-            conditions=((f"H1+{_AX_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
+    # --- AX bytes 1-3 default (units 28-33) — DERIVED via register_byte_defaults ---
+    # The AX register's byte-index-only default writer — the exact mirror of the PC
+    # bank (H1[AX] selector). Same :class:`RegisterByteDefaultSpec` shape.
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.ax",
+        select_conditions=((f"H1+{_AX_I}", 1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step=None,
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
     # --- MEM marker default (units 34-35) ---
     rules.append(step_function_rule(
@@ -300,22 +303,19 @@ def _register_default_ffn_rules(S: float) -> tuple:
         scope="MARK_MEM",
     ))
 
-    # --- MEM addr bytes 1-3 default (units 36-41) ---
-    for byte_idx in (0, 1, 2):
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.mem_byte_{byte_idx}_default_lo",
-            conditions=((f"H1+{_MEM_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_LO+0", 2.0 / S),),
-        ))
-        rules.append(multi_way_and_rule(
-            name=f"layer3_ffn.mem_byte_{byte_idx}_default_hi",
-            conditions=((f"H1+{_MEM_I}", 1.0),
-                        (_BYTE_INDEX[byte_idx], 1.0)),
-            threshold=1.5,
-            writes=(("OUTPUT_HI+0", 2.0 / S),),
-        ))
+    # --- MEM addr bytes 1-3 default (units 36-41) — DERIVED via register_byte_defaults ---
+    # The MEM register's byte-index-only default writer — the exact mirror of the
+    # PC/AX banks (H1[MEM] selector). Same :class:`RegisterByteDefaultSpec` shape.
+    rules.extend(register_byte_defaults(RegisterByteDefaultSpec(
+        name_prefix="layer3_ffn.mem",
+        select_conditions=((f"H1+{_MEM_I}", 1.0),),
+        byte_idx_name="byte",
+        write_scale=2.0 / S,
+        marker=None,
+        marker_first_step=None,
+        byte_idx_default=(0, 1, 2),
+        byte1_first_step=False,
+    )))
 
     # --- STACK0 bytes 0-2 default + first-step (units 42-49) — DERIVED ---
     # The STACK0 register's byte-default writer (docs/semantic_spec_CONTROL.md
@@ -838,6 +838,12 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     :func:`dim_ref` for the ``(byte_index, "0")`` family lookup so
     the rule names the byte-position role rather than the bare slot
     label. Byte-identical via DimRef.parse.
+
+    DERIVED via the :func:`const_value_override` primitive — each rule is a single
+    authoritative fixed-VALUE OUTPUT override (the PC byte-1 = 1 landing) gated by
+    an AND, exactly the primitive's shape (the same one that owns the L16 top-level
+    LEV return 0x0a). The value writes stay caller-supplied DATA. Byte-identical
+    (proof: ``tools/_isa_golden_hash.py`` == 91f55411).
     """
     common_conds = (
         (f"H1+{_PC_I}", 1.0),
@@ -852,7 +858,7 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     )
     # Rule 0 (unit 134): wrap token -- new byte0 high nibble == 0 AND
     # new byte0 low nibble == 2 (i.e. PC just crossed 0x100).
-    wrap = multi_way_and_rule(
+    wrap = const_value_override(ConstValueOverrideSpec(
         name="layer3_ffn.pc_byte1_wrap_token",
         conditions=common_conds + (
             ("CLEAN_EMBED_LO+2", 1.0),
@@ -860,7 +866,7 @@ def _pc_byte1_output_rules(S: float) -> tuple:
         ),
         threshold=5.5,
         writes=common_writes,
-    )
+    ))
     # Rule 1 (unit 135): preserve when previous byte1 was already 1
     # (TEMP+1 from L3 head 7 carry low nibble) AND TEMP+16 (the carry
     # tag) AND CLEAN_EMBED_HI 0..4 (bound to byte0 high nibbles 0..4
@@ -870,12 +876,12 @@ def _pc_byte1_output_rules(S: float) -> tuple:
     preserve_conds.append(("TEMP+16", 1.0))
     for hi in range(5):
         preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
-    preserve = multi_way_and_rule(
+    preserve = const_value_override(ConstValueOverrideSpec(
         name="layer3_ffn.pc_byte1_preserve",
         conditions=tuple(preserve_conds),
         threshold=6.5,
         writes=common_writes,
-    )
+    ))
     return (wrap, preserve)
 
 
@@ -931,12 +937,14 @@ def _jsr_pc_byte1_seq_carry_stage_rules(S: float) -> tuple:
     preserve_conds.append(("TEMP+16", 1.0))
     for hi in range(5):
         preserve_conds.append((f"CLEAN_EMBED_HI+{hi}", 1.0))
-    preserve = multi_way_and_rule(
+    # DERIVED via const_value_override — same AND-gated fixed-write shape as the
+    # production pc_byte1 preserve rule, into the survivable JSR_PC_B1_AT_B0 band.
+    preserve = const_value_override(ConstValueOverrideSpec(
         name="layer3_ffn.jsr_pc_byte1_seq_carry_preserve",
         conditions=tuple(preserve_conds),
         threshold=6.5,
         writes=(("JSR_PC_B1_AT_B0+1", write_scale),),
-    )
+    ))
     return (preserve,)
 
 
@@ -1238,25 +1246,25 @@ def _carry_forward_head_spec(
     BD,
     *,
     head_idx: int,
-    marker_dim: int,
+    marker: str,
     l1h1_idx: int,
     l1h0_idx: int,
-    out_lo: int,
-    out_hi: int,
-    src_lo: int,
-    src_hi: int,
+    out_lo: str,
+    out_hi: str,
+    src_lo: str,
+    src_hi: str,
     L: float = 15.0,
 ) -> DeclarativeAttentionHeadSpec:
-    """Declarative replacement for ``Primitives.carry_forward_attention``.
+    """Declarative register carry-forward head — DERIVED via ``frame_relay``.
 
-    Mirrors the exact Q/K/V/O writes of the helper one-to-one so the
-    lowered matrices are byte-identical. The spec carries:
+    The register carry-forward relay (formerly ``Primitives.carry_forward_attention``)
+    is an instance of the generic :func:`frame_relay` value-relay pattern:
 
-    * ``Q[0] = marker_dim * L`` -- fires at the target marker.
+    * ``Q[0] = marker * L`` -- fires at the target register marker.
     * ``K[0] = L1H1+l1h1_idx * L``, ``K[0] = L1H0+l1h0_idx * -L`` --
-      fires at the previous step's byte 0 row.
-    * ``V[1+k] = src_lo+k``, ``V[17+k] = src_hi+k`` for k=0..15.
-    * ``O[out_lo+k] = V[1+k]``, ``O[out_hi+k] = V[17+k]`` for k=0..15.
+      selects the previous step's byte-0 row (the frame-select signature,
+      here an L1H1/L1H0 threshold-bank differential rather than a bare marker).
+    * value band ``src_{lo,hi}`` -> ``out_{lo,hi}`` (V slots 1..16 / 17..32).
     * Anti-leakage gate at slot 33: ``Q[33]=marker*L + CONST*-L/2``,
       ``K[33]=(L1H1+l1h1_idx)*0.1 + (L1H0+l1h0_idx)*-0.1 + CONST*L``.
       The K-side L1H1/L1H0 differential (at small weight 0.1) makes the
@@ -1266,35 +1274,41 @@ def _carry_forward_head_spec(
       a Q-gated slot softmax-cancels). The complement mirrors slot 0
       direction so the gate's K-side discriminator selects the same
       prev-step register byte-0 row already biased by slot 0.
+
+    Byte-identical to the hand-authored per-slot Q/K/V/O writes (proof:
+    ``tools/_isa_golden_hash.py`` == 91f55411).
     """
 
     GATE = 33
-    q = [
-        AP(0, marker_dim, L),
-        AP(GATE, marker_dim, L),
-        AP(GATE, BD.CONST, -L / 2),
-    ]
-    k = [
-        AP(0, BD.L1H1 + l1h1_idx, L),
-        AP(0, BD.L1H0 + l1h0_idx, -L),
-        AP(GATE, BD.L1H1 + l1h1_idx, 0.1),
-        AP(GATE, BD.L1H0 + l1h0_idx, -0.1),
-        AP(GATE, BD.CONST, L),
-    ]
-    v = []
-    o = []
-    for k_idx in range(16):
-        v.append(AP(1 + k_idx, src_lo + k_idx, 1.0))
-        v.append(AP(17 + k_idx, src_hi + k_idx, 1.0))
-        o.append(AO(out_lo + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(out_hi + k_idx, 17 + k_idx, 1.0))
-    return DeclarativeAttentionHeadSpec(
-        head_idx=head_idx,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-    )
+    l1h1 = f"L1H1+{l1h1_idx}"
+    l1h0 = f"L1H0+{l1h0_idx}"
+    # ``frame_relay`` resolves ``BASE+offset`` tokens by looking up the BASE name,
+    # so only the base names go in the dim_map (matches the L8 SP-gather pattern).
+    dim_map = {
+        n: int(getattr(BD, n))
+        for n in (marker, "CONST", "L1H1", "L1H0",
+                  out_lo, out_hi, src_lo, src_hi)
+    }
+    bundle = frame_relay(FrameRelaySpec(
+        name=f"layer3_carry_forward_{marker}",
+        q_gates=(
+            (0, marker, L),
+            (GATE, marker, L),
+            (GATE, "CONST", -L / 2),
+        ),
+        k_gates=(
+            (0, l1h1, L),
+            (0, l1h0, -L),
+            (GATE, l1h1, 0.1),
+            (GATE, l1h0, -0.1),
+            (GATE, "CONST", L),
+        ),
+        value_bands=(
+            CamValueBand(src_lo, out_lo, 16, 1, 1.0),
+            CamValueBand(src_hi, out_hi, 16, 17, 1.0),
+        ),
+    ))
+    return bundle.head_spec_builder(dim_map, head_idx=head_idx)
 
 
 def _carry_forward_head_specs(
@@ -1313,46 +1327,46 @@ def _carry_forward_head_specs(
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_0"],
-            marker_dim=BD.MARK_PC,
+            marker="MARK_PC",
             l1h1_idx=PC_I,
             l1h0_idx=PC_I,
-            out_lo=BD.EMBED_LO,
-            out_hi=BD.EMBED_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="EMBED_LO",
+            out_hi="EMBED_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_1"],
-            marker_dim=BD.MARK_AX,
+            marker="MARK_AX",
             l1h1_idx=AX_I,
             l1h0_idx=AX_I,
-            out_lo=BD.AX_CARRY_LO,
-            out_hi=BD.AX_CARRY_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="AX_CARRY_LO",
+            out_hi="AX_CARRY_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_2"],
-            marker_dim=BD.MARK_SP,
+            marker="MARK_SP",
             l1h1_idx=SP_I,
             l1h0_idx=SP_I,
-            out_lo=BD.EMBED_LO,
-            out_hi=BD.EMBED_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="EMBED_LO",
+            out_hi="EMBED_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _carry_forward_head_spec(
             BD,
             head_idx=_CARRY_FORWARD_HEAD_LAYOUT_BY_NAME["layer3_carry_forward_attn.head_3"],
-            marker_dim=BD.MARK_BP,
+            marker="MARK_BP",
             l1h1_idx=BP_I,
             l1h0_idx=BP_I,
-            out_lo=BD.EMBED_LO,
-            out_hi=BD.EMBED_HI,
-            src_lo=BD.EMBED_LO,
-            src_hi=BD.EMBED_HI,
+            out_lo="EMBED_LO",
+            out_hi="EMBED_HI",
+            src_lo="EMBED_LO",
+            src_hi="EMBED_HI",
         ),
         _stack0_carry_head_spec(BD),
         _ax_full_relay_head_spec(BD),
@@ -1425,39 +1439,46 @@ def _ax_full_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     See docs/VAR_L3_SP_BYTE2_2026_06_07.md,
     docs/NESTED_ATTRIBUTION_2026_06_09.md, and memory note
     ``project_var_failure_mode_shifted`` for prior attributions.
+
+    DERIVED via the generic :func:`frame_relay` primitive — the same value-relay
+    machinery as the L8 head-6 AX_CARRY refresh (``_layer8_head6_ax_carry_frame_spec``).
+    The head fires at the AX marker row (slot-0 + slot-33 gate signature, with the
+    two HAS_SE step-0 guards described above), K selects the AX marker, and the
+    two :class:`CamValueBand` blocks relay ``OUTPUT_{LO,HI}`` -> ``AX_FULL_{LO,HI}``.
+    Byte-identical to the hand-authored head (proof: ``tools/_isa_golden_hash.py``
+    == 91f55411).
     """
 
     L = 15.0
     GATE = 33
-    q = [
-        AP(0, BD.MARK_AX, L),
-        AP(0, BD.HAS_SE, 2 * L),
-        AP(0, BD.CONST, -L * 2.5),
-        AP(GATE, BD.MARK_AX, L),
-        AP(GATE, BD.HAS_SE, L),
-        AP(GATE, BD.CONST, -L * 1.5),
-    ]
-    k = [
-        AP(0, BD.MARK_AX, L),
-        AP(GATE, BD.CONST, L),
-        # K-side complement for slot-33 MARK_AX gate (per
-        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L3 carry_forward).
-        AP(GATE, BD.MARK_AX, L),
-    ]
-    v = []
-    o = []
-    for k_idx in range(16):
-        v.append(AP(1 + k_idx, BD.OUTPUT_LO + k_idx, 1.0))
-        v.append(AP(17 + k_idx, BD.OUTPUT_HI + k_idx, 1.0))
-        o.append(AO(BD.AX_FULL_LO + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(BD.AX_FULL_HI + k_idx, 17 + k_idx, 1.0))
-    return DeclarativeAttentionHeadSpec(
-        head_idx=5,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-    )
+    dim_map = {
+        n: int(getattr(BD, n))
+        for n in ("MARK_AX", "HAS_SE", "CONST",
+                  "OUTPUT_LO", "OUTPUT_HI", "AX_FULL_LO", "AX_FULL_HI")
+    }
+    bundle = frame_relay(FrameRelaySpec(
+        name="layer3_ax_full_relay",
+        q_gates=(
+            (0, "MARK_AX", L),
+            (0, "HAS_SE", 2 * L),
+            (0, "CONST", -L * 2.5),
+            (GATE, "MARK_AX", L),
+            (GATE, "HAS_SE", L),
+            (GATE, "CONST", -L * 1.5),
+        ),
+        # slot-0 AX marker select + slot-33 CONST anchor + slot-33 MARK_AX
+        # K-side complement (per docs/Q_SIDE_GATE_AUDIT_2026_06_07.md).
+        k_gates=(
+            (0, "MARK_AX", L),
+            (GATE, "CONST", L),
+            (GATE, "MARK_AX", L),
+        ),
+        value_bands=(
+            CamValueBand("OUTPUT_LO", "AX_FULL_LO", 16, 1, 1.0),
+            CamValueBand("OUTPUT_HI", "AX_FULL_HI", 16, 17, 1.0),
+        ),
+    ))
+    return bundle.head_spec_builder(dim_map, head_idx=5)
 
 
 def _lev_bp_to_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
