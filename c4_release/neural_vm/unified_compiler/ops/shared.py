@@ -1003,6 +1003,53 @@ def cmp_gt_lo_lt_hieq_guard_enabled() -> bool:
     return os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
 
 
+def cmp_combine_margin_enabled() -> bool:
+    """Return True iff the ComparisonCombine result byte gets an explicit
+    OUTPUT-HIGH-nibble CLAMP so the boolean result cannot leak an operand
+    ``(hi<<4)`` high nibble (DEFAULT OFF; opt-in via ``C4_CMP_COMBINE_MARGIN=1``;
+    only takes effect when the STACK0 emission is dropped, i.e.
+    ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is byte-identical to
+    golden ``91f55411``).
+
+    The residual cmp wall this lifts (survey R5, ~150 programs — if_gt/if_lt/
+    if_eq step-3, bool_and, func_max/min tail step-13). ROOT: the six
+    comparison opcodes (EQ/NE/LT/GT/LE/GE) write their boolean RESULT to
+    ``OUTPUT_LO`` (0 or 1) via the ComparisonCombine default+override banks, but
+    the accompanying ``OUTPUT_HI_THIS_STEP+0`` write is only ``+2.0/S`` (default
+    unit) and the OVERRIDE units write ``OUTPUT_LO`` ONLY — they never re-assert
+    ``OUTPUT_HI``. On the both-nibbles-nonzero / loaded-var / re-materialized-
+    operand paths a leaked operand HIGH nibble can survive in the OUTPUT_HI band
+    at the compare decode row with a comparable (~1-point) amplitude, so the
+    emitted result byte decodes as ``(hi<<4) | result`` instead of the clean
+    ``result`` in {0, 1}.
+
+    FIX (CLEAN MARGIN AT THE SOURCE, not a tail darken). A comparison result is
+    PROVABLY in {0, 1}, so its byte's HIGH nibble is ALWAYS 0 — there is no
+    operand-dependent case where a comparison opcode legitimately writes a
+    non-zero ``OUTPUT_HI``. So per comparison opcode we add ONE campaign-only
+    clamp unit (same gate as the default: ``MARK_SE_ONLY`` + relayed
+    ``SE_OP_<cmp>`` + the ``MARK_PC`` blocker) that DARKENS every non-zero
+    ``OUTPUT_HI_THIS_STEP+1..15`` nibble (strong negative) AND reinforces
+    ``OUTPUT_HI_THIS_STEP+0`` (positive), out-voting any leaked operand high
+    nibble at the decode row. Because the high nibble of a boolean result is
+    invariantly 0, the clamp CANNOT change any already-correct comparison (its
+    OUTPUT_HI is already 0-dominant) — it can only pull a leaked ``(hi<<4)`` back
+    to a clean low-nibble result. This is DISCRIMINATING (not the known Wave-B
+    zero-sum tail trade): it touches only ``OUTPUT_HI`` at the six comparison
+    opcodes' decode row, leaving ``OUTPUT_LO`` (the actual 0/1 result) and every
+    non-cmp opcode's OUTPUT_HI (which DO carry value high-nibbles, e.g. the
+    func_max RETURN value 0x63) UNTOUCHED.
+
+    DEFAULT OFF. Opt-in via ``C4_CMP_COMBINE_MARGIN=1`` (campaign only). Kept as
+    a dedicated kill-switch so ``tools/flag_regression_gate.py --flag
+    C4_CMP_COMBINE_MARGIN`` can A/B it inside the campaign config. Flag-OFF (or
+    ``C4_NO_STACK0_EMIT=0``) is byte-identical to golden.
+    """
+    if not no_stack0_emit_enabled():
+        return False
+    return os.environ.get("C4_CMP_COMBINE_MARGIN", "0") == "1"
+
+
 def func_lea_reread_bp_resharpen_enabled() -> bool:
     """Return True iff the L7 head-1 re-read-LEA BP-frame re-sharpen is active
     (DEFAULT ON in the campaign config — opt-out via
