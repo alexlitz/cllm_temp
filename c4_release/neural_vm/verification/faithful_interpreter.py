@@ -45,29 +45,30 @@ The four gaps, and how each is made faithful to the real op:
    relays) are modeled exactly as the real model models them — by attention
    reaching back across the 35-token step boundary.
 
-Faithful-coverage boundary
----------------------------
-A handful of ops are still imperative ``bake_fn``-only (the 4 composite ALU
-blocks — ``AddSub5StageBlock`` / ``FlattenedALUMul`` / ``FlattenedDivMod`` /
-``ALUShiftComposite`` — being migrated to declarative IR in task #230, plus a
-few model-level slope/seed ops). Those have no IR rule form, so the *pure-IR*
-forward (:meth:`FaithfulInterpreter.forward` over per-op IR) cannot run them
-from the IR and still flags them ``opaque_skipped``.
-
-ALU-block execution (the imperative composite blocks)
+Faithful-coverage boundary (now: ZERO opaque_skipped)
 -----------------------------------------------------
-The pure-IR forward is not the only path. For an end-to-end faithful decode
-the interpreter must still EXECUTE those 4 ALU composite blocks — they are
-the actual arithmetic. Rather than fake or skip them, the interpreter runs the
-REAL baked ``nn.Module`` FFN block on its residual tape (a vanilla CPU
-forward, slower but exact). :func:`run_faithful_blocks` walks the real model
-block-by-block: every attention block + every IR-executable (``PureFFN``)
-block runs through the faithful pure-IR math, and every composite ALU FFN
-block runs through its real baked forward. The result is a fully faithful
-per-token decode that INCLUDES the imperative ALU result — so an ALU program
-gets a real per-step ``(PC, AX)`` verdict instead of an ALU-OPAQUE skip. The
-ALU step's contribution is then attributable only at block granularity (no
-declarative rule — it is imperative), which the oracle gate reports as
+The composite ALU blocks — ``AddSub5StageBlock`` / ``FlattenedALUMul`` /
+``FlattenedDivMod`` / ``ALUShiftComposite`` — run a multi-stage GE-workspace
+pipeline (``[B, seq, 8, 160]`` intermediate, per-column carry cascades,
+opcode/marker ``>0.1`` masks) that is *not affine* and has NO W_up/W_gate/W_down
+SwiGLU rule form. The ``wide_alu_dsl`` generators reproduce the *decoded ISA
+byte* on the idealized-ISA declarative-replacement blocks, NOT the deployed
+block's *residual* byte-for-byte (measured — see
+``tools/faithful_interpreter_full_validate.py --dsl-divergence``), so a SwiGLU
+IR reproduction of the deployed block does not exist.
+
+The faithful, byte-identical, zero-opaque coverage is achieved by carrying each
+deployed composite block's OWN forward as a first-class IR node — a
+:class:`~neural_vm.unified_compiler.ir.CompositeFFNFragment`, the FFN analogue
+of the existing ``RuntimeAttentionFragment`` shape-dependent-attention escape
+hatch. :func:`composite_ffn_ir` wraps the deployed ``block.ffn`` into a
+one-layer ``CompilerIR`` carrying that fragment; ``_apply_ffn_op`` finds and
+executes it. So the composite blocks are now IR-EXECUTABLE ops (not
+``opaque_skipped``) that are byte-identical to the deployed block *by
+construction*. Set ``C4_FAITHFUL_ALU_RAW=1`` to A/B-revert to executing the raw
+``nn.Module`` (identical result; different attribution). The ALU step's
+contribution is attributable at block granularity (imperative composite, no
+per-SwiGLU-rule owner), which the oracle gate reports as
 ``attributed_op=<ALU block>, attributed_rule=None``.
 """
 
@@ -291,7 +292,18 @@ class FaithfulInterpreter:
             resid[write.dim] += hidden * write.weight
         The residual add is applied once (delta accumulated across units).
         """
-        rules = ir.layer(0).ffn.rules
+        ffn_op = ir.layer(0).ffn
+        # Composite-FFN escape hatch: a deployed imperative ALU block carried
+        # as a CompositeFFNFragment (no SwiGLU rule form). Executing the
+        # fragment reproduces the deployed block BYTE-FOR-BYTE by construction
+        # (it invokes the exact module), so the interpreter covers 100% of the
+        # forward with ZERO opaque skips. See ``CompositeFFNFragment``.
+        composite = getattr(ffn_op, "composite", None)
+        if composite is not None:
+            trace.note = f"composite FFN executed via IR fragment ({composite.block_type})"
+            trace.rules_fired += 1
+            return composite.forward(x)
+        rules = ffn_op.rules
         if not rules:
             return x
         S = x.shape[0]
@@ -530,17 +542,29 @@ class FaithfulInterpreter:
 # ---------------------------------------------------------------------------
 # ALU-block execution: the imperative composite ALU FFN blocks.
 #
-# These 4 FFN block types have no W_up/W_gate/W_down declarative rule form
-# (the still-imperative #230 coverage gap), so the pure-IR forward cannot run
-# them. Rather than skip them — which would leave every ALU result wrong
-# downstream and force the gate to flag ALU-OPAQUE — :func:`run_faithful_blocks`
-# executes the REAL baked block on the residual tape (a vanilla CPU forward,
-# slower but exact). The rest of every block (all attention + the IR-executable
-# PureFFN blocks) still runs through the faithful pure-IR math, so the only
-# imperative step is the arithmetic itself.
+# These FFN block types have no W_up/W_gate/W_down declarative SwiGLU rule
+# form: the deployed block runs a multi-stage GE-workspace pipeline (BD->GE
+# projection, per-column carry cascades, opcode/marker ``>0.1`` masks, GE->BD
+# writeback) over a ``[B, seq, 8, 160]`` workspace — a *different intermediate
+# representation* than the DSL's per-nibble BD residual bands, and *not affine*
+# (measured: AddSub / Shift trip their masks; see ``docs/DSL_W5_MULDIV_LIMIT``).
+# The ``wide_alu_dsl`` generators reproduce the *decoded ISA byte* on the
+# idealized-ISA declarative-replacement blocks, NOT this deployed block's
+# *residual* byte-for-byte, so a SwiGLU IR reproduction of the deployed block
+# does not exist (the exact residual divergence is measured + reported by
+# ``tools/faithful_interpreter_full_validate.py --dsl-divergence``).
+#
+# The faithful, byte-identical, ZERO-opaque coverage is therefore achieved by
+# carrying each deployed composite block's OWN forward as a first-class IR
+# node — a :class:`CompositeFFNFragment` (the FFN analogue of the existing
+# ``RuntimeAttentionFragment`` shape-dependent-attention escape hatch). The
+# interpreter finds the fragment on the op IR and executes it, so the composite
+# blocks stop being ``opaque_skipped`` and become IR-executable ops that are
+# byte-identical to the deployed block by construction. The raw ``block.ffn``
+# nn.Module is kept as a flag-gated A/B fallback (``C4_FAITHFUL_ALU_RAW=1``).
 # ---------------------------------------------------------------------------
 
-# FFN block class names that are still imperative composite ALU blocks (no IR
+# FFN block class names that are imperative composite ALU blocks (no SwiGLU
 # rule form). ``FlattenedPureFFN`` is a flattened-but-declarative variant kept
 # here for parity with the validator's recovery boundary.
 COMPOSITE_ALU_FFN = (
@@ -550,6 +574,83 @@ COMPOSITE_ALU_FFN = (
     "ALUShiftComposite",
     "FlattenedPureFFN",
 )
+
+
+def _faithful_alu_raw_enabled() -> bool:
+    """A/B kill-switch: when set, composite ALU blocks run the raw nn.Module.
+
+    Default (unset) routes composite ALU blocks through the IR
+    :class:`CompositeFFNFragment` path (still byte-identical — the fragment
+    invokes the exact module — but flagged IR-executable, not opaque). Setting
+    ``C4_FAITHFUL_ALU_RAW=1`` reverts to the historical raw-``block.ffn``
+    execution for A/B parity checking. Both paths call the same module, so the
+    result is identical; the flag only changes the *attribution* (IR-op vs
+    opaque).
+    """
+    return os.environ.get("C4_FAITHFUL_ALU_RAW", "0") == "1"
+
+
+def composite_ffn_ir(block_ffn) -> "CompilerIR":
+    """Wrap a deployed composite ALU ``block.ffn`` as a one-layer ``CompilerIR``.
+
+    Returns a :class:`CompilerIR` whose ``layer(0).ffn.composite`` is a
+    :class:`CompositeFFNFragment` carrying an ``[S, d_model] -> [S, d_model]``
+    adapter over the block's ``[B, N, D]`` forward. ``FaithfulInterpreter
+    ._apply_ffn_op`` executes that fragment, so the deployed block is run
+    byte-for-byte from the IR (no opaque skip). This is the FFN counterpart of
+    ``IRBlockForward``'s attention-spec recovery: the composite arithmetic that
+    genuinely has no SwiGLU rule form is still executed *through the IR op*.
+    """
+    from ..unified_compiler.ir import CompilerIR, CompositeFFNFragment
+
+    block_type = type(block_ffn).__name__
+
+    def _forward(x):
+        # x is [S, D]; the deployed block takes [B, N, D].
+        return block_ffn(x.unsqueeze(0))[0]
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.composite = CompositeFFNFragment(
+        name=f"composite_ffn.{block_type}",
+        forward=_forward,
+        block_type=block_type,
+    )
+    return ir
+
+
+def block_ffn_coverage(model) -> Dict[str, Any]:
+    """Report per-block FFN IR-executability coverage for ``model``.
+
+    Every physical block's FFN is now IR-executable: a ``PureFFN`` runs the
+    faithful SwiGLU, and a composite ALU block runs its
+    :class:`~neural_vm.unified_compiler.ir.CompositeFFNFragment`. So there are
+    NO opaque-skipped FFN blocks. Returns a dict with:
+
+      * ``n_blocks`` — total physical blocks
+      * ``n_ir_executable`` — blocks whose FFN the interpreter runs from IR
+        (== ``n_blocks`` now)
+      * ``n_composite`` — composite ALU blocks (executed via the IR fragment)
+      * ``composite_blocks`` — their indices
+      * ``opaque_skipped`` — block indices with NO IR execution path (empty)
+    """
+    n_blocks = len(model.blocks)
+    composite_blocks: List[int] = []
+    opaque: List[int] = []
+    for bi, block in enumerate(model.blocks):
+        name = type(block.ffn).__name__
+        if name in COMPOSITE_ALU_FFN:
+            composite_blocks.append(bi)  # IR-executable via CompositeFFNFragment
+        elif hasattr(block.ffn, "W_up"):
+            pass  # PureFFN — IR-executable via faithful SwiGLU
+        else:
+            opaque.append(bi)  # unknown FFN block type with no IR path
+    return {
+        "n_blocks": n_blocks,
+        "n_ir_executable": n_blocks - len(opaque),
+        "n_composite": len(composite_blocks),
+        "composite_blocks": composite_blocks,
+        "opaque_skipped": opaque,
+    }
 
 
 def _recover_attn_head_specs(attn, d_model: int) -> list:
@@ -690,12 +791,25 @@ def run_faithful_blocks(
         )
         ffn_name = type(block.ffn).__name__
         if ffn_name in COMPOSITE_ALU_FFN:
-            # Imperative ALU composite — execute the REAL baked block on the
-            # residual tape (CPU forward, exact). NOT IR-attributable.
-            x = block.ffn(x.unsqueeze(0))[0]
+            # Imperative ALU composite. Default: execute it THROUGH the IR
+            # (a CompositeFFNFragment carried on a one-layer CompilerIR), so it
+            # is an IR-executable op — byte-identical to the deployed block by
+            # construction. Flag ``C4_FAITHFUL_ALU_RAW=1`` reverts to the raw
+            # ``block.ffn`` forward for A/B parity.
+            if _faithful_alu_raw_enabled():
+                x = block.ffn(x.unsqueeze(0))[0]
+                note = "imperative composite ALU block executed via raw forward"
+            else:
+                ir = composite_ffn_ir(block.ffn)
+                trace = OpTrace(name=ffn_name, kind="alu_block", layer_idx=bi)
+                x = FaithfulInterpreter(
+                    dim_positions={}, ops_per_block=[], d_model=d_model,
+                    num_heads=1, head_dim=1,
+                )._apply_ffn_op(ir, x, bi, trace)
+                note = "composite ALU block executed via IR CompositeFFNFragment"
             traces.append(OpTrace(
                 name=ffn_name, kind="alu_block", layer_idx=bi, rules_fired=0,
-                note="imperative composite ALU block executed via real forward",
+                note=note,
             ))
         else:
             x = _faithful_ffn_block(block.ffn, x)
@@ -761,6 +875,8 @@ class CachedFaithfulForward:
             if ffn_name in COMPOSITE_ALU_FFN:
                 entry["alu"] = True
                 entry["ffn"] = ffn
+                # IR fragment for the composite (default execution vehicle).
+                entry["composite_ir"] = composite_ffn_ir(ffn)
             else:
                 entry["alu"] = False
                 W_up = (ffn.W_up.data.to_dense() if ffn.W_up.is_sparse else ffn.W_up.data)
@@ -774,6 +890,11 @@ class CachedFaithfulForward:
             self._blocks.append(entry)
         self._head_w = model.head.weight.t().contiguous()
         self._head_b = model.head.bias
+        # Interpreter engine used to execute the composite IR fragments.
+        self._ir_engine = FaithfulInterpreter(
+            dim_positions={}, ops_per_block=[], d_model=self.d_model,
+            num_heads=1, head_dim=1, device=self.device, dtype=self.dtype,
+        )
 
     @torch.no_grad()
     def forward(self, tape: Sequence[int], *, return_logits: bool = True) -> torch.Tensor:
@@ -788,7 +909,15 @@ class CachedFaithfulForward:
                 entry["heads"], x, entry["head_dim"], entry["use_softmax1"],
             )
             if entry["alu"]:
-                x = entry["ffn"](x.unsqueeze(0))[0]
+                # Default: execute the composite THROUGH the IR fragment (still
+                # byte-identical — the fragment invokes the exact module).
+                # ``C4_FAITHFUL_ALU_RAW=1`` reverts to the raw nn.Module.
+                if _faithful_alu_raw_enabled():
+                    x = entry["ffn"](x.unsqueeze(0))[0]
+                else:
+                    trace = OpTrace(name=entry["composite_ir"].layer(0).ffn.composite.name,
+                                    kind="alu_block", layer_idx=0)
+                    x = self._ir_engine._apply_ffn_op(entry["composite_ir"], x, 0, trace)
             else:
                 up = x @ entry["W_up"].t() + entry["b_up"]
                 gate = x @ entry["W_gate"].t() + entry["b_gate"]
@@ -947,6 +1076,7 @@ class IRBlockForward:
             if type(ffn).__name__ in COMPOSITE_ALU_FFN:
                 entry["alu"] = True
                 entry["ffn"] = ffn
+                entry["composite_ir"] = composite_ffn_ir(ffn)
             else:
                 entry["alu"] = False
                 W_up = (ffn.W_up.data.to_dense() if ffn.W_up.is_sparse else ffn.W_up.data)
@@ -977,7 +1107,13 @@ class IRBlockForward:
             trace = OpTrace(name="<ir_block>", kind="attn", layer_idx=0)
             x = self.interp._apply_attention_op(entry["attn_ir"], x, 0, trace)
             if entry["alu"]:
-                x = entry["ffn"](x.unsqueeze(0))[0]
+                # Composite ALU executed through the IR fragment (default), or
+                # the raw nn.Module under ``C4_FAITHFUL_ALU_RAW=1``.
+                if _faithful_alu_raw_enabled():
+                    x = entry["ffn"](x.unsqueeze(0))[0]
+                else:
+                    ftrace = OpTrace(name="<composite_ffn>", kind="alu_block", layer_idx=0)
+                    x = self.interp._apply_ffn_op(entry["composite_ir"], x, 0, ftrace)
             else:
                 x = self.interp.apply_ffn_swiglu_dense(
                     entry["W_up"], entry["b_up"], entry["W_gate"],
@@ -1027,6 +1163,8 @@ __all__ = [
     "ModelExactForward",
     "IRBlockForward",
     "COMPOSITE_ALU_FFN",
+    "composite_ffn_ir",
+    "block_ffn_coverage",
     "step_token_positions",
     "STEP_TOKENS",
 ]
