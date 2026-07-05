@@ -618,6 +618,41 @@ def composite_ffn_ir(block_ffn) -> "CompilerIR":
     return ir
 
 
+def block_ffn_coverage(model) -> Dict[str, Any]:
+    """Report per-block FFN IR-executability coverage for ``model``.
+
+    Every physical block's FFN is now IR-executable: a ``PureFFN`` runs the
+    faithful SwiGLU, and a composite ALU block runs its
+    :class:`~neural_vm.unified_compiler.ir.CompositeFFNFragment`. So there are
+    NO opaque-skipped FFN blocks. Returns a dict with:
+
+      * ``n_blocks`` — total physical blocks
+      * ``n_ir_executable`` — blocks whose FFN the interpreter runs from IR
+        (== ``n_blocks`` now)
+      * ``n_composite`` — composite ALU blocks (executed via the IR fragment)
+      * ``composite_blocks`` — their indices
+      * ``opaque_skipped`` — block indices with NO IR execution path (empty)
+    """
+    n_blocks = len(model.blocks)
+    composite_blocks: List[int] = []
+    opaque: List[int] = []
+    for bi, block in enumerate(model.blocks):
+        name = type(block.ffn).__name__
+        if name in COMPOSITE_ALU_FFN:
+            composite_blocks.append(bi)  # IR-executable via CompositeFFNFragment
+        elif hasattr(block.ffn, "W_up"):
+            pass  # PureFFN — IR-executable via faithful SwiGLU
+        else:
+            opaque.append(bi)  # unknown FFN block type with no IR path
+    return {
+        "n_blocks": n_blocks,
+        "n_ir_executable": n_blocks - len(opaque),
+        "n_composite": len(composite_blocks),
+        "composite_blocks": composite_blocks,
+        "opaque_skipped": opaque,
+    }
+
+
 def _recover_attn_head_specs(attn, d_model: int) -> list:
     """Read a baked ``AutoregressiveAttention``'s W_q/W_k/W_v/W_o into a list
     of declarative head specs (the inverse of ``lower_attention``).
@@ -1129,6 +1164,7 @@ __all__ = [
     "IRBlockForward",
     "COMPOSITE_ALU_FFN",
     "composite_ffn_ir",
+    "block_ffn_coverage",
     "step_token_positions",
     "STEP_TOKENS",
 ]
