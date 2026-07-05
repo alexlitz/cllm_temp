@@ -229,7 +229,8 @@ building blocks — conservative hold).
 | `C4_TAIL_LEA_E8_ARITH_GUARD_SHARP` | forced→True | campaign | **KEEP (A/B knob on live corrector)** — shapes the default-ON golden `C4_TAIL_LEA_E8_ARITH_GUARD`. |
 | `C4_LEA_E0D8_FETCH_DOMINATE` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — falls through to `_lea_byte0_memsp_relay_enabled()`. |
 | `C4_LEA_BYTE0_MEMSP_RELAY` | forced→live | campaign | **KEEP (A/B knob on live corrector)**. |
-| `C4_LEA_BYTE0_ALU_AMPLIFY` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — falls through to a `no_stack0_emit` default. |
+| `C4_LEA_BYTE0_ALU_AMPLIFY` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — the frame-depth LEA byte-0 ALU-amplifier kill-switch; overrides the `C4_OPCAM_FRAME` umbrella when set explicitly. |
+| `C4_OPCAM_FRAME` | `0` (off) | campaign | **KEEP** — operand-CAM frame-depth umbrella; `=1` turns on the L10 multi-param LEA byte-0 ALU-amplifier (survey R2: func_add/mul/max/min + absdiff 2nd-param `&b` 0xFFE8→0xFFE0). Default-OFF → flag-OFF byte-identical `91f55411`. `C4_LEA_BYTE0_ALU_AMPLIFY` overrides it. |
 | `C4_L15_SAVEDRA_HEAD` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — L15 head-15 saved-RA delivery. |
 | `C4_POST_ENT_SE_SUPPRESS` | `0` (off) | campaign | **DELETED** (commit `2043ff4d`) — dead-end framing building block. |
 | `C4_ENT_SP_BYTE1_ISMARK_BLOCKER` | `0` (off) | campaign | **DELETED** (commit `10d7b876`) — docstring records NEGATIVE RESULT (0 programs advance; "the real fix is the project-level multi-part build, not a solo corrector"). |
