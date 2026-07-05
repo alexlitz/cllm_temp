@@ -2377,6 +2377,23 @@ def compile_full_vm_dynamic(
                 and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
                 and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
             ),
+            # Operand-CAM frame-depth ALU-amplifier umbrella (campaign OFF by
+            # default, opt in =1, BAKE-affecting): ``C4_OPCAM_FRAME=1`` turns on
+            # the L10 multi-param LEA byte-0 ALU-AMPLIFIER (+4 L25-tail FFN
+            # rules), so the ON / OFF builds bake a different-width tail bank and
+            # must never share a memo entry. Mirrors the effective amplifier
+            # state ``l10_ops._lea_byte0_alu_amplify_enabled`` keys the tail-bank
+            # rule count on: the dedicated ``C4_LEA_BYTE0_ALU_AMPLIFY`` kill-
+            # switch (=0/=1) overrides the umbrella; both require the campaign
+            # STACK0-drop, so the non-campaign / golden build is byte-identical.
+            "C4_OPCAM_FRAME": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and (
+                    os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY") != "0"
+                    if os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY") is not None
+                    else os.environ.get("C4_OPCAM_FRAME", "0") != "0"
+                )
+            ),
             # func_add loaded-operand ADD ALU_HI cell-13 address-leak clear
             # (campaign-ON, opt out =0, BAKE-affecting): adds cell 13 to the
             # LoadedOperandAddHi15ClearFFN contaminant cell set, so the wrap
@@ -3234,6 +3251,22 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
             and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
+        ),
+        # Operand-CAM frame-depth ALU-amplifier umbrella (campaign OFF by
+        # default, opt in =1, BAKE-affecting): ``C4_OPCAM_FRAME=1`` turns on the
+        # L10 multi-param LEA byte-0 ALU-AMPLIFIER (+4 L25-tail FFN rules), so
+        # ON / OFF builds bake a different-width tail bank and must never share a
+        # serialised entry. Mirrors ``l10_ops._lea_byte0_alu_amplify_enabled``:
+        # the dedicated ``C4_LEA_BYTE0_ALU_AMPLIFY`` kill-switch (=0/=1)
+        # overrides the umbrella; both require the campaign STACK0-drop, so the
+        # non-campaign / golden build is byte-identical.
+        "C4_OPCAM_FRAME": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and (
+                os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY") != "0"
+                if os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY") is not None
+                else os.environ.get("C4_OPCAM_FRAME", "0") != "0"
+            )
         ),
         # func_add loaded-operand ADD ALU_HI cell-13 address-leak clear
         # (campaign-ON, opt out =0, BAKE-affecting): adds cell 13 to the
