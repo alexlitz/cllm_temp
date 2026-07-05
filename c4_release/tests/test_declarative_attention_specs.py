@@ -21,9 +21,11 @@ from neural_vm.unified_compiler.ops.l5_ops import (  # noqa: E402
     make_fetch_op,
 )
 from neural_vm.unified_compiler.ops.l6_ops import (  # noqa: E402
-    _bake_layer6_attn_spec,
-    _bake_layer6_relay_heads_spec,
     _layer6_bz_bnz_relay_head_spec,
+)
+from tests._l6_legacy_bake import (  # noqa: E402
+    bake_layer6_attn_spec as _bake_layer6_attn_spec,
+    bake_layer6_relay_heads_spec as _bake_layer6_relay_heads_spec,
 )
 from neural_vm.unified_compiler.ops.l8_ops import (  # noqa: E402
     _layer8_multibyte_fetch_head_spec,
@@ -46,8 +48,6 @@ from neural_vm.vm_step import (  # noqa: E402
     _set_stack0_carry_attn,
     _set_layer4_pc_relay,
     _set_layer5_fetch,
-    _set_layer6_attn,
-    _set_layer6_relay_heads,
     _set_layer7_memory_heads,
     _set_layer8_multibyte_fetch,
     _set_layer8_sp_gather,
@@ -341,13 +341,24 @@ def test_layer9_lev_bp_to_pc_relay_declarative_byte_identical_to_legacy_helper()
 
 
 def test_layer6_attn_spec_declarative_byte_identical_to_legacy_helper():
-    """The declarative L6 attention spec reproduces legacy matrix writes."""
+    """The imperative-signature L6 attn adapter reproduces the production spec.
+
+    The legacy vm_step writer ``_set_layer6_attn`` is a stale dead fixture: it
+    never wrote the head-5 OPCODE_BYTE_HI k=13/14/15 spillover cells (declared
+    on head 6 in ``_layer6_relay_head_specs``) that the production L6 attention
+    block emits, so it is no longer a valid byte-identity baseline. The
+    authoritative baseline is the declarative production spec
+    ``_layer6_attn_head_specs`` (gated by ``tools/_isa_golden_hash.py``); this
+    test asserts the imperative-signature ``bake_layer6_attn_spec`` adapter
+    reproduces it byte-for-byte (the head-5 K-scale 10x bump is folded into the
+    spec, so no post-multiply is applied to either side).
+    """
 
     d_model = 512
     num_heads = 8
     hd = d_model // num_heads
 
-    legacy = AutoregressiveAttention(
+    expected = AutoregressiveAttention(
         d_model, num_heads=num_heads, layer_idx=6, use_flash_attention=False
     )
     generated = AutoregressiveAttention(
@@ -355,14 +366,15 @@ def test_layer6_attn_spec_declarative_byte_identical_to_legacy_helper():
     )
 
     with torch.no_grad():
-        _set_layer6_attn(legacy, 100.0, _SetDim, hd)
-        legacy.W_k.data[5 * hd] *= 10.0
+        from neural_vm.unified_compiler.ops.l6_ops import _layer6_attn_head_specs
 
+        Primitives.generate_attention_heads(
+            expected, _layer6_attn_head_specs(_SetDim), hd
+        )
         _bake_layer6_attn_spec(generated, _SetDim, hd)
-        generated.W_k.data[5 * hd] *= 10.0
 
     for name in ("W_q", "W_k", "W_v", "W_o"):
-        assert torch.equal(getattr(legacy, name), getattr(generated, name)), name
+        assert torch.equal(getattr(expected, name), getattr(generated, name)), name
 
 
 def test_layer6_first_step_fetch_relay_blocks_ax_byte_rows():
@@ -399,13 +411,23 @@ def test_layer6_first_step_fetch_relay_blocks_ax_byte_rows():
 
 
 def test_layer6_relay_heads_spec_declarative_byte_identical_to_legacy_helper():
-    """The declarative L6 relay-head spec reproduces legacy matrix writes."""
+    """The imperative-signature L6 relay adapter reproduces the production spec.
+
+    The legacy vm_step writer ``_set_layer6_relay_heads`` is a stale dead
+    fixture: it only programs the bare AX_CARRY_LO/HI -> ALU relay on heads 6/7
+    and never wrote the opcode-flag broadcast or the post-LEV AX_CARRY refresh
+    sub-pattern that the production L6 relay heads emit, so it is no longer a
+    valid byte-identity baseline. The authoritative baseline is the declarative
+    production spec ``_layer6_relay_head_specs`` (gated by
+    ``tools/_isa_golden_hash.py``); this test asserts the imperative-signature
+    ``bake_layer6_relay_heads_spec`` adapter reproduces it byte-for-byte.
+    """
 
     d_model = 512
     num_heads = 8
     hd = d_model // num_heads
 
-    legacy = AutoregressiveAttention(
+    expected = AutoregressiveAttention(
         d_model, num_heads=num_heads, layer_idx=6, use_flash_attention=False
     )
     generated = AutoregressiveAttention(
@@ -413,11 +435,15 @@ def test_layer6_relay_heads_spec_declarative_byte_identical_to_legacy_helper():
     )
 
     with torch.no_grad():
-        _set_layer6_relay_heads(legacy, 100.0, _SetDim, hd)
+        from neural_vm.unified_compiler.ops.l6_ops import _layer6_relay_head_specs
+
+        Primitives.generate_attention_heads(
+            expected, _layer6_relay_head_specs(_SetDim), hd
+        )
         _bake_layer6_relay_heads_spec(generated, _SetDim, hd)
 
     for name in ("W_q", "W_k", "W_v", "W_o"):
-        assert torch.equal(getattr(legacy, name), getattr(generated, name)), name
+        assert torch.equal(getattr(expected, name), getattr(generated, name)), name
 
 
 def test_layer6_bz_bnz_relay_spec_declarative_byte_identical_to_legacy_helper():
