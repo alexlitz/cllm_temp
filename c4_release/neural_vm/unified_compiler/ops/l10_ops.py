@@ -10940,6 +10940,29 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 # amplifier can never lock in a wrong byte before rule (1) /
                 # the ALU_HI+15 magnitude path supplies the 0xE high nibble.
                 ("OUTPUT_HI_THIS_STEP+0", -1_000.0),
+                # SURGICAL over-fire FIX (task #421): the amplifier's target is
+                # the SECOND-local / RE-READ LEA (``&b`` BP-16 want 0xE0, and
+                # func's ``&x`` re-read), NOT the FIRST-LEA-after-ENT (``&a`` /
+                # ``&x`` / ``&n`` BP-8 want 0xE8). Teacher-forced diagnostic
+                # (tools/_diag_opcam_overfire.py, campaign config, BUILT dims)
+                # confirmed the OUTPUT_HI+0 block is INSUFFICIENT: on the
+                # first-LEA-after-an-inner-ENT the ALU already carries a COMPLETE
+                # 0xFE- address (OUTPUT_HI nib 14, OUTPUT_LO nib 0 == 0xE0), so
+                # the h=14/k=0 variant FIRES and slams 0xE0 over the genuine 0xE8
+                # on nested_sumsq step13, rec_factorial step6, rec_fib step6,
+                # func_square step6 (all measured tail=0xE8 but amp=0xE0). Those
+                # rows carry the FIRST-LEA-after-ENT residue OP_ENT ~+1.19; the
+                # genuine re-read targets carry OP_ENT ~+0.01 (decayed one VM step
+                # later). Same clean split the keystone e8 first-ent gate uses
+                # (``_lea_e8_first_ent_gate``, but INVERTED here). A -100 * ENT
+                # NOT-block vetoes the first-LEA (~-119, decisively below the
+                # threshold-20 firing margin) while barely touching the re-read
+                # (~-1.0) — the amplifier stays load-bearing on func/absdiff ``&b``
+                # (keystones e0_fetch/e8 are both dark there) and goes DARK on the
+                # first-LEA-after-ENT rows the keystone e8 correctly owns. The
+                # threshold is UNCHANGED (unlike the e8 gate) because the veto is
+                # one-sided: on the low-ENT re-read the term is negligible.
+                ("OP_ENT", -100.0),
                 ("OP_IMM", -1_000_000.0),
                 # #325: SHARP per-step ADD/SUB NOT-blockers (OPCODE_BYTE_LO+9/+10)
                 # replace the leaky cross-step OP_ADD/OP_SUB broadcast so a re-read
