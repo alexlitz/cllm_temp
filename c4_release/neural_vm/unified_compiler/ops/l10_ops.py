@@ -2061,8 +2061,8 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     from .shared import cmp_combine_margin_enabled
     if cmp_combine_margin_enabled():
         for _op in ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"):
-            _writes = [("OUTPUT_HI_THIS_STEP+0", 6.0 / S)]
-            _writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -8.0 / S)
+            _writes = [("OUTPUT_HI_THIS_STEP+0", 60.0 / S)]
+            _writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -60.0 / S)
                         for h in range(1, 16)]
             rules.append(multi_way_and_rule(
                 conditions=(
@@ -2354,8 +2354,11 @@ def _layer10_alu_cmp_hi_clamp_rules(S: float) -> tuple[FFNRule, ...]:
         return ()
 
     def _clamp(op_name: str) -> FFNRule:
-        writes = [("OUTPUT_HI_THIS_STEP+0", 6.0 / S)]
-        writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -8.0 / S) for h in range(1, 16)]
+        # Strong amplitudes (a comparison result HIGH nibble is invariantly 0,
+        # so OUTPUT_HI+0 can be driven decisively) so the clamp out-votes even
+        # a large leaked operand ``(hi<<4)`` (~13+ observed) at the decode row.
+        writes = [("OUTPUT_HI_THIS_STEP+0", 60.0 / S)]
+        writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -60.0 / S) for h in range(1, 16)]
         return multi_way_and_rule(
             name=f"l10_cmp_{op_name.lower()}_hi_clamp_step_end",
             conditions=(
