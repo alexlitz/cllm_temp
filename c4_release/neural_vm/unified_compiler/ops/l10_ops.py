@@ -742,6 +742,49 @@ def _stack0_store_top_e0_computed_enabled() -> bool:
     return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
 
 
+def _wide_mul_byte1_computed_enabled() -> bool:
+    """Flag for the ``wide_mul_byte1_preserve`` ENUMERATED->COMPUTED collapse.
+
+    Sibling of the M8 pilot (``_stack0_store_loaded_computed_enabled``) on the
+    ``wide_mul_byte1_preserve_rules`` bank inside
+    :func:`_tail_bit32_result_correction_rules`.  That bank is a full 16x16
+    nibble loop of 256 per-value AND rules (``tail_wide_mul_byte1_preserve_*``,
+    NO ``0x00`` skip) that, under the OP_MUL AX byte-0 evidence gate, matches a
+    byte value ``v = lo|(hi<<4)`` on its ``OUTPUT_LO+lo`` (weight 2.0) +
+    ``OUTPUT_HI_THIS_STEP+hi`` (weight 2.0) one-hots and re-asserts that same
+    byte on OUTPUT at strength ``10_000_000``.  Because the READ lane
+    (``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP``) == the WRITE lane (``OUTPUT_HI``
+    aliases ``OUTPUT_HI_THIS_STEP`` at the same residual dim), the whole bank is
+    a same-lane IDENTITY copy of the staged MUL byte-1 gated by structural
+    evidence -- the exact class the M8 route collapses.
+
+    The COMPUTED replacement collapses those 256 per-value AND units into 32
+    per-nibble ROUTE units (16 for ``OUTPUT_LO`` + 16 for
+    ``OUTPUT_HI_THIS_STEP``) via :func:`_computed_byte_writeback_route_rules`
+    (``match_weight=2.0``, ``threshold=220.0``, ``strength=10_000_000``, same
+    OP_MUL gate + ``bounded_ax_byte0`` / non-MUL blocker ``base_conditions``).
+    Each route unit fires on ITS channel's one-hot (plus the summed OTHER
+    band's one-hot -- one-hot in production, so ``2.0 * sum_j other[j]`` reduces
+    to the enumerated single ``2.0 * other[observed]``) so the firing decision
+    keeps the same 2-channel evidence magnitude / threshold=220 as the
+    enumerated bank, and writes ``nibble_value_writes`` for that channel.  When
+    the LO and HI route units both fire they reconstruct the same OUTPUT byte
+    the single enumerated unit wrote -- a COMPUTED copy, not a 256-way lookup.
+    Numeric proof (``tools/_probe_wide_mul_computed_writeback.py``): identical
+    firing region + 0 argmax mismatch across ALL 256 bytes (value 0x00
+    included; the enum enumerates it, and the route's LO+0/HI+0 units reproduce
+    it).  BYTE-IDENTITY-BREAKING -> verdict-validated.
+
+    DEFAULT **OFF** -> the full 256-rule bank is built -> byte-identical to the
+    golden default build ``91f55411``.  Opt-in via
+    ``C4_WIDE_MUL_BYTE1_COMPUTED=1`` (drops the L10-tail FFN hidden_dim by 224
+    units: 256 -> 32).  The ON / OFF builds have different state_dicts and MUST
+    NEVER share a memo / disk entry (registered in BOTH cache-key snapshots in
+    ``full_vm_compiler_dynamic.py``).
+    """
+    return os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
+
+
 def _lea_byte0_alu_amplify_enabled() -> bool:
     """Flag for the PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER
     (ROOT 1 sibling — the func_square / func_max / func_min re-read LEAs).
@@ -1530,6 +1573,28 @@ def _l10_carry_propagation_rules(
     collide, both writes when they don't). The CARRY+3 high-overflow
     write only fires at ``(15,15)`` for ADD and ``(0,0)`` for SUB,
     and only when ``byte_idx < 2``.
+
+    Bank-derivation status (M8 l10 survey, 2026-07): this bank is ALREADY a
+    fully COMPUTED generator (``add_rule_for`` / ``sub_rule_for`` evaluate
+    ``(lo + hi*16) +/- 1`` at build time over the 16x16 nibble cross-product)
+    authored through the canonical ``multi_way_and_rule`` DSL — it is NOT a
+    hand-written literal rule list. It does NOT route through
+    ``wide_alu_dsl.nibble_alu_lane_rules`` (the L8/L9 lane generator) because
+    it is a materially RICHER shape: (1) it is a whole-BYTE increment/decrement
+    (both output nibbles + the ``CARRY+3`` inter-byte overflow), not a single
+    ``f(a,b,cin) % 16`` result nibble; (2) the +1/-1 couples the two nibbles
+    (a low-nibble carry crosses into the high nibble, e.g. ``0x0F+1=0x10``), so
+    it does NOT factorise into the per-nibble route the M8 byte-writeback
+    collapse uses; (3) it carries the SUB-minuend-relay source swap
+    (``STACK0_BYTE_VAL_{k+1}`` for multi-byte) and the campaign-conditional
+    ``TEMP+9`` byte-1 hand-off gate. Re-expressing it via ``nibble_alu_lane_
+    rules`` would require extending that generator with byte-level (not
+    nibble-level) semantics + a second output nibble + the CARRY+3 write +
+    the minuend-source swap, risking the L8/L9 callers' byte-identity and
+    ADDING complexity, not removing it. It is width-locked to
+    ``_L10_CARRY_HIDDEN_DIM = 512`` (the ``PureFFN`` hidden_dim, hard-asserted
+    in ``_build_l10_carry_post_op``); a count-reducing collapse would break
+    that. Kept as the already-derived 2D nibble ALU cascade it is.
     """
 
     if byte_idx not in (0, 1, 2):
@@ -2038,6 +2103,14 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # unchanged. See ``_stack0_store_top_e0_computed_enabled``.
     if _stack0_store_top_e0_computed_enabled():
         extra -= 222
+    # wide_mul_byte1_preserve byte-writeback enumerated->COMPUTED collapse: with
+    # the flag ON the ``wide_mul_byte1_preserve_rules`` family drops from 256
+    # (full 16x16 per-value AND, NO lo==hi==0 skip) to 32 (16 LO + 16 HI
+    # per-nibble route), so the single-tenant tail range SHRINKS by 224.
+    # Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit unchanged.
+    # See ``_wide_mul_byte1_computed_enabled``.
+    if _wide_mul_byte1_computed_enabled():
+        extra -= 224
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -2445,6 +2518,23 @@ def _layer10_alu_mul_lo_rules(S: float) -> tuple[FFNRule, ...]:
     ``OUTPUT_LO``. Weights and threshold reuse the (40, 30, 30) / 80
     balanced 3-way AND from the bitwise sub-stages above so a single
     spurious one-hot in either operand band cannot fire the unit.
+
+    Bank-derivation status (M8 l10 survey, 2026-07): this is a genuine
+    2-OPERAND multiplication lookup table (``result`` depends non-linearly
+    on BOTH operand nibbles ``a`` and ``b``), NOT a 1-operand identity /
+    increment / cross-lane copy — so the per-nibble byte-writeback ROUTE
+    collapse (``_computed_byte_writeback_route_rules`` / the M8
+    ``C4_STACK0_*_COMPUTED`` family) does NOT apply (that route factorises a
+    same-value nibble copy into two independent per-nibble channels; a 16x16
+    product table has no such factorisation). It is also NOT covered by
+    ``C4_MUL_MULTIPASS`` (which replaces the L11 mul-partial / L12
+    mul-combine LOOKUP at a DIFFERENT layer — see ``shared.mul_multipass_
+    enabled`` — leaving this L10 mul-lo nibble table untouched). It is
+    already authored through the canonical ``multi_way_and_rule`` DSL (not a
+    hand-written literal rule list) and is width-locked into
+    ``_L10_FFN_UNIT_LAYOUT_MAIN_TOTAL`` (the byte-identical 1846-unit main
+    L10 ALU FFN). No count-preserving further collapse exists; kept as the
+    2-operand ``lookup_table_rules``-class product table it already is.
     """
 
     # Phase 8.D: OP_MUL gate -> (opcode_flag, MUL).
@@ -8070,6 +8160,54 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_ADJ", -1000.0),
             ("OP_ENT", -1000.0),
         )
+        # Shared per-family evidence gate (everything EXCEPT the two per-value
+        # OUTPUT nibble match terms). Emitted verbatim ahead of the per-value
+        # match in the enumerated bank; the computed route re-uses it as its
+        # ``base_conditions`` and appends the per-channel one-hot + summed-other
+        # match instead.
+        mul_byte1_base = bounded_ax_byte0 + (
+            ("HAS_SE", 20.0),
+            ("TEMP+10", 30.0),
+            ("OP_MUL", 80.0),
+            ("OP_EQ", -1000.0),
+            ("OP_NE", -1000.0),
+            ("OP_LT", -1000.0),
+            ("OP_GT", -1000.0),
+            ("OP_LE", -1000.0),
+            ("OP_GE", -1000.0),
+            ("OP_JSR", -1000.0),
+            ("OP_LEV", -1000.0),
+            ("TEMP+4", -1000.0),
+            ("TEMP+5", -1000.0),
+            ("TEMP+6", -1000.0),
+            ("TEMP+8", -1000.0),
+            ("TEMP+9", -1000.0),
+        ) + non_mul_blockers
+        # ENUMERATED->COMPUTED collapse (C4_WIDE_MUL_BYTE1_COMPUTED,
+        # DEFAULT-OFF): replace the 256-rule per-value lookup with a 32-rule
+        # per-nibble route.  Same READ==WRITE lane (OUTPUT); the route
+        # reproduces the winning byte (argmax) + firing region byte-for-byte at
+        # match_weight=2.0 / threshold=220 (proof:
+        # tools/_probe_wide_mul_computed_writeback.py).  BYTE-IDENTITY-BREAKING
+        # -> verdict-validated.  See _wide_mul_byte1_computed_enabled.
+        if _wide_mul_byte1_computed_enabled():
+            return _computed_byte_writeback_route_rules(
+                name_for=lambda band, k: (
+                    f"tail_wide_mul_byte1_preserve_route_{band}_{k}"
+                ),
+                base_conditions=mul_byte1_base,
+                threshold=220.0,
+                strength=10_000_000.0,
+                match_weight=2.0,
+                lo_base="OUTPUT_LO",
+                hi_base="OUTPUT_HI_THIS_STEP",
+                gate=dim_ref("opcode_flag", "MUL"),
+                scope="mark == AX AND opcode_at_AX == MUL",
+                dominates_at={
+                    "OUTPUT_LO": "is_byte",
+                    "OUTPUT_HI_THIS_STEP": "is_byte",
+                },
+            )
         rules = []
         for high_nibble in range(16):
             for low_nibble in range(16):

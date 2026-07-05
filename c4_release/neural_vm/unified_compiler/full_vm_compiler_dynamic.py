@@ -2530,6 +2530,15 @@ def compile_full_vm_dynamic(
             "C4_STACK0_STORE_TOP_E0_COMPUTED": (
                 os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
             ),
+            # wide_mul_byte1_preserve byte-writeback ENUMERATED (256 per-value
+            # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-OFF, opt
+            # in =1). Changes the L10-tail FFN hidden_dim (256 -> 32) AND the
+            # emitted OUTPUT delta magnitude, so the ON / OFF builds have
+            # different state_dicts and MUST NEVER share a memo / disk entry.
+            # See l10_ops._wide_mul_byte1_computed_enabled.
+            "C4_WIDE_MUL_BYTE1_COMPUTED": (
+                os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
+            ),
             # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11
             # mul-partial / L12 mul-combine lookup (DEFAULT-OFF, opt in =1).
             # Adds the MUL_MULTIPASS_WS 240-dim workspace band (changes
@@ -3360,6 +3369,15 @@ def _bake_from_scheduled_ops(
         # l10_ops._stack0_store_top_e0_computed_enabled.
         "C4_STACK0_STORE_TOP_E0_COMPUTED": (
             os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
+        ),
+        # wide_mul_byte1_preserve byte-writeback ENUMERATED (256 per-value AND)
+        # -> COMPUTED (32 per-nibble route) collapse (DEFAULT-OFF, opt in =1).
+        # Changes the L10-tail FFN hidden_dim (256 -> 32) AND the emitted OUTPUT
+        # delta, so the ON / OFF builds have different state_dicts and MUST
+        # NEVER share a serialised entry. See
+        # l10_ops._wide_mul_byte1_computed_enabled.
+        "C4_WIDE_MUL_BYTE1_COMPUTED": (
+            os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
         ),
         # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11 mul-partial
         # / L12 mul-combine lookup (DEFAULT-OFF, opt in =1). Adds the
