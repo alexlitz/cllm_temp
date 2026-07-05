@@ -1260,12 +1260,16 @@ def make_no_stack0_pc_highbyte_clear_op() -> Operation:
 # tail block (the LAST OUTPUT writer before the LM head, same slot as the two
 # existing correctors it subsumes).
 #
-# Gating: DEFAULT OFF (``C4_CLEAN_EMITTER`` unset). Increment 0 lands the op
-# flag-OFF -> ``tools/_isa_golden_hash.py`` (bare env) is byte-identical to the
-# golden ``91f55411``. When ON it additionally requires ``_no_stack0_emit()``
-# (the 30-token frame; the 35-token golden has STACK0-block decode slack that
-# absorbs a +1 drift). Follow-up increments A/B it ON vs the point-fixes via
-# ``cpu_full_trace`` + ``flag_regression_gate``, then collapse the point-fixes.
+# Gating: DEFAULT ON (``C4_CLEAN_EMITTER`` unset -> ON; opt out with =0). It
+# additionally requires ``_no_stack0_emit()`` (the 30-token frame, DEFAULT-ON;
+# the 35-token OFF build has STACK0-block decode slack that absorbs a +1 drift).
+# PROVEN net-positive on the full 1096 (516 -> 525, +9, full_trace spec_k=0
+# cap-600), so it is now the production default and SUBSUMES + REPLACES the two
+# point-fixes (``no_stack0_se_output_clear`` + ``no_stack0_mem_marker_output_clear``),
+# which are deleted (this op's 6-way NEXT_* sink is a strict superset). Because
+# ``C4_NO_STACK0_EMIT`` also defaults ON, ``tools/_isa_golden_hash.py`` (bare env)
+# now bakes this op -> the golden hash CHANGED from ``91f55411`` (intended
+# verdict-change). ``C4_CLEAN_EMITTER=0`` opts out.
 _CLEAN_EMITTER_HIDDEN_DIM = 32  # OUTPUT_LO[0..15] + OUTPUT_HI[0..15]
 # Same magnitude as the two point-fixes' ``-1e20``: it must dominate the
 # L20/L25 ALU/frame spray (~+8e14..+3e20 measured) so every byte logit at a
@@ -1281,17 +1285,19 @@ _CLEAN_EMITTER_NEXT_FLAGS = (
 def _clean_emitter_enabled() -> bool:
     """Kill-switch for the CLEAN_EMITTER generic marker-row OUTPUT sink.
 
-    DEFAULT OFF: ON iff ``C4_CLEAN_EMITTER`` is explicitly set AND the 30-token
-    frame is active (``_no_stack0_emit()``). Because the golden byte-identity
-    gate (``tools/_isa_golden_hash.py``) runs in a BARE env where
-    ``C4_CLEAN_EMITTER`` is unset, this op bakes NO units on the golden path ->
-    byte-identical to ``91f55411``. The explicit switch lets
-    ``tools/flag_regression_gate.py --flag C4_CLEAN_EMITTER`` A/B the op ON/OFF
-    inside the campaign config.
+    DEFAULT ON: ON iff ``C4_CLEAN_EMITTER`` is not explicitly disabled AND the
+    30-token frame is active (``_no_stack0_emit()``, itself DEFAULT-ON). PROVEN
+    net-positive on the full 1096 (516 -> 525, +9), so it is the production
+    default and replaces the two deleted point-fixes. Because both this flag and
+    ``C4_NO_STACK0_EMIT`` default ON, the golden byte-identity gate
+    (``tools/_isa_golden_hash.py``, bare env) now BAKES this op -> the golden
+    hash intentionally CHANGED from ``91f55411``. Opt out with
+    ``C4_CLEAN_EMITTER=0``; ``tools/flag_regression_gate.py --flag
+    C4_CLEAN_EMITTER`` A/Bs the op ON/OFF.
     """
     if not _no_stack0_emit():
         return False
-    return _os_l0.environ.get("C4_CLEAN_EMITTER", "0") != "0"
+    return _os_l0.environ.get("C4_CLEAN_EMITTER", "1") != "0"
 
 
 def _clean_emitter_rules() -> tuple[FFNRule, ...]:
