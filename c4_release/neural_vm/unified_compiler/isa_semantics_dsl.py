@@ -2047,6 +2047,16 @@ class CamValueBand:
 # "deliver the byte-row selector the collapsed frame dropped" datum. These are
 # declared as DATA (:class:`CamStoreRoute` / :class:`CamStoreStamp`) so the whole
 # store head is derivable with no hand-authored per-cell Q/K/V/O writes.
+#
+# DEDUP (2026-07-04): the store direction is NOT a second lowering. The fire
+# gate + per-byte routes + stamp are a structured FRONT-END over the SAME
+# emit-direction CAM the L14 mem-generation store heads use: a
+# :class:`CamBinaryAddressMatch` with an EMPTY address block (row select lives
+# in the discriminators, not a per-bit comparator). :func:`_store_spec_to_binary_cam`
+# translates the store fields into :class:`CamDiscriminatorSlot` rows +
+# :class:`CamValueBand` relays; BOTH store call sites (L13 heads 4/5 here, L14
+# mem-generation) lower through :func:`cam_binary_address_match` — ONE store
+# primitive.
 # ---------------------------------------------------------------------------
 
 
@@ -2883,8 +2893,12 @@ def frame_relay(spec: FrameRelaySpec) -> FrameRelayBundle:
 # :class:`CamValueBand` value relays. Its builder merges every write into
 # per-``(slot, dim)`` maps (last-write-wins, exactly the lowerer's indexed
 # assignment) so the produced head is byte-identical to the hand-authored L15
-# LI/LC head. It is GENERAL: the SAME shape addresses the L14 mem-generation
-# STORE (``direction="store"``) — a binary-addressed CAM in the emit direction.
+# LI/LC head. It is GENERAL: the SAME shape addresses EVERY store head via
+# ``direction="store"`` — the L14 mem-generation STORE (a binary-addressed CAM
+# with a per-bit comparator) AND the L13 SUB minuend / ADD addend relays (an
+# EMPTY address block; row select lives in the discriminators). It is the SINGLE
+# store lowering: :func:`_store_spec_to_binary_cam` translates the ``cam_lookup``
+# store fields into the same discriminator + value-band DATA.
 #
 # Like :func:`cam_lookup` the generator returns a pure builder bundle
 # (``head_spec_builder(dim_positions, head_idx)``); no compiler change, it lowers
