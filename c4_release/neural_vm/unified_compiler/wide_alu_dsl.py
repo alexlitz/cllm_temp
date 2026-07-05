@@ -768,8 +768,237 @@ def nibble_compare_lane_rules(
 
 
 # ---------------------------------------------------------------------------
-# Wave W3: Wide ADD/SUB — stubs.
+# Wave W3: Wide ADD/SUB — single op-parameterized core + thin wrappers.
 # ---------------------------------------------------------------------------
+#
+# ``wide_add_rules`` and ``wide_sub_rules`` are the SAME per-byte nibble-lookup
+# cascade — identical condition assembly, carry cascade math, index-0 blocker
+# band, thresholds, and carry-detect relay — differing ONLY in the per-nibble
+# arithmetic (``(a+b+cin)%16`` / overflow ``>=16`` vs ``(a-b-bin)&0xF`` / borrow
+# ``<0``) and the rule-name tag. ``wide_addsub_rules(op=...)`` is that single
+# generator (mirroring how :func:`nibble_alu_lane_rules` already parameterizes
+# add/sub); the two public names are thin wrappers preserving the caller-facing
+# ``carry_base``/``final_carry_dim`` (ADD) and ``borrow_base``/``final_borrow_dim``
+# (SUB) argument spellings. Byte-identity proven by the whole-model golden hash
+# and ``tests/test_wide_alu_dsl.py``.
+
+
+def wide_addsub_rules(
+    *,
+    op: Literal["add", "sub"],
+    operand_a_base: str,
+    operand_b_base: str,
+    result_base: str,
+    carry_base: str,
+    width_bytes: int,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    operand_a_cond_weight: float = 30.0,
+    operand_b_cond_weight: float = 30.0,
+    marker_cond_weight: float = 40.0,
+    threshold: float = 80.0,
+    final_carry_dim: str | None = None,
+    operand_a_artifact_blocker_weight: float = 0.0,
+    result_write_amplitude: float | None = None,
+    carry_signal_weight: float | None = None,
+) -> Tuple[FFNRule, ...]:
+    """Per-byte nibble ADD/SUB lookup with inter-byte carry/borrow propagation.
+
+    The shared core behind :func:`wide_add_rules` (``op="add"``) and
+    :func:`wide_sub_rules` (``op="sub"``). Each "byte" in this DSL slice is a
+    single 4-bit nibble: ``operand_a_base+(b*16+k)`` is the one-hot at nibble
+    ``k`` for byte ``b`` (wider operands stack bytes contiguously). For each
+    byte ``b`` and nibble pair ``(a_nib, b_nib)``:
+
+      * ADD: ``res = (a+b+carry_in) % 16``; carry_out when ``a+b+carry_in >= 16``.
+      * SUB: ``res = (a-b-carry_in) & 0xF``; borrow_out when ``a-b-carry_in < 0``.
+
+    Byte 0 has no carry-in (256 rules). Byte ``b > 0`` emits 512 rules (a
+    carry_in=0 set suppressed by a negative weight on ``carry_base+(b-1)`` and a
+    carry_in=1 set positively conditioned on it) plus one carry/borrow-in relay
+    rule. See the two wrappers' docstrings for the full rule mechanics; the only
+    ``op``-dependent differences are the per-nibble arithmetic above and the
+    rule-name tag (``wide_add_b{b}_cin{...}`` / ``wide_sub_b{b}_bin{...}``,
+    ``carry_in_detect`` / ``borrow_in_detect``).
+
+    Args:
+        op: ``"add"`` or ``"sub"``.
+        carry_base: the inter-byte carry (ADD) / borrow (SUB) cascade dim base;
+            a byte's overflow lands on ``carry_base+b`` and byte ``b`` reads
+            ``carry_base+(b-1)`` for carry/borrow-in.
+        final_carry_dim: optional redirect for the LAST byte's carry/borrow-out
+            (e.g. SUB byte-0 borrow -> ``CARRY+2``).
+        (all other args mirror :func:`wide_add_rules`.)
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * (512 + 1)``.
+    """
+    if op not in ("add", "sub"):
+        raise ValueError(
+            f"wide_addsub_rules: op must be 'add'/'sub'; got {op!r}"
+        )
+    if width_bytes < 1:
+        raise ValueError(
+            f"wide_addsub_rules: width_bytes must be >= 1; got {width_bytes!r}"
+        )
+
+    is_add = op == "add"
+    cin_tag = "cin" if is_add else "bin"
+    detect_tag = "carry" if is_add else "borrow"
+
+    rules: list[FFNRule] = []
+    write_amplitude = (
+        2.0 / S if result_write_amplitude is None
+        else result_write_amplitude / S
+    )
+    # The inter-byte carry/borrow cascade dim is written at a CONTROLLED
+    # residual amplitude (~2.0) regardless of the dominant result amplitude, so
+    # the next byte's carry/borrow-read math sees a known signal. (Writing it at
+    # the dominant result amplitude would make the carry-read term swamp the
+    # operand discrimination.)
+    carry_write_amplitude = 2.0 / S
+    if carry_signal_weight is None:
+        # Legacy operand-relative carry/borrow discrimination. With defaults
+        # (a=b=30, marker=40, thr=80) this reproduces the historical
+        # -50 / +30 / thr 120 cascade exactly. Written at the result amplitude
+        # (back-compat: the historical single-amplitude behavior).
+        carry_write_amplitude = write_amplitude
+        carry_suppress_w = -(marker_cond_weight + operand_a_cond_weight
+                             + operand_b_cond_weight - threshold + 30.0)
+        carry_require_w = operand_a_cond_weight
+        carry_threshold = threshold + carry_require_w + 10.0
+    else:
+        # Absolute discrimination decoupled from operand weights. The cascade
+        # dim is written by the prior byte at residual ~6.0 (the lowering's
+        # saturated output for a 2.0/S write_amplitude AND rule -- measured,
+        # lowering-stable). Choose ``carry_signal_weight`` so ``csw * 6.0``
+        # equals roughly ONE operand discriminator's worth, so a present
+        # carry/borrow acts like an extra required operand:
+        #   cin=0 fires iff carry absent: M > T (C=0); M - csw*6 < T (C=6).
+        #   cin=1 fires iff carry present AND operands match:
+        #     C=0 -> M < T+csw*6 (dies); C=6, no-b -> M+csw*6 < T+csw*6
+        #     (dies); C=6, full -> M+csw*6 > T+csw*6 (fires).
+        csw = carry_signal_weight
+        carry_residual = 6.0
+        carry_suppress_w = -csw
+        carry_require_w = csw
+        carry_threshold = threshold + csw * carry_residual
+    blk = operand_a_artifact_blocker_weight
+
+    for b in range(width_bytes):
+        a_band = operand_a_base
+        b_band = operand_b_base
+        is_last = (b == width_bytes - 1)
+        # Where this byte's carry/borrow-out lands. The final byte can be
+        # redirected (e.g. SUB byte-0 borrow -> CARRY+2) via ``final_carry_dim``.
+        if is_last and final_carry_dim is not None:
+            carry_out_dim = final_carry_dim
+        else:
+            carry_out_dim = f"{carry_base}+{b}"
+        # carry_in possibilities for this byte
+        if b == 0:
+            carry_in_cases = (0,)
+        else:
+            carry_in_cases = (0, 1)
+
+        for carry_in in carry_in_cases:
+            for a_nib in range(16):
+                # Index-0 artifact blocker: negative weight on every OTHER
+                # non-zero operand-A nibble cell in this lane. When A's true
+                # nibble is non-zero its strong one-hot trips these, suppressing
+                # the spurious a_nib=0 rule the gather's value-proportional
+                # index-0 artifact would otherwise fire.
+                blocker_terms = ()
+                if blk > 0.0:
+                    blocker_terms = tuple(
+                        (f"{a_band}+{b * 16 + j}", -blk)
+                        for j in range(1, 16)
+                        if j != a_nib
+                    )
+                for b_nib in range(16):
+                    if is_add:
+                        total = a_nib + b_nib + carry_in
+                        res_nib = total % 16
+                        carry_out = total >= 16
+                    else:
+                        raw = a_nib - b_nib - carry_in
+                        res_nib = raw & 0xF
+                        carry_out = raw < 0
+
+                    writes: list[Tuple[str, float]] = [
+                        (
+                            f"{result_base}+{b * 16 + res_nib}",
+                            write_amplitude,
+                        ),
+                    ]
+                    if carry_out:
+                        # Carry/borrow dims (the inter-byte cascade and the
+                        # final overflow consumed downstream) use the controlled
+                        # amplitude, not the dominant result amplitude.
+                        writes.append((carry_out_dim, carry_write_amplitude))
+
+                    if b == 0:
+                        # No carry-in dim. Standard 3-way AND.
+                        conditions = (
+                            (marker_gate, marker_cond_weight),
+                            (f"{a_band}+{b * 16 + a_nib}",
+                             operand_a_cond_weight),
+                            (f"{b_band}+{b * 16 + b_nib}",
+                             operand_b_cond_weight),
+                        ) + blocker_terms
+                        rule_threshold = threshold
+                    elif carry_in == 0:
+                        # Suppress when carry-in dim is active.
+                        conditions = (
+                            (marker_gate, marker_cond_weight),
+                            (f"{a_band}+{b * 16 + a_nib}",
+                             operand_a_cond_weight),
+                            (f"{b_band}+{b * 16 + b_nib}",
+                             operand_b_cond_weight),
+                            (f"{carry_base}+{b - 1}", carry_suppress_w),
+                        ) + blocker_terms
+                        rule_threshold = threshold
+                    else:
+                        # carry_in == 1: require carry dim positively.
+                        conditions = (
+                            (marker_gate, marker_cond_weight),
+                            (f"{a_band}+{b * 16 + a_nib}",
+                             operand_a_cond_weight),
+                            (f"{b_band}+{b * 16 + b_nib}",
+                             operand_b_cond_weight),
+                            (f"{carry_base}+{b - 1}", carry_require_w),
+                        ) + blocker_terms
+                        rule_threshold = carry_threshold
+
+                    rules.append(multi_way_and_rule(
+                        name=(
+                            f"wide_{op}_b{b}_{cin_tag}{carry_in}_"
+                            f"a{a_nib:x}_b{b_nib:x}"
+                        ),
+                        conditions=conditions,
+                        threshold=rule_threshold,
+                        gate=opcode_gate,
+                        writes=tuple(writes),
+                    ))
+
+        # Single carry/borrow-in detection / relay rule for byte > 0 (no-op
+        # observable; self-relay keeps the cascade bit-stable).
+        if b > 0:
+            rules.append(multi_way_and_rule(
+                name=f"wide_{op}_b{b}_{detect_tag}_in_detect",
+                conditions=(
+                    (marker_gate, marker_cond_weight),
+                    (f"{carry_base}+{b - 1}", 60.0),
+                ),
+                threshold=80.0,
+                gate=opcode_gate,
+                writes=(
+                    (f"{carry_base}+{b - 1}", 0.0),
+                ),
+            ))
+
+    return tuple(rules)
 
 
 def wide_add_rules(
@@ -851,159 +1080,27 @@ def wide_add_rules(
         ``256 + (width_bytes - 1) * (512 + 1)`` — 256 sum rules for byte
         0 plus 512 sum rules and 1 carry-relay rule per subsequent byte.
     """
-    if width_bytes < 1:
-        raise ValueError(
-            f"wide_add_rules: width_bytes must be >= 1; got {width_bytes!r}"
-        )
-
-    rules: list[FFNRule] = []
-    write_amplitude = (
-        2.0 / S if result_write_amplitude is None
-        else result_write_amplitude / S
+    # Thin wrapper: ADD is the ``op="add"`` instance of the shared
+    # :func:`wide_addsub_rules` core. Byte-identical.
+    return wide_addsub_rules(
+        op="add",
+        operand_a_base=operand_a_base,
+        operand_b_base=operand_b_base,
+        result_base=result_base,
+        carry_base=carry_base,
+        width_bytes=width_bytes,
+        opcode_gate=opcode_gate,
+        marker_gate=marker_gate,
+        S=S,
+        operand_a_cond_weight=operand_a_cond_weight,
+        operand_b_cond_weight=operand_b_cond_weight,
+        marker_cond_weight=marker_cond_weight,
+        threshold=threshold,
+        final_carry_dim=final_carry_dim,
+        operand_a_artifact_blocker_weight=operand_a_artifact_blocker_weight,
+        result_write_amplitude=result_write_amplitude,
+        carry_signal_weight=carry_signal_weight,
     )
-    # The inter-byte carry cascade dim is written at a CONTROLLED residual
-    # amplitude (~2.0) regardless of the dominant result amplitude, so the
-    # next byte's carry-read math sees a known carry signal. (Writing the
-    # carry at the dominant result amplitude would make the carry-read term
-    # swamp the operand discrimination.)
-    carry_write_amplitude = 2.0 / S
-    if carry_signal_weight is None:
-        # Legacy operand-relative carry discrimination. With defaults
-        # (a=b=30, marker=40, thr=80) this reproduces the historical
-        # -50 / +30 / thr 120 cascade exactly. Carry written at the result
-        # amplitude (back-compat: the historical single-amplitude behavior).
-        carry_write_amplitude = write_amplitude
-        carry_suppress_w = -(marker_cond_weight + operand_a_cond_weight
-                             + operand_b_cond_weight - threshold + 30.0)
-        carry_require_w = operand_a_cond_weight
-        carry_threshold = threshold + carry_require_w + 10.0
-    else:
-        # Absolute carry discrimination decoupled from operand weights. The
-        # carry cascade dim is written by the prior byte at residual ~6.0
-        # (the lowering's saturated output for a 2.0/S write_amplitude AND
-        # rule -- measured, lowering-stable). Choose ``carry_signal_weight``
-        # so ``csw * 6.0`` equals roughly ONE operand discriminator's worth,
-        # so a present carry acts like an extra required operand:
-        #   cin=0 fires iff carry absent: M > T (C=0); M - csw*6 < T (C=6).
-        #   cin=1 fires iff carry present AND operands match:
-        #     C=0 -> M < T+csw*6 (dies); C=6, no-b -> M+csw*6 < T+csw*6
-        #     (dies); C=6, full -> M+csw*6 > T+csw*6 (fires).
-        csw = carry_signal_weight
-        carry_residual = 6.0
-        carry_suppress_w = -csw
-        carry_require_w = csw
-        carry_threshold = threshold + csw * carry_residual
-    blk = operand_a_artifact_blocker_weight
-
-    for b in range(width_bytes):
-        a_band = operand_a_base
-        b_band = operand_b_base
-        is_last = (b == width_bytes - 1)
-        # Where this byte's carry-out lands. The final byte can be
-        # redirected (e.g. SUB borrow -> CARRY+2) via ``final_carry_dim``.
-        if is_last and final_carry_dim is not None:
-            carry_out_dim = final_carry_dim
-        else:
-            carry_out_dim = f"{carry_base}+{b}"
-        # carry_in possibilities for this byte
-        if b == 0:
-            carry_in_cases = (0,)
-        else:
-            carry_in_cases = (0, 1)
-
-        for carry_in in carry_in_cases:
-            for a_nib in range(16):
-                # Index-0 artifact blocker: negative weight on every OTHER
-                # non-zero operand-A nibble cell in this lane. When A's
-                # true nibble is non-zero its strong one-hot trips these,
-                # suppressing the spurious a_nib=0 rule that the gather's
-                # value-proportional index-0 artifact would otherwise fire.
-                blocker_terms = ()
-                if blk > 0.0:
-                    blocker_terms = tuple(
-                        (f"{a_band}+{b * 16 + j}", -blk)
-                        for j in range(1, 16)
-                        if j != a_nib
-                    )
-                for b_nib in range(16):
-                    total = a_nib + b_nib + carry_in
-                    sum_nib = total % 16
-                    carry_out = total >= 16
-
-                    writes: list[Tuple[str, float]] = [
-                        (
-                            f"{result_base}+{b * 16 + sum_nib}",
-                            write_amplitude,
-                        ),
-                    ]
-                    if carry_out:
-                        # Carry dims (both the inter-byte cascade and the
-                        # final overflow consumed downstream) use the
-                        # controlled carry amplitude, not the dominant result
-                        # amplitude.
-                        writes.append((carry_out_dim, carry_write_amplitude))
-
-                    if b == 0:
-                        # No carry-in dim. Standard 3-way AND.
-                        conditions = (
-                            (marker_gate, marker_cond_weight),
-                            (f"{a_band}+{b * 16 + a_nib}",
-                             operand_a_cond_weight),
-                            (f"{b_band}+{b * 16 + b_nib}",
-                             operand_b_cond_weight),
-                        ) + blocker_terms
-                        rule_threshold = threshold
-                    elif carry_in == 0:
-                        # Suppress when carry-in dim is active.
-                        conditions = (
-                            (marker_gate, marker_cond_weight),
-                            (f"{a_band}+{b * 16 + a_nib}",
-                             operand_a_cond_weight),
-                            (f"{b_band}+{b * 16 + b_nib}",
-                             operand_b_cond_weight),
-                            (f"{carry_base}+{b - 1}", carry_suppress_w),
-                        ) + blocker_terms
-                        rule_threshold = threshold
-                    else:
-                        # carry_in == 1: require carry dim positively.
-                        conditions = (
-                            (marker_gate, marker_cond_weight),
-                            (f"{a_band}+{b * 16 + a_nib}",
-                             operand_a_cond_weight),
-                            (f"{b_band}+{b * 16 + b_nib}",
-                             operand_b_cond_weight),
-                            (f"{carry_base}+{b - 1}", carry_require_w),
-                        ) + blocker_terms
-                        rule_threshold = carry_threshold
-
-                    rules.append(multi_way_and_rule(
-                        name=(
-                            f"wide_add_b{b}_cin{carry_in}_"
-                            f"a{a_nib:x}_b{b_nib:x}"
-                        ),
-                        conditions=conditions,
-                        threshold=rule_threshold,
-                        gate=opcode_gate,
-                        writes=tuple(writes),
-                    ))
-
-        # Single carry-in detection / relay rule for byte > 0 (no-op
-        # observable; self-relay keeps the cascade bit-stable).
-        if b > 0:
-            rules.append(multi_way_and_rule(
-                name=f"wide_add_b{b}_carry_in_detect",
-                conditions=(
-                    (marker_gate, marker_cond_weight),
-                    (f"{carry_base}+{b - 1}", 60.0),
-                ),
-                threshold=80.0,
-                gate=opcode_gate,
-                writes=(
-                    (f"{carry_base}+{b - 1}", 0.0),
-                ),
-            ))
-
-    return tuple(rules)
 
 
 def wide_sub_rules(
@@ -1087,142 +1184,28 @@ def wide_sub_rules(
         ``256 + (width_bytes - 1) * (512 + 1)`` — 256 diff rules for byte
         0 plus 512 diff rules and 1 borrow-relay rule per subsequent byte.
     """
-    if width_bytes < 1:
-        raise ValueError(
-            f"wide_sub_rules: width_bytes must be >= 1; got {width_bytes!r}"
-        )
-
-    rules: list[FFNRule] = []
-    write_amplitude = (
-        2.0 / S if result_write_amplitude is None
-        else result_write_amplitude / S
+    # Thin wrapper: SUB is the ``op="sub"`` instance of the shared
+    # :func:`wide_addsub_rules` core (``borrow_base`` -> ``carry_base``,
+    # ``final_borrow_dim`` -> ``final_carry_dim``). Byte-identical.
+    return wide_addsub_rules(
+        op="sub",
+        operand_a_base=operand_a_base,
+        operand_b_base=operand_b_base,
+        result_base=result_base,
+        carry_base=borrow_base,
+        width_bytes=width_bytes,
+        opcode_gate=opcode_gate,
+        marker_gate=marker_gate,
+        S=S,
+        operand_a_cond_weight=operand_a_cond_weight,
+        operand_b_cond_weight=operand_b_cond_weight,
+        marker_cond_weight=marker_cond_weight,
+        threshold=threshold,
+        final_carry_dim=final_borrow_dim,
+        operand_a_artifact_blocker_weight=operand_a_artifact_blocker_weight,
+        result_write_amplitude=result_write_amplitude,
+        carry_signal_weight=carry_signal_weight,
     )
-    # See wide_add_rules: carry/borrow cascade dims use a controlled
-    # amplitude so the next byte's borrow-read math sees a known signal.
-    borrow_write_amplitude = 2.0 / S
-    if carry_signal_weight is None:
-        # Legacy operand-relative discrimination (reproduces -50/+30/thr120).
-        borrow_write_amplitude = write_amplitude
-        borrow_suppress_w = -(marker_cond_weight + operand_a_cond_weight
-                              + operand_b_cond_weight - threshold + 30.0)
-        borrow_require_w = operand_a_cond_weight
-        borrow_threshold = threshold + borrow_require_w + 10.0
-    else:
-        # Absolute discrimination decoupled from operand weights (see
-        # wide_add_rules: carry cascade residual ~6.0, the lowering-stable
-        # saturated AND output for a 2.0/S write).
-        csw = carry_signal_weight
-        borrow_residual = 6.0
-        borrow_suppress_w = -csw
-        borrow_require_w = csw
-        borrow_threshold = threshold + csw * borrow_residual
-    blk = operand_a_artifact_blocker_weight
-
-    for b in range(width_bytes):
-        a_band = operand_a_base
-        b_band = operand_b_base
-        is_last = (b == width_bytes - 1)
-        # Where this byte's borrow-out lands. The final byte can be
-        # redirected (e.g. byte-0 SUB borrow -> CARRY+2) via
-        # ``final_borrow_dim``.
-        if is_last and final_borrow_dim is not None:
-            borrow_out_dim = final_borrow_dim
-        else:
-            borrow_out_dim = f"{borrow_base}+{b}"
-        # borrow_in possibilities for this byte
-        if b == 0:
-            borrow_in_cases = (0,)
-        else:
-            borrow_in_cases = (0, 1)
-
-        for borrow_in in borrow_in_cases:
-            for a_nib in range(16):
-                # Index-0 artifact blocker (see wide_add_rules): negative
-                # weight on every OTHER non-zero operand-A cell in this lane.
-                blocker_terms = ()
-                if blk > 0.0:
-                    blocker_terms = tuple(
-                        (f"{a_band}+{b * 16 + j}", -blk)
-                        for j in range(1, 16)
-                        if j != a_nib
-                    )
-                for b_nib in range(16):
-                    raw = a_nib - b_nib - borrow_in
-                    diff_nib = raw & 0xF
-                    borrow_out = raw < 0
-
-                    writes: list[Tuple[str, float]] = [
-                        (
-                            f"{result_base}+{b * 16 + diff_nib}",
-                            write_amplitude,
-                        ),
-                    ]
-                    if borrow_out:
-                        writes.append(
-                            (borrow_out_dim, borrow_write_amplitude)
-                        )
-
-                    if b == 0:
-                        # No borrow-in dim. Standard 3-way AND.
-                        conditions = (
-                            (marker_gate, marker_cond_weight),
-                            (f"{a_band}+{b * 16 + a_nib}",
-                             operand_a_cond_weight),
-                            (f"{b_band}+{b * 16 + b_nib}",
-                             operand_b_cond_weight),
-                        ) + blocker_terms
-                        rule_threshold = threshold
-                    elif borrow_in == 0:
-                        # Suppress when borrow-in dim is active.
-                        conditions = (
-                            (marker_gate, marker_cond_weight),
-                            (f"{a_band}+{b * 16 + a_nib}",
-                             operand_a_cond_weight),
-                            (f"{b_band}+{b * 16 + b_nib}",
-                             operand_b_cond_weight),
-                            (f"{borrow_base}+{b - 1}", borrow_suppress_w),
-                        ) + blocker_terms
-                        rule_threshold = threshold
-                    else:
-                        # borrow_in == 1: require borrow dim positively.
-                        conditions = (
-                            (marker_gate, marker_cond_weight),
-                            (f"{a_band}+{b * 16 + a_nib}",
-                             operand_a_cond_weight),
-                            (f"{b_band}+{b * 16 + b_nib}",
-                             operand_b_cond_weight),
-                            (f"{borrow_base}+{b - 1}", borrow_require_w),
-                        ) + blocker_terms
-                        rule_threshold = borrow_threshold
-
-                    rules.append(multi_way_and_rule(
-                        name=(
-                            f"wide_sub_b{b}_bin{borrow_in}_"
-                            f"a{a_nib:x}_b{b_nib:x}"
-                        ),
-                        conditions=conditions,
-                        threshold=rule_threshold,
-                        gate=opcode_gate,
-                        writes=tuple(writes),
-                    ))
-
-        # Single borrow-in detection / relay rule for byte > 0 (no-op
-        # observable; self-relay keeps the cascade bit-stable).
-        if b > 0:
-            rules.append(multi_way_and_rule(
-                name=f"wide_sub_b{b}_borrow_in_detect",
-                conditions=(
-                    (marker_gate, marker_cond_weight),
-                    (f"{borrow_base}+{b - 1}", 60.0),
-                ),
-                threshold=80.0,
-                gate=opcode_gate,
-                writes=(
-                    (f"{borrow_base}+{b - 1}", 0.0),
-                ),
-            ))
-
-    return tuple(rules)
 
 
 # ---------------------------------------------------------------------------
@@ -2096,7 +2079,7 @@ def wide_div_rules_ge_format(
 
 
 # ---------------------------------------------------------------------------
-# Wave W3 (retry): GE-format wide ADD/SUB helpers.
+# Wave W3 (retry): GE-format wide ADD/SUB helpers — op-parameterized core.
 # ---------------------------------------------------------------------------
 #
 # These mirror ``wide_add_rules`` / ``wide_sub_rules`` semantically but
@@ -2126,10 +2109,16 @@ def wide_div_rules_ge_format(
 # (``marker_gate``, ``opcode_gate``). Callers supply a ``dim_positions``
 # map that resolves ``p{b}_NIB_A`` → ``b * POS_STRIDE + nib_a_offset``
 # for the flattened ``[seq, 8 * POS_STRIDE]`` workspace.
+#
+# As with the BD ``wide_add_rules`` / ``wide_sub_rules`` pair, ADD and SUB
+# are the SAME per-position cascade differing only in the per-nibble
+# arithmetic and rule-name tag; ``wide_ge_addsub_rules(op=...)`` is that
+# single core and the two public names are thin wrappers.
 
 
-def wide_ge_add_rules(
+def wide_ge_addsub_rules(
     *,
+    op: Literal["add", "sub"],
     width_bytes: int,
     opcode_gate: str,
     marker_gate: str,
@@ -2140,57 +2129,46 @@ def wide_ge_add_rules(
     carry_out_name: str = "CARRY_OUT",
     position_prefix: str = "p",
 ) -> Tuple[FFNRule, ...]:
-    """Emit FFN rules for wide multi-byte ADD on the GE workspace.
+    """Per-position GE-workspace nibble ADD/SUB cascade (shared core).
 
-    Mirrors :func:`wide_add_rules` semantically but routes each byte
-    row through a distinct GE-format position rather than offsetting
-    into a single 16-dim band. Each byte position ``b`` in
-    ``0..width_bytes-1`` references its own per-nibble one-hot bands
-    ``p{b}_NIB_A+{nib}`` (operand A), ``p{b}_NIB_B+{nib}`` (operand B),
-    ``p{b}_RESULT+{nib}`` (sum nibble), and a single per-position
-    carry-out flag ``p{b}_CARRY_OUT``. The inter-byte carry cascade
-    reads ``p{b-1}_CARRY_OUT`` for byte ``b > 0``.
+    The shared core behind :func:`wide_ge_add_rules` (``op="add"``) and
+    :func:`wide_ge_sub_rules` (``op="sub"``). Routes each byte row through a
+    distinct GE-format position (``p{b}_NIB_A``/``NIB_B``/``RESULT`` and the
+    per-position carry/borrow flag ``p{b}_{carry_out_name}``) rather than
+    offsetting into a single 16-dim band. Per-byte semantics:
 
-    Per-byte rule semantics are identical to :func:`wide_add_rules`:
+      * ADD: ``res = (a+b+carry_in) % 16``; carry_out when ``a+b+carry_in >= 16``.
+      * SUB: ``res = (a-b-carry_in) & 0xF``; borrow_out when ``a-b-carry_in < 0``.
 
-      * sum_nib  = (a_nib + b_nib + carry_in) % 16
-      * carry_out = (a_nib + b_nib + carry_in) >= 16
-
-    Byte 0 emits 256 rules (no carry-in). Byte ``b > 0`` emits 256+256
-    rules (separately gated for ``carry_in=0`` via the ``-50`` borrow-
-    suppression weight and ``carry_in=1`` via the ``+30`` cumulative
-    threshold-120 cascade) plus one carry-relay rule. Total:
-    ``256 + (width_bytes - 1) * (512 + 1)``.
-
-    The function is GE-only: it does NOT touch BD bands. Callers
-    pair it with a BD→GE projection upstream (BDToGEConverter) and a
-    GE→BD writeback downstream (GEToBDConverter), the same way the
-    ``AddSub5StageBlock`` does.
+    Byte 0 emits 256 rules (no carry-in). Byte ``b > 0`` emits 256+256 rules
+    (carry_in=0 via the ``-50`` suppression weight; carry_in=1 via the ``+30``
+    cumulative threshold-120 cascade) plus one carry/borrow-relay rule. Total:
+    ``256 + (width_bytes - 1) * (512 + 1)``. The only ``op``-dependent
+    differences are the per-nibble arithmetic above and the rule-name tag
+    (``wide_ge_add_b{b}_cin{...}`` / ``wide_ge_sub_b{b}_bin{...}``).
 
     Args:
-        width_bytes: number of nibble-wide bytes in the wide ADD
-            (1 for 4-bit, 2 for 8-bit, 4 for 16-bit, 8 for 32-bit).
-        opcode_gate: dim ref for the ``ADD`` opcode gate.
-        marker_gate: dim ref for the AX-style marker gate.
-        S: SwiGLU scale.
-        operand_a_name: slot suffix for operand A's per-position nibble
-            band. Default ``"NIB_A"``. Combined with ``position_prefix``
-            yields ``"p{b}_NIB_A"``.
-        operand_b_name: slot suffix for operand B's per-position band.
-        result_name: slot suffix for the per-position result band.
-        carry_out_name: slot suffix for the per-position 1-bit carry
-            flag.
-        position_prefix: prefix for the per-position slot names.
+        op: ``"add"`` or ``"sub"``.
+        carry_out_name: per-position 1-bit carry (ADD) / borrow (SUB) flag
+            suffix. The wrappers pass ``"CARRY_OUT"`` / ``"BORROW_OUT"``.
+        (all other args mirror :func:`wide_ge_add_rules`.)
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length
-        ``256 + (width_bytes - 1) * 513``.
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * 513``.
     """
+    if op not in ("add", "sub"):
+        raise ValueError(
+            f"wide_ge_addsub_rules: op must be 'add'/'sub'; got {op!r}"
+        )
     if width_bytes < 1:
         raise ValueError(
-            f"wide_ge_add_rules: width_bytes must be >= 1; "
+            f"wide_ge_addsub_rules: width_bytes must be >= 1; "
             f"got {width_bytes!r}"
         )
+
+    is_add = op == "add"
+    cin_tag = "cin" if is_add else "bin"
+    detect_tag = "carry" if is_add else "borrow"
 
     rules: list[FFNRule] = []
     write_amplitude = 2.0 / S
@@ -2209,12 +2187,17 @@ def wide_ge_add_rules(
         for carry_in in carry_in_cases:
             for a_nib in range(16):
                 for b_nib in range(16):
-                    total = a_nib + b_nib + carry_in
-                    sum_nib = total % 16
-                    carry_out = total >= 16
+                    if is_add:
+                        total = a_nib + b_nib + carry_in
+                        res_nib = total % 16
+                        carry_out = total >= 16
+                    else:
+                        raw = a_nib - b_nib - carry_in
+                        res_nib = raw & 0xF
+                        carry_out = raw < 0
 
                     writes: list[Tuple[str, float]] = [
-                        (f"{out_band}+{sum_nib}", write_amplitude),
+                        (f"{out_band}+{res_nib}", write_amplitude),
                     ]
                     if carry_out:
                         writes.append(
@@ -2247,7 +2230,7 @@ def wide_ge_add_rules(
 
                     rules.append(multi_way_and_rule(
                         name=(
-                            f"wide_ge_add_b{b}_cin{carry_in}_"
+                            f"wide_ge_{op}_b{b}_{cin_tag}{carry_in}_"
                             f"a{a_nib:x}_b{b_nib:x}"
                         ),
                         conditions=conditions,
@@ -2256,13 +2239,13 @@ def wide_ge_add_rules(
                         writes=tuple(writes),
                     ))
 
-        # Single carry-in detection / relay rule for byte > 0. Probes
-        # the prior byte's carry-out as a verification observable. The
-        # write is a no-op self-relay (amplitude 0) so the cascade is
-        # bit-stable across repeated lowerings.
+        # Single carry/borrow-in detection / relay rule for byte > 0. Probes
+        # the prior byte's carry-out as a verification observable. The write is
+        # a no-op self-relay (amplitude 0) so the cascade is bit-stable across
+        # repeated lowerings.
         if b > 0:
             rules.append(multi_way_and_rule(
-                name=f"wide_ge_add_b{b}_carry_in_detect",
+                name=f"wide_ge_{op}_b{b}_{detect_tag}_in_detect",
                 conditions=(
                     (marker_gate, 40.0),
                     (carry_in_dim, 60.0),
@@ -2275,6 +2258,41 @@ def wide_ge_add_rules(
             ))
 
     return tuple(rules)
+
+
+def wide_ge_add_rules(
+    *,
+    width_bytes: int,
+    opcode_gate: str,
+    marker_gate: str,
+    S: float,
+    operand_a_name: str = "NIB_A",
+    operand_b_name: str = "NIB_B",
+    result_name: str = "RESULT",
+    carry_out_name: str = "CARRY_OUT",
+    position_prefix: str = "p",
+) -> Tuple[FFNRule, ...]:
+    """Emit FFN rules for wide multi-byte ADD on the GE workspace.
+
+    Thin wrapper: ADD is the ``op="add"`` instance of the shared
+    :func:`wide_ge_addsub_rules` core. Byte-identical. See the core docstring
+    for the per-position dim naming and cascade mechanics.
+
+    Returns:
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * 513``.
+    """
+    return wide_ge_addsub_rules(
+        op="add",
+        width_bytes=width_bytes,
+        opcode_gate=opcode_gate,
+        marker_gate=marker_gate,
+        S=S,
+        operand_a_name=operand_a_name,
+        operand_b_name=operand_b_name,
+        result_name=result_name,
+        carry_out_name=carry_out_name,
+        position_prefix=position_prefix,
+    )
 
 
 def wide_ge_sub_rules(
@@ -2291,118 +2309,26 @@ def wide_ge_sub_rules(
 ) -> Tuple[FFNRule, ...]:
     """Emit FFN rules for wide multi-byte SUB on the GE workspace.
 
-    Mirror of :func:`wide_ge_add_rules` for subtraction. Per-byte rule
-    semantics are identical to :func:`wide_sub_rules`:
-
-      * diff_nib   = (a_nib - b_nib - borrow_in) & 0xF
-      * borrow_out = (a_nib - b_nib - borrow_in) < 0
-
-    Per-position dim names ``p{b}_NIB_A``, ``p{b}_NIB_B``,
-    ``p{b}_RESULT``, ``p{b}_BORROW_OUT`` (the borrow flag is per
-    position; previous-byte borrow read via
-    ``p{b-1}_BORROW_OUT`` for ``b > 0``). Rule mechanics, condition
-    weights and thresholds match :func:`wide_ge_add_rules` modulo the
-    sub-specific arithmetic.
-
-    Args:
-        width_bytes: number of nibble-wide bytes in the wide SUB.
-        opcode_gate: dim ref for the ``SUB`` opcode gate.
-        marker_gate: dim ref for the AX-style marker gate.
-        S: SwiGLU scale.
-        operand_a_name, operand_b_name, result_name: per-position slot
-            suffixes (defaults match the ADD helper).
-        borrow_out_name: per-position 1-bit borrow flag suffix.
-        position_prefix: prefix for the per-position slot names.
+    Thin wrapper: SUB is the ``op="sub"`` instance of the shared
+    :func:`wide_ge_addsub_rules` core (``borrow_out_name`` -> the core's
+    ``carry_out_name``). Byte-identical. See the core docstring for the
+    per-position dim naming and cascade mechanics.
 
     Returns:
-        ``tuple[FFNRule, ...]`` of length
-        ``256 + (width_bytes - 1) * 513``.
+        ``tuple[FFNRule, ...]`` of length ``256 + (width_bytes - 1) * 513``.
     """
-    if width_bytes < 1:
-        raise ValueError(
-            f"wide_ge_sub_rules: width_bytes must be >= 1; "
-            f"got {width_bytes!r}"
-        )
-
-    rules: list[FFNRule] = []
-    write_amplitude = 2.0 / S
-
-    for b in range(width_bytes):
-        a_band = f"{position_prefix}{b}_{operand_a_name}"
-        b_band = f"{position_prefix}{b}_{operand_b_name}"
-        out_band = f"{position_prefix}{b}_{result_name}"
-        borrow_out_dim = f"{position_prefix}{b}_{borrow_out_name}"
-        borrow_in_dim = (
-            f"{position_prefix}{b - 1}_{borrow_out_name}" if b > 0 else None
-        )
-
-        borrow_in_cases = (0,) if b == 0 else (0, 1)
-
-        for borrow_in in borrow_in_cases:
-            for a_nib in range(16):
-                for b_nib in range(16):
-                    raw = a_nib - b_nib - borrow_in
-                    diff_nib = raw & 0xF
-                    borrow_out = raw < 0
-
-                    writes: list[Tuple[str, float]] = [
-                        (f"{out_band}+{diff_nib}", write_amplitude),
-                    ]
-                    if borrow_out:
-                        writes.append(
-                            (borrow_out_dim, write_amplitude)
-                        )
-
-                    if b == 0:
-                        conditions = (
-                            (marker_gate, 40.0),
-                            (f"{a_band}+{a_nib}", 30.0),
-                            (f"{b_band}+{b_nib}", 30.0),
-                        )
-                        threshold = 80.0
-                    elif borrow_in == 0:
-                        conditions = (
-                            (marker_gate, 40.0),
-                            (f"{a_band}+{a_nib}", 30.0),
-                            (f"{b_band}+{b_nib}", 30.0),
-                            (borrow_in_dim, -50.0),
-                        )
-                        threshold = 80.0
-                    else:
-                        conditions = (
-                            (marker_gate, 40.0),
-                            (f"{a_band}+{a_nib}", 30.0),
-                            (f"{b_band}+{b_nib}", 30.0),
-                            (borrow_in_dim, 30.0),
-                        )
-                        threshold = 120.0
-
-                    rules.append(multi_way_and_rule(
-                        name=(
-                            f"wide_ge_sub_b{b}_bin{borrow_in}_"
-                            f"a{a_nib:x}_b{b_nib:x}"
-                        ),
-                        conditions=conditions,
-                        threshold=threshold,
-                        gate=opcode_gate,
-                        writes=tuple(writes),
-                    ))
-
-        if b > 0:
-            rules.append(multi_way_and_rule(
-                name=f"wide_ge_sub_b{b}_borrow_in_detect",
-                conditions=(
-                    (marker_gate, 40.0),
-                    (borrow_in_dim, 60.0),
-                ),
-                threshold=80.0,
-                gate=opcode_gate,
-                writes=(
-                    (borrow_in_dim, 0.0),
-                ),
-            ))
-
-    return tuple(rules)
+    return wide_ge_addsub_rules(
+        op="sub",
+        width_bytes=width_bytes,
+        opcode_gate=opcode_gate,
+        marker_gate=marker_gate,
+        S=S,
+        operand_a_name=operand_a_name,
+        operand_b_name=operand_b_name,
+        result_name=result_name,
+        carry_out_name=borrow_out_name,
+        position_prefix=position_prefix,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3260,8 +3186,10 @@ __all__ = [
     "nibble_alu_lane_rules",
     "nibble_compare_lane_rules",
     "nibble_fused_madd_combine_rules",
+    "wide_addsub_rules",
     "wide_add_rules",
     "wide_sub_rules",
+    "wide_ge_addsub_rules",
     "wide_ge_add_rules",
     "wide_ge_sub_rules",
     "wide_shift_rules",
