@@ -759,6 +759,27 @@ class StructuralOp:
     alibi_pin_count:
         How many of the leading ALiBi slope slots receive
         :attr:`alibi_pin_value`. Defaults to 4 (the L15 load-head count).
+    alibi_slope_num_heads:
+        Head count used in the ``2 ** (-8/N * (i+1))`` ALiBi-slope
+        *formula* for the RESIZED heads, decoupled from the physical
+        :attr:`target_num_heads`. ``None`` (default) means "use
+        ``target_num_heads``" (the standard behaviour). Setting it to a
+        SMALLER value than ``target_num_heads`` keeps every head 0 ..
+        ``alibi_slope_num_heads-1``'s slope IDENTICAL to a build that
+        resized to exactly ``alibi_slope_num_heads`` heads, while still
+        physically allocating ``target_num_heads`` head slots. This is
+        the surgical knob for appending ONE extra head (e.g. the
+        ``C4_SI_STORE_ADDR`` L15 head 16) WITHOUT perturbing the ALiBi
+        recency geometry of the pre-existing heads: the slope formula
+        ``2 ** (-8/N * (i+1))`` reweights EVERY head when ``N`` changes,
+        so a 16->17 grow would silently shift the recency of the
+        load-bearing LEV frame-restore heads (4-11, 14) across every
+        func/rec/nested/loop program. The extra head's own slope is set
+        explicitly by its head spec (``generate_attention_head`` writes
+        ``alibi_slopes[head_idx]`` post-resize), so its formula slope
+        here is a don't-care. Slots beyond ``alibi_slope_num_heads`` use
+        the ``alibi_slope_num_heads`` term ``i+1`` continued (a small
+        tail value, overwritten by the head spec anyway).
     follow_up:
         Optional callable ``follow_up(block, dim_positions, S)`` run
         after the structural resize completes. Used by L15 to stash the
@@ -778,6 +799,7 @@ class StructuralOp:
     layers_threshold: Optional[int] = None
     alibi_pin_value: Optional[float] = None
     alibi_pin_count: int = 4
+    alibi_slope_num_heads: Optional[int] = None
     follow_up: Optional[Callable[..., None]] = None
     metadata: Mapping[str, object] = field(default_factory=dict)
 
@@ -1879,9 +1901,21 @@ class CompilerIR:
                 hasattr(attn, "alibi_slopes")
                 and attn.alibi_slopes is not None
             ):
+                # ``alibi_slope_num_heads`` decouples the slope FORMULA's ``N``
+                # from the physical head count so appending ONE extra head
+                # (e.g. the flag-gated SI-store CAM head 16) does not reweight
+                # the recency of the pre-existing load-bearing heads. When set
+                # to ``num_heads_new - 1`` every head 0..N-2 gets a slope
+                # identical to the un-appended build; the extra head's own slope
+                # is written by its head spec post-resize (a don't-care here).
+                _slope_n = (
+                    int(sop.alibi_slope_num_heads)
+                    if sop.alibi_slope_num_heads is not None
+                    else num_heads_new
+                )
                 new_slopes = torch.tensor(
                     [
-                        2.0 ** (-8.0 / num_heads_new * (i + 1))
+                        2.0 ** (-8.0 / _slope_n * (i + 1))
                         for i in range(num_heads_new)
                     ]
                 )
