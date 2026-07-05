@@ -453,19 +453,53 @@ def _bake_op_capture(op, dim_positions: Mapping[str, int],
     return block, counts
 
 
+def setdim_positions_with_bands(names: Sequence[str]) -> Dict[str, int]:
+    """Resolve ``names`` via ``_SetDim``, filling op-local band dims.
+
+    The static ``_SetDim`` proxy is a stable collision-free layout, but it
+    predates a handful of op-local residual bands (registered via
+    ``register_residual_band``, e.g. ``MEM_STORE_AT_VAL`` /
+    ``LI_ZEROADDR_COMMITTED``) that live only in the compiled layout. Rules that
+    gate on those bands make ``getattr(_SetDim, name)`` raise ``AttributeError``.
+    Assign each missing name a fresh non-colliding slot past the end of the
+    ``_SetDim`` block so symbolic-vs-lowered drift checks still see a distinct,
+    internally-consistent position for every referenced dim.
+    """
+    from neural_vm.vm_step import _SetDim
+
+    existing = {
+        name: int(getattr(_SetDim, name))
+        for name in names
+        if hasattr(_SetDim, name)
+    }
+    next_slot = (max(existing.values()) + 1) if existing else 0
+    positions: Dict[str, int] = {}
+    for name in names:
+        if name in existing:
+            positions[name] = existing[name]
+        else:
+            positions[name] = next_slot
+            next_slot += 1
+    return positions
+
+
 def _bake_ffn_rules_capture(rules: Sequence[Any],
                             *, hidden_dim: Optional[int] = None,
                             d_model: int = _DEFAULT_D_MODEL,
                             S: float = 1.0) -> StubFFN:
     """Lower a sequence of ``FFNRule`` objects into a fresh ``StubFFN``."""
     from neural_vm.unified_compiler.primitives import Primitives
-    from neural_vm.vm_step import _SetDim
 
     if hidden_dim is None:
         hidden_dim = max(len(rules), 16)
-    ffn = StubFFN(d_model=d_model, hidden_dim=hidden_dim)
     names = Primitives.ffn_rule_dim_names(rules)
-    dim_positions = Primitives.dim_positions_from_bd(_SetDim, names)
+    dim_positions = setdim_positions_with_bands(names)
+    # Widen the stub so every resolved dim position (including op-local band
+    # slots appended past the end of the _SetDim block, which reach ~930) is in
+    # bounds. A 16-wide nibble band writes NAME+15, so pad past the max.
+    max_pos = max(dim_positions.values(), default=0)
+    d_model = max(d_model, max_pos + 16)
+    ffn = StubFFN(d_model=d_model, hidden_dim=hidden_dim)
     Primitives.lower_ffn_rules(
         ffn, list(rules), dim_positions, start_unit=0, S=S,
     )

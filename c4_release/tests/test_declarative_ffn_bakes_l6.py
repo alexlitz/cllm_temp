@@ -75,8 +75,6 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     L6_TEMP_CLEANUP_START_UNIT,
     L6_TEMP_CLEANUP_RULE_START_UNIT,
     _bake_layer6_routing_ffn,
-    _bake_layer6_attn_spec,
-    _bake_layer6_relay_heads_spec,
     _layer6_adj_ax_route_rules,
     _layer6_adj_sp_writeback_rules,
     _layer6_bnz_ax_route_rules,
@@ -130,6 +128,10 @@ from neural_vm.unified_compiler.ops.l6_ops import (
     _lower_layer6_binary_pop_sp_increment_ir,
 )
 from neural_vm.unified_compiler.ops.model_ops import make_function_call_weights_op
+from tests._l6_legacy_bake import (
+    bake_layer6_attn_spec as _bake_layer6_attn_spec,
+    bake_layer6_relay_heads_spec as _bake_layer6_relay_heads_spec,
+)
 
 
 class _StubFFN:

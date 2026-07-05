@@ -56,11 +56,28 @@ def _assert_same_ffn_units(
 
 
 def test_layer1_ffn_declarative_matches_legacy_helper():
+    from c4_release.neural_vm.unified_compiler.positional_invariant import (
+        invariant_threshold,
+    )
+
+    S = 100.0
     actual = _StubFFN(hidden_dim=8)
     expected = _StubFFN(hidden_dim=8)
 
-    _bake_layer1_ffn(actual, 100.0, _SetDim)
-    _set_layer1_ffn(expected, 100.0, _SetDim)
+    _bake_layer1_ffn(actual, S, _SetDim)
+    _set_layer1_ffn(expected, S, _SetDim)
+
+    # The frozen legacy helper hardcodes the STACK0_BYTE0 flag's AND threshold at
+    # the 35-token golden value (1.5). The declarative bake resolves it through
+    # ``invariant_threshold`` (unit 0), which auto-raises the threshold to the
+    # make-unreachable suppress value in the 30-token campaign default (STACK0
+    # emission dropped => the byte-0 anchor row vanishes). Align the legacy
+    # expected side to the current STEP_TOKENS so this stays a byte-identity
+    # parity check in BOTH frame configs (a no-op at STEP_TOKENS=35).
+    stack0_byte0_threshold = invariant_threshold(
+        live=1.5, suppressed=1.0e9, marker="BP", k=6,
+    )
+    expected.b_up[0] = -S * stack0_byte0_threshold
 
     _assert_same_ffn(actual, expected)
 
@@ -236,7 +253,14 @@ def test_convo_io_opcode_decode_ir_passes_declaration_and_lowering_checks():
 
 
 def test_convo_io_opcode_decode_op_exposes_compiler_ir_only_when_enabled():
-    """``compiler_ir`` is attached only when ``enable_conversational_io=True``."""
+    """``compiler_ir`` carries FFN rules only when ``enable_conversational_io``.
+
+    Phase 11.A ("IR exposure") flipped the disabled contract from ``None`` to a
+    vacuous empty ``CompilerIR()`` (see ``make_convo_io_opcode_decode_op``), so
+    the op's declarations-only surface is uniform regardless of the flag. When
+    the flag is off the exposed IR must therefore be present but EMPTY (no FFN
+    rules); when on it carries the two L5 FFN units.
+    """
 
     from c4_release.neural_vm.unified_compiler.ops.flag_gated_ops import (
         make_convo_io_opcode_decode_op,
@@ -245,6 +269,10 @@ def test_convo_io_opcode_decode_op_exposes_compiler_ir_only_when_enabled():
     op_off = make_convo_io_opcode_decode_op(enable_conversational_io=False)
     op_on = make_convo_io_opcode_decode_op(enable_conversational_io=True)
 
-    assert op_off.compiler_ir is None
+    # Disabled: IR is either absent OR vacuous (no FFN rules on any layer).
+    if op_off.compiler_ir is not None:
+        assert all(
+            not layer.ffn.rules for layer in op_off.compiler_ir.layers
+        ), "disabled convo-io op must expose no FFN rules"
     assert op_on.compiler_ir is not None
     assert len(op_on.compiler_ir.layer(0).ffn.rules) == 2

@@ -1289,9 +1289,16 @@ def test_cam_lookup_reexpresses_l7_operand_gather_head0():
     head0_idx = l7_ops._L7_HEAD_LAYOUT_BY_NAME["layer7_operand_gather.head_0"]
     gen = bundle.head_spec_builder(dp, head0_idx)
     # Hand-reconstruct the legacy head 0 verbatim (the pre-migration source).
+    # The STACK0->ALU value relay (V/O bands) is gated on ``value_active``, which
+    # follows ``C4_OPERAND_FROM_MEMSP``: in the 30-token campaign-default config
+    # the operand read is re-routed to mem[SP] (L4 SP->ADDR_KEY + L8 mem-to-ALU
+    # CAM), so head 0 suppresses its V/O while keeping the Q/K gates. Mirror that
+    # in the legacy reconstruction so this stays a byte-identity proof in BOTH
+    # flag states.
     from c4_release.neural_vm.unified_compiler.primitives import (
         AO, AP, DeclarativeAttentionHeadSpec,
     )
+    value_active = not l7_ops.operand_from_memsp_enabled()
     L = 15.0
     legacy = DeclarativeAttentionHeadSpec(
         head_idx=head0_idx,
@@ -1303,10 +1310,14 @@ def test_cam_lookup_reexpresses_l7_operand_gather_head0():
             AP(33, dp["OP_ENT"], -L * 10),
         ),
         k=(AP(0, dp["STACK0_BYTE0"], L), AP(33, dp["CONST"], L)),
-        v=tuple(AP(1 + k, dp["CLEAN_EMBED_LO"] + k, 1.0) for k in range(16))
-        + tuple(AP(17 + k, dp["CLEAN_EMBED_HI"] + k, 1.0) for k in range(16)),
-        o=tuple(AO(dp["ALU_LO"] + k, 1 + k, 6.0) for k in range(16))
-        + tuple(AO(dp["ALU_HI"] + k, 17 + k, 6.0) for k in range(16)),
+        v=(
+            tuple(AP(1 + k, dp["CLEAN_EMBED_LO"] + k, 1.0) for k in range(16))
+            + tuple(AP(17 + k, dp["CLEAN_EMBED_HI"] + k, 1.0) for k in range(16))
+        ) if value_active else (),
+        o=(
+            tuple(AO(dp["ALU_LO"] + k, 1 + k, 6.0) for k in range(16))
+            + tuple(AO(dp["ALU_HI"] + k, 17 + k, 6.0) for k in range(16))
+        ) if value_active else (),
     )
     assert [(w.slot, w.dim, w.weight) for w in gen.q] == \
         [(w.slot, w.dim, w.weight) for w in legacy.q]
@@ -1797,9 +1808,6 @@ def test_l15_li_lc_load_derived_is_byte_identical_to_handbuilt():
     produced by ``cam_binary_address_match`` (the sole live path) match a fresh
     hand-reconstruction of the DELETED legacy Q/K/V/O writes, byte-for-byte.
     This is the byte-identity proof behind the golden-hash-neutral flip."""
-    from c4_release.neural_vm.dim_registry_dynamic import (
-        build_default_registry_dynamic,
-    )
     from c4_release.neural_vm.unified_compiler.ops.shared import (
         _as_setdim_proxy,
     )
@@ -1814,8 +1822,15 @@ def test_l15_li_lc_load_derived_is_byte_identical_to_handbuilt():
         AO, AP, DeclarativeAttentionHeadSpec,
     )
 
-    reg = build_default_registry_dynamic()
-    dp = {name: int(slot.start) for name, slot in reg.slots.items()}
+    # Resolve dims through the BUILT layout's ``dim_positions`` (production's own
+    # map), NOT ``build_default_registry_dynamic()``. The L15 LI/LC load dim map
+    # references op-local residual bands (``LI_ZEROADDR_COMMITTED``,
+    # ``MEM_STORE_AT_VAL``) that are registered via ``register_residual_band`` and
+    # therefore live in the compiled layout but NOT in the default registry (nor
+    # in the stale ``_SetDim`` fallback). Both the ``derived`` production spec and
+    # the ``legacy`` hand-reconstruction resolve through the same ``BD``, so the
+    # byte-identity comparison stays internally consistent.
+    dp = _built_dim_positions()
     BD = _as_setdim_proxy(dp)
     PC_I = marker_bank_index("PC")
     AX_I = marker_bank_index("AX")

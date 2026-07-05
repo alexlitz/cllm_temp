@@ -31,6 +31,7 @@ import pytest
 
 from neural_vm.unified_compiler.ir import CompilerIR
 from neural_vm.unified_compiler.ops.l16_ops import (
+    _allocate_layer16_units,
     _layer16_lev_routing_rules,
     lower_layer16_lev_routing_ir,
 )
@@ -41,7 +42,43 @@ from tests._per_op_audit import (
     StubFFN,
     assert_fires_during_bake,
     assert_no_drift,
+    setdim_positions_with_bands,
 )
+
+
+class _SetDimWithBands:
+    """``_SetDim`` attribute proxy that also resolves op-local band dims.
+
+    ``lower_layer16_lev_routing_ir`` resolves its dim names via
+    ``getattr(BD, name)``; a few L16 rules gate on op-local residual bands
+    (``MEM_STORE_AT_VAL``) that ``_SetDim`` predates, so the bare proxy raises
+    ``AttributeError``. This wrapper delegates to ``_SetDim`` and falls back to a
+    fresh non-colliding slot (matching ``setdim_positions_with_bands``) for any
+    missing name.
+    """
+
+    def __init__(self):
+        base = [
+            getattr(_SetDim, n)
+            for n in dir(_SetDim)
+            if not n.startswith("_") and isinstance(getattr(_SetDim, n), int)
+        ]
+        self._next_slot = (max(base) + 1) if base else 0
+        self._extra: dict[str, int] = {}
+
+    def __getattr__(self, name):
+        if name in ("_next_slot", "_extra"):
+            raise AttributeError(name)
+        try:
+            return getattr(_SetDim, name)
+        except AttributeError:
+            if name not in self._extra:
+                self._extra[name] = self._next_slot
+                self._next_slot += 1
+            return self._extra[name]
+
+
+_SETDIM_WITH_BANDS = _SetDimWithBands()
 
 
 # --------------------------------------------------------------------------- #
@@ -151,10 +188,15 @@ def l16_rules_by_name(l16_rules):
 
 @pytest.fixture(scope="module")
 def l16_dim_positions(l16_rules):
-    """Dim positions for every dim name referenced by any L16 rule."""
+    """Dim positions for every dim name referenced by any L16 rule.
+
+    Resolved via ``_SetDim`` with op-local residual bands (e.g.
+    ``MEM_STORE_AT_VAL``, which ``_SetDim`` predates) filled into fresh
+    non-colliding slots — see ``setdim_positions_with_bands``.
+    """
 
     names = Primitives.ffn_rule_dim_names(l16_rules)
-    return Primitives.dim_positions_from_bd(_SetDim, names)
+    return setdim_positions_with_bands(names)
 
 
 # --------------------------------------------------------------------------- #
@@ -208,16 +250,23 @@ def test_l16_full_layer_fires_during_bake(l16_rules):
 
     Catches silent regressions where a rule loses its W_up / W_down rows
     (a rule that bakes to all zeros is invisible to the lowered model).
-    Also pins the per-layer unit count at 728 — matches the
+    Also pins the per-layer unit count at the current production count
+    (the allocator's ``layer16_lev_routing`` range width) — matches the
     ``ffn_units_used`` annotation on ``make_layer16_lev_routing_op``.
     """
 
-    assert len(l16_rules) == 728
+    routing_range = next(
+        r for r in _allocate_layer16_units().ranges()
+        if r.op_name == "layer16_lev_routing"
+    )
+    expected_units = routing_range.end - routing_range.start
+    assert len(l16_rules) == expected_units
     stub = assert_fires_during_bake(l16_rules)
     # Sanity: total non-zero rows in W_up matches rule count.
     nonzero_units = (stub.W_up.abs().sum(dim=1) > 0).sum().item()
-    assert nonzero_units >= 728, (
-        f"some L16 units baked with empty W_up: only {nonzero_units} of 728"
+    assert nonzero_units >= expected_units, (
+        f"some L16 units baked with empty W_up: only {nonzero_units} "
+        f"of {expected_units}"
     )
 
 
@@ -238,16 +287,19 @@ def test_l16_family_fires_during_bake(family_id, prefix, expected_count, l16_rul
 
 
 def test_l16_bake_matches_legacy_unit_count():
-    """The full L16 bake must end at unit 728.
+    """The full L16 bake must end at the current production unit count.
 
     Mirrors ``test_layer16_lev_routing_ir_matches_legacy_helper`` but
     only the unit count — it's a quick sanity check usable independently
-    of the legacy ``_set_layer16_lev_routing`` helper.
+    of the legacy ``_set_layer16_lev_routing`` helper. The ``d_model`` must
+    cover every resolved dim position, including the op-local band slots
+    ``_SETDIM_WITH_BANDS`` appends past the end of the ``_SetDim`` block.
     """
 
-    stub = StubFFN(hidden_dim=1024)
-    end = lower_layer16_lev_routing_ir(stub, 100.0, _SetDim)
-    assert end == 728
+    expected_units = len(tuple(_layer16_lev_routing_rules(100.0)))
+    stub = StubFFN(d_model=2048, hidden_dim=max(expected_units + 16, 1024))
+    end = lower_layer16_lev_routing_ir(stub, 100.0, _SETDIM_WITH_BANDS)
+    assert end == expected_units
 
 
 # --------------------------------------------------------------------------- #
