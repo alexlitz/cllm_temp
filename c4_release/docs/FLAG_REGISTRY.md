@@ -105,6 +105,7 @@ model. Opt-out with `=0`.
 | `C4_L10_EXIT_AXCARRY` | `1` (`==`) | active | L10 EXIT AX-carry. |
 | `C4_L16_LEV_PC_TOP_OPCODE_GATE` | `1` (`==`) | active | L16 LEV PC-top opcode gate. |
 | `C4_MEM_MARKER_OUTPUT_CLEAR` | `1` | active | L0 MEM-marker OUTPUT clear. |
+| `C4_CLEAN_EMITTER` | `0` (off) | active | L0 generic all-marker-row OUTPUT sink (the ≠STEP_TOKENS framing megaroot fix, increment 0). Gated on the 6-way OR of `NEXT_PC/AX/SP/BP/MEM/SE` + `no_stack0_emit`; sinks OUTPUT at EVERY marker row so the marker wins by construction. DEFAULT OFF ⇒ golden `91f55411` byte-identical. Subsumes `no_stack0_se_output_clear` + `C4_MEM_MARKER_OUTPUT_CLEAR`. See `docs/CLEAN_EMITTER_SCOPE_2026_07_04.md`. |
 | `C4_TAIL_LEA_E8_ARITH_GUARD` | `1` | active | Tail LEA-E8 arith guard. |
 | `C4_TAIL_LEA_E8_DIVMOD_GUARD` | `1` | active | Tail LEA-E8 DIV/MOD guard. |
 | `C4_TAIL_LEA_E8_ENT_GUARD` | `1` | active | Tail LEA-E8 ENT guard (also requires `no_stack0_emit`). |

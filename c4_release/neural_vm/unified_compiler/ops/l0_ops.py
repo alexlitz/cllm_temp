@@ -1224,3 +1224,201 @@ def make_no_stack0_pc_highbyte_clear_op() -> Operation:
         smoke_tests={"all"},
         spec_section="STACK0_EMISSION_REMOVAL_CAMPAIGN_2026_06_17.md#inc0",
     )
+
+
+# ===========================================================================
+# CLEAN EMITTER (C4_CLEAN_EMITTER) -- the generic all-marker-row OUTPUT sink
+# ===========================================================================
+#
+# The R-FRAME marker-dominance invariant (docs/CLEAN_EMITTER_SCOPE_2026_07_04.md,
+# docs/semantic_spec_EMIT_FRAMING.md §2.b / §G5): on ANY row where a NEXT_<REG>
+# marker-schedule flag is lit, the LM head is DESIGNED to emit the register
+# MARKER (head[marker, NEXT_*]=+20) and never a byte (head[byte, NEXT_*]=-80).
+# That suppression is out-voted when the L20/L25 tail sprays OUTPUT_LO/HI up to
+# ~1e15 there (head[byte, OUTPUT_*+k]=+5 -> byte logit ~5e15 >> +20 marker), so a
+# STRAY value byte wins the marker row -> the step emits != STEP_TOKENS tokens ->
+# the fixed-stride decode desyncs. This is the =/=STEP_TOKENS framing MEGAROOT
+# (survey-R1 ~760 programs: var/expr/if/bool/nested/loops/func).
+#
+# The two landed point-fixes (``no_stack0_se_output_clear`` gated on
+# ``MARK_SE_ONLY`` = the STEP_END/PC row; ``no_stack0_mem_marker_output_clear``
+# gated on ``NEXT_MEM`` = the MEM row) sink OUTPUT at ONE marker row each -- only
+# 2 of the 6. The AX/SP/BP marker rows (``NEXT_AX``/``NEXT_SP``/``NEXT_BP``) have
+# NO corrector, so a spray landing there still drifts, and the natural next fix
+# is 3 MORE copies of the same 32-rule point-fix.
+#
+# THIS op is the CLEAN generic emitter: ONE op that sinks OUTPUT_LO/HI at EVERY
+# marker-predicting row, gated on the 6-way OR of the marker-schedule flags
+# ``(NEXT_PC | NEXT_AX | NEXT_SP | NEXT_BP | NEXT_MEM | NEXT_SE)``. Those flags
+# are MUTUALLY-EXCLUSIVE one-hots (exactly one lit per marker row, ~0 on every
+# value-byte row and on the teacher-forced MEM addr/val rows), so summing them
+# with an explicit ``threshold=0.5`` fires iff ANY one is ~1.0. On a fire the
+# balanced silu saturates and the sink drives every OUTPUT nibble far below the
+# marker baseline, so the marker wins its row -> the frame is exactly N tokens BY
+# CONSTRUCTION and the drift class cannot occur for ANY register. Standalone
+# ``PureFFN`` post_op appended AFTER ``tail_bit32_result_correction`` on the L25
+# tail block (the LAST OUTPUT writer before the LM head, same slot as the two
+# existing correctors it subsumes).
+#
+# Gating: DEFAULT OFF (``C4_CLEAN_EMITTER`` unset). Increment 0 lands the op
+# flag-OFF -> ``tools/_isa_golden_hash.py`` (bare env) is byte-identical to the
+# golden ``91f55411``. When ON it additionally requires ``_no_stack0_emit()``
+# (the 30-token frame; the 35-token golden has STACK0-block decode slack that
+# absorbs a +1 drift). Follow-up increments A/B it ON vs the point-fixes via
+# ``cpu_full_trace`` + ``flag_regression_gate``, then collapse the point-fixes.
+_CLEAN_EMITTER_HIDDEN_DIM = 32  # OUTPUT_LO[0..15] + OUTPUT_HI[0..15]
+# Same magnitude as the two point-fixes' ``-1e20``: it must dominate the
+# L20/L25 ALU/frame spray (~+8e14..+3e20 measured) so every byte logit at a
+# marker row goes hugely negative and the register MARKER wins the argmax.
+_CLEAN_EMITTER_WW = -1.0e20
+# The 6 marker-schedule flags (one lit per marker-predicting row). Mutually
+# exclusive one-hots, so their SUM is the 6-way OR gate.
+_CLEAN_EMITTER_NEXT_FLAGS = (
+    "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP", "NEXT_MEM", "NEXT_SE",
+)
+
+
+def _clean_emitter_enabled() -> bool:
+    """Kill-switch for the CLEAN_EMITTER generic marker-row OUTPUT sink.
+
+    DEFAULT OFF: ON iff ``C4_CLEAN_EMITTER`` is explicitly set AND the 30-token
+    frame is active (``_no_stack0_emit()``). Because the golden byte-identity
+    gate (``tools/_isa_golden_hash.py``) runs in a BARE env where
+    ``C4_CLEAN_EMITTER`` is unset, this op bakes NO units on the golden path ->
+    byte-identical to ``91f55411``. The explicit switch lets
+    ``tools/flag_regression_gate.py --flag C4_CLEAN_EMITTER`` A/B the op ON/OFF
+    inside the campaign config.
+    """
+    if not _no_stack0_emit():
+        return False
+    return _os_l0.environ.get("C4_CLEAN_EMITTER", "0") != "0"
+
+
+def _clean_emitter_rules() -> tuple[FFNRule, ...]:
+    """32 AND rules sinking OUTPUT_LO/HI hugely negative at EVERY marker row.
+
+    Each unit fires when the SUM of the 6 marker-schedule flags clears
+    ``threshold=0.5`` -- i.e. when ANY ``NEXT_*`` is lit (they are exclusive
+    one-hots, so the sum is ~1.0 at a marker row and ~0 elsewhere) -- and writes
+    a large-negative value into one OUTPUT nibble. Because value-byte rows and
+    the teacher-forced MEM addr/val rows carry NO ``NEXT_*`` flag, the sink
+    NEVER touches a real value byte; it only sinks the semantically-dead OUTPUT
+    at a marker-predicting row so the register MARKER wins there (the R-FRAME
+    marker-dominance invariant).
+    """
+    # 6-way OR gate: all flags at weight 1.0, threshold 0.5 -> fires iff the
+    # summed one-hots >= 0.5 (any single flag ~1.0). NEXT_* are slot-level
+    # singleton transition flags with no (category, role) binding, so they stay
+    # bare NAMEs; the OUTPUT ``+k`` write offset is the raw nibble value.
+    conditions = tuple((flag, 1.0) for flag in _CLEAN_EMITTER_NEXT_FLAGS)
+    WW = _CLEAN_EMITTER_WW
+    rules: list[FFNRule] = []
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"clean_emitter_marker_sink_lo_{k}",
+            conditions=conditions,
+            threshold=0.5,
+            writes=((dim_ref("output_lo", "nibble", k), WW),),
+        ))
+    for k in range(16):
+        rules.append(multi_way_and_rule(
+            name=f"clean_emitter_marker_sink_hi_{k}",
+            conditions=conditions,
+            threshold=0.5,
+            writes=((dim_ref("output_hi", "nibble", k), WW),),
+        ))
+    return tuple(rules)
+
+
+def make_clean_emitter_op() -> Operation:
+    """Append the CLEAN_EMITTER generic all-marker-row OUTPUT sink (increment 0).
+
+    Standalone ``PureFFN`` post_op on the L25 tail block (appended AFTER the two
+    existing point-fix correctors), so it is the LAST writer of OUTPUT on every
+    marker-predicting row before the LM head. Gated by ``C4_CLEAN_EMITTER``
+    (DEFAULT OFF) + ``_no_stack0_emit()``; OFF bakes NO units (byte-identical to
+    golden ``91f55411``). See the module-level block comment + the scope doc
+    ``docs/CLEAN_EMITTER_SCOPE_2026_07_04.md`` for the drift mechanism.
+    """
+    if not _clean_emitter_enabled():
+        # OFF: register a no-op so the dep graph / op list is stable but no
+        # weights change (byte-identical to the pre-flag build).
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="clean_emitter",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            requires={"after": "no_stack0_mem_marker_output_clear"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="CLEAN_EMITTER_SCOPE_2026_07_04.md#3",
+        )
+
+    rules = _clean_emitter_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _CLEAN_EMITTER_HIDDEN_DIM, (
+            f"clean_emitter rule-count drift: produced {len(rules)}, "
+            f"expected {_CLEAN_EMITTER_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="clean_emitter",
+        reads={
+            "NEXT_PC", "NEXT_AX", "NEXT_SP", "NEXT_BP", "NEXT_MEM", "NEXT_SE",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # Append AFTER the two point-fix correctors on the L25 tail block, so
+        # this op is the last writer of OUTPUT on every marker row before the
+        # LM head.
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "no_stack0_mem_marker_output_clear"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="CLEAN_EMITTER_SCOPE_2026_07_04.md#3",
+    )
