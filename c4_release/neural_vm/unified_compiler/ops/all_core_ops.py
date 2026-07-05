@@ -890,50 +890,31 @@ def all_core_ops(
         # byte-1 (gcd/rec_fib step-0). Off -> inert -> golden byte-identical.
         # Standalone PureFFN post_op on the L25 tail block after tail_bit32.
         make_jsr_pc_byte1_emit_op(),
-        # No-STACK0 (30-token) STEP_END OUTPUT-clear FFN: drives OUTPUT_LO/HI
-        # hugely negative at the MARK_SE_ONLY row so the LM head emits REG_PC (not
-        # a stray byte) after STEP_END, killing the +1-token/step frame drift that
-        # desyncs the 30-token fixed-stride decode. Standalone PureFFN post_op on
-        # the L25 tail block after tail_bit32 (LAST OUTPUT writer before the head).
-        # Gated by C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
-        # See l0_ops.make_no_stack0_se_output_clear_op.
-        make_no_stack0_se_output_clear_op(),
-        # No-STACK0 (30-token) MEM-MARKER-row OUTPUT-clear FFN: drives OUTPUT_LO/HI
-        # hugely negative at the bounded NEXT_MEM one-hot row (the BP-byte3 row
-        # whose logits decide the MEM marker) so the LM head emits Token.MEM (not
-        # a stray ALU-result value byte) -> the NEXT_MEM->NEXT_SE->NEXT_PC marker
-        # chain fires and the next step's REG_PC is emitted. Fixes the
-        # var_update SI-store / if_var BZ-branch SILENCE collapse (the model went
-        # quiet after the store/branch because the leaked result byte broke the
-        # marker chain). Standalone PureFFN post_op on the L25 tail block after
-        # no_stack0_se_output_clear (LAST OUTPUT writer at the MEM-marker row).
-        # Gated by C4_NO_STACK0_EMIT + C4_MEM_MARKER_OUTPUT_CLEAR (default ON);
-        # flag-OFF bakes NO units (byte-identical to HEAD's 35-token golden).
-        # See l0_ops.make_no_stack0_mem_marker_output_clear_op.
-        make_no_stack0_mem_marker_output_clear_op(),
         # No-STACK0 (30-token) PC value-byte OUTPUT-clear FFN (Inc 0): at the
         # PC value-byte rows (H1+0 PC-marker proximity + IS_BYTE + per-byte
         # BYTE_INDEX one-hot) sinks OUTPUT high nibbles so the PC HIGH bytes
         # default to 0x00 and the byte-0 nibble-1 leak is cleared, killing the
         # self-reinforcing 0x01 PC-replication that is the dominant 30-token
-        # blocker (288/375 PC-wrong). Appended AFTER no_stack0_se_output_clear
-        # (LAST OUTPUT writer at the PC rows), so it overrides every upstream
-        # leak source (block 33 L15 nibble_copy + block 41 L25 tail). Gated by
-        # C4_NO_STACK0_EMIT; flag-OFF bakes NO units (byte-identical).
-        # See l0_ops.make_no_stack0_pc_highbyte_clear_op.
+        # blocker (288/375 PC-wrong). Appended AFTER tail_bit32_result_correction
+        # on the PC rows, so it overrides every upstream leak source (block 33
+        # L15 nibble_copy + block 41 L25 tail). Gated by C4_NO_STACK0_EMIT;
+        # flag-OFF bakes NO units. See l0_ops.make_no_stack0_pc_highbyte_clear_op.
         make_no_stack0_pc_highbyte_clear_op(),
-        # CLEAN_EMITTER (flag C4_CLEAN_EMITTER, DEFAULT OFF): the generic
-        # all-marker-row OUTPUT sink. Gated on the 6-way OR of the marker-schedule
-        # flags (NEXT_PC|NEXT_AX|NEXT_SP|NEXT_BP|NEXT_MEM|NEXT_SE), it sinks
-        # OUTPUT_LO/HI hugely negative at EVERY marker-predicting row so the LM
-        # head emits the register MARKER (never a stray value byte) -> the frame is
-        # exactly N tokens BY CONSTRUCTION, so the =/=STEP_TOKENS framing megaroot
-        # cannot occur for ANY register. Subsumes the two per-row point-fixes above
-        # (SE-clear + MEM-marker-clear) and pre-empts the 3 unwritten AX/SP/BP-row
-        # copies. Standalone PureFFN post_op appended AFTER them on the L25 tail
-        # (LAST OUTPUT writer before the head). OFF -> bakes NO units ->
-        # byte-identical to golden 91f55411. See l0_ops.make_clean_emitter_op +
-        # docs/CLEAN_EMITTER_SCOPE_2026_07_04.md.
+        # CLEAN_EMITTER (flag C4_CLEAN_EMITTER, DEFAULT ON, opt out =0): the
+        # generic all-marker-row OUTPUT sink. Gated on the 6-way OR of the
+        # marker-schedule flags (NEXT_PC|NEXT_AX|NEXT_SP|NEXT_BP|NEXT_MEM|NEXT_SE),
+        # it sinks OUTPUT_LO/HI hugely negative at EVERY marker-predicting row so
+        # the LM head emits the register MARKER (never a stray value byte) -> the
+        # frame is exactly N tokens BY CONSTRUCTION, so the =/=STEP_TOKENS framing
+        # megaroot cannot occur for ANY register. PROVEN net-positive on the full
+        # 1096 (516 -> 525, +9), so it is the production default and SUBSUMES +
+        # REPLACES the two deleted per-row point-fixes (SE-clear + MEM-marker-clear)
+        # plus the 3 unwritten AX/SP/BP-row copies. Standalone PureFFN post_op
+        # appended AFTER no_stack0_pc_highbyte_clear on the L25 tail (LAST OUTPUT
+        # writer before the head). Because C4_NO_STACK0_EMIT also defaults ON, the
+        # bare-env golden gate now bakes this op (hash 745484ba, was 91f55411);
+        # C4_CLEAN_EMITTER=0 reproduces 91f55411. See l0_ops.make_clean_emitter_op
+        # + docs/CLEAN_EMITTER_SCOPE_2026_07_04.md.
         make_clean_emitter_op(),
         # L15 attention resize: add LEV/ALU/store-disambiguation heads
         # (phase=14.9 so it fires before _set_layer15_memory_lookup populates
