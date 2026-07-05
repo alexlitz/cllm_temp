@@ -2539,6 +2539,16 @@ def compile_full_vm_dynamic(
             "C4_WIDE_MUL_BYTE1_COMPUTED": (
                 os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
             ),
+            # M8 collapse for the L14 ADDR_KEY nibble decode: the load-query
+            # lo+hi ENUMERATED (2 x 16x16 = 512 per-(lo,hi) AND) bank ->
+            # COMPUTED (2 x 32 per-nibble route) collapse (DEFAULT-OFF, opt in
+            # =1). Changes the L14 addr_key FFN hidden_dim (512 -> 64) AND the
+            # ADDR_KEY firing/write, so the ON / OFF builds have different
+            # state_dicts and MUST NEVER share a memo / disk entry. See
+            # l14_ops._l14_byte_computed_enabled.
+            "C4_L14_BYTE_COMPUTED": (
+                os.environ.get("C4_L14_BYTE_COMPUTED", "0") != "0"
+            ),
             # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11
             # mul-partial / L12 mul-combine lookup (DEFAULT-OFF, opt in =1).
             # Adds the MUL_MULTIPASS_WS 240-dim workspace band (changes
@@ -3378,6 +3388,15 @@ def _bake_from_scheduled_ops(
         # l10_ops._wide_mul_byte1_computed_enabled.
         "C4_WIDE_MUL_BYTE1_COMPUTED": (
             os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
+        ),
+        # M8 collapse for the L14 ADDR_KEY nibble decode: the load-query lo+hi
+        # ENUMERATED (2 x 16x16 = 512 per-(lo,hi) AND) bank -> COMPUTED (2 x 32
+        # per-nibble route) collapse (DEFAULT-OFF, opt in =1). Changes the L14
+        # addr_key FFN hidden_dim (512 -> 64) AND the ADDR_KEY firing/write, so
+        # the ON / OFF builds have different state_dicts and MUST NEVER share a
+        # serialised entry. See l14_ops._l14_byte_computed_enabled.
+        "C4_L14_BYTE_COMPUTED": (
+            os.environ.get("C4_L14_BYTE_COMPUTED", "0") != "0"
         ),
         # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11 mul-partial
         # / L12 mul-combine lookup (DEFAULT-OFF, opt in =1). Adds the
