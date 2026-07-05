@@ -36,6 +36,13 @@ matches the model's argmax at EVERY position. This is the headline
 byte-for-byte signal: a divergence on a passing program means the interpreter
 is still unfaithful.
 
+This tool EXCLUDES the composite ALU FFN blocks from the Layer-A residual diff
+and runs them raw (the historical coverage boundary). For the FULL zero-opaque
+validation — composite ALU blocks executed THROUGH their IR
+``CompositeFFNFragment`` and INCLUDED in the per-block residual identity, over
+the full tractable corpus, plus the DSL-SwiGLU-vs-deployed divergence report —
+see ``tools/faithful_interpreter_full_validate.py``.
+
 Usage
 -----
     CUDA_VISIBLE_DEVICES=1 python tools/faithful_interpreter_validate.py --smoke
