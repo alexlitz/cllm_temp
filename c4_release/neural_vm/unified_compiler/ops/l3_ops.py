@@ -7,9 +7,12 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import multi_way_and_rule, step_function_rule
 from ..ir import CompilerIR, FFNRule
 from ..isa_semantics_dsl import (
+    CamValueBand,
+    FrameRelaySpec,
     RegisterByteDefaultSpec,
     RegisterDeltaSpec,
     SequentialAddDelta,
+    frame_relay,
     register_byte_defaults,
     register_delta,
 )
@@ -1420,39 +1423,46 @@ def _ax_full_relay_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     See docs/VAR_L3_SP_BYTE2_2026_06_07.md,
     docs/NESTED_ATTRIBUTION_2026_06_09.md, and memory note
     ``project_var_failure_mode_shifted`` for prior attributions.
+
+    DERIVED via the generic :func:`frame_relay` primitive — the same value-relay
+    machinery as the L8 head-6 AX_CARRY refresh (``_layer8_head6_ax_carry_frame_spec``).
+    The head fires at the AX marker row (slot-0 + slot-33 gate signature, with the
+    two HAS_SE step-0 guards described above), K selects the AX marker, and the
+    two :class:`CamValueBand` blocks relay ``OUTPUT_{LO,HI}`` -> ``AX_FULL_{LO,HI}``.
+    Byte-identical to the hand-authored head (proof: ``tools/_isa_golden_hash.py``
+    == 91f55411).
     """
 
     L = 15.0
     GATE = 33
-    q = [
-        AP(0, BD.MARK_AX, L),
-        AP(0, BD.HAS_SE, 2 * L),
-        AP(0, BD.CONST, -L * 2.5),
-        AP(GATE, BD.MARK_AX, L),
-        AP(GATE, BD.HAS_SE, L),
-        AP(GATE, BD.CONST, -L * 1.5),
-    ]
-    k = [
-        AP(0, BD.MARK_AX, L),
-        AP(GATE, BD.CONST, L),
-        # K-side complement for slot-33 MARK_AX gate (per
-        # docs/Q_SIDE_GATE_AUDIT_2026_06_07.md L3 carry_forward).
-        AP(GATE, BD.MARK_AX, L),
-    ]
-    v = []
-    o = []
-    for k_idx in range(16):
-        v.append(AP(1 + k_idx, BD.OUTPUT_LO + k_idx, 1.0))
-        v.append(AP(17 + k_idx, BD.OUTPUT_HI + k_idx, 1.0))
-        o.append(AO(BD.AX_FULL_LO + k_idx, 1 + k_idx, 1.0))
-        o.append(AO(BD.AX_FULL_HI + k_idx, 17 + k_idx, 1.0))
-    return DeclarativeAttentionHeadSpec(
-        head_idx=5,
-        q=tuple(q),
-        k=tuple(k),
-        v=tuple(v),
-        o=tuple(o),
-    )
+    dim_map = {
+        n: int(getattr(BD, n))
+        for n in ("MARK_AX", "HAS_SE", "CONST",
+                  "OUTPUT_LO", "OUTPUT_HI", "AX_FULL_LO", "AX_FULL_HI")
+    }
+    bundle = frame_relay(FrameRelaySpec(
+        name="layer3_ax_full_relay",
+        q_gates=(
+            (0, "MARK_AX", L),
+            (0, "HAS_SE", 2 * L),
+            (0, "CONST", -L * 2.5),
+            (GATE, "MARK_AX", L),
+            (GATE, "HAS_SE", L),
+            (GATE, "CONST", -L * 1.5),
+        ),
+        # slot-0 AX marker select + slot-33 CONST anchor + slot-33 MARK_AX
+        # K-side complement (per docs/Q_SIDE_GATE_AUDIT_2026_06_07.md).
+        k_gates=(
+            (0, "MARK_AX", L),
+            (GATE, "CONST", L),
+            (GATE, "MARK_AX", L),
+        ),
+        value_bands=(
+            CamValueBand("OUTPUT_LO", "AX_FULL_LO", 16, 1, 1.0),
+            CamValueBand("OUTPUT_HI", "AX_FULL_HI", 16, 17, 1.0),
+        ),
+    ))
+    return bundle.head_spec_builder(dim_map, head_idx=5)
 
 
 def _lev_bp_to_pc_head_spec(BD) -> DeclarativeAttentionHeadSpec:
