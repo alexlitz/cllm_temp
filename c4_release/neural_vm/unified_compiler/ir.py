@@ -230,11 +230,73 @@ class FFNRule:
         )
 
 
+@dataclass(frozen=True)
+class CompositeFFNFragment:
+    """An imperative composite-FFN fragment carried by an :class:`FFNOp`.
+
+    The FFN counterpart of :class:`RuntimeAttentionFragment`. Some deployed
+    FFN *blocks* are composite ``nn.Module``s whose forward is not a single
+    SwiGLU rule list — the imperative ALU composites (``AddSub5StageBlock``
+    / ``FlattenedALUMul`` / ``FlattenedDivMod`` / ``ALUShiftComposite``) run
+    a multi-stage GE-workspace pipeline (BD->GE projection, per-column carry
+    cascades, opcode/marker ``>0.1`` masks, GE->BD writeback) that has NO
+    W_up/W_gate/W_down rule form and is *not affine* (see
+    ``docs/DSL_W5_MULDIV_LIMIT.md`` — the GE workspace is ``[B, seq, 8, 160]``,
+    a different intermediate representation than the DSL's per-nibble BD
+    residual bands). A byte-for-byte SwiGLU reproduction of these blocks does
+    not exist; the DSL ``wide_*_rules`` generators reproduce the *decoded ISA
+    byte* on the idealized-ISA declarative-replacement blocks, not the
+    deployed imperative block's *residual*.
+
+    So — exactly as :class:`RuntimeAttentionFragment` keeps a shape-dependent
+    attention writer visible AT THE IR SITE as a callable rather than hidden
+    inside a bake function — this node carries the deployed composite block's
+    own deterministic forward as an IR-visible callable. A faithful executor
+    (``FaithfulInterpreter``) that finds a :class:`CompositeFFNFragment` on an
+    op's IR runs it and is byte-identical to the deployed block *by
+    construction* (it invokes the exact module), turning what was an
+    ``opaque_skipped`` gap into a first-class, IR-executable op.
+
+    Attributes
+    ----------
+    name:
+        Human-readable identifier (e.g. ``"composite_ffn.FlattenedALUMul"``).
+    forward:
+        Callable reproducing the block. Called as ``forward(x)`` where ``x``
+        is the ``[S, d_model]`` post-attention residual tape; returns the
+        ``[S, d_model]`` post-FFN residual. (The deployed block modules take
+        a ``[B, N, D]`` tensor; the fragment builder is responsible for the
+        ``unsqueeze(0)`` / ``[0]`` adaptation so this signature stays
+        ``[S, D] -> [S, D]``.)
+    block_type:
+        The deployed ``nn.Module`` class name (for attribution / reporting).
+    metadata:
+        Optional opaque mapping for downstream tooling. Never consulted by
+        the lowerer.
+    """
+
+    name: str
+    forward: Callable[[object], object]
+    block_type: str = ""
+    metadata: Mapping[str, object] = field(default_factory=dict)
+
+
 @dataclass
 class FFNOp:
-    """Declarative FFN operation made of conditional-write rules."""
+    """Declarative FFN operation made of conditional-write rules.
+
+    ``rules`` is the ordinary declarative SwiGLU rule list. ``composite`` is
+    the escape hatch for a deployed FFN *block* with no rule form: an
+    imperative :class:`CompositeFFNFragment` carrying the block's own forward
+    (the ALU composites — see that class). When ``composite`` is set the FFN
+    op is executed by running the fragment (byte-identical to the deployed
+    block); ``rules`` is typically empty in that case. The two are not mixed
+    on the lowering path — ``composite`` is an interpreter-execution vehicle
+    for the faithful-decode oracle, not a weight-lowering target.
+    """
 
     rules: List[FFNRule] = field(default_factory=list)
+    composite: Optional["CompositeFFNFragment"] = None
 
     def append(self, rule: FFNRule) -> "FFNOp":
         self.rules.append(rule)
