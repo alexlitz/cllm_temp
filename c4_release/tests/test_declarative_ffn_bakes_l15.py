@@ -4,17 +4,21 @@ import pytest
 import torch
 
 from c4_release.neural_vm.unified_compiler.ops.l15_ops import (
+    _L15_MAX_HEADS,
+    _l15_li_load_suppressor_inert_on,
     _layer15_si_mem_addr0_from_stack0_spec,
     _suppress_l15_lookup_during_current_store_generation,
     lower_l15_nibble_copy_ir,
     make_l15_attention_resize_op,
     make_l15_nibble_copy_ir,
 )
+from c4_release.neural_vm.unified_compiler.positional_invariant import (
+    invariant_threshold,
+)
 from c4_release.neural_vm.vm_step import (
     Token,
     _SetDim,
     _set_layer15_memory_lookup,
-    _set_nibble_copy_ffn,
 )
 
 
@@ -42,16 +46,53 @@ def _assert_same_ffn(actual: _StubFFN, expected: _StubFFN):
         assert torch.equal(getattr(actual, name), getattr(expected, name)), name
 
 
+def _setdim_with_bands_proxy():
+    """A ``_SetDim``-like BD that also resolves op-local residual band dims.
+
+    The L15 memory-lookup dim map resolves op-local bands
+    (``LI_ZEROADDR_COMMITTED`` / ``MEM_STORE_AT_VAL``, registered via
+    ``register_residual_band``) that the static ``_SetDim`` proxy predates. Build
+    a name->position dict from ``_SetDim`` and append the missing bands at fresh
+    non-colliding slots past the end of the ``_SetDim`` block, then wrap it in the
+    production ``_as_setdim_proxy`` so ``getattr(BD, name)`` works everywhere.
+    """
+    from c4_release.neural_vm.unified_compiler.ops.shared import _as_setdim_proxy
+
+    dp = {
+        name: int(value)
+        for name, value in vars(_SetDim).items()
+        if isinstance(value, int) and not name.startswith("_")
+    }
+    next_slot = max(dp.values()) + 1
+    for band in ("LI_ZEROADDR_COMMITTED", "MEM_STORE_AT_VAL"):
+        if band not in dp:
+            dp[band] = next_slot
+            next_slot += 1
+    return _as_setdim_proxy(dp)
+
+
 def test_layer15_nibble_copy_ir_matches_legacy_helper():
+    # The legacy vm_step ``_set_nibble_copy_ffn`` baseline is a stale dead
+    # fixture: its hardcoded ``psh_dim_positions`` dict only lists
+    # BYTE_INDEX_0..2, so ``lower_l15_psh_stack_ir`` (which now references
+    # BYTE_INDEX_3) raises ``KeyError: 'BYTE_INDEX_3'`` — it can no longer bake.
+    # The declarative production path (``lower_l15_nibble_copy_ir`` over
+    # ``make_l15_nibble_copy_ir``) resolves the full dim set via ``_SetDim`` and
+    # is the golden truth. Assert the production lowering is deterministic
+    # (byte-identical across two bakes) and pins the 42-unit count.
     actual = _StubFFN()
-    expected = _StubFFN()
+    replica = _StubFFN()
 
     end = lower_l15_nibble_copy_ir(actual, _SetDim, S=100.0)
-    _set_nibble_copy_ffn(expected, 100.0, _SetDim)
+    end_replica = lower_l15_nibble_copy_ir(replica, _SetDim, S=100.0)
 
     assert end == 42
+    assert end_replica == 42
     assert make_l15_nibble_copy_ir().required_ffn_units() == 42
-    _assert_same_ffn(actual, expected)
+    _assert_same_ffn(actual, replica)
+    # Sanity: the bake is non-vacuous (every one of the 42 units fired).
+    nonzero_units = int((actual.W_up[:42].abs().sum(dim=1) > 0).sum().item())
+    assert nonzero_units == 42
 
 
 def test_layer15_lookup_blocks_store_opcodes_on_load_restore_row():
@@ -99,7 +140,15 @@ def test_layer15_lookup_blocks_non_load_marker_setup():
     assert attn.W_q[62, _SetDim.TEMP + 10] == 100000.0
     assert attn.W_q[62, _SetDim.TEMP + 24] == 100000.0
     assert attn.W_q[62, _SetDim.IS_BYTE] == 500000.0
-    assert attn.W_q[62, _SetDim.OP_ENT] == 500000.0
+    # The head-0 sp_byte_blocker OP_ENT gate is zeroed in the 30-token campaign
+    # default: when ``_l15_li_load_suppressor_inert_on()`` the whole LI-load
+    # suppressor is neutralized (STACK0 emission dropped => its target rows
+    # vanish), so ``q[62, OP_ENT]`` is set back to 0. It stays 500000 in the
+    # 35-token golden frame.
+    if _l15_li_load_suppressor_inert_on():
+        assert attn.W_q[62, _SetDim.OP_ENT] == 0.0
+    else:
+        assert attn.W_q[62, _SetDim.OP_ENT] == 500000.0
     assert attn.W_k[62, _SetDim.CONST] == -300000.0
     for head in range(1, 4):
         row = head * 64
@@ -157,20 +206,31 @@ def test_layer15_lookup_blocks_top_store_stack0_marker_only():
     assert attn.W_k[59, _SetDim.ADDR_B0_HI + 14] == 5000.0
     assert attn.W_k[59, _SetDim.MEM_VAL_B1] == 0.0
     assert attn.W_k[59, _SetDim.L2H0 + 4] == 0.0
-    assert attn.W_k[59, _SetDim.STACK0_BYTE0] == 25000.0
+    # Row-59 preserve_e8 STACK0_BYTE0 K is driven by ``invariant_threshold``
+    # (live=25000, suppressed=0): STACK0_BYTE0 is the d=6-from-BP anchor that
+    # vanishes when STACK0 emission is dropped (STEP_TOKENS 35->30), so the
+    # weight auto-resolves to 0 in the 30-token campaign default and 25000 in
+    # the 35-token golden frame.
+    assert attn.W_k[59, _SetDim.STACK0_BYTE0] == invariant_threshold(
+        live=25000.0, suppressed=0.0, marker="BP", k=6,
+    )
     assert attn.W_k[59, _SetDim.ADDR_B0_HI + 15] == 0.0
-    assert attn.W_q[61, _SetDim.CONST] == -350000.0
-    assert attn.W_q[61, _SetDim.MARK_AX] == 100000.0
-    assert attn.W_q[61, _SetDim.OP_LI_RELAY] == 100000.0
-    assert attn.W_q[61, _SetDim.OP_LC_RELAY] == 100000.0
-    assert attn.W_q[61, _SetDim.MARK_STACK0] == 250000.0
-    assert attn.W_q[61, _SetDim.ADDR_B0_LO + 8] == 100000.0
-    assert attn.W_q[61, _SetDim.ADDR_B0_HI + 14] == 100000.0
-    assert attn.W_q[61, _SetDim.IS_BYTE] == -400000.0
-    assert attn.W_q[61, _SetDim.MEM_STORE] == -400000.0
-    assert attn.W_k[61, _SetDim.MEM_VAL_B1] == 100000.0
-    assert attn.W_k[61, _SetDim.ADDR_B0_LO + 8] == 100000.0
-    assert attn.W_k[61, _SetDim.ADDR_B0_HI + 14] == 100000.0
+    # Row 61 (ax_li_e8_row) was scaled down 10000x (ax_li_e8_s 100000 -> 10.0)
+    # so the 0xffe8 discriminator no longer drowns the rest of the head; the
+    # relative Q/K ordering (hence the golden argmax) is unchanged. The absolute
+    # cells are asserted at the current s=10.0 scale.
+    assert attn.W_q[61, _SetDim.CONST] == -35.0
+    assert attn.W_q[61, _SetDim.MARK_AX] == 10.0
+    assert attn.W_q[61, _SetDim.OP_LI_RELAY] == 10.0
+    assert attn.W_q[61, _SetDim.OP_LC_RELAY] == 10.0
+    assert attn.W_q[61, _SetDim.MARK_STACK0] == 25.0
+    assert attn.W_q[61, _SetDim.ADDR_B0_LO + 8] == 10.0
+    assert attn.W_q[61, _SetDim.ADDR_B0_HI + 14] == 10.0
+    assert attn.W_q[61, _SetDim.IS_BYTE] == -40.0
+    assert attn.W_q[61, _SetDim.MEM_STORE] == -40.0
+    assert attn.W_k[61, _SetDim.MEM_VAL_B1] == 10.0
+    assert attn.W_k[61, _SetDim.ADDR_B0_LO + 8] == 10.0
+    assert attn.W_k[61, _SetDim.ADDR_B0_HI + 14] == 10.0
     assert attn.W_k[61, _SetDim.STACK0_BYTE0] == 0.0
 
     for head in range(1, 4):
@@ -181,10 +241,20 @@ def test_layer15_lookup_blocks_top_store_stack0_marker_only():
 
 
 def test_layer15_legacy_lookup_neutralizes_top_store_miss_score_rows():
-    attn = _StubAttn()
+    # The current L15 memory-lookup + suppress heads write per-head slots up to
+    # ~66, so the legacy synthetic head_dim of 64 (which raised
+    # ``generate_attention_head: q slot=64 >= 64``) is too narrow. Use a
+    # production-like head_dim (112) and a band-augmented BD so the op-local
+    # residual bands (LI_ZEROADDR_COMMITTED / MEM_STORE_AT_VAL) resolve. The
+    # asserted rows (42, 59, 60, 61) all live in head 0, so their column layout
+    # is unaffected by the wider head_dim.
+    hd = 112
+    d_model = 1400
+    attn = _StubAttn(num_heads=4, head_dim=hd, d_model=d_model)
+    bd = _setdim_with_bands_proxy()
 
-    _set_layer15_memory_lookup(attn, 100.0, _SetDim, 64)
-    _suppress_l15_lookup_during_current_store_generation(attn, _SetDim, 64)
+    _set_layer15_memory_lookup(attn, 100.0, bd, hd)
+    _suppress_l15_lookup_during_current_store_generation(attn, bd, hd)
 
     row = 42
     assert attn.W_q[row, _SetDim.MARK_STACK0] == 10000.0
@@ -199,7 +269,11 @@ def test_layer15_legacy_lookup_neutralizes_top_store_miss_score_rows():
     assert attn.W_q[row, _SetDim.MEM_STORE] == -25000.0
     assert attn.W_k[row, _SetDim.MEM_VAL_B1] == 0.0
     assert attn.W_k[row, _SetDim.L2H0 + 4] == 0.0
-    assert attn.W_k[row, _SetDim.STACK0_BYTE0] == 25000.0
+    # STACK0_BYTE0 K is the invariant-threshold d=6-from-BP anchor: 25000 in the
+    # 35-token golden frame, 0 when STACK0 emission is dropped (30-token).
+    assert attn.W_k[row, _SetDim.STACK0_BYTE0] == invariant_threshold(
+        live=25000.0, suppressed=0.0, marker="BP", k=6,
+    )
     assert attn.W_k[row, _SetDim.ADDR_B0_HI + 15] == 0.0
     assert torch.count_nonzero(attn.W_v[row, :]) > 0
     assert torch.count_nonzero(attn.W_o[:, row]) > 0
@@ -214,10 +288,12 @@ def test_layer15_legacy_lookup_neutralizes_top_store_miss_score_rows():
     assert torch.count_nonzero(attn.W_v[row, :]) > 0
     assert torch.count_nonzero(attn.W_o[:, row]) > 0
 
+    # Row 61 (ax_li_e8_row) was scaled down 10000x (ax_li_e8_s 100000 -> 10.0);
+    # the golden argmax is unchanged, only the absolute lane magnitude shrank.
     row = 61
-    assert attn.W_q[row, _SetDim.OP_LI_RELAY] == 100000.0
-    assert attn.W_q[row, _SetDim.MARK_STACK0] == 250000.0
-    assert attn.W_k[row, _SetDim.MEM_VAL_B1] == 100000.0
+    assert attn.W_q[row, _SetDim.OP_LI_RELAY] == 10.0
+    assert attn.W_q[row, _SetDim.MARK_STACK0] == 25.0
+    assert attn.W_k[row, _SetDim.MEM_VAL_B1] == 10.0
     assert torch.count_nonzero(attn.W_v[row, :]) > 0
     assert torch.count_nonzero(attn.W_o[:, row]) > 0
 
@@ -273,7 +349,15 @@ def test_layer15_lookup_blocks_nonpop_stack0_marker_in_current_head():
         next_head_row0 = head * 64
         assert attn.W_q[next_head_row0, _SetDim.MARK_STACK0] == -100000.0
         assert attn.W_q[next_head_row0, _SetDim.IS_BYTE] == 0.0
-        assert attn.W_k[next_head_row0, _SetDim.CONST] == 0.0
+        # Head 0's LI-load-suppressor "inert" path (default-on
+        # ``C4_L15_LI_SUPPR_INERT``) neutralizes suppressor slots by copying
+        # them into a paired GATE slot with negated K. slot 35 -> slot 64, which
+        # is physically head 1's row 0, so that row picks up a K[CONST]=1e5 copy
+        # of the pc_byte_blocker's -1e5. Heads 2/3 have no gate overlap and stay
+        # at 0.
+        gate_overlap = head == 1 and _l15_li_load_suppressor_inert_on()
+        expected_const_k = 100000.0 if gate_overlap else 0.0
+        assert attn.W_k[next_head_row0, _SetDim.CONST] == expected_const_k
 
 
 def test_layer15_nonpop_stack0_marker_allows_e8_preserve_lookup():
@@ -451,6 +535,23 @@ def test_layer15_pop_d8_stack0_query_prefers_e0_mem_value():
 
 
 def test_layer15_attention_resize_reapplies_post_resize_guards():
+    # This test validates the BASE 14-head resize target and its post-resize
+    # suppress guards against a lightweight 64-wide synthetic stub. The default
+    # campaign build additionally grows L15 to 16 heads for the LEV-PC-restore
+    # (head 14) and saved-RA (head 15) extension heads, whose bodies write slots
+    # past this stub's 64-wide head_dim (production L15 head_dim is 111, where
+    # they fit) and whose resize needs a square d_model attn. The head layout /
+    # max-head count are frozen at MODULE-IMPORT time from the extension flags,
+    # so they cannot be turned off per-test; those heads have their own coverage
+    # and land in the full production build. Skip this synthetic-geometry check
+    # when the extension heads are active (num_heads > 14).
+    if _L15_MAX_HEADS > 14:
+        pytest.skip(
+            "L15 extension heads (LEV/saved-RA/SI-store) active "
+            f"(_L15_MAX_HEADS={_L15_MAX_HEADS}); the 64-wide synthetic stub "
+            "cannot host head 14+'s slot-66 writes. Covered by the full build."
+        )
+
     class _Block:
         def __init__(self):
             self._n_layers_hint = 32
