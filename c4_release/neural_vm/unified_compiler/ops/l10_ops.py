@@ -875,11 +875,33 @@ def _lea_byte0_alu_amplify_enabled() -> bool:
     amplifier now rides along as designed. It is kept DEFAULT OFF here pending
     a clean cross-cluster ``flag_regression_gate`` pass; flip it together with
     ``C4_L15_LI_VALROW_B1`` once that gate is green under an uncontended fleet.
+
+    UMBRELLA (2026-07-04, ``C4_OPCAM_FRAME``): the operand-CAM frame-depth
+    discriminator survey (R2) rolls the amplifier under ONE campaign-only
+    default-OFF flag ``C4_OPCAM_FRAME`` — the single lever the ROOT brief asks
+    for. ``C4_OPCAM_FRAME=1`` turns this amplifier ON in the campaign config
+    (the gating LI value-load fix ``C4_L15_LI_VALROW_B1`` is ALREADY campaign
+    default-ON, so the amplifier is the only remaining gate). The frame-depth
+    discriminator is the AUTOREGRESSIVE ``OUTPUT_HI+{14,13}`` complete-frame-
+    address presence (the byte the L8 ``lea_lo`` ALU computed for THIS frame
+    depth), re-asserted at 1e6 so it survives the block-42 default overwrite —
+    NOT a single-rule tail tweak: it preserves WHATEVER the ALU correctly
+    computed per frame depth. The dedicated ``C4_LEA_BYTE0_ALU_AMPLIFY``
+    kill-switch still wins when set explicitly (``=0`` forces OFF even under
+    the umbrella; ``=1`` forces ON), so the flag-regression gate can A/B just
+    this change. flag-OFF (neither flag set, or ``C4_NO_STACK0_EMIT=0``, or the
+    35-token golden) is byte-identical to ``91f55411``: this branch is never
+    entered there (+0 tail rules).
     """
+    from .shared import no_stack0_emit_enabled
+
     forced = os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY")
     if forced is not None:
-        from .shared import no_stack0_emit_enabled
+        # Dedicated kill-switch wins: explicit =1/=0 overrides the umbrella.
         return forced != "0" and no_stack0_emit_enabled()
+    if os.environ.get("C4_OPCAM_FRAME", "0") != "0":
+        # Operand-CAM frame-depth umbrella: campaign-only, default-OFF.
+        return no_stack0_emit_enabled()
     return False
 
 
