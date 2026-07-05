@@ -19,6 +19,7 @@ from .shared import (
     ffn_lint_mull14_demo_enabled,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
+    si_store_addr_enabled,
     sili_b1_restore_enabled,
     sub_full_borrow_enabled,
 )
@@ -100,6 +101,26 @@ register_residual_band(
     "LI_RELOAD_B1", 32,
     owner="make_layer14_sili_b1_capture_op",
     flag=sili_b1_restore_enabled, never_share=True,
+)
+
+
+# Fresh over-width residual band carrying the SI-store-addr CAM's LI-QUERY
+# zero-address VETO flag (campaign flag ``C4_SI_STORE_ADDR``). Fires ≈1 on an
+# LI byte-0 lookup row whose target address (its own AX_CARRY byte-0) is 0x00 --
+# i.e. BOTH null nibbles (AX_CARRY_LO+0 AND AX_CARRY_HI+0) hot -- the
+# ABSOLUTE-address path (e.g. LI 0x200 -> byte-0 = 0x00) where the L15 head-16
+# store-addr CAM would otherwise null-match a spurious ADDR_B0=0x00 store marker
+# and deliver 0. L15 head-16 keys a large NEGATIVE Q on this dim in its firing
+# gate so it fails-closed (softmax1 sink) on that row, never overriding head-0's
+# correct value. ``never_share=True`` keeps a private slot: it is a bounded 0/1
+# flag written at the L14 mem-generation block and read by L15 head-16 one block
+# downstream on the SAME LI-query row. Flag-gated on the campaign SI-store CAM
+# switch so a golden (flag-OFF) build omits it entirely (smaller d_model,
+# byte-identical). Sized 1 (a single indicator scalar).
+register_residual_band(
+    "LI_QUERY_ZEROADDR", 1,
+    owner="make_layer14_li_query_zeroaddr_op",
+    flag=si_store_addr_enabled, never_share=True,
 )
 
 
@@ -373,6 +394,14 @@ _L14_CLEANUP_CHAIN_LAYOUT = {
     # empty-band underflow detector reads a live operand. See
     # ``make_layer14_sub_full_borrow_flag_op``.
     "layer14_sub_full_borrow_flag":          (None,    1),
+    # SI-store-addr CAM LI-QUERY zero-address VETO flag precursor (CAMPAIGN-ONLY,
+    # C4_SI_STORE_ADDR). ONE FFN unit writing the private ``LI_QUERY_ZEROADDR``
+    # band on the LI byte-0 lookup row when the query's own AX_CARRY byte-0 is
+    # 0x00 (both null nibbles hot) -- the abs-address path L15 head-16 must NOT
+    # fire on. A chain TAIL entry so it can never shift a real op's start_unit:
+    # flag-OFF the op is not registered and ``_l14_chain_alloc`` never claims its
+    # slot (golden byte-identical). See ``make_layer14_li_query_zeroaddr_op``.
+    "layer14_li_query_zeroaddr":             (None,    1),
 }
 
 
@@ -4681,6 +4710,146 @@ def make_layer14_li_zeroaddr_indicator_op() -> Operation:
         ffn_units_used=1926 if enabled else 0,
         smoke_tests=set(),
         spec_section="project_campaign_savedra_chain_flip (#318)",
+    )
+
+
+_LI_QUERY_ZEROADDR_HIDDEN_DIM = 1
+
+
+def _layer14_li_query_zeroaddr_rules(S: float = 100.0) -> tuple[FFNRule, ...]:
+    """One FFNRule: the LI-QUERY zero-address VETO flag (SI-store CAM head-16).
+
+    Fires ≈1 ONLY on an LI byte-0 lookup row whose OWN target address (its
+    ``AX_CARRY`` byte-0) is 0x00 -- BOTH null nibbles hot -- the absolute-address
+    path (e.g. ``LI 0x200`` -> byte-0 = 0x00). Built-layout probe
+    (``tools/_probe_si_overwrite_cpu.py``, campaign config) confirms the cell
+    values on the LI byte-0 lookup row: a ZERO-address query carries
+    ``AX_CARRY_LO+0 = AX_CARRY_HI+0 ≈ 1.287`` (both null nibbles hot), a
+    RELATIVE-address query carries at most ONE of them hot (``0xe0`` -> LO+0≈1.287
+    BUT HI+0≈0.291; ``0xe8`` -> both ≈0.291). So the two-nibble zero-address AND
+    with ``threshold=2.0`` cleanly separates the full-0x00 case (1.287+1.287 =
+    2.574 > 2.0) from the one-null 0xX0 / 0x0X relative case (1.287+0.291 = 1.578
+    < 2.0) and the no-null 0xXY case (0.582 < 2.0), with ~0.57 margin either side.
+
+    THE FACTORED FORM (the AND that must hold):
+
+        output = OP_LI * silu(S*(AX_CARRY_LO+0 + AX_CARRY_HI+0) - S*thr)
+
+    The SwiGLU gate (``gate=OP_LI``) multiplies the silu, so a NON-LI store /
+    address value row is forced to 0 REGARDLESS of its own null-nibble amplitude
+    (this is a QUERY-row flag; it must not light up on candidate store rows). The
+    silu side then does the two-nibble zero-address AND. ``OP_LI`` is ~5.2 at the
+    LI byte-0 emit row (the query) and ~0 elsewhere, so it is a clean row gate.
+
+    Output goes to the private ``LI_QUERY_ZEROADDR`` band so L15 head-16 can key
+    a large NEGATIVE Q on this SINGLE dim in its firing gate -- when the flag is
+    lit the whole candidate row-score drops below the softmax1 sink and the head
+    fails-closed (writes ~nothing), never overriding head-0's correct value on
+    the abs-address path. Write magnitude ``1.0/S`` makes the output ≈1 at S=100
+    (silu(S*~0.57) ≈ 0.57*S, times 1/S, times OP_LI-gate); the consumer head only
+    needs a positive sign, so the exact magnitude is not load-bearing.
+    """
+    return (
+        multi_way_and_rule(
+            name="l14_li_query_zeroaddr_veto",
+            conditions=(
+                ("AX_CARRY_LO+0", 1.0),
+                ("AX_CARRY_HI+0", 1.0),
+            ),
+            threshold=2.0,
+            gate="OP_LI",
+            gate_weight=1.0,
+            gate_bias=0.0,
+            writes=(("LI_QUERY_ZEROADDR+0", 1.0 / S),),
+            scope=("OP_LI and AX_CARRY_LO+0 and AX_CARRY_HI+0"),
+        ),
+    )
+
+
+def _layer14_li_query_zeroaddr_ir(S: float = 100.0) -> CompilerIR:
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(_layer14_li_query_zeroaddr_rules(S))
+    return ir
+
+
+def make_layer14_li_query_zeroaddr_op() -> Operation:
+    """L14 FFN: materialize the LI-QUERY zero-address VETO flag (SI-store CAM).
+
+    The FFN half of the L15 head-16 firing veto (agent a76baa3b, refine of
+    a8653eca). One :class:`FFNRule` (:func:`_layer14_li_query_zeroaddr_rules`)
+    fires ≈1 ONLY on an LI byte-0 lookup row whose target address (its own
+    ``AX_CARRY`` byte-0) is 0x00, writing the fresh private ``LI_QUERY_ZEROADDR``
+    band. L15 head-16 (``_layer15_si_store_addr_cam_head_spec``) keys a large
+    NEGATIVE Q on that single dim in its firing gate so the store-addr CAM
+    fails-closed on the abs-address path (where ``AX_CARRY=0x00`` would otherwise
+    null-match a spurious ``ADDR_B0=0x00`` store marker and deliver 0), while
+    still firing for the ``var_mul`` relative-address case (``AX_CARRY=0xE8`` etc,
+    where at most ONE null nibble is hot so the veto flag stays 0).
+
+    Campaign-flag-gated (``C4_SI_STORE_ADDR``, shared with the head-16 CAM): the
+    op is registered ONLY when the flag is on (see ``all_core_ops``), so a
+    flag-OFF / golden build never sees it. The read (``AX_CARRY_LO/HI`` from the
+    upstream ALU/decode path, ``OP_LI`` from decode) is present at the L14 input
+    on the LI-query row; ``LI_QUERY_ZEROADDR`` is a flag-gated residual band
+    (omitted otherwise), so the op is a no-op outside the campaign config too.
+
+    LAST entry in the L14 cleanup chain (``_L14_CLEANUP_CHAIN_LAYOUT``): it
+    pre-claims every deterministic, fixed-size preceding slot and lands at the
+    first free gap. Because it is the chain tail, growing it can never shift a
+    real op's start_unit; flag-OFF it is not registered, so the chain is
+    byte-identical to golden.
+    """
+    enabled = si_store_addr_enabled()
+
+    def bake(block, dim_positions, S):
+        if not enabled:
+            return
+        ffn = getattr(block, "ffn", None)
+        if ffn is None or not hasattr(ffn, "W_up"):
+            return
+        start_unit = _l14_chain_alloc("layer14_li_query_zeroaddr")
+        ir = _layer14_li_query_zeroaddr_ir(S)
+        rules = ir.layer(0).ffn.rules
+        assert len(rules) == _LI_QUERY_ZEROADDR_HIDDEN_DIM, (
+            f"li_query_zeroaddr rule-count drift: {len(rules)} "
+            f"!= {_LI_QUERY_ZEROADDR_HIDDEN_DIM} (the chain layout reserves "
+            f"{_LI_QUERY_ZEROADDR_HIDDEN_DIM} unit)"
+        )
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
+        ffn._l14_unit_counter = next_unit
+
+    return Operation(
+        name="layer14_li_query_zeroaddr",
+        slot_share=("ffn_units",),
+        reads={"AX_CARRY_LO", "AX_CARRY_HI", "OP_LI", "CONST"}
+        if enabled else set(),
+        writes={"LI_QUERY_ZEROADDR"} if enabled else set(),
+        kind="block",
+        target_op_name="layer14_mem_generation",
+        # Order after the prior chain-tail flag ops (li_zeroaddr + sub_full_borrow)
+        # so the chain alloc pre-claims their deterministic slots, and after
+        # mem_generation (the L14 attn op this block targets).
+        requires={"after": [
+            "layer14_sub_full_borrow_flag",
+            "layer14_li_zeroaddr_indicator",
+            "layer14_mem_generation",
+        ]} if enabled else {},
+        declarative_bake_fn=bake,
+        compiler_ir=_layer14_li_query_zeroaddr_ir(),
+        declarative_authority="spec_generated",
+        migrated=True,
+        # Chain tail (after li_zeroaddr 1925 + sub_full_borrow 1926): this
+        # single-unit op lands at the next free gap in the campaign config, so
+        # the block must be sized to fit it. Only reserved when the flag is on;
+        # OFF => not registered, so the prior chain sizing governs (golden
+        # byte-identical). Sized generously (the block auto-trims dead units).
+        ffn_units_used=1928 if enabled else 0,
+        smoke_tests=set(),
+        spec_section="project_si_store_provenance_two_root_wall",
     )
 
 

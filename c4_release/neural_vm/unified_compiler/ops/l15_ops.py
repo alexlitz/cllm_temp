@@ -2840,6 +2840,10 @@ def _layer15_si_store_addr_cam_dim_map(BD) -> dict:
     base_names = (
         "OP_LI", "CONST", "MARK_AX", "OP_PSH", "OUTPUT_LO", "OUTPUT_HI",
         "AX_CARRY_LO", "AX_CARRY_HI", "ADDR_B0_LO", "ADDR_B0_HI",
+        # LI-QUERY zero-address VETO flag (L14 make_layer14_li_query_zeroaddr_op,
+        # C4_SI_STORE_ADDR): the firing veto reads it to fail-closed on the
+        # absolute-address path.
+        "LI_QUERY_ZEROADDR",
     )
     return {n: int(getattr(BD, n)) for n in base_names}
 
@@ -2932,6 +2936,25 @@ def _layer15_si_store_addr_cam_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     discs.append(CamDiscriminatorSlot(
         slot=60, q=(("OP_LI", 2.0 * _cam_s), ("CONST", -0.05 * 2.0 * _cam_s)),
         k=(("MARK_AX", _ax_req), ("CONST", -_ax_req))))
+    # Slot 63: LI-QUERY zero-address FIRING VETO (agent a76baa3b, refine of the
+    # a8653eca CAM). ROOT: on the ABSOLUTE-address LI path (e.g. LI 0x200 ->
+    # target byte-0 = 0x00) the Q keys the LI-query's OWN AX_CARRY, which is
+    # all-zero (BOTH null nibbles hot), so the per-nibble match (slots 16 LO-k0 +
+    # 58 HI-k0) null-matches a spurious ADDR_B0=0x00 store marker (probe @217,
+    # value 0) that OVERRIDES head-0's correct value at value_scale 60. The
+    # store-addr CAM was BUILT for the RELATIVE case (var_mul &a=0xE8), where the
+    # query AX_CARRY is NON-zero -- so it must NOT fire when the query address is
+    # all-zero (null-null = no relative target). ``LI_QUERY_ZEROADDR`` (the L14
+    # FFN two-nibble zero-address AND, gated OP_LI) is ≈>0 ONLY on the abs-address
+    # LI query row and 0 on every relative-address LI query (0xE8/0xE0: at most
+    # ONE null nibble, AND<thr). A large NEGATIVE Q here against K=CONST (≈1 on
+    # EVERY candidate) subtracts a uniform block from the row-score, driving ALL
+    # candidates below the softmax1 sink so the head fails-closed (writes ~0) on
+    # the abs path -- while it is INERT (flag=0) on the var_mul relative path the
+    # head was built for. Sized to out-subtract the ~2.7M firing-gate baseline.
+    _veto = 30_000_000.0
+    discs.append(CamDiscriminatorSlot(
+        slot=63, q=(("LI_QUERY_ZEROADDR", -_veto),), k=(("CONST", 1.0),)))
 
     value_bands = (
         CamValueBand("AX_CARRY_LO", "OUTPUT_LO", 16, 32, value_scale),
