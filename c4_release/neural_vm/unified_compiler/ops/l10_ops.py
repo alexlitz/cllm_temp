@@ -5805,7 +5805,9 @@ def make_layer10_alu_op() -> Operation:
         # 2288. See ``_layer10_alu_eq_engine_rules``.
         # Ordering engine (2026-06-12): +272 units reaching 2560. See
         # ``_layer10_alu_ordering_engine_rules``.
-        ffn_units_used=2560,
+        # C4_CMP_COMBINE_MARGIN campaign clamp bank appended last: +6 flag-ON,
+        # +0 flag-OFF (byte-identical golden).
+        ffn_units_used=2560 + _l10_main_cmp_margin_extra(),
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
             "TestSmoke32Bit::test_or_16bit",
@@ -6161,7 +6163,9 @@ def make_l10_post_ops_combined() -> Operation:
         # PC_VIA_LEV_DETECTOR_LO read above (lev_detector_head phase=8.06
         # is in-step producer). Previous: requires={"after":
         # "layer16_lev_routing"}. See CONTROL_FLOW_DETECTOR_HEADS.md §2.4.
-        ffn_units_used=1562,
+        # C4_CMP_COMBINE_MARGIN campaign clamp grows the LAST tenant
+        # (comparison_combine) by +6; flag-OFF -> 1562 -> byte-identical golden.
+        ffn_units_used=1562 + _l10_main_cmp_margin_extra(),
         smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#registers",
     )
