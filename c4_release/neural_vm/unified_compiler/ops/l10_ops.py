@@ -2082,6 +2082,15 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     # See ``shared.cmp_combine_margin_enabled``.
     from .shared import cmp_combine_margin_enabled
     if cmp_combine_margin_enabled():
+        # SURGICAL GATE (2026-07): additionally require the FRESH-comparison
+        # signature ``SE_CMP_GROUP+0`` so the OUTPUT-HI clamp fires ONLY on a
+        # genuine comparison-result decode row (result provably in {0, 1}) and
+        # never on a value-carrying row that merely inherited a stale/leaked
+        # ``OP_<cmp>``. See the twin gate in ``_layer10_alu_cmp_hi_clamp_rules``
+        # and the SE-row probe (tools/_probe_cmp_se_row_disc.py): SE_CMP_GROUP
+        # is ~0.94 on the genuine cmp decode row, ~0.00 everywhere else. The
+        # +0.94 group flag lifts the "all markers present" sum to 2.94 >= 2.5;
+        # a leaked ``OP_<cmp>`` without the fresh group flag stays at 2.0 < 2.5.
         for _op in ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE"):
             _writes = [("OUTPUT_HI_THIS_STEP+0", 60.0 / S)]
             _writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -60.0 / S)
@@ -2090,12 +2099,15 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
                 conditions=(
                     ("MARK_SE_ONLY", 1.0),
                     (_op, 1.0),
+                    ("SE_CMP_GROUP+0", 1.0),
                     ("MARK_PC", MARK_PC_BLOCK),
                 ),
-                threshold=1.5,
+                threshold=2.5,
                 writes=tuple(_writes),
                 name=f"l10_cmp_hi_clamp_{_op.lower()}_step_end",
-                scope=f"MARK_SE_ONLY and {_op} and not MARK_PC",
+                scope=(
+                    f"MARK_SE_ONLY and {_op} and SE_CMP_GROUP and not MARK_PC"
+                ),
             ))
 
     return tuple(rules)
@@ -2381,14 +2393,32 @@ def _layer10_alu_cmp_hi_clamp_rules(S: float) -> tuple[FFNRule, ...]:
         # a large leaked operand ``(hi<<4)`` (~13+ observed) at the decode row.
         writes = [("OUTPUT_HI_THIS_STEP+0", 60.0 / S)]
         writes += [(f"OUTPUT_HI_THIS_STEP+{h}", -60.0 / S) for h in range(1, 16)]
+        # SURGICAL GATE (2026-07): require the FRESH-comparison signature
+        # ``SE_CMP_GROUP+0`` in addition to ``SE_OP_<cmp>``. Probing the SE
+        # step-end rows (tools/_probe_cmp_se_row_disc.py) shows ``SE_CMP_GROUP``
+        # is ~0.94 on the genuine comparison-result decode row and ~0.00 on
+        # EVERY other SE row (incl. rows carrying a weak stale CMP residue),
+        # while ``SE_OP_<cmp>`` alone can survive as a stale/cross-frame leak on
+        # a value-carrying row (a compare feeding a value, e.g. func_max's
+        # RETURN 0x63). Gating on ``SE_CMP_GROUP+0`` too means the OUTPUT-HI
+        # clamp fires ONLY when THIS step's opcode is a genuinely-relayed
+        # comparison whose result is provably in {0, 1} -- it can no longer
+        # clobber a legitimately-nonzero OUTPUT_HI high nibble on a
+        # non-comparison / value row. The +0.94 group flag pushes the "all
+        # three markers present" sum to 1 + 1 + 0.94 = 2.94 >= 2.5 (fires),
+        # while a leaked ``SE_OP`` WITHOUT the fresh group flag stays at
+        # 1 + 1 = 2.0 < 2.5 (blocked). This CANNOT weaken the intended fix:
+        # every genuine comparison decode carries ``SE_CMP_GROUP`` (the same
+        # L9 step_end_operand_relay that mirrors ``OP_<cmp> -> SE_OP_<cmp>``).
         return multi_way_and_rule(
             name=f"l10_cmp_{op_name.lower()}_hi_clamp_step_end",
             conditions=(
                 ("MARK_SE_ONLY", 1.0),
                 (f"SE_OP_{op_name}", 1.0),
+                ("SE_CMP_GROUP+0", 1.0),
                 ("MARK_PC", -50.0),
             ),
-            threshold=1.5,
+            threshold=2.5,
             writes=tuple(writes),
         )
 
