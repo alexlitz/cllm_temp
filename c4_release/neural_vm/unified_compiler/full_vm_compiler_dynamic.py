@@ -2260,6 +2260,16 @@ def compile_full_vm_dynamic(
             "C4_VAR_THREE_LI": (
                 os.environ.get("C4_VAR_THREE_LI") == "1"
             ),
+            # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
+            # opt in =1). At the deeper-frame 2-arg func LI whose arg address is
+            # 0xE0 (lo-nibble 0), the L15 head-0 value delivery carries the
+            # ADDRESS lo-nibble 0 alongside the real value lo-nibble, so byte-0
+            # decodes ``value & 0xF0`` (e.g. b=0x55 -> 0x50). Flag-OFF registers
+            # NO rules -> byte-identical to golden. Own key so ON/OFF never share
+            # a memo / disk entry.
+            "C4_ABSDIFF_FIX": (
+                os.environ.get("C4_ABSDIFF_FIX") == "1"
+            ),
             # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
             # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
             # value_scale=40 V/O delivery. Output-affecting on the LEV PC marker
@@ -3159,6 +3169,12 @@ def _bake_from_scheduled_ops(
         # Same head shape, different W_q, so ON / OFF must never share an entry.
         "C4_VAR_THREE_LI": (
             os.environ.get("C4_VAR_THREE_LI") == "1"
+        ),
+        # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
+        # opt in =1). Flag-OFF registers NO rules -> byte-identical to golden.
+        # Own key so ON/OFF never share a memo / disk entry.
+        "C4_ABSDIFF_FIX": (
+            os.environ.get("C4_ABSDIFF_FIX") == "1"
         ),
         # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
         # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs

@@ -1616,6 +1616,45 @@ def var_three_li_enabled() -> bool:
     return os.environ.get("C4_VAR_THREE_LI", "0") == "1"
 
 
+def absdiff_fix_enabled() -> bool:
+    """Return True iff the absdiff arg-b LI value byte-0 LO-nibble
+    de-contamination is active (DEFAULT OFF — opt in via ``C4_ABSDIFF_FIX=1``;
+    only meaningful in the 30-token campaign config).
+
+    ROOT (verified spec_k=0 AUTHORITATIVE AR verdict via ``tools/cpu_full_trace``
+    AND teacher-forced ``tools/_probe_vt_head0_sistore.py`` + per-block
+    OUTPUT_LO attribution, campaign config, BUILT dims; absdiff_0 id1046
+    ``int abs_diff(int a,int b){if(a>b)return a-b;return b-a;} main(){return
+    abs_diff(16,85);}`` diverges at step 12, the 2nd LI = the arg-``b`` deref
+    inside the ``if(a>b)`` comparison): ``exp=(pc=74,ax=85) got=(pc=74,ax=80)``.
+    PC is correct; only AX byte-0's LO nibble is wrong (0x55 -> 0x50).
+
+    Arg ``a`` lives at BP-relative 0xFFE8 (addr byte-0 = 0xE8, lo-nibble 8) and
+    arg ``b`` at 0xFFE0 (addr byte-0 = 0xE0, lo-nibble 0). The L15 head-0
+    memory-lookup value delivery (value_scale=40) correctly content-addresses
+    ``b``'s pushed value row (CLEAN_EMBED=0x55) and delivers OUTPUT_LO+5 = +40,
+    but at this ZERO-lo-nibble arg address the same value row's CLEAN_EMBED_LO
+    ALSO carries the ADDRESS lo-nibble 0, so head-0 delivers OUTPUT_LO+0 = +67.5
+    as well. Attribution proves BOTH writes originate in block 35 (= logical
+    L15). At the LM head the byte-0 token 0x50 (hi=5 correct, lo=0 contaminated)
+    wins at logit 542 over the correct 0x55 at logit 403 (margin ~139), so byte-0
+    decodes ``value & 0xF0``. This affects ALL 25 absdiff cases (the arg-``b``
+    deref precedes the branch, so both taken and not-taken paths corrupt).
+
+    This is the documented L15 head-0 LI value-CAM zero-lo-nibble aliasing WALL:
+    the value nibble and the address nibble ALIAS in CLEAN_EMBED at a
+    zero-lo-nibble arg address, and var_simple's ``x`` at BP+0 (addr 0x00) shares
+    the exact separating signature, so every head-0 slot discriminator that
+    flips absdiff also regresses var_simple (blueprint, 3 attempts). The clean
+    fix needs an FFN-materialized (committed-zero-address) indicator dim so the
+    AND is done outside the bilinear head — a multi-block build, NOT a single
+    additive slot. DEFAULT OFF; flag-OFF registers NO rules -> byte-identical to
+    golden ``b1dcae63``. Kept as a dedicated kill-switch for the flag-regression
+    gate and the byte-identity gate.
+    """
+    return os.environ.get("C4_ABSDIFF_FIX", "0") == "1"
+
+
 def loaded_operand_add_hi15_clear_enabled() -> bool:
     """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
     clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),
