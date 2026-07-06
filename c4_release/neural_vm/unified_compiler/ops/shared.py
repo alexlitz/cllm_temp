@@ -1651,6 +1651,21 @@ def absdiff_fix_enabled() -> bool:
     additive slot. DEFAULT OFF; flag-OFF registers NO rules -> byte-identical to
     golden ``b1dcae63``. Kept as a dedicated kill-switch for the flag-regression
     gate and the byte-identity gate.
+
+    STATUS (measured, NOT net-positive — kept DEFAULT-OFF): the L10 tail-block
+    ``l10_absdiff_argb_li_lo`` corrector (a per-nibble OUTPUT_LO winner-take-all
+    gated on the head-0-delivered value LO nibble ``OUTPUT_LO+k`` + the 0xE0
+    address discriminator) was BUILT and measured on the authoritative AR
+    verdict (``cpu_full_trace --spec-k 0``). It REGRESSES its own target:
+    absdiff_0 goes from ``div_step=12`` (byte-0 lo nibble) OFF to ``div_step=1``
+    (``exp=(pc=210,ax=0) got=(pc=210,ax=2)``) ON — the ``OUTPUT_LO+k`` gate is a
+    RESIDUAL value that is nonzero on non-value-delivery rows too, so the
+    corrector over-fires at an earlier step. This CONFIRMS the wall: without an
+    FFN-materialized indicator dim, the value LO nibble cannot be re-stamped
+    cleanly (it aliases with residual OUTPUT_LO mass on other rows AND with the
+    address-0 contaminant on the value row). The corrector stays flag-OFF; do
+    NOT flip ON. Next session: build the (committed-zero-address) indicator dim
+    at L13/L14 and gate a MARK_AX-only head-0 slot on it (blueprint).
     """
     return os.environ.get("C4_ABSDIFF_FIX", "0") == "1"
 
