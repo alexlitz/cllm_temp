@@ -2377,6 +2377,19 @@ def compile_full_vm_dynamic(
                 and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
                 and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
             ),
+            # nested callee-ENT AX-dump over-fire FIX (#342, campaign-config,
+            # DEFAULT OFF, opt in =1, BAKE-affecting): appends a FETCHED-ENT
+            # ``OPCODE_BYTE_LO+6`` NOT-blocker to the L10 ``e8_alubp_memsp`` writer
+            # so the ON / OFF builds bake different L25-tail FFN weights and must
+            # never share a memo entry. Gated on the campaign LEA byte-0 relay so
+            # the non-campaign / golden build is byte-identical. DEFAULT OFF (does
+            # NOT track the campaign floor). See
+            # l10_ops._lea_e8_nested_ent_axdump_enabled.
+            "C4_NESTED_ENT_AXDUMP": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+                and os.environ.get("C4_NESTED_ENT_AXDUMP", "0") != "0"
+            ),
             # Operand-CAM frame-depth ALU-amplifier umbrella (campaign OFF by
             # default, opt in =1, BAKE-affecting): ``C4_OPCAM_FRAME=1`` turns on
             # the L10 multi-param LEA byte-0 ALU-AMPLIFIER (+4 L25-tail FFN
@@ -3259,6 +3272,18 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
             and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
+        ),
+        # nested callee-ENT AX-dump over-fire FIX (#342, campaign-config, DEFAULT
+        # OFF, opt in =1, BAKE-affecting): appends a FETCHED-ENT
+        # ``OPCODE_BYTE_LO+6`` NOT-blocker to the L10 ``e8_alubp_memsp`` writer so
+        # ON / OFF builds bake different L25-tail FFN weights and must never share
+        # a serialised entry. Gated on the campaign prerequisites so the
+        # non-campaign / golden build is byte-identical. DEFAULT OFF (does NOT
+        # track the campaign floor). See l10_ops._lea_e8_nested_ent_axdump_enabled.
+        "C4_NESTED_ENT_AXDUMP": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+            and os.environ.get("C4_NESTED_ENT_AXDUMP", "0") != "0"
         ),
         # Operand-CAM frame-depth ALU-amplifier umbrella (campaign OFF by
         # default, opt in =1, BAKE-affecting): ``C4_OPCAM_FRAME=1`` turns on the
