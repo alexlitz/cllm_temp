@@ -1797,6 +1797,7 @@ class MultiPassDivBlock(nn.Module):
                  q_lo, q_hi, r_lo, r_hi, op_div, op_mod, mark_ax,
                  ax_carry_lo=None, ax_carry_hi=None,
                  stack0_b1_lo=None, stack0_b1_hi=None,
+                 alu_lo=None, alu_hi=None,
                  campaign_clear=False, scratch_bands=None):
         super().__init__()
         self.pipeline = nn.Sequential(*passes)
@@ -1812,6 +1813,20 @@ class MultiPassDivBlock(nn.Module):
         self.mark_ax = int(mark_ax)
         self.ax_carry_lo = None if ax_carry_lo is None else int(ax_carry_lo)
         self.ax_carry_hi = None if ax_carry_hi is None else int(ax_carry_hi)
+        # Dividend (a) operand nibble bands = ALU_LO (a0) / ALU_HI (a1); the
+        # divisor (b) bands = AX_CARRY_LO (b0) / AX_CARRY_HI (b1). The p0_seed
+        # pass reads these four 16-cell one-hot bands at weight 1.0 assuming an
+        # incoming residual == 1.0 (the amplitude-normalized cascade convention
+        # in ``wide_alu_dsl``). On the REAL teacher-forced residual they carry
+        # max_abs ~72 (attention relays amplify the active lane; the L6 FFN can
+        # drive inactive lanes negative), so an un-clamped read seeds the
+        # cascade OFF its fixed point and the running residual explodes to
+        # ~1.5e37 -> inf -> NaN by pass 21. Clamping them to clean 0/1 one-hots
+        # at the block INPUT (matching the composite's
+        # ``GEToBDConverter._clean_onehot``) restores the seed invariant so the
+        # cascade stays numerically stable. See ``forward``.
+        self.alu_lo = None if alu_lo is None else int(alu_lo)
+        self.alu_hi = None if alu_hi is None else int(alu_hi)
         self.stack0_b1_lo = None if stack0_b1_lo is None else int(stack0_b1_lo)
         self.stack0_b1_hi = None if stack0_b1_hi is None else int(stack0_b1_hi)
         self.campaign_clear = bool(campaign_clear)
@@ -1827,6 +1842,41 @@ class MultiPassDivBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 0) OPERAND CLAMP (the NaN fix). The p0_seed pass reads the dividend
+        #    (ALU_LO/HI) and divisor (AX_CARRY_LO/HI) nibble one-hot bands at
+        #    weight 1.0, and the whole amplitude-normalized cascade assumes an
+        #    incoming residual of exactly 1.0 on every one-hot it consumes. On
+        #    the REAL teacher-forced residual those operand bands carry
+        #    max_abs ~72 (attention relays amplify the active lane; the L6 FFN
+        #    drives inactive lanes negative). An un-clamped read seeds the
+        #    cascade off its fixed point, so each pass AMPLIFIES instead of
+        #    renormalizing and the running residual explodes to ~1.5e37 -> inf
+        #    -> NaN by pass 21 (all-NaN block output -> frame collapse). The
+        #    composite ``FlattenedDivMod`` never hits this because its
+        #    ``GEToBDConverter._clean_onehot`` threshold-clamps the SAME four
+        #    bands to exact 0/1 one-hots before the convert. Mirror that here:
+        #    at the div/mod-AX rows ONLY (so no other op's operand read is
+        #    perturbed), replace each operand band with a clean 0/1 one-hot
+        #    ``(clamp(band, 0, 1) > 0.5)`` before the cascade runs. This is the
+        #    seed invariant the cascade was designed around, restored on the
+        #    real input. Gated rows outside div/mod-AX are byte-identical.
+        pre_mark = (x[:, :, self.mark_ax] > 0.5)
+        pre_div = (x[:, :, self.op_div] > 0.1) & pre_mark
+        pre_mod = (x[:, :, self.op_mod] > 0.1) & pre_mark
+        pre_dm = (pre_div | pre_mod)[:, :, None].to(dtype=x.dtype)  # [B, seq, 1]
+        operand_bands = [b for b in (self.alu_lo, self.alu_hi,
+                                     self.ax_carry_lo, self.ax_carry_hi)
+                         if b is not None]
+        if operand_bands and bool(pre_dm.any()):
+            x = x.clone()
+            for base in operand_bands:
+                band = x[:, :, base:base + 16]
+                clean = (torch.clamp(band, min=0.0, max=1.0) > 0.5).to(
+                    dtype=x.dtype
+                )
+                # Only overwrite on div/mod-AX rows; elsewhere keep the raw band.
+                x[:, :, base:base + 16] = clean * pre_dm + band * (1.0 - pre_dm)
+
         # 1) run the compute cascade (residual threaded through all passes).
         x = self.pipeline(x)
 
