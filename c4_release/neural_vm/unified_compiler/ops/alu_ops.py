@@ -2349,6 +2349,12 @@ def _build_multipass_div_post_op(block, dim_positions, S):
         ax_carry_hi=getattr(proxy, "AX_CARRY_HI", None),
         stack0_b1_lo=getattr(proxy, "STACK0_BYTE_VAL_1_LO", None),
         stack0_b1_hi=getattr(proxy, "STACK0_BYTE_VAL_1_HI", None),
+        # Operand bands the cascade reads (dividend a = ALU_LO/HI, divisor
+        # b = AX_CARRY_LO/HI). Passed so the block can clean-onehot-clamp them
+        # to the cascade's residual==1.0 seed invariant before the passes run
+        # (the NaN-on-real-residual fix — see MultiPassDivBlock.forward step 0).
+        alu_lo=getattr(proxy, "ALU_LO", None),
+        alu_hi=getattr(proxy, "ALU_HI", None),
         campaign_clear=campaign_clear,
         scratch_bands=scratch_bands,
     )
