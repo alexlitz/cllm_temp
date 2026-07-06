@@ -247,7 +247,19 @@ def _faithful_ffn_forward(ffn, x: torch.Tensor) -> torch.Tensor:
 
 
 _COMPOSITE_FFN = ("AddSub5StageBlock", "FlattenedALUMul", "ALUShiftComposite",
-                  "FlattenedDivMod", "FlattenedPureFFN")
+                  "FlattenedDivMod", "FlattenedPureFFN",
+                  # Campaign operand-recover / cell-clear wraps (l8/l10/l14).
+                  # These do NOT expose W_up/W_gate/W_down (they delegate to an
+                  # ``inner`` PureFFN after a cell edit), so the faithful forward
+                  # must run the real ``block.ffn(x)`` — exactly production. When
+                  # a campaign flag installs one of these (e.g.
+                  # ``LoadedOperandAddHi15ClearFFN`` for the func_add/max/min
+                  # ALU_HI cell-13 leak clear) treating it as composite runs the
+                  # real wrap; treating it as a plain PureFFN AttributeErrors on
+                  # ``W_up``.
+                  "LoadedOperandAddHi15ClearFFN", "CmpOperandSeRecoverFFN",
+                  "MulOperandSeRecoverFFN", "BitwiseOperandSeRecoverFFN",
+                  "ShiftOutputClearFFN")
 
 
 @dataclass
