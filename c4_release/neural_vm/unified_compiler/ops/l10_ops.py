@@ -1187,6 +1187,7 @@ from ..wide_alu_dsl import bitwise_rules
 from .residual_band_registry import register_residual_band
 from .shared import (
     _as_setdim_proxy,
+    absdiff_fix_enabled,
     loop_lea_b0_e0_restore_enabled,
     loop_lea_b0_e8_oplea_req_enabled,
     loop_lea_b0_e8_restore_enabled,
@@ -12366,6 +12367,171 @@ def make_l10_loop_lea_b0_e0_op() -> Operation:
         # so this is the LAST OUTPUT writer at the 2nd-local LEA row, dominating
         # the block-44 0x01 slam.
         requires={"after": "l10_loop_lea_b0_e8"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+# ===========================================================================
+# absdiff arg-b LI value byte-0 LO-nibble de-contamination (campaign; DEFAULT
+# OFF, opt in C4_ABSDIFF_FIX=1). See ``shared.absdiff_fix_enabled`` for the full
+# root. In one line: the 2-arg func arg-``b`` deref (LI at BP-relative 0xFFE0,
+# addr byte-0 lo-nibble 0) has its L15 head-0-delivered value LO nibble
+# out-competed at the LM head by the ALIASED address lo-nibble on the over-biased
+# OUTPUT_LO+0 default cell, so byte-0 decodes ``value & 0xF0`` (b=0x55 -> 0x50).
+# ===========================================================================
+_ABSDIFF_LI_LO_DOM = 30.0          # per-cell winner-take-all magnitude at S=100:
+#     restamped as +DOM/S on the delivered value nibble, -DOM/S on OUTPUT_LO+0.
+#     Head-0 delivers the value nibble at OUTPUT_LO+k ~=40 and the address-0
+#     contaminant at OUTPUT_LO+0 ~=67.5; +DOM on the value cell and -DOM on +0
+#     (both un-normalised residual writes, not softmax) flip the ~+27 deficit.
+_ABSDIFF_LI_LO_THRESHOLD = 4.0     # fires only when the arg-b-deref discriminator
+#     sum (below) clears it; every non-(arg-b LI) row stays silent.
+
+
+def _l10_absdiff_argb_li_lo_rules() -> tuple[FFNRule, ...]:
+    """15 rules: at the arg-``b`` deref LI row (addr 0xE0) re-stamp the delivered
+    NONZERO value LO nibble over the aliased address-0 default.
+
+    Each rule k in 1..15 is gated on the head-0-delivered ``OUTPUT_LO+k`` (the
+    value's own LO nibble, present at ~+40 for the arg-``b`` value) AND the
+    arg-``b``-deref discriminator, and writes ``+DOM`` to ``OUTPUT_LO+k`` and
+    ``-DOM`` to ``OUTPUT_LO+0`` so the genuine nonzero value nibble beats the
+    address-0 contaminant. k==0 is intentionally omitted: a genuinely-zero value
+    LO nibble MUST leave ``OUTPUT_LO+0`` untouched (no over-fire). The
+    discriminator REQUIRES ``ADDR_B0_LO+0`` (lo-nibble 0, i.e. 0xE0 -- excludes
+    func arg-``a`` @ 0xE8 which is ``ADDR_B0_LO+8``) AND ``ADDR_B0_HI+14``
+    (hi-nibble 0xE -- excludes var_simple ``x`` @ BP+0 == 0x00 which is
+    ``ADDR_B0_HI+0``), so it is a genuine arg-``b`` (deeper-frame 0xE0-addressed)
+    LI requirement, NOT a broad LI touch.
+    """
+    OPC_BLOCK = 500.0
+    owning_ops = tuple(
+        op for op in _L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS if op != "OP_JSR"
+    )
+    disc: tuple[tuple[str, float], ...] = (
+        ("MARK_AX", 100.0),
+        # GENUINE LI at MARK_AX (~+5.24 opcode broadcast).
+        ("OP_LI", 200.0),
+        # 0xE0 address signature: lo-nibble 0 (excludes 0xE8 arg-a) AND
+        # hi-nibble 14 (excludes 0x00 var_simple x). Large symmetric weights so
+        # the (lo0 AND hi14) address is a genuine requirement.
+        ("ADDR_B0_LO+0", 1000.0),
+        ("ADDR_B0_HI+14", 1000.0),
+        ("ADDR_B0_LO+8", -1000.0),   # NOT arg-a (0xE8)
+        # Genuine address-eval LEA rows carry MEM_ADDR_SRC; the LI value row does
+        # not. Hard NOT-block so this never touches an address-eval row.
+        ("MEM_ADDR_SRC", -1_000_000.0),
+        # HARD NOT-block IS_BYTE / every non-AX marker: fire ONLY on the AX
+        # value-byte-0 MARKER row (IS_BYTE=0, MARK_AX=1).
+        ("IS_BYTE", -1_000_000.0),
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
+        # No owning opcode may be live (an ALU/branch step must not be restamped).
+        *((op, -OPC_BLOCK) for op in owning_ops),
+    )
+    rules: list[FFNRule] = []
+    for k in range(1, 16):
+        rules.append(multi_way_and_rule(
+            name=f"l10_absdiff_argb_li_lo_{k}",
+            conditions=disc,
+            threshold=_ABSDIFF_LI_LO_THRESHOLD,
+            # gate on the head-0-delivered value LO nibble at cell k.
+            gate=f"OUTPUT_LO+{k}",
+            writes=(
+                (f"OUTPUT_LO+{k}", _ABSDIFF_LI_LO_DOM),
+                ("OUTPUT_LO+0", -_ABSDIFF_LI_LO_DOM),
+            ),
+        ))
+    return tuple(rules)
+
+
+def make_l10_absdiff_argb_li_lo_op() -> Operation:
+    """Flag-gated arg-``b`` deref LI value byte-0 LO de-contamination op.
+
+    Standalone ``PureFFN`` post_op attached to the L25 tail block AFTER
+    ``l10_loop_lea_b0_e0`` (so it is the LAST OUTPUT-LO writer at the arg-``b`` LI
+    row). Flag-OFF (or non-campaign / golden) produces ZERO rules and appends NO
+    post_op -> byte-identical to golden ``b1dcae63``. See
+    ``absdiff_fix_enabled`` / ``_l10_absdiff_argb_li_lo_rules``.
+    """
+    if not absdiff_fix_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_absdiff_argb_li_lo",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#registers",
+        )
+
+    rules = _l10_absdiff_argb_li_lo_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_absdiff_argb_li_lo",
+        reads={
+            "MARK_AX", "OP_LI", "MEM_ADDR_SRC", "IS_BYTE",
+            "ADDR_B0_LO", "ADDR_B0_HI",
+            "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
+            "OUTPUT_LO",
+            *_L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS,
+        },
+        writes={"OUTPUT_LO"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        # Run AFTER l10_loop_lea_b0_e0 so this is the LAST OUTPUT-LO writer at the
+        # arg-b LI row (it must dominate the L15 head-0 address-0 contamination).
+        requires={"after": "l10_loop_lea_b0_e0"},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=ir,

@@ -44,6 +44,7 @@ from .shared import si_store_addr_enabled  # noqa: F401
 from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
+from .shared import absdiff_fix_enabled  # noqa: F401
 from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
 from .shared import loop_si_byterow_marker_clear_enabled  # noqa: F401
 from .shared import loop_li_opcode_fetch_addrkey_clamp_enabled  # noqa: F401
@@ -785,6 +786,20 @@ def all_core_ops(
         *(
             [make_l10_loop_lea_b0_e0_op()]
             if loop_lea_b0_e0_restore_enabled() else []
+        ),
+        # absdiff arg-``b`` deref LI value byte-0 LO de-contamination (flag
+        # C4_ABSDIFF_FIX, DEFAULT OFF): a post_op attached AFTER
+        # l10_loop_lea_b0_e0 that re-stamps the head-0-delivered NONZERO value LO
+        # nibble over the aliased address-0 default on the 2-arg func arg-``b``
+        # LI (addr 0xE0). Gated on the arg-b-deref discriminator (OP_LI + MARK_AX
+        # + ADDR_B0_LO+0 + ADDR_B0_HI+14, excluding func arg-a @ 0xE8 and
+        # var_simple x @ 0x00), so it is a no-op on every non-arg-b-LI row.
+        # REGISTERED ONLY when the flag is on (lookahead-chain pattern) so a
+        # flag-off / golden build is byte-identical. See
+        # _l10_absdiff_argb_li_lo_rules / absdiff_fix_enabled.
+        *(
+            [make_l10_absdiff_argb_li_lo_op()]
+            if absdiff_fix_enabled() else []
         ),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =
