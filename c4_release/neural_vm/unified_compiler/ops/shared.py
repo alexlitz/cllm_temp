@@ -1027,18 +1027,30 @@ def cmp_combine_margin_enabled() -> bool:
     PROVABLY in {0, 1}, so its byte's HIGH nibble is ALWAYS 0 — there is no
     operand-dependent case where a comparison opcode legitimately writes a
     non-zero ``OUTPUT_HI``. So per comparison opcode we add ONE campaign-only
-    clamp unit (same gate as the default: ``MARK_SE_ONLY`` + relayed
-    ``SE_OP_<cmp>`` + the ``MARK_PC`` blocker) that DARKENS every non-zero
-    ``OUTPUT_HI_THIS_STEP+1..15`` nibble (strong negative) AND reinforces
-    ``OUTPUT_HI_THIS_STEP+0`` (positive), out-voting any leaked operand high
-    nibble at the decode row. Because the high nibble of a boolean result is
-    invariantly 0, the clamp CANNOT change any already-correct comparison (its
-    OUTPUT_HI is already 0-dominant) — it can only pull a leaked ``(hi<<4)`` back
-    to a clean low-nibble result. This is DISCRIMINATING (not the known Wave-B
-    zero-sum tail trade): it touches only ``OUTPUT_HI`` at the six comparison
-    opcodes' decode row, leaving ``OUTPUT_LO`` (the actual 0/1 result) and every
-    non-cmp opcode's OUTPUT_HI (which DO carry value high-nibbles, e.g. the
-    func_max RETURN value 0x63) UNTOUCHED.
+    clamp unit that DARKENS every non-zero ``OUTPUT_HI_THIS_STEP+1..15`` nibble
+    (strong negative) AND reinforces ``OUTPUT_HI_THIS_STEP+0`` (positive),
+    out-voting any leaked operand high nibble at the decode row.
+
+    SURGICAL GATE (2026-07). The clamp fires on
+    ``MARK_SE_ONLY`` + ``SE_OP_<cmp>`` + **``SE_CMP_GROUP+0``** + the
+    ``MARK_PC`` blocker (threshold 2.5 so ALL THREE positive markers are
+    required, not just two-of-three). The added ``SE_CMP_GROUP+0`` condition is
+    the FRESH-comparison discriminator: probing the SE step-end rows
+    (``tools/_probe_cmp_se_row_disc.py``) shows ``SE_CMP_GROUP`` is ~0.94 on the
+    genuine comparison-result decode row and ~0.00 on EVERY other SE row, while
+    ``SE_OP_<cmp>`` ALONE can survive as a stale/cross-frame leak on a
+    value-carrying row (a compare feeding a value — e.g. ``func_max``'s RETURN
+    value ``0x63`` in a deeper 30-token frame). Without the group flag the clamp
+    could clobber a legitimately-nonzero OUTPUT_HI high nibble on such a
+    non-comparison / value row; with it the clamp fires ONLY when THIS step's
+    opcode is a genuinely-relayed comparison whose result is provably in
+    {0, 1}. This CANNOT weaken the intended fix — every genuine comparison
+    decode carries ``SE_CMP_GROUP`` (the SAME L9 ``step_end_operand_relay`` that
+    mirrors ``OP_<cmp> -> SE_OP_<cmp>``). Because the high nibble of a boolean
+    result is invariantly 0, the clamp still cannot change any already-correct
+    comparison; it only pulls a leaked ``(hi<<4)`` back to a clean low-nibble
+    result. ``OUTPUT_LO`` (the actual 0/1 result) and every non-cmp opcode's
+    OUTPUT_HI (which DO carry value high-nibbles) stay UNTOUCHED.
 
     DEFAULT OFF. Opt-in via ``C4_CMP_COMBINE_MARGIN=1`` (campaign only). Kept as
     a dedicated kill-switch so ``tools/flag_regression_gate.py --flag
