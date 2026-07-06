@@ -569,6 +569,81 @@ def _lea_e8_first_ent_gate_enabled() -> bool:
     return _lea_byte0_memsp_relay_enabled()
 
 
+def _lea_e8_nested_ent_axdump_enabled() -> bool:
+    """Flag for the NESTED callee-ENT AX-dump over-fire FIX (#342) — hard-block
+    the ``e8_alubp_memsp`` BP-8 0xE8 writer on the FETCHED-ENT-opcode one-hot so
+    it stops stamping 0xE8 over the carried AX on a genuine callee ENT step in a
+    NESTED call (``nested_sumsq`` / ``nested_quad``, ~25).
+
+    DEFAULT OFF (opt in via ``C4_NESTED_ENT_AXDUMP=1``) — unlike the sibling
+    campaign gates, this fix does NOT track the campaign floor, so the golden
+    default build (flag unset) is byte-identical.
+
+    The wall this lifts (verified bit-exact ``cpu_full_trace --spec-k 0``, BUILT
+    dims, the DEFAULT 30-token campaign config; ``nested_sumsq`` id975
+    ``int square(int x){return x*x;} int sum_squares(int a,int b){return
+    square(a)+square(b);} main{sum_squares(2,2);}``): the run diverges at the
+    inner ``square()`` callee ENT step, where the AX register MUST preserve the
+    carried prior AX (the argument value that was just pushed / the running sum),
+    but the AX dump emits **0xFFE8** — byte-0 = 0xE8, the stale BP-8 LEA local
+    address from the first-level frame's ``&a`` LEA — instead of the carried
+    value.
+
+    ROOT (the SAME class as #345's if_var main-ENT 744-leak, one nesting level
+    deeper): the campaign keystone ``tail_lea_local_ax_byte0_e8_alubp_memsp``
+    (the BP-8 0xE8 LEA byte-0 writer, strength 1e6) FIRES on the callee ENT
+    AX-marker row. Its ``_lea_e8_first_ent_gate_enabled`` branch adds
+    ``("OP_ENT", +100)`` to distinguish the FIRST-LEA-after-ENT from the re-read
+    LEA — but ``OP_ENT`` is a CROSS-STEP-PERSISTENT residue that is ALSO high
+    (~+5.24, saturating the AND-sum well past the +60 threshold bump) on the
+    genuine callee ENT step itself, so the 0xE8 slam over-fires and stamps 0xE8
+    over the carried AX. The ``e0_fetch_memsp`` 0xE0 writer does not rescue it
+    (this is a BP-8 frame, not a 2nd-local re-read).
+
+    THE FIX (mirrors #345 ``_tail_lea_e8_ent_byte0_blockers``): append the SHARP
+    per-step FETCHED ENT opcode low-nibble one-hot ``OPCODE_BYTE_LO+6`` as a hard
+    NOT-blocker on the e8 writer. It is +1.0 EXACTLY on a genuine ENT step (ENT =
+    C4 opcode 6 = 0x06) and 0.0 on a genuine LEA AX-marker row (which carries
+    ``OPCODE_BYTE_LO+0``), so the legit BP-8 LEA byte-0 0xE8 emit — including
+    func's first-LEA ``&a`` / ``&x`` and the nested first-level ``&a`` — is
+    byte-identical; only the callee-ENT rows where the 0xE8 slam is WRONG are
+    vetoed, leaving the upstream ``ent_ax_passthrough`` (``AX_CARRY -> OUTPUT``)
+    to survive to the LM head. This is the CURRENT-fetched-opcode discriminator
+    the persistent ``OP_ENT`` residue lacks.
+
+    Note ``_tail_lea_e8_ent_byte0_blockers`` (#345) blocks the LEGACY
+    ``tail_lea_local_ax_marker_byte0_e8`` corrector, NOT this campaign
+    ``e8_alubp_memsp`` keystone (which the golden build never emits), so this is
+    an INDEPENDENT blocker on a distinct writer.
+
+    DEFAULT tracks its OWN env var (DEFAULT OFF, NOT floored ON by the campaign)
+    AND requires ``_lea_byte0_memsp_relay_enabled()`` (the e8 writer's campaign
+    branch): the NOT-blocker is appended ONLY when both hold, so flag-OFF,
+    ``C4_NO_STACK0_EMIT=0``, or the 35-token golden build are all byte-identical
+    to the pre-fix default. Dedicated kill-switch so ``tools/
+    flag_regression_gate.py --flag C4_NESTED_ENT_AXDUMP`` can A/B it.
+    """
+    return (
+        os.environ.get("C4_NESTED_ENT_AXDUMP", "0") != "0"
+        and _lea_byte0_memsp_relay_enabled()
+    )
+
+
+def _lea_e8_nested_ent_axdump_blockers() -> tuple:
+    """FETCHED-ENT NOT-blocker for the campaign ``e8_alubp_memsp`` 0xE8 byte-0
+    writer (nested callee-ENT AX-dump fix, #342).
+
+    Empty unless ``_lea_e8_nested_ent_axdump_enabled`` (byte-identical off). When
+    active, hard-blocks the writer on the per-step FETCHED ENT opcode one-hot
+    ``OPCODE_BYTE_LO+6`` so it cannot stamp the BP-8 0xE8 over the carried AX on a
+    genuine callee-ENT AX-marker row. Byte-identical on genuine LEA rows
+    (``OPCODE_BYTE_LO+6 == 0`` there).
+    """
+    if not _lea_e8_nested_ent_axdump_enabled():
+        return ()
+    return ((_ENT_GUARD_OPCODE_LO, -1_000_000_000.0),)
+
+
 def _lea_byte0_memsp_relay_enabled() -> bool:
     """Flag for the PHASE-2 KEYSTONE — the campaign LEA byte-0 address relay
     (ROOT 1, gates func_identity step-6 + var_mul/three multi-local + nested).
@@ -10840,6 +10915,14 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 ("MARK_BP", -10000.0),
                 ("MARK_STACK0", -10000.0),
                 ("MARK_MEM", -10000.0),
+                # #342 nested callee-ENT AX-dump FIX: the SHARP per-step FETCHED
+                # ENT opcode one-hot ``OPCODE_BYTE_LO+6`` (== 1.0 on a genuine ENT
+                # step, 0.0 on a genuine LEA row = ``OPCODE_BYTE_LO+0``) hard-blocks
+                # this 0xE8 slam on the nested callee-ENT AX-marker row, where the
+                # persistent ``OP_ENT`` residue over-fires the writer over the
+                # carried AX. Empty (byte-identical) unless C4_NESTED_ENT_AXDUMP=1.
+                # See ``_lea_e8_nested_ent_axdump_enabled``.
+                *_lea_e8_nested_ent_axdump_blockers(),
             ) + ((
                 # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX: gate on the
                 # FIRST-LEA-after-ENT ``OP_ENT`` residue (~+1.19 on the first LEA,
