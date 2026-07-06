@@ -4767,6 +4767,21 @@ def _l15_attention_resize_structural_ir(dim_positions, head_dim) -> CompilerIR:
     # unaffected -- the LEV PC-restore head only matters for >16-layer LEV
     # builds where the return-address restore path exists.
     _lev_target = _L15_MAX_HEADS  # 15 (flag on) or 14 (flag off)
+    # SURGICAL ALiBi neutralization (C4_SI_STORE_ADDR, campaign, DEFAULT-OFF):
+    # appending the SI-store CAM as head 16 grows the L15 head count 16->17,
+    # which -- via the ``2**(-8/N*(i+1))`` slope formula -- would RECOMPUTE the
+    # ALiBi recency slope of EVERY resized head (heads 4-11 LEV saved_bp/pop_d8/
+    # return_addr, head 14 lev_pc_restore) with N=17 instead of N=16. That is a
+    # BROAD perturbation: it shifts the recency tie-break of the load-bearing
+    # frame-restore heads on every func/rec/nested/loop program, regressing
+    # unrelated clusters even though the new head only fires on SI/LI rows. Fix:
+    # decouple the slope FORMULA's N from the physical head count. With the SI
+    # head on we still ALLOCATE 17 slots but compute slopes as if N==16, so
+    # heads 0-15 keep byte-identical slopes to the (savedra) 16-head build; the
+    # SI head (16) gets its own 0.05 slope from its head spec post-resize. When
+    # the flag is off ``alibi_slope_num_heads`` is None -> standard behaviour ->
+    # golden byte-identical.
+    _slope_n = 16 if si_store_addr_enabled() else None
     ir.layer(0).structural_ops.append(
         StructuralOp(
             kind="attention_resize",
@@ -4775,6 +4790,7 @@ def _l15_attention_resize_structural_ir(dim_positions, head_dim) -> CompilerIR:
             layers_threshold=16,
             alibi_pin_value=0.05,
             alibi_pin_count=4,
+            alibi_slope_num_heads=_slope_n,
             follow_up=_l15_attention_resize_follow_up,
             metadata={
                 "op_name": "l15_attention_resize",
