@@ -2516,6 +2516,14 @@ def compile_full_vm_dynamic(
             # the ON / OFF builds MUST NEVER share a memo / disk entry. DEFAULT-OFF
             # -> golden (35-tok) build is byte-identical (key unchanged when unset).
             "C4_CAMPAIGN": campaign_enabled(),
+            # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt
+            # out =0, BAKE-affecting): when active it appends a 32-unit PureFFN
+            # post_op to the L25 tail block (the 6-way NEXT_* OUTPUT sink), so
+            # the ON / OFF builds have different state_dicts and MUST NEVER share
+            # a memo entry. Gated (like the op) on ``_no_stack0_emit`` so the OFF
+            # build's key differs iff the op would actually bake. See
+            # l0_ops._clean_emitter_enabled.
+            "C4_CLEAN_EMITTER": (os.environ.get("C4_CLEAN_EMITTER", "1") != "0"),
             # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255
             # per-value AND) -> COMPUTED (32 per-nibble route) collapse
             # (DEFAULT-OFF, opt in =1). Changes the L10-tail FFN hidden_dim
@@ -3383,6 +3391,11 @@ def _bake_from_scheduled_ops(
         # share a serialised entry. DEFAULT-OFF -> golden (35-tok) build is
         # byte-identical (key unchanged when unset).
         "C4_CAMPAIGN": campaign_enabled(),
+        # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt out
+        # =0, BAKE-affecting): appends a 32-unit PureFFN post_op to the L25 tail
+        # block, so the ON / OFF builds have different state_dicts and MUST NEVER
+        # share a serialised entry. See l0_ops._clean_emitter_enabled.
+        "C4_CLEAN_EMITTER": (os.environ.get("C4_CLEAN_EMITTER", "1") != "0"),
         # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255 per-value
         # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-ON, kill-switch
         # =0). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,

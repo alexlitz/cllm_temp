@@ -1,13 +1,19 @@
 # CLEAN EMITTER — scope + first increment (the ≠STEP_TOKENS framing megaroot)
 
-**Status:** SCOPE + PILOT (multi-session megaroot-fix; this doc is increment 0 of
-the `C4_CLEAN_EMITTER` build). Feeds `docs/semantic_spec_EMIT_FRAMING.md` §G5
-(the "≠STEP_TOKENS drift is a LOWERING misfire, not SPEC" gap).
-**Golden gate:** flag-OFF (`C4_CLEAN_EMITTER` unset) `tools/_isa_golden_hash.py`
-== `91f5541100d9a9ec7081105a6bde83f9de5c65cc62317a62bf108bdc93aa56c1`
-(`91f55411`), byte-identical before and after this increment. The scope doc is
-committed FIRST (no weight change); the increment is committed second (gated
-default-OFF, byte-identical when unset).
+**Status:** LANDED (multi-session megaroot-fix). Increments 0-1 shipped: the
+`C4_CLEAN_EMITTER` op is now **DEFAULT ON** (PROVEN net-positive on the full
+1096: 516 → 525, +9, full_trace spec_k=0 cap-600) and the two subsumed point-fix
+correctors (`no_stack0_se_output_clear` + `no_stack0_mem_marker_output_clear`,
+plus the `C4_MEM_MARKER_OUTPUT_CLEAR` kill-switch) are DELETED. Feeds
+`docs/semantic_spec_EMIT_FRAMING.md` §G5.
+**Golden gate:** the bare-env `tools/_isa_golden_hash.py` golden moved from
+`91f55411` (pre-flip) to
+`b1dcae630381bbe93ece7a53efbeadf4a6fefef0227db8fa17fba81d76ad53f5` (`b1dcae63`)
+— an INTENDED verdict-change (because `C4_NO_STACK0_EMIT` defaults ON, the bare
+env now bakes the emitter). On the pre-deletion tree `C4_CLEAN_EMITTER=0`
+reproduced `91f55411`; that escape hatch is retired now the correctors are gone.
+The narrative below is the ORIGINAL increment-0 scope (default-OFF pilot); the
+"default OFF" language is historical.
 
 This is the SURVEY-R1 biggest verdict lever (~760 programs: var / expr / if /
 bool / nested / loops / func). It documents the EXACT drift mechanism from the
