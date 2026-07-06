@@ -64,10 +64,15 @@ def _jsr_ax_clean_enabled() -> bool:
     That polluted index becomes the step-0 AX register (0xF7F7F7.. in
     test_jsr_then_lev_simple; the gcd(50) + rec_fib(25) + rec_power(25)
     step-0 cluster wall). When ON, a matched negative-clear band cancels the
-    passthrough's OUTPUT write EXACTLY on the polluted low-target JSR-to-main
-    path (small / byte1==0 entry target, TEMP[0]=IS_JSR ∧ ¬FETCH_HI), so the
-    leaked bytes are zeroed and JSR-to-main leaves a clean step-0 AX. OFF ->
-    no clean rules are emitted -> golden byte-identical.
+    passthrough's OUTPUT write EXACTLY on the polluted entry JSR-to-main path,
+    discriminated by ``HAS_SE`` (the first-step marker): the entry ``JSR main``
+    carries ``HAS_SE ~= 0`` at its AX-marker row while every NESTED JSR (a
+    recursive call / any post-first JSR) carries ``HAS_SE ~= 0.99`` and a REAL
+    caller AX the passthrough must preserve. The clean band therefore fires
+    ONLY on the first step, so the leaked bytes are zeroed on JSR-to-main while
+    the legitimate nested-call AX passthrough is left intact (the pre-narrowing
+    blanket cancel zeroed the nested AX too -> the flag-ON func/rec/nested
+    regression). OFF -> no clean rules are emitted -> golden byte-identical.
     """
     import os as _os
     return _os.environ.get("C4_JSR_AX_CLEAN", "0") != "0"
@@ -546,10 +551,32 @@ def _function_call_jsr_ax_clean_rules(S: float) -> tuple[FFNRule, ...]:
     On the entry JSR-to-main this zeroes the amplified undefined-AX_CARRY
     pollution; the callee's genuine return value is materialized later by the
     LEV teardown, not by this step. Only appended when the flag is ON.
+
+    SURGICAL NARROWING (``HAS_SE`` first-step gate): the cancel fires ONLY on
+    the program-entry ``JSR main`` (the *only* JSR whose AX_CARRY is undefined
+    WEAK garbage). A NESTED JSR (a recursive call / any JSR after the first
+    step) carries a REAL caller AX that the passthrough legitimately copies to
+    OUTPUT, so blanket-cancelling it there was load-bearing damage (broke
+    passing func/rec/nested programs -> the flag-ON regression). ``HAS_SE`` is
+    the established first-step discriminator (L5 ``first_step_at_pc`` decode is
+    ``HAS_SE == 0``-gated; L16 uses the same ``HAS_SE`` split to separate the
+    initial top-level JSR from local-frame JSRs). Probe (spec_k=0, campaign
+    config, block 7 pre-passthrough) at the AX-marker row:
+      * ENTRY JSR-to-main (rec_factorial/rec_sum id700/750):
+        ``HAS_SE = +0.000``, AX_CARRY WEAK (mag ~0.45) -> polluted, MUST clean.
+      * NESTED JSR (same programs, later step): ``HAS_SE = +0.993``, AX_CARRY a
+        strong one-hot (mag ~1.0) -> legitimate caller AX, MUST preserve.
+    A strong ``-10.0`` HAS_SE penalty drops the AND below threshold on any
+    non-first step (``6.0 - 10.0*0.993 < 4.0``) while leaving the entry step
+    firing (``6.0 - 10.0*0.0 = 6.0 >= 4.0``). Byte-identical when the flag is
+    OFF (no clean rules emitted at all).
     """
     T = 4.0
     write_scale = 2.0 / S
-    conditions = (("OP_JSR", 1.0), ("MARK_AX", 1.0))
+    # HAS_SE (first-step marker) is ~0 on the program-entry JSR-to-main and
+    # ~0.99 on every later (nested) JSR; the -10.0 penalty confines the cancel
+    # to the entry step where AX is undefined garbage.
+    conditions = (("OP_JSR", 1.0), ("MARK_AX", 1.0), ("HAS_SE", -10.0))
     rules: list[FFNRule] = []
     for k in range(16):
         rules.append(multi_way_and_rule(
