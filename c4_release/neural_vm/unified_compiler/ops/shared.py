@@ -1984,6 +1984,46 @@ def store_ax_b0_override_enabled() -> bool:
     )
 
 
+def store_ax_b0_override_v2_enabled() -> bool:
+    """Return True iff the SI/SC store-AX byte-0 OUTPUT materializer uses the
+    zero-default OVERRIDE write form *with an ALU/cmp opcode ANTI-CONDITION gate*
+    (the "clean discriminator" V2). DEFAULT **OFF** (``C4_STORE_AX_B0_OVERRIDE_V2``,
+    opt in ``=1``); gated behind the two campaign flags so the flag-OFF golden
+    (35-tok) build is byte-identical.
+
+    WHY V2 (root: var_three id300 / var_mul step-9 SI-store; task this session):
+    the plain ``C4_STORE_AX_B0_OVERRIDE`` (default OFF since 7869e5c3) FIXES the
+    store step (var_three id300 SI-of-b step-9: AX byte-0 token 0 -> 6, GPU/CPU
+    teacher-forced verified) but was reverted OFF because "ON amplified the
+    l16_store_ax_carry misfire onto ADD/SUB/cmp/mul rows (-24)". The plain
+    ``store_ax_conditions`` gate (``OP_SI + OP_SC + MARK_AX - 8*MARK_PC -
+    10*IS_BYTE - 20*OP_EXIT - 20*OP_JMP``, threshold 4.0) does NOT explicitly
+    forbid the ALU/cmp opcodes, so any residual OP_SI/OP_SC energy at an
+    ADD/SUB/MUL/DIV/MOD/cmp AX-marker row can lift the AND-gate ``up`` above zero
+    and let the strong ``-W`` OUTPUT_LO+0 write bleed onto the arithmetic result
+    byte. V2 adds a large-negative anti-condition on every ALU/cmp opcode flag
+    (``-20`` each) so the AND-gate ``up`` is driven deeply negative (silu -> 0) on
+    ANY ADD/SUB/MUL/DIV/MOD/EQ/NE/LT/GT/LE/GE row — the override CANNOT fire there
+    by construction, while a genuine SI/SC store row (all ALU/cmp flags ~0) is
+    unaffected. This is the clean store-only discriminator the plain override
+    lacked. Rule COUNT is unchanged (only the SI/SC store rules' condition tuple +
+    write tuples change, and only when V2 is ON), so the flag-OFF golden bake is
+    byte-identical.
+
+    Mutually exclusive with the plain override in practice: enable EITHER
+    ``C4_STORE_AX_B0_OVERRIDE=1`` (broad, un-discriminated) OR
+    ``C4_STORE_AX_B0_OVERRIDE_V2=1`` (discriminated). If both are set, V2 wins (the
+    anti-condition gate is the strict superset guard). Output-affecting only inside
+    the campaign; flag OFF (or off-campaign) keeps the bare additive ``2.0/S``
+    write (golden ``f725c06e`` byte-identical).
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "0") != "0"
+    )
+
+
 def loop_lea_b0_e8_restore_enabled() -> bool:
     """Return True iff the loop_sum in-loop ``LEA &i`` byte-0 0xE8 RESTORE
     (``C4_LOOP_LEA_B0_E8``) is active.
