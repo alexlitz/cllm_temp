@@ -45,6 +45,7 @@ from .shared import l8_operand_sp_disc_enabled  # noqa: F401
 from .shared import sili_b1_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
 from .shared import absdiff_fix_enabled  # noqa: F401
+from .shared import absdiff_ret_byte1_enabled  # noqa: F401
 from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
 from .shared import jsr_bp_byte3_clear_enabled  # noqa: F401
 from .shared import loop_si_byterow_marker_clear_enabled  # noqa: F401
@@ -820,6 +821,20 @@ def all_core_ops(
         *(
             [make_l10_absdiff_argb_li_lo_op()]
             if absdiff_fix_enabled() else []
+        ),
+        # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker de-contamination
+        # (flag C4_ABSDIFF_RET_BYTE1, DEFAULT OFF): a post_op attached AFTER
+        # tail_bit32_result_correction that, on the AX value-byte rows of the
+        # LEV-return context (H2_PREV_STEP+0 + IS_BYTE, marker-gates OFF), forces
+        # the spurious OUTPUT_LO high-byte nibble back to 0 -> AX byte-1/2/3
+        # decode as 0. Fixes the absdiff step-22 (ADJ-after-LEV) 0x01 leak driven
+        # by l6_psh_stack0_marker_final_lo_1 mis-firing on the non-binary stale
+        # ALU_LO. REGISTERED ONLY when the flag is on (lookahead-chain pattern) so
+        # a flag-off / golden build is byte-identical. See
+        # _l10_absdiff_ret_byte1_rules / absdiff_ret_byte1_enabled.
+        *(
+            [make_l10_absdiff_ret_byte1_op()]
+            if absdiff_ret_byte1_enabled() else []
         ),
         # Multi-byte ADD high-byte adder (2026-06-12): appends a post_op
         # AFTER tail_bit32_result_correction that writes OUTPUT byte 1 =

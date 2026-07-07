@@ -1670,6 +1670,64 @@ def absdiff_fix_enabled() -> bool:
     return os.environ.get("C4_ABSDIFF_FIX", "0") == "1"
 
 
+def absdiff_ret_byte1_enabled() -> bool:
+    """Return True iff the absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
+    de-contamination is active (DEFAULT OFF — opt in via
+    ``C4_ABSDIFF_RET_BYTE1=1``; only meaningful in the 30-token campaign config).
+
+    ROOT (block-input attribution via ``tools/interp_oracle_gate`` +
+    ``tools/_probe_absdiff_ret_byte1.py``, spec_k=0 campaign, BUILT dims,
+    golden ``f725c06e``; absdiff_0 id1046, absdiff_7 id1053, absdiff_8 id1054):
+    on the ADJ step that IMMEDIATELY FOLLOWS the ``abs_diff`` LEV (function
+    return) — the failure-map "step-22" — the AX byte-1 predictor row emits
+    token ``0x01`` instead of ``0`` (``got_ax_bytes=[69,1,0,0]`` for
+    ``|16-85|=69``). The AX byte VALUE is decoded from the ``OUTPUT_LO`` nibble
+    one-hots (``W[1]-W[0]`` peaks at ``OUTPUT_LO+1`` / ``OUTPUT_LO+0``), and at
+    the leak row ``OUTPUT_LO+0`` is crushed to ``-199.5`` while ``OUTPUT_LO+1``
+    rises to ``+9.1`` -> the argmax nibble is 1 -> byte 0x01.
+
+    The runtime-dominant writer of ``OUTPUT_LO+1`` there is
+    ``layer6_routing_ffn :: l6_psh_stack0_marker_final_lo_1`` (contrib +9.94 vs
+    the clean_emitter default +0.96). That L6 rule is a 3-way AND
+    ``PSH_AT_SP AND MARK_STACK0 AND ALU_LO+1`` (threshold 2.5, unit weights) that
+    is only meant to fire at a genuine PSH-STACK0 marker step. On the post-LEV
+    ADJ step BOTH ``PSH_AT_SP`` and ``MARK_STACK0`` are 0, but ``ALU_LO+1`` reads
+    a NON-BINARY ``5.81`` (stale ALU low-nibble after the SUB) which alone clears
+    the AND threshold — so the AND mis-fires and stamps the value-1 nibble into
+    ``OUTPUT_LO``. This is NOT the ``H*_DUMP_OUT`` byte-1 dump path (already
+    killed at LEV by ``C4_LEV_AX_BYTE1_KILL``); it is the parallel OUTPUT-band
+    decode leak that still wins.
+
+    FIX (this flag, correct-by-construction, CLEAN DISCRIMINATOR): on the AX
+    value-byte rows of the LEV-return step — ``OP_LEV`` (the return-context
+    opcode marker, > 0.8 ONLY on the ADJ/return step, PATH-INDEPENDENT across
+    both the ``a>b`` true and false absdiff paths, and decaying AX~1.1 > SP~0.9 >
+    BP~0.6 across the step) AND ``IS_BYTE`` (a value byte, excludes the
+    byte-0/MARK_AX row so byte-0 keeps its real nibble) AND the ELEVATED
+    ``OUTPUT_LO+k`` leak itself (additive threshold, so the ~1.0 clean nibble
+    baseline stays dark) AND ``NOT PSH_AT_SP`` AND ``NOT MARK_STACK0`` (the L6
+    marker rule's own gates are provably OFF here, so its OUTPUT_LO write is
+    spurious) — for each nibble k in 1..15, write ``-DOM`` to ``OUTPUT_LO+k`` and
+    ``+DOM`` to ``OUTPUT_LO+0`` so the AX high bytes decode nibble-0 -> byte
+    value 0. (An earlier ``H2_PREV_STEP+0`` discriminator was PATH-DEPENDENT — 0
+    on the ``a>b`` true path — and over-fired on the clean nibble baseline via a
+    multiplicative gate; the current OP_LEV + additive-threshold form is the
+    robust one.)
+
+    SAFETY: every absdiff / func_* / nested_* return value is <= 255, so AX bytes
+    1..3 are ALWAYS 0 at a return step — forcing OUTPUT_LO to nibble-0 there is
+    exactly correct, the same invariant ``C4_LEV_AX_BYTE1_KILL`` relies on. The
+    OP_LEV threshold + elevated-``OUTPUT_LO+k`` requirement keeps this off every
+    non-AX byte row (SP/BP decode, which ALSO reads OUTPUT_LO, has clean ~1.0
+    low nibbles at the return step so it never crosses the threshold) and off the
+    pre-LEV steps (OP_LEV=0); ``IS_BYTE`` keeps byte-0's real nibble; the marker
+    NOT-gates keep it off a genuine PSH-STACK0 rewrite. DEFAULT OFF; flag-OFF
+    registers NO rules -> byte-identical to golden ``f725c06e``. Kept as a
+    dedicated kill-switch for the flag-regression gate and the byte-identity gate.
+    """
+    return os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
+
+
 def loaded_operand_add_hi15_clear_enabled() -> bool:
     """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
     clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),
