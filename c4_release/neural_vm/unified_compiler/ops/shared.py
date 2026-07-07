@@ -1739,6 +1739,44 @@ def funcadd_alu_hi13_clear_enabled() -> bool:
     return os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
 
 
+def func_add_b0_hinib_enabled() -> bool:
+    """Return True iff the func-return ADD byte-0 HIGH-nibble over-count fix is
+    active — the ALL-CELL magnitude-windowed ALU_HI operand-B-bleed clear
+    (DEFAULT-OFF ``C4_FUNC_ADD_B0_HINIB``; opt in with =1). Gated behind the same
+    ``no_stack0_emit`` + ``loaded_operand_add_hi15_clear_enabled`` campaign chain
+    as the cell-13/15 clear, so the flag-OFF golden (35-tok) build is
+    byte-identical (the widened cell set is never installed off the campaign).
+
+    ROOT (BUILT-layout residual probe, campaign default, spec_k=0,
+    ``tools/_probe_funcadd_operand.py``): ``func_add`` (id 578 add(42,78)=0x78
+    got 0xB8, +0x40) diverges at step 13 = the ``a + b`` return ADD. The
+    operand-A high nibble (``a`` loaded from ``mem[BP+off]``) arrives in
+    ``ALU_HI`` as a TWO-hot: the true ``a//16`` cell (~+6.0) PLUS a spurious
+    ``~+1.0`` one-hot at the cell equal to **operand-B's high nibble**
+    (``b//16``). This is operand-B's high nibble bleeding through the L8 head-5
+    mem-to-ALU operand-A read into ALU_HI (measured cell-by-cell: id578 b_hi=4 ->
+    leak@4; id588 b_hi=3 -> leak@3, ALWAYS == b//16, ALWAYS ~1.0). The block-13
+    AddSub high-nibble add then reads the two-hot k-weighted sum
+    ``a_hi + b_hi`` for operand A, so the ADD result high nibble becomes
+    ``(a_hi + b_hi) + b_hi + carry`` = the true ``a_hi + b_hi + carry`` plus an
+    EXTRA ``b_hi`` -> ``+0x{b_hi}0`` over-count (the observed +0x30/+0x40/+0x50).
+    The prior cell-13 (0xD frame-address) clear does NOT catch this leak because
+    the leak cell is operand-B's high nibble (0x3/0x4/0x5), not the frame nibble.
+
+    THE FIX: the leak (~1.0) and the true operand one-hot (~6.0, >= ``CLEAN_MAX``)
+    are cleanly magnitude-separated by the SAME contaminant window the cell-13/15
+    clear uses. So extend ``LoadedOperandAddHi15ClearFFN``'s contaminant cell set
+    to ALL 16 ALU_HI cells: the window ``(0.5, CLEAN_MAX=5.85)`` clears the ~1.0
+    operand-B bleed while PRESERVING the ~6.0 true operand-A high-nibble one-hot.
+    Value-safe by construction (a true loaded operand-A high nibble is always
+    delivered at the SCALE_O ~6.0 magnitude; no legitimate operand cell sits in
+    the (0.5, 5.85) window). ADD-only opcode gate (unchanged) so it is inert on
+    every non-ADD row. Flips the 12/25 func_add whose operand-B high nibble is
+    non-zero (b >= 48); rides to func_max/min's loaded-operand return ADD.
+    """
+    return os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
+
+
 def operand_cam_fix_enabled() -> bool:
     """Return True iff the operand-CAM address-leak clear is WIDENED past OP_ADD
     to the loaded-operand SUB / MUL / MOD / DIV + six-CMP operand-delivery rows

@@ -1031,6 +1031,17 @@ def make_loaded_operand_add_hi15_clear_op() -> Operation:
         contam_cells = (15,)
         if funcadd_alu_hi13_clear_enabled():
             contam_cells = (13, 15)
+        # C4_FUNC_ADD_B0_HINIB (default-OFF): the func-return ADD leaks
+        # operand-B's high nibble (~+1.0) into operand-A's ALU_HI at a cell that
+        # VARIES with the operand (cell == b//16), not a fixed frame nibble. The
+        # ~1.0 leak vs the ~6.0 true one-hot are cleanly separated by the SAME
+        # contaminant window (0.5, CLEAN_MAX=5.85), so widen the ALU_HI clear to
+        # ALL 16 cells — the window preserves the true operand and zeros only the
+        # in-window bleed. ADD-only + ALU_HI-only + magnitude-windowed => value-
+        # safe by construction. See ``shared.func_add_b0_hinib_enabled``.
+        from .shared import func_add_b0_hinib_enabled
+        if func_add_b0_hinib_enabled():
+            contam_cells = tuple(range(16))
         # C4_OPERAND_CAM_FIX (default-OFF): widen the ADD-only ALU_HI clear to
         # the other loaded-operand consumers (SUB/MUL/MOD/DIV + six CMP). The
         # ALU_HI-only, same-cell (13/15), same-window discriminator is
