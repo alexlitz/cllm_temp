@@ -11,9 +11,10 @@ Status: **COMPLETE (scope + design).** Phase 2 builds the fix.
 
 ## 0. TL;DR — root cause, corrected
 
-The step-0 AX `0xE8`/`0xE0` slam on `if_gt` / `if_eq` / `func_max` / `func_min`
-(id360 `8>27` wants AX byte-0 `0x08`, gets `0xe8`; id402 `16==9` wants `0x10`,
-gets `0xe0`) is **NOT** owned by
+The step-0 AX `0xE8`/`0xE0` slam on `if_gt` / `if_eq` (id360 `8>27` wants AX
+byte-0 `0x08`, gets `0xe8`; id402 `16==9` wants `0x10`, gets `0xe0`) — and any
+if/expr program whose comparison operand ends in nibble 0/8 with `OP_LEA == 0`
+— is **NOT** owned by
 `layer16_lev_routing::l16_psh_mem_addr0_restore_lo_8` / `_restore_hi_14` (the
 rules the brief named). That attribution is a **CIRCULAR artifact** of the
 gate's attribution reading the FINAL pre-head residual (where the leaked
@@ -182,11 +183,21 @@ contribution is ~0 while they actively CORRUPT the structured
 
 **Blast radius:** only rows where the in-step operand's low nibble is exactly
 **8** (→ e8 false-fire, `FETCH_LO+8` high) or **0** (→ e0 false-fire,
-`FETCH_LO+0` high) AND `OP_LEA == 0`. Comparison/if/func programs with such an
-operand flat-diverge at step 0/1 (id360 `8>…`, id402 `16==…`, `func_max`/
-`func_min` at the arg-load step). Verified via gate ON vs OFF: id360/id402
-`step=0 AX[0]` FAIL disappears OFF (→ CROSS-STEP, no flat divergence). Memory
-smoke stays green (byte-identical). **No memory-smoke test regresses OFF.**
+`FETCH_LO+0` high) AND `OP_LEA == 0`. Comparison/if programs with such an
+operand flat-diverge at step 0/1 (id360 `8>…`, id402 `16==…`). Verified via gate
+ON vs OFF: id360/id402 `step=0 AX[0]` FAIL disappears OFF (→ CROSS-STEP, no flat
+divergence). Memory smoke stays green (byte-identical). **No memory-smoke test
+regresses OFF.**
+
+**Scoping caveat — `func_min` / `func_max` are NOT (only) this leak.** On
+`func_min_0` (id675) the loop_lea ops fire at steps 8/11/15 but with
+**`OP_LEA ≈ +5.23`** — those are *genuine* `LEA &param` (argument-address)
+rows where the `0xE8`/`0xE0` stamp is intended and correct. So the proposed
+`OP_LEA`-gate (§5) is a **no-op** on func_min's firing rows (gate > 0), and
+func_min's remaining step-11/12/13 failure is a *separate* framing/value root,
+not the E8/E0 slam. The E8/E0 fix cleanly addresses `if_gt`/`if_eq` (and any
+if/expr program whose comparison operand ends in nibble 0/8 with `OP_LEA == 0`);
+`func_min`/`func_max` need their own root-cause pass.
 
 ---
 
