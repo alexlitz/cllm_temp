@@ -12866,52 +12866,51 @@ def make_l10_absdiff_argb_li_lo_op() -> Operation:
 _ABSDIFF_RET_B1_DOM = 500.0        # per-cell winner-take-all magnitude at S=100:
 #     -DOM/S on the spurious value nibble OUTPUT_LO+k (k>=1), +DOM/S on
 #     OUTPUT_LO+0, so the AX high-byte decode collapses to nibble 0 (byte value
-#     0). 500 dominates the ~+9 stale l6_psh_stack0_marker_final_lo_k leak with
-#     wide margin (confirmed by residual injection: byte-1 1 -> 0 on
-#     absdiff_0/7/8).
-# The per-rule AND score is  OP_LEV (return-context marker)  +  IS_BYTE (~1.0)
-# +  OUTPUT_LO+k (the leak magnitude). ``OP_LEV`` is a PATH-INDEPENDENT
-# return-context selector: it is > 0.8 ONLY on the ADJ/return step's register
-# byte rows (0 on every non-return step, both the ``a>b`` true and false absdiff
-# paths), and it DECAYS across the step (AX byte rows ~1.1 > SP ~0.9 > BP ~0.6)
-# so, combined with the threshold, the AND fires on the AX byte leak row but not
-# on the deeper BP rows. Threshold 8.5 sits in the gap: the AX-byte-1 leak row
-# scores OP_LEV(1.17)+IS_BYTE(1.0)+OUTPUT_LO+1(~7.7-9.1) = ~9.9-11.3 -> FIRES,
-# while the CLEAN nibble baselines (SP ~2.8, BP-b3 ~7.65, AX-b2 ~3.1) and the
-# clean pre-LEV steps (OP_LEV=0) all stay < 8.5 -> DARK. Putting OUTPUT_LO+k in
-# the CONDITIONS (not as a multiplicative gate) is load-bearing: a multiplicative
-# gate fires at ANY positive OUTPUT_LO+k (incl. the ~1.0 clean nibble-0-default
-# baseline) and over-fires; the additive-threshold AND only clears when the
-# nibble is GENUINELY elevated by the leak.
-_ABSDIFF_RET_B1_THRESHOLD = 8.5
+#     0). 500 dominates the stale l6_psh_stack0_marker_final_lo_k leak (and its
+#     paired OUTPUT_LO+0 crush, down to ~-200) with wide margin.
+# ``OP_LEV`` is a PATH-INDEPENDENT return-step AX-byte-row SELECTOR: measured
+# across ALL 25 absdiff at the ADJ/return step it is 1.004..1.167 on the AX byte
+# rows, <=0.909 on the SP byte rows, <=0.708 on the BP byte rows, and 0 on every
+# non-return step (both the ``a>b`` true and false paths). Weighting OP_LEV at
+# _OP_LEV_W and setting the threshold at _OP_LEV_W * 0.95 makes the AND fire ONLY
+# where OP_LEV>=~0.95 -> exactly the AX byte rows of the return step, with wide
+# margin below the SP/BP rows (which ALSO read OUTPUT_LO, so must be excluded).
+# The force is UNCONDITIONAL on the leak magnitude (no OUTPUT_LO+k gate): the leak
+# magnitude varies 2.97..9.1 across the corpus AND is paired with a crushed
+# OUTPUT_LO+0, so a leak-magnitude gate misses the weak cases; since every
+# absdiff/func/nested return is <=255 (AX bytes 1..3 == 0), forcing nibble-0 on
+# the AX high-byte rows is unconditionally correct.
+_ABSDIFF_RET_B1_OP_LEV_W = 100.0
+_ABSDIFF_RET_B1_THRESHOLD = _ABSDIFF_RET_B1_OP_LEV_W * 0.95   # OP_LEV >= 0.95
 
 
 def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
-    """15 rules: on the AX value-byte rows of the LEV-return step, force a
-    GENUINELY-ELEVATED (stale-leak) OUTPUT_LO high-byte nibble back to 0.
+    """15 rules: on the AX value-byte rows of the LEV-return step, force the
+    OUTPUT_LO high-byte nibble to 0 (AX byte-1/2/3 -> value 0).
 
-    Each rule k in 1..15 fires iff the LEV-return-context AX-value-byte
-    discriminator is satisfied AND ``OUTPUT_LO+k`` is elevated by the leak, and
-    writes ``-DOM`` to ``OUTPUT_LO+k`` and ``+DOM`` to ``OUTPUT_LO+0`` so the AX
-    high bytes decode nibble-0 (byte value 0). k==0 is omitted (the clean
-    nibble-0 default is left untouched). The discriminator REQUIRES ``OP_LEV``
-    (the return-context opcode marker: > 0.8 ONLY on the ADJ/return step,
-    path-independent, and decaying AX~1.1 > SP~0.9 > BP~0.6 across the step so the
-    threshold keeps it off the deeper BP rows) AND ``IS_BYTE`` (a value byte ->
-    excludes the AX byte-0 / MARK_AX row so byte-0 keeps its real nibble) AND the
-    ELEVATED ``OUTPUT_LO+k`` leak itself (so the clean ~1.0 nibble baseline stays
-    DARK, only the ~8.5 leak fires), and HARD-NOT-blocks ``PSH_AT_SP`` /
-    ``MARK_STACK0`` (the mis-firing L6 marker rule's own gates, provably OFF here)
-    and every non-AX register marker, so it is a genuine
-    AX-value-byte return-step-with-a-live-leak requirement, NOT a broad OUTPUT-LO
-    touch.
+    Each rule k in 1..15 fires iff the return-step AX-byte-row discriminator is
+    satisfied, and writes ``-DOM`` to ``OUTPUT_LO+k`` and ``+DOM`` to
+    ``OUTPUT_LO+0`` so the AX high bytes decode nibble-0 (byte value 0). k==0 is
+    omitted (the clean nibble-0 default is left untouched). The discriminator
+    REQUIRES ``OP_LEV`` at weight _OP_LEV_W with a matched threshold so the AND
+    clears ONLY where ``OP_LEV >= ~0.95`` — measured to be EXACTLY the AX byte
+    rows of the ADJ/return step (AX 1.004..1.167, SP <=0.909, BP <=0.708, 0
+    elsewhere), a path-INDEPENDENT selector — AND ``IS_BYTE`` (a value byte ->
+    excludes the AX byte-0 / MARK_AX row so byte-0 keeps its real nibble), and
+    HARD-NOT-blocks ``PSH_AT_SP`` / ``MARK_STACK0`` (the mis-firing L6
+    ``l6_psh_stack0_marker_final`` rule's own gates, provably OFF here) and every
+    non-AX register marker, so it is a genuine AX-value-byte return-step
+    requirement, NOT a broad OUTPUT-LO touch. The correction is UNCONDITIONAL on
+    the leak magnitude (see the ``_ABSDIFF_RET_B1_DOM`` note) because every
+    absdiff/func/nested return is <=255.
     """
-    base_disc: tuple[tuple[str, float], ...] = (
-        # Return-context opcode marker (~1.1 on AX byte rows of the ADJ/return
-        # step, > SP ~0.9 > BP ~0.6, 0 on every non-return step and both absdiff
-        # paths). Path-INDEPENDENT (unlike the H* one-hots).
-        ("OP_LEV", 1.0),
-        # value byte (excludes the MARK_AX byte-0 predictor row, IS_BYTE=0).
+    disc: tuple[tuple[str, float], ...] = (
+        # Return-step AX-byte-row selector: OP_LEV >= ~0.95 (AX 1.004..1.167 at
+        # the ADJ/return step, SP <=0.909, BP <=0.708, 0 elsewhere). The weight +
+        # matched threshold make this a hard >=0.95 gate; path-INDEPENDENT.
+        ("OP_LEV", _ABSDIFF_RET_B1_OP_LEV_W),
+        # value byte (excludes the MARK_AX byte-0 predictor row, IS_BYTE=0). Small
+        # positive weight so it never lifts an OP_LEV<0.95 row over the threshold.
         ("IS_BYTE", 1.0),
         # HARD NOT-block the L6 marker rule's own gates: if this were a GENUINE
         # PSH-STACK0 marker step the corrector must NOT fire.
@@ -12928,9 +12927,6 @@ def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
     )
     rules: list[FFNRule] = []
     for k in range(1, 16):
-        # The elevated leak nibble is part of the AND (additive threshold), NOT a
-        # multiplicative gate -> only a GENUINELY-large OUTPUT_LO+k clears it.
-        disc = base_disc + ((f"OUTPUT_LO+{k}", 1.0),)
         rules.append(multi_way_and_rule(
             name=f"l10_absdiff_ret_byte1_{k}",
             conditions=disc,
