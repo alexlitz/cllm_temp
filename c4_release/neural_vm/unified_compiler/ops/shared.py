@@ -1772,7 +1772,11 @@ def func_add_b0_hinib_enabled() -> bool:
     delivered at the SCALE_O ~6.0 magnitude; no legitimate operand cell sits in
     the (0.5, 5.85) window). ADD-only opcode gate (unchanged) so it is inert on
     every non-ADD row. Flips the 12/25 func_add whose operand-B high nibble is
-    non-zero (b >= 48); rides to func_max/min's loaded-operand return ADD.
+    non-zero (b >= 48). Scope is the loaded-operand ADD row (func_add step-13,
+    also any expr/var frame ADD reading a loaded operand-A); func_max/min return
+    via GT/LT+BZ+LEV with NO ADD step, so they are OUT of this fix's scope (their
+    loaded-operand compare rows are the C4_OPERAND_CAM_FIX territory). This fix
+    SUBSUMES the cell-13/15 clears when on (all 16 cells >= (13,15)).
     """
     return os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
 
