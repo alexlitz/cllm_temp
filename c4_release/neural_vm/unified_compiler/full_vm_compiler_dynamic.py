@@ -2386,7 +2386,7 @@ def compile_full_vm_dynamic(
             "C4_LOOP_LEA_OPLEA_GATE": (
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-                and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "0") != "0"
+                and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
             ),
             # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt
             # out =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60
@@ -3301,7 +3301,7 @@ def _bake_from_scheduled_ops(
         "C4_LOOP_LEA_OPLEA_GATE": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "0") != "0"
+            and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
         ),
         # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt out
         # =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60 threshold bump

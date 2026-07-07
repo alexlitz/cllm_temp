@@ -2147,7 +2147,7 @@ def loop_lea_oplea_gate_enabled() -> bool:
     (a) is EXACTLY 0 on the ``OP_LEA==0`` leak (true zero-out) and (b) is ~1.0 on
     the genuine ``OP_LEA==5.23`` LEA (write magnitude preserved).
     """
-    return os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "0") != "0"
+    return os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
 
 
 def loop_si_byterow_marker_clear_enabled() -> bool:
