@@ -124,6 +124,7 @@ the flag-regression / cross-op gates.
 |------|---------|--------|---------|
 | `C4_LOADED_OPERAND_ADD_HI15_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-15 address-leak clear (var_update). |
 | `C4_FUNCADD_ALU_HI13_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-13 leak clear (func_add/mul/max/min). |
+| `C4_FUNC_ADD_B0_HINIB` | `0` (off) | active | func-return ADD byte-0 hi-nibble over-count fix: widen the loaded-operand ADD ALU_HI clear to ALL 16 cells (magnitude-windowed) to zero the ~1.0 operand-B-high-nibble bleed while preserving the ~6.0 true operand. Gated on `no_stack0_emit` (campaign). |
 | `C4_SILI_CAM_B1` | `1` (campaign) | active | SI/LI load byte-1 address-leak discriminator (Inc-2). |
 | `C4_SILI_B1_RESTORE` | `1` (campaign) | active | SI/LI byte-1 restore. |
 | `C4_STORE_AX_B0_OVERRIDE` | `1` in build / `0` in shared | active | Store AX byte-0 override. |

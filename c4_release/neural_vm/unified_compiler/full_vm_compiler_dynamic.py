@@ -2442,6 +2442,19 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
             ),
+            # func-return ADD byte-0 HIGH-nibble over-count fix (campaign
+            # DEFAULT-OFF, opt in =1, MODULE-affecting): widens the
+            # LoadedOperandAddHi15ClearFFN contaminant cell set to ALL 16 ALU_HI
+            # cells (magnitude-windowed) so the ~1.0 operand-B-high-nibble bleed
+            # is cleared while the ~6.0 true operand-A one-hot is preserved. The
+            # wrap MODULE (its ``contam_cells``) differs ON vs OFF, so the two
+            # serialised models must never share a serialised entry. Gated on the
+            # campaign prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign /
+            # golden build is byte-identical. See shared.func_add_b0_hinib_enabled.
+            "C4_FUNC_ADD_B0_HINIB": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
+            ),
             # Operand-CAM address-leak clear WIDEN (campaign OFF by default,
             # opt in =1, MODULE-affecting): widens the ADD-only
             # LoadedOperandAddHi15ClearFFN opcode gate to the loaded-operand
@@ -3352,6 +3365,19 @@ def _bake_from_scheduled_ops(
         "C4_FUNCADD_ALU_HI13_CLEAR": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
+        ),
+        # func-return ADD byte-0 HIGH-nibble over-count fix (campaign DEFAULT-OFF,
+        # opt in =1, MODULE-affecting): widens the LoadedOperandAddHi15ClearFFN
+        # contaminant cell set to ALL 16 ALU_HI cells (magnitude-windowed) so the
+        # ~1.0 operand-B-high-nibble bleed is cleared while the ~6.0 true
+        # operand-A one-hot is preserved. The wrap MODULE (its ``contam_cells``)
+        # differs ON vs OFF, so the two serialised models must never share a
+        # serialised entry. Gated on the campaign prerequisite
+        # ``C4_NO_STACK0_EMIT`` so the non-campaign / golden build is
+        # byte-identical. See shared.func_add_b0_hinib_enabled.
+        "C4_FUNC_ADD_B0_HINIB": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
         ),
         # Operand-CAM address-leak clear WIDEN (campaign OFF by default, opt in
         # =1, MODULE-affecting): widens the ADD-only LoadedOperandAddHi15ClearFFN
