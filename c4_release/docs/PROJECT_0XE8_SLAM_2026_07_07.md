@@ -5,7 +5,10 @@ Phase 1: **SCOPE + DESIGN ONLY.** Byte-identical to golden
 throughout — no weight changes. This doc + `tools/probe_e8_slam_rowsig.py`
 (+ `tools/_probe_e8_slam_loadbearing.py`) are the foundation for the Phase-2 fix.
 
-Status: **COMPLETE (scope + design).** Phase 2 builds the fix.
+Status: **PHASE 2 COMPLETE + VERIFIED.** The multiplicative `OP_LEA` gate
+(`C4_LOOP_LEA_OPLEA_GATE`, DEFAULT-OFF) is built (commit `abe5f9aa`) and the
+full flip-gate is green: **full-1096 525 → 569 (+44), ZERO regressions**, flag-OFF
+byte-identical to golden `b1dcae63`. See §6 for the Phase-2 verification results.
 
 ---
 
@@ -309,6 +312,53 @@ belt-and-suspenders follow-up if any residual amplitude path is found.
 * Do **not** naively delete/veto the loop_lea ops wholesale — they are the only
   writer that keeps the in-loop `LEA &i` byte-0 = `0xE8`/`0xE0` for the loop
   clusters (§3). Gate them, don't kill them.
+
+---
+
+## 6. Phase-2 build + verification (commit `abe5f9aa`, flag `C4_LOOP_LEA_OPLEA_GATE`)
+
+The §5a design was built as a per-unit multiplicative gate wrapped behind a NEW
+DEFAULT-OFF flag `C4_LOOP_LEA_OPLEA_GATE` (registered in BOTH cache snapshots in
+`full_vm_compiler_dynamic.py`, gated on the campaign prerequisites). The gate is
+`gate = gate_bias + Σ gate_terms·x` with **`gate_bias=0.0`,
+`gate_terms=(("OP_LEA", 1/5.23=0.191205),)`** on EVERY unit — 32 e8 + 32 e0 = **64
+units gated**. `gate_bias=0.0` (not the doc's illustrative −1.0) is deliberate:
+the FFN math is `hidden = silu(up)·gate`, so a NEGATIVE gate would invert the
+±DOM winner-take-all on a false-fire row and stamp a *different* wrong byte;
+`gate==0` is the only true no-op. Genuine `OP_LEA≈5.23 → gate≈1.0` (write
+magnitude preserved); leak `OP_LEA==0 → gate=0.0` (unit zeroed, immune to the
+`+40` FETCH amplitude). See `shared.loop_lea_oplea_gate_enabled`.
+
+### Verification (all isolated caches, campaign config)
+
+| gate | check | result |
+|------|-------|--------|
+| OFF | `tools/_isa_golden_hash.py` | `b1dcae63…` — **byte-identical to golden** |
+| OFF | `tools/_verify_oplea_gate.py` | 0 units gated (constant_write, `b_gate=1.0`); `compare_symbolic_to_lowered_ffn` OK |
+| ON  | `tools/_verify_oplea_gate.py` | **64 units gated** (`b_gate=0.0`, `OP_LEA·0.191205`); `compare_symbolic_to_lowered_ffn` OK both families |
+| ON  | `tools/lint_cross_op_ffn.py --flag C4_LOOP_LEA_OPLEA_GATE` | **PASS** — 2 blocks changed (45=e8, 46=e0), neither writes a SHARED downstream OUTPUT/ALU band (local/private, no cross-op hazard) |
+| —   | loop-function preserved (`probe_e8_slam_rowsig --ids 450 --scan-all --blk-input`) | genuine in-loop `LEA &i` rows (loop_sum_0 steps 2/10/21/25/27/34/45) fire **byte-identically ON vs OFF** (same positions, same `up`, same nibble-8 stamp) — the gate is a no-op there |
+| ON  | `cpu_full_trace --ids 360,402 --spec-k 0` | **id360 if_gt `8>27` FAIL→PASS, id402 if_eq `16==9` FAIL→PASS** end-to-end (0xe8/0xe0 → correct 0x08/0x10) |
+
+### ★ THE FLIP-GATE — full-1096 `--criterion full_trace --spec-k 0 --max-steps-cap 600`
+
+Both runs on this tree, isolated caches:
+
+* gate-OFF baseline: **525/1096** (reproduces the documented 525 baseline exactly)
+* gate-ON: **569/1096**
+* **NET = +44, achieved by 19 clusters gaining and ZERO clusters regressing.**
+
+Per-cluster deltas (ON − OFF, non-zero only): if_gt +1, if_eq +2, if_lt +2,
+add +4, sub +2, mul +3, div +5, mod +3, bool_and +4, expr_add_mul +1,
+expr_mod +3, edge_pow +7, edge_literal +1, edge +1, edge_if_zero +1,
+edge_zero_add/div/mod/mul +1 each. **MEM-SMOKE var clusters unchanged** (var_simple
+25/25, var_mul, var_three, var_update all 0-delta ON vs OFF → the store/load path
+is byte-clean under the fix). The +44 spans every family whose comparison/IMM
+operand ends in nibble 0/8 (the exact blast radius §3 predicted) — the fix hands
+those OUTPUT cells back to the correct operand/ALU decoder.
+
+**Ready for Phase 3** (flip `C4_LOOP_LEA_OPLEA_GATE` default-ON — which moves the
+golden — and retire the flag).
 
 ---
 
