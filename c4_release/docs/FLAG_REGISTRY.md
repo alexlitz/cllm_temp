@@ -144,6 +144,7 @@ the flag-regression / cross-op gates.
 | `C4_LOOP_LEA_B0_E0` | `1` | active | Loop LEA byte-0 E0. |
 | `C4_LOOP_LEA_B0_E8` | `1` | active | Loop LEA byte-0 E8. |
 | `C4_LOOP_LEA_B0_E8_OPLEA_REQ` | `1` | active | Loop LEA byte-0 E8 OP_LEA requirement. |
+| `C4_LOOP_LEA_OPLEA_GATE` | `0` | active | Loop LEA byte-0 E8/E0 MULTIPLICATIVE OP_LEA gate (PROJECT_0XE8_SLAM Phase-2; clears the if_gt/if_eq IMM-row false-fire). |
 | `C4_LOOP_SI_BYTEROW_CLEAR` | `1` | active | Loop SI byte-row clear. |
 | `C4_LOOP_LI_FETCH_ADDRKEY_CLAMP` | `1` | active | Loop LI-fetch address-key clamp. |
 | `C4_IFVAR_BZ_HI_NIBBLE` | `1` | active | if_var BZ high-nibble. |
