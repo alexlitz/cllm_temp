@@ -60,6 +60,23 @@ from neural_vm.verification.faithful_interpreter import (  # noqa: E402
 # Register marker offset for the MEM address byte (35-tok: 26; 30-tok: 21).
 _MEM_MARKER_OFF = 21 if STEP_TOKENS == 30 else 26
 
+# The L16 lev-routing op is physical block 34 in the campaign 60-block model
+# (logical L18 in the 17-block pre-expansion view). The restore rules read the
+# block INPUT (post-block-33 residual). Reading the block INPUT (not the final
+# pre-head residual, which already INCLUDES the restore rule's own +1e7/S write)
+# is what makes the decompose CAUSAL rather than circular.
+_LEV_BLOCK = int(os.environ.get("PROBE_LEV_BLOCK", "34"))
+
+
+@torch.no_grad()
+def _block_input_residual(model, full_ctx, block=_LEV_BLOCK):
+    """Residual fed INTO ``block`` (i.e. after ``block-1``). This is the true
+    INPUT the restore-rule AND reads, before the rule's own write is applied."""
+    pad = torch.tensor([list(full_ctx)], dtype=torch.long,
+                        device=next(model.parameters()).device)
+    x = model.forward(pad, stop_after_block=block - 1)[0]
+    return x.to_dense() if x.is_sparse else x
+
 # The dims the restore rules + byte decode care about. Resolved against the
 # BUILT layout (NOT the static registry).
 _SIG_DIMS = [
@@ -193,6 +210,11 @@ def main():
                          "'--rule-prefix' rule fires (up>0), its OUTPUT nibble "
                          "argmaxes, and the row signature. Finds GENUINE restore "
                          "firings without knowing the store-token offset a priori.")
+    ap.add_argument("--blk-input", action="store_true",
+                    help="read the L16-block INPUT residual (post-block-33) "
+                         "instead of the final pre-head residual. This makes the "
+                         "OUTPUT self-read condition CAUSAL (the final residual "
+                         "already includes the restore rule's OWN write).")
     args = ap.parse_args()
 
     ids = [int(x) for x in args.ids.split(",") if x.strip()]
@@ -237,7 +259,10 @@ def main():
         prompt = build_code_prompt(bc, data)
         prefix = len(prompt)
         full_ctx = prompt + ot.draft_tokens
-        resid = ctx.fwd._residual_pre_head(full_ctx)
+        if args.blk_input:
+            resid = _block_input_residual(ctx.model, full_ctx)
+        else:
+            resid = ctx.fwd._residual_pre_head(full_ctx)
 
         if args.scan_all:
             _scan_all(ctx, dp, S, cid, desc, prefix, resid,
