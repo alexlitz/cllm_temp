@@ -1252,7 +1252,6 @@ from ..building_blocks_dsl import (
     byte_copy_computed_rules,
     byte_route_rules,
     multi_way_and_rule,
-    step_function_rule,
 )
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
