@@ -2100,6 +2100,56 @@ def loop_lea_b0_e0_restore_enabled() -> bool:
     )
 
 
+def loop_lea_oplea_gate_enabled() -> bool:
+    """Return True iff the ``C4_LOOP_LEA_OPLEA_GATE`` MULTIPLICATIVE ``OP_LEA``
+    gate on the ``C4_LOOP_LEA_B0_E8`` / ``C4_LOOP_LEA_B0_E0`` restore ops is
+    active (PROJECT_0XE8_SLAM Phase-2 fix).
+
+    DEFAULT **OFF** (opt in ``C4_LOOP_LEA_OPLEA_GATE=1``). Kept as a dedicated
+    kill-switch so ``tools/flag_regression_gate.py`` / ``tools/_isa_golden_hash.py``
+    can A/B JUST the gate: OFF leaves the loop_lea ops byte-identical to golden
+    ``b1dcae63`` (the gate is the only structural change), ON adds the gate to
+    every unit in both rule families. Inert whenever the loop_lea ops themselves
+    are OFF (non-campaign / golden), since the gate is only emitted then.
+
+    ROOT (docs/PROJECT_0XE8_SLAM_2026_07_07.md §5; measured spec_k=0, BUILT dims,
+    campaign): the loop_lea restore ops' discriminator scores an ``imm=-8`` /
+    ``imm=-16`` FETCH signature (``FETCH_LO+8`` / ``FETCH_LO+0`` at weight 1000)
+    that was calibrated against a SOFT FETCH one-hot (0.4-1.0 on genuine in-loop
+    ``LEA &i`` rows). On an ``if_gt`` / ``if_eq`` step-0 IMM comparison AX row the
+    FETCH band carries ``+40`` (a 40x-amplified broadcast, NOT a 0/1 one-hot), so
+    ``FETCH_LO+8 * 1000 = +4.0e6`` (S=100) OVERWHELMS every calibrated additive
+    margin -- the additive ``OP_LEA`` HARD-req (weight 200 + CONST -650) and the
+    ``OP_IMM * -500`` opcode block are dwarfed. Net ``up > 0`` -> the AND
+    spuriously fires and the per-cell winner-take-all slams ``0xE8`` / ``0xE0``
+    over the correct operand byte (id360 ``8>27`` wants 0x08, id402 ``16==9``
+    wants 0x10).
+
+    THE FIX: make ``OP_LEA`` a MULTIPLICATIVE gate that no FETCH amplitude can
+    cross. The FFN math is ``hidden = silu(up) * gate`` with
+    ``gate = gate_bias + Sum(gate_terms . x)`` (the gate weights are NOT scaled by
+    S). With ``gate_bias=0.0`` + ``gate_terms=(("OP_LEA", 1/5.23),)``:
+
+      * genuine in-loop ``LEA &i`` (``OP_LEA == 5.23``): gate = 1/5.23 * 5.23
+        = ~1.0 -> ``hidden = silu(up) * ~1.0`` -> the unit fires at the SAME
+        magnitude as today (loop function BYTE-IDENTICAL: the per-cell +/-DOM
+        winner-take-all is preserved).
+      * leak IMM / comparison row (``OP_LEA == 0``): gate = 0.0 EXACTLY ->
+        ``hidden = silu(up) * 0 = 0`` -> the whole unit ZEROES, regardless of the
+        ``+40`` FETCH amplitude, handing the OUTPUT cell back to the correct
+        comparison-decode writer.
+
+    A gate_bias of 0.0 (rather than the doc's illustrative -1.0) is deliberate:
+    with ``silu(up) * gate`` a NEGATIVE gate would INVERT the +/-DOM writes on a
+    false-fire row (silu(up) stays large-positive since ``up`` is only gated at
+    the DOWN projection), producing a DIFFERENT wrong byte rather than a clean
+    no-op. gate_bias=0.0 + a linear ``OP_LEA`` term is the unique gate that both
+    (a) is EXACTLY 0 on the ``OP_LEA==0`` leak (true zero-out) and (b) is ~1.0 on
+    the genuine ``OP_LEA==5.23`` LEA (write magnitude preserved).
+    """
+    return os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "0") != "0"
+
+
 def loop_si_byterow_marker_clear_enabled() -> bool:
     """Return True iff the loop back-edge SI-step value-byte-row MARKER-residue
     clear (``C4_LOOP_SI_BYTEROW_CLEAR``) is active.
