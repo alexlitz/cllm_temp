@@ -126,7 +126,8 @@ the flag-regression / cross-op gates.
 | `C4_FUNCADD_ALU_HI13_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-13 leak clear (func_add/mul/max/min). |
 | `C4_SILI_CAM_B1` | `1` (campaign) | active | SI/LI load byte-1 address-leak discriminator (Inc-2). |
 | `C4_SILI_B1_RESTORE` | `1` (campaign) | active | SI/LI byte-1 restore. |
-| `C4_STORE_AX_B0_OVERRIDE` | `1` in build / `0` in shared | active | Store AX byte-0 override. |
+| `C4_STORE_AX_B0_OVERRIDE` | `1` in build / `0` in shared | active | Store AX byte-0 override (un-discriminated; reverted OFF in shared 7869e5c3, -24 arith). |
+| `C4_STORE_AX_B0_OVERRIDE_V2` | `0` (default OFF) | active | Store AX byte-0 override, clean store-only discriminator (ALU/cmp opcode anti-conditions). Fixes var_three/var_mul SI-store step; add/sub untouched. |
 | `C4_PSH_ARG_VAL_AX` | `1` | active | PSH-of-argument value-source AX lock (call-arg store). |
 | `C4_L15_LI_SUPPR_INERT` | `1` | active | L15 head-0 LI/LC-load suppressor inert (func/nested/rec/var LI). |
 | `C4_L15_LI_ADDR_CAM` | campaign | active | L15 head-0 LI value-load ADDR_B0 CAM (#313). |
