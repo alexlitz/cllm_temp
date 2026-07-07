@@ -2150,6 +2150,57 @@ def loop_lea_oplea_gate_enabled() -> bool:
     return os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
 
 
+def jsr_bp_byte3_clear_enabled() -> bool:
+    """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR
+    (``C4_JSR_BP_BYTE3_CLEAR``) is active.
+
+    DEFAULT **OFF** (opt in ``C4_JSR_BP_BYTE3_CLEAR=1``). Requires the campaign
+    config (``C4_NO_STACK0_EMIT=1`` + ``C4_OPERAND_FROM_MEMSP=1``). Flag-off OR a
+    non-campaign / golden build registers NO rules and appends NO post_op, so the
+    model is bit-for-bit identical to golden ``f725c06e``.
+
+    ROOT — THE func-cluster STEP-0 (JSR) POISONING BYTE (func_min id675 /
+    func_max id650 / func_identity id550 / func_add id575; measured spec_k=0,
+    BUILT dim_positions, campaign; ``tools/_probe_funcmin_vcorr.py`` +
+    ``_probe_bp_b3_logit_attr.py`` + ``_probe_funcmin_inject.py``):
+
+    Every func-cluster program's FIRST value-byte correction (the cross-step
+    autoregressive poisoning point ``interp_oracle_gate._value_correction_step``)
+    is at **step 0 (the JSR that calls the callee)**, on **BP byte 3**. The
+    caller's BP is ``0x00010000`` (byte-2 = 0x01, byte-3 = 0x00), but the model
+    emits **BP byte-3 = 0x01** -> BP decodes to ``0x01010000`` and every
+    downstream frame-relative (``mem[BP-8]`` / ENT / LEV / LI) read is poisoned,
+    flat-diverging the whole cluster. Hook-inject clearing this one byte advances
+    the vcorr from step 0 to step 2 on ALL four programs (root confirmed).
+
+    ATTRIBUTION (LM-head logit, BUILT dims): at the BP byte-3 PREDICTOR row (the
+    BP byte-2 value row: ``IS_BYTE`` + ``BYTE_INDEX_2`` + ``H1+3`` + ``OP_JSR``,
+    ``HAS_SE==0``) the OUTPUT band is a near-TIE the WRONG way -- ``OUTPUT_LO+0 =
+    +6.94`` (nibble 0, correct 0x?0) vs ``OUTPUT_LO+1 = +8.00`` (nibble 1) -- so
+    the byte-3 low nibble decodes to 1 (``logit[1]-logit[0] = +4.3``, driven
+    100% by ``OUTPUT_LO+1`` via ``W_head[1,OUTPUT_LO+1]-W_head[0,·] = +5``). A
+    weak ``+2.0`` enters ``OUTPUT_LO+1`` at physical block ~18 and is amplified
+    ~3.4x at block ~58, and unlike the ENT step (which
+    ``l6_ent_after_jsr_bp_byte3_00`` clears) the JSR step has NO byte-3 clear.
+    The clean, always-present discriminator that isolates this exact row is
+    ``OP_JSR`` (the ENT-step clear is gated on ``OP_ENT``/``HAS_SE`` instead) +
+    the BP-register-byte ``H1+3`` staging signal + ``BYTE_INDEX_2``.
+
+    FIX (mirrors ``l6_ent_after_jsr_bp_byte3_00`` but JSR-gated + placed in the
+    L25 tail so it DOMINATES the block-58 amplifier): a flag-gated ``PureFFN``
+    post_op appended after the loop_lea ops that -- on the JSR-step BP byte-3
+    predictor row -- WTA-forces ``OUTPUT_LO`` and ``OUTPUT_HI_THIS_STEP`` to
+    nibble 0 (byte-3 = 0x00). ``OP_JSR`` + ``H1+3`` + ``BYTE_INDEX_2`` hard-req,
+    with ``HAS_SE`` (ENT rows) + every non-BP marker + wrong BYTE_INDEX
+    NOT-blocked, so it is a no-op on every non-JSR-BP-byte3 row.
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "0") == "1"
+    )
+
+
 def loop_si_byterow_marker_clear_enabled() -> bool:
     """Return True iff the loop back-edge SI-step value-byte-row MARKER-residue
     clear (``C4_LOOP_SI_BYTEROW_CLEAR``) is active.

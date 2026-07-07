@@ -12495,6 +12495,202 @@ def make_l10_loop_lea_b0_e0_op() -> Operation:
 
 
 # ===========================================================================
+# func-cluster step-0 (JSR) BP byte-3 high-byte CLEAR (campaign; DEFAULT OFF,
+# opt in C4_JSR_BP_BYTE3_CLEAR=1). See ``shared.jsr_bp_byte3_clear_enabled`` for
+# the full root. In one line: on the JSR that calls a callee, the caller's BP
+# byte-3 must be 0x00 (BP = 0x00010000) but the OUTPUT band is a near-tie the
+# WRONG way (OUTPUT_LO+1 +8.0 > OUTPUT_LO+0 +6.9) so byte-3 decodes 0x01, BP ->
+# 0x01010000 and every downstream frame-relative read is poisoned. The ENT step
+# has l6_ent_after_jsr_bp_byte3_00; the JSR step has NO clear.
+# ===========================================================================
+_JSR_BP_B3_DOM = 0.1               # per-cell winner-take-all magnitude (mirror
+#                                   of _LOOP_LEA_E8_DOM: +DOM on nibble 0, -DOM
+#                                   on every other cell, un-normalised residual).
+_JSR_BP_B3_THRESHOLD = 6.0        # the JSR-step BP byte-3 predictor row scores
+#                                   OP_JSR(0.1*6.85=0.685) + H1+3(1) + IS_BYTE(1)
+#                                   + BYTE_INDEX_2(10*0.97) - BYTE_INDEX_3(10*0.01)
+#                                   ~= 12.3 > 6.0; the byte-0/1 predictor rows
+#                                   (BYTE_INDEX_0/1 ~0.97, BYTE_INDEX_2 ~0.01)
+#                                   score ~-6.9 (BYTE_INDEX_2*10*0.01 -
+#                                   BYTE_INDEX_0/1*10*0.97) << 6.0 -> SILENT, so
+#                                   BP byte-0/1/2 are untouched. Every non-JSR /
+#                                   non-BP / HAS_SE(ENT) / marker row is
+#                                   hard-vetoed far below threshold.
+
+
+def _l10_jsr_bp_byte3_clear_rules() -> tuple[FFNRule, ...]:
+    """32 winner-take-all rules: force byte-3 = 0x00 on the JSR-step BP byte-3
+    predictor row (the BP byte-2 value row, BYTE_INDEX_2 + H1+3).
+
+    16 LO units drive ``OUTPUT_LO`` to nibble 0 and 16 HI units drive
+    ``OUTPUT_HI_THIS_STEP`` to nibble 0 (``+DOM`` at cell 0, ``-DOM`` elsewhere),
+    so the byte-3 low + high nibbles decode 0 -> byte-3 = 0x00. The
+    discriminator REQUIRES a real JSR step (``OP_JSR``), the BP-register-byte
+    ``H1+3`` staging one-hot, and ``BYTE_INDEX_2`` (the byte-3 predictor row),
+    and HARD-blocks ``HAS_SE`` (the ENT-step byte rows carry HAS_SE~1 and are
+    already handled by ``l6_ent_after_jsr_bp_byte3_00``), the non-BP register
+    ``H1`` one-hots (PC=+0 / AX=+1 / SP=+2), the wrong ``BYTE_INDEX`` rows, and
+    every non-BP marker. So the op is a strict no-op on every other row.
+    """
+    # CRITICAL (mirrors the l6_ent_after_jsr_bp_byte* comment): the wrong
+    # BYTE_INDEX one-hots carry a ~0.01 ADJACENT-INDEX residue, so a -1e6 hard
+    # NOT-block on BYTE_INDEX_1 / BYTE_INDEX_3 would spuriously veto THIS row
+    # (BYTE_INDEX_3 residue ~0.01 * -1e6 = -1e4 crushes the AND). The
+    # BYTE_INDEX_2 positive + the threshold ALREADY discriminate the byte-3
+    # predictor row from the byte-0/1/3 predictor rows, so the adjacent BYTE
+    # rows are separated ADDITIVELY, not by a hard block. Likewise the H1 one-
+    # hots (PC=+0 / AX=+1 / SP=+2 / BP=+3) are clean 0/1 one-hots here, so the
+    # non-BP register rows ARE hard-blockable via H1+0/+1/+2.
+    disc: tuple[tuple[str, float], ...] = (
+        # CONST (=1) bias so OP_JSR is a HARD, LOAD-BEARING requirement: a
+        # non-JSR row (OP_JSR==0) scores >= -12 below every positive term and
+        # falls under the threshold, so this op is a strict no-op on every
+        # program without a JSR step (add/sub/var/loop/if) AND on the non-JSR
+        # steps of func/nested/rec/gcd.
+        ("CONST", -12.0),
+        # GENUINE JSR step gate: OP_JSR ~6.85 on the byte rows of a JSR step.
+        # Weight 2 -> +13.7 on a JSR row (with CONST -12 -> net +1.7 baseline);
+        # 0 on any non-JSR row (net -12 baseline -> silent).
+        ("OP_JSR", 2.0),
+        # BP-register byte-row staging one-hot (PC=H1+0, AX=H1+1, SP=H1+2,
+        # BP=H1+3). The clean, always-present BP discriminator on value rows.
+        ("H1+3", 1.0),
+        ("IS_BYTE", 1.0),
+        # The byte-3 PREDICTOR row is the BP byte-2 value row (BYTE_INDEX_2).
+        # LARGE symmetric weight (the LOAD-BEARING row selector): the byte-3
+        # predictor scores +10*0.97; the byte-0/1 predictors (BYTE_INDEX_0/1
+        # ~0.97, BYTE_INDEX_2 ~0.01) score -10*0.97 -> deep NEGATIVE, silent.
+        ("BYTE_INDEX_2", 10.0),
+        ("BYTE_INDEX_0", -10.0),
+        ("BYTE_INDEX_1", -10.0),
+        ("BYTE_INDEX_3", -10.0),
+        # HARD NOT-block HAS_SE: the ENT-step BP byte rows carry HAS_SE~=0.98 and
+        # are ALREADY cleared by l6_ent_after_jsr_bp_byte3_00; the JSR-step rows
+        # carry HAS_SE==0. This keeps the op JSR-exclusive.
+        ("HAS_SE", -1_000_000.0),
+        # HARD NOT-block the non-BP register byte rows (their H1 one-hot != +3;
+        # H1+0/+1/+2 are clean 0/1 one-hots here, no adjacent residue).
+        ("H1+0", -1_000_000.0),
+        ("H1+1", -1_000_000.0),
+        ("H1+2", -1_000_000.0),
+        # Never any register-MARKER row (value-byte target only).
+        ("MARK_PC", -1_000_000.0),
+        ("MARK_AX", -1_000_000.0),
+        ("MARK_SP", -1_000_000.0),
+        ("MARK_BP", -1_000_000.0),
+        ("MARK_STACK0", -1_000_000.0),
+        ("MARK_MEM", -1_000_000.0),
+    )
+    rules: list[FFNRule] = []
+    for out_dim in ("OUTPUT_LO", "OUTPUT_HI_THIS_STEP"):
+        for k in range(16):
+            writes = tuple(
+                (f"{out_dim}+{j}", (_JSR_BP_B3_DOM if j == 0 else -_JSR_BP_B3_DOM))
+                for j in range(16)
+            )
+            rules.append(multi_way_and_rule(
+                name=f"l10_jsr_bp_byte3_clear_{out_dim.lower()}_{k}",
+                conditions=disc,
+                threshold=_JSR_BP_B3_THRESHOLD,
+                writes=writes,
+            ))
+    return tuple(rules)
+
+
+def make_l10_jsr_bp_byte3_clear_op() -> Operation:
+    """Flag-gated JSR-step BP byte-3 = 0x00 CLEAR op (C4_JSR_BP_BYTE3_CLEAR).
+
+    Standalone ``PureFFN`` post_op attached to the L25 tail block AFTER the
+    loop_lea ops (so it is the LAST OUTPUT writer at the JSR-step BP byte-3
+    predictor row and DOMINATES the block-58 amplifier). Flag-off (or
+    non-campaign / golden) produces ZERO rules and appends NO post_op ->
+    byte-identical to golden ``f725c06e``. See ``jsr_bp_byte3_clear_enabled`` /
+    ``_l10_jsr_bp_byte3_clear_rules``.
+    """
+    from .shared import jsr_bp_byte3_clear_enabled
+
+    if not jsr_bp_byte3_clear_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="l10_jsr_bp_byte3_clear",
+            reads=set(),
+            writes=set(),
+            kind="block",
+            target_op_name="l10_post_ops_combined",
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            compiler_ir=CompilerIR(),
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="BLOG_SPEC.md#registers",
+        )
+
+    rules = _l10_jsr_bp_byte3_clear_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="l10_jsr_bp_byte3_clear",
+        reads={
+            "OP_JSR", "H1", "IS_BYTE", "HAS_SE",
+            "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
+            "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
+            "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
+        },
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        # Run in the LATE L25 tail AFTER tail_bit32_result_correction (the
+        # OUTPUT-band amplifier chain) -- mirror of make_l10_add_high_byte_adder_op
+        # -- so this is the LAST OUTPUT writer at the JSR-step BP byte-3 predictor
+        # row and DOMINATES the block-58 amplifier (a post_ops_combined placement
+        # runs at phase 10.5, BEFORE the amplifier, and gets overwritten).
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+# ===========================================================================
 # absdiff arg-b LI value byte-0 LO-nibble de-contamination (campaign; DEFAULT
 # OFF, opt in C4_ABSDIFF_FIX=1). See ``shared.absdiff_fix_enabled`` for the full
 # root. In one line: the 2-arg func arg-``b`` deref (LI at BP-relative 0xFFE0,
