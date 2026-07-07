@@ -1252,6 +1252,7 @@ from ..building_blocks_dsl import (
     byte_copy_computed_rules,
     byte_route_rules,
     multi_way_and_rule,
+    step_function_rule,
 )
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
 from ..layer_compiler import Operation
@@ -1289,6 +1290,22 @@ register_residual_band(
     "NONFIRST_PSH_SP_SUPPRESS", 1,
     owner="make_l10_nonfirst_psh_sp_helper_op",
     flag=_nonfirst_psh_sp_fix_enabled,
+    never_share=True,
+)
+
+# absdiff LEV-return byte-1 leak flag (C4_ABSDIFF_RET_BYTE1). A BOUNDED
+# step-function indicator = step(-(OUTPUT_LO+0) >= 10) written by the precursor
+# ``make_l10_absdiff_ret_byte1_flag_op`` on the AX byte rows of the return step:
+# it is 1 where the mis-firing L6 marker rule CRUSHED OUTPUT_LO+0 (the absdiff
+# single-byte leak, crush -46..-199) and 0 where OUTPUT_LO+0 is clean positive
+# (a genuine func_mul multi-byte return, +3.91). Bounded (unlike the raw crush)
+# so the huge-magnitude SP/BP/LEA crushes cannot leak into the correction AND;
+# the OP_LEV>=0.95 selector then excludes those non-AX / non-return rows.
+# Flag-off => band not collected (byte-identical d_model).
+register_residual_band(
+    "ABSDIFF_RET_LEAK", 1,
+    owner="make_l10_absdiff_ret_byte1_flag_op",
+    flag=absdiff_ret_byte1_enabled,
     never_share=True,
 )
 
@@ -12882,10 +12899,62 @@ _ABSDIFF_RET_B1_DOM = 500.0        # per-cell winner-take-all magnitude at S=100
 # the AX high-byte rows is unconditionally correct.
 _ABSDIFF_RET_B1_OP_LEV_W = 100.0
 _ABSDIFF_RET_B1_THRESHOLD = _ABSDIFF_RET_B1_OP_LEV_W * 0.95   # OP_LEV >= 0.95
+# The l6-crush flag BAND: fire the ABSDIFF_RET_LEAK indicator when OUTPUT_LO+0 is
+# crushed into the MODERATE band -1000 <= OUTPUT_LO+0 <= -10 (i.e.
+# 10 <= -(OUTPUT_LO+0) <= 1000). The absdiff single-byte leak crushes OUTPUT_LO+0
+# to -46..-199 (fires); a genuine func_mul return with a REAL byte-1 either leaves
+# it CLEAN POSITIVE (+3.91, below the low bound -> dark) OR SATURATES it hugely-
+# negative (~-6e9, above the high bound -> dark). Both passing func_mul cases
+# (id603 +3.91, id605 -6e9) are thus excluded. The band = step(>=10) MINUS
+# step(>=1000) on -(OUTPUT_LO+0), so the saturated tail cancels to 0. The
+# corrector reads the flag only as a gate>0 / gate==0 test.
+_ABSDIFF_RET_LEAK_CRUSH_LO = 10.0     # min crush magnitude to fire.
+_ABSDIFF_RET_LEAK_CRUSH_HI = 1000.0   # above this = saturated func_mul -> DRIVE < 0.
+_ABSDIFF_RET_LEAK_INDICATOR = 2.0     # write_value -> ~1.0 flag magnitude.
+
+
+def _l10_absdiff_ret_byte1_flag_rules() -> tuple[FFNRule, ...]:
+    """2 precursor rules: write the BANDED ``ABSDIFF_RET_LEAK`` l6-crush indicator.
+
+    Net flag = step(-(OUTPUT_LO+0) >= 10)*1 - step(-(OUTPUT_LO+0) >= 1000)*2. The
+    corrector reads it as a MULTIPLICATIVE gate:
+      * clean POSITIVE OUTPUT_LO+0 (func_mul +3.91, ``-x < 10``): both dark ->
+        flag 0 -> gate 0 -> corrector DARK (byte-1 preserved).
+      * MODERATE crush (absdiff -46..-199, ``10 <= -x < 1000``): only the +1 rule
+        fires -> flag > 0 -> gate > 0 -> corrector FIRES (byte-1 -> 0).
+      * SATURATED crush (genuine multi-byte func_mul ~-6e9, ``-x >= 1000``): BOTH
+        fire and the -2 rule DOMINATES (2x slope) -> flag DRIVEN hugely NEGATIVE
+        -> gate < 0. A negative multiplicative gate makes ``silu(up)*gate`` NEGATIVE
+        so the corrector's writes FLIP SIGN (+DOM to OUTPUT_LO+k, -DOM to +0) — but
+        on the saturated row those +-DOM (~500) are NEGLIGIBLE against the genuine
+        ~6e9 delivered nibble, so the real byte-1 is PRESERVED. (The 2x cancel is
+        load-bearing: an equal-weight cancel leaves a constant POSITIVE residual at
+        saturation — silu is linear, not a true step — which would fire the gate and
+        zero the genuine byte-1.)
+    """
+    # multi_way_and_rule fires on score >= threshold; we need -(OUTPUT_LO+0) >= T,
+    # i.e. conditions=((OUTPUT_LO+0, -1.0),) with threshold=T -> silu score is
+    # -OUTPUT_LO+0.
+    return (
+        multi_way_and_rule(
+            name="l10_absdiff_ret_leak_flag_lo",
+            conditions=(("OUTPUT_LO+0", -1.0),),
+            threshold=_ABSDIFF_RET_LEAK_CRUSH_LO,
+            writes=(("ABSDIFF_RET_LEAK", _ABSDIFF_RET_LEAK_INDICATOR / 100.0),),
+        ),
+        # 2x weight so at saturation the net flag is DRIVEN NEGATIVE (gate<0 =>
+        # corrector dark on the genuine multi-byte row).
+        multi_way_and_rule(
+            name="l10_absdiff_ret_leak_flag_hi_cancel",
+            conditions=(("OUTPUT_LO+0", -1.0),),
+            threshold=_ABSDIFF_RET_LEAK_CRUSH_HI,
+            writes=(("ABSDIFF_RET_LEAK", -2.0 * _ABSDIFF_RET_LEAK_INDICATOR / 100.0),),
+        ),
+    )
 
 
 def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
-    """15 rules: on the AX value-byte rows of the LEV-return step, force the
+    """15 rules: on the AX byte-1 leak row of the LEV-return step, force the
     OUTPUT_LO high-byte nibble to 0 (AX byte-1/2/3 -> value 0).
 
     Each rule k in 1..15 fires iff the return-step AX-byte-row discriminator is
@@ -12896,13 +12965,13 @@ def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
     clears ONLY where ``OP_LEV >= ~0.95`` — measured to be EXACTLY the AX byte
     rows of the ADJ/return step (AX 1.004..1.167, SP <=0.909, BP <=0.708, 0
     elsewhere), a path-INDEPENDENT selector — AND ``IS_BYTE`` (a value byte ->
-    excludes the AX byte-0 / MARK_AX row so byte-0 keeps its real nibble), and
-    HARD-NOT-blocks ``PSH_AT_SP`` / ``MARK_STACK0`` (the mis-firing L6
-    ``l6_psh_stack0_marker_final`` rule's own gates, provably OFF here) and every
-    non-AX register marker, so it is a genuine AX-value-byte return-step
-    requirement, NOT a broad OUTPUT-LO touch. The correction is UNCONDITIONAL on
-    the leak magnitude (see the ``_ABSDIFF_RET_B1_DOM`` note) because every
-    absdiff/func/nested return is <=255.
+    excludes the AX byte-0 / MARK_AX row so byte-0 keeps its real nibble) AND the
+    BOUNDED ``ABSDIFF_RET_LEAK`` l6-crush flag (1 on the absdiff single-byte leak,
+    0 on a genuine func_mul multi-byte return whose byte-1 is REAL — so func_mul
+    is NOT touched), and HARD-NOT-blocks ``PSH_AT_SP`` / ``MARK_STACK0`` (the
+    mis-firing L6 ``l6_psh_stack0_marker_final`` rule's own gates, provably OFF
+    here) and every non-AX register marker, so it is a genuine leaking-AX-value-
+    byte return-step requirement, NOT a broad OUTPUT-LO touch.
     """
     disc: tuple[tuple[str, float], ...] = (
         # Return-step AX-byte-row selector: OP_LEV >= ~0.95 (AX 1.004..1.167 at
@@ -12931,6 +13000,13 @@ def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
             name=f"l10_absdiff_ret_byte1_{k}",
             conditions=disc,
             threshold=_ABSDIFF_RET_B1_THRESHOLD,
+            # MULTIPLICATIVE gate on the BOUNDED l6-crush flag: flag=0 (a genuine
+            # func_mul multi-byte return, OUTPUT_LO+0 clean positive) => gate=0 =>
+            # NO write, so func_mul's real byte-1 is preserved; flag~1 (the absdiff
+            # single-byte leak, OUTPUT_LO+0 crushed) => gate~1 => the write fires.
+            # A multiplicative gate (not an additive condition) makes the flag a
+            # HARD requirement independent of the large OP_LEV score.
+            gate="ABSDIFF_RET_LEAK",
             writes=(
                 (f"OUTPUT_LO+{k}", -_ABSDIFF_RET_B1_DOM),
                 ("OUTPUT_LO+0", _ABSDIFF_RET_B1_DOM),
@@ -12939,33 +13015,106 @@ def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
+def _noop_block_op(name: str) -> Operation:
+    """A ``kind="block"`` post_op that appends nothing (flag-OFF path)."""
+    def _noop_bake(block, dim_positions, S):
+        del block, dim_positions, S
+
+    return Operation(
+        name=name,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        declarative_bake_fn=_noop_bake,
+        declarative_authority="spec_generated",
+        compiler_ir=CompilerIR(),
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
+def _absdiff_ret_bake(rules):
+    """Return a ``bake`` closure that lowers ``rules`` into a fresh PureFFN
+    post_op on the tail block (shared by the flag + corrector ops)."""
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = Primitives.dim_positions_from_bd(
+            _as_setdim_proxy(dim_positions),
+            Primitives.ffn_rule_dim_names(rules),
+        )
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+    return bake
+
+
+def make_l10_absdiff_ret_byte1_flag_op() -> Operation:
+    """Flag-gated PRECURSOR: writes the bounded ``ABSDIFF_RET_LEAK`` l6-crush flag.
+
+    Runs AFTER ``tail_bit32_result_correction`` (so it reads the final crushed
+    OUTPUT_LO+0) and BEFORE ``make_l10_absdiff_ret_byte1_op`` (which gates on the
+    flag). Flag-OFF -> ZERO rules, NO post_op, NO band -> byte-identical to golden
+    ``f725c06e``. See ``_l10_absdiff_ret_byte1_flag_rules``.
+    """
+    if not absdiff_ret_byte1_enabled():
+        return _noop_block_op("l10_absdiff_ret_byte1_flag")
+
+    rules = _l10_absdiff_ret_byte1_flag_rules()
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+    return Operation(
+        name="l10_absdiff_ret_byte1_flag",
+        reads={"OUTPUT_LO"},
+        writes={"ABSDIFF_RET_LEAK"},
+        kind="block",
+        target_op_name="l10_post_ops_combined",
+        requires={"after": "tail_bit32_result_correction"},
+        declarative_bake_fn=_absdiff_ret_bake(rules),
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="BLOG_SPEC.md#registers",
+    )
+
+
 def make_l10_absdiff_ret_byte1_op() -> Operation:
     """Flag-gated absdiff / func-return AX byte-1 OUTPUT_LO de-contamination op.
 
     Standalone ``PureFFN`` post_op attached to the L25 tail block AFTER
-    ``tail_bit32_result_correction`` (so it is the LAST OUTPUT-LO writer at the
-    AX return-byte row, dominating the L6 stale marker leak that persists into
-    the tail). Flag-OFF (or non-campaign / golden) produces ZERO rules and
+    ``l10_absdiff_ret_byte1_flag`` (so the ``ABSDIFF_RET_LEAK`` gate is fresh) and
+    thus after ``tail_bit32_result_correction`` — it is the LAST OUTPUT-LO writer
+    at the AX return-byte row, dominating the L6 stale marker leak that persists
+    into the tail. Flag-OFF (or non-campaign / golden) produces ZERO rules and
     appends NO post_op -> byte-identical to golden ``f725c06e``. See
     ``absdiff_ret_byte1_enabled`` / ``_l10_absdiff_ret_byte1_rules``.
     """
     if not absdiff_ret_byte1_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="l10_absdiff_ret_byte1",
-            reads=set(),
-            writes=set(),
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            compiler_ir=CompilerIR(),
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="BLOG_SPEC.md#registers",
-        )
+        return _noop_block_op("l10_absdiff_ret_byte1")
 
     rules = _l10_absdiff_ret_byte1_rules()
 
@@ -13007,17 +13156,18 @@ def make_l10_absdiff_ret_byte1_op() -> Operation:
     return Operation(
         name="l10_absdiff_ret_byte1",
         reads={
-            "OP_LEV", "IS_BYTE", "PSH_AT_SP", "MARK_STACK0",
+            "OP_LEV", "IS_BYTE", "ABSDIFF_RET_LEAK", "PSH_AT_SP", "MARK_STACK0",
             "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
             "MEM_ADDR_SRC", "OUTPUT_LO",
         },
         writes={"OUTPUT_LO"},
         kind="block",
         target_op_name="l10_post_ops_combined",
-        # Run AFTER tail_bit32_result_correction so this is the LAST OUTPUT-LO
-        # writer at the AX return-byte row (it must dominate the L6 stale-marker
-        # OUTPUT_LO leak that persists into the tail block).
-        requires={"after": "tail_bit32_result_correction"},
+        # Run AFTER the flag op (fresh ABSDIFF_RET_LEAK), hence after
+        # tail_bit32_result_correction -> this is the LAST OUTPUT-LO writer at the
+        # AX return-byte row (it must dominate the L6 stale-marker OUTPUT_LO leak
+        # that persists into the tail block).
+        requires={"after": "l10_absdiff_ret_byte1_flag"},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=ir,

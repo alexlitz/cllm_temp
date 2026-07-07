@@ -1714,16 +1714,39 @@ def absdiff_ret_byte1_enabled() -> bool:
     multiplicative gate; the current OP_LEV + additive-threshold form is the
     robust one.)
 
-    SAFETY: every absdiff / func_* / nested_* return value is <= 255, so AX bytes
-    1..3 are ALWAYS 0 at a return step — forcing OUTPUT_LO to nibble-0 there is
-    exactly correct, the same invariant ``C4_LEV_AX_BYTE1_KILL`` relies on. The
-    OP_LEV threshold + elevated-``OUTPUT_LO+k`` requirement keeps this off every
-    non-AX byte row (SP/BP decode, which ALSO reads OUTPUT_LO, has clean ~1.0
-    low nibbles at the return step so it never crosses the threshold) and off the
-    pre-LEV steps (OP_LEV=0); ``IS_BYTE`` keeps byte-0's real nibble; the marker
-    NOT-gates keep it off a genuine PSH-STACK0 rewrite. DEFAULT OFF; flag-OFF
-    registers NO rules -> byte-identical to golden ``f725c06e``. Kept as a
-    dedicated kill-switch for the flag-regression gate and the byte-identity gate.
+    NOT-a-multi-byte GUARD (the bounded ``ABSDIFF_RET_LEAK`` l6-crush flag):
+    ``func_mul`` returns a PRODUCT that can EXCEED 255 (e.g. mul(49,36)=1764,
+    byte-1=6; mul(17,21)=357, byte-1=1), so its byte-1 is REAL and must NOT be
+    zeroed. func_mul shares the LEV-return-step OP_LEV signature, so OP_LEV alone
+    wrongly fires there (regressing e.g. func_mul_3 PASS->FAIL). The separator is
+    the l6-CRUSH: on the absdiff single-byte leak the mis-firing
+    ``l6_psh_stack0_marker_cancel_output`` sub-loop CRUSHES ``OUTPUT_LO+0``
+    NEGATIVE (measured -46..-199 on ALL 25 absdiff at the ADJ AX byte-1 row)
+    while a genuine func_mul return leaves it CLEAN POSITIVE (+3.91) OR SATURATES
+    it hugely-negative (~-6e9). A PRECURSOR FFN writes a BANDED indicator
+    ``ABSDIFF_RET_LEAK = step(-(OUTPUT_LO+0) >= 10) - 2*step(-(OUTPUT_LO+0) >=
+    1000)``, and the corrector MULTIPLICATIVELY gates on it: clean-POSITIVE
+    OUTPUT_LO+0 (func_mul +3.91) -> flag 0 -> gate 0 -> NO write (legit byte-1
+    preserved); MODERATE crush (absdiff -46..-199) -> flag > 0 -> the correction
+    fires (byte-1 -> 0); SATURATED crush (genuine multi-byte func_mul ~-6e9, e.g.
+    mul(26,33)=858) -> the 2x hi-cancel DRIVES the flag NEGATIVE -> the corrector's
+    sign-flipped writes stay proportional to the ~6e9 delivered nibble so the
+    genuine byte-1 is PRESERVED (verified: passing func_mul id603/605/608 all stay
+    OK). The 2x cancel is load-bearing: silu is linear (not a true step) so an
+    equal-weight cancel would leave a positive residual at saturation that zeroes
+    the genuine byte-1. The raw (ungated) crush value was rejected: it let the
+    huge SP/BP/LEA/func_mul crushes amplify the multiplicative gate.
+
+    SAFETY: every absdiff / func_identity / nested single-byte return is <= 255,
+    so AX bytes 1..3 are 0 at the return step — forcing OUTPUT_LO to nibble-0 on
+    the l6-crushed rows is exactly correct (same invariant ``C4_LEV_AX_BYTE1_KILL``
+    relies on), and the crush guard excludes the genuine multi-byte func_mul
+    case. The OP_LEV>=~0.95 selector + crush term keep this off every non-AX byte
+    row (SP OP_LEV<=0.909 -> score<threshold; BP<=0.708) and off the pre-LEV
+    steps (OP_LEV=0); ``IS_BYTE`` keeps byte-0's real nibble; the marker NOT-gates
+    keep it off a genuine PSH-STACK0 rewrite. DEFAULT OFF; flag-OFF registers NO
+    rules -> byte-identical to golden ``f725c06e``. Kept as a dedicated
+    kill-switch for the flag-regression gate and the byte-identity gate.
     """
     return os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
 
