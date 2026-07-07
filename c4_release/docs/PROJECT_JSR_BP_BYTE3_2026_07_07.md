@@ -85,12 +85,20 @@ non-JSR byte-3 predictor ~-0.4 → only the target row fires.
   ΔOUTPUT_LO+1 = -1243 (byte-3 → 0x00).
 * **Live model flag-ON**: BP byte-3 → 0x00 on every step-0 JSR; BP byte-2 stays
   0x01; BP byte-0/1 and SP byte-3 untouched; add/sub byte-identical ON/OFF.
-* **On-target AR verdict** (`cpu_full_trace --spec-k 0` ON vs OFF on
-  func_min/max + var_three/loop_sum + add/sub) + broad regression: launched,
-  extremely slow under the multi-agent CPU contention — DEFERRED to the main
-  thread (per brief). The teacher-forced + hook-inject evidence establishes the
-  root and the byte flip; the AR PASS/advance verdict is the remaining
-  confirmation.
+* **Gate classify flag-ON** (`_probe_funcmin_attr.py`): the vcorr (first
+  value-byte poisoning step) **advances 0 → 2** on func_min (675), func_max
+  (650), func_identity (550), func_add (575) — the step-0 BP byte-3 leak is
+  eliminated cluster-wide; the new first poisoning point is step 2 (SP byte-2,
+  §5). The still-reported div_step (12/14/10/16) is now CROSS-STEP downstream of
+  the step-2 wall (a teacher-forcing artifact), NOT the same failure.
+* **On-target AR verdict** (`cpu_full_trace --spec-k 0 --max-steps-cap 40` ON vs
+  OFF on func_min/max + var_three/loop_sum + add/sub) + broad regression:
+  launched, but the 20-step func programs' autoregressive decode is
+  impractically slow under the concurrent multi-agent CPU contention (>200 min
+  CPU/state without finishing program 1) — **DEFERRED to the main thread** (per
+  brief). The teacher-forced + hook-inject + gate-classify evidence establishes
+  the root, the byte flip, and the cluster-wide vcorr advance; the AR
+  PASS/advance verdict is the remaining confirmation.
 
 ## 5. Next wall (after this fix)
 
