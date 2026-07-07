@@ -46,6 +46,7 @@ from .shared import sili_b1_restore_enabled  # noqa: F401
 from .shared import loop_lea_b0_e0_restore_enabled  # noqa: F401
 from .shared import absdiff_fix_enabled  # noqa: F401
 from .shared import loop_lea_b0_e8_restore_enabled  # noqa: F401
+from .shared import jsr_bp_byte3_clear_enabled  # noqa: F401
 from .shared import loop_si_byterow_marker_clear_enabled  # noqa: F401
 from .shared import loop_li_opcode_fetch_addrkey_clamp_enabled  # noqa: F401
 
@@ -786,6 +787,25 @@ def all_core_ops(
         *(
             [make_l10_loop_lea_b0_e0_op()]
             if loop_lea_b0_e0_restore_enabled() else []
+        ),
+        # func-cluster step-0 (JSR) BP byte-3 high-byte CLEAR (flag
+        # C4_JSR_BP_BYTE3_CLEAR, DEFAULT OFF): a post_op attached AFTER the
+        # loop_lea ops that forces byte-3 = 0x00 on the JSR-step BP byte-3
+        # predictor row (IS_BYTE + BYTE_INDEX_2 + H1+3 + OP_JSR, HAS_SE-cold).
+        # ROOT: every func-cluster program's FIRST value-byte correction (the
+        # cross-step poisoning point) is at step 0 (JSR), on BP byte-3 -- the
+        # OUTPUT band is a near-tie the WRONG way (OUTPUT_LO+1 +8.0 >
+        # OUTPUT_LO+0 +6.9) so byte-3 decodes 0x01, BP -> 0x01010000 and the
+        # whole cluster flat-diverges. The ENT step has
+        # l6_ent_after_jsr_bp_byte3_00; the JSR step had NO clear. Hook-inject
+        # confirmed clearing this one byte advances the vcorr step 0 -> step 2 on
+        # func_min/max/identity/add. REGISTERED ONLY when the flag is on
+        # (lookahead-chain pattern) so a flag-off / golden build is
+        # byte-identical. See _l10_jsr_bp_byte3_clear_rules /
+        # jsr_bp_byte3_clear_enabled.
+        *(
+            [make_l10_jsr_bp_byte3_clear_op()]
+            if jsr_bp_byte3_clear_enabled() else []
         ),
         # absdiff arg-``b`` deref LI value byte-0 LO de-contamination (flag
         # C4_ABSDIFF_FIX, DEFAULT OFF): a post_op attached AFTER
