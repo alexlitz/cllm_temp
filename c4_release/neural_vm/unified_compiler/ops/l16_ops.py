@@ -47,6 +47,7 @@ from .shared import (
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
     store_ax_b0_override_enabled,
+    store_ax_b0_override_v2_enabled,
 )
 
 
@@ -1541,6 +1542,23 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
         (dim_ref('opcode_flag', 'EXIT'), -20.0),
         (dim_ref('opcode_flag', 'JMP'), -20.0),
     )
+    # V2 (C4_STORE_AX_B0_OVERRIDE_V2, default OFF): the CLEAN store-only
+    # discriminator. The plain override's -W OUTPUT_LO+0 write regressed
+    # ADD/SUB/cmp/mul (-24, revert 7869e5c3) because the store gate does not
+    # explicitly forbid the ALU/cmp opcodes. V2 appends a large-negative
+    # anti-condition on EVERY ALU/cmp opcode flag so the AND-gate `up` is driven
+    # deeply negative (silu -> 0) on ANY arithmetic/compare row — the override
+    # CANNOT bleed onto the arith result byte by construction — while a genuine
+    # SI/SC store row (all ALU/cmp flags ~0) is unaffected. Only appended when V2
+    # is ON, so flag-OFF keeps `store_ax_conditions` unchanged -> golden
+    # byte-identical.
+    _store_ax_v2 = store_ax_b0_override_v2_enabled()
+    if _store_ax_v2:
+        store_ax_conditions = store_ax_conditions + tuple(
+            (dim_ref('opcode_flag', _op), -20.0)
+            for _op in ('ADD', 'SUB', 'MUL', 'DIV', 'MOD',
+                        'EQ', 'NE', 'LT', 'GT', 'LE', 'GE')
+        )
     # var_mul step-9 fix (campaign-ON, opt out C4_STORE_AX_B0_OVERRIDE=0): the
     # SI/SC store-AX marker carries a STRONG OUTPUT byte-0 zero-default (the
     # L19/block-33 ~+26/+40 on OUTPUT_LO+0) that out-votes the bare additive
@@ -1551,7 +1569,10 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
     # nonzero low nibble overrides the zero default (k==0 self-cancels -> a
     # genuinely-zero low byte stays at the zero default). Flag-OFF keeps the
     # bare additive 2.0/S write (rule count unchanged -> golden byte-identical).
-    _store_ax_override = store_ax_b0_override_enabled()
+    # The override write form (30/S carried-nibble + -30/S OUTPUT_LO+0) is used
+    # by BOTH the plain override AND the discriminated V2 variant; V2 additionally
+    # hardens the gate (above) so it never fires on ALU/cmp rows.
+    _store_ax_override = store_ax_b0_override_enabled() or _store_ax_v2
     _store_ax_lo_w = (30.0 / S) if _store_ax_override else (2.0 / S)
     for k in range(16):
         lo_writes = ((dim_ref('output_lo', 'nibble', k), _store_ax_lo_w),)

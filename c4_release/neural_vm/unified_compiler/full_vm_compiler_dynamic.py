@@ -2362,6 +2362,15 @@ def compile_full_vm_dynamic(
             "C4_STORE_AX_B0_OVERRIDE": (
                 os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
             ),
+            # SI/SC store-AX byte-0 OVERRIDE V2 = the clean store-only
+            # discriminator (default OFF, opt in =1, BAKE-affecting): appends
+            # ALU/cmp opcode anti-conditions to store_ax_conditions AND switches
+            # the l16_store_ax_carry_lo write to the override form, so the ON/OFF
+            # builds bake different L16 FFN weights and must never share a memo
+            # entry. See shared.store_ax_b0_override_v2_enabled.
+            "C4_STORE_AX_B0_OVERRIDE_V2": (
+                os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "0") != "0"
+            ),
             # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
             # campaign-ON, opt out =0, BAKE-affecting): registers the
             # l10_loop_lea_b0_e0 PureFFN post_op so the ON / OFF builds
