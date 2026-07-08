@@ -27,7 +27,7 @@ from neural_vm.verification.decl_verifier import (
 print(f"[t={time.time():.1f}] imports done", flush=True)
 
 try:
-    from neural_vm.unified_compiler.backbone_bounds import load_default_bounds
+    from neural_vm.verification.backbone_bounds import load_default_bounds
     bounds_obj = load_default_bounds()
     bb = bounds_obj.as_strength_bound if bounds_obj is not None else None
 except Exception as e:

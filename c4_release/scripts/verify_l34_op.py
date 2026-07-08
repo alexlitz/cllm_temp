@@ -31,7 +31,7 @@ from neural_vm.unified_compiler.ops.l14_ops import (
 )
 
 try:
-    from neural_vm.unified_compiler.backbone_bounds import load_default_bounds
+    from neural_vm.verification.backbone_bounds import load_default_bounds
     bounds = load_default_bounds()
     bb = bounds.as_strength_bound if bounds is not None else None
 except Exception:

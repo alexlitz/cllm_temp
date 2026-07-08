@@ -13,7 +13,7 @@ from typing import List
 
 from neural_vm.dim_registry import DimRegistry
 from neural_vm.unified_compiler.ir import FFNRule
-from neural_vm.unified_compiler.predicates import (
+from neural_vm.verification.predicates import (
     And,
     Atom,
     Not,

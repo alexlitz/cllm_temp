@@ -23,7 +23,7 @@ from neural_vm.unified_compiler.ops.l10_ops import (
 )
 
 try:
-    from neural_vm.unified_compiler.backbone_bounds import load_default_bounds
+    from neural_vm.verification.backbone_bounds import load_default_bounds
     bb_obj = load_default_bounds()
     bb = bb_obj.as_strength_bound if bb_obj is not None else None
 except Exception:

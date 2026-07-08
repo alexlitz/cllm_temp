@@ -37,8 +37,8 @@ import dataclasses
 import re
 from typing import Iterable, Optional, Tuple
 
-from .ir import ConditionTerm, DimRef, FFNRule, WriteTerm
-from .primitives import (
+from ..unified_compiler.ir import ConditionTerm, DimRef, FFNRule, WriteTerm
+from ..unified_compiler.primitives import (
     AttentionProjectionWrite,
     DeclarativeAttentionHeadSpec,
 )

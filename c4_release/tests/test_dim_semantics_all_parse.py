@@ -1,7 +1,7 @@
 """F-4 acceptance test: every default dim has a parseable semantics."""
 import pytest
 from neural_vm.dim_registry import build_default_registry
-from neural_vm.unified_compiler.predicates import parse
+from neural_vm.verification.predicates import parse
 
 
 def test_every_default_dim_has_semantics():

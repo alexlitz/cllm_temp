@@ -91,7 +91,7 @@ class DimRegistry:
         """Register a dimension allocation. Returns the DimSlot.
 
         `semantics` is a predicate-DSL string (parse with
-        neural_vm.unified_compiler.predicates.parse) describing when this
+        neural_vm.verification.predicates.parse) describing when this
         dim fires. Optional during F-3 tolerant rollout; will become
         required in a follow-on commit once all ~80 dims are backfilled.
 
@@ -483,7 +483,7 @@ def build_default_registry() -> DimRegistry:
     """Build a DimRegistry matching the current _BakeDim allocations (d_model=512).
 
     Every alloc carries a ``semantics=`` predicate string (parseable by
-    ``neural_vm.unified_compiler.predicates.parse``) describing where the
+    ``neural_vm.verification.predicates.parse``) describing where the
     slot's value fires across the token sequence. Predicates are
     best-effort and conservative: a permissive-but-parseable predicate is
     preferred to no predicate so that the F-3 tolerant shim can flip to

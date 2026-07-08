@@ -1,6 +1,6 @@
 """S-3: predicate satisfiability + overlap tests."""
 import pytest
-from neural_vm.unified_compiler.predicates import (
+from neural_vm.verification.predicates import (
     is_tautology,
     overlaps,
     parse,

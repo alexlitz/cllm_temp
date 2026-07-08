@@ -4,7 +4,7 @@ import pytest
 from pathlib import Path
 import tempfile
 
-from neural_vm.unified_compiler.backbone_bounds import BackboneBounds, load_default_bounds
+from neural_vm.verification.backbone_bounds import BackboneBounds, load_default_bounds
 
 
 def _write_v1(tmp_path, bounds):

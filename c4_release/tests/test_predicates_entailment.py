@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from neural_vm.unified_compiler.predicates import (
+from neural_vm.verification.predicates import (
     entails,
     explain_failure,
     parse,

@@ -1,4 +1,4 @@
-"""Unit tests for ``unified_compiler.step_end_migration`` helpers.
+"""Unit tests for ``verification.step_end_migration`` helpers.
 
 These exercise the scaffolding the Wave B migrations rely on without
 touching any model weights or actually moving a production rule. See
@@ -17,7 +17,7 @@ from c4_release.neural_vm.unified_compiler.primitives import (
     AP,
     DeclarativeAttentionHeadSpec,
 )
-from c4_release.neural_vm.unified_compiler.step_end_migration import (
+from c4_release.neural_vm.verification.step_end_migration import (
     MARK_AX_NAME,
     MARK_SE_NAME,
     MigrationSafetyError,
