@@ -1670,6 +1670,87 @@ def absdiff_fix_enabled() -> bool:
     return os.environ.get("C4_ABSDIFF_FIX", "0") == "1"
 
 
+def absdiff_ret_byte1_enabled() -> bool:
+    """Return True iff the absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
+    de-contamination is active (DEFAULT ON — opt out via
+    ``C4_ABSDIFF_RET_BYTE1=0``; only meaningful in the 30-token campaign config).
+
+    ROOT (block-input attribution via ``tools/interp_oracle_gate`` +
+    ``tools/_probe_absdiff_ret_byte1.py``, spec_k=0 campaign, BUILT dims,
+    golden ``f725c06e``; absdiff_0 id1046, absdiff_7 id1053, absdiff_8 id1054):
+    on the ADJ step that IMMEDIATELY FOLLOWS the ``abs_diff`` LEV (function
+    return) — the failure-map "step-22" — the AX byte-1 predictor row emits
+    token ``0x01`` instead of ``0`` (``got_ax_bytes=[69,1,0,0]`` for
+    ``|16-85|=69``). The AX byte VALUE is decoded from the ``OUTPUT_LO`` nibble
+    one-hots (``W[1]-W[0]`` peaks at ``OUTPUT_LO+1`` / ``OUTPUT_LO+0``), and at
+    the leak row ``OUTPUT_LO+0`` is crushed to ``-199.5`` while ``OUTPUT_LO+1``
+    rises to ``+9.1`` -> the argmax nibble is 1 -> byte 0x01.
+
+    The runtime-dominant writer of ``OUTPUT_LO+1`` there is
+    ``layer6_routing_ffn :: l6_psh_stack0_marker_final_lo_1`` (contrib +9.94 vs
+    the clean_emitter default +0.96). That L6 rule is a 3-way AND
+    ``PSH_AT_SP AND MARK_STACK0 AND ALU_LO+1`` (threshold 2.5, unit weights) that
+    is only meant to fire at a genuine PSH-STACK0 marker step. On the post-LEV
+    ADJ step BOTH ``PSH_AT_SP`` and ``MARK_STACK0`` are 0, but ``ALU_LO+1`` reads
+    a NON-BINARY ``5.81`` (stale ALU low-nibble after the SUB) which alone clears
+    the AND threshold — so the AND mis-fires and stamps the value-1 nibble into
+    ``OUTPUT_LO``. This is NOT the ``H*_DUMP_OUT`` byte-1 dump path (already
+    killed at LEV by ``C4_LEV_AX_BYTE1_KILL``); it is the parallel OUTPUT-band
+    decode leak that still wins.
+
+    FIX (this flag, correct-by-construction, CLEAN DISCRIMINATOR): on the AX
+    value-byte rows of the LEV-return step — ``OP_LEV`` (the return-context
+    opcode marker, > 0.8 ONLY on the ADJ/return step, PATH-INDEPENDENT across
+    both the ``a>b`` true and false absdiff paths, and decaying AX~1.1 > SP~0.9 >
+    BP~0.6 across the step) AND ``IS_BYTE`` (a value byte, excludes the
+    byte-0/MARK_AX row so byte-0 keeps its real nibble) AND the ELEVATED
+    ``OUTPUT_LO+k`` leak itself (additive threshold, so the ~1.0 clean nibble
+    baseline stays dark) AND ``NOT PSH_AT_SP`` AND ``NOT MARK_STACK0`` (the L6
+    marker rule's own gates are provably OFF here, so its OUTPUT_LO write is
+    spurious) — for each nibble k in 1..15, write ``-DOM`` to ``OUTPUT_LO+k`` and
+    ``+DOM`` to ``OUTPUT_LO+0`` so the AX high bytes decode nibble-0 -> byte
+    value 0. (An earlier ``H2_PREV_STEP+0`` discriminator was PATH-DEPENDENT — 0
+    on the ``a>b`` true path — and over-fired on the clean nibble baseline via a
+    multiplicative gate; the current OP_LEV + additive-threshold form is the
+    robust one.)
+
+    NOT-a-multi-byte GUARD (the bounded ``ABSDIFF_RET_LEAK`` l6-crush flag):
+    ``func_mul`` returns a PRODUCT that can EXCEED 255 (e.g. mul(49,36)=1764,
+    byte-1=6; mul(17,21)=357, byte-1=1), so its byte-1 is REAL and must NOT be
+    zeroed. func_mul shares the LEV-return-step OP_LEV signature, so OP_LEV alone
+    wrongly fires there (regressing e.g. func_mul_3 PASS->FAIL). The separator is
+    the l6-CRUSH: on the absdiff single-byte leak the mis-firing
+    ``l6_psh_stack0_marker_cancel_output`` sub-loop CRUSHES ``OUTPUT_LO+0``
+    NEGATIVE (measured -46..-199 on ALL 25 absdiff at the ADJ AX byte-1 row)
+    while a genuine func_mul return leaves it CLEAN POSITIVE (+3.91) OR SATURATES
+    it hugely-negative (~-6e9). A PRECURSOR FFN writes a BANDED indicator
+    ``ABSDIFF_RET_LEAK = step(-(OUTPUT_LO+0) >= 10) - 2*step(-(OUTPUT_LO+0) >=
+    1000)``, and the corrector MULTIPLICATIVELY gates on it: clean-POSITIVE
+    OUTPUT_LO+0 (func_mul +3.91) -> flag 0 -> gate 0 -> NO write (legit byte-1
+    preserved); MODERATE crush (absdiff -46..-199) -> flag > 0 -> the correction
+    fires (byte-1 -> 0); SATURATED crush (genuine multi-byte func_mul ~-6e9, e.g.
+    mul(26,33)=858) -> the 2x hi-cancel DRIVES the flag NEGATIVE -> the corrector's
+    sign-flipped writes stay proportional to the ~6e9 delivered nibble so the
+    genuine byte-1 is PRESERVED (verified: passing func_mul id603/605/608 all stay
+    OK). The 2x cancel is load-bearing: silu is linear (not a true step) so an
+    equal-weight cancel would leave a positive residual at saturation that zeroes
+    the genuine byte-1. The raw (ungated) crush value was rejected: it let the
+    huge SP/BP/LEA/func_mul crushes amplify the multiplicative gate.
+
+    SAFETY: every absdiff / func_identity / nested single-byte return is <= 255,
+    so AX bytes 1..3 are 0 at the return step — forcing OUTPUT_LO to nibble-0 on
+    the l6-crushed rows is exactly correct (same invariant ``C4_LEV_AX_BYTE1_KILL``
+    relies on), and the crush guard excludes the genuine multi-byte func_mul
+    case. The OP_LEV>=~0.95 selector + crush term keep this off every non-AX byte
+    row (SP OP_LEV<=0.909 -> score<threshold; BP<=0.708) and off the pre-LEV
+    steps (OP_LEV=0); ``IS_BYTE`` keeps byte-0's real nibble; the marker NOT-gates
+    keep it off a genuine PSH-STACK0 rewrite. DEFAULT OFF; flag-OFF registers NO
+    rules -> byte-identical to golden ``f725c06e``. Kept as a dedicated
+    kill-switch for the flag-regression gate and the byte-identity gate.
+    """
+    return os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
+
+
 def loaded_operand_add_hi15_clear_enabled() -> bool:
     """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
     clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),
@@ -1737,6 +1818,48 @@ def funcadd_alu_hi13_clear_enabled() -> bool:
     cell-13 leak on their loaded operand-A ADD/compare steps).
     """
     return os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
+
+
+def func_add_b0_hinib_enabled() -> bool:
+    """Return True iff the func-return ADD byte-0 HIGH-nibble over-count fix is
+    active — the ALL-CELL magnitude-windowed ALU_HI operand-B-bleed clear
+    (DEFAULT-ON ``C4_FUNC_ADD_B0_HINIB``; opt out with =0). Gated behind the same
+    ``no_stack0_emit`` + ``loaded_operand_add_hi15_clear_enabled`` campaign chain
+    as the cell-13/15 clear, so the flag-OFF golden (35-tok) build is
+    byte-identical (the widened cell set is never installed off the campaign).
+
+    ROOT (BUILT-layout residual probe, campaign default, spec_k=0,
+    ``tools/_probe_funcadd_operand.py``): ``func_add`` (id 578 add(42,78)=0x78
+    got 0xB8, +0x40) diverges at step 13 = the ``a + b`` return ADD. The
+    operand-A high nibble (``a`` loaded from ``mem[BP+off]``) arrives in
+    ``ALU_HI`` as a TWO-hot: the true ``a//16`` cell (~+6.0) PLUS a spurious
+    ``~+1.0`` one-hot at the cell equal to **operand-B's high nibble**
+    (``b//16``). This is operand-B's high nibble bleeding through the L8 head-5
+    mem-to-ALU operand-A read into ALU_HI (measured cell-by-cell: id578 b_hi=4 ->
+    leak@4; id588 b_hi=3 -> leak@3, ALWAYS == b//16, ALWAYS ~1.0). The block-13
+    AddSub high-nibble add then reads the two-hot k-weighted sum
+    ``a_hi + b_hi`` for operand A, so the ADD result high nibble becomes
+    ``(a_hi + b_hi) + b_hi + carry`` = the true ``a_hi + b_hi + carry`` plus an
+    EXTRA ``b_hi`` -> ``+0x{b_hi}0`` over-count (the observed +0x30/+0x40/+0x50).
+    The prior cell-13 (0xD frame-address) clear does NOT catch this leak because
+    the leak cell is operand-B's high nibble (0x3/0x4/0x5), not the frame nibble.
+
+    THE FIX: the leak (~1.0) and the true operand one-hot (~6.0, >= ``CLEAN_MAX``)
+    are cleanly magnitude-separated by the SAME contaminant window the cell-13/15
+    clear uses. So extend ``LoadedOperandAddHi15ClearFFN``'s contaminant cell set
+    to ALL 16 ALU_HI cells: the window ``(0.5, CLEAN_MAX=5.85)`` clears the ~1.0
+    operand-B bleed while PRESERVING the ~6.0 true operand-A high-nibble one-hot.
+    Value-safe by construction (a true loaded operand-A high nibble is always
+    delivered at the SCALE_O ~6.0 magnitude; no legitimate operand cell sits in
+    the (0.5, 5.85) window). ADD-only opcode gate (unchanged) so it is inert on
+    every non-ADD row. Flips the 12/25 func_add whose operand-B high nibble is
+    non-zero (b >= 48). Scope is the loaded-operand ADD row (func_add step-13,
+    also any expr/var frame ADD reading a loaded operand-A); func_max/min return
+    via GT/LT+BZ+LEV with NO ADD step, so they are OUT of this fix's scope (their
+    loaded-operand compare rows are the C4_OPERAND_CAM_FIX territory). This fix
+    SUBSUMES the cell-13/15 clears when on (all 16 cells >= (13,15)).
+    """
+    return os.environ.get("C4_FUNC_ADD_B0_HINIB", "1") != "0"
 
 
 def operand_cam_fix_enabled() -> bool:
@@ -1939,6 +2062,46 @@ def store_ax_b0_override_enabled() -> bool:
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
         and os.environ.get("C4_STORE_AX_B0_OVERRIDE", "0") != "0"
+    )
+
+
+def store_ax_b0_override_v2_enabled() -> bool:
+    """Return True iff the SI/SC store-AX byte-0 OUTPUT materializer uses the
+    zero-default OVERRIDE write form *with an ALU/cmp opcode ANTI-CONDITION gate*
+    (the "clean discriminator" V2). DEFAULT **ON** (``C4_STORE_AX_B0_OVERRIDE_V2``,
+    opt out ``=0``); gated behind the two campaign flags so the flag-OFF golden
+    (35-tok) build is byte-identical.
+
+    WHY V2 (root: var_three id300 / var_mul step-9 SI-store; task this session):
+    the plain ``C4_STORE_AX_B0_OVERRIDE`` (default OFF since 7869e5c3) FIXES the
+    store step (var_three id300 SI-of-b step-9: AX byte-0 token 0 -> 6, GPU/CPU
+    teacher-forced verified) but was reverted OFF because "ON amplified the
+    l16_store_ax_carry misfire onto ADD/SUB/cmp/mul rows (-24)". The plain
+    ``store_ax_conditions`` gate (``OP_SI + OP_SC + MARK_AX - 8*MARK_PC -
+    10*IS_BYTE - 20*OP_EXIT - 20*OP_JMP``, threshold 4.0) does NOT explicitly
+    forbid the ALU/cmp opcodes, so any residual OP_SI/OP_SC energy at an
+    ADD/SUB/MUL/DIV/MOD/cmp AX-marker row can lift the AND-gate ``up`` above zero
+    and let the strong ``-W`` OUTPUT_LO+0 write bleed onto the arithmetic result
+    byte. V2 adds a large-negative anti-condition on every ALU/cmp opcode flag
+    (``-20`` each) so the AND-gate ``up`` is driven deeply negative (silu -> 0) on
+    ANY ADD/SUB/MUL/DIV/MOD/EQ/NE/LT/GT/LE/GE row — the override CANNOT fire there
+    by construction, while a genuine SI/SC store row (all ALU/cmp flags ~0) is
+    unaffected. This is the clean store-only discriminator the plain override
+    lacked. Rule COUNT is unchanged (only the SI/SC store rules' condition tuple +
+    write tuples change, and only when V2 is ON), so the flag-OFF golden bake is
+    byte-identical.
+
+    Mutually exclusive with the plain override in practice: enable EITHER
+    ``C4_STORE_AX_B0_OVERRIDE=1`` (broad, un-discriminated) OR
+    ``C4_STORE_AX_B0_OVERRIDE_V2=1`` (discriminated). If both are set, V2 wins (the
+    anti-condition gate is the strict superset guard). Output-affecting only inside
+    the campaign; flag OFF (or off-campaign) keeps the bare additive ``2.0/S``
+    write (golden ``f725c06e`` byte-identical).
+    """
+    return (
+        no_stack0_emit_enabled()
+        and operand_from_memsp_enabled()
+        and os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
     )
 
 
@@ -2154,7 +2317,7 @@ def jsr_bp_byte3_clear_enabled() -> bool:
     """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR
     (``C4_JSR_BP_BYTE3_CLEAR``) is active.
 
-    DEFAULT **OFF** (opt in ``C4_JSR_BP_BYTE3_CLEAR=1``). Requires the campaign
+    DEFAULT **ON** (opt out ``C4_JSR_BP_BYTE3_CLEAR=0``). Requires the campaign
     config (``C4_NO_STACK0_EMIT=1`` + ``C4_OPERAND_FROM_MEMSP=1``). Flag-off OR a
     non-campaign / golden build registers NO rules and appends NO post_op, so the
     model is bit-for-bit identical to golden ``f725c06e``.
@@ -2197,7 +2360,7 @@ def jsr_bp_byte3_clear_enabled() -> bool:
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "0") == "1"
+        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
     )
 
 

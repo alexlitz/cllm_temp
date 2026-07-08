@@ -124,9 +124,11 @@ the flag-regression / cross-op gates.
 |------|---------|--------|---------|
 | `C4_LOADED_OPERAND_ADD_HI15_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-15 address-leak clear (var_update). |
 | `C4_FUNCADD_ALU_HI13_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-13 leak clear (func_add/mul/max/min). |
+| `C4_FUNC_ADD_B0_HINIB` | `0` (off) | active | func-return ADD byte-0 hi-nibble over-count fix: widen the loaded-operand ADD ALU_HI clear to ALL 16 cells (magnitude-windowed) to zero the ~1.0 operand-B-high-nibble bleed while preserving the ~6.0 true operand. Gated on `no_stack0_emit` (campaign). |
 | `C4_SILI_CAM_B1` | `1` (campaign) | active | SI/LI load byte-1 address-leak discriminator (Inc-2). |
 | `C4_SILI_B1_RESTORE` | `1` (campaign) | active | SI/LI byte-1 restore. |
-| `C4_STORE_AX_B0_OVERRIDE` | `1` in build / `0` in shared | active | Store AX byte-0 override. |
+| `C4_STORE_AX_B0_OVERRIDE` | `1` in build / `0` in shared | active | Store AX byte-0 override (un-discriminated; reverted OFF in shared 7869e5c3, -24 arith). |
+| `C4_STORE_AX_B0_OVERRIDE_V2` | `0` (default OFF) | active | Store AX byte-0 override, clean store-only discriminator (ALU/cmp opcode anti-conditions). Fixes var_three/var_mul SI-store step; add/sub untouched. |
 | `C4_PSH_ARG_VAL_AX` | `1` | active | PSH-of-argument value-source AX lock (call-arg store). |
 | `C4_L15_LI_SUPPR_INERT` | `1` | active | L15 head-0 LI/LC-load suppressor inert (func/nested/rec/var LI). |
 | `C4_L15_LI_ADDR_CAM` | campaign | active | L15 head-0 LI value-load ADDR_B0 CAM (#313). |
@@ -233,6 +235,7 @@ building blocks — conservative hold).
 | `C4_LEA_BYTE0_MEMSP_RELAY` | forced→live | campaign | **KEEP (A/B knob on live corrector)**. |
 | `C4_LEA_BYTE0_ALU_AMPLIFY` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — the frame-depth LEA byte-0 ALU-amplifier kill-switch; overrides the `C4_OPCAM_FRAME` umbrella when set explicitly. |
 | `C4_OPCAM_FRAME` | `0` (off) | campaign | **KEEP** — operand-CAM frame-depth umbrella; `=1` turns on the L10 multi-param LEA byte-0 ALU-amplifier (survey R2: func_add/mul/max/min + absdiff 2nd-param `&b` 0xFFE8→0xFFE0). Default-OFF → flag-OFF byte-identical `91f55411`. `C4_LEA_BYTE0_ALU_AMPLIFY` overrides it. |
+| `C4_ABSDIFF_RET_BYTE1` | `0` (off) | campaign | **KEEP** — absdiff/func-return AX byte-1 OUTPUT_LO stale-marker de-contamination. `=1` adds two L10-tail post_ops (a bounded `ABSDIFF_RET_LEAK` l6-crush-band flag + the corrector) that force the spurious OUTPUT_LO high-byte nibble to 0 on the AX byte rows of the LEV-return step (OP_LEV≥0.95 selector), fixing the step-22 (ADJ-after-LEV) 0x01 leak on all 25 absdiff; the crush-band flag excludes genuine multi-byte func_mul returns (no regression). Default-OFF → flag-OFF byte-identical `f725c06e`. See `shared.absdiff_ret_byte1_enabled`. |
 | `C4_L15_SAVEDRA_HEAD` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — L15 head-15 saved-RA delivery. |
 | `C4_POST_ENT_SE_SUPPRESS` | `0` (off) | campaign | **DELETED** (commit `2043ff4d`) — dead-end framing building block. |
 | `C4_ENT_SP_BYTE1_ISMARK_BLOCKER` | `0` (off) | campaign | **DELETED** (commit `10d7b876`) — docstring records NEGATIVE RESULT (0 programs advance; "the real fix is the project-level multi-part build, not a solo corrector"). |
