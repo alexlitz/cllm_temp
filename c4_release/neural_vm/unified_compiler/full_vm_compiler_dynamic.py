@@ -2500,6 +2500,16 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_OPERAND_CAM_FIX", "0") != "0"
             ),
+            # func_max/func_min CMP loaded-operand-A clean (task #428, DEFAULT-OFF,
+            # opt in =1, MODULE-affecting): installs the CmpLoadedOperandCleanFFN
+            # wrap on the L9 block.ffn so the ON / OFF models are structurally
+            # different modules and must never share a memo entry. Gated on the
+            # campaign prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden
+            # build is byte-identical. See shared.func_cmp_operand_clean_enabled.
+            "C4_FUNC_CMP_OPERAND_CLEAN": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_FUNC_CMP_OPERAND_CLEAN", "0") == "1"
+            ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
             # ON / OFF builds bake a different W_q row and must never share a
@@ -3047,6 +3057,13 @@ def _collect_ops_for_compile(
         # Campaign-gated; flag-OFF leaves block.ffn untouched (golden
         # byte-identical).
         ops.append(_static.make_loaded_operand_add_hi15_clear_op())
+        # Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task
+        # #428). Wraps the L9 block.ffn (CMP nibble-comparator factory) to clean
+        # the SE_ALU operand-A band on the MARK_SE_ONLY cmp row before the L9 CMP
+        # rules read it. Must come AFTER layer9_alu (whose FFN it wraps).
+        # Explicit-opt-in campaign flag; flag-OFF leaves block.ffn untouched
+        # (golden byte-identical). See shared.func_cmp_operand_clean_enabled.
+        ops.append(_static.make_cmp_loaded_operand_clean_op())
         ops.append(_static.make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
         ops.append(_static.make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
 
@@ -3454,6 +3471,16 @@ def _bake_from_scheduled_ops(
         "C4_OPERAND_CAM_FIX": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_OPERAND_CAM_FIX", "0") != "0"
+        ),
+        # func_max/func_min CMP loaded-operand-A clean (task #428, DEFAULT-OFF,
+        # opt in =1, MODULE-affecting): installs CmpLoadedOperandCleanFFN on the
+        # L9 block.ffn so the ON / OFF models are structurally different modules
+        # and must never share a serialised entry. Gated on the campaign
+        # prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign / golden build is
+        # byte-identical. See shared.func_cmp_operand_clean_enabled.
+        "C4_FUNC_CMP_OPERAND_CLEAN": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_FUNC_CMP_OPERAND_CLEAN", "0") == "1"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF

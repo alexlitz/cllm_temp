@@ -1480,6 +1480,127 @@ class CmpOperandSeRecoverFFN(nn.Module):
         return None
 
 
+class CmpLoadedOperandCleanFFN(nn.Module):
+    """Campaign func_max/func_min CMP loaded-operand-A two-hot clean.
+
+    Drop-in replacement for ``block.ffn`` of the L9 block (the block whose FFN
+    holds the L9 CMP nibble-comparator factory — ``_layer9_cmp_rules``). Its
+    attention head ``layer9_step_end_operand_relay`` has ALREADY mirrored the
+    per-step operand-A ``ALU_LO/HI`` into ``SE_ALU_LO/HI`` (Q@MARK_SE_ONLY,
+    K@MARK_AX within-step) at the FFN's INPUT, so this wrap cleans the
+    SE-tagged operand-A band on the ``MARK_SE_ONLY`` cmp row BEFORE the CMP
+    factory rules read it, then delegates to the inner ``PureFFN``.
+
+    THE ROOT (spec_k=0, BUILT dims, campaign+``C4_JSR_BP_BYTE3_CLEAR=1``, GPU/CPU
+    faithful, ``tools/_probe_funcmax_cmp_operand.py`` + ``_probe_funcmax_cmp_sweep.py``):
+    ``func_max`` / ``func_min`` (ids 650-699) return via a ``GT`` / ``LT`` compare
+    + ``BZ`` branch + ``LEV`` — the loaded local ``a`` (``LI`` -> ``PSH`` ->
+    ``mem[SP]``) is operand A of that compare. The L8 head-5 mem-to-ALU value copy
+    delivers operand A into ``ALU_HI`` as a TWO-HOT: the true ``a//16`` cell PLUS a
+    spurious ``~+0.94`` one-hot at the cell equal to operand-B's high nibble
+    (``b//16``) — operand B (``AX_CARRY_HI``, the other loaded local) bleeding
+    through head 5's operand-A read (the SAME leak class as func_add's
+    ``C4_FUNC_ADD_B0_HINIB``, on the CMP path). The ``layer9_step_end_operand_relay``
+    mirrors this two-hot into ``SE_ALU_HI``, and the L9 nibble comparator
+    (``a_hi < b_hi`` / ``a_hi == b_hi``) reads the contaminated operand-A high
+    nibble -> WRONG ``GT``/``LT`` flag -> wrong branch -> returns the wrong operand.
+    The leak is DECISIVE precisely when ``a//16 == 0``: the immediate path delivers
+    a positive ``SE_ALU_HI[0]`` one-hot (~+5.12) for a zero high nibble, but the
+    LOADED path delivers NO cell-0 one-hot (only the ``~-0.02`` residue) so the
+    ``~+0.94`` ``b_hi`` leak WINS the argmax and the comparator reads
+    ``a_hi == b_hi`` instead of ``a_hi == 0``.
+
+    THE FIX (this wrap; correct by construction, campaign-default-OFF, gated OFF
+    byte-identical): on the ``MARK_SE_ONLY`` cmp rows ONLY, for BOTH the high and
+    low nibble bands:
+      1. LEAK CLEAR — zero ``SE_ALU_*[c]`` where ``c == b nibble`` (the
+         ``SE_AX_CARRY_*`` one-hot, operand B) AND the cell is in the narrow leak
+         window ``(0.5, LEAK_MAX=3.0)``. The ``~0.94`` leak is zeroed; a genuine
+         operand-A one-hot is preserved: the IMMEDIATE ``a_hi==b_hi`` true one-hot
+         lands ``~+5.63`` and the LOADED one lands ``~+6.59`` — BOTH ``>= 3.0`` so
+         both survive (measured; window chosen to sit strictly between the 0.94
+         leak and the 5.63 minimum true magnitude). This is what makes the fix
+         inert on the shared ``if_gt`` / ``if_lt`` ``a_hi==b_hi`` path.
+      2. ZERO-NIBBLE RECOVER — after the clear, if NO ``SE_ALU_*`` cell is strong
+         (``>= LEAK_MAX``) on that cmp row, the true nibble is 0, so write a
+         positive one-hot at cell 0 (``+ALU_CLEAN_MAG=5.3``, the immediate-path
+         cell-0 magnitude) so the comparator's ``a==0`` / ``a<b`` unit fires
+         (``SE_ALU_*+0`` must be positive for the L9 4-way AND to trip). Immediate
+         ``a==0`` rows already carry a strong cell-0 one-hot, so the recover never
+         fires there (inert on ``if_gt``/``if_lt`` immediates).
+
+    Runs in ONE block (it IS ``block.ffn`` of the L9 block) so the physical block
+    count is unchanged (the absolute-position LEA contract holds). Operand B
+    (``SE_AX_CARRY``) is never rewritten; ``CMP`` is never written here. Gate-OFF /
+    non-campaign leaves ``block.ffn = inner`` exactly (byte-identical to golden
+    ``f725c06e`` flag-OFF); installed only when ``no_stack0_emit_enabled() and
+    func_cmp_operand_clean_enabled()`` AND the ``SE_ALU`` mirror dims exist.
+    """
+
+    LEAK_MAX = 3.0        # upper bound of the ~0.94 b_hi leak window (< 5.63 true)
+    ALU_CLEAN_MAG = 5.3   # golden immediate-path cell-0 one-hot magnitude (~5.12)
+
+    def __init__(self, inner, *, se_alu_lo, se_alu_hi, se_ax_carry_lo,
+                 se_ax_carry_hi, mark_se_only, se_cmp_op_dims):
+        super().__init__()
+        self.inner = inner
+        self.se_alu_lo = int(se_alu_lo)
+        self.se_alu_hi = int(se_alu_hi)
+        self.se_ax_carry_lo = int(se_ax_carry_lo)
+        self.se_ax_carry_hi = int(se_ax_carry_hi)
+        self.mark_se_only = int(mark_se_only)
+        # The six SE-tagged comparison opcode flag dims (one-hot per cmp step at
+        # the SE row). Fires the wrap only on genuine cmp SE rows.
+        self.se_cmp_op_dims = tuple(int(d) for d in se_cmp_op_dims)
+        self._is_cmp_loaded_operand_clean_wrap = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # cmp opcode (OR of the six SE_OP flags) AND MARK_SE_ONLY, per row.
+        cmp_op = torch.zeros_like(x[:, :, self.mark_se_only])
+        for d in self.se_cmp_op_dims:
+            cmp_op = cmp_op + x[:, :, d]
+        row = ((cmp_op > 0.5) & (x[:, :, self.mark_se_only] > 0.5))[:, :, None]
+        row = row.to(dtype=x.dtype)  # [B,S,1]
+        x = x.clone()
+        oh0 = torch.zeros(16, device=x.device, dtype=x.dtype)
+        oh0[0] = self.ALU_CLEAN_MAG
+        oh0 = oh0.view(1, 1, 16)
+        for a_base, b_base in (
+            (self.se_alu_hi, self.se_ax_carry_hi),
+            (self.se_alu_lo, self.se_ax_carry_lo),
+        ):
+            band = x[:, :, a_base:a_base + 16]                       # [B,S,16]
+            b_oh = (x[:, :, b_base:b_base + 16] > 0.5).to(x.dtype)   # operand-B nibble
+            in_win = ((band > 0.5) & (band < self.LEAK_MAX)).to(x.dtype)
+            # 1. Zero the b-nibble leak cell (in-window only) on cmp SE rows.
+            zero_mask = b_oh * in_win * row
+            band2 = band * (1.0 - zero_mask)
+            # 2. If no strong cell remains on this cmp SE row -> true nibble is 0
+            #    -> write a positive cell-0 one-hot (immediate-path shape).
+            strong = (band2 >= self.LEAK_MAX).any(dim=-1, keepdim=True).to(x.dtype)
+            need0 = row[:, :, 0:1] * (1.0 - strong)                  # [B,S,1]
+            band2 = band2 + need0 * oh0
+            x[:, :, a_base:a_base + 16] = band2
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility (plumb through to inner) ----
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 class MulOperandSeRecoverFFN(nn.Module):
     """Campaign MUL operand-A SE_ALU recover wrapping the L11 wide_mul FFN.
 

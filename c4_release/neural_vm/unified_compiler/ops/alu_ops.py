@@ -1061,6 +1061,92 @@ def make_loaded_operand_add_hi15_clear_op() -> Operation:
     )
 
 
+def make_cmp_loaded_operand_clean_op() -> Operation:
+    """Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task #428).
+
+    Wraps ``model.blocks[9].ffn`` (the L9 block whose FFN holds the CMP
+    nibble-comparator factory ``_layer9_cmp_rules``) with
+    :class:`CmpLoadedOperandCleanFFN`. The L9 attention head
+    ``layer9_step_end_operand_relay`` has already mirrored the per-step operand-A
+    ``ALU_LO/HI`` into ``SE_ALU_LO/HI`` at the FFN INPUT, so the wrap cleans the
+    SE-tagged operand-A band on the ``MARK_SE_ONLY`` cmp row BEFORE the CMP rules
+    read it (zero the ``~0.94`` operand-B ``b_hi`` leak in a narrow window +
+    write a positive cell-0 one-hot when the true nibble is 0), then delegates to
+    the inner ``PureFFN``. See ``shared.func_cmp_operand_clean_enabled`` for the
+    full root + value-safety argument.
+
+    Runs in ONE block (it IS ``block.ffn``) so the physical block count is
+    unchanged (the absolute-position LEA contract holds). Campaign-only + explicit
+    opt-in: installed only when ``no_stack0_emit_enabled() and
+    func_cmp_operand_clean_enabled()`` AND the ``SE_ALU`` mirror dims exist in this
+    layout (campaign over-width dims; absent in the narrow golden). Flag-OFF /
+    non-campaign leaves ``block.ffn`` exactly (byte-identical to golden
+    ``f725c06e`` flag-OFF). Runs AFTER ``layer9_alu`` so it wraps the built L9 FFN.
+    """
+    def bake(block, dim_positions, S):
+        from .shared import (
+            no_stack0_emit_enabled,
+            func_cmp_operand_clean_enabled,
+        )
+        if not (no_stack0_emit_enabled() and func_cmp_operand_clean_enabled()):
+            return
+        BD = _as_setdim_proxy(dim_positions)
+        # Only install when the SE_ALU / SE_AX_CARRY mirror dims exist (campaign
+        # over-width dims). Also require the SE_OP_<cmp> flag dims.
+        need = (
+            "SE_ALU_LO", "SE_ALU_HI", "SE_AX_CARRY_LO", "SE_AX_CARRY_HI",
+            "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT", "SE_OP_GT", "SE_OP_LE",
+            "SE_OP_GE",
+        )
+        if not all(hasattr(BD, nm) for nm in need):
+            return
+        # ``kind="block"`` bound to the L9 CMP layer (``target_op_name``): the
+        # compiler passes the RESOLVED physical L9 block AFTER its FFN is fully
+        # lowered (the ``_layer9_cmp_rules`` CMP factory), and its attention has
+        # already mirrored operand-A into ``SE_ALU`` at the FFN input — so
+        # wrapping ``block.ffn`` cleans the SE band the CMP rules read.
+        # Idempotent guard.
+        if getattr(block.ffn, "_is_cmp_loaded_operand_clean_wrap", False):
+            return
+        from ...efficient_alu_neural import CmpLoadedOperandCleanFFN
+        se_cmp_op_dims = [
+            getattr(BD, nm) for nm in (
+                "SE_OP_EQ", "SE_OP_NE", "SE_OP_LT", "SE_OP_GT",
+                "SE_OP_LE", "SE_OP_GE",
+            )
+        ]
+        block.ffn = CmpLoadedOperandCleanFFN(
+            block.ffn,
+            se_alu_lo=BD.SE_ALU_LO,
+            se_alu_hi=BD.SE_ALU_HI,
+            se_ax_carry_lo=BD.SE_AX_CARRY_LO,
+            se_ax_carry_hi=BD.SE_AX_CARRY_HI,
+            mark_se_only=BD.MARK_SE_ONLY,
+            se_cmp_op_dims=se_cmp_op_dims,
+        )
+
+    return Operation(
+        name="cmp_loaded_operand_clean",
+        # Bind to the L9 layer (the CMP factory anchor) — same target the
+        # ``layer9_alu`` block op uses — and run at a phase AFTER the L9 FFN +
+        # its post_ops are lowered so ``block.ffn`` is finalised (and after the
+        # L10 wraps never touch this block). phase=9.95 > any L9 FFN phase, < L10.
+        target_op_name="layer9_marker_suppress",
+        phase=9.95,
+        reads=set(),
+        writes=set(),
+        kind="block",
+        declarative_bake_fn=bake,
+        declarative_authority="structural_model",
+        migrated=True,
+        claims=set(),
+        produces={'__module_replacement':
+                  'L9.ffn[CmpLoadedOperandCleanFFN]'},
+        spec_section="BLOG_SPEC.md#binary-ALU",
+        opcodes={"OP_LT", "OP_GT", "OP_EQ", "OP_NE", "OP_LE", "OP_GE"},
+    )
+
+
 def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
     """Replace L10 ``block.ffn`` with a rule-lowered bitwise FFN (= bitwise neural ALU).
 

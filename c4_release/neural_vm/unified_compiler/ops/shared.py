@@ -1910,6 +1910,54 @@ def operand_cam_fix_enabled() -> bool:
     return no_stack0_emit_enabled() and (explicit is not None and explicit != "0")
 
 
+def func_cmp_operand_clean_enabled() -> bool:
+    """Return True iff the func_max/func_min CMP loaded-operand-A two-hot clean
+    is active (DEFAULT-OFF ``C4_FUNC_CMP_OPERAND_CLEAN``; opt in with ``=1``).
+    Gated behind the ``no_stack0_emit`` campaign prerequisite so the flag-OFF
+    golden (35-tok) build is byte-identical (the L9 ``block.ffn`` wrap is never
+    installed off the campaign, and the ``SE_ALU`` mirror dims it reads are
+    campaign over-width dims absent from the narrow golden layout).
+
+    ROOT (spec_k=0, BUILT dims, campaign + ``C4_JSR_BP_BYTE3_CLEAR=1``, GPU/CPU
+    faithful; ``tools/_probe_funcmax_cmp_operand.py`` +
+    ``tools/_probe_funcmax_cmp_sweep.py``): ``func_max`` / ``func_min`` (ids
+    650-699) return via a ``GT`` / ``LT`` compare + ``BZ`` branch + ``LEV`` — the
+    loaded local ``a`` (``LI`` -> ``PSH`` -> ``mem[SP]``) is operand A of that
+    compare. The L8 head-5 mem-to-ALU operand-A read delivers ``ALU_HI`` as a
+    TWO-HOT: the true ``a//16`` cell PLUS a spurious ``~+0.94`` one-hot at the cell
+    equal to operand-B's high nibble (``b//16``) — operand B bleeding through the
+    operand-A read (the SAME leak class as func_add's ``C4_FUNC_ADD_B0_HINIB``, on
+    the CMP path). The ``layer9_step_end_operand_relay`` mirrors the two-hot into
+    ``SE_ALU_HI`` and the L9 nibble comparator reads the wrong operand-A high
+    nibble -> wrong ``GT``/``LT`` flag -> wrong branch -> returns the wrong
+    operand. DECISIVE when ``a//16 == 0``: the LOADED path delivers NO positive
+    cell-0 one-hot for a zero high nibble (unlike the immediate path, which lands
+    ``SE_ALU_HI[0] ~= +5.12``), so the ``~0.94`` ``b_hi`` leak WINS the argmax and
+    the comparator reads ``a_hi == b_hi`` instead of ``a_hi == 0``.
+
+    THE FIX (``CmpLoadedOperandCleanFFN`` wrapping the L9 ``block.ffn``): on the
+    ``MARK_SE_ONLY`` cmp rows only, (1) zero ``SE_ALU_*[c]`` where ``c == b``
+    nibble (``SE_AX_CARRY_*`` one-hot) AND in the narrow leak window
+    ``(0.5, 3.0)`` — the ``~0.94`` leak is zeroed while the immediate
+    ``a_hi==b_hi`` true one-hot (``~+5.63``) and the loaded one (``~+6.59``) both
+    survive; and (2) if no ``SE_ALU_*`` cell is strong after the clear, write a
+    positive cell-0 one-hot (``+5.3``) so the ``a==0`` comparator unit fires. Both
+    steps are provably inert on the shared ``if_gt``/``if_lt`` immediate path
+    (immediates carry a strong cell-0 one-hot for ``a==0`` and a ``>=5.63``
+    one-hot for ``a_hi==b_hi``, neither of which the window/recover touches). The
+    window is chosen to sit strictly between the 0.94 leak and the 5.63 minimum
+    true magnitude, so it is correct by construction (measured, not tuned).
+
+    Campaign entry point: ``C4_CAMPAIGN=1`` does NOT auto-enable this (it is a
+    net-new value fix pending its verdict-flip audit); opt in explicitly with
+    ``C4_FUNC_CMP_OPERAND_CLEAN=1``.
+    """
+    return (
+        no_stack0_emit_enabled()
+        and os.environ.get("C4_FUNC_CMP_OPERAND_CLEAN", "0") == "1"
+    )
+
+
 def sili_cam_b1_enabled() -> bool:
     """Return True iff the si/li LOAD byte-1 address-leak discriminator (Inc-2)
     is active. DEFAULT campaign-ON (``C4_SILI_CAM_B1=1``), opt out with
