@@ -2372,14 +2372,16 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
             ),
             # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
-            # de-contamination (DEFAULT ON, opt out =0, STRUCTURALLY-affecting):
+            # de-contamination (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting):
             # registers TWO extra L10-tail PureFFN post_ops (a bounded
             # ABSDIFF_RET_LEAK l6-crush flag + the corrector) so the ON / OFF
             # builds STRUCTURALLY differ (extra FFN ops + blocks) and must never
             # share a memo entry. Flag-OFF registers NO rules -> byte-identical
-            # to golden. See shared.absdiff_ret_byte1_enabled.
+            # to golden. Held DEFAULT-OFF in the 2026-07 round-1 land: ON regressed
+            # test_lea_basic (crush-band over-fires on the ENT-frame LEA row).
+            # See shared.absdiff_ret_byte1_enabled.
             "C4_ABSDIFF_RET_BYTE1": (
-                os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
+                os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
             ),
             # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
             # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an
@@ -3334,13 +3336,15 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
         ),
         # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker de-contamination
-        # (DEFAULT ON, opt out =0, STRUCTURALLY-affecting): registers TWO extra
+        # (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting): registers TWO extra
         # L10-tail PureFFN post_ops (a bounded ABSDIFF_RET_LEAK l6-crush flag +
         # the corrector) so ON / OFF builds STRUCTURALLY differ (extra FFN ops +
         # blocks) and must never share a serialised entry. Flag-OFF registers NO
-        # rules -> byte-identical to golden. See shared.absdiff_ret_byte1_enabled.
+        # rules -> byte-identical to golden. Held DEFAULT-OFF in the 2026-07
+        # round-1 land: ON regressed test_lea_basic (crush-band over-fires on the
+        # ENT-frame LEA row). See shared.absdiff_ret_byte1_enabled.
         "C4_ABSDIFF_RET_BYTE1": (
-            os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
+            os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
         ),
         # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
         # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an extra

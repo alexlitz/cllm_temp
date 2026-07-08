@@ -12,15 +12,18 @@ unchanged) — leaving 146. The remaining flags are read via a literal
 `environ.get("C4_...")` / `getenv` / `_env_int("C4_...")`, plus 5 read
 indirectly via an `_ENV`-name constant (see the STRUCTURAL / RUNTIME table).
 
-> **2026-07 round-1 combo LANDED (default-ON).** Four value flags were flipped
-> DEFAULT-ON as one coherent combo (full-1096 measured 580/1096, +11 vs 569, 0
-> regressions): `C4_JSR_BP_BYTE3_CLEAR`, `C4_FUNC_ADD_B0_HINIB`,
-> `C4_STORE_AX_B0_OVERRIDE_V2`, `C4_ABSDIFF_RET_BYTE1`. NEW golden (default
-> build, no `C4_*` env) `state_dict_sha256 =
-> 54df58c1b9c6afee63b03814967f8a40deeef9b2ad3b1dc2ccd817b9acc93690` (short
-> `54df58c1`). Each keeps a `=0` escape hatch; setting all four to `0` reproduces
-> the prior golden `f725c06e1ad4d27659817eb46acba9f7aefe5a2545dcb1357baa24a2406fde6c`
-> (short `f725c06e` — use for flag-OFF byte-identity checks). All four are
+> **2026-07 round-1 combo LANDED (default-ON) — 3 of the 4 flags.** Three value
+> flags were flipped DEFAULT-ON as the coherent combo:
+> `C4_JSR_BP_BYTE3_CLEAR`, `C4_FUNC_ADD_B0_HINIB`, `C4_STORE_AX_B0_OVERRIDE_V2`.
+> The 4th, `C4_ABSDIFF_RET_BYTE1`, was **held DEFAULT-OFF**: flipping it ON
+> regressed the `test_lea_basic` smoke (its crush-band over-fires on the ENT-frame
+> LEA row and zeroes the address); it needs a surgical re-gate first. NEW golden
+> (default build, no `C4_*` env) `state_dict_sha256 =
+> e50521f32b0ed952d5730f79b63adb8c4c78f4d4f0466d3bcbaa354bb3c90e86` (short
+> `e50521f3`). Each keeps a `=0` escape hatch;
+> setting all four to `0` reproduces the prior golden
+> `f725c06e1ad4d27659817eb46acba9f7aefe5a2545dcb1357baa24a2406fde6c` (short
+> `f725c06e` — use for flag-OFF byte-identity checks). All flags are
 > campaign-track (gated on `no_stack0_emit`), so the non-campaign / golden 35-token
 > build is byte-identical regardless.
 
@@ -247,7 +250,7 @@ building blocks — conservative hold).
 | `C4_LEA_BYTE0_MEMSP_RELAY` | forced→live | campaign | **KEEP (A/B knob on live corrector)**. |
 | `C4_LEA_BYTE0_ALU_AMPLIFY` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — the frame-depth LEA byte-0 ALU-amplifier kill-switch; overrides the `C4_OPCAM_FRAME` umbrella when set explicitly. |
 | `C4_OPCAM_FRAME` | `0` (off) | campaign | **KEEP** — operand-CAM frame-depth umbrella; `=1` turns on the L10 multi-param LEA byte-0 ALU-amplifier (survey R2: func_add/mul/max/min + absdiff 2nd-param `&b` 0xFFE8→0xFFE0). Default-OFF → flag-OFF byte-identical `91f55411`. `C4_LEA_BYTE0_ALU_AMPLIFY` overrides it. |
-| `C4_ABSDIFF_RET_BYTE1` | `1` (default ON) | campaign | **round-1 combo, DEFAULT-ON (opt out `=0`).** absdiff/func-return AX byte-1 OUTPUT_LO stale-marker de-contamination. Adds two L10-tail post_ops (a bounded `ABSDIFF_RET_LEAK` l6-crush-band flag + the corrector) that force the spurious OUTPUT_LO high-byte nibble to 0 on the AX byte rows of the LEV-return step (OP_LEV≥0.95 selector), fixing the step-22 (ADJ-after-LEV) 0x01 leak on all 25 absdiff; the crush-band flag excludes genuine multi-byte func_mul returns (no regression). Flag-OFF / non-campaign byte-identical `f725c06e`. See `shared.absdiff_ret_byte1_enabled`. |
+| `C4_ABSDIFF_RET_BYTE1` | `0` (off) | campaign | **HELD DEFAULT-OFF (round-1 land: ON regressed `test_lea_basic`).** absdiff/func-return AX byte-1 OUTPUT_LO stale-marker de-contamination. `=1` adds two L10-tail post_ops (a bounded `ABSDIFF_RET_LEAK` l6-crush-band flag + the corrector) that force the spurious OUTPUT_LO high-byte nibble to 0 on the AX byte rows of the LEV-return step (OP_LEV≥0.95 selector), fixing the step-22 (ADJ-after-LEV) 0x01 leak on all 25 absdiff. When flipped default-ON it regressed the `test_lea_basic` smoke (`ENT; IMM 0; LEA 2; EXIT` → address decodes 0): the crush-band / OP_LEV-return selector over-fires on the ENT-frame LEA row and zeroes the real address OUTPUT_LO nibble. Needs a surgical re-gate (exclude non-LEV LEA rows) before it can go default-ON. Default-OFF → flag-OFF byte-identical `f725c06e`. See `shared.absdiff_ret_byte1_enabled`. |
 | `C4_JSR_BP_BYTE3_CLEAR` | `1` (default ON) | campaign | **round-1 combo, DEFAULT-ON (opt out `=0`).** func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR. Appends an L10-tail `PureFFN` post_op that WTA-forces the JSR-step BP byte-3 predictor row (`OP_JSR` + `H1+3` + `BYTE_INDEX_2`) to nibble 0, killing the `0x01010000` BP corruption that flat-diverges the whole func cluster. Requires the campaign config; flag-OFF / non-campaign registers NO rules → byte-identical `f725c06e`. Registered in BOTH cache-key snapshots. See `shared.jsr_bp_byte3_clear_enabled`. |
 | `C4_L15_SAVEDRA_HEAD` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — L15 head-15 saved-RA delivery. |
 | `C4_POST_ENT_SE_SUPPRESS` | `0` (off) | campaign | **DELETED** (commit `2043ff4d`) — dead-end framing building block. |

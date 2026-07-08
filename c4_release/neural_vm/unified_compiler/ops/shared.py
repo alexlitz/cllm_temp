@@ -1672,8 +1672,14 @@ def absdiff_fix_enabled() -> bool:
 
 def absdiff_ret_byte1_enabled() -> bool:
     """Return True iff the absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
-    de-contamination is active (DEFAULT ON — opt out via
-    ``C4_ABSDIFF_RET_BYTE1=0``; only meaningful in the 30-token campaign config).
+    de-contamination is active (DEFAULT OFF — opt in via
+    ``C4_ABSDIFF_RET_BYTE1=1``; only meaningful in the 30-token campaign config).
+
+    NOTE (2026-07 round-1 land): held DEFAULT-OFF — flipping it ON regressed the
+    ``test_lea_basic`` smoke (``ENT; IMM 0; LEA 2; EXIT`` -> address decodes 0):
+    the ``ABSDIFF_RET_LEAK`` crush-band / OP_LEV-return selector over-fires on
+    the ENT-frame LEA row and zeroes the real address OUTPUT_LO nibble. Needs a
+    surgical re-gate (exclude non-LEV LEA rows) before it can go default-ON.
 
     ROOT (block-input attribution via ``tools/interp_oracle_gate`` +
     ``tools/_probe_absdiff_ret_byte1.py``, spec_k=0 campaign, BUILT dims,
@@ -1748,7 +1754,7 @@ def absdiff_ret_byte1_enabled() -> bool:
     rules -> byte-identical to golden ``f725c06e``. Kept as a dedicated
     kill-switch for the flag-regression gate and the byte-identity gate.
     """
-    return os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
+    return os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
 
 
 def loaded_operand_add_hi15_clear_enabled() -> bool:
