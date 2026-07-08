@@ -355,31 +355,11 @@ def make_alu_shift_composite_ops():
     ]
 
 
-# Keep individual factory shims for callers that want a single op (e.g.,
-# unit tests). Each returns a fresh builder so the ops aren't entangled.
-def make_l13_alu_shift_bdtoge_op() -> Operation:
-    """L13 FFN stage 1: BD → GenericE format conversion (standalone factory)."""
-    return make_alu_shift_composite_ops()[0]
-
-
-def make_l13_alu_shift_precompute_op() -> Operation:
-    """L13 FFN stage 2: SHL/SHR sub-chunk precompute (standalone factory)."""
-    return make_alu_shift_composite_ops()[1]
-
-
-def make_l13_alu_shift_select_op() -> Operation:
-    """L13 FFN stage 3: shift-select FFN (standalone factory)."""
-    return make_alu_shift_composite_ops()[2]
-
-
-def make_l13_alu_shift_getobd_op() -> Operation:
-    """L13 FFN stage 4: GenericE → BD format conversion (standalone factory)."""
-    return make_alu_shift_composite_ops()[3]
-
-
-def make_l13_alu_shift_install_op() -> Operation:
-    """L13 block op: swap ``model.blocks[13].ffn`` for the composite (standalone factory)."""
-    return make_alu_shift_composite_ops()[4]
+# NOTE (dead-code sweep #363 I2): the per-stage single-op factory shims
+# (``make_l13_alu_shift_{bdtoge,precompute,select,getobd,install}_op``, each a
+# 1-line ``make_alu_shift_composite_ops()[i]`` wrapper) were DELETED — they had
+# zero callers (build path uses ``make_alu_shift_composite_ops()`` directly at
+# ``all_core_ops.py``). Byte-identity-safe (golden ``f725c06e`` unchanged).
 
 
 # ---------------------------------------------------------------------------
@@ -2842,23 +2822,12 @@ def make_alu_divmod_composite_ops(alu_mode: str = 'lookup'):
     return [make_bdtoge(), make_longdiv(), make_getobd(), make_install()]
 
 
-# Single-op factory shims for callers that want one op (e.g. unit tests).
-# Each returns a fresh builder so the ops aren't entangled across factories.
-def make_l10_alu_divmod_bdtoge_op(alu_mode: str = 'lookup') -> Operation:
-    """L10 stage 1: BD → GE format conversion (standalone factory)."""
-    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[0]
-
-
-def make_l10_alu_divmod_longdiv_op(alu_mode: str = 'lookup') -> Operation:
-    """L10 stage 2: long-division pipeline (standalone factory)."""
-    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[1]
-
-
-def make_l10_alu_divmod_getobd_op(alu_mode: str = 'lookup') -> Operation:
-    """L10 stage 3: GE → BD format conversion (standalone factory)."""
-    return make_alu_divmod_composite_ops(alu_mode=alu_mode)[2]
-
-
+# Single-op factory shim for the install op (the only one with callers).
+# NOTE (dead-code sweep #363 I2): the sibling per-stage shims
+# (``make_l10_alu_divmod_{bdtoge,longdiv,getobd}_op``, each a 1-line
+# ``make_alu_divmod_composite_ops()[i]`` wrapper) were DELETED — they had zero
+# callers (build path uses ``make_alu_divmod_composite_ops(...)`` directly at
+# ``full_vm_compiler_dynamic.py``). Byte-identity-safe (golden ``f725c06e``).
 def make_l10_alu_divmod_install_op(alu_mode: str = 'lookup') -> Operation:
     """L10 install op: append composite to block.post_ops (standalone factory)."""
     return make_alu_divmod_composite_ops(alu_mode=alu_mode)[3]
