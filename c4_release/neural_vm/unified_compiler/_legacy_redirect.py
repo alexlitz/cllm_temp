@@ -839,40 +839,12 @@ def _reshare_aliased_params(model, alias_map: dict) -> None:
             alias_mod._buffers[alias_attr] = keep_mod._buffers[keep_attr]
 
 
-def _strip_module_to_meta(module) -> None:
-    """Replace a module's persistent parameters/buffers with meta tensors.
-
-    Meta tensors have shape + dtype but no storage, so they pickle in a few
-    hundred bytes regardless of original size. Non-persistent buffers (those
-    excluded from ``state_dict``) are left intact — they're not reloaded from
-    safetensors and the model needs them at runtime (e.g. compact-routing
-    index buffers).
-    """
-    import torch as _torch
-
-    for name in list(module._parameters.keys()):
-        p = module._parameters[name]
-        if p is None:
-            continue
-        module._parameters[name] = _torch.nn.Parameter(
-            _torch.empty(p.shape, dtype=p.dtype, device="meta"),
-            requires_grad=p.requires_grad,
-        )
-    for name in list(module._buffers.keys()):
-        if name in module._non_persistent_buffers_set:
-            continue
-        b = module._buffers[name]
-        if b is None:
-            continue
-        module._buffers[name] = _torch.empty(
-            b.shape, dtype=b.dtype, device="meta"
-        )
-
-
-def _strip_model_to_meta(model) -> None:
-    """Strip every submodule of ``model`` to meta tensors (in place)."""
-    for mod in model.modules():
-        _strip_module_to_meta(mod)
+# NOTE (dead-code sweep #363 I2): the ``_strip_module_to_meta`` /
+# ``_strip_model_to_meta`` param+buffer meta-strip pair (introduced by the
+# f43463a2 safetensors cache switch) was DELETED — it had zero callers (the
+# per-module stripper was only invoked by the whole-model wrapper, which itself
+# had no caller). The live cache path offloads real weights to the safetensors
+# sidecar and pickles a metadata-only op view via ``_strip_op_for_cache``.
 
 
 def _try_load_cached(path: pathlib.Path, kwargs_snapshot: dict):

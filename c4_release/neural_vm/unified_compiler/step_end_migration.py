@@ -37,7 +37,7 @@ import dataclasses
 import re
 from typing import Iterable, Optional, Tuple
 
-from .ir import ConditionTerm, DimRef, FFNRule, WriteTerm
+from .ir import ConditionTerm, DimRef, FFNRule
 from .primitives import (
     AttentionProjectionWrite,
     DeclarativeAttentionHeadSpec,
@@ -133,10 +133,6 @@ def _rewrite_scope(
     if scope is None:
         return None
     return re.sub(rf"\b{re.escape(from_marker)}\b", MARK_SE_NAME, scope)
-
-
-def _names_of_writes(writes: Iterable[WriteTerm]) -> Tuple[str, ...]:
-    return tuple(w.dim.name for w in writes)
 
 
 # ---------------------------------------------------------------------------

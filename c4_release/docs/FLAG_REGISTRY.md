@@ -65,7 +65,7 @@ model. Opt-out with `=0`.
 | `C4_AX_BYTE1_DUMP` | `1` | active | AX byte-1 register-dump LM-head columns (H1_DUMP_OUT). |
 | `C4_AX_BYTE1_HINIB` | `1` | active | AX byte-1 high-nibble dump (the +11 golden win, n_heads 10→11). |
 | `C4_AX_BYTE1_SIGNEXT_LEA` | `1` | active | AX byte-1 sign-extension delivery on negative LEA-local frame addresses (#343). |
-| `C4_STACK0_B0_DUMP` | `1` | active | STACK0 byte-0 register-dump LM-head columns (Root 2). |
+| `C4_STACK0_B0_DUMP` | — | REMOVED | STACK0 byte-0 register-dump LM-head columns (Root 2) — the dump machinery was consolidated onto the OUTPUT-canonical path (#362 I1); no `environ.get` reads it anymore. Only prose/comment references remain (`efficient_alu_neural.py`, `full_vm_compiler_dynamic.py`). The stale `tools/_isa_carry_golden.py` `STACK0_ON/OFF` combos + the `test_whole_model_hash_stack0_byte0_migration_byte_identical` gate (both env-gated OFF by default) are now no-ops (setting the flag has no weight effect). |
 | `C4_STACK0_NEXT_ARITH` | `1` | active | Consumer-opcode lookahead bands + dump-block gate (#221). |
 | `C4_BP_SAVE_DUMP` | `1` | active | BP-save register dump (the `_isa_golden_hash` reference flag). |
 | `C4_MUL_WIDTH2` | `1` | active | Width-2 (16-bit) MUL path + MUL_RESULT_HI band (d_model 872→981). |
