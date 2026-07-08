@@ -12,6 +12,18 @@ unchanged) — leaving 146. The remaining flags are read via a literal
 `environ.get("C4_...")` / `getenv` / `_env_int("C4_...")`, plus 5 read
 indirectly via an `_ENV`-name constant (see the STRUCTURAL / RUNTIME table).
 
+> **2026-07 round-1 combo LANDED (default-ON).** Four value flags were flipped
+> DEFAULT-ON as one coherent combo (full-1096 measured 580/1096, +11 vs 569, 0
+> regressions): `C4_JSR_BP_BYTE3_CLEAR`, `C4_FUNC_ADD_B0_HINIB`,
+> `C4_STORE_AX_B0_OVERRIDE_V2`, `C4_ABSDIFF_RET_BYTE1`. NEW golden (default
+> build, no `C4_*` env) `state_dict_sha256 =
+> 54df58c1b9c6afee63b03814967f8a40deeef9b2ad3b1dc2ccd817b9acc93690` (short
+> `54df58c1`). Each keeps a `=0` escape hatch; setting all four to `0` reproduces
+> the prior golden `f725c06e1ad4d27659817eb46acba9f7aefe5a2545dcb1357baa24a2406fde6c`
+> (short `f725c06e` — use for flag-OFF byte-identity checks). All four are
+> campaign-track (gated on `no_stack0_emit`), so the non-campaign / golden 35-token
+> build is byte-identical regardless.
+
 **Columns**
 - **DEFAULT** — the value read when the flag is unset (the 2nd arg to
   `environ.get`, or the effective boolean of the comparison). `unset→off` means
@@ -124,11 +136,11 @@ the flag-regression / cross-op gates.
 |------|---------|--------|---------|
 | `C4_LOADED_OPERAND_ADD_HI15_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-15 address-leak clear (var_update). |
 | `C4_FUNCADD_ALU_HI13_CLEAR` | `1` (campaign) | active | Loaded-operand ADD hi-nibble cell-13 leak clear (func_add/mul/max/min). |
-| `C4_FUNC_ADD_B0_HINIB` | `0` (off) | active | func-return ADD byte-0 hi-nibble over-count fix: widen the loaded-operand ADD ALU_HI clear to ALL 16 cells (magnitude-windowed) to zero the ~1.0 operand-B-high-nibble bleed while preserving the ~6.0 true operand. Gated on `no_stack0_emit` (campaign). |
+| `C4_FUNC_ADD_B0_HINIB` | `1` (default ON) | active | **round-1 combo, DEFAULT-ON (opt out `=0`).** func-return ADD byte-0 hi-nibble over-count fix: widen the loaded-operand ADD ALU_HI clear to ALL 16 cells (magnitude-windowed) to zero the ~1.0 operand-B-high-nibble bleed while preserving the ~6.0 true operand. Gated on `no_stack0_emit` (campaign); flag-OFF / non-campaign byte-identical `f725c06e`. |
 | `C4_SILI_CAM_B1` | `1` (campaign) | active | SI/LI load byte-1 address-leak discriminator (Inc-2). |
 | `C4_SILI_B1_RESTORE` | `1` (campaign) | active | SI/LI byte-1 restore. |
 | `C4_STORE_AX_B0_OVERRIDE` | `1` in build / `0` in shared | active | Store AX byte-0 override (un-discriminated; reverted OFF in shared 7869e5c3, -24 arith). |
-| `C4_STORE_AX_B0_OVERRIDE_V2` | `0` (default OFF) | active | Store AX byte-0 override, clean store-only discriminator (ALU/cmp opcode anti-conditions). Fixes var_three/var_mul SI-store step; add/sub untouched. |
+| `C4_STORE_AX_B0_OVERRIDE_V2` | `1` (default ON) | active | **round-1 combo, DEFAULT-ON (opt out `=0`).** Store AX byte-0 override, clean store-only discriminator (ALU/cmp opcode anti-conditions). Fixes var_three/var_mul SI-store step; add/sub untouched. Gated behind the two campaign flags; flag-OFF / non-campaign byte-identical `f725c06e`. |
 | `C4_PSH_ARG_VAL_AX` | `1` | active | PSH-of-argument value-source AX lock (call-arg store). |
 | `C4_L15_LI_SUPPR_INERT` | `1` | active | L15 head-0 LI/LC-load suppressor inert (func/nested/rec/var LI). |
 | `C4_L15_LI_ADDR_CAM` | campaign | active | L15 head-0 LI value-load ADDR_B0 CAM (#313). |
@@ -235,7 +247,8 @@ building blocks — conservative hold).
 | `C4_LEA_BYTE0_MEMSP_RELAY` | forced→live | campaign | **KEEP (A/B knob on live corrector)**. |
 | `C4_LEA_BYTE0_ALU_AMPLIFY` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — the frame-depth LEA byte-0 ALU-amplifier kill-switch; overrides the `C4_OPCAM_FRAME` umbrella when set explicitly. |
 | `C4_OPCAM_FRAME` | `0` (off) | campaign | **KEEP** — operand-CAM frame-depth umbrella; `=1` turns on the L10 multi-param LEA byte-0 ALU-amplifier (survey R2: func_add/mul/max/min + absdiff 2nd-param `&b` 0xFFE8→0xFFE0). Default-OFF → flag-OFF byte-identical `91f55411`. `C4_LEA_BYTE0_ALU_AMPLIFY` overrides it. |
-| `C4_ABSDIFF_RET_BYTE1` | `0` (off) | campaign | **KEEP** — absdiff/func-return AX byte-1 OUTPUT_LO stale-marker de-contamination. `=1` adds two L10-tail post_ops (a bounded `ABSDIFF_RET_LEAK` l6-crush-band flag + the corrector) that force the spurious OUTPUT_LO high-byte nibble to 0 on the AX byte rows of the LEV-return step (OP_LEV≥0.95 selector), fixing the step-22 (ADJ-after-LEV) 0x01 leak on all 25 absdiff; the crush-band flag excludes genuine multi-byte func_mul returns (no regression). Default-OFF → flag-OFF byte-identical `f725c06e`. See `shared.absdiff_ret_byte1_enabled`. |
+| `C4_ABSDIFF_RET_BYTE1` | `1` (default ON) | campaign | **round-1 combo, DEFAULT-ON (opt out `=0`).** absdiff/func-return AX byte-1 OUTPUT_LO stale-marker de-contamination. Adds two L10-tail post_ops (a bounded `ABSDIFF_RET_LEAK` l6-crush-band flag + the corrector) that force the spurious OUTPUT_LO high-byte nibble to 0 on the AX byte rows of the LEV-return step (OP_LEV≥0.95 selector), fixing the step-22 (ADJ-after-LEV) 0x01 leak on all 25 absdiff; the crush-band flag excludes genuine multi-byte func_mul returns (no regression). Flag-OFF / non-campaign byte-identical `f725c06e`. See `shared.absdiff_ret_byte1_enabled`. |
+| `C4_JSR_BP_BYTE3_CLEAR` | `1` (default ON) | campaign | **round-1 combo, DEFAULT-ON (opt out `=0`).** func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR. Appends an L10-tail `PureFFN` post_op that WTA-forces the JSR-step BP byte-3 predictor row (`OP_JSR` + `H1+3` + `BYTE_INDEX_2`) to nibble 0, killing the `0x01010000` BP corruption that flat-diverges the whole func cluster. Requires the campaign config; flag-OFF / non-campaign registers NO rules → byte-identical `f725c06e`. Registered in BOTH cache-key snapshots. See `shared.jsr_bp_byte3_clear_enabled`. |
 | `C4_L15_SAVEDRA_HEAD` | forced→live | campaign | **KEEP (A/B knob on live corrector)** — L15 head-15 saved-RA delivery. |
 | `C4_POST_ENT_SE_SUPPRESS` | `0` (off) | campaign | **DELETED** (commit `2043ff4d`) — dead-end framing building block. |
 | `C4_ENT_SP_BYTE1_ISMARK_BLOCKER` | `0` (off) | campaign | **DELETED** (commit `10d7b876`) — docstring records NEGATIVE RESULT (0 programs advance; "the real fix is the project-level multi-part build, not a solo corrector"). |
