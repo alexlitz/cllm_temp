@@ -1616,6 +1616,60 @@ def var_three_li_enabled() -> bool:
     return os.environ.get("C4_VAR_THREE_LI", "0") == "1"
 
 
+def li_value_load_enabled() -> bool:
+    """Return True iff the L15 SI-store-addr CAM (head 16) NULL-HIGH-ADDRESS
+    candidate VETO is active (DEFAULT OFF — opt in via ``C4_LI_VALUE_LOAD=1``;
+    only meaningful in the 30-token campaign config where head 16 installs).
+
+    ROOT (verified spec_k=0 teacher-forced, BUILT dims, campaign config,
+    ``tools/_probe_l15_perhead_output.py``; func_max id650 / func_min id675
+    ``int min(int a,int b){if(a<b)return a;return b;} main(){return min(13,57);}``
+    LI that loads operand ``b`` at addr 0xE0): the head-16 SI-store-addr CAM
+    (``layer15_si_store_addr_cam``, ``C4_SI_STORE_ADDR``, value_scale=60) is
+    designed for the RELATIVE-store case (var_mul: local ``b`` IS ``SI``-stored,
+    so a store AX-marker carries ``ADDR_B0=0xE0`` + ``AX_CARRY``=value). For a
+    CALL-SITE-arg LI (func_max/min args come from a PSH at the call site, NO
+    matching SI store exists in the callee frame), the CAM's per-nibble address
+    match fires on the callee ENT-frame PHANTOM row (id675 pos 269:
+    ``ADDR_B0=0x00``, ``AX_CARRY=0x0d``=13=``a``, OP_ENT) via a spurious
+    LO-NULL-nibble match (query addr 0xE0 has LO nibble 0, which slot-16
+    positive-matches the phantom's ``ADDR_B0_LO+0``; the query HI nibble 14 does
+    NOT match the phantom's ``ADDR_B0_HI+0``, but the partial LO-only match +
+    firing baseline still WINS). head 16 then delivers ``a``'s value into OUTPUT
+    at value_scale 60, DOMINATING head-0's CORRECT value (value_scale 40) at the
+    argmax. It fails visibly only when the phantom value's byte lands on the same
+    nibble-0 default the LM head decodes as 0x00 (id675 ``a``=13=0x0d has HI
+    nibble 0 -> HI nibble-0 = 66.5 buries head-0's correct HI nibble-3 = 40.0 ->
+    the ``b`` LI decodes 0x00 not 0x39); func_max ``a``=36=0x24 has HI nibble 2,
+    so it lands off nibble-0 and head-0 wins BY LUCK (the byte0-right/byte0-wrong
+    asymmetry across arg values is the fingerprint).
+
+    FIX. A genuine local-store target ALWAYS has a NON-null high address nibble
+    (stack locals live at 0xE8/0xE0/0xD8/... -> ``ADDR_B0_HI`` = 14/13/...); only
+    the callee ENT/phantom rows carry ``ADDR_B0=0x00`` (``ADDR_B0_HI+0`` hot).
+    Add a K-side candidate VETO on ``ADDR_B0_HI+0`` (gated on the OP_LI query, so
+    it applies only at the LI lookup): a candidate with a NULL high address
+    nibble is driven below the softmax1 CONST sink, so head 16 fails-CLOSED
+    (writes ~0) on the phantom and head-0's genuine value survives. GENUINE
+    relative stores (0xE_/0xD_ HI nibble) are UNTOUCHED (``ADDR_B0_HI+0``==0
+    there, so the veto contributes 0), so var_mul / var_three / var_update keep
+    the store-addr CAM's value delivery byte-identically. The abs-address LI
+    path (``LI 0x200`` -> store marker ``ADDR_B0_HI+0`` hot) is ALREADY
+    fail-closed by the slot-63 ``LI_QUERY_ZEROADDR`` query-side veto, so this
+    K-side veto is redundant-safe there.
+
+    DEFAULT OFF. Reads its OWN env var (NOT floored ON by ``C4_CAMPAIGN``) so the
+    campaign default set stays untouched until this fix is proven net-positive +
+    HOLD-clean; opt in via ``C4_LI_VALUE_LOAD=1`` (only takes effect under the
+    campaign / MEM-from-SP path, since head 16 installs only when
+    ``C4_SI_STORE_ADDR`` is on — floored ON by ``C4_CAMPAIGN``; the veto slot is
+    written into head 16 only when this flag is on, so flag-OFF omits it ->
+    byte-identical to golden). Kept as a dedicated kill-switch for
+    ``tools/flag_regression_gate.py`` and the flag-OFF golden byte-identity gate.
+    """
+    return os.environ.get("C4_LI_VALUE_LOAD", "0") == "1"
+
+
 def absdiff_fix_enabled() -> bool:
     """Return True iff the absdiff arg-b LI value byte-0 LO-nibble
     de-contamination is active (DEFAULT OFF — opt in via ``C4_ABSDIFF_FIX=1``;

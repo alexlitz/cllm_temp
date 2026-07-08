@@ -356,6 +356,7 @@ from .shared import (
     _as_setdim_proxy,
     no_stack0_emit_enabled,
     l15_lookup_cmp_veto_enabled,
+    li_value_load_enabled,
     si_store_addr_enabled,
     var_three_li_enabled,
 )
@@ -2955,6 +2956,34 @@ def _layer15_si_store_addr_cam_head_spec(BD) -> DeclarativeAttentionHeadSpec:
     _veto = 30_000_000.0
     discs.append(CamDiscriminatorSlot(
         slot=63, q=(("LI_QUERY_ZEROADDR", -_veto),), k=(("CONST", 1.0),)))
+
+    if li_value_load_enabled():
+        # Slot 32: NULL-HIGH-ADDRESS candidate VETO (func_max id650 / func_min
+        # id675 CALL-SITE-arg LI, 2026-07-08). ROOT: on a call-site-arg LI (the
+        # value came from a PSH at the call site, NO matching SI store exists in
+        # the callee frame) the per-nibble address match fires on the callee
+        # ENT-frame PHANTOM row (id675 pos 269: ``ADDR_B0=0x00``,
+        # ``AX_CARRY=0x0d``=13=``a``, OP_ENT) via a spurious LO-NULL-nibble match
+        # (query addr 0xE0 has a LO null nibble, which slot-16 positive-matches
+        # the phantom's ``ADDR_B0_LO+0``; the query HI nibble 14 does NOT match
+        # the phantom's ``ADDR_B0_HI+0``, but the partial LO-only match + firing
+        # baseline still WINS), and delivers ``a``'s value at value_scale 60,
+        # burying head-0's CORRECT ``b`` value. A genuine local-store target
+        # ALWAYS has a NON-null high address nibble (stack locals 0xE8/0xE0/0xD8
+        # -> ``ADDR_B0_HI`` = 14/13/...); only the phantom carries
+        # ``ADDR_B0=0x00`` (``ADDR_B0_HI+0`` hot). A large NEGATIVE K on
+        # ``ADDR_B0_HI+0`` (gated on the OP_LI query, K on the candidate) drives
+        # every null-high-address candidate below the softmax1 CONST sink so the
+        # head fails-CLOSED (writes ~0) on the phantom and head-0's genuine value
+        # survives. GENUINE relative stores (0xE_/0xD_ HI nibble) have
+        # ``ADDR_B0_HI+0``==0 -> veto contributes 0 -> byte-identical value
+        # delivery for var_mul/var_three/var_update. The abs-address LI path is
+        # already fail-closed by the slot-63 query-side veto (redundant-safe).
+        # Own kill-switch ``C4_LI_VALUE_LOAD`` (DEFAULT OFF; flag-OFF omits this
+        # slot -> byte-identical to golden). See shared.li_value_load_enabled.
+        discs.append(CamDiscriminatorSlot(
+            slot=32, q=(("OP_LI", _psh_rej), ("CONST", -0.05 * _psh_rej)),
+            k=(("ADDR_B0_HI+0", -_veto),)))
 
     value_bands = (
         CamValueBand("AX_CARRY_LO", "OUTPUT_LO", 16, 32, value_scale),

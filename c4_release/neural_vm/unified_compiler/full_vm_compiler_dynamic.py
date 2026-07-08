@@ -2260,6 +2260,16 @@ def compile_full_vm_dynamic(
             "C4_VAR_THREE_LI": (
                 os.environ.get("C4_VAR_THREE_LI") == "1"
             ),
+            # L15 head-16 SI-store-addr CAM null-high-address candidate veto
+            # (DEFAULT-OFF, opt in =1): adds one slot-32 K veto on ADDR_B0_HI+0 so
+            # the store-addr CAM fails-closed on the callee ENT-frame phantom row
+            # (ADDR_B0=0x00) at a call-site-arg LI (func_max/min operand-b). Same
+            # head shape, different W_k values, so ON / OFF builds MUST NOT share
+            # a memo / disk entry. Only installs when C4_SI_STORE_ADDR is on
+            # (head 16 exists), so OFF is byte-identical to golden.
+            "C4_LI_VALUE_LOAD": (
+                os.environ.get("C4_LI_VALUE_LOAD") == "1"
+            ),
             # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
             # opt in =1). At the deeper-frame 2-arg func LI whose arg address is
             # 0xE0 (lo-nibble 0), the L15 head-0 value delivery carries the
@@ -3258,6 +3268,15 @@ def _bake_from_scheduled_ops(
         # Same head shape, different W_q, so ON / OFF must never share an entry.
         "C4_VAR_THREE_LI": (
             os.environ.get("C4_VAR_THREE_LI") == "1"
+        ),
+        # L15 head-16 SI-store-addr CAM null-high-address candidate veto
+        # (DEFAULT-OFF, opt in =1): one slot-32 K veto on ADDR_B0_HI+0 so the
+        # store-addr CAM fails-closed on the callee ENT-frame phantom (ADDR_B0=0)
+        # at a call-site-arg LI (func_max/min operand-b). Different W_k, so ON /
+        # OFF must never share an entry. Only installs when C4_SI_STORE_ADDR is
+        # on (head 16 exists); OFF is byte-identical to golden.
+        "C4_LI_VALUE_LOAD": (
+            os.environ.get("C4_LI_VALUE_LOAD") == "1"
         ),
         # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
         # opt in =1). Flag-OFF registers NO rules -> byte-identical to golden.
