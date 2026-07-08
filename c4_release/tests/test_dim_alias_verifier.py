@@ -1077,7 +1077,7 @@ def test_eff_disjoint_from_read_dim_helper():
     from neural_vm.verification.dim_alias_verifier import (
         _eff_disjoint_from_read_dim,
     )
-    from neural_vm.unified_compiler.predicates import parse
+    from neural_vm.verification.predicates import parse
 
     # L14-shaped eff: fires only at NON-MEM rows.
     eff = parse("(is_byte OR NOT is_byte) AND NOT mark == MEM")

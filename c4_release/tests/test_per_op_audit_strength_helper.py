@@ -2,7 +2,7 @@
 import pytest
 from neural_vm.dim_registry import DimRegistry
 from neural_vm.unified_compiler.ir import FFNRule, FFNOp
-from neural_vm.unified_compiler.backbone_bounds import BackboneBounds
+from neural_vm.verification.backbone_bounds import BackboneBounds
 from tests._per_op_audit import assert_rule_strength_dominance
 
 

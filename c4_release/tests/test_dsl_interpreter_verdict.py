@@ -33,7 +33,7 @@ os.environ.setdefault("C4_SMOKE_SPEC_K", "0")
 
 
 def test_generator_for_rule_recognises_each_generator():
-    from neural_vm.unified_compiler.generator_attribution import generator_for_rule
+    from neural_vm.verification.generator_attribution import generator_for_rule
 
     assert generator_for_rule("ax_byte1_carry_val0_lo_3") == "cross_step_carry"
     assert generator_for_rule("stack0_b0_carry_val2_hi_15") == "cross_step_carry"
@@ -48,7 +48,7 @@ def test_generator_for_rule_recognises_each_generator():
 
 
 def test_generator_for_rule_none_for_hand_authored_and_empty():
-    from neural_vm.unified_compiler.generator_attribution import generator_for_rule
+    from neural_vm.verification.generator_attribution import generator_for_rule
 
     assert generator_for_rule("l10_tail_stack0_pop_loaded_42") is None
     assert generator_for_rule("some_hand_rule") is None
@@ -57,7 +57,7 @@ def test_generator_for_rule_none_for_hand_authored_and_empty():
 
 
 def test_attribute_to_generator_strings():
-    from neural_vm.unified_compiler.generator_attribution import attribute_to_generator
+    from neural_vm.verification.generator_attribution import attribute_to_generator
 
     assert "GENERATOR cross_step_carry" in attribute_to_generator(
         "ax_byte1_carry_val0_lo_3"

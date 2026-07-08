@@ -3772,7 +3772,7 @@ def verify_rule_scopes(
     If ``require_scope`` is False (default), rules without a scope are
     silently skipped (opt-in adoption).
     """
-    from neural_vm.unified_compiler.predicates import parse, entails, explain_failure
+    from neural_vm.verification.predicates import parse, entails, explain_failure
     from neural_vm.verification.effective_predicate import effective_predicate
 
     issues: List[Dict] = []
@@ -3853,7 +3853,7 @@ def verify_rule_strength(
     from neural_vm.verification.writer_index import build_writer_index
     from neural_vm.verification.contribution_algebra import max_contribution
     from neural_vm.verification.effective_predicate import effective_predicate
-    from neural_vm.unified_compiler.predicates import parse, overlaps
+    from neural_vm.verification.predicates import parse, overlaps
 
     issues: List[Dict] = []
 

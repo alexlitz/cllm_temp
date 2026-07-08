@@ -128,7 +128,7 @@ def assert_rule_strength_dominance(
         from neural_vm.dim_registry import build_default_registry
         registry = build_default_registry()
     if bounds is None:
-        from neural_vm.unified_compiler.backbone_bounds import load_default_bounds
+        from neural_vm.verification.backbone_bounds import load_default_bounds
         bounds = load_default_bounds()
 
     from neural_vm.verification.decl_verifier import (

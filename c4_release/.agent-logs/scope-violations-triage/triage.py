@@ -43,7 +43,7 @@ from neural_vm.unified_compiler.ops.l10_ops import (  # noqa: E402
 from neural_vm.verification.decl_verifier import (  # noqa: E402
     verify_rule_scopes,
 )
-from neural_vm.unified_compiler.predicates import (  # noqa: E402
+from neural_vm.verification.predicates import (  # noqa: E402
     parse,
     satisfiable,
 )

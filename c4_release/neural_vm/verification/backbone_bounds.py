@@ -108,8 +108,8 @@ class BackboneBounds:
 def load_default_bounds() -> BackboneBounds:
     """Load .agent-logs/backbone-bounds/v1.json from the repo root.
     Falls back to empty bounds with a warning if the file doesn't exist."""
-    # __file__ -> .../c4_release/neural_vm/unified_compiler/backbone_bounds.py
-    # parents: [0]=unified_compiler [1]=neural_vm [2]=c4_release
+    # __file__ -> .../c4_release/neural_vm/verification/backbone_bounds.py
+    # parents: [0]=verification [1]=neural_vm [2]=c4_release
     c4_root = Path(__file__).resolve().parent.parent.parent
     path = c4_root / ".agent-logs" / "backbone-bounds" / "v1.json"
     if not path.exists():

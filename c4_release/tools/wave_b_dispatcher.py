@@ -4,7 +4,7 @@
 Coordinates the symbolic migration of the 42 position-role violations
 flagged by ``tools/lint_position_role.py`` (commit 199479f4) using the
 ``migrate_rule_to_step_end`` helper landed in
-``neural_vm/unified_compiler/step_end_migration.py`` (commit a9aefb4f).
+``neural_vm/verification/step_end_migration.py`` (commit a9aefb4f).
 
 The dispatcher does NOT edit any ``l*_ops.py`` file. It operates
 symbolically:
@@ -431,7 +431,7 @@ def _try_import_helper() -> Tuple[Optional[Callable], Optional[type]]:
     (None, None) if the helper module can't be imported."""
 
     try:
-        from neural_vm.unified_compiler.step_end_migration import (  # noqa: E501
+        from neural_vm.verification.step_end_migration import (  # noqa: E501
             MigrationSafetyError,
             migrate_rule_to_step_end,
         )

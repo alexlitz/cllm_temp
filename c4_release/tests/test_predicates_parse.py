@@ -1,10 +1,10 @@
-"""Parser tests for the predicate DSL in neural_vm.unified_compiler.predicates."""
+"""Parser tests for the predicate DSL in neural_vm.verification.predicates."""
 
 from __future__ import annotations
 
 import pytest
 
-from neural_vm.unified_compiler.predicates import (
+from neural_vm.verification.predicates import (
     And,
     BoolAtom,
     ByteIndexEq,
