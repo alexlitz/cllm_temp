@@ -2182,6 +2182,16 @@ def compile_full_vm_dynamic(
             "C4_AX_BYTE1_SIGNEXT_LEA": (
                 os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
             ),
+            # AX high-byte (byte-2/3) all-step zero-default (DEFAULT-OFF; opt in
+            # with =1): appends the l11 ``make_ax_hibyte_clear_allstep_op`` FFN
+            # (register byte-2/3 dump -> 0 on every step) AND omits the redundant
+            # ``H*_DUMP_OUT`` LM-head columns in model_ops. Output-affecting (no
+            # source change), so the ON / OFF builds must NEVER share a memo /
+            # disk entry. The if_var GT-FALSE cluster leaks AX byte-2 = 0x01 at
+            # the BZ/IMM return steps; this flag forces it to 0.
+            "C4_AX_HIBYTE_CLEAR": (
+                os.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
+            ),
             # (C4_STACK0_B0_DUMP removed 2026-07: the STACK0-b0 dump machinery it
             # gated was deleted as provably-dead in the 30-token frame, so the
             # flag no longer affects the build and is no longer part of the memo /
@@ -3199,6 +3209,14 @@ def _bake_from_scheduled_ops(
         # The ON / OFF builds must never share a serialised entry.
         "C4_AX_BYTE1_SIGNEXT_LEA": (
             os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
+        ),
+        # AX high-byte (byte-2/3) all-step zero-default (DEFAULT-OFF; opt in with
+        # =1, output-affecting, no source change): appends the l11
+        # ``make_ax_hibyte_clear_allstep_op`` FFN + omits the redundant
+        # ``H*_DUMP_OUT`` LM-head columns. The ON / OFF builds must never share a
+        # serialised entry.
+        "C4_AX_HIBYTE_CLEAR": (
+            os.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
         ),
         # (C4_STACK0_B0_DUMP removed 2026-07: the STACK0-b0 dump machinery it
         # gated was deleted as provably-dead in the 30-token frame, so the flag
