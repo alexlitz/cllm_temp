@@ -2369,17 +2369,29 @@ def compile_full_vm_dynamic(
             # builds bake different L16 FFN weights and must never share a memo
             # entry. See shared.store_ax_b0_override_v2_enabled.
             "C4_STORE_AX_B0_OVERRIDE_V2": (
-                os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "0") != "0"
+                os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
             ),
             # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
-            # de-contamination (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting):
+            # de-contamination (DEFAULT ON, opt out =0, STRUCTURALLY-affecting):
             # registers TWO extra L10-tail PureFFN post_ops (a bounded
             # ABSDIFF_RET_LEAK l6-crush flag + the corrector) so the ON / OFF
             # builds STRUCTURALLY differ (extra FFN ops + blocks) and must never
             # share a memo entry. Flag-OFF registers NO rules -> byte-identical
             # to golden. See shared.absdiff_ret_byte1_enabled.
             "C4_ABSDIFF_RET_BYTE1": (
-                os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
+                os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
+            ),
+            # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
+            # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an
+            # extra L10-tail PureFFN post_op so the ON / OFF builds STRUCTURALLY
+            # differ (an extra FFN op + block) and must never share a memo entry.
+            # Gated on the campaign prerequisites (``C4_NO_STACK0_EMIT`` +
+            # ``C4_OPERAND_FROM_MEMSP``) so the non-campaign / golden build is
+            # byte-identical. See shared.jsr_bp_byte3_clear_enabled.
+            "C4_JSR_BP_BYTE3_CLEAR": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+                and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
             ),
             # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
             # campaign-ON, opt out =0, BAKE-affecting): registers the
@@ -2462,7 +2474,7 @@ def compile_full_vm_dynamic(
                 and os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
             ),
             # func-return ADD byte-0 HIGH-nibble over-count fix (campaign
-            # DEFAULT-OFF, opt in =1, MODULE-affecting): widens the
+            # DEFAULT-ON, opt out =0, MODULE-affecting): widens the
             # LoadedOperandAddHi15ClearFFN contaminant cell set to ALL 16 ALU_HI
             # cells (magnitude-windowed) so the ~1.0 operand-B-high-nibble bleed
             # is cleared while the ~6.0 true operand-A one-hot is preserved. The
@@ -2472,7 +2484,7 @@ def compile_full_vm_dynamic(
             # golden build is byte-identical. See shared.func_add_b0_hinib_enabled.
             "C4_FUNC_ADD_B0_HINIB": (
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
+                and os.environ.get("C4_FUNC_ADD_B0_HINIB", "1") != "0"
             ),
             # Operand-CAM address-leak clear WIDEN (campaign OFF by default,
             # opt in =1, MODULE-affecting): widens the ADD-only
@@ -3319,16 +3331,28 @@ def _bake_from_scheduled_ops(
         # builds bake different L16 FFN weights and must never share a
         # serialised entry. See shared.store_ax_b0_override_v2_enabled.
         "C4_STORE_AX_B0_OVERRIDE_V2": (
-            os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "0") != "0"
+            os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
         ),
         # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker de-contamination
-        # (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting): registers TWO extra
+        # (DEFAULT ON, opt out =0, STRUCTURALLY-affecting): registers TWO extra
         # L10-tail PureFFN post_ops (a bounded ABSDIFF_RET_LEAK l6-crush flag +
         # the corrector) so ON / OFF builds STRUCTURALLY differ (extra FFN ops +
         # blocks) and must never share a serialised entry. Flag-OFF registers NO
         # rules -> byte-identical to golden. See shared.absdiff_ret_byte1_enabled.
         "C4_ABSDIFF_RET_BYTE1": (
-            os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
+            os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
+        ),
+        # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
+        # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an extra
+        # L10-tail PureFFN post_op so ON / OFF builds STRUCTURALLY differ (an
+        # extra FFN op + block) and must never share a serialised entry. Gated on
+        # the campaign prerequisites (``C4_NO_STACK0_EMIT`` +
+        # ``C4_OPERAND_FROM_MEMSP``) so the non-campaign / golden build is
+        # byte-identical. See shared.jsr_bp_byte3_clear_enabled.
+        "C4_JSR_BP_BYTE3_CLEAR": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
+            and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
         ),
         # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
         # campaign-ON, opt out =0, BAKE-affecting): registers the
@@ -3403,8 +3427,8 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
         ),
-        # func-return ADD byte-0 HIGH-nibble over-count fix (campaign DEFAULT-OFF,
-        # opt in =1, MODULE-affecting): widens the LoadedOperandAddHi15ClearFFN
+        # func-return ADD byte-0 HIGH-nibble over-count fix (campaign DEFAULT-ON,
+        # opt out =0, MODULE-affecting): widens the LoadedOperandAddHi15ClearFFN
         # contaminant cell set to ALL 16 ALU_HI cells (magnitude-windowed) so the
         # ~1.0 operand-B-high-nibble bleed is cleared while the ~6.0 true
         # operand-A one-hot is preserved. The wrap MODULE (its ``contam_cells``)
@@ -3414,7 +3438,7 @@ def _bake_from_scheduled_ops(
         # byte-identical. See shared.func_add_b0_hinib_enabled.
         "C4_FUNC_ADD_B0_HINIB": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
+            and os.environ.get("C4_FUNC_ADD_B0_HINIB", "1") != "0"
         ),
         # Operand-CAM address-leak clear WIDEN (campaign OFF by default, opt in
         # =1, MODULE-affecting): widens the ADD-only LoadedOperandAddHi15ClearFFN

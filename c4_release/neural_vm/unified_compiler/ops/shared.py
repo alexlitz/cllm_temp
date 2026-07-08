@@ -1672,8 +1672,8 @@ def absdiff_fix_enabled() -> bool:
 
 def absdiff_ret_byte1_enabled() -> bool:
     """Return True iff the absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
-    de-contamination is active (DEFAULT OFF — opt in via
-    ``C4_ABSDIFF_RET_BYTE1=1``; only meaningful in the 30-token campaign config).
+    de-contamination is active (DEFAULT ON — opt out via
+    ``C4_ABSDIFF_RET_BYTE1=0``; only meaningful in the 30-token campaign config).
 
     ROOT (block-input attribution via ``tools/interp_oracle_gate`` +
     ``tools/_probe_absdiff_ret_byte1.py``, spec_k=0 campaign, BUILT dims,
@@ -1748,7 +1748,7 @@ def absdiff_ret_byte1_enabled() -> bool:
     rules -> byte-identical to golden ``f725c06e``. Kept as a dedicated
     kill-switch for the flag-regression gate and the byte-identity gate.
     """
-    return os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
+    return os.environ.get("C4_ABSDIFF_RET_BYTE1", "1") != "0"
 
 
 def loaded_operand_add_hi15_clear_enabled() -> bool:
@@ -1823,7 +1823,7 @@ def funcadd_alu_hi13_clear_enabled() -> bool:
 def func_add_b0_hinib_enabled() -> bool:
     """Return True iff the func-return ADD byte-0 HIGH-nibble over-count fix is
     active — the ALL-CELL magnitude-windowed ALU_HI operand-B-bleed clear
-    (DEFAULT-OFF ``C4_FUNC_ADD_B0_HINIB``; opt in with =1). Gated behind the same
+    (DEFAULT-ON ``C4_FUNC_ADD_B0_HINIB``; opt out with =0). Gated behind the same
     ``no_stack0_emit`` + ``loaded_operand_add_hi15_clear_enabled`` campaign chain
     as the cell-13/15 clear, so the flag-OFF golden (35-tok) build is
     byte-identical (the widened cell set is never installed off the campaign).
@@ -1859,7 +1859,7 @@ def func_add_b0_hinib_enabled() -> bool:
     loaded-operand compare rows are the C4_OPERAND_CAM_FIX territory). This fix
     SUBSUMES the cell-13/15 clears when on (all 16 cells >= (13,15)).
     """
-    return os.environ.get("C4_FUNC_ADD_B0_HINIB", "0") == "1"
+    return os.environ.get("C4_FUNC_ADD_B0_HINIB", "1") != "0"
 
 
 def operand_cam_fix_enabled() -> bool:
@@ -2068,8 +2068,8 @@ def store_ax_b0_override_enabled() -> bool:
 def store_ax_b0_override_v2_enabled() -> bool:
     """Return True iff the SI/SC store-AX byte-0 OUTPUT materializer uses the
     zero-default OVERRIDE write form *with an ALU/cmp opcode ANTI-CONDITION gate*
-    (the "clean discriminator" V2). DEFAULT **OFF** (``C4_STORE_AX_B0_OVERRIDE_V2``,
-    opt in ``=1``); gated behind the two campaign flags so the flag-OFF golden
+    (the "clean discriminator" V2). DEFAULT **ON** (``C4_STORE_AX_B0_OVERRIDE_V2``,
+    opt out ``=0``); gated behind the two campaign flags so the flag-OFF golden
     (35-tok) build is byte-identical.
 
     WHY V2 (root: var_three id300 / var_mul step-9 SI-store; task this session):
@@ -2101,7 +2101,7 @@ def store_ax_b0_override_v2_enabled() -> bool:
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "0") != "0"
+        and os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
     )
 
 
@@ -2317,7 +2317,7 @@ def jsr_bp_byte3_clear_enabled() -> bool:
     """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR
     (``C4_JSR_BP_BYTE3_CLEAR``) is active.
 
-    DEFAULT **OFF** (opt in ``C4_JSR_BP_BYTE3_CLEAR=1``). Requires the campaign
+    DEFAULT **ON** (opt out ``C4_JSR_BP_BYTE3_CLEAR=0``). Requires the campaign
     config (``C4_NO_STACK0_EMIT=1`` + ``C4_OPERAND_FROM_MEMSP=1``). Flag-off OR a
     non-campaign / golden build registers NO rules and appends NO post_op, so the
     model is bit-for-bit identical to golden ``f725c06e``.
@@ -2360,7 +2360,7 @@ def jsr_bp_byte3_clear_enabled() -> bool:
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "0") == "1"
+        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
     )
 
 
