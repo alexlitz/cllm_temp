@@ -373,13 +373,6 @@ def _addr_key_match_writes(BD, weight: float, top_slot_base: int = 35):
     )
 
 
-def _code_fetch_v_writes(BD, weight: float = 1.0):
-    return (
-        _band_projection_writes(32, BD.CLEAN_EMBED_LO, weight)
-        + _band_projection_writes(48, BD.CLEAN_EMBED_HI, weight)
-    )
-
-
 def _fetch_head_specs(BD) -> tuple[DeclarativeAttentionHeadSpec, ...]:
     """Declarative replacement for ``setup_helpers._set_layer5_fetch``.
 

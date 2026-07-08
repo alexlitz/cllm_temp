@@ -1619,12 +1619,6 @@ def _conversational_io_output_routing_rules(S: float) -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _conversational_io_output_routing_ir(S: float = 100.0) -> CompilerIR:
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_conversational_io_output_routing_rules(S))
-    return ir
-
-
 def _lower_conversational_io_output_routing_ir(ffn, S: float, BD) -> int:
     """Lower the convo-IO output-routing FFN rules at pinned unit 1200."""
 
