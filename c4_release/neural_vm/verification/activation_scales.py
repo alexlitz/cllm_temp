@@ -78,11 +78,19 @@ _CANONICAL_SCALES: Dict[str, float] = {
     "HAS_SE": 1.0,
     "CMP+4": 1.0,
     "CMP+5": 1.0,
-    # opcode one-hots: amplified upstream — the measured residual scale
+    # opcode one-hots at the POST-L9 branch gate: MEASURED amplified residual
+    # scale ~5.0 (the decode band writes the branch opcode one-hot at a higher
+    # amplitude at the L22 post-L9 block the BZ/BNZ gate reads — the hand
+    # OP_BZ/OP_BNZ weight 0.2 == 1/5.0 is exactly this). See
+    # docs/DERIVE_ACTSCALE_2026_07_09.md §measurement.
     "OP_BZ": 5.0,
     "OP_BNZ": 5.0,
-    "OP_JMP": 5.0,
-    "OP_JSR": 5.0,
+    # OP_JMP / OP_JSR are NOT amplified at the L6 all-step / first-step JMP gate
+    # blocks — the MEASUREMENT (probe_measure_scales) shows OP_JMP == 0 at those
+    # blocks in the corpus, i.e. the live JMP PC path is ELSEWHERE and those three
+    # pc_mux override bands are DEAD reserved bands (docs/DERIVE_CONTROL §1). Their
+    # gate-local scale is left at the default 1.0 so the deadness check keeps them
+    # dead (hand threshold 4.5/5.0/5.5 > raw max-fire ~2.0 at unit scale).
 }
 
 # Default scale for any dim not in the table (treat as a clean unit one-hot).

@@ -219,14 +219,16 @@ def derive_gate(conditions, *, position_class: str = "*",
     scaled to the gate's normalized activation regime.
 
     **Satisfiability safety.** Deadness is decided by whether the HAND gate could
-    fire at runtime: ``sum(hand_weight * activation_scale)`` over positives vs the
-    hand threshold. A LIVE hand band (raw runtime sum >= hand threshold — e.g.
-    all-step JMP ``1*1 + 1*5 = 6 >= 4.5``) gets the DERIVED balanced-AND threshold
-    (``n_norm - 0.5 + step_guard``). A DEAD hand band (raw runtime sum < hand
-    threshold, unsatisfiable by design — the reserved delayed/first-step JMP bands
-    whose CMP+0 / HAS_SE==0 discriminator never co-activates) is kept dead: its
-    derived threshold is forced ABOVE the derived positive sum, so the derivation
-    never RESURRECTS a reserved band.
+    EVER fire: ``sum(hand_weight * activation_scale)`` over positives (maximal
+    firing) vs the hand threshold. A DEAD hand band (that maximal sum < hand
+    threshold — unsatisfiable by design; the reserved delayed/first-step JMP bands
+    whose ``CMP+0`` / ``HAS_SE==0`` discriminator never co-activates and whose
+    ``CONST=-1000`` veto enforces deadness) is returned UNTOUCHED — positives,
+    threshold, AND its deliberately-huge blockers all preserved — so the
+    derivation can NEVER resurrect it. Only a LIVE band (maximal sum >= hand
+    threshold — e.g. BZ ``1 + 0.2*5 + 1.28 + 1 + 10 = 14.28 >= 13.5``) gets the
+    DERIVED balanced-AND (positives ``1/scale``, threshold ``n_norm - 0.5 +
+    step_guard``, blockers from the safety factor).
     """
     from ...verification.activation_scales import load_activation_scales
 
@@ -234,49 +236,60 @@ def derive_gate(conditions, *, position_class: str = "*",
         safety_factor = _pc_override_safety_factor()
     scales = load_activation_scales()
 
+    # --- Deadness check FIRST -------------------------------------------------
+    # RAW hand runtime sum over positives: sum(hand_weight * activation_scale) —
+    # what the HAND gate accumulates when every positive dim is active at its
+    # measured scale. If that maximal firing sum is BELOW the hand threshold, the
+    # band is unsatisfiable by design (a reserved / disabled override band — the
+    # delayed / first-step JMP bands, whose CMP+0 / HAS_SE==0 discriminator never
+    # co-activates and whose CONST=-1000 veto enforces deadness). A DEAD band is
+    # returned UNTOUCHED: its positives, threshold, and (crucially) its
+    # deliberately-huge blockers stay as-authored, so the derivation can NEVER
+    # resurrect it. Only LIVE bands are re-derived.
+    if hand_threshold is not None:
+        raw_max_fire = sum(
+            float(w) * scales.scale(dim, position_class)
+            for dim, w in conditions if w > 0
+        )
+        if hand_threshold > raw_max_fire + 1e-6:
+            return tuple(conditions), hand_threshold
+
+    # --- LIVE band: full scale derivation -------------------------------------
     rebuilt = []
     n_norm = 0
     step_guard_total = 0.0
     norm_pos_weights = []
-    # RAW hand runtime sum over positives: sum(hand_weight * activation_scale).
-    # This is what the HAND gate accumulates at runtime; comparing it to the hand
-    # threshold decides deadness (independent of the normalization).
-    hand_raw_runtime_sum = 0.0
     for dim, w in conditions:
-        s = scales.scale(dim, position_class)
         if w <= 0:
             rebuilt.append((dim, w))  # blocker sign preserved; magnitude below
             continue
-        hand_raw_runtime_sum += float(w) * s
         if w >= _STEP_GUARD_AMP_FLOOR:
             # amplified satisfiability guard — preserve verbatim, add to threshold
             rebuilt.append((dim, w))
             step_guard_total += float(w)
             continue
         # scale-normalized discriminator: weight = 1/scale
+        s = scales.scale(dim, position_class)
         nw = 1.0 / s if s > 0 else 1.0
         rebuilt.append((dim, nw))
         norm_pos_weights.append(nw)
         n_norm += 1
 
-    # Blocker magnitude scaled to the normalized positive regime.
-    max_norm = max(norm_pos_weights) if norm_pos_weights else 1.0
-    block = safety_factor * float(max_norm) * float(max(n_norm, 1))
+    thr = (n_norm - 0.5) + step_guard_total
+
+    # Blocker magnitude: a single active blocker must veto the gate even when ALL
+    # positives fire. The maximal positive contribution is ``derived_pos_sum``
+    # (each normalized discriminator + each preserved step-guard); a blocker at
+    # ``-safety_factor * (derived_pos_sum + 1)`` guarantees
+    # ``derived_pos_sum - block < thr`` for any ``safety_factor >= 1``, so no
+    # should-block row is admitted (verdict-PRESERVING). This scales the veto to
+    # the gate's FULL activation regime (INCLUDING the amplified step-guard —
+    # e.g. BZ's HAS_SE=10), which the normalized-positive-only max would miss.
+    derived_pos_sum = sum(w for _d, w in rebuilt if w > 0)
+    block = safety_factor * (float(derived_pos_sum) + 1.0)
     out = tuple(
         (dim, w) if w > 0 else (dim, -block) for dim, w in rebuilt
     )
-
-    derived_pos_sum = sum(w for _d, w in out if w > 0)
-    derived_thr = (n_norm - 0.5) + step_guard_total
-
-    if hand_threshold is not None and hand_threshold > hand_raw_runtime_sum + 1e-6:
-        # DEAD hand band: the HAND gate itself cannot fire at runtime
-        # (raw activation sum < hand threshold — a reserved / disabled band whose
-        # discriminator never co-activates). Keep it dead: force the derived
-        # threshold above the derived positive sum so the AND stays unsatisfiable.
-        thr = derived_pos_sum + 0.5
-    else:
-        thr = derived_thr
     return out, thr
 
 
