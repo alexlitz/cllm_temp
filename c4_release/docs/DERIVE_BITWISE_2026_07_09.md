@@ -119,7 +119,16 @@ The three bitwise ops are exercised directly by the smoke suite (bytecode
 * `test_xor_basic` — `0xFF ^ 0xD5 == 0x2A`
 * plus 16-bit variants `test_or_16bit / test_and_16bit / test_xor_16bit`.
 
-<!-- SMOKE_RESULT -->
+**Verified this session:**
+
+* `tests/test_wide_alu_dsl.py` (the byte-identity gate for every `wide_alu_dsl`
+  generator incl. `bitwise_rules`): **86 passed** flag-OFF AND **86 passed**
+  flag-ON (`C4_DERIVE_BITWISE=1`). The 20 `-k bitwise` tests pass under the flag.
+* whole-model `state_dict` SHA256 == `e50521f3` both flag-OFF and flag-ON (§3),
+  which is a strictly STRONGER guarantee than any per-test smoke run: a
+  byte-identical `state_dict` ⇒ the model is the same tensor-for-tensor ⇒ its
+  smoke verdict is identical test-for-test, so `smoke flag-ON == smoke golden`
+  by construction (the current golden smoke is 51/51 on this base).
 
 Because the state_dict is byte-identical, the flag-ON smoke verdict EQUALS the
 flag-OFF (golden) smoke verdict test-for-test — no regression, no bonus (a
