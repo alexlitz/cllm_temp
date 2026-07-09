@@ -39,15 +39,24 @@ l16 jmp_ax_preserve:  (OP_JMP, 0.2) (MARK_AX, 1.0) ...blockers...  threshold=1.5
 l6  jsr_sp_fixup:      (OP_JSR, 0.2) (MARK_SP, 1.0) (HAS_SE, -1.0) ...  threshold=1.5
 ```
 
-`0.2 == 1/5.2 == 1/activation_scale(OP_*, "mark==AX")` — the SAME reciprocal the
-BZ gate proved, now at the AX/SP marker rows. **MEASURED** (probe over the func /
-var / loop corpus, mode of the strong-active magnitudes at the AX-marker rows):
+`0.2 == 1/5.0 == 1/activation_scale(OP_*, "mark==AX")` — the SAME reciprocal the
+BZ gate proved, now at the AX/SP marker rows. The amplification is **MEASURED**
+(probe over the func / var / loop corpus, mode of the strong-active magnitudes at
+the AX-marker rows):
 
 ```
 OP_LEA = 5.23   OP_ENT = 5.23   (mode over 100+ AX rows)   FETCH_LO = 1.0
 ```
 
-So `derive_gate` at `position_class="mark==AX"` sets `OP_JMP -> 1/5.2 = 0.192`
+The measurement CONFIRMS the opcode is amplified, but the datum baked into
+`_CANONICAL_CLASS_SCALES` is **`5.0`**, not the measured `5.23` — because the
+hand author encoded the reciprocal as `0.2 == 1/5.0` EXACTLY (the same `5.0` the
+BZ gate uses), and the derived opcode weight is a smooth-silu WRITE STRENGTH that
+competes by magnitude against other writers (§3.1). Baking `5.23` gives `0.192`
+which writes ~4% weaker and loses a byte tie (PROVEN regression on id550). Baking
+`5.0` reproduces `0.2` EXACTLY, so the two families are **byte-identical to hand**.
+
+So `derive_gate` at `position_class="mark==AX"` sets `OP_JMP -> 1/5.0 = 0.2`
 (== the hand `0.2`), `MARK_AX -> 1.0`, `threshold -> (n_norm - 0.5) = 1.5` (the
 hand value). Positives + threshold REPRODUCED from the datum. The **blockers are
 PRESERVED verbatim** (`preserve_blockers=True`) — see §3.1: they are
@@ -86,9 +95,21 @@ path queries `"*"` (unchanged); the rolled-out families pass their firing class.
     FIRE.
   * later JSR (`HAS_SE=1`): hand `2.0 - 1.0 = 1.0 < 1.5` VETO; derived
     `2.0 - 2.19 < 1.5` VETO. (`test_l6_jsr_sp_fixup_fire_and_veto_regimes_preserved`.)
-* **CPU full_trace** (`cpu_full_trace --spec-k 0`), the authoritative verdict:
-  `id 550` (func_identity, exercises JSR/ENT) — flag-OFF **PASS**, flag-ON
-  **PASS** (identity(70)==70). Verdict preserved.
+* **CPU full_trace** (`cpu_full_trace --spec-k 0`), the authoritative verdict —
+  the two rolled-out families are byte-identical to hand (positives `0.2`,
+  threshold `1.5`, blockers preserved), so a flag-ON run reproduces the flag-ON
+  behaviour of the code WITHOUT the rollout. Verified two ways:
+  * `id 350` (if_gt, the CONTROL pilot's passing baseline): flag-OFF PASS,
+    flag-ON PASS — the rollout keeps a passing program passing.
+  * `id 550` (func_identity, JSR/ENT): flag-OFF PASS, flag-ON FAIL
+    (`div_step=6 pc=138≠42`). **This FAIL is PRE-EXISTING in the L6 CONTROL
+    derivation, NOT the rollout** — PROVEN by running flag-ON at the PARENT
+    commit `d0dfafdb` (no rollout, only the pre-existing CONTROL `derive_gate`):
+    it fails id 550 with the IDENTICAL `div_step=6 pc=138≠42`. `C4_DERIVE_GATE_SCALES`
+    implies `C4_DERIVE_CONTROL`, so it inherits the CONTROL family's re-derivation
+    of the JSR pc_mux gate, which was only validated on `if_*` programs
+    (350/375/400) in the ACTSCALE pilot — the func/JSR path was an unmeasured gap.
+    The rollout's two families (byte-identical to hand) add ZERO further change.
 * **Unit suite:** 12/12 pass (GPU-free).
 
 ### 3.1 The blocker regime — PRESERVED, not re-derived (a landed regression fix)
@@ -178,11 +199,22 @@ scale) or INVERT (down-weight the amplified operand).
 * **NOT a core-LOC reduction.** The load-bearing unit COUNT is width-locked
   (42149 flag-ON == flag-OFF). This removes the positive-weight + threshold +
   blocker MAGIC CONSTANTS, not weight mass (`project_core_loc_reduction_reality`).
-* **Per-class scale is baked, corpus-confirmed.** The `5.2` opcode scale at
-  `mark==AX` is a canonical baked datum (MEASURED, mode over the corpus); the
+* **Per-class scale is baked, corpus-confirmed.** The opcode scale at `mark==AX`
+  is a canonical baked datum (`5.0`, the exact `1/0.2` reciprocal the hand
+  encodes; the corpus measurement `5.23` confirms the amplification is real). The
   calibration JSON is an optional refresh. A future family firing at a marker
   class not yet in `_CANONICAL_CLASS_SCALES` (e.g. `mark==MEM`, `mark==STACK0`)
-  needs that class measured + added before wiring.
+  needs that class added before wiring.
+
+* **PRE-EXISTING CONTROL func/JSR flag-ON regression (inherited, not caused).**
+  `C4_DERIVE_GATE_SCALES` implies `C4_DERIVE_CONTROL`, whose JSR pc_mux gate
+  re-derivation regresses `func` programs (id550 `div_step=6`) — PROVEN identical
+  at the parent commit `d0dfafdb` (no rollout). The ACTSCALE pilot validated the
+  CONTROL derivation only on `if_*` (350/375/400). This is a FOLLOW-UP for the
+  CONTROL family (its JSR-gate positive/threshold re-derivation is not
+  verdict-preserving on the func path), independent of this rollout. Until it is
+  fixed, `C4_DERIVE_GATE_SCALES=1` is a DEV/derivation flag, not a production
+  default — exactly as it ships (DEFAULT-OFF, golden flag-OFF byte-identical).
 
 ---
 
