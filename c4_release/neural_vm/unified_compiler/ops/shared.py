@@ -214,12 +214,12 @@ def derive_gate(conditions, *, position_class: str = "*",
         missing-one ``n_norm - 1`` => midpoint ``n_norm - 0.5``) shifted up by
         each preserved step-guard amplitude. (The hand BZ ``threshold = 3.5 + 10``
         is REPRODUCED: 4 normalized positives -> 3.5, plus the HAS_SE guard 10.)
-      * Each BLOCKER (``w < 0``) is re-derived via ``derive_pc_override_gate``'s
-        spec-structural veto ``-safety_factor * max_norm_weight * n_norm``.
+      * Each BLOCKER (``w < 0``) is re-derived to the spec-structural veto
+        ``-safety_factor * (derived_pos_sum + 1)`` so a single active blocker
+        vetoes past the threshold even when EVERY positive fires (scaled to the
+        gate's FULL activation regime, including the amplified step-guard).
 
-    Returns ``(rebuilt_conditions, threshold)``. ``max_norm_weight`` for the
-    blocker scale uses the normalized (unit) positive weight, keeping the veto
-    scaled to the gate's normalized activation regime.
+    Returns ``(rebuilt_conditions, threshold)``.
 
     **Satisfiability safety.** Deadness is decided by whether the HAND gate could
     EVER fire: ``sum(hand_weight * activation_scale)`` over positives (maximal
