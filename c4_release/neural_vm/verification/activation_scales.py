@@ -89,8 +89,41 @@ _CANONICAL_SCALES: Dict[str, float] = {
     # blocks — the MEASUREMENT (probe_measure_scales) shows OP_JMP == 0 at those
     # blocks in the corpus, i.e. the live JMP PC path is ELSEWHERE and those three
     # pc_mux override bands are DEAD reserved bands (docs/DERIVE_CONTROL §1). Their
-    # gate-local scale is left at the default 1.0 so the deadness check keeps them
-    # dead (hand threshold 4.5/5.0/5.5 > raw max-fire ~2.0 at unit scale).
+    # gate-local scale is left at the default 1.0 (the ``"*"`` wildcard) so the
+    # deadness check keeps them dead (hand threshold 4.5/5.0/5.5 > raw max-fire
+    # ~2.0 at unit scale). The per-block amplified opcode scale is in the
+    # PER-CLASS table below (an opcode reads 5.2 at ``mark==AX`` but the L6 JMP
+    # override band's OP_JMP reads ~0 at its all-step block — the SAME dim, a
+    # DIFFERENT scale per block, which is exactly why the scale is class-keyed).
+    "MARK_SE_ONLY": 1.0,
+    "PSH_AT_SP": 1.0,
+}
+
+# ---------------------------------------------------------------------------
+# PER-(position_class) scale overrides (task #452 gate rollout).
+#
+# The flat table above is the ``"*"`` wildcard (each dim's default scale). A gate
+# reading a dim at a SPECIFIC block/row-class can see a DIFFERENT amplitude — the
+# per-block-keying the ACTSCALE doc §6 flagged. The decisive case: an opcode
+# one-hot reads ~0 at the L6 all-step JMP override block (dead reserved band, so
+# ``OP_JMP`` stays 1.0 under ``"*"`` and the L6 deadness holds) but reads ~5.2 at
+# the ``mark==AX`` marker row where the L16 branch/frame + L10 CMP-combine
+# correctors fire. MEASURED (docs/GATE_ROLLOUT_2026_07_09.md): ``OP_LEA`` /
+# ``OP_ENT`` == 5.23 (mode over 100+ AX rows). So the AX-marker corrector gates'
+# hand ``0.2`` opcode weight == ``1/5.2`` == ``1/scale(OP_*, "mark==AX")`` — the
+# SAME reciprocal the BZ gate proved, now at the AX class. Keyed by class so the
+# L6 ``"*"`` deadness and the L16 ``mark==AX`` liveness coexist on one datum.
+# ---------------------------------------------------------------------------
+_AX_OPCODE_SCALE = 5.2
+_CANONICAL_CLASS_SCALES: Dict[str, Dict[str, float]] = {
+    "mark==AX": {
+        d: _AX_OPCODE_SCALE
+        for d in (
+            "OP_LEA", "OP_ADD", "OP_SUB", "OP_ADJ", "OP_ENT", "OP_LEV",
+            "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+            "OP_PSH", "OP_SI", "OP_SC", "OP_LI", "OP_IMM", "OP_JMP", "OP_JSR",
+        )
+    },
 }
 
 # Default scale for any dim not in the table (treat as a clean unit one-hot).
@@ -116,14 +149,23 @@ class ActivationScales:
     def canonical(cls) -> "ActivationScales":
         """The baked analytic table (no calibration JSON needed).
 
-        Position-class-agnostic: every dim maps its canonical scale under the
-        wildcard class ``"*"`` (the gate derivation queries by dim, falling back
-        to ``"*"``)."""
+        Each dim maps its canonical scale under the wildcard class ``"*"`` (the
+        gate-derivation default) PLUS any per-``position_class`` overrides
+        (``_CANONICAL_CLASS_SCALES``) — e.g. an opcode one-hot reads ``5.2`` at
+        ``mark==AX`` but stays ``1.0`` under ``"*"`` (dead at the L6 all-step JMP
+        block). The class-keyed entry wins for a class-specific query; ``"*"``
+        is the fallback (see :meth:`scale`)."""
+        scales: Dict[str, Dict[str, float]] = {
+            d: {"*": s} for d, s in _CANONICAL_SCALES.items()
+        }
+        for cls_name, per_dim in _CANONICAL_CLASS_SCALES.items():
+            for d, s in per_dim.items():
+                scales.setdefault(d, {})[cls_name] = s
         return cls(
             version=0,
             corpus_size=0,
             model_commit="canonical",
-            scales={d: {"*": s} for d, s in _CANONICAL_SCALES.items()},
+            scales=scales,
         )
 
     @classmethod
@@ -153,14 +195,24 @@ class ActivationScales:
                 v = by_dim.get("*")
             if v is not None and float(v) > 0.0:
                 return float(v)
-        # fall back to canonical baked scale
+        # fall back to canonical baked scale — a per-``position_class`` override
+        # (``_CANONICAL_CLASS_SCALES``, e.g. an opcode at ``mark==AX`` == 5.2)
+        # takes precedence over the flat ``"*"`` scale for a class-specific query.
+        canon_cls = _CANONICAL_CLASS_SCALES.get(position_class, {})
+        cv = canon_cls.get(dim)
+        if cv is not None and cv > 0.0:
+            return float(cv)
         canon = _CANONICAL_SCALES.get(dim)
         if canon is not None and canon > 0.0:
             return float(canon)
         return _DEFAULT_SCALE
 
     def has(self, dim: str) -> bool:
-        return dim in self.scales or dim in _CANONICAL_SCALES
+        return (
+            dim in self.scales
+            or dim in _CANONICAL_SCALES
+            or any(dim in per for per in _CANONICAL_CLASS_SCALES.values())
+        )
 
 
 def _default_calibration_path() -> Path:

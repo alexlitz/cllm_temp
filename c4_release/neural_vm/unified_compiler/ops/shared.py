@@ -297,6 +297,37 @@ def derive_gate(conditions, *, position_class: str = "*",
     return out, thr
 
 
+def derive_and_gate_maybe(conditions, threshold, *, position_class="*"):
+    """Family-wide ``derive_gate`` opt-in for a ``multi_way_and_rule`` caller
+    (task #452 rollout). Returns ``(conditions, threshold)``:
+
+      * when ``C4_DERIVE_GATE_SCALES`` is ON, the FULLY-derived gate
+        (:func:`derive_gate`, positives = ``1/activation_scale(dim,
+        position_class)``, threshold from the normalized balanced-AND +
+        step-guard, blockers from the safety factor) — reproducing the hand
+        positives + threshold from the calibration datum (verdict-preserving);
+      * OFF (the golden default), the hand ``conditions`` / ``threshold``
+        UNCHANGED.
+
+    This is the generalization of the L6 ``pc_mux`` wiring
+    (``l6_ops._maybe_derive_pc_mux_spec``) to any AND-shaped gate: an
+    opcode-reciprocal / marker balanced-AND whose positive discriminators read
+    at their calibrated ``activation_scale``. ``position_class`` selects the
+    scale axis — e.g. the L16 branch/frame + L10 CMP-combine correctors fire at
+    ``"mark==AX"`` where an opcode one-hot reads ``5.2`` (so its hand ``0.2`` ==
+    ``1/scale`` derives), whereas an L6 override band reads that same opcode at
+    ``"*"`` (``1.0``, keeping the reserved band dead). The deadness guard in
+    :func:`derive_gate` (a hand-DEAD band stays dead) makes this always safe to
+    wrap a mixed live/dead family.
+    """
+    if not derive_gate_scales_enabled():
+        return tuple(conditions), threshold
+    return derive_gate(
+        tuple(conditions), position_class=position_class,
+        hand_threshold=threshold,
+    )
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
