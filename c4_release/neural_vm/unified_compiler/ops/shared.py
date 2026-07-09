@@ -80,6 +80,37 @@ def derive_imm_enabled() -> bool:
     return os.environ.get("C4_DERIVE_IMM", "0") != "0"
 
 
+def derive_bitwise_enabled() -> bool:
+    """Flag for the SPEC-DERIVED BITWISE family (OR/XOR/AND). Default OFF.
+
+    BLOG_SPEC §568: *"Bitwise: 10 weights — one formula (a+b-ab) for all"*.
+    All three bitwise ops are ONE per-bit polynomial
+    ``r_bit = c_a*a_bit + c_b*b_bit + c_ab*(a_bit*b_bit)`` applied across the
+    4 nibble bits, with a single per-op coefficient triple read straight from
+    the spec text:
+
+      * OR  = ``a + b - a*b``   -> ``(c_a, c_b, c_ab) = ( 1,  1, -1)``
+      * AND = ``        a*b``   -> ``( 0,  0,  1)``
+      * XOR = ``a + b - 2*a*b`` -> ``( 1,  1, -2)``
+
+    When ``C4_DERIVE_BITWISE=1`` the L10 bitwise result nibbles (lookup post-op
+    AND both L10-main-FFN callers) are produced by this ONE shared formula
+    (``wide_alu_dsl._bitwise_result_from_spec_formula``) instead of the three
+    enumerated ``operator.and_/or_/xor`` bit functions
+    (``wide_alu_dsl._BITWISE_OP_FN``). The result nibbles are provably
+    identical per ``(a, b)`` pair (each per-bit result is in ``{0, 1}`` by
+    construction), so ``tools/_isa_golden_hash.py`` is UNCHANGED under the flag
+    — the derivation is a SOURCE collapse (3 distinct bit operators -> 1 spec
+    formula + 3 coefficient triples), not a weight change.
+
+    Default OFF => the enumerated-operator path stays the golden build. Both
+    ON/OFF are registered in the ``full_vm_compiler_dynamic.py`` cache-key
+    snapshots so a derived build never shares a memo / disk entry with the
+    hand path. See ``docs/DERIVE_BITWISE_2026_07_09.md``.
+    """
+    return os.environ.get("C4_DERIVE_BITWISE", "0") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
