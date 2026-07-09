@@ -83,6 +83,14 @@ path queries `"*"` (unchanged); the rolled-out families pass their firing class.
 
 ## 3. Verdict-preserving proof
 
+* **The two families' gate specs are BYTE-IDENTICAL flag-OFF vs flag-ON** — the
+  strongest possible result. The derived `OP_JMP`/`OP_JSR = 1/5.0 = 0.2`,
+  `MARK = 1.0`, `threshold = 1.5`, and the PRESERVED blockers exactly reproduce
+  the hand `(conditions, threshold)` tuple (proven by direct comparison of the
+  two builders' output OFF vs ON — every weight + threshold matches to 1e-9). So
+  the rollout is a weight-level NO-OP for these families: it eliminates the
+  authoring magic constants (they now DERIVE from the calibration datum) while
+  producing the SAME weights.
 * **Golden flag-OFF == `e50521f3`** after every edit (the datum + wiring are
   invisible when the flag is off).
 * **Flag-ON build:** SAME 42149 FFN units, no dead units (width-locked, per
