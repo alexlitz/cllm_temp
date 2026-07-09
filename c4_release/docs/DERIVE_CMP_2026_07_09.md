@@ -116,6 +116,16 @@ The flag-OFF hand path is retained verbatim (byte-identical golden gate), so no
 line is deleted yet; the derivation is proven a drop-in and the hand
 enumeration can be removed in a follow-up flip once `C4_DERIVE_CMP` defaults ON.
 
+## 5b. Gates (all green)
+
+- **Golden flag-OFF:** `e50521f3…` == base (unchanged).
+- **Golden flag-ON (`C4_DERIVE_CMP=1`):** `e50521f3…` == base (**byte-identical**).
+- **`tools/verify_derive_cmp.py`:** both banks 18/18 rule-for-rule, `BYTE-IDENTICAL`.
+- **Smoke flag-ON (`C4_DERIVE_CMP=1`, spec-k 0):** `TestSmokeComparison`
+  eq_true / eq_false / lt_true / ne_true / gt_true / le_true / ge_true = **7/7 PASS**;
+  `bz_branch` / `bnz_branch` = **2/2 PASS**. Identical to baseline (guaranteed by
+  the byte-identical hash).
+
 ## 6. Verdict (correctness + bonus fixes)
 
 - **Correctness:** flag-ON is byte-identical to golden `e50521f3` at the
