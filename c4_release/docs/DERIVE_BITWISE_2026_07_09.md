@@ -119,7 +119,21 @@ The three bitwise ops are exercised directly by the smoke suite (bytecode
 * `test_xor_basic` — `0xFF ^ 0xD5 == 0x2A`
 * plus 16-bit variants `test_or_16bit / test_and_16bit / test_xor_16bit`.
 
-**Verified this session:**
+**Verified this session (flag-ON, `C4_DERIVE_BITWISE=1`, spec_k=0 batched
+neural — the ground-truth smoke path):**
+
+| test | check | verdict |
+|------|-------|---------|
+| `test_or_basic`  | `0x0F \| 0x30 == 0x3F` | **PASS** |
+| `test_and_basic` | `0xFF & 0x2A == 0x2A` | **PASS** |
+| `test_xor_basic` | `0xFF ^ 0xD5 == 0x2A` | **PASS** |
+| `test_or_16bit`  | 16-bit OR | **PASS** |
+| `test_and_16bit` | 16-bit AND | **PASS** |
+| `test_xor_16bit` | 16-bit XOR | **PASS** |
+
+Full `bitwise` + `bit32` smoke groups (13 tests incl. add/sub/mul/shift
+co-tenants): **13 passed, 0 failed** flag-ON. No regression on any bitwise op
+or its band co-tenants.
 
 * `tests/test_wide_alu_dsl.py` (the byte-identity gate for every `wide_alu_dsl`
   generator incl. `bitwise_rules`): **86 passed** flag-OFF AND **86 passed**
