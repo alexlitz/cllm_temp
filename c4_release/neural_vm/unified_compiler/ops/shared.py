@@ -80,6 +80,206 @@ def derive_imm_enabled() -> bool:
     return os.environ.get("C4_DERIVE_IMM", "0") != "0"
 
 
+# ---------------------------------------------------------------------------
+# CONTROL-family PC-override gate derivation (task #391 + #395)
+#
+# Cherry-picked from the CONTROL branch (worktree-agent-a73192c6a3fb53696,
+# docs/DERIVE_CONTROL_2026_07_09.md) so the ACTIVATION-SCALE pilot can extend it.
+# ``C4_DERIVE_CONTROL`` re-derives the BLOCKER magnitudes (verdict-preserving);
+# ``C4_DERIVE_GATE_SCALES`` additionally re-derives the POSITIVE weights +
+# threshold from the per-dim runtime activation-scale datum
+# (``verification.activation_scales``) — the piece the CONTROL branch flagged as
+# not-yet-derivable from the ISA identity alone.
+# ---------------------------------------------------------------------------
+
+def derive_jmp_enabled() -> bool:
+    """Flag for the SPEC-ALONE-derived JMP PC-override gate (task #391 pilot).
+    Default OFF. See ``derive_pc_override_gate``: re-derives the JMP override
+    gate's blocker magnitudes from the gate's own structure."""
+    return os.environ.get("C4_DERIVE_JMP", "0") != "0"
+
+
+def derive_control_enabled() -> bool:
+    """Flag for the SPEC-ALONE-derived CONTROL-branch family (task #391 part 1).
+    Default OFF.
+
+    Generalizes the JMP pilot to JMP/BZ/BNZ/JSR, all routing their PC override
+    through the shared ``pc_mux`` encoder. ``C4_DERIVE_CONTROL=1`` re-derives
+    each branch op's PC-override gate BLOCKER magnitudes from the ISA
+    branch-condition alone (``derive_pc_override_gate``), eliminating the per-op
+    blocker magic constants while staying VERDICT-PRESERVING. The positive
+    weights + threshold are KEPT (they carry the runtime-activation-scale +
+    satisfiability data — the negative result in the CONTROL doc proves they are
+    not over-margin). Default OFF => the hand path stays the golden build."""
+    return os.environ.get("C4_DERIVE_CONTROL", "0") != "0"
+
+
+def derive_gate_scales_enabled() -> bool:
+    """Flag for the ACTIVATION-SCALE-derived CONTROL gate (task #395). Default OFF.
+
+    The CONTROL branch (``derive_control_enabled``) derives only the gate BLOCKER
+    magnitudes and KEEPS the hand positive weights + threshold, flagging the
+    per-dim runtime activation SCALE as the missing spec datum needed to derive
+    those too. ``C4_DERIVE_GATE_SCALES=1`` closes that datum: it re-derives the
+    FULL gate — positive weights = ``1/activation_scale(dim)`` (from the
+    calibration datum ``verification.activation_scales``), threshold from the
+    NORMALIZED balanced-AND (``n_pos - 0.5`` over unit-scale contributions, plus
+    the amplified step-guard's own weight), AND the blocker safety factor — with
+    ZERO hand-tuned per-op numbers.
+
+    This is a RE-DERIVATION (behaviour-correct, NOT byte-identical): it replaces
+    the hand ``OP_BZ=0.2`` (= ``1/5``, the measured OP_BZ activation scale) +
+    ``threshold=3.5+10`` with the derived form. Implies ``C4_DERIVE_CONTROL``
+    (the blocker derivation) — turning gate-scales on turns control on. Default
+    OFF => the hand-authored gate stays the golden build; the derived build must
+    NEVER share a memo / disk cache entry with the golden (registered in both
+    cache-key snapshots in ``full_vm_compiler_dynamic.py``)."""
+    return os.environ.get("C4_DERIVE_GATE_SCALES", "0") != "0"
+
+
+# Spec-structural safety factor for the derived PC-override gate blocker
+# magnitude (task #391): ``blocker = -k * max_pos_weight * n_pos``. The ONLY
+# numeric input to the blocker derivation and it is SPEC-STRUCTURAL (a fixed veto
+# headroom that scales with the AND width), NOT a per-op magic constant.
+# Overridable via ``C4_PC_OVERRIDE_K`` for the margin study.
+def _pc_override_safety_factor() -> float:
+    try:
+        return float(os.environ.get("C4_PC_OVERRIDE_K", "1"))
+    except ValueError:
+        return 1.0
+
+
+def derive_pc_override_gate(
+    conditions, *, hand_threshold=None, safety_factor=None,
+):
+    """Re-derive a CONTROL-branch PC-override gate's BLOCKER magnitudes from the
+    gate's own structure (task #391), eliminating the per-op blocker magic
+    constants while staying VERDICT-PRESERVING by construction.
+
+    The POSITIVE weights + threshold are PRESERVED (they carry the runtime-scale
+    + satisfiability information). Only the BLOCKER magnitudes are re-derived:
+    each ``w < 0`` dim -> ``-safety_factor * max_pos_weight * n_pos`` where
+    ``max_pos_weight`` is the gate's own largest positive weight. Blockers only
+    get STRONGER-or-equal vetoes on the same firing structure, so no should-fire
+    row is newly blocked and no should-block row newly admitted.
+
+    Returns ``(rebuilt_conditions, threshold)``.
+    """
+    if safety_factor is None:
+        safety_factor = _pc_override_safety_factor()
+    pos_weights = [w for _dim, w in conditions if w > 0]
+    n_pos = len(pos_weights)
+    max_pos = max(pos_weights) if pos_weights else 1.0
+    block = safety_factor * float(max_pos) * float(max(n_pos, 1))
+    out = tuple(
+        (dim, w) if w > 0 else (dim, -block) for dim, w in conditions
+    )
+    thr = hand_threshold if hand_threshold is not None else n_pos - 0.5
+    return out, thr
+
+
+# The step-guard amplitude — an AMPLIFIED positive whose weight is a
+# satisfiability lever (the AND is unsatisfiable unless the step-guard dim is
+# active), NOT a scale-normalizer. It is preserved by the scale derivation (its
+# weight is not ``1/scale``; it deliberately over-weights so the threshold offset
+# it contributes hard-gates the step-0 kill). Detected structurally: a positive
+# weight far above the reciprocal of any plausible activation scale (>= this).
+_STEP_GUARD_AMP_FLOOR = 3.0
+
+
+def derive_gate(conditions, *, position_class: str = "*",
+                hand_threshold=None, safety_factor=None):
+    """FULLY derive a balanced-AND gate — POSITIVE weights + threshold + BLOCKER
+    magnitudes — from (a) the per-dim runtime ACTIVATION-SCALE datum and (b) the
+    ISA-identity balanced-AND structure, with ZERO hand-tuned per-op numbers
+    (task #395). Closes the CONTROL branch's flagged datum.
+
+    Derivation (see docs/DERIVE_ACTSCALE_2026_07_09.md):
+
+      * Each SCALE-NORMALIZED positive dim (a discriminator one-hot / flag) gets
+        weight ``1/activation_scale(dim, position_class)`` so its residual
+        contribution ``scale * weight == 1.0`` — a unit AND term. (The hand
+        ``OP_BZ=0.2`` == ``1/5.0`` == ``1/scale(OP_BZ)`` is REPRODUCED, not
+        hand-authored.)
+      * A STEP-GUARD positive (weight ``>= _STEP_GUARD_AMP_FLOOR``, e.g. the BZ
+        ``HAS_SE=10`` step-0 kill) is PRESERVED verbatim — it is a satisfiability
+        amplitude, not a scale-normalizer, so it is a spec datum (the guard MUST
+        be active for the gate to fire), and it contributes its FULL weight to
+        the threshold.
+      * ``threshold = (n_norm - 0.5) + sum(step_guard_weights)`` — the balanced
+        AND over the ``n_norm`` unit-scale positives (all-on ``n_norm`` vs
+        missing-one ``n_norm - 1`` => midpoint ``n_norm - 0.5``) shifted up by
+        each preserved step-guard amplitude. (The hand BZ ``threshold = 3.5 + 10``
+        is REPRODUCED: 4 normalized positives -> 3.5, plus the HAS_SE guard 10.)
+      * Each BLOCKER (``w < 0``) is re-derived via ``derive_pc_override_gate``'s
+        spec-structural veto ``-safety_factor * max_norm_weight * n_norm``.
+
+    Returns ``(rebuilt_conditions, threshold)``. ``max_norm_weight`` for the
+    blocker scale uses the normalized (unit) positive weight, keeping the veto
+    scaled to the gate's normalized activation regime.
+
+    **Satisfiability safety.** Deadness is decided by whether the HAND gate could
+    fire at runtime: ``sum(hand_weight * activation_scale)`` over positives vs the
+    hand threshold. A LIVE hand band (raw runtime sum >= hand threshold — e.g.
+    all-step JMP ``1*1 + 1*5 = 6 >= 4.5``) gets the DERIVED balanced-AND threshold
+    (``n_norm - 0.5 + step_guard``). A DEAD hand band (raw runtime sum < hand
+    threshold, unsatisfiable by design — the reserved delayed/first-step JMP bands
+    whose CMP+0 / HAS_SE==0 discriminator never co-activates) is kept dead: its
+    derived threshold is forced ABOVE the derived positive sum, so the derivation
+    never RESURRECTS a reserved band.
+    """
+    from ...verification.activation_scales import load_activation_scales
+
+    if safety_factor is None:
+        safety_factor = _pc_override_safety_factor()
+    scales = load_activation_scales()
+
+    rebuilt = []
+    n_norm = 0
+    step_guard_total = 0.0
+    norm_pos_weights = []
+    # RAW hand runtime sum over positives: sum(hand_weight * activation_scale).
+    # This is what the HAND gate accumulates at runtime; comparing it to the hand
+    # threshold decides deadness (independent of the normalization).
+    hand_raw_runtime_sum = 0.0
+    for dim, w in conditions:
+        s = scales.scale(dim, position_class)
+        if w <= 0:
+            rebuilt.append((dim, w))  # blocker sign preserved; magnitude below
+            continue
+        hand_raw_runtime_sum += float(w) * s
+        if w >= _STEP_GUARD_AMP_FLOOR:
+            # amplified satisfiability guard — preserve verbatim, add to threshold
+            rebuilt.append((dim, w))
+            step_guard_total += float(w)
+            continue
+        # scale-normalized discriminator: weight = 1/scale
+        nw = 1.0 / s if s > 0 else 1.0
+        rebuilt.append((dim, nw))
+        norm_pos_weights.append(nw)
+        n_norm += 1
+
+    # Blocker magnitude scaled to the normalized positive regime.
+    max_norm = max(norm_pos_weights) if norm_pos_weights else 1.0
+    block = safety_factor * float(max_norm) * float(max(n_norm, 1))
+    out = tuple(
+        (dim, w) if w > 0 else (dim, -block) for dim, w in rebuilt
+    )
+
+    derived_pos_sum = sum(w for _d, w in out if w > 0)
+    derived_thr = (n_norm - 0.5) + step_guard_total
+
+    if hand_threshold is not None and hand_threshold > hand_raw_runtime_sum + 1e-6:
+        # DEAD hand band: the HAND gate itself cannot fire at runtime
+        # (raw activation sum < hand threshold — a reserved / disabled band whose
+        # discriminator never co-activates). Keep it dead: force the derived
+        # threshold above the derived positive sum so the AND stays unsatisfiable.
+        thr = derived_pos_sum + 0.5
+    else:
+        thr = derived_thr
+    return out, thr
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
