@@ -188,11 +188,14 @@ _STEP_GUARD_AMP_FLOOR = 3.0
 
 
 def derive_gate(conditions, *, position_class: str = "*",
-                hand_threshold=None, safety_factor=None):
+                hand_threshold=None, safety_factor=None, scales=None):
     """FULLY derive a balanced-AND gate — POSITIVE weights + threshold + BLOCKER
     magnitudes — from (a) the per-dim runtime ACTIVATION-SCALE datum and (b) the
     ISA-identity balanced-AND structure, with ZERO hand-tuned per-op numbers
     (task #395). Closes the CONTROL branch's flagged datum.
+
+    ``scales`` — an optional :class:`ActivationScales` to use instead of the
+    process-loaded datum (dependency injection for tests / a bespoke calibration).
 
     Derivation (see docs/DERIVE_ACTSCALE_2026_07_09.md):
 
@@ -234,7 +237,8 @@ def derive_gate(conditions, *, position_class: str = "*",
 
     if safety_factor is None:
         safety_factor = _pc_override_safety_factor()
-    scales = load_activation_scales()
+    if scales is None:
+        scales = load_activation_scales()
 
     # --- Deadness check FIRST -------------------------------------------------
     # RAW hand runtime sum over positives: sum(hand_weight * activation_scale) —
