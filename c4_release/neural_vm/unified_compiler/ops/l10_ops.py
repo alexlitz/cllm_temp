@@ -1251,6 +1251,7 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     byte_copy_computed_rules,
     byte_route_rules,
+    derived_comparison_rules,
     multi_way_and_rule,
 )
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
@@ -1981,6 +1982,63 @@ def _build_l10_carry_post_op(
     return post_op
 
 
+# The six comparison opcodes, in the canonical L10 cmp-combine bank order.
+_CMP_OPS_ORDER = ("EQ", "NE", "LT", "GT", "LE", "GE")
+# The (HI_EQ ∧ LO_LT) lexicographic product term that gets the campaign guard
+# threshold on GT / GE (see ``cmp_gt_lo_lt_hieq_guard_enabled``).
+_CMP_HI_EQ_LO_LT_TERM = ("CMP+1", "CMP+3")
+
+
+def _derived_cmp_combine_rules(
+    S: float,
+    *,
+    opcode_gate_fmt: str,
+    default_threshold: float,
+    override3_threshold: float,
+    override_include_blocker: bool,
+    name_prefix_fmt: str,
+    gt_ge_guard_threshold: float,
+) -> tuple[FFNRule, ...]:
+    """Derive all six comparison decoders from ONE zero-detector (task #446).
+
+    Shared body for the two hand-authored cmp-combine banks
+    (``_l10_comparison_combine_rules`` decode path and
+    ``_layer10_alu_cmp_combine_rules`` L10-main ALU lane), selected by
+    ``C4_DERIVE_CMP``. Both are the SAME §576-590 truth table over the CMP
+    zero-detector/sign flags; the per-path DATA (gate spelling, thresholds,
+    whether overrides carry the MARK_PC blocker) is entirely in the kwargs,
+    matching the corresponding hand path byte-for-byte. Emits 18 units (one
+    default + one-to-three overrides per op) in ``_CMP_OPS_ORDER``.
+    """
+    rules: list[FFNRule] = []
+    for op in _CMP_OPS_ORDER:
+        thr_override = (
+            {_CMP_HI_EQ_LO_LT_TERM: gt_ge_guard_threshold}
+            if op in ("GT", "GE") else {}
+        )
+        rules.extend(derived_comparison_rules(
+            op=op,
+            marker_dim="MARK_SE_ONLY",
+            opcode_gate=opcode_gate_fmt.format(op=op),
+            result_lo_band="OUTPUT_LO",
+            default_write=(("OUTPUT_HI_THIS_STEP+0", 2.0),),
+            blocker_dim="MARK_PC",
+            blocker_weight=-50.0,
+            default_threshold=default_threshold,
+            override2_threshold=1.5,
+            override3_threshold=override3_threshold,
+            override3_hi_lt_blocker_weight=-0.1,
+            default_write_value=2.0,
+            override_write_value=4.0,
+            scope_prefix="MARK_SE_ONLY",
+            name_prefix=name_prefix_fmt.format(op=op.lower()),
+            override3_threshold_override=thr_override,
+            override_include_blocker=override_include_blocker,
+            S=S,
+        ))
+    return tuple(rules)
+
+
 def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """Declarative rules for ``ComparisonCombine`` (18 units).
 
@@ -2125,46 +2183,64 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
 
     rules: list[FFNRule] = []
 
-    # EQ: default 0, override (CMP+1,CMP+2 -> 1)
-    rules.append(cmp_default("OP_EQ", 0, idx=0))
-    rules.append(cmp_override_3way("OP_EQ", "CMP+1", "CMP+2", 1, 0, idx=1))
+    from .shared import derive_cmp_enabled
+    if derive_cmp_enabled():
+        # C4_DERIVE_CMP (task #446): the 18 core units are the SAME §576-590
+        # truth table over the CMP zero-detector/sign flags, so re-derive them
+        # from the single ``derived_comparison_rules`` generator instead of the
+        # per-op default+override hand-enumeration below. Byte-identical to the
+        # hand path (proof: tools/verify_derive_cmp.py + golden hash). The
+        # margin-clamp bank appended below is orthogonal and unchanged.
+        rules.extend(_derived_cmp_combine_rules(
+            S,
+            opcode_gate_fmt="OP_{op}",
+            default_threshold=1.5,
+            override3_threshold=2.5,
+            override_include_blocker=True,
+            name_prefix_fmt="l10_cmp_{op}",
+            gt_ge_guard_threshold=_gt_gtge_3way_thresh,
+        ))
+    else:
+        # EQ: default 0, override (CMP+1,CMP+2 -> 1)
+        rules.append(cmp_default("OP_EQ", 0, idx=0))
+        rules.append(cmp_override_3way("OP_EQ", "CMP+1", "CMP+2", 1, 0, idx=1))
 
-    # NE: default 1, override (CMP+1,CMP+2 -> 0)
-    rules.append(cmp_default("OP_NE", 1, idx=2))
-    rules.append(cmp_override_3way("OP_NE", "CMP+1", "CMP+2", 0, 1, idx=3))
+        # NE: default 1, override (CMP+1,CMP+2 -> 0)
+        rules.append(cmp_default("OP_NE", 1, idx=2))
+        rules.append(cmp_override_3way("OP_NE", "CMP+1", "CMP+2", 0, 1, idx=3))
 
-    # LT: default 0, override CMP+0 -> 1, override (CMP+1,CMP+3 -> 1)
-    rules.append(cmp_default("OP_LT", 0, idx=4))
-    rules.append(cmp_override_2way("OP_LT", "CMP+0", 1, 0, idx=5))
-    rules.append(cmp_override_3way("OP_LT", "CMP+1", "CMP+3", 1, 0, idx=6))
+        # LT: default 0, override CMP+0 -> 1, override (CMP+1,CMP+3 -> 1)
+        rules.append(cmp_default("OP_LT", 0, idx=4))
+        rules.append(cmp_override_2way("OP_LT", "CMP+0", 1, 0, idx=5))
+        rules.append(cmp_override_3way("OP_LT", "CMP+1", "CMP+3", 1, 0, idx=6))
 
-    # GT: default 1, override CMP+0 -> 0, two 3-way overrides -> 0
-    rules.append(cmp_default("OP_GT", 1, idx=7))
-    rules.append(cmp_override_2way("OP_GT", "CMP+0", 0, 1, idx=8))
-    # idx=9 (hi_eq AND lo_lt): campaign-gated 2.75 threshold rejects the
-    # spurious lo_lt-alone trip on the loaded-var GT-TRUE path (if_var 425/436/
-    # 440/441/445/448). See ``cmp_gt_lo_lt_hieq_guard_enabled``.
-    rules.append(cmp_override_3way(
-        "OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9,
-        threshold=_gt_gtge_3way_thresh,
-    ))
-    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+2", 0, 1, idx=10))
+        # GT: default 1, override CMP+0 -> 0, two 3-way overrides -> 0
+        rules.append(cmp_default("OP_GT", 1, idx=7))
+        rules.append(cmp_override_2way("OP_GT", "CMP+0", 0, 1, idx=8))
+        # idx=9 (hi_eq AND lo_lt): campaign-gated 2.75 threshold rejects the
+        # spurious lo_lt-alone trip on the loaded-var GT-TRUE path (if_var 425/436/
+        # 440/441/445/448). See ``cmp_gt_lo_lt_hieq_guard_enabled``.
+        rules.append(cmp_override_3way(
+            "OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9,
+            threshold=_gt_gtge_3way_thresh,
+        ))
+        rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+2", 0, 1, idx=10))
 
-    # LE: default 0, override CMP+0 -> 1, two 3-way overrides -> 1
-    rules.append(cmp_default("OP_LE", 0, idx=11))
-    rules.append(cmp_override_2way("OP_LE", "CMP+0", 1, 0, idx=12))
-    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+3", 1, 0, idx=13))
-    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+2", 1, 0, idx=14))
+        # LE: default 0, override CMP+0 -> 1, two 3-way overrides -> 1
+        rules.append(cmp_default("OP_LE", 0, idx=11))
+        rules.append(cmp_override_2way("OP_LE", "CMP+0", 1, 0, idx=12))
+        rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+3", 1, 0, idx=13))
+        rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+2", 1, 0, idx=14))
 
-    # GE: default 1, override CMP+0 -> 0, override (CMP+1,CMP+3 -> 0)
-    rules.append(cmp_default("OP_GE", 1, idx=15))
-    rules.append(cmp_override_2way("OP_GE", "CMP+0", 0, 1, idx=16))
-    # idx=17 (hi_eq AND lo_lt): symmetric campaign-gated 2.75 threshold so the
-    # loaded-var GE result is not flipped to 0 by a spurious lo_lt alone.
-    rules.append(cmp_override_3way(
-        "OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17,
-        threshold=_gt_gtge_3way_thresh,
-    ))
+        # GE: default 1, override CMP+0 -> 0, override (CMP+1,CMP+3 -> 0)
+        rules.append(cmp_default("OP_GE", 1, idx=15))
+        rules.append(cmp_override_2way("OP_GE", "CMP+0", 0, 1, idx=16))
+        # idx=17 (hi_eq AND lo_lt): symmetric campaign-gated 2.75 threshold so the
+        # loaded-var GE result is not flipped to 0 by a spurious lo_lt alone.
+        rules.append(cmp_override_3way(
+            "OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17,
+            threshold=_gt_gtge_3way_thresh,
+        ))
 
     # C4_CMP_COMBINE_MARGIN (campaign-only, default-OFF): +6 OUTPUT_HI clamp
     # units appended LAST so the 18-unit default+override footprint is
@@ -2318,6 +2394,23 @@ def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
     flipping the result via a +4.0/S / -4.0/S pair on OUTPUT_LO) that
     fire on CMP-flag combinations from L9.
     """
+
+    from .shared import derive_cmp_enabled
+    if derive_cmp_enabled():
+        # C4_DERIVE_CMP (task #446): re-derive this L10-main ALU cmp lane from
+        # the single ``derived_comparison_rules`` generator. Same §576-590
+        # truth table, this path's structural constants (SE_OP gate, default
+        # threshold 2.5, override3 threshold 4.0, overrides omit the MARK_PC
+        # blocker). Byte-identical to the hand path below.
+        return _derived_cmp_combine_rules(
+            S,
+            opcode_gate_fmt="SE_OP_{op}+0",
+            default_threshold=2.5,
+            override3_threshold=4.0,
+            override_include_blocker=False,
+            name_prefix_fmt="l10_alu_cmp_{op}",
+            gt_ge_guard_threshold=4.0,
+        )
 
     def _cmp_default(op_name: str, default_result: int) -> FFNRule:
         # DSL v4b: 3-condition AND with explicit threshold 2.5 and a
