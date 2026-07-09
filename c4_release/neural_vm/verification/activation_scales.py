@@ -114,16 +114,19 @@ _CANONICAL_SCALES: Dict[str, float] = {
 # SAME reciprocal the BZ gate proved, now at the AX class. Keyed by class so the
 # L6 ``"*"`` deadness and the L16 ``mark==AX`` liveness coexist on one datum.
 # ---------------------------------------------------------------------------
-_AX_OPCODE_SCALE = 5.2
+_AMPLIFIED_OPCODE_SCALE = 5.2
+# Every opcode one-hot the AX-/SP-marker correctors read. The opcode flag is
+# BROADCAST in-step to every marker row (the L5 decode band + the Wave-A
+# step-end relay carry it), so it reads the SAME ~5.2 amplified plateau at the
+# AX and SP marker rows (MEASURED at mark==AX; the SP row shares the broadcast).
+_AMPLIFIED_OPCODES = (
+    "OP_LEA", "OP_ADD", "OP_SUB", "OP_ADJ", "OP_ENT", "OP_LEV",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_PSH", "OP_SI", "OP_SC", "OP_LI", "OP_IMM", "OP_JMP", "OP_JSR",
+)
 _CANONICAL_CLASS_SCALES: Dict[str, Dict[str, float]] = {
-    "mark==AX": {
-        d: _AX_OPCODE_SCALE
-        for d in (
-            "OP_LEA", "OP_ADD", "OP_SUB", "OP_ADJ", "OP_ENT", "OP_LEV",
-            "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
-            "OP_PSH", "OP_SI", "OP_SC", "OP_LI", "OP_IMM", "OP_JMP", "OP_JSR",
-        )
-    },
+    "mark==AX": {d: _AMPLIFIED_OPCODE_SCALE for d in _AMPLIFIED_OPCODES},
+    "mark==SP": {d: _AMPLIFIED_OPCODE_SCALE for d in _AMPLIFIED_OPCODES},
 }
 
 # Default scale for any dim not in the table (treat as a clean unit one-hot).

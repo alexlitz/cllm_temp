@@ -47,10 +47,21 @@ if _C4_RELEASE_DIR not in sys.path:
 # The discriminator dims whose activation scale the CONTROL gates depend on
 # (markers, opcode one-hots, branch/step flags). Extend as more gate families
 # are migrated to derive_gate.
+#
+# GATE-ROLLOUT (task #452): the AX-/SP-marker corrector families
+# (l16 jmp_ax_preserve, l6 jsr_sp_fixup) read the FULL opcode one-hot set at the
+# marker row (the opcode flag is broadcast in-step). Measuring them here records
+# the ``mark==AX`` / ``mark==SP`` amplified scale (~5.2) that
+# ``activation_scales._CANONICAL_CLASS_SCALES`` bakes; the calibration confirms
+# the canonical table (an OPTIONAL refresh, not a build prerequisite).
 _GATE_DIMS = [
     "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
     "MARK_SE", "IS_BYTE", "HAS_SE",
     "OP_JMP", "OP_JSR", "OP_BZ", "OP_BNZ",
+    # opcode one-hots the AX-/SP-marker gate rollout depends on
+    "OP_LEA", "OP_ADD", "OP_SUB", "OP_ADJ", "OP_ENT", "OP_LEV",
+    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
+    "OP_PSH", "OP_SI", "OP_SC", "OP_LI", "OP_IMM",
     "CMP+0", "CMP+4", "CMP+5",
 ]
 
@@ -141,6 +152,17 @@ def main() -> int:
             # opcode / cmp flags live at the PC (opcode) row
             if "mark==PC" in buckets:
                 out.append("mark==PC")
+            # GATE-ROLLOUT (task #452): the opcode flag is BROADCAST in-step to
+            # every marker row (the L5 decode band + Wave-A step-end relay carry
+            # it), so it is amplified (~5.2) at the AX / SP marker rows the
+            # rollout corrector families (l16 jmp_ax_preserve, l6 jsr_sp_fixup)
+            # fire on. Record those classes so the calibration confirms the
+            # _CANONICAL_CLASS_SCALES 5.2 datum, not just the PC-row scale.
+            if dim.startswith("OP_"):
+                if "mark==AX" in buckets:
+                    out.append("mark==AX")
+                if "mark==SP" in buckets:
+                    out.append("mark==SP")
         elif dim == "IS_BYTE":
             for b in buckets:
                 if b.startswith("is_byte"):

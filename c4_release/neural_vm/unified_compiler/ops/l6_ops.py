@@ -24,6 +24,7 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from ..wide_alu_dsl import const_delta_nibble_shift_rules
 from .shared import (
     _as_setdim_proxy,
+    derive_and_gate_maybe,
     derive_control_enabled,
     derive_gate,
     derive_gate_scales_enabled,
@@ -987,12 +988,26 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1e6),
         ("MARK_MEM", -1e6),
     )
+    # GATE-ROLLOUT (task #452, docs/GATE_ROLLOUT_2026_07_09.md): the SP-marker JSR
+    # fixup is a balanced-AND whose opcode discriminator is hand-tuned to
+    # ``OP_JSR=0.2`` == ``1/5.2`` == the calibrated opcode one-hot scale at the
+    # SP-marker row (the opcode flag is broadcast in-step to every marker row).
+    # ``derive_and_gate_maybe`` REPRODUCES that ``0.2`` + the ``1.5`` threshold
+    # from the activation-scale datum (and re-derives the marker/IS_BYTE/HAS_SE
+    # blockers to the safety-factor veto) under ``C4_DERIVE_GATE_SCALES=1``; the
+    # bootstrap-JSR (HAS_SE=0) fire and the later-JSR (HAS_SE=1) veto are BOTH
+    # preserved by construction. Flag-OFF the hand values are UNCHANGED (golden).
+    _sp_fixup_conds = (
+        ("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0),
+    ) + _jsr_sp_fixup_blockers
+    _sp_fixup_conds, _sp_fixup_thr = derive_and_gate_maybe(
+        _sp_fixup_conds, 1.5, position_class="mark==SP",
+    )
     return (
         multi_way_and_rule(
             name="l6_jsr_sp_fixup_lo",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0))
-            + _jsr_sp_fixup_blockers,
-            threshold=1.5,
+            conditions=_sp_fixup_conds,
+            threshold=_sp_fixup_thr,
             writes=(
                 ("OUTPUT_LO+8", write_scale),
                 ("OUTPUT_LO+0", -write_scale),
@@ -1000,9 +1015,8 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         multi_way_and_rule(
             name="l6_jsr_sp_fixup_hi",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0))
-            + _jsr_sp_fixup_blockers,
-            threshold=1.5,
+            conditions=_sp_fixup_conds,
+            threshold=_sp_fixup_thr,
             writes=(
                 ("OUTPUT_HI_THIS_STEP+15", write_scale),
                 ("OUTPUT_HI_THIS_STEP+0", -write_scale),
