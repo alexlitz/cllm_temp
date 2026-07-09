@@ -2260,6 +2260,17 @@ def compile_full_vm_dynamic(
             "C4_VAR_THREE_LI": (
                 os.environ.get("C4_VAR_THREE_LI") == "1"
             ),
+            # Derived-CAM MEMORY umbrella (DEFAULT-OFF, opt in =1): a single
+            # entry point that floors ON the clean binary-address-CAM memory-fix
+            # heads (C4_SI_STORE_ADDR store-provenance CAM + C4_VAR_THREE_LI
+            # store-row veto). Because it OR-floors those two head-installing
+            # predicates it changes the built head set, so the ON / OFF builds
+            # MUST NOT share a memo / disk entry. (An explicit per-flag value
+            # still wins, so this key is what distinguishes a pure-umbrella
+            # build from an explicit-flag build.)
+            "C4_DERIVE_MEMORY": (
+                os.environ.get("C4_DERIVE_MEMORY", "0") != "0"
+            ),
             # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
             # opt in =1). At the deeper-frame 2-arg func LI whose arg address is
             # 0xE0 (lo-nibble 0), the L15 head-0 value delivery carries the
@@ -3241,6 +3252,13 @@ def _bake_from_scheduled_ops(
         # Same head shape, different W_q, so ON / OFF must never share an entry.
         "C4_VAR_THREE_LI": (
             os.environ.get("C4_VAR_THREE_LI") == "1"
+        ),
+        # Derived-CAM MEMORY umbrella (DEFAULT-OFF, opt in =1): floors ON the
+        # clean binary-address-CAM memory-fix heads (C4_SI_STORE_ADDR +
+        # C4_VAR_THREE_LI). Changes the built head set, so ON / OFF must never
+        # share a memo / disk entry.
+        "C4_DERIVE_MEMORY": (
+            os.environ.get("C4_DERIVE_MEMORY", "0") != "0"
         ),
         # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
         # opt in =1). Flag-OFF registers NO rules -> byte-identical to golden.
