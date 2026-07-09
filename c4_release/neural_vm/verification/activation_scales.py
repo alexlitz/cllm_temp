@@ -114,11 +114,20 @@ _CANONICAL_SCALES: Dict[str, float] = {
 # SAME reciprocal the BZ gate proved, now at the AX class. Keyed by class so the
 # L6 ``"*"`` deadness and the L16 ``mark==AX`` liveness coexist on one datum.
 # ---------------------------------------------------------------------------
-_AMPLIFIED_OPCODE_SCALE = 5.2
+# The opcode one-hot's amplified plateau at the AX/SP marker rows. MEASURED at
+# ~5.23 (OP_LEA/OP_ENT mode over 100+ AX rows), but the hand corrector gates
+# encode the reciprocal as ``0.2`` == ``1/5.0`` EXACTLY, and the derived write
+# strength (a smooth silu magnitude, NOT just a fire/no-fire threshold) competes
+# by magnitude against other writers — so the ``5.0`` reciprocal must be
+# reproduced EXACTLY to stay verdict-preserving (``0.192`` from ``5.23`` writes
+# ~4% weaker and loses a byte tie, PROVEN on id550). So bake the CANONICAL ``5.0``
+# (== the hand author's ``1/0.2``), the same value the BZ gate uses; the ``5.23``
+# measurement CONFIRMS the amplification is real but is not the encoded reciprocal.
+_AMPLIFIED_OPCODE_SCALE = 5.0
 # Every opcode one-hot the AX-/SP-marker correctors read. The opcode flag is
 # BROADCAST in-step to every marker row (the L5 decode band + the Wave-A
-# step-end relay carry it), so it reads the SAME ~5.2 amplified plateau at the
-# AX and SP marker rows (MEASURED at mark==AX; the SP row shares the broadcast).
+# step-end relay carry it), so it reads the SAME amplified plateau at the AX and
+# SP marker rows (MEASURED at mark==AX; the SP row shares the broadcast).
 _AMPLIFIED_OPCODES = (
     "OP_LEA", "OP_ADD", "OP_SUB", "OP_ADJ", "OP_ENT", "OP_LEV",
     "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",

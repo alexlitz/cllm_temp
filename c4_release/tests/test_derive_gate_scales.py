@@ -115,18 +115,18 @@ def test_live_gate_blocker_vetoes_past_threshold():
 
 
 def test_class_keyed_opcode_scale_ax_vs_star():
-    """GATE-ROLLOUT (task #452): an opcode one-hot reads 5.2 at ``mark==AX`` (the
+    """GATE-ROLLOUT (task #452): an opcode one-hot reads 5.0 at ``mark==AX`` (the
     AX-marker corrector rows) but stays 1.0 under the ``"*"`` wildcard (dead at
     the L6 all-step JMP override block). The same dim, different scale per class —
     the per-block-keying that lets the L6 deadness and the L16 liveness coexist."""
     sc = ActivationScales.canonical()
-    # OP_JMP: dead-band default 1.0, amplified 5.2 at the AX marker
+    # OP_JMP: dead-band default 1.0, amplified 5.0 at the AX marker
     assert sc.scale("OP_JMP", "*") == 1.0
-    assert sc.scale("OP_JMP", "mark==AX") == 5.2
-    assert sc.scale("OP_JMP", "mark==SP") == 5.2
-    # OP_LEA / OP_ENT similarly amplified at AX (MEASURED 5.23)
-    assert sc.scale("OP_LEA", "mark==AX") == 5.2
-    assert sc.scale("OP_ENT", "mark==AX") == 5.2
+    assert sc.scale("OP_JMP", "mark==AX") == 5.0
+    assert sc.scale("OP_JMP", "mark==SP") == 5.0
+    # OP_LEA / OP_ENT similarly amplified at AX (MEASURED 5.23; baked 5.0 == 1/0.2)
+    assert sc.scale("OP_LEA", "mark==AX") == 5.0
+    assert sc.scale("OP_ENT", "mark==AX") == 5.0
     # markers stay unit-scale in every class
     assert sc.scale("MARK_AX", "mark==AX") == 1.0
     assert sc.scale("MARK_SP", "mark==SP") == 1.0
@@ -143,7 +143,7 @@ def test_l6_all_step_jmp_stays_dead_under_star_class():
 
 
 def test_l16_jmp_ax_preserve_reproduces_hand_at_ax_class():
-    """GATE-ROLLOUT: the l16 jmp_ax_preserve gate — OP_JMP=0.2 (=1/5.2 at the AX
+    """GATE-ROLLOUT: the l16 jmp_ax_preserve gate — OP_JMP=0.2 (=1/5.0 at the AX
     marker), MARK_AX=1.0, threshold=1.5 — is REPRODUCED by derive_gate at the
     ``mark==AX`` class. ``preserve_blockers=True``: the negatives are
     broadcast-defeat guards, KEPT verbatim (only positives + threshold derive)."""
@@ -154,7 +154,7 @@ def test_l16_jmp_ax_preserve_reproduces_hand_at_ax_class():
     out, thr = derive_gate(hand, position_class="mark==AX", hand_threshold=1.5,
                            preserve_blockers=True)
     w = _wmap(out)
-    assert abs(w["OP_JMP"] - 1.0 / 5.2) < 1e-3   # ~0.192 == the hand 0.2
+    assert abs(w["OP_JMP"] - 0.2) < 1e-9   # 1/5.0 == the hand 0.2 EXACTLY
     assert w["MARK_AX"] == 1.0
     assert abs(thr - 1.5) < 1e-6                 # (2 - 0.5) balanced-AND midpoint
     # blockers PRESERVED verbatim (broadcast-defeat guards, not re-derived)
@@ -166,7 +166,7 @@ def test_l16_jmp_ax_preserve_reproduces_hand_at_ax_class():
 def test_l6_jsr_sp_fixup_positives_derive_blockers_preserved():
     """GATE-ROLLOUT: the l6 jsr_sp_fixup gate (OP_JSR=0.2, MARK_SP=1.0,
     HAS_SE=-1.0, threshold=1.5) with ``preserve_blockers=True``: OP_JSR derives to
-    1/5.2, MARK_SP stays 1.0, threshold 1.5, and the -1e6 broadcast-defeat
+    1/5.0, MARK_SP stays 1.0, threshold 1.5, and the -1e6 broadcast-defeat
     blockers + the HAS_SE=-1 soft term are KEPT verbatim (re-deriving them
     regressed id550 div_step=6)."""
     hand = (("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0),
@@ -175,7 +175,7 @@ def test_l6_jsr_sp_fixup_positives_derive_blockers_preserved():
     out, thr = derive_gate(hand, position_class="mark==SP", hand_threshold=1.5,
                            preserve_blockers=True)
     w = _wmap(out)
-    assert abs(w["OP_JSR"] - 1.0 / 5.2) < 1e-3   # ~0.192 == the hand 0.2
+    assert abs(w["OP_JSR"] - 0.2) < 1e-9   # 1/5.0 == the hand 0.2 EXACTLY
     assert w["MARK_SP"] == 1.0
     assert abs(thr - 1.5) < 1e-6
     # HAS_SE soft term + the -1e6 broadcast-defeat guards KEPT verbatim
@@ -183,7 +183,7 @@ def test_l6_jsr_sp_fixup_positives_derive_blockers_preserved():
     assert w["MARK_PC"] == -1e6
     assert w["IS_BYTE"] == -1e6
     # the fire/veto regimes still hold with the derived positive:
-    op = (1.0 / 5.2) * 5.2                        # OP fires at its SP-row scale
+    op = 0.2 * 5.0                                # OP fires at its SP-row scale
     assert op + 1.0 >= thr                        # bootstrap (HAS_SE=0) fires
     assert op + 1.0 - 1.0 < thr                   # later (HAS_SE=1) vetoed
 

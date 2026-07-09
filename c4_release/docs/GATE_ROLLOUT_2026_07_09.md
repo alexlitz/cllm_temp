@@ -49,9 +49,9 @@ OP_LEA = 5.23   OP_ENT = 5.23   (mode over 100+ AX rows)   FETCH_LO = 1.0
 
 So `derive_gate` at `position_class="mark==AX"` sets `OP_JMP -> 1/5.2 = 0.192`
 (== the hand `0.2`), `MARK_AX -> 1.0`, `threshold -> (n_norm - 0.5) = 1.5` (the
-hand value), and re-derives the blockers to the safety-factor veto
-`-(pos_sum+1)`. Positives + threshold REPRODUCED from the datum; blockers
-re-derived stronger-or-adequate (verdict-preserving).
+hand value). Positives + threshold REPRODUCED from the datum. The **blockers are
+PRESERVED verbatim** (`preserve_blockers=True`) — see §3.1: they are
+broadcast-defeat guards, not safety-factor vetoes.
 
 ### Why a per-`position_class` axis was REQUIRED
 
@@ -91,6 +91,23 @@ path queries `"*"` (unchanged); the rolled-out families pass their firing class.
   **PASS** (identity(70)==70). Verdict preserved.
 * **Unit suite:** 12/12 pass (GPU-free).
 
+### 3.1 The blocker regime — PRESERVED, not re-derived (a landed regression fix)
+
+`derive_gate`'s default re-derives blockers to the safety-factor veto
+`-(pos_sum+1)` — correct for the L6 CONTROL gates, whose blockers ARE
+safety-factor vetoes sized to the firing-row positive sum. But the l16/l6 JSR/JMP
+corrector blockers are a DIFFERENT class: **broadcast-defeat guards**. The opcode
+flag is broadcast in-step to EVERY marker row, so `OP_JSR`/`OP_JMP` reads ~5.2 at
+non-firing rows too; the `-1e6` / `-10` blockers exist to veto the gate at those
+broadcast rows (a much larger perturbation than the firing-row positive sum). The
+first flag-ON run PROVED this: re-deriving the blockers to `-(pos_sum+1)≈-2.2`
+was too weak at the broadcast rows and regressed `id550` (`div_step=6`,
+`pc=138` vs oracle `pc=42`). The fix: `derive_and_gate_maybe(...,
+preserve_blockers=True)` — derive the positives + threshold from the scale datum,
+KEEP the hand blocker magnitudes. This is the correct scoping (the blockers are a
+structural guard, not a magic constant the safety factor can replace); the two
+families use it.
+
 ## 4. Magic constants eliminated
 
 Per rolled-out gate the hand form carries: the opcode weight `0.2`, `MARK_*` unit
@@ -103,14 +120,16 @@ structure + (c) the single safety factor `k`:
 | opcode weight (`OP_JMP=0.2`, `OP_JSR=0.2`) | HAND | **`1/scale(OP, class)`** |
 | marker weight (`MARK_AX=1`, `MARK_SP=1`) | HAND | **`1/scale=1`** |
 | threshold (`1.5`) | HAND | **`n_norm - 0.5`** |
-| blocker magnitudes (`-10`, `-2`, `-1`, `-1e6`) | HAND | **`-k·(pos_sum+1)`** |
+| blocker magnitudes (`-10`, `-2`, `-1`, `-1e6`) | HAND | HAND (broadcast-defeat guard — §3.1) |
 
 Across the 2 families (18 gates: 16 `jmp_ax_preserve` + 2 `jsr_sp_fixup`) the
-per-gate opcode-reciprocal `0.2`, the `1.5` threshold, and the assorted blocker
-magic numbers all derive to `0` hand-tuned per-op constants. The ONLY remaining
-numeric inputs are the ones the CONTROL doc already isolated: the safety factor
-`k` (spec-structural, default `1`), and the MEASURED activation scales (a datum,
-not a hand constant).
+per-gate opcode-reciprocal `0.2` weights and the `1.5` threshold derive to `0`
+hand-tuned per-op constants. The blockers are PRESERVED (§3.1: a structural
+broadcast-defeat guard, not a magic constant — re-deriving them regressed
+verdicts). The remaining numeric inputs are the MEASURED activation scales (a
+datum, not a hand constant) and the preserved blocker guards. (For the L6 CONTROL
+family, whose blockers ARE safety-factor vetoes, `derive_gate` also derives the
+blockers — that path is unchanged.)
 
 ## 5. Honest limits — the `1/scale` regime is NARROW
 
