@@ -104,10 +104,21 @@ def main() -> int:
     cols = {d: c for d, c in cols.items() if c is not None}
 
     # (dim, position_class) -> list of residual values (over all blocks + progs).
-    # We take the characteristic scale as the median of the ACTIVE (|v| above a
-    # small floor) values at that dim's own class, aggregated across blocks — the
-    # scale is a structural property of the compiled model, stable across blocks.
+    #
+    # The characteristic scale is the value the GATE reads at a row where the dim
+    # is genuinely its own decoded discriminator (e.g. OP_BZ on a BZ instruction's
+    # PC row == 5.0), NOT a small cross-row leak (OP_BZ ~0.2 on a non-BZ PC row)
+    # and NOT a pre-decode zero (blocks before the opcode decode band). So a dim
+    # activation is only counted when it clears a STRONG-ACTIVE floor (> 1.0 for
+    # opcode one-hots, which selects the amplified 5.0 plateau over the 0.2 leak;
+    # markers/flags at ~1.0 use a small floor). The scale is then the MODE (most
+    # common rounded value) of those strong-active samples — robust to the mix of
+    # blocks / steps in the corpus.
     samples = defaultdict(list)
+
+    # dims whose amplified one-hot must clear a strong floor to count (opcode /
+    # CMP one-hots are amplified; a small residual is a cross-row leak, not scale).
+    _STRONG_FLOOR = {d: (1.0 if (d.startswith("OP_")) else 1e-3) for d in _GATE_DIMS}
 
     captured = {}
     def mk_hook(bi):
@@ -164,20 +175,26 @@ def main() -> int:
             for pos in range(min(seq, len(classes))):
                 buckets = classes[pos]
                 for dim, col in cols.items():
+                    floor = _STRONG_FLOOR.get(dim, 1e-3)
                     for cls in relevant_classes(dim, buckets):
                         v = float(resid[pos, col].item())
-                        if abs(v) > 1e-3:  # active
+                        if abs(v) > floor:  # strongly active (own-discriminator row)
                             samples[(dim, cls)].append(abs(v))
         print(f"[calibrate] id={idx} {desc} done", flush=True)
     for h in handles:
         h.remove()
 
-    # Characteristic scale = median of active magnitudes at the dim's own class.
+    # Characteristic scale = the MODE (most common value, rounded to 1 dp) of the
+    # strong-active magnitudes at the dim's own class — the amplified plateau the
+    # gate reads (robust to the block/step mix that would skew a mean/median).
     scales = defaultdict(dict)
     for (dim, cls), vals in samples.items():
         if not vals:
             continue
-        s = float(statistics.median(vals))
+        try:
+            s = float(statistics.mode([round(v, 1) for v in vals]))
+        except statistics.StatisticsError:
+            s = float(statistics.median(vals))
         scales[dim][cls] = round(s, 4)
         # also expose under wildcard "*" so a query without a class resolves.
         scales[dim]["*"] = round(s, 4)
