@@ -993,15 +993,18 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
     # ``OP_JSR=0.2`` == ``1/5.2`` == the calibrated opcode one-hot scale at the
     # SP-marker row (the opcode flag is broadcast in-step to every marker row).
     # ``derive_and_gate_maybe`` REPRODUCES that ``0.2`` + the ``1.5`` threshold
-    # from the activation-scale datum (and re-derives the marker/IS_BYTE/HAS_SE
-    # blockers to the safety-factor veto) under ``C4_DERIVE_GATE_SCALES=1``; the
-    # bootstrap-JSR (HAS_SE=0) fire and the later-JSR (HAS_SE=1) veto are BOTH
-    # preserved by construction. Flag-OFF the hand values are UNCHANGED (golden).
+    # from the activation-scale datum under ``C4_DERIVE_GATE_SCALES=1``.
+    # ``preserve_blockers=True``: the ``-1e6`` marker/IS_BYTE blockers + the
+    # ``HAS_SE=-1`` term are BROADCAST-DEFEAT guards (they veto the in-step
+    # ~5.2 OP_JSR broadcast at every non-SP / non-bootstrap row — see the block
+    # comment above), NOT safety-factor vetoes; re-deriving them is too weak and
+    # regresses the autoregressive PC (id550 div_step=6). So only positives +
+    # threshold derive; blockers stay hand. Flag-OFF the hand values are UNCHANGED.
     _sp_fixup_conds = (
         ("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0),
     ) + _jsr_sp_fixup_blockers
     _sp_fixup_conds, _sp_fixup_thr = derive_and_gate_maybe(
-        _sp_fixup_conds, 1.5, position_class="mark==SP",
+        _sp_fixup_conds, 1.5, position_class="mark==SP", preserve_blockers=True,
     )
     return (
         multi_way_and_rule(

@@ -188,7 +188,8 @@ _STEP_GUARD_AMP_FLOOR = 3.0
 
 
 def derive_gate(conditions, *, position_class: str = "*",
-                hand_threshold=None, safety_factor=None, scales=None):
+                hand_threshold=None, safety_factor=None, scales=None,
+                preserve_blockers: bool = False):
     """FULLY derive a balanced-AND gate — POSITIVE weights + threshold + BLOCKER
     magnitudes — from (a) the per-dim runtime ACTIVATION-SCALE datum and (b) the
     ISA-identity balanced-AND structure, with ZERO hand-tuned per-op numbers
@@ -196,6 +197,16 @@ def derive_gate(conditions, *, position_class: str = "*",
 
     ``scales`` — an optional :class:`ActivationScales` to use instead of the
     process-loaded datum (dependency injection for tests / a bespoke calibration).
+
+    ``preserve_blockers`` (task #452) — when True, derive ONLY the positive
+    weights (``1/scale``) + threshold and KEEP the hand blocker magnitudes. Use
+    this for a gate whose negatives are BROADCAST-DEFEAT guards: they veto the
+    in-step-broadcast AMPLIFIED opcode (~5.2) at NON-firing marker rows, a much
+    larger perturbation than the firing-row positive sum, so the safety-factor
+    veto ``-(pos_sum+1)`` is too weak there and would let the gate mis-fire on a
+    broadcast row (regressing the autoregressive PC). The l16 jmp_ax_preserve /
+    l6 jsr_sp_fixup families are this class — their hand ``-1e6`` / ``-10``
+    blockers are the guard, NOT a magic constant the safety factor can replace.
 
     Derivation (see docs/DERIVE_ACTSCALE_2026_07_09.md):
 
@@ -289,6 +300,11 @@ def derive_gate(conditions, *, position_class: str = "*",
     # should-block row is admitted (verdict-PRESERVING). This scales the veto to
     # the gate's FULL activation regime (INCLUDING the amplified step-guard —
     # e.g. BZ's HAS_SE=10), which the normalized-positive-only max would miss.
+    if preserve_blockers:
+        # keep the hand blocker magnitudes (broadcast-defeat guards) verbatim;
+        # only the positives + threshold are re-derived from the scale datum.
+        out = tuple(rebuilt)
+        return out, thr
     derived_pos_sum = sum(w for _d, w in rebuilt if w > 0)
     block = safety_factor * (float(derived_pos_sum) + 1.0)
     out = tuple(
@@ -297,26 +313,35 @@ def derive_gate(conditions, *, position_class: str = "*",
     return out, thr
 
 
-def derive_and_gate_maybe(conditions, threshold, *, position_class="*"):
+def derive_and_gate_maybe(conditions, threshold, *, position_class="*",
+                          preserve_blockers: bool = False):
     """Family-wide ``derive_gate`` opt-in for a ``multi_way_and_rule`` caller
     (task #452 rollout). Returns ``(conditions, threshold)``:
 
-      * when ``C4_DERIVE_GATE_SCALES`` is ON, the FULLY-derived gate
+      * when ``C4_DERIVE_GATE_SCALES`` is ON, the derived gate
         (:func:`derive_gate`, positives = ``1/activation_scale(dim,
         position_class)``, threshold from the normalized balanced-AND +
-        step-guard, blockers from the safety factor) — reproducing the hand
-        positives + threshold from the calibration datum (verdict-preserving);
+        step-guard) — reproducing the hand positives + threshold from the
+        calibration datum (verdict-preserving);
       * OFF (the golden default), the hand ``conditions`` / ``threshold``
         UNCHANGED.
+
+    ``preserve_blockers`` — pass True for a gate whose negatives are
+    BROADCAST-DEFEAT guards (they veto the in-step-broadcast amplified opcode at
+    NON-firing marker rows). Their magnitude is NOT a safety-factor veto sized to
+    the firing-row positive sum, so re-deriving them is too weak at the broadcast
+    rows and regresses the autoregressive PC (PROVEN on id550 div_step=6 with the
+    l16/l6 JSR/JMP families). With ``preserve_blockers=True`` the positives +
+    threshold derive from the scale datum but the hand blockers are KEPT.
 
     This is the generalization of the L6 ``pc_mux`` wiring
     (``l6_ops._maybe_derive_pc_mux_spec``) to any AND-shaped gate: an
     opcode-reciprocal / marker balanced-AND whose positive discriminators read
     at their calibrated ``activation_scale``. ``position_class`` selects the
-    scale axis — e.g. the L16 branch/frame + L10 CMP-combine correctors fire at
-    ``"mark==AX"`` where an opcode one-hot reads ``5.2`` (so its hand ``0.2`` ==
-    ``1/scale`` derives), whereas an L6 override band reads that same opcode at
-    ``"*"`` (``1.0``, keeping the reserved band dead). The deadness guard in
+    scale axis — e.g. the L16 branch/frame correctors fire at ``"mark==AX"``
+    where an opcode one-hot reads ``5.2`` (so its hand ``0.2`` == ``1/scale``
+    derives), whereas an L6 override band reads that same opcode at ``"*"``
+    (``1.0``, keeping the reserved band dead). The deadness guard in
     :func:`derive_gate` (a hand-DEAD band stays dead) makes this always safe to
     wrap a mixed live/dead family.
     """
@@ -324,7 +349,7 @@ def derive_and_gate_maybe(conditions, threshold, *, position_class="*"):
         return tuple(conditions), threshold
     return derive_gate(
         tuple(conditions), position_class=position_class,
-        hand_threshold=threshold,
+        hand_threshold=threshold, preserve_blockers=preserve_blockers,
     )
 
 
