@@ -65,7 +65,8 @@ indirectly via an `_ENV`-name constant (see the STRUCTURAL / RUNTIME table).
 |------|---------|-------|--------|---------|
 | `C4_NO_STACK0_EMIT` | `1` in `shared`/`0` in probes | campaign | active | Drop the STACK0 register block from the emitted step (35→30 tokens). The campaign master gate; ~90 tools + 5 build sites consult it. `campaign_enabled()` OR-in supplies the ON floor. |
 | `C4_OPERAND_FROM_MEMSP` | `1` | campaign | active | Read operand-A from `mem[SP]` instead of the emitted STACK0 token (pairs with `NO_STACK0_EMIT`). ON floor via campaign. |
-| `C4_SI_STORE_ADDR` | unset→off | campaign | active | L15 head-16 SI/SC store address-provenance CAM (var_mul / multilocal-LI). Grows L15 16→17 heads. Flipped ON by `C4_CAMPAIGN`. |
+| `C4_SI_STORE_ADDR` | unset→off | campaign | active | L15 head-16 SI/SC store address-provenance CAM (var_mul / multilocal-LI). Grows L15 16→17 heads. Flipped ON by `C4_CAMPAIGN` **or `C4_DERIVE_MEMORY`**. |
+| `C4_DERIVE_MEMORY` | `0` (off) | derive | active | **Umbrella for the derived binary-address-CAM MEMORY-fix path** (BLOG_SPEC §408-412). OR-floors the two clean-CAM memory-fix predicates `si_store_addr` (L15 head-16 store-provenance CAM) + `var_three_li` (L15 head-0 store-row veto); explicit per-flag `=0` still opts out. Byte-identical to `C4_SI_STORE_ADDR=1 C4_VAR_THREE_LI=1` under campaign. DEFAULT OFF ⇒ golden byte-identical (`e50521f3`). Registered in BOTH cache-key snapshots. Meaningful only with `C4_CAMPAIGN=1` (30-token MEM-from-SP path). See `docs/DERIVE_MEMORY_2026_07_09.md`. |
 | `C4_OPERAND_CAM_FIX` | `0` (off) | campaign | active | Widen the operand-CAM ALU_HI address-leak clear past OP_ADD to SUB/MUL/MOD/DIV/CMP. Gated on `no_stack0_emit`; flipped ON by `C4_CAMPAIGN`. |
 
 ---
