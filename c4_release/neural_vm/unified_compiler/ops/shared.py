@@ -112,6 +112,36 @@ def derive_bitwise_enabled() -> bool:
     return os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
 
 
+def derive_shift_enabled() -> bool:
+    """Flag for the SPEC-DERIVED SHIFT family (SHL/SHR, task #448). Default OFF.
+
+    When ``C4_DERIVE_SHIFT=1`` the per-``(value, shift)`` result value that the
+    L13 SHL/SHR lookup table stores is COMPUTED from the ``BLOG_SPEC`` "Shifts"
+    building blocks (docs/BLOG_SPEC.md §597-599) instead of the hand-authored
+    Python bit-shift operators ``(v << s) & 0xFF`` / ``v >> s``:
+
+      * SHL by ``s`` = **multiply by the power of two** ``2**s`` then take the
+        **modulus by floor** for 8-bit overflow: ``(v * 2**s) mod 256`` where
+        ``x mod m = x - m*floor(x/m)`` (§555 MAGIC floor / §560 bit-range
+        extraction — a floor then a mod by a power of two).
+      * SHR by ``s`` = **floor-divide by the power of two**: ``floor(v / 2**s)``.
+
+    The powers of two are taken from ONE derived table (``2**s`` for
+    ``s in 0..7``) rather than a per-shift hand-typed constant, and the byte
+    truncation is the generic mod-by-floor primitive rather than a per-op
+    ``& 0xFF`` mask — so the derivation has ZERO per-op magic constants
+    (see :mod:`shift_semantics_dsl`).
+
+    The derived formula equals the hand-authored bit-op for EVERY ``(v, s)``
+    with ``v in 0..255``, ``s in 0..7`` (proven exhaustively in
+    ``shift_semantics_dsl._SPEC_MATCHES_BITOPS`` and by the whole-model golden
+    hash held under ``C4_DERIVE_SHIFT=1``), so the L13 shifts FFN (SHL + SHR,
+    4096 lookup units) is reproduced BYTE-FOR-BYTE. Default OFF keeps the
+    hand-authored lambda path as the golden build.
+    """
+    return os.environ.get("C4_DERIVE_SHIFT", "0") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 

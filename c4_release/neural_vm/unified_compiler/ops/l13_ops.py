@@ -20,8 +20,10 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (
     _as_setdim_proxy,
     _empty_compiler_ir_factory,
+    derive_shift_enabled,
     operand_from_memsp_enabled,
 )
+from ..shift_semantics_dsl import shl_result, shr_result
 
 
 # === L13 attention-head layout (pinned indices) =====================
@@ -259,10 +261,22 @@ def _layer13_shl_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 7.E.3: the gate ref uses :func:`dim_ref` for the
     ``(opcode_flag, SHL)`` semantic pair.
+
+    Task #448 (``C4_DERIVE_SHIFT=1``): the per-``(value, shift)`` result is
+    DERIVED from the BLOG_SPEC §599 "multiply by a power of two, then mod by
+    floor" recipe (:func:`shift_semantics_dsl.shl_result`) instead of the
+    hand-authored ``(v << s) & 0xFF`` bit-op. The derived value equals the
+    bit-op for every ``(v, s)`` (proven exhaustively), so the 2048 lookup
+    units are byte-identical (golden hash held). Default OFF => the
+    hand-authored lambda path is the golden build.
     """
+    shift_fn = (
+        shl_result if derive_shift_enabled()
+        else (lambda v, s: (v << s) & 0xFF)
+    )
     return _layer13_shifts_substage_rules(
         "OP_SHL",
-        lambda v, s: (v << s) & 0xFF,
+        shift_fn,
         name_prefix="l13_shl",
         S=S,
         gate=dim_ref("opcode_flag", "SHL"),
@@ -274,10 +288,20 @@ def _layer13_shr_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 7.E.3: the gate ref uses :func:`dim_ref` for the
     ``(opcode_flag, SHR)`` semantic pair.
+
+    Task #448 (``C4_DERIVE_SHIFT=1``): the per-``(value, shift)`` result is
+    DERIVED from the BLOG_SPEC §599/§555 "floor-divide by a power of two"
+    recipe (:func:`shift_semantics_dsl.shr_result`) instead of the
+    hand-authored ``v >> s`` bit-op. Byte-identical (golden hash held);
+    default OFF keeps the hand-authored path.
     """
+    shift_fn = (
+        shr_result if derive_shift_enabled()
+        else (lambda v, s: (v >> s) & 0xFF)
+    )
     return _layer13_shifts_substage_rules(
         "OP_SHR",
-        lambda v, s: (v >> s) & 0xFF,
+        shift_fn,
         name_prefix="l13_shr",
         S=S,
         gate=dim_ref("opcode_flag", "SHR"),
