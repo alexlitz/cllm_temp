@@ -36,7 +36,6 @@ bit-for-bit on randomized input (see Section 4 of the design doc and
 
 from __future__ import annotations
 
-import operator
 import os
 from typing import Callable, Literal, Mapping, Optional, Sequence, Tuple
 
@@ -45,15 +44,14 @@ from .ir import FFNRule
 
 
 # ---------------------------------------------------------------------------
-# Wave W1: Bitwise (AND/OR/XOR) — POC implementation.
+# Wave W1: Bitwise (AND/OR/XOR).
 # ---------------------------------------------------------------------------
-
-
-_BITWISE_OP_FN: dict[str, Callable[[int, int], int]] = {
-    "and": operator.and_,
-    "or": operator.or_,
-    "xor": operator.xor,
-}
+#
+# The result nibble for all three bitwise ops is DERIVED from the single
+# BLOG_SPEC §568 per-bit formula (see ``_bitwise_result_from_spec_formula``
+# below). The former enumerated ``operator.and_/or_/xor`` dispatch
+# (``_BITWISE_OP_FN``) was proven byte-identical to the derivation
+# (golden e50521f3, task #449) and has been deleted.
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +120,15 @@ def _bitwise_result_from_spec_formula(op: str, a: int, b: int) -> int:
 
 
 def _derive_bitwise_enabled() -> bool:
-    """Local mirror of ``ops.shared.derive_bitwise_enabled`` (DEFAULT-OFF).
+    """Local mirror of ``ops.shared.derive_bitwise_enabled`` (DEFAULT-ON).
 
     Kept local so ``wide_alu_dsl`` (a leaf DSL module) does not import the
-    ``ops`` package. ``C4_DERIVE_BITWISE=1`` routes the bitwise result nibble
-    through the single BLOG_SPEC §568 formula instead of the enumerated
-    ``operator`` dispatch. Byte-identical either way.
+    ``ops`` package. The bitwise result nibble is produced by the single
+    BLOG_SPEC §568 formula; ``C4_DERIVE_BITWISE=0`` is a legacy kill-switch
+    that would restore the (now-deleted) enumerated ``operator`` dispatch —
+    kept only as a no-op escape hatch. Byte-identical either way.
     """
-    return os.environ.get("C4_DERIVE_BITWISE", "0") != "0"
+    return os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
 
 
 def bitwise_rules(
@@ -246,16 +245,14 @@ def bitwise_rules(
         raise ValueError(
             f"bitwise_rules: op must be 'and'/'or'/'xor'; got {op!r}"
         )
-    # Result-nibble source. DEFAULT (flag-OFF): the enumerated ``operator``
-    # dispatch (three distinct Python bit operators) — byte-identical golden.
-    # ``C4_DERIVE_BITWISE=1``: the SINGLE BLOG_SPEC §568 per-bit formula
+    # Result-nibble source: the SINGLE BLOG_SPEC §568 per-bit formula
     # ``c_a*a + c_b*b + c_ab*a*b`` for ALL three ops (zero op-specific operator,
-    # zero magic constants). The result nibbles are provably identical, so this
-    # only changes the SOURCE, not the weights.
-    if _derive_bitwise_enabled():
-        op_fn = lambda a, b, _op=op: _bitwise_result_from_spec_formula(_op, a, b)
-    else:
-        op_fn = _BITWISE_OP_FN[op]
+    # zero magic constants). This is the sole path — the former enumerated
+    # ``operator`` dispatch was proven byte-identical (golden e50521f3) and
+    # deleted (task #449). ``C4_DERIVE_BITWISE`` remains a registered no-op
+    # kill-switch for cache-key isolation.
+    _ = _derive_bitwise_enabled()  # keep the flag live for cache-key isolation
+    op_fn = lambda a, b, _op=op: _bitwise_result_from_spec_formula(_op, a, b)
 
     write_value = result_write_value / S
     rules: list[FFNRule] = []

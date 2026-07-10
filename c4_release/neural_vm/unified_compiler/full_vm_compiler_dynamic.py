@@ -2205,15 +2205,15 @@ def compile_full_vm_dynamic(
             "C4_DERIVE_IMM": (
                 os.environ.get("C4_DERIVE_IMM", "0") != "0"
             ),
-            # BITWISE one-formula derivation (task #449, DEFAULT-OFF): the L10
+            # BITWISE one-formula derivation (task #449, DEFAULT-ON): the L10
             # OR/XOR/AND result nibbles derive from the SINGLE BLOG_SPEC §568
-            # per-bit formula ``c_a*a + c_b*b + c_ab*a*b`` instead of the three
-            # enumerated ``operator.and_/or_/xor`` bit functions. Byte-identical
-            # per nibble, but the two builds derive from DIFFERENT source so
-            # they must never share a memo / disk entry. See
-            # shared.derive_bitwise_enabled.
+            # per-bit formula ``c_a*a + c_b*b + c_ab*a*b``. The enumerated
+            # ``operator.and_/or_/xor`` dispatch has been deleted;
+            # ``C4_DERIVE_BITWISE=0`` is a legacy no-op kill-switch. Byte-identical
+            # golden e50521f3. Registered here so a build never shares a memo /
+            # disk entry across the flag. See shared.derive_bitwise_enabled.
             "C4_DERIVE_BITWISE": (
-                os.environ.get("C4_DERIVE_BITWISE", "0") != "0"
+                os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
             ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
@@ -3320,13 +3320,13 @@ def _bake_from_scheduled_ops(
         "C4_DERIVE_IMM": (
             os.environ.get("C4_DERIVE_IMM", "0") != "0"
         ),
-        # BITWISE one-formula derivation (task #449, DEFAULT-OFF): OR/XOR/AND
+        # BITWISE one-formula derivation (task #449, DEFAULT-ON): OR/XOR/AND
         # result nibbles from the single BLOG_SPEC §568 per-bit formula
-        # ``c_a*a + c_b*b + c_ab*a*b`` instead of the three enumerated
-        # ``operator`` bit functions. Byte-identical, different source; ON / OFF
-        # must never share a serialised entry. See shared.derive_bitwise_enabled.
+        # ``c_a*a + c_b*b + c_ab*a*b``. The enumerated ``operator`` dispatch is
+        # deleted; ``C4_DERIVE_BITWISE=0`` is a legacy no-op kill-switch.
+        # Byte-identical golden e50521f3. See shared.derive_bitwise_enabled.
         "C4_DERIVE_BITWISE": (
-            os.environ.get("C4_DERIVE_BITWISE", "0") != "0"
+            os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
         ),
         # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
         # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /

@@ -81,7 +81,7 @@ def derive_imm_enabled() -> bool:
 
 
 def derive_bitwise_enabled() -> bool:
-    """Flag for the SPEC-DERIVED BITWISE family (OR/XOR/AND). Default OFF.
+    """Flag for the SPEC-DERIVED BITWISE family (OR/XOR/AND). Default ON.
 
     BLOG_SPEC §568: *"Bitwise: 10 weights — one formula (a+b-ab) for all"*.
     All three bitwise ops are ONE per-bit polynomial
@@ -103,12 +103,13 @@ def derive_bitwise_enabled() -> bool:
     — the derivation is a SOURCE collapse (3 distinct bit operators -> 1 spec
     formula + 3 coefficient triples), not a weight change.
 
-    Default OFF => the enumerated-operator path stays the golden build. Both
-    ON/OFF are registered in the ``full_vm_compiler_dynamic.py`` cache-key
-    snapshots so a derived build never shares a memo / disk entry with the
-    hand path. See ``docs/DERIVE_BITWISE_2026_07_09.md``.
+    Default ON => the derived one-formula path is the golden build (the
+    enumerated ``operator`` dispatch has been deleted; ``C4_DERIVE_BITWISE=0``
+    is a legacy no-op kill-switch). Both ON/OFF are registered in the
+    ``full_vm_compiler_dynamic.py`` cache-key snapshots so a build never shares
+    a memo / disk entry across the flag. See ``docs/DERIVE_BITWISE_2026_07_09.md``.
     """
-    return os.environ.get("C4_DERIVE_BITWISE", "0") != "0"
+    return os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
 
 
 def mul_width2_enabled() -> bool:
