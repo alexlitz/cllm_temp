@@ -449,6 +449,62 @@ def derive_and_gate_maybe(conditions, threshold, *, position_class="*",
     )
 
 
+def derive_memory_enabled() -> bool:
+    """Umbrella flag for the fully-DERIVED MEMORY family (LI/LC/SI/SC/PSH).
+    Default OFF.
+
+    BLOG_SPEC §408-412 ("Memory") models C4 memory as a KV-attention
+    binary-address CAM: a STORE (SI/SC) attends to its registers for
+    address+value, encodes the address in binary (key ``+scale`` for a 1-bit,
+    ``-scale`` for a 0-bit), and ALiBi recency prioritises the exact-address /
+    most-recent write; a LOAD (LI/LC) queries with a key identical to the store
+    key and retrieves the value. That ONE mechanism is the DSL
+    :func:`isa_semantics_dsl.cam_binary_address_match` primitive
+    (:class:`CamBinaryAddressBlock` per-bit comparator +
+    :class:`CamDiscriminatorSlot` gates + :class:`CamValueBand` value relay).
+
+    The MEMORY heads are ALREADY DERIVED through that primitive on the DEFAULT
+    (flag-OFF) path, byte-identically to the hand-authored form (proof:
+    ``test_isa_semantics_dsl.py`` L15 LI/LC-load, L14 mem-generation store, L13
+    relay, L7 operand-gather, L8 mem/fetch heads == handbuilt; whole-model
+    golden hash unchanged). See ``docs/semantic_spec_MEMORY.md`` §2c and
+    ``docs/DERIVE_MEMORY_2026_07_09.md``. So the byte-identical *lowering* work
+    is complete and needs no flag.
+
+    What this flag turns ON is the DERIVED-CAM MEMORY FIX PATH — the clean
+    address-keyed store-provenance CAM that a correct derivation of BLOG_SPEC
+    §408-412 IMPLIES but the hand-authored value-row load could not deliver
+    (memory note ``project_si_store_provenance_two_root_wall``: the store VALUE
+    rows are provenance-blind on BOTH axes; the clean ``(address, value)`` pair
+    lives on the store AX-MARKER, so the derived CAM keys the LI-query on its
+    ``AX_CARRY`` target address, matches the store marker's ``ADDR_B0``, and
+    copies the marker's ``AX_CARRY`` clean value). It is the SINGLE entry point
+    for the two derived-memory FIX heads, each already built as a clean
+    :func:`cam_binary_address_match` head with ZERO per-op magic-number
+    correctors:
+
+      * ``si_store_addr_enabled()`` -- L15 head-16 SI/SC store-provenance CAM
+        (the ``var_mul``/multilocal ``LI a`` returns b's value wall). Keyed on
+        ``AX_CARRY`` (target addr) -> store-marker ``ADDR_B0`` -> clean marker
+        ``AX_CARRY`` value.
+      * ``var_three_li_enabled()`` -- the L15 head-0 OP_SI/OP_SC store-row veto
+        (the ``var_three`` ``SI b`` stray-relay desync).
+
+    Mirrors ``campaign_enabled()``: ``C4_DERIVE_MEMORY=1`` supplies an ON floor
+    for those two predicates, and an explicit per-flag value still wins
+    (``C4_SI_STORE_ADDR=0`` opts that one out even under this umbrella). DEFAULT
+    OFF -> every predicate keeps its exact pre-existing value, so the golden
+    (flag-OFF) build is byte-identical (``tools/_isa_golden_hash.py`` unchanged).
+    Registered in BOTH cache-key snapshots in ``full_vm_compiler_dynamic.py`` so
+    a derive-memory build never shares a memo / disk cache entry with a golden
+    build. These derived-CAM heads use the 30-token campaign MEM-from-SP signals
+    (``AX_CARRY``/``ADDR_B0`` marker provenance), so ``C4_DERIVE_MEMORY=1`` is
+    only meaningful alongside ``C4_CAMPAIGN=1``; at the golden 35-token frame the
+    flag-ON build is byte-identical to flag-OFF (the heads never install).
+    """
+    return os.environ.get("C4_DERIVE_MEMORY", "0") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
@@ -1936,7 +1992,7 @@ def si_store_addr_enabled() -> bool:
     ``C4_SI_STORE_ADDR=0`` opts out even under the campaign).
     """
     explicit = os.environ.get("C4_SI_STORE_ADDR")
-    if explicit is None and campaign_enabled():
+    if explicit is None and (campaign_enabled() or derive_memory_enabled()):
         return True
     return explicit == "1"
 
@@ -1981,8 +2037,18 @@ def var_three_li_enabled() -> bool:
     produced only by the 30-token frame — flag-ON at golden 35-tok is
     byte-identical). Kept as a dedicated kill-switch for
     ``tools/flag_regression_gate.py`` and the flag-OFF golden byte-identity gate.
+
+    ``C4_DERIVE_MEMORY=1`` (the derived-CAM MEMORY umbrella,
+    :func:`derive_memory_enabled`) supplies an ON floor -- this store-row veto is
+    part of the clean binary-address-CAM memory-fix path the umbrella activates
+    -- but an explicit ``C4_VAR_THREE_LI`` value still wins
+    (``C4_VAR_THREE_LI=0`` opts out even under the umbrella). DEFAULT OFF ->
+    byte-identical golden.
     """
-    return os.environ.get("C4_VAR_THREE_LI", "0") == "1"
+    explicit = os.environ.get("C4_VAR_THREE_LI")
+    if explicit is None and derive_memory_enabled():
+        return True
+    return explicit == "1"
 
 
 def li_value_load_enabled() -> bool:
