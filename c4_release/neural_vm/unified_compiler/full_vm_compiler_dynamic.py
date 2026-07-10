@@ -2223,6 +2223,14 @@ def compile_full_vm_dynamic(
             "C4_DERIVE_SHIFT": (
                 os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
             ),
+            # COMPARISON family derived from ONE zero-detector (task #446;
+            # DEFAULT-OFF). Re-expresses the L10 cmp-combine banks from
+            # ``derived_comparison_rules`` — byte-identical to the hand path, but
+            # a different SOURCE, so ON / OFF must never share a memo / disk entry.
+            # See shared.derive_cmp_enabled.
+            "C4_DERIVE_CMP": (
+                os.environ.get("C4_DERIVE_CMP", "0") != "0"
+            ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
             # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
@@ -3344,6 +3352,13 @@ def _bake_from_scheduled_ops(
         # shared.derive_shift_enabled.
         "C4_DERIVE_SHIFT": (
             os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
+        ),
+        # COMPARISON family derived from ONE zero-detector (task #446,
+        # DEFAULT-OFF). Byte-identical to the hand path but a different SOURCE;
+        # ON / OFF must never share a serialised entry. See
+        # shared.derive_cmp_enabled.
+        "C4_DERIVE_CMP": (
+            os.environ.get("C4_DERIVE_CMP", "0") != "0"
         ),
         # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
         # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /

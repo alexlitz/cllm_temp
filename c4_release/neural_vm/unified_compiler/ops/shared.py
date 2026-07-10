@@ -144,6 +144,39 @@ def derive_shift_enabled() -> bool:
     return os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
 
 
+def derive_cmp_enabled() -> bool:
+    """Flag for the COMPARISON family derived from ONE zero-detector (task
+    #446). DEFAULT OFF.
+
+    When ``C4_DERIVE_CMP=1`` the six comparison opcodes' L10 decode banks
+    (both the ``ComparisonCombine`` decode-row path
+    ``_l10_comparison_combine_rules`` and the L10-main ALU cmp lane
+    ``_layer10_alu_cmp_combine_rules``) are re-expressed by the single DSL
+    generator :func:`building_blocks_dsl.derived_comparison_rules`, which
+    realizes BLOG_SPEC §576-590 literally: all of EQ/NE/LT/GT/LE/GE reduce to
+    ONE zero-detector primitive ``Z(d)`` (the §510 +1/-2/+1 second-difference,
+    computed per nibble by the upstream L9 comparator as the CMP equality/less
+    flags) plus its sign. Two derived combinators ``A_EQ_B := HI_EQ ∧ LO_EQ``
+    and ``A_LT_B := HI_LT ∨ (HI_EQ ∧ LO_LT)`` are built once, and every opcode
+    is then pure boolean algebra over them (EQ=A_EQ_B, NE=¬A_EQ_B, LT=A_LT_B,
+    GT=¬A_LT_B∧¬A_EQ_B, LE=A_LT_B∨A_EQ_B, GE=¬A_LT_B) — ZERO per-op magic
+    constants, replacing the hand-authored per-op default+override
+    enumeration.
+
+    The derivation reproduces the hand-authored 18-unit banks byte-for-byte
+    when passed the golden structural constants (proof:
+    ``tools/verify_derive_cmp.py`` — the whole-model golden hash is UNCHANGED
+    under ``C4_DERIVE_CMP=1``). Default OFF keeps the hand-authored path as the
+    golden build; either value is byte-identical, so this is a pure
+    architecture/derivation-provenance flip, not a behavior change.
+
+    A kill-switch so ``tools/flag_regression_gate.py --flag C4_DERIVE_CMP`` can
+    A/B it. Registered in BOTH cache-key snapshots in
+    ``full_vm_compiler_dynamic.py``.
+    """
+    return os.environ.get("C4_DERIVE_CMP", "0") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 
