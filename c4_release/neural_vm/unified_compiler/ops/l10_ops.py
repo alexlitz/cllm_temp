@@ -7507,29 +7507,30 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     "OUTPUT_HI_THIS_STEP": "mark == STACK0",
                 },
             )
-        rules = []
-        for lo in range(16):
-            for hi in range(16):
-                if lo == 0 and hi == 0:
-                    continue
-                value = lo | (hi << 4)
-                rules.append(
-                    multi_way_and_rule(
-                        name=f"tail_stack0_pop_loaded_byte_{value:02x}",
-                        scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                        conditions=base_conditions + (
-                            (f"OUTPUT_LO+{lo}", 0.05),
-                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.05),
-                        ),
-                        threshold=12.0,
-                        gate=gate_mark_stack0,
-                        writes=Primitives.byte_value_writes(
-                            value, strength=500.0, competitor_strength=competitor,
-                        ),
-                    )
-                )
-        return tuple(rules)
+        # Tier-3 tail-bank consolidation: this 16x16 nibble loop is the canonical
+        # evidence-keyed byte-value writeback pattern (READ==WRITE lane, OUTPUT).
+        # Authored via ``_byte_value_writeback_rules`` so the shape lives in one
+        # place; it emits the byte-IDENTICAL rule tuple this loop used to build by
+        # hand (same order, same weights, same threshold/gate, same lo==hi==0
+        # skip) — a count-preserving authoring refactor only.
+        return _byte_value_writeback_rules(
+            name_for=lambda value: f"tail_stack0_pop_loaded_byte_{value:02x}",
+            base_conditions=base_conditions,
+            threshold=12.0,
+            strength=500.0,
+            lo_match_weight=0.05,
+            hi_match_weight=0.05,
+            competitor_strength=competitor,
+            lo_base="OUTPUT_LO",
+            hi_base="OUTPUT_HI_THIS_STEP",
+            gate=gate_mark_stack0,
+            scope="mark == STACK0",
+            dominates_at={
+                "OUTPUT_LO": "mark == STACK0",
+                "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+            },
+            skip=lambda lo, hi: lo == 0 and hi == 0,
+        )
 
     def stack0_store_top_e0_output_rules() -> tuple[FFNRule, ...]:
         """Restore nonzero store-top values when SP points at the stored cell."""
