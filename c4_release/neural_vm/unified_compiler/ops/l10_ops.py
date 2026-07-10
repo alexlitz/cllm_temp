@@ -6389,6 +6389,11 @@ def _byte_value_writeback_rules(
     hi_base: str = "OUTPUT_HI_THIS_STEP",
     lo_match_weight: float = 1.0,
     hi_match_weight: float = 1.0,
+    tie_break_lo_base: Optional[str] = None,
+    tie_break_hi_base: Optional[str] = None,
+    tie_break_weight: float = 0.0,
+    write_lo_base: str = "OUTPUT_LO",
+    write_hi_base: str = "OUTPUT_HI",
     competitor_strength: Optional[float] = None,
     gate: Optional[object] = None,
     scope: Optional[str] = None,
@@ -6423,6 +6428,17 @@ def _byte_value_writeback_rules(
             band; ``ALU_LO`` / ``ALU_HI`` families pass those instead).
         lo_match_weight / hi_match_weight: the per-value match condition
             weights (families vary between 1.0 and 0.05 / 0.001).
+        tie_break_lo_base / tie_break_hi_base / tie_break_weight: an OPTIONAL
+            secondary per-value nibble-match pair appended verbatim AFTER the
+            primary ``lo_base``/``hi_base`` terms (e.g. the cross-lane
+            ``stack0_store_top_e0`` family reads its source nibble from
+            ``ALU_LO``/``ALU_HI`` at weight 1.0 and adds a
+            ``OUTPUT_LO``/``OUTPUT_HI_THIS_STEP`` tie-breaker at weight 0.001).
+            Left ``None`` (no extra terms) for the plain OUTPUT-lane banks.
+        write_lo_base / write_hi_base: the OUTPUT nibble bands the resulting
+            byte is written to (default ``OUTPUT_LO`` / ``OUTPUT_HI`` — the
+            ``byte_value_writes`` defaults — so cross-lane READ families can
+            still WRITE to OUTPUT).
         competitor_strength: forwarded to ``byte_value_writes`` for families
             that soften the losing-channel suppression (e.g. the shallow
             pop-loaded crush).
@@ -6441,19 +6457,27 @@ def _byte_value_writeback_rules(
             if skip is not None and skip(lo, hi):
                 continue
             value = lo | (hi << 4)
+            match_terms = (
+                (f"{lo_base}+{lo}", lo_match_weight),
+                (f"{hi_base}+{hi}", hi_match_weight),
+            )
+            if tie_break_lo_base is not None:
+                match_terms += (
+                    (f"{tie_break_lo_base}+{lo}", tie_break_weight),
+                    (f"{tie_break_hi_base}+{hi}", tie_break_weight),
+                )
             rules.append(
                 multi_way_and_rule(
                     name=name_for(value),
                     scope=scope,
                     dominates_at=dominates_at,
-                    conditions=tuple(base_conditions) + (
-                        (f"{lo_base}+{lo}", lo_match_weight),
-                        (f"{hi_base}+{hi}", hi_match_weight),
-                    ),
+                    conditions=tuple(base_conditions) + match_terms,
                     threshold=threshold,
                     gate=gate,
                     writes=Primitives.byte_value_writes(
                         value,
+                        lo_base=write_lo_base,
+                        hi_base=write_hi_base,
                         strength=strength,
                         competitor_strength=competitor_strength,
                     ),
@@ -7583,31 +7607,35 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                     "OUTPUT_HI_THIS_STEP": "mark == STACK0",
                 },
             )
-        rules = []
-        for lo in range(16):
-            for hi in range(16):
-                if lo == 0 and hi == 0:
-                    continue
-                value = lo | (hi << 4)
-                if value == 0xE0:
-                    continue
-                rules.append(
-                    multi_way_and_rule(
-                        name=f"tail_stack0_store_top_e0_byte_{value:02x}",
-                        scope="mark == STACK0",
-                        dominates_at={"OUTPUT_LO": "mark == STACK0", "OUTPUT_HI_THIS_STEP": "mark == STACK0"},
-                        conditions=base_conditions + (
-                            (f"ALU_LO+{lo}", 1.0),
-                            (f"ALU_HI+{hi}", 1.0),
-                            (f"OUTPUT_LO+{lo}", 0.001),
-                            (f"OUTPUT_HI_THIS_STEP+{hi}", 0.001),
-                        ),
-                        threshold=25.0,
-                        gate=gate_mark_stack0,
-                        writes=byte_writes(value, strength=2000.0),
-                    )
-                )
-        return tuple(rules)
+        # Tier-3 tail-bank consolidation: this 16x16 nibble loop is the CROSS-LANE
+        # variant of the byte-value writeback pattern — the source nibble is read
+        # from ALU_LO/ALU_HI (weight 1.0) with an OUTPUT tie-breaker (weight
+        # 0.001), and the byte is written to OUTPUT.  Authored via
+        # ``_byte_value_writeback_rules`` (with the tie-break pair) so the shape
+        # lives in one place; it emits the byte-IDENTICAL rule tuple this loop
+        # used to build by hand (same order, same weights, threshold=25, gate,
+        # lo==hi==0 and value==0xE0 skips) — a count-preserving authoring
+        # refactor only.
+        return _byte_value_writeback_rules(
+            name_for=lambda value: f"tail_stack0_store_top_e0_byte_{value:02x}",
+            base_conditions=base_conditions,
+            threshold=25.0,
+            strength=2000.0,
+            lo_base="ALU_LO",
+            hi_base="ALU_HI",
+            lo_match_weight=1.0,
+            hi_match_weight=1.0,
+            tie_break_lo_base="OUTPUT_LO",
+            tie_break_hi_base="OUTPUT_HI_THIS_STEP",
+            tie_break_weight=0.001,
+            gate=gate_mark_stack0,
+            scope="mark == STACK0",
+            dominates_at={
+                "OUTPUT_LO": "mark == STACK0",
+                "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+            },
+            skip=lambda lo, hi: (lo == 0 and hi == 0) or (lo | (hi << 4)) == 0xE0,
+        )
 
     def stack0_store_top_e8_from_e0_output_rules() -> tuple[FFNRule, ...]:
         """Restore top-store values for the e0->e8 local-store transition.
