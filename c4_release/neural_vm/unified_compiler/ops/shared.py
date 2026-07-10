@@ -113,7 +113,7 @@ def derive_bitwise_enabled() -> bool:
 
 
 def derive_shift_enabled() -> bool:
-    """Flag for the SPEC-DERIVED SHIFT family (SHL/SHR, task #448). Default OFF.
+    """Flag for the SPEC-DERIVED SHIFT family (SHL/SHR, task #448). Default ON.
 
     When ``C4_DERIVE_SHIFT=1`` the per-``(value, shift)`` result value that the
     L13 SHL/SHR lookup table stores is COMPUTED from the ``BLOG_SPEC`` "Shifts"
@@ -136,10 +136,12 @@ def derive_shift_enabled() -> bool:
     with ``v in 0..255``, ``s in 0..7`` (proven exhaustively in
     ``shift_semantics_dsl._SPEC_MATCHES_BITOPS`` and by the whole-model golden
     hash held under ``C4_DERIVE_SHIFT=1``), so the L13 shifts FFN (SHL + SHR,
-    4096 lookup units) is reproduced BYTE-FOR-BYTE. Default OFF keeps the
-    hand-authored lambda path as the golden build.
+    4096 lookup units) is reproduced BYTE-FOR-BYTE. Default ON => the derived
+    powers-of-two + mod-by-floor path is the golden build (the hand-authored
+    ``(v << s) & 0xFF`` / ``v >> s`` lambdas have been deleted;
+    ``C4_DERIVE_SHIFT=0`` is a legacy no-op kill-switch for cache-key isolation).
     """
-    return os.environ.get("C4_DERIVE_SHIFT", "0") != "0"
+    return os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
 
 
 def mul_width2_enabled() -> bool:

@@ -2216,11 +2216,12 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
             ),
             # L13 SHL/SHR result DERIVED from BLOG_SPEC §599 (powers-of-two +
-            # mod-by-floor) instead of the hand-authored bit-ops (task #448).
-            # Byte-identical to the hand path, but derives from a DIFFERENT
-            # source so the two builds must never share a memo / disk entry.
+            # mod-by-floor) (task #448, DEFAULT-ON). The hand-authored
+            # ``(v << s) & 0xFF`` / ``v >> s`` lambdas have been deleted;
+            # ``C4_DERIVE_SHIFT=0`` is a legacy no-op kill-switch. Byte-identical
+            # golden e50521f3. Registered here for cache-key isolation.
             "C4_DERIVE_SHIFT": (
-                os.environ.get("C4_DERIVE_SHIFT", "0") != "0"
+                os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
             ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
@@ -3335,13 +3336,14 @@ def _bake_from_scheduled_ops(
         "C4_DERIVE_BITWISE": (
             os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
         ),
-        # SHIFT full-derivation (task #448, DEFAULT-OFF): the L13 SHL/SHR lookup
+        # SHIFT full-derivation (task #448, DEFAULT-ON): the L13 SHL/SHR lookup
         # result is derived from BLOG_SPEC §599 (multiply/divide by powers of two
-        # + mod-by-floor) instead of the hand-authored bit-ops. Byte-identical to
-        # the hand path, different source; ON / OFF must never share a serialised
-        # entry. See shared.derive_shift_enabled.
+        # + mod-by-floor). The hand-authored ``(v << s) & 0xFF`` / ``v >> s``
+        # lambdas have been deleted; ``C4_DERIVE_SHIFT=0`` is a legacy no-op
+        # kill-switch. Byte-identical golden e50521f3. See
+        # shared.derive_shift_enabled.
         "C4_DERIVE_SHIFT": (
-            os.environ.get("C4_DERIVE_SHIFT", "0") != "0"
+            os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
         ),
         # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
         # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /
