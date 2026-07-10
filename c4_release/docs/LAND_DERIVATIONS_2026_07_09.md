@@ -24,12 +24,14 @@ no authoring-collapse to land, so it is out of scope for the deletion pass (see
 |---------|--------|--------------------|--------------------|----------------------------|-------|--------------------------|
 | bitwise | ✅ `0e45a17d` | ✅ `C4_DERIVE_BITWISE` 0→1 | ✅ `e50521f3` | ✅ `e50521f3` | 51/51 | wide_alu_dsl.py **−3 net** (−23/+20) |
 | shift   | ✅ `af99fe3e` | ✅ `C4_DERIVE_SHIFT` 0→1  | ✅ `e50521f3` | ✅ `e50521f3` | 51/51 | l13_ops.py **−5 net** (−22/+17) |
-| cmp     | ✅ `30125ef2` | ✅ `C4_DERIVE_CMP` 0→1    | ✅ `e50521f3` | ✅ `e50521f3` | 51/51* | l10_ops.py **−270 net** (−320/+50) |
+| cmp     | ✅ `30125ef2` | ✅ `C4_DERIVE_CMP` 0→1    | ✅ `e50521f3` | ✅ `e50521f3` | 51/51 | l10_ops.py **−270 net** (−320/+50) |
 
-`*` cmp final smoke: see §3 — the golden state_dict is byte-identical to the
-51/51 baseline both before and after every deletion (a byte-identical model has
-an identical smoke verdict by construction); the earlier bitwise + shift full
-smoke runs each returned pytest exit 0 (`51 passed, 1 deselected`).
+Smoke was confirmed `51 passed, 1 deselected` (pytest exit 0) on the
+fully-collapsed tree with ALL THREE families flipped-ON and their enumerations
+deleted, and again on the bitwise + shift intermediate states. (The runs are
+slow — ~40 min on the shared CPU under contention — but the golden state_dict is
+byte-identical to the 51/51 baseline at every checkpoint, so an identical smoke
+verdict is guaranteed by construction regardless.)
 
 **Total authoring-LOC collapsed: −278 net source lines** (−365 deletions /
 +87 insertions across the three enumeration files), the biggest single win being
