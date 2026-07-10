@@ -121,12 +121,20 @@ _GATE_RUN_CAP = 40
 
 # Total sample budget knobs (used by --regen-sample). Sized so the sample runs
 # in ~8-10 min per state on one GPU (~1.6s/program amortised + ~40s bake).
-_N_HEAVY = 12   # per shared-output-bus cluster (add/sub/mul/div/mod)
+_N_HEAVY = 12   # per shared-output-bus cluster (add/sub/mul/div/mod) — CHEAP (<=8 steps)
 _N_MEM = 10     # per MEM-SMOKE var_* cluster
-_N_CONSUMER = 8  # per multi-byte-consumer cluster (expr/nested/absdiff)
+# Multi-byte consumers: expr_* are CHEAP (<=8 steps) so keep 8; nested_* are the
+# expensive 31/39-step width-2 band, so cap those tighter (see _N_CONSUMER_DEEP)
+# to keep the gate's wall time near ~10 min while still covering the cluster.
+_N_CONSUMER = 8       # per cheap consumer cluster (expr_*, absdiff ~24 steps)
+_N_CONSUMER_DEEP = 5  # per EXPENSIVE consumer cluster (nested_quad 31, nested_sumsq 39)
 _N_MEDIUM = 6   # per remaining 25-member cluster (if_*, func_*, bool_and)
 _N_DEEP = 2     # per deep cluster (loop_*/rec_*/gcd) — tracked sentinels only
 _N_EDGE_SMALL = 1  # per tiny edge_* cluster (1-15 members)
+
+# The expensive-consumer clusters (31/39-step, width-2 band). Sampled at
+# _N_CONSUMER_DEEP so the gate does not blow past ~12 min on the deep band.
+_CONSUMER_DEEP = {"nested_quad", "nested_sumsq"}
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +170,8 @@ def _n_for_cluster(cluster: str, pop: int) -> int:
         n = _N_HEAVY
     elif cluster in _MEM_SMOKE_CLUSTERS:
         n = _N_MEM
+    elif cluster in _CONSUMER_DEEP:
+        n = _N_CONSUMER_DEEP
     elif cluster in _MULTIBYTE_CONSUMER:
         n = _N_CONSUMER
     elif cluster.startswith(("loop_", "rec_")) or cluster == "gcd":
