@@ -22,7 +22,15 @@ from ..isa_semantics_dsl import (
 )
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from ..wide_alu_dsl import const_delta_nibble_shift_rules
-from .shared import _as_setdim_proxy
+from .shared import (
+    _as_setdim_proxy,
+    derive_and_gate_maybe,
+    derive_control_enabled,
+    derive_gate,
+    derive_gate_scales_enabled,
+    derive_jmp_enabled,
+    derive_pc_override_gate,
+)
 
 
 # === L6 attention-head layout (auto-fit; legacy head_idx as docs) =====
@@ -432,6 +440,68 @@ def _pc_target_byte1_lo_from_imm_hi(k: int) -> int:
 # per-op :class:`PcMuxSpec`. See ``_layer6_all_step_jmp_pc_override_rules`` etc.
 
 
+def _gate_deriver(conditions, *, hand_threshold):
+    """Return the appropriate gate deriver for the active flags.
+
+    * ``C4_DERIVE_GATE_SCALES`` -> :func:`derive_gate` (FULL derivation:
+      positive weights = ``1/activation_scale``, threshold from the normalized
+      balanced-AND + step-guard, blockers from the safety factor). Task #395 —
+      closes the CONTROL branch's flagged activation-scale datum.
+    * else ``C4_DERIVE_CONTROL`` / ``C4_DERIVE_JMP`` -> :func:`derive_pc_override_gate`
+      (BLOCKER-only derivation; positive weights + threshold PRESERVED). Task #391.
+    """
+    if derive_gate_scales_enabled():
+        return derive_gate(conditions, hand_threshold=hand_threshold)
+    return derive_pc_override_gate(conditions, hand_threshold=hand_threshold)
+
+
+def _apply_derived_gate(spec: "PcMuxSpec") -> "PcMuxSpec":
+    """Return ``spec`` with its gate (and any distinct target/odd-hi condition
+    tuples) re-derived. The BLOCKER-only path preserves the per-band shape AND
+    satisfiability; the SCALE path additionally re-derives positive weights +
+    threshold (and is satisfiability-safe: a hand-DEAD band stays dead — see
+    ``shared.derive_gate``)."""
+
+    import dataclasses
+
+    conds, thr = _gate_deriver(spec.conditions, hand_threshold=spec.threshold)
+    changed: dict = {"conditions": conds, "threshold": thr}
+    if spec.target_conditions is not None:
+        tconds, _ = _gate_deriver(
+            spec.target_conditions, hand_threshold=spec.threshold,
+        )
+        changed["target_conditions"] = tconds
+    if spec.odd_hi_conditions is not None:
+        oconds, _ = _gate_deriver(
+            spec.odd_hi_conditions, hand_threshold=spec.threshold,
+        )
+        changed["odd_hi_conditions"] = oconds
+    # The odd-hi correction band derives its own threshold offset from the base
+    # threshold inside pc_mux; leave any explicit override to track the re-derived
+    # base.
+    if spec.odd_hi_threshold is not None:
+        changed["odd_hi_threshold"] = None
+    return dataclasses.replace(spec, **changed)
+
+
+def _maybe_derive_pc_mux_spec(
+    spec: "PcMuxSpec", *, n_pos: int | None = None,
+) -> "PcMuxSpec":
+    """Return ``spec`` re-derived when any CONTROL-family flag is on
+    (``C4_DERIVE_JMP`` / ``C4_DERIVE_CONTROL`` / ``C4_DERIVE_GATE_SCALES``);
+    otherwise the hand-authored ``spec`` unchanged (golden default). ``n_pos`` is
+    accepted for backward-compat with the JMP pilot call sites but unused (the
+    derivation reads the conditions' structure directly)."""
+
+    if not (
+        derive_jmp_enabled()
+        or derive_control_enabled()
+        or derive_gate_scales_enabled()
+    ):
+        return spec
+    return _apply_derived_gate(spec)
+
+
 def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
     """CompilerIR rules for L6 all-step JMP PC override units 320..383.
 
@@ -463,6 +533,8 @@ def _layer6_all_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             hi_source="FETCH_HI",
         ),
     )
+    # n_pos = 2: {MARK_PC, OP_JMP}. MARK_AX is the wrong-marker blocker.
+    spec = _maybe_derive_pc_mux_spec(spec, n_pos=2)
     return pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
 
 
@@ -604,6 +676,11 @@ def _layer6_all_step_jsr_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         odd_hi_conditions=odd_hi_conditions,
     )
+    # CONTROL family: the many wrong-marker / IS_BYTE / NEXT_SE / wrong-nibble
+    # blockers are re-derived to the shared spec-structural veto; the MARK_PC=20
+    # amplitude + threshold are preserved (blocker-only) or, under
+    # C4_DERIVE_GATE_SCALES, the positives are scale-normalized too.
+    spec = _maybe_derive_pc_mux_spec(spec)
     return pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
 
 
@@ -701,6 +778,10 @@ def _layer6_delayed_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             hi_source="AX_CARRY_HI",
         ),
     )
+    # n_pos = 2: {MARK_PC, CMP+0}. MARK_AX + CONST are the wrong-context blockers.
+    # This is a DEAD reserved band (threshold 5.5 > runtime marker sum ~2) — the
+    # derivation keeps it dead (see shared.derive_gate satisfiability guard).
+    spec = _maybe_derive_pc_mux_spec(spec, n_pos=2)
     return pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
 
 
@@ -728,6 +809,10 @@ def _layer6_first_step_jmp_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
             hi_source="AX_CARRY_HI",
         ),
     )
+    # n_pos = 2: {MARK_PC, OP_JMP}. HAS_SE (first-step => HAS_SE==0) + MARK_AX are
+    # the wrong-context blockers. DEAD reserved band (threshold 5.0 > runtime
+    # sum ~2) — kept dead by the derivation.
+    spec = _maybe_derive_pc_mux_spec(spec, n_pos=2)
     return pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
 
 
@@ -903,12 +988,29 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1e6),
         ("MARK_MEM", -1e6),
     )
+    # GATE-ROLLOUT (task #452, docs/GATE_ROLLOUT_2026_07_09.md): the SP-marker JSR
+    # fixup is a balanced-AND whose opcode discriminator is hand-tuned to
+    # ``OP_JSR=0.2`` == ``1/5.2`` == the calibrated opcode one-hot scale at the
+    # SP-marker row (the opcode flag is broadcast in-step to every marker row).
+    # ``derive_and_gate_maybe`` REPRODUCES that ``0.2`` + the ``1.5`` threshold
+    # from the activation-scale datum under ``C4_DERIVE_GATE_SCALES=1``.
+    # ``preserve_blockers=True``: the ``-1e6`` marker/IS_BYTE blockers + the
+    # ``HAS_SE=-1`` term are BROADCAST-DEFEAT guards (they veto the in-step
+    # ~5.2 OP_JSR broadcast at every non-SP / non-bootstrap row — see the block
+    # comment above), NOT safety-factor vetoes; re-deriving them is too weak and
+    # regresses the autoregressive PC (id550 div_step=6). So only positives +
+    # threshold derive; blockers stay hand. Flag-OFF the hand values are UNCHANGED.
+    _sp_fixup_conds = (
+        ("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0),
+    ) + _jsr_sp_fixup_blockers
+    _sp_fixup_conds, _sp_fixup_thr = derive_and_gate_maybe(
+        _sp_fixup_conds, 1.5, position_class="mark==SP", preserve_blockers=True,
+    )
     return (
         multi_way_and_rule(
             name="l6_jsr_sp_fixup_lo",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0))
-            + _jsr_sp_fixup_blockers,
-            threshold=1.5,
+            conditions=_sp_fixup_conds,
+            threshold=_sp_fixup_thr,
             writes=(
                 ("OUTPUT_LO+8", write_scale),
                 ("OUTPUT_LO+0", -write_scale),
@@ -916,9 +1018,8 @@ def _layer6_jsr_sp_fixup_rules(S: float) -> tuple[FFNRule, ...]:
         ),
         multi_way_and_rule(
             name="l6_jsr_sp_fixup_hi",
-            conditions=(("OP_JSR", 0.2), ("MARK_SP", 1.0), ("HAS_SE", -1.0))
-            + _jsr_sp_fixup_blockers,
-            threshold=1.5,
+            conditions=_sp_fixup_conds,
+            threshold=_sp_fixup_thr,
             writes=(
                 ("OUTPUT_HI_THIS_STEP+15", write_scale),
                 ("OUTPUT_HI_THIS_STEP+0", -write_scale),
@@ -4564,6 +4665,12 @@ def _post_l9_bz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
         # written at MARK_PC, not STACK0). The NEXT step's cancel reads it.
         fresh_writer=("BZ_TARGET_FRESH", ()),
     )
+    # CONTROL family: the IS_BYTE blocker (+ target band's MARK_STACK0) is
+    # re-derived to the spec-structural veto; the positives + threshold are
+    # preserved (blocker-only), OR under C4_DERIVE_GATE_SCALES the positive
+    # weights (OP_BZ=0.2 == 1/scale(OP_BZ)) + threshold (3.5 = n_norm-0.5, +10
+    # step-0 guard) are DERIVED from the activation-scale datum.
+    spec = _maybe_derive_pc_mux_spec(spec)
     return pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET).rules_builder()
 
 
@@ -4624,6 +4731,10 @@ def _post_l9_bnz_pc_override_rules(S: float) -> tuple[FFNRule, ...]:
                 fetch_pc_marker_amp=_FETCH_PC_MARKER_AMP,
             ),
         )
+        # CONTROL family: each BNZ group's CMP branch-NONZERO blocker is
+        # re-derived to the spec-structural veto; under C4_DERIVE_GATE_SCALES the
+        # positive weights (OP_BNZ=0.2 == 1/scale) + threshold are DERIVED too.
+        spec = _maybe_derive_pc_mux_spec(spec)
         rules.extend(
             pc_mux(spec, instr_width=INSTR_WIDTH, pc_offset=PC_OFFSET)
             .rules_builder()

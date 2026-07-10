@@ -2242,6 +2242,28 @@ def compile_full_vm_dynamic(
             "C4_DERIVE_CMP": (
                 os.environ.get("C4_DERIVE_CMP", "1") != "0"
             ),
+            # CONTROL-family PC-override gate derivations (task #391 + #395,
+            # DEFAULT-OFF). Each re-derives the branch gates (JMP/BZ/BNZ/JSR) from
+            # spec structure: DERIVE_JMP/CONTROL = blocker magnitudes only;
+            # DERIVE_GATE_SCALES = FULL gate (positive weights = 1/activation_scale
+            # + threshold from the normalized balanced-AND + blockers). Behaviour-
+            # correct RE-DERIVATION (NOT byte-identical), so ON / OFF must never
+            # share a memo / disk entry. See shared.derive_{jmp,control}_enabled /
+            # derive_gate_scales_enabled.
+            "C4_DERIVE_JMP": (
+                os.environ.get("C4_DERIVE_JMP", "0") != "0"
+            ),
+            "C4_DERIVE_CONTROL": (
+                os.environ.get("C4_DERIVE_CONTROL", "0") != "0"
+            ),
+            "C4_DERIVE_GATE_SCALES": (
+                os.environ.get("C4_DERIVE_GATE_SCALES", "0") != "0"
+            ),
+            "C4_PC_OVERRIDE_K": os.environ.get("C4_PC_OVERRIDE_K", "1"),
+            # activation-scale calibration source: the JSON path changes the
+            # derived gate weights, so two builds with different calibrations must
+            # never share a cache entry (only relevant when GATE_SCALES is on).
+            "C4_ACTSCALE_JSON": os.environ.get("C4_ACTSCALE_JSON", ""),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
             # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
@@ -3415,6 +3437,21 @@ def _bake_from_scheduled_ops(
         "C4_DERIVE_CMP": (
             os.environ.get("C4_DERIVE_CMP", "1") != "0"
         ),
+        # CONTROL-family PC-override gate derivations (task #391 + #395,
+        # DEFAULT-OFF). RE-DERIVATION (behaviour-correct, NOT byte-identical), so
+        # ON / OFF must never share a memo / disk entry. See
+        # shared.derive_{jmp,control}_enabled / derive_gate_scales_enabled.
+        "C4_DERIVE_JMP": (
+            os.environ.get("C4_DERIVE_JMP", "0") != "0"
+        ),
+        "C4_DERIVE_CONTROL": (
+            os.environ.get("C4_DERIVE_CONTROL", "0") != "0"
+        ),
+        "C4_DERIVE_GATE_SCALES": (
+            os.environ.get("C4_DERIVE_GATE_SCALES", "0") != "0"
+        ),
+        "C4_PC_OVERRIDE_K": os.environ.get("C4_PC_OVERRIDE_K", "1"),
+        "C4_ACTSCALE_JSON": os.environ.get("C4_ACTSCALE_JSON", ""),
         # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
         # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /
         # restore PureFFN ops so ON / OFF builds STRUCTURALLY differ (d_model +

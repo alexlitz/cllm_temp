@@ -44,6 +44,7 @@ from ..primitives import Primitives
 from .residual_band_registry import register_residual_band
 from .shared import (
     _as_setdim_proxy,
+    derive_and_gate_maybe,
     no_stack0_emit_enabled,
     operand_from_memsp_enabled,
     store_ax_b0_override_enabled,
@@ -1841,10 +1842,26 @@ def _layer16_lev_routing_rules(S: float) -> tuple[FFNRule, ...]:
             # TEMP[11]. Do not treat that marker residue as the preserved AX
             # value when JMP is merely preserving the prior AX byte.
             extra_conditions.append((dim_ref('temp_scratch', 'general', 11), -2.0))
+        # GATE-ROLLOUT (task #452): the hand gate is a balanced-AND whose opcode
+        # discriminator is hand-tuned to ``OP_JMP=0.2`` == ``1/5.2`` == the
+        # calibrated OP one-hot scale at the ``mark==AX`` row this corrector
+        # fires on. ``derive_and_gate_maybe`` REPRODUCES that ``0.2`` + the ``1.5``
+        # balanced-AND threshold from the activation-scale datum when
+        # ``C4_DERIVE_GATE_SCALES=1``; flag-OFF the hand values are UNCHANGED.
+        # ``preserve_blockers=True``: the marker/IS_BYTE/FETCH_LO negatives are
+        # BROADCAST-DEFEAT guards (they veto the in-step-broadcast amplified OP_JMP
+        # ~5.2 at NON-AX rows), NOT simple safety-factor vetoes sized to the
+        # firing-row positive sum. Re-deriving them to ``-(pos_sum+1)`` is too
+        # weak at the broadcast rows and regresses the autoregressive PC (id550
+        # div_step=6). So positives + threshold derive; blockers stay hand.
+        jmp_conds, jmp_thr = derive_and_gate_maybe(
+            jmp_ax_preserve_conditions + tuple(extra_conditions),
+            1.5, position_class="mark==AX", preserve_blockers=True,
+        )
         rules.append(multi_way_and_rule(
             name=f"l16_jmp_ax_preserve_lo_{k}",
-            conditions=jmp_ax_preserve_conditions + tuple(extra_conditions),
-            threshold=1.5,
+            conditions=jmp_conds,
+            threshold=jmp_thr,
             gate=dim_ref('output_lo', 'nibble', k),
             writes=tuple(
                 (
