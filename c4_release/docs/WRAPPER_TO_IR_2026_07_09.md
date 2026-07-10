@@ -90,12 +90,13 @@ AFTER:  DSLInterpreterVerdictRunner(model=efficient) constructed OK; inner._dsl 
 * **Golden hash unchanged:** `tools/_isa_golden_hash.py` = `e50521f3…` (== target `e50521f3`),
   identical before and after — the change is confined to the verification/tooling layer.
 * **Per-block residual identity (incl. the 5 wrappers, executed via the IR fragment):**
-  `--alu-mode efficient` Layer-A = **16/16** programs (each wrapper block's IR-fragment
+  `--alu-mode efficient` Layer-A = **40/40** programs (each wrapper block's IR-fragment
   output matches the deployed `block(x)` to fp exactness).
 * **Full-tape argmax identity vs `model.forward`:** `CachedFaithfulForward` and
   `IRBlockForward` = **2310/2310** positions across the 14 smoke programs
   (add/sub/mul/div/mod/and/or/xor/eq/…, which exercise every wrapper block), and
-  Layer-B = **16/16** on the corpus sample.
+  the validator's Layer-B (`CachedFaithfulForward` argmax vs `model.forward`) =
+  **40/40** on the 40-program corpus sample, PC/AX per-step decode = **40/40**.
 * **End-to-end verdict = CPU-neural:** `DSLInterpreterVerdictRunner` (efficient model,
   `IRBlockForward` vehicle) vs `BatchedPureNeuralRunner` CPU-neural agree on
   status **and** first-divergence step (e.g. `mul` fail@step-3 on both) — the full
