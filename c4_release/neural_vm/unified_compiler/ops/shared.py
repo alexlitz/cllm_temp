@@ -146,7 +146,7 @@ def derive_shift_enabled() -> bool:
 
 def derive_cmp_enabled() -> bool:
     """Flag for the COMPARISON family derived from ONE zero-detector (task
-    #446). DEFAULT OFF.
+    #446). DEFAULT ON.
 
     When ``C4_DERIVE_CMP=1`` the six comparison opcodes' L10 decode banks
     (both the ``ComparisonCombine`` decode-row path
@@ -166,15 +166,16 @@ def derive_cmp_enabled() -> bool:
     The derivation reproduces the hand-authored 18-unit banks byte-for-byte
     when passed the golden structural constants (proof:
     ``tools/verify_derive_cmp.py`` — the whole-model golden hash is UNCHANGED
-    under ``C4_DERIVE_CMP=1``). Default OFF keeps the hand-authored path as the
-    golden build; either value is byte-identical, so this is a pure
-    architecture/derivation-provenance flip, not a behavior change.
+    under this flag). Default ON => the single-zero-detector derivation is the
+    golden build (the per-op default+override hand-enumeration in both banks has
+    been deleted; ``C4_DERIVE_CMP=0`` is now a legacy no-op kill-switch, since
+    either value is byte-identical). This is a pure architecture/derivation-
+    provenance flip, not a behavior change.
 
-    A kill-switch so ``tools/flag_regression_gate.py --flag C4_DERIVE_CMP`` can
-    A/B it. Registered in BOTH cache-key snapshots in
-    ``full_vm_compiler_dynamic.py``.
+    Registered in BOTH cache-key snapshots in
+    ``full_vm_compiler_dynamic.py`` for cache-key isolation.
     """
-    return os.environ.get("C4_DERIVE_CMP", "0") != "0"
+    return os.environ.get("C4_DERIVE_CMP", "1") != "0"
 
 
 def mul_width2_enabled() -> bool:

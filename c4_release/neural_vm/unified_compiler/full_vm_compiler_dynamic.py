@@ -2224,12 +2224,13 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
             ),
             # COMPARISON family derived from ONE zero-detector (task #446;
-            # DEFAULT-OFF). Re-expresses the L10 cmp-combine banks from
-            # ``derived_comparison_rules`` — byte-identical to the hand path, but
-            # a different SOURCE, so ON / OFF must never share a memo / disk entry.
-            # See shared.derive_cmp_enabled.
+            # DEFAULT-ON). The L10 cmp-combine banks are generated from
+            # ``derived_comparison_rules``; the per-op default+override hand
+            # enumeration has been deleted. ``C4_DERIVE_CMP=0`` is a legacy no-op
+            # kill-switch. Byte-identical golden e50521f3. Registered here for
+            # cache-key isolation. See shared.derive_cmp_enabled.
             "C4_DERIVE_CMP": (
-                os.environ.get("C4_DERIVE_CMP", "0") != "0"
+                os.environ.get("C4_DERIVE_CMP", "1") != "0"
             ),
             # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
             # opt out with =0): promotes H1+2 to a hard requirement on
@@ -3354,11 +3355,11 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
         ),
         # COMPARISON family derived from ONE zero-detector (task #446,
-        # DEFAULT-OFF). Byte-identical to the hand path but a different SOURCE;
-        # ON / OFF must never share a serialised entry. See
-        # shared.derive_cmp_enabled.
+        # DEFAULT-ON). The per-op default+override hand enumeration has been
+        # deleted; ``C4_DERIVE_CMP=0`` is a legacy no-op kill-switch.
+        # Byte-identical golden e50521f3. See shared.derive_cmp_enabled.
         "C4_DERIVE_CMP": (
-            os.environ.get("C4_DERIVE_CMP", "0") != "0"
+            os.environ.get("C4_DERIVE_CMP", "1") != "0"
         ),
         # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
         # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /
