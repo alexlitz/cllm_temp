@@ -567,12 +567,37 @@ class FaithfulInterpreter:
 # FFN block class names that are imperative composite ALU blocks (no SwiGLU
 # rule form). ``FlattenedPureFFN`` is a flattened-but-declarative variant kept
 # here for parity with the validator's recovery boundary.
+#
+# The trailing five are the efficient/production-mode campaign WRAPPER FFN
+# blocks (``make_efficient_l{8,10,11}_*_wrap_op`` +
+# ``make_loaded_operand_add_hi15_clear_op`` install them at
+# ``alu_mode='efficient'`` under the campaign flags). Each wraps an ``inner``
+# PureFFN, does an in-place operand/output cell edit in its ``forward(x)`` (x is
+# ``[B, N, D]``), then delegates to ``inner`` — so it exposes NO
+# W_up/W_gate/W_down of its own (``getattr(block.ffn, 'W_up')`` AttributeErrors)
+# and is not a single SwiGLU rule list. They therefore honour the SAME
+# composite-FFN contract as the ALU composites above: the deployed block's own
+# ``forward`` is carried as a :class:`CompositeFFNFragment` and executed through
+# the IR (``composite_ffn_ir`` does the ``[B,N,D]`` <-> ``[S,D]`` adapt), which
+# is byte-identical to the deployed block BY CONSTRUCTION (it invokes the exact
+# module). Registering them here turns what was ``opaque_skipped`` (and an
+# ``IRBlockForward`` / ``DSLInterpreterVerdictRunner`` ``AttributeError: no
+# W_up`` crash) into first-class IR-executable ops — so the faithful interpreter
+# covers 100% of the efficient/production model with ZERO opaque skips. See
+# ``docs/WRAPPER_TO_IR_2026_07_09.md``.
 COMPOSITE_ALU_FFN = (
     "AddSub5StageBlock",
     "FlattenedALUMul",
     "FlattenedDivMod",
     "ALUShiftComposite",
     "FlattenedPureFFN",
+    # Efficient/production-mode campaign operand-recover / cell-clear wrappers
+    # (delegate to an ``inner`` PureFFN after a cell edit; no W_up of their own).
+    "LoadedOperandAddHi15ClearFFN",
+    "CmpOperandSeRecoverFFN",
+    "MulOperandSeRecoverFFN",
+    "BitwiseOperandSeRecoverFFN",
+    "ShiftOutputClearFFN",
 )
 
 
