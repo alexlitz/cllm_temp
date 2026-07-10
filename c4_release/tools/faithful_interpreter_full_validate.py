@@ -82,7 +82,17 @@ from neural_vm.speculative import DraftVM  # noqa: E402
 # ---------------------------------------------------------------------------
 
 
-def build_model(device: str = "cpu"):
+def build_model(device: str = "cpu", *, alu_mode: str = "lookup",
+                disk_cache: bool = True):
+    """Build the baked model.
+
+    ``alu_mode='efficient'`` is the PRODUCTION efficient-mode model: it installs
+    the 5 campaign WRAPPER FFN blocks (``LoadedOperandAddHi15ClearFFN`` /
+    ``{Mul,Cmp,Bitwise}OperandSeRecoverFFN`` / ``ShiftOutputClearFFN``) that
+    have no W_up of their own. Those are now IR-covered via
+    :class:`CompositeFFNFragment` (registered in ``COMPOSITE_ALU_FFN``), so the
+    ``--coverage`` gate reports ``opaque_skipped==[]`` on this model too.
+    """
     import contextlib
     import io
 
@@ -91,7 +101,9 @@ def build_model(device: str = "cpu"):
     )
 
     with contextlib.redirect_stdout(io.StringIO()):
-        model, layout = compile_full_vm_dynamic(disk_cache=True)
+        model, layout = compile_full_vm_dynamic(
+            disk_cache=disk_cache, alu_mode=alu_mode,
+        )
     model = model.to(device)
     model.eval()
     return model, layout
@@ -384,13 +396,22 @@ def main(argv=None) -> int:
                     help="Report the DSL-SwiGLU vs deployed-composite divergence.")
     ap.add_argument("--max-steps", type=int, default=48)
     ap.add_argument("--max-decl-steps", type=int, default=40)
+    ap.add_argument("--alu-mode", default="lookup", choices=("lookup", "efficient"),
+                    help="'efficient' builds the PRODUCTION efficient-mode model "
+                         "(installs the 5 campaign wrapper FFN blocks).")
+    ap.add_argument("--no-disk-cache", action="store_true",
+                    help="Compile fresh (disk_cache=False) — needed for a "
+                         "non-default --alu-mode.")
     args = ap.parse_args(argv)
     if not any([args.coverage, args.limit, args.full, args.dsl_divergence]):
         args.coverage = True
         args.limit = 24
 
-    print("[full-validate] building model (cached compile, CPU)...", file=sys.stderr)
-    model, layout = build_model("cpu")
+    print(f"[full-validate] building model (alu_mode={args.alu_mode}, CPU)...",
+          file=sys.stderr)
+    model, layout = build_model(
+        "cpu", alu_mode=args.alu_mode, disk_cache=not args.no_disk_cache,
+    )
     print(f"[full-validate] d_model={model.d_model} blocks={len(model.blocks)} "
           f"STEP_TOKENS={STEP_TOKENS}", file=sys.stderr)
 
