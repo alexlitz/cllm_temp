@@ -121,20 +121,37 @@ _GATE_RUN_CAP = 40
 
 # Total sample budget knobs (used by --regen-sample). Sized so the sample runs
 # in ~8-10 min per state on one GPU (~1.6s/program amortised + ~40s bake).
-_N_HEAVY = 12   # per shared-output-bus cluster (add/sub/mul/div/mod) — CHEAP (<=8 steps)
-_N_MEM = 10     # per MEM-SMOKE var_* cluster
-# Multi-byte consumers: expr_* are CHEAP (<=8 steps) so keep 8; nested_* are the
-# expensive 31/39-step width-2 band, so cap those tighter (see _N_CONSUMER_DEEP)
-# to keep the gate's wall time near ~10 min while still covering the cluster.
-_N_CONSUMER = 8       # per cheap consumer cluster (expr_*, absdiff ~24 steps)
-_N_CONSUMER_DEEP = 5  # per EXPENSIVE consumer cluster (nested_quad 31, nested_sumsq 39)
-_N_MEDIUM = 6   # per remaining 25-member cluster (if_*, func_*, bool_and)
+# RUNTIME MODEL (measured RTX A5000, full_trace spec_k=0): a program's decode
+# cost scales with its DIVERGENCE STEP (fail-fast) x the un-windowed O(steps^2)
+# forward, so the ~13-15-step FAILING programs (var_three/absdiff/func_max) and
+# the 31/39-step nested_* are the wall-time drivers, NOT the arith band (which
+# diverges at <=5 steps). The -34 we must catch is dominated by the CHEAP
+# shared-OUTPUT-bus ALU families + var, so those stay heavy and the expensive
+# deep/late-diverging clusters are capped. This keeps the gate ~10-12 min/state.
+_N_HEAVY = 12   # per shared-output-bus cluster (add/sub/mul/div/mod) — CHEAP (<=5-step divergence)
+# MEM-SMOKE var_* budgets. var_simple has cheap ~7-11-step members (heavy=10);
+# var_mul/var_update are uniformly ~17 steps and var_three ~25 (the mid-band
+# wall), so those are capped to keep the gate ~12 min while still guaranteeing
+# the SI/LI store-load path can never silently break (>=6 ids each, pass+fail).
+_N_MEM = 10      # var_simple (has shallow members)
+_N_MEM_MID = 6   # var_mul / var_update (~17 steps)
+_N_MEM_DEEP = 5  # var_three (~25 steps, the mid-band wall) — capped
+_N_CONSUMER = 8       # per CHEAP consumer cluster (expr_* ~8 steps)
+_N_CONSUMER_MID = 4   # per MID-cost consumer cluster (absdiff ~15-step divergence)
+_N_CONSUMER_DEEP = 3  # per EXPENSIVE consumer cluster (nested_quad 31, nested_sumsq 39)
+_N_MEDIUM = 6   # per if_* cluster (~10-step divergence, cheap-ish)
+_N_MEDIUM_SLOW = 4  # per func_* cluster (~13-15-step divergence)
 _N_DEEP = 2     # per deep cluster (loop_*/rec_*/gcd) — tracked sentinels only
 _N_EDGE_SMALL = 1  # per tiny edge_* cluster (1-15 members)
 
-# The expensive-consumer clusters (31/39-step, width-2 band). Sampled at
-# _N_CONSUMER_DEEP so the gate does not blow past ~12 min on the deep band.
+# The expensive-consumer clusters (31/39-step, width-2 band) — capped tight.
 _CONSUMER_DEEP = {"nested_quad", "nested_sumsq"}
+# Mid-cost consumers (~24-step decl, ~15-step divergence).
+_CONSUMER_MID = {"absdiff"}
+# func_* clusters diverge at ~13-15 steps — cheaper than nested but not free.
+_FUNC_CLUSTERS = {
+    "func_identity", "func_add", "func_mul", "func_square", "func_max", "func_min",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +185,20 @@ def _n_for_cluster(cluster: str, pop: int) -> int:
     """How many representatives to draw from a cluster of population ``pop``."""
     if cluster in _SHARED_OUTPUT_BUS:
         n = _N_HEAVY
+    elif cluster == "var_three":
+        n = _N_MEM_DEEP
+    elif cluster in ("var_mul", "var_update"):
+        n = _N_MEM_MID
     elif cluster in _MEM_SMOKE_CLUSTERS:
         n = _N_MEM
     elif cluster in _CONSUMER_DEEP:
         n = _N_CONSUMER_DEEP
+    elif cluster in _CONSUMER_MID:
+        n = _N_CONSUMER_MID
     elif cluster in _MULTIBYTE_CONSUMER:
         n = _N_CONSUMER
+    elif cluster in _FUNC_CLUSTERS:
+        n = _N_MEDIUM_SLOW
     elif cluster.startswith(("loop_", "rec_")) or cluster == "gcd":
         n = _N_DEEP
     elif pop >= 20:
