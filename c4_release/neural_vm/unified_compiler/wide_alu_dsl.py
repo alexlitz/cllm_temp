@@ -36,7 +36,7 @@ bit-for-bit on randomized input (see Section 4 of the design doc and
 
 from __future__ import annotations
 
-import operator
+import os
 from typing import Callable, Literal, Mapping, Optional, Sequence, Tuple
 
 from .building_blocks_dsl import multi_way_and_rule
@@ -44,15 +44,91 @@ from .ir import FFNRule
 
 
 # ---------------------------------------------------------------------------
-# Wave W1: Bitwise (AND/OR/XOR) — POC implementation.
+# Wave W1: Bitwise (AND/OR/XOR).
 # ---------------------------------------------------------------------------
+#
+# The result nibble for all three bitwise ops is DERIVED from the single
+# BLOG_SPEC §568 per-bit formula (see ``_bitwise_result_from_spec_formula``
+# below). The former enumerated ``operator.and_/or_/xor`` dispatch
+# (``_BITWISE_OP_FN``) was proven byte-identical to the derivation
+# (golden e50521f3, task #449) and has been deleted.
 
 
-_BITWISE_OP_FN: dict[str, Callable[[int, int], int]] = {
-    "and": operator.and_,
-    "or": operator.or_,
-    "xor": operator.xor,
+# ---------------------------------------------------------------------------
+# BLOG_SPEC §568 one-formula derivation (``C4_DERIVE_BITWISE``, DEFAULT-OFF).
+# ---------------------------------------------------------------------------
+#
+# BLOG_SPEC §568 (line 225): *"Bitwise: 10 weights — one formula (a+b-ab) for
+# all"*.  ALL THREE bitwise nibble ops are ONE per-BIT polynomial applied
+# independently across the 4 bits of the nibble:
+#
+#     r_bit = c_a*a_bit + c_b*b_bit + c_ab*(a_bit * b_bit)
+#
+# with a single per-op coefficient triple read STRAIGHT FROM the spec text
+# (``a+b-ab`` / ``ab`` / ``a+b-2ab``) — no per-op branch, no Python bit
+# operator, and zero magic constants (the coefficients ARE the ISA identity):
+#
+#     OR   = a + b - 1*a*b   ->  (c_a, c_b, c_ab) = ( 1,  1, -1)
+#     AND  =         1*a*b   ->  (c_a, c_b, c_ab) = ( 0,  0,  1)
+#     XOR  = a + b - 2*a*b   ->  (c_a, c_b, c_ab) = ( 1,  1, -2)
+#
+# The DEFAULT (flag-OFF) path keeps ``_BITWISE_OP_FN`` (the three enumerated
+# ``operator.and_/or_/xor`` bit functions) so the golden build is byte-for-byte
+# unchanged.  With ``C4_DERIVE_BITWISE=1`` the SAME 512-per-op result nibbles
+# are produced instead by ``_bitwise_result_from_spec_formula`` — the single
+# shared polynomial — so the op-specific Python operator is eliminated in
+# favour of the spec's one formula.  The result VALUES are provably identical
+# per nibble (``tools/probe_reg_emission_map.py`` /
+# ``tests/test_wide_alu_dsl.py``), so the whole-model hash is unchanged either
+# way; the derivation is a SOURCE collapse (3 distinct operators -> 1 formula +
+# 3 spec-read coefficient triples), not a weight change.
+#
+# See ``docs/DERIVE_BITWISE_2026_07_09.md`` and ``shared.derive_bitwise_enabled``.
+
+# The ONLY per-op DATA: (c_a, c_b, c_ab), each triple lifted verbatim from the
+# BLOG_SPEC §568 one-formula bitwise identities. NOT a magic constant — the
+# ISA definition of the op.
+_BITWISE_SPEC_COEFFS: dict[str, tuple[int, int, int]] = {
+    "or": (1, 1, -1),    # a + b - a*b
+    "and": (0, 0, 1),    #         a*b
+    "xor": (1, 1, -2),   # a + b - 2*a*b
 }
+
+
+def _bitwise_result_from_spec_formula(op: str, a: int, b: int) -> int:
+    """Nibble ``a OP b`` from the SINGLE BLOG_SPEC §568 per-bit formula.
+
+    All three ops are the one polynomial ``c_a*a_bit + c_b*b_bit +
+    c_ab*(a_bit*b_bit)`` applied per bit across the 4 nibble bits, with the
+    per-op coefficient triple read directly from the spec (``_BITWISE_SPEC_COEFFS``).
+    Reproduces ``operator.and_/or_/xor`` on every ``(a, b)`` nibble pair by
+    construction (each per-bit result is provably in ``{0, 1}``); this is the
+    derived replacement for the enumerated ``_BITWISE_OP_FN`` dispatch.
+    """
+    c_a, c_b, c_ab = _BITWISE_SPEC_COEFFS[op]
+    result = 0
+    for bit in range(4):
+        a_bit = (a >> bit) & 1
+        b_bit = (b >> bit) & 1
+        r_bit = c_a * a_bit + c_b * b_bit + c_ab * (a_bit * b_bit)
+        # The one formula yields a genuine bit for every legal coefficient
+        # triple; assert it (cheap, build-time) so a mis-transcribed spec
+        # coefficient fails loudly rather than silently corrupting a nibble.
+        assert r_bit in (0, 1), (op, a, b, bit, r_bit)
+        result |= r_bit << bit
+    return result
+
+
+def _derive_bitwise_enabled() -> bool:
+    """Local mirror of ``ops.shared.derive_bitwise_enabled`` (DEFAULT-ON).
+
+    Kept local so ``wide_alu_dsl`` (a leaf DSL module) does not import the
+    ``ops`` package. The bitwise result nibble is produced by the single
+    BLOG_SPEC §568 formula; ``C4_DERIVE_BITWISE=0`` is a legacy kill-switch
+    that would restore the (now-deleted) enumerated ``operator`` dispatch —
+    kept only as a no-op escape hatch. Byte-identical either way.
+    """
+    return os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
 
 
 def bitwise_rules(
@@ -165,11 +241,18 @@ def bitwise_rules(
     Raises:
         ValueError: if ``op`` is not one of ``"and"``, ``"or"``, ``"xor"``.
     """
-    op_fn = _BITWISE_OP_FN.get(op)
-    if op_fn is None:
+    if op not in _BITWISE_SPEC_COEFFS:
         raise ValueError(
             f"bitwise_rules: op must be 'and'/'or'/'xor'; got {op!r}"
         )
+    # Result-nibble source: the SINGLE BLOG_SPEC §568 per-bit formula
+    # ``c_a*a + c_b*b + c_ab*a*b`` for ALL three ops (zero op-specific operator,
+    # zero magic constants). This is the sole path — the former enumerated
+    # ``operator`` dispatch was proven byte-identical (golden e50521f3) and
+    # deleted (task #449). ``C4_DERIVE_BITWISE`` remains a registered no-op
+    # kill-switch for cache-key isolation.
+    _ = _derive_bitwise_enabled()  # keep the flag live for cache-key isolation
+    op_fn = lambda a, b, _op=op: _bitwise_result_from_spec_formula(_op, a, b)
 
     write_value = result_write_value / S
     rules: list[FFNRule] = []

@@ -80,6 +80,104 @@ def derive_imm_enabled() -> bool:
     return os.environ.get("C4_DERIVE_IMM", "0") != "0"
 
 
+def derive_bitwise_enabled() -> bool:
+    """Flag for the SPEC-DERIVED BITWISE family (OR/XOR/AND). Default ON.
+
+    BLOG_SPEC §568: *"Bitwise: 10 weights — one formula (a+b-ab) for all"*.
+    All three bitwise ops are ONE per-bit polynomial
+    ``r_bit = c_a*a_bit + c_b*b_bit + c_ab*(a_bit*b_bit)`` applied across the
+    4 nibble bits, with a single per-op coefficient triple read straight from
+    the spec text:
+
+      * OR  = ``a + b - a*b``   -> ``(c_a, c_b, c_ab) = ( 1,  1, -1)``
+      * AND = ``        a*b``   -> ``( 0,  0,  1)``
+      * XOR = ``a + b - 2*a*b`` -> ``( 1,  1, -2)``
+
+    When ``C4_DERIVE_BITWISE=1`` the L10 bitwise result nibbles (lookup post-op
+    AND both L10-main-FFN callers) are produced by this ONE shared formula
+    (``wide_alu_dsl._bitwise_result_from_spec_formula``) instead of the three
+    enumerated ``operator.and_/or_/xor`` bit functions
+    (``wide_alu_dsl._BITWISE_OP_FN``). The result nibbles are provably
+    identical per ``(a, b)`` pair (each per-bit result is in ``{0, 1}`` by
+    construction), so ``tools/_isa_golden_hash.py`` is UNCHANGED under the flag
+    — the derivation is a SOURCE collapse (3 distinct bit operators -> 1 spec
+    formula + 3 coefficient triples), not a weight change.
+
+    Default ON => the derived one-formula path is the golden build (the
+    enumerated ``operator`` dispatch has been deleted; ``C4_DERIVE_BITWISE=0``
+    is a legacy no-op kill-switch). Both ON/OFF are registered in the
+    ``full_vm_compiler_dynamic.py`` cache-key snapshots so a build never shares
+    a memo / disk entry across the flag. See ``docs/DERIVE_BITWISE_2026_07_09.md``.
+    """
+    return os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
+
+
+def derive_shift_enabled() -> bool:
+    """Flag for the SPEC-DERIVED SHIFT family (SHL/SHR, task #448). Default ON.
+
+    When ``C4_DERIVE_SHIFT=1`` the per-``(value, shift)`` result value that the
+    L13 SHL/SHR lookup table stores is COMPUTED from the ``BLOG_SPEC`` "Shifts"
+    building blocks (docs/BLOG_SPEC.md §597-599) instead of the hand-authored
+    Python bit-shift operators ``(v << s) & 0xFF`` / ``v >> s``:
+
+      * SHL by ``s`` = **multiply by the power of two** ``2**s`` then take the
+        **modulus by floor** for 8-bit overflow: ``(v * 2**s) mod 256`` where
+        ``x mod m = x - m*floor(x/m)`` (§555 MAGIC floor / §560 bit-range
+        extraction — a floor then a mod by a power of two).
+      * SHR by ``s`` = **floor-divide by the power of two**: ``floor(v / 2**s)``.
+
+    The powers of two are taken from ONE derived table (``2**s`` for
+    ``s in 0..7``) rather than a per-shift hand-typed constant, and the byte
+    truncation is the generic mod-by-floor primitive rather than a per-op
+    ``& 0xFF`` mask — so the derivation has ZERO per-op magic constants
+    (see :mod:`shift_semantics_dsl`).
+
+    The derived formula equals the hand-authored bit-op for EVERY ``(v, s)``
+    with ``v in 0..255``, ``s in 0..7`` (proven exhaustively in
+    ``shift_semantics_dsl._SPEC_MATCHES_BITOPS`` and by the whole-model golden
+    hash held under ``C4_DERIVE_SHIFT=1``), so the L13 shifts FFN (SHL + SHR,
+    4096 lookup units) is reproduced BYTE-FOR-BYTE. Default ON => the derived
+    powers-of-two + mod-by-floor path is the golden build (the hand-authored
+    ``(v << s) & 0xFF`` / ``v >> s`` lambdas have been deleted;
+    ``C4_DERIVE_SHIFT=0`` is a legacy no-op kill-switch for cache-key isolation).
+    """
+    return os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
+
+
+def derive_cmp_enabled() -> bool:
+    """Flag for the COMPARISON family derived from ONE zero-detector (task
+    #446). DEFAULT ON.
+
+    When ``C4_DERIVE_CMP=1`` the six comparison opcodes' L10 decode banks
+    (both the ``ComparisonCombine`` decode-row path
+    ``_l10_comparison_combine_rules`` and the L10-main ALU cmp lane
+    ``_layer10_alu_cmp_combine_rules``) are re-expressed by the single DSL
+    generator :func:`building_blocks_dsl.derived_comparison_rules`, which
+    realizes BLOG_SPEC §576-590 literally: all of EQ/NE/LT/GT/LE/GE reduce to
+    ONE zero-detector primitive ``Z(d)`` (the §510 +1/-2/+1 second-difference,
+    computed per nibble by the upstream L9 comparator as the CMP equality/less
+    flags) plus its sign. Two derived combinators ``A_EQ_B := HI_EQ ∧ LO_EQ``
+    and ``A_LT_B := HI_LT ∨ (HI_EQ ∧ LO_LT)`` are built once, and every opcode
+    is then pure boolean algebra over them (EQ=A_EQ_B, NE=¬A_EQ_B, LT=A_LT_B,
+    GT=¬A_LT_B∧¬A_EQ_B, LE=A_LT_B∨A_EQ_B, GE=¬A_LT_B) — ZERO per-op magic
+    constants, replacing the hand-authored per-op default+override
+    enumeration.
+
+    The derivation reproduces the hand-authored 18-unit banks byte-for-byte
+    when passed the golden structural constants (proof:
+    ``tools/verify_derive_cmp.py`` — the whole-model golden hash is UNCHANGED
+    under this flag). Default ON => the single-zero-detector derivation is the
+    golden build (the per-op default+override hand-enumeration in both banks has
+    been deleted; ``C4_DERIVE_CMP=0`` is now a legacy no-op kill-switch, since
+    either value is byte-identical). This is a pure architecture/derivation-
+    provenance flip, not a behavior change.
+
+    Registered in BOTH cache-key snapshots in
+    ``full_vm_compiler_dynamic.py`` for cache-key isolation.
+    """
+    return os.environ.get("C4_DERIVE_CMP", "1") != "0"
+
+
 def mul_width2_enabled() -> bool:
     """Return True iff the width=2 (16-bit) MUL path is active (DEFAULT ON).
 

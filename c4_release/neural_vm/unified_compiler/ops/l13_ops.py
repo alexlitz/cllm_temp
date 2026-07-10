@@ -20,8 +20,10 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (
     _as_setdim_proxy,
     _empty_compiler_ir_factory,
+    derive_shift_enabled,
     operand_from_memsp_enabled,
 )
+from ..shift_semantics_dsl import shl_result, shr_result
 
 
 # === L13 attention-head layout (pinned indices) =====================
@@ -259,10 +261,19 @@ def _layer13_shl_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 7.E.3: the gate ref uses :func:`dim_ref` for the
     ``(opcode_flag, SHL)`` semantic pair.
+
+    Task #448: the per-``(value, shift)`` result is DERIVED from the BLOG_SPEC
+    §599 "multiply by a power of two, then mod by floor" recipe
+    (:func:`shift_semantics_dsl.shl_result`). The derived value equals the
+    former hand-authored ``(v << s) & 0xFF`` bit-op for every ``(v, s)`` (proven
+    exhaustively / golden hash e50521f3), so that enumerated bit-op has been
+    DELETED and the derivation is the sole source. ``C4_DERIVE_SHIFT`` remains a
+    registered no-op kill-switch for cache-key isolation.
     """
+    _ = derive_shift_enabled()  # keep the flag live for cache-key isolation
     return _layer13_shifts_substage_rules(
         "OP_SHL",
-        lambda v, s: (v << s) & 0xFF,
+        shl_result,
         name_prefix="l13_shl",
         S=S,
         gate=dim_ref("opcode_flag", "SHL"),
@@ -274,10 +285,18 @@ def _layer13_shr_rules(S: float) -> tuple[FFNRule, ...]:
 
     Phase 7.E.3: the gate ref uses :func:`dim_ref` for the
     ``(opcode_flag, SHR)`` semantic pair.
+
+    Task #448: the per-``(value, shift)`` result is DERIVED from the BLOG_SPEC
+    §599/§555 "floor-divide by a power of two" recipe
+    (:func:`shift_semantics_dsl.shr_result`). Byte-identical to the former
+    hand-authored ``v >> s`` bit-op for every ``(v, s)`` (golden hash e50521f3),
+    so that enumerated bit-op has been DELETED and the derivation is the sole
+    source. ``C4_DERIVE_SHIFT`` remains a registered no-op kill-switch.
     """
+    _ = derive_shift_enabled()  # keep the flag live for cache-key isolation
     return _layer13_shifts_substage_rules(
         "OP_SHR",
-        lambda v, s: (v >> s) & 0xFF,
+        shr_result,
         name_prefix="l13_shr",
         S=S,
         gate=dim_ref("opcode_flag", "SHR"),

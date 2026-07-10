@@ -1251,6 +1251,7 @@ from ...ffn_unit_allocator import FFNUnitAllocator
 from ..building_blocks_dsl import (
     byte_copy_computed_rules,
     byte_route_rules,
+    derived_comparison_rules,
     multi_way_and_rule,
 )
 from ..ir import CompilerIR, ConditionTerm, DimRef, FFNRule, StructuralOp
@@ -1981,6 +1982,63 @@ def _build_l10_carry_post_op(
     return post_op
 
 
+# The six comparison opcodes, in the canonical L10 cmp-combine bank order.
+_CMP_OPS_ORDER = ("EQ", "NE", "LT", "GT", "LE", "GE")
+# The (HI_EQ ∧ LO_LT) lexicographic product term that gets the campaign guard
+# threshold on GT / GE (see ``cmp_gt_lo_lt_hieq_guard_enabled``).
+_CMP_HI_EQ_LO_LT_TERM = ("CMP+1", "CMP+3")
+
+
+def _derived_cmp_combine_rules(
+    S: float,
+    *,
+    opcode_gate_fmt: str,
+    default_threshold: float,
+    override3_threshold: float,
+    override_include_blocker: bool,
+    name_prefix_fmt: str,
+    gt_ge_guard_threshold: float,
+) -> tuple[FFNRule, ...]:
+    """Derive all six comparison decoders from ONE zero-detector (task #446).
+
+    Shared body for the two hand-authored cmp-combine banks
+    (``_l10_comparison_combine_rules`` decode path and
+    ``_layer10_alu_cmp_combine_rules`` L10-main ALU lane), selected by
+    ``C4_DERIVE_CMP``. Both are the SAME §576-590 truth table over the CMP
+    zero-detector/sign flags; the per-path DATA (gate spelling, thresholds,
+    whether overrides carry the MARK_PC blocker) is entirely in the kwargs,
+    matching the corresponding hand path byte-for-byte. Emits 18 units (one
+    default + one-to-three overrides per op) in ``_CMP_OPS_ORDER``.
+    """
+    rules: list[FFNRule] = []
+    for op in _CMP_OPS_ORDER:
+        thr_override = (
+            {_CMP_HI_EQ_LO_LT_TERM: gt_ge_guard_threshold}
+            if op in ("GT", "GE") else {}
+        )
+        rules.extend(derived_comparison_rules(
+            op=op,
+            marker_dim="MARK_SE_ONLY",
+            opcode_gate=opcode_gate_fmt.format(op=op),
+            result_lo_band="OUTPUT_LO",
+            default_write=(("OUTPUT_HI_THIS_STEP+0", 2.0),),
+            blocker_dim="MARK_PC",
+            blocker_weight=-50.0,
+            default_threshold=default_threshold,
+            override2_threshold=1.5,
+            override3_threshold=override3_threshold,
+            override3_hi_lt_blocker_weight=-0.1,
+            default_write_value=2.0,
+            override_write_value=4.0,
+            scope_prefix="MARK_SE_ONLY",
+            name_prefix=name_prefix_fmt.format(op=op.lower()),
+            override3_threshold_override=thr_override,
+            override_include_blocker=override_include_blocker,
+            S=S,
+        ))
+    return tuple(rules)
+
+
 def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """Declarative rules for ``ComparisonCombine`` (18 units).
 
@@ -2022,148 +2080,29 @@ def _l10_comparison_combine_rules(S: float) -> tuple[FFNRule, ...]:
         2.75 if cmp_gt_lo_lt_hieq_guard_enabled() else 2.5
     )
 
-    def cmp_default(op_name: str, default_result: int, *, idx: int) -> FFNRule:
-        # DSL v4b: 3-condition AND with explicit threshold 1.5; MARK_PC
-        # blocker uses negative weight. constant_write style (no gate).
-        #
-        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY. Wave A's
-        # ``step_end_operand_relay`` (commit 10ca51a7) broadcasts CMP /
-        # OP_<cmp> from MARK_AX into MARK_SE_ONLY within the same step,
-        # so the rule fires one row later byte-identically. MARK_PC
-        # blocker retained for structural symmetry (zero at STEP_END).
-        return multi_way_and_rule(
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                (op_name, 1.0),
-                ("MARK_PC", MARK_PC_BLOCK),
-            ),
-            threshold=1.5,
-            writes=(
-                (f"OUTPUT_LO+{default_result}", 2.0 / S),
-                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
-            ),
-            name=f"l10_cmp_default_{op_name.lower()}_{idx}_step_end",
-            scope=f"MARK_SE_ONLY and {op_name} and not MARK_PC",
-        )
-
-    def cmp_override_2way(
-        op_name: str, cmp_name: str, to_result: int, from_result: int,
-        *, idx: int,
-    ) -> FFNRule:
-        # DSL v4b: 3-condition AND (MARK_AX + CMP cell + MARK_PC blocker)
-        # gated on the opcode flag.
-        #
-        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
-        # Wave A step_end_operand_relay (10ca51a7).
-        return multi_way_and_rule(
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                (cmp_name, 1.0),
-                ("MARK_PC", MARK_PC_BLOCK),
-            ),
-            threshold=1.5,
-            gate=op_name,
-            gate_weight=1.0,
-            writes=(
-                (f"OUTPUT_LO+{to_result}", 4.0 / S),
-                (f"OUTPUT_LO+{from_result}", -4.0 / S),
-            ),
-            name=f"l10_cmp_override2_{op_name.lower()}_{idx}_step_end",
-            scope=f"MARK_SE_ONLY and {op_name} and {cmp_name} and not MARK_PC",
-        )
-
-    def cmp_override_3way(
-        op_name: str, cmp_name1: str, cmp_name2: str,
-        to_result: int, from_result: int, *, idx: int,
-        threshold: float = 2.5,
-    ) -> FFNRule:
-        # DSL v4b: 4-condition AND (MARK_AX + 2 CMP cells + MARK_PC
-        # blocker) with explicit threshold 2.5 (2.75 for the campaign-gated
-        # GT/GE (hi_eq AND lo_lt) override -- see
-        # ``cmp_gt_lo_lt_hieq_guard_enabled``), gated on opcode.
-        #
-        # Shape B CMP fix (2026-06-07, removal-4): add CMP+0 blocker at
-        # weight -0.1 to suppress this override when hi_lt is hot. The
-        # Shape B EQ/NE step's neural residual amplifies CMP+1
-        # (hi_eq) to ~10 because L9 hi_eq_k fires spuriously when
-        # ALU_HI+0 (residual at ~6 from the zero-nibble representation)
-        # and AX_CARRY_HI+0 (~0.3) both register as positive. Without
-        # this blocker, CMP+1 alone clears the additive 2.5 threshold,
-        # firing the EQ/NE override on Shape B (test_eq_false +
-        # test_ne_true). With CMP+0 amplified to ~150 (true hi_lt) the
-        # blocker contributes -15 to the score, suppressing the rule.
-        # Semantically clean: when hi_lt is true the operands are not
-        # equal at the high nibble, so any CMP override that asserts
-        # equality (via CMP+1=hi_eq AND CMP+2=lo_eq or CMP+1=hi_eq AND
-        # CMP+3=lo_lt) must not fire. Same justification holds for the
-        # LT/GT/LE/GE 3way overrides that gate on CMP+1: hi_eq cannot
-        # be true when hi_lt is true. The 2way overrides on CMP+0 are
-        # left untouched (they ARE the hi_lt path).
-        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
-        # Wave A step_end_operand_relay (10ca51a7).
-        return multi_way_and_rule(
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                (cmp_name1, 1.0),
-                (cmp_name2, 1.0),
-                ("MARK_PC", MARK_PC_BLOCK),
-                ("CMP+0", -0.1),
-            ),
-            threshold=threshold,
-            gate=op_name,
-            gate_weight=1.0,
-            writes=(
-                (f"OUTPUT_LO+{to_result}", 4.0 / S),
-                (f"OUTPUT_LO+{from_result}", -4.0 / S),
-            ),
-            name=f"l10_cmp_override3_{op_name.lower()}_{idx}_step_end",
-            scope=(
-                f"MARK_SE_ONLY and {op_name} and {cmp_name1} and "
-                f"{cmp_name2} and not MARK_PC"
-            ),
-        )
-
     rules: list[FFNRule] = []
 
-    # EQ: default 0, override (CMP+1,CMP+2 -> 1)
-    rules.append(cmp_default("OP_EQ", 0, idx=0))
-    rules.append(cmp_override_3way("OP_EQ", "CMP+1", "CMP+2", 1, 0, idx=1))
-
-    # NE: default 1, override (CMP+1,CMP+2 -> 0)
-    rules.append(cmp_default("OP_NE", 1, idx=2))
-    rules.append(cmp_override_3way("OP_NE", "CMP+1", "CMP+2", 0, 1, idx=3))
-
-    # LT: default 0, override CMP+0 -> 1, override (CMP+1,CMP+3 -> 1)
-    rules.append(cmp_default("OP_LT", 0, idx=4))
-    rules.append(cmp_override_2way("OP_LT", "CMP+0", 1, 0, idx=5))
-    rules.append(cmp_override_3way("OP_LT", "CMP+1", "CMP+3", 1, 0, idx=6))
-
-    # GT: default 1, override CMP+0 -> 0, two 3-way overrides -> 0
-    rules.append(cmp_default("OP_GT", 1, idx=7))
-    rules.append(cmp_override_2way("OP_GT", "CMP+0", 0, 1, idx=8))
-    # idx=9 (hi_eq AND lo_lt): campaign-gated 2.75 threshold rejects the
-    # spurious lo_lt-alone trip on the loaded-var GT-TRUE path (if_var 425/436/
-    # 440/441/445/448). See ``cmp_gt_lo_lt_hieq_guard_enabled``.
-    rules.append(cmp_override_3way(
-        "OP_GT", "CMP+1", "CMP+3", 0, 1, idx=9,
-        threshold=_gt_gtge_3way_thresh,
-    ))
-    rules.append(cmp_override_3way("OP_GT", "CMP+1", "CMP+2", 0, 1, idx=10))
-
-    # LE: default 0, override CMP+0 -> 1, two 3-way overrides -> 1
-    rules.append(cmp_default("OP_LE", 0, idx=11))
-    rules.append(cmp_override_2way("OP_LE", "CMP+0", 1, 0, idx=12))
-    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+3", 1, 0, idx=13))
-    rules.append(cmp_override_3way("OP_LE", "CMP+1", "CMP+2", 1, 0, idx=14))
-
-    # GE: default 1, override CMP+0 -> 0, override (CMP+1,CMP+3 -> 0)
-    rules.append(cmp_default("OP_GE", 1, idx=15))
-    rules.append(cmp_override_2way("OP_GE", "CMP+0", 0, 1, idx=16))
-    # idx=17 (hi_eq AND lo_lt): symmetric campaign-gated 2.75 threshold so the
-    # loaded-var GE result is not flipped to 0 by a spurious lo_lt alone.
-    rules.append(cmp_override_3way(
-        "OP_GE", "CMP+1", "CMP+3", 0, 1, idx=17,
-        threshold=_gt_gtge_3way_thresh,
+    # C4_DERIVE_CMP (task #446): the 18 core comparison units are the §576-590
+    # truth table over the CMP zero-detector/sign flags, generated from the
+    # single ``derived_comparison_rules`` DSL (via ``_derived_cmp_combine_rules``)
+    # — two combinators ``A_EQ_B := HI_EQ ∧ LO_EQ`` / ``A_LT_B := HI_LT ∨
+    # (HI_EQ ∧ LO_LT)`` and pure boolean algebra over them, ZERO per-op magic.
+    # The former per-op default+override hand-enumeration (and its nested
+    # ``cmp_default`` / ``cmp_override_2way`` / ``cmp_override_3way`` helpers)
+    # was proven byte-identical to this derivation (golden e50521f3;
+    # tools/verify_derive_cmp.py 18/18) and has been DELETED — the derivation is
+    # the sole source. ``C4_DERIVE_CMP`` remains a registered no-op kill-switch
+    # for cache-key isolation. The margin-clamp bank appended below is orthogonal.
+    from .shared import derive_cmp_enabled
+    _ = derive_cmp_enabled()  # keep the flag live for cache-key isolation
+    rules.extend(_derived_cmp_combine_rules(
+        S,
+        opcode_gate_fmt="OP_{op}",
+        default_threshold=1.5,
+        override3_threshold=2.5,
+        override_include_blocker=True,
+        name_prefix_fmt="l10_cmp_{op}",
+        gt_ge_guard_threshold=_gt_gtge_3way_thresh,
     ))
 
     # C4_CMP_COMBINE_MARGIN (campaign-only, default-OFF): +6 OUTPUT_HI clamp
@@ -2309,154 +2248,38 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
 def _layer10_alu_cmp_combine_rules(S: float) -> tuple[FFNRule, ...]:
     """L10 cmp_combine rules: 18 units for EQ/NE/LT/GT/LE/GE.
 
-    Mirrors the ``_cmp_default`` / ``_cmp_override_2way`` /
-    ``_cmp_override_3way`` helpers in ``vm_step._set_layer10_alu``.
-
-    Each comparison opcode has one default unit (writes a baseline 0 or
-    1 result + an OUTPUT_HI[0]=1 marker, ungated via ``b_gate=1.0``)
-    followed by 1-3 override units (each gated on the OP_* dim,
-    flipping the result via a +4.0/S / -4.0/S pair on OUTPUT_LO) that
-    fire on CMP-flag combinations from L9.
+    Derived from the single BLOG_SPEC §576-590 zero-detector/sign primitive via
+    ``_derived_cmp_combine_rules`` (task #446, C4_DERIVE_CMP). Each comparison
+    opcode still emits one default unit (writes a baseline 0 or 1 result +
+    an OUTPUT_HI[0]=1 marker, ungated via ``b_gate=1.0``) followed by 1-3
+    override units (each gated on the SE_OP_* dim, flipping the result via a
+    +4.0/S / -4.0/S pair on OUTPUT_LO) that fire on CMP-flag combinations from
+    L9 — but those 18 units now fall out of ONE truth table over the two
+    combinators ``A_EQ_B``/``A_LT_B`` rather than a per-op hand-enumeration
+    (which was byte-identical, golden e50521f3, and has been deleted).
     """
 
-    def _cmp_default(op_name: str, default_result: int) -> FFNRule:
-        # DSL v4b: 3-condition AND with explicit threshold 2.5 and a
-        # negative MARK_PC blocker (-50). multi_way_and_rule with
-        # gate=None lowers via constant_write (gate_bias=1.0).
-        #
-        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY. Wave A
-        # ``step_end_operand_relay`` (10ca51a7) broadcasts CMP /
-        # OP_<cmp> from MARK_AX into MARK_SE_ONLY in the same step.
-        return multi_way_and_rule(
-            name=f"l10_cmp_{op_name.lower()}_default_step_end",
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                # Wave B Phase 2.2 (2026-06-12): raw OP_<NAME> -> SE_OP_<NAME>.
-                # This SE-row default reads the relayed opcode flag (the L9
-                # step_end_operand_relay now mirrors OP_<cmp> -> SE_OP_<cmp>
-                # AND transmits across the AX->SE gap after the slope fix in
-                # make_layer9_se_relay_slope_op). Raw OP_<NAME> is cold at
-                # MARK_SE_ONLY; SE_OP_<NAME> carries the same flag at the SE
-                # row. The MARK_AX ordering engine still drives the live
-                # decode this phase (Wall 4 / Phase 3), so this SE-row write
-                # is parallel/additive, not the decode source.
-                (f"SE_OP_{op_name}", 1.0),
-                # MARK_PC blocker: mirror the parallel rule at line 518
-                # which has MARK_PC_BLOCK=-50 to prevent the default from
-                # firing at positions where MARK_PC leaks into MARK_AX.
-                # Without this, OUTPUT_LO+default_result clobbers legitimate
-                # AX_byte0 writes on pure-IMM steps. See IF_EQ_CMP_DEFAULT_LEAK.md.
-                # Wave B: blocker preserved (zero at STEP_END, inert).
-                ("MARK_PC", -50.0),
-            ),
-            threshold=2.5,
-            writes=(
-                (f"OUTPUT_LO+{default_result}", 2.0 / S),
-                ("OUTPUT_HI_THIS_STEP+0", 2.0 / S),
-            ),
-        )
-
-    def _cmp_override_2way(
-        op_name: str, cmp_idx: int, to_result: int, from_result: int,
-        suffix: str,
-    ) -> FFNRule:
-        # DSL v4b: 2-condition balanced AND (MARK_AX + CMP+i, both 1.0)
-        # with threshold 1.5; OP_<NAME> gate via (opcode_flag, NAME).
-        #
-        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
-        # Wave A step_end_operand_relay (10ca51a7).
-        return multi_way_and_rule(
-            name=f"l10_cmp_{op_name.lower()}_override2_{suffix}_step_end",
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                # The CMP cascade is computed FRESH at the SE row by the
-                # L9 CMP rules (_layer9_cmp_rules, which read the relayed
-                # SE_ALU/SE_AX_CARRY operands), so the override reads the
-                # raw CMP cascade at MARK_SE_ONLY directly -- it is hot
-                # here (not at MARK_AX). The SE_CMP relay mirror would be
-                # cold (it mirrors AX-row CMP, which is empty this step).
-                (f"CMP+{cmp_idx}", 1.0),
-            ),
-            threshold=1.5,
-            # Wave B Phase 2.2 (2026-06-12): gate on the relayed
-            # SE_OP_<NAME> dispatch flag (raw OP_<NAME> is cold at the SE
-            # row; the L9 relay mirrors the opcode flag to SE_OP_<NAME>).
-            gate=f"SE_OP_{op_name}+0",
-            gate_weight=1.0,
-            writes=(
-                (f"OUTPUT_LO+{to_result}", 4.0 / S),
-                (f"OUTPUT_LO+{from_result}", -4.0 / S),
-            ),
-        )
-
-    def _cmp_override_3way(
-        op_name: str, cmp_idx1: int, cmp_idx2: int,
-        to_result: int, from_result: int, suffix: str,
-    ) -> FFNRule:
-        # DSL v4b: 3-condition AND (MARK_AX + 2 CMP cells, all 1.0) with
-        # explicit threshold 4.0 (the legacy bake's "all three must be
-        # present" gate). multi_way_and_rule with explicit threshold
-        # passes through unchanged.
-        #
-        # Shape B CMP fix (2026-06-07, removal-4): add CMP+0 blocker
-        # at weight -0.1 to suppress this override when hi_lt is hot
-        # (operands not equal at hi nibble). See the parallel rule in
-        # ``_l10_comparison_combine_rules.cmp_override_3way`` for the
-        # detailed rationale. The same Shape B residual amplification
-        # of CMP+1 (~10) fires this rule via the additive structure
-        # (1 + 10.587 + 0 = 11.587 >= 4.0) even when CMP+2 is zero.
-        # With CMP+0 amplified to ~150 (true hi_lt), the -0.1 blocker
-        # contributes -15 to the score, dropping it below 4.0.
-        # Wave B Cluster 1 (2026-06-10): MARK_AX -> MARK_SE_ONLY under
-        # Wave A step_end_operand_relay (10ca51a7).
-        return multi_way_and_rule(
-            name=f"l10_cmp_{op_name.lower()}_override3_{suffix}_step_end",
-            conditions=(
-                ("MARK_SE_ONLY", 1.0),
-                # Raw CMP cascade computed fresh at the SE row by the L9
-                # CMP rules (see override2 note); read it directly here.
-                (f"CMP+{cmp_idx1}", 1.0),
-                (f"CMP+{cmp_idx2}", 1.0),
-                ("CMP+0", -0.1),
-            ),
-            threshold=4.0,
-            # Wave B Phase 2.2 (2026-06-12): gate on the relayed
-            # SE_OP_<NAME> dispatch flag.
-            gate=f"SE_OP_{op_name}+0",
-            gate_weight=1.0,
-            writes=(
-                (f"OUTPUT_LO+{to_result}", 4.0 / S),
-                (f"OUTPUT_LO+{from_result}", -4.0 / S),
-            ),
-        )
-
-    return (
-        # EQ: default=0, override to 1 when hi_eq AND lo_eq.
-        _cmp_default("EQ", 0),
-        _cmp_override_3way("EQ", 1, 2, 1, 0, "hi_eq_lo_eq"),
-        # NE: default=1, override to 0 when hi_eq AND lo_eq.
-        _cmp_default("NE", 1),
-        _cmp_override_3way("NE", 1, 2, 0, 1, "hi_eq_lo_eq"),
-        # LT: default=0, override to 1 on hi_lt OR (hi_eq AND lo_lt).
-        _cmp_default("LT", 0),
-        _cmp_override_2way("LT", 0, 1, 0, "hi_lt"),
-        _cmp_override_3way("LT", 1, 3, 1, 0, "hi_eq_lo_lt"),
-        # GT: default=1, override to 0 on hi_lt / (hi_eq AND lo_lt) /
-        # (hi_eq AND lo_eq).
-        _cmp_default("GT", 1),
-        _cmp_override_2way("GT", 0, 0, 1, "hi_lt"),
-        _cmp_override_3way("GT", 1, 3, 0, 1, "hi_eq_lo_lt"),
-        _cmp_override_3way("GT", 1, 2, 0, 1, "hi_eq_lo_eq"),
-        # LE: default=0, override to 1 on hi_lt / (hi_eq AND lo_lt) /
-        # (hi_eq AND lo_eq).
-        _cmp_default("LE", 0),
-        _cmp_override_2way("LE", 0, 1, 0, "hi_lt"),
-        _cmp_override_3way("LE", 1, 3, 1, 0, "hi_eq_lo_lt"),
-        _cmp_override_3way("LE", 1, 2, 1, 0, "hi_eq_lo_eq"),
-        # GE: default=1, override to 0 on hi_lt / (hi_eq AND lo_lt).
-        _cmp_default("GE", 1),
-        _cmp_override_2way("GE", 0, 0, 1, "hi_lt"),
-        _cmp_override_3way("GE", 1, 3, 0, 1, "hi_eq_lo_lt"),
+    # C4_DERIVE_CMP (task #446): this L10-main ALU cmp lane is generated from
+    # the single ``derived_comparison_rules`` DSL (via
+    # ``_derived_cmp_combine_rules``) — the same §576-590 zero-detector/sign
+    # truth table as the decode-row bank, with this path's structural constants
+    # (SE_OP gate, default threshold 2.5, override3 threshold 4.0, overrides omit
+    # the MARK_PC blocker). The former per-op default+override hand-enumeration
+    # (and its nested ``_cmp_default`` / ``_cmp_override_2way`` /
+    # ``_cmp_override_3way`` helpers) was proven byte-identical to this
+    # derivation (golden e50521f3; tools/verify_derive_cmp.py 18/18) and has been
+    # DELETED — the derivation is the sole source. ``C4_DERIVE_CMP`` remains a
+    # registered no-op kill-switch for cache-key isolation.
+    from .shared import derive_cmp_enabled
+    _ = derive_cmp_enabled()  # keep the flag live for cache-key isolation
+    return _derived_cmp_combine_rules(
+        S,
+        opcode_gate_fmt="SE_OP_{op}+0",
+        default_threshold=2.5,
+        override3_threshold=4.0,
+        override_include_blocker=False,
+        name_prefix_fmt="l10_alu_cmp_{op}",
+        gt_ge_guard_threshold=4.0,
     )
 
 

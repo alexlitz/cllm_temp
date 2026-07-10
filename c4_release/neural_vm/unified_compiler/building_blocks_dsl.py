@@ -400,6 +400,227 @@ def multi_way_or_rules(
 
 
 # ===========================================================================
+# §576-590 — Comparison family from ONE zero-detector primitive
+# ===========================================================================
+#
+# BLOG_SPEC §576-590: EQ, NE, LT, GT, LE, GE all reduce to a single
+# zero-detector primitive ``Z(d)`` (three SiLU nodes, +1/-2/+1 second
+# difference) applied to a difference, plus the SIGN of that difference:
+#
+#   EQ(a,b) = Z(a-b)                 NE(a,b) = ¬Z(a-b)
+#   LT(a,b) = sign(a-b) < 0          GT(a,b) = sign(a-b) > 0
+#   LE(a,b) = LT ∨ EQ                GE(a,b) = GT ∨ EQ
+#
+# In the c4-release codebase the zero-detector and sign are already computed
+# per 4-bit nibble by the upstream L9 nibble comparator
+# (``wide_alu_dsl.nibble_compare_lane_rules``): ``mode="equal"`` IS the
+# discrete zero-detector Z(a_nib - b_nib) (§510 one-hot indicator form of the
+# +1/-2/+1 bump), and ``mode="less_than"`` IS the sign(a_nib - b_nib) < 0
+# primitive. They land as the four CMP condition-flag cells:
+#
+#   HI_EQ = Z(A.hi - B.hi)   HI_LT = sign(A.hi - B.hi) < 0
+#   LO_EQ = Z(A.lo - B.lo)   LO_LT = sign(A.lo - B.lo) < 0
+#
+# ``derived_comparison_rules`` is the DSL COMPOSITION that turns those four
+# primitive flags into the six opcode results. It builds TWO derived
+# combinators once — the whole-operand equality and less-than —
+#
+#   A_EQ_B := HI_EQ ∧ LO_EQ                  (the §576 zero-detector, packed
+#                                             two nibbles at a time per §590)
+#   A_LT_B := HI_LT ∨ (HI_EQ ∧ LO_LT)        (the §588 sign, lexicographic)
+#
+# and then expresses every opcode as pure boolean algebra over {A_EQ_B,
+# A_LT_B}: EQ=A_EQ_B, NE=¬A_EQ_B, LT=A_LT_B, GT=¬A_LT_B∧¬A_EQ_B,
+# LE=A_LT_B∨A_EQ_B, GE=¬A_LT_B. There are ZERO per-opcode magic constants:
+# the six results fall out of ONE truth table over the two combinators, which
+# in turn fall out of ONE zero-detector + one sign primitive. This is the
+# §576 claim ("all can be reduced to a single primitive") realized as code.
+#
+# Lowering: each boolean result is realized as a DEFAULT write (the value
+# when no override fires) plus one OVERRIDE unit per product-term that flips
+# the result — exactly the §510/§590 point-indicator + N-way-AND shape. An
+# AND of k flags is an ``multi_way_and_rule`` over those k CMP cells; an OR is
+# just several overrides driving the same result; a NOT is realized by
+# flipping which value is the default. The default/override write amplitudes
+# and the marker/opcode gate are structural (shared by all six ops, passed by
+# the caller), not per-op tuning.
+
+
+# The four upstream nibble-comparator primitive flags, in CMP-band order.
+# HI_LT=CMP+0, HI_EQ=CMP+1, LO_EQ=CMP+2, LO_LT=CMP+3 (see vm_step.py:701).
+_CMP_HI_LT = "CMP+0"
+_CMP_HI_EQ = "CMP+1"
+_CMP_LO_EQ = "CMP+2"
+_CMP_LO_LT = "CMP+3"
+
+# Whole-operand derived combinators as products (AND-terms) of primitive
+# flags. Each entry is a tuple of CMP flag dims that must ALL hold.
+#   A_EQ_B  <=>  HI_EQ ∧ LO_EQ                         (one product term)
+#   A_LT_B  <=>  HI_LT  ∨  (HI_EQ ∧ LO_LT)             (two product terms)
+_A_EQ_B_TERMS: Tuple[Tuple[str, ...], ...] = (
+    (_CMP_HI_EQ, _CMP_LO_EQ),
+)
+_A_LT_B_TERMS: Tuple[Tuple[str, ...], ...] = (
+    (_CMP_HI_LT,),
+    (_CMP_HI_EQ, _CMP_LO_LT),
+)
+
+
+def _cmp_result_terms(op: str) -> Tuple[int, Tuple[Tuple[str, ...], ...]]:
+    """Return ``(default_result, override_terms)`` for one comparison op.
+
+    ``default_result`` is the boolean value written when NO override fires;
+    ``override_terms`` is the list of product terms (each a tuple of CMP flag
+    dims AND-ed together) that, when any one holds, flips the result to
+    ``1 - default_result``. Derived purely from the two combinators
+    ``A_EQ_B`` / ``A_LT_B`` (which are themselves the zero-detector + sign),
+    NOT hand-enumerated per op:
+
+      * EQ = A_EQ_B                -> default 0, override→1 on A_EQ_B's terms
+      * NE = ¬A_EQ_B               -> default 1, override→0 on A_EQ_B's terms
+      * LT = A_LT_B                -> default 0, override→1 on A_LT_B's terms
+      * GT = ¬A_LT_B ∧ ¬A_EQ_B     -> default 1, override→0 on (A_LT_B ∪ A_EQ_B)
+      * LE = A_LT_B ∨ A_EQ_B       -> default 0, override→1 on (A_LT_B ∪ A_EQ_B)
+      * GE = ¬A_LT_B               -> default 1, override→0 on A_LT_B's terms
+    """
+    if op == "EQ":
+        return 0, _A_EQ_B_TERMS
+    if op == "NE":
+        return 1, _A_EQ_B_TERMS
+    if op == "LT":
+        return 0, _A_LT_B_TERMS
+    if op == "GE":
+        return 1, _A_LT_B_TERMS
+    if op == "LE":
+        return 0, _A_LT_B_TERMS + _A_EQ_B_TERMS
+    if op == "GT":
+        return 1, _A_LT_B_TERMS + _A_EQ_B_TERMS
+    raise ValueError(f"derived_comparison_rules: unknown op {op!r}")
+
+
+def derived_comparison_rules(
+    *,
+    op: str,
+    marker_dim: str,
+    opcode_gate: str,
+    result_lo_band: str,
+    default_write: Sequence[Tuple[str, float]],
+    blocker_dim: str,
+    blocker_weight: float,
+    default_threshold: float,
+    override2_threshold: float,
+    override3_threshold: float,
+    override3_hi_lt_blocker_weight: float,
+    default_write_value: float,
+    override_write_value: float,
+    scope_prefix: str,
+    name_prefix: str,
+    override3_threshold_override: Mapping[Tuple[str, ...], float] = (),
+    override_include_blocker: bool = True,
+    S: float = 100.0,
+) -> Tuple[FFNRule, ...]:
+    """Derive ONE comparison opcode's decoder from the zero-detector flags.
+
+    Emits the DEFAULT write unit + one OVERRIDE unit per product term for
+    ``op`` (see :func:`_cmp_result_terms`). Every override is a
+    ``multi_way_and_rule`` over the term's CMP flag cells at the marker row,
+    gated on ``opcode_gate``; a single-flag term (``HI_LT``) lowers to a
+    2-way AND, a two-flag term (``HI_EQ ∧ LO_EQ`` / ``HI_EQ ∧ LO_LT``) to a
+    3-way AND with the §-noted ``HI_LT`` NOT-blocker (equality/lexicographic
+    terms cannot hold when the high nibble already decided ``<``).
+
+    The override result direction is uniform per op: it flips the default, so
+    ``override_write_pos`` receives ``+override_write_value`` and
+    ``override_write_neg`` receives ``-override_write_value`` (the two
+    ``OUTPUT_LO`` result cells). ALL amplitudes / thresholds / gates are
+    caller-supplied structural constants shared by all six ops — no per-op
+    magic. Result is byte-identical to the hand-authored enumeration when the
+    caller passes the golden structural constants.
+
+    Args:
+        op: one of EQ/NE/LT/GT/LE/GE.
+        marker_dim: the decode-row marker (e.g. ``MARK_SE_ONLY``).
+        opcode_gate: the (relayed) opcode-dispatch flag for this op.
+        result_lo_band: base of the 2-cell one-hot result (``OUTPUT_LO``).
+            The override always drives ``result_lo_band+(1-default)`` up and
+            ``result_lo_band+default`` down (flip the default).
+        default_write: extra writes on the default unit (e.g. the OUTPUT_HI
+            zero reinforcement) as ``(dim, weight)`` at raw amplitude / S.
+        blocker_dim / blocker_weight: the marker-row NOT-blocker (MARK_PC).
+        default_threshold: AND threshold for the default (marker+opcode).
+        override2_threshold / override3_threshold: AND thresholds for the
+            single-flag / two-flag overrides.
+        override3_hi_lt_blocker_weight: the small negative ``HI_LT`` blocker
+            on the two-flag overrides (Shape-B suppression).
+        default_write_value / override_write_value: raw write amplitudes
+            (lowered / S).
+        scope_prefix / name_prefix: diagnostics tags.
+        override3_threshold_override: optional per-term threshold override
+            (maps a product term to its threshold), for the campaign-gated
+            GT/GE ``(HI_EQ ∧ LO_LT)`` guard.
+        override_include_blocker: whether the OVERRIDE units also carry the
+            ``blocker_dim`` NOT-blocker (True for the ComparisonCombine decode
+            path, False for the L10-main ALU cmp lane whose overrides omit it).
+        S: SwiGLU scale.
+
+    Returns:
+        ``tuple[FFNRule, ...]``: one default unit + one unit per override
+        term.
+    """
+    default_result, override_terms = _cmp_result_terms(op)
+    thr_override = dict(override3_threshold_override)
+
+    rules: list[FFNRule] = []
+    # --- Default unit: constant write of the no-override result. ---
+    rules.append(multi_way_and_rule(
+        name=f"{name_prefix}_default",
+        conditions=(
+            (marker_dim, 1.0),
+            (opcode_gate, 1.0),
+            (blocker_dim, blocker_weight),
+        ),
+        threshold=default_threshold,
+        writes=(
+            (f"{result_lo_band}+{default_result}", default_write_value / S),
+            *tuple((d, w / S) for d, w in default_write),
+        ),
+        scope=f"{scope_prefix} and {op} default",
+    ))
+
+    # --- Override units: one N-way AND per product term, flipping result. ---
+    # An override drives the result to ``1 - default_result``: the "to" cell
+    # (the flipped value) up, the "from" cell (the default) down.
+    pos_cell = f"{result_lo_band}+{1 - default_result}"
+    neg_cell = f"{result_lo_band}+{default_result}"
+    for term in override_terms:
+        conds: list[Tuple[str, float]] = [(marker_dim, 1.0)]
+        conds += [(flag, 1.0) for flag in term]
+        if override_include_blocker:
+            conds.append((blocker_dim, blocker_weight))
+        if len(term) == 1:
+            threshold = override2_threshold
+        else:
+            # Two-flag (equality / lexicographic) term: add the HI_LT
+            # NOT-blocker and use the 3-way threshold (or a per-term override
+            # for the campaign GT/GE lo_lt guard).
+            conds.append((_CMP_HI_LT, override3_hi_lt_blocker_weight))
+            threshold = thr_override.get(term, override3_threshold)
+        rules.append(multi_way_and_rule(
+            name=f"{name_prefix}_override_{'_'.join(t.replace('+', '') for t in term)}",
+            conditions=tuple(conds),
+            threshold=threshold,
+            gate=opcode_gate,
+            gate_weight=1.0,
+            writes=(
+                (pos_cell, override_write_value / S),
+                (neg_cell, -override_write_value / S),
+            ),
+            scope=f"{scope_prefix} and {op} override {'/'.join(term)}",
+        ))
+    return tuple(rules)
+
+
+# ===========================================================================
 # §522 — Cancelling residuals
 # ===========================================================================
 
@@ -1664,6 +1885,7 @@ __all__ = [
     "band_range_check_rules",
     "multi_way_and_rule",
     "multi_way_or_rules",
+    "derived_comparison_rules",
     "cancel_residual_rule",
     "byte_clear_rules",
     "byte_route_rules",
