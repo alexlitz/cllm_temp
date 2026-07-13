@@ -77,7 +77,11 @@ from .layer_compiler import (
 from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
 from .ir import ModelArchitectureSpec
 from . import _legacy_redirect as _static
-from .ops.shared import operand_from_memsp_enabled, campaign_enabled
+from .ops.shared import (
+    operand_from_memsp_enabled,
+    campaign_enabled,
+    emit_g5_rbyte_enabled,
+)
 from ..kv_eviction import KVEvictionPolicy
 
 
@@ -2686,6 +2690,15 @@ def compile_full_vm_dynamic(
             # the ON / OFF builds MUST NEVER share a memo / disk entry. DEFAULT-OFF
             # -> golden (35-tok) build is byte-identical (key unchanged when unset).
             "C4_CAMPAIGN": campaign_enabled(),
+            # EMIT-G5 R-BYTE ``ax_bytes_zero`` fold verification toggle (DEFAULT
+            # OFF, opt in =1). BYTE-NEUTRAL: both states bake the identical
+            # weights (golden ``e50521f3``), but the flag routes the spec-driven
+            # generator through a SECOND independent code path (see
+            # l14_ops._make_ax_bytes_zero_op / ops.shared.emit_g5_rbyte_enabled).
+            # Keyed here so the ON / OFF builds never share a memo entry — a
+            # cross-state hit would silently skip the flag-ON path during the
+            # byte-identity golden check. See docs/EMIT_G5_ROLLOUT_2026_07_13.md.
+            "C4_EMIT_G5_RBYTE": emit_g5_rbyte_enabled(),
             # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt
             # out =0, BAKE-affecting): when active it appends a 32-unit PureFFN
             # post_op to the L25 tail block (the 6-way NEXT_* OUTPUT sink), so
@@ -3725,6 +3738,15 @@ def _bake_from_scheduled_ops(
         # share a serialised entry. DEFAULT-OFF -> golden (35-tok) build is
         # byte-identical (key unchanged when unset).
         "C4_CAMPAIGN": campaign_enabled(),
+        # EMIT-G5 R-BYTE ``ax_bytes_zero`` fold verification toggle (DEFAULT OFF,
+        # opt in =1). BYTE-NEUTRAL: both states bake the identical weights (golden
+        # ``e50521f3``), but the flag routes the spec-driven generator through a
+        # SECOND independent code path (see l14_ops._make_ax_bytes_zero_op /
+        # ops.shared.emit_g5_rbyte_enabled). Keyed here so the ON / OFF builds
+        # never share a serialised entry — a cross-state hit would silently skip
+        # the flag-ON path during the byte-identity golden check. See
+        # docs/EMIT_G5_ROLLOUT_2026_07_13.md.
+        "C4_EMIT_G5_RBYTE": emit_g5_rbyte_enabled(),
         # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt out
         # =0, BAKE-affecting): appends a 32-unit PureFFN post_op to the L25 tail
         # block, so the ON / OFF builds have different state_dicts and MUST NEVER
