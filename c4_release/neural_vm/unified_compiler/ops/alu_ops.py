@@ -964,103 +964,6 @@ def make_efficient_l8_addsub_wrap_op(alu_mode: str = 'lookup') -> Operation:
     )
 
 
-def make_loaded_operand_add_hi15_clear_op() -> Operation:
-    """Campaign loaded-operand ADD ALU cell-15 contaminant clear (var_update).
-
-    Wraps ``model.blocks[8].ffn`` (the L8 main FFN, physical block 11 — the
-    operand-delivery block where ``make_layer8_mem_to_alu_op`` head 5 writes
-    ALU_LO/HI from ``mem[SP]``) with :class:`LoadedOperandAddHi15ClearFFN`,
-    which zeros the spurious ``ALU_HI+15`` address-nibble leak on the ``OP_ADD``
-    MARK_AX rows so the var_update ``x = x + k`` ADD (block 12 AddSub) reads a
-    clean operand-A high nibble (no ``+0xF0``). See
-    ``shared.loaded_operand_add_hi15_clear_enabled`` for the full rationale.
-
-    DELIBERATELY ADD-ONLY (narrower than the dropped broad clear that also gated
-    on SUB + the six cmp opcodes and cleared ALU_LO+15 — that form was DROPPED
-    for regressing var_mul). ``var_mul`` has no ADD step, so this wrap is
-    provably inert on it.
-
-    Campaign-only: installed only when ``no_stack0_emit_enabled() and
-    loaded_operand_add_hi15_clear_enabled()``. Flag-OFF / non-campaign leaves
-    ``block.ffn`` exactly (byte-identical to golden ``f2b040aa`` flag-OFF). Runs
-    AFTER ``efficient_l8_addsub_wrap`` so that op's ``d_model`` read sees the raw
-    L8 PureFFN (this wrap deliberately does NOT expose ``W_up``, mirroring
-    ``CmpOperandSeRecoverFFN``).
-    """
-    def bake(model, dim_positions, S):
-        from .shared import (
-            no_stack0_emit_enabled,
-            loaded_operand_add_hi15_clear_enabled,
-        )
-        if not (no_stack0_emit_enabled()
-                and loaded_operand_add_hi15_clear_enabled()):
-            return
-        from .shared import funcadd_alu_hi13_clear_enabled
-        from ...efficient_alu_neural import LoadedOperandAddHi15ClearFFN
-        BD = _as_setdim_proxy(dim_positions)
-        block = model.blocks[8]
-        # Idempotent guard.
-        if getattr(block.ffn, "_is_loaded_operand_add_hi15_clear_wrap", False):
-            return
-        # var_update's frame-address leak rides ALU_HI cell 15 (0xF nibble of
-        # 0xFFE8/0xFFF8); func_add/mul/max/min's single-level-frame leak rides
-        # cell 13 (0xD nibble). Both NEVER a real <=100 operand high nibble, so
-        # the contaminant-window clear is value-safe. The cell-13 add is gated
-        # so it can be A/B'd independently of the original cell-15 var_update
-        # fix; flag-OFF keeps the cell set == (15,) byte-identical.
-        contam_cells = (15,)
-        if funcadd_alu_hi13_clear_enabled():
-            contam_cells = (13, 15)
-        # C4_FUNC_ADD_B0_HINIB (default-OFF): the func-return ADD leaks
-        # operand-B's high nibble (~+1.0) into operand-A's ALU_HI at a cell that
-        # VARIES with the operand (cell == b//16), not a fixed frame nibble. The
-        # ~1.0 leak vs the ~6.0 true one-hot are cleanly separated by the SAME
-        # contaminant window (0.5, CLEAN_MAX=5.85), so widen the ALU_HI clear to
-        # ALL 16 cells — the window preserves the true operand and zeros only the
-        # in-window bleed. ADD-only + ALU_HI-only + magnitude-windowed => value-
-        # safe by construction. See ``shared.func_add_b0_hinib_enabled``.
-        from .shared import func_add_b0_hinib_enabled
-        if func_add_b0_hinib_enabled():
-            contam_cells = tuple(range(16))
-        # C4_OPERAND_CAM_FIX (default-OFF): widen the ADD-only ALU_HI clear to
-        # the other loaded-operand consumers (SUB/MUL/MOD/DIV + six CMP). The
-        # ALU_HI-only, same-cell (13/15), same-window discriminator is
-        # unchanged, so flag-OFF the gate is ``(OP_ADD,)`` and this bake is
-        # byte-identical to the existing ADD-only wrap. See
-        # ``shared.operand_cam_fix_enabled``.
-        from .shared import operand_cam_fix_enabled
-        gate_dims = None
-        if operand_cam_fix_enabled():
-            gate_dims = (
-                BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_MOD, BD.OP_DIV,
-                BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE,
-            )
-        block.ffn = LoadedOperandAddHi15ClearFFN(
-            block.ffn,
-            alu_hi=BD.ALU_HI,
-            mark_ax=BD.MARK_AX,
-            add_dim=BD.OP_ADD,
-            contam_cells=contam_cells,
-            gate_dims=gate_dims,
-        )
-
-    return Operation(
-        name="loaded_operand_add_hi15_clear",
-        requires={"after": ("efficient_l8_addsub_wrap",)},
-        reads=set(),
-        writes=set(),
-        kind="model",
-        declarative_bake_fn=bake,
-        declarative_authority="structural_model",
-        migrated=True,
-        claims=set(),
-        produces={'__module_replacement':
-                  'L8.ffn[LoadedOperandAddHi15ClearFFN]'},
-        spec_section="BLOG_SPEC.md#binary-ALU",
-        opcodes={"OP_ADD"},
-    )
-
-
 def make_clean_operand_op() -> Operation:
     """DERIVED clean-one-hot operand delivery (CBC Phase 1 feasibility flag).
 
@@ -1077,9 +980,14 @@ def make_clean_operand_op() -> Operation:
     pass-gain (``clean_operand_add_enabled()`` — ``C4_CLEAN_OPERAND_ADD=1``,
     cleans ONLY the five arithmetic rows, leaving the CMP calibration contract
     intact). Flag-OFF / non-campaign leaves ``block.ffn`` exactly (byte-identical
-    golden ``e50521f3``). Runs AFTER ``loaded_operand_add_hi15_clear`` so it
-    wraps whatever operand band the existing correctors produced (the clean
-    one-hot is the last word).
+    golden ``e50521f3``). Runs AFTER ``efficient_l8_addsub_wrap`` so it wraps the
+    raw L8 operand-delivery ``PureFFN`` directly — the clean one-hot is the last
+    (and only) word on the operand band. This SUBSUMES the former ADD-only
+    address-leak corrector ``LoadedOperandAddHi15ClearFFN`` (removed): the
+    clean-snap zeros every non-argmax ALU_HI cell on the ADD/SUB/MUL/DIV/MOD
+    MARK_AX rows, so the old cell-13/15 (and all-16) hi-nibble clears were provably
+    inert once ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON (forward max_abs_diff=0.0
+    on ADD rows; fast-gate byte-identical corpus verdicts).
     """
     def bake(model, dim_positions, S):
         from .shared import (
@@ -1117,7 +1025,7 @@ def make_clean_operand_op() -> Operation:
 
     return Operation(
         name="clean_operand",
-        requires={"after": ("loaded_operand_add_hi15_clear",)},
+        requires={"after": ("efficient_l8_addsub_wrap",)},
         reads=set(),
         writes=set(),
         kind="model",
