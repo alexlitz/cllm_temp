@@ -145,7 +145,32 @@ could generalise the same L11-source cancel to those rows, but that is a separat
 
 `tools/fast_gate.py --base main --clusters
 edge_pow,mul,div,mod,var_simple,var_mul,expr_add_mul,func_mul` (main =
-corrector-present/no-root; HEAD = corrector-deleted/root-ON): **<FAST_GATE_NET>**.
+corrector-present/no-root; HEAD = corrector-deleted/root-ON), 65 ids × 8 clusters
+on GPU 0:
+
+```
+OFF (base main, corrector present): pass=52/65
+ON  (HEAD, corrector deleted+root): pass=52/65
+REGRESSIONS 0   GAINS 0   NET = +0   (0 per-id verdict differences)
+MEM-SMOKE clusters (var_*): clean
+```
+
+**NET = +0 (no regression).** The `func_mul` cluster (LEA-heavy function calls) is
+byte-identical base↔HEAD, confirming the added L11 passthrough block does NOT
+shift any LEA-/framing-relevant runtime position (the model-op hardcoded
+`blocks[15]`/`blocks[16]` bakes run on the PRE-expansion logical block list, so
+the mid-stack L11 post_op is invisible to them).
+
+### note on the added physical block
+
+Unlike the deleted `ShiftOutputClearFFN` (a same-block `block.ffn` wrapper), the
+root op is a `block.post_ops` entry on L11 → after `_expand_wrapper_blocks` it
+becomes one extra passthrough block (n_blocks 59 → 60 flag-ON). The fast-gate +
+full smoke (incl. `lea_basic`, func, control-flow) prove this is LEA-/framing-safe
+(the absolute-position LEA contract is about pre-expansion model-op indices +
+sequence positions, both unchanged). A future tidy could fold the 1 unit into the
+L11 mul_partial FFN (via `C4_DISABLE_WRAPPER_EXPANSION`'s Sequential merge or the
+allocator) to keep the block count, but it is not required for correctness.
 
 ## LOC delta
 
