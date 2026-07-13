@@ -2425,8 +2425,8 @@ def clean_operand_enabled() -> bool:
 
 def clean_operand_add_enabled() -> bool:
     """Return True iff the ARITHMETIC-ONLY clean-one-hot operand delivery is
-    active (``C4_CLEAN_OPERAND_ADD`` — DEFAULT-OFF, CBC first correct-by-
-    construction pass-gain).
+    active (``C4_CLEAN_OPERAND_ADD`` — DEFAULT-ON, CBC first correct-by-
+    construction pass-gain; opt out with ``=0``).
 
     This is the narrowed sibling of ``clean_operand_enabled`` (``C4_CLEAN_OPERAND``).
     It installs the SAME :class:`CleanOperandOneHotFFN` wrap on the L8 main FFN,
@@ -2447,7 +2447,7 @@ def clean_operand_add_enabled() -> bool:
     (``e50521f3``) build is byte-identical (the wrap is never installed off the
     campaign / off the flag).
     """
-    if os.environ.get("C4_CLEAN_OPERAND_ADD", "0") == "0":
+    if os.environ.get("C4_CLEAN_OPERAND_ADD", "1") == "0":
         return False
     return no_stack0_emit_enabled()
 

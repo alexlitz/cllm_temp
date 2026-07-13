@@ -134,17 +134,20 @@ Run these BEFORE committing any new op or rule change:
 
 - **`tools/_isa_golden_hash.py` — the authoritative byte-identity gate.**
   The current golden (default build) is `state_dict_sha256 =
-  b1dcae630381bbe93ece7a53efbeadf4a6fefef0227db8fa17fba81d76ad53f5`
-  (short `b1dcae63`) after the `C4_CLEAN_EMITTER` DEFAULT-ON flip + the
-  deletion of the two subsumed point-fix correctors (2026-07;
-  `no_stack0_se_output_clear` + `no_stack0_mem_marker_output_clear` gone,
-  net FFN units 42149 → 42117). This is an INTENDED verdict-change (full
-  1096 516 → 525, +9), so the golden moved off the prior `91f55411`.
-  Because `C4_NO_STACK0_EMIT` defaults ON, the bare-env gate now bakes the
-  clean emitter; `C4_CLEAN_EMITTER=0` on the pre-deletion tree reproduced
-  `91f55411` (escape hatch retired once the correctors were deleted). Any
-  docs/analysis change must leave `b1dcae63` unchanged; any weight-affecting
-  change must intend the hash it produces.
+  e50521f32b0ed952d5730f79b63adb8c4c78f4d4f0466d3bcbaa354bb3c90e86`
+  (short `e50521f3`). Any docs/analysis change must leave `e50521f3`
+  unchanged; any weight-affecting change must intend the hash it produces.
+  NOTE (2026-07): the `C4_CLEAN_OPERAND_ADD` DEFAULT-ON flip (the first
+  correct-by-construction pass-gain, full-1096 `full_trace` 580 → 593, +13)
+  is **state_dict-NEUTRAL** — it installs a param-free `CleanOperandOneHotFFN`
+  forward-wrap on the L8 main FFN (physical block 12) that only fires in the
+  efficient-ALU campaign build, so the bare-env golden hash is UNCHANGED at
+  `e50521f3`. Escape hatch: `C4_CLEAN_OPERAND_ADD=0` also builds `e50521f3`
+  (and reverts the L8 block to the bare `LoadedOperandAddHi15ClearFFN`
+  corrector in the campaign build). The prior `C4_CLEAN_EMITTER` DEFAULT-ON
+  flip (2026-07; deleted `no_stack0_se_output_clear` +
+  `no_stack0_mem_marker_output_clear`, net FFN units 42149 → 42117, full 1096
+  516 → 525, +9) sits underneath this golden.
 - **`tools/lint_dim_resolution.py` — MANDATORY ratchet for any tool/op that
   resolves a residual-dim POSITION.** The blessed resolution path is
   `neural_vm.unified_compiler.dim_resolver.DimResolver` over the BUILT

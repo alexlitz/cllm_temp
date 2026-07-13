@@ -2600,17 +2600,20 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_CLEAN_OPERAND", "0") != "0"
             ),
-            # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-OFF,
-            # opt in =1, MODULE-affecting): installs the SAME CleanOperandOneHotFFN
+            # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-ON,
+            # opt out =0, MODULE-affecting): installs the SAME CleanOperandOneHotFFN
             # wrap but with an ARITHMETIC-ONLY op_dims tuple (OP_ADD/SUB/MUL/DIV/MOD,
             # NO cmp dims) so the ON model's wrap module differs from both flag-OFF
             # and the full C4_CLEAN_OPERAND variant and must never share a memo
             # entry. Gated on the campaign prerequisite C4_NO_STACK0_EMIT so the
-            # non-campaign / golden build is byte-identical. See
-            # shared.clean_operand_add_enabled.
+            # non-campaign / golden build is byte-identical. The default is ON
+            # ONLY in the campaign config (C4_NO_STACK0_EMIT!=0); off the campaign
+            # the wrap is never installed so the golden e50521f3 build is
+            # byte-identical. Escape hatch: C4_CLEAN_OPERAND_ADD=0 reproduces
+            # e50521f3. See shared.clean_operand_add_enabled.
             "C4_CLEAN_OPERAND_ADD": (
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_CLEAN_OPERAND_ADD", "0") != "0"
+                and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
             ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
@@ -3668,16 +3671,18 @@ def _bake_from_scheduled_ops(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_CLEAN_OPERAND", "0") != "0"
         ),
-        # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-OFF, opt
-        # in =1, MODULE-affecting): installs the SAME CleanOperandOneHotFFN wrap
+        # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-ON, opt
+        # out =0, MODULE-affecting): installs the SAME CleanOperandOneHotFFN wrap
         # with an ARITHMETIC-ONLY op_dims tuple (no cmp dims) so the ON model's
         # wrap module differs from both flag-OFF and the full C4_CLEAN_OPERAND
         # variant and must never share a serialised entry. Gated on the campaign
         # prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden build is
-        # byte-identical. See shared.clean_operand_add_enabled.
+        # byte-identical. Default is ON only in the campaign config; escape hatch
+        # C4_CLEAN_OPERAND_ADD=0 reproduces golden e50521f3. See
+        # shared.clean_operand_add_enabled.
         "C4_CLEAN_OPERAND_ADD": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CLEAN_OPERAND_ADD", "0") != "0"
+            and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF
