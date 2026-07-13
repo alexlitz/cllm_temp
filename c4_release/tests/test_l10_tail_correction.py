@@ -26,6 +26,24 @@ from neural_vm.vm_step import (  # noqa: E402
 )
 
 
+@pytest.fixture(autouse=True)
+def _force_enumerated_tail(monkeypatch):
+    """Probe the ENUMERATED tail rule form (R-FRAME escape hatch).
+
+    This file's coverage queries per-value tail rules by their enumerated
+    ``range(256)`` names (e.g. ``tail_wide_mul_byte1_preserve_9``,
+    ``tail_sp_pop_carry_byte2_08``). After the R-FRAME INCR-3 flip
+    (``C4_R_FRAME_TAIL`` default-ON), the production build emits the COLLAPSED
+    per-nibble route form instead, so those enumerated names no longer exist.
+    Force the escape hatch (``C4_R_FRAME_TAIL=0``) so these regression tests
+    keep exercising the enumerated rules they were written against. The
+    collapsed default-ON form is verdict-equivalent (golden ``b9a74424``, the
+    proven ``C4_SP_BYTE2_CARRY`` + ``C4_WIDE_MUL_BYTE1_COMPUTED`` composition);
+    the escape hatch is byte-identical to golden ``e50521f3``.
+    """
+    monkeypatch.setenv("C4_R_FRAME_TAIL", "0")
+
+
 def _tail_rule(name: str):
     for rule in _tail_bit32_result_correction_rules():
         if rule.name == name:

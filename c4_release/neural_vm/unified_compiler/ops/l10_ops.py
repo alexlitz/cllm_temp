@@ -1,8 +1,152 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 import os
-from dataclasses import replace
-from typing import Mapping, Optional
+from dataclasses import dataclass, field, replace
+from typing import Mapping, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# R-FRAME INCR-3 — the L25 tail register-EMISSION-FRAME guarantee collapse.
+#
+# See ``docs/RFRAME_EMITTER_SCOPE_2026_07_13.md`` §3 and
+# ``docs/RFRAME_INCR3_PILOT_2026_07_13.md``. The L25 tail bank
+# (``_tail_bit32_result_correction_rules``) guarantees each register frame byte
+# (PC/SP/BP/STACK0/MEM-addr) via ~79 named ``multi_way_and_rule`` + several
+# ``range(16)/(256)`` byte-value-writeback banks. Several of those banks are
+# PURE ENUMERATIONS of a single computed fact (``byte = f(source)``) and were
+# each collapsed behind a per-family point-flag (the "M8" collapse flags:
+# ``_sp_byte2_carry_computed_enabled``, ``_stack0_*_computed_enabled``,
+# ``_wide_mul_byte1_computed_enabled``).
+#
+# INCR-3 unifies those per-family point-flags into ONE table-driven collapse
+# keyed by REGISTER: ``R_FRAME_TABLE`` names, per register, which tail
+# frame-guarantee sub-families are pure enumerations that collapse to their
+# computed form. ``_r_frame_tail_enabled(family)`` reads the single
+# ``C4_R_FRAME_TAIL`` super-switch, so the whole tail frame-guarantee collapse
+# ships behind one flag instead of six.
+#
+# ROLLOUT + FLIP (this increment, DEFAULT-ON): ``C4_R_FRAME_TAIL`` now defaults
+# ON and routes six pure-copy families through ``R_FRAME_TABLE`` -- the SP
+# byte-2 pop-carry (SP row), the ALU-VAL ``wide_mul_byte1`` preserve (AX row),
+# and the four STACK0 byte-writeback families (STACK0 row:
+# ``stack0_store_loaded`` / ``stack0_pop_loaded`` / ``stack0_store_e8`` /
+# ``stack0_store_top_e0``). Each routed family's ``range(256)`` enumeration
+# collapses to its computed (per-nibble route) form -- byte-for-byte identical
+# to the surviving members on every reachable step (the dropped siblings are
+# structurally dead). This is VERDICT-EQUIVALENT: the golden hash MOVED
+# e50521f3 -> ``b9a74424`` (-478 tail units) and that model is byte-for-byte the
+# proven point-flag composition ``C4_SP_BYTE2_CARRY=1``
+# ``C4_WIDE_MUL_BYTE1_COMPUTED=1`` (the four STACK0 collapses were already ON in
+# golden). Escape hatch ``C4_R_FRAME_TAIL=0`` rebuilds the full ``range(256)``
+# enumerated banks -> bit-for-bit golden ``e50521f3`` (the enumerated fallbacks
+# are LOAD-BEARING for the escape hatch and are NOT deleted).
+#
+# The PC and BP rows stay SCAFFOLDED (``tail_collapse=()``) -- their tail
+# frame-guarantee families are hand-tuned discriminators, NOT pure-copy. The
+# STACK0 flat-block pure-copy majority (~1.3k LOC) is a follow-up route toward
+# the scope doc's ~-2,600-LOC estimate.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RegisterEmitSpec:
+    """One row of ``R_FRAME_TABLE`` — the per-register emission-frame datum.
+
+    The R-FRAME emitter re-authors the SAME emission act ("put register ``reg``'s
+    byte ``k`` into ``OUTPUT_LO/HI`` at its frame row") from a small per-register
+    table instead of hand-cloned banks. This spec carries ONLY the data that
+    varies across registers (§2 of the scope doc); the invariant lowering (the
+    ``range(16)`` nibble copy, the marker Q/K match, the byte-value writeback
+    shape) is the shared machinery the emitter drives.
+
+    Attributes:
+        reg: register name ("PC"|"AX"|"SP"|"BP"|"STACK0").
+        marker_idx: the ``H1+<marker_idx>`` marker-bank index for ``reg``
+            (PC=0, AX=1, SP=2, BP=3, ...). Used by the same-step carry head.
+        value_lo / value_hi: the clean value band the frame byte is copied from
+            (``CLEAN_EMBED_{LO,HI}`` for PC/AX/SP/BP; ``STACK0_B*`` for STACK0).
+        tail_collapse: the names of this register's tail frame-guarantee
+            sub-families that are PURE ENUMERATIONS collapsible to their computed
+            form under ``C4_R_FRAME_TAIL``. Empty = not-yet-routed (scaffolded).
+    """
+
+    reg: str
+    marker_idx: int
+    value_lo: str = "CLEAN_EMBED_LO"
+    value_hi: str = "CLEAN_EMBED_HI"
+    tail_collapse: Tuple[str, ...] = field(default_factory=tuple)
+
+
+# The R-FRAME register table. INCR-3 ROLLOUT: the SP row carries the pilot's
+# SP byte-2 pop-carry family; the AX row carries the ALU-VAL wide-mul byte-1
+# preserve family (ALU-VAL, but same computed-collapse shape — folds naturally
+# under the same table per the pilot doc §2.b footnote); the STACK0 row carries
+# the four pure-copy STACK0 byte-writeback families. PC/BP remain scaffolded
+# (``tail_collapse=()``) — their tail frame-guarantee families are hand-tuned
+# discriminators, NOT pure-copy (see the pilot doc §2.b table).
+#
+# ROUTING SEMANTICS (preserves flag-OFF golden ``e50521f3``): each routed
+# family's own point-flag default is UNCHANGED when ``C4_R_FRAME_TAIL`` is off
+# (the four STACK0 families default-ON = already in golden; wide-mul default-OFF).
+# ``C4_R_FRAME_TAIL=1`` is a UNIFIED super-switch that forces the collapse ON
+# for every routed family (its only observable delta vs the SP pilot's flag-ON
+# hash is folding in the default-OFF ``wide_mul_byte1_preserve`` family, -224
+# more tail units).
+R_FRAME_TABLE: Tuple[RegisterEmitSpec, ...] = (
+    RegisterEmitSpec(reg="PC", marker_idx=0),
+    RegisterEmitSpec(
+        reg="AX",
+        marker_idx=1,
+        tail_collapse=("wide_mul_byte1",),
+    ),
+    RegisterEmitSpec(
+        reg="SP",
+        marker_idx=2,
+        tail_collapse=("sp_pop_carry_byte2",),
+    ),
+    RegisterEmitSpec(reg="BP", marker_idx=3),
+    RegisterEmitSpec(
+        reg="STACK0",
+        marker_idx=10,
+        tail_collapse=(
+            "stack0_store_loaded",
+            "stack0_pop_loaded",
+            "stack0_store_e8",
+            "stack0_store_top_e0",
+        ),
+    ),
+)
+
+# Fast per-register lookup by tail-collapse family name.
+_R_FRAME_BY_REG: Mapping[str, RegisterEmitSpec] = {r.reg: r for r in R_FRAME_TABLE}
+_R_FRAME_TAIL_FAMILIES: frozenset = frozenset(
+    fam for r in R_FRAME_TABLE for fam in r.tail_collapse
+)
+
+
+def _r_frame_tail_enabled(family: str) -> bool:
+    """Is the R-FRAME table-driven collapse of tail frame-guarantee ``family`` on?
+
+    Reads the single ``C4_R_FRAME_TAIL`` kill-switch (DEFAULT-ON). A ``family``
+    is collapsible iff it appears in some ``R_FRAME_TABLE`` row's
+    ``tail_collapse`` (SP ``"sp_pop_carry_byte2"``, AX ``"wide_mul_byte1"``, the
+    four STACK0 pure-copy families); an unknown / un-routed family is never
+    collapsed. This is the INCR-3 unified replacement for the per-family "M8"
+    point-flags (e.g. ``_sp_byte2_carry_computed_enabled``), keyed by REGISTER
+    via the table.
+
+    DEFAULT **ON** (flipped at INCR-3 flip, golden moved e50521f3 -> b9a74424,
+    -478 tail units) -> every routed family's ENUMERATED->COMPUTED collapse is
+    realized. Escape hatch ``C4_R_FRAME_TAIL=0`` rebuilds the full enumerated
+    tail bank -> byte-identical to golden ``e50521f3``. The flip is
+    verdict-equivalent — b9a74424 is byte-for-byte the proven point-flag
+    composition ``C4_SP_BYTE2_CARRY=1 C4_WIDE_MUL_BYTE1_COMPUTED=1``. Same
+    discipline as CLEAN_EMITTER.
+    """
+
+    if family not in _R_FRAME_TAIL_FAMILIES:
+        return False
+    return os.environ.get("C4_R_FRAME_TAIL", "1") != "0"
 
 
 def _nonfirst_psh_sp_fix_enabled() -> bool:
@@ -734,9 +878,15 @@ def _stack0_store_loaded_computed_enabled() -> bool:
 
     DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
     weight-changing but field-identical, new golden).  Kill-switch with
-    ``C4_STACK0_STORE_LOADED_COMPUTED=0``.
+    ``C4_STACK0_STORE_LOADED_COMPUTED=0``.  Also routed under the unified
+    R-FRAME table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON. The OR
+    keeps the individual default when the R-FRAME super-switch is off, so
+    flag-OFF golden is unchanged.
     """
-    return os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
+    return (
+        os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
+        or _r_frame_tail_enabled("stack0_store_loaded")
+    )
 
 
 def _stack0_pop_loaded_computed_enabled() -> bool:
@@ -758,9 +908,14 @@ def _stack0_pop_loaded_computed_enabled() -> bool:
 
     DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
     weight-changing but field-identical, new golden).  Kill-switch with
-    ``C4_STACK0_POP_LOADED_COMPUTED=0``.
+    ``C4_STACK0_POP_LOADED_COMPUTED=0``.  Also routed under the unified R-FRAME
+    table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON; the OR keeps the
+    individual default off-path so flag-OFF golden is unchanged.
     """
-    return os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
+    return (
+        os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
+        or _r_frame_tail_enabled("stack0_pop_loaded")
+    )
 
 
 def _stack0_store_e8_computed_enabled() -> bool:
@@ -782,9 +937,14 @@ def _stack0_store_e8_computed_enabled() -> bool:
 
     DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
     weight-changing but field-identical, new golden).  Kill-switch with
-    ``C4_STACK0_STORE_E8_COMPUTED=0``.
+    ``C4_STACK0_STORE_E8_COMPUTED=0``.  Also routed under the unified R-FRAME
+    table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON; the OR keeps the
+    individual default off-path so flag-OFF golden is unchanged.
     """
-    return os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
+    return (
+        os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
+        or _r_frame_tail_enabled("stack0_store_e8")
+    )
 def _stack0_store_top_e0_computed_enabled() -> bool:
     """Flag for GAP-PRIMITIVE #3 pilot — CROSS-LANE COMPUTED ALU->OUTPUT copy.
 
@@ -812,9 +972,14 @@ def _stack0_store_top_e0_computed_enabled() -> bool:
 
     DEFAULT-ON (verdict-neutral cross-lane enumerated->computed collapse
     realized; weight-changing but field-identical, new golden).  Kill-switch
-    with ``C4_STACK0_STORE_TOP_E0_COMPUTED=0``.
+    with ``C4_STACK0_STORE_TOP_E0_COMPUTED=0``.  Also routed under the unified
+    R-FRAME table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON; the OR
+    keeps the individual default off-path so flag-OFF golden is unchanged.
     """
-    return os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
+    return (
+        os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
+        or _r_frame_tail_enabled("stack0_store_top_e0")
+    )
 
 
 def _wide_mul_byte1_computed_enabled() -> bool:
@@ -855,9 +1020,15 @@ def _wide_mul_byte1_computed_enabled() -> bool:
     ``C4_WIDE_MUL_BYTE1_COMPUTED=1`` (drops the L10-tail FFN hidden_dim by 224
     units: 256 -> 32).  The ON / OFF builds have different state_dicts and MUST
     NEVER share a memo / disk entry (registered in BOTH cache-key snapshots in
-    ``full_vm_compiler_dynamic.py``).
+    ``full_vm_compiler_dynamic.py``).  Also routed under the unified R-FRAME
+    table (AX row) — ``C4_R_FRAME_TAIL=1`` forces it ON. Because its individual
+    default is OFF, the R-FRAME super-switch is what folds this ALU-VAL family
+    into the tail collapse (the -224 delta beyond the SP pilot's flag-ON hash).
     """
-    return os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
+    return (
+        os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
+        or _r_frame_tail_enabled("wide_mul_byte1")
+    )
 
 
 def _lea_byte0_alu_amplify_enabled() -> bool:
@@ -2179,12 +2350,15 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
         extra += 4
     if _sp_pop_carry_byte0_dominate_enabled():
         extra += 1
-    # SP byte-2 pop-carry enumeration collapse (M8 #1): with the flag ON the
-    # ``sp_pop_carry_rules`` byte-2 family drops from 256 (``range(256)``) to 2
-    # (``range(2)``, old in {0x00, 0x01}), so the single-tenant tail range
-    # SHRINKS by 254. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit
-    # unchanged. See ``_sp_byte2_carry_computed_enabled``.
-    if _sp_byte2_carry_computed_enabled():
+    # SP byte-2 pop-carry enumeration collapse (M8 #1 / R-FRAME INCR-3 SP
+    # pilot): with the collapse ON the ``sp_pop_carry_rules`` byte-2 family
+    # drops from 256 (``range(256)``) to 2 (``range(2)``, old in {0x00, 0x01}),
+    # so the single-tenant tail range SHRINKS by 254. The collapse fires under
+    # EITHER the table-driven ``C4_R_FRAME_TAIL`` flag (SP row) OR the legacy
+    # ``C4_SP_BYTE2_CARRY`` point-flag. Flag-OFF (incl golden 35-token) -> 0 ->
+    # bit-for-bit unchanged. See ``_r_frame_tail_enabled`` /
+    # ``_sp_byte2_carry_computed_enabled``.
+    if _r_frame_tail_enabled("sp_pop_carry_byte2") or _sp_byte2_carry_computed_enabled():
         extra -= 254
     # STACK0 store-loaded byte-writeback enumerated->COMPUTED collapse (M8
     # pilot): with the flag ON the ``stack0_store_loaded_output_rules`` family
@@ -6553,10 +6727,20 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             # corresponding members of the 256-rule bank) -- a verdict-neutral
             # ~0.5k-LOC deletion. See ``_sp_byte2_carry_computed_enabled``.
             output_match_weight = 5.0
+            # R-FRAME INCR-3 (SP pilot): the byte-2 pop-carry ``range(256)``
+            # enumeration collapses to its computed 2-row form under the
+            # table-driven ``C4_R_FRAME_TAIL`` flag (SP row's
+            # ``tail_collapse=("sp_pop_carry_byte2",)``) OR the legacy per-family
+            # ``C4_SP_BYTE2_CARRY`` point-flag. Both yield the byte-IDENTICAL two
+            # surviving rules (``old in {0x00, 0x01}``); only the 254 dead
+            # siblings are dropped. See ``_r_frame_tail_enabled`` /
+            # ``_sp_byte2_carry_computed_enabled``.
+            _sp_byte2_collapse = (
+                _r_frame_tail_enabled("sp_pop_carry_byte2")
+                or _sp_byte2_carry_computed_enabled()
+            )
             _byte2_old_values = (
-                range(2)
-                if _sp_byte2_carry_computed_enabled()
-                else range(256)
+                range(2) if _sp_byte2_collapse else range(256)
             )
             for old_value in _byte2_old_values:
                 rules.append(
