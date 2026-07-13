@@ -2399,6 +2399,59 @@ def operand_cam_fix_enabled() -> bool:
     return no_stack0_emit_enabled() and (explicit is not None and explicit != "0")
 
 
+def clean_operand_enabled() -> bool:
+    """Return True iff the DERIVED clean-one-hot operand delivery is active
+    (``C4_CLEAN_OPERAND`` — DEFAULT-OFF feasibility flag).
+
+    Installs :class:`CleanOperandOneHotFFN` on the L8 main FFN (physical block
+    11, the operand-delivery block). On the binary-op / cmp MARK_AX rows it
+    snaps the ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) bands to a
+    clean per-nibble one-hot (keep the argmax at ~6.0, zero the cell-8/cell-0
+    residues + address two-hot + index-0 artifact). This is the correct-by-
+    construction generalisation of ALL the per-op address-leak / hybrid-rebuild
+    correctors (``LoadedOperandAddHi15ClearFFN``, ``CmpOperandSeRecoverFFN``,
+    the func-add hi-nibble clears).
+
+    Feasibility question (CBC Phase 1): does a CLEAN operand let the downstream
+    ALU carry side-signal + CMP decode compute correctly WITHOUT the correctors?
+    Gated behind the ``no_stack0_emit`` campaign flag so the flag-OFF golden
+    (``e50521f3``) build is byte-identical (the wrap is never installed off the
+    campaign / off the flag).
+    """
+    if os.environ.get("C4_CLEAN_OPERAND", "0") == "0":
+        return False
+    return no_stack0_emit_enabled()
+
+
+def clean_operand_add_enabled() -> bool:
+    """Return True iff the ARITHMETIC-ONLY clean-one-hot operand delivery is
+    active (``C4_CLEAN_OPERAND_ADD`` — DEFAULT-OFF, CBC first correct-by-
+    construction pass-gain).
+
+    This is the narrowed sibling of ``clean_operand_enabled`` (``C4_CLEAN_OPERAND``).
+    It installs the SAME :class:`CleanOperandOneHotFFN` wrap on the L8 main FFN,
+    but the clean-snap fires ONLY on the ARITHMETIC opcode rows
+    (``OP_ADD/OP_SUB/OP_MUL/OP_DIV/OP_MOD``) — the CMP/EQ/LT/GT/bool consumer
+    rows (``OP_EQ..OP_GE``) are left byte-identical.
+
+    RATIONALE (see docs/CLEAN_OPERAND_FEASIBILITY_2026_07_10.md): a clean
+    operand FIXES arithmetic (the ADD inter-byte carry stays correct → +6
+    flips) but BREAKS the CMP path (the CMP nibble comparators' ``-0.5/-0.8``
+    per-nibble blockers are a magnitude CONTRACT calibrated to the dirty
+    hybrid; a perfect one-hot overshoots the lt/eq decode window → −23 CMP
+    regressions). Gating the clean-snap to the arithmetic opcodes ONLY captures
+    the arithmetic gain with ZERO CMP regression (the CMP calibration contract
+    is left intact), so this slice is byte-identical-OFF AND net-positive-ON.
+
+    Gated behind the ``no_stack0_emit`` campaign flag so the flag-OFF golden
+    (``e50521f3``) build is byte-identical (the wrap is never installed off the
+    campaign / off the flag).
+    """
+    if os.environ.get("C4_CLEAN_OPERAND_ADD", "0") == "0":
+        return False
+    return no_stack0_emit_enabled()
+
+
 def func_cmp_operand_clean_enabled() -> bool:
     """Return True iff the func_max/func_min CMP loaded-operand-A two-hot clean
     is active (DEFAULT-OFF ``C4_FUNC_CMP_OPERAND_CLEAN``; opt in with ``=1``).
