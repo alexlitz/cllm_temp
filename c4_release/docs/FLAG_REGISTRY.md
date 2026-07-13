@@ -129,6 +129,7 @@ model. Opt-out with `=0`.
 | `C4_TAIL_LEA_E8_ENT_GUARD` | `1` | active | Tail LEA-E8 ENT guard (also requires `no_stack0_emit`). |
 | `C4_NESTED_JSR_PC_FIX` | `1` | active | Nested JSR PC fix. |
 | `C4_INC3_H5_DIM0_CLEAN` | `1` | active | L8 head-5 dim-0 clean (Inc-3). |
+| `C4_EMIT_G5_RBYTE` | `0` (off) | active | **BYTE-NEUTRAL verification toggle** for the EMIT-G5 4→1 `layer14_{jsr,lc,alu_nocarry,ent}_ax_bytes_zero` fold (`l14_ops._make_ax_bytes_zero_op`). When `=1` each op's 4-unit rule program is rebuilt through a SECOND independent `_ax_bytes_zero_rules(spec, S)` call and asserted structurally identical before lowering — a distinct code path that exercises the spec table without touching a weight. DEFAULT OFF ⇒ golden byte-identical (`e50521f3`); `=1` ALSO byte-identical (`e50521f3`). Registered in BOTH cache-key snapshots so the ON/OFF builds never share a cache entry during the golden check. See `docs/EMIT_G5_ROLLOUT_2026_07_13.md`. |
 
 ---
 

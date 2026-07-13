@@ -15,6 +15,7 @@ from ..layer_compiler import Operation
 from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (
     _as_setdim_proxy,
+    emit_g5_rbyte_enabled,
     ffn_lint_clean_demo_enabled,
     ffn_lint_mull14_demo_enabled,
     no_stack0_emit_enabled,
@@ -2814,74 +2815,134 @@ def make_layer14_jsr_mem_default_suppress_op() -> Operation:
     )
 
 
-def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
-    """FFNRule program for ``_set_layer14_jsr_ax_bytes_zero``.
+# =========================================================================
+# EMIT G5 R-BYTE — generic ``ax_bytes_zero`` AX-byte-1..3 cleanup fold
+# =========================================================================
+#
+# The four L14 cleanup ops ``layer14_{jsr,lc,alu_nocarry,ent}_ax_bytes_zero``
+# were structurally IDENTICAL: at the AX byte rows (``IS_BYTE`` + ``H1[AX]``)
+# each spreads ``-3/S`` across every OUTPUT_LO/HI nibble and boosts
+# ``OUTPUT_LO[0]`` / ``OUTPUT_HI[0]`` by ``+5/S`` so the byte-value-0 token
+# wins argmax → AX bytes 1-3 = 0x00, per C4's 8-bit-AX-with-32-bit-register
+# convention. They differed ONLY in:
+#   * the OPCODE-CLASS gate (``OP_JSR`` / ``OP_LC_RELAY`` / ``TEMP+7`` /
+#     ``OP_ENT``) — one distinct L5 one-hot ``OP_*`` decode (or L7 relay) each,
+#   * the campaign JSR gate-weight re-anchor (40.0 vs 1.0),
+#   * an optional ``BYTE_INDEX_3`` byte-0/3 blocker + a raised threshold,
+#   * an optional ``TEMP+7`` selector condition (the nocarry-ALU relay),
+#   * per-op wiring metadata (reads / claims / slot_share / smoke / spec).
+#
+# MUTUAL-EXCLUSIVITY AUDIT (the pilot's flagged prerequisite): the four gates
+# NEVER co-fire on any row. ``OP_JSR`` / ``OP_ENT`` / ``OP_LC`` are three of the
+# 34 MUTUALLY-EXCLUSIVE one-hot ``OP_*`` flags the L5 opcode decode emits
+# (``make_layer5_opcode_decode_op`` — exactly one hot per instruction byte);
+# ``OP_LC_RELAY`` is the L7 head-5 relay of ``OP_LC``; ``TEMP+7``
+# (NOCARRY_ALU_OP) is the L7 relay of ``OP_AND|OP_OR|OP_XOR|OP_SHR`` — a
+# DISJOINT opcode set. No single VM step is two opcodes at once, so no row has
+# two of these gates lit. (This is exactly what the op docstrings already
+# asserted: "gate on disjoint relays".) The fold therefore preserves each op as
+# its own 4-unit range at its pinned chain offset — the exclusivity guarantees a
+# future collapse to ONE 4-unit OR-gated range would also be safe, but the
+# spec-driven fold keeps the per-op ranges so the raised-threshold /
+# ``BYTE_INDEX_3`` / gate-weight variations stay byte-for-byte exact.
+#
+# See docs/EMIT_G5_ROLLOUT_2026_07_13.md.
 
-    Mirrors the 4 imperative hidden units: at AX byte positions
-    (IS_BYTE + H1[AX]) gated by OP_JSR, each unit spreads -3/S across one
-    nibble band (LO or HI) or boosts a single byte-value-0 slot (+5/S on
-    OUTPUT_LO[0] / OUTPUT_HI[0]). The byte-value-0 token wins argmax →
-    AX bytes 1-3 = 0x00 for the JSR-preserved AX. The W_down write weights
-    encode the original ``-3.0 / S`` / ``5.0 / S`` constants directly so
-    the lowerer's "no S scaling on writes" contract reproduces the
-    imperative helper byte-for-byte.
+
+class _AxBytesZeroSpec:
+    """Per-opcode configuration for the generic ``ax_bytes_zero`` cleanup op.
+
+    Captures the FOUR ways the ``layer14_*_ax_bytes_zero`` ops differed. Every
+    other detail (the 4 nibble-band units, the ``IS_BYTE`` + ``H1[AX]`` scope,
+    the ``-3/S`` spread + ``+5/S`` byte-0 boost, the boundary guard, the
+    ``layer14_mem_generation`` binding) is SHARED and lives in the generic
+    generator/factory below.
+    """
+
+    def __init__(
+        self,
+        *,
+        op_name,
+        gate,
+        gate_weight_fn=None,
+        threshold=1.5,
+        extra_conditions=(),
+        scope,
+        reads,
+        claims_start=None,
+        block_stack0_guard=False,
+        slot_share=None,
+        ffn_units_used=None,
+        smoke_tests,
+        spec_section,
+    ):
+        self.op_name = op_name
+        self.gate = gate
+        # ``gate_weight_fn`` is a 0-arg callable so a flag-dependent weight
+        # (the campaign JSR re-anchor) is evaluated at bake time, not import.
+        self.gate_weight_fn = gate_weight_fn or (lambda: 1.0)
+        self.threshold = threshold
+        self.extra_conditions = tuple(extra_conditions)
+        self.scope = scope
+        self.reads = set(reads)
+        # ``claims_start`` pins the W_down dim-ownership claims to the op's
+        # legacy chain offset (byte-identity). ``None`` => no explicit claims
+        # (matches the ENT op, which never declared any).
+        self.claims_start = claims_start
+        self.block_stack0_guard = block_stack0_guard
+        self.slot_share = slot_share
+        self.ffn_units_used = ffn_units_used
+        self.smoke_tests = set(smoke_tests)
+        self.spec_section = spec_section
+
+
+def _ax_bytes_zero_rules(spec, S):
+    """Generic FFNRule program for a ``layer14_*_ax_bytes_zero`` cleanup op.
+
+    Reproduces the four hand-written ops bit-for-bit. At AX byte rows
+    (``IS_BYTE`` + ``H1[AX]`` + the spec's ``extra_conditions``) gated by the
+    spec's opcode-class flag, four units spread ``-3/S`` across the LO / HI
+    nibble bands and boost ``OUTPUT_LO[0]`` / ``OUTPUT_HI[0]`` by ``+5/S`` so the
+    byte-value-0 token wins argmax (AX bytes 1-3 = 0x00). The W_down write
+    weights encode the original ``-3.0 / S`` / ``5.0 / S`` constants directly so
+    the lowerer's "no S scaling on writes" contract reproduces each imperative
+    helper byte-for-byte.
     """
     AX_I = 1
     common_conditions = (
         ("IS_BYTE", 1.0),
         (f"H1+{AX_I}", 1.0),
+        *spec.extra_conditions,
     )
-    # Phase 8.D: the OP_JSR gate resolves through the
-    # (opcode_flag, "JSR") semantic pair; byte-identical to the
-    # legacy "OP_JSR" slot string via DimRef.parse.
-    gate_jsr = dim_ref("opcode_flag", "JSR")
-    # CAMPAIGN re-anchor (var_three step-0 OUTPUT_HI leak, 2026-06-21):
-    # var_three step 0 IS a JSR (the call into main); AX must stay 0 (0x0000).
-    # The L7 head-5 OP_JSR broadcast onto the AX byte rows is a token-distance
-    # RAMP. In the golden 35-token frame OP_JSR lands ~6.6 on the AX byte rows,
-    # so this AX-zero floor's silu(OP_JSR*1.0) gate fires hard and pins
-    # OUTPUT_HI+0 (byte-1 high nibble -> 0). When C4_NO_STACK0_EMIT drops the
-    # 5-token STACK0 block (35->30), the ramp shifts so the AX byte rows fall in
-    # the broadcast DIP: OP_JSR collapses to ~0.2 there (GPU-probed, spec_k=0:
-    # AX byte rows 0.239/0.211/0.201/0.191, vs >5 on every OTHER marker's byte
-    # rows). silu(0.2)=0.13 -> the floor barely fires -> a competing block-32
-    # OUTPUT_HI broadcast wins high-nibble 1 -> AX=0x1000. This is the campaign
-    # POSITIONAL-SHIFT bug class. Re-anchor: amplify the OP_JSR gate WEIGHT in
-    # the 30-token frame so silu(OP_JSR*W) is strong at the dipped AX byte rows
-    # (0.19*40=7.6 -> silu~7.6, matching golden's ~6.6) while staying exactly 0
-    # where OP_JSR==0 (silu(0)==0) so NO non-JSR row is touched. The unit's
-    # IS_BYTE+H1+1 W_up scope already confines firing to AX byte rows, so the
-    # SP/BP/MEM rows (where OP_JSR is strong) are W_up-blocked regardless.
-    # Flag-OFF (golden 35-tok) keeps gate_weight=1.0 -> BYTE-IDENTICAL.
-    jsr_gate_weight = 40.0 if no_stack0_emit_enabled() else 1.0
     common_kwargs = dict(
         conditions=common_conditions,
-        threshold=1.5,
-        gate=gate_jsr,
-        gate_weight=jsr_gate_weight,
+        threshold=spec.threshold,
+        gate=spec.gate,
+        gate_weight=spec.gate_weight_fn(),
         gate_bias=0.0,
-        scope="OP_JSR and IS_BYTE and H1+1",
+        scope=spec.scope,
     )
+    prefix = spec.op_name.replace("layer14_", "l14_")
     rules = (
         multi_way_and_rule(
-            name="l14_jsr_ax_bytes_zero_lo_neg",
+            name=f"{prefix}_lo_neg",
             writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
             **common_kwargs,
         ),
         multi_way_and_rule(
-            name="l14_jsr_ax_bytes_zero_hi_neg",
+            name=f"{prefix}_hi_neg",
             writes=tuple(
                 (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
             ),
             **common_kwargs,
         ),
         multi_way_and_rule(
-            name="l14_jsr_ax_bytes_zero_lo0_boost",
+            name=f"{prefix}_lo0_boost",
             writes=(("OUTPUT_LO+0", 5.0 / S),),
             **common_kwargs,
         ),
         multi_way_and_rule(
-            name="l14_jsr_ax_bytes_zero_hi0_boost",
+            name=f"{prefix}_hi0_boost",
             writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
             **common_kwargs,
         ),
@@ -2889,273 +2950,145 @@ def _layer14_jsr_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
     return rules
 
 
-def _layer14_jsr_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
+def _ax_bytes_zero_ir(spec, S=100.0):
     ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer14_jsr_ax_bytes_zero_rules(S))
+    ir.layer(0).ffn.rules.extend(_ax_bytes_zero_rules(spec, S))
     return ir
 
 
-def make_layer14_jsr_ax_bytes_zero_op() -> Operation:
-    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_JSR is active.
+def _make_ax_bytes_zero_op(spec):
+    """Build a ``layer14_*_ax_bytes_zero`` Operation from ``spec``.
 
-    FIX 2026-05-12 (fix-jsr-ax-bytes-1-3): Per C4's 8-bit-AX convention, AX
-    bytes 1-3 must be 0. For OP_JSR, the L9 ALU JSR-preserve routing writes
-    the previous AX byte 0 at MARK_AX (correctly emitting AX byte 0), but
-    bytes 1-3 of AX are predicted at AX byte 0/1/2 positions where L14
-    attention / L7 head 1 SP gather contaminate OUTPUT with SP/PC bytes.
-
-    This op mirrors ``BinaryOpByteZeroingPostOp``: at AX byte positions
-    (IS_BYTE + H1[AX]) when OP_JSR is active, write -3/S to every OUTPUT_LO
-    /OUTPUT_HI nibble dim and +5/S to OUTPUT_LO[0]/OUTPUT_HI[0], so the
-    byte-value-0 token wins argmax — producing AX bytes 1-3 = 0x00. OP_JSR
-    is broadcast to AX byte positions by L7 head 5 (V slot 8, also new in
-    this commit).
-
-    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
-    counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
-    Phase 14.6: runs AFTER ``layer14_addr_key_neural_decode`` (14.5).
-
-    Migration (Phase 6 wave 3J): the per-unit writes are now declared via
-    :func:`_layer14_jsr_ax_bytes_zero_rules` and attached as ``compiler_ir``;
-    the bake lowers the rule list via :meth:`CompilerIR.lower_ffn` at the
-    pinned chain offset and then runs the boundary-guard / STACK0-block
-    post-passes. Byte-identical with the legacy imperative helper.
+    Byte-identical replacement for the four hand-written
+    ``make_layer14_*_ax_bytes_zero_op`` factories. Pinned to its
+    ``_L14_CLEANUP_CHAIN_LAYOUT`` offset; the bake lowers the 4-unit rule
+    program via :meth:`CompilerIR.lower_ffn`, then runs the shared boundary
+    guard (and, for JSR, the STACK0-block guard).
     """
+
     def bake(block, dim_positions, S):
         ffn = block.ffn
-        # Phase 6 Wave 6D: this op's layout entry uses ``pin=None`` so the
-        # allocator picks the first free gap past the prior chain claims.
-        # First-fit on a 4096-wide pool with predecessors filling
-        # [0, 1862) lands the 4-unit auto-fit range back at unit 1862, so
-        # the FFN weights are byte-identical to the legacy pin even though
-        # the author never wrote the offset. The rules don't cross-reference
-        # the unit index, so moving the range elsewhere (e.g. if a future
-        # predecessor expands) would still leave the FFN function invariant.
-        start_unit = _l14_chain_alloc("layer14_jsr_ax_bytes_zero")
-        ir = _layer14_jsr_ax_bytes_zero_ir(S)
+        start_unit = _l14_chain_alloc(spec.op_name)
+        ir = _ax_bytes_zero_ir(spec, S)
         rules = ir.layer(0).ffn.rules
+        if emit_g5_rbyte_enabled():
+            # EMIT-G5 R-BYTE byte-neutral verification path: rebuild the same
+            # 4-unit rule program through a SECOND independent generator call
+            # and assert it is structurally identical before lowering. This
+            # exercises the spec table via a distinct code path without
+            # touching a single weight (the rules are pure functions of the
+            # spec), so golden ``e50521f3`` is byte-identical flag-ON and
+            # flag-OFF. See docs/EMIT_G5_ROLLOUT_2026_07_13.md.
+            alt = tuple(_ax_bytes_zero_rules(spec, S))
+            assert tuple(repr(r) for r in alt) == tuple(
+                repr(r) for r in rules
+            ), f"EMIT_G5 rule-program drift for {spec.op_name}"
         dim_map = Primitives.dim_positions_from_bd(
             _as_setdim_proxy(dim_positions),
             Primitives.ffn_rule_dim_names(rules),
         )
-        next_unit = ir.lower_ffn(
-            ffn, dim_map, start_unit=start_unit, S=S,
+        next_unit = ir.lower_ffn(ffn, dim_map, start_unit=start_unit, S=S)
+        _guard_l14_output_units_on_step_boundary(
+            ffn, dim_positions, S, start_unit, next_unit
         )
-        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
-        _block_l14_jsr_ax_zero_on_stack0_bytes(ffn, dim_positions, S, start_unit, next_unit)
+        if spec.block_stack0_guard:
+            _block_l14_jsr_ax_zero_on_stack0_bytes(
+                ffn, dim_positions, S, start_unit, next_unit
+            )
         ffn._l14_unit_counter = next_unit
 
-    # Dim-ownership claims (W_down output cells). Runs at phase 14.6 after
-    # ``layer14_addr_key_neural_decode`` (14.5) which closes the chain at
-    # unit 1874. The bake's auto-fit allocator (Phase 6 Wave 6D) lands the
-    # 4 units back at 1874 because the prior chain claims fill [0, 1874)
-    # contiguously and first-fit on a 4096-wide pool picks the first free
-    # gap. The helper writes 4 units (shifted +4 by var-cluster JSR-path
-    # follow-up's jsr_mem_default_suppress insertion 2026-06-06; initially
-    # +8 then narrowed to +4 the same day, see VAR_CLUSTER_JSR_PATH_
-    # FINDINGS_2026_06_06.md):
-    #   unit 1874: -3/S on OUTPUT_LO[0..15]
-    #   unit 1875: -3/S on OUTPUT_HI[0..15]
-    #   unit 1876: +5/S on OUTPUT_LO[0]
-    #   unit 1877: +5/S on OUTPUT_HI[0]
-    _claims = set()
-    for k in range(16):
-        _claims.add((14, "ffn_W_down", "1874", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1875", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1876", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1877", "OUTPUT_HI+0"))
+    claims = set()
+    if spec.claims_start is not None:
+        c = spec.claims_start
+        for k in range(16):
+            claims.add((14, "ffn_W_down", str(c + 0), f"OUTPUT_LO+{k}"))
+            claims.add((14, "ffn_W_down", str(c + 1), f"OUTPUT_HI+{k}"))
+        claims.add((14, "ffn_W_down", str(c + 2), "OUTPUT_LO+0"))
+        claims.add((14, "ffn_W_down", str(c + 3), "OUTPUT_HI+0"))
 
-    return Operation(
-        name="layer14_jsr_ax_bytes_zero",
-        reads={"OP_JSR", "IS_BYTE", "H1", "CONST", "STACK0_BYTE0", "STACK0_BYTE1",
-               "STACK0_BYTE2", "STACK0_BYTE3"},
+    kwargs = dict(
+        name=spec.op_name,
+        reads=spec.reads,
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         declarative_bake_fn=bake,
-        compiler_ir=_layer14_jsr_ax_bytes_zero_ir(),
+        compiler_ir=_ax_bytes_zero_ir(spec),
         declarative_authority="spec_generated",
-        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
-        # ``target_op_name``. Binds to whichever layer the compiler
-        # placed ``layer14_mem_generation`` (the L14 attn op).
         target_op_name="layer14_mem_generation",
         migrated=True,
-        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
-        # ``tools/derive_produces_consumes.py`` from the IR rule writes
-        # then slot-mapped: the rule scope is ``IS_BYTE and H1+1`` (AX
-        # byte positions), matching the existing AX_byte0 convention
-        # used by the L14 temp_clear POC. OP_JSR is broadcast to AX byte
-        # positions by L7 head 5 (V slot 8) in the same step, so it's
-        # the fresh in-step value, not a cross-step durable.
-        claims=_claims,
         requires={"after": "layer14_mem_generation"},
+        smoke_tests=spec.smoke_tests,
+        spec_section=spec.spec_section,
+    )
+    if spec.slot_share is not None:
+        kwargs["slot_share"] = spec.slot_share
+    if claims:
+        kwargs["claims"] = claims
+    if spec.ffn_units_used is not None:
+        kwargs["ffn_units_used"] = spec.ffn_units_used
+    return Operation(**kwargs)
+
+
+# --- The four opcode specs (declaration order == the pinned chain order) ----
+#
+# EMIT-G5 R-BYTE toggle (``C4_EMIT_G5_RBYTE``, DEFAULT OFF): a BYTE-NEUTRAL
+# verification flag. When ON, each op's 4-unit rule program is rebuilt through a
+# SECOND independent ``_ax_bytes_zero_rules(spec, S)`` call and asserted
+# structurally identical before lowering (see the ``bake`` closure below) — a
+# second code path that exercises the spec table without changing any weight
+# (the rules are pure functions of the spec; every op stays pinned to its
+# ``_L14_CLEANUP_CHAIN_LAYOUT`` offset). Golden ``e50521f3`` is byte-identical in
+# BOTH flag states.
+
+_AX_BYTES_ZERO_SPECS = {
+    # JSR: OP_JSR gate (L5 one-hot via opcode_flag). Campaign re-anchors the
+    # gate weight to 40.0 to survive the 30-token broadcast dip (var_three
+    # step-0 OUTPUT_HI leak, 2026-06-21); golden (35-token, flag-OFF) keeps
+    # 1.0 -> byte-identical. Owns the STACK0-block guard (JSR's STACK0 marker
+    # emits the return-address byte, which must NOT be AX-zeroed).
+    "jsr": _AxBytesZeroSpec(
+        op_name="layer14_jsr_ax_bytes_zero",
+        gate=dim_ref("opcode_flag", "JSR"),
+        gate_weight_fn=lambda: 40.0 if no_stack0_emit_enabled() else 1.0,
+        threshold=1.5,
+        extra_conditions=(),
+        scope="OP_JSR and IS_BYTE and H1+1",
+        reads={
+            "OP_JSR", "IS_BYTE", "H1", "CONST",
+            "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2", "STACK0_BYTE3",
+        },
+        claims_start=1874,
+        block_stack0_guard=True,
         smoke_tests={"TestSmokeFunctionCall::test_simple_function"},
         spec_section="BLOG_SPEC.md#function-calls",
-    )
-
-
-def _layer14_alu_nocarry_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
-    """FFNRule program for ``_set_layer14_alu_nocarry_ax_bytes_zero``.
-
-    Mirrors the 4 imperative hidden units: at AX byte positions 1-3
-    (IS_BYTE + H1[AX] + TEMP[7]*4 + NOT BYTE_INDEX_3*4) gated by TEMP[7]
-    (the NOCARRY_ALU_OP relay populated by L7 head 5 for AND/OR/XOR/SHR),
-    each unit spreads -3/S across one nibble band (LO or HI) or boosts a
-    single byte-value-0 slot (+5/S on OUTPUT_LO[0] / OUTPUT_HI[0]). The
-    elevated threshold of 5.0 plus the ``TEMP+7`` condition weight of
-    4.0 reproduce the imperative ``b_up = -S * 5.0`` and
-    ``W_up[TEMP+7] = S * 4`` lines exactly; without TEMP[7] the
-    pre-silu drops to -300 (no firing) so byte 0 and non-target opcodes
-    are both safe.
-    """
-    AX_I = 1
-    common_conditions = (
-        ("IS_BYTE", 1.0),
-        (f"H1+{AX_I}", 1.0),
-        ("TEMP+7", 4.0),
-        ("BYTE_INDEX_3", -4.0),
-    )
-    common_kwargs = dict(
-        conditions=common_conditions,
-        threshold=5.0,
+    ),
+    # LC: OP_LC_RELAY gate (L7 head-5 relay of OP_LC). Byte 0 is the loaded
+    # char (L15 head 0) and must be preserved, so a BYTE_INDEX_3 blocker gates
+    # off bytes 0/3.
+    "lc": _AxBytesZeroSpec(
+        op_name="layer14_lc_ax_bytes_zero",
+        gate="OP_LC_RELAY",
+        threshold=1.5,
+        extra_conditions=(("BYTE_INDEX_3", -4.0),),
+        scope="OP_LC_RELAY and IS_BYTE and H1+1 and not BYTE_INDEX_3",
+        reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
+        claims_start=1878,
+        smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
+        spec_section="BLOG_SPEC.md#memory",
+    ),
+    # nocarry-ALU (AND/OR/XOR/SHR): TEMP+7 (NOCARRY_ALU_OP relay). The TEMP+7
+    # condition (weight 4.0) + raised threshold 5.0 reproduce the imperative
+    # ``b_up = -S*5.0`` / ``W_up[TEMP+7] = S*4`` lines; BYTE_INDEX_3 blocker
+    # gates off byte 3.
+    "alu_nocarry": _AxBytesZeroSpec(
+        op_name="layer14_alu_nocarry_ax_bytes_zero",
         gate="TEMP+7",
-        gate_weight=1.0,
-        gate_bias=0.0,
+        threshold=5.0,
+        extra_conditions=(("TEMP+7", 4.0), ("BYTE_INDEX_3", -4.0)),
         scope="TEMP+7 and IS_BYTE and H1+1 and not BYTE_INDEX_3",
-    )
-    rules = (
-        multi_way_and_rule(
-            name="l14_alu_nocarry_ax_bytes_zero_lo_neg",
-            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_alu_nocarry_ax_bytes_zero_hi_neg",
-            writes=tuple(
-                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
-            ),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_alu_nocarry_ax_bytes_zero_lo0_boost",
-            writes=(("OUTPUT_LO+0", 5.0 / S),),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_alu_nocarry_ax_bytes_zero_hi0_boost",
-            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
-            **common_kwargs,
-        ),
-    )
-    return rules
-
-
-def _layer14_alu_nocarry_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer14_alu_nocarry_ax_bytes_zero_rules(S))
-    return ir
-
-
-def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
-    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when a non-carry ALU
-    op is active (V7 Block 13, fix-v7-block13-ax-merge, 2026-05-12).
-
-    Per ``c4_release/docs/V7_HEAP_OPS_NEURAL_PLAN.md`` §2 (AX merge): for
-    non-carry ALU ops (AND/OR/XOR/SHR), AX bytes 1-3 must be 0 per C4's
-    8-bit-AX-with-32-bit-register convention. The L10
-    ``BinaryOpByteZeroingPostOp`` already attempts this clearing but can be
-    overridden by downstream contamination at L11-L14 (MUL accumulators,
-    L14 mem_addr_gather attention bleed, etc.). This L14 cleanup runs AFTER
-    those sources and BEFORE L15 to restore AX bytes 1-3 = 0x00.
-
-    Mirrors ``make_layer14_jsr_ax_bytes_zero_op`` and
-    ``make_layer14_lc_ax_bytes_zero_op``: gates on ``TEMP[7]`` (NOCARRY_ALU_OP
-    relay = OP_AND | OP_OR | OP_XOR | OP_SHR, supplied by L7 head 5 V slot
-    9, also new in this commit) at AX byte positions 1-3, blocks at byte 0
-    via ``BYTE_INDEX_0 = -S*4``, and zeros bytes 1-3 by writing -3/S to
-    every OUTPUT_LO/HI nibble dim and +5/S to OUTPUT_LO[0] / OUTPUT_HI[0].
-
-    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
-    counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
-    Phase 14.8: runs AFTER ``layer14_lc_ax_bytes_zero`` (14.7) — JSR / LC /
-    nocarry-ALU gate on disjoint relays (OP_JSR vs OP_LC_RELAY vs TEMP[7])
-    so the relative order within 14.6-14.8 only matters for unit allocation.
-
-    Migration (Phase 6 wave 3J): per-unit writes declared via
-    :func:`_layer14_alu_nocarry_ax_bytes_zero_rules` and attached as
-    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
-    """
-    def bake(block, dim_positions, S):
-        ffn = block.ffn
-        # Pinned to chain offset 1870 (jsr_ax + lc_ax consume units 1862..1869).
-        # Last op in the L14 cleanup chain. Byte-identical with the legacy
-        # ``_l14_unit_counter`` start.
-        start_unit = _l14_chain_alloc("layer14_alu_nocarry_ax_bytes_zero")
-        ir = _layer14_alu_nocarry_ax_bytes_zero_ir(S)
-        rules = ir.layer(0).ffn.rules
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        next_unit = ir.lower_ffn(
-            ffn, dim_map, start_unit=start_unit, S=S,
-        )
-        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
-        ffn._l14_unit_counter = next_unit
-
-    # Dim-ownership claims (W_down output cells). Runs at phase 14.8 — last
-    # op in the L14 cleanup chain. Predecessors leave the counter at 1882.
-    # The helper writes 4 units mirroring jsr/lc_ax_bytes_zero (shifted +4
-    # by var-cluster JSR-path follow-up's jsr_mem_default_suppress 2026-06-06;
-    # initial +8 was narrowed to +4 the same day, see findings doc):
-    #   unit 1882: -3/S on OUTPUT_LO[0..15]
-    #   unit 1883: -3/S on OUTPUT_HI[0..15]
-    #   unit 1884: +5/S on OUTPUT_LO[0]
-    #   unit 1885: +5/S on OUTPUT_HI[0]
-    _claims = set()
-    for k in range(16):
-        _claims.add((14, "ffn_W_down", "1882", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1883", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1884", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1885", "OUTPUT_HI+0"))
-
-    return Operation(
-        name="layer14_alu_nocarry_ax_bytes_zero",
-        # Phase 1 (memory cluster fix plan): shares L14 FFN unit range with
-        # ``layer14_demo_phase6_wave7`` at a disjoint sub-range (this op
-        # owns units 0..1885; the demo op owns unit 1886). See
-        # docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
-        slot_share=("ffn_units",),
         reads={"TEMP", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir=_layer14_alu_nocarry_ax_bytes_zero_ir(),
-        declarative_authority="spec_generated",
-        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
-        # ``target_op_name``. Binds to whichever layer the compiler
-        # placed ``layer14_mem_generation`` (the L14 attn op).
-        target_op_name="layer14_mem_generation",
-        migrated=True,
-        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
-        # ``tools/derive_produces_consumes.py``; mirrors
-        # ``layer14_jsr_ax_bytes_zero``. Rule scope ``IS_BYTE and H1+1``
-        # = AX byte positions -> AX_byte0 slot. TEMP[7] (NOCARRY_ALU_OP
-        # relay) is populated by L7 head 5 V slot 9 in the same step.
-        claims=_claims,
-        requires={"after": "layer14_mem_generation"},
-        # The L14 FFN chain (``_l14_unit_counter`` reaches 1886 after this
-        # op runs). The chain is: temp_clear + temp residue clamp +
-        # ADD byte-1 high cleanup (4 units) →
-        # clear_addr_key_pollution (48) → clear_output_corruption (3) →
-        # PSH MEM high-nibble boost (15) → clear_mem_marker_output (64) →
-        # mem_addr_src_default_suppress (8, var-cluster 2026-06-05) →
-        # jsr_mem_default_suppress (4, JSR-path narrowed 2026-06-06) →
-        # addr_key_neural_decode (1728) →
-        # jsr_ax_bytes_zero (4) → lc_ax_bytes_zero (4) → this op (4) →
-        # demo_phase6_wave7 (1). Annotating only the chain tail with the
-        # cumulative max is sufficient — the compiler aggregates per-layer
-        # max across all ops, so this single annotation suffices for L14
-        # dynamic sizing.
+        claims_start=1882,
+        slot_share=("ffn_units",),
         ffn_units_used=1886,
         smoke_tests={
             "TestSmoke32Bit::test_and_16bit",
@@ -3168,134 +3101,66 @@ def make_layer14_alu_nocarry_ax_bytes_zero_op() -> Operation:
             "TestSmokeShift::test_shr",
         },
         spec_section="BLOG_SPEC.md#shifts",
-    )
-
-
-# === L14 ENT AX bytes 1-3 zero (Wave 1 Cluster B1, 2026-06-07) ===========
-
-
-def _layer14_ent_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
-    """FFNRule program: zero AX bytes 1-3 when OP_ENT is broadcast.
-
-    Mirrors :func:`_layer14_jsr_ax_bytes_zero_rules` but gates on
-    ``OP_ENT`` instead of ``OP_JSR``. The OP_ENT flag is broadcast by L7
-    head 7 V slot 4 (see ``layer7_memory_heads`` claims) so OP_ENT is
-    present at AX byte positions (IS_BYTE + H1[AX]) within the ENT step.
-    At those positions, the four units spread -3/S across one nibble
-    band (LO or HI) or boost a single byte-value-0 slot (+5/S on
-    OUTPUT_LO[0] / OUTPUT_HI[0]). The byte-value-0 token then wins
-    argmax -> AX bytes 1-3 = 0x00.
-
-    Pre-fix observed token stream for ``ENT, IMM 0, LEA 2, EXIT``:
-    step 0 emits ``REG_AX 0x00 0xE8 0xE8 0xE8`` (SP byte 0 leak); after
-    fix the trailing 0xE8 bytes are pulled to 0x00, restoring the C4
-    AX-byte-1..3 invariant and unblocking the LEA address path.
-    """
-    AX_I = 1
-    common_conditions = (
-        ("IS_BYTE", 1.0),
-        (f"H1+{AX_I}", 1.0),
-    )
-    # Resolve the OP_ENT gate via the (opcode_flag, "ENT") semantic pair;
-    # byte-identical to the raw "OP_ENT" slot string via DimRef.parse.
-    gate_ent = dim_ref("opcode_flag", "ENT")
-    common_kwargs = dict(
-        conditions=common_conditions,
+    ),
+    # ENT: OP_ENT gate (L5 one-hot via opcode_flag). Fixes test_lea_basic (SP
+    # byte-0 0xE8 leak into AX bytes 1-3 at ENT step 0). No BYTE_INDEX_3 blocker
+    # and no explicit claims — matches the hand op exactly.
+    "ent": _AxBytesZeroSpec(
+        op_name="layer14_ent_ax_bytes_zero",
+        gate=dim_ref("opcode_flag", "ENT"),
         threshold=1.5,
-        gate=gate_ent,
-        gate_weight=1.0,
-        gate_bias=0.0,
+        extra_conditions=(),
         scope="OP_ENT and IS_BYTE and H1+1",
-    )
-    rules = (
-        multi_way_and_rule(
-            name="l14_ent_ax_bytes_zero_lo_neg",
-            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_ent_ax_bytes_zero_hi_neg",
-            writes=tuple(
-                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
-            ),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_ent_ax_bytes_zero_lo0_boost",
-            writes=(("OUTPUT_LO+0", 5.0 / S),),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_ent_ax_bytes_zero_hi0_boost",
-            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
-            **common_kwargs,
-        ),
-    )
-    return rules
-
-
-def _layer14_ent_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer14_ent_ax_bytes_zero_rules(S))
-    return ir
-
-
-def make_layer14_ent_ax_bytes_zero_op() -> Operation:
-    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_ENT is active.
-
-    Wave 1 Cluster B1 (2026-06-07): fixes ``test_lea_basic``. Per C4's
-    8-bit-AX-with-32-bit-register convention, AX bytes 1-3 must be 0.
-    At ENT step 0, the model leaks SP byte 0 (0xE8 from the ENT-pushed
-    frame) into AX byte positions 1-3, producing AX=0xE8E8E800. The
-    LEA step downstream depends on a clean AX (and a clean BP, which is
-    cascaded from AX); the leak collapses LEA to AX=0x00 instead of
-    BP + imm, and ``test_lea_basic`` (program
-    ``[ENT, IMM 0, LEA 2, EXIT]``, expects AX != 0) fails with
-    exit_code=0.
-
-    Mirrors :func:`make_layer14_jsr_ax_bytes_zero_op` and the LC / ALU
-    nocarry variants: gates on ``OP_ENT`` (broadcast by L7 head 7 V slot
-    4) at AX byte positions (IS_BYTE + H1[AX]). Four units zero
-    OUTPUT_LO/OUTPUT_HI nibble dims (-3/S each) and boost the byte-0
-    slot (+5/S on OUTPUT_LO[0] / OUTPUT_HI[0]).
-
-    Pinned to ``layer_idx=14`` via ``kind="block"``. Runs after
-    ``layer14_alu_nocarry_ax_bytes_zero`` in the L14 cleanup chain. Uses
-    auto-fit allocation via :func:`_l14_chain_alloc`.
-    """
-    def bake(block, dim_positions, S):
-        ffn = block.ffn
-        start_unit = _l14_chain_alloc("layer14_ent_ax_bytes_zero")
-        ir = _layer14_ent_ax_bytes_zero_ir(S)
-        rules = ir.layer(0).ffn.rules
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        next_unit = ir.lower_ffn(
-            ffn, dim_map, start_unit=start_unit, S=S,
-        )
-        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
-        ffn._l14_unit_counter = next_unit
-
-    return Operation(
-        name="layer14_ent_ax_bytes_zero",
-        # Same FFN unit range share as the sibling cleanup ops: this op
-        # owns 4 units past the alu_nocarry tail; demo_phase6_wave7 sits
-        # past it. See docs/SLOT_REGISTRY_AUDIT_2026_06_05.md.
-        slot_share=("ffn_units",),
         reads={"OP_ENT", "IS_BYTE", "H1", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir=_layer14_ent_ax_bytes_zero_ir(),
-        declarative_authority="spec_generated",
-        target_op_name="layer14_mem_generation",
-        migrated=True,
-        requires={"after": "layer14_mem_generation"},
+        claims_start=None,
+        slot_share=("ffn_units",),
         smoke_tests={"TestSmokeAddress::test_lea_basic"},
         spec_section="BLOG_SPEC.md#registers",
-    )
+    ),
+}
+
+
+def make_layer14_jsr_ax_bytes_zero_op():
+    """L14 FFN: zero AX bytes 1-3 at AX byte rows when OP_JSR is active.
+
+    Restores C4's 8-bit-AX convention across JSR (bytes 1-3 = 0x00). Spec-driven
+    via :func:`_make_ax_bytes_zero_op` (EMIT-G5 fold); byte-identical to the
+    former hand-written factory. See docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md and
+    docs/EMIT_G5_ROLLOUT_2026_07_13.md.
+    """
+    return _make_ax_bytes_zero_op(_AX_BYTES_ZERO_SPECS["jsr"])
+
+
+def make_layer14_lc_ax_bytes_zero_op():
+    """L14 FFN: zero AX bytes 1-3 at AX byte rows 1-3 when OP_LC is active.
+
+    LC is a 1-byte load (char); byte 0 is the loaded value (L15 head 0), bytes
+    1-3 must be 0x00. Spec-driven via :func:`_make_ax_bytes_zero_op` (EMIT-G5
+    fold); byte-identical to the former hand-written factory.
+    """
+    return _make_ax_bytes_zero_op(_AX_BYTES_ZERO_SPECS["lc"])
+
+
+def make_layer14_alu_nocarry_ax_bytes_zero_op():
+    """L14 FFN: zero AX bytes 1-3 at AX byte rows 1-3 for non-carry ALU ops.
+
+    AND/OR/XOR/SHR produce a byte-sized result; AX bytes 1-3 must be 0x00.
+    Gates on TEMP[7] (NOCARRY_ALU_OP relay). Spec-driven via
+    :func:`_make_ax_bytes_zero_op` (EMIT-G5 fold); byte-identical to the former
+    hand-written factory. See docs/V7_HEAP_OPS_NEURAL_PLAN.md §2.
+    """
+    return _make_ax_bytes_zero_op(_AX_BYTES_ZERO_SPECS["alu_nocarry"])
+
+
+def make_layer14_ent_ax_bytes_zero_op():
+    """L14 FFN: zero AX bytes 1-3 at AX byte rows when OP_ENT is active.
+
+    Wave 1 Cluster B1 (2026-06-07): fixes test_lea_basic (SP byte-0 0xE8 leak
+    into AX bytes 1-3 at ENT step 0 -> AX=0xE8E8E800). Spec-driven via
+    :func:`_make_ax_bytes_zero_op` (EMIT-G5 fold); byte-identical to the former
+    hand-written factory.
+    """
+    return _make_ax_bytes_zero_op(_AX_BYTES_ZERO_SPECS["ent"])
 
 
 # === L14 SUB no-borrow multi-byte minuend-byte1 passthrough =============
@@ -4539,153 +4404,6 @@ def make_layer14_li_query_zeroaddr_op() -> Operation:
         spec_section="project_si_store_provenance_two_root_wall",
     )
 
-
-def _layer14_lc_ax_bytes_zero_rules(S: float) -> tuple[FFNRule, ...]:
-    """FFNRule program for ``_set_layer14_lc_ax_bytes_zero``.
-
-    Mirrors the 4 imperative hidden units: at AX byte positions 1-3
-    (IS_BYTE + H1[AX] + NOT BYTE_INDEX_0 via ``BYTE_INDEX_3 = -S*4``
-    blocker) gated by OP_LC_RELAY, each unit spreads -3/S across one
-    nibble band (LO or HI) or boosts a single byte-value-0 slot (+5/S on
-    OUTPUT_LO[0] / OUTPUT_HI[0]). The ``BYTE_INDEX_3`` blocker is a
-    "kill switch": at any byte index where it is 1 the condition sum
-    drops by 4S and the SiLU side stops firing, which is why the
-    imperative helper labels it as a "Block after AX byte 3" guard.
-    """
-    AX_I = 1
-    common_conditions = (
-        ("IS_BYTE", 1.0),
-        (f"H1+{AX_I}", 1.0),
-        ("BYTE_INDEX_3", -4.0),
-    )
-    common_kwargs = dict(
-        conditions=common_conditions,
-        threshold=1.5,
-        gate="OP_LC_RELAY",
-        gate_weight=1.0,
-        gate_bias=0.0,
-        scope="OP_LC_RELAY and IS_BYTE and H1+1 and not BYTE_INDEX_3",
-    )
-    rules = (
-        multi_way_and_rule(
-            name="l14_lc_ax_bytes_zero_lo_neg",
-            writes=tuple((f"OUTPUT_LO+{k}", -3.0 / S) for k in range(16)),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_lc_ax_bytes_zero_hi_neg",
-            writes=tuple(
-                (f"OUTPUT_HI_THIS_STEP+{k}", -3.0 / S) for k in range(16)
-            ),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_lc_ax_bytes_zero_lo0_boost",
-            writes=(("OUTPUT_LO+0", 5.0 / S),),
-            **common_kwargs,
-        ),
-        multi_way_and_rule(
-            name="l14_lc_ax_bytes_zero_hi0_boost",
-            writes=(("OUTPUT_HI_THIS_STEP+0", 5.0 / S),),
-            **common_kwargs,
-        ),
-    )
-    return rules
-
-
-def _layer14_lc_ax_bytes_zero_ir(S: float = 100.0) -> CompilerIR:
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(_layer14_lc_ax_bytes_zero_rules(S))
-    return ir
-
-
-def make_layer14_lc_ax_bytes_zero_op() -> Operation:
-    """L14 FFN: Zero AX bytes 1-3 at AX byte positions when OP_LC is active.
-
-    FIX V7 Phase 7a (LC byte clearing, per V7_HEAP_OPS_NEURAL_PLAN.md):
-    Per C4's LC (load-char) semantics, the loaded value is a single byte
-    placed in AX byte 0; AX bytes 1-3 must be 0. L15 attention head 0
-    writes the resolved memory byte into ``OUTPUT_LO/HI`` at the AX byte 0
-    position. Heads 1-3 fire for LI (writing AX bytes 1-3 from the loaded
-    word), but for LC they must be suppressed so bytes 1-3 emit 0.
-
-    Mirrors ``make_layer14_jsr_ax_bytes_zero_op``: at AX byte positions
-    1-3 (IS_BYTE + H1[AX] + NOT BYTE_INDEX_0) when OP_LC_RELAY is active,
-    write -3/S to every OUTPUT_LO/HI nibble dim and +5/S to OUTPUT_LO[0]
-    / OUTPUT_HI[0] so the byte-value-0 token wins argmax — producing AX
-    bytes 1-3 = 0x00. Byte 0 is protected by a strong BYTE_INDEX_0
-    blocker so this op does NOT override the L15 head 0 load result.
-
-    OP_LC_RELAY at AX byte positions is supplied by L7 head 5 (V slot 2,
-    already wired in ``_set_layer7_memory_heads``).
-
-    Pinned to ``layer_idx=14`` via ``kind="block"``. Shares the FFN unit
-    counter ``block.ffn._l14_unit_counter`` with the other L14 cleanup ops.
-    Phase 14.7: runs AFTER ``layer14_jsr_ax_bytes_zero`` (14.6) — the JSR
-    and LC ops gate on disjoint relays (OP_JSR vs OP_LC_RELAY) so the
-    relative order within phase 14.6-14.7 only matters for unit allocation.
-
-    Migration (Phase 6 wave 3J): per-unit writes declared via
-    :func:`_layer14_lc_ax_bytes_zero_rules` and attached as
-    ``compiler_ir``; bake lowers through :meth:`CompilerIR.lower_ffn`.
-    """
-    def bake(block, dim_positions, S):
-        ffn = block.ffn
-        # Pinned to chain offset 1866 (jsr_ax_bytes_zero consumes 1862..1865).
-        # Byte-identical with the legacy ``_l14_unit_counter`` start.
-        start_unit = _l14_chain_alloc("layer14_lc_ax_bytes_zero")
-        ir = _layer14_lc_ax_bytes_zero_ir(S)
-        rules = ir.layer(0).ffn.rules
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        next_unit = ir.lower_ffn(
-            ffn, dim_map, start_unit=start_unit, S=S,
-        )
-        _guard_l14_output_units_on_step_boundary(ffn, dim_positions, S, start_unit, next_unit)
-        ffn._l14_unit_counter = next_unit
-
-    # Dim-ownership claims (W_down output cells). Runs at phase 14.7 after
-    # ``layer14_jsr_ax_bytes_zero`` (14.6) consumes units 1874..1877. The
-    # helper writes 4 units mirroring jsr_ax_bytes_zero (shifted +4 by
-    # var-cluster JSR-path follow-up's jsr_mem_default_suppress 2026-06-06;
-    # initial +8 was narrowed to +4 the same day, see findings doc):
-    #   unit 1878: -3/S on OUTPUT_LO[0..15]
-    #   unit 1879: -3/S on OUTPUT_HI[0..15]
-    #   unit 1880: +5/S on OUTPUT_LO[0]
-    #   unit 1881: +5/S on OUTPUT_HI[0]
-    _claims = set()
-    for k in range(16):
-        _claims.add((14, "ffn_W_down", "1878", f"OUTPUT_LO+{k}"))
-        _claims.add((14, "ffn_W_down", "1879", f"OUTPUT_HI+{k}"))
-    _claims.add((14, "ffn_W_down", "1880", "OUTPUT_LO+0"))
-    _claims.add((14, "ffn_W_down", "1881", "OUTPUT_HI+0"))
-
-    return Operation(
-        name="layer14_lc_ax_bytes_zero",
-        reads={"OP_LC_RELAY", "IS_BYTE", "H1", "BYTE_INDEX_3", "CONST"},
-        writes={"OUTPUT_LO", "OUTPUT_HI"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir=_layer14_lc_ax_bytes_zero_ir(),
-        declarative_authority="spec_generated",
-        # Phase 8.A.4: dropped ``layer_idx=14`` pin in favour of
-        # ``target_op_name``. Binds to whichever layer the compiler
-        # placed ``layer14_mem_generation`` (the L14 attn op).
-        target_op_name="layer14_mem_generation",
-        migrated=True,
-        # Wave 1 (docs/PRODUCES_CONSUMES_MIGRATION.md). Derived via
-        # ``tools/derive_produces_consumes.py``; mirrors
-        # ``layer14_jsr_ax_bytes_zero``. Rule scope ``IS_BYTE and H1+1``
-        # = AX byte positions -> AX_byte0 slot. OP_LC_RELAY is broadcast
-        # to AX byte positions by L7 head 5 (V slot 2) in the same step,
-        # so it's the fresh in-step value.
-        claims=_claims,
-        requires={"after": "layer14_mem_generation"},
-        smoke_tests={"TestSmokeMemory::test_sc_lc_roundtrip"},
-        spec_section="BLOG_SPEC.md#memory",
-    )
 
 
 # ---------------------------------------------------------------------------

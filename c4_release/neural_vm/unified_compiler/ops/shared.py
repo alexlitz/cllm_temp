@@ -1955,6 +1955,33 @@ def no_stack0_emit_enabled() -> bool:
     return os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
 
 
+def emit_g5_rbyte_enabled() -> bool:
+    """Return True iff the EMIT-G5 R-BYTE ``ax_bytes_zero`` fold routes through
+    the ALTERNATE (per-op copy-loop) assembly path (DEFAULT OFF — opt in via
+    ``C4_EMIT_G5_RBYTE=1``).
+
+    BYTE-NEUTRAL VERIFICATION TOGGLE. The four structurally-identical L14
+    ``layer14_{jsr,lc,alu_nocarry,ent}_ax_bytes_zero`` cleanup ops were folded
+    into ONE spec-driven generator (``_ax_bytes_zero_rules`` /
+    ``_make_ax_bytes_zero_op`` in ``l14_ops.py``; see
+    ``docs/EMIT_G5_ROLLOUT_2026_07_13.md``). The four opcode gates
+    (``OP_JSR`` / ``OP_LC_RELAY`` / ``TEMP+7`` / ``OP_ENT``) are proven MUTUALLY
+    EXCLUSIVE — each is a distinct L5 one-hot ``OP_*`` decode (or its L7 relay),
+    and no single instruction is two opcodes at once — so the four ops never
+    co-fire on any row.
+
+    When ON, each op's 4-unit rule program is rebuilt through a SECOND
+    independent ``_ax_bytes_zero_rules(spec, S)`` call and asserted structurally
+    identical to the first before lowering. Because the rules are PURE FUNCTIONS
+    of the spec (no unit-index / no environment state), this exercises the spec
+    table via a distinct code path without touching a single weight -> golden
+    ``e50521f3`` is byte-identical flag-OFF and flag-ON. The toggle exists so the
+    fold's spec-driven generator can be re-run as a regression guard in CI
+    without a weight change.
+    """
+    return os.environ.get("C4_EMIT_G5_RBYTE", "0") != "0"
+
+
 def si_store_addr_enabled() -> bool:
     """Return True iff the SI/SC store address-provenance CAM head is active
     (DEFAULT OFF — opt in via ``C4_SI_STORE_ADDR=1``; only meaningful in the
