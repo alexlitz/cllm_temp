@@ -690,9 +690,10 @@ def _layer14_mem_generation_head_specs(
     and slot 34 (MEM_STORE). Slot 38 is a shared non-MEM target blocker.
 
     Mirrors ``vm_step._set_layer14_mem_generation`` cell-for-cell; the
-    only post-step modifications are the targeted overrides applied by
-    :func:`_clear_l14_mem_generation_overbroad_sp_suppression`, which
-    remain in the bake_fn as residual byte-identity bookkeeping.
+    only post-step modifications are the targeted overrides now folded
+    into :func:`_layer14_mem_generation_head_specs_with_overrides` (the
+    legacy ``_clear_l14_mem_generation_overbroad_sp_suppression`` post-bake
+    override was removed 2026-07-13 — it had no caller).
     """
 
     L = 15.0
@@ -963,10 +964,11 @@ def _layer14_mem_generation_head_specs_with_overrides(
     """Merged L14 MEM-generation specs: base + overrides folded into one spec.
 
     Declarative replacement for the legacy post-bake patch
-    :func:`_clear_l14_mem_generation_overbroad_sp_suppression`. The
-    overrides are folded into the per-head ``q``/``k``/``v``/``o`` dicts
-    so the lowered weights are byte-identical with running the override
-    helper after :func:`_layer14_mem_generation_head_specs`.
+    ``_clear_l14_mem_generation_overbroad_sp_suppression`` (removed
+    2026-07-13; it had no caller). The overrides are folded into the
+    per-head ``q``/``k``/``v``/``o`` dicts so the lowered weights are
+    byte-identical with running the override helper after
+    :func:`_layer14_mem_generation_head_specs`.
 
     Each override cell is expressed as a (slot, dim) -> final-value
     assignment; the row-wide ``W_q[base + 33, :] *= 2.0`` step is handled
@@ -1562,9 +1564,9 @@ def make_layer14_mem_generation_op() -> Operation:
     :func:`_layer14_mem_generation_head_specs_with_overrides`; the
     imperative :func:`vm_step._set_layer14_mem_generation` helper is no
     longer called, and the legacy post-bake override
-    :func:`_clear_l14_mem_generation_overbroad_sp_suppression` has been
-    folded into the spec (byte-identical with running the spec then the
-    override imperatively).
+    ``_clear_l14_mem_generation_overbroad_sp_suppression`` has been folded
+    into the spec (byte-identical with running the spec then the override
+    imperatively; the standalone helper was removed 2026-07-13).
     """
 
     def bake(attn, dim_positions, S):
@@ -1840,327 +1842,12 @@ def make_layer14_alu_high_byte_relay_op() -> Operation:
     )
 
 
-def _clear_l14_mem_generation_overbroad_sp_suppression(attn, BD, HD) -> None:
-    """Keep L14 MEM generation live when H1[SP] also fires at MEM positions.
-
-    The legacy helper suppresses queries whenever ``H1[SP]`` is high to avoid
-    early SP-byte pollution. In the strict autoregressive trace, ``H1[SP]`` is
-    also high at the MEM marker, so heads 0-3 select the softmax1 sink instead
-    of the SP marker and emit zero address bytes. The position gate already
-    suppresses non-MEM targets strongly; this removes only the overbroad
-    H1[SP] query penalties.
-    """
-
-    pc_i = 0
-    ax_i = 1
-    sp_i = 2
-    bp_i = 3
-    mem_i = 4
-    for head in range(8):
-        base = head * HD
-        attn.W_q.data[base, BD.H1 + sp_i] = 0.0
-        # MEM_STORE is represented with strength 2 at MEM positions, so the
-        # legacy +/-500 position gate can exactly cancel the +500 MEM_STORE
-        # gate at non-target MEM offsets. Doubling the position gate leaves
-        # target positions at zero net gate but makes non-target heads stay
-        # below the softmax1 sink.
-        attn.W_q.data[base + 33, :] *= 2.0
-        attn.W_q.data[base + 33, BD.H1 + sp_i] = 0.0
-        # L14's sources are the prior SP/AX/STACK0 sections. Once MEM bytes
-        # start emitting, their BYTE_INDEX flags are more recent than the true
-        # sources and can win via ALiBi. Use an otherwise-unused score slot to
-        # exclude the current MEM section as an attention source for every head.
-        attn.W_q.data[base + 35, BD.CONST] = 40.0
-        attn.W_k.data[base + 35, BD.MARK_MEM] = -40.0
-        attn.W_k.data[base + 35, BD.H3 + 4] = -40.0
-
-        # The legacy position gate was calibrated before the stricter
-        # source-bonus rows below. In neural-authoritative smoke, PC/AX/BP
-        # byte queries can still overcome that gate and make MEM generation
-        # write OUTPUT outside the MEM section. Add a separate non-MEM target
-        # blocker that stays inactive at the real MEM addr/value targets.
-        target_block_s = 5000.0
-        for dim in (
-            BD.MARK_PC,
-            BD.MARK_AX,
-            BD.MARK_SP,
-            BD.MARK_BP,
-            BD.MARK_STACK0,
-            BD.H1 + pc_i,
-            BD.H1 + ax_i,
-            BD.H1 + bp_i,
-            BD.H4 + bp_i,
-        ):
-            attn.W_q.data[base + 38, dim] = -target_block_s
-        attn.W_k.data[base + 38, BD.CONST] = 5.0
-
-    # Address heads own only the MEM marker/address-byte lanes.  Keep them off
-    # the MEM value lanes so their address source rows cannot overwrite stored
-    # value bytes during ENT/JSR.
-    for head in range(4):
-        base = head * HD
-        attn.W_q.data[base + 38, BD.H1 + sp_i] = -target_block_s
-        for dim in (
-            BD.MEM_VAL_B0,
-            BD.MEM_VAL_B1,
-            BD.MEM_VAL_B2,
-            BD.MEM_VAL_B3,
-        ):
-            attn.W_q.data[base + 38, dim] = -target_block_s
-
-    # Head 0 predicts address byte 0 from the SP marker for PSH. The legacy
-    # source bonus keyed only on H1[SP], which is active on SP byte positions
-    # but not on the SP marker where byte 0's fresh OUTPUT lives.
-    attn.W_k.data[1, BD.MARK_SP] = 45.0
-    # Heads 1-3 can read the already-emitted SP byte tokens directly. The
-    # old shifted-OUTPUT path is fragile in strict neural mode; this bonus is
-    # active only for PSH because Q[base+1] flips negative when MEM_ADDR_SRC=1.
-    # Suppress the BP/STACK0 span on the same source dimension: BYTE_INDEX_*
-    # is deliberately global, and without this guard the nearer STACK0 zero
-    # bytes beat the SP address bytes under ALiBi in strict autoregressive
-    # smoke.
-    for head in range(4):
-        attn.W_k.data[head * HD + 1, BD.H4 + bp_i] = -30.0
-        attn.W_k.data[head * HD + 1, BD.MARK_STACK0] = -30.0
-    for head, byte_dim in (
-        (1, BD.BYTE_INDEX_1),
-        (2, BD.BYTE_INDEX_2),
-        (3, BD.BYTE_INDEX_3),
-    ):
-        # These heads now source the SP/STACK0 byte token directly, so reading
-        # that token's OUTPUT would mix in the source position's prediction for
-        # the following byte (usually the L3 zero default). Keep CLEAN_EMBED as
-        # the only payload source while retaining V[0]'s default cancel.
-        base = head * HD
-        attn.W_v.data[base + 0, BD.CONST] = 1.0
-        for k in range(16):
-            attn.W_v.data[base + 1 + k, BD.OUTPUT_LO + k] = 0.0
-            attn.W_v.data[base + 17 + k, BD.OUTPUT_HI + k] = 0.0
-        attn.W_k.data[head * HD + 1, byte_dim] = 60.0
-
-    # SI/SC addresses come from the stack top before the pop.  By the time the
-    # MEM section is emitted, the current step's STACK0 bytes have already been
-    # regenerated to the post-pop value.  Those current rows carry MEM_STORE
-    # leakage, so block them and let the most recent pre-store STACK0 row win.
-    si_source_s = 200.0
-    for head in range(4):
-        base = head * HD
-        for dim in (
-            BD.MEM_STORE,
-            BD.STACK0_BYTE0,
-            BD.H1 + bp_i,
-            BD.L1H4 + bp_i,
-            BD.H2 + bp_i,
-            BD.H3 + bp_i,
-            BD.H4 + bp_i,
-            BD.MARK_STACK0,
-            BD.H1 + ax_i,
-            BD.H1 + sp_i,
-        ):
-            attn.W_k.data[base + 2, dim] = 0.0
-        attn.W_k.data[base + 2, BD.MEM_STORE] = -4.0 * si_source_s
-        attn.W_k.data[base + 2, BD.H1 + ax_i] = -si_source_s
-        attn.W_k.data[base + 2, BD.H1 + sp_i] = -si_source_s
-        if head == 0:
-            # SI/SC byte 0 must come from the pre-store stack-top byte. The
-            # STACK0 marker can still carry the just-stored AX byte before the
-            # late tail correction, which would turn the store value into the
-            # store address.
-            attn.W_k.data[base + 2, BD.STACK0_BYTE0] = si_source_s
-        elif head == 1:
-            attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
-            attn.W_k.data[base + 2, BD.H2 + bp_i] = si_source_s
-            attn.W_k.data[base + 2, BD.L1H4 + bp_i] = -si_source_s
-        elif head == 2:
-            attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
-            attn.W_k.data[base + 2, BD.H3 + bp_i] = si_source_s
-            attn.W_k.data[base + 2, BD.H2 + bp_i] = -si_source_s
-        else:
-            attn.W_k.data[base + 2, BD.MARK_STACK0] = -si_source_s
-            attn.W_k.data[base + 2, BD.H4 + bp_i] = si_source_s
-            attn.W_k.data[base + 2, BD.H3 + bp_i] = -si_source_s
-
-    # ENT stores the old BP at the freshly established frame address
-    # (BP = old SP - 8). Address heads must therefore source BP, not the
-    # final SP value after local allocation.
-    ent_addr_s = 50.0
-    ent_wrong_target_s = 500.0
-    for head in range(4):
-        base = head * HD
-        attn.W_q.data[base + 39, BD.OP_ENT] = ent_addr_s
-        attn.W_q.data[base + 39, BD.HAS_SE] = ent_addr_s * 3.0
-        attn.W_q.data[base + 39, BD.CONST] = -ent_addr_s * 6.0
-        if head == 0:
-            attn.W_q.data[base + 39, BD.IS_BYTE] = -12.0 * ent_addr_s
-            attn.W_k.data[base + 39, BD.MARK_BP] = ent_addr_s
-            continue
-        attn.W_k.data[base + 39, BD.H1 + bp_i] = 0.0
-        attn.W_q.data[base + 40, BD.OP_ENT] = ent_addr_s
-        attn.W_q.data[base + 40, BD.HAS_SE] = 0.0
-        attn.W_q.data[base + 40, BD.CONST] = 0.0
-        for dim in (BD.BYTE_INDEX_0, BD.BYTE_INDEX_1, BD.BYTE_INDEX_2):
-            attn.W_q.data[base + 40, dim] = 0.0
-        allowed_query_dim = (
-            BD.BYTE_INDEX_0,
-            BD.BYTE_INDEX_1,
-            BD.BYTE_INDEX_2,
-        )[head - 1]
-        for dim in (
-            BD.BYTE_INDEX_0,
-            BD.BYTE_INDEX_1,
-            BD.BYTE_INDEX_2,
-            BD.BYTE_INDEX_3,
-        ):
-            if dim != allowed_query_dim:
-                attn.W_q.data[base + 40, dim] = -ent_wrong_target_s
-        attn.W_k.data[base + 40, BD.H1 + bp_i] = ent_addr_s
-        attn.W_k.data[
-            base + 40,
-            (BD.BYTE_INDEX_1, BD.BYTE_INDEX_2, BD.BYTE_INDEX_3)[head - 1],
-        ] = ent_addr_s
-    # At the MEM marker only head 0 should emit address byte 0. Heads 1-3 use
-    # the already-emitted address bytes as their query positions, and the ENT
-    # source rows can otherwise overpower their non-target position gate and
-    # add zero-byte defaults into addr byte 0.
-    mem_marker_block_s = 300.0
-    for head in range(1, 4):
-        base = head * HD
-        attn.W_q.data[base + 41, BD.MARK_MEM] = -mem_marker_block_s
-        attn.W_k.data[base + 41, BD.CONST] = mem_marker_block_s
-    ent_target_gate_s = 200.0
-    for head, query_dim in (
-        (1, BD.BYTE_INDEX_0),
-        (2, BD.BYTE_INDEX_1),
-        (3, BD.BYTE_INDEX_2),
-    ):
-        base = head * HD
-        attn.W_q.data[base + 42, BD.CONST] = 0.0
-        attn.W_q.data[base + 42, BD.OP_ENT] = 0.0
-        attn.W_q.data[base + 42, query_dim] = 0.0
-        attn.W_k.data[base + 42, BD.CONST] = 0.0
-        attn.W_q.data[base + 43, BD.CONST] = -ent_target_gate_s
-        attn.W_q.data[base + 43, BD.H3 + mem_i] = ent_target_gate_s
-        attn.W_k.data[base + 43, BD.CONST] = ent_target_gate_s
-
-    # Value heads source AX for PSH/SI/SC and STACK0 for JSR/ENT. With the
-    # steeper L14 ALiBi slope, the old H1[AX] bonus is not strong enough to
-    # beat the softmax1 sink from MEM value positions. This score slot makes
-    # the source choice explicit without changing the payload path.
-    source_s = 50.0
-    for head in range(4, 8):
-        base = head * HD
-        # The value heads double the CLEAN_EMBED nibble payload to overcome
-        # downstream defaults. Keep V[0] as a matched cancel so nonzero bytes
-        # beat the L3 zero default while real zero bytes still emit 0.
-        attn.W_v.data[base + 0, BD.CONST] = 2.0
-        for k in range(16):
-            attn.W_v.data[base + 1 + k, BD.CLEAN_EMBED_LO + k] = 2.0
-            attn.W_v.data[base + 17 + k, BD.CLEAN_EMBED_HI + k] = 2.0
-        attn.W_q.data[base + 36, BD.CONST] = source_s
-        attn.W_q.data[base + 36, BD.OP_JSR] = -2.0 * source_s
-        attn.W_q.data[base + 36, BD.OP_ENT] = -2.0 * source_s
-        attn.W_k.data[base + 36, BD.H1 + ax_i] = source_s
-        # Keep SP neutral for the value-source selector. With JSR/ENT the
-        # query row is negative so a negative H1[SP] key makes the current SP
-        # byte an attractive source; that corrupts the same step's SP byte
-        # outputs by rereading SP_byte0 as SP_byte1.
-        attn.W_k.data[base + 36, BD.H1 + sp_i] = 0.0
-        attn.W_k.data[base + 36, BD.H4 + bp_i] = -source_s
-        # STACK0 value bytes carry H4[BP], while the STACK0 marker carries
-        # both H4[BP] and MARK_STACK0. For JSR/ENT the query is negative, so
-        # H4[BP]'s negative K makes STACK0 bytes attractive. Give the marker a
-        # matching positive term so it nets to zero instead of winning as a
-        # payload-less source.
-        attn.W_k.data[base + 36, BD.MARK_STACK0] = source_s
-        # MEM-source exclusion is handled by the sign-stable row 35 above.
-        # Do not put MEM dims on this sign-flipping selector row: for ENT/JSR
-        # the query is negative, so negative MEM keys make the current MEM
-        # section look like a source and beat the intended STACK0 bytes.
-        attn.W_k.data[base + 36, BD.MARK_MEM] = 0.0
-        attn.W_k.data[base + 36, BD.H3 + mem_i] = 0.0
-
-        # Heads 4-7 generate MEM value bytes only. Keep them silent while the
-        # MEM marker and address bytes are being emitted; heads 0-3 own those
-        # address positions. Value byte 0 is predicted from the BYTE_INDEX_3
-        # query, so only byte indexes 0..2 are blocked here.
-        value_target_block_s = 15000.0
-        for dim in (
-            BD.MARK_MEM,
-            BD.BYTE_INDEX_0,
-            BD.BYTE_INDEX_1,
-            BD.BYTE_INDEX_2,
-        ):
-            attn.W_q.data[base + 38, dim] = -value_target_block_s
-        mem_val_dims = (
-            BD.MEM_VAL_B0,
-            BD.MEM_VAL_B1,
-            BD.MEM_VAL_B2,
-            BD.MEM_VAL_B3,
-        )
-        own_value_idx = head - 4
-        for idx, dim in enumerate(mem_val_dims):
-            if idx != own_value_idx:
-                attn.W_q.data[base + 38, dim] = -value_target_block_s
-
-        # ENT stores the caller's old BP. After a normal call prologue that
-        # old BP lives in the previous JSR step's BP byte rows, not in the
-        # current STACK0 rows used by JSR's return-address store.
-        ent_old_bp_s = 80.0
-        ent_value_target_s = 1000.0
-        source_byte_dim = (
-            BD.BYTE_INDEX_0,
-            BD.BYTE_INDEX_1,
-            BD.BYTE_INDEX_2,
-            BD.BYTE_INDEX_3,
-        )[own_value_idx]
-        target_query_dim = (
-            BD.MEM_VAL_B0,
-            BD.MEM_VAL_B1,
-            BD.MEM_VAL_B2,
-            BD.MEM_VAL_B3,
-        )[own_value_idx]
-        attn.W_q.data[base + 44, BD.OP_ENT] = ent_old_bp_s
-        # OPCODE-BROADCAST HARDENING (2026-06-11, var_simple_12 / id 262):
-        # mirror of the declarative spec
-        # ``_layer14_mem_generation_head_specs_with_overrides`` slot 44. The
-        # declarative spec is the LIVE path (make_layer14_mem_generation_op's
-        # bake calls Primitives.generate_attention_heads on it); this imperative
-        # ``_clear_l14_mem_generation_overbroad_sp_suppression`` helper is no
-        # longer invoked (folded into the spec). Kept in sync to prevent a stale
-        # re-enable from reintroducing the misfire. Hard subtractive NOT-blockers
-        # on the register-emit markers bury OP_ENT's in-step broadcast (~12-17)
-        # so slot 44 cannot fire on the step-2 LEA PC-emit row; byte-identical on
-        # the legit ENT MEM-value row (MARK_PC/AX/SP/BP all 0 there).
-        slot44_marker_block_s = 1000000.0  # 1e6 >> ent_old_bp_s * ENT_bcast
-        for blk_dim in (BD.MARK_PC, BD.MARK_AX, BD.MARK_SP, BD.MARK_BP):
-            attn.W_q.data[base + 44, blk_dim] = -slot44_marker_block_s
-        attn.W_k.data[base + 44, BD.OP_JSR] = ent_old_bp_s
-        attn.W_k.data[base + 44, BD.H1 + bp_i] = ent_old_bp_s
-        attn.W_k.data[base + 44, source_byte_dim] = ent_old_bp_s
-        attn.W_q.data[base + 45, BD.CONST] = -0.9 * ent_value_target_s
-        attn.W_q.data[base + 45, target_query_dim] = ent_value_target_s
-        attn.W_k.data[base + 45, BD.CONST] = ent_value_target_s
-
-        # PSH store values are sourced from AX. STACK0 is generated later in
-        # the same step and is not authoritative for the MEM value bytes here.
-
-        # SI/SC AX preservation now happens late in L16 before the MEM value
-        # bytes are generated. Keep the source selector byte-indexed on the
-        # current AX bytes; the previous "prefer older AX" penalty makes byte 0
-        # lose to the nearer byte 3 zero under strict neural ALiBi.
-        attn.W_q.data[base + 37, :] = 0.0
-        attn.W_k.data[base + 37, :] = 0.0
-
-    # The legacy MEM-generation heads use V slot 0 as the matched zero-nibble
-    # cancel. A full cancel leaves real zero nibbles at exactly the same logit
-    # as every wrong nibble in that band, so batched GEMM/SDPA rounding can
-    # choose any token with the same other nibble. Keep the cancel strong
-    # enough to suppress zero when the copied nibble is nonzero, but leave a
-    # positive margin when the copied nibble itself is zero.
-    for head in range(8):
-        base = head * HD
-        attn.W_o.data[BD.OUTPUT_LO + 0, base + 0] = -0.5
-        attn.W_o.data[BD.OUTPUT_HI + 0, base + 0] = -0.5
+# NOTE: the legacy imperative post-bake override
+# _clear_l14_mem_generation_overbroad_sp_suppression (~322 LOC) was
+# REMOVED here (L14 clear/guard corrector-removal, 2026-07-13). It had NO
+# caller anywhere in the repo and its logic was folded into the LIVE
+# declarative spec _layer14_mem_generation_head_specs_with_overrides
+# (Wave 2E). Deleting it is byte-identical (golden e50521f3).
 
 
 def _layer14_temp_clear_rules(S: float) -> tuple[FFNRule, ...]:
