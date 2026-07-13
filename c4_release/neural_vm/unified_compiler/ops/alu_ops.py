@@ -994,12 +994,14 @@ def make_clean_operand_op() -> Operation:
             no_stack0_emit_enabled,
             clean_operand_enabled,
             clean_operand_add_enabled,
+            clean_operand_bitwise_enabled,
         )
         if not no_stack0_emit_enabled():
             return
         full = clean_operand_enabled()
         arith_only = clean_operand_add_enabled()
-        if not (full or arith_only):
+        bitwise = clean_operand_bitwise_enabled()
+        if not (full or arith_only or bitwise):
             return
         from ...efficient_alu_neural import CleanOperandOneHotFFN
         BD = _as_setdim_proxy(dim_positions)
@@ -1012,7 +1014,17 @@ def make_clean_operand_op() -> Operation:
         # flags are set the broader (all-consumer) gate wins.
         arith_dims = (BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_MOD, BD.OP_DIV)
         cmp_dims = (BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE)
-        op_dims = arith_dims + cmp_dims if full else arith_dims
+        bitwise_dims = (BD.OP_AND, BD.OP_OR, BD.OP_XOR)
+        if full:
+            op_dims = arith_dims + cmp_dims
+        else:
+            op_dims = arith_dims
+        # The bitwise probe adds the three bitwise opcodes on top of the
+        # arithmetic slice so the OP_AND/OP_OR/OP_XOR MARK_AX rows also get the
+        # clean one-hot snap (C4_CLEAN_OPERAND_BITWISE). Independent of the
+        # arith-only default: it only ever ADDS the bitwise dims.
+        if bitwise:
+            op_dims = tuple(op_dims) + bitwise_dims
         block.ffn = CleanOperandOneHotFFN(
             block.ffn,
             alu_lo=BD.ALU_LO,
@@ -1356,7 +1368,6 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         from .shared import (
             no_stack0_emit_enabled,
             cmp_byte0_se_recover_enabled,
-            bitwise_byte0_se_recover_enabled,
         )
         block_ffn = cleanup_ffn
         if no_stack0_emit_enabled() and cmp_byte0_se_recover_enabled():
@@ -1386,40 +1397,23 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
                 )
         block.ffn = block_ffn
 
-        # === STACK0 campaign (2026-06-24): bitwise operand-A SE recover ===
-        # Under the campaign config the SAME L14 ALU-clear that crushes the cmp
-        # operand also crushes the BITWISE operand-A byte-0 — but for the bitwise
-        # lookup the crush bites at the LOOKUP block (a downstream post_op block),
-        # not at ``cleanup_ffn``. So the cmp recover above (wrapping ``block.ffn``)
-        # does NOT reach the lookup. Wrap the lookup post_op itself with a recover
-        # that restores ALU_LO/HI from SE_ALU on the OR/XOR/AND + MARK_AX + crushed
-        # row BEFORE the lookup reads it. ``or_16bit`` / ``xor_16bit`` lose byte-0
-        # EXACTLY when operand A's nibble is 0; ``and_16bit`` passes coincidentally
-        # (its nibbles 0xF survive the cell-0 crush). One block — the lookup's own —
-        # so the physical block count is unchanged (lea contract). Flag-OFF /
-        # non-campaign appends the bare ``lookup_ffn`` (byte-identical to golden).
-        # See ``shared.bitwise_byte0_se_recover_enabled`` for the full rationale.
-        lookup_op = lookup_ffn
-        if (
-            no_stack0_emit_enabled()
-            and bitwise_byte0_se_recover_enabled()
-            and hasattr(bd_proxy, "SE_ALU_LO")
-            and hasattr(bd_proxy, "SE_ALU_HI")
-        ):
-            from ...efficient_alu_neural import BitwiseOperandSeRecoverFFN
-            bitwise_op_dims = [
-                getattr(bd_proxy, nm) for nm in ("OP_AND", "OP_OR", "OP_XOR")
-            ]
-            lookup_op = BitwiseOperandSeRecoverFFN(
-                lookup_ffn,
-                alu_lo=bd_proxy.ALU_LO,
-                alu_hi=bd_proxy.ALU_HI,
-                se_alu_lo=bd_proxy.SE_ALU_LO,
-                se_alu_hi=bd_proxy.SE_ALU_HI,
-                mark_ax=bd_proxy.MARK_AX,
-                bitwise_op_dims=bitwise_op_dims,
-            )
-        block.post_ops.append(lookup_op)
+        # === STACK0 campaign bitwise operand delivery (2026-07-13) ===
+        # The bitwise lookup post_op reads operand A from ``ALU_LO/HI`` at its own
+        # downstream block. Under the campaign config the L9 non-ALU ALU-scrubber
+        # subtracts a FIXED pattern from the ALU band before the lookup runs; the
+        # dirty operand-gather hybrid delivers the true A==0 nibble at only ~+5.48
+        # so the subtraction drives cell 0 NEGATIVE and the lookup's A==0 rule
+        # cannot fire (``or_16bit`` / ``xor_16bit`` lost byte-0). Rather than
+        # re-materialise the crushed operand at the lookup block (the former
+        # ``BitwiseOperandSeRecoverFFN``, deleted), the campaign now delivers a
+        # CLEAN operand-A one-hot (+6.0) UPSTREAM at the L8 operand-delivery FFN
+        # via ``CleanOperandOneHotFFN`` extended to the bitwise opcodes
+        # (``C4_CLEAN_OPERAND_BITWISE``, default-ON): 6.0 − 5.56 = +0.44 stays
+        # positive and survives the crush to the lookup, which then fires the
+        # rescaled ``bitwise_rules`` (a+b−ab) correctly. So the lookup post_op is
+        # the bare rule-lowered ``lookup_ffn`` — no SE-recover wrap. Flag-OFF /
+        # non-campaign appends the same bare ``lookup_ffn`` (byte-identical golden).
+        block.post_ops.append(lookup_ffn)
 
     return Operation(
         name="efficient_l10_andorxor_wrap",
