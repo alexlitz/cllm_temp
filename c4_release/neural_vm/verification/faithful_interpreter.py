@@ -599,7 +599,9 @@ COMPOSITE_ALU_FFN = (
     "CleanOperandOneHotFFN",
     "CmpOperandSeRecoverFFN",
     "MulOperandSeRecoverFFN",
-    "ShiftOutputClearFFN",
+    # (``ShiftOutputClearFFN`` removed — the SHR OUTPUT byte-0 leak it cleared is
+    # now cancelled at its L11 source by ``make_output_b0_noleak_op``
+    # (C4_OUTPUT_B0_NOLEAK, DEFAULT-ON), so the wrap is no longer installed.)
 )
 
 

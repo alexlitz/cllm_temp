@@ -2614,14 +2614,20 @@ def compile_full_vm_dynamic(
                     else "0",
                 ) != "0"
             ),
-            # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in
-            # campaign, opt out =0, BAKE-affecting): when active the L13
-            # ALUShiftComposite block.ffn is wrapped in ShiftOutputClearFFN,
-            # otherwise it is the bare composite. The two builds STRUCTURALLY
-            # differ so they must never share a memo entry. See
-            # shared.shift_output_byte0_clear_enabled.
+            # C4_SHIFT_OUTPUT_B0_CLEAR: now INERT (the ShiftOutputClearFFN wrap it
+            # gated was DELETED 2026-07-13; the SHR OUTPUT byte-0 leak is now
+            # cancelled at its L11 source by C4_OUTPUT_B0_NOLEAK). Kept in the
+            # cache key as an always-same term for memo/serialised-key stability;
+            # a follow-up dead-flag sweep can drop it.
             "C4_SHIFT_OUTPUT_B0_CLEAR": (
                 os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
+            ),
+            # L11 OUTPUT byte-0 no-leak root (DEFAULT-ON, BAKE-affecting): when
+            # active a 1-unit L11 post-op FFN is baked (cancelling OUTPUT byte-0
+            # on the OP_SHR compute row), so the ON / OFF builds differ and must
+            # never share a memo entry. See shared.output_b0_noleak_enabled.
+            "C4_OUTPUT_B0_NOLEAK": (
+                os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
             ),
             # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
             # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
@@ -3655,13 +3661,19 @@ def _bake_from_scheduled_ops(
                 else "0",
             ) != "0"
         ),
-        # SHIFT (SHL/SHR) consumer OUTPUT byte-0 clear (DEFAULT-ON in campaign,
-        # opt out =0, BAKE-affecting): when active the L13 ALUShiftComposite
-        # block.ffn is wrapped in ShiftOutputClearFFN, otherwise it is the bare
-        # composite. The two builds STRUCTURALLY differ so they must never share
-        # a serialised entry. See shared.shift_output_byte0_clear_enabled.
+        # C4_SHIFT_OUTPUT_B0_CLEAR: now INERT (the ShiftOutputClearFFN wrap it
+        # gated was DELETED 2026-07-13; the SHR OUTPUT byte-0 leak is cancelled at
+        # its L11 source by C4_OUTPUT_B0_NOLEAK). Kept as an always-same cache-key
+        # term for serialised-key stability; a follow-up dead-flag sweep can drop it.
         "C4_SHIFT_OUTPUT_B0_CLEAR": (
             os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
+        ),
+        # L11 OUTPUT byte-0 no-leak root (DEFAULT-ON, BAKE-affecting): when active
+        # a 1-unit L11 post-op FFN is baked (cancelling OUTPUT byte-0 on the OP_SHR
+        # compute row) so the ON / OFF builds differ and must never share a
+        # serialised entry. See shared.output_b0_noleak_enabled.
+        "C4_OUTPUT_B0_NOLEAK": (
+            os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
         ),
         # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
         # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)

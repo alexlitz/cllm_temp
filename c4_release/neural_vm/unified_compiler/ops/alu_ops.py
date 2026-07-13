@@ -266,35 +266,15 @@ def make_alu_shift_composite_ops():
         def bake(block, dim_positions, S):
             if builder.composite is None:
                 return  # No stage bakes ran (lookup mode safety).
-            # === STACK0 campaign (2026-06-24): SHIFT OUTPUT byte-0 clear ===
-            # Under the campaign config a SPURIOUS ``OUTPUT_LO+0``/``OUTPUT_HI+0``
-            # zero-default leaks into the SHR row at block 16 (logical L11) and,
-            # because ``GEToBDConverter`` ADDS its result one-hot, SURVIVES to TIE
-            # the true 0x2A — the argmax breaks the tie toward cell-0 so
-            # ``test_shr`` decodes 0x00. Wrap the composite so it ZEROES the
-            # OUTPUT band on the OP_SHL/OP_SHR + MARK_AX row BEFORE it writes,
-            # removing the stale default so the shift result stands unopposed.
-            # It runs as the SAME block (it IS ``block.ffn``) so the physical
-            # block count is unchanged (lea contract). Flag-OFF / non-campaign
-            # leaves ``block.ffn = builder.composite`` exactly (byte-identical to
-            # golden). See ``shared.shift_output_byte0_clear_enabled``.
-            from .shared import (
-                no_stack0_emit_enabled,
-                shift_output_byte0_clear_enabled,
-            )
-            composite = builder.composite
-            if no_stack0_emit_enabled() and shift_output_byte0_clear_enabled():
-                from ...efficient_alu_neural import ShiftOutputClearFFN
-                bd_proxy = _as_setdim_proxy(dim_positions)
-                composite = ShiftOutputClearFFN(
-                    builder.composite,
-                    output_lo=bd_proxy.OUTPUT_LO,
-                    output_hi=bd_proxy.OUTPUT_HI,
-                    mark_ax=bd_proxy.MARK_AX,
-                    op_shl=bd_proxy.OP_SHL,
-                    op_shr=bd_proxy.OP_SHR,
-                )
-            block.ffn = composite
+            # The SHR OUTPUT byte-0 zero-default leak (a stale
+            # ``OUTPUT_{LO,HI}+0 = 2.0`` on the SHR compute row, planted by the
+            # L11 emission head, that TIED the true 0x2A and made ``test_shr``
+            # decode 0x00) is now cancelled CORRECT-BY-CONSTRUCTION at its L11
+            # source by ``l11_ops.make_output_b0_noleak_op`` (C4_OUTPUT_B0_NOLEAK,
+            # DEFAULT-ON). The consumer-side ``ShiftOutputClearFFN`` wrap that
+            # used to patch it here is DELETED (proven inert: forward == inner,
+            # max-diff ~2.4e-7). See docs/OUTPUT_BYTE0_LEAK_ROOT_2026_07_13.md.
+            block.ffn = builder.composite
 
         return Operation(
             name="l13_alu_shift_install",
