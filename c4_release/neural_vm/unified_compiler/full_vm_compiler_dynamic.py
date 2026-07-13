@@ -2753,23 +2753,6 @@ def compile_full_vm_dynamic(
             "C4_WIDE_MUL_BYTE1_COMPUTED": (
                 os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
             ),
-            # R-FRAME INCR-3 unified tail-collapse super-switch (DEFAULT-ON,
-            # escape hatch =0). Routes the SP byte-2 pop-carry, the four STACK0
-            # pure-copy byte-writeback families, and the ALU-VAL
-            # wide_mul_byte1_preserve family through the R_FRAME_TABLE. When ON it
-            # forces every routed family's ENUMERATED->COMPUTED collapse (golden
-            # moved e50521f3 -> b9a74424, -478 tail units; byte-for-byte the
-            # proven C4_SP_BYTE2_CARRY + C4_WIDE_MUL_BYTE1_COMPUTED composition).
-            # The state_dict differs ON vs OFF so the two builds MUST NEVER share
-            # a memo / disk entry. Also register the legacy C4_SP_BYTE2_CARRY
-            # point-flag (SP byte-2 collapse) for the same isolation. See
-            # l10_ops._r_frame_tail_enabled.
-            "C4_R_FRAME_TAIL": (
-                os.environ.get("C4_R_FRAME_TAIL", "1") != "0"
-            ),
-            "C4_SP_BYTE2_CARRY": (
-                os.environ.get("C4_SP_BYTE2_CARRY", "0") == "1"
-            ),
             # M8 collapse for the L14 ADDR_KEY nibble decode: the load-query
             # lo+hi ENUMERATED (2 x 16x16 = 512 per-(lo,hi) AND) bank ->
             # COMPUTED (2 x 32 per-nibble route) collapse (DEFAULT-OFF, opt in
@@ -2799,6 +2782,16 @@ def compile_full_vm_dynamic(
             # See ops/shared.div_multipass_enabled.
             "C4_DIV_MULTIPASS": (
                 os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
+            ),
+            # MUL byte-1 delivery (DEFAULT-OFF, opt in =1): adds an OP_MUL/OP_SHL
+            # W_up blocker to the ``layer14_jsr_ax_bytes_zero`` clear units so
+            # the JSR AX-bytes-zero clear does not mis-fire on MUL/SHL byte-1
+            # emit rows (idx104/idx106 spurious-OP_JSR-leak). Output-affecting
+            # (changes W_up), so the ON / OFF builds have different state_dicts
+            # and MUST NEVER share a memo / disk entry. See
+            # ops/l14_ops._mul_b1_delivery_enabled.
+            "C4_MUL_B1_DELIVERY": (
+                os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
             ),
             # Auto-widen: extra residual bands change d_model / n_heads, so
             # widened and baseline builds must never share a memo entry.
@@ -3820,21 +3813,6 @@ def _bake_from_scheduled_ops(
         "C4_WIDE_MUL_BYTE1_COMPUTED": (
             os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
         ),
-        # R-FRAME INCR-3 unified tail-collapse super-switch (DEFAULT-ON, escape
-        # hatch =0). Routes SP byte-2, the four STACK0 pure-copy families, and
-        # the ALU-VAL wide_mul_byte1 family through R_FRAME_TABLE; forces every
-        # routed collapse ON (golden e50521f3 -> b9a74424, -478 tail units;
-        # byte-for-byte the proven C4_SP_BYTE2_CARRY + C4_WIDE_MUL_BYTE1_COMPUTED
-        # composition). The state_dict differs ON vs OFF so the two builds MUST
-        # NEVER share a serialised entry. Also register the legacy
-        # C4_SP_BYTE2_CARRY point-flag for the same isolation. See
-        # l10_ops._r_frame_tail_enabled.
-        "C4_R_FRAME_TAIL": (
-            os.environ.get("C4_R_FRAME_TAIL", "1") != "0"
-        ),
-        "C4_SP_BYTE2_CARRY": (
-            os.environ.get("C4_SP_BYTE2_CARRY", "0") == "1"
-        ),
         # M8 collapse for the L14 ADDR_KEY nibble decode: the load-query lo+hi
         # ENUMERATED (2 x 16x16 = 512 per-(lo,hi) AND) bank -> COMPUTED (2 x 32
         # per-nibble route) collapse (DEFAULT-OFF, opt in =1). Changes the L14
@@ -3860,6 +3838,13 @@ def _bake_from_scheduled_ops(
         # ops/shared.div_multipass_enabled.
         "C4_DIV_MULTIPASS": (
             os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
+        ),
+        # MUL byte-1 delivery (DEFAULT-OFF, opt in =1): OP_MUL/OP_SHL W_up
+        # blocker on the ``layer14_jsr_ax_bytes_zero`` clear units (idx104/idx106
+        # spurious-OP_JSR-leak). Output-affecting → ON / OFF builds must never
+        # share a serialised cache entry. See ops/l14_ops._mul_b1_delivery_enabled.
+        "C4_MUL_B1_DELIVERY": (
+            os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
         ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
