@@ -1187,6 +1187,16 @@ def all_core_ops(
         # declared). Phase=1400 — runs after every structural model
         # bake (expand_wrapper_blocks=1300).
         make_norm_compensator_seed_op(),
+        # CMP-opcode Q-veto on block-17 (logical L11) attention head 4 — the
+        # block-17 half of the combined ``C4_ALU_OPERAND_SURVIVE`` operand
+        # survival fix (its companion is the l9_ops block-15 clear spare).
+        # Registered unconditionally so the dep-graph topology is stable across
+        # the flag; the bake_fn is a clean early-return no-op when OFF
+        # (byte-identical golden e50521f3). Phase=1450 — after
+        # expand_wrapper_blocks (1300) and norm_compensator_seed (1400) so
+        # block-17's 8->13 head expansion has fully materialised head 4 before
+        # the patch lands.
+        make_cmp_h4_qveto_op(),
     ]
 
 

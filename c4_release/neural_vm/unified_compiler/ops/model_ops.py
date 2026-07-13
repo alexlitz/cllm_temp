@@ -3632,6 +3632,131 @@ def make_norm_compensator_seed_op() -> Operation:
     )
 
 
+# CMP-opcode Q-veto on block-17 (logical L11) attention head 4 --------------
+#
+# Root cause (docs/CMP_BLOCK17_COMPANION_2026_07_10.md,
+# docs/CMP_H4_QVETO_2026_07_13.md, docs/SERECOVER_DELETE_2026_07_13.md):
+# block-17 (logical L11, ``AutoregressiveAttention``, 13 heads, head_dim 111)
+# hosts a pair of runtime-materialised MEM->ALU load heads. Head 5 is CMP-gated
+# (its Q carries a large ``CMP+3`` term so it fires ON cmp result rows by
+# design); head 4 is the UN-gated twin (its Q carries a ``TEMP+3`` term and NO
+# cmp gate). Head 4 SELF-attends (w~0.96); its self-score is driven by
+# ``Q@TEMP+3``. On the passing ``x=5`` row ``TEMP+3=1.0`` -> self-score -5440
+# (head OFF); on the failing ``x=35`` (if_var id433, x>76) row a spurious
+# ``TEMP+3=2.0`` leaks onto the cmp result row -> self-score +491 (head ON) ->
+# the head writes a uniform ~-8 floor to every ALU_LO/HI cell, crushing the
+# clean GT one-hot (``min=-8, argmax@3=-2``).
+#
+# Fix (proven, ``tools/_probe_h4fix3.py``): add a large-negative CMP-opcode
+# veto to head 4's Q at the head-dim slots where its K reads the self /
+# ``CONST`` row (the ``K@CONST>1`` slots, materialised at head-dims 0 and 33 on
+# the built model). With ``W_q[4*HD+slot, OP_EQ..OP_GE] = -1e5`` head 4 is
+# vetoed on ANY cmp row: id433 goes ``min=-8, argmax@3=-2`` -> ``min=-0.1,
+# argmax@3=+6.0`` (clean one-hot); the passing ``x=5`` row is unchanged
+# (already clean); id437 is unchanged (that is the SEPARATE block-15 L9 clear
+# crush, handled by the ``C4_ALU_OPERAND_SURVIVE`` block-15 spare that shares
+# this flag).
+#
+# This is the block-17 half of the combined operand-survival fix, gated on the
+# SAME flag ``C4_ALU_OPERAND_SURVIVE`` (default-ON) as the block-15 L9-clear
+# spare (``l9_ops._alu_operand_survive_enabled``). The bake is a clean
+# early-return no-op when OFF, so golden flag-OFF state_dict is byte-identical
+# (e50521f3). Registered unconditionally (dep-graph topology stable across the
+# flag).
+_CMP_H4_QVETO_BLOCK = 17
+_CMP_H4_QVETO_HEAD = 4
+_CMP_H4_QVETO_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
+_CMP_H4_QVETO_MAGNITUDE = 1e5
+
+
+def _cmp_h4_qveto_enabled() -> bool:
+    """``C4_ALU_OPERAND_SURVIVE`` — default ON (byte-identical golden when =0).
+
+    Shared with ``l9_ops._alu_operand_survive_enabled`` (the block-15 spare);
+    this is the block-17 head-4 half.
+    """
+    import os as _os
+    return _os.environ.get("C4_ALU_OPERAND_SURVIVE", "1") != "0"
+
+
+def make_cmp_h4_qveto_op() -> Operation:
+    """Veto block-17 attention head 4 on CMP result rows (``C4_ALU_OPERAND_SURVIVE``).
+
+    Phase=1450 — runs AFTER ``expand_wrapper_blocks`` (1300) and the Qwen
+    ``norm_compensator_seed`` (1400) so block-17's 8->13 head expansion has
+    fully materialised head 4 and this patch lands on the FINAL Q weights.
+
+    No-op unless ``C4_ALU_OPERAND_SURVIVE`` is set (default ON; OFF only when
+    explicitly =0). When on: for each head-dim slot where head 4's K reads the
+    ``CONST`` self-row (``W_k[4*HD+s, CONST] > 1``, the slots the head uses to
+    score its own row), overwrite head 4's Q at the six CMP-opcode columns with
+    a large negative so the head's self-score collapses on any cmp result row
+    and it stops writing its ~-8 ALU floor.
+    """
+    def _bake(model, dim_positions, S):
+        del S
+        if not _cmp_h4_qveto_enabled():
+            return
+        import torch
+        blocks = getattr(model, "blocks", None)
+        if blocks is None or len(blocks) <= _CMP_H4_QVETO_BLOCK:
+            return
+        attn = getattr(blocks[_CMP_H4_QVETO_BLOCK], "attn", None)
+        if attn is None or not hasattr(attn, "W_q") or not hasattr(attn, "W_k"):
+            return
+        hd = int(getattr(attn, "head_dim", 0))
+        n_heads = int(getattr(attn, "num_heads", 0))
+        if hd <= 0 or n_heads <= _CMP_H4_QVETO_HEAD:
+            return
+        const_idx = dim_positions.get("CONST")
+        if const_idx is None:
+            return
+        op_cols = [
+            dim_positions[o]
+            for o in _CMP_H4_QVETO_OPS
+            if o in dim_positions
+        ]
+        if not op_cols:
+            return
+        base = _CMP_H4_QVETO_HEAD * hd
+        with torch.no_grad():
+            # Densify the (typically sparse-COO) Q/K parameters so the
+            # in-place index writes below land — mirrors the probe and the
+            # norm_compensator dense-path handling. K is read-only here.
+            wk = attn.W_k.data
+            if wk.layout != torch.strided:
+                wk = wk.to_dense()
+            wq = attn.W_q.data
+            if wq.layout != torch.strided:
+                wq_dense = wq.to_dense().contiguous()
+                attn.W_q = nn.Parameter(wq_dense, requires_grad=False)
+                wq = attn.W_q.data
+            # Slots where head 4's K scores the CONST self-row.
+            k_const = wk[base:base + hd, const_idx]
+            veto_slots = [s for s in range(hd) if float(k_const[s]) > 1.0]
+            for slot in veto_slots:
+                for col in op_cols:
+                    wq[base + slot, col] = -_CMP_H4_QVETO_MAGNITUDE
+
+    return Operation(
+        name="cmp_h4_qveto",
+        reads=set(),
+        writes=set(),
+        # Structural post-build weight patch: no per-step residual write
+        # surface, so the producer/consumer audit must not expect one.
+        audited_empty_produces=True,
+        kind="model",
+        declarative_bake_fn=_bake,
+        # Phase 1450: after norm_compensator_seed (1400) / expand_wrapper
+        # (1300) so the 13-head block-17 attention is fully materialised.
+        phase=1450,
+        migrated=True,
+        declarative_authority="structural_model",
+        smoke_tests={"all"},
+        spec_section="docs/SERECOVER_DELETE_2026_07_13.md",
+    )
+
+
 def make_contract_validation_op() -> Operation:
     """Run the contract validator. Previously inline in set_vm_weights.
 
