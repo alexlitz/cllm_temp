@@ -3137,6 +3137,13 @@ def _collect_ops_for_compile(
         # Campaign-gated; flag-OFF leaves block.ffn untouched (golden
         # byte-identical).
         ops.append(_static.make_loaded_operand_add_hi15_clear_op())
+        # CBC Phase 1 feasibility: DERIVED clean-one-hot operand delivery
+        # (C4_CLEAN_OPERAND, DEFAULT-OFF). Snaps ALU_LO/HI + AX_CARRY_LO/HI to a
+        # clean per-nibble one-hot on the binary-op/cmp MARK_AX rows. Must come
+        # AFTER loaded_operand_add_hi15_clear (it wraps whatever operand band the
+        # existing correctors produce). Flag-OFF leaves block.ffn untouched
+        # (golden byte-identical). See shared.clean_operand_enabled.
+        ops.append(_static.make_clean_operand_op())
         # Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task
         # #428). Wraps the L9 block.ffn (CMP nibble-comparator factory) to clean
         # the SE_ALU operand-A band on the MARK_SE_ONLY cmp row before the L9 CMP

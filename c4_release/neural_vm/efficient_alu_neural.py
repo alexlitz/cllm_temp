@@ -1339,6 +1339,99 @@ class LoadedOperandAddHi15ClearFFN(nn.Module):
         return None
 
 
+class CleanOperandOneHotFFN(nn.Module):
+    """Feasibility probe: derive a CLEAN nibble one-hot operand delivery.
+
+    Drop-in replacement for ``block.ffn`` of the L8 main block (physical block
+    11 — the operand-delivery block where ``make_layer8_mem_to_alu_op`` head 5 /
+    ``make_layer7_operand_gather_op`` write ALU_LO/HI at the binary-op MARK_AX
+    row). Holds the original L8 ALU ``PureFFN`` (``inner``) and, BEFORE
+    delegating to it, snaps the ALU_LO/HI (operand A) and AX_CARRY_LO/HI
+    (operand B) bands to a CLEAN per-nibble one-hot on the MARK_AX operand rows.
+
+    This is the ``C4_CLEAN_OPERAND`` feasibility flag (DEFAULT-OFF). It
+    GENERALISES the address-leak / index-0-artifact correctors
+    (``LoadedOperandAddHi15ClearFFN``, the func-add hi-nibble clear, the
+    ``CmpOperandSeRecoverFFN`` hybrid rebuild): instead of clearing SPECIFIC
+    leak cells, it derives a clean one-hot for the WHOLE band by keeping only
+    the argmax cell (the true nibble, delivered at ~SCALE_O=6.0) and zeroing
+    every other cell (the +0.45 cell-8 residue, the -0.52 cell-0 default-cancel
+    residue, the ~5.5 address-nibble two-hot, the ~5.3 index-0 magnitude
+    artifact). The kept cell is renormalised to the clean magnitude.
+
+    Purpose: measure whether a correct-by-construction clean operand lets the
+    downstream ALU/CMP derivations compute correctly WITHOUT their cleanup
+    correctors — the decisive go/no-go for eliminating the operand correctors.
+
+    Gate-OFF leaves ``block.ffn = inner`` exactly (byte-identical golden); the
+    wrap is installed only when ``clean_operand_enabled()``.
+    """
+
+    # The clean true-nibble magnitude the downstream lanes expect (SCALE_O).
+    CLEAN_MAG = 6.0
+    # Noise floor: a cell below this is treated as absent (the golden dirt is
+    # cell-8 ~0.45, cell-0 default-cancel ~0.52; the true one-hot is ~6.0, the
+    # address/index-0 two-hot leaks are ~5.3-5.5 — all >> 0.9). We keep ONLY the
+    # per-band argmax and zero the rest, so the floor only guards all-zero bands.
+    NOISE_FLOOR = 0.9
+
+    def __init__(self, inner: nn.Module, *, alu_lo, alu_hi, carry_lo, carry_hi,
+                 mark_ax, op_dims):
+        super().__init__()
+        self.inner = inner
+        self.alu_lo = int(alu_lo)
+        self.alu_hi = int(alu_hi)
+        self.carry_lo = int(carry_lo)
+        self.carry_hi = int(carry_hi)
+        self.mark_ax = int(mark_ax)
+        # Consumer opcode flag dims (ADD/SUB/MUL/DIV/MOD + six CMP). One-hot per
+        # step; a row is an operand-delivery row iff exactly one is set.
+        self.op_dims = tuple(int(d) for d in op_dims)
+        self._is_clean_operand_wrap = True
+
+    def _clean_band(self, band, active):
+        """Snap ``band`` [B,S,16] to a clean one-hot on ``active`` [B,S,1] rows.
+
+        Keep only the argmax cell (if it clears NOISE_FLOOR) at CLEAN_MAG; zero
+        everything else. Inactive rows are returned untouched.
+        """
+        # argmax cell + its value.
+        maxv, maxi = band.max(dim=-1, keepdim=True)  # [B,S,1]
+        has_hot = (maxv > self.NOISE_FLOOR).to(dtype=band.dtype)  # [B,S,1]
+        onehot = torch.zeros_like(band)
+        onehot.scatter_(-1, maxi, 1.0)
+        clean = onehot * (self.CLEAN_MAG * has_hot)
+        return band * (1.0 - active) + clean * active
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = x[:, :, self.op_dims[0]] > 0.5
+        for d in self.op_dims[1:]:
+            gate = gate | (x[:, :, d] > 0.5)
+        active = (gate & (x[:, :, self.mark_ax] > 0.5))[:, :, None].to(x.dtype)
+        x = x.clone()
+        for base in (self.alu_lo, self.alu_hi, self.carry_lo, self.carry_hi):
+            sl = slice(base, base + 16)
+            x[:, :, sl] = self._clean_band(x[:, :, sl], active)
+        return self.inner(x)
+
+    # ---- composite-FFN compatibility (plumb through to inner) ----
+    def compact(self, block_size=1):
+        if hasattr(self.inner, "compact"):
+            return self.inner.compact(block_size=block_size)
+        return None
+
+    def sparsify(self):
+        if hasattr(self.inner, "sparsify"):
+            return self.inner.sparsify()
+        return None
+
+    def compact_moe(self, opcode_range=None, relay_map=None):
+        fn = getattr(self.inner, "compact_moe", None)
+        if fn is not None:
+            return fn(opcode_range=opcode_range, relay_map=relay_map)
+        return None
+
+
 class CmpOperandSeRecoverFFN(nn.Module):
     """Campaign comparison operand-A SE_ALU recover wrapping the L10 cmp FFN.
 

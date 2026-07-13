@@ -2399,6 +2399,30 @@ def operand_cam_fix_enabled() -> bool:
     return no_stack0_emit_enabled() and (explicit is not None and explicit != "0")
 
 
+def clean_operand_enabled() -> bool:
+    """Return True iff the DERIVED clean-one-hot operand delivery is active
+    (``C4_CLEAN_OPERAND`` — DEFAULT-OFF feasibility flag).
+
+    Installs :class:`CleanOperandOneHotFFN` on the L8 main FFN (physical block
+    11, the operand-delivery block). On the binary-op / cmp MARK_AX rows it
+    snaps the ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) bands to a
+    clean per-nibble one-hot (keep the argmax at ~6.0, zero the cell-8/cell-0
+    residues + address two-hot + index-0 artifact). This is the correct-by-
+    construction generalisation of ALL the per-op address-leak / hybrid-rebuild
+    correctors (``LoadedOperandAddHi15ClearFFN``, ``CmpOperandSeRecoverFFN``,
+    the func-add hi-nibble clears).
+
+    Feasibility question (CBC Phase 1): does a CLEAN operand let the downstream
+    ALU carry side-signal + CMP decode compute correctly WITHOUT the correctors?
+    Gated behind the ``no_stack0_emit`` campaign flag so the flag-OFF golden
+    (``e50521f3``) build is byte-identical (the wrap is never installed off the
+    campaign / off the flag).
+    """
+    if os.environ.get("C4_CLEAN_OPERAND", "0") == "0":
+        return False
+    return no_stack0_emit_enabled()
+
+
 def func_cmp_operand_clean_enabled() -> bool:
     """Return True iff the func_max/func_min CMP loaded-operand-A two-hot clean
     is active (DEFAULT-OFF ``C4_FUNC_CMP_OPERAND_CLEAN``; opt in with ``=1``).
