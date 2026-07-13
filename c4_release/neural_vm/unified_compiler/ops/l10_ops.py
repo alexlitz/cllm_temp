@@ -3321,15 +3321,28 @@ def _byte_passthrough_chain_spec(
     )
 
 
+def _bake_r_frame_passthrough_head(attn, BD, S, HD, *, spec_fn, alibi_idx) -> None:
+    """Shared R-FRAME register byte-passthrough head bake.
+
+    INCR-1 collapse: the AX/SP/BP/PC ``_bake_layer10_*_byte_passthrough_head``
+    helpers were byte-for-byte identical apart from ``spec_fn`` (the
+    per-register head spec) and ``alibi_idx`` (the L10 attention slot the ALiBi
+    slope 1.0 tie-break is written to). Both are per-register DATA, so the bake
+    is a single shared lowering driven by that data. Emits the identical
+    ``generate_attention_head`` weights + the same single ``alibi_slopes``
+    write, so the golden hash is UNCHANGED.
+    """
+    Primitives.generate_attention_head(attn, spec_fn(BD, S), HD)
+    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+        attn.alibi_slopes.data[alibi_idx] = 1.0
+
+
 def _bake_layer10_byte_passthrough_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 1 AX byte passthrough spec."""
-    Primitives.generate_attention_head(
-        attn,
-        _layer10_ax_byte_passthrough_head_spec(BD, S),
-        HD,
+    _bake_r_frame_passthrough_head(
+        attn, BD, S, HD,
+        spec_fn=_layer10_ax_byte_passthrough_head_spec, alibi_idx=1,
     )
-    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-        attn.alibi_slopes.data[1] = 1.0
 
 
 def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
@@ -3601,25 +3614,18 @@ def _layer10_ax_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpe
 
 def _bake_layer10_sp_byte_passthrough_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 2 SP byte passthrough spec."""
-    SP_IDX = 2
-    Primitives.generate_attention_head(
-        attn,
-        _layer10_sp_byte_passthrough_head_spec(BD, S),
-        HD,
+    _bake_r_frame_passthrough_head(
+        attn, BD, S, HD,
+        spec_fn=_layer10_sp_byte_passthrough_head_spec, alibi_idx=2,
     )
-    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-        attn.alibi_slopes.data[2] = 1.0
 
 
 def _bake_layer10_bp_byte_passthrough_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 7 BP byte passthrough spec."""
-    Primitives.generate_attention_head(
-        attn,
-        _layer10_bp_byte_passthrough_head_spec(BD, S),
-        HD,
+    _bake_r_frame_passthrough_head(
+        attn, BD, S, HD,
+        spec_fn=_layer10_bp_byte_passthrough_head_spec, alibi_idx=7,
     )
-    if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-        attn.alibi_slopes.data[7] = 1.0
 
 
 def _layer10_sp_byte_passthrough_head_spec(BD, S) -> DeclarativeAttentionHeadSpec:
@@ -4578,44 +4584,50 @@ def _layer10_carry_relay_ir(dim_positions, HD) -> CompilerIR:
     return ir
 
 
-def _layer10_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
+def _r_frame_passthrough_ir(dim_positions, *, spec_fn, ir_name) -> CompilerIR:
+    """Shared R-FRAME register byte-passthrough ``compiler_ir_factory``.
+
+    INCR-1 collapse: the AX/SP/BP/PC ``_layer10_*_byte_passthrough_ir``
+    factories were byte-for-byte identical apart from the head spec function
+    and the IR head name (both per-register data). One shared factory appends
+    the identical head IR, so census/IR output is UNCHANGED.
+    """
     proxy = _as_setdim_proxy(dim_positions)
     ir = CompilerIR()
-    ir.layer(0).attention.append(
-        _layer10_ax_byte_passthrough_head_spec(proxy, 100.0),
-        name="layer10_byte_passthrough_bake.head_1",
-    )
+    ir.layer(0).attention.append(spec_fn(proxy, 100.0), name=ir_name)
     return ir
+
+
+def _layer10_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
+    return _r_frame_passthrough_ir(
+        dim_positions,
+        spec_fn=_layer10_ax_byte_passthrough_head_spec,
+        ir_name="layer10_byte_passthrough_bake.head_1",
+    )
 
 
 def _layer10_sp_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
-    proxy = _as_setdim_proxy(dim_positions)
-    ir = CompilerIR()
-    ir.layer(0).attention.append(
-        _layer10_sp_byte_passthrough_head_spec(proxy, 100.0),
-        name="layer10_sp_byte_passthrough_bake.head_2",
+    return _r_frame_passthrough_ir(
+        dim_positions,
+        spec_fn=_layer10_sp_byte_passthrough_head_spec,
+        ir_name="layer10_sp_byte_passthrough_bake.head_2",
     )
-    return ir
 
 
 def _layer10_bp_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
-    proxy = _as_setdim_proxy(dim_positions)
-    ir = CompilerIR()
-    ir.layer(0).attention.append(
-        _layer10_bp_byte_passthrough_head_spec(proxy, 100.0),
-        name="layer10_bp_byte_passthrough_bake.head_7",
+    return _r_frame_passthrough_ir(
+        dim_positions,
+        spec_fn=_layer10_bp_byte_passthrough_head_spec,
+        ir_name="layer10_bp_byte_passthrough_bake.head_7",
     )
-    return ir
 
 
 def _layer10_pc_byte_passthrough_ir(dim_positions, HD) -> CompilerIR:
-    proxy = _as_setdim_proxy(dim_positions)
-    ir = CompilerIR()
-    ir.layer(0).attention.append(
-        _layer10_pc_byte_passthrough_head_spec(proxy, 100.0),
-        name="layer10_pc_byte_passthrough_bake.head_11",
+    return _r_frame_passthrough_ir(
+        dim_positions,
+        spec_fn=_layer10_pc_byte_passthrough_head_spec,
+        ir_name="layer10_pc_byte_passthrough_bake.head_11",
     )
-    return ir
 
 
 def _layer10_psh_stack0_passthrough_ir(dim_positions, HD) -> CompilerIR:
@@ -5076,19 +5088,33 @@ def make_layer10_carry_relay_bake_op() -> Operation:
     )
 
 
-def make_layer10_byte_passthrough_bake_op() -> Operation:
-    """Bake ``_set_layer10_byte_passthrough`` into ``model.blocks[10].attn``.
+def _make_r_frame_passthrough_bake_op(
+    *,
+    op_name: str,
+    head_slot: int,
+    spec_fn,
+    ir_factory,
+    reads: set,
+    smoke_tests: set,
+    requires: dict | None = None,
+) -> Operation:
+    """Shared R-FRAME register byte-passthrough ``Operation`` builder.
 
-    Was an inline call in ``set_vm_weights`` (both branches):
-    ``_set_layer10_byte_passthrough(attn10, S, BD, HD)``. Inline call
-    removed; this op now owns the bake. Phase=10.1.
+    INCR-1 collapse (register-emission-frame). The AX/SP/BP/PC
+    ``make_layer10_*_byte_passthrough_bake_op`` functions were structurally
+    identical: each pinned the L10 head allocator, lowered its per-register
+    head spec via ``generate_attention_head``, wrote ``alibi_slopes[slot]=1.0``,
+    declared the SAME OUTPUT_LO/HI ``CLEAN_EMBED`` V-claims (only the head slot
+    varied), and returned an ``Operation`` with the identical
+    ``target_op_name/migrated/declarative_authority/writes/spec_section``.
+    The ONLY per-register data is the 5-tuple ``(op_name, head_slot, spec_fn,
+    reads, smoke_tests)`` (+ PC's ``requires``). This builder is that data
+    table's single lowering; each ``make_*`` below is a one-line call, so the
+    emitted Operation — and therefore the golden hash — is UNCHANGED.
 
-    Phase 6 Wave 2D: migrated to ``AttentionHeadIR`` form. The head_idx=1
-    literal is replaced with a pinned-allocator lookup
-    (``_l10_head_idx("layer10_byte_passthrough_bake.head_1")``); the
-    bake_fn stashes a per-bake :class:`AttentionHeadAllocator` on ``attn``
-    so the L10 head axis is auditable. See
-    ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
+    The V/O nibble copy (``range(16)`` CLEAN_EMBED_LO/HI -> OUTPUT_LO/HI) is
+    already shared inside ``_byte_passthrough_chain_spec``; this collapses the
+    surrounding per-register bake/claim/Operation GLUE.
     """
     def bake(block, dim_positions, S):
         proxy = _as_setdim_proxy(dim_positions)
@@ -5098,33 +5124,60 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
         head_allocator = _allocate_layer10_attention_heads()
         attn._l10_head_allocator = head_allocator
         HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the head spec directly into ``attn``
-        # (was ``_bake_layer10_byte_passthrough_head``) so census v2
-        # classifies this op as ``declarative``.
-        Primitives.generate_attention_head(
-            attn, _layer10_ax_byte_passthrough_head_spec(proxy, S), HD,
-        )
+        Primitives.generate_attention_head(attn, spec_fn(proxy, S), HD)
         if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes.data[1] = 1.0
+            attn.alibi_slopes.data[head_slot] = 1.0
 
-    # Dim-ownership claims: L10 attn head 1 AX byte passthrough.
-    # ``byte_passthrough_chain`` writes V slots 0..31 + O writes OUTPUT_LO/HI:
-    #   W_v[1*HD + k, CLEAN_EMBED_LO + k]    for k=0..15
-    #   W_v[1*HD + 16 + k, CLEAN_EMBED_HI + k]  for k=0..15
-    #   W_o[OUTPUT_LO + k, 1*HD + k]         for k=0..15
-    #   W_o[OUTPUT_HI + k, 1*HD + 16 + k]    for k=0..15
+    # Dim-ownership claims: the byte_passthrough chain writes V slots 0..31 +
+    # O writes OUTPUT_LO/HI at this head slot:
+    #   W_v[slot*HD + k, CLEAN_EMBED_LO + k]       for k=0..15
+    #   W_v[slot*HD + 16 + k, CLEAN_EMBED_HI + k]  for k=0..15
+    #   W_o[OUTPUT_LO + k, slot*HD + k]            for k=0..15
+    #   W_o[OUTPUT_HI + k, slot*HD + 16 + k]       for k=0..15
     _claims = set()
     for k in range(16):
-        _claims.add((10, "attn_W_v", f"1_{k}", f"CLEAN_EMBED_LO+{k}"))
-        _claims.add((10, "attn_W_v", f"1_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
+        _claims.add((10, "attn_W_v", f"{head_slot}_{k}", f"CLEAN_EMBED_LO+{k}"))
+        _claims.add(
+            (10, "attn_W_v", f"{head_slot}_{16 + k}", f"CLEAN_EMBED_HI+{k}")
+        )
 
+    kwargs = {}
+    if requires is not None:
+        kwargs["requires"] = requires
     return Operation(
-        name="layer10_byte_passthrough_bake",
-        # Phase 8.A.6 v2: matches layer10_byte_passthrough's TEMP_PREV_STEP
-        # rename. See that op for rationale.
-        # Declaration audit (2026-06-05): added MARK_AX, H3, H4, MEM_VAL_B0,
-        # MEM_ADDR_SRC, OP_SI, OP_SC, CMP, CONST to cover the full Q/K read
-        # set of _layer10_ax_byte_passthrough_head_spec lowered here.
+        name=op_name,
+        reads=reads,
+        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
+        kind="block",
+        declarative_bake_fn=bake,
+        compiler_ir_factory=ir_factory,
+        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
+        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
+        # attn-only sibling anchor) so the L10 attn family can migrate layers
+        # independently of ``layer10_alu`` (1846 FFN units). Metadata-only at
+        # L10 today.
+        target_op_name="_layer10_attn_anchor",
+        migrated=True,
+        declarative_authority="spec_generated",
+        claims=_claims,
+        smoke_tests=smoke_tests,
+        spec_section="BLOG_SPEC.md#registers",
+        **kwargs,
+    )
+
+
+def make_layer10_byte_passthrough_bake_op() -> Operation:
+    """Bake the AX byte-passthrough head into ``model.blocks[10].attn`` (slot 1).
+
+    INCR-1: thin call over ``_make_r_frame_passthrough_bake_op``. The AX row's
+    per-register data is its head spec (``_layer10_ax_byte_passthrough_head_spec``
+    — the LI-reload query blocks) + the full Q/K read set audited 2026-06-05.
+    """
+    return _make_r_frame_passthrough_bake_op(
+        op_name="layer10_byte_passthrough_bake",
+        head_slot=1,
+        spec_fn=_layer10_ax_byte_passthrough_head_spec,
+        ir_factory=_layer10_byte_passthrough_ir,
         reads={"IS_BYTE", "HAS_SE", "OP_IMM", "OP_LI_RELAY", "OP_LC_RELAY",
                "OP_SI", "OP_SC", "TEMP.*.-1", "CMP", "CONST",
                "H1", "H3", "H4", "MARK_AX",
@@ -5132,214 +5185,78 @@ def make_layer10_byte_passthrough_bake_op() -> Operation:
                "BYTE_INDEX_3", "MEM_STORE", "MEM_ADDR_SRC",
                "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir_factory=_layer10_byte_passthrough_ir,
-        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
-        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
-        # attn-only sibling anchor). Both resolve to L10 today; the split
-        # lets a future Phase 2 retry move the attn family to a non-L10
-        # layer without dragging ``layer10_alu`` (1846 FFN units) along.
-        target_op_name="_layer10_attn_anchor",
-        migrated=True,
-        declarative_authority="spec_generated",
-        claims=_claims,
         smoke_tests={"all"},
-        spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer10_sp_byte_passthrough_bake_op() -> Operation:
-    """Bake ``_set_layer10_sp_byte_passthrough`` into ``model.blocks[10].attn``.
+    """Bake the SP byte-passthrough head into ``model.blocks[10].attn`` (slot 2).
 
-    Was an inline call in ``set_vm_weights`` (both branches):
-    ``_set_layer10_sp_byte_passthrough(attn10, S, BD, HD)``. Inline call
-    removed; this op now owns the bake. Phase=10.2.
-
-    Phase 6 Wave 2D: migrated to ``AttentionHeadIR`` form. The head_idx=2
-    literal is replaced with a pinned-allocator lookup
-    (``_l10_head_idx("layer10_sp_byte_passthrough_bake.head_2")``); the
-    bake_fn stashes a per-bake :class:`AttentionHeadAllocator` on ``attn``.
-    See ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
+    INCR-1: thin call over ``_make_r_frame_passthrough_bake_op``.
     """
-    def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        # Per-bake attention-head allocator with the L10 head layout pinned.
-        # See ``make_layer10_carry_relay_bake_op`` for the rationale.
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the head spec directly into ``attn``
-        # (was ``_bake_layer10_sp_byte_passthrough_head``) so census v2
-        # classifies this op as ``declarative``.
-        Primitives.generate_attention_head(
-            attn, _layer10_sp_byte_passthrough_head_spec(proxy, S), HD,
-        )
-        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes.data[2] = 1.0
-
-    # Dim-ownership claims: L10 attn head 2 SP byte passthrough.
-    #   W_v[2*HD + k, CLEAN_EMBED_LO + k]      for k=0..15
-    #   W_v[2*HD + 16 + k, CLEAN_EMBED_HI + k] for k=0..15
-    _claims = set()
-    for k in range(16):
-        _claims.add((10, "attn_W_v", f"2_{k}", f"CLEAN_EMBED_LO+{k}"))
-        _claims.add((10, "attn_W_v", f"2_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
-
-    return Operation(
-        name="layer10_sp_byte_passthrough_bake",
-        # Declaration audit (2026-06-05): added MARK_SP, CONST to mirror the
-        # Q/K read set of _layer10_sp_byte_passthrough_head_spec.
+    return _make_r_frame_passthrough_bake_op(
+        op_name="layer10_sp_byte_passthrough_bake",
+        head_slot=2,
+        spec_fn=_layer10_sp_byte_passthrough_head_spec,
+        ir_factory=_layer10_sp_byte_passthrough_ir,
         reads={"IS_BYTE", "HAS_SE", "H1", "MARK_SP", "CONST", "PSH_AT_SP", "CMP",
                "OP_ENT", "OP_JSR",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
                "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir_factory=_layer10_sp_byte_passthrough_ir,
-        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
-        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
-        # attn-only sibling anchor). Metadata-only at L10 today; enables
-        # the future Phase 2 retry to separate attn and FFN families.
-        target_op_name="_layer10_attn_anchor",
-        migrated=True,
-        declarative_authority="spec_generated",
-        claims=_claims,
         smoke_tests={"all"},
-        spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer10_bp_byte_passthrough_bake_op() -> Operation:
-    """Bake BP upper-byte passthrough into ``model.blocks[10].attn``.
+    """Bake the BP byte-passthrough head into ``model.blocks[10].attn`` (slot 7).
 
     BP byte 0 is carried at the marker by L3. This head carries bytes 1-3
-    across ordinary non-ENT/LEV steps so BP remains valid after the first
-    synthetic step and while executing inside functions.
-
-    Phase 6 Wave 2D: migrated to ``AttentionHeadIR`` form. The head_idx=7
-    literal is replaced with a pinned-allocator lookup
-    (``_l10_head_idx("layer10_bp_byte_passthrough_bake.head_7")``); the
-    bake_fn stashes a per-bake :class:`AttentionHeadAllocator` on ``attn``.
-    See ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
+    across ordinary non-ENT/LEV steps so BP remains valid inside functions.
+    INCR-1: thin call over ``_make_r_frame_passthrough_bake_op``.
     """
-    def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        # Per-bake attention-head allocator with the L10 head layout pinned.
-        # See ``make_layer10_carry_relay_bake_op`` for the rationale.
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the head spec directly into ``attn``
-        # (was ``_bake_layer10_bp_byte_passthrough_head``) so census v2
-        # classifies this op as ``declarative``.
-        Primitives.generate_attention_head(
-            attn, _layer10_bp_byte_passthrough_head_spec(proxy, S), HD,
-        )
-        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes.data[7] = 1.0
-
-    _claims = set()
-    for k in range(16):
-        _claims.add((10, "attn_W_v", f"7_{k}", f"CLEAN_EMBED_LO+{k}"))
-        _claims.add((10, "attn_W_v", f"7_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
-
-    return Operation(
-        name="layer10_bp_byte_passthrough_bake",
-        # Declaration audit (2026-06-05): added CONST, MARK_STACK0, MEM_STORE,
-        # MEM_ADDR_SRC, CMP, ADDR_B0_LO, ADDR_B0_HI, STACK0_BYTE0/1/2 to mirror
-        # the Q/K read set of _layer10_bp_byte_passthrough_head_spec (the head
-        # spec lowered here uses these dims in top_store_query rows; ADDR_B0_*
-        # are the shareable dims most affected by the audit).
+    return _make_r_frame_passthrough_bake_op(
+        op_name="layer10_bp_byte_passthrough_bake",
+        head_slot=7,
+        spec_fn=_layer10_bp_byte_passthrough_head_spec,
+        ir_factory=_layer10_bp_byte_passthrough_ir,
         reads={"IS_BYTE", "HAS_SE", "H1", "OP_ENT", "OP_LEV",
                "CONST", "MARK_STACK0", "MEM_STORE", "MEM_ADDR_SRC", "CMP",
                "ADDR_B0_LO", "ADDR_B0_HI",
                "STACK0_BYTE0", "STACK0_BYTE1", "STACK0_BYTE2",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir_factory=_layer10_bp_byte_passthrough_ir,
-        # Phase 3 (mem cluster fix, 2026-06-05): retargeted from
-        # ``layer10_carry_relay`` to ``_layer10_attn_anchor`` (the new
-        # attn-only sibling anchor). Metadata-only at L10 today.
-        target_op_name="_layer10_attn_anchor",
-        migrated=True,
-        declarative_authority="spec_generated",
-        claims=_claims,
         smoke_tests={
             "TestSmokeBasic::test_add_basic",
             "TestSmokeFunctionCall::test_simple_function",
         },
-        spec_section="BLOG_SPEC.md#registers",
     )
 
 
 def make_layer10_pc_byte_passthrough_bake_op() -> Operation:
-    """Bake PC upper-byte passthrough into ``model.blocks[10].attn``.
+    """Bake the PC byte-passthrough head into ``model.blocks[10].attn`` (slot 11).
 
-    PC byte 0 is written by L3 (default IS_BYTE -> byte 0 = PC_idx
-    increment) and overridden by L6/L7 (JSR/JMP/branch target) or L9
-    (LEV mem[BP+8] byte 0). This head carries PC bytes 1-3 across
-    ordinary non-branch / non-LEV steps so PC stays valid at MARK_PC
-    byte rows for downstream heads (notably the AX byte_passthrough
-    cross-step value lookup). Mirrors the BP/SP/AX byte_passthrough
-    bake ops; runs at L10 attn slot 11.
-
-    See ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md`` (2026-05-11) for the
-    architectural cascade this closes the first step on.
+    PC byte 0 is written by L3 and overridden by L6/L7 (JSR/JMP/branch target)
+    or L9 (LEV mem[BP+8] byte 0). This head carries PC bytes 1-3 across ordinary
+    non-branch / non-LEV steps. See ``docs/PHASE_5_JSR_ENT_LEV_FOLLOWUP.md``.
+    INCR-1: thin call over ``_make_r_frame_passthrough_bake_op``. The
+    ``requires`` clause pins the attn resize (8 -> 13 heads) before this bake so
+    slot 11 is in-bounds.
     """
-    def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        # Per-bake attention-head allocator with the L10 head layout pinned.
-        # See ``make_layer10_carry_relay_bake_op`` for the rationale.
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        Primitives.generate_attention_head(
-            attn, _layer10_pc_byte_passthrough_head_spec(proxy, S), HD,
-        )
-        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes.data[11] = 1.0
-
-    # Dim-ownership claims: L10 attn head 11 PC byte passthrough.
-    # ``byte_passthrough_chain`` writes V slots 0..31 + O writes
-    # OUTPUT_LO/HI mirror the AX/SP/BP heads.
-    _claims = set()
-    for k in range(16):
-        _claims.add((10, "attn_W_v", f"11_{k}", f"CLEAN_EMBED_LO+{k}"))
-        _claims.add((10, "attn_W_v", f"11_{16 + k}", f"CLEAN_EMBED_HI+{k}"))
-
-    return Operation(
-        name="layer10_pc_byte_passthrough_bake",
+    return _make_r_frame_passthrough_bake_op(
+        op_name="layer10_pc_byte_passthrough_bake",
+        head_slot=11,
+        spec_fn=_layer10_pc_byte_passthrough_head_spec,
+        ir_factory=_layer10_pc_byte_passthrough_ir,
         reads={"IS_BYTE", "HAS_SE", "H1", "CONST",
                "OP_JSR", "OP_JMP", "OP_BZ", "OP_BNZ", "OP_LEV",
                "MARK_STACK0",
                "MEM_VAL_B0", "MEM_VAL_B1", "MEM_VAL_B2", "MEM_VAL_B3",
                "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2",
                "BYTE_INDEX_3", "CLEAN_EMBED_LO", "CLEAN_EMBED_HI"},
-        writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        kind="block",
-        declarative_bake_fn=bake,
-        compiler_ir_factory=_layer10_pc_byte_passthrough_ir,
-        target_op_name="_layer10_attn_anchor",
-        migrated=True,
-        declarative_authority="spec_generated",
-        # Ensure attn resize (8 -> 13 heads) runs before this bake so
-        # slot 11 is in-bounds when generate_attention_head writes
-        # W_q/W_k/W_v/W_o at head_idx=11.
-        requires={"after": "l10_attention_resize"},
-        claims=_claims,
         smoke_tests={
             "TestSmokeFunctionCall::test_simple_function",
         },
-        spec_section="BLOG_SPEC.md#registers",
+        requires={"after": "l10_attention_resize"},
     )
 
 
