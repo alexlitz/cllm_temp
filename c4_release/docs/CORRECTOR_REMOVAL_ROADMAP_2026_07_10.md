@@ -87,9 +87,15 @@ The `CleanOperandOneHotFFN` docstring states this verbatim: "It GENERALISES the
 address-leak / index-0-artifact correctors (`LoadedOperandAddHi15ClearFFN`, the
 func-add hi-nibble clear …)".
 
-*Fast-gate evidence:* `tools/fast_gate.py --flag C4_LOADED_OPERAND_ADD_HI15_CLEAR`
-(OFF = corrector removed; ON = present), CLEAN_OPERAND_ADD default-ON in both.
-**[RESULT PENDING — see §RESULTS below; net ≥ 0 ⟹ FREE −224 LOC delete.]**
+*Fast-gate evidence (§RESULTS):* `tools/fast_gate.py --flag
+C4_LOADED_OPERAND_ADD_HI15_CLEAR` (OFF = corrector removed; ON = present),
+CLEAN_OPERAND_ADD default-ON in both — **byte-identical corpus verdicts** (same
+`got_ax`, same `divergence_step`) on every diverging id across
+add/sub/mul/func_add/func_mul/var_update/var_mul/expr_add_mul/absdiff/if_var,
+net = **0**. Corroborated by a **numerical inertness proof** (`max_abs_diff =
+0.0` between the clean-wrap-over-Hi15Clear and clean-wrap-over-bare-PureFFN
+forward on a synthetic dirty ADD MARK_AX row). ⟹ **FREE −224 LOC delete
+(EXECUTED, §STEP 3).**
 
 ### CLASS B — DERIVABLE-ROOT (deletion needs a specific root derived first)
 
@@ -123,12 +129,41 @@ EMIT/MEMORY derive-roots (multi-session), NOT free.
 
 ## STEP 3 — FREE DELETES EXECUTED
 
-**[PENDING the class-A fast-gate result — §RESULTS. If net ≥ 0, delete
-`LoadedOperandAddHi15ClearFFN` + `make_loaded_operand_add_hi15_clear_op` + the
-3 companion flags/branches (`C4_FUNCADD_ALU_HI13_CLEAR`, `C4_FUNC_ADD_B0_HINIB`,
-the `contam_cells` widening in `alu_ops.py`), collapsing `make_clean_operand_op`
-to wrap the bare `PureFFN` directly. −224 LOC. Re-verify: fast-gate net ≥ 0 +
-golden flag-OFF == `e50521f3` + smoke 51/51.]**
+**A1 — `LoadedOperandAddHi15ClearFFN` removed (−224 LOC). EXECUTED (commit
+`5ebb8da2`).**
+
+Deleted:
+- `LoadedOperandAddHi15ClearFFN` class (`efficient_alu_neural.py`, **−127**).
+- `make_loaded_operand_add_hi15_clear_op` (`alu_ops.py`, **−97**) + its
+  registration in `full_vm_compiler_dynamic.py` + its export in
+  `_legacy_redirect.py`.
+- `make_clean_operand_op` now `requires={"after": ("efficient_l8_addsub_wrap",)}`
+  and wraps the raw L8 operand-delivery `PureFFN` directly (block 12 chain is now
+  `CleanOperandOneHotFFN → PureFFN`, was `→ LoadedOperandAddHi15ClearFFN →`).
+- `faithful_interpreter.COMPOSITE_ALU_FFN`: swapped the removed
+  `LoadedOperandAddHi15ClearFFN` name for `CleanOperandOneHotFFN` (the outer
+  wrap now recognised for zero-opaque IR coverage).
+
+Left in place (inert, byte-harmless, not on any live build path anymore): the 4
+now-dead flag defs (`loaded_operand_add_hi15_clear_enabled`,
+`funcadd_alu_hi13_clear_enabled`, `func_add_b0_hinib_enabled`,
+`operand_cam_fix_enabled`) + their cache-key entries — removing them changes no
+weights; a follow-up dead-flag sweep can drop them (~110 LOC) once a fleet pass
+re-runs the full memo/serialised-cache-key audit.
+
+**Re-verification (all gates PASS):**
+- **golden flag-OFF byte-identity:** `tools/_isa_golden_hash.py` == `e50521f3`
+  (unchanged — the lookup/golden build never installed the wrap).
+- **campaign build:** block-12 ffn = `CleanOperandOneHotFFN → PureFFN` (Hi15Clear
+  gone); all other SeRecover wraps intact.
+- **fast-gate `--base main` (main corrector-present vs HEAD corrector-removed),
+  affected clusters (74 ids × 10 clusters):** base 53p/21f, HEAD 53p/21f, **NET =
+  0** (0 gains, 0 regressions, 0 per-id verdict differences — byte-identical
+  campaign build).
+- **smoke:** `pytest tests/test_smoke.py` **51/51 PASS** (spec_k=0, GPU, isolated
+  cache).
+
+**Running −LOC total (free deletes this session): −224.**
 
 ---
 
@@ -167,8 +202,74 @@ provenance-anchor (unlocks the L14 clear family).
 - Full: `run_1096_canonical --criterion full_trace --spec-k 0 --max-steps-cap 40`
   ≥ 593; `pytest tests/test_smoke.py` 51/51.
 
-## RESULTS (fast-gate evidence)
+## RESULTS (evidence for the A1 free delete)
 
-**[TO BE FILLED — class-A `C4_LOADED_OPERAND_ADD_HI15_CLEAR` fast-gate running
-CPU, affected clusters. OFF pass vs ON pass → net.]**
+### 1. Numerical inertness proof (the primary evidence)
+
+On the built campaign model, block 12's ffn chain was
+`CleanOperandOneHotFFN → LoadedOperandAddHi15ClearFFN → PureFFN`. Feeding a
+synthetic dirty ADD MARK_AX row (true nibble @3 = 6.0, cell-15 leak = 5.5,
+operand-B bleed @4 = 1.0) and comparing the forward of `clean(x)` (wrap over
+Hi15Clear over PureFFN) vs `clean_noinner(x)` (wrap over bare PureFFN):
+
+```
+max |y_with_inner - y_without_inner| on ADD MARK_AX rows = 0.0
+=> LoadedOperandAddHi15ClearFFN is INERT (byte-identical) after the clean-snap
+```
+
+The clean-snap (which runs FIRST, `forward` at `efficient_alu_neural.py:1412`)
+keeps only the per-band argmax at 6.0 and zeros every other ALU_HI cell on the
+ADD row, so cells 13/15/4 are already 0 before the inner's contaminant-window
+clear runs → the inner has nothing to clear.
+
+### 2. fast-gate `C4_LOADED_OPERAND_ADD_HI15_CLEAR` (OFF=removed, ON=present)
+
+Byte-level per-id compare on the 8 diverging ids logged across the affected
+clusters — `got_ax` and `divergence_step` **IDENTICAL** OFF vs ON on every row
+(idx 275/279/283/287 expr_add_mul, 1046/1052/1058/1064 absdiff family). The
+other 66 ids pass in both states. Net = 0.
+
+### 3. fast-gate `--base main` (main present vs HEAD removed), 74 ids × 10 clusters
+
+```
+OFF (base=main, corrector present): pass=53 fail=21
+ON  (HEAD, corrector removed):      pass=53 fail=21
+GAINS 0   REGRESSIONS 0   NET = 0   (0 per-id verdict differences)
+```
+
+### 4. golden flag-OFF byte-identity
+
+```
+CUDA_VISIBLE_DEVICES="" tools/_isa_golden_hash.py
+  state_dict_sha256 = e50521f32b0ed952d5730f79b63adb8c4c78f4d4f0466d3bcbaa354bb3c90e86  (== e50521f3)
+```
+
+### 5. smoke
+
+```
+pytest tests/test_smoke.py  ->  51 passed, 1 deselected  (spec_k=0, GPU)
+```
+
+**Conclusion:** the A1 delete (`LoadedOperandAddHi15ClearFFN`, −224 LOC) is a
+verified FREE delete — byte-identical golden, byte-identical campaign build, net
+0 corpus, smoke 51/51. Committed `5ebb8da2`.
+
+---
+
+## APPENDIX — corrector-debt LOC by file (measured at `e50521f3`, pre-delete)
+
+| File | total LOC | corrector LOC (of that) | biggest corrector |
+|------|----------:|------------------------:|-------------------|
+| `l10_ops.py` | 13,737 | ~5,300 | `_tail_bit32_result_correction_rules` 4,599 |
+| `l6_ops.py` | 4,851 | ~960 | PC-override / SP-fixup family |
+| `l14_ops.py` | 5,912 | ~1,100 | clear/guard family 723 + AX-emission |
+| `efficient_alu_neural.py` | 3,143 | ~815 | SeRecover family (Cmp/Mul/Bitwise) 517 |
+| `l11_ops.py` | 3,200 | ~400 | AX-dump emission family |
+| `l0_ops.py` | 1,037 | 151 | no-stack0 PC hi-byte clear |
+
+The corrector debt is **heavily concentrated in the L25 tail bank (Class C,
+item #1, 4,761 LOC = 53% of all corrector debt)** — deletable only via the deep
+EMIT G5 clean-emitter derive-root, not free. The FREE / near-free wins are the
+operand-cleanup wrappers (Class A done −224; Class B −715 behind 3 bounded
+engine-derive missions).
 </content>
