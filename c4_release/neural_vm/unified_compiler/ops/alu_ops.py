@@ -1061,6 +1061,76 @@ def make_loaded_operand_add_hi15_clear_op() -> Operation:
     )
 
 
+def make_clean_operand_op() -> Operation:
+    """DERIVED clean-one-hot operand delivery (CBC Phase 1 feasibility flag).
+
+    Wraps ``model.blocks[8].ffn`` (the L8 main FFN, physical block 11 — the
+    operand-delivery block) with :class:`CleanOperandOneHotFFN`, which snaps
+    the ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) bands to a clean
+    per-nibble one-hot on the binary-op / cmp MARK_AX rows. This is the
+    correct-by-construction generalisation of the per-op address-leak / hybrid-
+    rebuild correctors. See ``shared.clean_operand_enabled``.
+
+    Installed when ``no_stack0_emit_enabled()`` AND either the feasibility flag
+    (``clean_operand_enabled()`` — ``C4_CLEAN_OPERAND=1``, cleans ALL eleven
+    ADD/SUB/MUL/DIV/MOD + six-CMP consumer rows) OR the arithmetic-only CBC
+    pass-gain (``clean_operand_add_enabled()`` — ``C4_CLEAN_OPERAND_ADD=1``,
+    cleans ONLY the five arithmetic rows, leaving the CMP calibration contract
+    intact). Flag-OFF / non-campaign leaves ``block.ffn`` exactly (byte-identical
+    golden ``e50521f3``). Runs AFTER ``loaded_operand_add_hi15_clear`` so it
+    wraps whatever operand band the existing correctors produced (the clean
+    one-hot is the last word).
+    """
+    def bake(model, dim_positions, S):
+        from .shared import (
+            no_stack0_emit_enabled,
+            clean_operand_enabled,
+            clean_operand_add_enabled,
+        )
+        if not no_stack0_emit_enabled():
+            return
+        full = clean_operand_enabled()
+        arith_only = clean_operand_add_enabled()
+        if not (full or arith_only):
+            return
+        from ...efficient_alu_neural import CleanOperandOneHotFFN
+        BD = _as_setdim_proxy(dim_positions)
+        block = model.blocks[8]
+        if getattr(block.ffn, "_is_clean_operand_wrap", False):
+            return
+        # The feasibility flag cleans ALL consumers; the arithmetic-only CBC
+        # pass-gain cleans ONLY the arithmetic opcode rows so the CMP/bool
+        # consumers (calibrated to the dirty hybrid) are never snapped. If BOTH
+        # flags are set the broader (all-consumer) gate wins.
+        arith_dims = (BD.OP_ADD, BD.OP_SUB, BD.OP_MUL, BD.OP_MOD, BD.OP_DIV)
+        cmp_dims = (BD.OP_EQ, BD.OP_NE, BD.OP_LT, BD.OP_GT, BD.OP_LE, BD.OP_GE)
+        op_dims = arith_dims + cmp_dims if full else arith_dims
+        block.ffn = CleanOperandOneHotFFN(
+            block.ffn,
+            alu_lo=BD.ALU_LO,
+            alu_hi=BD.ALU_HI,
+            carry_lo=BD.AX_CARRY_LO,
+            carry_hi=BD.AX_CARRY_HI,
+            mark_ax=BD.MARK_AX,
+            op_dims=op_dims,
+        )
+
+    return Operation(
+        name="clean_operand",
+        requires={"after": ("loaded_operand_add_hi15_clear",)},
+        reads=set(),
+        writes=set(),
+        kind="model",
+        declarative_bake_fn=bake,
+        declarative_authority="structural_model",
+        migrated=True,
+        claims=set(),
+        produces={'__module_replacement': 'L8.ffn[CleanOperandOneHotFFN]'},
+        spec_section="BLOG_SPEC.md#binary-ALU",
+        opcodes={"OP_ADD", "OP_SUB"},
+    )
+
+
 def make_cmp_loaded_operand_clean_op() -> Operation:
     """Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task #428).
 
