@@ -1384,8 +1384,14 @@ class CleanOperandOneHotFFN(nn.Module):
         self.carry_lo = int(carry_lo)
         self.carry_hi = int(carry_hi)
         self.mark_ax = int(mark_ax)
-        # Consumer opcode flag dims (ADD/SUB/MUL/DIV/MOD + six CMP). One-hot per
-        # step; a row is an operand-delivery row iff exactly one is set.
+        # Consumer opcode flag dims whose MARK_AX operand rows get the clean-snap.
+        # One-hot per step; a row is a snap row iff exactly one of these is set.
+        #  * ``C4_CLEAN_OPERAND`` (the feasibility flag) passes ALL eleven
+        #    consumers (ADD/SUB/MUL/DIV/MOD + six CMP) — cleans every op.
+        #  * ``C4_CLEAN_OPERAND_ADD`` (the arithmetic-only CBC pass-gain) passes
+        #    ONLY the five arithmetic dims (OP_ADD/SUB/MUL/DIV/MOD) — the CMP
+        #    rows are NOT in ``op_dims`` so they are never snapped and stay
+        #    byte-identical (the CMP calibration contract is left intact).
         self.op_dims = tuple(int(d) for d in op_dims)
         self._is_clean_operand_wrap = True
 
