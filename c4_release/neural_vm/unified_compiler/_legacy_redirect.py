@@ -218,7 +218,6 @@ from .migrated_ops import (
     make_alu_divmod_composite_ops,
     make_contract_validation_op,
     make_efficient_l8_addsub_wrap_op,
-    make_loaded_operand_add_hi15_clear_op,
     make_clean_operand_op,
     make_cmp_loaded_operand_clean_op,
     make_efficient_l10_andorxor_wrap_op,

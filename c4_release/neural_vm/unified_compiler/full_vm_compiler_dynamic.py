@@ -3157,21 +3157,22 @@ def _collect_ops_for_compile(
         ops.append(_static.make_l12_alu_mul_getobd_op())
         ops.append(_static.make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
         # Campaign loaded-operand ADD ALU cell-15 contaminant clear
-        # (var_update). Must come AFTER efficient_l8_addsub_wrap (whose d_model
-        # read sees the raw L8 PureFFN before this wrap is applied).
-        # Campaign-gated; flag-OFF leaves block.ffn untouched (golden
-        # byte-identical).
-        ops.append(_static.make_loaded_operand_add_hi15_clear_op())
         # CBC Phase 1: DERIVED clean-one-hot operand delivery. Snaps
         # ALU_LO/HI + AX_CARRY_LO/HI to a clean per-nibble one-hot. Two flags,
-        # both DEFAULT-OFF, both gated on this campaign so flag-OFF is golden
-        # byte-identical:
+        # both gated on this campaign so flag-OFF is golden byte-identical:
         #   * C4_CLEAN_OPERAND      — feasibility, cleans ALL binary-op + cmp rows
-        #   * C4_CLEAN_OPERAND_ADD  — CBC pass-gain, cleans ONLY the arithmetic
-        #     (ADD/SUB/MUL/DIV/MOD) rows, leaving the CMP calibration intact.
-        # Must come AFTER loaded_operand_add_hi15_clear (it wraps whatever operand
-        # band the existing correctors produce). See shared.clean_operand_enabled
-        # / shared.clean_operand_add_enabled.
+        #   * C4_CLEAN_OPERAND_ADD  — CBC pass-gain (DEFAULT-ON), cleans ONLY the
+        #     arithmetic (ADD/SUB/MUL/DIV/MOD) rows, leaving the CMP calibration
+        #     intact.
+        # This SUBSUMES the former ADD-only address-leak corrector
+        # (``LoadedOperandAddHi15ClearFFN``): the clean-snap zeros every non-argmax
+        # ALU_HI cell on the ADD/SUB/MUL/DIV/MOD MARK_AX rows BEFORE any hi-nibble
+        # clear could run, so the old cell-13/15 (and all-16) clears were provably
+        # inert once ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON (proven: forward
+        # max_abs_diff=0.0 on ADD rows; fast-gate byte-identical corpus verdicts).
+        # Must come AFTER efficient_l8_addsub_wrap (whose d_model read sees the raw
+        # L8 PureFFN before this wrap). See shared.clean_operand_enabled /
+        # shared.clean_operand_add_enabled.
         ops.append(_static.make_clean_operand_op())
         # Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task
         # #428). Wraps the L9 block.ffn (CMP nibble-comparator factory) to clean

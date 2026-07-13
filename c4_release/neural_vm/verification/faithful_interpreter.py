@@ -593,7 +593,10 @@ COMPOSITE_ALU_FFN = (
     "FlattenedPureFFN",
     # Efficient/production-mode campaign operand-recover / cell-clear wrappers
     # (delegate to an ``inner`` PureFFN after a cell edit; no W_up of their own).
-    "LoadedOperandAddHi15ClearFFN",
+    # (``LoadedOperandAddHi15ClearFFN`` removed — its ADD-only cell-13/15 clear was
+    # subsumed by the ``CleanOperandOneHotFFN`` clean-snap once
+    # ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON, so the wrap is no longer installed.)
+    "CleanOperandOneHotFFN",
     "CmpOperandSeRecoverFFN",
     "MulOperandSeRecoverFFN",
     "BitwiseOperandSeRecoverFFN",
