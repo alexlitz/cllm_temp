@@ -2615,6 +2615,16 @@ def compile_full_vm_dynamic(
                 os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
                 and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
             ),
+            # Bitwise clean operand delivery (campaign-ON, opt out =0,
+            # MODULE-affecting): ADDS the three bitwise opcodes (OP_AND/OP_OR/
+            # OP_XOR) to the CleanOperandOneHotFFN op_dims so the ON model's wrap
+            # module differs and must never share a memo entry. Gated on the
+            # campaign prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden
+            # build is byte-identical. See shared.clean_operand_bitwise_enabled.
+            "C4_CLEAN_OPERAND_BITWISE": (
+                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+                and os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") != "0"
+            ),
             # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
             # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
             # ON / OFF builds bake a different W_q row and must never share a
@@ -3684,6 +3694,15 @@ def _bake_from_scheduled_ops(
         "C4_CLEAN_OPERAND_ADD": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
+        ),
+        # Bitwise clean operand delivery (campaign-ON, opt out =0,
+        # MODULE-affecting): ADDS OP_AND/OP_OR/OP_XOR to the CleanOperandOneHotFFN
+        # op_dims so the ON model's wrap module differs and must never share a
+        # serialised entry. Gated on C4_NO_STACK0_EMIT so the golden build is
+        # byte-identical. See shared.clean_operand_bitwise_enabled.
+        "C4_CLEAN_OPERAND_BITWISE": (
+            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
+            and os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF

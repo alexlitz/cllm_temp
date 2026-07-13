@@ -1067,54 +1067,6 @@ def cmp_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_CMP_BYTE0_SE_RECOVER", "1") != "0"
 
 
-def bitwise_byte0_se_recover_enabled() -> bool:
-    """Return True iff the BITWISE (OR/XOR/AND) operand-A byte-0 SE_ALU recovery
-    is active (DEFAULT ON in the campaign config — opt-out via
-    ``C4_BITWISE_BYTE0_SE_RECOVER=0``; only takes effect when the STACK0 emission
-    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is
-    byte-identical to golden ``7f6f2e5d``).
-
-    The wall this lifts (GPU-confirmed spec_k=0, BUILT dims, campaign config
-    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the 16-bit ``or_16bit`` /
-    ``xor_16bit`` (and the per-nibble ``or``/``xor`` cases) byte-0 result is LOST
-    EXACTLY when operand A's nibble == 0. ``and_16bit`` passes only because its
-    nibbles are 0xF (the result then == operand A's surviving cell). The chain:
-    operand A is delivered from ``mem[SP]`` into ``ALU_LO/HI`` by the L8
-    ``make_layer8_mem_to_alu_op`` head 5 at the AX marker, but the L14 ALU-clear
-    (block 19 of the campaign 55-block layout) CRUSHES ``ALU_LO/HI+0`` to ~0 —
-    destroying the LEGIT A==0 one-hot. (Golden survives because its A==0
-    magnitude ~11 >> the ~5.5 cell-0 artifact; the campaign mem-CAM delivers the
-    legit A==0 at only ~5.5 ≈ the artifact, so the cleanup + L14 clear net it to
-    zero.) The bitwise lookup post_op (``bitwise_rules``, gated on MARK_AX + the
-    op flag, reading ``ALU`` × ``AX_CARRY``) then reads the crushed ALU at its
-    own downstream block: the A==0 nibble is absent, the rule for that nibble
-    never fires, and OUTPUT_LO/HI stays empty → the byte-0 token decodes 0x00.
-
-    The clean operand A IS present at the bitwise compute row in
-    ``SE_ALU_LO/HI`` (the L9 ``step_end_operand_relay`` mirror, written BEFORE
-    the crush and surviving to the lookup block — spec_k=0: for ``or_16bit``
-    ``SE_ALU_LO+0 == SE_ALU_HI+0 == ~0.85`` = operand A byte0 0x00; for
-    ``xor_16bit`` ``SE_ALU_LO+15`` / ``SE_ALU_HI+0`` = 0x0F).
-
-    FIX (the MUL/CMP byte-0 SE-recover precedent applied to the bitwise lookup):
-    a forward-pass recover WRAPS the bitwise lookup post_op so it runs in the
-    SAME block, BEFORE the lookup reads ``ALU`` (NO physical block is added — the
-    absolute-position lea contract holds). On the OR/XOR/AND opcode + MARK_AX +
-    crushed row ONLY it (1) multiplicatively CLEARS the ``ALU_LO/HI`` band (a
-    crushed floor AND an already-clean one-hot both go to 0 — idempotent, the
-    non-crushed passing rows are re-materialized identically), then (2) WRITES
-    the clean operand-A one-hot from ``SE_ALU_LO/HI`` at the cleaned ~5.82
-    magnitude the rescaled lookup cond weight (``30/5.82``) was tuned against.
-    Operand B (``AX_CARRY``, clean) and the result band are untouched.
-
-    DEFAULT ON. Opt-out via ``C4_BITWISE_BYTE0_SE_RECOVER=0`` restores the raw
-    crushed ALU read. Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_BITWISE_BYTE0_SE_RECOVER`` can A/B
-    it inside the campaign config.
-    """
-    return os.environ.get("C4_BITWISE_BYTE0_SE_RECOVER", "1") != "0"
-
-
 def shift_output_byte0_clear_enabled() -> bool:
     """Return True iff the SHIFT (SHL/SHR) consumer OUTPUT byte-0 zero-default
     clear is active (DEFAULT ON in the campaign config — opt-out via
@@ -2448,6 +2400,43 @@ def clean_operand_add_enabled() -> bool:
     campaign / off the flag).
     """
     if os.environ.get("C4_CLEAN_OPERAND_ADD", "1") == "0":
+        return False
+    return no_stack0_emit_enabled()
+
+
+def clean_operand_bitwise_enabled() -> bool:
+    """Return True iff the BITWISE (OP_AND/OP_OR/OP_XOR) clean-one-hot operand
+    delivery is active (``C4_CLEAN_OPERAND_BITWISE`` — DEFAULT-ON in the campaign
+    config; opt out with ``=0``).
+
+    Extends the :class:`CleanOperandOneHotFFN` op-dim gate at the L8 main FFN
+    (physical block 12, the operand-delivery block) to include the three bitwise
+    opcodes, so the ALU_LO/HI (operand A) and AX_CARRY_LO/HI (operand B) bands are
+    snapped to a clean per-nibble one-hot on the OP_AND/OP_OR/OP_XOR MARK_AX rows
+    (the same clean-snap the arithmetic ``C4_CLEAN_OPERAND_ADD`` already applies
+    to ADD/SUB/MUL/DIV/MOD).
+
+    This SUBSUMES the former :class:`BitwiseOperandSeRecoverFFN` recover (deleted,
+    2026-07-13). ROOT (spec_k=0, BUILT dims, campaign, hook-free probe
+    ``tools/_probe_bitw_alu_trace.py``): the L9 non-ALU ALU-scrubber that fires at
+    the physical block-21 row subtracts a FIXED pattern (~5.56 at cell 0, ~0.9 at
+    cell 8, ~0.94 at cell 15) from the ALU band. The dirty operand-gather hybrid
+    delivers the true A==0 nibble at only ~+5.48, so 5.48 − 5.56 = −0.08 → the
+    cell-0 one-hot goes NEGATIVE and the rescaled bitwise lookup's A==0 rule
+    cannot fire → ``or_16bit`` / ``xor_16bit`` lose byte-0. The clean snap
+    delivers the SAME nibble at +6.0, so 6.0 − 5.56 = +0.44 → cell 0 stays
+    POSITIVE and survives the crush to the lookup block, where the rescaled
+    ``bitwise_rules`` (a+b−ab, operand_a_cw = 30/5.82) fires correctly. So the
+    SeRecover's whole job (re-materialise the crushed operand at the lookup block)
+    is unnecessary once the operand is delivered clean upstream — proven inert
+    (all 6 bitwise smoke programs pass with C4_CLEAN_OPERAND_BITWISE=1 AND the
+    SeRecover removed).
+
+    Gated behind the ``no_stack0_emit`` campaign prerequisite so the flag-OFF
+    golden (35-tok) build is byte-identical (``e50521f3``): the wrap is never
+    installed off the campaign / with ``C4_NO_STACK0_EMIT=0``.
+    """
+    if os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") == "0":
         return False
     return no_stack0_emit_enabled()
 

@@ -599,7 +599,6 @@ COMPOSITE_ALU_FFN = (
     "CleanOperandOneHotFFN",
     "CmpOperandSeRecoverFFN",
     "MulOperandSeRecoverFFN",
-    "BitwiseOperandSeRecoverFFN",
     "ShiftOutputClearFFN",
 )
 

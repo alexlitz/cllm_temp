@@ -258,7 +258,7 @@ _COMPOSITE_FFN = ("AddSub5StageBlock", "FlattenedALUMul", "ALUShiftComposite",
                   # real wrap; treating it as a plain PureFFN AttributeErrors on
                   # ``W_up``.
                   "LoadedOperandAddHi15ClearFFN", "CmpOperandSeRecoverFFN",
-                  "MulOperandSeRecoverFFN", "BitwiseOperandSeRecoverFFN",
+                  "MulOperandSeRecoverFFN",
                   "ShiftOutputClearFFN")
 
 
