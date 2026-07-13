@@ -92,23 +92,53 @@ model drop the MUL high byte (1495 → 215 = low byte only), the exact
 the feasibility doc flagged. Net of the arithmetic cluster is still strongly
 positive (+5 gains vs 1 loss; predicted full +18).
 
-## Gate (d) — full `run_1096_canonical --criterion full_trace --spec-k 0`
+## Gate (d) — full `run_1096_canonical --criterion full_trace --spec-k 0 --max-steps-cap 40` — 580 → 593 (+13)
 
-<!-- FULL_1096_RESULT -->
-(running — OFF baseline on GPU 0, ON on GPU 1; ~2h each. Numbers filled below.)
+```
+OFF (flag unset):        CANONICAL SCORE [full_trace]: 580/1096 PASS  [fail=283 error=0 skipped(>cap)=233]
+ON  (C4_CLEAN_OPERAND_ADD=1): CANONICAL SCORE [full_trace]: 593/1096 PASS  [fail=270 error=0 skipped(>cap)=233]
 
-## Gate (e) — `pytest tests/test_smoke.py`
+NET: +13  (580 -> 593)   >= the 586 target
+```
 
-<!-- SMOKE_RESULT -->
-(running on CPU — filled below.)
+Both states ran the SAME config (`--max-steps-cap 40`, the short-only mode that
+matches the fast-gate and the 580 baseline; the 233 deep loop/gcd/rec programs
+are `skipped(>cap)` in BOTH, not counted). OFF reproduces the mission baseline
+`580` exactly. ON = **593 (+13)** — above the `>=586` target. The +13 is the
+net arithmetic gain (clean ADD/SUB/MUL operands keep the carry correct) with the
+CMP path untouched.
 
-## Verdict
+Note: a first full run used the canonical DEFAULT `--max-steps-cap 1000` (folds
+the 233 deep programs in as fails), which produces a much lower absolute pass
+for BOTH states (not comparable to the 580 baseline) — re-run at cap 40 to match
+the baseline + fast-gate config. The DELTA was positive under both caps.
 
-The arithmetic-only gate is **correct-by-construction working as designed**:
-byte-identical flag-OFF (`e50521f3`), the CMP contract stays intact (zero
-CMP/bool regression — the whole point), and the arithmetic clusters net positive
-(fast-gate predicted **+18**). The one `mul` idx-104 regression is a within-
-arithmetic byte-1 MUL corrector interaction, not a CMP break.
+## Gate (e) — `pytest tests/test_smoke.py` — 51/51 PASS
+
+```
+================ 51 passed, 1 deselected in 2193.23s (0:36:33) =================
+```
+
+`C4_CLEAN_OPERAND_ADD=1`, CPU (`CUDA_VISIBLE_DEVICES=""`, isolated cache). All
+51 smoke tests pass (the 1 deselected is the standard non-smoke test). No
+regression — the arithmetic clean-snap and the untouched CMP path both hold.
+
+## Verdict — READY TO LAND
+
+All four gates pass:
+
+* **byte-identical flag-OFF** — golden `e50521f3` (ISA hash, flag unset AND set).
+* **fast-gate net-positive, ZERO cmp/bool regression** — +18 predicted; the only
+  regression is 1 arithmetic `mul` (idx 104, byte-1 MUL corrector interaction),
+  NOT a CMP break; every CMP/bool cluster is untouched (the whole point).
+* **full-1096 580 -> 593 (+13)** — above the `>=586` target (same
+  `--max-steps-cap 40` config both states; OFF reproduces the 580 baseline).
+* **smoke 51/51**.
+
+This is the first *correct-by-construction* pass-gain: clean ADD/SUB/MUL/DIV/MOD
+operands keep the inter-byte carry correct, and gating the clean-snap to the
+arithmetic opcodes ONLY leaves the CMP calibration contract intact. **READY TO
+LAND** (do NOT merge from this agent per the brief).
 
 ## Reproduce
 
