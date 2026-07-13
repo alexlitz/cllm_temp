@@ -25,20 +25,19 @@ def campaign_enabled() -> bool:
     This is the one flag that turns on the coherent 30-token *campaign* set
     without the caller having to juggle the growing pile of individual campaign
     flags (``C4_NO_STACK0_EMIT`` ``C4_OPERAND_FROM_MEMSP`` ``C4_SI_STORE_ADDR``
-    ``C4_OPERAND_CAM_FIX`` ...). It is wired in by having each campaign-gating
-    predicate OR-in ``campaign_enabled()``:
+    ...). It is wired in by having each campaign-gating predicate OR-in
+    ``campaign_enabled()``:
 
       * ``no_stack0_emit_enabled()``     -- STACK0 register block dropped (30-tok)
       * ``operand_from_memsp_enabled()`` -- operand-A read from ``mem[SP]``
       * ``si_store_addr_enabled()``      -- SI/SC store address-provenance CAM
-      * ``operand_cam_fix_enabled()``    -- widened operand-CAM address-leak clear
 
     So ``C4_CAMPAIGN=1`` ALONE reproduces the full campaign config, and it is
     exactly equivalent to setting each of those explicit flags to its campaign
     value. The two predicates that ALREADY default ON in a bare env
     (``no_stack0_emit`` / ``operand_from_memsp``, both ``!= "0"``) are unchanged
-    by the OR-in; the two that default OFF (``si_store_addr`` / ``operand_cam_fix``)
-    are the ones ``C4_CAMPAIGN`` flips on.
+    by the OR-in; the one that defaults OFF (``si_store_addr``)
+    is the one ``C4_CAMPAIGN`` flips on.
 
     An explicit per-flag override still wins for the two default-ON predicates
     (setting ``C4_NO_STACK0_EMIT=0`` opts that one op out even under the
@@ -2244,159 +2243,6 @@ def absdiff_ret_byte1_enabled() -> bool:
     kill-switch for the flag-regression gate and the byte-identity gate.
     """
     return os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
-
-
-def loaded_operand_add_hi15_clear_enabled() -> bool:
-    """Return True iff the loaded-operand ADD high-nibble cell-15 address-leak
-    clear is active. DEFAULT campaign-ON (``C4_LOADED_OPERAND_ADD_HI15_CLEAR=1``),
-    opt out with ``C4_LOADED_OPERAND_ADD_HI15_CLEAR=0``; gated behind the
-    ``no_stack0_emit`` campaign flag so the flag-OFF golden (35-tok) build is
-    byte-identical (the wrap is never installed off the campaign).
-
-    ROOT (GPU full_trace + oracle-tape probe, campaign default, spec_k=0, BUILT
-    dims, ``tools/probe_varupd_add_survival.py``): ``var_update`` (ids 325-349,
-    0/25) diverges at step 12 = the ``x = x + k`` ADD, neural ``got = expected +
-    240 (0xF0)`` for ALL 25. Operand A is the LOADED variable ``x`` (``LI`` ->
-    ``PSH`` -> ``mem[SP]``); the L8 head-5 mem-to-ALU value copy leaks the ``0xF``
-    high nibble of the SP-relative store address (``0xFFE8``/``0xFFF8``) into
-    ``ALU_HI+15`` (~+5.5) on top of the clean byte-0 one-hot, so the block-12
-    AddSub high-nibble add reads a TWO-hot and the result gains ``0xF0``.
-    IMMEDIATE operands have no such leak (so the immediate ``add`` cluster
-    PASSES).
-
-    THE FIX (``LoadedOperandAddHi15ClearFFN`` wrapping the L8 main FFN): on the
-    ``OP_ADD`` MARK_AX rows ONLY, zero ``ALU_HI+15`` when it is in the
-    contaminant window (``(0.5, 5.85)``) — a true ``0xF`` operand one-hot
-    (~+6.0) is preserved, an immediate operand's ``@15`` (~0) is untouched.
-
-    DELIBERATELY ADD-ONLY (narrower than the dropped broad
-    ``C4_LOADED_OPERAND_HI15_CLEAR``, which also gated on ``OP_SUB`` + the six
-    cmp opcodes and cleared ``ALU_LO+15`` — that broad form was DROPPED for
-    regressing ``var_mul``). ``var_mul`` (``a*b``) has NO ADD step (its
-    operand-delivery rows carry only ``OP_MUL``/``OP_LI``/``OP_PSH``; the MUL
-    row's true operand value 0xF legitimately lands ``ALU+15 ~6.0``), so gating
-    on ``OP_ADD`` makes the wrap PROVABLY INERT on ``var_mul``. Verified
-    ``tools/probe_varmul_alu15.py``.
-    """
-    return os.environ.get("C4_LOADED_OPERAND_ADD_HI15_CLEAR", "1") != "0"
-
-
-def funcadd_alu_hi13_clear_enabled() -> bool:
-    """Return True iff the loaded-operand ADD high-nibble cell-13 address-leak
-    clear is active. DEFAULT campaign-ON (``C4_FUNCADD_ALU_HI13_CLEAR=1``), opt
-    out with ``C4_FUNCADD_ALU_HI13_CLEAR=0``; gated behind the same
-    ``no_stack0_emit`` + ``loaded_operand_add_hi15_clear_enabled`` campaign
-    chain so the flag-OFF golden (35-tok) build is byte-identical (the wider
-    contaminant cell set is never installed off the campaign).
-
-    ROOT (GPU full_trace id 575 + teacher-forced argmax probe, campaign default,
-    spec_k=0, BUILT dims, ``tools/probe_funcadd_leak.py``): ``func_add``
-    (``int add(int a,int b){return a+b;}``, id 575 = add(57,11), 0/25) diverges
-    at step 13 = the ``a + b`` ADD. With the LEA ``&b`` fix (cc2ec2a8) the func
-    args are delivered (step-9 LI) and addresses correct (step-11 LEA), so step
-    13 IS the arithmetic. The operand-A high nibble (``a`` loaded from
-    ``mem[BP+off]``) arrives in ALU_HI as a TWO-hot: the true nibble cell
-    (``a//16`` <= 6, ~6-7) PLUS a CONSTANT ``~+5.49`` leak at **cell 13** — the
-    ``0xD`` high nibble of the single-level call-frame load address (cf.
-    var_update's ``0xF``/cell-15 leak). The block-12 AddSub high-nibble add then
-    reads the two-hot and writes OUT_HI at the WRONG cell (``add(57,11)``:
-    OUT_HI@1 instead of @4 -> AX byte0 = ``0x1B`` not ``0x44``). Sweep across 10
-    operand pairs (``probe_funcadd_leak.py``) confirms the leak is ALWAYS cell
-    13, ~5.49, and NEVER the true operand cell (func/var operands <= 100 ->
-    hi nibble <= 6 << 13).
-
-    THE FIX: add cell 13 to ``LoadedOperandAddHi15ClearFFN``'s contaminant cell
-    set (alongside the existing cell 15). The same contaminant window
-    (``(0.5, CLEAN_MAX=5.85)``) discriminates the ~5.49 leak from a true
-    one-hot (~6-7), so it is value-safe. Flips ``func_add`` and rides to
-    ``func_mul`` / ``func_max`` / ``func_min`` (same single-level frame, same
-    cell-13 leak on their loaded operand-A ADD/compare steps).
-    """
-    return os.environ.get("C4_FUNCADD_ALU_HI13_CLEAR", "1") != "0"
-
-
-def func_add_b0_hinib_enabled() -> bool:
-    """Return True iff the func-return ADD byte-0 HIGH-nibble over-count fix is
-    active — the ALL-CELL magnitude-windowed ALU_HI operand-B-bleed clear
-    (DEFAULT-ON ``C4_FUNC_ADD_B0_HINIB``; opt out with =0). Gated behind the same
-    ``no_stack0_emit`` + ``loaded_operand_add_hi15_clear_enabled`` campaign chain
-    as the cell-13/15 clear, so the flag-OFF golden (35-tok) build is
-    byte-identical (the widened cell set is never installed off the campaign).
-
-    ROOT (BUILT-layout residual probe, campaign default, spec_k=0,
-    ``tools/_probe_funcadd_operand.py``): ``func_add`` (id 578 add(42,78)=0x78
-    got 0xB8, +0x40) diverges at step 13 = the ``a + b`` return ADD. The
-    operand-A high nibble (``a`` loaded from ``mem[BP+off]``) arrives in
-    ``ALU_HI`` as a TWO-hot: the true ``a//16`` cell (~+6.0) PLUS a spurious
-    ``~+1.0`` one-hot at the cell equal to **operand-B's high nibble**
-    (``b//16``). This is operand-B's high nibble bleeding through the L8 head-5
-    mem-to-ALU operand-A read into ALU_HI (measured cell-by-cell: id578 b_hi=4 ->
-    leak@4; id588 b_hi=3 -> leak@3, ALWAYS == b//16, ALWAYS ~1.0). The block-13
-    AddSub high-nibble add then reads the two-hot k-weighted sum
-    ``a_hi + b_hi`` for operand A, so the ADD result high nibble becomes
-    ``(a_hi + b_hi) + b_hi + carry`` = the true ``a_hi + b_hi + carry`` plus an
-    EXTRA ``b_hi`` -> ``+0x{b_hi}0`` over-count (the observed +0x30/+0x40/+0x50).
-    The prior cell-13 (0xD frame-address) clear does NOT catch this leak because
-    the leak cell is operand-B's high nibble (0x3/0x4/0x5), not the frame nibble.
-
-    THE FIX: the leak (~1.0) and the true operand one-hot (~6.0, >= ``CLEAN_MAX``)
-    are cleanly magnitude-separated by the SAME contaminant window the cell-13/15
-    clear uses. So extend ``LoadedOperandAddHi15ClearFFN``'s contaminant cell set
-    to ALL 16 ALU_HI cells: the window ``(0.5, CLEAN_MAX=5.85)`` clears the ~1.0
-    operand-B bleed while PRESERVING the ~6.0 true operand-A high-nibble one-hot.
-    Value-safe by construction (a true loaded operand-A high nibble is always
-    delivered at the SCALE_O ~6.0 magnitude; no legitimate operand cell sits in
-    the (0.5, 5.85) window). ADD-only opcode gate (unchanged) so it is inert on
-    every non-ADD row. Flips the 12/25 func_add whose operand-B high nibble is
-    non-zero (b >= 48). Scope is the loaded-operand ADD row (func_add step-13,
-    also any expr/var frame ADD reading a loaded operand-A); func_max/min return
-    via GT/LT+BZ+LEV with NO ADD step, so they are OUT of this fix's scope (their
-    loaded-operand compare rows are the C4_OPERAND_CAM_FIX territory). This fix
-    SUBSUMES the cell-13/15 clears when on (all 16 cells >= (13,15)).
-    """
-    return os.environ.get("C4_FUNC_ADD_B0_HINIB", "1") != "0"
-
-
-def operand_cam_fix_enabled() -> bool:
-    """Return True iff the operand-CAM address-leak clear is WIDENED past OP_ADD
-    to the loaded-operand SUB / MUL / MOD / DIV + six-CMP operand-delivery rows
-    (DEFAULT OFF — opt in via ``C4_OPERAND_CAM_FIX=1``). Gated behind the
-    ``no_stack0_emit`` campaign flag so the flag-OFF golden (35-tok) build is
-    byte-identical (the wider opcode gate is never installed off the campaign).
-
-    ROOT (BUILT-layout survey, campaign default, spec_k=0,
-    ``tools/probe_operand_cam_leak_survey.py``): the L8 head-5 mem-to-ALU
-    operand-A read (``LI`` -> ``PSH`` -> ``mem[SP]``) delivers the LOADED value
-    into ``ALU_HI`` as a TWO-HOT on EVERY consumer op, not just ADD: the true
-    value hi-nibble one-hot (~+6.0, cell = value//16 <= 6 for corpus operands)
-    PLUS a spurious ``~+5.49`` frame-address high-nibble leak at cell 13 (0xD,
-    single-level call frame) or cell 15 (0xF, direct ``0xFFF8`` frame). The
-    ``LoadedOperandAddHi15ClearFFN`` already discriminates + clears this leak on
-    the ``OP_ADD`` rows (window ``(0.5, CLEAN_MAX=5.85)``); the leak is IDENTICAL
-    in shape on the loaded-operand SUB (``absdiff``), MUL (``var_mul``), and the
-    comparison ops (``if_var`` GT/LT, ``absdiff`` GT), but those rows are NOT
-    cleared (the wrap is deliberately ADD-only). The block-12 ALU / L10 cmp
-    engine then reads the two-hot and gains the leaked hi-nibble.
-
-    THE FIX: widen the wrap's opcode gate to the loaded-operand binary + cmp
-    consumer set, keeping the SAME ALU_HI-only, same-cell (13/15), same-window
-    discriminator. This is provably narrower than the DROPPED broad clear
-    (``C4_LOADED_OPERAND_HI15_CLEAR``) that regressed ``var_mul``: that form also
-    cleared ``ALU_LO+15`` (which IS a true value cell for a low-nibble-0xF
-    operand). The measured leak is ``ALU_HI``-ONLY on every op (survey:
-    ``ALU_LO`` is a clean single one-hot at every operand-delivery row), and the
-    ``(0.5, 5.85)`` window spares any genuine 0xD/0xF hi-nibble operand
-    (immediate operands land ~+6.0 > CLEAN_MAX; the leak is ~5.49). So the
-    widen is value-safe by the same construction that makes the ADD case safe.
-
-    Campaign entry point: ``C4_CAMPAIGN=1`` supplies the ON floor (see
-    ``campaign_enabled``, which also turns on the ``no_stack0_emit`` prerequisite);
-    an explicit ``C4_OPERAND_CAM_FIX=0`` still opts out even under the campaign.
-    """
-    explicit = os.environ.get("C4_OPERAND_CAM_FIX")
-    if explicit is None and campaign_enabled():
-        return no_stack0_emit_enabled()
-    return no_stack0_emit_enabled() and (explicit is not None and explicit != "0")
 
 
 def clean_operand_enabled() -> bool:
