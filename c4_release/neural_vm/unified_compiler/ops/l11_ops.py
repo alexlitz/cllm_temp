@@ -2315,6 +2315,154 @@ def make_loop_ax_byte3_cap_op() -> Operation:
 
 
 # ===========================================================================
+# L11 OUTPUT byte-0 no-leak ROOT (C4_OUTPUT_B0_NOLEAK, default OFF)
+# ===========================================================================
+#
+# ROOT (see ``shared.output_b0_noleak_enabled`` for the full spec_k=0 trace):
+# the SHR/SHL ALU-compute MARK_AX row ALSO carries the frame's ``IS_BYTE`` +
+# ``BYTE_INDEX_3`` tags, so this L11 block's register-byte EMISSION heads
+# (V=``CLEAN_EMBED`` -> O=``OUTPUT_LO/HI``) spuriously plant a ``0x00``
+# zero-default (``OUTPUT_LO+0 = OUTPUT_HI+0 = 2.0``) on it. On ``shl`` the band
+# stays empty; on ``shr`` the default survives (``GEToBDConverter`` ADDS the
+# shift result) and TIES the true ``0x2A`` -> argmax breaks to cell-0 -> 0x00.
+#
+# FIX: a 2-unit post-op FFN on THIS L11 block zeroes ``OUTPUT_LO+0`` /
+# ``OUTPUT_HI+0`` on the ``OP_SHL/OP_SHR + MARK_AX`` row, so the L11 OUTPUT band
+# is EMPTY on the shift-compute row like ``shl``'s. This makes the downstream
+# consumer-side ``ShiftOutputClearFFN`` (which cleared the SAME default at the
+# L17 composite) a provable no-op -> that wrap is DELETED. The two nibbles are
+# the ONLY leaked cells (measured); a strong negative (-30) kills them
+# regardless of the emission head's exact fire magnitude while a MARK_* /
+# non-shift row (gate off) stays byte-identical.
+_OUTPUT_B0_NOLEAK_HIDDEN_DIM = 2  # one AND per shift opcode (OP_SHL, OP_SHR)
+_OUTPUT_B0_NOLEAK_CLEAR_W = 30.0  # >> the +2.0 leak, sign-flipped to kill it
+
+
+def _output_b0_noleak_enabled() -> bool:
+    """Local shim for :func:`shared.output_b0_noleak_enabled` (campaign-gated)."""
+    from .shared import no_stack0_emit_enabled, output_b0_noleak_enabled
+    return no_stack0_emit_enabled() and output_b0_noleak_enabled()
+
+
+def _output_b0_noleak_rules() -> tuple[FFNRule, ...]:
+    """2 AND rules zeroing OUTPUT byte-0 on the shift (SHL/SHR) MARK_AX row.
+
+    Each fires iff ``MARK_AX`` AND the shift opcode flag are hot (the opcode
+    flags sit at ~5.0 on the compute row, MARK_AX at 1.0; threshold 3.5 clears
+    on a fire and stays dark on a MARK_AX-only or opcode-only row). It writes a
+    strong NEGATIVE to ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` to kill the leaked
+    ``0x00`` zero-default; no other band is touched, and the shift composite's
+    own ``OUTPUT_LO+10 / OUTPUT_HI+2`` result one-hot (a different cell) is
+    untouched, so the true ``0x2A`` stands unopposed.
+    """
+    rules: list[FFNRule] = []
+    for op_flag in ("OP_SHL", "OP_SHR"):
+        rules.append(multi_way_and_rule(
+            name=f"output_b0_noleak_{op_flag.lower()}",
+            conditions=(
+                ("MARK_AX", 1.0),
+                (op_flag, 1.0),
+            ),
+            threshold=3.5,
+            writes=(
+                ("OUTPUT_LO+0", -_OUTPUT_B0_NOLEAK_CLEAR_W),
+                ("OUTPUT_HI+0", -_OUTPUT_B0_NOLEAK_CLEAR_W),
+            ),
+        ))
+    return tuple(rules)
+
+
+def make_output_b0_noleak_op() -> Operation:
+    """L11 post-op: zero the shift-row OUTPUT byte-0 zero-default at its SOURCE.
+
+    Registered always; bakes weights ONLY under the campaign flag
+    (``no_stack0_emit_enabled() and output_b0_noleak_enabled()``), so flag-OFF /
+    non-campaign is byte-identical to golden. Runs as a post_op on THIS L11
+    ``layer11_mul_partial`` block (the block that plants the leak) so the OUTPUT
+    band is clean the moment it leaves L11 -- the downstream shift writeback
+    (and the now-inert ``ShiftOutputClearFFN``) see an empty band on the shift
+    row exactly like ``shl``.
+    """
+    if not _output_b0_noleak_enabled():
+        def _noop_bake(block, dim_positions, S):
+            del block, dim_positions, S
+
+        return Operation(
+            name="output_b0_noleak",
+            reads=set(),
+            writes=set(),
+            audited_empty_produces=True,
+            kind="block",
+            target_op_name="_layer11_ffn_dep_anchor",
+            requires={"after": "layer11_mul_partial"},
+            declarative_bake_fn=_noop_bake,
+            declarative_authority="spec_generated",
+            migrated=True,
+            smoke_tests={"all"},
+            spec_section="OUTPUT_BYTE0_LEAK_ROOT_2026_07_13.md",
+        )
+
+    rules = _output_b0_noleak_rules()
+
+    def bake(block, dim_positions, S):
+        from ...base_layers import PureFFN
+
+        d_model = None
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            d_model = getattr(attn, "dim", None)
+            if d_model is None and hasattr(attn, "W_q"):
+                try:
+                    d_model = attn.W_q.shape[0]
+                except (AttributeError, IndexError):
+                    d_model = None
+        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
+            try:
+                d_model = block.ffn.W_up.shape[1]
+            except (AttributeError, IndexError):
+                d_model = None
+        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
+            try:
+                d_model = max(int(v) for v in dim_positions.values()) + 1
+            except (TypeError, ValueError):
+                d_model = None
+        if d_model is None:
+            d_model = 512
+        assert len(rules) == _OUTPUT_B0_NOLEAK_HIDDEN_DIM, (
+            f"output_b0_noleak rule-count drift: produced {len(rules)}, "
+            f"expected {_OUTPUT_B0_NOLEAK_HIDDEN_DIM}"
+        )
+        ffn = PureFFN(d_model, len(rules))
+        dim_map = {}
+        for _nm in Primitives.ffn_rule_dim_names(rules):
+            _base = _nm.split("+", 1)[0]
+            _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
+            dim_map[_nm] = int(dim_positions[_base]) + _off
+        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        block.post_ops.append(ffn)
+
+    ir = CompilerIR()
+    ir.layer(0).ffn.rules.extend(rules)
+
+    return Operation(
+        name="output_b0_noleak",
+        reads={"MARK_AX", "OP_SHL", "OP_SHR"},
+        writes={"OUTPUT_LO", "OUTPUT_HI"},
+        kind="block",
+        # Post-op on the L11 mul_partial block (where the emission heads plant
+        # the leak), so the OUTPUT band is clean when it leaves L11.
+        target_op_name="_layer11_ffn_dep_anchor",
+        requires={"after": "layer11_mul_partial"},
+        declarative_bake_fn=bake,
+        declarative_authority="spec_generated",
+        compiler_ir=ir,
+        migrated=True,
+        smoke_tests={"all"},
+        spec_section="OUTPUT_BYTE0_LEAK_ROOT_2026_07_13.md",
+    )
+
+
+# ===========================================================================
 # AX byte-1 DUMP -> OUTPUT decode (UNCONDITIONAL, OUTPUT-canonical)
 # ===========================================================================
 #

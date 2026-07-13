@@ -1161,6 +1161,43 @@ def shift_output_byte0_clear_enabled() -> bool:
     return os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
 
 
+def output_b0_noleak_enabled() -> bool:
+    """Return True iff the L11 OUTPUT byte-0 no-leak root is active (DEFAULT OFF
+    — opt in with ``C4_OUTPUT_B0_NOLEAK=1``; only takes effect when the STACK0
+    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign
+    is byte-identical to golden ``e50521f3``).
+
+    THE ROOT (spec_k=0, campaign ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``,
+    localized in ``tools/probe_shr_output_b0_leak.py`` /
+    ``probe_shr_blk17_emitter.py``): the SHR (``84 >> 1``) MARK_AX compute row
+    picks up a stale ``OUTPUT_LO+0 = 2.0`` / ``OUTPUT_HI+0 = 2.0`` zero-default
+    at **physical block 17 (logical L11)** — the ``layer11_mul_partial`` block,
+    whose register-byte EMISSION heads (V=``CLEAN_EMBED`` -> O=``OUTPUT_LO/HI``)
+    spuriously fire on this ALU-compute row because it ALSO carries the frame's
+    ``IS_BYTE`` + ``BYTE_INDEX_3`` tags. The block-16 residual is BYTE-IDENTICAL
+    between the leaking SHR row and the clean SHL row EXCEPT for the ``OP_SHR``
+    flag, so the emission is empty on ``shl`` (its OUTPUT band never gets the
+    default) but leaks the ``0x00`` default on ``shr``. Downstream, the L17
+    ``ALUShiftComposite`` ADDS its own ``OUTPUT_LO+10 / OUTPUT_HI+2 = 0x2A`` one-
+    hot at magnitude 2.0, so the stale ``0x00`` TIES the true ``0x2A`` and the LM
+    argmax breaks toward the lower nibble index (cell-0) -> both bytes decode
+    ``0x00`` -> result ``0x00`` (``shr`` decodes 0 instead of 42).
+
+    FIX (correct-by-construction at the SOURCE layer): a 2-unit L11 post-op FFN
+    zeroes ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` on the ``OP_SHL/OP_SHR + MARK_AX``
+    shift-compute row, so the L11 OUTPUT band is EMPTY there like ``shl``'s — the
+    stale default never propagates to the shift writeback. This SUPERSEDES the
+    downstream consumer-side ``ShiftOutputClearFFN`` (which cleared the SAME
+    default at the L17 composite block): with this root the composite's OUTPUT
+    band is already empty on the shift row, so ``ShiftOutputClear.forward`` ==
+    ``inner`` (max-diff 0) -> the wrap is a TRUE no-op and is DELETED.
+
+    DEFAULT OFF -> flag-OFF is byte-identical to golden ``e50521f3``; the op only
+    bakes weights when ``no_stack0_emit_enabled() and output_b0_noleak_enabled()``.
+    """
+    return os.environ.get("C4_OUTPUT_B0_NOLEAK", "0") != "0"
+
+
 def mul_multibyte_l19_boost_enabled() -> bool:
     """Return True iff the NARROWED MULTI-byte MUL byte-0 product is BOOSTED on
     the LITERAL-mul ``MUL+MARK_AX`` product row so it survives the block-34

@@ -2650,6 +2650,13 @@ def compile_full_vm_dynamic(
             "C4_SHIFT_OUTPUT_B0_CLEAR": (
                 os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
             ),
+            # L11 OUTPUT byte-0 no-leak root (DEFAULT-OFF, BAKE-affecting): when
+            # active a 2-unit L11 post-op FFN is baked (zeroing OUTPUT byte-0 on
+            # the shift-compute row), so the ON / OFF builds differ and must
+            # never share a memo entry. See shared.output_b0_noleak_enabled.
+            "C4_OUTPUT_B0_NOLEAK": (
+                os.environ.get("C4_OUTPUT_B0_NOLEAK", "0") != "0"
+            ),
             # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
             # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
             # head-0 slot-0 Q discriminator gains six OP_<cmp> * -1e6 veto cells,
@@ -3715,6 +3722,13 @@ def _bake_from_scheduled_ops(
         # a serialised entry. See shared.shift_output_byte0_clear_enabled.
         "C4_SHIFT_OUTPUT_B0_CLEAR": (
             os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
+        ),
+        # L11 OUTPUT byte-0 no-leak root (DEFAULT-OFF, BAKE-affecting): when
+        # active a 2-unit L11 post-op FFN is baked (zeroing OUTPUT byte-0 on the
+        # shift-compute row) so the ON / OFF builds differ and must never share a
+        # serialised entry. See shared.output_b0_noleak_enabled.
+        "C4_OUTPUT_B0_NOLEAK": (
+            os.environ.get("C4_OUTPUT_B0_NOLEAK", "0") != "0"
         ),
         # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
         # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)
