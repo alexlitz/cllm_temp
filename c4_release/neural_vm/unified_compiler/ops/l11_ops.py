@@ -2334,8 +2334,23 @@ def make_loop_ax_byte3_cap_op() -> Operation:
 # the ONLY leaked cells (measured); a strong negative (-30) kills them
 # regardless of the emission head's exact fire magnitude while a MARK_* /
 # non-shift row (gate off) stays byte-identical.
-_OUTPUT_B0_NOLEAK_HIDDEN_DIM = 2  # one AND per shift opcode (OP_SHL, OP_SHR)
-_OUTPUT_B0_NOLEAK_CLEAR_W = 30.0  # >> the +2.0 leak, sign-flipped to kill it
+_OUTPUT_B0_NOLEAK_HIDDEN_DIM = 1  # one AND, OP_SHR only (SHL band is already clean)
+# The L11 emission head leaks a ``+2.0`` one-hot at OUTPUT_{LO,HI}+0 on the SHR
+# compute row ONLY (SHL's OUTPUT band is already empty -- the block-16 residual
+# is byte-identical between the leaking SHR row and the clean SHL row except the
+# OP_SHR flag; see DERIVE_SHIFT_2026_07_09.md and the ShiftOutputClear docstring).
+# A single balanced-silu AND unit (MARK_AX + OP_SHR, both hot at ~1.0/~5.0 on the
+# compute row -> threshold 3.5 fires) writes ``-0.8/S`` back, which under the
+# saturated-fire gain lands a residual delta that cancels the leaked +2.0 to
+# EXACTLY 0.0 at the shift-composite block input (measured, spec_k=0: band =
+# -0.0000). Cancelling to zero -- not a large negative -- is what makes the
+# downstream ShiftOutputClear multiplicative-zero a TRUE no-op (forward == inner).
+# Scoping to OP_SHR (NOT OP_SHL) is load-bearing: an OP_SHL cancel corrupts the
+# multi-step 8-bit SHL decomposition (test_shl_8bit 256->273); SHL never leaks so
+# it needs no cancel. The ``0.8`` numerator is the leak-cancel amplitude at the
+# AND unit's operating point (probe_output_b0_noleak_verify.py verifies the band
+# lands at 0 and the clear is inert), not an arbitrary per-op constant.
+_OUTPUT_B0_NOLEAK_CANCEL_NUM = 0.8  # lowered as -CANCEL_NUM/S; cancels the +2.0 leak to 0
 
 
 def _output_b0_noleak_enabled() -> bool:
@@ -2344,44 +2359,48 @@ def _output_b0_noleak_enabled() -> bool:
     return no_stack0_emit_enabled() and output_b0_noleak_enabled()
 
 
-def _output_b0_noleak_rules() -> tuple[FFNRule, ...]:
-    """2 AND rules zeroing OUTPUT byte-0 on the shift (SHL/SHR) MARK_AX row.
+def _output_b0_noleak_rules(S: float = 100.0) -> tuple[FFNRule, ...]:
+    """1 AND rule cancelling OUTPUT byte-0 on the SHR MARK_AX compute row.
 
-    Each fires iff ``MARK_AX`` AND the shift opcode flag are hot (the opcode
-    flags sit at ~5.0 on the compute row, MARK_AX at 1.0; threshold 3.5 clears
-    on a fire and stays dark on a MARK_AX-only or opcode-only row). It writes a
-    strong NEGATIVE to ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` to kill the leaked
-    ``0x00`` zero-default; no other band is touched, and the shift composite's
-    own ``OUTPUT_LO+10 / OUTPUT_HI+2`` result one-hot (a different cell) is
-    untouched, so the true ``0x2A`` stands unopposed.
+    Fires iff ``MARK_AX`` AND ``OP_SHR`` are hot (the opcode flag sits at ~5.0 on
+    the compute row, MARK_AX at 1.0; threshold 3.5 fires on the compute row and
+    stays dark on a MARK_AX-only or opcode-only row). It writes ``-CANCEL_NUM/S``
+    to ``OUTPUT_LO+0`` / ``OUTPUT_HI+0``; under the saturated-fire gain this lands
+    a residual delta that cancels the leaked ``+2.0`` emission-head one-hot to
+    EXACTLY ``0.0`` at the shift-composite block input (the SHL-clean empty-band
+    state; measured spec_k=0). Cancelling to ZERO (not a large negative) is what
+    makes the downstream ``ShiftOutputClearFFN`` multiplicative-zero a TRUE no-op
+    (``forward == inner``). Scoped to OP_SHR only -- SHL never leaks and an
+    OP_SHL cancel corrupts the 8-bit SHL decomposition. No other band is touched;
+    the shift composite's own ``OUTPUT_LO+10 / OUTPUT_HI+2`` result one-hot (a
+    different cell) is untouched, so the true ``0x2A`` stands.
     """
-    rules: list[FFNRule] = []
-    for op_flag in ("OP_SHL", "OP_SHR"):
-        rules.append(multi_way_and_rule(
-            name=f"output_b0_noleak_{op_flag.lower()}",
-            conditions=(
-                ("MARK_AX", 1.0),
-                (op_flag, 1.0),
-            ),
-            threshold=3.5,
-            writes=(
-                ("OUTPUT_LO+0", -_OUTPUT_B0_NOLEAK_CLEAR_W),
-                ("OUTPUT_HI+0", -_OUTPUT_B0_NOLEAK_CLEAR_W),
-            ),
-        ))
-    return tuple(rules)
+    clear_w = _OUTPUT_B0_NOLEAK_CANCEL_NUM / S  # DSL write convention: -num/S
+    return (multi_way_and_rule(
+        name="output_b0_noleak_op_shr",
+        conditions=(
+            ("MARK_AX", 1.0),
+            ("OP_SHR", 1.0),
+        ),
+        threshold=3.5,
+        writes=(
+            ("OUTPUT_LO+0", -clear_w),
+            ("OUTPUT_HI+0", -clear_w),
+        ),
+    ),)
 
 
 def make_output_b0_noleak_op() -> Operation:
     """L11 post-op: zero the shift-row OUTPUT byte-0 zero-default at its SOURCE.
 
     Registered always; bakes weights ONLY under the campaign flag
-    (``no_stack0_emit_enabled() and output_b0_noleak_enabled()``), so flag-OFF /
-    non-campaign is byte-identical to golden. Runs as a post_op on THIS L11
-    ``layer11_mul_partial`` block (the block that plants the leak) so the OUTPUT
-    band is clean the moment it leaves L11 -- the downstream shift writeback
-    (and the now-inert ``ShiftOutputClearFFN``) see an empty band on the shift
-    row exactly like ``shl``.
+    (``no_stack0_emit_enabled() and output_b0_noleak_enabled()``, DEFAULT-ON), so
+    flag-OFF (``C4_OUTPUT_B0_NOLEAK=0``) / non-campaign is byte-identical to the
+    ``e50521f3`` golden. Runs as a post_op on THIS L11 ``layer11_mul_partial``
+    block (the block that plants the leak) so the OUTPUT band is clean the moment
+    it leaves L11 -- the downstream shift writeback sees an empty band on the SHR
+    row exactly like ``shl``, which is what made the now-DELETED
+    ``ShiftOutputClearFFN`` consumer-side clear a provable no-op.
     """
     if not _output_b0_noleak_enabled():
         def _noop_bake(block, dim_positions, S):
@@ -2393,8 +2412,12 @@ def make_output_b0_noleak_op() -> Operation:
             writes=set(),
             audited_empty_produces=True,
             kind="block",
+            # Co-locate at L11 via the FFN dep anchor (mirrors
+            # ``layer11_step_end_operand_relay``). NO ``requires["after"]``:
+            # that would force a strictly-later LAYER (ref_layer+1) and evict
+            # the op off L11. The post_op append runs after ``block.ffn`` (the
+            # mul_partial leak) automatically -- post_ops always follow the FFN.
             target_op_name="_layer11_ffn_dep_anchor",
-            requires={"after": "layer11_mul_partial"},
             declarative_bake_fn=_noop_bake,
             declarative_authority="spec_generated",
             migrated=True,
@@ -2428,17 +2451,21 @@ def make_output_b0_noleak_op() -> Operation:
                 d_model = None
         if d_model is None:
             d_model = 512
-        assert len(rules) == _OUTPUT_B0_NOLEAK_HIDDEN_DIM, (
-            f"output_b0_noleak rule-count drift: produced {len(rules)}, "
+        # The clear write is an S-independent literal residual delta (-2.0),
+        # so the rule set is the same at any S; rebuild at the bake's S for the
+        # AND threshold's lowering (the condition sums scale with S).
+        baked_rules = _output_b0_noleak_rules(S)
+        assert len(baked_rules) == _OUTPUT_B0_NOLEAK_HIDDEN_DIM, (
+            f"output_b0_noleak rule-count drift: produced {len(baked_rules)}, "
             f"expected {_OUTPUT_B0_NOLEAK_HIDDEN_DIM}"
         )
-        ffn = PureFFN(d_model, len(rules))
+        ffn = PureFFN(d_model, len(baked_rules))
         dim_map = {}
-        for _nm in Primitives.ffn_rule_dim_names(rules):
+        for _nm in Primitives.ffn_rule_dim_names(baked_rules):
             _base = _nm.split("+", 1)[0]
             _off = int(_nm.split("+", 1)[1]) if "+" in _nm else 0
             dim_map[_nm] = int(dim_positions[_base]) + _off
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
+        Primitives.lower_ffn_rules(ffn, baked_rules, dim_map, S=S)
         block.post_ops.append(ffn)
 
     ir = CompilerIR()
@@ -2446,13 +2473,18 @@ def make_output_b0_noleak_op() -> Operation:
 
     return Operation(
         name="output_b0_noleak",
-        reads={"MARK_AX", "OP_SHL", "OP_SHR"},
+        reads={"MARK_AX", "OP_SHR"},
         writes={"OUTPUT_LO", "OUTPUT_HI"},
         kind="block",
         # Post-op on the L11 mul_partial block (where the emission heads plant
-        # the leak), so the OUTPUT band is clean when it leaves L11.
+        # the leak), so the OUTPUT band is clean when it leaves L11. Co-locate at
+        # L11 via the FFN dep anchor (mirrors ``layer11_step_end_operand_relay``,
+        # which is also a kind="block" op on this anchor). NO ``requires["after"]``:
+        # ``requires["after"]="layer11_mul_partial"`` forces a strictly-LATER
+        # layer (ref_layer+1) and evicts the op off L11 -> its bake never runs.
+        # The post_op append lands after ``block.ffn`` (the mul_partial leak)
+        # automatically -- post_ops always follow the FFN.
         target_op_name="_layer11_ffn_dep_anchor",
-        requires={"after": "layer11_mul_partial"},
         declarative_bake_fn=bake,
         declarative_authority="spec_generated",
         compiler_ir=ir,

@@ -70,11 +70,9 @@ def main():
     dev = p._device
     STEP = int(Token.STEP_TOKENS)
 
-    # (1) emitted results
+    # (1) emitted results (ground-truth spec_k=0 replay -> decoded REG_AX)
     for label, prog in (("shr 84>>1", SHR), ("shl 21<<1", SHL)):
-        res = runner.run_batch([bytes(prog)], spec_k=0, expected_steps_list=[5])
-        r0 = res[0]
-        ec = getattr(r0, "exit_code", None)
+        _out, ec = p.emitted_result(prog, max_steps=20)
         print(f"  {label}: exit_code={ec} -> {'PASS(42)' if ec == 42 else 'FAIL'}")
 
     # locate the ShiftOutputClear wrapper block

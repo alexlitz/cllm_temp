@@ -887,17 +887,18 @@ def all_core_ops(
             [make_loop_ax_byte3_cap_op()]
             if _loop_ax_byte3_cap_enabled() else []
         ),
-        # L11 OUTPUT byte-0 no-leak ROOT (C4_OUTPUT_B0_NOLEAK, DEFAULT-OFF):
-        # zeroes OUTPUT_LO+0 / OUTPUT_HI+0 on the OP_SHL/OP_SHR + MARK_AX shift-
+        # L11 OUTPUT byte-0 no-leak ROOT (C4_OUTPUT_B0_NOLEAK, DEFAULT-ON):
+        # cancels OUTPUT_LO+0 / OUTPUT_HI+0 to 0 on the OP_SHR + MARK_AX shift-
         # compute row at THIS L11 block, so the frame's spurious IS_BYTE+
-        # BYTE_INDEX_3-tagged register-byte emission heads do not leak a 0x00
+        # BYTE_INDEX_3-tagged register-byte emission head does not leak a 0x00
         # zero-default onto the shift result (the leak the downstream
         # ShiftOutputClearFFN corrector patched at the L17 composite). With the
-        # root fixed the composite's OUTPUT band is empty on the shift row like
-        # shl's, so ShiftOutputClear is a provable no-op and is DELETED.
-        # Registered always; bakes weights only under the campaign flag ->
-        # flag-OFF is byte-identical to golden e50521f3. See
-        # l11_ops.make_output_b0_noleak_op.
+        # root fixed the composite's OUTPUT band is empty on the SHR row like
+        # shl's, so ShiftOutputClearFFN was a provable no-op (inertness max-diff
+        # ~2.4e-7) and has been DELETED. Registered always; bakes weights only
+        # under the campaign flag. DEFAULT-ON changes the bare golden to
+        # 8135b989 (C4_OUTPUT_B0_NOLEAK=0 reverts to e50521f3). See
+        # l11_ops.make_output_b0_noleak_op + docs/OUTPUT_BYTE0_LEAK_ROOT_2026_07_13.md.
         make_output_b0_noleak_op(),
         # AX byte-1 DUMP -> OUTPUT decode (OUTPUT-canonical, UNCONDITIONAL).
         # Decodes the carried byte-1 one-hot out of ``H1_DUMP_OUT`` (filled by

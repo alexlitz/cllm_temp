@@ -1116,7 +1116,15 @@ def bitwise_byte0_se_recover_enabled() -> bool:
 
 
 def shift_output_byte0_clear_enabled() -> bool:
-    """Return True iff the SHIFT (SHL/SHR) consumer OUTPUT byte-0 zero-default
+    """DEAD (2026-07-13): the ``ShiftOutputClearFFN`` wrap this flag gated was
+    DELETED. The SHR OUTPUT byte-0 zero-default leak is now cancelled
+    correct-by-construction at its L11 source by ``make_output_b0_noleak_op``
+    (``C4_OUTPUT_B0_NOLEAK``, DEFAULT-ON). Nothing on the build path reads this
+    flag anymore; the function is retained only so its cache-key entry and any
+    A/B tooling reference resolve. A follow-up dead-flag sweep can remove it.
+    Original docstring preserved below for provenance.
+
+    Return True iff the SHIFT (SHL/SHR) consumer OUTPUT byte-0 zero-default
     clear is active (DEFAULT ON in the campaign config — opt-out via
     ``C4_SHIFT_OUTPUT_B0_CLEAR=0``; only takes effect when the STACK0 emission
     is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is
@@ -1162,10 +1170,17 @@ def shift_output_byte0_clear_enabled() -> bool:
 
 
 def output_b0_noleak_enabled() -> bool:
-    """Return True iff the L11 OUTPUT byte-0 no-leak root is active (DEFAULT OFF
-    — opt in with ``C4_OUTPUT_B0_NOLEAK=1``; only takes effect when the STACK0
-    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign
-    is byte-identical to golden ``e50521f3``).
+    """Return True iff the L11 OUTPUT byte-0 no-leak root is active (DEFAULT ON
+    — opt out with ``C4_OUTPUT_B0_NOLEAK=0``; only takes effect when the STACK0
+    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
+
+    This root SUPERSEDES the deleted ``ShiftOutputClearFFN`` consumer-side
+    corrector: it is DEFAULT-ON so the campaign build keeps ``test_shr`` = 42
+    after the wrap is removed. Because the op bakes a real FFN unit, the
+    DEFAULT-ON flip CHANGES the bare golden state_dict from ``e50521f3`` to
+    ``8135b989`` (intended, mirrors the ``C4_CLEAN_EMITTER`` default-ON golden
+    change). The escape hatch ``C4_OUTPUT_B0_NOLEAK=0`` reverts to the golden
+    ``e50521f3`` (and re-exposes the raw SHR leak the deleted corrector patched).
 
     THE ROOT (spec_k=0, campaign ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``,
     localized in ``tools/probe_shr_output_b0_leak.py`` /
@@ -1183,19 +1198,18 @@ def output_b0_noleak_enabled() -> bool:
     argmax breaks toward the lower nibble index (cell-0) -> both bytes decode
     ``0x00`` -> result ``0x00`` (``shr`` decodes 0 instead of 42).
 
-    FIX (correct-by-construction at the SOURCE layer): a 2-unit L11 post-op FFN
-    zeroes ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` on the ``OP_SHL/OP_SHR + MARK_AX``
-    shift-compute row, so the L11 OUTPUT band is EMPTY there like ``shl``'s — the
-    stale default never propagates to the shift writeback. This SUPERSEDES the
-    downstream consumer-side ``ShiftOutputClearFFN`` (which cleared the SAME
-    default at the L17 composite block): with this root the composite's OUTPUT
-    band is already empty on the shift row, so ``ShiftOutputClear.forward`` ==
-    ``inner`` (max-diff 0) -> the wrap is a TRUE no-op and is DELETED.
-
-    DEFAULT OFF -> flag-OFF is byte-identical to golden ``e50521f3``; the op only
-    bakes weights when ``no_stack0_emit_enabled() and output_b0_noleak_enabled()``.
+    FIX (correct-by-construction at the SOURCE layer): a 1-unit L11 post-op FFN
+    (OP_SHR only) cancels ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` on the ``OP_SHR +
+    MARK_AX`` compute row to exactly 0, so the OUTPUT band is EMPTY there like
+    ``shl``'s — the stale default never propagates to the shift writeback. This
+    SUPERSEDES the downstream consumer-side ``ShiftOutputClearFFN`` (which cleared
+    the SAME default at the L17 composite block): with this root the composite's
+    OUTPUT band is already empty on the SHR row, so ``ShiftOutputClear.forward``
+    == ``inner`` (max-diff ~2.4e-7) -> the wrap is a TRUE no-op and is DELETED.
+    SHL is NOT touched (its band is already clean and an OP_SHL cancel corrupts
+    the 8-bit SHL decomposition).
     """
-    return os.environ.get("C4_OUTPUT_B0_NOLEAK", "0") != "0"
+    return os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
 
 
 def mul_multibyte_l19_boost_enabled() -> bool:
