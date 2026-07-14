@@ -1066,103 +1066,6 @@ def cmp_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_CMP_BYTE0_SE_RECOVER", "1") != "0"
 
 
-def shift_output_byte0_clear_enabled() -> bool:
-    """DEAD (2026-07-13): the ``ShiftOutputClearFFN`` wrap this flag gated was
-    DELETED. The SHR OUTPUT byte-0 zero-default leak is now cancelled
-    correct-by-construction at its L11 source by ``make_output_b0_noleak_op``
-    (``C4_OUTPUT_B0_NOLEAK``, DEFAULT-ON). Nothing on the build path reads this
-    flag anymore; the function is retained only so its cache-key entry and any
-    A/B tooling reference resolve. A follow-up dead-flag sweep can remove it.
-    Original docstring preserved below for provenance.
-
-    Return True iff the SHIFT (SHL/SHR) consumer OUTPUT byte-0 zero-default
-    clear is active (DEFAULT ON in the campaign config — opt-out via
-    ``C4_SHIFT_OUTPUT_B0_CLEAR=0``; only takes effect when the STACK0 emission
-    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is
-    byte-identical to golden ``7f6f2e5d``).
-
-    The wall this lifts (GPU-confirmed spec_k=0, BUILT dims, campaign config
-    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the ``test_shr`` smoke
-    program (``84 >> 1 == 42``) decodes 0x00 instead of 0x2A. ``test_shl``
-    (``21 << 1 == 42``) passes. Block-trace of the SHR MARK_AX compute row:
-    operand A (0x54) survives intact in ``ALU_LO/HI`` and the L13 shift lookup
-    (block 31 / logical L17 ``ALUShiftComposite``) CORRECTLY computes the result
-    — ``OUTPUT_LO+10 += 2.0`` / ``OUTPUT_HI+2 += 2.0`` = 0x2A. BUT a SPURIOUS
-    ``OUTPUT_LO+0 = 2.0`` / ``OUTPUT_HI+0 = 2.0`` byte-0 zero-default was written
-    UPSTREAM at block 16 (logical L11) by the L11 attention's OUTPUT-byte-0
-    broadcast on the SHR row (campaign cross-step OUTPUT-band leak; golden's
-    block-16 OUTPUT band is empty so it never appears there). Because
-    ``GEToBDConverter`` ADDS its result one-hot (``OUTPUT += indicator*2.0``)
-    rather than overwriting, the stale 0x00 SURVIVES and TIES the true 0x2A at
-    magnitude 2.0 — and the LM-head argmax breaks the tie toward the LOWER nibble
-    index (cell-0), so both bytes decode 0x00 → result 0x00. ``shl`` is clean
-    because its block-16 OUTPUT band is empty (no stale 0x00 to tie against).
-
-    FIX (consumer-side, the ``GEToBDConverter`` output_amplitude precedent
-    applied to the SHIFT writeback): a forward-pass clear WRAPS the
-    ``ALUShiftComposite`` so it runs in the SAME block (NO physical block is
-    added — the absolute-position lea contract holds). On the OP_SHL/OP_SHR +
-    MARK_AX row ONLY it ZEROES the ``OUTPUT_LO``/``OUTPUT_HI`` band BEFORE the
-    composite writes its result, so the stale upstream 0x00 default is removed
-    and the shift's own ``+2.0`` one-hot stands unopposed. Idempotent for the
-    passing ``shl`` (its OUTPUT band is already empty at the shift block — the
-    clear is a no-op, then the composite re-writes the SAME 0x2A). No operand /
-    ALU / carry / result band is touched besides OUTPUT; the composite's own
-    fully SHL/SHR-gated writeback is unchanged.
-
-    DEFAULT ON. Opt-out via ``C4_SHIFT_OUTPUT_B0_CLEAR=0`` restores the raw
-    additive writeback (the byte-identical-OFF path: flag-OFF, or
-    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden ``7f6f2e5d``).
-    Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_SHIFT_OUTPUT_B0_CLEAR`` can A/B it
-    inside the campaign config.
-    """
-    return os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
-
-
-def output_b0_noleak_enabled() -> bool:
-    """Return True iff the L11 OUTPUT byte-0 no-leak root is active (DEFAULT ON
-    — opt out with ``C4_OUTPUT_B0_NOLEAK=0``; only takes effect when the STACK0
-    emission is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
-
-    This root SUPERSEDES the deleted ``ShiftOutputClearFFN`` consumer-side
-    corrector: it is DEFAULT-ON so the campaign build keeps ``test_shr`` = 42
-    after the wrap is removed. Because the op bakes a real FFN unit, the
-    DEFAULT-ON flip CHANGES the bare golden state_dict from ``e50521f3`` to
-    ``8135b989`` (intended, mirrors the ``C4_CLEAN_EMITTER`` default-ON golden
-    change). The escape hatch ``C4_OUTPUT_B0_NOLEAK=0`` reverts to the golden
-    ``e50521f3`` (and re-exposes the raw SHR leak the deleted corrector patched).
-
-    THE ROOT (spec_k=0, campaign ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``,
-    localized in ``tools/probe_shr_output_b0_leak.py`` /
-    ``probe_shr_blk17_emitter.py``): the SHR (``84 >> 1``) MARK_AX compute row
-    picks up a stale ``OUTPUT_LO+0 = 2.0`` / ``OUTPUT_HI+0 = 2.0`` zero-default
-    at **physical block 17 (logical L11)** — the ``layer11_mul_partial`` block,
-    whose register-byte EMISSION heads (V=``CLEAN_EMBED`` -> O=``OUTPUT_LO/HI``)
-    spuriously fire on this ALU-compute row because it ALSO carries the frame's
-    ``IS_BYTE`` + ``BYTE_INDEX_3`` tags. The block-16 residual is BYTE-IDENTICAL
-    between the leaking SHR row and the clean SHL row EXCEPT for the ``OP_SHR``
-    flag, so the emission is empty on ``shl`` (its OUTPUT band never gets the
-    default) but leaks the ``0x00`` default on ``shr``. Downstream, the L17
-    ``ALUShiftComposite`` ADDS its own ``OUTPUT_LO+10 / OUTPUT_HI+2 = 0x2A`` one-
-    hot at magnitude 2.0, so the stale ``0x00`` TIES the true ``0x2A`` and the LM
-    argmax breaks toward the lower nibble index (cell-0) -> both bytes decode
-    ``0x00`` -> result ``0x00`` (``shr`` decodes 0 instead of 42).
-
-    FIX (correct-by-construction at the SOURCE layer): a 1-unit L11 post-op FFN
-    (OP_SHR only) cancels ``OUTPUT_LO+0`` / ``OUTPUT_HI+0`` on the ``OP_SHR +
-    MARK_AX`` compute row to exactly 0, so the OUTPUT band is EMPTY there like
-    ``shl``'s — the stale default never propagates to the shift writeback. This
-    SUPERSEDES the downstream consumer-side ``ShiftOutputClearFFN`` (which cleared
-    the SAME default at the L17 composite block): with this root the composite's
-    OUTPUT band is already empty on the SHR row, so ``ShiftOutputClear.forward``
-    == ``inner`` (max-diff ~2.4e-7) -> the wrap is a TRUE no-op and is DELETED.
-    SHL is NOT touched (its band is already clean and an OP_SHL cancel corrupts
-    the 8-bit SHL decomposition).
-    """
-    return os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
-
-
 def mul_multibyte_l19_boost_enabled() -> bool:
     """Return True iff the NARROWED MULTI-byte MUL byte-0 product is BOOSTED on
     the LITERAL-mul ``MUL+MARK_AX`` product row so it survives the block-34
@@ -1350,15 +1253,13 @@ def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
     blockers are UNTOUCHED, so lt/le/ge/eq/ne margins are unchanged. Band-local to
     the CMP engine (no shared OUTPUT/ALU read perturbed).
 
-    DEFAULT ON. Opt-out via ``C4_CMP_HI_LT_ALU15_GUARD=0`` restores the full
-    cell-15 blocker (the byte-identical-OFF path: flag-OFF, or
-    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden). Kept as a
-    dedicated kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_CMP_HI_LT_ALU15_GUARD`` can A/B it inside the campaign config.
+    DEFAULT ON — now UNCONDITIONAL under the campaign frame. The former
+    ``C4_CMP_HI_LT_ALU15_GUARD`` escape hatch was RETIRED 2026-07-14 (proven
+    default-ON, intervention-verified discriminating fix). Non-campaign
+    (``C4_NO_STACK0_EMIT=0``) still restores the full cell-15 blocker
+    (byte-identical to golden — the guard never fires off the campaign frame).
     """
-    if not no_stack0_emit_enabled():
-        return False
-    return os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
+    return no_stack0_emit_enabled()
 
 
 def cmp_gt_lo_lt_hieq_guard_enabled() -> bool:
@@ -1419,15 +1320,13 @@ def cmp_gt_lo_lt_hieq_guard_enabled() -> bool:
     (hi_lt) override and EQ/NE/LT/LE overrides are UNTOUCHED, so lt/le/eq/ne and
     the hi_lt-driven GT/GE-false margins are unchanged.
 
-    DEFAULT ON. Opt-out via ``C4_CMP_GT_LO_LT_HIEQ_GUARD=0`` restores the 2.5
-    threshold (the byte-identical-OFF path: flag-OFF, or
-    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden). Kept as a
-    dedicated kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_CMP_GT_LO_LT_HIEQ_GUARD`` can A/B it inside the campaign config.
+    DEFAULT ON — now UNCONDITIONAL under the campaign frame. The former
+    ``C4_CMP_GT_LO_LT_HIEQ_GUARD`` escape hatch was RETIRED 2026-07-14 (proven
+    default-ON, rebuild-verified discriminating fix). Non-campaign
+    (``C4_NO_STACK0_EMIT=0``) still restores the 2.5 threshold (byte-identical to
+    golden — the raise never applies off the campaign frame).
     """
-    if not no_stack0_emit_enabled():
-        return False
-    return os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
+    return no_stack0_emit_enabled()
 
 
 def cmp_combine_margin_enabled() -> bool:
@@ -2319,12 +2218,12 @@ def clean_operand_add_enabled() -> bool:
     the arithmetic gain with ZERO CMP regression (the CMP calibration contract
     is left intact), so this slice is byte-identical-OFF AND net-positive-ON.
 
-    Gated behind the ``no_stack0_emit`` campaign flag so the flag-OFF golden
+    Gated behind the ``no_stack0_emit`` campaign flag so the non-campaign golden
     (``e50521f3``) build is byte-identical (the wrap is never installed off the
-    campaign / off the flag).
+    campaign). The former ``C4_CLEAN_OPERAND_ADD`` escape hatch was RETIRED
+    2026-07-14 (proven default-ON pass-gain); the fix is now unconditional under
+    campaign.
     """
-    if os.environ.get("C4_CLEAN_OPERAND_ADD", "1") == "0":
-        return False
     return no_stack0_emit_enabled()
 
 
@@ -2356,12 +2255,12 @@ def clean_operand_bitwise_enabled() -> bool:
     (all 6 bitwise smoke programs pass with C4_CLEAN_OPERAND_BITWISE=1 AND the
     SeRecover removed).
 
-    Gated behind the ``no_stack0_emit`` campaign prerequisite so the flag-OFF
+    Gated behind the ``no_stack0_emit`` campaign prerequisite so the non-campaign
     golden (35-tok) build is byte-identical (``e50521f3``): the wrap is never
-    installed off the campaign / with ``C4_NO_STACK0_EMIT=0``.
+    installed with ``C4_NO_STACK0_EMIT=0``. The former ``C4_CLEAN_OPERAND_BITWISE``
+    escape hatch was RETIRED 2026-07-14 (proven default-ON, SUBSUMES the deleted
+    BitwiseOperandSeRecoverFFN); the fix is now unconditional under campaign.
     """
-    if os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") == "0":
-        return False
     return no_stack0_emit_enabled()
 
 

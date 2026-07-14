@@ -2201,27 +2201,17 @@ def _build_cache_key_snapshot(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_CLEAN_OPERAND", "0") != "0"
         ),
-        # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-ON, opt
-        # out =0, MODULE-affecting): installs the SAME CleanOperandOneHotFFN wrap
-        # with an ARITHMETIC-ONLY op_dims tuple (no cmp dims) so the ON model's
-        # wrap module differs from both flag-OFF and the full C4_CLEAN_OPERAND
-        # variant and must never share a serialised entry. Gated on the campaign
-        # prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden build is
-        # byte-identical. Default is ON only in the campaign config; escape hatch
-        # C4_CLEAN_OPERAND_ADD=0 reproduces golden e50521f3. See
-        # shared.clean_operand_add_enabled.
-        "C4_CLEAN_OPERAND_ADD": (
+        # Arithmetic + bitwise clean operand delivery (CleanOperandOneHotFFN wrap
+        # on the L8 main FFN, MODULE-affecting). The C4_CLEAN_OPERAND_ADD /
+        # C4_CLEAN_OPERAND_BITWISE escape hatches were RETIRED 2026-07-14 (proven
+        # default-ON); the wrap is now installed unconditionally under the campaign
+        # prerequisite C4_NO_STACK0_EMIT, so the non-campaign / golden build stays
+        # byte-identical (wrap absent). Keyed on C4_NO_STACK0_EMIT so the campaign
+        # (wrap-present) and non-campaign (wrap-absent) builds never share a
+        # serialised entry. See shared.clean_operand_add_enabled /
+        # clean_operand_bitwise_enabled.
+        "clean_operand_arith_bitwise_wrap": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
-        ),
-        # Bitwise clean operand delivery (campaign-ON, opt out =0,
-        # MODULE-affecting): ADDS OP_AND/OP_OR/OP_XOR to the CleanOperandOneHotFFN
-        # op_dims so the ON model's wrap module differs and must never share a
-        # serialised entry. Gated on C4_NO_STACK0_EMIT so the golden build is
-        # byte-identical. See shared.clean_operand_bitwise_enabled.
-        "C4_CLEAN_OPERAND_BITWISE": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF
@@ -2246,42 +2236,15 @@ def _build_cache_key_snapshot(
                 else "0",
             ) != "0"
         ),
-        # C4_SHIFT_OUTPUT_B0_CLEAR: now INERT (the ShiftOutputClearFFN wrap it
-        # gated was DELETED 2026-07-13; the SHR OUTPUT byte-0 leak is cancelled at
-        # its L11 source by C4_OUTPUT_B0_NOLEAK). Kept as an always-same cache-key
-        # term for serialised-key stability; a follow-up dead-flag sweep can drop it.
-        "C4_SHIFT_OUTPUT_B0_CLEAR": (
-            os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
-        ),
-        # L11 OUTPUT byte-0 no-leak root (DEFAULT-ON, BAKE-affecting): when active
-        # a 1-unit L11 post-op FFN is baked (cancelling OUTPUT byte-0 on the OP_SHR
-        # compute row) so the ON / OFF builds differ and must never share a
-        # serialised entry. See shared.output_b0_noleak_enabled.
-        "C4_OUTPUT_B0_NOLEAK": (
-            os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
-        ),
-        # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
-        # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)
-        # blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF builds bake
-        # different FFN weights and must never share a serialised entry. Gated on
-        # the campaign prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign /
-        # flag-OFF build is byte-identical to golden. See
-        # shared.cmp_hi_lt_alu15_leak_guard_enabled.
-        "C4_CMP_HI_LT_ALU15_GUARD": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
-        ),
-        # if_var GT-TRUE lo_lt-leak guard (DEFAULT-ON, opt out =0,
-        # BAKE-affecting): when active the ComparisonCombine GT/GE
-        # ``(hi_eq AND lo_lt)`` override threshold is RAISED 2.5 -> 2.75, so the
-        # ON / OFF builds bake different ``b_up`` and must never share a
-        # serialised entry. Gated on the campaign prerequisite
-        # ``C4_NO_STACK0_EMIT`` so the non-campaign / flag-OFF build is
-        # byte-identical to golden. See shared.cmp_gt_lo_lt_hieq_guard_enabled.
-        "C4_CMP_GT_LO_LT_HIEQ_GUARD": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
-        ),
+        # if_var GT-FALSE 0xF-leak guard + GT-TRUE lo_lt-leak guard: the
+        # C4_CMP_HI_LT_ALU15_GUARD (hi_lt ALU_HI+15 veto drop) and
+        # C4_CMP_GT_LO_LT_HIEQ_GUARD (GT/GE 2.5->2.75 threshold raise) escape
+        # hatches were RETIRED 2026-07-14 (proven default-ON). Both bakes are now
+        # unconditional under the campaign frame; their state tracks
+        # C4_NO_STACK0_EMIT exactly (which the cache key already distinguishes via
+        # its other campaign terms), so the campaign / non-campaign builds still
+        # never share a serialised entry. See shared.cmp_hi_lt_alu15_leak_guard_enabled
+        # / cmp_gt_lo_lt_hieq_guard_enabled.
         # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
         # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
         # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target index
@@ -2331,11 +2294,14 @@ def _build_cache_key_snapshot(
         # the flag-ON path during the byte-identity golden check. See
         # docs/EMIT_G5_ROLLOUT_2026_07_13.md.
         "C4_EMIT_G5_RBYTE": emit_g5_rbyte_enabled(),
-        # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt out
-        # =0, BAKE-affecting): appends a 32-unit PureFFN post_op to the L25 tail
-        # block, so the ON / OFF builds have different state_dicts and MUST NEVER
-        # share a serialised entry. See l0_ops._clean_emitter_enabled.
-        "C4_CLEAN_EMITTER": (os.environ.get("C4_CLEAN_EMITTER", "1") != "0"),
+        # CLEAN_EMITTER generic all-marker-row OUTPUT sink (BAKE-affecting):
+        # appends a 32-unit PureFFN post_op to the L25 tail block under the
+        # campaign frame. The C4_CLEAN_EMITTER escape hatch was RETIRED 2026-07-14
+        # (proven default-ON); the op is now installed unconditionally under
+        # C4_NO_STACK0_EMIT, so campaign (post_op present) and non-campaign
+        # (absent) builds never share a serialised entry. See
+        # l0_ops._clean_emitter_enabled.
+        "clean_emitter_wrap": (os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"),
         # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255 per-value
         # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-ON, kill-switch
         # =0). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,
@@ -2401,31 +2367,12 @@ def _build_cache_key_snapshot(
         "C4_DIV_MULTIPASS": (
             os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
         ),
-        # MUL byte-1 delivery (DEFAULT-OFF, opt in =1): OP_MUL/OP_SHL W_up
-        # blocker on the ``layer14_jsr_ax_bytes_zero`` clear units (idx104/idx106
-        # spurious-OP_JSR-leak). Output-affecting → ON / OFF builds must never
-        # share a serialised cache entry. See ops/l14_ops._mul_b1_delivery_enabled.
-        "C4_MUL_B1_DELIVERY": (
-            os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
-        ),
-        # Combined ALU operand-survival fix (DEFAULT-ON, opt out =0,
-        # WEIGHT+BAKE-affecting): the block-15 L9-clear operand spare
-        # (l9_ops._alu_operand_survive_enabled -- extra W_up NOT-blocker
-        # columns) AND the block-17 head-4 CMP Q-veto
-        # (model_ops.make_cmp_h4_qveto_op -- overwrites head 4's W_q at the six
-        # CMP columns with -1e5). Both survive operand-A through the two
-        # ALU-clear crushes so CmpOperandSeRecoverFFN / MulOperandSeRecoverFFN
-        # are inert and deleted. ON / OFF bake different block-15 W_up +
-        # block-17 W_q, so they must NEVER share a memo / disk entry. OFF (=0)
-        # reproduces the fork-point golden. See docs/SERECOVER_DELETE_2026_07_13.md.
-        "C4_ALU_OPERAND_SURVIVE": (
-            os.environ.get("C4_ALU_OPERAND_SURVIVE", "1") != "0"
-        ),
         # Whether OP_LT is in the L9 raw-band clear spare (DEFAULT-OFF; LT
         # excluded fixes func_min id675 while EQ/NE/GT/LE/GE stay spared so
         # if_eq/bool_and hold). Weight-affecting (adds/removes the OP_LT -1e6
         # blocker column on the block-15 clear), so ON/OFF must not share a memo
-        # entry. Only meaningful when C4_ALU_OPERAND_SURVIVE is ON. See
+        # entry. (The operand-survival spare itself is now unconditional —
+        # C4_ALU_OPERAND_SURVIVE was RETIRED 2026-07-14.) See
         # docs/FUNCMIN_FIX_2026_07_13.md.
         "C4_ALU_OPERAND_SURVIVE_CMP_RAW": (
             os.environ.get("C4_ALU_OPERAND_SURVIVE_CMP_RAW", "0") != "0"
