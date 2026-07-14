@@ -1979,14 +1979,6 @@ def _build_cache_key_snapshot(
         "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
             os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
         ),
-        # ENT-step AX-dump 0xE8/0x02 (744) sentinel-slam guard (#311; DEFAULT-ON
-        # in the campaign config, opt out =0; output-affecting on the main-ENT
-        # AX byte-0/byte-1 dump rows): the ON / OFF builds must never share a
-        # serialised entry. See l10_ops.py ``_tail_lea_e8_ent_guard_enabled``.
-        "C4_TAIL_LEA_E8_ENT_GUARD": (
-            os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
-            and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-        ),
         # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
         # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit): the
         # ON / OFF builds bake the byte_39_from_e8_addr rule with different

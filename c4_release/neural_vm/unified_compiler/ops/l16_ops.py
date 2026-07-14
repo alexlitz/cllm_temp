@@ -171,10 +171,10 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     l10 arith guard so a single ``--flag C4_TAIL_LEA_E8_ARITH_GUARD`` A/Bs
     both 0xE8-byte0 writers in lock-step.
     """
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_ARITH_GUARD`` escape hatch was retired). The l10 sibling
+    # guard was retired in lock-step.
+    return no_stack0_emit_enabled()
 
 
 def _arith_guard_addsub_blockers() -> tuple:

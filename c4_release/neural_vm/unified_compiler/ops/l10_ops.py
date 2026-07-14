@@ -140,10 +140,9 @@ def _tail_lea_e8_divmod_guard_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_DIVMOD_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_DIVMOD_GUARD`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 def _tail_lea_e8_arith_guard_enabled() -> bool:
@@ -185,10 +184,9 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_ARITH_GUARD`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 def _tail_lea_e8_arith_guard_sharp_enabled() -> bool:
@@ -421,10 +419,9 @@ def _tail_lea_e8_ent_guard_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_ENT_GUARD`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 # ENT is C4 opcode 6 = 0x06 -> low nibble 0x6. The per-step FETCHED opcode
@@ -971,10 +968,9 @@ def _sp_pop_carry_byte0_dominate_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_SP_POP_CARRY_BYTE0_DOMINATE", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_SP_POP_CARRY_BYTE0_DOMINATE`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 def _psh_stack0_highbyte_darken_enabled() -> bool:
