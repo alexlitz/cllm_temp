@@ -2010,14 +2010,11 @@ def _build_cache_key_snapshot(
         "C4_MUL_STACK0_BYTE39_GUARD": (
             os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") != "0"
         ),
-        # L11 wide_mul operand-A SE recover (#321, DEFAULT-ON in campaign, opt
-        # out =0, BAKE-affecting): when active the L11 wide_mul block.ffn is
-        # wrapped in MulOperandSeRecoverFFN, otherwise it is the bare PureFFN.
-        # The two builds STRUCTURALLY differ so they must never share a
-        # serialised entry. See shared.mul_l11_se_recover_enabled.
-        "C4_MUL_L11_SE_RECOVER": (
-            os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
-        ),
+        # (``C4_MUL_L11_SE_RECOVER`` cache-key entry removed 2026-07-14 — the
+        # ``MulOperandSeRecoverFFN`` wrap it isolated was DELETED 2026-07-13
+        # (root-fixed by ``C4_ALU_OPERAND_SURVIVE``), so ON / OFF now produce
+        # byte-identical builds and no longer need separate serialised entries.
+        # See docs/L10_ATTN_GLUE_2026_07_13.md dead-flag sweep.)
         # si/li LOAD byte-1 ADDRESS-leak discriminator (Inc-2, campaign-ON, opt
         # out =0): adds L10 head-1 slot 83 so ON / OFF builds must never share a
         # serialised entry. See shared.sili_cam_b1_enabled.
