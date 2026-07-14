@@ -1000,7 +1000,9 @@ def _psh_stack0_highbyte_darken_enabled() -> bool:
     ``C4_PSH_STACK0_HIGHBYTE_DARKEN=0`` the head spec is byte-identical to
     the prior build (the two slot-7 BYTE_INDEX terms are omitted).
     """
-    return os.environ.get("C4_PSH_STACK0_HIGHBYTE_DARKEN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_PSH_STACK0_HIGHBYTE_DARKEN`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _stack0_pop_loaded_shallow_crush_enabled() -> bool:
@@ -1036,7 +1038,9 @@ def _stack0_pop_loaded_shallow_crush_enabled() -> bool:
     ``C4_STACK0_POP_LOADED_SHALLOW_CRUSH=0`` the family is byte-identical to the
     prior build (competitor strength stays 500).
     """
-    return os.environ.get("C4_STACK0_POP_LOADED_SHALLOW_CRUSH", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_STACK0_POP_LOADED_SHALLOW_CRUSH`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l10_exit_axcarry_enabled() -> bool:
@@ -1073,7 +1077,9 @@ def _l10_exit_axcarry_enabled() -> bool:
     byte-identical to HEAD. See ``_l10_exit_axcarry_rules`` /
     ``make_l10_exit_axcarry_op``.
     """
-    return os.environ.get("C4_L10_EXIT_AXCARRY", "1") == "1"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L10_EXIT_AXCARRY`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref

@@ -1889,37 +1889,6 @@ def _build_cache_key_snapshot(
         "C4_AX_BYTE1_FULL_WIDTH": (
             os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
         ),
-        # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
-        # opt out with =0, output-affecting): the ON / OFF builds must never
-        # share a serialised entry.
-        "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
-            os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
-        ),
-        # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1, output-affecting on
-        # post-LEV ADJ AX rows): the ON / OFF builds must never share a
-        # serialised entry. Ships with the C4_L15_LEV func chain.
-        "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
-            os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
-        ),
-        # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0,
-        # output-affecting on the call-arg PSH store value): the ON / OFF
-        # builds must never share a serialised entry.
-        "C4_PSH_ARG_VAL_AX": (
-            os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
-        ),
-        # L15 head-0 LI/LC-load suppressor inert (DEFAULT-ON, opt out =0,
-        # output-affecting on func/nested/rec/var LI loads): the ON / OFF
-        # builds must never share a serialised entry.
-        "C4_L15_LI_SUPPR_INERT": (
-            os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
-        ),
-        # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows L15
-        # memory-lookup attention 14 -> 15 heads (changes num_heads + the L15
-        # W_q/W_k/W_v/W_o shapes), so the ON / OFF builds must never share a
-        # serialised entry.
-        "C4_L15_LEV_PC_RESTORE": (
-            os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
-        ),
         # L15 head-16 SI/SC store address-provenance CAM (DEFAULT-OFF, opt in
         # =1): grows L15 memory-lookup attention 16 -> 17 heads (changes
         # num_heads + the L15 W_q/W_k/W_v/W_o shapes), so the ON / OFF builds
@@ -1955,22 +1924,13 @@ def _build_cache_key_snapshot(
         "C4_ABSDIFF_FIX": (
             os.environ.get("C4_ABSDIFF_FIX") == "1"
         ),
-        # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
-        # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs
-        # fold into the same key so any retune invalidates the entry.
+        # L15 LEV address-widening sub-knobs (the non-boolean retune values;
+        # the DEFAULT-ON ADDR_WIDEN + PC_ONLY toggles were retired in the P5
+        # flag-retire 2026-07-14, so only the int knobs remain distinguishing).
         "C4_L15_LEV_ADDR_WIDEN": (
-            os.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0",
             os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
             os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
             os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
-            os.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0",
-        ),
-        # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
-        # opt out =0, output-affecting on the func/nested/rec EXIT value): adds a
-        # 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY >= 3.0. The ON / OFF
-        # builds must never share a serialised entry.
-        "C4_LEV_AX_BYTE1_KILL": (
-            os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
         ),
         # LEA-local multi-local E8 guard (DEFAULT-OFF, opt in =1, output-
         # affecting on the var multi-local LEA-from-frame address): the ON / OFF
@@ -2161,15 +2121,6 @@ def _build_cache_key_snapshot(
         # its other campaign terms), so the campaign / non-campaign builds still
         # never share a serialised entry. See shared.cmp_hi_lt_alu15_leak_guard_enabled
         # / cmp_gt_lo_lt_hieq_guard_enabled.
-        # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
-        # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
-        # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target index
-        # >= 16 keeps byte-0's high nibble (BZ 16 -> PC 130, not 2). The ON / OFF
-        # builds bake different FFN weights and must never share a serialised
-        # entry. See l6_ops._ifvar_bz_hi_nibble_enabled.
-        "C4_IFVAR_BZ_HI_NIBBLE": (
-            os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
-        ),
         # Multilocal-ENT AX byte-0 source fix (DEFAULT-ON in campaign, opt out
         # =0, BAKE-affecting): when active ``make_l10_ent_axcarry_op`` appends a
         # PureFFN post_op to the L25 tail block that re-asserts the carried AX

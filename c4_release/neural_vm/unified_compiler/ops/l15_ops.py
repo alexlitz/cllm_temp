@@ -63,7 +63,9 @@ def _l15_li_load_suppressor_inert_on() -> bool:
     PC/SP/STACK0/pop row the suppressors actually guard) the writes are absent,
     so HEAD is byte-identical with the flag OFF.
     """
-    return _os_l15.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LI_SUPPR_INERT`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_pc_restore_head_on() -> bool:
@@ -108,7 +110,9 @@ def _l15_lev_pc_restore_head_on() -> bool:
     ``W_q/W_k/W_v`` row count and ``W_o`` column count -- d_model is unchanged
     so every OTHER block is byte-identical regardless of the flag.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LEV_PC_RESTORE`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_addr_widen_on() -> bool:
@@ -142,7 +146,9 @@ def _l15_lev_addr_widen_on() -> bool:
     address scale, value_scale 1.0, original slot-31), so smoke stays at the
     HEAD baseline. Turn ON once the single-store framing fix lands.
     """
-    return _os_l15.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LEV_ADDR_WIDEN`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_b0_boost_factor() -> float:
@@ -235,7 +241,9 @@ def _l15_lev_pc_only_on() -> bool:
     load is no longer clobbered. Flag-off omits the slot (byte-identical to the
     widen build); consulted only when ``C4_L15_LEV_ADDR_WIDEN`` is on.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LEV_PC_ONLY`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_opcode_gate_on() -> bool:
