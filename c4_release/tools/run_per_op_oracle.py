@@ -67,10 +67,53 @@ def _all_op_classes() -> List[str]:
 
 
 def _shard(ops: List[str], n: int) -> List[List[str]]:
-    """Round-robin the op-classes into ``n`` shards (balances cheap vs deep)."""
+    """Distribute op-classes into ``n`` shards, CO-LOCATING op-classes that share
+    a representative program so the per-process decode cache is exploited.
+
+    Op-classes that decode the SAME program (var_simple_0 covers LI/SI/LEA/JSR/
+    ENT; func_identity_0 covers ADJ/LEV) are grouped onto ONE worker, so the
+    expensive shared decode runs ONCE (via the ``per_op_decode._DECODE_CACHE``)
+    instead of once per worker. Groups are then greedily packed onto the ``n``
+    shards (largest group first) to balance the load.
+    """
+    from tests.oracles.per_op_decode import op_class_specs
+
+    specs = op_class_specs()
+    # Build a signature for each op = the set of representative programs it runs.
+    def sig(op: str):
+        s = specs[op]
+        return frozenset([("c", i) for i in s.corpus_ids]
+                         + [("r", r.label) for r in s.raw])
+
+    # Union-find on shared programs so all ops sharing ANY program cluster.
+    parent = {op: op for op in ops}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        parent[find(a)] = find(b)
+
+    prog_owner: dict = {}
+    for op in ops:
+        for p in sig(op):
+            if p in prog_owner:
+                union(op, prog_owner[p])
+            else:
+                prog_owner[p] = op
+    groups: dict = {}
+    for op in ops:
+        groups.setdefault(find(op), []).append(op)
+    group_list = sorted(groups.values(), key=len, reverse=True)
+
+    # Greedy pack groups onto n shards (smallest-current-shard first).
     shards: List[List[str]] = [[] for _ in range(max(1, n))]
-    for i, op in enumerate(ops):
-        shards[i % len(shards)].append(op)
+    for grp in group_list:
+        shards.sort(key=len)
+        shards[0].extend(grp)
     return [s for s in shards if s]
 
 
