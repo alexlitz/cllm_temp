@@ -266,6 +266,16 @@ real per-step work, not a lookup. It needs no autoregressive token feedback for
 straight-line code. (Branches require restoring PC-driven fetch + cross-position carry —
 scoped as a documented extension, projected below.)
 
+> **Control flow — IMPLEMENTED (see `CONTROL_FLOW.md`).** The branch extension is
+> now built + validated. Mechanism: **PC-driven per-block dispatch** — each
+> unrolled block is a *universal VM step* that runs the instruction at the runtime
+> PC (an exact-integer PC one-hot gates the op), on this same single-position
+> depth=time substrate. `JMP/BZ/BNZ` pass the oracle; a computed-predicate
+> `if-then-else` decodes byte-exact. It needed **no `model.py` change** — pure
+> additive FFN gadgets (`control.py`) + a routing check in `compiler.py`. Bounded
+> unroll suffices (the 332 corpus has no unbounded loops), so no cross-position
+> attention fetch was required.
+
 **Measured skeleton LOC (code-only: no blanks / comments / docstrings):**
 
 | File               | LOC | File               | LOC |
