@@ -2066,18 +2066,6 @@ def _build_cache_key_snapshot(
         "C4_ABSDIFF_RET_BYTE1": (
             os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
         ),
-        # PROJECT_0XE8_SLAM Phase-2: MULTIPLICATIVE OP_LEA gate on the
-        # loop_lea_b0_e8 / _e0 restore ops (DEFAULT OFF, opt in =1,
-        # BAKE-affecting): adds a per-unit gate to EVERY unit in both rule
-        # families so the discriminator's W_gate / b_gate weights differ ON vs
-        # OFF and the two serialised models must NEVER share an entry. Gated on
-        # the campaign prerequisites so the non-campaign / golden build is
-        # byte-identical. See shared.loop_lea_oplea_gate_enabled.
-        "C4_LOOP_LEA_OPLEA_GATE": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
-        ),
         # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt out
         # =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60 threshold bump
         # to the L10 ``e8_alubp_memsp`` writer so ON / OFF builds bake different

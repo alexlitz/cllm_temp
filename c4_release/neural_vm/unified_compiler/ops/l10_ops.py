@@ -1100,9 +1100,7 @@ from .shared import (
     absdiff_fix_enabled,
     absdiff_ret_byte1_enabled,
     loop_lea_b0_e0_restore_enabled,
-    loop_lea_b0_e8_oplea_req_enabled,
     loop_lea_b0_e8_restore_enabled,
-    loop_lea_oplea_gate_enabled,
     loop_li_opcode_fetch_addrkey_clamp_enabled,
     loop_si_byterow_marker_clear_enabled,
     mul_stack0_byte39_guard_enabled,
@@ -11510,7 +11508,9 @@ _LOOP_LEA_E8_HI_NIBBLE = 14      # 0xE8 high nibble (0xE)
 # silu(up) * 0 = 0, a true zero-out that NO FETCH amplitude can cross. A bias of
 # 0.0 is deliberate: a NEGATIVE gate would INVERT the +/-DOM winner-take-all on a
 # false-fire row (silu(up) stays large-positive) and stamp a DIFFERENT wrong
-# byte, whereas gate==0 is a clean no-op. See shared.loop_lea_oplea_gate_enabled.
+# byte, whereas gate==0 is a clean no-op. The gate is applied unconditionally in
+# the campaign loop_lea ops (the former C4_LOOP_LEA_OPLEA_GATE flag was retired
+# in the P5 flag-retire 2026-07-14).
 _LOOP_LEA_OPLEA_GENUINE = 5.23   # measured genuine in-loop LEA OP_LEA value
 _LOOP_LEA_OPLEA_GATE_W = 1.0 / _LOOP_LEA_OPLEA_GENUINE  # -> genuine gate ~= 1.0
 
@@ -11540,12 +11540,11 @@ def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
     # FIRES (100 + 1048 + 160 - 650 = 658 > 500, 158-pt margin) while the LI row
     # (OP_LEA 0) is VETOED (100 + 0 + 1000 - 650 = 450 < 500). The 2nd/3rd-local
     # LEAs (FETCH net -1000) stay silent (-502). OFF reverts to the regressed
-    # weights for A/B. See ``shared.loop_lea_b0_e8_oplea_req_enabled``.
-    _oplea_req = loop_lea_b0_e8_oplea_req_enabled()
-    _op_lea_w = 200.0 if _oplea_req else 60.0
-    _const_bias: tuple[tuple[str, float], ...] = (
-        (("CONST", -650.0),) if _oplea_req else ()
-    )
+    # weights for A/B. The OPLEA_REQ narrowing is now UNCONDITIONAL (P5
+    # flag-retire 2026-07-14; the former ``C4_LOOP_LEA_B0_E8_OPLEA_REQ`` escape
+    # hatch was retired).
+    _op_lea_w = 200.0
+    _const_bias: tuple[tuple[str, float], ...] = (("CONST", -650.0),)
     disc: tuple[tuple[str, float], ...] = _const_bias + (
         ("MARK_AX", 100.0),
         # GENUINE LEA (OP_LEA ~5.24): HARD requirement when the OPLEA_REQ
@@ -11595,15 +11594,15 @@ def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
     # ENT opcode one-hot ``OPCODE_BYTE_LO+6`` hard-blocks it on a real ENT step
     # while leaving every genuine in-loop LEA row (OPCODE_BYTE_LO+6 == 0)
     # byte-identical. See ``_tail_lea_e8_ent_guard_enabled``.
-    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (default OFF via
-    # C4_LOOP_LEA_OPLEA_GATE). Added to EVERY unit so the whole op zeroes when
+    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (unconditional as
+    # of the P5 flag-retire 2026-07-14; the former C4_LOOP_LEA_OPLEA_GATE escape
+    # hatch was retired). Added to EVERY unit so the whole op zeroes when
     # OP_LEA == 0 (the IMM/comparison leak rows) regardless of FETCH amplitude,
     # and is a ~no-op (gate ~= 1.0) on genuine OP_LEA ~= 5.23 in-loop LEA rows.
-    _gate_kwargs: dict = (
-        {"gate_bias": 0.0, "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),)}
-        if loop_lea_oplea_gate_enabled()
-        else {}
-    )
+    _gate_kwargs: dict = {
+        "gate_bias": 0.0,
+        "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),),
+    }
     rules: list[FFNRule] = []
     for out_dim, tgt in (
         ("OUTPUT_LO", _LOOP_LEA_E8_LO_NIBBLE),
@@ -11768,16 +11767,16 @@ def _l10_loop_lea_b0_e0_rules() -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1_000_000.0),
         ("MARK_MEM", -1_000_000.0),
     )
-    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (default OFF via
-    # C4_LOOP_LEA_OPLEA_GATE). Mirror of the e8 op: added to EVERY unit so the
-    # whole op zeroes when OP_LEA == 0 (the IMM/comparison leak rows, e.g. if_eq
-    # id402 wants byte-0 0x10 not 0xe0) regardless of FETCH amplitude, and is a
-    # ~no-op (gate ~= 1.0) on genuine OP_LEA ~= 5.23 2nd-local LEA rows.
-    _gate_kwargs: dict = (
-        {"gate_bias": 0.0, "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),)}
-        if loop_lea_oplea_gate_enabled()
-        else {}
-    )
+    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (unconditional as
+    # of the P5 flag-retire 2026-07-14; the former C4_LOOP_LEA_OPLEA_GATE escape
+    # hatch was retired). Mirror of the e8 op: added to EVERY unit so the whole op
+    # zeroes when OP_LEA == 0 (the IMM/comparison leak rows, e.g. if_eq id402
+    # wants byte-0 0x10 not 0xe0) regardless of FETCH amplitude, and is a ~no-op
+    # (gate ~= 1.0) on genuine OP_LEA ~= 5.23 2nd-local LEA rows.
+    _gate_kwargs: dict = {
+        "gate_bias": 0.0,
+        "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),),
+    }
     rules: list[FFNRule] = []
     for out_dim, tgt in (
         ("OUTPUT_LO", _LOOP_LEA_E0_LO_NIBBLE),
