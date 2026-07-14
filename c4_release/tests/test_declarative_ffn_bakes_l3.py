@@ -13,7 +13,8 @@ Covers:
 
 import torch
 
-from c4_release.neural_vm.vm_step import _SetDim, _set_layer3_ffn
+from c4_release.neural_vm.vm_step import _SetDim
+from tests.oracles.vm_step_layer_bakes import _set_layer3_ffn
 from c4_release.neural_vm.unified_compiler.ops.l3_ops import (
     _convo_io_state_init_ir,
     _register_default_ffn_ir,

@@ -1778,1484 +1778,46 @@ def _emit_cross_step_safety_warnings(
 _INPROC_COMPILE_CACHE: Dict[str, Tuple[Any, Any]] = {}
 
 
-def _inproc_cache_key(snapshot: dict) -> str:
-    """Stable SHA1 of a kwargs snapshot for in-process memoisation."""
-    import hashlib as _hashlib
-    import json as _json
-    payload = _json.dumps(snapshot, sort_keys=True, default=repr).encode("utf-8")
-    return _hashlib.sha1(payload).hexdigest()
-
-
-def compile_full_vm_dynamic(
-    S: float = 100.0,
+def _build_cache_key_snapshot(
     *,
-    enable_conversational_io: bool = False,
-    enable_tool_calling: bool = False,
-    enable_neural_io_think_protocol: bool = False,
-    alu_mode: str = "lookup",
-    n_heads: int = 8,
-    ffn_hidden: int = 4096,
-    max_seq_len: int = 8192,
-    pin_io_only: bool = True,
-    disk_cache: bool = True,
-    use_dynamic_ffn: bool = True,
-    enable_moe_routing: Optional[bool] = None,
-    arch: Optional[ModelArchitectureSpec] = None,
-    positional_encoding: Optional[str] = None,
-    attention_normalization: Optional[str] = None,
-    rope_base: Optional[float] = None,
-    use_rms_norm: Optional[bool] = None,
-    rms_norm_eps: Optional[float] = None,
-    require_declarative_bake: Optional[bool] = None,
-    declarations_only: bool = False,
-    kv_eviction_policy=None,
-    kv_eviction_n_steps: int = 64,
-    strict: bool = True,
-    allow_sealed_cycles: bool = True,
-    model_shape_constraint=None,
-    target_shape_overrides=None,
-    d_model_packing: bool = False,
-    d_model_packing_target: Optional[int] = None,
-    cross_step_baseline_allowlist: Optional[Iterable[Tuple[str, str]]] = None,
-    # Model-semantics umbrella flags (see
-    # ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``). All default to
-    # ``None`` so existing callers see no behavior change. ``preset=`` is
-    # the convenience shortcut; the six per-axis flags are the per-axis
-    # override surface. Mixing ``preset=`` with ``arch=`` is rejected like
-    # the existing ``arch=`` vs individual-kwarg gate.
-    preset: Optional[str] = None,
-    softmax_variant: Optional[str] = None,
-    normalization: Optional[str] = None,
-    ffn_variant: Optional[str] = None,
-    per_head_qk_norm: Optional[str] = None,
-    ffn_routing: Optional[str] = None,
-    extra_residual_dims: Optional[Mapping[str, int]] = None,
+    S,
+    enable_conversational_io,
+    enable_tool_calling,
+    enable_neural_io_think_protocol,
+    alu_mode,
+    n_heads,
+    ffn_hidden,
+    max_seq_len,
+    pin_io_only,
+    enable_moe_routing,
+    positional_encoding,
+    attention_normalization,
+    rope_base,
+    use_rms_norm,
+    rms_norm_eps,
+    require_declarative_bake,
+    declarations_only,
+    kv_eviction_policy,
+    kv_eviction_n_steps,
+    extra_residual_dims,
 ):
-    """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
+    """Single source of truth for the compile cache-invalidation snapshot.
 
-    Signature mirrors ``compile_full_vm`` exactly (same args/kwargs, same
-    return type ``(model, layout)``). As of Phase 8.G.3 this is the only
-    implementation of ``compile_full_vm`` — that entry point is a thin
-    unconditional redirect here after the static phase-pruning body was
-    deleted.
+    Both the in-process memo (``compile_full_vm_dynamic``) and the on-disk cache
+    (``_bake_from_scheduled_ops`` -> ``_static._cache_key``) key on this dict, so
+    any C4_* flag / build kwarg that changes the baked weights (or the model
+    geometry) MUST appear here exactly once, and the two call sites MUST use the
+    identical key set -- otherwise a flag registered on only one layer silently
+    lets that layer hand back a stale model when the flag is toggled.
 
-    Internally:
-
-      1. Collect the same op list as ``compile_full_vm`` (delegating to
-         the same factories with the same flags).
-      2. Compute a hybrid dep+phase schedule via
-         ``compute_dynamic_schedule``. This is the load-bearing dynamic
-         logic; today it agrees with the static phase order on the full
-         op set (cycle members fall back to phase, non-cycle ops sort by
-         topological depth with phase as a tiebreaker — and on the current
-         op set the tiebreaker always wins because the DAG depth chain is
-         only 4 layers deep vs. the 17-layer static layout).
-      3. Hand the scheduled ops to the unchanged ``LayerCompiler`` and
-         ``build_model_from_layout`` pipelines used by ``compile_full_vm``.
-         The static path's phase pruning runs on top, so any residual
-         ordering ambiguity is resolved identically to the static path.
-
-    The caller receives ``(model, layout)`` exactly as from
-    ``compile_full_vm`` (which is now a thin redirect to this function
-    after the Phase 8.G.3 static-body deletion). The historical
-    byte-identity gate (``compare_compile_paths``) was removed alongside
-    the static body; the surviving fast scheduler invariants in
-    ``tests/test_compile_dynamic_byte_identical.py`` continue to gate
-    dep-graph regressions.
-
-    Args mirror ``compile_full_vm`` -- see that function's docstring for
-    detailed semantics. The disk-cache key is namespaced by appending
-    ``"__dynamic"`` to the kwargs snapshot so dynamic and static
-    compiles cannot trample each other's cache entries.
-
-    Strict mode (B14, ON by default as of Phase 7.A.5 default-flip)
-    ----------------------------------------------------------------
-    When ``strict=True`` (the default since Phase 7.A.5), the dynamic
-    compile refuses to fall back to ``phase`` for any ordering decision.
-    Before compiling, every op is categorised against the unpruned
-    declared-dep graph (mirroring ``tools/analyze_scheduler.py``); if any
-    op falls into ``dep_graph_cycle_member`` (and ``allow_sealed_cycles``
-    is False), ``phase_required_but_undeclared``, or
-    ``phase_inconsistent_with_deps``, the call raises
-    ``StrictModeUnschedulableError`` with the offending op names.
-
-    On a clean op set strict mode produces the same byte-identical
-    layout as the static path, because on a fully-declared op set the
-    dep-derived order and the phase-derived order agree (Phase A
-    finding, see ``DYNAMIC_SCHEDULER_MIGRATION_PLAN.md``).
-
-    Cycle-aware admission (``allow_sealed_cycles=True``, also the
-    default) accepts the OUTPUT_HI / IF_VAR SCC as a sealed group: the
-    hybrid scheduler still falls back to phase ordering INSIDE the SCC,
-    but every op OUTSIDE the SCC must be cleanly placeable from declared
-    deps alone. Today's production op set has ~92 cycle members and 0
-    non-cycle ``phase_required_but_undeclared`` /
-    ``phase_inconsistent_with_deps`` ops, so the default
-    ``strict=True, allow_sealed_cycles=True`` admits the compile and
-    produces a byte-identical layout to the prior strict-off path.
-
-    Passing ``strict=False`` restores the pre-Phase-7.A.5 behaviour
-    (no admission gate). Passing ``allow_sealed_cycles=False`` restores
-    the legacy "any cycle is a failure" behaviour, which today fails on
-    the production op set until B9 (dim decomposition) completes.
-
-    Target-shape overrides (shape-only rebuild)
-    --------------------------------------------
-    ``target_shape_overrides`` (when not ``None``) is a
-    ``ModelShapeConstraint`` whose pinned fields drive a POST-COMPILE
-    rebuild of the returned VM into a fresh ``AutoregressiveVM`` with
-    the target ``d_model`` / ``n_layers`` / ``n_heads`` / ``head_dim``
-    / ``intermediate_size`` / ``vocab_size``. The rebuilt model has
-    zero-initialized weights — it is NOT semantically equivalent to the
-    compiled VM. This is the minimum viable path that lets the HF
-    state-dict export adapters (Mixtral, Llama) be wired end-to-end
-    without rewriting the allocator stack to natively emit
-    Mixtral-shaped weights. See ``_rebuild_to_target_shape`` for the
-    documented gap (the allocator-native path is tracked separately).
-
-    ``model_shape_constraint`` (validation-only) and
-    ``target_shape_overrides`` (rebuild) compose: when both are set,
-    the rebuild runs first, then the constraint validates the rebuilt
-    model. Use ``target_shape_overrides`` alone for "shape-match HF
-    export"; use ``model_shape_constraint`` alone to assert the
-    naturally-allocated shape matches an external envelope.
+    Reconciled 2026-07-13: the former dual inline snapshots had drifted
+    (``C4_L15_LOOKUP_CMP_VETO`` / ``C4_STACK0_NEXT_ARITH`` were memo-only;
+    ``C4_ADDSUB_DECLARATIVE`` / ``C4_L10_ENT_AXCARRY`` were disk-only), a
+    cache-collision hazard. This builder is their union (byte-identical values
+    for every shared key). The ``sort_keys=True`` in both key hashers makes the
+    dict order here irrelevant.
     """
-    # Mirror static-path env-flag handling to keep the API truly identical.
-    if not declarations_only:
-        declarations_only = _static._env_flag_enabled(
-            _static._DECLARATIONS_ONLY_BAKE_ENV
-        )
-    # Phase 7.F.2: default to OFF (preserves byte-identity with the
-    # historical baseline). Accept either a ``KVEvictionPolicy`` member
-    # or its string value; the static path is symmetric.
-    if kv_eviction_policy is None:
-        kv_eviction_policy = KVEvictionPolicy.OFF
-    if enable_moe_routing is None:
-        enable_moe_routing = _static._env_flag_enabled(
-            _static._ENABLE_MOE_ROUTING_ENV
-        )
-    if require_declarative_bake is None:
-        require_declarative_bake = _static._env_flag_enabled(
-            _static._REQUIRE_DECLARATIVE_BAKE_ENV
-        )
-    if declarations_only:
-        require_declarative_bake = True
-
-    # Model-semantics umbrella (see
-    # ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``). Resolves the
-    # six per-axis flags + the ``preset=`` shortcut into the existing
-    # ``positional_encoding`` / ``attention_normalization`` / ``use_rms_norm``
-    # / ``enable_moe_routing`` kwargs that the bake pipeline already
-    # consumes. The expansion is purely additive: when every umbrella flag
-    # is ``None`` (the default for existing callers) this block is a no-op
-    # and the downstream bake is byte-identical to the historical path.
-    (
-        positional_encoding,
-        attention_normalization,
-        use_rms_norm,
-        enable_moe_routing,
-    ) = _resolve_semantics_flags(
-        preset=preset,
-        positional_encoding=positional_encoding,
-        softmax_variant=softmax_variant,
-        attention_normalization=attention_normalization,
-        normalization=normalization,
-        use_rms_norm=use_rms_norm,
-        ffn_variant=ffn_variant,
-        per_head_qk_norm=per_head_qk_norm,
-        ffn_routing=ffn_routing,
-        enable_moe_routing=enable_moe_routing,
-        arch=arch,
-    )
-
-    # ------------------------------------------------------------------
-    # Auto-widen: extra residual bands requested by an op / caller.
-    # ------------------------------------------------------------------
-    # ``extra_residual_dims`` maps ``name -> size`` for fresh residual
-    # bands that should be appended past the natural d_model. Declaring
-    # them grows d_model automatically (the layout's d_model is the
-    # highest dim end), and the head-dim-preserving alignment in
-    # ``_bake_from_scheduled_ops`` then rounds d_model up to a multiple of
-    # the base head_dim and ADDS heads — so an op never has to hardcode
-    # d_model to claim a fresh band. The dims are bump-pointer allocated
-    # at the tail; the op's rules reference them by name through
-    # ``layout.dim_positions``. This is the API for AX ``H1_PREV_STEP``,
-    # MUL ``MUL_RESULT_HI``, and any future over-width family.
-    if extra_residual_dims:
-        for _name, _size in extra_residual_dims.items():
-            if not isinstance(_name, str) or not _name:
-                raise ValueError(
-                    f"extra_residual_dims: name must be a non-empty str "
-                    f"(got {_name!r})"
-                )
-            if not isinstance(_size, int) or _size <= 0:
-                raise ValueError(
-                    f"extra_residual_dims[{_name!r}]: size must be a "
-                    f"positive int (got {_size!r})"
-                )
-
-    # ------------------------------------------------------------------
-    # Auto-collect op-local residual bands (replaces the central dict).
-    # ------------------------------------------------------------------
-    # Band-adding ops no longer hand-edit a shared dict here. Each op declares
-    # the over-width residual band(s) it needs LOCALLY, next to the op that
-    # reads/writes them, via ``register_residual_band`` in
-    # ``ops/residual_band_registry.py`` (populated at op-module import time —
-    # ``all_core_ops`` wildcard-imports every ``lN_ops`` module). The registry
-    # is auto-collected here: ``collect_registered_residual_bands`` evaluates
-    # each band's flag predicate FRESH (so flag-off builds omit the band and
-    # stay byte-identical) and returns the union in registration order.
-    #
-    # The current production registry holds: the AX byte-1 carry bands
-    # (``H1_PREV_STEP`` / ``H1_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``, l11_ops,
-    # always present), the Root 2 STACK0 byte-0 carry bands (``STACK0_B0_*``,
-    # l11_ops, always present), and the flag-gated width=2 MUL result band
-    # (``MUL_RESULT_HI_LO/HI``, alu_ops, ``C4_MUL_WIDTH2``-gated). Every band
-    # routes through the SINGLE head-dim-preserving auto-widen in
-    # ``_bake_from_scheduled_ops`` (``base_head_dim`` captured from the BASE
-    # layout BEFORE any extra band is appended, so the widen rounds d_model up
-    # to a multiple of the BASE head_dim and ADDS heads instead of
-    # repartitioning every existing head — declaring them via
-    # ``declare_setdim_compat_dims`` would re-derive head_dim from the widened
-    # width and scramble attention content -> regresses test_bnz_branch). The
-    # collected set flows into the disk/in-proc cache key below (which hashes
-    # ``extra_residual_dims`` but NOT ``C4_MUL_WIDTH2`` / ``C4_AX_BYTE1_DUMP``
-    # directly), so flag-on and flag-off builds never share a serialised entry.
-    #
-    # The COMBINED widen (14 AX/Root2-flag dims + 28 Root2 PREV/DUMP dims always
-    # + 32 MUL dims when enabled) rounds head-dim-preservingly (base head_dim
-    # 109): 872 -> 981 (n_heads 8 -> 9). All existing dims are
-    # byte-behaviour-identical (every new band is zero on every row the prior
-    # model touched). Threaded by NAME via ``layout.dim_positions`` -- they must
-    # NOT be op-declared ``declare_dim``s. To add a new band-adding op, call
-    # ``register_residual_band`` at that op's module top — never touch this file.
-    # See docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md.
-    #
-    # AX byte-1 VALUE-GENERALISATION (byte-1 0..15): the carry now ALSO copies
-    # the H2/H3 marker-distance one-hots (``H2/H3_PREV_STEP`` ->
-    # ``H2/H3_DUMP_OUT``, +28 dims) because the fresh-step byte-1 emission
-    # one-hot is SPREAD across H1 (v 0..4) / H2 (v 5..11) / H3 (v 12..15). Those
-    # four bands are now ALSO declared op-locally via ``register_residual_band``
-    # in ``ops/l11_ops.py`` (next to the H1 pair), so they auto-collect here.
-    from .ops.residual_band_registry import (
-        collect_registered_residual_bands,
-        collect_never_share_band_names,
-        collect_alibi_base_residual_bands,
-    )
-    _merged_extra = collect_registered_residual_bands()
-    # The ALiBi-slope BASE band set: bands active with every C4_* flag at its
-    # DEFAULT. Used to derive the slope base head count so a non-default
-    # over-width flag (e.g. C4_AX_BYTE1_FULL_WIDTH) does not shift existing
-    # heads' ALiBi slopes (see collect_alibi_base_residual_bands +
-    # _bake_from_scheduled_ops base_n_heads). Caller/env extra_residual_dims
-    # are folded in below so an explicitly-requested band is part of the base.
-    _alibi_base_extra = collect_alibi_base_residual_bands()
-    # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the auto-collected
-    # production bands (A/B diagnostics only — the carry ops then reference
-    # undeclared dims, so this is for layout/geometry comparison, not a runnable
-    # build). The caller-passed / env ``extra_residual_dims`` below is preserved.
-    if os.environ.get("C4_DISABLE_AX_CARRY_BANDS") == "1":
-        _merged_extra = {}
-        _alibi_base_extra = {}
-    if extra_residual_dims:
-        _merged_extra.update(extra_residual_dims)
-        # An explicitly-requested band is part of the geometry the existing
-        # heads are authored against, so it belongs in the slope base too.
-        _alibi_base_extra.update(extra_residual_dims)
-    extra_residual_dims = _merged_extra or None
-    # Carry/dump bands that must keep a private dim-liveness slot — threaded
-    # into the compiler's never-share set inside ``_bake_from_scheduled_ops``
-    # (no class-level ``_LIVENESS_NEVER_SHARE_NAMES`` hand-edit needed).
-    _never_share_band_names = collect_never_share_band_names()
-
-    from ..config import get_config
-    vm_config = get_config()
-
-    # V2 vision (Phase 8.X): a single ``arch=ModelArchitectureSpec(...)`` may
-    # be passed in lieu of the individual architectural kwargs
-    # (``positional_encoding=``, ``attention_normalization=``,
-    # ``rope_base=``, ``use_rms_norm=``, ``rms_norm_eps=``). Mixing the two
-    # surfaces is rejected with an explicit error rather than silently
-    # privileging one — the migration story is "pick one path per call site".
-    # The individual kwargs remain the back-compat surface; new callers
-    # should prefer ``arch=`` (which composes per-layer overrides cleanly
-    # via :class:`LayerSpec`).
-    if arch is not None:
-        _explicit_arch_kwargs = {
-            name: value
-            for name, value in (
-                ("positional_encoding", positional_encoding),
-                ("attention_normalization", attention_normalization),
-                ("rope_base", rope_base),
-                ("use_rms_norm", use_rms_norm),
-                ("rms_norm_eps", rms_norm_eps),
-            )
-            if value is not None
-        }
-        if _explicit_arch_kwargs:
-            raise TypeError(
-                "compile_full_vm_dynamic(arch=...) is mutually exclusive "
-                "with the individual architectural kwargs "
-                f"{sorted(_explicit_arch_kwargs)}. Pass either an "
-                "``arch=ModelArchitectureSpec(...)`` instance OR the "
-                "individual ``positional_encoding=``/"
-                "``attention_normalization=``/``rope_base=``/"
-                "``use_rms_norm=``/``rms_norm_eps=`` kwargs, not both."
-            )
-        # Project the spec back onto the legacy 5-kwarg surface that the
-        # downstream ``_bake_from_scheduled_ops`` / ``_rebuild_to_target_shape``
-        # APIs still consume. This keeps the runtime path byte-identical
-        # to the historical kwarg path — a spec is just a typed name for
-        # the same five values.
-        positional_encoding = arch.positional_encoding.kind
-        attention_normalization = arch.attention_activation.softmax_kind
-        rope_base = float(arch.positional_encoding.rope_base)
-        use_rms_norm = arch.norm_pre_attention.kind == "rmsnorm"
-        rms_norm_eps = float(arch.norm_pre_attention.eps)
-    else:
-        if positional_encoding is None:
-            positional_encoding = vm_config.positional_encoding
-        if attention_normalization is None:
-            attention_normalization = vm_config.attention_normalization
-        if rope_base is None:
-            rope_base = vm_config.rope_base
-        if use_rms_norm is None:
-            use_rms_norm = vm_config.use_rms_norm
-        if rms_norm_eps is None:
-            rms_norm_eps = vm_config.rms_norm_eps
-
-    # In-process memo short-circuit. Mirrors the kwargs snapshot built inside
-    # ``_bake_from_scheduled_ops`` at the disk-cache lookup so the two layers
-    # invalidate together. Skips the ~1.3 s ``_collect_ops_for_compile`` pass
-    # and the ~3 s ``torch.load`` deserialisation on every subsequent call in
-    # the same process. Cross-process callers (fresh pytest invocations) still
-    # fall through to the disk cache. Disabled when ``disk_cache=False``
-    # (test paths that explicitly want a fresh compile) and when
-    # ``require_declarative_bake`` / ``declarations_only`` / a
-    # ``target_shape_overrides`` rebuild is requested (those paths post-process
-    # the model and would alias if we handed back a memoised reference).
-    _inproc_snapshot = None
-    if (
-        disk_cache
-        and not require_declarative_bake
-        and not declarations_only
-        and target_shape_overrides is None
-        and model_shape_constraint is None
-        and not d_model_packing
-    ):
-        _inproc_snapshot = {
-            "S": S,
-            "enable_conversational_io": enable_conversational_io,
-            "enable_tool_calling": enable_tool_calling,
-            "enable_neural_io_think_protocol": enable_neural_io_think_protocol,
-            "alu_mode": alu_mode,
-            "n_heads": n_heads,
-            "ffn_hidden": ffn_hidden,
-            "max_seq_len": max_seq_len,
-            "pin_io_only": pin_io_only,
-            "enable_moe_routing": bool(enable_moe_routing),
-            "positional_encoding": positional_encoding,
-            "attention_normalization": attention_normalization,
-            "rope_base": float(rope_base),
-            "use_rms_norm": bool(use_rms_norm),
-            "rms_norm_eps": float(rms_norm_eps),
-            "require_declarative_bake": bool(require_declarative_bake),
-            "declarations_only": bool(declarations_only),
-            "kv_eviction_policy": KVEvictionPolicy(kv_eviction_policy).value,
-            "kv_eviction_n_steps": int(kv_eviction_n_steps),
-            "C4_DISABLE_WRAPPER_EXPANSION": (
-                os.environ.get("C4_DISABLE_WRAPPER_EXPANSION") == "1"
-            ),
-            # Qwen R1 (see _bake_from_scheduled_ops cache key for context).
-            "C4_QWEN_EXPORT_COMPAT": (
-                os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
-            ),
-            # AX byte-1 register-dump emission flag (DEFAULT-ON; opt out with
-            # =0): toggles the LM-head ``H1_DUMP_OUT`` columns (output-affecting,
-            # no source change), so the ON and OFF builds must NEVER share a
-            # memo / disk entry.
-            "C4_AX_BYTE1_DUMP": (
-                os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
-            ),
-            # AX byte-1 sign-extension delivery on a negative LEA-local frame
-            # address (#343; DEFAULT-ON in the campaign config, opt out =0,
-            # output-affecting on the var_update step-14 LEA AX byte-1 row): adds
-            # the AX_CARRY_LO/HI+15 sign-ext NOT-blocker pair to the L10 ADD
-            # high-byte adder so it cannot nuke the block-35 0xFF. The ON / OFF
-            # builds must NEVER share a memo / disk entry.
-            "C4_AX_BYTE1_SIGNEXT_LEA": (
-                os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
-            ),
-            # AX high-byte (byte-2/3) all-step zero-default (DEFAULT-OFF; opt in
-            # with =1): appends the l11 ``make_ax_hibyte_clear_allstep_op`` FFN
-            # (register byte-2/3 dump -> 0 on every step) AND omits the redundant
-            # ``H*_DUMP_OUT`` LM-head columns in model_ops. Output-affecting (no
-            # source change), so the ON / OFF builds must NEVER share a memo /
-            # disk entry. The if_var GT-FALSE cluster leaks AX byte-2 = 0x01 at
-            # the BZ/IMM return steps; this flag forces it to 0.
-            "C4_AX_HIBYTE_CLEAR": (
-                os.environ.get("C4_AX_HIBYTE_CLEAR", "0") != "0"
-            ),
-            # (C4_STACK0_B0_DUMP removed 2026-07: the STACK0-b0 dump machinery it
-            # gated was deleted as provably-dead in the 30-token frame, so the
-            # flag no longer affects the build and is no longer part of the memo /
-            # disk cache key.)
-            # Consumer-opcode LOOKAHEAD (#221; DEFAULT-ON, opt out =0): adds the
-            # PC+8 chain + lookahead fetch head + arith-decode flag + AX->STACK0
-            # relay + prior-arith latch + dump-block flag bands AND the dump's
-            # STACK0_B0_DUMP_BLOCK blocker (output-affecting on multi-op arith
-            # intermediate-operand frames). On / off builds must NEVER share a
-            # memo / disk entry -- the band presence changes d_model and the dump
-            # gate changes emission, so this flag toggles geometry AND output.
-            "C4_STACK0_NEXT_ARITH": (
-                os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
-            ),
-            # IMM full-derivation (task #392, DEFAULT-OFF): derives the ENTIRE
-            # IMM opcode from spec — decode (decode_band) + marker_broadcast
-            # relay + value_route copy — with zero hand-authored IMM rules.
-            # Implies C4_DERIVE_DECODE. Byte-identical to the hand path, but the
-            # two builds derive from DIFFERENT source so they must never share a
-            # memo / disk entry.
-            "C4_DERIVE_IMM": (
-                os.environ.get("C4_DERIVE_IMM", "0") != "0"
-            ),
-            # BITWISE one-formula derivation (task #449, DEFAULT-ON): the L10
-            # OR/XOR/AND result nibbles derive from the SINGLE BLOG_SPEC §568
-            # per-bit formula ``c_a*a + c_b*b + c_ab*a*b``. The enumerated
-            # ``operator.and_/or_/xor`` dispatch has been deleted;
-            # ``C4_DERIVE_BITWISE=0`` is a legacy no-op kill-switch. Byte-identical
-            # golden e50521f3. Registered here so a build never shares a memo /
-            # disk entry across the flag. See shared.derive_bitwise_enabled.
-            "C4_DERIVE_BITWISE": (
-                os.environ.get("C4_DERIVE_BITWISE", "1") != "0"
-            ),
-            # L13 SHL/SHR result DERIVED from BLOG_SPEC §599 (powers-of-two +
-            # mod-by-floor) (task #448, DEFAULT-ON). The hand-authored
-            # ``(v << s) & 0xFF`` / ``v >> s`` lambdas have been deleted;
-            # ``C4_DERIVE_SHIFT=0`` is a legacy no-op kill-switch. Byte-identical
-            # golden e50521f3. Registered here for cache-key isolation.
-            "C4_DERIVE_SHIFT": (
-                os.environ.get("C4_DERIVE_SHIFT", "1") != "0"
-            ),
-            # COMPARISON family derived from ONE zero-detector (task #446;
-            # DEFAULT-ON). The L10 cmp-combine banks are generated from
-            # ``derived_comparison_rules``; the per-op default+override hand
-            # enumeration has been deleted. ``C4_DERIVE_CMP=0`` is a legacy no-op
-            # kill-switch. Byte-identical golden e50521f3. Registered here for
-            # cache-key isolation. See shared.derive_cmp_enabled.
-            "C4_DERIVE_CMP": (
-                os.environ.get("C4_DERIVE_CMP", "1") != "0"
-            ),
-            # CONTROL-family PC-override gate derivations (task #391 + #395,
-            # DEFAULT-OFF). Each re-derives the branch gates (JMP/BZ/BNZ/JSR) from
-            # spec structure: DERIVE_JMP/CONTROL = blocker magnitudes only;
-            # DERIVE_GATE_SCALES = FULL gate (positive weights = 1/activation_scale
-            # + threshold from the normalized balanced-AND + blockers). Behaviour-
-            # correct RE-DERIVATION (NOT byte-identical), so ON / OFF must never
-            # share a memo / disk entry. See shared.derive_{jmp,control}_enabled /
-            # derive_gate_scales_enabled.
-            "C4_DERIVE_JMP": (
-                os.environ.get("C4_DERIVE_JMP", "0") != "0"
-            ),
-            "C4_DERIVE_CONTROL": (
-                os.environ.get("C4_DERIVE_CONTROL", "0") != "0"
-            ),
-            "C4_DERIVE_GATE_SCALES": (
-                os.environ.get("C4_DERIVE_GATE_SCALES", "0") != "0"
-            ),
-            "C4_PC_OVERRIDE_K": os.environ.get("C4_PC_OVERRIDE_K", "1"),
-            # activation-scale calibration source: the JSON path changes the
-            # derived gate weights, so two builds with different calibrations must
-            # never share a cache entry (only relevant when GATE_SCALES is on).
-            "C4_ACTSCALE_JSON": os.environ.get("C4_ACTSCALE_JSON", ""),
-            # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
-            # opt out with =0): promotes H1+2 to a hard requirement on
-            # l16_ent_frame_sp_byte1_ff via a net-zero CONST baseline
-            # (output-affecting on the OP_ENT-broadcast misfire rows), so the
-            # ON / OFF builds must NEVER share a memo / disk entry.
-            "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
-                os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
-            ),
-            # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1): adds a MARK_AX
-            # NOT-blocker to the l8_alu_adj_lo_*_step_end ADJ low-nibble ALU rules
-            # so the SP-adjustment result cannot leak into the AX register dump on
-            # the post-LEV ADJ step (the func_identity low-nibble->8 corruption).
-            # Output-affecting on ADJ AX rows, so ON / OFF builds must NEVER share
-            # a memo / disk entry. Ships with the C4_L15_LEV func chain.
-            "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
-                os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
-            ),
-            # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0):
-            # adds a MEM_STORE-gated AX-row boost slot to L14/L18 value head 4
-            # (output-affecting on the call-arg PSH store value), so the ON /
-            # OFF builds must NEVER share a memo / disk entry.
-            "C4_PSH_ARG_VAL_AX": (
-                os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
-            ),
-            # L15 head-0 LI/LC-load suppressor inert (DEFAULT-ON, opt out =0):
-            # adds per-suppressor cancel slots to L15 memory_lookup head 0 so a
-            # frame-local LI/LC load is not buried by the func-frame OP_ENT
-            # broadcast (output-affecting on func/nested/rec/var LI), so the
-            # ON / OFF builds must NEVER share a memo / disk entry.
-            "C4_L15_LI_SUPPR_INERT": (
-                os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
-            ),
-            # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows the L15
-            # memory-lookup attention from 14 -> 15 heads and adds the
-            # content-addressable return-address restore head. CHANGES num_heads
-            # and the L15 W_q/W_k/W_v/W_o shapes, so the ON / OFF builds MUST
-            # NEVER share a memo / disk entry. (Address-widen + the sub-tuning
-            # env knobs only matter when this parent flag is on.)
-            "C4_L15_LEV_PC_RESTORE": (
-                os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
-            ),
-            # L15 head-16 SI/SC store address-provenance CAM (DEFAULT-OFF, opt in
-            # =1). CHANGES num_heads (16->17) and the L15 W_q/W_k/W_v/W_o shapes,
-            # so the ON / OFF builds MUST NEVER share a memo / disk entry.
-            "C4_SI_STORE_ADDR": (
-                os.environ.get("C4_SI_STORE_ADDR") == "1"
-            ),
-            # L15 head-0 OP_SI/OP_SC store-row veto (DEFAULT-OFF, opt in =1):
-            # adds two slot-0 Q writes to head 0 so it self-fires on SI/SC store
-            # rows carrying a stray OP_LI_RELAY (var_three ``SI b``). Same head
-            # shape, different W_q values, so the ON / OFF builds MUST NOT share
-            # a memo / disk entry.
-            "C4_VAR_THREE_LI": (
-                os.environ.get("C4_VAR_THREE_LI") == "1"
-            ),
-            # L15 head-16 SI-store-addr CAM null-high-address candidate veto
-            # (DEFAULT-OFF, opt in =1): adds one slot-32 K veto on ADDR_B0_HI+0 so
-            # the store-addr CAM fails-closed on the callee ENT-frame phantom row
-            # (ADDR_B0=0x00) at a call-site-arg LI (func_max/min operand-b). Same
-            # head shape, different W_k values, so ON / OFF builds MUST NOT share
-            # a memo / disk entry. Only installs when C4_SI_STORE_ADDR is on
-            # (head 16 exists), so OFF is byte-identical to golden.
-            "C4_LI_VALUE_LOAD": (
-                os.environ.get("C4_LI_VALUE_LOAD") == "1"
-            ),
-            # Derived-CAM MEMORY umbrella (DEFAULT-OFF, opt in =1): a single
-            # entry point that floors ON the clean binary-address-CAM memory-fix
-            # heads (C4_SI_STORE_ADDR store-provenance CAM + C4_VAR_THREE_LI
-            # store-row veto). Because it OR-floors those two head-installing
-            # predicates it changes the built head set, so the ON / OFF builds
-            # MUST NOT share a memo / disk entry. (An explicit per-flag value
-            # still wins, so this key is what distinguishes a pure-umbrella
-            # build from an explicit-flag build.)
-            "C4_DERIVE_MEMORY": (
-                os.environ.get("C4_DERIVE_MEMORY", "0") != "0"
-            ),
-            # absdiff arg-b LI value byte-0 LO-nibble de-contaminate (DEFAULT-OFF,
-            # opt in =1). At the deeper-frame 2-arg func LI whose arg address is
-            # 0xE0 (lo-nibble 0), the L15 head-0 value delivery carries the
-            # ADDRESS lo-nibble 0 alongside the real value lo-nibble, so byte-0
-            # decodes ``value & 0xF0`` (e.g. b=0x55 -> 0x50). Flag-OFF registers
-            # NO rules -> byte-identical to golden. Own key so ON/OFF never share
-            # a memo / disk entry.
-            "C4_ABSDIFF_FIX": (
-                os.environ.get("C4_ABSDIFF_FIX") == "1"
-            ),
-            # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
-            # byte-0 boost + OP_JSR/-OP_ENT return-store discriminator +
-            # value_scale=40 V/O delivery. Output-affecting on the LEV PC marker
-            # AND (the wall) on LI/LC load rows, so the ON / OFF builds MUST
-            # NEVER share a memo / disk entry. Sub-knobs fold into the same key.
-            "C4_L15_LEV_ADDR_WIDEN": (
-                os.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0",
-                os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
-                os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
-                os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
-                os.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0",
-            ),
-            # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
-            # opt out =0): adds a 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY
-            # >= 3.0, killing the byte-1 dump at the func/nested/rec LEV step
-            # (output-affecting on the func EXIT value), so the ON / OFF builds
-            # must NEVER share a memo / disk entry.
-            "C4_LEV_AX_BYTE1_KILL": (
-                os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
-            ),
-            # Imperative AddSub byte-0 OUTPUT dominant-amplitude write
-            # (DEFAULT-ON, opt out =0, output-affecting): out-votes the
-            # downstream L9 ALU_LO->OUTPUT_LO leak. The ON / OFF builds must
-            # never share a memo entry.
-            "C4_ADDSUB_DUMP_BOOST": (
-                os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
-            ),
-            # AX byte-1 FULL-WIDTH emission (DEFAULT-OFF, opt in =1): adds the
-            # AX_BYTE1_FULL_WIDE band + un-aliased LM-head columns 16..255 + the
-            # L25-tail band-FILL FFN (reads the ALU nibble pair -> wide band).
-            # The band changes d_model (already disambiguated by
-            # extra_residual_dims) AND the fill rules + columns are
-            # output-affecting, so the ON / OFF builds must NEVER share a memo /
-            # disk entry.
-            "C4_AX_BYTE1_FULL_WIDTH": (
-                os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
-            ),
-            # LEA-local multi-local E8 guard (DEFAULT-OFF, opt in =1, output-
-            # affecting on the var multi-local LEA-from-frame address): the
-            # ON / OFF builds must never share a memo entry.
-            "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
-                os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
-            ),
-            # ENT-step AX-dump 0xE8/0x02 (744) sentinel-slam guard (#311;
-            # DEFAULT-ON in the campaign config, opt out =0; output-affecting on
-            # the main-ENT-step AX byte-0/byte-1 dump rows): adds NOT-blockers to
-            # the L10-tail 0xE8 byte-0 + 0x02 byte-1 writers so the carried AX
-            # survives the ENT step. The ON / OFF builds must NEVER share a memo
-            # entry. See l10_ops._tail_lea_e8_ent_guard_enabled.
-            "C4_TAIL_LEA_E8_ENT_GUARD": (
-                os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
-                and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            ),
-            # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
-            # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit):
-            # the ON / OFF builds bake the byte_39_from_e8_addr rule with
-            # different conditions/threshold, so they must never share a memo
-            # entry. See l10_ops.py ``mul_stack0_byte39_guard_enabled``.
-            "C4_MUL_STACK0_BYTE39_GUARD": (
-                os.environ.get("C4_MUL_STACK0_BYTE39_GUARD", "0") != "0"
-            ),
-            # L11 wide_mul operand-A SE recover (#321, DEFAULT-ON in campaign,
-            # opt out =0, BAKE-affecting): when active the L11 wide_mul block.ffn
-            # is wrapped in MulOperandSeRecoverFFN, otherwise it is the bare
-            # PureFFN. The two builds STRUCTURALLY differ so they must never
-            # share a memo entry. See shared.mul_l11_se_recover_enabled.
-            "C4_MUL_L11_SE_RECOVER": (
-                os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
-            ),
-            # si/li LOAD byte-1 ADDRESS-leak discriminator (Inc-2, campaign-ON,
-            # opt out =0): adds L10 head-1 slot 83 (an ADDR_B1-magnitude
-            # anti-recency K term on the byte-1 predictor row) so the ON / OFF
-            # builds must never share a memo entry. See shared.sili_cam_b1_enabled.
-            "C4_SILI_CAM_B1": (
-                os.environ.get("C4_SILI_CAM_B1", "1") != "0"
-            ),
-            # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON,
-            # opt out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the
-            # capture (block 16) / restore (L25 tail) PureFFN ops, so the ON / OFF
-            # builds STRUCTURALLY differ (different d_model + extra blocks) and
-            # must never share a memo entry. See shared.sili_b1_restore_enabled.
-            "C4_SILI_B1_RESTORE": (
-                os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
-            ),
-            # SI/SC store-AX byte-0 OUTPUT zero-default OVERRIDE (var_mul step-9,
-            # campaign-ON, opt out =0, BAKE-affecting): rewrites the
-            # l16_store_ax_carry_lo write tuples (override vs bare additive) so
-            # the ON / OFF builds bake different L16 FFN weights and must never
-            # share a memo entry. See shared.store_ax_b0_override_enabled.
-            "C4_STORE_AX_B0_OVERRIDE": (
-                os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
-            ),
-            # SI/SC store-AX byte-0 OVERRIDE V2 = the clean store-only
-            # discriminator (default OFF, opt in =1, BAKE-affecting): appends
-            # ALU/cmp opcode anti-conditions to store_ax_conditions AND switches
-            # the l16_store_ax_carry_lo write to the override form, so the ON/OFF
-            # builds bake different L16 FFN weights and must never share a memo
-            # entry. See shared.store_ax_b0_override_v2_enabled.
-            "C4_STORE_AX_B0_OVERRIDE_V2": (
-                os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
-            ),
-            # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker
-            # de-contamination (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting):
-            # registers TWO extra L10-tail PureFFN post_ops (a bounded
-            # ABSDIFF_RET_LEAK l6-crush flag + the corrector) so the ON / OFF
-            # builds STRUCTURALLY differ (extra FFN ops + blocks) and must never
-            # share a memo entry. Flag-OFF registers NO rules -> byte-identical
-            # to golden. Held DEFAULT-OFF in the 2026-07 round-1 land: ON regressed
-            # test_lea_basic (crush-band over-fires on the ENT-frame LEA row).
-            # See shared.absdiff_ret_byte1_enabled.
-            "C4_ABSDIFF_RET_BYTE1": (
-                os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
-            ),
-            # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
-            # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an
-            # extra L10-tail PureFFN post_op so the ON / OFF builds STRUCTURALLY
-            # differ (an extra FFN op + block) and must never share a memo entry.
-            # Gated on the campaign prerequisites (``C4_NO_STACK0_EMIT`` +
-            # ``C4_OPERAND_FROM_MEMSP``) so the non-campaign / golden build is
-            # byte-identical. See shared.jsr_bp_byte3_clear_enabled.
-            "C4_JSR_BP_BYTE3_CLEAR": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-                and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
-            ),
-            # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
-            # campaign-ON, opt out =0, BAKE-affecting): registers the
-            # l10_loop_lea_b0_e0 PureFFN post_op so the ON / OFF builds
-            # STRUCTURALLY differ (an extra FFN op + block) and must never share
-            # a memo entry. Gated on the campaign prerequisites
-            # (``C4_NO_STACK0_EMIT`` + ``C4_OPERAND_FROM_MEMSP``) so the
-            # non-campaign / golden build is byte-identical. See
-            # shared.loop_lea_b0_e0_restore_enabled.
-            "C4_LOOP_LEA_B0_E0": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-                and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
-            ),
-            # PROJECT_0XE8_SLAM Phase-2: MULTIPLICATIVE OP_LEA gate on the
-            # loop_lea_b0_e8 / _e0 restore ops (DEFAULT OFF, opt in =1,
-            # BAKE-affecting): adds a per-unit gate (gate_bias=0.0 +
-            # gate_terms=("OP_LEA", ~0.191)) to EVERY unit in both rule families
-            # so the discriminator's W_gate / b_gate weights differ ON vs OFF ->
-            # the two builds must NEVER share a memo entry. Gated on the campaign
-            # prerequisites so the non-campaign / golden build is byte-identical.
-            # See shared.loop_lea_oplea_gate_enabled.
-            "C4_LOOP_LEA_OPLEA_GATE": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-                and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
-            ),
-            # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt
-            # out =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60
-            # threshold bump to the L10 ``e8_alubp_memsp`` writer so the ON / OFF
-            # builds bake different L25-tail FFN weights and must never share a
-            # memo entry. Gated on the campaign LEA byte-0 relay so the
-            # non-campaign / golden build is byte-identical. See
-            # l10_ops._lea_e8_first_ent_gate_enabled.
-            "C4_LEA_E8_FIRST_ENT_GATE": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-                and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
-            ),
-            # nested callee-ENT AX-dump over-fire FIX (#342, campaign-config,
-            # DEFAULT OFF, opt in =1, BAKE-affecting): appends a FETCHED-ENT
-            # ``OPCODE_BYTE_LO+6`` NOT-blocker to the L10 ``e8_alubp_memsp`` writer
-            # so the ON / OFF builds bake different L25-tail FFN weights and must
-            # never share a memo entry. Gated on the campaign LEA byte-0 relay so
-            # the non-campaign / golden build is byte-identical. DEFAULT OFF (does
-            # NOT track the campaign floor). See
-            # l10_ops._lea_e8_nested_ent_axdump_enabled.
-            "C4_NESTED_ENT_AXDUMP": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-                and os.environ.get("C4_NESTED_ENT_AXDUMP", "0") != "0"
-            ),
-            # Operand-CAM frame-depth ALU-amplifier umbrella (campaign OFF by
-            # default, opt in =1, BAKE-affecting): ``C4_OPCAM_FRAME=1`` turns on
-            # the L10 multi-param LEA byte-0 ALU-AMPLIFIER (+4 L25-tail FFN
-            # rules), so the ON / OFF builds bake a different-width tail bank and
-            # must never share a memo entry. Mirrors the effective amplifier
-            # state ``l10_ops._lea_byte0_alu_amplify_enabled`` keys the tail-bank
-            # rule count on: the dedicated ``C4_LEA_BYTE0_ALU_AMPLIFY`` kill-
-            # switch (=0/=1) overrides the umbrella; both require the campaign
-            # STACK0-drop, so the non-campaign / golden build is byte-identical.
-            "C4_OPCAM_FRAME": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and (
-                    os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY") != "0"
-                    if os.environ.get("C4_LEA_BYTE0_ALU_AMPLIFY") is not None
-                    else os.environ.get("C4_OPCAM_FRAME", "0") != "0"
-                )
-            ),
-            # func_max/func_min CMP loaded-operand-A clean (task #428, DEFAULT-OFF,
-            # opt in =1, MODULE-affecting): installs the CmpLoadedOperandCleanFFN
-            # wrap on the L9 block.ffn so the ON / OFF models are structurally
-            # different modules and must never share a memo entry. Gated on the
-            # campaign prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden
-            # build is byte-identical. See shared.func_cmp_operand_clean_enabled.
-            "C4_FUNC_CMP_OPERAND_CLEAN": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_FUNC_CMP_OPERAND_CLEAN", "0") == "1"
-            ),
-            # DERIVED clean-one-hot operand delivery (CBC, DEFAULT-OFF, opt in =1,
-            # MODULE-affecting): installs the CleanOperandOneHotFFN wrap on the L8
-            # main block.ffn so the ON / OFF models are structurally different
-            # modules and must never share a memo entry. Gated on the campaign
-            # prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden build is
-            # byte-identical. See shared.clean_operand_enabled.
-            "C4_CLEAN_OPERAND": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_CLEAN_OPERAND", "0") != "0"
-            ),
-            # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-ON,
-            # opt out =0, MODULE-affecting): installs the SAME CleanOperandOneHotFFN
-            # wrap but with an ARITHMETIC-ONLY op_dims tuple (OP_ADD/SUB/MUL/DIV/MOD,
-            # NO cmp dims) so the ON model's wrap module differs from both flag-OFF
-            # and the full C4_CLEAN_OPERAND variant and must never share a memo
-            # entry. Gated on the campaign prerequisite C4_NO_STACK0_EMIT so the
-            # non-campaign / golden build is byte-identical. The default is ON
-            # ONLY in the campaign config (C4_NO_STACK0_EMIT!=0); off the campaign
-            # the wrap is never installed so the golden e50521f3 build is
-            # byte-identical. Escape hatch: C4_CLEAN_OPERAND_ADD=0 reproduces
-            # e50521f3. See shared.clean_operand_add_enabled.
-            "C4_CLEAN_OPERAND_ADD": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
-            ),
-            # Bitwise clean operand delivery (campaign-ON, opt out =0,
-            # MODULE-affecting): ADDS the three bitwise opcodes (OP_AND/OP_OR/
-            # OP_XOR) to the CleanOperandOneHotFFN op_dims so the ON model's wrap
-            # module differs and must never share a memo entry. Gated on the
-            # campaign prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden
-            # build is byte-identical. See shared.clean_operand_bitwise_enabled.
-            "C4_CLEAN_OPERAND_BITWISE": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") != "0"
-            ),
-            # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting):
-            # adds OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so the
-            # ON / OFF builds bake a different W_q row and must never share a
-            # memo entry. See l15_ops._l15_sclc_byte0_on. Default mirrors
-            # C4_NO_STACK0_EMIT; the explicit-override A/B (C4_SCLC_LC_B0=0 with
-            # the campaign on) needs its own key so it doesn't reuse the ON bake.
-            "C4_SCLC_LC_B0": (
-                os.environ.get(
-                    "C4_SCLC_LC_B0",
-                    "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                    else "0",
-                ) != "0"
-            ),
-            # Multi-arg first-param LI JSR-phantom value-row penalty (campaign-ON,
-            # opt out =0): adds L15 head-0 slot 104 (a MARK_AX-gated -OP_JSR K
-            # penalty) so the genuine PSH'd-arg store row out-scores the callee
-            # JSR/ENT-step phantom MEM rows (func_add/mul step-9 a-LI). The ON /
-            # OFF builds bake a different W_q/W_k row and must never share a memo
-            # entry. See l15_ops._l15_li_jsr_phantom_penalty_on.
-            "C4_L15_LI_JSR_PHANTOM": (
-                os.environ.get(
-                    "C4_L15_LI_JSR_PHANTOM",
-                    "1" if os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                    else "0",
-                ) != "0"
-            ),
-            # C4_SHIFT_OUTPUT_B0_CLEAR: now INERT (the ShiftOutputClearFFN wrap it
-            # gated was DELETED 2026-07-13; the SHR OUTPUT byte-0 leak is now
-            # cancelled at its L11 source by C4_OUTPUT_B0_NOLEAK). Kept in the
-            # cache key as an always-same term for memo/serialised-key stability;
-            # a follow-up dead-flag sweep can drop it.
-            "C4_SHIFT_OUTPUT_B0_CLEAR": (
-                os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
-            ),
-            # L11 OUTPUT byte-0 no-leak root (DEFAULT-ON, BAKE-affecting): when
-            # active a 1-unit L11 post-op FFN is baked (cancelling OUTPUT byte-0
-            # on the OP_SHR compute row), so the ON / OFF builds differ and must
-            # never share a memo entry. See shared.output_b0_noleak_enabled.
-            "C4_OUTPUT_B0_NOLEAK": (
-                os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
-            ),
-            # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
-            # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
-            # head-0 slot-0 Q discriminator gains six OP_<cmp> * -1e6 veto cells,
-            # so the ON / OFF builds bake a different W_q row and must never share
-            # a memo entry. See shared.l15_lookup_cmp_veto_enabled.
-            "C4_L15_LOOKUP_CMP_VETO": (
-                os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
-            ),
-            # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
-            # BAKE-affecting): when active the L10 ordering-engine ``hi_lt``
-            # (CMP+0) blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF
-            # builds bake different FFN weights and must never share a memo entry.
-            # Gated on the campaign prerequisite ``C4_NO_STACK0_EMIT`` so the
-            # non-campaign / flag-OFF build is byte-identical to golden (and never
-            # collides with a non-campaign cache entry). See
-            # shared.cmp_hi_lt_alu15_leak_guard_enabled.
-            "C4_CMP_HI_LT_ALU15_GUARD": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
-            ),
-            # if_var GT-TRUE lo_lt-leak guard (DEFAULT-ON, opt out =0,
-            # BAKE-affecting): when active the ComparisonCombine GT/GE
-            # ``(hi_eq AND lo_lt)`` override threshold is RAISED 2.5 -> 2.75, so
-            # the ON / OFF builds bake different ``b_up`` and must never share a
-            # memo entry. Gated on the campaign prerequisite ``C4_NO_STACK0_EMIT``
-            # so the non-campaign / flag-OFF build is byte-identical to golden.
-            # See shared.cmp_gt_lo_lt_hieq_guard_enabled.
-            "C4_CMP_GT_LO_LT_HIEQ_GUARD": (
-                os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-                and os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
-            ),
-            # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
-            # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
-            # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target
-            # index >= 16 keeps byte-0's high nibble (BZ 16 -> PC 130, not 2).
-            # The ON / OFF builds bake different FFN weights and must never share
-            # a memo entry. See l6_ops._ifvar_bz_hi_nibble_enabled.
-            "C4_IFVAR_BZ_HI_NIBBLE": (
-                os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
-            ),
-            # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/
-            # max/min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): when
-            # active it adds a Q/K scoring slot (OP_LEA x OP_ENT) to the SHARED
-            # L7 operand-gather head 1, re-pinning the re-read LEA's gather onto
-            # the live ENT-frame BP row. The ON / OFF builds differ in W_q/W_k
-            # so they must NEVER share a memo entry. Gated on
-            # ``operand_from_memsp_enabled()`` (the campaign prerequisite is
-            # DEFAULT-ON post-flip; reading the raw env ``== "1"`` here would
-            # default OFF and let the campaign ON bake collide with a non-campaign
-            # cache entry). See shared.func_lea_reread_bp_resharpen_enabled.
-            "C4_FUNC_LEA_REREAD_BP_RESHARPEN": (
-                operand_from_memsp_enabled()
-                and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
-            ),
-            # Single CAMPAIGN-CONFIG entry point (DEFAULT-OFF; opt in with =1):
-            # ``C4_CAMPAIGN=1`` OR-ins the ON floor for the coherent 30-token
-            # campaign set (no_stack0_emit + operand_from_memsp + si_store_addr +
-            # operand_cam_fix — see ops.shared.campaign_enabled). Turning it on
-            # STRUCTURALLY changes the build (drops the STACK0 emission band,
-            # installs the SI-store CAM head, widens the operand-CAM clear), so
-            # the ON / OFF builds MUST NEVER share a memo / disk entry. DEFAULT-OFF
-            # -> golden (35-tok) build is byte-identical (key unchanged when unset).
-            "C4_CAMPAIGN": campaign_enabled(),
-            # EMIT-G5 R-BYTE ``ax_bytes_zero`` fold verification toggle (DEFAULT
-            # OFF, opt in =1). BYTE-NEUTRAL: both states bake the identical
-            # weights (golden ``e50521f3``), but the flag routes the spec-driven
-            # generator through a SECOND independent code path (see
-            # l14_ops._make_ax_bytes_zero_op / ops.shared.emit_g5_rbyte_enabled).
-            # Keyed here so the ON / OFF builds never share a memo entry — a
-            # cross-state hit would silently skip the flag-ON path during the
-            # byte-identity golden check. See docs/EMIT_G5_ROLLOUT_2026_07_13.md.
-            "C4_EMIT_G5_RBYTE": emit_g5_rbyte_enabled(),
-            # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt
-            # out =0, BAKE-affecting): when active it appends a 32-unit PureFFN
-            # post_op to the L25 tail block (the 6-way NEXT_* OUTPUT sink), so
-            # the ON / OFF builds have different state_dicts and MUST NEVER share
-            # a memo entry. Gated (like the op) on ``_no_stack0_emit`` so the OFF
-            # build's key differs iff the op would actually bake. See
-            # l0_ops._clean_emitter_enabled.
-            "C4_CLEAN_EMITTER": (os.environ.get("C4_CLEAN_EMITTER", "1") != "0"),
-            # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255
-            # per-value AND) -> COMPUTED (32 per-nibble route) collapse
-            # (DEFAULT-OFF, opt in =1). Changes the L10-tail FFN hidden_dim
-            # (255 -> 32 units) AND the emitted OUTPUT delta magnitude, so the
-            # ON / OFF builds have different state_dicts and MUST NEVER share a
-            # memo / disk entry. See l10_ops._stack0_store_loaded_computed_enabled.
-            "C4_STACK0_STORE_LOADED_COMPUTED": (
-                os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
-            ),
-            # STACK0 pop-loaded / store-top-e8 byte-writeback ENUMERATED (255
-            # per-value AND) -> COMPUTED (32 per-nibble route) collapses (siblings
-            # of the M8 pilot, DEFAULT-ON). Each changes the L10-tail FFN
-            # hidden_dim AND the emitted OUTPUT delta magnitude, so the ON / OFF
-            # builds have different state_dicts and MUST NEVER share a memo / disk
-            # entry. See l10_ops._stack0_pop_loaded_computed_enabled /
-            # _stack0_store_e8_computed_enabled.
-            "C4_STACK0_POP_LOADED_COMPUTED": (
-                os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
-            ),
-            "C4_STACK0_STORE_E8_COMPUTED": (
-                os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
-            ),
-            # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
-            # materializer ENUMERATED (254 per-value AND) -> COMPUTED (32
-            # per-nibble route) collapse (DEFAULT-ON, kill-switch =0). Changes the
-            # L10-tail FFN hidden_dim (254 -> 32) AND the OUTPUT delta magnitude,
-            # so ON / OFF builds have different state_dicts and MUST NEVER share
-            # a memo / disk entry. See l10_ops._stack0_store_top_e0_computed_enabled.
-            "C4_STACK0_STORE_TOP_E0_COMPUTED": (
-                os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
-            ),
-            # wide_mul_byte1_preserve byte-writeback ENUMERATED (256 per-value
-            # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-OFF, opt
-            # in =1). Changes the L10-tail FFN hidden_dim (256 -> 32) AND the
-            # emitted OUTPUT delta magnitude, so the ON / OFF builds have
-            # different state_dicts and MUST NEVER share a memo / disk entry.
-            # See l10_ops._wide_mul_byte1_computed_enabled.
-            "C4_WIDE_MUL_BYTE1_COMPUTED": (
-                os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
-            ),
-            # M8 collapse for the L14 ADDR_KEY nibble decode: the load-query
-            # lo+hi ENUMERATED (2 x 16x16 = 512 per-(lo,hi) AND) bank ->
-            # COMPUTED (2 x 32 per-nibble route) collapse (DEFAULT-OFF, opt in
-            # =1). Changes the L14 addr_key FFN hidden_dim (512 -> 64) AND the
-            # ADDR_KEY firing/write, so the ON / OFF builds have different
-            # state_dicts and MUST NEVER share a memo / disk entry. See
-            # l14_ops._l14_byte_computed_enabled.
-            "C4_L14_BYTE_COMPUTED": (
-                os.environ.get("C4_L14_BYTE_COMPUTED", "0") != "0"
-            ),
-            # GAP-PRIMITIVE #2: multi_pass MUL cascade replacing the L11
-            # mul-partial / L12 mul-combine lookup (DEFAULT-OFF, opt in =1).
-            # Adds the MUL_MULTIPASS_WS 240-dim workspace band (changes
-            # d_model / n_heads) AND swaps block.ffn for the 7-pass cascade
-            # (changes weights + emitted product byte 1), so the ON / OFF
-            # builds have different state_dicts and MUST NEVER share a memo /
-            # disk entry. See ops/shared.mul_multipass_enabled.
-            "C4_MUL_MULTIPASS": (
-                os.environ.get("C4_MUL_MULTIPASS", "0") == "1"
-            ),
-            # GAP-PRIMITIVE #2 (DIV): multi_pass long-division cascade replacing
-            # the L10 FlattenedDivMod composite (DEFAULT-OFF, opt in =1). Adds
-            # the DIV_MULTIPASS_WS 1728-dim workspace + result-lane bands
-            # (changes d_model / n_heads) AND swaps the divmod post_op for the
-            # 43-pass cascade (changes weights), so ON / OFF builds have
-            # different state_dicts and MUST NEVER share a memo / disk entry.
-            # See ops/shared.div_multipass_enabled.
-            "C4_DIV_MULTIPASS": (
-                os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
-            ),
-            # MUL byte-1 delivery (DEFAULT-OFF, opt in =1): adds an OP_MUL/OP_SHL
-            # W_up blocker to the ``layer14_jsr_ax_bytes_zero`` clear units so
-            # the JSR AX-bytes-zero clear does not mis-fire on MUL/SHL byte-1
-            # emit rows (idx104/idx106 spurious-OP_JSR-leak). Output-affecting
-            # (changes W_up), so the ON / OFF builds have different state_dicts
-            # and MUST NEVER share a memo / disk entry. See
-            # ops/l14_ops._mul_b1_delivery_enabled.
-            "C4_MUL_B1_DELIVERY": (
-                os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
-            ),
-            # Auto-widen: extra residual bands change d_model / n_heads, so
-            # widened and baseline builds must never share a memo entry.
-            "extra_residual_dims": (
-                tuple(sorted(extra_residual_dims.items()))
-                if extra_residual_dims else None
-            ),
-            "__dynamic": True,
-        }
-        _memo_key = _inproc_cache_key(_inproc_snapshot)
-        _memo_hit = _INPROC_COMPILE_CACHE.get(_memo_key)
-        if _memo_hit is not None:
-            _cached_model, _cached_layout = _memo_hit
-            # Re-attach KV eviction state mirrors the disk-cache hit path in
-            # ``_bake_from_scheduled_ops``; the cached model may have been
-            # built in this process with a different policy/step count.
-            _static._attach_kv_eviction_state(
-                _cached_model,
-                _cached_layout,
-                kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
-                n_steps=int(kv_eviction_n_steps),
-            )
-            return _cached_model, _cached_layout
-
-    # Collect ops with the same composition rules as compile_full_vm.
-    ops = _collect_ops_for_compile(
-        alu_mode=alu_mode,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-    )
-
-    # B14 strict-mode gate: refuse to compile if any op needs phase to
-    # be placed. Raised BEFORE any LayerCompiler / disk-cache work runs
-    # so the error citation is purely scheduler-level (no half-built
-    # model state to tear down, no stale cache hit masking the failure).
-    # When ``strict=False`` (the default), the hybrid scheduler falls
-    # back to phase, preserving the B11/B12 byte-identity behaviour.
-    #
-    # Cycle-aware strict mode (Phase 7.A.5 B14 attempt): when
-    # ``allow_sealed_cycles=True`` (the strict-mode default) the SCC of
-    # cycle members is accepted as a sealed group — the hybrid
-    # scheduler still routes them via phase fallback INSIDE the SCC, but
-    # the rest of the graph is dep-derived. This lets strict mode land
-    # before B9 dim decomposition completes. The byte-identity invariant
-    # still holds because the hybrid scheduler's actual placement logic
-    # is unchanged; strict mode is purely an admission gate.
-    if strict:
-        _assert_strict_mode_clean(
-            ops, allow_sealed_cycles=allow_sealed_cycles
-        )
-
-    # Compute the hybrid schedule. The schedule output (dep-derived
-    # order with phase-pruning fallback) is the load-bearing "dynamic"
-    # signal — it's how a strict dep-derived scheduler would lay these
-    # ops out. We do NOT feed that re-ordered list into LayerCompiler:
-    # ``_topological_sort`` uses ``ops.index(o)`` for Kahn's stability
-    # and any reordering would feed a different stability key in.
-    # Instead the schedule is computed alongside, and the compile pipeline
-    # runs over the natural ``_collect_ops`` order. On today's op set the
-    # two coincide on every non-cycle op and the cycle members fall
-    # through to phase-only ordering. This decoupling is what made B11 a
-    # byte-identical parallel path rather than a behavioural change
-    # (Phase 8.G.3 cut the static fallback that gated this claim, leaving
-    # the dynamic path as the single bake entry point).
-    _scheduled, _source = compute_dynamic_schedule(ops)
-
-    # Step-1 safety: scan for cross-step reads (``X.*.-1``) whose base dim
-    # ALSO has a same-step writer in the scheduled op set. On VM step 1
-    # there is no previous step, so the cross-step alias resolves to 0;
-    # when a same-step writer exists, the bake author very often meant to
-    # consume that fresh write instead. Emitted via ``warnings.warn`` with
-    # the ``CrossStepReadWarning`` category so callers can filter or
-    # promote to errors via the stdlib ``warnings`` filter mechanism. The
-    # canonical motivating case is the OPCODE_BYTE_LO read in
-    # ``opcode_decode_ffn`` (see ``ops/l5_ops.py``) whose same-step writer
-    # is ``layer5_fetch`` — on step 1 the decoder reads 0.
-    #
-    # Step 4 (``IR_INCREMENTAL_IMPROVEMENTS.md``): when ``strict=True``,
-    # the warning becomes a HARD ERROR (``CrossStepReadError``). The
-    # caller can pass ``cross_step_baseline_allowlist`` to whitelist the
-    # historical findings while migrating them off cross-step reads; the
-    # bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` (82 entries at Step-4
-    # landing) is used when no explicit allowlist is supplied. Passing
-    # ``cross_step_baseline_allowlist=[]`` promotes every finding to an
-    # error (useful for new bake authors who want zero cross-step
-    # zero-prop risk).
-    _emit_cross_step_safety_warnings(
-        _scheduled,
-        strict_error=strict,
-        allowlist=cross_step_baseline_allowlist,
-    )
-
-    # Build the model via the unchanged static pipeline with the natural
-    # op order. The static compile_full_vm wraps op collection inline,
-    # so we re-implement just the body here so the dynamic path is
-    # actually a parallel API (not a wrapper around the static call).
-    model, layout = _bake_from_scheduled_ops(
-        ops,
-        S=S,
-        alu_mode=alu_mode,
-        n_heads=n_heads,
-        ffn_hidden=ffn_hidden,
-        max_seq_len=max_seq_len,
-        pin_io_only=pin_io_only,
-        disk_cache=disk_cache,
-        use_dynamic_ffn=use_dynamic_ffn,
-        enable_moe_routing=enable_moe_routing,
-        positional_encoding=positional_encoding,
-        attention_normalization=attention_normalization,
-        rope_base=rope_base,
-        use_rms_norm=use_rms_norm,
-        rms_norm_eps=rms_norm_eps,
-        require_declarative_bake=require_declarative_bake,
-        declarations_only=declarations_only,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-        kv_eviction_policy=kv_eviction_policy,
-        kv_eviction_n_steps=kv_eviction_n_steps,
-        d_model_packing=d_model_packing,
-        d_model_packing_target=d_model_packing_target,
-        extra_residual_dims=extra_residual_dims,
-        never_share_band_names=_never_share_band_names,
-        alibi_base_extra_dims=(_alibi_base_extra or None),
-    )
-
-    # Post-compile shape rebuild. When the caller hands in
-    # ``target_shape_overrides`` (a ``ModelShapeConstraint``), REPLACE the
-    # compiled VM with a freshly-initialized ``AutoregressiveVM`` whose
-    # geometry matches the overrides. This is a SHAPE-ONLY rebuild — the
-    # baked VM weights are NOT copied into the new model, so semantic
-    # equivalence is sacrificed for shape compatibility. Use case:
-    # producing a target-architecture-shaped VM for HF state-dict export
-    # (Mixtral, Llama) without changing the VM's allocator-derived
-    # natural shape.
-    if target_shape_overrides is not None:
-        from ..verification.model_shape_constraint import ModelShapeConstraint as _MSC
-        if not isinstance(target_shape_overrides, _MSC):
-            raise TypeError(
-                "target_shape_overrides must be a ModelShapeConstraint instance, "
-                f"got {type(target_shape_overrides).__name__}"
-            )
-        model = _rebuild_to_target_shape(
-            model,
-            target_shape_overrides,
-            max_seq_len=max_seq_len,
-            positional_encoding=positional_encoding,
-            attention_normalization=attention_normalization,
-            rope_base=rope_base,
-            use_rms_norm=use_rms_norm,
-            rms_norm_eps=rms_norm_eps,
-        )
-
-    # Post-compile shape-constraint check. When the caller hands in a
-    # ``ModelShapeConstraint``, diff it against the compiled model and
-    # raise ``ModelShapeMismatchError`` on any mismatch. The check runs
-    # AFTER the bake so it sees the real ``num_heads`` / ``head_dim``
-    # the allocator emitted (Phase 8.O.1/8.O.2 dynamic heads + GQA), not
-    # just the caller's intent.
-    if model_shape_constraint is not None:
-        from ..verification.model_shape_constraint import (
-            ModelShapeConstraint as _MSC,
-            ModelShapeMismatchError,
-            validate_against_shape,
-        )
-        if not isinstance(model_shape_constraint, _MSC):
-            raise TypeError(
-                "model_shape_constraint must be a ModelShapeConstraint instance, "
-                f"got {type(model_shape_constraint).__name__}"
-            )
-        mismatches = validate_against_shape(model, model_shape_constraint)
-        if mismatches:
-            raise ModelShapeMismatchError(
-                mismatches, target=model_shape_constraint.target
-            )
-
-    # Populate the in-process memo so a subsequent call with the same kwargs
-    # in this process skips ``_collect_ops_for_compile`` + ``torch.load``.
-    # Only populated when the early-cache snapshot path was taken (the post-
-    # compile rebuild / packing branches are explicitly excluded above).
-    if _inproc_snapshot is not None:
-        _INPROC_COMPILE_CACHE[_inproc_cache_key(_inproc_snapshot)] = (model, layout)
-
-    return model, layout
-
-
-# ---------------------------------------------------------------------------
-# Internals: target-shape rebuild
-# ---------------------------------------------------------------------------
-
-
-def _rebuild_to_target_shape(
-    compiled_model,
-    overrides,
-    *,
-    max_seq_len: int,
-    positional_encoding: str,
-    attention_normalization: str,
-    rope_base: float,
-    use_rms_norm: bool,
-    rms_norm_eps: float,
-):
-    """Build a fresh ``AutoregressiveVM`` with the override geometry.
-
-    SHAPE-ONLY rebuild — returns a new model with target
-    ``d_model`` / ``n_layers`` / ``n_heads`` / ``head_dim`` /
-    ``ffn_hidden`` / ``vocab_size`` taken from ``overrides``, falling
-    back to the compiled model's values when a field is ``None``. The
-    new model's weights are nn.Parameter zeros (PureFFN's default init),
-    so it is NOT semantically equivalent to the compiled VM. The intent
-    is to produce a model whose ``state_dict`` shape matches a target
-    HF architecture (Mixtral, Llama) for export adapters.
-
-    Gap documented loudly: a real "compile-time shape override" would
-    have the allocator emit a baked, semantics-preserving model with
-    the target geometry (padding dims up, rebuilding attention with
-    GQA, padding FFN widths uniformly, padding vocab). That requires
-    reworking the dim allocator, head allocator, and FFN allocator to
-    accept a target envelope and route excess capacity to padding
-    rather than to functional ops. This rebuild is the minimum viable
-    path that lets the HF export adapters be wired end-to-end without
-    that allocator rework.
-
-    Override fields:
-      * ``d_model`` — total residual width (must equal num_heads * head_dim)
-      * ``num_hidden_layers`` — n_layers
-      * ``num_attention_heads`` — n_heads
-      * ``head_dim`` — per-head width (overrides d_model // n_heads)
-      * ``intermediate_size`` — FFN hidden_dim (applied uniformly)
-      * ``vocab_size`` — embedding + lm_head vocab
-      * ``num_key_value_heads`` — not honored yet (MHA only; raises if
-        set != num_attention_heads). GQA wiring through the runtime
-        attention module is a separate item.
-    """
-    from ..vm_step import AutoregressiveVM
-
-    d_model = overrides.d_model if overrides.d_model is not None else int(compiled_model.d_model)
-    n_layers = (
-        overrides.num_hidden_layers
-        if overrides.num_hidden_layers is not None
-        else len(compiled_model.blocks)
-    )
-    if overrides.num_attention_heads is not None:
-        n_heads = int(overrides.num_attention_heads)
-    else:
-        n_heads = int(getattr(compiled_model.blocks[0].attn, "num_heads", 8))
-    head_dim = overrides.head_dim
-    if head_dim is not None:
-        if int(head_dim) * n_heads != d_model:
-            raise ValueError(
-                f"target_shape_overrides: head_dim={head_dim} * "
-                f"num_attention_heads={n_heads} = {int(head_dim) * n_heads}, "
-                f"but d_model={d_model}. Mixtral requires num_attention_heads * "
-                "head_dim == hidden_size."
-            )
-    if overrides.num_key_value_heads is not None:
-        if int(overrides.num_key_value_heads) != n_heads:
-            raise NotImplementedError(
-                f"target_shape_overrides: num_key_value_heads="
-                f"{overrides.num_key_value_heads} != num_attention_heads="
-                f"{n_heads}. GQA rebuild is not yet implemented; pass MHA "
-                "(num_key_value_heads == num_attention_heads) for now."
-            )
-    if overrides.intermediate_size is not None:
-        ffn_hidden = int(overrides.intermediate_size)
-    else:
-        widths = [
-            int(getattr(b.ffn, "hidden_dim", 0)) for b in compiled_model.blocks
-        ]
-        # Step 3 (literal-fallback lint, audit 2026-06-03): historically
-        # the empty-widths branch substituted a literal ``4096`` —
-        # which silently seeded the rebuild with a stale shape any time
-        # ``compiled_model.blocks`` was empty (synthetic / partial
-        # rebuild fixtures). Demand an explicit override instead of
-        # papering over the missing topology.
-        if not widths:
-            raise ValueError(
-                "rebuild target: cannot derive ffn_hidden because "
-                "compiled_model.blocks is empty. Pass "
-                "target_shape_overrides.intermediate_size explicitly. "
-                "Bare-literal fallback (4096) removed by Step 3 (see "
-                "docs/LITERAL_FALLBACK_AUDIT.md)."
-            )
-        ffn_hidden = max(widths)
-    vocab_size = (
-        int(overrides.vocab_size)
-        if overrides.vocab_size is not None
-        else int(getattr(compiled_model, "vocab_size", 256))
-    )
-
-    ffn_widths: Dict[int, int] = {}
-    for layer_idx, ov in overrides.per_layer_overrides.items():
-        if not isinstance(layer_idx, int) or layer_idx < 0 or layer_idx >= n_layers:
-            raise ValueError(
-                f"target_shape_overrides.per_layer_overrides has layer_idx="
-                f"{layer_idx}, but rebuild has {n_layers} layers."
-            )
-        if (
-            ov.get("num_attention_heads") is not None
-            or ov.get("num_key_value_heads") is not None
-            or ov.get("head_dim") is not None
-        ):
-            raise NotImplementedError(
-                "target_shape_overrides: per-layer head/head_dim overrides "
-                "are not supported by the rebuild path (AutoregressiveVM "
-                "uses one n_heads / head_dim across all blocks)."
-            )
-        if ov.get("intermediate_size") is not None:
-            ffn_widths[layer_idx] = int(ov["intermediate_size"])
-
-    rebuilt = AutoregressiveVM(
-        vocab_size=vocab_size,
-        d_model=d_model,
-        n_layers=n_layers,
-        n_heads=n_heads,
-        ffn_hidden=ffn_widths if ffn_widths else ffn_hidden,
-        max_seq_len=max_seq_len,
-        positional_encoding=positional_encoding,
-        attention_normalization=attention_normalization,
-        rope_base=rope_base,
-        use_rms_norm=use_rms_norm,
-        rms_norm_eps=rms_norm_eps,
-    )
-    return rebuilt
-
-
-# ---------------------------------------------------------------------------
-# Internals: op collection + bake driver
-# ---------------------------------------------------------------------------
-
-
-def _collect_ops_for_compile(
-    *,
-    alu_mode: str,
-    enable_conversational_io: bool,
-    enable_tool_calling: bool,
-    enable_neural_io_think_protocol: bool,
-) -> List[Operation]:
-    """Collect the exact same op list ``compile_full_vm`` registers.
-
-    Mirrors the in-line composition logic in
-    ``compile_full_vm`` (core ops + flag-gated extras + ALU composites +
-    residual model ops + post-op attach ops). Kept in lock-step with the
-    static path so the dynamic scheduler sees the same input space.
-    """
-    ops: List[Operation] = []
-    ops.extend(_static.all_core_ops(
-        alu_mode=alu_mode,
-        enable_conversational_io=enable_conversational_io,
-        enable_tool_calling=enable_tool_calling,
-        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
-    ))
-    ops.append(_static.make_l10_post_op_attach_op(alu_mode=alu_mode))
-
-    if alu_mode == "efficient":
-        ops.append(_static.make_l11_alu_mul_bdtoge_op())
-        ops.append(_static.make_l11_alu_mul_schoolbook_op())
-        ops.append(_static.make_l11_alu_mul_carrypass1_op())
-        ops.append(_static.make_l11_alu_mul_carrypass2_op())
-        ops.append(_static.make_l11_alu_mul_carrypass3_op())
-        ops.append(_static.make_l12_alu_mul_genprop_op())
-        ops.append(_static.make_l12_alu_mul_binarylookahead_op())
-        ops.append(_static.make_l12_alu_mul_finalcorrection_op())
-        ops.append(_static.make_l12_alu_mul_getobd_op())
-        ops.append(_static.make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
-        # Campaign loaded-operand ADD ALU cell-15 contaminant clear
-        # CBC Phase 1: DERIVED clean-one-hot operand delivery. Snaps
-        # ALU_LO/HI + AX_CARRY_LO/HI to a clean per-nibble one-hot. Two flags,
-        # both gated on this campaign so flag-OFF is golden byte-identical:
-        #   * C4_CLEAN_OPERAND      — feasibility, cleans ALL binary-op + cmp rows
-        #   * C4_CLEAN_OPERAND_ADD  — CBC pass-gain (DEFAULT-ON), cleans ONLY the
-        #     arithmetic (ADD/SUB/MUL/DIV/MOD) rows, leaving the CMP calibration
-        #     intact.
-        # This SUBSUMES the former ADD-only address-leak corrector
-        # (``LoadedOperandAddHi15ClearFFN``): the clean-snap zeros every non-argmax
-        # ALU_HI cell on the ADD/SUB/MUL/DIV/MOD MARK_AX rows BEFORE any hi-nibble
-        # clear could run, so the old cell-13/15 (and all-16) clears were provably
-        # inert once ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON (proven: forward
-        # max_abs_diff=0.0 on ADD rows; fast-gate byte-identical corpus verdicts).
-        # Must come AFTER efficient_l8_addsub_wrap (whose d_model read sees the raw
-        # L8 PureFFN before this wrap). See shared.clean_operand_enabled /
-        # shared.clean_operand_add_enabled.
-        ops.append(_static.make_clean_operand_op())
-        # Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task
-        # #428). Wraps the L9 block.ffn (CMP nibble-comparator factory) to clean
-        # the SE_ALU operand-A band on the MARK_SE_ONLY cmp row before the L9 CMP
-        # rules read it. Must come AFTER layer9_alu (whose FFN it wraps).
-        # Explicit-opt-in campaign flag; flag-OFF leaves block.ffn untouched
-        # (golden byte-identical). See shared.func_cmp_operand_clean_enabled.
-        ops.append(_static.make_cmp_loaded_operand_clean_op())
-        ops.append(_static.make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
-        ops.append(_static.make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
-
-    for op in _static.make_alu_divmod_composite_ops(alu_mode=alu_mode):
-        ops.append(op)
-    # Bug #36 declarative wrapper: no-op bake, consolidates the
-    # FlattenedDivMod composite's reads/writes for dim_contracts_audit.
-    ops.append(_static.make_layer10_divmod_op())
-
-    ops.append(_static.make_residual_alibi_slopes_op())
-    ops.append(_static.make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))
-    ops.append(_static.make_layer8_op_imm_relay_op())
-    ops.append(_static.make_contract_validation_op())
-
-    if alu_mode == "lookup":
-        ops.extend(_static.all_alu_postop_attach_ops())
-
-    return ops
-
-
-def _bake_from_scheduled_ops(
-    scheduled: List[Operation],
-    *,
-    S: float,
-    alu_mode: str,
-    n_heads: int,
-    ffn_hidden: int,
-    max_seq_len: int,
-    pin_io_only: bool,
-    disk_cache: bool,
-    use_dynamic_ffn: bool,
-    enable_moe_routing: bool,
-    positional_encoding: str,
-    attention_normalization: str,
-    rope_base: float,
-    use_rms_norm: bool,
-    rms_norm_eps: float,
-    require_declarative_bake: bool,
-    declarations_only: bool,
-    enable_conversational_io: bool,
-    enable_tool_calling: bool,
-    enable_neural_io_think_protocol: bool,
-    kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
-    kv_eviction_n_steps: int = 64,
-    d_model_packing: bool = False,
-    d_model_packing_target: Optional[int] = None,
-    extra_residual_dims: Optional[Mapping[str, int]] = None,
-    never_share_band_names: Optional[Set[str]] = None,
-    alibi_base_extra_dims: Optional[Mapping[str, int]] = None,
-):
-    """Run the unchanged static compile/bake pipeline against ``scheduled``.
-
-    This is intentionally a near-mirror of the body of
-    ``compile_full_vm`` so the byte-identity invariant is structural
-    rather than incidental: any change to the static body that affects
-    ops_per_layer / dim_positions must be mirrored here. The diff is the
-    op-collection step — instead of ``for op in all_core_ops(...): add``,
-    we register ``scheduled`` directly.
-    """
-    import json
-    import os
-    import pathlib
-    import torch as _torch
-    from .layer_compiler import (
-        LayerCompiler,
-        ModelLayout,
-        build_model_from_layout,  # noqa: F401  (kept for symmetry / future)
-        dispatch_operation_bake,
-        validate_declarations_only_ops,
-    )
-    from .migrated_ops import declare_setdim_compat_dims
-
-    kwargs_snapshot = {
+    return {
         "S": S,
         "enable_conversational_io": enable_conversational_io,
         "enable_tool_calling": enable_tool_calling,
@@ -3853,10 +2415,893 @@ def _bake_from_scheduled_ops(
             tuple(sorted(extra_residual_dims.items()))
             if extra_residual_dims else None
         ),
+        # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
+        # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
+        # head-0 slot-0 Q discriminator gains six OP_<cmp> * -1e6 veto cells,
+        # so the ON / OFF builds bake a different W_q row and must never share
+        # a memo entry. See shared.l15_lookup_cmp_veto_enabled.
+        "C4_L15_LOOKUP_CMP_VETO": (
+            os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
+        ),
+        # Consumer-opcode LOOKAHEAD (#221; DEFAULT-ON, opt out =0): adds the
+        # PC+8 chain + lookahead fetch head + arith-decode flag + AX->STACK0
+        # relay + prior-arith latch + dump-block flag bands AND the dump's
+        # STACK0_B0_DUMP_BLOCK blocker (output-affecting on multi-op arith
+        # intermediate-operand frames). On / off builds must NEVER share a
+        # memo / disk entry -- the band presence changes d_model and the dump
+        # gate changes emission, so this flag toggles geometry AND output.
+        "C4_STACK0_NEXT_ARITH": (
+            os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
+        ),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).
         "__dynamic": True,
     }
+
+
+def _inproc_cache_key(snapshot: dict) -> str:
+    """Stable SHA1 of a kwargs snapshot for in-process memoisation."""
+    import hashlib as _hashlib
+    import json as _json
+    payload = _json.dumps(snapshot, sort_keys=True, default=repr).encode("utf-8")
+    return _hashlib.sha1(payload).hexdigest()
+
+
+def compile_full_vm_dynamic(
+    S: float = 100.0,
+    *,
+    enable_conversational_io: bool = False,
+    enable_tool_calling: bool = False,
+    enable_neural_io_think_protocol: bool = False,
+    alu_mode: str = "lookup",
+    n_heads: int = 8,
+    ffn_hidden: int = 4096,
+    max_seq_len: int = 8192,
+    pin_io_only: bool = True,
+    disk_cache: bool = True,
+    use_dynamic_ffn: bool = True,
+    enable_moe_routing: Optional[bool] = None,
+    arch: Optional[ModelArchitectureSpec] = None,
+    positional_encoding: Optional[str] = None,
+    attention_normalization: Optional[str] = None,
+    rope_base: Optional[float] = None,
+    use_rms_norm: Optional[bool] = None,
+    rms_norm_eps: Optional[float] = None,
+    require_declarative_bake: Optional[bool] = None,
+    declarations_only: bool = False,
+    kv_eviction_policy=None,
+    kv_eviction_n_steps: int = 64,
+    strict: bool = True,
+    allow_sealed_cycles: bool = True,
+    model_shape_constraint=None,
+    target_shape_overrides=None,
+    d_model_packing: bool = False,
+    d_model_packing_target: Optional[int] = None,
+    cross_step_baseline_allowlist: Optional[Iterable[Tuple[str, str]]] = None,
+    # Model-semantics umbrella flags (see
+    # ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``). All default to
+    # ``None`` so existing callers see no behavior change. ``preset=`` is
+    # the convenience shortcut; the six per-axis flags are the per-axis
+    # override surface. Mixing ``preset=`` with ``arch=`` is rejected like
+    # the existing ``arch=`` vs individual-kwarg gate.
+    preset: Optional[str] = None,
+    softmax_variant: Optional[str] = None,
+    normalization: Optional[str] = None,
+    ffn_variant: Optional[str] = None,
+    per_head_qk_norm: Optional[str] = None,
+    ffn_routing: Optional[str] = None,
+    extra_residual_dims: Optional[Mapping[str, int]] = None,
+):
+    """Compile and bake a Neural VM via the hybrid dynamic-layer scheduler.
+
+    Signature mirrors ``compile_full_vm`` exactly (same args/kwargs, same
+    return type ``(model, layout)``). As of Phase 8.G.3 this is the only
+    implementation of ``compile_full_vm`` — that entry point is a thin
+    unconditional redirect here after the static phase-pruning body was
+    deleted.
+
+    Internally:
+
+      1. Collect the same op list as ``compile_full_vm`` (delegating to
+         the same factories with the same flags).
+      2. Compute a hybrid dep+phase schedule via
+         ``compute_dynamic_schedule``. This is the load-bearing dynamic
+         logic; today it agrees with the static phase order on the full
+         op set (cycle members fall back to phase, non-cycle ops sort by
+         topological depth with phase as a tiebreaker — and on the current
+         op set the tiebreaker always wins because the DAG depth chain is
+         only 4 layers deep vs. the 17-layer static layout).
+      3. Hand the scheduled ops to the unchanged ``LayerCompiler`` and
+         ``build_model_from_layout`` pipelines used by ``compile_full_vm``.
+         The static path's phase pruning runs on top, so any residual
+         ordering ambiguity is resolved identically to the static path.
+
+    The caller receives ``(model, layout)`` exactly as from
+    ``compile_full_vm`` (which is now a thin redirect to this function
+    after the Phase 8.G.3 static-body deletion). The historical
+    byte-identity gate (``compare_compile_paths``) was removed alongside
+    the static body; the surviving fast scheduler invariants in
+    ``tests/test_compile_dynamic_byte_identical.py`` continue to gate
+    dep-graph regressions.
+
+    Args mirror ``compile_full_vm`` -- see that function's docstring for
+    detailed semantics. The disk-cache key is namespaced by appending
+    ``"__dynamic"`` to the kwargs snapshot so dynamic and static
+    compiles cannot trample each other's cache entries.
+
+    Strict mode (B14, ON by default as of Phase 7.A.5 default-flip)
+    ----------------------------------------------------------------
+    When ``strict=True`` (the default since Phase 7.A.5), the dynamic
+    compile refuses to fall back to ``phase`` for any ordering decision.
+    Before compiling, every op is categorised against the unpruned
+    declared-dep graph (mirroring ``tools/analyze_scheduler.py``); if any
+    op falls into ``dep_graph_cycle_member`` (and ``allow_sealed_cycles``
+    is False), ``phase_required_but_undeclared``, or
+    ``phase_inconsistent_with_deps``, the call raises
+    ``StrictModeUnschedulableError`` with the offending op names.
+
+    On a clean op set strict mode produces the same byte-identical
+    layout as the static path, because on a fully-declared op set the
+    dep-derived order and the phase-derived order agree (Phase A
+    finding, see ``DYNAMIC_SCHEDULER_MIGRATION_PLAN.md``).
+
+    Cycle-aware admission (``allow_sealed_cycles=True``, also the
+    default) accepts the OUTPUT_HI / IF_VAR SCC as a sealed group: the
+    hybrid scheduler still falls back to phase ordering INSIDE the SCC,
+    but every op OUTSIDE the SCC must be cleanly placeable from declared
+    deps alone. Today's production op set has ~92 cycle members and 0
+    non-cycle ``phase_required_but_undeclared`` /
+    ``phase_inconsistent_with_deps`` ops, so the default
+    ``strict=True, allow_sealed_cycles=True`` admits the compile and
+    produces a byte-identical layout to the prior strict-off path.
+
+    Passing ``strict=False`` restores the pre-Phase-7.A.5 behaviour
+    (no admission gate). Passing ``allow_sealed_cycles=False`` restores
+    the legacy "any cycle is a failure" behaviour, which today fails on
+    the production op set until B9 (dim decomposition) completes.
+
+    Target-shape overrides (shape-only rebuild)
+    --------------------------------------------
+    ``target_shape_overrides`` (when not ``None``) is a
+    ``ModelShapeConstraint`` whose pinned fields drive a POST-COMPILE
+    rebuild of the returned VM into a fresh ``AutoregressiveVM`` with
+    the target ``d_model`` / ``n_layers`` / ``n_heads`` / ``head_dim``
+    / ``intermediate_size`` / ``vocab_size``. The rebuilt model has
+    zero-initialized weights — it is NOT semantically equivalent to the
+    compiled VM. This is the minimum viable path that lets the HF
+    state-dict export adapters (Mixtral, Llama) be wired end-to-end
+    without rewriting the allocator stack to natively emit
+    Mixtral-shaped weights. See ``_rebuild_to_target_shape`` for the
+    documented gap (the allocator-native path is tracked separately).
+
+    ``model_shape_constraint`` (validation-only) and
+    ``target_shape_overrides`` (rebuild) compose: when both are set,
+    the rebuild runs first, then the constraint validates the rebuilt
+    model. Use ``target_shape_overrides`` alone for "shape-match HF
+    export"; use ``model_shape_constraint`` alone to assert the
+    naturally-allocated shape matches an external envelope.
+    """
+    # Mirror static-path env-flag handling to keep the API truly identical.
+    if not declarations_only:
+        declarations_only = _static._env_flag_enabled(
+            _static._DECLARATIONS_ONLY_BAKE_ENV
+        )
+    # Phase 7.F.2: default to OFF (preserves byte-identity with the
+    # historical baseline). Accept either a ``KVEvictionPolicy`` member
+    # or its string value; the static path is symmetric.
+    if kv_eviction_policy is None:
+        kv_eviction_policy = KVEvictionPolicy.OFF
+    if enable_moe_routing is None:
+        enable_moe_routing = _static._env_flag_enabled(
+            _static._ENABLE_MOE_ROUTING_ENV
+        )
+    if require_declarative_bake is None:
+        require_declarative_bake = _static._env_flag_enabled(
+            _static._REQUIRE_DECLARATIVE_BAKE_ENV
+        )
+    if declarations_only:
+        require_declarative_bake = True
+
+    # Model-semantics umbrella (see
+    # ``docs/MODEL_SEMANTICS_COMPILE_FLAGS_2026_06_09.md``). Resolves the
+    # six per-axis flags + the ``preset=`` shortcut into the existing
+    # ``positional_encoding`` / ``attention_normalization`` / ``use_rms_norm``
+    # / ``enable_moe_routing`` kwargs that the bake pipeline already
+    # consumes. The expansion is purely additive: when every umbrella flag
+    # is ``None`` (the default for existing callers) this block is a no-op
+    # and the downstream bake is byte-identical to the historical path.
+    (
+        positional_encoding,
+        attention_normalization,
+        use_rms_norm,
+        enable_moe_routing,
+    ) = _resolve_semantics_flags(
+        preset=preset,
+        positional_encoding=positional_encoding,
+        softmax_variant=softmax_variant,
+        attention_normalization=attention_normalization,
+        normalization=normalization,
+        use_rms_norm=use_rms_norm,
+        ffn_variant=ffn_variant,
+        per_head_qk_norm=per_head_qk_norm,
+        ffn_routing=ffn_routing,
+        enable_moe_routing=enable_moe_routing,
+        arch=arch,
+    )
+
+    # ------------------------------------------------------------------
+    # Auto-widen: extra residual bands requested by an op / caller.
+    # ------------------------------------------------------------------
+    # ``extra_residual_dims`` maps ``name -> size`` for fresh residual
+    # bands that should be appended past the natural d_model. Declaring
+    # them grows d_model automatically (the layout's d_model is the
+    # highest dim end), and the head-dim-preserving alignment in
+    # ``_bake_from_scheduled_ops`` then rounds d_model up to a multiple of
+    # the base head_dim and ADDS heads — so an op never has to hardcode
+    # d_model to claim a fresh band. The dims are bump-pointer allocated
+    # at the tail; the op's rules reference them by name through
+    # ``layout.dim_positions``. This is the API for AX ``H1_PREV_STEP``,
+    # MUL ``MUL_RESULT_HI``, and any future over-width family.
+    if extra_residual_dims:
+        for _name, _size in extra_residual_dims.items():
+            if not isinstance(_name, str) or not _name:
+                raise ValueError(
+                    f"extra_residual_dims: name must be a non-empty str "
+                    f"(got {_name!r})"
+                )
+            if not isinstance(_size, int) or _size <= 0:
+                raise ValueError(
+                    f"extra_residual_dims[{_name!r}]: size must be a "
+                    f"positive int (got {_size!r})"
+                )
+
+    # ------------------------------------------------------------------
+    # Auto-collect op-local residual bands (replaces the central dict).
+    # ------------------------------------------------------------------
+    # Band-adding ops no longer hand-edit a shared dict here. Each op declares
+    # the over-width residual band(s) it needs LOCALLY, next to the op that
+    # reads/writes them, via ``register_residual_band`` in
+    # ``ops/residual_band_registry.py`` (populated at op-module import time —
+    # ``all_core_ops`` wildcard-imports every ``lN_ops`` module). The registry
+    # is auto-collected here: ``collect_registered_residual_bands`` evaluates
+    # each band's flag predicate FRESH (so flag-off builds omit the band and
+    # stay byte-identical) and returns the union in registration order.
+    #
+    # The current production registry holds: the AX byte-1 carry bands
+    # (``H1_PREV_STEP`` / ``H1_DUMP_OUT`` / ``AX_CARRY_OVERFLOW``, l11_ops,
+    # always present), the Root 2 STACK0 byte-0 carry bands (``STACK0_B0_*``,
+    # l11_ops, always present), and the flag-gated width=2 MUL result band
+    # (``MUL_RESULT_HI_LO/HI``, alu_ops, ``C4_MUL_WIDTH2``-gated). Every band
+    # routes through the SINGLE head-dim-preserving auto-widen in
+    # ``_bake_from_scheduled_ops`` (``base_head_dim`` captured from the BASE
+    # layout BEFORE any extra band is appended, so the widen rounds d_model up
+    # to a multiple of the BASE head_dim and ADDS heads instead of
+    # repartitioning every existing head — declaring them via
+    # ``declare_setdim_compat_dims`` would re-derive head_dim from the widened
+    # width and scramble attention content -> regresses test_bnz_branch). The
+    # collected set flows into the disk/in-proc cache key below (which hashes
+    # ``extra_residual_dims`` but NOT ``C4_MUL_WIDTH2`` / ``C4_AX_BYTE1_DUMP``
+    # directly), so flag-on and flag-off builds never share a serialised entry.
+    #
+    # The COMBINED widen (14 AX/Root2-flag dims + 28 Root2 PREV/DUMP dims always
+    # + 32 MUL dims when enabled) rounds head-dim-preservingly (base head_dim
+    # 109): 872 -> 981 (n_heads 8 -> 9). All existing dims are
+    # byte-behaviour-identical (every new band is zero on every row the prior
+    # model touched). Threaded by NAME via ``layout.dim_positions`` -- they must
+    # NOT be op-declared ``declare_dim``s. To add a new band-adding op, call
+    # ``register_residual_band`` at that op's module top — never touch this file.
+    # See docs/RESIDUAL_BAND_REGISTRY_2026_06_13.md.
+    #
+    # AX byte-1 VALUE-GENERALISATION (byte-1 0..15): the carry now ALSO copies
+    # the H2/H3 marker-distance one-hots (``H2/H3_PREV_STEP`` ->
+    # ``H2/H3_DUMP_OUT``, +28 dims) because the fresh-step byte-1 emission
+    # one-hot is SPREAD across H1 (v 0..4) / H2 (v 5..11) / H3 (v 12..15). Those
+    # four bands are now ALSO declared op-locally via ``register_residual_band``
+    # in ``ops/l11_ops.py`` (next to the H1 pair), so they auto-collect here.
+    from .ops.residual_band_registry import (
+        collect_registered_residual_bands,
+        collect_never_share_band_names,
+        collect_alibi_base_residual_bands,
+    )
+    _merged_extra = collect_registered_residual_bands()
+    # The ALiBi-slope BASE band set: bands active with every C4_* flag at its
+    # DEFAULT. Used to derive the slope base head count so a non-default
+    # over-width flag (e.g. C4_AX_BYTE1_FULL_WIDTH) does not shift existing
+    # heads' ALiBi slopes (see collect_alibi_base_residual_bands +
+    # _bake_from_scheduled_ops base_n_heads). Caller/env extra_residual_dims
+    # are folded in below so an explicitly-requested band is part of the base.
+    _alibi_base_extra = collect_alibi_base_residual_bands()
+    # Escape hatch: ``C4_DISABLE_AX_CARRY_BANDS=1`` drops the auto-collected
+    # production bands (A/B diagnostics only — the carry ops then reference
+    # undeclared dims, so this is for layout/geometry comparison, not a runnable
+    # build). The caller-passed / env ``extra_residual_dims`` below is preserved.
+    if os.environ.get("C4_DISABLE_AX_CARRY_BANDS") == "1":
+        _merged_extra = {}
+        _alibi_base_extra = {}
+    if extra_residual_dims:
+        _merged_extra.update(extra_residual_dims)
+        # An explicitly-requested band is part of the geometry the existing
+        # heads are authored against, so it belongs in the slope base too.
+        _alibi_base_extra.update(extra_residual_dims)
+    extra_residual_dims = _merged_extra or None
+    # Carry/dump bands that must keep a private dim-liveness slot — threaded
+    # into the compiler's never-share set inside ``_bake_from_scheduled_ops``
+    # (no class-level ``_LIVENESS_NEVER_SHARE_NAMES`` hand-edit needed).
+    _never_share_band_names = collect_never_share_band_names()
+
+    from ..config import get_config
+    vm_config = get_config()
+
+    # V2 vision (Phase 8.X): a single ``arch=ModelArchitectureSpec(...)`` may
+    # be passed in lieu of the individual architectural kwargs
+    # (``positional_encoding=``, ``attention_normalization=``,
+    # ``rope_base=``, ``use_rms_norm=``, ``rms_norm_eps=``). Mixing the two
+    # surfaces is rejected with an explicit error rather than silently
+    # privileging one — the migration story is "pick one path per call site".
+    # The individual kwargs remain the back-compat surface; new callers
+    # should prefer ``arch=`` (which composes per-layer overrides cleanly
+    # via :class:`LayerSpec`).
+    if arch is not None:
+        _explicit_arch_kwargs = {
+            name: value
+            for name, value in (
+                ("positional_encoding", positional_encoding),
+                ("attention_normalization", attention_normalization),
+                ("rope_base", rope_base),
+                ("use_rms_norm", use_rms_norm),
+                ("rms_norm_eps", rms_norm_eps),
+            )
+            if value is not None
+        }
+        if _explicit_arch_kwargs:
+            raise TypeError(
+                "compile_full_vm_dynamic(arch=...) is mutually exclusive "
+                "with the individual architectural kwargs "
+                f"{sorted(_explicit_arch_kwargs)}. Pass either an "
+                "``arch=ModelArchitectureSpec(...)`` instance OR the "
+                "individual ``positional_encoding=``/"
+                "``attention_normalization=``/``rope_base=``/"
+                "``use_rms_norm=``/``rms_norm_eps=`` kwargs, not both."
+            )
+        # Project the spec back onto the legacy 5-kwarg surface that the
+        # downstream ``_bake_from_scheduled_ops`` / ``_rebuild_to_target_shape``
+        # APIs still consume. This keeps the runtime path byte-identical
+        # to the historical kwarg path — a spec is just a typed name for
+        # the same five values.
+        positional_encoding = arch.positional_encoding.kind
+        attention_normalization = arch.attention_activation.softmax_kind
+        rope_base = float(arch.positional_encoding.rope_base)
+        use_rms_norm = arch.norm_pre_attention.kind == "rmsnorm"
+        rms_norm_eps = float(arch.norm_pre_attention.eps)
+    else:
+        if positional_encoding is None:
+            positional_encoding = vm_config.positional_encoding
+        if attention_normalization is None:
+            attention_normalization = vm_config.attention_normalization
+        if rope_base is None:
+            rope_base = vm_config.rope_base
+        if use_rms_norm is None:
+            use_rms_norm = vm_config.use_rms_norm
+        if rms_norm_eps is None:
+            rms_norm_eps = vm_config.rms_norm_eps
+
+    # In-process memo short-circuit. Mirrors the kwargs snapshot built inside
+    # ``_bake_from_scheduled_ops`` at the disk-cache lookup so the two layers
+    # invalidate together. Skips the ~1.3 s ``_collect_ops_for_compile`` pass
+    # and the ~3 s ``torch.load`` deserialisation on every subsequent call in
+    # the same process. Cross-process callers (fresh pytest invocations) still
+    # fall through to the disk cache. Disabled when ``disk_cache=False``
+    # (test paths that explicitly want a fresh compile) and when
+    # ``require_declarative_bake`` / ``declarations_only`` / a
+    # ``target_shape_overrides`` rebuild is requested (those paths post-process
+    # the model and would alias if we handed back a memoised reference).
+    _inproc_snapshot = None
+    if (
+        disk_cache
+        and not require_declarative_bake
+        and not declarations_only
+        and target_shape_overrides is None
+        and model_shape_constraint is None
+        and not d_model_packing
+    ):
+        _inproc_snapshot = _build_cache_key_snapshot(
+            S=S,
+            enable_conversational_io=enable_conversational_io,
+            enable_tool_calling=enable_tool_calling,
+            enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+            alu_mode=alu_mode,
+            n_heads=n_heads,
+            ffn_hidden=ffn_hidden,
+            max_seq_len=max_seq_len,
+            pin_io_only=pin_io_only,
+            enable_moe_routing=enable_moe_routing,
+            positional_encoding=positional_encoding,
+            attention_normalization=attention_normalization,
+            rope_base=rope_base,
+            use_rms_norm=use_rms_norm,
+            rms_norm_eps=rms_norm_eps,
+            require_declarative_bake=require_declarative_bake,
+            declarations_only=declarations_only,
+            kv_eviction_policy=kv_eviction_policy,
+            kv_eviction_n_steps=kv_eviction_n_steps,
+            extra_residual_dims=extra_residual_dims,
+        )
+        _memo_key = _inproc_cache_key(_inproc_snapshot)
+        _memo_hit = _INPROC_COMPILE_CACHE.get(_memo_key)
+        if _memo_hit is not None:
+            _cached_model, _cached_layout = _memo_hit
+            # Re-attach KV eviction state mirrors the disk-cache hit path in
+            # ``_bake_from_scheduled_ops``; the cached model may have been
+            # built in this process with a different policy/step count.
+            _static._attach_kv_eviction_state(
+                _cached_model,
+                _cached_layout,
+                kv_eviction_policy=KVEvictionPolicy(kv_eviction_policy),
+                n_steps=int(kv_eviction_n_steps),
+            )
+            return _cached_model, _cached_layout
+
+    # Collect ops with the same composition rules as compile_full_vm.
+    ops = _collect_ops_for_compile(
+        alu_mode=alu_mode,
+        enable_conversational_io=enable_conversational_io,
+        enable_tool_calling=enable_tool_calling,
+        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+    )
+
+    # B14 strict-mode gate: refuse to compile if any op needs phase to
+    # be placed. Raised BEFORE any LayerCompiler / disk-cache work runs
+    # so the error citation is purely scheduler-level (no half-built
+    # model state to tear down, no stale cache hit masking the failure).
+    # When ``strict=False`` (the default), the hybrid scheduler falls
+    # back to phase, preserving the B11/B12 byte-identity behaviour.
+    #
+    # Cycle-aware strict mode (Phase 7.A.5 B14 attempt): when
+    # ``allow_sealed_cycles=True`` (the strict-mode default) the SCC of
+    # cycle members is accepted as a sealed group — the hybrid
+    # scheduler still routes them via phase fallback INSIDE the SCC, but
+    # the rest of the graph is dep-derived. This lets strict mode land
+    # before B9 dim decomposition completes. The byte-identity invariant
+    # still holds because the hybrid scheduler's actual placement logic
+    # is unchanged; strict mode is purely an admission gate.
+    if strict:
+        _assert_strict_mode_clean(
+            ops, allow_sealed_cycles=allow_sealed_cycles
+        )
+
+    # Compute the hybrid schedule. The schedule output (dep-derived
+    # order with phase-pruning fallback) is the load-bearing "dynamic"
+    # signal — it's how a strict dep-derived scheduler would lay these
+    # ops out. We do NOT feed that re-ordered list into LayerCompiler:
+    # ``_topological_sort`` uses ``ops.index(o)`` for Kahn's stability
+    # and any reordering would feed a different stability key in.
+    # Instead the schedule is computed alongside, and the compile pipeline
+    # runs over the natural ``_collect_ops`` order. On today's op set the
+    # two coincide on every non-cycle op and the cycle members fall
+    # through to phase-only ordering. This decoupling is what made B11 a
+    # byte-identical parallel path rather than a behavioural change
+    # (Phase 8.G.3 cut the static fallback that gated this claim, leaving
+    # the dynamic path as the single bake entry point).
+    _scheduled, _source = compute_dynamic_schedule(ops)
+
+    # Step-1 safety: scan for cross-step reads (``X.*.-1``) whose base dim
+    # ALSO has a same-step writer in the scheduled op set. On VM step 1
+    # there is no previous step, so the cross-step alias resolves to 0;
+    # when a same-step writer exists, the bake author very often meant to
+    # consume that fresh write instead. Emitted via ``warnings.warn`` with
+    # the ``CrossStepReadWarning`` category so callers can filter or
+    # promote to errors via the stdlib ``warnings`` filter mechanism. The
+    # canonical motivating case is the OPCODE_BYTE_LO read in
+    # ``opcode_decode_ffn`` (see ``ops/l5_ops.py``) whose same-step writer
+    # is ``layer5_fetch`` — on step 1 the decoder reads 0.
+    #
+    # Step 4 (``IR_INCREMENTAL_IMPROVEMENTS.md``): when ``strict=True``,
+    # the warning becomes a HARD ERROR (``CrossStepReadError``). The
+    # caller can pass ``cross_step_baseline_allowlist`` to whitelist the
+    # historical findings while migrating them off cross-step reads; the
+    # bundled :data:`CROSS_STEP_BASELINE_ALLOWLIST` (82 entries at Step-4
+    # landing) is used when no explicit allowlist is supplied. Passing
+    # ``cross_step_baseline_allowlist=[]`` promotes every finding to an
+    # error (useful for new bake authors who want zero cross-step
+    # zero-prop risk).
+    _emit_cross_step_safety_warnings(
+        _scheduled,
+        strict_error=strict,
+        allowlist=cross_step_baseline_allowlist,
+    )
+
+    # Build the model via the unchanged static pipeline with the natural
+    # op order. The static compile_full_vm wraps op collection inline,
+    # so we re-implement just the body here so the dynamic path is
+    # actually a parallel API (not a wrapper around the static call).
+    model, layout = _bake_from_scheduled_ops(
+        ops,
+        S=S,
+        alu_mode=alu_mode,
+        n_heads=n_heads,
+        ffn_hidden=ffn_hidden,
+        max_seq_len=max_seq_len,
+        pin_io_only=pin_io_only,
+        disk_cache=disk_cache,
+        use_dynamic_ffn=use_dynamic_ffn,
+        enable_moe_routing=enable_moe_routing,
+        positional_encoding=positional_encoding,
+        attention_normalization=attention_normalization,
+        rope_base=rope_base,
+        use_rms_norm=use_rms_norm,
+        rms_norm_eps=rms_norm_eps,
+        require_declarative_bake=require_declarative_bake,
+        declarations_only=declarations_only,
+        enable_conversational_io=enable_conversational_io,
+        enable_tool_calling=enable_tool_calling,
+        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+        kv_eviction_policy=kv_eviction_policy,
+        kv_eviction_n_steps=kv_eviction_n_steps,
+        d_model_packing=d_model_packing,
+        d_model_packing_target=d_model_packing_target,
+        extra_residual_dims=extra_residual_dims,
+        never_share_band_names=_never_share_band_names,
+        alibi_base_extra_dims=(_alibi_base_extra or None),
+    )
+
+    # Post-compile shape rebuild. When the caller hands in
+    # ``target_shape_overrides`` (a ``ModelShapeConstraint``), REPLACE the
+    # compiled VM with a freshly-initialized ``AutoregressiveVM`` whose
+    # geometry matches the overrides. This is a SHAPE-ONLY rebuild — the
+    # baked VM weights are NOT copied into the new model, so semantic
+    # equivalence is sacrificed for shape compatibility. Use case:
+    # producing a target-architecture-shaped VM for HF state-dict export
+    # (Mixtral, Llama) without changing the VM's allocator-derived
+    # natural shape.
+    if target_shape_overrides is not None:
+        from ..verification.model_shape_constraint import ModelShapeConstraint as _MSC
+        if not isinstance(target_shape_overrides, _MSC):
+            raise TypeError(
+                "target_shape_overrides must be a ModelShapeConstraint instance, "
+                f"got {type(target_shape_overrides).__name__}"
+            )
+        model = _rebuild_to_target_shape(
+            model,
+            target_shape_overrides,
+            max_seq_len=max_seq_len,
+            positional_encoding=positional_encoding,
+            attention_normalization=attention_normalization,
+            rope_base=rope_base,
+            use_rms_norm=use_rms_norm,
+            rms_norm_eps=rms_norm_eps,
+        )
+
+    # Post-compile shape-constraint check. When the caller hands in a
+    # ``ModelShapeConstraint``, diff it against the compiled model and
+    # raise ``ModelShapeMismatchError`` on any mismatch. The check runs
+    # AFTER the bake so it sees the real ``num_heads`` / ``head_dim``
+    # the allocator emitted (Phase 8.O.1/8.O.2 dynamic heads + GQA), not
+    # just the caller's intent.
+    if model_shape_constraint is not None:
+        from ..verification.model_shape_constraint import (
+            ModelShapeConstraint as _MSC,
+            ModelShapeMismatchError,
+            validate_against_shape,
+        )
+        if not isinstance(model_shape_constraint, _MSC):
+            raise TypeError(
+                "model_shape_constraint must be a ModelShapeConstraint instance, "
+                f"got {type(model_shape_constraint).__name__}"
+            )
+        mismatches = validate_against_shape(model, model_shape_constraint)
+        if mismatches:
+            raise ModelShapeMismatchError(
+                mismatches, target=model_shape_constraint.target
+            )
+
+    # Populate the in-process memo so a subsequent call with the same kwargs
+    # in this process skips ``_collect_ops_for_compile`` + ``torch.load``.
+    # Only populated when the early-cache snapshot path was taken (the post-
+    # compile rebuild / packing branches are explicitly excluded above).
+    if _inproc_snapshot is not None:
+        _INPROC_COMPILE_CACHE[_inproc_cache_key(_inproc_snapshot)] = (model, layout)
+
+    return model, layout
+
+
+# ---------------------------------------------------------------------------
+# Internals: target-shape rebuild
+# ---------------------------------------------------------------------------
+
+
+def _rebuild_to_target_shape(
+    compiled_model,
+    overrides,
+    *,
+    max_seq_len: int,
+    positional_encoding: str,
+    attention_normalization: str,
+    rope_base: float,
+    use_rms_norm: bool,
+    rms_norm_eps: float,
+):
+    """Build a fresh ``AutoregressiveVM`` with the override geometry.
+
+    SHAPE-ONLY rebuild — returns a new model with target
+    ``d_model`` / ``n_layers`` / ``n_heads`` / ``head_dim`` /
+    ``ffn_hidden`` / ``vocab_size`` taken from ``overrides``, falling
+    back to the compiled model's values when a field is ``None``. The
+    new model's weights are nn.Parameter zeros (PureFFN's default init),
+    so it is NOT semantically equivalent to the compiled VM. The intent
+    is to produce a model whose ``state_dict`` shape matches a target
+    HF architecture (Mixtral, Llama) for export adapters.
+
+    Gap documented loudly: a real "compile-time shape override" would
+    have the allocator emit a baked, semantics-preserving model with
+    the target geometry (padding dims up, rebuilding attention with
+    GQA, padding FFN widths uniformly, padding vocab). That requires
+    reworking the dim allocator, head allocator, and FFN allocator to
+    accept a target envelope and route excess capacity to padding
+    rather than to functional ops. This rebuild is the minimum viable
+    path that lets the HF export adapters be wired end-to-end without
+    that allocator rework.
+
+    Override fields:
+      * ``d_model`` — total residual width (must equal num_heads * head_dim)
+      * ``num_hidden_layers`` — n_layers
+      * ``num_attention_heads`` — n_heads
+      * ``head_dim`` — per-head width (overrides d_model // n_heads)
+      * ``intermediate_size`` — FFN hidden_dim (applied uniformly)
+      * ``vocab_size`` — embedding + lm_head vocab
+      * ``num_key_value_heads`` — not honored yet (MHA only; raises if
+        set != num_attention_heads). GQA wiring through the runtime
+        attention module is a separate item.
+    """
+    from ..vm_step import AutoregressiveVM
+
+    d_model = overrides.d_model if overrides.d_model is not None else int(compiled_model.d_model)
+    n_layers = (
+        overrides.num_hidden_layers
+        if overrides.num_hidden_layers is not None
+        else len(compiled_model.blocks)
+    )
+    if overrides.num_attention_heads is not None:
+        n_heads = int(overrides.num_attention_heads)
+    else:
+        n_heads = int(getattr(compiled_model.blocks[0].attn, "num_heads", 8))
+    head_dim = overrides.head_dim
+    if head_dim is not None:
+        if int(head_dim) * n_heads != d_model:
+            raise ValueError(
+                f"target_shape_overrides: head_dim={head_dim} * "
+                f"num_attention_heads={n_heads} = {int(head_dim) * n_heads}, "
+                f"but d_model={d_model}. Mixtral requires num_attention_heads * "
+                "head_dim == hidden_size."
+            )
+    if overrides.num_key_value_heads is not None:
+        if int(overrides.num_key_value_heads) != n_heads:
+            raise NotImplementedError(
+                f"target_shape_overrides: num_key_value_heads="
+                f"{overrides.num_key_value_heads} != num_attention_heads="
+                f"{n_heads}. GQA rebuild is not yet implemented; pass MHA "
+                "(num_key_value_heads == num_attention_heads) for now."
+            )
+    if overrides.intermediate_size is not None:
+        ffn_hidden = int(overrides.intermediate_size)
+    else:
+        widths = [
+            int(getattr(b.ffn, "hidden_dim", 0)) for b in compiled_model.blocks
+        ]
+        # Step 3 (literal-fallback lint, audit 2026-06-03): historically
+        # the empty-widths branch substituted a literal ``4096`` —
+        # which silently seeded the rebuild with a stale shape any time
+        # ``compiled_model.blocks`` was empty (synthetic / partial
+        # rebuild fixtures). Demand an explicit override instead of
+        # papering over the missing topology.
+        if not widths:
+            raise ValueError(
+                "rebuild target: cannot derive ffn_hidden because "
+                "compiled_model.blocks is empty. Pass "
+                "target_shape_overrides.intermediate_size explicitly. "
+                "Bare-literal fallback (4096) removed by Step 3 (see "
+                "docs/LITERAL_FALLBACK_AUDIT.md)."
+            )
+        ffn_hidden = max(widths)
+    vocab_size = (
+        int(overrides.vocab_size)
+        if overrides.vocab_size is not None
+        else int(getattr(compiled_model, "vocab_size", 256))
+    )
+
+    ffn_widths: Dict[int, int] = {}
+    for layer_idx, ov in overrides.per_layer_overrides.items():
+        if not isinstance(layer_idx, int) or layer_idx < 0 or layer_idx >= n_layers:
+            raise ValueError(
+                f"target_shape_overrides.per_layer_overrides has layer_idx="
+                f"{layer_idx}, but rebuild has {n_layers} layers."
+            )
+        if (
+            ov.get("num_attention_heads") is not None
+            or ov.get("num_key_value_heads") is not None
+            or ov.get("head_dim") is not None
+        ):
+            raise NotImplementedError(
+                "target_shape_overrides: per-layer head/head_dim overrides "
+                "are not supported by the rebuild path (AutoregressiveVM "
+                "uses one n_heads / head_dim across all blocks)."
+            )
+        if ov.get("intermediate_size") is not None:
+            ffn_widths[layer_idx] = int(ov["intermediate_size"])
+
+    rebuilt = AutoregressiveVM(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_layers=n_layers,
+        n_heads=n_heads,
+        ffn_hidden=ffn_widths if ffn_widths else ffn_hidden,
+        max_seq_len=max_seq_len,
+        positional_encoding=positional_encoding,
+        attention_normalization=attention_normalization,
+        rope_base=rope_base,
+        use_rms_norm=use_rms_norm,
+        rms_norm_eps=rms_norm_eps,
+    )
+    return rebuilt
+
+
+# ---------------------------------------------------------------------------
+# Internals: op collection + bake driver
+# ---------------------------------------------------------------------------
+
+
+def _collect_ops_for_compile(
+    *,
+    alu_mode: str,
+    enable_conversational_io: bool,
+    enable_tool_calling: bool,
+    enable_neural_io_think_protocol: bool,
+) -> List[Operation]:
+    """Collect the exact same op list ``compile_full_vm`` registers.
+
+    Mirrors the in-line composition logic in
+    ``compile_full_vm`` (core ops + flag-gated extras + ALU composites +
+    residual model ops + post-op attach ops). Kept in lock-step with the
+    static path so the dynamic scheduler sees the same input space.
+    """
+    ops: List[Operation] = []
+    ops.extend(_static.all_core_ops(
+        alu_mode=alu_mode,
+        enable_conversational_io=enable_conversational_io,
+        enable_tool_calling=enable_tool_calling,
+        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+    ))
+    ops.append(_static.make_l10_post_op_attach_op(alu_mode=alu_mode))
+
+    if alu_mode == "efficient":
+        ops.append(_static.make_l11_alu_mul_bdtoge_op())
+        ops.append(_static.make_l11_alu_mul_schoolbook_op())
+        ops.append(_static.make_l11_alu_mul_carrypass1_op())
+        ops.append(_static.make_l11_alu_mul_carrypass2_op())
+        ops.append(_static.make_l11_alu_mul_carrypass3_op())
+        ops.append(_static.make_l12_alu_mul_genprop_op())
+        ops.append(_static.make_l12_alu_mul_binarylookahead_op())
+        ops.append(_static.make_l12_alu_mul_finalcorrection_op())
+        ops.append(_static.make_l12_alu_mul_getobd_op())
+        ops.append(_static.make_efficient_l8_addsub_wrap_op(alu_mode=alu_mode))
+        # Campaign loaded-operand ADD ALU cell-15 contaminant clear
+        # CBC Phase 1: DERIVED clean-one-hot operand delivery. Snaps
+        # ALU_LO/HI + AX_CARRY_LO/HI to a clean per-nibble one-hot. Two flags,
+        # both gated on this campaign so flag-OFF is golden byte-identical:
+        #   * C4_CLEAN_OPERAND      — feasibility, cleans ALL binary-op + cmp rows
+        #   * C4_CLEAN_OPERAND_ADD  — CBC pass-gain (DEFAULT-ON), cleans ONLY the
+        #     arithmetic (ADD/SUB/MUL/DIV/MOD) rows, leaving the CMP calibration
+        #     intact.
+        # This SUBSUMES the former ADD-only address-leak corrector
+        # (``LoadedOperandAddHi15ClearFFN``): the clean-snap zeros every non-argmax
+        # ALU_HI cell on the ADD/SUB/MUL/DIV/MOD MARK_AX rows BEFORE any hi-nibble
+        # clear could run, so the old cell-13/15 (and all-16) clears were provably
+        # inert once ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON (proven: forward
+        # max_abs_diff=0.0 on ADD rows; fast-gate byte-identical corpus verdicts).
+        # Must come AFTER efficient_l8_addsub_wrap (whose d_model read sees the raw
+        # L8 PureFFN before this wrap). See shared.clean_operand_enabled /
+        # shared.clean_operand_add_enabled.
+        ops.append(_static.make_clean_operand_op())
+        # Campaign func_max/func_min CMP loaded-operand-A two-hot clean (task
+        # #428). Wraps the L9 block.ffn (CMP nibble-comparator factory) to clean
+        # the SE_ALU operand-A band on the MARK_SE_ONLY cmp row before the L9 CMP
+        # rules read it. Must come AFTER layer9_alu (whose FFN it wraps).
+        # Explicit-opt-in campaign flag; flag-OFF leaves block.ffn untouched
+        # (golden byte-identical). See shared.func_cmp_operand_clean_enabled.
+        ops.append(_static.make_cmp_loaded_operand_clean_op())
+        ops.append(_static.make_efficient_l10_andorxor_wrap_op(alu_mode=alu_mode))
+        ops.append(_static.make_efficient_l11_alumul_wrap_op(alu_mode=alu_mode))
+
+    for op in _static.make_alu_divmod_composite_ops(alu_mode=alu_mode):
+        ops.append(op)
+    # Bug #36 declarative wrapper: no-op bake, consolidates the
+    # FlattenedDivMod composite's reads/writes for dim_contracts_audit.
+    ops.append(_static.make_layer10_divmod_op())
+
+    ops.append(_static.make_residual_alibi_slopes_op())
+    ops.append(_static.make_layer10_residual_alibi_slopes_op(alu_mode=alu_mode))
+    ops.append(_static.make_layer8_op_imm_relay_op())
+    ops.append(_static.make_contract_validation_op())
+
+    if alu_mode == "lookup":
+        ops.extend(_static.all_alu_postop_attach_ops())
+
+    return ops
+
+
+def _bake_from_scheduled_ops(
+    scheduled: List[Operation],
+    *,
+    S: float,
+    alu_mode: str,
+    n_heads: int,
+    ffn_hidden: int,
+    max_seq_len: int,
+    pin_io_only: bool,
+    disk_cache: bool,
+    use_dynamic_ffn: bool,
+    enable_moe_routing: bool,
+    positional_encoding: str,
+    attention_normalization: str,
+    rope_base: float,
+    use_rms_norm: bool,
+    rms_norm_eps: float,
+    require_declarative_bake: bool,
+    declarations_only: bool,
+    enable_conversational_io: bool,
+    enable_tool_calling: bool,
+    enable_neural_io_think_protocol: bool,
+    kv_eviction_policy: KVEvictionPolicy = KVEvictionPolicy.OFF,
+    kv_eviction_n_steps: int = 64,
+    d_model_packing: bool = False,
+    d_model_packing_target: Optional[int] = None,
+    extra_residual_dims: Optional[Mapping[str, int]] = None,
+    never_share_band_names: Optional[Set[str]] = None,
+    alibi_base_extra_dims: Optional[Mapping[str, int]] = None,
+):
+    """Run the unchanged static compile/bake pipeline against ``scheduled``.
+
+    This is intentionally a near-mirror of the body of
+    ``compile_full_vm`` so the byte-identity invariant is structural
+    rather than incidental: any change to the static body that affects
+    ops_per_layer / dim_positions must be mirrored here. The diff is the
+    op-collection step — instead of ``for op in all_core_ops(...): add``,
+    we register ``scheduled`` directly.
+    """
+    import json
+    import os
+    import pathlib
+    import torch as _torch
+    from .layer_compiler import (
+        LayerCompiler,
+        ModelLayout,
+        build_model_from_layout,  # noqa: F401  (kept for symmetry / future)
+        dispatch_operation_bake,
+        validate_declarations_only_ops,
+    )
+    from .migrated_ops import declare_setdim_compat_dims
+
+    kwargs_snapshot = _build_cache_key_snapshot(
+        S=S,
+        enable_conversational_io=enable_conversational_io,
+        enable_tool_calling=enable_tool_calling,
+        enable_neural_io_think_protocol=enable_neural_io_think_protocol,
+        alu_mode=alu_mode,
+        n_heads=n_heads,
+        ffn_hidden=ffn_hidden,
+        max_seq_len=max_seq_len,
+        pin_io_only=pin_io_only,
+        enable_moe_routing=enable_moe_routing,
+        positional_encoding=positional_encoding,
+        attention_normalization=attention_normalization,
+        rope_base=rope_base,
+        use_rms_norm=use_rms_norm,
+        rms_norm_eps=rms_norm_eps,
+        require_declarative_bake=require_declarative_bake,
+        declarations_only=declarations_only,
+        kv_eviction_policy=kv_eviction_policy,
+        kv_eviction_n_steps=kv_eviction_n_steps,
+        extra_residual_dims=extra_residual_dims,
+    )
     cache_path = None
     cache_key = (
         _static._cache_key(kwargs_snapshot) if disk_cache else None

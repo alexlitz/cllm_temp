@@ -18,8 +18,8 @@ from c4_release.neural_vm.unified_compiler.positional_invariant import (
 from c4_release.neural_vm.vm_step import (
     Token,
     _SetDim,
-    _set_layer15_memory_lookup,
 )
+from tests.oracles.vm_step_layer_bakes import _set_layer15_memory_lookup
 
 
 class _StubFFN:

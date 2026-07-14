@@ -29,7 +29,8 @@ from c4_release.neural_vm.unified_compiler.ops.l10_ops import (
     make_layer10_alu_op,
 )
 from c4_release.neural_vm.unified_compiler.primitives import Primitives
-from c4_release.neural_vm.vm_step import _SetDim, _set_layer10_alu
+from c4_release.neural_vm.vm_step import _SetDim
+from tests.oracles.vm_step_layer_bakes import _set_layer10_alu
 
 
 _L10_HIDDEN_DIM = 2048  # comfortable margin above the 1846-unit footprint

@@ -46,8 +46,10 @@ from neural_vm.vm_step import (  # noqa: E402
     _set_threshold_attn,
     _set_bz_bnz_relay,
     _set_stack0_carry_attn,
-    _set_layer4_pc_relay,
     _set_layer5_fetch,
+)
+from tests.oracles.vm_step_layer_bakes import (  # noqa: E402
+    _set_layer4_pc_relay,
     _set_layer7_memory_heads,
     _set_layer8_multibyte_fetch,
     _set_layer8_sp_gather,

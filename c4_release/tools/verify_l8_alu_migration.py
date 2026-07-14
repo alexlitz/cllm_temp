@@ -61,7 +61,8 @@ sys.path.insert(0, _PKG_ROOT)
 
 import torch
 
-from neural_vm.vm_step import _SetDim, _set_layer8_alu
+from neural_vm.vm_step import _SetDim
+from tests.oracles.vm_step_layer_bakes import _set_layer8_alu
 from neural_vm.unified_compiler.ir import (
     ConditionTerm,
     DimRef,

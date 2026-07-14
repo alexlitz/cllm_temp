@@ -8,7 +8,8 @@ range.
 
 import torch
 
-from c4_release.neural_vm.vm_step import _SetDim, _set_layer9_alu
+from c4_release.neural_vm.vm_step import _SetDim
+from tests.oracles.vm_step_layer_bakes import _set_layer9_alu
 from c4_release.neural_vm.unified_compiler.ir import (
     compare_symbolic_to_lowered_ffn,
     CompilerIR,
@@ -273,7 +274,7 @@ def _legacy_l9_with_marker_suppress() -> _StubFFN:
     :func:`vm_step._set_layer9_alu`, so the comparison helper has to chain
     them to expose units 3398..3404.
     """
-    from c4_release.neural_vm.vm_step import _set_layer9_marker_suppress
+    from tests.oracles.vm_step_layer_bakes import _set_layer9_marker_suppress
     ffn = _StubFFN(hidden_dim=3600)
     n9 = _set_layer9_alu(ffn, 100.0, _SetDim)
     _set_layer9_marker_suppress(ffn, 100.0, _SetDim, n9)

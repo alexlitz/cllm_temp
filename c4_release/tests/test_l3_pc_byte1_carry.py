@@ -13,7 +13,7 @@ from neural_vm.unified_compiler.ops.l3_ops import (
     make_register_default_ffn_op,
 )
 from neural_vm.unified_compiler.primitives import Primitives
-from neural_vm.vm_step import _set_layer3_ffn
+from tests.oracles.vm_step_layer_bakes import _set_layer3_ffn
 
 
 class _StubFFN:

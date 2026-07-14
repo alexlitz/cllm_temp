@@ -8,9 +8,9 @@ from c4_release.neural_vm.setup_helpers import (
 )
 from c4_release.neural_vm.vm_step import (
     _SetDim,
-    _set_layer4_ffn,
     _set_opcode_decode_ffn,
 )
+from tests.oracles.vm_step_layer_bakes import _set_layer4_ffn
 from c4_release.neural_vm.unified_compiler.ops.l1_ops import _bake_layer1_ffn
 from c4_release.neural_vm.unified_compiler.ops.l2_ops import (
     _bake_layer2_mem_byte_flags,

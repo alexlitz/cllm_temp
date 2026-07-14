@@ -70,7 +70,8 @@ from neural_vm.unified_compiler.ops.l15_ops import (  # noqa: E402
     lower_l15_psh_stack_ir,
     make_l15_psh_stack_ir,
 )
-from neural_vm.vm_step import _SetDim, _set_layer15_memory_lookup  # noqa: E402
+from neural_vm.vm_step import _SetDim  # noqa: E402
+from tests.oracles.vm_step_layer_bakes import _set_layer15_memory_lookup  # noqa: E402
 
 from ._per_op_audit import (  # noqa: E402
     assert_no_drift,

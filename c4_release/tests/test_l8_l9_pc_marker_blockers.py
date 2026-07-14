@@ -5,6 +5,8 @@ import torch
 from neural_vm.vm_step import (
     AddSubBytePropagationPostOp,
     _SetDim,
+)
+from tests.oracles.vm_step_layer_bakes import (
     _set_layer8_alu,
     _set_layer9_alu,
 )
