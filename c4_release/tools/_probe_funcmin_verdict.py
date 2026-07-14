@@ -62,7 +62,7 @@ def main():
     ff = runner.run_batch_fail_fast(
         bcs, data_list=datas, max_steps=None,
         expected_steps_list=decl_steps_l,
-        max_context_window=2048, spec_k=32, criterion="full_trace",
+        max_context_window=2048, spec_k=0, criterion="full_trace",
     )
     for (pid, exp, desc, decl_exit), res in zip(metas, ff):
         status = res.get("status")
