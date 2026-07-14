@@ -719,7 +719,10 @@ _CMP_OPCODES: tuple[str, ...] = (
 #                                deleted via C4_CLEAN_OPERAND_BITWISE)
 # ADD/SUB are deliberately EXCLUDED: they carry no SeRecover (their byte-1 /
 # carry cascade sources operand-A differently) so blocking them is out of scope.
-_SPARE_OPCODES: tuple[str, ...] = _CMP_OPCODES + (
+# The ARITHMETIC/BITWISE opcodes whose downstream engines (L10 wide_mul,
+# L11 divmod, L10 bitwise) read operand-A directly from the RAW ALU_LO/HI@AX
+# band. These MUST survive the L9 clear or the engine reads a crushed operand.
+_SPARE_OPCODES_ARITH: tuple[str, ...] = (
     "OP_MUL",
     "OP_DIV",
     "OP_MOD",
@@ -727,6 +730,54 @@ _SPARE_OPCODES: tuple[str, ...] = _CMP_OPCODES + (
     "OP_XOR",
     "OP_AND",
 )
+
+
+def _spare_cmp_raw_enabled() -> bool:
+    """``C4_ALU_OPERAND_SURVIVE_CMP_RAW`` — DEFAULT-OFF (scoped func_min fix).
+
+    Controls whether the six CMP opcodes are added to the L9 ALU-clear raw-band
+    spare (``_SPARE_OPCODES``).
+
+    Root (docs/FUNCMIN_FIX_2026_07_13.md): the CMP result is computed from the
+    **SE_ALU** band (the L9 nibble comparator + block-17 head-4 MEM->ALU load
+    head), NOT from the raw ALU_LO/HI@AX band. So keeping the raw ALU@AX band
+    ALIVE on a CMP row does NOT help the comparison — the CMP cascade is
+    byte-identical whether the raw band is crushed or spared. What it DOES do is
+    break func_min (id675): its LT result-writer at logical L14 (physical block
+    29) is gated on the raw ALU@AX band being crushed (all-negative); when the
+    spare keeps it alive that writer no longer fires, so the correct ``0x01`` is
+    lost and the L25 tail leaks ``0xE8``.
+
+    The CMP GAINS (id408 if_eq, id433 if_var, id1088 bool_and) are delivered by
+    the **block-17 head-4 CMP Q-veto** (``model_ops.make_cmp_h4_qveto_op``,
+    which shares the ``C4_ALU_OPERAND_SURVIVE`` flag and is UNCHANGED here), NOT
+    by the raw-band CMP spare. So excluding CMP from the raw-band spare fixes
+    func_min while every CMP gain HOLDS. The deleted ``CmpOperandSeRecoverFFN``
+    stays inert: it recovered raw-from-SE, but the CMP RESULT never read the raw
+    band, so a crushed raw CMP operand is harmless to the verdict.
+
+    DEFAULT-OFF (CMP excluded). Set ``=1`` to restore the original all-CMP-in
+    behaviour (the −4 net configuration the recover masked).
+    """
+    return os.environ.get("C4_ALU_OPERAND_SURVIVE_CMP_RAW", "0") != "0"
+
+
+def _spare_opcodes() -> tuple[str, ...]:
+    """The opcode set added as ``-1e6`` NOT-blockers to the L9 ALU-clear gate.
+
+    Always includes the arithmetic/bitwise opcodes (their engines read the raw
+    ALU@AX band). The six CMP opcodes are added ONLY when
+    ``C4_ALU_OPERAND_SURVIVE_CMP_RAW`` is set (default OFF) — see
+    :func:`_spare_cmp_raw_enabled` for why CMP is excluded by default.
+    """
+    if _spare_cmp_raw_enabled():
+        return _CMP_OPCODES + _SPARE_OPCODES_ARITH
+    return _SPARE_OPCODES_ARITH
+
+
+# Back-compat alias (the original name; now = the arith set unless the CMP-raw
+# opt-in flag is set, resolved at call time via ``_spare_opcodes()``).
+_SPARE_OPCODES: tuple[str, ...] = _SPARE_OPCODES_ARITH
 
 
 def _alu_operand_survive_enabled() -> bool:
@@ -835,7 +886,7 @@ def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     # :func:`_alu_operand_survive_enabled`.
     if _alu_operand_survive_enabled():
         common_conditions = common_conditions + tuple(
-            (op, -1e6) for op in _SPARE_OPCODES
+            (op, -1e6) for op in _spare_opcodes()
         )
 
     # ALU_LO clear (16 units) then ALU_HI clear (16 units).
