@@ -1864,13 +1864,6 @@ def _build_cache_key_snapshot(
         "C4_AX_BYTE1_DUMP": (
             os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
         ),
-        # AX byte-1 sign-extension delivery on a negative LEA-local frame address
-        # (#343; DEFAULT-ON in the campaign config, opt out =0, output-affecting,
-        # no source change): the L10 ADD high-byte adder sign-ext NOT-blocker pair.
-        # The ON / OFF builds must never share a serialised entry.
-        "C4_AX_BYTE1_SIGNEXT_LEA": (
-            os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
-        ),
         # AX high-byte (byte-2/3) all-step zero-default (DEFAULT-OFF; opt in with
         # =1, output-affecting, no source change): appends the l11
         # ``make_ax_hibyte_clear_allstep_op`` FFN + omits the redundant

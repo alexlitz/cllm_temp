@@ -284,10 +284,9 @@ def _arith_guard_addsub_blockers() -> tuple:
 
 
 def _ax_byte1_signext_lea_enabled() -> bool:
-    """Flag for the AX byte-1 sign-extension delivery on a negative LEA-local
-    frame address (#343 — the #325 byte-0 follow-up). DEFAULT ON wherever the
-    campaign STACK0 emission is dropped (``C4_NO_STACK0_EMIT=1``); opt-out via
-    ``C4_AX_BYTE1_SIGNEXT_LEA=0``.
+    """Gate for the AX byte-1 sign-extension delivery on a negative LEA-local
+    frame address (#343 — the #325 byte-0 follow-up). Active wherever the
+    campaign STACK0 emission is dropped (``C4_NO_STACK0_EMIT=1``).
 
     The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
     config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; tools/
@@ -336,19 +335,16 @@ def _ax_byte1_signext_lea_enabled() -> bool:
     This PREVENTS the 2e16 nuke (rather than out-writing it), so no astronomical
     write magnitude is needed.
 
-    DEFAULT tracks ``operand_from_memsp_enabled()`` (the adder's own campaign
-    branch): the blockers are added ONLY in the 30-token campaign config and ONLY
-    when this flag is on, so flag-OFF (``=0``), ``C4_NO_STACK0_EMIT=0``, or the
-    35-token golden build are all byte-identical to the pre-fix default (golden
-    ``4958b35b`` never enters the campaign adder branch). Dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_AX_BYTE1_SIGNEXT_LEA`` can A/B it.
+    The blockers are added ONLY in the 30-token campaign config, so
+    ``C4_NO_STACK0_EMIT=0`` or the 35-token golden build are byte-identical to
+    the pre-fix default (golden ``4958b35b`` never enters the campaign adder
+    branch). This is UNCONDITIONAL under campaign as of the P5 flag-retire
+    2026-07-14 (the former ``C4_AX_BYTE1_SIGNEXT_LEA`` escape hatch was retired
+    as a proven default-ON fix).
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    return no_stack0_emit_enabled()
 
 
 def _ax_byte1_signext_lea_blockers() -> tuple:
