@@ -220,7 +220,7 @@ def _mul_b1_delivery_enabled() -> bool:
     the JSR spec (``mul_b1_blocker=True``), evaluated at bake time so the flag
     gates cleanly. See docs/MUL_B1_LAND_2026_07_13.md.
     """
-    return _os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
+    return _os.environ.get("C4_MUL_B1_DELIVERY", "1") != "0"
 
 
 def _addr_key_neural_decode_unit_count() -> int:
