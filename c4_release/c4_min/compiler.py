@@ -26,6 +26,7 @@ from typing import List
 import torch
 
 from . import isa
+from . import control
 from .dsl import FFNRule, LinearExpr
 from .compile_ffn import compile_ffn, compile_fold
 from .layout import Layout
@@ -34,6 +35,14 @@ from .model import Transformer
 
 VOCAB = 257
 HALT_TOKEN = 256
+
+# Control-flow ops that need PC-driven dispatch (a computed next-PC).
+_CONTROL_OPS = frozenset({isa.JMP, isa.BZ, isa.BNZ})
+
+
+def has_control_flow(code) -> bool:
+    """True iff any instruction sets PC by other than the sequential +1."""
+    return any(ins.op in _CONTROL_OPS for ins in code)
 
 
 def _step_rules(L: Layout, ins: isa.Instr) -> List[FFNRule]:
@@ -90,12 +99,32 @@ def _build_layout(n_steps: int, n_heads: int) -> Layout:
     return L
 
 
-def compile_program(prog, n_heads: int = 4, max_pos: int = 4):
+def _build_pc_layout(n_code: int, max_steps: int, n_heads: int) -> Layout:
+    """Layout for the PC-driven build: a PC one-hot band (size n_code), one
+    per-executed-step OUTPUT slot, and one per-step HALT-seen snapshot slot."""
+    L = Layout(n_heads=n_heads)
+    L.PC_IS = [L._band(f"PC_IS_{i}", 1) for i in range(n_code)]
+    L.OUT_SLOTS = [L._band(f"OUT_{k}", 1) for k in range(max_steps)]
+    L.HALT_SEEN = [L._band(f"HSEEN_{k}", 1) for k in range(max_steps)]
+    while L._off % n_heads != 0:
+        L._band(f"_pad2_{L._off}", 1)
+    L.D = L._off
+    return L
+
+
+def compile_program(prog, n_heads: int = 4, max_pos: int = 4, max_steps=None):
     """Compile [(name, imm), ...] into a depth-unrolled Transformer.
 
-    Returns (model, layout, code). One op-block + one emit-block per VM step.
+    Straight-line programs use the per-position op bake (one op-block + one
+    emit-block per instruction). Programs with control flow (JMP/BZ/BNZ) use the
+    **PC-driven dispatch** build (``compile_program_pc``): each unrolled block is a
+    universal VM step that fetches + executes the instruction at the runtime PC.
+    Returns (model, layout, code).
     """
     code = isa.assemble(prog)
+    if has_control_flow(code):
+        return compile_program_pc(code, n_heads=n_heads, max_pos=max_pos,
+                                  max_steps=max_steps)
     n_steps = len(code)
     L = _build_layout(n_steps, n_heads)
     dim = L.D
@@ -177,12 +206,64 @@ def _load_head(model, L):
     model.lm_bias.copy_(b)
 
 
+def compile_program_pc(code, n_heads: int = 4, max_pos: int = 4, max_steps=None):
+    """PC-DRIVEN build: each unrolled block is a universal VM step that dispatches
+    on the runtime PC (so a computed branch selects the right next instruction).
+
+    Per step-block pipeline (all pure FFN, single position; see CONTROL_FLOW.md):
+      1. fetch   — PC scalar -> PC one-hot ``PC_IS[i]`` + ``AX_ZERO`` predicate.
+      2. dispatch— rules gated on ``PC_IS[i]`` apply code[i]'s AX/STACK0 effect
+                   AND the PC update (sequential +1 or branch target).
+      3. fold    — AX mod-256 (unconditional; a no-op unless AX overflowed a byte).
+      4. emit    — copy post-step AX into this step's OUT slot; snapshot HALTED.
+
+    Unrolls ``max_steps`` step-blocks (bounded depth suffices for the corpus — no
+    unbounded loops). ``run`` reads the trace up to the first halted step.
+    """
+    n_code = len(code)
+    if max_steps is None:
+        max_steps = 2 * n_code + 4          # generous bound; every op advances >=1
+    L = _build_pc_layout(n_code, max_steps, n_heads)
+    dim = L.D
+
+    fetch = control.compile_pc_fetch(L.PC, L.AX, L.PC_IS, L.AX_ZERO, L.ONE, dim)
+    disp_rules = control.dispatch_rules(L, code, L.PC_IS)
+
+    ffn_specs = []
+    for k in range(max_steps):
+        ffn_specs.append(fetch)
+        ffn_specs.append(compile_ffn(disp_rules, dim))
+        ffn_specs.append(compile_fold(L.AX, L.ONE, dim, modulus=256))
+        # emit AX -> OUT_k ; snapshot cumulative HALTED -> HALT_SEEN_k
+        ffn_specs.append(compile_ffn([
+            FFNRule([(L.ONE, 0.5, 1.5)], {L.OUT_SLOTS[k]: LinearExpr.of(L.AX, 1.0)}),
+            FFNRule([(L.ONE, 0.5, 1.5)], {L.HALT_SEEN[k]: LinearExpr.of(L.HALTED, 1.0)}),
+        ], dim))
+    n_blocks = len(ffn_specs)
+    hidden = max(f["W_up"].shape[0] for f in ffn_specs) if ffn_specs else 1
+
+    model = Transformer(dim=dim, n_heads=n_heads, hidden=hidden,
+                        n_blocks=n_blocks, max_pos=max_pos, vocab=VOCAB)
+
+    with torch.no_grad():
+        model.embed.zero_()
+        model.embed[0, L.ONE] = 1.0
+        # PC starts at 0 (already zero); AX/SP/BP/STACK0 start at 0.
+        for blk, spec in zip(model.blocks, ffn_specs):
+            _zero_attn(blk.attn)
+            _load_ffn(blk.ffn, spec, hidden)
+        _load_head(model, L)
+
+    return model, L, code
+
+
 def run(model, L, code):
     """Run the depth-unrolled model; decode the per-step AX trace via the LM head.
 
     Each VM step k is decoded as ``argmax_v head(OUT_k)`` — a genuine argmax over
-    the 257-way vocab (byte values + HALT), stride-free. HALT token wins on the
-    step whose HALTED band is set.
+    the 257-way vocab (byte values + HALT), stride-free. For the PC-driven build
+    the model unrolls a fixed ``max_steps``; we truncate the returned trace at the
+    first step whose HALT-seen snapshot fired (the executed step count).
     """
     import torch.nn.functional as F
 
@@ -192,12 +273,15 @@ def run(model, L, code):
         x = blk(x)
     state = x[0, 0]  # [D]
 
+    n_slots = len(L.OUT_SLOTS)
     out = []
-    for k in range(len(code)):
-        # value trace = AX byte per step (no HALT token in the value channel).
+    halt_seen = getattr(L, "HALT_SEEN", None)
+    for k in range(n_slots):
         W, b = head_matrix(L, model.dim, L.OUT_SLOTS[k], halt_band=None)
         logits = F.linear(state, W, b)  # [VOCAB]
         out.append(int(logits.argmax().item()))
+        if halt_seen is not None and float(state[halt_seen[k]]) > 0.5:
+            break                        # this step executed HALT -> stop the trace
     return out
 
 

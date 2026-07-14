@@ -55,6 +55,48 @@ def test_halt_terminator_fires():
     assert compiler.halted(model, L, code) is True
 
 
+def test_jmp_forward_skips():
+    """JMP 2 skips IMM 99 and lands on IMM 5 -> exit 5, 3 executed steps."""
+    got, ref = _check([("JMP", 2), ("IMM", 99), ("IMM", 5), ("HALT", 0)])
+    assert got[-1] == 5
+    assert len(got) == 3  # JMP; IMM 5; HALT (IMM 99 skipped)
+
+
+def test_bz_taken_and_nottaken():
+    """BZ branches iff AX==0; both paths decode correctly + at the right length."""
+    # AX==0 -> branch to idx 3 (skip IMM 99), exit 7.
+    taken, _ = _check([("IMM", 0), ("BZ", 3), ("IMM", 99), ("IMM", 7), ("HALT", 0)])
+    assert taken[-1] == 7
+    # AX!=0 -> fall through to IMM 42, exit 42.
+    nottaken, _ = _check([("IMM", 1), ("BZ", 3), ("IMM", 42), ("HALT", 0)])
+    assert nottaken[-1] == 42
+
+
+def test_bnz_taken_and_nottaken():
+    """BNZ branches iff AX!=0 (mirror of BZ)."""
+    taken, _ = _check([("IMM", 1), ("BNZ", 3), ("IMM", 99), ("IMM", 7), ("HALT", 0)])
+    assert taken[-1] == 7
+    nottaken, _ = _check([("IMM", 0), ("BNZ", 3), ("IMM", 42), ("HALT", 0)])
+    assert nottaken[-1] == 42
+
+
+def test_if_then_else_computed_predicate():
+    """if a==b then X else Y, with the branch predicate COMPUTED at runtime (SUB).
+
+    Proves depth=time control flow: the instruction executed after BZ depends on
+    the runtime a-b, and the not-taken branch's instructions are correctly
+    skipped. THEN-path and ELSE-path decode byte-exact vs the reference.
+    """
+    def ite(a, b, X, Y):
+        return [("IMM", a), ("PSH", 0), ("IMM", b), ("SUB", 0),
+                ("BZ", 7), ("IMM", Y), ("JMP", 8), ("IMM", X), ("HALT", 0)]
+
+    for a, b, X, Y in [(5, 5, 111, 222), (5, 7, 111, 222),
+                       (9, 9, 42, 99), (3, 8, 42, 99)]:
+        got, ref = _check(ite(a, b, X, Y))
+        assert got[-1] == (X if a == b else Y), (a, b, got)
+
+
 def test_carry_forward_attention():
     """carry_forward_head copies a band from position t-1 to t (t=0 keeps self)."""
     import torch
@@ -107,6 +149,8 @@ if __name__ == "__main__":
         test_imm_add_halt, test_sub, test_sub_underflow_wraps_mod_256,
         test_add_wraps_mod_256,
         test_imm_only, test_halt_terminator_fires,
+        test_jmp_forward_skips, test_bz_taken_and_nottaken,
+        test_bnz_taken_and_nottaken, test_if_then_else_computed_predicate,
         test_carry_forward_attention, test_content_match_attention,
     ]
     passed = 0

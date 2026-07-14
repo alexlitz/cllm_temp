@@ -34,6 +34,10 @@ class Layout:
         self.OUTPUT = self._scalar("OUTPUT")
         self.HALTED = self._scalar("HALTED")
 
+        # control-flow scratch (PC-driven dispatch, see CONTROL_FLOW.md):
+        #   AX_ZERO  == relu(1-AX): 1.0 iff AX==0 (branch predicate for BZ/BNZ)
+        self.AX_ZERO = self._scalar("AX_ZERO")
+
         # constant bias lane (baked to 1.0 in the embedding, never written)
         self.ONE = self._scalar("ONE")
 
