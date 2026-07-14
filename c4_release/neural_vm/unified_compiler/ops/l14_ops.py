@@ -190,39 +190,6 @@ def _l14_byte_computed_enabled() -> bool:
     return _os.environ.get("C4_L14_BYTE_COMPUTED", "0") != "0"
 
 
-def _mul_b1_delivery_enabled() -> bool:
-    """MUL byte-1 delivery: block the JSR AX-bytes-zero clear on MUL/SHL rows.
-
-    ROOT (proven, 2026-07-13, tools/_probe_jsr_residue.py + _probe_blk34_rule.py,
-    spec_k=0 faithful-autoregressive): the wide-MUL byte-1 relay
-    (``layer15_alu_high_byte_relay`` head 8) already stages+delivers the derived
-    result byte 1 (``AX_FULL_LO/HI+idx`` -> ``OUTPUT_LO/HI+idx`` scale 20) on the
-    byte-1 AX-emit row — IDENTICALLY for the passing (idx110/idx100) AND failing
-    (idx104/idx106) muls (head-8 attn=1.0 to the marker, delivered OUTPUT_LO+5=40
-    for ALL). The failing muls drop byte 1 NOT because the relay fails, but
-    because block 34 (the ``layer14_jsr_ax_bytes_zero`` clear) pre-slams OUTPUT to
-    the byte-0-default: idx104/106 carry a SPURIOUS ``OP_JSR`` residue (~0.22) on
-    the byte-1 emit row of a genuine MUL step. In the 30-token campaign frame the
-    ``OP_JSR`` gate weight is amplified to 40 (the var_three positional-dip
-    re-anchor), so ``silu(0.22*40)=silu(8.85)`` fires the clear HARD, slamming
-    OUTPUT_LO/HI to -3/S on every lane and +5/S on lane 0 -> byte 0 wins -> byte 1
-    = 0x00. The passing muls (idx110/idx100) have ``OP_JSR~=0`` there so the clear
-    never fires and head-8's +40 lands cleanly (byte 1 = 0x05).
-
-    FIX: the ``layer14_jsr_ax_bytes_zero`` clear is only meant for GENUINE JSR
-    steps (where ``AX`` bytes 1-3 must be 0x00). A MUL/SHL step's byte 1 is a real
-    result byte and must NOT be zeroed. Add a hard ``OP_MUL``/``OP_SHL`` W_up
-    blocker (weight -30, S-scaled) to the JSR spec's 4 clear units so ``up`` is
-    driven far negative (``silu(up)~=0``) whenever a MUL/SHL opcode is present on
-    the row — cancelling the spurious mis-fire — while leaving genuine JSR rows
-    (``OP_MUL==OP_SHL==0``) byte-for-byte unchanged. Output-affecting; flag OFF ->
-    byte-identical golden. Reconstructed onto the EMIT-G5 fold: applied only to
-    the JSR spec (``mul_b1_blocker=True``), evaluated at bake time so the flag
-    gates cleanly. See docs/MUL_B1_LAND_2026_07_13.md.
-    """
-    return _os.environ.get("C4_MUL_B1_DELIVERY", "1") != "0"
-
-
 def _addr_key_neural_decode_unit_count() -> int:
     """FFN units the ``layer14_addr_key_neural_decode`` op emits.
 
@@ -2965,7 +2932,10 @@ def _ax_bytes_zero_rules(spec, S):
     # spec sets ``mul_b1_blocker`` (see ``_mul_b1_delivery_enabled``); evaluated
     # here at bake time so the flag gates cleanly (matches the ``gate_weight_fn``
     # idiom).
-    if spec.mul_b1_blocker and _mul_b1_delivery_enabled():
+    if spec.mul_b1_blocker:
+        # MUL byte-1 delivery (formerly C4_MUL_B1_DELIVERY, RETIRED 2026-07-14;
+        # proven default-ON fix now unconditional). Only the JSR spec sets
+        # mul_b1_blocker, so genuine JSR rows (OP_MUL==OP_SHL==0) are unchanged.
         common_conditions = common_conditions + (
             ("OP_MUL", -30.0),
             ("OP_SHL", -30.0),
@@ -3063,10 +3033,10 @@ def _make_ax_bytes_zero_op(spec):
         claims.add((14, "ffn_W_down", str(c + 3), "OUTPUT_HI+0"))
 
     reads = set(spec.reads)
-    if spec.mul_b1_blocker and _mul_b1_delivery_enabled():
-        # C4_MUL_B1_DELIVERY adds an OP_MUL/OP_SHL W_up blocker to the JSR
-        # clear units (see ``_ax_bytes_zero_rules`` / ``_mul_b1_delivery_enabled``),
-        # so the op now reads those two opcode one-hots.
+    if spec.mul_b1_blocker:
+        # MUL byte-1 delivery (formerly C4_MUL_B1_DELIVERY, RETIRED 2026-07-14):
+        # the OP_MUL/OP_SHL W_up blocker on the JSR clear units means the op
+        # reads those two opcode one-hots.
         reads = reads | {"OP_MUL", "OP_SHL"}
 
     kwargs = dict(

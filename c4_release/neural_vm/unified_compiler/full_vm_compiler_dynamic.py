@@ -2394,13 +2394,6 @@ def _build_cache_key_snapshot(
         "C4_DIV_MULTIPASS": (
             os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
         ),
-        # MUL byte-1 delivery (DEFAULT-OFF, opt in =1): OP_MUL/OP_SHL W_up
-        # blocker on the ``layer14_jsr_ax_bytes_zero`` clear units (idx104/idx106
-        # spurious-OP_JSR-leak). Output-affecting → ON / OFF builds must never
-        # share a serialised cache entry. See ops/l14_ops._mul_b1_delivery_enabled.
-        "C4_MUL_B1_DELIVERY": (
-            os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
-        ),
         # Combined ALU operand-survival fix (DEFAULT-ON, opt out =0,
         # WEIGHT+BAKE-affecting): the block-15 L9-clear operand spare
         # (l9_ops._alu_operand_survive_enabled -- extra W_up NOT-blocker
