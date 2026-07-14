@@ -11531,7 +11531,7 @@ def _resolve_l10_postop_d_model(block, dim_positions) -> int:
     Prefers ``block.attn.dim`` -> ``block.attn.W_q.shape[0]`` ->
     ``block.ffn.W_up.shape[1]`` -> ``max(dim_positions.values())+1`` -> 512.
     Verbatim extraction of the 13-line ladder copied into every tail post-op
-    bake (14 copies incl. ``make_l10_post_op_attach_op`` / ``_absdiff_ret_bake``).
+    bake (also present in ``make_l10_post_op_attach_op``).
     """
     d_model = None
     attn = getattr(block, "attn", None)
@@ -12483,63 +12483,16 @@ def make_l10_jsr_bp_byte3_clear_op() -> Operation:
     """
     from .shared import jsr_bp_byte3_clear_enabled
 
-    if not jsr_bp_byte3_clear_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="l10_jsr_bp_byte3_clear",
-            reads=set(),
-            writes=set(),
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            compiler_ir=CompilerIR(),
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="BLOG_SPEC.md#registers",
-        )
-
-    rules = _l10_jsr_bp_byte3_clear_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical golden ``f725c06e``).
+    # Run in the LATE L25 tail AFTER tail_bit32_result_correction (the
+    # OUTPUT-band amplifier chain) -- mirror of make_l10_add_high_byte_adder_op --
+    # so this is the LAST OUTPUT writer at the JSR-step BP byte-3 predictor row
+    # and DOMINATES the block-58 amplifier (a post_ops_combined placement runs at
+    # phase 10.5, BEFORE the amplifier, and gets overwritten).
+    return _make_l10_postop(
         name="l10_jsr_bp_byte3_clear",
+        rules_fn=_l10_jsr_bp_byte3_clear_rules,
         reads={
             "OP_JSR", "H1", "IS_BYTE", "HAS_SE",
             "BYTE_INDEX_0", "BYTE_INDEX_1", "BYTE_INDEX_2", "BYTE_INDEX_3",
@@ -12547,19 +12500,9 @@ def make_l10_jsr_bp_byte3_clear_op() -> Operation:
             "OUTPUT_LO", "OUTPUT_HI_THIS_STEP",
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        kind="block",
-        target_op_name="l10_post_ops_combined",
-        # Run in the LATE L25 tail AFTER tail_bit32_result_correction (the
-        # OUTPUT-band amplifier chain) -- mirror of make_l10_add_high_byte_adder_op
-        # -- so this is the LAST OUTPUT writer at the JSR-step BP byte-3 predictor
-        # row and DOMINATES the block-58 amplifier (a post_ops_combined placement
-        # runs at phase 10.5, BEFORE the amplifier, and gets overwritten).
         requires={"after": "tail_bit32_result_correction"},
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
+        suppress=False,
+        flag_fn=jsr_bp_byte3_clear_enabled,
         spec_section="BLOG_SPEC.md#registers",
     )
 
@@ -12650,63 +12593,13 @@ def make_l10_absdiff_argb_li_lo_op() -> Operation:
     post_op -> byte-identical to golden ``b1dcae63``. See
     ``absdiff_fix_enabled`` / ``_l10_absdiff_argb_li_lo_rules``.
     """
-    if not absdiff_fix_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="l10_absdiff_argb_li_lo",
-            reads=set(),
-            writes=set(),
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            compiler_ir=CompilerIR(),
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="BLOG_SPEC.md#registers",
-        )
-
-    rules = _l10_absdiff_argb_li_lo_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical golden ``b1dcae63``).
+    # Run AFTER l10_loop_lea_b0_e0 so this is the LAST OUTPUT-LO writer at the
+    # arg-b LI row (it must dominate the L15 head-0 address-0 contamination).
+    return _make_l10_postop(
         name="l10_absdiff_argb_li_lo",
+        rules_fn=_l10_absdiff_argb_li_lo_rules,
         reads={
             "MARK_AX", "OP_LI", "MEM_ADDR_SRC", "IS_BYTE",
             "ADDR_B0_LO", "ADDR_B0_HI",
@@ -12715,16 +12608,9 @@ def make_l10_absdiff_argb_li_lo_op() -> Operation:
             *_L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS,
         },
         writes={"OUTPUT_LO"},
-        kind="block",
-        target_op_name="l10_post_ops_combined",
-        # Run AFTER l10_loop_lea_b0_e0 so this is the LAST OUTPUT-LO writer at the
-        # arg-b LI row (it must dominate the L15 head-0 address-0 contamination).
         requires={"after": "l10_loop_lea_b0_e0"},
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
+        suppress=False,
+        flag_fn=absdiff_fix_enabled,
         spec_section="BLOG_SPEC.md#registers",
     )
 
@@ -12871,63 +12757,6 @@ def _l10_absdiff_ret_byte1_rules() -> tuple[FFNRule, ...]:
     return tuple(rules)
 
 
-def _noop_block_op(name: str) -> Operation:
-    """A ``kind="block"`` post_op that appends nothing (flag-OFF path)."""
-    def _noop_bake(block, dim_positions, S):
-        del block, dim_positions, S
-
-    return Operation(
-        name=name,
-        reads=set(),
-        writes=set(),
-        kind="block",
-        target_op_name="l10_post_ops_combined",
-        declarative_bake_fn=_noop_bake,
-        declarative_authority="spec_generated",
-        compiler_ir=CompilerIR(),
-        migrated=True,
-        smoke_tests={"all"},
-        spec_section="BLOG_SPEC.md#registers",
-    )
-
-
-def _absdiff_ret_bake(rules):
-    """Return a ``bake`` closure that lowers ``rules`` into a fresh PureFFN
-    post_op on the tail block (shared by the flag + corrector ops)."""
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-    return bake
-
-
 def make_l10_absdiff_ret_byte1_flag_op() -> Operation:
     """Flag-gated PRECURSOR: writes the bounded ``ABSDIFF_RET_LEAK`` l6-crush flag.
 
@@ -12936,24 +12765,16 @@ def make_l10_absdiff_ret_byte1_flag_op() -> Operation:
     flag). Flag-OFF -> ZERO rules, NO post_op, NO band -> byte-identical to golden
     ``f725c06e``. See ``_l10_absdiff_ret_byte1_flag_rules``.
     """
-    if not absdiff_ret_byte1_enabled():
-        return _noop_block_op("l10_absdiff_ret_byte1_flag")
-
-    rules = _l10_absdiff_ret_byte1_flag_rules()
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical golden ``f725c06e``).
+    return _make_l10_postop(
         name="l10_absdiff_ret_byte1_flag",
+        rules_fn=_l10_absdiff_ret_byte1_flag_rules,
         reads={"OUTPUT_LO"},
         writes={"ABSDIFF_RET_LEAK"},
-        kind="block",
-        target_op_name="l10_post_ops_combined",
         requires={"after": "tail_bit32_result_correction"},
-        declarative_bake_fn=_absdiff_ret_bake(rules),
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
+        suppress=False,
+        flag_fn=absdiff_ret_byte1_enabled,
         spec_section="BLOG_SPEC.md#registers",
     )
 
@@ -12969,66 +12790,24 @@ def make_l10_absdiff_ret_byte1_op() -> Operation:
     appends NO post_op -> byte-identical to golden ``f725c06e``. See
     ``absdiff_ret_byte1_enabled`` / ``_l10_absdiff_ret_byte1_rules``.
     """
-    if not absdiff_ret_byte1_enabled():
-        return _noop_block_op("l10_absdiff_ret_byte1")
-
-    rules = _l10_absdiff_ret_byte1_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical golden ``f725c06e``).
+    # Run AFTER the flag op (fresh ABSDIFF_RET_LEAK), hence after
+    # tail_bit32_result_correction -> this is the LAST OUTPUT-LO writer at the AX
+    # return-byte row (it must dominate the L6 stale-marker OUTPUT_LO leak that
+    # persists into the tail block).
+    return _make_l10_postop(
         name="l10_absdiff_ret_byte1",
+        rules_fn=_l10_absdiff_ret_byte1_rules,
         reads={
             "OP_LEV", "IS_BYTE", "ABSDIFF_RET_LEAK", "PSH_AT_SP", "MARK_STACK0",
             "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP", "MARK_MEM",
             "MEM_ADDR_SRC", "OUTPUT_LO",
         },
         writes={"OUTPUT_LO"},
-        kind="block",
-        target_op_name="l10_post_ops_combined",
-        # Run AFTER the flag op (fresh ABSDIFF_RET_LEAK), hence after
-        # tail_bit32_result_correction -> this is the LAST OUTPUT-LO writer at the
-        # AX return-byte row (it must dominate the L6 stale-marker OUTPUT_LO leak
-        # that persists into the tail block).
         requires={"after": "l10_absdiff_ret_byte1_flag"},
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
+        suppress=False,
+        flag_fn=absdiff_ret_byte1_enabled,
         spec_section="BLOG_SPEC.md#registers",
     )
 
@@ -13121,82 +12900,26 @@ def make_l10_loop_si_byterow_marker_clear_op() -> Operation:
     ``loop_si_byterow_marker_clear_enabled`` /
     ``_l10_loop_si_byterow_marker_clear_rules``.
     """
-    if not loop_si_byterow_marker_clear_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="l10_loop_si_byterow_marker_clear",
-            reads=set(),
-            writes=set(),
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            compiler_ir=CompilerIR(),
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="BLOG_SPEC.md#registers",
-        )
-
-    rules = _l10_loop_si_byterow_marker_clear_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        # NOTE: deliberately NOT calling _suppress_ffn_on_step_boundary here: the
-        # op is INTENDED to fire on value-byte rows (IS_BYTE=1); the boundary
-        # suppressor would gate exactly those rows off. The IS_BYTE gate + the
-        # hard marker NOT-blocks already restrict it to value-byte rows.
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical golden ``5acb3d23``).
+    # Writes the shared opcode dims the tail bank reads; the produces/consumes dep
+    # (tail_bit32 reads MEM_STORE / OP_SI) orders this op BEFORE the tail bank so
+    # the bias lands before the -1e8 NOT-blocker reads it.
+    #
+    # ``suppress=False`` is LOAD-BEARING: the op is INTENDED to fire on value-byte
+    # rows (IS_BYTE=1); ``_suppress_ffn_on_step_boundary`` would gate exactly those
+    # rows off. The IS_BYTE gate + the hard marker NOT-blocks already restrict it
+    # to value-byte rows.
+    return _make_l10_postop(
         name="l10_loop_si_byterow_marker_clear",
+        rules_fn=_l10_loop_si_byterow_marker_clear_rules,
         reads={
             "IS_BYTE", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
             "MARK_STACK0", "MARK_MEM",
         },
-        # Writes the shared opcode dims the tail bank reads; the produces/consumes
-        # dep (tail_bit32 reads MEM_STORE / OP_SI) orders this op BEFORE the tail
-        # bank so the bias lands before the -1e8 NOT-blocker reads it.
         writes={"MEM_STORE", "OP_SI"},
-        kind="block",
-        target_op_name="l10_post_ops_combined",
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
+        suppress=False,
+        flag_fn=loop_si_byterow_marker_clear_enabled,
         spec_section="BLOG_SPEC.md#registers",
     )
 
@@ -13292,84 +13015,32 @@ def make_l10_loop_li_opcode_fetch_addrkey_clamp_op() -> Operation:
     byte-identical to golden. See ``loop_li_opcode_fetch_addrkey_clamp_enabled``
     / ``_l10_loop_li_opcode_fetch_addrkey_clamp_rules``.
     """
-    if not loop_li_opcode_fetch_addrkey_clamp_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="l10_loop_li_fetch_addrkey_clamp",
-            reads=set(),
-            writes=set(),
-            kind="block",
-            target_op_name="layer3_carry_forward_attn",
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            compiler_ir=CompilerIR(),
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="BLOG_SPEC.md#memory",
-        )
-
-    rules = _l10_loop_li_opcode_fetch_addrkey_clamp_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        # Fires on prompt code-byte rows (IS_BYTE=1, no marker); do NOT call
-        # _suppress_ffn_on_step_boundary (it would gate exactly those rows).
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical).
+    #
+    # ``target_op_name="layer3_carry_forward_attn"`` binds to the L3
+    # carry_forward attention op (block 3) -- the HOME of the
+    # ``_pc_byte1_prev_head_spec`` head that creates the ADDR_KEY+32 doubling. A
+    # block post_op here runs at block 3 AFTER that head, so the clamp lands in the
+    # residual stream BEFORE the L5 opcode fetch (block 6) reads it. (The L4 FFN
+    # dep anchor resolves to block 6 in the dynamic schedule, so an L4-anchored
+    # post_op would run AFTER the fetch -- too late.)
+    #
+    # ``suppress=False`` is LOAD-BEARING: the op fires on prompt code-byte rows
+    # (IS_BYTE=1, no marker); ``_suppress_ffn_on_step_boundary`` would gate exactly
+    # those rows off.
+    return _make_l10_postop(
         name="l10_loop_li_fetch_addrkey_clamp",
+        rules_fn=_l10_loop_li_opcode_fetch_addrkey_clamp_rules,
         reads={
             "IS_BYTE", "MARK_PC", "MARK_AX", "MARK_SP", "MARK_BP",
             "MARK_STACK0", "MARK_MEM", "ADDR_KEY",
         },
         writes={"ADDR_KEY"},
-        kind="block",
-        # Bind to the L3 carry_forward attention op (block 3) -- the HOME of the
-        # ``_pc_byte1_prev_head_spec`` head that creates the ADDR_KEY+32 doubling.
-        # A block post_op here runs at block 3 AFTER that head, so the clamp lands
-        # in the residual stream BEFORE the L5 opcode fetch (block 6) reads it.
-        # (The L4 FFN dep anchor resolves to block 6 in the dynamic schedule, so
-        # an L4-anchored post_op would run AFTER the fetch -- too late.)
         target_op_name="layer3_carry_forward_attn",
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
         spec_section="BLOG_SPEC.md#memory",
+        suppress=False,
+        flag_fn=loop_li_opcode_fetch_addrkey_clamp_enabled,
     )
 
 
@@ -13468,64 +13139,14 @@ def make_l10_exit_axcarry_op() -> Operation:
     ON ships ``test_simple_function`` (-> 42) under the 6 LEV flags. See
     ``_l10_exit_axcarry_enabled`` / ``_l10_exit_axcarry_rules``.
     """
-    if not _l10_exit_axcarry_enabled():
-        def _noop_bake(block, dim_positions, S):
-            del block, dim_positions, S
-
-        return Operation(
-            name="l10_exit_axcarry",
-            reads=set(),
-            writes=set(),
-            kind="block",
-            target_op_name="l10_post_ops_combined",
-            declarative_bake_fn=_noop_bake,
-            declarative_authority="spec_generated",
-            compiler_ir=CompilerIR(),
-            migrated=True,
-            smoke_tests={"all"},
-            spec_section="BLOG_SPEC.md#function-call",
-        )
-
-    rules = _l10_exit_axcarry_rules()
-
-    def bake(block, dim_positions, S):
-        from ...base_layers import PureFFN
-
-        d_model = None
-        attn = getattr(block, "attn", None)
-        if attn is not None:
-            d_model = getattr(attn, "dim", None)
-            if d_model is None and hasattr(attn, "W_q"):
-                try:
-                    d_model = attn.W_q.shape[0]
-                except (AttributeError, IndexError):
-                    d_model = None
-        if d_model is None and hasattr(block, "ffn") and hasattr(block.ffn, "W_up"):
-            try:
-                d_model = block.ffn.W_up.shape[1]
-            except (AttributeError, IndexError):
-                d_model = None
-        if d_model is None and isinstance(dim_positions, dict) and dim_positions:
-            try:
-                d_model = max(int(v) for v in dim_positions.values()) + 1
-            except (TypeError, ValueError):
-                d_model = None
-        if d_model is None:
-            d_model = 512
-        ffn = PureFFN(d_model, len(rules))
-        dim_map = Primitives.dim_positions_from_bd(
-            _as_setdim_proxy(dim_positions),
-            Primitives.ffn_rule_dim_names(rules),
-        )
-        Primitives.lower_ffn_rules(ffn, rules, dim_map, S=S)
-        _suppress_ffn_on_step_boundary(ffn, dim_map, S)
-        block.post_ops.append(ffn)
-
-    ir = CompilerIR()
-    ir.layer(0).ffn.rules.extend(rules)
-
-    return Operation(
+    # R-FRAME INCR-1 style glue collapse: thin call over ``_make_l10_postop``.
+    # Flag-off -> the shared noop Operation (byte-identical to HEAD). Must run
+    # AFTER tail_bit32_result_correction (the OUTPUT producer it overrides),
+    # mirroring make_l10_add_high_byte_adder_op's ordering (it reads OUTPUT so the
+    # scheduler orders it last).
+    return _make_l10_postop(
         name="l10_exit_axcarry",
+        rules_fn=_l10_exit_axcarry_rules,
         reads={
             "MARK_AX", "OP_LEA", "MEM_ADDR_SRC",
             "MARK_PC", "MARK_SP", "MARK_BP", "MARK_STACK0", "MARK_MEM",
@@ -13536,16 +13157,9 @@ def make_l10_exit_axcarry_op() -> Operation:
             *_L10_EXIT_AXCARRY_OUTPUT_OWNING_OPS,
         },
         writes={"OUTPUT_LO", "OUTPUT_HI_THIS_STEP"},
-        kind="block",
-        target_op_name="l10_post_ops_combined",
-        # Must run AFTER tail_bit32_result_correction (the OUTPUT producer it
-        # overrides), mirroring make_l10_add_high_byte_adder_op's ordering.
         requires={"after": "tail_bit32_result_correction"},
-        declarative_bake_fn=bake,
-        declarative_authority="spec_generated",
-        compiler_ir=ir,
-        migrated=True,
-        smoke_tests={"all"},
+        suppress=True,
+        flag_fn=_l10_exit_axcarry_enabled,
         spec_section="BLOG_SPEC.md#function-call",
     )
 
