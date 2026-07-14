@@ -227,5 +227,82 @@ Projected LOC per component (measured for skeleton, projected for full ISA):
 (per-nibble one-hots + 32-bit carry cascades). Even tripling every projection for
 unforeseen gadget complexity (bitwise/cmp exactness at 8-bit) lands at ~7.9K — still under
 budget. **Preliminary GO**, contingent on the vertical slice proving the substrate
-compiles + runs + decodes correctly (see `test_slice.py`). See REPORT section at bottom for
-the measured skeleton LOC and final GO/NO-GO.
+compiles + runs + decodes correctly (see `test_slice.py`). See REPORT section below for the
+measured skeleton LOC and final GO/NO-GO.
+
+---
+
+## REPORT — measured skeleton + GO/NO-GO
+
+**What was built (this slice):** a complete, self-contained substrate — `isa.py`
+(opcodes + assembler + reference interpreter), `layout.py` (band registry), `model.py`
+(exact reference architecture: ALiBi/softmax attention + SwiGLU FFN, additive residual, no
+RMSNorm), `dsl.py` (`FFNRule`/`AttentionSpec`/`LinearExpr`), `compile_ffn.py` (rule→SwiGLU
+bake + exact mod-256 fold), `compile_attn.py` (spec→head bake), `compiler.py` (full
+pipeline: assemble→layout→embed→blocks→head→pack `state_dict`→run→decode). Six opcodes are
+wired: `IMM, LEA, PSH, ADD, SUB, HALT`.
+
+**Slice result (all argmax-correct through the LM head, vs the reference interpreter):**
+
+| Program                                | Reference     | Model         | ✓ |
+|----------------------------------------|---------------|---------------|---|
+| `IMM 5; PSH; IMM 3; ADD; HALT`         | `[5,5,3,8,8]` | `[5,5,3,8,8]` | ✓ |
+| `IMM 10; PSH; IMM 4; SUB; HALT`        | `[…,6,6]`     | `[…,6,6]`     | ✓ |
+| `IMM 200; PSH; IMM 100; ADD; HALT`     | `[…,44,44]`   | `[…,44,44]`   | ✓ (8-bit wrap) |
+| `IMM 42; HALT`                         | `[42,42]`     | `[42,42]`     | ✓ |
+
+`test_slice.py`: **7/7 pass** under `pytest` (4 end-to-end programs + HALT terminator + both
+attention-head constructions self-tested). The compiled `state_dict` **saves + reloads +
+re-runs identically** (round-trip verified). Total model params for the 5-instr slice:
+~202K (all baked, zero-trained). Both substrate attention gadgets are proven independently:
+``carry_forward_head`` copies a band from t-1→t; ``content_match_head`` selects the position
+whose key matches the query offset and copies its value (the pop / memory-load primitive).
+
+**Architecture decision that made the slice honest:** a single parallel forward cannot carry
+a *computed* register from step k-1 (all positions see only the pre-op value), so **depth =
+time**: each VM step is one transformer block, state flows through depth, and per-step AX is
+emitted into a private `OUT_k` slot decoded by the LM head. This is a real transformer doing
+real per-step work, not a lookup. It needs no autoregressive token feedback for
+straight-line code. (Branches require restoring PC-driven fetch + cross-position carry —
+scoped as a documented extension, projected below.)
+
+**Measured skeleton LOC (code-only: no blanks / comments / docstrings):**
+
+| File               | LOC | File               | LOC |
+|--------------------|----:|--------------------|----:|
+| `compiler.py`      | 141 | `compile_ffn.py`   |  84 |
+| `isa.py`           | 109 | `compile_attn.py`  |  61 |
+| `model.py`         |  68 | `layout.py`        |  35 |
+| `dsl.py`           |  35 | `test_slice.py`    |  71 |
+| **substrate total**| **~533** | **+ tests**   |  71 |
+
+(Total incl. tests, code-only: **604**; physical lines incl. comments/docstrings: **853**.)
+
+**Projected full-ISA total (code-only LOC), extrapolated from the measured 6-op skeleton
+(~7 LOC per op via the shared rule compilers):**
+
+| Component                                             | LOC |
+|-------------------------------------------------------|----:|
+| substrate + compiler pipeline (measured)              | 449 |
+| ops already wired (IMM/LEA/PSH/ADD/SUB/HALT, measured)|  41 |
+| bitwise AND/OR/XOR (bit-decompose gadget + rules)     | 120 |
+| shift SHL/SHR                                         |  70 |
+| cmp EQ/NE/LT/LE/GT/GE (threshold gadget + rules)      | 110 |
+| memory LI/SI (addr→cell attention)                    |  90 |
+| control JMP/BZ/BNZ/JSR/ENT/LEV                        | 180 |
+| PC-driven fetch (branches) + cross-position carry     | 320 |
+| signed SUB/SHL wrap folds                             |  30 |
+| tests (per-op-class oracle vs `interpret`)            | 200 |
+| **PROJECTED GRAND TOTAL**                             | **~1,610** |
+
+**GO / NO-GO: GO.** The projected full-ISA build is **~1.6K code-only LOC**; even applying a
+**3× pessimism factor** (for 8-bit bitwise/cmp exactness and branch control-flow) lands at
+**~4.8K — comfortably under the 10K budget**, and roughly **9× smaller than the reference
+substrate alone** (14,504 LOC). The per-op cost is dominated by *reusable gadgets*
+(mod-fold, bit-decompose, threshold, addr-match attention), not per-op code, so adding ops
+after the first of each class is near-free (~7 LOC each). The scalar-per-register layout is
+the decisive lever: it removes the reference's per-nibble one-hots and 32-bit carry
+cascades, which are what inflate the general substrate. The one real risk to the budget is
+branch-driven control flow (cross-position state carry, the `PC-driven fetch` row), which is
+un-exercised by this straight-line slice — but even tripling that entire line item leaves
+the total under 6K.

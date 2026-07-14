@@ -1,0 +1,131 @@
+"""c4_min ISA: 8-bit-only C4 opcode subset, encoding, and a reference interpreter.
+
+Opcode numeric values match the reference ``neural_vm.embedding.Opcode`` so the
+semantics are shared, but only the 8-bit subset is defined here. Clean-room: no
+import from ``neural_vm``.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List, Tuple
+
+MASK = 0xFF          # 8-bit value mask
+WIDTH = 2            # cells per instruction slot: [opcode, imm]
+NUM_OPS = 40        # size of the opcode one-hot band (covers all values below)
+
+# Opcode values (subset of the C4 ISA; 8-bit only).
+LEA, IMM, JMP, JSR, BZ, BNZ, ENT, LEV = 0, 1, 2, 3, 4, 5, 6, 8
+LI, SI, PSH = 9, 11, 13
+OR, XOR, AND = 14, 15, 16
+EQ, NE, LT, GT, LE, GE = 17, 18, 19, 20, 21, 22
+SHL, SHR = 23, 24
+ADD, SUB = 25, 26
+HALT = 38  # alias EXIT
+
+NAMES = {
+    LEA: "LEA", IMM: "IMM", JMP: "JMP", JSR: "JSR", BZ: "BZ", BNZ: "BNZ",
+    ENT: "ENT", LEV: "LEV", LI: "LI", SI: "SI", PSH: "PSH", OR: "OR",
+    XOR: "XOR", AND: "AND", EQ: "EQ", NE: "NE", LT: "LT", GT: "GT",
+    LE: "LE", GE: "GE", SHL: "SHL", SHR: "SHR", ADD: "ADD", SUB: "SUB",
+    HALT: "HALT",
+}
+BY_NAME = {v: k for k, v in NAMES.items()}
+
+
+@dataclass
+class Instr:
+    op: int
+    imm: int = 0
+
+    def __repr__(self) -> str:
+        return f"{NAMES.get(self.op, self.op)} {self.imm}"
+
+
+def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
+    """Turn [(name, imm), ...] into a code table of Instr."""
+    out = []
+    for entry in prog:
+        name, imm = (entry if isinstance(entry, tuple) else (entry, 0))
+        out.append(Instr(BY_NAME[name], imm & MASK))
+    return out
+
+
+def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256):
+    """Reference 8-bit interpreter. Returns list of AX values emitted per step.
+
+    Stack grows downward from ``mem_size`` (top). ``pop`` reads stack[SP] then SP+=1.
+    Emits the value of AX after each executed step.
+    """
+    ax = sp = bp = 0
+    sp = mem_size          # empty stack
+    pc = 0
+    mem = [0] * mem_size
+    stack = [0] * (mem_size + 1)
+    emitted = []
+
+    def push(v):
+        nonlocal sp
+        sp -= 1
+        stack[sp] = v & MASK
+
+    def pop():
+        nonlocal sp
+        v = stack[sp]
+        sp += 1
+        return v & MASK
+
+    steps = 0
+    while pc < len(code) and steps < max_steps:
+        steps += 1
+        ins = code[pc]
+        op, imm = ins.op, ins.imm
+        pc += 1
+        if op == IMM:
+            ax = imm & MASK
+        elif op == LEA:
+            ax = (bp + imm) & MASK
+        elif op == PSH:
+            push(ax)
+        elif op == ADD:
+            ax = (pop() + ax) & MASK
+        elif op == SUB:
+            ax = (pop() - ax) & MASK
+        elif op == AND:
+            ax = pop() & ax
+        elif op == OR:
+            ax = pop() | ax
+        elif op == XOR:
+            ax = pop() ^ ax
+        elif op == SHL:
+            ax = (pop() << ax) & MASK
+        elif op == SHR:
+            ax = (pop() >> ax) & MASK
+        elif op == EQ:
+            ax = 1 if pop() == ax else 0
+        elif op == NE:
+            ax = 1 if pop() != ax else 0
+        elif op == LT:
+            ax = 1 if pop() < ax else 0
+        elif op == GT:
+            ax = 1 if pop() > ax else 0
+        elif op == LE:
+            ax = 1 if pop() <= ax else 0
+        elif op == GE:
+            ax = 1 if pop() >= ax else 0
+        elif op == LI:
+            ax = mem[ax] & MASK
+        elif op == SI:
+            mem[pop()] = ax & MASK
+        elif op == JMP:
+            pc = imm
+        elif op == BZ:
+            pc = imm if ax == 0 else pc
+        elif op == BNZ:
+            pc = imm if ax != 0 else pc
+        elif op == HALT:
+            emitted.append(ax)
+            break
+        else:
+            raise NotImplementedError(f"op {op} not in slice ISA")
+        emitted.append(ax)
+    return emitted
