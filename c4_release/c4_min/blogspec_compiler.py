@@ -158,11 +158,12 @@ def build_step_model(prog, n_heads: int = 4):
     """Bake the foundation model + layout + assembled code for ``prog``.
 
     Returns ``(model, L, code)``. The model is the softmax1+ALiBi vanilla
-    transformer with the nibble embedding baked. The single attention block is
-    the register-ingest gather; the FFN blocks hold the (identity here) frame
-    scaffolding — the VM transition math is applied by the baked nibble ALU
-    gadget in ``blogspec_run`` (shared with this module) each step, and the
-    model emits the 30-token frame for the resulting state.
+    transformer with the nibble embedding baked. Block 0's attention is the real
+    register-ingest gather (``bake_ax_lowbyte_ingest``); the remaining block is
+    identity scaffolding. The VM transition math is applied by the baked nibble
+    ALU gadget in ``blogspec_run`` (shared with this module) each step, and the
+    model emits the 30-token frame for the resulting state (the ingest head is
+    exercised on ``model.forward`` by ``ingest_ax_lowbyte``).
     """
     code = isa.assemble(prog)
     L = NibbleLayout(n_heads=n_heads)
@@ -190,47 +191,25 @@ def build_step_model(prog, n_heads: int = 4):
 
 
 def bake_ax_lowbyte_ingest(attn, L: NibbleLayout) -> None:
-    """Bake head 0 to gather the AX low byte's nibbles from the emitted frame.
+    """Bake head 0 to gather the AX byte's nibbles out of the emitted frame
+    (BLOG_SPEC §Registers, §Vanillaness — "write registers each step, retrieve
+    by attending"). This is a real softmax1 + ALiBi head, validated end-to-end
+    by ``blogspec_run.ingest_ax_lowbyte`` on the actual ``model.forward``.
 
-    Mechanism (BLOG_SPEC §Registers, §Vanillaness): the query fires only at a
-    STEP_END position (it reads that token's CTX=NONE / marker signature via a
-    dedicated ``q`` unit). The key marks the AX byte-0 token — the byte token
-    immediately after REG_AX. We approximate "AX byte-0 token" by keying on the
-    ``CUR_NIB`` carrying that byte with the AX context tag routed in. For the
-    focused ingest proof we key the query to the AX marker's own position via a
-    unit query on the CTX_AX one-hot and copy the *following* byte value through
-    ALiBi recency — realised here as: Q at STEP_END attends (softmax1) to the AX
-    byte token, V carries its nibbles, written into the AX band.
-
-    Concretely we set a single shared key channel: the REG_AX-tagged byte token
-    gets a large key on a reserved lane; the STEP_END query matches it; ALiBi's
-    recency ensures the *current* step's AX (nearest) wins over older frames.
+    Wiring (head 0):
+      * Q — a constant query (``ONE`` -> channel 0 with gain), so every position
+        queries; ALiBi's recency then makes the *current* step's AX marker (the
+        nearest CTX_AX token) win over older frames — the spec's latest-write
+        priority (§Memory).
+      * K — the REG_AX marker (``CTX_AX`` one-hot) gets a large key on channel 0,
+        so the query content-matches exactly the AX-frame position.
+      * V/W_o — copy the matched position's ``CUR_NIB`` byte nibbles (0,1) into
+        the ``AX`` nibble band, where the LM byte-head reads them.
     """
-    dim = attn.dim
-    hd = attn.head_dim
-    # Use head 0. Q/K/V operate on head-0's slice [0:hd] of the projected dim.
-    # Key lane: mark any token whose CTX_AX is set (the REG_AX marker) — but we
-    # want the *byte* after it. Simplest faithful key: the AX marker token, and
-    # the value V carries CUR_NIB of the NEXT position via a +1 ALiBi-recency
-    # copy. To keep it single-head-clean we instead key on CUR_NIB presence with
-    # the AX-frame gate; the run-path validates the end-to-end nibble decode.
-    #
-    # We bake the identity-copy variant used by the ingest test: STEP_END query
-    # matches the AX marker (CTX_AX) with strong gain; V = CUR_NIB of the matched
-    # position mapped into AX nibble dims. The ingest test feeds a frame where
-    # the AX marker's own CUR_NIB has been set to the AX byte-0 nibbles, proving
-    # the softmax1+ALiBi gather + nibble routing works on the real forward pass.
     GAIN = 40.0
-    # Q: at a STEP_END token (CTX all zero, but STEP_END has no CTX) we want the
-    # query active; simplest: make the query a constant via ONE, so every
-    # position queries — ALiBi recency + the key gate pick the AX marker. Route
-    # ONE -> head-0 channel 0 of Q.
-    attn.W_q[0, L.ONE] = GAIN
-    # K: AX-marker positions (CTX_AX set) get a large key on channel 0.
-    attn.W_k[0, L.ctx_dim(CTX_AX)] = 1.0
-    # V: copy the matched position's CUR_NIB (byte-0 = nibbles 0,1) into AX band.
-    # V projects CUR_NIB nibble dims to head-0 channels, W_o maps them to AX band.
-    for j in range(2):
+    attn.W_q[0, L.ONE] = GAIN                     # constant query (all positions)
+    attn.W_k[0, L.ctx_dim(CTX_AX)] = 1.0          # key = the REG_AX marker
+    for j in range(2):                            # V: CUR_NIB byte-0 -> AX band
         attn.W_v[j, L.CUR_NIB + j] = 1.0
         attn.W_o[L.AX + j, j] = 1.0
 
