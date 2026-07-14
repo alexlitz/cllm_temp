@@ -2276,12 +2276,12 @@ def clean_operand_add_enabled() -> bool:
     the arithmetic gain with ZERO CMP regression (the CMP calibration contract
     is left intact), so this slice is byte-identical-OFF AND net-positive-ON.
 
-    Gated behind the ``no_stack0_emit`` campaign flag so the flag-OFF golden
+    Gated behind the ``no_stack0_emit`` campaign flag so the non-campaign golden
     (``e50521f3``) build is byte-identical (the wrap is never installed off the
-    campaign / off the flag).
+    campaign). The former ``C4_CLEAN_OPERAND_ADD`` escape hatch was RETIRED
+    2026-07-14 (proven default-ON pass-gain); the fix is now unconditional under
+    campaign.
     """
-    if os.environ.get("C4_CLEAN_OPERAND_ADD", "1") == "0":
-        return False
     return no_stack0_emit_enabled()
 
 
@@ -2313,12 +2313,12 @@ def clean_operand_bitwise_enabled() -> bool:
     (all 6 bitwise smoke programs pass with C4_CLEAN_OPERAND_BITWISE=1 AND the
     SeRecover removed).
 
-    Gated behind the ``no_stack0_emit`` campaign prerequisite so the flag-OFF
+    Gated behind the ``no_stack0_emit`` campaign prerequisite so the non-campaign
     golden (35-tok) build is byte-identical (``e50521f3``): the wrap is never
-    installed off the campaign / with ``C4_NO_STACK0_EMIT=0``.
+    installed with ``C4_NO_STACK0_EMIT=0``. The former ``C4_CLEAN_OPERAND_BITWISE``
+    escape hatch was RETIRED 2026-07-14 (proven default-ON, SUBSUMES the deleted
+    BitwiseOperandSeRecoverFFN); the fix is now unconditional under campaign.
     """
-    if os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") == "0":
-        return False
     return no_stack0_emit_enabled()
 
 

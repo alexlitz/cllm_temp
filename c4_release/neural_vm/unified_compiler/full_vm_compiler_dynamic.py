@@ -2201,27 +2201,17 @@ def _build_cache_key_snapshot(
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
             and os.environ.get("C4_CLEAN_OPERAND", "0") != "0"
         ),
-        # Arithmetic-only clean operand delivery (CBC pass-gain, DEFAULT-ON, opt
-        # out =0, MODULE-affecting): installs the SAME CleanOperandOneHotFFN wrap
-        # with an ARITHMETIC-ONLY op_dims tuple (no cmp dims) so the ON model's
-        # wrap module differs from both flag-OFF and the full C4_CLEAN_OPERAND
-        # variant and must never share a serialised entry. Gated on the campaign
-        # prerequisite C4_NO_STACK0_EMIT so the non-campaign / golden build is
-        # byte-identical. Default is ON only in the campaign config; escape hatch
-        # C4_CLEAN_OPERAND_ADD=0 reproduces golden e50521f3. See
-        # shared.clean_operand_add_enabled.
-        "C4_CLEAN_OPERAND_ADD": (
+        # Arithmetic + bitwise clean operand delivery (CleanOperandOneHotFFN wrap
+        # on the L8 main FFN, MODULE-affecting). The C4_CLEAN_OPERAND_ADD /
+        # C4_CLEAN_OPERAND_BITWISE escape hatches were RETIRED 2026-07-14 (proven
+        # default-ON); the wrap is now installed unconditionally under the campaign
+        # prerequisite C4_NO_STACK0_EMIT, so the non-campaign / golden build stays
+        # byte-identical (wrap absent). Keyed on C4_NO_STACK0_EMIT so the campaign
+        # (wrap-present) and non-campaign (wrap-absent) builds never share a
+        # serialised entry. See shared.clean_operand_add_enabled /
+        # clean_operand_bitwise_enabled.
+        "clean_operand_arith_bitwise_wrap": (
             os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CLEAN_OPERAND_ADD", "1") != "0"
-        ),
-        # Bitwise clean operand delivery (campaign-ON, opt out =0,
-        # MODULE-affecting): ADDS OP_AND/OP_OR/OP_XOR to the CleanOperandOneHotFFN
-        # op_dims so the ON model's wrap module differs and must never share a
-        # serialised entry. Gated on C4_NO_STACK0_EMIT so the golden build is
-        # byte-identical. See shared.clean_operand_bitwise_enabled.
-        "C4_CLEAN_OPERAND_BITWISE": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CLEAN_OPERAND_BITWISE", "1") != "0"
         ),
         # SC/LC byte-0 reload (campaign-ON, opt out =0, BAKE-affecting): adds
         # OP_LC to the L15 head-0 #318 keystone slot-103 Q gate so ON / OFF
