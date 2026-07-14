@@ -107,19 +107,23 @@ in BOTH cache-key snapshots (`full_vm_compiler_dynamic.py`).
 
 `tools/_probe_funcmin_verdict.py` runs `BatchedPureNeuralRunner.
 run_batch_fail_fast(spec_k=0, criterion="full_trace")` — the SAME criterion the
-fast gate uses. Empirical (see §7 for commands):
+fast gate uses. All three raw-spare configs MEASURED on CPU (see §7 for
+commands):
 
-| id | program | expected | all-CMP-out draft | **LT-only-out (fix)** |
-|---|---|---|---|---|
-| 675  | `func_min` min(13,57)     | 13   | PASS | **PASS (regression FIXED)** |
-| 612  | `func_mul` mul(41,29)     | 1189 | PASS | **PASS (gain HOLDS)** |
-| 408  | `if_eq`   7==7            | 1    | **FAIL** | **PASS (gain HOLDS)** |
-| 433  | `if_var`  x=35, x>76      | 0    | PASS | **PASS (gain HOLDS)** |
-| 1088 | `bool_and` 57>65 && 65>18 | 0    | **FAIL** | **PASS (gain HOLDS)** |
+| id | program | exp | all-CMP-in (`CMP_RAW=1`, orig) | all-CMP-out (rejected draft) | **LT-only-out (fix, default)** |
+|---|---|---|---|---|---|
+| 675  | `func_min` min(13,57)     | 13   | **FAIL** (decoded 65512) | PASS | **PASS (regression FIXED)** |
+| 612  | `func_mul` mul(41,29)     | 1189 | PASS | PASS | **PASS (gain HOLDS)** |
+| 408  | `if_eq`   7==7            | 1    | PASS | **FAIL** (decoded 0) | **PASS (gain HOLDS)** |
+| 433  | `if_var`  x=35, x>76      | 0    | PASS | PASS | **PASS (gain HOLDS)** |
+| 1088 | `bool_and` 57>65 && 65>18 | 0    | PASS | **FAIL** (decoded 1) | **PASS (gain HOLDS)** |
 
-The all-CMP-out draft column (id408/id1088 FAIL) is the empirical falsification
-that forced the LT-only scoping. The LT-only column (5/5 PASS) = func_min
-unblocked + all 4 gains intact.
+* **all-CMP-in** (the original branch) = the fast-gate config: 4 gains PASS,
+  `func_min` FAILS = the reported +12/−1-regression.
+* **all-CMP-out** (the rejected first draft): fixes func_min but REGRESSES
+  id408 + id1088 → the empirical falsification that forced the LT-only scoping.
+* **LT-only-out** (this fix, default): **5/5 PASS** — func_min unblocked AND all
+  4 gains intact. This is the 0-regression config.
 
 ## 5. Golden — flag-OFF byte-identical to the branch's fork-point main default
 
