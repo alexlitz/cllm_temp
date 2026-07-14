@@ -78,7 +78,6 @@ from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
 from .ir import ModelArchitectureSpec
 from . import _legacy_redirect as _static
 from .ops.shared import (
-    operand_from_memsp_enabled,
     campaign_enabled,
     emit_g5_rbyte_enabled,
 )
@@ -2018,17 +2017,6 @@ def _build_cache_key_snapshot(
         "C4_ABSDIFF_RET_BYTE1": (
             os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
         ),
-        # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt out
-        # =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60 threshold bump
-        # to the L10 ``e8_alubp_memsp`` writer so ON / OFF builds bake different
-        # L25-tail FFN weights and must never share a serialised entry. Gated on
-        # the campaign prerequisites so the non-campaign / golden build is
-        # byte-identical. See l10_ops._lea_e8_first_ent_gate_enabled.
-        "C4_LEA_E8_FIRST_ENT_GATE": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
-        ),
         # nested callee-ENT AX-dump over-fire FIX (#342, campaign-config, DEFAULT
         # OFF, opt in =1, BAKE-affecting): appends a FETCHED-ENT
         # ``OPCODE_BYTE_LO+6`` NOT-blocker to the L10 ``e8_alubp_memsp`` writer so
@@ -2121,29 +2109,6 @@ def _build_cache_key_snapshot(
         # its other campaign terms), so the campaign / non-campaign builds still
         # never share a serialised entry. See shared.cmp_hi_lt_alu15_leak_guard_enabled
         # / cmp_gt_lo_lt_hieq_guard_enabled.
-        # Multilocal-ENT AX byte-0 source fix (DEFAULT-ON in campaign, opt out
-        # =0, BAKE-affecting): when active ``make_l10_ent_axcarry_op`` appends a
-        # PureFFN post_op to the L25 tail block that re-asserts the carried AX
-        # over the leaked-LEA materializer on the multilocal main-ENT step, so
-        # the ON / OFF builds STRUCTURALLY differ (extra post_op / FFN units)
-        # and must never share a serialised entry. See
-        # l10_ops._l10_ent_axcarry_enabled.
-        "C4_L10_ENT_AXCARRY": (
-            os.environ.get("C4_L10_ENT_AXCARRY", "1") != "0"
-            and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-        ),
-        # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/max/
-        # min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): adds a Q/K
-        # scoring slot to the SHARED L7 operand-gather head 1. The ON / OFF
-        # builds differ in W_q/W_k so they must NEVER share a serialised entry.
-        # Gated on ``operand_from_memsp_enabled()`` (DEFAULT-ON post-flip;
-        # reading the raw env ``== "1"`` would default OFF and let the campaign
-        # ON bake collide with a non-campaign cache entry). See
-        # shared.func_lea_reread_bp_resharpen_enabled.
-        "C4_FUNC_LEA_REREAD_BP_RESHARPEN": (
-            operand_from_memsp_enabled()
-            and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
-        ),
         # Single CAMPAIGN-CONFIG entry point (DEFAULT-OFF; opt in with =1):
         # ``C4_CAMPAIGN=1`` OR-ins the ON floor for the coherent 30-token
         # campaign set (no_stack0_emit + operand_from_memsp + si_store_addr +

@@ -1269,15 +1269,12 @@ def func_lea_reread_bp_resharpen_enabled() -> bool:
     ``tools/lint_cross_op_attention.py`` (MANDATORY for shared-head edits)
     gates the post-softmax head OUTPUT at OTHER-op / OTHER-context probe rows.
 
-    DEFAULT ON. Opt-out via ``C4_FUNC_LEA_REREAD_BP_RESHARPEN=0`` (the
-    byte-identical-OFF path: flag-OFF, or ``C4_OPERAND_FROM_MEMSP=0``, are both
-    byte-identical to golden ``7f6f2e5d``). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_FUNC_LEA_REREAD_BP_RESHARPEN`` can
-    A/B it inside the campaign config.
+    UNCONDITIONAL under the operand-from-memsp campaign as of the P5 flag-retire
+    2026-07-14 (the former ``C4_FUNC_LEA_REREAD_BP_RESHARPEN`` escape hatch was
+    retired as a proven default-ON fix). ``C4_OPERAND_FROM_MEMSP=0`` is
+    byte-identical to golden ``7f6f2e5d``.
     """
-    if not operand_from_memsp_enabled():
-        return False
-    return os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
+    return operand_from_memsp_enabled()
 
 
 def mul_l19_flood_cap_enabled() -> bool:

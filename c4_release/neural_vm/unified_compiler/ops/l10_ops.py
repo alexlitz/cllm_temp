@@ -575,17 +575,13 @@ def _lea_e8_first_ent_gate_enabled() -> bool:
     slam is silenced on are byte-identical (their pre-slam value is already 0xE8
     or, for var ``&b``, delivered by e0_fetch).
 
-    DEFAULT tracks ``_lea_byte0_memsp_relay_enabled()`` (the e8 writer's own
-    campaign branch): the OP_ENT gate is applied ONLY in the 30-token campaign
-    config and ONLY when this flag is on, so flag-OFF (``=0``),
-    ``C4_NO_STACK0_EMIT=0``, or the 35-token golden build are all byte-identical
-    to the pre-fix default (golden never emits this writer). Dedicated
-    kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_LEA_E8_FIRST_ENT_GATE`` can A/B it inside the campaign config.
+    Tracks ``_lea_byte0_memsp_relay_enabled()`` (the e8 writer's own campaign
+    branch): the OP_ENT gate is applied ONLY in the 30-token campaign config, so
+    ``C4_NO_STACK0_EMIT=0`` or the 35-token golden build are byte-identical to the
+    pre-fix default (golden never emits this writer). Unconditional under campaign
+    as of the P5 flag-retire 2026-07-14 (the former ``C4_LEA_E8_FIRST_ENT_GATE``
+    escape hatch was retired as a proven default-ON fix).
     """
-    forced = os.environ.get("C4_LEA_E8_FIRST_ENT_GATE")
-    if forced is not None:
-        return forced != "0" and _lea_byte0_memsp_relay_enabled()
     return _lea_byte0_memsp_relay_enabled()
 
 
@@ -11358,8 +11354,8 @@ def _l10_ent_axcarry_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    if os.environ.get("C4_L10_ENT_AXCARRY", "1") == "0":
-        return False
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_L10_ENT_AXCARRY`` escape hatch was retired as a proven default-ON fix).
     return no_stack0_emit_enabled()
 
 
