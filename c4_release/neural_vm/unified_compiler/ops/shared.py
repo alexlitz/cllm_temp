@@ -829,56 +829,6 @@ def mul_byte0_se_recover_enabled() -> bool:
     return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
 
 
-def mul_l11_se_recover_enabled() -> bool:
-    """Return True iff the L11 wide_mul operand-A SE_ALU recovery is active
-    (DEFAULT ON in the campaign config — opt-out via ``C4_MUL_L11_SE_RECOVER=0``;
-    only takes effect when the STACK0 emission is dropped, i.e.
-    ``C4_NO_STACK0_EMIT=1`` AND the MUL byte-0 SE recovery is on).
-
-    The wall this lifts (#321, root aa52e1c9, verified spec_k=0 / BUILT dims,
-    campaign config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the
-    campaign mul byte-1 DROP fails (104/106/124/138, plus the a_lo=7 family) —
-    the decode is correct for the LOW byte only, the product's high byte (byte
-    1) is dropped at the emit token.
-
-    Distinct from :func:`mul_byte0_se_recover_enabled` effect (2). That flag's
-    OUTPUT-flood cap (``_MulCombineStage``) treats the L11 wide_mul flood
-    AFTER it has happened — it CLEARS the flooded OUTPUT band so the
-    SE-recovered ``FlattenedALUMul`` (block 29 / logical L15) product survives
-    at the LM-head argmax. But the wide_mul ALSO computes the product's BYTE 1
-    into the dedicated ``MUL_RESULT_HI`` band (block 16 / logical L11), and the
-    ``_layer14_alu_high_byte_relay`` (l14_ops.py:1330, OP_MUL-gated) EMITs that
-    byte 1 at the emit token. Because the L11 wide_mul reads the L10-CRUSHED
-    operand-A (``ALU_LO/HI`` all-negative for the failing rows), its byte-1
-    write is the FLOOD, NOT the true product byte 1 — and the flood drowns the
-    +20-scaled byte-1 emit relay write, so the emit token decodes only the low
-    byte. The L15 ``FlattenedALUMul`` already gets a clean byte-0 recovery (via
-    ``BDToGEConverter``), but the L11 wide_mul one block EARLIER does NOT.
-
-    FIX. When enabled, the efficient-mode L11 wrap
-    (``make_efficient_l11_alumul_wrap_op``) installs ``MulOperandSeRecoverFFN``
-    as ``block.ffn`` — a drop-in wrapper holding the rule-lowered wide_mul
-    ``PureFFN`` (``inner``) that, on the OP_MUL + MARK_AX row ONLY, restores the
-    crushed operand-A ``ALU_LO/HI`` band from the surviving ``SE_ALU_LO/HI``
-    mirror BEFORE the wide_mul rules read it. It reproduces the SAME golden
-    hybrid operand band (true-nibble one-hot + the index-0 / cell-8 / cell-15
-    magnitude artifacts) the width=2 wide_mul AND-threshold + artifact-blocker
-    were tuned against, so the wide_mul computes the CORRECT ``MUL_RESULT_HI``
-    (no flood) and the byte-1 emit relay propagates. It runs in ONE block (it
-    IS ``block.ffn``) so the physical block count is unchanged (the lea
-    absolute-position contract holds). Exactly the byte-0 SE-recovery precedent
-    (``CmpOperandSeRecoverFFN`` at L10), applied one block earlier at L11.
-
-    DEFAULT ON. Opt-out via ``C4_MUL_L11_SE_RECOVER=0`` restores the raw crushed
-    ``ALU_LO/HI`` read at the L11 wide_mul (the byte-identical-OFF path: flag-OFF,
-    or ``C4_NO_STACK0_EMIT=0``, or ``C4_MUL_BYTE0_SE_RECOVER=0`` are all
-    byte-identical to golden ``7f6f2e5d``). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_MUL_L11_SE_RECOVER`` can A/B it
-    inside the campaign config.
-    """
-    return os.environ.get("C4_MUL_L11_SE_RECOVER", "1") != "0"
-
-
 def sub_full_borrow_enabled() -> bool:
     """Return True iff the SUB full-borrow multi-byte 0xFF completion is active
     (DEFAULT ON in the campaign config — opt-out via ``C4_SUB_FULL_BORROW=0``;
@@ -1007,63 +957,6 @@ def l8_operand_sp_disc_enabled() -> bool:
     return os.environ.get("C4_L8_OPERAND_SP_DISC", "1") != "0"
 
 
-def cmp_byte0_se_recover_enabled() -> bool:
-    """Return True iff the COMPARISON operand-A byte-0 SE_ALU recovery is active
-    (DEFAULT ON in the campaign config — opt-out via
-    ``C4_CMP_BYTE0_SE_RECOVER=0``; only takes effect when the STACK0 emission
-    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
-
-    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
-    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``): the cmp low-nibble /
-    bool_and (nested-GT) fails — if_eq {412 7==45, 418 7==28, 420 28==12},
-    if_lt 96<70 family, and bool_and 1071-1095 (6 fail) — whose comparison
-    result decodes WRONG because operand A is crushed at the cmp-engine read.
-
-    This is the comparison analog of :func:`mul_byte0_se_recover_enabled`. For
-    a SUBSET of operands (value-dependent: e.g. 7, 57 crushed; 5, 96 NOT
-    crushed — the same pipeline-path dependence the MUL/divmod crush shows),
-    operand-A byte 0 — delivered from ``mem[SP]`` into ALU_LO/HI by the L8
-    ``make_layer8_mem_to_alu_op`` head 5 (CLEAN +6.0 one-hot at the true
-    nibble at blocks 11..13) — is CRUSHED ALL-NEGATIVE by the L10 ALU-clear
-    (block 14): every cell ~-45, the true nibble ~-39 (spec_k=0
-    ``tools/probe_cmp_se_recover.py``). The crush PERSISTS to the cmp-engine
-    read (block ~19). The ``_layer10_alu_ordering_engine_rules`` /
-    ``_layer10_alu_eq_engine_rules`` recompute the CMP cascade from the raw
-    ``ALU_HI/LO`` (operand A) + ``AX_CARRY_HI/LO`` (operand B) at MARK_AX via
-    per-nibble AND units whose ``-0.5``/``-0.8`` index BLOCKERS reject the
-    operand-gather index-0 magnitude artifact. With ALU crushed to ~-45 every
-    blocker term flips strongly POSITIVE (``-0.5 * -45 = +22.5``), so EVERY
-    nibble unit clears threshold and the four CMP flags saturate to garbage
-    (spec_k=0: CMP=[25947,17146,16997,32593] for 7==45). The
-    ``ComparisonCombine`` then mis-decodes (eq_false -> 1, etc.). The clean
-    operands the engines need ARE present at the AX row in
-    ``SE_ALU_LO/HI`` (~+0.8 one-hot at the true nibble; the L9
-    ``step_end_operand_relay`` mirror, written BEFORE the crush and surviving
-    through block 19 — spec_k=0: SE_ALU_LO==0x7/SE_ALU_HI==0x0 for 7).
-
-    FIX. When enabled, a forward-pass recover prepended to the efficient-mode
-    L10 wrap (``make_efficient_l10_andorxor_wrap_op``) — running on the SAME
-    block as the cmp engines, BEFORE they read, so NO physical block is added
-    (the absolute-position lea contract holds) — does, on the cmp opcodes +
-    MARK_AX row ONLY: (1) multiplicatively CLEAR the ``ALU_LO/HI`` band (so a
-    crushed -45 floor AND an already-clean +6 one-hot both go to 0 —
-    IDEMPOTENT, the non-crushed passing rows are not perturbed because their
-    own clean operand is re-materialized identically), then (2) WRITE the
-    clean operand-A one-hot from ``SE_ALU_LO/HI`` at the golden +6.0 magnitude
-    the engines were tuned against. The engines then recompute the cascade
-    from the SAME clean positive one-hot they see in the golden 35-token
-    config — so NO threshold re-tuning is needed and the blockers reject the
-    index-0 artifact exactly as designed. Operand B (``AX_CARRY``, clean) is
-    untouched; ``CMP`` is never written here.
-
-    DEFAULT ON. Opt-out via ``C4_CMP_BYTE0_SE_RECOVER=0`` restores the raw
-    crushed ALU_LO/HI read (the byte-identical-OFF path: flag-OFF, or
-    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden ``7f6f2e5d``).
-    Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_CMP_BYTE0_SE_RECOVER`` can A/B it
-    inside the campaign config.
-    """
-    return os.environ.get("C4_CMP_BYTE0_SE_RECOVER", "1") != "0"
 
 
 def mul_multibyte_l19_boost_enabled() -> bool:
@@ -1575,53 +1468,6 @@ def l15_lookup_cmp_veto_enabled() -> bool:
     golden byte-identity gate.
     """
     return os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
-
-
-def mul_se_recover_strict_onehot_enabled() -> bool:
-    """Return True iff the ``MulOperandSeRecoverFFN`` rebuilds the recovered
-    operand-A one-hot as a STRICT SINGLE-ARGMAX (one cell only) rather than the
-    ``clamp(0,1) > 0.5`` multi-cell threshold (DEFAULT ON in the campaign config
-    — opt-out via ``C4_MUL_SE_RECOVER_STRICT_ONEHOT=0``; only takes effect under
-    ``C4_NO_STACK0_EMIT=1`` + ``C4_MUL_BYTE0_SE_RECOVER=1``, since the recover
-    branch is campaign-only and crush-gated).
-
-    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
-    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; var_mul 275-299 = 0/25, the
-    MULTI-LOCAL ``a*b`` frame — DECISIVE control: the literal mul of the same
-    values PASSES, var FAILS):
-
-    In the deep multi-local var frame the L9 ``step_end_operand_relay`` SE_ALU
-    mirror accumulates a SPURIOUS extra operand-A HIGH-nibble cell. Probed at the
-    block-16 (logical L11) MUL row for var_mul 275 (23*47, a=23=0x17 so the true
-    A high nibble is cell 1): ``SE_ALU_HI`` reads ``hot=[(1,0.7),(15,0.6)]`` — the
-    true cell 1 (0.7) AND a stale cell 15 (0.6) — whereas the PASSING literal mul
-    reads a clean ``hot=[(1,0.7)]``. The ``MulOperandSeRecoverFFN`` rebuilds the
-    recovered one-hot with ``clamp(SE_ALU_HI,0,1) > 0.5``, which keeps BOTH cells
-    (0.7>0.5 AND 0.6>0.5) -> the recovered ``ALU_HI`` becomes ``[(1,6.0),(15,6.0)]``
-    (TWO non-zero A high-nibble cells). The width=2 wide_mul's per-rule operand-A
-    artifact BLOCKER (``operand_a_artifact_blocker_weight=3.0`` on every OTHER
-    non-zero A cell) then TRIPS on the true rule: the 5-way AND drops below its
-    19.0 threshold and the wide_mul fires on NO rule -> ``MUL_RESULT_HI``/OUTPUT
-    stay 0 (probed: var block-16 OUTPUT band == 0 vs lit == 41.6). The only thing
-    left is the downstream ``+2.0`` GEToBD/L16 default at the WRONG nibble, so the
-    product decodes to garbage (id275 23*47=1081 -> neural 73).
-
-    FIX. When this flag is on, the recover rebuilds the operand-A one-hot from the
-    SE mirror as a STRICT single-argmax (the single largest cell only). cell 1
-    (0.7) beats the stale cell 15 (0.6) so the recovered ``ALU_HI`` is a clean
-    ``[(1,6.0)]`` one-hot -> the wide_mul fires on the true rule -> the correct
-    product band (41.6) is computed and survives. This is byte-IDENTICAL to the
-    current ``clamp>0.5`` behaviour for any case whose SE mirror is already a
-    single cell (the literal mul + every PASSING crushed mul), and only changes
-    the multi-cell var-frame case the blocker was silently eating.
-
-    DEFAULT ON. Opt-out via ``C4_MUL_SE_RECOVER_STRICT_ONEHOT=0`` restores the
-    ``clamp>0.5`` rebuild (flag-OFF, or ``C4_NO_STACK0_EMIT=0``, or
-    ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden — the recover
-    path is campaign-only). Kept as a dedicated kill-switch for
-    ``tools/flag_regression_gate.py``.
-    """
-    return os.environ.get("C4_MUL_SE_RECOVER_STRICT_ONEHOT", "1") != "0"
 
 
 def divmod_axcarry_clear_enabled() -> bool:

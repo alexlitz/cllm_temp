@@ -3144,6 +3144,38 @@ def _bake_r_frame_passthrough_head(attn, BD, S, HD, *, spec_fn, alibi_idx) -> No
         attn.alibi_slopes.data[alibi_idx] = 1.0
 
 
+def _l10_bake_attn_heads(block, dim_positions, S, specs, *, alibi_slot=None):
+    """Shared L10 attention-head bake preamble + head lowering.
+
+    Every ``make_layer10_*_bake_op`` closure repeated the identical bake
+    preamble: build the ``_as_setdim_proxy`` over ``dim_positions``, grab
+    ``block.attn``, stash a freshly-pinned ``_allocate_layer10_attention_heads``
+    allocator on ``attn`` (for downstream inspection — the actual ``head_idx``
+    still comes from :func:`_l10_head_idx`), derive ``HD`` from the head axis,
+    lower one-or-more head specs via ``Primitives.generate_attention_head``, and
+    (for the two persistence/passthrough families) pin one ``alibi_slopes`` slot
+    to 1.0. Only the per-op DATA varied: the list of spec factories and the
+    optional alibi slot.
+
+    ``specs`` is an iterable of zero-arg callables each returning a
+    :class:`DeclarativeAttentionHeadSpec` for the proxy/S captured here (the
+    call sites pass ``lambda: _layer10_..._head_spec(proxy, S)`` so a spec can
+    take extra per-head args like ``byte_h``). Lowering order is preserved, so
+    the emitted ``generate_attention_head`` weights + the single ``alibi_slopes``
+    write are byte-identical — golden hash UNCHANGED.
+    """
+    proxy = _as_setdim_proxy(dim_positions)
+    attn = block.attn
+    head_allocator = _allocate_layer10_attention_heads()
+    attn._l10_head_allocator = head_allocator
+    HD = attn.W_q.shape[0] // attn.num_heads
+    for spec_factory in specs:
+        Primitives.generate_attention_head(attn, spec_factory(proxy), HD)
+    if alibi_slot is not None:
+        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
+            attn.alibi_slopes.data[alibi_slot] = 1.0
+
+
 def _bake_layer10_byte_passthrough_head(attn, BD, S, HD) -> None:
     """Declarative L10 head 1 AX byte passthrough spec."""
     _bake_r_frame_passthrough_head(
@@ -4823,21 +4855,14 @@ def make_layer10_carry_relay_bake_op() -> Operation:
     call until Wave 6B shrinks it to ``_lower_via_compiler_ir``.
     """
     def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        # Per-bake attention-head allocator with the L10 head layout pinned.
-        # Stashed on ``attn`` for downstream inspection / extension; the
-        # actual ``head_idx`` value used by the spec comes from
-        # :func:`_l10_head_idx` so the spec stays in lockstep with the
-        # layout table without re-querying the allocator here.
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the head spec directly into ``attn``
-        # (was ``_bake_layer10_carry_relay_head``) so census v2 classifies
-        # this op as ``declarative`` (no helper hop).
-        Primitives.generate_attention_head(
-            attn, _layer10_carry_relay_head_spec(proxy, S), HD,
+        # Shared bake preamble + head lowering (allocator pin, HD, spec ->
+        # generate_attention_head). The actual ``head_idx`` value comes from
+        # :func:`_l10_head_idx` so the spec stays in lockstep with the layout
+        # table. Phase 8.C: the head spec is lowered directly (no helper hop)
+        # so census v2 classifies this op as ``declarative``.
+        _l10_bake_attn_heads(
+            block, dim_positions, S,
+            [lambda p: _layer10_carry_relay_head_spec(p, S)],
         )
 
     # Dim-ownership claims: L10 attn head 0 CARRY relay (AX marker → AX bytes).
@@ -5081,18 +5106,12 @@ def make_layer10_psh_stack0_passthrough_bake_op() -> Operation:
     See ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
     """
     def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        # Per-bake attention-head allocator with the L10 head layout pinned.
-        # See ``make_layer10_carry_relay_bake_op`` for the rationale.
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the head spec directly into ``attn``
-        # (was ``_bake_layer10_psh_stack0_passthrough_head``) so census v2
-        # classifies this op as ``declarative``.
-        Primitives.generate_attention_head(
-            attn, _layer10_psh_stack0_passthrough_head_spec(proxy, S), HD,
+        # Shared bake preamble + head lowering. Phase 8.C: the head spec is
+        # lowered directly (no helper hop) so census v2 classifies this op as
+        # ``declarative``. See ``make_layer10_carry_relay_bake_op``.
+        _l10_bake_attn_heads(
+            block, dim_positions, S,
+            [lambda p: _layer10_psh_stack0_passthrough_head_spec(p, S)],
         )
 
     # Dim-ownership claims: L10 attn head 3 PSH STACK0 passthrough.
@@ -5242,17 +5261,16 @@ def make_layer10_psh_ax_broadcast_bake_op() -> Operation:
     docs/L8_SP_GATHER_STACK0_AUDIT_2026_06_07.md.
     """
     def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        for byte_h in (1, 2, 3):
-            Primitives.generate_attention_head(
-                attn,
-                _layer10_psh_ax_broadcast_head_spec(proxy, S, byte_h),
-                HD,
-            )
+        # Shared bake preamble + head lowering. Three heads (slots 8/9/10),
+        # one per PSH'd AX byte h. See ``make_layer10_carry_relay_bake_op``.
+        _l10_bake_attn_heads(
+            block, dim_positions, S,
+            [
+                (lambda h: lambda p: _layer10_psh_ax_broadcast_head_spec(
+                    p, S, h))(byte_h)
+                for byte_h in (1, 2, 3)
+            ],
+        )
 
     # Dim-ownership claims: heads 8/9/10 V slots 0..31 read CLEAN_EMBED.
     _claims = set()
@@ -5308,28 +5326,19 @@ def make_layer10_stack0_byte_relay_bake_op() -> Operation:
     ``make_layer10_carry_relay_bake_op`` for the shared infrastructure.
     """
     def bake(block, dim_positions, S):
-        proxy = _as_setdim_proxy(dim_positions)
-        attn = block.attn
-        # Per-bake attention-head allocator with the L10 head layout pinned.
-        # This bake op owns three heads (4, 5, 6). See
-        # ``make_layer10_carry_relay_bake_op`` for the rationale.
-        head_allocator = _allocate_layer10_attention_heads()
-        attn._l10_head_allocator = head_allocator
-        HD = attn.W_q.shape[0] // attn.num_heads
-        # Phase 8.C inline: lower the three head specs directly into
-        # ``attn`` (was ``_bake_layer10_stack0_byte_relay_head``) so census
-        # v2 classifies this op as ``declarative``.
-        Primitives.generate_attention_head(
-            attn, _layer10_stack0_byte_relay_head_spec(proxy, S), HD,
+        # Shared bake preamble + head lowering. This bake op owns three heads
+        # (4, 5, 6) and pins the head-6 alibi slot. Phase 8.C: the head specs
+        # are lowered directly (no helper hop) so census v2 classifies this op
+        # as ``declarative``. See ``make_layer10_carry_relay_bake_op``.
+        _l10_bake_attn_heads(
+            block, dim_positions, S,
+            [
+                lambda p: _layer10_stack0_byte_relay_head_spec(p, S),
+                lambda p: _layer10_nonbitwise_stack0_byte_relay_head_spec(p, S),
+                lambda p: _layer10_stack0_persistence_head_spec(p, S),
+            ],
+            alibi_slot=6,
         )
-        Primitives.generate_attention_head(
-            attn, _layer10_nonbitwise_stack0_byte_relay_head_spec(proxy, S), HD,
-        )
-        Primitives.generate_attention_head(
-            attn, _layer10_stack0_persistence_head_spec(proxy, S), HD,
-        )
-        if hasattr(attn, "alibi_slopes") and attn.alibi_slopes is not None:
-            attn.alibi_slopes.data[6] = 1.0
 
     # Dim-ownership claims: L10 attn head 4/5 stack-memory byte relays
     # (→ ALU at AX byte) and head 6 STACK0 upper-byte carry.
