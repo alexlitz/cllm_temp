@@ -518,7 +518,14 @@ def run_op_class(op: str, *, max_steps_cap: int = 60) -> OpClassVerdict:
 # authoritative regression gate for a change is
 # ``tools/run_per_op_oracle.py --baseline`` (pass->fail blocks); this xfail set
 # keeps the pytest itself a valid green/red signal.
-_KNOWN_FAIL_OP_CLASSES = frozenset({"AND", "NE", "LE", "GE", "SHR", "LC", "SC"})
+_KNOWN_FAIL_OP_CLASSES = frozenset(
+    # bitwise / comparison / char families:
+    {"AND", "NE", "LE", "GE", "SHR", "LC", "SC"}
+    # + JMP: the ``edge_loop_never`` representative (a loop that never runs)
+    #   diverges at the loop-skip branch; the other JMP path (``edge_loop_once_
+    #   skip``) is not sampled here. A branch-decode fail, baseline-recorded.
+    | {"JMP"}
+)
 
 try:
     import pytest

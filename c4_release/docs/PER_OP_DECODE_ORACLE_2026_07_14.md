@@ -38,14 +38,25 @@ compare) and overrides **exactly one** method (`_forward_argmax_batch`) to serve
 the per-token argmax from `ModelExactForward`. Because the only substitution IS
 `model.forward` over one row, its per-program `full_trace` `status` is
 **byte-identical to `tools/run_1096_canonical.py --criterion full_trace
---spec-k 0`** — the exact per-program criterion the 30-min gate uses — with **no
-GPU**.
+--spec-k 0`** — the exact per-program pass criterion the 30-min gate uses — with
+**no GPU**.
+
+**On `spec_k` (load-bearing):** the oracle runs the faithful decode at
+`spec_k=32` (matching `faithful_autoregressive_validate.py`), NOT `spec_k=0`. The
+speculative path teacher-forces the UNSAFE MEM offsets from the DraftVM — those
+bytes are unreadable from a flat forward argmax, so decoding them from the
+model's own argmax (what `spec_k=0` would do in the faithful per-row path) would
+feed wrong MEM bytes back and desync the next step. The **pass SET is identical**
+for any `spec_k` because the model is the final arbiter (per
+`run_1096_canonical`'s own note + `project_probe_path_spec_k_not_hooks`), so the
+`spec_k=32` faithful verdict == the `spec_k=0` canonical/GPU pass set.
 
 **Authority ranking (the rec-agent's question):**
-`run_1096_canonical --spec-k 0` (GPU) == `ModelExactForward` AR decode (CPU) ==
-`model.forward` — all three agree at the saturated ties (validated in
-`tools/faithful_autoregressive_validate.py`, and the byte-identity is the whole
-reason `ModelExactForward` exists). `fast_gate.py` is NOT a divergent authority —
+`run_1096_canonical --spec-k 0` (GPU) == `ModelExactForward` AR decode (CPU,
+`spec_k=32`) == `model.forward` — all three agree at the saturated ties
+(validated in `tools/faithful_autoregressive_validate.py`, and the byte-identity
+is the whole reason `ModelExactForward` exists). `fast_gate.py` is NOT a divergent
+authority —
 it simply *shells out to* `run_1096_canonical` on a stratified sample, so it runs
 the SAME GPU path (it predicts a corpus **delta**, it is not a faithful CPU
 gate). The recovered-weight `CachedFaithfulForward` is the ONLY one that
@@ -100,9 +111,45 @@ Every one of the 30 op-classes has ≥1 decode-checked representative
 
 ## 4. Baseline (recorded on main `02e84ee8`, golden `1c04c3fd`)
 
-<!-- BASELINE_TABLE -->
+Recorded with `tools/run_per_op_oracle.py` (faithful full_trace verdict per
+program). **22 of 30 op-classes PASS all representatives; 8 FAIL** — every FAIL
+is a REAL, pre-existing per-op decode divergence (NOT a bug in the oracle — the
+ISA-VM oracle value is correct and the neural model decodes a different byte):
+
+| status | op-classes |
+|---|---|
+| **PASS (22)** | ADD SUB MUL DIV MOD · EQ LT GT · OR XOR SHL · IMM BZ BNZ · PSH LI SI LEA JSR ENT ADJ LEV |
+| **FAIL (8)** | AND · NE LE GE · SHR · LC SC · JMP |
+
+Representative fail evidence (from the recorded verdicts):
+
+* `AND 255 & 15` → oracle 15, **model decodes AX=1** (diverges @ step 3). The
+  `108 & 58` case passes — the fail is operand-pattern-specific (matches the
+  16-bit-bitwise-recover notes in memory).
+* `NE`/`LE`/`GE` — one operand ordering passes, the reversed one fails (the
+  comparison-decode margin family).
+* `SHR 255 >> 4` fails; `200 >> 2` passes.
+* `LC`/`SC` (char load/store) — the model decodes AX=0 (the load-char / store-
+  char path the C corpus never exercises is not decoded at all).
+* `JMP` — the `edge_loop_never` representative (a loop that never runs) diverges
+  at the loop-skip branch. A branch-decode fail; the frame ops that share
+  `var_simple_0`/`func_identity_0` (LI/SI/LEA/JSR/ENT/ADJ/LEV) all PASS.
+
+The frame ops PASS: the memory-smoke framing-drift program `var_simple_0`
+decodes correctly (SI/LI/LEA/JSR/ENT all 1/1 pass, sharing that program) and
+`func_identity_0` decodes correctly (ADJ/LEV pass). These are the historically
+hard framing-drift clusters — their per-op decode is CLEAN on main today.
 
 The recorded per-program verdicts are in `tools/per_op_oracle_baseline.json`.
+Regenerate with:
+`OMP_NUM_THREADS=4 python tools/run_per_op_oracle.py --workers 8 \
+--record-baseline tools/per_op_oracle_baseline.json`.
+
+**Speed note (measured).** Uncontended, the full 30-op-class suite at
+`--workers 8` lands in ~5–8 min. Under heavy box contention (other agents; load
+~20) the per-program growing-tape decode slows ~4x, so plan `--workers` and
+`OMP_NUM_THREADS` against the actual free-core budget (the runner is CPU-bound,
+not memory-bound past ~1.5GB/worker).
 
 **Reading the baseline.** A `pass` means the neural model's decoded `(PC, AX)`
 matched the ISA-VM oracle trace at EVERY completed step (the full_trace

@@ -268,6 +268,15 @@
     }
    ]
   },
+  "JMP": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "corpus#1029",
+     "status": "fail"
+    }
+   ]
+  },
   "JSR": {
    "ok": true,
    "programs": [
@@ -282,6 +291,24 @@
    "programs": [
     {
      "label": "corpus#250",
+     "status": "pass"
+    }
+   ]
+  },
+  "ADJ": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#550",
+     "status": "pass"
+    }
+   ]
+  },
+  "LEV": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#550",
      "status": "pass"
     }
    ]
