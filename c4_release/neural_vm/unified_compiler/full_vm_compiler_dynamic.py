@@ -2302,45 +2302,14 @@ def _build_cache_key_snapshot(
         # (absent) builds never share a serialised entry. See
         # l0_ops._clean_emitter_enabled.
         "clean_emitter_wrap": (os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"),
-        # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255 per-value
-        # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-ON, kill-switch
-        # =0). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,
-        # so the ON / OFF builds have different state_dicts and MUST NEVER share
-        # a serialised entry. See l10_ops._stack0_store_loaded_computed_enabled.
-        "C4_STACK0_STORE_LOADED_COMPUTED": (
-            os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
-        ),
-        # STACK0 pop-loaded / store-top-e8 byte-writeback ENUMERATED (255
-        # per-value AND) -> COMPUTED (32 per-nibble route) collapses (siblings of
-        # the M8 pilot, DEFAULT-ON). Each changes the L10-tail FFN hidden_dim AND
-        # the emitted OUTPUT delta, so the ON / OFF builds have different
-        # state_dicts and MUST NEVER share a serialised entry. See
-        # l10_ops._stack0_pop_loaded_computed_enabled /
-        # _stack0_store_e8_computed_enabled.
-        "C4_STACK0_POP_LOADED_COMPUTED": (
-            os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
-        ),
-        "C4_STACK0_STORE_E8_COMPUTED": (
-            os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
-        ),
-        # GAP-PRIMITIVE #3 pilot: STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT
-        # ENUMERATED (254 per-value AND) -> COMPUTED (32 per-nibble route)
-        # collapse (DEFAULT-ON, kill-switch =0). Changes the L10-tail FFN hidden_dim
-        # AND the emitted OUTPUT delta, so the ON / OFF builds have different
-        # state_dicts and MUST NEVER share a serialised entry. See
-        # l10_ops._stack0_store_top_e0_computed_enabled.
-        "C4_STACK0_STORE_TOP_E0_COMPUTED": (
-            os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
-        ),
-        # wide_mul_byte1_preserve byte-writeback ENUMERATED (256 per-value AND)
-        # -> COMPUTED (32 per-nibble route) collapse (DEFAULT-OFF, opt in =1).
-        # Changes the L10-tail FFN hidden_dim (256 -> 32) AND the emitted OUTPUT
-        # delta, so the ON / OFF builds have different state_dicts and MUST
-        # NEVER share a serialised entry. See
-        # l10_ops._wide_mul_byte1_computed_enabled.
-        "C4_WIDE_MUL_BYTE1_COMPUTED": (
-            os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
-        ),
+        # P5 RETIRE: the six R-FRAME INCR-3 tail frame-guarantee collapses
+        # (``C4_R_FRAME_TAIL`` / ``C4_SP_BYTE2_CARRY`` /
+        # ``C4_STACK0_{STORE_LOADED,POP_LOADED,STORE_E8,STORE_TOP_E0}_COMPUTED`` /
+        # ``C4_WIDE_MUL_BYTE1_COMPUTED``) are now UNCONDITIONAL (the enumerated
+        # ``range(256)`` fallbacks are DELETED). Those flags no longer branch the
+        # build, so their cache-key entries are REMOVED — the collapsed form is the
+        # only form the L10-tail bank emits. See
+        # docs/P5_RFRAME_RETIRE_2026_07_13.md.
         # M8 collapse for the L14 ADDR_KEY nibble decode: the load-query lo+hi
         # ENUMERATED (2 x 16x16 = 512 per-(lo,hi) AND) bank -> COMPUTED (2 x 32
         # per-nibble route) collapse (DEFAULT-OFF, opt in =1). Changes the L14

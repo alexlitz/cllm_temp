@@ -1,152 +1,35 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
 import os
-from dataclasses import dataclass, field, replace
-from typing import Mapping, Optional, Tuple
+from dataclasses import replace
+from typing import Mapping, Optional
 
 
 # ---------------------------------------------------------------------------
 # R-FRAME INCR-3 — the L25 tail register-EMISSION-FRAME guarantee collapse.
+# RETIRED (P5, docs/P5_RFRAME_RETIRE_2026_07_13.md).
 #
-# See ``docs/RFRAME_EMITTER_SCOPE_2026_07_13.md`` §3 and
-# ``docs/RFRAME_INCR3_PILOT_2026_07_13.md``. The L25 tail bank
-# (``_tail_bit32_result_correction_rules``) guarantees each register frame byte
-# (PC/SP/BP/STACK0/MEM-addr) via ~79 named ``multi_way_and_rule`` + several
-# ``range(16)/(256)`` byte-value-writeback banks. Several of those banks are
-# PURE ENUMERATIONS of a single computed fact (``byte = f(source)``) and were
-# each collapsed behind a per-family point-flag (the "M8" collapse flags:
-# ``_sp_byte2_carry_computed_enabled``, ``_stack0_*_computed_enabled``,
-# ``_wide_mul_byte1_computed_enabled``).
+# The L25 tail bank (``_tail_bit32_result_correction_rules``) guaranteed each
+# register frame byte via several ``range(256)`` byte-value-writeback banks that
+# were PURE ENUMERATIONS of a single computed fact (``byte = f(source)``). INCR-3
+# collapsed six of those pure-copy families to their computed per-nibble ROUTE
+# form behind the unified ``C4_R_FRAME_TAIL`` super-switch (DEFAULT-ON), keeping
+# the enumerated banks as a flag-OFF escape hatch.
 #
-# INCR-3 unifies those per-family point-flags into ONE table-driven collapse
-# keyed by REGISTER: ``R_FRAME_TABLE`` names, per register, which tail
-# frame-guarantee sub-families are pure enumerations that collapse to their
-# computed form. ``_r_frame_tail_enabled(family)`` reads the single
-# ``C4_R_FRAME_TAIL`` super-switch, so the whole tail frame-guarantee collapse
-# ships behind one flag instead of six.
-#
-# ROLLOUT + FLIP (this increment, DEFAULT-ON): ``C4_R_FRAME_TAIL`` now defaults
-# ON and routes six pure-copy families through ``R_FRAME_TABLE`` -- the SP
-# byte-2 pop-carry (SP row), the ALU-VAL ``wide_mul_byte1`` preserve (AX row),
-# and the four STACK0 byte-writeback families (STACK0 row:
-# ``stack0_store_loaded`` / ``stack0_pop_loaded`` / ``stack0_store_e8`` /
-# ``stack0_store_top_e0``). Each routed family's ``range(256)`` enumeration
-# collapses to its computed (per-nibble route) form -- byte-for-byte identical
-# to the surviving members on every reachable step (the dropped siblings are
-# structurally dead). This is VERDICT-EQUIVALENT: the golden hash MOVED
-# e50521f3 -> ``b9a74424`` (-478 tail units) and that model is byte-for-byte the
-# proven point-flag composition ``C4_SP_BYTE2_CARRY=1``
-# ``C4_WIDE_MUL_BYTE1_COMPUTED=1`` (the four STACK0 collapses were already ON in
-# golden). Escape hatch ``C4_R_FRAME_TAIL=0`` rebuilds the full ``range(256)``
-# enumerated banks -> bit-for-bit golden ``e50521f3`` (the enumerated fallbacks
-# are LOAD-BEARING for the escape hatch and are NOT deleted).
-#
-# The PC and BP rows stay SCAFFOLDED (``tail_collapse=()``) -- their tail
-# frame-guarantee families are hand-tuned discriminators, NOT pure-copy. The
-# STACK0 flat-block pure-copy majority (~1.3k LOC) is a follow-up route toward
-# the scope doc's ~-2,600-LOC estimate.
+# P5 RETIRE makes the collapse UNCONDITIONAL: the six routed families
+# (``sp_pop_carry_byte2`` [SP], ``wide_mul_byte1`` [AX], and the four STACK0
+# families ``stack0_store_loaded`` / ``stack0_pop_loaded`` / ``stack0_store_e8``
+# / ``stack0_store_top_e0``) now emit ONLY their computed route form. The
+# ``range(256)`` enumerated fallbacks, the ``C4_R_FRAME_TAIL`` /
+# ``R_FRAME_TABLE`` / ``_r_frame_tail_enabled`` machinery, and the six per-family
+# "M8" point-flags (``_sp_byte2_carry_computed_enabled`` / ``C4_SP_BYTE2_CARRY``,
+# ``_stack0_*_computed_enabled`` / ``C4_STACK0_*_COMPUTED``,
+# ``_wide_mul_byte1_computed_enabled`` / ``C4_WIDE_MUL_BYTE1_COMPUTED``) are
+# DELETED. The DEFAULT model is UNCHANGED — the default was already the collapsed
+# form, so the golden hash stays ``1c04c3fd`` — but the -478 tail units are now a
+# real SOURCE-LOC deletion. This PERMANENTLY drops the ``C4_R_FRAME_TAIL=0``
+# reversibility for these six families (the intended P5 trade).
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RegisterEmitSpec:
-    """One row of ``R_FRAME_TABLE`` — the per-register emission-frame datum.
-
-    The R-FRAME emitter re-authors the SAME emission act ("put register ``reg``'s
-    byte ``k`` into ``OUTPUT_LO/HI`` at its frame row") from a small per-register
-    table instead of hand-cloned banks. This spec carries ONLY the data that
-    varies across registers (§2 of the scope doc); the invariant lowering (the
-    ``range(16)`` nibble copy, the marker Q/K match, the byte-value writeback
-    shape) is the shared machinery the emitter drives.
-
-    Attributes:
-        reg: register name ("PC"|"AX"|"SP"|"BP"|"STACK0").
-        marker_idx: the ``H1+<marker_idx>`` marker-bank index for ``reg``
-            (PC=0, AX=1, SP=2, BP=3, ...). Used by the same-step carry head.
-        value_lo / value_hi: the clean value band the frame byte is copied from
-            (``CLEAN_EMBED_{LO,HI}`` for PC/AX/SP/BP; ``STACK0_B*`` for STACK0).
-        tail_collapse: the names of this register's tail frame-guarantee
-            sub-families that are PURE ENUMERATIONS collapsible to their computed
-            form under ``C4_R_FRAME_TAIL``. Empty = not-yet-routed (scaffolded).
-    """
-
-    reg: str
-    marker_idx: int
-    value_lo: str = "CLEAN_EMBED_LO"
-    value_hi: str = "CLEAN_EMBED_HI"
-    tail_collapse: Tuple[str, ...] = field(default_factory=tuple)
-
-
-# The R-FRAME register table. INCR-3 ROLLOUT: the SP row carries the pilot's
-# SP byte-2 pop-carry family; the AX row carries the ALU-VAL wide-mul byte-1
-# preserve family (ALU-VAL, but same computed-collapse shape — folds naturally
-# under the same table per the pilot doc §2.b footnote); the STACK0 row carries
-# the four pure-copy STACK0 byte-writeback families. PC/BP remain scaffolded
-# (``tail_collapse=()``) — their tail frame-guarantee families are hand-tuned
-# discriminators, NOT pure-copy (see the pilot doc §2.b table).
-#
-# ROUTING SEMANTICS (preserves flag-OFF golden ``e50521f3``): each routed
-# family's own point-flag default is UNCHANGED when ``C4_R_FRAME_TAIL`` is off
-# (the four STACK0 families default-ON = already in golden; wide-mul default-OFF).
-# ``C4_R_FRAME_TAIL=1`` is a UNIFIED super-switch that forces the collapse ON
-# for every routed family (its only observable delta vs the SP pilot's flag-ON
-# hash is folding in the default-OFF ``wide_mul_byte1_preserve`` family, -224
-# more tail units).
-R_FRAME_TABLE: Tuple[RegisterEmitSpec, ...] = (
-    RegisterEmitSpec(reg="PC", marker_idx=0),
-    RegisterEmitSpec(
-        reg="AX",
-        marker_idx=1,
-        tail_collapse=("wide_mul_byte1",),
-    ),
-    RegisterEmitSpec(
-        reg="SP",
-        marker_idx=2,
-        tail_collapse=("sp_pop_carry_byte2",),
-    ),
-    RegisterEmitSpec(reg="BP", marker_idx=3),
-    RegisterEmitSpec(
-        reg="STACK0",
-        marker_idx=10,
-        tail_collapse=(
-            "stack0_store_loaded",
-            "stack0_pop_loaded",
-            "stack0_store_e8",
-            "stack0_store_top_e0",
-        ),
-    ),
-)
-
-# Fast per-register lookup by tail-collapse family name.
-_R_FRAME_BY_REG: Mapping[str, RegisterEmitSpec] = {r.reg: r for r in R_FRAME_TABLE}
-_R_FRAME_TAIL_FAMILIES: frozenset = frozenset(
-    fam for r in R_FRAME_TABLE for fam in r.tail_collapse
-)
-
-
-def _r_frame_tail_enabled(family: str) -> bool:
-    """Is the R-FRAME table-driven collapse of tail frame-guarantee ``family`` on?
-
-    Reads the single ``C4_R_FRAME_TAIL`` kill-switch (DEFAULT-ON). A ``family``
-    is collapsible iff it appears in some ``R_FRAME_TABLE`` row's
-    ``tail_collapse`` (SP ``"sp_pop_carry_byte2"``, AX ``"wide_mul_byte1"``, the
-    four STACK0 pure-copy families); an unknown / un-routed family is never
-    collapsed. This is the INCR-3 unified replacement for the per-family "M8"
-    point-flags (e.g. ``_sp_byte2_carry_computed_enabled``), keyed by REGISTER
-    via the table.
-
-    DEFAULT **ON** (flipped at INCR-3 flip, golden moved e50521f3 -> b9a74424,
-    -478 tail units) -> every routed family's ENUMERATED->COMPUTED collapse is
-    realized. Escape hatch ``C4_R_FRAME_TAIL=0`` rebuilds the full enumerated
-    tail bank -> byte-identical to golden ``e50521f3``. The flip is
-    verdict-equivalent — b9a74424 is byte-for-byte the proven point-flag
-    composition ``C4_SP_BYTE2_CARRY=1 C4_WIDE_MUL_BYTE1_COMPUTED=1``. Same
-    discipline as CLEAN_EMITTER.
-    """
-
-    if family not in _R_FRAME_TAIL_FAMILIES:
-        return False
-    return os.environ.get("C4_R_FRAME_TAIL", "1") != "0"
 
 
 def _nonfirst_psh_sp_fix_enabled() -> bool:
@@ -853,184 +736,6 @@ def _lea_byte0_memsp_relay_enabled() -> bool:
     return no_stack0_emit_enabled()
 
 
-def _stack0_store_loaded_computed_enabled() -> bool:
-    """Flag for the M8 pilot — COMPUTED (route) STACK0-store byte-writeback.
-
-    The ``stack0_store_loaded_output_rules`` family is a 16x16 nibble loop that
-    ENUMERATES 255 per-value AND rules: for each byte value ``v = lo|(hi<<4)``
-    one FFN unit fires iff (structural evidence) AND ``OUTPUT_LO+lo`` AND
-    ``OUTPUT_HI_THIS_STEP+hi`` are on, and writes byte ``v`` back to the OUTPUT
-    nibbles.  Because the READ lane == the WRITE lane (OUTPUT), the whole bank is
-    an *identity copy* of the OUTPUT byte gated by structural evidence.
-
-    The COMPUTED replacement collapses those 255 per-value AND units into 32
-    per-nibble ROUTE units (16 for ``OUTPUT_LO`` + 16 for
-    ``OUTPUT_HI_THIS_STEP``).  Each route unit fires on ITS channel's one-hot
-    (plus the sum of the OTHER band's one-hot, so the firing decision keeps the
-    same 2-channel evidence magnitude / threshold=25 as the enumerated bank)
-    and writes ``nibble_value_writes`` for that channel.  Isolated numeric proof
-    (``tools/_probe_m8_computed_writeback.py``): the route reproduces the
-    enumerated bank's WINNING byte (argmax) byte-for-byte across all 256 input
-    values AND matches its firing region on the gate-off / IS_BYTE-block
-    contexts.  The only difference is the raw silu-scaled delta magnitude (the
-    argmax / winner-margin is preserved), so this is BYTE-IDENTITY-BREAKING but
-    VERDICT-validated: proving the enumerated->computed collapse.
-
-    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
-    weight-changing but field-identical, new golden).  Kill-switch with
-    ``C4_STACK0_STORE_LOADED_COMPUTED=0``.  Also routed under the unified
-    R-FRAME table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON. The OR
-    keeps the individual default when the R-FRAME super-switch is off, so
-    flag-OFF golden is unchanged.
-    """
-    return (
-        os.environ.get("C4_STACK0_STORE_LOADED_COMPUTED", "1") != "0"
-        or _r_frame_tail_enabled("stack0_store_loaded")
-    )
-
-
-def _stack0_pop_loaded_computed_enabled() -> bool:
-    """Flag for the ``stack0_pop_loaded`` ENUMERATED->COMPUTED collapse.
-
-    Sibling of the M8 pilot (``_stack0_store_loaded_computed_enabled``) on the
-    ``stack0_pop_loaded_output_rules`` bank — a 16x16 nibble loop of 255
-    per-value AND rules (skipping ``0x00``) that reinforces a STACK0 byte a
-    strong upstream load relayed into the OUTPUT band.  Its READ lane
-    (``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP`` at match weight ``0.05``) == its
-    WRITE lane (OUTPUT), so it is a same-lane identity copy gated by structural
-    evidence and collapses to 32 per-nibble ROUTE units (16 LO + 16 HI) via
-    :func:`_computed_byte_writeback_route_rules` (``match_weight=0.05``,
-    ``threshold=12.0``, same ``competitor`` — softened to 5 under the shallow
-    crush flag).  Numeric proof
-    (``tools/_probe_computed_writeback_banks.py``): identical firing region +
-    0 argmax mismatch across all 255 non-zero bytes for BOTH competitor values.
-    BYTE-IDENTITY-BREAKING -> verdict-validated.
-
-    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
-    weight-changing but field-identical, new golden).  Kill-switch with
-    ``C4_STACK0_POP_LOADED_COMPUTED=0``.  Also routed under the unified R-FRAME
-    table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON; the OR keeps the
-    individual default off-path so flag-OFF golden is unchanged.
-    """
-    return (
-        os.environ.get("C4_STACK0_POP_LOADED_COMPUTED", "1") != "0"
-        or _r_frame_tail_enabled("stack0_pop_loaded")
-    )
-
-
-def _stack0_store_e8_computed_enabled() -> bool:
-    """Flag for the ``stack0_store_top_e8_from_e0`` ENUMERATED->COMPUTED collapse.
-
-    Sibling of the M8 pilot on the NIBBLE-LOOP part of
-    ``stack0_store_top_e8_from_e0_output_rules`` — 255 per-value AND rules
-    (skipping ``0x00``) restoring a top-store value for the e0->e8 local-store
-    transition.  Its READ lane (``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP`` at match
-    weight ``0.001``) == its WRITE lane (OUTPUT), so it collapses to 32
-    per-nibble ROUTE units via :func:`_computed_byte_writeback_route_rules`
-    (``match_weight=0.001``, ``threshold=4300.0``).  The trailing special
-    ``byte_39_from_e8_addr`` rule is NOT part of the nibble loop (its own
-    MEM_ADDR_SRC-keyed context) and is emitted UNCHANGED, so the family drops
-    255 -> 33 (32 route + 1 byte-39).  Numeric proof
-    (``tools/_probe_computed_writeback_banks.py``): identical firing region +
-    0 argmax mismatch across all 255 non-zero bytes.  BYTE-IDENTITY-BREAKING ->
-    verdict-validated.
-
-    DEFAULT-ON (verdict-neutral enumerated->computed collapse realized;
-    weight-changing but field-identical, new golden).  Kill-switch with
-    ``C4_STACK0_STORE_E8_COMPUTED=0``.  Also routed under the unified R-FRAME
-    table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON; the OR keeps the
-    individual default off-path so flag-OFF golden is unchanged.
-    """
-    return (
-        os.environ.get("C4_STACK0_STORE_E8_COMPUTED", "1") != "0"
-        or _r_frame_tail_enabled("stack0_store_e8")
-    )
-def _stack0_store_top_e0_computed_enabled() -> bool:
-    """Flag for GAP-PRIMITIVE #3 pilot — CROSS-LANE COMPUTED ALU->OUTPUT copy.
-
-    ``stack0_store_top_e0_output_rules`` is a 16x16 nibble loop that ENUMERATES
-    254 per-value AND rules (256 minus 0x00 minus 0xE0): for each byte value
-    ``v = lo|(hi<<4)`` one FFN unit fires iff (structural evidence) AND
-    ``ALU_LO+lo`` AND ``ALU_HI+hi`` (the SOURCE lane one-hots, weight 1.0 — the
-    tiny ``OUTPUT+*`` 0.001 terms are negligible tie-breakers) and writes byte
-    ``v`` to the OUTPUT nibbles.  Because the READ lane (ALU) != the WRITE lane
-    (OUTPUT), this is a CROSS-LANE materializer — the exact class agent #389
-    flagged the same-lane M8 route could not cover.
-
-    The COMPUTED replacement collapses those 254 per-value AND units into 32
-    per-nibble ROUTE units via :func:`byte_copy_computed_rules` (16 for
-    ``OUTPUT_LO`` + 16 for ``OUTPUT_HI_THIS_STEP``).  Each route unit fires on
-    ITS SOURCE channel's one-hot (``ALU_LO/ALU_HI+k``) plus the sum of the OTHER
-    SOURCE band's one-hot — reconstructing the enumerated 2-channel AND
-    magnitude / threshold=25 — and writes a one-hot nibble into OUTPUT.
-    Isolated numeric proof (``tools/_probe_crosslane_bytecopy.py``): the route
-    reproduces the enumerated ALU->OUTPUT bank's WINNING byte (argmax)
-    byte-for-byte across all 256 source bytes AND matches its firing region on
-    the gate-off / IS_BYTE-block non-firing contexts; only the raw silu-scaled
-    delta magnitude differs (winner-margin preserved).  BYTE-IDENTITY-BREAKING
-    -> VERDICT-validated.
-
-    DEFAULT-ON (verdict-neutral cross-lane enumerated->computed collapse
-    realized; weight-changing but field-identical, new golden).  Kill-switch
-    with ``C4_STACK0_STORE_TOP_E0_COMPUTED=0``.  Also routed under the unified
-    R-FRAME table (STACK0 row) — ``C4_R_FRAME_TAIL=1`` forces it ON; the OR
-    keeps the individual default off-path so flag-OFF golden is unchanged.
-    """
-    return (
-        os.environ.get("C4_STACK0_STORE_TOP_E0_COMPUTED", "1") != "0"
-        or _r_frame_tail_enabled("stack0_store_top_e0")
-    )
-
-
-def _wide_mul_byte1_computed_enabled() -> bool:
-    """Flag for the ``wide_mul_byte1_preserve`` ENUMERATED->COMPUTED collapse.
-
-    Sibling of the M8 pilot (``_stack0_store_loaded_computed_enabled``) on the
-    ``wide_mul_byte1_preserve_rules`` bank inside
-    :func:`_tail_bit32_result_correction_rules`.  That bank is a full 16x16
-    nibble loop of 256 per-value AND rules (``tail_wide_mul_byte1_preserve_*``,
-    NO ``0x00`` skip) that, under the OP_MUL AX byte-0 evidence gate, matches a
-    byte value ``v = lo|(hi<<4)`` on its ``OUTPUT_LO+lo`` (weight 2.0) +
-    ``OUTPUT_HI_THIS_STEP+hi`` (weight 2.0) one-hots and re-asserts that same
-    byte on OUTPUT at strength ``10_000_000``.  Because the READ lane
-    (``OUTPUT_LO`` / ``OUTPUT_HI_THIS_STEP``) == the WRITE lane (``OUTPUT_HI``
-    aliases ``OUTPUT_HI_THIS_STEP`` at the same residual dim), the whole bank is
-    a same-lane IDENTITY copy of the staged MUL byte-1 gated by structural
-    evidence -- the exact class the M8 route collapses.
-
-    The COMPUTED replacement collapses those 256 per-value AND units into 32
-    per-nibble ROUTE units (16 for ``OUTPUT_LO`` + 16 for
-    ``OUTPUT_HI_THIS_STEP``) via :func:`_computed_byte_writeback_route_rules`
-    (``match_weight=2.0``, ``threshold=220.0``, ``strength=10_000_000``, same
-    OP_MUL gate + ``bounded_ax_byte0`` / non-MUL blocker ``base_conditions``).
-    Each route unit fires on ITS channel's one-hot (plus the summed OTHER
-    band's one-hot -- one-hot in production, so ``2.0 * sum_j other[j]`` reduces
-    to the enumerated single ``2.0 * other[observed]``) so the firing decision
-    keeps the same 2-channel evidence magnitude / threshold=220 as the
-    enumerated bank, and writes ``nibble_value_writes`` for that channel.  When
-    the LO and HI route units both fire they reconstruct the same OUTPUT byte
-    the single enumerated unit wrote -- a COMPUTED copy, not a 256-way lookup.
-    Numeric proof (``tools/_probe_wide_mul_computed_writeback.py``): identical
-    firing region + 0 argmax mismatch across ALL 256 bytes (value 0x00
-    included; the enum enumerates it, and the route's LO+0/HI+0 units reproduce
-    it).  BYTE-IDENTITY-BREAKING -> verdict-validated.
-
-    DEFAULT **OFF** -> the full 256-rule bank is built -> byte-identical to the
-    golden default build ``91f55411``.  Opt-in via
-    ``C4_WIDE_MUL_BYTE1_COMPUTED=1`` (drops the L10-tail FFN hidden_dim by 224
-    units: 256 -> 32).  The ON / OFF builds have different state_dicts and MUST
-    NEVER share a memo / disk entry (registered in BOTH cache-key snapshots in
-    ``full_vm_compiler_dynamic.py``).  Also routed under the unified R-FRAME
-    table (AX row) — ``C4_R_FRAME_TAIL=1`` forces it ON. Because its individual
-    default is OFF, the R-FRAME super-switch is what folds this ALU-VAL family
-    into the tail collapse (the -224 delta beyond the SP pilot's flag-ON hash).
-    """
-    return (
-        os.environ.get("C4_WIDE_MUL_BYTE1_COMPUTED", "0") == "1"
-        or _r_frame_tail_enabled("wide_mul_byte1")
-    )
-
-
 def _lea_byte0_alu_amplify_enabled() -> bool:
     """Flag for the PHASE-2 multi-param / multi-local LEA byte-0 ALU-AMPLIFIER
     (ROOT 1 sibling — the func_square / func_max / func_min re-read LEAs).
@@ -1212,44 +917,6 @@ def _sp_pop_marker_cmp3_hardgate_enabled() -> bool:
         os.environ.get("C4_SP_POP_MARKER_CMP3_HARDGATE", "0") == "1"
         and no_stack0_emit_enabled()
     )
-
-
-def _sp_byte2_carry_computed_enabled() -> bool:
-    """Flag for the COMPUTED (collapsed) SP byte-2 pop-carry corrector.
-
-    M8 #1 convergent win (LOC down, verdict-neutral-or-better). The
-    ``sp_pop_carry_rules`` byte-2 family enumerates one FFN unit per possible
-    ``old_value`` in ``range(256)`` (``tail_sp_pop_carry_byte2_00`` ..
-    ``tail_sp_pop_carry_byte2_ff``), each writing ``(old + 1) & 0xFF`` on the
-    binary-pop ``SP += 8`` step where the byte-1 lane overflowed (the pop that
-    crosses a 0x0..FF -> 0x1..00 boundary). That is 256 rules (~0.5k LOC) to
-    express a single fact.
-
-    Corpus reality (measured across ALL 1096 programs, DraftVM per-step SP):
-    SP never leaves the range ``[0x0FE10, 0x10000]`` -- initial SP is
-    ``STACK_INIT = 0x10000`` and even the deepest recursion (rec/gcd) only pushes
-    a few dozen 8-byte frames. So the SP byte-2 (bits 16..23) takes **exactly two
-    values, 0x00 and 0x01**, and the ONLY carry that ever fires is the pop back
-    to the frame base ``0x00FFF8 + 8 = 0x010000`` (byte-2 ``0x00 -> 0x01``). The
-    ``0x02..0xFF`` old-values are structurally unreachable (they would require SP
-    below ``0x0FF00``, i.e. > 32 outstanding pushes). The rule
-    ``byte2 = 0x01 iff (SP & 0xFFFF) == 0 else 0x00`` has ZERO violations over
-    657600 per-step SP samples.
-
-    With the flag ON the enumeration is COLLAPSED to ``old in {0x00, 0x01}`` (2
-    rules): ``0x00 -> 0x01`` is the live pop-carry and ``0x01 -> 0x02`` is a
-    dead-but-cheap insurance rule for the (unreachable) next boundary. The two
-    surviving rules are byte-for-byte IDENTICAL to the corresponding members of
-    the 256-rule bank (same ``base_conditions``, ``OUTPUT``/``CLEAN_EMBED``
-    match, threshold, and ``byte_writes(old+1)``); only the 254 provably-dead
-    siblings are dropped. So the emitted SP byte-2 is unchanged on every
-    reachable step -- a verdict-neutral LOC deletion (~0.5k lines).
-
-    DEFAULT **OFF** -> the full ``range(256)`` bank is built -> byte-identical to
-    golden ``b4d2ab27``. Opt-in via ``C4_SP_BYTE2_CARRY=1``.
-    """
-
-    return os.environ.get("C4_SP_BYTE2_CARRY", "0") == "1"
 
 
 def _sp_pop_carry_byte0_dominate_enabled() -> bool:
@@ -1683,11 +1350,19 @@ _L10_FFN_UNIT_LAYOUT_POST_OPS_COMBINED_TOTAL = 1562
 # Tail bit32 result correction (lives on L17 block.post_ops as its own
 # fresh PureFFN). Single tenant today; the layout makes the bank
 # explicit so a future tenant claims through the allocator.
+#
+# P5 RETIRE (R-FRAME INCR-3 unconditional collapse): the six pure-copy tail
+# frame-guarantee families now emit ONLY their computed per-nibble route form
+# (the ``range(256)`` enumerated fallbacks + the ``C4_R_FRAME_TAIL`` escape
+# hatch are DELETED). The tail bank is thereby permanently 690 units, not the
+# retired 2059-unit fully-enumerated form: the six collapses drop 254 + 223 +
+# 223 + 223 + 222 + 224 = 1369 units (2059 - 1369 = 690). This IS the default
+# golden (``1c04c3fd``) build, which was already the collapsed form.
 _L10_FFN_UNIT_LAYOUT_TAIL_BIT32 = (
     # (sub-stage name, legacy_start (docs only), n_units)
-    ("tail_bit32_result_correction.rules", 0, 2059),
+    ("tail_bit32_result_correction.rules", 0, 690),
 )
-_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL = 2059
+_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL = 690
 
 
 def _allocate_l10_main_ffn_units() -> FFNUnitAllocator:
@@ -2343,6 +2018,13 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
     # sensitive tail bank; flag-OFF (incl golden 35-token) each adds 0 ->
     # bit-for-bit unchanged. See _lea_byte0_alu_amplify_enabled /
     # _sp_pop_carry_byte0_dominate_enabled.
+    # P5 RETIRE: the six R-FRAME INCR-3 tail frame-guarantee collapses are now
+    # UNCONDITIONAL (their computed per-nibble route form is the only form the
+    # builders emit; the ``range(256)`` enumerated fallbacks + ``C4_R_FRAME_TAIL``
+    # escape hatch are DELETED). Their -1369 units are baked into the base count
+    # ``_L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL`` (690, not 2059), so they no longer
+    # appear as conditional ``extra`` adjustments. Only the three DEFAULT-OFF
+    # campaign flags below still widen the single-tenant tail range.
     extra = 0
     if _lea_byte0_memsp_relay_enabled():
         extra += 3
@@ -2350,55 +2032,6 @@ def _allocate_l10_tail_bit32_units(n_rules: int) -> FFNUnitAllocator:
         extra += 4
     if _sp_pop_carry_byte0_dominate_enabled():
         extra += 1
-    # SP byte-2 pop-carry enumeration collapse (M8 #1 / R-FRAME INCR-3 SP
-    # pilot): with the collapse ON the ``sp_pop_carry_rules`` byte-2 family
-    # drops from 256 (``range(256)``) to 2 (``range(2)``, old in {0x00, 0x01}),
-    # so the single-tenant tail range SHRINKS by 254. The collapse fires under
-    # EITHER the table-driven ``C4_R_FRAME_TAIL`` flag (SP row) OR the legacy
-    # ``C4_SP_BYTE2_CARRY`` point-flag. Flag-OFF (incl golden 35-token) -> 0 ->
-    # bit-for-bit unchanged. See ``_r_frame_tail_enabled`` /
-    # ``_sp_byte2_carry_computed_enabled``.
-    if _r_frame_tail_enabled("sp_pop_carry_byte2") or _sp_byte2_carry_computed_enabled():
-        extra -= 254
-    # STACK0 store-loaded byte-writeback enumerated->COMPUTED collapse (M8
-    # pilot): with the flag ON the ``stack0_store_loaded_output_rules`` family
-    # drops from 255 (16x16 per-value AND, minus the lo==hi==0 skip) to 32
-    # (16 LO + 16 HI per-nibble route), so the single-tenant tail range SHRINKS
-    # by 223. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit unchanged.
-    # See ``_stack0_store_loaded_computed_enabled``.
-    if _stack0_store_loaded_computed_enabled():
-        extra -= 223
-    # STACK0 pop-loaded byte-writeback enumerated->COMPUTED collapse: with the
-    # flag ON the ``stack0_pop_loaded_output_rules`` family drops from 255
-    # (16x16 per-value AND, minus the lo==hi==0 skip) to 32 (16 LO + 16 HI
-    # per-nibble route) -> tail range SHRINKS by 223. Flag-OFF -> 0.
-    # See ``_stack0_pop_loaded_computed_enabled``.
-    if _stack0_pop_loaded_computed_enabled():
-        extra -= 223
-    # STACK0 store-top e8-from-e0 byte-writeback enumerated->COMPUTED collapse:
-    # with the flag ON the NIBBLE-LOOP part of
-    # ``stack0_store_top_e8_from_e0_output_rules`` drops from 255 to 32 (the
-    # trailing byte_39 special rule is UNCHANGED) -> tail range SHRINKS by 223.
-    # Flag-OFF -> 0. See ``_stack0_store_e8_computed_enabled``.
-    if _stack0_store_e8_computed_enabled():
-        extra -= 223
-    # STACK0 store-top-e0 CROSS-LANE ALU->OUTPUT enumerated->COMPUTED collapse
-    # (GAP-PRIMITIVE #3 pilot): with the flag ON the
-    # ``stack0_store_top_e0_output_rules`` family drops from 254 (16x16
-    # per-value AND, minus the lo==hi==0 and value==0xE0 skips) to 32 (16 LO +
-    # 16 HI per-nibble cross-lane route), so the single-tenant tail range
-    # SHRINKS by 222. Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit
-    # unchanged. See ``_stack0_store_top_e0_computed_enabled``.
-    if _stack0_store_top_e0_computed_enabled():
-        extra -= 222
-    # wide_mul_byte1_preserve byte-writeback enumerated->COMPUTED collapse: with
-    # the flag ON the ``wide_mul_byte1_preserve_rules`` family drops from 256
-    # (full 16x16 per-value AND, NO lo==hi==0 skip) to 32 (16 LO + 16 HI
-    # per-nibble route), so the single-tenant tail range SHRINKS by 224.
-    # Flag-OFF (incl golden 35-token) -> 0 -> bit-for-bit unchanged.
-    # See ``_wide_mul_byte1_computed_enabled``.
-    if _wide_mul_byte1_computed_enabled():
-        extra -= 224
     expected = _L10_FFN_UNIT_LAYOUT_TAIL_BIT32_TOTAL + extra
     if n_rules != expected:
         raise ValueError(
@@ -6727,22 +6360,17 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             # corresponding members of the 256-rule bank) -- a verdict-neutral
             # ~0.5k-LOC deletion. See ``_sp_byte2_carry_computed_enabled``.
             output_match_weight = 5.0
-            # R-FRAME INCR-3 (SP pilot): the byte-2 pop-carry ``range(256)``
-            # enumeration collapses to its computed 2-row form under the
-            # table-driven ``C4_R_FRAME_TAIL`` flag (SP row's
-            # ``tail_collapse=("sp_pop_carry_byte2",)``) OR the legacy per-family
-            # ``C4_SP_BYTE2_CARRY`` point-flag. Both yield the byte-IDENTICAL two
-            # surviving rules (``old in {0x00, 0x01}``); only the 254 dead
-            # siblings are dropped. See ``_r_frame_tail_enabled`` /
-            # ``_sp_byte2_carry_computed_enabled``.
-            _sp_byte2_collapse = (
-                _r_frame_tail_enabled("sp_pop_carry_byte2")
-                or _sp_byte2_carry_computed_enabled()
-            )
-            _byte2_old_values = (
-                range(2) if _sp_byte2_collapse else range(256)
-            )
-            for old_value in _byte2_old_values:
+            # R-FRAME INCR-3 (SP pilot) — P5 RETIRE (unconditional collapse):
+            # the byte-2 pop-carry is emitted ONLY in its computed 2-row form
+            # (``old in {0x00, 0x01}``). Across the whole 1096 corpus SP stays in
+            # ``[0x0FE10, 0x10000]`` so byte-2 is only ever 0x00 or 0x01 and the
+            # ONLY carry that fires is ``0x00 -> 0x01`` (the pop back to the frame
+            # base ``0x010000``); ``0x02..0xFF`` are structurally unreachable. The
+            # two surviving rules are byte-for-byte identical to the corresponding
+            # members of the retired 256-rule ``range(256)`` bank. The enumerated
+            # fallback + its ``C4_R_FRAME_TAIL`` / ``C4_SP_BYTE2_CARRY`` flag branch
+            # are DELETED (P5); the default was already this collapsed form.
+            for old_value in range(2):
                 rules.append(
                     multi_way_and_rule(
                         name=(
@@ -7429,45 +7057,22 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_LE", -1000000.0),
             ("OP_GE", -1000000.0),
         )
-        # ENUMERATED->COMPUTED collapse (C4_STACK0_POP_LOADED_COMPUTED,
-        # DEFAULT-OFF): replace the 255-rule per-value lookup with a 32-rule
-        # per-nibble route.  Same READ==WRITE lane (OUTPUT); the route
-        # reproduces the winning byte (argmax) + firing region byte-for-byte
-        # at match_weight=0.05 / threshold=12 for BOTH competitor values
-        # (proof: tools/_probe_computed_writeback_banks.py).  BYTE-IDENTITY-
-        # BREAKING -> verdict-validated.
-        if _stack0_pop_loaded_computed_enabled():
-            return _computed_byte_writeback_route_rules(
-                name_for=lambda band, k: (
-                    f"tail_stack0_pop_loaded_route_{band}_{k}"
-                ),
-                base_conditions=base_conditions,
-                threshold=12.0,
-                strength=500.0,
-                match_weight=0.05,
-                competitor_strength=competitor,
-                lo_base="OUTPUT_LO",
-                hi_base="OUTPUT_HI_THIS_STEP",
-                gate=gate_mark_stack0,
-                scope="mark == STACK0",
-                dominates_at={
-                    "OUTPUT_LO": "mark == STACK0",
-                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
-                },
-            )
-        # Tier-3 tail-bank consolidation: this 16x16 nibble loop is the canonical
-        # evidence-keyed byte-value writeback pattern (READ==WRITE lane, OUTPUT).
-        # Authored via ``_byte_value_writeback_rules`` so the shape lives in one
-        # place; it emits the byte-IDENTICAL rule tuple this loop used to build by
-        # hand (same order, same weights, same threshold/gate, same lo==hi==0
-        # skip) — a count-preserving authoring refactor only.
-        return _byte_value_writeback_rules(
-            name_for=lambda value: f"tail_stack0_pop_loaded_byte_{value:02x}",
+        # R-FRAME INCR-3 (STACK0 row) — P5 RETIRE (unconditional collapse):
+        # emit ONLY the 32-rule per-nibble COMPUTED route (16 LO + 16 HI). Same
+        # READ==WRITE lane (OUTPUT); the route reproduces the winning byte (argmax)
+        # + firing region byte-for-byte at match_weight=0.05 / threshold=12 for
+        # BOTH competitor values (proof: tools/_probe_computed_writeback_banks.py).
+        # The retired 255-rule per-value ENUMERATED lookup + its ``C4_R_FRAME_TAIL``
+        # / ``C4_STACK0_POP_LOADED_COMPUTED`` flag branch are DELETED (P5); the
+        # default was already this collapsed form.
+        return _computed_byte_writeback_route_rules(
+            name_for=lambda band, k: (
+                f"tail_stack0_pop_loaded_route_{band}_{k}"
+            ),
             base_conditions=base_conditions,
             threshold=12.0,
             strength=500.0,
-            lo_match_weight=0.05,
-            hi_match_weight=0.05,
+            match_weight=0.05,
             competitor_strength=competitor,
             lo_base="OUTPUT_LO",
             hi_base="OUTPUT_HI_THIS_STEP",
@@ -7477,7 +7082,6 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
                 "OUTPUT_LO": "mark == STACK0",
                 "OUTPUT_HI_THIS_STEP": "mark == STACK0",
             },
-            skip=lambda lo, hi: lo == 0 and hi == 0,
         )
 
     def stack0_store_top_e0_output_rules() -> tuple[FFNRule, ...]:
@@ -7501,64 +7105,34 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+2", -1000.0),
             ("H1+3", -1000.0),
         )
-        # GAP-PRIMITIVE #3 pilot (C4_STACK0_STORE_TOP_E0_COMPUTED, DEFAULT-OFF):
-        # replace the 254-rule per-value ENUMERATED ALU->OUTPUT materializer with
-        # a 32-rule per-nibble CROSS-LANE COMPUTED copy.  READ lane (ALU) !=
-        # WRITE lane (OUTPUT): the route fires on the SOURCE (ALU) one-hot + the
-        # summed OTHER source band (reconstructing the 2-channel AND magnitude /
-        # threshold=25) and writes the byte into OUTPUT.  Reproduces the winning
-        # byte (argmax) + firing region byte-for-byte (proof:
-        # tools/_probe_crosslane_bytecopy.py).  BYTE-IDENTITY-BREAKING ->
-        # verdict-validated.  The tiny 0.001 OUTPUT tie-breaker terms of the
-        # enumerated form are dropped (negligible: 0.001*mag << the 5.8 ALU
-        # one-hot that carries the decision).
-        if _stack0_store_top_e0_computed_enabled():
-            return byte_copy_computed_rules(
-                src_lo="ALU_LO",
-                src_hi="ALU_HI",
-                dst_lo="OUTPUT_LO",
-                dst_hi="OUTPUT_HI_THIS_STEP",
-                base_conditions=base_conditions,
-                threshold=25.0,
-                strength=2000.0,
-                name_for=lambda band, k: (
-                    f"tail_stack0_store_top_e0_route_{band}_{k}"
-                ),
-                gate=gate_mark_stack0,
-                scope="mark == STACK0",
-                dominates_at={
-                    "OUTPUT_LO": "mark == STACK0",
-                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
-                },
-            )
-        # Tier-3 tail-bank consolidation: this 16x16 nibble loop is the CROSS-LANE
-        # variant of the byte-value writeback pattern — the source nibble is read
-        # from ALU_LO/ALU_HI (weight 1.0) with an OUTPUT tie-breaker (weight
-        # 0.001), and the byte is written to OUTPUT.  Authored via
-        # ``_byte_value_writeback_rules`` (with the tie-break pair) so the shape
-        # lives in one place; it emits the byte-IDENTICAL rule tuple this loop
-        # used to build by hand (same order, same weights, threshold=25, gate,
-        # lo==hi==0 and value==0xE0 skips) — a count-preserving authoring
-        # refactor only.
-        return _byte_value_writeback_rules(
-            name_for=lambda value: f"tail_stack0_store_top_e0_byte_{value:02x}",
+        # R-FRAME INCR-3 (STACK0 row, GAP-PRIMITIVE #3) — P5 RETIRE (unconditional
+        # collapse): emit ONLY the 32-rule per-nibble CROSS-LANE COMPUTED copy.
+        # READ lane (ALU) != WRITE lane (OUTPUT): the route fires on the SOURCE
+        # (ALU) one-hot + the summed OTHER source band (reconstructing the
+        # 2-channel AND magnitude / threshold=25) and writes the byte into OUTPUT.
+        # Reproduces the retired 254-rule ENUMERATED ALU->OUTPUT materializer's
+        # winning byte (argmax) + firing region byte-for-byte (proof:
+        # tools/_probe_crosslane_bytecopy.py). The enumerated fallback (whose tiny
+        # 0.001 OUTPUT tie-breaker terms were negligible) + its ``C4_R_FRAME_TAIL``
+        # / ``C4_STACK0_STORE_TOP_E0_COMPUTED`` flag branch are DELETED (P5); the
+        # default was already this collapsed form.
+        return byte_copy_computed_rules(
+            src_lo="ALU_LO",
+            src_hi="ALU_HI",
+            dst_lo="OUTPUT_LO",
+            dst_hi="OUTPUT_HI_THIS_STEP",
             base_conditions=base_conditions,
             threshold=25.0,
             strength=2000.0,
-            lo_base="ALU_LO",
-            hi_base="ALU_HI",
-            lo_match_weight=1.0,
-            hi_match_weight=1.0,
-            tie_break_lo_base="OUTPUT_LO",
-            tie_break_hi_base="OUTPUT_HI_THIS_STEP",
-            tie_break_weight=0.001,
+            name_for=lambda band, k: (
+                f"tail_stack0_store_top_e0_route_{band}_{k}"
+            ),
             gate=gate_mark_stack0,
             scope="mark == STACK0",
             dominates_at={
                 "OUTPUT_LO": "mark == STACK0",
                 "OUTPUT_HI_THIS_STEP": "mark == STACK0",
             },
-            skip=lambda lo, hi: (lo == 0 and hi == 0) or (lo | (hi << 4)) == 0xE0,
         )
 
     def stack0_store_top_e8_from_e0_output_rules() -> tuple[FFNRule, ...]:
@@ -7592,60 +7166,32 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+2", -1000.0),
             ("H1+3", -1000.0),
         )
-        # ENUMERATED->COMPUTED collapse (C4_STACK0_STORE_E8_COMPUTED,
-        # DEFAULT-OFF): replace the 255-rule per-value NIBBLE LOOP with a
-        # 32-rule per-nibble route (same READ==WRITE lane, OUTPUT; match_weight
-        # 0.001 / threshold 4300).  The trailing byte_39 special rule below is
-        # NOT part of the loop and is emitted UNCHANGED.  The route reproduces
-        # the winning byte (argmax) + firing region byte-for-byte (proof:
-        # tools/_probe_computed_writeback_banks.py).  BYTE-IDENTITY-BREAKING ->
-        # verdict-validated.
-        if _stack0_store_e8_computed_enabled():
-            rules = list(_computed_byte_writeback_route_rules(
-                name_for=lambda band, k: (
-                    f"tail_stack0_store_top_e8_from_e0_route_{band}_{k}"
-                ),
-                base_conditions=base_conditions,
-                threshold=4300.0,
-                strength=5000.0,
-                match_weight=0.001,
-                lo_base="OUTPUT_LO",
-                hi_base="OUTPUT_HI_THIS_STEP",
-                gate=gate_mark_stack0,
-                scope="mark == STACK0",
-                dominates_at={
-                    "OUTPUT_LO": "mark == STACK0",
-                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
-                },
-            ))
-        else:
-            # Tier-3 tail-bank consolidation: this 16x16 nibble loop is the
-            # canonical evidence-keyed byte-value writeback pattern (READ==WRITE
-            # lane, OUTPUT).  Authored via ``_byte_value_writeback_rules`` so the
-            # shape lives in one place; it emits the byte-IDENTICAL rule tuple
-            # this loop used to build by hand (same order, same 0.001 match
-            # weights, threshold=4300, gate, lo==hi==0 skip) — a count-preserving
-            # authoring refactor only.  The trailing byte_39 special rule below
-            # is appended UNCHANGED.
-            rules = list(_byte_value_writeback_rules(
-                name_for=lambda value: (
-                    f"tail_stack0_store_top_e8_from_e0_byte_{value:02x}"
-                ),
-                base_conditions=base_conditions,
-                threshold=4300.0,
-                strength=5000.0,
-                lo_match_weight=0.001,
-                hi_match_weight=0.001,
-                lo_base="OUTPUT_LO",
-                hi_base="OUTPUT_HI_THIS_STEP",
-                gate=gate_mark_stack0,
-                scope="mark == STACK0",
-                dominates_at={
-                    "OUTPUT_LO": "mark == STACK0",
-                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
-                },
-                skip=lambda lo, hi: lo == 0 and hi == 0,
-            ))
+        # R-FRAME INCR-3 (STACK0 row) — P5 RETIRE (unconditional collapse): emit
+        # ONLY the 32-rule per-nibble COMPUTED route (same READ==WRITE lane,
+        # OUTPUT; match_weight 0.001 / threshold 4300). The trailing byte_39
+        # special rule below is NOT part of the loop and is emitted UNCHANGED. The
+        # route reproduces the retired 255-rule per-value ENUMERATED NIBBLE LOOP's
+        # winning byte (argmax) + firing region byte-for-byte (proof:
+        # tools/_probe_computed_writeback_banks.py). The enumerated fallback + its
+        # ``C4_R_FRAME_TAIL`` / ``C4_STACK0_STORE_E8_COMPUTED`` flag branch are
+        # DELETED (P5); the default was already this collapsed form.
+        rules = list(_computed_byte_writeback_route_rules(
+            name_for=lambda band, k: (
+                f"tail_stack0_store_top_e8_from_e0_route_{band}_{k}"
+            ),
+            base_conditions=base_conditions,
+            threshold=4300.0,
+            strength=5000.0,
+            match_weight=0.001,
+            lo_base="OUTPUT_LO",
+            hi_base="OUTPUT_HI_THIS_STEP",
+            gate=gate_mark_stack0,
+            scope="mark == STACK0",
+            dominates_at={
+                "OUTPUT_LO": "mark == STACK0",
+                "OUTPUT_HI_THIS_STEP": "mark == STACK0",
+            },
+        ))
         # The byte-0x39 store-pop restore is driven by the (unbounded)
         # ``OUTPUT_LO+9`` term: at a binary-op STACK0 byte-0 emit row the
         # operand/result byte's low nibble 9 lands in OUTPUT_LO+9 at magnitude
@@ -7728,52 +7274,29 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("H1+3", -1_000_000_000.0),
             ("H1+4", -1_000_000_000.0),
         )
-        # M8 PILOT (C4_STACK0_STORE_LOADED_COMPUTED, DEFAULT-OFF): replace the
-        # 255-rule per-value ENUMERATED lookup with a 32-rule per-nibble
-        # COMPUTED route.  Since this bank's READ lane (OUTPUT) == its WRITE
-        # lane, the enumerated form is an identity-copy of the OUTPUT byte; the
-        # route reproduces the winning byte (argmax) + firing region
-        # byte-for-byte (proof: tools/_probe_m8_computed_writeback.py).
-        # BYTE-IDENTITY-BREAKING -> verdict-validated (see gate below).
-        if _stack0_store_loaded_computed_enabled():
-            return _computed_byte_writeback_route_rules(
-                name_for=lambda band, k: (
-                    f"tail_stack0_store_loaded_route_{band}_{k}"
-                ),
-                base_conditions=base_conditions,
-                threshold=25.0,
-                strength=5000.0,
-                lo_base="OUTPUT_LO",
-                hi_base="OUTPUT_HI_THIS_STEP",
-                gate=gate_mark_stack0,
-                scope="mark == STACK0",
-                dominates_at={
-                    "OUTPUT_LO": "mark == STACK0",
-                    "OUTPUT_HI_THIS_STEP": "mark == STACK0",
-                },
-            )
-        # Tier-3 tail-bank consolidation (task J5): this 16x16 nibble loop is
-        # the canonical evidence-keyed byte-value writeback pattern shared by
-        # ~40 sibling generators.  Authored via ``_byte_value_writeback_rules``
-        # so the shape lives in one place; it emits the byte-IDENTICAL rule
-        # tuple this loop used to build by hand (same order, same weights,
-        # same threshold/gate) — a count-preserving authoring refactor only.
-        return _byte_value_writeback_rules(
-            name_for=lambda value: f"tail_stack0_store_loaded_byte_{value:02x}",
+        # R-FRAME INCR-3 (STACK0 row) — P5 RETIRE (unconditional collapse):
+        # emit ONLY the 32-rule per-nibble COMPUTED route (16 LO + 16 HI). Since
+        # this bank's READ lane (OUTPUT) == its WRITE lane, the retired 255-rule
+        # per-value ENUMERATED lookup was an identity-copy of the OUTPUT byte; the
+        # route reproduces the winning byte (argmax) + firing region byte-for-byte
+        # (proof: tools/_probe_m8_computed_writeback.py). The enumerated fallback +
+        # its ``C4_R_FRAME_TAIL`` / ``C4_STACK0_STORE_LOADED_COMPUTED`` flag branch
+        # are DELETED (P5); the default was already this collapsed form.
+        return _computed_byte_writeback_route_rules(
+            name_for=lambda band, k: (
+                f"tail_stack0_store_loaded_route_{band}_{k}"
+            ),
             base_conditions=base_conditions,
             threshold=25.0,
             strength=5000.0,
             lo_base="OUTPUT_LO",
             hi_base="OUTPUT_HI_THIS_STEP",
-            lo_match_weight=1.0,
-            hi_match_weight=1.0,
             gate=gate_mark_stack0,
             scope="mark == STACK0",
             dominates_at={
                 "OUTPUT_LO": "mark == STACK0",
                 "OUTPUT_HI_THIS_STEP": "mark == STACK0",
             },
-            skip=lambda lo, hi: lo == 0 and hi == 0,
         )
 
     def stack0_store_top_value_from_alu_rules() -> tuple[FFNRule, ...]:
@@ -8363,10 +7886,9 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("OP_ENT", -1000.0),
         )
         # Shared per-family evidence gate (everything EXCEPT the two per-value
-        # OUTPUT nibble match terms). Emitted verbatim ahead of the per-value
-        # match in the enumerated bank; the computed route re-uses it as its
+        # OUTPUT nibble match terms). The computed route uses it as its
         # ``base_conditions`` and appends the per-channel one-hot + summed-other
-        # match instead.
+        # match.
         mul_byte1_base = bounded_ax_byte0 + (
             ("HAS_SE", 20.0),
             ("TEMP+10", 30.0),
@@ -8385,88 +7907,31 @@ def _tail_bit32_result_correction_rules() -> tuple[FFNRule, ...]:
             ("TEMP+8", -1000.0),
             ("TEMP+9", -1000.0),
         ) + non_mul_blockers
-        # ENUMERATED->COMPUTED collapse (C4_WIDE_MUL_BYTE1_COMPUTED,
-        # DEFAULT-OFF): replace the 256-rule per-value lookup with a 32-rule
-        # per-nibble route.  Same READ==WRITE lane (OUTPUT); the route
-        # reproduces the winning byte (argmax) + firing region byte-for-byte at
-        # match_weight=2.0 / threshold=220 (proof:
-        # tools/_probe_wide_mul_computed_writeback.py).  BYTE-IDENTITY-BREAKING
-        # -> verdict-validated.  See _wide_mul_byte1_computed_enabled.
-        if _wide_mul_byte1_computed_enabled():
-            return _computed_byte_writeback_route_rules(
-                name_for=lambda band, k: (
-                    f"tail_wide_mul_byte1_preserve_route_{band}_{k}"
-                ),
-                base_conditions=mul_byte1_base,
-                threshold=220.0,
-                strength=10_000_000.0,
-                match_weight=2.0,
-                lo_base="OUTPUT_LO",
-                hi_base="OUTPUT_HI_THIS_STEP",
-                gate=dim_ref("opcode_flag", "MUL"),
-                scope="mark == AX AND opcode_at_AX == MUL",
-                dominates_at={
-                    "OUTPUT_LO": "is_byte",
-                    "OUTPUT_HI_THIS_STEP": "is_byte",
-                },
-            )
-        rules = []
-        for high_nibble in range(16):
-            for low_nibble in range(16):
-                byte_value = (high_nibble << 4) | low_nibble
-                name = (
-                    f"tail_wide_mul_byte1_preserve_{low_nibble:01x}"
-                    if high_nibble == 0
-                    else f"tail_wide_mul_byte1_preserve_{high_nibble:01x}{low_nibble:01x}"
-                )
-                rules.append(
-                    multi_way_and_rule(
-                        name=name,
-                        # The MARK_AX hard blocker (-1000) inside
-                        # bounded_ax_byte0 plus the OP_MUL positive whose
-                        # semantics include ``mark == AX`` make the
-                        # conditions-only effective predicate unsatisfiable;
-                        # F-5-gate fallback then surfaces ``mark == AX AND
-                        # opcode_at_AX == MUL`` as the effective firing set
-                        # (the gate physically forces firing there). Declare
-                        # scope to match so F-7 entailment succeeds. Keep
-                        # dominates_at on ``is_byte`` (the broader output
-                        # surface the rule actually staked a claim on) so
-                        # strength competition is computed against the
-                        # narrower historical population of is_byte
-                        # competitors rather than the broader mark==AX
-                        # writer set; with V1's sign-blind algebra and
-                        # positive_sum < threshold every write at any
-                        # dominance scope is flagged regardless, so this
-                        # choice is purely to keep the diagnostic stable.
-                        scope="mark == AX AND opcode_at_AX == MUL",
-                        dominates_at={"OUTPUT_LO": "is_byte", "OUTPUT_HI_THIS_STEP": "is_byte"},
-                        conditions=bounded_ax_byte0 + (
-                            ("HAS_SE", 20.0),
-                            ("TEMP+10", 30.0),
-                            ("OP_MUL", 80.0),
-                            ("OP_EQ", -1000.0),
-                            ("OP_NE", -1000.0),
-                            ("OP_LT", -1000.0),
-                            ("OP_GT", -1000.0),
-                            ("OP_LE", -1000.0),
-                            ("OP_GE", -1000.0),
-                            ("OP_JSR", -1000.0),
-                            ("OP_LEV", -1000.0),
-                            (f"OUTPUT_LO+{low_nibble}", 2.0),
-                            (f"OUTPUT_HI_THIS_STEP+{high_nibble}", 2.0),
-                            ("TEMP+4", -1000.0),
-                            ("TEMP+5", -1000.0),
-                            ("TEMP+6", -1000.0),
-                            ("TEMP+8", -1000.0),
-                            ("TEMP+9", -1000.0),
-                        ) + non_mul_blockers,
-                        threshold=220.0,
-                        gate=dim_ref("opcode_flag", "MUL"),
-                        writes=byte_writes(byte_value, strength=10_000_000.0),
-                    )
-                )
-        return tuple(rules)
+        # R-FRAME INCR-3 (AX row) — P5 RETIRE (unconditional collapse): emit ONLY
+        # the 32-rule per-nibble COMPUTED route (16 LO + 16 HI). Same READ==WRITE
+        # lane (OUTPUT); the route reproduces the retired 256-rule per-value
+        # ENUMERATED lookup's winning byte (argmax) + firing region byte-for-byte
+        # at match_weight=2.0 / threshold=220 (proof:
+        # tools/_probe_wide_mul_computed_writeback.py). The enumerated fallback +
+        # its ``C4_R_FRAME_TAIL`` / ``C4_WIDE_MUL_BYTE1_COMPUTED`` flag branch are
+        # DELETED (P5); the default was already this collapsed form.
+        return _computed_byte_writeback_route_rules(
+            name_for=lambda band, k: (
+                f"tail_wide_mul_byte1_preserve_route_{band}_{k}"
+            ),
+            base_conditions=mul_byte1_base,
+            threshold=220.0,
+            strength=10_000_000.0,
+            match_weight=2.0,
+            lo_base="OUTPUT_LO",
+            hi_base="OUTPUT_HI_THIS_STEP",
+            gate=dim_ref("opcode_flag", "MUL"),
+            scope="mark == AX AND opcode_at_AX == MUL",
+            dominates_at={
+                "OUTPUT_LO": "is_byte",
+                "OUTPUT_HI_THIS_STEP": "is_byte",
+            },
+        )
 
     ax_byte0 = (
         ("IS_BYTE", 1.0),
