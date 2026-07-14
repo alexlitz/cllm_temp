@@ -16,10 +16,10 @@ This module reconciles the two (see DESIGN.md section (g)):
     ``op | imm<<8``) into the substrate's ``[(op_name, imm), ...]`` form.
   * ``RealBackend`` compiles+runs the real substrate and assembles a
     ``Decoded`` (exit-code-only: the straight-line slice tracks AX, not PC).
-  * ``expected_8bit`` computes the ground truth via the substrate's OWN
-    clean-room 8-bit reference interpreter (``isa.interpret``) so the expected
-    semantics match the model's 8-bit width (the neural_vm reference is 32-bit
-    and disagrees on wrap/underflow boundary cases — see DESIGN.md (g)).
+  * ``expected_8bit`` reconciles the ground truth to the substrate's 8-bit
+    width by masking the (full-coverage, 32-bit) reference-oracle exit code to
+    8 bits — the neural_vm reference is 32-bit and disagrees on wrap/underflow
+    boundary cases (see DESIGN.md (g)).
 
 Ops outside the implemented slice (IMM/LEA/PSH/ADD/SUB/HALT) raise
 ``NotImplementedError`` inside the compiler; the harness records that as
@@ -33,6 +33,7 @@ from typing import List, Optional, Tuple
 from . import isa
 from . import compiler as _compiler
 from .oracle import Decoded, Expected, Program
+from .oracle import expected_for_program as _expected_ref
 
 
 # The reference-VM EXIT opcode id (oracle uses OP_EXIT=38); the substrate's
@@ -59,26 +60,30 @@ def prog_to_ops(prog: Program) -> List[Tuple[str, int]]:
     return ops
 
 
-def expected_8bit(prog: Program, *, max_steps: int = 256) -> Expected:
-    """Ground truth via the substrate's clean-room 8-bit reference interpreter.
+def expected_8bit(prog: Program, *, max_steps: int = 64) -> Expected:
+    """Ground truth reconciled to the substrate's 8-bit width.
 
-    Matches the model-under-test's 8-bit width exactly (unlike the 32-bit
-    neural_vm oracle). ``exit_code`` is the AX on the HALT step, zero-extended
-    into the 32-bit field the harness compares against.
+    The reference oracle (``oracle.expected_for_program`` via
+    ``neural_vm.verification.symbolic_program``) is a full 32-bit VM and covers
+    every op-class — but it disagrees with the 8-bit substrate on wrap/underflow
+    boundary cases (e.g. ``255+1 -> 256`` vs ``0``, ``7-9 -> 2**32-2`` vs
+    ``254``). Since the substrate is defined 8-bit (DESIGN.md (a)–(c)), we take
+    the 32-bit oracle's exit code and **mask it to 8 bits** — the correct
+    semantic bridge (``256 & 0xFF == 0``, ``(2**32-2) & 0xFF == 254``). This
+    keeps full op-class coverage on the expected side (the neural_vm interpreter
+    knows ENT/ADJ/JSR/LEV etc., which the substrate's slice interpreter does
+    not) while matching the model's width for the implemented ops.
     """
-    try:
-        ops = prog_to_ops(prog)
-    except KeyError as exc:
-        return Expected(exit_code=None, steps=None, halted=False,
-                        error=f"{prog.label}: {exc}")
-    code = [isa.Instr(isa.BY_NAME[name], imm) for name, imm in ops]
-    emitted = isa.interpret(code, max_steps=max_steps)
-    if not emitted:
-        return Expected(exit_code=None, steps=None, halted=False,
-                        error=f"{prog.label}: produced no output")
-    halted = any(ins.op == isa.HALT for ins in code)
-    exit_code = int(emitted[-1]) & 0xFFFFFFFF
-    return Expected(exit_code=exit_code, steps=len(emitted), halted=halted)
+    exp = _expected_ref(prog, max_steps=max_steps)
+    if exp.exit_code is None:
+        return exp
+    return Expected(
+        exit_code=int(exp.exit_code) & 0xFF,
+        steps=exp.steps,
+        halted=exp.halted,
+        trace=exp.trace,
+        error=exp.error,
+    )
 
 
 class RealBackend:

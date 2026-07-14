@@ -358,11 +358,16 @@ the two:
   2. **Compile+run** — call `compiler.compile_program(...)` then
      `compiler.run(...)`, yielding the per-step AX list.
   3. **`Decoded` assembly** — the substrate emits AX per step; the exit code is
-     the AX on the HALT step (8-bit, zero-extended to the 32-bit field the
-     oracle compares). `steps` = number of executed VM steps. The straight-line
-     slice does not track PC, so the adapter returns an **exit-code-only**
-     `Decoded` (no trace) — a valid weaker conformer per the harness contract
-     (it degrades to exit_code + steps comparison).
+     the AX on the HALT step (8-bit). `steps` = number of executed VM steps. The
+     straight-line slice does not track PC, so the adapter returns an
+     **exit-code-only** `Decoded` (no trace) — a valid weaker conformer per the
+     harness contract (it degrades to exit_code + steps comparison).
+  4. **8-bit expected reconciliation** (`expected_8bit`) — the reference oracle
+     is a full 32-bit VM, so it disagrees with the 8-bit substrate on
+     wrap/underflow boundary cases (`255+1 -> 256` vs `0`; `7-9 -> 2**32-2` vs
+     `254`). The adapter masks the oracle's exit code to 8 bits before comparing
+     — the correct semantic bridge — keeping full op-class coverage on the
+     expected side while matching the substrate's width for the implemented ops.
 
 Ops the adapter can drive are exactly the substrate's implemented slice
 (`IMM/LEA/PSH/ADD/SUB/HALT`); any op-class whose program uses an unimplemented

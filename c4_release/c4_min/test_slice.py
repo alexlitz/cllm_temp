@@ -30,6 +30,12 @@ def test_sub():
     assert got[-1] == 6
 
 
+def test_sub_underflow_wraps_mod_256():
+    """7 - 9 == 254 (8-bit two's-complement underflow via the mod-256 fold)."""
+    got, _ = _check([("IMM", 7), ("PSH", 0), ("IMM", 9), ("SUB", 0), ("HALT", 0)])
+    assert got[-1] == (7 - 9) & 0xFF == 254
+
+
 def test_add_wraps_mod_256():
     """200 + 100 == 44 (8-bit wrap)."""
     got, _ = _check([("IMM", 200), ("PSH", 0), ("IMM", 100), ("ADD", 0), ("HALT", 0)])
@@ -98,7 +104,8 @@ if __name__ == "__main__":
     import traceback
 
     tests = [
-        test_imm_add_halt, test_sub, test_add_wraps_mod_256,
+        test_imm_add_halt, test_sub, test_sub_underflow_wraps_mod_256,
+        test_add_wraps_mod_256,
         test_imm_only, test_halt_terminator_fires,
         test_carry_forward_attention, test_content_match_attention,
     ]

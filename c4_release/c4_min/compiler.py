@@ -57,7 +57,14 @@ def _step_rules(L: Layout, ins: isa.Instr) -> List[FFNRule]:
     elif op == isa.ADD:
         rules.append(FFNRule(G, {ax: LinearExpr.of(stk, 1.0)}))
     elif op == isa.SUB:
-        rules.append(FFNRule(G, {ax: LinearExpr.of(stk, 1.0) + LinearExpr.of(ax, -2.0)}))
+        # AX = pop() - AX = stk - ax. Compute (stk - ax + 256) so the value is
+        # in [1, 511]; the following mod-256 fold re-quantises it to [0, 256),
+        # yielding the correct 8-bit two's-complement result on underflow
+        # (e.g. 7 - 9 -> 254). (stk - 2*ax) + 256 written additively onto AX:
+        #   ax += stk - 2*ax + 256  ==  stk - ax + 256.
+        rules.append(FFNRule(G, {ax: LinearExpr.of(stk, 1.0)
+                                 + LinearExpr.of(ax, -2.0)
+                                 + LinearExpr.c(256.0)}))
     elif op == isa.HALT:
         rules.append(FFNRule(G, {L.HALTED: LinearExpr.c(1.0)}))
     else:
@@ -97,10 +104,11 @@ def compile_program(prog, n_heads: int = 4, max_pos: int = 4):
     ffn_specs = []
     for k, ins in enumerate(code):
         ffn_specs.append(compile_ffn(_step_rules(L, ins), dim))
-        if ins.op == isa.ADD:
-            # 8-bit wrap: fold AX back into [0,256) after an add that can carry
-            # out of a byte (result in [0,510]). Signed SUB wrap + SHL wrap are
-            # documented extensions (same gadget, wider/offset fold).
+        if ins.op in (isa.ADD, isa.SUB):
+            # 8-bit wrap: fold AX back into [0,256). ADD leaves AX in [0,510]
+            # (carry-out of a byte); SUB is computed as (a - b + 256) in [1,511]
+            # so the same mod-256 fold yields the two's-complement result on
+            # underflow. (SHL wrap is the same gadget with a wider/offset fold.)
             ffn_specs.append(compile_fold(L.AX, L.ONE, dim, modulus=256))
         ffn_specs.append(compile_ffn(_emit_rule(L, L.OUT_SLOTS[k]), dim))
     n_blocks = len(ffn_specs)
