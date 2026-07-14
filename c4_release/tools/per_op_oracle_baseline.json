@@ -1,0 +1,343 @@
+{
+ "note": "per-op decode oracle baseline, main 02e84ee8 golden 1c04c3fd (full_trace faithful verdict, spec_k=32)",
+ "op_classes": {
+  "ADD": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#0",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#1",
+     "status": "pass"
+    }
+   ]
+  },
+  "SUB": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#50",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#51",
+     "status": "pass"
+    }
+   ]
+  },
+  "MUL": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#100",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#101",
+     "status": "pass"
+    }
+   ]
+  },
+  "DIV": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#150",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#151",
+     "status": "pass"
+    }
+   ]
+  },
+  "MOD": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#200",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#201",
+     "status": "pass"
+    }
+   ]
+  },
+  "EQ": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#400",
+     "status": "pass"
+    }
+   ]
+  },
+  "NE": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "ne_7_9",
+     "status": "fail"
+    },
+    {
+     "label": "ne_5_5",
+     "status": "pass"
+    }
+   ]
+  },
+  "LT": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#375",
+     "status": "pass"
+    }
+   ]
+  },
+  "GT": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#350",
+     "status": "pass"
+    }
+   ]
+  },
+  "LE": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "le_7_9",
+     "status": "pass"
+    },
+    {
+     "label": "le_9_7",
+     "status": "fail"
+    }
+   ]
+  },
+  "GE": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "ge_9_7",
+     "status": "fail"
+    },
+    {
+     "label": "ge_7_9",
+     "status": "pass"
+    }
+   ]
+  },
+  "AND": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "and_108_58",
+     "status": "pass"
+    },
+    {
+     "label": "and_255_15",
+     "status": "fail"
+    }
+   ]
+  },
+  "OR": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "or_108_58",
+     "status": "pass"
+    },
+    {
+     "label": "or_16_1",
+     "status": "pass"
+    }
+   ]
+  },
+  "XOR": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "xor_108_58",
+     "status": "pass"
+    },
+    {
+     "label": "xor_255_255",
+     "status": "pass"
+    }
+   ]
+  },
+  "SHL": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "shl_5_3",
+     "status": "pass"
+    },
+    {
+     "label": "shl_1_8",
+     "status": "pass"
+    }
+   ]
+  },
+  "SHR": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "shr_200_2",
+     "status": "pass"
+    },
+    {
+     "label": "shr_255_4",
+     "status": "fail"
+    }
+   ]
+  },
+  "LI": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#250",
+     "status": "pass"
+    }
+   ]
+  },
+  "LC": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "lc_data0",
+     "status": "fail"
+    }
+   ]
+  },
+  "SI": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#250",
+     "status": "pass"
+    }
+   ]
+  },
+  "SC": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "sc_then_lc",
+     "status": "fail"
+    }
+   ]
+  },
+  "PSH": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#0",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#100",
+     "status": "pass"
+    }
+   ]
+  },
+  "LEA": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#250",
+     "status": "pass"
+    }
+   ]
+  },
+  "IMM": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#1031",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#1022",
+     "status": "pass"
+    }
+   ]
+  },
+  "JMP": {
+   "ok": false,
+   "programs": [
+    {
+     "label": "corpus#1029",
+     "status": "fail"
+    }
+   ]
+  },
+  "JSR": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#250",
+     "status": "pass"
+    }
+   ]
+  },
+  "ENT": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#250",
+     "status": "pass"
+    }
+   ]
+  },
+  "ADJ": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#550",
+     "status": "pass"
+    }
+   ]
+  },
+  "LEV": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#550",
+     "status": "pass"
+    }
+   ]
+  },
+  "BZ": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "corpus#1026",
+     "status": "pass"
+    },
+    {
+     "label": "corpus#1027",
+     "status": "pass"
+    }
+   ]
+  },
+  "BNZ": {
+   "ok": true,
+   "programs": [
+    {
+     "label": "bnz_taken",
+     "status": "pass"
+    },
+    {
+     "label": "bnz_nottaken",
+     "status": "pass"
+    }
+   ]
+  }
+ }
+}
