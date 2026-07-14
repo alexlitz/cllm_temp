@@ -2269,14 +2269,6 @@ def _build_cache_key_snapshot(
             tuple(sorted(extra_residual_dims.items()))
             if extra_residual_dims else None
         ),
-        # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
-        # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
-        # head-0 slot-0 Q discriminator gains six OP_<cmp> * -1e6 veto cells,
-        # so the ON / OFF builds bake a different W_q row and must never share
-        # a memo entry. See shared.l15_lookup_cmp_veto_enabled.
-        "C4_L15_LOOKUP_CMP_VETO": (
-            os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
-        ),
         # Consumer-opcode LOOKAHEAD (#221; DEFAULT-ON, opt out =0): adds the
         # PC+8 chain + lookahead fetch head + arith-decode flag + AX->STACK0
         # relay + prior-arith latch + dump-block flag bands AND the dump's

@@ -1430,46 +1430,6 @@ def mul_l19_product_boost_enabled() -> bool:
     return os.environ.get("C4_MUL_L19_PRODUCT_BOOST", "1") != "0"
 
 
-def l15_lookup_cmp_veto_enabled() -> bool:
-    """Return True iff the L15 ``li_lc_stack0_h0`` lookup head's slot-0
-    discriminator VETOES on the comparison opcodes (OP_GT/OP_LT/OP_GE/OP_LE/
-    OP_EQ/OP_NE), suppressing its spurious +40 CLEAN_EMBED->OUTPUT_LO copy on
-    a COMPARISON step (DEFAULT ON; opt-out via ``C4_L15_LOOKUP_CMP_VETO=0``).
-
-    The wall this lifts (verified spec_k=0, BUILT dims, GPU full_trace;
-    ``bool_and`` 24/25, the sole fail id=1087 ``97>20 && 20>34``):
-
-    L15 memory-lookup head 0 (``li_lc_stack0_h{0}``, value_scale=40) is the
-    LI/LC + STACK0-POP load head. Its slot-0 discriminator fires the lookup
-    on ``CMP+3`` (the "POP group" flag) -- but ``CMP+3`` is OVERLOADED: the L9
-    cmp cascade ALSO drives it as the low-nibble-less-than flag, so on a
-    GT-true comparison step (probed id=1087 step-3 AX row: ``CMP+3=1.45``,
-    ``OP_GT+0=5.23``) the head MIS-FIRES, attends a cross-step ``CLEAN_EMBED``
-    row, and copies ``+40.0`` into ``OUTPUT_LO+0``. That ``+40`` buries the
-    clean GT result one-hot (``OUTPUT_LO+1=5.11`` for GT=1) at the LM-head
-    argmax, so the comparison byte decodes ``0`` instead of ``1`` -> the
-    full_trace step-3 AX diverges (``expected ax=1 got ax=0``). It fires only
-    for diff-hi-nibble GT-true operands (the ones whose ``CMP+3`` lo_lt flag
-    rides high enough to clear the head's threshold).
-
-    FIX. The slot-0 discriminator already vetoes the non-load opcodes
-    (``OP_JSR/OP_ENT/OP_LEA/OP_IMM`` at ``-1e6``) but NOT the comparison
-    opcodes. A genuine LI/LC/POP load NEVER has a comparison opcode hot at its
-    own marker (the opcode is OP_LI/OP_LC/OP_POP), whereas a comparison step
-    has exactly one of OP_GT/OP_LT/OP_GE/OP_LE/OP_EQ/OP_NE one-hot at MARK_AX.
-    Adding those six opcodes to the SAME ``non_load_suppression`` veto keeps
-    the head silent on comparison rows (``OP_GT*-1e6 << CMP+3*50000``) and
-    byte-identical on every real load row. Scoped to head 0's slot-0 Q only;
-    no V/O / scale change, so the LI/LC/POP delivery is untouched.
-
-    DEFAULT ON. Opt-out via ``C4_L15_LOOKUP_CMP_VETO=0`` restores the
-    no-veto discriminator (the byte-identical-OFF path). Kept as a dedicated
-    kill-switch for ``tools/flag_regression_gate.py`` and the flag-OFF
-    golden byte-identity gate.
-    """
-    return os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
-
-
 def addsub_declarative_enabled() -> bool:
     """Return True iff efficient-mode L8 ADD/SUB uses the DECLARATIVE wrap
     (DEFAULT OFF — opt-in via ``C4_ADDSUB_DECLARATIVE=1``).
