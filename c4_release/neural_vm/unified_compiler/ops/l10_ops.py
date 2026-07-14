@@ -2835,12 +2835,11 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
     # and lo_lt-alone does NOT flip LT-false 50<44). hi_lt (CMP+0) lands ~0.77
     # alone and already trips its 2-way override (> 0.5), so its strength is
     # left untouched — only the EQ flag and the lo_lt 3-way partner are
-    # boosted. Gated so flag-OFF is byte-identical to the golden bake.
-    if os.environ.get("C4_CMP_FLAG_MARGIN_FIX", "1") != "0":
-        FLAG_EQ = 0.45  # -> ~1.05 at decode row (was ~0.72)
-        FLAG_LT_LO_LT = 0.19  # lo_lt -> ~1.10 (was ~0.88); hi_lt unchanged
-    else:
-        FLAG_LT_LO_LT = FLAG_LT
+    # boosted. Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_CMP_FLAG_MARGIN_FIX`` escape hatch was retired as a proven default-ON
+    # fix).
+    FLAG_EQ = 0.45  # -> ~1.05 at decode row (was ~0.72)
+    FLAG_LT_LO_LT = 0.19  # lo_lt -> ~1.10 (was ~0.88); hi_lt unchanged
     # CMP equal-high-nibble GT lo-margin fix (#322, 2026-06-23, CAMPAIGN only).
     # ROOT (isolated CPU-autoregressive, campaign config
     # ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims, spec_k=0,
@@ -2870,8 +2869,11 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
     # zero-sum trade. ``lo_lt`` (CMP+3) write strength is UNTOUCHED so lt/le/ge
     # margins are unchanged. Kill-switch ``C4_CMP_GT_LO_MARGIN=0`` restores the
     # 0.45 campaign value; flag-OFF / non-campaign is byte-identical to golden.
-    from .shared import no_stack0_emit_enabled, cmp_gt_lo_margin_enabled
-    if no_stack0_emit_enabled() and cmp_gt_lo_margin_enabled():
+    from .shared import no_stack0_emit_enabled
+    # The campaign hi_eq knock-down is unconditional under campaign (P5
+    # flag-retire 2026-07-14; the former ``C4_CMP_GT_LO_MARGIN`` escape hatch was
+    # retired as a proven default-ON fix).
+    if no_stack0_emit_enabled():
         FLAG_EQ = 0.30  # campaign: -> hi_eq ~1.24 (was 1.86 at 0.45)
 
     # if_var GT-FALSE 0xF-leak guard (#339, 2026-06-25, CAMPAIGN only).

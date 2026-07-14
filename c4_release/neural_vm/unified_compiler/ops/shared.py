@@ -1038,46 +1038,6 @@ def cmp_eq_hinib_veto_enabled() -> bool:
     return True
 
 
-def cmp_gt_lo_margin_enabled() -> bool:
-    """Return True iff the CMP equal-high-nibble GT lo-margin knock-down is active
-    (DEFAULT ON in the campaign config — opt-out via ``C4_CMP_GT_LO_MARGIN=0``;
-    only takes effect when the STACK0 emission is dropped, i.e.
-    ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is byte-identical to
-    golden ``7f6f2e5d``).
-
-    The residual cmp wall this lifts (#322, isolated CPU-autoregressive, campaign
-    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims, spec_k=0,
-    ``tools/probe_gt_lo_margin.py``): the equal-high-nibble GT-TRUE comparisons
-    ``if_gt 54>53 / 60>54 / 54>50`` (A.hi == B.hi, A.lo > B.lo, so ``lo_lt = 0``)
-    decoded GT=0 because the live ComparisonCombine's ``(hi_eq AND lo_lt) -> GT=0``
-    3-way override (fires iff ``MARK_AX + hi_eq + lo_lt > 2.5``) SPURIOUSLY tripped
-    on ``hi_eq`` ALONE. In the campaign config the ``CmpOperandSeRecoverFFN``
-    re-materializes a STRONGER operand-A one-hot than golden, so the shared
-    ``C4_CMP_FLAG_MARGIN_FIX`` ``FLAG_EQ=0.45`` overshoots and lands ``hi_eq`` at
-    ~1.86 at the decode row -- ABOVE its own (0.75, 1.5) single-flag ceiling --
-    making ``1 + 1.86 + 0 = 2.86 > 2.5`` flip GT-true to GT=0
-    (probed OUTPUT_LO@blk26 = [25.5@0, -15.9@1]).
-
-    FIX: campaign-only, lower the ordering-engine ``FLAG_EQ`` to 0.30 so ``hi_eq``
-    lands at ~1.24 (comfortably in-window). The spurious single-flag trip is gone
-    (``1 + 1.24 + 0 = 2.24 < 2.5`` -> override OFF -> GT stays default=1, probed
-    [0.6@0, 8.9@1] -> GT=1) while every INTENDED ``(hi_eq AND lo_lt)`` override
-    still fires decisively (53>54 / 86<87: ``1 + 1.24 + 1.45 = 3.69 > 2.5``) and
-    ``lo_lt``-alone still does NOT trip (50<44: ``1 + 0 + 1.45 = 2.45 < 2.5``).
-    The ``lo_lt`` (CMP+3) write strength is UNTOUCHED so lt/le/ge margins are
-    unchanged -- DISCRIMINATING, no zero-sum trade. ``lint_cross_op_ffn`` PASS
-    (band-local to CMP; no shared OUTPUT/ALU read perturbed).
-
-    DEFAULT ON. Opt-out via ``C4_CMP_GT_LO_MARGIN=0`` restores the 0.45 campaign
-    value (byte-identical-OFF). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_CMP_GT_LO_MARGIN`` can A/B it inside
-    the campaign config.
-    """
-    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
-    # ``C4_CMP_GT_LO_MARGIN`` escape hatch was retired as a proven default-ON fix).
-    return True
-
-
 def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
     """Return True iff the L10 ordering-engine ``hi_lt`` (CMP+0) blocker DROPS its
     ``ALU_HI+15`` (0xF address-high-nibble) veto term in the campaign config
