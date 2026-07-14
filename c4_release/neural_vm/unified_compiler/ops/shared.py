@@ -2380,10 +2380,11 @@ def loop_lea_b0_e0_restore_enabled() -> bool:
     address-eval LEA, and the ``IS_BYTE`` + non-AX marker NOT-blocks keep it OFF
     every value-byte / non-AX row.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_LEA_B0_E0`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
     )
 
 

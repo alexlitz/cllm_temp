@@ -2089,17 +2089,6 @@ def _build_cache_key_snapshot(
         "C4_ABSDIFF_RET_BYTE1": (
             os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
         ),
-        # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
-        # campaign-ON, opt out =0, BAKE-affecting): registers the
-        # l10_loop_lea_b0_e0 PureFFN post_op so ON / OFF builds STRUCTURALLY
-        # differ (an extra FFN op + block) and must never share a serialised
-        # entry. Gated on the campaign prerequisites so the non-campaign /
-        # golden build is byte-identical. See shared.loop_lea_b0_e0_restore_enabled.
-        "C4_LOOP_LEA_B0_E0": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
-        ),
         # PROJECT_0XE8_SLAM Phase-2: MULTIPLICATIVE OP_LEA gate on the
         # loop_lea_b0_e8 / _e0 restore ops (DEFAULT OFF, opt in =1,
         # BAKE-affecting): adds a per-unit gate to EVERY unit in both rule
