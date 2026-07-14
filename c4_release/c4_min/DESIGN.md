@@ -306,3 +306,72 @@ cascades, which are what inflate the general substrate. The one real risk to the
 branch-driven control flow (cross-position state carry, the `PC-driven fetch` row), which is
 un-exercised by this straight-line slice — but even tripling that entire line item leaves
 the total under 6K.
+
+---
+
+## (g) Model interface — the oracle-harness contract
+
+*(Folded in from the oracle-harness lane's `DESIGN.md`. The substrate design
+above (a)–(f) is authoritative for the compiler/layout/architecture; this
+section pins the interface the per-op oracle harness (`oracle.py` +
+`run_oracle.py`) depends on, and records how the REAL substrate satisfies it via
+a thin adapter.)*
+
+**Reference semantics (expected side only).** The authoritative ISA behaviour
+for the *expected* (ground-truth) side of the oracle lives in
+`neural_vm/verification/symbolic_program.py::SymbolicDeclarativeProgramRunner`
+— a pure-Python bytecode interpreter. The harness reuses it for the expected
+side ONLY; the model-under-test side is c4_min-only (clean-room). Programs are
+encoded in the c4 encoding `instr = opcode | (imm << 8)` and carry an optional
+`data: bytes` segment loaded at the data base `0x10000`. The program's
+observable result is its **exit code** = `AX` at `EXIT` (masked to 32 bits),
+plus an optional per-step `(pc, ax)` trace.
+
+**Harness's expected model interface** (the signatures `run_oracle.py` was
+originally written against, a *stub*):
+
+```python
+# stub the harness was written against:
+c4_min.compile.compile_program(prog: Program) -> state_dict (dict)
+c4_min.model.run(state_dict, prog, *, max_steps) -> Decoded
+```
+where `Program` (`oracle.Program`) has `.bytecode: tuple[int]` (encoded ints)
+and `.data: bytes`, and `Decoded` (`oracle.Decoded`) carries
+`exit_code / steps / halted / trace=((pc,ax),...)`.
+
+**The REAL substrate interface** (this repo, section (e)):
+
+```python
+c4_min.compiler.compile_program(prog, n_heads=4, max_pos=4) -> (model, layout, code)
+c4_min.compiler.run(model, layout, code) -> list[int]   # per-step AX trace
+```
+where `prog` is `[(op_name, imm), ...]` (name strings), values are 8-bit, and
+there is no `state_dict` / `data` segment in the straight-line slice.
+
+**The adapter (`c4_min/oracle_adapter.py`).** A thin `RealBackend` reconciles
+the two:
+
+  1. **Program translation** — decode each `Program.bytecode` int
+     (`op = w & 0xFF`, `imm = (w >> 8) & 0xFF`) into the substrate's
+     `[(op_name, imm), ...]` form, mapping the opcode id to its name via
+     `isa.NAMES` and appending an explicit `HALT` if the program ends on `EXIT`.
+  2. **Compile+run** — call `compiler.compile_program(...)` then
+     `compiler.run(...)`, yielding the per-step AX list.
+  3. **`Decoded` assembly** — the substrate emits AX per step; the exit code is
+     the AX on the HALT step (8-bit, zero-extended to the 32-bit field the
+     oracle compares). `steps` = number of executed VM steps. The straight-line
+     slice does not track PC, so the adapter returns an **exit-code-only**
+     `Decoded` (no trace) — a valid weaker conformer per the harness contract
+     (it degrades to exit_code + steps comparison).
+
+Ops the adapter can drive are exactly the substrate's implemented slice
+(`IMM/LEA/PSH/ADD/SUB/HALT`); any op-class whose program uses an unimplemented
+opcode raises `NotImplementedError` in `_step_rules`, which the harness records
+as `model_error` (the FAN-OUT baseline: the op is not built yet). This is the
+intended per-op PASS/FAIL table — implemented ops PASS, the rest FAIL pending
+the opcode fan-out.
+
+**Verdict.** For each generated program the harness (1) computes the expected
+`(exit_code, steps[, trace])` via the reference VM, (2) drives the real compiler
+through the adapter, (3) PASS iff `exit_code` (and `trace`, when present) match.
+Output is a per-op-class PASS/FAIL table mirroring `tools/run_per_op_oracle.py`.
