@@ -692,7 +692,9 @@ def div_multibyte_enabled() -> bool:
     (divmod stays at block 14, converter reads CLEAN_EMBED). See
     ``docs/DIV_MOD_MULTIBYTE_DIVIDEND_BLOCKER_2026_06_12.md``.
     """
-    return os.environ.get("C4_DIV_MULTIBYTE", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_DIV_MULTIBYTE`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def divmod_byte0_se_recover_enabled() -> bool:
@@ -730,7 +732,9 @@ def divmod_byte0_se_recover_enabled() -> bool:
     ``tools/flag_regression_gate.py --flag C4_DIVMOD_BYTE0_SE_RECOVER`` can
     A/B it inside the campaign config.
     """
-    return os.environ.get("C4_DIVMOD_BYTE0_SE_RECOVER", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_DIVMOD_BYTE0_SE_RECOVER`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def mul_byte0_se_recover_enabled() -> bool:
@@ -790,7 +794,9 @@ def mul_byte0_se_recover_enabled() -> bool:
     ``tools/flag_regression_gate.py --flag C4_MUL_BYTE0_SE_RECOVER`` can A/B it
     inside the campaign config.
     """
-    return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_BYTE0_SE_RECOVER`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def sub_full_borrow_enabled() -> bool:
@@ -980,7 +986,9 @@ def mul_multibyte_l19_boost_enabled() -> bool:
     path is campaign-only). Kept as a dedicated kill-switch for
     ``tools/flag_regression_gate.py``.
     """
-    return os.environ.get("C4_MUL_MULTIBYTE_L19_BOOST", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_MULTIBYTE_L19_BOOST`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def cmp_eq_hinib_veto_enabled() -> bool:
@@ -1025,7 +1033,9 @@ def cmp_eq_hinib_veto_enabled() -> bool:
     kill-switch so ``tools/flag_regression_gate.py --flag C4_CMP_EQ_HINIB_VETO``
     can A/B it inside the campaign config.
     """
-    return os.environ.get("C4_CMP_EQ_HINIB_VETO", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_CMP_EQ_HINIB_VETO`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def cmp_gt_lo_margin_enabled() -> bool:
@@ -1063,7 +1073,9 @@ def cmp_gt_lo_margin_enabled() -> bool:
     ``tools/flag_regression_gate.py --flag C4_CMP_GT_LO_MARGIN`` can A/B it inside
     the campaign config.
     """
-    return os.environ.get("C4_CMP_GT_LO_MARGIN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_CMP_GT_LO_MARGIN`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
@@ -1349,7 +1361,9 @@ def mul_l19_flood_cap_enabled() -> bool:
     or ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden). Kept as a
     dedicated kill-switch for ``tools/flag_regression_gate.py``.
     """
-    return os.environ.get("C4_MUL_L19_FLOOD_CAP", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_L19_FLOOD_CAP`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def mul_l19_product_boost_enabled() -> bool:
@@ -1391,7 +1405,9 @@ def mul_l19_product_boost_enabled() -> bool:
     is campaign-only). Kept as a dedicated kill-switch for
     ``tools/flag_regression_gate.py``.
     """
-    return os.environ.get("C4_MUL_L19_PRODUCT_BOOST", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_L19_PRODUCT_BOOST`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def addsub_declarative_enabled() -> bool:
