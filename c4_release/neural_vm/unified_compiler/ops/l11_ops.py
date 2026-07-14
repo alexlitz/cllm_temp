@@ -2329,9 +2329,13 @@ _OUTPUT_B0_NOLEAK_CANCEL_NUM = 0.8  # lowered as -CANCEL_NUM/S; cancels the +2.0
 
 
 def _output_b0_noleak_enabled() -> bool:
-    """Local shim for :func:`shared.output_b0_noleak_enabled` (campaign-gated)."""
-    from .shared import no_stack0_emit_enabled, output_b0_noleak_enabled
-    return no_stack0_emit_enabled() and output_b0_noleak_enabled()
+    """L11 OUTPUT byte-0 no-leak root — now UNCONDITIONAL (P5 flag-retire
+    2026-07-14). The former ``C4_OUTPUT_B0_NOLEAK`` escape hatch was a proven
+    default-ON fix; its OFF branch is deleted. Still gated on the campaign
+    prerequisite ``no_stack0_emit_enabled`` (the golden 35-tok / non-campaign
+    build never installed this op)."""
+    from .shared import no_stack0_emit_enabled
+    return no_stack0_emit_enabled()
 
 
 def _output_b0_noleak_rules(S: float = 100.0) -> tuple[FFNRule, ...]:
@@ -2368,9 +2372,10 @@ def _output_b0_noleak_rules(S: float = 100.0) -> tuple[FFNRule, ...]:
 def make_output_b0_noleak_op() -> Operation:
     """L11 post-op: zero the shift-row OUTPUT byte-0 zero-default at its SOURCE.
 
-    Registered always; bakes weights ONLY under the campaign flag
-    (``no_stack0_emit_enabled() and output_b0_noleak_enabled()``, DEFAULT-ON), so
-    flag-OFF (``C4_OUTPUT_B0_NOLEAK=0``) / non-campaign is byte-identical to the
+    Registered always; bakes weights ONLY under the campaign prerequisite
+    (``no_stack0_emit_enabled()``, DEFAULT-ON — the former ``C4_OUTPUT_B0_NOLEAK``
+    escape hatch was RETIRED 2026-07-14, the fix is now unconditional under
+    campaign), so non-campaign (``C4_NO_STACK0_EMIT=0``) is byte-identical to the
     ``e50521f3`` golden. Runs as a post_op on THIS L11 ``layer11_mul_partial``
     block (the block that plants the leak) so the OUTPUT band is clean the moment
     it leaves L11 -- the downstream shift writeback sees an empty band on the SHR

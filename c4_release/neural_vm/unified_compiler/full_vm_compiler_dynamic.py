@@ -2253,13 +2253,6 @@ def _build_cache_key_snapshot(
         "C4_SHIFT_OUTPUT_B0_CLEAR": (
             os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
         ),
-        # L11 OUTPUT byte-0 no-leak root (DEFAULT-ON, BAKE-affecting): when active
-        # a 1-unit L11 post-op FFN is baked (cancelling OUTPUT byte-0 on the OP_SHR
-        # compute row) so the ON / OFF builds differ and must never share a
-        # serialised entry. See shared.output_b0_noleak_enabled.
-        "C4_OUTPUT_B0_NOLEAK": (
-            os.environ.get("C4_OUTPUT_B0_NOLEAK", "1") != "0"
-        ),
         # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
         # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)
         # blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF builds bake
