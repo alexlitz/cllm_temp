@@ -257,8 +257,13 @@ _COMPOSITE_FFN = ("AddSub5StageBlock", "FlattenedALUMul", "ALUShiftComposite",
                   # ALU_HI cell-13 leak clear) treating it as composite runs the
                   # real wrap; treating it as a plain PureFFN AttributeErrors on
                   # ``W_up``.
-                  "LoadedOperandAddHi15ClearFFN", "CmpOperandSeRecoverFFN",
-                  "MulOperandSeRecoverFFN",
+                  "LoadedOperandAddHi15ClearFFN",
+                  # ``CleanOperandOneHotFFN`` (C4_CLEAN_OPERAND_ADD /
+                  # _BITWISE, DEFAULT-ON in the campaign efficient build) snaps
+                  # the operand bands to a clean one-hot then delegates to its
+                  # ``inner`` PureFFN — same delegate-not-expose pattern, so the
+                  # faithful forward must run the real ``block.ffn(x)``.
+                  "CleanOperandOneHotFFN",
                   "ShiftOutputClearFFN")
 
 

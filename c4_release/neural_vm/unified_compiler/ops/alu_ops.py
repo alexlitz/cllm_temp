@@ -1332,50 +1332,20 @@ def make_efficient_l10_andorxor_wrap_op(alu_mode: str = 'lookup') -> Operation:
         # is a post_op expanded into its own passthrough block AFTER
         # block.ffn so the bitwise lookup reads the cleaned operands.
         #
-        # === STACK0 campaign (2026-06-22): comparison operand-A SE recover ===
-        # Under ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` the L10
-        # ALU-clear crushes operand A all-negative for a value-dependent subset
-        # of cmp rows; the ordering/eq engines (merged into ``cleanup_ffn``)
-        # then read a -45 floor and their index-0 BLOCKERS flip positive ->
-        # every nibble unit fires -> CMP saturates to garbage -> mis-decode
-        # (bool_and + cmp low-nibble). The clean operand survives in SE_ALU;
-        # wrap ``cleanup_ffn`` in a forward-pass recover that restores the
-        # ALU band from SE_ALU on the cmp+MARK_AX row BEFORE the engines read.
-        # It runs as the SAME block (it IS block.ffn) so the physical block
-        # count is unchanged (lea contract). Flag-OFF / non-campaign leaves
-        # ``block.ffn = cleanup_ffn`` exactly (byte-identical to golden). See
-        # ``shared.cmp_byte0_se_recover_enabled`` for the full rationale.
-        from .shared import (
-            no_stack0_emit_enabled,
-            cmp_byte0_se_recover_enabled,
-        )
-        block_ffn = cleanup_ffn
-        if no_stack0_emit_enabled() and cmp_byte0_se_recover_enabled():
-            from ...efficient_alu_neural import CmpOperandSeRecoverFFN
-            # Resolve the operand / marker / cmp-opcode dims via the BUILT
-            # dim_positions (NOT the static registry) so a widen repack can't
-            # mis-point the read. ``_as_setdim_proxy`` exposes them by name.
-            cmp_op_dims = [
-                getattr(bd_proxy, nm) for nm in (
-                    "OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE",
-                )
-            ]
-            # Only install when the SE_ALU mirror dims exist in this layout
-            # (they are campaign over-width dims; absent in narrow golden).
-            if (
-                hasattr(bd_proxy, "SE_ALU_LO")
-                and hasattr(bd_proxy, "SE_ALU_HI")
-            ):
-                block_ffn = CmpOperandSeRecoverFFN(
-                    cleanup_ffn,
-                    alu_lo=bd_proxy.ALU_LO,
-                    alu_hi=bd_proxy.ALU_HI,
-                    se_alu_lo=bd_proxy.SE_ALU_LO,
-                    se_alu_hi=bd_proxy.SE_ALU_HI,
-                    mark_ax=bd_proxy.MARK_AX,
-                    cmp_op_dims=cmp_op_dims,
-                )
-        block.ffn = block_ffn
+        # === CMP operand-A SE recover DELETED (2026-07-13, #serecover-delete) ===
+        # The historical ``CmpOperandSeRecoverFFN`` wrap re-materialised the
+        # crushed operand-A ALU band from the ``SE_ALU`` mirror on cmp+MARK_AX
+        # rows because the L9/L10 ALU-clear buried operand-A all-negative. That
+        # crush is now fixed AT ITS ROOT by ``C4_ALU_OPERAND_SURVIVE``
+        # (default-ON): the block-15 L9-clear operand spare
+        # (``l9_ops._alu_operand_survive_enabled``) + the block-17 head-4 CMP
+        # Q-veto (``model_ops.make_cmp_h4_qveto_op``) keep operand-A a clean
+        # positive one-hot through BOTH crushes, so the recover's crush-detect
+        # gate never fires and its forward is byte-identical to the wrapped
+        # ``cleanup_ffn`` (PROVEN inert, max|forward-inner|=0 over eq/lt/gt at
+        # A={7,57,23}; see docs/SERECOVER_DELETE_2026_07_13.md). The wrapper is
+        # therefore deleted; ``block.ffn`` is simply the cleanup+cmp-engine FFN.
+        block.ffn = cleanup_ffn
 
         # === STACK0 campaign bitwise operand delivery (2026-07-13) ===
         # The bitwise lookup post_op reads operand A from ``ALU_LO/HI`` at its own
@@ -1647,49 +1617,19 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
             f"lower_ffn_rules wrote {end} units; expected {len(rules)}"
         )
 
-        # === STACK0 campaign (#321): L11 wide_mul operand-A SE recover ===
-        # Under ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1`` the L10
-        # ALU-clear crushes operand A all-negative for a value-dependent subset
-        # of mul rows; the L11 wide_mul (this ``new_ffn``) then reads the ~-39
-        # floor and FLOODS ``MUL_RESULT_HI`` -> the OP_MUL-gated
-        # ``_layer14_alu_high_byte_relay`` EMITs that flooded byte 1 (the
-        # 104/106/124/138 + a_lo=7 byte-1 DROP family). The clean operand
-        # survives in ``SE_ALU``; wrap ``new_ffn`` in a forward-pass recover that
-        # restores the ALU band from ``SE_ALU`` on the OP_MUL + MARK_AX row
-        # BEFORE the wide_mul reads it, so it computes the CORRECT
-        # ``MUL_RESULT_HI`` (no flood) and the byte-1 emit propagates. It runs as
-        # the SAME block (it IS ``block.ffn``) so the physical block count is
-        # unchanged (lea contract). Flag-OFF / non-campaign / width=1 leaves
-        # ``block.ffn = new_ffn`` exactly (byte-identical to golden). Only width=2
-        # has a ``MUL_RESULT_HI`` byte-1 band to repair; gating on
-        # ``mul_byte0_se_recover_enabled`` keeps the L11 recovery consistent with
-        # the L15 ``BDToGEConverter`` byte-0 recovery. See
-        # ``shared.mul_l11_se_recover_enabled`` for the full rationale.
-        from .shared import (
-            no_stack0_emit_enabled,
-            mul_byte0_se_recover_enabled,
-            mul_l11_se_recover_enabled,
-        )
-        block_ffn = new_ffn
-        if (
-            mul_width2_enabled()
-            and no_stack0_emit_enabled()
-            and mul_byte0_se_recover_enabled()
-            and mul_l11_se_recover_enabled()
-            and hasattr(bd_proxy, "SE_ALU_LO")
-            and hasattr(bd_proxy, "SE_ALU_HI")
-        ):
-            from ...efficient_alu_neural import MulOperandSeRecoverFFN
-            block_ffn = MulOperandSeRecoverFFN(
-                new_ffn,
-                alu_lo=bd_proxy.ALU_LO,
-                alu_hi=bd_proxy.ALU_HI,
-                se_alu_lo=bd_proxy.SE_ALU_LO,
-                se_alu_hi=bd_proxy.SE_ALU_HI,
-                mark_ax=bd_proxy.MARK_AX,
-                op_mul=bd_proxy.OP_MUL,
-            )
-        block.ffn = block_ffn
+        # === L11 wide_mul operand-A SE recover DELETED (2026-07-13) ===
+        # The historical ``MulOperandSeRecoverFFN`` wrap re-materialised the
+        # crushed operand-A ALU band from ``SE_ALU`` on OP_MUL+MARK_AX rows so
+        # the width=2 wide_mul computed the correct ``MUL_RESULT_HI`` (the
+        # byte-1 DROP family). That crush is now fixed AT ITS ROOT by
+        # ``C4_ALU_OPERAND_SURVIVE`` (default-ON block-15 L9-clear operand
+        # spare + block-17 head-4 CMP Q-veto): operand-A stays a clean positive
+        # one-hot through both crushes, so the recover's crush-detect gate
+        # never fires and its forward is byte-identical to the wrapped
+        # ``new_ffn`` (PROVEN inert, max|forward-inner|=0 over mul A={23,7}; see
+        # docs/SERECOVER_DELETE_2026_07_13.md). The wrapper is deleted;
+        # ``block.ffn`` is simply the wide_mul FFN.
+        block.ffn = new_ffn
 
     return Operation(
         name="efficient_l11_alumul_wrap",

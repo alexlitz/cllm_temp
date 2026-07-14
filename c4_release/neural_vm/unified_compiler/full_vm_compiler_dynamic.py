@@ -2408,6 +2408,28 @@ def _build_cache_key_snapshot(
         "C4_MUL_B1_DELIVERY": (
             os.environ.get("C4_MUL_B1_DELIVERY", "0") != "0"
         ),
+        # Combined ALU operand-survival fix (DEFAULT-ON, opt out =0,
+        # WEIGHT+BAKE-affecting): the block-15 L9-clear operand spare
+        # (l9_ops._alu_operand_survive_enabled -- extra W_up NOT-blocker
+        # columns) AND the block-17 head-4 CMP Q-veto
+        # (model_ops.make_cmp_h4_qveto_op -- overwrites head 4's W_q at the six
+        # CMP columns with -1e5). Both survive operand-A through the two
+        # ALU-clear crushes so CmpOperandSeRecoverFFN / MulOperandSeRecoverFFN
+        # are inert and deleted. ON / OFF bake different block-15 W_up +
+        # block-17 W_q, so they must NEVER share a memo / disk entry. OFF (=0)
+        # reproduces the fork-point golden. See docs/SERECOVER_DELETE_2026_07_13.md.
+        "C4_ALU_OPERAND_SURVIVE": (
+            os.environ.get("C4_ALU_OPERAND_SURVIVE", "1") != "0"
+        ),
+        # Whether OP_LT is in the L9 raw-band clear spare (DEFAULT-OFF; LT
+        # excluded fixes func_min id675 while EQ/NE/GT/LE/GE stay spared so
+        # if_eq/bool_and hold). Weight-affecting (adds/removes the OP_LT -1e6
+        # blocker column on the block-15 clear), so ON/OFF must not share a memo
+        # entry. Only meaningful when C4_ALU_OPERAND_SURVIVE is ON. See
+        # docs/FUNCMIN_FIX_2026_07_13.md.
+        "C4_ALU_OPERAND_SURVIVE_CMP_RAW": (
+            os.environ.get("C4_ALU_OPERAND_SURVIVE_CMP_RAW", "0") != "0"
+        ),
         # Auto-widen: extra residual bands change d_model / n_heads, so a
         # widened model must never share a serialised cache entry with the
         # baseline (or with a different requested band set).

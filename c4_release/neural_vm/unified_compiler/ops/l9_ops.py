@@ -1,5 +1,7 @@
 """Auto-extracted per-layer factories. See ../migrated_ops.py for history."""
 
+import os
+
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
 from ...ffn_unit_allocator import FFNUnitAllocator
@@ -697,6 +699,159 @@ _NON_ALU_OPCODES: tuple[str, ...] = (
 )
 
 
+# The value-dependent CMP subset (``CmpOperandSeRecoverFFN`` recovers them).
+_CMP_OPCODES: tuple[str, ...] = (
+    "OP_EQ",
+    "OP_NE",
+    "OP_LT",
+    "OP_GT",
+    "OP_LE",
+    "OP_GE",
+)
+
+# Full set of ALU opcodes whose operand-A is BOTH crushed by this L9 ALU-clear
+# AND masked by a dedicated ``*OperandSeRecoverFFN`` (proof the crush is real
+# and load-bearing for that family). Sparing the clear on these rows is the
+# ROOT fix the recovers work around:
+#   * CMP (``OP_EQ..OP_GE``)  -> ``CmpOperandSeRecoverFFN`` (L10)
+#   * MUL/DIV/MOD             -> ``MulOperandSeRecoverFFN`` (L11 wide_mul)
+#   * bitwise (OR/XOR/AND)    -> ``BitwiseOperandSeRecoverFFN`` (L10, already
+#                                deleted via C4_CLEAN_OPERAND_BITWISE)
+# ADD/SUB are deliberately EXCLUDED: they carry no SeRecover (their byte-1 /
+# carry cascade sources operand-A differently) so blocking them is out of scope.
+# The ARITHMETIC/BITWISE opcodes whose downstream engines (L10 wide_mul,
+# L11 divmod, L10 bitwise) read operand-A directly from the RAW ALU_LO/HI@AX
+# band. These MUST survive the L9 clear or the engine reads a crushed operand.
+_SPARE_OPCODES_ARITH: tuple[str, ...] = (
+    "OP_MUL",
+    "OP_DIV",
+    "OP_MOD",
+    "OP_OR",
+    "OP_XOR",
+    "OP_AND",
+)
+
+
+def _spare_cmp_raw_enabled() -> bool:
+    """``C4_ALU_OPERAND_SURVIVE_CMP_RAW`` — DEFAULT-OFF (scoped func_min fix).
+
+    Controls whether ``OP_LT`` is added to the L9 ALU-clear raw-band spare (the
+    other five CMP opcodes ``EQ/NE/GT/LE/GE`` are always spared; only ``OP_LT``
+    is toggled by this flag). DEFAULT-OFF = LT EXCLUDED.
+
+    Root (docs/FUNCMIN_FIX_2026_07_13.md, verified by ``_probe_funcmin_leak.py``
+    leak traces): the raw-band CMP spare is a **zero-sum lever across CMP
+    opcodes** — it is NOT (as an earlier draft claimed) harmless to every CMP
+    verdict:
+
+      * ``OP_LT``: func_min id675's LT-result writer at logical L14 (physical
+        block 29) is gated on the raw ALU@AX band being CRUSHED all-negative.
+        Sparing LT keeps the band alive → the writer stops firing → the correct
+        ``0x01`` is lost → the L25 tail (block 45) leaks ``0xE8``. So LT must be
+        EXCLUDED for func_min to pass.
+      * ``OP_EQ/NE/GT/LE/GE``: the if_eq id408 (LE) and bool_and id1088 (GT)
+        gains DO read the spared raw operand — EXCLUDING them regresses both
+        (leak trace: id408 goes NaN at block 46, id1088's correct 0x00 at block
+        29 is clobbered to 0xE0 at block 37 then 0x01 at block 45). So these
+        five must STAY spared for the gains to hold.
+
+    Excluding ONLY ``OP_LT`` therefore fixes func_min id675 AND holds all four
+    gains (id408 if_eq, id433 if_var, id612 func_mul, id1088 bool_and). The
+    id433 gain additionally rides the block-17 head-4 CMP Q-veto (SE band,
+    unchanged). The deleted ``CmpOperandSeRecoverFFN`` stays gone: with the five
+    non-LT CMP opcodes spared, the CMP operand it used to re-materialise is
+    already alive for EQ/NE/GT/LE/GE, and for LT the verdict wants it crushed.
+
+    DEFAULT-OFF (LT excluded). Set ``=1`` to restore the original all-CMP-in
+    behaviour (LT included → func_min id675 regresses, the config the recover
+    masked).
+    """
+    return os.environ.get("C4_ALU_OPERAND_SURVIVE_CMP_RAW", "0") != "0"
+
+
+# The ONE CMP opcode that must be EXCLUDED from the raw-band spare: ``OP_LT``.
+# func_min id675's LT-result writer at logical L14 (physical block 29) is gated
+# on the raw ALU@AX band being CRUSHED all-negative; sparing it keeps the band
+# alive → the writer stops firing → the correct 0x01 is lost → 0xE8 leak.
+# The other five CMP opcodes (EQ/NE/GT/LE/GE) DO need the raw band spared (the
+# if_eq id408 / bool_and id1088 gains break WITHOUT it — id408 goes NaN, id1088
+# is clobbered to 0xE0/0x01 downstream at blocks 37/45). See
+# docs/FUNCMIN_FIX_2026_07_13.md §1-2 for the leak-trace evidence.
+_CMP_OPCODES_SPARED: tuple[str, ...] = (
+    "OP_EQ",
+    "OP_NE",
+    "OP_GT",
+    "OP_LE",
+    "OP_GE",
+)
+
+
+def _spare_opcodes() -> tuple[str, ...]:
+    """The opcode set added as ``-1e6`` NOT-blockers to the L9 ALU-clear gate.
+
+    Always includes the arithmetic/bitwise opcodes (their engines read the raw
+    ALU@AX band) AND five of the six CMP opcodes (``EQ/NE/GT/LE/GE`` — the
+    if_eq/bool_and gains need the raw CMP operand spared). ``OP_LT`` is the ONE
+    opcode EXCLUDED by default: func_min id675's crush-gated LT writer needs the
+    raw band CRUSHED (see :func:`_spare_cmp_raw_enabled`). Setting
+    ``C4_ALU_OPERAND_SURVIVE_CMP_RAW=1`` restores the original all-CMP-in
+    behaviour (LT included → func_min regresses).
+    """
+    if _spare_cmp_raw_enabled():
+        return _CMP_OPCODES + _SPARE_OPCODES_ARITH
+    return _CMP_OPCODES_SPARED + _SPARE_OPCODES_ARITH
+
+
+# Back-compat alias (the original name; now = the arith set + the 5 spared CMP
+# opcodes unless the CMP-raw opt-in flag is set, resolved at call time via
+# ``_spare_opcodes()``).
+_SPARE_OPCODES: tuple[str, ...] = _CMP_OPCODES_SPARED + _SPARE_OPCODES_ARITH
+
+
+def _alu_operand_survive_enabled() -> bool:
+    """``C4_ALU_OPERAND_SURVIVE`` — DEFAULT-ON block-15 half of the combined fix.
+
+    The L9 ALU-clear (physical block 15, unit band 3344+; the "L10 ALU-clear"
+    of the docs) is a broad ``MARK_AX AND (any non-ALU opcode)`` scrub of the
+    ``ALU_LO/HI`` band that stops residual ALU_* from contaminating L10's
+    bitwise / MUL units at NON-ALU positions. It legitimately fires on the AX
+    marker + AX byte rows. On an **ALU** step (CMP / MUL / DIV / MOD /
+    bitwise), however, MARK_AX still broadcasts to ~2.0 in the frame so the
+    clear fires anyway, AND a spurious NON-ALU-opcode LEAK inflates the
+    pre-activation into a full crush:
+
+      * CMP rows: a spurious ``OP_SI = +10`` leak (``W_up[u3344,OP_SI]=+100``)
+        → pre-act ~+1050 → ``-0.1`` write becomes ``-105`` → buries operand-A
+        (``gt_57_29``, ``eq_7_45``).
+      * MUL rows: a spurious ``OP_JSR = +10`` leak
+        (``W_up[u3344,OP_JSR]=+100``) → the SAME ~+1050 pre-act / ``-105``
+        crush (mul 23*65, the byte-1 drop family).
+
+    Each affected op family carries a dedicated ``*OperandSeRecoverFFN``
+    (``CmpOperandSeRecoverFFN`` / ``MulOperandSeRecoverFFN``) that
+    re-materialises operand-A from the surviving ``SE_ALU`` mirror precisely
+    because of this crush.
+
+    When enabled, a hard ``-1e6`` NOT-blocker for each ``_SPARE_OPCODES``
+    opcode is added to the clear's AND gate. On a genuine ALU AX row the live
+    opcode flag (e.g. ``OP_GT`` / ``OP_MUL ≈ +10``) is present → the ``-1e6``
+    blocker vetoes EVERY clear unit → operand-A stays the clean live
+    ``ALU_LO/HI`` one-hot, and the spurious non-ALU leak can no longer trip the
+    crush. The clear STILL fires exactly as before at every intended NON-ALU
+    firing row (PSH/LI/SI/... AX marker + AX byte rows), where every
+    ``_SPARE_OPCODES`` flag == 0 so the ``-1e6*0 == 0`` blocker is inert.
+
+    The blockers are extra ``W_up`` columns (not extra units), so the L9 FFN's
+    pinned 3405-unit layout is preserved and the flag is byte-identical OFF.
+
+    This is the block-15 half of the combined operand-survival fix; the
+    block-17 head-4 CMP Q-veto (``model_ops.make_cmp_h4_qveto_op``) is the
+    companion half, gated on the SAME flag. See
+    ``docs/SERECOVER_DELETE_2026_07_13.md``.
+    """
+    return os.environ.get("C4_ALU_OPERAND_SURVIVE", "1") != "0"
+
+
 def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     """ALU LO/HI clear at non-ALU opcodes (32 units).
 
@@ -742,6 +897,25 @@ def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1e6),
         ("MARK_MEM", -1e6),
     )
+
+    # OPERAND-SURVIVE fix (2026-07-13, C4_ALU_OPERAND_SURVIVE default-ON): on an
+    # ALU step (CMP / MUL / DIV / MOD / bitwise) the L10 / L11 engines
+    # legitimately need operand-A from the raw ALU band, but MARK_AX broadcasts
+    # so this clear fires anyway and a spurious NON-ALU-opcode leak (OP_SI on
+    # CMP rows, OP_JSR on MUL rows) inflates it into a -105 crush that BURIES
+    # operand-A (the reason the ``*OperandSeRecoverFFN`` recovers exist). A hard
+    # -1e6 NOT-blocker for each ALU opcode vetoes every clear unit on a genuine
+    # ALU AX row (live opcode flag present) so operand-A stays a clean one-hot.
+    # At every intended NON-ALU firing row every _SPARE_OPCODES flag == 0, so
+    # the blocker is inert (-1e6*0 == 0) → byte-identical flag-OFF. These are
+    # extra W_up columns, not extra units, so the 3405-unit layout is preserved.
+    # This is the block-15 half of the combined fix; block-17 head-4 CMP Q-veto
+    # (model_ops.make_cmp_h4_qveto_op) is the companion. See
+    # :func:`_alu_operand_survive_enabled`.
+    if _alu_operand_survive_enabled():
+        common_conditions = common_conditions + tuple(
+            (op, -1e6) for op in _spare_opcodes()
+        )
 
     # ALU_LO clear (16 units) then ALU_HI clear (16 units).
     #

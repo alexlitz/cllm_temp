@@ -595,10 +595,12 @@ COMPOSITE_ALU_FFN = (
     # (delegate to an ``inner`` PureFFN after a cell edit; no W_up of their own).
     # (``LoadedOperandAddHi15ClearFFN`` removed — its ADD-only cell-13/15 clear was
     # subsumed by the ``CleanOperandOneHotFFN`` clean-snap once
-    # ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON, so the wrap is no longer installed.)
+    # ``C4_CLEAN_OPERAND_ADD`` went DEFAULT-ON, so the wrap is no longer installed.
+    # ``CmpOperandSeRecoverFFN`` / ``MulOperandSeRecoverFFN`` removed 2026-07-13 —
+    # the L9/L10 ALU-clear operand crush they recovered from is fixed at its root
+    # by ``C4_ALU_OPERAND_SURVIVE``, so the wraps are provably inert and deleted;
+    # see docs/SERECOVER_DELETE_2026_07_13.md.)
     "CleanOperandOneHotFFN",
-    "CmpOperandSeRecoverFFN",
-    "MulOperandSeRecoverFFN",
     # (``ShiftOutputClearFFN`` removed — the SHR OUTPUT byte-0 leak it cleared is
     # now cancelled at its L11 source by ``make_output_b0_noleak_op``
     # (C4_OUTPUT_B0_NOLEAK, DEFAULT-ON), so the wrap is no longer installed.)
