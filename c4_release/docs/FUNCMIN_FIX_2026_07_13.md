@@ -1,9 +1,10 @@
 # FUNCMIN_FIX — unblock the −359 SeRecover deletion (fix the func_min id675 regression)
 
 **Branch** `serecover-delete` · **Fix flag** `C4_ALU_OPERAND_SURVIVE_CMP_RAW`
-(**DEFAULT-OFF**, opt-in `=1` restores old behaviour) · **Parent flag**
-`C4_ALU_OPERAND_SURVIVE` (default-ON, the −359 delete) ·
-**Config** spec_k=0, full_trace, campaign default.
+(**DEFAULT-OFF** = OP_LT excluded from the raw spare; opt-in `=1` restores the
+old all-CMP-in behaviour) · **Parent flag** `C4_ALU_OPERAND_SURVIVE`
+(default-ON, the −359 delete) · **Config** spec_k=0, full_trace, campaign
+default.
 
 ## TL;DR
 
@@ -14,145 +15,147 @@ scored **+12 net with 4 GAINS** (`bool_and` id1088, `func_mul` id612, `if_eq`
 id408, `if_var` id433) but **1 REGRESSION: `func_min` id675** (`min(13,57)`),
 which blocked the landing (any regression blocks).
 
-**Root:** the regression is NOT the block-17 head-4 CMP Q-veto (that is what
-delivers the 4 CMP gains and is unchanged), nor a downstream CMP margin
-(`docs/DERIVE_CMP_2026_07_09.md`). It is the **block-15 L9-clear raw-band
-SPARE over-firing on CMP rows**. The spare's original opcode set included the
-six CMP opcodes (`_CMP_OPCODES`), so on a CMP AX row it kept the raw
-`ALU_LO/HI@AX` operand-A band ALIVE. But the CMP RESULT is computed from the
-**SE_ALU** band (the L9 nibble comparator, `docs/DERIVE_CMP_2026_07_09.md`
-`CMP+0..3` primitives), NOT the raw `ALU@AX` band — so sparing the raw CMP
-operand does not help the comparison. What it DOES do is break `func_min`: its
-LT-result writer at logical L14 (physical block 29) is gated on the raw
-`ALU@AX` band being CRUSHED (all-negative); with the spare keeping it alive the
-writer stops firing, the correct `0x01` LT result is lost, and the L25 tail
-(physical block 45) leaks `0xE8`.
+**Root:** the regression is the **block-15 L9-clear raw-band SPARE**. That spare
+originally added a `−1e6` NOT-blocker for ALL SIX CMP opcodes, keeping the raw
+`ALU_LO/HI@AX` operand-A band ALIVE on every CMP AX row. But the raw-band CMP
+spare is a **zero-sum lever ACROSS CMP opcodes** — it is load-bearing for some
+CMP verdicts and destructive for others:
 
-**Fix (scoped, byte-safe):** remove the six CMP opcodes from the raw-band spare.
-`_spare_opcodes()` now returns only the ARITH/BITWISE set
-(`OP_MUL/DIV/MOD/OR/XOR/AND`) whose downstream engines DO read operand-A from
-the raw `ALU@AX` band. A new opt-in flag `C4_ALU_OPERAND_SURVIVE_CMP_RAW`
-(default-OFF) restores the original all-CMP-in behaviour. The 4 CMP gains HOLD
-because they come from the block-17 head-4 Q-veto (SE band), which is untouched;
-`func_min` id675 passes because its LT writer sees the crushed raw band again.
+* **`OP_LT`** — func_min id675's LT-result writer at logical L14 (physical block
+  29) is gated on the raw `ALU@AX` band being CRUSHED all-negative. With LT
+  spared the band stays a clean `+6` one-hot → the writer's crush-gate never
+  trips → the correct `0x01` is never written → the L25 tail (block 45) leaks
+  `0xE8`. **LT must be EXCLUDED** for func_min to pass.
+* **`OP_EQ / NE / GT / LE / GE`** — the `if_eq` id408 (LE) and `bool_and` id1088
+  (GT) gains DO read the spared raw operand. Excluding them regresses both:
+  leak trace (`_probe_funcmin_leak.py`, teacher-forced correct tape, FINAL AX
+  byte) shows **id408 goes NaN at block 46** and **id1088's correct `0x00` at
+  block 29 is clobbered to `0xE0` at block 37 then `0x01` at block 45**. **These
+  five must STAY spared** for the gains to hold.
 
-## 1. Diagnosis (spec_k=0, faithful-autoregressive)
+**Fix:** exclude **ONLY `OP_LT`** from the raw-band spare.
+`_CMP_OPCODES_SPARED = (EQ, NE, GT, LE, GE)` stays in `_spare_opcodes()`; `LT`
+is dropped by default. The new opt-in `C4_ALU_OPERAND_SURVIVE_CMP_RAW=1`
+restores the original all-CMP-in behaviour (LT back → func_min regresses).
 
-`func_min` id675 source: `int min(int a,int b){ if(a<b) return a; return b; }
-int main(){ return min(13,57); }` → expected exit 13. The compare is `a<b`
-(LT, 13<57 → true → return a=13).
+> ⚠ An earlier draft of this fix excluded ALL SIX CMP opcodes and claimed "the
+> CMP result never reads the raw band, so every gain holds." That was
+> **FALSIFIED** by the spec_k=0 verdict (`id408 FAIL`, `id1088 FAIL`) and the
+> leak trace above. The corrected fix excludes only `OP_LT`.
 
-`tools/_probe_funcmin_leak.py` (teacher-forced over the correct DraftVM tape,
-decoding the AX result byte per block INPUT + FINAL at the LT compare row, and
-dumping the surviving raw `ALU_LO/HI@AX` band) isolates the flip:
+## 1. Diagnosis (leak trace, teacher-forced correct tape)
 
-* The CMP cascade (`SE_ALU` band, `CMP+0..3` primitives) is **byte-identical**
-  ON-vs-OFF — the comparison itself is unaffected by the raw-band spare. This
-  matches `docs/DERIVE_CMP_2026_07_09.md`: LT/GT/EQ reduce to the L9 nibble
-  comparator's zero-detector + sign primitives on the SE band, never the raw
-  `ALU_LO/HI@AX` operand band.
-* At logical L14 (physical block 29) the LT-result writer emits the correct
-  `0x01` **only when the raw `ALU@AX` band is crushed all-negative**. With
-  `C4_ALU_OPERAND_SURVIVE=1` (original all-CMP spare) that band survives as a
-  clean `+6` one-hot on the CMP row → the writer's crush-gate no longer trips →
-  the `0x01` is never written → the L25 tail (physical block 45) falls through
-  to its `0xE8` default → wrong AX byte → id675 fails.
+`tools/_probe_funcmin_leak.py` forward-hooks every block, decodes the AX result
+byte (OUTPUT_LO/HI @ the AX-marker row) per block INPUT + FINAL at the compare
+step, and dumps the surviving raw `ALU_LO/HI@AX` band. The FINAL AX byte is a
+reliable proxy for compare-step correctness. Comparing the three raw-spare
+configs on the four CMP programs:
 
-So the regression is specifically the **CMP subset of the block-15 raw-band
-spare** interacting with func_min's crush-gated LT writer. It is not the
-block-17 veto (SE band) and not a DERIVE_CMP margin.
+| id | prog | opcode | exp AX | all-CMP-in (orig, `CMP_RAW=1`) | all-CMP-**out** (rejected draft) | **LT-only-out (fix)** |
+|---|---|---|---|---|---|---|
+| 675  | func_min | LT | `0x01` | `0xE8` ✗ (spare alive → writer off) | `0x01` ✓ | **`0x01` ✓** |
+| 408  | if_eq    | LE | `0x01` | `0x01` ✓ | **NaN** @blk46 ✗ | **`0x01` ✓** |
+| 1088 | bool_and | GT | `0x00` | `0x00` ✓ | `0xE0`→`0x01` @blk37/45 ✗ | **`0x00` ✓** |
+| 433  | if_var   | GT | `0x00` | `0x00` ✓ | `0x00` ✓ | **`0x00` ✓** |
 
-## 2. Why the 4 CMP gains are independent of the raw-band CMP spare
+The raw `ALU@AX` band in the LT-only-out fix: **crushed `−39`** on the id675 LT
+row (writer fires → `0x01`), **alive `+6`** on the id408/id1088/id433 EQ/GT/LE
+rows (no NaN, no downstream clobber). So excluding only LT gives every program
+the raw-band state its verdict needs. (id433 additionally rides the block-17
+head-4 CMP Q-veto — SE band, unchanged.)
 
-The three CMP-family gains — `if_eq` id408 (`7==7`), `if_var` id433
-(`x=35; x>76`), `bool_and` id1088 (`57>65 && 65>18`) — are delivered by the
-**block-17 (logical L11) head-4 CMP Q-veto** (`model_ops.make_cmp_h4_qveto_op`,
-phase 1450). That veto overwrites head-4's `W_q` at the six CMP columns
-(`K@CONST` self-row slots 0/33) with `−1e5` so the un-gated MEM→ALU load head
-stops crushing the clean GT/EQ one-hot on cmp RESULT rows. It reads/writes the
-`ALU@AX` band via the attention head, not via the L9-clear spare, and it is
-**unchanged** by this fix (still gated on the parent `C4_ALU_OPERAND_SURVIVE`).
-`func_mul` id612 comes from the ARITH spare (`OP_MUL`), which is retained.
+The CMP RESULT for LT/GT is written at logical L14 (physical block 29); the
+comparison PRIMITIVES themselves come from the L9 nibble comparator SE band
+(`docs/DERIVE_CMP_2026_07_09.md`), but the block-29 result WRITER and the L25
+tail (block 45) are gated on the raw `ALU@AX` band state, which is exactly what
+the spare toggles — hence the zero-sum-across-opcodes behaviour.
 
-Therefore excluding the six CMP opcodes from the raw-band spare fixes func_min
-while every gain holds. The deleted `CmpOperandSeRecoverFFN` stays inert: it
-recovered the raw operand from SE, but since the CMP RESULT never reads the raw
-band, a crushed raw CMP operand is harmless to the verdict.
+## 2. Why LT-only holds all four gains
+
+* `func_min` id675 (LT): raw band crushed → block-29 LT writer fires → `0x01`.
+* `if_eq` id408 (LE): raw band spared → EQ path reads a live `+6` operand, no
+  NaN → `0x01`.
+* `bool_and` id1088 (GT): raw band spared → GT result `0x00` survives, no
+  block-37/45 clobber.
+* `if_var` id433 (GT): raw band spared + block-17 head-4 Q-veto → `0x00`.
+* `func_mul` id612 (MUL): ARITH spare unchanged (`OP_MUL` always spared).
+
+`OP_LT` is the only opcode toggled; among the sampled ids only func_min uses LT,
+so LT-only exclusion fixes func_min with zero collateral on the gains.
 
 ## 3. The scoped fix (`neural_vm/unified_compiler/ops/l9_ops.py`)
 
 * `_SPARE_OPCODES_ARITH = (OP_MUL, OP_DIV, OP_MOD, OP_OR, OP_XOR, OP_AND)` — the
-  opcodes whose downstream engines (L10 wide_mul / L11 divmod / L10 bitwise)
-  read operand-A directly from the raw `ALU_LO/HI@AX` band, so they MUST survive
-  the L9 clear.
+  opcodes whose downstream engines read operand-A directly from the raw
+  `ALU_LO/HI@AX` band.
+* `_CMP_OPCODES_SPARED = (OP_EQ, OP_NE, OP_GT, OP_LE, OP_GE)` — the five CMP
+  opcodes whose verdict reads the spared raw operand (if_eq/bool_and gains).
 * `_spare_cmp_raw_enabled()` reads `C4_ALU_OPERAND_SURVIVE_CMP_RAW`
   (default `"0"`).
-* `_spare_opcodes()` returns `_SPARE_OPCODES_ARITH` by default (CMP excluded),
-  or `_CMP_OPCODES + _SPARE_OPCODES_ARITH` when the opt-in flag is set.
+* `_spare_opcodes()` returns `_CMP_OPCODES_SPARED + _SPARE_OPCODES_ARITH` by
+  default (LT excluded), or `_CMP_OPCODES + _SPARE_OPCODES_ARITH` when the
+  opt-in flag is set (LT back in).
 * `_alu_clear_rules` adds the `(op, -1e6)` NOT-blocker for each opcode in
-  `_spare_opcodes()` (was `_SPARE_OPCODES`).
+  `_spare_opcodes()`.
 
-The flag is a pure opcode-set change on the block-15 clear's AND gate (adds /
-removes CMP `-1e6` blocker COLUMNS, not units → 3405-unit L9 layout preserved),
-weight-affecting, so ON/OFF must not share a serialised cache entry:
-registered in BOTH cache-key snapshots
-(`full_vm_compiler_dynamic.py` in-proc memo + disk-cache `kwargs_snapshot`).
+Pure opcode-set change on the block-15 clear's AND gate (adds/removes the
+`OP_LT` `-1e6` blocker COLUMN, not units → 3405-unit L9 layout preserved),
+weight-affecting, so ON/OFF must not share a serialised cache entry: registered
+in BOTH cache-key snapshots (`full_vm_compiler_dynamic.py`).
 
-## 4. Verdict proof (CPU, spec_k=0, full_trace)
+## 4. Verdict proof (CPU, spec_k=0, full_trace — the fast-gate criterion)
 
 `tools/_probe_funcmin_verdict.py` runs `BatchedPureNeuralRunner.
 run_batch_fail_fast(spec_k=0, criterion="full_trace")` — the SAME criterion the
-fast gate uses (not the teacher-forced interp_oracle_gate, which over-flags
-cross-step programs). With the scoped fix (`C4_ALU_OPERAND_SURVIVE=1`,
-`C4_ALU_OPERAND_SURVIVE_CMP_RAW` unset):
+fast gate uses. Empirical (see §7 for commands):
 
-| id | program | expected | verdict |
-|---|---|---|---|
-| 675  | `func_min` min(13,57)      | 13   | **PASS (regression FIXED)** |
-| 612  | `func_mul` mul(41,29)      | 1189 | **PASS (gain HOLDS)** |
-| 408  | `if_eq`   7==7             | 1    | **PASS (gain HOLDS)** |
-| 433  | `if_var`  x=35, x>76       | 0    | **PASS (gain HOLDS)** |
-| 1088 | `bool_and` 57>65 && 65>18  | 0    | **PASS (gain HOLDS)** |
+| id | program | expected | all-CMP-out draft | **LT-only-out (fix)** |
+|---|---|---|---|---|
+| 675  | `func_min` min(13,57)     | 13   | PASS | **PASS (regression FIXED)** |
+| 612  | `func_mul` mul(41,29)     | 1189 | PASS | **PASS (gain HOLDS)** |
+| 408  | `if_eq`   7==7            | 1    | **FAIL** | **PASS (gain HOLDS)** |
+| 433  | `if_var`  x=35, x>76      | 0    | PASS | **PASS (gain HOLDS)** |
+| 1088 | `bool_and` 57>65 && 65>18 | 0    | **FAIL** | **PASS (gain HOLDS)** |
 
-_(Empirical run: see §7 for the exact command; the CPU verdict path is the
-fast-gate criterion so these five-of-five PASS = func_min unblocked + 4 gains
-intact.)_
+The all-CMP-out draft column (id408/id1088 FAIL) is the empirical falsification
+that forced the LT-only scoping. The LT-only column (5/5 PASS) = func_min
+unblocked + all 4 gains intact.
 
 ## 5. Golden — flag-OFF byte-identical to the branch's fork-point main default
 
 * Branch **flag-OFF** (`C4_ALU_OPERAND_SURVIVE=0`) golden
   `state_dict_sha256 = e50521f3...` (`tools/_isa_golden_hash.py`,
-  `disk_cache=False`, campaign default) — **UNCHANGED** by this fix (the scoped
-  CMP exclusion only touches the ON raw-band spare; OFF the whole spare is
-  absent). `e50521f3` is exactly the main default golden at the branch's
-  merge-base `aead086e` ("Merge blog-p0p1 … byte-identical golden e50521f3").
+  `disk_cache=False`, campaign default) — **UNCHANGED** by this fix (the LT-only
+  exclusion only touches the ON raw-band spare; OFF the whole spare is absent).
+  `e50521f3` is exactly the main default golden at the branch's merge-base
+  `aead086e` ("Merge blog-p0p1 … byte-identical golden e50521f3").
 * ⚠ **Rebase note:** current main has advanced 12 commits past `aead086e` and
-  flipped two default-golden-changing flags ON —
-  `C4_R_FRAME_TAIL` (`e50521f3` → `b9a74424`) and `C4_MUL_B1_DELIVERY`
-  (→ `c18ef9f9`). Current main **default** golden is therefore `c18ef9f9`, not
-  `e50521f3`. The func_min fix is golden-neutral relative to its base; to make
-  the branch's flag-OFF equal to current main default, the branch must be
-  rebased / main merged in (a landing-logistics step, not a defect in this fix).
-  The −359 delete + operand-survival flags are orthogonal to the two
-  main-ahead flips, so the rebase is expected to be conflict-light.
+  flipped two default-golden-changing flags ON — `C4_R_FRAME_TAIL`
+  (`e50521f3` → `b9a74424`) and `C4_MUL_B1_DELIVERY` (→ `c18ef9f9`). Current
+  main **default** golden is therefore `c18ef9f9`, not `e50521f3`. The func_min
+  fix is golden-neutral relative to its base; to make the branch's flag-OFF
+  equal to current main default, the branch must be rebased / main merged in (a
+  landing-logistics step, not a defect in this fix). The −359 delete + the two
+  survival flags are orthogonal to the two main-ahead flips, so the rebase is
+  expected to be conflict-light.
 
 ## 6. Files
 
 * `neural_vm/unified_compiler/ops/l9_ops.py` — `_SPARE_OPCODES_ARITH`,
-  `_spare_cmp_raw_enabled`, `_spare_opcodes`, `_SPARE_OPCODES` back-compat alias;
-  `_alu_clear_rules` uses `_spare_opcodes()`.
+  `_CMP_OPCODES_SPARED`, `_spare_cmp_raw_enabled`, `_spare_opcodes`,
+  `_SPARE_OPCODES` alias; `_alu_clear_rules` uses `_spare_opcodes()`.
 * `neural_vm/unified_compiler/full_vm_compiler_dynamic.py` —
   `C4_ALU_OPERAND_SURVIVE_CMP_RAW` in both cache-key snapshots.
 * `tools/_probe_funcmin_leak.py` — the per-block AX-byte leak trace (diagnosis).
-* `tools/_probe_funcmin_verdict.py` — the spec_k=0 full_trace verdict A/B.
-* `docs/FLAG_REGISTRY.md` — new `C4_ALU_OPERAND_SURVIVE_CMP_RAW` entry.
+* `tools/_probe_funcmin_verdict.py` — the spec_k=0 full_trace verdict.
+* `docs/FLAG_REGISTRY.md` — `C4_ALU_OPERAND_SURVIVE_CMP_RAW` entry.
 
 ## 7. Gate — DEFERRED (GPU run by the operator)
 
-Fix verified on CPU (spec_k=0 full_trace, §4). The authoritative A/B fast gate
-is deferred to a free GPU / main. Target: **0 regressions, +12 net or better**
-(the 4 gains + func_min now passing, no new regression; flag-OFF byte-identical
-so no passing program can move under OFF).
+Fix verified on CPU (leak trace §1 + spec_k=0 full_trace §4). The authoritative
+A/B fast gate is deferred to a free GPU / main. Target: **0 regressions, +12 net
+or better** (the 4 gains + func_min now passing; flag-OFF byte-identical so no
+passing program can move under OFF).
 
 ```
 cd c4_release
@@ -166,4 +169,11 @@ CPU re-verify of the 5 ids (fast-gate criterion):
 ```
 C4_ALU_OPERAND_SURVIVE=1 python tools/_probe_funcmin_verdict.py \
   --ids 675,612,408,433,1088
+```
+
+Leak-trace re-verify (fast, teacher-forced FINAL AX byte per program):
+
+```
+C4_ALU_OPERAND_SURVIVE=1 python tools/_probe_funcmin_leak.py \
+  --ids 675,1088,408,433
 ```
