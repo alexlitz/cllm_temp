@@ -2285,12 +2285,10 @@ def _build_multipass_div_post_op(block, dim_positions, S):
 
     from .shared import (
         no_stack0_emit_enabled,
-        divmod_axcarry_clear_enabled,
-        divmod_stack0_byte1_clear_enabled,
     )
-    campaign_clear = (
-        no_stack0_emit_enabled() and divmod_axcarry_clear_enabled()
-    )
+    # divmod AX_CARRY-clear is now UNCONDITIONAL under campaign (P5 flag-retire
+    # 2026-07-14; the former ``C4_DIVMOD_AXCARRY_CLEAR`` escape hatch was retired).
+    campaign_clear = no_stack0_emit_enabled()
     # Op-local scratch/result bands the 43-pass cascade populates with
     # intermediate one-hots. They are NOT part of the per-step token frame and
     # nothing downstream reads them (the OUTPUT routing consumes q/r), so the
