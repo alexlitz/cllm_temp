@@ -1857,12 +1857,6 @@ def _build_cache_key_snapshot(
         "C4_QWEN_EXPORT_COMPAT": (
             os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
         ),
-        # AX byte-1 register-dump emission flag (DEFAULT-ON; opt out with =0,
-        # output-affecting, no source change): the ON / OFF builds must never
-        # share a serialised entry.
-        "C4_AX_BYTE1_DUMP": (
-            os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
-        ),
         # AX high-byte (byte-2/3) all-step zero-default (DEFAULT-OFF; opt in with
         # =1, output-affecting, no source change): appends the l11
         # ``make_ax_hibyte_clear_allstep_op`` FFN + omits the redundant

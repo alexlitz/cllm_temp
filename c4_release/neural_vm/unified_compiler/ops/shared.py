@@ -530,15 +530,13 @@ def mul_width2_enabled() -> bool:
     (d_model 920, width=1 lo-byte MUL, ``mul_overflow`` decodes 20). Any
     other value (or unset) keeps the width=2 default ON.
 
-    ``C4_MUL_MULTIPASS=1`` IMPLIES width=2: the multipass cascade routes the
-    product's byte 1 into the ``MUL_RESULT_HI_LO/HI`` band, so that band (and
-    the L13 relay that stages it into AX_FULL) MUST be present even if
-    ``C4_MUL_WIDTH2=0`` was passed. OR-in the multipass flag so the band is
-    always collected when the cascade is installed.
+    width=2 is now UNCONDITIONAL as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_MUL_WIDTH2`` escape hatch — a d_model-920 width=1 lo-byte-MUL build —
+    was retired as a proven default-ON fix). This also subsumes the
+    ``C4_MUL_MULTIPASS`` implication (the multipass cascade needs width=2's
+    ``MUL_RESULT_HI`` band, which is now always present).
     """
-    if os.environ.get("C4_MUL_MULTIPASS", "0") == "1":
-        return True
-    return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
+    return True
 
 
 def mul_multipass_enabled() -> bool:
@@ -916,13 +914,12 @@ def l8_operand_sp_disc_enabled() -> bool:
     but mis-frames an intermediate step) -- the discriminator+sharpener is now net
     +9 on its own and BLOCKER-2 is the remaining headroom (0/25 -> 9/25 done).
 
-    Opt-out: ``C4_L8_OPERAND_SP_DISC=0`` restores the byte-identical pre-fix path
-    (kept as a kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_L8_OPERAND_SP_DISC`` can still A/B it inside the campaign).
+    Unconditional under the operand-from-memsp campaign as of the P5 flag-retire
+    2026-07-14 (the former ``C4_L8_OPERAND_SP_DISC`` escape hatch was retired as a
+    proven default-ON fix; the SP_ADDR_* discriminator bands stay campaign-gated
+    so a non-campaign build omits them → byte-identical golden).
     """
-    if not operand_from_memsp_enabled():
-        return False
-    return os.environ.get("C4_L8_OPERAND_SP_DISC", "1") != "0"
+    return operand_from_memsp_enabled()
 
 
 
