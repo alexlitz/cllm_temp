@@ -456,7 +456,8 @@ class GEToBDConverter(nn.Module):
         # ``output_amplitude`` (default 2.0 = byte-identical to HEAD) lets the
         # add/sub stage write the byte-0 result one-hot at a DOMINANT magnitude
         # so it out-votes the downstream block-11 / logical-L9 ALU_LO->OUTPUT_LO
-        # operand leak (see ``shared.addsub_output_boost_enabled``). Every other
+        # operand leak (the add/sub stage passes the dominant amplitude
+        # unconditionally as of the P5 flag-retire 2026-07-14). Every other
         # GEToBD caller (divmod / shift / mul GE writeback) keeps the 2.0
         # default, so this is scoped strictly to the add/sub stage that passes a
         # boosted value.

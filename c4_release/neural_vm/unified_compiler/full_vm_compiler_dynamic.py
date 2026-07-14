@@ -1889,14 +1889,6 @@ def _build_cache_key_snapshot(
         "C4_ADDSUB_DECLARATIVE": (
             os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
         ),
-        # Imperative AddSub byte-0 OUTPUT dominant-amplitude write (DEFAULT-ON,
-        # opt out =0, output-affecting on the add/sub MARK_AX OUTPUT_LO/HI byte-0
-        # one-hot): writes the block-10 result at amplitude 30.0 instead of 2.0
-        # to out-vote the downstream L9 ALU_LO->OUTPUT_LO leak. The ON / OFF
-        # builds must never share a serialised entry.
-        "C4_ADDSUB_DUMP_BOOST": (
-            os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
-        ),
         # AX byte-1 FULL-WIDTH emission (DEFAULT-OFF, opt in =1,
         # output-affecting + geometry-affecting): adds the AX_BYTE1_FULL_WIDE
         # band, the un-aliased LM-head columns 16..255, and the L25-tail
