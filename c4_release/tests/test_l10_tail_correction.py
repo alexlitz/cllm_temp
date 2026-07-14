@@ -26,28 +26,49 @@ from neural_vm.vm_step import (  # noqa: E402
 )
 
 
-@pytest.fixture(autouse=True)
-def _force_enumerated_tail(monkeypatch):
-    """Probe the ENUMERATED tail rule form (R-FRAME escape hatch).
-
-    This file's coverage queries per-value tail rules by their enumerated
-    ``range(256)`` names (e.g. ``tail_wide_mul_byte1_preserve_9``,
-    ``tail_sp_pop_carry_byte2_08``). After the R-FRAME INCR-3 flip
-    (``C4_R_FRAME_TAIL`` default-ON), the production build emits the COLLAPSED
-    per-nibble route form instead, so those enumerated names no longer exist.
-    Force the escape hatch (``C4_R_FRAME_TAIL=0``) so these regression tests
-    keep exercising the enumerated rules they were written against. The
-    collapsed default-ON form is verdict-equivalent (golden ``b9a74424``, the
-    proven ``C4_SP_BYTE2_CARRY`` + ``C4_WIDE_MUL_BYTE1_COMPUTED`` composition);
-    the escape hatch is byte-identical to golden ``e50521f3``.
-    """
-    monkeypatch.setenv("C4_R_FRAME_TAIL", "0")
+# P5 RETIRE (docs/P5_RFRAME_RETIRE_2026_07_13.md): the six R-FRAME INCR-3 tail
+# frame-guarantee collapses are now UNCONDITIONAL — the ``range(256)`` enumerated
+# fallbacks + the ``C4_R_FRAME_TAIL`` escape hatch are DELETED, so the L10-tail
+# bank emits ONLY the collapsed per-nibble ROUTE form. Regression tests below that
+# query a RETIRED per-value enumerated rule by name (e.g.
+# ``tail_wide_mul_byte1_preserve_9``, ``tail_sp_pop_carry_byte2_08``,
+# ``tail_stack0_store_loaded_byte_11``) can no longer resolve that name; ``_tail_rule``
+# SKIPS them with a clear reason rather than failing. The retired per-value form's
+# firing behaviour is now covered by the computed route (``*_route_lo_k`` /
+# ``*_route_hi_k``) — see the ``tools/_probe_*`` numeric-equivalence proofs cited
+# in ``l10_ops.py`` — plus the surviving reachable SP byte-2 members
+# ``tail_sp_pop_carry_byte2_00`` / ``_01``.
+#
+# Names of the retired enumerated per-value tail families (prefix match). A query
+# for one of these that is not built is a P5-retired name -> pytest.skip.
+_RETIRED_ENUMERATED_TAIL_PREFIXES = (
+    "tail_wide_mul_byte1_preserve_",
+    "tail_sp_pop_carry_byte2_",
+    "tail_stack0_store_loaded_byte_",
+    "tail_stack0_pop_loaded_byte_",
+    "tail_stack0_store_top_e0_byte_",
+    "tail_stack0_store_top_e8_from_e0_byte_",
+)
 
 
 def _tail_rule(name: str):
     for rule in _tail_bit32_result_correction_rules():
         if rule.name == name:
             return rule
+    # A retired enumerated per-value name (P5): the collapsed route form is the
+    # only build. The per-nibble ``*_route_*`` rules do NOT reproduce this
+    # per-value rule's name/shape, so skip rather than fail. The surviving
+    # reachable SP byte-2 members (``_00`` / ``_01``) and any ``*_route_*`` name
+    # still resolve normally.
+    if any(
+        name.startswith(prefix) and not name.startswith(prefix + "route")
+        for prefix in _RETIRED_ENUMERATED_TAIL_PREFIXES
+    ):
+        pytest.skip(
+            f"tail rule {name!r} is a RETIRED enumerated per-value form "
+            "(P5 R-FRAME retire); the collapsed per-nibble route is the only "
+            "build. See docs/P5_RFRAME_RETIRE_2026_07_13.md."
+        )
     raise AssertionError(f"missing tail rule {name}")
 
 
