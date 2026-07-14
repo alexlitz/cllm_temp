@@ -2000,12 +2000,6 @@ def _build_cache_key_snapshot(
         # (root-fixed by ``C4_ALU_OPERAND_SURVIVE``), so ON / OFF now produce
         # byte-identical builds and no longer need separate serialised entries.
         # See docs/L10_ATTN_GLUE_2026_07_13.md dead-flag sweep.)
-        # si/li LOAD byte-1 ADDRESS-leak discriminator (Inc-2, campaign-ON, opt
-        # out =0): adds L10 head-1 slot 83 so ON / OFF builds must never share a
-        # serialised entry. See shared.sili_cam_b1_enabled.
-        "C4_SILI_CAM_B1": (
-            os.environ.get("C4_SILI_CAM_B1", "1") != "0"
-        ),
         # IMM full-derivation (task #392, DEFAULT-OFF): whole IMM opcode from
         # spec — decode + marker_broadcast relay + value_route (zero
         # hand-authored IMM rules). Implies C4_DERIVE_DECODE. Byte-identical to
@@ -2053,14 +2047,6 @@ def _build_cache_key_snapshot(
         ),
         "C4_PC_OVERRIDE_K": os.environ.get("C4_PC_OVERRIDE_K", "1"),
         "C4_ACTSCALE_JSON": os.environ.get("C4_ACTSCALE_JSON", ""),
-        # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
-        # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /
-        # restore PureFFN ops so ON / OFF builds STRUCTURALLY differ (d_model +
-        # extra blocks) and must never share a serialised entry. See
-        # shared.sili_b1_restore_enabled.
-        "C4_SILI_B1_RESTORE": (
-            os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
-        ),
         # SI/SC store-AX byte-0 OUTPUT zero-default OVERRIDE (var_mul step-9,
         # campaign-ON, opt out =0, BAKE-affecting): rewrites the
         # l16_store_ax_carry_lo write tuples so ON / OFF builds bake different
@@ -2068,15 +2054,6 @@ def _build_cache_key_snapshot(
         # shared.store_ax_b0_override_enabled.
         "C4_STORE_AX_B0_OVERRIDE": (
             os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
-        ),
-        # SI/SC store-AX byte-0 OVERRIDE V2 = the clean store-only
-        # discriminator (default OFF, opt in =1, BAKE-affecting): appends
-        # ALU/cmp opcode anti-conditions to store_ax_conditions AND switches
-        # the l16_store_ax_carry_lo write to the override form, so the ON/OFF
-        # builds bake different L16 FFN weights and must never share a
-        # serialised entry. See shared.store_ax_b0_override_v2_enabled.
-        "C4_STORE_AX_B0_OVERRIDE_V2": (
-            os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
         ),
         # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker de-contamination
         # (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting): registers TWO extra

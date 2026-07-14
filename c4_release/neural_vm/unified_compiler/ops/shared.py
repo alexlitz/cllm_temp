@@ -2087,10 +2087,11 @@ def sili_cam_b1_enabled() -> bool:
         fail is a SEPARATE pre-existing LC byte-0 reload bug (got 0, want 42)
         outside this byte-1 scope.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_SILI_CAM_B1`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_SILI_CAM_B1", "1") != "0"
     )
 
 
@@ -2142,10 +2143,11 @@ def sili_b1_restore_enabled() -> bool:
     inside the campaign; flag OFF (or off-campaign) omits the band + both ops
     (golden ``7f6f2e5d`` byte-identical).
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_SILI_B1_RESTORE`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
     )
 
 
@@ -2222,10 +2224,12 @@ def store_ax_b0_override_v2_enabled() -> bool:
     the campaign; flag OFF (or off-campaign) keeps the bare additive ``2.0/S``
     write (golden ``f725c06e`` byte-identical).
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_STORE_AX_B0_OVERRIDE_V2`` escape hatch was retired). Campaign gate
+    # preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
     )
 
 
