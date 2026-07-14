@@ -2554,10 +2554,12 @@ def loop_si_byterow_marker_clear_enabled() -> bool:
     DISTINCT downstream value-load / operand-CAM root (task #342 family), out of
     scope for the back-edge desync.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_SI_BYTEROW_CLEAR`` escape hatch was retired). Campaign gate
+    # preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_SI_BYTEROW_CLEAR", "1") != "0"
     )
 
 
@@ -2640,10 +2642,12 @@ def loop_li_opcode_fetch_addrkey_clamp_enabled() -> bool:
     IDENTICALLY flag-ON and flag-OFF (a pre-existing base failure, not a
     regression).
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_LI_FETCH_ADDRKEY_CLAMP`` escape hatch was retired). Campaign gate
+    # preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_LI_FETCH_ADDRKEY_CLAMP", "1") != "0"
     )
 
 
