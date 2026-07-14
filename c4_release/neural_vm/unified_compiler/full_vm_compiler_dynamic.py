@@ -2089,18 +2089,6 @@ def _build_cache_key_snapshot(
         "C4_ABSDIFF_RET_BYTE1": (
             os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
         ),
-        # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
-        # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an extra
-        # L10-tail PureFFN post_op so ON / OFF builds STRUCTURALLY differ (an
-        # extra FFN op + block) and must never share a serialised entry. Gated on
-        # the campaign prerequisites (``C4_NO_STACK0_EMIT`` +
-        # ``C4_OPERAND_FROM_MEMSP``) so the non-campaign / golden build is
-        # byte-identical. See shared.jsr_bp_byte3_clear_enabled.
-        "C4_JSR_BP_BYTE3_CLEAR": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
-        ),
         # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
         # campaign-ON, opt out =0, BAKE-affecting): registers the
         # l10_loop_lea_b0_e0 PureFFN post_op so ON / OFF builds STRUCTURALLY

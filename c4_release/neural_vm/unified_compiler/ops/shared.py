@@ -2438,13 +2438,14 @@ def loop_lea_oplea_gate_enabled() -> bool:
 
 
 def jsr_bp_byte3_clear_enabled() -> bool:
-    """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR
-    (``C4_JSR_BP_BYTE3_CLEAR``) is active.
+    """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR is
+    active (UNCONDITIONAL under campaign as of the P5 flag-retire 2026-07-14; the
+    former ``C4_JSR_BP_BYTE3_CLEAR`` escape hatch was retired).
 
-    DEFAULT **ON** (opt out ``C4_JSR_BP_BYTE3_CLEAR=0``). Requires the campaign
-    config (``C4_NO_STACK0_EMIT=1`` + ``C4_OPERAND_FROM_MEMSP=1``). Flag-off OR a
-    non-campaign / golden build registers NO rules and appends NO post_op, so the
-    model is bit-for-bit identical to golden ``f725c06e``.
+    Requires the campaign config (``C4_NO_STACK0_EMIT=1`` +
+    ``C4_OPERAND_FROM_MEMSP=1``). A non-campaign / golden build registers NO rules
+    and appends NO post_op, so the model is bit-for-bit identical to golden
+    ``f725c06e``.
 
     ROOT — THE func-cluster STEP-0 (JSR) POISONING BYTE (func_min id675 /
     func_max id650 / func_identity id550 / func_add id575; measured spec_k=0,
@@ -2481,10 +2482,13 @@ def jsr_bp_byte3_clear_enabled() -> bool:
     with ``HAS_SE`` (ENT rows) + every non-BP marker + wrong BYTE_INDEX
     NOT-blocked, so it is a no-op on every non-JSR-BP-byte3 row.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_JSR_BP_BYTE3_CLEAR`` escape hatch was retired as a proven default-ON
+    # fix). The campaign gate is preserved so the non-campaign golden build is
+    # byte-identical.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
     )
 
 
