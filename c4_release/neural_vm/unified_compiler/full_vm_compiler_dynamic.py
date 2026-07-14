@@ -2236,28 +2236,15 @@ def _build_cache_key_snapshot(
                 else "0",
             ) != "0"
         ),
-        # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
-        # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)
-        # blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF builds bake
-        # different FFN weights and must never share a serialised entry. Gated on
-        # the campaign prerequisite ``C4_NO_STACK0_EMIT`` so the non-campaign /
-        # flag-OFF build is byte-identical to golden. See
-        # shared.cmp_hi_lt_alu15_leak_guard_enabled.
-        "C4_CMP_HI_LT_ALU15_GUARD": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
-        ),
-        # if_var GT-TRUE lo_lt-leak guard (DEFAULT-ON, opt out =0,
-        # BAKE-affecting): when active the ComparisonCombine GT/GE
-        # ``(hi_eq AND lo_lt)`` override threshold is RAISED 2.5 -> 2.75, so the
-        # ON / OFF builds bake different ``b_up`` and must never share a
-        # serialised entry. Gated on the campaign prerequisite
-        # ``C4_NO_STACK0_EMIT`` so the non-campaign / flag-OFF build is
-        # byte-identical to golden. See shared.cmp_gt_lo_lt_hieq_guard_enabled.
-        "C4_CMP_GT_LO_LT_HIEQ_GUARD": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
-        ),
+        # if_var GT-FALSE 0xF-leak guard + GT-TRUE lo_lt-leak guard: the
+        # C4_CMP_HI_LT_ALU15_GUARD (hi_lt ALU_HI+15 veto drop) and
+        # C4_CMP_GT_LO_LT_HIEQ_GUARD (GT/GE 2.5->2.75 threshold raise) escape
+        # hatches were RETIRED 2026-07-14 (proven default-ON). Both bakes are now
+        # unconditional under the campaign frame; their state tracks
+        # C4_NO_STACK0_EMIT exactly (which the cache key already distinguishes via
+        # its other campaign terms), so the campaign / non-campaign builds still
+        # never share a serialised entry. See shared.cmp_hi_lt_alu15_leak_guard_enabled
+        # / cmp_gt_lo_lt_hieq_guard_enabled.
         # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
         # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
         # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target index

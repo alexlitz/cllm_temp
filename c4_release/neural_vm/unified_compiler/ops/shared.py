@@ -1253,15 +1253,13 @@ def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
     blockers are UNTOUCHED, so lt/le/ge/eq/ne margins are unchanged. Band-local to
     the CMP engine (no shared OUTPUT/ALU read perturbed).
 
-    DEFAULT ON. Opt-out via ``C4_CMP_HI_LT_ALU15_GUARD=0`` restores the full
-    cell-15 blocker (the byte-identical-OFF path: flag-OFF, or
-    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden). Kept as a
-    dedicated kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_CMP_HI_LT_ALU15_GUARD`` can A/B it inside the campaign config.
+    DEFAULT ON — now UNCONDITIONAL under the campaign frame. The former
+    ``C4_CMP_HI_LT_ALU15_GUARD`` escape hatch was RETIRED 2026-07-14 (proven
+    default-ON, intervention-verified discriminating fix). Non-campaign
+    (``C4_NO_STACK0_EMIT=0``) still restores the full cell-15 blocker
+    (byte-identical to golden — the guard never fires off the campaign frame).
     """
-    if not no_stack0_emit_enabled():
-        return False
-    return os.environ.get("C4_CMP_HI_LT_ALU15_GUARD", "1") != "0"
+    return no_stack0_emit_enabled()
 
 
 def cmp_gt_lo_lt_hieq_guard_enabled() -> bool:
@@ -1322,15 +1320,13 @@ def cmp_gt_lo_lt_hieq_guard_enabled() -> bool:
     (hi_lt) override and EQ/NE/LT/LE overrides are UNTOUCHED, so lt/le/eq/ne and
     the hi_lt-driven GT/GE-false margins are unchanged.
 
-    DEFAULT ON. Opt-out via ``C4_CMP_GT_LO_LT_HIEQ_GUARD=0`` restores the 2.5
-    threshold (the byte-identical-OFF path: flag-OFF, or
-    ``C4_NO_STACK0_EMIT=0``, are both byte-identical to golden). Kept as a
-    dedicated kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_CMP_GT_LO_LT_HIEQ_GUARD`` can A/B it inside the campaign config.
+    DEFAULT ON — now UNCONDITIONAL under the campaign frame. The former
+    ``C4_CMP_GT_LO_LT_HIEQ_GUARD`` escape hatch was RETIRED 2026-07-14 (proven
+    default-ON, rebuild-verified discriminating fix). Non-campaign
+    (``C4_NO_STACK0_EMIT=0``) still restores the 2.5 threshold (byte-identical to
+    golden — the raise never applies off the campaign frame).
     """
-    if not no_stack0_emit_enabled():
-        return False
-    return os.environ.get("C4_CMP_GT_LO_LT_HIEQ_GUARD", "1") != "0"
+    return no_stack0_emit_enabled()
 
 
 def cmp_combine_margin_enabled() -> bool:
