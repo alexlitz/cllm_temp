@@ -735,49 +735,77 @@ _SPARE_OPCODES_ARITH: tuple[str, ...] = (
 def _spare_cmp_raw_enabled() -> bool:
     """``C4_ALU_OPERAND_SURVIVE_CMP_RAW`` — DEFAULT-OFF (scoped func_min fix).
 
-    Controls whether the six CMP opcodes are added to the L9 ALU-clear raw-band
-    spare (``_SPARE_OPCODES``).
+    Controls whether ``OP_LT`` is added to the L9 ALU-clear raw-band spare (the
+    other five CMP opcodes ``EQ/NE/GT/LE/GE`` are always spared; only ``OP_LT``
+    is toggled by this flag). DEFAULT-OFF = LT EXCLUDED.
 
-    Root (docs/FUNCMIN_FIX_2026_07_13.md): the CMP result is computed from the
-    **SE_ALU** band (the L9 nibble comparator + block-17 head-4 MEM->ALU load
-    head), NOT from the raw ALU_LO/HI@AX band. So keeping the raw ALU@AX band
-    ALIVE on a CMP row does NOT help the comparison — the CMP cascade is
-    byte-identical whether the raw band is crushed or spared. What it DOES do is
-    break func_min (id675): its LT result-writer at logical L14 (physical block
-    29) is gated on the raw ALU@AX band being crushed (all-negative); when the
-    spare keeps it alive that writer no longer fires, so the correct ``0x01`` is
-    lost and the L25 tail leaks ``0xE8``.
+    Root (docs/FUNCMIN_FIX_2026_07_13.md, verified by ``_probe_funcmin_leak.py``
+    leak traces): the raw-band CMP spare is a **zero-sum lever across CMP
+    opcodes** — it is NOT (as an earlier draft claimed) harmless to every CMP
+    verdict:
 
-    The CMP GAINS (id408 if_eq, id433 if_var, id1088 bool_and) are delivered by
-    the **block-17 head-4 CMP Q-veto** (``model_ops.make_cmp_h4_qveto_op``,
-    which shares the ``C4_ALU_OPERAND_SURVIVE`` flag and is UNCHANGED here), NOT
-    by the raw-band CMP spare. So excluding CMP from the raw-band spare fixes
-    func_min while every CMP gain HOLDS. The deleted ``CmpOperandSeRecoverFFN``
-    stays inert: it recovered raw-from-SE, but the CMP RESULT never read the raw
-    band, so a crushed raw CMP operand is harmless to the verdict.
+      * ``OP_LT``: func_min id675's LT-result writer at logical L14 (physical
+        block 29) is gated on the raw ALU@AX band being CRUSHED all-negative.
+        Sparing LT keeps the band alive → the writer stops firing → the correct
+        ``0x01`` is lost → the L25 tail (block 45) leaks ``0xE8``. So LT must be
+        EXCLUDED for func_min to pass.
+      * ``OP_EQ/NE/GT/LE/GE``: the if_eq id408 (LE) and bool_and id1088 (GT)
+        gains DO read the spared raw operand — EXCLUDING them regresses both
+        (leak trace: id408 goes NaN at block 46, id1088's correct 0x00 at block
+        29 is clobbered to 0xE0 at block 37 then 0x01 at block 45). So these
+        five must STAY spared for the gains to hold.
 
-    DEFAULT-OFF (CMP excluded). Set ``=1`` to restore the original all-CMP-in
-    behaviour (the −4 net configuration the recover masked).
+    Excluding ONLY ``OP_LT`` therefore fixes func_min id675 AND holds all four
+    gains (id408 if_eq, id433 if_var, id612 func_mul, id1088 bool_and). The
+    id433 gain additionally rides the block-17 head-4 CMP Q-veto (SE band,
+    unchanged). The deleted ``CmpOperandSeRecoverFFN`` stays gone: with the five
+    non-LT CMP opcodes spared, the CMP operand it used to re-materialise is
+    already alive for EQ/NE/GT/LE/GE, and for LT the verdict wants it crushed.
+
+    DEFAULT-OFF (LT excluded). Set ``=1`` to restore the original all-CMP-in
+    behaviour (LT included → func_min id675 regresses, the config the recover
+    masked).
     """
     return os.environ.get("C4_ALU_OPERAND_SURVIVE_CMP_RAW", "0") != "0"
+
+
+# The ONE CMP opcode that must be EXCLUDED from the raw-band spare: ``OP_LT``.
+# func_min id675's LT-result writer at logical L14 (physical block 29) is gated
+# on the raw ALU@AX band being CRUSHED all-negative; sparing it keeps the band
+# alive → the writer stops firing → the correct 0x01 is lost → 0xE8 leak.
+# The other five CMP opcodes (EQ/NE/GT/LE/GE) DO need the raw band spared (the
+# if_eq id408 / bool_and id1088 gains break WITHOUT it — id408 goes NaN, id1088
+# is clobbered to 0xE0/0x01 downstream at blocks 37/45). See
+# docs/FUNCMIN_FIX_2026_07_13.md §1-2 for the leak-trace evidence.
+_CMP_OPCODES_SPARED: tuple[str, ...] = (
+    "OP_EQ",
+    "OP_NE",
+    "OP_GT",
+    "OP_LE",
+    "OP_GE",
+)
 
 
 def _spare_opcodes() -> tuple[str, ...]:
     """The opcode set added as ``-1e6`` NOT-blockers to the L9 ALU-clear gate.
 
     Always includes the arithmetic/bitwise opcodes (their engines read the raw
-    ALU@AX band). The six CMP opcodes are added ONLY when
-    ``C4_ALU_OPERAND_SURVIVE_CMP_RAW`` is set (default OFF) — see
-    :func:`_spare_cmp_raw_enabled` for why CMP is excluded by default.
+    ALU@AX band) AND five of the six CMP opcodes (``EQ/NE/GT/LE/GE`` — the
+    if_eq/bool_and gains need the raw CMP operand spared). ``OP_LT`` is the ONE
+    opcode EXCLUDED by default: func_min id675's crush-gated LT writer needs the
+    raw band CRUSHED (see :func:`_spare_cmp_raw_enabled`). Setting
+    ``C4_ALU_OPERAND_SURVIVE_CMP_RAW=1`` restores the original all-CMP-in
+    behaviour (LT included → func_min regresses).
     """
     if _spare_cmp_raw_enabled():
         return _CMP_OPCODES + _SPARE_OPCODES_ARITH
-    return _SPARE_OPCODES_ARITH
+    return _CMP_OPCODES_SPARED + _SPARE_OPCODES_ARITH
 
 
-# Back-compat alias (the original name; now = the arith set unless the CMP-raw
-# opt-in flag is set, resolved at call time via ``_spare_opcodes()``).
-_SPARE_OPCODES: tuple[str, ...] = _SPARE_OPCODES_ARITH
+# Back-compat alias (the original name; now = the arith set + the 5 spared CMP
+# opcodes unless the CMP-raw opt-in flag is set, resolved at call time via
+# ``_spare_opcodes()``).
+_SPARE_OPCODES: tuple[str, ...] = _CMP_OPCODES_SPARED + _SPARE_OPCODES_ARITH
 
 
 def _alu_operand_survive_enabled() -> bool:
