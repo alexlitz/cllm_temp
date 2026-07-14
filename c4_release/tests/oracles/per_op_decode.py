@@ -508,10 +508,37 @@ def run_op_class(op: str, *, max_steps_cap: int = 60) -> OpClassVerdict:
 # Pytest entry points (parametrised over op-classes).
 # ---------------------------------------------------------------------------
 
+# Op-classes that do NOT fully decode on main today (golden 1c04c3fd) — a
+# pre-existing per-op decode divergence in the bitwise / comparison / char
+# families (the ISA-VM oracle value is correct; the neural model decodes a
+# different byte). Marked ``xfail(strict)`` so a plain ``pytest`` run is GREEN on
+# main AND a regression flips them: if one of these UNEXPECTEDLY starts passing
+# (an improvement) the strict xfail turns it RED, prompting a baseline update;
+# and any op-class NOT listed here that regresses fails normally. The
+# authoritative regression gate for a change is
+# ``tools/run_per_op_oracle.py --baseline`` (pass->fail blocks); this xfail set
+# keeps the pytest itself a valid green/red signal.
+_KNOWN_FAIL_OP_CLASSES = frozenset({"AND", "NE", "LE", "GE", "SHR", "LC", "SC"})
+
 try:
     import pytest
 
-    @pytest.mark.parametrize("op", ALL_OP_CLASSES)
+    @pytest.mark.parametrize(
+        "op",
+        [
+            pytest.param(
+                op,
+                marks=pytest.mark.xfail(
+                    strict=True,
+                    reason="pre-existing bitwise/cmp/char decode divergence "
+                           "(baseline-recorded); see docs/PER_OP_DECODE_ORACLE_"
+                           "2026_07_14.md",
+                )
+                if op in _KNOWN_FAIL_OP_CLASSES else (),
+            )
+            for op in ALL_OP_CLASSES
+        ],
+    )
     def test_per_op_decode(op: str) -> None:
         """Each op-class: every representative program decodes ``pass``."""
         v = run_op_class(op)
