@@ -48,10 +48,11 @@ def _nonfirst_psh_sp_fix_enabled() -> bool:
     The fix adds an EMBED_LO+8 / EMBED_HI+15 NOT-blocker (the input SP byte0
     == 0xF8 evidence carried onto the MARK_SP row by the L3 carry-forward)
     so the rule is suppressed on a push whose incoming SP already ends in
-    0xF8. Default ON; with ``C4_NONFIRST_PSH_SP_FIX=0`` the rule's conditions
-    are byte-identical to the prior build.
+    0xF8. Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_NONFIRST_PSH_SP_FIX`` escape hatch was retired as a proven default-ON
+    fix).
     """
-    return os.environ.get("C4_NONFIRST_PSH_SP_FIX", "1") != "0"
+    return True
 
 
 def _lea_local_e8_multilocal_guard_enabled() -> bool:

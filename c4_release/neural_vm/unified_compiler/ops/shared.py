@@ -837,14 +837,12 @@ def sub_full_borrow_enabled() -> bool:
 
     DEFAULT ON. Opt-out via ``C4_SUB_FULL_BORROW=0`` restores the byte-identical
     pre-fix path (flag-OFF or ``C4_OPERAND_FROM_MEMSP=0`` are both byte-identical
-    to golden ``7f6f2e5d``: the band is flag-gated so a flag-off build omits it
-    entirely → smaller d_model). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_SUB_FULL_BORROW`` can A/B it inside
-    the campaign config.
+    to golden ``7f6f2e5d``: the band is campaign-gated so a non-campaign build
+    omits it entirely → smaller d_model). Unconditional under the operand-
+    from-memsp campaign as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_SUB_FULL_BORROW`` escape hatch was retired as a proven default-ON fix).
     """
-    if not operand_from_memsp_enabled():
-        return False
-    return os.environ.get("C4_SUB_FULL_BORROW", "1") != "0"
+    return operand_from_memsp_enabled()
 
 
 def l8_operand_sp_disc_enabled() -> bool:

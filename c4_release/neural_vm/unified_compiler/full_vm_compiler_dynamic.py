@@ -2185,16 +2185,6 @@ def _build_cache_key_snapshot(
             tuple(sorted(extra_residual_dims.items()))
             if extra_residual_dims else None
         ),
-        # Consumer-opcode LOOKAHEAD (#221; DEFAULT-ON, opt out =0): adds the
-        # PC+8 chain + lookahead fetch head + arith-decode flag + AX->STACK0
-        # relay + prior-arith latch + dump-block flag bands AND the dump's
-        # STACK0_B0_DUMP_BLOCK blocker (output-affecting on multi-op arith
-        # intermediate-operand frames). On / off builds must NEVER share a
-        # memo / disk entry -- the band presence changes d_model and the dump
-        # gate changes emission, so this flag toggles geometry AND output.
-        "C4_STACK0_NEXT_ARITH": (
-            os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
-        ),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).
         "__dynamic": True,
