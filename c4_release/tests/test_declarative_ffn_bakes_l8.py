@@ -8,8 +8,8 @@ from c4_release.neural_vm.unified_compiler.ops.l8_ops import (
     lower_layer8_multibyte_routing_ir,
 )
 from c4_release.neural_vm.unified_compiler.ops.all_core_ops import all_core_ops
-from c4_release.neural_vm.vm_step import (
-    _SetDim,
+from c4_release.neural_vm.vm_step import _SetDim
+from tests.oracles.vm_step_layer_bakes import (
     _set_layer8_alu,
     _set_layer8_multibyte_routing,
 )

@@ -7,7 +7,8 @@ from neural_vm.unified_compiler.ops.l16_ops import (
     _layer16_lev_routing_rules,
     lower_layer16_lev_routing_ir,
 )
-from neural_vm.vm_step import _SetDim, _set_layer16_lev_routing
+from neural_vm.vm_step import _SetDim
+from tests.oracles.vm_step_layer_bakes import _set_layer16_lev_routing
 
 
 class _StubFFN:

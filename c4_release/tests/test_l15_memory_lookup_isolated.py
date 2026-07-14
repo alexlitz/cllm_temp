@@ -40,8 +40,8 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from neural_vm.vm_step import (  # noqa: E402
-    _SetDim,
+from neural_vm.vm_step import _SetDim  # noqa: E402
+from tests.oracles.vm_step_layer_bakes import (  # noqa: E402
     _set_layer15_memory_lookup_heads_0_3,
 )
 
