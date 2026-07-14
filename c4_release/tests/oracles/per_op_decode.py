@@ -351,6 +351,9 @@ class OpClassVerdict:
 # standalone runner build the model ONCE.
 _RUNNER = None
 _CORPUS_CACHE: Optional[Dict[int, Tuple[list, bytes, int, int]]] = None
+# Faithful-decode verdict cache, keyed on (bytecode, data), so a program shared
+# by several op-classes decodes only once per process (var_simple_0 covers 5).
+_DECODE_CACHE: Dict[Tuple[tuple, bytes], dict] = {}
 
 
 def _get_runner():
@@ -444,21 +447,32 @@ def decode_program(
             op=op, label=label, steps=steps, oracle_exit=int(o.exit_code),
             status="skipped", note=f"steps {steps} > cap {max_steps_cap}",
         )
-    runner = _get_runner()
-    t0 = time.monotonic()
-    with contextlib.redirect_stderr(io.StringIO()):
-        v = runner.run_batch_fail_fast(
-            [list(bytecode)], data_list=[bytes(data)], max_steps=None,
-            expected_steps_list=[steps], spec_k=32, criterion="full_trace",
-        )[0]
-    dt = time.monotonic() - t0
+    # Decode-verdict cache: a program shared by several op-classes (e.g.
+    # var_simple_0 covers LI/SI/LEA/JSR/ENT) runs the EXPENSIVE ~O(steps^2)
+    # faithful decode only ONCE per process; the cached verdict is re-badged for
+    # each op-class. The verdict depends only on (bytecode, data), so this is
+    # exact — not an approximation.
+    key = (tuple(bytecode), bytes(data))
+    cached = _DECODE_CACHE.get(key)
+    if cached is None:
+        runner = _get_runner()
+        t0 = time.monotonic()
+        with contextlib.redirect_stderr(io.StringIO()):
+            v = runner.run_batch_fail_fast(
+                [list(bytecode)], data_list=[bytes(data)], max_steps=None,
+                expected_steps_list=[steps], spec_k=32, criterion="full_trace",
+            )[0]
+        cached = dict(v)
+        cached["_seconds"] = time.monotonic() - t0
+        _DECODE_CACHE[key] = cached
+    v = cached
     return ProgramVerdict(
         op=op, label=label, steps=steps, oracle_exit=int(o.exit_code),
         status=str(v.get("status")),
         divergence_step=v.get("divergence_step"),
         expected_pc=v.get("expected_pc"), got_pc=v.get("got_pc"),
         expected_ax=v.get("expected_ax"), got_ax=v.get("got_ax"),
-        seconds=dt,
+        seconds=float(v.get("_seconds", 0.0)),
     )
 
 
