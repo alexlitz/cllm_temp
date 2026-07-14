@@ -2236,13 +2236,6 @@ def _build_cache_key_snapshot(
                 else "0",
             ) != "0"
         ),
-        # C4_SHIFT_OUTPUT_B0_CLEAR: now INERT (the ShiftOutputClearFFN wrap it
-        # gated was DELETED 2026-07-13; the SHR OUTPUT byte-0 leak is cancelled at
-        # its L11 source by C4_OUTPUT_B0_NOLEAK). Kept as an always-same cache-key
-        # term for serialised-key stability; a follow-up dead-flag sweep can drop it.
-        "C4_SHIFT_OUTPUT_B0_CLEAR": (
-            os.environ.get("C4_SHIFT_OUTPUT_B0_CLEAR", "1") != "0"
-        ),
         # if_var GT-FALSE 0xF-leak guard (#339, campaign-ON, opt out =0,
         # BAKE-affecting): when active the L10 ordering-engine ``hi_lt`` (CMP+0)
         # blocker DROPS its ``ALU_HI+15`` veto term, so the ON / OFF builds bake
@@ -2314,11 +2307,14 @@ def _build_cache_key_snapshot(
         # the flag-ON path during the byte-identity golden check. See
         # docs/EMIT_G5_ROLLOUT_2026_07_13.md.
         "C4_EMIT_G5_RBYTE": emit_g5_rbyte_enabled(),
-        # CLEAN_EMITTER generic all-marker-row OUTPUT sink (DEFAULT-ON, opt out
-        # =0, BAKE-affecting): appends a 32-unit PureFFN post_op to the L25 tail
-        # block, so the ON / OFF builds have different state_dicts and MUST NEVER
-        # share a serialised entry. See l0_ops._clean_emitter_enabled.
-        "C4_CLEAN_EMITTER": (os.environ.get("C4_CLEAN_EMITTER", "1") != "0"),
+        # CLEAN_EMITTER generic all-marker-row OUTPUT sink (BAKE-affecting):
+        # appends a 32-unit PureFFN post_op to the L25 tail block under the
+        # campaign frame. The C4_CLEAN_EMITTER escape hatch was RETIRED 2026-07-14
+        # (proven default-ON); the op is now installed unconditionally under
+        # C4_NO_STACK0_EMIT, so campaign (post_op present) and non-campaign
+        # (absent) builds never share a serialised entry. See
+        # l0_ops._clean_emitter_enabled.
+        "clean_emitter_wrap": (os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"),
         # M8 pilot: STACK0 store-loaded byte-writeback ENUMERATED (255 per-value
         # AND) -> COMPUTED (32 per-nibble route) collapse (DEFAULT-ON, kill-switch
         # =0). Changes the L10-tail FFN hidden_dim AND the emitted OUTPUT delta,

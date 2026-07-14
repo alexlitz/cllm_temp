@@ -890,21 +890,16 @@ _CLEAN_EMITTER_NEXT_FLAGS = (
 
 
 def _clean_emitter_enabled() -> bool:
-    """Kill-switch for the CLEAN_EMITTER generic marker-row OUTPUT sink.
+    """The CLEAN_EMITTER generic marker-row OUTPUT sink — now UNCONDITIONAL under
+    the 30-token campaign frame (``_no_stack0_emit()``, itself DEFAULT-ON).
 
-    DEFAULT ON: ON iff ``C4_CLEAN_EMITTER`` is not explicitly disabled AND the
-    30-token frame is active (``_no_stack0_emit()``, itself DEFAULT-ON). PROVEN
-    net-positive on the full 1096 (516 -> 525, +9), so it is the production
-    default and replaces the two deleted point-fixes. Because both this flag and
-    ``C4_NO_STACK0_EMIT`` default ON, the golden byte-identity gate
-    (``tools/_isa_golden_hash.py``, bare env) now BAKES this op -> the golden
-    hash intentionally CHANGED from ``91f55411``. Opt out with
-    ``C4_CLEAN_EMITTER=0``; ``tools/flag_regression_gate.py --flag
-    C4_CLEAN_EMITTER`` A/Bs the op ON/OFF.
+    The former ``C4_CLEAN_EMITTER`` escape hatch was RETIRED 2026-07-14: this was
+    a PROVEN net-positive default-ON fix (full 1096 516 -> 525, +9) that replaced
+    two deleted point-fixes and will never be reverted. The non-campaign golden
+    (``C4_NO_STACK0_EMIT=0``) still bakes NO units (the op is a no-op off the
+    campaign frame).
     """
-    if not _no_stack0_emit():
-        return False
-    return _os_l0.environ.get("C4_CLEAN_EMITTER", "1") != "0"
+    return _no_stack0_emit()
 
 
 def _clean_emitter_rules() -> tuple[FFNRule, ...]:
@@ -948,8 +943,9 @@ def make_clean_emitter_op() -> Operation:
 
     Standalone ``PureFFN`` post_op on the L25 tail block (appended AFTER the two
     existing point-fix correctors), so it is the LAST writer of OUTPUT on every
-    marker-predicting row before the LM head. Gated by ``C4_CLEAN_EMITTER``
-    (DEFAULT OFF) + ``_no_stack0_emit()``; OFF bakes NO units (byte-identical to
+    marker-predicting row before the LM head. Now UNCONDITIONAL under
+    ``_no_stack0_emit()`` (the ``C4_CLEAN_EMITTER`` escape hatch was RETIRED
+    2026-07-14); off the campaign frame it bakes NO units (byte-identical to
     golden ``91f55411``). See the module-level block comment + the scope doc
     ``docs/CLEAN_EMITTER_SCOPE_2026_07_04.md`` for the drift mechanism.
     """
