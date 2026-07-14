@@ -48,10 +48,11 @@ def _nonfirst_psh_sp_fix_enabled() -> bool:
     The fix adds an EMBED_LO+8 / EMBED_HI+15 NOT-blocker (the input SP byte0
     == 0xF8 evidence carried onto the MARK_SP row by the L3 carry-forward)
     so the rule is suppressed on a push whose incoming SP already ends in
-    0xF8. Default ON; with ``C4_NONFIRST_PSH_SP_FIX=0`` the rule's conditions
-    are byte-identical to the prior build.
+    0xF8. Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_NONFIRST_PSH_SP_FIX`` escape hatch was retired as a proven default-ON
+    fix).
     """
-    return os.environ.get("C4_NONFIRST_PSH_SP_FIX", "1") != "0"
+    return True
 
 
 def _lea_local_e8_multilocal_guard_enabled() -> bool:
@@ -140,10 +141,9 @@ def _tail_lea_e8_divmod_guard_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_DIVMOD_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_DIVMOD_GUARD`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 def _tail_lea_e8_arith_guard_enabled() -> bool:
@@ -185,10 +185,9 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_ARITH_GUARD`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 def _tail_lea_e8_arith_guard_sharp_enabled() -> bool:
@@ -284,10 +283,9 @@ def _arith_guard_addsub_blockers() -> tuple:
 
 
 def _ax_byte1_signext_lea_enabled() -> bool:
-    """Flag for the AX byte-1 sign-extension delivery on a negative LEA-local
-    frame address (#343 — the #325 byte-0 follow-up). DEFAULT ON wherever the
-    campaign STACK0 emission is dropped (``C4_NO_STACK0_EMIT=1``); opt-out via
-    ``C4_AX_BYTE1_SIGNEXT_LEA=0``.
+    """Gate for the AX byte-1 sign-extension delivery on a negative LEA-local
+    frame address (#343 — the #325 byte-0 follow-up). Active wherever the
+    campaign STACK0 emission is dropped (``C4_NO_STACK0_EMIT=1``).
 
     The wall this lifts (verified AUTOREGRESSIVE spec_k=0, BUILT dims, campaign
     config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; tools/
@@ -336,19 +334,16 @@ def _ax_byte1_signext_lea_enabled() -> bool:
     This PREVENTS the 2e16 nuke (rather than out-writing it), so no astronomical
     write magnitude is needed.
 
-    DEFAULT tracks ``operand_from_memsp_enabled()`` (the adder's own campaign
-    branch): the blockers are added ONLY in the 30-token campaign config and ONLY
-    when this flag is on, so flag-OFF (``=0``), ``C4_NO_STACK0_EMIT=0``, or the
-    35-token golden build are all byte-identical to the pre-fix default (golden
-    ``4958b35b`` never enters the campaign adder branch). Dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_AX_BYTE1_SIGNEXT_LEA`` can A/B it.
+    The blockers are added ONLY in the 30-token campaign config, so
+    ``C4_NO_STACK0_EMIT=0`` or the 35-token golden build are byte-identical to
+    the pre-fix default (golden ``4958b35b`` never enters the campaign adder
+    branch). This is UNCONDITIONAL under campaign as of the P5 flag-retire
+    2026-07-14 (the former ``C4_AX_BYTE1_SIGNEXT_LEA`` escape hatch was retired
+    as a proven default-ON fix).
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    return no_stack0_emit_enabled()
 
 
 def _ax_byte1_signext_lea_blockers() -> tuple:
@@ -425,10 +420,9 @@ def _tail_lea_e8_ent_guard_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_ENT_GUARD`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 # ENT is C4 opcode 6 = 0x06 -> low nibble 0x6. The per-step FETCHED opcode
@@ -582,17 +576,13 @@ def _lea_e8_first_ent_gate_enabled() -> bool:
     slam is silenced on are byte-identical (their pre-slam value is already 0xE8
     or, for var ``&b``, delivered by e0_fetch).
 
-    DEFAULT tracks ``_lea_byte0_memsp_relay_enabled()`` (the e8 writer's own
-    campaign branch): the OP_ENT gate is applied ONLY in the 30-token campaign
-    config and ONLY when this flag is on, so flag-OFF (``=0``),
-    ``C4_NO_STACK0_EMIT=0``, or the 35-token golden build are all byte-identical
-    to the pre-fix default (golden never emits this writer). Dedicated
-    kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_LEA_E8_FIRST_ENT_GATE`` can A/B it inside the campaign config.
+    Tracks ``_lea_byte0_memsp_relay_enabled()`` (the e8 writer's own campaign
+    branch): the OP_ENT gate is applied ONLY in the 30-token campaign config, so
+    ``C4_NO_STACK0_EMIT=0`` or the 35-token golden build are byte-identical to the
+    pre-fix default (golden never emits this writer). Unconditional under campaign
+    as of the P5 flag-retire 2026-07-14 (the former ``C4_LEA_E8_FIRST_ENT_GATE``
+    escape hatch was retired as a proven default-ON fix).
     """
-    forced = os.environ.get("C4_LEA_E8_FIRST_ENT_GATE")
-    if forced is not None:
-        return forced != "0" and _lea_byte0_memsp_relay_enabled()
     return _lea_byte0_memsp_relay_enabled()
 
 
@@ -975,10 +965,9 @@ def _sp_pop_carry_byte0_dominate_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    return (
-        os.environ.get("C4_SP_POP_CARRY_BYTE0_DOMINATE", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_SP_POP_CARRY_BYTE0_DOMINATE`` escape hatch was retired).
+    return no_stack0_emit_enabled()
 
 
 def _psh_stack0_highbyte_darken_enabled() -> bool:
@@ -1008,7 +997,9 @@ def _psh_stack0_highbyte_darken_enabled() -> bool:
     ``C4_PSH_STACK0_HIGHBYTE_DARKEN=0`` the head spec is byte-identical to
     the prior build (the two slot-7 BYTE_INDEX terms are omitted).
     """
-    return os.environ.get("C4_PSH_STACK0_HIGHBYTE_DARKEN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_PSH_STACK0_HIGHBYTE_DARKEN`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _stack0_pop_loaded_shallow_crush_enabled() -> bool:
@@ -1044,7 +1035,9 @@ def _stack0_pop_loaded_shallow_crush_enabled() -> bool:
     ``C4_STACK0_POP_LOADED_SHALLOW_CRUSH=0`` the family is byte-identical to the
     prior build (competitor strength stays 500).
     """
-    return os.environ.get("C4_STACK0_POP_LOADED_SHALLOW_CRUSH", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_STACK0_POP_LOADED_SHALLOW_CRUSH`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l10_exit_axcarry_enabled() -> bool:
@@ -1081,7 +1074,9 @@ def _l10_exit_axcarry_enabled() -> bool:
     byte-identical to HEAD. See ``_l10_exit_axcarry_rules`` /
     ``make_l10_exit_axcarry_op``.
     """
-    return os.environ.get("C4_L10_EXIT_AXCARRY", "1") == "1"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L10_EXIT_AXCARRY`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 from ...attention_head_allocator import AttentionHeadAllocator
 from ...dim_registry import dim_ref
@@ -1104,9 +1099,7 @@ from .shared import (
     absdiff_fix_enabled,
     absdiff_ret_byte1_enabled,
     loop_lea_b0_e0_restore_enabled,
-    loop_lea_b0_e8_oplea_req_enabled,
     loop_lea_b0_e8_restore_enabled,
-    loop_lea_oplea_gate_enabled,
     loop_li_opcode_fetch_addrkey_clamp_enabled,
     loop_si_byterow_marker_clear_enabled,
     mul_stack0_byte39_guard_enabled,
@@ -2839,12 +2832,11 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
     # and lo_lt-alone does NOT flip LT-false 50<44). hi_lt (CMP+0) lands ~0.77
     # alone and already trips its 2-way override (> 0.5), so its strength is
     # left untouched — only the EQ flag and the lo_lt 3-way partner are
-    # boosted. Gated so flag-OFF is byte-identical to the golden bake.
-    if os.environ.get("C4_CMP_FLAG_MARGIN_FIX", "1") != "0":
-        FLAG_EQ = 0.45  # -> ~1.05 at decode row (was ~0.72)
-        FLAG_LT_LO_LT = 0.19  # lo_lt -> ~1.10 (was ~0.88); hi_lt unchanged
-    else:
-        FLAG_LT_LO_LT = FLAG_LT
+    # boosted. Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_CMP_FLAG_MARGIN_FIX`` escape hatch was retired as a proven default-ON
+    # fix).
+    FLAG_EQ = 0.45  # -> ~1.05 at decode row (was ~0.72)
+    FLAG_LT_LO_LT = 0.19  # lo_lt -> ~1.10 (was ~0.88); hi_lt unchanged
     # CMP equal-high-nibble GT lo-margin fix (#322, 2026-06-23, CAMPAIGN only).
     # ROOT (isolated CPU-autoregressive, campaign config
     # ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims, spec_k=0,
@@ -2874,8 +2866,11 @@ def _layer10_alu_ordering_engine_rules(S: float) -> tuple[FFNRule, ...]:
     # zero-sum trade. ``lo_lt`` (CMP+3) write strength is UNTOUCHED so lt/le/ge
     # margins are unchanged. Kill-switch ``C4_CMP_GT_LO_MARGIN=0`` restores the
     # 0.45 campaign value; flag-OFF / non-campaign is byte-identical to golden.
-    from .shared import no_stack0_emit_enabled, cmp_gt_lo_margin_enabled
-    if no_stack0_emit_enabled() and cmp_gt_lo_margin_enabled():
+    from .shared import no_stack0_emit_enabled
+    # The campaign hi_eq knock-down is unconditional under campaign (P5
+    # flag-retire 2026-07-14; the former ``C4_CMP_GT_LO_MARGIN`` escape hatch was
+    # retired as a proven default-ON fix).
+    if no_stack0_emit_enabled():
         FLAG_EQ = 0.30  # campaign: -> hi_eq ~1.24 (was 1.86 at 0.45)
 
     # if_var GT-FALSE 0xF-leak guard (#339, 2026-06-25, CAMPAIGN only).
@@ -11360,8 +11355,8 @@ def _l10_ent_axcarry_enabled() -> bool:
     """
     from .shared import no_stack0_emit_enabled
 
-    if os.environ.get("C4_L10_ENT_AXCARRY", "1") == "0":
-        return False
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_L10_ENT_AXCARRY`` escape hatch was retired as a proven default-ON fix).
     return no_stack0_emit_enabled()
 
 
@@ -11514,7 +11509,9 @@ _LOOP_LEA_E8_HI_NIBBLE = 14      # 0xE8 high nibble (0xE)
 # silu(up) * 0 = 0, a true zero-out that NO FETCH amplitude can cross. A bias of
 # 0.0 is deliberate: a NEGATIVE gate would INVERT the +/-DOM winner-take-all on a
 # false-fire row (silu(up) stays large-positive) and stamp a DIFFERENT wrong
-# byte, whereas gate==0 is a clean no-op. See shared.loop_lea_oplea_gate_enabled.
+# byte, whereas gate==0 is a clean no-op. The gate is applied unconditionally in
+# the campaign loop_lea ops (the former C4_LOOP_LEA_OPLEA_GATE flag was retired
+# in the P5 flag-retire 2026-07-14).
 _LOOP_LEA_OPLEA_GENUINE = 5.23   # measured genuine in-loop LEA OP_LEA value
 _LOOP_LEA_OPLEA_GATE_W = 1.0 / _LOOP_LEA_OPLEA_GENUINE  # -> genuine gate ~= 1.0
 
@@ -11544,12 +11541,11 @@ def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
     # FIRES (100 + 1048 + 160 - 650 = 658 > 500, 158-pt margin) while the LI row
     # (OP_LEA 0) is VETOED (100 + 0 + 1000 - 650 = 450 < 500). The 2nd/3rd-local
     # LEAs (FETCH net -1000) stay silent (-502). OFF reverts to the regressed
-    # weights for A/B. See ``shared.loop_lea_b0_e8_oplea_req_enabled``.
-    _oplea_req = loop_lea_b0_e8_oplea_req_enabled()
-    _op_lea_w = 200.0 if _oplea_req else 60.0
-    _const_bias: tuple[tuple[str, float], ...] = (
-        (("CONST", -650.0),) if _oplea_req else ()
-    )
+    # weights for A/B. The OPLEA_REQ narrowing is now UNCONDITIONAL (P5
+    # flag-retire 2026-07-14; the former ``C4_LOOP_LEA_B0_E8_OPLEA_REQ`` escape
+    # hatch was retired).
+    _op_lea_w = 200.0
+    _const_bias: tuple[tuple[str, float], ...] = (("CONST", -650.0),)
     disc: tuple[tuple[str, float], ...] = _const_bias + (
         ("MARK_AX", 100.0),
         # GENUINE LEA (OP_LEA ~5.24): HARD requirement when the OPLEA_REQ
@@ -11599,15 +11595,15 @@ def _l10_loop_lea_b0_e8_rules() -> tuple[FFNRule, ...]:
     # ENT opcode one-hot ``OPCODE_BYTE_LO+6`` hard-blocks it on a real ENT step
     # while leaving every genuine in-loop LEA row (OPCODE_BYTE_LO+6 == 0)
     # byte-identical. See ``_tail_lea_e8_ent_guard_enabled``.
-    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (default OFF via
-    # C4_LOOP_LEA_OPLEA_GATE). Added to EVERY unit so the whole op zeroes when
+    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (unconditional as
+    # of the P5 flag-retire 2026-07-14; the former C4_LOOP_LEA_OPLEA_GATE escape
+    # hatch was retired). Added to EVERY unit so the whole op zeroes when
     # OP_LEA == 0 (the IMM/comparison leak rows) regardless of FETCH amplitude,
     # and is a ~no-op (gate ~= 1.0) on genuine OP_LEA ~= 5.23 in-loop LEA rows.
-    _gate_kwargs: dict = (
-        {"gate_bias": 0.0, "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),)}
-        if loop_lea_oplea_gate_enabled()
-        else {}
-    )
+    _gate_kwargs: dict = {
+        "gate_bias": 0.0,
+        "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),),
+    }
     rules: list[FFNRule] = []
     for out_dim, tgt in (
         ("OUTPUT_LO", _LOOP_LEA_E8_LO_NIBBLE),
@@ -11772,16 +11768,16 @@ def _l10_loop_lea_b0_e0_rules() -> tuple[FFNRule, ...]:
         ("MARK_STACK0", -1_000_000.0),
         ("MARK_MEM", -1_000_000.0),
     )
-    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (default OFF via
-    # C4_LOOP_LEA_OPLEA_GATE). Mirror of the e8 op: added to EVERY unit so the
-    # whole op zeroes when OP_LEA == 0 (the IMM/comparison leak rows, e.g. if_eq
-    # id402 wants byte-0 0x10 not 0xe0) regardless of FETCH amplitude, and is a
-    # ~no-op (gate ~= 1.0) on genuine OP_LEA ~= 5.23 2nd-local LEA rows.
-    _gate_kwargs: dict = (
-        {"gate_bias": 0.0, "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),)}
-        if loop_lea_oplea_gate_enabled()
-        else {}
-    )
+    # PROJECT_0XE8_SLAM Phase-2: the MULTIPLICATIVE OP_LEA gate (unconditional as
+    # of the P5 flag-retire 2026-07-14; the former C4_LOOP_LEA_OPLEA_GATE escape
+    # hatch was retired). Mirror of the e8 op: added to EVERY unit so the whole op
+    # zeroes when OP_LEA == 0 (the IMM/comparison leak rows, e.g. if_eq id402
+    # wants byte-0 0x10 not 0xe0) regardless of FETCH amplitude, and is a ~no-op
+    # (gate ~= 1.0) on genuine OP_LEA ~= 5.23 2nd-local LEA rows.
+    _gate_kwargs: dict = {
+        "gate_bias": 0.0,
+        "gate_terms": (("OP_LEA", _LOOP_LEA_OPLEA_GATE_W),),
+    }
     rules: list[FFNRule] = []
     for out_dim, tgt in (
         ("OUTPUT_LO", _LOOP_LEA_E0_LO_NIBBLE),

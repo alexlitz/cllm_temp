@@ -63,7 +63,9 @@ def _l15_li_load_suppressor_inert_on() -> bool:
     PC/SP/STACK0/pop row the suppressors actually guard) the writes are absent,
     so HEAD is byte-identical with the flag OFF.
     """
-    return _os_l15.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LI_SUPPR_INERT`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_pc_restore_head_on() -> bool:
@@ -108,7 +110,9 @@ def _l15_lev_pc_restore_head_on() -> bool:
     ``W_q/W_k/W_v`` row count and ``W_o`` column count -- d_model is unchanged
     so every OTHER block is byte-identical regardless of the flag.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LEV_PC_RESTORE`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_addr_widen_on() -> bool:
@@ -142,7 +146,9 @@ def _l15_lev_addr_widen_on() -> bool:
     address scale, value_scale 1.0, original slot-31), so smoke stays at the
     HEAD baseline. Turn ON once the single-store framing fix lands.
     """
-    return _os_l15.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LEV_ADDR_WIDEN`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_b0_boost_factor() -> float:
@@ -235,7 +241,9 @@ def _l15_lev_pc_only_on() -> bool:
     load is no longer clobbered. Flag-off omits the slot (byte-identical to the
     widen build); consulted only when ``C4_L15_LEV_ADDR_WIDEN`` is on.
     """
-    return _os_l15.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L15_LEV_PC_ONLY`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l15_lev_opcode_gate_on() -> bool:
@@ -355,7 +363,6 @@ from ..primitives import AO, AP, DeclarativeAttentionHeadSpec, Primitives
 from .shared import (
     _as_setdim_proxy,
     no_stack0_emit_enabled,
-    l15_lookup_cmp_veto_enabled,
     li_value_load_enabled,
     si_store_addr_enabled,
     var_three_li_enabled,
@@ -1562,23 +1569,24 @@ def _layer15_memory_lookup_heads_0_3_specs_with_overrides(
                 ("OP_JSR", non_load_suppression), ("OP_ENT", non_load_suppression),
                 ("OP_LEA", non_load_suppression), ("OP_IMM", non_load_suppression),
             ])
-            if l15_lookup_cmp_veto_enabled():
-                # COMPARISON-STEP VETO (bool_and id=1087, 2026-06-25).
-                # CMP+3 (above) is overloaded: it is BOTH the POP-group flag
-                # this head keys on AND the L9 low-nibble-less-than cmp flag.
-                # On a comparison step (OP_GT/OP_LT/... one-hot at MARK_AX,
-                # CMP+3 also hot) the slot-0 discriminator MIS-FIRES and dumps
-                # +40 CLEAN_EMBED -> OUTPUT_LO+0, burying the cmp result byte.
-                # A real LI/LC/POP load never has a comparison opcode hot at
-                # its own marker, so extend the SAME non_load veto to the six
-                # comparison opcodes: OP_<cmp> * -1e6 dominates CMP+3 * 50000,
-                # keeping the head silent on cmp rows and byte-identical on
-                # every load row. Kill-switch: ``C4_L15_LOOKUP_CMP_VETO=0``.
-                _OV.slot(0, q=[
-                    ("OP_GT", non_load_suppression), ("OP_LT", non_load_suppression),
-                    ("OP_GE", non_load_suppression), ("OP_LE", non_load_suppression),
-                    ("OP_EQ", non_load_suppression), ("OP_NE", non_load_suppression),
-                ])
+            # COMPARISON-STEP VETO (bool_and id=1087, 2026-06-25; UNCONDITIONAL
+            # as of the P5 flag-retire 2026-07-14 — the former
+            # ``C4_L15_LOOKUP_CMP_VETO`` escape hatch was retired).
+            # CMP+3 (above) is overloaded: it is BOTH the POP-group flag
+            # this head keys on AND the L9 low-nibble-less-than cmp flag.
+            # On a comparison step (OP_GT/OP_LT/... one-hot at MARK_AX,
+            # CMP+3 also hot) the slot-0 discriminator MIS-FIRES and dumps
+            # +40 CLEAN_EMBED -> OUTPUT_LO+0, burying the cmp result byte.
+            # A real LI/LC/POP load never has a comparison opcode hot at
+            # its own marker, so extend the SAME non_load veto to the six
+            # comparison opcodes: OP_<cmp> * -1e6 dominates CMP+3 * 50000,
+            # keeping the head silent on cmp rows and byte-identical on
+            # every load row.
+            _OV.slot(0, q=[
+                ("OP_GT", non_load_suppression), ("OP_LT", non_load_suppression),
+                ("OP_GE", non_load_suppression), ("OP_LE", non_load_suppression),
+                ("OP_EQ", non_load_suppression), ("OP_NE", non_load_suppression),
+            ])
 
             if var_three_li_enabled():
                 # STORE-STEP VETO (var_three id300, 2026-07-04). The ``SI b``

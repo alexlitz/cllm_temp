@@ -4573,7 +4573,9 @@ def _ifvar_bz_hi_nibble_enabled() -> bool:
     16 BNZ per ``lo_nonzero``/``hi_nonzero`` group = 32 BNZ) to
     ``post_l9_bz_bnz_pc_override``.
     """
-    return _os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_IFVAR_BZ_HI_NIBBLE`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 # NOTE: the hand-authored ``_append_branch_pc_byte0_odd_imm_hi_correction_rules``

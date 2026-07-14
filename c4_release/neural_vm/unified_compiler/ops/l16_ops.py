@@ -110,7 +110,9 @@ def _ent_frame_sp_byte0_psh_blocker_enabled() -> bool:
     ON; ``C4_ENT_FRAME_SP_BYTE0_PSH_BLOCKER=0`` restores the legacy tuple
     (byte-identical golden ``cd54bfc0``).
     """
-    return _os.environ.get("C4_ENT_FRAME_SP_BYTE0_PSH_BLOCKER", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_ENT_FRAME_SP_BYTE0_PSH_BLOCKER`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _ent_sp_byte1_ff_h1_hardening_enabled() -> bool:
@@ -143,7 +145,9 @@ def _ent_sp_byte1_ff_h1_hardening_enabled() -> bool:
     weight on any ``H1+2 == 0`` row, burying the OP_ENT broadcast below the
     4.5 threshold.
     """
-    return os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_ENT_SP_BYTE1_FF_H1_HARDEN`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _tail_lea_e8_arith_guard_enabled() -> bool:
@@ -171,10 +175,10 @@ def _tail_lea_e8_arith_guard_enabled() -> bool:
     l10 arith guard so a single ``--flag C4_TAIL_LEA_E8_ARITH_GUARD`` A/Bs
     both 0xE8-byte0 writers in lock-step.
     """
-    return (
-        os.environ.get("C4_TAIL_LEA_E8_ARITH_GUARD", "1") != "0"
-        and no_stack0_emit_enabled()
-    )
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_TAIL_LEA_E8_ARITH_GUARD`` escape hatch was retired). The l10 sibling
+    # guard was retired in lock-step.
+    return no_stack0_emit_enabled()
 
 
 def _arith_guard_addsub_blockers() -> tuple:
@@ -312,7 +316,9 @@ def _lev_pc_top_return_opcode_gate_on() -> bool:
     (the residue step writes nothing). DEFAULT-OFF so HEAD is byte-identical;
     ships with the C4_L15_LEV func chain.
     """
-    return os.environ.get("C4_L16_LEV_PC_TOP_OPCODE_GATE", "1") == "1"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_L16_LEV_PC_TOP_OPCODE_GATE`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _stack0_marker_isbyte_hardening_on() -> bool:

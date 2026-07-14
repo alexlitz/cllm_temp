@@ -530,15 +530,13 @@ def mul_width2_enabled() -> bool:
     (d_model 920, width=1 lo-byte MUL, ``mul_overflow`` decodes 20). Any
     other value (or unset) keeps the width=2 default ON.
 
-    ``C4_MUL_MULTIPASS=1`` IMPLIES width=2: the multipass cascade routes the
-    product's byte 1 into the ``MUL_RESULT_HI_LO/HI`` band, so that band (and
-    the L13 relay that stages it into AX_FULL) MUST be present even if
-    ``C4_MUL_WIDTH2=0`` was passed. OR-in the multipass flag so the band is
-    always collected when the cascade is installed.
+    width=2 is now UNCONDITIONAL as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_MUL_WIDTH2`` escape hatch — a d_model-920 width=1 lo-byte-MUL build —
+    was retired as a proven default-ON fix). This also subsumes the
+    ``C4_MUL_MULTIPASS`` implication (the multipass cascade needs width=2's
+    ``MUL_RESULT_HI`` band, which is now always present).
     """
-    if os.environ.get("C4_MUL_MULTIPASS", "0") == "1":
-        return True
-    return os.environ.get("C4_MUL_WIDTH2", "1") != "0"
+    return True
 
 
 def mul_multipass_enabled() -> bool:
@@ -601,42 +599,6 @@ def div_multipass_enabled() -> bool:
     ``C4_DIV_MULTIPASS=1``.
     """
     return os.environ.get("C4_DIV_MULTIPASS", "0") == "1"
-
-
-def mul_w2_thresh_fix_enabled() -> bool:
-    """Return True iff the width=2 MUL 5-way-AND threshold is lowered to fire
-    the clean-operand wide-product cases the default 19.5 just barely blocks
-    (DEFAULT OFF — opt-in via ``C4_MUL_W2_THRESH_FIX=1``).
-
-    The bug this lifts (verified spec_k=0 ground-truth full_trace + the offline
-    SwiGLU sim ``tools/_mul16_retune.py`` over 32 probed operand vectors):
-    the wide-product 16-bit MUL path is ALREADY ~26/30 correct on the pure-MUL
-    band, but a handful of CLEAN-operand cases (mul_11 100*68 -> 0x1A90,
-    mul_31 52*86 -> 0x1178) miss because their true-quad 5-way-AND condition
-    lands at ~19.45 — a razor-thin 0.05 below the default ``threshold=19.5``
-    (their A high-nibble one-hot is ~0.13 weaker than the smoke cases'). The
-    rule never fires, so ALL four result nibble bands are empty and the product
-    truncates to byte 0 (got 0x90 / 0x78, high byte lost).
-
-    The fix lowers the wide_mul width=2 5-way-AND threshold from 19.5 to 19.0.
-    Verified over the 32-case probed grid: every CLEAN-operand fixable case now
-    fires (30/30) with a STRICTLY BETTER worst-case result-band margin (0.044 vs
-    0.000) — the threshold does NOT admit any spurious quad, the smoke cases
-    (6*7=0x2A, 100*5=0x1F4) stay byte-correct, and the band stays a clean
-    one-hot for the L13 byte-1 relay's raw V@O copy. 19.0 (not the more
-    aggressive 18.5) is the chosen value: at 18.5 an INTERMEDIATE MUL feeding a
-    downstream DIV (expr_mul_div_19 3*16/8) spuriously emits a byte-1 that leaks
-    into the divisor; the 0.44-margin 19.0 reliably fires the true quad while
-    staying above that leak boundary (ground-truth full_trace verified — no expr
-    regression). The 2 residual pure-MUL misses (9*98, 89*26) are an UPSTREAM
-    operand-gather defect (ALU_HI reads nibble 3 instead of the true high
-    nibble) — NOT a threshold issue, NOT fixable here.
-
-    DEFAULT ON (flipped 2026-06-17 after smoke 51/0 flag-ON + +2 16-bit MUL
-    verified): lowers the wide_mul width=2 firing threshold 19.5->19.0. Opt OUT
-    via ``C4_MUL_W2_THRESH_FIX=0``. Only meaningful when ``mul_width2_enabled()``.
-    """
-    return os.environ.get("C4_MUL_W2_THRESH_FIX", "1") != "0"
 
 
 def mul_stack0_byte39_guard_enabled() -> bool:
@@ -728,7 +690,9 @@ def div_multibyte_enabled() -> bool:
     (divmod stays at block 14, converter reads CLEAN_EMBED). See
     ``docs/DIV_MOD_MULTIBYTE_DIVIDEND_BLOCKER_2026_06_12.md``.
     """
-    return os.environ.get("C4_DIV_MULTIBYTE", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_DIV_MULTIBYTE`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def divmod_byte0_se_recover_enabled() -> bool:
@@ -766,7 +730,9 @@ def divmod_byte0_se_recover_enabled() -> bool:
     ``tools/flag_regression_gate.py --flag C4_DIVMOD_BYTE0_SE_RECOVER`` can
     A/B it inside the campaign config.
     """
-    return os.environ.get("C4_DIVMOD_BYTE0_SE_RECOVER", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_DIVMOD_BYTE0_SE_RECOVER`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def mul_byte0_se_recover_enabled() -> bool:
@@ -826,7 +792,9 @@ def mul_byte0_se_recover_enabled() -> bool:
     ``tools/flag_regression_gate.py --flag C4_MUL_BYTE0_SE_RECOVER`` can A/B it
     inside the campaign config.
     """
-    return os.environ.get("C4_MUL_BYTE0_SE_RECOVER", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_BYTE0_SE_RECOVER`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def sub_full_borrow_enabled() -> bool:
@@ -867,14 +835,12 @@ def sub_full_borrow_enabled() -> bool:
 
     DEFAULT ON. Opt-out via ``C4_SUB_FULL_BORROW=0`` restores the byte-identical
     pre-fix path (flag-OFF or ``C4_OPERAND_FROM_MEMSP=0`` are both byte-identical
-    to golden ``7f6f2e5d``: the band is flag-gated so a flag-off build omits it
-    entirely → smaller d_model). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_SUB_FULL_BORROW`` can A/B it inside
-    the campaign config.
+    to golden ``7f6f2e5d``: the band is campaign-gated so a non-campaign build
+    omits it entirely → smaller d_model). Unconditional under the operand-
+    from-memsp campaign as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_SUB_FULL_BORROW`` escape hatch was retired as a proven default-ON fix).
     """
-    if not operand_from_memsp_enabled():
-        return False
-    return os.environ.get("C4_SUB_FULL_BORROW", "1") != "0"
+    return operand_from_memsp_enabled()
 
 
 def l8_operand_sp_disc_enabled() -> bool:
@@ -948,13 +914,12 @@ def l8_operand_sp_disc_enabled() -> bool:
     but mis-frames an intermediate step) -- the discriminator+sharpener is now net
     +9 on its own and BLOCKER-2 is the remaining headroom (0/25 -> 9/25 done).
 
-    Opt-out: ``C4_L8_OPERAND_SP_DISC=0`` restores the byte-identical pre-fix path
-    (kept as a kill-switch so ``tools/flag_regression_gate.py --flag
-    C4_L8_OPERAND_SP_DISC`` can still A/B it inside the campaign).
+    Unconditional under the operand-from-memsp campaign as of the P5 flag-retire
+    2026-07-14 (the former ``C4_L8_OPERAND_SP_DISC`` escape hatch was retired as a
+    proven default-ON fix; the SP_ADDR_* discriminator bands stay campaign-gated
+    so a non-campaign build omits them → byte-identical golden).
     """
-    if not operand_from_memsp_enabled():
-        return False
-    return os.environ.get("C4_L8_OPERAND_SP_DISC", "1") != "0"
+    return operand_from_memsp_enabled()
 
 
 
@@ -1016,7 +981,9 @@ def mul_multibyte_l19_boost_enabled() -> bool:
     path is campaign-only). Kept as a dedicated kill-switch for
     ``tools/flag_regression_gate.py``.
     """
-    return os.environ.get("C4_MUL_MULTIBYTE_L19_BOOST", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_MULTIBYTE_L19_BOOST`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def cmp_eq_hinib_veto_enabled() -> bool:
@@ -1061,45 +1028,9 @@ def cmp_eq_hinib_veto_enabled() -> bool:
     kill-switch so ``tools/flag_regression_gate.py --flag C4_CMP_EQ_HINIB_VETO``
     can A/B it inside the campaign config.
     """
-    return os.environ.get("C4_CMP_EQ_HINIB_VETO", "1") != "0"
-
-
-def cmp_gt_lo_margin_enabled() -> bool:
-    """Return True iff the CMP equal-high-nibble GT lo-margin knock-down is active
-    (DEFAULT ON in the campaign config — opt-out via ``C4_CMP_GT_LO_MARGIN=0``;
-    only takes effect when the STACK0 emission is dropped, i.e.
-    ``C4_NO_STACK0_EMIT=1``, so flag-OFF / non-campaign is byte-identical to
-    golden ``7f6f2e5d``).
-
-    The residual cmp wall this lifts (#322, isolated CPU-autoregressive, campaign
-    config ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``, BUILT dims, spec_k=0,
-    ``tools/probe_gt_lo_margin.py``): the equal-high-nibble GT-TRUE comparisons
-    ``if_gt 54>53 / 60>54 / 54>50`` (A.hi == B.hi, A.lo > B.lo, so ``lo_lt = 0``)
-    decoded GT=0 because the live ComparisonCombine's ``(hi_eq AND lo_lt) -> GT=0``
-    3-way override (fires iff ``MARK_AX + hi_eq + lo_lt > 2.5``) SPURIOUSLY tripped
-    on ``hi_eq`` ALONE. In the campaign config the ``CmpOperandSeRecoverFFN``
-    re-materializes a STRONGER operand-A one-hot than golden, so the shared
-    ``C4_CMP_FLAG_MARGIN_FIX`` ``FLAG_EQ=0.45`` overshoots and lands ``hi_eq`` at
-    ~1.86 at the decode row -- ABOVE its own (0.75, 1.5) single-flag ceiling --
-    making ``1 + 1.86 + 0 = 2.86 > 2.5`` flip GT-true to GT=0
-    (probed OUTPUT_LO@blk26 = [25.5@0, -15.9@1]).
-
-    FIX: campaign-only, lower the ordering-engine ``FLAG_EQ`` to 0.30 so ``hi_eq``
-    lands at ~1.24 (comfortably in-window). The spurious single-flag trip is gone
-    (``1 + 1.24 + 0 = 2.24 < 2.5`` -> override OFF -> GT stays default=1, probed
-    [0.6@0, 8.9@1] -> GT=1) while every INTENDED ``(hi_eq AND lo_lt)`` override
-    still fires decisively (53>54 / 86<87: ``1 + 1.24 + 1.45 = 3.69 > 2.5``) and
-    ``lo_lt``-alone still does NOT trip (50<44: ``1 + 0 + 1.45 = 2.45 < 2.5``).
-    The ``lo_lt`` (CMP+3) write strength is UNTOUCHED so lt/le/ge margins are
-    unchanged -- DISCRIMINATING, no zero-sum trade. ``lint_cross_op_ffn`` PASS
-    (band-local to CMP; no shared OUTPUT/ALU read perturbed).
-
-    DEFAULT ON. Opt-out via ``C4_CMP_GT_LO_MARGIN=0`` restores the 0.45 campaign
-    value (byte-identical-OFF). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_CMP_GT_LO_MARGIN`` can A/B it inside
-    the campaign config.
-    """
-    return os.environ.get("C4_CMP_GT_LO_MARGIN", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_CMP_EQ_HINIB_VETO`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def cmp_hi_lt_alu15_leak_guard_enabled() -> bool:
@@ -1333,15 +1264,12 @@ def func_lea_reread_bp_resharpen_enabled() -> bool:
     ``tools/lint_cross_op_attention.py`` (MANDATORY for shared-head edits)
     gates the post-softmax head OUTPUT at OTHER-op / OTHER-context probe rows.
 
-    DEFAULT ON. Opt-out via ``C4_FUNC_LEA_REREAD_BP_RESHARPEN=0`` (the
-    byte-identical-OFF path: flag-OFF, or ``C4_OPERAND_FROM_MEMSP=0``, are both
-    byte-identical to golden ``7f6f2e5d``). Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_FUNC_LEA_REREAD_BP_RESHARPEN`` can
-    A/B it inside the campaign config.
+    UNCONDITIONAL under the operand-from-memsp campaign as of the P5 flag-retire
+    2026-07-14 (the former ``C4_FUNC_LEA_REREAD_BP_RESHARPEN`` escape hatch was
+    retired as a proven default-ON fix). ``C4_OPERAND_FROM_MEMSP=0`` is
+    byte-identical to golden ``7f6f2e5d``.
     """
-    if not operand_from_memsp_enabled():
-        return False
-    return os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
+    return operand_from_memsp_enabled()
 
 
 def mul_l19_flood_cap_enabled() -> bool:
@@ -1385,7 +1313,9 @@ def mul_l19_flood_cap_enabled() -> bool:
     or ``C4_MUL_BYTE0_SE_RECOVER=0`` are all byte-identical to golden). Kept as a
     dedicated kill-switch for ``tools/flag_regression_gate.py``.
     """
-    return os.environ.get("C4_MUL_L19_FLOOD_CAP", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_L19_FLOOD_CAP`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def mul_l19_product_boost_enabled() -> bool:
@@ -1427,177 +1357,9 @@ def mul_l19_product_boost_enabled() -> bool:
     is campaign-only). Kept as a dedicated kill-switch for
     ``tools/flag_regression_gate.py``.
     """
-    return os.environ.get("C4_MUL_L19_PRODUCT_BOOST", "1") != "0"
-
-
-def l15_lookup_cmp_veto_enabled() -> bool:
-    """Return True iff the L15 ``li_lc_stack0_h0`` lookup head's slot-0
-    discriminator VETOES on the comparison opcodes (OP_GT/OP_LT/OP_GE/OP_LE/
-    OP_EQ/OP_NE), suppressing its spurious +40 CLEAN_EMBED->OUTPUT_LO copy on
-    a COMPARISON step (DEFAULT ON; opt-out via ``C4_L15_LOOKUP_CMP_VETO=0``).
-
-    The wall this lifts (verified spec_k=0, BUILT dims, GPU full_trace;
-    ``bool_and`` 24/25, the sole fail id=1087 ``97>20 && 20>34``):
-
-    L15 memory-lookup head 0 (``li_lc_stack0_h{0}``, value_scale=40) is the
-    LI/LC + STACK0-POP load head. Its slot-0 discriminator fires the lookup
-    on ``CMP+3`` (the "POP group" flag) -- but ``CMP+3`` is OVERLOADED: the L9
-    cmp cascade ALSO drives it as the low-nibble-less-than flag, so on a
-    GT-true comparison step (probed id=1087 step-3 AX row: ``CMP+3=1.45``,
-    ``OP_GT+0=5.23``) the head MIS-FIRES, attends a cross-step ``CLEAN_EMBED``
-    row, and copies ``+40.0`` into ``OUTPUT_LO+0``. That ``+40`` buries the
-    clean GT result one-hot (``OUTPUT_LO+1=5.11`` for GT=1) at the LM-head
-    argmax, so the comparison byte decodes ``0`` instead of ``1`` -> the
-    full_trace step-3 AX diverges (``expected ax=1 got ax=0``). It fires only
-    for diff-hi-nibble GT-true operands (the ones whose ``CMP+3`` lo_lt flag
-    rides high enough to clear the head's threshold).
-
-    FIX. The slot-0 discriminator already vetoes the non-load opcodes
-    (``OP_JSR/OP_ENT/OP_LEA/OP_IMM`` at ``-1e6``) but NOT the comparison
-    opcodes. A genuine LI/LC/POP load NEVER has a comparison opcode hot at its
-    own marker (the opcode is OP_LI/OP_LC/OP_POP), whereas a comparison step
-    has exactly one of OP_GT/OP_LT/OP_GE/OP_LE/OP_EQ/OP_NE one-hot at MARK_AX.
-    Adding those six opcodes to the SAME ``non_load_suppression`` veto keeps
-    the head silent on comparison rows (``OP_GT*-1e6 << CMP+3*50000``) and
-    byte-identical on every real load row. Scoped to head 0's slot-0 Q only;
-    no V/O / scale change, so the LI/LC/POP delivery is untouched.
-
-    DEFAULT ON. Opt-out via ``C4_L15_LOOKUP_CMP_VETO=0`` restores the
-    no-veto discriminator (the byte-identical-OFF path). Kept as a dedicated
-    kill-switch for ``tools/flag_regression_gate.py`` and the flag-OFF
-    golden byte-identity gate.
-    """
-    return os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
-
-
-def divmod_axcarry_clear_enabled() -> bool:
-    """Return True iff the divmod writeback CLEARS the AX_CARRY (divisor) band
-    at the divmod AX row (DEFAULT ON in the campaign config — opt-out via
-    ``C4_DIVMOD_AXCARRY_CLEAR=0``; only takes effect when the STACK0 emission
-    is dropped, i.e. ``C4_NO_STACK0_EMIT=1``).
-
-    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
-    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; ~10 div/mod fails of the
-    "got_ax == divisor" pattern, e.g. 1162/37 -> 37, 2009/43 -> 43, 106/4 ->
-    4, 794/49 -> 49):
-
-    The ``FlattenedDivMod`` (block 28 / logical L14) computes the CORRECT
-    quotient/remainder into OUTPUT_LO/HI at +2.0 (the long-division compute is
-    bit-exact for every residual operand — there is NO divider arch-wall). But
-    for a MULTI-BYTE dividend the L10 ALU-clear crushes ALU_LO/HI all-negative
-    at the divmod row (probe ``tools/probe_divmod_l20_src.py``: 1162/37 ->
-    ALU == -45 uniform). The downstream L20 ``layer16_lev_routing`` frame-relay
-    then MIS-FIRES on that crushed-ALU divmod row and MATERIALIZES the
-    AX_CARRY band (the DIVISOR, e.g. 0x25 == 37) into OUTPUT at +4.4, out-
-    voting the +2.0 quotient — so the emitted AX byte is the divisor, not the
-    quotient. (The PASSING divmod rows keep a clean positive ALU one-hot and
-    the L20 relay stays silent — verified pass-vs-fail discriminator.)
-
-    The divmod has already CONSUMED the divisor (operand-B byte 0 read from
-    AX_CARRY_LO/HI into GE NIB_B by ``BDToGEConverter`` at the divmod block
-    input) by the time the writeback runs, so the AX_CARRY band is dead at the
-    divmod AX row from L14 onward. Clearing it removes the divisor source the
-    L20 relay leaks, so the +2.0 quotient survives to the AX emit. Verified
-    (hook ``tools/probe_divmod_alurestore_test.py MODE=clearaxc``): 1162/37,
-    106/4, 2009/43, 794/49 -> CORRECT quotient; PASSING rows (843/31, 176/4,
-    54/7) UNCHANGED. The 0xE8 (744) and L18 slam patterns are SEPARATE
-    downstream-tail corruptors (out of the divmod writeback's reach).
-
-    AX_CARRY is only read downstream by opcode-gated ops (OP_MUL at L12,
-    OP_LI/LC/SI/SC at L13/L15) whose gates are inactive on a divmod row, and
-    by the L14 ``AX_CARRY_HI+15`` NOT-blocker (cleared band == "not 15" ==
-    safe), so the divmod-row clear touches no other op/config.
-
-    DEFAULT ON. Opt-out via ``C4_DIVMOD_AXCARRY_CLEAR=0`` restores the raw
-    AX_CARRY passthrough (the byte-identical-OFF path: flag-OFF or
-    ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden ``4958b35b``).
-    Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_DIVMOD_AXCARRY_CLEAR`` can A/B it
-    inside the campaign config.
-    """
-    return os.environ.get("C4_DIVMOD_AXCARRY_CLEAR", "1") != "0"
-
-
-def divmod_stack0_byte1_clear_enabled() -> bool:
-    """Return True iff the divmod writeback CLEARS the STACK0_BYTE_VAL_1
-    (dividend byte-1 carrier) band at the divmod AX row (DEFAULT ON in the
-    campaign config — opt-out via ``C4_DIVMOD_STACK0_BYTE1_CLEAR=0``; only
-    takes effect when the STACK0 emission is dropped, i.e.
-    ``C4_NO_STACK0_EMIT=1``).
-
-    The wall this lifts (verified spec_k=0, BUILT dims, campaign config
-    ``C4_NO_STACK0_EMIT=1 C4_OPERAND_FROM_MEMSP=1``; the residual ~4 div/mod
-    fails of the "L18 slam" pattern the ``divmod_axcarry_clear_enabled`` note
-    explicitly flags as a SEPARATE downstream-tail corruptor, e.g. 364/14 ->
-    1, 1132/33 -> 4, 268%17 -> 1, 428%16 -> 1):
-
-    The ``FlattenedDivMod`` (block 28 / logical L14) computes the CORRECT
-    quotient/remainder into OUTPUT_LO/HI at +2.0 (the long-division compute is
-    bit-exact — verified blk28 OUTPUT == the right answer for every fail). But
-    for a MULTI-BYTE dividend the divmod AX row still carries the dividend's
-    byte-1 in the ``STACK0_BYTE_VAL_1_LO/HI`` carrier (the band the
-    ``BDToGEConverter`` cummax-gathers operand-A byte 1 from). The L18 (block
-    32) ``layer14_mem_generation`` ADDRESS head 1 — whose V/O slots 32+/48+
-    read ``STACK0_BYTE_VAL_1`` into OUTPUT_LO/HI to generate the SI/SC store
-    address byte 1 — MIS-FIRES on that crushed divmod AX row and MATERIALIZES
-    the dividend byte 1 into OUTPUT at +13.9, overwriting the +2.0 quotient ->
-    the emitted AX byte is ``hi(dividend)`` (e.g. 0x04 for 1132, 0x01 for 364),
-    not the quotient. (PASSING divmod rows have ``STACK0_BYTE_VAL_1 == 0`` —
-    single-byte dividend, e.g. 89%10 hi=0 — so head 1 reads zeros and stays
-    silent: the clean pass-vs-fail discriminator, verified
-    ``tools/probe_divmod_fast.py``.)
-
-    The divmod has already CONSUMED the dividend byte 1 (the
-    ``BDToGEConverter`` cummax-gathered it into GE operand-A positions 2/3 at
-    the divmod block INPUT, BEFORE this writeback runs) by the time the
-    writeback executes, so the ``STACK0_BYTE_VAL_1`` band is dead at the divmod
-    AX row from this block onward. Clearing it here — gated on the SAME
-    divmod-AX ``opcode_mask`` the OUTPUT write + the AX_CARRY clear use —
-    removes the byte-1 source the L18 mem-gen head 1 leaks, so the +2.0
-    quotient survives to the emit. (The L18 head reads ``STACK0_BYTE_VAL_1``
-    only for SI/SC store-address byte-1 generation, whose opcode rows are not
-    DIV/MOD, so the divmod-row clear touches no other op/config — exactly the
-    ``divmod_axcarry_clear`` precedent applied to the byte-1 carrier instead of
-    AX_CARRY.)
-
-    DEFAULT ON. Opt-out via ``C4_DIVMOD_STACK0_BYTE1_CLEAR=0`` restores the raw
-    ``STACK0_BYTE_VAL_1`` passthrough (the byte-identical-OFF path: flag-OFF or
-    ``C4_NO_STACK0_EMIT=0`` are both byte-identical to golden ``7f6f2e5d``).
-    Kept as a dedicated kill-switch so
-    ``tools/flag_regression_gate.py --flag C4_DIVMOD_STACK0_BYTE1_CLEAR`` can
-    A/B it inside the campaign config.
-    """
-    return os.environ.get("C4_DIVMOD_STACK0_BYTE1_CLEAR", "1") != "0"
-
-
-def addsub_output_boost_enabled() -> bool:
-    """Return True iff the imperative AddSub5StageBlock writes its byte-0
-    OUTPUT_LO/HI at a DOMINANT amplitude (DEFAULT ON — opt-out via
-    ``C4_ADDSUB_DUMP_BOOST=0``).
-
-    The bug this lifts (verified spec_k=0, BUILT dims, full_trace 0..99):
-    the imperative ``_AddSubGEToBD`` stage (block 10 / logical L8) computes
-    byte-0 add/sub CORRECTLY from the ``_clean_onehot``-thresholded operands
-    and writes the result one-hot into ``OUTPUT_LO/HI`` at amplitude 2.0.
-    The DOWNSTREAM block 11 (logical L9) then floods ``OUTPUT_LO`` with a
-    near-uniform ~83.5 pedestal PLUS the documented L9 ``ALU_LO -> OUTPUT_LO``
-    operand leak (a peak at operand-A's low-nibble lane). With the block-10
-    write only at 2.0 that spurious leaked lane out-votes the correct result
-    lane by a tiny margin (~1.2 out of ~96), flipping the argmax. This is the
-    SAME "downstream L9 ALU_LO->OUTPUT_LO leak" the ``DeclarativeAddSubBlock``
-    out-votes with its dominant amplitude (see ``addsub_declarative_enabled``);
-    we apply the identical remedy on the imperative path, which (unlike the
-    declarative wrap) already reads CLEAN operands so it does not regress the
-    multi-byte cascade.
-
-    When enabled, ``_AddSubGEToBD`` passes ``output_amplitude`` to its
-    ``GEToBDConverter`` so the byte-0 OUTPUT one-hot is written at the boosted
-    magnitude; the carry/borrow CARRY writes and byte-1 AX_FULL staging are
-    UNCHANGED. Flag-OFF restores the amplitude-2.0 write (byte-identical to
-    HEAD). Measured: add 40->XX, sub 44->XX on full_trace ids 0-99, smoke
-    51/0, mul/div/mod guards held.
-    """
-    return os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_MUL_L19_PRODUCT_BOOST`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def addsub_declarative_enabled() -> bool:
@@ -2217,10 +1979,11 @@ def sili_cam_b1_enabled() -> bool:
         fail is a SEPARATE pre-existing LC byte-0 reload bug (got 0, want 42)
         outside this byte-1 scope.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_SILI_CAM_B1`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_SILI_CAM_B1", "1") != "0"
     )
 
 
@@ -2272,10 +2035,11 @@ def sili_b1_restore_enabled() -> bool:
     inside the campaign; flag OFF (or off-campaign) omits the band + both ops
     (golden ``7f6f2e5d`` byte-identical).
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_SILI_B1_RESTORE`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
     )
 
 
@@ -2352,10 +2116,12 @@ def store_ax_b0_override_v2_enabled() -> bool:
     the campaign; flag OFF (or off-campaign) keeps the bare additive ``2.0/S``
     write (golden ``f725c06e`` byte-identical).
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_STORE_AX_B0_OVERRIDE_V2`` escape hatch was retired). Campaign gate
+    # preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
     )
 
 
@@ -2411,57 +2177,12 @@ def loop_lea_b0_e8_restore_enabled() -> bool:
     row, so the whole op is a no-op everywhere except the loop in-loop ``LEA &i``
     row it targets.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_LEA_B0_E8`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_LEA_B0_E8", "1") != "0"
     )
-
-
-def loop_lea_b0_e8_oplea_req_enabled() -> bool:
-    """Return True iff the ``C4_LOOP_LEA_B0_E8`` discriminator's ``OP_LEA``
-    HARD-REQUIREMENT narrowing is active (POST-FLIP func_identity step-9 LI
-    regression fix).
-
-    DEFAULT **ON** wherever the e8-restore op itself is active; opt-out via
-    ``C4_LOOP_LEA_B0_E8_OPLEA_REQ=0`` (which reverts to the pre-fix
-    ``OP_LEA`` weight 60 / no CONST bias, reproducing the regression — kept as a
-    dedicated kill-switch so ``tools/flag_regression_gate.py`` can A/B JUST the
-    narrowing). Inert (and therefore byte-identical) whenever the e8-restore op
-    is OFF, since the discriminator is only emitted then.
-
-    ROOT (GPU spec_k=0, BUILT dims, campaign config; ``tools/_probe_funcid_loope8.py``
-    on ``func_identity`` id550 ``identity(70)``): the e8-restore op's discriminator
-    (``MARK_AX*100 + OP_LEA*60 + FETCH_LO+8*1000 - FETCH_LO+0*1000
-    - FETCH_HI+14*1000`` > threshold 500) was MEANT to fire only on a GENUINE
-    in-loop ``LEA &i`` (``OP_LEA == 5.24``), but ``OP_LEA`` is NOT load-bearing:
-    the ``FETCH_LO+8 * 1000`` term ALONE clears threshold 500. ``func_identity``'s
-    ``return x`` body issues ``LEA &x`` (step 8, fires correctly) THEN ``LI``
-    (step 9, loads value 70 = 0x46). The LI's FETCHED-instruction byte carries
-    ``FETCH_LO+8 == 1.00`` (the LI opcode encodes to FETCH low-nibble 8) while
-    ``OP_LEA == 0`` and ``OP_LI == 0.01`` (cold) — so the op scores
-    100 + 0 + 1000 = 1100 > 500 and FALSE-FIRES on the LI row, stamping 0xE8 over
-    the loaded 0x46 (got_ax 0xFFE8 = sign-extended 0xE8, oracle 70). The bug was
-    introduced by ``C4_LOOP_LEA_B0_E8`` (commit ``fd60f5f4``, the first post-flip
-    bad commit for id550; bisect-confirmed) and is INVISIBLE to ``OP_LI`` /
-    ``OP_LI_RELAY`` NOT-blocks (both ~0 at the LI byte-0 lookup row).
-
-    THE FIX: make ``OP_LEA`` a HARD requirement. The genuine in-loop ``LEA &i``
-    carries ``OP_LEA == 5.24``; the LI carries ``OP_LEA == 0`` EXACTLY. Bump the
-    ``OP_LEA`` condition weight 60 -> 200 and add a ``CONST -650`` bias so the
-    score needs the genuine LEA's OP_LEA term to cross threshold 500:
-
-      * genuine ``&i`` LEA: 100 + 5.24*200 + 160(FETCH) - 650 = 658 > 500 -> FIRES
-        (158-pt margin, up from the pre-fix 74).
-      * ``func_identity`` LI: 100 + 0 + 1000(FETCH) - 650 = 450 < 500 -> VETOED.
-      * 2nd/3rd-local LEAs (``var_mul`` / ``var_three``, FETCH net -1000):
-        100 + 1048 - 1000 - 650 = -502 -> still SILENT.
-      * clean non-LEA AX row (no FETCH, OP_LEA 0): 100 - 650 = -550 -> SILENT.
-
-    OFF leaves the discriminator at the pre-fix weights (byte-identical to the
-    regressed build).
-    """
-    return os.environ.get("C4_LOOP_LEA_B0_E8_OPLEA_REQ", "1") != "0"
 
 
 def loop_lea_b0_e0_restore_enabled() -> bool:
@@ -2510,71 +2231,23 @@ def loop_lea_b0_e0_restore_enabled() -> bool:
     address-eval LEA, and the ``IS_BYTE`` + non-AX marker NOT-blocks keep it OFF
     every value-byte / non-AX row.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_LEA_B0_E0`` escape hatch was retired). Campaign gate preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
     )
 
 
-def loop_lea_oplea_gate_enabled() -> bool:
-    """Return True iff the ``C4_LOOP_LEA_OPLEA_GATE`` MULTIPLICATIVE ``OP_LEA``
-    gate on the ``C4_LOOP_LEA_B0_E8`` / ``C4_LOOP_LEA_B0_E0`` restore ops is
-    active (PROJECT_0XE8_SLAM Phase-2 fix).
-
-    DEFAULT **OFF** (opt in ``C4_LOOP_LEA_OPLEA_GATE=1``). Kept as a dedicated
-    kill-switch so ``tools/flag_regression_gate.py`` / ``tools/_isa_golden_hash.py``
-    can A/B JUST the gate: OFF leaves the loop_lea ops byte-identical to golden
-    ``b1dcae63`` (the gate is the only structural change), ON adds the gate to
-    every unit in both rule families. Inert whenever the loop_lea ops themselves
-    are OFF (non-campaign / golden), since the gate is only emitted then.
-
-    ROOT (docs/PROJECT_0XE8_SLAM_2026_07_07.md §5; measured spec_k=0, BUILT dims,
-    campaign): the loop_lea restore ops' discriminator scores an ``imm=-8`` /
-    ``imm=-16`` FETCH signature (``FETCH_LO+8`` / ``FETCH_LO+0`` at weight 1000)
-    that was calibrated against a SOFT FETCH one-hot (0.4-1.0 on genuine in-loop
-    ``LEA &i`` rows). On an ``if_gt`` / ``if_eq`` step-0 IMM comparison AX row the
-    FETCH band carries ``+40`` (a 40x-amplified broadcast, NOT a 0/1 one-hot), so
-    ``FETCH_LO+8 * 1000 = +4.0e6`` (S=100) OVERWHELMS every calibrated additive
-    margin -- the additive ``OP_LEA`` HARD-req (weight 200 + CONST -650) and the
-    ``OP_IMM * -500`` opcode block are dwarfed. Net ``up > 0`` -> the AND
-    spuriously fires and the per-cell winner-take-all slams ``0xE8`` / ``0xE0``
-    over the correct operand byte (id360 ``8>27`` wants 0x08, id402 ``16==9``
-    wants 0x10).
-
-    THE FIX: make ``OP_LEA`` a MULTIPLICATIVE gate that no FETCH amplitude can
-    cross. The FFN math is ``hidden = silu(up) * gate`` with
-    ``gate = gate_bias + Sum(gate_terms . x)`` (the gate weights are NOT scaled by
-    S). With ``gate_bias=0.0`` + ``gate_terms=(("OP_LEA", 1/5.23),)``:
-
-      * genuine in-loop ``LEA &i`` (``OP_LEA == 5.23``): gate = 1/5.23 * 5.23
-        = ~1.0 -> ``hidden = silu(up) * ~1.0`` -> the unit fires at the SAME
-        magnitude as today (loop function BYTE-IDENTICAL: the per-cell +/-DOM
-        winner-take-all is preserved).
-      * leak IMM / comparison row (``OP_LEA == 0``): gate = 0.0 EXACTLY ->
-        ``hidden = silu(up) * 0 = 0`` -> the whole unit ZEROES, regardless of the
-        ``+40`` FETCH amplitude, handing the OUTPUT cell back to the correct
-        comparison-decode writer.
-
-    A gate_bias of 0.0 (rather than the doc's illustrative -1.0) is deliberate:
-    with ``silu(up) * gate`` a NEGATIVE gate would INVERT the +/-DOM writes on a
-    false-fire row (silu(up) stays large-positive since ``up`` is only gated at
-    the DOWN projection), producing a DIFFERENT wrong byte rather than a clean
-    no-op. gate_bias=0.0 + a linear ``OP_LEA`` term is the unique gate that both
-    (a) is EXACTLY 0 on the ``OP_LEA==0`` leak (true zero-out) and (b) is ~1.0 on
-    the genuine ``OP_LEA==5.23`` LEA (write magnitude preserved).
-    """
-    return os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
-
-
 def jsr_bp_byte3_clear_enabled() -> bool:
-    """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR
-    (``C4_JSR_BP_BYTE3_CLEAR``) is active.
+    """Return True iff the func step-0 JSR-step BP byte-3 high-byte CLEAR is
+    active (UNCONDITIONAL under campaign as of the P5 flag-retire 2026-07-14; the
+    former ``C4_JSR_BP_BYTE3_CLEAR`` escape hatch was retired).
 
-    DEFAULT **ON** (opt out ``C4_JSR_BP_BYTE3_CLEAR=0``). Requires the campaign
-    config (``C4_NO_STACK0_EMIT=1`` + ``C4_OPERAND_FROM_MEMSP=1``). Flag-off OR a
-    non-campaign / golden build registers NO rules and appends NO post_op, so the
-    model is bit-for-bit identical to golden ``f725c06e``.
+    Requires the campaign config (``C4_NO_STACK0_EMIT=1`` +
+    ``C4_OPERAND_FROM_MEMSP=1``). A non-campaign / golden build registers NO rules
+    and appends NO post_op, so the model is bit-for-bit identical to golden
+    ``f725c06e``.
 
     ROOT — THE func-cluster STEP-0 (JSR) POISONING BYTE (func_min id675 /
     func_max id650 / func_identity id550 / func_add id575; measured spec_k=0,
@@ -2611,10 +2284,13 @@ def jsr_bp_byte3_clear_enabled() -> bool:
     with ``HAS_SE`` (ENT rows) + every non-BP marker + wrong BYTE_INDEX
     NOT-blocked, so it is a no-op on every non-JSR-BP-byte3 row.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_JSR_BP_BYTE3_CLEAR`` escape hatch was retired as a proven default-ON
+    # fix). The campaign gate is preserved so the non-campaign golden build is
+    # byte-identical.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
     )
 
 
@@ -2678,10 +2354,12 @@ def loop_si_byterow_marker_clear_enabled() -> bool:
     DISTINCT downstream value-load / operand-CAM root (task #342 family), out of
     scope for the back-edge desync.
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_SI_BYTEROW_CLEAR`` escape hatch was retired). Campaign gate
+    # preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_SI_BYTEROW_CLEAR", "1") != "0"
     )
 
 
@@ -2764,10 +2442,12 @@ def loop_li_opcode_fetch_addrkey_clamp_enabled() -> bool:
     IDENTICALLY flag-ON and flag-OFF (a pre-existing base failure, not a
     regression).
     """
+    # Unconditional under campaign (P5 flag-retire 2026-07-14; the former
+    # ``C4_LOOP_LI_FETCH_ADDRKEY_CLAMP`` escape hatch was retired). Campaign gate
+    # preserved.
     return (
         no_stack0_emit_enabled()
         and operand_from_memsp_enabled()
-        and os.environ.get("C4_LOOP_LI_FETCH_ADDRKEY_CLAMP", "1") != "0"
     )
 
 

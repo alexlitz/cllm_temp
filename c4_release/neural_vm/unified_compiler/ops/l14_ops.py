@@ -144,7 +144,9 @@ def _psh_arg_val_ax_enabled() -> bool:
     its value from AX like every other PSH/SI/SC store. Output-affecting; flag
     OFF reverts to byte-identical pre-fix weights.
     """
-    return _os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_PSH_ARG_VAL_AX`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _l14_byte_computed_enabled() -> bool:

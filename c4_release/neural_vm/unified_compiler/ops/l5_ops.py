@@ -57,9 +57,10 @@ def _stack0_next_arith_enabled() -> bool:
     div/add/if_gt/if_lt/if_eq/bool_and/paren) and smoke 51/0. Flag-off
     (``C4_STACK0_NEXT_ARITH=0``) registers NONE of the 7 ops and no bands ->
     byte-identical to the pre-feature build (HEAD). Evaluated lazily (compile
-    time) so a per-process env flip is honoured and the cache key reflects it.
+    time). Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    ``C4_STACK0_NEXT_ARITH`` escape hatch was retired as a proven default-ON fix).
     """
-    return os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
+    return True
 
 
 # ===========================================================================
@@ -153,7 +154,9 @@ def _nested_jsr_pc_fix_enabled() -> bool:
     ON; with ``C4_NESTED_JSR_PC_FIX=0`` the L5 FFN footprint is exactly the
     prior 89 units and the build is byte-identical.
     """
-    return os.environ.get("C4_NESTED_JSR_PC_FIX", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_NESTED_JSR_PC_FIX`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 # === L5 FFN unit layout (auto-fit; legacy offsets retained as docs) ===

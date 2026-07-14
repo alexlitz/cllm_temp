@@ -1450,7 +1450,7 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
         from ...base_layers import PureFFN
         from ..primitives import Primitives
         from ..wide_alu_dsl import wide_mul_rules
-        from .shared import mul_width2_enabled, mul_w2_thresh_fix_enabled
+        from .shared import mul_width2_enabled
 
         # W5 POC: 256 rules covering nibble × nibble = 0..15 × 0..15.
         # Operand A's low nibble lives in ALU_LO band, operand B's in
@@ -1550,8 +1550,10 @@ def make_efficient_l11_alumul_wrap_op(alu_mode: str = 'lookup') -> Operation:
             # 3*16/8) spuriously emit a byte-1, which leaks into the divisor; the
             # 0.44-margin 19.0 reliably fires the true quad while staying above
             # that leak boundary (no expr regression, ground-truth verified).
-            # See shared.mul_w2_thresh_fix_enabled.
-            _w2_thr = 19.0 if mul_w2_thresh_fix_enabled() else 19.5
+            # The 19.0 threshold is unconditional as of the P5 flag-retire
+            # 2026-07-14 (the former C4_MUL_W2_THRESH_FIX escape hatch, which
+            # restored the pre-fix 19.5, was retired as a proven default-ON fix).
+            _w2_thr = 19.0
             rules = wide_mul_rules(
                 operand_a_base="ALU_LO",
                 operand_b_base="AX_CARRY_LO",
@@ -2285,12 +2287,10 @@ def _build_multipass_div_post_op(block, dim_positions, S):
 
     from .shared import (
         no_stack0_emit_enabled,
-        divmod_axcarry_clear_enabled,
-        divmod_stack0_byte1_clear_enabled,
     )
-    campaign_clear = (
-        no_stack0_emit_enabled() and divmod_axcarry_clear_enabled()
-    )
+    # divmod AX_CARRY-clear is now UNCONDITIONAL under campaign (P5 flag-retire
+    # 2026-07-14; the former ``C4_DIVMOD_AXCARRY_CLEAR`` escape hatch was retired).
+    campaign_clear = no_stack0_emit_enabled()
     # Op-local scratch/result bands the 43-pass cascade populates with
     # intermediate one-hots. They are NOT part of the per-step token frame and
     # nothing downstream reads them (the OUTPUT routing consumes q/r), so the

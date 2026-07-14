@@ -78,7 +78,6 @@ from .ssa_dim import base_of, is_ssa_form, parse_ssa_name
 from .ir import ModelArchitectureSpec
 from . import _legacy_redirect as _static
 from .ops.shared import (
-    operand_from_memsp_enabled,
     campaign_enabled,
     emit_g5_rbyte_enabled,
 )
@@ -1858,19 +1857,6 @@ def _build_cache_key_snapshot(
         "C4_QWEN_EXPORT_COMPAT": (
             os.environ.get("C4_QWEN_EXPORT_COMPAT") == "1"
         ),
-        # AX byte-1 register-dump emission flag (DEFAULT-ON; opt out with =0,
-        # output-affecting, no source change): the ON / OFF builds must never
-        # share a serialised entry.
-        "C4_AX_BYTE1_DUMP": (
-            os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
-        ),
-        # AX byte-1 sign-extension delivery on a negative LEA-local frame address
-        # (#343; DEFAULT-ON in the campaign config, opt out =0, output-affecting,
-        # no source change): the L10 ADD high-byte adder sign-ext NOT-blocker pair.
-        # The ON / OFF builds must never share a serialised entry.
-        "C4_AX_BYTE1_SIGNEXT_LEA": (
-            os.environ.get("C4_AX_BYTE1_SIGNEXT_LEA", "1") != "0"
-        ),
         # AX high-byte (byte-2/3) all-step zero-default (DEFAULT-OFF; opt in with
         # =1, output-affecting, no source change): appends the l11
         # ``make_ax_hibyte_clear_allstep_op`` FFN + omits the redundant
@@ -1889,51 +1875,12 @@ def _build_cache_key_snapshot(
         "C4_ADDSUB_DECLARATIVE": (
             os.environ.get("C4_ADDSUB_DECLARATIVE", "0") == "1"
         ),
-        # Imperative AddSub byte-0 OUTPUT dominant-amplitude write (DEFAULT-ON,
-        # opt out =0, output-affecting on the add/sub MARK_AX OUTPUT_LO/HI byte-0
-        # one-hot): writes the block-10 result at amplitude 30.0 instead of 2.0
-        # to out-vote the downstream L9 ALU_LO->OUTPUT_LO leak. The ON / OFF
-        # builds must never share a serialised entry.
-        "C4_ADDSUB_DUMP_BOOST": (
-            os.environ.get("C4_ADDSUB_DUMP_BOOST", "1") != "0"
-        ),
         # AX byte-1 FULL-WIDTH emission (DEFAULT-OFF, opt in =1,
         # output-affecting + geometry-affecting): adds the AX_BYTE1_FULL_WIDE
         # band, the un-aliased LM-head columns 16..255, and the L25-tail
         # band-FILL FFN. The ON / OFF builds must never share a serialised entry.
         "C4_AX_BYTE1_FULL_WIDTH": (
             os.environ.get("C4_AX_BYTE1_FULL_WIDTH", "0") != "0"
-        ),
-        # post-ENT SP-byte1=0xff H1+2 hardening (framing-recovery; DEFAULT-ON,
-        # opt out with =0, output-affecting): the ON / OFF builds must never
-        # share a serialised entry.
-        "C4_ENT_SP_BYTE1_FF_H1_HARDEN": (
-            os.environ.get("C4_ENT_SP_BYTE1_FF_H1_HARDEN", "1") != "0"
-        ),
-        # L8 ADJ-lo AX-marker blocker (DEFAULT-OFF, opt in =1, output-affecting on
-        # post-LEV ADJ AX rows): the ON / OFF builds must never share a
-        # serialised entry. Ships with the C4_L15_LEV func chain.
-        "C4_L8_ADJ_LO_AX_MARKER_BLOCKER": (
-            os.environ.get("C4_L8_ADJ_LO_AX_MARKER_BLOCKER", "1") == "1"
-        ),
-        # PSH-of-argument value-source AX lock (DEFAULT-ON, opt out =0,
-        # output-affecting on the call-arg PSH store value): the ON / OFF
-        # builds must never share a serialised entry.
-        "C4_PSH_ARG_VAL_AX": (
-            os.environ.get("C4_PSH_ARG_VAL_AX", "1") != "0"
-        ),
-        # L15 head-0 LI/LC-load suppressor inert (DEFAULT-ON, opt out =0,
-        # output-affecting on func/nested/rec/var LI loads): the ON / OFF
-        # builds must never share a serialised entry.
-        "C4_L15_LI_SUPPR_INERT": (
-            os.environ.get("C4_L15_LI_SUPPR_INERT", "1") != "0"
-        ),
-        # L15 LEV PC-restore head 14 (DEFAULT-OFF, opt in =1): grows L15
-        # memory-lookup attention 14 -> 15 heads (changes num_heads + the L15
-        # W_q/W_k/W_v/W_o shapes), so the ON / OFF builds must never share a
-        # serialised entry.
-        "C4_L15_LEV_PC_RESTORE": (
-            os.environ.get("C4_L15_LEV_PC_RESTORE", "1") != "0"
         ),
         # L15 head-16 SI/SC store address-provenance CAM (DEFAULT-OFF, opt in
         # =1): grows L15 memory-lookup attention 16 -> 17 heads (changes
@@ -1970,22 +1917,13 @@ def _build_cache_key_snapshot(
         "C4_ABSDIFF_FIX": (
             os.environ.get("C4_ABSDIFF_FIX") == "1"
         ),
-        # L15 LEV address-widening on head 14 (DEFAULT-OFF, opt in =1):
-        # output-affecting on the LEV PC marker and on LI/LC load rows. Sub-knobs
-        # fold into the same key so any retune invalidates the entry.
+        # L15 LEV address-widening sub-knobs (the non-boolean retune values;
+        # the DEFAULT-ON ADDR_WIDEN + PC_ONLY toggles were retired in the P5
+        # flag-retire 2026-07-14, so only the int knobs remain distinguishing).
         "C4_L15_LEV_ADDR_WIDEN": (
-            os.environ.get("C4_L15_LEV_ADDR_WIDEN", "1") != "0",
             os.environ.get("C4_L15_LEV_B0_BOOST", "8"),
             os.environ.get("C4_L15_LEV_JSR_DISC", "100"),
             os.environ.get("C4_L15_LEV_BYTE0_SELECT", "400"),
-            os.environ.get("C4_L15_LEV_PC_ONLY", "1") != "0",
-        ),
-        # LEV (function-return) AX byte-1 stale-carry dump kill (DEFAULT-ON,
-        # opt out =0, output-affecting on the func/nested/rec EXIT value): adds a
-        # 3rd AX_CARRY_OVERFLOW unit firing on Σ AX_CARRY >= 3.0. The ON / OFF
-        # builds must never share a serialised entry.
-        "C4_LEV_AX_BYTE1_KILL": (
-            os.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
         ),
         # LEA-local multi-local E8 guard (DEFAULT-OFF, opt in =1, output-
         # affecting on the var multi-local LEA-from-frame address): the ON / OFF
@@ -1993,14 +1931,6 @@ def _build_cache_key_snapshot(
         # ``_lea_local_e8_multilocal_guard_enabled``.
         "C4_LEA_LOCAL_E8_MULTILOCAL_GUARD": (
             os.environ.get("C4_LEA_LOCAL_E8_MULTILOCAL_GUARD", "0") != "0"
-        ),
-        # ENT-step AX-dump 0xE8/0x02 (744) sentinel-slam guard (#311; DEFAULT-ON
-        # in the campaign config, opt out =0; output-affecting on the main-ENT
-        # AX byte-0/byte-1 dump rows): the ON / OFF builds must never share a
-        # serialised entry. See l10_ops.py ``_tail_lea_e8_ent_guard_enabled``.
-        "C4_TAIL_LEA_E8_ENT_GUARD": (
-            os.environ.get("C4_TAIL_LEA_E8_ENT_GUARD", "1") != "0"
-            and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
         ),
         # L10 tail byte-0x39 STACK0-restore store-context guard (DEFAULT-OFF,
         # opt in =1, output-affecting on the binary-op STACK0 byte-0 emit): the
@@ -2015,12 +1945,6 @@ def _build_cache_key_snapshot(
         # (root-fixed by ``C4_ALU_OPERAND_SURVIVE``), so ON / OFF now produce
         # byte-identical builds and no longer need separate serialised entries.
         # See docs/L10_ATTN_GLUE_2026_07_13.md dead-flag sweep.)
-        # si/li LOAD byte-1 ADDRESS-leak discriminator (Inc-2, campaign-ON, opt
-        # out =0): adds L10 head-1 slot 83 so ON / OFF builds must never share a
-        # serialised entry. See shared.sili_cam_b1_enabled.
-        "C4_SILI_CAM_B1": (
-            os.environ.get("C4_SILI_CAM_B1", "1") != "0"
-        ),
         # IMM full-derivation (task #392, DEFAULT-OFF): whole IMM opcode from
         # spec — decode + marker_broadcast relay + value_route (zero
         # hand-authored IMM rules). Implies C4_DERIVE_DECODE. Byte-identical to
@@ -2068,14 +1992,6 @@ def _build_cache_key_snapshot(
         ),
         "C4_PC_OVERRIDE_K": os.environ.get("C4_PC_OVERRIDE_K", "1"),
         "C4_ACTSCALE_JSON": os.environ.get("C4_ACTSCALE_JSON", ""),
-        # si/li 16-bit LOAD byte-1 value RESTORE (Inc-2 part-c, campaign-ON, opt
-        # out =0, BAKE-affecting): registers the LI_RELOAD_B1 band + the capture /
-        # restore PureFFN ops so ON / OFF builds STRUCTURALLY differ (d_model +
-        # extra blocks) and must never share a serialised entry. See
-        # shared.sili_b1_restore_enabled.
-        "C4_SILI_B1_RESTORE": (
-            os.environ.get("C4_SILI_B1_RESTORE", "1") != "0"
-        ),
         # SI/SC store-AX byte-0 OUTPUT zero-default OVERRIDE (var_mul step-9,
         # campaign-ON, opt out =0, BAKE-affecting): rewrites the
         # l16_store_ax_carry_lo write tuples so ON / OFF builds bake different
@@ -2083,15 +1999,6 @@ def _build_cache_key_snapshot(
         # shared.store_ax_b0_override_enabled.
         "C4_STORE_AX_B0_OVERRIDE": (
             os.environ.get("C4_STORE_AX_B0_OVERRIDE", "1") != "0"
-        ),
-        # SI/SC store-AX byte-0 OVERRIDE V2 = the clean store-only
-        # discriminator (default OFF, opt in =1, BAKE-affecting): appends
-        # ALU/cmp opcode anti-conditions to store_ax_conditions AND switches
-        # the l16_store_ax_carry_lo write to the override form, so the ON/OFF
-        # builds bake different L16 FFN weights and must never share a
-        # serialised entry. See shared.store_ax_b0_override_v2_enabled.
-        "C4_STORE_AX_B0_OVERRIDE_V2": (
-            os.environ.get("C4_STORE_AX_B0_OVERRIDE_V2", "1") != "0"
         ),
         # absdiff / func-return AX byte-1 OUTPUT_LO stale-marker de-contamination
         # (DEFAULT OFF, opt in =1, STRUCTURALLY-affecting): registers TWO extra
@@ -2103,52 +2010,6 @@ def _build_cache_key_snapshot(
         # ENT-frame LEA row). See shared.absdiff_ret_byte1_enabled.
         "C4_ABSDIFF_RET_BYTE1": (
             os.environ.get("C4_ABSDIFF_RET_BYTE1", "0") == "1"
-        ),
-        # func/var/loop/gcd/nested step-0 JSR-step BP byte-3 = 0x00 CLEAR
-        # (campaign-ON, opt out =0, STRUCTURALLY-affecting): registers an extra
-        # L10-tail PureFFN post_op so ON / OFF builds STRUCTURALLY differ (an
-        # extra FFN op + block) and must never share a serialised entry. Gated on
-        # the campaign prerequisites (``C4_NO_STACK0_EMIT`` +
-        # ``C4_OPERAND_FROM_MEMSP``) so the non-campaign / golden build is
-        # byte-identical. See shared.jsr_bp_byte3_clear_enabled.
-        "C4_JSR_BP_BYTE3_CLEAR": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_JSR_BP_BYTE3_CLEAR", "1") != "0"
-        ),
-        # loop_sum in-loop 2nd-local ``LEA &sum`` byte-0 0xE0 RESTORE (#330,
-        # campaign-ON, opt out =0, BAKE-affecting): registers the
-        # l10_loop_lea_b0_e0 PureFFN post_op so ON / OFF builds STRUCTURALLY
-        # differ (an extra FFN op + block) and must never share a serialised
-        # entry. Gated on the campaign prerequisites so the non-campaign /
-        # golden build is byte-identical. See shared.loop_lea_b0_e0_restore_enabled.
-        "C4_LOOP_LEA_B0_E0": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LOOP_LEA_B0_E0", "1") != "0"
-        ),
-        # PROJECT_0XE8_SLAM Phase-2: MULTIPLICATIVE OP_LEA gate on the
-        # loop_lea_b0_e8 / _e0 restore ops (DEFAULT OFF, opt in =1,
-        # BAKE-affecting): adds a per-unit gate to EVERY unit in both rule
-        # families so the discriminator's W_gate / b_gate weights differ ON vs
-        # OFF and the two serialised models must NEVER share an entry. Gated on
-        # the campaign prerequisites so the non-campaign / golden build is
-        # byte-identical. See shared.loop_lea_oplea_gate_enabled.
-        "C4_LOOP_LEA_OPLEA_GATE": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LOOP_LEA_OPLEA_GATE", "1") != "0"
-        ),
-        # func re-read-LEA ``&b`` byte-0 0xE8 over-fire FIX (campaign-ON, opt out
-        # =0, BAKE-affecting): adds an ``OP_ENT`` condition + a +60 threshold bump
-        # to the L10 ``e8_alubp_memsp`` writer so ON / OFF builds bake different
-        # L25-tail FFN weights and must never share a serialised entry. Gated on
-        # the campaign prerequisites so the non-campaign / golden build is
-        # byte-identical. See l10_ops._lea_e8_first_ent_gate_enabled.
-        "C4_LEA_E8_FIRST_ENT_GATE": (
-            os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-            and os.environ.get("C4_OPERAND_FROM_MEMSP", "1") != "0"
-            and os.environ.get("C4_LEA_E8_FIRST_ENT_GATE", "1") != "0"
         ),
         # nested callee-ENT AX-dump over-fire FIX (#342, campaign-config, DEFAULT
         # OFF, opt in =1, BAKE-affecting): appends a FETCHED-ENT
@@ -2242,38 +2103,6 @@ def _build_cache_key_snapshot(
         # its other campaign terms), so the campaign / non-campaign builds still
         # never share a serialised entry. See shared.cmp_hi_lt_alu15_leak_guard_enabled
         # / cmp_gt_lo_lt_hieq_guard_enabled.
-        # if_var BZ/BNZ branch-target byte-0 HIGH-NIBBLE correction (#430;
-        # DEFAULT-ON, opt out =0, BAKE-affecting): adds 32 odd-FETCH_HI
-        # correction units to post_l9_bz_bnz_pc_override so a BZ/BNZ target index
-        # >= 16 keeps byte-0's high nibble (BZ 16 -> PC 130, not 2). The ON / OFF
-        # builds bake different FFN weights and must never share a serialised
-        # entry. See l6_ops._ifvar_bz_hi_nibble_enabled.
-        "C4_IFVAR_BZ_HI_NIBBLE": (
-            os.environ.get("C4_IFVAR_BZ_HI_NIBBLE", "1") != "0"
-        ),
-        # Multilocal-ENT AX byte-0 source fix (DEFAULT-ON in campaign, opt out
-        # =0, BAKE-affecting): when active ``make_l10_ent_axcarry_op`` appends a
-        # PureFFN post_op to the L25 tail block that re-asserts the carried AX
-        # over the leaked-LEA materializer on the multilocal main-ENT step, so
-        # the ON / OFF builds STRUCTURALLY differ (extra post_op / FFN units)
-        # and must never share a serialised entry. See
-        # l10_ops._l10_ent_axcarry_enabled.
-        "C4_L10_ENT_AXCARRY": (
-            os.environ.get("C4_L10_ENT_AXCARRY", "1") != "0"
-            and os.environ.get("C4_NO_STACK0_EMIT", "1") != "0"
-        ),
-        # L7 head-1 re-read-LEA BP-frame RE-SHARPEN (func_add/mul/square/max/
-        # min; DEFAULT-ON in campaign, opt out =0, BAKE-affecting): adds a Q/K
-        # scoring slot to the SHARED L7 operand-gather head 1. The ON / OFF
-        # builds differ in W_q/W_k so they must NEVER share a serialised entry.
-        # Gated on ``operand_from_memsp_enabled()`` (DEFAULT-ON post-flip;
-        # reading the raw env ``== "1"`` would default OFF and let the campaign
-        # ON bake collide with a non-campaign cache entry). See
-        # shared.func_lea_reread_bp_resharpen_enabled.
-        "C4_FUNC_LEA_REREAD_BP_RESHARPEN": (
-            operand_from_memsp_enabled()
-            and os.environ.get("C4_FUNC_LEA_REREAD_BP_RESHARPEN", "1") != "0"
-        ),
         # Single CAMPAIGN-CONFIG entry point (DEFAULT-OFF; opt in with =1):
         # ``C4_CAMPAIGN=1`` OR-ins the ON floor for the coherent 30-token
         # campaign set (no_stack0_emit + operand_from_memsp + si_store_addr +
@@ -2349,24 +2178,6 @@ def _build_cache_key_snapshot(
         "extra_residual_dims": (
             tuple(sorted(extra_residual_dims.items()))
             if extra_residual_dims else None
-        ),
-        # L15 li_lc_stack0_h0 lookup-head comparison-step veto (bool_and
-        # id=1087, DEFAULT-ON, opt out =0, BAKE-affecting): when active the
-        # head-0 slot-0 Q discriminator gains six OP_<cmp> * -1e6 veto cells,
-        # so the ON / OFF builds bake a different W_q row and must never share
-        # a memo entry. See shared.l15_lookup_cmp_veto_enabled.
-        "C4_L15_LOOKUP_CMP_VETO": (
-            os.environ.get("C4_L15_LOOKUP_CMP_VETO", "1") != "0"
-        ),
-        # Consumer-opcode LOOKAHEAD (#221; DEFAULT-ON, opt out =0): adds the
-        # PC+8 chain + lookahead fetch head + arith-decode flag + AX->STACK0
-        # relay + prior-arith latch + dump-block flag bands AND the dump's
-        # STACK0_B0_DUMP_BLOCK blocker (output-affecting on multi-op arith
-        # intermediate-operand frames). On / off builds must NEVER share a
-        # memo / disk entry -- the band presence changes d_model and the dump
-        # gate changes emission, so this flag toggles geometry AND output.
-        "C4_STACK0_NEXT_ARITH": (
-            os.environ.get("C4_STACK0_NEXT_ARITH", "1") != "0"
         ),
         # Namespace the dynamic cache so it never collides with the static
         # entry (same kwargs, different scheduler).

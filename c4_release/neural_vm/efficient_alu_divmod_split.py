@@ -255,17 +255,15 @@ class _DivModGEToBDStage(nn.Module):
         # band is dead at this row from L14 onward. Clear it here, gated on the
         # SAME divmod-AX ``opcode_mask`` used for the OUTPUT write, so the L20
         # relay has no divisor to leak and the quotient survives to the emit.
-        # See ``shared.divmod_axcarry_clear_enabled`` for the full rationale +
-        # the byte-identity envelope. Flag-OFF / ``C4_NO_STACK0_EMIT=0`` leave
+        # (This divmod AX_CARRY-clear is UNCONDITIONAL under campaign as of the
+        # P5 flag-retire 2026-07-14; the former ``C4_DIVMOD_AXCARRY_CLEAR`` escape
+        # hatch was retired.) ``C4_NO_STACK0_EMIT=0`` (non-campaign) leaves
         # AX_CARRY untouched (byte-identical to golden ``4958b35b``).
         from .unified_compiler.ops.shared import (
             no_stack0_emit_enabled,
-            divmod_axcarry_clear_enabled,
-            divmod_stack0_byte1_clear_enabled,
         )
         if (
             no_stack0_emit_enabled()
-            and divmod_axcarry_clear_enabled()
             and hasattr(BD, "AX_CARRY_LO")
             and hasattr(BD, "AX_CARRY_HI")
         ):
@@ -298,7 +296,6 @@ class _DivModGEToBDStage(nn.Module):
         # leave the band untouched (byte-identical to golden ``7f6f2e5d``).
         if (
             no_stack0_emit_enabled()
-            and divmod_stack0_byte1_clear_enabled()
             and hasattr(BD, "STACK0_BYTE_VAL_1_LO")
             and hasattr(BD, "STACK0_BYTE_VAL_1_HI")
         ):

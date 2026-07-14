@@ -1708,7 +1708,9 @@ def _lev_ax_byte1_kill_enabled() -> bool:
     a trade. Flag-off (``C4_LEV_AX_BYTE1_KILL=0``) omits the unit, so the
     overflow flag is byte-identical with the prior 2-unit design.
     """
-    return _os_stack0.environ.get("C4_LEV_AX_BYTE1_KILL", "1") != "0"
+    # Unconditional as of the P5 flag-retire 2026-07-14 (the former
+    # ``C4_LEV_AX_BYTE1_KILL`` escape hatch was retired as a proven default-ON fix).
+    return True
 
 
 def _ax_byte1_carry_overflow_flag_rules() -> tuple[FFNRule, ...]:

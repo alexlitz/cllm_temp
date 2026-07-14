@@ -2528,8 +2528,10 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
     # ``ax_byte1_carry_overflow_flag`` precursor + the ``AX_CARRY_OVERFLOW``
     # kill condition on the dump) excludes them. See
     # ``docs/AX_BYTE1_DUMP_CARRY_LANDED_2026_06_13.md``.
+    # The AX byte-1 carried-step LM-head DUMP emission is UNCONDITIONAL as of the
+    # P5 flag-retire 2026-07-14 (the former ``C4_AX_BYTE1_DUMP`` escape hatch,
+    # which omitted these LM-head columns, was retired as a proven default-ON fix).
     import os as _os
-    _emission_on = _os.environ.get("C4_AX_BYTE1_DUMP", "1") != "0"
     # When ``C4_AX_HIBYTE_CLEAR`` is ON, the L25 ``b1_to_output`` FFN decodes the
     # carried byte-1 out of the ``H1/H2/H3_DUMP_OUT`` bands into the canonical
     # ``OUTPUT_LO/HI`` nibbles across THIS op's value range (0..15), and the
@@ -2549,8 +2551,6 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
 
     def _bake(model, dim_positions, S):
         del S
-        if not _emission_on:
-            return
         from ...vm_step import Token
         ir = CompilerIR()
         ir.embeddings.extend(
@@ -2564,12 +2564,11 @@ def make_ax_byte1_dump_head_bake_op() -> Operation:
         del HD
         from ...vm_step import Token
         ir = CompilerIR()
-        if _emission_on:
-            ir.embeddings.extend(
-                _ax_byte1_dump_head_bake_rules(
-                    Token.VOCAB_SIZE, skip_h1=_skip_h1, skip_h23=_skip_h23
-                )
+        ir.embeddings.extend(
+            _ax_byte1_dump_head_bake_rules(
+                Token.VOCAB_SIZE, skip_h1=_skip_h1, skip_h23=_skip_h23
             )
+        )
         return ir
 
     return Operation(
@@ -2859,11 +2858,12 @@ def make_ax_byte1_full_width_fill_op() -> Operation:
 # edge_literal still failing at step=1). This unified source fixes both.
 #
 # Default-ON (GPU-confirmed +11: edge_literal 5->15, smoke 51/0, zero arith
-# regression; commit 1f0403f9 verified). Set ``C4_AX_BYTE1_HINIB=0`` to omit the
-# band -> the pre-feature build (legacy emission covers byte1<16; this ADDS byte1>=16).
+# regression; commit 1f0403f9 verified). Unconditional as of the P5 flag-retire
+# 2026-07-14 (the former ``C4_AX_BYTE1_HINIB=0`` escape hatch — which omitted the
+# band, reverting to the pre-feature legacy emission covering only byte1<16 — was
+# retired as a proven default-ON fix).
 def _ax_byte1_hinib_enabled() -> bool:
-    import os as _os
-    return _os.environ.get("C4_AX_BYTE1_HINIB", "1") != "0"
+    return True
 
 
 _AX_BYTE1_HINIB_BAND = "AX_BYTE1_HINIB"
