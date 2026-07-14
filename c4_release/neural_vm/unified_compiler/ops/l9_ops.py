@@ -808,50 +808,6 @@ def _spare_opcodes() -> tuple[str, ...]:
 _SPARE_OPCODES: tuple[str, ...] = _CMP_OPCODES_SPARED + _SPARE_OPCODES_ARITH
 
 
-def _alu_operand_survive_enabled() -> bool:
-    """``C4_ALU_OPERAND_SURVIVE`` — DEFAULT-ON block-15 half of the combined fix.
-
-    The L9 ALU-clear (physical block 15, unit band 3344+; the "L10 ALU-clear"
-    of the docs) is a broad ``MARK_AX AND (any non-ALU opcode)`` scrub of the
-    ``ALU_LO/HI`` band that stops residual ALU_* from contaminating L10's
-    bitwise / MUL units at NON-ALU positions. It legitimately fires on the AX
-    marker + AX byte rows. On an **ALU** step (CMP / MUL / DIV / MOD /
-    bitwise), however, MARK_AX still broadcasts to ~2.0 in the frame so the
-    clear fires anyway, AND a spurious NON-ALU-opcode LEAK inflates the
-    pre-activation into a full crush:
-
-      * CMP rows: a spurious ``OP_SI = +10`` leak (``W_up[u3344,OP_SI]=+100``)
-        → pre-act ~+1050 → ``-0.1`` write becomes ``-105`` → buries operand-A
-        (``gt_57_29``, ``eq_7_45``).
-      * MUL rows: a spurious ``OP_JSR = +10`` leak
-        (``W_up[u3344,OP_JSR]=+100``) → the SAME ~+1050 pre-act / ``-105``
-        crush (mul 23*65, the byte-1 drop family).
-
-    Each affected op family carries a dedicated ``*OperandSeRecoverFFN``
-    (``CmpOperandSeRecoverFFN`` / ``MulOperandSeRecoverFFN``) that
-    re-materialises operand-A from the surviving ``SE_ALU`` mirror precisely
-    because of this crush.
-
-    When enabled, a hard ``-1e6`` NOT-blocker for each ``_SPARE_OPCODES``
-    opcode is added to the clear's AND gate. On a genuine ALU AX row the live
-    opcode flag (e.g. ``OP_GT`` / ``OP_MUL ≈ +10``) is present → the ``-1e6``
-    blocker vetoes EVERY clear unit → operand-A stays the clean live
-    ``ALU_LO/HI`` one-hot, and the spurious non-ALU leak can no longer trip the
-    crush. The clear STILL fires exactly as before at every intended NON-ALU
-    firing row (PSH/LI/SI/... AX marker + AX byte rows), where every
-    ``_SPARE_OPCODES`` flag == 0 so the ``-1e6*0 == 0`` blocker is inert.
-
-    The blockers are extra ``W_up`` columns (not extra units), so the L9 FFN's
-    pinned 3405-unit layout is preserved and the flag is byte-identical OFF.
-
-    This is the block-15 half of the combined operand-survival fix; the
-    block-17 head-4 CMP Q-veto (``model_ops.make_cmp_h4_qveto_op``) is the
-    companion half, gated on the SAME flag. See
-    ``docs/SERECOVER_DELETE_2026_07_13.md``.
-    """
-    return os.environ.get("C4_ALU_OPERAND_SURVIVE", "1") != "0"
-
-
 def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     """ALU LO/HI clear at non-ALU opcodes (32 units).
 
@@ -910,12 +866,13 @@ def _alu_clear_rules(S: float) -> tuple[FFNRule, ...]:
     # the blocker is inert (-1e6*0 == 0) → byte-identical flag-OFF. These are
     # extra W_up columns, not extra units, so the 3405-unit layout is preserved.
     # This is the block-15 half of the combined fix; block-17 head-4 CMP Q-veto
-    # (model_ops.make_cmp_h4_qveto_op) is the companion. See
-    # :func:`_alu_operand_survive_enabled`.
-    if _alu_operand_survive_enabled():
-        common_conditions = common_conditions + tuple(
-            (op, -1e6) for op in _spare_opcodes()
-        )
+    # (model_ops.make_cmp_h4_qveto_op) is the companion. Formerly gated on
+    # C4_ALU_OPERAND_SURVIVE (RETIRED 2026-07-14, proven default-ON) — now
+    # unconditional. The spare-opcode SET is still selectable via
+    # C4_ALU_OPERAND_SURVIVE_CMP_RAW (see _spare_opcodes / _spare_cmp_raw_enabled).
+    common_conditions = common_conditions + tuple(
+        (op, -1e6) for op in _spare_opcodes()
+    )
 
     # ALU_LO clear (16 units) then ALU_HI clear (16 units).
     #

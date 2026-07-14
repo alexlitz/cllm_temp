@@ -3657,37 +3657,28 @@ def make_norm_compensator_seed_op() -> Operation:
 # crush, handled by the ``C4_ALU_OPERAND_SURVIVE`` block-15 spare that shares
 # this flag).
 #
-# This is the block-17 half of the combined operand-survival fix, gated on the
-# SAME flag ``C4_ALU_OPERAND_SURVIVE`` (default-ON) as the block-15 L9-clear
-# spare (``l9_ops._alu_operand_survive_enabled``). The bake is a clean
-# early-return no-op when OFF, so golden flag-OFF state_dict is byte-identical
-# (e50521f3). Registered unconditionally (dep-graph topology stable across the
-# flag).
+# This is the block-17 half of the combined operand-survival fix (companion to
+# the block-15 L9-clear spare, l9_ops._alu_clear_rules). Formerly gated on
+# ``C4_ALU_OPERAND_SURVIVE`` (RETIRED 2026-07-14, proven default-ON) — now
+# unconditional. Registered unconditionally (dep-graph topology stable).
 _CMP_H4_QVETO_BLOCK = 17
 _CMP_H4_QVETO_HEAD = 4
 _CMP_H4_QVETO_OPS = ("OP_EQ", "OP_NE", "OP_LT", "OP_GT", "OP_LE", "OP_GE")
 _CMP_H4_QVETO_MAGNITUDE = 1e5
 
 
-def _cmp_h4_qveto_enabled() -> bool:
-    """``C4_ALU_OPERAND_SURVIVE`` — default ON (byte-identical golden when =0).
-
-    Shared with ``l9_ops._alu_operand_survive_enabled`` (the block-15 spare);
-    this is the block-17 head-4 half.
-    """
-    import os as _os
-    return _os.environ.get("C4_ALU_OPERAND_SURVIVE", "1") != "0"
-
-
 def make_cmp_h4_qveto_op() -> Operation:
-    """Veto block-17 attention head 4 on CMP result rows (``C4_ALU_OPERAND_SURVIVE``).
+    """Veto block-17 attention head 4 on CMP result rows.
+
+    Formerly gated on ``C4_ALU_OPERAND_SURVIVE`` (RETIRED 2026-07-14, proven
+    default-ON; the block-17 head-4 companion of the block-15 L9-clear spare) —
+    now UNCONDITIONAL.
 
     Phase=1450 — runs AFTER ``expand_wrapper_blocks`` (1300) and the Qwen
     ``norm_compensator_seed`` (1400) so block-17's 8->13 head expansion has
     fully materialised head 4 and this patch lands on the FINAL Q weights.
 
-    No-op unless ``C4_ALU_OPERAND_SURVIVE`` is set (default ON; OFF only when
-    explicitly =0). When on: for each head-dim slot where head 4's K reads the
+    For each head-dim slot where head 4's K reads the
     ``CONST`` self-row (``W_k[4*HD+s, CONST] > 1``, the slots the head uses to
     score its own row), overwrite head 4's Q at the six CMP-opcode columns with
     a large negative so the head's self-score collapses on any cmp result row
@@ -3695,8 +3686,6 @@ def make_cmp_h4_qveto_op() -> Operation:
     """
     def _bake(model, dim_positions, S):
         del S
-        if not _cmp_h4_qveto_enabled():
-            return
         import torch
         blocks = getattr(model, "blocks", None)
         if blocks is None or len(blocks) <= _CMP_H4_QVETO_BLOCK:
