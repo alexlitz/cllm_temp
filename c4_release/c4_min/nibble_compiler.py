@@ -317,17 +317,20 @@ def _empty_ffn(dim: int):
 # --------------------------------------- EMIT store-select into code memory ----
 
 def compile_emit_store(L: Layout, dim: int):
-    """EMIT: ``CODE_WORD[IMM] := AX + 256*STACK0``, gated on OP_IS[EMIT]. PC += 1.
+    """EMIT: ``CODE_WORD[IMM] := AX + 256*STACK0``, gated on OP_IS[EMIT]. PC += 1;
+    SP -= 1 (pop the produced-immediate that rode STACK0).
 
-    Identical algebra to nibble_handoff.compile_emit_store, but EMIT is opcode 30
-    here (not 27) so it coexists with MUL. Store-SELECT, the write-mirror of the
-    fetch read-select over the shared CODE_WORD band.
+    Same store-SELECT algebra as nibble_handoff.compile_emit_store (write-mirror of
+    the fetch read-select over the shared CODE_WORD band), but EMIT is opcode 30
+    here (27 == MUL) and it POPS the immediate it consumed so a compiler that emits
+    many instructions (``PSH imm; IMM op; EMIT`` per produced word) keeps a balanced
+    stack — otherwise every emit would leak one cell and overflow the SP-stack.
     """
     n = L.CODE_SIZE
     BIG = 256.0
     silu_big = float(F.silu(torch.tensor(0.5 * BIG)))   # == 128.0 exactly
     op_emit = L.OP_IS + EMIT
-    n_units = 3 * n + 1
+    n_units = 3 * n + 2       # 3 store units/slot + PC-bump + SP-pop (the immediate)
     W_up = torch.zeros(n_units, dim); b_up = torch.zeros(n_units)
     W_gate = torch.zeros(n_units, dim); b_gate = torch.zeros(n_units)
     W_down = torch.zeros(dim, n_units); b_down = torch.zeros(dim)
@@ -345,11 +348,15 @@ def compile_emit_store(L: Layout, dim: int):
         _and_unit(u, L.ADDR_IS[i], [(L.AX, 1.0)], L.CODE_WORD[i], +1.0); u += 1
         _and_unit(u, L.ADDR_IS[i], [(L.STACK0, 256.0)], L.CODE_WORD[i], +1.0); u += 1
         _and_unit(u, L.ADDR_IS[i], [(L.CODE_WORD[i], 1.0)], L.CODE_WORD[i], -1.0); u += 1
+    silu_S = float(F.silu(torch.tensor(0.5 * FFN_S)))
     # PC += 1 on EMIT.
     W_up[u, op_emit] += FFN_S; b_up[u] += -FFN_S * 0.5
     W_gate[u, L.ONE] += 1.0
-    silu_S = float(F.silu(torch.tensor(0.5 * FFN_S)))
-    W_down[L.PC, u] += 1.0 / silu_S
+    W_down[L.PC, u] += 1.0 / silu_S; u += 1
+    # SP -= 1 on EMIT (pop the produced-immediate the store consumed from STACK0).
+    W_up[u, op_emit] += FFN_S; b_up[u] += -FFN_S * 0.5
+    W_gate[u, L.ONE] += 1.0
+    W_down[L.SP, u] += -1.0 / silu_S
     return {"W_up": W_up, "b_up": b_up, "W_gate": W_gate, "b_gate": b_gate,
             "W_down": W_down, "b_down": b_down}
 
@@ -607,6 +614,7 @@ def interpret_full(code: List[isa.Instr], src: List[int], code_size: int,
                 mem[stack0] = ax & 0xFF
         elif op == EMIT:
             words[imm % code_size] = (ax & 0xFF) | ((stack0 & 0xFF) << 8)
+            sp = max(0, sp - 1)          # EMIT pops the produced-immediate it used
         elif op == isa.JMP:
             pc = imm
         elif op == isa.BZ:
@@ -725,3 +733,149 @@ def _source_bytes(source) -> List[int]:
 def make_word(op_name: str, imm: int) -> int:
     op = EMIT if op_name == "EMIT" else isa.BY_NAME[op_name]
     return (op & 0xFF) | ((imm & 0xFF) << 8)
+
+
+# ======================================================================== #
+#  THE MINIMAL-SUBSET C COMPILER, IN c4_min BYTECODE                        #
+# ======================================================================== #
+#
+#  This is the headline artifact: a COMPILER written in c4_min bytecode that,
+#  when run on ``CompilerMachine`` (or baked into the weights), reads a C
+#  integer expression out of the SOURCE data band, parses it with correct
+#  operator precedence (``*`` binds tighter than ``+``), EMITs the compiled
+#  bytecode into empty code memory, and JMPs to it — the universal fetch then
+#  runs the freshly-produced program. NOTHING about the input expression is in
+#  this bytecode: the operand digits and the operators (hence the precedence
+#  decisions) are all read from SRC at runtime via ``LC``.
+#
+#  Grammar (minimal C-subset instance of the c4 expr()/stmt() descent): a
+#  three-operand two-operator integer expression ``D op D op D`` over single
+#  ASCII digits and the operators ``+`` and ``*`` (e.g. ``2+3*4``). All four
+#  precedence cases (+/+, +/*, */+, */*) are handled by RUNTIME branches on the
+#  operator characters — exactly the precedence lookahead the c4 compiler does.
+#  The produced code is the SAME ``op | imm<<8`` packed encoding the real c4
+#  compiler emits (``code[code_pos] = op | (imm<<8)``, c4_compile.c:352): for
+#  ``2+3*4`` this is ``IMM 2; PSH; IMM 3; PSH; IMM 4; MUL; ADD; HALT`` == 14,
+#  byte-identical to c4's own output (JSR/ENT/LEV framing aside).
+
+# Where the produced program is EMITted (must be PAST the compiler's own code).
+COMPILER_OUTBASE = 160
+# ASCII of the two operators the compiler recognises.
+_STAR = ord("*")   # 42
+_PLUS = ord("+")   # 43
+
+
+class _Asm:
+    """Tiny label assembler for hand-writing the compiler bytecode."""
+
+    def __init__(self):
+        self.code: List[list] = []
+        self.labels: dict = {}
+
+    def emit(self, op: int, imm=0) -> int:
+        self.code.append([op, imm])
+        return len(self.code) - 1
+
+    def label(self, name: str):
+        self.labels[name] = len(self.code)
+
+    def resolve(self) -> List[Tuple[str, int]]:
+        out = []
+        for op, imm in self.code:
+            if isinstance(imm, str):
+                imm = self.labels[imm]
+            name = "EMIT" if op == EMIT else isa.NAMES[op]
+            out.append((name, imm))
+        return out
+
+
+def _emit_produced(a: _Asm, out_slot: int, opcode: int,
+                   digit_at=None, imm_const=None):
+    """Compiler bytecode that EMITs ONE produced instruction into ``out_slot``.
+
+    EMIT writes ``CODE[out_slot] = AX + 256*STACK0`` (low byte = produced OPCODE,
+    high byte = produced IMMEDIATE), and pops the immediate. So: put the produced
+    immediate on the stack (``PSH``), then AX := produced opcode, then ``EMIT``.
+
+      * ``digit_at``: the produced immediate is ``src[digit_at] - '0'`` — READ FROM
+        SOURCE at runtime (``LC``), the operand value the compiler is parsing.
+      * ``imm_const``: the produced immediate is a constant (0 for PSH/MUL/ADD/HALT).
+    """
+    if digit_at is not None:
+        a.emit(isa.IMM, digit_at); a.emit(isa.LC, 0)          # AX = src[digit_at]
+        a.emit(isa.PSH, 0); a.emit(isa.IMM, 48); a.emit(isa.SUB, 0)  # AX = char-'0'
+    else:
+        a.emit(isa.IMM, int(imm_const or 0))
+    a.emit(isa.PSH, 0)                                         # STACK0 = produced imm
+    a.emit(isa.IMM, opcode)                                    # AX = produced opcode
+    a.emit(EMIT, out_slot)                                     # CODE[out_slot] := word
+
+
+def _test_op_is_star(a: _Asm, src_pos: int, target_label: str):
+    """Compiler bytecode: read src[src_pos]; if it is '*' branch to target_label.
+
+    ``AX := src[pos] - '*'`` (== 0 iff the operator is ``*``), then ``BZ``. This is
+    the runtime operator test that drives the precedence decision."""
+    a.emit(isa.IMM, src_pos); a.emit(isa.LC, 0)               # AX = src[pos] = operator
+    a.emit(isa.PSH, 0); a.emit(isa.IMM, _STAR); a.emit(isa.SUB, 0)  # AX = op - '*'
+    a.emit(isa.BZ, target_label)
+
+
+def expr_compiler_bytecode(outbase: int = COMPILER_OUTBASE):
+    """Assemble the minimal-subset expression compiler as c4_min bytecode.
+
+    Returns a list of ``(mnemonic, imm)`` — the COMPILER program. Load it as the
+    ``prog`` of ``CompilerMachine.run(prog, source="2+3*4")`` (or bake it) and it
+    reads the source, emits the compiled bytecode at ``outbase``.., and JMPs there.
+
+    Precedence handling for ``d0 op1 d1 op2 d2`` (positions 0..4 of the source):
+      op1=='*' : fold d0*d1 immediately (``IMM d0;PSH;IMM d1;MUL``), then op2.
+      op1=='+' : defer; if op2=='*' the ``d1*d2`` term binds first, so the ADD is
+                 emitted LAST (``IMM d0;PSH;IMM d1;PSH;IMM d2;MUL;ADD``); if op2=='+'
+                 it left-folds (``IMM d0;PSH;IMM d1;ADD;PSH;IMM d2;ADD``).
+    """
+    O = outbase
+    a = _Asm()
+    # --- op1 = src[1]: choose the multiply-first vs add-first skeleton ---
+    _test_op_is_star(a, 1, "op1_star")
+    a.emit(isa.JMP, "op1_plus")
+
+    # ===================== op1 == '*' : d0*d1 folds first =====================
+    a.label("op1_star")
+    _emit_produced(a, O + 0, isa.IMM, digit_at=0)             # IMM d0
+    _emit_produced(a, O + 1, isa.PSH, imm_const=0)            # PSH
+    _emit_produced(a, O + 2, isa.IMM, digit_at=2)             # IMM d1
+    _emit_produced(a, O + 3, isa.MUL, imm_const=0)            # MUL  (d0*d1)
+    _emit_produced(a, O + 4, isa.PSH, imm_const=0)            # PSH
+    _emit_produced(a, O + 5, isa.IMM, digit_at=4)             # IMM d2
+    _test_op_is_star(a, 3, "star_op2_mul")                    # op2 ?
+    _emit_produced(a, O + 6, isa.ADD, imm_const=0)            # op2=='+' : ADD
+    a.emit(isa.JMP, "star_done")
+    a.label("star_op2_mul")
+    _emit_produced(a, O + 6, isa.MUL, imm_const=0)            # op2=='*' : MUL
+    a.label("star_done")
+    _emit_produced(a, O + 7, isa.HALT, imm_const=0)           # HALT
+    a.emit(isa.JMP, O)                                        # HANDOFF -> run it
+
+    # ===================== op1 == '+' : deferred add =====================
+    a.label("op1_plus")
+    _emit_produced(a, O + 0, isa.IMM, digit_at=0)             # IMM d0
+    _emit_produced(a, O + 1, isa.PSH, imm_const=0)            # PSH
+    _emit_produced(a, O + 2, isa.IMM, digit_at=2)             # IMM d1
+    _test_op_is_star(a, 3, "plus_op2_star")                   # op2 ?
+    # op2 == '+' : left-fold  (d0+d1) then +d2
+    _emit_produced(a, O + 3, isa.ADD, imm_const=0)            # ADD  (d0+d1)
+    _emit_produced(a, O + 4, isa.PSH, imm_const=0)            # PSH
+    _emit_produced(a, O + 5, isa.IMM, digit_at=4)             # IMM d2
+    _emit_produced(a, O + 6, isa.ADD, imm_const=0)            # ADD
+    a.emit(isa.JMP, "plus_done")
+    # op2 == '*' : d1*d2 binds first, ADD emitted last
+    a.label("plus_op2_star")
+    _emit_produced(a, O + 3, isa.PSH, imm_const=0)            # PSH
+    _emit_produced(a, O + 4, isa.IMM, digit_at=4)             # IMM d2
+    _emit_produced(a, O + 5, isa.MUL, imm_const=0)            # MUL  (d1*d2)
+    _emit_produced(a, O + 6, isa.ADD, imm_const=0)            # ADD  (d0 + d1*d2)
+    a.label("plus_done")
+    _emit_produced(a, O + 7, isa.HALT, imm_const=0)           # HALT
+    a.emit(isa.JMP, O)                                        # HANDOFF -> run it
+    return a.resolve()
