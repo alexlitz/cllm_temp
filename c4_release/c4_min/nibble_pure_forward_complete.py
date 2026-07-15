@@ -108,6 +108,8 @@ class PureForwardCompleteLayout(PureForwardLayout):
         self.LEV_QRY_BIN = self._band("LEV_QRY_BIN", ADDR_BITS)  # LEV ret-PC bits
         self.LEV_RET = self._band("LEV_RET", NIB_PER_REG)     # loaded return-PC nibbles
         self.LEV_RET_VAL = self._scalar("LEV_RET_VAL")        # its scalar image
+        self.AXB_LO = self._scalar("AXB_LO")                  # AX_VAL low nibble scratch
+        self.AXB_HI = self._scalar("AXB_HI")                  # AX_VAL high nibble scratch
         while self._off % n_heads != 0:
             self._scalar(f"_pfcpad{self._off}")
         self.D = self._off
@@ -412,6 +414,58 @@ def alu32_housekeeping_rules(L) -> List[FFNRule]:
     return rules
 
 
+def compile_ax_nib_split(L, dim: int) -> Dict[str, torch.Tensor]:
+    """AXB_LO = low nibble of AX_VAL's byte, AXB_HI = high nibble — via ONE ungated
+    256-cell one-hot of AX_VAL (triangular pulse) summed with the nibble weights.
+    Runs in its OWN block so the writeback (next block) can read AXB_LO/AXB_HI (FFN
+    units all see the block INPUT, so producer and consumer must be different
+    blocks)."""
+    thr = list(range(-1, 257))
+    tu = {t: k for k, t in enumerate(thr)}
+    n_thr = len(thr)
+    axb_lo, axb_hi = L.AXB_LO, L.AXB_HI
+    spec = _empty_spec(dim, n_thr + 2)
+    u = 0
+    relu0 = u
+    for t, k in tu.items():
+        spec["W_up"][u, L.AX_VAL] = RELU_S
+        spec["b_up"][u] = -RELU_S * t
+        spec["W_gate"][u, L.ONE] = 1.0
+        u += 1
+    for lane in (axb_lo, axb_hi):                # self-clear (SET)
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
+        spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
+    for a in range(256):
+        lo, hi = a & 0xF, (a >> 4) & 0xF
+        for lane, val in ((axb_lo, lo), (axb_hi, hi)):
+            if val:
+                spec["W_down"][lane, relu0 + tu[a - 1]] += val / RELU_S
+                spec["W_down"][lane, relu0 + tu[a]] += -2.0 * val / RELU_S
+                spec["W_down"][lane, relu0 + tu[a + 1]] += val / RELU_S
+    return spec
+
+
+def compile_ax_byte_to_nibbles(L, dim: int, ops) -> Dict[str, torch.Tensor]:
+    """When any op in ``ops`` (byte-producing: IMM/LEA/CMP/bitwise/LI) is active,
+    SET AX nibble 0 = AXB_LO, nibble 1 = AXB_HI (computed by ``compile_ax_nib_split``
+    in the previous block), and clear AX nibbles 2..7 — so the AX nibble band is the
+    canonical 8-bit result and the driver decodes AX from it uniformly."""
+    axb_lo, axb_hi = L.AXB_LO, L.AXB_HI
+    spec = _empty_spec(dim, len(ops) * 8 + len(ops) * 2)
+    u = 0
+    for op in ops:
+        g = L.OP_IS + op
+        for j in range(8):                       # clear AX[0..7] gated
+            spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+            spec["W_gate"][u, L.AX + j] = 1.0
+            spec["W_down"][L.AX + j, u] += -1.0 / SILU_HALF; u += 1
+        for nb, src in ((0, axb_lo), (1, axb_hi)):   # nib0=AXB_LO, nib1=AXB_HI
+            spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+            spec["W_gate"][u, src] = 1.0
+            spec["W_down"][L.AX + nb, u] += 1.0 / SILU_HALF; u += 1
+    return spec
+
+
 def _fold_ax_gated(L, dim: int, ops) -> Dict[str, torch.Tensor]:
     """Fold AX_VAL mod 256 ONLY when one of ``ops`` is active (LEA masks &0xFF).
     The 32-bit ALU result must NOT be folded, so the base global fold is replaced
@@ -500,10 +554,20 @@ def build_pure_forward_complete_model(code_size: int = 32,
     disp_rules += alu32_housekeeping_rules(L)
     if include_bitwise:
         disp_rules += _bitwise_pop_rules(L)
+    # ops whose AX result is a BYTE written into AX_VAL by the dispatch: IMM/LEA +
+    # cmp + bitwise + LI/LC (the memory head writes AX nibbles for LI, but a byte-
+    # value writeback of AX_VAL is idempotent for it too).  These get a byte->nibble
+    # writeback so the AX nibble band is canonical (the driver decodes AX from it).
+    byte_ax_ops = [isa.IMM, isa.LEA, isa.LI, isa.LC] + \
+                  [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE]
+    if include_bitwise:
+        byte_ax_ops += [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
     block_specs += [
         ("dispatch", compile_ffn(disp_rules, dim)),
         ("branch-delta", compile_branch_delta(L, dim)),
         ("fold-lea", _fold_ax_gated(L, dim, [isa.LEA])),  # LEA masks &0xFF; ALU 32-bit
+        ("ax-nib-split", compile_ax_nib_split(L, dim)),   # AX_VAL byte -> AXB_LO/HI
+        ("ax-byte-nib", compile_ax_byte_to_nibbles(L, dim, byte_ax_ops)),
     ]
     n_blocks = len(block_specs)
     hidden = max(f["W_up"].shape[0] for _, f in block_specs)
@@ -571,10 +635,12 @@ def _bitwise_pop_rules(L) -> List[FFNRule]:
 # heap share ONE byte-addressed region; SP/BP are byte addresses descending from
 # SP_INIT.  Matches the neural build's per-step AX emit.
 # ===========================================================================
-def ref_interpret(code: List[isa.Instr], max_steps: int = 512) -> List[int]:
-    """Reference interpreter with the SP-addressed memory stack (values 8-bit for
-    the emitted-AX trace; MUL/DIV/MOD are the 32-bit ALU widened result folded to
-    the byte on emit — matching the neural byte frame)."""
+def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
+                  mask: int = 0xFF) -> List[int]:
+    """Reference interpreter with the SP-addressed memory stack.  ``mask`` = 0xFF
+    (8-bit AX trace, the default; matches the neural byte frame) or 0xFFFFFFFF (the
+    full 32-bit AX for the 32-bit-arithmetic proof: ADD/SUB/MUL wrap mod 2^32,
+    DIV/MOD unsigned floor with b==0 -> 0, ISA_SPEC 4.2)."""
     mem: Dict[int, int] = {}
     sp = bp = SP_INIT
     ax = pc = 0
@@ -591,19 +657,19 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512) -> List[int]:
         elif op == isa.LEA:
             ax = (bp + 4 * imm) & 0xFF
         elif op == isa.PSH:
-            sp -= 4; mem[sp] = ax & 0xFF
+            sp -= 4; mem[sp] = ax & mask
         elif op in (isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD):
-            v = mem.get(sp, 0) & 0xFF; sp += 4
+            v = mem.get(sp, 0) & mask; sp += 4
             if op == isa.ADD:
-                ax = (v + ax) & 0xFF
+                ax = (v + ax) & mask
             elif op == isa.SUB:
-                ax = (v - ax) & 0xFF
+                ax = (v - ax) & mask
             elif op == isa.MUL:
-                ax = (v * ax) & 0xFF
+                ax = (v * ax) & mask
             elif op == isa.DIV:
-                ax = ((v // ax) if ax else 0) & 0xFF
+                ax = ((v // ax) if ax else 0) & mask
             else:
-                ax = ((v % ax) if ax else 0) & 0xFF
+                ax = ((v % ax) if ax else 0) & mask
         elif op in (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR):
             v = mem.get(sp, 0) & 0xFF; sp += 4
             if op == isa.OR:
@@ -643,10 +709,10 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512) -> List[int]:
         elif op == isa.NOP:
             pass
         elif op == isa.HALT:
-            trace.append(ax & 0xFF); break
+            trace.append(ax & mask); break
         else:
             raise NotImplementedError(f"op {isa.NAMES.get(op, op)} not in ref ISA")
-        trace.append(ax & 0xFF)
+        trace.append(ax & mask)
     return trace
 
 
@@ -712,10 +778,14 @@ def _build_frame(pc, ax, sp, bp, stk, mem_addr=0, mem_val=0):
 
 def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
                               code: List[isa.Instr], max_steps: int = 512,
-                              verbose: bool = False, collect_tokens: bool = False):
+                              verbose: bool = False, collect_tokens: bool = False,
+                              mask: int = 0xFF):
     """Execute ``code`` with the complete pure-forward step: every VM step is ONE
     ``model.forward`` over the growing token stream.  Returns the per-step AX
-    trace (matching :func:`ref_interpret`).
+    trace (matching :func:`ref_interpret`).  ``mask`` (0xFF = 8-bit AX trace, or
+    0xFFFFFFFF = the full 32-bit AX for the 32-bit-arithmetic proof) is applied to
+    the emitted AX only; the model always carries the full 32-bit AX in its nibble
+    bands (the ALU is 32-bit-exact) regardless of ``mask``.
 
     LEV is expanded to its two frame loads (BP then return-PC) by re-running the
     forward with the appropriate stack query — but because the whole state lives
@@ -751,14 +821,12 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
         halted = float(state[L.HALTED]) > 0.5
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
         imm = code[cur_pc].imm if 0 <= cur_pc < len(code) else 0
-        # AX: for a 32-bit ALU op (ADD/SUB/MUL/DIV/MOD) the result is the full 4-byte
-        # AX nibble band the ax-mux wrote — decode it per-byte with the LM byte-head
-        # argmax (the spec re-quantiser; residue-immune, no torch.round).  For every
-        # other op AX is the scalar AX_VAL the dispatch wrote.
-        if op in ALU_OPS:
-            ax = _decode_reg_from_nibbles(state, L, L.AX)
-        else:
-            ax = _snap_lane(state[L.AX_VAL])
+        # AX is ALWAYS the canonical AX nibble band: the ax-mux writes the full 4-byte
+        # 32-bit ALU result there, the memory head writes the loaded byte, and the
+        # ax-byte-nib writeback puts every byte-producing op's AX_VAL into it.  Decode
+        # it per-byte with the LM byte-head argmax (the spec re-quantiser; residue-
+        # immune, no torch.round).  One uniform path — no python if/elif on the op.
+        ax = _decode_reg_from_nibbles(state, L, L.AX)
         # store bookkeeping: which address does this op write, and what value?  All
         # addresses/values are derived from the PRE-step registers the driver
         # tracks (the store target is decided before the op runs; the value is a
@@ -767,17 +835,17 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
         is_store = False
         if op in (isa.SI, isa.SC):
             # SI: *pop = AX.  The popped stack top MEM[cur_sp] is the target ADDRESS.
-            is_store = True; s_addr = _mem_top(store_log, cur_sp); s_val = ax & 0xFF
+            is_store = True; s_addr = _mem_top(store_log, cur_sp); s_val = ax & mask
         elif op == isa.PSH:
-            is_store = True; s_addr = cur_sp - 4; s_val = ax & 0xFF
+            is_store = True; s_addr = cur_sp - 4; s_val = ax & mask
         elif op == isa.JSR:
-            is_store = True; s_addr = cur_sp - 4; s_val = (cur_pc + 1) & 0xFF
+            is_store = True; s_addr = cur_sp - 4; s_val = (cur_pc + 1) & 0xFFFFFFFF
         elif op == isa.ENT:
             is_store = True; s_addr = cur_sp - 4; s_val = cur_bp & 0xFFFFFFFF
         frame = _build_frame(pc, ax, sp, bp, stk,
                              mem_addr=(s_addr if is_store else 0),
                              mem_val=(s_val if is_store else 0))
-        trace.append(ax & 0xFF)
+        trace.append(ax & mask)
         frame_idx += 1
         if is_store:
             store_log[frame_idx] = (s_addr, s_val)
