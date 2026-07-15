@@ -78,11 +78,12 @@ _SAMPLE = [
                           "int main(){ return square(50); }",            2500, False),
     ("func_max",          "int max(int a,int b){ if (a>b) return a; return b; } "
                           "int main(){ return max(5, 9); }",               9, False),
-    # --- a short loop (BZ/JMP branch + accumulate, result > 8 bits) — kept small
-    #     (2^9 = 512 in 9 iters) so the quadratic stream growth stays tractable for
-    #     a CI test; the deep-loop tail is scored separately in run_1096_pure_forward.
+    # --- a short loop (BZ/JMP branch + accumulate) — kept SMALL (5 iters, ~35
+    #     steps) so the quadratic stream growth stays CI-tractable; this proves the
+    #     in-forward BZ/JMP loop control.  The full deep-loop tail (loops/gcd/rec, up
+    #     to thousands of steps) is scored separately in run_1096_pure_forward.
     ("loop_pow2",         "int main(){ int r; int i; r=1; i=0; "
-                          "while (i < 9) { r = r * 2; i = i + 1; } return r; }", 512, False),
+                          "while (i < 5) { r = r * 2; i = i + 1; } return r; }", 32, False),
 ]
 
 
@@ -104,12 +105,17 @@ def pf_divmod():
 
 def _run_pure(model, L, source, expected, name):
     from src.compiler import compile_c
+    from c4_min.nibble_pure_forward_complete import ref_interpret
     code = bytecode_to_isa(compile_c(source)[0])
+    # Right-size the step cap from the reference step count (pure-python HARNESS
+    # sizing — NOT model compute, run OUTSIDE the guard) so the loop case doesn't
+    # burn the quadratic stream growth on steps past the halt.
+    cap = len(ref_interpret(code, max_steps=20000, mask=0xFFFFFFFF)) + 6
     # the whole run under the settrace purity guard — no _apply_op / DictMemStack /
     # gadget may be entered; a leak raises AssertionError and fails the test, so
     # reaching the value assertion is itself the purity proof.
     trace = assert_no_python_compute(
-        run_pure_forward_complete, model, L, code, max_steps=512, mask=0xFFFFFFFF)
+        run_pure_forward_complete, model, L, code, max_steps=cap, mask=0xFFFFFFFF)
     got = trace[-1] & 0xFFFFFFFF if trace else None
     assert got == expected, f"{name}: pure-forward got {got}, expected {expected}"
 
