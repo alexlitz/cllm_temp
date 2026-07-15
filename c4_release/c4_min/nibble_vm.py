@@ -50,7 +50,7 @@ scalar next-state back into the nibble bands.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn.functional as F

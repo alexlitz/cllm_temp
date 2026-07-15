@@ -26,11 +26,11 @@ needs is derived from those nibbles *within a step* and does not persist:
     ``OP_VAL``    — fetched scalar opcode (= Σ_i PC_IS[i]*CODE_OP[i]).
     ``IMM``       — fetched scalar immediate.
     ``OP_IS[op]`` — decoded opcode one-hot (exact pulse of ``OP_VAL``).
-    ``NEXT_*``    — the scalar next-state the dispatch writes (recomposed to
-                    nibbles by the emit stage). Kept separate from the value
-                    lanes so a dispatch write and its nibble recompose don't
-                    fight inside one additive-residual block.
     ``HALTED``    — latched by HALT; drives the run loop's stop + HALT token.
+
+    Dispatch writes the next-state directly into the value lanes (SET semantics);
+    the driver's frame round-trip (``nibble_vm._emit_and_reembed``) writes those
+    scalars back into the canonical nibble bands. No separate NEXT_* lanes.
 
 The residual is one position wide per VM step (the step-block is applied
 recurrently by the vanilla token round-trip driver); attention is only used for
@@ -94,13 +94,10 @@ class NibbleVMLayout:
         self.IMM = self._scalar("IMM")
         self.OP_IS = self._band("OP_IS", isa.NUM_OPS)   # decoded opcode one-hot
 
-        # --- dispatch next-state (scalar; recomposed to nibbles at emit) ------
-        self.NEXT_PC = self._scalar("NEXT_PC")
-        self.NEXT_AX = self._scalar("NEXT_AX")
-        self.NEXT_SP = self._scalar("NEXT_SP")
-        self.NEXT_BP = self._scalar("NEXT_BP")
-        self.NEXT_STK = self._scalar("NEXT_STK")
-
+        # The dispatch writes the next-state directly into the value lanes above
+        # (SET semantics, per universal.py); the driver's frame round-trip
+        # (nibble_vm._emit_and_reembed) writes those scalars back into the nibble
+        # bands. No separate NEXT_* lanes are needed.
         self.HALTED = self._scalar("HALTED")
         self.ONE = self._scalar("ONE")                  # constant 1.0 lane
 
@@ -129,15 +126,15 @@ class NibbleVMLayout:
     def band(self, name: str):
         return self._names[name]
 
-    # value-lane / nibble-band pairing used by the recompose + emit stages.
+    # (nibble_base, value_lane) for each register the VM carries — used by the
+    # recompose bridge and the driver's frame round-trip.
     def reg_pairs(self):
-        """(nibble_base, value_lane, next_lane) for each register the VM carries."""
         return [
-            (self.PC, self.PC_VAL, self.NEXT_PC),
-            (self.AX, self.AX_VAL, self.NEXT_AX),
-            (self.SP, self.SP_VAL, self.NEXT_SP),
-            (self.BP, self.BP_VAL, self.NEXT_BP),
-            (self.STACK0, self.STK_VAL, self.NEXT_STK),
+            (self.PC, self.PC_VAL),
+            (self.AX, self.AX_VAL),
+            (self.SP, self.SP_VAL),
+            (self.BP, self.BP_VAL),
+            (self.STACK0, self.STK_VAL),
         ]
 
     def __repr__(self) -> str:
