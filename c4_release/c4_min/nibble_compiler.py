@@ -554,6 +554,181 @@ def build_compiler_step(code_size: int, src_size: int, mem_size: int = 0,
     return model, L
 
 
+# ============================================================================ #
+#  COMPILER IN THE WEIGHTS: the hybrid baked fetch                             #
+# ============================================================================ #
+
+def compile_hybrid_word_select(L: Layout, gen_code: List[isa.Instr], dim: int):
+    """Hybrid WORD select — the COMPILER lives in the WEIGHTS, produced code in mem.
+
+        WORD = Σ_{i<GEN} PC_IS[i]·word_i(BAKED constant)          # compiler code
+             + Σ_{i>=GEN} PC_IS[i]·CODE_WORD[i](DATA memory)       # produced code
+
+    For the compiler's own slots (``i < len(gen_code)``) the instruction word
+    ``word_i = op_i | imm_i<<8`` is a CONSTANT baked into the weights (it rides the
+    unit's constant gate bias, gated on the ``PC_IS[i]`` detector) — the spec's
+    read-only code segment. For the produced slots (``i >= GEN``) the word is read
+    from the writable ``CODE_WORD`` data band exactly like ``compile_word_select``,
+    so EMIT can fill it at runtime. There is NO compiler bytecode in the input
+    state; ``initial_state_baked`` writes only the SOURCE.
+
+    So a single fetch dots the PC one-hot against a code table that is HALF weights
+    (the compiler) and HALF memory (the program it produces). WORD self-clears
+    first (SET). Precision: exact power-of-two ``POW2=256`` normaliser.
+    """
+    n = L.CODE_SIZE
+    gen = len(gen_code)
+    POW2 = 256.0                                  # silu(256)=256 exactly; 1/256 exact
+    # gen baked-word units + (n-gen) memory-product units + 1 self-clear
+    n_units = n + 1
+    W_up = torch.zeros(n_units, dim); b_up = torch.zeros(n_units)
+    W_gate = torch.zeros(n_units, dim); b_gate = torch.zeros(n_units)
+    W_down = torch.zeros(dim, n_units); b_down = torch.zeros(dim)
+    for i in range(n):
+        if i < gen:
+            # BAKED: WORD += PC_IS[i] * word_i  (word_i is a constant on the gate
+            # bias). EXACT power-of-two normaliser: silu(256*PC_IS[i]) = 256 iff
+            # PC==i, gate = word_i constant, down = 1/256 -> WORD += word_i (exact,
+            # 256*65535 < 2**24). Using silu(60)/60 here injected a WORD-proportional
+            # residue that flipped the produced word's low byte (0x201 -> 0x200).
+            word_i = float((gen_code[i].op & 0xFF) | ((gen_code[i].imm & 0xFF) << 8))
+            W_up[i, L.PC_IS[i]] = POW2           # detector: silu(256)=256 iff PC==i
+            b_gate[i] = word_i                   # gate = constant baked word
+            W_down[L.WORD, i] += 1.0 / POW2
+        else:
+            # MEMORY: WORD += PC_IS[i] * CODE_WORD[i]  (the produced program)
+            W_up[i, L.PC_IS[i]] = POW2            # silu(256)=256; gate on PC one-hot
+            W_gate[i, L.CODE_WORD[i]] = 1.0
+            W_down[L.WORD, i] += 1.0 / POW2
+    # self-clear WORD (SET)
+    W_up[n, L.ONE] = POW2
+    W_gate[n, L.WORD] = 1.0
+    W_down[L.WORD, n] += -1.0 / POW2
+    return {"W_up": W_up, "b_up": b_up, "W_gate": W_gate, "b_gate": b_gate,
+            "W_down": W_down, "b_down": b_down}
+
+
+def build_baked_compiler_step(gen_code: List[isa.Instr], code_size: int,
+                              src_size: int, mem_size: int = 0,
+                              stack_depth: int = 8, n_heads: int = 4,
+                              max_pos: int = 4):
+    """The COMPILER-IN-WEIGHTS model. Identical to ``build_compiler_step`` except
+    the code-fetch block is the HYBRID baked/memory word-select: the compiler
+    bytecode ``gen_code`` is baked into the WEIGHTS, the produced program is read
+    from CODE_WORD memory. The input state carries ONLY the C source — no compiler
+    bytecode anywhere in the data. Returns ``(model, L)``.
+    """
+    from .stack import compile_sp_fetch, compile_stack0_select
+    L = build_compiler_layout(code_size, src_size, mem_size=mem_size,
+                              stack_depth=stack_depth, n_heads=n_heads)
+    L.GEN_SIZE = len(gen_code)
+    dim = L.D
+
+    ffn_specs = [
+        U.compile_fetch_select(L, dim),
+        compile_hybrid_word_select(L, gen_code, dim),     # <-- compiler in WEIGHTS
+        U.compile_word_decode_imm(L, dim),
+        U.compile_word_decode_op(L, dim),
+        U.compile_opcode_decode(L, dim),
+        compile_sp_fetch(L.SP, L.STACK, L.SP_IS, L.STACK0, L.ONE, dim),
+        compile_stack0_select(L.STACK, L.SP_IS, L.STACK0, L.ONE, dim),
+        compile_store_addr_onehot(L, dim),
+        compile_ax_addr_onehot(L, dim),
+        compile_mem_store_addr_onehot(L, dim),
+        compile_ffn(compiler_dispatch_rules(L), dim),
+        compile_mul_dispatch(L, dim),
+        compile_lc_source_read(L, dim),
+        compile_li_mem_read(L, dim),
+        compile_si_mem_store(L, dim),
+        compile_emit_store(L, dim),
+        U.compile_branch_delta(L, dim),
+        compile_fold(L.AX, L.ONE, dim, modulus=256),
+        compile_ffn([
+            FFNRule([(L.ONE, 0.5, 1.5)], {L.OUT_SLOTS[0]: LinearExpr.of(L.AX, 1.0)
+                                          + LinearExpr.of(L.OUT_SLOTS[0], -1.0)}),
+            FFNRule([(L.ONE, 0.5, 1.5)], {L.HALT_SEEN[0]: LinearExpr.of(L.HALTED, 1.0)
+                                          + LinearExpr.of(L.HALT_SEEN[0], -1.0)}),
+        ], dim),
+    ]
+    n_blocks = len(ffn_specs)
+    hidden = max(f["W_up"].shape[0] for f in ffn_specs)
+    model = Transformer(dim=dim, n_heads=n_heads, hidden=hidden,
+                        n_blocks=n_blocks, max_pos=max_pos, vocab=VOCAB)
+    with torch.no_grad():
+        model.embed.zero_()
+        model.embed[0, L.ONE] = 1.0
+        for blk, spec in zip(model.blocks, ffn_specs):
+            _zero_attn(blk.attn)
+            _load_ffn(blk.ffn, spec, hidden)
+        _load_head(model, L)
+    return model, L
+
+
+def initial_state_baked(model, L, src: List[int]) -> torch.Tensor:
+    """Initial state for the BAKED compiler: ONLY the C source in the SRC band.
+
+    THE PROOF SURFACE: unlike ``load_program`` (which writes the compiler bytecode
+    into CODE_WORD), this writes NO compiler bytecode — the compiler is entirely in
+    the weights. CODE_WORD starts all-zero (the produced program is not there; it
+    is EMITted at runtime). Only the source is input.
+    """
+    assert len(src) <= L.SRC_SIZE
+    state = model.embed[0].clone()
+    for i, ch in enumerate(src):
+        state[L.SRC[i]] = float(ch & 0xFF)
+    return state
+
+
+def run_baked_compiler(model, L, src: List[int], max_steps: int = 8192,
+                       requantize: bool = True, return_code: bool = False):
+    """Run the COMPILER-IN-WEIGHTS on C ``src`` — with NO compiler bytecode in the
+    input state (only the source). The weights ARE the compiler."""
+    W, b = head_matrix(L, model.dim, L.OUT_SLOTS[0], halt_band=None)
+    halt_seen = L.HALT_SEEN[0]
+    state = initial_state_baked(model, L, src)
+    trace: List[int] = []
+    for _ in range(max_steps):
+        state = _step_once(model, state)
+        if requantize:
+            state = _requantize(state, L)
+        logits = F.linear(state, W, b)
+        trace.append(int(logits.argmax().item()))
+        if float(state[halt_seen]) > 0.5:
+            break
+    if return_code:
+        words = [int(round(float(state[L.CODE_WORD[i]]))) for i in range(L.CODE_SIZE)]
+        return trace, words
+    return trace
+
+
+class BakedCompilerMachine:
+    """A C COMPILER that IS a transformer: the compiler bytecode is baked into the
+    WEIGHTS. Feed only the C source; the weights read it, emit bytecode into memory,
+    and run it — no compiler bytecode anywhere in the input.
+
+        bcm = BakedCompilerMachine(expr_compiler_bytecode(), code_size=176, src_size=8)
+        bcm.run("2+3*4")   # -> trace[-1] == 14, with NO bytecode in the input
+    """
+
+    def __init__(self, prog, code_size: int, src_size: int, mem_size: int = 8,
+                 stack_depth: int = 8, n_heads: int = 4):
+        self.gen_code = _assemble(prog)
+        self.code_size = code_size
+        self.model, self.L = build_baked_compiler_step(
+            self.gen_code, code_size, src_size, mem_size=mem_size,
+            stack_depth=stack_depth, n_heads=n_heads)
+
+    def run(self, source, max_steps: int = 8192, requantize: bool = True,
+            return_code: bool = False):
+        return run_baked_compiler(self.model, self.L, _source_bytes(source),
+                                  max_steps=max_steps, requantize=requantize,
+                                  return_code=return_code)
+
+    @property
+    def n_blocks(self) -> int:
+        return len(self.model.blocks)
+
+
 # --------------------------------------------------- reference interpreter -----
 
 def interpret_full(code: List[isa.Instr], src: List[int], code_size: int,
