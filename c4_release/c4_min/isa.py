@@ -13,20 +13,24 @@ MASK = 0xFF          # 8-bit value mask
 WIDTH = 2            # cells per instruction slot: [opcode, imm]
 NUM_OPS = 40        # size of the opcode one-hot band (covers all values below)
 
-# Opcode values (subset of the C4 ISA; 8-bit only).
-LEA, IMM, JMP, JSR, BZ, BNZ, ENT, LEV = 0, 1, 2, 3, 4, 5, 6, 8
-LI, SI, PSH = 9, 11, 13
+# Opcode values (subset of the C4 ISA). Values match neural_vm.embedding.Opcode.
+LEA, IMM, JMP, JSR, BZ, BNZ, ENT, ADJ, LEV = 0, 1, 2, 3, 4, 5, 6, 7, 8
+LI, LC, SI, SC, PSH = 9, 10, 11, 12, 13
 OR, XOR, AND = 14, 15, 16
 EQ, NE, LT, GT, LE, GE = 17, 18, 19, 20, 21, 22
 SHL, SHR = 23, 24
 ADD, SUB = 25, 26
+MUL, DIV, MOD = 27, 28, 29
+NOP = 39
 HALT = 38  # alias EXIT
 
 NAMES = {
     LEA: "LEA", IMM: "IMM", JMP: "JMP", JSR: "JSR", BZ: "BZ", BNZ: "BNZ",
-    ENT: "ENT", LEV: "LEV", LI: "LI", SI: "SI", PSH: "PSH", OR: "OR",
+    ENT: "ENT", ADJ: "ADJ", LEV: "LEV", LI: "LI", LC: "LC", SI: "SI",
+    SC: "SC", PSH: "PSH", OR: "OR",
     XOR: "XOR", AND: "AND", EQ: "EQ", NE: "NE", LT: "LT", GT: "GT",
     LE: "LE", GE: "GE", SHL: "SHL", SHR: "SHR", ADD: "ADD", SUB: "SUB",
+    MUL: "MUL", DIV: "DIV", MOD: "MOD", NOP: "NOP",
     HALT: "HALT",
 }
 BY_NAME = {v: k for k, v in NAMES.items()}
@@ -42,11 +46,17 @@ class Instr:
 
 
 def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
-    """Turn [(name, imm), ...] into a code table of Instr."""
+    """Turn [(name, imm), ...] into a code table of Instr.
+
+    The immediate is kept at its full 32-bit width: a value literal (``IMM``/
+    ``LEA``) can be a multi-byte constant and a jump/branch/call immediate is a
+    PC target that may exceed one byte. The per-op mod-fold (if any) is applied
+    at execution in ``_apply_op``, not here.
+    """
     out = []
     for entry in prog:
         name, imm = (entry if isinstance(entry, tuple) else (entry, 0))
-        out.append(Instr(BY_NAME[name], imm & MASK))
+        out.append(Instr(BY_NAME[name], imm & 0xFFFFFFFF))
     return out
 
 
@@ -90,6 +100,12 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256):
             ax = (pop() + ax) & MASK
         elif op == SUB:
             ax = (pop() - ax) & MASK
+        elif op == MUL:
+            ax = (pop() * ax) & MASK
+        elif op == DIV:
+            v = pop(); ax = (v // ax if ax else 0) & MASK
+        elif op == MOD:
+            v = pop(); ax = (v % ax if ax else 0) & MASK
         elif op == AND:
             ax = pop() & ax
         elif op == OR:

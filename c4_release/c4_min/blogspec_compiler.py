@@ -122,36 +122,48 @@ def _mod16(x: float) -> tuple:
     return low, ge16
 
 
-def nibble_add_gadget(a: int, b: int) -> int:
-    """8-bit ``a + b`` computed nibble-by-nibble through the SwiGLU add + fold
-    primitives (BLOG_SPEC §Basic Arithmetic, §Addition Implementation), with an
-    8-bit wrap. No python arithmetic on the values and NO rounding — every step
-    is silu-based, and the nibble sums (<=30) are exact in fp32.
+def nibble_add_gadget(a: int, b: int, width_nibbles: int = 2) -> int:
+    """``a + b`` computed nibble-by-nibble through the SwiGLU add + fold
+    primitives (BLOG_SPEC §Basic Arithmetic, §Addition Implementation), with a
+    ``2**(4*width_nibbles)`` wrap. No python arithmetic on the values and NO
+    rounding — every step is silu-based, and the nibble sums (<=30) are exact in
+    fp32.
+
+    ``width_nibbles`` defaults to 2 (the 8-bit foundation proof — nibbles 0,1).
+    The fan-out value ops (§Comparisons/§Bitwise/§Mul-Div) call it with
+    ``width_nibbles=8`` for the full 32-bit ripple (the corpus's multi-byte
+    immediates/products need the wider adder). The carry ripple is identical at
+    any width; only the number of nibble stages and the final mask change.
     """
-    an, bn = V.nibbles_of_byte(a), V.nibbles_of_byte(b)
+    an = V.nibbles_of_value(a, width_nibbles)
+    bn = V.nibbles_of_value(b, width_nibbles)
     carry = 0.0
     nibs = []
-    for j in range(2):
+    for j in range(width_nibbles):
         s = _add_pos(_add_pos(float(an[j]), float(bn[j])), carry)  # a_j+b_j+carry
         low, carry = _mod16(s)                                     # nibble + carry
         nibs.append(low)
-    # reassemble byte = low_nibble + 16 * high_nibble (values already exact ints).
-    val = float(nibs[0]) + 16.0 * float(nibs[1])
-    return int(val) & 0xFF
+    # reassemble value = Σ_j 16**j · nibble_j (values already exact ints).
+    val = 0.0
+    for j in range(width_nibbles):
+        val += float(nibs[j]) * (16.0 ** j)
+    return int(val) & ((1 << (4 * width_nibbles)) - 1)
 
 
-def nibble_sub_gadget(a: int, b: int) -> int:
-    """8-bit ``a - b`` (two's-complement wrap): computed as (a + (256-b)) mod 256
-    through the same add+fold gadget, so subtraction also runs the SwiGLU
-    primitive path (§Basic Arithmetic: "subtraction naturally can work
-    similarly"). No python subtraction on the values."""
-    # 256 - b is a constant complement; adding it and dropping the byte-9 carry
-    # yields the two's-complement difference. Use the byte adder then wrap.
-    comp = (256 - b) & 0x1FF
-    total = a + comp                     # in [0, 511]
-    # fold mod 256 via the clamped-relu (x>=256) subtract, exact-integer.
-    ge = _relu(float(total) - 255.0) - _relu(float(total) - 256.0)
-    return int(float(total) - 256.0 * ge) & 0xFF
+def nibble_sub_gadget(a: int, b: int, width_nibbles: int = 2) -> int:
+    """``a - b`` (two's-complement wrap): computed as ``(a + (M-b)) mod M`` with
+    ``M = 2**(4*width_nibbles)`` through the same add+fold ripple, so subtraction
+    also runs the SwiGLU primitive path (§Basic Arithmetic: "subtraction
+    naturally can work similarly"). No python subtraction on the values.
+
+    ``width_nibbles`` defaults to 2 (8-bit foundation); the fan-out ops widen it
+    to 8 (32-bit) so multi-byte minuends/subtrahends don't truncate.
+    """
+    M = 1 << (4 * width_nibbles)
+    # M - b is the constant complement; the wider adder ripples the borrow and the
+    # final mask drops the overflow carry, yielding the two's-complement diff.
+    comp = (M - (b & (M - 1))) & (2 * M - 1)
+    return nibble_add_gadget(a & (M - 1), comp & (M - 1), width_nibbles)
 
 
 def build_step_model(prog, n_heads: int = 4):
