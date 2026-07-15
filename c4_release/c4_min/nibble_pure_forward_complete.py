@@ -70,6 +70,14 @@ from .blogspec_memory import ADDR_BITS
 # opcode value for ADJ / LC / SC / NOP (canonical C4 values; base isa lacks ADJ).
 ADJ = isa.ADJ if hasattr(isa, "ADJ") else 7
 
+# Number of nibbles the STATIC immediate-nibble program encoding carries per slot.
+# The corpus's largest VALUE literal is < 10^4 (< 16^4); 5 nibbles (< 16^5 ≈ 1.05M)
+# is generous headroom while keeping the CODE_IMM_NIB band (code_size × IMM_NIBS)
+# small (each extra nibble/slot inflates the model residual dim — the wall-time and
+# memory driver).  A COMPUTED result (e.g. factorial) uses the full 8 AX nibbles via
+# the ALU; only the IMM LITERAL is bounded here.
+IMM_NIBS = 5
+
 
 # ===========================================================================
 # The op groups (the stack contract).
@@ -110,6 +118,14 @@ class PureForwardCompleteLayout(PureForwardLayout):
         self.LEV_RET_VAL = self._scalar("LEV_RET_VAL")        # its scalar image
         self.AXB_LO = self._scalar("AXB_LO")                  # AX_VAL low nibble scratch
         self.AXB_HI = self._scalar("AXB_HI")                  # AX_VAL high nibble scratch
+        # FULL 32-bit IMM: the immediate's 8 nibbles are part of the STATIC program
+        # encoding (CODE_IMM_NIB[i][j], written by the overlay from the bytecode —
+        # a pure re-encoding of the constant, no runtime compute), gathered at PC
+        # into IMM_NIB by the same PC-one-hot product-select as the scalar IMM, and
+        # written verbatim into the 8 AX nibbles on IMM so literals > 255 survive.
+        self.CODE_IMM_NIB = [self._band(f"CODE_IMM_NIB_{i}", IMM_NIBS)
+                             for i in range(code_size)]
+        self.IMM_NIB = self._band("IMM_NIB", IMM_NIBS)        # fetched immediate nibbles
         while self._off % n_heads != 0:
             self._scalar(f"_pfcpad{self._off}")
         self.D = self._off
@@ -416,6 +432,9 @@ def callconv_dispatch_rules(L) -> List[FFNRule]:
     # ADJ n: SP += 4*imm ; PC += 1.
     rules.append(FFNRule([(L.OP_IS + ADJ, 0.5, 1.5)], {
         sp: LinearExpr.of(imm, 4.0), pc: LinearExpr.c(1.0)}))
+    # NOP: PC += 1 (no state change).  The compiler emits NOP for alignment/padding;
+    # without this rule the PC never advances past a NOP and the VM spins forever.
+    rules.append(FFNRule([(L.OP_IS + isa.NOP, 0.5, 1.5)], {pc: LinearExpr.c(1.0)}))
     # LEA o: AX = (BP + 4*imm) & 0xFF ; PC += 1.  imm is the SLOT offset; *4 gives a
     # byte address matching the SP/BP byte-addressing.  Add BP's LOW BYTE only (the
     # 8-bit op masks &0xFF, and BP's higher bytes vanish mod 256) so the downstream
@@ -463,7 +482,8 @@ def compile_opcode_decode_pfc(L, dim: int) -> Dict[str, torch.Tensor]:
                      [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] +
                      [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR] +
                      [isa.MUL, isa.DIV, isa.MOD] +
-                     [isa.JSR, isa.ENT, ADJ, isa.LEV]))    # + calling convention
+                     [isa.JSR, isa.ENT, ADJ, isa.LEV] +      # + calling convention
+                     [isa.NOP]))                             # + NOP (PC += 1 no-op)
     return compile_opcode_decode_ops(L, dim, ops)
 
 
@@ -516,6 +536,46 @@ def compile_ax_byte_to_nibbles(L, dim: int, ops) -> Dict[str, torch.Tensor]:
             spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
             spec["W_gate"][u, src] = 1.0
             spec["W_down"][L.AX + nb, u] += 1.0 / SILU_HALF; u += 1
+    return spec
+
+
+def compile_imm_nib_fetch(L, dim: int) -> Dict[str, torch.Tensor]:
+    """IMM_NIB[j] = Σ_i PC_IS[i]·CODE_IMM_NIB[i][j]  (j=0..7) — the same bilinear
+    PC-one-hot product-select the scalar-IMM fetch uses, applied to the immediate's
+    8 static program-data nibbles.  Self-clears IMM_NIB first (SET)."""
+    n = L.code_size
+    spec = _empty_spec(dim, IMM_NIBS + n * IMM_NIBS)
+    u = 0
+    for j in range(IMM_NIBS):                        # self-clear IMM_NIB (SET)
+        spec["W_up"][u, L.ONE] = S
+        spec["W_gate"][u, L.IMM_NIB + j] = 1.0
+        spec["W_down"][L.IMM_NIB + j, u] += -1.0 / SILU_S
+        u += 1
+    for i in range(n):
+        for j in range(IMM_NIBS):
+            spec["W_up"][u, L.PC_IS[i]] = S
+            spec["W_gate"][u, L.CODE_IMM_NIB[i] + j] = 1.0
+            spec["W_down"][L.IMM_NIB + j, u] += 1.0 / SILU_S
+            u += 1
+    return spec
+
+
+def compile_imm_ax_nibbles(L, dim: int) -> Dict[str, torch.Tensor]:
+    """On IMM, SET all 8 AX nibbles = IMM_NIB (the fetched immediate nibbles), so a
+    full 32-bit literal lands in the canonical AX nibble band.  Gated on OP_IS[IMM].
+    Runs AFTER the byte-nib writeback (which only wrote nibbles 0,1) and overwrites
+    all 8 with the full value."""
+    spec = _empty_spec(dim, 8 + IMM_NIBS)
+    u = 0
+    g = L.OP_IS + isa.IMM
+    for j in range(8):                              # clear ALL 8 AX nibbles gated
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.AX + j] = 1.0
+        spec["W_down"][L.AX + j, u] += -1.0 / SILU_HALF; u += 1
+    for j in range(IMM_NIBS):                        # + IMM_NIB[j] into AX[j] (rest 0)
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.IMM_NIB + j] = 1.0
+        spec["W_down"][L.AX + j, u] += 1.0 / SILU_HALF; u += 1
     return spec
 
 
@@ -584,6 +644,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("pc-fetch",    compile_pc_fetch(L, dim)),
         ("code-select", compile_code_select(L, dim)),
         ("opcode-decode", compile_opcode_decode_pfc(L, dim)),  # + JSR/ENT/ADJ/LEV
+        ("imm-nib-fetch", compile_imm_nib_fetch(L, dim)),      # IMM_NIB <- CODE_IMM_NIB@PC
         ("mem-prep", compile_mem_prep(L, dim)),
         ("mem-cam",  compile_nibble_to_scalar(L, dim)),          # ATTN=LI head
         ("pop-addr", compile_pop_addr(L, dim)),                  # POP_ADDR/LEV_ADDR
@@ -618,11 +679,14 @@ def build_pure_forward_complete_model(code_size: int = 32,
     disp_rules += alu32_housekeeping_rules(L)
     if include_bitwise:
         disp_rules += _bitwise_pop_rules(L)
-    # ops whose AX result is a BYTE written into AX_VAL by the dispatch: IMM/LEA +
-    # cmp + bitwise + LI/LC (the memory head writes AX nibbles for LI, but a byte-
-    # value writeback of AX_VAL is idempotent for it too).  These get a byte->nibble
-    # writeback so the AX nibble band is canonical (the driver decodes AX from it).
-    byte_ax_ops = [isa.IMM, isa.LEA, isa.LI, isa.LC] + \
+    # ops whose AX result is a BYTE recomposed from AX_VAL by the byte-nib writeback
+    # (so the AX nibble band is canonical, the driver decodes AX from it): IMM/LEA +
+    # cmp + bitwise.  NOTE: LI/LC are EXCLUDED — the memory KV head writes their AX
+    # nibbles DIRECTLY with the full 32-bit loaded value, and the byte-nib block reads
+    # AXB_LO/HI off the STEP-INPUT AX_VAL (the OLD AX, recomposed at block 0 before
+    # the head ran), so including LI/LC would clobber the loaded value with the stale
+    # low byte.  A loaded 32-bit int (e.g. a variable holding 1000) must survive whole.
+    byte_ax_ops = [isa.IMM, isa.LEA] + \
                   [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE]
     if include_bitwise:
         byte_ax_ops += [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
@@ -632,6 +696,10 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("fold-lea", _fold_ax_gated(L, dim, [isa.LEA])),  # LEA masks &0xFF; ALU 32-bit
         ("ax-nib-split", compile_ax_nib_split(L, dim)),   # AX_VAL byte -> AXB_LO/HI
         ("ax-byte-nib", compile_ax_byte_to_nibbles(L, dim, byte_ax_ops)),
+        # FULL 32-bit IMM: overwrite ALL 8 AX nibbles with the fetched immediate
+        # nibbles (the byte-nib block above only set nibbles 0,1) so literals > 255
+        # (corpus values up to ~10000) survive into the canonical AX nibble band.
+        ("imm-ax-nib", compile_imm_ax_nibbles(L, dim)),
     ]
     n_blocks = len(block_specs)
     hidden = max(f["W_up"].shape[0] for _, f in block_specs)
@@ -802,6 +870,10 @@ def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
             for k, ins in enumerate(code):
                 x[0, i, L.CODE_OP[k]] = float(ins.op)
                 x[0, i, L.CODE_IMM[k]] = float(ins.imm)
+                # the immediate's low IMM_NIBS nibbles are part of the STATIC program
+                # encoding (a pure re-encoding of the constant, gathered at PC).
+                for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                    x[0, i, L.CODE_IMM_NIB[k] + j] = float(nv)
         pos = 1
         frame_idx = 0
         while pos + V.FRAME_LEN <= Sn:
