@@ -542,10 +542,18 @@ def _fold_ax_gated(L, dim: int, ops) -> Dict[str, torch.Tensor]:
 # BUILD the complete pure-forward model.
 # ===========================================================================
 def build_pure_forward_complete_model(code_size: int = 32,
-                                      include_bitwise: bool = True):
+                                      include_bitwise: bool = True,
+                                      include_divmod: bool = True):
     """Assemble the complete pure-forward VM: frame ingest + LI/LC KV head +
     stack-pop KV head + the 32-bit ALU FFN blocks + callconv, all as persistent
-    weights applied by ``model.forward``.  Returns ``(model, L)``."""
+    weights applied by ``model.forward``.  Returns ``(model, L)``.
+
+    ``include_divmod`` (default True) folds the base-16 long-division DIV/MOD
+    blocks (262 blocks — the dominant cost and the memory/time hazard the deliver-
+    able flags).  Set False for a LEAN model (36 blocks, ~10x faster forward) that
+    keeps the multi-slot stack + callconv + ADD/SUB/MUL + cmp/bitwise/memory; only
+    DIV/MOD are then unsupported (their RES band stays unfilled).  The corpus
+    values are <=9999 so the 8-bit-masked byte trace needs no 32-bit division."""
     n_heads = N_ROLES + 3          # 20 ingest + LI head + stack-pop head + lev head
     L = PureForwardCompleteLayout(code_size, n_heads=n_heads)
     A.extend_layout_for_alu32(L)               # ALU scratch bands
@@ -589,9 +597,11 @@ def build_pure_forward_complete_model(code_size: int = 32,
         block_specs.append((name, spec))
     for name, spec in A.compile_mul_blocks(L, dim):
         block_specs.append((name, spec))
-    for name, spec in A.compile_divmod_blocks(L, dim):
-        block_specs.append((name, spec))
-    block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=ALU_OPS)))
+    if include_divmod:                             # 262 blocks — LEAN skips these
+        for name, spec in A.compile_divmod_blocks(L, dim):
+            block_specs.append((name, spec))
+    mux_ops = ALU_OPS if include_divmod else [isa.ADD, isa.SUB, isa.MUL]
+    block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=mux_ops)))
     if include_bitwise:
         from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
         for name, spec in build_bitwise_blocks(L, dim):
