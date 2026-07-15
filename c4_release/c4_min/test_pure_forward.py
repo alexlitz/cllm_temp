@@ -26,7 +26,7 @@ PROOF_PROG = [("IMM", 6), ("PSH", 0), ("IMM", 7), ("ADD", 0), ("HALT", 0)]
 
 
 def _build(code_size=16):
-    return build_pure_forward_model(code_size=code_size)
+    return build_pure_forward_model(code_size=code_size, include_memory=False)
 
 
 # --- the frame-ingest attention reconstructs the register state from the stream --
@@ -93,9 +93,49 @@ def test_token_stream_is_the_state():
 
 
 def test_one_head_per_register_byte():
-    """The ingest uses exactly one gather head per (register, byte) = 20 heads."""
-    model, L = _build()
-    assert model.blocks[0].attn.n_heads == N_ROLES == 20
+    """The ingest uses exactly one gather head per (register, byte) = 20 heads;
+    the memory build adds one §Memory KV head (21 total)."""
+    model_off, _ = build_pure_forward_model(code_size=16, include_memory=False)
+    assert model_off.blocks[0].attn.n_heads == N_ROLES == 20
+    model_on, _ = build_pure_forward_model(code_size=16, include_memory=True)
+    assert model_on.blocks[0].attn.n_heads == N_ROLES + 1 == 21
+
+
+# --- M3: memory in KV — LI/SI via softmax1-KV attention over the emitted MEM tokens
+def _build_mem(code_size=20):
+    return build_pure_forward_model(code_size=code_size, include_memory=True)
+
+
+def test_store_then_load_pure_forward():
+    """A store-then-load runs pure-forward: the store DATA rides in the emitted MEM
+    token in the stream, the load VALUE is retrieved by the model's KV attention."""
+    model, L = _build_mem()
+    prog = [("IMM", 0x40), ("PSH", 0), ("IMM", 42), ("SI", 0),
+            ("IMM", 0x40), ("LI", 0), ("HALT", 0)]
+    code = isa.assemble(prog)
+    trace = assert_no_python_compute(run_pure_forward, model, L, code)
+    assert trace == isa.interpret(code), (trace, isa.interpret(code))
+    assert trace[-1] == 42
+
+
+def test_memory_zfod_latest_wins_two_addr():
+    """ZFOD (unwritten reads 0), latest-write-wins, and cross-address, all pure."""
+    model, L = _build_mem()
+    cases = {
+        "zfod": ([("IMM", 0x40), ("PSH", 0), ("IMM", 42), ("SI", 0),
+                  ("IMM", 0x80), ("LI", 0), ("HALT", 0)], 0),
+        "latest": ([("IMM", 0x40), ("PSH", 0), ("IMM", 42), ("SI", 0),
+                    ("IMM", 0x40), ("PSH", 0), ("IMM", 99), ("SI", 0),
+                    ("IMM", 0x40), ("LI", 0), ("HALT", 0)], 99),
+        "two_addr": ([("IMM", 0x40), ("PSH", 0), ("IMM", 11), ("SI", 0),
+                      ("IMM", 0x44), ("PSH", 0), ("IMM", 22), ("SI", 0),
+                      ("IMM", 0x44), ("LI", 0), ("HALT", 0)], 22),
+    }
+    for name, (prog, exp) in cases.items():
+        code = isa.assemble(prog)
+        trace = assert_no_python_compute(run_pure_forward, model, L, code)
+        assert trace == isa.interpret(code), (name, trace, isa.interpret(code))
+        assert trace[-1] == exp, (name, trace[-1], exp)
 
 
 if __name__ == "__main__":

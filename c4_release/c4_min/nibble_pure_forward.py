@@ -93,6 +93,12 @@ class PureForwardLayout(NibbleVMLayout):
                              ingest query for that slot carries the same one-hot.
       ``IS_FRAME_BYTE`` (1)— 1.0 on real frame byte tokens (KV candidates); 0 on
                              markers / the query row (query-exclusion penalty).
+
+    KV-memory bands (§Memory softmax1 CAM over the emitted store frames):
+      ``ADDR_BIN`` (32)    — store address bits (KEY) on a store frame's MEM token.
+      ``QRY_BIN``  (32)    — load address bits (QUERY) on the load step's query row.
+      ``VAL_NIB``  (16)    — store value nibbles (VALUE) on a store frame's MEM token.
+      ``IS_STORE`` (1) / ``IS_LOAD`` (1) — the store/load role flags.
     """
 
     def __init__(self, code_size: int, n_heads: int):
@@ -100,6 +106,14 @@ class PureForwardLayout(NibbleVMLayout):
         self._off = self.D
         self.ROLE = self._band("ROLE", N_ROLES)
         self.IS_FRAME_BYTE = self._scalar("IS_FRAME_BYTE")
+        # KV-memory bands.
+        from .blogspec_memory import ADDR_BITS as _AB
+        from .blogspec_layout import NIB_PER_REG as _NR
+        self.ADDR_BIN = self._band("ADDR_BIN", _AB)
+        self.QRY_BIN = self._band("QRY_BIN", _AB)
+        self.VAL_NIB = self._band("VAL_NIB", _NR)
+        self.IS_STORE = self._scalar("IS_STORE")
+        self.IS_LOAD = self._scalar("IS_LOAD")
         while self._off % n_heads != 0:
             self._scalar(f"_pfpad{self._off}")
         self.D = self._off
@@ -159,40 +173,278 @@ def bake_frame_ingest(attn, L: PureForwardLayout, reg_bases: Dict[str, int]) -> 
 # ===========================================================================
 # BUILD the pure-forward model: ingest attention on block 0 + the baked step.
 # ===========================================================================
-def build_pure_forward_model(code_size: int = 32):
-    """Assemble the pure-forward VM: block-0 attention = the frame-ingest CAM, and
-    the SAME baked step FFN blocks as ``nibble_vm.build_step_model`` (recompose /
-    fetch / code-select / decode / dispatch / branch / fold). ``n_heads`` is forced
-    to ``N_ROLES`` so every register byte gets its own gather head.
+MEM_HEAD_CHANNELS = 51               # 32 addr + ZFOD + penalty + load-enable + 16 value
+
+
+# Ops the pure-forward interpreter decodes (base + memory when included).
+PF_MEM_OPS = [isa.LI, isa.LC, isa.SI, isa.SC]
+
+
+def compile_opcode_decode_pf(L, dim: int) -> Dict[str, torch.Tensor]:
+    """``OP_IS[op] = (OP_VAL == op)`` for the base ops + the memory ops LI/LC/SI/SC
+    (the triangular-pulse decode, widened past BASE_OPS)."""
+    from .nibble_vm import BASE_OPS
+    from .nibble_unified import compile_opcode_decode_ops
+    return compile_opcode_decode_ops(L, dim, sorted(set(BASE_OPS + PF_MEM_OPS)))
+
+
+def compile_mem_prep(L, dim: int) -> Dict[str, torch.Tensor]:
+    """The pre-CAM memory prep FFN (runs after opcode decode, before the mem-cam
+    attention). On a LOAD (OP_IS[LI] or OP_IS[LC]): set IS_LOAD=1, expand the
+    ingested AX_VAL -> QRY_BIN (the load address), and CLEAR the AX nibble band so
+    the CAM's additive write lands on exactly the loaded value. On a STORE (OP_IS[SI]
+    /OP_IS[SC]): set IS_STORE=1 (this position becomes the store KV row) and expand
+    the address (STK_VAL, the popped address) -> ADDR_BIN and copy AX nibbles ->
+    VAL_NIB. Everything gated on the decoded opcode one-hot — in weights, no python."""
+    specs = []
+    # IS_LOAD = OP_IS[LI]+OP_IS[LC] (SET, opcode-gated). This is the ONLY store/load
+    # flag the model sets on the CURRENT row; the STORE-side bands (IS_STORE,
+    # ADDR_BIN, VAL_NIB) live on PAST store-frame MEM tokens and are set by the
+    # driver's overlay from the emitted MEM bytes (the §Memory write log in the token
+    # stream), so the current-step FFN must NOT touch them (it would clobber a
+    # store row's key when it runs at that row).
+    specs.append(_flag_from_ops(L, L.IS_LOAD, [isa.LI, isa.LC], dim))
+    # QRY_BIN <- AX_VAL bits (the load address). Ungated: QRY_BIN is only READ by the
+    # CAM when IS_LOAD is set (the load-enable channel gates the whole head).
+    specs.append(compile_addr_expand(L, L.AX_VAL, L.QRY_BIN, dim))
+    # clear AX nibble band on a load (so the CAM's additive write is a clean SET).
+    specs.append(_clear_band_gated(L, L.AX, 8, dim, gate_ops=[isa.LI, isa.LC]))
+    return _concat_specs(specs, dim)
+
+
+def _concat_specs(specs, dim):
+    tot = sum(s["W_up"].shape[0] for s in specs)
+    out = _empty_spec(dim, tot)
+    u = 0
+    for s in specs:
+        h = s["W_up"].shape[0]
+        out["W_up"][u:u + h] = s["W_up"]; out["b_up"][u:u + h] = s["b_up"]
+        out["W_gate"][u:u + h] = s["W_gate"]; out["b_gate"][u:u + h] = s["b_gate"]
+        out["W_down"][:, u:u + h] = s["W_down"]
+        out["b_down"] += s["b_down"]
+        u += h
+    return out
+
+
+def _flag_from_ops(L, flag_band, ops, dim):
+    """flag_band := sum_op OP_IS[op] (SET: self-clear then add each op-hot)."""
+    spec = _empty_spec(dim, 1 + len(ops))
+    spec["W_up"][0, L.ONE] = S; spec["W_gate"][0, flag_band] = 1.0
+    spec["W_down"][flag_band, 0] += -1.0 / SILU_S
+    for i, op in enumerate(ops, start=1):
+        spec["W_up"][i, L.ONE] = S; spec["W_gate"][i, L.OP_IS + op] = 1.0
+        spec["W_down"][flag_band, i] += 1.0 / SILU_S
+    return spec
+
+
+def _clear_band_gated(L, base, n, dim, gate_ops):
+    """Clear band dims base..base+n-1 when any OP_IS[gate_ops] is active (SET -old)."""
+    spec = _empty_spec(dim, n * len(gate_ops))
+    u = 0
+    for op in gate_ops:
+        g = L.OP_IS + op
+        for j in range(n):
+            spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+            spec["W_gate"][u, base + j] = 1.0
+            spec["W_down"][base + j, u] += -1.0 / SILU_HALF
+            u += 1
+    return spec
+
+
+def _copy_nibbles(L, src_base, dst_base, dim, n=16):
+    """dst nibbles := src nibbles (SET, ungated)."""
+    spec = _empty_spec(dim, 2 * n)
+    u = 0
+    for j in range(n):
+        spec["W_up"][u, L.ONE] = S                            # clear dst
+        spec["W_gate"][u, dst_base + j] = 1.0
+        spec["W_down"][dst_base + j, u] += -1.0 / SILU_S; u += 1
+        spec["W_up"][u, L.ONE] = S                            # + src
+        spec["W_gate"][u, src_base + j] = 1.0
+        spec["W_down"][dst_base + j, u] += 1.0 / SILU_S; u += 1
+    return spec
+
+
+from .nibble_vm import SILU_HALF
+
+
+# ---------------------------------------------------------------------------
+# AX_VAL (scalar 0..255) -> QRY_BIN (32 per-bit dims) — a fixed FFN, not python.
+# bit b = floor(AX / 2^b) mod 2, built as a shared-relu difference (the same
+# integer-exact ramp the fetch one-hots use). AX here is an 8-bit load address in
+# the corpus slice, so 8 low bits carry it; the upper 24 stay 0.
+# ---------------------------------------------------------------------------
+def compile_addr_expand(L, src_lane: int, bin_base: int, dim: int,
+                        n_bits: int = 8) -> Dict[str, torch.Tensor]:
+    """``QRY_BIN[b] = bit b of src_lane`` for b < n_bits (the low byte load address).
+    bit b = (floor(v/2^b) is odd). Realise as ``v mod 2^{b+1} >= 2^b`` via two
+    ReLU ramps per bit on ``v - k*2^{b+1}`` — but a compact exact form for a byte
+    is: expand v to a 256-cell one-hot then sum the cells whose index has bit b set.
+    We use the one-hot-then-select (the proven §510 triangular pulse), 256 relu +
+    per-bit sums. Self-clears each QRY_BIN lane (SET)."""
+    thresholds = list(range(-1, 257))
+    n_thr = len(thresholds)
+    tu = {t: j for j, t in enumerate(thresholds)}
+    n_units = n_thr + n_bits           # relu bank + self-clear per bit
+    spec = _empty_spec(dim, n_units)
+    for t, j in tu.items():
+        spec["W_up"][j, src_lane] = RELU_S
+        spec["b_up"][j] = -RELU_S * t
+        spec["W_gate"][j, L.ONE] = 1.0
+    clear0 = n_thr
+    for b in range(n_bits):            # self-clear each QRY_BIN[b] (SET)
+        uu = clear0 + b
+        spec["W_up"][uu, L.ONE] = S
+        spec["W_gate"][uu, bin_base + b] = 1.0
+        spec["W_down"][bin_base + b, uu] += -1.0 / SILU_S
+    # one-hot cell a via the triangular pulse; add 1 to QRY_BIN[b] for each a with bit b.
+    for a in range(256):
+        # cell(a) coefficient set into each bit lane where a has that bit.
+        for b in range(n_bits):
+            if (a >> b) & 1:
+                spec["W_down"][bin_base + b, tu[a - 1]] += 1.0 / RELU_S
+                spec["W_down"][bin_base + b, tu[a]] += -2.0 / RELU_S
+                spec["W_down"][bin_base + b, tu[a + 1]] += 1.0 / RELU_S
+    return spec
+
+
+
+
+def _bake_pf_memory_head(attn, L, head: int) -> None:
+    """Bake the §Memory KV head on head ``head`` of ``attn`` (pure-forward layout).
+    Same CAM as ``blogspec_memory.bake_memory_head`` but on THIS layout's bands and
+    a chosen head index; writes the loaded value nibbles into the AX nibble band."""
+    from .blogspec_memory import ADDR_BITS, EFF, BIAS, MEM_ALIBI_SLOPE
+    from .blogspec_layout import NIB_PER_REG
+    hs = attn.scale
+    smag = (EFF / hs) ** 0.5
+    qb = (BIAS / hs) ** 0.5
+    kb = (BIAS / hs) ** 0.5
+    PEN = 100.0 * ADDR_BITS * EFF
+    p = (PEN / hs) ** 0.5
+    attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
+    HD = attn.head_dim
+    base = head * HD
+    for b in range(ADDR_BITS):
+        attn.W_k[base + b, L.ADDR_BIN + b] = 2.0 * smag
+        attn.W_k[base + b, L.ONE] = -smag
+        attn.W_q[base + b, L.QRY_BIN + b] = 2.0 * smag
+        attn.W_q[base + b, L.ONE] = -smag
+    cB = base + ADDR_BITS
+    attn.W_q[cB, L.IS_LOAD] = -qb
+    attn.W_k[cB, L.IS_STORE] = kb
+    cR = base + ADDR_BITS + 1
+    attn.W_q[cR, L.IS_LOAD] = p
+    attn.W_k[cR, L.ONE] = -p
+    attn.W_k[cR, L.IS_STORE] = p
+    # channel n+2: LOAD-ENABLE. A NON-load query (IS_LOAD=0) must attend to nothing
+    # (the softmax1 sink) so the CAM contributes 0 on non-memory steps. KEY = -c·ONE
+    # on every row; QUERY = c·(ONE - IS_LOAD). For IS_LOAD=1 the query is 0 (no
+    # penalty); for IS_LOAD=0 the query is c·ONE so EVERY candidate scores -c²·hs
+    # (far below the sink) ⇒ the head outputs ~0 on every non-load step.
+    cL = base + ADDR_BITS + 2
+    c = (PEN / hs) ** 0.5
+    attn.W_q[cL, L.ONE] = c
+    attn.W_q[cL, L.IS_LOAD] = -c
+    attn.W_k[cL, L.ONE] = -c
+    for j in range(NIB_PER_REG):
+        attn.W_v[base + ADDR_BITS + 3 + j, L.VAL_NIB + j] = 1.0
+        attn.W_o[L.AX + j, base + ADDR_BITS + 3 + j] = 1.0
+
+
+# ---------------------------------------------------------------------------
+# LI / SI dispatch on the value lanes (§dispatch interface). The memory EFFECT
+# (the CAM read for LI, the store-token emit for SI) happens via the KV head +
+# the driver's overlay; here we only do the register/PC/SP housekeeping.
+# ---------------------------------------------------------------------------
+def memory_dispatch_rules(L) -> List:
+    """LI: AX := loaded value (written by the memory CAM into the AX nibble band;
+    the value-lane AX_VAL is refreshed by the mem-cam block's recompose FFN, so the
+    LI expert must NOT overwrite AX_VAL) — only PC += 1. SI: PC += 1, SP += 4 (pop
+    consumed the address); the store addr/val are laid into the emitted MEM token by
+    the driver (a store frame), becoming a KV entry. IS_LOAD / IS_STORE flags are
+    set by the driver on the query/store rows."""
+    from .dsl import FFNRule, LinearExpr
+    pc, sp = L.PC_VAL, L.SP_VAL
+
+    def G(op):
+        return [(L.OP_IS + op, 0.5, 1.5)]
+
+    rules = []
+    rules.append(FFNRule(G(isa.LI), {pc: LinearExpr.c(1.0)}))       # AX from CAM
+    rules.append(FFNRule(G(isa.LC), {pc: LinearExpr.c(1.0)}))
+    rules.append(FFNRule(G(isa.SI), {pc: LinearExpr.c(1.0), sp: LinearExpr.c(4.0)}))
+    rules.append(FFNRule(G(isa.SC), {pc: LinearExpr.c(1.0), sp: LinearExpr.c(4.0)}))
+    return rules
+
+
+def build_pure_forward_model(code_size: int = 32, include_memory: bool = True):
+    """Assemble the pure-forward VM: block-0 attention = the frame-ingest CAM, an
+    optional §Memory KV head, and the SAME baked step FFN blocks as
+    ``nibble_vm.build_step_model`` (recompose / fetch / code-select / decode /
+    dispatch / branch / fold), with LI/SI dispatch when ``include_memory``.
+
+    ``n_heads = N_ROLES (+1 for the memory head)`` — one gather head per register
+    byte plus the memory CAM. ``head_dim`` is forced ≥ ``MEM_HEAD_CHANNELS`` (via
+    dim padding) so the memory head's 50 local channels fit.
 
     Returns ``(model, L)``. The op result is computed by the FFN weights inside
-    ``model.forward``; the register state is reconstructed from the token stream by
-    the block-0 attention. Nothing is computed in Python.
+    ``model.forward``; the register state + memory are reconstructed from the token
+    stream by attention. Nothing is computed in Python.
     """
-    n_heads = N_ROLES                                # one gather head per reg-byte
+    n_heads = N_ROLES + (1 if include_memory else 0)
     L = PureForwardLayout(code_size, n_heads=n_heads)
+    # force head_dim >= MEM_HEAD_CHANNELS by padding dim up to a multiple of n_heads.
+    min_dim = n_heads * MEM_HEAD_CHANNELS if include_memory else L.D
+    if L.D < min_dim:
+        target = -(-min_dim // n_heads) * n_heads
+        while L._off < target:
+            L._scalar(f"_hdpad{L._off}")
+        L.D = L._off
     dim = L.D
-    ffn_specs = [
-        compile_nibble_to_scalar(L, dim),            # block 0 FFN
-        compile_pc_fetch(L, dim),
-        compile_code_select(L, dim),
-        compile_opcode_decode(L, dim),
-        compile_ffn(base_dispatch_rules(L), dim),
-        compile_branch_delta(L, dim),
-        compile_fold(L.AX_VAL, L.ONE, dim, modulus=256),
+    # Block order. The memory read has an intra-forward data dependency: the load
+    # ADDRESS is the ingested AX, and the CAM must know it is a LOAD. So fetch+decode
+    # run FIRST (to know the opcode), THEN a mem-prep FFN sets IS_LOAD from OP_IS[LI/
+    # LC], expands the ingested AX_VAL -> QRY_BIN, and clears the AX nibble band on a
+    # load; THEN the mem-cam block's ATTENTION runs the §Memory CAM (writes the loaded
+    # value nibbles into the cleared AX band); a recompose refreshes AX_VAL; dispatch
+    # does the PC/SP housekeeping. All inside ONE model.forward.
+    block_specs = [
+        ("ingest+recompose", compile_nibble_to_scalar(L, dim)),   # block 0 FFN
+        ("pc-fetch",    compile_pc_fetch(L, dim)),
+        ("code-select", compile_code_select(L, dim)),
+        ("opcode-decode", compile_opcode_decode_pf(L, dim)),
     ]
-    n_blocks = len(ffn_specs)
-    hidden = max(f["W_up"].shape[0] for f in ffn_specs)
+    if include_memory:
+        block_specs += [
+            ("mem-prep", compile_mem_prep(L, dim)),               # IS_LOAD + QRY_BIN + clear AX
+            ("mem-cam",  compile_nibble_to_scalar(L, dim)),       # ATTN=CAM; FFN: refresh AX_VAL
+        ]
+    block_specs += [
+        ("dispatch", compile_ffn(base_dispatch_rules(L)
+                     + (memory_dispatch_rules(L) if include_memory else []), dim)),
+        ("branch-delta", compile_branch_delta(L, dim)),
+        ("fold", compile_fold(L.AX_VAL, L.ONE, dim, modulus=256)),
+    ]
+    n_blocks = len(block_specs)
+    hidden = max(f["W_up"].shape[0] for _, f in block_specs)
     model = Transformer(dim=dim, n_heads=n_heads, hidden=hidden,
                         n_blocks=n_blocks, vocab=V.VOCAB, max_seq_len=8192)
     with torch.no_grad():
         _bake_pure_embedding(model, L)
-        for bi, spec in enumerate(ffn_specs):
+        for bi, (name, spec) in enumerate(block_specs):
             _zero_attn(model.blocks[bi].attn)
             _load_ffn(model.blocks[bi].ffn, spec, hidden)
         # block 0 attention = the frame-ingest CAM.
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
         bake_frame_ingest(model.blocks[0].attn, L, reg_bases)
+        if include_memory:
+            # the §Memory KV head is the ATTENTION of the "mem-cam" block (index 2),
+            # AFTER addr-expand has set QRY_BIN: it reads the load query, content-
+            # addresses the store rows in the stream, and writes the loaded value
+            # into the AX nibble band (its FFN then refreshes AX_VAL).
+            mem_block = [i for i, (nm, _) in enumerate(block_specs) if nm == "mem-cam"][0]
+            _bake_pf_memory_head(model.blocks[mem_block].attn, L, head=N_ROLES)
     return model, L
 
 
@@ -236,48 +488,80 @@ def _init_frame_role_slots():
 _init_frame_role_slots()
 
 
-def build_frame_tokens(pc: int, ax: int, sp: int, bp: int, stack0: int
-                       ) -> List[int]:
+def build_frame_tokens(pc: int, ax: int, sp: int, bp: int, stack0: int,
+                       mem_addr: int = 0, mem_val: int = 0) -> List[int]:
     """The 30-token frame carrying the five registers; STACK0 in the MEM value
-    slot (so the pure-forward stack-top mirror round-trips through the stream)."""
+    slot (so the pure-forward stack-top mirror round-trips through the stream).
+    On a STORE step the MEM slot instead carries the store's ``addr``/``val`` (the
+    KV entry) — the store DATA rides in the emitted token stream, per §Memory."""
+    if mem_addr or mem_val:
+        return V.build_step_frame(pc, ax, sp, bp, mem_addr=mem_addr, mem_val=mem_val)
     return V.build_step_frame(pc, ax, sp, bp, mem_addr=0, mem_val=stack0 & 0xFFFFFFFF)
 
 
-def make_overlay(code: List[isa.Instr], L: PureForwardLayout):
+# frame-local index of the MEM marker and its addr/val byte slots.
+_MEM_MARKER_LOCAL = 20
+_MEM_ADDR_LOCAL = [21, 22, 23, 24]
+_MEM_VAL_LOCAL = [25, 26, 27, 28]
+
+
+def make_overlay(code: List[isa.Instr], L: PureForwardLayout, store_frames=None):
     """Return an ``overlay(x)`` that writes, in-place on the embedded stream ``x``
     ([1,S,D]): the PROGRAM into the DATA bands at every position (so fetch@PC works
     at the last position), and the ROLE / IS_FRAME_BYTE frame-slot tags on each
-    30-token frame. BOS carries the initial register state so step 1 has a frame to
-    ingest. Everything here is structural (program = input; roles = frame layout);
-    NO VM value is computed in Python."""
+    30-token frame. Everything here is structural (program = input; roles = frame
+    layout).
+
+    ``store_frames`` (optional set of frame indices, 0 = the init frame) marks which
+    emitted frames were STORE steps: their MEM token is turned into a KV entry —
+    ``IS_STORE=1`` + ``ADDR_BIN`` expanded from the frame's MEM addr bytes +
+    ``VAL_NIB`` from the MEM val bytes. This is the §Memory store log riding in the
+    emitted MEM tokens; marking which MEM token is a store is the driver's routing
+    bookkeeping (it fetched the op), exactly the ``KVMemory`` contract."""
+    store_frames = store_frames or set()
+
     def overlay(x: torch.Tensor) -> None:
-        S = x.shape[1]
-        # program in DATA bands + ONE at every position (fetch@PC reads the last).
-        for i in range(S):
+        Sn = x.shape[1]
+        for i in range(Sn):
             x[0, i, L.ONE] = 1.0
             for k, ins in enumerate(code):
                 x[0, i, L.CODE_OP[k]] = float(ins.op)
                 x[0, i, L.CODE_IMM[k]] = float(ins.imm)
-        # BOS (position 0) carries the INITIAL register frame's role/value so the
-        # first step ingests PC=0,AX=0,SP=BP=0x10000,STACK0=0. We encode the init
-        # registers as a virtual frame on BOS via the ROLE/CUR_NIB of... no — the
-        # driver seeds an explicit init frame as the first real frame (see runner).
-        # Here: tag every 30-token frame's byte slots with their role.
-        # positions 1.. are frames of length 30.
         pos = 1
-        while pos + V.FRAME_LEN <= S:
+        frame_idx = 0
+        while pos + V.FRAME_LEN <= Sn:
             for local, role in _FRAME_ROLE_SLOTS.items():
                 p = pos + local
                 x[0, p, L.ROLE + role] = 1.0
                 x[0, p, L.IS_FRAME_BYTE] = 1.0
+            # If this emitted frame was a STORE, make its MEM token a KV entry.
+            if frame_idx in store_frames:
+                mem_pos = pos + _MEM_MARKER_LOCAL
+                addr = 0
+                for bi, a in enumerate(_MEM_ADDR_LOCAL):
+                    byte = int(round(float(x[0, pos + a, L.CUR_NIB + 0]))) \
+                        + (int(round(float(x[0, pos + a, L.CUR_NIB + 1]))) << 4)
+                    addr |= byte << (8 * bi)
+                x[0, mem_pos, L.IS_STORE] = 1.0
+                x[0, mem_pos, L.IS_FRAME_BYTE] = 0.0     # the store token is not a role byte
+                for b, bit in enumerate(_address_bits(addr)):
+                    x[0, mem_pos, L.ADDR_BIN + b] = bit
+                # value nibbles from the MEM val bytes (2 nibbles per byte token).
+                for bi, vloc in enumerate(_MEM_VAL_LOCAL):
+                    lo = int(x[0, pos + vloc, L.CUR_NIB + 0])
+                    hi = int(x[0, pos + vloc, L.CUR_NIB + 1])
+                    x[0, mem_pos, L.VAL_NIB + 2 * bi + 0] = float(lo)
+                    x[0, mem_pos, L.VAL_NIB + 2 * bi + 1] = float(hi)
             pos += V.FRAME_LEN
-        # The INGEST QUERY position is the LAST token of the stream (the current
-        # STEP_END). It must light EVERY role query so all 20 gather heads fire
-        # (each head reads only its own ROLE+h dim). IS_FRAME_BYTE stays 0 there so
-        # the query row is not itself a KV candidate (query-exclusion).
+            frame_idx += 1
         for role in range(N_ROLES):
             x[0, -1, L.ROLE + role] = 1.0
     return overlay
+
+
+def _address_bits(addr: int):
+    from .blogspec_memory import ADDR_BITS
+    return [float((addr >> b) & 1) for b in range(ADDR_BITS)]
 
 
 # ===========================================================================
@@ -287,11 +571,13 @@ def make_overlay(code: List[isa.Instr], L: PureForwardLayout):
 SP_INIT = 0x10000
 
 
-def _emit_frame_from_state(state: torch.Tensor, L: PureForwardLayout
-                           ) -> Tuple[List[int], int, int, bool]:
+def _emit_frame_from_state(state: torch.Tensor, L: PureForwardLayout,
+                           is_store: bool = False, store_addr: int = 0,
+                           store_val: int = 0) -> Tuple[List[int], int, int, bool]:
     """Decode the model's computed next-state (the value lanes at the last
     position) into the next 30-token frame via the LM byte-head's value argmax —
-    the spec's own re-quantiser (no ``torch.round``). Returns
+    the spec's own re-quantiser (no ``torch.round``). On a STORE step the MEM slot
+    carries ``store_addr``/``store_val`` (the KV entry). Returns
     ``(frame_tokens, ax_value, next_pc, halted)``."""
     pc = _snap_lane(state[L.PC_VAL])
     ax = _snap_lane(state[L.AX_VAL])
@@ -299,7 +585,11 @@ def _emit_frame_from_state(state: torch.Tensor, L: PureForwardLayout
     bp = _snap_lane(state[L.BP_VAL])
     stk = _snap_lane(state[L.STK_VAL])
     halted = float(state[L.HALTED]) > 0.5
-    frame = build_frame_tokens(pc, ax, sp, bp, stk)
+    if is_store:
+        frame = build_frame_tokens(pc, ax, sp, bp, stk,
+                                   mem_addr=store_addr, mem_val=store_val)
+    else:
+        frame = build_frame_tokens(pc, ax, sp, bp, stk)
     return frame, ax & 0xFF, pc, halted
 
 
@@ -317,23 +607,45 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
     register init (PC=AX=0, SP=BP=0x10000, STACK0=0) — the "step 0" frame the first
     real step ingests. Each iteration appends exactly one 30-token frame.
     """
-    overlay = make_overlay(code, L)
     init_frame = build_frame_tokens(0, 0, SP_INIT, SP_INIT, 0)
     stream: List[int] = [V.BOS] + init_frame
     trace: List[int] = []
+    store_frames = set()                            # emitted frame indices that are stores
+    cur_pc = 0                                       # PC of the step about to run
+    frame_idx = 0                                    # emitted-frame counter (0 = init)
     for _ in range(max_steps):
+        # the overlay marks past store frames (KV entries) + program + roles.
+        overlay = make_overlay(code, L, store_frames=store_frames)
         toks = torch.tensor([stream])
         with torch.no_grad():
             x = model.embed[toks].clone()
-            overlay(x)                              # program-in-data + frame roles
+            overlay(x)                              # program-in-data + frame roles + KV
             for blk in model.blocks:                # == model.forward minus LM head
                 x = blk(x)
         state = x[0, -1]
-        frame, ax_byte, npc, halted = _emit_frame_from_state(state, L)
+        # Is the step that just ran a STORE? (the driver fetches the op at cur_pc —
+        # the same code-as-data fetch the model does; this is routing bookkeeping.)
+        op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
+        is_store = op in (isa.SI, isa.SC)
+        s_addr = s_val = 0
+        if is_store:
+            # SI: *pop = AX. The store ADDRESS is the popped stack top (STK_VAL, the
+            # STACK0 the model ingested) and the VALUE is AX — both model value lanes,
+            # decoded by the same LM value-argmax as the registers. They ride in the
+            # emitted frame's MEM addr/val slot (the §Memory write log token).
+            s_addr = _snap_lane(state[L.STK_VAL])
+            s_val = _snap_lane(state[L.AX_VAL]) & 0xFF
+        frame, ax_byte, npc, halted = _emit_frame_from_state(
+            state, L, is_store=is_store, store_addr=s_addr, store_val=s_val)
         trace.append(ax_byte)
+        frame_idx += 1
+        if is_store:
+            store_frames.add(frame_idx)             # this emitted frame is a KV entry
         stream += frame                             # APPEND the emitted frame
         if verbose:
-            print(f"  step -> pc_next={npc} ax={ax_byte} halted={halted}")
+            print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op)} -> "
+                  f"pc_next={npc} ax={ax_byte} store={is_store} halted={halted}")
+        cur_pc = npc
         if halted or npc < 0 or npc >= len(code):
             break
     if collect_tokens:
