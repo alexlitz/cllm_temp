@@ -114,6 +114,14 @@ class PureForwardLayout(NibbleVMLayout):
         self.VAL_NIB = self._band("VAL_NIB", _NR)
         self.IS_STORE = self._scalar("IS_STORE")
         self.IS_LOAD = self._scalar("IS_LOAD")
+        # CMP result scratch lanes (computed ungated from d = STK - AX each step).
+        self.CMP_EQ = self._scalar("CMP_EQ")     # 1 iff STK == AX
+        self.CMP_GT = self._scalar("CMP_GT")     # 1 iff STK  > AX
+        self.CMP_LT = self._scalar("CMP_LT")     # 1 iff STK  < AX
+        # 8-bit MUL/DIV/MOD table operand one-hots + result lane.
+        self.MDM_A_OH = self._band("MDM_A_OH", 256)
+        self.MDM_B_OH = self._band("MDM_B_OH", 256)
+        self.MDM_RES = self._scalar("MDM_RES")   # byte result (pre-dispatch)
         while self._off % n_heads != 0:
             self._scalar(f"_pfpad{self._off}")
         self.D = self._off
@@ -181,11 +189,15 @@ PF_MEM_OPS = [isa.LI, isa.LC, isa.SI, isa.SC]
 
 
 def compile_opcode_decode_pf(L, dim: int) -> Dict[str, torch.Tensor]:
-    """``OP_IS[op] = (OP_VAL == op)`` for the base ops + the memory ops LI/LC/SI/SC
-    (the triangular-pulse decode, widened past BASE_OPS)."""
+    """``OP_IS[op] = (OP_VAL == op)`` for the base ops + memory ops LI/LC/SI/SC +
+    the comparisons EQ/NE/LT/GT/LE/GE (the triangular-pulse decode)."""
     from .nibble_vm import BASE_OPS
     from .nibble_unified import compile_opcode_decode_ops
-    return compile_opcode_decode_ops(L, dim, sorted(set(BASE_OPS + PF_MEM_OPS)))
+    ops = sorted(set(BASE_OPS + PF_MEM_OPS +
+                     [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] +
+                     [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR] +
+                     [isa.MUL, isa.DIV, isa.MOD]))
+    return compile_opcode_decode_ops(L, dim, ops)
 
 
 def compile_mem_prep(L, dim: int) -> Dict[str, torch.Tensor]:
@@ -378,7 +390,110 @@ def memory_dispatch_rules(L) -> List:
     return rules
 
 
-def build_pure_forward_model(code_size: int = 32, include_memory: bool = True):
+# ---------------------------------------------------------------------------
+# COMPARISONS (EQ/NE/LT/GT/LE/GE) — the §Comparisons zero-detector + sign-of-diff
+# on the byte value lanes, as SwiGLU weights. Split into (a) an UNGATED compute of
+# the 3 primitives CMP_EQ/CMP_GT/CMP_LT from d = STK - AX (runs every step), and
+# (b) an opcode-gated WRITE of the boolean into AX_VAL (product units: contributes
+# OP_IS[op]·result). This keeps the arbitrary-d gadget out of the per-op gate.
+# ---------------------------------------------------------------------------
+CMP_OPS = [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE]
+
+
+def compile_cmp_compute(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Ungated: CMP_EQ = (d==0), CMP_GT = (d>=1), CMP_LT = (-d>=1) where
+    d = STK_VAL - AX_VAL ∈ [-255,255]. Each is an integer-exact ramp; self-clears
+    the 3 lanes first (SET)."""
+    spec = _empty_spec(dim, 3 + 3 + 2 + 2)   # 3 clears + EQ(3 z-units) + GT(2) + LT(2)
+    u = 0
+    for lane in (L.CMP_EQ, L.CMP_GT, L.CMP_LT):     # self-clear (SET)
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
+        spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
+    # EQ = Z(d): the §584 finite-2nd-difference silu bump (peak 1 at d==0).
+    sig = float(torch.sigmoid(torch.tensor(S * 0.5)))
+    k = S * 0.5 * (2.0 * sig - 1.0)
+    for bias, w in [(S * 0.5, 1.0), (0.0, -2.0), (-S * 0.5, 1.0)]:
+        spec["W_up"][u, L.STK_VAL] += S; spec["W_up"][u, L.AX_VAL] += -S
+        spec["b_up"][u] += bias
+        spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][L.CMP_EQ, u] += w / k; u += 1
+    # GT = step(d >= 1) = relu(d) - relu(d-1)  (integer d).
+    for idx, thr in enumerate((0.0, 1.0)):
+        spec["W_up"][u, L.STK_VAL] += RELU_S; spec["W_up"][u, L.AX_VAL] += -RELU_S
+        spec["b_up"][u] += -RELU_S * thr; spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][L.CMP_GT, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
+    # LT = step(-d >= 1).
+    for idx, thr in enumerate((0.0, 1.0)):
+        spec["W_up"][u, L.AX_VAL] += RELU_S; spec["W_up"][u, L.STK_VAL] += -RELU_S
+        spec["b_up"][u] += -RELU_S * thr; spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][L.CMP_LT, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
+    return spec
+
+
+def cmp_dispatch_rules(L) -> List:
+    """The opcode-gated CMP write: AX := boolean (SET) + PC+=1, SP+=4. The boolean
+    is a linear combo of the CMP_EQ/GT/LT scratch lanes:
+      EQ=CMP_EQ  NE=1-CMP_EQ  LT=CMP_LT  GT=CMP_GT  LE=1-CMP_GT  GE=1-CMP_LT."""
+    from .dsl import FFNRule, LinearExpr
+    ax, sp, pc = L.AX_VAL, L.SP_VAL, L.PC_VAL
+
+    def G(op):
+        return [(L.OP_IS + op, 0.5, 1.5)]
+
+    bool_of = {
+        isa.EQ: LinearExpr.of(L.CMP_EQ, 1.0),
+        isa.NE: LinearExpr.c(1.0) + LinearExpr.of(L.CMP_EQ, -1.0),
+        isa.LT: LinearExpr.of(L.CMP_LT, 1.0),
+        isa.GT: LinearExpr.of(L.CMP_GT, 1.0),
+        isa.LE: LinearExpr.c(1.0) + LinearExpr.of(L.CMP_GT, -1.0),
+        isa.GE: LinearExpr.c(1.0) + LinearExpr.of(L.CMP_LT, -1.0),
+    }
+    rules = []
+    for op in CMP_OPS:
+        rules.append(FFNRule(G(op), {
+            ax: bool_of[op] + LinearExpr.of(ax, -1.0),   # SET AX = boolean
+            pc: LinearExpr.c(1.0), sp: LinearExpr.c(4.0)}))
+    return rules
+
+
+MULDIV_OPS = [isa.MUL, isa.DIV, isa.MOD]
+
+
+def muldiv_dispatch_rules(L) -> List:
+    """MUL/DIV/MOD (8-bit table): AX := MDM_RES (the table result computed by the
+    mdm-expand/select blocks on the pre-op STK/AX bytes), PC += 1, SP += 4. SET AX.
+    The 8-bit table is the spec-sanctioned 'lookup table in the FFN'; the full
+    32-bit MUL/DIV/MOD are iterative and do NOT fold (see the deliverable doc)."""
+    from .dsl import FFNRule, LinearExpr
+    ax, sp, pc = L.AX_VAL, L.SP_VAL, L.PC_VAL
+    rules = []
+    for op in MULDIV_OPS:
+        rules.append(FFNRule([(L.OP_IS + op, 0.5, 1.5)], {
+            ax: LinearExpr.of(L.MDM_RES, 1.0) + LinearExpr.of(ax, -1.0),
+            pc: LinearExpr.c(1.0), sp: LinearExpr.c(4.0)}))
+    return rules
+
+
+BITWISE_OPS = [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
+
+
+def bitwise_dispatch_rules(L) -> List:
+    """OR/XOR/AND/SHL/SHR housekeeping: PC += 1 ; SP += 4 (pop consumed). The RESULT
+    is written to the AX nibble band by the bw-select block and recomposed to AX_VAL
+    by bw-recompose; the dispatch only does the PC/SP update (like the unified
+    model's bitwise experts)."""
+    from .dsl import FFNRule, LinearExpr
+    pc, sp = L.PC_VAL, L.SP_VAL
+    rules = []
+    for op in BITWISE_OPS:
+        rules.append(FFNRule([(L.OP_IS + op, 0.5, 1.5)],
+                             {pc: LinearExpr.c(1.0), sp: LinearExpr.c(4.0)}))
+    return rules
+
+
+def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
+                             include_cmp: bool = True, include_bitwise: bool = True,
+                             include_muldiv: bool = True):
     """Assemble the pure-forward VM: block-0 attention = the frame-ingest CAM, an
     optional §Memory KV head, and the SAME baked step FFN blocks as
     ``nibble_vm.build_step_model`` (recompose / fetch / code-select / decode /
@@ -394,6 +509,12 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True):
     """
     n_heads = N_ROLES + (1 if include_memory else 0)
     L = PureForwardLayout(code_size, n_heads=n_heads)
+    if include_bitwise:
+        from . import nibble_bitwise as _bw
+        _bw.extend_layout_for_bitwise(L)          # A_OH/B_OH/SHIFT_* bands
+        while L._off % n_heads != 0:
+            L._scalar(f"_bwpad{L._off}")
+        L.D = L._off
     # force head_dim >= MEM_HEAD_CHANNELS by padding dim up to a multiple of n_heads.
     min_dim = n_heads * MEM_HEAD_CHANNELS if include_memory else L.D
     if L.D < min_dim:
@@ -420,9 +541,29 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True):
             ("mem-prep", compile_mem_prep(L, dim)),               # IS_LOAD + QRY_BIN + clear AX
             ("mem-cam",  compile_nibble_to_scalar(L, dim)),       # ATTN=CAM; FFN: refresh AX_VAL
         ]
+    if include_cmp:
+        block_specs += [("cmp-compute", compile_cmp_compute(L, dim))]  # CMP_EQ/GT/LT
+    if include_muldiv:
+        from .nibble_unified import compile_mdm_expand, compile_mdm_select
+        block_specs += [("mdm-expand", compile_mdm_expand(L, dim)),
+                        ("mdm-select", compile_mdm_select(L, dim))]     # MDM_RES = op(a,b)
+    if include_bitwise:
+        from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
+        for name, spec in build_bitwise_blocks(L, dim):     # bw-expand/bit4/select
+            block_specs.append((name, spec))
+        block_specs.append(("bw-recompose", _bw_recompose_spec(
+            L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))  # AX nibbles -> AX_VAL
+    disp_rules = base_dispatch_rules(L)
+    if include_memory:
+        disp_rules = disp_rules + memory_dispatch_rules(L)
+    if include_cmp:
+        disp_rules = disp_rules + cmp_dispatch_rules(L)
+    if include_bitwise:
+        disp_rules = disp_rules + bitwise_dispatch_rules(L)     # PC+1 ; SP+4
+    if include_muldiv:
+        disp_rules = disp_rules + muldiv_dispatch_rules(L)      # AX = MDM_RES ; PC+1 ; SP+4
     block_specs += [
-        ("dispatch", compile_ffn(base_dispatch_rules(L)
-                     + (memory_dispatch_rules(L) if include_memory else []), dim)),
+        ("dispatch", compile_ffn(disp_rules, dim)),
         ("branch-delta", compile_branch_delta(L, dim)),
         ("fold", compile_fold(L.AX_VAL, L.ONE, dim, modulus=256)),
     ]

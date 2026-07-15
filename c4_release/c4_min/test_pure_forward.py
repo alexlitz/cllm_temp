@@ -103,7 +103,12 @@ def test_one_head_per_register_byte():
 
 # --- M3: memory in KV — LI/SI via softmax1-KV attention over the emitted MEM tokens
 def _build_mem(code_size=20):
-    return build_pure_forward_model(code_size=code_size, include_memory=True)
+    # memory-only lean build: no cmp/bitwise/muldiv tables (the 8-bit muldiv table
+    # is ~181k hidden units and would make this build minutes-slow for no reason —
+    # the KV-memory path is independent of the arithmetic experts).
+    return build_pure_forward_model(code_size=code_size, include_memory=True,
+                                    include_cmp=False, include_bitwise=False,
+                                    include_muldiv=False)
 
 
 def test_store_then_load_pure_forward():
@@ -136,6 +141,60 @@ def test_memory_zfod_latest_wins_two_addr():
         trace = assert_no_python_compute(run_pure_forward, model, L, code)
         assert trace == isa.interpret(code), (name, trace, isa.interpret(code))
         assert trace[-1] == exp, (name, trace[-1], exp)
+
+
+# --- EXTENDED op families: CMP / BITWISE / 8-bit MULDIV, all pure-forward ---------
+# Each is an OP_IS[op]-gated FFN expert computed inside model.forward; the operand
+# is popped from STACK0 (the ingested stack-top) and combined with AX. Lean builds
+# (only the family under test) keep these fast — the 8-bit muldiv table is the one
+# slow build (~181k hidden units), so it gets a small case set.
+def _push_op(a, b, op):
+    """IMM a ; PSH ; IMM b ; <op> ; HALT  →  AX = a <op> b."""
+    return [("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)]
+
+
+def test_cmp_family_pure_forward():
+    """EQ/NE/LT/GT/LE/GE run pure-forward: the §Comparisons zero-detector +
+    sign-of-diff computed ungated each step, the boolean written by the opcode-gated
+    expert — all in model.forward, no python compare."""
+    model, L = build_pure_forward_model(code_size=20, include_memory=False,
+                                        include_cmp=True, include_bitwise=False,
+                                        include_muldiv=False)
+    cases = [("EQ", 5, 5), ("EQ", 5, 6), ("NE", 5, 6), ("LT", 3, 7),
+             ("GT", 7, 3), ("LE", 3, 3), ("GE", 3, 7)]
+    for op, a, b in cases:
+        code = isa.assemble(_push_op(a, b, op))
+        trace = assert_no_python_compute(run_pure_forward, model, L, code)
+        assert trace == isa.interpret(code), (op, a, b, trace, isa.interpret(code))
+
+
+def test_bitwise_family_pure_forward():
+    """OR/XOR/AND/SHL/SHR run pure-forward via the folded per-nibble table FFN
+    blocks; the result recomposes to AX inside model.forward — no python bitops."""
+    model, L = build_pure_forward_model(code_size=20, include_memory=False,
+                                        include_cmp=False, include_bitwise=True,
+                                        include_muldiv=False)
+    cases = [("OR", 0x0C, 0x03), ("XOR", 0xFF, 0x0F), ("AND", 0xF0, 0x3C),
+             ("SHL", 0x03, 2), ("SHR", 0xF0, 3)]
+    for op, a, b in cases:
+        code = isa.assemble(_push_op(a, b, op))
+        trace = assert_no_python_compute(run_pure_forward, model, L, code)
+        assert trace == isa.interpret(code), (op, a, b, trace, isa.interpret(code))
+
+
+def test_muldiv_family_pure_forward():
+    """MUL/DIV/MOD (8-bit table) run pure-forward: the byte×byte lookup lives in the
+    mdm-select FFN, the result copied to AX by the opcode-gated expert. Includes the
+    div/mod-by-zero → 0 spec convention. (Slow build: the ~181k-unit table.)"""
+    model, L = build_pure_forward_model(code_size=20, include_memory=False,
+                                        include_cmp=False, include_bitwise=False,
+                                        include_muldiv=True)
+    cases = [("MUL", 6, 7), ("MUL", 20, 20), ("DIV", 84, 7), ("MOD", 85, 7),
+             ("DIV", 5, 0), ("MOD", 5, 0)]
+    for op, a, b in cases:
+        code = isa.assemble(_push_op(a, b, op))
+        trace = assert_no_python_compute(run_pure_forward, model, L, code)
+        assert trace == isa.interpret(code), (op, a, b, trace, isa.interpret(code))
 
 
 if __name__ == "__main__":
