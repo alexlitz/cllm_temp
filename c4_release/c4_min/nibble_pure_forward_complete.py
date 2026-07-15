@@ -227,9 +227,10 @@ def compile_stack_prep(L: PureForwardCompleteLayout, dim: int) -> Dict[str, torc
     specs.append(_flag_from_ops(L, L.IS_LEV, [isa.LEV], dim))
     # SP_QRY_BIN <- bits of POP_ADDR (SP for pops, BP for LEV).
     specs.append(compile_nibble_addr_expand(L, L.POP_ADDR, L.SP_QRY_BIN, dim, n_nibbles=8))
-    # LEV_QRY_BIN <- bits of LEV_ADDR (BP) with bit 2 forced (BP+4, 4-aligned BP).
+    # LEV_QRY_BIN <- bits of LEV_ADDR (BP).  The +4 (BP -> BP+4, the return-PC slot)
+    # is a SEPARATE block (``lev-addr4``) because the +4 ripple-carry reads
+    # LEV_QRY_BIN at its block INPUT — it must run AFTER this expand writes it.
     specs.append(compile_nibble_addr_expand(L, L.LEV_ADDR, L.LEV_QRY_BIN, dim, n_nibbles=8))
-    specs.append(_force_bit2(L, L.LEV_QRY_BIN, dim))     # +4 (BP is 4-aligned)
     # clear STACK0 (pop dest) + LEV_RET (LEV ret-PC dest) so head writes are clean.
     specs.append(_clear_band_gated_ops(L, L.STACK0, 8, dim, POP_OPS + [isa.LEV]))
     specs.append(_clear_band_gated_ops(L, L.LEV_RET, 8, dim, [isa.LEV]))
@@ -237,14 +238,50 @@ def compile_stack_prep(L: PureForwardCompleteLayout, dim: int) -> Dict[str, torc
 
 
 def _force_bit2(L, bin_base, dim):
-    """Set bit 2 of the address band to 1 (BP is 4-aligned so BP+4 flips bit 2)."""
-    spec = _empty_spec(dim, 2)
-    spec["W_up"][0, L.ONE] = S            # clear bit 2
-    spec["W_gate"][0, bin_base + 2] = 1.0
-    spec["W_down"][bin_base + 2, 0] += -1.0 / SILU_S
-    spec["W_up"][1, L.ONE] = S            # set bit 2 = 1
-    spec["W_gate"][1, L.ONE] = 1.0
-    spec["W_down"][bin_base + 2, 1] += 1.0 / SILU_S
+    """Add 4 to the binary address band (BP+4 = LEV return-PC slot).  BP is
+    4-aligned (bits 0,1 = 0) but bit 2 is NOT necessarily 0 (e.g. BP=228=0xE4 has
+    bit 2 set) — so a bit-force would be WRONG.  This is a true ripple-carry +1 at
+    bit position 2, expressed ENTIRELY on the block-input bits (FFN units all read
+    the block input, so no relu chaining):
+
+        carry_k  = AND(bits 2..k-1)  = [ sum(bits 2..k-1) == k-2 ]     (carry into k)
+        andk     = AND(bits 2..k)    = [ sum(bits 2..k)   == k-1 ]     ( = bit_k·carry_k)
+        new_bit_k = bit_k XOR carry_k = bit_k + carry_k - 2·andk
+
+    carry_2 = 1 (the injected +4).  Bits 0,1 are untouched.  Each ``[sum==n]``
+    prefix-AND is one relu bump (relu(x-(n-0.5)) - relu(x-(n+0.5)))."""
+    hi = ADDR_BITS
+
+    def and_bits(spec, u, lo, k, out_base, coeff):
+        """Add ``coeff · AND(bits lo..k)`` to residual dim ``out_base``.  x = Σ bits
+        (an integer in 0..cnt), so AND == [x >= cnt] — a SHARP unit step at cnt
+        realised as a narrow ramp relu(x-(cnt-w)) - relu(x-cnt) of amplitude 1 at
+        x=cnt (w=0.5, so the step is 1.0 exactly at the integer x=cnt, 0 at cnt-1)."""
+        cnt = k - lo + 1
+        w = 0.5
+        for i, thr in enumerate((cnt - w, cnt)):
+            spec["W_up"][u, L.ONE] = -RELU_S * thr
+            for j in range(lo, k + 1):
+                spec["W_up"][u, bin_base + j] = RELU_S
+            spec["W_gate"][u, L.ONE] = 1.0
+            spec["W_down"][out_base, u] += (coeff if i == 0 else -coeff) / (RELU_S * w)
+            u += 1
+        return u
+
+    # new_bit_k = bit_k XOR carry_k, so the FFN DELTA (added to the residual bit_k)
+    # is exactly  carry_k - 2·(bit_k AND carry_k) = carry_k - 2·AND(bits 2..k).  No
+    # clear/restore needed — the residual already carries bit_k.  carry_2 = 1.
+    spec = _empty_spec(dim, hi * 6)
+    u = 0
+    for k in range(2, hi):
+        if k == 2:                                   # carry_2 = 1 (the injected +4)
+            spec["W_up"][u, L.ONE] = S
+            spec["W_gate"][u, L.ONE] = 1.0
+            spec["W_down"][bin_base + k, u] += 1.0 / SILU_S; u += 1
+        else:                                        # carry_k = AND(bits 2..k-1)
+            u = and_bits(spec, u, 2, k - 1, bin_base + k, +1.0)
+        # - 2·(bit_k AND carry_k) = -2·AND(bits 2..k)
+        u = and_bits(spec, u, 2, k, bin_base + k, -2.0)
     return spec
 
 
@@ -414,6 +451,22 @@ def alu32_housekeeping_rules(L) -> List[FFNRule]:
     return rules
 
 
+def compile_opcode_decode_pfc(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Opcode decode for the COMPLETE VM: the pure-forward decode set PLUS the
+    calling-convention ops (JSR/ENT/ADJ/LEV).  ``compile_opcode_decode_pf`` decodes
+    BASE_OPS + memory + cmp + bitwise + muldiv, but NOT JSR/ENT/ADJ/LEV — so their
+    dispatch rules (all gated on ``OP_IS[op]``) never fire and JSR/ENT/LEV stay
+    no-ops.  This widens the decode so the callconv one-hots light up."""
+    from .nibble_vm import BASE_OPS
+    from .nibble_unified import compile_opcode_decode_ops
+    ops = sorted(set(BASE_OPS + PF.PF_MEM_OPS +
+                     [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] +
+                     [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR] +
+                     [isa.MUL, isa.DIV, isa.MOD] +
+                     [isa.JSR, isa.ENT, ADJ, isa.LEV]))    # + calling convention
+    return compile_opcode_decode_ops(L, dim, ops)
+
+
 def compile_ax_nib_split(L, dim: int) -> Dict[str, torch.Tensor]:
     """AXB_LO = low nibble of AX_VAL's byte, AXB_HI = high nibble — via ONE ungated
     256-cell one-hot of AX_VAL (triangular pulse) summed with the nibble weights.
@@ -522,11 +575,12 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
         ("pc-fetch",    compile_pc_fetch(L, dim)),
         ("code-select", compile_code_select(L, dim)),
-        ("opcode-decode", compile_opcode_decode_pf(L, dim)),
+        ("opcode-decode", compile_opcode_decode_pfc(L, dim)),  # + JSR/ENT/ADJ/LEV
         ("mem-prep", compile_mem_prep(L, dim)),
         ("mem-cam",  compile_nibble_to_scalar(L, dim)),          # ATTN=LI head
         ("pop-addr", compile_pop_addr(L, dim)),                  # POP_ADDR/LEV_ADDR
         ("stack-prep", compile_stack_prep(L, dim)),
+        ("lev-addr4", _force_bit2(L, L.LEV_QRY_BIN, dim)),       # LEV_QRY_BIN += 4
         ("stack-pop-cam", compile_stk_recompose(L, dim)),        # ATTN=stack+lev heads
         ("cmp-compute", compile_cmp_compute(L, dim)),
         ("alu-expand", A.compile_expand(L, dim)),
