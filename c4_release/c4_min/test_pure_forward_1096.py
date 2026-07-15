@@ -78,12 +78,13 @@ _SAMPLE = [
                           "int main(){ return square(50); }",            2500, False),
     ("func_max",          "int max(int a,int b){ if (a>b) return a; return b; } "
                           "int main(){ return max(5, 9); }",               9, False),
-    # --- a short loop (BZ/JMP branch + accumulate) — kept SMALL (5 iters, ~35
-    #     steps) so the quadratic stream growth stays CI-tractable; this proves the
-    #     in-forward BZ/JMP loop control.  The full deep-loop tail (loops/gcd/rec, up
-    #     to thousands of steps) is scored separately in run_1096_pure_forward.
+    # --- a short loop (BZ/JMP branch + accumulate) — kept MINIMAL (2 iters) so the
+    #     quadratic stream growth stays CI-tractable (the compiler's loop codegen is
+    #     ~26 steps/iter); this proves the in-forward BZ/JMP loop control.  The full
+    #     deep-loop tail (loops/gcd/rec, up to thousands of steps) is scored
+    #     separately in run_1096_pure_forward.
     ("loop_pow2",         "int main(){ int r; int i; r=1; i=0; "
-                          "while (i < 5) { r = r * 2; i = i + 1; } return r; }", 32, False),
+                          "while (i < 2) { r = r * 2; i = i + 1; } return r; }", 4, False),
 ]
 
 
