@@ -165,10 +165,18 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
                  isa.GT: v > ax, isa.LE: v <= ax, isa.GE: v >= ax}[op]
             ax = 1 if r else 0
         elif op in (isa.LI, isa.LC):
-            ax = mem.get(ax, 0) & 0xFF
+            # The §Memory KV head relays ALL value nibbles the matching store wrote
+            # (NIB_PER_REG = the full register width), and the store_log KV entry the
+            # model recalls carries the full ``ax & mask`` (see the store bookkeeping
+            # below).  So a load recalls the FULL stored value — NOT ``& 0xFF``.  The
+            # old truncation drafted 222 for a >8-bit stored value (var_simple x=990)
+            # while the model correctly recalled 990, and speculation then wrongly
+            # rejected the model's CORRECT load.  Keep the draft consistent with the
+            # store_log (the actual KV the model reads).
+            ax = mem.get(ax, 0) & mask
         elif op in (isa.SI, isa.SC):
             addr = mem.get(sp, 0); pop_val = addr; sp += 4
-            mem[addr] = ax & 0xFF
+            mem[addr] = ax & mask
         elif op == isa.JMP:
             pc = imm
         elif op == isa.BZ:

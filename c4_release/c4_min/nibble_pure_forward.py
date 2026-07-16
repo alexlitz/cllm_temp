@@ -287,24 +287,41 @@ from .nibble_vm import SILU_HALF
 # the corpus slice, so 8 low bits carry it; the upper 24 stay 0.
 # ---------------------------------------------------------------------------
 def compile_addr_expand(L, src_lane: int, bin_base: int, dim: int,
-                        n_bits: int = 8) -> Dict[str, torch.Tensor]:
+                        n_bits: int = 8, clear_bits: Optional[int] = None
+                        ) -> Dict[str, torch.Tensor]:
     """``QRY_BIN[b] = bit b of src_lane`` for b < n_bits (the low byte load address).
     bit b = (floor(v/2^b) is odd). Realise as ``v mod 2^{b+1} >= 2^b`` via two
     ReLU ramps per bit on ``v - k*2^{b+1}`` — but a compact exact form for a byte
     is: expand v to a 256-cell one-hot then sum the cells whose index has bit b set.
     We use the one-hot-then-select (the proven §510 triangular pulse), 256 relu +
-    per-bit sums. Self-clears each QRY_BIN lane (SET)."""
+    per-bit sums. Self-clears each QRY_BIN lane (SET).
+
+    ``clear_bits`` (default ``ADDR_BITS``=32) is how many QRY_BIN lanes are
+    zero-CLEARED before the low ``n_bits`` are (re)set from ``src_lane``. This MUST
+    cover the whole address width the §Memory CAM queries: the store keys expand the
+    FULL 32-bit ``ADDR_BIN`` (high bits = 0 for a ≤8-bit stack address), so the load
+    QUERY's high bits (8..31) must be an explicit 0 too — otherwise a single stale
+    high query bit disagrees with every store's 0 high bit and turns a ``+EFF``
+    exact-address match into a ``-EFF`` mismatch (the LI→0 deep-loop fade: the query
+    high bits were left uncleared, so a residual QRY_BIN[8]=1 from an earlier step
+    destroyed the address match and the load faded to ZFOD).  We only compute the
+    low ``n_bits`` from the value (stack addresses fit a byte); bits ``n_bits..
+    clear_bits`` are held at 0."""
+    from .blogspec_memory import ADDR_BITS
+    if clear_bits is None:
+        clear_bits = ADDR_BITS
+    clear_bits = max(clear_bits, n_bits)
     thresholds = list(range(-1, 257))
     n_thr = len(thresholds)
     tu = {t: j for j, t in enumerate(thresholds)}
-    n_units = n_thr + n_bits           # relu bank + self-clear per bit
+    n_units = n_thr + clear_bits       # relu bank + self-clear per (queried) bit
     spec = _empty_spec(dim, n_units)
     for t, j in tu.items():
         spec["W_up"][j, src_lane] = RELU_S
         spec["b_up"][j] = -RELU_S * t
         spec["W_gate"][j, L.ONE] = 1.0
     clear0 = n_thr
-    for b in range(n_bits):            # self-clear each QRY_BIN[b] (SET)
+    for b in range(clear_bits):        # self-clear EVERY queried QRY_BIN[b] (SET 0)
         uu = clear0 + b
         spec["W_up"][uu, L.ONE] = S
         spec["W_gate"][uu, bin_base + b] = 1.0
