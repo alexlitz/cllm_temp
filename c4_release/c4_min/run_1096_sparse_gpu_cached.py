@@ -149,6 +149,36 @@ def score_program(idx, source, expected, description, *, model, L, compile_c,
                   detail=f"exit mismatch: exp {exp} got {got}; " + detail, **base)
 
 
+def _write_output(path, results, agg, device, args, include_divmod, st,
+                  vram_load, wall, partial=False, vram_peak=0.0):
+    """Serialise the (possibly partial) scoreboard to ``path`` as JSON."""
+    counts = Counter(r.status for r in results)
+    n_pass = counts.get("PASS", 0)
+    total = len(results)
+    compact_diffs = [r.idx for r in results
+                     if "COMPACT_DIFFERS" in (r.detail or "")
+                     or "COMPACT_ERR" in (r.detail or "")]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({
+            "device": device, "shard_of": args.shard_of,
+            "shard_idx": args.shard_idx, "wall_seconds": wall,
+            "steps_total": agg.get("total_steps", 0),
+            "partial": partial,
+            "step_cap": args.step_cap, "include_divmod": include_divmod,
+            "compute_mode": args.compute_mode, "evict": not args.no_evict,
+            "vram_load_mb": vram_load, "vram_peak_mb": vram_peak,
+            "storage_mb": st.sparse_mb,
+            "check_compact": args.check_compact,
+            "compact_disagreements": compact_diffs,
+            "kv_cache": {k: agg.get(k) for k in
+                         ("max_seq_len", "max_cache_size", "total_evicted")},
+            "summary": {s: counts.get(s, 0) for s in _STATUSES}
+            | {"total": total, "pass": n_pass},
+            "clusters": dict(_cluster_table(sorted(results, key=lambda r: r.idx))),
+            "results": [asdict(r) for r in sorted(results, key=lambda r: r.idx)],
+        }, fh, indent=2)
+
+
 # ---------------------------------------------------------------------------
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -307,6 +337,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"[sparse-gpu:{device}] {i+1}/{len(indexed)} done "
                   f"(pass {npass}) [{el:.0f}s, {steps_done/max(el,1e-6):.1f} st/s] "
                   f"cache~{agg.get('max_cache_size')}", file=sys.stderr, flush=True)
+            # Incremental checkpoint: write partial results so a long deep-loop
+            # tail never loses the completed portion (JSON is rewritten each time).
+            if args.output:
+                _write_output(args.output + ".partial", results, agg, device,
+                              args, include_divmod, st, vram_load,
+                              time.monotonic() - t0, partial=True)
     wall = time.monotonic() - t0
 
     if device.startswith("cuda"):
