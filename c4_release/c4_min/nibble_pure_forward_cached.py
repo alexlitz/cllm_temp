@@ -150,12 +150,13 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
 
     survivors = kept_mask.clone()
 
-    # -- mechanism 3: ALiBi-recency horizon -----------------------------------
+    # -- mechanism 3: ALiBi-recency horizon (PER-ENTRY Cauchy-Schwarz bound) ---
     if slope is not None and slope > 0.0 and survivors.any():
         surv_idx = torch.nonzero(survivors, as_tuple=False).flatten()
         newest = int(positions[surv_idx].max())
         max_kn = float(knorm[surv_idx].max())
-        ceil_score = (max_kn * max_kn) * scale
+        # ceil_score_e = max_kn * |k_e| * scale  (0 for a zero-key entry).
+        ceil_score = (max_kn * knorm[surv_idx].to(torch.float64)) * scale
         dist = (newest - positions[surv_idx]).to(torch.float64)
         arg = (ceil_score - slope * dist).clamp(max=0.0)
         max_w = torch.exp(arg)

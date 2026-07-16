@@ -228,15 +228,21 @@ class KVCache:
         # influence is far below the byte-head's argmax margin.
         if self.slope is not None and self.slope > 0.0 and survivors:
             newest = max(e.position for e in survivors)
-            # ceil on any entry's content score q.k*scale: bounded by
-            # max_key_norm^2 * scale (query & key are same residual family, so a
-            # query's norm is bounded by the largest key norm observed). This is a
-            # conservative, model-agnostic upper bound; smaller => tighter horizon.
+            # ceil on entry e's content score q.k_e*scale, PER ENTRY, by
+            # Cauchy-Schwarz: |q.k_e| <= |q|*|k_e| <= max_kn * |k_e| (a query's
+            # norm is bounded by the largest key norm in the same residual family).
+            # This per-entry bound is TIGHTER than a single global max_kn^2 ceiling
+            # and — crucially — is 0 for a ZERO-KEY entry (its score is exactly 0
+            # before ALiBi), so a zero-key entry is evicted as soon as
+            # exp(-slope*dist) falls below recency_eps.  Still a true upper bound
+            # => output-exact.  (The old global max_kn^2 ceiling kept zero-key
+            # value-carrying markers — STEP_END, cross-role bytes — forever, which
+            # let the cache grow ~linearly; this per-entry form keeps it FLAT.)
             max_kn = max(e.key_norm() for e in survivors)
-            ceil_score = (max_kn * max_kn) * self.score_scale
             kept3: List[KVEntry] = []
             for e in survivors:
                 dist = newest - e.position
+                ceil_score = (max_kn * e.key_norm()) * self.score_scale
                 # A zero-VALUE entry never contributes to the numerator, so only
                 # its denominator term (bounded the same way) can matter; either
                 # way the recency weight bound below is the correct keep/drop test.
