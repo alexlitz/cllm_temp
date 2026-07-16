@@ -21,11 +21,10 @@ contribute exactly 0 either way.  It is a drop-in for
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from .blogspec_model import softmax1

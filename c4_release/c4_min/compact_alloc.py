@@ -218,8 +218,8 @@ def empirical_value_liveness(model, L, programs, eps: float = 1e-6):
     return first_nz, last_nz
 
 
-def refine_liveness_empirically(liveness: List[DimLiveness], first_nz, last_nz,
-                                n_blocks: int) -> List[DimLiveness]:
+def refine_liveness_empirically(liveness: List[DimLiveness], first_nz,
+                                last_nz) -> List[DimLiveness]:
     """Union the weight interval with the observed value-life interval.
 
     For each shareable dim, extend ``[def_block, last_use_block]`` to also cover
@@ -245,28 +245,17 @@ def refine_liveness_empirically(liveness: List[DimLiveness], first_nz, last_nz,
 
 # ---------------------------------------------------------------------------
 # Never-share set (the _LIVENESS_NEVER_SHARE principle).  Every dim the Python
-# driver reads/writes OUTSIDE the block stack: the overlay's writes + the
-# decode's reads.  Harvested straight off the layout ``L`` so it tracks the
-# exact bands the driver ``run_pure_forward_complete`` touches.
+# driver reads/writes OUTSIDE the block stack (the overlay's writes + the
+# decode's reads), PLUS the two driver-visible value images the weight-only
+# liveness cannot see: the embedding per-token nibble source ``CUR_NIB`` (written
+# at EVERY position incl. the query row) and the ``AX_VAL`` scalar the
+# recompose/decode consumes.  Every OTHER value-carrying scratch band (the ALU
+# pipeline, operand one-hots, query-address bins) is instead handled soundly and
+# config-generally by the empirical value-liveness pass above
+# (:func:`refine_liveness_empirically`), so it need NOT be hand-listed here.
+# Names absent in a given config are simply skipped, so the set is correct for
+# LEAN / bitwise / divmod alike.
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# The register / scalar-image bands whose VALUE persists in the additive
-# residual and is read WITHIN a forward across blocks — the c4_min analogue of
-# the bigger version's ``_LIVENESS_NEVER_SHARE_NAMES``.  These MUST keep a
-# private slot: dim-sharing is only sound when a slot is provably zero outside
-# each occupant's liveness interval, but a register/scratch VALUE is written
-# ADDITIVELY (skip connection) and is NOT re-zeroed between the block that last
-# reads it and the block that next writes the sharing partner — so a shared slot
-# would carry the stale value (0..255 / a nibble 0..15) into the partner and
-# corrupt it (the divmod/bitwise configs add exactly such short-interval scratch
-# bands next to the register images -> the observed 0xFFFFFFFF corruption).
-#
-# The names are matched against the built layout ``L._names``; a name that is
-# absent in a given config (e.g. the ALU_* divmod scratch on a LEAN build) is
-# simply skipped, so this one list is correct for LEAN / bitwise / divmod alike.
-# Driver-visible bands that the weight-only liveness cannot see AND that are
-# also empirically clamped to live-to-end below (belt-and-braces): the embedding
-# per-token nibble source + the AX_VAL scalar the recompose/decode consumes.
 _NEVER_SHARE_NAMES: Tuple[str, ...] = (
     "CUR_NIB",   # embedding-written at EVERY position incl. the query row.
     "AX_VAL",    # register scalar carried + read within-forward (cmp/callconv/fold).
@@ -278,14 +267,13 @@ def never_share_dims_from_layout(L) -> set:
     """Return the set of residual dims that must keep a private, fixed slot.
 
     Covers (1) the dims the driver's ``make_overlay_complete`` WRITES, (2) the
-    embedding-written per-token nibble source, (3) the per-step decode READS,
-    and (4) every register / scratch VALUE image read within-forward across
-    blocks (``_NEVER_SHARE_NAMES`` / ``_NEVER_SHARE_PREFIXES`` — the c4_min
-    analogue of the bigger version's ``_LIVENESS_NEVER_SHARE``).  The weight-only
-    liveness analysis sees these bands' read/write blocks but NOT that their
-    value persists (additively) in a shared slot between occupants, so they are
-    pinned live-to-end.  Names absent in a given config are skipped, so the set
-    is correct for LEAN / bitwise / divmod alike.
+    per-step decode READS, and (3) the two driver-visible value images the
+    weight-only liveness cannot see (``_NEVER_SHARE_NAMES``: ``CUR_NIB`` +
+    ``AX_VAL``).  All the OTHER value-carrying scratch bands are made
+    corruption-proof by the empirical value-liveness pass
+    (:func:`refine_liveness_empirically`), not by this set.  Names absent in a
+    given config are skipped, so the set is correct for LEAN / bitwise / divmod
+    alike.
     """
     ns: set = set()
 
@@ -526,8 +514,7 @@ def compact_model(model, L, probe_programs=None):
         probe_programs = _default_probe_programs(L)
     if probe_programs:
         first_nz, last_nz = empirical_value_liveness(model, L, probe_programs)
-        liveness = refine_liveness_empirically(liveness, first_nz, last_nz,
-                                               n_blocks)
+        liveness = refine_liveness_empirically(liveness, first_nz, last_nz)
     new_slot, new_dim = color_dims(liveness)
 
     # head_dim floor: the attention heads use per-head LOCAL channels
@@ -650,7 +637,7 @@ _PROBE_SOURCES = (
 )
 
 
-def _default_probe_programs(L, max_steps_per: int = 40):
+def _default_probe_programs(L):
     """Harvest ``(code, stream)`` probe pairs for the value-liveness pass.
 
     Compiles the built-in battery and, for each program, lays down a couple of
