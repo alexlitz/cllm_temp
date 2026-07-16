@@ -129,8 +129,53 @@ def test_vectorized_prune_matches_reference():
     assert mism == 0, f"{mism}/{trials} prune keep-set mismatches"
 
 
+def test_driver_byte_identical_naive_incl_functions_and_eviction():
+    """The KV-cached (+evicted) driver's full output is BYTE-IDENTICAL to the
+    naive re-forward driver on a battery that exercises the eviction hazards:
+    multi-step arithmetic, 32-bit values, a memory store/load round-trip, the
+    calling convention (JSR/ENT/LEV — the regression that caught the
+    address-merge bug), and a loop that triggers many prunes.
+    """
+    import c4_min.nibble_pure_forward as _PF
+    import c4_min.nibble_pure_forward_complete as _PFC
+    _PF.SP_INIT = 0xF0
+    _PFC.SP_INIT = 0xF0
+    from c4_min import isa
+    from c4_min.nibble_pure_forward_complete import (
+        build_pure_forward_complete_model, run_pure_forward_complete)
+    from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
+
+    def I(op, imm=0):
+        return isa.Instr(op, imm)
+
+    model, L = build_pure_forward_complete_model(
+        code_size=16, include_bitwise=False, include_divmod=False)
+    battery = [
+        ("add", [I(isa.IMM, 5), I(isa.PSH), I(isa.IMM, 3), I(isa.ADD),
+                 I(isa.HALT)], 20, 0xFF),
+        ("mul32", [I(isa.IMM, 1000), I(isa.PSH), I(isa.IMM, 1000), I(isa.MUL),
+                   I(isa.HALT)], 20, 0xFFFFFFFF),
+        ("si_li", [I(isa.IMM, 7), I(isa.PSH), I(isa.IMM, 200), I(isa.PSH),
+                   I(isa.IMM, 7), I(isa.SI), I(isa.IMM, 200), I(isa.LI),
+                   I(isa.HALT)], 30, 0xFF),
+        # JSR to a routine that returns AX=42, then LEV back — the calling
+        # convention over the content-addressed stack KV head.
+        ("func", [I(isa.JSR, 3), I(isa.HALT), I(isa.NOP), I(isa.ENT, 0),
+                  I(isa.IMM, 42), I(isa.LEV)], 30, 0xFF),
+        # loop that triggers many prunes (eviction-heavy).
+        ("loop", [I(isa.IMM, 16), I(isa.PSH), I(isa.IMM, 1), I(isa.SUB),
+                  I(isa.BNZ, 1), I(isa.HALT)], 100, 0xFF),
+    ]
+    for name, code, ms, mask in battery:
+        naive = run_pure_forward_complete(model, L, code, max_steps=ms, mask=mask)
+        cached = run_pure_forward_cached(
+            model, L, code, max_steps=ms, mask=mask, evict=True, prune_interval=60)
+        assert naive == cached, (name, naive, cached)
+
+
 if __name__ == "__main__":
     test_cached_attention_matches_full()
     test_uncached_forward_byte_identical()
     test_vectorized_prune_matches_reference()
+    test_driver_byte_identical_naive_incl_functions_and_eviction()
     print("all KV-cache equivalence tests passed")
