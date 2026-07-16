@@ -112,14 +112,19 @@ def apply_overlay_window(x_win: torch.Tensor, w_start: int, code, L,
 def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
                          positions: torch.Tensor, slope: float, scale: float,
                          cos_threshold: float, zero_eps: float,
-                         recency_eps: float) -> torch.Tensor:
+                         recency_eps: float,
+                         dup_metric: str = "cosine") -> torch.Tensor:
     """Return a boolean ``[S]`` keep-mask == the survivors of ``KVCache.prune``.
 
     Reproduces, in order:
-      mech 1 (near-dup cos-sim>thr, keep the NEWER of a duplicate pair),
+      mech 1 (near-dup, keep the NEWER of a duplicate pair; ``dup_metric``),
       mech 3 (ALiBi-recency horizon: drop max_w < recency_eps),
       mech 2a (dead-value head: all survivors zero-value -> drop all),
       mech 2b (free-zero stale: drop fully-zero recency-negligible entries).
+
+    ``dup_metric`` = "cosine" (register-marker heads) or "exact" (content-
+    addressed §Memory heads whose keys share a large ADDR_BIN common-mode bias;
+    see ``nibble_kv_prune.KVCache.prune``).
     """
     import math
     S = keys.shape[0]
@@ -129,22 +134,33 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
     vnorm = vals.norm(dim=-1)                                   # [S]
 
     # -- mechanism 1: greedy newest-first near-duplicate drop -----------------
-    # cosine_sim(a,b) = 0 if either key is zero, else dot/(|a||b|).
     order = torch.argsort(positions, descending=True)          # newest first
     kept_mask = torch.zeros(S, dtype=torch.bool)               # index-space mask
-    # normalised keys for cosine (zero-norm rows -> zero vector -> sim 0).
-    safe = knorm.clamp(min=1e-30)
-    unit = keys / safe.unsqueeze(-1)
-    unit[knorm == 0] = 0.0
     kept_idx: List[int] = []
-    for oi in order.tolist():
-        if kept_idx:
-            # cos-sim of this entry vs all already-kept (newer) entries.
-            sims = unit[kept_idx] @ unit[oi]                   # [n_kept]
-            # zero-key entries -> sim 0 (both directions) via the zeroed unit.
-            if float(sims.max()) > cos_threshold:
-                continue
-        kept_idx.append(oi)
+    if dup_metric == "exact":
+        # relative-L2: |k_e - k| <= (1-cos_threshold)*max(|k_e|,|k|).  Merges only
+        # verbatim-identical keys, so distinct content addresses all survive.
+        tol = 1.0 - cos_threshold
+        for oi in order.tolist():
+            if kept_idx:
+                diff = (keys[kept_idx] - keys[oi]).norm(dim=-1)
+                denom = torch.maximum(
+                    knorm[kept_idx],
+                    knorm[oi].expand_as(knorm[kept_idx])).clamp(min=1e-30)
+                if bool((diff <= tol * denom).any()):
+                    continue
+            kept_idx.append(oi)
+    else:
+        # raw cosine (zero-key rows -> unit 0 -> sim 0, matching cosine_sim).
+        safe = knorm.clamp(min=1e-30)
+        unit = keys / safe.unsqueeze(-1)
+        unit[knorm == 0] = 0.0
+        for oi in order.tolist():
+            if kept_idx:
+                sims = unit[kept_idx] @ unit[oi]               # [n_kept]
+                if float(sims.max()) > cos_threshold:
+                    continue
+            kept_idx.append(oi)
     for oi in kept_idx:
         kept_mask[oi] = True
 
@@ -258,14 +274,25 @@ class BlockKVCacheBatched:
         # drops all its entries (no keep_any contribution). Skip it entirely.
         vnorm = self.V[0].norm(dim=-1)                       # [H, S]
         head_has_value = (vnorm > zero_eps).any(dim=-1)      # [H]
+        # per-head near-dup metric: a CONTENT-ADDRESSED head (a §Memory store head)
+        # has keys dominated by a shared common-mode bias (the ADDR_BIN `-smag`
+        # term), so raw cosine cannot separate distinct addresses (0.999) and would
+        # wrongly merge distinct stores.  Detect it by the common-mode fraction
+        # |mean_key| / mean(|key|): high (~1) for such heads, low for register-
+        # marker heads whose distinct keys spread in direction.  Use the exact
+        # (relative-L2) dup metric on those heads so every distinct store survives.
+        knorm_hs = self.K[0].norm(dim=-1)                    # [H, S]
+        mean_key = self.K[0].mean(dim=1)                     # [H, HD]
+        cm_frac = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
         for h in range(self.n_heads):
             if not bool(head_has_value[h]):
                 continue                                     # mechanism 2a: evict all
+            metric = "exact" if float(cm_frac[h]) > 0.9 else "cosine"
             mask = prune_keep_mask_head(
                 self.K[0, h], self.V[0, h], self.pos,
                 slope=float(self.slopes[h]), scale=self.scale,
                 cos_threshold=cos_threshold, zero_eps=zero_eps,
-                recency_eps=recency_eps)
+                recency_eps=recency_eps, dup_metric=metric)
             keep_any |= mask
         keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
         dropped = S - int(keep_idx.numel())

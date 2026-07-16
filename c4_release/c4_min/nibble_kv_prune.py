@@ -139,10 +139,15 @@ class KVCache:
                  zero_eps: float = ZERO_VALUE_EPS,
                  slope: Optional[float] = None,
                  recency_eps: float = RECENCY_WEIGHT_EPS,
-                 score_scale: float = 1.0):
+                 score_scale: float = 1.0,
+                 dup_metric: str = "cosine"):
         self.cos_threshold = cos_threshold
         self.prune_interval = prune_interval
         self.zero_eps = zero_eps
+        # near-duplicate metric for mechanism 1: "cosine" (register-marker heads,
+        # the default/original policy) or "exact" (content-addressed §Memory heads
+        # whose keys share a large ADDR_BIN common-mode bias — see prune()).
+        self.dup_metric = dup_metric
         # ``slope`` is this head's ALiBi slope; enables the recency-horizon
         # mechanism (mechanism 3). When None, only cos-sim + zero-value fire.
         self.slope = slope
@@ -211,10 +216,33 @@ class KVCache:
         # Sort newest-first; keep an entry only if it is not a near-duplicate of
         # an already-kept (hence newer) entry. That deterministically drops the
         # older member of every duplicate group (keeps the live marker).
+        #
+        # ``dup_metric`` selects HOW "near-duplicate" is measured:
+        #   * "cosine" (default): raw cosine > cos_threshold — the original policy,
+        #     correct for register-marker heads whose distinct keys are well
+        #     separated in direction.
+        #   * "exact": relative-L2 |k_e - k| <= (1-cos_threshold)*|k| — used for a
+        #     CONTENT-ADDRESSED head (a §Memory store) whose keys carry a large
+        #     shared ADDR_BIN common-mode bias, so DIFFERENT addresses are
+        #     ~parallel (raw cosine 0.999) and a cosine dup-test would wrongly merge
+        #     distinct stores (a later load then reads 0). Relative-L2 is ~0 only
+        #     for a VERBATIM-repeated key (true latest-write-wins) and stays O(smag)
+        #     apart for distinct addresses, so every distinct store survives.
         ordered = sorted(self.entries, key=lambda e: e.position, reverse=True)
         survivors: List[KVEntry] = []
+        tol = 1.0 - self.cos_threshold
         for e in ordered:
-            if any(cosine_sim(e.key, k.key) > self.cos_threshold for k in survivors):
+            if self.dup_metric == "exact":
+                dup = False
+                for k in survivors:
+                    denom = max(float(k.key.norm()), float(e.key.norm()), 1e-30)
+                    if float((e.key - k.key).norm()) <= tol * denom:
+                        dup = True
+                        break
+            else:
+                dup = any(cosine_sim(e.key, k.key) > self.cos_threshold
+                          for k in survivors)
+            if dup:
                 continue                      # older near-dup of a kept newer key
             survivors.append(e)
 
