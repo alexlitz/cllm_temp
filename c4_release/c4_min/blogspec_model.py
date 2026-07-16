@@ -62,29 +62,74 @@ class Attn(nn.Module):
         )
         self.register_buffer("alibi_slopes", slopes)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, past_kv=None, q_positions=None,
+                use_cache: bool = False):
+        """Multi-head softmax1 + ALiBi attention.
+
+        Default path (``past_kv is None``, ``q_positions is None``,
+        ``use_cache=False``) is **byte-identical** to the un-cached spec forward:
+        the new tokens sit at absolute positions ``0..S-1`` and attend causally
+        over themselves.
+
+        Incremental / cached path (``past_kv`` given):
+          * ``x`` is only the NEW query tokens (``[B, Snew, D]``); ``q_positions``
+            gives their ABSOLUTE sequence positions (a ``[Snew]`` long tensor).
+          * ``past_kv = (K_cache, V_cache, pos_cache)`` holds the K/V of the
+            already-seen tokens (``[B, H, Sc, HD]`` + ``[Sc]`` positions).
+          * K/V are computed for the new tokens only, concatenated with the cache,
+            and the query attends over the union.  ALiBi distance uses ABSOLUTE
+            positions (``|q_pos - k_pos|``) so the bias is identical to the
+            un-cached forward, and softmax1's ``+1`` sink is preserved verbatim.
+
+        Returns ``out`` (default) or ``(out, (K_all, V_all, pos_all))`` when
+        ``use_cache`` — the updated per-block cache for the next step.
+        """
         B, S, D = x.shape
         H, HD = self.n_heads, self.head_dim
         Q = F.linear(x, self.W_q).view(B, S, H, HD).transpose(1, 2)
-        K = F.linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
-        V = F.linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+        Knew = F.linear(x, self.W_k).view(B, S, H, HD).transpose(1, 2)
+        Vnew = F.linear(x, self.W_v).view(B, S, H, HD).transpose(1, 2)
+
+        # Absolute positions of the query rows.
+        if q_positions is None:
+            q_pos = torch.arange(S, device=x.device)
+        else:
+            q_pos = q_positions.to(device=x.device, dtype=torch.long)
+
+        # Assemble the full K/V (cache + new) and their absolute positions.
+        if past_kv is not None:
+            K_cache, V_cache, pos_cache = past_kv
+            K = torch.cat([K_cache, Knew], dim=2)
+            V = torch.cat([V_cache, Vnew], dim=2)
+            k_pos = torch.cat([pos_cache.to(x.device), q_pos], dim=0)
+        else:
+            K, V, k_pos = Knew, Vnew, q_pos
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
-        # ALiBi bias: -slope * |i - j| (§327-331).
-        pos = torch.arange(S, device=x.device)
-        dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()
-        scores = scores - self.alibi_slopes.view(1, H, 1, 1) * dist
-
-        # Causal mask.
-        causal = torch.triu(
-            torch.full((S, S), float("-inf"), device=x.device), diagonal=1
-        )
-        scores = scores + causal
+        if past_kv is None and q_positions is None:
+            # -- default (un-cached) path: byte-identical to the original spec --
+            pos = torch.arange(S, device=x.device)
+            dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()
+            scores = scores - self.alibi_slopes.view(1, H, 1, 1) * dist
+            causal = torch.triu(
+                torch.full((S, S), float("-inf"), device=x.device), diagonal=1
+            )
+            scores = scores + causal
+        else:
+            # -- cached / windowed path: ALiBi + causal over ABSOLUTE positions --
+            dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs().float()
+            scores = scores - self.alibi_slopes.view(1, H, 1, 1) * dist.unsqueeze(0)
+            mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1))     # [Sq, Sk]
+            scores = scores.masked_fill(
+                mask.unsqueeze(0).unsqueeze(0), float("-inf"))
 
         attn = softmax1(scores, dim=-1)          # §491 softmax1 (ZFOD)
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, S, D)
-        return x + F.linear(out, self.W_o)
+        out = x + F.linear(out, self.W_o)
+        if use_cache:
+            return out, (K, V, k_pos)
+        return out
 
 
 class FFN(nn.Module):
@@ -112,7 +157,12 @@ class Block(nn.Module):
         self.attn = Attn(dim, n_heads, max_seq_len)
         self.ffn = FFN(dim, hidden)
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None, q_positions=None, use_cache: bool = False):
+        if use_cache or past_kv is not None or q_positions is not None:
+            a, new_kv = self.attn(x, past_kv=past_kv, q_positions=q_positions,
+                                  use_cache=True)
+            out = self.ffn(a)
+            return (out, new_kv) if use_cache else out
         return self.ffn(self.attn(x))
 
 
@@ -145,3 +195,27 @@ class Transformer(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         return F.linear(x, self.lm_head, self.lm_bias)
+
+    def forward_hidden_cached(self, x, past_key_values=None, q_positions=None,
+                              use_cache: bool = False):
+        """Run the BLOCK stack (no LM head) with an optional per-block KV cache.
+
+        ``x`` is the pre-embedded / overlaid residual for the NEW query rows only
+        (``[B, Snew, D]``); ``q_positions`` gives their absolute positions.
+        ``past_key_values`` is a list (one entry per block) of ``(K, V, pos)``
+        caches, or ``None`` for the first step.  Returns ``(hidden, new_caches)``
+        where ``hidden`` is the block-stack output for the query rows and
+        ``new_caches`` is the updated per-block cache list.
+
+        The register/nibble decode reads ``hidden[:, -1]`` exactly as the naive
+        driver reads ``model.forward``'s last row — this only changes HOW the
+        block stack is evaluated (incremental K/V), not WHAT it computes.
+        """
+        n = len(self.blocks)
+        if past_key_values is None:
+            past_key_values = [None] * n
+        new_caches = []
+        for blk, pkv in zip(self.blocks, past_key_values):
+            x, kv = blk(x, past_kv=pkv, q_positions=q_positions, use_cache=True)
+            new_caches.append(kv)
+        return x, new_caches
