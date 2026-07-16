@@ -24,7 +24,9 @@ MUL, DIV, MOD = 27, 28, 29
 # File / system opcodes (§File Operations). Values match the BLOG_SPEC opcode
 # table (30-33). These cross the computation/outside-world boundary, so they are
 # dispatched via the TOOL_CALL-token protocol (see ``nibble_filesys``) rather
-# than being computed neurally like the ALU ops above.
+# than being computed neurally like the ALU ops above. PRTF (op 33) is the
+# printf visible-output byte channel, shared by the tool-IO dispatch and the
+# think-tag string quine (§System / §Printing).
 OPEN, READ, CLOS, PRTF = 30, 31, 32, 33
 NOP = 39
 HALT = 38  # alias EXIT
@@ -67,11 +69,15 @@ def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
     return out
 
 
-def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256):
+def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
+              out: list = None):
     """Reference 8-bit interpreter. Returns list of AX values emitted per step.
 
     Stack grows downward from ``mem_size`` (top). ``pop`` reads stack[SP] then SP+=1.
-    Emits the value of AX after each executed step.
+    Emits the value of AX after each executed step. If ``out`` is a list, PRTF
+    appends ``AX & 0xFF`` to it — the byte-stream a real stdout would see (the
+    ``printf("%c", AX)`` visible-output channel, §System / op 33). This is the
+    single-char printf form the classic string quine uses.
     """
     ax = sp = bp = 0
     sp = mem_size          # empty stack
@@ -139,6 +145,9 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256):
             ax = mem[ax] & MASK
         elif op == SI:
             mem[pop()] = ax & MASK
+        elif op == PRTF:
+            if out is not None:
+                out.append(ax & 0xFF)   # printf visible output byte; AX unchanged
         elif op == JMP:
             pc = imm
         elif op == BZ:

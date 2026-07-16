@@ -35,12 +35,22 @@ STEP_END = 261
 HALT     = 262   # program-halt terminator (EXIT); ends generation (§Exiting)
 BOS      = 263   # attention sink / position anchor
 SEP      = 264   # system-prompt section separator (token 256 in the spec)
+# --- think-tag I/O contract (BLOG_SPEC §Printing and Reading Input, line 851) --
+# "all VM computation happens inside THINK_START/THINK_END tags (hidden from the
+#  user), and when a printf executes, the model exits the think block, emits a
+#  character byte token (visible to the user), then re-enters the think block".
+# So the 30-token register frames live inside THINK; a PRTF step emits THINK_END,
+# then a *visible* byte token (0..255), then THINK_START. The VISIBLE OUTPUT of a
+# program is exactly the byte tokens that appear OUTSIDE think tags.
+THINK_START = 265
+THINK_END   = 266
 
-VOCAB = 265
+VOCAB = 267
 
 MARKER_NAMES = {
     REG_PC: "REG_PC", REG_AX: "REG_AX", REG_SP: "REG_SP", REG_BP: "REG_BP",
     MEM: "MEM", STEP_END: "STEP_END", HALT: "HALT", BOS: "BOS", SEP: "SEP",
+    THINK_START: "THINK_START", THINK_END: "THINK_END",
 }
 
 # order of the four registers in a step frame
@@ -73,6 +83,28 @@ def build_step_frame(pc: int, ax: int, sp: int, bp: int,
     frame += [STEP_END]
     assert len(frame) == FRAME_LEN, len(frame)
     return frame
+
+
+def visible_output(tokens: List[int]) -> List[int]:
+    """Extract the user-visible byte stream from a full token stream: the byte
+    tokens (0..255) that appear OUTSIDE the THINK_START/THINK_END tags.
+
+    The stream starts inside a think block (THINK_START is emitted right after
+    BOS by the driver). A PRTF step emits ``THINK_END, <byte>, THINK_START``: the
+    single byte between an END and the next START is visible output; every byte
+    inside the think block (the register frames) is hidden. This is exactly the
+    think-tag protocol the spec uses to separate internal VM thinking from
+    user-facing stdout (BLOG_SPEC line 851)."""
+    out: List[int] = []
+    inside = True                         # the run opens with THINK_START
+    for t in tokens:
+        if t == THINK_START:
+            inside = True
+        elif t == THINK_END:
+            inside = False
+        elif not inside and 0 <= t <= 255:
+            out.append(t)                 # a visible (outside-think) byte token
+    return out
 
 
 def parse_step_frame(frame: List[int]) -> dict:
