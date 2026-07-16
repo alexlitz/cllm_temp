@@ -61,14 +61,32 @@ COS_SIM_THRESHOLD = 0.99      # keys nearer than this are duplicates (line 814)
 PRUNE_INTERVAL_TOKENS = 120   # eviction runs every ~120 tokens / ~3 VM steps (816)
 ZERO_VALUE_EPS = 1e-9         # a value embedding within this of 0 is a "zero write"
 # ALiBi-recency negligibility: an entry whose *maximum possible* softmax1 weight
-# (bounded by exp(-slope * distance_from_newest_entry), since a query's raw score
-# for any entry is at most that of the newest content-matched key, and the older
-# entry carries an extra -slope*distance ALiBi penalty) falls below this epsilon
-# is dominated by recency and can never win non-trivial attention -> evictable.
-# This is the explicit realisation of the spec's own eviction justification
-# ("ALiBi's steep recency bias ... will never win non-trivial attention weight",
-# line 814). At head-0's slope 0.25 this triggers ~90 tokens (3 frames) back.
+# falls below this epsilon is dominated by recency and can never win non-trivial
+# attention -> evictable. The max-weight bound is
+#     exp( own_ceil - slope * distance_from_newest )
+# where ``own_ceil = own_key_norm^2 * scale`` is the score a query *maximally
+# aligned to THIS entry's own key* would produce (the best case for recalling this
+# specific entry). Using the entry's OWN key norm — not a single global ceiling for
+# the whole head — is the STORE-EARLY/LOAD-LATE correctness pivot
+# (``docs/KV_EVICTION_HARDENING_2026_07_15.md``): a zero-/weak-key byte-value token
+# has a negligible ``own_ceil`` and becomes recency-dead once ``slope*dist`` exceeds
+# it (this is what bounds the cache), but an ADDRESS-LIVE memory store has a *large*
+# ``own_ceil`` — BLOG_SPEC line 410: the memory head's ``sum(scale^2)`` is chosen
+# large enough that an exact-address query "beats ALiBi even ... far in the past" —
+# so it stays recallable and is NEVER recency-evicted while non-superseded. At
+# head-0's slope 0.25 a zero-key byte token triggers ~90 tokens (3 frames) back; a
+# strong-key store does not.
 RECENCY_WEIGHT_EPS = 1e-6
+# Address-liveness protection (the store-early/load-late fix). An entry whose own
+# aligned content score ``key_norm^2 * scale`` is at least this multiple of the
+# recency budget ``|ln(recency_eps)|`` is treated as ADDRESS-LIVE: a future
+# exact-match query can still recall it, so recency (mechanism 3) may not evict it —
+# it leaves the cache only by supersession (a newer near-duplicate key, mechanism 1)
+# or a zero write (mechanism 2). This makes the policy keep entries by ADDRESS
+# LIVENESS, not just recency, exactly as the spec's memory design requires. The
+# default 1.0 is the natural boundary (score can still clear the recency floor at
+# dist 0); it is deliberately conservative (keeps rather than drops on the margin).
+ADDRESS_LIVE_MARGIN = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +158,10 @@ class KVCache:
                  slope: Optional[float] = None,
                  recency_eps: float = RECENCY_WEIGHT_EPS,
                  score_scale: float = 1.0,
-                 dup_metric: str = "cosine"):
+                 address_live_margin: float = ADDRESS_LIVE_MARGIN):
         self.cos_threshold = cos_threshold
         self.prune_interval = prune_interval
         self.zero_eps = zero_eps
-        # near-duplicate metric for mechanism 1: "cosine" (register-marker heads,
-        # the default/original policy) or "exact" (content-addressed §Memory heads
-        # whose keys share a large ADDR_BIN common-mode bias — see prune()).
-        self.dup_metric = dup_metric
         # ``slope`` is this head's ALiBi slope; enables the recency-horizon
         # mechanism (mechanism 3). When None, only cos-sim + zero-value fire.
         self.slope = slope
@@ -155,11 +169,61 @@ class KVCache:
         # attention score scale (head_dim**-0.5) — used to bound content scores
         # in the recency horizon so its weight bound matches the real softmax1.
         self.score_scale = score_scale
+        # address-liveness protection multiple (see ADDRESS_LIVE_MARGIN): a
+        # strong-key entry (own aligned score >= margin * recency budget) is never
+        # recency-evicted, only superseded — the store-early/load-late fix.
+        self.address_live_margin = address_live_margin
         self.entries: List[KVEntry] = []
         self._tokens_since_prune = 0
         # bookkeeping for the bounded-growth measurement
         self.total_appended = 0
         self.total_evicted = 0
+        # diagnostics: how many entries mechanism 3 protected as address-live.
+        self.address_live_protected = 0
+
+    # -- address-liveness test (the store-early/load-late correctness pivot) --
+    def _is_address_live(self, entry: "KVEntry") -> bool:
+        """True iff a future exact-match query could still recall ``entry`` past
+        the recency floor — i.e. its OWN aligned content score
+        ``key_norm^2 * score_scale`` reaches at least ``address_live_margin`` times
+        the recency budget ``|ln(recency_eps)|``. Such an entry is ADDRESS-LIVE:
+        recency (mechanism 3) may never evict it (only supersession / zero-write
+        can), because a load matching its address key beats ALiBi at any distance
+        (BLOG_SPEC line 410). A zero-/weak-key byte-value token fails this test and
+        stays recency-governed (which is what keeps the cache bounded)."""
+        import math
+        own_ceil = (entry.key_norm() ** 2) * self.score_scale
+        budget = abs(math.log(self.recency_eps)) if self.recency_eps > 0.0 else 0.0
+        return own_ceil >= self.address_live_margin * budget
+
+    # -- recency-negligibility test (the mechanism-1 supersession + mech-3 pivot) --
+    def _max_future_weight(self, entry: "KVEntry", newest_pos: int) -> float:
+        """The entry's LARGEST possible softmax1 weight for ANY future frontier
+        query (best case: a query perfectly aligned to THIS entry's own key, sitting
+        at the newest live position so the ALiBi distance is minimal and only grows).
+
+            max_w = exp( min(0, own_key_norm^2 * scale  -  slope * (newest - pos)) )
+
+        This upper-bounds the entry's contribution to BOTH the softmax1 numerator
+        (its weighted value) AND its ``exp(score)`` term in the denominator, so an
+        entry with ``max_w < recency_eps`` is an output no-op to that tolerance for
+        every future query — the single condition that makes dropping it byte-exact
+        (mechanism 3), and the CORRECT gate for near-duplicate supersession
+        (mechanism 1). Requires the head slope; ``None`` when slope is unknown."""
+        import math
+        if self.slope is None or self.slope <= 0.0:
+            return 1.0                    # no recency model -> assume load-bearing
+        dist = newest_pos - entry.position
+        own_ceil = (entry.key_norm() ** 2) * self.score_scale
+        return math.exp(min(0.0, own_ceil - self.slope * dist))
+
+    def _is_recency_negligible(self, entry: "KVEntry", newest_pos: int) -> bool:
+        """True iff ``entry`` can never win non-trivial attention again — its max
+        future softmax1 weight is below ``recency_eps``. Safe-to-drop for ANY value
+        (register re-emit OR distinct memory), because both its numerator and
+        denominator contributions are below tolerance. This is the ONE bound that
+        makes eviction byte-exact; mechanisms 1 and 3 both key off it."""
+        return self._max_future_weight(entry, newest_pos) < self.recency_eps
 
     # -- generation-loop interface ------------------------------------------
     def append(self, key: torch.Tensor, value: torch.Tensor, position: int,
@@ -185,20 +249,36 @@ class KVCache:
         each key group (e.g. the live register marker) is retained before the
         recency/zero rules look at what remains.
 
-        Mechanism 1 (cos-sim>0.99 + recency): whenever two keys are near-dup the
-        *older* (smaller position) is dropped — ALiBi gives it a permanently
-        smaller weight than the newer identical copy (latest-write-wins). This
-        keeps the newest marker of each register/address.
+        Mechanism 1 (cos-sim>0.99 + RECENCY-GATED supersession): whenever two keys
+        are near-dup the *older* (smaller position) is dropped ONLY once its own max
+        future softmax1 weight is recency-negligible (``_is_recency_negligible``).
+        The recency gate is the correctness fix (docs/KV_EVICTION_HARDENING): a
+        near-duplicate KEY does not imply a superseded VALUE, and even a same-value
+        older copy's ``exp(score)`` is load-bearing in the softmax1 DENOMINATOR while
+        it is still recency-live — so latest-write-wins is only OUTPUT-EXACT once the
+        older copy is recency-dead. This keeps the newest marker of each register/
+        address, drops overwritten address values once ALiBi crushes them (not
+        before), and never drops a recency-live near-dup that still contributes.
 
-        Mechanism 3 (ALiBi-recency horizon): an entry whose *max possible* future
-        softmax1 weight is below ``recency_eps`` is dominated by recency and can
-        never win non-trivial attention — safe to evict. The bound accounts for
-        the entry's best content score (bounded by its key norm) PLUS its ALiBi
-        penalty: ``exp(ceil_score - slope*dist)`` where any future query sits at
-        position >= newest, so ``dist >= newest_pos - pos`` only grows. This is
-        the explicit form of the spec's justification ("ALiBi's steep recency
-        bias ... will never win non-trivial attention weight") and generalises
-        mechanism 1 to non-duplicate old payloads.
+        Mechanism 3 (ALiBi-recency horizon, ADDRESS-LIVENESS-AWARE): an entry whose
+        *max possible* future softmax1 weight is below ``recency_eps`` is dominated
+        by recency and can never win non-trivial attention — safe to evict. The
+        bound uses the entry's OWN aligned content score ceiling
+        ``own_key_norm^2 * scale`` (the best a query aligned to THIS entry's key
+        could score) PLUS its ALiBi penalty: ``exp(own_ceil - slope*dist)``, where
+        any future query sits at position >= newest so ``dist`` only grows.
+
+        Using the entry's OWN key norm — not a single head-wide ceiling — is the
+        store-early/load-late correctness pivot. A weak/zero-key byte-value token
+        has a tiny ``own_ceil`` and is recency-dead once ``slope*dist`` exceeds it
+        (this is what bounds the cache). But an ADDRESS-LIVE memory store has a
+        *large* ``own_ceil`` (BLOG_SPEC line 410: the memory head's ``sum(scale^2)``
+        is chosen so an exact-address query beats ALiBi "even ... far in the past"),
+        so ``_is_address_live`` is True and mechanism 3 NEVER evicts it — a value
+        stored once and loaded thousands of steps later survives, because a matching
+        load can still recall it. Such entries leave the cache only by supersession
+        (mechanism 1, a newer same-address write) or a zero write (mechanism 2).
+        This is the spec's "keep by address liveness, not just recency" guarantee.
 
         Mechanism 2 (free zero): a fully-zero entry (value==0 AND key==0) is an
         exact softmax1 no-op at any position (adds 0 to the numerator and only
@@ -212,38 +292,43 @@ class KVCache:
             self._tokens_since_prune = 0
             return 0
 
-        # --- mechanism 1: near-duplicate keys -> evict the OLDER --------------
-        # Sort newest-first; keep an entry only if it is not a near-duplicate of
-        # an already-kept (hence newer) entry. That deterministically drops the
-        # older member of every duplicate group (keeps the live marker).
+        # --- mechanism 1: near-duplicate keys -> evict the OLDER (RECENCY-GATED)
+        # Sort newest-first; keep an entry unless it is a near-duplicate of an
+        # already-kept (hence newer) entry AND its OWN max future softmax1 weight is
+        # already recency-negligible. The recency gate is the CORRECTNESS FIX
+        # (docs/KV_EVICTION_HARDENING_2026_07_15.md, the adversarial-recency bug):
         #
-        # ``dup_metric`` selects HOW "near-duplicate" is measured:
-        #   * "cosine" (default): raw cosine > cos_threshold — the original policy,
-        #     correct for register-marker heads whose distinct keys are well
-        #     separated in direction.
-        #   * "exact": relative-L2 |k_e - k| <= (1-cos_threshold)*|k| — used for a
-        #     CONTENT-ADDRESSED head (a §Memory store) whose keys carry a large
-        #     shared ADDR_BIN common-mode bias, so DIFFERENT addresses are
-        #     ~parallel (raw cosine 0.999) and a cosine dup-test would wrongly merge
-        #     distinct stores (a later load then reads 0). Relative-L2 is ~0 only
-        #     for a VERBATIM-repeated key (true latest-write-wins) and stays O(smag)
-        #     apart for distinct addresses, so every distinct store survives.
+        #   A near-duplicate KEY does NOT imply a superseded VALUE. Two entries can
+        #   share a key DIRECTION (cos-sim > 0.99) yet carry DIFFERENT values (two
+        #   distinct memory writes that happen to alias a key direction; a register
+        #   marker whose payload changed). Even when the values MATCH, the older
+        #   copy's ``exp(score)`` term is load-bearing in the softmax1 DENOMINATOR
+        #   while it is still recency-live — dropping it re-weights every other
+        #   entry. So "latest-write-wins" is only output-exact once the older copy is
+        #   recency-negligible: at that point its numerator AND denominator terms are
+        #   both < recency_eps and removal is a byte-exact no-op regardless of value.
+        #
+        # Gating on ``_is_recency_negligible`` (the mechanism-3 bound, using the
+        # entry's OWN key ceiling) makes supersession exact in every case:
+        #   * churn markers ≥1 frame apart  -> older is recency-negligible -> dropped
+        #     (the CHK-6 register stream: byte-identical, cache stays flat);
+        #   * an ADDRESS-LIVE value OVERWRITTEN by a newer same-address write -> the
+        #     old write stays recallable (and IS kept) until ALiBi crushes it (~119
+        #     tokens at head-0), exactly as the unbounded cache recalls it, THEN it
+        #     is dropped -> latest-write-wins is honoured WITHOUT resurrecting or
+        #     prematurely dropping the stale value;
+        #   * two recency-live near-dups with different values -> BOTH kept (they both
+        #     contribute), fixing the divergence the un-gated rule produced.
+        # When slope is unknown (no head pass) the gate is conservative (keeps), so a
+        # slope-less caller never drops a possibly-live near-dup.
         ordered = sorted(self.entries, key=lambda e: e.position, reverse=True)
+        newest_pos_all = ordered[0].position
         survivors: List[KVEntry] = []
-        tol = 1.0 - self.cos_threshold
         for e in ordered:
-            if self.dup_metric == "exact":
-                dup = False
-                for k in survivors:
-                    denom = max(float(k.key.norm()), float(e.key.norm()), 1e-30)
-                    if float((e.key - k.key).norm()) <= tol * denom:
-                        dup = True
-                        break
-            else:
-                dup = any(cosine_sim(e.key, k.key) > self.cos_threshold
-                          for k in survivors)
-            if dup:
-                continue                      # older near-dup of a kept newer key
+            is_near_dup = any(
+                cosine_sim(e.key, k.key) > self.cos_threshold for k in survivors)
+            if is_near_dup and self._is_recency_negligible(e, newest_pos_all):
+                continue                      # superseded AND recency-dead -> drop
             survivors.append(e)
 
         # --- mechanism 3: ALiBi-recency horizon (needs the head slope) --------
@@ -254,28 +339,29 @@ class KVCache:
         # is thus an output no-op to that tolerance — regardless of its value.
         # This is what makes eviction byte-exact: a dropped entry's decode
         # influence is far below the byte-head's argmax margin.
+        #
+        # HARDENED (store-early/load-late): the score ceiling is the entry's OWN
+        # aligned score ``own_key_norm^2 * scale`` (best case for recalling exactly
+        # this entry), NOT a single head-wide max. And an ADDRESS-LIVE entry
+        # (``_is_address_live``: own ceiling reaches the recency budget, so an
+        # exact-address load could still win at any distance — BLOG_SPEC line 410)
+        # is NEVER evicted here; it can only be superseded (mech 1) or zeroed
+        # (mech 2). A weak/zero-key byte-value token is not address-live and still
+        # recency-evicts once ``slope*dist`` exceeds its (tiny) own ceiling — which
+        # is exactly what keeps the cache bounded on the register-churn stream.
         if self.slope is not None and self.slope > 0.0 and survivors:
             newest = max(e.position for e in survivors)
-            # ceil on entry e's content score q.k_e*scale, PER ENTRY, by
-            # Cauchy-Schwarz: |q.k_e| <= |q|*|k_e| <= max_kn * |k_e| (a query's
-            # norm is bounded by the largest key norm in the same residual family).
-            # This per-entry bound is TIGHTER than a single global max_kn^2 ceiling
-            # and — crucially — is 0 for a ZERO-KEY entry (its score is exactly 0
-            # before ALiBi), so a zero-key entry is evicted as soon as
-            # exp(-slope*dist) falls below recency_eps.  Still a true upper bound
-            # => output-exact.  (The old global max_kn^2 ceiling kept zero-key
-            # value-carrying markers — STEP_END, cross-role bytes — forever, which
-            # let the cache grow ~linearly; this per-entry form keeps it FLAT.)
-            max_kn = max(e.key_norm() for e in survivors)
             kept3: List[KVEntry] = []
             for e in survivors:
-                dist = newest - e.position
-                ceil_score = (max_kn * e.key_norm()) * self.score_scale
-                # A zero-VALUE entry never contributes to the numerator, so only
-                # its denominator term (bounded the same way) can matter; either
-                # way the recency weight bound below is the correct keep/drop test.
-                max_w = math.exp(min(0.0, ceil_score - self.slope * dist))
-                if max_w >= self.recency_eps:
+                if self._is_address_live(e):
+                    kept3.append(e)                 # protected: recall beats recency
+                    self.address_live_protected += 1
+                    continue
+                # A zero-VALUE entry never contributes to the numerator, so only its
+                # denominator term (bounded the same way) can matter; either way the
+                # recency weight bound is the correct keep/drop test. Uses the entry's
+                # OWN key ceiling (store-early/load-late pivot), shared with mech 1.
+                if not self._is_recency_negligible(e, newest):
                     kept3.append(e)
             survivors = kept3
 
@@ -365,7 +451,8 @@ class MultiHeadKVCache:
                  cos_threshold: float = COS_SIM_THRESHOLD,
                  prune_interval: int = PRUNE_INTERVAL_TOKENS,
                  zero_eps: float = ZERO_VALUE_EPS,
-                 recency_eps: float = RECENCY_WEIGHT_EPS):
+                 recency_eps: float = RECENCY_WEIGHT_EPS,
+                 address_live_margin: float = ADDRESS_LIVE_MARGIN):
         self.n_heads = n_heads
         self.head_dim = head_dim
         self.slopes = slopes
@@ -375,7 +462,8 @@ class MultiHeadKVCache:
         self.heads = [
             KVCache(cos_threshold, prune_interval, zero_eps,
                     slope=float(slopes[h]), recency_eps=recency_eps,
-                    score_scale=self.scale)
+                    score_scale=self.scale,
+                    address_live_margin=address_live_margin)
             for h in range(n_heads)
         ]
 
@@ -410,6 +498,13 @@ class MultiHeadKVCache:
         """Live entries in a single head (all heads prune identically-shaped, but
         may differ if keys differ per head)."""
         return len(self.heads[0])
+
+    def address_live_protected(self) -> int:
+        """Total mechanism-3 recency-eviction *skips* across all heads (an entry
+        kept because it is ADDRESS-LIVE — its own aligned score can still recall it
+        past the recency floor). Nonzero => the store-early/load-late protection
+        actually fired on this run."""
+        return sum(c.address_live_protected for c in self.heads)
 
 
 # ---------------------------------------------------------------------------

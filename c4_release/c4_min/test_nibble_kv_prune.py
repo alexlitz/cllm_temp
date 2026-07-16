@@ -81,14 +81,35 @@ def test_zero_value_but_strong_key_is_kept():
 
 
 def test_near_duplicate_key_evicts_older():
-    c = P.KVCache()
+    """A re-emitted register marker (near-identical key) whose OLDER copy is a full
+    recency window back is dropped — supersession is RECENCY-GATED so it is
+    provably output-exact (the older copy's max future softmax1 weight is below
+    recency_eps, so removing its numerator AND denominator terms is a no-op). At a
+    weak (norm-1) marker key and slope 0.25 the eviction fires once the older copy
+    is ~90 tokens (3 frames) behind the newer one."""
+    c = P.KVCache(slope=0.25, score_scale=1.0, recency_eps=1e-6)
     # same register marker re-emitted across two steps => near-identical keys.
     k = torch.tensor([1.0, 0.0, 0.0])
     c.append(k.clone(), torch.tensor([9.0, 0.0, 0.0]), position=5)    # older
-    c.append(k.clone() + 1e-4, torch.tensor([9.0, 0.0, 0.0]), position=35)  # newer
+    c.append(k.clone() + 1e-4, torch.tensor([9.0, 0.0, 0.0]), position=95)  # newer
     evicted = c.prune()
     assert evicted == 1
-    assert len(c) == 1 and c.entries[0].position == 35        # newer survives
+    assert len(c) == 1 and c.entries[0].position == 95        # newer survives
+
+
+def test_near_duplicate_recency_live_is_kept():
+    """The correctness fix (adversarial-recency): a near-duplicate key whose OLDER
+    copy is STILL recency-live (only a few tokens back) is NOT dropped — its
+    exp(score) term is load-bearing in the softmax1 denominator, and if the values
+    differ it also contributes to the numerator, so evicting it would change the
+    output. Un-gated cos-sim eviction (the pre-fix bug) wrongly dropped it."""
+    c = P.KVCache(slope=0.25, score_scale=1.0, recency_eps=1e-6)
+    k = torch.tensor([1.0, 0.0, 0.0])
+    # two near-dup-key entries only 2 tokens apart, DIFFERENT values -> both live.
+    c.append(k.clone(), torch.tensor([9.0, 0.0, 0.0]), position=100)
+    c.append(k.clone() + 1e-4, torch.tensor([3.0, 0.0, 0.0]), position=102)
+    assert c.prune() == 0                       # both kept (older still recency-live)
+    assert {e.position for e in c.entries} == {100, 102}
 
 
 def test_distinct_keys_and_newest_survive():
@@ -99,14 +120,22 @@ def test_distinct_keys_and_newest_survive():
 
 
 def test_maybe_prune_respects_interval():
-    c = P.KVCache(prune_interval=120)
+    """The interval mechanic: prune fires only once ``prune_interval`` tokens have
+    been appended. With a real slope the 120 near-duplicate keys collapse to the
+    small recency window (every copy whose OLDER twin is recency-negligible is
+    dropped); before the interval nothing prunes."""
+    c = P.KVCache(prune_interval=120, slope=0.25, score_scale=1.0, recency_eps=1e-6)
     for i in range(119):
         c.append(torch.tensor([1.0]), torch.tensor([1.0]), position=i)
     assert c.maybe_prune() == 0                 # < interval -> no prune yet
     c.append(torch.tensor([1.0]), torch.tensor([1.0]), position=119)
-    # 120 near-duplicate keys -> all but the newest evicted at the interval.
+    # 120 near-duplicate keys -> every copy behind the recency horizon is evicted,
+    # leaving only the small live window (newest survives; the rest are RECENCY-
+    # negligible near-dups). The cache is bounded, not one-entry (that would drop
+    # denominator-live copies), which is the corrected, output-exact behaviour.
     n = c.maybe_prune()
-    assert n == 119 and len(c) == 1
+    assert n >= 60 and len(c) == 120 - n        # most evicted, newest always kept
+    assert max(e.position for e in c.entries) == 119
 
 
 # ---------------------------------------------------------------------------
