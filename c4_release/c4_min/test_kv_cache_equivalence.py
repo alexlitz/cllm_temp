@@ -162,9 +162,10 @@ def test_driver_byte_identical_naive_incl_functions_and_eviction():
         # convention over the content-addressed stack KV head.
         ("func", [I(isa.JSR, 3), I(isa.HALT), I(isa.NOP), I(isa.ENT, 0),
                   I(isa.IMM, 42), I(isa.LEV)], 30, 0xFF),
-        # loop that triggers many prunes (eviction-heavy).
-        ("loop", [I(isa.IMM, 16), I(isa.PSH), I(isa.IMM, 1), I(isa.SUB),
-                  I(isa.BNZ, 1), I(isa.HALT)], 100, 0xFF),
+        # loop that triggers multiple prunes (eviction-heavy) — kept CI-small
+        # (the naive re-forward baseline is O(stream^2); the cached path is fast).
+        ("loop", [I(isa.IMM, 6), I(isa.PSH), I(isa.IMM, 1), I(isa.SUB),
+                  I(isa.BNZ, 1), I(isa.HALT)], 40, 0xFF),
     ]
     for name, code, ms, mask in battery:
         naive = run_pure_forward_complete(model, L, code, max_steps=ms, mask=mask)
