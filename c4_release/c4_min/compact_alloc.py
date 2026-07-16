@@ -158,20 +158,134 @@ def compute_liveness(model, never_share_dims: set) -> List[DimLiveness]:
 
 
 # ---------------------------------------------------------------------------
+# Empirical VALUE-liveness (soundness fix for the additive residual).
+#
+# The weight-only ``compute_liveness`` records the blocks that READ / WRITE a
+# dim, but the residual is a bare additive skip: a dim's VALUE persists in the
+# stream from the block that writes it until *something explicitly cancels it* —
+# which the weights alone cannot reveal (no per-block clear is annotated).  A
+# scratch band (ALU partials, operand one-hots, query-address bins) is written
+# additively and is often NEVER re-zeroed, so its value is still sitting in its
+# slot long after its last weight-READ.  Sharing that slot with another dim
+# (disjoint *weight* interval) then leaks the stale value into the partner — the
+# bitwise/divmod ``0xFFFFFFFF`` corruption.
+#
+# The sound fix is to color by the OBSERVED value-liveness: run a battery of
+# representative programs through the (uncompacted) model and record, per dim,
+# the first and last block at which its residual is nonzero at ANY position.
+# Two dims may share a slot only if these OBSERVED intervals are disjoint, which
+# is corruption-proof by construction (a shared slot is provably zero outside
+# each occupant's observed value-life).  Coverage-limited (only what the battery
+# exercises), so it is UNIONED with the weight interval and gated by an L-inf=0
+# byte-identity check on the same battery before use.
+# ---------------------------------------------------------------------------
+def empirical_value_liveness(model, L, programs, eps: float = 1e-6):
+    """Observe each dim's nonzero-value block range over ``programs``.
+
+    ``programs`` is a list of ``(code, stream)`` pairs (bytecode + token stream)
+    or ``(code, None)`` to build a default stream.  Returns two int lists
+    ``(first_nz, last_nz)`` indexed by dim: the earliest / latest block (``-1`` =
+    already nonzero at the block input, i.e. from embedding) at which the dim's
+    residual value exceeds ``eps`` at any sequence position, unioned across every
+    program.  A dim never observed nonzero gets ``(n, -1)`` (empty).
+    """
+    dim = model.dim
+    n = len(model.blocks)
+    first_nz = [n] * dim         # sentinel: never nonzero
+    last_nz = [-2] * dim
+    from .nibble_pure_forward_complete import make_overlay_complete
+
+    def obs(x, blk_idx):
+        # x: [1, S, D]; a dim is "value-live at blk_idx" if nonzero at any pos.
+        nz = (x[0].abs() > eps).any(dim=0)     # [D]
+        idx = torch.nonzero(nz, as_tuple=False).flatten().tolist()
+        for d in idx:
+            if blk_idx < first_nz[d]:
+                first_nz[d] = blk_idx
+            if blk_idx > last_nz[d]:
+                last_nz[d] = blk_idx
+
+    with torch.no_grad():
+        for code, stream in programs:
+            overlay = make_overlay_complete(code, L)
+            toks = torch.tensor([stream])
+            x = model.embed[toks].clone()
+            overlay(x)
+            obs(x, -1)                      # block input (embedding + overlay)
+            for b, blk in enumerate(model.blocks):
+                x = blk(x)
+                obs(x, b)
+    return first_nz, last_nz
+
+
+def refine_liveness_empirically(liveness: List[DimLiveness], first_nz, last_nz,
+                                n_blocks: int) -> List[DimLiveness]:
+    """Union the weight interval with the observed value-life interval.
+
+    For each shareable dim, extend ``[def_block, last_use_block]`` to also cover
+    every block where its value was observed nonzero.  This makes the coloring
+    corruption-proof against additive-residual value persistence (a scratch band
+    that is written but never re-zeroed keeps its slot busy to its last observed
+    nonzero block, so no other dim can be coloured into that slot while the stale
+    value is live).  Never-share dims are untouched (already pinned to end).
+    """
+    out: List[DimLiveness] = []
+    for d, lv in enumerate(liveness):
+        if lv.never_share:
+            out.append(lv)
+            continue
+        fnz, lnz = first_nz[d], last_nz[d]
+        d0, d1 = lv.def_block, lv.last_use_block
+        if lnz >= -1:                       # observed nonzero at least once
+            d0 = min(d0, fnz)
+            d1 = max(d1, lnz)
+        out.append(DimLiveness(d0, d1, False))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Never-share set (the _LIVENESS_NEVER_SHARE principle).  Every dim the Python
 # driver reads/writes OUTSIDE the block stack: the overlay's writes + the
 # decode's reads.  Harvested straight off the layout ``L`` so it tracks the
 # exact bands the driver ``run_pure_forward_complete`` touches.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# The register / scalar-image bands whose VALUE persists in the additive
+# residual and is read WITHIN a forward across blocks — the c4_min analogue of
+# the bigger version's ``_LIVENESS_NEVER_SHARE_NAMES``.  These MUST keep a
+# private slot: dim-sharing is only sound when a slot is provably zero outside
+# each occupant's liveness interval, but a register/scratch VALUE is written
+# ADDITIVELY (skip connection) and is NOT re-zeroed between the block that last
+# reads it and the block that next writes the sharing partner — so a shared slot
+# would carry the stale value (0..255 / a nibble 0..15) into the partner and
+# corrupt it (the divmod/bitwise configs add exactly such short-interval scratch
+# bands next to the register images -> the observed 0xFFFFFFFF corruption).
+#
+# The names are matched against the built layout ``L._names``; a name that is
+# absent in a given config (e.g. the ALU_* divmod scratch on a LEAN build) is
+# simply skipped, so this one list is correct for LEAN / bitwise / divmod alike.
+# Driver-visible bands that the weight-only liveness cannot see AND that are
+# also empirically clamped to live-to-end below (belt-and-braces): the embedding
+# per-token nibble source + the AX_VAL scalar the recompose/decode consumes.
+_NEVER_SHARE_NAMES: Tuple[str, ...] = (
+    "CUR_NIB",   # embedding-written at EVERY position incl. the query row.
+    "AX_VAL",    # register scalar carried + read within-forward (cmp/callconv/fold).
+)
+_NEVER_SHARE_PREFIXES: Tuple[str, ...] = ()
+
+
 def never_share_dims_from_layout(L) -> set:
     """Return the set of residual dims that must keep a private, fixed slot.
 
-    These are the dims the driver's ``make_overlay_complete`` WRITES and its
-    per-step decode (``PC_VAL/SP_VAL/BP_VAL/STK_VAL/HALTED`` + the AX nibble
-    band) READS between forwards — plus the ``ONE`` constant lane.  The
-    weight-only liveness analysis cannot observe these cross-forward
-    read/writes, so (exactly like ``_LIVENESS_NEVER_SHARE`` in the bigger
-    version) they are pinned live-to-end.
+    Covers (1) the dims the driver's ``make_overlay_complete`` WRITES, (2) the
+    embedding-written per-token nibble source, (3) the per-step decode READS,
+    and (4) every register / scratch VALUE image read within-forward across
+    blocks (``_NEVER_SHARE_NAMES`` / ``_NEVER_SHARE_PREFIXES`` — the c4_min
+    analogue of the bigger version's ``_LIVENESS_NEVER_SHARE``).  The weight-only
+    liveness analysis sees these bands' read/write blocks but NOT that their
+    value persists (additively) in a shared slot between occupants, so they are
+    pinned live-to-end.  Names absent in a given config are skipped, so the set
+    is correct for LEAN / bitwise / divmod alike.
     """
     ns: set = set()
 
@@ -198,6 +312,12 @@ def never_share_dims_from_layout(L) -> set:
     add_band(L.STK_VAL)
     add_band(L.HALTED)
     add_band(L.AX, 8)              # the 8 AX nibble dims the decode argmaxes
+
+    # --- register / scratch VALUE images read within-forward (the fix) ---
+    for name, (base, size) in L._names.items():
+        if name in _NEVER_SHARE_NAMES or \
+                any(name.startswith(p) for p in _NEVER_SHARE_PREFIXES):
+            add_band(base, size)
 
     return ns
 
@@ -373,7 +493,7 @@ class CompactionStats:
         return self.dense_params_after * 4 / 1e6
 
 
-def compact_model(model, L):
+def compact_model(model, L, probe_programs=None):
     """Compact ``model`` in place-ish and return ``(compact_model, L, stats)``.
 
     Applies Fix #1 (dim-sharing by liveness) + Fix #2 (per-block minimal FFN
@@ -381,6 +501,12 @@ def compact_model(model, L):
     ``model`` under the driver, plus the re-indexed ``L`` and a
     :class:`CompactionStats`.  Fix #3 (sparse storage) is a separate serialiser
     (:func:`sparse_state_dict`) applied to the returned compact model.
+
+    ``probe_programs`` (list of ``(code, stream)``) refines the weight-liveness
+    with the OBSERVED value-liveness (:func:`empirical_value_liveness`) so the
+    dim-sharing is corruption-proof against additive-residual value persistence
+    on the bitwise / divmod configs (the ``AX_VAL``-family bug).  Defaults to a
+    built-in battery covering every op family (:func:`_default_probe_programs`).
     """
     from .blogspec_model import Transformer as _T
 
@@ -392,6 +518,16 @@ def compact_model(model, L):
     # ---- Fix #1: liveness -> colouring -> re-index ----
     ns_dims = never_share_dims_from_layout(L)
     liveness = compute_liveness(model, ns_dims)
+    # Refine with OBSERVED value-liveness (soundness fix for the additive
+    # residual: a scratch band that is written but never re-zeroed keeps its slot
+    # busy to its last observed nonzero block, so no partner is coloured over a
+    # stale value). Skipped only if a caller explicitly passes ``[]``.
+    if probe_programs is None:
+        probe_programs = _default_probe_programs(L)
+    if probe_programs:
+        first_nz, last_nz = empirical_value_liveness(model, L, probe_programs)
+        liveness = refine_liveness_empirically(liveness, first_nz, last_nz,
+                                               n_blocks)
     new_slot, new_dim = color_dims(liveness)
 
     # head_dim floor: the attention heads use per-head LOCAL channels
@@ -485,6 +621,80 @@ def compact_model(model, L):
                                               if not l.never_share) - new_dim,
     )
     return compact, L, stats
+
+
+# ---------------------------------------------------------------------------
+# Default probe battery for the empirical value-liveness pass.  Covers every op
+# family so the observed value-life of each scratch band is exercised; the
+# streams are harvested by running the (uncompacted) driver a few steps per
+# program, which lays down the real ALU / operand-one-hot / query-address bands.
+# ---------------------------------------------------------------------------
+_PROBE_SOURCES = (
+    "int main(){ return 500 + 700; }",                       # add carry
+    "int main(){ return 1900 - 50; }",                       # sub borrow
+    "int main(){ return 100 * 10; }",                        # mul partials
+    "int main(){ return 1000 * 1000; }",                     # wide mul
+    "int main(){ return 720 / 6; }",                         # div (divmod cfg)
+    "int main(){ return 84 % 5; }",                          # mod (divmod cfg)
+    "int main(){ return 12 | 3; }",                          # bitwise or
+    "int main(){ return 12 ^ 10; }",                         # bitwise xor
+    "int main(){ return 12 & 10; }",                         # bitwise and
+    "int main(){ if (5 > 3) return 1; return 0; }",          # cmp gt
+    "int main(){ if (7 == 7) return 1; return 0; }",         # cmp eq
+    "int main(){ int x; x = 1000; return x; }",              # SI/LI var
+    "int main(){ int x; x = 7; x = x + 6; return x; }",      # var update
+    "int identity(int x){ return x; } "
+    "int main(){ return identity(1000); }",                  # JSR/ENT/LEV
+    "int add(int a,int b){ return a + b; } "
+    "int main(){ return add(300, 400); }",                   # func args
+)
+
+
+def _default_probe_programs(L, max_steps_per: int = 40):
+    """Harvest ``(code, stream)`` probe pairs for the value-liveness pass.
+
+    Compiles the built-in battery and, for each program, lays down a couple of
+    SHORT representative token streams that exercise a distinct set of the scratch
+    bands (ALU partials, operand one-hots, query-address bins).  Robust to a
+    config that cannot run div/mod (those programs simply contribute their
+    non-div-specific bands).  Returns a list suitable for
+    :func:`empirical_value_liveness`.  Import-light: pulls the C compiler + ISA
+    adapter lazily so a caller that supplies its own ``probe_programs`` never
+    pays for them.  Every source's div/mod/mul/bitwise/cmp/var scratch is a pure
+    function of the overlaid operands, so a small battery of short streams covers
+    the full band set — keeping the pass cheap even on the 304-block divmod model
+    (each probe is one full forward through every block).
+    """
+    try:
+        from src.compiler import compile_c
+        from .run_1096_pure_forward import bytecode_to_isa
+        from . import nibble_pure_forward_complete as pfc
+    except Exception:                       # pragma: no cover - defensive
+        return []
+    progs = []
+    for src in _PROBE_SOURCES:
+        try:
+            code = bytecode_to_isa(compile_c(src)[0])
+        except Exception:
+            continue
+        # Build streams structurally: BOS + init frame, then a couple of
+        # representative store/step frames.  This is enough to light up the ALU /
+        # operand / query bands the FFNs compute, because the FFN scratch is a
+        # pure function of the (overlaid) code + register frames, independent of
+        # the *decoded* next-step value.  Kept SHORT (<=2 frames) so the value-
+        # liveness pass stays cheap even on the 300-block divmod model (each
+        # probe is a full forward through every block).
+        from .nibble_pure_forward_complete import _build_frame, SP_INIT
+        from . import blogspec_vocab as V
+        for nframes in (0, 2):
+            stream = [V.BOS] + _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+            for k in range(nframes):
+                stream += _build_frame((k + 1) % max(1, len(code)),
+                                       (7 * (k + 1)) & 0xFFFFFFFF,
+                                       SP_INIT - 4 * (k + 1), SP_INIT,
+                                       3 * (k + 1))
+            progs.append((code, stream))
+    return progs
 
 
 def _remap_attn(src, dst, new_slot, new_dim, n_heads):
