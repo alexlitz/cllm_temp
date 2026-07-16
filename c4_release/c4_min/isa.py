@@ -21,6 +21,7 @@ EQ, NE, LT, GT, LE, GE = 17, 18, 19, 20, 21, 22
 SHL, SHR = 23, 24
 ADD, SUB = 25, 26
 MUL, DIV, MOD = 27, 28, 29
+PRTF = 33  # I/O: printf — emits AX & 0xFF as a visible output byte (§System, op 33)
 NOP = 39
 HALT = 38  # alias EXIT
 
@@ -30,7 +31,7 @@ NAMES = {
     SC: "SC", PSH: "PSH", OR: "OR",
     XOR: "XOR", AND: "AND", EQ: "EQ", NE: "NE", LT: "LT", GT: "GT",
     LE: "LE", GE: "GE", SHL: "SHL", SHR: "SHR", ADD: "ADD", SUB: "SUB",
-    MUL: "MUL", DIV: "DIV", MOD: "MOD", NOP: "NOP",
+    MUL: "MUL", DIV: "DIV", MOD: "MOD", PRTF: "PRTF", NOP: "NOP",
     HALT: "HALT",
 }
 BY_NAME = {v: k for k, v in NAMES.items()}
@@ -60,11 +61,15 @@ def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
     return out
 
 
-def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256):
+def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
+              out: list = None):
     """Reference 8-bit interpreter. Returns list of AX values emitted per step.
 
     Stack grows downward from ``mem_size`` (top). ``pop`` reads stack[SP] then SP+=1.
-    Emits the value of AX after each executed step.
+    Emits the value of AX after each executed step. If ``out`` is a list, PRTF
+    appends ``AX & 0xFF`` to it — the byte-stream a real stdout would see (the
+    ``printf("%c", AX)`` visible-output channel, §System / op 33). This is the
+    single-char printf form the classic string quine uses.
     """
     ax = sp = bp = 0
     sp = mem_size          # empty stack
@@ -132,6 +137,9 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256):
             ax = mem[ax] & MASK
         elif op == SI:
             mem[pop()] = ax & MASK
+        elif op == PRTF:
+            if out is not None:
+                out.append(ax & 0xFF)   # printf visible output byte; AX unchanged
         elif op == JMP:
             pc = imm
         elif op == BZ:

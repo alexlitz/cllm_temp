@@ -250,7 +250,8 @@ class BlockKVCacheBatched:
         return 0 if self.pos is None else int(self.pos.shape[0])
 
     def evict(self, cos_threshold: float, prune_interval: int,
-              zero_eps: float, recency_eps: float) -> int:
+              zero_eps: float, recency_eps: float,
+              protect_positions=None) -> int:
         """Apply the spec eviction policy; return #positions dropped.
 
         The keep-set is the UNION across heads of each head's ``prune()`` survivors
@@ -258,6 +259,15 @@ class BlockKVCacheBatched:
         entry it would attend to — the batched tensors then keep exactly that
         union.  Because the batched axis is shared, this is the conservative,
         output-exact intersection of the per-head policies.
+
+        ``protect_positions`` (a set/tensor of ABSOLUTE positions) PINS exactly those
+        cached rows — the data-segment store tokens the program loads at ARBITRARY
+        future times, so ALiBi-recency cannot bound their future usefulness (a §Memory
+        store is a persistent value, not a recency-decayed register frame).  Only the
+        MEM store rows are pinned (54 for the quine), NOT the whole seed frames, so the
+        cache stays small: the bundled data segment (the quine's ``Q``) survives the
+        whole run while every register frame (incl. the seed frames' dead marker rows)
+        still evicts.
 
         Fast path: a head whose ENTRY VALUES are all zero is an exact softmax1
         no-op (its ``attention_output`` is the zero vector for every query —
@@ -304,6 +314,9 @@ class BlockKVCacheBatched:
                 cos_threshold=cos_threshold, zero_eps=zero_eps,
                 recency_eps=recency_eps, dup_metric=metric)
             keep_any |= mask
+        if protect_positions is not None and len(protect_positions) > 0:
+            prot = torch.as_tensor(sorted(protect_positions), dtype=pos_cpu.dtype)
+            keep_any |= torch.isin(pos_cpu, prot)      # pin the data-segment store rows
         keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
         dropped = S - int(keep_idx.numel())
         if dropped:
@@ -324,7 +337,8 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
                             mask: int = 0xFF, evict: bool = True,
                             cos_threshold: float = 0.99, prune_interval: int = 120,
                             zero_eps: float = 1e-9, recency_eps: float = 1e-6,
-                            stats: Optional[dict] = None):
+                            stats: Optional[dict] = None, out: Optional[List[int]] = None,
+                            seed_mem: Optional[Dict[int, int]] = None):
     """KV-cached form of :func:`run_pure_forward_complete`.
 
     Byte-identical output to the naive re-forward driver (proven in
@@ -334,6 +348,11 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
 
     ``stats`` (optional dict) is filled with ``max_seq_len`` / ``max_cache_size``
     (per block) / ``total_evicted`` / ``steps`` for the bounded-memory report.
+
+    If ``out`` is a list, a PRTF step appends its VISIBLE output byte — the AX
+    byte-0 the model itself decoded from its nibble band (a genuine LM-head argmax,
+    NOT a python copy).  This is the ``printf("%c", AX)`` visible-output channel
+    (§Printing / op 33), collected on the SAME KV-cached model path.
     """
     blocks = model.blocks
     n_blocks = len(blocks)
@@ -343,14 +362,30 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
               for b in range(n_blocks)]
     tokens_since_prune = 0
 
-    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
-    stream: List[int] = [V.BOS] + init_frame
-    trace: List[int] = []
+    # Seed the data segment (if any) as leading MEM-STORE frames so the KV memory
+    # holds it before step 0 (the classic quine's "string literal in data").  Each
+    # seed byte becomes one store frame recorded in ``store_log`` at frame idx k;
+    # the init frame then sits at frame idx ``n_seed``.
+    seed_frames: List[int] = []
     store_log: Dict[int, Tuple[int, int]] = {}
+    for k, (addr, val) in enumerate(sorted((seed_mem or {}).items())):
+        seed_frames += _build_frame(0, 0, SP_INIT, SP_INIT, 0,
+                                    mem_addr=addr & 0xFFFFFFFF,
+                                    mem_val=val & 0xFFFFFFFF)
+        store_log[k] = (addr & 0xFFFFFFFF, val & 0xFFFFFFFF)
+    n_seed = len(store_log)
+    # absolute positions of the seed frames' MEM store tokens (frame k occupies
+    # positions 1+k*FRAME_LEN .. ; its store token is at local _MEM_MARKER_LOCAL).
+    seed_store_positions = {1 + k * V.FRAME_LEN + _MEM_MARKER_LOCAL
+                            for k in range(n_seed)}
+
+    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+    stream: List[int] = [V.BOS] + seed_frames + init_frame
+    trace: List[int] = []
     cur_pc = 0
     cur_sp = cur_bp = SP_INIT
     cur_ax = 0
-    frame_idx = 0
+    frame_idx = n_seed
 
     # -- step 0: no cache yet.  The window is the WHOLE initial stream
     # ([BOS]+init_frame, 31 rows); its last row is the query row.  We commit all
@@ -381,6 +416,13 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
         imm = code[cur_pc].imm if 0 <= cur_pc < len(code) else 0
         ax = _decode_reg_from_nibbles(state, L, L.AX)
+
+        # --- I/O: PRTF emits a VISIBLE output byte (printf("%c", AX)) ------------
+        # The byte is the model's OWN decoded AX byte-0 (a genuine LM-head argmax,
+        # not a python copy).  PRTF's dispatch rule only advances PC, so AX here is
+        # the value the printf prints.  Same KV-cached model path as every op.
+        if op == isa.PRTF and out is not None:
+            out.append(ax & 0xFF)
 
         s_addr = s_val = 0
         is_store = False
@@ -431,11 +473,18 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
         win_len = 1 + V.FRAME_LEN                    # 1 old query row + 30 new frame
         max_seq = max(max_seq, len(stream))
 
-        # -- bounded eviction: prune every ``prune_interval`` tokens.
+        # -- bounded eviction: prune every ``prune_interval`` tokens.  Pin ONLY the
+        # data-segment STORE rows (the ``n_seed`` seed frames' MEM tokens, at local
+        # offset ``_MEM_MARKER_LOCAL`` in each) so the bundled data ``Q``
+        # (content-addressed, loaded at arbitrary future steps) is never recency-
+        # evicted; every register frame — including the seed frames' dead marker
+        # rows — still evicts, so the cache stays small.
+        protect_positions = seed_store_positions
         tokens_since_prune += V.FRAME_LEN
         if evict and tokens_since_prune >= prune_interval:
             for b in range(n_blocks):
-                caches[b].evict(cos_threshold, prune_interval, zero_eps, recency_eps)
+                caches[b].evict(cos_threshold, prune_interval, zero_eps, recency_eps,
+                                protect_positions=protect_positions)
             tokens_since_prune = 0
         max_cache = max(max_cache, caches[0].size())
 

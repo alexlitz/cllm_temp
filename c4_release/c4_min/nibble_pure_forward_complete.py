@@ -435,6 +435,11 @@ def callconv_dispatch_rules(L) -> List[FFNRule]:
     # NOP: PC += 1 (no state change).  The compiler emits NOP for alignment/padding;
     # without this rule the PC never advances past a NOP and the VM spins forever.
     rules.append(FFNRule([(L.OP_IS + isa.NOP, 0.5, 1.5)], {pc: LinearExpr.c(1.0)}))
+    # PRTF: PC += 1 (I/O only, no register state change).  The visible output byte
+    # is printf(AX & 0xFF): the driver reads it from the model's decoded AX byte-0
+    # and emits it via the think-tag protocol (§Printing, BLOG_SPEC line 851).  AX
+    # and the stack are untouched, exactly like NOP for the register transition.
+    rules.append(FFNRule([(L.OP_IS + isa.PRTF, 0.5, 1.5)], {pc: LinearExpr.c(1.0)}))
     # LEA o: AX = (BP + 4*imm) & 0xFF ; PC += 1.  imm is the SLOT offset; *4 gives a
     # byte address matching the SP/BP byte-addressing.  Add BP's LOW BYTE only (the
     # 8-bit op masks &0xFF, and BP's higher bytes vanish mod 256) so the downstream
@@ -483,6 +488,7 @@ def compile_opcode_decode_pfc(L, dim: int) -> Dict[str, torch.Tensor]:
                      [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR] +
                      [isa.MUL, isa.DIV, isa.MOD] +
                      [isa.JSR, isa.ENT, ADJ, isa.LEV] +      # + calling convention
+                     [isa.PRTF] +                            # + PRTF (I/O: PC += 1)
                      [isa.NOP]))                             # + NOP (PC += 1 no-op)
     return compile_opcode_decode_ops(L, dim, ops)
 
@@ -768,11 +774,14 @@ def _bitwise_pop_rules(L) -> List[FFNRule]:
 # SP_INIT.  Matches the neural build's per-step AX emit.
 # ===========================================================================
 def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
-                  mask: int = 0xFF) -> List[int]:
+                  mask: int = 0xFF, out: List[int] = None) -> List[int]:
     """Reference interpreter with the SP-addressed memory stack.  ``mask`` = 0xFF
     (8-bit AX trace, the default; matches the neural byte frame) or 0xFFFFFFFF (the
     full 32-bit AX for the 32-bit-arithmetic proof: ADD/SUB/MUL wrap mod 2^32,
-    DIV/MOD unsigned floor with b==0 -> 0, ISA_SPEC 4.2)."""
+    DIV/MOD unsigned floor with b==0 -> 0, ISA_SPEC 4.2).
+
+    If ``out`` is a list, PRTF appends ``AX & 0xFF`` to it — the visible stdout
+    byte a ``printf("%c", AX)`` would emit (§System / op 33)."""
     mem: Dict[int, int] = {}
     sp = bp = SP_INIT
     ax = pc = 0
@@ -838,6 +847,9 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
             sp += 4 * imm
         elif op == isa.LEV:
             sp = bp; bp = mem.get(sp, 0); pc = mem.get(sp + 4, 0); sp += 8
+        elif op == isa.PRTF:
+            if out is not None:
+                out.append(ax & 0xFF)   # printf visible byte; registers unchanged
         elif op == isa.NOP:
             pass
         elif op == isa.HALT:
@@ -912,16 +924,41 @@ def _build_frame(pc, ax, sp, bp, stk, mem_addr=0, mem_val=0):
     return V.build_step_frame(pc, ax, sp, bp, mem_addr=0, mem_val=stk & 0xFFFFFFFF)
 
 
+def _seed_frames(seed_mem):
+    """Turn a ``{addr: value}`` data segment into a list of leading STORE frames.
+
+    Each entry becomes one MEM-store frame (PC/AX/SP/BP left at their init values)
+    that seeds ``mem[addr] = value`` into the model's KV memory BEFORE the program
+    runs — the classic quine's "string literal in the data segment", materialised
+    as the §Memory store-log rows the loads content-address.  Returns
+    ``(frames, store_log)`` where ``store_log`` maps each seed frame's index to its
+    ``(addr, val)`` so the overlay tags its MEM token as a KV entry."""
+    frames: List[int] = []
+    store_log: Dict[int, Tuple[int, int]] = {}
+    for k, (addr, val) in enumerate(sorted(seed_mem.items())):
+        frames += _build_frame(0, 0, SP_INIT, SP_INIT, 0,
+                               mem_addr=addr & 0xFFFFFFFF, mem_val=val & 0xFFFFFFFF)
+        store_log[k] = (addr & 0xFFFFFFFF, val & 0xFFFFFFFF)   # frame idx k
+    return frames, store_log
+
+
 def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
                               code: List[isa.Instr], max_steps: int = 512,
                               verbose: bool = False, collect_tokens: bool = False,
-                              mask: int = 0xFF):
+                              mask: int = 0xFF, out: List[int] = None,
+                              seed_mem=None):
     """Execute ``code`` with the complete pure-forward step: every VM step is ONE
     ``model.forward`` over the growing token stream.  Returns the per-step AX
     trace (matching :func:`ref_interpret`).  ``mask`` (0xFF = 8-bit AX trace, or
     0xFFFFFFFF = the full 32-bit AX for the 32-bit-arithmetic proof) is applied to
     the emitted AX only; the model always carries the full 32-bit AX in its nibble
     bands (the ALU is 32-bit-exact) regardless of ``mask``.
+
+    If ``out`` is a list, a PRTF step appends its VISIBLE output byte — the AX
+    byte-0 the model itself decoded from its nibble band (a genuine LM-head argmax,
+    NOT a python copy) — and the emitted token stream carries ``THINK_END, <byte>,
+    THINK_START`` around that byte so ``blogspec_vocab.visible_output(stream)``
+    recovers exactly ``out`` (the think-tag stdout protocol, §Printing).
 
     LEV is expanded to its two frame loads (BP then return-PC) by re-running the
     forward with the appropriate stack query — but because the whole state lives
@@ -931,16 +968,28 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
     SP=BP and the driver issuing the two frame reads across the SAME KV log — see
     below (the two loads are two model.forwards, still pure-forward)."""
     init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
-    stream: List[int] = [V.BOS] + init_frame
+    # The MODEL's token stream stays the pure contiguous 30-token frame stream (no
+    # in-stream think tags) so the overlay/frame geometry is byte-identical to the
+    # non-PRTF path.  The think-tag protocol (THINK_END, <visible byte>, THINK_START)
+    # is materialised in a SEPARATE ``vis_stream`` the driver returns, from which
+    # ``blogspec_vocab.visible_output`` recovers exactly the printed bytes — the
+    # user-facing view, decoupled from the internal execution stream.
+    # Prepend the seeded data segment (if any) as leading STORE frames so the KV
+    # memory holds it before step 0; then BOS + the seed frames + the init frame.
+    seed_frames, store_log = _seed_frames(seed_mem or {})
+    n_seed = len(store_log)                        # number of leading data frames
+    stream: List[int] = [V.BOS] + seed_frames + init_frame
+    vis_stream: List[int] = [V.BOS, V.THINK_START]
     trace: List[int] = []
-    store_log: Dict[int, Tuple[int, int]] = {}
     cur_pc = 0
     # pre-step register bookkeeping (mirrors the state the model reads; the driver
     # only uses these to know WHICH address a push/store writes — the code-as-data
     # fetch the model itself does — never to compute the VM transition).
     cur_sp = cur_bp = SP_INIT
     cur_ax = 0
-    frame_idx = 0
+    # the init frame sits at frame index ``n_seed`` (after the seed data frames);
+    # the first emitted step frame is ``n_seed + 1``.
+    frame_idx = n_seed
     for _ in range(max_steps):
         overlay = make_overlay_complete(code, L, store_log=store_log)
         toks = torch.tensor([stream])
@@ -986,6 +1035,18 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
         if is_store:
             store_log[frame_idx] = (s_addr, s_val)
         stream += frame
+        vis_stream += frame
+        # --- I/O: PRTF emits a VISIBLE byte via the think-tag protocol -----------
+        # The printed byte is the model's OWN decoded AX byte-0 (a genuine LM-head
+        # argmax over the nibble band, not a python copy).  PRTF leaves AX/SP/BP
+        # unchanged (its dispatch rule only does PC += 1), so this decoded AX is the
+        # value ``printf("%c", AX)`` prints.  We exit the think block, emit the byte,
+        # re-enter — so ``visible_output(vis_stream)`` yields exactly ``out``.
+        if op == isa.PRTF:
+            emit_b = ax & 0xFF
+            if out is not None:
+                out.append(emit_b)
+            vis_stream += [V.THINK_END, emit_b, V.THINK_START]
         if verbose:
             print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):4s} -> "
                   f"pc'={pc} ax={ax&0xFF} sp={sp} bp={bp} stk={stk} "
@@ -993,6 +1054,9 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
         cur_pc, cur_sp, cur_bp, cur_ax = pc, sp, bp, ax
         if halted or pc < 0 or pc >= len(code):
             break
+    vis_stream += [V.THINK_END, V.HALT]            # close think, then terminate
+    if out is not None:
+        return (trace, vis_stream) if collect_tokens else trace
     if collect_tokens:
         return trace, stream
     return trace
