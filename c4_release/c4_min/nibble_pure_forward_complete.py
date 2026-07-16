@@ -48,6 +48,7 @@ import torch
 
 from . import isa
 from . import blogspec_vocab as V
+from . import nibble_filesys as _FS   # OPEN/READ/CLOS/PRTF via the TOOL_CALL boundary
 from .nibble_vm import (
     S, RELU_S, SILU_S, SILU_HALF,
     compile_nibble_to_scalar, compile_pc_fetch, compile_code_select,
@@ -915,13 +916,22 @@ def _build_frame(pc, ax, sp, bp, stk, mem_addr=0, mem_val=0):
 def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
                               code: List[isa.Instr], max_steps: int = 512,
                               verbose: bool = False, collect_tokens: bool = False,
-                              mask: int = 0xFF):
+                              mask: int = 0xFF, fio=None, data_seg=None):
     """Execute ``code`` with the complete pure-forward step: every VM step is ONE
     ``model.forward`` over the growing token stream.  Returns the per-step AX
     trace (matching :func:`ref_interpret`).  ``mask`` (0xFF = 8-bit AX trace, or
     0xFFFFFFFF = the full 32-bit AX for the 32-bit-arithmetic proof) is applied to
     the emitted AX only; the model always carries the full 32-bit AX in its nibble
     bands (the ALU is 32-bit-exact) regardless of ``mask``.
+
+    FILE OPS (OPEN/READ/CLOS/PRTF) are the ONE class not computed neurally (§Tool
+    Use Mode): when ``fio`` (a ``nibble_filesys.FileOpState``) is passed, an op in
+    ``FILE_OPCODES`` is dispatched via the TOOL_CALL protocol — the driver marshals
+    the args off the KV store log, the runner performs the real I/O against the
+    stub filesystem / stdin, and the integer result re-enters AX (READ also lays
+    its bytes back into the store log as fresh §Memory KV frames so LC reads them).
+    ``data_seg`` (``{byte_addr: byte}``) seeds the read-only data segment (the
+    filename / format string literals the c4 loader places).
 
     LEV is expanded to its two frame loads (BP then return-PC) by re-running the
     forward with the appropriate stack query — but because the whole state lives
@@ -963,6 +973,39 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
         # it per-byte with the LM byte-head argmax (the spec re-quantiser; residue-
         # immune, no torch.round).  One uniform path — no python if/elif on the op.
         ax = _decode_reg_from_nibbles(state, L, L.AX)
+        # -- FILE OP: the ONE class not computed neurally (§Tool Use Mode).  The
+        # model has no rules for OPEN/READ/CLOS/PRTF, so its PC/SP/AX for this row
+        # are meaningless — the DRIVER performs the whole op via the TOOL_CALL
+        # runner and overrides the registers.  READ's bytes re-enter the token
+        # stream as their OWN §Memory KV frames so LC reads them back byte-exact.
+        if fio is not None and op in _FS.FILE_OPCODES:
+            new_ax, new_sp, byte_stores = _FS.dispatch_file_op_driver(
+                op, cur_ax & 0xFFFFFFFF, imm, cur_sp, store_log, fio,
+                data_seg=data_seg, slot=4)
+            pc = cur_pc + 1                     # file ops advance PC by one (no branch)
+            sp = new_sp
+            bp = cur_bp
+            ax = new_ax & 0xFFFFFFFF
+            frame = _build_frame(pc, ax, sp, bp, stk)
+            trace.append(ax & mask)
+            frame_idx += 1
+            stream += frame
+            # lay READ's bytes into the KV log as one store frame per byte, so a
+            # later LC(addr) attends to the byte the file delivered.
+            for (baddr, bval) in byte_stores:
+                bframe = _build_frame(pc, ax, sp, bp, stk,
+                                      mem_addr=baddr, mem_val=bval & 0xFF)
+                frame_idx += 1
+                store_log[frame_idx] = (baddr, bval & 0xFF)
+                stream += bframe
+            if verbose:
+                print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):4s} -> "
+                      f"pc'={pc} ax={ax&0xFFFFFFFF} sp={sp} (FILE, "
+                      f"{len(byte_stores)} byte-stores)")
+            cur_pc, cur_sp, cur_bp, cur_ax = pc, sp, bp, ax
+            if pc < 0 or pc >= len(code):
+                break
+            continue
         # store bookkeeping: which address does this op write, and what value?  All
         # addresses/values are derived from the PRE-step registers the driver
         # tracks (the store target is decided before the op runs; the value is a

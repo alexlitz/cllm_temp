@@ -21,6 +21,11 @@ EQ, NE, LT, GT, LE, GE = 17, 18, 19, 20, 21, 22
 SHL, SHR = 23, 24
 ADD, SUB = 25, 26
 MUL, DIV, MOD = 27, 28, 29
+# File / system opcodes (§File Operations). Values match the BLOG_SPEC opcode
+# table (30-33). These cross the computation/outside-world boundary, so they are
+# dispatched via the TOOL_CALL-token protocol (see ``nibble_filesys``) rather
+# than being computed neurally like the ALU ops above.
+OPEN, READ, CLOS, PRTF = 30, 31, 32, 33
 NOP = 39
 HALT = 38  # alias EXIT
 
@@ -30,7 +35,9 @@ NAMES = {
     SC: "SC", PSH: "PSH", OR: "OR",
     XOR: "XOR", AND: "AND", EQ: "EQ", NE: "NE", LT: "LT", GT: "GT",
     LE: "LE", GE: "GE", SHL: "SHL", SHR: "SHR", ADD: "ADD", SUB: "SUB",
-    MUL: "MUL", DIV: "DIV", MOD: "MOD", NOP: "NOP",
+    MUL: "MUL", DIV: "DIV", MOD: "MOD",
+    OPEN: "OPEN", READ: "READ", CLOS: "CLOS", PRTF: "PRTF",
+    NOP: "NOP",
     HALT: "HALT",
 }
 BY_NAME = {v: k for k, v in NAMES.items()}

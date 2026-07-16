@@ -42,6 +42,7 @@ import torch
 
 from . import isa
 from . import blogspec_vocab as V
+from . import nibble_filesys as _FS   # OPEN/READ/CLOS/PRTF via the TOOL_CALL boundary
 from .nibble_pure_forward import (
     N_ROLES, _FRAME_ROLE_SLOTS, _MEM_MARKER_LOCAL, _address_bits, SP_INIT,
     _snap_lane,
@@ -324,7 +325,8 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
                             mask: int = 0xFF, evict: bool = True,
                             cos_threshold: float = 0.99, prune_interval: int = 120,
                             zero_eps: float = 1e-9, recency_eps: float = 1e-6,
-                            stats: Optional[dict] = None):
+                            stats: Optional[dict] = None,
+                            fio=None, data_seg=None):
     """KV-cached form of :func:`run_pure_forward_complete`.
 
     Byte-identical output to the naive re-forward driver (proven in
@@ -381,6 +383,62 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
         imm = code[cur_pc].imm if 0 <= cur_pc < len(code) else 0
         ax = _decode_reg_from_nibbles(state, L, L.AX)
+
+        # -- FILE OP (OPEN/READ/CLOS/PRTF): the ONE class not computed neurally
+        # (§Tool Use Mode).  The model's registers for this row are meaningless;
+        # the DRIVER performs the whole op via the TOOL_CALL runner and overrides
+        # them.  A READ appends its bytes as their OWN §Memory KV store frames so
+        # a later LC(addr) attends to the file byte.  Multiple frames are appended
+        # this step; the commit + next-window are widened to cover them all.
+        if fio is not None and op in _FS.FILE_OPCODES:
+            new_ax, new_sp, byte_stores = _FS.dispatch_file_op_driver(
+                op, cur_ax & 0xFFFFFFFF, imm, cur_sp, store_log, fio,
+                data_seg=data_seg, slot=4)
+            pc = cur_pc + 1                     # file ops advance PC by one (no branch)
+            sp = new_sp
+            bp = cur_bp
+            ax = new_ax & 0xFFFFFFFF
+            appended = []                       # the frames this step emits
+            frame_idx += 1
+            trace.append(ax & mask)
+            appended += _build_frame(pc, ax, sp, bp, stk)
+            for (baddr, bval) in byte_stores:
+                frame_idx += 1
+                store_log[frame_idx] = (baddr, bval & 0xFF)
+                appended += _build_frame(pc, ax, sp, bp, stk,
+                                         mem_addr=baddr, mem_val=bval & 0xFF)
+            # commit the CURRENT window's frozen rows (same as the normal path).
+            n_commit = win_len - 1
+            if n_commit > 0:
+                for b in range(n_blocks):
+                    K_all, V_all, pos_all = new_kv[b]
+                    K_win = K_all[:, :, -win_len:, :]
+                    V_win = V_all[:, :, -win_len:, :]
+                    pos_win = pos_all[-win_len:]
+                    caches[b].commit(K_win[:, :, :n_commit, :],
+                                     V_win[:, :, :n_commit, :],
+                                     pos_win[:n_commit])
+            if verbose:
+                print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):4s} -> "
+                      f"pc'={pc} ax={ax&0xFFFFFFFF} sp={sp} (FILE, "
+                      f"{len(byte_stores)} byte-stores) cache={caches[0].size()}")
+            cur_pc, cur_sp, cur_bp, cur_ax = pc, sp, bp, ax
+            if pc < 0 or pc >= len(code):
+                break
+            # append all emitted frames; NEXT window = [old_query_row] + all frames.
+            prev_query_pos = win_start + win_len - 1
+            n_new_frames = 1 + len(byte_stores)
+            stream += appended
+            win_start = prev_query_pos
+            win_len = 1 + n_new_frames * V.FRAME_LEN
+            max_seq = max(max_seq, len(stream))
+            tokens_since_prune += n_new_frames * V.FRAME_LEN
+            if evict and tokens_since_prune >= prune_interval:
+                for b in range(n_blocks):
+                    caches[b].evict(cos_threshold, prune_interval, zero_eps, recency_eps)
+                tokens_since_prune = 0
+            max_cache = max(max_cache, caches[0].size())
+            continue
 
         s_addr = s_val = 0
         is_store = False
