@@ -142,23 +142,59 @@ class SparseAttn:
             w.to(device)
         return self
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # default (un-cached) path only — byte-identical to blogspec Attn.forward.
+    def forward(self, x: torch.Tensor, past_kv=None, q_positions=None,
+                use_cache: bool = False):
+        """softmax1 + ALiBi attention — byte-identical to ``blogspec_model.Attn``.
+
+        Mirrors the dense ``Attn.forward`` exactly for BOTH the default un-cached
+        path AND the incremental cached / windowed path that
+        ``run_pure_forward_cached`` drives.  Q/K/V/O go through the SAME
+        ``F.linear`` (in ``dense_kernel`` mode the sparse ``.linear`` materialises
+        the weight and calls ``F.linear``, so the GEMM + accum order are identical
+        -> L-inf=0), and the ALiBi / causal / softmax1 math is copied verbatim.
+        Returns ``out`` (default) or ``(out, (K, V, k_pos))`` when ``use_cache``.
+        """
         B, S, D = x.shape
         H, HD = self.n_heads, self.head_dim
         Q = self.W_q.linear(x).view(B, S, H, HD).transpose(1, 2)
-        K = self.W_k.linear(x).view(B, S, H, HD).transpose(1, 2)
-        V = self.W_v.linear(x).view(B, S, H, HD).transpose(1, 2)
+        Knew = self.W_k.linear(x).view(B, S, H, HD).transpose(1, 2)
+        Vnew = self.W_v.linear(x).view(B, S, H, HD).transpose(1, 2)
+
+        if q_positions is None:
+            q_pos = torch.arange(S, device=x.device)
+        else:
+            q_pos = q_positions.to(device=x.device, dtype=torch.long)
+
+        if past_kv is not None:
+            K_cache, V_cache, pos_cache = past_kv
+            K = torch.cat([K_cache, Knew], dim=2)
+            V = torch.cat([V_cache, Vnew], dim=2)
+            k_pos = torch.cat([pos_cache.to(x.device), q_pos], dim=0)
+        else:
+            K, V, k_pos = Knew, Vnew, q_pos
+
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        pos = torch.arange(S, device=x.device)
-        dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()
-        scores = scores - self.alibi_slopes.view(1, H, 1, 1) * dist
-        causal = torch.triu(
-            torch.full((S, S), float("-inf"), device=x.device), diagonal=1)
-        scores = scores + causal
+
+        if past_kv is None and q_positions is None:
+            pos = torch.arange(S, device=x.device)
+            dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs().float()
+            scores = scores - self.alibi_slopes.view(1, H, 1, 1) * dist
+            causal = torch.triu(
+                torch.full((S, S), float("-inf"), device=x.device), diagonal=1)
+            scores = scores + causal
+        else:
+            dist = (q_pos.unsqueeze(1) - k_pos.unsqueeze(0)).abs().float()
+            scores = scores - self.alibi_slopes.view(1, H, 1, 1) * dist.unsqueeze(0)
+            mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1))     # [Sq, Sk]
+            scores = scores.masked_fill(
+                mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
         attn = softmax1(scores, dim=-1)
         out = torch.matmul(attn, V).transpose(1, 2).contiguous().view(B, S, D)
-        return x + self.W_o.linear(out)
+        out = x + self.W_o.linear(out)
+        if use_cache:
+            return out, (K, V, k_pos)
+        return out
 
 
 class SparseFFN:
@@ -199,7 +235,12 @@ class SparseBlock:
     def to(self, device):
         self.attn.to(device); self.ffn.to(device); return self
 
-    def __call__(self, x):
+    def __call__(self, x, past_kv=None, q_positions=None, use_cache: bool = False):
+        if use_cache or past_kv is not None or q_positions is not None:
+            a, new_kv = self.attn.forward(x, past_kv=past_kv,
+                                          q_positions=q_positions, use_cache=True)
+            out = self.ffn.forward(a)
+            return (out, new_kv) if use_cache else out
         return self.ffn.forward(self.attn.forward(x))
 
 
@@ -263,6 +304,28 @@ class SparseTransformer:
         for blk in self.blocks:
             x = blk(x)
         return F.linear(x, self.lm_head, self.lm_bias)
+
+    def forward_hidden_cached(self, x, past_key_values=None, q_positions=None,
+                              use_cache: bool = False):
+        """KV-cached block-stack forward (no LM head) — the API
+        ``run_pure_forward_cached`` drives.
+
+        Byte-identical to ``blogspec_model.Transformer.forward_hidden_cached``:
+        the SPARSE blocks compute the same GEMMs (``dense_kernel`` -> L-inf=0),
+        so the incremental K/V cache and the returned hidden are the same the
+        dense model would produce.  ``x`` is the NEW query rows' residual
+        (``[B, Snew, D]``); ``q_positions`` their absolute positions;
+        ``past_key_values`` a per-block ``(K, V, pos)`` list (or ``None``).
+        Returns ``(hidden, new_caches)``.
+        """
+        n = len(self.blocks)
+        if past_key_values is None:
+            past_key_values = [None] * n
+        new_caches = []
+        for blk, pkv in zip(self.blocks, past_key_values):
+            x, kv = blk(x, past_kv=pkv, q_positions=q_positions, use_cache=True)
+            new_caches.append(kv)
+        return x, new_caches
 
     # -- storage accounting -------------------------------------------------
     def stats(self) -> SparseStats:

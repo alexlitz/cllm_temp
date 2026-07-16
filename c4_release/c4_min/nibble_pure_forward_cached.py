@@ -269,10 +269,20 @@ class BlockKVCacheBatched:
         if self.K is None:
             return 0
         S = self.pos.shape[0]
+        # The keep-mask DECISION (norms / cosines / recency comparisons + the
+        # per-entry Python greedy near-dup loop) is device-independent — it is the
+        # exact ``nibble_kv_prune`` policy.  Compute it on CPU copies of K/V/pos so
+        # it is bit-identical regardless of where the (heavy) attention GEMMs ran,
+        # then apply the surviving index to the on-device tensors.  This keeps
+        # eviction correctness identical to the CPU reference while K/V live on GPU.
+        K_cpu = self.K.detach().to("cpu")
+        V_cpu = self.V.detach().to("cpu")
+        pos_cpu = self.pos.detach().to("cpu")
+        slopes_cpu = self.slopes.detach().to("cpu")
         keep_any = torch.zeros(S, dtype=torch.bool)
         # batched per-head value norms: a head with all-zero values -> mechanism 2a
         # drops all its entries (no keep_any contribution). Skip it entirely.
-        vnorm = self.V[0].norm(dim=-1)                       # [H, S]
+        vnorm = V_cpu[0].norm(dim=-1)                        # [H, S]
         head_has_value = (vnorm > zero_eps).any(dim=-1)      # [H]
         # per-head near-dup metric: a CONTENT-ADDRESSED head (a §Memory store head)
         # has keys dominated by a shared common-mode bias (the ADDR_BIN `-smag`
@@ -281,25 +291,26 @@ class BlockKVCacheBatched:
         # |mean_key| / mean(|key|): high (~1) for such heads, low for register-
         # marker heads whose distinct keys spread in direction.  Use the exact
         # (relative-L2) dup metric on those heads so every distinct store survives.
-        knorm_hs = self.K[0].norm(dim=-1)                    # [H, S]
-        mean_key = self.K[0].mean(dim=1)                     # [H, HD]
+        knorm_hs = K_cpu[0].norm(dim=-1)                     # [H, S]
+        mean_key = K_cpu[0].mean(dim=1)                      # [H, HD]
         cm_frac = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
         for h in range(self.n_heads):
             if not bool(head_has_value[h]):
                 continue                                     # mechanism 2a: evict all
             metric = "exact" if float(cm_frac[h]) > 0.9 else "cosine"
             mask = prune_keep_mask_head(
-                self.K[0, h], self.V[0, h], self.pos,
-                slope=float(self.slopes[h]), scale=self.scale,
+                K_cpu[0, h], V_cpu[0, h], pos_cpu,
+                slope=float(slopes_cpu[h]), scale=self.scale,
                 cos_threshold=cos_threshold, zero_eps=zero_eps,
                 recency_eps=recency_eps, dup_metric=metric)
             keep_any |= mask
         keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
         dropped = S - int(keep_idx.numel())
         if dropped:
-            self.K = self.K[:, :, keep_idx, :]
-            self.V = self.V[:, :, keep_idx, :]
-            self.pos = self.pos[keep_idx]
+            keep_idx_dev = keep_idx.to(self.K.device)
+            self.K = self.K[:, :, keep_idx_dev, :]
+            self.V = self.V[:, :, keep_idx_dev, :]
+            self.pos = self.pos[keep_idx_dev]
             self.total_evicted += dropped
         return dropped
 
