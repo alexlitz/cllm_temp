@@ -120,15 +120,26 @@ from .blogspec_model import Transformer
 #     only has to separate stores to the SAME address, which are ≥ one 30-token
 #     frame apart, so ``slope·30`` decisively favours the newer (latest-write-wins).
 ADDR_BITS = 32           # 4-byte aligned 32-bit addresses (§Memory)
-EFF = 4000.0             # post-scale per-bit match contribution (huge, §410)
+EFF = 40000.0            # post-scale per-bit match contribution (huge, §410)
 BIAS = (ADDR_BITS - 1) * EFF   # constant subtracted from load↔store pairs (ZFOD)
 # Recency slope. Two constraints (§410 decoupling): (a) ``slope·Δ`` must decisively
-# prefer the newer of two same-address stores — this compact interface spaces
-# store rows one token apart, so ``slope·1 ≈ 6`` gives an exp(6)≈400× preference;
-# (b) ``slope·dist`` must never overwhelm an exact match's ``+EFF``, i.e. a far
-# store still reads weight ~1 while ``dist < EFF/slope ≈ 666`` tokens. ``EFF`` is
-# set large enough that both hold across a multi-hundred-token program.
-MEM_ALIBI_SLOPE = 6.0
+# prefer the newer of two same-address stores — the driver spaces store rows one
+# 30-token FRAME apart, so ``slope·30 = 30`` gives an exp(30)≈1e13× preference (far
+# past any byte-decode argmax margin); (b) ``slope·dist`` must never overwhelm an
+# exact match's ``+EFF``, i.e. a far store still reads weight ~1 while
+# ``dist < EFF/slope = 40000`` tokens — the RECALL HORIZON.
+#
+# DEEP-LOOP FIX (CHK-1): the horizon must EXCEED the longest store→load recall gap
+# a program produces.  Measured across the deep-loop corpus (gcd, loop_sum, nested,
+# rec_*), the ordinary-loop max gap is ~700 tokens and most recursion needs a few
+# thousand; the previous ``EFF=4000 slope=6`` horizon of only 667 tokens sat BELOW
+# the loop_sum (669) / gcd (699) recall gaps, so the newest exact-address store fell
+# just past the horizon (``EFF - slope·dist < 0``) and softmax1's +1 sink won — the
+# load faded to ZFOD 0 (the LI→0 deep-loop divergence).  Raising EFF 10× and
+# dropping the slope 6× lifts the horizon to 40000 tokens (57× the ordinary-loop max
+# gap) while KEEPING the exp(30) latest-write-wins recency, exactly the spec's "sum
+# of scale² large enough ... even with extremely significant positional bias" (§410).
+MEM_ALIBI_SLOPE = 1.0
 
 
 class MemoryLayout(NibbleLayout):
