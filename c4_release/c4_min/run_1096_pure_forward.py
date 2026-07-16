@@ -16,7 +16,7 @@ division — ``nibble_alu32``).  The only Python on the compute path is the
 argmax-generate-append emit; the ``assert_no_python_compute`` settrace guard
 (``--guard``) is the machine proof.
 
-Corpus + expected values are the SAME as ``run_1096_nibble.py``:
+Corpus + expected values are the SAME as the shared corpus loader:
 ``tests.test_suite_1000.generate_test_programs`` (source, expected, description)
 compiled by ``src.compiler.compile_c``.  The C4 compiler encodes ``int`` as an
 8-byte word (``elem_size = 8``); the pure-forward ISA addresses the stack in
@@ -26,7 +26,7 @@ frame, ``byte_off = WORD * slot``).  The final AX (decoded from the canonical
 32-bit AX nibble band via the LM byte-head argmax, no ``torch.round``) is compared
 to ``expected & 0xFFFFFFFF``.
 
-Categorisation (mirrors ``run_1096_nibble.py``):
+Categorisation (mirrors ``run_1096_canonical``):
   PASS      — final AX == expected.
   FAIL      — halted, final AX != expected.
   TIMEOUT   — ran to ``--step-cap`` without HALT (deep-loop / non-halt).
@@ -115,7 +115,7 @@ def bytecode_to_isa(bytecode) -> List[isa.Instr]:
 
 
 # ---------------------------------------------------------------------------
-# Per-program result + cluster key (matches run_1096_nibble / run_1096_canonical).
+# Per-program result + cluster key (matches run_1096_canonical).
 # ---------------------------------------------------------------------------
 @dataclass
 class Result:
@@ -132,7 +132,7 @@ class Result:
 
 
 def cluster_of(description: str) -> str:
-    """Stable cluster key (matches run_1096_nibble.cluster_of)."""
+    """Stable cluster key (matches run_1096_canonical.cluster_of)."""
     base = description.split(":", 1)[0].strip()
     base = re.sub(r"_\d+$", "", base)
     base = re.sub(r"\d+$", "", base)
