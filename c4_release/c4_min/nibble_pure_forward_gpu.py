@@ -270,7 +270,7 @@ def run_batch_gpu(model, L: PureForwardCompleteLayout,
     ``evict=False`` byte-identical to ``run_pure_forward_cached(..., evict=False)``
     (== naive) on the same device (up to the saturated-tie fp handful).
     """
-    from .nibble_pure_forward_cached import prune_keep_mask_head
+    from .nibble_pure_forward_cached import evict_keep_index
     n_blocks = len(model.blocks)
     H = model.blocks[0].attn.n_heads
     HD = model.blocks[0].attn.head_dim
@@ -436,7 +436,6 @@ def run_batch_gpu(model, L: PureForwardCompleteLayout,
         # this is exactly why ``cache_len`` and the padded-cache assembly above are
         # PER BLOCK.
         if evict:
-            slopes = model.blocks[0].attn.alibi_slopes
             scale = HD ** -0.5
             for p in still_active:
                 ps = progs[p]
@@ -448,22 +447,19 @@ def run_batch_gpu(model, L: PureForwardCompleteLayout,
                     if ps.K[b] is None:
                         continue
                     Kb, Vb, posb = ps.K[b], ps.V[b], ps.pos[b]
-                    S = posb.shape[0]
-                    keep_any = torch.zeros(S, dtype=torch.bool)
-                    vnorm = Vb[0].norm(dim=-1)                    # [H,S]
-                    head_has_value = (vnorm > zero_eps).any(dim=-1)
-                    Kb_cpu = Kb[0].cpu(); Vb_cpu = Vb[0].cpu(); posb_cpu = posb.cpu()
-                    for h in range(H):
-                        if not bool(head_has_value[h]):
-                            continue
-                        mask_h = prune_keep_mask_head(
-                            Kb_cpu[h], Vb_cpu[h], posb_cpu,
-                            slope=float(slopes[h]), scale=scale,
-                            cos_threshold=cos_threshold, zero_eps=zero_eps,
-                            recency_eps=recency_eps)
-                        keep_any |= mask_h
-                    keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
-                    if int(keep_idx.numel()) < S:
+                    S = int(posb.shape[0])
+                    # SHARED spec eviction policy (SAME ``evict_keep_index`` the
+                    # single-program cached driver / block-verifier use).  Per BLOCK
+                    # slopes (not block-0's), and — crucially — the EXACT dup metric
+                    # on content-addressed §Memory store heads, without which distinct
+                    # stored values are cosine-merged (~0.999 ADDR_BIN common-mode) and
+                    # a deep-loop LI/LC recalls nothing (got=0, ZFOD — the batched-path
+                    # deep-loop memory bug).
+                    keep_idx = evict_keep_index(
+                        Kb, Vb, posb, model.blocks[b].attn.alibi_slopes, scale, H,
+                        cos_threshold=cos_threshold, zero_eps=zero_eps,
+                        recency_eps=recency_eps)
+                    if keep_idx is not None and int(keep_idx.numel()) < S:
                         keep_dev = keep_idx.to(Kb.device)
                         ps.K[b] = Kb[:, :, keep_dev, :]
                         ps.V[b] = Vb[:, :, keep_dev, :]
