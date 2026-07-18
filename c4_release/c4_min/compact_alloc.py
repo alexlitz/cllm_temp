@@ -795,8 +795,16 @@ def build_compact_pure_forward_model(code_size: int = 48,
     L = _rebuild_layout(pfc, code_size, n_heads, include_bitwise)
 
     # Build the model with each block's REAL hidden (no global-max padding).
+    # The Transformer ctor allocates ONE uniform FFN hidden for ALL blocks — using
+    # ``max(hidden_per_block)`` (the global-max, e.g. 21544) would re-materialise
+    # the exact ~190 GB FFN padding this whole pass exists to remove (every
+    # ``n_blocks`` FFN allocated at once inside the ctor's ModuleList BEFORE any
+    # swap runs). Build with a PLACEHOLDER hidden=1 and install each block's own
+    # ragged FFN via ``_swap_ffn`` below (which replaces the Parameter, freeing the
+    # placeholder). Pure construction-order change — the FFNs are swapped either
+    # way — so the resulting model is byte-identical; it only drops the transient.
     hidden_per_block = [max(1, sp["W_up"].shape[0]) for _, sp in block_specs]
-    model = _T(dim=dim, n_heads=n_heads, hidden=max(hidden_per_block),
+    model = _T(dim=dim, n_heads=n_heads, hidden=1,
                n_blocks=n_blocks, vocab=vocab, max_seq_len=max_seq)
     with torch.no_grad():
         pfc._bake_pure_embedding(model, L)
