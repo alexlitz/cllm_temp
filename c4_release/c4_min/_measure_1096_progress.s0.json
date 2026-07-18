@@ -8,16 +8,16 @@
     "max_steps": 20000,
     "storage_mb": 26.43558,
     "vram_load_mb": 27.94496,
-    "wall_seconds": 6102.556834499352
+    "wall_seconds": 6113.50982728228
   },
   "summary": {
-    "PASS": 533,
+    "PASS": 541,
     "FAIL": 7,
     "TIMEOUT": 0,
     "ERROR": 0,
     "DEEP": 0,
-    "total": 540,
-    "pass": 533
+    "total": 548,
+    "pass": 541
   },
   "clusters": {
     "add": {
@@ -397,8 +397,8 @@
       "DEEP": 0
     },
     "bool_and": {
-      "n": 4,
-      "PASS": 4,
+      "n": 12,
+      "PASS": 12,
       "FAIL": 0,
       "TIMEOUT": 0,
       "ERROR": 0,
@@ -7963,6 +7963,118 @@
       "forwards": 1,
       "speedup": 12.0,
       "max_cache": 7,
+      "wall": 1.5,
+      "detail": ""
+    },
+    {
+      "idx": 1080,
+      "cluster": "bool_and",
+      "description": "bool_and_9: 99>48 && 48>64",
+      "expected": 0,
+      "status": "PASS",
+      "got": 0,
+      "steps": 12,
+      "forwards": 1,
+      "speedup": 12.0,
+      "max_cache": 6,
+      "wall": 1.5,
+      "detail": ""
+    },
+    {
+      "idx": 1082,
+      "cluster": "bool_and",
+      "description": "bool_and_11: 25>77 && 77>17",
+      "expected": 0,
+      "status": "PASS",
+      "got": 0,
+      "steps": 7,
+      "forwards": 1,
+      "speedup": 7.0,
+      "max_cache": 6,
+      "wall": 1.0,
+      "detail": ""
+    },
+    {
+      "idx": 1084,
+      "cluster": "bool_and",
+      "description": "bool_and_13: 61>47 && 47>70",
+      "expected": 0,
+      "status": "PASS",
+      "got": 0,
+      "steps": 12,
+      "forwards": 1,
+      "speedup": 12.0,
+      "max_cache": 6,
+      "wall": 1.5,
+      "detail": ""
+    },
+    {
+      "idx": 1086,
+      "cluster": "bool_and",
+      "description": "bool_and_15: 15>36 && 36>10",
+      "expected": 0,
+      "status": "PASS",
+      "got": 0,
+      "steps": 7,
+      "forwards": 1,
+      "speedup": 7.0,
+      "max_cache": 6,
+      "wall": 1.0,
+      "detail": ""
+    },
+    {
+      "idx": 1088,
+      "cluster": "bool_and",
+      "description": "bool_and_17: 57>65 && 65>18",
+      "expected": 0,
+      "status": "PASS",
+      "got": 0,
+      "steps": 7,
+      "forwards": 1,
+      "speedup": 7.0,
+      "max_cache": 6,
+      "wall": 1.0,
+      "detail": ""
+    },
+    {
+      "idx": 1090,
+      "cluster": "bool_and",
+      "description": "bool_and_19: 57>44 && 44>3",
+      "expected": 1,
+      "status": "PASS",
+      "got": 1,
+      "steps": 12,
+      "forwards": 1,
+      "speedup": 12.0,
+      "max_cache": 7,
+      "wall": 1.5,
+      "detail": ""
+    },
+    {
+      "idx": 1092,
+      "cluster": "bool_and",
+      "description": "bool_and_21: 64>47 && 47>30",
+      "expected": 1,
+      "status": "PASS",
+      "got": 1,
+      "steps": 12,
+      "forwards": 1,
+      "speedup": 12.0,
+      "max_cache": 7,
+      "wall": 1.4,
+      "detail": ""
+    },
+    {
+      "idx": 1094,
+      "cluster": "bool_and",
+      "description": "bool_and_23: 28>3 && 3>40",
+      "expected": 0,
+      "status": "PASS",
+      "got": 0,
+      "steps": 12,
+      "forwards": 1,
+      "speedup": 12.0,
+      "max_cache": 6,
       "wall": 1.5,
       "detail": ""
     }
