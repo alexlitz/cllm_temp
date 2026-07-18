@@ -205,6 +205,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="dense_kernel: L-inf=0. sparse_mm: argmax-identical, faster.")
     ap.add_argument("--check-compact", action="store_true",
                     help="ALSO run the compact model per program; flag disagreements.")
+    ap.add_argument("--stream-build", action="store_true",
+                    help="Build the compact SPARSE model block-at-a-time "
+                         "(build_compact_sparse_streaming) so the peak build RSS is "
+                         "~one dense block (~1 GB divmod), not ~79 GB. Byte-identical.")
+    ap.add_argument("--load-sparse", type=str, default=None,
+                    help="Reload a saved streamed sparse model (save_sparse_transformer "
+                         "artifact) INSTEAD of building — no rebuild, no peak.")
     ap.add_argument("--output", type=str, default=None)
     ap.add_argument("--progress", type=int, default=20)
     args = ap.parse_args(argv)
@@ -243,13 +250,48 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     include_divmod = not args.no_divmod
     t_build = time.monotonic()
-    print(f"[sparse-gpu:{device}] building pure-forward model "
-          f"(divmod={include_divmod}, bitwise={args.include_bitwise}) ...",
-          file=sys.stderr, flush=True)
+
+    # ``sparse`` may be filled directly by the reload / stream branches below; the
+    # dense-build + SparseTransformer-wrap section is then skipped (guarded on
+    # ``sparse is None``).  Both are byte-identical (dense_kernel L-inf=0).
+    sparse = None
+    st = None
+    compact_model_for_check = None
+    Lc_for_check = None
+
+    # -- FAST PATH: reload a pre-saved streamed sparse model (no rebuild, no peak).
+    if args.load_sparse:
+        from c4_min.compact_alloc import load_sparse_transformer
+        print(f"[sparse-gpu:{device}] reloading sparse model from "
+              f"{args.load_sparse} ...", file=sys.stderr, flush=True)
+        sparse, L = load_sparse_transformer(args.load_sparse,
+                                            compute_mode=args.compute_mode)
+        st = sparse.stats()
+    # -- STREAM BUILD: build the compact model directly SPARSE, block-at-a-time
+    #    (peak build RSS ~one dense block, not ~79 GB) — byte-identical (L-inf=0).
+    elif args.stream_build:
+        from c4_min.compact_alloc import build_compact_sparse_streaming
+        print(f"[sparse-gpu:{device}] STREAM building pure-forward model "
+              f"(divmod={include_divmod}, bitwise={args.include_bitwise}) ...",
+              file=sys.stderr, flush=True)
+        sparse, L, cstats = build_compact_sparse_streaming(
+            code_size=args.code_size, include_bitwise=args.include_bitwise,
+            include_divmod=include_divmod, compute_mode=args.compute_mode)
+        st = sparse.stats()
+        print(f"[sparse-gpu:{device}] STREAM compact: dim {cstats.dim_before}->"
+              f"{cstats.dim_after} blocks={cstats.n_blocks} "
+              f"nnz={cstats.nonzero_params}", file=sys.stderr, flush=True)
+
+    if sparse is None:
+        print(f"[sparse-gpu:{device}] building pure-forward model "
+              f"(divmod={include_divmod}, bitwise={args.include_bitwise}) ...",
+              file=sys.stderr, flush=True)
     # Build the model. For divmod we MUST use the compact builder (never the
     # 106 GB dense path); for LEAN the dense builder is cheap and its dense-kernel
     # sparse wrap is L-inf=0.  Both then wrap SPARSE for the GPU forward.
-    if include_divmod:
+    if sparse is not None:
+        pass
+    elif include_divmod:
         dense_or_compact, L, cstats = build_compact_pure_forward_model(
             code_size=args.code_size, include_bitwise=args.include_bitwise,
             include_divmod=True)
@@ -271,10 +313,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                     code_size=args.code_size,
                     include_bitwise=args.include_bitwise, include_divmod=False)
 
-    # Wrap SPARSE (storage in CSR; dense_kernel forward is L-inf=0).
-    sparse = SparseTransformer(dense_or_compact, compute_mode=args.compute_mode)
-    st = sparse.stats()
-    del dense_or_compact  # drop the dense weights; only the CSR survive
+    # Wrap SPARSE (storage in CSR; dense_kernel forward is L-inf=0).  Skipped when
+    # the reload / stream branch already produced ``sparse`` directly.
+    if sparse is None:
+        sparse = SparseTransformer(dense_or_compact, compute_mode=args.compute_mode)
+        st = sparse.stats()
+        del dense_or_compact  # drop the dense weights; only the CSR survive
     sparse = sparse.to(device)
     if device.startswith("cuda"):
         torch.cuda.synchronize(torch.device(device))

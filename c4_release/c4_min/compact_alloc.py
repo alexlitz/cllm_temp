@@ -1174,6 +1174,125 @@ def build_compact_sparse_streaming(code_size: int = 48,
     return sparse, L, stats
 
 
+# ===========================================================================
+# SAVE / RELOAD a streamed sparse model (so the measure sweep reloads the divmod
+# artifact instead of rebuilding it — no 79 GB peak, no 30 s bake).  The on-disk
+# form stores each weight as a COO sparse tensor (a few MB) + the attn scalars +
+# the FFN biases + embed/lm_head/lm_bias + the (remapped) layout ``L``.  The
+# loader rebuilds a small dense-block model from the COO tensors and re-wraps it
+# with :class:`SparseTransformer` — byte-identical to the streamed model.
+# ===========================================================================
+def _sparse_weight_to_dense(w) -> torch.Tensor:
+    """Densify a :class:`sparse_forward.SparseWeight` (CSR or dense)."""
+    if not w.is_sparse:
+        return w.dense.detach().clone()
+    return w.csr.to_dense()
+
+
+def save_sparse_transformer(sparse, L, stats, path: str) -> None:
+    """Serialise a streamed ``SparseTransformer`` + its layout to ``path``.
+
+    Weights are stored COO (small); the loader materialises them back and
+    re-wraps :class:`SparseTransformer` (so the reloaded model is byte-identical
+    to the streamed one).  ``L`` is pickled whole (it is a small dataclass of int
+    band offsets)."""
+    blocks = []
+    for b in sparse.blocks:
+        at, ff = b.attn, b.ffn
+        blk = {
+            "n_heads": at.n_heads, "head_dim": at.head_dim, "scale": at.scale,
+            "max_seq_len": at.max_seq_len,
+            "alibi_slopes": at.alibi_slopes.detach().cpu().clone(),
+            "W_q": _sparse_weight_to_dense(at.W_q).to_sparse().coalesce(),
+            "W_k": _sparse_weight_to_dense(at.W_k).to_sparse().coalesce(),
+            "W_v": _sparse_weight_to_dense(at.W_v).to_sparse().coalesce(),
+            "W_o": _sparse_weight_to_dense(at.W_o).to_sparse().coalesce(),
+            "W_up": _sparse_weight_to_dense(ff.W_up).to_sparse().coalesce(),
+            "W_gate": _sparse_weight_to_dense(ff.W_gate).to_sparse().coalesce(),
+            "W_down": _sparse_weight_to_dense(ff.W_down).to_sparse().coalesce(),
+            "b_up": ff.b_up.detach().cpu().clone(),
+            "b_gate": ff.b_gate.detach().cpu().clone(),
+            "b_down": ff.b_down.detach().cpu().clone(),
+        }
+        blocks.append(blk)
+    payload = {
+        "format": "c4min_sparse_stream_v1",
+        "dim": sparse.dim, "vocab": sparse.vocab,
+        "max_seq_len": sparse.max_seq_len, "compute_mode": sparse.compute_mode,
+        "embed": sparse.embed.detach().cpu().to_sparse().coalesce(),
+        "lm_head": sparse.lm_head.detach().cpu().to_sparse().coalesce(),
+        "lm_bias": sparse.lm_bias.detach().cpu().clone(),
+        "blocks": blocks,
+        "layout": L,
+        "stats": stats,
+    }
+    torch.save(payload, path)
+
+
+class _LoadedBlock:
+    """A dense ``.attn`` / ``.ffn`` holder that :class:`SparseTransformer` can
+    re-wrap (mirrors ``blogspec_model.Block``'s field shape, no nn.Module)."""
+
+    def __init__(self, attn, ffn):
+        self.attn = attn
+        self.ffn = ffn
+
+
+def load_sparse_transformer(path: str, compute_mode: Optional[str] = None):
+    """Reload a saved streamed sparse model — returns ``(SparseTransformer, L)``.
+
+    Rebuilds each block's dense weights from the stored COO tensors, wraps them
+    in a lightweight holder, and re-wraps the whole model with
+    :class:`SparseTransformer` (so the reloaded forward is byte-identical to the
+    streamed model).  Peak memory is one block's dense weights at a time (the
+    ``SparseTransformer`` ctor sparsifies block-by-block), never the full dense
+    model."""
+    import torch.nn as nn
+    from .blogspec_model import Attn as _Attn, FFN as _FFN
+    from .sparse_forward import SparseTransformer
+
+    payload = torch.load(path, weights_only=False)
+    assert payload.get("format") == "c4min_sparse_stream_v1", "bad artifact format"
+    dim = payload["dim"]
+    vocab = payload["vocab"]
+    max_seq = payload["max_seq_len"]
+    mode = compute_mode or payload["compute_mode"]
+    L = payload["layout"]
+
+    # A tiny holder mirroring blogspec Transformer for SparseTransformer's ctor.
+    class _Holder:
+        pass
+    holder = _Holder()
+    holder.dim = dim
+    holder.vocab = vocab
+    holder.max_seq_len = max_seq
+    holder.embed = payload["embed"].to_dense()
+    holder.lm_head = payload["lm_head"].to_dense()
+    holder.lm_bias = payload["lm_bias"]
+    holder.blocks = []
+    with torch.no_grad():
+        for blk in payload["blocks"]:
+            n_heads = blk["n_heads"]
+            at = _Attn(dim, n_heads, blk["max_seq_len"])
+            at.W_q.copy_(blk["W_q"].to_dense())
+            at.W_k.copy_(blk["W_k"].to_dense())
+            at.W_v.copy_(blk["W_v"].to_dense())
+            at.W_o.copy_(blk["W_o"].to_dense())
+            at.scale = blk["scale"]
+            at.alibi_slopes.copy_(blk["alibi_slopes"])
+            hidden = blk["b_up"].shape[0]
+            ff = _FFN(dim, hidden)
+            ff.W_up.copy_(blk["W_up"].to_dense())
+            ff.W_gate.copy_(blk["W_gate"].to_dense())
+            ff.W_down.copy_(blk["W_down"].to_dense())
+            ff.b_up.copy_(blk["b_up"])
+            ff.b_gate.copy_(blk["b_gate"])
+            ff.b_down.copy_(blk["b_down"])
+            holder.blocks.append(_LoadedBlock(at, ff))
+    sparse = SparseTransformer(holder, compute_mode=mode)
+    return sparse, L
+
+
 def _rebuild_layout(pfc, code_size, n_heads, include_bitwise):
     """Reconstruct the ``PureForwardCompleteLayout`` exactly as the builder does."""
     from . import nibble_pure_forward_complete as _pfc

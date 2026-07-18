@@ -117,3 +117,108 @@ def test_divmod_compact_battery():
         ("mod", "int main(){ return 84 % 5; }", 4),
         ("divzero", "int main(){ return 5 / 0; }", 0),
     ])
+
+
+# ---------------------------------------------------------------------------
+# STREAMING SPARSE BUILD (the OOM fix): peak live memory is ~one dense block,
+# not all N.  The streamed sparse model is byte-identical (L-inf=0 in
+# ``dense_kernel`` mode) to ``SparseTransformer(build_compact_pure_forward_model)``.
+# ---------------------------------------------------------------------------
+def _decode_band_row(x, L):
+    row = x[0, -1]
+    vals = []
+    for nm in ("PC_VAL", "AX_VAL", "SP_VAL", "BP_VAL", "STK_VAL", "HALTED"):
+        vals.append(row[getattr(L, nm)].reshape(-1))
+    for k in range(8):
+        vals.append(row[L.AX + k].reshape(-1))
+    return torch.cat(vals)
+
+
+def _stream_vs_old_linf(include_bitwise):
+    """L-inf between ``SparseTransformer(compact-dense)`` and the streamed sparse
+    build on the decode bands."""
+    from src.compiler import compile_c
+    from c4_min.run_1096_pure_forward import bytecode_to_isa
+    from c4_min.compact_alloc import build_compact_sparse_streaming
+    from c4_min.sparse_forward import SparseTransformer
+
+    compact, Lo, _ = build_compact_pure_forward_model(
+        code_size=44, include_bitwise=include_bitwise, include_divmod=False)
+    old = SparseTransformer(compact, compute_mode="dense_kernel")
+    new, Ln, stats = build_compact_sparse_streaming(
+        code_size=44, include_bitwise=include_bitwise, include_divmod=False,
+        compute_mode="dense_kernel")
+    srcs = ["int main(){ return 500 + 700; }",
+            "int main(){ int x; x = 1000; return x; }"]
+    if include_bitwise:
+        srcs.append("int main(){ return 12 | 3; }")
+    worst = 0.0
+    for src in srcs:
+        code = bytecode_to_isa(compile_c(src)[0])
+        stream = [V.BOS] + _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+        for _ in range(4):
+            stream += _build_frame(1, 7, SP_INIT - 4, SP_INIT, 3)
+        toks = torch.tensor([stream])
+        ov_o = make_overlay_complete(code, Lo)
+        ov_n = make_overlay_complete(code, Ln)
+        with torch.no_grad():
+            xo = old.embed[toks].clone(); ov_o(xo)
+            for blk in old.blocks:
+                xo = blk(xo)
+            xn = new.embed[toks].clone(); ov_n(xn)
+            for blk in new.blocks:
+                xn = blk(xn)
+        worst = max(worst, (_decode_band_row(xo, Lo)
+                            - _decode_band_row(xn, Ln)).abs().max().item())
+    return worst, new, Ln, stats
+
+
+def test_lean_streaming_is_byte_identical():
+    worst, _, _, stats = _stream_vs_old_linf(include_bitwise=False)
+    assert worst < 1e-9, worst
+    assert stats.dim_after < stats.dim_before
+
+
+def test_bitwise_streaming_is_byte_identical():
+    worst, sparse, L, _ = _stream_vs_old_linf(include_bitwise=True)
+    assert worst < 1e-9, worst
+    # streamed model runs the battery correctly too.
+    _battery(sparse, L, [
+        ("add", "int main(){ return 500 + 700; }", 1200),
+        ("var", "int main(){ int x; x = 1000; return x; }", 1000),
+        ("bw_or", "int main(){ return 12 | 3; }", 15),
+    ])
+
+
+def test_streaming_save_reload_byte_identical(tmp_path):
+    from c4_min.compact_alloc import (build_compact_sparse_streaming,
+                                      save_sparse_transformer,
+                                      load_sparse_transformer)
+    from src.compiler import compile_c
+    from c4_min.run_1096_pure_forward import bytecode_to_isa
+
+    sparse, L, stats = build_compact_sparse_streaming(
+        code_size=44, include_bitwise=True, include_divmod=False,
+        compute_mode="dense_kernel")
+    path = str(tmp_path / "lean_sparse.pt")
+    save_sparse_transformer(sparse, L, stats, path)
+    r, Lr = load_sparse_transformer(path)
+    assert r.dim == sparse.dim and len(r.blocks) == len(sparse.blocks)
+    worst = 0.0
+    for src in ["int main(){ return 500 + 700; }",
+                "int main(){ return 12 | 3; }"]:
+        code = bytecode_to_isa(compile_c(src)[0])
+        stream = [V.BOS] + _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+        for _ in range(4):
+            stream += _build_frame(1, 7, SP_INIT - 4, SP_INIT, 3)
+        toks = torch.tensor([stream])
+        with torch.no_grad():
+            xa = sparse.embed[toks].clone(); make_overlay_complete(code, L)(xa)
+            for b in sparse.blocks:
+                xa = b(xa)
+            xb = r.embed[toks].clone(); make_overlay_complete(code, Lr)(xb)
+            for b in r.blocks:
+                xb = b(xb)
+        worst = max(worst, (_decode_band_row(xa, L)
+                            - _decode_band_row(xb, Lr)).abs().max().item())
+    assert worst < 1e-9, worst
