@@ -117,11 +117,14 @@ def compute_liveness(model, never_share_dims: set) -> List[DimLiveness]:
 
     for b, blk in enumerate(model.blocks):
         at = blk.attn
-        # Reads: any dim a Q/K/V projection column touches.
-        for w in (at.W_q, at.W_k, at.W_v):
-            mark_read(_nonzero_dims_cols(w), b)
-        # Writes: attn output rows.
-        mark_write(_nonzero_dims_rows(at.W_o), b)
+        # A param-free zero-attention block (``_ZeroAttn``) contributes NO reads or
+        # writes (all-zero projections) — skip it (it has no W_* tensors to scan).
+        if not getattr(at, "is_zero", False):
+            # Reads: any dim a Q/K/V projection column touches.
+            for w in (at.W_q, at.W_k, at.W_v):
+                mark_read(_nonzero_dims_cols(w), b)
+            # Writes: attn output rows.
+            mark_write(_nonzero_dims_rows(at.W_o), b)
         ffn = blk.ffn
         for w in (ffn.W_up, ffn.W_gate):
             mark_read(_nonzero_dims_cols(w), b)
@@ -841,6 +844,336 @@ def build_compact_pure_forward_model(code_size: int = 48,
     return compact, Lc, stats
 
 
+# ===========================================================================
+# STREAMING BUILD (the OOM fix) — build the compact SPARSE model block-at-a-time
+# so the peak live memory is ONE block's dense attention (~a few MB..1 GB), NOT
+# all ``n_blocks`` dense attention matrices (28 GB for divmod) + the padded FFN.
+#
+# WHERE THE DENSE MATERIALISATION WAS
+# -----------------------------------
+# ``build_compact_pure_forward_model`` built a full dense intermediate
+# ``Transformer`` for ALL ``n_blocks``:
+#   * ``Attn.__init__`` allocates 4×[dim,dim] dense zeros PER BLOCK — for divmod
+#     (dim=2415, n_blocks=304) that is 28 GB of attention that is 99.99 % ZERO
+#     (only 3 heads are ever baked: frame-ingest on block 0, the mem-cam LI head,
+#     and the stack-pop / lev heads).  The other 301 blocks are ``_zero_attn``.
+#   * the ctor's uniform FFN hidden was the global-max (21544) -> the ~190 GB FFN
+#     padding (fixed separately by the ``hidden=1`` placeholder above).
+#   * ``compact_model`` then built a SECOND full dense ``Transformer`` (the remap
+#     target), so at its peak BOTH dense models were live.
+# Only ~180k-390k of those params are nonzero (~26 MB CSR).
+#
+# THE STREAMING FIX
+# -----------------
+# 1. The intermediate model used for the liveness passes stores attention SPARSE:
+#    the 301 zero-attention blocks use a param-free ``_ZeroAttn`` (``out = x``,
+#    byte-identical to an all-zero ``Attn``) that allocates NOTHING, and only the
+#    3 baked blocks carry a real dense ``Attn``.  Peak intermediate memory is the
+#    ragged FFNs (~3 GB divmod) + 3 dense attentions (~0.3 GB), never 28 GB.
+# 2. The compact model is built + sparsified ONE block at a time: remap the
+#    block's dense weights onto the packed dim, wrap it as a ``SparseBlock`` (CSR),
+#    then free the dense block.  Peak = one block's dense (attention + that block's
+#    ragged FFN), not all ``n_blocks``.
+# The result is byte-identical (L∞=0) to ``build_compact_pure_forward_model`` +
+# ``SparseTransformer`` — it is a construction-ORDER change, not a semantics one:
+# the same liveness -> same colouring -> same per-block remapped weights -> same
+# CSR.  A ``gate`` (``streaming=`` / env flag) selects it; the old dense path is
+# kept intact behind the same public entry point.
+# ===========================================================================
+class _ZeroAttn:
+    """A param-free stand-in for an all-zero attention block (``out = x``).
+
+    A ``blogspec_model.Attn`` with W_q=W_k=W_v=W_o=0 computes Q=K=V=0 -> scores=0
+    -> softmax1 weights -> ``matmul(attn, V)=0`` (V is 0) -> ``out = x + W_o@0 =
+    x``.  So an all-zero attention is exactly the identity on the residual — this
+    class realises that WITHOUT allocating the 4×[dim,dim] dense zeros (28 GB
+    across the 301 unbaked divmod blocks).  Exposes ``n_heads`` / ``head_dim`` /
+    ``scale`` / ``max_seq_len`` / ``alibi_slopes`` and a ``.W_q``-style nonzero
+    interface (all-empty) so ``compute_liveness`` / ``_remap_attn`` treat it as
+    contributing nothing, and a ``forward`` identical to the zero-attention path.
+    """
+
+    def __init__(self, dim: int, n_heads: int, max_seq_len: int):
+        self.dim = dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        self.scale = self.head_dim ** -0.5
+        self.max_seq_len = max_seq_len
+        self.alibi_slopes = torch.tensor(
+            [2.0 ** (-8.0 / n_heads * (i + 1)) for i in range(n_heads)])
+        self.is_zero = True
+
+    def forward(self, x, past_kv=None, q_positions=None, use_cache: bool = False):
+        # out = x (all-zero attention). Mirror the cache contract so the intermediate
+        # can also run the KV-cached path if ever asked (it is not, but be safe).
+        if use_cache or past_kv is not None or q_positions is not None:
+            B, S, _ = x.shape
+            H, HD = self.n_heads, self.head_dim
+            z = x.new_zeros(B, H, S, HD)
+            if q_positions is None:
+                k_pos = torch.arange(S, device=x.device)
+            else:
+                k_pos = q_positions.to(device=x.device, dtype=torch.long)
+            if past_kv is not None:
+                _, _, pos_cache = past_kv
+                k_pos = torch.cat([pos_cache.to(x.device), k_pos], dim=0)
+                z = x.new_zeros(B, H, k_pos.shape[0], HD)
+            return x, (z, z, k_pos)
+        return x
+
+    __call__ = forward
+
+
+class _StreamBlock:
+    """Intermediate block: ``_ZeroAttn`` (or a real dense ``Attn``) + ragged FFN."""
+
+    def __init__(self, attn, ffn):
+        self.attn = attn
+        self.ffn = ffn
+
+    def __call__(self, x, past_kv=None, q_positions=None, use_cache: bool = False):
+        if use_cache or past_kv is not None or q_positions is not None:
+            a, new_kv = self.attn(x, past_kv=past_kv, q_positions=q_positions,
+                                  use_cache=True)
+            out = self.ffn(a)
+            return (out, new_kv) if use_cache else out
+        return self.ffn(self.attn(x))
+
+
+class _StreamIntermediate:
+    """Memory-cheap mirror of ``blogspec_model.Transformer`` for the liveness pass.
+
+    Same ``.embed`` / ``.lm_head`` / ``.lm_bias`` / ``.dim`` / ``.vocab`` /
+    ``.blocks`` / ``.max_seq_len`` API + per-block ``.attn`` / ``.ffn``, but the
+    301 zero-attention blocks carry a param-free ``_ZeroAttn`` instead of a dense
+    ``Attn`` (so the 28 GB of zero attention is never allocated).  ``forward`` is
+    byte-identical to the dense ``Transformer`` on the default (un-cached) path.
+    """
+
+    def __init__(self, dim, vocab, max_seq_len, embed, lm_head, lm_bias, blocks):
+        self.dim = dim
+        self.vocab = vocab
+        self.max_seq_len = max_seq_len
+        self.embed = embed
+        self.lm_head = lm_head
+        self.lm_bias = lm_bias
+        self.blocks = blocks
+
+
+def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L):
+    """Build the memory-cheap intermediate (sparse attention, ragged dense FFN).
+
+    Only the 3 baked attention blocks (frame-ingest block 0, mem-cam, stack-pop)
+    get a real dense ``Attn``; every other block gets a param-free ``_ZeroAttn``.
+    Byte-identical forward to the full dense intermediate the non-streaming path
+    builds (the un-baked blocks ARE all-zero attention there too).
+    """
+    import torch.nn as nn
+    from .blogspec_model import Attn as _Attn, FFN as _FFN
+
+    n_blocks = len(block_specs)
+    mem_block = pfc._find(block_specs, "mem-cam")
+    stk_block = pfc._find(block_specs, "stack-pop-cam")
+    baked = {0, mem_block, stk_block}
+
+    # embedding + LM head (dense; embed is a gather, head is only used by .forward
+    # which the liveness pass does not call for the block stack — but keep it real).
+    embed = torch.zeros(vocab, dim)
+    lm_head = torch.zeros(vocab, dim)
+    lm_bias = torch.zeros(vocab)
+
+    blocks: List[_StreamBlock] = []
+    with torch.no_grad():
+        # Bake the embedding into a tiny throwaway holder so we can reuse
+        # ``_bake_pure_embedding`` (it writes model.embed).
+        class _EmbHolder:
+            pass
+        eh = _EmbHolder(); eh.dim = dim; eh.embed = embed
+        pfc._bake_pure_embedding(eh, L)
+
+        for bi, (name, spec) in enumerate(block_specs):
+            if bi in baked:
+                at = _Attn(dim, n_heads, max_seq)          # dense (zeroed) attn
+                for p in (at.W_q, at.W_k, at.W_v, at.W_o):
+                    p.zero_()
+            else:
+                at = _ZeroAttn(dim, n_heads, max_seq)      # param-free identity
+            hid = max(1, spec["W_up"].shape[0])
+            ffn = _FFN(dim, hid)
+            _swap_ffn(ffn, spec["W_up"], spec["b_up"], spec["W_gate"],
+                      spec["b_gate"], spec["W_down"], spec["b_down"])
+            blocks.append(_StreamBlock(at, ffn))
+
+        reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP,
+                     "STACK0": L.STACK0}
+        pfc.bake_frame_ingest(blocks[0].attn, L, reg_bases)
+        pfc._bake_pf_memory_head(blocks[mem_block].attn, L, head=pfc.N_ROLES)
+        pfc._bake_stack_pop_head(blocks[stk_block].attn, L, head=pfc.N_ROLES + 1)
+        pfc._bake_lev_ret_head(blocks[stk_block].attn, L, head=pfc.N_ROLES + 2)
+
+    return _StreamIntermediate(dim, vocab, max_seq, embed, lm_head, lm_bias, blocks)
+
+
+def build_compact_sparse_streaming(code_size: int = 48,
+                                   include_bitwise: bool = True,
+                                   include_divmod: bool = False,
+                                   compute_mode: str = "dense_kernel",
+                                   density_thresh: float = 0.25,
+                                   min_numel: int = 4096,
+                                   probe_programs=None):
+    """Build the c4_min pure-forward VM directly as a streaming SPARSE model.
+
+    Returns ``(SparseTransformer, L, stats)`` — the SAME public triple as
+    ``build_compact_pure_forward_model`` (whose compact dense model you would then
+    wrap with ``SparseTransformer``), but built block-at-a-time so the PEAK live
+    memory is ONE block's dense weights (a few MB..~1 GB), never the 28 GB of dense
+    attention + padded FFN.  Byte-identical (L∞=0 in ``dense_kernel`` mode) to
+    ``SparseTransformer(build_compact_pure_forward_model(...)[0])``.
+
+    ``compute_mode`` / ``density_thresh`` / ``min_numel`` match
+    ``sparse_forward.SparseTransformer`` (defaults: bit-identical dense_kernel).
+    """
+    import inspect
+    from . import nibble_pure_forward_complete as pfc
+    from .sparse_forward import SparseTransformer, SparseBlock
+
+    # ---- capture block_specs + dims (same trick as the dense builder) ----
+    captured: Dict[str, object] = {}
+    orig_T = pfc.Transformer
+
+    class _CaptureT:
+        def __init__(self, dim, n_heads, hidden, n_blocks, vocab, max_seq_len):
+            frame = inspect.currentframe().f_back
+            captured["block_specs"] = frame.f_locals["block_specs"]
+            captured["dim"] = dim
+            captured["n_heads"] = n_heads
+            captured["vocab"] = vocab
+            captured["max_seq_len"] = max_seq_len
+            raise _CaptureDone
+
+    class _CaptureDone(Exception):
+        pass
+
+    pfc.Transformer = _CaptureT
+    try:
+        pfc.build_pure_forward_complete_model(
+            code_size=code_size, include_bitwise=include_bitwise,
+            include_divmod=include_divmod)
+    except _CaptureDone:
+        pass
+    finally:
+        pfc.Transformer = orig_T
+
+    block_specs = captured["block_specs"]
+    dim = captured["dim"]
+    n_heads = captured["n_heads"]
+    vocab = captured["vocab"]
+    max_seq = captured["max_seq_len"]
+    n_blocks = len(block_specs)
+    L = _rebuild_layout(pfc, code_size, n_heads, include_bitwise)
+    hidden_per_block = [max(1, sp["W_up"].shape[0]) for _, sp in block_specs]
+    L._block_names = [n for n, _ in block_specs]
+
+    # ---- memory-cheap intermediate for the liveness passes (sparse attn) ----
+    model = _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab,
+                                       max_seq, L)
+
+    # ---- Fix #1: liveness -> colouring (identical to compact_model) ----
+    ns_dims = never_share_dims_from_layout(L)
+    liveness = compute_liveness(model, ns_dims)
+    if probe_programs is None:
+        probe_programs = _default_probe_programs(L)
+    if probe_programs:
+        first_nz, last_nz = empirical_value_liveness(model, L, probe_programs)
+        liveness = refine_liveness_empirically(liveness, first_nz, last_nz)
+    new_slot, new_dim = color_dims(liveness)
+
+    hd_floor = _required_head_dim(model, n_heads)
+    dim_floor = hd_floor * n_heads
+    if new_dim < dim_floor:
+        new_dim = dim_floor
+    if new_dim % n_heads != 0:
+        new_dim += n_heads - (new_dim % n_heads)
+
+    # ---- Fix #2: per-block live hidden (mask before we discard the specs) ----
+    hidden_masks = [live_ffn_units(blk.ffn) for blk in model.blocks]
+    hidden_after = [max(1, int(m.sum())) for m in hidden_masks]
+
+    # Re-point the layout ``L`` onto the packed dim (the driver reads the register
+    # bands at their NEW physical slots).  Identical to the call ``compact_model``
+    # makes after its block loop — without it the driver would read the register
+    # decode bands at their ORIGINAL positions while the weights write the packed
+    # positions (the 240 = 0xF0 nibble-corruption signature the harness caught).
+    remap_layout(L, new_slot, new_dim)
+
+    # ---- STREAM: build + remap + sparsify ONE block at a time ----
+    # Build the SparseTransformer shell without a source model, then fill blocks.
+    sparse = SparseTransformer.__new__(SparseTransformer)
+    sparse.dim = new_dim
+    sparse.vocab = vocab
+    sparse.max_seq_len = max_seq
+    sparse.compute_mode = compute_mode
+    sparse.embed = _remap_in_cols(model.embed, new_slot, new_dim).contiguous()
+    sparse.lm_head = _remap_in_cols(model.lm_head, new_slot, new_dim).contiguous()
+    sparse.lm_bias = model.lm_bias.detach().clone()
+    log: Dict[str, int] = {}
+    sparse.blocks = []
+    sparse._log = log
+
+    from .blogspec_model import Attn as _Attn, FFN as _FFN
+    import torch.nn as nn
+    for bi in range(n_blocks):
+        src = model.blocks[bi]
+        with torch.no_grad():
+            # -- one dense compact block (attention + this block's ragged FFN) --
+            cat = _Attn(new_dim, n_heads, max_seq)
+            for p in (cat.W_q, cat.W_k, cat.W_v, cat.W_o):
+                p.zero_()
+            if not getattr(src.attn, "is_zero", False):
+                _remap_attn(src.attn, cat, new_slot, new_dim, n_heads)
+                cat.alibi_slopes.copy_(src.attn.alibi_slopes)
+                cat.scale = src.attn.scale
+            else:
+                # all-zero attention: nothing to remap; keep zeroed weights.
+                cat.scale = src.attn.scale
+            # FFN: trim to live hidden, then re-index dims.
+            ff = src.ffn
+            mask = hidden_masks[bi]
+            if int(mask.sum()) == 0:
+                mask = torch.zeros_like(mask); mask[0] = True
+            keep = torch.nonzero(mask, as_tuple=False).flatten()
+            Wup = _remap_in_cols(ff.W_up[keep], new_slot, new_dim)
+            Wgate = _remap_in_cols(ff.W_gate[keep], new_slot, new_dim)
+            Wdown = _remap_out_rows(ff.W_down[:, keep], new_slot, new_dim)
+            cff = _FFN(new_dim, max(1, keep.numel()))
+            _swap_ffn(cff, Wup, ff.b_up[keep], Wgate, ff.b_gate[keep],
+                      Wdown, _remap_vec(ff.b_down, new_slot, new_dim))
+        # -- wrap this ONE dense block sparse, then free the dense block --
+        dense_block = _StreamBlock(cat, cff)
+        sparse.blocks.append(
+            SparseBlock(dense_block, density_thresh, min_numel, log, compute_mode))
+        # free the intermediate source block + the transient dense compact block.
+        model.blocks[bi] = None
+        del src, cat, cff, dense_block
+
+    # ---- stats (match build_compact_pure_forward_model) ----
+    global_hidden = max(hidden_per_block)
+    stats = CompactionStats(
+        dim_before=dim, dim_after=new_dim,
+        hidden_max_before=global_hidden,
+        hidden_per_block_after=hidden_after,
+        n_blocks=n_blocks, n_heads=n_heads, vocab=vocab,
+        dense_params_before=_dense_param_count(dim, global_hidden, n_blocks, vocab),
+        dense_params_after=_dense_param_count_ragged(new_dim, hidden_after,
+                                                     n_blocks, vocab),
+        nonzero_params=int(sparse.stats().total_nnz),
+        never_share_count=len(ns_dims),
+        shared_slots_saved=len(ns_dims) + sum(1 for l in liveness
+                                              if not l.never_share) - new_dim,
+    )
+    return sparse, L, stats
+
+
 def _rebuild_layout(pfc, code_size, n_heads, include_bitwise):
     """Reconstruct the ``PureForwardCompleteLayout`` exactly as the builder does."""
     from . import nibble_pure_forward_complete as _pfc
@@ -919,6 +1252,8 @@ def _required_head_dim(model, n_heads: int) -> int:
     max_local = 0
     for blk in model.blocks:
         at = blk.attn
+        if getattr(at, "is_zero", False):
+            continue                      # param-free zero-attention: no channels
         for name in ("W_q", "W_k", "W_v"):
             w = getattr(at, name)                    # rows head-partitioned
             rows = torch.nonzero((w != 0).any(dim=1), as_tuple=False).flatten()
