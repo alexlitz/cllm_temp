@@ -609,19 +609,20 @@ def _fold_ax_gated(L, dim: int, ops) -> Dict[str, torch.Tensor]:
 # BUILD the complete pure-forward model.
 # ===========================================================================
 def build_pure_forward_complete_model(code_size: int = 32,
-                                      include_bitwise: bool = True,
-                                      include_divmod: bool = True,
                                       recurrent_divmod: bool = False):
     """Assemble the complete pure-forward VM: frame ingest + LI/LC KV head +
-    stack-pop KV head + the 32-bit ALU FFN blocks + callconv, all as persistent
-    weights applied by ``model.forward``.  Returns ``(model, L)``.
+    stack-pop KV head + the 32-bit ALU FFN blocks + callconv + bitwise + the
+    base-16 long-division DIV/MOD blocks, all as persistent weights applied by
+    ``model.forward``.  Returns ``(model, L)``.
 
-    ``include_divmod`` (default True) folds the base-16 long-division DIV/MOD
-    blocks (262 blocks — the dominant cost and the memory/time hazard the deliver-
-    able flags).  Set False for a LEAN model (36 blocks, ~10x faster forward) that
-    keeps the multi-slot stack + callconv + ADD/SUB/MUL + cmp/bitwise/memory; only
-    DIV/MOD are then unsupported (their RES band stays unfilled).  The corpus
-    values are <=9999 so the 8-bit-masked byte trace needs no 32-bit division.
+    This is the SINGLE canonical full-VM interpreter: it ALWAYS folds the
+    complete op set (ADD/SUB/MUL + DIV/MOD + OR/XOR/AND/SHL/SHR + cmp + memory +
+    callconv).  There is no reduced / "lean" op-subset construction — the former
+    ``include_bitwise`` / ``include_divmod`` split flags have been removed so the
+    build is one byte-identical model with every opcode present.  (Skipping the
+    ~300 divmod blocks when the *step's* opcode is not DIV/MOD is a runtime
+    block-dispatch concern — see the ``_apply_order`` seam and the block-MoE
+    integration note below — NOT a build-time op-subset toggle.)
 
     ``recurrent_divmod`` (default False) folds DIV/MOD as a RECURRENT step: the
     8 long-division iterations are unrolled into ONE reused iteration BODY (21
@@ -632,16 +633,16 @@ def build_pure_forward_complete_model(code_size: int = 32,
     physical blocks in the FULL application sequence (the body indices repeat);
     the physical block count (what the model STORES) drops 262 -> 115 for divmod,
     while the forward applies the same 262-long sequence.  Byte-identical DIV/MOD
-    results to the unrolled build (gadget gate: 24/24)."""
+    results to the unrolled build (gadget gate: 24/24).  This is a compute-SHAPE
+    toggle (same op set, fewer stored blocks), NOT an op-subset toggle."""
     n_heads = N_ROLES + 3          # 20 ingest + LI head + stack-pop head + lev head
     L = PureForwardCompleteLayout(code_size, n_heads=n_heads)
     A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
-    if include_bitwise:
-        from . import nibble_bitwise as _bw
-        _bw.extend_layout_for_bitwise(L)
-        while L._off % n_heads != 0:
-            L._scalar(f"_bwpad{L._off}")
-        L.D = L._off
+    from . import nibble_bitwise as _bw
+    _bw.extend_layout_for_bitwise(L)
+    while L._off % n_heads != 0:
+        L._scalar(f"_bwpad{L._off}")
+    L.D = L._off
     # force head_dim >= MEM_HEAD_CHANNELS so both KV heads' local channels fit.
     min_dim = n_heads * MEM_HEAD_CHANNELS
     if L.D < min_dim:
@@ -684,8 +685,19 @@ def build_pure_forward_complete_model(code_size: int = 32,
     # APPLIES 262 — the recurrence.  The final full ``L._apply_order`` is assembled
     # after all blocks are appended (below).
     divmod_apply_order: List[int] = []
+    # ---- BLOCK-MoE SEAM (integration point for the block-level identity/null
+    # expert + block dispatch) -------------------------------------------------
+    # ``[divmod_start, divmod_end)`` is the contiguous span of the ~262 DIV/MOD
+    # blocks — the dominant physical cost and the block-MoE's primary skip target.
+    # The full op set is ALWAYS built (no op-subset flag); making it CHEAP for a
+    # non-DIV/MOD step is a RUNTIME block-dispatch concern.  #628's block-MoE plugs
+    # in here: it can read ``L._divmod_span = (divmod_start, divmod_end)`` (recorded
+    # below) to gate this contiguous block range behind an identity/null expert when
+    # the step's decoded opcode is not DIV/MOD, without changing any stored weight.
+    # Do NOT convert this span back into a build-time op-subset — the model must
+    # STORE every op; block-MoE only SKIPS its application per step.
     divmod_start = len(block_specs)                 # first physical divmod block idx
-    if include_divmod and recurrent_divmod:
+    if recurrent_divmod:
         unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim)
         # place the UNIQUE blocks physically, remember each name's physical index,
         # then map the (repeating) apply_names to those indices.
@@ -694,19 +706,18 @@ def build_pure_forward_complete_model(code_size: int = 32,
             name_to_idx[name] = len(block_specs)
             block_specs.append((name, spec))
         divmod_apply_order = [name_to_idx[n] for n in apply_names]
-    elif include_divmod:                           # 262 blocks — LEAN skips these
+    else:
         for name, spec in A.compile_divmod_blocks(L, dim):
             divmod_apply_order.append(len(block_specs))
             block_specs.append((name, spec))
     divmod_end = len(block_specs)                   # one past the last physical divmod block
-    mux_ops = ALU_OPS if include_divmod else [isa.ADD, isa.SUB, isa.MUL]
-    block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=mux_ops)))
-    if include_bitwise:
-        from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
-        for name, spec in build_bitwise_blocks(L, dim):
-            block_specs.append((name, spec))
-        block_specs.append(("bw-recompose", _bw_recompose_spec(
-            L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))
+    L._divmod_span = (divmod_start, divmod_end)     # block-MoE skip target (seam)
+    block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=ALU_OPS)))
+    from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
+    for name, spec in build_bitwise_blocks(L, dim):
+        block_specs.append((name, spec))
+    block_specs.append(("bw-recompose", _bw_recompose_spec(
+        L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))
 
     # Dispatch: base ops MINUS the ALU ops (ax-mux writes AX) + memory + cmp +
     # callconv + ALU housekeeping + bitwise housekeeping.
@@ -715,8 +726,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
     disp_rules += cmp_dispatch_rules_pop(L)
     disp_rules += callconv_dispatch_rules(L)
     disp_rules += alu32_housekeeping_rules(L)
-    if include_bitwise:
-        disp_rules += _bitwise_pop_rules(L)
+    disp_rules += _bitwise_pop_rules(L)
     # ops whose AX result is a BYTE recomposed from AX_VAL by the byte-nib writeback
     # (so the AX nibble band is canonical, the driver decodes AX from it): IMM/LEA +
     # cmp + bitwise.  NOTE: LI/LC are EXCLUDED — the memory KV head writes their AX
@@ -725,9 +735,8 @@ def build_pure_forward_complete_model(code_size: int = 32,
     # the head ran), so including LI/LC would clobber the loaded value with the stale
     # low byte.  A loaded 32-bit int (e.g. a variable holding 1000) must survive whole.
     byte_ax_ops = [isa.IMM, isa.LEA] + \
-                  [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE]
-    if include_bitwise:
-        byte_ax_ops += [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
+                  [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] + \
+                  [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
     block_specs += [
         ("dispatch", compile_ffn(disp_rules, dim)),
         ("branch-delta", compile_branch_delta(L, dim)),
@@ -744,9 +753,9 @@ def build_pure_forward_complete_model(code_size: int = 32,
     # The model STORES ``n_blocks`` distinct blocks but APPLIES them in
     # ``L._apply_order``: identity everywhere except the DIV/MOD span, where the
     # recurrent path repeats the reused iteration-body indices.  A None means "no
-    # remapping" (the driver falls back to range(n_blocks)) so non-divmod and
-    # unrolled builds are byte-identical to before.
-    if include_divmod and recurrent_divmod:
+    # remapping" (the driver falls back to range(n_blocks)) so the unrolled build
+    # is byte-identical to before.
+    if recurrent_divmod:
         L._apply_order = (list(range(divmod_start)) + divmod_apply_order +
                           list(range(divmod_end, n_blocks)))
     else:
