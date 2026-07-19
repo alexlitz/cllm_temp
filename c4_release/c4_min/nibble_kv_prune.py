@@ -140,7 +140,8 @@ class KVCache:
                  slope: Optional[float] = None,
                  recency_eps: float = RECENCY_WEIGHT_EPS,
                  score_scale: float = 1.0,
-                 dup_metric: str = "cosine"):
+                 dup_metric: str = "cosine",
+                 content_addressed: Optional[bool] = None):
         self.cos_threshold = cos_threshold
         self.prune_interval = prune_interval
         self.zero_eps = zero_eps
@@ -148,6 +149,22 @@ class KVCache:
         # the default/original policy) or "exact" (content-addressed §Memory heads
         # whose keys share a large ADDR_BIN common-mode bias — see prune()).
         self.dup_metric = dup_metric
+        # ``content_addressed`` marks a §Memory (address-CAM) head, whose non-zero
+        # store rows are the program's LIVE HEAP — retrieved by ADDRESS at an
+        # arbitrary future step, NOT recency-decayed like a register frame.  On
+        # such a head the recency HORIZON (mechanism 3) must NEVER drop a live
+        # (non-zero-value, non-superseded) store: the cache is FREE-DRIVEN and
+        # HEAP-MIRRORING — its size = the live heap footprint, which is UNBOUNDED
+        # in general (grows with the bump allocator, shrinks with free).  A live
+        # store is evicted ONLY by supersession (mechanism 1: a newer verbatim
+        # same-address write — ALiBi latest-write-wins) or by FREEING (its value is
+        # overwritten with 0 → it becomes a zero-value row and the zero-value
+        # recency window evicts BOTH the old value and the zeroing write with nil
+        # effect, ZFOD).  BLOG_SPEC §Memory 410-412 + §Memory Allocation and
+        # Freeing 689-691 + line 708.  ``None`` = infer from ``dup_metric``
+        # ("exact" ⇒ content-addressed), so existing callers keep their behaviour.
+        self.content_addressed = (content_addressed if content_addressed is not None
+                                  else (dup_metric == "exact"))
         # ``slope`` is this head's ALiBi slope; enables the recency-horizon
         # mechanism (mechanism 3). When None, only cos-sim + zero-value fire.
         self.slope = slope
@@ -292,6 +309,22 @@ class KVCache:
                 # a saved BP/PC stored ~250k tokens ago).
                 if e.is_zero_value(self.zero_eps):
                     ceil_score = 0.0
+                elif self.content_addressed:
+                    # LIVE HEAP on a §Memory (address-CAM) head: a non-zero-value
+                    # store is retrieved by ADDRESS at an ARBITRARY future step, so
+                    # its usefulness is NOT recency-decayed — ALiBi only breaks ties
+                    # among exact-address matches, it does NOT license dropping the
+                    # sole live store of an address.  The recency HORIZON must be a
+                    # NO-OP here (a fixed EFF/slope window would silently drop a live
+                    # allocated address on a long enough program → wrong answer).
+                    # It is evicted ONLY when superseded (mechanism 1, a newer
+                    # verbatim same-address key) or FREED (value → 0, handled by the
+                    # zero-value branch above).  This makes the cache track the
+                    # UNBOUNDED live heap (grows with malloc, shrinks with free) with
+                    # NO fixed recency/size cap — BLOG_SPEC §Memory 410-412 +
+                    # §Memory Allocation and Freeing 689-691.
+                    kept3.append(e)
+                    continue
                 else:
                     ceil_score = (max_kn * e.key_norm()) * self.score_scale
                 max_w = math.exp(min(0.0, ceil_score - self.slope * dist))

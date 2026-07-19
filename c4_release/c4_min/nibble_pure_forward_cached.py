@@ -114,7 +114,8 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
                          positions: torch.Tensor, slope: float, scale: float,
                          cos_threshold: float, zero_eps: float,
                          recency_eps: float,
-                         dup_metric: str = "cosine") -> torch.Tensor:
+                         dup_metric: str = "cosine",
+                         content_addressed: Optional[bool] = None) -> torch.Tensor:
     """Return a boolean ``[S]`` keep-mask == the survivors of ``KVCache.prune``.
 
     Reproduces, in order:
@@ -126,8 +127,18 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
     ``dup_metric`` = "cosine" (register-marker heads) or "exact" (content-
     addressed §Memory heads whose keys share a large ADDR_BIN common-mode bias;
     see ``nibble_kv_prune.KVCache.prune``).
+
+    ``content_addressed`` (``None`` ⇒ infer from ``dup_metric == "exact"``) marks
+    a §Memory (address-CAM) head, whose non-zero-value store rows are the LIVE
+    HEAP.  On such a head the recency HORIZON must NOT drop a live (non-zero-value,
+    non-superseded) store — it is FREE-DRIVEN (evicted only by supersession or by
+    freeing/zeroing), so the cache tracks the UNBOUNDED live heap with no fixed
+    recency/size cap (BLOG_SPEC §Memory 410-412 + §Memory Allocation/Freeing
+    689-691).  Matches ``nibble_kv_prune.KVCache.prune`` mechanism 3 exactly.
     """
     import math
+    if content_addressed is None:
+        content_addressed = (dup_metric == "exact")
     S = keys.shape[0]
     if S == 0:
         return torch.zeros(0, dtype=torch.bool)
@@ -191,6 +202,14 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
         arg = (ceil_score - slope * dist).clamp(max=0.0)
         max_w = torch.exp(arg)
         drop = max_w < recency_eps
+        if content_addressed:
+            # LIVE HEAP: on a §Memory (address-CAM) head a NON-zero-value store is
+            # retrieved by ADDRESS at an arbitrary future step, so the recency
+            # horizon must be a NO-OP for it (a fixed EFF/slope window would
+            # silently drop a live allocated address on a long enough program).
+            # Only zero-value (freed/NULL) rows are recency-evicted here; live
+            # stores are dropped ONLY by supersession (mechanism 1) or freeing.
+            drop = drop & (zero_val_surv > 0.0)
         drop_idx = surv_idx[drop]
         survivors[drop_idx] = False
 

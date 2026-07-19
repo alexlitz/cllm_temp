@@ -114,18 +114,24 @@ def test_vectorized_prune_matches_reference():
         scale = HD ** -0.5
         for cos_thr, zeps, reps in [(0.99, 1e-9, 1e-6), (0.95, 1e-9, 1e-4),
                                     (0.999, 1e-9, 1e-9)]:
-            c = KVCache(cos_threshold=cos_thr, zero_eps=zeps, slope=slope,
-                        recency_eps=reps, score_scale=scale)
-            for i in range(S):
-                c.append(keys[i], vals[i], int(positions[i]), meta=i)
-            c.prune()
-            ref = set(e.meta for e in c.entries)
-            mask = prune_keep_mask_head(keys, vals, positions, slope, scale,
-                                        cos_thr, zeps, reps)
-            vec = set(torch.nonzero(mask, as_tuple=False).flatten().tolist())
-            trials += 1
-            if ref != vec:
-                mism += 1
+            # exercise BOTH head types: register-marker (cosine near-dup, recency
+            # horizon on all rows) AND content-addressed §Memory (exact near-dup,
+            # NO recency drop on a live non-zero store — the free-driven rule).
+            # The reference and the vectorised driver must agree on BOTH so the two
+            # implementations stay byte-for-byte consistent.
+            for dm in ("cosine", "exact"):
+                c = KVCache(cos_threshold=cos_thr, zero_eps=zeps, slope=slope,
+                            recency_eps=reps, score_scale=scale, dup_metric=dm)
+                for i in range(S):
+                    c.append(keys[i], vals[i], int(positions[i]), meta=i)
+                c.prune()
+                ref = set(e.meta for e in c.entries)
+                mask = prune_keep_mask_head(keys, vals, positions, slope, scale,
+                                            cos_thr, zeps, reps, dup_metric=dm)
+                vec = set(torch.nonzero(mask, as_tuple=False).flatten().tolist())
+                trials += 1
+                if ref != vec:
+                    mism += 1
     assert mism == 0, f"{mism}/{trials} prune keep-set mismatches"
 
 
