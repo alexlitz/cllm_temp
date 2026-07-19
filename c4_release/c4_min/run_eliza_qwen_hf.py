@@ -167,7 +167,10 @@ def run_eliza_turn_qwen(vm: Q.QwenFullVM, code: List[isa.Instr],
                 resp = fio.runner.handle(call)
                 data = resp.data or b""
                 for i, byte in enumerate(data):
-                    store_log.append({"addr": (buf + i) & 0xFF, "val": byte & 0xFF})
+                    a = (buf + i) & 0xFF                # each READ byte as a MEM
+                    store_log = [s for s in store_log   # frame (latest-write-wins)
+                                 if (s["addr"] & 0xFF) != a]
+                    store_log.append({"addr": a, "val": byte & 0xFF})
                 fio.calls.append(call)
                 new_ax = len(data) & 0xFF
             else:  # PRTF(fmt_ptr) -> n_written
@@ -205,6 +208,11 @@ def run_eliza_turn_qwen(vm: Q.QwenFullVM, code: List[isa.Instr],
 
         if op in (isa.SI, isa.SC):
             store_addr = Q._snap(state[L.STK_VAL]) & 0xFF
+            # §Memory latest-write-wins as KV-log compaction (see qwen_full_vm.
+            # run_program): a re-store supersedes the prior write, so each address
+            # appears at most once — a clean one-frame content-address for the CAM.
+            store_log = [s for s in store_log
+                         if (s["addr"] & 0xFF) != store_addr]
             store_log.append({"addr": store_addr, "val": ax & 0xFF})
 
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
@@ -251,16 +259,36 @@ class QwenElizaChat:
         return reply, steps, ok
 
 
+# A COMPACT default keyword set for the interactive session. Fewer, short rules =>
+# a smaller code + data segment => a smaller per-forward token window => a snappy
+# ~5-10 s/turn on CPU. The FULL 8-rule ELIZA (``--full``) is the classic table but
+# ~30 s/turn (a ~240-token window). Both run byte-exact through the real forward;
+# this is purely a wall-time / conversational-breadth trade (the per-forward window
+# grows with the code + data-segment size, and the whole window is re-forwarded
+# every VM step).
+FAST_RULES: List[Tuple[str, str]] = [
+    ("bye",   "BYE. TAKE CARE.\n"),
+    ("hi",    "HELLO. HOW ARE YOU?\n"),
+    ("sad",   "WHY ARE YOU SAD?\n"),
+    ("happy", "WHAT MAKES YOU HAPPY?\n"),
+    ("yes",   "YOU SEEM SURE.\n"),
+    ("no",    "WHY NOT?\n"),
+]
+
+
 def build_qwen_eliza(eliza: Optional[E.Eliza] = None,
+                     full: bool = False,
                      verbose: bool = True) -> QwenElizaChat:
     """Construct the genuine ``Qwen2Model`` + compile the ELIZA bytecode.
 
     Uses ``SUBSET_MEM_CMP`` — the minimal op subset ELIZA needs (memory + cmp; no
     mul/div/mod, so no 45 GB byte-table wall). The result is a real
-    ``Qwen2Model(cfg)`` (hidden 1152, intermediate 896, 10 layers) whose weights
-    compute the VM.
+    ``Qwen2Model(cfg)`` (hidden 1152-1536, intermediate 896, 10 layers) whose
+    weights compute the VM. ``full`` selects the classic 8-rule ELIZA (wider window,
+    ~30 s/turn) vs the compact default (~5-10 s/turn); both are byte-exact.
     """
-    eliza = eliza or E.build_chat_min()
+    if eliza is None:
+        eliza = E.build_chat_min() if full else E.build_chat_min(rules=FAST_RULES)
     code_size = len(eliza.code) + 2
     if verbose:
         print(f"[build] compiling a genuine Qwen2Model (subset=mem+cmp, "
@@ -281,18 +309,20 @@ def build_qwen_eliza(eliza: Optional[E.Eliza] = None,
     return QwenElizaChat(vm=vm, eliza=eliza)
 
 
-_GREETING = ("ELIZA (running through a genuine transformers.Qwen2Model.forward).\n"
-             "Talk to me. Try: hello / sad / happy / mother / dream / yes / no.\n"
-             "The keyword must START your line (prefix match). Type 'bye' to end.\n")
+def _greeting(chat: QwenElizaChat) -> str:
+    kws = " / ".join(kw.decode("latin-1") for kw, _ in chat.eliza.rules)
+    return ("ELIZA (running through a genuine transformers.Qwen2Model.forward).\n"
+            f"Talk to me. Keywords (must START your line, prefix match): {kws}.\n"
+            "Anything else -> a generic reply. Type 'bye' to end.\n")
 
 
 def interactive(chat: Optional[QwenElizaChat] = None,
-                check_reference: bool = True) -> None:
+                full: bool = False, check_reference: bool = True) -> None:
     """Read a line of user input, run ELIZA through the Qwen forward, print the
     reply, and loop. Reads stdin so ``python -m c4_min.run_eliza_qwen_hf`` is a
     real interactive terminal chat."""
-    chat = chat or build_qwen_eliza()
-    print("\n" + _GREETING)
+    chat = chat or build_qwen_eliza(full=full)
+    print("\n" + _greeting(chat))
     while True:
         try:
             sys.stdout.write("you> ")
@@ -323,12 +353,15 @@ def interactive(chat: Optional[QwenElizaChat] = None,
 
 
 def demo(messages: Optional[List[str]] = None,
-         check_reference: bool = True) -> None:
+         full: bool = False, check_reference: bool = True) -> None:
     """A scripted multi-turn exchange through the genuine ``Qwen2Model.forward``,
     each turn byte-exact-checked against the plain-python reference."""
-    messages = messages or ["hello there", "sad today", "mother knows",
-                            "yes indeed", "flibberty", "bye now"]
-    chat = build_qwen_eliza()
+    if messages is None:
+        messages = (["hello there", "sad today", "mother knows", "yes indeed",
+                     "flibberty jibbet", "bye now"] if full else
+                    ["hi there", "sad today", "happy now", "yes indeed",
+                     "flibberty jibbet", "bye now"])
+    chat = build_qwen_eliza(full=full)
     print("\n=== ELIZA through a genuine transformers.Qwen2Model.forward ===\n")
     total_steps = 0
     total_t = 0.0
@@ -352,10 +385,12 @@ def demo(messages: Optional[List[str]] = None,
 
 def main(argv: Optional[List[str]] = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
+    full = "--full" in argv
+    check = "--no-check" not in argv
     if "--demo" in argv:
-        demo(check_reference="--no-check" not in argv)
+        demo(full=full, check_reference=check)
     else:
-        interactive(check_reference="--no-check" not in argv)
+        interactive(full=full, check_reference=check)
 
 
 if __name__ == "__main__":

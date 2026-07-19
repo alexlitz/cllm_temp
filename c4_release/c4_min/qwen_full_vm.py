@@ -754,6 +754,16 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
         elif subset.memory and op in (isa.SI, isa.SC):
             store_addr = _snap(state[L.STK_VAL])       # popped address
             store_val = ax if op == isa.SI else (ax & 0xFF)
+            # §Memory latest-write-wins as KV-log COMPACTION: a re-store to an
+            # address SUPERSEDES the prior write, so drop the earlier frame and keep
+            # only the latest. This makes each address appear at MOST once in the
+            # window, so the address CAM is a clean one-frame content-address (the
+            # RoPE recency lane is then only a safety tiebreak, never forced to
+            # split two frames at the SAME sharp address match — the resolution
+            # limit that otherwise pits same-address recency against a distinct
+            # older-address exact match). Compaction also shrinks the window.
+            store_log = [s for s in store_log
+                         if (s["addr"] & 0xFF) != (store_addr & 0xFF)]
             store_log.append({"addr": store_addr, "val": store_val})
 
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
