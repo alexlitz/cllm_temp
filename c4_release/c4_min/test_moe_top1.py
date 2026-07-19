@@ -26,7 +26,7 @@ from c4_min.compact_alloc import build_compact_pure_forward_model
 from c4_min.nibble_pure_forward_complete import ref_interpret
 from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
 from c4_min.moe_top1 import Top1RoutedFFN
-from c4_min._probe_pf_corpus_sample import progs_by_class
+from c4_min._pf_op_class_progs import progs_by_class
 
 
 @pytest.fixture(scope="module")

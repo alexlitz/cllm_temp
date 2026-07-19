@@ -27,7 +27,7 @@ from c4_min.nibble_pure_forward_complete import ref_interpret  # noqa: E402
 from c4_min.nibble_pure_forward_cached import run_pure_forward_cached  # noqa: E402
 from c4_min.moe_top1 import Top1RoutedFFN  # noqa: E402
 from c4_min.sparse_forward import SparseTransformer  # noqa: E402
-from c4_min._probe_pf_corpus_sample import progs_by_class, ALL  # noqa: E402
+from c4_min._pf_op_class_progs import progs_by_class, ALL  # noqa: E402
 
 
 def _run(m, L, code):
