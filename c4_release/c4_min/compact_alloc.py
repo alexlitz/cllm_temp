@@ -262,6 +262,11 @@ def refine_liveness_empirically(liveness: List[DimLiveness], first_nz,
 _NEVER_SHARE_NAMES: Tuple[str, ...] = (
     "CUR_NIB",   # embedding-written at EVERY position incl. the query row.
     "AX_VAL",    # register scalar carried + read within-forward (cmp/callconv/fold).
+    "A_BIT",     # per-nibble bit planes of the pop operand (shared OR/XOR/AND gadget).
+    "B_BIT",     # per-nibble bit planes of the AX  operand — must not alias a stale
+                 # band: the default probe battery only lights the LOW nibbles, so a
+                 # colouring that shares the high-nibble plane slots leaks a stale
+                 # value into the bitwise combine (the 0x**22 corruption).
 )
 _NEVER_SHARE_PREFIXES: Tuple[str, ...] = ()
 
