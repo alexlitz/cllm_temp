@@ -33,7 +33,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _C4C = os.path.join(_ROOT, "bundler", "c4_bundler_small.c")
 
-_CFG = dict(code_size=32, include_bitwise=False, include_divmod=False)
+_CFG = dict(code_size=32)
 _SRC = "int main(){ return 500 + 700; }"
 
 

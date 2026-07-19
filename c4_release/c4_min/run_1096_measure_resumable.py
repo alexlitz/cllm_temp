@@ -277,7 +277,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     t_build = time.monotonic()
     print(f"[measure:{device}] building SPARSE divmod model ...", file=sys.stderr, flush=True)
     base, L, cstats = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=False, include_divmod=True)
+        code_size=64)
     sparse = SparseTransformer(base, compute_mode="dense_kernel")
     st = sparse.stats()
     del base

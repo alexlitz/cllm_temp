@@ -497,8 +497,7 @@ def run_chat(messages: List[str], eliza: Optional[Eliza] = None,
     if model is None:
         from .nibble_pure_forward_complete import build_pure_forward_complete_model
         model, L = build_pure_forward_complete_model(
-            code_size=len(eliza.code) + 2, include_bitwise=True,
-            include_divmod=False)
+            code_size=len(eliza.code) + 2)
     turns: List[Turn] = []
     for msg in messages:
         ref = chat_turn_ref(eliza, msg)

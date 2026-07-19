@@ -98,7 +98,7 @@ def test_neural_quine_byte_exact_self_output():
 
     code, seed_mem, S = build_quine()
     model, L, _ = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=True, include_divmod=False)
+        code_size=64)
     sparse = SparseTransformer(model, compute_mode="dense_kernel")
     del model
     dev = "cuda:0" if torch.cuda.is_available() else "cpu"

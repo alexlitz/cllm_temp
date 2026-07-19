@@ -69,7 +69,7 @@ def _run_c_tokens(exe, binp, tok):
 @pytest.fixture(scope="module")
 def compact():
     model, L, _ = CA.build_compact_pure_forward_model(
-        code_size=48, include_bitwise=True, include_divmod=False)
+        code_size=48)
     model.eval()
     return model, L
 

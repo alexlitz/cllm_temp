@@ -161,7 +161,7 @@ def test_pure_forward_complete_exec_is_vanilla_argmax():
     from c4_min.nibble_pure_forward_complete import (
         build_pure_forward_complete_model, run_pure_forward_complete)
     model, L = build_pure_forward_complete_model(
-        code_size=16, include_bitwise=False, include_divmod=False)
+        code_size=16)
     for prog in (_ADD, _SUB_UF, _BRANCH, _LOOP):
         code = isa.assemble(prog)
         trace = _assert_vanilla_exec(

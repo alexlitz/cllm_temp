@@ -205,7 +205,7 @@ def test_driver_byte_identical_naive_incl_functions_and_eviction():
         return isa.Instr(op, imm)
 
     model, L = build_pure_forward_complete_model(
-        code_size=16, include_bitwise=False, include_divmod=False)
+        code_size=16)
     battery = [
         ("add", [I(isa.IMM, 5), I(isa.PSH), I(isa.IMM, 3), I(isa.ADD),
                  I(isa.HALT)], 20, 0xFF),

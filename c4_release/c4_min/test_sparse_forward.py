@@ -23,7 +23,7 @@ from c4_min import blogspec_vocab as V
 @pytest.fixture(scope="module")
 def dense_model():
     return build_pure_forward_complete_model(
-        code_size=44, include_bitwise=False, include_divmod=False)
+        code_size=44)
 
 
 def _stream(nframes):

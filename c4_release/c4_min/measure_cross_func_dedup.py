@@ -187,7 +187,7 @@ def measure(sparse, names):
 def main():
     print("Building compact/streaming sparse model (bitwise config, no divmod)...")
     sparse, L, _ = build_compact_sparse_streaming(
-        code_size=48, include_bitwise=True, include_divmod=False,
+        code_size=48,
         compute_mode="dense_kernel")
     names = L._block_names
     print(f"n_blocks={len(sparse.blocks)} dim={sparse.dim}\n")

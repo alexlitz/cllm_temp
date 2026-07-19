@@ -61,7 +61,7 @@ def main():
     import onnxruntime as ort
 
     t = build_compact_pure_forward_model(
-        code_size=24, include_bitwise=True, include_divmod=False)
+        code_size=24)
     m, L, _ = t
     dim = m.dim
     names = list(L._block_names)

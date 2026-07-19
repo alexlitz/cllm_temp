@@ -51,7 +51,7 @@ CASES = [
 
 def _build(recurrent):
     sparse, L, _ = build_compact_sparse_streaming(
-        code_size=44, include_bitwise=False, include_divmod=True,
+        code_size=44,
         compute_mode="dense_kernel", recurrent_divmod=recurrent)
     return sparse, L
 

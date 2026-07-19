@@ -47,7 +47,7 @@ def main():
     _seed_cstring(data, FMT, "hi\n")
 
     m, L = build_pure_forward_complete_model(
-        code_size=len(code) + 2, include_bitwise=True, include_divmod=False)
+        code_size=len(code) + 2)
 
     fs = FS.StubFilesystem({})
     fio = FS.FileOpState(runner=FS.FileRunner(fs=fs, stdin=FS.InputKVStream(b"AB")))

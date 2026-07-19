@@ -120,7 +120,7 @@ def main(argv=None):
     def build(compute_mode):
         t = time.monotonic()
         base, L, _ = build_compact_pure_forward_model(
-            code_size=64, include_bitwise=False, include_divmod=True)
+            code_size=64)
         m = SparseTransformer(base, compute_mode=compute_mode)
         del base
         m = m.to(device)

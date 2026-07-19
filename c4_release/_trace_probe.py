@@ -15,7 +15,7 @@ def w(s):
 
 import torch
 dev = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-model, L = build_pure_forward_complete_model(code_size=64, include_bitwise=False, include_divmod=False)
+model, L = build_pure_forward_complete_model(code_size=64)
 sp = SparseTransformer(model, compute_mode='dense_kernel').to(dev)
 w(f"device={dev}")
 tests = generate_test_programs()

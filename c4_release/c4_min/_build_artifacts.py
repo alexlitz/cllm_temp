@@ -1,13 +1,15 @@
-"""Build + save the SPARSE pure-forward artifacts (lean + divmod) for the
-aggressive-speculation full-1096 verify runner, via the STREAMING builder so the
-peak build RSS is ~one dense block (never the 79 GB dense divmod).
+"""Build + save the SPARSE pure-forward artifact for the aggressive-speculation
+full-1096 verify runner, via the STREAMING builder so the peak build RSS is ~one
+dense block (never the 79 GB dense divmod).
 
-The saved artifact bakes ALL weights (incl. the EFF=500000 memory-CAM) + the
-layout, so ``--load-sparse`` reloads a byte-identical model with NO rebuild.
+There is now a SINGLE full-op-set interpreter (every opcode incl. DIV/MOD), so
+there is one artifact — the former lean/divmod split is gone.  The saved artifact
+bakes ALL weights (incl. the EFF=500000 memory-CAM) + the layout, so
+``--load-sparse`` reloads a byte-identical model with NO rebuild.
 
 Usage:
-    python -m c4_min._build_artifacts lean  /tmp/c4_lean_sparse_fs.pt
-    python -m c4_min._build_artifacts divmod /tmp/c4_divmod_sparse_fs.pt
+    python -m c4_min._build_artifacts /tmp/c4_sparse_fs.pt
+    # (a leading label arg, e.g. 'full', is accepted and ignored for back-compat)
 """
 from __future__ import annotations
 
@@ -27,14 +29,17 @@ def _peak_gb() -> float:
 
 
 def main() -> int:
-    which = sys.argv[1]
-    path = sys.argv[2]
-    include_divmod = (which == "divmod")
+    # Back-compat: accept either "<path>" or "<label> <path>" (label ignored —
+    # there is one full-op-set artifact now).
+    args = sys.argv[1:]
+    if len(args) == 1:
+        which, path = "full", args[0]
+    else:
+        which, path = args[0], args[1]
     assert abs(_MEM.EFF - 500000.0) < 1e-6, f"EFF must be 500000, got {_MEM.EFF}"
     t0 = time.time()
     sparse, L, stats = build_compact_sparse_streaming(
-        code_size=_CODE_SIZE, include_bitwise=True,
-        include_divmod=include_divmod, compute_mode="dense_kernel")
+        code_size=_CODE_SIZE, compute_mode="dense_kernel")
     st = sparse.stats()
     save_sparse_transformer(sparse, L, stats, path)
     print(f"SAVED {which} -> {path} | blocks={len(sparse.blocks)} dim={sparse.dim} "

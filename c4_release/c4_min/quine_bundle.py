@@ -62,7 +62,7 @@ def _build_small_model(code_size: int = 64):
     ``(model, L, stats)``."""
     from .compact_alloc import build_compact_pure_forward_model
     return build_compact_pure_forward_model(
-        code_size=code_size, include_bitwise=True, include_divmod=False)
+        code_size=code_size)
 
 
 def _sparse_state_dict(model) -> Dict[str, object]:
@@ -100,8 +100,6 @@ def build_bundle(path: str, code_size: int = 64) -> Dict[str, object]:
         "vocab": model.vocab,
         "max_seq_len": model.max_seq_len,
         "code_size": code_size,
-        "include_bitwise": True,
-        "include_divmod": False,
         "mem_alibi_slope": QUINE_MEM_ALIBI_SLOPE,
         "sp_init": SP_INIT_QUINE,
     }

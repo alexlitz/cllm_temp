@@ -53,7 +53,7 @@ def main():
     # keeps full stack + callconv + ADD/SUB/MUL + cmp/bitwise/mem.  This is the
     # SAME model the corpus/ONNX runners use.
     m, L, _stats = build_compact_pure_forward_model(
-        code_size=24, include_bitwise=True, include_divmod=False)
+        code_size=24)
     print(f"LEAN compact model: dim={m.dim} blocks={len(m.blocks)} "
           f"heads={m.blocks[0].attn.n_heads} ({time.time()-t:.1f}s)", flush=True)
 

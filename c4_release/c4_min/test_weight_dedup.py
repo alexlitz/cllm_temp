@@ -12,14 +12,11 @@ single shared storage.  These tests prove:
   * the SHARED storage is genuinely shared (a mutation of the representative is
     visible through every tied reference).
 
-The divmod (304-block) gate is opt-in via ``C4_TEST_DIVMOD_DEDUP=1`` (it is the
-big-win config but the build is slower); LEAN + bitwise run by default.
+The single full-op-set interpreter (every opcode incl. DIV/MOD, ~305 blocks) is
+built once via the memory-safe streaming builder (peak ~9.5 GB RSS).
 """
 from __future__ import annotations
 
-import os
-
-import pytest
 import torch
 
 from c4_min.compact_alloc import build_compact_sparse_streaming
@@ -30,10 +27,9 @@ from c4_min.weight_dedup import (
 )
 
 
-def _build(include_bitwise, include_divmod):
+def _build():
     return build_compact_sparse_streaming(
-        code_size=44, include_bitwise=include_bitwise,
-        include_divmod=include_divmod, compute_mode="dense_kernel")
+        code_size=44, compute_mode="dense_kernel")
 
 
 def _token_streams(L, n_frames=(0, 2, 4)):
@@ -66,9 +62,9 @@ def _forward_via_blocks(model, L, streams):
 # ---------------------------------------------------------------------------
 # Byte-identity: forward L-inf = 0 after tie.
 # ---------------------------------------------------------------------------
-def _tie_is_byte_identical(include_bitwise, include_divmod):
-    tied, L, _ = _build(include_bitwise, include_divmod)
-    ref, _, _ = _build(include_bitwise, include_divmod)   # untied twin
+def _tie_is_byte_identical():
+    tied, L, _ = _build()
+    ref, _, _ = _build()   # untied twin
     streams = _token_streams(L)
 
     before = _forward_via_blocks(ref, L, streams)
@@ -85,21 +81,18 @@ def _tie_is_byte_identical(include_bitwise, include_divmod):
     return stats
 
 
-def test_lean_dedup_byte_identical():
-    stats = _tie_is_byte_identical(include_bitwise=False, include_divmod=False)
+def test_full_dedup_byte_identical():
+    stats = _tie_is_byte_identical()
     assert stats.nonzero_after < stats.nonzero_before
-
-
-def test_bitwise_dedup_byte_identical():
-    stats = _tie_is_byte_identical(include_bitwise=True, include_divmod=False)
-    assert stats.nonzero_after < stats.nonzero_before
+    # DIV/MOD is now always present — the big-win config: >50% nonzero savings.
+    assert stats.nonzero_saved > stats.nonzero_after
 
 
 # ---------------------------------------------------------------------------
 # The tie is REAL sharing: mutating the representative changes every tied ref.
 # ---------------------------------------------------------------------------
 def test_tie_shares_storage_identity():
-    tied, L, _ = _build(include_bitwise=True, include_divmod=False)
+    tied, L, _ = _build()
     dedup_sparse_transformer(tied, L)
     # find a weight slot whose storage id() appears more than once
     from collections import defaultdict
@@ -135,8 +128,10 @@ def _program_battery(model, L, cases):
         assert got == exp, f"{name}: dedup got {got}, want {exp}"
 
 
-def test_bitwise_dedup_program_decode_unchanged():
-    tied, L, _ = _build(include_bitwise=True, include_divmod=False)
+def test_full_dedup_program_decode_unchanged():
+    """The single full-op-set model decodes the whole op battery (incl. bitwise
+    AND DIV/MOD) byte-identically after weight-tying."""
+    tied, L, _ = _build()
     dedup_sparse_transformer(tied, L)
     _program_battery(tied, L, [
         ("add", "int main(){ return 500 + 700; }", 1200),
@@ -148,19 +143,6 @@ def test_bitwise_dedup_program_decode_unchanged():
                  "int main(){ return identity(1000); }", 1000),
         ("bw_or", "int main(){ return 12 | 3; }", 15),
         ("bw_and", "int main(){ return 12 & 10; }", 8),
-    ])
-
-
-@pytest.mark.skipif(os.environ.get("C4_TEST_DIVMOD_DEDUP") != "1",
-                    reason="304-block divmod build is slow; "
-                           "set C4_TEST_DIVMOD_DEDUP=1 to run")
-def test_divmod_dedup_byte_identical_and_program_decode():
-    stats = _tie_is_byte_identical(include_bitwise=True, include_divmod=True)
-    # divmod is the big-win config: >50% nonzero savings expected.
-    assert stats.nonzero_saved > stats.nonzero_after
-    tied, L, _ = _build(include_bitwise=True, include_divmod=True)
-    dedup_sparse_transformer(tied, L)
-    _program_battery(tied, L, [
         ("div", "int main(){ return 720 / 6; }", 120),
         ("mod", "int main(){ return 84 % 5; }", 4),
     ])

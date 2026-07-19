@@ -32,7 +32,7 @@ from c4_min._pf_op_class_progs import progs_by_class
 @pytest.fixture(scope="module")
 def compact():
     m, L, _ = build_compact_pure_forward_model(
-        code_size=24, include_bitwise=True, include_divmod=False)
+        code_size=24)
     return m, L
 
 

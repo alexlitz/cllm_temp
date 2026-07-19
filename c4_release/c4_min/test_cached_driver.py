@@ -114,11 +114,11 @@ def main():
           flush=True)
     t0 = time.time()
     model_lean, L_lean = build_pure_forward_complete_model(
-        code_size=16, include_bitwise=False, include_divmod=False)
+        code_size=16)
     model_dm = L_dm = None
     if want_dm:
         model_dm, L_dm = build_pure_forward_complete_model(
-            code_size=16, include_bitwise=False, include_divmod=True)
+            code_size=16)
     print(f"[cached] built in {time.time()-t0:.1f}s "
           f"(lean blocks={len(model_lean.blocks)}"
           f"{', divmod blocks=' + str(len(model_dm.blocks)) if want_dm else ''})",

@@ -49,7 +49,7 @@ def compact_lean():
     # the default value-liveness probe battery (whose compiled C sources exceed
     # 16 instructions).  bitwise=False keeps the LEAN block stack small/fast.
     model, L, stats = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=False, include_divmod=False)
+        code_size=64)
     model.eval()
     return model, L, stats
 

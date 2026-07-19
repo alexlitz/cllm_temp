@@ -63,7 +63,7 @@ def _model():
     global _MODEL, _L
     if _MODEL is None:
         _MODEL, _L = build_pure_forward_complete_model(
-            code_size=48, include_bitwise=True, include_divmod=False)
+            code_size=48)
     return _MODEL, _L
 
 

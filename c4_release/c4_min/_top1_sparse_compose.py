@@ -37,7 +37,7 @@ def _run(m, L, code):
 def main():
     t = time.time()
     m, L, _ = build_compact_pure_forward_model(
-        code_size=24, include_bitwise=True, include_divmod=False)
+        code_size=24)
     print(f"compact model ({time.time()-t:.1f}s): dim={m.dim} blocks={len(m.blocks)}")
     P = progs_by_class()
 

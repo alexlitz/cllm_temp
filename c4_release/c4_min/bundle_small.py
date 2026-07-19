@@ -274,15 +274,15 @@ def _build_model(config: Dict[str, object]):
     _PF.SP_INIT = 0xF0
     _PFC.SP_INIT = 0xF0
     from c4_min.nibble_pure_forward_complete import build_pure_forward_complete_model
+    # SINGLE full-op-set interpreter: build it regardless of any legacy
+    # include_bitwise/include_divmod keys an OLD bundle's config may carry.
     model, L = build_pure_forward_complete_model(
-        code_size=int(config["code_size"]),
-        include_bitwise=bool(config["include_bitwise"]),
-        include_divmod=bool(config["include_divmod"]))
+        code_size=int(config["code_size"]))
     return model, L
 
 
 def _assemble_parts(source: str, *, expected, description, code_size,
-                    include_bitwise, include_divmod, step_cap, reuse_model):
+                    step_cap, reuse_model):
     """Compile + serialise the three bundle sections and the finalised header.
 
     Returns ``(pre, hjson, runtime_bytes, weights_blob, bytecode_bytes, config,
@@ -294,8 +294,7 @@ def _assemble_parts(source: str, *, expected, description, code_size,
     the C4-C bundler concatenates to produce a byte-identical file.
     """
     config = {
-        "code_size": code_size, "include_bitwise": include_bitwise,
-        "include_divmod": include_divmod,
+        "code_size": code_size,
     }
     code = _compile_source_to_bytecode(source)
     model, L = reuse_model if reuse_model is not None else _build_model(config)
@@ -352,7 +351,6 @@ def _assemble_parts(source: str, *, expected, description, code_size,
 
 def prepare_bundle(source: str, out_dir: str, *, expected: Optional[int] = None,
                    description: str = "", code_size: int = 64,
-                   include_bitwise: bool = True, include_divmod: bool = False,
                    step_cap: int = 10000, reuse_model=None) -> Dict[str, object]:
     """Emit the raw bundle parts a section-fusing bundler concatenates.
 
@@ -367,8 +365,7 @@ def prepare_bundle(source: str, out_dir: str, *, expected: Optional[int] = None,
     os.makedirs(out_dir, exist_ok=True)
     pre, hjson, runtime_bytes, weights_blob, bytecode_bytes, config, wstats, program = \
         _assemble_parts(source, expected=expected, description=description,
-                        code_size=code_size, include_bitwise=include_bitwise,
-                        include_divmod=include_divmod, step_cap=step_cap,
+                        code_size=code_size, step_cap=step_cap,
                         reuse_model=reuse_model)
     header_bin = pre + hjson
     parts = [("header.bin", header_bin), ("runtime.bin", runtime_bytes),
@@ -389,7 +386,6 @@ def prepare_bundle(source: str, out_dir: str, *, expected: Optional[int] = None,
 
 def assemble_bundle(source: str, out_path: str, *, expected: Optional[int] = None,
                     description: str = "", code_size: int = 64,
-                    include_bitwise: bool = True, include_divmod: bool = False,
                     step_cap: int = 10000,
                     reuse_model=None) -> Dict[str, object]:
     """Build a .c4bundle from a C4 source string.
@@ -401,8 +397,7 @@ def assemble_bundle(source: str, out_path: str, *, expected: Optional[int] = Non
     """
     pre, hjson, runtime_bytes, weights_blob, bytecode_bytes, config, wstats, program = \
         _assemble_parts(source, expected=expected, description=description,
-                        code_size=code_size, include_bitwise=include_bitwise,
-                        include_divmod=include_divmod, step_cap=step_cap,
+                        code_size=code_size, step_cap=step_cap,
                         reuse_model=reuse_model)
 
     with open(out_path, "wb") as fh:
@@ -530,8 +525,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     pa.add_argument("--description", default="")
     pa.add_argument("--out", required=True)
     pa.add_argument("--code-size", type=int, default=64)
-    pa.add_argument("--no-bitwise", action="store_true")
-    pa.add_argument("--divmod", action="store_true")
     pa.add_argument("--step-cap", type=int, default=10000)
 
     pp = sub.add_parser("prepare", help="emit the raw bundle parts for a "
@@ -541,8 +534,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     pp.add_argument("--description", default="")
     pp.add_argument("--out-dir", required=True)
     pp.add_argument("--code-size", type=int, default=64)
-    pp.add_argument("--no-bitwise", action="store_true")
-    pp.add_argument("--divmod", action="store_true")
     pp.add_argument("--step-cap", type=int, default=10000)
 
     pr = sub.add_parser("run", help="run a .c4bundle end-to-end")
@@ -558,7 +549,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         info = assemble_bundle(
             args.source, args.out, expected=args.expected,
             description=args.description, code_size=args.code_size,
-            include_bitwise=not args.no_bitwise, include_divmod=args.divmod,
             step_cap=args.step_cap)
         print(json.dumps(info, indent=2))
         return 0
@@ -566,7 +556,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         info = prepare_bundle(
             args.source, args.out_dir, expected=args.expected,
             description=args.description, code_size=args.code_size,
-            include_bitwise=not args.no_bitwise, include_divmod=args.divmod,
             step_cap=args.step_cap)
         print(json.dumps(info, indent=2))
         return 0

@@ -93,7 +93,7 @@ def pf_lean():
     """LEAN pure-forward model (38 blocks): stack + callconv + ADD/SUB/MUL + cmp +
     memory + the full 32-bit IMM.  Fast; covers every non-div/mod family."""
     return build_pure_forward_complete_model(
-        code_size=44, include_bitwise=False, include_divmod=False)
+        code_size=44)
 
 
 @pytest.fixture(scope="module")
@@ -101,7 +101,7 @@ def pf_divmod():
     """Pure-forward model WITH the fp32-exact 32-bit long-division ALU folded in
     (298 blocks) — proves DIV/MOD (incl. div-by-zero -> 0) run in-forward too."""
     return build_pure_forward_complete_model(
-        code_size=44, include_bitwise=False, include_divmod=True)
+        code_size=44)
 
 
 def _run_pure(model, L, source, expected, name):
@@ -153,9 +153,9 @@ if __name__ == "__main__":
     import sys
     from src.compiler import compile_c
     lean = build_pure_forward_complete_model(
-        code_size=44, include_bitwise=False, include_divmod=False)
+        code_size=44)
     dm = build_pure_forward_complete_model(
-        code_size=44, include_bitwise=False, include_divmod=True)
+        code_size=44)
     npass = 0
     for name, source, expected, needs_dm in _SAMPLE:
         model, L = (dm if needs_dm else lean)

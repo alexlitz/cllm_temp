@@ -121,7 +121,7 @@ def _run_case(model, L, op, a, b):
 def main():
     print("Building compact/streaming sparse model (bitwise, no divmod)...")
     sparse, L, _ = build_compact_sparse_streaming(
-        code_size=48, include_bitwise=True, include_divmod=False,
+        code_size=48,
         compute_mode="dense_kernel")
     cases = _battery()
     print(f"battery: {len(cases)} op cases "
@@ -193,7 +193,7 @@ def verify_bitwise_perbit_share() -> int:
 
     def _build():
         return build_compact_sparse_streaming(
-            code_size=48, include_bitwise=True, include_divmod=False,
+            code_size=48,
             compute_mode="dense_kernel")
 
     cases = _bitwise_cases()

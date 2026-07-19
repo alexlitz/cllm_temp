@@ -66,7 +66,7 @@ def main():
     t0 = time.monotonic()
     print(f"[deep-tail:{dev}] building divmod sparse model ...", flush=True)
     base, L, _cs = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=False, include_divmod=True)
+        code_size=64)
     sparse = SparseTransformer(base, compute_mode="dense_kernel").to(dev)
     del base
     print(f"[deep-tail:{dev}] built in {time.monotonic()-t0:.0f}s "

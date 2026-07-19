@@ -86,7 +86,7 @@ def main():
     # -- COMPACT model (the corpus/ONNX target; dispatch already de-padded). ----
     t = time.time()
     cm, cL, _ = build_compact_pure_forward_model(
-        code_size=24, include_bitwise=True, include_divmod=False)
+        code_size=24)
     print(f"\ncompact model built ({time.time()-t:.1f}s): "
           f"dim={cm.dim} blocks={len(cm.blocks)}")
     dispatch_stats(cm, cL, "COMPACT")
@@ -94,7 +94,7 @@ def main():
     # -- COMPLETE model (dispatch padded to global-max -> huge dense->routed). --
     t = time.time()
     xm, xL = build_pure_forward_complete_model(
-        code_size=24, include_bitwise=True, include_divmod=False)
+        code_size=24)
     print(f"\ncomplete (padded) model built ({time.time()-t:.1f}s): "
           f"dim={xL.D} blocks={len(xm.blocks)}")
     dispatch_stats(xm, xL, "COMPLETE(padded)")

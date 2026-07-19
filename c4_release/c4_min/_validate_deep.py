@@ -29,7 +29,7 @@ def main():
     device = sys.argv[1] if len(sys.argv) > 1 else "cpu"
     t = time.monotonic()
     base, L, cs = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=False, include_divmod=True)
+        code_size=64)
     sparse = SparseTransformer(base, compute_mode="sparse_mm")
     del base
     sparse = sparse.to(device)

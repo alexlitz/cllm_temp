@@ -34,7 +34,7 @@ def main():
 
     t = time.monotonic()
     base, L, cs = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=False, include_divmod=True)
+        code_size=64)
     sparse = SparseTransformer(base, compute_mode=compute)
     del base
     sparse = sparse.to(device)
