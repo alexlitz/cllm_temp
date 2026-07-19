@@ -55,18 +55,44 @@ class SparseWeight:
     #                   SAME F.linear as the dense model -> BIT-IDENTICAL (L-inf=0).
     #                   Storage stays sparse; only one weight is dense-transient.
     compute_mode: str = "sparse_mm"
+    # RESIDENT dense weight (set by ``materialize_dense``): the CSR densified ONCE
+    # and kept on-device so ``linear`` skips the per-call ``csr.to_dense()`` (the
+    # driver-bound cost — a 300-block verify re-densifies ~2100 CSR weights EVERY
+    # forward).  Using it is BIT-IDENTICAL to ``dense_kernel`` (same F.linear GEMM,
+    # same accum order — just the exact same dense tensor cached instead of rebuilt).
+    dense_resident: Optional[torch.Tensor] = None
 
     def to(self, device) -> "SparseWeight":
         if self.dense is not None:
             self.dense = self.dense.to(device)
         if self.csr is not None:
             self.csr = self.csr.to(device)
+        if self.dense_resident is not None:
+            self.dense_resident = self.dense_resident.to(device)
         return self
+
+    def materialize_dense(self, device=None) -> None:
+        """Densify the CSR ONCE into a resident dense weight (on ``device`` if
+        given) so ``linear`` reuses it instead of re-running ``csr.to_dense()`` on
+        every forward.  Bit-identical to ``dense_kernel`` (same GEMM, same tensor).
+        Only meaningful for a sparse weight; a dense-kept weight is already resident.
+        """
+        if not self.is_sparse:
+            if device is not None and self.dense is not None:
+                self.dense = self.dense.to(device)
+            return
+        d = self.csr.to_dense()
+        if device is not None:
+            d = d.to(device)
+        self.dense_resident = d
 
     def linear(self, x: torch.Tensor) -> torch.Tensor:
         """``x @ W.T`` for ``x`` of shape ``[..., in_dim]`` -> ``[..., out_dim]``."""
         if not self.is_sparse:
             return F.linear(x, self.dense)
+        if self.dense_resident is not None:
+            # resident dense (materialize_dense): identical GEMM, no re-densify.
+            return F.linear(x, self.dense_resident)
         if self.compute_mode == "dense_kernel":
             # bit-identical to the dense forward: same GEMM, same accum order.
             return F.linear(x, self.csr.to_dense())
@@ -140,6 +166,11 @@ class SparseAttn:
         self.alibi_slopes = self.alibi_slopes.to(device)
         for w in (self.W_q, self.W_k, self.W_v, self.W_o):
             w.to(device)
+        return self
+
+    def materialize_dense(self, device=None):
+        for w in (self.W_q, self.W_k, self.W_v, self.W_o):
+            w.materialize_dense(device)
         return self
 
     def forward(self, x: torch.Tensor, past_kv=None, q_positions=None,
@@ -218,6 +249,11 @@ class SparseFFN:
             w.to(device)
         return self
 
+    def materialize_dense(self, device=None):
+        for w in (self.W_up, self.W_gate, self.W_down):
+            w.materialize_dense(device)
+        return self
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         up = self.W_up.linear(x) + self.b_up
         gate = self.W_gate.linear(x) + self.b_gate
@@ -250,6 +286,10 @@ class SparseBlock:
             self.ffn = self.ffn.to(device)
         else:
             self.ffn.to(device)
+        return self
+
+    def materialize_dense(self, device=None):
+        self.attn.materialize_dense(device); self.ffn.materialize_dense(device)
         return self
 
     def __call__(self, x, past_kv=None, q_positions=None, use_cache: bool = False):
@@ -315,6 +355,23 @@ class SparseTransformer:
         self.lm_bias = self.lm_bias.to(device)
         for b in self.blocks:
             b.to(device)
+        return self
+
+    def materialize_dense(self, device=None):
+        """Densify EVERY block's CSR weights ONCE onto ``device`` (block-by-block
+        so peak transient memory is one block's dense weights, not all at once).
+        After this, ``linear`` uses the resident dense weight — no per-forward
+        ``to_dense``.  Bit-identical to ``dense_kernel`` (same F.linear GEMM).
+
+        VRAM cost is the full dense model (~3.5 GB lean / ~10 GB divmod), so call
+        it only when the card can hold model + KV caches + batch activations.
+        """
+        for b in self.blocks:
+            b.materialize_dense(device)
+        if device is not None and device != "cpu":
+            self.embed = self.embed.to(device)
+            self.lm_head = self.lm_head.to(device)
+            self.lm_bias = self.lm_bias.to(device)
         return self
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:

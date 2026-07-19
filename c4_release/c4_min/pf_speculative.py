@@ -47,13 +47,110 @@ import torch
 
 from . import isa
 from . import blogspec_vocab as V
-from .nibble_pure_forward import N_ROLES, _snap_lane
+from .nibble_pure_forward import (
+    N_ROLES, _snap_lane, _FRAME_ROLE_SLOTS, _MEM_MARKER_LOCAL, _address_bits,
+)
 from .nibble_pure_forward_complete import (
     PureForwardCompleteLayout, IMM_NIBS, _build_frame, _decode_reg_from_nibbles,
     _mem_top, ADJ,
 )
 import c4_min.nibble_pure_forward_complete as _PFC
 from .nibble_pure_forward_cached import apply_overlay_window, BlockKVCacheBatched
+from .blogspec_layout import NIB_PER_REG
+
+
+# ===========================================================================
+# O(1)-DECODE OVERLAY.  ``apply_overlay_window`` re-writes the PROGRAM-IN-DATA
+# (every ``code`` op's CODE_OP/CODE_IMM/CODE_IMM_NIB dims) into EVERY row of the
+# span — an O(rows * code_len) scalar-write loop.  Measured: ~1.06 ms/row, of
+# which ~97% is that row-INVARIANT code re-scan.  Over a whole program this is
+# O(total_rows * code_len) == O(stream * C), the deep-program stall (fib12's 8369
+# steps -> ~250k rows -> minutes of pure-Python overlay).
+#
+# But the code-in-data residual is IDENTICAL for every row (it does not depend on
+# the absolute position), so it can be built ONCE as a [D] vector and BROADCAST-
+# added to all rows in one tensor op.  Only the per-position frame-role / store
+# tags are row-dependent, and those are a handful of scalar writes per row (O(1)
+# per row -> O(rows) total, position-independent).  This turns the per-block
+# overlay from O(rows * C) into O(rows + C) and the whole-program overlay from
+# O(stream * C) into O(stream + blocks * C) — the O(1)-per-row decode.
+#
+# Byte-identity: the produced residual at every (row, dim) is the SAME float
+# ``apply_overlay_window`` writes (same ``float(op)`` / nibble values, same role
+# one-hots), just assembled by broadcast + a lean per-row loop instead of a
+# per-row full re-scan.  Proven L-inf==0 vs ``apply_overlay_window`` in
+# ``spotcheck_vs_cached`` / the runner's ``--check-overlay`` gate.
+# ===========================================================================
+def build_code_vec(code: List[isa.Instr], L: PureForwardCompleteLayout,
+                   D: int, device, dtype=torch.float32
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The ROW-INVARIANT program-in-data + ONE overlay as ``(idx, vals)``.
+
+    ``idx`` [K] long — the residual dims the code-in-data overlay WRITES (ONE +
+    every CODE_OP/CODE_IMM/CODE_IMM_NIB dim).  ``vals`` [K] — the values it writes.
+    Built ONCE per program (the code never changes across steps); the fast overlay
+    ASSIGNS ``x[:, idx] = vals`` on every row (overwriting the embedding at those
+    dims, exactly as ``apply_overlay_window`` does with ``x[...] = v`` — NOT ``+=``,
+    since the embedding is non-zero at these dims).
+    """
+    idx: List[int] = [L.ONE]
+    vals: List[float] = [1.0]
+    for k, ins in enumerate(code):
+        idx.append(L.CODE_OP[k]); vals.append(float(ins.op))
+        idx.append(L.CODE_IMM[k]); vals.append(float(ins.imm))
+        for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+            idx.append(L.CODE_IMM_NIB[k] + j); vals.append(float(nv))
+    return (torch.tensor(idx, device=device, dtype=torch.long),
+            torch.tensor(vals, device=device, dtype=dtype))
+
+
+def apply_overlay_window_fast(x_win: torch.Tensor, w_start: int, L,
+                              store_log: Dict[int, Tuple[int, int]],
+                              code_vec: Tuple[torch.Tensor, torch.Tensor],
+                              query_rows: Optional[List[int]] = None) -> None:
+    """O(rows + code) in-place overlay of ``x_win`` ([1, W, D]) — byte-identical to
+    ``apply_overlay_window`` but with the row-invariant code-in-data ASSIGNED by ONE
+    broadcast indexed-write instead of a per-row re-scan.
+
+    ``code_vec`` is ``build_code_vec(code, L, D)`` -> ``(idx, vals)`` (precomputed
+    once).  ``query_rows`` (window-local indices) are re-tagged with all-ROLE
+    one-hots (the per-step query tag); if None, only the LAST row is a query row
+    (the single-step window contract of
+    ``apply_overlay_window(is_last_row_query=True)``).
+    """
+    W = x_win.shape[1]
+    # 1) row-INVARIANT program-in-data + ONE: ONE broadcast ASSIGN over the code
+    # dims (overwrites the embedding at those dims, exactly like the slow overlay's
+    # ``x[...] = v``).  O(W*K) writes but as ONE vectorised op, not a Python loop.
+    code_idx, code_vals = code_vec
+    x_win[0, :, code_idx] = code_vals
+    # 2) per-position frame roles / store tags (O(1) per row -> O(W) total).
+    for wi in range(W):
+        p = w_start + wi
+        if p == 0:
+            continue                       # BOS row carries no frame roles
+        f = (p - 1) // V.FRAME_LEN
+        local = (p - 1) % V.FRAME_LEN
+        if local in _FRAME_ROLE_SLOTS:
+            role = _FRAME_ROLE_SLOTS[local]
+            x_win[0, wi, L.ROLE + role] = 1.0
+            x_win[0, wi, L.IS_FRAME_BYTE] = 1.0
+        if local == _MEM_MARKER_LOCAL and f in store_log:
+            addr, val = store_log[f]
+            x_win[0, wi, L.IS_STORE] = 1.0
+            x_win[0, wi, L.IS_FRAME_BYTE] = 0.0
+            for b, bit in enumerate(_address_bits(addr)):
+                x_win[0, wi, L.ADDR_BIN + b] = bit
+            for j, nv in enumerate(V.nibbles_of_value(val & 0xFFFFFFFF, NIB_PER_REG)):
+                x_win[0, wi, L.VAL_NIB + j] = float(nv)
+    # 3) query-row all-ROLE tag (the per-step query overlay).
+    if query_rows is None:
+        for role in range(N_ROLES):
+            x_win[0, -1, L.ROLE + role] = 1.0
+    else:
+        for wi in query_rows:
+            for role in range(N_ROLES):
+                x_win[0, wi, L.ROLE + role] = 1.0
 
 
 # ===========================================================================
@@ -276,7 +373,7 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                   evict: bool = True, cos_threshold: float = 0.99,
                   prune_interval: int = 120, zero_eps: float = 1e-9,
                   recency_eps: float = 1e-6, mask: int = 0xFFFFFFFF,
-                  stats: Optional[dict] = None) -> VerifyResult:
+                  stats: Optional[dict] = None, fast: bool = True) -> VerifyResult:
     """Verify the whole drafted stream on the SPARSE model in BLOCKS.
 
     Processes ``block_steps`` VM steps per batched ``forward_hidden_cached``.  For
@@ -307,6 +404,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     max_cache = 0
     last_got_ax = None                      # the MODEL's decoded AX at the last step
     dev = torch.device(device)
+    # O(1)-decode: build the row-invariant program-in-data vector ONCE (on the
+    # embed's device/dtype so the broadcast-add is a device-resident op) instead of
+    # re-writing the whole code into every span row each block.
+    code_vec = (build_code_vec(code, L, model.embed.shape[1], dev,
+                               dtype=model.embed.dtype) if fast else None)
 
     step = 0
     while step < n_steps:
@@ -327,12 +429,18 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             # The span's last row is NOT necessarily a query row, so overlay with
             # is_last_row_query=False, then explicitly re-tag EACH step's query row
             # with all-ROLE one-hots (the driver's per-step query tag).
-            apply_overlay_window(x, span_start, code, L, store_log,
-                                 is_last_row_query=False)
-            for s in range(step, end):
-                wi = draft.win_starts[s] - span_start
-                for role in range(N_ROLES):
-                    x[0, wi, L.ROLE + role] = 1.0
+            q_local = [draft.win_starts[s] - span_start for s in range(step, end)]
+            if fast:
+                # O(rows + code): broadcast the code-in-data, per-row roles, then
+                # tag exactly this block's query rows (byte-identical residual).
+                apply_overlay_window_fast(x, span_start, L, store_log, code_vec,
+                                          query_rows=q_local)
+            else:
+                apply_overlay_window(x, span_start, code, L, store_log,
+                                     is_last_row_query=False)
+                for wi in q_local:
+                    for role in range(N_ROLES):
+                        x[0, wi, L.ROLE + role] = 1.0
             past = [caches[b].as_past_kv() for b in range(n_blocks)]
             hidden, new_kv = model.forward_hidden_cached(
                 x, past_key_values=past, q_positions=q_positions, use_cache=True)
@@ -455,7 +563,7 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     expected: int, *, block_steps: int = 64,
                     max_steps: int = 300000, device: str = "cpu",
                     evict: bool = True, prune_interval: int = 120,
-                    mask: int = 0xFFFFFFFF) -> SpecResult:
+                    mask: int = 0xFFFFFFFF, fast: bool = True) -> SpecResult:
     """Full speculative decode of ONE pure-forward program.
 
     1) draft the whole stream with the reference VM (zero forwards);
@@ -478,7 +586,7 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     stats: dict = {}
     vr = verify_blocks(model, L, code, draft, block_steps=block_steps,
                        device=device, evict=evict, prune_interval=prune_interval,
-                       mask=mask, stats=stats)
+                       mask=mask, stats=stats, fast=fast)
     naive = draft.step_count
     speedup = (naive / vr.forwards) if vr.forwards else float("inf")
     if not vr.all_matched:
@@ -527,10 +635,20 @@ def spotcheck_vs_cached(model, L: PureForwardCompleteLayout,
         prune_interval=prune_interval)
     draft = draft_pf_program(code, max_steps=max_steps, mask=mask)
     spec_trace = [fr["ax"] & mask for fr in draft.frames]
+    # Verify BOTH overlay paths (slow apply_overlay_window vs the O(1) fast one) and
+    # assert they accept the same stream + decode the same final AX — the byte-
+    # identity gate for the O(1)-decode optimization.
     vr = verify_blocks(model, L, code, draft, block_steps=block_steps,
                        device=device, evict=evict, prune_interval=prune_interval,
-                       mask=mask)
-    identical = (drv_trace == spec_trace) and vr.all_matched
+                       mask=mask, fast=True)
+    vr_slow = verify_blocks(model, L, code, draft, block_steps=block_steps,
+                            device=device, evict=evict, prune_interval=prune_interval,
+                            mask=mask, fast=False)
+    fast_matches_slow = (
+        vr.all_matched == vr_slow.all_matched
+        and vr.decoded_final_ax == vr_slow.decoded_final_ax
+        and vr.accepted_steps == vr_slow.accepted_steps)
+    identical = (drv_trace == spec_trace) and vr.all_matched and fast_matches_slow
     first_div = None
     for i, (a, b) in enumerate(zip(drv_trace, spec_trace)):
         if a != b:
@@ -544,6 +662,7 @@ def spotcheck_vs_cached(model, L: PureForwardCompleteLayout,
         "n_steps_spec": len(spec_trace),
         "verify_all_matched": vr.all_matched,
         "verify_forwards": vr.forwards,
+        "fast_matches_slow": fast_matches_slow,
         "first_divergence": first_div,
         "driver_final_ax": drv_trace[-1] if drv_trace else None,
         "spec_final_ax": spec_trace[-1] if spec_trace else None,

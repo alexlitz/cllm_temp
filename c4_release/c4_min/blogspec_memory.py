@@ -120,7 +120,10 @@ from .blogspec_model import Transformer
 #     only has to separate stores to the SAME address, which are ≥ one 30-token
 #     frame apart, so ``slope·30`` decisively favours the newer (latest-write-wins).
 ADDR_BITS = 32           # 4-byte aligned 32-bit addresses (§Memory)
-EFF = 500000.0           # post-scale per-bit match contribution (huge, §410)
+EFF = 500000.0           # post-scale per-bit match contribution (huge, §410); raised
+                         # 40k->500k (deep-recursion fix e52ab0c5) so the final LEV of a
+                         # deep recursion (rec_fib(12) store->load gap 250,839 tokens)
+                         # reads weight ~1 instead of fading to ZFOD 0.
 BIAS = (ADDR_BITS - 1) * EFF   # constant subtracted from load↔store pairs (ZFOD)
 # Recency slope. Two constraints (§410 decoupling): (a) ``slope·Δ`` must decisively
 # prefer the newer of two same-address stores — the driver spaces store rows one
