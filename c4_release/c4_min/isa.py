@@ -28,6 +28,14 @@ MUL, DIV, MOD = 27, 28, 29
 # printf visible-output byte channel, shared by the tool-IO dispatch and the
 # think-tag string quine (§System / §Printing).
 OPEN, READ, CLOS, PRTF = 30, 31, 32, 33
+# Runtime-library syscall aliases (§"Memory Allocation and Freeing" 687, §"Memset,
+# Memcmp and Memcpy" 747). These are NOT neural ops: malloc/free/memset/memcmp are
+# "compiled from C into the VM's bytecode and execute entirely neurally" (§687) —
+# baked base-ISA subroutines (see ``nibble_runtime``). The op numbers exist ONLY so
+# a word-width reference VM (``nibble_runtime.ref_interpret_words``) can run them as
+# INTRINSICS to prove the baked bytecode is equivalent to the "compiled from C"
+# contract. The unified neural model never decodes them — it runs the bytecode.
+MALC, FREE, MSET, MCMP = 34, 35, 36, 37
 NOP = 39
 HALT = 38  # alias EXIT
 
@@ -39,6 +47,7 @@ NAMES = {
     LE: "LE", GE: "GE", SHL: "SHL", SHR: "SHR", ADD: "ADD", SUB: "SUB",
     MUL: "MUL", DIV: "DIV", MOD: "MOD",
     OPEN: "OPEN", READ: "READ", CLOS: "CLOS", PRTF: "PRTF",
+    MALC: "MALC", FREE: "FREE", MSET: "MSET", MCMP: "MCMP",
     NOP: "NOP",
     HALT: "HALT",
 }
