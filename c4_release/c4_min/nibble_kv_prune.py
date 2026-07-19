@@ -270,10 +270,30 @@ class KVCache:
             kept3: List[KVEntry] = []
             for e in survivors:
                 dist = newest - e.position
-                ceil_score = (max_kn * e.key_norm()) * self.score_scale
-                # A zero-VALUE entry never contributes to the numerator, so only
-                # its denominator term (bounded the same way) can matter; either
-                # way the recency weight bound below is the correct keep/drop test.
+                # DECOUPLE the ZERO-VALUE (NULL-write) recency horizon from the
+                # (EFF-coupled) content ceiling — the CHK-6 flat-cache fix.  A
+                # zero-VALUE entry contributes EXACTLY 0 to the softmax1 numerator,
+                # so keeping vs dropping it can only perturb the DENOMINATOR by its
+                # own ``exp(score)`` term.  On the §Memory heads a NULL memory-write
+                # row carries the store-role / load-enable GATE (``-PEN`` on a
+                # dedicated channel), so its ACTUAL score against any query is
+                # ``<= 0`` ⇒ ``exp(score) <= exp(-slope*dist)`` and its denominator
+                # influence decays with DISTANCE ALONE, independent of the key
+                # magnitude.  The recall ``EFF`` inflates the §Memory key norm to
+                # ~1e5, so the Cauchy-Schwarz content ceil ``max_kn*|k_e|*scale`` is
+                # ~1e9 and ``exp(ceil - slope*dist)=1`` forever — the coupling that
+                # let the cache grow ~linearly on deep recursion / distinct-address
+                # runs (measured: rec_sum(6) memory head 151 entries, 123 of them
+                # stale NULL rows).  Using ``ceil_score = 0`` for a zero-value entry
+                # restores the SMALL, EFF-INDEPENDENT recency window
+                # (``dist > -log(recency_eps)/slope`` ≈ tens of tokens) WITHOUT
+                # touching value-carrying store rows, whose full content ceil keeps
+                # the ``EFF``-sized recall horizon (a deeply-nested LEV still recalls
+                # a saved BP/PC stored ~250k tokens ago).
+                if e.is_zero_value(self.zero_eps):
+                    ceil_score = 0.0
+                else:
+                    ceil_score = (max_kn * e.key_norm()) * self.score_scale
                 max_w = math.exp(min(0.0, ceil_score - self.slope * dist))
                 if max_w >= self.recency_eps:
                     kept3.append(e)

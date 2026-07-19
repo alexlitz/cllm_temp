@@ -174,6 +174,19 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
         max_kn = float(knorm[surv_idx].max())
         # ceil_score_e = max_kn * |k_e| * scale  (0 for a zero-key entry).
         ceil_score = (max_kn * knorm[surv_idx].to(torch.float64)) * scale
+        # CHK-6 DECOUPLE: a ZERO-VALUE (NULL-write) entry contributes 0 to the
+        # softmax1 numerator, so only its denominator term can matter; on the
+        # §Memory heads it carries the store-role / load-enable GATE (``-PEN``) so
+        # its ACTUAL score is <= 0 => its influence decays with DISTANCE ALONE
+        # (exp(score) <= exp(-slope*dist)), independent of the EFF-inflated key
+        # magnitude.  Forcing ``ceil_score = 0`` for a zero-value entry restores the
+        # small, EFF-INDEPENDENT recency window that keeps the cache FLAT on deep
+        # recursion / distinct-address runs, WITHOUT touching value-carrying store
+        # rows (whose full content ceil keeps the EFF-sized recall horizon so a
+        # deeply-nested LEV still recalls a BP/PC stored ~250k tokens ago).  Matches
+        # ``nibble_kv_prune.KVCache.prune`` mechanism 3 exactly (test_cached_driver).
+        zero_val_surv = (vnorm[surv_idx] <= zero_eps).to(torch.float64)
+        ceil_score = ceil_score * (1.0 - zero_val_surv)
         dist = (newest - positions[surv_idx]).to(torch.float64)
         arg = (ceil_score - slope * dist).clamp(max=0.0)
         max_w = torch.exp(arg)
