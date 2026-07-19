@@ -751,15 +751,17 @@ def _swap_ffn(ffn, Wup, bup, Wgate, bgate, Wdown, bdown):
 # Peak memory is ~the attention (4*dim^2*n_blocks) + the tiny real FFNs, never
 # the padded FFN — so the divmod model can be built where the dense one OOMs.
 # ---------------------------------------------------------------------------
-def build_compact_pure_forward_model(code_size: int = 48,
-                                     include_bitwise: bool = True,
-                                     include_divmod: bool = False):
+def build_compact_pure_forward_model(code_size: int = 48):
     """Build the c4_min pure-forward VM as a COMPACT dense model directly.
 
-    Returns ``(compact_model, L, stats)``.  Never allocates the global-max FFN
-    padding: each block's FFN is built at its own hidden width, then Fix #1
-    (dim-sharing) packs the residual.  The result is byte-identical (L∞=0) to
-    ``build_pure_forward_complete_model`` under the driver.
+    Returns ``(compact_model, L, stats)``.  Builds the SINGLE full-op-set
+    interpreter (no op-subset toggle — every opcode present).  Never allocates
+    the global-max FFN padding: each block's FFN is built at its own hidden
+    width, then Fix #1 (dim-sharing) packs the residual.  The result is
+    byte-identical (L∞=0) to ``build_pure_forward_complete_model`` under the
+    driver.  NOTE: the full-op dense-compact path peaks at ~48 GB RSS (the
+    ~300 DIV/MOD blocks); prefer ``build_compact_sparse_streaming`` (peak = one
+    block) when memory is tight.
     """
     import inspect
     import torch.nn as nn
@@ -784,9 +786,7 @@ def build_compact_pure_forward_model(code_size: int = 48,
 
     pfc.Transformer = _CaptureT
     try:
-        pfc.build_pure_forward_complete_model(
-            code_size=code_size, include_bitwise=include_bitwise,
-            include_divmod=include_divmod)
+        pfc.build_pure_forward_complete_model(code_size=code_size)
     except _CaptureDone:
         pass
     finally:
@@ -800,7 +800,7 @@ def build_compact_pure_forward_model(code_size: int = 48,
     n_blocks = len(block_specs)
 
     # Rebuild L exactly as the builder does (so its band offsets match dim).
-    L = _rebuild_layout(pfc, code_size, n_heads, include_bitwise)
+    L = _rebuild_layout(pfc, code_size, n_heads)
 
     # Build the model with each block's REAL hidden (no global-max padding).
     # The Transformer ctor allocates ONE uniform FFN hidden for ALL blocks — using
@@ -1041,8 +1041,6 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
 
 
 def build_compact_sparse_streaming(code_size: int = 48,
-                                   include_bitwise: bool = True,
-                                   include_divmod: bool = False,
                                    compute_mode: str = "dense_kernel",
                                    density_thresh: float = 0.25,
                                    min_numel: int = 4096,
@@ -1050,11 +1048,14 @@ def build_compact_sparse_streaming(code_size: int = 48,
                                    recurrent_divmod: bool = False):
     """Build the c4_min pure-forward VM directly as a streaming SPARSE model.
 
-    Returns ``(SparseTransformer, L, stats)`` — the SAME public triple as
-    ``build_compact_pure_forward_model`` (whose compact dense model you would then
-    wrap with ``SparseTransformer``), but built block-at-a-time so the PEAK live
-    memory is ONE block's dense weights (a few MB..~1 GB), never the 28 GB of dense
-    attention + padded FFN.  Byte-identical (L∞=0 in ``dense_kernel`` mode) to
+    Builds the SINGLE full-op-set interpreter (every opcode present — no
+    op-subset toggle).  Returns ``(SparseTransformer, L, stats)`` — the SAME
+    public triple as ``build_compact_pure_forward_model`` (whose compact dense
+    model you would then wrap with ``SparseTransformer``), but built
+    block-at-a-time so the PEAK live memory is ONE block's dense weights (a few
+    MB..~1 GB), never the full dense attention + padded FFN.  This is the
+    memory-safe way to materialise / verify the full-op model.  Byte-identical
+    (L∞=0 in ``dense_kernel`` mode) to
     ``SparseTransformer(build_compact_pure_forward_model(...)[0])``.
 
     ``compute_mode`` / ``density_thresh`` / ``min_numel`` match
@@ -1090,8 +1091,7 @@ def build_compact_sparse_streaming(code_size: int = 48,
     pfc.Transformer = _CaptureT
     try:
         pfc.build_pure_forward_complete_model(
-            code_size=code_size, include_bitwise=include_bitwise,
-            include_divmod=include_divmod, recurrent_divmod=recurrent_divmod)
+            code_size=code_size, recurrent_divmod=recurrent_divmod)
     except _CaptureDone:
         pass
     finally:
@@ -1103,7 +1103,7 @@ def build_compact_sparse_streaming(code_size: int = 48,
     vocab = captured["vocab"]
     max_seq = captured["max_seq_len"]
     n_blocks = len(block_specs)
-    L = _rebuild_layout(pfc, code_size, n_heads, include_bitwise,
+    L = _rebuild_layout(pfc, code_size, n_heads,
                         recurrent_divmod=recurrent_divmod)
     L._apply_order = captured["apply_order"]     # None for non-recurrent builds
     hidden_per_block = [max(1, sp["W_up"].shape[0]) for _, sp in block_specs]
@@ -1378,18 +1378,19 @@ def load_sparse_transformer(path: str, compute_mode: Optional[str] = None):
     return sparse, L
 
 
-def _rebuild_layout(pfc, code_size, n_heads, include_bitwise,
-                    recurrent_divmod=False):
-    """Reconstruct the ``PureForwardCompleteLayout`` exactly as the builder does."""
+def _rebuild_layout(pfc, code_size, n_heads, recurrent_divmod=False):
+    """Reconstruct the ``PureForwardCompleteLayout`` exactly as the builder does.
+
+    Mirrors ``build_pure_forward_complete_model``: the full op set is ALWAYS
+    present, so the bitwise band is always extended (no op-subset toggle)."""
     from . import nibble_pure_forward_complete as _pfc
     L = _pfc.PureForwardCompleteLayout(code_size, n_heads=n_heads)
     _pfc.A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
-    if include_bitwise:
-        from . import nibble_bitwise as _bw
-        _bw.extend_layout_for_bitwise(L)
-        while L._off % n_heads != 0:
-            L._scalar(f"_bwpad{L._off}")
-        L.D = L._off
+    from . import nibble_bitwise as _bw
+    _bw.extend_layout_for_bitwise(L)
+    while L._off % n_heads != 0:
+        L._scalar(f"_bwpad{L._off}")
+    L.D = L._off
     min_dim = n_heads * _pfc.MEM_HEAD_CHANNELS
     if L.D < min_dim:
         target = -(-min_dim // n_heads) * n_heads
