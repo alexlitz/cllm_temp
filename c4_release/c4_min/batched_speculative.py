@@ -49,7 +49,21 @@ from .nibble_pure_forward_cached import (
 _EDGES = [8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
 
-def _bucket(items: List[dict], batch_cap: int) -> List[List[dict]]:
+def _bucket(items: List[dict], batch_cap: int, block_steps: int = 48,
+            bytes_per_prog_row: float = 0.0, vram_budget_gb: float = 9.0,
+            evict: bool = True, prune_interval: int = 120) -> List[List[dict]]:
+    """Depth-bucket + DEPTH-ADAPTIVE sub-batch.
+
+    The batched-verify VRAM peak per program is ~ ``rows * bytes_per_prog_row``
+    where ``rows`` is the transient K/V + scores row-count of ONE block-verify
+    forward: the block's span ``W ~ min(block_steps, depth) * FRAME_LEN`` PLUS the
+    live KV cache.  With eviction the live cache is BOUNDED (the softmax1+ALiBi
+    policy keeps ~O(prune_interval) rows, not O(depth)), so the estimate uses the
+    bounded cache, not the full stream — otherwise deep buckets shrink to batch=1
+    needlessly.  Without eviction it grows with depth.  A SHALLOW bucket runs wide
+    (up to ``batch_cap``); a DEEP bucket auto-shrinks to keep the predicted peak
+    under ``vram_budget_gb``.  ``bytes_per_prog_row`` = ``n_blocks * H * HD * 4 * 2``
+    (K+V fp32, all blocks); when 0 only ``batch_cap`` applies (CPU / no budget)."""
     buckets: Dict[int, List[dict]] = {}
     for it in items:
         rs = it["draft"].step_count
@@ -62,8 +76,22 @@ def _bucket(items: List[dict], batch_cap: int) -> List[List[dict]]:
     batches: List[List[dict]] = []
     for key in sorted(buckets):
         band = sorted(buckets[key], key=lambda r: r["draft"].step_count)
-        for s in range(0, len(band), batch_cap):
-            batches.append(band[s:s + batch_cap])
+        max_depth = max(r["draft"].step_count for r in band)
+        W = min(block_steps, max_depth) * V.FRAME_LEN + V.FRAME_LEN
+        if evict:
+            # eviction bounds the live cache to ~a few prune windows of rows.
+            live_cache = min(max_depth * V.FRAME_LEN, 6 * prune_interval)
+        else:
+            live_cache = max_depth * V.FRAME_LEN
+        rows = W + live_cache
+        if bytes_per_prog_row > 0:
+            per_prog_gb = rows * bytes_per_prog_row / 1e9
+            b_budget = max(1, int(vram_budget_gb / max(per_prog_gb, 1e-9)))
+        else:
+            b_budget = batch_cap
+        sub = max(1, min(batch_cap, b_budget))
+        for s in range(0, len(band), sub):
+            batches.append(band[s:s + sub])
     return batches
 
 
@@ -375,16 +403,19 @@ def speculative_run_batch(model, L: PureForwardCompleteLayout,
                           max_steps: int = 300000, device: str = "cpu",
                           evict: bool = True, prune_interval: int = 120,
                           mask: int = 0xFFFFFFFF, fast: bool = True,
-                          batch_cap: int = 8,
+                          batch_cap: int = 8, vram_budget_gb: float = 9.0,
                           progress: Optional[Callable[[int, int], None]] = None
                           ) -> Tuple[List[dict], int, int]:
     """Cross-program batched speculation over ``items`` (each a dict with
     ``idx``/``cluster``/``description``/``expected``/``code``).  Returns
     ``(result_rows, sum_naive_forwards, sum_spec_forwards)``.
 
-    Each program is drafted (free), depth-bucketed, and its block-verify spans are
+    Each program is drafted (free), DEPTH-bucketed (with a VRAM-budget-adaptive
+    sub-batch size so deep buckets auto-shrink), and its block-verify spans are
     stacked with its bucket-mates into one batched forward per block-step.  A
-    program whose draft does not HALT is a TIMEOUT (no forwards)."""
+    program whose draft does not HALT is a TIMEOUT (no forwards).  A batch that OOMs
+    is split in half and retried (down to batch=1) so a deep member never kills the
+    run."""
     rows: List[dict] = []
     sum_naive = sum_spec = 0
     # draft everything first (free); split TIMEOUTs (non-halting) out.
@@ -403,11 +434,39 @@ def speculative_run_batch(model, L: PureForwardCompleteLayout,
         it2["draft"] = draft
         verifiable.append(it2)
 
-    batches = _bucket(verifiable, batch_cap)
+    # per-(program,row) KV cache bytes (K+V, fp32, all blocks) for the VRAM budget.
+    n_blocks = len(model.blocks)
+    H = model.blocks[0].attn.n_heads
+    HD = model.blocks[0].attn.head_dim
+    bytes_per_prog_row = (n_blocks * H * HD * 4 * 2
+                          if device.startswith("cuda") else 0.0)
+    batches = _bucket(verifiable, batch_cap, block_steps=block_steps,
+                      bytes_per_prog_row=bytes_per_prog_row,
+                      vram_budget_gb=vram_budget_gb, evict=evict,
+                      prune_interval=prune_interval)
     done = 0
-    for batch in batches:
-        nf, sn = _verify_batch(model, L, batch, block_steps, device, evict,
-                               prune_interval, mask, fast)
+    bi = 0
+    while bi < len(batches):
+        batch = batches[bi]
+        try:
+            nf, sn = _verify_batch(model, L, batch, block_steps, device, evict,
+                                   prune_interval, mask, fast)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if len(batch) == 1:
+                # a single program OOMs: emit ERROR, don't kill the run.
+                it = batch[0]
+                rows.append(dict(idx=it["idx"], cluster=it["cluster"], status="ERROR",
+                                 expected=it["expected"] & 0xFFFFFFFF, got=None,
+                                 steps=it["draft"].step_count, forwards=0,
+                                 naive_forwards=it["draft"].step_count, speedup=0.0,
+                                 detail="OOM at batch=1", description=it["description"]))
+                done += 1
+                bi += 1
+                continue
+            half = (len(batch) + 1) // 2
+            batches[bi:bi + 1] = [batch[:half], batch[half:]]
+            continue
         sum_spec += nf
         sum_naive += sn
         for it in batch:
@@ -419,6 +478,7 @@ def speculative_run_batch(model, L: PureForwardCompleteLayout,
                 accepted=it["accepted"], max_cache=it.get("max_cache", 0),
                 detail=it["detail"], description=it["description"]))
             done += 1
+        bi += 1
         if progress:
             npass = sum(1 for r in rows if r["status"] == "PASS")
             progress(done, npass)

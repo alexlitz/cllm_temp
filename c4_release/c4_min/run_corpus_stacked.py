@@ -193,6 +193,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="cross-program batch size for the block-verify (1 = per "
                          "program).  Programs are depth-bucketed so a batch runs "
                          "~its members' depth with no idle slots.")
+    ap.add_argument("--vram-budget", type=float, default=8.0,
+                    help="per-batch VRAM budget (GB) — deep buckets auto-shrink "
+                         "their sub-batch to stay under it.")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--offset", type=int, default=0)
     ap.add_argument("--clusters", type=str, default=None)
@@ -273,7 +276,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         rows, sn, ss = speculative_run_batch(
             sparse, L, ok, block_steps=args.block_steps, max_steps=args.max_steps,
             device=device, evict=evict, prune_interval=args.prune_interval,
-            fast=fast, batch_cap=args.batch,
+            fast=fast, batch_cap=args.batch, vram_budget_gb=args.vram_budget,
             progress=lambda done, npass: _report_progress(
                 device, done, len(ok), npass, t0, args))
         sum_naive += sn
