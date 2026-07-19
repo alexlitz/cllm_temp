@@ -11,11 +11,10 @@ def peak_rss_gb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
 
 
-def measure(include_divmod, tag, code_size=48, recurrent_divmod=False):
+def measure(tag, code_size=48, recurrent_divmod=False):
     t0 = time.monotonic()
     sparse, L, stats = build_compact_sparse_streaming(
-        code_size=code_size, include_bitwise=False,
-        include_divmod=include_divmod, compute_mode="dense_kernel",
+        code_size=code_size, compute_mode="dense_kernel",
         recurrent_divmod=recurrent_divmod)
     build_s = time.monotonic() - t0
     n_phys = len(getattr(sparse, "_phys_blocks", sparse.blocks))  # STORED blocks
@@ -35,17 +34,14 @@ def measure(include_divmod, tag, code_size=48, recurrent_divmod=False):
 
 
 if __name__ == "__main__":
-    which = sys.argv[1] if len(sys.argv) > 1 else "divmod"
-    if which == "lean":
-        measure(False, "LEAN")
-    elif which == "divmod":
-        measure(True, "DIVMOD")
+    # The full-op-set model always has DIV/MOD; the only shape knob is
+    # recurrent_divmod (unrolled 262-block span vs the 21-block reused body).
+    which = sys.argv[1] if len(sys.argv) > 1 else "compare"
+    if which == "unrolled":
+        measure("DIVMOD-UNROLLED")
     elif which == "recurrent":
-        measure(True, "DIVMOD-RECURRENT", recurrent_divmod=True)
-    elif which == "compare":
-        measure(True, "DIVMOD-UNROLLED")
-        measure(True, "DIVMOD-RECURRENT", recurrent_divmod=True)
-    else:
-        measure(False, "LEAN")
-        measure(True, "DIVMOD")
+        measure("DIVMOD-RECURRENT", recurrent_divmod=True)
+    else:   # compare
+        measure("DIVMOD-UNROLLED")
+        measure("DIVMOD-RECURRENT", recurrent_divmod=True)
     print(f"[final] peak_rss={peak_rss_gb():.2f}GB")

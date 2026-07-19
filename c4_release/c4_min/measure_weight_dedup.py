@@ -99,15 +99,12 @@ def measure_recurrent_block_potential(sparse, L):
     return len(sparse.blocks), len(groups), detail
 
 
-def run_config(include_bitwise: bool, include_divmod: bool):
-    tag = ("divmod" if include_divmod else
-           ("bitwise" if include_bitwise else "lean"))
-    print(f"\n{'=' * 78}\nCONFIG: {tag}  (bitwise={include_bitwise}, "
-          f"divmod={include_divmod})\n{'=' * 78}")
+def run_config():
+    print(f"\n{'=' * 78}\nCONFIG: full (single op set: incl. bitwise + divmod)"
+          f"\n{'=' * 78}")
     t0 = time.time()
     sparse, L, cstats = build_compact_sparse_streaming(
-        code_size=48, include_bitwise=include_bitwise,
-        include_divmod=include_divmod, compute_mode="dense_kernel")
+        code_size=48, compute_mode="dense_kernel")
     print(f"built in {time.time() - t0:.1f}s  peak RSS {_rss_gb():.2f} GB")
     print(f"  n_blocks={len(sparse.blocks)}  dim={sparse.dim}  "
           f"vocab={sparse.vocab}")
@@ -147,16 +144,15 @@ def run_config(include_bitwise: bool, include_divmod: bool):
           f"un-tied)]")
 
     # ---- verify byte-identity vs a fresh un-tied twin ----
-    _verify(include_bitwise, include_divmod, sparse, L)
+    _verify(sparse, L)
     return stats
 
 
-def _verify(include_bitwise, include_divmod, tied, L):
+def _verify(tied, L):
     from c4_min.nibble_pure_forward_complete import _build_frame, SP_INIT
     from c4_min import blogspec_vocab as V
     ref, _, _ = build_compact_sparse_streaming(
-        code_size=48, include_bitwise=include_bitwise,
-        include_divmod=include_divmod, compute_mode="dense_kernel")
+        code_size=48, compute_mode="dense_kernel")
     streams = []
     for nf in (0, 2, 4):
         s = [V.BOS] + _build_frame(0, 0, SP_INIT, SP_INIT, 0)
@@ -185,17 +181,9 @@ def _verify(include_bitwise, include_divmod, tied, L):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--lean", action="store_true")
-    ap.add_argument("--bitwise", action="store_true")
-    ap.add_argument("--divmod", action="store_true")
-    args = ap.parse_args()
-    any_sel = args.lean or args.bitwise or args.divmod
-    if not any_sel or args.lean:
-        run_config(include_bitwise=False, include_divmod=False)
-    if not any_sel or args.bitwise:
-        run_config(include_bitwise=True, include_divmod=False)
-    if args.divmod:
-        run_config(include_bitwise=True, include_divmod=True)
+    ap.parse_args()
+    # ONE full-op-set model — the former lean/bitwise/divmod configs are unified.
+    run_config()
 
 
 if __name__ == "__main__":

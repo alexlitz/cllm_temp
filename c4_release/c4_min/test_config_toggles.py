@@ -1,36 +1,28 @@
 """CONFIG-TOGGLE MATRIX gate for the c4_min build/run path.
 
-Codifies the working combination matrix of the real config axes of the
-CANONICAL builder (``compact_alloc``) + the canonical KV-cached driver
-(``run_pure_forward_cached``):
+There is now a SINGLE full-op-set interpreter (every opcode incl. DIV/MOD +
+bitwise) — the former include_divmod / include_bitwise op-subset splits are gone.
+This file codifies the remaining REAL config axes of the CANONICAL builder
+(``compact_alloc``) + the canonical KV-cached driver (``run_pure_forward_cached``):
 
-  include_divmod  {False, True}   (True => stream-build / load-sparse, NEVER the
-                                   79 GB dense build)
-  include_bitwise {False, True}
   compute_mode    {sparse_mm, dense_kernel}   (argmax-identical)
   eviction        {off, on (base policy)}
-  build path      {fresh, stream-build, load-sparse}  (byte-identical)
+  build path      {stream-build, load-sparse}  (byte-identical)
   device          {cpu, cuda:0}
 
 Each combination is checked BOTH for numeric consistency (decode-band L-inf) AND
-argmax correctness of a representative sanity set (a few programs per op family
-that exercise the axis: div/mod for divmod, and/or/xor/shl/shr for bitwise, a
-memory store->load, a branch, a function).
+argmax correctness of the full op battery (ALU / memory / flow / func / bitwise /
+div-mod).  The FULL model is built ONCE (module fixture) via the STREAMING sparse
+builder so peak build RSS is ~one dense block (~9.5 GB), NEVER the ~130 GB full-op
+dense build.
 
-The FULL matrix (all 20 combos across cpu+cuda, lean+bitwise+divmod) lives in
-``c4_min/_matrix_toggles.py`` (run: ``python -c "import sys; sys.argv=['x','cuda'];
-from c4_min._matrix_toggles import main; main()"``).  This file is the CI subset:
-
-  * default (bare ``pytest``): LEAN (no-divmod), CPU only — fast (~1-2 min).
-  * ``C4_TEST_DIVMOD=1``: also the 304-block divmod family (stream-build +
-    load-sparse, ~30 s build peak <15 GB; div/mod sanity ~15 s).
+  * default (bare ``pytest``): CPU, streaming build (~30 s), full battery.
   * ``C4_TEST_CUDA=1``: also run the sanity batteries on ``cuda:0`` and assert
     the GPU result matches CPU.
 
 Run:
   OMP_NUM_THREADS=4 python -m pytest c4_min/test_config_toggles.py -v
-  C4_TEST_DIVMOD=1 C4_TEST_CUDA=1 OMP_NUM_THREADS=4 \
-      python -m pytest c4_min/test_config_toggles.py -v
+  C4_TEST_CUDA=1 OMP_NUM_THREADS=4 python -m pytest c4_min/test_config_toggles.py -v
 """
 from __future__ import annotations
 
@@ -61,12 +53,10 @@ _PF.SP_INIT = 0xF0
 _PFC.SP_INIT = 0xF0
 
 from c4_min.compact_alloc import (
-    build_compact_pure_forward_model,
     build_compact_sparse_streaming,
     save_sparse_transformer,
     load_sparse_transformer,
 )
-from c4_min.sparse_forward import SparseTransformer
 from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
 from c4_min.nibble_pure_forward_complete import (
     ref_interpret, make_overlay_complete, _build_frame, SP_INIT)
@@ -92,8 +82,8 @@ DIVMOD = [("div", "int main(){ return 720 / 6; }", 120),
           ("mod", "int main(){ return 84 % 5; }", 4),
           ("divzero", "int main(){ return 5 / 0; }", 0)]
 
-LEAN_BASE = ALU + MEM + FLOW + FUNC
-_RUN_DIVMOD = os.environ.get("C4_TEST_DIVMOD") == "1"
+BASE = ALU + MEM + FLOW + FUNC
+FULL_BATTERY = BASE + BITWISE + DIVMOD
 # Use the force-init result captured at the top of the module — NOT a fresh
 # ``torch.cuda.is_available()`` here, which the c4_min imports above have
 # already poisoned to False under pytest.
@@ -169,132 +159,60 @@ _BID_SRCS = ["int main(){ return 500 + 700; }",
 
 
 # =========================================================================
-# LEAN family (no divmod): build-path byte-identity + compute_mode +
-# bitwise + eviction + (optional) device — the always-on CI subset.
+# SINGLE FULL-OP-SET MODEL: build-path byte-identity + compute_mode +
+# eviction + full op battery (incl. bitwise AND div/mod) + (optional) device.
+# Built ONCE via the STREAMING sparse builder (peak ~9.5 GB, never dense).
 # =========================================================================
 @pytest.fixture(scope="module")
-def lean_bw(tmp_path_factory):
-    """(fresh, stream, loaded, stream_mm) + layouts for the bitwise lean model."""
-    path = str(tmp_path_factory.mktemp("t") / "lean_bw.pt")
-    fresh_c, Lf, _ = build_compact_pure_forward_model(
-        code_size=64, include_bitwise=True, include_divmod=False)
-    fresh = SparseTransformer(fresh_c, compute_mode="dense_kernel")
+def full_model(tmp_path_factory):
+    """(stream, loaded, stream_mm) + layouts for the single full-op-set model."""
+    path = str(tmp_path_factory.mktemp("t") / "full.pt")
     stream, Ls, st = build_compact_sparse_streaming(
-        code_size=64, include_bitwise=True, include_divmod=False,
-        compute_mode="dense_kernel")
+        code_size=64, compute_mode="dense_kernel")
     save_sparse_transformer(stream, Ls, st, path)
     loaded, Ll = load_sparse_transformer(path, compute_mode="dense_kernel")
     stream_mm, Lmm, _ = build_compact_sparse_streaming(
-        code_size=64, include_bitwise=True, include_divmod=False,
-        compute_mode="sparse_mm")
-    return dict(fresh=(fresh, Lf), stream=(stream, Ls), load=(loaded, Ll),
-                stream_mm=(stream_mm, Lmm))
+        code_size=64, compute_mode="sparse_mm")
+    return dict(stream=(stream, Ls), load=(loaded, Ll), stream_mm=(stream_mm, Lmm))
 
 
-def test_build_paths_byte_identical(lean_bw):
-    """fresh (compact->Sparse) == stream-build == load-sparse (L-inf = 0)."""
-    f, Lf = lean_bw["fresh"]
-    s, Ls = lean_bw["stream"]
-    ld, Ll = lean_bw["load"]
-    assert _linf(f, Lf, s, Ls, _BID_SRCS) < 1e-9      # fresh vs stream
-    assert _linf(s, Ls, ld, Ll, _BID_SRCS) < 1e-9     # stream vs load-sparse
+def test_build_paths_byte_identical(full_model):
+    """stream-build == load-sparse (L-inf = 0), across bitwise + div/mod srcs."""
+    s, Ls = full_model["stream"]
+    ld, Ll = full_model["load"]
+    srcs = _BID_SRCS + ["int main(){ return 720 / 6; }",
+                        "int main(){ return 84 % 5; }"]
+    assert _linf(s, Ls, ld, Ll, srcs) < 1e-9     # stream vs load-sparse
 
 
-def test_compute_mode_argmax_identical(lean_bw):
+def test_compute_mode_argmax_identical(full_model):
     """dense_kernel vs sparse_mm: fp-accum residue only (<1e-3), argmax-safe."""
-    f, Lf = lean_bw["fresh"]
-    mm, Lmm = lean_bw["stream_mm"]
-    d = _linf(f, Lf, mm, Lmm, _BID_SRCS)
+    s, Ls = full_model["stream"]
+    mm, Lmm = full_model["stream_mm"]
+    d = _linf(s, Ls, mm, Lmm, _BID_SRCS)
     assert d < 1e-3, d           # tiny residue, never changes an argmax decode
 
 
-@pytest.mark.parametrize("path", ["fresh", "stream", "load", "stream_mm"])
-def test_lean_bitwise_battery_all_paths(lean_bw, path):
-    """Every build path + compute_mode runs the full lean+bitwise battery."""
-    m, L = lean_bw[path]
-    _battery(m, L, LEAN_BASE + BITWISE, evict=True, device="cpu")
+@pytest.mark.parametrize("path", ["stream", "load", "stream_mm"])
+def test_full_battery_all_paths(full_model, path):
+    """Every build path + compute_mode runs the FULL op battery (incl. div/mod)."""
+    m, L = full_model[path]
+    _battery(m, L, FULL_BATTERY, evict=True, device="cpu")
 
 
-def test_eviction_on_off_agree(lean_bw):
+def test_eviction_on_off_agree(full_model):
     """Eviction ON (base prune policy) and OFF give identical correct outputs."""
-    m, L = lean_bw["stream"]
-    _battery(m, L, LEAN_BASE + BITWISE, evict=True, device="cpu")
-    _battery(m, L, LEAN_BASE + BITWISE, evict=False, device="cpu")
-
-
-def test_no_bitwise_model_lacks_bitwise_ops():
-    """include_bitwise=False: ALU still correct, bitwise ops unsupported.
-
-    Negative control — the toggle actually gates the bitwise blocks (the ops
-    diverge from the correct answer on the no-bitwise model)."""
-    sp, L, _ = build_compact_sparse_streaming(
-        code_size=64, include_bitwise=False, include_divmod=False,
-        compute_mode="dense_kernel")
-    _battery(sp, L, ALU + MEM + FLOW, evict=True, device="cpu")   # ALU/mem/flow OK
-    wrong = 0
-    for nm, src, exp in BITWISE:
-        if _final(sp, L, src, True, "cpu") != exp:
-            wrong += 1
-    assert wrong == len(BITWISE), "bitwise ops should be unsupported without the flag"
+    m, L = full_model["stream"]
+    _battery(m, L, FULL_BATTERY, evict=True, device="cpu")
+    _battery(m, L, FULL_BATTERY, evict=False, device="cpu")
 
 
 @pytest.mark.skipif(not _RUN_CUDA,
                     reason="set C4_TEST_CUDA=1 (needs cuda:0) to run the GPU rows")
-def test_lean_cuda_matches_cpu(lean_bw):
+def test_cuda_matches_cpu(full_model):
     """cuda:0 gives the SAME argmax-correct outputs as cpu (dense_kernel)."""
-    m, L = lean_bw["stream"]
-    _battery(m, L, LEAN_BASE + BITWISE, evict=True, device="cuda:0")
+    m, L = full_model["stream"]
+    _battery(m, L, FULL_BATTERY, evict=True, device="cuda:0")
     # sparse_mm on GPU too (argmax-identical).
-    mm, Lmm = lean_bw["stream_mm"]
-    _battery(mm, Lmm, LEAN_BASE + BITWISE, evict=True, device="cuda:0")
-
-
-# =========================================================================
-# DIVMOD family — stream-build + load-sparse ONLY (never the 79 GB dense
-# build).  Gated behind C4_TEST_DIVMOD=1 (304-block build; peak <15 GB).
-# =========================================================================
-@pytest.fixture(scope="module")
-def divmod_models(tmp_path_factory):
-    path = str(tmp_path_factory.mktemp("t") / "divmod.pt")
-    stream, L, st = build_compact_sparse_streaming(
-        code_size=64, include_bitwise=True, include_divmod=True,
-        compute_mode="dense_kernel")
-    save_sparse_transformer(stream, L, st, path)
-    loaded, Ll = load_sparse_transformer(path, compute_mode="dense_kernel")
-    loaded_mm, Lmm = load_sparse_transformer(path, compute_mode="sparse_mm")
-    return dict(stream=(stream, L), load=(loaded, Ll), load_mm=(loaded_mm, Lmm))
-
-
-@pytest.mark.skipif(not _RUN_DIVMOD,
-                    reason="304-block divmod build; set C4_TEST_DIVMOD=1 to run")
-def test_divmod_stream_vs_load_byte_identical(divmod_models):
-    s, Ls = divmod_models["stream"]
-    ld, Ll = divmod_models["load"]
-    mm, Lmm = divmod_models["load_mm"]
-    dm_srcs = ["int main(){ return 720 / 6; }", "int main(){ return 84 % 5; }"]
-    assert _linf(s, Ls, ld, Ll, dm_srcs) < 1e-9        # stream vs load-sparse
-    assert _linf(s, Ls, mm, Lmm, dm_srcs) < 1e-3       # dense_kernel vs sparse_mm
-
-
-@pytest.mark.skipif(not _RUN_DIVMOD,
-                    reason="304-block divmod build; set C4_TEST_DIVMOD=1 to run")
-@pytest.mark.parametrize("path", ["stream", "load", "load_mm"])
-def test_divmod_battery_all_paths(divmod_models, path):
-    m, L = divmod_models[path]
-    # div/mod/divzero + one ALU + one bitwise (confirm the big model keeps them).
-    _battery(m, L, DIVMOD + ALU[:1] + BITWISE[:1], evict=True, device="cpu")
-
-
-@pytest.mark.skipif(not _RUN_DIVMOD,
-                    reason="304-block divmod build; set C4_TEST_DIVMOD=1 to run")
-def test_divmod_eviction_on_off_agree(divmod_models):
-    m, L = divmod_models["stream"]
-    _battery(m, L, DIVMOD, evict=True, device="cpu")
-    _battery(m, L, DIVMOD, evict=False, device="cpu")
-
-
-@pytest.mark.skipif(not (_RUN_DIVMOD and _RUN_CUDA),
-                    reason="set C4_TEST_DIVMOD=1 C4_TEST_CUDA=1 to run divmod-on-GPU")
-def test_divmod_cuda_matches_cpu(divmod_models):
-    m, L = divmod_models["stream"]
-    _battery(m, L, DIVMOD, evict=True, device="cuda:0")
+    mm, Lmm = full_model["stream_mm"]
+    _battery(mm, Lmm, FULL_BATTERY, evict=True, device="cuda:0")

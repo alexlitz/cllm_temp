@@ -1,19 +1,21 @@
 """Full config-toggle MATRIX harness for the c4_min build/run path.
 
-Exercises the real config axes of the canonical builder
-(``compact_alloc.build_compact_sparse_streaming`` /
-``build_compact_pure_forward_model`` / ``load_sparse_transformer``) and the
-canonical KV-cached driver (``run_pure_forward_cached``) in every meaningful
-combination, checks each is argmax-CORRECT vs the byte-exact reference
-(``ref_interpret`` / the corpus ``expected``) and CONSISTENT across
-compute_mode / build-path / device.
+Exercises the real config axes of the canonical builder for the SINGLE
+full-op-set model (``compact_alloc.build_compact_sparse_streaming`` /
+``load_sparse_transformer``) and the canonical KV-cached driver
+(``run_pure_forward_cached``) in every meaningful combination, checks each is
+argmax-CORRECT vs the byte-exact reference (``ref_interpret`` / the corpus
+``expected``) and CONSISTENT across compute_mode / build-path / device.
+
+There is now ONE op set (every opcode incl. DIV/MOD + bitwise) — the former
+include_divmod / include_bitwise op-subset axes are gone.  The model is built via
+the STREAMING sparse builder (peak build RSS ~one dense block), never the
+~130 GB full-op dense build.
 
 Axes:
-  include_divmod  {False, True}   (True => stream-build / load-sparse, never 79GB dense)
-  include_bitwise {False, True}
   compute_mode    {sparse_mm, dense_kernel}   (must be argmax-identical)
   eviction        {off, on}
-  build path      {fresh, stream-build, load-sparse}   (must be byte-identical)
+  build path      {stream-build, load-sparse}   (must be byte-identical)
   device          {cpu, cuda:0}
 
 Run:  OMP_NUM_THREADS=4 python -u -m c4_min._matrix_toggles [cuda]
@@ -52,12 +54,10 @@ _PF.SP_INIT = 0xF0
 _PFC.SP_INIT = 0xF0
 
 from c4_min.compact_alloc import (
-    build_compact_pure_forward_model,
     build_compact_sparse_streaming,
     save_sparse_transformer,
     load_sparse_transformer,
 )
-from c4_min.sparse_forward import SparseTransformer
 from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
 from c4_min.nibble_pure_forward_complete import (
     ref_interpret, make_overlay_complete, _build_frame, SP_INIT)
@@ -197,115 +197,59 @@ def main(argv=None):
                 "int main(){ int x; x = 1000; return x; }",
                 "int main(){ return 12 | 3; }"]
 
-    # ================= LEAN family (no divmod) ==========================
-    for include_bitwise in (False, True):
-        tag = "bw" if include_bitwise else "nobw"
-        fresh_c, Lf, _ = build_compact_pure_forward_model(
-            code_size=64, include_bitwise=include_bitwise, include_divmod=False)
-        fresh = SparseTransformer(fresh_c, compute_mode="dense_kernel")
-        del fresh_c
-        path = f"/tmp/c4_matrix_lean_{tag}.pt"
-        stream, Ls, st_stream = build_compact_sparse_streaming(
-            code_size=64, include_bitwise=include_bitwise,
-            include_divmod=False, compute_mode="dense_kernel")
-        save_sparse_transformer(stream, Ls, st_stream, path)
-        loaded, Ll = load_sparse_transformer(path, compute_mode="dense_kernel")
-        stream_mm, Lmm, _ = build_compact_sparse_streaming(
-            code_size=64, include_bitwise=include_bitwise,
-            include_divmod=False, compute_mode="sparse_mm")
-
-        # -- byte-identity of build paths (fresh vs stream vs load) + sparse_mm
-        for c in [_compile(s) for s in srcs_bid]:
-            r_fresh = _block_stack(fresh, Lf, c)
-            for nm, (m, L) in [("stream", (stream, Ls)), ("load", (loaded, Ll))]:
-                d = (r_fresh - _block_stack(m, L, c)).abs().max().item()
-                byteid[(tag, f"fresh-vs-{nm}")] = max(
-                    byteid.get((tag, f"fresh-vs-{nm}"), 0.0), d)
-            d = (r_fresh - _block_stack(stream_mm, Lmm, c)).abs().max().item()
-            byteid[(tag, "dense_kernel-vs-sparse_mm")] = max(
-                byteid.get((tag, "dense_kernel-vs-sparse_mm"), 0.0), d)
-
-        base = ALU + MEM + FLOW + FUNC + (BITWISE if include_bitwise else [])
-        fast = ALU[:1] + MEM + FLOW[:1] + (BITWISE[:2] if include_bitwise else [])
-        # The canonical stream model gets the FULL end-to-end battery on device[0]
-        # (evict on); the redundant axes (evict off, second device) get the fast
-        # subset.  fresh / load / sparse_mm are proven L-inf-identical to the
-        # stream model above, so each gets ONE fast correctness confirmation.
-        d0 = devices[0]
-        for device in devices:
-            sm = stream.to(device)
-            for evict in (True, False):
-                cases = base if (device == d0 and evict) else fast
-                ok, rows = battery(sm, Ls, cases, evict=evict, device=device)
-                key = (f"divmod=F/{tag}", "dense_kernel", "stream", device,
-                       "evict" if evict else "noevict")
-                results[key] = (ok, rows)
-                _print_row("divmod=F", tag, "dense_kernel", "stream", device,
-                           evict, rows)
-            sm.to("cpu")
-        for kind, m, L, mode in [("fresh", fresh, Lf, "dense_kernel"),
-                                 ("load", loaded, Ll, "dense_kernel"),
-                                 ("stream_mm", stream_mm, Lmm, "sparse_mm")]:
-            md = m.to(d0)
-            ok, rows = battery(md, L, fast, evict=True, device=d0)
-            results[(f"divmod=F/{tag}", mode, kind, d0, "evict")] = (ok, rows)
-            _print_row("divmod=F", tag, mode, kind, d0, True, rows)
-            md.to("cpu")
-
-        if not include_bitwise:
-            _, negrows = battery(stream, Ls, BITWISE, evict=True, device="cpu")
-            nwrong = sum(1 for r in negrows if not r[3])
-            print(f"  NOTE  divmod=F nobw: bitwise ops unsupported — "
-                  f"{nwrong}/{len(negrows)} diverge from correct (as expected)",
-                  flush=True)
-        del fresh, stream, loaded, stream_mm
-
-    # ================= DIVMOD family (stream-build + load-sparse) =========
-    print("-" * 82, flush=True)
-    dm_path = "/tmp/c4_matrix_divmod.pt"
-    sp_dm, L_dm, st_dm = build_compact_sparse_streaming(
-        code_size=64, include_bitwise=True, include_divmod=True,
-        compute_mode="dense_kernel")
-    save_sparse_transformer(sp_dm, L_dm, st_dm, dm_path)
-    print(f"  [divmod stream-build: dim={st_dm.dim_after} nblocks={st_dm.n_blocks} "
-          f"nnz={sp_dm.stats().total_nnz} peakRSS={_peak_gb():.1f}GB]", flush=True)
-    loaded_dm, L_dm2 = load_sparse_transformer(dm_path, compute_mode="dense_kernel")
-    dm_mm, L_dm3 = load_sparse_transformer(dm_path, compute_mode="sparse_mm")
-
-    # byte-identity: stream vs load, dense_kernel vs sparse_mm
-    for c in [_compile(s) for s in
-              ["int main(){ return 720 / 6; }", "int main(){ return 84 % 5; }"]]:
-        r_stream = _block_stack(sp_dm, L_dm, c)
-        byteid[("divmod", "stream-vs-load")] = max(
-            byteid.get(("divmod", "stream-vs-load"), 0.0),
-            (r_stream - _block_stack(loaded_dm, L_dm2, c)).abs().max().item())
-        byteid[("divmod", "dense_kernel-vs-sparse_mm")] = max(
-            byteid.get(("divmod", "dense_kernel-vs-sparse_mm"), 0.0),
-            (r_stream - _block_stack(dm_mm, L_dm3, c)).abs().max().item())
-
-    dm_base = DIVMOD + ALU[:1] + BITWISE[:1]
-    dm_fast = DIVMOD[:2]              # div + mod (fast) for the redundant axes
+    # ============= SINGLE FULL-OP-SET MODEL (streaming only) =============
+    # Every opcode present (ALU + mem + flow + func + bitwise + div/mod).  The
+    # streaming build is memory-safe (~one dense block peak); load-sparse and
+    # sparse_mm are the remaining byte-identity axes.
     d0 = devices[0]
-    # canonical stream-built divmod model: full battery on d0/evict, subset else.
+    path = "/tmp/c4_matrix_full.pt"
+    stream, Ls, st_stream = build_compact_sparse_streaming(
+        code_size=64, compute_mode="dense_kernel")
+    save_sparse_transformer(stream, Ls, st_stream, path)
+    print(f"  [full stream-build: dim={st_stream.dim_after} "
+          f"nblocks={st_stream.n_blocks} nnz={stream.stats().total_nnz} "
+          f"peakRSS={_peak_gb():.1f}GB]", flush=True)
+    loaded, Ll = load_sparse_transformer(path, compute_mode="dense_kernel")
+    stream_mm, Lmm, _ = build_compact_sparse_streaming(
+        code_size=64, compute_mode="sparse_mm")
+
+    # -- byte-identity of build paths (stream vs load) + dense_kernel vs sparse_mm
+    srcs_bid_full = srcs_bid + ["int main(){ return 720 / 6; }",
+                                "int main(){ return 84 % 5; }"]
+    for c in [_compile(s) for s in srcs_bid_full]:
+        r_stream = _block_stack(stream, Ls, c)
+        byteid[("full", "stream-vs-load")] = max(
+            byteid.get(("full", "stream-vs-load"), 0.0),
+            (r_stream - _block_stack(loaded, Ll, c)).abs().max().item())
+        byteid[("full", "dense_kernel-vs-sparse_mm")] = max(
+            byteid.get(("full", "dense_kernel-vs-sparse_mm"), 0.0),
+            (r_stream - _block_stack(stream_mm, Lmm, c)).abs().max().item())
+
+    base = ALU + MEM + FLOW + FUNC + BITWISE + DIVMOD
+    fast = ALU[:1] + MEM + FLOW[:1] + BITWISE[:2] + DIVMOD[:2]
+    # The canonical stream model gets the FULL end-to-end battery on device[0]
+    # (evict on); the redundant axes (evict off, second device) get the fast
+    # subset.  load / sparse_mm are proven L-inf-identical to the stream model
+    # above, so each gets ONE fast correctness confirmation.
     for device in devices:
-        sm = sp_dm.to(device)
+        sm = stream.to(device)
         for evict in (True, False):
-            cases = dm_base if (device == d0 and evict) else dm_fast
-            ok, rows = battery(sm, L_dm, cases, evict=evict, device=device)
-            key = ("divmod=T/bw", "dense_kernel", "stream", device,
+            cases = base if (device == d0 and evict) else fast
+            ok, rows = battery(sm, Ls, cases, evict=evict, device=device)
+            key = ("full", "dense_kernel", "stream", device,
                    "evict" if evict else "noevict")
             results[key] = (ok, rows)
-            _print_row("divmod=T", "bw", "dense_kernel", "stream", device,
+            _print_row("full", "all", "dense_kernel", "stream", device,
                        evict, rows)
         sm.to("cpu")
-    # load-sparse (dense_kernel) + sparse_mm: one fast confirmation on device[0].
-    for kind, m, L, mode in [("load", loaded_dm, L_dm2, "dense_kernel"),
-                             ("load_mm", dm_mm, L_dm3, "sparse_mm")]:
+    for kind, m, L, mode in [("load", loaded, Ll, "dense_kernel"),
+                             ("stream_mm", stream_mm, Lmm, "sparse_mm")]:
         md = m.to(d0)
-        ok, rows = battery(md, L, dm_fast, evict=True, device=d0)
-        results[("divmod=T/bw", mode, kind, d0, "evict")] = (ok, rows)
-        _print_row("divmod=T", "bw", mode, kind, d0, True, rows)
+        ok, rows = battery(md, L, fast, evict=True, device=d0)
+        results[("full", mode, kind, d0, "evict")] = (ok, rows)
+        _print_row("full", "all", mode, kind, d0, True, rows)
         md.to("cpu")
+    del stream, loaded, stream_mm
 
     # ================= SUMMARY =========================================
     print("=" * 82, flush=True)
