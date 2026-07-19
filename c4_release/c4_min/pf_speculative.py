@@ -82,38 +82,48 @@ from .blogspec_layout import NIB_PER_REG
 # ``spotcheck_vs_cached`` / the runner's ``--check-overlay`` gate.
 # ===========================================================================
 def build_code_vec(code: List[isa.Instr], L: PureForwardCompleteLayout,
-                   D: int, device, dtype=torch.float32) -> torch.Tensor:
-    """The ROW-INVARIANT program-in-data + ONE residual as a single ``[D]`` vector.
+                   D: int, device, dtype=torch.float32
+                   ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The ROW-INVARIANT program-in-data + ONE overlay as ``(idx, vals)``.
 
-    Built ONCE per program (the code never changes across steps), then broadcast-
-    added to every window row instead of re-writing it per row.
+    ``idx`` [K] long — the residual dims the code-in-data overlay WRITES (ONE +
+    every CODE_OP/CODE_IMM/CODE_IMM_NIB dim).  ``vals`` [K] — the values it writes.
+    Built ONCE per program (the code never changes across steps); the fast overlay
+    ASSIGNS ``x[:, idx] = vals`` on every row (overwriting the embedding at those
+    dims, exactly as ``apply_overlay_window`` does with ``x[...] = v`` — NOT ``+=``,
+    since the embedding is non-zero at these dims).
     """
-    vec = torch.zeros(D, device=device, dtype=dtype)
-    vec[L.ONE] = 1.0
+    idx: List[int] = [L.ONE]
+    vals: List[float] = [1.0]
     for k, ins in enumerate(code):
-        vec[L.CODE_OP[k]] = float(ins.op)
-        vec[L.CODE_IMM[k]] = float(ins.imm)
+        idx.append(L.CODE_OP[k]); vals.append(float(ins.op))
+        idx.append(L.CODE_IMM[k]); vals.append(float(ins.imm))
         for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
-            vec[L.CODE_IMM_NIB[k] + j] = float(nv)
-    return vec
+            idx.append(L.CODE_IMM_NIB[k] + j); vals.append(float(nv))
+    return (torch.tensor(idx, device=device, dtype=torch.long),
+            torch.tensor(vals, device=device, dtype=dtype))
 
 
 def apply_overlay_window_fast(x_win: torch.Tensor, w_start: int, L,
                               store_log: Dict[int, Tuple[int, int]],
-                              code_vec: torch.Tensor,
+                              code_vec: Tuple[torch.Tensor, torch.Tensor],
                               query_rows: Optional[List[int]] = None) -> None:
     """O(rows + code) in-place overlay of ``x_win`` ([1, W, D]) — byte-identical to
-    ``apply_overlay_window`` but with the row-invariant code-in-data added by ONE
-    broadcast instead of a per-row re-scan.
+    ``apply_overlay_window`` but with the row-invariant code-in-data ASSIGNED by ONE
+    broadcast indexed-write instead of a per-row re-scan.
 
-    ``code_vec`` is ``build_code_vec(code, L, D)`` (precomputed once).
-    ``query_rows`` (window-local indices) are re-tagged with all-ROLE one-hots (the
-    per-step query tag); if None, only the LAST row is a query row (the single-step
-    window contract of ``apply_overlay_window(is_last_row_query=True)``).
+    ``code_vec`` is ``build_code_vec(code, L, D)`` -> ``(idx, vals)`` (precomputed
+    once).  ``query_rows`` (window-local indices) are re-tagged with all-ROLE
+    one-hots (the per-step query tag); if None, only the LAST row is a query row
+    (the single-step window contract of
+    ``apply_overlay_window(is_last_row_query=True)``).
     """
     W = x_win.shape[1]
-    # 1) row-INVARIANT program-in-data + ONE: one broadcast add (O(D), not O(W*C)).
-    x_win[0, :, :] += code_vec
+    # 1) row-INVARIANT program-in-data + ONE: ONE broadcast ASSIGN over the code
+    # dims (overwrites the embedding at those dims, exactly like the slow overlay's
+    # ``x[...] = v``).  O(W*K) writes but as ONE vectorised op, not a Python loop.
+    code_idx, code_vals = code_vec
+    x_win[0, :, code_idx] = code_vals
     # 2) per-position frame roles / store tags (O(1) per row -> O(W) total).
     for wi in range(W):
         p = w_start + wi
