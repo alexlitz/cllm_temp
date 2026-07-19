@@ -258,7 +258,7 @@ _RUNTIME_SRC = """\
 def _compile_source_to_bytecode(source: str) -> List[Tuple[int, int]]:
     """Compile a C4 source string to the ISA (op, imm) stream the driver runs.
 
-    Uses the same front end + translation as ``run_1096_pure_forward_cached``:
+    Uses the same front end + translation as ``run_1096_pure_forward``:
     ``src.compiler.compile_c`` -> ``bytecode_to_isa``.
     """
     from src.compiler import compile_c
