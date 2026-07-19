@@ -57,7 +57,7 @@ ONNX_IR_VERSION = 10
 # HuggingFace/LLM export — no custom domains, no control-flow subgraphs.
 VANILLA_OPS = {
     # projections + attention/FFN/LM-head matmuls
-    "MatMul", "Gemm",
+    "MatMul", "Gemm", "Einsum",
     # softmax1 primitives (exp(x-m) / (exp(-m)+sum)) + the SwiGLU gate
     "Exp", "ReduceMax", "ReduceSum", "Div", "Sigmoid", "Mul",
     # residual / bias / ALiBi / scores plumbing
@@ -65,8 +65,12 @@ VANILLA_OPS = {
     # token-embedding lookup + reshapes/transposes for the head split
     # (Gather from the TorchScript tracer, GatherND from the dynamo exporter;
     # both are the ordinary embedding-table lookup)
-    "Gather", "GatherND", "Reshape", "Transpose", "Concat", "Unsqueeze",
-    "Squeeze",
+    "Gather", "GatherND", "GatherElements", "Reshape", "Transpose", "Concat",
+    "Unsqueeze", "Squeeze",
+    # top-1 MoE router: ArgMax the opcode one-hot -> Gather the active expert's
+    # unit rows (the structural-sparsity dispatch; a standard hard-routed MoE,
+    # NOT a control-flow branch — no If/Loop/Scan).
+    "ArgMax",
     # causal mask + positions (all data-independent shape math)
     "Trilu", "Range", "ConstantOfShape", "Constant", "Shape", "Cast",
     "Expand", "Where", "Equal", "Slice", "Identity", "ScatterElements",
