@@ -306,6 +306,13 @@ def extend_layout_for_bitwise(L: NibbleLayout) -> NibbleLayout:
     L.SHIFT_LO_OH = L._band("SHIFT_LO_OH", 16)   # one-hot of AX nibble 0 (bits 0..3)
     L.SHIFT_N1_OH = L._band("SHIFT_N1_OH", 16)   # one-hot of AX nibble 1 (for bit4)
     L.SHIFT_BIT4 = L._band("SHIFT_BIT4", 2)      # one-hot of bit 4 (0 or 1)
+    # per-nibble bit PLANES for the shared per-bit OR/XOR/AND gadget: for each of
+    # the 16 nibbles, the 4 bits of the STACK0 (A) and AX (B) operand nibble as
+    # exact 0/1 indicators (band j*4 + p = bit p of nibble j). These let the three
+    # bitwise ops share ONE bit-extraction (opcode-independent) and reduce to a
+    # tiny per-bit combine, instead of three full 256-entry (a,b) lookup tables.
+    L.A_BIT = L._band("A_BIT", N_NIB * 4)        # A_BIT[j*4+p] = bit p of STACK0 nib j
+    L.B_BIT = L._band("B_BIT", N_NIB * 4)        # B_BIT[j*4+p] = bit p of AX     nib j
     L.D = L._off
     return L
 
@@ -352,6 +359,121 @@ def compile_onehot_expand(src_bands: List[int], oh_bases: List[int],
             W_down[oh_base + a, thr_unit[a + 1]] += 1.0 / RELU_S
     return {"W_up": W_up, "b_up": b_up, "W_gate": W_gate, "b_gate": b_gate,
             "W_down": W_down, "b_down": b_down}
+
+
+def compile_bit_extract(src_bands: List[int], bit_bases: List[int],
+                        one_band: int, dim: int) -> dict:
+    """Compile the per-nibble BIT-PLANE extraction as SwiGLU weights (shared, ungated).
+
+    For each ``(src, bit_base)`` pair (``src`` a nibble band 0..15) materialise the
+    four bit indicators ``bit_base + p = (src >> p) & 1`` for ``p`` in 0..3.
+    Bit ``p`` is the integer-exact ``floor(src/2**p) - 2*floor(src/2**(p+1))``.
+    Each ``floor(src/2**p)`` is a staircase of relu steps (one relu per unit rise,
+    exactly like ``compile_fold`` / the divmod floor); the two floors share their
+    relu banks across the two consecutive planes, so the whole extraction is a
+    handful of relu units per nibble — a fraction of the 256-entry (a,b) tables it
+    replaces. Purely a function of the operand nibble (no opcode gate), so ONE copy
+    serves OR, XOR and AND.
+    """
+    assert len(src_bands) == len(bit_bases)
+    # floor(v/2**p) for a nibble v in 0..15 rises 1 at v=2**p, 2*2**p, ...  We build
+    # each floor from unit-rise relu steps: floor(v/M) = sum_{m>=1} step(v >= m*M),
+    # step(v>=t) = relu(v-(t-1)) - relu(v-t) (exact 0/1 on integers). For M=2**p and
+    # v in 0..15 the thresholds needed are the multiples of M up to 15.
+    def floor_terms(M):
+        # returns {threshold: coeff} for the relu STEPS composing floor(v/M).
+        terms = {}
+        m = M
+        while m <= 15:
+            # step(v>=m) = relu(v-(m-1)) - relu(v-m)
+            terms[m - 1] = terms.get(m - 1, 0.0) + 1.0
+            terms[m] = terms.get(m, 0.0) - 1.0
+            m += M
+        return terms
+
+    # bit p = floor(v/2**p) - 2*floor(v/2**(p+1)); collect the net relu-threshold
+    # coefficients per source, then emit ONE relu unit per (src, distinct threshold).
+    W_rows = []          # (src, threshold, coeff, bit_base+p) accumulation
+    per_src_thr = []     # list over srcs of {threshold: {bit_idx: coeff}}
+    for src, bit_base in zip(src_bands, bit_bases):
+        thr_map: dict = {}
+        for p in range(4):
+            hi = floor_terms(1 << p)             # +floor(v/2**p)
+            lo = floor_terms(1 << (p + 1))       # -2*floor(v/2**(p+1))
+            net: dict = {}
+            for t, c in hi.items():
+                net[t] = net.get(t, 0.0) + c
+            for t, c in lo.items():
+                net[t] = net.get(t, 0.0) - 2.0 * c
+            for t, c in net.items():
+                if c == 0.0:
+                    continue
+                thr_map.setdefault(t, {})[bit_base + p] = \
+                    thr_map.setdefault(t, {}).get(bit_base + p, 0.0) + c
+        per_src_thr.append((src, thr_map))
+
+    n_units = sum(len(thr_map) for _src, thr_map in per_src_thr) or 1
+    W_up = torch.zeros(n_units, dim); b_up = torch.zeros(n_units)
+    W_gate = torch.zeros(n_units, dim); b_gate = torch.zeros(n_units)
+    W_down = torch.zeros(dim, n_units); b_down = torch.zeros(dim)
+    u = 0
+    for src, thr_map in per_src_thr:
+        for t, dst_coeffs in thr_map.items():
+            # up = RELU_S*(src - t); hidden = relu(src - t); gate = 1 (via ONE).
+            W_up[u, src] = RELU_S
+            b_up[u] = -RELU_S * t
+            W_gate[u, one_band] = 1.0
+            for dst, c in dst_coeffs.items():
+                W_down[dst, u] += c / RELU_S
+            u += 1
+    return {"W_up": W_up, "b_up": b_up, "W_gate": W_gate, "b_gate": b_gate,
+            "W_down": W_down, "b_down": b_down}
+
+
+# the per-bit boolean combine for each of the three bitwise ops, expressed as
+# additive contributions of the result bit (weight 2**p on the nibble):
+#   AND(a,b) = a*b                       -> +[A_BIT ∧ B_BIT]
+#   OR (a,b) = a + b - a*b               -> +[A_BIT] +[B_BIT] -[A_BIT ∧ B_BIT]
+#   XOR(a,b) = a + b - 2*a*b             -> +[A_BIT] +[B_BIT] -2*[A_BIT ∧ B_BIT]
+# where each [·] is an FFNRule gated on the listed bit-plane predicate(s).
+_PERBIT_COMBINE = {
+    isa.AND: [(("A", "B"), 1.0)],
+    isa.OR:  [(("A",), 1.0), (("B",), 1.0), (("A", "B"), -1.0)],
+    isa.XOR: [(("A",), 1.0), (("B",), 1.0), (("A", "B"), -2.0)],
+}
+
+
+def perbit_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
+    """Per-nibble OR/XOR/AND result via the SHARED bit-plane gadget (§Bitwise).
+
+    Replaces the op's 256-entry ``(a,b)`` lookup with the boolean per-bit identity
+    ``AND=a·b``, ``OR=a+b-a·b``, ``XOR=a+b-2a·b`` on the pre-extracted bit planes
+    ``A_BIT``/``B_BIT`` (built once, shared across the three ops). For nibble ``j``
+    each of the 4 bit planes ``p`` contributes ``2**p`` weighted by the boolean
+    combine, gated on the bit-plane predicates. A single ``-AX+j`` self-cancel per
+    nibble keeps SET semantics — identical result values to the table, but a couple
+    dozen rules per nibble instead of 670. Bit-exact vs ``bitwise_dispatch_rules``.
+    """
+    if op not in _PERBIT_COMBINE:
+        raise ValueError(f"perbit_select_rules: op {op} not OR/XOR/AND")
+    rules: List[FFNRule] = []
+    for j in range(N_NIB):
+        res = L.AX + j
+        # SET semantics: cancel the old AX nibble once (same as the table path).
+        rules.append(FFNRule([(L.ONE, 0.5, 1.5)],
+                             {res: LinearExpr.of(res, -1.0)}))
+        for p in range(4):
+            a_bit = L.A_BIT + j * 4 + p
+            b_bit = L.B_BIT + j * 4 + p
+            weight = float(1 << p)
+            for operands, coeff in _PERBIT_COMBINE[op]:
+                when = []
+                if "A" in operands:
+                    when.append((a_bit, 0.5, 1.5))
+                if "B" in operands:
+                    when.append((b_bit, 0.5, 1.5))
+                rules.append(FFNRule(when, {res: LinearExpr.c(coeff * weight)}))
+    return rules
 
 
 def bitwise_dispatch_rules(L: NibbleLayout, op: int) -> Tuple[dict, List[FFNRule]]:

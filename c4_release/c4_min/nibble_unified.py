@@ -382,32 +382,62 @@ def _opcode_gate_rules(rules: List[FFNRule], op_band: int) -> List[FFNRule]:
     return out
 
 
+def _bitwise_perbit_enabled() -> bool:
+    """Cross-functional-dedup share for OR/XOR/AND: compute the three ops from ONE
+    shared per-nibble bit-plane extraction + a tiny boolean per-bit combine, in
+    place of three independent 256-entry (a,b) lookup tables. Default ON (the
+    result values, and hence the greedy/argmax decode, are bit-identical to the
+    table path); escape hatch ``C4_BITWISE_PERBIT=0`` restores the full tables."""
+    import os
+    return os.environ.get("C4_BITWISE_PERBIT", "1") != "0"
+
+
 def build_bitwise_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
     """Compile the OR/XOR/AND/SHL/SHR dispatch as opcode-gated FFN sub-blocks on
-    the AX/STACK0 nibble bands (the real ``nibble_bitwise`` per-nibble 256-entry
-    tables + power-of-two select, already SwiGLU weights). One shared expand
-    block builds the operand one-hots; each op's select is OP_IS-gated. The
-    shift bit4 fold and shift selects are likewise gated. Returns named specs."""
-    _bw.extend_layout_for_bitwise(L)                  # allocate A_OH/B_OH/SHIFT_*
+    the AX/STACK0 nibble bands. SHL/SHR use the ``nibble_bitwise`` power-of-two
+    select. OR/XOR/AND share ONE per-nibble bit-plane extraction (``bw-bitplanes``)
+    + a boolean per-bit combine (the cross-functional dedup: ``AND=a·b``,
+    ``OR=a+b-a·b``, ``XOR=a+b-2a·b`` on the shared planes), which is bit-identical
+    to — but ~19x smaller than — three separate 256-entry tables. One shared expand
+    block builds the shift one-hots. Each op's select is OP_IS-gated; the shift
+    bit4 fold and shift selects are likewise gated. Returns named specs."""
+    _bw.extend_layout_for_bitwise(L)                  # allocate A_OH/B_OH/SHIFT_*/*_BIT
     L.D = L._off                                      # bands grew; refresh D
+    perbit = _bitwise_perbit_enabled()
     blocks: List[Tuple[str, Dict[str, torch.Tensor]]] = []
-    # ONE expand block: STACK0/AX nibbles + AX nib0/nib1 -> one-hots.
+    # ONE expand block: the shift one-hots (STACK0 nibbles for the shifted source,
+    # AX nib0/nib1 for the count).  When the OR/XOR/AND path uses the FULL TABLES
+    # (escape hatch) the operand one-hots A_OH/B_OH are needed too.
+    exp_src = [L.STACK0 + j for j in range(_bw.N_NIB)] + [L.AX + 0, L.AX + 1]
+    exp_oh = list(L.A_OH) + [L.SHIFT_LO_OH, L.SHIFT_N1_OH]
+    if not perbit:
+        exp_src += [L.AX + j for j in range(_bw.N_NIB)]
+        exp_oh += list(L.B_OH)
     expand = _bw.compile_onehot_expand(
-        src_bands=[L.STACK0 + j for j in range(_bw.N_NIB)]
-                  + [L.AX + j for j in range(_bw.N_NIB)]
-                  + [L.AX + 0, L.AX + 1],
-        oh_bases=list(L.A_OH) + list(L.B_OH) + [L.SHIFT_LO_OH, L.SHIFT_N1_OH],
-        cells=16, one_band=L.ONE, dim=L.D)
+        src_bands=exp_src, oh_bases=exp_oh, cells=16, one_band=L.ONE, dim=L.D)
     blocks.append(("bw-expand", expand))
     # shift bit4 fold (gated by SHL|SHR).
     bit4 = _bw._shift_bit4_rules(L)
     bit4g = (_opcode_gate_rules(bit4, L.OP_IS + isa.SHL)
              + _opcode_gate_rules(bit4, L.OP_IS + isa.SHR))
     blocks.append(("bw-bit4", compile_ffn(bit4g, L.D)))
+    if perbit:
+        # ONE shared, opcode-INDEPENDENT bit-plane extraction: STACK0/AX nibbles ->
+        # A_BIT/B_BIT (4 planes each).  OR, XOR and AND all read these same planes.
+        planes = _bw.compile_bit_extract(
+            src_bands=[L.STACK0 + j for j in range(_bw.N_NIB)]
+                      + [L.AX + j for j in range(_bw.N_NIB)],
+            bit_bases=[L.A_BIT + j * 4 for j in range(_bw.N_NIB)]
+                      + [L.B_BIT + j * 4 for j in range(_bw.N_NIB)],
+            one_band=L.ONE, dim=L.D)
+        blocks.append(("bw-bitplanes", planes))
     # per-op selects, opcode-gated, all merged into ONE select block.
     sel: List[FFNRule] = []
     for op in (isa.OR, isa.XOR, isa.AND):
-        _, s = _bw.bitwise_dispatch_rules(L, op)
+        if perbit:
+            s = _bw.perbit_select_rules(L, op)           # shared per-bit gadget
+        else:
+            _, s = _bw.bitwise_dispatch_rules(L, op)      # full 256-entry table
         sel += _opcode_gate_rules(s, L.OP_IS + op)
     for op in (isa.SHL, isa.SHR):
         _, _b4, s = _bw.shift_dispatch_rules(L, op)
