@@ -203,6 +203,72 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
 
 
 # ===========================================================================
+# SHARED per-block eviction keep-index.  This is the ONE place that decides the
+# spec eviction survivors for a block's ``(K, V, pos)`` cache — used by BOTH the
+# single-program cached driver's ``BlockKVCacheBatched.evict`` AND the GPU-batched
+# corpus runner (``nibble_pure_forward_gpu.run_batch_gpu``), so their eviction
+# policy is provably byte-identical.
+#
+# The CRITICAL detail (the deep-loop memory-recall bug when this is skipped): a
+# CONTENT-ADDRESSED §Memory store head's keys are dominated by a shared ADDR_BIN
+# common-mode bias, so raw cosine similarity between DISTINCT store addresses is
+# ~0.999 and mechanism-1 (near-duplicate merge) would WRONGLY drop distinct stored
+# values — the LI/LC load then recalls nothing (got=0, ZFOD).  We detect such a
+# head by its common-mode fraction ``|mean_key| / mean(|key|)`` (~1 for a
+# content-addressed head, low for a register-marker head whose distinct keys
+# spread in direction) and use the EXACT (relative-L2) dup metric on it, so every
+# distinct store survives.
+# ===========================================================================
+def evict_keep_index(K: torch.Tensor, V: torch.Tensor, pos: torch.Tensor,
+                     slopes: torch.Tensor, scale: float, n_heads: int,
+                     cos_threshold: float, zero_eps: float, recency_eps: float,
+                     protect_positions=None) -> torch.Tensor:
+    """Return the surviving ``keep_idx`` (long tensor of index positions) for one
+    block's cache ``(K [1,H,S,HD], V [1,H,S,HD], pos [S])`` under the spec
+    softmax1+ALiBi eviction policy (UNION across heads, EXACT dup metric on
+    content-addressed §Memory store heads).  ``protect_positions`` (absolute
+    positions) pins those cached rows.  Returns ``None`` when nothing is dropped.
+
+    The keep DECISION (norms / cosines / recency + the per-entry greedy near-dup
+    loop) is device-independent, so it runs on CPU copies and is bit-identical
+    regardless of where the (heavy) attention GEMMs ran.
+    """
+    if K is None:
+        return None
+    S = int(pos.shape[0])
+    K_cpu = K.detach().to("cpu")
+    V_cpu = V.detach().to("cpu")
+    pos_cpu = pos.detach().to("cpu")
+    slopes_cpu = slopes.detach().to("cpu")
+    keep_any = torch.zeros(S, dtype=torch.bool)
+    # a head whose entry VALUES are all zero is an exact softmax1 no-op
+    # (mechanism 2a evicts all its entries — no keep_any contribution); skip it.
+    vnorm = V_cpu[0].norm(dim=-1)                        # [H, S]
+    head_has_value = (vnorm > zero_eps).any(dim=-1)      # [H]
+    # per-head near-dup metric: content-addressed heads get the EXACT metric.
+    knorm_hs = K_cpu[0].norm(dim=-1)                     # [H, S]
+    mean_key = K_cpu[0].mean(dim=1)                      # [H, HD]
+    cm_frac = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
+    for h in range(n_heads):
+        if not bool(head_has_value[h]):
+            continue                                     # mechanism 2a: evict all
+        metric = "exact" if float(cm_frac[h]) > 0.9 else "cosine"
+        mask = prune_keep_mask_head(
+            K_cpu[0, h], V_cpu[0, h], pos_cpu,
+            slope=float(slopes_cpu[h]), scale=scale,
+            cos_threshold=cos_threshold, zero_eps=zero_eps,
+            recency_eps=recency_eps, dup_metric=metric)
+        keep_any |= mask
+    if protect_positions is not None and len(protect_positions) > 0:
+        prot = torch.as_tensor(sorted(protect_positions), dtype=pos_cpu.dtype)
+        keep_any |= torch.isin(pos_cpu, prot)      # pin the data-segment store rows
+    keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
+    if int(keep_idx.numel()) >= S:
+        return None                                 # nothing dropped
+    return keep_idx
+
+
+# ===========================================================================
 # BATCHED per-block KV cache + eviction.  We keep the K/V as batched tensors
 # (fast ``torch.matmul`` attention) and drive the eviction KEEP-mask through the
 # PROVEN ``nibble_kv_prune`` policy (per head), so the eviction that runs on the
@@ -280,46 +346,16 @@ class BlockKVCacheBatched:
         if self.K is None:
             return 0
         S = self.pos.shape[0]
-        # The keep-mask DECISION (norms / cosines / recency comparisons + the
-        # per-entry Python greedy near-dup loop) is device-independent — it is the
-        # exact ``nibble_kv_prune`` policy.  Compute it on CPU copies of K/V/pos so
-        # it is bit-identical regardless of where the (heavy) attention GEMMs ran,
-        # then apply the surviving index to the on-device tensors.  This keeps
-        # eviction correctness identical to the CPU reference while K/V live on GPU.
-        K_cpu = self.K.detach().to("cpu")
-        V_cpu = self.V.detach().to("cpu")
-        pos_cpu = self.pos.detach().to("cpu")
-        slopes_cpu = self.slopes.detach().to("cpu")
-        keep_any = torch.zeros(S, dtype=torch.bool)
-        # batched per-head value norms: a head with all-zero values -> mechanism 2a
-        # drops all its entries (no keep_any contribution). Skip it entirely.
-        vnorm = V_cpu[0].norm(dim=-1)                        # [H, S]
-        head_has_value = (vnorm > zero_eps).any(dim=-1)      # [H]
-        # per-head near-dup metric: a CONTENT-ADDRESSED head (a §Memory store head)
-        # has keys dominated by a shared common-mode bias (the ADDR_BIN `-smag`
-        # term), so raw cosine cannot separate distinct addresses (0.999) and would
-        # wrongly merge distinct stores.  Detect it by the common-mode fraction
-        # |mean_key| / mean(|key|): high (~1) for such heads, low for register-
-        # marker heads whose distinct keys spread in direction.  Use the exact
-        # (relative-L2) dup metric on those heads so every distinct store survives.
-        knorm_hs = K_cpu[0].norm(dim=-1)                     # [H, S]
-        mean_key = K_cpu[0].mean(dim=1)                      # [H, HD]
-        cm_frac = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
-        for h in range(self.n_heads):
-            if not bool(head_has_value[h]):
-                continue                                     # mechanism 2a: evict all
-            metric = "exact" if float(cm_frac[h]) > 0.9 else "cosine"
-            mask = prune_keep_mask_head(
-                K_cpu[0, h], V_cpu[0, h], pos_cpu,
-                slope=float(slopes_cpu[h]), scale=self.scale,
-                cos_threshold=cos_threshold, zero_eps=zero_eps,
-                recency_eps=recency_eps, dup_metric=metric)
-            keep_any |= mask
-        if protect_positions is not None and len(protect_positions) > 0:
-            prot = torch.as_tensor(sorted(protect_positions), dtype=pos_cpu.dtype)
-            keep_any |= torch.isin(pos_cpu, prot)      # pin the data-segment store rows
-        keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
-        dropped = S - int(keep_idx.numel())
+        # The keep DECISION is the SHARED spec policy (``evict_keep_index``) — the
+        # SAME one the GPU-batched corpus runner uses, so eviction is byte-identical
+        # across both drivers (incl. the EXACT dup metric on content-addressed
+        # §Memory store heads, without which distinct stores are wrongly merged and
+        # a deep-loop LI/LC recalls nothing).
+        keep_idx = evict_keep_index(
+            self.K, self.V, self.pos, self.slopes, self.scale, self.n_heads,
+            cos_threshold=cos_threshold, zero_eps=zero_eps,
+            recency_eps=recency_eps, protect_positions=protect_positions)
+        dropped = 0 if keep_idx is None else (S - int(keep_idx.numel()))
         if dropped:
             keep_idx_dev = keep_idx.to(self.K.device)
             self.K = self.K[:, :, keep_idx_dev, :]

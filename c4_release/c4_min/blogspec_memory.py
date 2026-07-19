@@ -120,14 +120,14 @@ from .blogspec_model import Transformer
 #     only has to separate stores to the SAME address, which are ≥ one 30-token
 #     frame apart, so ``slope·30`` decisively favours the newer (latest-write-wins).
 ADDR_BITS = 32           # 4-byte aligned 32-bit addresses (§Memory)
-EFF = 40000.0            # post-scale per-bit match contribution (huge, §410)
+EFF = 500000.0           # post-scale per-bit match contribution (huge, §410)
 BIAS = (ADDR_BITS - 1) * EFF   # constant subtracted from load↔store pairs (ZFOD)
 # Recency slope. Two constraints (§410 decoupling): (a) ``slope·Δ`` must decisively
 # prefer the newer of two same-address stores — the driver spaces store rows one
 # 30-token FRAME apart, so ``slope·30 = 30`` gives an exp(30)≈1e13× preference (far
 # past any byte-decode argmax margin); (b) ``slope·dist`` must never overwhelm an
 # exact match's ``+EFF``, i.e. a far store still reads weight ~1 while
-# ``dist < EFF/slope = 40000`` tokens — the RECALL HORIZON.
+# ``dist < EFF/slope = 500000`` tokens — the RECALL HORIZON.
 #
 # DEEP-LOOP FIX (CHK-1): the horizon must EXCEED the longest store→load recall gap
 # a program produces.  Measured across the deep-loop corpus (gcd, loop_sum, nested,
@@ -135,10 +135,28 @@ BIAS = (ADDR_BITS - 1) * EFF   # constant subtracted from load↔store pairs (ZF
 # thousand; the previous ``EFF=4000 slope=6`` horizon of only 667 tokens sat BELOW
 # the loop_sum (669) / gcd (699) recall gaps, so the newest exact-address store fell
 # just past the horizon (``EFF - slope·dist < 0``) and softmax1's +1 sink won — the
-# load faded to ZFOD 0 (the LI→0 deep-loop divergence).  Raising EFF 10× and
-# dropping the slope 6× lifts the horizon to 40000 tokens (57× the ordinary-loop max
-# gap) while KEEPING the exp(30) latest-write-wins recency, exactly the spec's "sum
-# of scale² large enough ... even with extremely significant positional bias" (§410).
+# load faded to ZFOD 0 (the LI→0 deep-loop divergence).
+#
+# DEEP-RECURSION FIX (CHK-1, 2026-07-18): the FINAL LEV of a deep-recursion program
+# (rec_fib, rec_sum) returns from ``main``'s OUTERMOST call — it recalls the saved
+# BP + return-PC that were stored at the VERY START of the run (frame ~5/6), spanning
+# nearly the whole program.  Measured max store→load recall gap: rec_sum(14) = 8649,
+# rec_fib(9) = 58599, rec_fib(10) = 95319, rec_fib(11) = 154719, rec_fib(12) = 250839
+# tokens (the deepest in the corpus).  The store SURVIVES eviction (the CAM head's
+# mechanism-3 recency horizon is |k|²·scale/slope ≈ 130M tokens, far past any gap),
+# but the ATTENTION READ at recall time gave the single far-back exact-address store
+# a NEGATIVE score (``EFF - slope·dist = 40000 - 250839 < 0``), so softmax1's +1 sink
+# won and the LEV recalled ZFOD 0 — the saved BP/return-PC collapsed (bp=0, pc=0) and
+# the frame desynced.  This is a pure ATTENTION recall-horizon limit, NOT an eviction
+# or truncation bug (proven: raising EFF alone flips fib(9) 34→PASS).  Raising EFF
+# 40000→500000 (slope unchanged at 1.0) lifts the horizon 40000→500000 tokens — 2×
+# the deepest corpus gap (250839) — while KEEPING the exp(30) latest-write-wins
+# recency, exactly the spec's "sum of scale² large enough ... even with extremely
+# significant positional bias" (§410).  NOTE: the horizon is finite, so a recursion
+# deeper than ~500k tokens would still fade — a fundamental property of the
+# stack-in-KV-memory-with-ALiBi design (§410 decouples match from recency but a
+# finite match magnitude can always be out-run by a far enough store); 500000 covers
+# the entire 1096 corpus with margin.
 MEM_ALIBI_SLOPE = 1.0
 
 

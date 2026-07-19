@@ -68,10 +68,16 @@ if _PKG_PARENT not in sys.path:
 
 # small stack base so frame-relative LEA (the frame lives in a small byte window)
 # reaches the frame; MUST be set before importing the driver modules.
+# 0xFC (not 0xF0): the stack grows DOWN from here, so the base must exceed the
+# deepest program's stack depth or SP underflows below 0 — which the LM value-head
+# (``_snap_lane``, argmax over v>=0) CANNOT represent, so a negative SP snaps to 0
+# and the ENT/LEV frame collapses.  rec_sum(14) needs 248 bytes; 0xF0=240 underflows
+# to -8, 0xFC=252 keeps the whole corpus in [4, 252] (measured: 0 underflow, 0 over
+# 255, so every stack address stays 8-bit-addressable for LEA/LI locals).
 import c4_min.nibble_pure_forward as _PF        # noqa: E402
 import c4_min.nibble_pure_forward_complete as _PFC  # noqa: E402
-_PF.SP_INIT = 0xF0
-_PFC.SP_INIT = 0xF0
+_PF.SP_INIT = 0xFC
+_PFC.SP_INIT = 0xFC
 
 from c4_min import isa  # noqa: E402
 from c4_min.nibble_pure_forward_complete import (  # noqa: E402
