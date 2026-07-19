@@ -28,6 +28,22 @@ import time
 
 import torch
 
+# CRITICAL: force CUDA init HERE, before the heavy c4_min imports below.
+# Those imports otherwise poison torch's lazy CUDA init so that a LATER
+# ``.to('cuda:0')`` inside ``main()`` raises "No CUDA GPUs are available"
+# (the retry loop there can never recover a poisoned init). A single
+# ``.to('cuda:0')`` up front — while CUDA is still pristine — pins init True
+# and survives the imports. Only attempt it when the GPU rows were requested.
+_CUDA_PREINIT = False
+if any(a in sys.argv[1:] for a in ("cuda", "gpuonly")):
+    for _ in range(5):
+        try:
+            _ = torch.zeros(1).to("cuda:0")
+            _CUDA_PREINIT = True
+            break
+        except Exception:  # noqa: BLE001 — driver busy: retry a few times
+            time.sleep(2)
+
 # The canonical runner pins SP_INIT=0xF0; mirror it so the reference interpreter
 # and the driver agree on the frame arithmetic.
 import c4_min.nibble_pure_forward as _PF
@@ -154,24 +170,16 @@ def linf_build_paths(models_layouts, srcs):
 
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
-    want_cuda = "cuda" in argv
+    want_cuda = ("cuda" in argv) or ("gpuonly" in argv)
     if want_cuda:
-        # CRITICAL: force CUDA init BEFORE any model build. The build path
-        # (fork/thread interplay) otherwise poisons torch's lazy CUDA init and
-        # `.to('cuda:0')` then raises "No CUDA GPUs are available".
-        # `is_available()` CACHES its first result, so a transient
-        # driver-busy at startup would pin it False — retry a few times.
-        ok = False
-        for _ in range(5):
-            try:
-                _ = torch.zeros(1).to("cuda:0")
-                ok = True
-                break
-            except Exception:  # noqa: BLE001
-                torch.cuda.is_available.cache_clear() if hasattr(
-                    torch.cuda.is_available, "cache_clear") else None
-                time.sleep(2)
-        assert ok, "cuda requested but not init-able (driver busy?)"
+        # CUDA must have been force-inited at MODULE TOP (before the c4_min
+        # imports) — those imports poison lazy init, so a first-touch here
+        # can no longer recover it. ``_CUDA_PREINIT`` records that pin.
+        assert _CUDA_PREINIT, (
+            "cuda requested but not init-able. The module-top force-init "
+            "failed (no GPU / driver busy). Run via "
+            "`python -m c4_min._matrix_toggles cuda` so the CLI arg is seen "
+            "at import time.")
     if "gpuonly" in argv:
         devices = ["cuda:0"]
     elif "cpuonly" in argv:

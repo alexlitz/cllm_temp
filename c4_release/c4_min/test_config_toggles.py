@@ -39,6 +39,20 @@ import os
 import pytest
 import torch
 
+# CRITICAL: force CUDA init HERE, before the heavy c4_min imports below.
+# Under pytest's import machinery those imports otherwise poison torch's lazy
+# CUDA init and ``torch.cuda.is_available()`` then returns False for the rest
+# of the session (so the GPU rows would silently SKIP even with
+# C4_TEST_CUDA=1). A single ``.to('cuda:0')`` up front pins init True and
+# survives the imports. Mirrors ``_matrix_toggles.main``'s force-init.
+_CUDA_OK = False
+if os.environ.get("C4_TEST_CUDA") == "1":
+    try:
+        _ = torch.zeros(1).to("cuda:0")
+        _CUDA_OK = True
+    except Exception:  # noqa: BLE001 — no GPU / driver busy: GPU rows stay skipped
+        _CUDA_OK = False
+
 # Mirror the canonical runner's SP_INIT pin so the reference interpreter and the
 # cached-window driver agree on the frame arithmetic.
 import c4_min.nibble_pure_forward as _PF
@@ -80,7 +94,10 @@ DIVMOD = [("div", "int main(){ return 720 / 6; }", 120),
 
 LEAN_BASE = ALU + MEM + FLOW + FUNC
 _RUN_DIVMOD = os.environ.get("C4_TEST_DIVMOD") == "1"
-_RUN_CUDA = os.environ.get("C4_TEST_CUDA") == "1" and torch.cuda.is_available()
+# Use the force-init result captured at the top of the module — NOT a fresh
+# ``torch.cuda.is_available()`` here, which the c4_min imports above have
+# already poisoned to False under pytest.
+_RUN_CUDA = os.environ.get("C4_TEST_CUDA") == "1" and _CUDA_OK
 
 
 # ---- helpers -------------------------------------------------------------
