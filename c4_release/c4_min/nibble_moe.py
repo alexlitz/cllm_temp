@@ -72,6 +72,7 @@ from typing import Dict, List, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from . import isa
 from .blogspec_model import FFN
@@ -197,12 +198,107 @@ class NibbleStandardMoEFFN(nn.Module):
         return x + output
 
 
+# ===========================================================================
+# TOP-1 hard-routed MoE — compute ONLY the argmax opcode's expert.
+# ===========================================================================
+class NibbleTop1MoEFFN(nn.Module):
+    """Top-1 hard-routed form of :class:`NibbleStandardMoEFFN`.
+
+    The soft MoE above runs ALL ``num_experts`` experts every step and blends by
+    the opcode one-hot, so ~37/38 of the compute multiplies by ~0.  This class
+    computes ONLY the active opcode's expert: it argmaxes the opcode one-hot to
+    the active opcode, ``Gather``s that opcode's expert's (padded) weight slabs,
+    and runs one SwiGLU.  The output is argmax-identical to the soft blend (the
+    inactive experts' ``weight_i=0`` contribution is dropped).
+
+    Vanilla / ONNX: ``ArgMax`` (route) + ``Gather`` (select the expert's weights)
+    + the SwiGLU matmuls.  No Python ``for``/``if`` over experts in ``forward``,
+    no ``.item()``.  Experts are padded to a common hidden width ``Hmax`` (pad
+    rows are all-zero -> contribute 0); an ``op -> expert-slot`` table maps the
+    argmax opcode to its expert slab (opcodes with no expert map to a dead
+    all-zero slab, so a mis-decoded opcode is a safe no-op, matching the soft
+    blend where its weight would be 0).
+
+    Assumes GREEDY decode (the decoded opcode one-hot has one high lane).
+    """
+
+    def __init__(self, experts: List[FFN], expert_opcodes: List[int],
+                 op_start: int, num_ops: int):
+        super().__init__()
+        self.op_start = int(op_start)
+        self.num_ops = int(num_ops)
+        self.num_experts = len(experts)
+        D = experts[0].W_up.shape[1] if experts else 0
+        self.dim = int(D)
+        Hmax = max((e.W_up.shape[0] for e in experts), default=1)
+        self.Hmax = int(Hmax)
+
+        # Stack padded expert weights: [E+1, Hmax, D] (slot E = dead all-zero).
+        E = self.num_experts
+        Wup = torch.zeros(E + 1, Hmax, D)
+        bup = torch.zeros(E + 1, Hmax)
+        Wg = torch.zeros(E + 1, Hmax, D)
+        bg = torch.zeros(E + 1, Hmax)
+        Wd = torch.zeros(E + 1, D, Hmax)
+        bd = torch.zeros(E + 1, D)
+        with torch.no_grad():
+            for i, e in enumerate(experts):
+                h = e.W_up.shape[0]
+                Wup[i, :h] = e.W_up.detach()
+                bup[i, :h] = e.b_up.detach()
+                Wg[i, :h] = e.W_gate.detach()
+                bg[i, :h] = e.b_gate.detach()
+                Wd[i, :, :h] = e.W_down.detach()
+                bd[i] = e.b_down.detach()
+        self.register_buffer("Wup", Wup)
+        self.register_buffer("bup", bup)
+        self.register_buffer("Wg", Wg)
+        self.register_buffer("bg", bg)
+        self.register_buffer("Wd", Wd)
+        self.register_buffer("bd", bd)
+
+        # opcode -> expert slot (default = dead slot E). The routing band is the
+        # opcode one-hot; the argmax opcode indexes this table to its expert.
+        op_to_slot = torch.full((num_ops,), E, dtype=torch.long)
+        for i, op in enumerate(expert_opcodes):
+            op_to_slot[int(op)] = i
+        self.register_buffer("op_to_slot", op_to_slot)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Top-1 routed MoE forward: run ONLY the argmax opcode's expert.
+
+        ``x`` : ``[batch, pos, dim]``.  Returns ``x + (E_sel(x) - x)`` for the
+        selected expert ``E_sel`` (the SwiGLU with additive residual), i.e. the
+        soft blend restricted to the single active expert.  Router reads the
+        opcode one-hot at position 0 (the VM-step residual is one position wide),
+        matching the soft MoE's routing signal.
+        """
+        B, P, D = x.shape
+        opcode_weights = x[:, 0, self.op_start:self.op_start + self.num_ops]
+        active_op = opcode_weights.argmax(dim=-1)            # [B]
+        slot = self.op_to_slot[active_op]                    # [B] expert slot
+
+        # Gather the selected expert's padded weight slabs (per batch element).
+        Wup = self.Wup.index_select(0, slot)                 # [B, Hmax, D]
+        bup = self.bup.index_select(0, slot)                 # [B, Hmax]
+        Wg = self.Wg.index_select(0, slot)                   # [B, Hmax, D]
+        bg = self.bg.index_select(0, slot)                   # [B, Hmax]
+        Wd = self.Wd.index_select(0, slot)                   # [B, D, Hmax]
+        bd = self.bd.index_select(0, slot)                   # [B, D]
+
+        up = torch.einsum("bhd,bpd->bph", Wup, x) + bup.unsqueeze(1)
+        gate = torch.einsum("bhd,bpd->bph", Wg, x) + bg.unsqueeze(1)
+        hidden = F.silu(up) * gate                           # [B, P, Hmax]
+        delta = torch.einsum("bdh,bph->bpd", Wd, hidden) + bd.unsqueeze(1)
+        return x + delta
+
+
 # ---------------------------------------------------------------------------
 # Convenience: build the MoE dispatch straight from the skeleton's layout.
 # ---------------------------------------------------------------------------
 def build_moe_dispatch(L: NibbleVMLayout,
-                       rules: Sequence[FFNRule] | None = None
-                       ) -> NibbleStandardMoEFFN:
+                       rules: Sequence[FFNRule] | None = None,
+                       top1: bool = False):
     """Build the ``StandardMoEFFN`` that REPLACES the skeleton's dense dispatch
     FFN (``compile_ffn(base_dispatch_rules(L))``, the block-5 SwiGLU).
 
@@ -211,16 +307,21 @@ def build_moe_dispatch(L: NibbleVMLayout,
     the same way — the MoE partitions by opcode automatically. The routing band
     is ``L.OP_IS`` (the decoded opcode one-hot), so the MoE reuses the skeleton's
     existing fetch/decode pipeline unchanged.
+
+    ``top1=True`` returns the :class:`NibbleTop1MoEFFN` (hard-routed: only the
+    argmax opcode's expert runs) instead of the soft-blend
+    :class:`NibbleStandardMoEFFN`; the two are argmax-identical.
     """
     if rules is None:
         rules = base_dispatch_rules(L)
     experts, expert_opcodes = experts_from_rules(rules, L, L.D)
-    return NibbleStandardMoEFFN(
-        experts, expert_opcodes, op_start=L.OP_IS, num_ops=isa.NUM_OPS)
+    cls = NibbleTop1MoEFFN if top1 else NibbleStandardMoEFFN
+    return cls(experts, expert_opcodes, op_start=L.OP_IS, num_ops=isa.NUM_OPS)
 
 
 __all__ = [
     "NibbleStandardMoEFFN",
+    "NibbleTop1MoEFFN",
     "experts_from_rules",
     "build_moe_dispatch",
 ]
