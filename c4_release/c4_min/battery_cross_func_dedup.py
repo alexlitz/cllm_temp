@@ -124,5 +124,61 @@ def main():
     return 0 if ok else 1
 
 
+def verify_bitwise_perbit_share() -> int:
+    """Prove the CROSS-FUNCTIONAL bitwise share (OR/XOR/AND -> one shared per-bit
+    gadget) is ARGMAX-EXACT: build the model with the gadget (default) and with the
+    full 256-entry tables (``C4_BITWISE_PERBIT=0``) and assert the two agree on
+    every bitwise op case (bit-identical result values, hence identical greedy
+    decode).  Two builds; no divmod; ~a few GB RSS."""
+    import os
+
+    def _bitwise_cases():
+        out = []
+        for op in ("OR", "XOR", "AND"):
+            for a, b in [(0x0C, 0x03), (0xFF, 0x0F), (0xF0, 0x3C), (0xABCD, 0x1234),
+                         (0xDEADBEEF, 0x0F0F0F0F), (0x55, 0xAA), (0x00, 0x00),
+                         (0xFFFF, 0xFFFF), (0x12345678, 0x87654321),
+                         (0x80000000, 0x00000001), (0xFFFFFFFF, 0xFFFFFFFF)]:
+                out.append((op, a, b))
+        return out
+
+    def _build():
+        return build_compact_sparse_streaming(
+            code_size=48, include_bitwise=True, include_divmod=False,
+            compute_mode="dense_kernel")
+
+    cases = _bitwise_cases()
+    print("\n=== BITWISE per-bit share: argmax-identity gate (gadget vs full tables) ===")
+    prev = os.environ.get("C4_BITWISE_PERBIT")
+    try:
+        os.environ["C4_BITWISE_PERBIT"] = "1"          # the shared per-bit gadget
+        sp_on, L_on, _ = _build()
+        on = {c: _run_case(sp_on, L_on, *c)[0] for c in cases}
+        del sp_on, L_on
+        os.environ["C4_BITWISE_PERBIT"] = "0"          # the full 256-entry tables
+        sp_off, L_off, _ = _build()
+        off = {c: _run_case(sp_off, L_off, *c)[0] for c in cases}
+        del sp_off, L_off
+    finally:
+        if prev is None:
+            os.environ.pop("C4_BITWISE_PERBIT", None)
+        else:
+            os.environ["C4_BITWISE_PERBIT"] = prev
+    diffs = [c for c in cases if on[c] != off[c]]
+    print(f"  {len(cases)} bitwise cases; per-bit-gadget vs table DIFFS: {len(diffs)}")
+    for op, a, b in diffs[:20]:
+        print(f"   DIFF {op} {a:#x} {b:#x}: gadget {on[(op, a, b)]} tbl {off[(op, a, b)]}")
+    share_ok = not diffs
+    print("  " + ("SHARE PASS: OR/XOR/AND per-bit gadget is argmax-identical to the "
+                  "256-entry tables" if share_ok else "SHARE FAIL"))
+    return 0 if share_ok else 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import sys
+    if "--share-only" in sys.argv:
+        # fast gate: only the OR/XOR/AND per-bit share argmax-identity check.
+        raise SystemExit(verify_bitwise_perbit_share())
+    rc = main()
+    rc |= verify_bitwise_perbit_share()
+    raise SystemExit(rc)

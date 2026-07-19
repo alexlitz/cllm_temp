@@ -111,23 +111,30 @@ def measure(sparse, names):
     print("  => byte-identical TIE NOT possible (both blocks run in parallel, feed the")
     print("     mux; different bands/biases).  Physical MERGE = measured potential below.")
 
-    # ---- bitwise tables ----
-    print("\n--- BITWISE: 3 lookup tables vs a shared per-bit gadget ---")
+    # ---- bitwise tables vs the IMPLEMENTED per-bit gadget ----
+    from .nibble_unified import _bitwise_perbit_enabled
+    perbit_on = _bitwise_perbit_enabled()
+    print("\n--- BITWISE: 3 lookup tables vs the SHARED per-bit gadget (IMPLEMENTED) ---")
     per_nib = {}
     for nm, op in (("OR", isa.OR), ("XOR", isa.XOR), ("AND", isa.AND)):
         fn = _BITWISE_FN[op]
         per_nib[nm] = sum(1 for a in range(16) for b in range(16) if fn(a, b) != 0)
     tot_tbl = sum(per_nib.values())
-    print(f"  OR/XOR/AND per-nibble nonzero table entries: "
+    print(f"  OR/XOR/AND per-nibble nonzero TABLE entries: "
           f"OR={per_nib['OR']} XOR={per_nib['XOR']} AND={per_nib['AND']} "
-          f"= {tot_tbl}/nibble x {N_NIB} nibbles = {tot_tbl * N_NIB}")
-    print(f"  (the 3x256 table; nonzero-only = {tot_tbl} entries/nibble)")
-    per_bit_est = 8 + (3 + 2 + 1) * 4    # 8 bit-extract + (OR3/XOR2/AND1)*4 planes
-    print(f"  shared per-bit gadget est: ~{per_bit_est} rules/nibble "
-          f"(4 bit-planes a + 4 bit-planes b extract, shared; then OR/XOR/AND")
-    print(f"     bit-combine 3+2+1 per plane).  vs {tot_tbl}/nibble "
-          f"=> ~{tot_tbl / per_bit_est:.0f}x smaller table.")
-    print("  => NOT byte-identical (entirely different weights).  Measured potential.")
+          f"= {tot_tbl}/nibble x {N_NIB} nibbles = {tot_tbl * N_NIB} select rules")
+    # the applied per-bit gadget: per nibble, one -AX self-cancel + per plane the
+    # boolean combine (AND 1, OR 3, XOR 3 rules) = 1 + 4*(1+3+3) = 29 rules/nibble.
+    perbit_rules_per_nib = 1 + 4 * (1 + 3 + 3)
+    perbit_total = perbit_rules_per_nib * N_NIB
+    print(f"  APPLIED shared per-bit gadget: bit-plane extract (bw-bitplanes, shared "
+          f"across the 3 ops) + a boolean combine")
+    print(f"    AND=a.b  OR=a+b-a.b  XOR=a+b-2a.b  on the shared planes = "
+          f"{perbit_rules_per_nib} rules/nibble x {N_NIB} = {perbit_total} select rules")
+    print(f"  => OR/XOR/AND select {tot_tbl * N_NIB} -> {perbit_total} "
+          f"(~{tot_tbl * N_NIB / max(1, perbit_total):.1f}x smaller); ARGMAX-IDENTICAL "
+          f"to the table (bit-exact per (a,b)).")
+    print(f"  [current build path: {'PER-BIT gadget (default)' if perbit_on else 'FULL TABLES (C4_BITWISE_PERBIT=0)'}]")
 
     # ---- per-hidden-unit byte-identical tie (the finest clean granularity) ----
     print("\n--- FINEST BYTE-IDENTICAL TIE: per-hidden-unit dedup across ALL in-scope "
@@ -170,9 +177,9 @@ def measure(sparse, names):
     ]
     for fam_name, cur, shr, proj, note in rows:
         print(f"{fam_name:38s} {cur:8d} {shr:8d} {proj:10d}  {note}")
-    print(f"{'BITWISE OR/XOR/AND (in bw-select)':38s} "
-          f"{tot_tbl * N_NIB:8d} {0:8d} {per_bit_est * N_NIB:10d}  "
-          f"per-bit gadget (NOT byte-id; measured potential)")
+    print(f"{'BITWISE OR/XOR/AND (bw-select rules)':38s} "
+          f"{tot_tbl * N_NIB:8d} {tot_tbl * N_NIB - perbit_total:8d} {perbit_total:10d}  "
+          f"per-bit gadget APPLIED (argmax-identical; C4_BITWISE_PERBIT)")
 
     return fam_nnz, dupes, total
 
