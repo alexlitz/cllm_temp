@@ -222,8 +222,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     import c4_min.nibble_pure_forward as _PF
     import c4_min.nibble_pure_forward_complete as _PFC
-    _PF.SP_INIT = 0xF0
-    _PFC.SP_INIT = 0xF0
+    # 0xFC (not 0xF0): stack grows DOWN, so the base must exceed the deepest program's
+    # stack depth or SP underflows below 0 — unrepresentable by the LM value-head
+    # (_snap_lane argmaxes v>=0, so a negative SP snaps to 0 and the ENT/LEV frame
+    # collapses).  rec_sum(14) needs 248 bytes; 0xFC=252 keeps the corpus in [4,252]
+    # (measured 0 underflow, 0 over-255).  NOTE: build_compact_pure_forward_model
+    # transitively imports run_1096_pure_forward, which re-pins SP_INIT — so that
+    # module's value (also 0xFC) is the one in force at draft time.
+    _PF.SP_INIT = 0xFC
+    _PFC.SP_INIT = 0xFC
     from c4_min.isa import Instr, LEA, ENT, ADJ
     from c4_min.compact_alloc import build_compact_pure_forward_model
     from c4_min.sparse_forward import SparseTransformer
