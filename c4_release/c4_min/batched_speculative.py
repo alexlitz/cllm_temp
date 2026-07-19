@@ -31,6 +31,7 @@ import torch
 from . import isa
 from . import blogspec_vocab as V
 from .nibble_pure_forward import N_ROLES, _snap_lane
+from .nibble_vm import VALVOCAB
 from .nibble_pure_forward_complete import (
     PureForwardCompleteLayout, _decode_reg_from_nibbles,
 )
@@ -183,6 +184,62 @@ def _decode_and_check(state, L, fr, mask):
     return ok, {"pc": got_pc, "ax": got_ax, "sp": got_sp, "bp": got_bp}
 
 
+# ---------------------------------------------------------------------------
+# VECTORISED batched register decode — the whole batch's query rows' registers
+# decoded in a handful of on-device tensor ops instead of a per-row Python
+# ``_snap_lane`` (which built a 65792-elem arange + argmax PER LANE PER ROW) +
+# ``_decode_reg_from_nibbles`` (a per-byte per-nibble Python loop).
+# ---------------------------------------------------------------------------
+def _snap_nib_batched(x: torch.Tensor) -> torch.Tensor:
+    """argmax_n (2·n·x − n²) over n=0..15, batched over an arbitrary-shape ``x``.
+    Byte-identical to ``_snap_nib`` (same fp32->fp64 formula, same first-max tie).
+    Returns a long tensor of the SAME shape as ``x``."""
+    n = torch.arange(16, dtype=torch.float64, device=x.device)          # [16]
+    xf = x.to(torch.float64).unsqueeze(-1)                              # [...,1]
+    logits = 2.0 * n * xf - n * n                                       # [...,16]
+    return logits.argmax(dim=-1)                                        # [...] long
+
+
+def _snap_lane_batched(x: torch.Tensor) -> torch.Tensor:
+    """``_snap_lane`` batched over ``x`` [R].  The lane values are always within
+    ~2e-4 of an integer (register scalars: PC/SP/BP), so the parabola
+    ``2·v·x − v²`` (peaked at v=x, downward) has its integer argmax at exactly
+    ``round(x)`` — a NARROW 3-candidate argmax {r-1, r, r+1} (same fp64 formula,
+    same first-max tie order) reproduces the full-vocab argmax bit-for-bit while
+    avoiding the 65792-wide arange.  Clamped to [0, VALVOCAB)."""
+    xf = x.to(torch.float64)                                            # [R]
+    r = torch.round(xf).to(torch.long)                                 # nearest int
+    cand = torch.stack([r - 1, r, r + 1], dim=-1)                      # [R,3]
+    cand = cand.clamp(0, VALVOCAB - 1)
+    cf = cand.to(torch.float64)
+    logits = 2.0 * cf * xf.unsqueeze(-1) - cf * cf                     # [R,3]
+    best = logits.argmax(dim=-1)                                        # [R] in {0,1,2}
+    return cand.gather(-1, best.unsqueeze(-1)).squeeze(-1)              # [R] long
+
+
+def decode_states_batched(states: torch.Tensor, L, mask: int):
+    """Decode PC/SP/BP/AX for a batch of query-row states ``[R, D]`` at once.
+
+    Returns ``(pc[R], sp[R], bp[R], ax[R])`` long tensors (on ``states.device``),
+    byte-identical to the per-row ``_snap_lane`` / ``_decode_reg_from_nibbles``.
+    AX is masked with ``mask``.  This moves the whole batch's register decode off
+    the per-row Python critical path (the ~7s ``_snap_lane`` cost in the profile)."""
+    if states.dim() == 1:
+        states = states.unsqueeze(0)
+    pc = _snap_lane_batched(states[:, L.PC_VAL])
+    sp = _snap_lane_batched(states[:, L.SP_VAL])
+    bp = _snap_lane_batched(states[:, L.BP_VAL])
+    # AX: 4 bytes, each = lo_nib + 16*hi_nib, nibbles at AX + 2*bi + {0,1}.
+    nib_idx = torch.arange(8, device=states.device) + L.AX              # [8]
+    nibs = states[:, nib_idx]                                          # [R,8]
+    snapped = _snap_nib_batched(nibs)                                  # [R,8] long
+    weights = torch.tensor([1, 16, 256, 4096, 65536, 16 * 65536,
+                            256 * 65536, 4096 * 65536],
+                           dtype=torch.long, device=states.device)     # [8]
+    ax = (snapped * weights).sum(dim=-1) & mask                        # [R]
+    return pc, sp, bp, ax
+
+
 def _verify_batch(model, L, batch: List[dict], block_steps: int, device: str,
                   evict: bool, prune_interval: int, mask: int, fast: bool,
                   cos_threshold=0.99, zero_eps=1e-9, recency_eps=1e-6):
@@ -298,29 +355,62 @@ def _verify_batch(model, L, batch: List[dict], block_steps: int, device: str,
                 del kv, K_all, V_all, pos_all, pK, pV, pP, pVal
             n_forwards += 1
 
-        # -- per-program decode + accept each of its block's query rows -----------
+        # -- VECTORISED decode of EVERY query row of EVERY program in the batch ----
+        # Gather (i, wi) for all programs' query rows, decode PC/SP/BP/AX in ONE
+        # batched tensor op (byte-identical to the per-row _decode_and_check), then
+        # run the per-program accept scan reading the decoded arrays (no per-row
+        # 65792-wide arange argmax / per-nibble Python).
+        gather_rows = []      # (i_in_batch, wi)
+        row_meta = []         # (span_index, s, is_last)  aligned to gather_rows
+        for si, (ai, span_toks, span_start, q_local, srange) in enumerate(spans):
+            n_steps = batch[ai]["draft"].step_count
+            for s, wi in zip(srange, q_local):
+                gather_rows.append((si, wi))
+                row_meta.append((si, s, s == n_steps - 1))
+        if gather_rows:
+            gi = torch.tensor([g[0] for g in gather_rows], device=dev, dtype=torch.long)
+            gw = torch.tensor([g[1] for g in gather_rows], device=dev, dtype=torch.long)
+            gstates = hidden[gi, gw]                                    # [R, D]
+            d_pc, d_sp, d_bp, d_ax = decode_states_batched(gstates, L, mask)
+            d_pc = d_pc.tolist(); d_sp = d_sp.tolist()
+            d_bp = d_bp.tolist(); d_ax = d_ax.tolist()
+        # per-span accept scan over the decoded arrays (in row_meta order, which is
+        # grouped by span then step — identical accept/first-mismatch order).
+        span_first_bad = {}          # si -> (s, got) first mismatch
+        span_last_ax = {}            # si -> decoded ax at the program's last step
+        span_accepted = {}           # si -> count accepted before any mismatch
+        for r, (si, s, is_last) in enumerate(row_meta):
+            if si in span_first_bad:
+                continue                                    # already failed this span
+            fr = batch[spans[si][0]]["draft"].frames[s]
+            gpc, gsp, gbp, gax = d_pc[r], d_sp[r], d_bp[r], d_ax[r]
+            if fr.get("is_halt"):
+                ok = (gax == (fr["ax"] & mask))
+            else:
+                ok = (gpc == fr["pc"] and gax == (fr["ax"] & mask)
+                      and gsp == (fr["sp"] & 0xFFFFFFFF)
+                      and gbp == (fr["bp"] & 0xFFFFFFFF))
+            if not ok:
+                span_first_bad[si] = (s, {"pc": gpc, "ax": gax, "sp": gsp, "bp": gbp})
+                continue
+            span_accepted[si] = span_accepted.get(si, 0) + 1
+            if is_last:
+                span_last_ax[si] = gax
         for i, (ai, span_toks, span_start, q_local, srange) in enumerate(spans):
             it = batch[ai]
-            draft = it["draft"]
-            n_steps = draft.step_count
-            bad = False
-            for s, wi in zip(srange, q_local):
-                state = hidden[i, wi]
-                ok, got = _decode_and_check(state, L, draft.frames[s], mask)
-                if not ok:
-                    it["_mismatch"] = {"step": s, "got": got,
-                                       "want": {k: draft.frames[s][k]
-                                                for k in ("pc", "ax", "sp", "bp")}}
-                    bad = True
-                    break
-                it["_accepted"] += 1
-                if s == n_steps - 1:
-                    it["_last_ax"] = got["ax"]
-            if bad:
+            it["_accepted"] += span_accepted.get(i, 0)
+            if i in span_last_ax:
+                it["_last_ax"] = span_last_ax[i]
+            if i in span_first_bad:
+                s, got = span_first_bad[i]
+                it["_mismatch"] = {"step": s, "got": got,
+                                   "want": {k: it["draft"].frames[s][k]
+                                            for k in ("pc", "ax", "sp", "bp")}}
                 it["_done"] = True
                 it["_failed"] = True
                 continue
             # commit the frozen (non-query) rows of THIS program's span.
+            n_steps = it["draft"].step_count
             S = len(span_toks)
             q_set = set(q_local)
             keep = [wi for wi in range(S) if wi not in q_set]
@@ -346,15 +436,32 @@ def _verify_batch(model, L, batch: List[dict], block_steps: int, device: str,
                             continue
                         Kb, Vb, posb = pc.K[b], pc.V[b], pc.pos[b]
                         Sb = posb.shape[0]
+                        # FAST GPU-side skip (byte-identical to verify_blocks'
+                        # BlockKVCacheBatched.evict fast path): a head with all-zero
+                        # VALUES is a softmax1 no-op (mechanism 2a evicts every one of
+                        # its entries), so it contributes NOTHING to keep_any.  Detect
+                        # the live-value heads with ONE batched GPU norm; if NO head
+                        # has value, keep_any is all-False -> evict all rows, and we
+                        # skip the (expensive) CPU copy + per-head prune entirely.
+                        # ~92% of blocks are all-zero-value in a deep loop -> ~12x
+                        # fewer CPU roundtrips.
+                        vnorm = Vb[0].norm(dim=-1)                     # [H, Sb] on dev
+                        hv = (vnorm > zero_eps).any(dim=-1)           # [H] on dev
+                        if not bool(hv.any()):
+                            # every head zero-value -> mechanism 2a drops all.
+                            pc.total_evicted += Sb
+                            pc.K[b] = Kb[:, :, :0, :]
+                            pc.V[b] = Vb[:, :, :0, :]
+                            pc.pos[b] = posb[:0]
+                            continue
+                        hv_cpu = hv.cpu()
                         keep_any = torch.zeros(Sb, dtype=torch.bool)
-                        vnorm = Vb[0].norm(dim=-1)
-                        hv = (vnorm > zero_eps).any(dim=-1)
                         Kc = Kb[0].cpu(); Vc = Vb[0].cpu(); Pc = posb.cpu()
                         knorm_hs = Kc.norm(dim=-1)
                         mean_key = Kc.mean(dim=1)
                         cm = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
                         for h in range(H):
-                            if not bool(hv[h]):
+                            if not bool(hv_cpu[h]):
                                 continue
                             metric = "exact" if float(cm[h]) > 0.9 else "cosine"
                             keep_any |= prune_keep_mask_head(
