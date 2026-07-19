@@ -120,7 +120,8 @@ def route_dims_from_ffn(W_up: torch.Tensor, op_is_base: int, num_ops: int,
     return route_dims, route_op
 
 
-def build_op_unit_table(unit_op: torch.Tensor, num_ops: int
+def build_op_unit_table(unit_op: torch.Tensor, num_ops: int,
+                        dead_mask: torch.Tensor | None = None
                         ) -> tuple[torch.Tensor, int, List[int]]:
     """Build the static ``[num_ops, K]`` opcode -> unit-rows gather table.
 
@@ -129,8 +130,11 @@ def build_op_unit_table(unit_op: torch.Tensor, num_ops: int
     index** (``num_units`` — a sentinel row we append below as an all-zero unit)
     so every row is exactly ``K`` wide (a rectangular Gather, ONNX-friendly).
 
-    Any ungated units (``unit_op == -1``) are NOT in this table; the caller runs
-    them unconditionally (they always fire regardless of opcode).
+    A unit that is ALL-ZERO (``dead_mask[u]`` True — e.g. the global-max FFN
+    padding rows in the un-compacted complete model) contributes exactly 0 to the
+    residual regardless of opcode, so it is DROPPED entirely (neither routed nor
+    run-always).  Genuine ungated units (``unit_op == -1`` and not dead) ARE run
+    unconditionally by the caller.
 
     Returns ``(op_units[num_ops, K], K, ungated_unit_indices)``.
     """
@@ -139,6 +143,8 @@ def build_op_unit_table(unit_op: torch.Tensor, num_ops: int
     per_op: List[List[int]] = [[] for _ in range(num_ops)]
     ungated: List[int] = []
     for u in range(num_units):
+        if dead_mask is not None and bool(dead_mask[u]):
+            continue                                     # all-zero padding: drop
         op = int(unit_op[u])
         if op < 0:
             ungated.append(u)
@@ -190,9 +196,15 @@ class Top1RoutedFFN(nn.Module):
         self.num_ops = int(num_ops)
 
         unit_op = unit_opcodes_from_ffn(W_up, self.op_is_base, self.num_ops)
-        table, K, ungated = build_op_unit_table(unit_op, self.num_ops)
+        # All-zero units (global-max FFN padding rows) contribute nothing and are
+        # dropped from routing entirely.
+        dead_mask = ((W_up.abs().sum(dim=1) == 0) &
+                     (W_gate.abs().sum(dim=1) == 0) &
+                     (W_down.abs().sum(dim=0) == 0))
+        table, K, ungated = build_op_unit_table(unit_op, self.num_ops, dead_mask)
         self.K = int(K)
         self.n_units = int(H)
+        self.n_active_units = int((~dead_mask).sum())
         self.n_ungated = len(ungated)
 
         # Genuine opcode-guard dims to route over (NOT the naive OP_IS window,
