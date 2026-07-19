@@ -69,6 +69,20 @@ from .nibble_vm import (
 from .blogspec_model import Transformer, softmax1
 
 
+def _snap_nib(x: float) -> int:
+    """The nibble re-quantiser: ``argmax_n (2*n*x - n^2)`` over n in 0..15 — the
+    same vanilla LM-head argmax the register decode uses (``_snap_lane`` for a full
+    value, this for a single 4-bit nibble), NOT ``torch.round``.  Residue-immune:
+    an argmax over the 16 discrete candidates, so it snaps a nibble dim to its exact
+    integer regardless of any O(1e-5) fp residue."""
+    best, bn = -1e30, 0
+    for n in range(16):
+        s = 2.0 * n * x - n * n
+        if s > best:
+            best, bn = s, n
+    return bn
+
+
 # The registers the ingest reconstructs from the prior frame, in frame order.
 # Each is 4 bytes; STACK0 is carried in the STACK0 slot of the frame (extended
 # frame). The base 30-token frame carries PC/AX/SP/BP; STACK0 is carried in the
@@ -697,8 +711,11 @@ def make_overlay(code: List[isa.Instr], L: PureForwardLayout, store_frames=None)
                 mem_pos = pos + _MEM_MARKER_LOCAL
                 addr = 0
                 for bi, a in enumerate(_MEM_ADDR_LOCAL):
-                    byte = int(round(float(x[0, pos + a, L.CUR_NIB + 0]))) \
-                        + (int(round(float(x[0, pos + a, L.CUR_NIB + 1]))) << 4)
+                    # decode the address byte from its two nibble dims via the
+                    # vanilla LM-head argmax (``_snap_nib``), NOT a python round —
+                    # ONE re-quant mechanism (the argmax) on the whole exec path.
+                    byte = _snap_nib(float(x[0, pos + a, L.CUR_NIB + 0])) \
+                        + (_snap_nib(float(x[0, pos + a, L.CUR_NIB + 1])) << 4)
                     addr |= byte << (8 * bi)
                 x[0, mem_pos, L.IS_STORE] = 1.0
                 x[0, mem_pos, L.IS_FRAME_BYTE] = 0.0     # the store token is not a role byte

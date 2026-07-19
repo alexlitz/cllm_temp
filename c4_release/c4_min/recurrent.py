@@ -26,11 +26,14 @@ Why it stays EXACT over arbitrarily many steps
 The one thing that makes the classic C4 neural VM exact over arbitrary steps is
 that its state round-trips through *tokens* every step — a re-quantisation to
 exact integers that stops fp error from accumulating. We reproduce that here
-directly on the residual: after each step-block forward we **round every VM state
-scalar to the nearest integer** (and the fold already reduced AX mod 256). Since
-every band in this substrate holds an exact non-negative integer between steps
-(register value, PC index, stack cell, one-hot 0/1), rounding is a no-op on the
-true value but *annihilates* the O(1e-6) fp residue the SwiGLU gadgets leave — so
+directly on the residual: after each step-block forward we **re-quantise every VM
+state scalar to its exact integer via the vanilla LM-head argmax** (``argmax_v
+(2*v*x - v^2)`` over the value vocab — the model's OWN emit-token snap, the same
+one ``nibble_vm._snap_lane`` uses; there is NO ``torch.round`` on the exec path),
+and the fold already reduced AX mod 256. Since every band in this substrate holds
+an exact non-negative integer between steps (register value, PC index, stack
+cell, one-hot 0/1), the argmax snap is a no-op on the true value but *annihilates*
+the O(1e-5) fp residue the SwiGLU gadgets leave (residue-immune by construction) — so
 step k+1 sees a byte-exact integer state, and error can never compound. The
 un-requantised depth-unroll drifts after ~O(150) chained blocks; requantised, it
 is exact to whatever step budget you give the driver (demonstrated to 1000s).
@@ -118,14 +121,37 @@ def build_step_model(code: List[isa.Instr], n_heads: int = 4, max_pos: int = 4):
     return model, L, code
 
 
+# The value vocabulary for the LM-head requant.  Every persistent band in this
+# 8-bit control slice holds a small non-negative integer between steps: AX/STACK0
+# are folded mod 256 (<=255), PC is a word index (<= n_code), SP/BP/ALU scratch
+# stay near 0, and the one-hots are 0/1.  ``VALVOCAB`` covers that range with
+# head-room (measured max across add/sub-underflow/branch/deep-loop = 254).  The
+# argmax over this vocab is the SAME vanilla re-quantiser the nibble VM uses
+# (``nibble_vm._snap_lane``): ``argmax_v (2*v*x - v^2) == round(x)`` for x in range.
+VALVOCAB = 512
+
+
 # Bands that hold a persistent integer VM value between steps and must be
 # re-quantised. Scratch bands (PC_IS, AX_ZERO, HALT_SEEN, OUT) are recomputed each
 # step, so requantising them too is harmless — we requantise the WHOLE vector
 # except the constant ONE lane, which keeps error from hiding anywhere.
 def _requantize(state: torch.Tensor, one_band: int) -> torch.Tensor:
-    """Round every band to the nearest integer (annihilating fp residue), then
-    restore the constant ONE lane to exactly 1.0. Idempotent on integer state."""
-    q = torch.round(state)
+    """Re-quantise every band to its exact integer via the VANILLA LM-head argmax
+    (``argmax_v (2*v*x - v^2)`` over the value vocab — the model's own emit-token
+    snap, NOT ``torch.round``), then restore the constant ONE lane to exactly 1.0.
+
+    This is the SAME requantiser the token-emit path uses (``nibble_vm._snap_lane``
+    / ``blogspec_run._decode_byte_from_nibbles``): the value tokens ARE the
+    quantised state.  For a clean integer state the argmax equals the round, but it
+    is residue-IMMUNE by construction (an argmax over discrete candidates), so it
+    annihilates the O(1e-5) SwiGLU fp residue exactly.  Idempotent on integer state.
+    """
+    # LM-head value logits: for each band scalar x, score candidate v by
+    # 2*v*x - v^2; the argmax over v is the emitted (re-quantised) integer.  One
+    # matmul over the whole [D] state vector — the standard batched decode argmax.
+    v = torch.arange(VALVOCAB, dtype=state.dtype, device=state.device)
+    logits = 2.0 * state.unsqueeze(-1) * v - v * v          # [D, VALVOCAB]
+    q = logits.argmax(dim=-1).to(state.dtype)               # [D] emitted tokens
     q[one_band] = 1.0
     return q
 
