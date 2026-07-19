@@ -156,9 +156,10 @@ class KVMemStack:
     out of the attention. Used for the routing-faithfulness proof; behaviourally
     identical to ``DictMemStack`` on the store/load contract."""
 
-    def __init__(self):
+    def __init__(self, positional: str = "alibi", norm: str = "none",
+                 sink: str = "softmax1"):
         from .blogspec_memory import KVMemory
-        self._kv = KVMemory()
+        self._kv = KVMemory(positional=positional, norm=norm, sink=sink)
 
     def store_int(self, addr: int, value: int, nbytes: int = 4) -> None:
         # 4-byte-aligned int store (§Memory). char (1-byte) stores use char=True.
