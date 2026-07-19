@@ -56,17 +56,20 @@ ONNX_IR_VERSION = 10
 # any HuggingFace / LLM KV-cache decode export — no custom domains, no control-flow
 # subgraphs, no external-memory ops.
 VANILLA_OPS = {
-    # projections + attention/FFN matmuls
-    "MatMul", "Gemm",
+    # projections + attention/FFN matmuls (+ SwiGLU einsum in the routed MoE)
+    "MatMul", "Gemm", "Einsum",
     # softmax1 primitives (exp(x-m) / (exp(-m)+sum)) + the SwiGLU gate
     "Exp", "ReduceMax", "ReduceSum", "Div", "Sigmoid", "Mul",
     # residual / bias / ALiBi / scores plumbing + causal-mask compare
     "Add", "Sub", "Neg", "Abs", "Clip", "Where", "Greater", "GreaterOrEqual",
     "Less", "Equal", "Not",
+    # top-1 MoE router: ArgMax the opcode one-hot -> Gather the active expert
+    # (structural-sparsity dispatch; a standard hard-routed MoE, NOT control flow)
+    "ArgMax",
     # token-embedding lookup (Gather) + reshapes/transposes for head split + the
     # KV-cache concat
-    "Gather", "GatherND", "Reshape", "Transpose", "Concat", "Unsqueeze",
-    "Squeeze", "Expand", "Slice", "Identity", "ScatterElements",
+    "Gather", "GatherND", "GatherElements", "Reshape", "Transpose", "Concat",
+    "Unsqueeze", "Squeeze", "Expand", "Slice", "Identity", "ScatterElements",
     # shape / positional math (all data-independent)
     "Trilu", "Range", "ConstantOfShape", "Constant", "Shape", "Cast", "Size",
 }
