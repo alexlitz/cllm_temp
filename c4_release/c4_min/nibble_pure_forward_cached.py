@@ -321,39 +321,51 @@ def evict_keep_index(K: torch.Tensor, V: torch.Tensor, pos: torch.Tensor,
     content-addressed §Memory store heads).  ``protect_positions`` (absolute
     positions) pins those cached rows.  Returns ``None`` when nothing is dropped.
 
-    The keep DECISION (norms / cosines / recency + the per-entry greedy near-dup
-    loop) is device-independent, so it runs on CPU copies and is bit-identical
-    regardless of where the (heavy) attention GEMMs ran.
+    GPU-BOUND: the decision runs ON ``K``'s device — the per-head near-dup
+    supersession (mechanism 1) is a batched ``[H,S,S]`` matmul and the recency /
+    free / dead-head masks are batched boolean ops, so a deep-loop prune keeps the
+    GPU busy instead of copying the whole cache to the CPU for a per-entry Python
+    loop.  The per-head decision is the SAME vectorised ``prune_keep_mask_head``
+    policy (byte-identical to the reference ``KVCache.prune`` — 720-trial gate);
+    only the head SELECTION (which are all-zero-value / content-addressed) is a
+    handful of scalar reductions, so no O(cache) work leaves the device.
     """
     if K is None:
         return None
     S = int(pos.shape[0])
-    K_cpu = K.detach().to("cpu")
-    V_cpu = V.detach().to("cpu")
-    pos_cpu = pos.detach().to("cpu")
-    slopes_cpu = slopes.detach().to("cpu")
-    keep_any = torch.zeros(S, dtype=torch.bool)
+    dev = K.device
+    Kh = K[0]                                           # [H, S, HD]  (on device)
+    Vh = V[0]
+    slopes = slopes.to(dev)
+    keep_any = torch.zeros(S, dtype=torch.bool, device=dev)
     # a head whose entry VALUES are all zero is an exact softmax1 no-op
     # (mechanism 2a evicts all its entries — no keep_any contribution); skip it.
-    vnorm = V_cpu[0].norm(dim=-1)                        # [H, S]
-    head_has_value = (vnorm > zero_eps).any(dim=-1)      # [H]
+    vnorm_hs = Vh.norm(dim=-1)                           # [H, S]
+    head_has_value = (vnorm_hs > zero_eps).any(dim=-1)   # [H]
     # per-head near-dup metric: content-addressed heads get the EXACT metric.
-    knorm_hs = K_cpu[0].norm(dim=-1)                     # [H, S]
-    mean_key = K_cpu[0].mean(dim=1)                      # [H, HD]
+    knorm_hs = Kh.norm(dim=-1)                           # [H, S]
+    mean_key = Kh.mean(dim=1)                            # [H, HD]
     cm_frac = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
+    # Move the H tiny per-head scalar decisions to host in ONE sync (H booleans /
+    # floats), not per-cache-entry, so the loop itself launches only batched GPU
+    # kernels through ``prune_keep_mask_head``.
+    head_has_value_l = head_has_value.tolist()
+    cm_frac_l = cm_frac.tolist()
+    slopes_l = slopes.tolist()
     for h in range(n_heads):
-        if not bool(head_has_value[h]):
+        if not head_has_value_l[h]:
             continue                                     # mechanism 2a: evict all
-        metric = "exact" if float(cm_frac[h]) > 0.9 else "cosine"
+        metric = "exact" if cm_frac_l[h] > 0.9 else "cosine"
         mask = prune_keep_mask_head(
-            K_cpu[0, h], V_cpu[0, h], pos_cpu,
-            slope=float(slopes_cpu[h]), scale=scale,
+            Kh[h], Vh[h], pos,
+            slope=float(slopes_l[h]), scale=scale,
             cos_threshold=cos_threshold, zero_eps=zero_eps,
             recency_eps=recency_eps, dup_metric=metric)
         keep_any |= mask
     if protect_positions is not None and len(protect_positions) > 0:
-        prot = torch.as_tensor(sorted(protect_positions), dtype=pos_cpu.dtype)
-        keep_any |= torch.isin(pos_cpu, prot)      # pin the data-segment store rows
+        prot = torch.as_tensor(sorted(protect_positions),
+                               dtype=pos.dtype, device=dev)
+        keep_any |= torch.isin(pos, prot)          # pin the data-segment store rows
     keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
     if int(keep_idx.numel()) >= S:
         return None                                 # nothing dropped
