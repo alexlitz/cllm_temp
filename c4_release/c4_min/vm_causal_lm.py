@@ -411,6 +411,72 @@ class ToolCallStoppingCriteria(StoppingCriteria):
 
 
 # ===========================================================================
+# The agentic tool-use I/O loop: generate() -> stop on TOOL_CALL -> service -> resume.
+#
+# READ / PRTF are the ONE op class the blogspec does NOT compute neurally (§Tool Use
+# Mode).  ``generate()`` stops (ToolCallStoppingCriteria) when the model reaches one;
+# the driver services it — READ pulls the input line into the memory KV log so a later
+# LC reads it back through the Qwen memory CAM; PRTF reads the format string out of
+# memory and captures the output byte(s) — writes the file-op result frame into the
+# token stream, and RESUMES generate().  The compute stays neural; only this boundary
+# is Python.
+# ===========================================================================
+def run_agentic_generate(model: C4VMForCausalLM,
+                         tool_service, max_new_tokens: int = 8192,
+                         max_tool_calls: int = 4096) -> dict:
+    """Drive the VM to completion as an AGENTIC loop over ``model.generate``.
+
+    ``tool_service(op, reg_state, program)`` services one file op and returns
+    ``(next_reg_state, store_additions, visible_bytes)`` — the register effect
+    (PC += 1, AX := result), any memory stores the op made (READ's buffered bytes),
+    and any user-visible OUTPUT bytes (PRTF).  Returns
+    ``{"tokens": [...], "visible": bytes, "n_forward": int, "n_tool": int}``."""
+    from transformers import StoppingCriteriaList
+    stop = StoppingCriteriaList([HaltStoppingCriteria(),
+                                 ToolCallStoppingCriteria(model)])
+    ids = [V.BOS]
+    visible = bytearray()
+    n_tool = 0
+    while True:
+        model.pending_tool = None
+        out = model.generate(
+            torch.tensor([ids]), do_sample=False, num_beams=1,
+            max_new_tokens=max_new_tokens, stopping_criteria=stop,
+            pad_token_id=V.HALT)
+        ids = out[0].tolist()
+        if model.pending_tool is None:
+            break                               # HALT (program end)
+        tool = model.pending_tool
+        # drop the sentinel HALT the stop-criteria appended to pause generation.
+        while ids and ids[-1] == V.HALT:
+            ids.pop()
+        next_reg, store_add, vis = tool_service(tool["op"], tool["reg"], model.program)
+        for st in store_add:                    # READ's bytes -> persistent KV log
+            a = st["addr"] & 0xFF
+            model.program.store_log = [s for s in model.program.store_log
+                                       if (s["addr"] & 0xFF) != a]
+            model.program.store_log.append({"addr": a, "val": st["val"] & 0xFF})
+        # a PRTF OUTPUT byte is user-visible: expose it OUTSIDE the think block.
+        for byte in vis:
+            ids += [V.THINK_END, byte & 0xFF, V.THINK_START]
+            visible.append(byte & 0xFF)
+        # write the serviced file-op RESULT frame into the stream (state-in-stream):
+        # its decoded PC/AX carry the effect so the replay picks it up with no
+        # re-service.  Clear the frame memo (the store log changed under it).
+        frame = _step_frame_tokens(next_reg["PC"], next_reg["AX"], next_reg["SP"],
+                                   next_reg["BP"], 0, next_reg["STACK0"])
+        ids += frame
+        model._frame_memo.clear()
+        model.pending_tool = None
+        n_tool += 1
+        if n_tool > max_tool_calls:
+            break
+        if next_reg["PC"] < 0 or next_reg["PC"] >= len(model.program.code):
+            break
+    return {"tokens": ids, "visible": bytes(visible), "n_tool": n_tool}
+
+
+# ===========================================================================
 # Factory + decode helpers + the deliverable battery.
 # ===========================================================================
 _VM_CACHE: Dict[Tuple, Q.QwenFullVM] = {}
