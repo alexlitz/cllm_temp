@@ -166,7 +166,9 @@ def nibble_sub_gadget(a: int, b: int, width_nibbles: int = 2) -> int:
     return nibble_add_gadget(a & (M - 1), comp & (M - 1), width_nibbles)
 
 
-def build_step_model(prog, n_heads: int = 4):
+def build_step_model(prog, n_heads: int = 4, positional: str = "alibi",
+                     norm: str = "none", sink: str = "softmax1",
+                     norm_K: float = 1.0e6):
     """Bake the foundation model + layout + assembled code for ``prog``.
 
     Returns ``(model, L, code)``. The model is the softmax1+ALiBi vanilla
@@ -176,19 +178,34 @@ def build_step_model(prog, n_heads: int = 4):
     ALU gadget in ``blogspec_run`` (shared with this module) each step, and the
     model emits the 30-token frame for the resulting state (the ingest head is
     exercised on ``model.forward`` by ``ingest_ax_lowbyte``).
+
+    ``positional`` / ``norm`` / ``sink`` are the ``blogspec_model`` architectural
+    toggles (default = ALiBi / norm-free / softmax1, byte-identical). Under
+    ``norm="rmsnorm"`` the model dim is widened by one head-block and dim ``L.D``
+    is used as the NORM_COMP compensator lane (``norm_K`` on every row, identity
+    gamma) so RMSNorm is an identity on the real dims.
     """
     code = isa.assemble(prog)
     L = NibbleLayout(n_heads=n_heads)
     dim = L.D
+    comp_dim = None
+    if norm == "rmsnorm":
+        # widen by a full head-block so the compensator has its own lane past the
+        # live bands (keeps head_dim an integer + head boundaries aligned).
+        comp_dim = L.D
+        dim = L.D + n_heads
     # one attention block (register ingest) + one FFN block (frame scaffold).
     n_blocks = 2
     hidden = max(8, NIB_PER_REG)
 
     model = Transformer(dim=dim, n_heads=n_heads, hidden=hidden,
                         n_blocks=n_blocks, vocab=V.VOCAB,
-                        max_seq_len=8192)
+                        max_seq_len=8192, positional=positional, norm=norm,
+                        sink=sink)
     with torch.no_grad():
-        model.embed.copy_(build_embedding(L))
+        E = torch.zeros(V.VOCAB, dim)
+        E[:, :L.D] = build_embedding(L)
+        model.embed.copy_(E)
         for blk in model.blocks:
             for p in (blk.attn.W_q, blk.attn.W_k, blk.attn.W_v, blk.attn.W_o):
                 p.zero_()
@@ -199,6 +216,8 @@ def build_step_model(prog, n_heads: int = 4):
         # attending" mechanism). Validated by ``ingest_ax_lowbyte``.
         bake_ax_lowbyte_ingest(model.blocks[0].attn, L)
         _bake_emit_head(model, L)
+    if comp_dim is not None:
+        model.set_norm_compensator(comp_dim, K=norm_K)
     return model, L, code
 
 

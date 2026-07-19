@@ -204,6 +204,13 @@ class MemoryLayout(NibbleLayout):
         self.IS_LOAD = self._scalar("IS_LOAD")
         self.IS_CHAR = self._scalar("IS_CHAR")
 
+        # RMSNorm compensator lane (only carries K when norm="rmsnorm"; stays 0
+        # otherwise, so it is inert for the default norm-free path). A single
+        # large-K lane whose energy dominates ``mean(x^2)`` makes RMSNorm an
+        # identity on the real dims (``blogspec_model.Transformer
+        # .set_norm_compensator`` / ``qwen_embed`` §3).
+        self.NORM_COMP = self._scalar("NORM_COMP")
+
         while self._off % n_heads != 0:
             self._scalar(f"_pad{self._off}")
         self.D = self._off
@@ -305,7 +312,16 @@ def bake_memory_head(attn, L: MemoryLayout, head: int = 0) -> None:
         attn.W_o[L.AX + j, base + j] = 1.0
 
 
-def build_memory_model(n_heads: int = 4):
+NORM_K = 1.0e6     # RMSNorm compensator constant (>> residual & CAM mags; the
+                   # KV head's ±smag CAM score ~n·EFF is huge, so the compensator
+                   # must dominate strongly enough that per-row rms differences
+                   # (VAL_NIB nibble energy varies per store) don't perturb the
+                   # score past the tiny recency tie-break; qwen_embed §3).
+
+
+def build_memory_model(n_heads: int = 4, positional: str = "alibi",
+                       norm: str = "none", sink: str = "softmax1",
+                       norm_K: float = NORM_K):
     """Bake a ``blogspec_model`` transformer with the KV-memory head on block 0.
 
     Returns ``(model, L)``. The remaining heads/blocks are identity; block 0
@@ -313,10 +329,18 @@ def build_memory_model(n_heads: int = 4):
     ONE lane (needed for the ±smag key bias). Store/load positions are set by
     :class:`KVMemory` overlaying the residual bands, then run through
     ``model.forward``.
+
+    ``positional`` / ``norm`` / ``sink`` are the three ``blogspec_model``
+    architectural toggles (default = ALiBi / norm-free / softmax1, byte-identical
+    to the historical head). Under ``norm="rmsnorm"`` a NORM_COMP lane holding
+    ``norm_K`` is baked onto every embedding row and every RMSNorm ``weight`` set
+    to ``norm_K/√dim`` so RMSNorm is an identity on the real dims (the
+    compensator-lane trick).
     """
     L = MemoryLayout(n_heads=n_heads)
     model = Transformer(dim=L.D, n_heads=n_heads, hidden=max(8, NIB_PER_REG),
-                        n_blocks=1, vocab=V.VOCAB, max_seq_len=8192)
+                        n_blocks=1, vocab=V.VOCAB, max_seq_len=8192,
+                        positional=positional, norm=norm, sink=sink)
     with torch.no_grad():
         E = torch.zeros(V.VOCAB, L.D)
         E[:, L.ONE] = 1.0
@@ -325,6 +349,8 @@ def build_memory_model(n_heads: int = 4):
             for p in (blk.attn.W_q, blk.attn.W_k, blk.attn.W_v, blk.attn.W_o):
                 p.zero_()
         bake_memory_head(model.blocks[0].attn, L, head=0)
+    # RMSNorm compensator: identity gamma + K on every row's NORM_COMP lane.
+    model.set_norm_compensator(L.NORM_COMP, K=norm_K)
     return model, L
 
 
@@ -350,9 +376,11 @@ class KVMemory:
     """
 
     def __init__(self, model=None, L: Optional[MemoryLayout] = None,
-                 n_heads: int = 4):
+                 n_heads: int = 4, positional: str = "alibi",
+                 norm: str = "none", sink: str = "softmax1"):
         if model is None:
-            model, L = build_memory_model(n_heads=n_heads)
+            model, L = build_memory_model(n_heads=n_heads, positional=positional,
+                                          norm=norm, sink=sink)
         self.model = model
         self.L = L
         # Each entry is a (token_id, residual_overlay) pair. The residual overlay
