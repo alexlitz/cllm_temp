@@ -105,22 +105,43 @@ def cluster_of(description: str) -> str:
 
 
 def build_model(device: str, compute_mode: str, include_divmod: bool,
-                include_bitwise: bool, code_size: int, verbose: bool = True):
+                include_bitwise: bool, code_size: int, verbose: bool = True,
+                load_sparse: Optional[str] = None,
+                materialize_dense: bool = False):
     t = time.monotonic()
-    if verbose:
-        print(f"[stacked:{device}] building sparse model "
-              f"(divmod={include_divmod} bitwise={include_bitwise} "
-              f"compute={compute_mode}) ...", file=sys.stderr, flush=True)
-    if include_divmod:
-        base, L, _cs = build_compact_pure_forward_model(
-            code_size=code_size, include_bitwise=include_bitwise, include_divmod=True)
+    if load_sparse:
+        from c4_min.compact_alloc import load_sparse_transformer
+        if verbose:
+            print(f"[stacked:{device}] reloading sparse model from {load_sparse} ...",
+                  file=sys.stderr, flush=True)
+        sparse, L = load_sparse_transformer(load_sparse, compute_mode=compute_mode)
+        st = sparse.stats()
+        sparse = sparse.to(device)
     else:
-        base, L = build_pure_forward_complete_model(
-            code_size=code_size, include_bitwise=include_bitwise, include_divmod=False)
-    sparse = SparseTransformer(base, compute_mode=compute_mode)
-    st = sparse.stats()
-    del base
-    sparse = sparse.to(device)
+        if verbose:
+            print(f"[stacked:{device}] building sparse model "
+                  f"(divmod={include_divmod} bitwise={include_bitwise} "
+                  f"compute={compute_mode}) ...", file=sys.stderr, flush=True)
+        if include_divmod:
+            base, L, _cs = build_compact_pure_forward_model(
+                code_size=code_size, include_bitwise=include_bitwise,
+                include_divmod=True)
+        else:
+            base, L = build_pure_forward_complete_model(
+                code_size=code_size, include_bitwise=include_bitwise,
+                include_divmod=False)
+        sparse = SparseTransformer(base, compute_mode=compute_mode)
+        st = sparse.stats()
+        del base
+        sparse = sparse.to(device)
+    if materialize_dense:
+        # densify every CSR weight ONCE onto the device so the per-forward
+        # ``csr.to_dense()`` (the 300-block divmod verify's driver-bound cost) is
+        # paid once, not per forward.  Bit-identical to dense_kernel.
+        if verbose:
+            print(f"[stacked:{device}] materializing dense weights on {device} ...",
+                  file=sys.stderr, flush=True)
+        sparse.materialize_dense(device)
     if device.startswith("cuda"):
         torch.cuda.synchronize(torch.device(device))
         vram = torch.cuda.memory_allocated(torch.device(device)) / 1e6
@@ -182,6 +203,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     choices=["dense_kernel", "sparse_mm"])
     ap.add_argument("--no-divmod", action="store_true")
     ap.add_argument("--no-bitwise", action="store_true", default=True)
+    ap.add_argument("--load-sparse", type=str, default=None,
+                    help="reload a saved streamed sparse model (save_sparse_transformer "
+                         "artifact) instead of building — no rebuild, no divmod peak.")
+    ap.add_argument("--materialize-dense", action="store_true",
+                    help="densify every CSR weight ONCE onto the device (bit-identical "
+                         "to dense_kernel) so the per-forward csr.to_dense() cost — the "
+                         "300-block divmod verify's driver-bound cost — is paid once.")
     ap.add_argument("--code-size", type=int, default=64)
     ap.add_argument("--block-steps", type=int, default=64)
     ap.add_argument("--max-steps", type=int, default=300000)
@@ -221,7 +249,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     include_divmod = not args.no_divmod
     include_bitwise = not args.no_bitwise
     sparse, L, st, build_dt, vram = build_model(
-        device, args.compute_mode, include_divmod, include_bitwise, args.code_size)
+        device, args.compute_mode, include_divmod, include_bitwise, args.code_size,
+        load_sparse=args.load_sparse, materialize_dense=args.materialize_dense)
 
     prepared = prepare(indexed)
     print(f"[stacked:{device}] running {len(prepared)} programs | "

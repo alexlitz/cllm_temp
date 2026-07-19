@@ -135,35 +135,45 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
     vnorm = vals.norm(dim=-1)                                   # [S]
 
     # -- mechanism 1: greedy newest-first near-duplicate drop -----------------
+    # VECTORISED near-dup matrix (byte-identical to the per-entry loop, proven in
+    # ``test_vectorized_prune_matches_reference``): the greedy decision "does this
+    # candidate near-duplicate an ALREADY-KEPT NEWER entry?" only needs the boolean
+    # ``dup[i, j]`` = "entry i near-duplicates entry j".  We build that whole [S, S]
+    # matrix with ONE matmul / broadcast (GPU-friendly) instead of an O(S) tensor op
+    # per greedy step (the ~200k tiny ``.norm()`` calls that dominated eviction), then
+    # run the SAME greedy newest-first scan reading precomputed booleans — same result,
+    # no per-iteration tensor ops.
     order = torch.argsort(positions, descending=True)          # newest first
     kept_mask = torch.zeros(S, dtype=torch.bool)               # index-space mask
-    kept_idx: List[int] = []
     if dup_metric == "exact":
         # relative-L2: |k_e - k| <= (1-cos_threshold)*max(|k_e|,|k|).  Merges only
         # verbatim-identical keys, so distinct content addresses all survive.
         tol = 1.0 - cos_threshold
-        for oi in order.tolist():
-            if kept_idx:
-                diff = (keys[kept_idx] - keys[oi]).norm(dim=-1)
-                denom = torch.maximum(
-                    knorm[kept_idx],
-                    knorm[oi].expand_as(knorm[kept_idx])).clamp(min=1e-30)
-                if bool((diff <= tol * denom).any()):
-                    continue
-            kept_idx.append(oi)
+        # diff[i,j] = |k_i - k_j|; denom[i,j] = max(|k_i|,|k_j|).clamp(1e-30).
+        diff = torch.cdist(keys.unsqueeze(0), keys.unsqueeze(0)).squeeze(0)  # [S,S]
+        denom = torch.maximum(knorm.unsqueeze(1),
+                              knorm.unsqueeze(0)).clamp(min=1e-30)
+        dup = diff <= tol * denom                              # [S,S] near-dup bool
     else:
         # raw cosine (zero-key rows -> unit 0 -> sim 0, matching cosine_sim).
         safe = knorm.clamp(min=1e-30)
         unit = keys / safe.unsqueeze(-1)
         unit[knorm == 0] = 0.0
-        for oi in order.tolist():
-            if kept_idx:
-                sims = unit[kept_idx] @ unit[oi]               # [n_kept]
-                if float(sims.max()) > cos_threshold:
-                    continue
-            kept_idx.append(oi)
-    for oi in kept_idx:
-        kept_mask[oi] = True
+        sims = unit @ unit.t()                                 # [S,S] cosine
+        dup = sims > cos_threshold                             # strict > (as loop)
+    # greedy newest-first: keep an entry unless it near-duplicates an already-kept
+    # (newer) entry.  Reads the precomputed ``dup`` matrix (one vectorised numpy
+    # ``&`` + ``.any()`` per step, no per-entry tensor op).  A diagonal entry
+    # dup[i,i] is always True (self-similar) but never consulted (a candidate is
+    # only tested against ALREADY-kept entries, never itself).
+    import numpy as _np
+    dup_np = dup.cpu().numpy()
+    kept_bool = _np.zeros(S, dtype=bool)
+    for oi in order.tolist():
+        if bool((dup_np[oi] & kept_bool).any()):
+            continue
+        kept_bool[oi] = True
+    kept_mask = torch.from_numpy(kept_bool.copy())
 
     survivors = kept_mask.clone()
 
@@ -188,17 +198,22 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
             survivors[:] = False
 
     # -- mechanism 2b: free-zero (value==0 AND key==0) + recency-stale ---------
+    # VECTORISED (byte-identical to the per-entry loop): a surviving free-zero entry
+    # (value==0 AND key==0) is dropped iff slope<=0 OR its ALiBi-recency weight
+    # exp(-slope*(newest_all - pos)) < recency_eps.  Computed over all survivors at
+    # once instead of a Python per-entry scan.
     if survivors.any():
         surv_idx = torch.nonzero(survivors, as_tuple=False).flatten()
         newest_all = int(positions[surv_idx].max())
-        free_zero = (vnorm <= zero_eps) & (knorm <= zero_eps)
-        for i in surv_idx.tolist():
-            if not bool(free_zero[i]):
-                continue
-            if slope is None or slope <= 0.0:
-                survivors[i] = False
-            elif math.exp(-slope * (newest_all - int(positions[i]))) < recency_eps:
-                survivors[i] = False
+        free_zero = (vnorm <= zero_eps) & (knorm <= zero_eps)      # [S]
+        fz_surv = free_zero[surv_idx]                              # [n_surv]
+        if slope is None or slope <= 0.0:
+            drop2 = fz_surv
+        else:
+            recw = torch.exp(-slope * (newest_all
+                                       - positions[surv_idx].to(torch.float64)))
+            drop2 = fz_surv & (recw < recency_eps)
+        survivors[surv_idx[drop2]] = False
     return survivors
 
 
