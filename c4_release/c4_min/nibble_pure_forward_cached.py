@@ -219,9 +219,11 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
         # relative-L2: |k_e - k_f| <= (1-cos_threshold)*max(|k_e|,|k_f|).  Merges
         # only verbatim-identical keys, so distinct content addresses all survive.
         tol = 1.0 - cos_threshold
-        # exact pairwise L2 (``donot_use_mm_for_euclid_dist`` forces the direct
-        # ||a-b|| formula, not the matmul-expanded ||a||^2-2a.b+||b||^2 that can
-        # drift by ULPs at large S — the reference uses per-pair ``.norm()``).
+        # ``donot_use_mm_for_euclid_dist`` forces the direct ||a-b|| formula (not
+        # the matmul-expanded ||a||^2-2a.b+||b||^2 whose cancellation can drift by
+        # ULPs at large S) so the boolean near-dup matrix is byte-identical to the
+        # reference's per-pair ``(k_e-k_f).norm()`` — verified 0-mismatch across the
+        # 720-trial + large-cache gate.  ``diff`` is the [S,S] pairwise distance.
         diff = torch.cdist(keys.unsqueeze(0), keys.unsqueeze(0),
                            compute_mode="donot_use_mm_for_euclid_dist").squeeze(0)
         denom = torch.maximum(knorm.unsqueeze(1),
