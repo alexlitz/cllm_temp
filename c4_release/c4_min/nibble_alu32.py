@@ -236,7 +236,7 @@ def _truncate(spec, u, dim):
 class ALU32Bands:
     """Allocate the scratch bands the 32-bit ALU blocks use (attaches onto L)."""
 
-    def __init__(self, L):
+    def __init__(self, L, recurrent_divmod: bool = False):
         self.A = L._band("ALU_A", 4)          # operand-A bytes (STACK0 = popped)
         self.B = L._band("ALU_B", 4)          # operand-B bytes (AX = accumulator)
         self.NOTB = L._band("ALU_NOTB", 4)    # ~B bytes (for SUB two's complement)
@@ -269,13 +269,26 @@ class ALU32Bands:
         self.DIV_RES = L._band("ALU_DIV_RES", 8)   # quotient nibbles (result)
         self.MOD_RES = L._band("ALU_MOD_RES", 8)   # remainder nibbles (result)
         self.BZ = L._scalar("ALU_BZ")          # divisor == 0 predicate
+        # RECURRENT DIV/MOD scratch (only allocated when the recurrent path is
+        # active, so the unrolled build's dim is byte-identically unchanged): the
+        # digit-index counter IT (0..7, threaded across the 8 reused iteration
+        # applications like PC/AX) and its 8-lane one-hot IT_OH (used by the
+        # index-independent shift-gather and qcopy-scatter).
+        self.recurrent_divmod = recurrent_divmod
+        if recurrent_divmod:
+            self.IT = L._scalar("ALU_IT")          # current iteration index 0..7
+            self.IT_OH = L._band("ALU_IT_OH", 8)   # one-hot(IT)
 
 
-def extend_layout_for_alu32(L):
-    """Allocate ALU-32 scratch bands on ``L`` and refresh ``L.D`` (pad to heads)."""
+def extend_layout_for_alu32(L, recurrent_divmod: bool = False):
+    """Allocate ALU-32 scratch bands on ``L`` and refresh ``L.D`` (pad to heads).
+
+    ``recurrent_divmod`` adds the digit-index counter band the reused
+    division-iteration block reads/threads; OFF (default) is byte-identical to
+    the historical unrolled build (same dim, same weights)."""
     if getattr(L, "ALU32", None) is not None:
         return L.ALU32
-    L.ALU32 = ALU32Bands(L)
+    L.ALU32 = ALU32Bands(L, recurrent_divmod=recurrent_divmod)
     while L._off % L.n_heads != 0:
         L._scalar(f"_alupad{L._off}")
     L.D = L._off
@@ -662,6 +675,163 @@ def _div_finalize_block(L, dim) -> Dict[str, torch.Tensor]:
         # the quotient from the iteration blocks -> it IS in the block input).
         u = _guard(spec, u, [gz], {a.DIV_RES + c: -1.0}, 0.0, a.DIV_RES + c, 1.0)  # - BZ*DIV_RES
     return _truncate(spec, u, dim)
+
+
+# ===========================================================================
+# RECURRENT DIV/MOD (the refactor): ONE division-iteration block-body, REUSED
+# 8 times by the block-application loop, carrying the running remainder R, the
+# quotient nibbles DIV_RES, and the digit-index counter IT through the residual
+# across the reused applications — exactly as the VM step is itself recurrent
+# (one step-block re-applied per token, threading PC/AX/SP).  The unrolled
+# `_div_shift_block(div_nib_idx)` / `_div_qcopy_block(q_out_idx)` baked the
+# iteration index into the WEIGHTS (so the 8 iterations were 8 DISTINCT blocks);
+# here the index lives in the DATA (the IT counter) and the shift-gather /
+# qcopy-scatter select the dividend/quotient nibble via one-hot(IT), so every
+# iteration application is byte-identical weights.
+# ===========================================================================
+def _div_it_oh_units(spec, u, a, it_const=0.0):
+    """Recompute IT_OH[j] = [(IT+it_const) == j] = [form>=j] - [form>=j+1] for
+    j=0..7 (SET each), where ``form = IT + it_const`` reads the BLOCK INPUT IT.
+
+    ``it_const`` lets the increment block compute IT_OH from IT+1 in the SAME
+    block (every FFN unit reads the block input, so IT_OH must be formed from the
+    pre-increment IT plus the literal +1, not from the post-increment IT which is
+    only a residual delta this block writes)."""
+    for j in range(8):
+        u = _clear(spec, u, a.IT_OH + j)
+        u = _step_ge(spec, u, {a.IT: 1.0}, it_const, j, a.IT_OH + j, 1.0)       # +[form>=j]
+        u = _step_ge(spec, u, {a.IT: 1.0}, it_const, j + 1, a.IT_OH + j, -1.0)  # -[form>=j+1]
+    return u
+
+
+def _div_it_init_block(L, dim) -> Dict[str, torch.Tensor]:
+    """Zero R, zero the quotient result, set the digit counter IT = 0, and prime
+    IT_OH = one-hot(0).  The recurrent counterpart of ``_div_init_block``."""
+    a = L.ALU32
+    RN = a.RN
+    # units: R clears (RN) + DIV_RES clears (8) + IT clear (1) + IT_OH (8*5).
+    spec = _empty_spec(dim, RN + 8 + 1 + 8 * 5)
+    u = 0
+    for c in range(RN):
+        u = _clear(spec, u, a.R + c)
+    for c in range(8):
+        u = _clear(spec, u, a.DIV_RES + c)
+    u = _clear(spec, u, a.IT)                          # IT = 0
+    u = _div_it_oh_units(spec, u, a)                   # IT_OH = one-hot(0)
+    return _truncate(spec, u, dim)
+
+
+def _div_shift_block_rec(L, dim) -> Dict[str, torch.Tensor]:
+    """Index-INDEPENDENT nibble shift: R[c] <- R[c-1] (c>=1); R[0] <- the dividend
+    nibble selected by the counter, ``sum_j IT_OH[j] * STACK0[7-j]`` (iteration
+    ``it`` folds STACK0 nibble ``7-it``, MSB first).  Reads the block INPUT (R and
+    IT_OH), so the same weights fire for every iteration.  (SET R.)"""
+    a = L.ALU32
+    RN = a.RN
+    # units: (RN-1) high-nibble shifts (2 each) + R[0] clear (1) + 8 gather guards.
+    spec = _empty_spec(dim, (RN - 1) * 2 + 1 + 8)
+    u = 0
+    # shift the high nibbles first is irrelevant (all read block input): SET each.
+    for c in range(RN - 1, 0, -1):
+        u = _clear(spec, u, a.R + c)
+        u = _ident(spec, u, {a.R + c - 1: 1.0}, 0.0, a.R + c, 1.0)
+    u = _clear(spec, u, a.R + 0)
+    for j in range(8):                                 # R[0] = sum_j IT_OH[j]*STACK0[7-j]
+        u = _guard(spec, u, [(a.IT_OH + j, 1.0, 0.0)],
+                   {L.STACK0 + (7 - j): 1.0}, 0.0, a.R + 0, 1.0)
+    return _truncate(spec, u, dim)
+
+
+def _div_qcopy_block_rec(L, dim) -> Dict[str, torch.Tensor]:
+    """Index-INDEPENDENT quotient store: DIV_RES[7-j] += IT_OH[j]*QD (iteration
+    ``it`` writes quotient nibble ``7-it``, MSB first).  SET the selected slot by
+    first clearing it gated on IT_OH[j], then adding QD gated on IT_OH[j]."""
+    a = L.ALU32
+    spec = _empty_spec(dim, 8 * 2)
+    u = 0
+    for j in range(8):
+        slot = a.DIV_RES + (7 - j)
+        g = (a.IT_OH + j, 1.0, 0.0)
+        u = _guard(spec, u, [g], {slot: -1.0}, 0.0, slot, 1.0)     # clear slot gated
+        u = _guard(spec, u, [g], {a.QD: 1.0}, 0.0, slot, 1.0)      # + QD gated
+    return _truncate(spec, u, dim)
+
+
+def _div_r2r_incr_block(L, dim) -> Dict[str, torch.Tensor]:
+    """Copy R2 -> R for the next iteration, INCREMENT the digit counter IT += 1, and
+    recompute IT_OH = one-hot(IT).  This is the recurrent step's state-thread: the
+    reused iteration body's tail that advances the counter (like PC += 1)."""
+    a = L.ALU32
+    RN = a.RN
+    # units: R copy (RN*2) + IT increment (1) + IT_OH (8*5).
+    spec = _empty_spec(dim, RN * 2 + 1 + 8 * 5)
+    u = 0
+    for c in range(RN):
+        u = _clear(spec, u, a.R + c)
+        u = _ident(spec, u, {a.R2 + c: 1.0}, 0.0, a.R + c, 1.0)
+    u = _ident(spec, u, {L.ONE: 1.0}, 0.0, a.IT, 1.0)      # IT += 1
+    u = _div_it_oh_units(spec, u, a, it_const=1.0)         # IT_OH = one-hot(IT+1)
+    return _truncate(spec, u, dim)
+
+
+def _divmod_iteration_body(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+    """The ONE reusable long-division iteration body (index-independent).  Order
+    matches one unrolled iteration: shift, gteq, qdigit, qcopy, qb, qb-carry x N,
+    sub-nibble x RN, r2->r + IT++.  Returned as a named block list; the caller
+    reuses the SAME specs for all 8 iterations (weight-shared recurrence)."""
+    a = L.ALU32
+    RN = a.RN
+    body: List[Tuple[str, Dict[str, torch.Tensor]]] = [
+        ("alu-div-shift", _div_shift_block_rec(L, dim)),
+        ("alu-div-gteq", _div_gteq_block(L, dim)),
+        ("alu-div-qd", _div_qdigit_block(L, dim)),
+        ("alu-div-qcopy", _div_qcopy_block_rec(L, dim)),
+        ("alu-div-qb", _div_qb_block(L, dim)),
+    ]
+    for r in range(_QB_CARRY_ROUNDS):
+        body.append((f"alu-div-qbc-{r}", _carry_round_block(L, dim, a.QB, a.QB, RN)))
+    for c in range(RN):
+        body.append((f"alu-div-sub-{c}", _div_sub_nibble_block(L, dim, c)))
+    body.append(("alu-div-r2r", _div_r2r_incr_block(L, dim)))
+    return body
+
+
+def compile_divmod_blocks_recurrent(L, dim, n_iters: int = 8):
+    """RECURRENT base-16 long division: KB-precompute + init, then the SINGLE
+    iteration body REUSED ``n_iters`` times, then finalize.
+
+    Returns ``(unique_blocks, apply_names)``:
+      * ``unique_blocks`` — the DISTINCT block specs to materialise (KB, init, the
+        ONE iteration body, finalize).  This is what the model stores.
+      * ``apply_names``   — the full application order (the body names repeat
+        ``n_iters`` times); the block-application loop applies each named block,
+        reusing the shared body weights ``n_iters`` times.  This threads R / IT /
+        DIV_RES through the residual across the reused applications, exactly like
+        the VM step threads PC/AX/SP through the emitted frame.
+
+    fp/semantics are IDENTICAL to :func:`compile_divmod_blocks` — the same gteq /
+    qdigit / qb / carry / sub gadgets, only the iteration index moved from the
+    weights (8 distinct shift/qcopy blocks) into the IT counter (one shared body).
+    """
+    global _ONE
+    _ONE = L.ONE
+    assert getattr(L.ALU32, "recurrent_divmod", False), \
+        "compile_divmod_blocks_recurrent needs extend_layout_for_alu32(recurrent_divmod=True)"
+    prefix = _kb_precompute_blocks(L, dim)                 # KB[k]=k*b, BZ
+    prefix.append(("alu-div-init", _div_it_init_block(L, dim)))
+    body = _divmod_iteration_body(L, dim)                  # the ONE reused body
+    finalize = [("alu-div-finalize", _div_finalize_block(L, dim))]
+
+    unique = prefix + body + finalize                     # DISTINCT specs to store
+    prefix_names = [n for n, _ in prefix]
+    body_names = [n for n, _ in body]
+    # application order: prefix (once) | body x n_iters | finalize (once).  The
+    # body names REPEAT so the loop reuses the shared iteration weights n_iters x.
+    apply_names = list(prefix_names)
+    for _ in range(n_iters):
+        apply_names += body_names
+    apply_names.append("alu-div-finalize")
+    return unique, apply_names
 
 
 def compile_divmod_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:

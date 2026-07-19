@@ -610,7 +610,8 @@ def _fold_ax_gated(L, dim: int, ops) -> Dict[str, torch.Tensor]:
 # ===========================================================================
 def build_pure_forward_complete_model(code_size: int = 32,
                                       include_bitwise: bool = True,
-                                      include_divmod: bool = True):
+                                      include_divmod: bool = True,
+                                      recurrent_divmod: bool = False):
     """Assemble the complete pure-forward VM: frame ingest + LI/LC KV head +
     stack-pop KV head + the 32-bit ALU FFN blocks + callconv, all as persistent
     weights applied by ``model.forward``.  Returns ``(model, L)``.
@@ -620,10 +621,21 @@ def build_pure_forward_complete_model(code_size: int = 32,
     able flags).  Set False for a LEAN model (36 blocks, ~10x faster forward) that
     keeps the multi-slot stack + callconv + ADD/SUB/MUL + cmp/bitwise/memory; only
     DIV/MOD are then unsupported (their RES band stays unfilled).  The corpus
-    values are <=9999 so the 8-bit-masked byte trace needs no 32-bit division."""
+    values are <=9999 so the 8-bit-masked byte trace needs no 32-bit division.
+
+    ``recurrent_divmod`` (default False) folds DIV/MOD as a RECURRENT step: the
+    8 long-division iterations are unrolled into ONE reused iteration BODY (21
+    blocks) instead of 168 distinct blocks, and the block-application loop applies
+    that body 8 times (threading the running remainder R + digit-index counter IT
+    through the residual across the reused applications — exactly as the VM step
+    itself is recurrent, threading PC/AX/SP).  ``L._apply_order`` then indexes the
+    physical blocks in the FULL application sequence (the body indices repeat);
+    the physical block count (what the model STORES) drops 262 -> 115 for divmod,
+    while the forward applies the same 262-long sequence.  Byte-identical DIV/MOD
+    results to the unrolled build (gadget gate: 24/24)."""
     n_heads = N_ROLES + 3          # 20 ingest + LI head + stack-pop head + lev head
     L = PureForwardCompleteLayout(code_size, n_heads=n_heads)
-    A.extend_layout_for_alu32(L)               # ALU scratch bands
+    A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
     if include_bitwise:
         from . import nibble_bitwise as _bw
         _bw.extend_layout_for_bitwise(L)
@@ -665,9 +677,28 @@ def build_pure_forward_complete_model(code_size: int = 32,
         block_specs.append((name, spec))
     for name, spec in A.compile_mul_blocks(L, dim):
         block_specs.append((name, spec))
-    if include_divmod:                             # 262 blocks — LEAN skips these
-        for name, spec in A.compile_divmod_blocks(L, dim):
+    # ``divmod_apply_order`` records the physical-block indices to apply for the
+    # DIV/MOD span, in application order.  For the unrolled path it is just the
+    # divmod blocks' own indices (identity); for the recurrent path the reused
+    # iteration-body block indices REPEAT 8x, so the model STORES 115 blocks but
+    # APPLIES 262 — the recurrence.  The final full ``L._apply_order`` is assembled
+    # after all blocks are appended (below).
+    divmod_apply_order: List[int] = []
+    divmod_start = len(block_specs)                 # first physical divmod block idx
+    if include_divmod and recurrent_divmod:
+        unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim)
+        # place the UNIQUE blocks physically, remember each name's physical index,
+        # then map the (repeating) apply_names to those indices.
+        name_to_idx: Dict[str, int] = {}
+        for name, spec in unique:
+            name_to_idx[name] = len(block_specs)
             block_specs.append((name, spec))
+        divmod_apply_order = [name_to_idx[n] for n in apply_names]
+    elif include_divmod:                           # 262 blocks — LEAN skips these
+        for name, spec in A.compile_divmod_blocks(L, dim):
+            divmod_apply_order.append(len(block_specs))
+            block_specs.append((name, spec))
+    divmod_end = len(block_specs)                   # one past the last physical divmod block
     mux_ops = ALU_OPS if include_divmod else [isa.ADD, isa.SUB, isa.MUL]
     block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=mux_ops)))
     if include_bitwise:
@@ -709,6 +740,17 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("imm-ax-nib", compile_imm_ax_nibbles(L, dim)),
     ]
     n_blocks = len(block_specs)
+    # ---- application order (recurrence) ----------------------------------
+    # The model STORES ``n_blocks`` distinct blocks but APPLIES them in
+    # ``L._apply_order``: identity everywhere except the DIV/MOD span, where the
+    # recurrent path repeats the reused iteration-body indices.  A None means "no
+    # remapping" (the driver falls back to range(n_blocks)) so non-divmod and
+    # unrolled builds are byte-identical to before.
+    if include_divmod and recurrent_divmod:
+        L._apply_order = (list(range(divmod_start)) + divmod_apply_order +
+                          list(range(divmod_end, n_blocks)))
+    else:
+        L._apply_order = None
     hidden = max(f["W_up"].shape[0] for _, f in block_specs)
     model = Transformer(dim=dim, n_heads=n_heads, hidden=hidden,
                         n_blocks=n_blocks, vocab=V.VOCAB, max_seq_len=16384)
@@ -725,6 +767,15 @@ def build_pure_forward_complete_model(code_size: int = 32,
         _bake_stack_pop_head(model.blocks[stk_block].attn, L, head=N_ROLES + 1)
         _bake_lev_ret_head(model.blocks[stk_block].attn, L, head=N_ROLES + 2)
     L._block_names = [n for n, _ in block_specs]
+    # RECURRENCE: re-point ``model.blocks`` through the application order so the
+    # forward applies the reused divmod iteration body N times (the stored blocks
+    # are the DISTINCT set; ``model.blocks`` now holds repeated references — shared
+    # nn.Module weights, identical math).  ``_phys_blocks`` keeps the distinct set.
+    if L._apply_order is not None:
+        import torch.nn as _nn
+        phys = list(model.blocks)
+        model._phys_blocks = phys
+        model.blocks = _nn.ModuleList([phys[i] for i in L._apply_order])
     return model, L
 
 
