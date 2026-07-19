@@ -423,14 +423,16 @@ class ToolCallStoppingCriteria(StoppingCriteria):
 # ===========================================================================
 def run_agentic_generate(model: C4VMForCausalLM,
                          tool_service, max_new_tokens: int = 8192,
-                         max_tool_calls: int = 4096) -> dict:
+                         max_tool_calls: int = 4096, streamer=None) -> dict:
     """Drive the VM to completion as an AGENTIC loop over ``model.generate``.
 
     ``tool_service(op, reg_state, program)`` services one file op and returns
     ``(next_reg_state, store_additions, visible_bytes)`` — the register effect
     (PC += 1, AX := result), any memory stores the op made (READ's buffered bytes),
-    and any user-visible OUTPUT bytes (PRTF).  Returns
-    ``{"tokens": [...], "visible": bytes, "n_forward": int, "n_tool": int}``."""
+    and any user-visible OUTPUT bytes (PRTF).  ``streamer`` (optional) is a genuine
+    ``transformers.TextIteratorStreamer`` attached to each ``generate`` segment so
+    the whole agentic turn streams live.  Returns
+    ``{"tokens": [...], "visible": bytes, "n_tool": int}``."""
     from transformers import StoppingCriteriaList
     stop = StoppingCriteriaList([HaltStoppingCriteria(),
                                  ToolCallStoppingCriteria(model)])
@@ -439,10 +441,13 @@ def run_agentic_generate(model: C4VMForCausalLM,
     n_tool = 0
     while True:
         model.pending_tool = None
-        out = model.generate(
-            torch.tensor([ids]), do_sample=False, num_beams=1,
+        gen_kwargs = dict(
+            input_ids=torch.tensor([ids]), do_sample=False, num_beams=1,
             max_new_tokens=max_new_tokens, stopping_criteria=stop,
             pad_token_id=V.HALT)
+        if streamer is not None:
+            gen_kwargs["streamer"] = streamer
+        out = model.generate(**gen_kwargs)
         ids = out[0].tolist()
         if model.pending_tool is None:
             break                               # HALT (program end)

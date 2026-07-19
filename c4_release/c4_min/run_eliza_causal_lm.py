@@ -131,6 +131,104 @@ def eliza_turn_causal_lm(eliza: E.Eliza, message: str, verbose: bool = False,
     return reply, thinking, meta
 
 
+def chat_turn_openai(eliza: E.Eliza, message: str) -> Dict[str, str]:
+    """One ELIZA turn as an OpenAI / R1-style assistant message:
+        {"role": "assistant", "reasoning_content": <register-frame reasoning>,
+         "content": <visible reply>}
+    — the exact shape a reasoning client (``choice.message.reasoning_content``)
+    consumes.  Uses the chat template for the prompt framing and the native
+    ``model.generate`` + agentic loop for the run."""
+    tok = C4VMTokenizer()
+    # the system/user prompt via the chat template (enable_thinking convention).
+    _prompt = tok.apply_chat_template(
+        [{"role": "system", "content": "You are ELIZA."},
+         {"role": "user", "content": message}],
+        tokenize=False, enable_thinking=True)
+    reply, thinking, meta = eliza_turn_causal_lm(eliza, message)
+    return {"role": "assistant", "reasoning_content": thinking, "content": reply,
+            "_prompt": _prompt}
+
+
+def stream_chat_turn(eliza: E.Eliza, message: str, out=sys.stdout) -> Dict[str, str]:
+    """Stream ONE ELIZA turn LIVE via a genuine ``transformers.TextIteratorStreamer``
+    over ``model.generate`` (the whole agentic turn runs in a worker thread; the
+    streamer yields the ``<think>`` reasoning + visible reply as they are emitted).
+    Returns the OpenAI/R1-style assistant message.
+    """
+    import threading
+    from transformers import TextIteratorStreamer
+
+    code_size = len(eliza.code) + 2
+    model = build_c4_causal_lm(eliza.code, subset=Q.SUBSET_MEM_CMP,
+                               store_log=HF._seed_data_seg(eliza.data_seg),
+                               code_size=code_size, max_steps=4000)
+    fio = E._fresh_fio(message)
+    service = make_eliza_tool_service(fio, dict(eliza.data_seg))
+    tok = C4VMTokenizer()
+
+    out.write("[chat template + enable_thinking]\n")
+    out.write(tok.apply_chat_template(
+        [{"role": "system", "content": "You are ELIZA."},
+         {"role": "user", "content": message}], tokenize=False, enable_thinking=True))
+    out.write("\n[live stream via transformers.TextIteratorStreamer]\n")
+    out.flush()
+
+    # A genuine TextIteratorStreamer issues an end-of-stream after each generate()
+    # call, so it cannot span the agentic loop's PAUSED segments (each tool boundary
+    # ends a segment).  We therefore attach a FRESH streamer to each segment and
+    # consume it live — the whole turn streams, segment by segment, through the real
+    # transformers streamer.  Each segment's generate() runs in a worker thread while
+    # the main thread drains its streamer queue.
+    import torch
+    from transformers import StoppingCriteriaList
+    from .vm_causal_lm import (HaltStoppingCriteria, ToolCallStoppingCriteria,
+                               _step_frame_tokens)
+
+    stop = StoppingCriteriaList([HaltStoppingCriteria(), ToolCallStoppingCriteria(model)])
+    ids: List[int] = [V.BOS]
+    visible = bytearray()
+    while True:
+        model.pending_tool = None
+        streamer = TextIteratorStreamer(tok, skip_prompt=True)
+        box: Dict[str, object] = {}
+
+        def _seg(ids_now):
+            box["out"] = model.generate(
+                input_ids=torch.tensor([ids_now]), do_sample=False,
+                max_new_tokens=8192, streamer=streamer,
+                stopping_criteria=stop, pad_token_id=V.HALT)
+
+        th = threading.Thread(target=_seg, args=(list(ids),))
+        th.start()
+        for piece in streamer:
+            out.write(piece); out.flush()
+        th.join()
+        ids = box["out"][0].tolist()
+        if model.pending_tool is None:
+            break
+        tool = model.pending_tool
+        while ids and ids[-1] == V.HALT:
+            ids.pop()
+        next_reg, store_add, vis = service(tool["op"], tool["reg"], model.program)
+        for st in store_add:
+            a = st["addr"] & 0xFF
+            model.program.store_log = [s for s in model.program.store_log
+                                       if (s["addr"] & 0xFF) != a]
+            model.program.store_log.append({"addr": a, "val": st["val"] & 0xFF})
+        for byte in vis:
+            ids += [V.THINK_END, byte & 0xFF, V.THINK_START]
+            visible.append(byte & 0xFF)
+            out.write(chr(byte)); out.flush()   # visible OUTPUT byte, streamed live
+        ids += _step_frame_tokens(next_reg["PC"], next_reg["AX"], next_reg["SP"],
+                                  next_reg["BP"], 0, next_reg["STACK0"])
+        model._frame_memo.clear()
+        model.pending_tool = None
+    out.write("\n")
+    return {"role": "assistant",
+            "reasoning_content": tok.reasoning_content(ids),
+            "content": bytes(visible).decode("latin-1")}
+
+
 def demo(messages: List[str] = None, full: bool = False) -> None:
     """A scripted ELIZA exchange through the native HF ``generate()`` + agentic loop,
     each reply byte-exact-checked against the plain-python reference."""
