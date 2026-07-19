@@ -56,7 +56,7 @@ sub-block is best kept dense; the rest of the stack keeps ``sparse_mm``.
 """
 from __future__ import annotations
 
-from typing import List
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -84,6 +84,40 @@ def unit_opcodes_from_ffn(W_up: torch.Tensor, op_is_base: int, num_ops: int,
     unit_op = torch.where(has_guard, unit_op,
                           torch.full_like(unit_op, -1))
     return unit_op
+
+
+def route_dims_from_ffn(W_up: torch.Tensor, op_is_base: int, num_ops: int,
+                        guard_thresh: float = 1e-3
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Recover the EXACT residual dims to route over + the opcode each keys.
+
+    The naive ``x[..., OP_IS:OP_IS+num_ops]`` slice is WRONG on the *compact*
+    (dim-shared) model: the compaction packs other, unrelated bands (``BP_LOW``,
+    ``AXB_LO``, ...) into that dim window, and one of them can carry a value
+    (e.g. 240) that beats the true opcode one-hot (~1) in an argmax.  Those alias
+    bands are simply *never live at the same block* as ``OP_IS`` — the dispatch
+    FFN itself only ever reads the genuine opcode-guard dims — so we route over
+    exactly the dims the FFN's ``W_up`` guards use.
+
+    Returns ``(route_dims[R], route_op[R])``: ``route_dims`` = the sorted set of
+    genuine opcode-guard dims (one per opcode that owns >=1 unit), and
+    ``route_op[i]`` = the opcode index (``0..num_ops-1``) that ``route_dims[i]``
+    keys.  The router argmaxes ``x[..., route_dims]`` and maps the winning index
+    through ``route_op`` to the active opcode.
+    """
+    unit_op = unit_opcodes_from_ffn(W_up, op_is_base, num_ops, guard_thresh)
+    dim_to_op: Dict[int, int] = {}
+    H = W_up.shape[0]
+    for u in range(H):
+        op = int(unit_op[u])
+        if op < 0:
+            continue
+        d = op_is_base + op                       # the guard column = OP_IS + op
+        dim_to_op[d] = op
+    dims = sorted(dim_to_op)
+    route_dims = torch.tensor(dims, dtype=torch.long)
+    route_op = torch.tensor([dim_to_op[d] for d in dims], dtype=torch.long)
+    return route_dims, route_op
 
 
 def build_op_unit_table(unit_op: torch.Tensor, num_ops: int
@@ -161,6 +195,12 @@ class Top1RoutedFFN(nn.Module):
         self.n_units = int(H)
         self.n_ungated = len(ungated)
 
+        # Genuine opcode-guard dims to route over (NOT the naive OP_IS window,
+        # which the compact/dim-shared layout pollutes with alias bands).
+        route_dims, route_op = route_dims_from_ffn(
+            W_up, self.op_is_base, self.num_ops)
+        self.n_route = int(route_dims.numel())
+
         # Append ONE all-zero "dead" unit at index H so padded gather slots
         # contribute exactly 0 (silu(0)*0 = 0, down col all-zero).
         Wup_pad = torch.cat([W_up, torch.zeros(1, D)], dim=0)         # [H+1, D]
@@ -178,6 +218,8 @@ class Top1RoutedFFN(nn.Module):
         self.register_buffer("W_down", Wd_pad)
         self.register_buffer("b_down", b_down)
         self.register_buffer("op_units", table)          # [num_ops, K] long
+        self.register_buffer("route_dims", route_dims)   # [R] residual dims to argmax
+        self.register_buffer("route_op", route_op)       # [R] opcode of each route dim
         # Ungated (always-run) unit indices, if any. Kept as a buffer so they
         # gather statically at trace time (empty tensor if none).
         self.register_buffer(
@@ -190,12 +232,17 @@ class Top1RoutedFFN(nn.Module):
 
         ``x`` : ``[batch, pos, dim]``.  Returns ``x + down(silu(up)·gate)`` with
         the down-projection restricted to the routed units.  Pure tensor ops:
-        ArgMax (route) + Gather (select rows/cols) + the SwiGLU matmuls.
+        Gather (route dims) + ArgMax (route) + Gather (select rows/cols) + the
+        SwiGLU matmuls.
         """
         B, P, D = x.shape
-        # -- Router: argmax the OP_IS one-hot per (batch,pos) row. --------------
-        opis = x[..., self.op_is_base:self.op_is_base + self.num_ops]  # [B,P,num_ops]
-        active_op = opis.argmax(dim=-1)                              # [B,P] long
+        # -- Router: argmax the opcode one-hot over the GENUINE guard dims. -----
+        # (index_select the route dims, argmax, map winner -> opcode.  This is
+        # robust to the compact layout's dim-sharing: the alias bands packed into
+        # the OP_IS window are NOT in ``route_dims``.)
+        opis = x.index_select(-1, self.route_dims)                   # [B,P,R]
+        win = opis.argmax(dim=-1)                                    # [B,P] -> route idx
+        active_op = self.route_op[win]                               # [B,P] -> opcode
 
         # -- Gather the active opcode's unit indices (+ ungated). --------------
         sel = self.op_units[active_op]                               # [B,P,K]
