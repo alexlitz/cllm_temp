@@ -79,19 +79,17 @@ def _run_config(include_bitwise, include_divmod, econ):
                 continue
             n_checked += 1
             assert w.csr is None and w.dense is None, "sibling kept private storage"
-            # reconstruct base[row][:,col] and compare to the ref twin's weight
+            # reconstruct base[row][:,col] from the SPARSE perms and check it is a
+            # real table (the byte-identity vs the un-tied twin is asserted above).
             bd = _dense_of(base)
-            ri = getattr(w, "_crossop_row", None)
-            ci = getattr(w, "_crossop_col", None)
+            rp = getattr(w, "_crossop_row", None)
+            cp = getattr(w, "_crossop_col", None)
             W = bd
-            if ri is not None:
-                W = W[ri.to(torch.long)]
-            if ci is not None:
-                W = W[:, ci.to(torch.long)]
-            # find the same slot in ref
-            # (siblings share shape+content with base; just check reconstruction
-            #  is a real integer table with no fractional drift)
-            assert torch.equal(W, W.round()) or True  # values are as-stored
+            if rp is not None:
+                W = W[rp.full()]
+            if cp is not None:
+                W = W[:, cp.full()]
+            assert W.shape == (w.out_dim, w.in_dim)
     assert n_checked == st.tensors_tied
     return st
 

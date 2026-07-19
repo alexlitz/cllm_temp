@@ -41,11 +41,15 @@ The tie is priced honestly two ways:
 * **unique nonzero SCALAR weights** — a permutation reuses the base's scalars, so
   every sibling's nnz scalars become duplicates: unique-scalar count drops by the
   full summed sibling nnz.  This is the primary "unique weight count" metric.
-* **stored BYTES** — a sibling now stores an integer perm index instead of its CSR
-  value+col arrays.  This is a win only when the index is smaller than the saved
-  arrays; the pass is ECONOMICALLY GATED to only tie a group when it reduces both
-  the unique-scalar count AND the stored bytes (``econ=True``, the default), or —
-  with ``econ=False`` — whenever it reduces unique scalars (bytes may be a wash).
+* **stored BYTES** — a sibling stores only a SPARSE integer permutation instead of
+  its CSR value+col arrays.  The full axis perm is ~99% identity (it mostly
+  permutes all-zero base rows/cols among themselves), so it is stored as identity
+  + a handful of ``(pos -> tgt)`` int16 overrides (:class:`SparsePerm`), which is
+  tiny (e.g. the 16x divmod ``kb`` core needs 270 overrides, not 16*1633 index
+  entries).  The pass is ECONOMICALLY GATED to only tie a group when it reduces
+  both the unique-scalar count AND the stored bytes (``econ=True``, the default),
+  or — with ``econ=False`` — whenever it reduces unique scalars.  With the sparse
+  perm the two modes essentially coincide (the index is near-free).
 
 ALMOST-shareable but NOT tied (reported, never tied): tensors that match a
 representative's value multiset + row/col degree sequences but for which NO exact
@@ -191,15 +195,6 @@ def _perm_dtype(n: int) -> torch.dtype:
     return torch.int32
 
 
-def _perm_bytes(row_idx, col_idx, out_dim, in_dim) -> int:
-    b = 0
-    if row_idx is not None:
-        b += row_idx.numel() * (2 if out_dim <= (1 << 15) else 4)
-    if col_idx is not None:
-        b += col_idx.numel() * (2 if in_dim <= (1 << 15) else 4)
-    return b
-
-
 def _sparse_weight_storage_bytes(w) -> int:
     return int(w.storage_bytes())
 
@@ -254,15 +249,67 @@ def find_crossop_groups(sparse, L=None) -> List[CrossOpGroup]:
 # ---------------------------------------------------------------------------
 # The tie (in place).
 # ---------------------------------------------------------------------------
-def _make_permuted_linear(base_w, row_idx, col_idx):
+@dataclass
+class SparsePerm:
+    """A permutation index stored SPARSELY as identity + explicit overrides.
+
+    A permutation ``idx`` of length ``n`` reconstructs a tensor axis as
+    ``base[idx]``.  The c4_min weights are ~99% zero rows/cols, so ``idx`` is
+    almost entirely permuting all-zero base rows/cols among themselves — those
+    positions can be CANONICALISED to identity (a zero-source landing on a
+    zero-identity-target produces the same zero line either way), leaving only a
+    handful of positions that truly differ.  We store just those override pairs
+    ``(pos -> tgt)`` (int16) + the length; the full ``idx`` is materialised as
+    ``arange(n)`` with the overrides written in.  The reconstruction is verified
+    ``torch.equal`` to the original weight at tie time, so it is byte-EXACT.
+    """
+    n: int
+    pos: torch.Tensor        # int16/int32 override positions
+    tgt: torch.Tensor        # int16/int32 override targets
+
+    def full(self) -> torch.Tensor:
+        idx = torch.arange(self.n, dtype=torch.long)
+        if self.pos.numel():
+            idx[self.pos.to(torch.long)] = self.tgt.to(torch.long)
+        return idx
+
+    def bytes(self) -> int:
+        w = 2 if self.n <= (1 << 15) else 4
+        return int(self.pos.numel()) * w + int(self.tgt.numel()) * w + 4
+
+
+def _compact_perm(idx: torch.Tensor, base_axis_nonzero: torch.Tensor
+                  ) -> SparsePerm:
+    """Compact a full axis permutation into a :class:`SparsePerm`.
+
+    ``base_axis_nonzero[k]`` is True iff base row/col ``k`` has any nonzero.  A
+    position ``j`` whose source ``idx[j]`` is an all-zero base line AND whose
+    identity target ``j`` is also all-zero can be reset to identity without
+    changing the reconstructed weight (both produce a zero line).  Every other
+    position that differs from identity is stored as an override."""
+    n = idx.numel()
+    it = idx.to(torch.long)
+    ar = torch.arange(n)
+    src_zero = ~base_axis_nonzero[it]
+    tgt_zero = ~base_axis_nonzero[ar]
+    canon_id = src_zero & tgt_zero          # safe to force identity
+    keep = (it != ar) & (~canon_id)         # must store these
+    pos = ar[keep]
+    tgt = it[keep]
+    dt = _perm_dtype(n)
+    return SparsePerm(n=n, pos=pos.to(dt), tgt=tgt.to(dt))
+
+
+def _make_permuted_linear(base_w, row_perm: "SparsePerm | None",
+                          col_perm: "SparsePerm | None"):
     """Return a ``linear`` closure that reconstructs the exact dense weight from
-    ``base_w`` + integer perms and calls the unchanged ``F.linear``.
+    ``base_w`` + sparse perms and calls the unchanged ``F.linear``.
 
     Byte-identical: the reconstructed tensor equals the sibling's original weight
     (proven at tie time), so the GEMM and accumulation order are the same the
     stored-dense model used in ``dense_kernel`` mode -> L-inf = 0."""
-    ri = None if row_idx is None else row_idx.to(torch.long)
-    ci = None if col_idx is None else col_idx.to(torch.long)
+    ri = None if row_perm is None else row_perm.full()
+    ci = None if col_perm is None else col_perm.full()
 
     def linear(self, x: torch.Tensor) -> torch.Tensor:
         # base dense (resident if materialized, else CSR->dense / dense).
@@ -305,13 +352,13 @@ class CrossOpStats:
             "=== cross-op structural dedup (permutation sharing) ===",
             f"  groups tied        : {self.groups_tied}",
             f"  sibling tensors tied: {self.tensors_tied} "
-            f"(each -> base ref + int perm)",
+            f"(each -> base ref + SPARSE int perm)",
             f"  unique NONZERO scalars: {self.scalars_before} -> {self.scalars_after} "
             f"(saved {self.scalars_saved}, "
             f"{100 * self.scalars_saved / max(1, self.scalars_before):.1f}%)",
             f"  weight stored bytes  : {bb/1e6:.3f} MB -> {ba/1e6:.3f} MB "
             f"(saved {(bb-ba)/1e6:.3f} MB; incl {self.perm_index_bytes/1e6:.3f} MB "
-            f"of int perm indices)",
+            f"of sparse int perm indices)",
             f"  ALMOST-shareable (multiset match, NO exact perm) NOT tied: "
             f"{self.almost_count}",
         ]
@@ -348,31 +395,31 @@ def crossop_dedup(sparse, L=None, econ: bool = True) -> CrossOpStats:
     groups = find_crossop_groups(sparse, L)
 
     # decide + apply per group
-    kept_scalars = 0
-    kept_bytes = 0
-    counted_bases = set()
     for g in groups:
-        # base representative storage
         rep_bi, rep_kind = g.rep
-        rep_w = sparse.blocks[rep_bi].ffn.__dict__.get(rep_kind) \
-            if rep_kind.startswith("W_") and hasattr(sparse.blocks[rep_bi].ffn,
-                                                     rep_kind) \
-            else None
         rep_w = _resolve_slot(sparse, rep_bi, rep_kind)
-        rep_store_bytes = _sparse_weight_storage_bytes(rep_w)
         rep_nnz = int(rep_w.nnz)
+        rep_dense = _dense_of(rep_w)
+        base_col_nz = (rep_dense != 0).any(0)
+        base_row_nz = (rep_dense != 0).any(1)
 
-        # price the tie for this group
+        # build the COMPACT (sparse) perms for every member + price the tie
         sib_scalars = sum(m["nnz"] for m in g.members)
         sib_bytes = sum(_sparse_weight_storage_bytes(m["w"]) for m in g.members)
-        idx_bytes = sum(_perm_bytes(m["row"], m["col"],
-                                    rep_w.out_dim, rep_w.in_dim)
-                        for m in g.members)
+        idx_bytes = 0
+        for m in g.members:
+            rp = (None if m["row"] is None
+                  else _compact_perm(m["row"], base_row_nz))
+            cp = (None if m["col"] is None
+                  else _compact_perm(m["col"], base_col_nz))
+            m["rowp"], m["colp"] = rp, cp
+            idx_bytes += (0 if rp is None else rp.bytes()) \
+                + (0 if cp is None else cp.bytes())
         scalar_win = sib_scalars > 0
         byte_win = sib_bytes > idx_bytes
         do_tie = g.members and scalar_win and (byte_win or not econ)
 
-        # record almost-shareable for the group
+        # record almost-shareable for the group (reported, never tied)
         for a in g.almost:
             stats.almost_count += 1
             stats.almost_detail.append(
@@ -383,33 +430,29 @@ def crossop_dedup(sparse, L=None, econ: bool = True) -> CrossOpStats:
             continue
 
         stats.groups_tied += 1
-        gnames = {_resolve_name(L, rep_bi): rep_kind}
         for m in g.members:
             sib = m["w"]
-            # verify exact reconstruction ONCE (acceptance gate) then swap linear
-            base = _dense_of(rep_w)
-            W = base
-            if m["row"] is not None:
-                W = W[m["row"].to(torch.long)]
-            if m["col"] is not None:
-                W = W[:, m["col"].to(torch.long)]
+            rp, cp = m["rowp"], m["colp"]
+            # verify EXACT reconstruction from the compact perms (acceptance gate)
+            W = rep_dense
+            if rp is not None:
+                W = W[rp.full()]
+            if cp is not None:
+                W = W[:, cp.full()]
             assert torch.equal(W, _dense_of(sib)), \
                 f"perm reconstruction mismatch {m['name']}:{m['kind']}"
             # drop private storage, install reconstruction closure
-            row_i = None if m["row"] is None else m["row"].to(_perm_dtype(rep_w.out_dim))
-            col_i = None if m["col"] is None else m["col"].to(_perm_dtype(rep_w.in_dim))
             sib.csr = None
             sib.dense = None
             sib.dense_resident = None
             sib._crossop_base = rep_w
-            sib._crossop_row = row_i
-            sib._crossop_col = col_i
+            sib._crossop_row = rp
+            sib._crossop_col = cp
             sib.linear = types.MethodType(
-                _make_permuted_linear(rep_w, row_i, col_i), sib)
+                _make_permuted_linear(rep_w, rp, cp), sib)
             stats.tensors_tied += 1
-            stats.perm_index_bytes += _perm_bytes(row_i, col_i,
-                                                  rep_w.out_dim, rep_w.in_dim)
-            gnames.setdefault(m["name"], m["kind"])
+            stats.perm_index_bytes += (0 if rp is None else rp.bytes()) \
+                + (0 if cp is None else cp.bytes())
         stats.group_detail.append(
             f"x{len(g.members)+1} {rep_kind} shape={g.shape} nnz={rep_nnz} "
             f"base={_resolve_name(L, rep_bi)} "
@@ -449,10 +492,11 @@ def _post_accounting(sparse) -> Tuple[int, int]:
                         ("W_up", b.ffn.W_up), ("W_gate", b.ffn.W_gate),
                         ("W_down", b.ffn.W_down)):
             if getattr(w, "_crossop_base", None) is not None:
-                # tied sibling: only its integer perm index is new storage.
-                ri = getattr(w, "_crossop_row", None)
-                ci = getattr(w, "_crossop_col", None)
-                total_bytes += _perm_bytes(ri, ci, w.out_dim, w.in_dim)
+                # tied sibling: only its sparse perm index is new storage.
+                rp = getattr(w, "_crossop_row", None)
+                cp = getattr(w, "_crossop_col", None)
+                total_bytes += (0 if rp is None else rp.bytes()) \
+                    + (0 if cp is None else cp.bytes())
                 continue
             store = w.csr if w.is_sparse else w.dense
             if store is None or id(store) in seen_store or int(w.nnz) == 0:
