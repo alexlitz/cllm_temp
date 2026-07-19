@@ -48,14 +48,11 @@ def _model(code_size):
     """
     global _MODEL, _L, _SPARSE
     if _SPARSE is None:
-        import gc
-        from c4_min.nibble_pure_forward_complete import build_pure_forward_complete_model
-        from c4_min.sparse_forward import SparseTransformer
-        model, _L = build_pure_forward_complete_model(
-            code_size=code_size, recurrent_divmod=True)
-        _SPARSE = SparseTransformer(model, compute_mode="dense_kernel")
-        del model                # free the dense weights; CSR is the resident copy
-        gc.collect()
+        # STREAMING sparse build (peak RSS ~one block).  Conversational I/O uses
+        # low-window buffers, so the base 8-bit query suffices — addr32=False.
+        from c4_min.lib_neural import build_lib_model_streaming
+        _SPARSE, _L, _ = build_lib_model_streaming(
+            code_size=code_size, recurrent_divmod=True, addr32=False)
     return _SPARSE, _L
 
 
@@ -101,16 +98,12 @@ def test_eliza_one_turn_bounded_neural():
     message = "yes"                      # a short prefix-match turn (few steps)
     ref = CE.chat_turn_ref(eliza, message)
 
-    # Build once for the ELIZA code size; drive the bounded turn through the model.
-    from c4_min.sparse_forward import SparseTransformer
-    from c4_min.nibble_pure_forward_complete import build_pure_forward_complete_model
+    # Build once for the ELIZA code size (streaming sparse; peak RSS ~one block);
+    # drive the bounded turn through the model.
+    from c4_min.lib_neural import build_lib_model_streaming
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
-    import gc
-    model, L = build_pure_forward_complete_model(
-        code_size=len(eliza.code) + 2, recurrent_divmod=True)
-    sparse = SparseTransformer(model, compute_mode="dense_kernel")
-    del model                    # free the dense weights; CSR is the resident copy
-    gc.collect()
+    sparse, L, _ = build_lib_model_streaming(
+        code_size=len(eliza.code) + 2, recurrent_divmod=True, addr32=False)
 
     fio = CE._fresh_fio(message)
     STEP_CAP = 120                        # bounded: fail fast rather than hang

@@ -63,29 +63,59 @@ def compile_mem_prep_addr32(L: PureForwardCompleteLayout, dim: int) -> Dict[str,
     return _concat_specs(specs, dim)
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _addr32_mem_prep():
+    """Temporarily route ``nibble_pure_forward_complete.compile_mem_prep`` to the
+    32-bit-address-query widening, so ANY build path that goes through
+    ``build_pure_forward_complete_model`` (the dense builder OR the streaming
+    sparse builder, which BOTH call the pfc-namespace ``compile_mem_prep``) emits
+    the widened ``mem-prep`` block.  Byte-identical to the base for byte-sized
+    addresses (proven in ``test_lib_addr32_byteident``), so this is additive."""
+    import c4_min.nibble_pure_forward_complete as pfc
+    orig = pfc.compile_mem_prep
+    pfc.compile_mem_prep = compile_mem_prep_addr32
+    try:
+        yield
+    finally:
+        pfc.compile_mem_prep = orig
+
+
 def build_lib_model(code_size: int = 32, recurrent_divmod: bool = True,
                     addr32: bool = True):
-    """Build the canonical unified full-op model, then (if ``addr32``) SWAP the
-    ``mem-prep`` block's FFN for the 32-bit-address-query widening so the runtime
+    """Build the canonical unified full-op DENSE model with (if ``addr32``) the
+    32-bit-address-query widening on the ``mem-prep`` block, so the runtime
     library's heap addresses (0x30008) survive the §Memory CAM.
 
     Returns ``(model, L)``.  With ``addr32=False`` this is exactly
-    ``build_pure_forward_complete_model`` (the base corpus model).
+    ``build_pure_forward_complete_model`` (the base corpus model).  NOTE the dense
+    build peaks at ~62 GB RSS (the DIV/MOD blocks); prefer
+    :func:`build_lib_model_streaming` for the memory-safe sparse build.
     """
-    model, L = build_pure_forward_complete_model(
-        code_size=code_size, recurrent_divmod=recurrent_divmod)
-    if not addr32:
-        return model, L
-    # Locate the mem-prep block (records live in L._block_names, in apply order for
-    # the recurrent build; the physical block list is model._phys_blocks when the
-    # recurrence remapped model.blocks).
-    names = L._block_names
-    phys = getattr(model, "_phys_blocks", model.blocks)
-    idx = names.index("mem-prep")
-    hidden = phys[idx].ffn.W_up.shape[0]
-    spec = compile_mem_prep_addr32(L, L.D)
-    assert spec["W_up"].shape[0] <= hidden, (
-        f"widened mem-prep hidden {spec['W_up'].shape[0]} > block hidden {hidden}")
-    with torch.no_grad():
-        _load_ffn(phys[idx].ffn, spec, hidden)
+    ctx = _addr32_mem_prep() if addr32 else contextlib.nullcontext()
+    with ctx:
+        model, L = build_pure_forward_complete_model(
+            code_size=code_size, recurrent_divmod=recurrent_divmod)
     return model, L
+
+
+def build_lib_model_streaming(code_size: int = 32, recurrent_divmod: bool = True,
+                              addr32: bool = True, compute_mode: str = "dense_kernel"):
+    """Memory-safe: build the canonical unified full-op model as a STREAMING SPARSE
+    model (peak RSS = ONE block, not the ~62 GB dense whole), with the 32-bit
+    address-query widening on ``mem-prep`` (if ``addr32``).  This is the build the
+    neural library tests use.
+
+    Returns ``(SparseTransformer, L, build_stats)`` — the same triple as
+    ``compact_alloc.build_compact_sparse_streaming``.  Byte-identical (L-inf=0 in
+    dense_kernel mode) to wrapping the dense ``build_lib_model`` output in a
+    ``SparseTransformer``.
+    """
+    from .compact_alloc import build_compact_sparse_streaming
+    ctx = _addr32_mem_prep() if addr32 else contextlib.nullcontext()
+    with ctx:
+        return build_compact_sparse_streaming(
+            code_size=code_size, compute_mode=compute_mode,
+            recurrent_divmod=recurrent_divmod)

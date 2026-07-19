@@ -35,15 +35,11 @@ _L = None
 def _sparse_model(code_size: int):
     global _SPARSE, _L
     if _SPARSE is None:
-        from c4_min.lib_neural import build_lib_model
-        from c4_min.sparse_forward import SparseTransformer
-        model, _L = build_lib_model(code_size=code_size, recurrent_divmod=True,
-                                    addr32=True)
-        _SPARSE = SparseTransformer(model, compute_mode="dense_kernel")
-        # free the dense weights — the sparse CSR is the resident copy.
-        import gc
-        del model
-        gc.collect()
+        # STREAMING sparse build: peak RSS is ~one block, not the ~62 GB dense
+        # whole — the memory-safe way to materialise the unified full-op model.
+        from c4_min.lib_neural import build_lib_model_streaming
+        _SPARSE, _L, _ = build_lib_model_streaming(
+            code_size=code_size, recurrent_divmod=True, addr32=True)
     return _SPARSE, _L
 
 
