@@ -229,19 +229,37 @@ class SparseBlock:
     def __init__(self, block, density_thresh, min_numel, log, compute_mode):
         self.attn = SparseAttn(block.attn, density_thresh, min_numel, log,
                                compute_mode)
-        self.ffn = SparseFFN(block.ffn, density_thresh, min_numel, log,
-                             compute_mode)
+        # A TOP-1-routed dispatch FFN (moe_top1.Top1RoutedFFN) exploits EXPERT
+        # sparsity, not weight sparsity: it already computes only the active
+        # opcode's <=K unit rows.  Sparsifying its padded weight tensors would
+        # both break the router and be pointless (the routed slab is tiny/dense),
+        # so it is kept AS-IS -- the two techniques compose orthogonally (routing
+        # shrinks the row set; sparse_mm shrinks per-row cost on the OTHER blocks).
+        from .moe_top1 import Top1RoutedFFN
+        if isinstance(block.ffn, Top1RoutedFFN):
+            self.ffn = block.ffn                     # keep the routed FFN (dense)
+            self._routed = True
+        else:
+            self.ffn = SparseFFN(block.ffn, density_thresh, min_numel, log,
+                                 compute_mode)
+            self._routed = False
 
     def to(self, device):
-        self.attn.to(device); self.ffn.to(device); return self
+        self.attn.to(device)
+        if self._routed:
+            self.ffn = self.ffn.to(device)
+        else:
+            self.ffn.to(device)
+        return self
 
     def __call__(self, x, past_kv=None, q_positions=None, use_cache: bool = False):
         if use_cache or past_kv is not None or q_positions is not None:
             a, new_kv = self.attn.forward(x, past_kv=past_kv,
                                           q_positions=q_positions, use_cache=True)
-            out = self.ffn.forward(a)
+            out = self.ffn.forward(a) if not self._routed else self.ffn(a)
             return (out, new_kv) if use_cache else out
-        return self.ffn.forward(self.attn.forward(x))
+        a = self.attn.forward(x)
+        return self.ffn(a) if self._routed else self.ffn.forward(a)
 
 
 @dataclass
@@ -338,11 +356,23 @@ class SparseTransformer:
             sparse_bytes += t.numel() * 4
             total_nnz += int((t != 0).sum().item())
         for b in self.blocks:
-            for w in (b.attn.W_q, b.attn.W_k, b.attn.W_v, b.attn.W_o,
-                      b.ffn.W_up, b.ffn.W_gate, b.ffn.W_down):
+            for w in (b.attn.W_q, b.attn.W_k, b.attn.W_v, b.attn.W_o):
                 dense_bytes += w.dense_equiv_bytes()
                 sparse_bytes += w.storage_bytes()
                 total_nnz += w.nnz
+            if getattr(b, "_routed", False):
+                # routed dispatch FFN: raw dense tensors, kept dense (expert
+                # sparsity handles its compute; only the tiny active slab runs).
+                for w in (b.ffn.W_up, b.ffn.W_gate, b.ffn.W_down):
+                    n = w.numel() * 4
+                    dense_bytes += n
+                    sparse_bytes += n
+                    total_nnz += int((w != 0).sum().item())
+            else:
+                for w in (b.ffn.W_up, b.ffn.W_gate, b.ffn.W_down):
+                    dense_bytes += w.dense_equiv_bytes()
+                    sparse_bytes += w.storage_bytes()
+                    total_nnz += w.nnz
             for v in (b.ffn.b_up, b.ffn.b_gate, b.ffn.b_down, b.attn.alibi_slopes):
                 dense_bytes += v.numel() * 4
                 sparse_bytes += v.numel() * 4
