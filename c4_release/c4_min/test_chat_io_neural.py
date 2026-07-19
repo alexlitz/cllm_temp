@@ -48,11 +48,14 @@ def _model(code_size):
     """
     global _MODEL, _L, _SPARSE
     if _SPARSE is None:
+        import gc
         from c4_min.nibble_pure_forward_complete import build_pure_forward_complete_model
         from c4_min.sparse_forward import SparseTransformer
-        _MODEL, _L = build_pure_forward_complete_model(
+        model, _L = build_pure_forward_complete_model(
             code_size=code_size, recurrent_divmod=True)
-        _SPARSE = SparseTransformer(_MODEL, compute_mode="dense_kernel")
+        _SPARSE = SparseTransformer(model, compute_mode="dense_kernel")
+        del model                # free the dense weights; CSR is the resident copy
+        gc.collect()
     return _SPARSE, _L
 
 
@@ -92,7 +95,6 @@ def test_read_lc_prtf_primitive_neural():
 # 2. ONE bounded ELIZA turn through the unified model, byte-exact vs reference.
 # ---------------------------------------------------------------------------
 def test_eliza_one_turn_bounded_neural():
-    import pytest
     from c4_min import chat_eliza as CE
 
     eliza = CE.build_chat_min()
@@ -103,9 +105,12 @@ def test_eliza_one_turn_bounded_neural():
     from c4_min.sparse_forward import SparseTransformer
     from c4_min.nibble_pure_forward_complete import build_pure_forward_complete_model
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
+    import gc
     model, L = build_pure_forward_complete_model(
         code_size=len(eliza.code) + 2, recurrent_divmod=True)
     sparse = SparseTransformer(model, compute_mode="dense_kernel")
+    del model                    # free the dense weights; CSR is the resident copy
+    gc.collect()
 
     fio = CE._fresh_fio(message)
     STEP_CAP = 120                        # bounded: fail fast rather than hang
