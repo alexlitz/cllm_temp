@@ -65,8 +65,9 @@ def I(op, imm=0):
     return isa.Instr(op, imm)
 
 
-def battery(include_divmod: bool):
-    """(name, code, max_steps, mask) — one program per op family."""
+def battery():
+    """(name, code, max_steps, mask) — one program per op family (full op set,
+    DIV/MOD always included)."""
     b = [
         ("add",  [I(isa.IMM, 5), I(isa.PSH), I(isa.IMM, 3), I(isa.ADD), I(isa.HALT)], 20, 0xFF),
         ("sub",  [I(isa.IMM, 40), I(isa.PSH), I(isa.IMM, 9), I(isa.SUB), I(isa.HALT)], 20, 0xFF),
@@ -82,11 +83,10 @@ def battery(include_divmod: bool):
         ("loop_countdown", [I(isa.IMM, 8), I(isa.PSH), I(isa.IMM, 1), I(isa.SUB),
                             I(isa.BNZ, 1), I(isa.HALT)], 200, 0xFF),
     ]
-    if include_divmod:
-        b += [
-            ("div", [I(isa.IMM, 100), I(isa.PSH), I(isa.IMM, 7), I(isa.DIV), I(isa.HALT)], 20, 0xFFFFFFFF),
-            ("mod", [I(isa.IMM, 100), I(isa.PSH), I(isa.IMM, 7), I(isa.MOD), I(isa.HALT)], 20, 0xFFFFFFFF),
-        ]
+    b += [
+        ("div", [I(isa.IMM, 100), I(isa.PSH), I(isa.IMM, 7), I(isa.DIV), I(isa.HALT)], 20, 0xFFFFFFFF),
+        ("mod", [I(isa.IMM, 100), I(isa.PSH), I(isa.IMM, 7), I(isa.MOD), I(isa.HALT)], 20, 0xFFFFFFFF),
+    ]
     return b
 
 
@@ -127,7 +127,7 @@ class _LoggingOnnx(OnnxCachedModel):
         return hidden_o, new_o
 
 
-def run_battery(torch_model, L, onnx_path, include_divmod: bool,
+def run_battery(torch_model, L, onnx_path,
                 intra_threads: int) -> Tuple[int, int, float, int]:
     n_ok = n_fail = 0
     global_max_abs = 0.0
@@ -136,7 +136,7 @@ def run_battery(torch_model, L, onnx_path, include_divmod: bool,
     print(f"\n{'prog':16s} {'ref':>10s} {'torch':>10s} {'onnx':>10s} "
           f"{'trace==':>8s} {'maxabs':>10s} {'maxrel':>10s} {'flips':>6s}")
     print("-" * 88)
-    for name, code, msteps, mask in battery(include_divmod):
+    for name, code, msteps, mask in battery():
         ref = ref_interpret(code, max_steps=msteps, mask=mask)
         tr_t = run_pure_forward_cached(torch_model, L, code, max_steps=msteps,
                                        mask=mask, evict=True, prune_interval=120)
@@ -355,8 +355,6 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--battery", action="store_true",
                     help="run the per-op byte-identity battery (and exit).")
-    ap.add_argument("--divmod", action="store_true",
-                    help="build the divmod (compact) model instead of LEAN.")
     ap.add_argument("--onnx-path", type=str, default=None,
                     help="reuse an existing exported ONNX (skip re-export).")
     ap.add_argument("--out-dir", type=str, default="/tmp/c4_compact_onnx")
@@ -380,12 +378,9 @@ def main(argv=None) -> int:
     ap.add_argument("--output", type=str, default=None)
     args = ap.parse_args(argv)
 
-    include_divmod = args.divmod
-    print(f"[build] building compact pure-forward model "
-          f"(divmod={include_divmod}) ...", flush=True)
+    print("[build] building full-op-set compact pure-forward model ...", flush=True)
     t = time.time()
-    compact, L, stats = build_compact(code_size=args.code_size,
-                                      include_divmod=include_divmod)
+    compact, L, stats = build_compact(code_size=args.code_size)
     compact.eval()
     print(f"[build] compact model in {time.time()-t:.0f}s | "
           f"dim {stats.dim_before}->{stats.dim_after} blocks={stats.n_blocks} "
@@ -415,7 +410,7 @@ def main(argv=None) -> int:
 
     if args.battery:
         n_ok, n_fail, mx, flips = run_battery(
-            compact, L, onnx_path, include_divmod, args.intra_threads)
+            compact, L, onnx_path, args.intra_threads)
         return 0 if n_fail == 0 else 1
 
     return run_corpus(compact, L, onnx_path, args)

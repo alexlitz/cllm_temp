@@ -64,10 +64,8 @@ _PFC.SP_INIT = 0xFC
 import torch  # noqa: E402
 
 from c4_min import isa  # noqa: E402
-from c4_min.compact_alloc import build_compact_pure_forward_model  # noqa: E402
-from c4_min.nibble_pure_forward_complete import (  # noqa: E402
-    build_pure_forward_complete_model, ref_interpret,
-)
+from c4_min.compact_alloc import build_compact_sparse_streaming  # noqa: E402
+from c4_min.nibble_pure_forward_complete import ref_interpret  # noqa: E402
 from c4_min.sparse_forward import SparseTransformer  # noqa: E402
 from c4_min.pf_speculative import (  # noqa: E402
     speculative_run, draft_pf_program, spotcheck_vs_cached,
@@ -104,8 +102,8 @@ def cluster_of(description: str) -> str:
     return base or "misc"
 
 
-def build_model(device: str, compute_mode: str, include_divmod: bool,
-                include_bitwise: bool, code_size: int, verbose: bool = True,
+def build_model(device: str, compute_mode: str, code_size: int,
+                verbose: bool = True,
                 load_sparse: Optional[str] = None,
                 materialize_dense: bool = False):
     t = time.monotonic()
@@ -119,20 +117,15 @@ def build_model(device: str, compute_mode: str, include_divmod: bool,
         sparse = sparse.to(device)
     else:
         if verbose:
-            print(f"[stacked:{device}] building sparse model "
-                  f"(divmod={include_divmod} bitwise={include_bitwise} "
-                  f"compute={compute_mode}) ...", file=sys.stderr, flush=True)
-        if include_divmod:
-            base, L, _cs = build_compact_pure_forward_model(
-                code_size=code_size, include_bitwise=include_bitwise,
-                include_divmod=True)
-        else:
-            base, L = build_pure_forward_complete_model(
-                code_size=code_size, include_bitwise=include_bitwise,
-                include_divmod=False)
-        sparse = SparseTransformer(base, compute_mode=compute_mode)
+            print(f"[stacked:{device}] building full-op-set sparse model "
+                  f"(streaming, compute={compute_mode}) ...",
+                  file=sys.stderr, flush=True)
+        # STREAMING sparse build: peak RSS is ~one dense block, so the full-op
+        # model (incl. the ~300 DIV/MOD blocks) never materialises the ~130 GB
+        # dense (or the ~48 GB dense-compact) intermediate.
+        sparse, L, _cs = build_compact_sparse_streaming(
+            code_size=code_size, compute_mode=compute_mode)
         st = sparse.stats()
-        del base
         sparse = sparse.to(device)
     if materialize_dense:
         # densify every CSR weight ONCE onto the device so the per-forward
@@ -201,8 +194,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--device", type=str, default="cpu")
     ap.add_argument("--compute-mode", type=str, default="sparse_mm",
                     choices=["dense_kernel", "sparse_mm"])
-    ap.add_argument("--no-divmod", action="store_true")
-    ap.add_argument("--no-bitwise", action="store_true", default=True)
     ap.add_argument("--load-sparse", type=str, default=None,
                     help="reload a saved streamed sparse model (save_sparse_transformer "
                          "artifact) instead of building — no rebuild, no divmod peak.")
@@ -246,10 +237,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     all_tests = generate_test_programs()
     indexed = select_programs(args, all_tests)
 
-    include_divmod = not args.no_divmod
-    include_bitwise = not args.no_bitwise
     sparse, L, st, build_dt, vram = build_model(
-        device, args.compute_mode, include_divmod, include_bitwise, args.code_size,
+        device, args.compute_mode, args.code_size,
         load_sparse=args.load_sparse, materialize_dense=args.materialize_dense)
 
     prepared = prepare(indexed)
@@ -355,7 +344,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             json.dump({
                 "device": device, "compute_mode": args.compute_mode,
                 "wall_seconds": wall, "build_seconds": build_dt,
-                "include_divmod": include_divmod, "batch": args.batch,
+                "op_set": "full", "batch": args.batch,
                 "fast_overlay": fast, "evict": evict,
                 "block_steps": args.block_steps,
                 "storage_mb": st.sparse_mb, "vram_load_mb": vram,

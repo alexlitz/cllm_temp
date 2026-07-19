@@ -41,9 +41,11 @@ Usage
     OMP_NUM_THREADS=4 PYTHONPATH=$(pwd) python c4_min/run_1096_pure_forward.py \
         --per-cluster 4 --output /tmp/pf_sample.json
 
-MEMORY DISCIPLINE: LEAN/SPARSE model (``include_bitwise=False`` — the corpus uses
-NO bitwise ops; ``include_divmod`` folds the 32-bit long-division blocks needed by
-div/mod/expr_mul_div).  Runs SEQUENTIALLY.  Set ``OMP_NUM_THREADS=4``.
+MEMORY DISCIPLINE: builds the SINGLE full-op-set interpreter via the STREAMING
+sparse builder (``build_compact_sparse_streaming``), so peak build RSS is ~one
+dense block (~9.5 GB) — NEVER the ~130 GB the full-op DENSE build would take.
+The op set always includes DIV/MOD (32-bit long division) + bitwise.  Runs
+SEQUENTIALLY.  Set ``OMP_NUM_THREADS=4``.
 """
 from __future__ import annotations
 
@@ -83,8 +85,9 @@ _PFC.SP_INIT = 0xFC
 
 from c4_min import isa  # noqa: E402
 from c4_min.nibble_pure_forward_complete import (  # noqa: E402
-    build_pure_forward_complete_model, run_pure_forward_complete, ref_interpret,
+    run_pure_forward_complete, ref_interpret,
 )
+from c4_min.compact_alloc import build_compact_sparse_streaming  # noqa: E402
 from c4_min.nibble_pure_forward import assert_no_python_compute  # noqa: E402
 
 
@@ -303,9 +306,6 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "many per cluster (stratified deep-loop sample). Default 0.")
     ap.add_argument("--code-size", type=int, default=64,
                     help="Max program length the model's code band holds. Default 64.")
-    ap.add_argument("--no-divmod", action="store_true",
-                    help="LEAN model WITHOUT the 32-bit long-division blocks (~10x "
-                         "faster forward; div/mod/expr_mul_div then FAIL).")
     ap.add_argument("--guard", action="store_true",
                     help="Wrap every run in assert_no_python_compute (the purity "
                          "proof). Roughly doubles wall-time (runs a settrace).")
@@ -385,13 +385,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                    f"{args.max_ref_steps}) NOT run"
                    if deep_reported else ""))
 
-    include_divmod = not args.no_divmod
     t_build = time.monotonic()
-    print(f"[pf-1096] building pure-forward model (code_size={args.code_size}, "
-          f"include_divmod={include_divmod}, include_bitwise=False) ...",
+    print(f"[pf-1096] building full-op-set pure-forward model "
+          f"(code_size={args.code_size}, streaming sparse) ...",
           file=sys.stderr, flush=True)
-    model, L = build_pure_forward_complete_model(
-        code_size=args.code_size, include_bitwise=False, include_divmod=include_divmod)
+    model, L, _bstats = build_compact_sparse_streaming(
+        code_size=args.code_size, compute_mode="dense_kernel")
     print(f"[pf-1096] model: dim={L.D} blocks={len(model.blocks)} "
           f"heads={model.blocks[0].attn.n_heads} ({time.monotonic()-t_build:.1f}s)",
           file=sys.stderr, flush=True)
@@ -442,7 +441,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "wall_seconds": wall,
                 "coverage": coverage,
                 "step_cap": args.step_cap,
-                "include_divmod": include_divmod,
+                "op_set": "full",
                 "guard": args.guard,
                 "summary": {s: sum(1 for r in results if r.status == s)
                             for s in _STATUSES} | {"total": len(results)},

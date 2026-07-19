@@ -396,19 +396,22 @@ def _fmt_bytes(n: int) -> str:
         x /= 1024.0
 
 
-def build_compact(code_size=64, include_bitwise=True, include_divmod=False):
+def build_compact(code_size=64):
+    """Build the SINGLE full-op-set compact model for ONNX export.
+
+    NOTE: ONNX export needs the DENSE compact model, and the full op set (incl.
+    the ~300 DIV/MOD blocks) makes this dense-compact build ~48 GB RSS.  Run on a
+    high-memory host; there is no reduced-op export variant.
+    """
     import c4_min.nibble_pure_forward as _PF
     import c4_min.nibble_pure_forward_complete as _PFC
     _PF.SP_INIT = 0xF0
     _PFC.SP_INIT = 0xF0
     from c4_min.compact_alloc import build_compact_pure_forward_model
-    return build_compact_pure_forward_model(
-        code_size=code_size, include_bitwise=include_bitwise,
-        include_divmod=include_divmod)
+    return build_compact_pure_forward_model(code_size=code_size)
 
 
-def main(out_dir: str = "/tmp/c4_compact_onnx", include_divmod: bool = False
-         ) -> int:
+def main(out_dir: str = "/tmp/c4_compact_onnx") -> int:
     os.makedirs(out_dir, exist_ok=True)
     dense_path = os.path.join(out_dir, "compact_vm.onnx")
     sparse_path = os.path.join(out_dir, "compact_vm_sparse.onnx")
@@ -417,7 +420,7 @@ def main(out_dir: str = "/tmp/c4_compact_onnx", include_divmod: bool = False
     print("COMPACT C4 VM  ->  vanilla ONNX (KV-cached decode) + sparse tensors")
     print("=" * 74)
 
-    compact, L, stats = build_compact(include_divmod=include_divmod)
+    compact, L, stats = build_compact()
     compact.eval()
     n_params = sum(p.numel() for p in compact.parameters())
     n_nz = sum(int((p != 0).sum()) for p in compact.parameters())
@@ -450,5 +453,4 @@ def main(out_dir: str = "/tmp/c4_compact_onnx", include_divmod: bool = False
 
 
 if __name__ == "__main__":
-    import sys
-    raise SystemExit(main(include_divmod="--divmod" in sys.argv))
+    raise SystemExit(main())

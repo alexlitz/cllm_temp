@@ -6,10 +6,11 @@ Composes the two proven CHK-1 wins into one full-1096 scoreboard:
   * **small/sparse weights** — the c4_min pure-forward VM is ~99.998 % sparse, so
     ``sparse_forward.SparseTransformer`` stores it as a few MB of CSR and (in
     ``dense_kernel`` mode) runs the SAME ``F.linear`` GEMMs -> **L-inf=0**
-    byte-identical to the dense forward.  The divmod model — dense 54 GB, 106 GB
-    transient — is built via ``compact_alloc.build_compact_pure_forward_model``
-    (which NEVER materialises the padded FFN: peak is the attention + real FFNs)
-    and then wrapped SPARSE, so it fits a 24 GB card in a few MB.
+    byte-identical to the dense forward.  The SINGLE full-op-set model (every
+    opcode incl. DIV/MOD) is built via the STREAMING sparse builder
+    (``compact_alloc.build_compact_sparse_streaming``), which NEVER materialises
+    the ~130 GB full-op dense / ~48 GB dense-compact intermediate: peak build RSS
+    is ~one dense block, and the result fits a 24 GB card in a few MB.
   * **O(cache)/step** — every VM step is driven by
     ``nibble_pure_forward_cached.run_pure_forward_cached``: a fixed 31-row window
     against a per-block incremental KV cache with bounded (softmax1+ALiBi)
@@ -18,10 +19,8 @@ Composes the two proven CHK-1 wins into one full-1096 scoreboard:
     with ``SP_INIT`` pinned to ``0xF0`` (as the reference runner does).
 
 The SPARSE model's per-program PASS/FAIL is the authoritative pure-forward VM
-result.  ``--check-compact`` ALSO runs the dim-shared **compact** model
-(``compact_alloc``, empirical liveness) per program and records any program where
-compact != sparse — closing the "empirical liveness is coverage-limited" concern
-on the real corpus.
+result.  ``--load-sparse`` reloads a pre-saved streamed sparse model with no
+rebuild.
 
 Shard the corpus across the two idle A5000s (one worker per GPU):
     OMP_NUM_THREADS=4 python c4_min/run_1096_sparse_gpu_cached.py \
@@ -58,10 +57,7 @@ import c4_min.nibble_pure_forward_complete as _PFC  # noqa: E402
 _PF.SP_INIT = 0xF0
 _PFC.SP_INIT = 0xF0
 
-from c4_min.nibble_pure_forward_complete import (  # noqa: E402
-    build_pure_forward_complete_model, ref_interpret,
-)
-from c4_min.compact_alloc import build_compact_pure_forward_model  # noqa: E402
+from c4_min.nibble_pure_forward_complete import ref_interpret  # noqa: E402
 from c4_min.sparse_forward import SparseTransformer  # noqa: E402
 from c4_min.nibble_pure_forward_cached import run_pure_forward_cached  # noqa: E402
 
@@ -149,27 +145,22 @@ def score_program(idx, source, expected, description, *, model, L, compile_c,
                   detail=f"exit mismatch: exp {exp} got {got}; " + detail, **base)
 
 
-def _write_output(path, results, agg, device, args, include_divmod, st,
+def _write_output(path, results, agg, device, args, st,
                   vram_load, wall, partial=False, vram_peak=0.0):
     """Serialise the (possibly partial) scoreboard to ``path`` as JSON."""
     counts = Counter(r.status for r in results)
     n_pass = counts.get("PASS", 0)
     total = len(results)
-    compact_diffs = [r.idx for r in results
-                     if "COMPACT_DIFFERS" in (r.detail or "")
-                     or "COMPACT_ERR" in (r.detail or "")]
     with open(path, "w", encoding="utf-8") as fh:
         json.dump({
             "device": device, "shard_of": args.shard_of,
             "shard_idx": args.shard_idx, "wall_seconds": wall,
             "steps_total": agg.get("total_steps", 0),
             "partial": partial,
-            "step_cap": args.step_cap, "include_divmod": include_divmod,
+            "step_cap": args.step_cap, "op_set": "full",
             "compute_mode": args.compute_mode, "evict": not args.no_evict,
             "vram_load_mb": vram_load, "vram_peak_mb": vram_peak,
             "storage_mb": st.sparse_mb,
-            "check_compact": args.check_compact,
-            "compact_disagreements": compact_diffs,
             "kv_cache": {k: agg.get(k) for k in
                          ("max_seq_len", "max_cache_size", "total_evicted")},
             "summary": {s: counts.get(s, 0) for s in _STATUSES}
@@ -195,20 +186,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "when this shard runs the LEAN model).")
     ap.add_argument("--step-cap", type=int, default=12000)
     ap.add_argument("--code-size", type=int, default=64)
-    ap.add_argument("--no-divmod", action="store_true",
-                    help="LEAN model (no DIV/MOD blocks). Default builds divmod.")
-    ap.add_argument("--include-bitwise", action="store_true", default=True)
     ap.add_argument("--no-evict", action="store_true")
     ap.add_argument("--prune-interval", type=int, default=120)
     ap.add_argument("--compute-mode", type=str, default="dense_kernel",
                     choices=["dense_kernel", "sparse_mm"],
                     help="dense_kernel: L-inf=0. sparse_mm: argmax-identical, faster.")
-    ap.add_argument("--check-compact", action="store_true",
-                    help="ALSO run the compact model per program; flag disagreements.")
-    ap.add_argument("--stream-build", action="store_true",
-                    help="Build the compact SPARSE model block-at-a-time "
-                         "(build_compact_sparse_streaming) so the peak build RSS is "
-                         "~one dense block (~1 GB divmod), not ~79 GB. Byte-identical.")
     ap.add_argument("--load-sparse", type=str, default=None,
                     help="Reload a saved streamed sparse model (save_sparse_transformer "
                          "artifact) INSTEAD of building — no rebuild, no peak.")
@@ -248,16 +230,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.limit is not None:
         indexed = indexed[:args.limit]
 
-    include_divmod = not args.no_divmod
     t_build = time.monotonic()
 
-    # ``sparse`` may be filled directly by the reload / stream branches below; the
-    # dense-build + SparseTransformer-wrap section is then skipped (guarded on
-    # ``sparse is None``).  Both are byte-identical (dense_kernel L-inf=0).
-    sparse = None
-    st = None
-    compact_model_for_check = None
-    Lc_for_check = None
+    # The SINGLE full-op-set interpreter (every opcode incl. DIV/MOD + bitwise) is
+    # ALWAYS built via a memory-safe path: reload a saved streamed model, or STREAM
+    # build directly SPARSE block-at-a-time (peak build RSS ~one dense block, never
+    # the ~130 GB full-op dense / ~48 GB dense-compact intermediate).
 
     # -- FAST PATH: reload a pre-saved streamed sparse model (no rebuild, no peak).
     if args.load_sparse:
@@ -267,58 +245,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         sparse, L = load_sparse_transformer(args.load_sparse,
                                             compute_mode=args.compute_mode)
         st = sparse.stats()
-    # -- STREAM BUILD: build the compact model directly SPARSE, block-at-a-time
-    #    (peak build RSS ~one dense block, not ~79 GB) — byte-identical (L-inf=0).
-    elif args.stream_build:
+    else:
         from c4_min.compact_alloc import build_compact_sparse_streaming
-        print(f"[sparse-gpu:{device}] STREAM building pure-forward model "
-              f"(divmod={include_divmod}, bitwise={args.include_bitwise}) ...",
-              file=sys.stderr, flush=True)
+        print(f"[sparse-gpu:{device}] STREAM building full-op-set pure-forward "
+              f"model ...", file=sys.stderr, flush=True)
         sparse, L, cstats = build_compact_sparse_streaming(
-            code_size=args.code_size, include_bitwise=args.include_bitwise,
-            include_divmod=include_divmod, compute_mode=args.compute_mode)
+            code_size=args.code_size, compute_mode=args.compute_mode)
         st = sparse.stats()
         print(f"[sparse-gpu:{device}] STREAM compact: dim {cstats.dim_before}->"
               f"{cstats.dim_after} blocks={cstats.n_blocks} "
               f"nnz={cstats.nonzero_params}", file=sys.stderr, flush=True)
 
-    if sparse is None:
-        print(f"[sparse-gpu:{device}] building pure-forward model "
-              f"(divmod={include_divmod}, bitwise={args.include_bitwise}) ...",
-              file=sys.stderr, flush=True)
-    # Build the model. For divmod we MUST use the compact builder (never the
-    # 106 GB dense path); for LEAN the dense builder is cheap and its dense-kernel
-    # sparse wrap is L-inf=0.  Both then wrap SPARSE for the GPU forward.
-    if sparse is not None:
-        pass
-    elif include_divmod:
-        dense_or_compact, L, cstats = build_compact_pure_forward_model(
-            code_size=args.code_size, include_bitwise=args.include_bitwise,
-            include_divmod=True)
-        print(f"[sparse-gpu:{device}] compact base: dim {cstats.dim_before}->"
-              f"{cstats.dim_after} blocks={cstats.n_blocks} "
-              f"({cstats.size_mb_after:.0f}MB dense) nnz={cstats.nonzero_params}",
-              file=sys.stderr, flush=True)
-        compact_model_for_check = dense_or_compact if args.check_compact else None
-        Lc_for_check = L
-    else:
-        dense_or_compact, L = build_pure_forward_complete_model(
-            code_size=args.code_size, include_bitwise=args.include_bitwise,
-            include_divmod=False)
-        compact_model_for_check = None
-        Lc_for_check = None
-        if args.check_compact:
-            compact_model_for_check, Lc_for_check, _ = \
-                build_compact_pure_forward_model(
-                    code_size=args.code_size,
-                    include_bitwise=args.include_bitwise, include_divmod=False)
-
-    # Wrap SPARSE (storage in CSR; dense_kernel forward is L-inf=0).  Skipped when
-    # the reload / stream branch already produced ``sparse`` directly.
-    if sparse is None:
-        sparse = SparseTransformer(dense_or_compact, compute_mode=args.compute_mode)
-        st = sparse.stats()
-        del dense_or_compact  # drop the dense weights; only the CSR survive
     sparse = sparse.to(device)
     if device.startswith("cuda"):
         torch.cuda.synchronize(torch.device(device))
@@ -332,24 +269,17 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"| VRAM-load {vram_load:.0f}MB | mode={args.compute_mode}",
           file=sys.stderr, flush=True)
 
-    # compact model for the per-program agreement backstop.
+    # There is ONE canonical full-op-set model now; no separate compact model to
+    # cross-check against (the streaming build IS the compact model).
     compact_check = None
     Lc = None
-    if args.check_compact and compact_model_for_check is not None:
-        compact_check = SparseTransformer(
-            compact_model_for_check, compute_mode=args.compute_mode).to(device)
-        Lc = Lc_for_check
-        del compact_model_for_check
-        print(f"[sparse-gpu:{device}] compact-check model wrapped sparse on {device}",
-              file=sys.stderr, flush=True)
 
     coverage = (f"shard {args.shard_idx+1}/{args.shard_of}: "
-                f"{len(indexed)}/{len(all_tests)} programs (deep loops INCLUDED"
-                + (f", divmod" if include_divmod else "") + ")"
+                f"{len(indexed)}/{len(all_tests)} programs (deep loops INCLUDED, "
+                f"full op set incl. divmod)"
                 + (f" [<= {args.per_cluster}/cluster]" if args.per_cluster else ""))
     print(f"[sparse-gpu:{device}] scoring {coverage} | step_cap={args.step_cap} | "
-          f"evict={'off' if args.no_evict else 'ON'} | "
-          f"compact-check={'ON' if args.check_compact else 'off'}",
+          f"evict={'off' if args.no_evict else 'ON'}",
           file=sys.stderr, flush=True)
 
     # reference step counts (pure-python harness sizing; not model compute).
@@ -385,7 +315,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # tail never loses the completed portion (JSON is rewritten each time).
             if args.output:
                 _write_output(args.output + ".partial", results, agg, device,
-                              args, include_divmod, st, vram_load,
+                              args, st, vram_load,
                               time.monotonic() - t0, partial=True)
     wall = time.monotonic() - t0
 
@@ -399,8 +329,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     n_pass = counts.get("PASS", 0)
     total = len(results)
     steps_total = agg.get("total_steps", 0)
-    compact_diffs = [r for r in results if "COMPACT_DIFFERS" in (r.detail or "")
-                     or "COMPACT_ERR" in (r.detail or "")]
 
     print("\n" + "=" * 74)
     print(f"c4_min SPARSE PURE-FORWARD VM — KV-CACHED on {device} "
@@ -414,10 +342,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  KV-cache: max_seq_len={agg.get('max_seq_len')} "
           f"max_cache(block0)={agg.get('max_cache_size')} "
           f"total_evicted={agg.get('total_evicted')}")
-    if args.check_compact:
-        print(f"  compact-vs-sparse: {len(compact_diffs)} disagreements "
-              f"of {total} (empirical-liveness "
-              f"{'VALIDATED' if not compact_diffs else 'FAILS — see below'})")
     print("-" * 74)
     for s in _STATUSES:
         print(f"  {s:10s} {counts.get(s, 0):5d}")
@@ -425,10 +349,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  SHARD SCORE: {n_pass}/{total} ({100.0*n_pass/max(total,1):.2f}%)")
     print("=" * 74)
     _print_cluster_table(_cluster_table(results))
-    if compact_diffs:
-        print("\nCOMPACT != SPARSE (unsound dim-share candidates):")
-        for r in compact_diffs:
-            print(f"  id={r.idx} [{r.cluster}] {r.detail}")
 
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
@@ -436,12 +356,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "device": device, "shard_of": args.shard_of,
                 "shard_idx": args.shard_idx, "wall_seconds": wall,
                 "steps_total": steps_total, "coverage": coverage,
-                "step_cap": args.step_cap, "include_divmod": include_divmod,
+                "step_cap": args.step_cap, "op_set": "full",
                 "compute_mode": args.compute_mode, "evict": evict,
                 "vram_load_mb": vram_load, "vram_peak_mb": vram_peak,
                 "storage_mb": st.sparse_mb,
-                "check_compact": args.check_compact,
-                "compact_disagreements": [r.idx for r in compact_diffs],
                 "kv_cache": {k: agg.get(k) for k in
                              ("max_seq_len", "max_cache_size", "total_evicted")},
                 "summary": {s: counts.get(s, 0) for s in _STATUSES}
