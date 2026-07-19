@@ -950,14 +950,20 @@ class _StreamIntermediate:
     byte-identical to the dense ``Transformer`` on the default (un-cached) path.
     """
 
-    def __init__(self, dim, vocab, max_seq_len, embed, lm_head, lm_bias, blocks):
+    def __init__(self, dim, vocab, max_seq_len, embed, lm_head, lm_bias, blocks,
+                 phys_blocks=None):
         self.dim = dim
         self.vocab = vocab
         self.max_seq_len = max_seq_len
         self.embed = embed
         self.lm_head = lm_head
         self.lm_bias = lm_bias
+        # ``.blocks`` is the APPLICATION sequence (forward/liveness iterate it; the
+        # recurrent-divmod build repeats the reused body's block objects here).
+        # ``.phys_blocks`` is the DISTINCT physical set (what the model STORES); for
+        # a non-recurrent build the two are the same list.
         self.blocks = blocks
+        self.phys_blocks = phys_blocks if phys_blocks is not None else blocks
 
 
 def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L):
@@ -991,6 +997,9 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
         eh = _EmbHolder(); eh.dim = dim; eh.embed = embed
         pfc._bake_pure_embedding(eh, L)
 
+        # ONE physical _StreamBlock per UNIQUE spec (block_specs is already the
+        # unique set for the recurrent build).
+        phys: List[_StreamBlock] = []
         for bi, (name, spec) in enumerate(block_specs):
             if bi in baked:
                 at = _Attn(dim, n_heads, max_seq)          # dense (zeroed) attn
@@ -1002,16 +1011,28 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
             ffn = _FFN(dim, hid)
             _swap_ffn(ffn, spec["W_up"], spec["b_up"], spec["W_gate"],
                       spec["b_gate"], spec["W_down"], spec["b_down"])
-            blocks.append(_StreamBlock(at, ffn))
+            phys.append(_StreamBlock(at, ffn))
 
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP,
                      "STACK0": L.STACK0}
-        pfc.bake_frame_ingest(blocks[0].attn, L, reg_bases)
-        pfc._bake_pf_memory_head(blocks[mem_block].attn, L, head=pfc.N_ROLES)
-        pfc._bake_stack_pop_head(blocks[stk_block].attn, L, head=pfc.N_ROLES + 1)
-        pfc._bake_lev_ret_head(blocks[stk_block].attn, L, head=pfc.N_ROLES + 2)
+        pfc.bake_frame_ingest(phys[0].attn, L, reg_bases)
+        pfc._bake_pf_memory_head(phys[mem_block].attn, L, head=pfc.N_ROLES)
+        pfc._bake_stack_pop_head(phys[stk_block].attn, L, head=pfc.N_ROLES + 1)
+        pfc._bake_lev_ret_head(phys[stk_block].attn, L, head=pfc.N_ROLES + 2)
 
-    return _StreamIntermediate(dim, vocab, max_seq, embed, lm_head, lm_bias, blocks)
+        # APPLICATION order: for the recurrent-divmod build ``L._apply_order`` maps
+        # the FULL application sequence onto the unique physical blocks (the reused
+        # iteration body indices REPEAT), so the intermediate forward (which the
+        # liveness/empirical passes RUN) applies the same 262-long divmod sequence
+        # the production model does — even though only 115 blocks are stored.
+        apply_order = getattr(L, "_apply_order", None)
+        if apply_order is None:
+            blocks = phys
+        else:
+            blocks = [phys[i] for i in apply_order]
+
+    return _StreamIntermediate(dim, vocab, max_seq, embed, lm_head, lm_bias,
+                               blocks, phys_blocks=phys)
 
 
 def build_compact_sparse_streaming(code_size: int = 48,
@@ -1020,7 +1041,8 @@ def build_compact_sparse_streaming(code_size: int = 48,
                                    compute_mode: str = "dense_kernel",
                                    density_thresh: float = 0.25,
                                    min_numel: int = 4096,
-                                   probe_programs=None):
+                                   probe_programs=None,
+                                   recurrent_divmod: bool = False):
     """Build the c4_min pure-forward VM directly as a streaming SPARSE model.
 
     Returns ``(SparseTransformer, L, stats)`` — the SAME public triple as
@@ -1045,6 +1067,12 @@ def build_compact_sparse_streaming(code_size: int = 48,
         def __init__(self, dim, n_heads, hidden, n_blocks, vocab, max_seq_len):
             frame = inspect.currentframe().f_back
             captured["block_specs"] = frame.f_locals["block_specs"]
+            # ``L._apply_order`` was set by the builder just before it constructs
+            # the Transformer — capture it so the streaming path reuses the exact
+            # recurrent application sequence (the fresh _rebuild_layout below cannot
+            # regenerate it without re-running the block emission).
+            captured["apply_order"] = getattr(frame.f_locals.get("L"),
+                                              "_apply_order", None)
             captured["dim"] = dim
             captured["n_heads"] = n_heads
             captured["vocab"] = vocab
@@ -1058,7 +1086,7 @@ def build_compact_sparse_streaming(code_size: int = 48,
     try:
         pfc.build_pure_forward_complete_model(
             code_size=code_size, include_bitwise=include_bitwise,
-            include_divmod=include_divmod)
+            include_divmod=include_divmod, recurrent_divmod=recurrent_divmod)
     except _CaptureDone:
         pass
     finally:
@@ -1070,7 +1098,9 @@ def build_compact_sparse_streaming(code_size: int = 48,
     vocab = captured["vocab"]
     max_seq = captured["max_seq_len"]
     n_blocks = len(block_specs)
-    L = _rebuild_layout(pfc, code_size, n_heads, include_bitwise)
+    L = _rebuild_layout(pfc, code_size, n_heads, include_bitwise,
+                        recurrent_divmod=recurrent_divmod)
+    L._apply_order = captured["apply_order"]     # None for non-recurrent builds
     hidden_per_block = [max(1, sp["W_up"].shape[0]) for _, sp in block_specs]
     L._block_names = [n for n, _ in block_specs]
 
@@ -1096,7 +1126,10 @@ def build_compact_sparse_streaming(code_size: int = 48,
         new_dim += n_heads - (new_dim % n_heads)
 
     # ---- Fix #2: per-block live hidden (mask before we discard the specs) ----
-    hidden_masks = [live_ffn_units(blk.ffn) for blk in model.blocks]
+    # Masks are per PHYSICAL block (one per unique spec); the recurrent-divmod
+    # apply-order reuses the same physical block many times, so we compute the mask
+    # once per stored block, not once per application.
+    hidden_masks = [live_ffn_units(blk.ffn) for blk in model.phys_blocks]
     hidden_after = [max(1, int(m.sum())) for m in hidden_masks]
 
     # Re-point the layout ``L`` onto the packed dim (the driver reads the register
@@ -1122,8 +1155,10 @@ def build_compact_sparse_streaming(code_size: int = 48,
 
     from .blogspec_model import Attn as _Attn, FFN as _FFN
     import torch.nn as nn
-    for bi in range(n_blocks):
-        src = model.blocks[bi]
+    n_phys = len(model.phys_blocks)                # DISTINCT blocks the model stores
+    phys_sparse: List = [None] * n_phys            # materialised once per unique block
+    for bi in range(n_phys):
+        src = model.phys_blocks[bi]
         with torch.no_grad():
             # -- one dense compact block (attention + this block's ragged FFN) --
             cat = _Attn(new_dim, n_heads, max_seq)
@@ -1150,27 +1185,43 @@ def build_compact_sparse_streaming(code_size: int = 48,
                       Wdown, _remap_vec(ff.b_down, new_slot, new_dim))
         # -- wrap this ONE dense block sparse, then free the dense block --
         dense_block = _StreamBlock(cat, cff)
-        sparse.blocks.append(
-            SparseBlock(dense_block, density_thresh, min_numel, log, compute_mode))
+        phys_sparse[bi] = SparseBlock(dense_block, density_thresh, min_numel, log,
+                                      compute_mode)
         # free the intermediate source block + the transient dense compact block.
-        model.blocks[bi] = None
+        model.phys_blocks[bi] = None
         del src, cat, cff, dense_block
 
+    # ---- APPLICATION order: ``sparse.blocks`` is the full apply sequence, reusing
+    # the DISTINCT physical SparseBlock objects (the recurrent-divmod body repeats).
+    # ``forward`` iterates ``sparse.blocks``, so applying the reused block object N
+    # times IS the recurrence; storage (stats/save) dedups by object identity.
+    apply_order = getattr(L, "_apply_order", None)
+    if apply_order is None:
+        sparse.blocks = phys_sparse
+    else:
+        sparse.blocks = [phys_sparse[i] for i in apply_order]
+    sparse._phys_blocks = phys_sparse              # the distinct stored blocks
+    model.blocks = None                            # drop the apply-order reference list
+
     # ---- stats (match build_compact_pure_forward_model) ----
+    # ``n_blocks`` here is the number of APPLICATIONS (the full sequence); the model
+    # STORES ``n_phys`` distinct blocks.  Report both.
     global_hidden = max(hidden_per_block)
+    n_apply = len(sparse.blocks)
     stats = CompactionStats(
         dim_before=dim, dim_after=new_dim,
         hidden_max_before=global_hidden,
         hidden_per_block_after=hidden_after,
-        n_blocks=n_blocks, n_heads=n_heads, vocab=vocab,
-        dense_params_before=_dense_param_count(dim, global_hidden, n_blocks, vocab),
+        n_blocks=n_phys, n_heads=n_heads, vocab=vocab,
+        dense_params_before=_dense_param_count(dim, global_hidden, n_phys, vocab),
         dense_params_after=_dense_param_count_ragged(new_dim, hidden_after,
-                                                     n_blocks, vocab),
+                                                     n_phys, vocab),
         nonzero_params=int(sparse.stats().total_nnz),
         never_share_count=len(ns_dims),
         shared_slots_saved=len(ns_dims) + sum(1 for l in liveness
                                               if not l.never_share) - new_dim,
     )
+    stats.n_apply = n_apply                         # applications (>= n_blocks for recurrent)
     return sparse, L, stats
 
 
@@ -1196,8 +1247,24 @@ def save_sparse_transformer(sparse, L, stats, path: str) -> None:
     re-wraps :class:`SparseTransformer` (so the reloaded model is byte-identical
     to the streamed one).  ``L`` is pickled whole (it is a small dataclass of int
     band offsets)."""
+    # Store the DISTINCT physical blocks once (deduped by object identity) + an
+    # ``apply_order`` index list mapping the full application sequence onto them.
+    # A recurrent-divmod model reuses the same SparseBlock object across the 8
+    # iterations, so saving ``sparse.blocks`` verbatim would write the reused body
+    # 8x; instead we save each unique block once and rebuild the sequence on load.
+    phys = getattr(sparse, "_phys_blocks", None)
+    if phys is None:
+        # dedup by identity, preserving first-seen order.
+        phys = []
+        seen: Dict[int, int] = {}
+        for b in sparse.blocks:
+            if id(b) not in seen:
+                seen[id(b)] = len(phys)
+                phys.append(b)
+    id_to_idx = {id(b): i for i, b in enumerate(phys)}
+    apply_order = [id_to_idx[id(b)] for b in sparse.blocks]
     blocks = []
-    for b in sparse.blocks:
+    for b in phys:
         at, ff = b.attn, b.ffn
         blk = {
             "n_heads": at.n_heads, "head_dim": at.head_dim, "scale": at.scale,
@@ -1223,6 +1290,7 @@ def save_sparse_transformer(sparse, L, stats, path: str) -> None:
         "lm_head": sparse.lm_head.detach().cpu().to_sparse().coalesce(),
         "lm_bias": sparse.lm_bias.detach().cpu().clone(),
         "blocks": blocks,
+        "apply_order": apply_order,        # full application sequence over ``blocks``
         "layout": L,
         "stats": stats,
     }
@@ -1290,14 +1358,27 @@ def load_sparse_transformer(path: str, compute_mode: Optional[str] = None):
             ff.b_down.copy_(blk["b_down"])
             holder.blocks.append(_LoadedBlock(at, ff))
     sparse = SparseTransformer(holder, compute_mode=mode)
+    # Rebuild the APPLICATION sequence: ``SparseTransformer.__init__`` wrapped the
+    # DISTINCT physical blocks 1:1; re-point ``sparse.blocks`` through the saved
+    # apply-order so a recurrent-divmod body's block object is reused across the 8
+    # iterations (byte-identical to the streamed model).  Absent (older artifacts)
+    # -> identity (already 1:1).
+    apply_order = payload.get("apply_order")
+    if apply_order is not None:
+        phys = sparse.blocks
+        sparse._phys_blocks = phys
+        sparse.blocks = [phys[i] for i in apply_order]
+    else:
+        sparse._phys_blocks = sparse.blocks
     return sparse, L
 
 
-def _rebuild_layout(pfc, code_size, n_heads, include_bitwise):
+def _rebuild_layout(pfc, code_size, n_heads, include_bitwise,
+                    recurrent_divmod=False):
     """Reconstruct the ``PureForwardCompleteLayout`` exactly as the builder does."""
     from . import nibble_pure_forward_complete as _pfc
     L = _pfc.PureForwardCompleteLayout(code_size, n_heads=n_heads)
-    _pfc.A.extend_layout_for_alu32(L)
+    _pfc.A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
     if include_bitwise:
         from . import nibble_bitwise as _bw
         _bw.extend_layout_for_bitwise(L)

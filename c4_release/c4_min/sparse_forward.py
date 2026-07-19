@@ -337,7 +337,15 @@ class SparseTransformer:
             dense_bytes += t.numel() * 4
             sparse_bytes += t.numel() * 4
             total_nnz += int((t != 0).sum().item())
+        # DISTINCT blocks only: a recurrent build reuses the same SparseBlock object
+        # many times in ``self.blocks`` (the application sequence), but the model
+        # STORES each unique block once — count storage/nnz by object identity so a
+        # reused block is not multiply-counted.
+        seen: set = set()
         for b in self.blocks:
+            if id(b) in seen:
+                continue
+            seen.add(id(b))
             for w in (b.attn.W_q, b.attn.W_k, b.attn.W_v, b.attn.W_o,
                       b.ffn.W_up, b.ffn.W_gate, b.ffn.W_down):
                 dense_bytes += w.dense_equiv_bytes()

@@ -11,13 +11,15 @@ def peak_rss_gb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024.0 * 1024.0)
 
 
-def measure(include_divmod, tag, code_size=48):
+def measure(include_divmod, tag, code_size=48, recurrent_divmod=False):
     t0 = time.monotonic()
     sparse, L, stats = build_compact_sparse_streaming(
         code_size=code_size, include_bitwise=False,
-        include_divmod=include_divmod, compute_mode="dense_kernel")
+        include_divmod=include_divmod, compute_mode="dense_kernel",
+        recurrent_divmod=recurrent_divmod)
     build_s = time.monotonic() - t0
-    n_blocks = len(sparse.blocks)
+    n_phys = len(getattr(sparse, "_phys_blocks", sparse.blocks))  # STORED blocks
+    n_apply = len(sparse.blocks)                                  # APPLICATIONS
     st = sparse.stats()
     nnz = st.total_nnz
     with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
@@ -25,10 +27,11 @@ def measure(include_divmod, tag, code_size=48):
     save_sparse_transformer(sparse, L, stats, path)
     size_mb = os.path.getsize(path) / (1024.0 * 1024.0)
     os.unlink(path)
-    print(f"[{tag}] blocks={n_blocks} nnz={nnz} artifact={size_mb:.2f}MB "
-          f"dim={L.D} build={build_s:.1f}s peak_rss={peak_rss_gb():.2f}GB")
-    return dict(blocks=n_blocks, nnz=nnz, size_mb=size_mb, dim=L.D,
-                build_s=build_s)
+    print(f"[{tag}] stored_blocks={n_phys} applied_blocks={n_apply} nnz={nnz} "
+          f"artifact={size_mb:.2f}MB dim={L.D} build={build_s:.1f}s "
+          f"peak_rss={peak_rss_gb():.2f}GB")
+    return dict(blocks=n_phys, applied=n_apply, nnz=nnz, size_mb=size_mb,
+                dim=L.D, build_s=build_s)
 
 
 if __name__ == "__main__":
@@ -37,6 +40,11 @@ if __name__ == "__main__":
         measure(False, "LEAN")
     elif which == "divmod":
         measure(True, "DIVMOD")
+    elif which == "recurrent":
+        measure(True, "DIVMOD-RECURRENT", recurrent_divmod=True)
+    elif which == "compare":
+        measure(True, "DIVMOD-UNROLLED")
+        measure(True, "DIVMOD-RECURRENT", recurrent_divmod=True)
     else:
         measure(False, "LEAN")
         measure(True, "DIVMOD")
