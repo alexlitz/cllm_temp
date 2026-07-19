@@ -59,6 +59,12 @@ from .model import Transformer
 from . import universal as U
 
 EMIT = C.EMIT
+# EMITP: emit at the RUNTIME output pointer OUT_PTR (a moving code-emit cursor),
+# then OUT_PTR += 1.  Needed by a LOOP compiler that emits a variable number of
+# produced instructions (its output address is not a compile-time constant).
+EMITP = 31
+isa.NAMES.setdefault(EMITP, "EMITP")
+isa.BY_NAME.setdefault("EMITP", EMITP)
 silu_S_full = float(F.silu(torch.tensor(FFN_S)))
 
 
@@ -447,3 +453,248 @@ class DedupBakedCompilerMachine:
     @property
     def n_blocks(self) -> int:
         return len(self.model.blocks)
+
+
+# ============================================================================ #
+#  LOOP COMPILER: a variable-length code emitter with a MOVING output pointer   #
+#                                                                               #
+#  The fixed-slot EMIT (CODE[imm] := ...) forces a compile-time-constant target #
+#  slot per emit-site, so a compiler that emits an UNBOUNDED number of produced #
+#  instructions (a loop over a variable-length source) cannot use it.  EMITP    #
+#  writes at the RUNTIME cursor OUT_PTR and bumps it, so a bytecode LOOP can     #
+#  emit as many words as the source demands.  This is the mechanism a real      #
+#  recursive/looping c4 codegen needs (``code[code_pos++] = word``).            #
+# ============================================================================ #
+
+def build_loop_compiler_layout(gen_size: int, out_size: int, src_size: int,
+                               mem_size: int = 0, stack_depth: int = 8,
+                               n_heads: int = 4, base=None) -> Layout:
+    """As ``build_dedup_compiler_layout`` plus an OUT_PTR emit cursor + its
+    one-hot (OUT_PTR_IS over the OUT region) for the moving-pointer EMITP."""
+    N = gen_size + out_size
+    B = base if base is not None else _choose_base(N)
+    H = (N + B - 1) // B
+
+    L = Layout(n_heads=n_heads)
+    L.GEN_SIZE = gen_size
+    L.OUT_SIZE = out_size
+    L.CODE_SIZE = N
+    L.SRC_SIZE = src_size
+    L.MEM_SIZE = mem_size
+    L.ADDR_MAX = max(src_size, mem_size)
+    L.PACKED = True
+    L.PC_BASE = B
+    L.PC_HI_N = H
+
+    L.PC_HI = L._band("PC_HI", 1)
+    L.PC_LO = L._band("PC_LO", 1)
+    L.PC_HI_IS = [L._band(f"PC_HI_IS_{h}", 1) for h in range(H)]
+    L.PC_LO_IS = [L._band(f"PC_LO_IS_{l}", 1) for l in range(B)]
+    L.WORD = L._band("WORD", 1)
+    L.OUT_WORD = [L._band(f"OUT_WORD_{k}", 1) for k in range(out_size)]
+    L.OUT_ADDR_IS = [L._band(f"OUT_ADDR_IS_{k}", 1) for k in range(out_size)]
+    # moving emit cursor: OUT_PTR is an ABSOLUTE code address (gen_size..N);
+    # OUT_PTR_IS[k] = (OUT_PTR - gen_size == k) is the store-address one-hot.
+    L.OUT_PTR = L._band("OUT_PTR", 1)
+    L.OUT_PTR_IS = [L._band(f"OUT_PTR_IS_{k}", 1) for k in range(out_size)]
+    L.SRC = [L._band(f"SRC_{i}", 1) for i in range(src_size)]
+    L.AX_IS = [L._band(f"AX_IS_{i}", 1) for i in range(L.ADDR_MAX)]
+    L.MEM = [L._band(f"MEM_{i}", 1) for i in range(mem_size)]
+    L.MEM_IS = [L._band(f"MEM_IS_{i}", 1) for i in range(mem_size)]
+    L.STACK_DEPTH = stack_depth
+    L.STACK = [L._band(f"STACK_{i}", 1) for i in range(stack_depth)]
+    L.SP_IS = [L._band(f"SP_IS_{i}", 1) for i in range(stack_depth)]
+    L.OP_VAL = L._band("OP_VAL", 1)
+    L.OP_IS = L._band("OP_IS", isa.NUM_OPS)
+    L.OUT_SLOTS = [L._band("OUT_0", 1)]
+    L.HALT_SEEN = [L._band("HSEEN_0", 1)]
+    while L._off % n_heads != 0:
+        L._band(f"_pad2_{L._off}", 1)
+    L.D = L._off
+    return L
+
+
+def compile_out_ptr_onehot(L: Layout, dim: int):
+    """OUT_PTR_IS[k] = (OUT_PTR - gen_size == k): the EMITP store-address one-hot
+    over the OUT region (indexed by the moving emit cursor OUT_PTR)."""
+    n = L.OUT_SIZE
+    gen = L.GEN_SIZE
+    thr = list(range(-1, n + 1))
+    tu = {t: j for j, t in enumerate(thr)}
+    nrel = len(thr)
+    c0 = nrel
+    nu = c0 + n
+    Wu = torch.zeros(nu, dim); bu = torch.zeros(nu)
+    Wg = torch.zeros(nu, dim); bg = torch.zeros(nu)
+    Wd = torch.zeros(dim, nu); bd = torch.zeros(dim)
+    for t, j in tu.items():
+        Wu[j, L.OUT_PTR] = RELU_S; bu[j] = -RELU_S * (t + gen); Wg[j, L.ONE] = 1.0
+    for c, band in enumerate(L.OUT_PTR_IS):
+        u = c0 + c
+        Wu[u, L.ONE] = FFN_S; Wg[u, band] = 1.0
+        Wd[band, u] += -1.0 / silu_S_full
+    for i, band in enumerate(L.OUT_PTR_IS):
+        Wd[band, tu[i - 1]] += 1.0 / RELU_S
+        Wd[band, tu[i]] += -2.0 / RELU_S
+        Wd[band, tu[i + 1]] += 1.0 / RELU_S
+    return {"W_up": Wu, "b_up": bu, "W_gate": Wg, "b_gate": bg,
+            "W_down": Wd, "b_down": bd}
+
+
+def compile_emitp_store(L: Layout, dim: int):
+    """EMITP: ``OUT_WORD[OUT_PTR-gen] := AX + 256*STACK0``, gated on OP_IS[EMITP].
+    Then PC += 1; SP -= 1 (pop produced-imm); OUT_PTR += 1 (advance the cursor).
+    Store-select over OUT_WORD addressed by OUT_PTR_IS (the moving cursor one-hot).
+    """
+    n = L.OUT_SIZE
+    BIG = 256.0
+    silu_big = float(F.silu(torch.tensor(0.5 * BIG)))
+    op = L.OP_IS + EMITP
+    n_units = 3 * n + 3
+    Wu = torch.zeros(n_units, dim); bu = torch.zeros(n_units)
+    Wg = torch.zeros(n_units, dim); bg = torch.zeros(n_units)
+    Wd = torch.zeros(dim, n_units); bd = torch.zeros(dim)
+
+    def _and_unit(u, addr_band, gate_terms, dst, coeff):
+        Wu[u, op] += BIG
+        Wu[u, addr_band] += BIG
+        bu[u] += -BIG * 1.5
+        for band, cg in gate_terms:
+            Wg[u, band] += cg
+        Wd[dst, u] += coeff / silu_big
+
+    u = 0
+    for k in range(n):
+        _and_unit(u, L.OUT_PTR_IS[k], [(L.AX, 1.0)], L.OUT_WORD[k], +1.0); u += 1
+        _and_unit(u, L.OUT_PTR_IS[k], [(L.STACK0, 256.0)], L.OUT_WORD[k], +1.0); u += 1
+        _and_unit(u, L.OUT_PTR_IS[k], [(L.OUT_WORD[k], 1.0)], L.OUT_WORD[k], -1.0); u += 1
+    silu_S = float(F.silu(torch.tensor(0.5 * FFN_S)))
+    Wu[u, op] += FFN_S; bu[u] += -FFN_S * 0.5; Wg[u, L.ONE] += 1.0
+    Wd[L.PC, u] += 1.0 / silu_S; u += 1
+    Wu[u, op] += FFN_S; bu[u] += -FFN_S * 0.5; Wg[u, L.ONE] += 1.0
+    Wd[L.SP, u] += -1.0 / silu_S; u += 1
+    Wu[u, op] += FFN_S; bu[u] += -FFN_S * 0.5; Wg[u, L.ONE] += 1.0
+    Wd[L.OUT_PTR, u] += 1.0 / silu_S
+    return {"W_up": Wu, "b_up": bu, "W_gate": Wg, "b_gate": bg,
+            "W_down": Wd, "b_down": bd}
+
+
+def build_loop_compiler_step(gen_code: List[isa.Instr], out_size: int,
+                             src_size: int, mem_size: int = 8,
+                             stack_depth: int = 8, n_heads: int = 4,
+                             max_pos: int = 4, base=None, out_ptr_init=None):
+    """COMPILER-IN-WEIGHTS with the deduped fetch AND a moving-pointer EMITP, so a
+    bytecode LOOP can emit a variable number of produced instructions.  OUT_PTR is
+    initialised to ``out_ptr_init`` (default gen_size, the start of the OUT region)
+    in the embedding.  Returns ``(model, L)``.
+    """
+    from .stack import compile_sp_fetch, compile_stack0_select
+    gen_size = len(gen_code)
+    L = build_loop_compiler_layout(gen_size, out_size, src_size, mem_size=mem_size,
+                                   stack_depth=stack_depth, n_heads=n_heads, base=base)
+    L.OUT_PTR_INIT = gen_size if out_ptr_init is None else out_ptr_init
+    dim = L.D
+
+    pc_fetch_specs = compile_factored_pc_fetch(L, dim)
+    ffn_specs = [
+        *pc_fetch_specs,
+        compile_dedup_word_select(L, gen_code, dim),
+        U.compile_word_decode_imm(L, dim),
+        U.compile_word_decode_op(L, dim),
+        U.compile_opcode_decode(L, dim),
+        compile_sp_fetch(L.SP, L.STACK, L.SP_IS, L.STACK0, L.ONE, dim),
+        compile_stack0_select(L.STACK, L.SP_IS, L.STACK0, L.ONE, dim),
+        compile_out_store_addr_onehot(L, dim),
+        compile_out_ptr_onehot(L, dim),
+        C.compile_ax_addr_onehot(L, dim),
+        C.compile_mem_store_addr_onehot(L, dim),
+        compile_ffn(C.compiler_dispatch_rules(L), dim),
+        C.compile_mul_dispatch(L, dim),
+        C.compile_lc_source_read(L, dim),
+        C.compile_li_mem_read(L, dim),
+        C.compile_si_mem_store(L, dim),
+        compile_out_emit_store(L, dim),
+        compile_emitp_store(L, dim),
+        U.compile_branch_delta(L, dim),
+        compile_fold(L.AX, L.ONE, dim, modulus=256),
+        compile_ffn([
+            FFNRule([(L.ONE, 0.5, 1.5)], {L.OUT_SLOTS[0]: LinearExpr.of(L.AX, 1.0)
+                                          + LinearExpr.of(L.OUT_SLOTS[0], -1.0)}),
+            FFNRule([(L.ONE, 0.5, 1.5)], {L.HALT_SEEN[0]: LinearExpr.of(L.HALTED, 1.0)
+                                          + LinearExpr.of(L.HALT_SEEN[0], -1.0)}),
+        ], dim),
+    ]
+    n_blocks = len(ffn_specs)
+    hidden = max(f["W_up"].shape[0] for f in ffn_specs)
+    model = Transformer(dim=dim, n_heads=n_heads, hidden=hidden,
+                        n_blocks=n_blocks, max_pos=max_pos, vocab=VOCAB)
+    with torch.no_grad():
+        model.embed.zero_()
+        model.embed[0, L.ONE] = 1.0
+        model.embed[0, L.OUT_PTR] = float(L.OUT_PTR_INIT)
+        for blk, spec in zip(model.blocks, ffn_specs):
+            _zero_attn(blk.attn)
+            _load_ffn(blk.ffn, spec, hidden)
+        _load_head(model, L)
+    return model, L
+
+
+def run_loop_compiler(model, L, src: List[int], max_steps: int = 8192,
+                      requantize: bool = True, return_code: bool = False):
+    W, b = head_matrix(L, model.dim, L.OUT_SLOTS[0], halt_band=None)
+    halt_seen = L.HALT_SEEN[0]
+    state = model.embed[0].clone()
+    for i, ch in enumerate(src):
+        state[L.SRC[i]] = float(ch & 0xFF)
+    trace: List[int] = []
+    for _ in range(max_steps):
+        state = C._step_once(model, state)
+        if requantize:
+            state = C._requantize(state, L)
+        logits = F.linear(state, W, b)
+        trace.append(int(logits.argmax().item()))
+        if float(state[halt_seen]) > 0.5:
+            break
+    if return_code:
+        words = [int(round(float(state[L.OUT_WORD[k]]))) for k in range(L.OUT_SIZE)]
+        return trace, words
+    return trace
+
+
+class LoopCompilerMachine:
+    """A C compiler that IS a transformer, deduped fetch + moving-pointer EMITP.
+    Its bytecode can LOOP over a variable-length source, emitting a variable number
+    of produced instructions at the runtime cursor OUT_PTR (start = gen_size)."""
+
+    def __init__(self, prog, out_size: int, src_size: int, mem_size: int = 8,
+                 stack_depth: int = 8, n_heads: int = 4, base=None):
+        self.gen_code = _assemble_loop(prog)
+        self.out_size = out_size
+        self.model, self.L = build_loop_compiler_step(
+            self.gen_code, out_size, src_size, mem_size=mem_size,
+            stack_depth=stack_depth, n_heads=n_heads, base=base)
+
+    def run(self, source, max_steps: int = 8192, requantize: bool = True,
+            return_code: bool = False):
+        return run_loop_compiler(self.model, self.L, C._source_bytes(source),
+                                 max_steps=max_steps, requantize=requantize,
+                                 return_code=return_code)
+
+    @property
+    def n_blocks(self) -> int:
+        return len(self.model.blocks)
+
+
+def _assemble_loop(prog) -> List[isa.Instr]:
+    """assemble understanding EMIT (30) and EMITP (31) mnemonics."""
+    out = []
+    for entry in prog:
+        name, imm = (entry if isinstance(entry, tuple) else (entry, 0))
+        if name == "EMIT":
+            op = EMIT
+        elif name == "EMITP":
+            op = EMITP
+        else:
+            op = isa.BY_NAME[name]
+        out.append(isa.Instr(op, imm & 0xFF))
+    return out
