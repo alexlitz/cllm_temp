@@ -135,6 +135,56 @@ def test_vectorized_prune_matches_reference():
     assert mism == 0, f"{mism}/{trials} prune keep-set mismatches"
 
 
+def test_vectorized_prune_matches_reference_large_and_content_addressed():
+    """Byte-identity of the vectorised keep-mask on the DEEP-TAIL regime that the
+    per-entry Python loop was too slow for: LARGE near-dup-heavy caches (the live
+    heap a rec_fib(12) reaches) and the EXPLICIT ``content_addressed`` flag (the
+    free-driven §Memory head — live non-zero stores are never recency-dropped).
+
+    Complements ``test_vectorized_prune_matches_reference`` (720 small trials): it
+    stresses the two regimes the vectorisation targets — many near-duplicate
+    register markers repeated across steps, and the address-CAM live-heap head.
+    """
+    torch.manual_seed(7)
+    mism = 0
+    trials = 0
+    HD = 8
+    scale = HD ** -0.5
+    for S in [200, 600, 1500]:
+        # a realistic live-heap cache: a handful of distinct key groups (register
+        # markers / store addresses) each repeated across many steps (near-dup),
+        # plus freed/NULL zero rows — exactly the supersession-heavy shape.
+        n_groups = 24
+        proto = torch.randn(n_groups, HD)
+        idx = torch.randint(0, n_groups, (S,))
+        keys = proto[idx] * (1.0 + 0.0005 * torch.randn(S, 1))
+        vals = torch.randn(S, HD)
+        zmask = torch.rand(S) < 0.15
+        vals[zmask] = 0.0
+        zk = zmask & (torch.rand(S) < 0.5)
+        keys[zk] = 0.0
+        positions = torch.arange(S) * 30
+        slope = 0.25
+        for cos_thr, zeps, reps in [(0.99, 1e-9, 1e-6), (0.999, 1e-9, 1e-9)]:
+            for dm, ca in [("cosine", False), ("exact", True), ("exact", False),
+                           ("cosine", True)]:
+                c = KVCache(cos_threshold=cos_thr, zero_eps=zeps, slope=slope,
+                            recency_eps=reps, score_scale=scale, dup_metric=dm,
+                            content_addressed=ca)
+                for i in range(S):
+                    c.append(keys[i], vals[i], int(positions[i]), meta=i)
+                c.prune()
+                ref = set(e.meta for e in c.entries)
+                mask = prune_keep_mask_head(keys, vals, positions, slope, scale,
+                                            cos_thr, zeps, reps, dup_metric=dm,
+                                            content_addressed=ca)
+                vec = set(torch.nonzero(mask, as_tuple=False).flatten().tolist())
+                trials += 1
+                if ref != vec:
+                    mism += 1
+    assert mism == 0, f"{mism}/{trials} large/content-addressed keep-set mismatches"
+
+
 def test_driver_byte_identical_naive_incl_functions_and_eviction():
     """The KV-cached (+evicted) driver's full output is BYTE-IDENTICAL to the
     naive re-forward driver on a battery that exercises the eviction hazards:
@@ -184,5 +234,6 @@ if __name__ == "__main__":
     test_cached_attention_matches_full()
     test_uncached_forward_byte_identical()
     test_vectorized_prune_matches_reference()
+    test_vectorized_prune_matches_reference_large_and_content_addressed()
     test_driver_byte_identical_naive_incl_functions_and_eviction()
     print("all KV-cache equivalence tests passed")
