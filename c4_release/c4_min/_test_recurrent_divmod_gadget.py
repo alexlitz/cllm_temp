@@ -60,7 +60,14 @@ def run_unrolled(a_val, b_val):
     return div & 0xFFFFFFFF, mod & 0xFFFFFFFF
 
 
-def main():
+_CASES = [(0, 1), (1, 1), (7, 2), (100, 7), (999, 7), (1000, 13), (255, 16),
+          (65535, 255), (0xFFFFFFFF, 3), (123456, 789), (5, 0), (0, 0),
+          (2**31, 2), (2**32 - 1, 15), (42, 42), (41, 42), (1000000, 1),
+          (720, 6), (84, 5), (10**9, 7), (0xFFFFFFFF, 0xFFFFFFFF),
+          (0xDEADBEEF, 0x1234), (256, 256), (65536, 65537)]
+
+
+def _setup():
     n_heads = N_ROLES + 3
     L = PureForwardCompleteLayout(8, n_heads=n_heads)
     A.extend_layout_for_alu32(L, recurrent_divmod=True)
@@ -68,12 +75,35 @@ def main():
     A._ONE = L.ONE
     unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim, n_iters=8)
     unique = [(n, {k: v.to(torch.float64) for k, v in s.items()}) for n, s in unique]
+    return L, dim, unique, apply_names
 
-    cases = [(0, 1), (1, 1), (7, 2), (100, 7), (999, 7), (1000, 13), (255, 16),
-             (65535, 255), (0xFFFFFFFF, 3), (123456, 789), (5, 0), (0, 0),
-             (2**31, 2), (2**32 - 1, 15), (42, 42), (41, 42), (1000000, 1),
-             (720, 6), (84, 5), (10**9, 7), (0xFFFFFFFF, 0xFFFFFFFF),
-             (0xDEADBEEF, 0x1234), (256, 256), (65536, 65537)]
+
+def test_recurrent_divmod_byte_identical_to_unrolled():
+    """The recurrent single-iteration-body divmod is byte-identical to the 262-block
+    unrolled stack across the full battery (incl x/0, x%0, 32-bit edges)."""
+    L, dim, unique, apply_names = _setup()
+    for a_val, b_val in _CASES:
+        div, mod = run(a_val, b_val, L, dim, unique, apply_names)
+        udiv, umod = run_unrolled(a_val, b_val)
+        assert (div, mod) == (udiv, umod), f"{a_val}/%{b_val}: rec({div},{mod}) != unrolled({udiv},{umod})"
+
+
+def test_recurrent_divmod_stores_fewer_blocks():
+    """The recurrent build STORES one reused iteration body, not 8 unrolled copies:
+    115 unique divmod blocks applied as 262 (8x the 21-block body + prefix/final)."""
+    L, dim, unique, apply_names = _setup()
+    assert len(unique) == 115, len(unique)
+    assert len(apply_names) == 262, len(apply_names)
+    # the reused body must recur exactly 8x (the digit count).
+    from collections import Counter
+    counts = Counter(apply_names)
+    body_reused = [n for n, c in counts.items() if c == 8]
+    assert len(body_reused) == 21, sorted(body_reused)
+
+
+def main():
+    L, dim, unique, apply_names = _setup()
+    cases = _CASES
     ok_ref = 0        # byte-identity vs the UNROLLED block stack (the real gate)
     ok_num = 0        # sanity vs divmod32 (informational; b==0 mod differs by design)
     for a_val, b_val in cases:
