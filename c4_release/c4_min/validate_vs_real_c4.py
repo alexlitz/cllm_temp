@@ -91,7 +91,53 @@ def main():
             print("   real  :", [hex(w) for w in real_core])
     print("-" * 56)
     print("model-produced arith cores byte-identical to real c4 (all):", allok)
-    return 0 if allok else 1
+
+    # ---- FETCH-DEDUP: the variable-length LOOP compiler (sub-linear D) ----
+    from c4_min import loop_compiler as LC
+    from c4_min import nibble_fetch_dedup as FD
+    chain_exprs = ["2+3+4+5", "2*3*4*5", "7+8+9", "1+2+3+4+5+6",
+                   "3+3+3+3+3+3+3", "1+1+1+1+1+1+1+1+1+1"]
+    prog = LC.chain_compiler_bytecode()
+    lm = FD.LoopCompilerMachine(prog, out_size=48, src_size=32,
+                                mem_size=8, stack_depth=16)
+    print(f"\nDEDUP loop compiler-in-weights: D={lm.L.D} (baseline for the same "
+          f"code_size ~ {3*(lm.L.CODE_SIZE)+148}), {lm.n_blocks} blocks, "
+          f"gen_size={lm.L.GEN_SIZE}")
+    print(f"{'C chain':>22} {'len':>4} {'result':>7} {'core vs real c4':>16}")
+    print("-" * 56)
+    loopok = True
+    for e in chain_exprs:
+        src = [ord(c) for c in e] + [0]
+        trace, words = lm.run(src, max_steps=30000, return_code=True)
+        produced = []
+        for w in words:
+            produced.append(w)
+            if (w & 0xFF) == isa.HALT:
+                break
+        model_core = [w for w in produced if (w & 0xFF) != isa.HALT]
+        real_core = c4_arith_core(real_c4_words(args.c4, e))
+        core_ok = model_core == real_core
+        res_ok = trace[-1] == (eval(e) & 0xFF)
+        loopok &= core_ok and res_ok
+        print(f"{e:>22} {len(e):>4} {trace[-1]:>7} "
+              f"{('MATCH' if core_ok else 'DIFFER') + ('' if res_ok else '!'):>16}")
+        if not core_ok:
+            print("   model :", [hex(w) for w in model_core])
+            print("   real  :", [hex(w) for w in real_core])
+    print("-" * 56)
+    print("dedup loop-compiler cores byte-identical to real c4 (all):", loopok)
+
+    # ---- the full-c4-scale D wall (dedup vs baseline projection) ----
+    base = C._assemble(C.expr_compiler_bytecode(outbase=0))
+    filler = isa.Instr(isa.IMM, 0)
+    gen4k = list(base) + [filler] * (4000 - len(base))
+    _, L4k = FD.build_dedup_baked_compiler_step(gen4k, out_size=48, src_size=32,
+                                                mem_size=8, stack_depth=16)
+    base_proj = 3 * (L4k.CODE_SIZE) + 148
+    print(f"\nfull-c4-scale (gen_size=4000): dedup D={L4k.D} vs baseline "
+          f"D~{base_proj} ({base_proj / L4k.D:.0f}x smaller residual)")
+
+    return 0 if (allok and loopok) else 1
 
 
 if __name__ == "__main__":

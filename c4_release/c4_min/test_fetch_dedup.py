@@ -78,3 +78,44 @@ def test_D_is_sublinear():
     # doubling-ish code_size must NOT triple D (baseline would ~triple).
     (g0, d0), (g1, d1) = ds[0], ds[-1]
     assert d1 / d0 < 2.0, ds        # ~x60 code -> < x2 D
+
+
+def test_loop_compiler_variable_length():
+    """The LOOP compiler emits a VARIABLE number of produced instrs (moving EMITP
+    cursor) byte-identically to the c4 pattern IMM d0;[PSH;IMM di;OP]*;HALT."""
+    from c4_min import loop_compiler as LC
+    prog = LC.chain_compiler_bytecode()
+    machine = D.LoopCompilerMachine(prog, out_size=48, src_size=32,
+                                    mem_size=8, stack_depth=16)
+    cases = {
+        "2+3+4+5": [1|(2<<8), 13, 1|(3<<8), 25, 13, 1|(4<<8), 25, 13, 1|(5<<8), 25],
+        "2*3*4*5": [1|(2<<8), 13, 1|(3<<8), 27, 13, 1|(4<<8), 27, 13, 1|(5<<8), 27],
+        "7+8+9":   [1|(7<<8), 13, 1|(8<<8), 25, 13, 1|(9<<8), 25],
+    }
+    for e, exp_core in cases.items():
+        src = [ord(c) for c in e] + [0]
+        trace, words = machine.run(src, max_steps=20000, return_code=True)
+        produced = []
+        for w in words:
+            produced.append(w)
+            if (w & 0xFF) == isa.HALT:
+                break
+        core = [w for w in produced if (w & 0xFF) != isa.HALT]
+        assert core == exp_core, (e, [hex(w) for w in core])
+        assert trace[-1] == (eval(e) & 0xFF), (e, trace[-1])
+
+
+def test_full_c4_scale_builds_small_D():
+    """A full-c4-scale baked compiler (gen_size~4000) fits a small residual D
+    (~<600) — the fetch-dedup wall, vs the baseline 3*code_size+148 ~= 12k."""
+    from c4_min import nibble_compiler as C
+    base = C._assemble(C.expr_compiler_bytecode(outbase=0))
+    filler = isa.Instr(isa.IMM, 0)
+    gen = list(base) + [filler] * (4000 - len(base))
+    model, L = D.build_dedup_baked_compiler_step(gen, out_size=48, src_size=32,
+                                                 mem_size=8, stack_depth=16)
+    assert L.D < 600, L.D
+    # baseline would be > 12000
+    Lb = C.build_compiler_layout(4048, 32, 8, 16)
+    assert Lb.D > 12000
+    assert Lb.D / L.D > 20
