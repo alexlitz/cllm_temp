@@ -576,3 +576,69 @@ def run_battery(verbose: bool = True) -> dict:
         print(f"=== battery: {n_pass}/{len(results)} byte-exact through "
               f"model.generate(do_sample=False) ===")
     return {"n_pass": n_pass, "n_total": len(results), "results": results}
+
+
+# ===========================================================================
+# USAGE — the two exact snippets (also runnable: ``python -m c4_min.vm_causal_lm``).
+# ===========================================================================
+def _usage_generate() -> None:
+    """SNIPPET 1 — ``C4VMForCausalLM(...).generate(...)`` RUNS a program."""
+    from transformers import StoppingCriteriaList
+    # 1. compile a program (compute 6 + 7) and build the genuine HF causal LM.
+    code = isa.assemble([("IMM", 6), ("PSH", 0), ("IMM", 7), ("ADD", 0), ("HALT", 0)])
+    model = build_c4_causal_lm(code, subset=Q.SUBSET_BASE)      # a Qwen2Model VM
+    # 2. greedy generate() autoregressively RUNS the VM (argmax over the frame vocab).
+    out = model.generate(
+        torch.tensor([[V.BOS]]), do_sample=False, max_new_tokens=512,
+        stopping_criteria=StoppingCriteriaList([HaltStoppingCriteria()]),
+        pad_token_id=V.HALT)
+    # 3. the emitted frame stream decodes byte-exact to the reference.
+    ax = decode_ax_trace(out[0].tolist())
+    print("SNIPPET 1  generate() runs the VM")
+    print(f"  AX trace   : {ax}")
+    print(f"  isa.interpret: {isa.interpret(code)}")
+    print(f"  byte-exact : {ax == isa.interpret(code)}\n")
+
+
+def _usage_stream_chat() -> None:
+    """SNIPPET 2 — ``TextIteratorStreamer`` + a chat turn, thinking as reasoning_content."""
+    import threading
+    from transformers import TextIteratorStreamer, StoppingCriteriaList
+    from .vm_tokenizer import C4VMTokenizer
+    tok = C4VMTokenizer()
+    # a chat turn (chat template, enable_thinking) computing 20 + 22:
+    _prompt = tok.apply_chat_template(
+        [{"role": "user", "content": "compute 20 + 22"}], tokenize=False,
+        enable_thinking=True)
+    code = isa.assemble([("IMM", 20), ("PSH", 0), ("IMM", 22), ("ADD", 0), ("HALT", 0)])
+    model = build_c4_causal_lm(code, subset=Q.SUBSET_BASE)
+    # stream the frame tokens live through a GENUINE transformers.TextIteratorStreamer.
+    streamer = TextIteratorStreamer(tok, skip_prompt=True)
+    box = {}
+
+    def _run():
+        box["out"] = model.generate(
+            torch.tensor([[V.BOS]]), do_sample=False, max_new_tokens=512,
+            streamer=streamer, pad_token_id=V.HALT,
+            stopping_criteria=StoppingCriteriaList([HaltStoppingCriteria()]))
+
+    th = threading.Thread(target=_run); th.start()
+    print("SNIPPET 2  TextIteratorStreamer + chat turn (thinking via reasoning_content)")
+    for _piece in streamer:                        # frames stream live as <think>…
+        pass
+    th.join()
+    ids = box["out"][0].tolist()
+    parts = tok.split(ids)                          # structured reasoning/content split
+    msg = {"role": "assistant", "reasoning_content": parts["reasoning_content"],
+           "content": parts["content"]}
+    print(f"  reasoning_content: {len(msg['reasoning_content'].splitlines())} "
+          f"register-frame thinking steps (hidden)")
+    print(f"  last reasoning line: {msg['reasoning_content'].splitlines()[-1]}")
+    print(f"  content (visible)  : {msg['content']!r}  "
+          f"(this compute program has no PRTF; AX=42 in the final frame)\n")
+
+
+if __name__ == "__main__":
+    _usage_generate()
+    _usage_stream_chat()
+    run_battery()
