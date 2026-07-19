@@ -104,17 +104,80 @@ def apply_overlay_window(x_win: torch.Tensor, w_start: int, code, L,
 
 
 # ===========================================================================
-# VECTORISED per-head prune keep-mask — a torch re-expression of the EXACT three
+# VECTORISED per-head prune keep-mask — a torch re-expression of the EXACT four
 # ``nibble_kv_prune.KVCache.prune`` mechanisms (validated byte-for-byte against
-# the reference in ``test_cached_driver`` / ``test_evict_vectorized_matches``).
-# The reference is O(n^2) per-entry Python; this runs the same decision in a
-# handful of batched tensor ops so eviction is tractable on deep loops.
+# the reference in ``test_kv_cache_equivalence`` / ``test_cached_driver``).
+#
+# The reference is O(cache^2) PER-ENTRY *PYTHON*: a greedy newest-first loop that
+# compares every entry to each already-kept survivor, one Python iteration each
+# (mechanism 1) plus a per-entry Python free-zero scan (mechanism 2b).  That makes
+# eviction CPU-serial and leaves the GPU IDLE during it on a deep loop — a
+# rec_fib(12) ~250k-token stream reaches a large live-heap cache and the pruning
+# dominated wall-time.  This form runs the SAME decision as a handful of *batched
+# tensor ops* ON THE INPUT DEVICE:
+#   * mechanism 1's O(cache^2) pairwise near-dup test is ONE matmul / cdist
+#     (GPU-busy), and the greedy newest-first selection is a fully-vectorised
+#     recency-rank fixpoint (``_greedy_survivors_from_dup_matrix``) — no per-entry
+#     Python loop, no per-entry device<->host ``.item()`` sync;
+#   * mechanisms 3 / 2a / 2b are plain boolean masks over the whole cache.
+# The keep-mask is BYTE-IDENTICAL to the per-entry policy (720-trial gate); only
+# the SPEED changes, and the whole computation stays on ``keys.device``.
 # ===========================================================================
+def _greedy_survivors_from_dup_matrix(D: torch.Tensor,
+                                      positions: torch.Tensor) -> torch.Tensor:
+    """Fully-vectorised equivalent of the reference greedy newest-first near-dup
+    loop, given the boolean pairwise near-dup matrix ``D`` (``D[i,j]`` = entry i
+    is a near-duplicate of entry j; diagonal already cleared).
+
+    The reference (``KVCache.prune`` mechanism 1) processes entries newest-first
+    and keeps an entry iff it is NOT a near-dup of any ALREADY-KEPT (hence newer)
+    entry.  That "compare only to survivors" rule differs from a naive "drop if
+    ANY newer near-dup exists" whenever the near-dup relation is non-transitive
+    (a rare angle-chain A~B, B~C, A!~C), so we reproduce the greedy exactly:
+
+        keep[e] = NOT OR_f ( f strictly-newer-than-e AND D[e,f] AND keep[f] )
+
+    Dependencies point only to strictly-newer entries (a total recency order), so
+    the recurrence is an ACYCLIC fixpoint: iterating from ``keep = all True`` each
+    entry reaches its final value once all newer entries have settled, in at most
+    (longest non-transitive chain) passes — 1 for the transitive common case.  We
+    iterate to convergence with a hard ``S``-pass cap (the DAG-depth bound) so it
+    is guaranteed to terminate at the exact greedy answer, no per-entry Python.
+
+    Tie-break: the reference uses a STABLE ``sorted(..., reverse=True)`` — equal
+    positions keep their original (ascending-index) append order, i.e. among ties
+    the lower index is processed first ("newer").  We encode that total order as a
+    rank so "strictly newer" is exact even with duplicate positions.
+    """
+    S = D.shape[0]
+    dev = D.device
+    # Total recency order matching the reference's stable reverse-sort: primary key
+    # = position DESCENDING, tie-break = index ASCENDING (processed first == the
+    # "newer" survivor a duplicate defers to).  ``argsort(argsort(key, desc))``
+    # gives rank 0 = newest.  ``key = position*S - index`` is a strictly-monotone
+    # encoding of (position desc, index asc) for the small non-negative positions
+    # and ``index < S`` used here.
+    idx = torch.arange(S, device=dev)
+    order_key = positions.to(torch.int64) * S - idx
+    rank = torch.argsort(torch.argsort(order_key, descending=True))
+    # newer[e,f] = f is strictly-newer than e AND a near-dup of e.
+    newer = D & (rank.unsqueeze(1) > rank.unsqueeze(0))
+    keep = torch.ones(S, dtype=torch.bool, device=dev)
+    for _ in range(S + 1):
+        drop = (newer & keep.unsqueeze(0)).any(dim=1)   # e drops if a KEPT newer dup
+        new_keep = ~drop
+        if bool(torch.equal(new_keep, keep)):
+            return new_keep
+        keep = new_keep
+    return keep
+
+
 def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
                          positions: torch.Tensor, slope: float, scale: float,
                          cos_threshold: float, zero_eps: float,
                          recency_eps: float,
-                         dup_metric: str = "cosine") -> torch.Tensor:
+                         dup_metric: str = "cosine",
+                         content_addressed: Optional[bool] = None) -> torch.Tensor:
     """Return a boolean ``[S]`` keep-mask == the survivors of ``KVCache.prune``.
 
     Reproduces, in order:
@@ -126,79 +189,110 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
     ``dup_metric`` = "cosine" (register-marker heads) or "exact" (content-
     addressed §Memory heads whose keys share a large ADDR_BIN common-mode bias;
     see ``nibble_kv_prune.KVCache.prune``).
+
+    ``content_addressed`` (``None`` ⇒ infer from ``dup_metric == "exact"``) marks
+    a §Memory (address-CAM) head, whose non-zero-value store rows are the LIVE
+    HEAP.  On such a head the recency HORIZON must NOT drop a live (non-zero-value,
+    non-superseded) store — it is FREE-DRIVEN (evicted only by supersession or by
+    freeing/zeroing), so the cache tracks the UNBOUNDED live heap with no fixed
+    recency/size cap (BLOG_SPEC §Memory 410-412 + §Memory Allocation/Freeing
+    689-691).  Matches ``nibble_kv_prune.KVCache.prune`` mechanism 3 exactly.
+
+    Fully vectorised: every mechanism is a batched tensor op on ``keys``'s device
+    (the O(cache^2) near-dup test is one matmul/cdist), with no per-entry Python
+    loop — the eviction runs GPU-bound on the deep tail, byte-identical keep-mask.
     """
-    import math
+    if content_addressed is None:
+        content_addressed = (dup_metric == "exact")
     S = keys.shape[0]
+    dev = keys.device
     if S == 0:
-        return torch.zeros(0, dtype=torch.bool)
+        return torch.zeros(0, dtype=torch.bool, device=dev)
+    positions = positions.to(dev)
     knorm = keys.norm(dim=-1)                                   # [S]
     vnorm = vals.norm(dim=-1)                                   # [S]
 
-    # -- mechanism 1: greedy newest-first near-duplicate drop -----------------
-    order = torch.argsort(positions, descending=True)          # newest first
-    kept_mask = torch.zeros(S, dtype=torch.bool)               # index-space mask
-    kept_idx: List[int] = []
+    # -- mechanism 1: near-duplicate supersession (latest-write-wins) ----------
+    # Build the pairwise near-dup boolean matrix ``D`` in ONE batched op, then run
+    # the greedy newest-first selection as a vectorised recency-rank fixpoint.
     if dup_metric == "exact":
-        # relative-L2: |k_e - k| <= (1-cos_threshold)*max(|k_e|,|k|).  Merges only
-        # verbatim-identical keys, so distinct content addresses all survive.
+        # relative-L2: |k_e - k_f| <= (1-cos_threshold)*max(|k_e|,|k_f|).  Merges
+        # only verbatim-identical keys, so distinct content addresses all survive.
         tol = 1.0 - cos_threshold
-        for oi in order.tolist():
-            if kept_idx:
-                diff = (keys[kept_idx] - keys[oi]).norm(dim=-1)
-                denom = torch.maximum(
-                    knorm[kept_idx],
-                    knorm[oi].expand_as(knorm[kept_idx])).clamp(min=1e-30)
-                if bool((diff <= tol * denom).any()):
-                    continue
-            kept_idx.append(oi)
+        # ``donot_use_mm_for_euclid_dist`` forces the direct ||a-b|| formula (not
+        # the matmul-expanded ||a||^2-2a.b+||b||^2 whose cancellation can drift by
+        # ULPs at large S) so the boolean near-dup matrix is byte-identical to the
+        # reference's per-pair ``(k_e-k_f).norm()`` — verified 0-mismatch across the
+        # 720-trial + large-cache gate.  ``diff`` is the [S,S] pairwise distance.
+        diff = torch.cdist(keys.unsqueeze(0), keys.unsqueeze(0),
+                           compute_mode="donot_use_mm_for_euclid_dist").squeeze(0)
+        denom = torch.maximum(knorm.unsqueeze(1),
+                              knorm.unsqueeze(0)).clamp(min=1e-30)
+        D = diff <= tol * denom                                              # [S,S]
     else:
         # raw cosine (zero-key rows -> unit 0 -> sim 0, matching cosine_sim).
         safe = knorm.clamp(min=1e-30)
         unit = keys / safe.unsqueeze(-1)
         unit[knorm == 0] = 0.0
-        for oi in order.tolist():
-            if kept_idx:
-                sims = unit[kept_idx] @ unit[oi]               # [n_kept]
-                if float(sims.max()) > cos_threshold:
-                    continue
-            kept_idx.append(oi)
-    for oi in kept_idx:
-        kept_mask[oi] = True
-
-    survivors = kept_mask.clone()
+        D = (unit @ unit.t()) > cos_threshold
+    D.fill_diagonal_(False)
+    survivors = _greedy_survivors_from_dup_matrix(D, positions)
 
     # -- mechanism 3: ALiBi-recency horizon (PER-ENTRY Cauchy-Schwarz bound) ---
     if slope is not None and slope > 0.0 and survivors.any():
-        surv_idx = torch.nonzero(survivors, as_tuple=False).flatten()
-        newest = int(positions[surv_idx].max())
-        max_kn = float(knorm[surv_idx].max())
+        # ``newest`` / ``max_kn`` are the max over the SURVIVORS only (mask the
+        # non-survivors to sentinels so a single reduction gives the same value the
+        # reference computes over its ``survivors`` list).
+        neg_inf_pos = torch.full_like(positions, -(1 << 62))
+        newest = torch.where(survivors, positions, neg_inf_pos).max()
+        surv_kn = torch.where(survivors, knorm, torch.zeros_like(knorm))
+        max_kn = surv_kn.max().to(torch.float64)
         # ceil_score_e = max_kn * |k_e| * scale  (0 for a zero-key entry).
-        ceil_score = (max_kn * knorm[surv_idx].to(torch.float64)) * scale
-        dist = (newest - positions[surv_idx]).to(torch.float64)
+        ceil_score = (max_kn * knorm.to(torch.float64)) * scale
+        # CHK-6 DECOUPLE: a ZERO-VALUE (NULL-write) entry contributes 0 to the
+        # softmax1 numerator, so only its denominator term can matter; on the
+        # §Memory heads it carries the store-role / load-enable GATE (``-PEN``) so
+        # its ACTUAL score is <= 0 => its influence decays with DISTANCE ALONE
+        # (exp(score) <= exp(-slope*dist)), independent of the EFF-inflated key
+        # magnitude.  Forcing ``ceil_score = 0`` for a zero-value entry restores the
+        # small, EFF-INDEPENDENT recency window that keeps the cache FLAT on deep
+        # recursion / distinct-address runs, WITHOUT touching value-carrying store
+        # rows (whose full content ceil keeps the EFF-sized recall horizon so a
+        # deeply-nested LEV still recalls a BP/PC stored ~250k tokens ago).  Matches
+        # ``nibble_kv_prune.KVCache.prune`` mechanism 3 exactly (test_cached_driver).
+        zero_val = (vnorm <= zero_eps).to(torch.float64)
+        ceil_score = ceil_score * (1.0 - zero_val)
+        dist = (newest - positions).to(torch.float64)
         arg = (ceil_score - slope * dist).clamp(max=0.0)
         max_w = torch.exp(arg)
         drop = max_w < recency_eps
-        drop_idx = surv_idx[drop]
-        survivors[drop_idx] = False
+        if content_addressed:
+            # LIVE HEAP: on a §Memory (address-CAM) head a NON-zero-value store is
+            # retrieved by ADDRESS at an arbitrary future step, so the recency
+            # horizon must be a NO-OP for it (a fixed EFF/slope window would
+            # silently drop a live allocated address on a long enough program).
+            # Only zero-value (freed/NULL) rows are recency-evicted here; live
+            # stores are dropped ONLY by supersession (mechanism 1) or freeing.
+            drop = drop & (zero_val > 0.0)
+        survivors = survivors & ~drop
 
     # -- mechanism 2a: dead-value head (all survivors zero-value) --------------
     if survivors.any():
-        surv_idx = torch.nonzero(survivors, as_tuple=False).flatten()
-        if bool((vnorm[surv_idx] <= zero_eps).all()):
-            survivors[:] = False
+        surv_has_value = survivors & (vnorm > zero_eps)
+        if not bool(surv_has_value.any()):
+            survivors = torch.zeros_like(survivors)
 
     # -- mechanism 2b: free-zero (value==0 AND key==0) + recency-stale ---------
     if survivors.any():
-        surv_idx = torch.nonzero(survivors, as_tuple=False).flatten()
-        newest_all = int(positions[surv_idx].max())
+        neg_inf_pos = torch.full_like(positions, -(1 << 62))
+        newest_all = torch.where(survivors, positions, neg_inf_pos).max()
         free_zero = (vnorm <= zero_eps) & (knorm <= zero_eps)
-        for i in surv_idx.tolist():
-            if not bool(free_zero[i]):
-                continue
-            if slope is None or slope <= 0.0:
-                survivors[i] = False
-            elif math.exp(-slope * (newest_all - int(positions[i]))) < recency_eps:
-                survivors[i] = False
+        if slope is None or slope <= 0.0:
+            stale = torch.ones_like(survivors)   # no recency model: honour the rule
+        else:
+            stale = torch.exp(-slope * (newest_all - positions).to(torch.float64)) \
+                    < recency_eps
+        survivors = survivors & ~(free_zero & stale)
     return survivors
 
 
@@ -229,39 +323,51 @@ def evict_keep_index(K: torch.Tensor, V: torch.Tensor, pos: torch.Tensor,
     content-addressed §Memory store heads).  ``protect_positions`` (absolute
     positions) pins those cached rows.  Returns ``None`` when nothing is dropped.
 
-    The keep DECISION (norms / cosines / recency + the per-entry greedy near-dup
-    loop) is device-independent, so it runs on CPU copies and is bit-identical
-    regardless of where the (heavy) attention GEMMs ran.
+    GPU-BOUND: the decision runs ON ``K``'s device — the per-head near-dup
+    supersession (mechanism 1) is a batched ``[H,S,S]`` matmul and the recency /
+    free / dead-head masks are batched boolean ops, so a deep-loop prune keeps the
+    GPU busy instead of copying the whole cache to the CPU for a per-entry Python
+    loop.  The per-head decision is the SAME vectorised ``prune_keep_mask_head``
+    policy (byte-identical to the reference ``KVCache.prune`` — 720-trial gate);
+    only the head SELECTION (which are all-zero-value / content-addressed) is a
+    handful of scalar reductions, so no O(cache) work leaves the device.
     """
     if K is None:
         return None
     S = int(pos.shape[0])
-    K_cpu = K.detach().to("cpu")
-    V_cpu = V.detach().to("cpu")
-    pos_cpu = pos.detach().to("cpu")
-    slopes_cpu = slopes.detach().to("cpu")
-    keep_any = torch.zeros(S, dtype=torch.bool)
+    dev = K.device
+    Kh = K[0]                                           # [H, S, HD]  (on device)
+    Vh = V[0]
+    slopes = slopes.to(dev)
+    keep_any = torch.zeros(S, dtype=torch.bool, device=dev)
     # a head whose entry VALUES are all zero is an exact softmax1 no-op
     # (mechanism 2a evicts all its entries — no keep_any contribution); skip it.
-    vnorm = V_cpu[0].norm(dim=-1)                        # [H, S]
-    head_has_value = (vnorm > zero_eps).any(dim=-1)      # [H]
+    vnorm_hs = Vh.norm(dim=-1)                           # [H, S]
+    head_has_value = (vnorm_hs > zero_eps).any(dim=-1)   # [H]
     # per-head near-dup metric: content-addressed heads get the EXACT metric.
-    knorm_hs = K_cpu[0].norm(dim=-1)                     # [H, S]
-    mean_key = K_cpu[0].mean(dim=1)                      # [H, HD]
+    knorm_hs = Kh.norm(dim=-1)                           # [H, S]
+    mean_key = Kh.mean(dim=1)                            # [H, HD]
     cm_frac = mean_key.norm(dim=-1) / knorm_hs.mean(dim=-1).clamp(min=1e-30)
+    # Move the H tiny per-head scalar decisions to host in ONE sync (H booleans /
+    # floats), not per-cache-entry, so the loop itself launches only batched GPU
+    # kernels through ``prune_keep_mask_head``.
+    head_has_value_l = head_has_value.tolist()
+    cm_frac_l = cm_frac.tolist()
+    slopes_l = slopes.tolist()
     for h in range(n_heads):
-        if not bool(head_has_value[h]):
+        if not head_has_value_l[h]:
             continue                                     # mechanism 2a: evict all
-        metric = "exact" if float(cm_frac[h]) > 0.9 else "cosine"
+        metric = "exact" if cm_frac_l[h] > 0.9 else "cosine"
         mask = prune_keep_mask_head(
-            K_cpu[0, h], V_cpu[0, h], pos_cpu,
-            slope=float(slopes_cpu[h]), scale=scale,
+            Kh[h], Vh[h], pos,
+            slope=float(slopes_l[h]), scale=scale,
             cos_threshold=cos_threshold, zero_eps=zero_eps,
             recency_eps=recency_eps, dup_metric=metric)
         keep_any |= mask
     if protect_positions is not None and len(protect_positions) > 0:
-        prot = torch.as_tensor(sorted(protect_positions), dtype=pos_cpu.dtype)
-        keep_any |= torch.isin(pos_cpu, prot)      # pin the data-segment store rows
+        prot = torch.as_tensor(sorted(protect_positions),
+                               dtype=pos.dtype, device=dev)
+        keep_any |= torch.isin(pos, prot)          # pin the data-segment store rows
     keep_idx = torch.nonzero(keep_any, as_tuple=False).flatten()
     if int(keep_idx.numel()) >= S:
         return None                                 # nothing dropped
