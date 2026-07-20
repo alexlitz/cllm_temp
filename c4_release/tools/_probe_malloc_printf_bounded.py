@@ -45,13 +45,15 @@ def main():
     # ref AX (word-width, low stack) for a per-step sanity trace (the file-marshalled
     # PRTF bytes are what run_model checks; here we just watch AX at the LI feeding
     # the first printf — it must be 72 not 0).
+    evict = os.environ.get("C4_EVICT", "1") not in ("0", "")
+    print(f"evict={evict}", flush=True)
     with LC._low_stack_sp():
         ref = C.ref_interpret(instrs, max_steps=STEPS, mask=0xFFFFFFFF)
         with LC._install_fileop_marshalling():
             got = run_pure_forward_cached(
                 sparse, L, instrs, max_steps=STEPS, mask=0xFFFFFFFF, verbose=True,
                 fio=fio, data_seg=LC._bytes_to_seg(data),
-                evict=True, prune_interval=60)
+                evict=evict, prune_interval=60)
 
     print("\nstdout so far:", repr(bytes(fio.runner.stdout)), flush=True)
     n = min(len(ref), len(got))

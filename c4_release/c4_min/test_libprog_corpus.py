@@ -103,18 +103,34 @@ def test_reference_byte_exact(entry):
 #   * HEAVY tier — the heap / file / deep-loop programs (malloc/memset/memcmp/
 #     filecat/malloc_free_reuse/memtest/malloc_printf, ~220-1551 steps): NOT yet
 #     byte-exact through the model.  The ABI retarget + file-op marshalling +
-#     8-bit-LEA low-stack relocation are all correct (proven 10/10 on the
-#     neural-ABI reference AND in a bounded neural trace: malloc's frame params
-#     read back correctly, the bump allocator + printf fire with the right fmt/
-#     args/control-flow), but a COMPUTED heap pointer that flows malloc-AX ->
-#     SI(frame local) -> LI -> memset -> printf reads back 0 through the model
-#     (the memset SC writes 'H'=72 to 0x20000 but the printf LC reads 0 ->
-#     "byte=0 char=\x00").  The isolated heap byte SC->LC round-trip DOES work
-#     through the model (the proven test_nibble_runtime_neural memset/zfod tests
-#     pass), so the blocker is specifically the 32-bit pointer surviving a
-#     store/load through a byte-window FRAME LOCAL (low byte 0x00 of 0x20000).
-#     A model memory-CAM fidelity issue, out of this corpus's scope + each neural
-#     run is ~20-90 min (the driver's per-step store-log scan is ~O(n^2)).
+#     8-bit-LEA low-stack relocation are all correct.
+#
+#     FIXED (#648/#660, the frame-offset IMM LEAK): the fetched scalar IMM leaked a
+#     fraction of nearby large literals (0x20000 etc.) through the imperfect PC
+#     one-hot; with the corpus's ~43 big literals in flight the residue exceeded 0.5
+#     and shifted (a) the LEA/ENT/ADJ frame byte (malloc's return pointer stored to
+#     the wrong 16-aligned frame cell) and (b) the JMP/BZ/BNZ branch TARGET (the
+#     memset 'JMP 134' decoded as 133, re-entering the fill loop one op early).  Both
+#     are fixed by reconstructing a CLEAN signed immediate from the leak-free IMM_NIB
+#     nibbles into a dedicated never-share IMM_CLEAN dim and routing every offset/
+#     target op through it (nibble_pure_forward_complete.compile_imm_clean).  A
+#     bounded neural trace now confirms: malloc returns 0x20000, SI stores it to the
+#     16-aligned frame local, LI reads it back, memset writes 'H'=72 to 0x20000
+#     (SC@131072=72), and 'JMP 163 -> 134' resolves correctly.  LEA sweep 9/9,
+#     runtime primitives 5/5 (zfod/malloc/memset/memcmp) still pass.
+#
+#     REMAINING (SEPARATE memory-CAM value bug, NOT the IMM leak): the memset fill
+#     loop keeps the running byte pointer in a FRAME LOCAL (BP-4) and increments it
+#     each iteration (p++).  The first LI of that local reads 0x20000 correctly, but
+#     a LATER LI of the SAME local (8 steps on, AFTER the iteration's SC heap write
+#     to 0x20000) reads 0 -> the pointer is lost and the second SC writes 'H' to
+#     address 1 instead of 0x20001.  A model §Memory-CAM recency/eviction fidelity
+#     issue for a frame-local pointer read back after an intervening store to the
+#     same-numbered heap address (0x20000 = the pointer value = the byte address).
+#     The LI/SI value path + the KV eviction are untouched by the IMM_CLEAN fix, so
+#     this is pre-existing.  Out of the IMM-leak scope; each neural run is ~60-130 min
+#     (the driver's per-step store-log scan is ~O(n^2) and the code_size=258 model is
+#     ~3x the code_size=55 model per step).
 #
 # The HEAVY tier is marked xfail(strict=False) so plain `pytest` is green and the
 # real (not faked) neural attempt is still exercised when C4_LIB_NEURAL_HEAVY=1.
