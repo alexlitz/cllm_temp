@@ -107,3 +107,69 @@ streaming build is byte-identical (L∞=0, `dense_kernel`) and stays under 20 GB
 
 - Merge: clean. Touches only `test_chat_io_neural.py` (test).
 - Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
+
+### 9a. `revalidate-capstones-unified-vm` (#647) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean. Adds `revalidate_capstones_unified.py` (tool) + the
+  `onnx_runtime_nibble.c` BSS fix (runtime C, not weight build).
+- NOTE: #647 is a strict ancestor of #661 — merging #661 next includes it.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
+
+### 9b. `bundle-unified-vm` (#661) — MERGED, ONE CONFLICT RESOLVED (fingerprint unchanged)
+
+- Merge: CONFLICT in `bundle_small.py` `_build_model` (the ONE genuine same-line
+  clash of the consolidation). Both sides addressed the SAME dense-build memory
+  hazard differently:
+  - HEAD (#656): GUARDED bundling behind `C4_ALLOW_DENSE_BUILD` — refuses to bundle
+    off the dense complete model unless opted in.
+  - #661: FIXES it — routes the weight serialiser onto `build_compact_sparse_streaming`
+    (`dense_kernel` = byte-identical, ~12 GB peak).
+  - RESOLUTION: took #661's streaming route (more-complete-wins per brief). The
+    streaming build stays well under the conftest 60 GB / per-build 20 GB ceilings
+    and is L∞=0 to the dense build, so it REMOVES the hazard entirely rather than
+    merely refusing it — #656's opt-in gate is no longer needed here. A comment in
+    `_build_model` records the decision. `bundle_small.py` parses clean; no orphaned
+    dense-guard code remains (only explanatory docstrings).
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) — all changed files are runtime C /
+  packaging tool / tests, no weight-build code.
+
+### 10. `libprog-neural-phase2` (#648) — ALREADY MERGED (no-op)
+
+- `git merge` → "Already up to date." #648 is a strict ANCESTOR of #660
+  (`fix-frame-local-ptr-store`), so it came in with item 1. No separate merge commit.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`).
+
+### 11a. `selfhost-3layer-feasibility` (#654) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean. Adds `selfhost/*.c` + `run_selfhost_feasibility.py` + a doc — additive
+  demo, not imported by any weight-build module.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
+
+### 11b. `agent-mandelbrot-neural-forward` (#659) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean. Adds `_mandel_run.py` / `_mandel_src.py` / `test_mandelbrot_neural.py`
+  + a doc — additive demo/test.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
+
+### 12. `blog-impl-correspondence-audit` (#655) — MERGED CLEAN (doc only)
+
+- Merge: clean. Adds `docs/BLOG_IMPL_CORRESPONDENCE_AUDIT.md` only.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
+
+## Excluded (per brief — in-flight, fold in a follow-up)
+
+- #662 scalar-IMM, item-6 primitives, item-7 fixedpoint-runtime — NOT merged.
+
+## Fingerprint summary
+
+| Point | Fingerprint (first 16) |
+|-------|------------------------|
+| base (`fix-zfod-malloc-neural`) | `3566e0560d3b71f9` |
+| after #660 (LEA-addr-nib block added — the ONLY build-weight change) | `f61decf217c718ba` |
+| final (after all 12 items) | `f61decf217c718ba` |
+
+The consolidation changed the build weights EXACTLY ONCE — the #660 LEA fix adds a
+new `OP_IS[LEA]`-gated physical block (n_blocks 305 → 306), a real VERIFIED feature
+listed in the brief as an additive coexisting block. Every OTHER branch was
+byte-identical to the build (tools / tests / docs / decode-runtime paths). No merge
+changed the fingerprint UNEXPECTEDLY; no branch was stopped.
