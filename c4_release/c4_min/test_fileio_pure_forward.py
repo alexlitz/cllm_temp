@@ -34,9 +34,8 @@ import os
 
 from c4_min import isa
 from c4_min import nibble_filesys as FS
-from c4_min.nibble_pure_forward_complete import (
-    build_pure_forward_complete_model, run_pure_forward_complete, SP_INIT,
-)
+from c4_min.nibble_pure_forward_complete import run_pure_forward_complete, SP_INIT
+from c4_min._build_guard import guarded_complete_build
 
 
 HELLO = b"hello, file!\n"
@@ -62,18 +61,17 @@ def _seed_cstring(d, addr, s):
 def _model():
     global _MODEL, _L
     if _MODEL is None:
-        _MODEL, _L = build_pure_forward_complete_model(
-            code_size=48)
+        # Memory-SAFE streaming full-op build (peak ~5 GB), byte-identical
+        # (L-inf=0, dense_kernel) to the dense complete model whose ~160k-row
+        # MUL/DIV/MOD block would peak at 54-108 GB RSS.  Returns a streaming
+        # SparseTransformer driven by the SAME runner.
+        _MODEL, _L = guarded_complete_build(code_size=48)
     return _MODEL, _L
 
 
 def _sparse():
-    global _SPARSE
-    if _SPARSE is None:
-        from c4_min.sparse_forward import SparseTransformer
-        m, _ = _model()
-        _SPARSE = SparseTransformer(m, compute_mode="dense_kernel")
-    return _SPARSE
+    # The streaming build already returns a (dense_kernel) SparseTransformer.
+    return _model()[0]
 
 
 def _mk_fio(files=None, stdin=b""):

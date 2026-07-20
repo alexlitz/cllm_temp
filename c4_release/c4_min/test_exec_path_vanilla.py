@@ -154,14 +154,18 @@ def test_recurrent_exec_is_vanilla_argmax():
 
 # ===========================================================================
 # 2. PURE-FORWARD-COMPLETE path — one model.forward per step; decode via the
-#    LM-head argmax (``_snap_lane`` / ``_snap_nib``).  Lean build (no divmod) to
-#    stay well under the memory/time budget.
+#    LM-head argmax (``_snap_lane`` / ``_snap_nib``).  Built via the memory-SAFE
+#    streaming path (``guarded_complete_build`` -> ``build_compact_sparse_streaming``,
+#    peak ~5 GB) instead of the DENSE ``build_pure_forward_complete_model`` (which
+#    pads every block to the ~160k-row MUL/DIV/MOD FFN and peaks at 54-108 GB RSS
+#    — this test at code_size=16 ballooned the box to 105 GB).  The streaming model
+#    is the SAME full-op-set interpreter, byte-identical (L-inf=0, dense_kernel) and
+#    driven by the SAME ``run_pure_forward_complete`` runner.
 # ===========================================================================
 def test_pure_forward_complete_exec_is_vanilla_argmax():
-    from c4_min.nibble_pure_forward_complete import (
-        build_pure_forward_complete_model, run_pure_forward_complete)
-    model, L = build_pure_forward_complete_model(
-        code_size=16)
+    from c4_min.nibble_pure_forward_complete import run_pure_forward_complete
+    from c4_min._build_guard import guarded_complete_build
+    model, L = guarded_complete_build(code_size=16)
     for prog in (_ADD, _SUB_UF, _BRANCH, _LOOP):
         code = isa.assemble(prog)
         trace = _assert_vanilla_exec(
