@@ -21,10 +21,31 @@ Run:
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
+import gc
 import os
 
 from c4_min import isa
 from c4_min import nibble_runtime as R
+
+
+# The KV-cached driver + dense-kernel sparse forward allocate large transient
+# CPU tensors per run; glibc's arena keeps those freed blocks resident, so the
+# process RSS high-water mark grows monotonically across the shared-model runs
+# (each byte-exact + cheap in isolation, but ~5 runs in one pytest process
+# accreted to >20 GB).  `malloc_trim(0)` returns the freed arena pages to the OS
+# between runs, so the per-run peak (~14 GB) stays flat instead of accumulating.
+_LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+
+
+def _release_memory():
+    """gc + return glibc's freed arenas to the OS (keeps RSS flat across runs)."""
+    gc.collect()
+    try:
+        _LIBC.malloc_trim(0)
+    except (AttributeError, OSError):
+        pass                                    # non-glibc: gc.collect() alone
 
 
 # Build the model + sparse wrapper ONCE and share it across the tests — but the
@@ -75,16 +96,21 @@ def _run_neural(instrs, max_steps=200, evict=False, prune_interval=60):
 
     ``evict`` prunes the per-block KV caches on a schedule (``prune_interval``)
     so the cache stays FLAT over deep loops — needed for the longer looping
-    subroutines (memcmp), whose stream would otherwise grow the cache to tens of
-    GB at this model width (dim≈1725 × 305 blocks).  ``prune_interval=60`` keeps
-    the peak RSS ~4 GB AND is byte-exact (verified full-trace equal to the
-    word-width reference for both memcmp branches; the driver default of 120 is
-    byte-exact too but lets the cache grow past the memory budget here)."""
+    subroutines (memcmp), whose stream would otherwise grow the cache without
+    bound at this model width (dim≈1725 × 305 blocks).  ``prune_interval=60`` is
+    byte-exact (verified full-trace equal to the word-width reference for both
+    memcmp branches; the driver default of 120 is byte-exact too but lets the
+    cache grow larger).  ``_release_memory`` after the run returns the freed
+    transient CPU tensors to the OS so the shared-process peak (~14 GB) stays
+    flat across all the tests instead of accreting past the memory budget."""
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
     sparse, L = _sparse_model(code_size=len(instrs) + 2)
-    return run_pure_forward_cached(sparse, L, instrs, max_steps=max_steps,
-                                   mask=0xFFFFFFFF, evict=evict,
-                                   prune_interval=prune_interval)
+    try:
+        return run_pure_forward_cached(sparse, L, instrs, max_steps=max_steps,
+                                       mask=0xFFFFFFFF, evict=evict,
+                                       prune_interval=prune_interval)
+    finally:
+        _release_memory()
 
 
 def _ref_ax_trace(instrs, max_steps=5000):
