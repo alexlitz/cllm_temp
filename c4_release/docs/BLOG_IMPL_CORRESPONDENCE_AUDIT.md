@@ -369,3 +369,27 @@ worth cleaning). Correctness (byte-exact decode under eviction) is asserted by
 | sparse makes ONNX significantly smaller | ✅ | export_onnx:265 "shrinks because 99% of entries are zeros" |
 | HALT/EXIT triggers EOS-token generation | ✅ | `isa.HALT=38`; vocab `HALT=262` "ends generation (§Exiting)"; complete forward emits HALT |
 | special halt token distinct from EOS in message mode | ✅ | vocab HALT=262 separate from message-end; matches §796 |
+
+## Capstones (baking, model-runs-C, speculation, self-hosting, quine, bundling)
+
+Tests RUN this session are marked (ran); memory-safe small models only.
+
+| Capstone | Class | Evidence |
+|----------|-------|----------|
+| **Baking bytecode into weights** (KV-retrieval, "read-only code segment") §828-832 | ✅ (ran) | `nibble_bake.py` — per-nibble equality → one-hot mask → MoE-value select; `test_nibble_bake.py` **12/12 passed** |
+| baked program runs with NO bytecode in input ("malloc-on-transformer" foundation) | ✅ (ran) | `run_baked`/`BakedProgram`; `initial_state_no_program` asserts bare embedding; 12/12 |
+| **Full-attention baking via SwiGLU** §834-838 | 🟡 BRANCH-ONLY / approximate-by-design | not on this unified branch (grep empty); task notes branch `full-attn-baking-completeness`. Blog itself frames it "for completeness"; only KV-retrieval baking (the needed one) is on trunk |
+| **Model-runs-C** (C in → compiler-in-weights → result) §840-842 | ✅ present | `nibble_compiler.py`, `demo_model_runs_c.py`, `nibble_handoff.py`; ⚠ its recurrent run uses `torch.round` (handoff:347, compiler:817) |
+| **Speculation** (perfect draft, 100% accept, ~1000× / huge blocks) §797-799 | ✅ present (not re-run) | `nibble_speculative.py` (perfect-draft logical VM, accepts in one pass), `batched_speculative.py` (cross-program). Status doc's 901-vs-80,524 forwards (89.4×) is documented, not independently re-run here. REV #10. |
+| **Self-hosting, 3 relationships** §859-899 | ✅ present (artifacts) | `onnx_runtime_nibble.c`, `onnx_runtime_nibble_fixedpoint.c` (C4-C ONNX runtime); the 3 relationships are realized by running the runtime under c4vm and vice-versa. No dedicated verification re-run on this branch (status doc: "not re-run full-1096 in this CPU session") |
+| **Quine** (outputs own source via transformer) §922-930 | ✅ (ran) | `quine_prtf.py` (PRTF string quine, byte-exact self-output through the small pure-forward transformer), `quine_bundle.py`; `test_quine_prtf.py` **6 passed, 1 skipped**. Uses PRTF not PUTCHAR (quine_prtf:7) |
+| **Bundling** (runtime+weights+bytecode → single ~150-200KB binary; cat/echo/yes CLIs) §910-920 | ✅ present | `bundle_small.py`, `bundler/neural_bundler.c`, `bundler/bundle_c4.c`, `cli_tools.py`; not size-measured this session |
+| fixed-point bundle variant (no float, 2^12 scale, SiLU LUT) §920 | ✅ present | `onnx_runtime_nibble_fixedpoint.c`; `nbl_bin_interp.py` |
+
+**Verdict (capstones):** all capstones are PRESENT on this unified branch, and the two I
+ran cheaply (baking/malloc-foundation 12/12, quine 6/7) PASS byte-exact. Full-attention
+baking is branch-only + approximate-by-design (as the blog anticipates). The
+model-runs-C / handoff / compiler / universal recurrent paths carry the non-vanilla
+`torch.round` (finding #8). Speculation and self-hosting are present but their headline
+performance numbers (89.4× forward reduction; full self-hosting execution) are documented
+in the status doc, not independently re-measured in this CPU-only audit.
