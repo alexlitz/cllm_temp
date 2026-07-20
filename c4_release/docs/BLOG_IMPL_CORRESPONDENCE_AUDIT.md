@@ -79,12 +79,33 @@ findings (beyond the already-logged revisions in `BLOG_SPEC_REVISIONS.md`) are t
    set is MSET/MCMP only. Stray blog header.
 
 7. **⚠ NEW — the dense `build_pure_forward_complete_model` is a 54-108 GB memory
-   hazard and is what TESTING_CHECKLIST_STATUS.md fingerprints.** The status doc's
-   "Default-build fingerprint" table (TESTING_CHECKLIST_STATUS.md:39-42) is computed over
+   hazard and is what TESTING_CHECKLIST_STATUS.md fingerprints — AND its own vanilla-
+   exec guard test is effectively unrunnable.** The status doc's "Default-build
+   fingerprint" table (TESTING_CHECKLIST_STATUS.md:39-42) is computed over
    `build_pure_forward_complete_model` — the DENSE builder the task warns never to run.
-   The blog says nothing about this build being impractical dense; the honest story is
-   only the lean (`include_muldiv=False` ~0.7 GB) / streaming (~3.6 GB) builds are
-   usable. (Verified below by NOT building it and by reading the builder.)
+   **Measured during this audit:** running `test_exec_path_vanilla.py`'s
+   `test_pure_forward_complete_exec_is_vanilla_argmax` (which calls
+   `build_pure_forward_complete_model(code_size=16)`) ballooned the pytest process to
+   **~105 GB RSS** before I killed it — so even the "lean" `code_size=16` guard test for
+   the complete model is a dense-build hazard, not runnable on a normal machine. The
+   blog says nothing about this build being impractical dense; the honest story is only
+   the lean (`include_muldiv=False` ~0.7 GB) / streaming (~3.6 GB) builds are usable, and
+   the `nibble_pure_forward_complete` vanilla-exec claim can only be *statically*
+   (AST + settrace) verified for the complete model, not run.
+
+8. **⚠ NEW — `torch.round` on 4 non-headline exec paths.** The vanilla-argmax
+   requantiser is used on the headline paths (recurrent / pure-forward / blogspec_run,
+   guarded by `test_exec_path_vanilla.py`), but `nibble_bake.run_baked` (:558),
+   `universal.py` (:582), `nibble_handoff.py` (:347), and `nibble_compiler.py` (:817)
+   all call `torch.round` — and those four are exactly the capstone paths (baked-program/
+   malloc, universal bytecode, model-runs-C, compiler). So "no rounding anywhere on the
+   exec path" (REV #4 / status:76) is true only for the headline 3.
+
+9. **⚠ NEW — MAGIC-floor fp trick (§555) is described-only; efficient-exp (§561-564) and
+   division-via-log-sink (§653-679) are not implemented.** No `2**23`/`8388608` constant
+   exists; floor is bit-plane selection. Division is long-division only (the blog does
+   flag log-sink division as non-default, so that one is honest; MAGIC-floor is presented
+   as used but isn't).
 
 *(Sections below add per-claim evidence; each section committed incrementally.)*
 
