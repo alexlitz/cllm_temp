@@ -74,11 +74,13 @@
 #define DT_FLOAT 0
 #define DT_INT64 1
 
-/* Sized for the COMPACT c4_min VM graph (dim=1564, 42 blocks): 4461 distinct
- * tensors / 3186 real nodes after Constant folding.  The tiny proof model
- * (dim=104, 2 blocks) fits far inside these bounds too — one runtime for both. */
-#define MAX_TENSORS 8192
-#define MAX_NODES 6144
+/* Sized for the ONE UNIFIED full-op VM graph (dim~1633, 305 blocks): the full op
+ * set (incl. the ~300 DIV/MOD blocks) yields ~33k nodes / ~34k distinct tensors.
+ * The old lean/compact graph (dim=1564, 42 blocks: 4461 tensors / 3186 nodes) and
+ * the tiny proof model (dim=104, 2 blocks) both fit far inside — one runtime for
+ * all.  These tables are BSS globals (~20 MB), never on the stack. */
+#define MAX_TENSORS 65536
+#define MAX_NODES 65536
 #define MAX_IO 8
 #define MAX_RANK 8
 #define MAX_ATTRS 4
