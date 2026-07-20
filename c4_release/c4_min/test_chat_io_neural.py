@@ -18,21 +18,26 @@ This module proves, THROUGH THE KV-CACHED SPARSE DRIVER WITH EVICTION:
 
 Tractability (measured, honest — see ``docs`` and the module ``__main__`` bench):
   Each VM step is ONE ``model.forward`` over a fixed ~31-row window through the
-  full unified model (305 physical blocks, sparse-CSR CPU) ~= 10 s/step, so a
-  turn of N VM steps is ~10N s.  With ``evict=True, prune_interval=60`` the KV
-  cache stays FLAT (max_cache_size ~= 157 regardless of turn length — the
-  eviction that also holds the peak RSS at ~8 GB), so cost is LINEAR in steps,
-  NOT the O(N^2) of the un-evicted growing-stream path.  The per-step 305-block
-  forward is the fixed floor; eviction removes the memory blow-up + the O(N^2)
-  cache-growth compute, it does not make the per-step forward cheap.
+  full unified model (305 physical blocks, sparse-CSR CPU) ~= 3 s/step on an idle
+  box (up to ~10 s/step under memory contention), so a turn of N VM steps is
+  ~3-10N s.  With ``evict=True, prune_interval=60`` the KV cache stays FLAT
+  (max_cache_size ~= 250-310 regardless of turn length — vs a growing token
+  stream that reached ~1100-2250; the eviction also holds the peak RSS at ~7 GB),
+  so cost is LINEAR in steps, NOT the O(N^2) of the un-evicted growing-stream
+  path.  The per-step 305-block forward is the fixed floor; eviction removes the
+  memory blow-up + the O(N^2) cache-growth compute, it does not make the per-step
+  forward cheap.
 
-  A compact 2-rule ELIZA turn is ~29-35 VM steps (~5-6 min); the full 8-rule
-  table's later rules are ~71-77 steps (~12 min).  So ONE full turn is always
-  tractable; a few turns are tractable but slow (opt-in ``C4_CHAT_NEURAL_MULTITURN
-  =1``, ~15-18 min for 3 short turns).  We do NOT claim untested-long multi-turn.
+  A compact 2-rule ELIZA turn is ~28-35 VM steps (~90-110 s idle; the full 8-rule
+  table's later rules are ~71-77 steps, ~12 min under contention).  So ONE full
+  turn is always tractable; a few turns are tractable (opt-in
+  ``C4_CHAT_NEURAL_MULTITURN=1``, ~5 min for 3 compact turns idle).  Measured
+  byte-exact: 1-turn (compact + 71-step full-table) and a 3-turn conversation
+  (rule0 + rule1 + fallback), all == the same-bytecode python reference.  We do
+  NOT claim untested-long multi-turn.
 
 The unified model build is memory-heavy DENSE (~62 GB); we always use the
-STREAMING SPARSE build (~6-8 GB peak) + KV-cache eviction + ``malloc_trim`` between
+STREAMING SPARSE build (~4-8 GB peak) + KV-cache eviction + ``malloc_trim`` between
 runs, single-process, ``OMP_NUM_THREADS=4``.
 
 Run:  OMP_NUM_THREADS=4 PYTHONPATH=<repo> python c4_min/test_chat_io_neural.py
@@ -54,7 +59,8 @@ BUF = 0x40   # low-256 window so the LC CAM reads the READ-back bytes byte-exact
 
 # Eviction cadence proven memory-flat for the looping library routines
 # (test_nibble_runtime_neural): prune every 60 tokens keeps the per-block cache
-# flat (~157 rows) and the peak RSS ~8 GB even as the token stream grows to ~2k+.
+# FLAT (~250-310 rows here) and the peak RSS ~7 GB even as the token stream grows
+# to ~1100-2250 tokens over a turn.
 _PRUNE_INTERVAL = 60
 
 
