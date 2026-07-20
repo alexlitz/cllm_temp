@@ -139,27 +139,25 @@ def pathway_quine(code_size: int = 64) -> bool:
 # Bundle pathway — bundle model+bytecode+program into one .c4bundle and run it
 # end-to-end THROUGH the bundled model, byte-exact result.
 #
-# BLOCKED on the unified VM by MEMORY: ``bundle_small._build_model`` bakes the
-# UNCOMPACTED, UNROLLED-DIV/MOD dense model (``build_pure_forward_complete_model``
-# with recurrent_divmod=False → 168 distinct div/mod blocks, FFN padded to the
-# global-max hidden) — MEASURED at ~117 GB RSS for a SINGLE build (vs the compact
-# builder's 48.6 GB).  ``run_bundle`` needs that dense reconstruct to scatter the
-# serialised COO weights into, so the genuine end-to-end round-trip is squarely in
-# the 54-108GB dense-OOM hazard and MUST NOT be run on a shared host.
+# UNBLOCKED (was the 117 GB dense hazard): ``bundle_small._build_model`` now
+# builds via ``compact_alloc.build_compact_sparse_streaming`` (peak = ONE block's
+# dense weights ≈ 12 GB, ``dense_kernel`` mode → L-inf=0 to the dense whole)
+# instead of the padded-dense ``build_pure_forward_complete_model`` (~117 GB,
+# OOM-killed twice).  ``run_bundle`` reconstructs the SAME streaming-sparse form
+# and scatters the serialised COO weights into it byte-identically, so the
+# genuine end-to-end round-trip runs in ~22 GB (two builds), well under the
+# 60 GB conftest guard / 48.6 GB compact / 117 GB dense hazards.
 #
-# The MEMORY-SAFE parts that ARE validated: the C4-C section-fusing bundler
-# (bundler/c4_bundler_small.c) compiles (test_c4c_bundler_exists_and_gcc_syntax),
-# and the flat-container framing is deterministic.  The blocker is a bundle-builder
-# choice (use recurrent_divmod=True / the compact builder → 48.6 GB, or stream the
-# reconstruct), NOT a correctness defect in the bundle format.
+# Also validated: the C4-C section-fusing bundler (bundler/c4_bundler_small.c)
+# compiles + fuses byte-identically (test_c4c_bundler_*), and the flat-container
+# framing is deterministic.  Both an ARITH (register decode) and a PRINTF (I/O:
+# data-seg + fio stdout capture) program are run byte-exact.
 # ---------------------------------------------------------------------------
-def pathway_bundle(code_size: int = 32, min_free_gb: float = 130.0):
-    """Returns True/False (byte-exact) or None (deferred — dense-OOM hazard).
+def pathway_bundle(code_size: int = 32, min_free_gb: float = 60.0):
+    """Returns True/False (byte-exact arith+printf) or None (deferred).
 
-    Default gate 130 GB reflects the MEASURED ~117 GB single-build cost of the
-    bundle's uncompacted-unrolled ``_build_model`` — effectively always DEFERRED
-    on any normal host until the bundle builder is switched to the compact /
-    recurrent_divmod dense (48.6 GB) or a streaming reconstruct.
+    Gated at 60 GB free (the streaming reconstruct peaks ~22 GB for the
+    assemble+run pair; the gate keeps a wide margin under the conftest guard).
     """
     import tempfile
     from c4_min import bundle_small as B
@@ -179,25 +177,37 @@ def pathway_bundle(code_size: int = 32, min_free_gb: float = 130.0):
     free = _free_gb()
     if free < min_free_gb:
         print("  [bundle:end-to-end] DEFERRED: free=%.1fGB < %.0fGB gate — the "
-              "bundle's uncompacted-unrolled dense _build_model is ~117GB RSS "
-              "(dense-OOM hazard). Fixable by switching _build_model to the "
-              "compact/recurrent_divmod builder (48.6GB)." % (free, min_free_gb))
+              "streaming reconstruct peaks ~22GB (assemble+run); re-run on a host "
+              "with a >%.0fGB free window." % (free, min_free_gb, min_free_gb))
         return None
 
-    src = "int main(){ return 500 + 700; }"     # -> 1200 (full 32-bit AX)
+    # (name, C source, assemble-kwargs, verdict-fn) — arith decodes the register,
+    # printf captures stdout byte-exact via the data-seg + fio I/O path.
+    cases = [
+        ("arith", "int main(){ return 500 + 700; }",   # -> 1200 (full 32-bit AX)
+         dict(expected=1200, code_size=code_size),
+         lambda r: r.get("status") == "PASS" and r.get("got") == 1200,
+         "expected=1200 got=%s"),
+        ("printf", 'int main(){ printf("hi\\n"); return 0; }',   # -> stdout "hi\n"
+         dict(expected_stdout=b"hi\n", code_size=max(64, code_size)),
+         lambda r: r.get("status") == "PASS" and r.get("stdout") == "hi\n",
+         "expected_stdout='hi\\n' stdout=%r"),
+    ]
+    allok = True
     with tempfile.TemporaryDirectory() as td:
-        path = os.path.join(td, "prog.c4bundle")
-        t0 = time.time()
-        info = B.assemble_bundle(src, path, expected=1200, description="add-const",
-                                 code_size=code_size, step_cap=400)
-        res = B.run_bundle(path, verbose=False)
-        got = res.get("got")
-        ok = (res.get("status") == "PASS" and got == 1200)
-        print("  [bundle:end-to-end] src=%r expected=1200 status=%s got=%s "
-              "BYTE-EXACT=%s (%.1fs) file=%dB peakRSS=%.1fGB"
-              % (src, res.get("status"), got, ok, time.time() - t0,
-                 info["bundle_bytes"], _rss_gb()))
-    return ok
+        for name, src, kw, verdict, fmt in cases:
+            path = os.path.join(td, name + ".c4bundle")
+            t0 = time.time()
+            info = B.assemble_bundle(src, path, description=name, step_cap=400, **kw)
+            res = B.run_bundle(path, verbose=False)
+            ok = verdict(res)
+            allok &= ok
+            detail = fmt % (res.get("got") if name == "arith" else res.get("stdout"))
+            print("  [bundle:end-to-end:%s] src=%r status=%s %s BYTE-EXACT=%s "
+                  "(%.1fs) file=%dB peakRSS=%.1fGB"
+                  % (name, src, res.get("status"), detail, ok, time.time() - t0,
+                     info["bundle_bytes"], _rss_gb()))
+    return allok
 
 
 # ---------------------------------------------------------------------------
