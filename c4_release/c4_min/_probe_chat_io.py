@@ -11,9 +11,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from c4_min import isa
 from c4_min import nibble_filesys as FS
-from c4_min.nibble_pure_forward_complete import (
-    build_pure_forward_complete_model, run_pure_forward_complete,
-)
+from c4_min.nibble_pure_forward_complete import run_pure_forward_complete
+from c4_min._build_guard import guarded_complete_build
 
 BUF = 0x40   # low-256 window so the LC CAM can read the read-back bytes
 
@@ -46,8 +45,7 @@ def main():
     data = {}
     _seed_cstring(data, FMT, "hi\n")
 
-    m, L = build_pure_forward_complete_model(
-        code_size=len(code) + 2)
+    m, L = guarded_complete_build(code_size=len(code) + 2)
 
     fs = FS.StubFilesystem({})
     fio = FS.FileOpState(runner=FS.FileRunner(fs=fs, stdin=FS.InputKVStream(b"AB")))

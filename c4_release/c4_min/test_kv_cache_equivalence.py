@@ -197,15 +197,18 @@ def test_driver_byte_identical_naive_incl_functions_and_eviction():
     _PF.SP_INIT = 0xF0
     _PFC.SP_INIT = 0xF0
     from c4_min import isa
-    from c4_min.nibble_pure_forward_complete import (
-        build_pure_forward_complete_model, run_pure_forward_complete)
+    from c4_min.nibble_pure_forward_complete import run_pure_forward_complete
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
+    from c4_min._build_guard import guarded_complete_build
 
     def I(op, imm=0):
         return isa.Instr(op, imm)
 
-    model, L = build_pure_forward_complete_model(
-        code_size=16)
+    # Memory-SAFE streaming build (peak ~5 GB) — byte-identical (L-inf=0) to the
+    # dense complete model whose ~160k-row MUL/DIV/MOD block would peak at
+    # 54-108 GB RSS.  Covers the mul32 battery case; both cached + naive drivers
+    # accept the streaming SparseTransformer.
+    model, L = guarded_complete_build(code_size=16)
     battery = [
         ("add", [I(isa.IMM, 5), I(isa.PSH), I(isa.IMM, 3), I(isa.ADD),
                  I(isa.HALT)], 20, 0xFF),

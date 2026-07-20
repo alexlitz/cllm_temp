@@ -17,7 +17,18 @@ from c4_min.nibble_pure_forward_complete import (
     build_pure_forward_complete_model, run_pure_forward_complete,
     ref_interpret, make_overlay_complete, _build_frame, SP_INIT)
 from c4_min.sparse_forward import SparseTransformer
+from c4_min._build_guard import require_dense_build
 from c4_min import blogspec_vocab as V
+
+
+# This module's PURPOSE is the DENSE-vs-sparse equivalence proof: it constructs
+# the DENSE complete model and asserts the SparseTransformer wrapper is
+# byte-identical (L-inf=0) to it.  The dense build pads every block to the
+# ~160k-row MUL/DIV/MOD FFN and peaks at 54-108 GB RSS, so it is OPT-IN only —
+# run with ``C4_ALLOW_DENSE_BUILD=1``.  (For the memory-safe full-op model that
+# IS the streamed sparse form, see build_compact_sparse_streaming, exercised by
+# test_pure_forward_1096 / run_1096_pure_forward.)
+pytestmark = require_dense_build()
 
 
 @pytest.fixture(scope="module")

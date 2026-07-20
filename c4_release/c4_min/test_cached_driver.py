@@ -23,9 +23,10 @@ _PFC.SP_INIT = 0xF0
 
 from c4_min import isa
 from c4_min.nibble_pure_forward_complete import (
-    build_pure_forward_complete_model, run_pure_forward_complete, ref_interpret)
+    run_pure_forward_complete, ref_interpret)
 from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
 from c4_min.nibble_pure_forward import assert_no_python_compute
+from c4_min._build_guard import guarded_complete_build
 
 
 def I(op, imm=0):
@@ -113,12 +114,13 @@ def main():
     print(f"[cached] building models (LEAN{'+divmod' if want_dm else ''}) ...",
           flush=True)
     t0 = time.time()
-    model_lean, L_lean = build_pure_forward_complete_model(
-        code_size=16)
+    # Memory-SAFE streaming full-op build (peak ~5 GB) — the streamed model
+    # already folds DIV/MOD, so it serves BOTH the lean and --divmod batteries;
+    # the dense build would peak at 54-108 GB RSS.
+    model_lean, L_lean = guarded_complete_build(code_size=16)
     model_dm = L_dm = None
     if want_dm:
-        model_dm, L_dm = build_pure_forward_complete_model(
-            code_size=16)
+        model_dm, L_dm = model_lean, L_lean
     print(f"[cached] built in {time.time()-t0:.1f}s "
           f"(lean blocks={len(model_lean.blocks)}"
           f"{', divmod blocks=' + str(len(model_dm.blocks)) if want_dm else ''})",

@@ -274,6 +274,20 @@ def _build_model(config: Dict[str, object]):
     _PF.SP_INIT = 0xF0
     _PFC.SP_INIT = 0xF0
     from c4_min.nibble_pure_forward_complete import build_pure_forward_complete_model
+    from c4_min._build_guard import dense_build_allowed
+    # The bundle weight serialiser reads each block's DENSE ``ffn.W_up`` /
+    # ``ffn.W_down`` (then COO-drops the zeros), so it needs the dense complete
+    # model — which pads every block to the ~160k-row MUL/DIV/MOD FFN and peaks at
+    # 54-108 GB RSS regardless of code_size.  That is a machine-killing build, so
+    # bundling is OPT-IN: set C4_ALLOW_DENSE_BUILD=1 to run it (on a box with the
+    # headroom).  (The runtime full-op model is available memory-safe via
+    # build_compact_sparse_streaming; only the dense-tensor serialisation here
+    # needs the padded form.)
+    if not dense_build_allowed():
+        raise RuntimeError(
+            "bundle_small builds the DENSE complete model (54-108 GB RSS) to "
+            "serialise its weights — set C4_ALLOW_DENSE_BUILD=1 to opt in "
+            "(memory hazard; see c4_min/_build_guard.py).")
     # SINGLE full-op-set interpreter: build it regardless of any legacy
     # include_bitwise/include_divmod keys an OLD bundle's config may carry.
     model, L = build_pure_forward_complete_model(

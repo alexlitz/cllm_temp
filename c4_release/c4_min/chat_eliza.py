@@ -495,9 +495,10 @@ def run_chat(messages: List[str], eliza: Optional[Eliza] = None,
     """
     eliza = eliza or build_chat_min()
     if model is None:
-        from .nibble_pure_forward_complete import build_pure_forward_complete_model
-        model, L = build_pure_forward_complete_model(
-            code_size=len(eliza.code) + 2)
+        # Memory-SAFE streaming full-op build (peak ~5 GB), byte-identical to the
+        # dense complete model (which peaks at 54-108 GB RSS).
+        from ._build_guard import guarded_complete_build
+        model, L = guarded_complete_build(code_size=len(eliza.code) + 2)
     turns: List[Turn] = []
     for msg in messages:
         ref = chat_turn_ref(eliza, msg)
