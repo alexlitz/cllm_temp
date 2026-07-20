@@ -524,9 +524,15 @@ def retarget_to_neural_abi(instrs: List[Tuple[int, int]]) -> "List":
     """Convert ``src.compiler`` (op, imm) tuples to neural-ABI :class:`isa.Instr`.
 
     Divides the frame-relative LEA/ENT/ADJ byte immediates by the 8-byte compiler
-    slot to get the neural slot count (the neural VM re-scales by its 4-byte
-    slot).  Raises if a slot-scaled immediate is not a multiple of 8 (would mean
-    a half-slot offset the neural ABI cannot express)."""
+    slot to get the neural SLOT COUNT (the neural VM re-scales by its 4-byte slot).
+
+    The slot-scaled offsets stay SIGNED: a frame local is at a NEGATIVE offset
+    (LEA -8 -> slot -1), and the neural LEA rule reads ``CODE_IMM`` as a signed
+    scalar (``AX = BP + 4*imm``), so a negative slot count is essential — masking
+    it to unsigned 32-bit turns ``LEA -1`` into ``LEA 4294967295`` and computes a
+    garbage address.  IMM/JMP/JSR/BZ/BNZ immediates are non-negative PC targets /
+    value literals and pass through unchanged.  Raises if a slot-scaled immediate
+    is not a multiple of 8 (a half-slot offset the neural ABI cannot express)."""
     from . import isa
     out = []
     for i, (op, imm) in enumerate(instrs):
@@ -536,8 +542,9 @@ def retarget_to_neural_abi(instrs: List[Tuple[int, int]]) -> "List":
                     f"instr {i} {isa.NAMES.get(op, op)} imm={imm} is not a "
                     "multiple of the 8-byte compiler slot — cannot retarget to "
                     "the 4-byte-slot neural ABI")
-            imm = imm // 8
-        out.append(isa.Instr(op, imm & 0xFFFFFFFF))
+            out.append(isa.Instr(op, imm // 8))          # keep SIGNED slot count
+        else:
+            out.append(isa.Instr(op, imm & 0xFFFFFFFF))
     return out
 
 
