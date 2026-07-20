@@ -70,18 +70,21 @@ def _sparse_model(code_size: int):
     return _SPARSE, _L
 
 
-def _run_neural(instrs, max_steps=200, evict=False):
+def _run_neural(instrs, max_steps=200, evict=False, prune_interval=60):
     """Run baked bytecode through the unified model (KV-cached sparse driver).
 
-    ``evict`` prunes the per-block KV caches on a schedule so the cache stays
-    FLAT over deep loops — needed for the longer looping subroutines (memcmp)
-    whose stream would otherwise grow the cache to tens of GB at this model
-    width.  Eviction is byte-exact for these programs (verified equal to the
-    word-width reference)."""
+    ``evict`` prunes the per-block KV caches on a schedule (``prune_interval``)
+    so the cache stays FLAT over deep loops — needed for the longer looping
+    subroutines (memcmp), whose stream would otherwise grow the cache to tens of
+    GB at this model width (dim≈1725 × 305 blocks).  ``prune_interval=60`` keeps
+    the peak RSS ~4 GB AND is byte-exact (verified full-trace equal to the
+    word-width reference for both memcmp branches; the driver default of 120 is
+    byte-exact too but lets the cache grow past the memory budget here)."""
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
     sparse, L = _sparse_model(code_size=len(instrs) + 2)
     return run_pure_forward_cached(sparse, L, instrs, max_steps=max_steps,
-                                   mask=0xFFFFFFFF, evict=evict)
+                                   mask=0xFFFFFFFF, evict=evict,
+                                   prune_interval=prune_interval)
 
 
 def _ref_ax_trace(instrs, max_steps=5000):
