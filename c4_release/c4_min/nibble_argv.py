@@ -396,8 +396,33 @@ def emit_return_argc(layout: ArgvLayout = DEFAULT_LAYOUT) -> List[isa.Instr]:
     return emit_argv_setup(layout).assemble()   # already ends AX=argc; HALT
 
 
+def emit_read_nth_stdin_byte(n: int, buf: int = 0x40) -> List[isa.Instr]:
+    """A COMPACT (straight-line, no-loop) neural proof of the READ-based argv path.
+
+    Reads and DISCARDS the first ``n`` bytes of the ARGV/stdin block, then reads
+    the ``n``-th byte into ``buf`` via ``READ(fd=0, buf, 1)`` and returns it
+    (``LC buf``).  This exercises the EXACT neural mechanism the full
+    ``__argv_setup`` uses — the READ opcode serviced from the position-signature
+    ``InputKVStream``, the read byte re-entering VM memory as a §Memory KV frame,
+    and an ``LC`` reading it back — but as ~``5*(n+1)`` straight-line instructions,
+    so it fits a SMALL ``code_size`` model (no 145-instruction loop reader).
+
+    For the ARGV block of ``args``, byte ``n`` picks a known target: bytes 0-3 are
+    ``argc`` (LE uint32), byte 4 is ``argv[0][0]``, etc.  The caller checks the
+    returned byte against the known ARGV-block byte (== gcc's view of that byte).
+    """
+    prog: List[Tuple[str, int]] = []
+    for _ in range(n + 1):                       # read n discards + 1 kept byte
+        prog += [("IMM", 0), ("PSH", 0),         # fd = 0 (neural stdin)
+                 ("IMM", buf), ("PSH", 0),        # buf
+                 ("IMM", 1), ("READ", 0)]         # AX = read(0, buf, 1)
+    prog += [("IMM", buf), ("LC", 0),            # AX = *(char*)buf = the n-th byte
+             ("HALT", 0)]
+    return isa.assemble(prog)
+
+
 __all__ = [
     "Arg", "argv_block", "argv_stdin", "ArgvLayout", "DEFAULT_LAYOUT", "SLOT",
     "emit_argv_setup", "emit_argv_program", "emit_print_argv_i_char0",
-    "emit_return_argc", "ArgvImage", "ref_argv_setup",
+    "emit_return_argc", "emit_read_nth_stdin_byte", "ArgvImage", "ref_argv_setup",
 ]
