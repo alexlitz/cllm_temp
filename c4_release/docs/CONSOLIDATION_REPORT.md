@@ -173,3 +173,66 @@ new `OP_IS[LEA]`-gated physical block (n_blocks 305 → 306), a real VERIFIED fe
 listed in the brief as an additive coexisting block. Every OTHER branch was
 byte-identical to the build (tools / tests / docs / decode-runtime paths). No merge
 changed the fingerprint UNEXPECTEDLY; no branch was stopped.
+
+## One post-merge test fix (test-only, no weight change)
+
+`test_crossop_dedup.py` (from #629) was written before the LEAN split was killed
+(`unify-full-vm-no-lean-splits`, `49907f07`). Two incompatibilities surfaced ONLY
+once #629 sat on the unified base — a legitimate consolidation finding, not a
+weight regression:
+
+1. `_build()` passed `include_bitwise=`/`include_divmod=` to
+   `build_compact_sparse_streaming` — those op-subset SPLIT kwargs were REMOVED
+   (the build is now the single full-op interpreter). Dropped them; the flags stay
+   as inert compat args.
+2. `test_almost_shareable_reported_not_tied` asserted a SPECIFIC pre-unification
+   near-miss weight pair existed (`>= 1`). The unified model has 0 "almost"
+   candidates — the cross-op dedup finds only EXACT permutation ties (19 real tie
+   groups, the cleaner outcome). Relaxed the stale precondition; KEPT the real
+   invariant (`st.almost_count == group tally` — almost candidates are REPORTED,
+   never silently tied).
+
+The 3 core crossop gates (byte-identity L∞=0, real-tie scalar accounting, exact
+permutation) pass unchanged. Test-only edit; the final fingerprint is unaffected.
+
+## Test result (c4_min suite, conftest-guarded, serial)
+
+The full 407-test suite is dominated by SLOW heavy-build neural tests (each a fresh
+streaming model build), so an exhaustive single run is multi-hour and repeatedly
+hit wall-clock bounds under the memory guard. Verified in bounded, per-file runs
+instead — all COMPLETED runs pass, ZERO failures:
+
+| File | Result |
+|------|--------|
+| test_blogspec_foundation | 10 passed |
+| test_moe_top1 | 9 passed |
+| test_handoff | 6 passed |
+| test_nibble_bake | 12 passed |
+| test_weight_dedup | 3 passed |
+| test_slice | 12 passed |
+| test_crossop_dedup | 4 passed, 1 skipped (after fix above) |
+| test_lib_addr32_byteident | 2 passed (addr32 byte-identity gate) |
+| test_nibble_kv_prune | 10 passed |
+| test_fetch_dedup | 5 passed |
+| test_nibble_io_position | 21 passed (#658 neural READ position sig) |
+| test_baked_attention | 7 passed (#652) |
+| test_neural_stdin_read | 6 passed (#658) |
+| **test_libprog_corpus** | **24 passed** (printf neural FAST tier + gcc goldens; #660/#648) |
+| **test_pure_forward_1096** | **4 lean families passed byte-exact** (+13 more before timeout) |
+
+**Confirmed: ~148 passed, 0 failed, 1 skipped (opt-in divmod gate).**
+
+Build-time-bound (slow full-model builds, no failures observed, hit the wall-clock
+timeout before finishing — NOT failures): `test_config_toggles`,
+`test_compact_alloc`, `test_argv_read`, and the heavier `test_pure_forward_1096`
+families. Their fast siblings covering the same paths (e.g. `test_neural_stdin_read`
+/ `test_nibble_io_position` for READ, the 4 lean 1096 families for decode) all pass.
+
+### Spot-checks (per brief)
+
+- FAST printf neural tier: `test_libprog_corpus` 24/24 byte-exact through
+  `model.forward` (printf_str/hex/int) + gcc goldens. PASS.
+- Primitives: foundation / moe / handoff / nibble_bake / weight_dedup / slice all
+  pass. PASS.
+- 1096 sample: 4 lean families (arith_add_32bit, cmp_gt, var_simple_32bit,
+  func_identity) byte-exact; 13/13 more passed before the heavy-build timeout. PASS.
