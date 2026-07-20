@@ -139,37 +139,62 @@ def pathway_quine(code_size: int = 64) -> bool:
 # Bundle pathway — bundle model+bytecode+program into one .c4bundle and run it
 # end-to-end THROUGH the bundled model, byte-exact result.
 #
-# The bundle serialises DENSE weights (COO over dense linear layers) and
-# ``run_bundle`` reconstructs a fresh DENSE unified full-op model
-# (``build_pure_forward_complete_model``) to scatter them into — that dense build
-# is the ~48-62 GB hazard, so this pathway is GATED on free memory (needs a dense
-# model, twice: once to assemble, once to run).  ``min_free_gb`` guards it.
+# BLOCKED on the unified VM by MEMORY: ``bundle_small._build_model`` bakes the
+# UNCOMPACTED, UNROLLED-DIV/MOD dense model (``build_pure_forward_complete_model``
+# with recurrent_divmod=False → 168 distinct div/mod blocks, FFN padded to the
+# global-max hidden) — MEASURED at ~117 GB RSS for a SINGLE build (vs the compact
+# builder's 48.6 GB).  ``run_bundle`` needs that dense reconstruct to scatter the
+# serialised COO weights into, so the genuine end-to-end round-trip is squarely in
+# the 54-108GB dense-OOM hazard and MUST NOT be run on a shared host.
+#
+# The MEMORY-SAFE parts that ARE validated: the C4-C section-fusing bundler
+# (bundler/c4_bundler_small.c) compiles (test_c4c_bundler_exists_and_gcc_syntax),
+# and the flat-container framing is deterministic.  The blocker is a bundle-builder
+# choice (use recurrent_divmod=True / the compact builder → 48.6 GB, or stream the
+# reconstruct), NOT a correctness defect in the bundle format.
 # ---------------------------------------------------------------------------
-def pathway_bundle(code_size: int = 32, min_free_gb: float = 70.0):
-    """Returns True/False (byte-exact) or None (deferred — not enough free mem)."""
+def pathway_bundle(code_size: int = 32, min_free_gb: float = 130.0):
+    """Returns True/False (byte-exact) or None (deferred — dense-OOM hazard).
+
+    Default gate 130 GB reflects the MEASURED ~117 GB single-build cost of the
+    bundle's uncompacted-unrolled ``_build_model`` — effectively always DEFERRED
+    on any normal host until the bundle builder is switched to the compact /
+    recurrent_divmod dense (48.6 GB) or a streaming reconstruct.
+    """
     import tempfile
     from c4_min import bundle_small as B
 
+    # container-mechanics smoke (model-free): the C4-C bundler compiles.
+    import shutil, subprocess
+    cc = shutil.which("gcc") or shutil.which("cc")
+    c4c = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "bundler", "c4_bundler_small.c")
+    bundler_ok = None
+    if cc and os.path.exists(c4c):
+        r = subprocess.run([cc, "-fsyntax-only", "-w", c4c],
+                           capture_output=True, text=True)
+        bundler_ok = (r.returncode == 0)
+        print("  [bundle:c4c-bundler-compiles] %s" % bundler_ok)
+
     free = _free_gb()
     if free < min_free_gb:
-        print("  [bundle] DEFERRED: free=%.1fGB < %.0fGB gate (dense reconstruct "
-              "needed for genuine end-to-end run_bundle)" % (free, min_free_gb))
+        print("  [bundle:end-to-end] DEFERRED: free=%.1fGB < %.0fGB gate — the "
+              "bundle's uncompacted-unrolled dense _build_model is ~117GB RSS "
+              "(dense-OOM hazard). Fixable by switching _build_model to the "
+              "compact/recurrent_divmod builder (48.6GB)." % (free, min_free_gb))
         return None
 
     src = "int main(){ return 500 + 700; }"     # -> 1200 (full 32-bit AX)
     with tempfile.TemporaryDirectory() as td:
         path = os.path.join(td, "prog.c4bundle")
         t0 = time.time()
-        # assemble_bundle bakes its OWN dense unified model (no reuse_model here so
-        # the round-trip is genuine: assemble builds dense -> serialise -> run
-        # rebuilds a SEPARATE dense model + scatters the serialised weights in).
         info = B.assemble_bundle(src, path, expected=1200, description="add-const",
                                  code_size=code_size, step_cap=400)
         res = B.run_bundle(path, verbose=False)
         got = res.get("got")
         ok = (res.get("status") == "PASS" and got == 1200)
-        print("  [bundle] src=%r expected=1200 status=%s got=%s BYTE-EXACT=%s "
-              "(%.1fs) file=%dB peakRSS=%.1fGB"
+        print("  [bundle:end-to-end] src=%r expected=1200 status=%s got=%s "
+              "BYTE-EXACT=%s (%.1fs) file=%dB peakRSS=%.1fGB"
               % (src, res.get("status"), got, ok, time.time() - t0,
                  info["bundle_bytes"], _rss_gb()))
     return ok
