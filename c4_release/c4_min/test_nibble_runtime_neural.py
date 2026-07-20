@@ -27,19 +27,45 @@ from c4_min import isa
 from c4_min import nibble_runtime as R
 
 
-# Build the model + sparse wrapper ONCE (shared across the tests).
+# Build the model + sparse wrapper ONCE and share it across the tests — but the
+# code overlay has EXACTLY ``code_size`` instruction slots (``L.CODE_OP[k]`` is a
+# fixed-length list), so a cached model built for a SHORT program indexes out of
+# range / control-flow-desyncs when a LONGER program is run through it later.
+# Tests run in file order (zfod=35, malloc_bump=45, memset=30): the ORIGINAL
+# `_sparse_model` built the shared model at the FIRST caller's code_size (37 for
+# zfod) and never grew it, so `test_malloc_bump_neural`'s 45-instruction program
+# then overran `L.CODE_OP` — an IndexError / control-flow desync (the "31 vs 35
+# steps + 0xFFFFFFFF garbage" the harness caught).  It was a test-harness sizing
+# bug, NOT a model value-path bug: each program is byte-exact through the model
+# when the model is built big enough (zfod/malloc_bump/memset all verified equal
+# to the word-width reference on one model at code_size=47).
+#
+# Fix: size the shared build to fit the LARGEST test program up front (one build,
+# no rebuild), and still GROW monotonically if a future/larger program is added
+# (dropping the old model first so peak RSS stays ~one streaming build, ~4 GB).
+# A model built at a LARGER code_size is byte-identical for a SHORTER program, so
+# the shared oversize model is safe for every test.
 _SPARSE = None
 _L = None
+_CODE_SIZE = 0
+
+#: Code-segment size the shared model is built at: the max instruction count of
+#: any test program (+2 headroom), so ONE streaming build serves every test.
+#: `_sparse_model` still grows past this if a bigger program is ever requested.
+_SHARED_CODE_SIZE = 48
 
 
 def _sparse_model(code_size: int):
-    global _SPARSE, _L
-    if _SPARSE is None:
+    global _SPARSE, _L, _CODE_SIZE
+    want = max(code_size, _SHARED_CODE_SIZE)
+    if _SPARSE is None or want > _CODE_SIZE:
         # STREAMING sparse build: peak RSS is ~one block, not the ~62 GB dense
         # whole — the memory-safe way to materialise the unified full-op model.
         from c4_min.lib_neural import build_lib_model_streaming
+        _SPARSE = _L = None                     # free the old model before rebuild
         _SPARSE, _L, _ = build_lib_model_streaming(
-            code_size=code_size, recurrent_divmod=True, addr32=True)
+            code_size=want, recurrent_divmod=True, addr32=True)
+        _CODE_SIZE = want
     return _SPARSE, _L
 
 
