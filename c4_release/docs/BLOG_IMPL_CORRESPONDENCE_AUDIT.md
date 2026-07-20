@@ -312,3 +312,31 @@ shipped nibble VM (which has ~86K–1.05M nonzeros, is 99.99% sparse, and uses 3
 unique values). The qualitative claims (extreme sparsity, few unique values, heavy
 sharing) are TRUE and if anything understated; the specific numbers are aspirational and
 should be labeled as such (extends REV #17/#18).
+
+## §File Operations + §Printing and Reading Input + §Tool Use Mode (693-717, 849-853)
+
+Reference: `nibble_filesys.py`, `blogspec_vocab.py` (think-tag), `vm_causal_lm.py`.
+
+| Claim | Class | Evidence |
+|-------|-------|----------|
+| OPEN/READ/CLOS via TOOL_CALL token protocol | ✅ | nibble_filesys `ToolCall`/`FileRunner.handle` (:285-299); wire format `TOOL_CALL:<type>:<id>` |
+| runtime lib (malloc/free/memset) are neural bytecode, not tool calls (§853) | ✅ | consistent with opcode audit — no MALC/MSET opcode; they lower to bytecode |
+| Two I/O modes (tool-call + native conversational) — REV #15 | 🟡 partial | tool-call fully present; "native" READ is a Python buffer (below) |
+| think-tag protocol: THINK_END, visible byte, THINK_START | ✅ (token-level) | `blogspec_vocab.visible_output` (:visible_output) parses visible bytes outside think tags; THINK_START/END tokens 265/266 |
+| **Native stdin via position-signature attention** (§702-739): multiple ALiBi-slope heads at BOS producing exponential tuples that uniquely map to position, nibble-cascade offset extraction | ⚠ **DESCRIBED-ONLY / Python buffer** | `InputKVStream` (nibble_filesys:242-255) is a plain Python byte buffer — `self.data[self.pos:self.pos+n]` — NOT the neural position-signature mechanism. Docstring claims "read out by attention, 100%-native pathway" but no IO/position-signature attention heads are baked anywhere (grep for IO_ALIBI/position-signature heads in `nibble_pure_forward*` = empty). |
+| **PRTF visible output is neural** | ⚠ **Python driver** | the visible byte is `out.append(ax & 0xFF)` read by the Python driver from decoded AX (nibble_pure_forward_complete:913), not emitted through a neural think-tag mechanism on the model |
+| position-offset via nibble cascade (§718-739) | ❌ not built | the O(log N) comparison-cascade offset extractor is described, not implemented |
+| System-prompt format (BYTECODE/SEP/DATA/SEP/ARGV) | ✅ | `blogspec_vocab` SEP=264; `universal.py` loads code table |
+| argv (`__argv_setup` read-as-input, §751-793) | 🟡 BRANCH-ONLY | not plumbed on this unified branch (grep for argv_setup/bake_argv = empty); the task notes argv was re-plumbed on branch `argv-read-plumb` |
+
+**⚠ NEW — the "100% native conversational I/O" is largely a Python harness, not neural.**
+The blog's most elaborate I/O section (§702-739, the multi-head ALiBi position-signature
++ nibble-cascade offset machinery for reading user input by attention) is **not
+implemented as a neural mechanism**. Native stdin (`InputKVStream`) is a Python buffer;
+PRTF's visible byte is read out by the Python driver. The think-tag *token stream*
+contract (visible bytes outside THINK tags) exists at the vocab level, and
+`vm_causal_lm.py` drives read/write turns via HF `model.generate()`, but the
+position-signature attention that the blog spends ~40 lines describing is not there. So
+"basic IO possible with a 100% native version of the transformer" (§695) is an
+**overclaim** for the position-addressed input path — it works, but through a Python
+runner, not the described neural position signatures.
