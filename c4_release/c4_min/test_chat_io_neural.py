@@ -81,7 +81,19 @@ def _release_memory():
 # test_nibble_runtime_neural, since the code overlay has a fixed ``code_size``
 # instruction slot count).  Conversational I/O uses low-window buffers, so the
 # base 8-bit query suffices — addr32=False.
+#
+# ``_MIN_CODE_SIZE`` floor: the streaming build's OWN value-liveness probe compiles
+# a battery of C programs (``compact_alloc._default_probe_programs``) and overlays
+# each onto the ``code_size`` code slots, so the shared model must be built at
+# least as big as the LONGEST probe program (the func-args probe ~50 instrs) — a
+# model built for a tiny program (e.g. the 14-instr READ/LC/PRTF primitive) makes
+# the build's own probe overlay index past ``L.CODE_OP`` (IndexError).  A model
+# built at a LARGER code_size is byte-identical for a SHORTER program, so this
+# floor is safe for every test.  55 is the size the sibling library-neural suite
+# (test_nibble_runtime_neural) builds at.
 # ---------------------------------------------------------------------------
+_MIN_CODE_SIZE = 64
+
 _SPARSE = None
 _L = None
 _CODE_SIZE = 0
@@ -89,12 +101,13 @@ _CODE_SIZE = 0
 
 def _model(code_size: int):
     global _SPARSE, _L, _CODE_SIZE
-    if _SPARSE is None or code_size > _CODE_SIZE:
+    want = max(code_size, _MIN_CODE_SIZE)
+    if _SPARSE is None or want > _CODE_SIZE:
         from c4_min.lib_neural import build_lib_model_streaming
         _SPARSE = _L = None                      # free the old model before rebuild
         _SPARSE, _L, _ = build_lib_model_streaming(
-            code_size=code_size, recurrent_divmod=True, addr32=False)
-        _CODE_SIZE = code_size
+            code_size=want, recurrent_divmod=True, addr32=False)
+        _CODE_SIZE = want
     return _SPARSE, _L
 
 
@@ -235,18 +248,21 @@ if __name__ == "__main__":
            ("test_eliza_one_turn_bounded_neural", test_eliza_one_turn_bounded_neural),
            ("test_eliza_multi_turn_neural", test_eliza_multi_turn_neural)]
     failed = 0
+    skipped = 0
     for name, fn in fns:
         t0 = time.time()
         try:
             fn()
             print(f"PASS {name}  ({time.time() - t0:.1f}s)")
-        except Exception as exc:  # noqa: BLE001
+        except BaseException as exc:  # noqa: BLE001 (pytest.skip raises BaseException)
             if type(exc).__name__ == "Skipped":
+                skipped += 1
                 print(f"SKIP {name}: {exc}")
                 continue
             failed += 1
             import traceback
             traceback.print_exc()
             print(f"FAIL {name}: {exc!r}")
-    print(f"\n{len(fns) - failed - 1} passed (+ multi-turn if opted in)")
+    passed = len(fns) - failed - skipped
+    print(f"\n{passed} passed, {skipped} skipped, {failed} failed")
     sys.exit(1 if failed else 0)
