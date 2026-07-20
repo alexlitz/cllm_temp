@@ -80,39 +80,44 @@ def build_loop_countdown(n: int):
 
 
 def build_malloc(n: int):
-    """A malloc/free heap program (uses the addr32 heap at 0x30008)."""
-    from src.compiler import compile_c
-    from c4_min.run_1096_pure_forward import bytecode_to_isa
-    from c4_min.nibble_runtime import RUNTIME_C
-    # Allocate n cells, write i to each, sum them back, free.
-    prog = RUNTIME_C + f"""
-    int main() {{
-        int *p; int i; int s;
-        p = malloc({n} * 4);
-        i = 0;
-        while (i < {n}) {{ p[i] = i; i = i + 1; }}
-        s = 0; i = 0;
-        while (i < {n}) {{ s = s + p[i]; i = i + 1; }}
-        free(p);
-        return s;
-    }}
-    """
-    bytecode, data = compile_c(prog)
-    code = bytecode_to_isa(bytecode)
-    return code, sum(range(n)), data, f"malloc n={n} (sum 0..{n-1})"
+    """A malloc + memset + memcmp heap program built from the c4_min runtime library
+    (``nibble_runtime``: pure base-ISA, uses the addr32 heap at 0x30008).
+
+    ``malloc(n)`` two buffers, ``memset`` both to the same byte, ``memcmp`` them ->
+    the memcmp all-equal loop returns 0.  memcmp is the deepest looping subroutine
+    (the deep-loop heavy case per the memory notes).  Reference AX via
+    ``ref_interpret_words``."""
+    import c4_min.nibble_runtime as R
+    n = max(1, n)
+    pa, pb = R.HEAP_BASE, R.HEAP_BASE + max(16, n + 8)
+    a = R.Asm()
+    a.splice(R.emit_malloc(pb - pa))                 # bump the heap (exercise malloc)
+    a.splice(R.emit_memset(pa, 0x41, n))             # fill A with 'A'
+    a.splice(R.emit_memset(pb, 0x41, n))             # fill B with 'A' (equal)
+    a.splice(R.emit_memcmp(pa, pb, n))               # all-equal -> 0
+    a.exit_()
+    code = a.instrs()
+    ref_ax, _ = R.ref_interpret_words(code, max_steps=200000)
+    return code, ref_ax & 0xFFFFFFFF, None, f"malloc+memset+memcmp n={n} (equal->0)"
 
 
 def build_matmul(dim: int):
-    """The self-emulation matmul: an NxN integer matmul (mul/add-heavy)."""
+    """The self-emulation matmul: an NxN integer matmul on malloc'd pointer arrays
+    (mul/add-heavy — the block-MoE has nothing to skip, so this stresses the
+    speculation lever).  Expected AX via the model's own 8-bit reference."""
     from src.compiler import compile_c
     from c4_min.run_1096_pure_forward import bytecode_to_isa
+    from c4_min.nibble_pure_forward_complete import ref_interpret
     N = dim
+    # malloc'd int arrays keep the local frame small (byte-sized LEA offsets) — the
+    # matmul products stay < 256 for small N so the model's 8-bit ALU is byte-exact.
     src = f"""
     int main() {{
-        int a[{N*N}]; int b[{N*N}]; int c[{N*N}];
+        int *a; int *b; int *c;
         int i; int j; int k; int s;
+        a = malloc({N*N*4}); b = malloc({N*N*4}); c = malloc({N*N*4});
         i = 0;
-        while (i < {N*N}) {{ a[i] = i + 1; b[i] = i + 2; c[i] = 0; i = i + 1; }}
+        while (i < {N*N}) {{ a[i] = i % 3; b[i] = i % 2; c[i] = 0; i = i + 1; }}
         i = 0;
         while (i < {N}) {{
             j = 0;
@@ -132,7 +137,9 @@ def build_matmul(dim: int):
     """
     bytecode, data = compile_c(src)
     code = bytecode_to_isa(bytecode)
-    return code, None, data, f"matmul {N}x{N}"
+    ref_ax = ref_interpret(code, max_steps=500000, mask=0xFFFFFFFF)
+    exp = (ref_ax[-1] & 0xFFFFFFFF) if ref_ax else None
+    return code, exp, data, f"matmul {N}x{N} (malloc arrays)"
 
 
 # ---------------------------------------------------------------------------
