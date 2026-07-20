@@ -275,3 +275,40 @@ Reference: `blogspec_memory.py`, `blogspec_vocab.py`.
 the strongest blog↔code correspondence in the whole project. Binary-CAM keys, query=key,
 ALiBi recency, softmax1 ZFOD, zero-overwrite free, 4-byte alignment, NULL-per-step, and
 the 30-token frame all match. EFF=500000 (the deep-recursion fix) is live.
+
+## §Weight / sparsity numbers (BLOG_SPEC.md:170-229) — MEASURED
+
+The blog's Summary claims **45 ops / 5,487 reported → 1,397 unique → ~800 with full
+op-class sharing**, and **96.4% sparse** ("With full op-class sharing | 88,548 | ~800";
+"tensors are 96.4% sparse"). I MEASURED the actual built c4_min nibble models (memory-
+safe, RSS reported):
+
+| Build | dim | blocks | total dense entries | **nonzero** | **sparsity** | unique nonzero values | RSS |
+|-------|----:|-------:|--------------------:|------------:|-------------:|----------------------:|----:|
+| lean (`include_muldiv=False`) | 1533 | 15 | 919,784,304 | **86,602** | **99.991%** | 314 | 4.1 GB |
+| muldiv (`include_muldiv=True`) | 1533 | 17 | 12,711,741,907 | **1,052,510** | **99.9917%** | 550 | 50.8 GB |
+
+**⚠ NEW — the blog's weight numbers do not describe the built model:**
+- **Sparsity is understated.** Blog says "96.4% sparse"; the measured lean model is
+  **99.991% sparse** and the muldiv model **99.9917%**. The 96.4% figure is far too low
+  — the real tensors are >99.99% zeros. (The blog's own §Sparse Tensors prose says
+  "over 99%+ sparse", which is right; the 96.4% in the Summary table is inconsistent
+  with the blog's own later text AND with measurement.)
+- **Nonzero count is ~15×–190× higher than claimed.** Blog "5,487 reported nonzero";
+  measured **86,602** (lean) / **1,052,510** (muldiv). The c4_min *nibble* VM with real
+  fp32-exact 32-bit divmod needs ~1M nonzero weights, not ~5.5K. The 5,487 is the
+  blog's *idealized per-op minimal* count for a 45-op model, NOT the built nibble model.
+- **"~800 unique weights" vs measured 314 / 550 unique VALUES.** These aren't directly
+  comparable (blog's "unique" = unique per-op-class *positions* after sharing; measured
+  = unique nonzero *scalar values*), but the built model genuinely uses only **314-550
+  distinct scalar values** across ~1M nonzeros — heavy value replication, consistent with
+  the blog's redundancy thesis (and with REV #12's weight-tying dedup). So the *spirit*
+  of "few unique weights" holds; the *specific* 5,487/1,397/800 table does not map to the
+  built model.
+
+**Verdict (weight numbers):** the blog's per-op L/W table and the 5,487/1,397/800 Summary
+are an **idealized accounting for a minimal 45-op model**, not a measurement of the
+shipped nibble VM (which has ~86K–1.05M nonzeros, is 99.99% sparse, and uses 314-550
+unique values). The qualitative claims (extreme sparsity, few unique values, heavy
+sharing) are TRUE and if anything understated; the specific numbers are aspirational and
+should be labeled as such (extends REV #17/#18).
