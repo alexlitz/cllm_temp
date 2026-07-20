@@ -1,0 +1,939 @@
+"""End-to-end LIB-PROGRAM CORPUS: real C programs that exercise the C4 runtime
+library (malloc / free / memset / memcmp) + file IO (OPEN/READ/CLOS) + printf,
+with a compile -> run -> byte-exact-stdout harness.
+
+WHAT THIS IS
+============
+Each corpus entry is a small, real C program (``c4_min/libprog/*.c``) that calls
+the c4 runtime-library routines and/or the file-IO / printf tool-call opcodes.
+The harness:
+
+  1. COMPILES the .c to C4 bytecode with the repo's real compiler
+     (:func:`src.compiler.compile_c`), which parses the C, and — because these
+     programs call ``malloc`` / ``free`` / ``memset`` / ``memcmp`` — LINKS the
+     C4 standard library (``src/stdlib/memory.c4``) so those functions are
+     compiled from C into bytecode subroutines (NOT tool calls, per BLOG_SPEC
+     §"Memory Allocation and Freeing" / §"Memset, Memcmp and Memcpy"). File ops
+     (OPEN/READ/CLOS) and ``printf`` (PRTF) stay tool calls (§Tool Use Mode).
+  2. RUNS the bytecode through a REFERENCE C4 VM (:class:`RefVM`) — a plain-python
+     word-addressed interpreter that executes the full C4 ISA (JSR/ENT/LEV/ADJ,
+     the ALU, LI/LC/SI/SC) so the linked malloc/memset/memcmp subroutines run
+     *as bytecode*, and services the file / printf tool-call boundary (OPEN/READ/
+     CLOS via a stub filesystem, PRTF via the c4 printf format subset).
+  3. Asserts stdout == the GOLDEN captured from real ``gcc`` (a byte-exact oracle).
+
+The GOLDEN for each program is captured by compiling the SAME .c with the system
+``gcc`` (standard headers prepended, so ``malloc`` / ``printf`` resolve to libc)
+and capturing its stdout.  ``libprog/GOLDENS.txt`` records the frozen goldens;
+:func:`regenerate_goldens` rebuilds them.
+
+TWO ENGINES (--engine reference|model)
+======================================
+  * ``reference`` (this file, available NOW): runs the bytecode on :class:`RefVM`.
+  * ``model``     (PENDING on #646): once the runtime library is integrated into
+    the unified neural model (``build_pure_forward_complete_model`` +
+    ``nibble_runtime``), the SAME bytecode runs through ``model.forward`` and the
+    same byte-exact stdout assertion applies.  :func:`run_model` is the hook; it
+    reports PENDING until #646's ``c4_min.nibble_runtime`` (the lib) lands.  It is
+    NOT faked.
+
+The pytest wrapper is ``c4_min/test_libprog_corpus.py``.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# The c4 printf format subset (%d %u %x %c %s %%) — reused so the reference VM's
+# PRTF formats bytes identically to the tool-call runner.
+from .nibble_filesys import _format_printf, _sign32
+
+_HERE = Path(__file__).resolve().parent
+LIBPROG_DIR = _HERE / "libprog"
+GOLDENS_PATH = LIBPROG_DIR / "GOLDENS.txt"
+
+# Instruction-index PC model (matches src.compiler's `current_addr = len(code)`
+# branch/call targets).  Stack descends by SLOT bytes per push; data segment
+# base is where the compiler places string literals.
+SLOT = 8
+STACK_TOP = 0x100000        # SP/BP init (well above the data seg + heap)
+DATA_BASE = 0x10000         # src.compiler places string literals here
+
+
+# ===========================================================================
+# Opcode ids (src.compiler.Op numbering; identical to c4_min.isa for the shared
+# subset).  Kept local so the harness does not depend on the src.Op enum import
+# at module load (the enum is used only inside compile helpers).
+# ===========================================================================
+LEA, IMM, JMP, JSR, BZ, BNZ, ENT, ADJ, LEV = 0, 1, 2, 3, 4, 5, 6, 7, 8
+LI, LC, SI, SC, PSH = 9, 10, 11, 12, 13
+OR, XOR, AND = 14, 15, 16
+EQ, NE, LT, GT, LE, GE = 17, 18, 19, 20, 21, 22
+SHL, SHR = 23, 24
+ADD, SUB, MUL, DIV, MOD = 25, 26, 27, 28, 29
+OPEN, READ, CLOS, PRTF = 30, 31, 32, 33
+EXIT, NOP = 38, 39
+
+
+# ===========================================================================
+# THE CORPUS: program -> (source file, lib functions exercised, what it shows).
+# Keep programs SMALL so the neural VM run (Phase 2) stays tractable.
+# ===========================================================================
+@dataclass
+class CorpusEntry:
+    name: str
+    source: str                       # .c filename under libprog/
+    lib_funcs: Tuple[str, ...]        # runtime-lib / IO functions exercised
+    demonstrates: str                 # the read/print capacity shown
+    # per-program file inputs for OPEN/READ (name -> bytes) and stdin bytes.
+    files: Dict[str, bytes] = field(default_factory=dict)
+    stdin: bytes = b""
+
+
+CORPUS: List[CorpusEntry] = [
+    CorpusEntry(
+        "memtest", "memtest.c",
+        ("malloc", "memset", "memcmp", "printf"),
+        "heap alloc -> fill -> byte-read-back print (%c loop) -> equal-buffer compare",
+    ),
+    CorpusEntry(
+        "malloc_free_reuse", "malloc_free_reuse.c",
+        ("malloc", "free", "memset", "printf"),
+        "alloc/fill/print, free, re-alloc/fill/print + %d",
+    ),
+    CorpusEntry(
+        "memset_fill", "memset_fill.c",
+        ("malloc", "memset", "printf"),
+        "memset fill then verify every byte via a %c read-back loop",
+    ),
+    CorpusEntry(
+        "memcmp_eq", "memcmp_eq.c",
+        ("malloc", "memset", "memcmp", "printf"),
+        "memcmp of two identical buffers -> 0 (equal branch)",
+    ),
+    CorpusEntry(
+        "memcmp_ne", "memcmp_ne.c",
+        ("malloc", "memset", "memcmp", "printf"),
+        "memcmp with a perturbed byte -> non-zero (differ branch)",
+    ),
+    CorpusEntry(
+        "filecat", "filecat.c",
+        ("malloc", "open", "read", "close", "printf"),
+        "OPEN+READ+CLOS a file into a heap buffer, then print it (cat-style)",
+        files={"greeting.txt": b"hello, file!\n"},
+    ),
+    CorpusEntry(
+        "printf_int", "printf_int.c",
+        ("printf",),
+        "printf %d (signed decimal) + %c (char) formatting across calls",
+    ),
+    CorpusEntry(
+        "printf_str", "printf_str.c",
+        ("printf",),
+        "printf %s (data-segment string pointer) + %d",
+    ),
+    CorpusEntry(
+        "printf_hex", "printf_hex.c",
+        ("printf",),
+        "printf %x (lowercase hex) + %d",
+    ),
+    CorpusEntry(
+        "malloc_printf", "malloc_printf.c",
+        ("malloc", "memset", "printf"),
+        "alloc+memset then report the fill via %d and %c reading a heap byte",
+    ),
+]
+
+CORPUS_BY_NAME = {e.name: e for e in CORPUS}
+
+
+# ===========================================================================
+# COMPILE: .c -> C4 bytecode via the repo's real compiler (src.compiler).
+# ===========================================================================
+def _repo_root() -> Path:
+    # c4_min/ lives at <root>/c4_release/c4_min ; src/ at <root>/c4_release/src
+    return _HERE.parent
+
+
+def compile_c_source(source: str) -> Tuple[List[Tuple[int, int]], bytes]:
+    """Compile C ``source`` -> (instructions, data_bytes).
+
+    Uses :func:`src.compiler.compile_c` (which links the C4 stdlib for
+    malloc/free/memset/memcmp).  The compiler emits packed words ``op + (imm<<8)``;
+    we unpack to ``(op, imm)`` instruction tuples (PC + branch targets are
+    instruction indices).  ``data_bytes`` are the static data-segment bytes that
+    load at :data:`DATA_BASE`.
+    """
+    root = _repo_root()
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from src.compiler import compile_c   # real C4 compiler (+ stdlib link)
+
+    code_words, data = compile_c(source)
+    instrs: List[Tuple[int, int]] = []
+    for w in code_words:
+        op = w & 0xFF
+        imm = w >> 8
+        # sign-extend a negative frame offset (LEA -8 etc.)
+        if imm >= (1 << 55):
+            imm -= (1 << 56)
+        instrs.append((op, imm))
+    return instrs, bytes(data)
+
+
+def compile_entry(entry: CorpusEntry) -> Tuple[List[Tuple[int, int]], bytes]:
+    """Compile a corpus entry's .c to (instructions, data_bytes)."""
+    src = (LIBPROG_DIR / entry.source).read_text()
+    return compile_c_source(src)
+
+
+# ===========================================================================
+# THE REFERENCE C4 VM — word-addressed, full ISA, tool-call IO.
+#
+# This is the byte-exact oracle for the LINKED-bytecode programs: it runs the
+# compiled malloc/memset/memcmp subroutines AS BYTECODE (JSR/ENT/LEV + the ALU),
+# and services the file / printf tool-call boundary.  PC and all branch/call
+# targets are INSTRUCTION INDICES (src.compiler's native form).
+# ===========================================================================
+class _StubFS:
+    """In-memory filesystem for OPEN/READ/CLOS: name -> bytes."""
+
+    def __init__(self, files: Optional[Dict[str, bytes]] = None):
+        self.files = dict(files or {})
+        self._open: Dict[int, Tuple[bytes, int]] = {}   # fd -> (data, pos)
+        self._next_fd = 3
+        self.stdin = b""
+        self.stdin_pos = 0
+
+    def open(self, path: str) -> int:
+        if path not in self.files:
+            return -1
+        fd = self._next_fd
+        self._next_fd += 1
+        self._open[fd] = (self.files[path], 0)
+        return fd
+
+    def read(self, fd: int, n: int) -> bytes:
+        if fd == 0:                                    # stdin
+            chunk = self.stdin[self.stdin_pos:self.stdin_pos + n]
+            self.stdin_pos += len(chunk)
+            return chunk
+        st = self._open.get(fd)
+        if st is None:
+            return b""
+        data, pos = st
+        chunk = data[pos:pos + n]
+        self._open[fd] = (data, pos + len(chunk))
+        return chunk
+
+    def close(self, fd: int) -> int:
+        self._open.pop(fd, None)
+        return 0
+
+
+class RefVM:
+    """Plain-python word-addressed C4 reference VM (the byte-exact oracle).
+
+    Memory is a ``{byte_addr: byte}`` dict.  SI/LI are 32-bit word store/load;
+    SC/LC are byte store/load (matching C ``char`` access and the neural LC/SC).
+    The stack descends from :data:`STACK_TOP` by :data:`SLOT` per push.  File
+    ops go through :class:`_StubFS`; PRTF formats via the c4 printf subset.
+    """
+
+    def __init__(self, instrs: List[Tuple[int, int]], data: bytes,
+                 files: Optional[Dict[str, bytes]] = None, stdin: bytes = b""):
+        self.code = instrs
+        self.mem: Dict[int, int] = {}
+        for i, b in enumerate(data):
+            self.mem[DATA_BASE + i] = b
+        self.fs = _StubFS(files)
+        self.fs.stdin = stdin
+        self.stdout = bytearray()
+        self.ax = 0
+        self.pc = 0
+        self.sp = STACK_TOP
+        self.bp = STACK_TOP
+
+    # -- memory helpers ------------------------------------------------------
+    def _lw(self, addr: int) -> int:
+        return sum(self.mem.get(addr + i, 0) << (8 * i) for i in range(4))
+
+    def _sw(self, addr: int, v: int) -> None:
+        for i in range(4):
+            self.mem[addr + i] = (v >> (8 * i)) & 0xFF
+
+    def _cstr(self, addr: int, limit: int = 4096) -> str:
+        out = bytearray()
+        for i in range(limit):
+            b = self.mem.get(addr + i, 0) & 0xFF
+            if b == 0:
+                break
+            out.append(b)
+        return out.decode("latin-1")
+
+    def _push(self, v: int) -> None:
+        self.sp -= SLOT
+        self._sw(self.sp, v & 0xFFFFFFFF)
+
+    def _pop(self) -> int:
+        v = self._lw(self.sp)
+        self.sp += SLOT
+        return v
+
+    # -- printf --------------------------------------------------------------
+    def _do_printf(self, n_pushed: int) -> None:
+        """PRTF: the format ptr was pushed FIRST, then each arg, so the stack is
+        (top->down) last-arg ... first-arg, fmt_ptr.  ``n_pushed`` is the number of
+        pushed slots (fmt + args), derived deterministically from the compiler's
+        trailing ``ADJ (n_args+1)*8`` (see :meth:`_prtf_pushed`).  We format via the
+        c4 subset, append to stdout, and set AX = n_written.  The compiler's ADJ
+        reclaims the pushed slots — PRTF itself does not pop."""
+        n_args = max(0, n_pushed - 1)
+        fmt_ptr = self._lw(self.sp + n_args * SLOT)   # deepest slot = fmt
+        fmt = self._cstr(fmt_ptr)
+        args: List[int] = []
+        for k in range(n_args):
+            # arg k (call order) sits at depth (n_args-1-k) above fmt.
+            args.append(self._lw(self.sp + (n_args - 1 - k) * SLOT))
+        strings = {str(a): self._cstr(a) for a in args}
+        text = _format_printf(fmt, args, strings)
+        self.stdout.extend(text.encode("latin-1"))
+        self.ax = len(text.encode("latin-1"))
+
+    def _prtf_pushed(self, prtf_idx: int) -> int:
+        """Number of slots pushed for the PRTF at instruction ``prtf_idx`` (fmt +
+        args).  The compiler ALWAYS emits ``ADJ (n_args+1)*8`` immediately after a
+        syscall, so the pushed-slot count is ``ADJ.imm / SLOT`` — a deterministic
+        read, not a format-string guess.  Falls back to a format-string spec count
+        if the next instruction is not an ADJ (defensive)."""
+        nxt = self.code[prtf_idx + 1] if prtf_idx + 1 < len(self.code) else None
+        if nxt is not None and nxt[0] == ADJ:
+            return max(1, nxt[1] // SLOT)
+        # defensive fallback: derive from the format string via a bounded scan.
+        return _count_format_args(_peek_fmt(self)) + 1
+
+    # -- run -----------------------------------------------------------------
+    def run(self, max_steps: int = 200000) -> str:
+        steps = 0
+        while 0 <= self.pc < len(self.code) and steps < max_steps:
+            steps += 1
+            op, imm = self.code[self.pc]
+            i = self.pc
+            self.pc += 1
+            if op == IMM:
+                self.ax = imm & 0xFFFFFFFF
+            elif op == LEA:
+                # src.compiler emits LEA/ENT/ADJ immediates as BYTE offsets (frame
+                # locals at -8, -16, ...; params at 16 + i*8), so imm is already a
+                # byte offset — do NOT re-scale by SLOT.
+                self.ax = (self.bp + imm) & 0xFFFFFFFF
+            elif op == PSH:
+                self._push(self.ax)
+            elif op == ADD:
+                self.ax = (self._pop() + self.ax) & 0xFFFFFFFF
+            elif op == SUB:
+                self.ax = (self._pop() - self.ax) & 0xFFFFFFFF
+            elif op == MUL:
+                self.ax = (self._pop() * self.ax) & 0xFFFFFFFF
+            elif op == DIV:
+                v = self._pop(); self.ax = (v // self.ax if self.ax else 0) & 0xFFFFFFFF
+            elif op == MOD:
+                v = self._pop(); self.ax = (v % self.ax if self.ax else 0) & 0xFFFFFFFF
+            elif op == OR:
+                self.ax = (self._pop() | self.ax) & 0xFFFFFFFF
+            elif op == XOR:
+                self.ax = (self._pop() ^ self.ax) & 0xFFFFFFFF
+            elif op == AND:
+                self.ax = (self._pop() & self.ax) & 0xFFFFFFFF
+            elif op == SHL:
+                self.ax = (self._pop() << self.ax) & 0xFFFFFFFF
+            elif op == SHR:
+                self.ax = (self._pop() >> self.ax) & 0xFFFFFFFF
+            elif op in (EQ, NE, LT, GT, LE, GE):
+                v = self._pop()
+                r = {EQ: v == self.ax, NE: v != self.ax, LT: v < self.ax,
+                     GT: v > self.ax, LE: v <= self.ax, GE: v >= self.ax}[op]
+                self.ax = 1 if r else 0
+            elif op == LI:
+                self.ax = self._lw(self.ax)
+            elif op == LC:
+                self.ax = self.mem.get(self.ax, 0) & 0xFF
+            elif op == SI:
+                self._sw(self._pop(), self.ax)
+            elif op == SC:
+                self.mem[self._pop()] = self.ax & 0xFF
+            elif op == JMP:
+                self.pc = imm
+            elif op == BZ:
+                self.pc = imm if self.ax == 0 else self.pc
+            elif op == BNZ:
+                self.pc = imm if self.ax != 0 else self.pc
+            elif op == JSR:
+                self._push(i + 1)                      # return = next instr index
+                self.pc = imm
+            elif op == ENT:
+                self._push(self.bp)                    # save caller BP
+                self.bp = self.sp
+                self.sp -= imm                         # reserve locals (BYTE size)
+            elif op == ADJ:
+                self.sp += imm                         # pop args (BYTE size)
+            elif op == LEV:
+                self.sp = self.bp
+                self.bp = self._pop()                  # restore caller BP
+                self.pc = self._pop()                  # restore return index
+            elif op in (OPEN, READ, CLOS, PRTF):
+                # Syscalls (§Tool Use Mode): args were pushed left-to-right, so the
+                # stack (top->down) holds the LAST arg first.  Like PRTF, they PEEK
+                # their args off the stack and do NOT pop — the compiler's trailing
+                # ADJ reclaims the pushed slots.  For open(name,flags): top=flags,
+                # then name.  For read(fd,buf,n): top=n, then buf, then fd.
+                if op == OPEN:
+                    name_ptr = self._lw(self.sp + 1 * SLOT)   # under flags
+                    self.ax = self.fs.open(self._cstr(name_ptr)) & 0xFFFFFFFF
+                elif op == READ:
+                    n = self._lw(self.sp + 0 * SLOT)
+                    buf = self._lw(self.sp + 1 * SLOT)
+                    fd = self._lw(self.sp + 2 * SLOT)
+                    chunk = self.fs.read(fd, n)
+                    for k, b in enumerate(chunk):
+                        self.mem[buf + k] = b
+                    self.ax = len(chunk)
+                elif op == CLOS:
+                    fd = self._lw(self.sp + 0 * SLOT)
+                    self.ax = self.fs.close(fd) & 0xFFFFFFFF
+                else:  # PRTF
+                    self._do_printf(self._prtf_pushed(i))
+            elif op == NOP:
+                pass
+            elif op == EXIT:
+                break
+            else:
+                raise NotImplementedError(f"op {op} not in RefVM ISA")
+        return bytes(self.stdout).decode("latin-1")
+
+
+def _peek_fmt(vm: "RefVM") -> str:
+    """Read the format string for the pending PRTF WITHOUT knowing the arg count
+    yet: the fmt ptr is the DEEPEST pushed slot, but we don't yet know the depth.
+    We resolve it by scanning outward — the c4 lowering pushes fmt first, so the
+    fmt ptr is the value at the largest SP offset that points at a valid C string
+    whose %-spec count is self-consistent with that depth.  In practice the
+    compiler always emits ``ADJ (n_args+1)`` so we instead derive n_args from the
+    format found at each candidate depth; the smallest depth whose fmt's spec
+    count == depth is the answer.  See :func:`_count_format_args`.
+    """
+    # Candidate depths 0..8 (printf in this corpus has <=3 args).  For each, read
+    # the value at sp + d*SLOT as a would-be fmt ptr and count its specs; the
+    # consistent depth is the one where spec-count == d.
+    for d in range(0, 9):
+        cand = vm._lw(vm.sp + d * SLOT)
+        fmt = vm._cstr(cand)
+        if fmt and _count_format_args(fmt) == d:
+            return fmt
+    # Fallback: depth 0 (no-arg printf) — fmt is the top of stack.
+    return vm._cstr(vm._lw(vm.sp))
+
+
+def _count_format_args(fmt: str) -> int:
+    """Number of conversion args a c4 printf format string consumes (%% is not
+    an arg; %d/%u/%x/%c/%s each consume one)."""
+    n = 0
+    i = 0
+    while i < len(fmt):
+        if fmt[i] == "%":
+            i += 1
+            if i < len(fmt) and fmt[i] != "%":
+                n += 1
+            i += 1
+        else:
+            i += 1
+    return n
+
+
+# ===========================================================================
+# ENGINE: reference (RefVM) | model (through the transformer, model.forward).
+# ===========================================================================
+def run_reference(entry: CorpusEntry, max_steps: int = 200000) -> str:
+    """Compile the entry and run its bytecode on :class:`RefVM`; return stdout."""
+    instrs, data = compile_entry(entry)
+    vm = RefVM(instrs, data, files=dict(entry.files), stdin=entry.stdin)
+    return vm.run(max_steps=max_steps)
+
+
+class ModelEnginePending(RuntimeError):
+    """Raised when the neural (model.forward) engine is requested but the runtime
+    library (``c4_min.nibble_runtime`` + ``c4_min.lib_neural`` on the unified
+    model) is not present in this checkout."""
+
+
+def lib_integrated() -> bool:
+    """True iff the runtime library — AND a stdout-capable neural model build —
+    are present in this checkout (i.e. the neural engine can actually run these
+    stdout-producing programs).
+
+    Requires ``c4_min.nibble_runtime`` (the baked malloc/free/memset/memcmp +
+    word-width oracle) and ``c4_min.lib_neural.build_lib_model_streaming`` (the
+    memory-safe 32-bit-load-address STREAMING model build).
+    """
+    try:
+        from . import nibble_runtime      # noqa: F401  (baked lib gadgets)
+        from . import lib_neural          # noqa: F401  (the 32-bit-addr model build)
+    except Exception:
+        return False
+    return hasattr(getattr(__import__("c4_min.lib_neural", fromlist=["x"]),
+                           "build_lib_model_streaming", None), "__call__")
+
+
+def _bytes_to_seg(data: bytes) -> Dict[int, int]:
+    """Byte data-segment -> {byte_addr: byte} at :data:`DATA_BASE` (the form the
+    pure-forward driver's ``data_seg`` expects)."""
+    return {DATA_BASE + i: b for i, b in enumerate(data)}
+
+
+# ---------------------------------------------------------------------------
+# ABI RETARGETING: src.compiler ABI -> the neural VM's ABI.
+#
+# ``src.compiler`` targets an 8-BYTE-slot, BYTE-OFFSET calling convention (SP
+# descends 8 per push; frame locals at BP-8/-16/...; params at BP+16/+24/...;
+# ENT/ADJ immediates are BYTE sizes).  The neural VM
+# (``nibble_pure_forward_complete.callconv_dispatch_rules``) uses a 4-BYTE-slot,
+# SLOT-COUNT convention (SP descends 4 per push; ENT reserves ``imm`` slots as
+# ``SP -= 4 + 4*imm``; ADJ is ``SP += 4*imm``; LEA is ``AX = BP + 4*imm``).
+#
+# The two ABIs map by ONE uniform rule — the frame-relative ops (LEA/ENT/ADJ)
+# carry a byte offset that is always a multiple of 8 (verified for the whole
+# corpus), and dividing it by 8 yields the neural slot count:
+#
+#   * local at compiler BP-8k  -> neural BP-4k   (LEA imm  -8k -> -k = off/8)
+#   * param at compiler BP+16+8i -> neural BP+8+4i (LEA imm 16+8i -> 2+i = off/8)
+#   * ENT  local-bytes 8*n  -> reserve n slots     (ENT imm 8n -> n = imm/8)
+#   * ADJ  arg-bytes  8*argc -> pop argc slots      (ADJ imm 8*argc -> argc = imm/8)
+#   * LEV  is self-consistent once JSR/ENT push the neural 4-byte frame.
+#
+# Every other op (IMM/PSH/JSR/BZ/BNZ/JMP branch targets = instruction indices,
+# LI/LC/SI/SC, the ALU, the file ops) is ABI-invariant and passes through.
+# ---------------------------------------------------------------------------
+_SLOT_SCALED_OPS = frozenset({LEA, ENT, ADJ})
+
+
+def retarget_to_neural_abi(instrs: List[Tuple[int, int]]) -> "List":
+    """Convert ``src.compiler`` (op, imm) tuples to neural-ABI :class:`isa.Instr`.
+
+    Divides the frame-relative LEA/ENT/ADJ byte immediates by the 8-byte compiler
+    slot to get the neural SLOT COUNT (the neural VM re-scales by its 4-byte slot).
+
+    The slot-scaled offsets stay SIGNED: a frame local is at a NEGATIVE offset
+    (LEA -8 -> slot -1), and the neural LEA rule reads ``CODE_IMM`` as a signed
+    scalar (``AX = BP + 4*imm``), so a negative slot count is essential — masking
+    it to unsigned 32-bit turns ``LEA -1`` into ``LEA 4294967295`` and computes a
+    garbage address.  IMM/JMP/JSR/BZ/BNZ immediates are non-negative PC targets /
+    value literals and pass through unchanged.  Raises if a slot-scaled immediate
+    is not a multiple of 8 (a half-slot offset the neural ABI cannot express)."""
+    from . import isa
+    out = []
+    for i, (op, imm) in enumerate(instrs):
+        if op in _SLOT_SCALED_OPS:
+            if imm % 8 != 0:
+                raise ValueError(
+                    f"instr {i} {isa.NAMES.get(op, op)} imm={imm} is not a "
+                    "multiple of the 8-byte compiler slot — cannot retarget to "
+                    "the 4-byte-slot neural ABI")
+            out.append(isa.Instr(op, imm // 8))          # keep SIGNED slot count
+        else:
+            out.append(isa.Instr(op, imm & 0xFFFFFFFF))
+    return out
+
+
+def _peek_fmt_ptr_and_args(mem, cur_sp: int, slot: int):
+    """Recover ``(fmt_ptr, args)`` for a compiler-ABI PRTF off the KV store log.
+
+    ``src.compiler`` pushes the fmt ptr FIRST then each vararg left-to-right, and
+    the stack descends, so at PRTF time the stack is (top->down)
+    ``last-arg ... first-arg, fmt_ptr`` — the fmt is the DEEPEST pushed slot and
+    the arg count is unknown up front.  We resolve the depth exactly as
+    :func:`_peek_fmt`/``RefVM._do_printf`` do on the reference VM: for each
+    candidate depth ``d`` (printf here has <=3 args), the value at ``cur_sp +
+    d*slot`` is a would-be fmt ptr; the CONSISTENT depth is the one whose fmt's
+    %-spec count == d.  Then fmt is at ``cur_sp + n_args*slot`` and arg k (call
+    order) at ``cur_sp + (n_args - 1 - k)*slot``."""
+    for d in range(0, 9):
+        cand = mem.load_int(cur_sp + d * slot, 4)
+        fmt = _cstr_from_mem(mem, cand)
+        if fmt and _count_format_args(fmt) == d:
+            n_args = d
+            fmt_ptr = cand
+            break
+    else:
+        # no-arg printf (fmt is the top of stack, spec count 0).
+        n_args = 0
+        fmt_ptr = mem.load_int(cur_sp, 4)
+    args = [mem.load_int(cur_sp + (n_args - 1 - k) * slot, 4)
+            for k in range(n_args)]
+    return fmt_ptr, args
+
+
+def _install_fileop_marshalling():
+    """Context manager that wraps ``nibble_filesys.dispatch_file_op_driver`` so
+    OPEN/READ/CLOS/PRTF marshal their args off the KV store log in the
+    ``src.compiler`` CALLING CONVENTION (all args PSHed left-to-right, then the op,
+    then a trailing ``ADJ argc``).
+
+    This is a CORPUS-HARNESS adapter, NOT a change to the I/O layer.  The base
+    ``nibble_filesys.dispatch_file_op`` uses the hand-assembled ``nibble_runtime``
+    convention (some args in AX / imm, the format popped from the TOP), whereas
+    ``src.compiler`` pushes EVERY arg onto the stack (leftmost deepest) and lets
+    the trailing ADJ reclaim them.  We therefore marshal each op's args off the
+    store log here and drive the SAME ``FileRunner`` + ``ToolCall`` protocol the
+    base path uses (identical stdout channel + READ byte re-entry), returning
+    ``(new_ax, new_sp, byte_stores)`` with SP UNCHANGED (the compiler's ADJ pops
+    the pushed args), byte-for-byte matching the base op's external effect.
+
+    Compiler stack layout at the op (top -> down), slot = 4 bytes:
+      * OPEN(name, flags): flags, name          -> name at cur_sp+slot
+      * READ(fd, buf, n)  : n, buf, fd          -> fd at cur_sp+2*slot
+      * CLOS(fd)          : fd                   -> fd at cur_sp
+      * PRTF(fmt, args...): last-arg..arg1, fmt  -> fmt deepest (see _peek_fmt)
+    """
+    import contextlib
+    from . import isa
+    from . import nibble_filesys as FS
+
+    orig = FS.dispatch_file_op_driver
+
+    def _wrapped(op, ax, imm, cur_sp, store_log, fio, data_seg=None, slot=4):
+        if op not in FS.FILE_OPCODES:
+            return orig(op, ax, imm, cur_sp, store_log, fio,
+                        data_seg=data_seg, slot=slot)
+        mem = FS.StoreLogMem(store_log, data_seg)
+
+        if op == isa.PRTF:
+            fmt_ptr, args = _peek_fmt_ptr_and_args(mem, cur_sp, slot)
+            fmt = _cstr_from_mem(mem, fmt_ptr)
+            strings = {str(a): _cstr_from_mem(mem, a) for a in args}
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.PRTF],
+                               {"fmt": fmt, "fmt_ptr": fmt_ptr, "args": args,
+                                "strings": strings})
+        elif op == isa.OPEN:
+            name_ptr = mem.load_int(cur_sp + 1 * slot, 4)   # under flags
+            path = _cstr_from_mem(mem, name_ptr)
+            flags = mem.load_int(cur_sp, 4)
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.OPEN],
+                               {"path": path, "name_ptr": name_ptr, "flags": flags})
+        elif op == isa.READ:
+            n = mem.load_int(cur_sp, 4)                     # top
+            buf = mem.load_int(cur_sp + 1 * slot, 4)
+            fd = mem.load_int(cur_sp + 2 * slot, 4)
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.READ],
+                               {"fd": fd, "buf": buf, "n": n})
+        else:  # CLOS
+            fd = mem.load_int(cur_sp, 4)
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.CLOS], {"fd": fd})
+
+        fio.calls.append(call)
+        resp = fio.runner.handle(call)          # runner performs the real I/O
+        fio.runner.apply(call, resp, mem)       # logs the call; READ writes -> mem.pending
+        # SP is UNCHANGED: the compiler's trailing ADJ reclaims the pushed args.
+        return resp.result & 0xFFFFFFFF, cur_sp, list(mem.pending)
+
+    @contextlib.contextmanager
+    def _ctx():
+        FS.dispatch_file_op_driver = _wrapped
+        try:
+            yield
+        finally:
+            FS.dispatch_file_op_driver = orig
+    return _ctx()
+
+
+def _cstr_from_mem(mem, addr: int, limit: int = 4096) -> str:
+    """Read a NUL-terminated C string out of a ``StoreLogMem`` view."""
+    out = bytearray()
+    for i in range(limit):
+        b = mem.load_int(addr + i, 1) & 0xFF
+        if b == 0:
+            break
+        out.append(b)
+    return out.decode("latin-1")
+
+
+# The neural VM's LEA is an 8-BIT op: ``AX = (BP + 4*imm) & 0xFF`` (only BP's low
+# byte survives — see ``callconv_dispatch_rules`` in nibble_pure_forward_complete).
+# So FRAME-RELATIVE addressing (locals/params via LEA, which every non-leaf
+# corpus program uses) only round-trips through LI/SI if the whole call stack sits
+# in the LOW-256-BYTE window.  The driver's default ``SP_INIT = 0x10000`` puts the
+# stack at 0xFFFC downward, whose LEA byte-mask (0xFC) mismatches the 0xFFFC store
+# key -> frame desync.  Relocating SP_INIT into the byte window (0xF0) keeps every
+# frame address < 0x100, so the byte-masked LEA equals the full address and the
+# 32-bit memory CAM matches.  Proven 10/10 on the neural-ABI reference at SP=0xF0
+# with byte-masked LEA (vs 4/10 at 0x10000); the heap (0x20000) + data seg
+# (0x10000) are well above the byte window, so they never collide with the stack.
+_LOW_STACK_SP_INIT = 0xF0
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _low_stack_sp(sp_init: int = _LOW_STACK_SP_INIT):
+    """Temporarily relocate the drivers' ``SP_INIT`` into the low-byte window so
+    the neural VM's byte-masked LEA can address frame locals/params.  A
+    harness-level adapter (like :func:`_install_fileop_marshalling`) — patches the
+    imported ``SP_INIT`` name in the cached + complete driver modules, NOT the I/O
+    layer or the model.  The compiler's absolute data/heap addresses (>= 0x10000)
+    are unaffected."""
+    from . import nibble_pure_forward_cached as pfcache
+    from . import nibble_pure_forward_complete as pfc
+    saved = (pfcache.SP_INIT, pfc.SP_INIT)
+    pfcache.SP_INIT = sp_init
+    pfc.SP_INIT = sp_init
+    try:
+        yield
+    finally:
+        pfcache.SP_INIT, pfc.SP_INIT = saved
+
+
+# The streaming build's internal value-liveness pass overlays a built-in probe
+# battery whose longest program is 19 instructions; ``code_size`` MUST cover it
+# (the overlay indexes ``L.CODE_OP[k]`` for every probe instruction), so the
+# minimum build size is 21 even for a tiny corpus program.
+_MIN_LIB_CODE_SIZE = 21
+
+
+def _lib_code_size(n_instrs: int) -> int:
+    return max(n_instrs + 2, _MIN_LIB_CODE_SIZE)
+
+
+# Cross-program shared streaming model (built ONCE, grown monotonically), so the
+# neural corpus run does not rebuild the ~4 GB model per program.  A model built
+# at a LARGER code_size is byte-identical for a shorter program (proven for the
+# lib neural tests), so the shared oversize model serves every entry.
+_LIB_SPARSE = None
+_LIB_L = None
+_LIB_CODE_SIZE = 0
+
+
+def _lib_streaming_model(code_size: int):
+    """Build/grow the shared STREAMING lib model to fit ``code_size`` instrs.
+
+    Peak RSS is ~one streaming block (~4 GB), NOT the ~62 GB dense whole.  Frees
+    the old model before a (rare) grow so peak stays ~one build."""
+    global _LIB_SPARSE, _LIB_L, _LIB_CODE_SIZE
+    if _LIB_SPARSE is None or code_size > _LIB_CODE_SIZE:
+        from .lib_neural import build_lib_model_streaming
+        _LIB_SPARSE = _LIB_L = None              # free the old model first
+        import gc
+        gc.collect()
+        _LIB_SPARSE, _LIB_L, _ = build_lib_model_streaming(
+            code_size=code_size, recurrent_divmod=True, addr32=True)
+        _LIB_CODE_SIZE = code_size
+    return _LIB_SPARSE, _LIB_L
+
+
+def run_model(entry: CorpusEntry, max_steps: int = 4000,
+              evict: bool = True, prune_interval: int = 60,
+              shared: bool = True) -> str:
+    """Run the entry's bytecode THROUGH THE TRANSFORMER (``model.forward``).
+
+    Compiles the entry, RETARGETS it to the neural ABI
+    (:func:`retarget_to_neural_abi`), builds the memory-safe STREAMING lib model
+    (``lib_neural.build_lib_model_streaming``, ~4 GB peak, KV-cache eviction ON),
+    and drives every VM step as one ``model.forward`` via the KV-cached driver
+    (``run_pure_forward_cached``) at ``mask=0xFFFFFFFF`` (word-width memory, the
+    library's heap needs 32-bit addresses).  The call stack is relocated into the
+    low-byte window (:func:`_low_stack_sp`) so the neural VM's 8-bit LEA can
+    address frame locals/params.  OPEN/READ/CLOS/PRTF cross the tool boundary via
+    the run's ``fio`` (the same ``FileRunner`` the chk1 tool-IO + malloc tests
+    use); their args are marshalled off the KV store log in the compiler calling
+    convention by a corpus-harness adapter (:func:`_install_fileop_marshalling`).
+
+    Returns the stdout the model produced (the ``FileRunner``'s formatted PRTF
+    bytes) — the SAME byte-exact assertion as :func:`run_reference`.  Raises
+    :class:`ModelEnginePending` if the lib/model build is not in this checkout.
+
+    ``shared`` reuses one grown model across programs (fast, memory-flat);
+    ``shared=False`` builds a fresh per-program model (isolation).
+    """
+    if not lib_integrated():
+        raise ModelEnginePending(
+            "neural engine PENDING: c4_min.nibble_runtime + "
+            "c4_min.lib_neural.build_lib_model_streaming not in this checkout")
+    from . import nibble_filesys as FS
+    from .nibble_pure_forward_cached import run_pure_forward_cached
+
+    raw_instrs, data = compile_entry(entry)
+    instrs = retarget_to_neural_abi(raw_instrs)
+    code_size = _lib_code_size(len(instrs))
+
+    if shared:
+        sparse, L = _lib_streaming_model(code_size)
+    else:
+        from .lib_neural import build_lib_model_streaming
+        sparse, L, _ = build_lib_model_streaming(
+            code_size=code_size, recurrent_divmod=True, addr32=True)
+
+    fio = FS.FileOpState(runner=FS.FileRunner(
+        fs=FS.StubFilesystem(dict(entry.files)),
+        stdin=FS.InputKVStream(entry.stdin)))
+    try:
+        with _low_stack_sp(), _install_fileop_marshalling():
+            run_pure_forward_cached(
+                sparse, L, instrs, max_steps=max_steps, mask=0xFFFFFFFF,
+                fio=fio, data_seg=_bytes_to_seg(data),
+                evict=evict, prune_interval=prune_interval)
+    finally:
+        if not shared:
+            del sparse, L
+        import gc
+        gc.collect()
+    return bytes(fio.runner.stdout).decode("latin-1")
+
+
+def run_engine(entry: CorpusEntry, engine: str = "reference", **kw) -> str:
+    if engine == "reference":
+        return run_reference(entry, **kw)
+    if engine == "model":
+        return run_model(entry, **kw)
+    raise ValueError(f"unknown engine {engine!r} (want reference|model)")
+
+
+# ===========================================================================
+# GOLDEN generation + storage (real gcc, byte-exact oracle).
+# ===========================================================================
+_GCC_HEADERS = (
+    "#include <stdlib.h>\n#include <string.h>\n#include <stdio.h>\n"
+    "#include <fcntl.h>\n#include <unistd.h>\n"
+)
+
+
+def gcc_available() -> bool:
+    from shutil import which
+    return which("gcc") is not None
+
+
+def gen_golden(entry: CorpusEntry, tmpdir: Optional[str] = None) -> bytes:
+    """Compile the entry's .c with real gcc (stdlib headers prepended so libc
+    resolves malloc/printf) and return its stdout bytes.  Files the program opens
+    are materialised in the run cwd so gcc's ``open``/``read`` see the same bytes
+    the c4 stub filesystem seeds.
+    """
+    import tempfile
+    src = (LIBPROG_DIR / entry.source).read_text()
+    with tempfile.TemporaryDirectory(dir=tmpdir) as d:
+        cfile = Path(d) / "prog.c"
+        cfile.write_text(_GCC_HEADERS + src)
+        binf = Path(d) / "prog"
+        # -static avoids the -lgcc_s link issue in this sandbox.
+        cp = subprocess.run(
+            ["gcc", "-w", "-static", "-o", str(binf), str(cfile)],
+            capture_output=True)
+        if cp.returncode != 0:
+            raise RuntimeError(f"gcc failed for {entry.name}:\n{cp.stderr.decode()}")
+        # materialise the program's input files in the run cwd.
+        for fname, data in entry.files.items():
+            (Path(d) / fname).write_bytes(data)
+        rp = subprocess.run([str(binf)], capture_output=True,
+                            input=entry.stdin, cwd=d)
+        return rp.stdout
+
+
+def regenerate_goldens(tmpdir: Optional[str] = None) -> Dict[str, bytes]:
+    """Rebuild every golden from gcc and write ``libprog/GOLDENS.txt`` (one
+    ``name=<hex>`` line per program).  Returns {name: golden_bytes}."""
+    if not gcc_available():
+        raise RuntimeError("gcc not available — cannot regenerate goldens")
+    goldens: Dict[str, bytes] = {}
+    for e in CORPUS:
+        goldens[e.name] = gen_golden(e, tmpdir=tmpdir)
+    lines = [f"{name}={g.hex()}" for name, g in goldens.items()]
+    GOLDENS_PATH.write_text("\n".join(lines) + "\n")
+    return goldens
+
+
+def load_goldens() -> Dict[str, bytes]:
+    """Read the frozen goldens from ``libprog/GOLDENS.txt`` -> {name: bytes}."""
+    if not GOLDENS_PATH.exists():
+        return {}
+    out: Dict[str, bytes] = {}
+    for line in GOLDENS_PATH.read_text().splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        name, hexv = line.split("=", 1)
+        out[name] = bytes.fromhex(hexv)
+    return out
+
+
+def golden_for(entry: CorpusEntry) -> bytes:
+    """The byte-exact golden for ``entry``: prefer the frozen file, else gcc."""
+    frozen = load_goldens()
+    if entry.name in frozen:
+        return frozen[entry.name]
+    return gen_golden(entry)
+
+
+# ===========================================================================
+# CLI: regenerate goldens / run the corpus on an engine, print a PASS/FAIL table.
+# ===========================================================================
+def _run_table(engine: str) -> int:
+    goldens = load_goldens()
+    n_pass = n_fail = n_pending = 0
+    print(f"{'PROGRAM':<20} {'LIB FUNCS':<34} {'ENGINE':<10} RESULT")
+    print("-" * 90)
+    for e in CORPUS:
+        libs = ",".join(e.lib_funcs)
+        want = goldens.get(e.name)
+        if want is None:
+            try:
+                want = gen_golden(e)
+            except Exception as exc:  # noqa: BLE001
+                print(f"{e.name:<20} {libs:<34} {engine:<10} NO-GOLDEN ({exc})")
+                n_fail += 1
+                continue
+        try:
+            got = run_engine(e, engine=engine).encode("latin-1")
+        except ModelEnginePending as exc:
+            print(f"{e.name:<20} {libs:<34} {engine:<10} PENDING (#646)")
+            n_pending += 1
+            continue
+        except Exception as exc:  # noqa: BLE001
+            print(f"{e.name:<20} {libs:<34} {engine:<10} ERROR: {exc!r}")
+            n_fail += 1
+            continue
+        if got == want:
+            print(f"{e.name:<20} {libs:<34} {engine:<10} PASS  {want!r}")
+            n_pass += 1
+        else:
+            print(f"{e.name:<20} {libs:<34} {engine:<10} FAIL")
+            print(f"    want={want!r}")
+            print(f"    got ={got!r}")
+            n_fail += 1
+    print("-" * 90)
+    print(f"{n_pass} pass / {n_fail} fail / {n_pending} pending  "
+          f"({len(CORPUS)} programs, engine={engine})")
+    return 1 if n_fail else 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="C4 lib-program corpus harness")
+    ap.add_argument("--engine", choices=["reference", "model"], default="reference",
+                    help="run bytecode on the reference VM (now) or the neural "
+                         "model (PENDING on #646)")
+    ap.add_argument("--regen-goldens", action="store_true",
+                    help="rebuild libprog/GOLDENS.txt from gcc")
+    args = ap.parse_args(argv)
+    os.environ.setdefault("OMP_NUM_THREADS", "4")
+    if args.regen_goldens:
+        g = regenerate_goldens()
+        print(f"wrote {len(g)} goldens -> {GOLDENS_PATH}")
+        for name, gv in g.items():
+            print(f"  {name:<20} {gv!r}")
+        return 0
+    return _run_table(args.engine)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -525,6 +525,75 @@ def compile_ax_nib_split(L, dim: int) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
+    """LEA-ONLY, residue-immune frame-address nibbles.
+
+    ``compile_ax_nib_split`` derives AXB_LO/AXB_HI from the SCALAR ``AX_VAL``.  On a
+    LEA the frame byte is ``(BP_LOW + 4*imm) mod 256``.  Two independent large-value
+    fp residues corrupt the naive path and surface only when the frame byte is
+    16-aligned (low nibble 0), so a malloc'd pointer stored to such a frame local is
+    read back from the wrong cell and lost (#648):
+
+      (a) the dispatch SET ``AX_VAL += BP_LOW + 4*imm - AX_VAL_old`` is scaled by the
+          opcode gate ``k``; when the prior AX held a heap pointer (~131072) any
+          ``(1-k)`` leaves a residue ``(1-k)*AX_VAL_old`` > 0.5; and
+      (b) the fetched ``IMM`` scalar itself leaks a fraction of a NEARBY large literal
+          (e.g. ``IMM 0x20000``) through the imperfect PC one-hot, so ``IMM`` for a
+          ``LEA -1`` reads e.g. ``-1.026`` not ``-1``.
+
+    Fix: recompute the LEA byte here from ``q = BP_LOW + 4*imm`` with a
+    ROUND-TO-NEAREST integer decode -- cell ``a`` fires iff ``q in [a-0.5, a+0.5)``,
+    built from CLAMPED steps at the half-integer edges (each a
+    ``relu(RELU_S*(q-e)) - relu(RELU_S*(q-e)-1)`` saturating to a clean 0/1 since q is
+    never within ``1/RELU_S`` of a half-integer edge) -- which absorbs BOTH the ~0.1
+    IMM residue and any AXB slop, snapping ``q`` to the exact frame integer before
+    taking its low/high nibbles (mod 256).  OVERWRITES AXB_LO/AXB_HI, gated on
+    OP_IS[LEA] (0 on every non-LEA op -> byte-identical).  Runs AFTER ``ax-nib-split``
+    and BEFORE ``ax-byte-nib``.  ``4*imm`` handles a negative slot count exactly
+    (linear gate read)."""
+    g = L.OP_IS + isa.LEA
+    axb_lo, axb_hi = L.AXB_LO, L.AXB_HI
+    q_lo, q_hi = -256, 512
+    # One CLAMPED step per half-integer edge e = a-0.5: s_e(q) = clamp(RELU_S*(q-e),0,1)
+    # = relu(RELU_S*(q-e)) - relu(RELU_S*(q-e)-1).  q is ~integer (|residue| < 0.1) and
+    # edges are half-integers, so q-e is always >= ~0.4 in magnitude -> the clamp is an
+    # exact 0/1 nearest-integer step.  Cell a = s_{a-0.5} - s_{a+0.5}.
+    edges = [a - 0.5 for a in range(q_lo, q_hi + 1)]
+    eu = {e: k for k, e in enumerate(edges)}
+    n_edge = len(edges)
+    spec = _empty_spec(dim, 2 * n_edge + 2)
+    u = 0
+    step0 = u
+    for e in edges:                       # two relu units -> one clamped step per edge
+        for j in range(2):
+            spec["W_up"][u, L.BP_LOW] = RELU_S
+            spec["W_up"][u, L.IMM] = 4.0 * RELU_S
+            spec["b_up"][u] = -RELU_S * e - (0.0 if j == 0 else 1.0)
+            spec["W_gate"][u, g] = 1.0    # gate on OP_IS[LEA] (0/1) so the step is
+            u += 1                        # zero on non-LEA steps
+    def step_units(e):                    # (idx_of_+relu, idx_of_-relu) for edge e
+        base = step0 + 2 * eu[e]
+        return base, base + 1
+    for lane in (axb_lo, axb_hi):         # SET: clear AXB (gated on LEA) before re-add
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, lane] = 1.0
+        spec["W_down"][lane, u] += -1.0 / SILU_HALF; u += 1
+    for a in range(q_lo, q_hi):           # cell a = step(a-0.5) - step(a+0.5)
+        byte = a & 0xFF
+        lo, hi = byte & 0xF, (byte >> 4) & 0xF
+        p_lo, m_lo = step_units(a - 0.5)  # +step at lower edge
+        p_hi, m_hi = step_units(a + 0.5)  # -step at upper edge
+        # step(q>=e) = silu(RELU_S*(q-e)) - silu(RELU_S*(q-e)-1) saturates to UNIT
+        # height, so route with coefficient ``val`` directly (no /RELU_S).
+        for lane, val in ((axb_lo, lo), (axb_hi, hi)):
+            if val:
+                spec["W_down"][lane, p_lo] += val
+                spec["W_down"][lane, m_lo] += -val
+                spec["W_down"][lane, p_hi] += -val
+                spec["W_down"][lane, m_hi] += val
+    return spec
+
+
 def compile_ax_byte_to_nibbles(L, dim: int, ops) -> Dict[str, torch.Tensor]:
     """When any op in ``ops`` (byte-producing: IMM/LEA/CMP/bitwise/LI) is active,
     SET AX nibble 0 = AXB_LO, nibble 1 = AXB_HI (computed by ``compile_ax_nib_split``
@@ -742,6 +811,10 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("branch-delta", compile_branch_delta(L, dim)),
         ("fold-lea", _fold_ax_gated(L, dim, [isa.LEA])),  # LEA masks &0xFF; ALU 32-bit
         ("ax-nib-split", compile_ax_nib_split(L, dim)),   # AX_VAL byte -> AXB_LO/HI
+        # LEA frame address is residue-immune: recompute AXB_LO/HI from BP_LOW+4*imm
+        # directly (small integer), so a large prior AX (heap ptr) cannot round the
+        # frame byte to the wrong 16-aligned cell (#648).  LEA-gated; else no-op.
+        ("lea-addr-nib", compile_lea_addr_nib(L, dim)),
         ("ax-byte-nib", compile_ax_byte_to_nibbles(L, dim, byte_ax_ops)),
         # FULL 32-bit IMM: overwrite ALL 8 AX nibbles with the fetched immediate
         # nibbles (the byte-nib block above only set nibbles 0,1) so literals > 255
