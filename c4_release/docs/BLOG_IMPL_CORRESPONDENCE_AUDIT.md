@@ -340,3 +340,32 @@ position-signature attention that the blog spends ~40 lines describing is not th
 "basic IO possible with a 100% native version of the transformer" (§695) is an
 **overclaim** for the position-addressed input path — it works, but through a Python
 runner, not the described neural position signatures.
+
+## §KV Cache Pruning (800-816) — confirms REV #22 by reading `nibble_kv_prune.py`
+
+| Blog claim | Class | Evidence |
+|-----------|-------|----------|
+| ">99.999% pruning" | ⚠ extrapolation | REV #22: measured max 98.744%; 99.999% is a steps→∞ ratio, not measured |
+| "cache at 1-10K tokens", "hundreds of millions of tokens" | ⚠ | measured ceiling ~4.9K tokens; 10⁸ is plausible-but-unmeasured |
+| "grows logarithmically" | ⚠ **wrong** | actually FLAT (small-heap) or O(live-heap) UNBOUNDED (memory-heavy); no program is logarithmic |
+| single "cosine > 0.99 for memory AND registers" | ⚠ **wrong→fixed in code** | `nibble_kv_prune.py:237-264` SPLITS it: registers = cosine dup-merge (`dup_metric="cosine"`); memory (`content_addressed`) = exact relative-L2 (:241-256). Cosine would wrongly merge distinct stores (shared ADDR_BIN common-mode ⇒ raw cosine 0.999). Exactly REV #22. |
+| latest-write-wins register eviction | ✅ | mechanism 1 (:235-264) |
+| same-address supersession + ZFOD/free zero-overwrite eviction | ✅ | zero-value branch (:310-311); free = value→0 |
+| memory eviction is UNBOUNDED heap-mirroring (REV #3) | ✅ | content_addressed recency-horizon is a NO-OP (:312-324): "tracks the UNBOUNDED live heap ... NO fixed recency/size cap"; a live store evicted only by supersede or free |
+
+**⚠ NEW nuance — the module's OWN docstring header still repeats the wrong claims.** The
+implementation (lines 235+) correctly splits cosine/exact and makes memory unbounded, but
+`nibble_kv_prune.py:1-15` still says "keeps the cache **bounded (logarithmic)**" and
+"**cos-sim > 0.99 + ALiBi**" for registers-and-memory unified — the same errors REV #22
+corrects. So the code is right but its top-of-file doc lags the fix (a self-inconsistency
+worth cleaning). Correctness (byte-exact decode under eviction) is asserted by
+`test_kv_cache_equivalence.py` / `test_kv_free_driven.py` (present on branch).
+
+## §Sparse Tensors (817-819) + §Exiting (794-796)
+
+| Claim | Class | Evidence |
+|-------|-------|----------|
+| network >99% sparse, sparse-tensor (COO) storage | ✅ | measured 99.99% (above); `export_onnx.py:20` sparse_initializer; `onnx_to_c4bin.py:127` COO |
+| sparse makes ONNX significantly smaller | ✅ | export_onnx:265 "shrinks because 99% of entries are zeros" |
+| HALT/EXIT triggers EOS-token generation | ✅ | `isa.HALT=38`; vocab `HALT=262` "ends generation (§Exiting)"; complete forward emits HALT |
+| special halt token distinct from EOS in message mode | ✅ | vocab HALT=262 separate from message-end; matches §796 |
