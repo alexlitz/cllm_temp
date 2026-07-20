@@ -175,10 +175,53 @@ def pathway_bundle(code_size: int = 32, min_free_gb: float = 70.0):
     return ok
 
 
+# ---------------------------------------------------------------------------
+# ONNX pathway.
+#
+# The GENUINE unified-full-op ONNX export traces the DENSE compact model
+# (``export_onnx_compact.build_compact`` -> ``build_compact_pure_forward_model``,
+# ~48.6 GB RSS measured) — there is NO lean/op-subset export variant since the
+# unification.  So the full-op ONNX + onnxruntime byte-exact corpus battery is
+# MEMORY-GATED (run ``python -m c4_min.run_onnx_corpus --battery`` on a host with
+# a stable >60 GB free window).
+#
+# What IS memory-safe here: the ONNX EXPORT PIPELINE + VANILLA-graph property +
+# byte-exact decode on a real baked C4 model — proven via ``export_onnx.main``
+# (the foundation step model, ~0.5 MB).  It exercises the exact same
+# torch.onnx.export -> op_inventory/assert_vanilla -> sparse-initializer ->
+# onnxruntime byte-exact machinery the full-op path uses, just on a small model.
+# ---------------------------------------------------------------------------
+def pathway_onnx(min_free_gb: float = 70.0):
+    """Returns True (foundation ONNX vanilla+byte-exact) and separately reports
+    whether the FULL-op unified export is runnable now or deferred."""
+    from c4_min import export_onnx as EO
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = EO.main(out_dir="/tmp/c4_onnx_foundation")
+    ok = (rc == 0)
+    # pull the vanilla + byte-exact verdicts out of the report
+    txt = buf.getvalue()
+    vanilla = "VANILLA: YES" in txt
+    byte_exact = "byte_exact_decode(dense+sparse)=True" in txt
+    print("  [onnx:foundation-model] vanilla(no Loop/Scan/If)=%s byte-exact-decode=%s "
+          "OVERALL=%s" % (vanilla, byte_exact, "PASS" if ok else "FAIL"))
+    free = _free_gb()
+    if free < min_free_gb:
+        print("  [onnx:full-unified-VM] DEFERRED: free=%.1fGB < %.0fGB gate — dense "
+              "compact export is ~48.6GB RSS (no lean op-subset variant). Run "
+              "`python -m c4_min.run_onnx_corpus --battery` on a stable >60GB host."
+              % (free, min_free_gb))
+    else:
+        print("  [onnx:full-unified-VM] free=%.1fGB OK — run "
+              "`python -m c4_min.run_onnx_corpus --battery --code-size 48`" % free)
+    return ok and vanilla and byte_exact
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--only", type=str, default="cli",
-                    help="comma list of pathways: cli,quine,bundle,corpus")
+                    help="comma list of pathways: cli,quine,onnx,bundle")
     ap.add_argument("--code-size", type=int, default=32)
     args = ap.parse_args(argv)
 
@@ -202,6 +245,10 @@ def main(argv=None) -> int:
     if "quine" in want:
         results["quine"] = pathway_quine(code_size=max(64, args.code_size))
         gc.collect()
+
+    # ONNX: foundation-model export is memory-safe; full-op export is gated.
+    if "onnx" in want:
+        results["onnx"] = pathway_onnx()
 
     # Bundle needs the DENSE reconstruct (memory-gated).
     if "bundle" in want:
