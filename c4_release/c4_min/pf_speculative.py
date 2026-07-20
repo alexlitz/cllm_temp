@@ -166,6 +166,8 @@ class PFDraft:
     halted: bool                               # did the program HALT (vs run off cap)
     final_ax_masked: int                       # AX & mask at the last emitted step
     win_starts: List[int]                      # absolute pos of each step's query row
+    out: List[int] = None                      # PRTF visible-output bytes (AX&0xFF)
+    prtf_steps: List[int] = None               # step indices that emitted a PRTF byte
 
 
 # The immediate is baked as IMM_NIBS little-endian nibbles (a STATIC re-encoding of
@@ -209,6 +211,8 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     frames: List[Dict[str, int]] = []
     store_log: Dict[int, Tuple[int, int]] = {}
     win_starts: List[int] = []
+    out: List[int] = []                         # PRTF visible-output bytes
+    prtf_steps: List[int] = []                  # step indices emitting a PRTF byte
     stk = 0                                     # STACK0 mirror (MEM_VAL of a frame)
     stream_len = len(tokens)                    # == 31 (BOS + init frame)
     frame_idx = 0                               # init frame is frame 0
@@ -288,6 +292,15 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             sp += 4 * imm
         elif op == isa.LEV:
             sp = bp; bp = mem.get(sp, 0); pc = mem.get(sp + 4, 0); sp += 8
+        elif op == isa.PRTF:
+            # I/O op (printf("%c", AX)): PC += 1 only, registers UNCHANGED — the
+            # driver decodes this step's AX from the SAME KV-cached model row and
+            # appends AX&0xFF as the visible output byte.  So the drafted frame is a
+            # normal register frame (AX unchanged) and the byte is verified for free:
+            # verify_blocks confirms the model's decoded AX == this frame's AX at the
+            # PRTF query row, and out.append(AX&0xFF) is that verified byte.
+            out.append(ax & 0xFF)
+            prtf_steps.append(len(frames))       # this step's index (frame position)
         elif op == isa.NOP:
             pass
         elif op == isa.HALT:
@@ -347,7 +360,8 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     final_ax = frames[-1]["ax"] if frames else 0
     return PFDraft(tokens=tokens, frames=frames, store_log=store_log,
                    step_count=len(frames), halted=halted,
-                   final_ax_masked=final_ax, win_starts=win_starts)
+                   final_ax_masked=final_ax, win_starts=win_starts,
+                   out=out, prtf_steps=prtf_steps)
 
 
 # ===========================================================================
