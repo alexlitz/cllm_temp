@@ -37,6 +37,9 @@ findings (beyond the already-logged revisions in `BLOG_SPEC_REVISIONS.md`) are t
    `PUTCHAR` opcode constant anywhere in `c4_min/`. All character I/O is funnelled
    through **PRTF (33)** + the think-tag / tool-call message protocol. So the blog's
    "I/O category, 2 ops, 440 weights" row and the 64/65 table rows are **stale**.
+   *Structural confirmation:* `isa.py:14` sets `NUM_OPS = 40`, so the opcode one-hot
+   routing band only spans values 0-39 — opcodes 64/65 are structurally out-of-band and
+   cannot be dispatched even in principle (grep for a 64/65 neural handler = empty).
 
 2. **⚠ NEW — MALC (34) / FREE (35) / MSET (36) / MCMP (37) are NOT neural opcodes in
    c4_min.** The blog table lists them as opcodes 34-37 with L/W budgets
