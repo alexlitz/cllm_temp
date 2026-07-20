@@ -393,3 +393,56 @@ model-runs-C / handoff / compiler / universal recurrent paths carry the non-vani
 `torch.round` (finding #8). Speculation and self-hosting are present but their headline
 performance numbers (89.4× forward reduction; full self-hosting execution) are documented
 in the status doc, not independently re-measured in this CPU-only audit.
+
+## §Registers / §Tokenization / §RoPE Binary Distance / two-models nuance
+
+| Claim | Class | Evidence |
+|-------|-------|----------|
+| Registers PC/AX/SP/BP 32-bit; SP=BP init 0x10000 (or 0x8000) | ✅ / 🟡 | `nibble_pure_forward.py:746 SP_INIT=0x10000` (matches blog default) BUT corpus runners override to **0xFC** (`run_corpus_resumable.py:74`, REV #7 small addressable stack). So the blog's 0x10000 is the *module default*, not the *corpus config*. |
+| Immediate = 32-bit operand read from code at PC | ✅ | `isa.assemble` keeps imm at 32-bit width (isa.py:60-69) |
+| Nibbles: 32-bit value = 16×4-bit nibbles, little-endian | ✅ | `blogspec_vocab.nibbles_of_value`, `nibble_cmp` NIB_PER_REG=16 |
+| Registers written every step → 30 tokens/step | ✅ | `blogspec_vocab.FRAME_LEN=30`; matches §444-459 exactly |
+| Many passes just output registers (no real compute) | ✅ | true — the 30-token frame is mostly bookkeeping (REV #16) |
+| RoPE binary distance `theta_k=2^k`, `alpha=sqrt(2·SCALE/d)`, aligned score≈SCALE | ✅ | `nibble_rope.py:14-94` — `binary_thetas` = `[2^k]`, `enc_k(p)=alpha·cos(2^k·p)` — matches §743-746 char-for-char |
+| **"pure transformer, no exotic architecture"** (§3 intro) | ✅ (headline) / 🟡 (nuance) | headline nibble VM is clean vanilla; the Qwen slice is a genuine `Qwen2Model.forward` (`qwen_full_vm.py`) but 8-bit-only (pruned MUL/DIV/MOD lookup table, `& 0xFF`, 8-bit addresses). So "the VM as a genuine Qwen2" holds only for the 8-bit slice; the fp32-exact 32-bit ALU runs on the softmax1+ALiBi headline model. |
+| headline "1096/1096" | 🟡 documented | measured 1085/1096 (`934ea608`), +11 deep-recursion fix live (EFF=500000); the full re-sweep with the fix is a documented GPU follow-up (status:56-73), not re-run here |
+
+**⚠ two-models nuance (REV #11 territory).** The blog reads as ONE transformer. In fact
+there are two: (a) the **headline nibble VM** (softmax1 + ALiBi, fp32-exact 32-bit ALU,
+the 1096 corpus) and (b) the **Qwen 8-bit slice** (RoPE + RMSNorm + GQA, genuine
+`Qwen2Model.forward`, 8-bit only, 58/58 sample). The blog's "you could look at the ONNX
+and say yup that is a standard transformer" is best evidenced by (b); the full-width math
+lives in (a). Both are vanilla, but the "embed the VM into a real Qwen2" claim is the
+8-bit slice, not the full 32-bit VM.
+
+---
+
+## Honest verdict
+
+The c4_min implementation is a **strong, largely faithful** realization of the blog's
+core: the vanilla transformer (softmax1 + ALiBi/RoPE + SwiGLU-MoE, no exotic ops), the
+softmax1-KV binary-address memory with ALiBi recency and ZFOD/free, the 30-token register
+frame, the argmax re-quantization, and the ALU math gadgets (zero-detector, 6-weight
+add/sub/mul, schoolbook mul, base-16 long division, per-nibble bitwise) are all present
+and, where I ran them (foundation 10/10, bake 12/12, quine 6/7), byte-exact — the memory
+subsystem and comparison/arithmetic constructions are near-verbatim transcriptions of the
+spec's math. Every capstone (baking, model-runs-C, speculation, self-hosting, quine,
+bundling) is present on the unified branch. **Where the blog and code DIVERGE, it is
+almost always the blog overclaiming a clean/uniform story the code refines:** the opcode
+table lists ops that were removed (GETCHAR/PUTCHAR), are compiled-to-bytecode not opcodes
+(malloc-family 34-37), or are absent (BLT/BGE/POP 40-42); the weight numbers (5,487 /
+96.4%) describe an idealized 45-op model, not the measured nibble VM (99.99% sparse,
+~86K-1M nonzeros); the "no torch.round on the exec path" holds only for the 3 headline
+paths and not the 4 baked/universal/handoff/compiler capstone loops; the elaborate native
+position-signature I/O (§702-739) is a Python buffer, not neural heads; the MAGIC-floor
+and efficient-exp/log-sink-division gadgets are described but unbuilt; and the KV-pruning
+"99.999% / logarithmic / cosine-for-both" claims are corrected in the code (and
+`BLOG_SPEC_REVISIONS.md`) but the pruning module's own header still repeats the old wrong
+text. The `BLOG_SPEC_REVISIONS.md` log already catches most of these directionally
+(#3/#4/#9/#11/#17/#18/#21/#22); this audit adds concrete file:line evidence and surfaces
+NEW ones the log missed — the removed GETCHAR/PUTCHAR, the malloc-family/BLT/BGE not being
+opcodes, the four `torch.round` capstone paths, the native-IO-is-a-Python-buffer, the
+described-only MAGIC-floor/efficient-exp, and the measured 99.99%-sparse / 105 GB
+dense-build hazard. **Net:** the implementation is more honest than the blog; the blog
+should be trimmed of the removed/idealized/described-only items so a reader isn't told the
+model does things it doesn't (or does them differently than described).
