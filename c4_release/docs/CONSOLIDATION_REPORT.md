@@ -43,3 +43,34 @@ streaming build is byte-identical (L∞=0, `dense_kernel`) and stays under 20 GB
   consolidation brief as an additive coexisting block — NOT a byte-identity-neutral
   change. Functional non-regression is confirmed by the final test suite.
 - New expected baseline from here: `f61decf217c718ba`.
+
+### 2. `c4min-crossop-dedup` (#629) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean, no conflicts. Adds `crossop_analyze.py`, `crossop_dedup.py`,
+  `measure_crossop_dedup.py`, `test_crossop_dedup.py` — read-only analysis tools +
+  a test. No weight-build file touched.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction — pure tool/test
+  additions, none in the weight-build import graph.
+
+### 3. `vanilla-exec-round-removal` (#657) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean, no conflicts.
+- Change: swaps the runtime `_requantize` (`nibble_bake`/`nibble_compiler`/
+  `nibble_handoff`/`universal`) from `torch.round` to a new additive
+  `compiler.vanilla_requantize` (`argmax_v (2vx − v²)` LM-head snap, argmax==round
+  on the exact-integer VM state, residue-immune, no `torch.round`). This is the
+  EXECUTION/decode path, NOT the weight build.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) — verified none of the four changed
+  runtime modules are in the weight-build import graph (`build_compact_sparse_streaming`
+  → `nibble_pure_forward_complete` does not import them); `compiler.py` change is a
+  pure function addition. This is the "#657 argmax==round" known-neutral case.
+
+### 4. `fix-dense-build-memory-hazard` (#656) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean; git auto-merged `test_exec_path_vanilla.py` (disjoint regions vs #657).
+- Change: adds `conftest.py` (autouse RSS watchdog, machine-safety hard-abort at
+  60 GB, 120 GB dense opt-in) + `_build_guard.py` (per-build 20 GB assertion) +
+  memory-safe guards in `bundle_small.py`/`chat_eliza.py`/`_probe_chat_io.py`/
+  `_top1_measure.py` + test routings to the streaming build. No weight-build code.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`). The conftest guard now protects all
+  subsequent builds (landed early per brief).
