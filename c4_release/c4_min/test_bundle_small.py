@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from c4_min.bundle_small import (  # noqa: E402
     assemble_bundle, prepare_bundle, run_bundle, read_header, _section,
     _build_model, _serialize_weights, _deserialize_weights,
-    _compile_source_to_bytecode, MAGIC,
+    _compile_source_to_bytecode, _phys_blocks, _sw_to_dense, MAGIC,
 )
 
 CC = shutil.which("gcc") or shutil.which("cc")
@@ -52,13 +52,37 @@ def test_c4c_bundler_exists_and_gcc_syntax():
     assert r.returncode == 0, r.stderr
 
 
+def _snapshot(model):
+    """Every model weight as a dense tensor keyed by name (streaming-sparse form).
+
+    The bundle's model is the memory-safe streaming-sparse ``SparseTransformer``,
+    whose per-block Q/K/V/O + W_up/W_gate/W_down are ``SparseWeight`` objects (no
+    ``state_dict``); ``_sw_to_dense`` densifies each so the round-trip can be
+    checked bit-for-bit over the DISTINCT physical blocks.
+    """
+    snap = {"embed": model.embed.detach().clone(),
+            "lm_head": model.lm_head.detach().clone(),
+            "lm_bias": model.lm_bias.detach().clone()}
+    for bi, blk in enumerate(_phys_blocks(model)):
+        a, f = blk.attn, blk.ffn
+        for nm, sw in [("Wq", a.W_q), ("Wk", a.W_k), ("Wv", a.W_v), ("Wo", a.W_o),
+                       ("Wup", f.W_up), ("Wgate", f.W_gate), ("Wdown", f.W_down)]:
+            snap[f"b{bi}.{nm}"] = _sw_to_dense(sw).clone()
+        snap[f"b{bi}.slopes"] = a.alibi_slopes.detach().clone()
+        snap[f"b{bi}.b_up"] = f.b_up.detach().clone()
+        snap[f"b{bi}.b_gate"] = f.b_gate.detach().clone()
+        snap[f"b{bi}.b_down"] = f.b_down.detach().clone()
+    return snap
+
+
 def test_weights_coo_roundtrip_byte_identical(model_L):
-    """serialize -> deserialize reconstructs every tensor bit-for-bit."""
+    """serialize -> deserialize reconstructs every weight bit-for-bit (L-inf=0)."""
     model, L = model_L
     blob, stats = _serialize_weights(model, L)
+    sd1 = _snapshot(model)
     model2, L2 = _build_model(_CFG)
     _deserialize_weights(blob, model2, L2)
-    sd1, sd2 = model.state_dict(), model2.state_dict()
+    sd2 = _snapshot(model2)
     assert set(sd1) == set(sd2)
     for k in sd1:
         assert torch.equal(sd1[k], sd2[k]), f"tensor {k} differs after round-trip"
@@ -86,7 +110,7 @@ def test_assemble_container_framing(tmp_path, model_L):
     assert b_off == w_off + w_len
     assert b_off + b_len == len(data)
     # bytecode section decodes to the same instruction count the compiler emits.
-    code = _compile_source_to_bytecode(_SRC)
+    code, _data_seg = _compile_source_to_bytecode(_SRC)
     bc = _section(data, hdr, "bytecode")
     (n,) = struct.unpack_from("<I", bc, 0)
     assert n == len(code)
@@ -120,10 +144,29 @@ def test_c4c_bundler_produces_byte_identical_bundle(tmp_path, model_L):
 
 @pytest.mark.slow
 def test_bundle_runs_end_to_end(tmp_path, model_L):
-    """Assemble + run through the bundled model; decoded result matches."""
+    """Assemble + run an ARITH bundle through the bundled model; result matches."""
     model, L = model_L
     out = str(tmp_path / "add.c4bundle")
     assemble_bundle(_SRC, out, expected=1200, reuse_model=(model, L), **_CFG)
     res = run_bundle(out, verbose=False)
     assert res["status"] == "PASS", res
     assert res["got"] == 1200
+
+
+@pytest.mark.slow
+def test_bundle_printf_runs_end_to_end_byte_exact(tmp_path):
+    """Assemble + run a PRINTF bundle; stdout is captured byte-exact.
+
+    Exercises the I/O path: the data segment (the ``"hi\\n"`` literal) rides in
+    the header, ``run_bundle`` wires an fio sink at ``mask=0xFF``, and the
+    verdict is byte-exact stdout, not the register value.
+    """
+    src = 'int main(){ printf("hi\\n"); return 0; }'
+    out = str(tmp_path / "printf.c4bundle")
+    # printf needs the low-256 pointer window -> code_size 64 (its own build).
+    info = assemble_bundle(src, out, expected_stdout=b"hi\n",
+                           description="printf", code_size=64, step_cap=400)
+    assert info["config"]["code_size"] == 64
+    res = run_bundle(out, verbose=False)
+    assert res["status"] == "PASS", res
+    assert res["stdout"] == "hi\n", res
