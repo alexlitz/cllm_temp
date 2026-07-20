@@ -653,6 +653,17 @@ def _cstr_from_mem(mem, addr: int, limit: int = 4096) -> str:
     return out.decode("latin-1")
 
 
+# The streaming build's internal value-liveness pass overlays a built-in probe
+# battery whose longest program is 19 instructions; ``code_size`` MUST cover it
+# (the overlay indexes ``L.CODE_OP[k]`` for every probe instruction), so the
+# minimum build size is 21 even for a tiny corpus program.
+_MIN_LIB_CODE_SIZE = 21
+
+
+def _lib_code_size(n_instrs: int) -> int:
+    return max(n_instrs + 2, _MIN_LIB_CODE_SIZE)
+
+
 # Cross-program shared streaming model (built ONCE, grown monotonically), so the
 # neural corpus run does not rebuild the ~4 GB model per program.  A model built
 # at a LARGER code_size is byte-identical for a shorter program (proven for the
@@ -710,13 +721,14 @@ def run_model(entry: CorpusEntry, max_steps: int = 4000,
 
     raw_instrs, data = compile_entry(entry)
     instrs = retarget_to_neural_abi(raw_instrs)
+    code_size = _lib_code_size(len(instrs))
 
     if shared:
-        sparse, L = _lib_streaming_model(len(instrs) + 2)
+        sparse, L = _lib_streaming_model(code_size)
     else:
         from .lib_neural import build_lib_model_streaming
         sparse, L, _ = build_lib_model_streaming(
-            code_size=len(instrs) + 2, recurrent_divmod=True, addr32=True)
+            code_size=code_size, recurrent_divmod=True, addr32=True)
 
     fio = FS.FileOpState(runner=FS.FileRunner(
         fs=FS.StubFilesystem(dict(entry.files)),
