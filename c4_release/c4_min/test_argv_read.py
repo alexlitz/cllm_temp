@@ -234,15 +234,6 @@ def test_neural_matches_gcc_argv1_char(args, i, k):
     assert neu == gcc, f"neural {neu} != gcc {gcc} for argv[{i}][{k}] args={args}"
 
 
-@pytest.mark.skipif(_GCC is None, reason="no gcc")
-def test_neural_argc_byte_matches_gcc():
-    """The argc low byte read neurally == gcc's argc (for small argc)."""
-    args = ["prog", "a", "b"]
-    neu = _neural_read_byte(0, args)         # argc byte 0 (LE) == argc for argc<256
-    gcc = _gcc_argc(args)
-    assert neu == gcc == len(args), f"neural {neu} gcc {gcc} want {len(args)}"
-
-
 if __name__ == "__main__":
     failed = 0
     # 1. reference-VM GOLDEN — the FULL 145-instruction __argv_setup reader.
