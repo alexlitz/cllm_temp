@@ -16,7 +16,7 @@ def _rss_gb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
 
 
-def run(width, height, maxiter, max_steps=200000, verbose=False):
+def run(width, height, maxiter, max_steps=200000, verbose=False, device="cpu"):
     from src.compiler import compile_c
     from c4_min.run_1096_pure_forward import bytecode_to_isa
     from c4_min.nibble_pure_forward_complete import ref_interpret
@@ -44,6 +44,11 @@ def run(width, height, maxiter, max_steps=200000, verbose=False):
         code_size=max(len(code) + 2, 64), recurrent_divmod=True, addr32=True)
     t_build = time.time() - t0
     print(f"build wall: {t_build:.1f}s  RSS after build: {_rss_gb():.2f} GB", flush=True)
+
+    if device and device != "cpu":
+        import torch
+        sparse = sparse.to(device)
+        print(f"moved model to {device}", flush=True)
 
     out, stats = [], {}
     print(f"running {n_ref_steps} steps through model.forward ...", flush=True)
@@ -79,5 +84,9 @@ if __name__ == "__main__":
     H = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     MI = int(sys.argv[3]) if len(sys.argv) > 3 else 3
     VERB = "-v" in sys.argv
-    ok, *_ = run(W, H, MI, verbose=VERB)
+    DEV = "cpu"
+    for a in sys.argv:
+        if a.startswith("--device="):
+            DEV = a.split("=", 1)[1]
+    ok, *_ = run(W, H, MI, verbose=VERB, device=DEV)
     sys.exit(0 if ok else 1)
