@@ -156,3 +156,101 @@ implemented. The table **overclaims** by listing malloc-family (34-37) and POP/B
 (40-42) and GETCHAR/PUTCHAR (64/65) as opcodes when they are either compiled-to-bytecode
 subroutines, absent, or explicitly removed. The blog's own §Tool-Use prose (line 853)
 already contradicts its own opcode table on 34-37.
+
+---
+
+## §Vanillaness (BLOG_SPEC.md:233-403) → model architecture
+
+Reference: `c4_min/blogspec_model.py` (the headline VM's transformer),
+`c4_min/nibble_moe.py` (MoE).
+
+| Claim | Class | Evidence |
+|-------|-------|----------|
+| softmax1 = `exp(x)/(1+Σexp(x))`, only real deviation | ✅ | `blogspec_model.py:66-78` `softmax1`; +1 sink, ZFOD |
+| softmax1 realizable via BOS sink under plain softmax | ✅ | `softmax1_via_bos_sink` (:81-101); a 0-logit column reproduces `+1` exactly; toggle `sink="bos_sink"` |
+| ALiBi slopes = geometric `2^(-8/n·(i+1))` | ✅ | `blogspec_model.py:150-153` — matches blog §307-311 char-for-char |
+| ALiBi replaceable by RoPE | ✅ | `positional="rope"` toggle (:181-215); RoPE binary-distance recency, content Q/K untouched (matches REV #11) |
+| SwiGLU FFN `down(silu(up·x)·(gate·x))` + additive residual | ✅ | `FFN.forward` (:314-318) `silu(up)*gate` |
+| MoE = soft blend, all experts run, opcode-one-hot weighted | ✅ | `NibbleStandardMoEFFN.forward` (:179-198) — verbatim port of blog `StandardMoEFFN`; `x + Σ w_i·(E_i(x)−x)` |
+| MoE ONNX-clean (static unroll, no `.item()`) | ✅ | opcode list is Python ints; loop unrolls at trace (nibble_moe:169-172) |
+| top-1 routing (compute only active expert) — REV #13 | ✅ | `NibbleTop1MoEFFN` (:204-293) ArgMax + `index_select` (Gather), argmax-identical to soft |
+| No RMSNorm / norm-free residual (spec's ref is norm-free) | ✅ | default `norm="none"`; RMSNorm-compensator is an *optional* toggle (:104-120, matches REV #11) |
+| No exotic ONNX ops / no special masking | ✅ | forward uses only linear/matmul/softmax/triu-causal-mask; 1 `scatter`-mention is a comment saying it is NOT used (nibble_moe:66) |
+| No `torch.round` on the **exec path** — REV #4 | ⚠ **split** | see below |
+
+**⚠ NEW — `torch.round` IS on FOUR non-headline exec paths.** The headline paths
+(`recurrent.py`, `nibble_pure_forward_complete.py`, `blogspec_run.py`) use the vanilla
+LM-head argmax requantiser `argmax_n(2·n·x − n²)` (`recurrent.py:138-156`,
+`nibble_pure_forward_complete.py:1189`), and `test_exec_path_vanilla.py` guards them
+(AST + settrace tripwire). **BUT** four other recurrent exec loops call `torch.round`
+for their per-step requant:
+- `nibble_bake.py:526` (`_requantize`, called by `run_baked` :558 — the *baked-program-
+  in-weights* / "malloc-on-transformer" demo loop),
+- `universal.py:582` (universal bytecode-as-system-prompt recurrent run),
+- `nibble_handoff.py:347` (model-runs-C handoff),
+- `nibble_compiler.py:817` (compiler recurrent run).
+
+`test_exec_path_vanilla.py` does **not** cover these four modules, so the "zero exec-
+time torch.round" claim (TESTING_CHECKLIST_STATUS.md:76-77) holds only for the headline
+3 paths, not for the baked/universal/handoff/compiler paths. Since these produce the
+capstones (model-runs-C, universal, quine, malloc), the vanilla-requant story is
+**inconsistent across paths** — the blog/REV #4 claim of "no rounding anywhere on the
+exec path" is an overclaim for those four. (Note the round versions are byte-equivalent
+to argmax on clean integer state, so this is a *vanillaness* purity issue, not a
+correctness bug.)
+
+## §The Building Blocks + ALU/math primitives (BLOG_SPEC.md:504-682)
+
+Reference: `nibble_cmp.py` (comparisons), `nibble_muldivmod.py` (mul/div/mod),
+`nibble_bitwise.py` (shifts/bitwise/floor), the baked versions in
+`nibble_pure_forward_complete.py`.
+
+| Primitive | Class | Evidence |
+|-----------|-------|----------|
+| Step fn `silu(S(x+ε))−silu(S(x−ε))` | ✅ | `nibble_cmp._step_ge1` / `_step_ge` (muldivmod) |
+| Point indicator (2nd-difference bump) | ✅ | `zero_detector` (nibble_cmp:96-106) — exact blog §584-586 transcription |
+| Range-check via two step fns | ✅ | band-range checks in nibble_bitwise dispatch |
+| ReLU-from-SiLU (scale away from 0) | ✅ | `_relu(z)=silu(RELU_S·z)/RELU_S` (muldivmod) |
+| Zero-detector for EQ/NE/BZ/BNZ | ✅ | `zero_detector`; 11 params (9w+2b); 4-nibble packing BASE=31 (§590) |
+| 6-weight ADD/SUB (`silu(S(a+b))/S`) | ✅ | nibble add+carry; matches §593 |
+| 6-weight MUL (`(silu(Sa)+silu(−Sa))·b/S`) | ✅ | `_mul` (muldivmod); exact blog §593 |
+| Schoolbook MUL, 10 partial products, i+j≥4 skip, 3 carry rounds | ✅ | muldivmod docstring:6-14 + impl; matches §620-640 |
+| Base-16 long division, `q=Σ_{k=1}^{15} step(rem−k·div)` | ✅ | muldivmod:16-19; matches §648 |
+| MOD = div-then-mul-then-subtract | ✅ | muldivmod:22 (§682) |
+| Per-nibble bitwise tables (256-entry AND/OR/XOR ×16) | ✅ | nibble_bitwise dispatch rules; §685 |
+| Comparisons are UNSIGNED 32-bit — REV #9 | ✅ | nibble_cmp:66 "unsigned 32-bit ordering, matching isa.interpret's masked comparisons" |
+| **MAGIC floor `(x+2^23)−2^23`** (§555) | ⚠ **DESCRIBED-ONLY** | no `8388608`/`2**23` constant anywhere in c4_min; floor is done by bit-plane selection (`nibble_bitwise._floor_div_pow2` :235-243), NOT the fp-mantissa MAGIC trick. §555 is prose, not code. |
+| **Efficient exp (BOS-sink, key √d, value e^B)** (§561-564) | ❌ **NOT IMPLEMENTED** | grep for the exp/log-sink construction finds nothing; division uses long division only (§Division default) — REV #19 already notes the shipped divider is long-division. §561-564 is described-only. |
+| **Division via attention-with-log-sink** (§653-679) | ❌ **NOT IMPLEMENTED** | the blog itself says it "set[s] the default behavior to be using long division" (§679); the log-sink divider is not built. Described-only (correctly flagged as non-default by the blog). |
+
+**Verdict (ALU/building blocks):** the SHIPPED constructions — zero-detector, step,
+6-weight add/sub/mul, schoolbook mul, base-16 long division, mod, per-nibble bitwise —
+all match the blog's math faithfully (`nibble_cmp` / `nibble_muldivmod` are near-verbatim
+transcriptions). Two of the blog's *alternative/optional* gadgets are **prose-only**: the
+MAGIC-floor fp trick (§555) and efficient-exp/division-via-log-sink (§561-564, §653-679).
+The blog does flag the log-sink divider as non-default, so that one is honestly labeled;
+MAGIC-floor is presented as if used but isn't.
+
+## §Memory (BLOG_SPEC.md:408-412, 687-691) + §Registers (442-461)
+
+Reference: `blogspec_memory.py`, `blogspec_vocab.py`.
+
+| Claim | Class | Evidence |
+|-------|-------|----------|
+| Store attends to registers for addr/val, binary-address ±scale keys | ✅ | blogspec_memory:39-50; `W_k` maps bit→`2·smag·bit − smag` (±smag) |
+| Query identical to key retrieves the address | ✅ | QRY_BIN with identical ±smag map (:47-50) |
+| Exact match dominates; 1 differing bit loses | ✅ | +n·EFF vs 2k·EFF cost; ZFOD BIAS `(n-1)·EFF` |
+| ALiBi recency = latest-write-wins | ✅ | MEM_ALIBI_SLOPE; among equal addresses newest wins (:65-69) |
+| softmax1 ZFOD — unwritten reads 0 | ✅ | +1 sink dominates when no match (:71-75) |
+| free = zero-overwrite → newest match returns 0 | ✅ | :73-74 (§691) |
+| 4-byte aligned, 32-bit addresses | ✅ | ADDR_BITS=32, "4-byte aligned" (:122) |
+| NULL memory write every step (keeps it simple) | ✅ | blogspec_memory:29-33; vocab MEM slot every frame (§461) |
+| 30-token register frame (PC/AX/SP/BP/MEM/STEP_END) | ✅ | `blogspec_vocab.build_step_frame` (:build_step_frame); exactly 30, asserted |
+| re-quant = emit→re-embed byte token (argmax) not round | ✅ | blogspec_vocab:17 header; the byte tokens ARE the quantiser |
+| deep-recursion scale EFF=500000 (REV #6) live | ✅ | `blogspec_memory.py:123` `EFF = 500000.0`; horizon EFF/slope=500000 tokens |
+| Eviction is UNBOUNDED / heap-mirroring (REV #3) | ✅ | see KV section below |
+
+**Verdict (memory):** an exceptionally faithful transcription — the memory subsystem is
+the strongest blog↔code correspondence in the whole project. Binary-CAM keys, query=key,
+ALiBi recency, softmax1 ZFOD, zero-overwrite free, 4-byte alignment, NULL-per-step, and
+the 30-token frame all match. EFF=500000 (the deep-recursion fix) is live.
