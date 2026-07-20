@@ -365,6 +365,30 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
 
 
 # ===========================================================================
+# BLOCK-MoE skip forward: run the KV-cached block stack but SKIP the [start, end)
+# block range (the divmod span), returning None kv for the skipped blocks.  Valid
+# only when the span has no divmod step (the caller gates this): every divmod
+# block's attention is all-zero (identity) so it produces identity output AND its
+# K/V is never read, and its FFN writes only dead scratch — so dropping the span's
+# COMPUTE is byte-identical to running it, at ~7x fewer blocks per forward.
+# ===========================================================================
+def _forward_hidden_cached_skip(model, x, past_key_values, q_positions, skip_range):
+    start, end = skip_range
+    n = len(model.blocks)
+    if past_key_values is None:
+        past_key_values = [None] * n
+    new_caches = [None] * n
+    hidden = x
+    for b in range(n):
+        if start <= b < end:
+            continue                        # identity expert: skip the block compute
+        hidden, kv = model.blocks[b](
+            hidden, past_kv=past_key_values[b], q_positions=q_positions, use_cache=True)
+        new_caches[b] = kv
+    return hidden, new_caches
+
+
+# ===========================================================================
 # 2. THE BLOCK-WISE PARALLEL VERIFIER — run the SPARSE model over the drafted
 #    stream in blocks, against the per-block KV cache + bounded eviction, and
 #    confirm the decoded register state at every step-query row == the draft.
@@ -387,7 +411,9 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                   evict: bool = True, cos_threshold: float = 0.99,
                   prune_interval: int = 120, zero_eps: float = 1e-9,
                   recency_eps: float = 1e-6, mask: int = 0xFFFFFFFF,
-                  stats: Optional[dict] = None, fast: bool = True) -> VerifyResult:
+                  stats: Optional[dict] = None, fast: bool = True,
+                  collect_out: Optional[List[int]] = None,
+                  block_moe: bool = False) -> VerifyResult:
     """Verify the whole drafted stream on the SPARSE model in BLOCKS.
 
     Processes ``block_steps`` VM steps per batched ``forward_hidden_cached``.  For
@@ -417,6 +443,24 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     max_seq = 1 + n_steps * V.FRAME_LEN
     max_cache = 0
     last_got_ax = None                      # the MODEL's decoded AX at the last step
+    prtf_set = set(draft.prtf_steps or ())  # steps whose model AX is a PRTF byte
+    # BLOCK-MoE divmod-skip: when block_moe and a whole block-verify span has NO
+    # DIV/MOD step, skip the ~262-block divmod span for that forward.  Safe because
+    # every divmod block's attention is all-zero (identity) — its K/V is never read
+    # — and its FFN writes only dead scratch bands (re-derived each step, consumed
+    # only by the post-span ax-mux, which reads them only on a DIV/MOD step).  So a
+    # span with no divmod step is byte-identical with the divmod blocks skipped, and
+    # their absent cache is never referenced (identity attention).  A span WITH a
+    # divmod step runs the full stack (the ax-mux needs the RES bands that step).
+    moe_span = None
+    divmod_step = None
+    blocks_run_total = 0
+    blocks_full_total = 0
+    if block_moe:
+        from .block_moe_divmod import resolve_divmod_span
+        moe_span = resolve_divmod_span(L)
+        _DM = {"DIV", "MOD"}
+        divmod_step = [(draft.frames[s]["op"] in _DM) for s in range(n_steps)]
     dev = torch.device(device)
     # O(1)-decode: build the row-invariant program-in-data vector ONCE (on the
     # embed's device/dtype so the broadcast-add is a device-resident op) instead of
@@ -456,8 +500,20 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     for role in range(N_ROLES):
                         x[0, wi, L.ROLE + role] = 1.0
             past = [caches[b].as_past_kv() for b in range(n_blocks)]
-            hidden, new_kv = model.forward_hidden_cached(
-                x, past_key_values=past, q_positions=q_positions, use_cache=True)
+            # BLOCK-MoE: skip the divmod span iff NO step in [step, end) is DIV/MOD.
+            span_has_divmod = (moe_span is not None
+                               and any(divmod_step[s] for s in range(step, end)))
+            skip_range = (moe_span if (moe_span is not None and not span_has_divmod)
+                          else None)
+            if skip_range is not None:
+                hidden, new_kv = _forward_hidden_cached_skip(
+                    model, x, past, q_positions, skip_range)
+                blocks_run_total += n_blocks - (skip_range[1] - skip_range[0])
+            else:
+                hidden, new_kv = model.forward_hidden_cached(
+                    x, past_key_values=past, q_positions=q_positions, use_cache=True)
+                blocks_run_total += n_blocks
+            blocks_full_total += n_blocks
         forwards += 1
 
         # decode + verify each step-query row of the block against the draft.
@@ -501,6 +557,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     max_seq_len=max_seq, max_cache_size=cache_now,
                     total_evicted=evicted_now, decoded_final_ax=None)
             accepted += 1
+            if collect_out is not None and s in prtf_set:
+                # PRTF visible byte = the MODEL's decoded AX byte-0 at this row (a
+                # verified byte: got_ax == want_ax just passed the accept check), so
+                # this is byte-identical to run_pure_forward_cached's out.append.
+                collect_out.append(got_ax & 0xFF)
             if s == n_steps - 1:
                 last_got_ax = got_ax & mask     # the model's actual final AX
 
@@ -517,6 +578,9 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         if keep:
             keep_idx = torch.tensor(keep, device=dev, dtype=torch.long)
             for b in range(n_blocks):
+                if new_kv[b] is None:
+                    continue                    # block-MoE skipped block (identity
+                    # attention -> its cache is never read, so a gap is harmless).
                 K_all, V_all, pos_all = new_kv[b]
                 K_span = K_all[:, :, -S:, :]
                 V_span = V_all[:, :, -S:, :]
@@ -543,6 +607,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         stats["max_cache_size"] = max(max_cache, caches[0].size())
         stats["total_evicted"] = sum(c.total_evicted for c in caches)
         stats["forwards"] = forwards
+        # block-MoE accounting: total blocks executed vs the full-stack equivalent.
+        stats["blocks_run"] = blocks_run_total
+        stats["blocks_full"] = blocks_full_total
+        stats["block_moe_speedup"] = (blocks_full_total / max(blocks_run_total, 1)
+                                      if block_moe else 1.0)
     return VerifyResult(
         accepted_steps=accepted, total_steps=n_steps,
         all_matched=(accepted == n_steps), forwards=forwards,
@@ -577,7 +646,9 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     expected: int, *, block_steps: int = 64,
                     max_steps: int = 300000, device: str = "cpu",
                     evict: bool = True, prune_interval: int = 120,
-                    mask: int = 0xFFFFFFFF, fast: bool = True) -> SpecResult:
+                    mask: int = 0xFFFFFFFF, fast: bool = True,
+                    block_moe: bool = False,
+                    collect_out: Optional[List[int]] = None) -> SpecResult:
     """Full speculative decode of ONE pure-forward program.
 
     1) draft the whole stream with the reference VM (zero forwards);
@@ -600,7 +671,8 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     stats: dict = {}
     vr = verify_blocks(model, L, code, draft, block_steps=block_steps,
                        device=device, evict=evict, prune_interval=prune_interval,
-                       mask=mask, stats=stats, fast=fast)
+                       mask=mask, stats=stats, fast=fast, block_moe=block_moe,
+                       collect_out=collect_out)
     naive = draft.step_count
     speedup = (naive / vr.forwards) if vr.forwards else float("inf")
     if not vr.all_matched:
