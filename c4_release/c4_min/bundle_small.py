@@ -315,17 +315,21 @@ _RUNTIME_SRC = """\
 # ---------------------------------------------------------------------------
 # Assemble.
 # ---------------------------------------------------------------------------
-def _compile_source_to_bytecode(source: str) -> List[Tuple[int, int]]:
-    """Compile a C4 source string to the ISA (op, imm) stream the driver runs.
+def _compile_source_to_bytecode(source: str) -> Tuple[List[Tuple[int, int]], List[int]]:
+    """Compile a C4 source string to the ISA ``(op, imm)`` stream + data segment.
 
     Uses the same front end + translation as ``run_1096_pure_forward``:
-    ``src.compiler.compile_c`` -> ``bytecode_to_isa``.
+    ``src.compiler.compile_c`` -> ``bytecode_to_isa``.  Returns
+    ``(code, data_seg)`` where ``data_seg`` is the compiler's data-segment byte
+    list (string literals etc., addressed from 0) — an I/O program (``printf``)
+    needs it; an arith program's is all-zero.
     """
     from src.compiler import compile_c
     from c4_min.run_1096_pure_forward import bytecode_to_isa
-    bytecode, _data = compile_c(source)
+    bytecode, data = compile_c(source)
     code = bytecode_to_isa(bytecode)
-    return [(int(i.op), int(i.imm) & 0xFFFFFFFF) for i in code]
+    return ([(int(i.op), int(i.imm) & 0xFFFFFFFF) for i in code],
+            [int(b) & 0xFF for b in (data or [])])
 
 
 def _build_model(config: Dict[str, object]):
@@ -359,7 +363,7 @@ def _build_model(config: Dict[str, object]):
 
 
 def _assemble_parts(source: str, *, expected, description, code_size,
-                    step_cap, reuse_model):
+                    step_cap, reuse_model, expected_stdout=None, mask=None):
     """Compile + serialise the three bundle sections and the finalised header.
 
     Returns ``(pre, hjson, runtime_bytes, weights_blob, bytecode_bytes, config,
@@ -369,11 +373,23 @@ def _assemble_parts(source: str, *, expected, description, code_size,
     is separable from the torch-only weight serialisation.  The offset fixed-point
     loop below is fully deterministic, so the SAME (pre, hjson, sections) is what
     the C4-C bundler concatenates to produce a byte-identical file.
+
+    ``expected_stdout`` (bytes/str) marks an I/O program (``printf``): the
+    data-segment string literals + a byte-mask are carried in the header so
+    ``run_bundle`` can capture stdout and verify it byte-exact.  ``mask``
+    overrides the register decode width (I/O programs ride the 8-bit AX byte,
+    ``mask=0xFF``; arith programs use the full ``0xFFFFFFFF``).
     """
     config = {
         "code_size": code_size,
     }
-    code = _compile_source_to_bytecode(source)
+    code, data_seg = _compile_source_to_bytecode(source)
+    # default mask: 0xFF for an I/O program (pointers ride the low AX byte),
+    # 0xFFFFFFFF for an arith program (full 32-bit result).
+    if mask is None:
+        mask = 0xFF if expected_stdout is not None else 0xFFFFFFFF
+    if isinstance(expected_stdout, str):
+        expected_stdout = expected_stdout.encode("latin-1")
     model, L = reuse_model if reuse_model is not None else _build_model(config)
     config.update({
         "dim": int(L.D), "n_blocks": len(model.blocks),
@@ -392,6 +408,13 @@ def _assemble_parts(source: str, *, expected, description, code_size,
         "expected": (None if expected is None else int(expected) & 0xFFFFFFFF),
         "description": description, "step_cap": step_cap, "n_instrs": len(code),
         "source": source,
+        # I/O program support: the data segment (string literals, addressed from
+        # 0), the decode mask, and the expected stdout (latin-1) if this is a
+        # printf-style program.  Empty/None for a pure arith program.
+        "data_seg": data_seg,
+        "mask": int(mask) & 0xFFFFFFFF,
+        "expected_stdout": (None if expected_stdout is None
+                            else expected_stdout.decode("latin-1")),
     }
     header = {
         "version": VERSION, "config": config, "program": program,
@@ -428,7 +451,8 @@ def _assemble_parts(source: str, *, expected, description, code_size,
 
 def prepare_bundle(source: str, out_dir: str, *, expected: Optional[int] = None,
                    description: str = "", code_size: int = 64,
-                   step_cap: int = 10000, reuse_model=None) -> Dict[str, object]:
+                   step_cap: int = 10000, reuse_model=None,
+                   expected_stdout=None, mask=None) -> Dict[str, object]:
     """Emit the raw bundle parts a section-fusing bundler concatenates.
 
     Writes, into ``out_dir``:  ``header.bin`` (MAGIC+version+hlen+finalised header
@@ -443,7 +467,8 @@ def prepare_bundle(source: str, out_dir: str, *, expected: Optional[int] = None,
     pre, hjson, runtime_bytes, weights_blob, bytecode_bytes, config, wstats, program = \
         _assemble_parts(source, expected=expected, description=description,
                         code_size=code_size, step_cap=step_cap,
-                        reuse_model=reuse_model)
+                        reuse_model=reuse_model, expected_stdout=expected_stdout,
+                        mask=mask)
     header_bin = pre + hjson
     parts = [("header.bin", header_bin), ("runtime.bin", runtime_bytes),
              ("weights.bin", weights_blob), ("bytecode.bin", bytecode_bytes)]
@@ -464,18 +489,22 @@ def prepare_bundle(source: str, out_dir: str, *, expected: Optional[int] = None,
 def assemble_bundle(source: str, out_path: str, *, expected: Optional[int] = None,
                     description: str = "", code_size: int = 64,
                     step_cap: int = 10000,
-                    reuse_model=None) -> Dict[str, object]:
+                    reuse_model=None, expected_stdout=None,
+                    mask=None) -> Dict[str, object]:
     """Build a .c4bundle from a C4 source string.
 
     Compiles ``source`` -> bytecode, builds the SMALL model at ``config``,
     serialises its weights sparse, and writes the flat container.  ``reuse_model``
     (a pre-built ``(model, L)``) skips the (slow) rebuild when assembling several
-    bundles at the same config.
+    bundles at the same config.  ``expected_stdout`` marks a printf-style I/O
+    program (the driver captures stdout and verifies it byte-exact); ``mask``
+    overrides the decode width (defaults 0xFF for I/O, 0xFFFFFFFF for arith).
     """
     pre, hjson, runtime_bytes, weights_blob, bytecode_bytes, config, wstats, program = \
         _assemble_parts(source, expected=expected, description=description,
                         code_size=code_size, step_cap=step_cap,
-                        reuse_model=reuse_model)
+                        reuse_model=reuse_model, expected_stdout=expected_stdout,
+                        mask=mask)
 
     with open(out_path, "wb") as fh:
         fh.write(pre)
@@ -555,17 +584,43 @@ def run_bundle(path: str, *, max_steps: Optional[int] = None,
         code.append(isa.Instr(op, imm))
 
     cap = max_steps if max_steps is not None else int(hdr.program.get("step_cap", 10000))
+    # I/O program support: wire the data segment (string literals) + an fio
+    # stdout/stdin sink so a printf-style bundle can be captured byte-exact.  An
+    # arith program carries an empty data_seg + no expected_stdout and behaves
+    # exactly as before (full 32-bit register decode).
+    mask = int(hdr.program.get("mask") or 0xFFFFFFFF)
+    exp_stdout_s = hdr.program.get("expected_stdout")
+    exp_stdout = (None if exp_stdout_s is None
+                  else exp_stdout_s.encode("latin-1"))
+    data_list = hdr.program.get("data_seg") or []
+    data_seg = {i: (int(b) & 0xFF) for i, b in enumerate(data_list)}
+    is_io = exp_stdout is not None
+
+    fio = None
+    if is_io:
+        from c4_min import nibble_filesys as FS
+        fio = FS.FileOpState(runner=FS.FileRunner(
+            fs=FS.StubFilesystem({}), stdin=FS.InputKVStream(b"")))
+
     stats: dict = {}
     t1 = time.monotonic()
     trace = run_pure_forward_cached(model, L, code, max_steps=cap,
-                                    mask=0xFFFFFFFF, evict=True,
-                                    prune_interval=120, stats=stats)
+                                    mask=mask, evict=True,
+                                    prune_interval=120, stats=stats,
+                                    fio=fio, data_seg=(data_seg or None))
     t_run = time.monotonic() - t1
 
-    got = (int(trace[-1]) & 0xFFFFFFFF) if trace else None
+    got_stdout = bytes(fio.runner.stdout) if is_io else None
+    got = (int(trace[-1]) & mask) if trace else None
     exp = hdr.program.get("expected")
     steps = len(trace)
-    if got is None:
+    if is_io:
+        # I/O program: the verdict is byte-exact STDOUT, not the register value.
+        if got_stdout == exp_stdout:
+            status = "PASS"
+        else:
+            status = "FAIL"
+    elif got is None:
         status = "ERROR"
     elif steps >= cap:
         status = "TIMEOUT"
@@ -582,9 +637,15 @@ def run_bundle(path: str, *, max_steps: Optional[int] = None,
         "description": hdr.program.get("description", ""),
         "config": hdr.config, "kv_stats": stats,
     }
+    if is_io:
+        result["stdout"] = (None if got_stdout is None
+                            else got_stdout.decode("latin-1"))
+        result["expected_stdout"] = exp_stdout_s
     if verbose:
+        tail = (f"stdout={got_stdout!r} expected_stdout={exp_stdout!r}"
+                if is_io else f"got={got} expected={exp}")
         print(f"[bundle] {os.path.basename(path)}  status={status}  "
-              f"got={got} expected={exp}  steps={steps}  "
+              f"{tail}  steps={steps}  "
               f"(load {t_load:.1f}s + run {t_run:.1f}s)", file=sys.stderr)
     return result
 
@@ -599,6 +660,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     pa = sub.add_parser("assemble", help="build a .c4bundle from a C4 source")
     pa.add_argument("--source", required=True)
     pa.add_argument("--expected", type=int, default=None)
+    pa.add_argument("--expected-stdout", default=None,
+                    help="mark a printf-style I/O program; verify stdout "
+                         "byte-exact (accepts \\n escapes)")
     pa.add_argument("--description", default="")
     pa.add_argument("--out", required=True)
     pa.add_argument("--code-size", type=int, default=64)
@@ -623,8 +687,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     if args.cmd == "assemble":
+        exp_stdout = (args.expected_stdout.encode("latin-1")
+                      .decode("unicode_escape").encode("latin-1")
+                      if args.expected_stdout is not None else None)
         info = assemble_bundle(
             args.source, args.out, expected=args.expected,
+            expected_stdout=exp_stdout,
             description=args.description, code_size=args.code_size,
             step_cap=args.step_cap)
         print(json.dumps(info, indent=2))
