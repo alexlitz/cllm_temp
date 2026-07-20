@@ -127,6 +127,13 @@ class PureForwardCompleteLayout(PureForwardLayout):
         self.CODE_IMM_NIB = [self._band(f"CODE_IMM_NIB_{i}", IMM_NIBS)
                              for i in range(code_size)]
         self.IMM_NIB = self._band("IMM_NIB", IMM_NIBS)        # fetched immediate nibbles
+        # CLEAN signed immediate scalar, reconstructed from the leak-free IMM_NIB
+        # nibbles (each rounded to its exact 0..15 cell) + a two's-complement sign
+        # correction.  Written ONCE into this DEDICATED never-share scratch dim (never
+        # an in-place overwrite of the leaky ``IMM`` scalar), so the frame-offset ops
+        # (LEA/ENT/ADJ/JSR) read an EXACT integer offset instead of ``IMM``'s
+        # large-literal PC-one-hot leak (#648/#660).  See ``compile_imm_clean``.
+        self.IMM_CLEAN = self._scalar("IMM_CLEAN")
         while self._off % n_heads != 0:
             self._scalar(f"_pfcpad{self._off}")
         self.D = self._off
@@ -411,7 +418,12 @@ def _bake_lev_ret_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
 # ===========================================================================
 def callconv_dispatch_rules(L) -> List[FFNRule]:
     ax, sp, bp, stk, pc = L.AX_VAL, L.SP_VAL, L.BP_VAL, L.STK_VAL, L.PC_VAL
-    imm = L.IMM
+    # Frame-offset ops (JSR/ENT/ADJ/LEA) read the CLEAN reconstructed immediate, not
+    # the leaky scalar ``L.IMM``: the leak (a fraction of nearby large literals via
+    # the imperfect PC one-hot) scaled by 4 rounds the frame byte to the wrong
+    # integer (#648/#660).  ``IMM_CLEAN`` is exact for the signed slot offsets and
+    # the small positive PC targets these ops carry.
+    imm = L.IMM_CLEAN
 
     def G(op):
         return [(L.OP_IS + op, 0.5, 1.5)]
@@ -539,14 +551,18 @@ def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
           ``(1-k)`` leaves a residue ``(1-k)*AX_VAL_old`` > 0.5; and
       (b) the fetched ``IMM`` scalar itself leaks a fraction of a NEARBY large literal
           (e.g. ``IMM 0x20000``) through the imperfect PC one-hot, so ``IMM`` for a
-          ``LEA -1`` reads e.g. ``-1.026`` not ``-1``.
+          ``LEA -1`` reads e.g. ``-1.026`` not ``-1``.  This block reads the CLEAN
+          ``IMM_CLEAN`` (reconstructed leak-free from IMM_NIB in ``compile_imm_clean``)
+          instead of ``IMM``, so (b) is fixed AT SOURCE — with several large literals
+          in flight the raw-``IMM`` residue can exceed the round tolerance below, but
+          ``IMM_CLEAN`` is EXACT.
 
-    Fix: recompute the LEA byte here from ``q = BP_LOW + 4*imm`` with a
+    Fix: recompute the LEA byte here from ``q = BP_LOW + 4*IMM_CLEAN`` with a
     ROUND-TO-NEAREST integer decode -- cell ``a`` fires iff ``q in [a-0.5, a+0.5)``,
     built from CLAMPED steps at the half-integer edges (each a
     ``relu(RELU_S*(q-e)) - relu(RELU_S*(q-e)-1)`` saturating to a clean 0/1 since q is
-    never within ``1/RELU_S`` of a half-integer edge) -- which absorbs BOTH the ~0.1
-    IMM residue and any AXB slop, snapping ``q`` to the exact frame integer before
+    never within ``1/RELU_S`` of a half-integer edge) -- which absorbs any AXB slop
+    (residue (a)), snapping ``q`` to the exact frame integer before
     taking its low/high nibbles (mod 256).  OVERWRITES AXB_LO/AXB_HI, gated on
     OP_IS[LEA] (0 on every non-LEA op -> byte-identical).  Runs AFTER ``ax-nib-split``
     and BEFORE ``ax-byte-nib``.  ``4*imm`` handles a negative slot count exactly
@@ -567,7 +583,7 @@ def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
     for e in edges:                       # two relu units -> one clamped step per edge
         for j in range(2):
             spec["W_up"][u, L.BP_LOW] = RELU_S
-            spec["W_up"][u, L.IMM] = 4.0 * RELU_S
+            spec["W_up"][u, L.IMM_CLEAN] = 4.0 * RELU_S    # CLEAN imm (no PC-leak)
             spec["b_up"][u] = -RELU_S * e - (0.0 if j == 0 else 1.0)
             spec["W_gate"][u, g] = 1.0    # gate on OP_IS[LEA] (0/1) so the step is
             u += 1                        # zero on non-LEA steps
@@ -633,6 +649,77 @@ def compile_imm_nib_fetch(L, dim: int) -> Dict[str, torch.Tensor]:
             spec["W_gate"][u, L.CODE_IMM_NIB[i] + j] = 1.0
             spec["W_down"][L.IMM_NIB + j, u] += 1.0 / SILU_S
             u += 1
+    return spec
+
+
+def compile_imm_clean(L, dim: int) -> Dict[str, torch.Tensor]:
+    """IMM_CLEAN = the EXACT signed immediate, reconstructed from ``IMM_NIB`` (the
+    leak-free per-nibble fetch) — the ROOT fix for the frame-address IMM leak
+    (#648/#660).
+
+    The scalar ``IMM = Σ_i PC_IS[i]·CODE_IMM[i]`` leaks a fraction of every NEARBY
+    large literal (e.g. ``0x20000``) through the imperfect PC one-hot; with the
+    corpus's ~43 big literals in flight the accumulated residue exceeds 0.5, so any
+    op scaling it by 4 (``AX/SP += 4·imm``) rounds the frame byte to the wrong
+    integer.  ``IMM_NIB[j]`` is fetched the SAME way, but each nibble is a small
+    integer 0..15, so a 16-cell one-hot (triangular pulse, exact at each integer)
+    ROUNDS each nibble to its nearest cell and kills the leak per-nibble.
+
+    We reconstruct a bounded-width SIGNED value from the low ``CLEAN_NIBS`` nibbles
+    (two's-complement, ``CLEAN_NIBS·4`` bits): the top of those nibbles is treated as
+    SIGNED (cell ``a>=8`` -> ``a-16``), so a negative slot offset ``-k`` (stored as
+    ``0xF..FC``) reconstructs to exactly ``-k`` and a small positive PC target /
+    offset to itself.  ``CLEAN_NIBS`` is chosen so every frame-offset op's immediate
+    (LEA/ENT/ADJ signed slot counts, |·| <= a few; JSR positive PC targets < code
+    size) fits its signed range — and, crucially, so the recompose coefficients
+    (``<= 16^CLEAN_NIBS``) stay SMALL: a large coefficient (e.g. ``16^4``) amplifies
+    the silu unit's ~1e-6 relative error to ~0.5 ABSOLUTE at the cell, which would
+    re-introduce a half-integer error.  With ``CLEAN_NIBS=3`` (signed range
+    ``[-2048, 2047]``) the max coefficient is ``16^3=4096`` and the result is
+    fp32-EXACT for every corpus immediate (unit-tested).
+
+    Result written ONCE into the DEDICATED never-share ``IMM_CLEAN`` scalar (NOT an
+    in-place overwrite of the leaky ``IMM`` dim — a fresh dim written once sidesteps
+    the compact_alloc liveness interaction that neutralised the in-place attempt).
+    Ungated (IMM_CLEAN is only READ by the frame-offset ops, which gate their own
+    writes on OP_IS)."""
+    # 3 low nibbles: signed 12-bit range [-2048, 2047] covers every corpus LEA/ENT/
+    # ADJ slot offset (|·| <= a few) and every JSR PC target (< code_size).  Kept
+    # small so the recompose coefficients (<= 16^3) do not amplify the silu residual.
+    n_nib = min(3, IMM_NIBS)
+    thr = list(range(-1, 17))
+    tu = {t: k for k, t in enumerate(thr)}
+    n_thr = len(thr)
+    # one relu bank per nibble (16-cell one-hot) + one self-clear unit for IMM_CLEAN.
+    spec = _empty_spec(dim, n_nib * n_thr + 1)
+    u = 0
+    relu0 = {}
+    for j in range(n_nib):
+        relu0[j] = u
+        for t, k in tu.items():
+            spec["W_up"][u, L.IMM_NIB + j] = RELU_S
+            spec["b_up"][u] = -RELU_S * t
+            spec["W_gate"][u, L.ONE] = 1.0
+            u += 1
+    # self-clear IMM_CLEAN (SET) so recurrent steps are idempotent.
+    spec["W_up"][u, L.ONE] = S
+    spec["W_gate"][u, L.IMM_CLEAN] = 1.0
+    spec["W_down"][L.IMM_CLEAN, u] += -1.0 / SILU_S
+    u += 1
+    # recompose: IMM_CLEAN += Σ_j Σ_a one-hot_j(a)·coeff(j,a).  The TOP of the
+    # reconstructed nibbles is SIGNED (a-16 when a>=8), so ``0xF..FC`` -> ``-k``.
+    base = 1
+    top = n_nib - 1
+    for j in range(n_nib):
+        r0 = relu0[j]
+        for a in range(16):
+            av = (a - 16) if (j == top and a >= 8) else a   # signed top nibble
+            coeff = av * base
+            if coeff:
+                spec["W_down"][L.IMM_CLEAN, r0 + tu[a - 1]] += coeff / RELU_S
+                spec["W_down"][L.IMM_CLEAN, r0 + tu[a]] += -2.0 * coeff / RELU_S
+                spec["W_down"][L.IMM_CLEAN, r0 + tu[a + 1]] += coeff / RELU_S
+        base *= 16
     return spec
 
 
@@ -734,6 +821,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("code-select", compile_code_select(L, dim)),
         ("opcode-decode", compile_opcode_decode_pfc(L, dim)),  # + JSR/ENT/ADJ/LEV
         ("imm-nib-fetch", compile_imm_nib_fetch(L, dim)),      # IMM_NIB <- CODE_IMM_NIB@PC
+        ("imm-clean", compile_imm_clean(L, dim)),              # IMM_CLEAN <- round(IMM_NIB)
         ("mem-prep", compile_mem_prep(L, dim)),
         ("mem-cam",  compile_nibble_to_scalar(L, dim)),          # ATTN=LI head
         ("pop-addr", compile_pop_addr(L, dim)),                  # POP_ADDR/LEV_ADDR

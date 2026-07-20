@@ -267,6 +267,15 @@ _NEVER_SHARE_NAMES: Tuple[str, ...] = (
                  # band: the default probe battery only lights the LOW nibbles, so a
                  # colouring that shares the high-nibble plane slots leaks a stale
                  # value into the bitwise combine (the 0x**22 corruption).
+    "IMM_CLEAN", # clean reconstructed frame-offset immediate (#648/#660): written
+                 # ONCE mid-pipeline (imm-clean block) and READ by the frame-offset
+                 # ops (LEA/ENT/ADJ/JSR dispatch + lea-addr-nib).  Pin a private slot
+                 # so the colouring can never share it — an in-place overwrite of the
+                 # EXISTING leaky IMM dim was neutralised by the liveness re-lowering
+                 # (its output equalled its input); a fresh pinned dim written once
+                 # sidesteps that.  The default probe battery does not exercise
+                 # frame-offset ops, so weight/empirical liveness alone would let it
+                 # share a slot and get clobbered.
 )
 _NEVER_SHARE_PREFIXES: Tuple[str, ...] = ()
 
