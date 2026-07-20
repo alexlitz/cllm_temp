@@ -896,7 +896,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
                   [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
     block_specs += [
         ("dispatch", compile_ffn(disp_rules, dim)),
-        ("branch-delta", compile_branch_delta(L, dim)),
+        ("branch-delta", compile_branch_delta_clean(L, dim)),  # BZ/BNZ via IMM_CLEAN
         ("fold-lea", _fold_ax_gated(L, dim, [isa.LEA])),  # LEA masks &0xFF; ALU 32-bit
         ("ax-nib-split", compile_ax_nib_split(L, dim)),   # AX_VAL byte -> AXB_LO/HI
         # LEA frame address is residue-immune: recompute AXB_LO/HI from BP_LOW+4*imm
@@ -965,9 +965,12 @@ def _find(block_specs, name):
 
 def _base_rules_minus_alu(L) -> List[FFNRule]:
     """The base dispatch rules with ADD/SUB REMOVED (the 32-bit ALU + ax-mux own
-    AX for ADD/SUB/MUL/DIV/MOD) and PSH/LEA REMOVED (callconv owns them)."""
+    AX for ADD/SUB/MUL/DIV/MOD), PSH/LEA REMOVED (callconv owns them), and JMP
+    REMOVED (re-added below reading the CLEAN immediate ``IMM_CLEAN`` for its target,
+    so a large-literal PC-one-hot leak cannot shift the jump target — the memset
+    ``JMP 134`` was leaking to 133, corrupting the fill loop; #648/#660)."""
     rules = base_dispatch_rules(L)
-    drop = {isa.ADD, isa.SUB, isa.PSH, isa.LEA}
+    drop = {isa.ADD, isa.SUB, isa.PSH, isa.LEA, isa.JMP}
     out = []
     for r in rules:
         # a rule's gate is [(OP_IS+op, ...)]; find which op.
@@ -975,7 +978,46 @@ def _base_rules_minus_alu(L) -> List[FFNRule]:
         if op in drop:
             continue
         out.append(r)
+    # JMP: PC = IMM_CLEAN (leak-free target).  PC += (IMM_CLEAN - PC).
+    out.append(FFNRule([(L.OP_IS + isa.JMP, 0.5, 1.5)], {
+        L.PC_VAL: LinearExpr.of(L.IMM_CLEAN, 1.0) + LinearExpr.of(L.PC_VAL, -1.0)}))
     return out
+
+
+def compile_branch_delta_clean(L, dim: int) -> Dict[str, torch.Tensor]:
+    """``compile_branch_delta`` (BZ/BNZ bilinear PC update) but reading the CLEAN
+    immediate ``IMM_CLEAN`` for the taken target instead of the leaky ``IMM`` — same
+    root fix as JMP: a large-literal PC-one-hot leak must not shift a branch target
+    (BZ/BNZ targets are small positive PC values < code_size, exact in IMM_CLEAN's
+    12-bit signed range).  Structurally identical to ``compile_branch_delta`` with
+    ``imm`` rebound; kept here (not a flag on the base) so non-complete builds — which
+    have no ``IMM_CLEAN`` dim — are untouched."""
+    import torch.nn.functional as _Fnn
+    pc, imm, azero, one = L.PC_VAL, L.IMM_CLEAN, L.AX_ZERO, L.ONE
+    BZ, BNZ = L.OP_IS + isa.BZ, L.OP_IS + isa.BNZ
+    spec = _empty_spec(dim, 4)
+    BIG = 200.0
+    silu_big = float(_Fnn.silu(torch.tensor(0.5 * BIG)))
+
+    def _and_unit(u, op_band, bool_terms, gate_terms):
+        spec["W_up"][u, op_band] += BIG
+        for band, coeff, const in bool_terms:
+            if band is not None:
+                spec["W_up"][u, band] += BIG * coeff
+            spec["b_up"][u] += BIG * const
+        spec["b_up"][u] += -BIG * 1.5
+        for band, coeff in gate_terms:
+            spec["W_gate"][u, band] += coeff
+
+    _and_unit(0, BZ,  [(azero, 1.0, 0.0)],  [(imm, 1.0), (pc, -1.0)])
+    spec["W_down"][pc, 0] += 1.0 / silu_big
+    _and_unit(1, BZ,  [(azero, -1.0, 1.0)], [(one, 1.0)])
+    spec["W_down"][pc, 1] += 1.0 / silu_big
+    _and_unit(2, BNZ, [(azero, -1.0, 1.0)], [(imm, 1.0), (pc, -1.0)])
+    spec["W_down"][pc, 2] += 1.0 / silu_big
+    _and_unit(3, BNZ, [(azero, 1.0, 0.0)],  [(one, 1.0)])
+    spec["W_down"][pc, 3] += 1.0 / silu_big
+    return spec
 
 
 def cmp_dispatch_rules_pop(L) -> List[FFNRule]:
