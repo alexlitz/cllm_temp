@@ -74,3 +74,36 @@ streaming build is byte-identical (L∞=0, `dense_kernel`) and stays under 20 GB
   `_top1_measure.py` + test routings to the streaming build. No weight-build code.
 - Fingerprint: UNCHANGED (`f61decf217c718ba`). The conftest guard now protects all
   subsequent builds (landed early per brief).
+
+### 5. `neural-io-position-wt` (#658) — MERGED CLEAN (fingerprint unchanged, re-built)
+
+- Merge: clean, no conflicts. Adds `nibble_io_position.py` (`IOPositionBuffer`,
+  ALiBi position-signature neural read) + edits `InputKVStream.read` in
+  `nibble_filesys.py` to retrieve stdin bytes through the real softmax1+ALiBi
+  attention forward (byte-identical to the reference slice).
+- `nibble_filesys.py` IS imported by `nibble_pure_forward_complete.py`, but the
+  change is confined to the runtime `InputKVStream` read class — no FFN block /
+  attention head is added to the weight build.
+- Fingerprint: RE-BUILT and UNCHANGED (`f61decf217c718ba`, peak 8.3 GB) — native
+  READ pathway is decode-runtime only.
+
+### 6. `argv-read-plumb` (#649) — MERGED CLEAN (fingerprint unchanged, re-built)
+
+- Merge: clean; git auto-merged `isa.py`.
+- Change: adds `nibble_argv.py`; the `isa.py` edit is additive to the REFERENCE
+  `interpret` (adds LC/SC/READ handling + a `stdin=` arg — no opcode-number change);
+  `nibble_pure_forward.py` gains an inert `fio=`/`data_seg=`/`mask=` file-op
+  dispatch branch in `run_pure_forward` (byte-identical to original when `fio=None`).
+- Fingerprint: RE-BUILT and UNCHANGED (`f61decf217c718ba`, peak 10.2 GB) — argv/READ
+  plumbing is decode-runtime; no weight-build code changed.
+
+### 7. `full-attn-baking-completeness` (#652) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean. Adds `baked_attention.py` + `test_baked_attention.py` — a completeness
+  verifier + test, NOT imported by any weight-build module.
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
+
+### 8. `eliza-full-turn-neural` (#653) — MERGED CLEAN (fingerprint unchanged)
+
+- Merge: clean. Touches only `test_chat_io_neural.py` (test).
+- Fingerprint: UNCHANGED (`f61decf217c718ba`) by construction.
