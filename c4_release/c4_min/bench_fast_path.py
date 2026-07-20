@@ -79,6 +79,21 @@ def build_loop_countdown(n: int):
     return code, 0, data, f"loop_countdown n={n}"
 
 
+def build_nested(outer: int, inner: int):
+    """A byte-SAFE deep nested loop (all values <= 255 so the model's 8-bit ALU is
+    byte-exact to the 32-bit draft): ``outer`` times, count ``inner`` down to 0;
+    return the outer count.  A genuinely DEEP program (outer*inner*~5 steps) that
+    stays fully verifiable — the deep-loop headline."""
+    from src.compiler import compile_c
+    from c4_min.run_1096_pure_forward import bytecode_to_isa
+    src = (f"int main(){{ int a; int b; int r; b=0; r={outer}; "
+           f"while(r>0){{ a={inner}; while(a>0){{ a=a-1; }} b=b+1; r=r-1; }} "
+           f"return b; }}")
+    bytecode, data = compile_c(src)
+    code = bytecode_to_isa(bytecode)
+    return code, outer, data, f"nested_loop {outer}x{inner} (byte-safe deep)"
+
+
 def build_malloc(n: int):
     """A malloc + memset + memcmp heap program built from the c4_min runtime library
     (``nibble_runtime``: pure base-ISA, uses the addr32 heap at 0x30008).
@@ -176,6 +191,8 @@ def run_bench(kind: str, args) -> int:
         code, expected, data, label = build_mandel(*args.grid)
     elif kind == "loop":
         code, expected, data, label = build_loop_countdown(args.n)
+    elif kind == "nested":
+        code, expected, data, label = build_nested(args.outer, args.inner)
     elif kind == "malloc":
         code, expected, data, label = build_malloc(args.n)
     elif kind == "matmul":
@@ -326,10 +343,12 @@ def run_bench(kind: str, args) -> int:
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("kind", choices=["mandel", "loop", "malloc", "matmul"])
+    ap.add_argument("kind", choices=["mandel", "loop", "nested", "malloc", "matmul"])
     ap.add_argument("grid", nargs="*", type=int, default=[],
                     help="mandel: W H MAXITER")
     ap.add_argument("--n", type=int, default=64, help="loop/malloc/matmul size")
+    ap.add_argument("--outer", type=int, default=40, help="nested: outer loop count")
+    ap.add_argument("--inner", type=int, default=200, help="nested: inner loop count")
     ap.add_argument("--device", type=str, default="cuda:0")
     ap.add_argument("--compute-mode", type=str, default="dense_kernel",
                     choices=["dense_kernel", "sparse_mm"])
