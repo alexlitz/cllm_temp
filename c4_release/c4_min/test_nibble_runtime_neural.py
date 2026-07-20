@@ -50,9 +50,10 @@ _L = None
 _CODE_SIZE = 0
 
 #: Code-segment size the shared model is built at: the max instruction count of
-#: any test program (+2 headroom), so ONE streaming build serves every test.
-#: `_sparse_model` still grows past this if a bigger program is ever requested.
-_SHARED_CODE_SIZE = 48
+#: any test program (+2 headroom), so ONE streaming build serves every test
+#: (the memcmp programs are the longest at 53 instrs -> 55).  `_sparse_model`
+#: still grows past this if a bigger program is ever requested.
+_SHARED_CODE_SIZE = 55
 
 
 def _sparse_model(code_size: int):
@@ -69,12 +70,18 @@ def _sparse_model(code_size: int):
     return _SPARSE, _L
 
 
-def _run_neural(instrs, max_steps=200):
-    """Run baked bytecode through the unified model (KV-cached sparse driver)."""
+def _run_neural(instrs, max_steps=200, evict=False):
+    """Run baked bytecode through the unified model (KV-cached sparse driver).
+
+    ``evict`` prunes the per-block KV caches on a schedule so the cache stays
+    FLAT over deep loops — needed for the longer looping subroutines (memcmp)
+    whose stream would otherwise grow the cache to tens of GB at this model
+    width.  Eviction is byte-exact for these programs (verified equal to the
+    word-width reference)."""
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
     sparse, L = _sparse_model(code_size=len(instrs) + 2)
     return run_pure_forward_cached(sparse, L, instrs, max_steps=max_steps,
-                                   mask=0xFFFFFFFF, evict=False)
+                                   mask=0xFFFFFFFF, evict=evict)
 
 
 def _ref_ax_trace(instrs, max_steps=5000):
@@ -215,6 +222,45 @@ def _memset_then_readback(p, c, n, off):
     a.imm(p + off).emit(isa.LC)     # AX = p[off]
     a.exit_()
     return a.instrs()
+
+
+# ---------------------------------------------------------------------------
+# 4. memcmp: seed two byte buffers via SC, then run the memcmp loop through the
+#    model.  Covers BOTH branches — first-differing byte (returns a[i]-b[i]) and
+#    all-equal (loops to completion, returns 0).  memcmp is the longest looping
+#    subroutine, so it runs with cache eviction (byte-exact, memory-bounded).
+# ---------------------------------------------------------------------------
+def _memcmp_prog(a_bytes, b_bytes):
+    """Store ``a_bytes`` at ``pa`` and ``b_bytes`` at ``pb`` (byte stores), then
+    emit_memcmp(pa, pb, n).  Self-contained: the neural memory holds the two
+    buffers from the leading SC stores, then the memcmp LC/SUB loop reads them
+    back through the model — the "compiled from C, not a tool call" path."""
+    pa, pb = R.HEAP_BASE, R.HEAP_BASE + 16
+    a = R.Asm()
+    for i, bv in enumerate(a_bytes):
+        R._store(a, pa + i, lambda a, bv=bv: a.imm(bv), byte=True)
+    for i, bv in enumerate(b_bytes):
+        R._store(a, pb + i, lambda a, bv=bv: a.imm(bv), byte=True)
+    a.splice(R.emit_memcmp(pa, pb, len(a_bytes)))
+    return a.instrs()
+
+
+def test_memcmp_mismatch_neural():
+    # a = [1, 5], b = [1, 2] -> first differs at index 1: 5 - 2 = 3.
+    prog = _memcmp_prog([1, 5], [1, 2])
+    tr = _run_neural(prog, max_steps=300, evict=True)
+    ref = _ref_ax_trace(prog)
+    assert tr == ref, f"memcmp(mismatch) neural != reference\n  neural={tr}\n  ref={ref}"
+    assert tr[-1] == 3, f"memcmp first-diff must be 5-2=3, got {tr[-1]}: {tr}"
+
+
+def test_memcmp_equal_neural():
+    # a == b -> the loop runs to completion and returns 0.
+    prog = _memcmp_prog([7, 7], [7, 7])
+    tr = _run_neural(prog, max_steps=300, evict=True)
+    ref = _ref_ax_trace(prog)
+    assert tr == ref, f"memcmp(equal) neural != reference\n  neural={tr}\n  ref={ref}"
+    assert tr[-1] == 0, f"memcmp equal must return 0, got {tr[-1]}: {tr}"
 
 
 if __name__ == "__main__":
