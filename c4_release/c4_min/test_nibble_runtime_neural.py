@@ -72,11 +72,9 @@ _CODE_SIZE = 0
 
 #: Code-segment size the shared model is built at: the max instruction count of
 #: any test program (+2 headroom), so ONE streaming build serves every test.
-#: The default suite's longest program is malloc_bump (45 -> 47); the opt-in
-#: heavy memcmp programs are longer (53 -> 55).  `_sparse_model` still grows past
-#: this if a bigger program is ever requested, so 47 is a safe default that the
-#: heavy path auto-grows to 55 on demand.
-_SHARED_CODE_SIZE = 55 if os.environ.get("C4_LIB_NEURAL_HEAVY") == "1" else 47
+#: The longest programs are the memcmp cases (53 instrs -> 55).  `_sparse_model`
+#: still grows past this if a bigger program is ever requested.
+_SHARED_CODE_SIZE = 55
 
 
 def _sparse_model(code_size: int):
@@ -93,18 +91,19 @@ def _sparse_model(code_size: int):
     return _SPARSE, _L
 
 
-def _run_neural(instrs, max_steps=200, evict=False, prune_interval=60):
+def _run_neural(instrs, max_steps=200, evict=True, prune_interval=60):
     """Run baked bytecode through the unified model (KV-cached sparse driver).
 
-    ``evict`` prunes the per-block KV caches on a schedule (``prune_interval``)
-    so the cache stays FLAT over deep loops — needed for the longer looping
-    subroutines (memcmp), whose stream would otherwise grow the cache without
-    bound at this model width (dim≈1725 × 305 blocks).  ``prune_interval=60`` is
-    byte-exact (verified full-trace equal to the word-width reference for both
-    memcmp branches; the driver default of 120 is byte-exact too but lets the
-    cache grow larger).  ``_release_memory`` after the run returns the freed
-    transient CPU tensors to the OS so the shared-process peak (~14 GB) stays
-    flat across all the tests instead of accreting past the memory budget."""
+    ``evict=True`` prunes the per-block KV caches on a schedule (``prune_interval``)
+    so the cache stays FLAT.  This is load-bearing for MEMORY, not just deep loops:
+    with ``evict=False`` even a short loop (memset, 4 iters) lets the KV stream +
+    the dense-kernel per-forward tensors churn the glibc arena to ~40 GB at the
+    full unified model's scale (305 blocks × dim≈1600), while ``evict=True,
+    prune_interval=60`` holds the peak at ~4 GB.  Eviction is BYTE-EXACT for every
+    library program (verified full-trace equal to the word-width reference for
+    zfod / malloc_bump / memset / both memcmp branches).  ``_release_memory`` after
+    the run returns the freed arenas to the OS so the shared-process baseline stays
+    flat across the tests."""
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
     sparse, L = _sparse_model(code_size=len(instrs) + 2)
     try:
@@ -258,27 +257,11 @@ def _memset_then_readback(p, c, n, off):
 # ---------------------------------------------------------------------------
 # 4. memcmp: seed two byte buffers via SC, then run the memcmp loop through the
 #    model.  Covers BOTH branches — first-differing byte (returns a[i]-b[i]) and
-#    all-equal (loops to completion, returns 0).
-#
-#    memcmp is the DEEPEST looping subroutine (72-88 model steps).  The KV-cached
-#    driver over that many steps churns the glibc arena to a large TRANSIENT peak
-#    at the full unified model's scale (305 blocks × dim≈1600), well past the
-#    ~4 GB streaming-build budget — an inherent property of running a deep loop
-#    through the whole model, not a build-time blow-up.  The result is byte-exact
-#    (verified full-trace equal to the word-width reference, both branches), so
-#    these tests are GATED OPT-IN behind ``C4_LIB_NEURAL_HEAVY=1`` to keep the
-#    default suite (malloc/free/memset) within a modest transient footprint.  Run
-#    them explicitly with a box that has headroom:
-#        C4_LIB_NEURAL_HEAVY=1 OMP_NUM_THREADS=4 pytest -k memcmp <this file>
+#    all-equal (loops to completion, returns 0).  memcmp is the deepest looping
+#    subroutine (72-88 model steps); with cache eviction (the ``_run_neural``
+#    default) it holds the same ~4 GB peak as the straight-line routines and is
+#    byte-exact.
 # ---------------------------------------------------------------------------
-import pytest
-
-_HEAVY = pytest.mark.skipif(
-    os.environ.get("C4_LIB_NEURAL_HEAVY") != "1",
-    reason="memcmp neural runs a deep loop through the full model (large transient "
-           "RSS); set C4_LIB_NEURAL_HEAVY=1 to run")
-
-
 def _memcmp_prog(a_bytes, b_bytes):
     """Store ``a_bytes`` at ``pa`` and ``b_bytes`` at ``pb`` (byte stores), then
     emit_memcmp(pa, pb, n).  Self-contained: the neural memory holds the two
@@ -294,21 +277,19 @@ def _memcmp_prog(a_bytes, b_bytes):
     return a.instrs()
 
 
-@_HEAVY
 def test_memcmp_mismatch_neural():
     # a = [1, 5], b = [1, 2] -> first differs at index 1: 5 - 2 = 3.
     prog = _memcmp_prog([1, 5], [1, 2])
-    tr = _run_neural(prog, max_steps=300, evict=True)
+    tr = _run_neural(prog, max_steps=300)
     ref = _ref_ax_trace(prog)
     assert tr == ref, f"memcmp(mismatch) neural != reference\n  neural={tr}\n  ref={ref}"
     assert tr[-1] == 3, f"memcmp first-diff must be 5-2=3, got {tr[-1]}: {tr}"
 
 
-@_HEAVY
 def test_memcmp_equal_neural():
     # a == b -> the loop runs to completion and returns 0.
     prog = _memcmp_prog([7, 7], [7, 7])
-    tr = _run_neural(prog, max_steps=300, evict=True)
+    tr = _run_neural(prog, max_steps=300)
     ref = _ref_ax_trace(prog)
     assert tr == ref, f"memcmp(equal) neural != reference\n  neural={tr}\n  ref={ref}"
     assert tr[-1] == 0, f"memcmp equal must return 0, got {tr[-1]}: {tr}"
