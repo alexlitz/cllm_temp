@@ -13,8 +13,11 @@ These tests run the BAKED bytecode through the KV-cached sparse driver
 ``nibble_runtime.ref_interpret_words`` — the library's faithful oracle (SI/LI are
 32-bit words, matching the neural memory's 4-byte MEM_VAL cells).
 
-The model build is ~62 GB dense before the sparse conversion; it is memory-heavy.
-Run ONLY on a box with headroom (``free -g``), single-process, ``OMP_NUM_THREADS=4``.
+The dense build peaks at ~62 GB, so these tests use the memory-safe STREAMING
+sparse build (``build_lib_model_streaming``, ~4 GB peak) and run the driver with
+KV-cache eviction, which holds the whole 5-test suite at ~3.4 GB peak RSS (the
+un-evicted driver churns the glibc arena to tens of GB even for a short loop —
+see ``_run_neural``).  Run single-process with ``OMP_NUM_THREADS=4``.
 
 Run:
     OMP_NUM_THREADS=4 PYTHONPATH=<repo> python c4_min/test_nibble_runtime_neural.py
@@ -30,12 +33,12 @@ from c4_min import isa
 from c4_min import nibble_runtime as R
 
 
-# The KV-cached driver + dense-kernel sparse forward allocate large transient
-# CPU tensors per run; glibc's arena keeps those freed blocks resident, so the
-# process RSS high-water mark grows monotonically across the shared-model runs
-# (each byte-exact + cheap in isolation, but ~5 runs in one pytest process
-# accreted to >20 GB).  `malloc_trim(0)` returns the freed arena pages to the OS
-# between runs, so the per-run peak (~14 GB) stays flat instead of accumulating.
+# The KV-cached driver + dense-kernel sparse forward allocate transient CPU
+# tensors per step; glibc's arena keeps freed blocks resident, so the process RSS
+# high-water mark can drift up across the shared-model runs.  Cache eviction (the
+# ``_run_neural`` default) is what keeps the per-run peak bounded (~4 GB); this
+# `malloc_trim(0)` is the belt-and-braces companion that also returns the freed
+# arena pages to the OS BETWEEN runs, so the shared-process baseline stays flat.
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
 
 
