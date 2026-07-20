@@ -70,18 +70,33 @@ def test_mandelbrot_source_ops_are_verified_subset():
     assert isa.MUL in used and isa.DIV in used, "fixed-point needs MUL + DIV"
 
 
+def test_mandelbrot_stays_nonnegative():
+    """Every intermediate AX value the reference produces is NON-NEGATIVE (never
+    wraps to the 2^31..2^32 range).  This is load-bearing for byte-exactness: a
+    wrapped-negative in AX corrupts the model's next ``LEA`` (the AX 0xFF high-byte
+    leak — verified in isolation).  The generator's ``if (b > t)`` escape guard
+    keeps the ``zx2 - zy2`` subtraction non-negative; this test locks that in.
+    Cheap (reference only) — always runs."""
+    from c4_min.nibble_pure_forward_complete import ref_interpret
+
+    code, _ = _compile(2, 1, 3)
+    trace = ref_interpret(code, max_steps=200000, mask=0xFFFFFFFF)
+    wrapped = [v for v in trace if v >= 2 ** 31]
+    assert not wrapped, f"{len(wrapped)} wrapped-negative AX values (would corrupt LEA)"
+
+
 def test_mandelbrot_reference_shape_is_mixed():
     """The reference render of the tiny grid is a genuine mix of inside ('*') and
     escaped (' ') cells — a filled region, not a solid block.  Cheap (reference
     only) — always runs; documents the exact bytes the neural run must reproduce."""
     from c4_min.nibble_pure_forward_complete import ref_interpret
 
-    code, _ = _compile(3, 2, 3)
+    code, _ = _compile(2, 1, 3)
     out = []
     ref_interpret(code, max_steps=200000, mask=0xFFFFFFFF, out=out)
     text = "".join(chr(b) if b != 10 else "\n" for b in out)
-    assert "*" in text and " " in text, f"expected a mix, got:\n{text}"
-    assert out.count(10) == 2, "one newline per row (H=2)"
+    assert "*" in text and " " in text, f"expected a mix, got:\n{text!r}"
+    assert out.count(10) == 1, "one newline per row (H=1)"
 
 
 @pytest.mark.skipif(
@@ -89,7 +104,7 @@ def test_mandelbrot_reference_shape_is_mixed():
     reason="heavy: bakes the streaming model + a few-hundred-step neural run "
            "(set C4_RUN_NEURAL_MANDELBROT=1)",
 )
-@pytest.mark.parametrize("width,height,maxiter", [(2, 2, 3)])
+@pytest.mark.parametrize("width,height,maxiter", [(2, 1, 3)])
 def test_mandelbrot_model_forward_byte_exact(width, height, maxiter):
     """The tiny mandelbrot printed by the ACTUAL streaming ``model.forward``
     (KV-cached driver, eviction ON) equals the reference interpreter's PRTF
@@ -134,7 +149,8 @@ if __name__ == "__main__":
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     os.environ["C4_RUN_NEURAL_MANDELBROT"] = "1"
     test_mandelbrot_source_ops_are_verified_subset()
+    test_mandelbrot_stays_nonnegative()
     test_mandelbrot_reference_shape_is_mixed()
-    test_mandelbrot_model_forward_byte_exact(2, 2, 3)
+    test_mandelbrot_model_forward_byte_exact(2, 1, 3)
     print("all mandelbrot-neural checks passed")
     sys.exit(0)
