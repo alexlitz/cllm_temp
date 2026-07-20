@@ -660,6 +660,41 @@ def _cstr_from_mem(mem, addr: int, limit: int = 4096) -> str:
     return out.decode("latin-1")
 
 
+# The neural VM's LEA is an 8-BIT op: ``AX = (BP + 4*imm) & 0xFF`` (only BP's low
+# byte survives — see ``callconv_dispatch_rules`` in nibble_pure_forward_complete).
+# So FRAME-RELATIVE addressing (locals/params via LEA, which every non-leaf
+# corpus program uses) only round-trips through LI/SI if the whole call stack sits
+# in the LOW-256-BYTE window.  The driver's default ``SP_INIT = 0x10000`` puts the
+# stack at 0xFFFC downward, whose LEA byte-mask (0xFC) mismatches the 0xFFFC store
+# key -> frame desync.  Relocating SP_INIT into the byte window (0xF0) keeps every
+# frame address < 0x100, so the byte-masked LEA equals the full address and the
+# 32-bit memory CAM matches.  Proven 10/10 on the neural-ABI reference at SP=0xF0
+# with byte-masked LEA (vs 4/10 at 0x10000); the heap (0x20000) + data seg
+# (0x10000) are well above the byte window, so they never collide with the stack.
+_LOW_STACK_SP_INIT = 0xF0
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _low_stack_sp(sp_init: int = _LOW_STACK_SP_INIT):
+    """Temporarily relocate the drivers' ``SP_INIT`` into the low-byte window so
+    the neural VM's byte-masked LEA can address frame locals/params.  A
+    harness-level adapter (like :func:`_install_fileop_marshalling`) — patches the
+    imported ``SP_INIT`` name in the cached + complete driver modules, NOT the I/O
+    layer or the model.  The compiler's absolute data/heap addresses (>= 0x10000)
+    are unaffected."""
+    from . import nibble_pure_forward_cached as pfcache
+    from . import nibble_pure_forward_complete as pfc
+    saved = (pfcache.SP_INIT, pfc.SP_INIT)
+    pfcache.SP_INIT = sp_init
+    pfc.SP_INIT = sp_init
+    try:
+        yield
+    finally:
+        pfcache.SP_INIT, pfc.SP_INIT = saved
+
+
 # The streaming build's internal value-liveness pass overlays a built-in probe
 # battery whose longest program is 19 instructions; ``code_size`` MUST cover it
 # (the overlay indexes ``L.CODE_OP[k]`` for every probe instruction), so the
@@ -707,10 +742,12 @@ def run_model(entry: CorpusEntry, max_steps: int = 4000,
     (``lib_neural.build_lib_model_streaming``, ~4 GB peak, KV-cache eviction ON),
     and drives every VM step as one ``model.forward`` via the KV-cached driver
     (``run_pure_forward_cached``) at ``mask=0xFFFFFFFF`` (word-width memory, the
-    library's heap needs 32-bit addresses).  OPEN/READ/CLOS/PRTF cross the tool
-    boundary via the run's ``fio`` (the same ``FileRunner`` the chk1 tool-IO +
-    malloc tests use); PRTF varargs are marshalled off the KV store log by a
-    corpus-harness adapter (:func:`_install_prtf_marshalling`).
+    library's heap needs 32-bit addresses).  The call stack is relocated into the
+    low-byte window (:func:`_low_stack_sp`) so the neural VM's 8-bit LEA can
+    address frame locals/params.  OPEN/READ/CLOS/PRTF cross the tool boundary via
+    the run's ``fio`` (the same ``FileRunner`` the chk1 tool-IO + malloc tests
+    use); their args are marshalled off the KV store log in the compiler calling
+    convention by a corpus-harness adapter (:func:`_install_fileop_marshalling`).
 
     Returns the stdout the model produced (the ``FileRunner``'s formatted PRTF
     bytes) — the SAME byte-exact assertion as :func:`run_reference`.  Raises
@@ -741,7 +778,7 @@ def run_model(entry: CorpusEntry, max_steps: int = 4000,
         fs=FS.StubFilesystem(dict(entry.files)),
         stdin=FS.InputKVStream(entry.stdin)))
     try:
-        with _install_fileop_marshalling():
+        with _low_stack_sp(), _install_fileop_marshalling():
             run_pure_forward_cached(
                 sparse, L, instrs, max_steps=max_steps, mask=0xFFFFFFFF,
                 fio=fio, data_seg=_bytes_to_seg(data),
