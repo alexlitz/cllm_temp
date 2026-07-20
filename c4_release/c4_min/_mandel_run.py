@@ -16,7 +16,7 @@ def _rss_gb():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
 
 
-def run(width, height, maxiter, max_steps=200000):
+def run(width, height, maxiter, max_steps=200000, verbose=False):
     from src.compiler import compile_c
     from c4_min.run_1096_pure_forward import bytecode_to_isa
     from c4_min.nibble_pure_forward_complete import ref_interpret
@@ -46,10 +46,13 @@ def run(width, height, maxiter, max_steps=200000):
     print(f"build wall: {t_build:.1f}s  RSS after build: {_rss_gb():.2f} GB", flush=True)
 
     out, stats = [], {}
+    print(f"running {n_ref_steps} steps through model.forward ...", flush=True)
     t0 = time.time()
+    # verbose=True prints a per-step heartbeat (incl. bounded cache size) so a
+    # long run is observable; the driver flushes each line.
     run_pure_forward_cached(sparse, L, code, max_steps=n_ref_steps + 6,
                             mask=0xFFFFFFFF, evict=True, prune_interval=60,
-                            out=out, stats=stats, data_seg=data)
+                            out=out, stats=stats, data_seg=data, verbose=verbose)
     t_run = time.time() - t0
     n = stats.get("steps", 0)
 
@@ -75,5 +78,6 @@ if __name__ == "__main__":
     W = int(sys.argv[1]) if len(sys.argv) > 1 else 1
     H = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     MI = int(sys.argv[3]) if len(sys.argv) > 3 else 3
-    ok, *_ = run(W, H, MI)
+    VERB = "-v" in sys.argv
+    ok, *_ = run(W, H, MI, verbose=VERB)
     sys.exit(0 if ok else 1)
