@@ -194,6 +194,62 @@ def head_matrix(L, dim, out_band, halt_band=None):
     return W, b
 
 
+# The value-token vocabulary the exec-path requant snaps against. Every band in a
+# c4_min VM state holds a small NON-NEGATIVE integer between steps: register bytes
+# / stack cells are folded mod 256 (<=255); PC / SP / BP are word indices; the
+# one-hots are 0/1; and the DATA bands that carry a PACKED code word
+# (``op | imm<<8``) reach up to 0xFFFF. ``_REQUANT_VALVOCAB`` covers that whole
+# range with head-room, so the argmax snap is byte-identical to a nearest-integer
+# round for every state these paths ever produce (measured across the
+# malloc-bake/universal/handoff/compiler capstones: global min == -1.5e-5 fp
+# residue, max == 51201 — a packed-word DATA band).
+_REQUANT_VALVOCAB = 1 << 16
+# Chunk the value vocab so the argmax never materialises a dense [D, VALVOCAB]
+# logit tensor: streaming / memory-safe, keeps only a running best over blocks.
+_REQUANT_VOCAB_CHUNK = 4096
+
+
+def vanilla_requantize(state: torch.Tensor, one_band: int) -> torch.Tensor:
+    """Re-quantise every band of ``state`` to its exact integer via the VANILLA
+    LM-head argmax, then pin the constant ONE lane back to 1.0.
+
+    This is the SAME mechanism ``head_matrix`` bakes and ``recurrent``/``nibble_vm``
+    use on the token-emit path: ``argmax_v (2*v*x - v^2)`` over the value-token
+    vocab is a plain next-token argmax — a dot product of each residual band
+    against the value-token embeddings ``W[v] = 2*v`` with bias ``b[v] = -v^2``.
+    The argmax equals ``round(x)`` for x in ``[0, VALVOCAB)`` but is residue-IMMUNE
+    by construction (an argmax over discrete integer candidates), so it annihilates
+    the O(1e-5) SwiGLU fp residue WITHOUT ever calling ``torch.round`` /
+    ``torch.floor`` / ``torch.trunc``. Byte-identical to the old ``torch.round``
+    for every c4_min VM state (all bands are non-negative integer+residue in
+    ``[0, 0xFFFF]``). Idempotent on already-integer state.
+
+    Streams the vocab in ``_REQUANT_VOCAB_CHUNK`` blocks: never allocates a dense
+    ``[D, VALVOCAB]`` tensor — peak memory is ``O(D * chunk)`` regardless of vocab
+    size, so the packed-word paths stay memory-safe. The score dot-product is
+    evaluated in float64: at v ~ 0xFFFF the terms ``2*v*x`` / ``v^2`` reach ~8e9,
+    past float32's 24-bit exact-integer range, so a float32 argmax would land a few
+    tokens off on the large packed-word DATA bands (float64 keeps it exact).
+    """
+    x = state.detach() if state.requires_grad else state
+    dev, dt = x.device, x.dtype
+    xd = x.to(torch.float64)                                      # exact large-v score
+    # incumbent = value token v=0, whose score 2*0*x - 0^2 == 0 for every band.
+    best_tok = torch.zeros_like(xd)
+    best_score = torch.zeros_like(xd)
+    for lo in range(1, _REQUANT_VALVOCAB, _REQUANT_VOCAB_CHUNK):
+        hi = min(lo + _REQUANT_VOCAB_CHUNK, _REQUANT_VALVOCAB)
+        v = torch.arange(lo, hi, dtype=torch.float64, device=dev)  # [C]
+        logits = 2.0 * xd.unsqueeze(-1) * v - v * v                # [D, C]
+        chunk_score, chunk_arg = logits.max(dim=-1)               # [D]
+        take = chunk_score > best_score
+        best_score = torch.where(take, chunk_score, best_score)
+        best_tok = torch.where(take, v[chunk_arg], best_tok)
+    q = best_tok.to(dt)
+    q[one_band] = 1.0
+    return q
+
+
 def _load_head(model, L):
     """Bake the LM head reading OUT_0 (a concrete slot) as the stored head.
 
