@@ -455,7 +455,7 @@ def _count_format_args(fmt: str) -> int:
 
 
 # ===========================================================================
-# ENGINE: reference (now) | model (PENDING on #646).
+# ENGINE: reference (RefVM) | model (through the transformer, model.forward).
 # ===========================================================================
 def run_reference(entry: CorpusEntry, max_steps: int = 200000) -> str:
     """Compile the entry and run its bytecode on :class:`RefVM`; return stdout."""
@@ -466,26 +466,26 @@ def run_reference(entry: CorpusEntry, max_steps: int = 200000) -> str:
 
 class ModelEnginePending(RuntimeError):
     """Raised when the neural (model.forward) engine is requested but the runtime
-    library (#646, ``c4_min.nibble_runtime`` on the unified model) has not landed
-    in this checkout yet."""
+    library (``c4_min.nibble_runtime`` + ``c4_min.lib_neural`` on the unified
+    model) is not present in this checkout."""
 
 
 def lib_integrated() -> bool:
-    """True iff #646's runtime library — AND a stdout-capable neural model build —
+    """True iff the runtime library — AND a stdout-capable neural model build —
     are present in this checkout (i.e. the neural engine can actually run these
     stdout-producing programs).
 
-    #646 (branch ``lib-into-unified-model``) lands ``c4_min.nibble_runtime`` (the
-    baked malloc/free/memset/memcmp gadgets + the word-width oracle) and
-    ``c4_min.lib_neural.build_lib_model`` (the 32-bit-load-address model build).
-    We require BOTH modules before claiming the neural engine is runnable.
+    Requires ``c4_min.nibble_runtime`` (the baked malloc/free/memset/memcmp +
+    word-width oracle) and ``c4_min.lib_neural.build_lib_model_streaming`` (the
+    memory-safe 32-bit-load-address STREAMING model build).
     """
     try:
-        from . import nibble_runtime      # noqa: F401  (present only after #646)
+        from . import nibble_runtime      # noqa: F401  (baked lib gadgets)
         from . import lib_neural          # noqa: F401  (the 32-bit-addr model build)
     except Exception:
         return False
-    return True
+    return hasattr(getattr(__import__("c4_min.lib_neural", fromlist=["x"]),
+                           "build_lib_model_streaming", None), "__call__")
 
 
 def _bytes_to_seg(data: bytes) -> Dict[int, int]:
@@ -494,53 +494,243 @@ def _bytes_to_seg(data: bytes) -> Dict[int, int]:
     return {DATA_BASE + i: b for i, b in enumerate(data)}
 
 
-def run_model(entry: CorpusEntry, max_steps: int = 4000) -> str:
-    """PENDING on #646 — run the entry's bytecode THROUGH THE TRANSFORMER.
+# ---------------------------------------------------------------------------
+# ABI RETARGETING: src.compiler ABI -> the neural VM's ABI.
+#
+# ``src.compiler`` targets an 8-BYTE-slot, BYTE-OFFSET calling convention (SP
+# descends 8 per push; frame locals at BP-8/-16/...; params at BP+16/+24/...;
+# ENT/ADJ immediates are BYTE sizes).  The neural VM
+# (``nibble_pure_forward_complete.callconv_dispatch_rules``) uses a 4-BYTE-slot,
+# SLOT-COUNT convention (SP descends 4 per push; ENT reserves ``imm`` slots as
+# ``SP -= 4 + 4*imm``; ADJ is ``SP += 4*imm``; LEA is ``AX = BP + 4*imm``).
+#
+# The two ABIs map by ONE uniform rule — the frame-relative ops (LEA/ENT/ADJ)
+# carry a byte offset that is always a multiple of 8 (verified for the whole
+# corpus), and dividing it by 8 yields the neural slot count:
+#
+#   * local at compiler BP-8k  -> neural BP-4k   (LEA imm  -8k -> -k = off/8)
+#   * param at compiler BP+16+8i -> neural BP+8+4i (LEA imm 16+8i -> 2+i = off/8)
+#   * ENT  local-bytes 8*n  -> reserve n slots     (ENT imm 8n -> n = imm/8)
+#   * ADJ  arg-bytes  8*argc -> pop argc slots      (ADJ imm 8*argc -> argc = imm/8)
+#   * LEV  is self-consistent once JSR/ENT push the neural 4-byte frame.
+#
+# Every other op (IMM/PSH/JSR/BZ/BNZ/JMP branch targets = instruction indices,
+# LI/LC/SI/SC, the ALU, the file ops) is ABI-invariant and passes through.
+# ---------------------------------------------------------------------------
+_SLOT_SCALED_OPS = frozenset({LEA, ENT, ADJ})
 
-    Once #646 lands, this compiles the entry, builds the unified pure-forward
-    model with the runtime library on it (``lib_neural.build_lib_model``), runs
-    every VM step as one ``model.forward`` via ``run_pure_forward_complete`` with
-    a file-op context (so OPEN/READ/CLOS/PRTF cross the tool boundary), and
-    returns the PRTF stdout — the SAME byte-exact assertion as
-    :func:`run_reference`.  Until then it raises :class:`ModelEnginePending` so
-    callers report PENDING (never fake a pass).
 
-    NOTE (honest scope): #646's landed neural tests exercise the lib on the
-    AX-VALUE path (``run_pure_forward_cached`` at ``mask=0xFFFFFFFF``, checking the
-    returned AX trace for heap word round-trips).  This corpus additionally needs
-    the STDOUT path (PRTF + file IO via ``fio``).  The wiring below uses the
-    stdout-capable ``run_pure_forward_complete`` driver; if #646's
-    ``build_lib_model`` does not yet expose a PRTF-capable build, this raises
-    :class:`ModelEnginePending` with that reason rather than silently passing.
-    Memory: #646's dense build is ~62 GB before the sparse conversion — keep the
-    corpus SMALL and build the model per-program on demand.
+def retarget_to_neural_abi(instrs: List[Tuple[int, int]]) -> "List":
+    """Convert ``src.compiler`` (op, imm) tuples to neural-ABI :class:`isa.Instr`.
+
+    Divides the frame-relative LEA/ENT/ADJ byte immediates by the 8-byte compiler
+    slot to get the neural slot count (the neural VM re-scales by its 4-byte
+    slot).  Raises if a slot-scaled immediate is not a multiple of 8 (would mean
+    a half-slot offset the neural ABI cannot express)."""
+    from . import isa
+    out = []
+    for i, (op, imm) in enumerate(instrs):
+        if op in _SLOT_SCALED_OPS:
+            if imm % 8 != 0:
+                raise ValueError(
+                    f"instr {i} {isa.NAMES.get(op, op)} imm={imm} is not a "
+                    "multiple of the 8-byte compiler slot — cannot retarget to "
+                    "the 4-byte-slot neural ABI")
+            imm = imm // 8
+        out.append(isa.Instr(op, imm & 0xFFFFFFFF))
+    return out
+
+
+def _peek_fmt_ptr_and_args(mem, cur_sp: int, slot: int):
+    """Recover ``(fmt_ptr, args)`` for a compiler-ABI PRTF off the KV store log.
+
+    ``src.compiler`` pushes the fmt ptr FIRST then each vararg left-to-right, and
+    the stack descends, so at PRTF time the stack is (top->down)
+    ``last-arg ... first-arg, fmt_ptr`` — the fmt is the DEEPEST pushed slot and
+    the arg count is unknown up front.  We resolve the depth exactly as
+    :func:`_peek_fmt`/``RefVM._do_printf`` do on the reference VM: for each
+    candidate depth ``d`` (printf here has <=3 args), the value at ``cur_sp +
+    d*slot`` is a would-be fmt ptr; the CONSISTENT depth is the one whose fmt's
+    %-spec count == d.  Then fmt is at ``cur_sp + n_args*slot`` and arg k (call
+    order) at ``cur_sp + (n_args - 1 - k)*slot``."""
+    for d in range(0, 9):
+        cand = mem.load_int(cur_sp + d * slot, 4)
+        fmt = _cstr_from_mem(mem, cand)
+        if fmt and _count_format_args(fmt) == d:
+            n_args = d
+            fmt_ptr = cand
+            break
+    else:
+        # no-arg printf (fmt is the top of stack, spec count 0).
+        n_args = 0
+        fmt_ptr = mem.load_int(cur_sp, 4)
+    args = [mem.load_int(cur_sp + (n_args - 1 - k) * slot, 4)
+            for k in range(n_args)]
+    return fmt_ptr, args
+
+
+def _install_fileop_marshalling():
+    """Context manager that wraps ``nibble_filesys.dispatch_file_op_driver`` so
+    OPEN/READ/CLOS/PRTF marshal their args off the KV store log in the
+    ``src.compiler`` CALLING CONVENTION (all args PSHed left-to-right, then the op,
+    then a trailing ``ADJ argc``).
+
+    This is a CORPUS-HARNESS adapter, NOT a change to the I/O layer.  The base
+    ``nibble_filesys.dispatch_file_op`` uses the hand-assembled ``nibble_runtime``
+    convention (some args in AX / imm, the format popped from the TOP), whereas
+    ``src.compiler`` pushes EVERY arg onto the stack (leftmost deepest) and lets
+    the trailing ADJ reclaim them.  We therefore marshal each op's args off the
+    store log here and drive the SAME ``FileRunner`` + ``ToolCall`` protocol the
+    base path uses (identical stdout channel + READ byte re-entry), returning
+    ``(new_ax, new_sp, byte_stores)`` with SP UNCHANGED (the compiler's ADJ pops
+    the pushed args), byte-for-byte matching the base op's external effect.
+
+    Compiler stack layout at the op (top -> down), slot = 4 bytes:
+      * OPEN(name, flags): flags, name          -> name at cur_sp+slot
+      * READ(fd, buf, n)  : n, buf, fd          -> fd at cur_sp+2*slot
+      * CLOS(fd)          : fd                   -> fd at cur_sp
+      * PRTF(fmt, args...): last-arg..arg1, fmt  -> fmt deepest (see _peek_fmt)
+    """
+    import contextlib
+    from . import isa
+    from . import nibble_filesys as FS
+
+    orig = FS.dispatch_file_op_driver
+
+    def _wrapped(op, ax, imm, cur_sp, store_log, fio, data_seg=None, slot=4):
+        if op not in FS.FILE_OPCODES:
+            return orig(op, ax, imm, cur_sp, store_log, fio,
+                        data_seg=data_seg, slot=slot)
+        mem = FS.StoreLogMem(store_log, data_seg)
+
+        if op == isa.PRTF:
+            fmt_ptr, args = _peek_fmt_ptr_and_args(mem, cur_sp, slot)
+            fmt = _cstr_from_mem(mem, fmt_ptr)
+            strings = {str(a): _cstr_from_mem(mem, a) for a in args}
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.PRTF],
+                               {"fmt": fmt, "fmt_ptr": fmt_ptr, "args": args,
+                                "strings": strings})
+        elif op == isa.OPEN:
+            name_ptr = mem.load_int(cur_sp + 1 * slot, 4)   # under flags
+            path = _cstr_from_mem(mem, name_ptr)
+            flags = mem.load_int(cur_sp, 4)
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.OPEN],
+                               {"path": path, "name_ptr": name_ptr, "flags": flags})
+        elif op == isa.READ:
+            n = mem.load_int(cur_sp, 4)                     # top
+            buf = mem.load_int(cur_sp + 1 * slot, 4)
+            fd = mem.load_int(cur_sp + 2 * slot, 4)
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.READ],
+                               {"fd": fd, "buf": buf, "n": n})
+        else:  # CLOS
+            fd = mem.load_int(cur_sp, 4)
+            call = FS.ToolCall(fio._new_id(), FS.TOOL_TYPE[isa.CLOS], {"fd": fd})
+
+        fio.calls.append(call)
+        resp = fio.runner.handle(call)          # runner performs the real I/O
+        fio.runner.apply(call, resp, mem)       # logs the call; READ writes -> mem.pending
+        # SP is UNCHANGED: the compiler's trailing ADJ reclaims the pushed args.
+        return resp.result & 0xFFFFFFFF, cur_sp, list(mem.pending)
+
+    @contextlib.contextmanager
+    def _ctx():
+        FS.dispatch_file_op_driver = _wrapped
+        try:
+            yield
+        finally:
+            FS.dispatch_file_op_driver = orig
+    return _ctx()
+
+
+def _cstr_from_mem(mem, addr: int, limit: int = 4096) -> str:
+    """Read a NUL-terminated C string out of a ``StoreLogMem`` view."""
+    out = bytearray()
+    for i in range(limit):
+        b = mem.load_int(addr + i, 1) & 0xFF
+        if b == 0:
+            break
+        out.append(b)
+    return out.decode("latin-1")
+
+
+# Cross-program shared streaming model (built ONCE, grown monotonically), so the
+# neural corpus run does not rebuild the ~4 GB model per program.  A model built
+# at a LARGER code_size is byte-identical for a shorter program (proven for the
+# lib neural tests), so the shared oversize model serves every entry.
+_LIB_SPARSE = None
+_LIB_L = None
+_LIB_CODE_SIZE = 0
+
+
+def _lib_streaming_model(code_size: int):
+    """Build/grow the shared STREAMING lib model to fit ``code_size`` instrs.
+
+    Peak RSS is ~one streaming block (~4 GB), NOT the ~62 GB dense whole.  Frees
+    the old model before a (rare) grow so peak stays ~one build."""
+    global _LIB_SPARSE, _LIB_L, _LIB_CODE_SIZE
+    if _LIB_SPARSE is None or code_size > _LIB_CODE_SIZE:
+        from .lib_neural import build_lib_model_streaming
+        _LIB_SPARSE = _LIB_L = None              # free the old model first
+        import gc
+        gc.collect()
+        _LIB_SPARSE, _LIB_L, _ = build_lib_model_streaming(
+            code_size=code_size, recurrent_divmod=True, addr32=True)
+        _LIB_CODE_SIZE = code_size
+    return _LIB_SPARSE, _LIB_L
+
+
+def run_model(entry: CorpusEntry, max_steps: int = 4000,
+              evict: bool = True, prune_interval: int = 60,
+              shared: bool = True) -> str:
+    """Run the entry's bytecode THROUGH THE TRANSFORMER (``model.forward``).
+
+    Compiles the entry, RETARGETS it to the neural ABI
+    (:func:`retarget_to_neural_abi`), builds the memory-safe STREAMING lib model
+    (``lib_neural.build_lib_model_streaming``, ~4 GB peak, KV-cache eviction ON),
+    and drives every VM step as one ``model.forward`` via the KV-cached driver
+    (``run_pure_forward_cached``) at ``mask=0xFFFFFFFF`` (word-width memory, the
+    library's heap needs 32-bit addresses).  OPEN/READ/CLOS/PRTF cross the tool
+    boundary via the run's ``fio`` (the same ``FileRunner`` the chk1 tool-IO +
+    malloc tests use); PRTF varargs are marshalled off the KV store log by a
+    corpus-harness adapter (:func:`_install_prtf_marshalling`).
+
+    Returns the stdout the model produced (the ``FileRunner``'s formatted PRTF
+    bytes) — the SAME byte-exact assertion as :func:`run_reference`.  Raises
+    :class:`ModelEnginePending` if the lib/model build is not in this checkout.
+
+    ``shared`` reuses one grown model across programs (fast, memory-flat);
+    ``shared=False`` builds a fresh per-program model (isolation).
     """
     if not lib_integrated():
         raise ModelEnginePending(
-            "neural engine PENDING: #646 (c4_min.nibble_runtime + "
-            "c4_min.lib_neural on the unified model) is not in this checkout — "
-            "run with --engine reference")
+            "neural engine PENDING: c4_min.nibble_runtime + "
+            "c4_min.lib_neural.build_lib_model_streaming not in this checkout")
     from . import nibble_filesys as FS
-    from .lib_neural import build_lib_model            # type: ignore
-    from .nibble_pure_forward_complete import run_pure_forward_complete
+    from .nibble_pure_forward_cached import run_pure_forward_cached
 
-    instrs, data = compile_entry(entry)
-    try:
-        model, L = build_lib_model(code_size=len(instrs) + 2)
-    except TypeError as exc:  # signature drift once #646 lands
-        raise ModelEnginePending(
-            f"#646 build_lib_model signature differs ({exc}); wire the model "
-            "builder args here") from exc
+    raw_instrs, data = compile_entry(entry)
+    instrs = retarget_to_neural_abi(raw_instrs)
+
+    if shared:
+        sparse, L = _lib_streaming_model(len(instrs) + 2)
+    else:
+        from .lib_neural import build_lib_model_streaming
+        sparse, L, _ = build_lib_model_streaming(
+            code_size=len(instrs) + 2, recurrent_divmod=True, addr32=True)
+
     fio = FS.FileOpState(runner=FS.FileRunner(
         fs=FS.StubFilesystem(dict(entry.files)),
         stdin=FS.InputKVStream(entry.stdin)))
     try:
-        run_pure_forward_complete(
-            model, L, instrs, max_steps=max_steps, mask=0xFFFFFFFF,
-            fio=fio, data_seg=_bytes_to_seg(data))
+        with _install_fileop_marshalling():
+            run_pure_forward_cached(
+                sparse, L, instrs, max_steps=max_steps, mask=0xFFFFFFFF,
+                fio=fio, data_seg=_bytes_to_seg(data),
+                evict=evict, prune_interval=prune_interval)
     finally:
+        if not shared:
+            del sparse, L
         import gc
-        del model
         gc.collect()
     return bytes(fio.runner.stdout).decode("latin-1")
 
