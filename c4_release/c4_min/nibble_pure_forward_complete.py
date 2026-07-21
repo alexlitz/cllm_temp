@@ -119,6 +119,12 @@ class PureForwardCompleteLayout(PureForwardLayout):
         self.LEV_RET_VAL = self._scalar("LEV_RET_VAL")        # its scalar image
         self.AXB_LO = self._scalar("AXB_LO")                  # AX_VAL low nibble scratch
         self.AXB_HI = self._scalar("AXB_HI")                  # AX_VAL high nibble scratch
+        # LEA frame quantity = BP_low + 4*imm (SIGNED imm), computed EXACT-INTEGER from
+        # BP + IMM nibbles in ``compile_lea_q_reduce`` (no silu-recompose scalar residue)
+        # and kept in the SMALL signed range [-256,511] so the address decode fires few
+        # steps -- avoids the large-q GPU sparse accumulation error (the #680 deep-read-
+        # back miss).  The address decode takes its low byte via ``a & 0xFF``.
+        self.LEA_Q = self._scalar("LEA_Q")                    # signed BP_low+4*imm [-256,511]
         # FULL 32-bit IMM: the immediate's 8 nibbles are part of the STATIC program
         # encoding (CODE_IMM_NIB[i][j], written by the overlay from the bytecode —
         # a pure re-encoding of the constant, no runtime compute), gathered at PC
@@ -525,39 +531,98 @@ def compile_ax_nib_split(L, dim: int) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def compile_lea_q_reduce(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Compute the EXACT-INTEGER LEA frame quantity ``LEA_Q = BP_low + 4*imm`` (with a
+    SIGNED immediate) -- the producer for ``compile_lea_addr_nib`` (the #680
+    generalization fix).
+
+    Both parts are read as EXACT INTEGERS from the canonical NIBBLE bands (a pure
+    LINEAR read of the residual -- NO silu-recompose scalar residue, which is what
+    ``BP_LOW`` / ``IMM_CLEAN`` carried and drifted 4x across a cell boundary at a deep
+    read-back, #680):
+
+        LEA_Q = BP_nib0 + 16*BP_nib1                     (BP's low byte, [0,255])
+              + 4*IMM_NIB0 + 64*IMM_NIB1                 (|4*imm| low part)
+              - 1024*(IMM_NIB1 >= 8)                     (two's-complement SIGN: makes
+                                                          4*imm SIGNED so LEA_Q stays
+                                                          small, in [-256, 511])
+
+    The SIGN step ``(IMM_NIB1>=8)`` is a clean 0/1 of the exact-integer nibble (its silu
+    argument is bounded by ``RELU_S*7.5 = 1500``, so ``1024*silu(...) < 2^24`` is fp32-
+    EXACT -- no catastrophic-cancellation error, unlike a mod-256 subtraction whose
+    ``256 * silu(RELU_S*sum)`` overflows 2^24).  Keeping ``LEA_Q`` in the small signed
+    range means the downstream address decode fires only ~O(few-hundred) saturated silu
+    steps, so the GPU-sparse accumulation error (which made the wide-range/large-q
+    decode blend AXB_LO to a mid-nibble 11.5 -> byte 235 not 236 -> a0 lost) is
+    negligible.  SET (self-clears), gated on OP_IS[LEA] so ``LEA_Q`` is 0 on every
+    non-LEA op (byte-identical).
+
+    Units: 1 self-clear + 1 gated-sum + 2 for the sign step (a UNIT silu step pair)."""
+    g = L.OP_IS + isa.LEA
+    q = L.LEA_Q
+    spec = _empty_spec(dim, 1 + 1 + 2)
+    u = 0
+    # self-clear LEA_Q (SET) so recurrent steps are idempotent.
+    spec["W_up"][u, L.ONE] = S
+    spec["W_gate"][u, q] = 1.0
+    spec["W_down"][q, u] += -1.0 / SILU_S
+    u += 1
+    # LEA_Q += (BP_low + 4*imm low part), gated on LEA: the GATE carries the exact
+    # linear nibble sum; up ~ +S/2 on LEA (silu -> SILU_HALF via the -S/2 bias), ~ -S/2
+    # off-LEA (silu ~ 0) so LEA_Q stays 0 on non-LEA ops.
+    spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+    spec["W_gate"][u, L.BP + 0] = 1.0
+    spec["W_gate"][u, L.BP + 1] = 16.0
+    spec["W_gate"][u, L.IMM_NIB + 0] = 4.0
+    spec["W_gate"][u, L.IMM_NIB + 1] = 64.0
+    spec["W_down"][q, u] += 1.0 / SILU_HALF
+    u += 1
+    # SIGN: LEA_Q -= 1024*(IMM_NIB1 >= 8).  UNIT step silu(z)-silu(z-1) at edge 7.5 of
+    # the exact-integer nibble; gated on LEA (W_gate = g) so it is 0 on non-LEA ops.
+    for jj in range(2):
+        spec["W_up"][u, L.IMM_NIB + 1] = RELU_S
+        spec["W_up"][u, L.ONE] = -RELU_S * 7.5 - (0.0 if jj == 0 else 1.0)
+        spec["W_gate"][u, g] = 1.0
+        spec["W_down"][q, u] += (-1024.0 if jj == 0 else 1024.0)
+        u += 1
+    return spec
+
+
 def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
-    """LEA-ONLY, residue-immune frame-address nibbles.
+    """LEA-ONLY, residue-immune frame-address nibbles (the #648 + #680 fix).
 
     ``compile_ax_nib_split`` derives AXB_LO/AXB_HI from the SCALAR ``AX_VAL``.  On a
-    LEA the frame byte is ``(BP_LOW + 4*imm) mod 256``.  Two independent large-value
-    fp residues corrupt the naive path and surface only when the frame byte is
-    16-aligned (low nibble 0), so a malloc'd pointer stored to such a frame local is
-    read back from the wrong cell and lost (#648):
+    LEA the frame byte is ``(BP_low + 4*imm) mod 256``.  The naive scalar path is
+    corrupted by fp residues that surface when the frame byte is 16-aligned (a malloc'd
+    pointer stored to such a frame local is read back from the wrong cell and lost,
+    #648) OR sits NEXT TO a rounding edge (the self-emul matvec reads a0 from BP-2 =
+    addr 236 = 0xEC, adjacent to edge 235.5 -> decoded 235 -> a0 lost, #680):
 
-      (a) the dispatch SET ``AX_VAL += BP_LOW + 4*imm - AX_VAL_old`` is scaled by the
-          opcode gate ``k``; when the prior AX held a heap pointer (~131072) any
-          ``(1-k)`` leaves a residue ``(1-k)*AX_VAL_old`` > 0.5; and
-      (b) the fetched ``IMM`` scalar itself leaks a fraction of a NEARBY large literal
-          (e.g. ``IMM 0x20000``) through the imperfect PC one-hot, so ``IMM`` for a
-          ``LEA -1`` reads e.g. ``-1.026`` not ``-1``.
+      (a) the dispatch SET ``AX_VAL += BP_LOW + 4*imm - AX_VAL_old`` scaled by the
+          opcode gate leaves ``(1-k)*AX_VAL_old`` when the prior AX held a heap pointer;
+      (b) the ``IMM`` scalar leaks a fraction of a nearby large literal via the PC
+          one-hot; and (c) even ``IMM_CLEAN`` / ``BP_LOW`` (silu-recomposed scalars)
+          carry a sub-milli residue that, amplified 4x, drifts q across a cell boundary
+          at a DEEP read-back (matvec LEA -2 at BP=244: IMM_CLEAN=-1.988 -> q=236.05).
 
-    Fix: recompute the LEA byte here from ``q = BP_LOW + 4*imm`` with a
-    ROUND-TO-NEAREST integer decode -- cell ``a`` fires iff ``q in [a-0.5, a+0.5)``,
-    built from CLAMPED steps at the half-integer edges (each a
-    ``relu(RELU_S*(q-e)) - relu(RELU_S*(q-e)-1)`` saturating to a clean 0/1 since q is
-    never within ``1/RELU_S`` of a half-integer edge) -- which absorbs BOTH the ~0.1
-    IMM residue and any AXB slop, snapping ``q`` to the exact frame integer before
-    taking its low/high nibbles (mod 256).  OVERWRITES AXB_LO/AXB_HI, gated on
-    OP_IS[LEA] (0 on every non-LEA op -> byte-identical).  Runs AFTER ``ax-nib-split``
-    and BEFORE ``ax-byte-nib``.  ``4*imm`` handles a negative slot count exactly
-    (linear gate read)."""
+    Fix (#680 generalization): the frame byte is computed EXACT-INTEGER and REDUCED to
+    the SIGNED integer ``LEA_Q = BP_low + 4*imm`` upstream (``compile_lea_q_reduce``)
+    entirely from the canonical NIBBLE bands (a pure linear read, no silu-recompose
+    residue), so this block just does a nearest-integer decode of ``LEA_Q`` (taking the
+    low byte via ``a & 0xFF``).  Two reasons this GENERALIZES where the old path did not:
+      * INTEGER INPUT: ``LEA_Q`` is a true float32 integer, so every ``|LEA_Q - e|``
+        is EXACTLY >= 0.5 at a half-integer edge -> the clamp is a clean 0/1 (no residue
+        can cross the edge -- kills the #680 deep-read-back miss AT SOURCE); and
+      * SMALL q: the SIGNED immediate keeps ``LEA_Q`` in ``[-256, 511]`` (not the raw
+        two's-complement ~1260), so only ~O(few-hundred) saturated silu steps sum on the
+        GPU sparse path -- the accumulation error that grows with q (and blended AXB_LO
+        to a mid-nibble 11.5) stays negligible.
+    OVERWRITES AXB_LO/AXB_HI, gated on OP_IS[LEA] (0 on every non-LEA op ->
+    byte-identical).  Runs AFTER ``lea-q-reduce`` and BEFORE ``ax-byte-nib``."""
     g = L.OP_IS + isa.LEA
     axb_lo, axb_hi = L.AXB_LO, L.AXB_HI
+    q = L.LEA_Q                            # exact-integer signed frame qty in [-256, 511]
     q_lo, q_hi = -256, 512
-    # One CLAMPED step per half-integer edge e = a-0.5: s_e(q) = clamp(RELU_S*(q-e),0,1)
-    # = relu(RELU_S*(q-e)) - relu(RELU_S*(q-e)-1).  q is ~integer (|residue| < 0.1) and
-    # edges are half-integers, so q-e is always >= ~0.4 in magnitude -> the clamp is an
-    # exact 0/1 nearest-integer step.  Cell a = s_{a-0.5} - s_{a+0.5}.
     edges = [a - 0.5 for a in range(q_lo, q_hi + 1)]
     eu = {e: k for k, e in enumerate(edges)}
     n_edge = len(edges)
@@ -566,8 +631,8 @@ def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
     step0 = u
     for e in edges:                       # two relu units -> one clamped step per edge
         for j in range(2):
-            spec["W_up"][u, L.BP_LOW] = RELU_S
-            spec["W_up"][u, L.IMM] = 4.0 * RELU_S
+            # decode the EXACT-INTEGER LEA_Q (small range): cell a = s_{a-.5} - s_{a+.5}.
+            spec["W_up"][u, q] = RELU_S
             spec["b_up"][u] = -RELU_S * e - (0.0 if j == 0 else 1.0)
             spec["W_gate"][u, g] = 1.0    # gate on OP_IS[LEA] (0/1) so the step is
             u += 1                        # zero on non-LEA steps
@@ -811,10 +876,13 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("branch-delta", compile_branch_delta(L, dim)),
         ("fold-lea", _fold_ax_gated(L, dim, [isa.LEA])),  # LEA masks &0xFF; ALU 32-bit
         ("ax-nib-split", compile_ax_nib_split(L, dim)),   # AX_VAL byte -> AXB_LO/HI
-        # LEA frame address is residue-immune: recompute AXB_LO/HI from BP_LOW+4*imm
-        # directly (small integer), so a large prior AX (heap ptr) cannot round the
-        # frame byte to the wrong 16-aligned cell (#648).  LEA-gated; else no-op.
-        ("lea-addr-nib", compile_lea_addr_nib(L, dim)),
+        # LEA frame address is residue-immune (#648 + #680): the frame byte is computed
+        # EXACT-INTEGER + reduced to [0,256) from the BP/IMM NIBBLES (lea-q-reduce ->
+        # LEA_Q), then decoded in a TINY 256-cell range (lea-addr-nib) -> no fp residue
+        # can round the byte to the wrong 16-aligned/edge-adjacent cell, at any read-back
+        # depth.  LEA-gated; else no-op (LEA_Q stays 0, AXB untouched).
+        ("lea-q-reduce", compile_lea_q_reduce(L, dim)),   # LEA_Q = (BP_low+4*imm) mod 256
+        ("lea-addr-nib", compile_lea_addr_nib(L, dim)),   # AXB_LO/HI <- decode(LEA_Q)
         ("ax-byte-nib", compile_ax_byte_to_nibbles(L, dim, byte_ax_ops)),
         # FULL 32-bit IMM: overwrite ALL 8 AX nibbles with the fetched immediate
         # nibbles (the byte-nib block above only set nibbles 0,1) so literals > 255
