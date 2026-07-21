@@ -404,6 +404,9 @@ class VerifyResult:
     max_cache_size: int = 0
     total_evicted: int = 0
     decoded_final_ax: Optional[int] = None
+    peak_vram_gb: float = 0.0           # peak CUDA allocated during verify
+    evict_rounds: int = 0               # #(eviction sweeps) run over all blocks
+    effective_block_steps: int = 0      # smallest K actually run (after OOM backoff)
 
 
 def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
@@ -413,15 +416,17 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                   recency_eps: float = 1e-6, mask: int = 0xFFFFFFFF,
                   stats: Optional[dict] = None, fast: bool = True,
                   collect_out: Optional[List[int]] = None,
-                  block_moe: bool = False) -> VerifyResult:
+                  block_moe: bool = False,
+                  evict_interval_steps: Optional[int] = None,
+                  oom_backoff: bool = True,
+                  min_block_steps: int = 4) -> VerifyResult:
     """Verify the whole drafted stream on the SPARSE model in BLOCKS.
 
-    Processes ``block_steps`` VM steps per batched ``forward_hidden_cached``.  For
-    each block we forward the CONTIGUOUS token span covering those steps against
+    Processes ``block_steps`` (== K) VM steps per batched ``forward_hidden_cached``.
+    For each block we forward the CONTIGUOUS token span covering those steps against
     the growing per-block KV cache, decode the register state at each step-query
     row, and confirm it equals the draft's next-step registers.  Frozen frame rows
-    (all non-query rows of the span) are committed to the cache and pruned every
-    ``prune_interval`` tokens so VRAM stays flat over deep loops.  The first
+    (all non-query rows of the span) are committed to the cache.  The first
     mismatch aborts and is reported (a genuine fail: model argmax != draft).
 
     Because softmax1 is causal and each step-query row sits at the END of its own
@@ -429,6 +434,29 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     in the per-step 31-row window (every row it attends to — its frame + all
     earlier frozen frames — is present with the same K/V).  This is the
     speculative collapse: N one-step forwards -> a few batched forwards.
+
+    BIG-K + EVICTION-INTERVAL (2026-07-20).  ``block_steps`` may be cranked to
+    ~1000 (~30k tokens/forward): the whole program is drafted ahead (free) and
+    verified in the FEWEST, LARGEST batched forwards, so the per-forward Python /
+    dispatch / eviction overhead amortizes over K steps.  The K ceiling is the
+    attention score matrix ``[H, Sq, Sk]`` (Sq == K*30, Sk == cache+K*30) which
+    grows ~O(K^2) in VRAM; ``oom_backoff`` HALVES the block on a CUDA-OOM and
+    retries (so a caller can request a big K and the verifier finds the largest
+    span that fits, down to ``min_block_steps``).  The K vs VRAM curve is reported
+    in ``stats`` (``peak_vram_gb`` / ``effective_block_steps``).
+
+    ``evict_interval_steps`` (default None == once per verify block, tuned to the
+    block boundary) decouples the EVICTION cadence from the OLD per-``prune_interval``
+    -token trigger: eviction runs once per this many VM steps, at block boundaries.
+    This is the user's lever — with a big K it is ONE eviction ROUND per ~30k-token
+    block, ~250x fewer eviction rounds than the old per-120-token cadence, which is
+    the CPU wall (each round = 306 per-block GPU-decisions + host syncs).  Because a
+    block is one forward, this can only make eviction LESS frequent than per-block;
+    the WITHIN-block cache growth is bounded by K (the span), which — with the
+    O(K^2) score matrix — is what caps K via VRAM.  For a FLAT-cache program a
+    moderate K keeps the cache small and the OOM backoff finds the fitting K; for a
+    GROWING-heap program (malloc) the cache tracks the live heap regardless of K, so
+    K is genuinely cache-capped and the backoff finds the real ceiling.
     """
     n_blocks = len(model.blocks)
     H = model.blocks[0].attn.n_heads
@@ -439,9 +467,20 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     n_steps = draft.step_count
     forwards = 0
     accepted = 0
-    tokens_since_prune = 0
+    steps_since_evict = 0
+    # EVICTION cadence in VM STEPS (the user's lever).  Default: once per verify
+    # block (K steps).  The OLD ``prune_interval`` was a 120-TOKEN trigger that
+    # fired every ~4 steps regardless of K; ``evict_interval_steps`` fires at most
+    # once per this many steps, so a big-K block evicts ONCE at its boundary.
+    evict_every = (evict_interval_steps if evict_interval_steps is not None
+                   else block_steps)
+    evict_every = max(1, int(evict_every))
     max_seq = 1 + n_steps * V.FRAME_LEN
     max_cache = 0
+    evict_rounds = 0
+    peak_vram = 0
+    is_cuda = device.startswith("cuda")
+    min_k = max(1, int(min_block_steps))
     last_got_ax = None                      # the MODEL's decoded AX at the last step
     prtf_set = set(draft.prtf_steps or ())  # steps whose model AX is a PRTF byte
     # BLOCK-MoE divmod-skip: when block_moe and a whole block-verify span has NO
@@ -462,18 +501,23 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         _DM = {"DIV", "MOD"}
         divmod_step = [(draft.frames[s]["op"] in _DM) for s in range(n_steps)]
     dev = torch.device(device)
+    if is_cuda:
+        # Reset the peak so ``peak_vram_gb`` reflects THIS verify's largest span
+        # (the K-vs-VRAM datapoint), not any earlier allocation.
+        torch.cuda.reset_peak_memory_stats(dev)
     # O(1)-decode: build the row-invariant program-in-data vector ONCE (on the
     # embed's device/dtype so the broadcast-add is a device-resident op) instead of
     # re-writing the whole code into every span row each block.
     code_vec = (build_code_vec(code, L, model.embed.shape[1], dev,
                                dtype=model.embed.dtype) if fast else None)
 
-    step = 0
-    while step < n_steps:
-        end = min(step + block_steps, n_steps)
-        # The contiguous token span covering steps [step, end): from this block's
-        # first step-query row to the last frame's end.  Step 0's span starts at 0
-        # (it must include BOS + init frame, whose query row is win_starts[0]).
+    # --- one block-verify forward over steps [step, end) --------------------
+    # Returns (hidden, new_kv, span_start, S, blocks_run).  Raises
+    # torch.cuda.OutOfMemoryError (or RuntimeError with 'out of memory') so the
+    # caller can halve K and retry; the caches are NOT mutated here (commit happens
+    # after), so a retry is safe.  Block counts are RETURNED (not accumulated into
+    # the running totals) so an OOM-retried block is not double-counted.
+    def _forward_span(step, end):
         span_start = 0 if step == 0 else draft.win_starts[step]
         span_end = (draft.win_starts[end] + 1) if end < n_steps \
             else len(draft.tokens)
@@ -508,13 +552,87 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             if skip_range is not None:
                 hidden, new_kv = _forward_hidden_cached_skip(
                     model, x, past, q_positions, skip_range)
-                blocks_run_total += n_blocks - (skip_range[1] - skip_range[0])
+                blocks_run = n_blocks - (skip_range[1] - skip_range[0])
             else:
                 hidden, new_kv = model.forward_hidden_cached(
                     x, past_key_values=past, q_positions=q_positions, use_cache=True)
-                blocks_run_total += n_blocks
-            blocks_full_total += n_blocks
+                blocks_run = n_blocks
+        return hidden, new_kv, span_start, S, blocks_run
+
+    # --- commit the FROZEN (non-query) rows of the span to the caches --------
+    # A step's query row carries the all-ROLE query overlay (wrong K/V for a frozen
+    # context token), so we commit exactly the non-query rows — whose overlay IS the
+    # plain context overlay computed above.  The NEXT block's first window re-reads
+    # from the last query row's position (span_start), which we therefore leave
+    # un-cached until it is committed here as a frozen row of the current span.
+    def _commit_span(new_kv, span_start, S, step, end):
+        q_rows_in_span = {draft.win_starts[s] - span_start
+                          for s in range(step, end)}
+        keep = [p for p in range(S) if p not in q_rows_in_span]
+        if not keep:
+            return
+        keep_idx = torch.tensor(keep, device=dev, dtype=torch.long)
+        for b in range(n_blocks):
+            if new_kv[b] is None:
+                continue                    # block-MoE skipped block (identity
+                # attention -> its cache is never read, so a gap is harmless).
+            K_all, V_all, pos_all = new_kv[b]
+            K_span = K_all[:, :, -S:, :]
+            V_span = V_all[:, :, -S:, :]
+            pos_span = pos_all[-S:]
+            caches[b].commit(K_span[:, :, keep_idx, :],
+                             V_span[:, :, keep_idx, :],
+                             pos_span[keep_idx])
+
+    def _cache_sizes():
+        return [c.size() for c in caches]
+
+    def _rollback_caches(sizes):
+        # Truncate any PARTIAL commit back to the pre-block sizes so an OOM mid-way
+        # through the per-block commit loop leaves the caches in the clean pre-block
+        # state — the retry then re-commits from scratch at the smaller K.
+        for c, n0 in zip(caches, sizes):
+            n_now = c.size()
+            if n_now > n0 and c.K is not None:
+                c.K = c.K[:, :, :n0, :]
+                c.V = c.V[:, :, :n0, :]
+                c.pos = c.pos[:n0]
+
+    cur_k = int(block_steps)
+    eff_min_k = cur_k                       # smallest K actually run (OOM backoff)
+    step = 0
+    while step < n_steps:
+        end = min(step + cur_k, n_steps)
+        # OOM-adaptive block: run forward + commit; on CUDA-OOM (the K^2 score
+        # matrix or the commit concat overflowing VRAM) roll back any partial
+        # commit, HALVE K, empty the cache and retry the WHOLE block from the same
+        # step.  ``cur_k`` stays dropped so later blocks also fit — this is how a
+        # caller can request a big K and the verifier finds the largest span that
+        # fits (the K vs VRAM ceiling), down to ``min_block_steps``.
+        pre_sizes = _cache_sizes()
+        while True:
+            try:
+                hidden, new_kv, span_start, S, blk_run = _forward_span(step, end)
+                # commit INSIDE the retry so a commit-time OOM (the concat) also
+                # backs off; the query-row verify below allocates nothing.
+                _commit_span(new_kv, span_start, S, step, end)
+                if is_cuda:
+                    peak_vram = max(peak_vram, torch.cuda.max_memory_allocated(dev))
+                break
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                oom = ("out of memory" in str(e).lower()
+                       or isinstance(e, torch.cuda.OutOfMemoryError))
+                span_k = end - step
+                if not (oom_backoff and is_cuda and oom and span_k > min_k):
+                    raise
+                _rollback_caches(pre_sizes)
+                torch.cuda.empty_cache()
+                cur_k = max(min_k, span_k // 2)
+                end = min(step + cur_k, n_steps)
+                eff_min_k = min(eff_min_k, cur_k)
         forwards += 1
+        blocks_run_total += blk_run       # count only the SUCCEEDED block
+        blocks_full_total += n_blocks
 
         # decode + verify each step-query row of the block against the draft.
         for s in range(step, end):
@@ -540,11 +658,15 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             if bad:
                 cache_now = max(max_cache, caches[0].size())
                 evicted_now = sum(c.total_evicted for c in caches)
+                vram_gb = peak_vram / (1024 ** 3)
                 if stats is not None:
                     stats["max_seq_len"] = max_seq
                     stats["max_cache_size"] = cache_now
                     stats["total_evicted"] = evicted_now
                     stats["forwards"] = forwards
+                    stats["peak_vram_gb"] = vram_gb
+                    stats["evict_rounds"] = evict_rounds
+                    stats["effective_block_steps"] = eff_min_k
                 return VerifyResult(
                     accepted_steps=accepted, total_steps=n_steps,
                     all_matched=False, forwards=forwards,
@@ -555,7 +677,9 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                         "want": {"pc": want_pc, "ax": want_ax,
                                  "sp": want_sp, "bp": want_bp}},
                     max_seq_len=max_seq, max_cache_size=cache_now,
-                    total_evicted=evicted_now, decoded_final_ax=None)
+                    total_evicted=evicted_now, decoded_final_ax=None,
+                    peak_vram_gb=vram_gb, evict_rounds=evict_rounds,
+                    effective_block_steps=eff_min_k)
             accepted += 1
             if collect_out is not None and s in prtf_set:
                 # PRTF visible byte = the MODEL's decoded AX byte-0 at this row (a
@@ -565,48 +689,41 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             if s == n_steps - 1:
                 last_got_ax = got_ax & mask     # the model's actual final AX
 
-        # commit the FROZEN (non-query) rows of the span to the caches.  A step's
-        # query row carries the all-ROLE query overlay (wrong K/V for a frozen
-        # context token), so we commit exactly the non-query rows — whose overlay
-        # IS the plain context overlay computed above.  The NEXT block's first
-        # window re-reads from the last query row's position (span_start), which we
-        # therefore leave un-cached until it is committed here as a frozen row of
-        # the current span (it is a non-query row of THIS span).
-        q_rows_in_span = {draft.win_starts[s] - span_start
-                          for s in range(step, end)}
-        keep = [p for p in range(S) if p not in q_rows_in_span]
-        if keep:
-            keep_idx = torch.tensor(keep, device=dev, dtype=torch.long)
-            for b in range(n_blocks):
-                if new_kv[b] is None:
-                    continue                    # block-MoE skipped block (identity
-                    # attention -> its cache is never read, so a gap is harmless).
-                K_all, V_all, pos_all = new_kv[b]
-                K_span = K_all[:, :, -S:, :]
-                V_span = V_all[:, :, -S:, :]
-                pos_span = pos_all[-S:]
-                caches[b].commit(K_span[:, :, keep_idx, :],
-                                 V_span[:, :, keep_idx, :],
-                                 pos_span[keep_idx])
+        # (the FROZEN non-query rows were committed to the caches inside the
+        # OOM-guarded block above.)
         if device.startswith("cuda"):
             torch.cuda.synchronize(dev)
 
-        tokens_since_prune += (end - step) * V.FRAME_LEN
-        if evict and tokens_since_prune >= prune_interval:
+        # EVICTION-INTERVAL (user's lever): evict ONCE per ``evict_every`` VM steps
+        # (default: once per verify block).  Fires at the block boundary, so with a
+        # big K this is ONE eviction sweep per ~30k-token block — ~250x fewer
+        # eviction ROUNDS than the old per-120-token trigger, which is the CPU wall
+        # (each round is 306 per-block GPU-decisions + host syncs).  Note: because a
+        # block is one forward, this can only make eviction LESS frequent than
+        # per-block (evict_every > K prunes every ceil(evict_every/K) blocks); it
+        # does NOT prune within a big-K forward, so the within-block cache growth is
+        # bounded by K (the span), not by evict_every.
+        steps_since_evict += (end - step)
+        if evict and steps_since_evict >= evict_every:
             for b in range(n_blocks):
                 caches[b].evict(cos_threshold, prune_interval, zero_eps, recency_eps)
-            tokens_since_prune = 0
+            steps_since_evict = 0
+            evict_rounds += 1
         max_cache = max(max_cache, caches[0].size())
         step = end
 
     # the answer is the MODEL's decoded AX at the last step (verify PROVED it equals
     # the draft's, so this is the token-by-token autoregressive final byte).
     decoded_final = last_got_ax
+    vram_gb = peak_vram / (1024 ** 3)
     if stats is not None:
         stats["max_seq_len"] = max_seq
         stats["max_cache_size"] = max(max_cache, caches[0].size())
         stats["total_evicted"] = sum(c.total_evicted for c in caches)
         stats["forwards"] = forwards
+        stats["peak_vram_gb"] = vram_gb
+        stats["evict_rounds"] = evict_rounds
+        stats["effective_block_steps"] = eff_min_k
         # block-MoE accounting: total blocks executed vs the full-stack equivalent.
         stats["blocks_run"] = blocks_run_total
         stats["blocks_full"] = blocks_full_total
@@ -617,7 +734,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         all_matched=(accepted == n_steps), forwards=forwards,
         max_seq_len=max_seq, max_cache_size=max(max_cache, caches[0].size()),
         total_evicted=sum(c.total_evicted for c in caches),
-        decoded_final_ax=decoded_final)
+        decoded_final_ax=decoded_final, peak_vram_gb=vram_gb,
+        evict_rounds=evict_rounds, effective_block_steps=eff_min_k)
 
 
 # ===========================================================================
@@ -648,7 +766,10 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     evict: bool = True, prune_interval: int = 120,
                     mask: int = 0xFFFFFFFF, fast: bool = True,
                     block_moe: bool = False,
-                    collect_out: Optional[List[int]] = None) -> SpecResult:
+                    collect_out: Optional[List[int]] = None,
+                    evict_interval_steps: Optional[int] = None,
+                    oom_backoff: bool = True,
+                    min_block_steps: int = 4) -> SpecResult:
     """Full speculative decode of ONE pure-forward program.
 
     1) draft the whole stream with the reference VM (zero forwards);
@@ -658,6 +779,10 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
        expected.  A verify mismatch is a genuine FAIL (model argmax != draft),
        reported with the step/position.  A draft that never HALTs within
        ``max_steps`` is a TIMEOUT.
+
+    ``block_steps`` (== K), ``evict_interval_steps``, ``oom_backoff`` and
+    ``min_block_steps`` are passed straight to ``verify_blocks`` (see its docstring
+    for the big-K + eviction-interval levers).
     """
     exp = expected & 0xFFFFFFFF
     draft = draft_pf_program(code, max_steps=max_steps, mask=mask)
@@ -672,7 +797,9 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     vr = verify_blocks(model, L, code, draft, block_steps=block_steps,
                        device=device, evict=evict, prune_interval=prune_interval,
                        mask=mask, stats=stats, fast=fast, block_moe=block_moe,
-                       collect_out=collect_out)
+                       collect_out=collect_out,
+                       evict_interval_steps=evict_interval_steps,
+                       oom_backoff=oom_backoff, min_block_steps=min_block_steps)
     naive = draft.step_count
     speedup = (naive / vr.forwards) if vr.forwards else float("inf")
     if not vr.all_matched:

@@ -48,6 +48,63 @@ def _rss_gb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024)
 
 
+class _GpuUtilSampler:
+    """Poll ``nvidia-smi`` GPU utilisation in a background thread while a verify
+    runs, so the report has an honest GPU-busy number (before vs after big-K)."""
+
+    def __init__(self, device: str, interval: float = 0.25):
+        import threading
+        self._idx = 0
+        if ":" in device:
+            try:
+                self._idx = int(device.split(":")[1])
+            except ValueError:
+                self._idx = 0
+        self._interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self.samples: List[float] = []
+
+    def _poll(self) -> Optional[float]:
+        import subprocess
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=utilization.gpu",
+                 "--format=csv,noheader,nounits",
+                 f"--id={self._idx}"], stderr=subprocess.DEVNULL, timeout=2)
+            return float(out.decode().strip().splitlines()[0])
+        except Exception:
+            return None
+
+    def start(self):
+        import threading
+
+        def _run():
+            while not self._stop.wait(self._interval):
+                u = self._poll()
+                if u is not None:
+                    self.samples.append(u)
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+
+    @property
+    def mean(self) -> float:
+        return sum(self.samples) / len(self.samples) if self.samples else 0.0
+
+    @property
+    def max(self) -> float:
+        return max(self.samples) if self.samples else 0.0
+
+    @property
+    def n(self) -> int:
+        return len(self.samples)
+
+
 # ---------------------------------------------------------------------------
 # Program builders: (code, expected, data_seg, label).  ``expected`` is the
 # reference final AX (or None for I/O programs where the deliverable is stdout).
@@ -165,6 +222,121 @@ def _reference(code, data, max_steps):
     return ref_tr, ref_out
 
 
+def _free_vram_gb(device: str) -> float:
+    """Free VRAM on ``device`` (GB) via nvidia-smi (contention-aware; torch's own
+    mem_get_info can under-report other-process usage on a shared box)."""
+    import subprocess
+    idx = 0
+    if ":" in device:
+        try:
+            idx = int(device.split(":")[1])
+        except ValueError:
+            idx = 0
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free",
+             "--format=csv,noheader,nounits", f"--id={idx}"],
+            stderr=subprocess.DEVNULL, timeout=3)
+        return float(out.decode().strip().splitlines()[0]) / 1024.0
+    except Exception:
+        return 0.0
+
+
+def _wait_for_vram(device: str, min_free_gb: float, timeout_s: float) -> None:
+    """Block until ``device`` has ``min_free_gb`` free (or ``timeout_s`` elapses).
+    The box is multi-agent GPU-contended; this avoids a load-time OOM when another
+    process momentarily owns the card, without failing the run."""
+    if min_free_gb <= 0:
+        return
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        free = _free_vram_gb(device)
+        if free >= min_free_gb:
+            return
+        print(f"  [vram-wait] {device} free={free:.1f}GB < {min_free_gb:.1f}GB; "
+              f"waiting ({int(time.time()-t0)}s/{int(timeout_s)}s) ...", flush=True)
+        time.sleep(10)
+    print(f"  [vram-wait] proceeding after {int(timeout_s)}s "
+          f"(free={_free_vram_gb(device):.1f}GB); OOM-backoff will adapt K",
+          flush=True)
+
+
+def _run_k_sweep(sparse, L, code, draft, device, args) -> int:
+    """Sweep K over ``args.k_sweep`` on ONE built model + ONE draft; print the
+    K vs amortized-ms/step vs peak-VRAM vs forwards vs GPU-util table.  The draft
+    is byte-identical across K (K only changes how the SAME stream is verified),
+    so ``all_matched`` / final AX MUST be K-invariant — the byte-exact gate."""
+    import torch
+    from c4_min.pf_speculative import verify_blocks
+    ks = [int(x) for x in args.k_sweep.split(",") if x.strip()]
+    n_steps = draft.step_count
+    print(f"  === K-SWEEP over {ks} on {n_steps} steps "
+          f"(evict_interval_steps={args.evict_interval_steps or 'per-block'}, "
+          f"block_moe={args.block_moe}) ===", flush=True)
+    header = (f"    {'K':>6} {'forwards':>9} {'eff_K':>6} {'wall_s':>9} "
+              f"{'ms/step':>9} {'vram_GB':>8} {'cache':>7} {'evictR':>7} "
+              f"{'GPU%':>5} {'match':>6} {'AX':>6}")
+    print(header, flush=True)
+    print("    " + "-" * (len(header) - 4), flush=True)
+    ref_ax = None
+    ref_match = None
+    all_ok = True
+    for K in ks:
+        stats: dict = {}
+        out: List[int] = []
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+        sampler = _GpuUtilSampler(device) if args.gpu_util else None
+        if sampler:
+            sampler.start()
+        t = time.time()
+        try:
+            vr = verify_blocks(sparse, L, code, draft, block_steps=K, device=device,
+                               evict=(not args.no_evict), prune_interval=args.prune_interval,
+                               mask=0xFFFFFFFF, stats=stats, fast=True, collect_out=out,
+                               block_moe=args.block_moe,
+                               evict_interval_steps=args.evict_interval_steps,
+                               oom_backoff=True, min_block_steps=args.min_block_steps)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            # even the OOM-backoff floor (min_block_steps) did not fit — this K's
+            # span exceeds the available VRAM.  Record it (the real ceiling under
+            # this contention) and continue the sweep instead of aborting.
+            if sampler:
+                sampler.stop()
+            if device.startswith("cuda"):
+                gc.collect()
+                torch.cuda.empty_cache()
+            msg = "OOM" if "out of memory" in str(e).lower() else "ERR"
+            print(f"    {K:>6} {'-':>9} {'-':>6} {'-':>9} {'-':>9} "
+                  f"{'-':>8} {'-':>7} {'-':>7} {'-':>5} {msg:>6} {'-':>6}"
+                  f"   (K span did not fit even at min_block_steps)", flush=True)
+            continue
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        wall = time.time() - t
+        if sampler:
+            sampler.stop()
+        ms = wall / max(n_steps, 1) * 1000.0
+        gpu = sampler.mean if sampler else 0.0
+        ax = vr.decoded_final_ax
+        # K-invariance byte-exact gate: match/AX must be identical across all K.
+        if ref_ax is None:
+            ref_ax, ref_match = ax, vr.all_matched
+        elif ax != ref_ax or vr.all_matched != ref_match:
+            all_ok = False
+        print(f"    {K:>6} {vr.forwards:>9} "
+              f"{stats.get('effective_block_steps', K):>6} {wall:>9.2f} "
+              f"{ms:>9.2f} {stats.get('peak_vram_gb', 0.0):>8.2f} "
+              f"{stats.get('max_cache_size', 0):>7} "
+              f"{stats.get('evict_rounds', 0):>7} {gpu:>5.0f} "
+              f"{str(vr.all_matched):>6} {str(ax):>6}", flush=True)
+    print(f"    K-invariance (all completed K same match+AX): {all_ok}", flush=True)
+    print(f"  RSS peak: {_rss_gb():.2f} GB", flush=True)
+    return 0 if all_ok else 1
+
+
 def run_bench(kind: str, args) -> int:
     import c4_min.nibble_pure_forward as _PF
     import c4_min.nibble_pure_forward_complete as _PFC
@@ -235,8 +407,14 @@ def run_bench(kind: str, args) -> int:
     print(f"  build wall: {t_build:.1f}s  blocks={n_blocks}  "
           f"RSS after build: {_rss_gb():.2f} GB", flush=True)
     if device != "cpu":
+        _wait_for_vram(device, args.min_free_gb, args.wait_vram_s)
         sparse = sparse.to(device)
         print(f"  moved model to {device}", flush=True)
+
+    # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
+    #    (K vs amortized ms/step vs peak-VRAM vs forwards vs GPU-util). ---------
+    if args.k_sweep:
+        return _run_k_sweep(sparse, L, code, draft, device, args)
 
     # -- NAIVE baseline: measure per-step wall on a bounded prefix ------------
     naive_steps = min(args.naive_steps, draft.step_count)
@@ -268,30 +446,63 @@ def run_bench(kind: str, args) -> int:
     print(f"  naive-prefix AX == draft: {naive_ax_ok}", flush=True)
 
     # -- FAST path: whole-program draft + batched verify ---------------------
+    evict_iv = args.evict_interval_steps
     print(f"  FAST: verify {draft.step_count} steps in blocks of "
-          f"K={args.block_steps} (block_moe={args.block_moe}) ...", flush=True)
+          f"K={args.block_steps} (block_moe={args.block_moe}, "
+          f"evict_interval_steps={evict_iv if evict_iv is not None else 'per-block'}) "
+          f"...", flush=True)
     fast_out: List[int] = []
     fast_stats: dict = {}
     if device.startswith("cuda"):
         torch.cuda.synchronize()
+    # sample GPU util during the verify (a lightweight nvidia-smi poller thread).
+    util_sampler = _GpuUtilSampler(device) if args.gpu_util else None
+    if util_sampler:
+        util_sampler.start()
     t = time.time()
-    vr = verify_blocks(sparse, L, code, draft, block_steps=args.block_steps,
-                       device=device, evict=(not args.no_evict), prune_interval=args.prune_interval,
-                       mask=0xFFFFFFFF, stats=fast_stats, fast=True,
-                       collect_out=fast_out, block_moe=args.block_moe)
+    try:
+        vr = verify_blocks(sparse, L, code, draft, block_steps=args.block_steps,
+                           device=device, evict=(not args.no_evict), prune_interval=args.prune_interval,
+                           mask=0xFFFFFFFF, stats=fast_stats, fast=True,
+                           collect_out=fast_out, block_moe=args.block_moe,
+                           evict_interval_steps=evict_iv, oom_backoff=True,
+                           min_block_steps=args.min_block_steps)
+    except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+        if "out of memory" not in str(e).lower():
+            raise
+        if util_sampler:
+            util_sampler.stop()
+        gc.collect()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        print(f"  FAST: OOM even at min_block_steps={args.min_block_steps} "
+              f"(GPU too contended / span too large); retry with a smaller "
+              f"--block-steps or on a freer GPU. detail: {str(e).splitlines()[0]}",
+              flush=True)
+        del sparse
+        gc.collect()
+        return 3
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     t_fast = time.time() - t
+    if util_sampler:
+        util_sampler.stop()
     fast_per_step = t_fast / max(draft.step_count, 1)
     print(f"  FAST: {vr.forwards} forwards in {t_fast:.1f}s "
-          f"({t_fast/60:.2f} min) -> {fast_per_step*1000:.1f} ms/step-equiv  "
+          f"({t_fast/60:.2f} min) -> {fast_per_step*1000:.2f} ms/step-equiv  "
           f"| all_matched={vr.all_matched} accepted={vr.accepted_steps}/"
           f"{draft.step_count}", flush=True)
     print(f"  FAST: max_cache={fast_stats.get('max_cache_size')} "
-          f"evicted={fast_stats.get('total_evicted')}  "
-          f"blocks_run={fast_stats.get('blocks_run')} "
+          f"evicted={fast_stats.get('total_evicted')} "
+          f"evict_rounds={fast_stats.get('evict_rounds')} "
+          f"eff_K={fast_stats.get('effective_block_steps')} "
+          f"peak_vram={fast_stats.get('peak_vram_gb', 0.0):.2f}GB", flush=True)
+    print(f"  FAST: blocks_run={fast_stats.get('blocks_run')} "
           f"blocks_full={fast_stats.get('blocks_full')} "
           f"block_moe_speedup={fast_stats.get('block_moe_speedup', 1.0):.2f}x", flush=True)
+    if util_sampler:
+        print(f"  FAST: GPU util mean={util_sampler.mean:.0f}% "
+              f"max={util_sampler.max:.0f}% (n={util_sampler.n})", flush=True)
     if not vr.all_matched:
         print(f"  FAST FAIL: {vr.first_mismatch}", flush=True)
 
@@ -352,13 +563,30 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--device", type=str, default="cuda:0")
     ap.add_argument("--compute-mode", type=str, default="dense_kernel",
                     choices=["dense_kernel", "sparse_mm"])
-    ap.add_argument("--block-steps", type=int, default=64,
-                    help="K = VM steps verified per batched forward.")
+    ap.add_argument("--block-steps", type=int, default=256,
+                    help="K = VM steps verified per batched forward (cranked; the "
+                         "OOM-backoff halves it if a span overflows VRAM).")
     ap.add_argument("--block-moe", action="store_true",
                     help="skip the divmod block span on non-divmod spans.")
     ap.add_argument("--naive-steps", type=int, default=50,
                     help="how many naive steps to time for the per-step baseline.")
     ap.add_argument("--prune-interval", type=int, default=60)
+    ap.add_argument("--evict-interval-steps", type=int, default=None,
+                    help="evict once per this many VM steps (default: once per "
+                         "verify block).  The user's lever: with a big K this is "
+                         "one eviction sweep per ~30k-token block.")
+    ap.add_argument("--min-block-steps", type=int, default=4,
+                    help="OOM-backoff floor for K.")
+    ap.add_argument("--gpu-util", action="store_true",
+                    help="sample nvidia-smi GPU utilisation during the verify.")
+    ap.add_argument("--min-free-gb", type=float, default=6.0,
+                    help="wait until the GPU has this much free VRAM before loading "
+                         "the model (multi-agent-contention guard); 0 disables.")
+    ap.add_argument("--wait-vram-s", type=float, default=600.0,
+                    help="max seconds to wait for --min-free-gb before proceeding.")
+    ap.add_argument("--k-sweep", type=str, default=None,
+                    help="comma list of K values to sweep (e.g. 32,64,128,256,512,"
+                         "1000); prints a K vs ms/step vs VRAM vs forwards table.")
     ap.add_argument("--no-evict", action="store_true",
                     help="disable KV eviction (bounded VRAM off; larger cache).")
     ap.add_argument("--max-steps", type=int, default=5_000_000)
