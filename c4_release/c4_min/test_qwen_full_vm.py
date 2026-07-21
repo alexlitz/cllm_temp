@@ -168,6 +168,51 @@ def test_muldiv_through_qwen(op, a, b):
     assert r["exact"], r
 
 
+# -- MUL/DIV/MOD via the EFFICIENT ALU (nibble_alu32, NOT the lookup table) ----
+# The efficient ALU replaces the 256x256x3 table (intermediate ~160465 -> ~45 GB)
+# with the spec's genuine 32-bit fp32 FFN gadgets: byte MUL schoolbook + base-16
+# long division.  It trades that table WIDTH for DEPTH (MUL ~10 blocks, DIV/MOD ~262
+# long-division iterations); ``recurrent_divmod`` reuses ONE iteration-body layer 8x
+# (Qwen ``layers`` gets repeated module refs).  Built once per module (large model).
+@pytest.fixture(scope="module")
+def vm_efficient_recurrent():
+    return Q.build(code_size=16, subset=Q.SUBSET_MULDIV, efficient_alu=True,
+                   recurrent_divmod=True)
+
+
+def test_efficient_alu_is_not_the_lookup_table(vm_efficient_recurrent):
+    """The efficient ALU has NO 256x256 lookup table: intermediate is O(1e3), not the
+    ~160465 (45 GB) table width; and the recurrent divmod stores << the applied
+    layer count (one reused long-division iteration body)."""
+    vm = vm_efficient_recurrent
+    assert vm.efficient_alu
+    assert vm.intermediate_size < 5000              # NOT the ~160465 table wall
+    assert vm.n_applied > vm.n_layers               # recurrent: applies more than stored
+    from transformers.models.qwen2 import Qwen2Model
+    assert isinstance(vm.qmodel, Qwen2Model)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("op,a,b", [
+    ("MUL", 6, 7), ("MUL", 12, 12), ("MUL", 200, 3), ("MUL", 16, 16),
+    ("DIV", 84, 7), ("DIV", 100, 7), ("DIV", 5, 0),
+    ("MOD", 84, 5), ("MOD", 100, 7), ("MOD", 41, 42),
+])
+def test_efficient_muldiv_through_qwen(vm_efficient_recurrent, op, a, b):
+    """Efficient MUL/DIV/MOD is byte-exact vs isa.interpret (8-bit) AND 32-bit-exact
+    vs nibble_muldivmod, through the genuine Qwen2Model.forward.  The FULL 32-bit
+    result lives in the AX nibble band at the ALU-op step (the trailing HALT reads
+    the scalar AX_VAL, folded mod 256), so read the 32-bit value at the op step."""
+    from c4_min.nibble_muldivmod import mul32, divmod32, mod32
+    vm = vm_efficient_recurrent
+    prog = isa.assemble([("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)])
+    r = Q.run_program(vm, prog, max_steps=32, mask=0xFFFFFFFF)
+    got32 = r["ax_trace"][3]                     # index 3 = the ALU op (IMM;PSH;IMM;OP)
+    ref32 = {"MUL": mul32(a, b), "DIV": divmod32(a, b)[0], "MOD": mod32(a, b)}[op]
+    assert got32 == ref32, (op, a, b, got32, ref32)                  # 32-bit-exact
+    assert [v & 0xFF for v in r["ax_trace"]] == r["ref_trace"]       # 8-bit == isa
+
+
 # -- the compute really runs in the Qwen forward, not a python gadget --------
 def test_compute_is_in_the_qwen_forward(vm_base):
     """Zeroing the Qwen MLPs annihilates the result -> the arithmetic is Qwen's
