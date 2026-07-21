@@ -38,6 +38,8 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
+import os
+
 import torch
 
 from . import isa
@@ -53,6 +55,15 @@ from .nibble_pure_forward_complete import (
 )
 from .nibble_kv_prune import MultiHeadKVCache, KVCache
 from .blogspec_layout import NIB_PER_REG
+
+
+# Kill-switch / A-B bench baseline for the mechanism-1 near-dup selection.  When set
+# (``C4_KV_PRUNE_FULL_COSINE=1``) the batched prune uses the ORIGINAL full O(S^2)
+# cosine matmul + greedy over ALL rows instead of the two-tier exact-dedup +
+# cosine-on-representatives collapse.  Both give the BYTE-IDENTICAL survivor set
+# (test_kv_cache_equivalence); the flag exists only to (a) A-B benchmark the prune
+# speedup on identical hardware and (b) provide a byte-identical fallback.
+_KV_PRUNE_FULL_COSINE = os.environ.get("C4_KV_PRUNE_FULL_COSINE", "0") == "1"
 
 
 # ===========================================================================
@@ -308,6 +319,24 @@ def prune_keep_mask_head(keys: torch.Tensor, vals: torch.Tensor,
 # The per-group ``slope`` / ``dup_metric`` / ``content_addressed`` become PER-N
 # vectors, so a single call reproduces the exact per-group policy byte-for-byte.
 # ===========================================================================
+def _recency_rank(positions: torch.Tensor,
+                  valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The per-group recency ``rank`` (rank 0 = newest) used by the greedy near-dup
+    selection — matching ``_greedy_survivors_batched``'s stable reverse-sort exactly.
+
+    ``key = position*S - index`` encodes (position DESC, index ASC), so the argsort
+    of the argsort gives rank 0 to the newest (largest position; ties broken by the
+    smaller original index).  ``positions`` is ``[N,S]`` (or ``[S]``).
+    """
+    if positions.dim() == 1:
+        positions = positions.unsqueeze(0)
+    N, S = positions.shape
+    dev = positions.device
+    idx = torch.arange(S, device=dev)
+    order_key = positions.to(torch.int64) * S - idx.unsqueeze(0)       # [N,S]
+    return torch.argsort(torch.argsort(order_key, dim=1, descending=True), dim=1)
+
+
 def _greedy_survivors_batched(D: torch.Tensor,
                               positions: torch.Tensor) -> torch.Tensor:
     """Batched form of :func:`_greedy_survivors_from_dup_matrix`.
@@ -326,9 +355,7 @@ def _greedy_survivors_batched(D: torch.Tensor,
     """
     N, S, _ = D.shape
     dev = D.device
-    idx = torch.arange(S, device=dev)                                  # [S]
-    order_key = positions.to(torch.int64) * S - idx.unsqueeze(0)       # [N,S]
-    rank = torch.argsort(torch.argsort(order_key, dim=1, descending=True), dim=1)
+    rank = _recency_rank(positions.to(dev))
     # newer[n,e,f] = f strictly-newer than e (per group): rank[e] > rank[f]
     # (rank 0 = newest), matching ``_greedy_survivors_from_dup_matrix``.
     strictly_newer = rank.unsqueeze(2) > rank.unsqueeze(1)             # [N,S,S]
@@ -342,6 +369,190 @@ def _greedy_survivors_batched(D: torch.Tensor,
             return new_keep
         keep = new_keep
     return keep
+
+
+# ===========================================================================
+# TWO-TIER mechanism-1 (near-duplicate supersession) for the COSINE groups.
+#
+# THE INSIGHT (see docs/KV_PRUNE_TWO_TIER): the VM re-emits the SAME ~30
+# register/marker frame every step, so a register-marker head's cache is dominated
+# by EXACT-DUPLICATE keys — a role's key is ``W_k @ x`` and ``x`` is
+# position-free (ALiBi injects position only in the attention SCORE, never the
+# key), so the key of a given (role, value) content is BIT-IDENTICAL across the K
+# steps that emit it.  Over a K-step verify span (S ~= K*35 ~= 1680) each of the
+# ~30 distinct role/value keys appears ~K times verbatim.
+#
+# The old mechanism-1 ran the O(S^2) cosine matmul + O(S^2)-per-pass greedy fixpoint
+# on ALL S rows — the deep-loop eviction's dominant cost (~1.5 s / prune, 30-36% of
+# the fast wall, #683).  Two tiers make it O(S) for the dominant case:
+#
+#   TIER A (O(S) exact-duplicate collapse): sort each group's rows by key so
+#   verbatim-identical keys are adjacent, giving each row a per-group CLASS id.
+#   Only the NEWEST member of an exact-duplicate class can ever survive mechanism 1
+#   (an older exact-dup has cosine 1.0 > threshold with its newer twin, so the
+#   greedy drops it; and if the newer twin is itself dropped by an even-newer
+#   near-dup, that near-dup is cosine>thr with the older twin too — SAME key
+#   direction — so the older twin is dropped as well).  So collapse each class to
+#   its newest representative; every non-representative is dropped for FREE.
+#
+#   TIER B (cosine on the small residual): build the cosine near-dup matrix and run
+#   the greedy fixpoint ONLY over the S_unique representatives (~30, not ~1680),
+#   then scatter the per-representative keep decision back to its representative row.
+#   The final mechanism-1 survivors are ``is_representative AND cosine_greedy(repr)``.
+#
+# This is BYTE-IDENTICAL to ``_greedy_survivors_batched(D_cosine_full)`` (exact-dup
+# is a subset of cosine near-dup, and a class shares one representative's cosine
+# decision), proven in ``test_kv_cache_equivalence`` (720 + large + fused gates).
+# ===========================================================================
+def _mech1_cosine_survivors_dedup(keys: torch.Tensor, knorm: torch.Tensor,
+                                  positions: torch.Tensor, rank: torch.Tensor,
+                                  valid: torch.Tensor, cos_threshold: float):
+    """Mechanism-1 survivor mask ``[N,S]`` for the COSINE metric via the two-tier
+    exact-dedup + cosine-on-representatives collapse.  Byte-identical to
+    ``_greedy_survivors_batched((cosine>thr) & row_valid & ~eye, positions)``.
+
+    ``rank`` [N,S] is the recency rank (0 = newest) matching
+    ``_greedy_survivors_batched`` (``positions*S - idx`` argsorted).  Invalid
+    (padded) rows never survive and never partner.
+    """
+    N, S, HD = keys.shape
+    dev = keys.device
+
+    # -- TIER A: exact-duplicate classes per group (sort keys so equals adjacent) --
+    # A stable per-group lexicographic sort by the key VECTOR groups bit-identical rows
+    # together; each distinct key becomes a small integer CLASS id per group.
+    # Rows that must NEVER merge into an exact-dup class (each is its own singleton —
+    # kept by mechanism 1, dropped later by mech 2a/2b/3 if at all):
+    #   * INVALID (padded) rows — dead, must not partner a real row;
+    #   * ZERO-KEY rows — a zero key has cosine 0 with EVERYTHING (``unit`` is 0), so
+    #     the reference greedy never drops a zero-key row for near-dup, EVEN against
+    #     another zero-key row.  Collapsing all-zero keys into one class would wrongly
+    #     drop all but the newest.
+    force_unique = (~valid) | (knorm == 0)                                # [N,S]
+    # lexicographic sort over the HD key columns (round-trip stable): sort by the
+    # last column first ... first column last so equal-key rows end adjacent.
+    order = torch.arange(S, device=dev).unsqueeze(0).expand(N, S).clone()  # [N,S]
+    for c in range(HD - 1, -1, -1):
+        col = torch.gather(keys[..., c], 1, order)                         # [N,S]
+        s = torch.argsort(col, dim=1, stable=True)
+        order = torch.gather(order, 1, s)
+    # sorted keys per group
+    sorted_keys = torch.gather(
+        keys, 1, order.unsqueeze(-1).expand(N, S, HD))                     # [N,S,HD]
+    # class boundary: a sorted row starts a new class iff its key != previous row's.
+    new_class = torch.ones(N, S, dtype=torch.bool, device=dev)
+    if S > 1:
+        neq = (sorted_keys[:, 1:] != sorted_keys[:, :-1]).any(dim=-1)      # [N,S-1]
+        new_class[:, 1:] = neq
+    class_of_sorted = torch.cumsum(new_class.to(torch.int64), dim=1) - 1   # [N,S]
+    # scatter class id back to ORIGINAL row order
+    class_id = torch.empty(N, S, dtype=torch.int64, device=dev)
+    class_id.scatter_(1, order, class_of_sorted)                           # [N,S]
+    # override: each FORCE-UNIQUE row gets its OWN fresh class id (>= S, per-row
+    # distinct via the row index) so it never merges with any other row — HD- and
+    # value-independent (no float sentinel needed).
+    if bool(force_unique.any()):
+        fresh = S + torch.arange(S, device=dev, dtype=torch.int64).unsqueeze(0)
+        class_id = torch.where(force_unique, fresh, class_id)             # [N,S]
+
+    # representative of each class = the row with the MAX rank-newness (rank 0 =
+    # newest, so the SMALLEST rank value).  Find, per (group, class), the min rank.
+    NEG_RANK = S + 1
+    rank_masked = torch.where(valid, rank, torch.full_like(rank, NEG_RANK))
+    Cmax = 2 * S                                                           # class ids in [0,2S)
+    # min rank per class via scatter_reduce (amin): init to NEG_RANK
+    best_rank = torch.full((N, Cmax), NEG_RANK, dtype=rank.dtype, device=dev)
+    best_rank.scatter_reduce_(1, class_id, rank_masked, reduce="amin",
+                              include_self=True)
+    my_class_best = torch.gather(best_rank, 1, class_id)                   # [N,S]
+    is_repr = valid & (rank_masked == my_class_best)                      # [N,S] newest per class
+
+    # -- TIER B: cosine greedy ONLY among representatives -----------------------
+    # Restricting the cosine near-dup + greedy to representatives is exact: a dropped
+    # exact-dup makes the identical cosine decision as its representative, so the
+    # per-representative keep decision determines the whole class.  We COMPACT the
+    # representatives to the front and pad to ``R`` = max #reps across the batch, so
+    # the O(cache^2) cosine matmul + greedy fixpoint runs on ``[N, R, R]`` with
+    # ``R << S`` (the ~30 distinct role/value keys, NOT the ~1680-row span) — this is
+    # where the O(S^2) -> O(S) collapse actually lands.  On the deep loop R is a
+    # couple dozen while S is a whole K-step span, so the matmul shrinks ~(S/R)^2.
+    n_reps = is_repr.sum(dim=1)                                            # [N]
+    R = int(n_reps.max().item()) if N else 0
+    if R == 0:
+        return torch.zeros(N, S, dtype=torch.bool, device=dev)
+    # compact index: for each group, the ORIGINAL row index of its r-th representative
+    # (r in [0,R)); pad slots (a group with < R reps) stay invalid.  Non-rep rows are
+    # scattered to a THROWAWAY slot R (extra column) so they can never clobber a real
+    # representative's slot (a scatter with a duplicated destination index picks an
+    # arbitrary source — the earlier bug).
+    rep_rank = torch.cumsum(is_repr.to(torch.int64), dim=1) - 1            # [N,S] 0-based slot
+    comp_idx_full = torch.zeros(N, R + 1, dtype=torch.int64, device=dev)   # [N,R+1]
+    slot_valid_full = torch.zeros(N, R + 1, dtype=torch.bool, device=dev)
+    row_ids = torch.arange(S, device=dev).unsqueeze(0).expand(N, S)
+    throwaway = torch.full_like(rep_rank, R)
+    scat_slot = torch.where(is_repr, rep_rank, throwaway)                  # non-rep -> R
+    comp_idx_full.scatter_(1, scat_slot, row_ids)
+    slot_valid_full.scatter_(1, scat_slot, is_repr)
+    comp_idx = comp_idx_full[:, :R]                                        # drop throwaway
+    slot_valid = slot_valid_full[:, :R]
+    # gather the representatives' keys + positions into the compact [N,R,*] tensors.
+    safe = knorm.clamp(min=1e-30)
+    unit = keys / safe.unsqueeze(-1)
+    unit = torch.where((knorm == 0).unsqueeze(-1), torch.zeros_like(unit), unit)
+    unit_c = torch.gather(unit, 1, comp_idx.unsqueeze(-1).expand(N, R, HD))  # [N,R,HD]
+    unit_c = torch.where(slot_valid.unsqueeze(-1), unit_c,
+                         torch.zeros_like(unit_c))
+    pos_c = torch.gather(positions, 1, comp_idx)                          # [N,R]
+    # The compact cosine matrix ``[N,R,R]`` is the ONLY ``O(R^2)`` allocation.  When
+    # the batch barely collapses (R ~ S) this can be large, so chunk over N to a
+    # memory budget — the sort/gather above were bounded by ``S*HD`` (letting the
+    # CALLER pass a big N), and this keeps the ``R^2`` peak bounded regardless of R.
+    eye_R = ~torch.eye(R, dtype=torch.bool, device=dev).unsqueeze(0)
+    vv_all = slot_valid.unsqueeze(2) & slot_valid.unsqueeze(1)
+    chunkNr = max(1, _FUSED_EVICT_MAX_DIST_ELEMS // max(R * R, 1))
+    keep_c = torch.empty(N, R, dtype=torch.bool, device=dev)
+    for n0 in range(0, N, chunkNr):
+        n1 = min(n0 + chunkNr, N)
+        Dc = torch.matmul(unit_c[n0:n1],
+                          unit_c[n0:n1].transpose(1, 2)) > cos_threshold  # [c,R,R]
+        Dc = Dc & vv_all[n0:n1] & eye_R
+        keep_c[n0:n1] = _greedy_survivors_batched(Dc, pos_c[n0:n1]) \
+            & slot_valid[n0:n1]
+    # GATHER the per-representative keep decision back to the ORIGINAL rows: row e's
+    # keep flag is ``keep_c[rep_rank[e]]`` iff e is a representative (else False).
+    # (Gather — not scatter — so overlapping/padded slots can't clobber a real row.)
+    rep_slot = rep_rank.clamp(min=0, max=max(R - 1, 0))                   # [N,S]
+    keep_for_row = torch.gather(keep_c, 1, rep_slot)                      # [N,S]
+    survivors = is_repr & keep_for_row
+    return survivors
+
+
+def _mech1_full_cosine_survivors(keys, knorm, positions, valid, cos_threshold,
+                                 exact):
+    """The ORIGINAL mechanism-1: full O(S^2) cosine matmul (all rows) + the exact
+    (relative-L2 cdist) metric for content-addressed groups, then the greedy
+    newest-first fixpoint over the whole [N,S,S] near-dup matrix.  Retained only as
+    the ``C4_KV_PRUNE_FULL_COSINE=1`` A-B baseline / byte-identical fallback for the
+    two-tier path — same survivor set (test_kv_cache_equivalence)."""
+    N, S, HD = keys.shape
+    dev = keys.device
+    tol = 1.0 - cos_threshold
+    safe = knorm.clamp(min=1e-30)
+    unit = keys / safe.unsqueeze(-1)
+    unit = torch.where((knorm == 0).unsqueeze(-1), torch.zeros_like(unit), unit)
+    D = torch.matmul(unit, unit.transpose(1, 2)) > cos_threshold          # [N,S,S]
+    if bool(exact.any()):
+        ei = torch.nonzero(exact, as_tuple=False).flatten()
+        ke = keys[ei]
+        diff = torch.cdist(ke, ke,
+                           compute_mode="donot_use_mm_for_euclid_dist")
+        kne = knorm[ei]
+        denom = torch.maximum(kne.unsqueeze(2),
+                              kne.unsqueeze(1)).clamp(min=1e-30)
+        D[ei] = diff <= tol * denom
+    row_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
+    D = D & row_valid & ~torch.eye(S, dtype=torch.bool, device=dev).unsqueeze(0)
+    return _greedy_survivors_batched(D, positions) & valid
 
 
 def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
@@ -373,6 +584,8 @@ def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
     """
     N, S, HD = keys.shape
     dev = keys.device
+    if S == 0:
+        return torch.zeros(N, 0, dtype=torch.bool, device=dev)
     if positions.dim() == 1:
         positions = positions.unsqueeze(0).expand(N, S)               # broadcast [S]
     positions = positions.to(dev)
@@ -384,18 +597,31 @@ def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
     knorm = torch.where(valid, knorm, torch.zeros_like(knorm))
 
     # -- mechanism 1: near-duplicate supersession (per group, both metrics) -----
-    # COSINE groups (the register-marker heads — the MAJORITY): raw cosine >
-    # cos_threshold via a FAST matmul.  EXACT groups (content-addressed §Memory
-    # heads): relative-L2 ``|k_e-k_f| <= (1-cos)*max(|k_e|,|k_f|)`` via the ULP-exact
-    # ``donot_use_mm`` cdist — computed ONLY for the exact groups (a small subset),
-    # since that cdist is ~10x slower than the matmul and running it on every head
-    # was the deep-loop eviction's dominant cost.
-    tol = 1.0 - cos_threshold
-    safe = knorm.clamp(min=1e-30)
-    unit = keys / safe.unsqueeze(-1)
-    unit = torch.where((knorm == 0).unsqueeze(-1), torch.zeros_like(unit), unit)
-    D = torch.matmul(unit, unit.transpose(1, 2)) > cos_threshold      # [N,S,S] cosine
-    if bool(exact.any()):
+    # COSINE groups (the register-marker heads — the MAJORITY): the TWO-TIER
+    # exact-duplicate collapse + cosine-on-representatives
+    # (``_mech1_cosine_survivors_dedup``) — O(S) hashing/sort of the ~1680-row span
+    # down to the ~30 distinct role/value keys, then the O(R^2) cosine matmul + greedy
+    # on the tiny representative set (R << S).  This replaces the old O(S^2) full
+    # cosine matmul + O(S^2)-per-pass fixpoint that dominated the deep-loop eviction
+    # wall (#683).  Byte-identical survivor set (test_kv_cache_equivalence).
+    #
+    # EXACT groups (content-addressed §Memory heads — a SMALL subset): relative-L2
+    # ``|k_e-k_f| <= (1-cos)*max(|k_e|,|k_f|)`` via the ULP-exact ``donot_use_mm``
+    # cdist, computed ONLY over that subset (unchanged path — distinct heap addresses
+    # are NOT verbatim-equal, so the hash collapse would not help and the ULP-exact
+    # cdist is required for the address common-mode).
+    if _KV_PRUNE_FULL_COSINE:
+        # KILL-SWITCH (C4_KV_PRUNE_FULL_COSINE=1): the ORIGINAL full O(S^2) cosine
+        # matmul + greedy on ALL rows — kept as a byte-identical fallback / A-B bench
+        # baseline.  Same survivor set as the two-tier path (test_kv_cache_equivalence).
+        survivors = _mech1_full_cosine_survivors(
+            keys, knorm, positions, valid, cos_threshold, exact)
+    else:
+        rank_all = _recency_rank(positions, valid)                    # [N,S]
+        survivors = _mech1_cosine_survivors_dedup(
+            keys, knorm, positions, rank_all, valid, cos_threshold) & valid   # [N,S]
+    if (not _KV_PRUNE_FULL_COSINE) and bool(exact.any()):
+        tol = 1.0 - cos_threshold
         ei = torch.nonzero(exact, as_tuple=False).flatten()          # exact-group idx
         ke = keys[ei]                                                # [Ne,S,HD]
         diff = torch.cdist(ke, ke,
@@ -403,13 +629,14 @@ def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
         kne = knorm[ei]                                              # [Ne,S]
         denom = torch.maximum(kne.unsqueeze(2),
                               kne.unsqueeze(1)).clamp(min=1e-30)      # [Ne,S,S]
-        D[ei] = diff <= tol * denom
-    # padded rows can never be a near-dup partner (they are dead).
-    row_valid = valid.unsqueeze(2) & valid.unsqueeze(1)
-    D = D & row_valid
-    eye = torch.eye(S, dtype=torch.bool, device=dev).unsqueeze(0)
-    D = D & ~eye
-    survivors = _greedy_survivors_batched(D, positions) & valid       # [N,S]
+        De = diff <= tol * denom                                     # [Ne,S,S]
+        # padded rows can never be a near-dup partner (they are dead).
+        row_valid_e = valid[ei].unsqueeze(2) & valid[ei].unsqueeze(1)
+        De = De & row_valid_e
+        eye = torch.eye(S, dtype=torch.bool, device=dev).unsqueeze(0)
+        De = De & ~eye
+        surv_e = _greedy_survivors_batched(De, positions[ei]) & valid[ei]  # [Ne,S]
+        survivors[ei] = surv_e
 
     # -- mechanism 3: ALiBi-recency horizon (per-entry Cauchy-Schwarz bound) ----
     slope = slope.to(dev).to(torch.float64)
@@ -629,7 +856,19 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
         if S == 0:
             continue
         blk_chunk = max(1, _FUSED_EVICT_MAX_DIST_ELEMS // max(H * S * HD, 1))
-        chunkN = max(1, _FUSED_EVICT_MAX_DIST_ELEMS // max(S * S, 1))
+        # ``chunkN`` bounds the per-call near-dup pass.  The FULL-cosine path holds a
+        # ``[chunkN, S, S]`` matrix, so it is bounded by ``S*S``.  The DEFAULT two-tier
+        # path (``_mech1_cosine_survivors_dedup``) NEVER materialises ``[*, S, S]`` —
+        # its peak is the ``[chunkN, S, HD]`` sorted-key tensor + a tiny ``[chunkN,R,R]``
+        # representative matmul (R = #distinct keys << S) — so it is bounded by
+        # ``S*HD`` (HD=8), letting chunkN be ~S/8 * larger.  That collapses the number
+        # of per-chunk kernel launches (the 8-pass lexicographic sort ran once per
+        # tiny chunkN=24M/S^2 chunk before — hundreds of launches/round; now ~1), which
+        # is what makes the O(S)-hash tier's win actually land at deep-loop scale.
+        if _KV_PRUNE_FULL_COSINE:
+            chunkN = max(1, _FUSED_EVICT_MAX_DIST_ELEMS // max(S * S, 1))
+        else:
+            chunkN = max(1, _FUSED_EVICT_MAX_DIST_ELEMS // max(S * HD, 1))
         Ltot = len(blocks_S)
         # accumulate EVERY block's [S] keep-mask into ONE [Ltot,S] tensor so the
         # compaction is a SINGLE batched op (one nonzero) — not 306 per-block

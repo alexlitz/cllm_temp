@@ -185,6 +185,104 @@ def test_vectorized_prune_matches_reference_large_and_content_addressed():
     assert mism == 0, f"{mism}/{trials} large/content-addressed keep-set mismatches"
 
 
+def test_two_tier_mech1_dedup_matches_full_cosine():
+    """The TWO-TIER mechanism-1 (``_mech1_cosine_survivors_dedup``: O(S) exact-dup
+    hash/sort collapse + O(R^2) cosine-on-representatives) produces the BYTE-IDENTICAL
+    survivor set to the ORIGINAL full O(S^2) cosine matmul + greedy, over
+    exact-dup-heavy (register-frame) shapes AND the adversarial cases: near-cosine
+    (non-verbatim) partners, zero keys (cosine 0 with everything — must NOT collapse),
+    parallel-but-distinct protos (representative-vs-representative merges), and padded
+    (invalid) rows.  This is the byte-identity gate for the #683 prune speedup."""
+    from c4_min.nibble_pure_forward_cached import (
+        _greedy_survivors_batched, _mech1_cosine_survivors_dedup, _recency_rank)
+
+    def _full(keys, knorm, positions, valid, cos_thr):
+        N, S, HD = keys.shape
+        dev = keys.device
+        safe = knorm.clamp(min=1e-30)
+        unit = keys / safe.unsqueeze(-1)
+        unit = torch.where((knorm == 0).unsqueeze(-1), torch.zeros_like(unit), unit)
+        D = torch.matmul(unit, unit.transpose(1, 2)) > cos_thr
+        rv = valid.unsqueeze(2) & valid.unsqueeze(1)
+        D = D & rv & ~torch.eye(S, dtype=torch.bool, device=dev).unsqueeze(0)
+        return _greedy_survivors_batched(D, positions) & valid
+
+    torch.manual_seed(0)
+    cos_thr = 0.99
+    mism = 0
+    for it in range(400):
+        N = int(torch.randint(1, 6, (1,)))
+        S = int(torch.randint(1, 50, (1,)))
+        HD = 8
+        n_groups = int(torch.randint(1, min(S, 12) + 1, (1,)))
+        proto = torch.randn(n_groups, HD)
+        idx = torch.randint(0, n_groups, (N, S))
+        keys = proto[idx]                              # exact-dup heavy
+        if it % 3 == 0:                                # some near-cosine (not exact)
+            m = torch.rand(N, S, 1) < 0.2
+            keys = keys + m * (0.0005 * torch.randn(N, S, HD))
+        if it % 5 == 0 and n_groups > 1:               # parallel-but-distinct protos
+            p2 = proto.clone()
+            p2[1] = p2[0] * (1.0 + 0.001 * torch.randn(HD))
+            keys = torch.where((idx == 1).unsqueeze(-1), p2[idx.clamp(max=1)], keys)
+        keys[torch.rand(N, S) < 0.1] = 0.0             # zero keys
+        valid = torch.rand(N, S) > 0.15
+        valid[:, 0] = True
+        positions = (torch.arange(S).unsqueeze(0).expand(N, S)
+                     * int(torch.randint(1, 30, (1,)))).clone()
+        positions = positions + torch.randint(0, 3, (N, S))
+        knorm = keys.norm(dim=-1)
+        knorm = torch.where(valid, knorm, torch.zeros_like(knorm))
+        rank = _recency_rank(positions, valid)
+        ref = _full(keys, knorm, positions, valid, cos_thr)
+        got = _mech1_cosine_survivors_dedup(
+            keys, knorm, positions, rank, valid, cos_thr) & valid
+        if not torch.equal(ref, got):
+            mism += 1
+    assert mism == 0, f"{mism}/400 two-tier vs full-cosine mech-1 mismatches"
+
+
+def test_batched_prune_two_tier_matches_full_cosine_kill_switch():
+    """``prune_keep_mask_batched`` (default two-tier) == the ``C4_KV_PRUNE_FULL_COSINE``
+    kill-switch (original full O(S^2) path) end-to-end — same keep-mask through ALL
+    mechanisms (1/3/2a/2b), incl. EXACT (content-addressed) groups and padding."""
+    import c4_min.nibble_pure_forward_cached as m
+    torch.manual_seed(5)
+    HD = 8
+    scale = HD ** -0.5
+    mism = 0
+    for _ in range(30):
+        N = int(torch.randint(1, 20, (1,)))
+        S = int(torch.randint(2, 60, (1,)))
+        n_groups = int(torch.randint(1, min(S, 16) + 1, (1,)))
+        proto = torch.randn(N, n_groups, HD)
+        idx = torch.randint(0, n_groups, (N, S))
+        keys = torch.gather(proto, 1, idx.unsqueeze(-1).expand(N, S, HD)).clone()
+        # content-addressed (exact) groups: big common-mode bias -> distinct addrs.
+        exact = torch.rand(N) < 0.3
+        keys = keys + exact.view(N, 1, 1) * 8.0
+        keys[torch.rand(N, S) < 0.1] = 0.0
+        vals = torch.randn(N, S, HD)
+        vals[torch.rand(N, S) < 0.12] = 0.0
+        positions = torch.sort(torch.randint(0, 900, (N, S)), dim=1)[0]
+        valid = torch.rand(N, S) > 0.1
+        valid[:, 0] = True
+        slope = torch.full((N,), 0.25)
+        ca = exact.clone()
+        try:
+            m._KV_PRUNE_FULL_COSINE = False
+            new = m.prune_keep_mask_batched(keys, vals, positions, slope, scale,
+                                            0.99, 1e-9, 1e-6, exact, ca, valid=valid)
+            m._KV_PRUNE_FULL_COSINE = True
+            old = m.prune_keep_mask_batched(keys, vals, positions, slope, scale,
+                                            0.99, 1e-9, 1e-6, exact, ca, valid=valid)
+        finally:
+            m._KV_PRUNE_FULL_COSINE = False
+        if not torch.equal(new, old):
+            mism += 1
+    assert mism == 0, f"{mism}/30 two-tier vs full-cosine batched-prune mismatches"
+
+
 def test_fused_all_block_evict_matches_per_block():
     """The FUSED all-block eviction (``evict_all_blocks_fused`` +
     ``apply_keep_mask``) produces the BYTE-IDENTICAL survivor set (K/V/pos) to the
@@ -306,6 +404,8 @@ if __name__ == "__main__":
     test_uncached_forward_byte_identical()
     test_vectorized_prune_matches_reference()
     test_vectorized_prune_matches_reference_large_and_content_addressed()
+    test_two_tier_mech1_dedup_matches_full_cosine()
+    test_batched_prune_two_tier_matches_full_cosine_kill_switch()
     test_fused_all_block_evict_matches_per_block()
     test_driver_byte_identical_naive_incl_functions_and_eviction()
     print("all KV-cache equivalence tests passed")
