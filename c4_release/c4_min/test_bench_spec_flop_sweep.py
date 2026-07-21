@@ -120,3 +120,32 @@ def test_forward_isolated_util_climbs_with_B():
     # per-step time drops dramatically and dense-util climbs (overhead amortised).
     assert rB["ms_per_step"] < r1["ms_per_step"]
     assert rB["dense_util_pct"] > r1["dense_util_pct"] * 10
+
+
+# ---------------------------------------------------------------------------
+# The end-to-end sweep() runs both passes, keeps the full-driver pass BOUNDED
+# (byte-exact gate + Python-driver ceiling), and lets the forward-isolated pass
+# carry the K-to-VRAM curve.  This pins that structure.
+# ---------------------------------------------------------------------------
+@requires_cuda
+def test_sweep_end_to_end_bounded_driver_and_full_forward_curve():
+    res = BS.sweep(device=DEVICE, n_steps=200,
+                   ks=[1, 16, 64, 256, 1024],
+                   driver_steps=120, driver_max_k=64,
+                   warmup=1, iters=1)
+    # full-driver pass is CAPPED at driver_max_k (K=256/1024 excluded).
+    driver_ks = [r["K"] for r in res["rows"]]
+    assert driver_ks == [1, 16, 64], driver_ks
+    # every full-driver K is BYTE-EXACT (100%% acceptance — the whole point).
+    assert all(r["byte_exact"] for r in res["rows"]),         "full-driver decode diverged from the reference at some K"
+    # forward-isolated pass carries the FULL K list (VRAM permitting).
+    fwd_bs = [r["B"] for r in res["forward_rows"]]
+    assert fwd_bs[:5] == [1, 16, 64, 256, 1024], fwd_bs
+    # and shows the overhead-bound speedup: bigger B is faster per step + more util.
+    f1 = next(r for r in res["forward_rows"] if r["B"] == 1)
+    f1024 = next(r for r in res["forward_rows"] if r["B"] == 1024)
+    assert f1024["ms_per_step"] < f1["ms_per_step"]
+    assert f1024["speedup"] > 10.0
+    assert f1024["dense_util_pct"] > f1["dense_util_pct"] * 5
+    # the sparse/dense FLOP split is the ~31,000x sparsity ratio.
+    assert res["tot"] / res["nz"] > 1000
