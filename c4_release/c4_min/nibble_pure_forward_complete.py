@@ -59,7 +59,8 @@ from .blogspec_model import Transformer
 from . import nibble_pure_forward as PF
 from .nibble_pure_forward import (
     PureForwardLayout, N_ROLES, bake_frame_ingest, _bake_pf_memory_head,
-    compile_opcode_decode_pf, compile_cmp_compute, cmp_dispatch_rules,
+    compile_opcode_decode_pf, compile_cmp_compute, compile_cmp_signed_finalize,
+    cmp_dispatch_rules,
     compile_mem_prep, memory_dispatch_rules, MEM_HEAD_CHANNELS,
     _address_bits, _FRAME_ROLE_SLOTS, _MEM_MARKER_LOCAL,
     _MEM_ADDR_LOCAL, _MEM_VAL_LOCAL, SP_INIT, _flag_from_ops, _concat_specs,
@@ -835,6 +836,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("lev-addr4", _force_bit2(L, L.LEV_QRY_BIN, dim)),       # LEV_QRY_BIN += 4
         ("stack-pop-cam", compile_stk_recompose(L, dim)),        # ATTN=stack+lev heads
         ("cmp-compute", compile_cmp_compute(L, dim)),
+        ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),
         ("alu-expand", A.compile_expand(L, dim)),
     ]
     for name, spec in A.compile_addsub_blocks(L, dim):
@@ -1094,9 +1096,18 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
             else:
                 ax = (v >> ax) & 0xFF
         elif op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE):
-            v = mem.get(sp, 0) & 0xFF; sp += 4
-            r = {isa.EQ: v == ax, isa.NE: v != ax, isa.LT: v < ax,
-                 isa.GT: v > ax, isa.LE: v <= ax, isa.GE: v >= ax}[op]
+            # C4's ordering comparisons (LT/GT/LE/GE) are SIGNED two's-complement
+            # on the 32-bit word (sign bit 31 — matching the neural model, whose
+            # signed-compare gadget uses a FIXED 2^31 sign boundary); EQ/NE are
+            # bit-equality (sign-agnostic).  Operands are read at the value width
+            # ``mask``: under the 8-bit fold they are < 2^31, so the sign bit is
+            # never set and the comparison is the unsigned byte order (unchanged);
+            # under the 32-bit proof a genuine negative has bit 31 set.
+            v = mem.get(sp, 0) & mask; av = ax & mask
+            sv = v - (1 << 32) if v & (1 << 31) else v      # signed 32-bit STK
+            sax = av - (1 << 32) if av & (1 << 31) else av  # signed 32-bit AX
+            r = {isa.EQ: v == av, isa.NE: v != av, isa.LT: sv < sax,
+                 isa.GT: sv > sax, isa.LE: sv <= sax, isa.GE: sv >= sax}[op]
             ax = 1 if r else 0
         elif op in (isa.LI, isa.LC):
             ax = mem.get(ax, 0) & 0xFF

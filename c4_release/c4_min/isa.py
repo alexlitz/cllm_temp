@@ -143,6 +143,13 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
         elif op == NE:
             ax = 1 if pop() != ax else 0
         elif op == LT:
+            # C4's ordering comparisons are SIGNED, but the neural model's signed
+            # gadget uses the 32-bit word's sign bit (2^31).  In this 8-bit slice
+            # every value is masked to [0,255] < 2^31, so the sign bit is never set
+            # and the SIGNED order coincides with the unsigned byte order — kept as
+            # a plain unsigned compare so this reference matches the model at the
+            # 8-bit fold (32-bit signed is exercised via ``ref_interpret`` /
+            # ``C4_VM_WIDTH32``).
             ax = 1 if pop() < ax else 0
         elif op == GT:
             ax = 1 if pop() > ax else 0

@@ -129,9 +129,17 @@ class PureForwardLayout(NibbleVMLayout):
         self.IS_STORE = self._scalar("IS_STORE")
         self.IS_LOAD = self._scalar("IS_LOAD")
         # CMP result scratch lanes (computed ungated from d = STK - AX each step).
+        # GT/LT are SIGNED (two's-complement, C4-faithful): the magnitude order is
+        # corrected by the two operands' sign bits so cross-sign pairs compare
+        # correctly (see ``compile_cmp_compute`` + ``compile_cmp_signed_finalize``).
         self.CMP_EQ = self._scalar("CMP_EQ")     # 1 iff STK == AX
-        self.CMP_GT = self._scalar("CMP_GT")     # 1 iff STK  > AX
-        self.CMP_LT = self._scalar("CMP_LT")     # 1 iff STK  < AX
+        self.CMP_GT = self._scalar("CMP_GT")     # 1 iff STK  > AX (SIGNED, final)
+        self.CMP_LT = self._scalar("CMP_LT")     # 1 iff STK  < AX (SIGNED, final)
+        # signed-compare intermediates (cmp-compute writes; cmp-finalize consumes).
+        self.MAG_GT = self._scalar("MAG_GT")     # UNSIGNED (STK>AX), raw ramp
+        self.MAG_LT = self._scalar("MAG_LT")     # UNSIGNED (STK<AX), raw ramp
+        self.SGN_STK = self._scalar("SGN_STK")   # 1 iff STK bit31 set (negative)
+        self.SGN_AX = self._scalar("SGN_AX")     # 1 iff AX  bit31 set (negative)
         # 8-bit MUL/DIV/MOD table operand one-hots + result lane.
         self.MDM_A_OH = self._band("MDM_A_OH", 256)
         self.MDM_B_OH = self._band("MDM_B_OH", 256)
@@ -467,12 +475,53 @@ CMP_OPS = [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE]
 
 
 def compile_cmp_compute(L, dim: int) -> Dict[str, torch.Tensor]:
-    """Ungated: CMP_EQ = (d==0), CMP_GT = (d>=1), CMP_LT = (-d>=1) where
-    d = STK_VAL - AX_VAL ∈ [-255,255]. Each is an integer-exact ramp; self-clears
-    the 3 lanes first (SET)."""
-    spec = _empty_spec(dim, 3 + 3 + 2 + 2)   # 3 clears + EQ(3 z-units) + GT(2) + LT(2)
+    """Ungated comparison PRIMITIVES from STK_VAL / AX_VAL each step (a companion
+    ``compile_cmp_signed_finalize`` block turns them into the SIGNED verdict):
+
+      CMP_EQ = (STK == AX)                       (sign-agnostic; final)
+      MAG_GT = (STK > AX)   as UNSIGNED magnitudes (raw ramp)
+      MAG_LT = (STK < AX)   as UNSIGNED magnitudes (raw ramp)
+      SGN_STK / SGN_AX = the operands' 32-bit sign bit (bit 31)
+
+    The value lanes hold the UNSIGNED magnitude of the two's-complement WORD
+    (nibbles recompose to Σ 16^j·nib_j ≥ 0), so the magnitude difference
+    ``d = STK_VAL - AX_VAL`` orders the operands correctly ONLY when they share a
+    sign.  C4's ``int`` is 32-bit and LT/GT/LE/GE are SIGNED; the finalize block
+    reconstructs the signed verdict from these primitives:
+
+        signed_GT = clamp01(MAG_GT) + (SGN_AX - SGN_STK)
+        signed_LT = clamp01(MAG_LT) + (SGN_STK - SGN_AX)
+
+    (derivation: the naive ``same_sign·mag ± cross_sign`` products cancel to this
+    linear correction, which flips exactly the two cross-sign cases and leaves
+    same-sign pairs unchanged; the result is always exactly 0 or 1).
+
+    ``sign(v)`` = clamped ``step(nib7 >= 8)`` on the value's TOP NIBBLE (nibble 7 of
+    the register nibble band), written to its OWN ``SGN_*`` dim.  The nibble is a
+    SMALL operand (0..15), so the step's threshold (``7.5``) and silu intermediates
+    are tiny and fp-EXACT — reading the sign from the ~2^31 recomposed SCALAR instead
+    would need a ``-RELU_S·(2^31-0.5)`` bias that is not fp32-representable (the specs
+    are built fp32, then cast fp64), corrupting the threshold; the nibble sidesteps
+    that.  ``MAG_GT``/``MAG_LT`` are the raw ``step(d)`` ramps and can read NOISY when
+    ``|d| ≈ 2^32`` (a cross-sign pair, where two ~2^32-scale relus cancel imperfectly
+    under the recompose's ~4-unit fp error) — the finalize block ``clamp01``s them
+    (relu(m) - relu(m-1)) so a noisy ~95 collapses to the correct unsigned 1, then
+    applies the sign correction.
+
+    Under the DEFAULT 8-bit fold the recompose/ingest carry only nibbles 0..4, so
+    nibble 7 is always 0, ``SGN_*`` are 0, ``MAG_*`` never exceed the 8-bit range (no
+    noise), and the finalize's ``clamp01(MAG) + 0`` is BYTE-IDENTICAL to the pre-fix
+    unsigned ``CMP_GT``/``CMP_LT`` (no 8-bit-corpus regression).  Under
+    ``C4_VM_WIDTH32`` a genuine two's-complement negative has nibble 7 >= 8, so the
+    correction fires and LT/GT/LE/GE become gcc-exact signed."""
+    SIGN_NIB = 7                         # top nibble of the 32-bit word (bit 28..31)
+    stk_sign_nib = L.STACK0 + SIGN_NIB   # STK top nibble (>= 8 iff STK negative)
+    ax_sign_nib = L.AX + SIGN_NIB        # AX top nibble  (>= 8 iff AX  negative)
+    W = 0.2                              # clamp-ramp width (matches compile_fold)
+    # 5 clears + EQ(3) + MAG_GT(2) + MAG_LT(2) + SGN_STK(2) + SGN_AX(2)
+    spec = _empty_spec(dim, 5 + 3 + 2 + 2 + 2 + 2)
     u = 0
-    for lane in (L.CMP_EQ, L.CMP_GT, L.CMP_LT):     # self-clear (SET)
+    for lane in (L.CMP_EQ, L.MAG_GT, L.MAG_LT, L.SGN_STK, L.SGN_AX):  # self-clear
         spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
         spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
     # EQ = Z(d): the §584 finite-2nd-difference silu bump (peak 1 at d==0).
@@ -483,16 +532,58 @@ def compile_cmp_compute(L, dim: int) -> Dict[str, torch.Tensor]:
         spec["b_up"][u] += bias
         spec["W_gate"][u, L.ONE] = 1.0
         spec["W_down"][L.CMP_EQ, u] += w / k; u += 1
-    # GT = step(d >= 1) = relu(d) - relu(d-1)  (integer d).
+    # MAG_GT = step(d >= 1) = relu(d) - relu(d-1)  (integer d), UNSIGNED.
     for idx, thr in enumerate((0.0, 1.0)):
         spec["W_up"][u, L.STK_VAL] += RELU_S; spec["W_up"][u, L.AX_VAL] += -RELU_S
         spec["b_up"][u] += -RELU_S * thr; spec["W_gate"][u, L.ONE] = 1.0
-        spec["W_down"][L.CMP_GT, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
-    # LT = step(-d >= 1).
+        spec["W_down"][L.MAG_GT, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
+    # MAG_LT = step(-d >= 1), UNSIGNED.
     for idx, thr in enumerate((0.0, 1.0)):
         spec["W_up"][u, L.AX_VAL] += RELU_S; spec["W_up"][u, L.STK_VAL] += -RELU_S
         spec["b_up"][u] += -RELU_S * thr; spec["W_gate"][u, L.ONE] = 1.0
-        spec["W_down"][L.CMP_LT, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
+        spec["W_down"][L.MAG_LT, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
+    # SGN_STK / SGN_AX = clamped step(nib7 >= 8) on the SMALL top nibble, each into
+    # its OWN dim (fp-exact: tiny threshold, no 2^31-scale bias).
+    lo = 7.5
+    for sign_nib, sgn_lane in ((stk_sign_nib, L.SGN_STK), (ax_sign_nib, L.SGN_AX)):
+        for idx, thr in enumerate((lo, lo + W)):
+            spec["W_up"][u, sign_nib] += RELU_S
+            spec["b_up"][u] += -RELU_S * thr
+            spec["W_gate"][u, L.ONE] = 1.0
+            spec["W_down"][sgn_lane, u] += (1.0 if idx == 0 else -1.0) / (RELU_S * W)
+            u += 1
+    return spec
+
+
+def compile_cmp_signed_finalize(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Combine the ``compile_cmp_compute`` primitives into the SIGNED verdict:
+
+        CMP_GT = clamp01(MAG_GT) + (SGN_AX - SGN_STK)
+        CMP_LT = clamp01(MAG_LT) + (SGN_STK - SGN_AX)
+
+    ``clamp01(m) = relu(m) - relu(m-1)`` collapses a NOISY cross-sign magnitude
+    ramp (~95, from the ~2^32-scale relu cancellation) to the correct unsigned 0/1
+    while leaving a clean same-sign 0/1 unchanged; the ``SGN_AX - SGN_STK`` term is
+    0 for same-sign pairs and ±1 across a sign boundary, so the sum is exactly the
+    signed verdict (0 or 1).  SET (self-clears CMP_GT/CMP_LT first)."""
+    spec = _empty_spec(dim, 2 + 2 + 2 + 2 + 2)  # 2 clears + clamp_GT(2)+clamp_LT(2)+sgn(2+2)
+    u = 0
+    for lane in (L.CMP_GT, L.CMP_LT):           # self-clear (SET)
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
+        spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
+    # clamp01(MAG_GT) = relu(MAG_GT) - relu(MAG_GT - 1)  -> CMP_GT
+    for dst, mag in ((L.CMP_GT, L.MAG_GT), (L.CMP_LT, L.MAG_LT)):
+        for idx, thr in enumerate((0.0, 1.0)):
+            spec["W_up"][u, mag] += RELU_S; spec["b_up"][u] += -RELU_S * thr
+            spec["W_gate"][u, L.ONE] = 1.0
+            spec["W_down"][dst, u] += (1.0 if idx == 0 else -1.0) / RELU_S; u += 1
+    # sign correction: +SGN_AX - SGN_STK -> CMP_GT ; +SGN_STK - SGN_AX -> CMP_LT.
+    # SGN_* are already clean 0/1, so a silu-identity read routes them verbatim.
+    for sgn, gt_c, lt_c in ((L.SGN_AX, +1.0, -1.0), (L.SGN_STK, -1.0, +1.0)):
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, sgn] = 1.0
+        spec["W_down"][L.CMP_GT, u] += gt_c / SILU_S
+        spec["W_down"][L.CMP_LT, u] += lt_c / SILU_S
+        u += 1
     return spec
 
 
@@ -608,7 +699,10 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
             ("mem-cam",  compile_nibble_to_scalar(L, dim)),       # ATTN=CAM; FFN: refresh AX_VAL
         ]
     if include_cmp:
-        block_specs += [("cmp-compute", compile_cmp_compute(L, dim))]  # CMP_EQ/GT/LT
+        block_specs += [
+            ("cmp-compute", compile_cmp_compute(L, dim)),        # MAG/SGN primitives
+            ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),  # signed CMP_GT/LT
+        ]
     if include_muldiv:
         from .nibble_unified import compile_mdm_expand, compile_mdm_select
         block_specs += [("mdm-expand", compile_mdm_expand(L, dim)),

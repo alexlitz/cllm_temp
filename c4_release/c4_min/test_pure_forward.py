@@ -11,6 +11,9 @@ Run:  OMP_NUM_THREADS=4 PYTHONPATH=$(pwd) python -m pytest c4_min/test_pure_forw
 """
 from __future__ import annotations
 
+import os
+
+import pytest
 import torch
 
 from c4_min import isa
@@ -166,6 +169,56 @@ def test_cmp_family_pure_forward():
         code = isa.assemble(_push_op(a, b, op))
         trace = assert_no_python_compute(run_pure_forward, model, L, code)
         assert trace == isa.interpret(code), (op, a, b, trace, isa.interpret(code))
+
+
+def test_cmp_signed_gadget_two_complement():
+    """The signed-compare gadget (``compile_cmp_compute`` + the clamp/sign-correct
+    ``compile_cmp_signed_finalize``) yields the SIGNED (two's-complement, bit 31)
+    LT/GT/LE/GE verdict — the #673 fix.  Feeds the two FFN blocks the 32-bit value
+    lanes (magnitudes) + the register NIBBLE bands (which carry the sign bit), incl.
+    the cross-sign case where the recompose leaves the scalar noisy near 2^32, and
+    checks every op against Python's SIGNED order.  Runs in fp64 (the width-32
+    substrate) — pure gadget algebra, no full-model round-trip (the lite pure-forward
+    model's single-slot frame is 8-bit and cannot carry a 32-bit stack value; this
+    isolates the CMP weights the production model shares byte-for-byte)."""
+    from .nibble_pure_forward import (
+        PureForwardLayout, compile_cmp_compute, compile_cmp_signed_finalize)
+    from .blogspec_model import FFN
+    from .blogspec_layout import NIB_PER_REG
+    from c4_min import blogspec_vocab as _V
+
+    L = PureForwardLayout(code_size=12, n_heads=21)
+    dim = L.D
+
+    def _mk(spec):
+        f = FFN(dim, spec["W_up"].shape[0]).double()
+        with torch.no_grad():
+            for kk in ("W_up", "b_up", "W_gate", "b_gate", "W_down", "b_down"):
+                getattr(f, kk).copy_(spec[kk].double())
+        return f
+
+    f1, f2 = _mk(compile_cmp_compute(L, dim)), _mk(compile_cmp_signed_finalize(L, dim))
+
+    def verdict(a, b):
+        """Run the two-block gadget on signed 32-bit a (STK) vs b (AX)."""
+        stk, ax = a & 0xFFFFFFFF, b & 0xFFFFFFFF
+        x = torch.zeros(1, 1, dim, dtype=torch.float64)
+        x[0, 0, L.ONE] = 1.0
+        x[0, 0, L.STK_VAL] = float(stk); x[0, 0, L.AX_VAL] = float(ax)
+        for j, nv in enumerate(_V.nibbles_of_value(stk, NIB_PER_REG)):
+            x[0, 0, L.STACK0 + j] = float(nv)
+        for j, nv in enumerate(_V.nibbles_of_value(ax, NIB_PER_REG)):
+            x[0, 0, L.AX + j] = float(nv)
+        y = f2(f1(x))[0, 0].detach()
+        return round(float(y[L.CMP_LT])), round(float(y[L.CMP_GT])), round(float(y[L.CMP_EQ]))
+
+    pairs = [(-10, 5), (5, -10), (-3, 0), (0, -3), (-3, -5), (-5, -3),
+             (-1, -2), (7, -3), (-3, 7), (100, -100), (3, 7), (7, 3), (5, 5),
+             (-2147483648, 0), (0, -2147483648), (2147483647, -1)]
+    for a, b in pairs:
+        lt, gt, eq = verdict(a, b)
+        assert (lt, gt, eq) == (int(a < b), int(a > b), int(a == b)), \
+            (a, b, "got LT/GT/EQ", lt, gt, eq)
 
 
 def test_bitwise_family_pure_forward():
