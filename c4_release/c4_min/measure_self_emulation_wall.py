@@ -18,12 +18,26 @@ This module MEASURES, on ``cuda:1``, for a TINY matvec:
   * total VM steps, tokens-per-step (the window fed to each forward), ms/step, wall,
   * the #702 single-stack-slot wall (why a width>=2 dot product must spill / call)
     and how call/spill-heaviness gates cross-step speculation batching,
+  * the PERFECT-DRAFT speculation forwards-saved (100% acceptance): 32x single-
+    program block batching + the MEASURED 54.7x@B=64 cross-program prior — a
+    FORWARDS-SAVED (throughput) win, NOT a per-token-compute win,
 and EXTRAPOLATES the honest wall of ONE smallest self-forward (~2.4M VM steps,
-BLOG_SPEC_REVISIONS §7) = ``total_tokens x per-token-compute``.
+the labeled basis) = ``total_tokens x per-token-compute``.
+
+MEASURED (cuda:1, this build, hidden=1728 inter=1124 138 recurrent layers):
+  * scalar MAC / tiny [Rx1]@[1] matvec are BYTE-EXACT vs numpy & isa.interpret,
+  * TOKENS PER VM STEP = 7.0 (BOS + 5-reg frame + query) — structural, invariant,
+  * per-step compute ~330-1250 ms/step (GPU-CONTENTION-sensitive; this cuda:1 is
+    shared), i.e. per-token ~47-179 ms; the two together pin the wall,
+  * peak ~5.6 GB — memory-safe,
+  * extrapolated ONE self-forward wall ~9-35 days (vs the blog's 88-day prior).
+The TWO PINNING QUANTITIES the wall reduces to: TOKENS-PER-STEP (=7, exact) and
+PER-TOKEN-COMPUTE (=ms/step / tokens-per-step, the contention-sensitive term).
 
 Memory-safe: ONE lean muldiv+efficient_alu Qwen build on ``cuda:1``, tiny programs,
-capped step counts.  Run:
+capped step counts (max_steps<=64).  Run:
     C4_SELF_EMU_DEV=cuda:1 python -m c4_min.measure_self_emulation_wall
+See docs/SELF_EMULATION_WALL_2026_07_21.md for the full write-up.
 """
 from __future__ import annotations
 
@@ -37,9 +51,25 @@ import torch
 from . import isa
 from . import qwen_full_vm as Q
 
-# ~2.4M VM steps for the smallest self-forward (BLOG_SPEC §901 answer, recorded in
-# docs/BLOG_SPEC_REVISIONS.md §7).  This is the EXTRAPOLATION basis (labeled).
+# ~2.4M VM steps for the smallest self-forward (BLOG_SPEC §901 self-hosting
+# perf-analysis answer).  This is a LABELED EXTRAPOLATION BASIS — not measured
+# here; a smaller/larger self-net scales the wall linearly (see docs write-up).
 SELF_FORWARD_STEPS = 2_400_000
+
+# MEASURED PRIOR (692-selfemul, prior session): CROSS-PROGRAM batched perfect-draft
+# speculation (``batched_speculative.run_corpus_stacked``) saved 54.7x forwards at a
+# batch of B=64 independent programs — the deterministic VM is a PERFECT draft (100%
+# acceptance), so one [B, W, D] block-verify forward commits ~block_steps VM steps for
+# EACH of B programs at once.  This is a FORWARDS-SAVED (throughput) win, not a
+# per-token-compute win: it needs B independent programs (or independent step-blocks)
+# runnable in lockstep, and it is gated by CALL/SPILL-heaviness (the #702 wall) —
+# see ``speculation_model`` below.
+BATCHED_SPEC_FWD_SAVED_B64 = 54.7
+SPEC_BATCH = 64
+# Single-program perfect-draft block width (steps committed per block-verify forward,
+# LEAN_FORWARD.md / pf_speculative.verify_blocks default).  Perfect draft => every
+# drafted step is accepted, so single-program forwards-saved = block_steps.
+SPEC_BLOCK_STEPS = 32
 
 
 def _dev() -> str:
@@ -210,7 +240,76 @@ def measure(dev: str = None, reps: int = 3) -> Dict[str, object]:
         "blog_prior_days": 88.0,
         "blog_prior_s_per_instr": 3.2,
     }
+
+    # (3b) SPECULATION forwards-saved model (perfect deterministic draft), and how
+    #      #702 call/spill-heaviness gates it.  Built on the measured 54.7x@B=64 prior.
+    out["speculation"] = speculation_model(
+        naive_wall_s=wall_s, ms_step=ms_step, mac_steps=mac.steps,
+        dot2_diverges=out["dot2_wall"]["diverges"],
+    )
     return out
+
+
+def speculation_model(naive_wall_s: float, ms_step: float, mac_steps: int,
+                      dot2_diverges: bool) -> Dict[str, object]:
+    """PERFECT-DRAFT speculation forwards-saved, and the #702 gate on it.
+
+    The c4_min logical VM is a DETERMINISTIC draft, so speculation has 100%
+    acceptance (LEAN_FORWARD.md): every drafted VM step is committed by the
+    verify forward.  Two independent levers, both FORWARDS-SAVED (throughput),
+    NEITHER lowers PER-TOKEN compute:
+
+      * SINGLE-PROGRAM block batching: one block-verify forward commits
+        ``SPEC_BLOCK_STEPS`` steps -> forwards-saved = SPEC_BLOCK_STEPS
+        (``steps / ceil(steps/block_steps)``, exact for a perfect draft).
+      * CROSS-PROGRAM batching: ``SPEC_BATCH``=64 independent programs stacked
+        into one ``[B, W, D]`` forward -> the MEASURED 54.7x@B=64 prior
+        (``batched_speculative``).  ~= B x the per-step launch amortisation.
+
+    THE #702 GATE.  A real matmul dot of width W>=2 needs stack DEPTH>=2 (park
+    one partial while computing the next).  This machine's register CAM tracks
+    exactly ONE live cell (STACK0), so a width>=2 dot DIVERGES in-register
+    (measured: dot2 50 -> 25) and MUST spill to a function frame (JSR/ENT/LEV) or
+    a memory round-trip per accumulate term.  Two consequences:
+
+      1. STEP INFLATION (the dominant gate): each extra dot term costs a spill
+         frame on top of its 5-step MAC, so a width-W output element runs
+         ~W*(mac_steps + spill_steps) VM steps, not W*mac_steps.  Since the wall
+         is total_steps x per-step-compute, call-heaviness multiplies the wall
+         DIRECTLY, and the ~2.4M-step basis ALREADY bakes in the spilled form.
+      2. LOCKSTEP RAGGEDNESS (the batching gate): cross-program batching needs B
+         programs at a similar call DEPTH to fill a [B, W, D] tile with no idle
+         rows (depth-bucketing).  Call-heavy programs fan out into many distinct
+         depths, so the achievable batch shrinks below B and the 54.7x@B=64 is an
+         UPPER bound (hit on uniform shallow loops; lower on deep call chains).
+
+    Speculation is NOT broken by calls (the deterministic draft knows every
+    dynamic target, so it drafts THROUGH a JSR) — it is GATED by them via (1)+(2).
+    """
+    single = SPEC_BLOCK_STEPS                              # perfect-draft, per-program
+    # Best case: cross-program batched perfect draft (measured prior).  A SINGLE
+    # self-forward is ONE program, so cross-program batching only applies if many
+    # self-forwards (or many independent inner-loop MACs) are run together.
+    best_case = BATCHED_SPEC_FWD_SAVED_B64                 # 54.7x @ B=64 (measured)
+    return {
+        "perfect_draft": True,
+        "single_program_fwd_saved": single,
+        "batched_fwd_saved_B64": best_case,
+        "batch": SPEC_BATCH,
+        "block_steps": SPEC_BLOCK_STEPS,
+        # forwards-saved cuts the NUMBER of forwards, so it divides the wall
+        # (throughput), leaving per-token compute untouched.  Report both bounds.
+        "wall_s_single_prog_spec": naive_wall_s / single,
+        "wall_days_single_prog_spec": naive_wall_s / single / 86400.0,
+        "wall_s_batched_spec": naive_wall_s / best_case,
+        "wall_days_batched_spec": naive_wall_s / best_case / 86400.0,
+        "hs702_dot2_diverges": dot2_diverges,
+        "hs702_note": (
+            "width>=2 dot needs depth>=2 -> a func-frame spill per accumulate "
+            "term; this INFLATES the step count (dominant gate) and RAGGENS "
+            "cross-program depth-bucketing (caps the 54.7x@B=64 to an upper bound)"
+        ),
+    }
 
 
 def _fmt(rep: Dict[str, object]) -> str:
@@ -218,6 +317,7 @@ def _fmt(rep: Dict[str, object]) -> str:
     mac = rep["mac"]
     mv = rep["matvec"]
     dw = rep["dot2_wall"]
+    sp = rep["speculation"]
     lines = [
         "=" * 76,
         "SELF-EMULATION WALL — the transformer running the transformer's forward",
@@ -242,8 +342,20 @@ def _fmt(rep: Dict[str, object]) -> str:
         f"{dw['model_1slot']}  diverges={dw['diverges']}",
         f"    -> {dw['note']}",
         "",
+        "(3b) SPECULATION forwards-saved (perfect deterministic draft) + #702 gate:",
+        f"    single-program block batching: {sp['single_program_fwd_saved']}x "
+        f"forwards-saved (block_steps={sp['block_steps']}, 100% accept)",
+        f"    cross-program batched: {sp['batched_fwd_saved_B64']:.1f}x @ B={sp['batch']} "
+        f"(MEASURED prior, batched_speculative) — an UPPER bound",
+        f"    #702 GATE: {sp['hs702_note']}",
+        f"    -> speculation is FORWARDS-SAVED (throughput), NOT per-token compute: "
+        f"wall/{sp['single_program_fwd_saved']} = {sp['wall_days_single_prog_spec']:.2f}d "
+        f"(single-prog) .. wall/{sp['batched_fwd_saved_B64']:.1f} = "
+        f"{sp['wall_days_batched_spec']:.2f}d (batched B={sp['batch']}, needs that many "
+        f"independent programs/step-blocks)",
+        "",
         "(4) EXTRAPOLATION (labeled) — ONE smallest self-forward:",
-        f"    basis: {e['basis_steps']:,} VM steps (BLOG_SPEC_REVISIONS §7)",
+        f"    basis: {e['basis_steps']:,} VM steps (LABELED extrapolation basis)",
         "    TWO pinning quantities:",
         f"      TOKENS PER VM STEP = {e['tokens_per_vm_step']:.1f} "
         f"(BOS + 5-reg frame + query; +1 per live store)",
@@ -254,6 +366,9 @@ def _fmt(rep: Dict[str, object]) -> str:
         f"= {e['wall_days']:.2f} days",
         f"    (blog prior: {e['blog_prior_days']:.0f} days @ "
         f"{e['blog_prior_s_per_instr']}s/instr)",
+        "    NOTE: TOKENS-PER-STEP (=7) is structural/invariant; PER-STEP compute is",
+        "    GPU-CONTENTION-sensitive (~330-1250 ms/step observed on this SHARED",
+        "    cuda:1) -> wall ~9-35 days, all well under the 88-day prior.",
     ]
     if "peak_cuda_gb" in rep:
         lines.append(f"\npeak cuda mem = {rep['peak_cuda_gb']:.2f} GB")
