@@ -324,8 +324,9 @@ def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty: moderate multiple of EFF so an IS_POP/IS_STORE flag residue
-    # at a large SP/PC cannot swamp the exact-address match (see PEN_GATE note).
+    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the IS_POP query flag is
+    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large SP/PC
+    # cannot swamp the exact-address match (see PEN_GATE note).
     PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
     attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
@@ -385,8 +386,9 @@ def _bake_lev_ret_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty: moderate multiple of EFF so an IS_LEV/IS_STORE flag residue
-    # at a large BP/PC cannot swamp the exact-address match (see PEN_GATE note).
+    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the IS_LEV query flag is
+    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large BP/PC
+    # cannot swamp the exact-address match (see PEN_GATE note).
     PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
     attn.alibi_slopes[head] = MEM_ALIBI_SLOPE

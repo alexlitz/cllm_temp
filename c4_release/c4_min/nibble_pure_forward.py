@@ -394,9 +394,10 @@ def _bake_pf_memory_head(attn, L, head: int) -> None:
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty: moderate multiple of EFF (NOT the huge address-separation
-    # margin) so a small IS_LOAD/IS_STORE flag residue at a large PC cannot swamp
-    # the exact-address match (frame-pointer read-back fix; see PEN_GATE note).
+    # Role-gate penalty (must dominate the worst-case partial address match, so it
+    # stays huge = 100·ADDR_BITS·EFF).  Robustness to a flag RESIDUE at a large PC
+    # comes from THRESHOLDING the IS_LOAD flag clean (``_flag_from_ops`` step), not
+    # from shrinking this gate — see the PEN_GATE note (frame-pointer read-back fix).
     PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
     attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
