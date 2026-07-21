@@ -137,10 +137,13 @@ byte-identical to the naive lean driver (asserted in `test_qwen_lean_forward.py`
 
 ## For the follow-on agents
 
-- **CUDA-graph / fusion**: wrap `LeanQwenVM.forward`. It is a fixed-shape-friendly
-  pure-torch stack (RoPE/RMSNorm/softmax/SwiGLU); the register decode reads
-  `hidden[:, -1]`. The naive driver rebuilds the window each step (fixed max shape
-  for a given code), so a captured graph over `forward` is straightforward.
+- **CUDA-graph / fusion**: **DONE** — see `qwen_lean_cuda_graph.py` +
+  `CUDA_GRAPH_LEAN.md`. `GraphedLeanForward` captures `LeanQwenVM.forward` as a CUDA
+  graph bucketed by the `(B, S)` window shape and replays it (byte-for-byte identical,
+  Linf = 0.0) inside drop-in `run_program_lean_graphed` / `speculative_run_lean_graphed`
+  drivers. Measured: **naive ~1.9-2.2x** (removes the per-step launch + Python
+  block-loop), **speculative ~1.1-1.4x** (the batched forward already amortises launch,
+  so a modest win on top — the two are complementary).
 - **async KV-eviction**: `forward` already takes a `past` per-layer KV cache and
   per-row `q_positions`. Port the `pf_speculative` bounded-eviction (softmax-value
   zero-head skip) policy over `new_past`; the compacted store log is already

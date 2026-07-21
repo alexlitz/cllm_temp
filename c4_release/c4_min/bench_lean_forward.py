@@ -257,13 +257,132 @@ def speculation_bench(device: str = "cpu", subset=Q.SUBSET_MEM_CMP,
     return {"rows": rows}
 
 
+# ---------------------------------------------------------------------------
+# CUDA-graph capture: eager lean forward vs graph-replay, ms/step before/after,
+# for BOTH the naive and speculative drivers, on base (7L) + mem+cmp (10L).
+#
+# The bench corpus is ALL-HALTING on its subset (a cmp on the base subset the model
+# can't decode would spin to max_steps) — mix of short single-step ops and a couple
+# of loop depths so both the per-step launch-overhead (short) and the amortised
+# window (loops, where speculation shines) are exercised.
+# ---------------------------------------------------------------------------
+GRAPH_BASE_PROGS: List[Tuple[str, list]] = [
+    ("arith_add", _bin("ADD", 100, 27)),
+    ("arith_sub", _bin("SUB", 200, 55)),
+    ("if_bz", [("IMM", 0), ("BZ", 3), ("IMM", 99), ("IMM", 7), ("HALT", 0)]),
+    ("loop_cd5", [("IMM", 5), ("PSH", 0), ("IMM", 1), ("SUB", 0), ("BNZ", 1), ("HALT", 0)]),
+    ("loop_cd20", [("IMM", 20), ("PSH", 0), ("IMM", 1), ("SUB", 0), ("BNZ", 1), ("HALT", 0)]),
+]
+
+GRAPH_MEM_PROGS: List[Tuple[str, list]] = [
+    ("cmp_eq", _bin("EQ", 5, 5)),
+    ("cmp_gt", _bin("GT", 9, 7)),
+    ("mem_si_li", [("IMM", 5), ("PSH", 0), ("IMM", 0x23), ("SI", 0),
+                   ("IMM", 5), ("LI", 0), ("HALT", 0)]),
+    ("var_add", [("IMM", 10), ("PSH", 0), ("IMM", 7), ("SI", 0),
+                 ("IMM", 10), ("LI", 0), ("PSH", 0), ("IMM", 3), ("ADD", 0), ("HALT", 0)]),
+    ("loop_cd20", [("IMM", 20), ("PSH", 0), ("IMM", 1), ("SUB", 0), ("BNZ", 1), ("HALT", 0)]),
+]
+
+
+def cuda_graph_bench(device: str = "cuda:1", subset=Q.SUBSET_BASE,
+                     progs=None, iters: int = 5, max_steps: int = 128) -> Dict:
+    """Head-to-head EAGER vs CUDA-GRAPH-replay ms/VM-step.
+
+    Captures ``LeanQwenVM.forward`` as a CUDA graph (bucketed by ``(B,S)`` window
+    shape) and replays it inside the SAME naive + speculative drivers.  Reports
+    ms/step before (eager) and after (graphed) and asserts the graphed trace is
+    byte-identical to the eager one.  The win is the per-step Python/kernel-launch
+    overhead the graph removes; it is largest for the naive driver + small windows.
+
+    ``max_steps`` bounds the drivers so a program the subset can't decode (e.g. a
+    cmp on the base subset) never spins to the default 4096 — the bench corpus below
+    is all-halting on its subset anyway.
+    """
+    from . import qwen_lean_cuda_graph as CG
+    warnings.filterwarnings("ignore")
+    if not device.startswith("cuda"):
+        print("\n=== CUDA-graph bench SKIPPED (needs a CUDA device) ===")
+        return {"skipped": True}
+    progs = progs or GRAPH_BASE_PROGS
+    vm = Q.build(code_size=24, subset=subset)
+    vm.embed = vm.embed.to(device)
+    lean = LF.LeanQwenVM.from_full_vm(vm, device=device)
+    print(f"\n=== CUDA-graph capture: eager vs graphed (subset {subset.name}, "
+          f"{lean.n_layers}L) ===")
+    print(f"  {'program':11s} {'steps':>5s} | "
+          f"{'naive eager':>11s} {'naive graph':>11s} {'nv x':>5s} | "
+          f"{'spec eager':>10s} {'spec graph':>10s} {'sp x':>5s} | {'BYTE-EQ':>7s}")
+    rows = []
+    tot = {"nE": 0.0, "nG": 0.0, "sE": 0.0, "sG": 0.0, "steps": 0}
+    for name, p in progs:
+        code = isa.assemble(p)
+        # reused warm graph pools (capture happens on the first call, then replays).
+        g_naive = CG.GraphedLeanForward(lean)
+        g_spec = CG.GraphedLeanForward(lean)
+
+        # correctness: graphed trace == eager trace PER DRIVER (what the graph work
+        # is responsible for).  We deliberately do NOT require naive==spec here —
+        # the two drivers can differ on the KNOWN signed-compare model failure
+        # (e.g. GT 9>7), which is orthogonal to graph fidelity; the graph replay
+        # reproduces WHATEVER its eager driver decodes, byte-for-byte.
+        e_naive = LF.run_program_lean(lean, code, max_steps=max_steps)
+        r_naive = CG.run_program_lean_graphed(lean, code, max_steps=max_steps, graphed=g_naive)
+        e_spec = LF.speculative_run_lean(lean, code, block_steps=32, max_steps=max_steps)
+        r_spec = CG.speculative_run_lean_graphed(lean, code, block_steps=32,
+                                                 max_steps=max_steps, graphed=g_spec)
+        byte_eq = (e_naive["ax_trace"] == r_naive["ax_trace"]
+                   and e_spec.ax_trace == r_spec.ax_trace)
+        steps = e_naive["steps"]
+
+        # warmup=2 so the graphed path's FIRST-call capture (per shape) is fully
+        # amortised out of the timed window — else a cold capture pollutes ms/step.
+        ms_nE, _ = _time_run(LF.run_program_lean, lean, code, device=device,
+                             warmup=2, iters=iters, max_steps=max_steps)
+        ms_nG, _ = _time_run(CG.run_program_lean_graphed, lean, code, device=device,
+                             warmup=2, iters=iters, max_steps=max_steps, graphed=g_naive)
+        ms_sE, _ = _time_run(LF.speculative_run_lean, lean, code, device=device,
+                             warmup=2, iters=iters, block_steps=32, max_steps=max_steps)
+        ms_sG, _ = _time_run(CG.speculative_run_lean_graphed, lean, code, device=device,
+                             warmup=2, iters=iters, block_steps=32, max_steps=max_steps,
+                             graphed=g_spec)
+
+        st = max(steps, 1)
+        row = {"name": name, "steps": steps,
+               "naive_eager": ms_nE / st, "naive_graph": ms_nG / st,
+               "spec_eager": ms_sE / st, "spec_graph": ms_sG / st,
+               "byte_eq": byte_eq}
+        rows.append(row)
+        tot["nE"] += ms_nE; tot["nG"] += ms_nG
+        tot["sE"] += ms_sE; tot["sG"] += ms_sG; tot["steps"] += steps
+        nvx = row["naive_eager"] / row["naive_graph"] if row["naive_graph"] else 0.0
+        spx = row["spec_eager"] / row["spec_graph"] if row["spec_graph"] else 0.0
+        print(f"  {name:11s} {steps:5d} | "
+              f"{row['naive_eager']:11.2f} {row['naive_graph']:11.2f} {nvx:4.2f}x | "
+              f"{row['spec_eager']:10.2f} {row['spec_graph']:10.2f} {spx:4.2f}x | "
+              f"{str(byte_eq):>7s}")
+
+    st = max(tot["steps"], 1)
+    nE, nG = tot["nE"] / st, tot["nG"] / st
+    sE, sG = tot["sE"] / st, tot["sG"] / st
+    print(f"\n  AGGREGATE ms/VM-step (subset {subset.name}):")
+    print(f"    naive : eager {nE:6.2f} -> graphed {nG:6.2f}  "
+          f"({nE - nG:+.2f} ms/step, {nE / nG:.2f}x)" if nG else "")
+    print(f"    spec  : eager {sE:6.2f} -> graphed {sG:6.2f}  "
+          f"({sE - sG:+.2f} ms/step, {sE / sG:.2f}x)" if sG else "")
+    all_eq = all(r["byte_eq"] for r in rows)
+    print(f"    graphed == eager byte-for-byte on ALL programs: {all_eq}")
+    return {"rows": rows, "naive_eager_step": nE, "naive_graph_step": nG,
+            "spec_eager_step": sE, "spec_graph_step": sG, "all_eq": all_eq}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--deep", action="store_true", help="include the 308-block reference")
     ap.add_argument("--iters", type=int, default=3)
     ap.add_argument("--only", default="all",
-                    help="all|head|window|spec")
+                    help="all|head|window|spec|graph")
     args = ap.parse_args()
     dev = args.device
     if dev.startswith("cuda"):
@@ -281,6 +400,12 @@ def main():
         window_scaling(dev, iters=max(3, args.iters))
     if args.only in ("all", "spec"):
         speculation_bench(dev, iters=args.iters)
+    if args.only in ("all", "graph"):
+        print("\n########## CUDA-GRAPH capture (eager vs graphed) ##########")
+        cuda_graph_bench(dev, subset=Q.SUBSET_BASE, progs=GRAPH_BASE_PROGS,
+                         iters=max(5, args.iters))
+        cuda_graph_bench(dev, subset=Q.SUBSET_MEM_CMP, progs=GRAPH_MEM_PROGS,
+                         iters=max(5, args.iters))
 
 
 if __name__ == "__main__":
