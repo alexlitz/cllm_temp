@@ -185,6 +185,74 @@ def test_vectorized_prune_matches_reference_large_and_content_addressed():
     assert mism == 0, f"{mism}/{trials} large/content-addressed keep-set mismatches"
 
 
+def test_fused_all_block_evict_matches_per_block():
+    """The FUSED all-block eviction (``evict_all_blocks_fused`` +
+    ``apply_keep_mask``) produces the BYTE-IDENTICAL survivor set (K/V/pos) to the
+    per-block ``BlockKVCacheBatched.evict`` loop it replaces — over a battery of
+    random multi-block caches with (a) DIVERGENT per-block sizes (blocks that
+    already evicted differently), (b) mixed register-marker vs content-addressed
+    (address-CAM) heads, (c) protection positions.  This is the fusion's
+    byte-identity gate: the deep-loop prune de-syncs onto the GPU but keeps EXACTLY
+    the entries the per-block policy kept (#667)."""
+    import copy
+    from c4_min.nibble_pure_forward_cached import (
+        BlockKVCacheBatched, evict_all_blocks_fused)
+    torch.manual_seed(11)
+    cos_threshold, zero_eps, recency_eps = 0.99, 1e-9, 1e-6
+    H, HD = 4, 8
+    for trial in range(30):
+        n_blocks = int(torch.randint(2, 8, (1,)))
+        # a few distinct ALiBi slope vectors shared across blocks (as in the model).
+        slope_protos = [torch.tensor([2.0 ** (-8.0 / 23 * (h + 1 + off))
+                                      for h in range(H)])
+                        for off in range(3)]
+        # build per-block caches with DIVERGENT sizes + positions (post-evict shape).
+        caches_a, caches_b = [], []
+        protect = set()
+        for b in range(n_blocks):
+            slopes = slope_protos[b % len(slope_protos)]
+            S = int(torch.randint(3, 40, (1,)))
+            # a content-addressed block? give its keys a big shared common-mode bias
+            # so cm_frac>0.9 (address-CAM head) for some blocks, marker heads for rest.
+            if b % 2 == 0:
+                keys = torch.randn(1, H, S, HD) + 8.0            # common-mode -> exact
+            else:
+                keys = torch.randn(1, H, S, HD)                  # marker -> cosine
+            vals = torch.randn(1, H, S, HD)
+            # inject near-dup + zero rows (the eviction hazards).
+            for _ in range(int(torch.randint(0, S, (1,)))):
+                i = int(torch.randint(0, S, (1,))); j = int(torch.randint(0, S, (1,)))
+                keys[0, :, i] = keys[0, :, j] * (1.0 + 0.0005 * torch.randn(1))
+            for _ in range(int(torch.randint(0, S // 2 + 1, (1,)))):
+                i = int(torch.randint(0, S, (1,))); vals[0, :, i] = 0.0
+                if int(torch.randint(0, 2, (1,))):
+                    keys[0, :, i] = 0.0
+            pos = torch.sort(torch.randperm(600)[:S])[0].to(torch.long)
+            ca = BlockKVCacheBatched(H, HD, slopes)
+            ca.K, ca.V, ca.pos = keys.clone(), vals.clone(), pos.clone()
+            cb = BlockKVCacheBatched(H, HD, slopes)
+            cb.K, cb.V, cb.pos = keys.clone(), vals.clone(), pos.clone()
+            caches_a.append(ca); caches_b.append(cb)
+            if int(torch.randint(0, 3, (1,))) == 0 and S:
+                protect.add(int(pos[int(torch.randint(0, S, (1,)))]))
+        protect = sorted(protect) if protect else None
+
+        # reference: per-block evict.
+        for c in caches_a:
+            c.evict(cos_threshold, 60, zero_eps, recency_eps,
+                    protect_positions=protect)
+        # fused: one batched decision + per-block mask compaction.
+        masks = evict_all_blocks_fused(caches_b, cos_threshold, zero_eps,
+                                       recency_eps, protect_positions=protect)
+        for b in range(n_blocks):
+            if masks[b] is not None:
+                caches_b[b].apply_keep_mask(masks[b])
+            # byte-identical surviving K/V/pos per block.
+            assert torch.equal(caches_a[b].pos, caches_b[b].pos), (trial, b)
+            assert torch.equal(caches_a[b].K, caches_b[b].K), (trial, b)
+            assert torch.equal(caches_a[b].V, caches_b[b].V), (trial, b)
+
+
 def test_driver_byte_identical_naive_incl_functions_and_eviction():
     """The KV-cached (+evicted) driver's full output is BYTE-IDENTICAL to the
     naive re-forward driver on a battery that exercises the eviction hazards:
@@ -238,5 +306,6 @@ if __name__ == "__main__":
     test_uncached_forward_byte_identical()
     test_vectorized_prune_matches_reference()
     test_vectorized_prune_matches_reference_large_and_content_addressed()
+    test_fused_all_block_evict_matches_per_block()
     test_driver_byte_identical_naive_incl_functions_and_eviction()
     print("all KV-cache equivalence tests passed")

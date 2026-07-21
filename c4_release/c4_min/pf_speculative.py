@@ -55,7 +55,9 @@ from .nibble_pure_forward_complete import (
     _mem_top, ADJ,
 )
 import c4_min.nibble_pure_forward_complete as _PFC
-from .nibble_pure_forward_cached import apply_overlay_window, BlockKVCacheBatched
+from .nibble_pure_forward_cached import (
+    apply_overlay_window, BlockKVCacheBatched, evict_all_blocks_fused,
+)
 from .blogspec_layout import NIB_PER_REG
 
 
@@ -481,6 +483,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     peak_vram = 0
     is_cuda = device.startswith("cuda")
     min_k = max(1, int(min_block_steps))
+    import time as _time
+    t_evict = 0.0                           # wall spent in the fused eviction
     last_got_ax = None                      # the MODEL's decoded AX at the last step
     prtf_set = set(draft.prtf_steps or ())  # steps whose model AX is a PRTF byte
     # BLOCK-MoE divmod-skip: when block_moe and a whole block-verify span has NO
@@ -697,16 +701,32 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         # EVICTION-INTERVAL (user's lever): evict ONCE per ``evict_every`` VM steps
         # (default: once per verify block).  Fires at the block boundary, so with a
         # big K this is ONE eviction sweep per ~30k-token block — ~250x fewer
-        # eviction ROUNDS than the old per-120-token trigger, which is the CPU wall
-        # (each round is 306 per-block GPU-decisions + host syncs).  Note: because a
-        # block is one forward, this can only make eviction LESS frequent than
-        # per-block (evict_every > K prunes every ceil(evict_every/K) blocks); it
-        # does NOT prune within a big-K forward, so the within-block cache growth is
-        # bounded by K (the span), not by evict_every.
+        # eviction ROUNDS than the old per-120-token trigger, which is the CPU wall.
+        # Note: because a block is one forward, this can only make eviction LESS
+        # frequent than per-block (evict_every > K prunes every ceil(evict_every/K)
+        # blocks); it does NOT prune within a big-K forward, so the within-block
+        # cache growth is bounded by K (the span), not by evict_every.
         steps_since_evict += (end - step)
         if evict and steps_since_evict >= evict_every:
+            # FUSED eviction (#667/#670): ONE batched on-GPU decision for ALL
+            # n_blocks caches (replaces the per-block Python loop of host-synced
+            # ``evict``), then a boolean-mask compaction per block.  Byte-identical
+            # survivor set to the per-block ``caches[b].evict`` loop; de-syncs the
+            # deep-loop prune so the GPU stays busy (GPU util was 41% under the old
+            # per-block host-synced eviction).  Timed with a drain around the prune
+            # (a correctness barrier the next forward needs anyway); the forward /
+            # overlay wall is the remainder (t_fast - t_evict).
+            if is_cuda:
+                torch.cuda.synchronize(dev)
+            _t0 = _time.perf_counter()
+            keep_masks = evict_all_blocks_fused(
+                caches, cos_threshold, zero_eps, recency_eps)
             for b in range(n_blocks):
-                caches[b].evict(cos_threshold, prune_interval, zero_eps, recency_eps)
+                if keep_masks[b] is not None:
+                    caches[b].apply_keep_mask(keep_masks[b])
+            if is_cuda:
+                torch.cuda.synchronize(dev)
+            t_evict += _time.perf_counter() - _t0
             steps_since_evict = 0
             evict_rounds += 1
         max_cache = max(max_cache, caches[0].size())
@@ -729,6 +749,14 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         stats["blocks_full"] = blocks_full_total
         stats["block_moe_speedup"] = (blocks_full_total / max(blocks_run_total, 1)
                                       if block_moe else 1.0)
+        # eviction wall (the #667 bottleneck instrumentation): the fused on-GPU
+        # prune should be a SMALL fraction of the fast wall (it was the dominant
+        # cost with the per-block host-synced loop).  ``t_evict`` is measured with a
+        # drain around the prune (correctness barrier the next forward needs anyway);
+        # the forward/overlay wall is the remainder (t_fast - t_evict), NOT separately
+        # drained so the block forwards still pipeline.
+        stats["t_evict"] = t_evict
+        stats["n_prunes"] = evict_rounds       # #fused-eviction rounds (== evict_rounds)
     return VerifyResult(
         accepted_steps=accepted, total_steps=n_steps,
         all_matched=(accepted == n_steps), forwards=forwards,

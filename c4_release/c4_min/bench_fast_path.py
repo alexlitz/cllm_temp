@@ -445,6 +445,15 @@ def run_bench(kind: str, args) -> int:
     naive_ax_ok = (naive_tr == naive_prefix_ax)
     print(f"  naive-prefix AX == draft: {naive_ax_ok}", flush=True)
 
+    # free the naive driver's (large, growing) KV cache before the FAST phase so its
+    # VRAM is returned to the allocator — else the fast path starts with a full card
+    # and OOMs on the first (pre-flatten) prune's stack.  (The naive baseline is only
+    # measured for the per-step wall; its cache is not needed afterward.)
+    del naive_tr, naive_stats
+    gc.collect()
+    if device.startswith("cuda"):
+        torch.cuda.empty_cache()
+
     # -- FAST path: whole-program draft + batched verify ---------------------
     evict_iv = args.evict_interval_steps
     print(f"  FAST: verify {draft.step_count} steps in blocks of "
@@ -503,6 +512,16 @@ def run_bench(kind: str, args) -> int:
     if util_sampler:
         print(f"  FAST: GPU util mean={util_sampler.mean:.0f}% "
               f"max={util_sampler.max:.0f}% (n={util_sampler.n})", flush=True)
+    # eviction wall FRACTION (the #667/#670 bottleneck instrumentation): the fused
+    # on-GPU eviction should now be a small fraction of the fast wall (it was the
+    # dominant cost with the per-block host-synced loop that stalled the GPU).
+    t_ev = fast_stats.get("t_evict", 0.0)
+    n_pr = fast_stats.get("n_prunes", 0)
+    t_rest = max(t_fast - t_ev, 0.0)
+    print(f"  FAST wall split: evict={t_ev:.1f}s "
+          f"({100*t_ev/max(t_fast,1e-9):.1f}%, {n_pr} prunes, "
+          f"{1000*t_ev/max(n_pr,1):.1f} ms/prune)  forward+overlay={t_rest:.1f}s "
+          f"({100*t_rest/max(t_fast,1e-9):.1f}%)", flush=True)
     if not vr.all_matched:
         print(f"  FAST FAIL: {vr.first_mismatch}", flush=True)
 
