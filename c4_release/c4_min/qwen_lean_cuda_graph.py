@@ -236,7 +236,9 @@ def run_program_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr],
     QL, L = lean.QL, lean.QL.L
     subset = lean.subset
     g = graphed or GraphedLeanForward(lean, pad_window=pad_window)
-    ref_trace = isa.interpret(code)
+    # Match the oracle's step budget to the driver's so a long loop is not truncated
+    # against a run-to-completion model trace (#691 BUG 2).
+    ref_trace = isa.interpret(code, max_steps=max_steps)
 
     reg_state = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
     store_log: List[dict] = []

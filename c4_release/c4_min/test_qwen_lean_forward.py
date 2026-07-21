@@ -103,14 +103,31 @@ def test_memory_lean_eq_hf(vm_memcmp, lean_memcmp):
         assert ok, (prog, rl["ax_trace"], rh["ax_trace"])
 
 
-@pytest.mark.parametrize("op,a,b", [
-    ("EQ", 5, 5), ("EQ", 7, 9), ("NE", 7, 9), ("GT", 9, 7), ("LE", 9, 7)])
+# #691 BUG 1: the ordering compares (LT/GT/LE/GE) degenerated to a constant before
+# the cmp-finalize block was added to the compacted bake.  BOTH orderings of every
+# op across the byte range must now be byte-exact vs isa.interpret AND lean == HF.
+@pytest.mark.parametrize("op", ["EQ", "NE", "LT", "GT", "LE", "GE"])
+@pytest.mark.parametrize("a,b", [
+    (5, 5), (7, 9), (9, 7), (0, 255), (255, 0), (200, 100), (128, 127)])
 def test_cmp_lean_eq_hf(vm_memcmp, lean_memcmp, op, a, b):
-    # NB: some signed-compare cases are a KNOWN model failure on this branch; the
-    # point is the lean forward reproduces the HF model's bytes EXACTLY either way.
     ok, rl, rh = _same_bytes(vm_memcmp, lean_memcmp,
                              [("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)])
-    assert ok, (op, a, b, rl["ax_trace"], rh["ax_trace"])
+    assert ok, (op, a, b, rl["ax_trace"], rh["ax_trace"])   # lean == HF
+    assert rl["exact"], (op, a, b, rl)                       # both == isa.interpret
+
+
+# #691 BUG 2: a countdown from >= 64 exceeds the default 256-step oracle cap; the
+# lean naive driver now runs the reference to its own step budget so the correct
+# run-to-completion trace is not compared against a truncated golden.
+@pytest.mark.parametrize("n", [63, 64, 100, 200, 255])
+def test_countdown_over_256_steps_lean(vm_base, lean_base, n):
+    code = isa.assemble([("IMM", n), ("PSH", 0), ("IMM", 1), ("SUB", 0),
+                         ("BNZ", 1), ("HALT", 0)])
+    rl = LF.run_program_lean(lean_base, code, max_steps=n * 4 + 20)
+    rh = Q.run_program(vm_base, code, max_steps=n * 4 + 20)
+    assert rl["ax_trace"] == rh["ax_trace"]                  # lean == HF
+    assert rl["exact"], (n, len(rl["ax_trace"]), len(rl["ref_trace"]))
+    assert len(rl["ref_trace"]) == 4 * n + 2                 # full trace, not capped
 
 
 # ---------------------------------------------------------------------------

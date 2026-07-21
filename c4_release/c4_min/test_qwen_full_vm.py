@@ -92,6 +92,22 @@ def test_loop_backbranch(vm_base):
     assert r["exact"], r
 
 
+# -- #691 BUG 2 regression: a countdown from >= 64 runs > 256 VM steps (each loop
+#    body is PSH/IMM/SUB/BNZ = 4 steps, so 4n+2 > 256 for n >= 64).  The default
+#    isa.interpret cap (max_steps=256) TRUNCATED the golden while the driver ran the
+#    loop to completion, so the correct model trace mismatched a short reference.
+#    run_program now runs the oracle to the SAME step budget; the model counts down
+#    byte-exact across the nibble-carry boundaries (100 = 0x64, 200 = 0xC8).
+@pytest.mark.parametrize("n", [50, 63, 64, 99, 100, 101, 200, 255])
+def test_countdown_over_256_steps(vm_base, n):
+    code = isa.assemble([("IMM", n), ("PSH", 0), ("IMM", 1), ("SUB", 0),
+                         ("BNZ", 1), ("HALT", 0)])
+    r = Q.run_program(vm_base, code, max_steps=n * 4 + 20)
+    assert r["exact"], (n, len(r["ax_trace"]), len(r["ref_trace"]))
+    assert r["ax_trace"][-1] == 0                 # counted all the way to 0
+    assert len(r["ref_trace"]) == 4 * n + 2       # full trace, not the 256 cap
+
+
 # -- FUNCTIONS (JSR/ENT/ADJ/LEV) through the fused forward -------------------
 @_skip_no_func_isa
 def test_function_call_leaf(vm_base):
@@ -126,6 +142,23 @@ def test_cmp_through_qwen(vm_memcmp, op, a, b, want):
     r = _exact(vm_memcmp, [("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)])
     assert r["exact"], r
     assert r["ax_trace"][-1] == want
+
+
+# -- #691 BUG 1 regression: the ORDERING compares (LT/GT/LE/GE) must NOT
+#    degenerate to a constant.  Without the cmp-finalize block CMP_GT/CMP_LT stay 0,
+#    so LT/GT always returned 0 and LE/GE always 1, REGARDLESS of operands (passing
+#    only when the constant happened to be the correct answer).  This matrix drives
+#    BOTH orderings of every op across the byte range (incl. equal, a<b, a>b, the
+#    0/255 boundary and 128-255 "negative bytes") and checks the model matches
+#    isa.interpret (the unsigned 8-bit-fold order, which == signed for values <2^31).
+@pytest.mark.parametrize("op", ["EQ", "NE", "LT", "GT", "LE", "GE"])
+@pytest.mark.parametrize("a,b", [
+    (0, 0), (5, 5), (255, 255), (7, 9), (9, 7), (0, 255), (255, 0),
+    (200, 100), (100, 200), (128, 127), (127, 128), (255, 254), (254, 255),
+])
+def test_cmp_ordering_matrix_through_qwen(vm_memcmp, op, a, b):
+    r = _exact(vm_memcmp, [("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)])
+    assert r["exact"], (op, a, b, r)
 
 
 # -- memory (SI/LI) + variables + ZFOD through the fused forward -------------

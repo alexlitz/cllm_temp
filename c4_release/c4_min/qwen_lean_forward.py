@@ -319,7 +319,10 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
     ``{"ax_trace","ref_trace","exact","steps"}``."""
     QL, L = lean.QL, lean.QL.L
     subset = lean.subset
-    ref_trace = isa.interpret(code)
+    # Match the reference oracle's step budget to the driver's so a loop longer than
+    # the default isa.interpret cap (256 steps) is not truncated against a
+    # run-to-completion model trace (#691 BUG 2: countdown >= 64 needs > 256 steps).
+    ref_trace = isa.interpret(code, max_steps=max_steps)
 
     reg_state = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
     store_log: List[dict] = []
@@ -412,7 +415,10 @@ def draft_program_lean(lean: LeanQwenVM, code: List[isa.Instr],
     EMPTY draft (fall back to naive) if the program uses an op outside the
     speculation slice (functions JSR/ENT/LEV, which need the driver's call stack)."""
     subset = lean.subset
-    ref_trace = isa.interpret(code)
+    # Match the reference oracle to the draft's step budget so a loop longer than the
+    # default isa.interpret cap (256) is not truncated against the full drafted trace
+    # (#691 BUG 2). The draft's own loop runs up to max_steps, so the golden must too.
+    ref_trace = isa.interpret(code, max_steps=max_steps)
 
     # register file mirrored EXACTLY as the model computes it (see base_dispatch_rules).
     pc = 0

@@ -504,7 +504,9 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
     # loop or an out-of-slice op has no finite reference — the byte-identity gate is
     # vs the naive lean driver, not vs isa.interpret, so a missing ref is fine.
     try:
-        ref_trace = isa.interpret(code)
+        # match the oracle's step budget to the driver's so a long loop is not
+        # truncated at the default 256-step cap (#691 BUG 2).
+        ref_trace = isa.interpret(code, max_steps=max_steps)
     except Exception:
         ref_trace = []
 

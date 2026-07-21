@@ -285,7 +285,19 @@ def _block_specs(L, code_size, subset, mdm_keys=None):
         specs += [("mem-prep", PF.compile_mem_prep(L, dim)),
                   ("mem-cam",  compile_nibble_to_scalar(L, dim))]
     if subset.cmp:
-        specs += [("cmp-compute", PF.compile_cmp_compute(L, dim))]
+        # cmp-compute emits the UNGATED primitives (CMP_EQ + the raw unsigned ramps
+        # MAG_GT/MAG_LT + the operands' sign bits SGN_STK/SGN_AX); cmp-finalize
+        # combines them into the SIGNED verdict lanes CMP_GT/CMP_LT that
+        # cmp_dispatch_rules reads (LT=CMP_LT, GT=CMP_GT, LE=1-CMP_GT, GE=1-CMP_LT).
+        # WITHOUT the finalize block CMP_GT/CMP_LT are never written and stay 0, so
+        # LT/GT degenerate to 0 and LE/GE to 1 for ALL operands (#691 BUG 1). The deep
+        # nibble_pure_forward.build_pure_forward_model / nibble_pure_forward_complete
+        # both append cmp-finalize right after cmp-compute (#673); the compacted Qwen
+        # bake was missing it. clamp01(MAG)+0 is byte-identical to the pre-fix unsigned
+        # verdict at the 8-bit fold (SGN_*=0 there), so this is signed-correct and
+        # regression-free for the unsigned <2^31 corpus.
+        specs += [("cmp-compute", PF.compile_cmp_compute(L, dim)),
+                  ("cmp-finalize", PF.compile_cmp_signed_finalize(L, dim))]
     if subset.muldiv:
         from .nibble_unified import compile_mdm_expand, compile_mdm_select
         mdm_sel = (compile_mdm_select_pruned(L, dim, mdm_keys) if mdm_keys is not None
@@ -310,7 +322,13 @@ def _block_specs(L, code_size, subset, mdm_keys=None):
     specs += [
         ("dispatch", compile_ffn(disp, dim)),
         ("branch-delta", compile_branch_delta(L, dim)),
-        ("fold", compile_fold(L.AX_VAL, L.ONE, dim, modulus=256)),
+        # width-aware fold modulus (256 at the 8-bit fold; a no-op 2^32 ramp under
+        # C4_VM_WIDTH32, where the per-byte requant carries the wrap). The prior
+        # hardcoded modulus=256 mod-clamped a genuine two's-complement negative SUB
+        # result under WIDTH32; matching the deep pure-forward path (compile_fold's
+        # default) keeps the 8-bit fold BYTE-IDENTICAL (modulus resolves to 256 when
+        # WIDTH32 is off) while not corrupting a wide/negative value when it is on.
+        ("fold", compile_fold(L.AX_VAL, L.ONE, dim)),
     ]
     return specs
 
@@ -711,7 +729,14 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
     the SP/BP/PC arithmetic is done inside the Qwen forward."""
     QL, L = vm.QL, vm.QL.L
     subset = vm.subset
-    ref_trace = isa.interpret(code)
+    # Run the reference oracle to the SAME step budget the model driver uses. The
+    # default isa.interpret cap (max_steps=256) TRUNCATES the reference for a loop
+    # longer than 256 VM steps — e.g. a countdown from n takes 4n+2 steps, so any
+    # n >= 64 (256 steps) truncated the golden while the driver ran the loop to
+    # completion, making the correct model trace mismatch a short reference (#691
+    # BUG 2: "countdown >= 100 diverges"). The model arithmetic is exact across the
+    # nibble-carry boundaries (100/200); the divergence was purely the capped oracle.
+    ref_trace = isa.interpret(code, max_steps=max_steps)
 
     reg_state = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
     store_log: List[dict] = []                       # persistent memory KV entries
