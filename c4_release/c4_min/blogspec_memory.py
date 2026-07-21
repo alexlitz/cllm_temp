@@ -162,6 +162,29 @@ BIAS = (ADDR_BITS - 1) * EFF   # constant subtracted from load↔store pairs (ZF
 # the entire 1096 corpus with margin.
 MEM_ALIBI_SLOPE = 1.0
 
+# ---------------------------------------------------------------------------
+# GATE-CHANNEL penalty scale (store-role + load/pop/lev-enable channels).
+# ---------------------------------------------------------------------------
+# The CAM's ROLE-GATE channels drive an INELIGIBLE candidate/query to a large
+# negative score so softmax1's +1 sink wins.  This penalty MUST stay huge: it has
+# to dominate the WORST-CASE partial address match of a load query against a
+# zero-address (non-store / query-row) key, which is O(ADDR_BITS·EFF) — so PEN_GATE
+# stays at ``100·ADDR_BITS·EFF``.
+#
+# The bug the frame-pointer read-back exposed was NOT this magnitude but the gate's
+# LINEAR dependence on the query FLAG.  The load/pop/lev-ENABLE channel contributes
+# ``-PEN_GATE·(1 - IS_LOAD)`` to the score; a query FLAG carrying a sub-permille
+# opcode-decode RESIDUE (``IS_LOAD = 1-ε`` at a large PC, where the CODE_OP nibble
+# ramp leaves ~1e-3 of slack) then contributes ``-PEN_GATE·ε`` — which, with
+# PEN_GATE huge, swamps the exact-address match ``+EFF`` and sinks the load to ZFOD
+# 0 (the malloc_printf memset frame-pointer read-back; the deep-frame ceiling on
+# mandelbrot ~136 / self-emulation ~296, where PC/SP grow large).  The FIX is to
+# THRESHOLD the query flag to a clean 0/1 at authoring time — ``_flag_from_ops``
+# (nibble_pure_forward) now writes a saturating relu-ramp STEP so ``IS_LOAD /
+# IS_POP / IS_LEV = 1.0`` exactly for any ``g > 0.6`` (residue-immune) — so the
+# huge gate can stay huge without amplifying flag residue.
+PEN_GATE = 100.0 * ADDR_BITS * EFF
+
 
 class MemoryLayout(NibbleLayout):
     """``NibbleLayout`` + the bands the KV-memory head needs.
@@ -273,9 +296,12 @@ def bake_memory_head(attn, L: MemoryLayout, head: int = 0) -> None:
     # bias so a load↔store pair contributes exactly -BIAS after ×hs.
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    # store-role penalty: non-store rows driven to -PEN (>> any CAM score) so a
-    # BOS/load row (ADDR_BIN=0, i.e. "address 0") can never win a load.
-    PEN = 100.0 * ADDR_BITS * EFF
+    # store-role penalty: non-store rows driven to -PEN_GATE (>> any CAM score) so a
+    # BOS/load row (ADDR_BIN=0, i.e. "address 0") can never win a load.  PEN_GATE is
+    # the shared role-gate scale (see module-top note); the query flags feeding these
+    # channels are THRESHOLDED clean (``_flag_from_ops`` step) so the huge penalty
+    # cannot amplify a flag residue (frame-pointer read-back / deep-frame fix).
+    PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
 
     # recency slope for this head only (small; §410 latest-write-wins).

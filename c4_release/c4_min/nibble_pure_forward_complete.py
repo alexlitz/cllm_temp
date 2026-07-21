@@ -318,13 +318,15 @@ def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     """Bake the stack-pop KV head: query = SP_QRY_BIN, enable = IS_POP, value ->
     STACK0 nibble band.  Same address CAM + ZFOD-bias + store-role + pop-enable
     channels as ``_bake_pf_memory_head``, on a different head/query/dest."""
-    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE
+    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
     from .blogspec_layout import NIB_PER_REG
     hs = attn.scale
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    PEN = 100.0 * ADDR_BITS * EFF
+    # Role-gate penalty: moderate multiple of EFF so an IS_POP/IS_STORE flag residue
+    # at a large SP/PC cannot swamp the exact-address match (see PEN_GATE note).
+    PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
     attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
     HD = attn.head_dim
@@ -377,13 +379,15 @@ def compile_stk_recompose(L, dim: int, hi_nibbles: int = 8) -> Dict[str, torch.T
 def _bake_lev_ret_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     """The LEV return-PC KV head: query = LEV_QRY_BIN (address = BP+4), enable =
     IS_LEV, value -> LEV_RET nibble band.  Same §Memory CAM as the stack head."""
-    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE
+    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
     from .blogspec_layout import NIB_PER_REG
     hs = attn.scale
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    PEN = 100.0 * ADDR_BITS * EFF
+    # Role-gate penalty: moderate multiple of EFF so an IS_LEV/IS_STORE flag residue
+    # at a large BP/PC cannot swamp the exact-address match (see PEN_GATE note).
+    PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
     attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
     HD = attn.head_dim

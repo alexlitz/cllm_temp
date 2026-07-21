@@ -252,14 +252,45 @@ def _concat_specs(specs, dim):
     return out
 
 
-def _flag_from_ops(L, flag_band, ops, dim):
-    """flag_band := sum_op OP_IS[op] (SET: self-clear then add each op-hot)."""
-    spec = _empty_spec(dim, 1 + len(ops))
+def _flag_from_ops(L, flag_band, ops, dim, sharpen: bool = True):
+    """flag_band := (a THRESHOLDED) indicator of ``any OP_IS[op] active``.
+
+    ``sharpen=True`` (default) writes a clean STEP: ``flag = 1`` when the summed
+    op-hot ``g = Σ OP_IS[op]`` exceeds ~0.5, else ``0`` — a saturating relu ramp
+    (0 for g<0.4, 1 for g>0.6, linear between) so a sub-permille opcode-decode
+    RESIDUE (g = 1-ε at a large PC) snaps to an EXACT 1.0 before it reaches the
+    §Memory CAM's role-gate channel.  Without this, the gate penalty
+    ``-PEN·(1-flag)`` (PEN huge, to dominate the address separation) turned a tiny
+    ``ε`` into a catastrophic ``-PEN·ε`` that sank an EXACT-address load to ZFOD 0
+    — the malloc_printf frame-pointer read-back bug (and the deep-frame ceiling on
+    mandelbrot / self-emulation, where PC/SP grow large).  ``sharpen=False`` keeps
+    the legacy linear copy (``flag = Σ OP_IS[op]``).
+
+    SET semantics: self-clear ``flag_band`` first, then write the (sharpened) sum.
+    """
+    if not sharpen:
+        spec = _empty_spec(dim, 1 + len(ops))
+        spec["W_up"][0, L.ONE] = S; spec["W_gate"][0, flag_band] = 1.0
+        spec["W_down"][flag_band, 0] += -1.0 / SILU_S
+        for i, op in enumerate(ops, start=1):
+            spec["W_up"][i, L.ONE] = S; spec["W_gate"][i, L.OP_IS + op] = 1.0
+            spec["W_down"][flag_band, i] += 1.0 / SILU_S
+        return spec
+    # sharpened step: 3 units — self-clear + two relu ramps (lo=0.4, hi=0.6) of the
+    # summed op-hot ``g`` giving a saturating 0..1 indicator, residue-immune.
+    spec = _empty_spec(dim, 3)
+    # unit 0: self-clear flag_band (SET) — silu(S)/SILU_S · flag_band = flag_band.
     spec["W_up"][0, L.ONE] = S; spec["W_gate"][0, flag_band] = 1.0
     spec["W_down"][flag_band, 0] += -1.0 / SILU_S
-    for i, op in enumerate(ops, start=1):
-        spec["W_up"][i, L.ONE] = S; spec["W_gate"][i, L.OP_IS + op] = 1.0
-        spec["W_down"][flag_band, i] += 1.0 / SILU_S
+    # units 1,2: relu(g - lo) - relu(g - hi), scaled to a 0..1 ramp.  up = RELU_S·g
+    # (shifted); gate = constant 1 (b_gate=1) so silu(up)·1 ≈ RELU_S·relu(shift).
+    RAMP = 1.0 / (0.2 * RELU_S)          # (relu(g-.4) - relu(g-.6)) * 5 -> 0..1
+    for k, (lo, sign) in enumerate(((0.4, +1.0), (0.6, -1.0)), start=1):
+        for op in ops:
+            spec["W_up"][k, L.OP_IS + op] = RELU_S
+        spec["b_up"][k] = -RELU_S * lo
+        spec["b_gate"][k] = 1.0          # gate = 1 (silu(up)·1)
+        spec["W_down"][flag_band, k] += sign * RAMP
     return spec
 
 
@@ -357,13 +388,16 @@ def _bake_pf_memory_head(attn, L, head: int) -> None:
     """Bake the §Memory KV head on head ``head`` of ``attn`` (pure-forward layout).
     Same CAM as ``blogspec_memory.bake_memory_head`` but on THIS layout's bands and
     a chosen head index; writes the loaded value nibbles into the AX nibble band."""
-    from .blogspec_memory import ADDR_BITS, EFF, BIAS, MEM_ALIBI_SLOPE
+    from .blogspec_memory import ADDR_BITS, EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
     from .blogspec_layout import NIB_PER_REG
     hs = attn.scale
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    PEN = 100.0 * ADDR_BITS * EFF
+    # Role-gate penalty: moderate multiple of EFF (NOT the huge address-separation
+    # margin) so a small IS_LOAD/IS_STORE flag residue at a large PC cannot swamp
+    # the exact-address match (frame-pointer read-back fix; see PEN_GATE note).
+    PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
     attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
     HD = attn.head_dim

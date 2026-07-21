@@ -56,11 +56,34 @@ def build_frame():
     return isa.assemble(prog)
 
 
+def build_args():
+    # Reproduce the memset ARGUMENT read that actually fails: main pushes 3 args
+    # (the middle/first holds the pointer value V), JSRs a callee, which ENTs and
+    # reads an arg via LEA k ; LI.  Matches malloc_printf pc 110-111.
+    V = int(os.environ.get("C4_ARGVAL", str(P0)), 0)
+    prog = [("IMM", V), ("PSH", 0),       # arg s = V   (the pointer)
+            ("IMM", 72), ("PSH", 0),      # arg c
+            ("IMM", 3), ("PSH", 0),       # arg n
+            ("JSR", None), ("ADJ", 3), ("HALT", 0)]
+    callee_pc = int(os.environ.get("C4_CALLEE_PC", str(len(prog))))
+    while len(prog) < callee_pc:
+        prog += [("NOP", 0)]
+    run_pc = len(prog)
+    prog += [("ENT", 2)]                  # 2 locals (like memset)
+    # read arg s (LEA 4 in the real memset accesses the arg holding V):
+    prog += [("LEA", 4), ("LI", 0)]       # AX = *(&arg) -> want V
+    prog += [("LEV", 0)]
+    prog[6] = ("JSR", run_pc)
+    return isa.assemble(prog)
+
+
 def main():
     os.system("free -g | head -2")
-    code = build_frame() if os.environ.get("C4_FRAME", "0") == "1" else build()
+    mode = os.environ.get("C4_MODE", "min")
+    code = {"min": build, "frame": build_frame, "args": build_args}[mode]()
     model, L, _ = build_lib_model_streaming(
-        code_size=max(64, len(code) + 2), recurrent_divmod=True, addr32=True)
+        code_size=max(int(os.environ.get("C4_CODESIZE", "64")), len(code) + 2),
+        recurrent_divmod=True, addr32=True)
 
     # locate the memory-cam block
     mem_blk_idx = None
@@ -141,6 +164,50 @@ def main():
                 val |= nb << (4 * j)
             print(f"     key[{ki}] abs_pos={int(k_pos[ki]):4d} score={float(sc[ki]):+.3e} "
                   f"w={float(w[ki]):.4e} relay_val={val}", flush=True)
+        # ALSO: find every candidate whose relay value == the target 0x20000, and
+        # print its score (to see if the frame-local store exists but scores wrong).
+        target_val = int(os.environ.get("C4_TARGET_VAL", str(P0)))
+        if is_load > 0.5:
+            allV = V[0, MEM_HEAD, :, 32 + 3:32 + 3 + 8]
+            for ki in range(allV.shape[0]):
+                val = 0
+                for j in range(8):
+                    nb = max(0, min(15, int(round(float(allV[ki, j])))))
+                    val |= nb << (4 * j)
+                if val == target_val:
+                    print(f"     >>> STORE relay={target_val} at key[{ki}] "
+                          f"abs_pos={int(k_pos[ki])} score={float(sc[ki]):+.3e} "
+                          f"w={float(w[ki]):.4e}", flush=True)
+                    # raw Q and K for the address channels (0..31) of the mem head,
+                    # to see fractional query/key residue.
+                    qch = Q[0, MEM_HEAD, qrow, :32]
+                    kch = K[0, MEM_HEAD, ki, :32]
+                    qkbit = (qch * kch)
+                    print(f"         per-bit Q*K sum(addr chans 0..31) = "
+                          f"{float(qkbit.sum()):+.4e}  (exact match would be "
+                          f"+32*|smag|^2)", flush=True)
+                    # raw query bits (fractional) — which lanes are non-{0, big}?
+                    raw = [round(float(qch[b]), 1) for b in range(12)]
+                    print(f"         Q addr chans[0..11] = {raw}", flush=True)
+                    rawk = [round(float(kch[b]), 1) for b in range(12)]
+                    print(f"         K addr chans[0..11] = {rawk}", flush=True)
+                    # gate channels 32=BIAS(IS_STORE/IS_LOAD), 33=store-role, 34=load-en
+                    for name, ch in (("BIAS", 32), ("STORE_ROLE", 33), ("LOAD_EN", 34)):
+                        qv = float(Q[0, MEM_HEAD, qrow, ch])
+                        kv = float(K[0, MEM_HEAD, ki, ch])
+                        print(f"         chan {ch}({name}): Q={qv:+.4e} K={kv:+.4e} "
+                              f"Q*K={qv * kv:+.4e}", flush=True)
+                    # the store row's IS_STORE input flag (from the cached K we can't
+                    # read x; report via the K decomposition above).
+                    addr_qk = float((Q[0, MEM_HEAD, qrow, :32] *
+                                     K[0, MEM_HEAD, ki, :32]).sum())
+                    gate_qk = float((Q[0, MEM_HEAD, qrow, 32:35] *
+                                     K[0, MEM_HEAD, ki, 32:35]).sum())
+                    print(f"         raw score = (addr {addr_qk:+.3e} + gate "
+                          f"{gate_qk:+.3e}) * hs; hs={target.scale:.4e}", flush=True)
+            # also dump the raw QRY_BIN float on the query input row (0..11).
+            rawq = [round(float(x[0, qrow, L.QRY_BIN + b]), 2) for b in range(12)]
+            print(f"     QRY_BIN raw floats[0..11] = {rawq}", flush=True)
         return orig_forward(x, past_kv=past_kv, q_positions=q_positions,
                             use_cache=use_cache)
 
