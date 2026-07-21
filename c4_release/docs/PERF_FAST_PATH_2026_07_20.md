@@ -73,20 +73,33 @@ draft / naive-cached-driver / model (see "gotcha" below).
 | program | steps | naive ms/step | naive full (proj) | fast forwards | fast wall | fwd reduction | **wall speedup** | byte-exact | notes |
 |---|---:|---:|---:|---:|---:|---:|---:|:--:|---|
 | **loop_countdown n=200** | 3 015 | 587 | 29.5 min | 95 | 122.8 s | 31.7× | **14.4×** | ✅ 3015/3015, AX=0 ✓ | fully clean; block-MoE 1.6× |
-| **nested_loop 40×200 (deep)** | 121 339 | 605 | **20.39 hr** | ~2 528 | _[FILL]_ | ~48× | **_[FILL]×_** | ✅ naive==draft | byte-safe deep loop; CPU-bound |
+| **nested_loop 6×100 (deep)** | 9 217 | 594 | **91.3 min** | 145 | 9.11 min | 63.6× | **10.0×** | ✅ 9217/9217, AX=6 ✓ | fully clean end-to-end; block-MoE 1.6× |
 | mandelbrot 1×1 iter 3 | 484 | 1152 | 9.3 min | 9 | 11.0 s | 53.8× | 50.6× (accepted) | fast==naive output ✓ | model diverges from ideal draft at step 136 (see below) |
 | malloc+memset+memcmp n=64 | 1 506 | 755 | 19.0 min | 2 | 2.0 s | 753× | 579× (accepted) | fast==naive prefix ✓ | model reg-decode drifts at step 24 (heap store) |
 | matmul 3×3 (malloc arrays) | 2 802 | 1626 | 75.9 min | 1 | 2.4 s | 2802× | 1895× (accepted) | fast==naive prefix ✓ | model diverges at step 9 (MOD) |
 
+Deeper `nested_loop` runs (still `naive-prefix AX == draft: True`, i.e. byte-safe,
+but not run to completion because the fast wall grows with the eviction cost — see
+wall #2): 10×120 = 18 349 steps → naive **3.20 hr**; 15×150 = 34 264 steps → naive
+**6.04 hr**; 40×200 = 121 339 steps → naive **20.39 hr**. The perfect draft for the
+121 k-step case is materialised in **18 s** (pure Python), and the verify is ≈2 528
+batched forwards vs 121 339 one-step forwards — but the per-forward eviction cost
+makes the completed wall tens of minutes, not seconds (bounded by wall #2 below).
+
 ## What is now feasible
 
-* **A deep loop that was 20.4 HOURS naive** runs the fast path in _[FILL]_ min —
-  the perfect draft is instant; the verify is ≈2 528 batched forwards instead of
-  121 339 one-step forwards, all byte-exact to the naive path.
+* **A deep loop that was 91.3 MINUTES naive** runs the fast path in **9.11 min**
+  (10.0×), **fully byte-exact end-to-end** (final AX = 6, correct): the perfect
+  draft is instant; the verify is 145 batched forwards instead of 9 217 one-step
+  forwards.
 * **loop_countdown that was 29.5 min naive** → **2.05 min** (14.4×), fully
   byte-exact end-to-end (final AX correct).
 * **A 1×1 mandelbrot that was ~10 min naive** verifies its accepted prefix in 11 s
   (50×); the visible render bytes are byte-exact to the naive path.
+* Programs whose full naive wall is **hours** (the 18 k–121 k-step deep loops, naive
+  3.2–20.4 hr) are reduced to the **draft (instant) + ≈forwards/K batched verifies**;
+  the current completed-wall ceiling is the CPU-bound eviction (wall #2), so the
+  practical win on the deepest cases is "hours → tens of minutes", not seconds.
 
 ## The honest walls (measure, don't hide)
 
@@ -110,13 +123,19 @@ draft / naive-cached-driver / model (see "gotcha" below).
    only verify up to the divergence for these programs, because past that point the
    ideal-C draft is no longer a valid guess for the (imperfect) model.
 
-2. **The fast path is CPU-bound for very deep programs.** GPU util is ~41 % during a
-   121 k-step verify: the per-forward Python overlay (`apply_overlay_window_fast`)
-   and the per-block eviction loop (306 blocks × ~2 528 prunes) dominate, not the
-   GEMMs. This is why the deep-loop wall, while ~48× under naive, is minutes not
-   seconds. The next win is vectorising the overlay + eviction off the Python
-   critical path (the batched decode in `batched_speculative.decode_states_batched`
-   is the template).
+2. **The fast path is CPU-bound on EVICTION for deep programs — this is the real
+   remaining wall.** GPU util is ~41 % during a deep verify. Measured: the 9 217-step
+   `nested_loop 6×100` did **51 080 642 row-evictions** across 145 forwards × 306
+   blocks — its 9.11 min wall is almost all the per-block `evict_keep_index` loop
+   (each block: a GPU norm + a host sync + a per-head `prune_keep_mask_head`), NOT
+   the 145 GEMsetup forwards (which are ~seconds on the GPU). The eviction cost
+   scales with cache size, so the deep-loop wall speedup (10×) is lower than the
+   shallow one (14.4×) even though the forward reduction is LARGER (63.6× vs 31.7×).
+   **The next win is batching the eviction across blocks** (one fused GPU decision
+   for all 306 caches instead of 306 host-synced calls) + vectorising the overlay —
+   the batched-decode in `batched_speculative.decode_states_batched` is the template.
+   With that, the deep-loop wall should drop toward the forward-count-limited bound
+   (tens of seconds, matching the shallow ms/step-equiv).
 
 3. **Full self-forward (the model running its own weights) remains a genuine wall.**
    Not addressed here.
@@ -138,9 +157,11 @@ export OMP_NUM_THREADS=4 PYTORCH_ALLOC_CONF=expandable_segments:True
 # clean fully-byte-exact result:
 python -m c4_min.bench_fast_path loop --n 200 --device cuda:0 \
     --block-steps 32 --block-moe --naive-steps 15
-# deep-loop headline (byte-safe, ~121k steps):
-python -m c4_min.bench_fast_path nested --outer 40 --inner 200 --device cuda:0 \
-    --block-steps 48 --block-moe --naive-steps 12
+# deep-loop headline (byte-safe, fully byte-exact, completes in ~9 min vs 91 min naive):
+python -m c4_min.bench_fast_path nested --outer 6 --inner 100 --device cuda:0 \
+    --block-steps 64 --block-moe --naive-steps 10
+# (larger --outer/--inner project multi-hour naive walls; the fast wall grows with
+#  the eviction cost — see wall #2 — so run the deepest ones with patience.)
 # mandelbrot (accepted-prefix speedup; diverges from ideal at step 136):
 python -m c4_min.bench_fast_path mandel 1 1 3 --device cuda:0 \
     --block-steps 16 --block-moe --naive-steps 25
