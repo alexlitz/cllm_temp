@@ -79,7 +79,7 @@ from .nibble_vm import (
     compile_ffn, compile_nibble_to_scalar, compile_pc_fetch,
     compile_code_select, compile_opcode_decode, base_dispatch_rules,
     compile_branch_delta, compile_fold, _empty_spec,
-    _write_reg_nibbles, VALVOCAB,
+    _write_reg_nibbles, VALVOCAB, vm_width32, maybe_cast_model_for_width,
 )
 from .nibble_moe import NibbleStandardMoEFFN, _ffn_from_spec
 
@@ -547,7 +547,7 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
             L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))
     post_blocks = [
         ("branch-delta", compile_branch_delta(L, dim)),
-        ("fold",        compile_fold(L.AX_VAL, L.ONE, dim, modulus=256)),
+        ("fold",        compile_fold(L.AX_VAL, L.ONE, dim)),   # width-aware (256/2^32)
     ]
     block_plan = pre_blocks + [("dispatch", moe)] + post_blocks
     n_blocks = len(block_plan)
@@ -572,6 +572,9 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
                 _load_ffn_padded(blk.ffn, payload, hidden)
         # block 0's attention = the real softmax1+ALiBi §Memory CAM head.
         bake_memory_head(model.blocks[0].attn, L, head=0)
+    # width-32: run the whole step in fp64 (SUB +2^32 shift / 16^7 recompose /
+    # per-byte requant exact to 2^32).  No-op under the 8-bit substrate.
+    maybe_cast_model_for_width(model)
 
     meta = {
         "code_size": code_size, "n_heads": n_heads, "dim": dim,

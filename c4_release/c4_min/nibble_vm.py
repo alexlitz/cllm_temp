@@ -50,6 +50,7 @@ scalar next-state back into the nibble bands.
 """
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Tuple
 
 import torch
@@ -67,6 +68,53 @@ S = 60.0        # silu identity: silu(60)≈60, silu(-60)≈0 (fp32-exact on int
 RELU_S = 200.0  # relu-via-silu: silu(RELU_S·z)/RELU_S ≈ relu(z), exact on ints
 SILU_S = float(F.silu(torch.tensor(S)))          # ≈ 60.0
 SILU_HALF = float(F.silu(torch.tensor(0.5 * S)))  # ≈ 30.0
+
+
+# ---------------------------------------------------------------------------
+# Value-lane WIDTH (Family-2 fix, #667).
+#
+# The folded corpus (``isa.interpret``, ``MASK=0xFF``) runs the whole scalar
+# value substrate at **8 bits**: the recompose reads 5 nibbles, ADD/SUB carry a
+# ``+256`` byte wrap, the ``fold`` block does ``AX mod 256``, LEA adds BP's LOW
+# byte, and the requant snaps a single flat argmax over ``VALVOCAB`` (~0x10100).
+# That makes loop counters and MOD operands **effectively 8-bit** — a
+# ``while (i < n)`` with ``n > 255`` diverges from ideal C because the operand is
+# truncated at the fold BEFORE the (already 32-bit-capable) compare ever sees it.
+#
+# ``C4_VM_WIDTH32=1`` widens the substrate to full 32 bits, exact (fp64 exec):
+#   * recompose reads all 8 nibbles (16^7 needs the high bytes)   -> full value
+#   * ADD/SUB drop the ``+256`` byte hack (SUB shift = 0); the requant wraps a
+#     negative SUB result mod 2^32 (two's complement) directly — routing a 2^32
+#     constant through the SwiGLU gate is NOT fp-exact even in fp64 (the
+#     silu-identity's ~1e-9 relative error times 2^32 is ~4 units)
+#   * the mod-256 ``fold`` becomes a NO-OP (a 2^32 ramp is not materialisable);
+#     the requant carries the mod-2^32 wrap
+#   * LEA uses the full BP value + imm
+#   * the requant (``_snap_lane`` -> ``_snap_lane_bytes``) snaps to the nearest
+#     integer via ``floor(x+½)`` (the round-free argmax equivalent — the AST guard
+#     forbids the ``round`` builtin here), reduces to ``v mod 2^32`` (two's
+#     complement, so a large loop counter / negative never aliases to zero), and
+#     splits into 4 little-endian bytes — the §720 high-to-low cascade at the token
+#     round-trip, exact to the full 2^32 with NO 2^32-wide vocab and NO fp64
+#     nibble-pack (§590).  The model runs in fp64 so 16^7 recompose + requant are
+#     exact past 2^24.  Unsigned 32-bit ordering (compare/branch) is exact.
+# Default OFF -> byte-identical to the 8-bit folded corpus.  ON -> 32-bit.
+# ---------------------------------------------------------------------------
+def vm_width32() -> bool:
+    """True iff the full-32-bit value substrate is enabled (``C4_VM_WIDTH32=1``)."""
+    return os.environ.get("C4_VM_WIDTH32", "0") == "1"
+
+
+def _recompose_hi_nibbles() -> int:
+    """Nibbles the recompose reads into a value lane: 8 (32-bit) when width-32,
+    else 5 (the 8-bit-substrate foundation range)."""
+    return 8 if vm_width32() else 5
+
+
+def _fold_modulus() -> int:
+    """The AX value-lane fold modulus: 2^32 (a no-op ramp, requant carries the
+    wrap) under width-32, else 256 (the 8-bit fold)."""
+    return (1 << 32) if vm_width32() else 256
 
 # The opcode VALUES the interpreter decodes + dispatches (the built base subset).
 BASE_OPS = [isa.IMM, isa.LEA, isa.PSH, isa.ADD, isa.SUB,
@@ -111,19 +159,24 @@ def compile_ffn(rules: List[FFNRule], dim: int) -> Dict[str, torch.Tensor]:
 # (1) NIBBLE -> SCALAR recompose. value_lane = Σ_j 16^j · nibble_j.
 # ---------------------------------------------------------------------------
 def compile_nibble_to_scalar(L: NibbleVMLayout, dim: int,
-                             hi_nibbles: int = 5) -> Dict[str, torch.Tensor]:
+                             hi_nibbles: int = None) -> Dict[str, torch.Tensor]:
     """Recompose each register's nibble band into its scalar value lane (SET).
 
     ``VAL = Σ_{j<hi_nibbles} 16^j · nibble_j`` via silu-identity reads
     (``silu(S·nib_j)/S ≈ nib_j``, exact for nibbles 0..15) weighted by ``16^j`` in
-    the down-projection. ``hi_nibbles=5`` covers the foundation range: 8-bit
-    AX/STACK0 (nibbles 0..1), small PC, and SP/BP = 0x10000 (nibble 4);
-    ``16^4 = 65536 < 2^24`` so the fp32 recompose is exact.
+    the down-projection. Default ``hi_nibbles`` = 8 under ``C4_VM_WIDTH32`` (full
+    32-bit): ``16^7`` exceeds fp32's 2^24 unit precision, so the width-32 model runs
+    in fp64 (2^32 < 2^53) where the recompose is exact and the requant re-snaps the
+    lane to the exact integer.  Else 5 (the 8-bit-substrate foundation range: 8-bit
+    AX/STACK0, small PC, SP/BP = 0x10000 at nibble 4; ``16^4 = 65536 < 2^24``
+    fp32-exact).
 
     This is the bridge that lets the PROVEN scalar dispatch algebra run on the
     spec's canonical nibble state: the nibble band is canonical; the scalar lane
     is its per-step image.
     """
+    if hi_nibbles is None:
+        hi_nibbles = _recompose_hi_nibbles()
     # (nibble_base, value_lane, n_read): full registers read hi_nibbles; BP_LOW
     # reads only nibbles 0,1 (the frame-pointer's low byte for the 8-bit LEA).
     pairs = [(L.PC, L.PC_VAL, hi_nibbles), (L.AX, L.AX_VAL, hi_nibbles),
@@ -270,6 +323,15 @@ def base_dispatch_rules(L: NibbleVMLayout) -> List[FFNRule]:
     """
     ax, sp, bp, stk, pc = L.AX_VAL, L.SP_VAL, L.BP_VAL, L.STK_VAL, L.PC_VAL
     IMM = L.IMM
+    # Width-32: NO non-negativity shift — the per-byte requant wraps a negative
+    # SUB result mod 2^32 (two's complement) directly, and routing a 2^32 constant
+    # through the SwiGLU gate is NOT fp-exact (the silu-identity's ~1e-9 relative
+    # error times 2^32 is ~4 units).  LEA uses the full BP value, not just its low
+    # byte.  8-bit: +256 wrap (the requant there is the flat non-negative argmax)
+    # + BP low byte (the folded-corpus behaviour).
+    w32 = vm_width32()
+    SUB_SHIFT = 0.0 if w32 else 256.0
+    lea_bp = LinearExpr.of(bp, 1.0) if w32 else LinearExpr.of(L.BP_LOW, 1.0)
 
     def G(op):
         return [(L.OP_IS + op, 0.5, 1.5)]         # fires iff decoded opcode == op
@@ -278,21 +340,22 @@ def base_dispatch_rules(L: NibbleVMLayout) -> List[FFNRule]:
     # IMM: AX = imm ; PC += 1
     rules.append(FFNRule(G(isa.IMM), {
         ax: LinearExpr.of(IMM, 1.0) + LinearExpr.of(ax, -1.0), pc: LinearExpr.c(1.0)}))
-    # LEA: AX = (BP + imm) & 0xFF ; PC += 1  (8-bit op: add BP's LOW byte, then
-    # the downstream mod-256 fold keeps AX a byte).
+    # LEA: AX = (BP + imm) ; PC += 1.  8-bit: BP LOW byte + fold; 32-bit: full BP.
     rules.append(FFNRule(G(isa.LEA), {
-        ax: LinearExpr.of(L.BP_LOW, 1.0) + LinearExpr.of(IMM, 1.0) + LinearExpr.of(ax, -1.0),
+        ax: lea_bp + LinearExpr.of(IMM, 1.0) + LinearExpr.of(ax, -1.0),
         pc: LinearExpr.c(1.0)}))
     # PSH: STACK0 = AX ; SP -= 4 ; PC += 1
     rules.append(FFNRule(G(isa.PSH), {
         stk: LinearExpr.of(ax, 1.0) + LinearExpr.of(stk, -1.0),
         sp: LinearExpr.c(-4.0), pc: LinearExpr.c(1.0)}))
-    # ADD: AX = STACK0 + AX ; SP += 4 ; PC += 1   (fold mod 256 downstream)
+    # ADD: AX = STACK0 + AX ; SP += 4 ; PC += 1   (per-byte requant wraps mod 2^W)
     rules.append(FFNRule(G(isa.ADD), {
         ax: LinearExpr.of(stk, 1.0), sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}))
-    # SUB: AX = STACK0 - AX == stk - 2·AX + 256 ; SP += 4 ; PC += 1 (fold downstream)
+    # SUB: AX = STACK0 - AX == stk - 2·AX + SHIFT ; SP += 4 ; PC += 1.  The SHIFT
+    # keeps the lane non-negative for the requant; the requant wraps mod 2^W so the
+    # extra SHIFT (a multiple of 2^W) vanishes.  8-bit SHIFT=256, 32-bit=2^32.
     rules.append(FFNRule(G(isa.SUB), {
-        ax: LinearExpr.of(stk, 1.0) + LinearExpr.of(ax, -2.0) + LinearExpr.c(256.0),
+        ax: LinearExpr.of(stk, 1.0) + LinearExpr.of(ax, -2.0) + LinearExpr.c(SUB_SHIFT),
         sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}))
     # JMP: PC = imm == PC += (imm - PC)
     rules.append(FFNRule(G(isa.JMP), {
@@ -345,10 +408,20 @@ def compile_branch_delta(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]
     return spec
 
 
-def compile_fold(band: int, one_band: int, dim: int, modulus: int = 256
+def compile_fold(band: int, one_band: int, dim: int, modulus: int = None
                  ) -> Dict[str, torch.Tensor]:
     """Exact mod-``modulus`` fold on ``band`` in [0, 2M): ``band -= M·(band>=M)``,
-    a sharp unit ramp at M-0.5. Ported from ``compile_ffn.compile_fold``."""
+    a sharp unit ramp at M-0.5. Ported from ``compile_ffn.compile_fold``.
+
+    Under ``C4_VM_WIDTH32`` the modulus is 2^32; the fp32 ramp at ``2^32-0.5``
+    cannot be materialised (it exceeds fp32 unit precision), so this block becomes
+    a NO-OP and the mod-2^32 wrap is done by the PER-BYTE requant round-trip
+    (``_emit_and_reembed`` snaps each byte mod 256 -> the whole value mod 2^32).
+    """
+    if modulus is None:
+        modulus = _fold_modulus()
+    if modulus >= (1 << 32):
+        return _empty_spec(dim, 1)                 # no-op; requant carries the wrap
     M, w = modulus, 0.2
     lo = M - 0.5
     spec = _empty_spec(dim, 2)
@@ -390,7 +463,7 @@ def build_step_model(code_size: int, n_heads: int = 4):
         compile_opcode_decode(L, dim),
         compile_ffn(base_dispatch_rules(L), dim),
         compile_branch_delta(L, dim),
-        compile_fold(L.AX_VAL, L.ONE, dim, modulus=256),
+        compile_fold(L.AX_VAL, L.ONE, dim),        # width-aware modulus (256 / 2^32)
     ]
     n_blocks = len(ffn_specs)
     hidden = max(f["W_up"].shape[0] for f in ffn_specs)
@@ -406,7 +479,17 @@ def build_step_model(code_size: int, n_heads: int = 4):
         for blk, spec in zip(model.blocks, ffn_specs):
             _zero_attn(blk.attn)
             _load_ffn(blk.ffn, spec, hidden)
+    maybe_cast_model_for_width(model)
     return model, L
+
+
+def maybe_cast_model_for_width(model) -> None:
+    """Cast the model to fp64 when the full-32-bit substrate is on, so the 16^7
+    recompose, the ADD/SUB algebra, and the requant integer snap are all exact to
+    2^32. No-op (fp32) under the 8-bit substrate — byte-identical to the folded
+    corpus."""
+    if vm_width32():
+        model.double()
 
 
 def _zero_attn(attn) -> None:
@@ -448,7 +531,11 @@ def load_program(model, L: NibbleVMLayout, code: List[isa.Instr]) -> torch.Tenso
     PC=AX=0, SP=BP=0x10000, written as NIBBLE bands. ONE=1.
     """
     assert len(code) <= L.code_size, f"{len(code)} slots > code_size {L.code_size}"
-    state = torch.zeros(L.D)
+    # width-32 runs the whole step in fp64 so the recompose (16^7), the SUB +2^32
+    # non-negativity shift, and the per-byte requant are all exact to the full
+    # 2^32; the 8-bit substrate stays fp32 (byte-identical to the folded corpus).
+    dtype = torch.float64 if vm_width32() else torch.float32
+    state = torch.zeros(L.D, dtype=dtype)
     state[L.ONE] = 1.0
     _write_reg_nibbles(state, L.PC, 0)
     _write_reg_nibbles(state, L.AX, 0)
@@ -516,11 +603,45 @@ VALVOCAB = 0x10100   # 0..0x100FF: covers SP/BP = 0x10000 ± small, plus head-ro
 def _snap_lane(lane: torch.Tensor) -> int:
     """The LM-head requant: emit the value token ``argmax_v (2·v·x − v²)`` over the
     value vocabulary — the exact-integer snap of the lane, NO ``round``. Vectorised
-    so the wide vocab is a single argmax (the standard decode-step argmax)."""
+    so the wide vocab is a single argmax (the standard decode-step argmax).
+
+    Under ``C4_VM_WIDTH32`` the flat argmax (capped at ``VALVOCAB`` ≈ 0x10100)
+    would clip any value > ~65K, so the snap descends to ``_snap_lane_bytes``: the
+    fp64-exact integer snap (``floor(x+½)``, the round-free argmax equivalent)
+    reduced to the unsigned 32-bit word ``v mod 2^32`` — exact to the full 2^32 with
+    no 2^32-wide vocab (the §720-style cascade at the token round-trip)."""
+    if vm_width32():
+        return _snap_lane_bytes(lane)
     x = float(lane)
     v = torch.arange(VALVOCAB, dtype=torch.float64)
     logits = 2.0 * v * x - v * v            # LM-head value logits
     return int(logits.argmax().item())      # argmax == the emitted value token
+
+
+def _snap_lane_bytes(lane: torch.Tensor) -> int:
+    """PER-BYTE requant for the full-32-bit substrate (Family-2 fix).
+
+    The lane holds a signed integer image carrying an O(1e-9) SwiGLU residue (a
+    SUB may dip negative, an ADD may overflow past 2^32).  We first snap it to the
+    nearest integer — the vanilla LM-head re-quantiser
+    ``round(x) = argmax_v (2·v·x − v²)`` — realised round-free as
+    ``floor(x + ½)`` (``math.floor``, NOT the ``round`` builtin the AST guard
+    forbids; identical to the argmax snap the 8-bit ``_snap_lane`` does, only that
+    flat argmax caps at ~0x10100 and cannot reach 2^32).  In fp64 the lane is exact
+    to 2^53 ≫ 2^32, so ``floor(x+½)`` recovers the exact integer (annihilating the
+    residue — the same job the argmax does).  The integer is then reduced to the
+    unsigned 32-bit word ``v mod 2^32`` and split into 4 little-endian bytes by
+    exact integer arithmetic.
+
+    Sign / overflow: ``% 2^32`` gives the two's-complement word, so a borrow
+    (negative lane) or overflow (≥ 2^32) wraps correctly and a large loop counter
+    never aliases a large value to zero.  fp64 required (the width-32 driver runs
+    the model in fp64)."""
+    import math
+    r = float(lane)
+    # snap to the nearest integer (== the LM-head argmax; floor(x+½) is round-free)
+    ivalue = math.floor(r + 0.5) if r >= 0 else -math.floor(-r + 0.5)
+    return ivalue & 0xFFFFFFFF                        # two's-complement 32-bit word
 
 
 def run_program(model, L: NibbleVMLayout, code: List[isa.Instr],
