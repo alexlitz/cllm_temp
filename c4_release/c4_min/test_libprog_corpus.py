@@ -101,9 +101,12 @@ def test_reference_byte_exact(entry):
 #     PSH/PRTF/ADJ, so they exercise the neural PRTF stdout channel end to end.
 #     These run by default (a few minutes: ~3s/step + one ~4 GB build).
 #   * HEAVY tier — the heap / file / deep-loop programs (malloc/memset/memcmp/
-#     filecat/malloc_free_reuse/memtest/malloc_printf, ~220-1551 steps): NOT yet
-#     byte-exact through the model.  The ABI retarget + file-op marshalling +
-#     8-bit-LEA low-stack relocation are all correct.
+#     filecat/malloc_free_reuse/memtest/malloc_printf, ~220-1551 steps).  The ABI
+#     retarget + file-op marshalling + 8-bit-LEA low-stack relocation are correct;
+#     malloc_printf now runs BYTE-EXACT through the model (verified end-to-end:
+#     model stdout == golden b'byte=72 char=H\nHHH\n'), after BOTH root causes below
+#     were fixed.  They stay xfail(strict=False) only because each real neural run is
+#     ~60-130 min (too slow for plain pytest); C4_LIB_NEURAL_HEAVY=1 runs them for real.
 #
 #     FIXED (#648/#660, the frame-offset IMM LEAK): the fetched scalar IMM leaked a
 #     fraction of nearby large literals (0x20000 etc.) through the imperfect PC
@@ -119,18 +122,25 @@ def test_reference_byte_exact(entry):
 #     (SC@131072=72), and 'JMP 163 -> 134' resolves correctly.  LEA sweep 9/9,
 #     runtime primitives 5/5 (zfod/malloc/memset/memcmp) still pass.
 #
-#     REMAINING (SEPARATE memory-CAM value bug, NOT the IMM leak): the memset fill
-#     loop keeps the running byte pointer in a FRAME LOCAL (BP-4) and increments it
-#     each iteration (p++).  The first LI of that local reads 0x20000 correctly, but
-#     a LATER LI of the SAME local (8 steps on, AFTER the iteration's SC heap write
-#     to 0x20000) reads 0 -> the pointer is lost and the second SC writes 'H' to
-#     address 1 instead of 0x20001.  A model §Memory-CAM recency/eviction fidelity
-#     issue for a frame-local pointer read back after an intervening store to the
-#     same-numbered heap address (0x20000 = the pointer value = the byte address).
-#     The LI/SI value path + the KV eviction are untouched by the IMM_CLEAN fix, so
-#     this is pre-existing.  Out of the IMM-leak scope; each neural run is ~60-130 min
-#     (the driver's per-step store-log scan is ~O(n^2) and the code_size=258 model is
-#     ~3x the code_size=55 model per step).
+#     FIXED (§Memory-CAM role-gate flag residue, the frame-pointer read-back): the
+#     memset fill loop / its args read the malloc'd pointer out of a FRAME LOCAL /
+#     arg slot once the callee sits at a HIGH pc (memset at pc 109).  The §Memory /
+#     stack-pop / LEV KV heads gate eligibility with a load/pop/lev-ENABLE channel
+#     whose score is LINEAR in the query flag: -PEN_GATE*(1 - IS_LOAD).  PEN_GATE is
+#     necessarily huge (100*ADDR_BITS*EFF, to dominate the worst-case partial address
+#     match), and the opcode-decode nibble ramp leaves IS_LOAD ~= 1-4e-4 at a large
+#     pc -> that residue * huge PEN_GATE = a -7e6 penalty that swamps the exact-
+#     address match (+5e5) and sinks an EXACT-address load to ZFOD 0.  In malloc_printf
+#     memset's LI of its byte-pointer read 0 -> the write went to address ~0 -> empty
+#     output.  Root-caused with the CAM-weight probe (score/gate-channel dump); it is
+#     a PURE attention read (reproduces with eviction OFF), NOT the frame-local/heap
+#     aliasing hypothesized nor eviction.  FIX (nibble_pure_forward._flag_from_ops):
+#     THRESHOLD the query flags to a clean 0/1 with a saturating relu-ramp step, so
+#     IS_LOAD/IS_POP/IS_LEV = 1.0 exactly for any g>0.6 (residue-immune) -> the huge
+#     gate stays huge without amplifying flag residue.  Neural primitives 5/5 and
+#     printf-tier 3/3 still pass; malloc_printf now byte-exact.  Each real neural run
+#     is still ~60-130 min (the driver's per-step store-log scan is ~O(n^2) and the
+#     code_size=258 model is ~3x the code_size=55 model per step).
 #
 # The HEAVY tier is marked xfail(strict=False) so plain `pytest` is green and the
 # real (not faked) neural attempt is still exercised when C4_LIB_NEURAL_HEAVY=1.
