@@ -154,6 +154,14 @@ def test_step_count_scales_with_precision():
 
 # ---------------------------------------------------------------------------
 # GPU: byte-exact through the ACTUAL lean neural forward (SUBSET_BITWISE).
+#
+# The subroutine MUL/DIV/MOD reach data-stack DEPTH 2-3 (``imm addr; PSH; <compute
+# value>; SI`` and the ``_lt_expr`` borrow-hack), which the STOCK single-``STACK0``
+# lean driver (``run_program_lean``, depth 1) cannot mirror — so these run under the
+# STACK-AWARE driver (``qwen_lean_stack_driver.run_program_lean_stack``), which keeps
+# a real depth-N Python data stack alongside the token stream while the model still
+# computes every opcode inside the shallow ~15-layer forward.  ``code_size`` must be
+# >= the program length (div8 is ~171 instructions), hence 256 here.
 # ---------------------------------------------------------------------------
 def _cuda1_or_skip():
     import torch
@@ -168,19 +176,44 @@ def lean_bitwise():
     os.environ.setdefault("C4_VM_CACHE_DIR", "/tmp/c4cache_agent")
     from c4_min import qwen_full_vm as Q
     from c4_min import qwen_lean_forward as LF
-    vm = Q.build(code_size=64, subset=Q.SUBSET_BITWISE)
+    vm = Q.build(code_size=256, subset=Q.SUBSET_BITWISE)
     return LF.LeanQwenVM.from_full_vm(vm, device=dev)
 
 
 @pytest.mark.parametrize("a,b", [(12, 11), (200, 3), (13, 10)])
 def test_mul8_through_neural_forward(lean_bitwise, a, b):
-    from c4_min import qwen_lean_forward as LF
-    r = LF.run_program_lean(lean_bitwise, M.program_mul8(a, b), max_steps=5000)
+    from c4_min import qwen_lean_stack_driver as SD
+    r = SD.run_program_lean_stack(lean_bitwise, M.program_mul8(a, b), max_steps=5000)
+    assert r["exact"], r
     assert r["ax_trace"][-1] == (a * b) & 0xFF
 
 
 @pytest.mark.parametrize("a,b", [(200, 17), (100, 7)])
 def test_div8_through_neural_forward(lean_bitwise, a, b):
-    from c4_min import qwen_lean_forward as LF
-    r = LF.run_program_lean(lean_bitwise, M.program_div8(a, b), max_steps=5000)
+    from c4_min import qwen_lean_stack_driver as SD
+    r = SD.run_program_lean_stack(lean_bitwise, M.program_div8(a, b), max_steps=5000)
+    assert r["exact"], r
     assert r["ax_trace"][-1] == (a // b) & 0xFF
+
+
+@pytest.mark.parametrize("a,b", [(200, 17), (100, 7)])
+def test_mod8_through_neural_forward(lean_bitwise, a, b):
+    from c4_min import qwen_lean_stack_driver as SD
+    r = SD.run_program_lean_stack(lean_bitwise, M.program_mod8(a, b), max_steps=5000)
+    assert r["exact"], r
+    assert r["ax_trace"][-1] == (a % b) & 0xFF
+
+
+@pytest.mark.parametrize("a,b", [(12, 11), (200, 3)])
+def test_muldiv_speculation_batches_and_is_exact(lean_bitwise, a, b):
+    """Perfect-draft speculation VERIFIES the whole inline BNZ loop in a handful of
+    BATCHED forwards (forwards << naive one-per-step) and is byte-exact vs
+    isa.interpret — the muldiv stays in the speculation slice (no JSR/ENT/LEV)."""
+    from c4_min import qwen_lean_stack_driver as SD
+    prog = M.program_mul8(a, b)
+    r = SD.speculative_run_lean_stack(lean_bitwise, prog, block_steps=256,
+                                      max_steps=5000)
+    assert r.exact and r.status == "PASS", r
+    assert r.ax_trace[-1] == (a * b) & 0xFF
+    assert r.forwards < r.naive_forwards          # batched < one-per-step
+    assert r.speedup > 1.0

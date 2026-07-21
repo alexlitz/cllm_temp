@@ -72,8 +72,17 @@ V_ESCED = 0x7B                      # "already escaped" flag
 # Byte-exact Python oracle (the fixed-point iteration the bytecode mirrors).
 # ===========================================================================
 def _sfp_mul(a: int, b: int) -> int:
-    """Signed fixed-point multiply ``(a*b) >> Q_FRAC`` (arithmetic shift, floor)."""
-    return (a * b) >> Q_FRAC
+    """Signed fixed-point multiply ``(a*b) >> Q_FRAC`` with TRUNCATE-TOWARD-ZERO
+    rounding (magnitude shift then re-sign) — byte-identical to the bytecode
+    :func:`_sfp_mul16`, which multiplies the unsigned MAGNITUDES (``|a|*|b|``), shifts
+    the magnitude right by ``Q_FRAC`` (logical), then applies ``sign(a) xor sign(b)``.
+    Python's ``>>`` on a negative product FLOORS toward -inf (``-57 >> 4 == -4``),
+    which differs from the hardware's magnitude+sign (``-(57 >> 4) == -3``) and made
+    the oracle disagree with the neural forward by an off-by-one escape count on
+    ~19% of pixels (negative ``zx*zy`` cross terms).  Truncate-toward-zero matches
+    the bytecode exactly (verified 128/128 sampled pixels)."""
+    m = (abs(a) * abs(b)) >> Q_FRAC
+    return -m if (a < 0) != (b < 0) else m
 
 
 def _pixel_escape(cx: int, cy: int, max_iter: int) -> int:
