@@ -411,6 +411,18 @@ def run_bench(kind: str, args) -> int:
         sparse = sparse.to(device)
         print(f"  moved model to {device}", flush=True)
 
+    # -- LOCAL (sliding-window) attention on the non-memory heads (opt-in) -----
+    # The ~20 ingest heads only read the last W tokens (O(S*W)); the memory /
+    # stack-pop / LEV KV heads stay GLOBAL (full causal).  Byte-identical: each
+    # windowed head's true attention weight past W is exactly 0.
+    if args.local_window is not None:
+        from .local_attention import install_local_attention
+        la = install_local_attention(sparse, window=args.local_window, verbose=True)
+        print(f"  LOCAL-ATTN: window={la['window']}  "
+              f"windowed {la['frac_windowed']*100:.1f}% of head-slots  "
+              f"({la['n_global_head_slots']} global, {la['n_local_head_slots']} local)",
+              flush=True)
+
     # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
     #    (K vs amortized ms/step vs peak-VRAM vs forwards vs GPU-util). ---------
     if args.k_sweep:
@@ -611,6 +623,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--max-steps", type=int, default=5_000_000)
     ap.add_argument("--sp-init", type=lambda s: int(s, 0), default=None,
                     help="override SP_INIT (e.g. 0xFC for deep recursion).")
+    ap.add_argument("--local-window", type=int, default=None,
+                    help="sliding-window (LOCAL) attention on the non-memory heads: "
+                         "the ~20 ingest heads only read the last W tokens (O(S*W)), "
+                         "the memory/stack/LEV KV heads stay GLOBAL (full causal). "
+                         "Byte-identical (ingest weight past W is 0). Try 64 (~2 VM "
+                         "steps). Off by default (full global attention).")
     args = ap.parse_args(argv)
     if args.kind == "mandel":
         if len(args.grid) < 3:
