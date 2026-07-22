@@ -237,6 +237,92 @@ def test_muldiv_through_qwen(vm_efficient_recurrent, op, a, b):
     assert [v & 0xFF for v in r["ax_trace"]] == r["ref_trace"]       # 8-bit == isa
 
 
+# -- SHIFT-VIA-MUL/DIV : SHL/SHR retire the ~20K barrel shifter -------------
+def test_shift_via_mul_gating():
+    """``shift_via_mul`` is enabled ONLY for a subset with BOTH muldiv (the MUL/DIV
+    gadgets a shift reuses) and bitwise (the SHL/SHR ops); a muldiv-less bitwise
+    subset keeps the barrel shifter, base/muldiv-only subsets are untouched."""
+    # FULL (bitwise+muldiv) -> on; the barrel shifter is DROPPED from bw-select.
+    QLf = Q.QwenFullLayout(24, Q.SUBSET_FULL, efficient_alu=True, shift_via_mul=True)
+    assert QLf.shift_via_mul is True
+    sf = Q._block_specs(QLf.L, 24, Q.SUBSET_FULL, efficient_alu=True,
+                        shift_via_mul=QLf.shift_via_mul)
+    names = [n for n, _ in sf]
+    assert "alu-shift-onehot" in names and "alu-shift-pow2" in names
+    assert "bw-expand" not in names and "bw-bit4" not in names   # barrel one-hots gone
+    # muldiv-LESS bitwise -> off (no MUL/DIV gadget), barrel shifter kept intact.
+    QLb = Q.QwenFullLayout(24, Q.SUBSET_BITWISE, efficient_alu=True, shift_via_mul=True)
+    assert QLb.shift_via_mul is False
+    sb = Q._block_specs(QLb.L, 24, Q.SUBSET_BITWISE, efficient_alu=True,
+                        shift_via_mul=QLb.shift_via_mul)
+    bnames = [n for n, _ in sb]
+    assert "bw-select" in bnames and "bw-expand" in bnames        # barrel path present
+    assert "alu-shift-pow2" not in bnames
+    # base / muldiv-only carry no SHL/SHR -> off.
+    assert Q.QwenFullLayout(24, Q.SUBSET_BASE).shift_via_mul is False
+    assert Q.QwenFullLayout(24, Q.SUBSET_MULDIV, efficient_alu=True,
+                            shift_via_mul=True).shift_via_mul is False
+
+
+def test_shift_via_mul_retires_the_barrel_shifter_weights():
+    """The barrel shifter (bw-* SHL 3776 + SHR 10944 = ~14.7K nz + its shift one-hot /
+    bit4 blocks) is REPLACED by a ~1.1K-nz pow2 table + operand route: the bitwise FFN
+    nz drops from ~20.5K to ~5.4K, and the added shift-route block is ~1.1K."""
+    def nz(specs, pred):
+        tot = 0
+        for name, s in specs:
+            if pred(name):
+                tot += sum(int((s[k] != 0).sum()) for k in
+                           ("W_up", "b_up", "W_gate", "b_gate", "W_down", "b_down")
+                           if k in s)
+        return tot
+    QLoff = Q.QwenFullLayout(24, Q.SUBSET_FULL, efficient_alu=True, shift_via_mul=False)
+    off = Q._block_specs(QLoff.L, 24, Q.SUBSET_FULL, efficient_alu=True,
+                         shift_via_mul=QLoff.shift_via_mul)
+    QLon = Q.QwenFullLayout(24, Q.SUBSET_FULL, efficient_alu=True, shift_via_mul=True)
+    on = Q._block_specs(QLon.L, 24, Q.SUBSET_FULL, efficient_alu=True,
+                        shift_via_mul=QLon.shift_via_mul)
+    bw_off = nz(off, lambda n: n.startswith("bw-"))
+    bw_on = nz(on, lambda n: n.startswith("bw-"))
+    sh_on = nz(on, lambda n: n.startswith("alu-shift"))
+    assert bw_off > 20000                       # barrel shifter dominates the ~20.5K
+    assert bw_on < 6000                         # OR/XOR/AND bitplanes + combine only
+    assert sh_on < 1500                         # tiny pow2 table + operand route
+    assert (bw_off - bw_on) > 14000             # barrel shifter (~15K nz) retired
+    assert (bw_on + sh_on) < bw_off // 2        # net > 2x smaller
+
+
+@pytest.fixture(scope="module")
+def vm_full_shift():
+    # FULL subset (bitwise + muldiv); recurrent divmod stores one reused long-division
+    # body so the build is light (the shift REUSES the same MUL/DIV gadgets).
+    return Q.build(code_size=8, subset=Q.SUBSET_FULL, efficient_alu=True,
+                   recurrent_divmod=True, code_from_memory=True, shift_via_mul=True)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("op", ["SHL", "SHR"])
+@pytest.mark.parametrize("x,n", [
+    (5, 0), (5, 1), (5, 7), (1, 15), (1, 31), (5, 32), (5, 40),
+    (200, 3), (255, 1), (255, 8), (0x80, 1),
+])
+def test_shift_via_mul_byte_exact_through_forward(vm_full_shift, op, x, n):
+    """SHL/SHR run byte-exact through the REAL Qwen forward via the NATIVE MUL/DIV
+    gadgets (``x*2**n`` / ``x//2**n``): the pow2-route overwrites AX with 2**n and the
+    ax-mux delivers MUL_RES/DIV_RES into AX — no barrel shifter.  Checked at 32-bit
+    (vs ``ref_interpret(mask=0xFFFFFFFF)``, incl x with high bits set / SHR unsigned /
+    shift-count >= 32 -> 0) AND at the 8-bit fold (vs ``isa.interpret``)."""
+    from c4_min.nibble_pure_forward_complete import ref_interpret
+    opc = getattr(isa, op)
+    prog = [isa.Instr(isa.IMM, x), isa.Instr(isa.PSH), isa.Instr(isa.IMM, n),
+            isa.Instr(opc), isa.Instr(isa.HALT)]
+    r = Q.run_program(vm_full_shift, prog, max_steps=8, mask=0xFFFFFFFF)
+    got32 = r["ax_trace"][3]                     # index 3 = the shift op (IMM;PSH;IMM;OP)
+    ref32 = ref_interpret(prog, max_steps=8, mask=0xFFFFFFFF)[3]
+    assert got32 == ref32, (op, x, n, got32, ref32)             # 32-bit-exact
+    assert (got32 & 0xFF) == (isa.interpret(prog, max_steps=8)[3])  # 8-bit == isa
+
+
 # -- the compute really runs in the Qwen forward, not a python gadget --------
 def test_compute_is_in_the_qwen_forward(vm_base):
     """Zeroing the Qwen MLPs annihilates the result -> the arithmetic is Qwen's

@@ -164,7 +164,7 @@ class QwenFullLayout:
 
     def __init__(self, code_size: int, subset: "Subset",
                  efficient_alu: bool = True, recurrent_divmod: bool = False,
-                 code_from_memory: bool = False):
+                 code_from_memory: bool = False, shift_via_mul: bool = True):
         # Build the pure-forward layout (all VM compute bands live here).  MUL/DIV/MOD
         # ALWAYS run through the ``nibble_alu32`` fp32 FFN gadgets (the 256x256x3
         # lookup table has been removed entirely), so the layout carries the ALU32
@@ -183,9 +183,16 @@ class QwenFullLayout:
         self.efficient_alu = efficient_alu
         self.recurrent_divmod = recurrent_divmod
         self.code_from_memory = code_from_memory
+        # SHIFT-VIA-MUL/DIV is available only when BOTH the MUL/DIV gadgets (muldiv)
+        # and the shift ops (bitwise) are present; a muldiv-less bitwise subset keeps
+        # the barrel shifter.  ``shift_via_mul`` requests it; ``self.shift_via_mul`` is
+        # the RESOLVED flag the block builder reads.
+        self.shift_via_mul = bool(shift_via_mul and subset.muldiv and subset.bitwise
+                                  and efficient_alu)
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
-            _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
+            _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod,
+                                       shift_via_mul=self.shift_via_mul)
         # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
         # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
         # bands.  Off (default) leaves the layout byte-identical, so an existing
@@ -268,13 +275,14 @@ class QwenFullVM:
     efficient_alu: bool = True    # MUL/DIV/MOD via nibble_alu32 gadgets (the ONLY path)
     n_applied: int = 0            # layers APPLIED per forward (>= n_layers if recurrent)
     code_from_memory: bool = False  # program in KV §Memory (fetch@PC), not a baked table
+    shift_via_mul: bool = False   # SHL/SHR via native MUL/DIV (x*2^n / x//2^n), no barrel
 
 
 def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           arch: QwenArch = QWEN2_5_ARCH, K: float = NORM_K,
           efficient_alu: bool = True,
           recurrent_divmod: bool = False, pad_to_stock: bool = False,
-          code_from_memory: bool = False) -> QwenFullVM:
+          code_from_memory: bool = False, shift_via_mul: bool = True) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
     ``efficient_alu`` (default True) bakes MUL/DIV/MOD as the ``nibble_alu32``
@@ -302,12 +310,14 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
 
     QL = QwenFullLayout(code_size, subset, efficient_alu=efficient_alu,
                         recurrent_divmod=recurrent_divmod,
-                        code_from_memory=code_from_memory)
+                        code_from_memory=code_from_memory,
+                        shift_via_mul=shift_via_mul)
     L = QL.L
     block_specs = _block_specs(L, code_size, subset,
                               efficient_alu=efficient_alu,
                               recurrent_divmod=recurrent_divmod,
-                              code_from_memory=code_from_memory)
+                              code_from_memory=code_from_memory,
+                              shift_via_mul=QL.shift_via_mul)
     block_names = [nm for nm, _ in block_specs]
     apply_order = getattr(L, "_qwen_apply", None)
 
@@ -392,7 +402,8 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
                       hidden_size=hidden_size, intermediate_size=intermediate,
                       n_layers=n_layers, fits_stock=fits_stock, embed=embed,
                       efficient_alu=efficient_alu, n_applied=n_applied,
-                      code_from_memory=code_from_memory)
+                      code_from_memory=code_from_memory,
+                      shift_via_mul=QL.shift_via_mul)
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +431,8 @@ def compile_ax_zero(L, dim: int) -> Dict[str, torch.Tensor]:
 
 
 def _block_specs(L, code_size, subset, efficient_alu=True,
-                 recurrent_divmod=False, code_from_memory=False):
+                 recurrent_divmod=False, code_from_memory=False,
+                 shift_via_mul=False):
     """The fused-VM FFN block list (one Qwen layer per block).
 
     Returns ``specs`` (list of ``(name, ffn_spec)``); when the efficient-ALU
@@ -480,10 +492,15 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
     eff_mdm = subset.muldiv and efficient_alu
     if subset.bitwise:
         from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
-        for name, spec in build_bitwise_blocks(L, dim):
+        # SHIFT-VIA-MUL/DIV: when on, the barrel shifter DROPS SHL/SHR (routed through
+        # the native MUL/DIV gadgets below), so build_bitwise_blocks keeps only the
+        # OR/XOR/AND per-bit combine and bw-recompose only recomposes those (SHL/SHR
+        # write AX via the ax-mux like MUL/DIV, not via the bitwise nibble path).
+        barrel_ops = () if shift_via_mul else (isa.SHL, isa.SHR)
+        recompose_ops = (isa.OR, isa.XOR, isa.AND) + barrel_ops
+        for name, spec in build_bitwise_blocks(L, dim, barrel_shift_ops=barrel_ops):
             specs.append((name, spec))
-        specs.append(("bw-recompose", _bw_recompose_spec(
-            L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))
+        specs.append(("bw-recompose", _bw_recompose_spec(L, dim, recompose_ops)))
     # -- EFFICIENT ALU: the nibble_alu32 fp32 FFN gadgets (§Basic Arithmetic /
     #    §Multiplication / §Division) replacing the mdm table.  Each block writes its
     #    op's dedicated RES nibble band UNCONDITIONALLY; the ax-mux copies the active
@@ -493,7 +510,19 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
         from . import nibble_alu32 as A
         A._ONE = L.ONE
         alu_ops = [isa.MUL, isa.DIV, isa.MOD]
+        # SHIFT-VIA-MUL/DIV: SHL reuses MUL (x * 2^n), SHR reuses DIV (x // 2^n).  The
+        # pow2-route block (BEFORE the operand expand + MUL/DIV read AX) overwrites AX
+        # with 2^n gated on SHL|SHR; the ax-mux then delivers MUL_RES/DIV_RES into AX
+        # on SHL/SHR.  No new VM steps — the shift rides the muldiv blocks already run.
+        mux_ops = list(alu_ops)
+        if shift_via_mul:
+            mux_ops += [isa.SHL, isa.SHR]
         specs.append(("alu-psh-nib", A.compile_psh_nibble_copy(L, dim)))
+        if shift_via_mul:
+            # one-hot(n) FIRST (its own block: the pow2 write's guard must read it as
+            # block input), then the pow2 route overwrites AX with 2^n before expand.
+            specs.append(("alu-shift-onehot", A.compile_shift_onehot(L, dim)))
+            specs.append(("alu-shift-pow2", A.compile_shift_pow2_route(L, dim)))
         specs.append(("alu-expand", A.compile_expand(L, dim)))
         for name, spec in A.compile_mul_blocks(L, dim):
             specs.append((name, spec))
@@ -511,7 +540,7 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
                 div_apply.append(len(specs))
                 specs.append((name, spec))
         div_end = len(specs)
-        specs.append(("alu-ax-mux", A.compile_ax_mux(L, dim, ops=alu_ops)))
+        specs.append(("alu-ax-mux", A.compile_ax_mux(L, dim, ops=mux_ops)))
     disp = base_dispatch_rules(L) + _call_dispatch_rules(L)
     if subset.memory:
         disp = disp + PF.memory_dispatch_rules(L)
@@ -1104,7 +1133,13 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
         # the scalar AX_VAL byte (the 8-bit fold path / loaded byte / cmp result).
         # ``mask`` narrows the emitted AX to the compare width (8-bit vs isa.interpret,
         # 32-bit vs the nibble_muldivmod reference).
-        if vm.efficient_alu and op in (isa.MUL, isa.DIV, isa.MOD):
+        # The nibble-decoded AX ops: MUL/DIV/MOD always, and SHL/SHR when they are
+        # routed through the native MUL/DIV gadgets (shift-via-mul writes the result to
+        # the AX NIBBLE band via the ax-mux, exactly like MUL/DIV/MOD).
+        _nib_ax_ops = {isa.MUL, isa.DIV, isa.MOD}
+        if vm.shift_via_mul:
+            _nib_ax_ops |= {isa.SHL, isa.SHR}
+        if vm.efficient_alu and op in _nib_ax_ops:
             ax = _decode_reg_from_nibbles(state, L, L.AX) & mask
         else:
             ax = _snap(state[L.AX_VAL]) & 0xFF
