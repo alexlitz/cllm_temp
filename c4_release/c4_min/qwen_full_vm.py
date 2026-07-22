@@ -97,6 +97,28 @@ STOCK_QHEADS = 14
 # frame token carrying all 16 of its nibbles (compact frame — fits the head budget).
 CAM_REGS = ["PC", "AX", "SP", "BP", "STACK0"]
 
+# ---------------------------------------------------------------------------
+# CODE-FROM-MEMORY (blogspec "Universal = bytecode fetched by PC").
+#
+# The baked CODE_OP[k]/CODE_IMM[k] table caps program size (PC >= code_size ->
+# IndexError) AND makes D scale ~3 per instruction (the ~3*code_size PC_IS +
+# CODE_OP + CODE_IMM residual bands), pushing hidden_size past stock-896 for a
+# long program.  The spec's true mechanism is the SAME as LI/SI: the program
+# lives in the KV §Memory, one CODE frame per instruction keyed on its address i.
+# Each step FETCHES the instruction at PC via the address-keyed CAM (like a load of
+# mem[PC]), delivering op -> OP_VAL and imm -> IMM.  This makes the fetch
+# PROGRAM-LENGTH-INDEPENDENT: no code_size table, no per-instruction residual band.
+#
+# The address bits key on the SLOWEST rotary lanes (near-identity RoPE) so the dot
+# is POSITION-INVARIANT: unlike the store log (whose loads are near their stores),
+# the code frames span the WHOLE window — a distant frame is up to ~program-length
+# positions from the fetch query, so a bit on a fast-rotating lane loses its match
+# on that frame and mis-fetches (frame 0 out-scoring frame 256 — a real off-by-
+# address bug).  The lowest-freq 12 rotary lanes (theta=1e6) stay cos>=0.997 even at
+# Δpos~500, so 12 bits key a PC up to 4095 (covers the full ~4000-instr c4 compiler
+# and every muldiv subroutine, code_size- and width-independent).
+CODE_ADDR_BITS = 12
+
 
 @dataclass
 class QwenArch:
@@ -141,21 +163,44 @@ class QwenFullLayout:
     iterations into ONE reused iteration body (adds the IT counter band)."""
 
     def __init__(self, code_size: int, subset: "Subset",
-                 efficient_alu: bool = False, recurrent_divmod: bool = False):
+                 efficient_alu: bool = False, recurrent_divmod: bool = False,
+                 code_from_memory: bool = False):
         # Build the pure-forward layout (all VM compute bands live here).  With the
         # efficient ALU we build WITHOUT the mdm lookup-table bands (include_muldiv=
         # False) and attach the nibble_alu32 scratch bands instead.
+        # CODE-FROM-MEMORY: the program lives in the KV §Memory (code frames), NOT in
+        # the CODE_OP[k]/PC_IS[k] residual table, so the vestigial table is sized to a
+        # SINGLE slot (~3 dims) instead of ~3*code_size — this is what removes the
+        # program-length dependence of the residual width.  ``code_size`` no longer
+        # gates the program that can run (the CAM fetches at ANY PC).
+        pf_code_size = 1 if code_from_memory else code_size
         self.pf = build_pure_forward_model(
-            code_size=code_size, include_memory=subset.memory,
+            code_size=pf_code_size, include_memory=subset.memory,
             include_cmp=subset.cmp, include_bitwise=subset.bitwise,
             include_muldiv=(subset.muldiv and not efficient_alu))[1]
         L = self.pf
         self.efficient_alu = efficient_alu
         self.recurrent_divmod = recurrent_divmod
+        self.code_from_memory = code_from_memory
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
             _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
-        # Append the CAM bands past the (possibly ALU-extended) pure-forward bands.
+        # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
+        # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
+        # bands.  Off (default) leaves the layout byte-identical, so an existing
+        # baked table build is unchanged; on, the program lives in these frames.
+        L.CODE_KEY_BIN = L.CODE_QRY_BIN = None
+        L.CODE_OPV = L.CODE_IMMV = None
+        L.IS_CODE = L.IS_FETCH = None
+        if code_from_memory:
+            L.CODE_KEY_BIN = L._band("CODE_KEY_BIN", CODE_ADDR_BITS)  # instr addr i (KEY)
+            L.CODE_QRY_BIN = L._band("CODE_QRY_BIN", CODE_ADDR_BITS)  # current PC (QUERY)
+            L.CODE_OPV = L._scalar("CODE_OPV")     # instr op    (VALUE -> OP_VAL)
+            L.CODE_IMMV = L._scalar("CODE_IMMV")   # instr imm   (VALUE -> IMM)
+            L.IS_CODE = L._scalar("IS_CODE")       # code-frame flag (KEY gate)
+            L.IS_FETCH = L._scalar("IS_FETCH")     # fetch-query flag (QUERY gate)
+            L.D = L._off                           # extend the pure-forward width
+        # Append the CAM bands past the (possibly ALU-/code-extended) pure-forward bands.
         off = L.D
         self._names: Dict[str, Tuple[int, int]] = {}
         # per-register ROLE one-hot (which register a frame token carries): 5.
@@ -221,12 +266,14 @@ class QwenFullVM:
     embed: torch.Tensor           # [vocab, hidden] token -> residual (injected)
     efficient_alu: bool = False   # MUL/DIV/MOD via nibble_alu32 gadgets, not the table
     n_applied: int = 0            # layers APPLIED per forward (>= n_layers if recurrent)
+    code_from_memory: bool = False  # program in KV §Memory (fetch@PC), not a baked table
 
 
 def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           arch: QwenArch = QWEN2_5_ARCH, K: float = NORM_K,
           mdm_keys=None, efficient_alu: bool = False,
-          recurrent_divmod: bool = False, pad_to_stock: bool = False) -> QwenFullVM:
+          recurrent_divmod: bool = False, pad_to_stock: bool = False,
+          code_from_memory: bool = False) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
     ``efficient_alu`` (default False) bakes MUL/DIV/MOD as the ``nibble_alu32``
@@ -255,11 +302,13 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     from transformers.models.qwen2 import Qwen2Model
 
     QL = QwenFullLayout(code_size, subset, efficient_alu=efficient_alu,
-                        recurrent_divmod=recurrent_divmod)
+                        recurrent_divmod=recurrent_divmod,
+                        code_from_memory=code_from_memory)
     L = QL.L
     block_specs = _block_specs(L, code_size, subset, mdm_keys=mdm_keys,
                               efficient_alu=efficient_alu,
-                              recurrent_divmod=recurrent_divmod)
+                              recurrent_divmod=recurrent_divmod,
+                              code_from_memory=code_from_memory)
     block_names = [nm for nm, _ in block_specs]
     apply_order = getattr(L, "_qwen_apply", None)
 
@@ -309,6 +358,11 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
         cam_layers: Dict[str, int] = {}
         _bake_register_cam(qmodel.layers[0].self_attn, QL, arch, comp, K)
         cam_layers["ingest"] = 0
+        if code_from_memory:
+            # bake the code-fetch CAM onto the code-cam block's self_attn (fetch@PC).
+            code_idx = block_names.index("code-cam")
+            _bake_code_cam(qmodel.layers[code_idx].self_attn, QL, arch, comp, K)
+            cam_layers["code-cam"] = code_idx
         if subset.memory:
             mem_idx = block_names.index("mem-cam")
             _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K)
@@ -333,15 +387,36 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
                       block_names=block_names, cam_layers=cam_layers, arch=arch,
                       hidden_size=hidden_size, intermediate_size=intermediate,
                       n_layers=n_layers, fits_stock=fits_stock, embed=embed,
-                      efficient_alu=efficient_alu, n_applied=n_applied)
+                      efficient_alu=efficient_alu, n_applied=n_applied,
+                      code_from_memory=code_from_memory)
 
 
 # ---------------------------------------------------------------------------
 # Block-spec list — mirrors nibble_pure_forward.build_pure_forward_model's FFN
 # side but with FUNCTION dispatch rules added.
 # ---------------------------------------------------------------------------
+def compile_ax_zero(L, dim: int) -> Dict[str, torch.Tensor]:
+    """``AX_ZERO = relu(1 - AX_VAL)`` (1 iff AX==0) — the BZ/BNZ branch predicate.
+
+    The code-from-memory path drops ``compile_pc_fetch`` (whose PC one-hot scaled
+    with ``code_size``); ``AX_ZERO`` is the only OTHER lane it produced, so this
+    ``code_size``-INDEPENDENT FFN recomputes just it (SET, self-clearing).  Same
+    relu ramp as ``compile_pc_fetch``'s AX_ZERO unit."""
+    spec = _empty_spec(dim, 2)
+    # unit 0: self-clear AX_ZERO (SET).
+    spec["W_up"][0, L.ONE] = S
+    spec["W_gate"][0, L.AX_ZERO] = 1.0
+    spec["W_down"][L.AX_ZERO, 0] += -1.0 / SILU_S
+    # unit 1: relu(1 - AX_VAL) -> AX_ZERO (1 iff AX==0, 0 for AX>=1).
+    spec["W_up"][1, L.AX_VAL] = -RELU_S
+    spec["b_up"][1] = RELU_S * 1.0
+    spec["W_gate"][1, L.ONE] = 1.0
+    spec["W_down"][L.AX_ZERO, 1] += 1.0 / RELU_S
+    return spec
+
+
 def _block_specs(L, code_size, subset, mdm_keys=None, efficient_alu=False,
-                 recurrent_divmod=False):
+                 recurrent_divmod=False, code_from_memory=False):
     """The fused-VM FFN block list (one Qwen layer per block).
 
     Returns ``specs`` (list of ``(name, ffn_spec)``); when the efficient-ALU
@@ -349,19 +424,37 @@ def _block_specs(L, code_size, subset, mdm_keys=None, efficient_alu=False,
     so ``build`` can point ``qmodel.layers`` at the reused iteration-body layers.
     ``efficient_alu`` swaps the 256x256 MUL/DIV/MOD lookup table for the
     ``nibble_alu32`` fp32 FFN gadgets (spec-faithful 32-bit MUL schoolbook +
-    base-16 long division)."""
+    base-16 long division).
+
+    ``code_from_memory`` swaps the baked ``pc-fetch`` + ``code-select`` blocks (which
+    scaled with ``code_size``) for a single ``code-cam`` attention block that FETCHES
+    the instruction at PC out of the KV §Memory (one code frame per instruction),
+    delivering ``OP_VAL``/``IMM`` — the "Universal = bytecode fetched by PC"
+    mechanism.  ``build`` bakes the code CAM onto that block's ``self_attn``.  Fetch
+    is then program-length-independent (no ``CODE_OP[k]`` table)."""
     from .nibble_vm import (
         compile_nibble_to_scalar, compile_pc_fetch, compile_code_select,
         base_dispatch_rules, compile_branch_delta, compile_fold, compile_ffn,
     )
     dim = L.D
     L._qwen_apply = None                   # default: identity apply order
-    specs = [
-        ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
-        ("pc-fetch",    compile_pc_fetch(L, dim)),
-        ("code-select", compile_code_select(L, dim)),
-        ("opcode-decode", compile_opcode_decode_full(L, dim)),
-    ]
+    if code_from_memory:
+        # FETCH FROM §MEMORY: the driver overlay writes CODE_QRY_BIN = bits(PC) on the
+        # query row; the code CAM (baked on this block's self_attn) selects the code
+        # frame whose CODE_KEY_BIN == PC and copies its op/imm into OP_VAL/IMM.  A
+        # tiny ax-zero FFN recomputes the only OTHER lane the dropped pc-fetch made.
+        specs = [
+            ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
+            ("code-cam",  compile_ax_zero(L, dim)),   # FFN=AX_ZERO; attn=code fetch CAM
+            ("opcode-decode", compile_opcode_decode_full(L, dim)),
+        ]
+    else:
+        specs = [
+            ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
+            ("pc-fetch",    compile_pc_fetch(L, dim)),
+            ("code-select", compile_code_select(L, dim)),
+            ("opcode-decode", compile_opcode_decode_full(L, dim)),
+        ]
     if subset.memory:
         specs += [("mem-prep", PF.compile_mem_prep(L, dim)),
                   ("mem-cam",  compile_nibble_to_scalar(L, dim))]
@@ -696,6 +789,20 @@ def _bake_memory_cam(attn, QL, arch, comp, K):
     q_w[gate_lane, L.ONE] = P
     q_w[gate_lane, L.IS_LOAD] = -P
     k_w[gate_lane, L.IS_STORE] = -P
+    # CODE-FRAME EXCLUSION (code-from-memory): the program lives in the SAME token
+    # stream as the store log (as ~N extra CODE frames, IS_CODE=1).  A code frame has
+    # IS_STORE=0 so it scores at the SINK (0) for this CAM — but with MANY code frames
+    # their softmax weight SUMS (each e^0=1), stealing a few % off an exact store
+    # match (whose net score ~8 logits is only ~e^8 vs ~N·e^0) and diluting the loaded
+    # value toward 0 (VAL_NIB=0 on code frames) -> an off-by-one load.  Push every
+    # IS_CODE row FAR below the sink (query +Pc·ONE, key -Pc·IS_CODE -> -Pc^2 on a
+    # code frame, 0 on store/BOS) so the code frames are INVISIBLE to the memory CAM.
+    # Present only when the layout carries code frames (byte-identical otherwise).
+    if getattr(L, "IS_CODE", None) is not None:
+        excl_lane = half - 1 - n_bits - 2
+        Pc = 60.0
+        q_w[excl_lane, L.ONE] = Pc
+        k_w[excl_lane, L.IS_CODE] = -Pc
     # recency on a MEDIUM rotary lane (lane 3: monotone decay over ~11 positions).
     # Two stores to the SAME address tie on the address match, so recency ALONE must
     # pick the latest (§Memory latest-write-wins). It only acts among stores on a
@@ -717,6 +824,80 @@ def _bake_memory_cam(attn, QL, arch, comp, K):
     for j in range(NIB_PER_REG):
         v_w[j, L.VAL_NIB + j] = 1.0
         o_w[L.AX + j, j] = 1.0
+
+
+# ===========================================================================
+# CODE §Memory CAM (fetch@PC): the "Universal = bytecode fetched by PC" mechanism.
+#
+# The SAME address-keyed CAM as _bake_memory_cam, applied to the CODE frames (one
+# per instruction, keyed on its address i) instead of the STORE frames.  A fetch
+# query keyed on PC selects the code frame whose address == PC and copies its op ->
+# OP_VAL and imm -> IMM (the scalars the opcode-decode + dispatch read).  This is
+# the address-keyed §Memory read (LI/SI machinery) reused to fetch the instruction
+# at PC — no baked CODE_OP[k] table, so the fetch is program-length-independent.
+# ===========================================================================
+def _bake_code_cam(attn, QL, arch, comp, K):
+    """Bake the code-fetch CAM on ``attn`` head 0 (fetch mem_code[PC]).
+
+    Structurally identical to ``_bake_memory_cam`` (per-bit agreement on slow RoPE
+    lanes + a bias lane so a NON-exact match sinks below the BOS 0, + a fetch-enable
+    gate), but keyed on the CODE frames: KEY = ``CODE_KEY_BIN`` (instruction address
+    i) gated by ``IS_CODE``; QUERY = ``CODE_QRY_BIN`` (current PC) gated by
+    ``IS_FETCH``; VALUE copies the frame's ``CODE_OPV`` -> ``OP_VAL`` and
+    ``CODE_IMMV`` -> ``IMM``.  Every code address i appears at MOST once, so no
+    recency tiebreak is needed (unlike the store log's latest-write-wins)."""
+    L = QL.L
+    hd = arch.head_dim
+    q_w = attn.q_proj.weight; k_w = attn.k_proj.weight
+    v_w = attn.v_proj.weight; o_w = attn.o_proj.weight
+    half = hd // 2
+    # CODE_ADDR_BITS (16) address bits; keep them on the slowest rotary pairs (near-
+    # identity RoPE) so the address dot is position-invariant, exactly as the memory
+    # CAM does.  half=32 rotary pairs comfortably hold 16 bits + 2 control lanes.
+    n_bits = min(CODE_ADDR_BITS, half - 3)
+    G = 16.0                                  # per-bit agreement gain (same as mem CAM)
+    # q = G*(2*QRY_BIN[b]-IS_FETCH), k = G*(2*KEY_BIN[b]-IS_CODE): on a fetch
+    # (IS_FETCH=1) vs a code frame (IS_CODE=1), q_b*k_b = +G^2 iff bits agree, -G^2
+    # iff disagree.  A non-fetch query (IS_FETCH=0) -> q_b=0; the BOS sink (IS_CODE=0,
+    # KEY=0) -> k_b=0.
+    for b in range(n_bits):
+        lane = half - 1 - b
+        q_w[lane, L.CODE_QRY_BIN + b] = 2.0 * G
+        q_w[lane, L.IS_FETCH] = -G
+        k_w[lane, L.CODE_KEY_BIN + b] = 2.0 * G
+        k_w[lane, L.IS_CODE] = -G
+    # bias lane: subtract (n_bits-0.5)*G^2 on a fetch*code pair so an EXACT match =
+    # +G^2 (> sink 0) and every 1-bit mismatch = -G^2 (< sink).  Needs BOTH flags.
+    bias_lane = half - 1 - n_bits
+    B = math.sqrt((n_bits - 0.5)) * G
+    q_w[bias_lane, L.IS_FETCH] = -B
+    k_w[bias_lane, L.IS_CODE] = B
+    # FETCH-ENABLE gate: on a NON-fetch step every code frame must sit FAR below the
+    # sink so the CAM outputs 0 (no leak).  Query +P on ONE, -P on IS_FETCH (=0 on a
+    # fetch, +P otherwise); code rows key -P on IS_CODE.  (In practice every step IS
+    # a fetch, but this keeps the head sink-clean if a non-fetch query ever runs.)
+    gate_lane = half - 1 - n_bits - 1
+    P = 60.0
+    q_w[gate_lane, L.ONE] = P
+    q_w[gate_lane, L.IS_FETCH] = -P
+    k_w[gate_lane, L.IS_CODE] = -P
+    # STORE-FRAME EXCLUSION (symmetric to the mem CAM's code exclusion): store frames
+    # (IS_STORE=1) share the token stream and score at the SINK (0) for this CAM; with
+    # many stores their summed softmax weight would steal a few % off the exact fetch
+    # match (net ~16 logits) and dilute the delivered OP_VAL/IMM toward 0.  Push every
+    # IS_STORE row FAR below the sink so store frames are INVISIBLE to the code CAM.
+    if getattr(L, "IS_STORE", None) is not None:
+        excl_lane = half - 1 - n_bits - 2
+        q_w[excl_lane, L.ONE] = P
+        k_w[excl_lane, L.IS_STORE] = -P
+    # value: copy the selected code frame's op/imm scalars into OP_VAL / IMM.  The
+    # softmax weight on the exact-PC-match frame is ~1.0, so OP_VAL = CODE_OPV and
+    # IMM = CODE_IMMV of the fetched instruction (the bilinear code-select, but from
+    # §Memory instead of the baked table).
+    v_w[0, L.CODE_OPV] = 1.0
+    o_w[L.OP_VAL, 0] = 1.0
+    v_w[1, L.CODE_IMMV] = 1.0
+    o_w[L.IMM, 1] = 1.0
 
 
 # ===========================================================================
@@ -778,6 +959,32 @@ def _signed_imm(imm: int) -> int:
     return imm - (1 << 32) if imm >= (1 << 31) else imm
 
 
+def _overlay_code_frames(x, L, code: List[isa.Instr], base_pos: int, row: int = 0):
+    """Write the program into the KV §Memory as CODE frames (code-from-memory).
+
+    One frame per instruction i at ``x[row, base_pos + i]``: KEY = ``CODE_KEY_BIN`` =
+    bits(i), VALUE = ``CODE_OPV`` (op) + ``CODE_IMMV`` (signed imm), gated by
+    ``IS_CODE=1``.  These PERSIST (the address-keyed code memory the fetch CAM reads
+    at PC), exactly like the store log persists for LI/SI.  Immediates are the SIGNED
+    image so |imm| stays O(hundreds) << the RMSNorm compensator (as CODE_IMM was)."""
+    for i, ins in enumerate(code):
+        p = base_pos + i
+        x[row, p, L.IS_CODE] = 1.0
+        for b, bit in enumerate(_address_bits(i, CODE_ADDR_BITS)):
+            x[row, p, L.CODE_KEY_BIN + b] = bit
+        x[row, p, L.CODE_OPV] = float(ins.op)
+        x[row, p, L.CODE_IMMV] = float(_signed_imm(ins.imm))
+
+
+def _overlay_fetch_query(x, L, pc: int, row: int = 0, col: int = -1):
+    """Write the fetch@PC query (code-from-memory) at ``x[row, col]``: ``IS_FETCH=1``
+    + ``CODE_QRY_BIN`` = bits(PC).  The code CAM selects the frame whose address ==
+    PC and delivers its op/imm into OP_VAL/IMM."""
+    x[row, col, L.IS_FETCH] = 1.0
+    for b, bit in enumerate(_address_bits(pc & ((1 << CODE_ADDR_BITS) - 1), CODE_ADDR_BITS)):
+        x[row, col, L.CODE_QRY_BIN + b] = bit
+
+
 def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
                               reg_state: dict, store_log: List[dict],
                               load_addr: Optional[int]) -> torch.Tensor:
@@ -785,30 +992,41 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
     embedded+overlaid residual [1,S,H]. Window:
       pos 0                : BOS sink
       1 .. len(store_log)  : one MEM token per persistent store (KV memory log)
+      [code frames]        : one per instruction (code-from-memory), else in-data table
       next 5               : the LATEST register frame (PC/AX/SP/BP/STACK0 tokens)
       last                 : STEP_END query row (register-role query + load query)."""
     QL, L = vm.QL, vm.QL.L
     subset = vm.subset
+    cfm = vm.code_from_memory
     from .blogspec_memory import ADDR_BITS
 
     n_store = len(store_log) if subset.memory else 0
+    n_code = len(code) if cfm else 0
     stream: List[int] = [V.BOS]
     stream += [V.MEM] * n_store                       # store KV tokens
+    stream += [V.MEM] * n_code                        # code KV tokens (fetch@PC)
     stream += [_REG_TOKEN[r] for r in CAM_REGS]       # register frame
     stream += [V.STEP_END]                            # query row
     x = vm.embed[torch.tensor([stream])].clone()
     Sn = x.shape[1]
 
-    # program-in-data at every position (fetch@PC universal). Immediates are stored
-    # as SIGNED small values (an assembler stores imm & 0xFFFFFFFF, so a small
-    # negative like LEA -8 would be 0xFFFFFFF8 = 4.3e9 — that would blow up the
-    # RMSNorm compensator, which must dominate every residual value; store the
-    # signed image so |imm| stays O(hundreds), well under K).
     for i in range(Sn):
         x[0, i, L.ONE] = 1.0
-        for k, ins in enumerate(code):
-            x[0, i, L.CODE_OP[k]] = float(ins.op)
-            x[0, i, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
+    if cfm:
+        # CODE-FROM-MEMORY: the program lives in the KV §Memory as code frames (one
+        # per instruction), fetched by PC via the address CAM — no baked CODE_OP[k]
+        # table, so no code_size limit and no program-length width dependence.
+        _overlay_code_frames(x, L, code, base_pos=1 + n_store)
+    else:
+        # program-in-data at every position (fetch@PC universal). Immediates are stored
+        # as SIGNED small values (an assembler stores imm & 0xFFFFFFFF, so a small
+        # negative like LEA -8 would be 0xFFFFFFF8 = 4.3e9 — that would blow up the
+        # RMSNorm compensator, which must dominate every residual value; store the
+        # signed image so |imm| stays O(hundreds), well under K).
+        for i in range(Sn):
+            for k, ins in enumerate(code):
+                x[0, i, L.CODE_OP[k]] = float(ins.op)
+                x[0, i, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
 
     # persistent store frames (memory KV log).
     if subset.memory:
@@ -821,7 +1039,7 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
                 x[0, p, L.VAL_NIB + j] = float(nv)
 
     # the latest register frame: one token per register carrying its nibbles+role.
-    reg0 = 1 + n_store
+    reg0 = 1 + n_store + n_code
     for h, reg in enumerate(CAM_REGS):
         p = reg0 + h
         for j, nv in enumerate(V.nibbles_of_value(reg_state[reg], NIB_PER_REG)):
@@ -830,9 +1048,11 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
         x[0, p, QL.IS_TOK] = 1.0
 
     # QUERY row (last position): every register role one-hot (the register CAM query)
-    # + the load address query (memory CAM) on a LOAD step.
+    # + the load address query (memory CAM) on a LOAD step + the fetch@PC query.
     for h in range(len(CAM_REGS)):
         x[0, -1, QL.ROLE + h] = 1.0
+    if cfm:
+        _overlay_fetch_query(x, L, reg_state["PC"])
     if subset.memory and load_addr is not None:
         x[0, -1, L.IS_LOAD] = 1.0
         for b, bit in enumerate(_address_bits(load_addr, ADDR_BITS)):

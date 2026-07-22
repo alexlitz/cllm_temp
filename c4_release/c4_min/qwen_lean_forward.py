@@ -52,6 +52,7 @@ from .blogspec_layout import NIB_PER_REG
 from .nibble_pure_forward import SP_INIT
 from .qwen_full_vm import (
     QwenFullVM, CAM_REGS, _REG_TOKEN, _snap, _address_bits, _signed_imm,
+    _overlay_code_frames, _overlay_fetch_query,
 )
 
 
@@ -250,6 +251,7 @@ class LeanQwenVM:
     QL: object                              # the VM layout (shared with qwen_full_vm)
     subset: object
     inv_freq: torch.Tensor = field(default=None)
+    code_from_memory: bool = False          # program in KV §Memory (fetch@PC), not baked
 
     # ------------------------------------------------------------------
     @classmethod
@@ -293,7 +295,8 @@ class LeanQwenVM:
             hidden_size=cfg.hidden_size, n_layers=cfg.num_hidden_layers,
             n_heads=cfg.num_attention_heads, n_kv_heads=cfg.num_key_value_heads,
             head_dim=head_dim, rope_theta=cfg.rope_theta, rms_eps=cfg.rms_norm_eps,
-            device=dev, dtype=dtype, QL=vm.QL, subset=vm.subset, inv_freq=inv_freq)
+            device=dev, dtype=dtype, QL=vm.QL, subset=vm.subset, inv_freq=inv_freq,
+            code_from_memory=vm.code_from_memory)
 
     # ------------------------------------------------------------------
     # LEAN forward — RoPE + RMSNorm + softmax + SwiGLU, no HF machinery.
@@ -417,11 +420,14 @@ def _build_stream_and_overlay(lean: LeanQwenVM, code: List[isa.Instr],
     ``(x [1,S,H], positions [S])``."""
     QL, L = lean.QL, lean.QL.L
     subset = lean.subset
+    cfm = lean.code_from_memory
     from .blogspec_memory import ADDR_BITS
 
     n_store = len(store_log) if subset.memory else 0
+    n_code = len(code) if cfm else 0
     stream: List[int] = [V.BOS]
     stream += [V.MEM] * n_store
+    stream += [V.MEM] * n_code                     # code KV tokens (fetch@PC)
     stream += [_REG_TOKEN[r] for r in CAM_REGS]
     stream += [V.STEP_END]
     toks = torch.tensor([stream], device=lean.device)
@@ -430,9 +436,14 @@ def _build_stream_and_overlay(lean: LeanQwenVM, code: List[isa.Instr],
 
     for i in range(Sn):
         x[0, i, L.ONE] = 1.0
-        for k, ins in enumerate(code):
-            x[0, i, L.CODE_OP[k]] = float(ins.op)
-            x[0, i, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
+    if cfm:
+        # CODE-FROM-MEMORY: program in the KV §Memory as code frames, fetched by PC.
+        _overlay_code_frames(x, L, code, base_pos=1 + n_store)
+    else:
+        for i in range(Sn):
+            for k, ins in enumerate(code):
+                x[0, i, L.CODE_OP[k]] = float(ins.op)
+                x[0, i, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
 
     if subset.memory:
         for si, st in enumerate(store_log):
@@ -443,7 +454,7 @@ def _build_stream_and_overlay(lean: LeanQwenVM, code: List[isa.Instr],
             for j, nv in enumerate(V.nibbles_of_value(st["val"], NIB_PER_REG)):
                 x[0, p, L.VAL_NIB + j] = float(nv)
 
-    reg0 = 1 + n_store
+    reg0 = 1 + n_store + n_code
     for hh, reg in enumerate(CAM_REGS):
         p = reg0 + hh
         for j, nv in enumerate(V.nibbles_of_value(reg_state[reg], NIB_PER_REG)):
@@ -453,6 +464,8 @@ def _build_stream_and_overlay(lean: LeanQwenVM, code: List[isa.Instr],
 
     for hh in range(len(CAM_REGS)):
         x[0, -1, QL.ROLE + hh] = 1.0
+    if cfm:
+        _overlay_fetch_query(x, L, reg_state["PC"])
     if subset.memory and load_addr is not None:
         x[0, -1, L.IS_LOAD] = 1.0
         for b, bit in enumerate(_address_bits(load_addr, ADDR_BITS)):
@@ -708,15 +721,17 @@ def _build_spec_batch(lean: LeanQwenVM, code: List[isa.Instr],
     so the causal mask drops them)."""
     QL, L = lean.QL, lean.QL.L
     subset = lean.subset
+    cfm = lean.code_from_memory
+    n_code = len(code) if cfm else 0
     from .blogspec_memory import ADDR_BITS
 
-    # per-step token windows (BOS + that step's store log + frame + query).
+    # per-step token windows (BOS + that step's store log + [code frames] + frame + query).
     windows: List[List[int]] = []
     step_stores: List[List[dict]] = []
     for st in drafted:
         store_rows = st["store_log"] if subset.memory else []
         step_stores.append(store_rows)
-        stream = [V.BOS] + [V.MEM] * len(store_rows)
+        stream = [V.BOS] + [V.MEM] * len(store_rows) + [V.MEM] * n_code
         stream += [_REG_TOKEN[r] for r in CAM_REGS] + [V.STEP_END]
         windows.append(stream)
     B = len(windows)
@@ -737,12 +752,17 @@ def _build_spec_batch(lean: LeanQwenVM, code: List[isa.Instr],
         s = len(w)
         store_rows = step_stores[i]
         n_store = len(store_rows)
-        # program-in-data on the real rows of this window.
         for p in range(s):
             x[i, p, L.ONE] = 1.0
-            for k, ins in enumerate(code):
-                x[i, p, L.CODE_OP[k]] = float(ins.op)
-                x[i, p, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
+        if cfm:
+            # CODE-FROM-MEMORY: program in the KV §Memory as code frames, fetched@PC.
+            _overlay_code_frames(x, L, code, base_pos=1 + n_store, row=i)
+        else:
+            # program-in-data on the real rows of this window.
+            for p in range(s):
+                for k, ins in enumerate(code):
+                    x[i, p, L.CODE_OP[k]] = float(ins.op)
+                    x[i, p, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
         # store frames.
         if subset.memory:
             for sj, srow in enumerate(store_rows):
@@ -753,7 +773,7 @@ def _build_spec_batch(lean: LeanQwenVM, code: List[isa.Instr],
                 for j, nv in enumerate(V.nibbles_of_value(srow["val"], NIB_PER_REG)):
                     x[i, p, L.VAL_NIB + j] = float(nv)
         # the register frame.
-        reg0 = 1 + n_store
+        reg0 = 1 + n_store + n_code
         reg_state = st["reg_state"]
         for hh, reg in enumerate(CAM_REGS):
             p = reg0 + hh
@@ -765,6 +785,8 @@ def _build_spec_batch(lean: LeanQwenVM, code: List[isa.Instr],
         qrow = s - 1
         for hh in range(len(CAM_REGS)):
             x[i, qrow, QL.ROLE + hh] = 1.0
+        if cfm:
+            _overlay_fetch_query(x, L, reg_state["PC"], row=i, col=qrow)
         if subset.memory and st["load_addr"] is not None:
             x[i, qrow, L.IS_LOAD] = 1.0
             for b, bit in enumerate(_address_bits(st["load_addr"], ADDR_BITS)):
@@ -820,9 +842,11 @@ def speculative_run_lean(lean: LeanQwenVM, code: List[isa.Instr], *,
             hidden, _ = lean.forward(x, past=None, q_positions=positions)
         forwards += 1
         # each row's query row is the last REAL position (positions < PAD_POS).
+        n_code = len(code) if lean.code_from_memory else 0
         for i, st in enumerate(slab):
             n_store = len(st["store_log"]) if lean.subset.memory else 0
-            qrow = (1 + n_store) + len(CAM_REGS)          # BOS + stores + 5 regs + STEP_END
+            # BOS + stores + [code frames] + 5 regs + STEP_END.
+            qrow = (1 + n_store + n_code) + len(CAM_REGS)
             state = hidden[i, qrow]
             ax = _snap(state[L.AX_VAL]) & 0xFF
             ax_trace.append(ax)

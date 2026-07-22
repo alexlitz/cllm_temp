@@ -633,9 +633,11 @@ def speculative_run_dispatch(lean, table: DispatchTable, *, block_steps: int = 2
         x, positions = _build_spec_batch(lean, table.code, slab)
         hidden = _fwd(x, positions)
         forwards += 1
+        n_code = len(table.code) if lean.code_from_memory else 0
         for i, st in enumerate(slab):
             n_store = len(st["store_log"]) if lean.subset.memory else 0
-            qrow = (1 + n_store) + len(CAM_REGS)
+            # BOS + stores + [code frames] + 5 regs + STEP_END.
+            qrow = (1 + n_store + n_code) + len(CAM_REGS)
             state = hidden[i, qrow]
             model_ax.append(_snap(state[L.AX_VAL]) & 0xFF)
     # reassemble the full trace in step order (model AX from the batch, trap AX known).
