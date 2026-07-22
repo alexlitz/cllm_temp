@@ -394,25 +394,32 @@ def _bitwise_perbit_enabled() -> bool:
 
 def build_bitwise_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
     """Compile the OR/XOR/AND/SHL/SHR dispatch as opcode-gated FFN sub-blocks on
-    the AX/STACK0 nibble bands. SHL/SHR use the ``nibble_bitwise`` power-of-two
-    select. OR/XOR/AND share ONE per-nibble bit-plane extraction (``bw-bitplanes``)
-    + a boolean per-bit combine (the cross-functional dedup: ``AND=a·b``,
-    ``OR=a+b-a·b``, ``XOR=a+b-2a·b`` on the shared planes), which is bit-identical
-    to — but ~19x smaller than — three separate 256-entry tables. One shared expand
-    block builds the shift one-hots. Each op's select is OP_IS-gated; the shift
-    bit4 fold and shift selects are likewise gated. Returns named specs."""
-    _bw.extend_layout_for_bitwise(L)                  # allocate A_OH/B_OH/SHIFT_*/*_BIT
+    the AX/STACK0 nibble bands. In the per-bit path (default) ALL FIVE ops share
+    ONE per-nibble bit-plane extraction (``bw-bitplanes``): OR/XOR/AND reduce to a
+    boolean per-bit combine (``AND=a·b``, ``OR=a+b-a·b``, ``XOR=a+b-2a·b``) and
+    SHL/SHR to a BARREL shift over the source bit planes (``perbit_shift_select_rules``
+    — place source bit ``b`` at ``b±s``), so the whole select shrinks ~7x (the shift
+    fan-out was 96% of the old 11k-unit block). Bit-identical to — and ~7-19x smaller
+    than — the dense per-(a,b) tables + per-(shift×nib×val) shift select. One shared
+    expand block builds the shift COUNT one-hots (AX nib0/nib1). Each op's select is
+    OP_IS-gated; the shift bit4 fold and shift selects are likewise gated. The
+    full-table escape hatch (``C4_BITWISE_PERBIT=0``) restores the dense tables +
+    the per-nibble operand one-hots. Returns named specs."""
+    _bw.extend_layout_for_bitwise(L)                  # allocate SHIFT_*/*_BIT (+A_OH/B_OH off-path)
     L.D = L._off                                      # bands grew; refresh D
     perbit = _bitwise_perbit_enabled()
     blocks: List[Tuple[str, Dict[str, torch.Tensor]]] = []
-    # ONE expand block: the shift one-hots (STACK0 nibbles for the shifted source,
-    # AX nib0/nib1 for the count).  When the OR/XOR/AND path uses the FULL TABLES
-    # (escape hatch) the operand one-hots A_OH/B_OH are needed too.
-    exp_src = [L.STACK0 + j for j in range(_bw.N_NIB)] + [L.AX + 0, L.AX + 1]
-    exp_oh = list(L.A_OH) + [L.SHIFT_LO_OH, L.SHIFT_N1_OH]
+    # ONE expand block: the shift COUNT one-hots (AX nib0/nib1 -> SHIFT_LO_OH/
+    # SHIFT_N1_OH).  In the per-bit path the barrel shifter reads the STACK0 SOURCE
+    # from the shared A_BIT bit planes (bw-bitplanes below), so it needs NO A_OH
+    # source one-hots.  Only the FULL-TABLE escape hatch (C4_BITWISE_PERBIT=0) needs
+    # the per-nibble operand one-hots A_OH/B_OH.
+    exp_src = [L.AX + 0, L.AX + 1]
+    exp_oh = [L.SHIFT_LO_OH, L.SHIFT_N1_OH]
     if not perbit:
-        exp_src += [L.AX + j for j in range(_bw.N_NIB)]
-        exp_oh += list(L.B_OH)
+        exp_src = [L.STACK0 + j for j in range(_bw.N_NIB)] + exp_src \
+                  + [L.AX + j for j in range(_bw.N_NIB)]
+        exp_oh = list(L.A_OH) + exp_oh + list(L.B_OH)
     expand = _bw.compile_onehot_expand(
         src_bands=exp_src, oh_bases=exp_oh, cells=16, one_band=L.ONE, dim=L.D)
     blocks.append(("bw-expand", expand))
@@ -440,7 +447,10 @@ def build_bitwise_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
             _, s = _bw.bitwise_dispatch_rules(L, op)      # full 256-entry table
         sel += _opcode_gate_rules(s, L.OP_IS + op)
     for op in (isa.SHL, isa.SHR):
-        _, _b4, s = _bw.shift_dispatch_rules(L, op)
+        if perbit:
+            s = _bw.perbit_shift_select_rules(L, op)      # barrel shift on A_BIT planes
+        else:
+            _, _b4, s = _bw.shift_dispatch_rules(L, op)    # dense per-(s×nib×val) table
         sel += _opcode_gate_rules(s, L.OP_IS + op)
     blocks.append(("bw-select", compile_ffn(sel, L.D)))
     return blocks
