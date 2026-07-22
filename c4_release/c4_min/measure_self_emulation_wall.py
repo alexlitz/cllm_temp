@@ -118,6 +118,90 @@ def dot2_prog(w: List[int], x: List[int]) -> List[Tuple[str, int]]:
     ]
 
 
+def dot_prog(w: List[int], x: List[int]) -> List[Tuple[str, int]]:
+    """A width-W dot product y = sum_i w_i*x_i in the KV-MEMORY-BACKED stack form
+    (#692/#702 fix).  The natural stack form parks each partial product with a PSH
+    and folds it with ADD, so the stack grows to depth 2 (park a partial while the
+    next product's operand is pushed).  Run through ``run_program(..., 
+    spill_stack_to_kv=True)`` that push-down stack lives in the persistent KV MEMORY
+    LOG (the same log SI/SC write, content-addressed by the memory CAM), so an
+    ARBITRARY-width dot is BYTE-EXACT — the ``dot2`` 1-slot-STACK0 wall dissolves.
+    This IS "the deeper stack maintained in memory": each PSH is an SI to the SP-
+    relative stack cell, each pop an LI of the new top."""
+    p: List[Tuple[str, int]] = [("IMM", w[0]), ("PSH", 0), ("IMM", x[0]), ("MUL", 0)]
+    for i in range(1, len(w)):
+        p += [("PSH", 0), ("IMM", w[i]), ("PSH", 0), ("IMM", x[i]),
+              ("MUL", 0), ("ADD", 0)]                       # acc += w_i*x_i
+    p += [("HALT", 0)]
+    return p
+
+
+def measure_matmul_depth1(vm: Q.QwenFullVM, dev: str) -> Dict[str, object]:
+    """Prove a width>=2 dot ([3,5].[7,11]=76) and a real 2x2 @ 2x1 matmul are
+    BYTE-EXACT vs numpy through the genuine Qwen forward on the KV-BACKED stack,
+    overcoming the depth-1 wall #692 found (which diverges: dot2 default -> 60/25)."""
+    import numpy as np
+    out: Dict[str, object] = {}
+
+    # dot2 [3,5].[7,11]=76 : DEFAULT diverges (1-slot STACK0), KV-backed = byte-exact.
+    w, x = [3, 5], [7, 11]
+    ref = int(np.dot(w, x)) & 0xFF
+    code = isa.assemble(dot_prog(w, x))
+    default_got = Q.run_program(vm, code, max_steps=64)["ax_trace"][-1]
+    fix = Q.run_program(vm, code, max_steps=64, spill_stack_to_kv=True)
+    out["dot2"] = {"w": w, "x": x, "numpy": ref, "default_1slot": default_got,
+                   "kv_backed": fix["ax_trace"][-1],
+                   "byte_exact": fix["ax_trace"][-1] == ref, "steps": fix["steps"],
+                   "default_diverges": default_got != ref}
+
+    # width-3 + width-4 dots (deeper stack) — arbitrary width byte-exact.
+    for w2, x2, tag in ([3, 5, 7], [2, 4, 6], "dot3"), ([1, 2, 3, 4], [5, 6, 7, 8], "dot4"):
+        r = Q.run_program(vm, isa.assemble(dot_prog(w2, x2)), max_steps=256,
+                          spill_stack_to_kv=True)
+        out[tag] = {"w": w2, "x": x2, "numpy": int(np.dot(w2, x2)) & 0xFF,
+                    "model": r["ax_trace"][-1],
+                    "byte_exact": r["ax_trace"][-1] == (int(np.dot(w2, x2)) & 0xFF),
+                    "steps": r["steps"]}
+
+    # a real 2x2 @ 2x1 matmul: each output element is one width-2 dot.
+    M = np.array([[3, 5], [7, 2]]); v = np.array([4, 6])
+    ref_mv = [int(M[i] @ v) & 0xFF for i in range(2)]
+    got_mv = []; total = 0
+    for i in range(2):
+        r = Q.run_program(vm, isa.assemble(dot_prog(list(M[i]), list(v))),
+                          max_steps=256, spill_stack_to_kv=True)
+        got_mv.append(r["ax_trace"][-1]); total += r["steps"]
+    out["matmul_2x2"] = {"M": M.tolist(), "v": v.tolist(), "numpy": ref_mv,
+                         "model": got_mv, "byte_exact": got_mv == ref_mv,
+                         "total_steps": total}
+
+    # TIMING for ONE width-2 dot (one emulated matmul output element).
+    win: List[int] = []
+    orig = Q._forward
+    def probe(vm_, xx):
+        win.append(int(xx.shape[1])); return orig(vm_, xx)
+    Q._forward = probe
+    try:
+        Q.run_program(vm, code, max_steps=64, spill_stack_to_kv=True)   # warmup
+        if dev.startswith("cuda"):
+            torch.cuda.synchronize(dev)
+        win.clear()
+        reps = 5; t0 = time.time()
+        for _ in range(reps):
+            r = Q.run_program(vm, code, max_steps=64, spill_stack_to_kv=True)
+        if dev.startswith("cuda"):
+            torch.cuda.synchronize(dev)
+        wall = (time.time() - t0) / reps
+    finally:
+        Q._forward = orig
+    steps = r["steps"]
+    out["timing"] = {"vm_steps_per_dot": steps, "wall_ms_per_dot": wall * 1000.0,
+                     "ms_per_step": 1000.0 * wall / steps,
+                     "tokens_per_step": sum(win) / len(win) if win else 0.0,
+                     "win_min": min(win) if win else 0, "win_max": max(win) if win else 0}
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Timed run with a window-length (tokens/step) probe.
 # ---------------------------------------------------------------------------
@@ -220,6 +304,10 @@ def measure(dev: str = None, reps: int = 3) -> Dict[str, object]:
         "note": "width>=2 dot needs a 2nd live stack cell; the register CAM tracks "
                 "ONE (STACK0) -> the #702 spill/func-call fallback",
     }
+
+    # (3c) #692 OVERCOME: width>=2 dot + real matmul BYTE-EXACT via the KV-backed
+    #      stack (spill_stack_to_kv) — the depth-1 wall dissolves.
+    out["matmul_depth1"] = measure_matmul_depth1(vm, dev)
 
     if dev.startswith("cuda"):
         out["peak_cuda_gb"] = torch.cuda.max_memory_allocated(dev) / 1e9
@@ -341,6 +429,27 @@ def _fmt(rep: Dict[str, object]) -> str:
         f"    deep-stack ref={dw['ref_deep_stack']}  model(1-slot STACK0)="
         f"{dw['model_1slot']}  diverges={dw['diverges']}",
         f"    -> {dw['note']}",
+        "",
+        "(3c) #692 OVERCOME — width>=2 dot + real matmul BYTE-EXACT (KV-backed stack):",
+        f"    dot2 {rep['matmul_depth1']['dot2']['w']}.{rep['matmul_depth1']['dot2']['x']}"
+        f"={rep['matmul_depth1']['dot2']['numpy']}: default(1-slot)="
+        f"{rep['matmul_depth1']['dot2']['default_1slot']} (WALL)  KV-backed="
+        f"{rep['matmul_depth1']['dot2']['kv_backed']}  byte_exact="
+        f"{rep['matmul_depth1']['dot2']['byte_exact']} ({rep['matmul_depth1']['dot2']['steps']} steps)",
+        f"    dot3={rep['matmul_depth1']['dot3']['model']} "
+        f"(exact={rep['matmul_depth1']['dot3']['byte_exact']})  dot4="
+        f"{rep['matmul_depth1']['dot4']['model']} "
+        f"(exact={rep['matmul_depth1']['dot4']['byte_exact']})",
+        f"    2x2@2x1 matmul M={rep['matmul_depth1']['matmul_2x2']['M']} "
+        f"v={rep['matmul_depth1']['matmul_2x2']['v']}: model="
+        f"{rep['matmul_depth1']['matmul_2x2']['model']} numpy="
+        f"{rep['matmul_depth1']['matmul_2x2']['numpy']} byte_exact="
+        f"{rep['matmul_depth1']['matmul_2x2']['byte_exact']} "
+        f"({rep['matmul_depth1']['matmul_2x2']['total_steps']} steps)",
+        f"    TIMING one dot: {rep['matmul_depth1']['timing']['vm_steps_per_dot']} steps "
+        f"{rep['matmul_depth1']['timing']['wall_ms_per_dot']:.0f} ms "
+        f"({rep['matmul_depth1']['timing']['ms_per_step']:.0f} ms/step, "
+        f"{rep['matmul_depth1']['timing']['tokens_per_step']:.1f} tok/step)",
         "",
         "(3b) SPECULATION forwards-saved (perfect deterministic draft) + #702 gate:",
         f"    single-program block batching: {sp['single_program_fwd_saved']}x "

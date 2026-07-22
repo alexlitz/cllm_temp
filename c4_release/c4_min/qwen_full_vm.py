@@ -806,7 +806,8 @@ def _forward(vm: QwenFullVM, x: torch.Tensor) -> torch.Tensor:
 
 
 def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
-                verbose: bool = False, mask: int = 0xFF) -> Dict[str, object]:
+                verbose: bool = False, mask: int = 0xFF,
+                spill_stack_to_kv: bool = False) -> Dict[str, object]:
     """Execute ``code`` on the fused Qwen VM. One VM step = one Qwen2Model.forward
     over the windowed token stream (state read from the latest frame by the register
     CAM; the op computed by the SwiGLU MLPs; control-flow — PC update / branch /
@@ -834,6 +835,18 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
     ax_trace: List[int] = []
     cur_pc = 0
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
+    # KV-MEMORY-BACKED operand stack (#692/#702 depth-1 wall fix, opt-in). The
+    # register CAM tracks exactly ONE live top-of-stack cell (STACK0) and a bare
+    # PSH does NOT spill to the KV log, so a 2nd push loses the 1st cell -> a
+    # width>=2 dot (needs depth 2 to park a partial) diverges. When ON, every PSH
+    # MIRRORS its value into the persistent KV memory log at the SP-relative stack
+    # address (the SAME log SI/SC write and the mem CAM content-addresses), and the
+    # next STACK0 is reconstructed from that log after each pop -> arbitrary depth,
+    # byte-exact. OFF (default) == the historical byte-identical 1-slot path.
+    stack_kv: List[Tuple[int, int]] = []
+    _POP_OPS = {isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD, isa.AND, isa.OR,
+                isa.XOR, isa.SHL, isa.SHR, isa.EQ, isa.NE, isa.LT, isa.GT,
+                isa.LE, isa.GE}
 
     for _ in range(max_steps):
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
@@ -861,6 +874,18 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
         stk = _snap(state[L.STK_VAL])
         halted = float(state[L.HALTED]) > 0.5
 
+        # KV-backed stack maintenance (the depth-1 wall fix).
+        if spill_stack_to_kv:
+            if op == isa.PSH:
+                saddr = sp & 0xFF                       # SP-relative stack address
+                stack_kv.append((saddr, prev["AX"] & 0xFF))
+                store_log = [s for s in store_log if (s["addr"] & 0xFF) != saddr]
+                store_log.append({"addr": saddr, "val": prev["AX"] & 0xFF})
+            elif op in _POP_OPS and stack_kv:
+                _psaddr, _ = stack_kv.pop()            # ALU pop freed the top cell
+                store_log = [s for s in store_log
+                             if (s["addr"] & 0xFF) != (_psaddr & 0xFF)]
+
         # function control that spans the token stream (push/pop of ret-PC/saved-BP).
         if op == isa.JSR:
             call_stack.append((cur_pc + 1, bp))       # return PC = after JSR
@@ -877,7 +902,14 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
             if ret_pc is not None:
                 pc = ret_pc
         elif subset.memory and op in (isa.SI, isa.SC):
-            store_addr = _snap(state[L.STK_VAL])       # popped address
+            if spill_stack_to_kv:
+                store_addr = stack_kv[-1][1] if stack_kv else 0   # KV-backed top-of-stack
+                if stack_kv:
+                    _psaddr, _ = stack_kv.pop()
+                    store_log = [s for s in store_log
+                                 if (s["addr"] & 0xFF) != (_psaddr & 0xFF)]
+            else:
+                store_addr = _snap(state[L.STK_VAL])   # popped address (1-slot path)
             store_val = ax if op == isa.SI else (ax & 0xFF)
             # §Memory latest-write-wins as KV-log COMPACTION: a re-store to an
             # address SUPERSEDES the prior write, so drop the earlier frame and keep
@@ -891,6 +923,8 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
                          if (s["addr"] & 0xFF) != (store_addr & 0xFF)]
             store_log.append({"addr": store_addr, "val": store_val})
 
+        if spill_stack_to_kv:
+            stk = stack_kv[-1][1] if stack_kv else 0   # next STACK0 = KV top-of-stack
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
         ax_trace.append(ax)
         if verbose:
