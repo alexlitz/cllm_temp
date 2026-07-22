@@ -334,6 +334,13 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     # The log-sink divide (reciprocal softmax1 precision + the q·b correction compare
     # ~2^34) requires fp64 — the whole model runs in doubles when it is active.
     model_dtype = torch.float64 if QL.div_logsink else torch.float32
+    # The log-sink div carries QUOTIENT-SCALE scalars (qf, q·b up to ~2^34) in the
+    # residual; the RMSNorm compensator must DOMINATE them (1-r_norm ~ v^2/2K^2 < 0.5),
+    # so raise K to K_DIV=1e15 for the div_logsink model.  SP/BP=65536 and the nibbles
+    # are unperturbed (r~1) and the value-argmax decode reads the preserved scalar.
+    if QL.div_logsink:
+        from .nibble_logsink_blocks import K_DIV
+        K = K_DIV
     block_names = [nm for nm, _ in block_specs]
     apply_order = getattr(L, "_qwen_apply", None)
 

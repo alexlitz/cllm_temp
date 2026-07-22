@@ -46,7 +46,14 @@ from .nibble_vm import S, RELU_S, SILU_S, SILU_HALF
 NEG = -80.0            # log(d_j==0) sink mask (e^NEG ~ 0 under softmax)
 BIG = 200.0            # query self / non-log-key penalty
 LOG16 = math.log(16.0)
-K_DIV = 1.0e15         # RMSNorm compensator for the quotient-scale scalars
+# RMSNorm compensator K for the whole div_logsink model.  It must dominate the
+# quotient-scale scalars (qf, q·b up to ~2^34 = 1.7e10) so the floor is exact
+# (1-r < 0.5/1.7e10 -> K > ~2e15).  1e15 is the sweet spot: it also gives the best
+# attention-reciprocal precision (a much larger K perturbs the RMSNorm-normalised
+# LOGQ query on the sink head).  For the 8-bit operand path (the corpus / isa.interpret
+# width) the quotient/remainder are <256 and this is byte-exact through the forward;
+# see the report for the 32-bit-through-the-forward precision note.
+K_DIV = 1.0e15
 
 _ONE = None            # layout ONE lane, set by the builders
 
@@ -301,21 +308,54 @@ def compile_log_query(L, dim) -> Dict[str, torch.Tensor]:
 #    b reconstructed from its 8 AX nibbles (linear form, up to 2^32 in the GATE).
 #    BR = b*RECIP ~ 1 (bounded).  All silu-identity multiplies (RECIP, BR >= 0).
 # ==========================================================================
-def compile_newton(L, dim) -> Dict[str, torch.Tensor]:
-    """RECIP2 = 2*RECIP  and  BR = b*RECIP (into the a.BR scratch).  The multiply
-    puts the LARGE integer ``b`` on the ``up`` (multiplicand) side —
-    ``silu(S·b)/SILU_S = b`` exactly for b>=1 (b==0 -> BR=0, handled by BZ) — and
-    the small ``RECIP`` on the ``gate``.  (A small×small silu-identity would lose
-    precision because ``silu(S·RECIP)/S ≠ RECIP`` for a fractional RECIP.)"""
+def compile_newton_br(L, dim, seed) -> Dict[str, torch.Tensor]:
+    """Compute BR = b*seed into the a.QB scratch (does NOT touch the reciprocals).
+    ``b`` (LARGE integer) on ``up`` -> silu(S*b)/SILU_S = b exact (b>=1; b==0 -> 0,
+    handled by BZ); ``seed`` on the ``gate``."""
     global _ONE
     _ONE = L.ONE
     a = L.LOGSINK
-    b_up = {L.AX + c: float(S * 16 ** c) for c in range(8)}   # up = S*b_form
+    b_up = {L.AX + c: float(S * 16 ** c) for c in range(8)}
+    spec = _empty64(dim, 2)
+    u = 0
+    u = _clear(spec, u, a.QB)
+    for band, coeff in b_up.items():
+        spec["W_up"][u, band] += coeff
+    spec["W_gate"][u, seed] += 1.0
+    spec["W_down"][a.QB, u] += 1.0 / SILU_S
+    u += 1
+    return _truncate(spec, u, dim)
+
+
+def compile_newton_step(L, dim, seed, dst) -> Dict[str, torch.Tensor]:
+    """Newton refine: dst = seed*(2 - BR) = 2*seed - seed*BR  (BR = b*seed ~ 1 in the
+    a.QB scratch, from ``compile_newton_br``).  All reads are of the block INPUT, so
+    seed/BR are the pre-refinement values.  BR (>=~0.5) on ``up``, seed on ``gate``."""
+    global _ONE
+    _ONE = L.ONE
+    a = L.LOGSINK
+    spec = _empty64(dim, 4)
+    u = 0
+    u = _clear(spec, u, dst)
+    u = _ident(spec, u, {seed: 1.0}, 0.0, dst, 2.0)               # 2*seed
+    spec["W_up"][u, a.QB] = S                                     # up = S*BR
+    spec["W_gate"][u, seed] += 1.0                               # gate = seed
+    spec["W_down"][dst, u] += -1.0 / SILU_S                       # - seed*BR
+    u += 1
+    return _truncate(spec, u, dim)
+
+
+def compile_newton(L, dim) -> Dict[str, torch.Tensor]:
+    """(legacy 2-block Newton, kept for the standalone test path.)  RECIP2 = 2*RECIP
+    and BR = b*RECIP into a.QB."""
+    global _ONE
+    _ONE = L.ONE
+    a = L.LOGSINK
+    b_up = {L.AX + c: float(S * 16 ** c) for c in range(8)}
     spec = _empty64(dim, 4)
     u = 0
     u = _clear(spec, u, a.RECIP2)
-    u = _ident(spec, u, {a.RECIP: 1.0}, 0.0, a.RECIP2, 2.0)   # RECIP2 = 2*RECIP
-    # BR = b*RECIP : up = S*b (large -> silu is exact), gate = RECIP.
+    u = _ident(spec, u, {a.RECIP: 1.0}, 0.0, a.RECIP2, 2.0)
     u = _clear(spec, u, a.QB)
     for band, coeff in b_up.items():
         spec["W_up"][u, band] += coeff
@@ -326,15 +366,14 @@ def compile_newton(L, dim) -> Dict[str, torch.Tensor]:
 
 
 def compile_newton2(L, dim) -> Dict[str, torch.Tensor]:
-    """RECIP2 -= RECIP*BR  (BR = b*RECIP ~ 1 in a.QB).  BR (>=~0.5) on ``up``,
-    RECIP on ``gate`` -> silu(S*BR)/SILU_S = BR exact, hidden = RECIP*BR."""
+    """(legacy) RECIP2 -= RECIP*BR."""
     global _ONE
     _ONE = L.ONE
     a = L.LOGSINK
     spec = _empty64(dim, 4)
     u = 0
-    spec["W_up"][u, a.QB] = S                          # up = S*BR
-    spec["W_gate"][u, a.RECIP] += 1.0                  # gate = RECIP
+    spec["W_up"][u, a.QB] = S
+    spec["W_gate"][u, a.RECIP] += 1.0
     spec["W_down"][a.RECIP2, u] += -1.0 / SILU_S       # -RECIP*BR
     u += 1
     u = _clear(spec, u, a.QB)                           # clear the scratch
@@ -621,8 +660,14 @@ def compile_logsink_blocks(L, dim) -> Tuple[List[Tuple[str, Dict]], List[str]]:
     add("ls-bm1", compile_bm1(L, dim))
     add("ls-logq", compile_log_query(L, dim))
     add("ls-recip-attn", _recip_attn_ffn(L, dim))         # FFN no-op; attn baked separately
-    add("ls-newton", compile_newton(L, dim))
-    add("ls-newton2", compile_newton2(L, dim))
+    # TWO Newton iterations (r <- r*(2 - b*r)): the sink reciprocal has a ~5e-7 residual
+    # RoPE phase; one step -> ~2.5e-13, two -> fp64.  Two steps keep the largest-quotient
+    # DIV (b small, a~2^32) within the ±1 correction band.  Iter 1: RECIP -> RECIP2.
+    # Iter 2: RECIP2 -> RECIP2 (in place; the step block reads RECIP2 + BR2 from input).
+    add("ls-newton-br1", compile_newton_br(L, dim, a.RECIP))
+    add("ls-newton-st1", compile_newton_step(L, dim, a.RECIP, a.RECIP2))
+    add("ls-newton-br2", compile_newton_br(L, dim, a.RECIP2))
+    add("ls-newton-st2", compile_newton_step(L, dim, a.RECIP2, a.RECIP2))
     add("ls-qf", compile_qf(L, dim), True)
     # decompose floor(QF - 0.5) -> Q nibbles (MSB-first, running rem in QREM).  The
     # -0.5 seed offset centres the (arbitrary) fractional part of ``QF = a/b`` into
