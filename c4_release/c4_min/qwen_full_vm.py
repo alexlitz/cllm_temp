@@ -342,6 +342,11 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     with torch.no_grad():
         gamma = rmsnorm_identity_gamma(hidden_size, K)
         qmodel.norm.weight.copy_(gamma)
+        # embed_tokens is VESTIGIAL — the VM always feeds inputs_embeds (the driver
+        # calls qmodel(inputs_embeds=...)), so this random nn.Embedding never fires.
+        # Zero it so the state_dict reflects the actual sparse working model (drops
+        # ~240-308K random non-zeros); the forward output is byte-identical.
+        qmodel.embed_tokens.weight.zero_()
         for layer in qmodel.layers:
             layer.input_layernorm.weight.copy_(gamma)
             layer.post_attention_layernorm.weight.copy_(gamma)
