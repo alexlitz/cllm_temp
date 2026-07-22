@@ -338,3 +338,22 @@ def test_self_emulation_matvec_byte_exact():
     got2 = Q.run_program(vm, isa.assemble(M.dot2_prog([3, 5], [10, 4])),
                         max_steps=16)["ax_trace"][-1]
     assert ref2 == 50 and got2 != ref2, (ref2, got2)
+
+    # #692 OVERCOME: the SAME width-2 dot is BYTE-EXACT with the KV-MEMORY-BACKED
+    # stack (spill_stack_to_kv) — the depth-1 wall dissolves.  Default(1-slot) still
+    # diverges; the KV-backed run matches numpy.  Arbitrary width + a real 2x2 matmul.
+    d2 = M.dot_prog([3, 5], [7, 11])
+    assert Q.run_program(vm, isa.assemble(d2), max_steps=64,
+                         spill_stack_to_kv=True)["ax_trace"][-1] == 76
+    assert Q.run_program(vm, isa.assemble(d2), max_steps=64)["ax_trace"][-1] != 76  # wall OFF
+    # width-3 / width-4 dots (deeper stack) byte-exact vs numpy.
+    for w, x in ([3, 5, 7], [2, 4, 6]), ([1, 2, 3, 4], [5, 6, 7, 8]):
+        got = Q.run_program(vm, isa.assemble(M.dot_prog(w, x)), max_steps=128,
+                            spill_stack_to_kv=True)["ax_trace"][-1]
+        assert got == int(np.dot(w, x)) & 0xFF, (w, x, got)
+    # a real 2x2 @ 2x1 matmul: each element one KV-backed dot, byte-exact vs numpy.
+    Mm, v = np.array([[3, 5], [7, 2]]), np.array([4, 6])
+    mm = [Q.run_program(vm, isa.assemble(M.dot_prog(list(Mm[i]), list(v))),
+                        max_steps=128, spill_stack_to_kv=True)["ax_trace"][-1]
+          for i in range(2)]
+    assert mm == [int(Mm[i] @ v) & 0xFF for i in range(2)], mm
