@@ -56,6 +56,158 @@ from .qwen_full_vm import (
 
 
 # ===========================================================================
+# FUNCTION-AWARE REFERENCE ORACLE.
+#
+# ``isa.interpret`` raises NotImplementedError on the FUNCTION opcodes (JSR/ENT/
+# ADJ/LEV) — it is the pure ALU/branch reference.  For a program that CALLS a
+# function we need a golden AX trace that MATCHES the fused VM driver's exact
+# transition (which rides a real call stack alongside the token stream; see
+# ``run_program_lean`` / ``qwen_full_vm.run_program``).  ``interpret_with_functions``
+# is that reference: a copy of ``isa.interpret``'s body (isa.py:81-179) plus a
+# real ``call_stack`` implementing the SAME push/pop abstraction as the driver.
+# ===========================================================================
+FUNC_OPS = (isa.JSR, isa.ENT, isa.ADJ, isa.LEV)
+
+
+def uses_functions(code: List[isa.Instr]) -> bool:
+    """True iff ``code`` contains any FUNCTION opcode (JSR/ENT/ADJ/LEV) — the ops
+    ``isa.interpret`` cannot execute, so the driver must use the function-aware
+    reference oracle ``interpret_with_functions`` instead."""
+    return any(ins.op in FUNC_OPS for ins in code)
+
+
+def interpret_with_functions(code: List[isa.Instr], mem_size: int = 256,
+                             max_steps: int = 256):
+    """Function-aware reference interpreter: ``isa.interpret`` + a real CALL STACK.
+
+    Byte-identical to ``isa.interpret`` for non-function programs (same ALU / branch
+    / memory / PRTF transitions, same per-step ``emitted.append(ax)``), and it also
+    executes JSR/ENT/ADJ/LEV with the SAME abstraction the fused VM driver rides:
+
+      * JSR imm : push (return-PC, BP) then PC := imm.  ``isa.interpret`` increments
+                  ``pc`` BEFORE dispatch, so at the JSR the return address is the
+                  ALREADY-incremented ``pc`` (post-increment), NOT ``pc+1``.
+      * ENT n   : push (None, BP-to-restore); BP := SP; SP -= n  (new frame).
+      * ADJ n   : SP += n  (pop the pushed args after a call).
+      * LEV     : SP := BP; pop the ENT frame's saved BP; pop the JSR frame's
+                  return PC; restore BP and PC (guarded for an empty stack).
+
+    AX is unchanged by every function op, so the emitted trace simply carries the
+    current AX across them — exactly as the model driver decodes it.
+    """
+    ax = sp = bp = 0
+    sp = mem_size          # empty stack
+    pc = 0
+    mem = [0] * mem_size
+    stack = [0] * (mem_size + 1)
+    emitted = []
+    # (ret_pc, saved_bp) frames — the SAME two-slot abstraction the fused VM
+    # driver pushes/pops alongside the token stream.
+    call_stack: List[Tuple[Optional[int], Optional[int]]] = []
+
+    def push(v):
+        nonlocal sp
+        sp -= 1
+        stack[sp] = v & isa.MASK
+
+    def pop():
+        nonlocal sp
+        v = stack[sp]
+        sp += 1
+        return v & isa.MASK
+
+    steps = 0
+    while pc < len(code) and steps < max_steps:
+        steps += 1
+        ins = code[pc]
+        op, imm = ins.op, ins.imm
+        pc += 1                                       # pre-increment (as isa.interpret)
+        if op == isa.IMM:
+            ax = imm & isa.MASK
+        elif op == isa.LEA:
+            ax = (bp + imm) & isa.MASK
+        elif op == isa.PSH:
+            push(ax)
+        elif op == isa.ADD:
+            ax = (pop() + ax) & isa.MASK
+        elif op == isa.SUB:
+            ax = (pop() - ax) & isa.MASK
+        elif op == isa.MUL:
+            ax = (pop() * ax) & isa.MASK
+        elif op == isa.DIV:
+            v = pop(); ax = (v // ax if ax else 0) & isa.MASK
+        elif op == isa.MOD:
+            v = pop(); ax = (v % ax if ax else 0) & isa.MASK
+        elif op == isa.AND:
+            ax = pop() & ax
+        elif op == isa.OR:
+            ax = pop() | ax
+        elif op == isa.XOR:
+            ax = pop() ^ ax
+        elif op == isa.SHL:
+            ax = (pop() << ax) & isa.MASK
+        elif op == isa.SHR:
+            ax = (pop() >> ax) & isa.MASK
+        elif op == isa.EQ:
+            ax = 1 if pop() == ax else 0
+        elif op == isa.NE:
+            ax = 1 if pop() != ax else 0
+        elif op == isa.LT:
+            ax = 1 if pop() < ax else 0
+        elif op == isa.GT:
+            ax = 1 if pop() > ax else 0
+        elif op == isa.LE:
+            ax = 1 if pop() <= ax else 0
+        elif op == isa.GE:
+            ax = 1 if pop() >= ax else 0
+        elif op == isa.LI:
+            ax = mem[ax] & isa.MASK
+        elif op == isa.SI:
+            mem[pop()] = ax & isa.MASK
+        elif op == isa.PRTF:
+            pass                                      # AX unchanged (visible-output only)
+        elif op == isa.JMP:
+            pc = imm
+        elif op == isa.BZ:
+            pc = imm if ax == 0 else pc
+        elif op == isa.BNZ:
+            pc = imm if ax != 0 else pc
+        elif op == isa.JSR:
+            # return address = the POST-increment pc (NOT pc+1: pc was already
+            # bumped past the JSR above).  Push (ret_pc, caller BP), jump to imm.
+            call_stack.append((pc, bp))
+            pc = imm
+        elif op == isa.ENT:
+            # new frame: save the caller BP, set BP := SP, reserve n locals.
+            call_stack.append((None, bp))
+            bp = sp
+            sp -= imm
+        elif op == isa.ADJ:
+            sp += imm                                 # discard pushed args after a call
+        elif op == isa.LEV:
+            # unwind the frame, then restore BP + return PC from the call stack.
+            sp = bp
+            saved_bp = ret_pc = None
+            if call_stack:
+                _, saved_bp = call_stack.pop()        # ENT frame (saved BP)
+            if call_stack:
+                ret_pc, _ = call_stack.pop()          # JSR frame (return PC)
+            if saved_bp is not None:
+                bp = saved_bp
+            if ret_pc is not None:
+                pc = ret_pc
+        elif op == isa.NOP:
+            pass
+        elif op == isa.HALT:
+            emitted.append(ax)
+            break
+        else:
+            raise NotImplementedError(f"op {op} not in function-slice ISA")
+        emitted.append(ax)
+    return emitted
+
+
+# ===========================================================================
 # The lean weight bundle — flat tensors extracted from the built Qwen2Model.
 # ===========================================================================
 @dataclass
@@ -322,7 +474,10 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
     # Match the reference oracle's step budget to the driver's so a loop longer than
     # the default isa.interpret cap (256 steps) is not truncated against a
     # run-to-completion model trace (#691 BUG 2: countdown >= 64 needs > 256 steps).
-    ref_trace = isa.interpret(code, max_steps=max_steps)
+    # For a program that CALLS a function, isa.interpret would raise on JSR/ENT/LEV,
+    # so use the function-aware oracle (byte-identical for non-function programs).
+    ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                 if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
 
     reg_state = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
     store_log: List[dict] = []
@@ -411,14 +566,18 @@ def draft_program_lean(lean: LeanQwenVM, code: List[isa.Instr],
     with the EXACT model transition (``base_dispatch_rules`` semantics: STACK0 is a
     SINGLE register PSH sets and pop-ops read; SP is -=4 on PSH, +=4 on a pop; AX is
     8-bit-folded) instead of a forward, so the drafted per-step register file — the
-    exact input the naive driver feeds the model — is byte-identical.  Returns an
-    EMPTY draft (fall back to naive) if the program uses an op outside the
-    speculation slice (functions JSR/ENT/LEV, which need the driver's call stack)."""
+    exact input the naive driver feeds the model — is byte-identical.  Functions
+    (JSR/ENT/ADJ/LEV) ARE drafted here, on the SAME call stack the naive driver rides,
+    so a function program batches too.  Returns an EMPTY draft (fall back to naive)
+    only for a genuinely unsupported op (e.g. a syscall outside the slice)."""
     subset = lean.subset
     # Match the reference oracle to the draft's step budget so a loop longer than the
     # default isa.interpret cap (256) is not truncated against the full drafted trace
     # (#691 BUG 2). The draft's own loop runs up to max_steps, so the golden must too.
-    ref_trace = isa.interpret(code, max_steps=max_steps)
+    # Use the function-aware oracle when the program calls a function (byte-identical
+    # to isa.interpret otherwise), so the golden covers JSR/ENT/LEV.
+    ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                 if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
 
     # register file mirrored EXACTLY as the model computes it (see base_dispatch_rules).
     pc = 0
@@ -430,6 +589,8 @@ def draft_program_lean(lean: LeanQwenVM, code: List[isa.Instr],
     store_log: List[dict] = []
     steps: List[dict] = []
     halted = False
+    # (ret_pc, saved_bp) frames — the SAME abstraction run_program_lean's driver rides.
+    call_stack: List[Tuple[Optional[int], Optional[int]]] = []
     POP_OPS = (isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD,
                isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR,
                isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE,
@@ -487,12 +648,37 @@ def draft_program_lean(lean: LeanQwenVM, code: List[isa.Instr],
             npc = imm if (ax & 0xFF) == 0 else npc
         elif op == isa.BNZ:
             npc = imm if (ax & 0xFF) != 0 else npc
+        elif op == isa.JSR:
+            # return address = pc+1 (draft uses the PRE-increment convention: pc is
+            # the CURRENT instruction, so the return is the next one).  Push
+            # (ret_pc, caller BP), jump to imm.  AX unchanged.
+            call_stack.append((pc + 1, bp))
+            npc = imm
+        elif op == isa.ENT:
+            # new frame: save caller BP, BP := SP, reserve imm locals.  AX unchanged.
+            call_stack.append((None, bp))
+            bp = sp
+            sp -= imm
+        elif op == isa.ADJ:
+            sp += imm                                 # discard pushed args.  AX unchanged.
+        elif op == isa.LEV:
+            # unwind + restore BP and return PC from the call stack.  AX unchanged.
+            sp = bp
+            saved_bp = ret_pc = None
+            if call_stack:
+                _, saved_bp = call_stack.pop()        # ENT frame (saved BP)
+            if call_stack:
+                ret_pc, _ = call_stack.pop()          # JSR frame (return PC)
+            if saved_bp is not None:
+                bp = saved_bp
+            if ret_pc is not None:
+                npc = ret_pc
         elif op == isa.HALT:
             halted_step = True
         elif op == isa.NOP:
             pass
         else:
-            # out-of-slice op (functions, syscalls) -> caller falls back to naive.
+            # genuinely out-of-slice op (e.g. a syscall) -> caller falls back to naive.
             return LeanDraft(steps=[], ref_trace=ref_trace, halted=False)
 
         if subset.memory and op in (isa.SI, isa.SC):

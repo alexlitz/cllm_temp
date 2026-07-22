@@ -72,6 +72,17 @@ N_NIB = NIB_PER_REG          # 16 nibbles per 32-bit register (§569-571).
 SHIFT_MASK = WIDTH_BITS - 1  # AX & 0x1F — C's 32-bit shift-count mask.
 
 
+def _bitwise_perbit_enabled() -> bool:
+    """The per-bit (bit-plane) path — shared by OR/XOR/AND *and* the barrel
+    shifter — is ON unless the full-table escape hatch is set (``C4_BITWISE_PERBIT=0``).
+    In the per-bit path the dense per-``(a,b)`` nibble one-hots ``A_OH``/``B_OH``
+    (512 dims) are dead: every op reads the shared ``A_BIT``/``B_BIT`` bit planes
+    instead.  Same env flag as ``nibble_unified._bitwise_perbit_enabled`` (kept
+    local here to avoid a circular import at the layout layer)."""
+    import os
+    return os.environ.get("C4_BITWISE_PERBIT", "1") != "0"
+
+
 def _relu_t(z: torch.Tensor) -> torch.Tensor:
     """Exact-integer ReLU via silu (BLOG_SPEC §ReLU), vectorised: at RELU_S=200
     the fp result rounds to the exact integer for integer ``z``."""
@@ -298,10 +309,18 @@ def extend_layout_for_bitwise(L: NibbleLayout) -> NibbleLayout:
     ``SHIFT_BIT4``) for ``s = AX & 0x1F``. Idempotent: only allocates if not
     already present.
     """
-    if getattr(L, "A_OH", None) is not None:
+    if getattr(L, "A_OH", None) is not None or getattr(L, "SHIFT_LO_OH", None) is not None:
         return L
-    L.A_OH = [L._band(f"A_OH_{j}", 16) for j in range(N_NIB)]
-    L.B_OH = [L._band(f"B_OH_{j}", 16) for j in range(N_NIB)]
+    # The dense per-(a,b) nibble one-hots A_OH/B_OH (512 dims) are DEAD in the
+    # per-bit path: bitwise-perbit and the barrel shifter both read the shared
+    # A_BIT/B_BIT bit planes below, never these.  Only allocate them for the
+    # full-256-entry-table escape hatch (C4_BITWISE_PERBIT=0).
+    if not _bitwise_perbit_enabled():
+        L.A_OH = [L._band(f"A_OH_{j}", 16) for j in range(N_NIB)]
+        L.B_OH = [L._band(f"B_OH_{j}", 16) for j in range(N_NIB)]
+    else:
+        L.A_OH = None
+        L.B_OH = None
     # shift-amount decomposition: s = AX_nib0 + 16*bit4 (AX & 0x1F).
     L.SHIFT_LO_OH = L._band("SHIFT_LO_OH", 16)   # one-hot of AX nibble 0 (bits 0..3)
     L.SHIFT_N1_OH = L._band("SHIFT_N1_OH", 16)   # one-hot of AX nibble 1 (for bit4)
@@ -595,6 +614,50 @@ def shift_dispatch_rules(L: NibbleLayout, op: int) -> Tuple[dict, List[FFNRule],
     return expand, bit4, select
 
 
+def perbit_shift_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
+    """SHL/SHR barrel shifter via the SHARED per-bit bit planes (§Shifts).
+
+    Replaces ``shift_dispatch_rules``'s dense per-(shift-amount × nibble-position ×
+    nibble-value) select (SHL 2732 + SHR 8044 rules) with a BARREL shift on the
+    already-extracted source bit planes ``A_BIT`` (``compile_bit_extract``, shared
+    with the bitwise ops).  The shift amount ``s = lo + 16*b4`` (``lo`` 0..15 from
+    ``SHIFT_LO_OH``, ``b4`` 0..1 from ``SHIFT_BIT4`` = bit 4 of ``AX & 0x1F``).
+
+    For each source bit ``b`` (0..31) and each ``s``, ONE AND-gated rule fires on
+    ``SHIFT_LO_OH[lo] ∧ SHIFT_BIT4[b4] ∧ A_BIT[b]`` and places that bit at the
+    target ``t = b+s`` (SHL, skip ``t>=32``) / ``t = b-s`` (SHR, skip ``t<0``),
+    writing ``2**(t%4)`` into result nibble ``AX+(t//4)`` — the §Shifts multiply /
+    floor-divide by a power of two, bit-plane-exact.  Plus 8 self-clear rules (SET
+    semantics: reset each result nibble once).  Bit-identical to
+    ``shift_dispatch_rules`` (verified), but ~32×2×32 = 2048 rules instead of
+    ~10.8k, because the source is read as 32 bit planes not 16×15 nibble one-hots.
+    """
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"perbit_shift_select_rules: op {op} not SHL/SHR")
+    extend_layout_for_bitwise(L)
+    rules: List[FFNRule] = []
+    # SET semantics: clear each result nibble once (same as the table path).
+    for j in range(N_NIB):
+        rules.append(FFNRule([(L.ONE, 0.5, 1.5)],
+                             {L.AX + j: LinearExpr.of(L.AX + j, -1.0)}))
+    for b4 in range(2):
+        for lo in range(16):
+            s = lo + 16 * b4                      # s in 0..31
+            for b in range(WIDTH_BITS):           # source bit index
+                t = b + s if op == isa.SHL else b - s
+                if op == isa.SHL and t >= WIDTH_BITS:
+                    continue                      # shifted past the 32-bit width.
+                if op == isa.SHR and t < 0:
+                    continue                      # dropped off the low end.
+                rules.append(FFNRule(
+                    [(L.SHIFT_LO_OH + lo, 0.5, 1.5),
+                     (L.SHIFT_BIT4 + b4, 0.5, 1.5),
+                     (L.A_BIT + b, 0.5, 1.5)],
+                    {L.AX + (t // 4): LinearExpr.c(float(1 << (t % 4)))},
+                ))
+    return rules
+
+
 def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     """Single entry point for the ISA dispatch: return the ordered list of FFN
     blocks that implement ``op`` on the nibble skeleton.
@@ -606,7 +669,35 @@ def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     Plugs the five ops the greenfield dispatch stubbed out (``control.py``
     raised ``NotImplementedError`` for AND/OR/XOR; SHL/SHR were absent). In a
     real fan-out each block's rules are additionally gated on the opcode one-hot.
+
+    In the per-bit path (default, ``C4_BITWISE_PERBIT != 0``) all five ops read the
+    shared ``A_BIT``/``B_BIT`` bit planes: OR/XOR/AND reduce to a boolean per-bit
+    combine and SHL/SHR to a barrel shift, so no per-nibble operand one-hots are
+    built.  The escape hatch restores the dense 256-entry / per-(shift×nib×val)
+    tables.
     """
+    extend_layout_for_bitwise(L)
+    if _bitwise_perbit_enabled():
+        # shared bit planes for BOTH operands (source + operand2).
+        planes = compile_bit_extract(
+            src_bands=[L.STACK0 + j for j in range(N_NIB)]
+                      + [L.AX + j for j in range(N_NIB)],
+            bit_bases=[L.A_BIT + j * 4 for j in range(N_NIB)]
+                      + [L.B_BIT + j * 4 for j in range(N_NIB)],
+            one_band=L.ONE, dim=L.D)
+        from .compile_ffn import compile_ffn
+        if op in _BITWISE_FN:
+            return [planes, compile_ffn(perbit_select_rules(L, op), L.D)]
+        if op in (isa.SHL, isa.SHR):
+            # the shift COUNT one-hots (AX nib0/nib1 -> SHIFT_LO_OH/SHIFT_N1_OH).
+            expand = compile_onehot_expand(
+                src_bands=[L.AX + 0, L.AX + 1],
+                oh_bases=[L.SHIFT_LO_OH, L.SHIFT_N1_OH],
+                cells=16, one_band=L.ONE, dim=L.D)
+            bit4 = compile_ffn(_shift_bit4_rules(L), L.D)
+            select = compile_ffn(perbit_shift_select_rules(L, op), L.D)
+            return [planes, expand, bit4, select]
+        raise ValueError(f"append_bitwise_shift_to_dispatch: unsupported op {op}")
     if op in _BITWISE_FN:
         expand, select = bitwise_dispatch_rules(L, op)
         return [expand, select]
