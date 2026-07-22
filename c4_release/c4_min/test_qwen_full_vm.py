@@ -190,17 +190,6 @@ def test_variable_via_memory(vm_memcmp):
     assert r["exact"], r
 
 
-# -- MUL/DIV/MOD through the fused forward (pruned FFN table) -----------------
-@pytest.mark.slow
-@pytest.mark.parametrize("op,a,b", [("MUL", 6, 7), ("DIV", 84, 7), ("MOD", 84, 5)])
-def test_muldiv_through_qwen(op, a, b):
-    keys = [(Q.isa.MUL if op == "MUL" else Q.isa.DIV if op == "DIV" else Q.isa.MOD,
-             a, b)]
-    vm = Q.build(code_size=16, subset=Q.SUBSET_MULDIV, mdm_keys=keys)
-    r = _exact(vm, [("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)])
-    assert r["exact"], r
-
-
 # -- MUL/DIV/MOD via the EFFICIENT ALU (nibble_alu32, NOT the lookup table) ----
 # The efficient ALU replaces the 256x256x3 table (intermediate ~160465 -> ~45 GB)
 # with the spec's genuine 32-bit fp32 FFN gadgets: byte MUL schoolbook + base-16
@@ -231,9 +220,11 @@ def test_efficient_alu_is_not_the_lookup_table(vm_efficient_recurrent):
     ("DIV", 84, 7), ("DIV", 100, 7), ("DIV", 5, 0),
     ("MOD", 84, 5), ("MOD", 100, 7), ("MOD", 41, 42),
 ])
-def test_efficient_muldiv_through_qwen(vm_efficient_recurrent, op, a, b):
-    """Efficient MUL/DIV/MOD is byte-exact vs isa.interpret (8-bit) AND 32-bit-exact
-    vs nibble_muldivmod, through the genuine Qwen2Model.forward.  The FULL 32-bit
+def test_muldiv_through_qwen(vm_efficient_recurrent, op, a, b):
+    """MUL/DIV/MOD is byte-exact vs isa.interpret (8-bit) AND 32-bit-exact
+    vs nibble_muldivmod, through the genuine Qwen2Model.forward.  The efficient
+    nibble_alu32 ALU is the ONLY MUL/DIV/MOD path (the 256x256 lookup table is
+    removed).  The FULL 32-bit
     result lives in the AX nibble band at the ALU-op step (the trailing HALT reads
     the scalar AX_VAL, folded mod 256), so read the 32-bit value at the op step."""
     from c4_min.nibble_muldivmod import mul32, divmod32, mod32

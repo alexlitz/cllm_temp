@@ -489,15 +489,15 @@ _VM_CACHE: Dict[Tuple, Q.QwenFullVM] = {}
 
 def build_c4_causal_lm(code: List[isa.Instr], subset: Q.Subset = Q.SUBSET_MEM_CMP,
                        store_log: Optional[List[dict]] = None, code_size: Optional[int] = None,
-                       mdm_keys=None, max_steps: int = 256) -> C4VMForCausalLM:
+                       max_steps: int = 256) -> C4VMForCausalLM:
     """Build a ``C4VMForCausalLM`` for ``code``: a genuine ``Qwen2Model`` VM (baked by
     ``qwen_full_vm.build``) wrapped in the HF causal-LM contract.  The VM engine is
-    memoised per (subset, code_size, mdm_keys) so a battery reuses one bake."""
+    memoised per (subset, code_size) so a battery reuses one bake."""
     cs = code_size if code_size is not None else len(code) + 2
-    key = (subset.name, cs, tuple(mdm_keys) if mdm_keys else None)
+    key = (subset.name, cs)
     vm = _VM_CACHE.get(key)
     if vm is None:
-        vm = Q.build(code_size=cs, subset=subset, mdm_keys=mdm_keys)
+        vm = Q.build(code_size=cs, subset=subset)
         _VM_CACHE[key] = vm
     prog = C4Program(code=code, store_log=[dict(s) for s in (store_log or [])],
                      max_steps=max_steps)

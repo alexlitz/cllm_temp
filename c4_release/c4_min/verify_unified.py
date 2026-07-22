@@ -146,7 +146,7 @@ def _check(model, L, progs):
 def main():
     t0 = time.time()
     model, L, meta = build_unified_model(
-        code_size=32, include_mdm_table=True, include_bitwise=True)
+        code_size=32, include_bitwise=True)
     build_s = time.time() - t0
     rep = param_report(model, meta)
     print("=" * 70)
@@ -164,8 +164,9 @@ def main():
     results["base+cmp"] = _check(model, L, family_programs())
     print("  [step-loop dispatch : OR/XOR/AND/SHL/SHR  (folded bitwise FFN)]")
     results["bitwise"] = _check(model, L, bitwise_programs())
-    print("  [step-loop dispatch : MUL/DIV/MOD  (folded 8-bit table FFN)]")
-    results["muldiv"] = _check(model, L, muldiv_programs())
+    # NOTE: MUL/DIV/MOD are no longer baked into this lean unified model — the dense
+    # 256x256 lookup table was removed; the only MUL/DIV/MOD path is the efficient
+    # nibble_alu32 ALU in qwen_full_vm (see test_qwen_full_vm::test_muldiv_through_qwen).
     step_s = time.time() - t
 
     print("  [folded KV-memory head (block-0 attn of the SAME model) : LI/SI]")
