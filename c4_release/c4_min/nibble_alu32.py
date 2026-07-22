@@ -236,7 +236,8 @@ def _truncate(spec, u, dim):
 class ALU32Bands:
     """Allocate the scratch bands the 32-bit ALU blocks use (attaches onto L)."""
 
-    def __init__(self, L, recurrent_divmod: bool = False):
+    def __init__(self, L, recurrent_divmod: bool = False,
+                 shift_via_mul: bool = False):
         self.A = L._band("ALU_A", 4)          # operand-A bytes (STACK0 = popped)
         self.B = L._band("ALU_B", 4)          # operand-B bytes (AX = accumulator)
         self.NOTB = L._band("ALU_NOTB", 4)    # ~B bytes (for SUB two's complement)
@@ -278,17 +279,34 @@ class ALU32Bands:
         if recurrent_divmod:
             self.IT = L._scalar("ALU_IT")          # current iteration index 0..7
             self.IT_OH = L._band("ALU_IT_OH", 8)   # one-hot(IT)
+        # SHIFT-VIA-MUL/DIV (retire the barrel shifter): a shift ``x</>> n`` is a
+        # multiply / floor-divide by ``2**n`` (§Shifts).  ``SH_N_OH`` is the EXACT-count
+        # one-hot of the shift amount ``n`` over s=0..31; the pow2-route block reads it
+        # to write ``2**n`` (or 0 when n>=32, no cell fires) into the AX nibble band, so
+        # the NATIVE MUL (SHL) / DIV (SHR) gadgets — already applied every forward —
+        # compute the shift with NO barrel-shifter weights.  Only allocated when
+        # shift_via_mul is on.
+        self.shift_via_mul = shift_via_mul
+        if shift_via_mul:
+            self.SH_N_OH = L._band("ALU_SH_N_OH", 32)   # one-hot(shift count n), s=0..31
 
 
-def extend_layout_for_alu32(L, recurrent_divmod: bool = False):
+def extend_layout_for_alu32(L, recurrent_divmod: bool = False,
+                            shift_via_mul: bool = False):
     """Allocate ALU-32 scratch bands on ``L`` and refresh ``L.D`` (pad to heads).
 
     ``recurrent_divmod`` adds the digit-index counter band the reused
     division-iteration block reads/threads; OFF (default) is byte-identical to
-    the historical unrolled build (same dim, same weights)."""
+    the historical unrolled build (same dim, same weights).
+
+    ``shift_via_mul`` (default False, so every EXISTING caller is byte-identical)
+    adds the shift-amount one-hot band used to route SHL/SHR through the NATIVE
+    MUL/DIV gadgets (``2**n`` power-of-two table) instead of the barrel shifter;
+    the qwen_full_vm FULL build passes True (muldiv+bitwise), everything else OFF."""
     if getattr(L, "ALU32", None) is not None:
         return L.ALU32
-    L.ALU32 = ALU32Bands(L, recurrent_divmod=recurrent_divmod)
+    L.ALU32 = ALU32Bands(L, recurrent_divmod=recurrent_divmod,
+                         shift_via_mul=shift_via_mul)
     while L._off % L.n_heads != 0:
         L._scalar(f"_alupad{L._off}")
     L.D = L._off
@@ -878,13 +896,21 @@ def compile_divmod_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
 _ALU_RESULT = {
     isa.ADD: "ADD_RES", isa.SUB: "SUB_RES", isa.MUL: "MUL_RES",
     isa.DIV: "DIV_RES", isa.MOD: "MOD_RES",
+    # SHIFT-VIA-MUL/DIV: SHL reuses the MUL product (x * 2**n), SHR the DIV quotient
+    # (x // 2**n).  The pow2-route block put 2**n in AX, so MUL_RES / DIV_RES already
+    # hold the shift result; the mux copies it into AX gated on OP_IS[SHL/SHR].
+    isa.SHL: "MUL_RES", isa.SHR: "DIV_RES",
 }
 
 
 def compile_ax_mux(L, dim, ops=None) -> Dict[str, torch.Tensor]:
     """Write AX_nib[c] = sum_op OP_IS[op] * RES[op][c]  for c=0..7  (SET), for the
     ALU ops in ``ops`` (default all five).  The old AX nibble is cleared gated on
-    'any ALU op active' so a non-ALU step leaves AX untouched."""
+    'any ALU op active' so a non-ALU step leaves AX untouched.
+
+    When ``ops`` includes SHL/SHR (the shift-via-mul path) their result comes from
+    MUL_RES / DIV_RES respectively (the shift computed by the reused MUL/DIV gadget
+    with the pow2-routed operand), so the SAME mux delivers it into AX."""
     global _ONE
     _ONE = L.ONE
     a = L.ALU32
@@ -917,4 +943,80 @@ def compile_psh_nibble_copy(L, dim) -> Dict[str, torch.Tensor]:
     for c in range(8):
         u = _guard(spec, u, [g], {L.STACK0 + c: -1.0}, 0.0, L.STACK0 + c, 1.0)  # clear
         u = _guard(spec, u, [g], {L.AX + c: 1.0}, 0.0, L.STACK0 + c, 1.0)       # = AX
+    return _truncate(spec, u, dim)
+
+
+# ===========================================================================
+# 6. SHIFT-VIA-MUL/DIV : retire the ~20K barrel shifter (§Shifts).
+#
+#   SHL x, n = (x * 2**n) & 0xFFFFFFFF   -> route through the NATIVE MUL gadget
+#   SHR x, n = x // 2**n   (logical)     -> route through the NATIVE DIV gadget
+#
+# The shift amount ``n`` lives in AX (the popped ``x`` is in STACK0).  ONE tiny
+# power-of-two block, gated on SHL|SHR, OVERWRITES the AX nibble band with ``2**n``
+# (a ~33-entry table: n=0..31 -> 2**n, n>=32 -> 0), so the MUL products block (reads
+# STACK0=A, AX=B) then computes ``x * 2**n`` INTO MUL_RES and the DIV blocks compute
+# ``x // 2**n`` INTO DIV_RES — no new VM steps, the shift REUSES the mul/div blocks
+# already applied every forward (in-step reuse).  The ax-mux copies MUL_RES -> AX on
+# SHL and DIV_RES -> AX on SHR.  This replaces the ~14.7K-nz barrel-shifter select
+# (``perbit_shift_select_rules``) with a ~few-hundred-weight pow2 table + operand
+# routing.  Requires the MUL (and DIV, for SHR) gadget present; behind
+# ``shift_via_mul`` (default True when the subset has muldiv) with the barrel shifter
+# as the muldiv-less fallback.
+# ===========================================================================
+def compile_shift_onehot(L, dim) -> Dict[str, torch.Tensor]:
+    """Build the EXACT-count one-hot ``SH_N_OH[s] = [n == s]`` (s=0..31) of the shift
+    amount ``n`` (AX low byte = ``AX_nib0 + 16*AX_nib1``): the point indicator
+    ``[n>=s] - [n>=s+1]``.  Opcode-INDEPENDENT and cheap; only the (opcode-gated)
+    pow2-route write consumes it.
+
+    Split from the pow2-route write into its OWN, PRIOR block because every FFN unit
+    reads the block INPUT: the write's guard on ``SH_N_OH[s]`` must see it already
+    materialised.  Over the EXACT count (not ``n mod 32``): for ``n >= 32`` no cell
+    fires, so the pow2 route writes 0 (whole 32-bit word shifted out -> 0)."""
+    global _ONE
+    _ONE = L.ONE
+    a = L.ALU32
+    n_form = {L.AX + 0: 1.0, L.AX + 1: 16.0}   # AX low byte = shift count n (0..255).
+    # per s: _clear (1) + two _step_ge (2 relu units each) = 5 units.
+    spec = _empty_spec(dim, 32 * 5 + 4)
+    u = 0
+    for s in range(32):
+        oh = a.SH_N_OH + s
+        u = _clear(spec, u, oh)
+        u = _step_ge(spec, u, n_form, 0.0, s, oh, 1.0)
+        u = _step_ge(spec, u, n_form, 0.0, s + 1, oh, -1.0)
+    return _truncate(spec, u, dim)
+
+
+def compile_shift_pow2_route(L, dim) -> Dict[str, torch.Tensor]:
+    """Overwrite AX with ``2**n`` (n = shift amount in AX), gated on SHL|SHR.
+
+    Reads the pre-built one-hot ``SH_N_OH[s] = [n == s]`` (``compile_shift_onehot``, a
+    PRIOR block) and, gated on SHL|SHR, SETs the AX nibble band to ``2**s`` via the
+    §520 one-hot select over the 33-entry power-of-two table ``{s: 2**s}``.  For
+    ``n >= 32`` no cell fires and the AX nibbles stay cleared to 0 — the correct "whole
+    word shifted out" result (``x*0`` / ``x//0`` -> 0, ISA §Shifts / §Division b==0).
+    Every unit reads the block input, so clearing AX (SET) then adding ``2**n`` composes
+    to a clean SET of ``2**n`` over the AX nibbles the MUL (SHL) / DIV (SHR) blocks read
+    NEXT.  This ~few-hundred-weight table + operand route REPLACES the ~14.7K-nz
+    barrel-shifter select."""
+    from .blogspec_vocab import nibbles_of_value
+    global _ONE
+    _ONE = L.ONE
+    a = L.ALU32
+    # unit budget: SHL|SHR each: 8 AX-clear + <=32*8 one-hot pow2 nibble writes.
+    spec = _empty_spec(dim, 2 * (8 + 32 * 8) + 4)
+    u = 0
+    # gated (SHL|SHR) AX := 2**n : clear the 8 AX nibbles, then add 2**s's nibbles for
+    # the (single) active one-hot.  n >= 32 -> no one-hot -> AX stays 0 (word shifted out).
+    for op in (isa.SHL, isa.SHR):
+        g = (L.OP_IS + op, 1.0, 0.0)
+        for c in range(8):
+            u = _guard(spec, u, [g], {L.AX + c: -1.0}, 0.0, L.AX + c, 1.0)      # clear AX[c]
+        for s in range(32):
+            oh = (a.SH_N_OH + s, 1.0, 0.0)
+            for c, nv in enumerate(nibbles_of_value(1 << s, 8)):
+                if nv:
+                    u = _guard(spec, u, [g, oh], {L.ONE: float(nv)}, 0.0, L.AX + c, 1.0)
     return _truncate(spec, u, dim)

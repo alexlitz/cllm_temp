@@ -298,7 +298,8 @@ def _opcode_gate_rules(rules: List[FFNRule], op_band: int) -> List[FFNRule]:
     return out
 
 
-def build_bitwise_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
+                         ) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
     """Compile the OR/XOR/AND/SHL/SHR dispatch as opcode-gated FFN sub-blocks on
     the AX/STACK0 nibble bands. ALL five ops share ONE per-nibble bit-plane
     extraction (``bw-bitplanes``): OR/XOR/AND via the boolean per-bit combine
@@ -310,22 +311,32 @@ def build_bitwise_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
     tables are removed): the per-bit gadget IS the only path, bit-identical to the
     old table result. One shared expand block builds the shift-amount one-hots. Each
     op's select is OP_IS-gated; the shift bit4 fold and selects are likewise gated.
-    Returns named specs."""
+    Returns named specs.
+
+    ``barrel_shift_ops`` (default ``(SHL, SHR)``) selects WHICH shift ops the barrel
+    shifter still owns.  In the full (muldiv+bitwise) build with ``shift_via_mul`` on
+    it is passed ``()`` — SHL/SHR are then computed via the NATIVE MUL/DIV gadgets
+    (``nibble_alu32.compile_shift_pow2_route`` + the ax-mux), so the ~14.7K-nz barrel
+    shifter (SHL 3776 + SHR 10944) is DROPPED entirely and the shift-amount one-hot /
+    bit4 blocks shrink to the bitplanes the OR/XOR/AND combine still needs."""
     _bw.extend_layout_for_bitwise(L)                  # allocate SHIFT_*/A_BIT/B_BIT
     L.D = L._off                                      # bands grew; refresh D
     blocks: List[Tuple[str, Dict[str, torch.Tensor]]] = []
     # ONE expand block: the shift-amount one-hots (AX nib0 -> SHIFT_LO_OH low 4 bits,
     # AX nib1 -> SHIFT_N1_OH for bit 4).  The barrel shifter reads the source bits
     # from A_BIT (below), so the source operand one-hots A_OH are no longer needed.
-    expand = _bw.compile_onehot_expand(
-        src_bands=[L.AX + 0, L.AX + 1], oh_bases=[L.SHIFT_LO_OH, L.SHIFT_N1_OH],
-        cells=16, one_band=L.ONE, dim=L.D)
-    blocks.append(("bw-expand", expand))
-    # shift bit4 fold (gated by SHL|SHR).
-    bit4 = _bw._shift_bit4_rules(L)
-    bit4g = (_opcode_gate_rules(bit4, L.OP_IS + isa.SHL)
-             + _opcode_gate_rules(bit4, L.OP_IS + isa.SHR))
-    blocks.append(("bw-bit4", compile_ffn(bit4g, L.D)))
+    # Only needed when the barrel shifter still owns a shift op.
+    if barrel_shift_ops:
+        expand = _bw.compile_onehot_expand(
+            src_bands=[L.AX + 0, L.AX + 1], oh_bases=[L.SHIFT_LO_OH, L.SHIFT_N1_OH],
+            cells=16, one_band=L.ONE, dim=L.D)
+        blocks.append(("bw-expand", expand))
+        # shift bit4 fold (gated by the barrel shift ops).
+        bit4 = _bw._shift_bit4_rules(L)
+        bit4g: List[FFNRule] = []
+        for op in barrel_shift_ops:
+            bit4g += _opcode_gate_rules(bit4, L.OP_IS + op)
+        blocks.append(("bw-bit4", compile_ffn(bit4g, L.D)))
     # ONE shared, opcode-INDEPENDENT bit-plane extraction: STACK0/AX nibbles ->
     # A_BIT/B_BIT (4 planes each).  OR/XOR/AND read A_BIT+B_BIT; the barrel SHL/SHR
     # reads the source planes A_BIT.
@@ -341,7 +352,7 @@ def build_bitwise_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
     for op in (isa.OR, isa.XOR, isa.AND):
         s = _bw.perbit_select_rules(L, op)               # shared per-bit gadget
         sel += _opcode_gate_rules(s, L.OP_IS + op)
-    for op in (isa.SHL, isa.SHR):
+    for op in barrel_shift_ops:                          # (SHL, SHR) unless routed via mul
         s = _bw.perbit_shift_select_rules(L, op)          # barrel shifter (per-bit)
         sel += _opcode_gate_rules(s, L.OP_IS + op)
     blocks.append(("bw-select", compile_ffn(sel, L.D)))

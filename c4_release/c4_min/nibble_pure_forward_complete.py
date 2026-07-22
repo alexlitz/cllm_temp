@@ -1148,17 +1148,27 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
             else:
                 ax = ((v % ax) if ax else 0) & mask
         elif op in (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR):
-            v = mem.get(sp, 0) & 0xFF; sp += 4
-            if op == isa.OR:
-                ax = (v | ax) & 0xFF
-            elif op == isa.XOR:
-                ax = (v ^ ax) & 0xFF
-            elif op == isa.AND:
-                ax = (v & ax) & 0xFF
-            elif op == isa.SHL:
-                ax = (v << ax) & 0xFF
+            # OR/XOR/AND stay 8-bit (per-nibble table over the loaded byte). SHL/SHR
+            # honour ``mask``: the neural model computes them via the NATIVE 32-bit
+            # MUL/DIV gadgets (``x*2**n`` / ``x//2**n``, shift-via-mul), so the 32-bit
+            # proof (``mask=0xFFFFFFFF``) reads a full-width operand and masks the
+            # result to 32 bits (SHR is logical/unsigned as ``x < 2**32``).  At the
+            # 8-bit default (``mask=0xFF``) this is byte-identical to the prior fixed
+            # ``& 0xFF`` form.
+            if op in (isa.SHL, isa.SHR):
+                v = mem.get(sp, 0) & mask; sp += 4
+                if op == isa.SHL:
+                    ax = (v << ax) & mask
+                else:
+                    ax = (v >> ax) & mask
             else:
-                ax = (v >> ax) & 0xFF
+                v = mem.get(sp, 0) & 0xFF; sp += 4
+                if op == isa.OR:
+                    ax = (v | ax) & 0xFF
+                elif op == isa.XOR:
+                    ax = (v ^ ax) & 0xFF
+                else:
+                    ax = (v & ax) & 0xFF
         elif op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE):
             # C4's ordering comparisons (LT/GT/LE/GE) are SIGNED two's-complement
             # on the 32-bit word (sign bit 31 — matching the neural model, whose
