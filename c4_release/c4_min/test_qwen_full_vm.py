@@ -286,3 +286,55 @@ def test_corpus_memcmp_families_100pct():
     """cmp / memory / var — 100% argmax-exact through the real Qwen2 forward."""
     rep = C.run(subsets=["mem+cmp"])
     assert rep["n_pass"] == rep["n_total"], [r for r in rep["results"] if not r["exact"]]
+
+
+# -- SELF-EMULATION wall: byte-exact matmul-multiply through the self-emulating VM --
+# The measurement module (``measure_self_emulation_wall``) builds a large efficient-ALU
+# recurrent VM (~5.6 GB CUDA) — heavy, so this test is BOTH ``@slow`` AND opt-in via
+# ``C4_SELF_EMU_DEV`` (unset -> skipped even under ``--runslow``).  It asserts only the
+# CHEAP byte-exact core (scalar MAC + tiny [R×1]@[1] matvec) at a small step cap; the
+# timing / extrapolation is left to the module's ``main``.
+import os as _os
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _os.environ.get("C4_SELF_EMU_DEV"),
+                    reason="opt-in: set C4_SELF_EMU_DEV=cuda:1 to run the heavy "
+                           "self-emulation build (~5.6 GB)")
+def test_self_emulation_matvec_byte_exact():
+    """The multiply a matmul forward is built from is BYTE-EXACT through the
+    self-emulating VM: scalar MAC == numpy/isa, and a tiny [R×1]@[1] matvec matches
+    numpy.  Also pins TOKENS-PER-STEP = 7 (structural) and the #702 width-2 divergence."""
+    import numpy as np
+    from c4_min import measure_self_emulation_wall as M
+
+    dev = _os.environ["C4_SELF_EMU_DEV"]
+    vm = M.build_vm(dev)
+
+    # scalar MAC (the matmul multiply), byte-exact.
+    r = Q.run_program(vm, isa.assemble(M.scalar_mac_prog(3, 5)), max_steps=16)
+    assert r["ax_trace"][-1] == (3 * 5) & 0xFF, r
+
+    # tiny [R×1]@[1] matvec, byte-exact vs numpy.
+    W, x0 = [3, 5, 7, 9], 11
+    got = [Q.run_program(vm, isa.assemble(M.scalar_mac_prog(w, x0)),
+                         max_steps=16)["ax_trace"][-1] for w in W]
+    assert got == [int(v) for v in (np.array(W) * x0) & 0xFF], got
+
+    # TOKENS-PER-STEP is the structural pinning quantity: BOS + 5-reg frame + query = 7.
+    wins = []
+    orig = Q._forward
+    def _probe(vm_, xx):
+        wins.append(int(xx.shape[1])); return orig(vm_, xx)
+    Q._forward = _probe
+    try:
+        Q.run_program(vm, isa.assemble(M.scalar_mac_prog(3, 5)), max_steps=16)
+    finally:
+        Q._forward = orig
+    assert wins and min(wins) == max(wins) == 7, wins
+
+    # #702: a width-2 dot needs depth-2 -> diverges on the 1-slot machine.
+    ref2 = isa.interpret(isa.assemble(M.dot2_prog([3, 5], [10, 4])))[-1]
+    got2 = Q.run_program(vm, isa.assemble(M.dot2_prog([3, 5], [10, 4])),
+                        max_steps=16)["ax_trace"][-1]
+    assert ref2 == 50 and got2 != ref2, (ref2, got2)
