@@ -207,13 +207,23 @@ class QwenFullVM:
 
 def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           arch: QwenArch = QWEN2_5_ARCH, K: float = NORM_K,
-          mdm_keys=None) -> QwenFullVM:
+          mdm_keys=None, pad_to_stock: bool = False) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
     ``mdm_keys`` (optional) restricts the MUL/DIV/MOD FFN table to the given set of
     ``(op, a, b)`` operand triples (the full 256x256x3 table is the D-budget wall,
     intermediate ~160465). If None and ``subset.muldiv`` is set, the FULL table is
-    used (unbuildable in RAM — use a pruned key set for the corpus)."""
+    used (unbuildable in RAM — use a pruned key set for the corpus).
+
+    ``pad_to_stock`` (default ``False``) builds the model at the EXACT stock
+    Qwen2.5-0.5B checkpoint shape — ``hidden_size=896``, ``intermediate_size=4864``,
+    ``num_hidden_layers=24`` — instead of the tight compacted shape. The VM occupies
+    the first ``len(block_specs)`` layers; the remaining layers are IDENTITY (their
+    self-attn AND MLP projections stay zeroed, so ``x + attn(RMSNorm(x)) + mlp(...)``
+    = ``x``), and the residual bands past the VM's ``D_used`` stay 0 on every token.
+    This proves the SAME weights load and run byte-exact through a config that is
+    shape-identical to the released 0.5B (only a subset that already ``fits_stock``
+    can be padded; a wider subset raises)."""
     from transformers.models.qwen2 import Qwen2Model
 
     QL = QwenFullLayout(code_size, subset)
@@ -230,6 +240,18 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
 
     fits_stock = (hidden_size <= STOCK_HIDDEN and intermediate <= STOCK_INTERMEDIATE
                   and n_layers <= STOCK_LAYERS)
+
+    if pad_to_stock:
+        if not fits_stock:
+            raise ValueError(
+                f"subset {subset.name!r} does not fit the stock 0.5B budget "
+                f"(hidden={hidden_size} inter={intermediate} layers={n_layers}); "
+                "cannot pad to stock")
+        # Grow to the EXACT released Qwen2.5-0.5B shape; the VM fills the first
+        # n_layers, the rest are identity, the residual past D_used stays 0.
+        hidden_size = STOCK_HIDDEN
+        intermediate = STOCK_INTERMEDIATE
+        n_layers = STOCK_LAYERS
 
     cfg = _qwen_config(hidden_size, intermediate, n_layers, V.VOCAB, arch)
     qmodel = Qwen2Model(cfg).to(torch.float32).eval()

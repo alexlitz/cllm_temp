@@ -115,35 +115,58 @@ class PureForwardLayout(NibbleVMLayout):
       ``IS_STORE`` (1) / ``IS_LOAD`` (1) — the store/load role flags.
     """
 
-    def __init__(self, code_size: int, n_heads: int):
+    def __init__(self, code_size: int, n_heads: int,
+                 include_memory: bool = True, include_cmp: bool = True,
+                 include_muldiv: bool = True):
+        # SUBSET-AWARE ALLOCATION.  The optional op families each own a chunk of the
+        # residual (memory KV = 82 dims, cmp = 11 dims, the 8-bit MUL/DIV/MOD operand
+        # tables = 513 dims).  Historically all THREE were allocated UNCONDITIONALLY,
+        # so a base (arith/func-only) build carried ~600 dead residual dims — enough
+        # to push the compacted Qwen bake's hidden_size one head-dim over the stock
+        # 0.5B ceiling (903 -> ceil to 960 > 896).  The ``include_*`` flags (which the
+        # subset builders already thread) now GATE the allocation: a family whose block
+        # is not baked no longer reserves its band.  DEFAULTS ARE ALL-TRUE so every
+        # existing caller (``PureForwardCompleteLayout``, the deep
+        # ``build_pure_forward_model`` default, the tests) is BYTE-IDENTICAL — only a
+        # subset that explicitly drops a family shrinks.  A skipped family's band
+        # attributes stay ``None`` (so ``getattr(L, "MDM_A_OH", None) is not None``
+        # lazy-alloc guards in ``extend_layout_for_mdm`` still work).
         super().__init__(code_size, n_heads=n_heads)
         self._off = self.D
         self.ROLE = self._band("ROLE", N_ROLES)
         self.IS_FRAME_BYTE = self._scalar("IS_FRAME_BYTE")
-        # KV-memory bands.
+        # KV-memory bands (only when the memory op family is baked).
         from .blogspec_memory import ADDR_BITS as _AB
         from .blogspec_layout import NIB_PER_REG as _NR
-        self.ADDR_BIN = self._band("ADDR_BIN", _AB)
-        self.QRY_BIN = self._band("QRY_BIN", _AB)
-        self.VAL_NIB = self._band("VAL_NIB", _NR)
-        self.IS_STORE = self._scalar("IS_STORE")
-        self.IS_LOAD = self._scalar("IS_LOAD")
+        self.ADDR_BIN = self.QRY_BIN = self.VAL_NIB = None
+        self.IS_STORE = self.IS_LOAD = None
+        if include_memory:
+            self.ADDR_BIN = self._band("ADDR_BIN", _AB)
+            self.QRY_BIN = self._band("QRY_BIN", _AB)
+            self.VAL_NIB = self._band("VAL_NIB", _NR)
+            self.IS_STORE = self._scalar("IS_STORE")
+            self.IS_LOAD = self._scalar("IS_LOAD")
         # CMP result scratch lanes (computed ungated from d = STK - AX each step).
         # GT/LT are SIGNED (two's-complement, C4-faithful): the magnitude order is
         # corrected by the two operands' sign bits so cross-sign pairs compare
         # correctly (see ``compile_cmp_compute`` + ``compile_cmp_signed_finalize``).
-        self.CMP_EQ = self._scalar("CMP_EQ")     # 1 iff STK == AX
-        self.CMP_GT = self._scalar("CMP_GT")     # 1 iff STK  > AX (SIGNED, final)
-        self.CMP_LT = self._scalar("CMP_LT")     # 1 iff STK  < AX (SIGNED, final)
-        # signed-compare intermediates (cmp-compute writes; cmp-finalize consumes).
-        self.MAG_GT = self._scalar("MAG_GT")     # UNSIGNED (STK>AX), raw ramp
-        self.MAG_LT = self._scalar("MAG_LT")     # UNSIGNED (STK<AX), raw ramp
-        self.SGN_STK = self._scalar("SGN_STK")   # 1 iff STK bit31 set (negative)
-        self.SGN_AX = self._scalar("SGN_AX")     # 1 iff AX  bit31 set (negative)
-        # 8-bit MUL/DIV/MOD table operand one-hots + result lane.
-        self.MDM_A_OH = self._band("MDM_A_OH", 256)
-        self.MDM_B_OH = self._band("MDM_B_OH", 256)
-        self.MDM_RES = self._scalar("MDM_RES")   # byte result (pre-dispatch)
+        self.CMP_EQ = self.CMP_GT = self.CMP_LT = None
+        self.MAG_GT = self.MAG_LT = self.SGN_STK = self.SGN_AX = None
+        if include_cmp:
+            self.CMP_EQ = self._scalar("CMP_EQ")     # 1 iff STK == AX
+            self.CMP_GT = self._scalar("CMP_GT")     # 1 iff STK  > AX (SIGNED, final)
+            self.CMP_LT = self._scalar("CMP_LT")     # 1 iff STK  < AX (SIGNED, final)
+            # signed-compare intermediates (cmp-compute writes; cmp-finalize consumes).
+            self.MAG_GT = self._scalar("MAG_GT")     # UNSIGNED (STK>AX), raw ramp
+            self.MAG_LT = self._scalar("MAG_LT")     # UNSIGNED (STK<AX), raw ramp
+            self.SGN_STK = self._scalar("SGN_STK")   # 1 iff STK bit31 set (negative)
+            self.SGN_AX = self._scalar("SGN_AX")     # 1 iff AX  bit31 set (negative)
+        # 8-bit MUL/DIV/MOD table operand one-hots + result lane (the 513-dim wall).
+        self.MDM_A_OH = self.MDM_B_OH = self.MDM_RES = None
+        if include_muldiv:
+            self.MDM_A_OH = self._band("MDM_A_OH", 256)
+            self.MDM_B_OH = self._band("MDM_B_OH", 256)
+            self.MDM_RES = self._scalar("MDM_RES")   # byte result (pre-dispatch)
         while self._off % n_heads != 0:
             self._scalar(f"_pfpad{self._off}")
         self.D = self._off
@@ -665,7 +688,12 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
     stream by attention. Nothing is computed in Python.
     """
     n_heads = N_ROLES + (1 if include_memory else 0)
-    L = PureForwardLayout(code_size, n_heads=n_heads)
+    # SUBSET-AWARE: skip the memory / cmp / muldiv residual bands a build does not
+    # bake (a base arith/func build no longer carries the ~600 dead dims of the
+    # unused op families).  ``include_bitwise`` extends the layout separately below.
+    L = PureForwardLayout(code_size, n_heads=n_heads,
+                          include_memory=include_memory, include_cmp=include_cmp,
+                          include_muldiv=include_muldiv)
     if include_bitwise:
         from . import nibble_bitwise as _bw
         _bw.extend_layout_for_bitwise(L)          # A_OH/B_OH/SHIFT_* bands
