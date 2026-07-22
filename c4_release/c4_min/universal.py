@@ -54,7 +54,8 @@ import torch
 
 from . import isa
 from . import control
-from .compiler import (VOCAB, _zero_attn, _load_ffn, _load_head, head_matrix)
+from .compiler import (VOCAB, _zero_attn, _load_ffn, _load_head, head_matrix,
+                       vanilla_requantize)
 from .compile_ffn import compile_ffn, compile_fold, S as FFN_S
 from .control import RELU_S
 from .dsl import FFNRule, LinearExpr
@@ -576,12 +577,13 @@ def _step_once(model, state: torch.Tensor) -> torch.Tensor:
 
 
 def _requantize(state: torch.Tensor, L) -> torch.Tensor:
-    """Round every band to the nearest integer (annihilating fp residue), then
-    pin ONE=1 and re-assert the (constant) CODE data bands so nothing can perturb
-    the program-in-data. Idempotent on the exact-integer VM state."""
-    q = torch.round(state)
-    q[L.ONE] = 1.0
-    return q
+    """Snap every band to its exact integer via the VANILLA LM-head argmax
+    (``argmax_v (2*v*x - v^2)`` — the model's own emit-token snap, annihilating fp
+    residue with NO ``torch.round``), then pin ONE=1. The value vocab covers the
+    packed CODE_WORD data band (``op | imm<<8`` up to 0xFFFF) so the constant
+    program-in-data is preserved byte-exact. Idempotent on the exact-integer VM
+    state."""
+    return vanilla_requantize(state, L.ONE)
 
 
 def run_universal(model, L, code: List[isa.Instr], max_steps: int = 100000,

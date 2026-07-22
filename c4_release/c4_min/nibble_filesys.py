@@ -67,12 +67,25 @@ Neural READ pathway (§File Operations / §Printing and Reading Input)
 The blog also gives READ a *native* pathway: like ``getchar``/stdin, READ can be
 satisfied from the **input KV** — bytes injected into the token stream between
 ``USER_INPUT_START``/``END`` markers and read out by attention, with no runner
-intervention (§849-851: "AX = read(fd,buf,n) via input KV"). We model that here
-with ``InputKVStream`` (fd 0 == stdin), so a READ on the stdin fd pulls its
-bytes from the injected input buffer rather than the file runner — the same
-result byte-for-byte, but on the 100%-native path. Regular file fds go through
-the tool-call runner. This is exactly the blog's two-mode story: file reads via
-tool call, stdin reads via input KV.
+intervention (§849-851: "AX = read(fd,buf,n) via input KV"). ``InputKVStream``
+(fd 0 == stdin) implements this: a READ on the stdin fd pulls its bytes from the
+injected input buffer rather than the file runner.
+
+This native read is GENUINELY NEURAL (``InputKVStream(neural=True)``, the
+default). The injected bytes are laid out as a token stream — a BOS/marker
+token followed by one value token per byte — and each returned byte is located
+by the multi-slope BOS **ALiBi position signature** (§704-712) and retrieved
+through the REAL ``blogspec_model.Attn`` softmax1 + ALiBi forward
+(``nibble_io_position.IOPositionBuffer.read_run_neural``): a query "matches the
+exponential signature of distance N" and attention reads the byte at that
+sequence position (§710). It is NOT a Python buffer slice — the transformer
+locates and copies the input byte. It is byte-for-byte identical to the plain
+slice (``neural=False``), which is kept as the reference / escape hatch.
+
+Regular file fds still go through the tool-call runner (file operations
+"intrinsically require a tool call", §693-695 — that boundary is NOT neural and
+is not claimed to be). This is the blog's two-mode story: file reads via tool
+call, stdin reads via the native input-KV position-signature attention.
 """
 from __future__ import annotations
 
@@ -243,14 +256,45 @@ class InputKVStream:
     """The neural-read (input-KV) byte buffer — the bytes injected between
     ``USER_INPUT_START``/``END`` that stdin reads attend to (§Printing and
     Reading Input). A READ on ``STDIN_FD`` is satisfied from here, with no file
-    runner and no real disk — the 100%-native pathway."""
+    runner and no real disk — the native (non-tool-call) pathway.
 
-    def __init__(self, data: bytes = b""):
+    ``read`` is genuinely NEURAL by default (``neural=True``): each returned
+    byte is located by the multi-slope BOS ALiBi **position signature** (§710)
+    and retrieved through the REAL ``blogspec_model.Attn`` softmax1 + ALiBi
+    forward (``nibble_io_position.IOPositionBuffer.read_run_neural``) — the
+    query "matches the exponential signature of distance N" and the attention
+    reads the byte at that position out of the injected token stream, exactly as
+    the spec describes.  It is NOT a Python list slice.
+
+    Set ``neural=False`` for the plain reference slice (``self.data[pos:pos+n]``)
+    — kept as an escape hatch and to gate byte-identity of the neural path
+    against it; the two are byte-for-byte identical over the buffer.
+    """
+
+    def __init__(self, data: bytes = b"", neural: bool = True, n_heads: int = 8):
         self.data = bytes(data)
         self.pos = 0
+        self.neural = neural
+        self.n_heads = n_heads
+        self._buf = None
+        if neural:
+            # Lazy import so the transformer dep only loads on the neural path.
+            from .nibble_io_position import IOPositionBuffer
+            self._buf = IOPositionBuffer(marker_pos=0, n_heads=n_heads)
+            self._buf.extend(self.data)
 
     def read(self, n: int) -> bytes:
-        chunk = self.data[self.pos:self.pos + n]
+        n = int(n)
+        avail = max(0, min(n, len(self.data) - self.pos))   # short-read length
+        if self.neural:
+            # Neural retrieval: position-signature query -> softmax1+ALiBi
+            # attention over the injected token stream (§710).  Truncate to the
+            # in-range bytes so a short read advances ``pos`` by exactly the
+            # bytes actually present (ZFOD would pad the rest with 0).
+            vals = self._buf.read_run_neural(self.pos, avail)
+            chunk = bytes(vals)
+        else:
+            chunk = self.data[self.pos:self.pos + n]        # reference slice
         self.pos += len(chunk)
         return chunk
 

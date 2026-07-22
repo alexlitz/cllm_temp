@@ -12,12 +12,31 @@ residue-IMMUNE).  A ``torch.round`` on the exec path is a NON-VANILLA short-cut:
 it snaps the fp residual with a hand-rolled quantiser instead of the transformer's
 own head.  This test asserts that no such short-cut runs.
 
+Coverage (ALL exec paths, not just the headline three)
+------------------------------------------------------
+The headline three paths (recurrent, pure-forward-complete, blogspec_run) are
+covered below.  This guard ALSO covers the four NON-headline capstone exec loops
+whose per-step requant was previously a ``torch.round`` and is now the same
+vanilla LM-head argmax (``compiler.vanilla_requantize``):
+
+  * ``nibble_bake``     — the malloc / program-baked-into-weights capstone.
+  * ``universal``       — the universal-interpreter capstone (program in DATA).
+  * ``nibble_handoff``  — the model-runs-C handoff capstone (EMIT then run).
+  * ``nibble_compiler`` — the C-compiler capstone (compile + run).
+
+Each is tripwired BOTH statically (no torch round/floor/trunc CALL node) and at
+runtime (executed under the guard: no torch quantiser fires AND the trace is
+byte-exact vs the reference interpreter).
+
 Two complementary guards
 -------------------------
 1. STATIC (AST): the decode-path modules contain no ``round`` / ``floor`` /
    ``trunc`` CALL node.  (``test_blogspec_foundation`` already does this for the
    blogspec modules; here we cover the nibble-VM / pure-forward / recurrent /
-   memory decode modules too — the exec-path requant.)
+   memory decode modules too — the exec-path requant.)  For the four capstone
+   modules the STATIC scan is TORCH-specific (``torch.round`` / ``.round()`` /
+   floor / trunc) so it does not false-flag the Python builtin ``round(scalar)``
+   read-out of the final integer code words on the ``return_code`` path.
 2. RUNTIME (monkeypatch + settrace): we actually EXECUTE a representative program
    on each exec path (recurrent, pure-forward-complete, blogspec_run) with
    ``torch.round`` / ``torch.floor`` / ``torch.trunc`` / ``Tensor.round`` /
@@ -74,11 +93,16 @@ class _VanillaExecGuard:
     python VM-compute call while active.  Empty ``violations`` == the step ran
     purely as transformer-forward + argmax-decode."""
 
-    def __init__(self):
+    def __init__(self, trace_py: bool = True):
         self.round_calls: List[str] = []
         self.py_calls: List[str] = []
         self._saved = {}
         self._prev_trace = None
+        # settrace is only needed for the python-VM-compute census; the torch
+        # quantiser tripwire (monkeypatch) works without it. Long-running exec
+        # paths (compiler/handoff) skip the tracer to stay fast — the round
+        # tripwire is unaffected.
+        self._trace_py = trace_py
 
     def _make_trip(self, label):
         rec = self.round_calls
@@ -105,12 +129,14 @@ class _VanillaExecGuard:
         for nm in ("round", "round_", "floor", "floor_", "trunc", "trunc_"):
             self._saved[("Tensor", nm)] = getattr(torch.Tensor, nm)
             setattr(torch.Tensor, nm, self._make_trip(f"Tensor.{nm}"))
-        self._prev_trace = sys.gettrace()
-        sys.settrace(self._tracer)
+        if self._trace_py:
+            self._prev_trace = sys.gettrace()
+            sys.settrace(self._tracer)
         return self
 
     def __exit__(self, *exc):
-        sys.settrace(self._prev_trace)
+        if self._trace_py:
+            sys.settrace(self._prev_trace)
         for (owner, nm), fn in self._saved.items():
             setattr(torch if owner == "torch" else torch.Tensor, nm, fn)
         return False
@@ -124,8 +150,14 @@ def _assert_vanilla_exec(run_fn, *args, enforce_no_py_compute=True, **kwargs):
     PURE-FORWARD paths (the whole VM transition is ``model.forward``); the
     ``blogspec_run`` reference driver computes the transition in python by design
     (its contribution is proving the NIBBLE + 30-token + argmax requant), so it is
-    checked for the quantiser only.  Returns ``run_fn``'s result."""
-    guard = _VanillaExecGuard()
+    checked for the quantiser only.  Returns ``run_fn``'s result.
+
+    The settrace-based python-compute census is only installed when
+    ``enforce_no_py_compute`` is set; the round/floor/trunc tripwire is a
+    monkeypatch that fires regardless, so the long-running capstone exec paths
+    (compiler/handoff) skip the (slow) tracer while still asserting no torch
+    quantiser ran."""
+    guard = _VanillaExecGuard(trace_py=enforce_no_py_compute)
     with guard:
         result = run_fn(*args, **kwargs)
     assert not guard.round_calls, \
@@ -154,14 +186,18 @@ def test_recurrent_exec_is_vanilla_argmax():
 
 # ===========================================================================
 # 2. PURE-FORWARD-COMPLETE path — one model.forward per step; decode via the
-#    LM-head argmax (``_snap_lane`` / ``_snap_nib``).  Lean build (no divmod) to
-#    stay well under the memory/time budget.
+#    LM-head argmax (``_snap_lane`` / ``_snap_nib``).  Built via the memory-SAFE
+#    streaming path (``guarded_complete_build`` -> ``build_compact_sparse_streaming``,
+#    peak ~5 GB) instead of the DENSE ``build_pure_forward_complete_model`` (which
+#    pads every block to the ~160k-row MUL/DIV/MOD FFN and peaks at 54-108 GB RSS
+#    — this test at code_size=16 ballooned the box to 105 GB).  The streaming model
+#    is the SAME full-op-set interpreter, byte-identical (L-inf=0, dense_kernel) and
+#    driven by the SAME ``run_pure_forward_complete`` runner.
 # ===========================================================================
 def test_pure_forward_complete_exec_is_vanilla_argmax():
-    from c4_min.nibble_pure_forward_complete import (
-        build_pure_forward_complete_model, run_pure_forward_complete)
-    model, L = build_pure_forward_complete_model(
-        code_size=16)
+    from c4_min.nibble_pure_forward_complete import run_pure_forward_complete
+    from c4_min._build_guard import guarded_complete_build
+    model, L = guarded_complete_build(code_size=16)
     for prog in (_ADD, _SUB_UF, _BRANCH, _LOOP):
         code = isa.assemble(prog)
         trace = _assert_vanilla_exec(
@@ -225,6 +261,140 @@ def test_no_quantizer_call_node_in_decode_modules():
                 assert name not in forbidden, (mod.__name__, name, ast.dump(node))
 
 
+# ===========================================================================
+# 5. THE 4 NON-HEADLINE EXEC PATHS — bake / universal / handoff / compiler.
+#    These are the malloc-bake / universal-interpreter / model-runs-C-handoff /
+#    C-compiler capstone loops whose per-step requant WAS ``torch.round`` and is
+#    now the same vanilla LM-head argmax (``compiler.vanilla_requantize``).  We
+#    tripwire them BOTH statically (no torch round/floor/trunc CALL node) AND at
+#    runtime (execute each capstone under the guard, assert no torch quantiser
+#    fired AND the trace is byte-exact vs the reference interpreter).
+# ===========================================================================
+
+# Modules whose per-step exec loop must be pure transformer-forward + argmax.
+_EXEC_PATH_MODULES = (
+    "c4_min.nibble_bake",       # malloc / program-baked-into-weights capstone
+    "c4_min.universal",         # universal-interpreter capstone (program in DATA)
+    "c4_min.nibble_handoff",    # model-runs-C handoff capstone (EMIT then run)
+    "c4_min.nibble_compiler",   # C-compiler capstone (compile + run)
+)
+
+
+def _torch_quantizer_call_nodes(mod):
+    """Return every ``torch.round`` / ``torch.floor`` / ``torch.trunc`` (or the
+    tensor-method ``.round()`` / ``.floor()`` / ``.trunc()``) CALL node in ``mod``.
+
+    Deliberately does NOT flag the Python BUILTIN ``round(scalar)`` used to read a
+    single already-integer band out of the FINAL state on the ``return_code`` path
+    (a post-run scalar read-out, not the per-step neural requant): only the torch
+    float->int quantisers that would run on the exec path are the non-vanilla
+    short-cut this guard forbids.
+    """
+    forbidden = {"round", "floor", "trunc"}
+    bad = []
+    tree = ast.parse(inspect.getsource(mod))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if isinstance(fn, ast.Attribute) and fn.attr in forbidden:
+            # torch.round(...) OR tensor.round(...) — both are torch quantisers.
+            # (builtin round(...) is an ast.Name, never an Attribute, so excluded.)
+            bad.append((fn.attr, ast.dump(node)))
+    return bad
+
+
+def test_no_torch_quantizer_call_node_in_exec_path_modules():
+    """STATIC: none of the 4 non-headline capstone modules contains a
+    ``torch.round`` / ``.round()`` (or floor/trunc) CALL node.  This is the
+    tripwire that FAILS if a torch quantiser is reintroduced on any of the
+    bake / universal / handoff / compiler exec paths."""
+    import importlib
+    for name in _EXEC_PATH_MODULES:
+        mod = importlib.import_module(name)
+        bad = _torch_quantizer_call_nodes(mod)
+        assert not bad, f"{name} has torch quantiser call(s): {bad}"
+
+
+def test_static_guard_is_not_vacuous():
+    """The static torch-quantiser scan MUST flag a real ``torch.round`` /
+    ``tensor.round`` and MUST NOT flag the builtin ``round(scalar)`` read-out —
+    otherwise it proves nothing / would false-positive the code-word read-out."""
+    import types
+    good_src = (
+        "import torch\n"
+        "def f(state, L):\n"
+        "    return [int(round(float(state[i]))) for i in range(3)]\n"
+    )
+    bad_torch = "import torch\ndef g(x):\n    return torch.round(x)\n"
+    bad_method = "def h(x):\n    return x.round()\n"
+    for src, expect_flag in ((good_src, False), (bad_torch, True),
+                             (bad_method, True)):
+        m = types.ModuleType("m")
+        m.__source_cache = src
+        # feed source directly (inspect.getsource can't see a synthetic module)
+        forbidden = {"round", "floor", "trunc"}
+        found = []
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+               and node.func.attr in forbidden:
+                found.append(node.func.attr)
+        assert bool(found) == expect_flag, (src, found)
+
+
+def test_bake_exec_is_vanilla_argmax():
+    """RUNTIME: the malloc/program-baked capstone runs with NO torch quantiser and
+    is byte-exact vs the reference interpreter."""
+    from c4_min.nibble_bake import BakedProgram
+    for prog in (_ADD, _SUB_UF, _BRANCH, _LOOP):
+        code = isa.assemble(prog)
+        ref = isa.interpret(code, max_steps=100000)
+        bp = BakedProgram(prog)
+        got = _assert_vanilla_exec(bp.run, max_steps=100000,
+                                   enforce_no_py_compute=False)
+        assert got == ref, (prog, got, ref)
+
+
+def test_universal_exec_is_vanilla_argmax():
+    """RUNTIME: the universal-interpreter capstone (program loaded as DATA, incl.
+    the PACKED code-word variant with 0xFFFF-range bands) runs with NO torch
+    quantiser and is byte-exact vs the reference interpreter."""
+    from c4_min.universal import UniversalInterpreter
+    for packed in (False, True):
+        ui = UniversalInterpreter(code_size=20, packed=packed)
+        for prog in (_ADD, _SUB_UF, _BRANCH, _LOOP):
+            ref = isa.interpret(isa.assemble(prog), max_steps=100000)
+            got = _assert_vanilla_exec(ui.run, prog, max_steps=100000,
+                                       enforce_no_py_compute=False)
+            assert got == ref, (packed, prog, got, ref)
+
+
+def test_handoff_exec_is_vanilla_argmax():
+    """RUNTIME: the model-runs-C handoff capstone (EMIT bytecode then run it) runs
+    with NO torch quantiser and is byte-exact vs the reference interpreter."""
+    import c4_min.nibble_handoff as H
+    for prog in (_ADD, _SUB_UF, _LOOP):
+        ref = isa.interpret(isa.assemble(prog), max_steps=100000)
+        hm = H.HandoffMachine(code_size=16)
+        got = _assert_vanilla_exec(hm.run, prog, enforce_no_py_compute=False)
+        assert got == ref, (prog, got, ref)
+
+
+def test_compiler_exec_is_vanilla_argmax():
+    """RUNTIME: the C-compiler capstone (compile a C expr to bytecode, then run it;
+    packed CODE_WORD bands up to 0xFFFF) runs with NO torch quantiser and is
+    byte-exact vs the in-module reference (``interpret_full``)."""
+    import c4_min.nibble_compiler as C
+    bc = C.expr_compiler_bytecode()
+    cm = C.CompilerMachine(code_size=176, src_size=8, mem_size=8, stack_depth=8)
+    for src in ("2+3*4", "5+6", "7*8"):
+        got = _assert_vanilla_exec(cm.run, bc, src, max_steps=4000,
+                                   enforce_no_py_compute=False)
+        ref, _ = C.interpret_full(C._assemble(bc), C._source_bytes(src), 176,
+                                  mem_size=8, max_steps=4000)
+        assert got == ref, (src, got, ref)
+
+
 if __name__ == "__main__":
     import traceback
     tests = [
@@ -233,6 +403,12 @@ if __name__ == "__main__":
         test_blogspec_run_exec_is_vanilla_argmax,
         test_guard_is_not_vacuous_negative_control,
         test_no_quantizer_call_node_in_decode_modules,
+        test_no_torch_quantizer_call_node_in_exec_path_modules,
+        test_static_guard_is_not_vacuous,
+        test_bake_exec_is_vanilla_argmax,
+        test_universal_exec_is_vanilla_argmax,
+        test_handoff_exec_is_vanilla_argmax,
+        test_compiler_exec_is_vanilla_argmax,
     ]
     passed = 0
     for t in tests:

@@ -88,7 +88,8 @@ import torch
 
 from . import isa
 from . import control
-from .compiler import VOCAB, _zero_attn, _load_ffn, _load_head, head_matrix
+from .compiler import (VOCAB, _zero_attn, _load_ffn, _load_head, head_matrix,
+                       vanilla_requantize)
 from .compile_ffn import compile_ffn, compile_fold, S as FFN_S, RELU_S
 from .dsl import FFNRule, LinearExpr
 from .layout import Layout
@@ -523,9 +524,11 @@ def initial_state_no_program(model, L) -> torch.Tensor:
 
 
 def _requantize(state: torch.Tensor, one_band: int) -> torch.Tensor:
-    q = torch.round(state)
-    q[one_band] = 1.0
-    return q
+    """Re-quantise every band to its exact integer via the VANILLA LM-head argmax
+    (``argmax_v (2*v*x - v^2)`` — the model's own emit-token snap, NOT
+    ``torch.round``), then pin the constant ONE lane to 1.0. Byte-identical to the
+    old round on the exact-integer VM state; residue-immune by construction."""
+    return vanilla_requantize(state, one_band)
 
 
 def _step_once(model, state: torch.Tensor) -> torch.Tensor:

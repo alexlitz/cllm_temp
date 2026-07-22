@@ -79,7 +79,7 @@ def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
 
 
 def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
-              out: list = None):
+              out: list = None, stdin=None):
     """Reference 8-bit interpreter. Returns list of AX values emitted per step.
 
     Stack grows downward from ``mem_size`` (top). ``pop`` reads stack[SP] then SP+=1.
@@ -87,6 +87,16 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
     appends ``AX & 0xFF`` to it — the byte-stream a real stdout would see (the
     ``printf("%c", AX)`` visible-output channel, §System / op 33). This is the
     single-char printf form the classic string quine uses.
+
+    ``stdin`` (a ``nibble_filesys.InputKVStream`` or any object with
+    ``read(n) -> bytes``) is the neural-stdin / input-KV byte source a
+    ``READ(fd=0, buf, n)`` pulls from (§Tool Use Mode: argv/stdin are "read
+    exactly as user input is"). READ marshalling matches
+    ``nibble_filesys.dispatch_file_op``: ``fd = pop()``, ``buf = pop()``,
+    ``n = AX``; it lays the read bytes into ``mem`` at ``buf`` and sets AX to the
+    number of bytes read. This is the SAME semantics the pure-forward driver
+    services via the TOOL_CALL runner — so this clean-room VM is a value-faithful
+    golden for the argv READ path.
     """
     ax = sp = bp = 0
     sp = mem_size          # empty stack
@@ -159,8 +169,26 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
             ax = 1 if pop() >= ax else 0
         elif op == LI:
             ax = mem[ax] & MASK
+        elif op == LC:
+            ax = mem[ax] & MASK        # byte load (mem is byte-addressed here)
         elif op == SI:
             mem[pop()] = ax & MASK
+        elif op == SC:
+            mem[pop()] = ax & MASK     # byte store
+        elif op == READ:
+            # READ(fd=pop, buf=pop, n=AX) -> n_read.  fd 0 is neural stdin: the
+            # bytes are pulled from ``stdin`` (the input-KV stream) and laid into
+            # ``mem`` at ``buf`` — argv "read exactly as user input is".
+            n = ax
+            buf = pop()
+            fd = pop()
+            if fd == 0 and stdin is not None:
+                chunk = stdin.read(n)
+            else:
+                chunk = b""
+            for i, byte in enumerate(chunk):
+                mem[(buf + i) % mem_size] = byte & MASK
+            ax = len(chunk) & MASK
         elif op == PRTF:
             if out is not None:
                 out.append(ax & 0xFF)   # printf visible output byte; AX unchanged

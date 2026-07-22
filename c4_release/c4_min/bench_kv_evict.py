@@ -125,15 +125,79 @@ def gpu_util_sample(device_idx, fn, stop_after=3.0):
     return peak[0], n
 
 
+def bench_all_blocks(dev: str, n_blocks: int, H: int, HD: int, sizes):
+    """The #667 fix's before/after: a WHOLE-model prune of ``n_blocks`` block caches.
+
+    OLD: the driver's per-block Python loop ``for b: caches[b].evict(...)`` — each
+    ``evict_keep_index`` launches a per-head loop AND forces multiple device->host
+    syncs (``head_has_value.tolist()`` + ``cm_frac.tolist()`` + ``slopes.tolist()``
+    per block + a final ``.nonzero()`` / ``.numel()``), so the GPU STALLS on the CPU
+    every block (41% util on the deep loop).
+
+    NEW: ``evict_all_blocks_fused`` — ONE batched on-GPU decision for all blocks +
+    heads, no per-block/per-head Python, one small host sync per chunk.  Byte-
+    identical survivor set (``test_fused_all_block_evict_matches_per_block``).
+    """
+    from c4_min.nibble_pure_forward_cached import (
+        BlockKVCacheBatched, evict_all_blocks_fused, evict_keep_index)
+    cos_thr, zeps, reps = 0.99, 1e-9, 1e-6
+    g = torch.Generator().manual_seed(7)
+    slope_protos = [torch.tensor([2.0 ** (-8.0 / 23 * (h + 1 + off))
+                                  for h in range(H)]) for off in range(4)]
+
+    def make(S):
+        caches = []
+        for b in range(n_blocks):
+            c = BlockKVCacheBatched(H, HD, slope_protos[b % 4].to(dev))
+            K, V, positions = make_live_heap_cache(S, HD=HD, device=dev,
+                                                   metric="cosine")
+            # promote per-head structure: [1,H,S,HD] (share the base pattern; the
+            # policy runs per head regardless).
+            c.K = K.unsqueeze(0).unsqueeze(0).expand(1, H, S, HD).contiguous()
+            c.V = V.unsqueeze(0).unsqueeze(0).expand(1, H, S, HD).contiguous()
+            c.pos = positions
+            caches.append(c)
+        return caches
+
+    def old_loop(caches):
+        for c in caches:
+            evict_keep_index(c.K, c.V, c.pos, c.slopes, c.scale, c.n_heads,
+                             cos_threshold=cos_thr, zero_eps=zeps, recency_eps=reps)
+
+    print(f"\nALL-BLOCK prune ({n_blocks} blocks x {H} heads, HD={HD}) on {dev} "
+          f"— OLD per-block host-synced loop vs NEW fused on-GPU decision")
+    print(f"{'S':>6} {'OLD ms':>10} {'NEW ms':>10} {'speedup':>9}")
+    for S in sizes:
+        caches = make(S)
+        t_old = timeit(lambda: old_loop(caches), dev, reps=2)
+        caches = make(S)
+        t_new = timeit(lambda: evict_all_blocks_fused(caches, cos_thr, zeps, reps),
+                       dev, reps=2)
+        print(f"{S:>6} {t_old*1e3:>10.1f} {t_new*1e3:>10.1f} "
+              f"{t_old/t_new:>8.1f}x", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--metric", default="cosine", choices=["cosine", "exact"])
     ap.add_argument("--sizes", default="500,1000,2000,4000,8000")
+    ap.add_argument("--all-blocks", action="store_true",
+                    help="benchmark the #667 whole-model prune (per-block loop vs "
+                         "fused), the deep-loop bottleneck.")
+    ap.add_argument("--n-blocks", type=int, default=306)
+    ap.add_argument("--heads", type=int, default=23)
+    ap.add_argument("--head-dim", type=int, default=78)
+    ap.add_argument("--block-sizes", default="8,30,120,500")
     args = ap.parse_args()
     dev = args.device
     metric = args.metric
     ca = (metric == "exact")
+
+    if args.all_blocks:
+        bench_all_blocks(dev, args.n_blocks, args.heads, args.head_dim,
+                         [int(s) for s in args.block_sizes.split(",")])
+        return
 
     old_prune = _load_old_prune()
     slope, scale = 0.25, 8 ** -0.5

@@ -92,6 +92,14 @@ def main():
     dispatch_stats(cm, cL, "COMPACT")
 
     # -- COMPLETE model (dispatch padded to global-max -> huge dense->routed). --
+    # This measurement's POINT is the padded-dense cost, so it needs the DENSE
+    # build (peak 54-108 GB RSS) — OPT-IN via C4_ALLOW_DENSE_BUILD=1.
+    from c4_min._build_guard import dense_build_allowed
+    if not dense_build_allowed():
+        print("\n[skip] COMPLETE(padded) dense-cost measurement — the dense "
+              "build peaks at 54-108 GB RSS.  Re-run with C4_ALLOW_DENSE_BUILD=1 "
+              "to include it.")
+        return 0
     t = time.time()
     xm, xL = build_pure_forward_complete_model(
         code_size=24)

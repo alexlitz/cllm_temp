@@ -59,7 +59,8 @@ import torch
 import torch.nn.functional as F
 
 from . import isa
-from .compiler import VOCAB, _zero_attn, _load_ffn, _load_head, head_matrix
+from .compiler import (VOCAB, _zero_attn, _load_ffn, _load_head, head_matrix,
+                       vanilla_requantize)
 from .compile_ffn import compile_ffn, compile_fold, S as FFN_S, RELU_S
 from .dsl import FFNRule, LinearExpr
 from .layout import Layout
@@ -814,9 +815,12 @@ def _step_once(model, state):
 
 
 def _requantize(state, L):
-    q = torch.round(state)
-    q[L.ONE] = 1.0
-    return q
+    """Snap every band to its exact integer via the VANILLA LM-head argmax
+    (``argmax_v (2*v*x - v^2)`` — the model's own emit-token snap, NO
+    ``torch.round``), then pin ONE=1. The vocab covers the packed CODE_WORD data
+    band (the compiler bytecode + the freshly-EMITted target words up to 0xFFFF),
+    so the program-in-data and produced code are preserved byte-exact."""
+    return vanilla_requantize(state, L.ONE)
 
 
 def load_program(model, L, code: List[isa.Instr], src: List[int]) -> torch.Tensor:

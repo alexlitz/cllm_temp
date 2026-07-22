@@ -185,6 +185,172 @@ def test_vectorized_prune_matches_reference_large_and_content_addressed():
     assert mism == 0, f"{mism}/{trials} large/content-addressed keep-set mismatches"
 
 
+def test_two_tier_mech1_dedup_matches_full_cosine():
+    """The TWO-TIER mechanism-1 (``_mech1_cosine_survivors_dedup``: O(S) exact-dup
+    hash/sort collapse + O(R^2) cosine-on-representatives) produces the BYTE-IDENTICAL
+    survivor set to the ORIGINAL full O(S^2) cosine matmul + greedy, over
+    exact-dup-heavy (register-frame) shapes AND the adversarial cases: near-cosine
+    (non-verbatim) partners, zero keys (cosine 0 with everything — must NOT collapse),
+    parallel-but-distinct protos (representative-vs-representative merges), and padded
+    (invalid) rows.  This is the byte-identity gate for the #683 prune speedup."""
+    from c4_min.nibble_pure_forward_cached import (
+        _greedy_survivors_batched, _mech1_cosine_survivors_dedup, _recency_rank)
+
+    def _full(keys, knorm, positions, valid, cos_thr):
+        N, S, HD = keys.shape
+        dev = keys.device
+        safe = knorm.clamp(min=1e-30)
+        unit = keys / safe.unsqueeze(-1)
+        unit = torch.where((knorm == 0).unsqueeze(-1), torch.zeros_like(unit), unit)
+        D = torch.matmul(unit, unit.transpose(1, 2)) > cos_thr
+        rv = valid.unsqueeze(2) & valid.unsqueeze(1)
+        D = D & rv & ~torch.eye(S, dtype=torch.bool, device=dev).unsqueeze(0)
+        return _greedy_survivors_batched(D, positions) & valid
+
+    torch.manual_seed(0)
+    cos_thr = 0.99
+    mism = 0
+    for it in range(400):
+        N = int(torch.randint(1, 6, (1,)))
+        S = int(torch.randint(1, 50, (1,)))
+        HD = 8
+        n_groups = int(torch.randint(1, min(S, 12) + 1, (1,)))
+        proto = torch.randn(n_groups, HD)
+        idx = torch.randint(0, n_groups, (N, S))
+        keys = proto[idx]                              # exact-dup heavy
+        if it % 3 == 0:                                # some near-cosine (not exact)
+            m = torch.rand(N, S, 1) < 0.2
+            keys = keys + m * (0.0005 * torch.randn(N, S, HD))
+        if it % 5 == 0 and n_groups > 1:               # parallel-but-distinct protos
+            p2 = proto.clone()
+            p2[1] = p2[0] * (1.0 + 0.001 * torch.randn(HD))
+            keys = torch.where((idx == 1).unsqueeze(-1), p2[idx.clamp(max=1)], keys)
+        keys[torch.rand(N, S) < 0.1] = 0.0             # zero keys
+        valid = torch.rand(N, S) > 0.15
+        valid[:, 0] = True
+        positions = (torch.arange(S).unsqueeze(0).expand(N, S)
+                     * int(torch.randint(1, 30, (1,)))).clone()
+        positions = positions + torch.randint(0, 3, (N, S))
+        knorm = keys.norm(dim=-1)
+        knorm = torch.where(valid, knorm, torch.zeros_like(knorm))
+        rank = _recency_rank(positions, valid)
+        ref = _full(keys, knorm, positions, valid, cos_thr)
+        got = _mech1_cosine_survivors_dedup(
+            keys, knorm, positions, rank, valid, cos_thr) & valid
+        if not torch.equal(ref, got):
+            mism += 1
+    assert mism == 0, f"{mism}/400 two-tier vs full-cosine mech-1 mismatches"
+
+
+def test_batched_prune_two_tier_matches_full_cosine_kill_switch():
+    """``prune_keep_mask_batched`` (default two-tier) == the ``C4_KV_PRUNE_FULL_COSINE``
+    kill-switch (original full O(S^2) path) end-to-end — same keep-mask through ALL
+    mechanisms (1/3/2a/2b), incl. EXACT (content-addressed) groups and padding."""
+    import c4_min.nibble_pure_forward_cached as m
+    torch.manual_seed(5)
+    HD = 8
+    scale = HD ** -0.5
+    mism = 0
+    for _ in range(30):
+        N = int(torch.randint(1, 20, (1,)))
+        S = int(torch.randint(2, 60, (1,)))
+        n_groups = int(torch.randint(1, min(S, 16) + 1, (1,)))
+        proto = torch.randn(N, n_groups, HD)
+        idx = torch.randint(0, n_groups, (N, S))
+        keys = torch.gather(proto, 1, idx.unsqueeze(-1).expand(N, S, HD)).clone()
+        # content-addressed (exact) groups: big common-mode bias -> distinct addrs.
+        exact = torch.rand(N) < 0.3
+        keys = keys + exact.view(N, 1, 1) * 8.0
+        keys[torch.rand(N, S) < 0.1] = 0.0
+        vals = torch.randn(N, S, HD)
+        vals[torch.rand(N, S) < 0.12] = 0.0
+        positions = torch.sort(torch.randint(0, 900, (N, S)), dim=1)[0]
+        valid = torch.rand(N, S) > 0.1
+        valid[:, 0] = True
+        slope = torch.full((N,), 0.25)
+        ca = exact.clone()
+        try:
+            m._KV_PRUNE_FULL_COSINE = False
+            new = m.prune_keep_mask_batched(keys, vals, positions, slope, scale,
+                                            0.99, 1e-9, 1e-6, exact, ca, valid=valid)
+            m._KV_PRUNE_FULL_COSINE = True
+            old = m.prune_keep_mask_batched(keys, vals, positions, slope, scale,
+                                            0.99, 1e-9, 1e-6, exact, ca, valid=valid)
+        finally:
+            m._KV_PRUNE_FULL_COSINE = False
+        if not torch.equal(new, old):
+            mism += 1
+    assert mism == 0, f"{mism}/30 two-tier vs full-cosine batched-prune mismatches"
+
+
+def test_fused_all_block_evict_matches_per_block():
+    """The FUSED all-block eviction (``evict_all_blocks_fused`` +
+    ``apply_keep_mask``) produces the BYTE-IDENTICAL survivor set (K/V/pos) to the
+    per-block ``BlockKVCacheBatched.evict`` loop it replaces — over a battery of
+    random multi-block caches with (a) DIVERGENT per-block sizes (blocks that
+    already evicted differently), (b) mixed register-marker vs content-addressed
+    (address-CAM) heads, (c) protection positions.  This is the fusion's
+    byte-identity gate: the deep-loop prune de-syncs onto the GPU but keeps EXACTLY
+    the entries the per-block policy kept (#667)."""
+    import copy
+    from c4_min.nibble_pure_forward_cached import (
+        BlockKVCacheBatched, evict_all_blocks_fused)
+    torch.manual_seed(11)
+    cos_threshold, zero_eps, recency_eps = 0.99, 1e-9, 1e-6
+    H, HD = 4, 8
+    for trial in range(30):
+        n_blocks = int(torch.randint(2, 8, (1,)))
+        # a few distinct ALiBi slope vectors shared across blocks (as in the model).
+        slope_protos = [torch.tensor([2.0 ** (-8.0 / 23 * (h + 1 + off))
+                                      for h in range(H)])
+                        for off in range(3)]
+        # build per-block caches with DIVERGENT sizes + positions (post-evict shape).
+        caches_a, caches_b = [], []
+        protect = set()
+        for b in range(n_blocks):
+            slopes = slope_protos[b % len(slope_protos)]
+            S = int(torch.randint(3, 40, (1,)))
+            # a content-addressed block? give its keys a big shared common-mode bias
+            # so cm_frac>0.9 (address-CAM head) for some blocks, marker heads for rest.
+            if b % 2 == 0:
+                keys = torch.randn(1, H, S, HD) + 8.0            # common-mode -> exact
+            else:
+                keys = torch.randn(1, H, S, HD)                  # marker -> cosine
+            vals = torch.randn(1, H, S, HD)
+            # inject near-dup + zero rows (the eviction hazards).
+            for _ in range(int(torch.randint(0, S, (1,)))):
+                i = int(torch.randint(0, S, (1,))); j = int(torch.randint(0, S, (1,)))
+                keys[0, :, i] = keys[0, :, j] * (1.0 + 0.0005 * torch.randn(1))
+            for _ in range(int(torch.randint(0, S // 2 + 1, (1,)))):
+                i = int(torch.randint(0, S, (1,))); vals[0, :, i] = 0.0
+                if int(torch.randint(0, 2, (1,))):
+                    keys[0, :, i] = 0.0
+            pos = torch.sort(torch.randperm(600)[:S])[0].to(torch.long)
+            ca = BlockKVCacheBatched(H, HD, slopes)
+            ca.K, ca.V, ca.pos = keys.clone(), vals.clone(), pos.clone()
+            cb = BlockKVCacheBatched(H, HD, slopes)
+            cb.K, cb.V, cb.pos = keys.clone(), vals.clone(), pos.clone()
+            caches_a.append(ca); caches_b.append(cb)
+            if int(torch.randint(0, 3, (1,))) == 0 and S:
+                protect.add(int(pos[int(torch.randint(0, S, (1,)))]))
+        protect = sorted(protect) if protect else None
+
+        # reference: per-block evict.
+        for c in caches_a:
+            c.evict(cos_threshold, 60, zero_eps, recency_eps,
+                    protect_positions=protect)
+        # fused: one batched decision + per-block mask compaction.
+        masks = evict_all_blocks_fused(caches_b, cos_threshold, zero_eps,
+                                       recency_eps, protect_positions=protect)
+        for b in range(n_blocks):
+            if masks[b] is not None:
+                caches_b[b].apply_keep_mask(masks[b])
+            # byte-identical surviving K/V/pos per block.
+            assert torch.equal(caches_a[b].pos, caches_b[b].pos), (trial, b)
+            assert torch.equal(caches_a[b].K, caches_b[b].K), (trial, b)
+            assert torch.equal(caches_a[b].V, caches_b[b].V), (trial, b)
+
+
 def test_driver_byte_identical_naive_incl_functions_and_eviction():
     """The KV-cached (+evicted) driver's full output is BYTE-IDENTICAL to the
     naive re-forward driver on a battery that exercises the eviction hazards:
@@ -197,15 +363,18 @@ def test_driver_byte_identical_naive_incl_functions_and_eviction():
     _PF.SP_INIT = 0xF0
     _PFC.SP_INIT = 0xF0
     from c4_min import isa
-    from c4_min.nibble_pure_forward_complete import (
-        build_pure_forward_complete_model, run_pure_forward_complete)
+    from c4_min.nibble_pure_forward_complete import run_pure_forward_complete
     from c4_min.nibble_pure_forward_cached import run_pure_forward_cached
+    from c4_min._build_guard import guarded_complete_build
 
     def I(op, imm=0):
         return isa.Instr(op, imm)
 
-    model, L = build_pure_forward_complete_model(
-        code_size=16)
+    # Memory-SAFE streaming build (peak ~5 GB) — byte-identical (L-inf=0) to the
+    # dense complete model whose ~160k-row MUL/DIV/MOD block would peak at
+    # 54-108 GB RSS.  Covers the mul32 battery case; both cached + naive drivers
+    # accept the streaming SparseTransformer.
+    model, L = guarded_complete_build(code_size=16)
     battery = [
         ("add", [I(isa.IMM, 5), I(isa.PSH), I(isa.IMM, 3), I(isa.ADD),
                  I(isa.HALT)], 20, 0xFF),
@@ -235,5 +404,8 @@ if __name__ == "__main__":
     test_uncached_forward_byte_identical()
     test_vectorized_prune_matches_reference()
     test_vectorized_prune_matches_reference_large_and_content_addressed()
+    test_two_tier_mech1_dedup_matches_full_cosine()
+    test_batched_prune_two_tier_matches_full_cosine_kill_switch()
+    test_fused_all_block_evict_matches_per_block()
     test_driver_byte_identical_naive_incl_functions_and_eviction()
     print("all KV-cache equivalence tests passed")

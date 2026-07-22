@@ -927,7 +927,8 @@ def _emit_frame_from_state(state: torch.Tensor, L: PureForwardLayout,
 
 def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
                      max_steps: int = 512, verbose: bool = False,
-                     collect_tokens: bool = False):
+                     collect_tokens: bool = False, fio=None, data_seg=None,
+                     mask: int = 0xFF):
     """Execute ``code`` with the PURE-FORWARD step: every VM step is ONE
     ``model.forward`` over the growing token stream (state read from the prior
     frame by the block-0 attention; the op computed by the FFN weights), and the
@@ -938,12 +939,27 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
     The stream starts ``[BOS] + init_frame`` where ``init_frame`` is the spec
     register init (PC=AX=0, SP=BP=0x10000, STACK0=0) — the "step 0" frame the first
     real step ingests. Each iteration appends exactly one 30-token frame.
+
+    FILE OPS (OPEN/READ/CLOS/PRTF) — the ONE class NOT computed neurally (§Tool Use
+    Mode).  When ``fio`` (a ``nibble_filesys.FileOpState``) is given, an op in
+    ``FILE_OPCODES`` is dispatched via the TOOL_CALL protocol exactly as in the
+    ``_complete`` driver: the runner marshals the args off the KV store log,
+    performs the real I/O (a READ(fd=0) is served from the neural-stdin
+    ``InputKVStream`` — the SAME path argv/stdin use, §"Reading Arguments"), and
+    the integer result re-enters AX.  READ's bytes re-enter the token stream as
+    their OWN §Memory KV store frames so a later LC reads them back byte-exact.
+    ``data_seg`` (``{byte_addr: byte}``) seeds the read-only data segment.  When
+    ``fio`` is None this argument is inert and the driver is byte-identical to the
+    original.
     """
+    from . import nibble_filesys as _FS
     init_frame = build_frame_tokens(0, 0, SP_INIT, SP_INIT, 0)
     stream: List[int] = [V.BOS] + init_frame
     trace: List[int] = []
     store_frames = set()                            # emitted frame indices that are stores
+    store_log: Dict[int, Tuple[int, int]] = {}      # frame_idx -> (addr, val) for file marshalling
     cur_pc = 0                                       # PC of the step about to run
+    cur_sp = SP_INIT
     frame_idx = 0                                    # emitted-frame counter (0 = init)
     for _ in range(max_steps):
         # the overlay marks past store frames (KV entries) + program + roles.
@@ -958,6 +974,37 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
         # Is the step that just ran a STORE? (the driver fetches the op at cur_pc —
         # the same code-as-data fetch the model does; this is routing bookkeeping.)
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
+        imm = code[cur_pc].imm if 0 <= cur_pc < len(code) else 0
+        sp = _snap_lane(state[L.SP_VAL])
+        # -- FILE OP: not computed neurally (§Tool Use Mode).  The driver performs
+        #    the whole op via the TOOL_CALL runner and overrides the registers;
+        #    READ's bytes re-enter as their own §Memory KV frames (LC reads back).
+        if fio is not None and op in _FS.FILE_OPCODES:
+            cur_ax = _snap_lane(state[L.AX_VAL])
+            new_ax, new_sp, byte_stores = _FS.dispatch_file_op_driver(
+                op, cur_ax & 0xFFFFFFFF, imm, cur_sp, store_log, fio,
+                data_seg=data_seg, slot=4)
+            npc = cur_pc + 1                         # file ops advance PC by one
+            frame = build_frame_tokens(npc, new_ax & 0xFFFFFFFF, new_sp, SP_INIT, 0)
+            trace.append(new_ax & mask)
+            frame_idx += 1
+            stream += frame
+            for (baddr, bval) in byte_stores:       # READ bytes -> KV store frames
+                bframe = build_frame_tokens(npc, new_ax & 0xFFFFFFFF, new_sp,
+                                            SP_INIT, 0, mem_addr=baddr,
+                                            mem_val=bval & 0xFF)
+                frame_idx += 1
+                store_frames.add(frame_idx)
+                store_log[frame_idx] = (baddr, bval & 0xFF)
+                stream += bframe
+            if verbose:
+                print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op)} -> "
+                      f"pc_next={npc} ax={new_ax & 0xFFFFFFFF} (FILE, "
+                      f"{len(byte_stores)} byte-stores)")
+            cur_pc, cur_sp = npc, new_sp
+            if npc < 0 or npc >= len(code):
+                break
+            continue
         is_store = op in (isa.SI, isa.SC)
         s_addr = s_val = 0
         if is_store:
@@ -966,18 +1013,28 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
             # decoded by the same LM value-argmax as the registers. They ride in the
             # emitted frame's MEM addr/val slot (the §Memory write log token).
             s_addr = _snap_lane(state[L.STK_VAL])
-            s_val = _snap_lane(state[L.AX_VAL]) & 0xFF
+            s_val = _snap_lane(state[L.AX_VAL]) & mask
         frame, ax_byte, npc, halted = _emit_frame_from_state(
             state, L, is_store=is_store, store_addr=s_addr, store_val=s_val)
         trace.append(ax_byte)
         frame_idx += 1
         if is_store:
             store_frames.add(frame_idx)             # this emitted frame is a KV entry
+            store_log[frame_idx] = (s_addr, s_val)
+        elif fio is not None and op == isa.PSH:
+            # A PSH writes AX to MEM[cur_sp-4] — the c4 stack IS memory (§Stack).
+            # The lean model handles the stack neurally via the STACK0 mirror, so a
+            # PSH is not marked as a KV store frame; but file-op ARG MARSHALLING
+            # (dispatch_file_op_driver) reads the pushed syscall args back off the
+            # KV store log, so when a file op is in play we record the push there
+            # (marshalling bookkeeping only — no effect on the neural stack path).
+            store_log[frame_idx] = (cur_sp - 4, _snap_lane(state[L.AX_VAL]) & 0xFFFFFFFF)
         stream += frame                             # APPEND the emitted frame
         if verbose:
             print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op)} -> "
                   f"pc_next={npc} ax={ax_byte} store={is_store} halted={halted}")
         cur_pc = npc
+        cur_sp = sp
         if halted or npc < 0 or npc >= len(code):
             break
     if collect_tokens:

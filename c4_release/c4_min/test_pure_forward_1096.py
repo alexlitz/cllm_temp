@@ -33,9 +33,8 @@ import c4_min.nibble_pure_forward_complete as _PFC
 _PF.SP_INIT = 0xF0
 _PFC.SP_INIT = 0xF0
 
-from c4_min.nibble_pure_forward_complete import (
-    build_pure_forward_complete_model, run_pure_forward_complete,
-)
+from c4_min.nibble_pure_forward_complete import run_pure_forward_complete
+from c4_min._build_guard import guarded_complete_build
 from c4_min.nibble_pure_forward import assert_no_python_compute
 from c4_min.run_1096_pure_forward import bytecode_to_isa
 
@@ -89,19 +88,29 @@ _SAMPLE = [
 
 
 @pytest.fixture(scope="module")
-def pf_lean():
-    """LEAN pure-forward model (38 blocks): stack + callconv + ADD/SUB/MUL + cmp +
-    memory + the full 32-bit IMM.  Fast; covers every non-div/mod family."""
-    return build_pure_forward_complete_model(
-        code_size=44)
+def pf_complete():
+    """The full-op-set complete model, built the memory-SAFE streaming way
+    (``guarded_complete_build`` -> ``build_compact_sparse_streaming``, peak ~5 GB —
+    NOT the dense ``build_pure_forward_complete_model`` whose ~160k-row MUL/DIV/MOD
+    block pads every block and peaks at 54-108 GB RSS).  The streaming model is the
+    SAME interpreter, byte-identical (L-inf=0, dense_kernel), driven by the SAME
+    runner — so it covers EVERY family incl. DIV/MOD.  One module-scoped build
+    serves both the lean and div/mod parametrisations (they were always the same
+    complete build)."""
+    return guarded_complete_build(code_size=44)
 
 
 @pytest.fixture(scope="module")
-def pf_divmod():
-    """Pure-forward model WITH the fp32-exact 32-bit long-division ALU folded in
-    (298 blocks) — proves DIV/MOD (incl. div-by-zero -> 0) run in-forward too."""
-    return build_pure_forward_complete_model(
-        code_size=44)
+def pf_lean(pf_complete):
+    """Non-div/mod families run on the one complete streaming model."""
+    return pf_complete
+
+
+@pytest.fixture(scope="module")
+def pf_divmod(pf_complete):
+    """DIV/MOD families run on the SAME complete streaming model (it folds the
+    fp32-exact base-16 long-division ALU)."""
+    return pf_complete
 
 
 def _run_pure(model, L, source, expected, name):
@@ -152,13 +161,11 @@ def test_32bit_results_exceed_8_bits():
 if __name__ == "__main__":
     import sys
     from src.compiler import compile_c
-    lean = build_pure_forward_complete_model(
-        code_size=44)
-    dm = build_pure_forward_complete_model(
-        code_size=44)
+    # ONE memory-safe streaming build serves both parametrisations.
+    complete = guarded_complete_build(code_size=44)
     npass = 0
     for name, source, expected, needs_dm in _SAMPLE:
-        model, L = (dm if needs_dm else lean)
+        model, L = complete
         code = bytecode_to_isa(compile_c(source)[0])
         try:
             trace = assert_no_python_compute(
