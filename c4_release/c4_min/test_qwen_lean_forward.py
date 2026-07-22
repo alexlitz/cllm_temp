@@ -156,6 +156,78 @@ def test_speculation_memory_matches_naive(lean_memcmp):
 
 
 # ---------------------------------------------------------------------------
+# Function speculation (#702): JSR/ENT/ADJ/LEV are DRAFTED (not naive-fallback),
+# so a function program batches K steps per forward BYTE-EXACT. The oracle is the
+# function-aware ``interpret_with_functions`` (byte-identical to isa.interpret for
+# non-function programs, and the ops isa.interpret can't run at all).
+# ---------------------------------------------------------------------------
+def test_function_oracle_matches_isa_for_nonfunc():
+    """``interpret_with_functions`` is byte-identical to ``isa.interpret`` for every
+    program that does NOT use a function op (so switching the golden is safe)."""
+    import random
+    rng = random.Random(3)
+    # NOP is excluded: isa.interpret raises on it (interpret_with_functions handles
+    # it), so it is not a program isa.interpret can run for the equivalence check.
+    names = ["IMM", "LEA", "PSH", "ADD", "SUB", "MUL", "DIV", "MOD", "AND", "OR",
+             "XOR", "SHL", "SHR", "EQ", "NE", "LT", "GT", "LE", "GE", "JMP",
+             "BZ", "BNZ", "HALT"]
+    checked = 0
+    for _ in range(500):
+        prog = [(rng.choice(names), rng.randint(0, 255))
+                for _ in range(rng.randint(1, 8))] + [("HALT", 0)]
+        code = isa.assemble(prog)
+        assert not LF.uses_functions(code)
+        try:
+            want = isa.interpret(code)              # skip degenerate empty-stack pops
+        except IndexError:
+            continue
+        assert LF.interpret_with_functions(code) == want, prog
+        checked += 1
+    assert checked > 100                            # enough well-formed programs compared
+
+
+@pytest.mark.parametrize("prog", [
+    # leaf function returns a constant via JSR/ENT/LEV.
+    [("JSR", 3), ("HALT", 0), ("NOP", 0), ("ENT", 0), ("IMM", 42), ("LEV", 0)],
+    # ENT reserves locals, ADJ pops args, leaf sets a constant.
+    [("JSR", 2), ("HALT", 0), ("ENT", 2), ("ADJ", 2), ("IMM", 9), ("LEV", 0)],
+    # nested call: main -> f -> g, g returns a constant.
+    [("JSR", 2), ("HALT", 0), ("ENT", 0), ("JSR", 5), ("LEV", 0),
+     ("ENT", 0), ("IMM", 13), ("LEV", 0)],
+])
+def test_function_program_batches_byte_exact(lean_base, prog):
+    """A function program (JSR/ENT/ADJ/LEV) batches via speculation BYTE-EXACT:
+    spec == naive == the function-aware golden, and the draft is NON-empty (the
+    detail is not the naive-fallback tag), so functions really are batched."""
+    code = isa.assemble(prog)
+    assert LF.uses_functions(code)
+    gold = LF.interpret_with_functions(code, max_steps=64)
+    rn = LF.run_program_lean(lean_base, code, max_steps=64)
+    rs = LF.speculative_run_lean(lean_base, code, block_steps=32)
+    assert rn["ax_trace"] == gold, (rn["ax_trace"], gold)     # model == golden
+    assert rs.ax_trace == rn["ax_trace"]                       # spec == naive
+    assert rs.exact and rn["exact"]
+    assert rs.detail != "naive-fallback"                       # truly batched
+
+
+def test_function_call_loop_batches_and_saves_forwards(lean_base):
+    """A loop that JSRs a leaf function on every iteration (100 calls, 700+ steps)
+    batches BYTE-EXACT and verifies many steps per forward — the perfect-draft
+    speculation now spans the call/return boundary."""
+    prog = [("IMM", 100), ("PSH", 0), ("JSR", 7), ("IMM", 1), ("SUB", 0),
+            ("BNZ", 1), ("HALT", 0), ("ENT", 0), ("LEV", 0)]
+    code = isa.assemble(prog)
+    gold = LF.interpret_with_functions(code, max_steps=4096)
+    rn = LF.run_program_lean(lean_base, code, max_steps=4096)
+    rs = LF.speculative_run_lean(lean_base, code, block_steps=64, max_steps=4096)
+    assert rn["ax_trace"] == gold
+    assert rs.ax_trace == rn["ax_trace"]
+    assert rs.exact
+    assert rs.forwards < rs.naive_forwards                     # real forwards saved
+    assert rs.detail != "naive-fallback"
+
+
+# ---------------------------------------------------------------------------
 # The compute really runs in the lean SwiGLU MLPs (not a python copy): zeroing a
 # lean layer's MLP annihilates the result.
 # ---------------------------------------------------------------------------
