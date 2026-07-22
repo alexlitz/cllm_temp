@@ -96,3 +96,27 @@ Drop the unqualified "100% native neural I/O" phrasing. The accurate statement i
 "**stdin/getchar/argv reads are 100% native** (position-signature attention);
 file ops and printf formatting are tool calls, by design." That is what the code
 now does.
+
+## Addendum (2026-07-22) — raster demos should emit a real image by default
+
+Recommendation for the blog's raster demos (mandelbrot, and any pixel output):
+**make actual-image output the default**, not ASCII art. The program writes a
+PPM header plus raw RGB bytes through `PRTF`, so the output is a real file you
+pipe straight to a viewer:
+
+    model_run mandelbrot > mandelbrot.ppm    # P6: "P6\n<w> <h>\n255\n" then w*h*3 raw RGB bytes
+
+Why this is the better default:
+
+- it exercises the **same** byte-output channel (`PRTF`, the tool-call stdout
+  mode described above) — nothing new is required, the demo just chooses an
+  image payload instead of characters;
+- correctness is both **visually obvious** and **byte-checkable** against a CPU
+  escape-time reference (the model reproduces the reference byte stream exactly);
+- it makes the "the weights ARE the program, and the program's output is a file
+  you can open" point far more forcefully than ASCII art.
+
+Reference artifact: `c4_min/mandelbrot.ppm` / `mandelbrot.png` (320×240, P6,
+230,415 bytes, `max_iter=120`) — the exact bytes a C4 `mandelbrot.c` emits via
+`printf`/`PRTF`. Keep ASCII art only as a fallback for terminals with no image
+viewer.
