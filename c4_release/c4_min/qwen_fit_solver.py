@@ -17,7 +17,7 @@ Every op's cost flows into one of four axes, and precision scales all of them:
   * **WIDTH**  (``intermediate_size``) — a lookup table (the 256×256×3 MUL/DIV/MOD
     table = ``intermediate 160465``) buys zero depth for a huge width.
   * **DEPTH**  (``num_hidden_layers``) — the efficient ALU (``nibble_alu32``) buys a
-    small width (``intermediate 1124``) for a large depth (schoolbook carry rounds +
+    small width (``intermediate 11272``) for a large depth (schoolbook carry rounds +
     long-division iterations: MUL +10 layers, DIV/MOD +262 layers).
   * **STEPS**  (``steps_per_op``) — a bytecode SUBROUTINE (JSR/LEV into a baked
     library routine) buys near-zero *extra* width/depth for many *program steps* per
@@ -38,7 +38,7 @@ Honesty (verified vs estimated)
   * **lookup-table** width, **efficient-ALU** unrolled/recurrent depth+width — VERIFIED:
     computed live from ``qwen_full_vm._block_specs`` (the same builders ``build``
     bakes), reproducing #698's ``fit_report_efficient`` numbers exactly (MUL +10 →
-    ~23 layers, DIV/MOD 262 unrolled / 138 stored recurrent, intermediate 1124).
+    ~23 layers, DIV/MOD 262 unrolled / 138 stored recurrent, intermediate 11272).
   * **precision != 32** on the efficient ALU — ESTIMATED. The baked ``nibble_alu32``
     is 32-bit-exact (fixed 8-nibble DIV / 4-byte ADD-SUB). The 8/16-bit *depths* here
     are a linear-in-nibble accounting PROJECTION of what a precision-parameterised ALU
@@ -49,11 +49,20 @@ Honesty (verified vs estimated)
 
 Everything except the actual bake runs on CPU with no model materialised (the
 accounting sizes the layout WITHOUT building the possibly-huge model, exactly like
-``fit_report``).
+``fit_report``).  MEMORY-SAFE: the 256x256x3 lookup table (``intermediate 160465``)
+is the ~45 GB / ~55 GB-peak-RSS wall, so its width is counted ANALYTICALLY (the
+nonzero ``_MDM_FN`` entries, tensor-free) on top of the memory-light muldiv-OFF
+build -- reproducing the real build (width 160465, +2 layers, same ``D_used``)
+exactly.  The whole solver peaks ~4.7 GB.  ``C4_FIT_BUILD_TABLE=1`` forces the real
+45 GB build as a byte-identity self-check.  Spec builds are ``lru_cache``-memoized on
+the spec-determining levers, so the P8/P16/P32 variants share one build.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import os
+
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import isa
@@ -149,10 +158,30 @@ _DIVMOD_UNROLLED_LAYERS = 262
 _DIV_FIXED_LAYERS = 22                 # KB-precompute (93→incl in stored) + init + finalize
 _DIV_LAYERS_PER_ITER = (_DIVMOD_UNROLLED_LAYERS - _DIV_FIXED_LAYERS) // _DIV_ITERS_32  # ≈30
 
-# Estimated bytecode-subroutine program-step counts per op (#699, pending reverify).
-# A schoolbook byte MUL is ~O(bytes²) steps; base-16 long division ~O(nibbles) steps
-# with a per-iteration inner compare loop.  Conservative, LABELLED [EST].
-_EST_SUBROUTINE_STEPS = {"mul": 40, "divmod": 120}
+# Estimated bytecode-subroutine program-step counts per op (#699 lean muldiv library,
+# branch verify-lean-muldiv-mandelbrot — LABELLED [EST], pending #699 re-verify).
+#
+# A subroutine MUL/DIV/MOD is a baked bytecode library routine reached by JSR/LEV: it
+# adds ~zero persistent width/depth but costs many PROGRAM STEPS (each step = one
+# Qwen forward).  The cost is O(precision):
+#   * schoolbook MUL  ~ O(bytes^2) partial-products with a per-byte carry inner loop;
+#   * base-2^8 long DIV/MOD ~ O(bytes) outer digits x an inner compare/subtract loop.
+# We anchor the 8-bit points on #699's observed lean-stack step counts (an 8-bit
+# ``program_mul8`` runs ~1.5e2 steps incl operand setup; DIV/MOD a bit more) and scale
+# per BYTE of precision.  Conservative + clearly ESTIMATED.
+_SUB_STEP_MUL_PER_BYTE2 = 150      # ~O(bytes^2): 8-bit(1 byte) ~= 150 steps (#699 obs.)
+_SUB_STEP_DIVMOD_PER_BYTE = 200    # ~O(bytes) outer x inner loop: 8-bit ~= 200 steps
+_SUBROUTINE_NOTE = ("subroutine steps_per_op ESTIMATED "
+                    "(#699 lean-muldiv, branch verify-lean-muldiv-mandelbrot; "
+                    "pending re-verify)")
+
+
+def _est_subroutine_steps(precision: int, divmod_: bool) -> int:
+    """Precision-scaled bytecode-subroutine step estimate per op ([EST], #699)."""
+    nbytes = max(1, -(-precision // 8))            # ceil(P/8) bytes
+    if divmod_:
+        return _SUB_STEP_DIVMOD_PER_BYTE * nbytes
+    return _SUB_STEP_MUL_PER_BYTE2 * nbytes * nbytes
 
 
 def _div_iters(precision: int) -> int:
@@ -220,22 +249,86 @@ class Accounting:
     notes: str = ""
 
 
-def _spec_sizes(config: FitConfig) -> Tuple[int, int, int, int]:
-    """(hidden, intermediate, stored_layers, applied_depth) from the REAL builders at
-    the config's op-subset + efficient/recurrent flags (32-bit, the baked path)."""
-    sub = config.subset
-    eff = config.efficient_alu
-    rec = config.recurrent_divmod
-    QL = QwenFullLayout(config.code_size, sub, efficient_alu=eff, recurrent_divmod=rec)
-    specs = _block_specs(QL.L, config.code_size, sub, efficient_alu=eff,
-                         recurrent_divmod=rec)
+# The 8-bit MUL/DIV/MOD LOOKUP-TABLE width, computed ANALYTICALLY (no tensors).
+# ``nibble_unified.compile_mdm_select`` allocates ONE hidden unit per NONZERO
+# op(a,b) over all 256x256 pairs of MUL/DIV/MOD, + 1 self-clear unit.  MATERIALISING
+# that spec is the ~45 GB / ~55 GB-RSS wall (``build_pure_forward_model(include_
+# muldiv=True)`` alone peaks ~55 GB) — so for the *accounting* we count the nonzero
+# entries with the SAME pure-Python ``_MDM_FN`` the builder uses (a 3x256x256 int
+# loop, ~0 memory), and add the two lookup blocks (mdm-expand + mdm-select) to the
+# memory-LIGHT muldiv-OFF build.  VERIFIED to reproduce the real build byte-for-byte:
+# 160465 width + (+2 stored layers), identical D_used (the mdm one-hot bands do not
+# widen the CAM residual).  Set ``C4_FIT_BUILD_TABLE=1`` to force the real (45 GB)
+# build instead of the analytic count (byte-identity self-check; NOT memory-safe).
+_ANALYTIC_LOOKUP_TABLE = os.environ.get("C4_FIT_BUILD_TABLE", "0") != "1"
+
+
+@lru_cache(maxsize=None)
+def _mdm_lookup_width() -> int:
+    """The exact ``compile_mdm_select`` width: nonzero op(a,b) entries over all
+    256x256 MUL/DIV/MOD pairs + 1 self-clear unit — counted with the builder's own
+    ``_MDM_FN``, tensor-free (this is what makes the lookup accounting memory-safe)."""
+    from .nibble_unified import _MDM_FN
+    keys = sum(1 for op in (isa.MUL, isa.DIV, isa.MOD)
+               for a in range(256) for b in range(256) if _MDM_FN[op](a, b) != 0)
+    return keys + 1
+
+
+@lru_cache(maxsize=None)
+def _raw_spec_sizes(code_size: int, memory: bool, cmp: bool, bitwise: bool,
+                    muldiv: bool, efficient_alu: bool, recurrent_divmod: bool
+                    ) -> Tuple[int, int, int, int]:
+    """(dim_used, intermediate, stored_layers, applied_depth) from the REAL
+    ``qwen_full_vm._block_specs`` builders — MEMOIZED on the spec-determining levers.
+
+    Precision is a POST-HOC projection (§account) and does NOT change the baked
+    specs, so the three (P8/P16/P32) accountings of e.g. the 160465-wide MUL/DIV/MOD
+    lookup table share ONE build instead of rebuilding that 45 GB-class table 3x.
+    ``arch`` (head geometry) is folded in by the caller — it only rescales
+    ``hidden``/``intermediate`` floors, never the spec shapes — so it stays out of
+    the cache key.  This is the whole reason the CPU solver is fast + memory-safe:
+    only the distinct (subset x strategy) spec builds ever materialise, once.
+
+    MEMORY SAFETY: the muldiv LOOKUP-TABLE build alone peaks ~55 GB RSS.  When
+    ``_ANALYTIC_LOOKUP_TABLE`` (default), we account it from the memory-LIGHT
+    muldiv-OFF build (~4.5 GB) plus the analytic mdm width + 2 lookup layers, which
+    reproduces the real build's (width, D_used, n_stored) exactly."""
+    lookup_table = muldiv and not efficient_alu
+    if lookup_table and _ANALYTIC_LOOKUP_TABLE:
+        # memory-safe: size from the muldiv-OFF build + the analytic table width.
+        sub = Subset(memory=memory, cmp=cmp, bitwise=bitwise, muldiv=False)
+        QL = QwenFullLayout(code_size, sub)
+        specs = _block_specs(QL.L, code_size, sub)
+        base_w = max(int(s["W_up"].shape[0]) for _, s in specs)
+        inter = max(base_w, _mdm_lookup_width())    # mdm-select dominates
+        n_stored = len(specs) + 2                    # + mdm-expand + mdm-select
+        return QL.D_used, inter, n_stored, n_stored
+    sub = Subset(memory=memory, cmp=cmp, bitwise=bitwise, muldiv=muldiv)
+    QL = QwenFullLayout(code_size, sub, efficient_alu=efficient_alu,
+                        recurrent_divmod=recurrent_divmod)
+    specs = _block_specs(QL.L, code_size, sub, efficient_alu=efficient_alu,
+                         recurrent_divmod=recurrent_divmod)
     apply_order = getattr(QL.L, "_qwen_apply", None)
     inter = max(int(s["W_up"].shape[0]) for _, s in specs)
-    arch = config.arch
-    inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
-    hidden = arch.hidden_for(QL.D_used + 1)
     n_stored = len(specs)
     n_applied = len(apply_order) if apply_order is not None else n_stored
+    return QL.D_used, inter, n_stored, n_applied
+
+
+def _spec_sizes(config: FitConfig,
+                subset: Optional[Subset] = None) -> Tuple[int, int, int, int]:
+    """(hidden, intermediate, stored_layers, applied_depth) at the config's op-subset
+    + efficient/recurrent flags (32-bit, the baked path), arch-rescaled.  ``subset``
+    overrides ``config.subset`` (used by the subroutine lever, which accounts the
+    stack WITHOUT muldiv baked in)."""
+    sub = subset if subset is not None else config.subset
+    eff = config.efficient_alu and (subset is None)   # subroutine drops the baked ALU
+    rec = config.recurrent_divmod and (subset is None)
+    d_used, inter, n_stored, n_applied = _raw_spec_sizes(
+        config.code_size, sub.memory, sub.cmp, sub.bitwise, sub.muldiv, eff, rec)
+    arch = config.arch
+    inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
+    hidden = arch.hidden_for(d_used + 1)
     return hidden, inter, n_stored, n_applied
 
 
@@ -251,16 +344,11 @@ def account(config: FitConfig) -> Accounting:
         # bytecode library routine — many PROGRAM STEPS per op, near-zero extra
         # persistent depth/width.  Re-account WITHOUT muldiv baked into the stack.
         sub_no_md = _drop_muldiv(config.subset)
-        QL = QwenFullLayout(config.code_size, sub_no_md)
-        specs = _block_specs(QL.L, config.code_size, sub_no_md)
-        inter = max(int(s["W_up"].shape[0]) for _, s in specs)
-        inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
-        hidden = arch.hidden_for(QL.D_used + 1)
-        n_stored = len(specs)
-        n_applied = n_stored
-        steps_per_op = _EST_SUBROUTINE_STEPS["divmod" if config.has_divmod else "mul"]
+        hidden, inter, n_stored, n_applied = _spec_sizes(config, subset=sub_no_md)
+        steps_per_op = _est_subroutine_steps(config.precision,
+                                             divmod_=config.has_divmod)
         verified = False
-        notes = "subroutine steps_per_op ESTIMATED (#699, pending reverify)"
+        notes = _SUBROUTINE_NOTE
     else:
         hidden, inter, n_stored, n_applied = _spec_sizes(config)
 
