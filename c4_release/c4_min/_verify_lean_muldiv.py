@@ -19,7 +19,10 @@ from c4_min import qwen_lean_forward as LF
 from c4_min import qwen_lean_stack_driver as SD
 
 t0 = time.time()
-vm = Q.build(code_size=64, subset=Q.SUBSET_BITWISE)
+# code_size must be >= the longest program's instruction count: div8/mod8 are
+# ~171 instructions, so a code_size=64 build would IndexError on CODE_OP[k] when
+# overlaying the program-in-data (the mul8 cases are only 50 instrs and DO fit 64).
+vm = Q.build(code_size=256, subset=Q.SUBSET_BITWISE)
 lean = LF.LeanQwenVM.from_full_vm(vm, device=DEV)
 print(f"[build] lean SUBSET_BITWISE on {DEV} in {time.time()-t0:.1f}s "
       f"(n_layers={vm.n_layers})", flush=True)
