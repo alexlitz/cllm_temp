@@ -71,6 +71,7 @@ from . import nibble_pure_forward as PF
 from .nibble_pure_forward import (
     PureForwardLayout, INGEST_REGS, build_pure_forward_model, SP_INIT,
 )
+from .nibble_pure_forward_complete import _decode_reg_from_nibbles
 
 
 # RMSNorm compensator. It must DOMINATE every residual value so RMSNorm ~ identity
@@ -130,16 +131,31 @@ def _rope_lane_pair(head_dim: int, slow: bool) -> Tuple[int, int]:
 class QwenFullLayout:
     """PureForwardLayout bands + CAM bands (role marker, per-reg value token nibble
     band, is-frame flag) + BOS sink + RMSNorm compensator, placed in a Qwen hidden
-    vector."""
+    vector.
 
-    def __init__(self, code_size: int, subset: "Subset"):
-        # Build the pure-forward layout (all VM compute bands live here).
+    ``efficient_alu`` (default False) attaches the ``nibble_alu32`` scratch bands
+    (``L.ALU32``: the operand-byte, MUL column, DIV/MOD nibble long-division and
+    per-op RES bands) BEFORE the CAM bands, so MUL/DIV/MOD run as the spec's
+    genuine 32-bit fp32 FFN gadgets INSTEAD of the 256x256 lookup table (the
+    ~45 GB intermediate wall).  ``recurrent_divmod`` folds the 8 long-division
+    iterations into ONE reused iteration body (adds the IT counter band)."""
+
+    def __init__(self, code_size: int, subset: "Subset",
+                 efficient_alu: bool = False, recurrent_divmod: bool = False):
+        # Build the pure-forward layout (all VM compute bands live here).  With the
+        # efficient ALU we build WITHOUT the mdm lookup-table bands (include_muldiv=
+        # False) and attach the nibble_alu32 scratch bands instead.
         self.pf = build_pure_forward_model(
             code_size=code_size, include_memory=subset.memory,
             include_cmp=subset.cmp, include_bitwise=subset.bitwise,
-            include_muldiv=subset.muldiv)[1]
+            include_muldiv=(subset.muldiv and not efficient_alu))[1]
         L = self.pf
-        # Append the CAM bands past the pure-forward bands.
+        self.efficient_alu = efficient_alu
+        self.recurrent_divmod = recurrent_divmod
+        if efficient_alu and subset.muldiv:
+            from . import nibble_alu32 as _A
+            _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
+        # Append the CAM bands past the (possibly ALU-extended) pure-forward bands.
         off = L.D
         self._names: Dict[str, Tuple[int, int]] = {}
         # per-register ROLE one-hot (which register a frame token carries): 5.
@@ -200,20 +216,32 @@ class QwenFullVM:
     arch: QwenArch
     hidden_size: int
     intermediate_size: int
-    n_layers: int
+    n_layers: int                 # STORED physical layers (Qwen num_hidden_layers)
     fits_stock: bool
     embed: torch.Tensor           # [vocab, hidden] token -> residual (injected)
+    efficient_alu: bool = False   # MUL/DIV/MOD via nibble_alu32 gadgets, not the table
+    n_applied: int = 0            # layers APPLIED per forward (>= n_layers if recurrent)
 
 
 def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           arch: QwenArch = QWEN2_5_ARCH, K: float = NORM_K,
-          mdm_keys=None, pad_to_stock: bool = False) -> QwenFullVM:
+          mdm_keys=None, efficient_alu: bool = False,
+          recurrent_divmod: bool = False, pad_to_stock: bool = False) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
-    ``mdm_keys`` (optional) restricts the MUL/DIV/MOD FFN table to the given set of
-    ``(op, a, b)`` operand triples (the full 256x256x3 table is the D-budget wall,
-    intermediate ~160465). If None and ``subset.muldiv`` is set, the FULL table is
-    used (unbuildable in RAM — use a pruned key set for the corpus).
+    ``efficient_alu`` (default False) bakes MUL/DIV/MOD as the ``nibble_alu32``
+    spec-faithful 32-bit fp32 FFN gadgets (byte MUL schoolbook + base-16 long
+    division) INSTEAD of the 256x256x3 lookup table — no ~45 GB intermediate wall,
+    full 32-bit-exact operands, and no ``mdm_keys`` pruning needed.  It trades the
+    table WIDTH for DEPTH: MUL is ~10 blocks, DIV/MOD ~262 (the 8 long-division
+    iterations).  ``recurrent_divmod`` folds those 8 iterations into ONE reused
+    layer body (Qwen ``layers`` gets repeated module references, so the model STORES
+    ~115 divmod layers but APPLIES 262) — a Universal-Transformer-style recurrence
+    exactly mirroring ``nibble_pure_forward_complete``.
+
+    ``mdm_keys`` (lookup-table path only) restricts the table to the given set of
+    ``(op, a, b)`` operand triples (the full table's intermediate ~160465 -> ~45 GB
+    fp32 is unbuildable in RAM). Ignored when ``efficient_alu`` is set.
 
     ``pad_to_stock`` (default ``False``) builds the model at the EXACT stock
     Qwen2.5-0.5B checkpoint shape — ``hidden_size=896``, ``intermediate_size=4864``,
@@ -226,16 +254,21 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     can be padded; a wider subset raises)."""
     from transformers.models.qwen2 import Qwen2Model
 
-    QL = QwenFullLayout(code_size, subset)
+    QL = QwenFullLayout(code_size, subset, efficient_alu=efficient_alu,
+                        recurrent_divmod=recurrent_divmod)
     L = QL.L
-    block_specs = _block_specs(L, code_size, subset, mdm_keys=mdm_keys)
+    block_specs = _block_specs(L, code_size, subset, mdm_keys=mdm_keys,
+                              efficient_alu=efficient_alu,
+                              recurrent_divmod=recurrent_divmod)
     block_names = [nm for nm, _ in block_specs]
+    apply_order = getattr(L, "_qwen_apply", None)
 
     dim_needed = QL.D_used + 1
     hidden_size = arch.hidden_for(dim_needed)
     intermediate = max(int(s["W_up"].shape[0]) for _, s in block_specs)
     intermediate = max(intermediate, arch.num_attention_heads * arch.head_dim, 8)
-    n_layers = len(block_specs)
+    n_layers = len(block_specs)            # STORED (distinct) physical layers
+    n_applied = len(apply_order) if apply_order is not None else n_layers
     comp = QL.D_used                       # compensator lane
 
     fits_stock = (hidden_size <= STOCK_HIDDEN and intermediate <= STOCK_INTERMEDIATE
@@ -281,22 +314,48 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
             _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K)
             cam_layers["mem-cam"] = mem_idx
 
+    # RECURRENCE (recurrent divmod): re-point qmodel.layers through the apply order
+    # so the forward applies the reused iteration-body layers 8x.  The STORED set
+    # (the distinct nn.Modules, what the model holds) stays n_layers; qmodel.layers
+    # holds repeated references (shared weights, identical math) — exactly the
+    # nibble_pure_forward_complete recurrence, ported onto Qwen2's ModuleList.
+    if apply_order is not None:
+        import torch.nn as _nn
+        phys = list(qmodel.layers)
+        qmodel._phys_layers = phys
+        qmodel.layers = _nn.ModuleList([phys[i] for i in apply_order])
+        # Qwen2Model.forward uses self.config.num_hidden_layers for the rotary/mask
+        # loop bound in some versions; iterating self.layers directly is the norm,
+        # but keep the config in sync with the APPLIED length for safety.
+        qmodel.config.num_hidden_layers = len(qmodel.layers)
+
     return QwenFullVM(qmodel=qmodel, QL=QL, subset=subset, K=K,
                       block_names=block_names, cam_layers=cam_layers, arch=arch,
                       hidden_size=hidden_size, intermediate_size=intermediate,
-                      n_layers=n_layers, fits_stock=fits_stock, embed=embed)
+                      n_layers=n_layers, fits_stock=fits_stock, embed=embed,
+                      efficient_alu=efficient_alu, n_applied=n_applied)
 
 
 # ---------------------------------------------------------------------------
 # Block-spec list — mirrors nibble_pure_forward.build_pure_forward_model's FFN
 # side but with FUNCTION dispatch rules added.
 # ---------------------------------------------------------------------------
-def _block_specs(L, code_size, subset, mdm_keys=None):
+def _block_specs(L, code_size, subset, mdm_keys=None, efficient_alu=False,
+                 recurrent_divmod=False):
+    """The fused-VM FFN block list (one Qwen layer per block).
+
+    Returns ``specs`` (list of ``(name, ffn_spec)``); when the efficient-ALU
+    recurrent path is active it ALSO returns an ``apply_order`` on ``L._qwen_apply``
+    so ``build`` can point ``qmodel.layers`` at the reused iteration-body layers.
+    ``efficient_alu`` swaps the 256x256 MUL/DIV/MOD lookup table for the
+    ``nibble_alu32`` fp32 FFN gadgets (spec-faithful 32-bit MUL schoolbook +
+    base-16 long division)."""
     from .nibble_vm import (
         compile_nibble_to_scalar, compile_pc_fetch, compile_code_select,
         base_dispatch_rules, compile_branch_delta, compile_fold, compile_ffn,
     )
     dim = L.D
+    L._qwen_apply = None                   # default: identity apply order
     specs = [
         ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
         ("pc-fetch",    compile_pc_fetch(L, dim)),
@@ -320,7 +379,8 @@ def _block_specs(L, code_size, subset, mdm_keys=None):
         # regression-free for the unsigned <2^31 corpus.
         specs += [("cmp-compute", PF.compile_cmp_compute(L, dim)),
                   ("cmp-finalize", PF.compile_cmp_signed_finalize(L, dim))]
-    if subset.muldiv:
+    eff_mdm = subset.muldiv and efficient_alu
+    if subset.muldiv and not efficient_alu:
         from .nibble_unified import compile_mdm_expand, compile_mdm_select
         mdm_sel = (compile_mdm_select_pruned(L, dim, mdm_keys) if mdm_keys is not None
                    else compile_mdm_select(L, dim))
@@ -332,6 +392,34 @@ def _block_specs(L, code_size, subset, mdm_keys=None):
             specs.append((name, spec))
         specs.append(("bw-recompose", _bw_recompose_spec(
             L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))
+    # -- EFFICIENT ALU: the nibble_alu32 fp32 FFN gadgets (§Basic Arithmetic /
+    #    §Multiplication / §Division) replacing the mdm table.  Each block writes its
+    #    op's dedicated RES nibble band UNCONDITIONALLY; the ax-mux copies the active
+    #    op's result into the AX nibble band gated on OP_IS[op].  The recurrent
+    #    divmod stores ONE reused iteration body (repeated 8x by _qwen_apply). ---
+    if eff_mdm:
+        from . import nibble_alu32 as A
+        A._ONE = L.ONE
+        alu_ops = [isa.MUL, isa.DIV, isa.MOD]
+        specs.append(("alu-psh-nib", A.compile_psh_nibble_copy(L, dim)))
+        specs.append(("alu-expand", A.compile_expand(L, dim)))
+        for name, spec in A.compile_mul_blocks(L, dim):
+            specs.append((name, spec))
+        div_start = len(specs)
+        if recurrent_divmod:
+            unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim)
+            name_to_idx = {}
+            for name, spec in unique:
+                name_to_idx[name] = len(specs)
+                specs.append((name, spec))
+            div_apply = [name_to_idx[n] for n in apply_names]
+        else:
+            div_apply = []
+            for name, spec in A.compile_divmod_blocks(L, dim):
+                div_apply.append(len(specs))
+                specs.append((name, spec))
+        div_end = len(specs)
+        specs.append(("alu-ax-mux", A.compile_ax_mux(L, dim, ops=alu_ops)))
     disp = base_dispatch_rules(L) + _call_dispatch_rules(L)
     if subset.memory:
         disp = disp + PF.memory_dispatch_rules(L)
@@ -339,8 +427,12 @@ def _block_specs(L, code_size, subset, mdm_keys=None):
         disp = disp + PF.cmp_dispatch_rules(L)
     if subset.bitwise:
         disp = disp + PF.bitwise_dispatch_rules(L)
-    if subset.muldiv:
+    if subset.muldiv and not efficient_alu:
         disp = disp + PF.muldiv_dispatch_rules(L)
+    if eff_mdm:
+        # ALU housekeeping: SP += 4 (popped operand) + PC += 1, gated per ALU op.
+        # (The ax-mux owns the AX write; no muldiv_dispatch_rules AX write here.)
+        disp = disp + _alu_housekeeping_rules(L, alu_ops)
     specs += [
         ("dispatch", compile_ffn(disp, dim)),
         ("branch-delta", compile_branch_delta(L, dim)),
@@ -352,7 +444,22 @@ def _block_specs(L, code_size, subset, mdm_keys=None):
         # WIDTH32 is off) while not corrupting a wide/negative value when it is on.
         ("fold", compile_fold(L.AX_VAL, L.ONE, dim)),
     ]
+    # Record the apply-order for the recurrent divmod (identity elsewhere): the
+    # physical layers before div_start, then the repeated iteration-body layer
+    # indices, then the rest — so build() points qmodel.layers at the reused layers.
+    if eff_mdm and recurrent_divmod:
+        n = len(specs)
+        L._qwen_apply = (list(range(div_start)) + div_apply + list(range(div_end, n)))
     return specs
+
+
+def _alu_housekeeping_rules(L, ops):
+    """SP += 4 (the popped operand consumed a stack slot) + PC += 1, gated on each
+    efficient-ALU op.  The ax-mux writes AX; these rules only advance SP/PC."""
+    from .dsl import FFNRule, LinearExpr
+    sp, pc = L.SP_VAL, L.PC_VAL
+    return [FFNRule([(L.OP_IS + op, 0.5, 1.5)],
+                    {sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}) for op in ops]
 
 
 def compile_mdm_select_pruned(L, dim, keys) -> Dict[str, torch.Tensor]:
@@ -739,12 +846,21 @@ def _forward(vm: QwenFullVM, x: torch.Tensor) -> torch.Tensor:
 
 
 def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
-                verbose: bool = False) -> Dict[str, object]:
+                verbose: bool = False, mask: int = 0xFF) -> Dict[str, object]:
     """Execute ``code`` on the fused Qwen VM. One VM step = one Qwen2Model.forward
     over the windowed token stream (state read from the latest frame by the register
     CAM; the op computed by the SwiGLU MLPs; control-flow — PC update / branch /
     call — all inside the forward). Returns
     ``{"ax_trace": [...], "ref_trace": [...], "exact": bool, "steps": int}``.
+
+    ``mask`` (default ``0xFF``) is the value width the emitted AX is decoded at for
+    the efficient-ALU ops (MUL/DIV/MOD).  The default 8-bit matches ``isa.interpret``
+    (the 8-bit reference used across c4_min and the 8-bit operand-load corpus path),
+    so ``ax_trace == ref_trace`` is byte-exact.  The EFFICIENT ALU computes the FULL
+    32-bit result; pass ``mask=0xFFFFFFFF`` to keep the 32-bit result in the trace and
+    compare it against a 32-bit reference (``nibble_muldivmod`` mul32/divmod32/mod32).
+    NB: the 32-bit result lives in the AX nibble band only at the ALU-op step — a
+    trailing non-ALU step (e.g. HALT) reads the scalar ``AX_VAL``, folded mod 256.
 
     Functions: JSR/ENT push (return-PC / saved-BP), LEV pops them. The push+pop
     rides an explicit CALL STACK (state that lives alongside the token stream); all
@@ -777,7 +893,16 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
         state = _forward(vm, x)
 
         pc = _snap(state[L.PC_VAL])
-        ax = _snap(state[L.AX_VAL]) & 0xFF
+        # AX decode: for the efficient-ALU ops (MUL/DIV/MOD) the ax-mux writes the
+        # FULL 32-bit result into the AX NIBBLE band, so decode it per-byte with the
+        # LM byte-head argmax (residue-immune, 32-bit-exact); every other op's AX is
+        # the scalar AX_VAL byte (the 8-bit fold path / loaded byte / cmp result).
+        # ``mask`` narrows the emitted AX to the compare width (8-bit vs isa.interpret,
+        # 32-bit vs the nibble_muldivmod reference).
+        if vm.efficient_alu and op in (isa.MUL, isa.DIV, isa.MOD):
+            ax = _decode_reg_from_nibbles(state, L, L.AX) & mask
+        else:
+            ax = _snap(state[L.AX_VAL]) & 0xFF
         sp = _snap(state[L.SP_VAL])
         bp = _snap(state[L.BP_VAL])
         stk = _snap(state[L.STK_VAL])
@@ -853,4 +978,35 @@ def fit_report(code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH) -> List[Dict]
             "over_hidden": max(0, hidden - STOCK_HIDDEN),
             "over_intermediate": max(0, inter - STOCK_INTERMEDIATE),
         })
+    return rows
+
+
+def fit_report_efficient(code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH) -> List[Dict]:
+    """Depth/width fit for the EFFICIENT-ALU MUL/DIV/MOD (nibble_alu32) — the table
+    WIDTH (intermediate ~160465 -> ~45 GB) is traded for DEPTH (schoolbook rounds +
+    long-division iterations).  Reports both the unrolled and the recurrent
+    (layer-reuse) layer counts so the honest depth cost is visible.  ``n_stored`` is
+    Qwen ``num_hidden_layers`` (distinct nn.Modules); ``n_applied`` is layers run per
+    forward (== n_stored unless recurrent)."""
+    rows = []
+    for sub in (SUBSET_MULDIV, SUBSET_FULL):
+        for recurrent in (False, True):
+            QL = QwenFullLayout(code_size, sub, efficient_alu=True,
+                                recurrent_divmod=recurrent)
+            specs = _block_specs(QL.L, code_size, sub, efficient_alu=True,
+                                 recurrent_divmod=recurrent)
+            apply_order = getattr(QL.L, "_qwen_apply", None)
+            inter = max(int(s["W_up"].shape[0]) for _, s in specs)
+            inter = max(inter, arch.num_attention_heads * arch.head_dim, 8)
+            hidden = arch.hidden_for(QL.D_used + 1)
+            n_stored = len(specs)
+            n_applied = len(apply_order) if apply_order is not None else n_stored
+            rows.append({
+                "subset": sub.name, "mode": "recurrent" if recurrent else "unrolled",
+                "hidden_size": hidden, "intermediate_size": inter,
+                "n_stored_layers": n_stored, "n_applied_layers": n_applied,
+                "query_heads": arch.num_attention_heads,
+                "fits_stock_0_5b_24L": n_stored <= STOCK_LAYERS,
+                "fits_stock_intermediate": inter <= STOCK_INTERMEDIATE,
+            })
     return rows
