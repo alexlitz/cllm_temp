@@ -476,54 +476,64 @@ def perbit_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
     return rules
 
 
-def bitwise_dispatch_rules(L: NibbleLayout, op: int) -> Tuple[dict, List[FFNRule]]:
-    """FFN blocks for a bitwise ``op`` (OR/XOR/AND) on the nibble dispatch.
+def perbit_shift_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
+    """BARREL SHIFTER for SHL/SHR via the SHARED source bit-planes (§Shifts).
 
-    Returns ``(expand_weights, select_rules)`` — two FFN blocks:
+    This is the per-BIT shift path that REPLACES the dense ``shift_dispatch_rules``
+    lookup table (the ``(lo, bit4, source_nibble, source_value) -> result_nibbles``
+    cross-product, ~10.8k rules for the two ops).  A barrel shifter routes each
+    RESULT bit from the single SOURCE bit at the shifted position, gated on the
+    decomposed shift amount ``s = lo + 16*bit4`` (``s = AX & 0x1F``):
 
-      * ``expand_weights`` — Phase A (compiled SwiGLU dict): STACK0/AX nibbles ->
-        per-nibble one-hots via the §510 triangular-pulse point indicator
-        (``compile_onehot_expand``). Compiled directly to weights because
-        ``compile_ffn``'s boolean guard cannot range-check an integer band.
-      * ``select_rules`` — Phase B (``FFNRule`` list, lowers via ``compile_ffn``):
-        the per-nibble **256-entry lookup table** (§Bitwise). For every nibble
-        ``j`` and every key ``(a,b)`` a rule gated on ``A_OH[j][a] ∧ B_OH[j][b]``
-        writes ``op(a,b)`` into ``AX+j`` (additive SET: ``+op(a,b)`` plus a
-        ``-AX+j`` self-cancel). The same 256 keys are emitted for each of the 16
-        nibbles (§685 "replicated 16 times").
+        SHL:  result_bit[k] = source_bit[k - s]      (k in 0..31, masked to 32 bit)
+        SHR:  result_bit[k] = source_bit[k + s]      (k in 0..63)
 
-    Reference-DSL correspondence: ``expand`` = ``one_hot_indicator_rule`` per
-    cell; ``select`` = ``lookup_table_rules`` keyed on the AND of the two
-    one-hots (``multi_way_and_rule``).
+    Reads the pre-extracted SOURCE bit-planes ``A_BIT[j*4+p] = bit p of STACK0
+    nibble j`` (built ONCE by ``compile_bit_extract`` in ``build_bitwise_blocks``,
+    shared with the OR/XOR/AND per-bit gadget), plus the shift-amount one-hots
+    ``SHIFT_LO_OH`` / ``SHIFT_BIT4``.  For each ``(lo, bit4)`` and each result bit
+    ``k`` whose source bit is in range, ONE rule gated on
+    ``SHIFT_LO_OH[lo] ∧ SHIFT_BIT4[bit4] ∧ A_BIT[src]`` writes ``2**(k%4)`` into
+    result nibble ``AX + k//4``.  A single ``-AX+j`` self-cancel per nibble keeps
+    SET semantics.  Bit-exact vs ``shift_dispatch_rules`` (byte-identical result
+    values), ~5x fewer rules, and no per-value dense table anywhere.
     """
-    if op not in _BITWISE_FN:
-        raise ValueError(f"bitwise_dispatch_rules: op {op} not OR/XOR/AND")
-    extend_layout_for_bitwise(L)
-    fn = _BITWISE_FN[op]
-
-    expand = compile_onehot_expand(
-        src_bands=[L.STACK0 + j for j in range(N_NIB)]
-                  + [L.AX + j for j in range(N_NIB)],
-        oh_bases=list(L.A_OH) + list(L.B_OH),
-        cells=16, one_band=L.ONE, dim=L.D,
-    )
-
-    select: List[FFNRule] = []
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"perbit_shift_select_rules: op {op} not SHL/SHR")
+    rules: List[FFNRule] = []
+    # SET semantics: cancel each old AX nibble once (same as the table path).
     for j in range(N_NIB):
-        res = L.AX + j
-        # cancel the old AX nibble once (SET semantics): -old value.
-        select.append(FFNRule([(L.ONE, 0.5, 1.5)],
-                              {res: LinearExpr.of(res, -1.0)}))
-        for a in range(16):
-            for b in range(16):
-                val = fn(a, b)
-                if val == 0:
-                    continue                     # zero table entry: no write.
-                select.append(FFNRule(
-                    [(L.A_OH[j] + a, 0.5, 1.5), (L.B_OH[j] + b, 0.5, 1.5)],
-                    {res: LinearExpr.c(float(val))},
+        rules.append(FFNRule([(L.ONE, 0.5, 1.5)],
+                             {L.AX + j: LinearExpr.of(L.AX + j, -1.0)}))
+    n_src_bits = N_NIB * 4                          # 64 source bit-planes (16 nibbles)
+    for lo in range(16):
+        for bit4 in range(2):
+            s = lo + 16 * bit4                      # shift amount 0..31 (AX & 0x1F)
+            # SHL result is 32-bit-masked (k in 0..31); SHR keeps the full width.
+            k_hi = WIDTH_BITS if op == isa.SHL else n_src_bits
+            for k in range(k_hi):
+                src = (k - s) if op == isa.SHL else (k + s)
+                if not (0 <= src < n_src_bits):
+                    continue                        # shifted-in zero bit: no write.
+                src_plane = L.A_BIT + (src // 4) * 4 + (src % 4)
+                rj, rp = k // 4, k % 4              # result nibble + bit within it
+                rules.append(FFNRule(
+                    [(L.SHIFT_LO_OH + lo, 0.5, 1.5),
+                     (L.SHIFT_BIT4 + bit4, 0.5, 1.5),
+                     (src_plane, 0.5, 1.5)],
+                    {L.AX + rj: LinearExpr.c(float(1 << rp))},
                 ))
-    return expand, select
+    return rules
+
+
+# NOTE: the DENSE per-nibble 256-entry (a,b) bitwise lookup table
+# (``bitwise_dispatch_rules``) and the DENSE per-value shift lookup table
+# (``shift_dispatch_rules``) have been REMOVED.  The per-bit gadget
+# (``perbit_select_rules`` for OR/XOR/AND) and the barrel shifter
+# (``perbit_shift_select_rules`` for SHL/SHR) — both reading the shared
+# ``compile_bit_extract`` bit-planes — are the SOLE bitwise/shift path and were
+# proven byte-identical to the removed tables before removal.  The
+# ``C4_BITWISE_PERBIT`` dense escape-hatch flag is likewise gone.
 
 
 def _shift_bit4_rules(L: NibbleLayout) -> List[FFNRule]:
@@ -540,79 +550,40 @@ def _shift_bit4_rules(L: NibbleLayout) -> List[FFNRule]:
     return rules
 
 
-def shift_dispatch_rules(L: NibbleLayout, op: int) -> Tuple[dict, List[FFNRule], List[FFNRule]]:
-    """FFN blocks for a shift ``op`` (SHL/SHR) on the nibble dispatch.
-
-    Returns ``(expand_weights, bit4_rules, select_rules)`` — three FFN blocks:
-
-      * ``expand_weights`` — Phase A (compiled): one-hots of STACK0 nibbles (the
-        source, into ``A_OH``), AX nibble-0 (``SHIFT_LO_OH``) and AX nibble-1
-        (``SHIFT_N1_OH``), all via the §510 triangular pulse.
-      * ``bit4_rules`` — fold nib1 one-hot -> ``SHIFT_BIT4`` (bit 4 of the count).
-      * ``select_rules`` — Phase B: the shift is ``pop <</>> s`` with
-        ``s = AX & 0x1F`` decomposed as ``s = lo + 16*bit4`` (§Shifts: "multiply
-        by powers of two ... modulus by floor"). For every ``(lo, bit4)`` and
-        every source nibble value, a rule gated on
-        ``SHIFT_LO_OH[lo] ∧ SHIFT_BIT4[bit4] ∧ A_OH[srcnib][a]`` writes the
-        placed bits of ``(a·16^srcnib) <</>> (lo+16·bit4)`` into the result AX
-        nibbles — the §520 power-of-two lookup-select, exact per bit-plane.
-    """
-    if op not in (isa.SHL, isa.SHR):
-        raise ValueError(f"shift_dispatch_rules: op {op} not SHL/SHR")
-    extend_layout_for_bitwise(L)
-
-    expand = compile_onehot_expand(
-        src_bands=[L.STACK0 + j for j in range(N_NIB)] + [L.AX + 0, L.AX + 1],
-        oh_bases=list(L.A_OH) + [L.SHIFT_LO_OH, L.SHIFT_N1_OH],
-        cells=16, one_band=L.ONE, dim=L.D,
-    )
-    bit4 = _shift_bit4_rules(L)
-
-    select: List[FFNRule] = []
-    for j in range(N_NIB):                        # cancel old AX nibbles once.
-        select.append(FFNRule([(L.ONE, 0.5, 1.5)],
-                              {L.AX + j: LinearExpr.of(L.AX + j, -1.0)}))
-    for lo in range(16):
-        for bit4v in range(2):
-            s = lo + 16 * bit4v                   # s in 0..31
-            for j in range(N_NIB):                # source nibble index
-                for a in range(1, 16):            # source nibble value (a=0: no-op)
-                    if op == isa.SHL:
-                        placed = ((a << (4 * j)) << s) & 0xFFFFFFFF
-                    else:
-                        placed = (a << (4 * j)) >> s
-                    if placed == 0:
-                        continue
-                    for rj, rn in enumerate(_nibbles(placed)):
-                        if rn == 0:
-                            continue
-                        select.append(FFNRule(
-                            [(L.SHIFT_LO_OH + lo, 0.5, 1.5),
-                             (L.SHIFT_BIT4 + bit4v, 0.5, 1.5),
-                             (L.A_OH[j] + a, 0.5, 1.5)],
-                            {L.AX + rj: LinearExpr.c(float(rn))},
-                        ))
-    return expand, bit4, select
-
-
 def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     """Single entry point for the ISA dispatch: return the ordered list of FFN
     blocks that implement ``op`` on the nibble skeleton.
 
-    Each block is either a compiled SwiGLU weight-dict (the one-hot expansion) or
-    an ``FFNRule`` list (lowered by the caller via ``compile_ffn``). Applying the
-    blocks in order transforms ``(STACK0=pop, AX=operand2)`` into ``AX=result``.
+    Each block is either a compiled SwiGLU weight-dict (the one-hot / bit-plane
+    expansions) or an ``FFNRule`` list (lowered by the caller via ``compile_ffn``).
+    Applying the blocks in order transforms ``(STACK0=pop, AX=operand2)`` into
+    ``AX=result``.
 
-    Plugs the five ops the greenfield dispatch stubbed out (``control.py``
-    raised ``NotImplementedError`` for AND/OR/XOR; SHL/SHR were absent). In a
-    real fan-out each block's rules are additionally gated on the opcode one-hot.
+    ALL five ops (OR/XOR/AND/SHL/SHR) use the per-BIT path — the shared bit-plane
+    extraction (``compile_bit_extract`` -> ``A_BIT``/``B_BIT``) plus a tiny per-bit
+    combine (OR/XOR/AND via ``perbit_select_rules``) or the BARREL SHIFTER
+    (SHL/SHR via ``perbit_shift_select_rules``).  There is NO dense per-value lookup
+    table any more.  In a real fan-out each block's rules are additionally gated on
+    the opcode one-hot.
     """
-    if op in _BITWISE_FN:
-        expand, select = bitwise_dispatch_rules(L, op)
-        return [expand, select]
+    extend_layout_for_bitwise(L)
+    # Shared bit-plane extraction of the source (STACK0) and operand-2 (AX) nibbles.
+    planes = compile_bit_extract(
+        src_bands=[L.STACK0 + j for j in range(N_NIB)]
+                  + [L.AX + j for j in range(N_NIB)],
+        bit_bases=[L.A_BIT + j * 4 for j in range(N_NIB)]
+                  + [L.B_BIT + j * 4 for j in range(N_NIB)],
+        one_band=L.ONE, dim=L.D)
+    if op in _PERBIT_COMBINE:                          # OR / XOR / AND
+        return [planes, perbit_select_rules(L, op)]
     if op in (isa.SHL, isa.SHR):
-        expand, bit4, select = shift_dispatch_rules(L, op)
-        return [expand, bit4, select]
+        # shift-amount one-hots (AX nib0 -> SHIFT_LO_OH, AX nib1 -> SHIFT_N1_OH) +
+        # the bit4 fold, then the barrel select over the source bit-planes.
+        expand = compile_onehot_expand(
+            src_bands=[L.AX + 0, L.AX + 1],
+            oh_bases=[L.SHIFT_LO_OH, L.SHIFT_N1_OH],
+            cells=16, one_band=L.ONE, dim=L.D)
+        return [expand, planes, _shift_bit4_rules(L), perbit_shift_select_rules(L, op)]
     raise ValueError(f"append_bitwise_shift_to_dispatch: unsupported op {op}")
 
 

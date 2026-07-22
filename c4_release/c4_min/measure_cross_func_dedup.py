@@ -112,8 +112,9 @@ def measure(sparse, names):
     print("     mux; different bands/biases).  Physical MERGE = measured potential below.")
 
     # ---- bitwise tables vs the IMPLEMENTED per-bit gadget ----
-    from .nibble_unified import _bitwise_perbit_enabled
-    perbit_on = _bitwise_perbit_enabled()
+    # The per-bit gadget (OR/XOR/AND) + barrel shifter (SHL/SHR) are now the SOLE
+    # bitwise/shift path — the dense 256-entry tables + the C4_BITWISE_PERBIT escape
+    # hatch have been removed (the gadget was byte-identical to them before removal).
     print("\n--- BITWISE: 3 lookup tables vs the SHARED per-bit gadget (IMPLEMENTED) ---")
     per_nib = {}
     for nm, op in (("OR", isa.OR), ("XOR", isa.XOR), ("AND", isa.AND)):
@@ -134,7 +135,8 @@ def measure(sparse, names):
     print(f"  => OR/XOR/AND select {tot_tbl * N_NIB} -> {perbit_total} "
           f"(~{tot_tbl * N_NIB / max(1, perbit_total):.1f}x smaller); ARGMAX-IDENTICAL "
           f"to the table (bit-exact per (a,b)).")
-    print(f"  [current build path: {'PER-BIT gadget (default)' if perbit_on else 'FULL TABLES (C4_BITWISE_PERBIT=0)'}]")
+    print(f"  [current build path: PER-BIT gadget + barrel shifter (sole path; dense "
+          f"tables removed)]")
 
     # ---- per-hidden-unit byte-identical tie (the finest clean granularity) ----
     print("\n--- FINEST BYTE-IDENTICAL TIE: per-hidden-unit dedup across ALL in-scope "
@@ -179,7 +181,7 @@ def measure(sparse, names):
         print(f"{fam_name:38s} {cur:8d} {shr:8d} {proj:10d}  {note}")
     print(f"{'BITWISE OR/XOR/AND (bw-select rules)':38s} "
           f"{tot_tbl * N_NIB:8d} {tot_tbl * N_NIB - perbit_total:8d} {perbit_total:10d}  "
-          f"per-bit gadget APPLIED (argmax-identical; C4_BITWISE_PERBIT)")
+          f"per-bit gadget APPLIED (argmax-identical; sole path, dense tables removed)")
 
     return fam_nnz, dupes, total
 
