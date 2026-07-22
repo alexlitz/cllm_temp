@@ -49,17 +49,17 @@ Honesty (verified vs estimated)
 
 Everything except the actual bake runs on CPU with no model materialised (the
 accounting sizes the layout WITHOUT building the possibly-huge model, exactly like
-``fit_report``).  MEMORY-SAFE: the 256x256x3 lookup table (``intermediate 160465``)
-is the ~45 GB / ~55 GB-peak-RSS wall, so its width is counted ANALYTICALLY (the
-nonzero ``_MDM_FN`` entries, tensor-free) on top of the memory-light muldiv-OFF
-build -- reproducing the real build (width 160465, +2 layers, same ``D_used``)
-exactly.  The whole solver peaks ~4.7 GB.  ``C4_FIT_BUILD_TABLE=1`` forces the real
-45 GB build as a byte-identity self-check.  Spec builds are ``lru_cache``-memoized on
-the spec-determining levers, so the P8/P16/P32 variants share one build.
+``fit_report``).  MEMORY-SAFE: the 256x256x3 dense lookup table (``intermediate
+160465``, the historical ~45 GB / ~55 GB-peak-RSS wall) has been REMOVED — the only
+MUL/DIV/MOD path is now the efficient nibble_alu32 ALU.  The "lookup-table" strategy
+is therefore a pure ACCOUNTING/tradeoff row whose width is the ANALYTIC count of the
+removed table (``qwen_full_vm._MDM_TABLE_WOULD_BE`` == 160465, tensor-free); nothing
+ever materialises a table, so the solver is memory-safe unconditionally (peaks
+~4.7 GB from the muldiv-OFF reference build only).  Spec builds are
+``lru_cache``-memoized on the spec-determining levers, so the P8/P16/P32 variants
+share one build.
 """
 from __future__ import annotations
-
-import os
 
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -249,29 +249,25 @@ class Accounting:
     notes: str = ""
 
 
-# The 8-bit MUL/DIV/MOD LOOKUP-TABLE width, computed ANALYTICALLY (no tensors).
-# ``nibble_unified.compile_mdm_select`` allocates ONE hidden unit per NONZERO
-# op(a,b) over all 256x256 pairs of MUL/DIV/MOD, + 1 self-clear unit.  MATERIALISING
-# that spec is the ~45 GB / ~55 GB-RSS wall (``build_pure_forward_model(include_
-# muldiv=True)`` alone peaks ~55 GB) — so for the *accounting* we count the nonzero
-# entries with the SAME pure-Python ``_MDM_FN`` the builder uses (a 3x256x256 int
-# loop, ~0 memory), and add the two lookup blocks (mdm-expand + mdm-select) to the
-# memory-LIGHT muldiv-OFF build.  VERIFIED to reproduce the real build byte-for-byte:
-# 160465 width + (+2 stored layers), identical D_used (the mdm one-hot bands do not
-# widen the CAM residual).  Set ``C4_FIT_BUILD_TABLE=1`` to force the real (45 GB)
-# build instead of the analytic count (byte-identity self-check; NOT memory-safe).
-_ANALYTIC_LOOKUP_TABLE = os.environ.get("C4_FIT_BUILD_TABLE", "0") != "1"
+# The dense 8-bit MUL/DIV/MOD LOOKUP-TABLE width, computed ANALYTICALLY (no tensors).
+# The table was ONE hidden unit per NONZERO op(a,b) over all 256x256 pairs of
+# MUL/DIV/MOD, + 1 self-clear unit; MATERIALISING it was the ~45 GB / ~55 GB-RSS wall.
+# The dense table has been REMOVED entirely (the only MUL/DIV/MOD path is now the
+# efficient nibble_alu32 ALU), so the "lookup-table" strategy here is a pure
+# ACCOUNTING/tradeoff row: its width is the analytic count of the removed table (the
+# nonzero ``_MDM_FN`` entries, tensor-free) — nothing ever builds a table.  This is
+# always analytic now (there is no table to build), so the strategy is memory-safe
+# unconditionally.
+_ANALYTIC_LOOKUP_TABLE = True
 
 
 @lru_cache(maxsize=None)
 def _mdm_lookup_width() -> int:
-    """The exact ``compile_mdm_select`` width: nonzero op(a,b) entries over all
-    256x256 MUL/DIV/MOD pairs + 1 self-clear unit — counted with the builder's own
-    ``_MDM_FN``, tensor-free (this is what makes the lookup accounting memory-safe)."""
-    from .nibble_unified import _MDM_FN
-    keys = sum(1 for op in (isa.MUL, isa.DIV, isa.MOD)
-               for a in range(256) for b in range(256) if _MDM_FN[op](a, b) != 0)
-    return keys + 1
+    """The analytic width the REMOVED dense MUL/DIV/MOD table would have had: nonzero
+    op(a,b) entries over all 256x256 pairs + 1 self-clear unit (== 160465).  Sourced
+    from ``qwen_full_vm._MDM_TABLE_WOULD_BE`` (the documented analytic constant),
+    tensor-free — nothing builds a table."""
+    return Q._MDM_TABLE_WOULD_BE
 
 
 @lru_cache(maxsize=None)
@@ -283,25 +279,26 @@ def _raw_spec_sizes(code_size: int, memory: bool, cmp: bool, bitwise: bool,
 
     Precision is a POST-HOC projection (§account) and does NOT change the baked
     specs, so the three (P8/P16/P32) accountings of e.g. the 160465-wide MUL/DIV/MOD
-    lookup table share ONE build instead of rebuilding that 45 GB-class table 3x.
-    ``arch`` (head geometry) is folded in by the caller — it only rescales
-    ``hidden``/``intermediate`` floors, never the spec shapes — so it stays out of
-    the cache key.  This is the whole reason the CPU solver is fast + memory-safe:
-    only the distinct (subset x strategy) spec builds ever materialise, once.
+    lookup-table TRADEOFF ROW share one accounting.  ``arch`` (head geometry) is
+    folded in by the caller — it only rescales ``hidden``/``intermediate`` floors,
+    never the spec shapes — so it stays out of the cache key.  This is the whole
+    reason the CPU solver is fast + memory-safe: only the distinct (subset x strategy)
+    spec builds ever materialise, once.
 
-    MEMORY SAFETY: the muldiv LOOKUP-TABLE build alone peaks ~55 GB RSS.  When
-    ``_ANALYTIC_LOOKUP_TABLE`` (default), we account it from the memory-LIGHT
-    muldiv-OFF build (~4.5 GB) plus the analytic mdm width + 2 lookup layers, which
-    reproduces the real build's (width, D_used, n_stored) exactly."""
+    The dense MUL/DIV/MOD lookup table has been REMOVED (the ~45 GB wall is gone), so
+    the "lookup-table" strategy is a pure ANALYTIC tradeoff row: we account it from the
+    memory-LIGHT muldiv-OFF build (~4.5 GB) plus the analytic removed-table width
+    (``_mdm_lookup_width`` == 160465) + the 2 lookup blocks it would have added — i.e.
+    what a dense byte×byte table WOULD have cost.  Nothing builds a table."""
     lookup_table = muldiv and not efficient_alu
     if lookup_table and _ANALYTIC_LOOKUP_TABLE:
-        # memory-safe: size from the muldiv-OFF build + the analytic table width.
+        # analytic: size from the muldiv-OFF build + the removed-table's analytic width.
         sub = Subset(memory=memory, cmp=cmp, bitwise=bitwise, muldiv=False)
         QL = QwenFullLayout(code_size, sub)
         specs = _block_specs(QL.L, code_size, sub)
         base_w = max(int(s["W_up"].shape[0]) for _, s in specs)
-        inter = max(base_w, _mdm_lookup_width())    # mdm-select dominates
-        n_stored = len(specs) + 2                    # + mdm-expand + mdm-select
+        inter = max(base_w, _mdm_lookup_width())    # the removed mdm-select dominated
+        n_stored = len(specs) + 2                    # + mdm-expand + mdm-select (removed)
         return QL.D_used, inter, n_stored, n_stored
     sub = Subset(memory=memory, cmp=cmp, bitwise=bitwise, muldiv=muldiv)
     QL = QwenFullLayout(code_size, sub, efficient_alu=efficient_alu,

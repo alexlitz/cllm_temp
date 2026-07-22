@@ -235,19 +235,11 @@ def test_bitwise_family_pure_forward():
         assert trace == isa.interpret(code), (op, a, b, trace, isa.interpret(code))
 
 
-def test_muldiv_family_pure_forward():
-    """MUL/DIV/MOD (8-bit table) run pure-forward: the byte×byte lookup lives in the
-    mdm-select FFN, the result copied to AX by the opcode-gated expert. Includes the
-    div/mod-by-zero → 0 spec convention. (Slow build: the ~181k-unit table.)"""
-    model, L = build_pure_forward_model(code_size=20, include_memory=False,
-                                        include_cmp=False, include_bitwise=False,
-                                        include_muldiv=True)
-    cases = [("MUL", 6, 7), ("MUL", 20, 20), ("DIV", 84, 7), ("MOD", 85, 7),
-             ("DIV", 5, 0), ("MOD", 5, 0)]
-    for op, a, b in cases:
-        code = isa.assemble(_push_op(a, b, op))
-        trace = assert_no_python_compute(run_pure_forward, model, L, code)
-        assert trace == isa.interpret(code), (op, a, b, trace, isa.interpret(code))
+# NOTE: the 8-bit MUL/DIV/MOD LOOKUP-TABLE test (``test_muldiv_family_pure_forward``)
+# has been REMOVED — the dense 256x256x3 table is gone from the LEAN pure-forward
+# model.  MUL/DIV/MOD now run ONLY through the efficient nibble_alu32 ALU in the Qwen
+# build; they are covered byte-exact + 32-bit-exact by
+# ``test_qwen_full_vm::test_muldiv_through_qwen``.
 
 
 if __name__ == "__main__":

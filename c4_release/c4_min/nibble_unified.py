@@ -239,98 +239,15 @@ _MDM_FN = {
 }
 
 
-def mdm_housekeep_spec(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
-    """The scalar-lane MUL/DIV/MOD expert: AX_VAL = MDM_RES (the 8-bit table
-    result, computed by the mdm-expand/select blocks that run BEFORE dispatch on
-    the pre-op STK_VAL/AX_VAL operands), PC += 1, SP += 4. Written SET (clear old
-    AX, add MDM_RES). Gated by the MoE opcode blend (only fires for MUL/DIV/MOD)."""
-    ax, sp, pc, one = L.AX_VAL, L.SP_VAL, L.PC_VAL, L.ONE
-    spec = _empty_spec(dim, 4)
-    spec["W_up"][0, one] = S; spec["W_gate"][0, ax] = 1.0
-    spec["W_down"][ax, 0] += -1.0 / SILU_S            # clear old AX (SET)
-    spec["W_up"][1, one] = S; spec["W_gate"][1, L.MDM_RES] = 1.0
-    spec["W_down"][ax, 1] += 1.0 / SILU_S             # AX = MDM_RES
-    spec["W_up"][2, one] = S; spec["W_gate"][2, one] = 1.0
-    spec["W_down"][pc, 2] += 1.0 / SILU_S
-    spec["W_up"][3, one] = S; spec["W_gate"][3, one] = 4.0
-    spec["W_down"][sp, 3] += 1.0 / SILU_S
-    return spec
-
-
-# ---------------------------------------------------------------------------
-# 8-bit MUL/DIV/MOD as ONE bilinear table select on the byte lanes.
-#
-# The result byte lives in AX_VAL. We add per-op operand one-hot bands and a
-# select block whose units fire on ``A_OH[a] AND B_OH[b] AND OP_IS[op]`` writing
-# ``op(a,b)`` into AX_VAL. This is the same "table embedded in the FFN" the spec
-# uses for the nibble bitwise ops (§685), scaled to the 8-bit operand. The full
-# 32-bit MUL/DIV/MOD carry-round / long-division is iterative (UNFOLDABLE).
-# ---------------------------------------------------------------------------
-def extend_layout_for_mdm(L: NibbleVMLayout) -> NibbleVMLayout:
-    """Allocate 256-cell one-hot bands for the byte operands STK_VAL, AX_VAL."""
-    if getattr(L, "MDM_A_OH", None) is not None:
-        return L
-    L.MDM_A_OH = L._band("MDM_A_OH", 256)
-    L.MDM_B_OH = L._band("MDM_B_OH", 256)
-    while L._off % L.n_heads != 0:
-        L._scalar(f"_pad{L._off}")
-    L.D = L._off
-    return L
-
-
-def compile_mdm_expand(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
-    """One-hot expand STK_VAL -> MDM_A_OH, AX_VAL -> MDM_B_OH (0..255) via the
-    §510 triangular pulse. Shared relu bank per source (the fetch/decode
-    one-hot construction, widened to 256 cells)."""
-    thresholds = list(range(-1, 257))
-    n_thr = len(thresholds)
-    spec = _empty_spec(dim, 2 * n_thr)
-    for si, (src, oh_base) in enumerate([(L.STK_VAL, L.MDM_A_OH),
-                                         (L.AX_VAL, L.MDM_B_OH)]):
-        base = si * n_thr
-        tu = {t: base + j for j, t in enumerate(thresholds)}
-        for t, u in tu.items():
-            spec["W_up"][u, src] = RELU_S
-            spec["b_up"][u] = -RELU_S * t
-            spec["W_gate"][u, L.ONE] = 1.0
-        for a in range(256):
-            spec["W_down"][oh_base + a, tu[a - 1]] += 1.0 / RELU_S
-            spec["W_down"][oh_base + a, tu[a]] += -2.0 / RELU_S
-            spec["W_down"][oh_base + a, tu[a + 1]] += 1.0 / RELU_S
-    return spec
-
-
-def compile_mdm_select(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
-    """The 8-bit MUL/DIV/MOD table select for all three ops in ONE block: for
-    every op and every (a,b) with op(a,b)!=0, a hidden unit gated on
-    ``MDM_A_OH[a] AND MDM_B_OH[b] AND OP_IS[op]`` writes op(a,b) into MDM_RES.
-
-    Runs BEFORE dispatch (on the pre-op STK/AX byte operands, so AX is not yet
-    cleared). The housekeeping expert then copies MDM_RES -> AX. One self-clear
-    unit resets MDM_RES each step (SET). This is the honest cost of a byte x byte
-    lookup: ~O(3 * 256^2) hidden units (zero entries skipped). Reported
-    separately from the core VM param count; the 32-bit form does NOT fold."""
-    keys = []
-    for op in (isa.MUL, isa.DIV, isa.MOD):
-        fn = _MDM_FN[op]
-        for a in range(256):
-            for b in range(256):
-                v = fn(a, b)
-                if v != 0:
-                    keys.append((op, a, b, v))
-    spec = _empty_spec(dim, max(1, len(keys) + 1))
-    # unit 0: self-clear MDM_RES (SET each step).
-    spec["W_up"][0, L.ONE] = S
-    spec["W_gate"][0, L.MDM_RES] = 1.0
-    spec["W_down"][L.MDM_RES, 0] += -1.0 / SILU_S
-    for u, (op, a, b, v) in enumerate(keys, start=1):
-        spec["W_up"][u, L.MDM_A_OH + a] += S
-        spec["W_up"][u, L.MDM_B_OH + b] += S
-        spec["W_up"][u, L.OP_IS + op] += S
-        spec["b_up"][u] += -S * 2.5                   # AND of 3 windows
-        spec["W_gate"][u, L.ONE] = float(v)
-        spec["W_down"][L.MDM_RES, u] += 1.0 / SILU_HALF
-    return spec
+# NOTE: the 256x256x3 dense MUL/DIV/MOD LOOKUP TABLE has been REMOVED entirely.
+# ``mdm_housekeep_spec`` / ``extend_layout_for_mdm`` / ``compile_mdm_expand`` /
+# ``compile_mdm_select`` (the byte×byte table gadget that materialised the ~45 GB /
+# intermediate ~160465 fp32 wall) are GONE.  MUL/DIV/MOD now run ONLY through the
+# efficient ``nibble_alu32`` fp32 FFN gadgets (byte MUL schoolbook + base-16 long
+# division), used by the Qwen build in ``qwen_full_vm``.  ``_MDM_FN`` (the tiny
+# 3-lambda truth table above) is kept purely as the ANALYTIC reference the fit
+# configurator uses to count the removed table's width (tensor-free); nothing builds
+# a table from it any more.
 
 
 # ===========================================================================
@@ -355,10 +272,9 @@ class UnifiedLayout(NibbleVMLayout):
         self.IS_STORE = self._scalar("IS_STORE")
         self.IS_LOAD = self._scalar("IS_LOAD")
         self.IS_CHAR = self._scalar("IS_CHAR")
-        # operand one-hot bands + result lane for the folded 8-bit MUL/DIV/MOD.
-        self.MDM_A_OH = self._band("MDM_A_OH", 256)
-        self.MDM_B_OH = self._band("MDM_B_OH", 256)
-        self.MDM_RES = self._scalar("MDM_RES")           # byte result (pre-dispatch)
+        # (The 256x256 MUL/DIV/MOD lookup-table operand one-hot bands have been
+        # removed — the dense table is gone; MUL/DIV/MOD run only through the
+        # efficient nibble_alu32 ALU in the Qwen build.)
         while self._off % n_heads != 0:
             self._scalar(f"_pad{self._off}")
         self.D = self._off
@@ -460,23 +376,25 @@ def _bw_recompose_spec(L, dim, ops) -> Dict[str, torch.Tensor]:
 
 
 def build_unified_model(code_size: int = 8, n_heads: int = 4,
-                        include_mdm_table: bool = True,
                         include_bitwise: bool = True):
     """Assemble ONE persistent ``blogspec_model.Transformer`` = the whole C4 VM
-    step. Returns ``(model, L, meta)``.
+    step (base / cmp / bitwise + §Memory). Returns ``(model, L, meta)``.
 
     Block stack (each block = softmax1+ALiBi attention THEN SwiGLU FFN):
 
       block 0 : KV-MEMORY attention head (real §Memory CAM) + recompose FFN
       1 pc-fetch | 2 code-select (universal fetch) | 3 opcode-decode
-      [mdm-expand | mdm-select]  (8-bit MUL/DIV/MOD table, before dispatch)
       [bw-expand | bw-bit4 | bw-select | bw-recompose]  (OR/XOR/AND/SHL/SHR)
       DISPATCH : MoE (StandardMoEFFN, per-op experts) | branch-delta | fold
 
     Everything is in the model weights: universal fetch (code-as-data), in-model
-    MoE dispatch, softmax1-KV memory, the op FFN experts, and the bitwise/table
-    FFN sub-blocks. No functional gadget, no Python dispatch, no Python memory
-    dict on the compute path.
+    MoE dispatch, softmax1-KV memory, the op FFN experts, and the bitwise FFN
+    sub-blocks. No functional gadget, no Python dispatch, no Python memory dict on
+    the compute path.
+
+    NOTE: MUL/DIV/MOD are NOT baked into this lean model — the 256x256x3 lookup
+    table has been removed; the only MUL/DIV/MOD path is the efficient
+    ``nibble_alu32`` ALU used by the Qwen build (``qwen_full_vm``).
     """
     L = UnifiedLayout(code_size, n_heads=n_heads)
     if include_bitwise:
@@ -495,9 +413,7 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
         base_specs[op] = compile_ffn(rr, dim) if rr else _empty_spec(dim, 1)
     cmp_specs = {op: compile_cmp_expert(L, op, dim)
                  for op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE)}
-    mdm_specs = {op: mdm_housekeep_spec(L, dim)
-                 for op in (isa.MUL, isa.DIV, isa.MOD)}
-    all_specs = {**base_specs, **cmp_specs, **mdm_specs}
+    all_specs = {**base_specs, **cmp_specs}
     if include_bitwise:
         # bitwise experts do only PC+=1 ; SP+=4 (the result is written to the AX
         # nibble bands by the bw-select block, then bw-recompose -> AX_VAL).
@@ -523,9 +439,6 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
         ("code-select", compile_code_select(L, dim)),
         ("opcode-decode", compile_opcode_decode_ops(L, dim, expert_ops)),
     ]
-    if include_mdm_table:
-        pre_blocks += [("mdm-expand", compile_mdm_expand(L, dim)),
-                       ("mdm-select", compile_mdm_select(L, dim))]
     if include_bitwise:
         for name, spec in build_bitwise_blocks(L, dim):
             pre_blocks.append((name, spec))
@@ -567,7 +480,6 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
         "n_blocks": n_blocks, "hidden": hidden,
         "block_names": [name for name, _ in block_plan],
         "moe_experts": expert_ops,
-        "include_mdm_table": include_mdm_table,
     }
     return model, L, meta
 

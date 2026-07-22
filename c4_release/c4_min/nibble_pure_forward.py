@@ -38,7 +38,8 @@ next 30-token frame, closing the loop through the token stream.
             SEQUENCE, not a python variable.
   block 0 FFN + blocks 1..k  the baked VM STEP — recompose nibbles→scalar lanes,
             fetch@PC over the program (code-as-data), opcode decode, dispatch of
-            the op (IMM/LEA/PSH/ADD/SUB/JMP/BZ/BNZ + cmp/bitwise/muldiv experts),
+            the op (IMM/LEA/PSH/ADD/SUB/JMP/BZ/BNZ + cmp/bitwise experts; MUL/DIV/MOD
+            run via the efficient nibble_alu32 ALU in the Qwen build, not here),
             branch delta, mod-256 fold. Identical persistent weights to
             ``nibble_vm.build_step_model`` — the op RESULT is computed by these
             FFN weights inside ``model.forward``.
@@ -117,20 +118,20 @@ class PureForwardLayout(NibbleVMLayout):
 
     def __init__(self, code_size: int, n_heads: int,
                  include_memory: bool = True, include_cmp: bool = True,
-                 include_muldiv: bool = True):
+                 include_muldiv: bool = False):
         # SUBSET-AWARE ALLOCATION.  The optional op families each own a chunk of the
-        # residual (memory KV = 82 dims, cmp = 11 dims, the 8-bit MUL/DIV/MOD operand
-        # tables = 513 dims).  Historically all THREE were allocated UNCONDITIONALLY,
-        # so a base (arith/func-only) build carried ~600 dead residual dims — enough
-        # to push the compacted Qwen bake's hidden_size one head-dim over the stock
-        # 0.5B ceiling (903 -> ceil to 960 > 896).  The ``include_*`` flags (which the
-        # subset builders already thread) now GATE the allocation: a family whose block
-        # is not baked no longer reserves its band.  DEFAULTS ARE ALL-TRUE so every
-        # existing caller (``PureForwardCompleteLayout``, the deep
-        # ``build_pure_forward_model`` default, the tests) is BYTE-IDENTICAL — only a
-        # subset that explicitly drops a family shrinks.  A skipped family's band
-        # attributes stay ``None`` (so ``getattr(L, "MDM_A_OH", None) is not None``
-        # lazy-alloc guards in ``extend_layout_for_mdm`` still work).
+        # residual (memory KV = 82 dims, cmp = 11 dims).  The ``include_*`` flags (which
+        # the subset builders thread) GATE the allocation: a family whose block is not
+        # baked no longer reserves its band.  A skipped family's band attributes stay
+        # ``None``.
+        #
+        # ``include_muldiv`` (default False) is now a LEGACY no-op knob.  The 256x256x3
+        # MUL/DIV/MOD lookup table has been REMOVED entirely (it was the ~45 GB wall),
+        # so this LEAN blogspec model no longer carries a MUL/DIV/MOD path at all — the
+        # ONLY MUL/DIV/MOD implementation is the efficient ``nibble_alu32`` ALU used by
+        # the Qwen build (``qwen_full_vm``).  The flag is kept so existing callers that
+        # pass ``include_muldiv=`` keep working; the value no longer allocates any band
+        # or bakes any block (the table is gone).
         super().__init__(code_size, n_heads=n_heads)
         self._off = self.D
         self.ROLE = self._band("ROLE", N_ROLES)
@@ -161,12 +162,9 @@ class PureForwardLayout(NibbleVMLayout):
             self.MAG_LT = self._scalar("MAG_LT")     # UNSIGNED (STK<AX), raw ramp
             self.SGN_STK = self._scalar("SGN_STK")   # 1 iff STK bit31 set (negative)
             self.SGN_AX = self._scalar("SGN_AX")     # 1 iff AX  bit31 set (negative)
-        # 8-bit MUL/DIV/MOD table operand one-hots + result lane (the 513-dim wall).
-        self.MDM_A_OH = self.MDM_B_OH = self.MDM_RES = None
-        if include_muldiv:
-            self.MDM_A_OH = self._band("MDM_A_OH", 256)
-            self.MDM_B_OH = self._band("MDM_B_OH", 256)
-            self.MDM_RES = self._scalar("MDM_RES")   # byte result (pre-dispatch)
+        # (The 256x256x3 MUL/DIV/MOD lookup-table operand one-hot bands MDM_A_OH/
+        # MDM_B_OH/MDM_RES have been removed — the table is gone; MUL/DIV/MOD run only
+        # through the efficient nibble_alu32 ALU in the Qwen build.)
         while self._off % n_heads != 0:
             self._scalar(f"_pfpad{self._off}")
         self.D = self._off
@@ -636,22 +634,9 @@ def cmp_dispatch_rules(L) -> List:
     return rules
 
 
-MULDIV_OPS = [isa.MUL, isa.DIV, isa.MOD]
-
-
-def muldiv_dispatch_rules(L) -> List:
-    """MUL/DIV/MOD (8-bit table): AX := MDM_RES (the table result computed by the
-    mdm-expand/select blocks on the pre-op STK/AX bytes), PC += 1, SP += 4. SET AX.
-    The 8-bit table is the spec-sanctioned 'lookup table in the FFN'; the full
-    32-bit MUL/DIV/MOD are iterative and do NOT fold (see the deliverable doc)."""
-    from .dsl import FFNRule, LinearExpr
-    ax, sp, pc = L.AX_VAL, L.SP_VAL, L.PC_VAL
-    rules = []
-    for op in MULDIV_OPS:
-        rules.append(FFNRule([(L.OP_IS + op, 0.5, 1.5)], {
-            ax: LinearExpr.of(L.MDM_RES, 1.0) + LinearExpr.of(ax, -1.0),
-            pc: LinearExpr.c(1.0), sp: LinearExpr.c(4.0)}))
-    return rules
+# (``muldiv_dispatch_rules`` + the 8-bit MUL/DIV/MOD lookup table it dispatched have
+# been removed — the table is gone; MUL/DIV/MOD run only through the efficient
+# ``nibble_alu32`` ALU in the Qwen build.)
 
 
 BITWISE_OPS = [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
@@ -673,7 +658,7 @@ def bitwise_dispatch_rules(L) -> List:
 
 def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
                              include_cmp: bool = True, include_bitwise: bool = True,
-                             include_muldiv: bool = True):
+                             include_muldiv: bool = False):
     """Assemble the pure-forward VM: block-0 attention = the frame-ingest CAM, an
     optional §Memory KV head, and the SAME baked step FFN blocks as
     ``nibble_vm.build_step_model`` (recompose / fetch / code-select / decode /
@@ -688,9 +673,10 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
     stream by attention. Nothing is computed in Python.
     """
     n_heads = N_ROLES + (1 if include_memory else 0)
-    # SUBSET-AWARE: skip the memory / cmp / muldiv residual bands a build does not
-    # bake (a base arith/func build no longer carries the ~600 dead dims of the
-    # unused op families).  ``include_bitwise`` extends the layout separately below.
+    # SUBSET-AWARE: skip the memory / cmp residual bands a build does not bake (a base
+    # arith/func build no longer carries the dead dims of the unused op families).
+    # ``include_bitwise`` extends the layout separately below.  ``include_muldiv`` is a
+    # legacy no-op (the lookup table is gone; MUL/DIV/MOD is efficient-ALU only).
     L = PureForwardLayout(code_size, n_heads=n_heads,
                           include_memory=include_memory, include_cmp=include_cmp,
                           include_muldiv=include_muldiv)
@@ -731,10 +717,6 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
             ("cmp-compute", compile_cmp_compute(L, dim)),        # MAG/SGN primitives
             ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),  # signed CMP_GT/LT
         ]
-    if include_muldiv:
-        from .nibble_unified import compile_mdm_expand, compile_mdm_select
-        block_specs += [("mdm-expand", compile_mdm_expand(L, dim)),
-                        ("mdm-select", compile_mdm_select(L, dim))]     # MDM_RES = op(a,b)
     if include_bitwise:
         from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
         for name, spec in build_bitwise_blocks(L, dim):     # bw-expand/bit4/select
@@ -748,8 +730,6 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
         disp_rules = disp_rules + cmp_dispatch_rules(L)
     if include_bitwise:
         disp_rules = disp_rules + bitwise_dispatch_rules(L)     # PC+1 ; SP+4
-    if include_muldiv:
-        disp_rules = disp_rules + muldiv_dispatch_rules(L)      # AX = MDM_RES ; PC+1 ; SP+4
     block_specs += [
         ("dispatch", compile_ffn(disp_rules, dim)),
         ("branch-delta", compile_branch_delta(L, dim)),

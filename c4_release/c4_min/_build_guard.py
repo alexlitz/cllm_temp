@@ -4,12 +4,12 @@ Background
 ----------
 ``nibble_pure_forward_complete.build_pure_forward_complete_model`` (the DENSE
 complete model) pads EVERY one of its ~37/305 transformer blocks to the GLOBAL
-max hidden width — which is the ~160k-row 8-bit MUL/DIV/MOD select FFN
-(``nibble_unified.compile_mdm_select``: one hidden unit per non-zero ``op(a,b)``
-across MUL/DIV/MOD x 256 x 256).  So the dense build peaks at 54-108 GB RSS and
-has repeatedly starved the box into swap when a guard / vanilla / smoke test
-built it (e.g. ``test_exec_path_vanilla`` at ``code_size=16`` ballooned to
-105 GB).
+max hidden width — the widest FFN in the stack (the long-division / expand
+blocks).  So the dense build peaks at tens of GB RSS and has repeatedly starved
+the box into swap when a guard / vanilla / smoke test built it (e.g.
+``test_exec_path_vanilla`` at ``code_size=16`` ballooned to 105 GB).  (The old
+256x256 MUL/DIV/MOD lookup table — the historical ~160k-row wall — has since been
+removed entirely; MUL/DIV/MOD run through the efficient nibble_alu32 ALU.)
 
 This module gives tests + tools a memory-SAFE way to obtain the SAME
 byte-identical full-op-set interpreter, plus an RSS watchdog they can arm

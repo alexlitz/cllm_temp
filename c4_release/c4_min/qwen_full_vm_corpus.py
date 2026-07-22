@@ -121,7 +121,7 @@ def corpus() -> List[Case]:
     for op, a, b in [("SHL", 5, 3), ("SHL", 1, 7), ("SHR", 200, 2), ("SHR", 0xFF, 4)]:
         C.append(Case("shift", f"{op.lower()}_{a}_{b}", _bin(op, a, b), "bitwise"))
 
-    # -- mul/div/mod (muldiv subset; pruned FFN table, no bitwise -> leaner build) --
+    # -- mul/div/mod (muldiv subset; efficient nibble_alu32 ALU, no bitwise) --
     for op, a, b in [("MUL", 6, 7), ("MUL", 12, 12), ("MUL", 15, 17),
                      ("DIV", 84, 7), ("DIV", 100, 3), ("DIV", 9, 4),
                      ("MOD", 84, 5), ("MOD", 100, 7), ("MOD", 9, 4)]:
@@ -133,21 +133,6 @@ def corpus() -> List[Case]:
 _SUBSET = {"base": Q.SUBSET_BASE, "mem+cmp": Q.SUBSET_MEM_CMP,
            "bitwise": Q.SUBSET_BITWISE, "muldiv": Q.SUBSET_MULDIV,
            "full": Q.SUBSET_FULL}
-_MDM_OP = {"MUL": isa.MUL, "DIV": isa.DIV, "MOD": isa.MOD}
-
-
-def _mdm_keys_for(cases: List[Case]):
-    """The pruned MUL/DIV/MOD table keys the muldiv cases reach (op, a, b)."""
-    keys = []
-    for c in cases:
-        if c.subset in ("full", "muldiv"):
-            # binop shape: IMM a; PSH; IMM b; OP; HALT
-            opname = c.prog[3][0]
-            a = c.prog[0][1]
-            b = c.prog[2][1]
-            if opname in _MDM_OP:
-                keys.append((_MDM_OP[opname], a, b))
-    return keys
 
 
 def run(subsets: Optional[List[str]] = None, code_size: int = 24,
@@ -168,9 +153,9 @@ def run(subsets: Optional[List[str]] = None, code_size: int = 24,
     results = []
     fam_pass: Dict[str, List[int]] = {}
     for sub_name, subs_cases in by_subset.items():
-        mdm_keys = (_mdm_keys_for(subs_cases)
-                    if sub_name in ("full", "muldiv") else None)
-        vm = Q.build(code_size=code_size, subset=_SUBSET[sub_name], mdm_keys=mdm_keys)
+        # MUL/DIV/MOD run through the efficient nibble_alu32 ALU (the only muldiv
+        # path now that the 256x256 lookup table is gone) — Q.build defaults to it.
+        vm = Q.build(code_size=code_size, subset=_SUBSET[sub_name])
         for c in subs_cases:
             res = Q.run_program(vm, isa.assemble(c.prog), max_steps=48)
             ok = res["exact"]

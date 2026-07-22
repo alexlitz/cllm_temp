@@ -48,10 +48,15 @@ def test_accounting_matches_fit_report_efficient(mode, strat):
 
 
 def test_analytic_lookup_table_matches_the_real_table_width():
+    # The dense 256x256 MUL/DIV/MOD table has been REMOVED; its width survives ONLY as
+    # the documented ANALYTIC constant Q._MDM_TABLE_WOULD_BE (computed tensor-free from
+    # the tiny _MDM_FN truth table, never building a table).  The lookup-table strategy
+    # is a pure accounting/tradeoff row that reports that hypothetical width.
     from c4_min.nibble_unified import _MDM_FN
     real_keys = sum(1 for op in (isa.MUL, isa.DIV, isa.MOD)
                     for a in range(256) for b in range(256) if _MDM_FN[op](a, b) != 0)
-    assert S._mdm_lookup_width() == real_keys + 1 == 160465
+    assert Q._MDM_TABLE_WOULD_BE == real_keys + 1 == 160465
+    assert S._mdm_lookup_width() == Q._MDM_TABLE_WOULD_BE == 160465
     acc = S.account(S.FitConfig(ops=S.FULL, muldiv_strategy="lookup-table", precision=8))
     assert acc.intermediate == 160465
     assert acc.hidden == 1600 and acc.stored_layers == 17
