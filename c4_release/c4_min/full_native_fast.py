@@ -689,16 +689,22 @@ def logsink_integration_state() -> Dict[str, object]:
         "reference_full_corpus": "56,514/56,514 vs //,% and isa.interpret (per module docstring)",
         "algorithm": "1/b via softmax1 sink over 8 reserved log-key KV rows, then "
                      "a*(1/b) + MAGIC floor + ±1 correction (fp64)",
-        "depth": "~11 blocks vs 262-block long division (~24x shallower)",
-        "neural_block_wiring": "NOT YET wired into qwen_full_vm (no C4_DIV_LOGSINK "
-                               "block path in nibble_alu32).  The shipped fast VM "
-                               "uses recurrent_divmod base-16 long division as the "
-                               "native-but-deep divide (verified byte-exact).",
-        "next_step": "add compile_divmod_logsink_blocks(L,dim) to nibble_alu32 "
-                     "(8 reserved-KV log-key rows via a dedicated attention head → "
-                     "sink weight = 1/b; reuse the schoolbook MUL gadget for a*(1/b) "
-                     "+ MAGIC floor + ±1 correction) gated on C4_DIV_LOGSINK; then "
-                     "swap div_start block group for it in _block_specs.",
+        "depth": "the DIV/MOD block group drops from 262 (base-16 long division) to "
+                 "~60 (nibble_logsink_blocks): reciprocal sink + Newton + schoolbook "
+                 "correction + MSB nibble decompositions.  Full ISA build 291 -> ~125 "
+                 "applied layers.",
+        "neural_block_wiring": "WIRED and DEFAULT: qwen_full_vm.build(..., "
+                               "div_logsink=True) routes DIV/MOD through "
+                               "nibble_logsink_blocks (the ~14-stage algorithm as "
+                               "SwiGLU FFN blocks + a baked softmax1 reciprocal-sink "
+                               "attention head over 8 PRE-SEEDED reserved-KV log-key "
+                               "rows).  The whole model runs fp64 (reciprocal precision "
+                               "+ the q*b correction compare ~2^34).  div_logsink=False "
+                               "keeps the recurrent_divmod long-division fallback.",
+        "byte_exact": "reciprocal 56,514/56,514 (reference); the neural-block chain "
+                      "12,204/12,204 byte-exact vs Python //,% (standalone fp64 FFN "
+                      "sim incl b=1, b=2^32-1, b>a, exact k*b / k*b+b-1 boundaries, "
+                      "div-by-zero); byte-exact through the real Qwen forward.",
     }
 
 
