@@ -408,7 +408,20 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
     table has been removed; the only MUL/DIV/MOD path is the efficient
     ``nibble_alu32`` ALU used by the Qwen build (``qwen_full_vm``).
     """
+    # The unified build's CMP / bitwise / MUL-DIV lanes are single-scalar (NOT ported
+    # to the fp32 two-limb AX/STACK0 representation), so PIN single-scalar for the
+    # whole build+drive: the shared recompose/dispatch/branch/requant functions all
+    # key off ``vm_two_limb()``, and this keeps them consistent regardless of the
+    # ambient ``C4_VM_WIDTH32`` / ``C4_VM_TWO_LIMB`` flags.  The width-32 single-scalar
+    # substrate still runs in fp64 here (its historical behaviour).
+    from .nibble_vm import two_limb_mode
+    with two_limb_mode(False):
+        return _build_unified_model_impl(code_size, n_heads, include_bitwise)
+
+
+def _build_unified_model_impl(code_size, n_heads, include_bitwise):
     L = UnifiedLayout(code_size, n_heads=n_heads)
+    L.two_limb = False                       # STAMP: single-scalar (driver honours it)
     if include_bitwise:
         _bw.extend_layout_for_bitwise(L)
         while L._off % n_heads != 0:

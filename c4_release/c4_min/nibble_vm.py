@@ -105,6 +105,99 @@ def vm_width32() -> bool:
     return os.environ.get("C4_VM_WIDTH32", "0") == "1"
 
 
+# ---------------------------------------------------------------------------
+# TWO-LIMB fp32 dispatch (kills the fp64 requirement of the width-32 substrate).
+#
+# The width-32 substrate historically ran the whole step in **fp64** for ONE
+# reason: ``compile_nibble_to_scalar`` recomposed each register's 8 nibbles into a
+# single scalar ``VAL = Σ 16^j·nib_j`` and ``16^7 = 2^28 > 2^24`` overflows fp32's
+# integer precision, so the ~2^32-wide AX/STACK0 value lanes and the ADD/SUB
+# algebra on them lost bits below fp64.  (PC < 4096 and SP/BP ≈ 65536 are small and
+# fp32-fine — only the DATA values AX and STACK0 force fp64.)
+#
+# ``two_limb`` represents AX and STACK0 as TWO fp32-exact limbs instead:
+#   ``*_LO`` = low 4 nibbles (bits 0..15) — a scalar ≤ 2^16-1 < 2^24 (fp32-exact).
+#   ``*_HI`` = high 4 nibbles (bits 16..31) kept as their own small integer (≤ 2^16-1).
+# ADD/SUB add/sub the limbs with a carry/borrow across the 2^16 boundary realised
+# by fp32 relu steps at HALF-INTEGER thresholds (exact — the residue never crosses,
+# and both the ``RELU_S·lo`` threshold arithmetic AND the ramp stay < 2^24).  The
+# requant recomposes ``lo + 2^16·hi`` in Python int (exact) and wraps mod 2^32.
+# NOTHING is fp64 — ``model_dtype == torch.float32``.  ``two_limb=False`` keeps the
+# historical single-scalar fp64 path intact as a fallback.
+#
+# Both limbs are ALWAYS present (no data-dependent branch); for small values the
+# HI limb is simply 0, so it degenerates to the plain fp32 scalar path for free.
+# ---------------------------------------------------------------------------
+# Low-limb width: 4 nibbles = bits 0..15, so the carry/borrow boundary is 2^16.
+# BOTH limbs are then ≤ 2^16-1 = 65535 < 2^24, and — critically — the CARRY step's
+# ``RELU_S·lo`` threshold arithmetic (scale 200) stays at ≈ 200·2^16 = 2^23.6 where
+# the fp32 ulp (≈ 1) is far smaller than the 0.25-wide ramp height (RELU_S·W = 50),
+# so the carry saturates to EXACTLY 1.  A 5-nibble low limb (boundary 2^20) FAILS
+# here: ``RELU_S·2^20 ≈ 2^27.6`` has ulp ≈ 16, catastrophically cancelling the
+# narrow ramp (carry came out ≈ 0.96, not 1).  The high limb takes the remaining 4
+# nibbles (bits 16..31, ≤ 65535 < 2^24, also fp32-exact).
+_LO_NIBBLES = 4
+_LO_MOD = 1 << (4 * _LO_NIBBLES)     # 2^16  — low-limb / carry boundary
+_HI_NIBBLES = 8 - _LO_NIBBLES        # 4 nibbles (bits 16..31)
+_HI_MASK = (1 << (4 * _HI_NIBBLES)) - 1   # 0xFFFF
+
+
+# A build/run may pin the limb mode for the WHOLE compile+drive (the shared
+# recompose/dispatch/branch/requant functions all key off ``vm_two_limb()``, so a
+# consistent model needs ONE decision).  The larger unified build (``nibble_unified``)
+# has single-scalar CMP/MUL/DIV lanes NOT ported to two-limb, so it pins
+# single-scalar; the base ``build_step_model`` uses the flag default.  ``None`` = use
+# the ``vm_width32``/``C4_VM_TWO_LIMB`` default below.
+_TWO_LIMB_OVERRIDE: "bool | None" = None
+
+
+def vm_two_limb() -> bool:
+    """True iff the fp32 TWO-LIMB AX/STACK0 dispatch is enabled.
+
+    ON (default when width-32 is on) -> AX/STACK0 carried as ``*_LO``/``*_HI`` fp32
+    limbs, the whole model runs in **fp32** (no fp64).  An in-process build context
+    (``two_limb_mode``) can PIN it (the unified build pins single-scalar).  Explicit
+    env override: ``C4_VM_TWO_LIMB=1``/``0``.  When width-32 is OFF the value lanes
+    are 8-bit and two-limb is irrelevant (HI limb always 0), so it defaults OFF
+    there — byte-identical to the folded 8-bit corpus.  ``C4_VM_TWO_LIMB=0`` with
+    width-32 ON is the fp64 single-scalar FALLBACK (the historical path, intact)."""
+    if _TWO_LIMB_OVERRIDE is not None:
+        return _TWO_LIMB_OVERRIDE
+    env = os.environ.get("C4_VM_TWO_LIMB")
+    if env is not None:
+        return env == "1"
+    return vm_width32()          # default: two-limb whenever the substrate is 32-bit
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def two_limb_mode(enabled: bool):
+    """Pin ``vm_two_limb()`` to ``enabled`` for the whole build+drive inside the
+    ``with`` block (all shared recompose/dispatch/requant functions read it).  Used
+    so a model is compiled AND driven with ONE consistent limb decision."""
+    global _TWO_LIMB_OVERRIDE
+    prev = _TWO_LIMB_OVERRIDE
+    _TWO_LIMB_OVERRIDE = enabled
+    try:
+        yield
+    finally:
+        _TWO_LIMB_OVERRIDE = prev
+
+
+def _layout_two_limb(L) -> bool:
+    """Whether the model built for layout ``L`` is a two-limb (fp32) build.
+
+    A build STAMPS its decision onto the layout (``L.two_limb``) so the recurrent
+    driver / requant honour how the model was actually compiled, regardless of the
+    ambient flag at run time (the base ``build_step_model`` stamps the flag default;
+    the single-scalar unified build stamps ``False``).  Falls back to the ambient
+    flag for layouts built before this stamp existed."""
+    v = getattr(L, "two_limb", None)
+    return vm_two_limb() if v is None else bool(v)
+
+
 def _recompose_hi_nibbles() -> int:
     """Nibbles the recompose reads into a value lane: 8 (32-bit) when width-32,
     else 5 (the 8-bit-substrate foundation range)."""
@@ -175,6 +268,8 @@ def compile_nibble_to_scalar(L: NibbleVMLayout, dim: int,
     spec's canonical nibble state: the nibble band is canonical; the scalar lane
     is its per-step image.
     """
+    if vm_two_limb():
+        return _compile_nibble_to_scalar_two_limb(L, dim)
     if hi_nibbles is None:
         hi_nibbles = _recompose_hi_nibbles()
     # (nibble_base, value_lane, n_read): full registers read hi_nibbles; BP_LOW
@@ -194,6 +289,64 @@ def compile_nibble_to_scalar(L: NibbleVMLayout, dim: int,
             spec["W_up"][u, L.ONE] = S            # gate passes nibble via silu-id
             spec["W_gate"][u, reg_base + j] = 1.0
             spec["W_down"][val_lane, u] += (16.0 ** j) / SILU_S
+            u += 1
+    return spec
+
+
+def _compile_nibble_to_scalar_two_limb(L: NibbleVMLayout, dim: int
+                                       ) -> Dict[str, torch.Tensor]:
+    """TWO-LIMB recompose (fp32-exact 32-bit).  PC/SP/BP recompose to their full
+    single scalar (small, fp32-fine: PC < 4096, SP/BP ≈ 65536 at nibble 4).  The
+    DATA registers AX and STACK0 recompose to two limbs each:
+
+      ``*_LO = Σ_{j<4} 16^j·nib_j``          (bits 0..15, ≤ 2^16-1 < 2^24)
+      ``*_HI = Σ_{j=4,5,6,7} 16^(j-4)·nib_j``  (bits 16..31 as a 0..2^16-1 integer)
+
+    Every read is the same silu-identity nibble pass (``silu(S·nib)/S ≈ nib``,
+    exact for nibbles 0..15) the single-scalar recompose uses; the low limb caps
+    its coefficient at ``16^3`` and the high limb re-bases at ``16^0`` so BOTH lanes
+    stay ≤ 2^16-1 — every product and sum is an integer < 2^24, fp32-exact.  The
+    16^7 term that forced fp64 never appears.  SET (self-clears keep it idempotent
+    across recurrent steps)."""
+    # PC/SP/BP: full single scalar (≤ 5 nibbles is plenty; these are small).
+    scalar_pairs = [(L.PC, L.PC_VAL, 5), (L.SP, L.SP_VAL, 5), (L.BP, L.BP_VAL, 5),
+                    (L.BP, L.BP_LOW, 2)]
+    # AX/STACK0: (nibble_base, LO_lane, HI_lane).
+    limb_pairs = [(L.AX, L.AX_LO, L.AX_HI), (L.STACK0, L.STK_LO, L.STK_HI)]
+    n_units = (sum(n + 1 for _, _, n in scalar_pairs)
+               + sum((1 + _LO_NIBBLES) + (1 + (8 - _LO_NIBBLES)) for _ in limb_pairs))
+    spec = _empty_spec(dim, n_units)
+    u = 0
+    for reg_base, val_lane, n_read in scalar_pairs:
+        spec["W_up"][u, L.ONE] = S               # self-clear (SET)
+        spec["W_gate"][u, val_lane] = 1.0
+        spec["W_down"][val_lane, u] += -1.0 / SILU_S
+        u += 1
+        for j in range(n_read):
+            spec["W_up"][u, L.ONE] = S
+            spec["W_gate"][u, reg_base + j] = 1.0
+            spec["W_down"][val_lane, u] += (16.0 ** j) / SILU_S
+            u += 1
+    for reg_base, lo_lane, hi_lane in limb_pairs:
+        # LOW limb: nibbles 0.._LO_NIBBLES-1 at coeff 16^j (top 16^4 = 65536).
+        spec["W_up"][u, L.ONE] = S               # self-clear LO (SET)
+        spec["W_gate"][u, lo_lane] = 1.0
+        spec["W_down"][lo_lane, u] += -1.0 / SILU_S
+        u += 1
+        for j in range(_LO_NIBBLES):
+            spec["W_up"][u, L.ONE] = S
+            spec["W_gate"][u, reg_base + j] = 1.0
+            spec["W_down"][lo_lane, u] += (16.0 ** j) / SILU_S
+            u += 1
+        # HIGH limb: nibbles _LO_NIBBLES..7 RE-BASED to coeff 16^(j-_LO_NIBBLES).
+        spec["W_up"][u, L.ONE] = S               # self-clear HI (SET)
+        spec["W_gate"][u, hi_lane] = 1.0
+        spec["W_down"][hi_lane, u] += -1.0 / SILU_S
+        u += 1
+        for j in range(_LO_NIBBLES, 8):
+            spec["W_up"][u, L.ONE] = S
+            spec["W_gate"][u, reg_base + j] = 1.0
+            spec["W_down"][hi_lane, u] += (16.0 ** (j - _LO_NIBBLES)) / SILU_S
             u += 1
     return spec
 
@@ -224,7 +377,14 @@ def compile_pc_fetch(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
         spec["W_up"][j, L.PC_VAL] = RELU_S
         spec["b_up"][j] = -RELU_S * t
         spec["W_gate"][j, L.ONE] = 1.0
-    spec["W_up"][az_unit, L.AX_VAL] = -RELU_S
+    # AX_ZERO = (AX == 0).  Single-scalar: relu(1 - AX_VAL).  Two-limb: relu(1 -
+    # AX_LO - AX_HI) — both limbs are non-negative integers, so their SUM is 0 iff
+    # both are 0, and the sum (≤ 2·(2^16-1) < 2^24) is fp32-exact.
+    if vm_two_limb():
+        spec["W_up"][az_unit, L.AX_LO] = -RELU_S
+        spec["W_up"][az_unit, L.AX_HI] = -RELU_S
+    else:
+        spec["W_up"][az_unit, L.AX_VAL] = -RELU_S
     spec["b_up"][az_unit] = RELU_S * 1.0
     spec["W_gate"][az_unit, L.ONE] = 1.0
     for c, band in enumerate(clear_bands):
@@ -251,7 +411,12 @@ def compile_code_select(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
     ``universal.compile_code_select``.
     """
     n = L.code_size
-    n_units = 2 * n + 2
+    two_limb = vm_two_limb()
+    # OP_VAL select (n) + IMM select (n, or 2n split into LO/HI limbs) + self-clears.
+    imm_selects = [(L.CODE_IMM_LO, L.IMM_LO), (L.CODE_IMM_HI, L.IMM_HI)] if two_limb \
+        else [(L.CODE_IMM, L.IMM)]
+    clear_bands = [L.OP_VAL] + [dst for _, dst in imm_selects]
+    n_units = n + n * len(imm_selects) + len(clear_bands)
     spec = _empty_spec(dim, n_units)
 
     def product(u, sel_band, data_band, dst_band):
@@ -262,9 +427,10 @@ def compile_code_select(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
     u = 0
     for i in range(n):
         product(u, L.PC_IS[i], L.CODE_OP[i], L.OP_VAL); u += 1
-    for i in range(n):
-        product(u, L.PC_IS[i], L.CODE_IMM[i], L.IMM); u += 1
-    for band in (L.OP_VAL, L.IMM):               # self-clear (SET)
+    for code_band, dst in imm_selects:           # IMM (single scalar or LO/HI limbs)
+        for i in range(n):
+            product(u, L.PC_IS[i], code_band[i], dst); u += 1
+    for band in clear_bands:                      # self-clear (SET)
         spec["W_up"][u, L.ONE] = S
         spec["W_gate"][u, band] = 1.0
         spec["W_down"][band, u] += -1.0 / SILU_S
@@ -321,6 +487,8 @@ def base_dispatch_rules(L: NibbleVMLayout) -> List[FFNRule]:
     the new value). PC is updated as a DELTA (``+1`` sequential, ``IMM-PC`` for
     JMP; BZ/BNZ deferred to the bilinear ``compile_branch_delta``).
     """
+    if vm_two_limb():
+        return _base_dispatch_rules_two_limb(L)
     ax, sp, bp, stk, pc = L.AX_VAL, L.SP_VAL, L.BP_VAL, L.STK_VAL, L.PC_VAL
     IMM = L.IMM
     # Width-32: NO non-negativity shift — the per-byte requant wraps a negative
@@ -368,6 +536,135 @@ def base_dispatch_rules(L: NibbleVMLayout) -> List[FFNRule]:
     return rules
 
 
+def _base_dispatch_rules_two_limb(L: NibbleVMLayout) -> List[FFNRule]:
+    """TWO-LIMB base dispatch (fp32-exact 32-bit).  The DATA registers AX and
+    STACK0 are carried as ``*_LO``/``*_HI`` fp32 limbs; every op writes the RAW
+    per-limb sum/difference and the CARRY/BORROW across the 2^16 limb boundary is
+    normalised by the separate ``compile_limb_normalize`` block that runs right
+    after dispatch (the non-linear relu carry step can't live in an additive
+    ``LinearExpr``).  PC/SP/BP stay single scalars (small).  ``IMM_LO/IMM_HI`` are
+    the fetched immediate's two limbs (value literals); PC-target immediates
+    (JMP/branch) are small and live entirely in ``IMM_LO``.
+
+    SET semantics per limb (the lane holds the OLD value):
+      IMM: ``AX_LO = IMM_LO``  == write ``IMM_LO - AX_LO``     (replace)
+      ADD: ``AX_LO = AX_LO + STK_LO`` == write ``+STK_LO``     (accumulate)
+      SUB: ``AX_LO = STK_LO - AX_LO`` == write ``STK_LO - 2·AX_LO``  (a+ (s-2a)=s-a)
+    All limb sums/diffs land in ``[-2^16, 2^17)`` (fp32-exact); normalize folds them
+    back into ``[0, 2^16)`` + the carried high limb.
+    """
+    ax_lo, ax_hi = L.AX_LO, L.AX_HI
+    stk_lo, stk_hi = L.STK_LO, L.STK_HI
+    sp, bp, pc = L.SP_VAL, L.BP_VAL, L.PC_VAL
+    imm_lo, imm_hi = L.IMM_LO, L.IMM_HI
+
+    def G(op):
+        return [(L.OP_IS + op, 0.5, 1.5)]
+
+    rules: List[FFNRule] = []
+    # IMM: AX = imm  (both limbs replaced) ; PC += 1
+    rules.append(FFNRule(G(isa.IMM), {
+        ax_lo: LinearExpr.of(imm_lo, 1.0) + LinearExpr.of(ax_lo, -1.0),
+        ax_hi: LinearExpr.of(imm_hi, 1.0) + LinearExpr.of(ax_hi, -1.0),
+        pc: LinearExpr.c(1.0)}))
+    # LEA: AX = BP + imm.  BP is a small full scalar (≈ 0x10000); it lands in the LOW
+    # limb (BP=2^16 sits right at the boundary, so normalize carries the bit-16 up),
+    # IMM's high limb passes through, and normalize folds LO->HI.  (SET: replace the
+    # old AX limbs, then add BP + IMM.)
+    rules.append(FFNRule(G(isa.LEA), {
+        ax_lo: LinearExpr.of(bp, 1.0) + LinearExpr.of(imm_lo, 1.0) + LinearExpr.of(ax_lo, -1.0),
+        ax_hi: LinearExpr.of(imm_hi, 1.0) + LinearExpr.of(ax_hi, -1.0),
+        pc: LinearExpr.c(1.0)}))
+    # PSH: STACK0 = AX  (copy both limbs) ; SP -= 4 ; PC += 1
+    rules.append(FFNRule(G(isa.PSH), {
+        stk_lo: LinearExpr.of(ax_lo, 1.0) + LinearExpr.of(stk_lo, -1.0),
+        stk_hi: LinearExpr.of(ax_hi, 1.0) + LinearExpr.of(stk_hi, -1.0),
+        sp: LinearExpr.c(-4.0), pc: LinearExpr.c(1.0)}))
+    # ADD: AX = STACK0 + AX  (per-limb accumulate; normalize carries) ; SP += 4 ; PC += 1
+    rules.append(FFNRule(G(isa.ADD), {
+        ax_lo: LinearExpr.of(stk_lo, 1.0), ax_hi: LinearExpr.of(stk_hi, 1.0),
+        sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}))
+    # SUB: AX = STACK0 - AX  (per-limb, ax+  (stk-2ax) = stk-ax; normalize borrows) ;
+    # SP += 4 ; PC += 1.  No 2^32 shift — the two's-complement wrap is done by the
+    # high-limb borrow chain + the requant mod-2^32, so no fp-inexact big constant.
+    rules.append(FFNRule(G(isa.SUB), {
+        ax_lo: LinearExpr.of(stk_lo, 1.0) + LinearExpr.of(ax_lo, -2.0),
+        ax_hi: LinearExpr.of(stk_hi, 1.0) + LinearExpr.of(ax_hi, -2.0),
+        sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}))
+    # JMP: PC = imm  (PC target is small -> IMM_LO) == PC += (IMM_LO - PC)
+    rules.append(FFNRule(G(isa.JMP), {
+        pc: LinearExpr.of(imm_lo, 1.0) + LinearExpr.of(pc, -1.0)}))
+    # BZ / BNZ: PC update deferred to compile_branch_delta (bilinear). No write.
+    rules.append(FFNRule(G(isa.BZ), {}))
+    rules.append(FFNRule(G(isa.BNZ), {}))
+    # HALT / EXIT: latch HALTED, freeze PC.
+    rules.append(FFNRule(G(isa.HALT), {L.HALTED: LinearExpr.c(1.0)}))
+    return rules
+
+
+def compile_limb_normalize(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
+    """Normalise the two-limb AX after dispatch: fold the raw LOW-limb sum/diff back
+    into ``[0, 2^16)`` and propagate the CARRY / BORROW into the HIGH limb.
+
+    After dispatch the LOW limb holds an INTEGER + a small silu-identity residue
+    (|res| < 0.5) in ``[-2^16, 2^17)``:
+      * ADD / LEA  -> ``lo ∈ [0, 2^17)``; if the integer part ``≥ 2^16`` CARRY 1 up.
+      * SUB        -> ``lo ∈ (-2^16, 2^16)``; if the integer part ``< 0`` BORROW 1 down.
+    The carry/borrow are SHARP UNIT STEPS placed at HALF-INTEGER thresholds (so the
+    ±0.5 residue never crosses the boundary), realised as the difference of two
+    ReLU-via-scale units divided by the ramp width:
+
+        carry  = [lo ≥ 2^16-0.5]  (ramp 2^16-0.625 .. 2^16-0.375)   lo -= 2^16·carry ; hi += carry
+        borrow = [lo ≤ -0.5]      (ramp on -lo, 0.375 .. 0.625)      lo += 2^16·borrow ; hi -= borrow
+
+    The ramp ENDPOINTS are exact multiples of 0.125 = 2^-3, and the CARRY step's
+    ``RELU_S·lo`` threshold arithmetic stays at ≈ 200·2^16 = 2^23.6 where the fp32 ulp
+    (≈ 1) is far below the ramp height (RELU_S·W = 50), so the step is fp32-exact and
+    saturates to EXACTLY 1.  (A 5-nibble low limb — boundary 2^20 — FAILS: ``RELU_S·
+    2^20 ≈ 2^27.6`` has ulp ≈ 16, cancelling the narrow ramp → carry ≈ 0.96.)  A plain
+    integer-threshold ``relu(x-(t-1))-relu(x-t)`` step would also fail: dispatch leaves
+    a fractional residue and that ramp returns the *fractional* residue itself (not 0)
+    near the boundary.  The HIGH limb is left in ``(-2^16, 2^17)`` (a single carry/
+    borrow can push it just past its 4-nibble range or negative); the requant
+    reconstructs ``lo + 2^16·hi`` in Python int and wraps mod 2^32, so the high-limb
+    overflow / underflow IS the 32-bit two's-complement wrap.  Only AX is normalised
+    (STACK0 is only ever COPIED from an already-normal AX)."""
+    M = _LO_MOD                                   # 2^16
+    W = 0.25                                       # ramp width (2 fp32 ulps at 2^16)
+    lo, hi = L.AX_LO, L.AX_HI
+    spec = _empty_spec(dim, 4)
+
+    def sharp_step(u, band, sign, thr):
+        # step ≈ [sign·band ≥ thr], a sharp ramp of width W centred on thr; endpoints
+        # thr∓W/2 are exact fp32 multiples of 0.125.  Two hidden units at u, u+1;
+        # step = (relu(z-(thr-W/2)) - relu(z-(thr+W/2)))/W with z = sign·band.
+        a, b = thr - W / 2, thr + W / 2
+        spec["W_up"][u, band] = RELU_S * sign
+        spec["b_up"][u] = -RELU_S * a
+        spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_up"][u + 1, band] = RELU_S * sign
+        spec["b_up"][u + 1] = -RELU_S * b
+        spec["W_gate"][u + 1, L.ONE] = 1.0
+        return u + 2
+
+    # CARRY step [lo ≥ M-0.5]: units 0,1.  carry = (relu(...) - relu(...))/(RELU_S·W).
+    sharp_step(0, lo, +1.0, M - 0.5)
+    # BORROW step [-lo ≥ 0.5] i.e. lo ≤ -0.5: units 2,3.
+    sharp_step(2, lo, -1.0, 0.5)
+
+    # lo -= M·carry ; hi += carry     (carry = (u0 - u1)/(RELU_S·W))
+    spec["W_down"][lo, 0] += -M / (RELU_S * W)
+    spec["W_down"][lo, 1] += +M / (RELU_S * W)
+    spec["W_down"][hi, 0] += +1.0 / (RELU_S * W)
+    spec["W_down"][hi, 1] += -1.0 / (RELU_S * W)
+    # lo += M·borrow ; hi -= borrow   (borrow = (u2 - u3)/(RELU_S·W))
+    spec["W_down"][lo, 2] += +M / (RELU_S * W)
+    spec["W_down"][lo, 3] += -M / (RELU_S * W)
+    spec["W_down"][hi, 2] += -1.0 / (RELU_S * W)
+    spec["W_down"][hi, 3] += +1.0 / (RELU_S * W)
+    return spec
+
+
 def compile_branch_delta(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]:
     """The BILINEAR PC update for BZ / BNZ (runs after dispatch; PC untouched).
 
@@ -380,7 +677,10 @@ def compile_branch_delta(L: NibbleVMLayout, dim: int) -> Dict[str, torch.Tensor]
     the decoded op-hot AND the boolean both hold (each 0/1); ``gate`` carries the
     delta value. Ported from ``universal.compile_branch_delta``.
     """
-    pc, imm, azero, one = L.PC_VAL, L.IMM, L.AX_ZERO, L.ONE
+    # The branch TARGET is a small PC index (< code_size).  Single-scalar: the full
+    # IMM lane.  Two-limb: it lives entirely in IMM_LO (IMM_HI == 0 for a PC target).
+    imm = L.IMM_LO if vm_two_limb() else L.IMM
+    pc, azero, one = L.PC_VAL, L.AX_ZERO, L.ONE
     BZ, BNZ = L.OP_IS + isa.BZ, L.OP_IS + isa.BNZ
     spec = _empty_spec(dim, 4)
     BIG = 200.0
@@ -455,6 +755,7 @@ def build_step_model(code_size: int, n_heads: int = 4):
     the canonical nibble bands. Returns ``(model, L)``.
     """
     L = NibbleVMLayout(code_size, n_heads=n_heads)
+    L.two_limb = vm_two_limb()                # STAMP the build decision (driver honours it)
     dim = L.D
     ffn_specs = [
         compile_nibble_to_scalar(L, dim),
@@ -462,8 +763,14 @@ def build_step_model(code_size: int, n_heads: int = 4):
         compile_code_select(L, dim),
         compile_opcode_decode(L, dim),
         compile_ffn(base_dispatch_rules(L), dim),
+    ]
+    if L.two_limb:
+        # normalise the two-limb AX (carry/borrow across the 2^16 boundary) BEFORE
+        # the branch/fold; STACK0 is only ever copied from an already-normal AX.
+        ffn_specs.append(compile_limb_normalize(L, dim))
+    ffn_specs += [
         compile_branch_delta(L, dim),
-        compile_fold(L.AX_VAL, L.ONE, dim),        # width-aware modulus (256 / 2^32)
+        compile_fold(L.AX_VAL, L.ONE, dim),        # width-aware modulus (256 / 2^32 / two-limb no-op)
     ]
     n_blocks = len(ffn_specs)
     hidden = max(f["W_up"].shape[0] for f in ffn_specs)
@@ -484,11 +791,15 @@ def build_step_model(code_size: int, n_heads: int = 4):
 
 
 def maybe_cast_model_for_width(model) -> None:
-    """Cast the model to fp64 when the full-32-bit substrate is on, so the 16^7
-    recompose, the ADD/SUB algebra, and the requant integer snap are all exact to
-    2^32. No-op (fp32) under the 8-bit substrate — byte-identical to the folded
-    corpus."""
-    if vm_width32():
+    """Cast the model to fp64 ONLY on the single-scalar width-32 FALLBACK path.
+
+    The single-scalar width-32 substrate needs fp64 because its ``16^7`` recompose
+    + ADD/SUB algebra exceed fp32's 2^24 integer precision.  The TWO-LIMB path
+    (``vm_two_limb``, the default when width-32 is on) carries AX/STACK0 as two
+    fp32-exact limbs, so it stays **fp32** — this cast is a NO-OP there and no fp64
+    appears anywhere.  Also a no-op under the 8-bit substrate (byte-identical to the
+    folded corpus)."""
+    if vm_width32() and not vm_two_limb():
         model.double()
 
 
@@ -531,10 +842,13 @@ def load_program(model, L: NibbleVMLayout, code: List[isa.Instr]) -> torch.Tenso
     PC=AX=0, SP=BP=0x10000, written as NIBBLE bands. ONE=1.
     """
     assert len(code) <= L.code_size, f"{len(code)} slots > code_size {L.code_size}"
-    # width-32 runs the whole step in fp64 so the recompose (16^7), the SUB +2^32
-    # non-negativity shift, and the per-byte requant are all exact to the full
-    # 2^32; the 8-bit substrate stays fp32 (byte-identical to the folded corpus).
-    dtype = torch.float64 if vm_width32() else torch.float32
+    # The TWO-LIMB width-32 path runs the whole step in fp32 (AX/STACK0 carried as
+    # two fp32-exact limbs, immediates stored as split limbs).  The single-scalar
+    # width-32 FALLBACK runs in fp64 (its 16^7 recompose + ADD/SUB algebra exceed
+    # fp32's 2^24).  The 8-bit substrate stays fp32 (byte-identical to the folded
+    # corpus).
+    two_limb = _layout_two_limb(L)
+    dtype = torch.float64 if (vm_width32() and not two_limb) else torch.float32
     state = torch.zeros(L.D, dtype=dtype)
     state[L.ONE] = 1.0
     _write_reg_nibbles(state, L.PC, 0)
@@ -544,7 +858,13 @@ def load_program(model, L: NibbleVMLayout, code: List[isa.Instr]) -> torch.Tenso
     _write_reg_nibbles(state, L.STACK0, 0)
     for i, ins in enumerate(code):
         state[L.CODE_OP[i]] = float(ins.op)
-        state[L.CODE_IMM[i]] = float(ins.imm)
+        if two_limb:
+            # store the immediate as two fp32-exact limbs (LOW/HIGH 4 nibbles each).
+            imm = int(ins.imm) & 0xFFFFFFFF
+            state[L.CODE_IMM_LO[i]] = float(imm & (_LO_MOD - 1))
+            state[L.CODE_IMM_HI[i]] = float((imm // _LO_MOD) & _HI_MASK)
+        else:
+            state[L.CODE_IMM[i]] = float(ins.imm)
     return state
 
 
@@ -568,28 +888,60 @@ def _emit_and_reembed(state: torch.Tensor, L: NibbleVMLayout) -> torch.Tensor:
     this writes it back into the spec's canonical nibble representation while
     annihilating all fp residue via the argmax.
     """
+    two_limb = _layout_two_limb(L)
     new = torch.zeros_like(state)
     new[L.ONE] = 1.0
     # carry the immutable program-in-data bands untouched.
     for i in range(L.code_size):
         new[L.CODE_OP[i]] = state[L.CODE_OP[i]]
-        new[L.CODE_IMM[i]] = state[L.CODE_IMM[i]]
+        if two_limb:
+            new[L.CODE_IMM_LO[i]] = state[L.CODE_IMM_LO[i]]
+            new[L.CODE_IMM_HI[i]] = state[L.CODE_IMM_HI[i]]
+        else:
+            new[L.CODE_IMM[i]] = state[L.CODE_IMM[i]]
     new[L.HALTED] = state[L.HALTED]
-    lanes = [(L.PC, L.PC_VAL), (L.AX, L.AX_VAL), (L.SP, L.SP_VAL),
-             (L.BP, L.BP_VAL), (L.STACK0, L.STK_VAL)]
-    for reg_base, val_lane in lanes:
-        # SNAP the lane to an exact integer via the LM-head argmax (the vanilla
-        # re-quantiser — annihilates the O(1e-6) SwiGLU residue; NO round), then
+    # (nibble_base, snapped 32-bit value): AX/STACK0 are reconstructed from their
+    # two fp32 limbs (lo + 2^16·hi, exact in Python int) under two-limb; PC/SP/BP
+    # are single scalars.  All snapped to an exact integer and re-embedded as bytes.
+    if two_limb:
+        lanes = [(L.PC, _snap_lane(state[L.PC_VAL])),
+                 (L.AX, _snap_two_limb(state[L.AX_LO], state[L.AX_HI])),
+                 (L.SP, _snap_lane(state[L.SP_VAL])),
+                 (L.BP, _snap_lane(state[L.BP_VAL])),
+                 (L.STACK0, _snap_two_limb(state[L.STK_LO], state[L.STK_HI]))]
+    else:
+        lanes = [(L.PC, _snap_lane(state[L.PC_VAL])), (L.AX, _snap_lane(state[L.AX_VAL])),
+                 (L.SP, _snap_lane(state[L.SP_VAL])), (L.BP, _snap_lane(state[L.BP_VAL])),
+                 (L.STACK0, _snap_lane(state[L.STK_VAL]))]
+    for reg_base, value in lanes:
         # EMIT its 4 little-endian byte tokens and RE-EMBED each byte's two nibbles
         # into the register's nibble band. The byte split uses the spec's own
         # floor/mod (§Efficient Floor), not python rounding.
-        value = _snap_lane(state[val_lane])
         for bi in range(4):
             byte = (value >> (8 * bi)) & 0xFF          # spec floor/mod byte split
             lo, hi = V.nibbles_of_byte(byte)
             new[reg_base + 2 * bi + 0] = float(lo)     # RE-EMBED (byte -> nibbles)
             new[reg_base + 2 * bi + 1] = float(hi)
     return new
+
+
+def _snap_two_limb(lo_lane: torch.Tensor, hi_lane: torch.Tensor) -> int:
+    """Reconstruct the exact unsigned 32-bit word from the two fp32 limbs.
+
+    Each limb is snapped to its nearest integer (the round-free ``floor(x+½)``
+    LM-head requant — annihilating the O(1e-6) SwiGLU residue) in fp32, where each
+    limb is < 2^24 and therefore fp32-exact.  The full value ``lo + 2^16·hi`` is
+    assembled in Python int (exact, no float) and reduced to the two's-complement
+    32-bit word ``& 0xFFFFFFFF`` — so a SUB borrow chain (negative high limb) or an
+    ADD carry chain (high limb past its 4-nibble range) wraps correctly and a large
+    loop counter never aliases to zero.  NO ``round`` (the AST guard forbids it);
+    NO fp64."""
+    import math
+    lo = float(lo_lane)
+    hi = float(hi_lane)
+    lo_i = math.floor(lo + 0.5) if lo >= 0 else -math.floor(-lo + 0.5)
+    hi_i = math.floor(hi + 0.5) if hi >= 0 else -math.floor(-hi + 0.5)
+    return (lo_i + _LO_MOD * hi_i) & 0xFFFFFFFF
 
 
 # The value vocabulary: token v decodes to the scalar integer v. Sized to cover
@@ -665,10 +1017,12 @@ def run_program(model, L: NibbleVMLayout, code: List[isa.Instr],
             x = blk(x)
         out = x[0, 0]
         halted = float(out[L.HALTED]) > 0.5
-        # decode this step's registers from the scalar next-state lanes.
-        dec = {name: _decode_lane(out, lane)
-               for name, lane in (("pc", L.PC_VAL), ("ax", L.AX_VAL),
-                                  ("sp", L.SP_VAL), ("bp", L.BP_VAL))}
+        # decode this step's registers from the scalar next-state lanes (AX is
+        # reconstructed from its two limbs under the fp32 two-limb path).
+        ax_val = (_snap_two_limb(out[L.AX_LO], out[L.AX_HI]) if _layout_two_limb(L)
+                  else _decode_lane(out, L.AX_VAL))
+        dec = {"pc": _decode_lane(out, L.PC_VAL), "ax": ax_val,
+               "sp": _decode_lane(out, L.SP_VAL), "bp": _decode_lane(out, L.BP_VAL)}
         frame = V.build_step_frame(dec["pc"], dec["ax"], dec["sp"], dec["bp"])
         tokens += frame
         frames.append({**dec, "op": _op_name_at(out, code, L)})
