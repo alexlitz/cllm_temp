@@ -597,8 +597,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--block-steps", type=int, default=256,
                     help="K = VM steps verified per batched forward (cranked; the "
                          "OOM-backoff halves it if a span overflows VRAM).")
-    ap.add_argument("--block-moe", action="store_true",
-                    help="skip the divmod block span on non-divmod spans.")
+    ap.add_argument("--block-moe", action=argparse.BooleanOptionalAction, default=True,
+                    help="block-sparse conditional dispatch: skip inert (non-active-op) "
+                         "block spans per step (DEFAULT ON; --no-block-moe for dense).")
     ap.add_argument("--naive-steps", type=int, default=50,
                     help="how many naive steps to time for the per-step baseline.")
     ap.add_argument("--prune-interval", type=int, default=60)
