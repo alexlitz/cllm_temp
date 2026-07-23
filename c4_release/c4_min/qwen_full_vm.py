@@ -164,7 +164,8 @@ class QwenFullLayout:
 
     def __init__(self, code_size: int, subset: "Subset",
                  efficient_alu: bool = True, recurrent_divmod: bool = False,
-                 code_from_memory: bool = False, shift_via_mul: bool = True):
+                 code_from_memory: bool = False, shift_via_mul: bool = True,
+                 div_logsink: bool = True):
         # Build the pure-forward layout (all VM compute bands live here).  MUL/DIV/MOD
         # ALWAYS run through the ``nibble_alu32`` fp32 FFN gadgets (the 256x256x3
         # lookup table has been removed entirely), so the layout carries the ALU32
@@ -189,10 +190,21 @@ class QwenFullLayout:
         # the RESOLVED flag the block builder reads.
         self.shift_via_mul = bool(shift_via_mul and subset.muldiv and subset.bitwise
                                   and efficient_alu)
+        # LOG-SINK DIVISION (default): DIV/MOD route through the ~14-block reciprocal
+        # sink + schoolbook-correction gadgets (nibble_logsink_blocks) instead of the
+        # 262-block base-16 recurrent long division.  div_logsink=False keeps the
+        # long-division fallback (recurrent or unrolled), byte-exact.
+        self.div_logsink = div_logsink and efficient_alu and subset.muldiv
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
             _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod,
                                        shift_via_mul=self.shift_via_mul)
+            if self.div_logsink:
+                # log-sink writes the quotient/remainder into the ALU32 DIV_RES/MOD_RES
+                # bands (which the ax-mux reads), so no result-routing change is needed.
+                from . import nibble_logsink_blocks as _LS
+                _LS.extend_layout_for_logsink(L, div_res=L.ALU32.DIV_RES,
+                                              mod_res=L.ALU32.MOD_RES)
         # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
         # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
         # bands.  Off (default) leaves the layout byte-identical, so an existing
@@ -276,14 +288,26 @@ class QwenFullVM:
     n_applied: int = 0            # layers APPLIED per forward (>= n_layers if recurrent)
     code_from_memory: bool = False  # program in KV §Memory (fetch@PC), not a baked table
     shift_via_mul: bool = False   # SHL/SHR via native MUL/DIV (x*2^n / x//2^n), no barrel
+    div_logsink: bool = False     # DIV/MOD via the log-sink reciprocal (fp64), not long div
+    model_dtype: object = torch.float32   # fp64 when div_logsink is active
 
 
 def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           arch: QwenArch = QWEN2_5_ARCH, K: float = NORM_K,
           efficient_alu: bool = True,
           recurrent_divmod: bool = False, pad_to_stock: bool = False,
-          code_from_memory: bool = False, shift_via_mul: bool = True) -> QwenFullVM:
+          code_from_memory: bool = False, shift_via_mul: bool = True,
+          div_logsink: bool = True) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
+
+    ``div_logsink`` (default ``True``): DIV/MOD route through the ~14-block LOG-SINK
+    divide (``nibble_logsink_blocks``: a softmax1 reciprocal sink ``1/b`` over 8
+    pre-seeded reserved-KV log-key rows, then ``a·(1/b)+MAGIC`` floor + schoolbook
+    ±1 correction) INSTEAD of the 262-block base-16 long division — shrinking the full
+    ISA build from 291 to ~40 applied layers.  The log-sink blocks (and the model that
+    runs them) are fp64 (the reciprocal + the ``q·b`` correction compare need doubles).
+    ``div_logsink=False`` keeps the ``recurrent_divmod`` / unrolled long-division path
+    (fp32, byte-exact) as the fallback.
 
     ``efficient_alu`` (default True) bakes MUL/DIV/MOD as the ``nibble_alu32``
     spec-faithful 32-bit fp32 FFN gadgets (byte MUL schoolbook + base-16 long
@@ -311,13 +335,24 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     QL = QwenFullLayout(code_size, subset, efficient_alu=efficient_alu,
                         recurrent_divmod=recurrent_divmod,
                         code_from_memory=code_from_memory,
-                        shift_via_mul=shift_via_mul)
+                        shift_via_mul=shift_via_mul, div_logsink=div_logsink)
     L = QL.L
     block_specs = _block_specs(L, code_size, subset,
                               efficient_alu=efficient_alu,
                               recurrent_divmod=recurrent_divmod,
                               code_from_memory=code_from_memory,
-                              shift_via_mul=QL.shift_via_mul)
+                              shift_via_mul=QL.shift_via_mul,
+                              div_logsink=QL.div_logsink)
+    # The log-sink divide (reciprocal softmax1 precision + the q·b correction compare
+    # ~2^34) requires fp64 — the whole model runs in doubles when it is active.
+    model_dtype = torch.float64 if QL.div_logsink else torch.float32
+    # The log-sink div carries QUOTIENT-SCALE scalars (qf, q·b up to ~2^34) in the
+    # residual; the RMSNorm compensator must DOMINATE them (1-r_norm ~ v^2/2K^2 < 0.5),
+    # so raise K to K_DIV=1e15 for the div_logsink model.  SP/BP=65536 and the nibbles
+    # are unperturbed (r~1) and the value-argmax decode reads the preserved scalar.
+    if QL.div_logsink:
+        from .nibble_logsink_blocks import K_DIV
+        K = K_DIV
     block_names = [nm for nm, _ in block_specs]
     apply_order = getattr(L, "_qwen_apply", None)
 
@@ -345,9 +380,9 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
         n_layers = STOCK_LAYERS
 
     cfg = _qwen_config(hidden_size, intermediate, n_layers, V.VOCAB, arch)
-    qmodel = Qwen2Model(cfg).to(torch.float32).eval()
+    qmodel = Qwen2Model(cfg).to(model_dtype).eval()
 
-    embed = _build_embedding(L, hidden_size, comp, K)
+    embed = _build_embedding(L, hidden_size, comp, K).to(model_dtype)
 
     with torch.no_grad():
         gamma = rmsnorm_identity_gamma(hidden_size, K)
@@ -381,6 +416,12 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
             mem_idx = block_names.index("mem-cam")
             _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K)
             cam_layers["mem-cam"] = mem_idx
+        if QL.div_logsink:
+            # bake the reciprocal softmax1 sink head (1/b) onto the ls-recip-attn block.
+            from . import nibble_logsink_blocks as LS
+            recip_idx = block_names.index("ls-recip-attn")
+            LS.bake_recip_sink_cam(qmodel.layers[recip_idx].self_attn, L, arch, head_idx=1)
+            cam_layers["ls-recip-attn"] = recip_idx
 
     # RECURRENCE (recurrent divmod): re-point qmodel.layers through the apply order
     # so the forward applies the reused iteration-body layers 8x.  The STORED set
@@ -403,7 +444,8 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
                       n_layers=n_layers, fits_stock=fits_stock, embed=embed,
                       efficient_alu=efficient_alu, n_applied=n_applied,
                       code_from_memory=code_from_memory,
-                      shift_via_mul=QL.shift_via_mul)
+                      shift_via_mul=QL.shift_via_mul,
+                      div_logsink=QL.div_logsink, model_dtype=model_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +474,7 @@ def compile_ax_zero(L, dim: int) -> Dict[str, torch.Tensor]:
 
 def _block_specs(L, code_size, subset, efficient_alu=True,
                  recurrent_divmod=False, code_from_memory=False,
-                 shift_via_mul=False):
+                 shift_via_mul=False, div_logsink=True):
     """The fused-VM FFN block list (one Qwen layer per block).
 
     Returns ``specs`` (list of ``(name, ffn_spec)``); when the efficient-ALU
@@ -506,6 +548,7 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
     #    op's dedicated RES nibble band UNCONDITIONALLY; the ax-mux copies the active
     #    op's result into the AX nibble band gated on OP_IS[op].  The recurrent
     #    divmod stores ONE reused iteration body (repeated 8x by _qwen_apply). ---
+    use_logsink = eff_mdm and getattr(L, "LOGSINK", None) is not None and div_logsink
     if eff_mdm:
         from . import nibble_alu32 as A
         A._ONE = L.ONE
@@ -527,7 +570,17 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
         for name, spec in A.compile_mul_blocks(L, dim):
             specs.append((name, spec))
         div_start = len(specs)
-        if recurrent_divmod:
+        div_apply = []
+        if use_logsink:
+            # LOG-SINK DIVIDE: ~14 blocks (reciprocal sink + schoolbook correction)
+            # replacing the 262-block long division.  Writes into ALU32 DIV_RES/MOD_RES.
+            from . import nibble_logsink_blocks as LS
+            LS._ONE = L.ONE
+            ls_blocks, _ = LS.compile_logsink_blocks(L, dim)
+            for name, spec in ls_blocks:
+                div_apply.append(len(specs))
+                specs.append((name, spec))
+        elif recurrent_divmod:
             unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim)
             name_to_idx = {}
             for name, spec in unique:
@@ -535,7 +588,6 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
                 specs.append((name, spec))
             div_apply = [name_to_idx[n] for n in apply_names]
         else:
-            div_apply = []
             for name, spec in A.compile_divmod_blocks(L, dim):
                 div_apply.append(len(specs))
                 specs.append((name, spec))
@@ -566,7 +618,8 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
     # Record the apply-order for the recurrent divmod (identity elsewhere): the
     # physical layers before div_start, then the repeated iteration-body layer
     # indices, then the rest — so build() points qmodel.layers at the reused layers.
-    if eff_mdm and recurrent_divmod:
+    # The log-sink divide is UNROLLED (no reused body), so it keeps identity apply.
+    if eff_mdm and recurrent_divmod and not use_logsink:
         n = len(specs)
         L._qwen_apply = (list(range(div_start)) + div_apply + list(range(div_end, n)))
     return specs
@@ -632,13 +685,18 @@ def _bake_ffn(mlp, spec, L, comp):
     bd = spec.get("b_down")
     if bd is not None and float(bd.abs().max()) != 0.0:
         raise AssertionError("nonzero b_down not supported")
-    gate_w = torch.zeros(inter, H); up_w = torch.zeros(inter, H); down_w = torch.zeros(H, inter)
+    # Match the MLP weight dtype (fp64 when the log-sink divide is active) so a
+    # fp64 spec's log-lookup coefficients keep full precision (a float32 round of
+    # ``log(v)/RELU_S`` loses ~1e-7 which the reciprocal amplifies quotient-fold).
+    dt = mlp.gate_proj.weight.dtype
+    gate_w = torch.zeros(inter, H, dtype=dt); up_w = torch.zeros(inter, H, dtype=dt)
+    down_w = torch.zeros(H, inter, dtype=dt)
     Dg = spec["W_up"].shape[1]
-    gate_w[:hidden, :Dg] = spec["W_up"]
-    up_w[:hidden, :Dg] = spec["W_gate"]
-    down_w[:Dg, :hidden] = spec["W_down"]
-    gate_w[:hidden, L.ONE] += spec["b_up"]
-    up_w[:hidden, L.ONE] += spec["b_gate"]
+    gate_w[:hidden, :Dg] = spec["W_up"].to(dt)
+    up_w[:hidden, :Dg] = spec["W_gate"].to(dt)
+    down_w[:Dg, :hidden] = spec["W_down"].to(dt)
+    gate_w[:hidden, L.ONE] += spec["b_up"].to(dt)
+    up_w[:hidden, L.ONE] += spec["b_gate"].to(dt)
     mlp.gate_proj.weight.copy_(gate_w)
     mlp.up_proj.weight.copy_(up_w)
     mlp.down_proj.weight.copy_(down_w)
@@ -986,6 +1044,22 @@ def _overlay_fetch_query(x, L, pc: int, row: int = 0, col: int = -1):
         x[row, col, L.CODE_QRY_BIN + b] = bit
 
 
+def _seed_logsink_rows(x, L, base_pos: int, row: int = 0):
+    """SEED the reciprocal sink head's reserved KV rows every step (position-indep):
+      rows base_pos..base_pos+7 : the 8 log-key rows (LOGKEY[j]=1, IS_RECIP_ROW=1)
+      row  base_pos+8           : the sink row (IS_SINK=1, IS_RECIP_ROW=1, value 1)
+    Seeding EVERY step (not just at t=0) is what makes a LEADING DIV work — the head
+    finds its log-keys regardless of how many program tokens precede the query."""
+    a = L.LOGSINK
+    for j in range(8):
+        p = base_pos + j
+        x[row, p, a.LOGKEY + j] = 1.0
+        x[row, p, a.IS_RECIP_ROW] = 1.0
+    sink = base_pos + 8
+    x[row, sink, a.IS_SINK] = 1.0
+    x[row, sink, a.IS_RECIP_ROW] = 1.0
+
+
 def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
                               reg_state: dict, store_log: List[dict],
                               load_addr: Optional[int]) -> torch.Tensor:
@@ -1003,7 +1077,14 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
 
     n_store = len(store_log) if subset.memory else 0
     n_code = len(code) if cfm else 0
+    dls = getattr(vm, "div_logsink", False)
+    # LOG-SINK reciprocal: 8 pre-seeded reserved-KV log-key rows + 1 sink row, placed
+    # right after BOS.  They are SEEDED EVERY STEP at fixed content (position-indep on
+    # the slow rotary lanes), so a program whose FIRST executed instruction is DIV
+    # finds them — the "leading-DIV" guarantee.
+    n_logsink = 9 if dls else 0
     stream: List[int] = [V.BOS]
+    stream += [V.MEM] * n_logsink                     # log-key rows + sink (recip head)
     stream += [V.MEM] * n_store                       # store KV tokens
     stream += [V.MEM] * n_code                        # code KV tokens (fetch@PC)
     stream += [_REG_TOKEN[r] for r in CAM_REGS]       # register frame
@@ -1013,11 +1094,13 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
 
     for i in range(Sn):
         x[0, i, L.ONE] = 1.0
+    if dls:
+        _seed_logsink_rows(x, L, base_pos=1)
     if cfm:
         # CODE-FROM-MEMORY: the program lives in the KV §Memory as code frames (one
         # per instruction), fetched by PC via the address CAM — no baked CODE_OP[k]
         # table, so no code_size limit and no program-length width dependence.
-        _overlay_code_frames(x, L, code, base_pos=1 + n_store)
+        _overlay_code_frames(x, L, code, base_pos=1 + n_logsink + n_store)
     else:
         # program-in-data at every position (fetch@PC universal). Immediates are stored
         # as SIGNED small values (an assembler stores imm & 0xFFFFFFFF, so a small
@@ -1032,7 +1115,7 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
     # persistent store frames (memory KV log).
     if subset.memory:
         for si, st in enumerate(store_log):
-            p = 1 + si
+            p = 1 + n_logsink + si
             x[0, p, L.IS_STORE] = 1.0
             for b, bit in enumerate(_address_bits(st["addr"], ADDR_BITS)):
                 x[0, p, L.ADDR_BIN + b] = bit
@@ -1040,7 +1123,7 @@ def _build_stream_and_overlay(vm: QwenFullVM, code: List[isa.Instr],
                 x[0, p, L.VAL_NIB + j] = float(nv)
 
     # the latest register frame: one token per register carrying its nibbles+role.
-    reg0 = 1 + n_store + n_code
+    reg0 = 1 + n_logsink + n_store + n_code
     for h, reg in enumerate(CAM_REGS):
         p = reg0 + h
         for j, nv in enumerate(V.nibbles_of_value(reg_state[reg], NIB_PER_REG)):
