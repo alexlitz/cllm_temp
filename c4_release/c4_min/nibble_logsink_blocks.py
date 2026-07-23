@@ -46,14 +46,15 @@ from .nibble_vm import S, RELU_S, SILU_S, SILU_HALF
 NEG = -80.0            # log(d_j==0) sink mask (e^NEG ~ 0 under softmax)
 BIG = 200.0            # query self / non-log-key penalty
 LOG16 = math.log(16.0)
-# RMSNorm compensator K for the whole div_logsink model.  It must dominate the
-# quotient-scale scalars (qf, q·b up to ~2^34 = 1.7e10) so the floor is exact
-# (1-r < 0.5/1.7e10 -> K > ~2e15).  1e15 is the sweet spot: it also gives the best
-# attention-reciprocal precision (a much larger K perturbs the RMSNorm-normalised
-# LOGQ query on the sink head).  For the 8-bit operand path (the corpus / isa.interpret
-# width) the quotient/remainder are <256 and this is byte-exact through the forward;
-# see the report for the 32-bit-through-the-forward precision note.
-K_DIV = 1.0e15
+# RMSNorm compensator K for the whole div_logsink model.  Two constraints:
+#   (a) the quotient-scale scalars (qf, q·b up to ~2^34 = 1.7e10) must be preserved to
+#       < 0.5 for the floor -> 1-r < 0.5/1.7e10 -> K > ~2e15;
+#   (b) the SET-semantics (``-old + new``) every nibble op uses is EXACT only when
+#       RMSNorm r == 1; a residual 1-r leaks ``value·(1-r)`` into each SET, and the
+#       schoolbook q·b multiplies a nibble error by up to 2^32, so the div nibbles must
+#       be preserved to ~1e-16 -> 1-r < 1e-16 for values up to 2^34 -> K > ~1.2e18.
+# 1e18 satisfies both (fp64 has the range; the softmax reciprocal is scale-invariant).
+K_DIV = 1.0e18
 
 _ONE = None            # layout ONE lane, set by the builders
 
@@ -611,6 +612,60 @@ def compile_correct(L, dim) -> Dict[str, torch.Tensor]:
 
 
 # ==========================================================================
+# 9b. refine : QSC = QSC2 + round(REM2 * RECIP2).  The exact quotient correction
+#     ``delta = round(rem/b) = round(rem * 1/b)`` absorbs a quotient error LARGER than
+#     ±1 (from the in-model ~1e-8 reciprocal on a large quotient), so re-decomposing
+#     QSC and re-running the schoolbook + ±1 makes the FULL 32-bit range exact through
+#     the forward.  REM2 is SIGNED (rem<0 when q0 too big), so the product uses
+#     silu(S*rem)/S - silu(-S*rem)/S = rem, gated by RECIP2.  Runs at K_DIV.
+# ==========================================================================
+def compile_refine(L, dim) -> Dict[str, torch.Tensor]:
+    global _ONE
+    _ONE = L.ONE
+    a = L.LOGSINK
+    spec = _empty64(dim, 8)
+    u = 0
+    # delta_raw = REM2 * RECIP2 (signed): +silu(S*REM2)*RECIP2/S - silu(-S*REM2)*RECIP2/S.
+    u = _clear(spec, u, a.REM)                       # reuse a.REM as delta_raw scratch
+    spec["W_up"][u, a.REM2] = S
+    spec["W_gate"][u, a.RECIP2] += 1.0
+    spec["W_down"][a.REM, u] += 1.0 / SILU_S
+    u += 1
+    spec["W_up"][u, a.REM2] = -S
+    spec["W_gate"][u, a.RECIP2] += 1.0
+    spec["W_down"][a.REM, u] += -1.0 / SILU_S
+    u += 1
+    return _truncate(spec, u, dim)
+
+
+def compile_refine_add(L, dim) -> Dict[str, torch.Tensor]:
+    """QSC = QSC2 + floor(delta_raw)  (delta_raw = REM2*RECIP2 = delta + rem/b in a.REM,
+    where the true quotient error ``delta = q - QSC2`` is an integer and ``rem/b`` is the
+    fractional part in [0,1)).  FLOOR (not round) recovers ``delta`` exactly:
+    floor(delta + rem/b) = delta.  The ramp sits at the INTEGERS (``[x >= k]`` centred
+    just below k), symmetric for the signed delta (|delta| < R)."""
+    global _ONE
+    _ONE = L.ONE
+    a = L.LOGSINK
+    R = 512                                          # |delta| bound (reciprocal err * a / b)
+    spec = _empty64(dim, 2 + 4 * R)
+    u = 0
+    u = _clear(spec, u, a.QSC)
+    u = _ident(spec, u, {a.QSC2: 1.0}, 0.0, a.QSC, 1.0)            # QSC = QSC2
+    # floor(x) = sum_{k>=1}[x >= k]  -  sum_{k>=0}[x <= -k-... ] handled symmetrically:
+    #   positive part: + sum_{k=1..R}[x >= k]         (ramp just below the integer k)
+    #   negative part: - sum_{k=1..R}[x < -(k-1)] = - sum_{k=1..R}[-x > k-1]
+    # Using the sharp ramp at k-0.001 (just below integer k) so x = delta+frac (frac in
+    # [0,1)) counts exactly ``delta`` integers >=1 for delta>0, and for delta<0
+    # (x = delta+frac, frac in [0,1) => x in [delta, delta+1)) the -part counts |delta|.
+    eps = 0.001
+    for k in range(1, R + 1):
+        u = _step_ge_sharp(spec, u, {a.REM: 1.0}, float(k) - eps, a.QSC, 1.0)
+        u = _step_ge_sharp(spec, u, {a.REM: -1.0}, float(k) - 1.0 + eps, a.QSC, -1.0)
+    return _truncate(spec, u, dim)
+
+
+# ==========================================================================
 # 10. finalize : zero DIV_RES/MOD_RES on b==0 (ISA_SPEC 4.2).  The nibbles were
 #     produced by the MSB-decompose blocks; this gates them off when b==0.  Runs
 #     at K_DIV (reads BZ which is small; K choice is irrelevant for the gate).
@@ -692,16 +747,29 @@ def compile_logsink_blocks(L, dim) -> Tuple[List[Tuple[str, Dict]], List[str]]:
             if c > 0:
                 add(f"{prefix}-red{c}", _msb_reduce_block(L, dim, rem_band, nib_band, c), True)
 
+    def schoolbook_and_correct(prefix):
+        # QSC = sum Q_c*16^c ; QB = q*b (schoolbook) ; REM = a - QB ; flags ; correct.
+        add(f"{prefix}-qb-products", compile_qb_products(L, dim), True)
+        add(f"{prefix}-qb-split", compile_qb_split(L, dim))
+        add(f"{prefix}-qb-carry0", compile_qb_carry(L, dim, a.QB_COL, a.QB_C1))
+        add(f"{prefix}-qb-carry1", compile_qb_carry(L, dim, a.QB_C1, a.QB_COL))
+        add(f"{prefix}-qb-carry2", compile_qb_carry(L, dim, a.QB_COL, a.QB_C1))
+        add(f"{prefix}-qb-recombine", compile_qb_recombine(L, dim, a.QB_C1), True)
+        add(f"{prefix}-rem", compile_rem(L, dim), True)
+        add(f"{prefix}-correct", compile_correct(L, dim), True)
+
     decompose("ls-q", a.QREM, a.Q)
-    # QSC = sum Q_c*16^c ; QB schoolbook q*b.
-    add("ls-qb-products", compile_qb_products(L, dim), True)
-    add("ls-qb-split", compile_qb_split(L, dim))
-    add("ls-qb-carry0", compile_qb_carry(L, dim, a.QB_COL, a.QB_C1))
-    add("ls-qb-carry1", compile_qb_carry(L, dim, a.QB_C1, a.QB_COL))
-    add("ls-qb-carry2", compile_qb_carry(L, dim, a.QB_COL, a.QB_C1))
-    add("ls-qb-recombine", compile_qb_recombine(L, dim, a.QB_C1), True)
-    add("ls-rem", compile_rem(L, dim), True)
-    add("ls-correct", compile_correct(L, dim), True)
+    schoolbook_and_correct("ls")
+    # REFINE (makes the FULL 32-bit range exact THROUGH the forward, not just <256):
+    # the in-model softmax reciprocal carries a ~1e-8 residue, so for a large quotient
+    # q0 = floor(a*r) can be off by more than ±1.  ``delta = round(REM * RECIP2)`` is
+    # the exact quotient correction (REM = a - q0*b, delta ~ REM/b), so QSC2 + delta is
+    # within ±1 of the true quotient; re-decompose it and re-run the schoolbook + ±1.
+    add("ls-refine", compile_refine(L, dim), True)
+    add("ls-refine-add", compile_refine_add(L, dim), True)
+    add("ls-r-seed", compile_seed_rem(L, dim, a.QSC, a.QREM, offset=-0.5), True)
+    decompose("ls-r", a.QREM, a.Q)
+    schoolbook_and_correct("ls2")
     # decompose QSC2 -> DIV_RES, REM2 -> MOD_RES.  QSC2/REM2 are CLEAN integers after
     # the correction, so each nibble needs only ONE snap pass (extract -> snap -> reduce
     # the running rem by the CLEAN nibble) — the snap between extract and reduce is what
