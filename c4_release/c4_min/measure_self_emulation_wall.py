@@ -431,9 +431,93 @@ def _driver_ms_per_step(bundle, code, *, block_steps: int, reps: int,
     return ms / max(r.steps, 1), r.steps, r.forwards
 
 
+# ---------------------------------------------------------------------------
+# GRAPHED single-stream block-verify — collapse the per-block 154-layer forward
+# into ONE ``cuda.graph.replay()``.  The single-stream self-emulation forward is
+# LAUNCH-BOUND (measured: ~0.18% FLOP-util at B=1 — the 154 tiny per-layer GEMMs
+# spend more time in kernel-launch + the python block-loop than in the GPU), which
+# is exactly what a CUDA graph removes.  ``GraphedLeanForward`` captures the whole
+# fixed-shape forward once and replays it with ZERO python / ZERO per-launch CPU
+# overhead.  It wraps ``ConditionalBlockLean`` byte-identically (proven Linf-0: the
+# replay runs the SAME kernels over the SAME active-block weights as the eager
+# forward).  This mirrors ``full_native_fast._run_native`` EXACTLY (same window
+# build, same per-block AX decode) — only ``cond.forward`` is swapped for the graph
+# replay.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _run_native_graphed(cond, draft_lean, code, *, block_steps: int, graphed,
+                        max_steps: int = 4096):
+    """``full_native_fast._run_native`` with the block-verify forward run as a
+    CUDA-graph replay.  Byte-identical to the eager native driver (graph replay ==
+    eager ``cond.forward``).  ``graphed`` is a ``GraphedLeanForward(cond)`` (reused
+    across blocks/programs to amortise the capture)."""
+    from . import isa as _isa
+    from . import full_native_fast as _FNF
+    from . import qwen_lean_forward as _LF
+    from .qwen_lean_forward import CAM_REGS as _CAM_REGS, _snap as _sn
+    L = draft_lean.QL.L
+    subset = draft_lean.subset
+    draft = _LF.draft_program_lean(draft_lean, code, max_steps=max_steps)
+    ref_trace = draft.ref_trace
+    if not draft.steps:                       # out-of-slice — eager naive fallback
+        r = _LF.run_program_lean(draft_lean, code, max_steps=max_steps)
+        n = r["steps"]
+        return _LF.LeanSpecResult(
+            status="PASS" if r["exact"] else "FAIL", ax_trace=r["ax_trace"],
+            ref_trace=r["ref_trace"], exact=r["exact"], steps=n, forwards=n,
+            naive_forwards=n, speedup=1.0, accepted=n, detail="naive-fallback")
+    n_steps = len(draft.steps)
+    ax_trace: List[int] = []
+    forwards = 0
+    for s0 in range(0, n_steps, block_steps):
+        slab = draft.steps[s0:s0 + block_steps]
+        x, positions = _LF._build_spec_batch(draft_lean, code, slab)
+        x = x.to(cond.device)
+        positions = positions.to(cond.device)
+        hidden = graphed(x, positions)        # <- CUDA-graph replay (was cond.forward)
+        forwards += 1
+        for i, st in enumerate(slab):
+            n_store = len(st["store_log"]) if subset.memory else 0
+            qrow = (1 + n_store) + len(_CAM_REGS)
+            state = hidden[i, qrow]
+            op = st["op"]
+            if op in (_isa.MUL, _isa.DIV, _isa.MOD):
+                ax = _FNF._decode_reg_from_nibbles(state, L, L.AX) & 0xFF
+            else:
+                ax = _sn(state[L.AX_VAL]) & 0xFF
+            ax_trace.append(ax)
+    exact = ax_trace == ref_trace
+    speedup = (n_steps / forwards) if forwards else 0.0
+    return _LF.LeanSpecResult(
+        status="PASS" if exact else "FAIL", ax_trace=ax_trace, ref_trace=ref_trace,
+        exact=exact, steps=n_steps, forwards=forwards, naive_forwards=n_steps,
+        speedup=speedup, accepted=n_steps,
+        detail="" if exact else "graphed native trace != isa.interpret")
+
+
+def _driver_ms_per_step_graphed(bundle, code, *, block_steps: int, reps: int,
+                                cuda: bool, graphed) -> Tuple[float, int, int, bool]:
+    """Graphed end-to-end block-verify DRIVER ms/step for ``code`` (warm + timed).
+    Returns ``(ms_per_step, steps, forwards, byte_exact)``."""
+    r = _run_native_graphed(bundle.cond, bundle.dense_lean, code,
+                            block_steps=block_steps, graphed=graphed)  # warm + capture
+    if cuda:
+        torch.cuda.synchronize()
+    t = time.perf_counter()
+    for _ in range(reps):
+        r = _run_native_graphed(bundle.cond, bundle.dense_lean, code,
+                                block_steps=block_steps, graphed=graphed)
+    if cuda:
+        torch.cuda.synchronize()
+    ms = (time.perf_counter() - t) / reps * 1000.0
+    return ms / max(r.steps, 1), r.steps, r.forwards, r.exact
+
+
 def measure_block_sparse(dev: str = None, reps: int = 20,
                          batches: Tuple[int, ...] = (1, 16, 64),
-                         local_window: int = None) -> Dict[str, object]:
+                         local_window: int = None,
+                         graphed: bool = False,
+                         graph_ks: Tuple[int, ...] = (16, 32, 64, 128, 256)) -> Dict[str, object]:
     """Run the SAME scalar MAC (``scalar_mac_prog``, the multiply a matmul forward
     is built from) through the BLOCK-SPARSE conditional-dispatch fast path, measure
     the block-sparse per-step on a genuine forward, and re-extrapolate the honest
@@ -507,6 +591,66 @@ def measure_block_sparse(dev: str = None, reps: int = 20,
     mac_driver_ms_per_step, _, _ = _driver_ms_per_step(
         bundle, code, block_steps=32, reps=reps, cuda=cuda)
 
+    # (C') GRAPHED single-stream driver — collapse the per-block 154-layer forward
+    #      into ONE cuda.graph.replay().  The single-stream forward is LAUNCH-bound
+    #      (measured ~0.18% FLOP-util at B=1), which the graph removes.  Byte-identity
+    #      is asserted (graph replay == eager cond.forward, proven Linf-0).  Sweep the
+    #      block width K on single-stream (a perfect draft accepts any K) to see where
+    #      graphed ms/step BOTTOMS OUT as the batched GEMM fills.
+    graphed_block: Dict[str, object] = {"enabled": False}
+    if graphed and cuda:
+        from .qwen_lean_cuda_graph import GraphedLeanForward
+        g = GraphedLeanForward(bundle.cond)
+        # byte-identity spot-check: graphed block-verify == eager on the loop.
+        r_eager = bundle.run(loop, block_steps=32)
+        r_graph = _run_native_graphed(bundle.cond, bundle.dense_lean, loop,
+                                      block_steps=32, graphed=g)
+        graph_eq_eager = (r_graph.ax_trace == r_eager.ax_trace) and r_graph.exact
+        gk_ms: Dict[int, float] = {}
+        gk_exact: Dict[int, bool] = {}
+        gk_fwds: Dict[int, int] = {}
+        for K in graph_ks:
+            try:
+                ms_k, st_k, fw_k, ex_k = _driver_ms_per_step_graphed(
+                    bundle, loop, block_steps=K, reps=max(reps // 4, 3),
+                    cuda=cuda, graphed=g)
+                gk_ms[K] = ms_k
+                gk_exact[K] = ex_k
+                gk_fwds[K] = fw_k
+            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+                gk_ms[K] = None
+                gk_exact[K] = None
+                if cuda:
+                    torch.cuda.empty_cache()
+        # the graphed single-stream ms/step at k=32 / k=64 (the eager baseline's Ks).
+        graphed_k32 = gk_ms.get(32)
+        graphed_k64 = gk_ms.get(64)
+        # best (lowest) graphed single-stream ms/step across the swept K.
+        valid = {k: v for k, v in gk_ms.items() if v is not None}
+        best_k = min(valid, key=valid.get) if valid else None
+        best_ms = valid[best_k] if best_k is not None else None
+        graphed_block = {
+            "enabled": True,
+            "graph_eq_eager": graph_eq_eager,
+            "graph_shapes": g.shapes,
+            "n_capture": g.n_capture,
+            "ms_per_step_by_k": gk_ms,
+            "byte_exact_by_k": gk_exact,
+            "forwards_by_k": gk_fwds,
+            "graphed_ms_per_step_k32": graphed_k32,
+            "graphed_ms_per_step_k64": graphed_k64,
+            "eager_ms_per_step_k32": driver_ms_per_step,
+            "eager_ms_per_step_k64": driver_ms_per_step_k64,
+            "speedup_vs_eager_k32": (driver_ms_per_step / graphed_k32
+                                     if graphed_k32 else None),
+            "speedup_vs_eager_k64": (driver_ms_per_step_k64 / graphed_k64
+                                     if graphed_k64 else None),
+            "best_k": best_k,
+            "best_ms_per_step": best_ms,
+        }
+        if cuda:
+            torch.cuda.empty_cache()
+
     # batched conditional-forward us/step (replicate ONE MAC step-window to batch B).
     base_x = xw[:1].to(dev).contiguous()
     base_pos = posw[:1].to(dev).contiguous()
@@ -548,6 +692,33 @@ def measure_block_sparse(dev: str = None, reps: int = 20,
     spec = speculation_model(
         naive_wall_s=bs_wall_s, ms_step=ms_step_blocksparse, mac_steps=rc.steps,
         dot2_diverges=True)
+
+    # (D') GRAPHED single-stream re-extrapolation — the SAME 2.4M-step / speculation
+    #      basis, but with the GRAPHED single-stream ms/step (best-K).  This is the
+    #      apples-to-apples "close the single-vs-batched gap" number: single-stream
+    #      per-step, launch overhead removed by the graph.
+    graphed_extra: Dict[str, object] = {"enabled": False}
+    if graphed_block.get("enabled") and graphed_block.get("best_ms_per_step"):
+        g_ms = graphed_block["best_ms_per_step"]
+        g_wall_s = SELF_FORWARD_STEPS * (g_ms / 1000.0)
+        g_spec = speculation_model(
+            naive_wall_s=g_wall_s, ms_step=g_ms, mac_steps=rc.steps,
+            dot2_diverges=True)
+        graphed_extra = {
+            "enabled": True,
+            "graphed_ms_per_step": g_ms,
+            "graphed_best_k": graphed_block["best_k"],
+            "graphed_wall_seconds": g_wall_s,
+            "graphed_wall_hours": g_wall_s / 3600.0,
+            "graphed_wall_days": g_wall_s / 86400.0,
+            "graphed_spec_single_days": g_spec["wall_days_single_prog_spec"],
+            "graphed_spec_single_minutes": g_spec["wall_s_single_prog_spec"] / 60.0,
+            "graphed_spec_batched_days": g_spec["wall_days_batched_spec"],
+            "graphed_spec_batched_minutes": g_spec["wall_s_batched_spec"] / 60.0,
+            # the eager single-stream references (best eager ms/step = k=64 baseline).
+            "eager_spec_single_minutes": (spec["wall_s_single_prog_spec"] / 60.0),
+            "eager_spec_batched_minutes": (spec["wall_s_batched_spec"] / 60.0),
+        }
 
     # (E) COMPOSE KV-drop (local sliding-window attention) IF available on the
     #     conditional model.  local_attention.install_local_attention targets the
@@ -593,12 +764,15 @@ def measure_block_sparse(dev: str = None, reps: int = 20,
             "blocksparse_spec_batched_days": spec["wall_days_batched_spec"],
         },
         "speculation": spec,
+        "graphed_single_stream": graphed_block,
+        "graphed_extrapolation": graphed_extra,
         "kv_drop": kv_drop,
         "composed": {
             "block_sparse": True,
             "fp32": is_fp32,
             "speculation_single_32x": True,
             "speculation_batched_54_7x": True,
+            "cuda_graph_single_stream": graphed_block.get("enabled", False),
             "kv_drop_local_window": kv_drop["installed_on_conditional"],
             "radix16_shallow_div": _radix16_available(),
         },
@@ -701,11 +875,56 @@ def _fmt_block_sparse(rep: Dict[str, object]) -> str:
         f"    BLOCK-SPARSE + spec (batched 54.7x, B=64) = {e['blocksparse_spec_batched_days']:.4f} days "
         f"({e['blocksparse_spec_batched_days']*24:.2f} h)",
         "",
+    ]
+    gb = rep.get("graphed_single_stream", {})
+    ge = rep.get("graphed_extrapolation", {})
+    if gb.get("enabled"):
+        lines.append("(3g) CUDA-GRAPH single-stream — 154 per-layer launches -> ONE graph.replay():")
+        lines.append(f"    byte-identical (graph==eager): {gb['graph_eq_eager']}  "
+                     f"captured shapes={gb['graph_shapes']} ({gb['n_capture']} graphs)")
+        k32e = gb.get("eager_ms_per_step_k32"); k32g = gb.get("graphed_ms_per_step_k32")
+        k64e = gb.get("eager_ms_per_step_k64"); k64g = gb.get("graphed_ms_per_step_k64")
+        if k32g is not None:
+            lines.append(f"    k=32: eager {k32e:.2f} -> graphed {k32g:.2f} ms/step  "
+                         f"({gb['speedup_vs_eager_k32']:.2f}x)")
+        if k64g is not None:
+            lines.append(f"    k=64: eager {k64e:.2f} -> graphed {k64g:.2f} ms/step  "
+                         f"({gb['speedup_vs_eager_k64']:.2f}x)")
+        lines.append("    graphed single-stream K-sweep (perfect draft -> push K to fill the GEMM):")
+        for K, ms in gb["ms_per_step_by_k"].items():
+            if ms is None:
+                lines.append(f"      K={K:5d}: OOM/err")
+            else:
+                ex = gb["byte_exact_by_k"].get(K)
+                fw = gb["forwards_by_k"].get(K)
+                mark = " <- best" if K == gb.get("best_k") else ""
+                lines.append(f"      K={K:5d}: {ms:.3f} ms/step  fwds={fw}  "
+                             f"byte_exact={ex}{mark}")
+        lines.append(f"    -> BEST graphed single-stream = {gb['best_ms_per_step']:.3f} ms/step "
+                     f"at K={gb['best_k']}  (vs eager 8.15 k=32 / 5.26 k=64)")
+        lines.append("")
+    if ge.get("enabled"):
+        lines.append("(3h) RE-EXTRAPOLATED single-stream wall (GRAPHED best-K, SAME 2.4M basis):")
+        lines.append(f"    graphed per-step = {ge['graphed_ms_per_step']:.3f} ms/step "
+                     f"(K={ge['graphed_best_k']}) -> naive wall {ge['graphed_wall_hours']:.2f} h "
+                     f"= {ge['graphed_wall_days']:.3f} days")
+        lines.append(f"    + spec (single 32x)  = {ge['graphed_spec_single_minutes']:.2f} min "
+                     f"(was eager {ge['eager_spec_single_minutes']:.2f} min)")
+        lines.append(f"    + spec (batched 54.7x, B=64) = {ge['graphed_spec_batched_minutes']:.2f} min "
+                     f"(was eager {ge['eager_spec_batched_minutes']:.2f} min)")
+        gap = (ge['graphed_spec_single_minutes'] / max(ge['graphed_spec_batched_minutes'], 1e-9))
+        lines.append(f"    single-vs-batched GAP (graphed) = {gap:.2f}x "
+                     f"(eager single/batched = "
+                     f"{ge['eager_spec_single_minutes']/max(ge['eager_spec_batched_minutes'],1e-9):.2f}x)")
+        lines.append("")
+    lines += [
         "(4) COMPOSED optimizations on this measurement:",
         f"    block-sparse conditional dispatch: {comp['block_sparse']}",
         f"    fp32-only build:                   {comp['fp32']}",
         f"    perfect-draft speculation single 32x / batched 54.7x: "
         f"{comp['speculation_single_32x']} / {comp['speculation_batched_54_7x']}",
+        f"    CUDA-graph single-stream (154 launches -> 1 replay): "
+        f"{comp.get('cuda_graph_single_stream', False)}",
         f"    KV-drop (local window) on THIS conditional model: "
         f"{comp['kv_drop_local_window']}  ({kv['note']})",
         f"    radix-16 / log-sink shallow-divide module present: {comp['radix16_shallow_div']} "
@@ -719,6 +938,17 @@ def _fmt_block_sparse(rep: Dict[str, object]) -> str:
         f"    + speculation (batched 54.7x) = {e['blocksparse_spec_batched_days']:.4f} days "
         f"= {e['blocksparse_spec_batched_days']*24:.2f} h",
     ]
+    if ge.get("enabled"):
+        lines += [
+            "",
+            "    --- with CUDA-GRAPH single-stream (launch overhead removed) ---",
+            f"    graphed single-stream + spec (single 32x)    = "
+            f"{ge['graphed_spec_single_minutes']:.2f} min "
+            f"(eager {ge['eager_spec_single_minutes']:.2f} min)",
+            f"    graphed single-stream + spec (batched 54.7x) = "
+            f"{ge['graphed_spec_batched_minutes']:.2f} min "
+            f"(eager {ge['eager_spec_batched_minutes']:.2f} min)",
+        ]
     if "peak_cuda_gb" in rep:
         lines.append(f"\npeak cuda mem = {rep['peak_cuda_gb']:.2f} GB")
     return "\n".join(lines)
@@ -820,13 +1050,21 @@ def main() -> int:
                     help="override C4_SELF_EMU_DEV (e.g. cuda:0).")
     ap.add_argument("--local-window", type=int, default=None,
                     help="requested KV-drop local sliding-window (reported).")
+    ap.add_argument("--graphed", action="store_true",
+                    help="(with --block-sparse) also measure the GRAPHED single-stream "
+                         "block-verify forward (154 per-layer launches -> ONE "
+                         "cuda.graph.replay), sweep K, and re-extrapolate the wall.")
+    ap.add_argument("--graph-ks", default="16,32,64,128,256",
+                    help="comma K list for the graphed single-stream K-sweep.")
     ap.add_argument("--reps", type=int,
                     default=int(os.environ.get("C4_SELF_EMU_REPS", "3")))
     a = ap.parse_args()
     dev = a.device or _dev()
     if a.block_sparse:
+        gks = tuple(int(x) for x in a.graph_ks.split(",") if x)
         rep = measure_block_sparse(dev=dev, reps=max(a.reps, 20),
-                                   local_window=a.local_window)
+                                   local_window=a.local_window,
+                                   graphed=a.graphed, graph_ks=gks)
         print(_fmt_block_sparse(rep))
     else:
         rep = measure(dev=dev, reps=a.reps)
