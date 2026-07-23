@@ -85,6 +85,29 @@ def mul_lookahead() -> bool:
     return os.environ.get("C4_MUL_LOOKAHEAD", "1") != "0"
 
 
+# ---------------------------------------------------------------------------
+# C4_KB_BATCHED — the divide's KB-precompute (``KB[k]=k*b`` normalise) resolve.
+#
+# DEFAULT ON: ``_kb_precompute_blocks`` resolves all 15 ``KB[k]`` with ONE batched
+# base-16 Kogge-Stone parallel prefix (raw | round-1 | G/P | ceil(log2 9)=4 KS
+# stages | fused apply | BZ = 9 blocks), vs the 15 x _KB_CARRY_ROUNDS serial
+# ripples (~92 blocks) the historical path used.  Byte-identical result (both
+# compute the exact carry-propagate over the same raw columns); validated
+# byte-exact for all 15 KB[k] over the edge set + random b<2^32 incl 0xFFFFFFFF.
+# Benefits EVERY _kb_precompute_blocks user — the long-division DIV/MOD fallback
+# AND the radix-16 KB threshold table share this prologue.
+#
+# OFF (``C4_KB_BATCHED=0``): the historical 15x6 serial ripple — byte-identical to
+# the pre-lookahead build (SAME weights, SAME ``L.D``: the batched prefix scratch
+# bands are only allocated when the flag is ON, allocated LAST).
+# ---------------------------------------------------------------------------
+def kb_batched() -> bool:
+    """True iff the KB-precompute uses the batched Kogge-Stone parallel prefix
+    (``C4_KB_BATCHED != '0'``, default ON).  OFF -> the 15x6 serial ripple, which
+    is byte-identical to the pre-batched build (same weights, same ``L.D``)."""
+    return os.environ.get("C4_KB_BATCHED", "1") != "0"
+
+
 # ===========================================================================
 # Low-level SwiGLU unit emitters — all fp32-exact for integer arguments.
 # A hidden unit computes ``silu(up . x + b_up) * (gate . x + b_gate)`` and its
@@ -276,7 +299,8 @@ class ALU32Bands:
     """Allocate the scratch bands the 32-bit ALU blocks use (attaches onto L)."""
 
     def __init__(self, L, recurrent_divmod: bool = False,
-                 shift_via_mul: bool = False, mul_lookahead: bool = False):
+                 shift_via_mul: bool = False, mul_lookahead: bool = False,
+                 kb_batched: bool = False):
         self.A = L._band("ALU_A", 4)          # operand-A bytes (STACK0 = popped)
         self.B = L._band("ALU_B", 4)          # operand-B bytes (AX = accumulator)
         self.NOTB = L._band("ALU_NOTB", 4)    # ~B bytes (for SUB two's complement)
@@ -342,11 +366,27 @@ class ALU32Bands:
             self.MUL_P0 = L._band("ALU_MUL_P0", _MUL_NCOL)  # propagate lane, buffer 0
             self.MUL_G1 = L._band("ALU_MUL_G1", _MUL_NCOL)  # generate lane, buffer 1
             self.MUL_P1 = L._band("ALU_MUL_P1", _MUL_NCOL)  # propagate lane, buffer 1
+        # KB-PRECOMPUTE LOOKAHEAD (batched base-16 Kogge-Stone) — the divide's
+        # ``KB[k]=k*b`` normalise resolves all 15 KB[k] in ONE parallel-prefix pass
+        # (raw|round1|G/P|4 KS stages|apply|BZ = 9 blocks) instead of 15 serial
+        # 6-round ripples (~92 blocks).  Scratch = t/G0/P0/G1/P1, 15 KB[k] x _RN
+        # columns side by side.  Allocated LAST + only when the flag is ON so the
+        # ripple path (C4_KB_BATCHED=0) is byte-identical to the pre-lookahead
+        # layout (same L.D, same band offsets).  15 = k in 1..15.
+        self.kb_batched = kb_batched
+        if kb_batched:
+            _NK = 15
+            self.KB_T = L._band("ALU_KB_T", _NK * _RN)      # t_c in [0,30] (post round-1)
+            self.KB_G0 = L._band("ALU_KB_G0", _NK * _RN)    # generate lane, buffer 0
+            self.KB_P0 = L._band("ALU_KB_P0", _NK * _RN)    # propagate lane, buffer 0
+            self.KB_G1 = L._band("ALU_KB_G1", _NK * _RN)    # generate lane, buffer 1
+            self.KB_P1 = L._band("ALU_KB_P1", _NK * _RN)    # propagate lane, buffer 1
 
 
 def extend_layout_for_alu32(L, recurrent_divmod: bool = False,
                             shift_via_mul: bool = False,
-                            mul_lookahead: "bool | None" = None):
+                            mul_lookahead: "bool | None" = None,
+                            kb_batched: "bool | None" = None):
     """Allocate ALU-32 scratch bands on ``L`` and refresh ``L.D`` (pad to heads).
 
     ``recurrent_divmod`` adds the digit-index counter band the reused
@@ -363,13 +403,23 @@ def extend_layout_for_alu32(L, recurrent_divmod: bool = False,
     7 serial ripples.  ``None`` (default) reads the ``C4_MUL_LOOKAHEAD`` flag (default
     ON), so the resolve bands are present by default and ``compile_mul_blocks`` uses
     them; the bands are allocated LAST, so ``C4_MUL_LOOKAHEAD=0`` (the ripple path)
-    is byte-identical to the pre-lookahead layout — same ``L.D``, same band offsets."""
+    is byte-identical to the pre-lookahead layout — same ``L.D``, same band offsets.
+
+    ``kb_batched`` allocates the batched base-16 Kogge-Stone KB-precompute scratch
+    bands so ``_kb_precompute_blocks`` normalises all 15 ``KB[k]`` in one prefix
+    pass (~9 blocks) instead of 15 serial ripples (~92).  ``None`` (default) reads
+    ``C4_KB_BATCHED`` (default ON); the bands are allocated LAST so
+    ``C4_KB_BATCHED=0`` (the ripple path) is byte-identical to the pre-batched
+    layout."""
     if getattr(L, "ALU32", None) is not None:
         return L.ALU32
     if mul_lookahead is None:
         mul_lookahead = globals()["mul_lookahead"]()   # module-level C4_MUL_LOOKAHEAD reader
+    if kb_batched is None:
+        kb_batched = globals()["kb_batched"]()         # module-level C4_KB_BATCHED reader
     L.ALU32 = ALU32Bands(L, recurrent_divmod=recurrent_divmod,
-                         shift_via_mul=shift_via_mul, mul_lookahead=mul_lookahead)
+                         shift_via_mul=shift_via_mul, mul_lookahead=mul_lookahead,
+                         kb_batched=kb_batched)
     while L._off % L.n_heads != 0:
         L._scalar(f"_alupad{L._off}")
     L.D = L._off
@@ -662,6 +712,40 @@ def compile_mul_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
 #    fp64).  ``b == 0 -> q = r = 0`` (ISA_SPEC 4.2).  DIV returns the assembled
 #    quotient nibbles; MOD the final remainder nibbles.
 # ===========================================================================
+def _kb_precompute_blocks_batched(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+    """BATCHED base-16 Kogge-Stone KB-precompute: resolve all 15 ``KB[k]=k*b`` in
+    ONE parallel-prefix pass (raw | round-1 | G/P | ceil(log2 RN) KS stages | fused
+    apply | BZ = ~9 blocks) instead of 15 serial ``_KB_CARRY_ROUNDS`` ripples
+    (~92 blocks).  Reuses the proven block builders from ``div_kb_lookahead`` (a
+    lazy import to avoid a load-time cycle: that module imports from here); passes
+    the ALU32 scratch band offsets (``KB_T``/``KB_G0``/``KB_P0``/``KB_G1``/
+    ``KB_P1``) so the resolve lives on the SAME layout, and writes the result into
+    the production ``a.KB`` band the compare reads — byte-identical to the ripple."""
+    from . import div_kb_lookahead as DKB
+    a = L.ALU32
+    RN = a.RN
+    _ONE_prev = globals().get("_ONE")
+    globals()["_ONE"] = L.ONE
+    n_stages = DKB._n_prefix_stages(RN)
+    blocks: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+    blocks.append(("alu-div-kb-raw", DKB._kb_raw_block(L, dim, RN)))
+    blocks.append(("alu-div-kb-round1", DKB._round1_block(L, dim, RN, a.KB, a.KB_T)))
+    blocks.append(("alu-div-kb-gp", DKB._gp_block(L, dim, RN, a.KB_T, a.KB_G0, a.KB_P0)))
+    (gs, ps), (gd, pd) = (a.KB_G0, a.KB_P0), (a.KB_G1, a.KB_P1)
+    d = 1
+    st = 0
+    while d < RN:
+        blocks.append((f"alu-div-kb-ks{st}",
+                       DKB._ks_stage_block(L, dim, RN, gs, ps, gd, pd, d)))
+        (gs, ps), (gd, pd) = (gd, pd), (gs, ps)
+        d *= 2
+        st += 1
+    blocks.append(("alu-div-kb-apply", DKB._apply_block(L, dim, RN, a.KB_T, gs, a.KB)))
+    blocks.append(("alu-div-bz", DKB._bz_block(L, dim)))
+    globals()["_ONE"] = _ONE_prev
+    return blocks
+
+
 def _kb_precompute_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
     """Compute KB[k] = k*b nibbles for k=1..15 from the AX (=B) nibble bands, plus
     the divisor-zero predicate BZ.  ``k*b`` = (single-nibble k) * (8-nibble b): a
@@ -670,8 +754,14 @@ def _kb_precompute_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
 
     Each KB[k] is carried in its OWN tiny block (RN rounds, in place) so no block
     is wide — the uniform-hidden budget is set by the small per-k carry, NOT by a
-    fused 15-k round.  This is the fix for the recovered draft's 75k-unit blocks."""
+    fused 15-k round.  This is the fix for the recovered draft's 75k-unit blocks.
+
+    When ``C4_KB_BATCHED`` is ON (default) and the batched scratch bands were
+    allocated (``a.kb_batched``), route to the batched Kogge-Stone prefix
+    (~9 blocks); OFF -> the 15 x ``_KB_CARRY_ROUNDS`` serial ripple below."""
     a = L.ALU32
+    if getattr(a, "kb_batched", False):
+        return _kb_precompute_blocks_batched(L, dim)
     RN = a.RN
     blocks = []
     # raw columns per k: KB[k] column c = b_nib[c] * k  (only c<8 for b; <= 225).
