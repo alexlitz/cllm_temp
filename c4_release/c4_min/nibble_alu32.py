@@ -169,13 +169,25 @@ def _nibble_carry_round(spec, u, src, dst, n):
         dst[c] = src[c] mod 16 + floor(src[c-1] / 16)     (carry-in from below)
     Every column stays ``< 256`` so ``floor(./16) <= 15`` (kmax=15).  When
     ``src == dst`` (in place) the block reads the pre-round residual — safe because
-    all units read the block INPUT and write deltas.  SET semantics."""
+    all units read the block INPUT and write deltas.  SET semantics.
+
+    CARRY-SHARING: each column's ``floor(src[c]/16)`` is the SAME value the baseline
+    computed twice (once as its own ``-16*floor`` mod, once as the ``+floor`` carry
+    into column c+1).  We emit it ONCE via ``_floor_div_pow2`` and route it to BOTH
+    destinations — half the staircase units per column, byte-identical result
+    (the top column's carry-out overflows past the kept nibbles and is dropped,
+    exactly as the baseline dropped it).  The +1 carry into ``dst[c+1]`` is a delta
+    on the block INPUT, so it survives that column's later ``_clear`` (which only
+    subtracts the input value)."""
     for c in range(n):
         u = _clear(spec, u, dst + c)                                                # SET -old
         u = _ident(spec, u, {src + c: 1.0}, 0.0, dst + c, 1.0)                       # + col
-        u = _floor_div_pow(spec, u, {src + c: 1.0}, 0.0, 16, _NIB_KMAX, dst + c, -16.0)  # - 16*floor
-        if c > 0:
-            u = _floor_div_pow(spec, u, {src + c - 1: 1.0}, 0.0, 16, _NIB_KMAX, dst + c, 1.0)  # + carry
+        if c + 1 < n:
+            # ONE floor(col/16) staircase -> -16 into col c (mod), +1 into c+1 (carry).
+            u = _floor_div_pow2(spec, u, {src + c: 1.0}, 0.0, 16, _NIB_KMAX,
+                                dst + c, -16.0, dst + c + 1, 1.0)
+        else:
+            u = _floor_div_pow(spec, u, {src + c: 1.0}, 0.0, 16, _NIB_KMAX, dst + c, -16.0)  # top: mod only
     return u
 
 
