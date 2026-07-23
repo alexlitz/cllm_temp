@@ -154,18 +154,21 @@ _TWO_LIMB_OVERRIDE: "bool | None" = None
 def vm_two_limb() -> bool:
     """True iff the fp32 TWO-LIMB AX/STACK0 dispatch is enabled.
 
-    ON (default when width-32 is on) -> AX/STACK0 carried as ``*_LO``/``*_HI`` fp32
-    limbs, the whole model runs in **fp32** (no fp64).  An in-process build context
-    (``two_limb_mode``) can PIN it (the unified build pins single-scalar).  Explicit
-    env override: ``C4_VM_TWO_LIMB=1``/``0``.  When width-32 is OFF the value lanes
-    are 8-bit and two-limb is irrelevant (HI limb always 0), so it defaults OFF
-    there — byte-identical to the folded 8-bit corpus.  ``C4_VM_TWO_LIMB=0`` with
-    width-32 ON is the fp64 single-scalar FALLBACK (the historical path, intact)."""
+    ON whenever width-32 is on -> AX/STACK0 carried as ``*_LO``/``*_HI`` fp32 limbs,
+    the whole model runs in **fp32** (no fp64).  The width-32 substrate is ALWAYS
+    two-limb now: the historical single-scalar fp64 fallback has been removed from
+    the production path so the model is genuinely fp32 (zero fp64 params).  When
+    width-32 is OFF the value lanes are 8-bit and two-limb is irrelevant (HI limb
+    always 0), so it is OFF there — byte-identical to the folded 8-bit corpus.  An
+    in-process build context (``two_limb_mode``) can still PIN it (e.g. the unified
+    build pins single-scalar for its own fp32 single-scalar CMP/MUL/DIV lanes)."""
     if _TWO_LIMB_OVERRIDE is not None:
         return _TWO_LIMB_OVERRIDE
     env = os.environ.get("C4_VM_TWO_LIMB")
     if env is not None:
-        return env == "1"
+        # honour an explicit off ONLY under the 8-bit substrate (irrelevant there);
+        # under width-32 two-limb is forced on to keep the model fp32 (no fp64 path).
+        return True if vm_width32() else (env == "1")
     return vm_width32()          # default: two-limb whenever the substrate is 32-bit
 
 
@@ -791,16 +794,15 @@ def build_step_model(code_size: int, n_heads: int = 4):
 
 
 def maybe_cast_model_for_width(model) -> None:
-    """Cast the model to fp64 ONLY on the single-scalar width-32 FALLBACK path.
+    """NO-OP — the model is ALWAYS fp32 (zero fp64 params).
 
-    The single-scalar width-32 substrate needs fp64 because its ``16^7`` recompose
-    + ADD/SUB algebra exceed fp32's 2^24 integer precision.  The TWO-LIMB path
-    (``vm_two_limb``, the default when width-32 is on) carries AX/STACK0 as two
-    fp32-exact limbs, so it stays **fp32** — this cast is a NO-OP there and no fp64
-    appears anywhere.  Also a no-op under the 8-bit substrate (byte-identical to the
-    folded corpus)."""
-    if vm_width32() and not vm_two_limb():
-        model.double()
+    The width-32 substrate is carried by the TWO-LIMB path (``vm_two_limb``, always
+    on when width-32 is on): AX/STACK0 ride as two fp32-exact limbs, so the whole
+    model stays fp32 and the ``16^7`` recompose that once forced fp64 never appears.
+    The historical single-scalar width-32 fp64 fallback has been removed from the
+    production path, so this cast is retired (kept as a no-op for call-site
+    compatibility)."""
+    return
 
 
 def _zero_attn(attn) -> None:
@@ -842,14 +844,12 @@ def load_program(model, L: NibbleVMLayout, code: List[isa.Instr]) -> torch.Tenso
     PC=AX=0, SP=BP=0x10000, written as NIBBLE bands. ONE=1.
     """
     assert len(code) <= L.code_size, f"{len(code)} slots > code_size {L.code_size}"
-    # The TWO-LIMB width-32 path runs the whole step in fp32 (AX/STACK0 carried as
-    # two fp32-exact limbs, immediates stored as split limbs).  The single-scalar
-    # width-32 FALLBACK runs in fp64 (its 16^7 recompose + ADD/SUB algebra exceed
-    # fp32's 2^24).  The 8-bit substrate stays fp32 (byte-identical to the folded
-    # corpus).
+    # The model is ALWAYS fp32 (zero fp64 params).  The TWO-LIMB width-32 path carries
+    # AX/STACK0 as two fp32-exact limbs (immediates stored as split limbs); the 8-bit
+    # substrate is fp32 (byte-identical to the folded corpus).  The historical fp64
+    # single-scalar width-32 fallback has been retired.
     two_limb = _layout_two_limb(L)
-    dtype = torch.float64 if (vm_width32() and not two_limb) else torch.float32
-    state = torch.zeros(L.D, dtype=dtype)
+    state = torch.zeros(L.D, dtype=torch.float32)
     state[L.ONE] = 1.0
     _write_reg_nibbles(state, L.PC, 0)
     _write_reg_nibbles(state, L.AX, 0)
@@ -959,9 +959,15 @@ def _snap_lane(lane: torch.Tensor) -> int:
 
     Under ``C4_VM_WIDTH32`` the flat argmax (capped at ``VALVOCAB`` ≈ 0x10100)
     would clip any value > ~65K, so the snap descends to ``_snap_lane_bytes``: the
-    fp64-exact integer snap (``floor(x+½)``, the round-free argmax equivalent)
-    reduced to the unsigned 32-bit word ``v mod 2^32`` — exact to the full 2^32 with
-    no 2^32-wide vocab (the §720-style cascade at the token round-trip)."""
+    integer snap (``floor(x+½)``, the round-free argmax equivalent) reduced to the
+    unsigned 32-bit word ``v mod 2^32``.  For width-32 this snaps only the SMALL
+    single-scalar lanes (PC < 4096, SP/BP ≈ 0x10000, all < 2^24 fp32-exact); the
+    wide DATA registers AX/STACK0 use ``_snap_two_limb`` on their two fp32 limbs.
+
+    This is a RUNTIME DECODE helper (Python-side, not a model parameter): the model
+    is fully fp32, and this local argmax stays fp64 because the value vocab reaches
+    ~0x10100 where ``v²`` ≈ 4.3e9 exceeds fp32's 2^24 integer precision (an fp32
+    argmax mis-snaps SP/BP = 0x10000).  No fp64 model params are involved."""
     if vm_width32():
         return _snap_lane_bytes(lane)
     x = float(lane)
@@ -979,16 +985,17 @@ def _snap_lane_bytes(lane: torch.Tensor) -> int:
     ``round(x) = argmax_v (2·v·x − v²)`` — realised round-free as
     ``floor(x + ½)`` (``math.floor``, NOT the ``round`` builtin the AST guard
     forbids; identical to the argmax snap the 8-bit ``_snap_lane`` does, only that
-    flat argmax caps at ~0x10100 and cannot reach 2^32).  In fp64 the lane is exact
-    to 2^53 ≫ 2^32, so ``floor(x+½)`` recovers the exact integer (annihilating the
+    flat argmax caps at ~0x10100 and cannot reach 2^32).  In the two-limb fp32 build
+    this snaps only the SMALL single-scalar lanes (PC < 4096, SP/BP ≈ 0x10000, all <
+    2^24 fp32-exact), so ``floor(x+½)`` recovers the exact integer (annihilating the
     residue — the same job the argmax does).  The integer is then reduced to the
     unsigned 32-bit word ``v mod 2^32`` and split into 4 little-endian bytes by
     exact integer arithmetic.
 
     Sign / overflow: ``% 2^32`` gives the two's-complement word, so a borrow
     (negative lane) or overflow (≥ 2^32) wraps correctly and a large loop counter
-    never aliases a large value to zero.  fp64 required (the width-32 driver runs
-    the model in fp64)."""
+    never aliases a large value to zero.  No fp64 — the model is fp32 and the wide
+    AX/STACK0 registers are snapped from their two fp32 limbs by ``_snap_two_limb``."""
     import math
     r = float(lane)
     # snap to the nearest integer (== the LM-head argmax; floor(x+½) is round-free)

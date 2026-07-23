@@ -186,19 +186,20 @@ def test_countdown_loop_32bit(vm, n):
     assert len(frames) == 4 * n + 2, f"countdown({n}) took {len(frames)} steps"
 
 
-# --- 6. the fp64 single-scalar fallback is intact (kill-switch) -------------
+# --- 6. the width-32 build is ALWAYS fp32 (fp64 fallback retired) -----------
 @_requires_w32
-def test_fp64_fallback_intact():
-    """``C4_VM_TWO_LIMB=0`` (with width-32 on) rebuilds the historical fp64
-    single-scalar model.  Verified in-process by toggling the build context."""
-    with N.two_limb_mode(False):
-        assert not N.vm_two_limb()
-        model, L = N.build_step_model(code_size=6)
-        assert set(p.dtype for p in model.parameters()) == {torch.float64}
-        # a small ADD still works on the fp64 fallback.
-        prog = [("IMM", 6), ("PSH", 0), ("IMM", 7), ("ADD", 0), ("HALT", 0)]
-        _, frames = N.run_program(model, L, isa.assemble(prog), max_steps=50)
-        assert N.decode_trace(frames)[-1] == 13
+def test_width32_build_is_always_fp32():
+    """The fp64 single-scalar width-32 fallback has been RETIRED: the default
+    width-32 build carries AX/STACK0 as two fp32-exact limbs, so the model is
+    genuinely fp32 (zero fp64 params) and there is no fp64 anywhere on the
+    production path."""
+    assert N.vm_two_limb(), "two-limb is the width-32 default"
+    model, L = N.build_step_model(code_size=6)
+    assert set(p.dtype for p in model.parameters()) == {torch.float32}
+    # a small ADD still works fp32.
+    prog = [("IMM", 6), ("PSH", 0), ("IMM", 7), ("ADD", 0), ("HALT", 0)]
+    _, frames = N.run_program(model, L, isa.assemble(prog), max_steps=50)
+    assert N.decode_trace(frames)[-1] == 13
 
 
 if __name__ == "__main__":

@@ -165,7 +165,7 @@ class QwenFullLayout:
     def __init__(self, code_size: int, subset: "Subset",
                  efficient_alu: bool = True, recurrent_divmod: bool = False,
                  code_from_memory: bool = False, shift_via_mul: bool = True,
-                 div_logsink: bool = True):
+                 div_logsink: bool = False):
         # Build the pure-forward layout (all VM compute bands live here).  MUL/DIV/MOD
         # ALWAYS run through the ``nibble_alu32`` fp32 FFN gadgets (the 256x256x3
         # lookup table has been removed entirely), so the layout carries the ALU32
@@ -190,21 +190,16 @@ class QwenFullLayout:
         # the RESOLVED flag the block builder reads.
         self.shift_via_mul = bool(shift_via_mul and subset.muldiv and subset.bitwise
                                   and efficient_alu)
-        # LOG-SINK DIVISION (default): DIV/MOD route through the ~14-block reciprocal
-        # sink + schoolbook-correction gadgets (nibble_logsink_blocks) instead of the
-        # 262-block base-16 recurrent long division.  div_logsink=False keeps the
-        # long-division fallback (recurrent or unrolled), byte-exact.
-        self.div_logsink = div_logsink and efficient_alu and subset.muldiv
+        # DIV/MOD always route through the fp32 base-16 recurrent/unrolled long
+        # division (byte-exact in fp32).  The fp64 log-sink reciprocal divide has been
+        # removed from the production path so the default build is genuinely fp32.
+        # ``div_logsink`` is retained (always resolves False) only so callers passing
+        # the historical kwarg do not error.
+        self.div_logsink = False
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
             _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod,
                                        shift_via_mul=self.shift_via_mul)
-            if self.div_logsink:
-                # log-sink writes the quotient/remainder into the ALU32 DIV_RES/MOD_RES
-                # bands (which the ax-mux reads), so no result-routing change is needed.
-                from . import nibble_logsink_blocks as _LS
-                _LS.extend_layout_for_logsink(L, div_res=L.ALU32.DIV_RES,
-                                              mod_res=L.ALU32.MOD_RES)
         # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
         # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
         # bands.  Off (default) leaves the layout byte-identical, so an existing
@@ -288,8 +283,8 @@ class QwenFullVM:
     n_applied: int = 0            # layers APPLIED per forward (>= n_layers if recurrent)
     code_from_memory: bool = False  # program in KV §Memory (fetch@PC), not a baked table
     shift_via_mul: bool = False   # SHL/SHR via native MUL/DIV (x*2^n / x//2^n), no barrel
-    div_logsink: bool = False     # DIV/MOD via the log-sink reciprocal (fp64), not long div
-    model_dtype: object = torch.float32   # fp64 when div_logsink is active
+    div_logsink: bool = False     # retired: DIV/MOD are fp32 long division (always False)
+    model_dtype: object = torch.float32   # the model is always fp32 (0 fp64 params)
 
 
 def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
@@ -297,17 +292,14 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           efficient_alu: bool = True,
           recurrent_divmod: bool = False, pad_to_stock: bool = False,
           code_from_memory: bool = False, shift_via_mul: bool = True,
-          div_logsink: bool = True) -> QwenFullVM:
+          div_logsink: bool = False) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
-    ``div_logsink`` (default ``True``): DIV/MOD route through the ~14-block LOG-SINK
-    divide (``nibble_logsink_blocks``: a softmax1 reciprocal sink ``1/b`` over 8
-    pre-seeded reserved-KV log-key rows, then ``a·(1/b)+MAGIC`` floor + schoolbook
-    ±1 correction) INSTEAD of the 262-block base-16 long division — shrinking the full
-    ISA build from 291 to ~40 applied layers.  The log-sink blocks (and the model that
-    runs them) are fp64 (the reciprocal + the ``q·b`` correction compare need doubles).
-    ``div_logsink=False`` keeps the ``recurrent_divmod`` / unrolled long-division path
-    (fp32, byte-exact) as the fallback.
+    The model is ALWAYS fp32 (``model_dtype == torch.float32``, zero fp64 params).
+    DIV/MOD route through the ``nibble_alu32`` fp32 base-16 recurrent/unrolled long
+    division (byte-exact in fp32).  The historical fp64 LOG-SINK reciprocal divide
+    has been removed from the production path; ``div_logsink`` is retained as a no-op
+    kwarg (always resolves False) only so legacy callers do not error.
 
     ``efficient_alu`` (default True) bakes MUL/DIV/MOD as the ``nibble_alu32``
     spec-faithful 32-bit fp32 FFN gadgets (byte MUL schoolbook + base-16 long
@@ -343,16 +335,10 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
                               code_from_memory=code_from_memory,
                               shift_via_mul=QL.shift_via_mul,
                               div_logsink=QL.div_logsink)
-    # The log-sink divide (reciprocal softmax1 precision + the q·b correction compare
-    # ~2^34) requires fp64 — the whole model runs in doubles when it is active.
-    model_dtype = torch.float64 if QL.div_logsink else torch.float32
-    # The log-sink div carries QUOTIENT-SCALE scalars (qf, q·b up to ~2^34) in the
-    # residual; the RMSNorm compensator must DOMINATE them (1-r_norm ~ v^2/2K^2 < 0.5),
-    # so raise K to K_DIV=1e15 for the div_logsink model.  SP/BP=65536 and the nibbles
-    # are unperturbed (r~1) and the value-argmax decode reads the preserved scalar.
-    if QL.div_logsink:
-        from .nibble_logsink_blocks import K_DIV
-        K = K_DIV
+    # The model is genuinely fp32-vanilla — every param is float32, zero fp64.  DIV/MOD
+    # are the fp32 base-16 long division (recurrent or unrolled), byte-exact, so no
+    # doubles and no raised K_DIV compensator are needed.
+    model_dtype = torch.float32
     block_names = [nm for nm, _ in block_specs]
     apply_order = getattr(L, "_qwen_apply", None)
 
@@ -416,12 +402,6 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
             mem_idx = block_names.index("mem-cam")
             _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K)
             cam_layers["mem-cam"] = mem_idx
-        if QL.div_logsink:
-            # bake the reciprocal softmax1 sink head (1/b) onto the ls-recip-attn block.
-            from . import nibble_logsink_blocks as LS
-            recip_idx = block_names.index("ls-recip-attn")
-            LS.bake_recip_sink_cam(qmodel.layers[recip_idx].self_attn, L, arch, head_idx=1)
-            cam_layers["ls-recip-attn"] = recip_idx
 
     # RECURRENCE (recurrent divmod): re-point qmodel.layers through the apply order
     # so the forward applies the reused iteration-body layers 8x.  The STORED set
@@ -474,7 +454,7 @@ def compile_ax_zero(L, dim: int) -> Dict[str, torch.Tensor]:
 
 def _block_specs(L, code_size, subset, efficient_alu=True,
                  recurrent_divmod=False, code_from_memory=False,
-                 shift_via_mul=False, div_logsink=True):
+                 shift_via_mul=False, div_logsink=False):
     """The fused-VM FFN block list (one Qwen layer per block).
 
     Returns ``specs`` (list of ``(name, ffn_spec)``); when the efficient-ALU
@@ -548,7 +528,7 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
     #    op's dedicated RES nibble band UNCONDITIONALLY; the ax-mux copies the active
     #    op's result into the AX nibble band gated on OP_IS[op].  The recurrent
     #    divmod stores ONE reused iteration body (repeated 8x by _qwen_apply). ---
-    use_logsink = eff_mdm and getattr(L, "LOGSINK", None) is not None and div_logsink
+    use_logsink = False   # retired: DIV/MOD are always fp32 long division
     if eff_mdm:
         from . import nibble_alu32 as A
         A._ONE = L.ONE
@@ -571,16 +551,7 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
             specs.append((name, spec))
         div_start = len(specs)
         div_apply = []
-        if use_logsink:
-            # LOG-SINK DIVIDE: ~14 blocks (reciprocal sink + schoolbook correction)
-            # replacing the 262-block long division.  Writes into ALU32 DIV_RES/MOD_RES.
-            from . import nibble_logsink_blocks as LS
-            LS._ONE = L.ONE
-            ls_blocks, _ = LS.compile_logsink_blocks(L, dim)
-            for name, spec in ls_blocks:
-                div_apply.append(len(specs))
-                specs.append((name, spec))
-        elif recurrent_divmod:
+        if recurrent_divmod:
             unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim)
             name_to_idx = {}
             for name, spec in unique:
@@ -685,9 +656,7 @@ def _bake_ffn(mlp, spec, L, comp):
     bd = spec.get("b_down")
     if bd is not None and float(bd.abs().max()) != 0.0:
         raise AssertionError("nonzero b_down not supported")
-    # Match the MLP weight dtype (fp64 when the log-sink divide is active) so a
-    # fp64 spec's log-lookup coefficients keep full precision (a float32 round of
-    # ``log(v)/RELU_S`` loses ~1e-7 which the reciprocal amplifies quotient-fold).
+    # Match the MLP weight dtype (always fp32 now — the model is genuinely fp32).
     dt = mlp.gate_proj.weight.dtype
     gate_w = torch.zeros(inter, H, dtype=dt); up_w = torch.zeros(inter, H, dtype=dt)
     down_w = torch.zeros(H, inter, dtype=dt)
@@ -1000,7 +969,14 @@ _REG_TOKEN = {"PC": V.REG_PC, "AX": V.REG_AX, "SP": V.REG_SP, "BP": V.REG_BP,
 
 
 def _snap(x: float) -> int:
-    """LM-head value-argmax requant (argmax_v 2·v·x − v²), no round. Vectorised."""
+    """LM-head value-argmax requant (argmax_v 2·v·x − v²), no round. Vectorised.
+
+    This is a RUNTIME DECODE helper (Python-side, not a model parameter): the
+    genuinely-fp32 model produces the lane ``x``, and this argmax reads it back to an
+    integer register value.  The value vocab reaches ``VALVOCAB ≈ 0x10100`` (SP/BP =
+    0x10000), where ``v²`` ≈ 4.3e9 exceeds fp32's 2^24 integer precision, so the
+    argmax computation stays fp64 to keep the SP/BP snap byte-exact.  The MODEL is
+    still fully fp32 (zero fp64 params); only this local Python argmax uses doubles."""
     from .nibble_vm import VALVOCAB
     v = torch.arange(VALVOCAB, dtype=torch.float64)
     logits = 2.0 * v * float(x) - v * v

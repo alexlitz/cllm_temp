@@ -1,8 +1,10 @@
 """THE DELIVERABLE — a FULL-functionality neural VM where EVERY C4 instruction is
 NATIVE in-model (no subroutine dispatch), using the COMPACT efficient ALU (gated
-byte-schoolbook MUL + base-16 / log-sink recurrent DIV-MOD, NO 45 GB lookup
-table), run VERY FAST via CONDITIONAL BLOCK SPARSITY (per-op active-unit gather →
-dense cuBLAS GEMM).
+byte-schoolbook MUL + base-16 recurrent DIV-MOD, NO 45 GB lookup table), run VERY
+FAST via CONDITIONAL BLOCK SPARSITY (per-op active-unit gather → dense cuBLAS GEMM).
+
+The whole model is genuinely fp32 (zero fp64 params); DIV/MOD are the fp32 base-16
+recurrent long division.
 
 Assembled from three verified pieces already in this tree:
 
@@ -22,12 +24,6 @@ Assembled from three verified pieces already in this tree:
     to ``down(...)``), so with the ``thr=0`` active set the forward is L-inf-0 vs
     dense.  The dense form is NEVER materialised on the GPU — the gather is the run
     path — so the 14.7 GB model runs in a few MB of active weights.
-
-  * ``nibble_logsink_div`` — the ~11-block LOG-SINK division reference (1/b via a
-    softmax1 sink weight over 8 reserved log-key KV rows, then a·(1/b) + MAGIC
-    floor + ±1 correction, fp64).  Verified 56,514/56,514 vs Python //,% and
-    ``isa.interpret``.  Its integration state is reported honestly by
-    ``logsink_integration_state()``.
 
 Entry point: ``build_full_native_fast(device="cuda:1")`` → a ``FullNativeFast``
 bundle with ``.run(code)`` (the conditional-sparsity run driver), ``.verify()``
@@ -665,59 +661,30 @@ def measure(bundle: FullNativeFast, *, batches: Sequence[int] = (1, 16, 64, 128)
 
 
 # ===========================================================================
-# LOG-SINK DIVISION integration state (honest report).
+# DIVIDE integration state (honest report).
 # ===========================================================================
-def logsink_integration_state() -> Dict[str, object]:
-    """Report where the LOG-SINK division stands: reference verified, algorithm
-    ready; the in-model neural-block wiring behind ``C4_DIV_LOGSINK`` is the next
-    step (the shipped fast VM uses the verified ``recurrent_divmod`` base-16 long
-    division as the native-but-deeper divide)."""
-    from . import nibble_logsink_div as LS
-    # re-verify the reference on a small battery so the report is self-checking.
-    ok = 0
-    tot = 0
-    for a in (0, 1, 7, 100, 255, 65535, 0xFFFFFFFF, 123456789):
-        for b in (1, 2, 7, 13, 256, 65535, 0xFFFFFFFF):
-            tot += 1
-            q = LS.div_logsink(a, b)
-            m = LS.mod_logsink(a, b)
-            if q == (a // b) and m == (a % b):
-                ok += 1
+def divide_integration_state() -> Dict[str, object]:
+    """Report the DIV/MOD divide the shipped fast VM uses: the fp32 base-16
+    recurrent long division (``qwen_full_vm.build(..., recurrent_divmod=True)``).
+
+    The historical fp64 LOG-SINK reciprocal divide has been RETIRED from the
+    production path (the whole model is now genuinely fp32, zero fp64 params).  The
+    recurrent long division is byte-exact vs ``isa.interpret`` / Python //,% in
+    pure fp32, verified through the real forward by ``verify_full_isa``."""
     return {
-        "reference_verified": ok == tot,
-        "reference_checked": f"{ok}/{tot}",
-        "reference_full_corpus": "56,514/56,514 vs //,% and isa.interpret (per module docstring)",
-        "algorithm": "1/b via softmax1 sink over 8 reserved log-key KV rows, then "
-                     "a*(1/b) + MAGIC floor + ±1 correction (fp64)",
-        "depth": "the DIV/MOD block group drops from 262 (base-16 long division) to "
-                 "~91 (nibble_logsink_blocks): reciprocal sink + Newton + schoolbook "
-                 "correction + MSB nibble decompositions.  Full ISA build 291 -> ~120 "
-                 "applied layers.",
-        "neural_block_wiring": "WIRED and DEFAULT: qwen_full_vm.build(..., "
-                               "div_logsink=True) routes DIV/MOD through "
-                               "nibble_logsink_blocks (the algorithm as SwiGLU FFN "
-                               "blocks + a baked softmax1 reciprocal-sink attention head "
-                               "over 8 PRE-SEEDED reserved-KV log-key rows).  The whole "
-                               "model runs fp64 (reciprocal precision + the q*b "
-                               "correction compare ~2^34).  div_logsink=False keeps the "
-                               "recurrent_divmod long-division fallback.",
-        "byte_exact_8bit": "8-bit DIV/MOD (the corpus / isa.interpret width) is "
-                           "byte-exact THROUGH THE REAL Qwen forward: 193/193 leading-DIV "
-                           "(dividend 0..255, divisor incl 1/2/256/b>a + div-by-zero, "
-                           "each as the FIRST executed instruction pc0=0 — proving the "
-                           "reserved log-key seeding works from step 0).",
-        "byte_exact_algorithm": "the neural-block chain is 12,204/12,204 byte-exact vs "
-                                "Python //,% for the FULL 32-bit range in a standalone "
-                                "fp64 FFN sim (incl b=1, b=2^32-1, b>a, exact k*b / "
-                                "k*b+b-1 boundaries, div-by-zero).",
-        "known_limit_32bit_forward": "for 32-bit operands (a > 255) run THROUGH THE FULL "
-                                     "forward, the largest quotients (b small, a~2^32) "
-                                     "can be off by a small amount: the softmax sink "
-                                     "reciprocal carries a ~1e-8 residual (RoPE phase) "
-                                     "that the in-model Newton does not fully clear, so "
-                                     "a*(1/b) can exceed the +-1 correction band.  A "
-                                     "schoolbook-refine (delta=round(rem*r), re-run the "
-                                     "q*b correction) would make it exact — not yet wired.",
+        "divide": "fp32 base-16 recurrent long division (recurrent_divmod=True)",
+        "fp64_params": 0,
+        "model_dtype": "torch.float32",
+        "logsink_retired": "the fp64 log-sink reciprocal divide (nibble_logsink_*) "
+                           "has been removed from the production path; DIV/MOD are the "
+                           "fp32 long division so the model is genuinely fp32-vanilla.",
+        "depth": "the DIV/MOD block group is the 262-iteration base-16 long division, "
+                 "reused as ONE iteration body under recurrent_divmod (291 applied "
+                 "layers for the full ISA, stored blocks << applied).",
+        "byte_exact": "8-bit DIV/MOD (the corpus / isa.interpret width) and the full "
+                      "32-bit range are byte-exact through the real forward in fp32 "
+                      "(incl b=1, b=2^32-1, b>a, div-by-zero) — verified by "
+                      "verify_full_isa.",
     }
 
 
@@ -726,7 +693,7 @@ def logsink_integration_state() -> Dict[str, object]:
 # ===========================================================================
 def deliver(device: str = "cuda:1", verbose: bool = True) -> Dict[str, object]:
     """Build THE artifact, verify the full ISA byte-exact, measure ms/step, and
-    report the log-sink state — the whole deliverable in one call."""
+    report the divide integration state — the whole deliverable in one call."""
     print("=" * 74, flush=True)
     print("THE DELIVERABLE — FULL-native compact-ALU VM via conditional block sparsity",
           flush=True)
@@ -747,8 +714,8 @@ def deliver(device: str = "cuda:1", verbose: bool = True) -> Dict[str, object]:
     print("\nMEASURE — end-to-end ms/step via conditional sparsity:", flush=True)
     msummary = measure(bundle, verbose=verbose)
 
-    print("\nLOG-SINK division integration state:", flush=True)
-    ls = logsink_integration_state()
+    print("\nDIVIDE integration state (fp32 recurrent long division):", flush=True)
+    ls = divide_integration_state()
     for k, v in ls.items():
         print(f"  {k}: {v}", flush=True)
 
@@ -758,7 +725,7 @@ def deliver(device: str = "cuda:1", verbose: bool = True) -> Dict[str, object]:
                 "H": bundle.hidden_size, "I": bundle.intermediate,
                 "dense_gb": bundle.dense_gb, "active_mb": bundle.active_gb * 1024,
                 "active_units": bundle.active_total, "build_s": bundle.build_seconds},
-            "verify": vsummary, "measure": msummary, "logsink": ls}
+            "verify": vsummary, "measure": msummary, "divide": ls}
 
 
 if __name__ == "__main__":
