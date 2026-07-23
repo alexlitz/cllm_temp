@@ -127,3 +127,106 @@ def test_tokens_per_step_is_the_honest_cost(vm):
     overlay's 7 — the honest cost of discrete-token registers)."""
     r = VV.run_program_vanilla(vm, isa.assemble([("IMM", 1), ("HALT", 0)]), max_steps=4)
     assert r["tokens_per_step"] == VV.FRAME_LEN == 31
+
+
+# ===========================================================================
+# FULL ISA (mem / cmp / bitwise / muldiv) through the SAME standard loop.
+#
+# Each family reuses the fused-VM COMPUTE blocks from qwen_full_vm into the vanilla
+# discrete-token frame (register nibbles the model EMITS; the register READ is the
+# positional CAM; memory is the address-keyed KV CAM over EMITTED store frames).  The
+# recompute-per-token CPU loop is slow, so these are ``@pytest.mark.slow`` with SHORT
+# programs + the KV-cache incremental decode.  Byte-exact vs isa.interpret (8-bit) for
+# cmp/bitwise/mem and vs ref_interpret(mask=0xFFFFFFFF) for the 32-bit muldiv.
+# ===========================================================================
+@pytest.fixture(scope="module")
+def vm_memcmp():
+    return VV.build(code_size=16, subset=VV.SUBSET_MEM_CMP, device="cpu")
+
+
+@pytest.fixture(scope="module")
+def vm_bitwise():
+    return VV.build(code_size=16, subset=VV.SUBSET_BITWISE, device="cpu")
+
+
+@pytest.fixture(scope="module")
+def vm_full():
+    return VV.build(code_size=16, subset=VV.SUBSET_FULL, device="cpu")
+
+
+def _witness(r):
+    assert r["used_inputs_embeds"] is False      # no computed reg value in inputs_embeds
+    assert r["reencoded_state"] is False         # no python re-encode of a computed value
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("op,a,b,want", [
+    ("EQ", 5, 5, 1), ("EQ", 7, 9, 0), ("LT", 7, 9, 1), ("GT", 9, 7, 1),
+    ("LE", 9, 7, 0), ("GE", 9, 7, 1), ("NE", 7, 9, 1),
+])
+def test_cmp_byte_exact_vanilla(vm_memcmp, op, a, b, want):
+    r = VV.run_program_vanilla(
+        vm_memcmp, isa.assemble([("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)]),
+        max_steps=8)
+    assert r["exact"] and r["ax_trace"][-1] == want, (op, a, b, r)
+    _witness(r)
+
+
+@pytest.mark.slow
+def test_memory_store_load_vanilla(vm_memcmp):
+    """A LI/SI store-load round trip: store 0x23 at addr 5, load it back."""
+    r = VV.run_program_vanilla(
+        vm_memcmp, isa.assemble([("IMM", 5), ("PSH", 0), ("IMM", 0x23), ("SI", 0),
+                                 ("IMM", 5), ("LI", 0), ("HALT", 0)]), max_steps=10)
+    assert r["exact"] and r["ax_trace"][-1] == 0x23, r
+    _witness(r)
+
+
+@pytest.mark.slow
+def test_memory_zfod_unwritten_reads_zero_vanilla(vm_memcmp):
+    r = VV.run_program_vanilla(
+        vm_memcmp, isa.assemble([("IMM", 50), ("LI", 0), ("HALT", 0)]), max_steps=6)
+    assert r["exact"] and r["ax_trace"][-1] == 0, r
+    _witness(r)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("op,a,b,want", [
+    ("OR", 0xF0, 0x0F, 0xFF), ("AND", 0xFF, 0x0F, 0x0F), ("XOR", 0xAA, 0x0F, 0xA5),
+    ("SHL", 3, 2, 12), ("SHR", 0x40, 2, 0x10),
+])
+def test_bitwise_byte_exact_vanilla(vm_bitwise, op, a, b, want):
+    r = VV.run_program_vanilla(
+        vm_bitwise, isa.assemble([("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)]),
+        max_steps=8)
+    assert r["exact"] and r["ax_trace"][-1] == want, (op, a, b, r)
+    _witness(r)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("op,a,b", [("MUL", 13, 11), ("DIV", 200, 13), ("MOD", 250, 9)])
+def test_muldiv_32bit_exact_vanilla(vm_full, op, a, b):
+    """MUL/DIV/MOD emit the FULL 32-bit result in the W=8 AX nibble frame, byte-exact
+    vs ``ref_interpret(mask=0xFFFFFFFF)``.  The 32-bit ax-mux result lives in the AX
+    nibble band; ``ax-muldiv-override`` routes it into AX's emitted nibbles."""
+    from c4_min.nibble_pure_forward_complete import ref_interpret
+    prog = isa.assemble([("IMM", a), ("PSH", 0), ("IMM", b), (op, 0), ("HALT", 0)])
+    want = ref_interpret(prog, max_steps=8, mask=0xFFFFFFFF)[3]
+    r = VV.run_program_vanilla(vm_full, prog, max_steps=8, mask=0xFFFFFFFF)
+    assert r["ax_trace"][3] == want, (op, a, b, want, r)
+    _witness(r)
+
+
+def test_full_isa_still_stock_qwen2_with_wider_frames():
+    """The wider-frame (W=8, 46-token) muldiv build is STILL a stock Qwen2ForCausalLM
+    (no custom modules), and its register widths derive from the subset."""
+    from transformers.models.qwen2 import Qwen2ForCausalLM
+    vm = VV.build(code_size=8, subset=VV.SUBSET_FULL, device="cpu")
+    assert isinstance(vm.model, Qwen2ForCausalLM)
+    assert type(vm.model.model.layers[0].self_attn).__name__ == "Qwen2Attention"
+    assert type(vm.model.model.layers[0].mlp).__name__ == "Qwen2MLP"
+    assert vm.model.config.num_attention_heads == 14 and vm.model.config.num_key_value_heads == 2
+    assert vm.VL.REG_WIDTH == 8 and vm.VL.FRAME_LEN == 46
+    assert VV.reg_width_for(VV.SUBSET_BASE) == 5 and VV.reg_width_for(VV.SUBSET_FULL) == 8
+    assert float(vm.model.model.embed_tokens.weight.abs().sum()) > 0.0   # real embed
+    assert float(vm.model.lm_head.weight.abs().sum()) > 0.0              # real lm_head
