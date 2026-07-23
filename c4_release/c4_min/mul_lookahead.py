@@ -414,7 +414,11 @@ DIM = 4096              # wide enough for every variant's private scratch bands.
 
 def _make_layout():
     L = NibbleVMLayout(8, n_heads=4)
-    extend_layout_for_alu32(L)
+    # Force the RIPPLE ``compile_mul_blocks`` (mul_lookahead=False) so ``build_baseline``
+    # is the 10-block/7-round ripple contender this bakeoff compares AGAINST — the
+    # Kogge-Stone contender here builds its OWN resolve on private ``_scratch`` bands
+    # (``build_kogge_stone``), independent of the production C4_MUL_LOOKAHEAD resolve.
+    extend_layout_for_alu32(L, mul_lookahead=False)
     A._ONE = L.ONE
     return L
 

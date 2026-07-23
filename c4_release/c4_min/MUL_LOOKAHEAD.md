@@ -103,3 +103,28 @@ div lever is the KB-precompute (15 × `_KB_CARRY_ROUNDS = 6` = 90 ripple blocks,
 `KB[k] = k·b`), where a **shared/batched** prefix resolve across the 15 independent
 9-column ripples could shave real depth — out of scope for this standalone multiply
 bakeoff, flagged for follow-up.
+
+## Production integration — `C4_MUL_LOOKAHEAD` (default ON)
+
+The resolve is wired into the production general multiply. `nibble_alu32.compile_mul_blocks`
+now selects the resolve on the `C4_MUL_LOOKAHEAD` flag (**default ON**):
+
+- **ON** (default): `products | split | round-1 | G/P | KS×3 | fused apply` = **8 blocks,
+  6 291 nz** into `ALU32.MUL_RES`. The four resolve builders (`_mul_round1_block`,
+  `_mul_gp_block`, `_mul_ks_stage_block`, `_mul_apply_block`) live in `nibble_alu32`
+  itself (no `mul_lookahead` import → no circular dependency), and the resolve's g/p/t
+  scratch lanes (`ALU_MUL_T`, `ALU_MUL_G0/P0/G1/P1`) are allocated by `ALU32Bands` **only
+  when the flag is on** and **last**, so a flag-OFF layout is byte-identical.
+- **OFF** (`C4_MUL_LOOKAHEAD=0`): the historical `products | split | 7× ripple | result
+  copy` = 10 blocks, 11 430 nz — **byte-identical** to the pre-lookahead build (same
+  `L.D`, same band offsets, same weight tensors; verified tensor-for-tensor against the
+  prior HEAD).
+
+**Scope guard:** only `compile_mul_blocks`' own resolve is flagged. The DIV/MOD path
+(`_kb_precompute_blocks`, the QB normalise) calls `_carry_round_block` **directly** and
+is untouched — it always ripples (its 9-column QB is already only 6 rounds, a wash for
+prefix). Verified byte-exact (a//b, a%b incl div-by-zero, full width) in both flag states.
+
+`mul_lookahead.py` remains the standalone bakeoff/derivation; its `build_baseline`
+contender pins the ripple path (`extend_layout_for_alu32(mul_lookahead=False)`) so it
+still measures the 10-block/7-round baseline it compares against.
