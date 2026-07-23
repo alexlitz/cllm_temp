@@ -830,9 +830,16 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
     if not live:
         return result
     dev = caches[live[0]].K.device
-    H = caches[live[0]].n_heads
     HD = caches[live[0]].head_dim
     scale = caches[live[0]].scale
+
+    # In a DROP-KV split cache ``.K`` holds ONLY the global heads, so the per-group
+    # head count comes from ``.K.shape[1]`` (grouped below), and ``_evict_slopes``
+    # returns the matching global-head slopes so the stack/metric shapes line up.
+    def _evict_slopes(cache):
+        if getattr(cache, "split", False):
+            return cache.slopes.index_select(0, cache._global_head_idx)
+        return cache.slopes
 
     prot = None
     if protect_positions is not None and len(protect_positions) > 0:
@@ -841,9 +848,13 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
 
     # group the live blocks by their current cache size S (no padding within a
     # group -> exact, memory-lean; ONE group in the lockstep common case).
-    by_size: Dict[int, List[int]] = {}
+    by_size: Dict[Tuple[int, int], List[int]] = {}
     for b in live:
-        by_size.setdefault(int(caches[b].pos.shape[0]), []).append(b)
+        # Group by (cache size, HEAD COUNT): a DROP-KV split cache holds only its
+        # GLOBAL heads in ``.K``, and different blocks may have different global-head
+        # counts (e.g. 1 vs 2), so the head axis must match within a stacked group.
+        by_size.setdefault((int(caches[b].pos.shape[0]), int(caches[b].K.shape[1])),
+                           []).append(b)
 
     # TWO memory bounds, both to ``_FUSED_EVICT_MAX_DIST_ELEMS``:
     #   * ``blk_chunk`` bounds the STACKED-cache copy (``blk_chunk*H*S*HD``), so the
@@ -852,9 +863,10 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
     #     (chunks HEADS too when a single block's ``H*S*S`` exceeds budget).
     # On the deep tail S is flat so both are ALL live blocks/heads in ONE fused pass;
     # at a rare pre-flatten large-S prune they shrink — still NO per-block host sync.
-    for S, blocks_S in by_size.items():
+    for (S, Hgrp), blocks_S in by_size.items():
         if S == 0:
             continue
+        H = Hgrp                             # this group's head count (Hg if split)
         blk_chunk = max(1, _FUSED_EVICT_MAX_DIST_ELEMS // max(H * S * HD, 1))
         # ``chunkN`` bounds the per-call near-dup pass.  The FULL-cosine path holds a
         # ``[chunkN, S, S]`` matrix, so it is bounded by ``S*S``.  The DEFAULT two-tier
@@ -882,7 +894,7 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
             keys = torch.stack([caches[b].K[0] for b in grp], dim=0)   # [Lb,H,S,HD]
             vals = torch.stack([caches[b].V[0] for b in grp], dim=0)
             pos = torch.stack([caches[b].pos.to(dev) for b in grp], 0)  # [Lb,S]
-            slope = torch.stack([caches[b].slopes.to(dev) for b in grp], 0)  # [Lb,H]
+            slope = torch.stack([_evict_slopes(caches[b]).to(dev) for b in grp], 0)  # [Lb,H]
 
             # per-(block,head) metric + dead-head selection (batched, on-device).
             vnorm = vals.norm(dim=-1)                                # [Lb,H,S]
@@ -935,6 +947,24 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
     return result
 
 
+class _SplitPastKV:
+    """The past-KV a DROP-KV split cache hands to ``local_attention.windowed_forward``.
+
+    Carries the two head-group caches that live on DIFFERENT (differently-trimmed)
+    position axes: the GLOBAL heads' full-history ``(Kg, Vg, posg)`` and the LOCAL
+    heads' window-trimmed ``(Kl, Vl, posl)``, plus the head-index partition so the
+    forward reads each head from its own group.  A plain 3-tuple past-KV can't carry
+    this (two different Sk), so the windowed forward type-checks for this object.
+    ``Kg`` is ``[1,Hg,Sg,HD]`` (only the global heads); ``Kl`` is ``[1,Hl,Sl,HD]``.
+    """
+    __slots__ = ("Kg", "Vg", "posg", "Kl", "Vl", "posl", "g_idx", "l_idx")
+
+    def __init__(self, Kg, Vg, posg, Kl, Vl, posl, g_idx, l_idx):
+        self.Kg = Kg; self.Vg = Vg; self.posg = posg
+        self.Kl = Kl; self.Vl = Vl; self.posl = posl
+        self.g_idx = g_idx; self.l_idx = l_idx
+
+
 # ===========================================================================
 # BATCHED per-block KV cache + eviction.  We keep the K/V as batched tensors
 # (fast ``torch.matmul`` attention) and drive the eviction KEEP-mask through the
@@ -964,15 +994,83 @@ class BlockKVCacheBatched:
         self.V: Optional[torch.Tensor] = None
         self.pos: Optional[torch.Tensor] = None    # [S]
         self.total_evicted = 0
+        # -- DROP-KV local-attention split (opt-in; None = classic full-H cache) --
+        # When ``set_head_groups`` is called (by ``local_attention.install`` with
+        # drop_local_kv=True), this cache stores the LOCAL (sliding-window) heads'
+        # K/V trimmed to only the last ``local_window`` ABSOLUTE positions and the
+        # GLOBAL (memory/stack/LEV) heads' K/V full-length — two tensors with two
+        # DIFFERENT position axes.  This is what actually shrinks VRAM: the ~7357
+        # local head-slots keep only ~W rows instead of the whole S-row history.
+        self._global_head_idx: Optional[torch.Tensor] = None   # [Hg] long
+        self._local_head_idx: Optional[torch.Tensor] = None    # [Hl] long
+        self._local_window: Optional[int] = None
+        # local-head cache (trimmed to last W positions).  self.K/V/pos above hold
+        # ONLY the GLOBAL heads when split is active (so eviction only touches them).
+        self.Kl: Optional[torch.Tensor] = None     # [1,Hl,Sl,HD]
+        self.Vl: Optional[torch.Tensor] = None
+        self.posl: Optional[torch.Tensor] = None   # [Sl] long
+
+    @property
+    def split(self) -> bool:
+        """True iff this cache is running the drop-KV local/global head split."""
+        return self._local_window is not None
+
+    def set_head_groups(self, global_head_idx, local_window: int) -> None:
+        """Enable the DROP-KV split: ``global_head_idx`` heads keep the FULL causal
+        KV, every other head is LOCAL and keeps only the last ``local_window``
+        ABSOLUTE positions (OLD rows DROPPED, not masked).
+
+        Byte-identical to full attention: a local head's true attention weight past
+        the window is exactly 0 (softmax1 + huge exact-match/role scores + ALiBi
+        recency drive the tail to ZFOD; measured window <= 28 tok < one 30-token VM
+        step, W=64 is >2 steps), so the dropped rows contribute exactly 0.
+        """
+        dev = self.slopes.device
+        g = torch.as_tensor(sorted(int(h) for h in global_head_idx),
+                            dtype=torch.long, device=dev)
+        gset = set(g.tolist())
+        l = torch.as_tensor([h for h in range(self.n_heads) if h not in gset],
+                           dtype=torch.long, device=dev)
+        self._global_head_idx = g
+        self._local_head_idx = l
+        self._local_window = int(local_window)
+
+    def _trim_local(self) -> None:
+        """Drop LOCAL-head cached rows older than the window (keep last W positions
+        by ABSOLUTE position).  A no-op read for the local heads past W, so dropping
+        is EXACT."""
+        if self.posl is None or self._local_window is None:
+            return
+        maxp = int(self.posl.max().item())
+        cutoff = maxp - self._local_window + 1
+        keep = (self.posl >= cutoff)
+        if bool(keep.all()):
+            return
+        keep_idx = torch.nonzero(keep, as_tuple=False).flatten()
+        dropped = int(self.posl.shape[0] - keep_idx.numel())
+        self.Kl = self.Kl.index_select(2, keep_idx)
+        self.Vl = self.Vl.index_select(2, keep_idx)
+        self.posl = self.posl.index_select(0, keep_idx)
+        self.total_evicted += dropped
 
     def as_past_kv(self):
-        if self.K is None:
+        if not self.split:
+            if self.K is None:
+                return None
+            return (self.K, self.V, self.pos)
+        # SPLIT: hand the windowed forward both head-group caches (global full,
+        # local trimmed) plus the head partition so it reads each group's own KV.
+        if self.K is None and self.Kl is None:
             return None
-        return (self.K, self.V, self.pos)
+        return _SplitPastKV(self.K, self.V, self.pos,
+                            self.Kl, self.Vl, self.posl,
+                            self._global_head_idx, self._local_head_idx)
 
     def commit(self, K_new: torch.Tensor, V_new: torch.Tensor,
                pos_new: torch.Tensor) -> None:
         """Append freshly-frozen positions' K/V (``[1,H,W,HD]`` + ``[W]``)."""
+        if self.split:
+            return self._commit_split(K_new, V_new, pos_new)
         if self.K is None:
             self.K, self.V, self.pos = K_new, V_new, pos_new
         else:
@@ -980,8 +1078,45 @@ class BlockKVCacheBatched:
             self.V = torch.cat([self.V, V_new], dim=2)
             self.pos = torch.cat([self.pos, pos_new], dim=0)
 
+    def _commit_split(self, K_new: torch.Tensor, V_new: torch.Tensor,
+                      pos_new: torch.Tensor) -> None:
+        """DROP-KV commit: route the freshly-frozen K/V (``[1,H,W,HD]``) into the two
+        head-group caches — GLOBAL heads appended to the full-history cache, LOCAL
+        heads appended then TRIMMED to the last ``local_window`` positions (old rows
+        DROPPED)."""
+        g, l = self._global_head_idx, self._local_head_idx
+        if l.numel() > 0:
+            Kl_new = K_new.index_select(1, l)
+            Vl_new = V_new.index_select(1, l)
+            if self.Kl is None:
+                self.Kl, self.Vl, self.posl = Kl_new, Vl_new, pos_new
+            else:
+                self.Kl = torch.cat([self.Kl, Kl_new], dim=2)
+                self.Vl = torch.cat([self.Vl, Vl_new], dim=2)
+                self.posl = torch.cat([self.posl, pos_new], dim=0)
+            self._trim_local()          # keep only the last-W local rows (the win)
+        if g.numel() > 0:
+            Kg_new = K_new.index_select(1, g)
+            Vg_new = V_new.index_select(1, g)
+            if self.K is None:
+                self.K, self.V, self.pos = Kg_new, Vg_new, pos_new
+            else:
+                self.K = torch.cat([self.K, Kg_new], dim=2)
+                self.V = torch.cat([self.V, Vg_new], dim=2)
+                self.pos = torch.cat([self.pos, pos_new], dim=0)
+
     def size(self) -> int:
+        # For a split cache this is the GLOBAL-head cache size (the only cache
+        # eviction manages; the local heads are already window-bounded).  For blocks
+        # with no global head it is 0 — honest: those blocks store only ~W local rows.
         return 0 if self.pos is None else int(self.pos.shape[0])
+
+    def local_size(self) -> int:
+        """#local-head cached rows (bounded by the window W). Split cache only."""
+        return 0 if self.posl is None else int(self.posl.shape[0])
+
+    def n_global_heads(self) -> int:
+        return 0 if self._global_head_idx is None else int(self._global_head_idx.numel())
 
     def evict(self, cos_threshold: float, prune_interval: int,
               zero_eps: float, recency_eps: float,
@@ -1013,13 +1148,21 @@ class BlockKVCacheBatched:
         if self.K is None:
             return 0
         S = self.pos.shape[0]
+        # In a DROP-KV split cache ``self.K`` holds ONLY the global heads, so the
+        # eviction runs over the global-head slopes / count (the local heads are
+        # already window-bounded and are pruned by the W-trim on commit).
+        if self.split:
+            n_h = int(self._global_head_idx.numel())
+            slopes = self.slopes.index_select(0, self._global_head_idx)
+        else:
+            n_h, slopes = self.n_heads, self.slopes
         # The keep DECISION is the SHARED spec policy (``evict_keep_index``) — the
         # SAME one the GPU-batched corpus runner uses, so eviction is byte-identical
         # across both drivers (incl. the EXACT dup metric on content-addressed
         # §Memory store heads, without which distinct stores are wrongly merged and
         # a deep-loop LI/LC recalls nothing).
         keep_idx = evict_keep_index(
-            self.K, self.V, self.pos, self.slopes, self.scale, self.n_heads,
+            self.K, self.V, self.pos, slopes, self.scale, n_h,
             cos_threshold=cos_threshold, zero_eps=zero_eps,
             recency_eps=recency_eps, protect_positions=protect_positions)
         dropped = 0 if keep_idx is None else (S - int(keep_idx.numel()))
