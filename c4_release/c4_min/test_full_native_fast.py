@@ -24,11 +24,13 @@ from c4_min import full_native_fast as FNF
 # ---------------------------------------------------------------------------
 # ALWAYS-ON cheap checks (no model build).
 # ---------------------------------------------------------------------------
-def test_logsink_reference_verifies():
-    """The log-sink division reference is byte-exact vs Python //,% on a battery
-    (the algorithm the neural-block C4_DIV_LOGSINK path will implement)."""
-    st = FNF.logsink_integration_state()
-    assert st["reference_verified"] is True, st["reference_checked"]
+def test_divide_integration_state_is_fp32():
+    """The shipped fast VM's divide is the fp32 base-16 recurrent long division —
+    zero fp64 params, byte-exact through the real forward (the fp64 log-sink divide
+    has been retired from the production path)."""
+    st = FNF.divide_integration_state()
+    assert st["fp64_params"] == 0, st
+    assert st["model_dtype"] == "torch.float32", st
 
 
 def test_coverage_corpus_fits_code_size():
