@@ -45,6 +45,7 @@ any other op block.  ``extend_layout_for_alu32`` allocates the scratch bands.
 """
 from __future__ import annotations
 
+import os
 from typing import Dict, List, Tuple
 
 import torch
@@ -56,6 +57,32 @@ from .nibble_vm import S, RELU_S, SILU_S, SILU_HALF, _empty_spec
 _SILU_G = SILU_HALF
 # the layout's ONE lane, set by the builders before emitting (keeps emitters terse).
 _ONE = None
+
+
+# ---------------------------------------------------------------------------
+# C4_MUL_LOOKAHEAD — the general MUL carry resolve.
+#
+# DEFAULT ON: ``compile_mul_blocks`` resolves the 8 post-split carry-save columns
+# with a base-16 Kogge-Stone parallel-prefix carry (round-1 | G/P | 3 prefix
+# combine | fused apply) — ``ceil(log2 8) = 3`` prefix stages + a fused result
+# write = 6 resolve blocks, vs the 7 SERIAL ripple rounds + a separate result copy
+# = 8 blocks the ripple used.  Byte-identical result (both compute the exact
+# carry-propagate over the same split columns).
+#
+# OFF (``C4_MUL_LOOKAHEAD=0``): the historical 7 serial ripple rounds + result
+# copy — byte-identical to the pre-lookahead build (SAME weights, SAME ``L.D``: the
+# resolve's private scratch bands are only allocated when the flag is ON).
+#
+# SCOPE: this flag governs ONLY ``compile_mul_blocks``' own resolve.  The DIV/MOD
+# path (``_kb_precompute_blocks`` / the QB normalise) calls ``_carry_round_block``
+# DIRECTLY and is UNAFFECTED — it always ripples (its 9-column QB is already only 6
+# rounds, a wash for prefix; see mul_lookahead.div_knockon).
+# ---------------------------------------------------------------------------
+def mul_lookahead() -> bool:
+    """True iff the general-MUL carry resolve uses the Kogge-Stone parallel prefix
+    (``C4_MUL_LOOKAHEAD != '0'``, default ON).  OFF -> the 7-ripple path, which is
+    byte-identical to the pre-lookahead build (same weights, same ``L.D``)."""
+    return os.environ.get("C4_MUL_LOOKAHEAD", "1") != "0"
 
 
 # ===========================================================================
@@ -249,7 +276,7 @@ class ALU32Bands:
     """Allocate the scratch bands the 32-bit ALU blocks use (attaches onto L)."""
 
     def __init__(self, L, recurrent_divmod: bool = False,
-                 shift_via_mul: bool = False):
+                 shift_via_mul: bool = False, mul_lookahead: bool = False):
         self.A = L._band("ALU_A", 4)          # operand-A bytes (STACK0 = popped)
         self.B = L._band("ALU_B", 4)          # operand-B bytes (AX = accumulator)
         self.NOTB = L._band("ALU_NOTB", 4)    # ~B bytes (for SUB two's complement)
@@ -301,10 +328,25 @@ class ALU32Bands:
         self.shift_via_mul = shift_via_mul
         if shift_via_mul:
             self.SH_N_OH = L._band("ALU_SH_N_OH", 32)   # one-hot(shift count n), s=0..31
+        # MUL LOOKAHEAD (Kogge-Stone) — resolve scratch, allocated LAST and ONLY when
+        # the flag is on so a flag-OFF build's ``L.D`` (and every earlier band offset)
+        # is byte-identical to the pre-lookahead layout.  The resolve reduces the 8
+        # post-split columns (< 256) to ``t_c`` in [0,30] (T), computes the binary
+        # generate/propagate lanes (G0/P0), Kogge-Stone-combines them across the 3
+        # prefix stages in DOUBLE-BUFFERED lanes (G0/P0 <-> G1/P1), and the fused
+        # apply writes MUL_RES directly.  See ``_mul_lookahead_resolve_blocks``.
+        self.mul_lookahead = mul_lookahead
+        if mul_lookahead:
+            self.MUL_T = L._band("ALU_MUL_T", _MUL_NCOL)    # t_c in [0,30] (post round-1)
+            self.MUL_G0 = L._band("ALU_MUL_G0", _MUL_NCOL)  # generate lane, buffer 0
+            self.MUL_P0 = L._band("ALU_MUL_P0", _MUL_NCOL)  # propagate lane, buffer 0
+            self.MUL_G1 = L._band("ALU_MUL_G1", _MUL_NCOL)  # generate lane, buffer 1
+            self.MUL_P1 = L._band("ALU_MUL_P1", _MUL_NCOL)  # propagate lane, buffer 1
 
 
 def extend_layout_for_alu32(L, recurrent_divmod: bool = False,
-                            shift_via_mul: bool = False):
+                            shift_via_mul: bool = False,
+                            mul_lookahead: "bool | None" = None):
     """Allocate ALU-32 scratch bands on ``L`` and refresh ``L.D`` (pad to heads).
 
     ``recurrent_divmod`` adds the digit-index counter band the reused
@@ -314,11 +356,20 @@ def extend_layout_for_alu32(L, recurrent_divmod: bool = False,
     ``shift_via_mul`` (default False, so every EXISTING caller is byte-identical)
     adds the shift-amount one-hot band used to route SHL/SHR through the NATIVE
     MUL/DIV gadgets (``2**n`` power-of-two table) instead of the barrel shifter;
-    the qwen_full_vm FULL build passes True (muldiv+bitwise), everything else OFF."""
+    the qwen_full_vm FULL build passes True (muldiv+bitwise), everything else OFF.
+
+    ``mul_lookahead`` allocates the Kogge-Stone MUL carry-resolve scratch bands so
+    ``compile_mul_blocks`` can resolve the columns with a parallel prefix instead of
+    7 serial ripples.  ``None`` (default) reads the ``C4_MUL_LOOKAHEAD`` flag (default
+    ON), so the resolve bands are present by default and ``compile_mul_blocks`` uses
+    them; the bands are allocated LAST, so ``C4_MUL_LOOKAHEAD=0`` (the ripple path)
+    is byte-identical to the pre-lookahead layout — same ``L.D``, same band offsets."""
     if getattr(L, "ALU32", None) is not None:
         return L.ALU32
+    if mul_lookahead is None:
+        mul_lookahead = globals()["mul_lookahead"]()   # module-level C4_MUL_LOOKAHEAD reader
     L.ALU32 = ALU32Bands(L, recurrent_divmod=recurrent_divmod,
-                         shift_via_mul=shift_via_mul)
+                         shift_via_mul=shift_via_mul, mul_lookahead=mul_lookahead)
     while L._off % L.n_heads != 0:
         L._scalar(f"_alupad{L._off}")
     L.D = L._off
@@ -459,15 +510,132 @@ def _mul_split_block(L, dim) -> Dict[str, torch.Tensor]:
     return _truncate(spec, u, dim)
 
 
+# ---------------------------------------------------------------------------
+# MUL CARRY-LOOKAHEAD (Kogge-Stone parallel prefix) — the DEFAULT resolve of the
+# 8 post-split carry-save columns (``a.MCOL`` < 256) into ``a.MUL_RES``.  Ported
+# from the proven ``mul_lookahead`` bakeoff (20,685/20,685 byte-exact incl
+# 0xFFFFFFFF^2); it reuses the SAME products+split front-end and the SAME library
+# ``_nibble_carry_round`` for round-1, then replaces the 7 serial ripple rounds
+# with 3 log-depth prefix stages.  See the ``mul_lookahead`` module docstring for
+# the full CLA derivation.  All scratch reads/writes are ALU32 bands allocated by
+# ``ALU32Bands`` when ``mul_lookahead`` is on.
+# ---------------------------------------------------------------------------
+def _mul_round1_block(L, dim, src, dst) -> Dict[str, torch.Tensor]:
+    """One base-16 carry round reducing the post-split columns (< 256) to
+    ``t_c = (src[c] mod 16) + floor(src[c-1]/16)`` in [0, 30].  Reuses the library
+    ``_nibble_carry_round`` (the SAME gadget the ripple baseline uses) — after this
+    ONE round the carries are pure BINARY, so the prefix that follows is clean CLA."""
+    spec = _empty_spec(dim, _MUL_NCOL * (2 + _NIB_KMAX * 2 + _NIB_KMAX * 2 + 2))
+    u = _nibble_carry_round(spec, 0, src, dst, _MUL_NCOL)
+    return _truncate(spec, u, dim)
+
+
+def _mul_gp_block(L, dim, t_band, g_band, p_band) -> Dict[str, torch.Tensor]:
+    """Generate / propagate lanes from ``t_c`` in [0, 30] (SET each):
+        G_c = [t_c >= 16]         (carries out with no incoming carry)
+        P_c = [t_c == 15] = [t_c >= 15] - [t_c >= 16]   (carries out iff incoming).
+    Both 0/1; thresholds 15/16 -> tiny fp32 args."""
+    spec = _empty_spec(dim, _MUL_NCOL * (2 + 2 + 2 + 2))
+    u = 0
+    for c in range(_MUL_NCOL):
+        tc = {t_band + c: 1.0}
+        u = _clear(spec, u, g_band + c)
+        u = _step_ge(spec, u, tc, 0.0, 16, g_band + c, 1.0)             # G = [t>=16]
+        u = _clear(spec, u, p_band + c)
+        u = _step_ge(spec, u, tc, 0.0, 15, p_band + c, 1.0)            # +[t>=15]
+        u = _step_ge(spec, u, tc, 0.0, 16, p_band + c, -1.0)          # -[t>=16] => [t==15]
+    return _truncate(spec, u, dim)
+
+
+def _mul_ks_stage_block(L, dim, g_src, p_src, g_dst, p_dst, d) -> Dict[str, torch.Tensor]:
+    """ONE Kogge-Stone prefix combine stage at distance ``d`` (SET g_dst/p_dst):
+        for c >= d:  (G_c, P_c) := (G_c OR (P_c AND G_{c-d}),  P_c AND P_{c-d})
+        for c <  d:  carried through.
+    0/1 lanes, single-staircase exact forms:
+        G_c OR (P_c AND G_{c-d}) = [2*G_c + P_c + G_{c-d} >= 2]
+        P_c AND P_{c-d}          = [P_c + P_{c-d} >= 2].
+    Reads the block INPUT (the previous stage's g_src/p_src), so one block."""
+    spec = _empty_spec(dim, _MUL_NCOL * (2 + 2 + 2 + 2))
+    u = 0
+    for c in range(_MUL_NCOL):
+        if c >= d:
+            gform = {g_src + c: 2.0, p_src + c: 1.0, g_src + c - d: 1.0}
+            u = _clear(spec, u, g_dst + c)
+            u = _step_ge(spec, u, gform, 0.0, 2, g_dst + c, 1.0)
+            pform = {p_src + c: 1.0, p_src + c - d: 1.0}
+            u = _clear(spec, u, p_dst + c)
+            u = _step_ge(spec, u, pform, 0.0, 2, p_dst + c, 1.0)
+        else:
+            u = _clear(spec, u, g_dst + c)
+            u = _ident(spec, u, {g_src + c: 1.0}, 0.0, g_dst + c, 1.0)
+            u = _clear(spec, u, p_dst + c)
+            u = _ident(spec, u, {p_src + c: 1.0}, 0.0, p_dst + c, 1.0)
+    return _truncate(spec, u, dim)
+
+
+def _mul_apply_block(L, dim, t_band, g_final, res_band) -> Dict[str, torch.Tensor]:
+    """Final digits into MUL_RES (SET), fused with the carry-apply (no separate copy):
+        b_c = G_final[c-1]  (carry INTO column c; b_0 = 0)
+        digit_c = t_c + G_final[c-1] - 16*G_final[c]
+    (since [t_c + b_c >= 16] = b_{c+1} = G_final[c]).  The top column's carry-out
+    G_final[NCOL-1] overflows past the kept nibbles and is dropped (exactly as the
+    ripple baseline dropped the top carry -> result & 0xFFFFFFFF)."""
+    spec = _empty_spec(dim, _MUL_NCOL * 4)
+    u = 0
+    for c in range(_MUL_NCOL):
+        u = _clear(spec, u, res_band + c)
+        u = _ident(spec, u, {t_band + c: 1.0}, 0.0, res_band + c, 1.0)          # + t_c
+        if c >= 1:
+            u = _ident(spec, u, {g_final + c - 1: 1.0}, 0.0, res_band + c, 1.0)  # + b_c
+        u = _ident(spec, u, {g_final + c: 1.0}, 0.0, res_band + c, -16.0)        # - 16*b_{c+1}
+    return _truncate(spec, u, dim)
+
+
+def _mul_lookahead_resolve_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+    """Resolve the split columns (``a.MCOL`` < 256) into ``a.MUL_RES`` with the
+    Kogge-Stone parallel prefix: round-1 (-> t_c in [0,30]) | G/P | 3 prefix combine
+    stages (double-buffered) | fused apply.  ``ceil(log2 8) = 3`` prefix stages
+    replace the 7 serial ripple rounds; the apply fuses the result write."""
+    a = L.ALU32
+    blocks: List[Tuple[str, Dict[str, torch.Tensor]]] = []
+    blocks.append(("alu-mul-round1", _mul_round1_block(L, dim, a.MCOL, a.MUL_T)))
+    blocks.append(("alu-mul-gp", _mul_gp_block(L, dim, a.MUL_T, a.MUL_G0, a.MUL_P0)))
+    (gs, ps), (gd, pd) = (a.MUL_G0, a.MUL_P0), (a.MUL_G1, a.MUL_P1)
+    d = 1
+    st = 0
+    while d < _MUL_NCOL:
+        blocks.append((f"alu-mul-ks{st}",
+                       _mul_ks_stage_block(L, dim, gs, ps, gd, pd, d)))
+        (gs, ps), (gd, pd) = (gd, pd), (gs, ps)   # swap buffers
+        d *= 2
+        st += 1
+    blocks.append(("alu-mul-apply", _mul_apply_block(L, dim, a.MUL_T, gs, a.MUL_RES)))
+    return blocks
+
+
 def compile_mul_blocks(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+    """32-bit MUL block stack: products + split front-end, then the column carry
+    resolve into ``a.MUL_RES``.
+
+    ``C4_MUL_LOOKAHEAD`` (default ON, via ``L.ALU32.mul_lookahead``) selects the
+    Kogge-Stone parallel-prefix resolve (round-1 | G/P | 3 prefix stages | fused
+    apply = 6 blocks); OFF selects the 7 serial ripple rounds + result copy — the
+    two are byte-identical over every operand.  The DIV/MOD path is UNAFFECTED (it
+    calls ``_carry_round_block`` directly and always ripples)."""
     global _ONE
     _ONE = L.ONE
     a = L.ALU32
     blocks = [("alu-mul-products", _mul_products_block(L, dim)),
               ("alu-mul-split", _mul_split_block(L, dim))]
-    # carry rounds settle every column to a single nibble.  A carry ripples one
-    # column per round; split partials keep columns < 256 so _MUL_CARRY_ROUNDS
-    # (verified worst-case + headroom) fully settle it, kmax=15 each -> tiny.
+    if getattr(a, "mul_lookahead", False):
+        # KOGGE-STONE resolve: 3 log-depth prefix stages settle the columns and the
+        # fused apply writes MUL_RES (no separate result copy).
+        blocks += _mul_lookahead_resolve_blocks(L, dim)
+        return blocks
+    # RIPPLE (flag-OFF, byte-identical to the pre-lookahead build): carry rounds
+    # settle every column to a single nibble.  A carry ripples one column per round;
+    # split partials keep columns < 256 so _MUL_CARRY_ROUNDS (verified worst-case +
+    # headroom) fully settle it, kmax=15 each -> tiny.
     src, dst = a.MCOL, a.MC1
     for r in range(_MUL_CARRY_ROUNDS):
         blocks.append((f"alu-mul-carry{r}", _carry_round_block(L, dim, src, dst, _MUL_NCOL)))

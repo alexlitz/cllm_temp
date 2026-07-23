@@ -237,9 +237,16 @@ def _result_copy_block(L, dim, src, res, dt=torch.float32) -> Block:
 def build_nibble_baseline(L, dim) -> Tuple[List[Block], int, dict]:
     A._ONE = L.ONE
     blocks = compile_mul_blocks(L, dim)
+    lookahead = getattr(L.ALU32, "mul_lookahead", False)   # C4_MUL_LOOKAHEAD (default ON)
     info = {
-        "note": "production nibble schoolbook; PP<=225, columns<256 -> fp32",
-        "n_products": 36, "carry_rounds": 7, "max_staircase_arg": 225,
+        "note": ("production nibble schoolbook; PP<=225, columns<256 -> fp32; "
+                 + ("Kogge-Stone parallel-prefix carry resolve (3 prefix stages)"
+                    if lookahead else "7 serial ripple carry rounds")),
+        "n_products": 36,
+        "carry_rounds": (0 if lookahead else 7),
+        "prefix_stages": (3 if lookahead else 0),
+        "resolve": ("kogge_stone" if lookahead else "ripple"),
+        "max_staircase_arg": 225,
     }
     return list(blocks), L.ALU32.MUL_RES, info
 
