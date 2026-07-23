@@ -400,6 +400,330 @@ def speculation_model(naive_wall_s: float, ms_step: float, mac_steps: int,
     }
 
 
+# ===========================================================================
+# BLOCK-SPARSE self-emulation wall — the SAME scalar MAC (the multiply a matmul
+# forward is built from), but run through the BLOCK-SPARSE conditional-dispatch
+# fast path (``full_native_fast`` / ``ConditionalBlockLean``) instead of the DENSE
+# overlay every-block-every-step build ``measure`` times.
+#
+# The dense build (`build_vm` above) runs all ~154 applied blocks every step ->
+# ~337.8 ms/step -> a 9.38-day wall.  The block-sparse path GATHERS only each op's
+# active FFN units (a few MB) and runs a dense cuBLAS GEMM on just that block; the
+# MAC's per-step forward is byte-EXACT (thr=0 drop adds exactly 0 to
+# down(silu(up)*gate)).  Scoped to the MAC's own ops (IMM/PSH/MUL/HALT) the active
+# union is ~0.58% of dense (~47 MB); the full-ISA union is ~2.63%.  MEASURED
+# per-step (block-verify, single-stream, k=32/64) is single-digit ms/step —
+# ~41-64x cheaper than the dense 337.8.  This function measures that on a GENUINE
+# forward and re-extrapolates the SAME 2.4M-step / speculation basis.
+# ===========================================================================
+def _driver_ms_per_step(bundle, code, *, block_steps: int, reps: int,
+                        cuda: bool) -> Tuple[float, int, int]:
+    """End-to-end block-verify DRIVER ms/step for ``code`` (warm + ``reps`` timed)."""
+    r = bundle.run(code, block_steps=block_steps)     # warm
+    if cuda:
+        torch.cuda.synchronize()
+    t = time.perf_counter()
+    for _ in range(reps):
+        r = bundle.run(code, block_steps=block_steps)
+    if cuda:
+        torch.cuda.synchronize()
+    ms = (time.perf_counter() - t) / reps * 1000.0
+    return ms / max(r.steps, 1), r.steps, r.forwards
+
+
+def measure_block_sparse(dev: str = None, reps: int = 20,
+                         batches: Tuple[int, ...] = (1, 16, 64),
+                         local_window: int = None) -> Dict[str, object]:
+    """Run the SAME scalar MAC (``scalar_mac_prog``, the multiply a matmul forward
+    is built from) through the BLOCK-SPARSE conditional-dispatch fast path, measure
+    the block-sparse per-step on a genuine forward, and re-extrapolate the honest
+    self-emulation wall on the SAME 2.4M-step / speculation basis ``measure`` uses.
+
+    Composition report: block-sparse conditional dispatch + fp32 (the lean weights
+    are extracted fp32 from the fp64-DIV VM) + perfect-draft speculation.  KV-drop
+    (local sliding-window attention) is checked for availability and its effect
+    reported IF it cleanly installs on the conditional model.
+    """
+    from . import full_native_fast as FNF
+
+    dev = dev or _dev()
+    cuda = dev.startswith("cuda")
+    t0 = time.time()
+    # Scope the active-unit union to the MAC's OWN opcodes (IMM/PSH/MUL/HALT): the
+    # union must cover every FFN unit that FIRES for the timed program, and the MAC
+    # is a pure multiply — no DIV/MOD megablock — so this keeps the probe + the
+    # conditional block SMALL and GPU-safe while staying byte-exact for the MAC.
+    mac_ops = [isa.IMM, isa.PSH, isa.MUL, isa.HALT]
+    bundle = FNF.build_full_native_fast(device=dev, ops=mac_ops, verbose=True)
+    build_s = time.time() - t0
+
+    # fp32 build check (the block-sparse conditional weights are fp32 even though the
+    # DIV/MOD path of the source VM is fp64) — this is the "fp32-only" lever.
+    is_fp32 = (bundle.dense_lean.dtype == torch.float32)
+
+    w, x = 3, 5
+    code = isa.assemble(scalar_mac_prog(w, x))
+    ref = (w * x) & 0xFF
+
+    # (A) BYTE-EXACT MAC through the CONDITIONAL block-sparse model + cross-check
+    #     conditional == dense (the byte-identity of the sparse kernel).
+    rc = bundle.run(code, block_steps=32)
+    rd = bundle.run_dense(code, block_steps=32)
+    mac_ax = rc.ax_trace[-1] if rc.ax_trace else -1
+    byte_exact = (mac_ax == ref) and rc.exact
+    cond_eq_dense = (rc.ax_trace == rd.ax_trace)
+
+    # (B) tokens/step (window length) for the MAC through the block-sparse driver —
+    #     the SAME structural quantity the dense tool reports (reuse the basis).
+    xw, posw, _ = PC_windows(bundle.dense_lean, code)
+    tokens_per_step = float(xw.shape[1])          # window S (BOS + stores + regs + STEP_END)
+
+    # (C) BLOCK-SPARSE per-step compute on GENUINE conditional forwards.  THREE
+    #     numbers, all real forwards on the gathered active block:
+    #       * DRIVER ms/step = the end-to-end block-verify driver wall / VM steps,
+    #         measured on a REAL multi-step program (a compact SUB/BNZ countdown that
+    #         fits the code table).  This is the honest SINGLE-STREAM per-step and the
+    #         apples-to-apples comparison to the dense tool's 337.8 driver ms/step: the
+    #         deep-layer per-FORWARD launch cost is amortised over block_steps VM steps
+    #         by the block-verify path (exactly as it is in the dense build).  A 5-step
+    #         MAC alone is NOT representative — its one short forward is launch-bound
+    #         over the 154-layer stack and would OVER-state the per-step.
+    #       * MAC driver ms/step = the same driver on the 5-step MAC (reported for
+    #         completeness — the launch-bound single-forward number).
+    #       * forward us/step at batch B = the amortised conditional-forward cost at
+    #         speculation batch B (one window = one VM step) — the batched ceiling.
+    cond = bundle.cond
+    # honest single-stream driver ms/step on a real multi-step loop (SUB/BNZ
+    # countdown from 60 → 0; compact enough for the code table, many VM steps).
+    loop = isa.assemble([("IMM", 60), ("PSH", 0), ("IMM", 1),
+                         ("SUB", 0), ("BNZ", 1), ("HALT", 0)])
+    driver_ms_per_step, loop_steps, loop_fwds = _driver_ms_per_step(
+        bundle, loop, block_steps=32, reps=max(reps // 4, 3), cuda=cuda)
+    driver_ms_per_step_k64, _, _ = _driver_ms_per_step(
+        bundle, loop, block_steps=64, reps=max(reps // 4, 3), cuda=cuda)
+
+    # the 5-step MAC's own driver ms/step (launch-bound single forward — reported,
+    # NOT used as the wall basis).
+    mac_driver_ms_per_step, _, _ = _driver_ms_per_step(
+        bundle, code, block_steps=32, reps=reps, cuda=cuda)
+
+    # batched conditional-forward us/step (replicate ONE MAC step-window to batch B).
+    base_x = xw[:1].to(dev).contiguous()
+    base_pos = posw[:1].to(dev).contiguous()
+    fwd_us_per_step: Dict[int, float] = {}
+    for B in batches:
+        try:
+            xb = base_x.expand(B, -1, -1).contiguous()
+            pb = base_pos.expand(B, -1).contiguous()
+            if cuda:
+                torch.cuda.synchronize()
+            for _ in range(5):
+                cond.forward(xb, q_positions=pb)
+            if cuda:
+                torch.cuda.synchronize()
+            t = time.perf_counter()
+            for _ in range(reps):
+                cond.forward(xb, q_positions=pb)
+            if cuda:
+                torch.cuda.synchronize()
+            fwd_ms = (time.perf_counter() - t) / reps * 1000.0
+            fwd_us_per_step[B] = fwd_ms / B * 1000.0   # us/step (one window = one VM step)
+            del xb, pb
+            if cuda:
+                torch.cuda.empty_cache()
+        except (RuntimeError, torch.cuda.OutOfMemoryError):
+            fwd_us_per_step[B] = None
+            if cuda:
+                torch.cuda.empty_cache()
+
+    # the single per-step compute the wall reduces to: the honest single-stream
+    # DRIVER ms/step (block_steps=32) on a real multi-step program — the apples-to-
+    # apples analogue of the dense tool's 337.8 driver ms/step.
+    ms_step_blocksparse = driver_ms_per_step
+
+    # (D) EXTRAPOLATE the SAME 2.4M-step basis with the block-sparse per-step.
+    dense_ms_step = 337.8                           # the labeled DENSE per-step (this tool)
+    dense_wall_s = SELF_FORWARD_STEPS * (dense_ms_step / 1000.0)
+    bs_wall_s = SELF_FORWARD_STEPS * (ms_step_blocksparse / 1000.0)
+    spec = speculation_model(
+        naive_wall_s=bs_wall_s, ms_step=ms_step_blocksparse, mac_steps=rc.steps,
+        dot2_diverges=True)
+
+    # (E) COMPOSE KV-drop (local sliding-window attention) IF available on the
+    #     conditional model.  local_attention.install_local_attention targets the
+    #     c4_min pure-forward SparseAttn model (the bench_fast_path lib model), NOT
+    #     the LeanQwenVM/ConditionalBlockLean forward, so it does NOT drop directly
+    #     onto THIS conditional model — report availability + the honest caveat.
+    kv_drop = _kv_drop_state(bundle, local_window)
+
+    out: Dict[str, object] = {
+        "device": dev, "build_s": build_s, "fp32": is_fp32,
+        "artifact": {
+            "stored_blocks": bundle.n_layers_stored,
+            "applied_layers": bundle.n_layers_applied,
+            "H": bundle.hidden_size, "I": bundle.intermediate,
+            "dense_gb": bundle.dense_gb, "active_mb": bundle.active_gb * 1024,
+            "active_units": bundle.active_total,
+            "active_frac": bundle.active_total / (bundle.intermediate * bundle.n_layers_applied),
+            "scoped_ops": [isa.NAMES[o] for o in mac_ops],
+        },
+        "mac": {"w": w, "x": x, "ref": ref, "model": mac_ax,
+                "byte_exact": byte_exact, "cond_eq_dense": cond_eq_dense,
+                "steps": rc.steps, "tokens_per_step": tokens_per_step},
+        "blocksparse_per_step": {
+            "driver_ms_per_step_loop_k32": driver_ms_per_step,
+            "driver_ms_per_step_loop_k64": driver_ms_per_step_k64,
+            "loop_steps": loop_steps, "loop_forwards": loop_fwds,
+            "mac_driver_ms_per_step": mac_driver_ms_per_step,
+            "forward_us_per_step": fwd_us_per_step,
+            "ms_per_step_single_stream": ms_step_blocksparse,
+            "dense_ms_per_step": dense_ms_step,
+            "per_step_speedup_vs_dense": dense_ms_step / max(ms_step_blocksparse, 1e-9),
+        },
+        "extrapolation": {
+            "basis_steps": SELF_FORWARD_STEPS,
+            "tokens_per_vm_step": tokens_per_step,
+            "dense_ms_per_step": dense_ms_step,
+            "dense_wall_days": dense_wall_s / 86400.0,
+            "blocksparse_ms_per_step": ms_step_blocksparse,
+            "blocksparse_wall_seconds": bs_wall_s,
+            "blocksparse_wall_hours": bs_wall_s / 3600.0,
+            "blocksparse_wall_days": bs_wall_s / 86400.0,
+            "blocksparse_spec_single_days": spec["wall_days_single_prog_spec"],
+            "blocksparse_spec_batched_days": spec["wall_days_batched_spec"],
+        },
+        "speculation": spec,
+        "kv_drop": kv_drop,
+        "composed": {
+            "block_sparse": True,
+            "fp32": is_fp32,
+            "speculation_single_32x": True,
+            "speculation_batched_54_7x": True,
+            "kv_drop_local_window": kv_drop["installed_on_conditional"],
+            "radix16_shallow_div": _radix16_available(),
+        },
+    }
+    if cuda:
+        out["peak_cuda_gb"] = torch.cuda.max_memory_allocated(dev) / 1e9
+    return out
+
+
+def PC_windows(lean, code):
+    """One-window builder for the MAC (delegates to the conditional-sparse module's
+    repetitive-program window builder so the token frame matches the run driver)."""
+    from . import perlayer_conditional_sparse as PC
+    return PC.repetitive_program_windows(lean, code, max_steps=64)
+
+
+def _radix16_available() -> bool:
+    """Is a hardened radix-16 / log-sink SHALLOW-divide module present on the branch
+    (composes further on DIV/MOD-heavy self-forwards, not on the pure-MUL MAC)?"""
+    try:
+        from . import nibble_logsink_blocks  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _kv_drop_state(bundle, local_window) -> Dict[str, object]:
+    """KV-drop (local sliding-window attention) composition state.  The
+    ``local_attention`` module is present on the branch and byte-identical (windowed
+    ingest heads' tail weight is 0), but it installs on the c4_min pure-forward
+    SparseAttn model (the ``bench_fast_path`` lib model), NOT on the
+    LeanQwenVM/ConditionalBlockLean forward this fast path uses — so it does not drop
+    directly onto THIS conditional model.  Report availability + the honest caveat."""
+    try:
+        from . import local_attention  # noqa: F401
+        available = True
+    except Exception:
+        available = False
+    return {
+        "module_available": available,
+        "installed_on_conditional": False,
+        "note": ("local_attention.install_local_attention targets the c4_min "
+                 "pure-forward SparseAttn (bench_fast_path lib model), not the "
+                 "LeanQwenVM/ConditionalBlockLean forward; KV-drop composes on the "
+                 "bench_fast_path driver (bigger K per VRAM) — a THROUGHPUT lever "
+                 "orthogonal to the per-step compute measured here — not directly "
+                 "on this conditional model."),
+        "requested_window": local_window,
+    }
+
+
+def _fmt_block_sparse(rep: Dict[str, object]) -> str:
+    a = rep["artifact"]
+    mac = rep["mac"]
+    bs = rep["blocksparse_per_step"]
+    e = rep["extrapolation"]
+    sp = rep["speculation"]
+    kv = rep["kv_drop"]
+    comp = rep["composed"]
+    fwd = "  ".join(
+        f"B{B}={bs['forward_us_per_step'][B]:.1f}us"
+        if bs["forward_us_per_step"].get(B) is not None else f"B{B}=OOM"
+        for B in bs["forward_us_per_step"])
+    lines = [
+        "=" * 78,
+        "SELF-EMULATION WALL (BLOCK-SPARSE) — the same MAC through conditional dispatch",
+        "=" * 78,
+        f"device={rep['device']}  build={rep['build_s']:.1f}s  fp32={rep['fp32']}",
+        f"ARTIFACT: {a['stored_blocks']} stored blocks / {a['applied_layers']} applied "
+        f"layers  H={a['H']} I={a['I']}",
+        f"  dense FFN = {a['dense_gb']:.1f} GB (dense build OOMs / runs every block "
+        f"every step) ; conditional active block = {a['active_mb']:.1f} MB "
+        f"({a['active_units']} units = {a['active_frac']*100:.4f}% of dense) — the RUN path",
+        f"  scoped to MAC ops {a['scoped_ops']} (pure multiply — no DIV/MOD megablock)",
+        "",
+        "(1) BYTE-EXACT self-emulated MULTIPLY through BLOCK-SPARSE conditional dispatch:",
+        f"    scalar MAC  {mac['w']}*{mac['x']} = {mac['ref']}: model={mac['model']}  "
+        f"byte_exact={mac['byte_exact']}  cond==dense={mac['cond_eq_dense']}  "
+        f"steps={mac['steps']}  tokens/step={mac['tokens_per_step']:.0f}",
+        "",
+        "(2) BLOCK-SPARSE PER-STEP (genuine conditional forwards) vs the DENSE 337.8 ms/step:",
+        f"    DRIVER ms/step (single-stream, real multi-step loop, {bs['loop_steps']} steps in "
+        f"{bs['loop_forwards']} fwds): k=32 {bs['driver_ms_per_step_loop_k32']:.2f}  "
+        f"k=64 {bs['driver_ms_per_step_loop_k64']:.2f} ms/step",
+        f"    (5-step MAC-only driver = {bs['mac_driver_ms_per_step']:.1f} ms/step — launch-bound "
+        f"single forward over the 154-layer stack, NOT the wall basis)",
+        f"    batched conditional forward us/step: {fwd}",
+        f"    -> single-stream per-step = {bs['ms_per_step_single_stream']:.3f} ms/step  "
+        f"(vs dense {bs['dense_ms_per_step']:.1f} ms/step = "
+        f"{bs['per_step_speedup_vs_dense']:.0f}x faster per step)",
+        "",
+        "(3) EXTRAPOLATION — SAME 2.4M-step / speculation basis, block-sparse per-step:",
+        f"    basis: {e['basis_steps']:,} VM steps  tokens/step={e['tokens_per_vm_step']:.0f}",
+        f"    DENSE wall (labeled)              = {e['dense_ms_per_step']:.1f} ms/step "
+        f"-> {e['dense_wall_days']:.2f} days",
+        f"    BLOCK-SPARSE wall                 = {e['blocksparse_ms_per_step']:.3f} ms/step "
+        f"-> {e['blocksparse_wall_hours']:.2f} h = {e['blocksparse_wall_days']:.3f} days",
+        f"    BLOCK-SPARSE + spec (single 32x)  = {e['blocksparse_spec_single_days']:.4f} days "
+        f"({e['blocksparse_spec_single_days']*24:.2f} h)",
+        f"    BLOCK-SPARSE + spec (batched 54.7x, B=64) = {e['blocksparse_spec_batched_days']:.4f} days "
+        f"({e['blocksparse_spec_batched_days']*24:.2f} h)",
+        "",
+        "(4) COMPOSED optimizations on this measurement:",
+        f"    block-sparse conditional dispatch: {comp['block_sparse']}",
+        f"    fp32-only build:                   {comp['fp32']}",
+        f"    perfect-draft speculation single 32x / batched 54.7x: "
+        f"{comp['speculation_single_32x']} / {comp['speculation_batched_54_7x']}",
+        f"    KV-drop (local window) on THIS conditional model: "
+        f"{comp['kv_drop_local_window']}  ({kv['note']})",
+        f"    radix-16 / log-sink shallow-divide module present: {comp['radix16_shallow_div']} "
+        f"(composes on DIV/MOD-heavy forwards; the MAC is pure MUL so it is not on this path)",
+        "",
+        "HONEST HEADLINE:",
+        f"    dense self-emulation wall     = {e['dense_wall_days']:.2f} days",
+        f"    block-sparse alone            = {e['blocksparse_wall_days']:.3f} days "
+        f"({e['dense_wall_days']/max(e['blocksparse_wall_days'],1e-9):.0f}x faster)",
+        f"    + speculation (single 32x)    = {e['blocksparse_spec_single_days']:.4f} days",
+        f"    + speculation (batched 54.7x) = {e['blocksparse_spec_batched_days']:.4f} days "
+        f"= {e['blocksparse_spec_batched_days']*24:.2f} h",
+    ]
+    if "peak_cuda_gb" in rep:
+        lines.append(f"\npeak cuda mem = {rep['peak_cuda_gb']:.2f} GB")
+    return "\n".join(lines)
+
+
 def _fmt(rep: Dict[str, object]) -> str:
     e = rep["extrapolation"]
     mac = rep["mac"]
@@ -485,10 +809,28 @@ def _fmt(rep: Dict[str, object]) -> str:
 
 
 def main() -> int:
+    import argparse
     import json
-    reps = int(os.environ.get("C4_SELF_EMU_REPS", "3"))
-    rep = measure(reps=reps)
-    print(_fmt(rep))
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--block-sparse", action="store_true",
+                    help="measure the self-emulation wall through the BLOCK-SPARSE "
+                         "conditional-dispatch fast path (full_native_fast / "
+                         "ConditionalBlockLean) instead of the DENSE overlay build.")
+    ap.add_argument("--device", default=None,
+                    help="override C4_SELF_EMU_DEV (e.g. cuda:0).")
+    ap.add_argument("--local-window", type=int, default=None,
+                    help="requested KV-drop local sliding-window (reported).")
+    ap.add_argument("--reps", type=int,
+                    default=int(os.environ.get("C4_SELF_EMU_REPS", "3")))
+    a = ap.parse_args()
+    dev = a.device or _dev()
+    if a.block_sparse:
+        rep = measure_block_sparse(dev=dev, reps=max(a.reps, 20),
+                                   local_window=a.local_window)
+        print(_fmt_block_sparse(rep))
+    else:
+        rep = measure(dev=dev, reps=a.reps)
+        print(_fmt(rep))
     dump = os.environ.get("C4_SELF_EMU_JSON")
     if dump:
         with open(dump, "w") as f:
