@@ -70,6 +70,7 @@ SCALE = 60.0     # silu-identity scale: silu(60)~=60, silu(-60)~=0.
 WIDTH_BITS = 32
 N_NIB = NIB_PER_REG          # 16 nibbles per 32-bit register (§569-571).
 SHIFT_MASK = WIDTH_BITS - 1  # AX & 0x1F — C's 32-bit shift-count mask.
+LOG_STAGES = 5               # log2(32): shift amounts 1,2,4,8,16 — one stage per n-bit.
 
 
 def _relu_t(z: torch.Tensor) -> torch.Tensor:
@@ -192,80 +193,105 @@ def and_gadget(a: int, b: int) -> int:
 
 
 # ===========================================================================
-# §Shifts — multiply-by / floor-divide-by a selected power of two.
+# §Shifts — a bitwise LOG-SHIFTER (5 conditional 2^k stages), NOT a barrel
+# select and NOT shift-via-mul.
 # ===========================================================================
 #
-# The shift amount ``s = AX & 0x1F`` (§ISA: shift-count masked to 5 bits for a
-# 32-bit operand). We select the power of two ``2**s`` with the §510 point
-# indicator over ``s`` (0..31) and:
-#   SHL:  result = (pop * 2**s)  mod 2**32   (§Shifts: multiply by powers of two;
-#                                             overflow handled by the mod-floor)
-#   SHR:  result = floor(pop / 2**s)         (§Shifts / §Chars right-shift)
-# The multiply uses the SwiGLU multiply primitive (§Basic Arithmetic) and the
-# mod-2**32 / floor use the clamped-relu / MAGIC floor of §Efficient Floor —
-# realised here on exact-integer silu math (no python <<, >>, or round of the
-# *values*).
+# A shift by ``n`` is 5 conditional stages, each gated on one bit of ``n``:
+#
+#     for k in 0..4:                       # shift amounts 1, 2, 4, 8, 16
+#         if n_bit_k:  x = x shifted by 2**k   (left for SHL, right for SHR)
+#
+# so the whole shift is ``O(bits × log2(32)) = 5`` stages instead of the full
+# per-(source-bit × shift-amount) select.  Each stage is a per-output-bit 2:1
+# MUX between "same bit" and "the bit 2**k away", gated on ``n``'s bit k — built
+# from the SAME boolean AND/OR machinery the bitwise ops use.  ``n`` is the AX
+# operand and its bits are exactly the AX bit-planes ``B_BIT``:
+#     n_bit_0..4  =  bits 0..4 of AX  =  ``B_BIT[0..4]``.
+# Because every value is a 0/1 bit-plane, the whole shifter is fp32-EXACT — no
+# scalar 32-bit value, no MUL, no DIV, no fp64.
+#
+# Direction is the ONLY difference between SHL and SHR (SHR is the logical /
+# unsigned right shift matching ``isa.interpret`` / ``ref_interpret``).
+#
+# ``n >= 32`` -> 0: the 5 stages consume ``n``'s low 5 bits (``n & 0x1F``); when
+# ANY higher bit of ``n`` is set (``n >= 32``) the result is forced all-zero, so
+# ``pop << n`` / ``pop >> n`` matches the full-width shift of ``ref_interpret``
+# (``(pop <</>> ax) & 0xFFFFFFFF``, ax UNMASKED) rather than a bare 5-bit mask.
 
 
 def _bit_planes(value: int) -> torch.Tensor:
     """The 32 bits of ``value`` as §510 indicators, ONE batched silu call:
-    ``bit_k = ind((value>>k)&1 == 1)`` (exact 0/1). The multiply-by-``2**k``
-    that recomposes is then a plain dot with the power-of-two vector — the
-    SwiGLU multiply primitive (§Basic Arithmetic) applied per bit-plane so it
-    stays fp-exact even for full 32-bit values."""
+    ``bit_k = ind((value>>k)&1 == 1)`` (exact 0/1)."""
     raw = torch.tensor([float((value >> k) & 1) for k in range(WIDTH_BITS)])
     # ind(raw == 1) via the same triangular-pulse point indicator (§510).
     return (_relu_t(raw - 0.0) - 2.0 * _relu_t(raw - 1.0) + _relu_t(raw - 2.0))
 
 
-def _mul_pow2(value: int, s: int) -> int:
-    """``(value * 2**s) mod 2**32`` (§Shifts: "multiply by powers of two ...
-    overflow handled via the modulus by floor"). Bit-plane-wise: bit ``k`` of
-    ``value`` contributes ``2**(k+s)`` iff ``k+s < 32`` (bits past 32 are the
-    mod-2**32 floor). Each contribution is the §510 indicator times the
-    exact-integer power-of-two placement. The recomposition is accumulated in
-    fp64 so the full 32-bit result is exact (fp32's 24-bit mantissa cannot hold
-    it — the same double-precision the spec notes for full-width recombination)."""
-    bits = _bit_planes(value).to(torch.float64)
-    weights = torch.tensor([float(1 << (k + s)) if (k + s) < WIDTH_BITS else 0.0
-                            for k in range(WIDTH_BITS)], dtype=torch.float64)
-    return int(round(float(bits @ weights))) & 0xFFFFFFFF
+def _log_shift_stage(planes: torch.Tensor, n_bit: float, k: int,
+                     left: bool) -> torch.Tensor:
+    """One conditional log stage over the 32 source ``planes`` (0/1 bit tensor).
+
+    Per output bit ``i`` a 2:1 mux picks between the SAME bit and the bit
+    ``2**k`` away, gated on ``n_bit`` (bit ``k`` of the shift amount):
+
+        left  (SHL):  out[i] = n_bit ? in[i - 2**k] : in[i]
+        right (SHR):  out[i] = n_bit ? in[i + 2**k] : in[i]
+
+    with the neighbour treated as 0 when it falls outside ``[0, 32)`` (bits
+    shifted in are zero).  The mux is the NOT-free boolean identity
+    ``out = same + n_bit*(neighbour - same)`` — pure 0/1 arithmetic, fp-exact.
+    """
+    shift = 1 << k
+    out = torch.zeros(WIDTH_BITS)
+    for i in range(WIDTH_BITS):
+        same = float(planes[i])
+        src = (i - shift) if left else (i + shift)
+        neigh = float(planes[src]) if 0 <= src < WIDTH_BITS else 0.0
+        out[i] = same + n_bit * (neigh - same)
+    return out
 
 
-def _floor_div_pow2(value: int, s: int) -> int:
-    """``floor(value / 2**s)`` for value in [0, 2**32), 0<=s<32 (§Shifts /
-    §Chars right-shift): drop the low ``s`` bits. Bit-plane select with §510
-    indicators — exact integer (fp64 recomposition), no python ``>>`` on the
-    value."""
-    bits = _bit_planes(value).to(torch.float64)
-    weights = torch.tensor([float(1 << (k - s)) if k >= s else 0.0
-                            for k in range(WIDTH_BITS)], dtype=torch.float64)
-    return int(round(float(bits @ weights))) & 0xFFFFFFFF
+def _n_bits(ax: int) -> Tuple[List[float], float]:
+    """The 5 low shift-amount bits ``n_bit_0..4`` (= AX bits 0..4) as exact 0/1,
+    plus ``keep = ind(n < 32)`` (1.0 iff every AX bit at position >= 5 is 0).
+    All computed from the §510 AX bit-planes — no python ``&`` on the value."""
+    planes = _bit_planes(ax & 0xFFFFFFFF)
+    n_bit = [float(planes[k]) for k in range(LOG_STAGES)]
+    hi = float(planes[LOG_STAGES:].sum())            # # of set bits at pos >= 5
+    keep = float(_point_indicator(hi, 0))            # 1.0 iff hi == 0  (n < 32)
+    return n_bit, keep
 
 
-def _shift_amount(ax: int) -> int:
-    """``s = AX & 0x1F`` selected with the §510 point indicator over 0..31."""
-    masked = ax & SHIFT_MASK
-    # prove the select is indicator-driven (not a bare python &): pick the s
-    # whose point indicator over the masked value fires (one batched call).
-    oh = _onehot_vec(float(masked), WIDTH_BITS)
-    return int(oh.argmax().item())
+def _log_shift(pop: int, ax: int, left: bool) -> int:
+    """The bitwise log-shifter: ``pop`` shifted by ``ax`` (SHL if ``left`` else
+    SHR), via the 5 conditional 2**k stages over the source bit-planes, forced to
+    0 when ``ax >= 32``.  Pure 0/1 bit math, fp32-exact."""
+    planes = _bit_planes(pop & 0xFFFFFFFF)
+    n_bit, keep = _n_bits(ax)
+    for k in range(LOG_STAGES):
+        planes = _log_shift_stage(planes, n_bit[k], k, left)
+    planes = planes * keep                           # n >= 32 -> all-zero
+    # recompose the 32 result bits to a 32-bit int (exact-integer place values).
+    val = 0
+    for i in range(WIDTH_BITS):
+        if int(round(float(planes[i]))) & 1:
+            val |= (1 << i)
+    return val & 0xFFFFFFFF
 
 
 def shl_gadget(pop: int, ax: int) -> int:
-    """32-bit ``pop << (ax & 0x1F)`` (§Shifts): multiply ``pop`` by the selected
-    ``2**s`` with the mod-2**32 overflow fold. ``s`` is chosen with the §510
-    indicator; the multiply-by-``2**s`` is the SwiGLU primitive applied per
-    bit-plane (fp-exact even for full 32-bit values)."""
-    s = _shift_amount(ax)
-    return _mul_pow2(pop & 0xFFFFFFFF, s)
+    """32-bit ``pop << ax`` (§Shifts) via the bitwise LOG-SHIFTER: 5 conditional
+    left-by-2**k stages gated on the AX bits, ``ax >= 32 -> 0``.  Matches
+    ``ref_interpret``'s ``(pop << ax) & 0xFFFFFFFF`` (unsigned, full-width)."""
+    return _log_shift(pop, ax, left=True)
 
 
 def shr_gadget(pop: int, ax: int) -> int:
-    """32-bit ``pop >> (ax & 0x1F)`` (logical, §Shifts / §Chars): floor-divide
-    ``pop`` by the selected ``2**s``. ``s`` chosen with the §510 indicator."""
-    s = _shift_amount(ax)
-    return _floor_div_pow2(pop & 0xFFFFFFFF, s)
+    """32-bit ``pop >> ax`` (logical, §Shifts / §Chars) via the bitwise
+    LOG-SHIFTER: 5 conditional right-by-2**k stages gated on the AX bits,
+    ``ax >= 32 -> 0``.  Matches ``ref_interpret``'s ``(pop >> ax) & 0xFFFFFFFF``."""
+    return _log_shift(pop, ax, left=False)
 
 
 # ===========================================================================
@@ -289,30 +315,38 @@ def shr_gadget(pop: int, ax: int) -> int:
 
 
 def extend_layout_for_bitwise(L: NibbleLayout) -> NibbleLayout:
-    """Allocate the per-nibble one-hot expansion bands used by the FFN dispatch.
+    """Allocate the SHARED bit-plane bands the per-bit bitwise combine and the
+    log-shifter both read/write.
 
-    Adds, for each of the 16 nibbles, two 16-cell one-hot bands:
-      ``A_OH_{j}`` — one-hot of ``STACK0`` nibble ``j`` (the ``pop`` operand)
-      ``B_OH_{j}`` — one-hot of ``AX`` nibble ``j`` (the second operand)
-    plus the shift-amount decomposition bands (``SHIFT_LO_OH``, ``SHIFT_N1_OH``,
-    ``SHIFT_BIT4``) for ``s = AX & 0x1F``. Idempotent: only allocates if not
-    already present.
+    * ``A_BIT``/``B_BIT`` — the 4 bit-planes of each of the 16 STACK0 (A) and AX
+      (B) operand nibbles as exact 0/1 indicators (band ``j*4+p`` = bit ``p`` of
+      nibble ``j``).  OR/XOR/AND combine these; the log-shifter reads the SOURCE
+      planes ``A_BIT`` and takes the shift amount ``n`` straight from the AX
+      planes ``B_BIT[0..4]`` (= bits 0..4 of AX).
+    * ``SH_STAGE`` — the log-shifter pipeline: ``LOG_STAGES`` fresh 32-plane
+      buffers, one per conditional 2**k stage (stage 0's input is ``A_BIT``,
+      stage ``k``'s output is ``SH_STAGE[k]``).
+    * ``SH_KEEP`` — the ``ind(n < 32)`` bit (result is forced 0 when ``n >= 32``).
+
+    The DENSE per-operand one-hot bands (``A_OH``/``B_OH``, 512 dims) and the
+    shift-amount one-hots (``SHIFT_LO_OH``/``SHIFT_N1_OH``/``SHIFT_BIT4``) are NO
+    LONGER allocated — the bit-planes serve both the bitwise combine and the
+    log-shifter.  Idempotent: only allocates if not already present.  ``A_OH`` /
+    ``B_OH`` are kept as ``None`` attributes for the legacy "per-bit path" checks.
     """
-    if getattr(L, "A_OH", None) is not None:
+    if getattr(L, "A_BIT", None) is not None:
         return L
-    L.A_OH = [L._band(f"A_OH_{j}", 16) for j in range(N_NIB)]
-    L.B_OH = [L._band(f"B_OH_{j}", 16) for j in range(N_NIB)]
-    # shift-amount decomposition: s = AX_nib0 + 16*bit4 (AX & 0x1F).
-    L.SHIFT_LO_OH = L._band("SHIFT_LO_OH", 16)   # one-hot of AX nibble 0 (bits 0..3)
-    L.SHIFT_N1_OH = L._band("SHIFT_N1_OH", 16)   # one-hot of AX nibble 1 (for bit4)
-    L.SHIFT_BIT4 = L._band("SHIFT_BIT4", 2)      # one-hot of bit 4 (0 or 1)
-    # per-nibble bit PLANES for the shared per-bit OR/XOR/AND gadget: for each of
-    # the 16 nibbles, the 4 bits of the STACK0 (A) and AX (B) operand nibble as
-    # exact 0/1 indicators (band j*4 + p = bit p of nibble j). These let the three
-    # bitwise ops share ONE bit-extraction (opcode-independent) and reduce to a
-    # tiny per-bit combine, instead of three full 256-entry (a,b) lookup tables.
+    L.A_OH = None            # dense operand one-hots retired (log-shifter path).
+    L.B_OH = None
+    # per-nibble bit PLANES for the shared per-bit OR/XOR/AND gadget AND the
+    # log-shifter source: for each of the 16 nibbles, the 4 bits of the STACK0 (A)
+    # and AX (B) operand nibble as exact 0/1 indicators.  ONE extraction serves
+    # OR/XOR/AND (combine) and SHL/SHR (source + shift-amount bits).
     L.A_BIT = L._band("A_BIT", N_NIB * 4)        # A_BIT[j*4+p] = bit p of STACK0 nib j
     L.B_BIT = L._band("B_BIT", N_NIB * 4)        # B_BIT[j*4+p] = bit p of AX     nib j
+    # log-shifter pipeline: one fresh 32-plane buffer per conditional 2**k stage.
+    L.SH_STAGE = [L._band(f"SH_STAGE_{k}", WIDTH_BITS) for k in range(LOG_STAGES)]
+    L.SH_KEEP = L._scalar("SH_KEEP")             # ind(n < 32) — n>=32 zeroes result.
     L.D = L._off
     return L
 
@@ -476,78 +510,146 @@ def perbit_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
     return rules
 
 
-def perbit_shift_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
-    """BARREL SHIFTER for SHL/SHR via the SHARED source bit-planes (§Shifts).
+# ---------------------------------------------------------------------------
+# LOG-SHIFTER FFN rules — 5 conditional 2**k stages + an n>=32 keep bit +
+# recompose.  These REPLACE the old barrel select (~17K nz) with ~6 shallow
+# blocks (one mux stage each) reading the SHARED source bit-planes ``A_BIT`` and
+# taking the shift amount straight from the AX bit-planes ``B_BIT[0..4]``.
+# ---------------------------------------------------------------------------
 
-    This is the per-BIT shift path that REPLACES the dense ``shift_dispatch_rules``
-    lookup table (the ``(lo, bit4, source_nibble, source_value) -> result_nibbles``
-    cross-product, ~10.8k rules for the two ops).  A barrel shifter routes each
-    RESULT bit from the single SOURCE bit at the shifted position, gated on the
-    decomposed shift amount ``s = lo + 16*bit4`` (``s = AX & 0x1F``):
+def _stage_in_dim(L: NibbleLayout, k: int, i: int) -> int:
+    """Residual dim of source bit ``i`` feeding log stage ``k`` (0..31).  Stage 0
+    reads the SOURCE planes ``A_BIT`` (bit i = nibble i//4, plane i%4); stage k>0
+    reads the previous stage's fresh 32-plane buffer ``SH_STAGE[k-1]``."""
+    if k == 0:
+        return L.A_BIT + (i // 4) * 4 + (i % 4)
+    return L.SH_STAGE[k - 1] + i
 
-        SHL:  result_bit[k] = source_bit[k - s]      (k in 0..31, masked to 32 bit)
-        SHR:  result_bit[k] = source_bit[k + s]      (k in 0..63)
 
-    Reads the pre-extracted SOURCE bit-planes ``A_BIT[j*4+p] = bit p of STACK0
-    nibble j`` (built ONCE by ``compile_bit_extract`` in ``build_bitwise_blocks``,
-    shared with the OR/XOR/AND per-bit gadget), plus the shift-amount one-hots
-    ``SHIFT_LO_OH`` / ``SHIFT_BIT4``.  For each ``(lo, bit4)`` and each result bit
-    ``k`` whose source bit is in range, ONE rule gated on
-    ``SHIFT_LO_OH[lo] ∧ SHIFT_BIT4[bit4] ∧ A_BIT[src]`` writes ``2**(k%4)`` into
-    result nibble ``AX + k//4``.  A single ``-AX+j`` self-cancel per nibble keeps
-    SET semantics.  Bit-exact vs ``shift_dispatch_rules`` (byte-identical result
-    values), ~5x fewer rules, and no per-value dense table anywhere.
+def shift_keep_rules(L: NibbleLayout) -> List[FFNRule]:
+    """Compute ``SH_KEEP = ind(n < 32)`` (n = AX): the log stages consume n's low
+    5 bits; when ANY AX bit at position >= 5 is set (n >= 32) the result must be
+    forced to 0.  ``keep = 1 - OR(high AX bits)``: seed ``+1`` unconditionally,
+    then subtract ``1`` gated on EACH high AX bit-plane (``B_BIT`` bits 5..31 and,
+    since B_BIT spans all 16 AX nibbles, every plane of AX nibbles >= 2 as well).
+    At most one high bit fires for a plain shift-count, and any that do drive keep
+    to 0 — exactly the ``n >= 32 -> 0`` fold.  (For arbitrary garbage AX with two
+    high bits set, keep can go negative, but the recompose only WRITES when
+    ``keep >= 1``, so <1 still zeroes the result.)"""
+    rules: List[FFNRule] = [
+        FFNRule([(L.ONE, 0.5, 1.5)], {L.SH_KEEP: LinearExpr.c(1.0)})
+    ]
+    # every AX bit-plane at global position >= 5 is a "high" bit (n >= 32 marker).
+    for b in range(LOG_STAGES, N_NIB * 4):
+        hi_plane = L.B_BIT + (b // 4) * 4 + (b % 4)
+        rules.append(FFNRule([(hi_plane, 0.5, 1.5)],
+                             {L.SH_KEEP: LinearExpr.c(-1.0)}))
+    return rules
+
+
+def log_shift_stage_rules(L: NibbleLayout, op: int, k: int) -> List[FFNRule]:
+    """One conditional log stage (shift by ``2**k`` gated on AX bit ``k``).
+
+    Per output bit ``i`` a 2:1 MUX picks between the SAME bit and the NEIGHBOUR
+    ``2**k`` away, realised NOT-free as ``out = same + n_bit*(neigh - same)``:
+
+        out[i] += same[i]                               (gated on same[i]==1)
+        out[i] += neigh[i]        when n_bit ∧ neigh[i]==1
+        out[i] -= same[i]         when n_bit ∧ same[i]==1
+
+    ``n_bit = AX bit k = B_BIT[k]`` (bits 0..4 of AX are the shift amount).  The
+    neighbour is ``i-2**k`` (SHL) or ``i+2**k`` (SHR), treated as 0 when out of
+    ``[0, 32)`` (shifted-in zero — its rules are simply omitted).  Writes into the
+    FRESH stage buffer ``SH_STAGE[k]`` (starts at 0), reading ``SH_STAGE[k-1]``
+    (or ``A_BIT`` for stage 0).  Pure 0/1 boolean AND/OR machinery — fp32-exact.
     """
     if op not in (isa.SHL, isa.SHR):
-        raise ValueError(f"perbit_shift_select_rules: op {op} not SHL/SHR")
+        raise ValueError(f"log_shift_stage_rules: op {op} not SHL/SHR")
+    left = (op == isa.SHL)
+    shift = 1 << k
+    n_bit = L.B_BIT + k                              # AX bit k = shift-amount bit k
+    out_base = L.SH_STAGE[k]
     rules: List[FFNRule] = []
-    # SET semantics: cancel each old AX nibble once (same as the table path).
+    for i in range(WIDTH_BITS):
+        out = out_base + i
+        same = _stage_in_dim(L, k, i)
+        src = (i - shift) if left else (i + shift)
+        neigh = _stage_in_dim(L, k, src) if 0 <= src < WIDTH_BITS else None
+        # out += same          (unconditional copy when n_bit == 0).
+        rules.append(FFNRule([(same, 0.5, 1.5)], {out: LinearExpr.c(1.0)}))
+        # out -= same          (cancel the copy when n_bit == 1).
+        rules.append(FFNRule([(n_bit, 0.5, 1.5), (same, 0.5, 1.5)],
+                             {out: LinearExpr.c(-1.0)}))
+        # out += neigh         (route the shifted-in bit when n_bit == 1).
+        if neigh is not None:
+            rules.append(FFNRule([(n_bit, 0.5, 1.5), (neigh, 0.5, 1.5)],
+                                 {out: LinearExpr.c(1.0)}))
+    return rules
+
+
+def shift_recompose_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
+    """Recompose the final log-stage result bit-planes into the AX nibble band,
+    gated on ``SH_KEEP`` (n < 32).
+
+    SET semantics: one ``-AX+j`` self-cancel per nibble, then each result bit
+    ``i`` of the last stage buffer ``SH_STAGE[LOG_STAGES-1]`` adds ``2**(i%4)``
+    into result nibble ``AX + i//4`` — gated on ``result_bit ∧ SH_KEEP`` so an
+    ``n >= 32`` shift leaves AX all-zero.  Reads only 0/1 planes; fp-exact."""
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"shift_recompose_rules: op {op} not SHL/SHR")
+    last = L.SH_STAGE[LOG_STAGES - 1]
+    rules: List[FFNRule] = []
     for j in range(N_NIB):
         rules.append(FFNRule([(L.ONE, 0.5, 1.5)],
                              {L.AX + j: LinearExpr.of(L.AX + j, -1.0)}))
-    n_src_bits = N_NIB * 4                          # 64 source bit-planes (16 nibbles)
-    for lo in range(16):
-        for bit4 in range(2):
-            s = lo + 16 * bit4                      # shift amount 0..31 (AX & 0x1F)
-            # SHL result is 32-bit-masked (k in 0..31); SHR keeps the full width.
-            k_hi = WIDTH_BITS if op == isa.SHL else n_src_bits
-            for k in range(k_hi):
-                src = (k - s) if op == isa.SHL else (k + s)
-                if not (0 <= src < n_src_bits):
-                    continue                        # shifted-in zero bit: no write.
-                src_plane = L.A_BIT + (src // 4) * 4 + (src % 4)
-                rj, rp = k // 4, k % 4              # result nibble + bit within it
-                rules.append(FFNRule(
-                    [(L.SHIFT_LO_OH + lo, 0.5, 1.5),
-                     (L.SHIFT_BIT4 + bit4, 0.5, 1.5),
-                     (src_plane, 0.5, 1.5)],
-                    {L.AX + rj: LinearExpr.c(float(1 << rp))},
-                ))
+    for i in range(WIDTH_BITS):
+        rj, rp = i // 4, i % 4
+        rules.append(FFNRule(
+            [(last + i, 0.5, 1.5), (L.SH_KEEP, 0.5, 1.5)],
+            {L.AX + rj: LinearExpr.c(float(1 << rp))},
+        ))
     return rules
+
+
+def perbit_shift_select_rules(L: NibbleLayout, op: int) -> List[FFNRule]:
+    """The complete LOG-SHIFTER rule list for SHL/SHR as ONE flat ``FFNRule``
+    sequence (§Shifts).  This SUPERSEDES both the old barrel select AND
+    shift-via-mul: ``keep`` bit, then the ``LOG_STAGES`` conditional 2**k stages,
+    then the recompose — the mux stages are wired to read/write the ``SH_STAGE``
+    pipeline buffers, so the caller must apply them as SEPARATE sequential FFN
+    blocks (see ``append_bitwise_shift_to_dispatch`` / ``build_bitwise_blocks``).
+    Kept as one entry point (the barrel select's old name) for callers that only
+    need the rule list / a rule count; the shift is ~6 shallow blocks, no dense
+    per-value table and no MUL/DIV dependency (works in a muldiv-less subset)."""
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"perbit_shift_select_rules: op {op} not SHL/SHR")
+    rules: List[FFNRule] = list(shift_keep_rules(L))
+    for k in range(LOG_STAGES):
+        rules += log_shift_stage_rules(L, op, k)
+    rules += shift_recompose_rules(L, op)
+    return rules
+
+
+def shift_stage_blocks(L: NibbleLayout, op: int) -> List[List[FFNRule]]:
+    """The log-shifter as an ORDERED list of per-block rule lists (the shift is a
+    pipeline — each mux stage reads the previous stage's buffer, so the stages
+    CANNOT be one FFN block).  Order: keep bit, ``LOG_STAGES`` mux stages, then
+    the keep-gated recompose.  ``LOG_STAGES + 2`` blocks."""
+    blocks: List[List[FFNRule]] = [list(shift_keep_rules(L))]
+    for k in range(LOG_STAGES):
+        blocks.append(log_shift_stage_rules(L, op, k))
+    blocks.append(shift_recompose_rules(L, op))
+    return blocks
 
 
 # NOTE: the DENSE per-nibble 256-entry (a,b) bitwise lookup table
 # (``bitwise_dispatch_rules``) and the DENSE per-value shift lookup table
-# (``shift_dispatch_rules``) have been REMOVED.  The per-bit gadget
-# (``perbit_select_rules`` for OR/XOR/AND) and the barrel shifter
-# (``perbit_shift_select_rules`` for SHL/SHR) — both reading the shared
+# (``shift_dispatch_rules``) have been REMOVED, as has the intermediate BARREL
+# SELECT (the per-(source-bit × shift-amount) cross-product, ~17K nz).  The
+# per-bit gadget (``perbit_select_rules`` for OR/XOR/AND) and the LOG-SHIFTER
+# (the 5 conditional 2**k stages for SHL/SHR) — both reading the shared
 # ``compile_bit_extract`` bit-planes — are the SOLE bitwise/shift path and were
-# proven byte-identical to the removed tables before removal.  The
-# ``C4_BITWISE_PERBIT`` dense escape-hatch flag is likewise gone.
-
-
-def _shift_bit4_rules(L: NibbleLayout) -> List[FFNRule]:
-    """Fold AX nibble-1's one-hot into ``SHIFT_BIT4`` (bit 4 of ``AX & 0x1F``).
-
-    ``bit4 = AX_nib1 mod 2``. Given ``SHIFT_N1_OH`` (one-hot of nib1), the odd
-    cells sum to ``SHIFT_BIT4+1`` and the even cells to ``SHIFT_BIT4+0`` — an OR
-    over the one-hot cells (``multi_way_or_rules`` shape)."""
-    rules: List[FFNRule] = []
-    for k in range(16):
-        parity = k & 1
-        rules.append(FFNRule([(L.SHIFT_N1_OH + k, 0.5, 1.5)],
-                            {L.SHIFT_BIT4 + parity: LinearExpr.c(1.0)}))
-    return rules
+# proven byte-exact to ``ref_interpret`` / ``isa.interpret`` before removal.
 
 
 def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
@@ -561,13 +663,15 @@ def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
 
     ALL five ops (OR/XOR/AND/SHL/SHR) use the per-BIT path — the shared bit-plane
     extraction (``compile_bit_extract`` -> ``A_BIT``/``B_BIT``) plus a tiny per-bit
-    combine (OR/XOR/AND via ``perbit_select_rules``) or the BARREL SHIFTER
-    (SHL/SHR via ``perbit_shift_select_rules``).  There is NO dense per-value lookup
-    table any more.  In a real fan-out each block's rules are additionally gated on
-    the opcode one-hot.
+    combine (OR/XOR/AND via ``perbit_select_rules``) or the LOG-SHIFTER
+    (SHL/SHR via the 5 conditional 2**k stages, ``shift_stage_blocks``).  There is
+    NO dense per-value lookup table and NO barrel select any more; the shift also
+    has no MUL/DIV dependency (works in a muldiv-less bitwise subset).  In a real
+    fan-out each block's rules are additionally gated on the opcode one-hot.
     """
     extend_layout_for_bitwise(L)
     # Shared bit-plane extraction of the source (STACK0) and operand-2 (AX) nibbles.
+    # For the shifter this ALSO yields the shift amount: AX bits 0..4 = B_BIT[0..4].
     planes = compile_bit_extract(
         src_bands=[L.STACK0 + j for j in range(N_NIB)]
                   + [L.AX + j for j in range(N_NIB)],
@@ -577,13 +681,9 @@ def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     if op in _PERBIT_COMBINE:                          # OR / XOR / AND
         return [planes, perbit_select_rules(L, op)]
     if op in (isa.SHL, isa.SHR):
-        # shift-amount one-hots (AX nib0 -> SHIFT_LO_OH, AX nib1 -> SHIFT_N1_OH) +
-        # the bit4 fold, then the barrel select over the source bit-planes.
-        expand = compile_onehot_expand(
-            src_bands=[L.AX + 0, L.AX + 1],
-            oh_bases=[L.SHIFT_LO_OH, L.SHIFT_N1_OH],
-            cells=16, one_band=L.ONE, dim=L.D)
-        return [expand, planes, _shift_bit4_rules(L), perbit_shift_select_rules(L, op)]
+        # bit-planes (source + shift amount), then the log-shifter pipeline
+        # (keep bit + LOG_STAGES conditional 2**k mux stages + keep-gated recompose).
+        return [planes] + shift_stage_blocks(L, op)
     raise ValueError(f"append_bitwise_shift_to_dispatch: unsupported op {op}")
 
 

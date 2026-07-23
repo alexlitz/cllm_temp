@@ -304,42 +304,29 @@ def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
     the AX/STACK0 nibble bands. ALL five ops share ONE per-nibble bit-plane
     extraction (``bw-bitplanes``): OR/XOR/AND via the boolean per-bit combine
     (``AND=a·b``, ``OR=a+b-a·b``, ``XOR=a+b-2a·b`` on the shared planes) and
-    SHL/SHR via the BARREL SHIFTER (``perbit_shift_select_rules`` — result bit k
-    routed from source bit k∓s, gated on the decomposed shift amount). There is NO
-    dense per-value table on the build path any more (the old ``C4_BITWISE_PERBIT=0``
-    escape hatch + ``bitwise_dispatch_rules`` / ``shift_dispatch_rules`` 256-entry
-    tables are removed): the per-bit gadget IS the only path, bit-identical to the
-    old table result. One shared expand block builds the shift-amount one-hots. Each
-    op's select is OP_IS-gated; the shift bit4 fold and selects are likewise gated.
-    Returns named specs.
+    SHL/SHR via the bitwise LOG-SHIFTER — the 5 conditional 2**k stages
+    (``shift by 2**k`` gated on AX bit k), each a per-output-bit 2:1 mux built from
+    the same boolean AND/OR machinery, plus an ``n >= 32 -> 0`` fold.  There is NO
+    dense per-value table AND NO barrel select on the build path any more; the log
+    stages read the SOURCE planes ``A_BIT`` and take the shift amount straight from
+    the AX planes ``B_BIT[0..4]`` (no shift-amount one-hot expand, no MUL/DIV).
+    Each op's rules are OP_IS-gated; the log stages of SHL and SHR share the
+    ``SH_STAGE`` pipeline buffers (only one opcode fires at a time).  Returns named
+    specs.
 
-    ``barrel_shift_ops`` (default ``(SHL, SHR)``) selects WHICH shift ops the barrel
-    shifter still owns.  In the full (muldiv+bitwise) build with ``shift_via_mul`` on
-    it is passed ``()`` — SHL/SHR are then computed via the NATIVE MUL/DIV gadgets
-    (``nibble_alu32.compile_shift_pow2_route`` + the ax-mux), so the ~14.7K-nz barrel
-    shifter (SHL 3776 + SHR 10944) is DROPPED entirely and the shift-amount one-hot /
-    bit4 blocks shrink to the bitplanes the OR/XOR/AND combine still needs."""
-    _bw.extend_layout_for_bitwise(L)                  # allocate SHIFT_*/A_BIT/B_BIT
+    ``barrel_shift_ops`` (default ``(SHL, SHR)``) selects WHICH shift ops the
+    LOG-SHIFTER owns.  In the full (muldiv+bitwise) build with the legacy
+    ``shift_via_mul`` on it is passed ``()`` — SHL/SHR are then computed via the
+    NATIVE MUL/DIV gadgets (``nibble_alu32.compile_shift_pow2_route`` + the ax-mux),
+    so the shifter blocks are DROPPED entirely and only the OR/XOR/AND combine
+    remains.  The log-shifter is the DEFAULT and needs no muldiv, so it also works
+    in a muldiv-less bitwise subset (where ``shift_via_mul`` is unavailable)."""
+    _bw.extend_layout_for_bitwise(L)                  # allocate A_BIT/B_BIT/SH_STAGE
     L.D = L._off                                      # bands grew; refresh D
     blocks: List[Tuple[str, Dict[str, torch.Tensor]]] = []
-    # ONE expand block: the shift-amount one-hots (AX nib0 -> SHIFT_LO_OH low 4 bits,
-    # AX nib1 -> SHIFT_N1_OH for bit 4).  The barrel shifter reads the source bits
-    # from A_BIT (below), so the source operand one-hots A_OH are no longer needed.
-    # Only needed when the barrel shifter still owns a shift op.
-    if barrel_shift_ops:
-        expand = _bw.compile_onehot_expand(
-            src_bands=[L.AX + 0, L.AX + 1], oh_bases=[L.SHIFT_LO_OH, L.SHIFT_N1_OH],
-            cells=16, one_band=L.ONE, dim=L.D)
-        blocks.append(("bw-expand", expand))
-        # shift bit4 fold (gated by the barrel shift ops).
-        bit4 = _bw._shift_bit4_rules(L)
-        bit4g: List[FFNRule] = []
-        for op in barrel_shift_ops:
-            bit4g += _opcode_gate_rules(bit4, L.OP_IS + op)
-        blocks.append(("bw-bit4", compile_ffn(bit4g, L.D)))
     # ONE shared, opcode-INDEPENDENT bit-plane extraction: STACK0/AX nibbles ->
-    # A_BIT/B_BIT (4 planes each).  OR/XOR/AND read A_BIT+B_BIT; the barrel SHL/SHR
-    # reads the source planes A_BIT.
+    # A_BIT/B_BIT (4 planes each).  OR/XOR/AND read A_BIT+B_BIT; the log-shifter
+    # reads the source planes A_BIT and the shift-amount bits B_BIT[0..4].
     planes = _bw.compile_bit_extract(
         src_bands=[L.STACK0 + j for j in range(_bw.N_NIB)]
                   + [L.AX + j for j in range(_bw.N_NIB)],
@@ -347,15 +334,28 @@ def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
                   + [L.B_BIT + j * 4 for j in range(_bw.N_NIB)],
         one_band=L.ONE, dim=L.D)
     blocks.append(("bw-bitplanes", planes))
-    # per-op selects, opcode-gated, all merged into ONE select block.
-    sel: List[FFNRule] = []
+    # OR/XOR/AND per-op selects, opcode-gated, merged into ONE combine block.
+    comb: List[FFNRule] = []
     for op in (isa.OR, isa.XOR, isa.AND):
         s = _bw.perbit_select_rules(L, op)               # shared per-bit gadget
-        sel += _opcode_gate_rules(s, L.OP_IS + op)
-    for op in barrel_shift_ops:                          # (SHL, SHR) unless routed via mul
-        s = _bw.perbit_shift_select_rules(L, op)          # barrel shifter (per-bit)
-        sel += _opcode_gate_rules(s, L.OP_IS + op)
-    blocks.append(("bw-select", compile_ffn(sel, L.D)))
+        comb += _opcode_gate_rules(s, L.OP_IS + op)
+    blocks.append(("bw-combine", compile_ffn(comb, L.D)))
+    # SHL/SHR LOG-SHIFTER: the shift is a PIPELINE (each mux stage reads the prior
+    # stage's buffer), so the stages are SEPARATE sequential FFN blocks.  SHL and
+    # SHR share the SH_STAGE buffers — both ops' rules are OP_IS-gated so only the
+    # decoded opcode writes.  Blocks: keep bit, LOG_STAGES mux stages, recompose.
+    if barrel_shift_ops:
+        n_stage_blocks = _bw.LOG_STAGES + 2
+        merged: List[List[FFNRule]] = [[] for _ in range(n_stage_blocks)]
+        for op in barrel_shift_ops:                      # (SHL, SHR) unless via mul
+            stage_blocks = _bw.shift_stage_blocks(L, op)
+            for bi, sb in enumerate(stage_blocks):
+                merged[bi] += _opcode_gate_rules(sb, L.OP_IS + op)
+        names = (["bw-shift-keep"]
+                 + [f"bw-shift-log{k}" for k in range(_bw.LOG_STAGES)]
+                 + ["bw-shift-recompose"])
+        for name, rules in zip(names, merged):
+            blocks.append((name, compile_ffn(rules, L.D)))
     return blocks
 
 
@@ -395,7 +395,8 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
 
       block 0 : KV-MEMORY attention head (real §Memory CAM) + recompose FFN
       1 pc-fetch | 2 code-select (universal fetch) | 3 opcode-decode
-      [bw-expand | bw-bit4 | bw-select | bw-recompose]  (OR/XOR/AND/SHL/SHR)
+      [bw-bitplanes | bw-combine | bw-shift-{keep,log0..4,recompose} | bw-recompose]
+                                                        (OR/XOR/AND + LOG-SHIFTER SHL/SHR)
       DISPATCH : MoE (StandardMoEFFN, per-op experts) | branch-delta | fold
 
     Everything is in the model weights: universal fetch (code-as-data), in-model
@@ -427,7 +428,7 @@ def build_unified_model(code_size: int = 8, n_heads: int = 4,
     all_specs = {**base_specs, **cmp_specs}
     if include_bitwise:
         # bitwise experts do only PC+=1 ; SP+=4 (the result is written to the AX
-        # nibble bands by the bw-select block, then bw-recompose -> AX_VAL).
+        # nibble bands by the bw-combine / log-shifter blocks, then bw-recompose).
         for op in (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR):
             hk = _empty_spec(dim, 2)
             hk["W_up"][0, L.ONE] = S; hk["W_gate"][0, L.ONE] = 1.0
