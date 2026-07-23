@@ -164,7 +164,7 @@ class QwenFullLayout:
 
     def __init__(self, code_size: int, subset: "Subset",
                  efficient_alu: bool = True, recurrent_divmod: bool = False,
-                 code_from_memory: bool = False, shift_via_mul: bool = True,
+                 code_from_memory: bool = True, shift_via_mul: bool = True,
                  div_logsink: bool = False):
         # Build the pure-forward layout (all VM compute bands live here).  MUL/DIV/MOD
         # ALWAYS run through the ``nibble_alu32`` fp32 FFN gadgets (the 256x256x3
@@ -202,8 +202,8 @@ class QwenFullLayout:
                                        shift_via_mul=self.shift_via_mul)
         # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
         # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
-        # bands.  Off (default) leaves the layout byte-identical, so an existing
-        # baked table build is unchanged; on, the program lives in these frames.
+        # bands.  On (DEFAULT) the program lives in these code frames (fetch@PC);
+        # off (explicit opt-in) reverts to the baked CODE_OP[k]/PC_IS[k] table.
         L.CODE_KEY_BIN = L.CODE_QRY_BIN = None
         L.CODE_OPV = L.CODE_IMMV = None
         L.IS_CODE = L.IS_FETCH = None
@@ -281,7 +281,7 @@ class QwenFullVM:
     embed: torch.Tensor           # [vocab, hidden] token -> residual (injected)
     efficient_alu: bool = True    # MUL/DIV/MOD via nibble_alu32 gadgets (the ONLY path)
     n_applied: int = 0            # layers APPLIED per forward (>= n_layers if recurrent)
-    code_from_memory: bool = False  # program in KV §Memory (fetch@PC), not a baked table
+    code_from_memory: bool = True   # program in KV §Memory (fetch@PC), not a baked table
     shift_via_mul: bool = False   # SHL/SHR via native MUL/DIV (x*2^n / x//2^n), no barrel
     div_logsink: bool = False     # retired: DIV/MOD are fp32 long division (always False)
     model_dtype: object = torch.float32   # the model is always fp32 (0 fp64 params)
@@ -291,7 +291,7 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           arch: QwenArch = QWEN2_5_ARCH, K: float = NORM_K,
           efficient_alu: bool = True,
           recurrent_divmod: bool = False, pad_to_stock: bool = False,
-          code_from_memory: bool = False, shift_via_mul: bool = True,
+          code_from_memory: bool = True, shift_via_mul: bool = True,
           div_logsink: bool = False) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
