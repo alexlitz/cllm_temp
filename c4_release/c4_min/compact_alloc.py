@@ -1397,6 +1397,12 @@ def _rebuild_layout(pfc, code_size, n_heads, recurrent_divmod=False):
     _pfc.A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
     from . import nibble_bitwise as _bw
     _bw.extend_layout_for_bitwise(L)
+    # TIGHT shifter (C4_TIGHT_SHIFT, default ON): mirror the builder's per-op tight
+    # scratch bands so this liveness-reconstruction layout matches the built model.
+    if _bw.tight_shift_enabled():
+        from . import isa as _isa
+        for _op in (_isa.SHL, _isa.SHR):
+            _bw.extend_layout_for_tight_shift(L, _op)
     while L._off % n_heads != 0:
         L._scalar(f"_bwpad{L._off}")
     L.D = L._off

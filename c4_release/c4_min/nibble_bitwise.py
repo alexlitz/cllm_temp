@@ -51,6 +51,7 @@ Two surfaces
 """
 from __future__ import annotations
 
+import os
 from typing import Callable, Dict, List, Tuple
 
 import torch
@@ -642,6 +643,221 @@ def shift_stage_blocks(L: NibbleLayout, op: int) -> List[List[FFNRule]]:
     return blocks
 
 
+# ===========================================================================
+# §Shifts (TIGHT) — the DIRECT 8x8 nibble shifter as the model's SHL/SHR.
+#
+# ``shift_tight_nibble`` proves a 6-block DIRECT nibble shifter byte-exact
+# standalone (1394/1465 nz vs the ~5269-nz bit-granular log-shifter above): an
+# amount decode (``c=n//4`` / ``r=n%4`` one-hots ``ceq``/``feq`` + ``POW``/``RNZ``/
+# ``keep``), a DIRECT triangular 8x8 coarse nibble select, a fine ``*2**r``
+# product, a low/carry peel and a KEEP-gated assemble.  It uses its OWN
+# ``_TightLayout`` (8-nibble scratch bands) and the shared ``nibble_alu32``
+# primitives.  Here we RE-USE those exact builders — the SOLE source of the
+# shift arithmetic — by mapping ``_TightLayout``'s bands onto the model's
+# ``NibbleLayout`` via a thin adapter:
+#
+#     IN_NIB  -> STACK0 nibbles 0..7   (the popped operand as the model has it)
+#     N       -> a fresh scratch scalar = AX low byte (the shift amount)
+#     OUT_NIB -> a fresh scratch band   (recomposed into AX by a final block)
+#     C/R/CEQ/FEQ/POW/RNZ/KEEP/COARSE/PROD/FINE_LO/FINE_CO -> fresh private bands
+#
+# Feeding the operand as NIBBLES directly, the tight path needs NO bit-planes
+# (unlike the log-shifter), so under ``C4_TIGHT_SHIFT`` SHL/SHR drop the shared
+# ``planes`` block entirely (OR/XOR/AND keep it).
+# ===========================================================================
+
+# The tight builders live in shift_tight_nibble; nibble_alu32 owns the shared
+# primitives + the ``_ONE`` global they emit against.  Imported lazily inside the
+# builders so a bare ``import nibble_bitwise`` has no hard tight dependency.
+_TIGHT_SCRATCH = (
+    # (_TightLayout-field, size)
+    ("N", 1),               # shift amount n (= AX low byte)
+    ("C", 1),               # c = n // 4  (0..7)
+    ("R", 1),               # r = n % 4   (0..3)
+    ("CEQ", 8),             # ceq[k] = [c == k]
+    ("FEQ", 4),             # feq[m] = [r == m]
+    ("POW", 1),             # fine multiplier
+    ("RNZ", 1),             # rnz = [r != 0]
+    ("KEEP", 1),            # keep = [n < 32]
+    ("COARSE", 8),          # coarse-shifted nibbles
+    ("PROD", 8),            # coarse * 2**r
+    ("FINE_LO", 8),         # prod % 16
+    ("FINE_CO", 8),         # floor(prod / 16)
+    ("OUT_NIB", 8),         # final result nibbles (pre AX-recompose)
+)
+
+_TIGHT_N_NIB = 8                    # the tight design carries the low 32 bits in 8 nibbles.
+
+
+def _tight_bands_attr(op: int) -> str:
+    """Per-op scratch-band dict attribute on ``L`` (SHL and SHR get PRIVATE scratch
+    bands so the two directions can coexist in the opcode-fanned unified model where
+    both pipelines run unconditionally and only the recompose is opcode-gated)."""
+    return f"_TS_BANDS_{isa.NAMES[op]}"
+
+
+def extend_layout_for_tight_shift(L: NibbleLayout, op: int) -> Dict[str, int]:
+    """Allocate the tight shifter's private scratch bands for ``op`` on the model
+    ``L`` (a fresh set per direction).
+
+    ``IN_NIB`` maps onto ``STACK0`` (the popped operand's 8 low nibbles) and the
+    result is recomposed into ``AX`` by a final block, so only the intermediate
+    scratch (``N``/``C``/``R``/one-hots/``COARSE``/``PROD``/peel/``OUT_NIB``) needs
+    fresh bands.  Idempotent per op; refreshes ``L.D``.  Returns the field->base
+    band map."""
+    attr = _tight_bands_attr(op)
+    bands = getattr(L, attr, None)
+    if bands is not None:
+        return bands
+    bands = {}
+    for field, size in _TIGHT_SCRATCH:
+        bands[field] = L._band(f"TS_{isa.NAMES[op]}_{field}", size)
+    setattr(L, attr, bands)
+    L.D = L._off
+    return bands
+
+
+class _TightAdapter:
+    """Presents the ``_TightLayout`` band-name interface the tight builders read,
+    but every band points into the model's ``NibbleLayout`` (per-op scratch bands
+    from ``extend_layout_for_tight_shift``; ``IN_NIB`` mapped onto the model's
+    ``STACK0`` operand band).  ``D``/``ONE`` are the MODEL's, so the tight builders
+    emit specs sized to the real residual."""
+
+    def __init__(self, L: NibbleLayout, bands: Dict[str, int]):
+        self.D = L.D
+        self.ONE = L.ONE
+        self.IN_NIB = L.STACK0          # popped operand nibbles 0..7 (model band)
+        for field, base in bands.items():
+            setattr(self, field, base)
+
+
+def _tight_load_amount_block(L: NibbleLayout, bands: Dict[str, int]) -> dict:
+    """Compute the tight shifter's scalar shift amount ``N = AX_nib0 + 16*AX_nib1``
+    (the AX low byte, 0..255 — the SAME shift-count form the log-shifter takes from
+    the AX bit-planes and ``compile_shift_onehot`` takes from AX).  A tiny SET
+    block: clear ``N`` then add nib0 + 16*nib1.  Must precede the amount decode,
+    which reads ``N`` as a scalar."""
+    from . import nibble_alu32 as _alu
+    _alu._ONE = L.ONE
+    spec = _alu._empty_spec(L.D, 3)
+    u = 0
+    u = _alu._clear(spec, u, bands["N"])
+    u = _alu._ident(spec, u, {L.AX + 0: 1.0, L.AX + 1: 16.0}, 0.0, bands["N"], 1.0)
+    return _alu._truncate(spec, u, L.D)
+
+
+def tight_out_to_ax_rules(L: NibbleLayout, out_band: int, gate_band: int) -> List[FFNRule]:
+    """Recompose the tight result band ``OUT_NIB`` (8 nibbles at ``out_band``) into
+    the AX nibble band, gated on ``gate_band`` (``ONE`` for the standalone one-op
+    path; ``OP_IS`` for the opcode-fanned unified model).  SET semantics: clear each
+    of the 16 AX nibbles once (result occupies 0..7; 8..15 are zeroed like the
+    log-shifter's recompose), then add ``OUT_NIB[j]`` into ``AX+j`` for the low 8.
+    All gated so a non-shift step (unified path) leaves AX untouched."""
+    rules: List[FFNRule] = []
+    for j in range(N_NIB):
+        rules.append(FFNRule([(gate_band, 0.5, 1.5)],
+                             {L.AX + j: LinearExpr.of(L.AX + j, -1.0)}))
+    for j in range(_TIGHT_N_NIB):
+        rules.append(FFNRule([(gate_band, 0.5, 1.5)],
+                             {L.AX + j: LinearExpr.of(out_band + j, 1.0)}))
+    return rules
+
+
+def tight_shift_stage_blocks(L: NibbleLayout, op: int,
+                             recompose_gate: int = None) -> List:
+    """The TIGHT direct-8x8 shifter as an ordered block list on the model ``L``,
+    the drop-in replacement for :func:`shift_stage_blocks` (§Shifts).
+
+    Re-uses the byte-exact builders from ``shift_tight_nibble`` (the SOLE source of
+    the shift arithmetic) over a :class:`_TightAdapter` that maps ``_TightLayout``'s
+    bands onto the model's ``NibbleLayout`` (per-op private scratch bands).  Blocks
+    (a short pipeline, each reads the previous block's outputs):
+
+        0    load amount   (``N`` = AX low byte)
+        1-2  amount decode (``c``/``r``, ``feq``/``POW``/``keep`` ; then ``ceq``)
+        3    DIRECT 8x8 coarse nibble select
+        4    fine product  (coarse * 2**r)
+        5    fine peel      (low + carry)
+        6    assemble       (KEEP-gated merge into ``OUT_NIB``)
+        7    recompose      (``OUT_NIB`` -> AX)
+
+    The result is written to AX exactly where the log-shifter's recompose writes
+    it; the popped operand is read straight from ``STACK0`` (nibbles), so no
+    bit-planes are needed.  ``n >= 32 -> 0`` via ``KEEP`` (matching
+    ``ref_interpret(mask=0xFFFFFFFF)``).  ``recompose_gate`` gates the final
+    AX-recompose: ``None`` -> ``L.ONE`` (always fires; the standalone one-op path),
+    or an ``OP_IS`` band for the opcode-fanned unified model (so the shift writes AX
+    only when its opcode is active).  Blocks 0-6 only touch this op's PRIVATE scratch
+    bands, so they are safe to apply unconditionally alongside the other direction."""
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"tight_shift_stage_blocks: op {op} not SHL/SHR")
+    from . import shift_tight_nibble as _st
+    from . import nibble_alu32 as _alu
+
+    bands = extend_layout_for_tight_shift(L, op)
+    left = (op == isa.SHL)
+    _alu._ONE = L.ONE                       # point the shared emitters' ONE lane at L.ONE
+    A = _TightAdapter(L, bands)
+    gate = L.ONE if recompose_gate is None else recompose_gate
+
+    blocks: List = [_tight_load_amount_block(L, bands)]
+    blocks += list(_st.build_amount_blocks(left)(A))
+    blocks.append(_st.build_coarse_select(A, left))
+    blocks.append(_st.build_fine_product(A))
+    blocks.append(_st.build_fine_peel(A))
+    blocks.append(_st.build_assemble(A, left))
+    blocks.append(tight_out_to_ax_rules(L, bands["OUT_NIB"], gate))
+    return blocks
+
+
+def tight_shift_enabled() -> bool:
+    """``C4_TIGHT_SHIFT`` (DEFAULT ON): the tight direct-8x8 nibble shifter is the
+    model's SHL/SHR.  Set ``C4_TIGHT_SHIFT=0`` to fall back to the bit-granular
+    log-shifter (``shift_stage_blocks``), byte-identically to the pre-tight model."""
+    return os.environ.get("C4_TIGHT_SHIFT", "1") not in ("0", "", "false", "False")
+
+
+def unified_tight_shift_blocks(L: NibbleLayout, dim_ref: Callable[[], int],
+                               shift_ops=(isa.SHL, isa.SHR)) -> List[Tuple[str, dict]]:
+    """The TIGHT shifter as named, opcode-gated FFN sub-blocks for the unified model
+    (``nibble_unified.build_bitwise_blocks``), the drop-in for the merged
+    ``bw-shift-*`` log-shifter blocks.
+
+    SHL and SHR each get PRIVATE tight scratch bands (``extend_layout_for_tight_shift``
+    per op), so their 6-block scratch pipelines (amount load/decode, coarse select,
+    fine product/peel, assemble) run UNCONDITIONALLY side-by-side — they only touch
+    their own scratch, never AX/STACK0.  Only the final ``OUT_NIB -> AX`` recompose
+    is opcode-gated (``OP_IS[op]``), so a shift writes AX only when its opcode is
+    active and the two recomposes MERGE into one block.  The layout is extended for
+    ALL ``shift_ops`` FIRST so every block is compiled at the final ``dim``.
+
+    ``dim_ref`` returns the CURRENT ``L.D`` (a thunk, since the layout keeps
+    growing); every spec is built once the layout is final."""
+    from .compile_ffn import compile_ffn as _compile_ffn
+    # 1) extend the layout for every direction up-front so dim is final.
+    for op in shift_ops:
+        extend_layout_for_tight_shift(L, op)
+    dim = dim_ref()
+    named: List[Tuple[str, dict]] = []
+    recompose_rules: List[FFNRule] = []
+    for op in shift_ops:
+        stage = tight_shift_stage_blocks(L, op, recompose_gate=L.OP_IS + op)
+        raw_specs, recompose = stage[:-1], stage[-1]     # blocks 0-6 raw; last = FFNRule recompose
+        step_names = ([f"bw-tshift-{isa.NAMES[op]}-load",
+                       f"bw-tshift-{isa.NAMES[op]}-amt1",
+                       f"bw-tshift-{isa.NAMES[op]}-amt2",
+                       f"bw-tshift-{isa.NAMES[op]}-coarse",
+                       f"bw-tshift-{isa.NAMES[op]}-fprod",
+                       f"bw-tshift-{isa.NAMES[op]}-fpeel",
+                       f"bw-tshift-{isa.NAMES[op]}-asm"])
+        for name, spec in zip(step_names, raw_specs):
+            named.append((name, spec))
+        recompose_rules += recompose                     # already OP_IS-gated
+    named.append(("bw-tshift-recompose", _compile_ffn(recompose_rules, dim)))
+    return named
+
+
 # NOTE: the DENSE per-nibble 256-entry (a,b) bitwise lookup table
 # (``bitwise_dispatch_rules``) and the DENSE per-value shift lookup table
 # (``shift_dispatch_rules``) have been REMOVED, as has the intermediate BARREL
@@ -661,17 +877,23 @@ def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     Applying the blocks in order transforms ``(STACK0=pop, AX=operand2)`` into
     ``AX=result``.
 
-    ALL five ops (OR/XOR/AND/SHL/SHR) use the per-BIT path — the shared bit-plane
-    extraction (``compile_bit_extract`` -> ``A_BIT``/``B_BIT``) plus a tiny per-bit
-    combine (OR/XOR/AND via ``perbit_select_rules``) or the LOG-SHIFTER
-    (SHL/SHR via the 5 conditional 2**k stages, ``shift_stage_blocks``).  There is
-    NO dense per-value lookup table and NO barrel select any more; the shift also
-    has no MUL/DIV dependency (works in a muldiv-less bitwise subset).  In a real
-    fan-out each block's rules are additionally gated on the opcode one-hot.
+    OR/XOR/AND use the per-BIT path — the shared bit-plane extraction
+    (``compile_bit_extract`` -> ``A_BIT``/``B_BIT``) plus a tiny per-bit combine
+    (``AND=a·b``, ``OR=a+b-a·b``, ``XOR=a+b-2a·b``).  SHL/SHR default to the TIGHT
+    direct-8x8 nibble shifter (``tight_shift_stage_blocks``, ``C4_TIGHT_SHIFT`` ON),
+    which reads the operand as NIBBLES straight from ``STACK0`` and so needs NO
+    bit-planes; with ``C4_TIGHT_SHIFT=0`` they fall back to the bit-granular
+    LOG-SHIFTER (``[planes] + shift_stage_blocks``, byte-identical to the pre-tight
+    model).  There is NO dense per-value lookup table and NO barrel select any more;
+    neither shift path has a MUL/DIV dependency.  In a real fan-out each block's
+    rules are additionally gated on the opcode one-hot.
     """
+    if op in (isa.SHL, isa.SHR) and tight_shift_enabled():
+        # TIGHT direct-8x8 shifter: operand fed as nibbles from STACK0 -> no planes.
+        return tight_shift_stage_blocks(L, op)
     extend_layout_for_bitwise(L)
     # Shared bit-plane extraction of the source (STACK0) and operand-2 (AX) nibbles.
-    # For the shifter this ALSO yields the shift amount: AX bits 0..4 = B_BIT[0..4].
+    # For the log-shifter this ALSO yields the shift amount: AX bits 0..4 = B_BIT[0..4].
     planes = compile_bit_extract(
         src_bands=[L.STACK0 + j for j in range(N_NIB)]
                   + [L.AX + j for j in range(N_NIB)],
@@ -681,8 +903,8 @@ def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     if op in _PERBIT_COMBINE:                          # OR / XOR / AND
         return [planes, perbit_select_rules(L, op)]
     if op in (isa.SHL, isa.SHR):
-        # bit-planes (source + shift amount), then the log-shifter pipeline
-        # (keep bit + LOG_STAGES conditional 2**k mux stages + keep-gated recompose).
+        # log-shifter fallback (C4_TIGHT_SHIFT=0): bit-planes (source + shift
+        # amount), then the pipeline (keep + LOG_STAGES 2**k mux stages + recompose).
         return [planes] + shift_stage_blocks(L, op)
     raise ValueError(f"append_bitwise_shift_to_dispatch: unsupported op {op}")
 

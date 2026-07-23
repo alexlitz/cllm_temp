@@ -636,10 +636,21 @@ def run_blocks(blocks: List[dict], L, pop: int, n: int) -> int:
 # VARIANT 2 — the LANDED bit-granular gadget, measured through nibble_bitwise.
 # ===========================================================================
 def measure_bit_granular(op: int) -> Tuple[int, int, float, Callable[[int, int], int]]:
-    """Depth, nz, max-relu-arg, and a runner for the landed log-shifter."""
+    """Depth, nz, max-relu-arg, and a runner for the landed bit-granular LOG-SHIFTER.
+
+    Built EXPLICITLY (bit-planes + ``shift_stage_blocks``), independent of the
+    ``C4_TIGHT_SHIFT`` default — this bench measures the log-shifter as a REFERENCE
+    baseline; the tight direct-8x8 shifter is measured by ``shift_tight_nibble``."""
     from .blogspec_layout import NibbleLayout
     L = NibbleLayout()
-    blocks = bw.append_bitwise_shift_to_dispatch(L, op)
+    bw.extend_layout_for_bitwise(L)
+    planes = bw.compile_bit_extract(
+        src_bands=[L.STACK0 + j for j in range(bw.N_NIB)]
+                  + [L.AX + j for j in range(bw.N_NIB)],
+        bit_bases=[L.A_BIT + j * 4 for j in range(bw.N_NIB)]
+                  + [L.B_BIT + j * 4 for j in range(bw.N_NIB)],
+        one_band=L.ONE, dim=L.D)
+    blocks = [planes] + bw.shift_stage_blocks(L, op)
     weights = bw.compile_dispatch(L, blocks)
     depth = len(weights)
     nz = _blocks_nz(weights)

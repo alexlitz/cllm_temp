@@ -340,22 +340,32 @@ def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
         s = _bw.perbit_select_rules(L, op)               # shared per-bit gadget
         comb += _opcode_gate_rules(s, L.OP_IS + op)
     blocks.append(("bw-combine", compile_ffn(comb, L.D)))
-    # SHL/SHR LOG-SHIFTER: the shift is a PIPELINE (each mux stage reads the prior
-    # stage's buffer), so the stages are SEPARATE sequential FFN blocks.  SHL and
-    # SHR share the SH_STAGE buffers — both ops' rules are OP_IS-gated so only the
-    # decoded opcode writes.  Blocks: keep bit, LOG_STAGES mux stages, recompose.
+    # SHL/SHR shifter.  DEFAULT: the TIGHT direct-8x8 nibble shifter
+    # (``C4_TIGHT_SHIFT`` ON) — a 6-block DIRECT nibble pipeline (amount decode,
+    # coarse select, fine product/peel, assemble) per direction reading the operand
+    # straight from the STACK0 nibbles (NO bit-planes).  Each direction has PRIVATE
+    # scratch bands so both run unconditionally; only the OUT->AX recompose is
+    # OP_IS-gated (merged for SHL+SHR).  FALLBACK (``C4_TIGHT_SHIFT=0``): the
+    # bit-granular LOG-SHIFTER — the shift is a PIPELINE (each mux stage reads the
+    # prior stage's buffer), stages are SEPARATE sequential FFN blocks; SHL and SHR
+    # share the SH_STAGE buffers, both OP_IS-gated.
     if barrel_shift_ops:
-        n_stage_blocks = _bw.LOG_STAGES + 2
-        merged: List[List[FFNRule]] = [[] for _ in range(n_stage_blocks)]
-        for op in barrel_shift_ops:                      # (SHL, SHR) unless via mul
-            stage_blocks = _bw.shift_stage_blocks(L, op)
-            for bi, sb in enumerate(stage_blocks):
-                merged[bi] += _opcode_gate_rules(sb, L.OP_IS + op)
-        names = (["bw-shift-keep"]
-                 + [f"bw-shift-log{k}" for k in range(_bw.LOG_STAGES)]
-                 + ["bw-shift-recompose"])
-        for name, rules in zip(names, merged):
-            blocks.append((name, compile_ffn(rules, L.D)))
+        if _bw.tight_shift_enabled():
+            for name, spec in _bw.unified_tight_shift_blocks(
+                    L, lambda: L.D, shift_ops=barrel_shift_ops):
+                blocks.append((name, spec))
+        else:
+            n_stage_blocks = _bw.LOG_STAGES + 2
+            merged: List[List[FFNRule]] = [[] for _ in range(n_stage_blocks)]
+            for op in barrel_shift_ops:                  # (SHL, SHR) unless via mul
+                stage_blocks = _bw.shift_stage_blocks(L, op)
+                for bi, sb in enumerate(stage_blocks):
+                    merged[bi] += _opcode_gate_rules(sb, L.OP_IS + op)
+            names = (["bw-shift-keep"]
+                     + [f"bw-shift-log{k}" for k in range(_bw.LOG_STAGES)]
+                     + ["bw-shift-recompose"])
+            for name, rules in zip(names, merged):
+                blocks.append((name, compile_ffn(rules, L.D)))
     return blocks
 
 
@@ -424,6 +434,13 @@ def _build_unified_model_impl(code_size, n_heads, include_bitwise):
     L.two_limb = False                       # STAMP: single-scalar (driver honours it)
     if include_bitwise:
         _bw.extend_layout_for_bitwise(L)
+        # TIGHT shifter (C4_TIGHT_SHIFT, default ON): allocate its private per-op
+        # scratch bands NOW, before ``dim`` is fixed below, so the tight shift blocks
+        # (compiled inside build_bitwise_blocks at the fixed ``dim``) reference valid
+        # residual dims.  OR/XOR/AND keep the shared A_BIT/B_BIT bit-planes.
+        if _bw.tight_shift_enabled():
+            for op in (isa.SHL, isa.SHR):
+                _bw.extend_layout_for_tight_shift(L, op)
         while L._off % n_heads != 0:
             L._scalar(f"_bwpad{L._off}")
         L.D = L._off
