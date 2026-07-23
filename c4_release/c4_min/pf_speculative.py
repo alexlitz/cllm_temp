@@ -465,6 +465,17 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     HD = model.blocks[0].attn.head_dim
     caches = [BlockKVCacheBatched(H, HD, model.blocks[b].attn.alibi_slopes)
               for b in range(n_blocks)]
+    # DROP-KV local attention: if ``install_local_attention(..., drop_local_kv=True)``
+    # tagged the blocks, tell each block's cache which heads are GLOBAL (keep full KV)
+    # vs LOCAL (keep only the last W positions — OLD rows DROPPED, not just masked).
+    # This is the actual VRAM lever: the ~7357 local head-slots keep ~W rows instead of
+    # the whole S-row history; eviction then only manages the ~3 global heads.
+    for b in range(n_blocks):
+        at = model.blocks[b].attn
+        if getattr(at, "_drop_local_kv", False) and getattr(at, "_local_window", None):
+            gmask = at._global_head_mask
+            g_idx = [int(h) for h in range(H) if bool(gmask[h])]
+            caches[b].set_head_groups(g_idx, int(at._local_window))
     store_log = draft.store_log
     n_steps = draft.step_count
     forwards = 0
@@ -481,6 +492,15 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     max_cache = 0
     evict_rounds = 0
     peak_vram = 0
+    Hf = model.blocks[0].attn.n_heads
+    # DROP-KV split peak accounting (measured at the max total-footprint moment, so
+    # the reduction is honest even though eviction later shrinks the global cache).
+    split_on = any(getattr(c, "split", False) for c in caches)
+    peak_split_rows = 0          # sum_b (Hg_b*global_b + Hl_b*local_b) at its peak
+    peak_gmax = 0                # high-water GLOBAL cache size (pre-eviction); the
+                                 # classic full-H cache would have held H*this per block
+                                 # (the global heads see FULL history == what a classic
+                                 # LOCAL head would also hold).
     is_cuda = device.startswith("cuda")
     min_k = max(1, int(min_block_steps))
     import time as _time
@@ -698,6 +718,18 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         if device.startswith("cuda"):
             torch.cuda.synchronize(dev)
 
+        # DROP-KV peak accounting — measured HERE (post-commit, PRE-eviction) so the
+        # global-cache high-water reflects what the classic full-H cache would have
+        # reached before eviction (the fair "avoided cost"); the split's own local
+        # rows are already window-bounded so their peak is stable.
+        if split_on:
+            g_max = max((c.size() for c in caches), default=0)
+            split_rows = sum(c.n_global_heads() * c.size()
+                             + (Hf - c.n_global_heads()) * c.local_size()
+                             for c in caches)
+            peak_split_rows = max(peak_split_rows, split_rows)
+            peak_gmax = max(peak_gmax, g_max)
+
         # EVICTION-INTERVAL (user's lever): evict ONCE per ``evict_every`` VM steps
         # (default: once per verify block).  Fires at the block boundary, so with a
         # big K this is ONE eviction sweep per ~30k-token block — ~250x fewer
@@ -729,7 +761,10 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             t_evict += _time.perf_counter() - _t0
             steps_since_evict = 0
             evict_rounds += 1
-        max_cache = max(max_cache, caches[0].size())
+        if split_on:
+            max_cache = max(max_cache, max((c.size() for c in caches), default=0))
+        else:
+            max_cache = max(max_cache, caches[0].size())
         step = end
 
     # the answer is the MODEL's decoded AX at the last step (verify PROVED it equals
@@ -738,7 +773,9 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     vram_gb = peak_vram / (1024 ** 3)
     if stats is not None:
         stats["max_seq_len"] = max_seq
-        stats["max_cache_size"] = max(max_cache, caches[0].size())
+        _final_cache = (max((c.size() for c in caches), default=0) if split_on
+                        else caches[0].size())
+        stats["max_cache_size"] = max(max_cache, _final_cache)
         stats["total_evicted"] = sum(c.total_evicted for c in caches)
         stats["forwards"] = forwards
         stats["peak_vram_gb"] = vram_gb
@@ -757,6 +794,27 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         # drained so the block forwards still pipeline.
         stats["t_evict"] = t_evict
         stats["n_prunes"] = evict_rounds       # #fused-eviction rounds (== evict_rounds)
+        # DROP-KV split accounting: how many caches actually manage a GLOBAL cache
+        # (the only ones eviction touches) vs the local-head window rows.  Reports
+        # the eviction-overhead reduction (only ~2 blocks have a global cache).
+        if split_on:
+            g_caches = [c for c in caches if getattr(c, "split", False)
+                        and c.n_global_heads() > 0]
+            stats["split_active"] = True
+            # #caches that manage a GLOBAL cache (the ONLY ones eviction touches) —
+            # the eviction-overhead reduction: ~2 of ~320 blocks, vs all 320 classic.
+            stats["n_global_caches"] = len(g_caches)
+            stats["max_local_cache"] = max((c.local_size() for c in caches), default=0)
+            # KV-row footprint: the split's peak rows vs the classic full-H cache the
+            # split AVOIDS.  Classic == n_blocks * H * (peak global cache high-water),
+            # since the global heads see FULL history so a classic LOCAL head would
+            # hold the SAME rows.  On a growing-cache program this is the big win; on a
+            # flat-cache (well-evicted) program the local window rows dominate.
+            classic_rows = n_blocks * Hf * peak_gmax
+            stats["kv_rows_split"] = peak_split_rows
+            stats["kv_rows_classic"] = classic_rows
+            stats["peak_global_cache"] = peak_gmax
+            stats["kv_row_reduction"] = (classic_rows / max(peak_split_rows, 1))
     return VerifyResult(
         accepted_steps=accepted, total_steps=n_steps,
         all_matched=(accepted == n_steps), forwards=forwards,

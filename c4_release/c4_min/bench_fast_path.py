@@ -274,13 +274,14 @@ def _run_k_sweep(sparse, L, code, draft, device, args) -> int:
           f"(evict_interval_steps={args.evict_interval_steps or 'per-block'}, "
           f"block_moe={args.block_moe}) ===", flush=True)
     header = (f"    {'K':>6} {'forwards':>9} {'eff_K':>6} {'wall_s':>9} "
-              f"{'ms/step':>9} {'vram_GB':>8} {'cache':>7} {'evictR':>7} "
+              f"{'ms/step':>9} {'vram_GB':>8} {'gcache':>7} {'lcache':>7} {'evictR':>7} "
               f"{'GPU%':>5} {'match':>6} {'AX':>6}")
     print(header, flush=True)
     print("    " + "-" * (len(header) - 4), flush=True)
     ref_ax = None
     ref_match = None
     all_ok = True
+    last_split_stats: dict = {}
     for K in ks:
         stats: dict = {}
         out: List[int] = []
@@ -310,7 +311,7 @@ def _run_k_sweep(sparse, L, code, draft, device, args) -> int:
                 torch.cuda.empty_cache()
             msg = "OOM" if "out of memory" in str(e).lower() else "ERR"
             print(f"    {K:>6} {'-':>9} {'-':>6} {'-':>9} {'-':>9} "
-                  f"{'-':>8} {'-':>7} {'-':>7} {'-':>5} {msg:>6} {'-':>6}"
+                  f"{'-':>8} {'-':>7} {'-':>7} {'-':>7} {'-':>5} {msg:>6} {'-':>6}"
                   f"   (K span did not fit even at min_block_steps)", flush=True)
             continue
         if device.startswith("cuda"):
@@ -326,13 +327,26 @@ def _run_k_sweep(sparse, L, code, draft, device, args) -> int:
             ref_ax, ref_match = ax, vr.all_matched
         elif ax != ref_ax or vr.all_matched != ref_match:
             all_ok = False
+        if stats.get("split_active"):
+            last_split_stats = stats
         print(f"    {K:>6} {vr.forwards:>9} "
               f"{stats.get('effective_block_steps', K):>6} {wall:>9.2f} "
               f"{ms:>9.2f} {stats.get('peak_vram_gb', 0.0):>8.2f} "
               f"{stats.get('max_cache_size', 0):>7} "
+              f"{stats.get('max_local_cache', 0):>7} "
               f"{stats.get('evict_rounds', 0):>7} {gpu:>5.0f} "
               f"{str(vr.all_matched):>6} {str(ax):>6}", flush=True)
     print(f"    K-invariance (all completed K same match+AX): {all_ok}", flush=True)
+    if last_split_stats:
+        print(f"    DROP-KV split: eviction manages "
+              f"{last_split_stats.get('n_global_caches')} global caches of "
+              f"{len(sparse.blocks)} blocks (vs all {len(sparse.blocks)} classic); "
+              f"peak global cache {last_split_stats.get('peak_global_cache')} rows, "
+              f"local window rows/block <= {last_split_stats.get('max_local_cache')}; "
+              f"KV-row footprint {last_split_stats.get('kv_rows_split')} vs classic full-H "
+              f"{last_split_stats.get('kv_rows_classic')} "
+              f"({last_split_stats.get('kv_row_reduction', 1.0):.1f}x fewer rows)",
+              flush=True)
     print(f"  RSS peak: {_rss_gb():.2f} GB", flush=True)
     return 0 if all_ok else 1
 
@@ -417,10 +431,15 @@ def run_bench(kind: str, args) -> int:
     # windowed head's true attention weight past W is exactly 0.
     if args.local_window is not None:
         from .local_attention import install_local_attention
-        la = install_local_attention(sparse, window=args.local_window, verbose=True)
-        print(f"  LOCAL-ATTN: window={la['window']}  "
+        drop_kv = not args.local_mask_only
+        la = install_local_attention(sparse, window=args.local_window,
+                                     drop_local_kv=drop_kv, verbose=True)
+        mode = "DROP-KV" if drop_kv else "MASK-ONLY"
+        print(f"  LOCAL-ATTN [{mode}]: window={la['window']}  "
               f"windowed {la['frac_windowed']*100:.1f}% of head-slots  "
-              f"({la['n_global_head_slots']} global, {la['n_local_head_slots']} local)",
+              f"({la['n_global_head_slots']} global, {la['n_local_head_slots']} local)"
+              + ("  -> local heads keep only last-W KV (cache ~Hg·S + Hl·W)"
+                 if drop_kv else "  -> full KV kept, windowed READ only (compute win)"),
               flush=True)
 
     # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
@@ -521,6 +540,16 @@ def run_bench(kind: str, args) -> int:
     print(f"  FAST: blocks_run={fast_stats.get('blocks_run')} "
           f"blocks_full={fast_stats.get('blocks_full')} "
           f"block_moe_speedup={fast_stats.get('block_moe_speedup', 1.0):.2f}x", flush=True)
+    if fast_stats.get("split_active"):
+        print(f"  FAST: DROP-KV split — eviction manages "
+              f"{fast_stats.get('n_global_caches')} global caches of "
+              f"{len(sparse.blocks)} blocks (vs all {len(sparse.blocks)} classic); "
+              f"peak global cache {fast_stats.get('peak_global_cache')} rows, "
+              f"local window rows/block <= {fast_stats.get('max_local_cache')}; "
+              f"KV-row footprint {fast_stats.get('kv_rows_split')} vs classic full-H "
+              f"{fast_stats.get('kv_rows_classic')} "
+              f"({fast_stats.get('kv_row_reduction', 1.0):.1f}x fewer rows)",
+              flush=True)
     if util_sampler:
         print(f"  FAST: GPU util mean={util_sampler.mean:.0f}% "
               f"max={util_sampler.max:.0f}% (n={util_sampler.n})", flush=True)
@@ -629,7 +658,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "the ~20 ingest heads only read the last W tokens (O(S*W)), "
                          "the memory/stack/LEV KV heads stay GLOBAL (full causal). "
                          "Byte-identical (ingest weight past W is 0). Try 64 (~2 VM "
-                         "steps). Off by default (full global attention).")
+                         "steps). Off by default (full global attention).  DEFAULT "
+                         "DROPS the local heads' old KV (cache ~Hg·S + Hl·W; the VRAM "
+                         "lever) — pass --local-mask-only for the old mask-only mode.")
+    ap.add_argument("--local-mask-only", action="store_true",
+                    help="with --local-window: keep the FULL KV cache and only WINDOW "
+                         "the local heads' softmax read (compute win, no VRAM win). "
+                         "The fallback for the default DROP-KV behavior.")
     args = ap.parse_args(argv)
     if args.kind == "mandel":
         if len(args.grid) < 3:

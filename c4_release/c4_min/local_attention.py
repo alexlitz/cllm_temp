@@ -41,6 +41,7 @@ import torch
 
 from . import sparse_forward as _SF
 from .blogspec_model import softmax1
+from .nibble_pure_forward_cached import _SplitPastKV
 
 
 # The ingest heads' recency slope (latest-frame-wins).  A LIVE head baked with THIS
@@ -127,10 +128,21 @@ def windowed_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
     attention weight past the window is 0.  Splits the heads into GLOBAL (full
     causal over all keys) and LOCAL (only keys with ``q_pos - k_pos < W``).
 
-    The KV CACHE (``past_kv`` / the returned ``(K, V, k_pos)``) is UNCHANGED — the
-    full projected K/V of every position is still stored (the global heads need it,
-    and the commit path is shared).  Only the SCORE/softmax READ for local heads is
-    restricted to the window, which is where the O(S²) cost lives.
+    TWO cache regimes, selected by the past-KV type:
+
+    * MASK-ONLY (``--local-mask-only`` fallback, ``past_kv`` a plain 3-tuple):
+      the full KV of every position is still stored; only the local heads' softmax
+      READ is windowed.  Saves compute (O(S·W) local scores) but NOT VRAM.
+
+    * DROP-KV (``_SplitPastKV`` past, the default): the LOCAL heads' old KV was
+      already DROPPED from the cache (the ``BlockKVCacheBatched`` split keeps only
+      the last-W local rows), so the local heads read a SHORT cache and the global
+      heads read their own full cache.  This is what shrinks VRAM from ~7360·S to
+      ~3·S + 7357·W.  Byte-identical: the dropped local rows' true weight is 0.
+
+    The returned ``(K, V, k_pos)`` is the NEW window rows only (``Knew/Vnew/q_pos``);
+    the driver's commit path routes them into the split cache itself (it slices the
+    last-S tail), so no concatenated past-KV tensor is materialised or returned.
     """
     W = getattr(self, "_local_window", None)
     gmask = getattr(self, "_global_head_mask", None)
@@ -148,72 +160,76 @@ def windowed_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
     else:
         q_pos = q_positions.to(device=x.device, dtype=torch.long)
 
-    if past_kv is not None:
-        K_cache, V_cache, pos_cache = past_kv
-        K = torch.cat([K_cache, Knew], dim=2)                   # [B,H,Sk,HD]
-        Vv = torch.cat([V_cache, Vnew], dim=2)
-        k_pos = torch.cat([pos_cache.to(x.device), q_pos], dim=0)
-    else:
-        K, Vv, k_pos = Knew, Vnew, q_pos
-
-    Sk = K.shape[2]
-    # --- GLOBAL heads: full causal over ALL keys (unchanged math) --------------
     g_idx = torch.nonzero(gmask, as_tuple=False).flatten()
     l_idx = torch.nonzero(~gmask, as_tuple=False).flatten()
     out = x.new_zeros(B, H, S, HD)
 
-    def _attend(idx, K_sub, V_sub, kpos_sub):
-        """Compute the softmax1+ALiBi attention output for the heads in ``idx``
-        over the key set ``K_sub``/``V_sub`` at absolute positions ``kpos_sub``."""
+    def _attend_group(idx, K_full, V_full, kpos_full, window):
+        """softmax1+ALiBi attention output for the heads ``idx`` over the FULL key
+        set ``K_full`` at abs positions ``kpos_full``.  ``window`` None -> full
+        causal (global heads); an int W -> drop keys with ``q_pos-k_pos >= W``
+        (local heads).  ``K_full`` here is already this GROUP's heads (index 0..len(idx))
+        when a split cache pre-selected them, else the full-H tensor indexed by ``idx``."""
         if idx.numel() == 0:
             return
-        Qg = Q[:, idx]                                          # [B,g,S,HD]
-        sc = torch.matmul(Qg, K_sub[:, idx].transpose(-2, -1)) * self.scale
-        dist = (q_pos.unsqueeze(1) - kpos_sub.unsqueeze(0)).abs().float()  # [S,Sk']
-        sc = sc - self.alibi_slopes[idx].view(1, -1, 1, 1) * dist.unsqueeze(0)
-        mask = (kpos_sub.unsqueeze(0) > q_pos.unsqueeze(1))     # future keys
-        sc = sc.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        pre_sel = (K_full.shape[1] == idx.numel())     # already this group's heads
+        Ksel = K_full if pre_sel else K_full[:, idx]
+        Vsel = V_full if pre_sel else V_full[:, idx]
+        Qg = Q[:, idx]
+        sc = torch.matmul(Qg, Ksel.transpose(-2, -1)) * self.scale
+        dist = (q_pos.unsqueeze(1) - kpos_full.unsqueeze(0)).float()   # signed [S,Sk']
+        sc = sc - self.alibi_slopes[idx].view(1, -1, 1, 1) * dist.abs().unsqueeze(0)
+        m = (kpos_full.unsqueeze(0) > q_pos.unsqueeze(1))              # future keys
+        if window is not None:
+            m = m | (dist >= window)                                  # older than window
+        sc = sc.masked_fill(m.unsqueeze(0).unsqueeze(0), float("-inf"))
         a = softmax1(sc, dim=-1)
-        out[:, idx] = torch.matmul(a, V_sub[:, idx])
+        out[:, idx] = torch.matmul(a, Vsel)
 
-    # global: all keys.
-    _attend(g_idx, K, Vv, k_pos)
-
-    # local: only the last-W keys by ABSOLUTE position.  A query at q_pos attends
-    # to keys with q_pos - k_pos < W (and k_pos <= q_pos for causality).  Across the
-    # whole span the union of needed keys is [q_pos.min() - W + 1 .. Sk-1]; slice to
-    # that contiguous suffix (the local heads never look further back), then apply
-    # the per-row window inside ``_attend`` via the causal + ALiBi + the extra
-    # window mask below.  This is where O(S²) -> O(S·W).
-    if l_idx.numel() > 0:
-        qmin = int(q_pos.min().item())
-        cutoff = qmin - W + 1                                   # earliest needed abs pos
-        keep = (k_pos >= cutoff)
-        if bool(keep.all()):
-            # window covers the whole cache already (short span) -> plain local mask.
-            Ksub, Vsub, kpos_sub = K, Vv, k_pos
+    if isinstance(past_kv, _SplitPastKV):
+        # DROP-KV: each head group reads its OWN cache (global full, local trimmed).
+        # Append this span's new rows to each group before attending; the local
+        # group's cache is already only the last-W rows (dropped on commit), and we
+        # additionally apply the per-row window mask so a query only sees <W back.
+        pk = past_kv
+        # GLOBAL heads.
+        if g_idx.numel() > 0:
+            Kg_new, Vg_new = Knew[:, g_idx], Vnew[:, g_idx]
+            if pk.Kg is not None:
+                Kg = torch.cat([pk.Kg, Kg_new], dim=2)
+                Vg = torch.cat([pk.Vg, Vg_new], dim=2)
+                posg = torch.cat([pk.posg.to(x.device), q_pos], dim=0)
+            else:
+                Kg, Vg, posg = Kg_new, Vg_new, q_pos
+            _attend_group(g_idx, Kg, Vg, posg, None)
+        # LOCAL heads.
+        if l_idx.numel() > 0:
+            Kl_new, Vl_new = Knew[:, l_idx], Vnew[:, l_idx]
+            if pk.Kl is not None:
+                Kl = torch.cat([pk.Kl, Kl_new], dim=2)
+                Vl = torch.cat([pk.Vl, Vl_new], dim=2)
+                posl = torch.cat([pk.posl.to(x.device), q_pos], dim=0)
+            else:
+                Kl, Vl, posl = Kl_new, Vl_new, q_pos
+            _attend_group(l_idx, Kl, Vl, posl, W)
+    else:
+        # MASK-ONLY fallback (or first span with no past): full KV, windowed READ.
+        if past_kv is not None:
+            K_cache, V_cache, pos_cache = past_kv
+            K = torch.cat([K_cache, Knew], dim=2)
+            Vv = torch.cat([V_cache, Vnew], dim=2)
+            k_pos = torch.cat([pos_cache.to(x.device), q_pos], dim=0)
         else:
-            keep_idx = torch.nonzero(keep, as_tuple=False).flatten()
-            Ksub = K[:, :, keep_idx, :]
-            Vsub = Vv[:, :, keep_idx, :]
-            kpos_sub = k_pos[keep_idx]
-        # per-row window: drop keys with (q_pos - k_pos) >= W (older than window).
-        Qg = Q[:, l_idx]
-        sc = torch.matmul(Qg, Ksub[:, l_idx].transpose(-2, -1)) * self.scale
-        dist = (q_pos.unsqueeze(1) - kpos_sub.unsqueeze(0)).float()   # signed [S,Sk']
-        adist = dist.abs()
-        sc = sc - self.alibi_slopes[l_idx].view(1, -1, 1, 1) * adist.unsqueeze(0)
-        future = (kpos_sub.unsqueeze(0) > q_pos.unsqueeze(1))
-        too_old = (dist >= W)                                   # strictly outside window
-        m = (future | too_old).unsqueeze(0).unsqueeze(0)
-        sc = sc.masked_fill(m, float("-inf"))
-        a = softmax1(sc, dim=-1)
-        out[:, l_idx] = torch.matmul(a, Vsub[:, l_idx])
+            K, Vv, k_pos = Knew, Vnew, q_pos
+        _attend_group(g_idx, K, Vv, k_pos, None)
+        _attend_group(l_idx, K, Vv, k_pos, W)
 
     out = out.transpose(1, 2).contiguous().view(B, S, D)
     out = x + self.W_o.linear(out)
     if use_cache:
-        return out, (K, Vv, k_pos)
+        # Return the NEW window rows only; the driver's commit slices the last-S tail
+        # and (for a split cache) routes each head group into its own trimmed cache.
+        return out, (Knew, Vnew, q_pos)
     return out
 
 
@@ -227,12 +243,19 @@ _ORIG_FORWARD = _SF.SparseAttn.forward
 
 
 def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
+                            drop_local_kv: bool = True,
                             verbose: bool = False) -> Dict[str, object]:
     """Install sliding-window attention on the LOCAL heads of every block.
 
     ``window`` = the sliding-window size W in TOKENS (must be >= the largest LOCAL
     head's measured window; the ingest heads are ≤ 28 = < one 30-token frame, so
     the default 64 = ~2 VM steps is safe).  The MEMORY/STACK/LEV heads stay GLOBAL.
+
+    ``drop_local_kv`` (default True) is the VRAM lever: the local heads' OLD KV is
+    physically DROPPED from the cache (only the last-W local rows are kept), so the
+    cache collapses from ~H·S to ~Hg·S + Hl·W.  ``drop_local_kv=False`` is the
+    MASK-ONLY fallback (``--local-mask-only``): the full KV is still stored and only
+    the local heads' softmax READ is windowed — saves compute, not VRAM.
 
     Returns a summary dict (classification + windowed-head fraction).
     ``uninstall_local_attention(model)`` reverts to the global forward.
@@ -247,12 +270,14 @@ def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
             gmask[h] = True
         at._local_window = int(window)
         at._global_head_mask = gmask
+        at._drop_local_kv = bool(drop_local_kv)     # read by verify_blocks cache init
         # bind the windowed forward as a bound method on this instance.
         at.forward = windowed_forward.__get__(at, type(at))
         n_global += int(gmask.sum())
         n_local += H - int(gmask.sum())
     summary = {
         "window": int(window),
+        "drop_local_kv": bool(drop_local_kv),
         "classification": cls,
         "n_local_head_slots": n_local,
         "n_global_head_slots": n_global,
@@ -260,7 +285,8 @@ def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
     }
     if verbose:
         live_global = {bi: hs for bi, hs in cls.items() if hs}
-        print(f"[local-attn] window={window}  live GLOBAL heads (block->heads): "
+        mode = "DROP-KV" if drop_local_kv else "MASK-ONLY"
+        print(f"[local-attn] {mode}  window={window}  live GLOBAL heads (block->heads): "
               f"{live_global}")
         print(f"[local-attn] windowed {n_local}/{n_local + n_global} head-slots "
               f"({summary['frac_windowed']*100:.1f}%) across {len(model.blocks)} blocks")
@@ -271,9 +297,8 @@ def uninstall_local_attention(model) -> None:
     """Revert every block to the ORIGINAL global ``SparseAttn.forward``."""
     for blk in model.blocks:
         at = blk.attn
-        if hasattr(at, "_local_window"):
-            del at._local_window
-        if hasattr(at, "_global_head_mask"):
-            del at._global_head_mask
+        for a in ("_local_window", "_global_head_mask", "_drop_local_kv"):
+            if hasattr(at, a):
+                delattr(at, a)
         if "forward" in at.__dict__:
             del at.__dict__["forward"]
