@@ -44,10 +44,22 @@ one-token compaction go away while staying inside Qwen2.5-0.5B's 14 query heads.
 
 Scope
 =====
-Base ISA (IMM/LEA/PSH/ADD/SUB/PC/SP/branch BZ/BNZ/JMP), byte-exact through the
-standard loop vs ``isa.interpret``.  The FFN COMPUTE blocks (recompose -> fetch ->
-decode -> dispatch -> branch -> fold) are REUSED verbatim from ``qwen_full_vm``; the
-new work is the emit/ingest boundary and the standard generation loop.
+FULL ISA, byte-exact through the standard loop, selected per ``subset``:
+
+  * base   (IMM/LEA/PSH/ADD/SUB/PC/SP/branch BZ/BNZ/JMP) — vs ``isa.interpret``.
+  * cmp    (EQ/NE/LT/GT/LE/GE) — result is a nibble the model emits, vs isa.interpret.
+  * bitwise (AND/OR/XOR/SHL/SHR) — vs isa.interpret (8-bit).
+  * memory (LI/SI) — the address-keyed KV CAM (``_bake_memory_cam``) content-addresses
+    the EMITTED store frames (persistent MEM tokens); vs isa.interpret.
+  * muldiv (MUL/DIV/MOD) — the efficient-ALU 32-bit gadgets; the result rides the AX
+    NIBBLE band and is emitted as W=8 nibbles, vs ``ref_interpret(mask=0xFFFFFFFF)``.
+
+The register width ``REG_WIDTH`` is 5 for the 8-bit families (SP/BP reach 0x10000 =
+nibble 4) and widens to 8 for the muldiv 32-bit results (``reg_width_for(subset)``).
+The FFN COMPUTE blocks (recompose -> fetch -> decode -> dispatch -> branch -> the ALU
+gadgets -> fold) are REUSED verbatim from ``qwen_full_vm._block_specs``; the new work
+is the emit/ingest boundary, the AX-from-nibble muldiv path, and the standard loop
+(optionally KV-cache-incremental, which is both faster and more literally vanilla).
 """
 from __future__ import annotations
 
@@ -62,11 +74,13 @@ from . import isa
 from . import blogspec_vocab as V
 from .blogspec_layout import NIB_PER_REG
 from .nibble_pure_forward import SP_INIT
+from .nibble_pure_forward_complete import ref_interpret
 from . import qwen_full_vm as Q
 from .qwen_full_vm import (
     QwenFullLayout, QwenArch, QWEN2_5_ARCH, NORM_K, ROPE_THETA,
     rmsnorm_identity_gamma, _rope_lane_pair, _block_specs, _bake_ffn,
-    _qwen_config, SUBSET_BASE, Subset, CAM_REGS,
+    _qwen_config, SUBSET_BASE, SUBSET_MEM, SUBSET_MEM_CMP, SUBSET_BITWISE,
+    SUBSET_MULDIV, SUBSET_FULL, Subset, CAM_REGS,
     STOCK_HIDDEN, STOCK_INTERMEDIATE, STOCK_LAYERS,
 )
 from .nibble_vm import S, SILU_S, RELU_S, _empty_spec
@@ -87,10 +101,29 @@ from . import nibble_alu32 as A
 # so the positional read is one head layout for every register.  8-bit AX/PC/STACK0
 # use nibbles 0..1 and leave 2..4 zero.  Frame = 5*(1+W) + 1 = 31 tokens / step.
 # ===========================================================================
-REG_WIDTH = 5                                     # nibbles emitted per register
+# REG_WIDTH is the nibbles emitted per register.  W=5 covers SP/BP = 0x10000
+# (nibble 4 = 1) for the base/cmp/bitwise 8-bit subsets, so the positional read is
+# one head layout for every register.  The MULDIV subset produces FULL 32-bit
+# results (MUL 13*11, DIV, MOD) that live across all 8 low nibbles of AX/STACK0, so
+# it widens to W=8 (the whole 32-bit word).  ``reg_width_for(subset)`` picks it; the
+# module-level ``REG_WIDTH`` / ``FRAME_LEN`` stay the BASE values (byte-identical to
+# the base-ISA build) and are overridden per-build via ``VanillaLayout.REG_WIDTH``.
+REG_WIDTH = 5                                     # nibbles/register (BASE default)
 FRAME_MARKERS = [V.REG_PC, V.REG_AX, V.REG_SP, V.REG_BP, V.MEM]
-FRAME_LEN = len(CAM_REGS) * (1 + REG_WIDTH) + 1   # 5*6 + 1 = 31
+FRAME_LEN = len(CAM_REGS) * (1 + REG_WIDTH) + 1   # 5*6 + 1 = 31 (BASE)
 assert FRAME_LEN == 31, FRAME_LEN
+
+
+def reg_width_for(subset: Subset) -> int:
+    """Nibbles emitted per register for ``subset``: 8 (the full 32-bit word) when the
+    efficient ALU is present (MUL/DIV/MOD write a 32-bit result into the AX/STACK0
+    nibble bands), else 5 (SP/BP reach 0x10000 = nibble 4; 8-bit AX/PC/STACK0 use
+    nibbles 0..1)."""
+    return 8 if subset.muldiv else 5
+
+
+def frame_len_for(reg_width: int) -> int:
+    return len(CAM_REGS) * (1 + reg_width) + 1
 
 
 def _nibble_token(n: int) -> int:
@@ -125,8 +158,7 @@ class VanillaLayout:
       * ``IS_STEP_END`` (1) — 1 on the STEP_END token (read-CAM QUERY gate + compute).
     """
 
-    OUT_BYTES = 3                                  # bytes covering W=5 nibbles (0,1,2)
-    SLOT_BITS = 6                                  # 2^6 = 64 > FRAME_LEN
+    SLOT_BITS = 6                                  # 2^6 = 64 > FRAME_LEN (W=8: 46, W=5: 31)
 
     def __init__(self, code_size: int, subset: Subset):
         self.QL = QwenFullLayout(code_size, subset, efficient_alu=subset.muldiv)
@@ -134,27 +166,36 @@ class VanillaLayout:
         self.L = L
         self.subset = subset
         self.code_size = code_size
+        # per-build frame geometry (W=8 for the 32-bit muldiv results, else 5).
+        self.REG_WIDTH = reg_width_for(subset)
+        # OUT_BYTES = ceil(W/2): the byte-split intermediate covers W nibbles.
+        self.OUT_BYTES = (self.REG_WIDTH + 1) // 2
+        self.FRAME_LEN = frame_len_for(self.REG_WIDTH)
+        self.STEP_SLOT = self.FRAME_LEN - 1
+        self.SLOT_PLAN = _slot_plan(self.REG_WIDTH)
+        W = self.REG_WIDTH
+        assert (1 << self.SLOT_BITS) > self.FRAME_LEN, (self.SLOT_BITS, self.FRAME_LEN)
         off = self.QL.D_used
         self._names: Dict[str, Tuple[int, int]] = {}
         n_reg = len(CAM_REGS)
 
         self.OUT_BYTE = self._band("OUT_BYTE", n_reg * self.OUT_BYTES, off); off = self._off
-        self.OUT_NIB = self._band("OUT_NIB", n_reg * REG_WIDTH, off); off = self._off
-        self.MIRROR = self._band("MIRROR", n_reg * REG_WIDTH, off); off = self._off
+        self.OUT_NIB = self._band("OUT_NIB", n_reg * W, off); off = self._off
+        self.MIRROR = self._band("MIRROR", n_reg * W, off); off = self._off
         self.EMIT_VAL = self._scalar("EMIT_VAL", off); off = self._off
-        self.RD_SLOT = self._band("RD_SLOT", n_reg * REG_WIDTH, off); off = self._off
+        self.RD_SLOT = self._band("RD_SLOT", n_reg * W, off); off = self._off
         self.REG_OF_NIB = self._band("REG_OF_NIB", n_reg, off); off = self._off
         self.SLOT_ADDR = self._band("SLOT_ADDR", self.SLOT_BITS, off); off = self._off
-        self.SLOT_ONEHOT = self._band("SLOT_ONEHOT", FRAME_LEN, off); off = self._off
+        self.SLOT_ONEHOT = self._band("SLOT_ONEHOT", self.FRAME_LEN, off); off = self._off
         self.IS_NIB_TOK = self._scalar("IS_NIB_TOK", off); off = self._off
         self.IS_STEP_END = self._scalar("IS_STEP_END", off); off = self._off
         self.D_used = off
 
     def mirror(self, reg_idx: int, j: int) -> int:
-        return self.MIRROR + reg_idx * REG_WIDTH + j
+        return self.MIRROR + reg_idx * self.REG_WIDTH + j
 
     def rd_slot(self, reg_idx: int, j: int) -> int:
-        return self.RD_SLOT + reg_idx * REG_WIDTH + j
+        return self.RD_SLOT + reg_idx * self.REG_WIDTH + j
 
     def _band(self, name, size, off):
         self._names[name] = (off, size)
@@ -168,13 +209,23 @@ class VanillaLayout:
         return self.OUT_BYTE + reg_idx * self.OUT_BYTES + i
 
     def out_nib(self, reg_idx: int, j: int) -> int:
-        return self.OUT_NIB + reg_idx * REG_WIDTH + j
+        return self.OUT_NIB + reg_idx * self.REG_WIDTH + j
 
 
 def _reg_val_lanes(L):
     """Scalar next-state value lane feeding each register's OUT_NIB block."""
     return {"PC": L.PC_VAL, "AX": L.AX_VAL, "SP": L.SP_VAL, "BP": L.BP_VAL,
             "STACK0": L.STK_VAL}
+
+
+# AX is the ONLY register whose next-state can be the FULL 32-bit efficient-ALU
+# result: MUL/DIV/MOD/SHL/SHR write it into the AX NIBBLE band L.AX (NOT the scalar
+# AX_VAL).  Every register's OUT_NIB is byte-split from its scalar value lane (base
+# build BYTE-IDENTICAL); in the muldiv build a small OVERRIDE block then OVERWRITES
+# AX's OUT_NIB with the L.AX nibbles gated on OP_IS[muldiv op] — so a MUL/DIV/MOD/SHL/
+# SHR step emits the 32-bit ax-muxed nibbles, and every other op keeps its AX_VAL
+# byte-split (which is correct for base/cmp/bitwise/mem, whose AX <= 0xFF).
+_AX_IDX = CAM_REGS.index("AX")
 
 
 # ===========================================================================
@@ -185,7 +236,7 @@ def _reg_val_lanes(L):
 # slot W+1          : REG_AX marker
 # ... etc, then the trailing STEP_END marker.
 # ===========================================================================
-def _slot_plan() -> List[Tuple[str, object]]:
+def _slot_plan(reg_width: int) -> List[Tuple[str, object]]:
     """Return the per-slot emit plan: a list of (kind, payload) of length FRAME_LEN.
 
     kind == "marker": payload is the fixed marker token id to emit.
@@ -194,14 +245,15 @@ def _slot_plan() -> List[Tuple[str, object]]:
     plan: List[Tuple[str, object]] = []
     for ri, mk in enumerate(FRAME_MARKERS):
         plan.append(("marker", mk))
-        for j in range(REG_WIDTH):
+        for j in range(reg_width):
             plan.append(("nib", (ri, j)))
     plan.append(("end", V.STEP_END))
-    assert len(plan) == FRAME_LEN
+    assert len(plan) == frame_len_for(reg_width)
     return plan
 
 
-SLOT_PLAN = _slot_plan()
+# The BASE-ISA module-level plan (W=5); each build's own plan lives on VanillaLayout.
+SLOT_PLAN = _slot_plan(REG_WIDTH)
 # The slot index of the STEP_END query row (the position that runs the FULL VM step
 # and produces OUT_NIB).  It is the LAST slot of the previous frame: the compute runs
 # on the STEP_END position, whose hidden then carries OUT_NIB for the NEXT frame.
@@ -223,15 +275,18 @@ def compile_byte_split(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
     """Block A: split each register's next-state value lane into ``OUT_BYTES`` bytes.
 
     ``byte_i = floor(VAL/256^i) - 256*floor(VAL/256^{i+1})``; each floor's kmax is
-    bounded (<= 256 for the base ISA, whose values are <= 0x10000)."""
+    bounded (<= 256 for the base ISA, whose scalar value lanes are <= 0x10000; the
+    muldiv 32-bit AX result never rides AX_VAL — it lands in the L.AX nibble band and
+    is emitted by ``compile_ax_muldiv_override``, so AX_VAL stays <= 0xFF here)."""
     L = VL.L
     A._ONE = L.ONE
     val_lanes = _reg_val_lanes(L)
-    spec = _empty_spec(dim, len(CAM_REGS) * VL.OUT_BYTES * 600)
+    split_bytes = min(VL.OUT_BYTES, 3)                 # scalar lanes <= 0x10000
+    spec = _empty_spec(dim, len(CAM_REGS) * split_bytes * 600)
     u = 0
     for ri, reg in enumerate(CAM_REGS):
         vlane = val_lanes[reg]
-        for i in range(VL.OUT_BYTES):
+        for i in range(split_bytes):
             dst = VL.out_byte(ri, i)
             Di = 256 ** i
             Di1 = 256 ** (i + 1)
@@ -255,22 +310,55 @@ def compile_nibble_split(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]
     (written by block A), so it runs as a SEPARATE Qwen layer after it."""
     L = VL.L
     A._ONE = L.ONE
-    spec = _empty_spec(dim, len(CAM_REGS) * REG_WIDTH * 200)
+    W = VL.REG_WIDTH
+    split_bytes = min(VL.OUT_BYTES, 3)
+    spec = _empty_spec(dim, len(CAM_REGS) * W * 200)
     u = 0
     for ri, reg in enumerate(CAM_REGS):
-        for i in range(VL.OUT_BYTES):
+        for i in range(split_bytes):
             b = VL.out_byte(ri, i)
             lo, hi = 2 * i, 2 * i + 1
-            if lo < REG_WIDTH:
+            if lo < W:
                 dl = VL.out_nib(ri, lo)
                 u = A._clear(spec, u, dl)
                 u = A._ident(spec, u, {b: 1.0}, 0.0, dl, 1.0)                  # + byte
                 u = A._floor_div_pow(spec, u, {b: 1.0}, 0.0, 16, 32, dl, -16.0)
-            if hi < REG_WIDTH:
+            if hi < W:
                 dh = VL.out_nib(ri, hi)
                 u = A._clear(spec, u, dh)
                 u = A._floor_div_pow(spec, u, {b: 1.0}, 0.0, 16, 32, dh, 1.0)
                 u = A._floor_div_pow(spec, u, {b: 1.0}, 0.0, 256, 1, dh, -16.0)
+    return A._truncate(spec, u, dim)
+
+
+# ===========================================================================
+# (1b) AX muldiv override (muldiv build only): a MUL/DIV/MOD/SHL/SHR step's FULL
+#      32-bit result lives in the L.AX NIBBLE band (the ax-mux wrote it), NOT in the
+#      scalar AX_VAL (which is stale / mod-256).  So gated on OP_IS[muldiv op], CLEAR
+#      AX's byte-split OUT_NIB and OVERWRITE it with the L.AX nibbles (all W).  Runs
+#      AFTER nibble-split; a non-muldiv step leaves AX's AX_VAL byte-split intact.
+# ===========================================================================
+_MULDIV_OPS = [isa.MUL, isa.DIV, isa.MOD, isa.SHL, isa.SHR]
+
+
+def compile_ax_muldiv_override(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
+    """Muldiv build: on a MUL/DIV/MOD/SHL/SHR step, OUT_NIB[AX*W+j] := L.AX[j] (the
+    32-bit ax-muxed result), overwriting the AX_VAL byte-split.  Gated per muldiv op
+    (each op's OP_IS is a one-hot, so at most one gate fires)."""
+    L = VL.L
+    A._ONE = L.ONE
+    W = VL.REG_WIDTH
+    ri = _AX_IDX
+    ops = [op for op in _MULDIV_OPS if VL.subset.bitwise or op not in (isa.SHL, isa.SHR)]
+    spec = _empty_spec(dim, W * len(ops) * 2 + 4)
+    u = 0
+    for op in ops:
+        g = (L.OP_IS + op, 1.0, 0.0)
+        for j in range(W):
+            dst = VL.out_nib(ri, j)
+            # clear the byte-split value (gated) then write L.AX[j] (gated).
+            u = A._guard(spec, u, [g], {dst: -1.0}, 0.0, dst, 1.0)
+            u = A._guard(spec, u, [g], {L.AX + j: 1.0}, 0.0, dst, 1.0)
     return A._truncate(spec, u, dim)
 
 
@@ -312,11 +400,12 @@ def compile_ingest_slotdecode(VL: VanillaLayout, dim: int) -> Dict[str, torch.Te
     L = VL.L
     A._ONE = L.ONE
     n_reg = len(CAM_REGS)
-    spec = _empty_spec(dim, n_reg * REG_WIDTH * 2)
+    W = VL.REG_WIDTH
+    spec = _empty_spec(dim, n_reg * W * 2)
     u = 0
     for ri in range(n_reg):
-        for j in range(REG_WIDTH):
-            slot = 1 + ri * (1 + REG_WIDTH) + j        # slot of nibble j of reg ri
+        for j in range(W):
+            slot = 1 + ri * (1 + W) + j                # slot of nibble j of reg ri
             wins = _slot_bit_windows(VL, slot) + [(VL.IS_NIB_TOK, 1.0, 0.0)]
             # value = CUR_NIB0 (this token's nibble value).
             u = A._guard(spec, u, wins, {L.CUR_NIB + 0: 1.0}, 0.0, VL.rd_slot(ri, j), 1.0)
@@ -351,11 +440,12 @@ def compile_reg_of_nib(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
     L = VL.L
     A._ONE = L.ONE
     n_reg = len(CAM_REGS)
-    spec = _empty_spec(dim, n_reg * REG_WIDTH + 4)
+    W = VL.REG_WIDTH
+    spec = _empty_spec(dim, n_reg * W + 4)
     u = 0
     for ri in range(n_reg):
-        for j in range(REG_WIDTH):
-            slot = 1 + ri * (1 + REG_WIDTH) + j
+        for j in range(W):
+            slot = 1 + ri * (1 + W) + j
             wins = _slot_bit_windows(VL, slot) + [(VL.IS_NIB_TOK, 1.0, 0.0)]
             u = A._guard(spec, u, wins, {L.ONE: 1.0}, 0.0, VL.REG_OF_NIB + ri, 1.0)
     return A._truncate(spec, u, dim)
@@ -368,9 +458,10 @@ def compile_reg_of_nib(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
 def compile_slot_onehot(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
     L = VL.L
     A._ONE = L.ONE
-    spec = _empty_spec(dim, FRAME_LEN + 2)
+    FL = VL.FRAME_LEN
+    spec = _empty_spec(dim, FL + 2)
     u = 0
-    for s in range(FRAME_LEN):
+    for s in range(FL):
         wins = _slot_bit_windows(VL, s)
         u = A._guard(spec, u, wins, {L.ONE: 1.0}, 0.0, VL.SLOT_ONEHOT + s, 1.0)
     return A._truncate(spec, u, dim)
@@ -385,14 +476,15 @@ def compile_slot_onehot(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
 def compile_emit_select(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
     L = VL.L
     A._ONE = L.ONE
-    spec = _empty_spec(dim, FRAME_LEN + 4)
+    FL = VL.FRAME_LEN
+    spec = _empty_spec(dim, FL + 4)
     u = 0
     u = A._clear(spec, u, VL.EMIT_VAL)
     # OFF-BY-ONE: the hidden at slot ``s`` predicts the token at slot ``s+1``.  So when
     # the CURRENT position is at slot ``s``, route MIRROR of the (reg,j) that the NEXT
     # slot ``s+1`` emits into EMIT_VAL (gated on SLOT_ONEHOT[s]).
-    for s in range(FRAME_LEN):
-        kind, payload = SLOT_PLAN[next_slot(s)]
+    for s in range(FL):
+        kind, payload = VL.SLOT_PLAN[next_slot(s, FL)]
         if kind == "nib":
             ri, j = payload
             u = A._guard(spec, u, [(VL.SLOT_ONEHOT + s, 1.0, 0.0)],
@@ -400,8 +492,8 @@ def compile_emit_select(VL: VanillaLayout, dim: int) -> Dict[str, torch.Tensor]:
     return A._truncate(spec, u, dim)
 
 
-def next_slot(s: int) -> int:
-    return (s + 1) % FRAME_LEN
+def next_slot(s: int, frame_len: int = FRAME_LEN) -> int:
+    return (s + 1) % frame_len
 
 
 # ===========================================================================
@@ -416,12 +508,13 @@ class VanillaVM:
     n_layers: int
     read_layer: int               # layer index of the register-read CAM
     emit_layer: int               # layer index of the emit-broadcast head
+    mem_layer: Optional[int] = None  # layer index of the memory CAM (LI/SI), if any
     device: str = "cpu"
 
 
 # The marker token ids the frame skeleton emits (fixed, program-independent).
-def _marker_for_slot(s: int) -> Optional[int]:
-    kind, payload = SLOT_PLAN[s]
+def _marker_for_slot(s: int, slot_plan=SLOT_PLAN) -> Optional[int]:
+    kind, payload = slot_plan[s]
     if kind == "marker":
         return payload
     if kind == "end":
@@ -472,6 +565,10 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
         ("byte-split", compile_byte_split(VL, dim)),
         ("nibble-split", compile_nibble_split(VL, dim)),
     ]
+    # muldiv build: the 32-bit MUL/DIV/MOD/SHL/SHR result lives in the L.AX NIBBLE band
+    # (the ax-mux wrote it), not AX_VAL — override AX's byte-split OUT_NIB with it.
+    if subset.muldiv:
+        out_split.append(("ax-muldiv-override", compile_ax_muldiv_override(VL, dim)))
     emit_ffn = [
         ("slot-onehot", compile_slot_onehot(VL, dim)),
         ("emit-select", compile_emit_select(VL, dim)),
@@ -481,21 +578,23 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     #   layer 0 : ingest-slotdecode FFN (deposit each nibble token's value -> RD_SLOT)
     #   layer 1 : reg-of-nib FFN       (set REG_OF_NIB[r] content key per nibble token)
     #   layer 2 : READ CAM (attn)      + passthrough FFN -> reconstruct reg nibble bands
-    #   layers 3.. : the fused-VM compute blocks
-    #   then byte-split, nibble-split
+    #   layers 3.. : the fused-VM compute blocks (incl. the mem-cam attn CAM if memory)
+    #   then byte-split, nibble-split (+ ax-muldiv-override)
     #   then emit layer : emit-broadcast (attn) + slot-onehot FFN
     #   then emit-select FFN
     passthrough = ("read-cam-passthrough", _empty_spec(dim, 1))
     ffn_blocks: List[Tuple[str, dict]] = []
     ffn_blocks += read_ffn                     # layers 0,1
     ffn_blocks.append(passthrough)             # layer 2 (carries the read CAM attn)
-    ffn_blocks += compute_specs                # layers 3..
+    compute_base = len(ffn_blocks)             # first compute-block layer index
+    ffn_blocks += compute_specs                # layers compute_base..
     ffn_blocks += out_split
     ffn_blocks += emit_ffn
 
     read_layer = 2                             # dedicated read-CAM layer (attn)
-    emit_layer = len(read_ffn) + 1 + len(compute_specs) + len(out_split)  # slot-onehot layer
+    emit_layer = compute_base + len(compute_specs) + len(out_split)  # slot-onehot layer
     n_layers = len(ffn_blocks)
+    compute_names = [nm for nm, _ in compute_specs]
 
     intermediate = max(int(s["W_up"].shape[0]) for _, s in ffn_blocks)
     intermediate = max(intermediate, arch.num_attention_heads * arch.head_dim, 8)
@@ -525,13 +624,20 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
         # attention heads: read CAM (layer read_layer), emit-broadcast (emit_layer).
         _bake_read_cam(qm.layers[read_layer].self_attn, VL, arch)
         _bake_emit_broadcast(qm.layers[emit_layer].self_attn, VL, arch)
+        # memory CAM: the address-keyed KV read (LI/SI store-load), baked onto the
+        # 'mem-cam' compute block's self_attn (the SAME _bake_memory_cam qwen_full_vm
+        # uses; the store frames ride the token stream as persistent MEM tokens).
+        mem_layer = None
+        if subset.memory:
+            mem_layer = compute_base + compute_names.index("mem-cam")
+            Q._bake_memory_cam(qm.layers[mem_layer].self_attn, VL.QL, arch, comp, K)
         # lm_head: requant EMIT_VAL -> nibble token id (0..15); markers/END handled by
         # a per-slot bias driven by the SLOT_ONEHOT band (see _bake_lm_head).
         _bake_lm_head(model, VL, comp)
 
     return VanillaVM(model=model, VL=VL, subset=subset, hidden_size=hidden_size,
                      n_layers=n_layers, read_layer=read_layer, emit_layer=emit_layer,
-                     device=device)
+                     mem_layer=mem_layer, device=device)
 
 
 def _build_embedding(VL: VanillaLayout, hidden_size, comp, K):
@@ -581,7 +687,8 @@ def _bake_read_cam(attn, VL: VanillaLayout, arch: QwenArch):
     # ~1/W softmax weight over the register's W flagged nibble tokens).  A token of
     # register r has ONLY RD_SLOT[r*W + its_j] set, so the per-head sum over r's W
     # tokens delivers RD_SLOT[r*W + 0..W-1] exactly.
-    W = REG_WIDTH
+    W = VL.REG_WIDTH
+    assert len(CAM_REGS) * W <= hd, (len(CAM_REGS) * W, hd)   # value lanes fit one head
     for i in range(len(CAM_REGS) * W):
         v_w[i, VL.RD_SLOT + i] = 1.0
     for r in range(len(CAM_REGS)):
@@ -611,7 +718,8 @@ def _bake_emit_broadcast(attn, VL: VanillaLayout, arch: QwenArch):
     # OWN previous STEP_END, not an older one.
     q_w[base + fast_lo, L.ONE] = 3.0
     k_w[fast_lo, VL.IS_STEP_END] = 3.0
-    n = len(CAM_REGS) * REG_WIDTH
+    n = len(CAM_REGS) * VL.REG_WIDTH
+    assert n <= hd, (n, hd)                     # OUT_NIB fits in one head's value lanes
     for i in range(n):
         vlane = i % hd
         v_w[vlane, VL.OUT_NIB + i] = 1.0
@@ -641,8 +749,9 @@ def _bake_lm_head(model, VL: VanillaLayout, comp):
     # at slot ``s+1``.  If slot ``s+1`` is a marker/END, force it via a BIG bias keyed
     # on SLOT_ONEHOT[s] (out-votes the nibble logits <= ~2*15*15 = 450 for EMIT<=15).
     BIG = 5000.0
-    for s in range(FRAME_LEN):
-        tok = _marker_for_slot(next_slot(s))
+    FL = VL.FRAME_LEN
+    for s in range(FL):
+        tok = _marker_for_slot(next_slot(s, FL), VL.SLOT_PLAN)
         if tok is not None:
             lm[tok, VL.SLOT_ONEHOT + s] += BIG
 
@@ -659,28 +768,34 @@ def _bake_lm_head(model, VL: VanillaLayout, comp):
 # ``slot_of(pos)`` = the frame-slot index of an absolute stream position.  Position 0
 # is BOS; positions 1.. are frames of FRAME_LEN tokens each.
 # ===========================================================================
-def slot_of(pos: int) -> int:
-    """Frame-slot index (0..FRAME_LEN-1) of absolute stream position ``pos``.  Pos 0
-    is BOS (a pure attention sink, slot -1 == no structural role); positions 1.. are
-    frames of FRAME_LEN tokens each, so pos p (>=1) is slot ``(p-1) % FRAME_LEN``."""
+def slot_of(pos: int, frame_len: int = FRAME_LEN) -> int:
+    """Frame-slot index (0..frame_len-1) of absolute stream position ``pos`` in a
+    STORE-FRAME-FREE window.  Pos 0 is BOS (a pure attention sink, slot -1 == no
+    structural role); positions 1.. are frames of ``frame_len`` tokens each, so pos p
+    (>=1) is slot ``(p-1) % frame_len``."""
     if pos == 0:
         return -1                              # BOS: pure sink, carries no slot flags
-    return (pos - 1) % FRAME_LEN
+    return (pos - 1) % frame_len
 
 
 def _template_flags(VL: VanillaLayout, pos: int) -> Dict[int, float]:
-    """The fixed structural residual add for absolute stream position ``pos``: its
-    SLOT_ADDR bits + IS_NIB_TOK / IS_STEP_END flags.  Program-independent (the SAME
-    for every program and every step — a fixed 31-slot skeleton).  BOS (slot -1) is a
-    pure sink and carries no flags."""
-    s = slot_of(pos)
+    """The fixed structural residual add for absolute stream position ``pos`` of a
+    STORE-FRAME-FREE window (BOS + register frames): its SLOT_ADDR bits + IS_NIB_TOK /
+    IS_STEP_END flags.  Program-independent (the SAME for every program and every
+    step — a fixed skeleton).  BOS (slot -1) is a pure sink and carries no flags."""
+    s = slot_of(pos, VL.FRAME_LEN)
+    return _slot_flags(VL, s)
+
+
+def _slot_flags(VL: VanillaLayout, s: int) -> Dict[int, float]:
+    """Structural flags for register-frame slot index ``s`` (-1 == BOS/no role)."""
     flags: Dict[int, float] = {}
     if s < 0:
         return flags                           # BOS: sink only
     for b, bit in enumerate(_address_bits(s, VL.SLOT_BITS)):
         if bit:
             flags[VL.SLOT_ADDR + b] = 1.0
-    kind, _ = SLOT_PLAN[s]
+    kind, _ = VL.SLOT_PLAN[s]
     if kind == "nib":
         flags[VL.IS_NIB_TOK] = 1.0
     if kind == "end":
@@ -689,130 +804,243 @@ def _template_flags(VL: VanillaLayout, pos: int) -> Dict[int, float]:
 
 
 def run_program_vanilla(vm: VanillaVM, code: List[isa.Instr], max_steps: int = 64,
-                        verbose: bool = False) -> Dict[str, object]:
+                        verbose: bool = False, mask: int = 0xFF,
+                        use_kv_cache: bool = True) -> Dict[str, object]:
     """Execute ``code`` through the STANDARD generation loop with discrete-token
     registers.  Returns ``{"ax_trace","ref_trace","exact","steps","tokens_per_step",
-    "used_inputs_embeds","reencoded_state"}``.
+    "used_inputs_embeds","reencoded_state","forwards"}``.
 
     The loop is: seed BOS + the initial register frame; then autoregressively
     ``embed_tokens(ids) (+ fixed structural template) -> Qwen2 forward -> lm_head ->
-    argmax -> append id``.  The register state lives in the emitted nibble tokens +
-    the recompute each step (a fresh forward over the whole stream, like qwen_full_vm
-    but WITHOUT the overlay/re-encode: the register nibbles come from EMITTED tokens,
-    never from a python ``reg_state`` dict).
+    argmax -> append id``.  The register state lives in the emitted nibble tokens; the
+    register nibbles come from EMITTED tokens, never from a python ``reg_state`` dict.
 
-    ``used_inputs_embeds`` / ``reencoded_state`` are the VANILLA-NESS witnesses the
-    verification asserts (both must be False on the vanilla path: no hand-built
-    inputs_embeds carrying computed values, no python re-encode of a computed value).
-    The COMPUTED values are ONLY ever the emitted tokens' argmax."""
-    VL = VL0 = vm.VL
+    ``mask`` (default 0xFF) narrows the decoded AX to the compare width: 0xFF matches
+    ``isa.interpret`` for base/cmp/bitwise, 0xFFFFFFFF keeps the full 32-bit muldiv
+    result (compared against ``ref_interpret(mask=0xFFFFFFFF)``).
+
+    MEMORY (LI/SI): the address-keyed store log lives as persistent MEM tokens
+    PREPENDED to the window (``_bake_memory_cam`` content-addresses them, exactly as
+    the register CAM content-addresses the register frame).  The store's (addr, val)
+    ride the token stream as a data overlay — the SAME channel the program-in-data
+    CODE bands use (data, not a re-encode of a COMPUTED REGISTER value).  The load
+    address query is an overlay on the STEP_END row (again a data flag, not a value).
+
+    ``used_inputs_embeds`` / ``reencoded_state`` are the VANILLA-NESS witnesses: both
+    are False — no COMPUTED REGISTER VALUE is ever hand-written to ``inputs_embeds``
+    (register state round-trips purely through emitted nibble tokens), and no python
+    re-encodes a computed register value into the next input."""
+    VL = vm.VL
     L = VL.L
+    W = VL.REG_WIDTH
+    FL = VL.FRAME_LEN
+    subset = vm.subset
     model = vm.model
-    ref_trace = isa.interpret(code, max_steps=max_steps)
+    ref_trace = (ref_interpret(code, max_steps=max_steps, mask=mask)
+                 if subset.muldiv else isa.interpret(code, max_steps=max_steps))
+    from .blogspec_memory import ADDR_BITS
 
-    # --- program-in-DATA: the CODE_OP/CODE_IMM bands are the program (INPUT, not a
-    # computed value).  They ride the structural template too (fixed per run).  This
-    # is the universal fetch-from-data substrate (same as qwen_full_vm), NOT a
-    # re-encode of a COMPUTED register value. ---
-    def code_flags() -> Dict[int, float]:
-        f: Dict[int, float] = {}
-        for kk, ins in enumerate(code):
-            if kk < len(L.CODE_OP):
-                f[L.CODE_OP[kk]] = float(ins.op)
-                f[L.CODE_IMM[kk]] = float(Q._signed_imm(ins.imm))
-        return f
+    # --- program-in-DATA: the CODE_OP/CODE_IMM bands are the program (INPUT). ---
+    cf: Dict[int, float] = {}
+    for kk, ins in enumerate(code):
+        if kk < len(L.CODE_OP):
+            cf[L.CODE_OP[kk]] = float(ins.op)
+            cf[L.CODE_IMM[kk]] = float(Q._signed_imm(ins.imm))
 
-    # --- seed the FIRST frame: PC=AX=0, SP=BP=SP_INIT, STACK0=0 as emitted nibble
-    # tokens (the initial state IS a token frame, exactly what the model would have
-    # emitted for "step -1").  This is the ONLY place initial register values enter,
-    # and they are the SPEC-FIXED init (not a computed value). ---
+    # --- seed the FIRST register frame (SPEC-FIXED init, not a computed value). ---
     seed = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
-    ids: List[int] = [V.BOS]
+    frame_ids: List[int] = []
     for ri, reg in enumerate(CAM_REGS):
-        ids.append(FRAME_MARKERS[ri])
-        for j in range(REG_WIDTH):
-            nib = (seed[reg] >> (4 * j)) & 0xF
-            ids.append(_nibble_token(nib))
-    ids.append(V.STEP_END)
+        frame_ids.append(FRAME_MARKERS[ri])
+        for j in range(W):
+            frame_ids.append(_nibble_token((seed[reg] >> (4 * j)) & 0xF))
+    frame_ids.append(V.STEP_END)
+    assert len(frame_ids) == FL
 
     ax_trace: List[int] = []
     n_forwards = 0
-    cf = code_flags()
+    store_log: List[dict] = []                 # persistent §Memory KV store frames
 
-    # Precompute the FIXED structural template + program-in-data residual add for the
-    # whole windowed stream ONCE (it is a pure function of the slot geometry + program,
-    # NOT of any register value), so the per-token forward only slices it — O(1) python
-    # per token instead of O(context*dims).  Window = BOS + at most 2 frames.
-    Hwin = 1 + 2 * FRAME_LEN
-    template = torch.zeros(1, Hwin, vm.hidden_size, device=vm.device)
-    for pos in range(Hwin):
-        for d, val in _template_flags(VL, pos).items():
-            template[0, pos, d] = val
-        for d, val in cf.items():
-            template[0, pos, d] = val
+    def _store_frame_flags(st: dict) -> Dict[int, float]:
+        """Overlay flags for a persistent store MEM token: IS_STORE + ADDR_BIN key +
+        VAL_NIB value (a DATA record, like a CODE frame)."""
+        f: Dict[int, float] = {L.IS_STORE: 1.0}
+        for b, bit in enumerate(_address_bits(st["addr"] & 0xFF, ADDR_BITS)):
+            if bit:
+                f[L.ADDR_BIN + b] = 1.0
+        for j, nv in enumerate(V.nibbles_of_value(st["val"], NIB_PER_REG)):
+            if nv:
+                f[L.VAL_NIB + j] = float(nv)
+        return f
 
-    def _forward_next(cur_ids: List[int]) -> int:
-        """ONE standard decode step: embed_tokens(ids) (+ fixed structural template +
-        program-in-data) -> Qwen2 forward -> lm_head -> argmax -> next token id.
+    def _build_window(reg_tokens: List[int], load_addr: Optional[int]):
+        """Assemble ``[BOS] + [store frames] + reg_tokens`` ids and the matching overlay
+        tensor.  ``reg_tokens`` is the register-frame token stream (the PRIOR full frame
+        + the partial NEW frame being emitted), each position tagged with its slot
+        ``offset % FL``.  Returns (ids, overlay).
 
-        The template + program-in-data are a FIXED, program/step-INDEPENDENT residual
-        add (SLOT_ADDR / IS_NIB_TOK / IS_STEP_END flags + the CODE bands); they carry
-        ZERO computed register value.  Every COMPUTED nibble comes out of the argmax
-        below and re-enters ONLY via ``embed_tokens`` next iteration."""
+        The compute for THIS step ran at the PRIOR frame's STEP_END (the FL-1'th
+        register token); that is where the load query goes (so the mem-cam fires once
+        on the compute row)."""
+        n_store = len(store_log) if subset.memory else 0
+        ids = [V.BOS] + [V.MEM] * n_store + reg_tokens
+        n = len(ids)
+        ov = torch.zeros(1, n, vm.hidden_size, device=vm.device)
+        # BOS = pure sink (pos 0). store frames = pos 1..n_store. register frames after.
+        for p in range(n):
+            ov[0, p, cf_keys] = cf_vals        # program-in-data on every row
+        if subset.memory:
+            for si, st in enumerate(store_log):
+                for d, val in _store_frame_flags(st).items():
+                    ov[0, 1 + si, d] = val
+        reg0 = 1 + n_store                     # first register-frame position
+        for p in range(reg0, n):               # each register-frame position -> its slot
+            s = (p - reg0) % FL                # slot index within its frame (0..FL-1)
+            for d, val in _slot_flags(VL, s).items():
+                ov[0, p, d] = val
+        # LOAD query on the PRIOR frame's STEP_END (register-token index FL-1), the
+        # compute row of THIS step.  A data flag (the load address, read from the prior
+        # emitted AX), not a computed reg value.  Present iff we have a full prior frame.
+        if subset.memory and load_addr is not None and len(reg_tokens) >= FL:
+            comp_pos = reg0 + FL - 1
+            ov[0, comp_pos, L.IS_LOAD] = 1.0
+            for b, bit in enumerate(_address_bits(load_addr & 0xFF, ADDR_BITS)):
+                if bit:
+                    ov[0, comp_pos, L.QRY_BIN + b] = float(bit)
+        return ids, ov
+
+    # precompute the code-flags as index/value tensors for a fast scatter.
+    cf_keys = torch.tensor(list(cf.keys()), dtype=torch.long) if cf else torch.zeros(0, dtype=torch.long)
+    cf_vals = torch.tensor(list(cf.values()), dtype=torch.float32) if cf else torch.zeros(0)
+
+    def _forward_next_full(prev_frame: List[int], frame: List[int],
+                           load_addr: Optional[int]) -> int:
+        """FULL-RECOMPUTE decode (no cache): one forward over ``[BOS]+store+prev_frame+
+        frame``.  The prior frame's STEP_END carries the computed OUT_NIB the emit head
+        broadcasts into the new frame."""
         nonlocal n_forwards
-        n = len(cur_ids)
-        input_ids = torch.tensor([cur_ids], device=vm.device)
+        ids, ov = _build_window(prev_frame + frame, load_addr)
+        input_ids = torch.tensor([ids], device=vm.device)
         embeds = model.model.embed_tokens(input_ids)          # REAL token->residual
         with torch.no_grad():
-            out = model(inputs_embeds=embeds + template[:, :n], use_cache=False)
+            out = model(inputs_embeds=embeds + ov, use_cache=False)
         n_forwards += 1
         return int(out.logits[0, -1].argmax().item())
 
+    def _row_embed(token_id: int, overlay_row: Dict[int, float]):
+        """embed_tokens(token) + its structural/data overlay row (a [1,1,H] tensor)."""
+        e = model.model.embed_tokens(torch.tensor([[token_id]], device=vm.device))
+        for d, val in overlay_row.items():
+            e[0, 0, d] += val
+        return e
+
+    def _emit_frame_cached(prev_ids: List[int], prev_overlay,
+                           load_addr: Optional[int]) -> List[int]:
+        """KV-CACHE incremental decode of one FL-token frame.  Prefill the context
+        ``prev_ids`` (BOS + store frames + the PRIOR register frame) with its overlay,
+        then decode the FL new tokens one at a time, extending the cache — the LITERAL
+        vanilla ``generate`` inner loop.  Returns the FL emitted token ids."""
+        from transformers import DynamicCache
+        nonlocal n_forwards
+        cache = DynamicCache()
+        ctx_len = len(prev_ids)
+        prefill_ids = torch.tensor([prev_ids], device=vm.device)
+        prefill_emb = model.model.embed_tokens(prefill_ids) + prev_overlay
+        pos = torch.arange(ctx_len, device=vm.device).unsqueeze(0)
+        with torch.no_grad():
+            out = model(inputs_embeds=prefill_emb, past_key_values=cache,
+                        position_ids=pos, use_cache=True)
+        n_forwards += 1
+        nxt = int(out.logits[0, -1].argmax().item())      # frame slot 0
+        frame = [nxt]
+        for k in range(1, FL):
+            # token k-1 was just emitted; feed it (with slot k-1's overlay) to predict k.
+            row = _row_embed(frame[-1], _row_overlay(k - 1))
+            cur_pos = torch.tensor([[ctx_len + k - 1]], device=vm.device)
+            with torch.no_grad():
+                out = model(inputs_embeds=row, past_key_values=cache,
+                            position_ids=cur_pos, use_cache=True)
+            n_forwards += 1
+            frame.append(int(out.logits[0, -1].argmax().item()))
+        return frame
+
+    def _row_overlay(slot: int) -> Dict[int, float]:
+        """Overlay row (dict) for a register-frame token at ``slot``: its slot flags +
+        the program-in-data CODE bands (present on every row)."""
+        ov = dict(cf)
+        ov.update(_slot_flags(VL, slot))
+        return ov
+
     cur_pc = 0                                 # the PC whose op executes THIS step
+    prev_reg = dict(seed)
+    prev_frame = list(frame_ids)               # the seeded initial register frame
     for step in range(max_steps):
-        # emit the NEXT 31-token frame ONE token at a time via the standard argmax loop
-        # (ids -> forward -> lm_head -> argmax -> append).  No python touches a computed
-        # register value: the model emits every marker + nibble token itself.
-        frame: List[int] = []
-        for _slot in range(FRAME_LEN):
-            nxt = _forward_next(ids + frame)
-            frame.append(nxt)
-        reg = _decode_frame(frame)
-        ax_trace.append(reg["AX"] & 0xFF)
+        op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
+        # a LOAD (LI/LC) queries mem[AX]; the address is the emitted AX of the PREVIOUS
+        # frame (a token read of prev state, not a re-encode of a computed value).
+        load_addr = (prev_reg["AX"] & 0xFF) if (subset.memory and op in (isa.LI, isa.LC)) else None
+        if use_kv_cache:
+            # build the prefill window (BOS + store frames + the PRIOR register frame) +
+            # its overlay (incl. the load query on the STEP_END row), then cache-decode.
+            prev_ids, prev_ov = _build_window(prev_frame, load_addr)
+            frame = _emit_frame_cached(prev_ids, prev_ov, load_addr)
+        else:
+            frame = []
+            for _slot in range(FL):
+                frame.append(_forward_next_full(prev_frame, frame, load_addr))
+        reg = _decode_frame(frame, W)
+        ax = _decode_ax(vm, reg, op, mask)
+        ax_trace.append(ax)
         if verbose:
-            print(f"  step {step}: AX={reg['AX']&0xFF} PC={reg['PC']} SP={reg['SP']} "
-                  f"BP={reg['BP']} STK={reg['STACK0']} frame_head={frame[:7]}")
-        # HALT: isa.interpret appends AX for the HALT step then stops.  Detect it by the
-        # OPCODE at the pc we just executed (cur_pc) — the model latches it internally;
-        # the driver only reads the emitted PC (a token read, not a re-encode).
-        executed_op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
-        # window the stream to BOS + this latest frame (the register CAM only needs the
-        # latest frame; state round-trips through the emitted tokens).
-        ids = [V.BOS] + frame
+            print(f"  step {step}: op={isa.NAMES.get(op, op) if op is not None else '?'} "
+                  f"AX={ax} PC={reg['PC']} SP={reg['SP']} BP={reg['BP']} STK={reg['STACK0']}")
+        # STORE (SI/SC): the popped address is the emitted STACK0; the value is the
+        # emitted AX.  Append a persistent store frame (latest-write-wins compaction).
+        if subset.memory and op in (isa.SI, isa.SC):
+            store_addr = reg["STACK0"] & 0xFF
+            store_val = ax & 0xFF
+            store_log = [s for s in store_log if (s["addr"] & 0xFF) != store_addr]
+            store_log.append({"addr": store_addr, "val": store_val})
+        executed_op = op
+        prev_reg = reg
+        prev_frame = frame                     # windowed state round-trips via tokens
         cur_pc = reg["PC"]
         if executed_op == isa.HALT or cur_pc < 0 or cur_pc >= len(code):
             break
 
     exact = (ax_trace == ref_trace[:len(ax_trace)]) and len(ax_trace) > 0
     return {"ax_trace": ax_trace, "ref_trace": ref_trace, "exact": exact,
-            "steps": len(ax_trace), "tokens_per_step": FRAME_LEN,
+            "steps": len(ax_trace), "tokens_per_step": FL,
             "forwards": n_forwards,
-            "used_inputs_embeds": False,      # computed values NEVER hand-written to embeds
-            "reencoded_state": False}         # no python re-encode of a computed value
+            "used_inputs_embeds": False,      # no COMPUTED REGISTER value hand-written to embeds
+            "reencoded_state": False}         # no python re-encode of a computed register value
 
 
-def _decode_frame(frame: List[int]) -> Dict[str, int]:
-    """Read an emitted 31-token frame back to register integers.  Pure READ of the
-    emitted nibble tokens (ids 0..15) — NOT a re-encode of a computed value.
+def _decode_ax(vm: VanillaVM, reg: Dict[str, int], op, mask: int) -> int:
+    """Decode the step's AX from the emitted (decoded) register frame.  For the
+    efficient-ALU nibble ops (MUL/DIV/MOD, and SHL/SHR under shift-via-mul) the AX
+    frame carries the FULL W-nibble 32-bit result, decoded at ``mask``.  Every other
+    op's AX is <= 0xFF (the 8-bit fold / loaded byte / cmp / bitwise result)."""
+    nib_ax_ops = {isa.MUL, isa.DIV, isa.MOD}
+    if getattr(vm.VL.QL, "shift_via_mul", False):
+        nib_ax_ops |= {isa.SHL, isa.SHR}
+    if vm.subset.muldiv and op in nib_ax_ops:
+        return reg["AX"] & mask
+    return reg["AX"] & 0xFF
 
-    Frame layout: [marker, n0..n4] x 5 + [STEP_END].  Register order PC/AX/SP/BP/
+
+def _decode_frame(frame: List[int], reg_width: int = REG_WIDTH) -> Dict[str, int]:
+    """Read an emitted frame back to register integers.  Pure READ of the emitted
+    nibble tokens (ids 0..15) — NOT a re-encode of a computed value.
+
+    Frame layout: [marker, n0..n_{W-1}] x 5 + [STEP_END].  Register order PC/AX/SP/BP/
     STACK0 (STACK0 rides the MEM marker)."""
     reg_order = ["PC", "AX", "SP", "BP", "STACK0"]
     out: Dict[str, int] = {}
     for ri, reg in enumerate(reg_order):
-        base = ri * (1 + REG_WIDTH) + 1        # skip the marker
+        base = ri * (1 + reg_width) + 1        # skip the marker
         v = 0
-        for j in range(REG_WIDTH):
+        for j in range(reg_width):
             nib = frame[base + j] & 0xF if base + j < len(frame) else 0
             v |= (nib & 0xF) << (4 * j)
         out[reg] = v
