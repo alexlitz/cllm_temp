@@ -48,7 +48,7 @@ def test_snap_lane_bytes_exact_to_2_32():
 def unified():
     from .nibble_unified import build_unified_model
     model, L, _meta = build_unified_model(
-        code_size=8, include_mdm_table=False, include_bitwise=False)
+        code_size=8, include_bitwise=False)   # (include_mdm_table removed — MDM table gone)
     return model, L
 
 

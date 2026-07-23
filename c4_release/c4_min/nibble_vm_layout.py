@@ -83,6 +83,32 @@ class NibbleVMLayout:
         # so it adds the frame-pointer's low byte, keeping AX within one mod-256.
         self.BP_LOW = self._scalar("BP_LOW")
 
+        # --- TWO-LIMB value lanes for AX and STACK0 (the fp32-safe 32-bit path) --
+        # A single ``16^7`` scalar recompose overflows fp32 (2^28 > 2^24), which is
+        # the ONLY reason the width-32 substrate needs fp64.  The data registers
+        # (AX, STACK0) are instead carried as two fp32-exact limbs:
+        #   ``*_LO`` = low 4 nibbles (bits 0..15, ``Σ_{j<4} 16^j·nib_j`` ≤ 2^16-1 < 2^24)
+        #   ``*_HI`` = high 4 nibbles (bits 16..31, ``Σ_{j=4..7} 16^(j-4)·nib_j`` ≤ 2^16-1)
+        # ADD/SUB carry/borrow across the 2^16 limb boundary with fp32 relu steps at
+        # half-integer thresholds (exact < 2^24).  For values < 2^16 the HI limb is 0
+        # so it costs nothing — the plain fp32 scalar path with no data-dependent
+        # branch (both limbs always present).  PC/SP/BP stay single scalars (small,
+        # fp32-fine).  Only used when ``two_limb`` (``nibble_vm.vm_two_limb``) is on.
+        self.AX_LO = self._scalar("AX_LO")
+        self.AX_HI = self._scalar("AX_HI")
+        self.STK_LO = self._scalar("STK_LO")
+        self.STK_HI = self._scalar("STK_HI")
+        # The fetched immediate ALSO needs two fp32-exact limbs when it carries a
+        # 32-bit value literal (``IMM 0xDEADBEEF``): a single scalar past 2^24 would
+        # be lossy.  ``IMM_LO/IMM_HI`` mirror ``AX_LO/AX_HI``; the code table stores
+        # the two immediate limbs (``CODE_IMM_LO/HI``) so the product-select fetch
+        # stays exact.  PC-target immediates (JMP/branch, < code_size) live wholly in
+        # IMM_LO (IMM_HI == 0) and the single-scalar ``IMM`` lane is unused.
+        self.IMM_LO = self._scalar("IMM_LO")
+        self.IMM_HI = self._scalar("IMM_HI")
+        self.CODE_IMM_LO = [self._scalar(f"CODE_IMM_LO_{i}") for i in range(code_size)]
+        self.CODE_IMM_HI = [self._scalar(f"CODE_IMM_HI_{i}") for i in range(code_size)]
+
         # --- data-memory code table (the PROGRAM, loaded as INPUT) ------------
         self.CODE_OP = [self._scalar(f"CODE_OP_{i}") for i in range(code_size)]
         self.CODE_IMM = [self._scalar(f"CODE_IMM_{i}") for i in range(code_size)]
