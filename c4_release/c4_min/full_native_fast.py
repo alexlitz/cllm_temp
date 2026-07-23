@@ -138,7 +138,8 @@ def _run_native(model, draft_lean: LF.LeanQwenVM, code: List[isa.Instr], *,
         forwards += 1
         for i, st in enumerate(slab):
             n_store = len(st["store_log"]) if subset.memory else 0
-            qrow = (1 + n_store) + len(CAM_REGS)
+            n_code = len(code) if draft_lean.code_from_memory else 0
+            qrow = (1 + n_store + n_code) + len(CAM_REGS)
             state = hidden[i, qrow]
             op = st["op"]
             if op in (isa.MUL, isa.DIV, isa.MOD):

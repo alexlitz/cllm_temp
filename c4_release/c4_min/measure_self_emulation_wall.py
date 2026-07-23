@@ -478,7 +478,8 @@ def _run_native_graphed(cond, draft_lean, code, *, block_steps: int, graphed,
         forwards += 1
         for i, st in enumerate(slab):
             n_store = len(st["store_log"]) if subset.memory else 0
-            qrow = (1 + n_store) + len(_CAM_REGS)
+            n_code = len(code) if draft_lean.code_from_memory else 0
+            qrow = (1 + n_store + n_code) + len(_CAM_REGS)
             state = hidden[i, qrow]
             op = st["op"]
             if op in (_isa.MUL, _isa.DIV, _isa.MOD):
