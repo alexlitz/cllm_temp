@@ -355,23 +355,48 @@ from .nibble_vm import SILU_HALF
 
 
 # ---------------------------------------------------------------------------
-# AX_VAL (scalar 0..255) -> QRY_BIN (32 per-bit dims) — a fixed FFN, not python.
-# bit b = floor(AX / 2^b) mod 2, built as a shared-relu difference (the same
-# integer-exact ramp the fetch one-hots use). AX here is an 8-bit load address in
-# the corpus slice, so 8 low bits carry it; the upper 24 stay 0.
+# AX nibbles -> QRY_BIN (32 per-bit dims) — a fixed FFN, not python.
+# bit b of the address = bit (b%4) of NIBBLE (b//4). The address already lives as
+# NIBBLES in the residual (L.AX+j holds nibble j, value 0..15), so we expand it
+# PER-NIBBLE: a 16-cell one-hot of each queried nibble (16 relu instead of 256),
+# then bit-select the 4 bits out of that nibble. For an 8-bit address that is 2
+# nibbles × ~18 relu instead of a dense 256-cell scalar one-hot (~8× smaller).
 # ---------------------------------------------------------------------------
+# Which nibble band feeds each scalar value lane (so an ``AX_VAL`` query is
+# expanded from the AX nibble band, ``STK_VAL`` from STACK0, etc.). Auto-derived
+# from the layout's ``reg_pairs`` — the per-nibble path uses the band; a caller
+# whose scalar lane has no nibble band (rare) falls back to the scalar one-hot.
+def _nib_base_for_lane(L, src_lane: int) -> Optional[int]:
+    for nib_base, val_lane in L.reg_pairs():
+        if val_lane == src_lane:
+            return nib_base
+    return None
+
+
 def compile_addr_expand(L, src_lane: int, bin_base: int, dim: int,
-                        n_bits: int = 8, clear_bits: Optional[int] = None
+                        n_bits: int = 8, clear_bits: Optional[int] = None,
+                        src_nib_base: Optional[int] = None
                         ) -> Dict[str, torch.Tensor]:
-    """``QRY_BIN[b] = bit b of src_lane`` for b < n_bits (the low byte load address).
-    bit b = (floor(v/2^b) is odd). Realise as ``v mod 2^{b+1} >= 2^b`` via two
-    ReLU ramps per bit on ``v - k*2^{b+1}`` — but a compact exact form for a byte
-    is: expand v to a 256-cell one-hot then sum the cells whose index has bit b set.
-    We use the one-hot-then-select (the proven §510 triangular pulse), 256 relu +
-    per-bit sums. Self-clears each QRY_BIN lane (SET).
+    """``QRY_BIN[b] = bit b of the address`` for b < n_bits (the low byte load
+    address), expanded PER-NIBBLE from the address's NIBBLE band.
+
+    bit ``b`` of the address is bit ``b%4`` of nibble ``b//4`` (each nibble is
+    4 bits). The address already lives as nibbles in the residual (``src_nib_base
+    + nib`` holds nibble ``nib``, an integer 0..15), so instead of the old dense
+    256-cell scalar one-hot on ``src_lane`` we expand each QUERIED nibble to a
+    16-cell one-hot (the proven triangular pulse, thresholds -1..16 → ~18 shared
+    relu units per nibble) and bit-SELECT: ``QRY_BIN[nib*4+k] = Σ_{v:(v>>k)&1}
+    onehot(nib==v)``. For an 8-bit address that is ``ceil(8/4)=2`` nibbles instead
+    of a 256-cell table — ~8× fewer weights, same output contract.
+
+    ``src_nib_base`` is the base of that nibble band; when ``None`` it is
+    auto-derived from ``src_lane`` (``AX_VAL`` → ``L.AX``, ``STK_VAL`` → ``L.STACK0``,
+    …). If no nibble band maps to ``src_lane`` the function transparently falls
+    back to the legacy scalar 256-cell one-hot on ``src_lane`` (so any caller that
+    passes a scalar lane with no backing nibble band still works).
 
     ``clear_bits`` (default ``ADDR_BITS``=32) is how many QRY_BIN lanes are
-    zero-CLEARED before the low ``n_bits`` are (re)set from ``src_lane``. This MUST
+    zero-CLEARED before the low ``n_bits`` are (re)set from the address. This MUST
     cover the whole address width the §Memory CAM queries: the store keys expand the
     FULL 32-bit ``ADDR_BIN`` (high bits = 0 for a ≤8-bit stack address), so the load
     QUERY's high bits (8..31) must be an explicit 0 too — otherwise a single stale
@@ -385,6 +410,58 @@ def compile_addr_expand(L, src_lane: int, bin_base: int, dim: int,
     if clear_bits is None:
         clear_bits = ADDR_BITS
     clear_bits = max(clear_bits, n_bits)
+    if src_nib_base is None:
+        src_nib_base = _nib_base_for_lane(L, src_lane)
+    if src_nib_base is None:
+        # no backing nibble band for this scalar lane — legacy scalar one-hot path.
+        return _compile_addr_expand_scalar(L, src_lane, bin_base, dim,
+                                           n_bits, clear_bits)
+
+    # PER-NIBBLE expand. Queried bits 0..n_bits-1 span nibbles 0..n_nib-1; each
+    # nibble owns 4 consecutive bits (the last may be partial when n_bits%4).
+    n_nib = (n_bits + 3) // 4
+    THR = list(range(-1, 17))          # 18 thresholds -> 16-cell one-hot per nibble
+    n_thr = len(THR)
+    n_units = n_nib * n_thr + clear_bits   # per-nibble relu banks + one clear/bit
+    spec = _empty_spec(dim, n_units)
+    # per-nibble 16-cell one-hot relu banks (one bank of n_thr units per nibble).
+    for nib in range(n_nib):
+        base_u = nib * n_thr
+        for jj, t in enumerate(THR):
+            u = base_u + jj
+            spec["W_up"][u, src_nib_base + nib] = RELU_S
+            spec["b_up"][u] = -RELU_S * t
+            spec["W_gate"][u, L.ONE] = 1.0
+    # self-clear EVERY queried QRY_BIN[b] (SET 0) across the full CAM address width.
+    clear0 = n_nib * n_thr
+    for b in range(clear_bits):
+        uu = clear0 + b
+        spec["W_up"][uu, L.ONE] = S
+        spec["W_gate"][uu, bin_base + b] = 1.0
+        spec["W_down"][bin_base + b, uu] += -1.0 / SILU_S
+    # bit-select: QRY_BIN[nib*4+k] += onehot(nib==v) for every v with (v>>k)&1.
+    # onehot(nib==v) via the triangular pulse over thresholds v-1,v,v+1 (+1,-2,+1).
+    for nib in range(n_nib):
+        base_u = nib * n_thr
+        tu = {t: base_u + jj for jj, t in enumerate(THR)}
+        for k in range(4):
+            b = nib * 4 + k
+            if b >= n_bits:
+                break
+            for v in range(16):
+                if (v >> k) & 1:
+                    spec["W_down"][bin_base + b, tu[v - 1]] += 1.0 / RELU_S
+                    spec["W_down"][bin_base + b, tu[v]] += -2.0 / RELU_S
+                    spec["W_down"][bin_base + b, tu[v + 1]] += 1.0 / RELU_S
+    return spec
+
+
+def _compile_addr_expand_scalar(L, src_lane: int, bin_base: int, dim: int,
+                                n_bits: int, clear_bits: int
+                                ) -> Dict[str, torch.Tensor]:
+    """Legacy 256-cell scalar one-hot expand (fallback when a scalar ``src_lane``
+    has no backing nibble band). Kept for full caller compatibility; the live
+    §Memory query uses the per-nibble path above."""
     thresholds = list(range(-1, 257))
     n_thr = len(thresholds)
     tu = {t: j for j, t in enumerate(thresholds)}
@@ -402,7 +479,6 @@ def compile_addr_expand(L, src_lane: int, bin_base: int, dim: int,
         spec["W_down"][bin_base + b, uu] += -1.0 / SILU_S
     # one-hot cell a via the triangular pulse; add 1 to QRY_BIN[b] for each a with bit b.
     for a in range(256):
-        # cell(a) coefficient set into each bit lane where a has that bit.
         for b in range(n_bits):
             if (a >> b) & 1:
                 spec["W_down"][bin_base + b, tu[a - 1]] += 1.0 / RELU_S
