@@ -475,7 +475,10 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         if getattr(at, "_drop_local_kv", False) and getattr(at, "_local_window", None):
             gmask = at._global_head_mask
             g_idx = [int(h) for h in range(H) if bool(gmask[h])]
-            caches[b].set_head_groups(g_idx, int(at._local_window))
+            caches[b].set_head_groups(
+                g_idx, int(at._local_window),
+                content_bound=getattr(at, "_content_bound_global", False),
+                content_cR=getattr(at, "_store_gate_channel", None))
     store_log = draft.store_log
     n_steps = draft.step_count
     forwards = 0

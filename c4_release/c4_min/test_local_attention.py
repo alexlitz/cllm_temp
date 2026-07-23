@@ -130,3 +130,65 @@ def test_install_uninstall_restores_global():
     LA.uninstall_local_attention(m)
     assert "forward" not in sa.__dict__        # reverted
     assert not hasattr(sa, "_local_window")
+
+
+# ---------------------------------------------------------------------------
+# CONTENT-BOUND global-head retention: the store-role gate keep-predicate.
+# ---------------------------------------------------------------------------
+def _mk_split_cache(Hg=3, S=10, HD=8, cR=5, p=1e5, store_rows=(1, 4, 7)):
+    """A synthetic split cache whose GLOBAL keys carry the store-role gate: store
+    rows key ~0 at channel ``cR``, non-store rows key ``-p`` (as the real §Memory /
+    stack / LEV CAM heads do)."""
+    from c4_min.nibble_pure_forward_cached import BlockKVCacheBatched
+    slopes = torch.ones(Hg + 2)                # arbitrary; only slice used by cache
+    c = BlockKVCacheBatched(n_heads=Hg + 2, head_dim=HD, slopes=slopes)
+    c.set_head_groups(list(range(Hg)), local_window=4,
+                      content_bound=True, content_cR=cR)
+    K = torch.randn(1, Hg, S, HD)
+    for s in range(S):
+        gate = 0.0 if s in store_rows else -p
+        K[:, :, s, cR] = gate
+    V = torch.randn(1, Hg, S, HD)
+    pos = torch.arange(S)
+    return c, K, V, pos, set(store_rows)
+
+
+def test_content_keep_predicate_selects_store_rows():
+    """``_global_content_keep`` keeps EXACTLY the store rows (gate ~0) and drops the
+    non-store rows (gate -p) — the provably-inert frames a global head weights 0."""
+    c, K, V, pos, store = _mk_split_cache()
+    keep = c._global_content_keep(K[0])         # [S] bool
+    kept = set(int(i) for i in torch.nonzero(keep).flatten().tolist())
+    assert kept == store, (kept, store)
+
+
+def test_content_commit_keeps_only_store_rows():
+    """A content-bound split commit routes ONLY the store rows into the global cache;
+    the global cache size == #store rows, not the span length."""
+    c, K, V, pos, store = _mk_split_cache(S=12, store_rows=(2, 5, 9))
+    # commit a full-H new span (the split routes local vs global internally); build a
+    # full-H K/V whose GLOBAL-head slice matches K/V above.
+    H = c.n_heads
+    Kf = torch.zeros(1, H, K.shape[2], K.shape[3])
+    Vf = torch.zeros(1, H, K.shape[2], K.shape[3])
+    g = c._global_head_idx
+    Kf[:, g] = K
+    Vf[:, g] = V
+    c.commit(Kf, Vf, pos)
+    assert c.size() == len(store), (c.size(), len(store))
+    # the surviving positions are exactly the store rows.
+    assert set(int(p) for p in c.pos.tolist()) == store
+
+
+def test_content_off_keeps_full_history():
+    """With ``content_bound=False`` the global cache keeps EVERY committed row (the
+    plain drop-KV split), so a non-store frame is retained."""
+    from c4_min.nibble_pure_forward_cached import BlockKVCacheBatched
+    Hg, S, HD = 2, 8, 8
+    c = BlockKVCacheBatched(n_heads=Hg + 1, head_dim=HD, slopes=torch.ones(Hg + 1))
+    c.set_head_groups(list(range(Hg)), local_window=4, content_bound=False)
+    H = c.n_heads
+    Kf = torch.randn(1, H, S, HD)
+    Vf = torch.randn(1, H, S, HD)
+    c.commit(Kf, Vf, torch.arange(S))
+    assert c.size() == S           # full history kept (no content drop)

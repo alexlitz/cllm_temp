@@ -60,6 +60,17 @@ def _mem_slope() -> float:
     return float(MEM_ALIBI_SLOPE)
 
 
+# The store-role GATE channel (within a global head's HD slice) that distinguishes
+# a STORE row (keys ~0 there) from a NON-STORE row (keys -PEN_GATE there).  Every
+# global head (memory-CAM / stack-pop / LEV) bakes it at ``cR = ADDR_BITS + 1``
+# (``W_k[base+ADDR_BITS+1, ONE] = -p`` + ``W_k[..., IS_STORE] = p``), so a non-store
+# row scores -PEN under a load/pop/lev query -> softmax1 weight EXACTLY 0.  This is
+# the channel the content-bound global cache keeps store rows by.
+def _store_gate_channel() -> int:
+    from .blogspec_memory import ADDR_BITS
+    return int(ADDR_BITS) + 1
+
+
 def _dense_cpu(w) -> torch.Tensor:
     """The dense [out, in] weight of a SparseWeight (or plain tensor), on CPU.
 
@@ -244,6 +255,7 @@ _ORIG_FORWARD = _SF.SparseAttn.forward
 
 def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
                             drop_local_kv: bool = True,
+                            content_bound_global: bool = False,
                             verbose: bool = False) -> Dict[str, object]:
     """Install sliding-window attention on the LOCAL heads of every block.
 
@@ -257,10 +269,18 @@ def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
     MASK-ONLY fallback (``--local-mask-only``): the full KV is still stored and only
     the local heads' softmax READ is windowed — saves compute, not VRAM.
 
+    ``content_bound_global`` (default False) bounds the GLOBAL cache BY CONTENT: each
+    global head is an address-CAM that keys ONLY ``IS_STORE`` frames (a non-store
+    frame's role-gate key -> softmax1 weight EXACTLY 0), so its cache keeps ONLY the
+    store frames — bounded by the WORKING SET (distinct live addresses, after latest-
+    write-wins eviction), NOT step count.  Byte-identical (dropped rows are provably
+    inert).  This is what makes the TOTAL KV runtime-independent.
+
     Returns a summary dict (classification + windowed-head fraction).
     ``uninstall_local_attention(model)`` reverts to the global forward.
     """
     cls = classify_heads(model, slope_tol=slope_tol)
+    cR = _store_gate_channel()
     n_local = n_global = 0
     for bi, blk in enumerate(model.blocks):
         at = blk.attn
@@ -271,6 +291,8 @@ def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
         at._local_window = int(window)
         at._global_head_mask = gmask
         at._drop_local_kv = bool(drop_local_kv)     # read by verify_blocks cache init
+        at._content_bound_global = bool(content_bound_global)
+        at._store_gate_channel = int(cR)
         # bind the windowed forward as a bound method on this instance.
         at.forward = windowed_forward.__get__(at, type(at))
         n_global += int(gmask.sum())
@@ -278,6 +300,8 @@ def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
     summary = {
         "window": int(window),
         "drop_local_kv": bool(drop_local_kv),
+        "content_bound_global": bool(content_bound_global),
+        "store_gate_channel": int(cR),
         "classification": cls,
         "n_local_head_slots": n_local,
         "n_global_head_slots": n_global,
@@ -286,8 +310,9 @@ def install_local_attention(model, window: int = 64, slope_tol: float = 1e-3,
     if verbose:
         live_global = {bi: hs for bi, hs in cls.items() if hs}
         mode = "DROP-KV" if drop_local_kv else "MASK-ONLY"
-        print(f"[local-attn] {mode}  window={window}  live GLOBAL heads (block->heads): "
-              f"{live_global}")
+        cb = "  +CONTENT-BOUND global (store-only)" if content_bound_global else ""
+        print(f"[local-attn] {mode}  window={window}{cb}  live GLOBAL heads "
+              f"(block->heads): {live_global}")
         print(f"[local-attn] windowed {n_local}/{n_local + n_global} head-slots "
               f"({summary['frac_windowed']*100:.1f}%) across {len(model.blocks)} blocks")
     return summary
@@ -297,7 +322,8 @@ def uninstall_local_attention(model) -> None:
     """Revert every block to the ORIGINAL global ``SparseAttn.forward``."""
     for blk in model.blocks:
         at = blk.attn
-        for a in ("_local_window", "_global_head_mask", "_drop_local_kv"):
+        for a in ("_local_window", "_global_head_mask", "_drop_local_kv",
+                  "_content_bound_global", "_store_gate_channel"):
             if hasattr(at, a):
                 delattr(at, a)
         if "forward" in at.__dict__:
