@@ -446,6 +446,20 @@ def run_bench(kind: str, args) -> int:
                  if drop_kv else "  -> full KV kept, windowed READ only (compute win)")
               + cb, flush=True)
 
+    # -- LIVE-HEAD-ONLY attention SCORING (opt-in) ---------------------------
+    # Compute Q@Kᵀ + attn@V ONLY for the ~23 live-value head-slots (of 5451);
+    # every _zero_attn head's per-head output is 0 by construction, so its score
+    # matmul is skipped byte-identically.  Orthogonal to --local-window (that
+    # windows the live heads' READ; this prunes the DEAD heads' matmul entirely).
+    if getattr(args, "live_head", False):
+        from .live_head_attention import install_live_head_attention
+        lh = install_live_head_attention(sparse, verbose=True)
+        print(f"  LIVE-HEAD-ATTN: scoring {lh['live_head_slots']}/"
+              f"{lh['total_head_slots']} head-slots "
+              f"({lh['frac_scored_after']*100:.2f}%)  "
+              f"{lh['dead_attention_blocks']}/{lh['n_blocks']} blocks are pure "
+              f"x-passthrough (attention sublayer skipped)", flush=True)
+
     # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
     #    (K vs amortized ms/step vs peak-VRAM vs forwards vs GPU-util). ---------
     if args.k_sweep:
@@ -669,6 +683,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="with --local-window: keep the FULL KV cache and only WINDOW "
                          "the local heads' softmax read (compute win, no VRAM win). "
                          "The fallback for the default DROP-KV behavior.")
+    ap.add_argument("--live-head", action="store_true",
+                    help="LIVE-HEAD-ONLY attention scoring: compute Q@Kᵀ+attn@V ONLY "
+                         "for the ~23 live-value head-slots (of 5451); every other "
+                         "_zero_attn head's per-head output is 0 by construction, so "
+                         "its score matmul is skipped.  Byte-identical (a zero-value "
+                         "head outputs x regardless of scores).  Cuts attn-scoring "
+                         "FLOPs ~99.6%%; 234/237 blocks become pure x-passthrough. "
+                         "Composes with --local-window.")
     ap.add_argument("--content-bound-global", action="store_true",
                     help="with --local-window (DROP-KV): bound the GLOBAL "
                          "(memory/stack/LEV) cache BY CONTENT — each global head is "
