@@ -560,7 +560,8 @@ def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
                             scale: float, cos_threshold: float, zero_eps: float,
                             recency_eps: float, exact: torch.Tensor,
                             content_addressed: torch.Tensor,
-                            valid: Optional[torch.Tensor] = None) -> torch.Tensor:
+                            valid: Optional[torch.Tensor] = None,
+                            skip_mech1: bool = False) -> torch.Tensor:
     """Return the ``[N, S]`` boolean keep-mask for N groups at once — byte-for-byte
     the stack of ``prune_keep_mask_head`` results, with these PER-GROUP vectors:
 
@@ -610,7 +611,17 @@ def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
     # cdist, computed ONLY over that subset (unchanged path — distinct heap addresses
     # are NOT verbatim-equal, so the hash collapse would not help and the ULP-exact
     # cdist is required for the address common-mode).
-    if _KV_PRUNE_FULL_COSINE:
+    if skip_mech1:
+        # SCHEDULE-DRIVEN split (C4_EVICT_SCHEDULE): the O(S^2) mechanism-1 near-dup
+        # SUPERSESSION is handled OFF the draft by the liveness schedule (the
+        # superseded rows are dropped before this call), so here we run ONLY the O(S)
+        # elementwise mechanisms 2a/2b/3.  All valid rows START as survivors; the
+        # zero-value recency (mech 3), dead-value-head (2a), and free-zero (2b) rules
+        # below then prune exactly as the content path does — per-head, byte-exact,
+        # with NO cdist/cosine.  This is what removes the O(S^2) while keeping the
+        # cross-head zero-value/recency decision the address-only schedule can't see.
+        survivors = valid.clone()
+    elif _KV_PRUNE_FULL_COSINE:
         # KILL-SWITCH (C4_KV_PRUNE_FULL_COSINE=1): the ORIGINAL full O(S^2) cosine
         # matmul + greedy on ALL rows — kept as a byte-identical fallback / A-B bench
         # baseline.  Same survivor set as the two-tier path (test_kv_cache_equivalence).
@@ -620,7 +631,7 @@ def prune_keep_mask_batched(keys: torch.Tensor, vals: torch.Tensor,
         rank_all = _recency_rank(positions, valid)                    # [N,S]
         survivors = _mech1_cosine_survivors_dedup(
             keys, knorm, positions, rank_all, valid, cos_threshold) & valid   # [N,S]
-    if (not _KV_PRUNE_FULL_COSINE) and bool(exact.any()):
+    if (not skip_mech1) and (not _KV_PRUNE_FULL_COSINE) and bool(exact.any()):
         tol = 1.0 - cos_threshold
         ei = torch.nonzero(exact, as_tuple=False).flatten()          # exact-group idx
         ke = keys[ei]                                                # [Ne,S,HD]
@@ -799,7 +810,8 @@ _FUSED_EVICT_MAX_DIST_ELEMS = 24 * 1024 * 1024       # 24M elems -> ~1 GiB peak 
 
 
 def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
-                           recency_eps: float, protect_positions=None):
+                           recency_eps: float, protect_positions=None,
+                           skip_mech1: bool = False):
     """Compute the per-block eviction keep-MASKS for EVERY block cache at once.
 
     ``caches`` is the list of ``BlockKVCacheBatched`` (all share H / HD; their
@@ -922,7 +934,7 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
                     keys_n[n0:n1], vals_n[n0:n1], pos_n[n0:n1], slope_n[n0:n1],
                     scale, cos_threshold, zero_eps, recency_eps,
                     exact=exact_n[n0:n1], content_addressed=exact_n[n0:n1],
-                    valid=valid_n[n0:n1])
+                    valid=valid_n[n0:n1], skip_mech1=skip_mech1)
 
             # UNION across a block's heads -> per-block keep-mask.
             keep_block = masks.reshape(Lb, H, S).any(dim=1)         # [Lb,S]
@@ -944,6 +956,62 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
             if k < S:                                             # this block dropped
                 result[b] = cols[off:off + k]                    # long keep-idx on dev
             off += k
+    return result
+
+
+# ===========================================================================
+# SCHEDULE-DRIVEN eviction (C4_EVICT_SCHEDULE).  The perfect draft materialises
+# every VM step, so the WHOLE memory access pattern is known up front: a single
+# O(stores) liveness pass (``nibble_evict_schedule.build_eviction_schedule``)
+# precomputes each store-KV row's exact eviction step (supersession / free).  This
+# replaces the per-round O(S^2) CONTENT comparison (``evict_all_blocks_fused`` ->
+# ``prune_keep_mask_batched``'s cdist/cosine near-dup) with a per-round O(dropped)
+# POSITION drop: given the cumulative set of absolute stream positions the schedule
+# says are dead through the committed frame, drop exactly those cached rows in
+# every block by ``torch.isin(pos, drop_positions)``.  The DECISION carries NO
+# cache-content matmul — it is a membership test over the (tiny) dead-position set.
+#
+# Byte-identity: on the §Memory (content-addressed) store heads the content path
+# drops a store row IFF (1) a newer verbatim same-address key exists (supersession)
+# or (2) it is a zero-value/free row past the recency horizon — EXACTLY the two
+# cases the liveness pass encodes off the draft (address == key, value 0 == free).
+# So the surviving store-row set is identical.  Non-store rows (register/ingest
+# heads) are handled by the SAME window-trim / dead-value path both configs use
+# (the schedule never adds a non-store position to the drop set), so their survivor
+# set is untouched.  See ``nibble_evict_schedule`` for the derivation.
+# ===========================================================================
+def evict_all_blocks_scheduled(caches, drop_positions):
+    """Compute per-block keep-MASKS that DROP exactly the scheduled dead store rows.
+
+    ``drop_positions`` is a 1-D long tensor (or list) of ABSOLUTE stream positions
+    the liveness schedule says are now dead.  Returns a ``[n_blocks]`` list where
+    entry ``b`` is a boolean ``[S_b]`` keep-mask (True = keep) ON ``caches[b].K``'s
+    device, or ``None`` if that block drops nothing.  The whole decision is one
+    ``torch.isin`` per block over its position axis — NO content comparison, NO
+    per-head near-dup matmul.  Byte-identical survivor set to the content path on
+    the store rows (see module docstring).
+    """
+    n_blocks = len(caches)
+    result = [None] * n_blocks
+    if n_blocks == 0:
+        return result
+    live = [b for b in range(n_blocks) if caches[b].K is not None]
+    if not live:
+        return result
+    dev = caches[live[0]].K.device
+    if not isinstance(drop_positions, torch.Tensor):
+        drop_positions = torch.as_tensor(list(drop_positions), dtype=torch.long,
+                                         device=dev)
+    else:
+        drop_positions = drop_positions.to(dev)
+    if drop_positions.numel() == 0:
+        return result
+    for b in live:
+        pos = caches[b].pos.to(dev)
+        dead = torch.isin(pos, drop_positions)     # [S_b] rows the schedule kills
+        if not bool(dead.any()):
+            continue                               # this block keeps everything
+        result[b] = ~dead                          # keep-mask (True = survive)
     return result
 
 
