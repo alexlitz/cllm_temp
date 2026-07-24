@@ -54,7 +54,9 @@ def test_per_function_compile_coverage():
         "setv", "op_matmul2d", "op_ew", "op_gather0", "op_transpose2d",
         "op_reduce_last", "op_unary", "op_clip", "op_copy", "op_softmax_last",
         "init_consts", "init_exp_table", "alloc_tables", "attr1", "run_nodes",
-        "main",
+        # the c4-subset .nblbin loader (open/read/close syscalls, not stdio) + I/O
+        "rd_i32", "rd_byte", "rd_i64lo", "rd_f32_fp", "load", "set_input",
+        "argmax_row", "main",
     }
     assert expected <= set(fns), f"missing functions: {expected - set(fns)}"
     # whole-program compile succeeding == every one of these compiles under c4

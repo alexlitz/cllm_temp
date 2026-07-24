@@ -83,6 +83,8 @@ int  EXP_STEPS;
 int  EXP_MIN_FP;
 int  *exp_tbl;      /* [EXP_STEPS+1] */
 
+int  *RDBUF;        /* 4-byte little-endian read buffer for the .nblbin loader */
+
 /* small helper: read tv[tid] (a malloc'd int* stored as an int) as a pointer */
 /* c4 has one-level pointers; we store each tensor payload pointer in tv[] and
  * index it back out.  A tensor's flat element f is tvp[f] where tvp = tv[tid].
@@ -432,7 +434,130 @@ int alloc_tables() {
     n_akey = malloc(MAX_NODES * MAX_ATTRS * 8);
     n_anv = malloc(MAX_NODES * MAX_ATTRS * 8);
     n_aval = malloc(MAX_NODES * MAX_ATTRS * MAX_RANK * 8);
+    RDBUF = malloc(8);               /* 4-byte read buffer for the loader */
     return 0;
+}
+
+/* ============ .nblbin loader (c4-subset: open/read/close, NOT fopen/fread) ====
+ * The shipped runtime used stdio fopen/fread/fscanf — NONE of which are in the c4
+ * subset.  The LOW-LEVEL syscalls open(30)/read(31)/close(32) ARE in the subset
+ * (src/compiler.py registers them), so a genuine c4-hostable loader reads the
+ * compact binary a byte at a time.  A 4-byte read buffer is reused for every i32
+ * (little-endian), matching onnx_to_c4bin's writer + onnx_runtime_fixedpoint_coo's
+ * rd_i32.  (int64 stored values are read lo/hi as two i32; only the low 32 bits are
+ * kept — the shapes/indices the tiny graph uses fit 32 bits.) */
+
+int rd_i32(int fd) {
+    int n; int v;
+    char *b;
+    b = (char *)RDBUF;
+    n = read(fd, b, 4);
+    v = (b[0] & 255) | ((b[1] & 255) << 8) | ((b[2] & 255) << 16) | ((b[3] & 255) << 24);
+    return v;
+}
+
+/* skip/return one byte (used for the tensor name bytes); reuse the 4-byte buffer */
+int rd_byte(int fd) {
+    char *b;
+    b = (char *)RDBUF;
+    read(fd, b, 1);
+    return b[0] & 255;
+}
+
+/* read a stored int64 (two i32 lo/hi); keep the low 32 bits (raw int payload) */
+int rd_i64lo(int fd) {
+    int lo; int hi;
+    lo = rd_i32(fd);
+    hi = rd_i32(fd);
+    return lo;                       /* tiny graph's shape/index values fit 32 bits */
+}
+
+/* decode a stored float32 bit-pattern to fixed-point (round(value*SCALE)), by hand
+ * (c4 has no float) — the same IEEE-754 decode as onnx_runtime_fixedpoint_coo.
+ * -inf mask fill saturates to NEG_INF_FP. */
+int rd_f32_fp(int fd) {
+    int bits; int sign; int exp; int mant; int m; int e; int s2; int half;
+    bits = rd_i32(fd);
+    sign = (bits >> 31) & 1;
+    exp = (bits >> 23) & 255;
+    mant = bits & 8388607;               /* 0x7FFFFF */
+    if (exp == 255) {
+        if (sign) return NEG_INF_FP;
+        return 0 - NEG_INF_FP;
+    }
+    if (exp == 0) { if (mant == 0) return 0; }
+    m = 8388608 | mant;                  /* 1<<23 | mant */
+    e = exp - 127 - 23 + SCALE_BITS;
+    if (e >= 0) {
+        m = m << e;
+    } else {
+        s2 = 0 - e;
+        if (s2 < 31) { half = 1 << (s2 - 1); m = (m + half) >> s2; }
+        else { m = 0; }
+    }
+    if (sign) return 0 - m;
+    return m;
+}
+
+/* load the .nblbin: header + tensor table + node table.  COO-sparse (is_init==2)
+ * initializers are reconstructed dense (zero-fill then scatter nnz).  Mirrors
+ * onnx_runtime_fixedpoint_coo.load, in the c4 subset. */
+int load(int fd) {
+    int magic; int i; int j; int k; int nl; int isi; int dt; int rank; int ne;
+    int nnz; int idx; int op; int nin; int nout; int nattr; int key; int nv;
+    int *dims; int *sidx; int *p; int c;
+    magic = rd_i32(fd);                  /* NBL1 = 0x314C424E */
+    n_tensors = rd_i32(fd);
+    n_nodes = rd_i32(fd);
+    input_tid = rd_i32(fd);
+    output_tid = rd_i32(fd);
+    dims = malloc(MAX_RANK * 8);
+    i = 0;
+    while (i < n_tensors) {
+        nl = rd_i32(fd);
+        j = 0; while (j < nl) { rd_byte(fd); j = j + 1; }   /* skip the name bytes */
+        isi = rd_i32(fd);
+        t_is_init[i] = isi;
+        dt = rd_i32(fd);
+        rank = rd_i32(fd);
+        j = 0; while (j < rank) { dims[j] = rd_i32(fd); j = j + 1; }
+        ne = rd_i32(fd);
+        if (isi == 1) {
+            alloc_tensor(i, dt, (dt == DT_FLOAT) ? 1 : 0, rank, dims);
+            if (dt == DT_FLOAT) { j = 0; while (j < ne) { setv(i, j, rd_f32_fp(fd)); j = j + 1; } }
+            else { j = 0; while (j < ne) { setv(i, j, rd_i64lo(fd)); j = j + 1; } }
+        } else if (isi == 2) {
+            alloc_tensor(i, DT_FLOAT, 1, rank, dims);
+            j = 0; while (j < ne) { setv(i, j, 0); j = j + 1; }
+            nnz = rd_i32(fd);
+            sidx = malloc(nnz * 8);
+            j = 0; while (j < nnz) { sidx[j] = rd_i64lo(fd); j = j + 1; }
+            j = 0; while (j < nnz) { setv(i, sidx[j], rd_f32_fp(fd)); j = j + 1; }
+            free(sidx);
+        } else {
+            t_dtype[i] = 0 - 1; t_isfp[i] = 0; t_rank[i] = 0; t_size[i] = 0;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < n_nodes) {
+        op = rd_i32(fd); n_op[i] = op;
+        nin = rd_i32(fd); n_nin[i] = nin;
+        j = 0; while (j < nin) { n_in[i * MAX_IO + j] = rd_i32(fd); j = j + 1; }
+        nout = rd_i32(fd); n_nout[i] = nout;
+        j = 0; while (j < nout) { n_out[i * MAX_IO + j] = rd_i32(fd); j = j + 1; }
+        nattr = rd_i32(fd); n_nattr[i] = nattr;
+        j = 0;
+        while (j < nattr) {
+            key = rd_i32(fd); nv = rd_i32(fd);
+            n_akey[i * MAX_ATTRS + j] = key; n_anv[i * MAX_ATTRS + j] = nv;
+            k = 0; while (k < nv) { n_aval[(i * MAX_ATTRS + j) * MAX_RANK + k] = rd_i32(fd); k = k + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    free(dims);
+    return magic;
 }
 
 /* find attribute value 0 for key on node nd, default dflt */
@@ -491,12 +616,57 @@ int run_nodes() {
     return 0;
 }
 
+/* set the input tokens tensor (the graph's B x S int frame) — the runtime's
+ * equivalent of the shipped runtime's fscanf token read, but here the tokens are
+ * passed in via a small int* the harness fills (open/read reads the MODEL; the
+ * tokens are the runtime's argument, not part of the .nblbin). */
+int set_input(int B, int Sn, int *toks) {
+    int *d; int i; int *dims;
+    d = malloc(B * Sn * 8);
+    i = 0; while (i < B * Sn) { d[i] = toks[i]; i = i + 1; }
+    dims = malloc(2 * 8); dims[0] = B; dims[1] = Sn;
+    t_rank[input_tid] = 2;
+    t_dims[input_tid * MAX_RANK + 0] = B;
+    t_dims[input_tid * MAX_RANK + 1] = Sn;
+    t_size[input_tid] = B * Sn;
+    t_isfp[input_tid] = 0; t_dtype[input_tid] = DT_INT64;
+    tv[input_tid] = (int)d; t_is_init[input_tid] = 1;
+    free(dims);
+    return 0;
+}
+
+/* argmax over the last (vocab) axis of the output tensor, per row */
+int argmax_row(int r, int vocab) {
+    int best; int bv; int c; int v;
+    best = 0; bv = getv(output_tid, r * vocab);
+    c = 1;
+    while (c < vocab) {
+        v = getv(output_tid, r * vocab + c);
+        if (v > bv) { bv = v; best = c; }
+        c = c + 1;
+    }
+    return best;
+}
+
 int main() {
+    int fd; int r; int rank; int vocab; int rows;
     init_consts();
     alloc_tables();
     init_exp_table();
-    /* A real driver loads the .nblbin (the loader is the flattened rd_i32 reader,
-     * omitted here because fscanf/fopen are not in the c4 subset — the harness
-     * bakes the node/tensor tables directly).  run_nodes() then executes them. */
+    /* c4-subset load of the tiny c4vm.onnx .nblbin via the open/read/close
+     * syscalls (in the c4 subset; the shipped runtime's fopen/fread/fscanf are
+     * NOT).  run_nodes() then executes the loaded node list. */
+    fd = open("model.nblbin", 0);
+    load(fd);
+    close(fd);
+    /* set_input([1,2,42,3]) would be called here by the driver, then run_nodes(),
+     * then argmax_row over the [B,S,vocab] output — printed with the single-arg
+     * printf.  (Left to the driver so this main stays a small smoke entry.) */
+    run_nodes();
+    rank = t_rank[output_tid];
+    vocab = t_dims[output_tid * MAX_RANK + rank - 1];
+    rows = t_size[output_tid] / vocab;
+    r = 0;
+    while (r < rows) { printf(argmax_row(r, vocab)); r = r + 1; }
     return 0;
 }

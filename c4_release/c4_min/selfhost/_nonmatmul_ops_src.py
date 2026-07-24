@@ -54,19 +54,43 @@ SCALE = 16  # 2^4, shared with _matmul_general_src.SCALE (kernels comparable)
 # oracle: the SAME SP-addressed memory-stack semantics as ref_interpret, but WITHOUT
 # the byte masks — a correct 32-bit c4 VM that handles the function ABI.  Used to
 # verify the exp-family ops (which compile under c4 but overflow the byte store).
-def refword_interpret(code, max_steps: int = 2_000_000, out: List[int] = None):
+def refword_interpret(code, max_steps: int = 2_000_000, out: List[int] = None,
+                      data=None, data_base: int = 0x10000, files=None):
     """A full-word (un-byte-masked) SP-addressed c4 interpreter.  Returns AX at
     HALT/exit; appends ``AX`` to ``out`` on PRTF.  ``code`` is a list of
     ``isa.Instr`` (the same the draft VM runs).  Slot offsets (LEA/ENT/ADJ) are in
     slot units (as ``bytecode_to_isa`` produces); locals are 4 stack-units apart
-    (matching ref_interpret's ``bp + 4*imm``)."""
+    (matching ref_interpret's ``bp + 4*imm``).
+
+    File IO (for the .nblbin loader): ``data`` (the compiled data segment) + its
+    ``data_base`` seed ``mem`` so string literals (filenames) resolve; ``files`` is
+    a ``{filename: bytes}`` map.  ``open(path,flags)`` returns a small fd, ``read(fd,
+    buf,n)`` copies file bytes into ``mem`` (as ints), ``close(fd)`` frees it."""
     from c4_min import isa
-    from c4_min.nibble_pure_forward_complete import ref_interpret  # for SP_INIT
     import c4_min.nibble_pure_forward_complete as PF
 
     SP_INIT = PF.SP_INIT
+    OPEN = getattr(isa, "OPEN", 30)
+    READ = getattr(isa, "READ", 31)
+    CLOS = getattr(isa, "CLOS", 32)
     ADJ = isa.ADJ if hasattr(isa, "ADJ") else 7
     mem: Dict[int, int] = {}
+    # seed the data segment (byte-addressed) so string literals resolve
+    if data is not None:
+        for i, b in enumerate(data):
+            mem[data_base + i] = b & 0xFF
+    files = files or {}
+    _open_files = {}       # fd -> (bytes, pos)
+    _next_fd = [3]
+
+    def _read_cstr(addr):
+        bs = bytearray()
+        a = addr
+        while mem.get(a, 0) & 0xFF:
+            bs.append(mem.get(a, 0) & 0xFF)
+            a += 1
+        return bs.decode("utf-8", "replace")
+
     sp = bp = SP_INIT
     ax = pc = 0
     steps = 0
@@ -143,6 +167,38 @@ def refword_interpret(code, max_steps: int = 2_000_000, out: List[int] = None):
             bp = mem.get(sp, 0)
             pc = mem.get(sp + 4, 0)
             sp += 8
+        elif op == OPEN:
+            # Sys-call ABI: the compiler PSHes EVERY arg then emits ADJ afterwards
+            # to clean them up, so the syscall PEEKS its args without popping.
+            # Stack (top->down): [flags, path, ..].
+            path_addr = mem.get(sp + 4, 0)     # path is the 2nd-from-top arg
+            name = _read_cstr(path_addr)
+            if name in files:
+                fd = _next_fd[0]
+                _next_fd[0] += 1
+                _open_files[fd] = [files[name], 0]
+                ax = fd
+            else:
+                ax = -1
+        elif op == READ:
+            # read(fd, buf, n): peek [n, buf, fd] (top->down); copy file->mem.
+            n = mem.get(sp, 0)
+            buf = mem.get(sp + 4, 0)
+            fd = mem.get(sp + 8, 0)
+            if fd in _open_files:
+                blob, pos = _open_files[fd]
+                chunk = blob[pos:pos + n]
+                for k, byte in enumerate(chunk):
+                    mem[buf + k] = byte & 0xFF
+                _open_files[fd][1] = pos + len(chunk)
+                ax = len(chunk)
+            else:
+                ax = 0
+        elif op == CLOS:
+            fd = mem.get(sp, 0)                 # peek fd (single arg)
+            if fd in _open_files:
+                del _open_files[fd]
+            ax = 0
         elif op == isa.PRTF:
             if out is not None:
                 out.append(ax)

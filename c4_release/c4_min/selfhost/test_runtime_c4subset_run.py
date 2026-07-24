@@ -20,6 +20,7 @@ CPU-only.  OMP_NUM_THREADS=4 python -m pytest \
 from __future__ import annotations
 
 import os
+import tempfile
 
 from c4_min.selfhost import _nonmatmul_ops_src as S
 
@@ -34,17 +35,20 @@ def _runtime_src():
 
 
 def _drive(probe_body, probe_call):
-    """Compile the runtime with ``probe_body`` (a C function) injected before
-    main() and ``main`` returning ``probe_call``; run on the full-word VM; the
-    probe PRTFs its result bytes into ``out``, returned as a list."""
+    """Compile the runtime with ``probe_body`` (a C function) injected in place of
+    main(), and a fresh main() that inits + calls ``probe_call``; run on the
+    full-word VM; the probe PRTFs its result bytes into ``out``, returned as a
+    list.  (The runtime's own main() opens the .nblbin — replaced here so these
+    op-core RUN checks stay hand-baked, no file needed.)"""
     from src.compiler import compile_c
     from c4_min.run_1096_pure_forward import bytecode_to_isa
 
     src = _runtime_src()
-    src = src.replace("int main() {", probe_body + "\nint main() {")
-    src = src.replace(
-        "    init_exp_table();\n    /* A real driver",
-        f"    init_exp_table();\n    {probe_call}\n    /* A real driver")
+    idx = src.index("int main() {")
+    new_main = ("int main() {\n"
+                "    init_consts();\n    alloc_tables();\n    init_exp_table();\n"
+                f"    {probe_call}\n    return 0;\n}}\n")
+    src = src[:idx] + probe_body + "\n" + new_main
     bc, data = compile_c(src)
     code = bytecode_to_isa(bc)
     out = []
@@ -227,6 +231,68 @@ def test_softmax_composed():
     assert abs(total - SCALE) <= 2, f"softmax probs sum {total} !~ {SCALE}"
 
 
+def _export_tiny_nblbin():
+    from c4_min import blogspec_compiler as C, export_onnx as E
+    from c4_min.onnx_to_c4bin import lower_onnx_to_bin
+    from c4_min.nbl_bin_interp import Graph
+    d = tempfile.mkdtemp(prefix="loader_")
+    onnxp = os.path.join(d, "m.onnx")
+    binp = os.path.join(d, "m.nblbin")
+    model, L, _ = C.build_step_model(E.PROOF_PROG)
+    model.eval()
+    E.export_onnx(model, onnxp)
+    lower_onnx_to_bin(onnxp, binp)
+    g = Graph(binp)
+    with open(binp, "rb") as f:
+        blob = f.read()
+    return g, blob
+
+
+def _run_with_file(src_probe_main, blob, max_steps=60_000_000):
+    from src.compiler import compile_c
+    from c4_min.run_1096_pure_forward import bytecode_to_isa
+    src = _runtime_src()
+    idx = src.index("int main() {")
+    src = src[:idx] + src_probe_main
+    bc, data = compile_c(src)
+    code = bytecode_to_isa(bc)
+    out = []
+    S.refword_interpret(code, max_steps=max_steps, out=out, data=data,
+                        files={"m.nblbin": blob})
+    return out
+
+
+def test_loader_reads_real_nblbin_header():
+    """The c4-subset loader (open/read/close, NOT stdio) reads the REAL tiny
+    c4vm.onnx .nblbin and reconstructs the header byte-exact vs nbl_bin_interp."""
+    g, blob = _export_tiny_nblbin()
+    probe = ('int main() {\n'
+             '    int fd;\n'
+             '    init_consts(); alloc_tables(); init_exp_table();\n'
+             '    fd = open("m.nblbin", 0); load(fd); close(fd);\n'
+             '    printf(n_tensors); printf(n_nodes);\n'
+             '    printf(input_tid); printf(output_tid);\n'
+             '    return 0;\n}')
+    out = _run_with_file(probe, blob)
+    assert out == [len(g.names), len(g.nodes), g.input_tid, g.output_tid], \
+        f"loader header {out} != {[len(g.names), len(g.nodes), g.input_tid, g.output_tid]}"
+
+
+def test_loader_reconstructs_node_ops():
+    """The loader reconstructs the node op list byte-exact vs nbl_bin_interp."""
+    from c4_min.nbl_bin_interp import OP_NAMES  # noqa: F401
+    g, blob = _export_tiny_nblbin()
+    probe = ('int main() {\n'
+             '    int fd; int i;\n'
+             '    init_consts(); alloc_tables(); init_exp_table();\n'
+             '    fd = open("m.nblbin", 0); load(fd); close(fd);\n'
+             '    i = 0; while (i < 8) { printf(n_op[i]); i = i + 1; }\n'
+             '    return 0;\n}')
+    out = _run_with_file(probe, blob)
+    py = [op for op, _, _, _ in g.nodes[:8]]
+    assert out == py, f"loader node ops {out} != {py}"
+
+
 if __name__ == "__main__":
     import sys
     checks = [
@@ -234,6 +300,8 @@ if __name__ == "__main__":
         ("gather", test_gather), ("transpose", test_transpose),
         ("reduce max/sum", test_reduce), ("unary neg/abs", test_unary_neg_abs),
         ("softmax(composed)", test_softmax_composed),
+        ("loader reads real .nblbin header", test_loader_reads_real_nblbin_header),
+        ("loader reconstructs node ops", test_loader_reconstructs_node_ops),
     ]
     passed = 0
     for name, fn in checks:
