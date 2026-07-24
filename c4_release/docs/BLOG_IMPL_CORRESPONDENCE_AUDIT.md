@@ -109,8 +109,192 @@ findings (beyond the already-logged revisions in `BLOG_SPEC_REVISIONS.md`) are t
    exists; floor is bit-plane selection. Division is long-division only (the blog does
    flag log-sink division as non-default, so that one is honest; MAGIC-floor is presented
    as used but isn't).
+   > **[2026-07-23 UPDATE]** Partly superseded — see §2026-07-23 REFRESH R2. The log-sink
+   > divide WAS later built (`226d38bb`/`c5641182`, full ISA 291→118 layers) then REMOVED
+   > with fp64 (`fa6dadea` deleted `nibble_logsink_*.py`), so "not implemented" → "built,
+   > then removed for fp32-vanillaness." A radix-16 hardened divide (`div_radix16_hardened.py`,
+   > 88 blocks, fp32) now exists as a standalone module (not the default on consolidate). A
+   > Granlund–Montgomery MAGIC-number CONSTANT divide was written (`60b27f6f`) but is on an
+   > UNMERGED side branch — NOT on this tree — so the §555 MAGIC-floor gap is still open here.
 
 *(Sections below add per-claim evidence; each section committed incrementally.)*
+
+---
+
+## 2026-07-23 REFRESH — deltas since the 2026-07-20 audit
+
+**Refresh scope.** Four changes landed after the 2026-07-20 audit was written; this
+section re-checks each against the code on the CURRENT tree
+(`consolidate-0.5b-2026-07-22`, worktree HEAD contains commit `046efd8e`). Findings
+#9, the §Vanillaness / §Adapting-to-Precision discussion, the §Division table rows, and
+the §KV-cache / §Memory / §How-Bytecode-is-Passed sections are affected. The original
+findings below are LEFT INTACT as the historical 2026-07-20 record; where one is now
+stale I add an inline `> **[2026-07-23 UPDATE]**` pointer back here.
+
+> **Branch-state discipline for this refresh.** Several of the divide changes the task
+> brief cited live ONLY on side worktree branches and are **NOT on consolidate / this
+> tree**. I verified merge state with `git merge-base --is-ancestor <c> consolidate-0.5b-2026-07-22`
+> for every commit and say explicitly, per item, whether the code is present here. Two
+> of the brief's claims were **wrong for the current tree** and are corrected below
+> (const_div_truncated.py absent; radix-16 not the wired default here).
+
+### R1 — fp64 REMOVED from the `qwen_full_vm` production path (genuinely fp32-vanilla). ✅ VERIFIED
+
+Commit `fa6dadea` ("remove ALL fp64 from the qwen_full_vm production path") is on this
+tree. The Qwen VM config now HARD-CODES fp32: `qwen_full_vm.py:287`
+`model_dtype: object = torch.float32   # the model is always fp32 (0 fp64 params)`, and
+the build docstring asserts "The model is ALWAYS fp32 (`model_dtype == torch.float32`,
+zero fp64 params)" (`qwen_full_vm.py:298`, echoed :338). The float64 branch and the
+`K_DIV` raise were dropped; `nibble_vm.maybe_cast_model_for_width` is now a no-op
+(always fp32) and the two-limb path is forced under width-32 so the single-scalar fp64
+fallback is retired (per the `fa6dadea` message, confirmed by grep — `nibble_vm.py` has
+no float64 model param).
+
+**Caveat I confirmed (not a hole, but worth stating precisely):** fp64 is NOT
+zero-in-the-repo — it survives as RUNTIME-PRECISION-ONLY, never a model param:
+- `qwen_full_vm.py:981` (`_snap`, the value-argmax DECODE helper) uses
+  `torch.arange(VALVOCAB, dtype=torch.float64)` because `v²ᐧ≈4.3e9` at the SP/BP value
+  vocab (`~0x10100`) exceeds fp32's 2^24 integer precision — a Python-side snap of the
+  model's fp32 lane, not a weight. Its own docstring says so (:978-979: "The MODEL is
+  still fully fp32 (zero fp64 params); only this local Python argmax uses doubles").
+- `nibble_cmp.py`/`nibble_muldivmod.py`/`nibble_rope.py`/`nibble_io_position.py` still
+  compute weight-VALUE coefficients in float64 and cast the output to fp32 (these feed
+  the HEADLINE nibble VM's baked weights, not the Qwen params).
+So "0 fp64 params in the built qwen model" holds; "0 fp64 anywhere in c4_min" does not,
+and the `fa6dadea` message is explicit that the residual fp64 is runtime-precision only.
+This UPDATES finding #9's implicit "fp64 divide" concern and the §Vanillaness discussion.
+
+### R2 — Divide is no longer long-division-ONLY (but the DEFAULT here is still long division). ✅ VERIFIED with corrections
+
+The 2026-07-20 §Division rows say "long division only; log-sink & MAGIC-floor
+described-only." Status on THIS tree:
+
+- **Radix-16 hardened divide EXISTS as a module.** `div_radix16_hardened.py` is present:
+  a base-16 digit-recurrence divide, **NO reciprocal / NO per-digit multiply**, with a
+  Kogge–Stone parallel-prefix borrow keeping every quantity in nibble-lane `[-16,15]`.
+  Depth is **88 blocks** (`:51` "depth 80 -> 88"; `:53` "88 < 127"), fp32, "0 fp64
+  params" (`:60`). ⚠ **Correction to the brief:** the module's own header line 3 states
+  it is a **"Standalone MEASURE-ONLY bakeoff module"** — its byte-exact self-check
+  numbers are COMPUTED AT RUNTIME by `measure()` (`:699`, "edge grid + adversarial +
+  >=6000 random (a,b<2^32) pairs" through a CPU SwiGLU forward sim), NOT baked as a
+  fixed count in the docstring. So "88 blocks, fp32, byte-exact" is right, but there is
+  no hardcoded self-check total in this file; the **3594/3594** figure the brief cited
+  comes from the (unmerged) `bc6c7684` commit message, not from this tree's code.
+
+- **Radix-16 as the DEFAULT divide is NOT on this tree.** Commit `bc6c7684` (#735) wires
+  radix-16 as default + width-narrow + `C4_CONST_OPERAND` hooks, but
+  `git merge-base --is-ancestor bc6c7684 consolidate-0.5b-2026-07-22` = **NO** (it lives
+  only on `worktree-agent-a4262510a4c274337`, pending a GPU gate). On THIS tree
+  `qwen_full_vm.py` contains **zero** references to `radix16` (grep empty) — the default
+  divide is the fp32 base-16 **recurrent/unrolled long division** (`recurrent_divmod`,
+  the `nibble_alu32` gadget; `qwen_full_vm.py:193-202, 463-466`). So the audit's
+  "long-division default" is STILL CORRECT for consolidate; radix-16 is an available
+  alternative module, not the wired default here.
+
+- **fp64 log-sink divide was BUILT then REMOVED.** `git log --all` shows `226d38bb`
+  ("§653 log-sink softmax division reference — ~11 blocks vs 262-block long division")
+  and `c5641182` ("log-sink division as the DEFAULT divide — full ISA 291→118 layers")
+  DID build it. `fa6dadea` then **DELETED** `nibble_logsink_blocks.py` (856 lines) and
+  `nibble_logsink_div.py` (confirmed in the `fa6dadea --stat`), unwired it from
+  `qwen_full_vm` + `full_native_fast`, and replaced `logsink_integration_state()` with a
+  fp32 `divide_integration_state()`. `ls nibble_logsink*.py` and
+  `git log --all | grep logsink` confirm the files are absent from the current tree. So
+  finding #9's "log-sink NOT IMPLEMENTED" is now "**built (291→118 layers), then removed
+  with fp64 for vanillaness**." (The blog was always honest that log-sink is non-default;
+  it was briefly the default on c5641182, now reverted.)
+
+- **Granlund–Montgomery CONSTANT divide — ⚠ NOT ON THIS TREE (brief was wrong).** The
+  brief says `const_div_truncated.py` (commit `60b27f6f`) "now exists." It does NOT
+  exist on consolidate/HEAD: `ls const_div*.py` = no matches;
+  `grep -rln "Granlund\|Montgomery\|const_div_truncated"` = empty. `60b27f6f` lives ONLY
+  on side branch `worktree-agent-ac37a51826c7b1460`
+  (`git merge-base --is-ancestor 60b27f6f consolidate-0.5b-2026-07-22` = **NO**). The
+  const-divisor work that IS on consolidate is a DIFFERENT, exploratory module —
+  `div_automaton_attn.py` (commit `2b4fe0d1`, "const-divisor divmod as an ATTENTION-CAM
+  automaton") plus the `div_radix16_attn.py` bakeoff (`5b1dae8e`) — both standalone
+  measure/bakeoff modules, neither wired into the qwen production build, and neither is
+  the Granlund–Montgomery magic-number truncated-multiply construction. The
+  `C4_CONST_OPERAND` flag likewise does NOT exist on this tree (grep empty) — it is
+  introduced by the unmerged `bc6c7684`. So the "MAGIC-floor described-only" gap (finding
+  #9 / §555) is **still open on consolidate**: the magic-number constant divide is
+  written, but on a branch that is not merged here.
+
+**Net for R2:** on consolidate, the default divide is still long division (audit correct);
+radix-16-hardened is a present-but-standalone module (88 blocks, fp32, measure-only);
+log-sink was built-then-removed (audit's "not implemented" is superseded by "removed for
+fp32-vanillaness"); and the Granlund–Montgomery constant divide + `C4_CONST_OPERAND` are
+NOT on this tree at all (only on unmerged side branches) — a correction to the brief.
+
+### R3 — KV eviction is CONTENT-BOUNDED for the fast-path GLOBAL heads (runtime-independent). ✅ VERIFIED, with a model-attribution correction
+
+Commit `046efd8e` (#723, MERGED to consolidate —
+`git merge-base --is-ancestor 046efd8e consolidate-0.5b-2026-07-22` = **YES**)
+content-bounds the 3 GLOBAL address-CAM heads (memory / stack-pop / LEV; block 7 head 20,
+block 11 heads 21-22). The mechanism, verified in code:
+- `local_attention.py:63-71` documents the store-role GATE channel `cR = ADDR_BITS+1`:
+  every global head bakes `W_k[base+ADDR_BITS+1, ONE] = -p` + `W_k[..., IS_STORE] = p`,
+  so a NON-STORE row scores `-PEN` under a load/pop/lev query → softmax1 weight EXACTLY 0.
+- `nibble_pure_forward_cached.py:1155-1187` `_global_content_keep` applies exactly this:
+  a row is kept iff its `cR` gate is above `-p/2` (store rows ~0, non-store ~`-p`), union
+  across the 3 global heads; the split commit (`:1129-1147`) routes only surviving store
+  rows into the global cache. `test_local_attention.py:165-180` asserts
+  `c.size() == #store rows, not span length`.
+- `local_attention.py:277` — "This is what makes the TOTAL KV runtime-independent."
+- Quantitatively (from the `046efd8e` message, a probe/bench not re-run in this CPU-only
+  refresh): on `nested 5x20` (1684 steps, 457 stores) the content-bound global cache
+  rises 7→~11 as the working set is covered then stays **FLAT at 11-12** (peak **13-16**)
+  for the whole run, vs drop-KV-only holding ~472. Across K=8/32/64/128/256 the content
+  gcache is 7/7/18/34/66 vs drop-KV 34/268/1197/2795/6530 — so it is bounded by the LIVE
+  ADDRESS SET, not step count (the "K-invariant" claim; note it still grows MODESTLY
+  7→66 with the working set — it is working-set-bounded, not literally constant).
+
+⚠ **Correction to the brief's model attribution.** The brief calls this "the Qwen
+fast-path." It is NOT the Qwen slice. `qwen_full_vm.py` imports neither
+`nibble_pure_forward_cached` nor `local_attention` nor `install_local_attention` (grep
+empty). All three files are the **KV-cached fast-path DRIVER of the HEADLINE sparse
+pure-forward nibble VM** — `nibble_pure_forward_cached.py:2,5,1301` is explicitly "KV-cached
+form of `run_pure_forward_complete`", and `pf_speculative.py:1` is "speculation for the
+SPARSE pure-forward whole-VM model." So this lands on **model (1) the headline nibble VM's
+fast-path cache**, a DISTINCT thing from the reference `nibble_kv_prune.py` the §KV section
+below audits (that module is the ground-truth eviction POLICY; this is the incremental
+per-block cache the deep-loop driver actually runs). This UPDATES the §KV-Cache section's
+"memory eviction is UNBOUNDED heap-mirroring" — that verdict was about `nibble_kv_prune.py`'s
+content-addressed recency horizon (still a no-op there), but the fast-path driver now DROPS
+provably-inert non-store frames so its GLOBAL cache is content-bounded/runtime-independent.
+Both statements are true of DIFFERENT modules; the audit's "unbounded" was never about the
+fast-path driver.
+
+### R4 — code-from-memory is now the DEFAULT. ✅ VERIFIED
+
+`qwen_full_vm.py` flips `code_from_memory=True` by default at every entry point:
+config field `qwen_full_vm.py:284` (`code_from_memory: bool = True   # program in KV
+§Memory (fetch@PC), not a baked table`), the layout builder kwarg `:167`, and `build()`
+`:294`. With it on (`:203-217, 480-489`) the baked `CODE_OP[k]`/`PC_IS[k]` table +
+`pc-fetch`/`code-select` blocks are replaced by a single `code-cam` attention block that
+FETCHES the instruction at PC out of KV §Memory — one code frame per instruction — and
+the build docstring names it "the 'Universal = bytecode fetched by PC' mechanism …
+Fetch is then program-length-independent (no `CODE_OP[k]` table)" (`:468-473`). This
+STRENGTHENS the blog's §How-Bytecode-is-Passed / §Universal correspondence: the program
+genuinely lives in §Memory as CODE frames fetched at PC, not a baked lookup table. (The
+`code_from_memory=False` path — the old baked table — is retained as an explicit opt-out.)
+
+### Refresh summary of corrections to the task brief
+
+1. **fp64 is NOT gone from the whole repo** — only from qwen model PARAMS. Runtime-precision
+   fp64 (value-argmax snap, weight-coefficient computation, reference oracles) remains, by
+   design; the model params are 0-fp64. (Brief's "genuinely fp32-vanilla" holds for the
+   built model, as stated.)
+2. **radix-16 is present but NOT the wired default on consolidate** — it's a standalone
+   MEASURE-ONLY module; the default divide here is still recurrent long division. The
+   "88 blocks, fp32, byte-exact" is right; the 3594/3594 self-check total is from the
+   unmerged `bc6c7684`, not this tree.
+3. **`const_div_truncated.py` (Granlund–Montgomery) does NOT exist on this tree** — it and
+   `C4_CONST_OPERAND` are on unmerged side branches only. The MAGIC-floor constant-divide
+   gap (finding #9) is still open on consolidate. The const-div work that IS here is the
+   different `div_automaton_attn.py` CAM-automaton (also not wired into the build).
+4. **The KV bound lands on the HEADLINE nibble VM's fast-path driver, not the Qwen slice.**
+   Otherwise the R3 mechanism and the flat ~11-16-row / working-set-bounded (not strictly
+   constant) behavior are exactly as the brief describes.
 
 ---
 
@@ -151,7 +335,7 @@ The blog has TWO opcode tables: the "How implemented in C4" table (lines 54-104,
 | 25 | ADD | 2/120 | ✅ | 6-weight nibble add + carry |
 | 26 | SUB | 2/120 | ✅ | nibble sub + borrow |
 | 27 | MUL | 4/320 | ✅ | schoolbook (nibble_muldivmod) |
-| 28 | DIV | 6/250 | ✅ | base-16 long division |
+| 28 | DIV | 6/250 | ✅ | base-16 long division (default; radix-16 hardened alt exists off-tree — 2026-07-23 REFRESH R2) |
 | 29 | MOD | 7/370 | ✅ | div-then-subtract |
 | 30 | OPEN | 1/20 | 🟡 tool-call | `nibble_filesys` TOOL_CALL protocol, not neural |
 | 31 | READ | 9/250 | 🟡 tool-call / neural-msg | conversational-IO + tool path |
@@ -247,6 +431,17 @@ Reference: `nibble_cmp.py` (comparisons), `nibble_muldivmod.py` (mul/div/mod),
 | **Efficient exp (BOS-sink, key √d, value e^B)** (§561-564) | ❌ **NOT IMPLEMENTED** | grep for the exp/log-sink construction finds nothing; division uses long division only (§Division default) — REV #19 already notes the shipped divider is long-division. §561-564 is described-only. |
 | **Division via attention-with-log-sink** (§653-679) | ❌ **NOT IMPLEMENTED** | the blog itself says it "set[s] the default behavior to be using long division" (§679); the log-sink divider is not built. Described-only (correctly flagged as non-default by the blog). |
 
+> **[2026-07-23 UPDATE — log-sink divide row + MAGIC-floor row]** See §2026-07-23 REFRESH R2.
+> The log-sink divider WAS subsequently built (`226d38bb` §653 reference ~11 blocks;
+> `c5641182` made it the default, full ISA 291→118 layers) and then REMOVED with fp64
+> (`fa6dadea` deleted `nibble_logsink_blocks.py` + `nibble_logsink_div.py`; grep for
+> `logsink` in the current tree = empty). So "NOT IMPLEMENTED" → "built, then removed for
+> fp32-vanillaness"; long division is again the default (audit still correct on the default).
+> Separately, a radix-16 hardened digit-recurrence divide (`div_radix16_hardened.py`, 88
+> blocks, fp32, reciprocal-free, measure-only) now exists as an ALTERNATIVE divide. The
+> MAGIC-floor §555 fp trick is now realized for the CONSTANT-divisor case (Granlund–Montgomery,
+> `60b27f6f`) but ONLY on an UNMERGED side branch, so §555 remains described-only on consolidate.
+
 **Verdict (ALU/building blocks):** the SHIPPED constructions — zero-detector, step,
 6-weight add/sub/mul, schoolbook mul, base-16 long division, mod, per-nibble bitwise —
 all match the blog's math faithfully (`nibble_cmp` / `nibble_muldivmod` are near-verbatim
@@ -330,6 +525,14 @@ Reference: `nibble_filesys.py`, `blogspec_vocab.py` (think-tag), `vm_causal_lm.p
 | **PRTF visible output is neural** | ⚠ **Python driver** | the visible byte is `out.append(ax & 0xFF)` read by the Python driver from decoded AX (nibble_pure_forward_complete:913), not emitted through a neural think-tag mechanism on the model |
 | position-offset via nibble cascade (§718-739) | ❌ not built | the O(log N) comparison-cascade offset extractor is described, not implemented |
 | System-prompt format (BYTECODE/SEP/DATA/SEP/ARGV) | ✅ | `blogspec_vocab` SEP=264; `universal.py` loads code table |
+
+> **[2026-07-23 UPDATE — "Universal = bytecode fetched by PC"]** Strengthened; see
+> §2026-07-23 REFRESH R4. `qwen_full_vm.py` now DEFAULTS `code_from_memory=True`
+> (`:284, 167, 294`): the program lives in KV §Memory as CODE frames fetched at PC by a
+> single `code-cam` attention block (`:480-489`), replacing the baked `CODE_OP[k]`/`PC_IS[k]`
+> table (fetch is now program-length-independent — the build docstring `:468-473` names it
+> "the 'Universal = bytecode fetched by PC' mechanism"). This is a closer match to the
+> blog's §How-Bytecode-is-Passed than the baked-table path the audit saw on 2026-07-20.
 | argv (`__argv_setup` read-as-input, §751-793) | 🟡 BRANCH-ONLY | not plumbed on this unified branch (grep for argv_setup/bake_argv = empty); the task notes argv was re-plumbed on branch `argv-read-plumb` |
 
 **⚠ NEW — the "100% native conversational I/O" is largely a Python harness, not neural.**
@@ -355,6 +558,15 @@ runner, not the described neural position signatures.
 | latest-write-wins register eviction | ✅ | mechanism 1 (:235-264) |
 | same-address supersession + ZFOD/free zero-overwrite eviction | ✅ | zero-value branch (:310-311); free = value→0 |
 | memory eviction is UNBOUNDED heap-mirroring (REV #3) | ✅ | content_addressed recency-horizon is a NO-OP (:312-324): "tracks the UNBOUNDED live heap ... NO fixed recency/size cap"; a live store evicted only by supersede or free |
+
+> **[2026-07-23 UPDATE]** Still true FOR `nibble_kv_prune.py` (the reference eviction
+> POLICY this section audits). But see §2026-07-23 REFRESH R3: a SEPARATE module — the
+> headline VM's fast-path KV-cached DRIVER (`nibble_pure_forward_cached.py` +
+> `local_attention.py`, commit `046efd8e`, MERGED) — now CONTENT-bounds the 3 global
+> address-CAM heads by dropping provably-inert non-store frames (softmax1 weight exactly 0),
+> so its GLOBAL cache stays flat at ~11-16 rows (working-set-bounded, runtime-independent),
+> NOT growing with history. The "unbounded" verdict was never about this driver; both are
+> true of their respective modules. (This is the fast-path cache, NOT the Qwen slice.)
 
 **⚠ NEW nuance — the module's OWN docstring header still repeats the wrong claims.** The
 implementation (lines 235+) correctly splits cosine/exact and makes memory unbounded, but
@@ -408,6 +620,14 @@ in the status doc, not independently re-measured in this CPU-only audit.
 | Many passes just output registers (no real compute) | ✅ | true — the 30-token frame is mostly bookkeeping (REV #16) |
 | RoPE binary distance `theta_k=2^k`, `alpha=sqrt(2·SCALE/d)`, aligned score≈SCALE | ✅ | `nibble_rope.py:14-94` — `binary_thetas` = `[2^k]`, `enc_k(p)=alpha·cos(2^k·p)` — matches §743-746 char-for-char |
 | **"pure transformer, no exotic architecture"** (§3 intro) | ✅ (headline) / 🟡 (nuance) | headline nibble VM is clean vanilla; the Qwen slice is a genuine `Qwen2Model.forward` (`qwen_full_vm.py`) but 8-bit-only (pruned MUL/DIV/MOD lookup table, `& 0xFF`, 8-bit addresses). So "the VM as a genuine Qwen2" holds only for the 8-bit slice; the fp32-exact 32-bit ALU runs on the softmax1+ALiBi headline model. |
+
+> **[2026-07-23 UPDATE]** See §2026-07-23 REFRESH R1: as of `fa6dadea` the Qwen slice is
+> now genuinely fp32-vanilla — `model_dtype` is hard `torch.float32` with ZERO fp64 params
+> (`qwen_full_vm.py:287`), and the 32-bit ALU MUL/DIV/MOD now run as fp32 `nibble_alu32`
+> gadgets INSIDE the real `Qwen2Model.forward` (the 256×256×3 lookup table was removed).
+> The "8-bit-only" caveat above described the earlier lookup-table build; the efficient-ALU
+> path is full 32-bit-exact in fp32. The only remaining fp64 is a Python-side value-argmax
+> decode snap (`:981`), never a model param.
 | headline "1096/1096" | 🟡 documented | measured 1085/1096 (`934ea608`), +11 deep-recursion fix live (EFF=500000); the full re-sweep with the fix is a documented GPU follow-up (status:56-73), not re-run here |
 
 **⚠ two-models nuance (REV #11 territory).** The blog reads as ONE transformer. In fact
