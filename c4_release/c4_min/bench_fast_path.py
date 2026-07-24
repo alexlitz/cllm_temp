@@ -451,7 +451,7 @@ def run_bench(kind: str, args) -> int:
     # every _zero_attn head's per-head output is 0 by construction, so its score
     # matmul is skipped byte-identically.  Orthogonal to --local-window (that
     # windows the live heads' READ; this prunes the DEAD heads' matmul entirely).
-    if getattr(args, "live_head", False):
+    if getattr(args, "live_head", False) or getattr(args, "fuse_dead_blocks", False):
         from .live_head_attention import install_live_head_attention
         lh = install_live_head_attention(sparse, verbose=True)
         print(f"  LIVE-HEAD-ATTN: scoring {lh['live_head_slots']}/"
@@ -459,6 +459,19 @@ def run_bench(kind: str, args) -> int:
               f"({lh['frac_scored_after']*100:.2f}%)  "
               f"{lh['dead_attention_blocks']}/{lh['n_blocks']} blocks are pure "
               f"x-passthrough (attention sublayer skipped)", flush=True)
+
+    # -- DEAD-BLOCK ATTENTION FUSION (opt-in) --------------------------------
+    # Bypass the ENTIRE attention sublayer of the ~234 dead-attention blocks
+    # (output = x directly; NO K/Q/V/W_o linears, NO KV write).  --live-head only
+    # skips the score matmul; this also skips the per-block linears (the measured
+    # wall) and the KV materialisation.  Byte-identical: a dead block's attention
+    # output is x (all heads _zero_attn), and its KV is provably never read.
+    if getattr(args, "fuse_dead_blocks", False):
+        from .live_head_attention import install_dead_block_fusion
+        df = install_dead_block_fusion(sparse, verbose=True)
+        print(f"  DEAD-BLOCK-FUSION: bypassed {df['fused_blocks']}/{df['n_blocks']} "
+              f"dead-attention blocks (output=x, no K/Q/V/W_o linears, no KV write); "
+              f"{df['live_attention_blocks']} live blocks keep attention", flush=True)
 
     # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
     #    (K vs amortized ms/step vs peak-VRAM vs forwards vs GPU-util). ---------
@@ -691,6 +704,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "head outputs x regardless of scores).  Cuts attn-scoring "
                          "FLOPs ~99.6%%; 234/237 blocks become pure x-passthrough. "
                          "Composes with --local-window.")
+    ap.add_argument("--fuse-dead-blocks", action="store_true",
+                    help="DEAD-BLOCK ATTENTION FUSION: bypass the ENTIRE attention "
+                         "sublayer of the ~234 blocks with NO live-value head "
+                         "(output = x directly; NO K/Q/V/W_o linears, NO KV write). "
+                         "Implies --live-head classification (installs live-head "
+                         "scoring on the ~3 live blocks).  --live-head alone only "
+                         "skips the score matmul; this ALSO removes the per-block "
+                         "linears (the measured wall) + KV materialisation on the "
+                         "dead blocks.  Byte-identical: a dead block's attention "
+                         "output is x and its KV is provably never read.")
     ap.add_argument("--content-bound-global", action="store_true",
                     help="with --local-window (DROP-KV): bound the GLOBAL "
                          "(memory/stack/LEV) cache BY CONTENT — each global head is "

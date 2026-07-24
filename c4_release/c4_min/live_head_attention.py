@@ -176,6 +176,86 @@ def live_head_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
     return out
 
 
+# ===========================================================================
+# DEAD-BLOCK ATTENTION FUSION — bypass the ENTIRE attention sublayer of a block
+# whose attention has NO live-value head (all heads ``_zero_attn``).
+#
+# ``live_head_forward`` already SKIPS the O(S²) score matmul on a dead block, but
+# it STILL materialises Q/K/V (three ``F.linear``s), the ``W_o`` linear, and the
+# full-H KV tuple for the returned cache.  Measured (this task's audit): those
+# per-block linears are the wall on the 234 dead blocks (~98% of the attention-
+# sublayer time even after score-skip).  A dead block's attention output is
+# PROVABLY ``x`` (all heads ``_zero_attn`` -> ``W_v`` slice 0 -> ``attn@V == 0``;
+# ``W_o`` slice 0 -> ``x + W_o·0 == x``; audited no output bias, L-inf=0), so we
+# can bypass the WHOLE sublayer: output is ``x`` directly, no linears, no KV.
+#
+# KV-CACHE SAFETY (option (a), skip the write entirely).  A dead block's KV is
+# NEVER read: (1) its OWN future attention ignores it — every head is dead, so a
+# future step's attention over this block also outputs ``x`` regardless of K/V;
+# (2) NO OTHER block reads block-k's cache — the driver's cache is strictly
+# positional (``caches[b]`` <-> ``blocks[b]``, per-block ``forward_hidden_cached``
+# append).  So returning ``None`` for a dead block's KV is byte-safe.  This is the
+# EXACT contract the speculative driver's block-MoE skip already relies on
+# (``pf_speculative._forward_hidden_cached_skip`` sets ``new_caches[b]=None`` and
+# ``_commit_span`` skips ``None`` with the comment "its cache is never read, so a
+# gap is harmless").  The single-program cached driver
+# (``nibble_pure_forward_cached``) is taught the same one-line ``None``-guard.
+# ===========================================================================
+def dead_block_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
+    """The fused forward for a block whose attention has NO live-value head.
+
+    Output is EXACTLY ``x`` (a dead block's attention sublayer is the identity on
+    the residual — proven L-inf=0).  Skips ALL of Q/K/V linears + ``W_o`` + the
+    KV materialisation.  On the cache path returns ``(x, None)``: the block writes
+    NO KV entry (byte-safe — a dead block's KV is provably never read; see module
+    docstring).  The driver tolerates the ``None`` (positional per-block cache).
+    """
+    if use_cache:
+        return x, None
+    return x
+
+
+def install_dead_block_fusion(model, verbose: bool = False) -> Dict[str, object]:
+    """Bypass the ENTIRE attention sublayer of every DEAD-attention block.
+
+    Composes with (and requires the same classification as) the live-head install:
+    a block with 0 live-value heads gets ``dead_block_forward`` (output ``x``, no
+    linears, no KV write); a block with >=1 live head keeps its attention (the
+    caller pairs this with ``install_live_head_attention`` so live blocks run the
+    live-head-only forward, and the ~234 dead blocks are fully fused away).
+
+    Sets ``attn._dead_block_fused = True`` on the fused blocks so
+    ``uninstall_dead_block_fusion`` can revert.  Returns the same summary dict as
+    ``live_head_attention_stats`` plus ``fused_blocks`` (the count bypassed).
+    """
+    cls = classify_live_head_slots(model)
+    fused = 0
+    for bi, blk in enumerate(model.blocks):
+        at = blk.attn
+        if not bool(cls[bi].any()):                # dead block: 0 live heads
+            at._dead_block_fused = True
+            at.forward = dead_block_forward.__get__(at, type(at))
+            fused += 1
+    stats = live_head_attention_stats(model)
+    stats["fused_blocks"] = fused
+    if verbose:
+        print(f"[dead-block-fusion] bypassed {fused}/{stats['n_blocks']} "
+              f"dead-attention blocks (output=x, no K/Q/V/W_o linears, no KV "
+              f"write); {stats['live_attention_blocks']} live blocks keep "
+              f"attention")
+    return stats
+
+
+def uninstall_dead_block_fusion(model) -> None:
+    """Revert every fused dead block to its prior ``attn.forward``."""
+    for blk in model.blocks:
+        at = blk.attn
+        if getattr(at, "_dead_block_fused", False):
+            delattr(at, "_dead_block_fused")
+        if "forward" in at.__dict__:
+            del at.__dict__["forward"]
+
+
 def install_live_head_attention(model, verbose: bool = False) -> Dict[str, object]:
     """Install live-head-only attention scoring on every block.
 

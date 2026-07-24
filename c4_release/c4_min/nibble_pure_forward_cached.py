@@ -1403,6 +1403,8 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
             n_commit = win_len - 1
             if n_commit > 0:
                 for b in range(n_blocks):
+                    if new_kv[b] is None:
+                        continue        # dead-block-fused: no KV (never read).
                     K_all, V_all, pos_all = new_kv[b]
                     K_win = K_all[:, :, -win_len:, :]
                     V_win = V_all[:, :, -win_len:, :]
@@ -1464,6 +1466,8 @@ def run_pure_forward_cached(model, L: PureForwardCompleteLayout,
         n_commit = win_len - 1
         if n_commit > 0:
             for b in range(n_blocks):
+                if new_kv[b] is None:
+                    continue        # dead-block-fused: no KV (provably never read).
                 K_all, V_all, pos_all = new_kv[b]
                 K_win = K_all[:, :, -win_len:, :]      # this window's K
                 V_win = V_all[:, :, -win_len:, :]
