@@ -607,6 +607,107 @@ def compile_lea_q_reduce(L, dim: int) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def _lea_q_snap_enabled() -> bool:
+    """The LEA_Q integer-SNAP (deep-context residue fix, #705).  DEFAULT ON.
+
+    ``compile_lea_q_reduce`` sums the RAW ``IMM_NIB`` nibbles (``4*IMM_NIB0 +
+    64*IMM_NIB1``).  Those nibbles are fetched via the PC one-hot, which at DEEP
+    context (large emitted token stream, e.g. the 2x2 self-emulation matmul at
+    ~6.5k tokens) carries a sub-permille residue: measured ``IMM_NIB0 = 11.9997``
+    / ``IMM_NIB1 = 14.9996`` (should be 12 / 15).  Amplified 64x in the sum, this
+    drifts ``LEA_Q`` to ``227.875`` (should be an exact ``228``).  The downstream
+    ``compile_lea_addr_nib`` decode is only residue-IMMUNE when ``LEA_Q`` is a TRUE
+    float32 INTEGER (its half-integer edges then cleanly separate cells); a
+    non-integer ``LEA_Q`` sitting ~0.1 below an integer BLENDS the decode across
+    cells (``AXB_LO = 4.557`` -> byte 229 instead of 228), so the LEA reads the
+    wrong frame address and the following ``LI`` loads ZFOD 0 from the un-stored
+    address (the 2x2 matmul step-225 divergence).  Snapping ``LEA_Q`` to the nearest
+    integer BEFORE the decode restores the exact-integer invariant the decode relies
+    on.  Escape hatch ``C4_LEA_Q_SNAP=0``."""
+    import os
+    return os.environ.get("C4_LEA_Q_SNAP", "1") != "0"
+
+
+def compile_lea_q_snap(L, dim: int) -> Dict[str, torch.Tensor]:
+    """RECOMPUTE ``LEA_Q`` from INTEGER-ROUNDED ``IMM_NIB`` nibbles (LEA-gated), #705.
+
+    ``compile_lea_q_reduce`` builds ``LEA_Q = BP0 + 16*BP1 + 4*IMM0 + 64*IMM1 - 1024*
+    sign`` from the RAW ``IMM_NIB`` nibbles.  Those nibbles are fetched via the PC
+    one-hot and at DEEP context carry a sub-permille residue (measured ``IMM0=11.9997``
+    / ``IMM1=14.9996``); the ``64x`` amplification drifts ``LEA_Q`` to ``227.875``
+    (target ``228``), and the downstream ``compile_lea_addr_nib`` decode — residue-
+    IMMUNE only for an EXACT-integer ``LEA_Q`` — then BLENDS across cells (byte 229
+    not 228), so the LEA reads the wrong frame address and the next ``LI`` loads ZFOD
+    0 (the 2x2 self-emulation matmul step-225 divergence).
+
+    Fix: re-derive ``LEA_Q`` here with each ``IMM_NIB`` nibble first ROUNDED to its
+    nearest integer via a NEAREST-INTEGER ROUND ``rnd(nib) = Σ_{v=1..15} step(nib >=
+    v-0.5)`` — a staircase of SHARP UNIT silu-steps at the half-integer edges.  Unlike
+    a triangular-pulse one-hot (which INTERPOLATES near an integer and would reproduce
+    the residue), the half-integer step staircase SNAPS: a nibble with residue << 0.5
+    sits >> 1/RELU_S from every edge, so each step is a clean 0/1 and the sum is the
+    exact nearest integer.  The edges are LOCAL to a single nibble (0..15) so there is
+    NO wide-range silu-tail accumulation, and the coefficient per nibble stays <= 64.
+    ``BP0/BP1`` are read directly (measured exact-integer; a heap BP is a clean nibble
+    already).  All units are gated on ``OP_IS[LEA]`` so the write is 0 on non-LEA ops
+    (``LEA_Q`` is a SET target, so an ungated add would leak) -> byte-identical off-LEA.
+    Runs BETWEEN ``lea-q-reduce`` and ``lea-addr-nib``; the decode then sees a TRUE
+    integer:
+
+        LEA_Q := BP0 + 16*BP1 + 4*rnd(IMM0) + 64*rnd(IMM1) - 1024*(rnd(IMM1) >= 8)
+    """
+    g = L.OP_IS + isa.LEA
+    q = L.LEA_Q
+    # rnd(nib) = Σ_{v=1..15} step(nib >= v-0.5), a nearest-integer ROUND (each step is
+    # a SHARP UNIT silu-step at a half-integer edge; a nibble with residue << 0.5 sits
+    # >> 1/RELU_S from every edge -> each step is a clean 0/1, so the sum is the exact
+    # nearest integer, unlike the triangular pulse which INTERPOLATES near an integer).
+    # A step at edge e needs TWO relu units: silu(RELU_S*(nib-e)) - silu(...-1).
+    edges = [v - 0.5 for v in range(1, 16)]     # 15 half-integer edges per nibble
+    n_step = len(edges)
+    # units: 2 nibbles * (15 edges * 2 relu) + clear + BP-add.
+    spec = _empty_spec(dim, 2 * (n_step * 2) + 1 + 1)
+    u = 0
+    step_base = {}
+    for bi, src in enumerate((L.IMM_NIB + 0, L.IMM_NIB + 1)):
+        step_base[bi] = {}
+        for e in edges:
+            base = u
+            for j in range(2):
+                spec["W_up"][u, src] = RELU_S
+                spec["b_up"][u] = -RELU_S * e - (0.0 if j == 0 else 1.0)
+                spec["W_gate"][u, g] = 1.0        # gate on LEA -> 0 off-LEA
+                u += 1
+            step_base[bi][e] = base               # (base, base+1) = the +/- relu pair
+    # SET: clear LEA_Q (gated on LEA).
+    clr = u
+    spec["W_up"][clr, g] = S; spec["b_up"][clr] = -S * 0.5
+    spec["W_gate"][clr, q] = 1.0
+    spec["W_down"][q, clr] += -1.0 / SILU_HALF
+    u += 1
+    # LEA-gated linear BP low-byte re-add (BP nibbles are clean integers).
+    add = u
+    spec["W_up"][add, g] = S; spec["b_up"][add] = -S * 0.5
+    spec["W_gate"][add, L.BP + 0] = 1.0
+    spec["W_gate"][add, L.BP + 1] = 16.0
+    spec["W_down"][q, add] += 1.0 / SILU_HALF
+    u += 1
+    # rounded-nibble re-add: LEA_Q += 4*rnd(IMM0) + 64*rnd(IMM1).  rnd(nib) is the sum
+    # of unit steps; each edge v-0.5 contributes ``scale`` to LEA_Q iff nib >= v-0.5.
+    # (The sign fold -1024*(IMM1>=8) is applied SEPARATELY below as one extra step.)
+    for bi, scale in ((0, 4.0), (1, 64.0)):
+        for e in edges:                            # e = v-0.5 for v=1..15
+            p, m = step_base[bi][e], step_base[bi][e] + 1
+            spec["W_down"][q, p] += scale          # +step (silu@e)
+            spec["W_down"][q, m] += -scale         # -step (silu@e-1) -> UNIT step
+    # two's-complement sign for IMM1: subtract 1024 when rnd(IMM1) >= 8, i.e. when the
+    # step at edge 7.5 is ON.  Reuse the bi=1 step at e=7.5 (v=8 edge) already built.
+    p, m = step_base[1][7.5], step_base[1][7.5] + 1
+    spec["W_down"][q, p] += -1024.0
+    spec["W_down"][q, m] += 1024.0
+    return spec
+
+
 def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
     """LEA-ONLY, residue-immune frame-address nibbles (the #648 + #680 fix).
 
@@ -980,6 +1081,13 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # can round the byte to the wrong 16-aligned/edge-adjacent cell, at any read-back
         # depth.  LEA-gated; else no-op (LEA_Q stays 0, AXB untouched).
         ("lea-q-reduce", compile_lea_q_reduce(L, dim)),   # LEA_Q = (BP_low+4*imm) mod 256
+    ]
+    if _lea_q_snap_enabled():
+        # #705: integer-SNAP LEA_Q before the decode (deep-context IMM_NIB residue
+        # fix).  DEFAULT ON; C4_LEA_Q_SNAP=0 reverts to the pre-#705 build (the
+        # 2x2 self-emulation matmul then diverges at step 225 as documented).
+        block_specs += [("lea-q-snap", compile_lea_q_snap(L, dim))]
+    block_specs += [
         ("lea-addr-nib", compile_lea_addr_nib(L, dim)),   # AXB_LO/HI <- decode(LEA_Q)
         ("ax-byte-nib", compile_ax_byte_to_nibbles(L, dim, byte_ax_ops)),
         # FULL 32-bit IMM: overwrite ALL 8 AX nibbles with the fetched immediate
