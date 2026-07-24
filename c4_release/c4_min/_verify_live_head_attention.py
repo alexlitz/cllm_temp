@@ -187,29 +187,79 @@ def main(argv=None):
           f"({'BYTE-IDENTICAL' if worst == 0.0 else 'NONZERO!'})")
 
     # ---- Proof C: end-to-end decode --------------------------------------
+    # Baseline = GLOBAL forward.  Compare against (1) live-head-only and (2)
+    # live-head + DEAD-BLOCK FUSION (the whole attention sublayer of a dead block
+    # bypassed AND its KV write skipped).  The memory/stack programs are the
+    # critical KV-safety test: they exercise the 3 LIVE blocks' KV (which fusion
+    # must leave untouched) while every dead block's KV is skipped.
     print("\n==================== PROOF C: END-TO-END DECODE ====================")
     progs = _battery()
-    c_ok = True
+    c_ok = True       # live-head-only == global
+    d_ok = True       # live-head + dead-block fusion == global
     for label, code, note in progs:
+        LHA.uninstall_dead_block_fusion(model)
         LHA.uninstall_live_head_attention(model)
-        tg = decode_trace(model, L, code, device)
-        LHA.install_live_head_attention(model)
+        tg = decode_trace(model, L, code, device)                 # GLOBAL baseline
+
+        LHA.install_live_head_attention(model)                    # live-head only
         tl = decode_trace(model, L, code, device)
         LHA.uninstall_live_head_attention(model)
-        same = (tg == tl)
-        c_ok = c_ok and same
+
+        LHA.install_live_head_attention(model)                    # live-head + fusion
+        LHA.install_dead_block_fusion(model)
+        tf = decode_trace(model, L, code, device)
+        LHA.uninstall_dead_block_fusion(model)
+        LHA.uninstall_live_head_attention(model)
+
+        same_l = (tg == tl)
+        same_f = (tg == tf)
+        c_ok = c_ok and same_l
+        d_ok = d_ok and same_f
+        verdict_str = ("IDENTICAL" if (same_l and same_f)
+                       else "live=%s fuse=%s" % (
+                           "OK" if same_l else "DIVERGES", "OK" if same_f else "DIVERGES"))
         print(f"  {label:12} [{note:34}]  steps={len(tg):4d}  "
-              f"AX_final={tg[-1] if tg else '?'}  "
-              f"-> {'IDENTICAL' if same else 'DIVERGES! g=%s l=%s' % (tg, tl)}")
+              f"AX_final={tg[-1] if tg else '?'}  -> {verdict_str}")
+        if not same_f:
+            print(f"      FUSION DIVERGES!  g={tg}\n                        f={tf}")
+
+    # ---- Proof B-fusion: fused block output L-inf == 0 vs global ----------
+    # A fused DEAD block must return EXACTLY x (and None KV).  Probe the first few
+    # dead blocks directly (the live blocks are never fused).
+    print("\n============ PROOF B-fusion: FUSED DEAD-BLOCK L-inf == 0 ============")
+    torch.manual_seed(1)
+    Dm = model.blocks[0].attn.dim
+    dead = [bi for bi in range(len(model.blocks)) if bi not in live_blocks][:4]
+    fuse_worst = 0.0
+    LHA.install_live_head_attention(model)
+    LHA.install_dead_block_fusion(model)
+    for bi in dead:
+        at = model.blocks[bi].attn
+        for S in (5, 30, 61):
+            x = torch.randn(1, S, Dm, device=device) * 3.0
+            out = at.forward(x)                       # fused: must be exactly x
+            fuse_worst = max(fuse_worst, float((out - x).abs().max()))
+            oc, kv = at.forward(x, q_positions=torch.arange(S, device=device),
+                                use_cache=True)
+            fuse_worst = max(fuse_worst, float((oc - x).abs().max()))
+            assert kv is None, f"fused block {bi} returned non-None KV"
+    LHA.uninstall_dead_block_fusion(model)
+    LHA.uninstall_live_head_attention(model)
+    print(f"  probed dead blocks        : {dead}")
+    print(f"  max L-inf (fused vs x)    : {fuse_worst:.3e} "
+          f"({'BYTE-IDENTICAL (out==x, KV=None)' if fuse_worst == 0.0 else 'NONZERO!'})")
 
     # ---- verdict ----------------------------------------------------------
     print("\n==================== VERDICT ====================")
     b_ok = (worst == 0.0)
-    verdict = a_ok and b_ok and c_ok
-    print(f"  A head bipartite audit    : {a_ok}")
-    print(f"  B raw-forward L-inf == 0  : {b_ok}")
-    print(f"  C end-to-end decode ident : {c_ok}")
-    print(f"  OVERALL: {'PASS — live-head-only == full forward BYTE-IDENTICAL' if verdict else 'FAIL'}")
+    f_ok = (fuse_worst == 0.0)
+    verdict = a_ok and b_ok and c_ok and d_ok and f_ok
+    print(f"  A head bipartite audit         : {a_ok}")
+    print(f"  B raw-forward L-inf == 0       : {b_ok}")
+    print(f"  B-fusion fused block == x      : {f_ok}")
+    print(f"  C live-head decode ident       : {c_ok}")
+    print(f"  C dead-block-FUSION decode ident: {d_ok}")
+    print(f"  OVERALL: {'PASS — live-head + dead-block-fusion == full forward BYTE-IDENTICAL' if verdict else 'FAIL'}")
     return 0 if verdict else 1
 
 
