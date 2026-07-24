@@ -57,6 +57,10 @@ from .nibble_pure_forward_complete import (
 import c4_min.nibble_pure_forward_complete as _PFC
 from .nibble_pure_forward_cached import (
     apply_overlay_window, BlockKVCacheBatched, evict_all_blocks_fused,
+    evict_all_blocks_scheduled,
+)
+from .nibble_evict_schedule import (
+    build_eviction_schedule, sorted_evict_frames, positions_new_at,
 )
 from .blogspec_layout import NIB_PER_REG
 
@@ -170,6 +174,12 @@ class PFDraft:
     win_starts: List[int]                      # absolute pos of each step's query row
     out: List[int] = None                      # PRTF visible-output bytes (AX&0xFF)
     prtf_steps: List[int] = None               # step indices that emitted a PRTF byte
+    # LIVENESS input (C4_EVICT_SCHEDULE): per-frame LOAD address (LI/LC reads
+    # ``mem[addr]``).  ``load_log[frame_idx] = addr`` for every frame that LOADED, so
+    # the liveness pass can compute, per store, the step after its LAST load (dead) or
+    # its supersession by a same-address store — the deterministic eviction schedule
+    # that replaces the O(S^2) content comparison.  None on drafts built without it.
+    load_log: Dict[int, int] = None
 
 
 # The immediate is baked as IMM_NIBS little-endian nibbles (a STATIC re-encoding of
@@ -212,6 +222,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     tokens: List[int] = [V.BOS] + init_frame
     frames: List[Dict[str, int]] = []
     store_log: Dict[int, Tuple[int, int]] = {}
+    load_log: Dict[int, int] = {}               # frame_idx -> loaded address (LI/LC)
     win_starts: List[int] = []
     out: List[int] = []                         # PRTF visible-output bytes
     prtf_steps: List[int] = []                  # step indices emitting a PRTF byte
@@ -231,6 +242,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         pc += 1
         step_halted = False
         pop_val = stk                        # STACK0 default (unchanged if not a pop)
+        load_addr = None                     # set by LI/LC (the address recalled)
         # --- the MODEL's transition (32-bit; IMM keeps the full nibble literal) --
         if op == isa.IMM:
             ax = imm & _IMM_MASK              # full 20-bit literal (model, not &0xFF)
@@ -276,6 +288,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             # while the model correctly recalled 990, and speculation then wrongly
             # rejected the model's CORRECT load.  Keep the draft consistent with the
             # store_log (the actual KV the model reads).
+            load_addr = ax                     # the address this LI/LC recalled (KV read)
             ax = mem.get(ax, 0) & mask
         elif op in (isa.SI, isa.SC):
             addr = mem.get(sp, 0); pop_val = addr; sp += 4
@@ -348,6 +361,8 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         frame_idx += 1
         if is_store:
             store_log[frame_idx] = (s_addr, s_val)
+        if load_addr is not None:
+            load_log[frame_idx] = load_addr & 0xFFFFFFFF
         cur_pc, cur_sp, cur_bp = pc, sp, bp
         if step_halted or not (0 <= pc < len(code)):
             halted = step_halted or (pc < 0 or pc >= len(code))
@@ -363,7 +378,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     return PFDraft(tokens=tokens, frames=frames, store_log=store_log,
                    step_count=len(frames), halted=halted,
                    final_ax_masked=final_ax, win_starts=win_starts,
-                   out=out, prtf_steps=prtf_steps)
+                   out=out, prtf_steps=prtf_steps, load_log=load_log)
 
 
 # ===========================================================================
@@ -421,7 +436,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                   block_moe: bool = False,
                   evict_interval_steps: Optional[int] = None,
                   oom_backoff: bool = True,
-                  min_block_steps: int = 4) -> VerifyResult:
+                  min_block_steps: int = 4,
+                  evict_schedule: Optional[bool] = None) -> VerifyResult:
     """Verify the whole drafted stream on the SPARSE model in BLOCKS.
 
     Processes ``block_steps`` (== K) VM steps per batched ``forward_hidden_cached``.
@@ -481,6 +497,36 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 content_cR=getattr(at, "_store_gate_channel", None))
     store_log = draft.store_log
     n_steps = draft.step_count
+    # SCHEDULE-DRIVEN eviction (C4_EVICT_SCHEDULE): precompute the deterministic
+    # per-store eviction step off the perfect draft ONCE, replacing the per-round
+    # O(S^2) content comparison with an O(dropped) position drop.  Default OFF
+    # (env / explicit arg) so the proven content-bound path stays the fallback until
+    # byte-identity is established.  When None, read the env flag.
+    if evict_schedule is None:
+        import os
+        evict_schedule = os.environ.get("C4_EVICT_SCHEDULE", "0") not in ("0", "", "false", "False")
+    sched = None
+    if evict and evict_schedule:
+        # the widest (smallest-slope) GLOBAL head sets the recency horizon for the
+        # freed (zero-value) rows, so the freed-row drop is never earlier than any
+        # head would drop it — conservative + byte-identical to the content horizon.
+        slope_min = None
+        for b in range(n_blocks):
+            c = caches[b]
+            if getattr(c, "split", False) and c._global_head_idx is not None \
+                    and c._global_head_idx.numel() > 0:
+                sl = c.slopes.index_select(0, c._global_head_idx)
+            else:
+                sl = c.slopes
+            sl = sl[sl > 0]
+            if sl.numel() == 0:
+                continue
+            m = float(sl.min())
+            slope_min = m if slope_min is None else min(slope_min, m)
+        sched = build_eviction_schedule(draft, slope_min=slope_min,
+                                        recency_eps=recency_eps, zero_eps=zero_eps)
+    sched_frames = sorted_evict_frames(sched) if sched is not None else []
+    sched_ptr = 0                       # frontier into sched_frames (O(steps) walk)
     forwards = 0
     accepted = 0
     steps_since_evict = 0
@@ -754,8 +800,38 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             if is_cuda:
                 torch.cuda.synchronize(dev)
             _t0 = _time.perf_counter()
-            keep_masks = evict_all_blocks_fused(
-                caches, cos_threshold, zero_eps, recency_eps)
+            if sched is not None:
+                # SCHEDULE-DRIVEN: drop exactly the store rows the liveness pass
+                # marked dead through the highest committed store frame (frame_idx
+                # ``end`` — step ``s`` commits ``store_log[s+1]`` so committing steps
+                # [step, end) has laid down store frames up to frame_idx ``end``).
+                # Walk the ASCENDING eviction-frame FRONTIER: emit only the NEW dead
+                # positions this round (true O(steps) total — no cumulative rescan).
+                # Already-dropped rows are gone from the cache, so incremental ==
+                # cumulative, byte-identical.
+                drop_pos: List[int] = []
+                while sched_ptr < len(sched_frames) and sched_frames[sched_ptr] <= end:
+                    drop_pos.extend(positions_new_at(sched, sched_frames[sched_ptr]))
+                    sched_ptr += 1
+                # 1) SUPERSESSION drops from the draft (removes the O(S^2) mech-1).
+                keep_masks = (evict_all_blocks_scheduled(caches, drop_pos)
+                              if drop_pos else [None] * n_blocks)
+                for b in range(n_blocks):
+                    if keep_masks[b] is not None:
+                        caches[b].apply_keep_mask(keep_masks[b])
+                # 2) the O(S) zero-value/recency mechanisms (2a/2b/3) — per-head,
+                # byte-exact, NO cdist/cosine (mech-1 skipped: the schedule already
+                # did supersession).  This handles the cross-head zero-value/recency
+                # decision the address-only schedule cannot see, so the KV survivor
+                # set matches the content path exactly on every head.
+                keep_masks = evict_all_blocks_fused(
+                    caches, cos_threshold, zero_eps, recency_eps, skip_mech1=True)
+            else:
+                # FUSED CONTENT eviction (#667/#670): ONE batched on-GPU decision for
+                # ALL n_blocks caches (the O(S^2) near-dup cdist/cosine over the live
+                # cache), then a boolean-mask compaction per block.
+                keep_masks = evict_all_blocks_fused(
+                    caches, cos_threshold, zero_eps, recency_eps)
             for b in range(n_blocks):
                 if keep_masks[b] is not None:
                     caches[b].apply_keep_mask(keep_masks[b])
@@ -858,7 +934,8 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     collect_out: Optional[List[int]] = None,
                     evict_interval_steps: Optional[int] = None,
                     oom_backoff: bool = True,
-                    min_block_steps: int = 4) -> SpecResult:
+                    min_block_steps: int = 4,
+                    evict_schedule: Optional[bool] = None) -> SpecResult:
     """Full speculative decode of ONE pure-forward program.
 
     1) draft the whole stream with the reference VM (zero forwards);
@@ -888,7 +965,8 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                        mask=mask, stats=stats, fast=fast, block_moe=block_moe,
                        collect_out=collect_out,
                        evict_interval_steps=evict_interval_steps,
-                       oom_backoff=oom_backoff, min_block_steps=min_block_steps)
+                       oom_backoff=oom_backoff, min_block_steps=min_block_steps,
+                       evict_schedule=evict_schedule)
     naive = draft.step_count
     speedup = (naive / vr.forwards) if vr.forwards else float("inf")
     if not vr.all_matched:
