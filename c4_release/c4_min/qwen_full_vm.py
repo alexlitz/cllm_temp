@@ -57,6 +57,7 @@ head = 6 ≤ 14, all in KV-group 0 of the 14/2 GQA (``repeat_kv`` broadcasts it)
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -84,6 +85,41 @@ from .nibble_vm import S, RELU_S, SILU_S, SILU_HALF, _empty_spec
 # so SP/BP recompose error < 0.1 (snaps exact) and all small lanes are unperturbed.
 NORM_K = 1e8
 ROPE_THETA = 1_000_000.0
+
+
+# ---------------------------------------------------------------------------
+# ALU wiring flags (all default to the SHALLOWER, byte-exact modules; each is a
+# kill-switch back to the older/general path).  See docs/FLAG_REGISTRY.md.
+# ---------------------------------------------------------------------------
+def _div_longdiv() -> bool:
+    """DIV/MOD path selector.  DEFAULT OFF -> the fp32-byte-exact radix-16
+    digit-recurrence divide (``div_radix16_hardened``, 88 blocks).  ON
+    (``C4_DIV_LONGDIV=1``) -> the base-16 long-division fallback
+    (``nibble_alu32.compile_divmod_blocks``, ~262 blocks) — retained as an escape
+    hatch for the retired log-sink regression."""
+    return os.environ.get("C4_DIV_LONGDIV", "0") == "1"
+
+
+def _kb_batched_prefix() -> bool:
+    """KB-precompute (``k*b`` normalise) resolve selector, shared by the
+    long-division fallback + the KB threshold table.  DEFAULT ON -> the batched
+    base-16 Kogge-Stone parallel prefix (``div_kb_lookahead``, ~9 blocks).  OFF
+    (``C4_KB_BATCHED=0``) -> the historical 15x6 serial ripple (~92 blocks)."""
+    return os.environ.get("C4_KB_BATCHED", "1") != "0"
+
+
+def _width_narrow() -> bool:
+    """Static width-narrowing of ALU ops (``width_narrow.infer_widths`` +
+    narrowed builders).  DEFAULT OFF (``C4_WIDTH_NARROW=1`` to enable) — the
+    biggest behaviour change; wired but deferred to the GPU byte-exact run."""
+    return os.environ.get("C4_WIDTH_NARROW", "0") == "1"
+
+
+def _const_operand() -> bool:
+    """Constant-operand fast paths for MUL/DIV/MOD (``const_mul`` / const-divisor
+    ``const_divmod_digitrec``).  DEFAULT OFF (``C4_CONST_OPERAND=1`` to enable) —
+    wired as a detection hook; deferred to the GPU byte-exact run."""
+    return os.environ.get("C4_CONST_OPERAND", "0") == "1"
 QWEN_HEAD_DIM = 64
 
 # stock Qwen2.5-0.5B residual / FFN / layer / head budget (the fit ceiling).
@@ -196,10 +232,19 @@ class QwenFullLayout:
         # ``div_logsink`` is retained (always resolves False) only so callers passing
         # the historical kwarg do not error.
         self.div_logsink = False
+        # DIV/MOD default = the fp32-byte-exact radix-16 digit-recurrence divide
+        # (``div_radix16_hardened``, 88 blocks); ``C4_DIV_LONGDIV=1`` falls back to
+        # the base ALU long division (~262 blocks).  The radix-16 divide reads the
+        # SAME operands (AX=B, STACK0=A) and (via a copy block) writes the SAME
+        # ``L.ALU32.DIV_RES / MOD_RES`` the ax-mux reads, so the ax-mux is unchanged.
+        self.div_radix16 = bool(efficient_alu and subset.muldiv and not _div_longdiv())
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
             _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod,
                                        shift_via_mul=self.shift_via_mul)
+            if self.div_radix16:
+                from . import div_radix16_hardened as _DR
+                _DR.extend_layout(L)   # allocate the LEANDIV scratch bands (pads L.D)
         # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
         # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
         # bands.  On (DEFAULT) the program lives in these code frames (fetch@PC);
@@ -549,17 +594,27 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
         specs.append(("alu-expand", A.compile_expand(L, dim)))
         for name, spec in A.compile_mul_blocks(L, dim):
             specs.append((name, spec))
+        # DIV/MOD builder selection.  When the layout carries the LEANDIV bands
+        # (radix-16 default, allocated by QwenFullLayout unless C4_DIV_LONGDIV=1)
+        # route DIV/MOD through the fp32-byte-exact radix-16 digit-recurrence
+        # divide (88 blocks) instead of the base ALU long division (~262).  Both
+        # write the shared L.ALU32.DIV_RES/MOD_RES the ax-mux reads (radix-16 via
+        # its result-copy block), so the ax-mux + housekeeping are unchanged.
+        if getattr(L, "LEANDIV", None) is not None and not _div_longdiv():
+            from . import div_radix16_hardened as DIVMOD
+        else:
+            DIVMOD = A
         div_start = len(specs)
         div_apply = []
         if recurrent_divmod:
-            unique, apply_names = A.compile_divmod_blocks_recurrent(L, dim)
+            unique, apply_names = DIVMOD.compile_divmod_blocks_recurrent(L, dim)
             name_to_idx = {}
             for name, spec in unique:
                 name_to_idx[name] = len(specs)
                 specs.append((name, spec))
             div_apply = [name_to_idx[n] for n in apply_names]
         else:
-            for name, spec in A.compile_divmod_blocks(L, dim):
+            for name, spec in DIVMOD.compile_divmod_blocks(L, dim):
                 div_apply.append(len(specs))
                 specs.append((name, spec))
         div_end = len(specs)
@@ -603,6 +658,110 @@ def _alu_housekeeping_rules(L, ops):
     sp, pc = L.SP_VAL, L.PC_VAL
     return [FFNRule([(L.OP_IS + op, 0.5, 1.5)],
                     {sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}) for op in ops]
+
+
+# ---------------------------------------------------------------------------
+# (3) WIDTH-NARROWING HOOK  (flag: C4_WIDTH_NARROW, default OFF)
+# (4) CONSTANT-OPERAND FAST-PATH HOOK  (flag: C4_CONST_OPERAND, default OFF)
+#
+# These two are PROGRAM-SPECIFIC optimisations: they need a compile-time-known
+# operand width / constant operand, which the UNIVERSAL qwen_full_vm build (the
+# program lives in KV §Memory, fetched at PC; the ALU blocks are baked ONCE,
+# program-independent) does not have.  So they cannot be a drop-in swap in the
+# universal ``_block_specs`` divmod path the way (1)/(2) are — they belong to a
+# PROGRAM-SPECIFIC depth-unrolled compile.
+#
+# Per the integration brief ("if too invasive to wire cleanly without a model
+# build, write the hook + the flag and flag it as needing the deferred test"),
+# these are wired as DETECTION + ROUTING-PLAN hooks: given a program (and, for a
+# per-site const operand, its constant-propagated operands), they return the list
+# of ALU sites to route to the narrowed / const-operand gadget and the builder to
+# call.  A program-specific compiler consumes the plan; the universal build leaves
+# the general ALU blocks in place.  Both DEFAULT OFF -> zero effect until the
+# deferred GPU byte-exact run wires the plan into the unrolled compile.
+# ---------------------------------------------------------------------------
+def plan_narrow_ops(program, mask_nibbles: int = 8) -> Optional[dict]:
+    """(3) Width-narrowing routing plan for a program (flag ``C4_WIDTH_NARROW``).
+
+    Returns ``None`` when the flag is OFF (the default).  When ON, runs
+    ``width_narrow.infer_widths`` and returns, per narrowable ALU site, the
+    inferred ``(wa, wb, w_result)`` and the ``width_narrow`` builder to call so an
+    op with statically-bounded operands is built at its inferred width instead of
+    the full 8-nibble gadget::
+
+        {"sites": [ {pc, op, wa, wb, w_result, builder}, ... ],
+         "ax_widths": [...], "mask_nibbles": mask_nibbles}
+
+    ``builder`` is a ``(op, wa, wb) -> callable(L, dim) -> (blocks, res_band, info)``
+    selector over ``width_narrow.build_{mul,add,sub,div,mod,cmp}``.  DEFERRED: a
+    program-specific unrolled compile consumes this plan; the universal build does
+    not (its ALU blocks are program-independent)."""
+    if not _width_narrow():
+        return None
+    from . import width_narrow as WN
+    wi = WN.infer_widths(program, mask_nibbles=mask_nibbles)
+
+    def _builder_for(op_name):
+        return {
+            "MUL": lambda L, dim, wa, wb: WN.build_mul(L, dim, wa, wb),
+            "ADD": lambda L, dim, wa, wb: WN.build_add(L, dim, max(wa, wb)),
+            "SUB": lambda L, dim, wa, wb: WN.build_sub(L, dim, max(wa, wb)),
+            "DIV": lambda L, dim, wa, wb: WN.build_div(L, dim, wa),
+            "MOD": lambda L, dim, wa, wb: WN.build_mod(L, dim, wb),
+        }.get(op_name)
+
+    sites = []
+    for s in wi["alu_sites"]:
+        b = _builder_for(s["op"])
+        if b is None:
+            continue                            # cmp/bitwise: not narrowed here
+        sites.append({**s, "builder": b})
+    return {"sites": sites, "ax_widths": wi["ax_widths"],
+            "mask_nibbles": wi["mask_nibbles"]}
+
+
+def plan_const_operand_ops(program) -> Optional[dict]:
+    """(4) Constant-operand fast-path routing plan (flag ``C4_CONST_OPERAND``).
+
+    Returns ``None`` when the flag is OFF (the default).  When ON, scans the
+    bytecode for MUL/DIV/MOD sites whose second operand (AX = ``b``) is a
+    compile-time constant (an ``IMM k`` immediately before the op — the simplest,
+    always-safe const-propagation window) and routes them to the specialised
+    gadget: const-multiplier (``const_mul.build_const_mul``) for MUL, const-divisor
+    digit-recurrence (``const_divmod_digitrec.build_const_divmod_digitrec``) for
+    DIV/MOD.  Returns::
+
+        {"sites": [ {pc, op, const, builder}, ... ]}
+
+    ``builder`` closes over the constant so the caller only supplies the layout.
+    DEFERRED: a program-specific unrolled compile consumes the plan; the universal
+    build leaves the general MUL/DIV/MOD blocks in place."""
+    if not _const_operand():
+        return None
+    from . import const_mul as CM
+    from . import const_divmod_digitrec as CD
+    code = isa.assemble(program) if program and not hasattr(program[0], "op") else list(program)
+    sites = []
+    prev_imm = None
+    for pc, ins in enumerate(code):
+        op = ins.op
+        if op == isa.IMM:
+            prev_imm = int(ins.imm)
+        elif op in (isa.MUL, isa.DIV, isa.MOD) and prev_imm is not None:
+            k = prev_imm
+            if op == isa.MUL:
+                builder = (lambda L, dim, kk=k: CM.build_const_mul(L, dim, kk))
+            else:                               # DIV / MOD share the const-divisor circuit
+                builder = (lambda kk=k: CD.build_const_divmod_digitrec(kk))
+            sites.append({"pc": pc, "op": isa.NAMES.get(op, op), "const": k,
+                          "builder": builder})
+            prev_imm = None
+        else:
+            # any op that overwrites AX (or a PSH consuming AX) breaks the IMM->op
+            # const window; conservatively drop the tracked constant.
+            if op not in (isa.PSH,):
+                prev_imm = None
+    return {"sites": sites}
 
 
 def compile_opcode_decode_full(L, dim):

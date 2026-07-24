@@ -84,8 +84,13 @@ from .nibble_vm_layout import NibbleVMLayout
 
 
 def _set_one(L):
-    """The nibble_alu32 emitters read a MODULE-GLOBAL ``_ONE``; set it there."""
-    import c4_min.nibble_alu32 as m
+    """The nibble_alu32 emitters read a MODULE-GLOBAL ``_ONE``; set it there.
+
+    Uses the RELATIVE import (same package this module lives in) so it resolves
+    identically whether the package is imported as ``c4_min`` (test path) or
+    ``c4_release.c4_min`` (repo-relative path) — the production qwen_full_vm build
+    imports it via the latter."""
+    from . import nibble_alu32 as m
     m._ONE = L.ONE
 
 
@@ -515,6 +520,58 @@ def compile_lean_divmod_blocks_recurrent(L, dim, n_iters: int = 8):
     for _ in range(n_iters):
         apply_names += [n for n, _ in body]
     apply_names.append("lean-finalize")
+    return unique, apply_names
+
+
+# ===========================================================================
+# 5b. Production-drop-in wiring (qwen_full_vm): write the result into the SAME
+#     ``L.ALU32.DIV_RES / MOD_RES`` bands the ``compile_ax_mux`` reads, so the
+#     radix-16 divide is a byte-for-byte substitute for
+#     ``nibble_alu32.compile_divmod_blocks`` (which also reads AX=B, STACK0=A
+#     and writes ALU32.DIV_RES/MOD_RES).  The radix-16 blocks compute onto the
+#     private LEANDIV.DIV_RES/MOD_RES; ONE tiny copy block relays those into the
+#     shared ALU32 result bands (the ax-mux is left untouched).
+# ===========================================================================
+def _lean_to_alu32_result_copy_block(L, dim) -> Dict[str, torch.Tensor]:
+    """SET ``ALU32.DIV_RES[c] = LEANDIV.DIV_RES[c]`` and ``ALU32.MOD_RES[c] =
+    LEANDIV.MOD_RES[c]`` for the 8 result nibbles.  Both source bands already
+    honour ``b == 0 -> (0, 0)`` (the finalize multiplied by ``1 - BZ``), so this
+    is a pure relay."""
+    a_lean = L.LEANDIV
+    a_alu = L.ALU32
+    spec = _empty_spec(dim, 8 * 4)
+    u = 0
+    for c in range(8):
+        u = _clear(spec, u, a_alu.DIV_RES + c)
+        u = _ident(spec, u, {a_lean.DIV_RES + c: 1.0}, 0.0, a_alu.DIV_RES + c, 1.0)
+        u = _clear(spec, u, a_alu.MOD_RES + c)
+        u = _ident(spec, u, {a_lean.MOD_RES + c: 1.0}, 0.0, a_alu.MOD_RES + c, 1.0)
+    return _truncate(spec, u, dim)
+
+
+def compile_divmod_blocks(L, dim):
+    """Radix-16 UNROLLED drop-in for ``nibble_alu32.compile_divmod_blocks``.
+
+    Same operand/result contract (AX=B divisor, STACK0=A dividend, results into
+    the shared ``L.ALU32.DIV_RES / MOD_RES``), same fp32-byte-exact semantics,
+    88 blocks instead of the base ALU's ~262.  Requires ``extend_layout(L)`` to
+    have been called (allocates the LEANDIV scratch bands) AND ``L.ALU32`` to be
+    present (the shared result bands the ax-mux reads)."""
+    blocks = list(compile_lean_divmod_blocks(L, dim))
+    blocks.append(("lean-result-copy", _lean_to_alu32_result_copy_block(L, dim)))
+    return blocks
+
+
+def compile_divmod_blocks_recurrent(L, dim, n_iters: int = 8):
+    """Radix-16 RECURRENT drop-in for ``nibble_alu32.compile_divmod_blocks_recurrent``.
+
+    Returns ``(unique_blocks, apply_names)``; the single reused iteration body is
+    stored once and applied ``n_iters`` times, then the finalize + the
+    ALU32-result relay.  The relay is applied ONCE (after the last iteration), so
+    it is a unique block that appears exactly once in ``apply_names``."""
+    unique, apply_names = compile_lean_divmod_blocks_recurrent(L, dim, n_iters=n_iters)
+    unique = list(unique) + [("lean-result-copy", _lean_to_alu32_result_copy_block(L, dim))]
+    apply_names = list(apply_names) + ["lean-result-copy"]
     return unique, apply_names
 
 
