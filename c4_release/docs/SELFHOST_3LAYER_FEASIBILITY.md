@@ -213,3 +213,74 @@ the real 64 GB VM — do **not** run it under memory pressure.
 - `c4_min/selfhost/onnx_kernel_c4subset.c` — c4-subset fixed-point MatMul kernel.
 - `c4_min/selfhost/onnx_runtime_fixedpoint_coo.c` — int-only runtime + COO load.
 - `c4_min/selfhost/run_selfhost_feasibility.py` — the measured feasibility driver.
+
+---
+
+## Update (2026-07-24): the WHOLE runtime now compiles under c4 + the grounded whole-forward step count
+
+The 2026-07-20 map reported only the **matmul kernel** self-hosting and left the
+full runtime as "not c4-compilable" + the non-matmul cost extrapolated. Both gaps
+are now closed with measured, reproducible artifacts:
+
+### 1. Every non-matmul op is in the c4 subset, byte-exact
+`c4_min/selfhost/_nonmatmul_ops_src.py` re-expresses every non-matmul ONNX op the
+tiny forward needs in the actual c4 subset (int-only, no `long`, no array decls,
+malloc-free locals-only byte-safe walk, no macros/expr-bounds).
+`test_nonmatmul_self_emulation.py` (19 checks):
+- **12 ops byte-exact through the real byte-masking DRAFT VM** (`ref_interpret`):
+  add, sub, mul, div, reduce_max, reduce_sum, gather, transpose, abs, neg, clip,
+  reshape/identity.
+- **exp / sigmoid / softmax** compile under c4 + are byte-exact on a full-word VM
+  (`refword_interpret`) + match `math.exp` within fixed-point tolerance. Their
+  internal scale (>255) overflows the draft VM's **byte store** — the honest
+  byte-machine boundary (the draft VM masks every SI/IMM/LEA to a byte; any
+  stored intermediate > 255 truncates).
+
+### 2. The WHOLE runtime compiles under c4
+`c4_min/selfhost/onnx_runtime_c4subset.c` rewrites the shipped
+`onnx_runtime_fixedpoint_coo.c` into the c4 grammar: `long`→`int`, 2-D/3-D global
+arrays→flattened 1-D malloc'd globals, `exp_tbl[EXP_STEPS+1]`→malloc'd pointer,
+macros→plain int globals, and — crucially — the loader uses the **`open`/`read`/
+`close` syscalls** (which ARE in the c4 subset), not the stdio `fopen`/`fread`/
+`fscanf` that blocked the shipped runtime. **All 29 functions compile** (5520
+bytecode words). The node dispatcher + 16 op cores RUN byte-exact vs numpy on the
+full-word VM (`test_runtime_c4subset_run.py`), and the c4-subset `load()` reads the
+**real** tiny `c4vm.onnx` `.nblbin` (45942 bytes) and reconstructs its header +
+node ops byte-exact vs `nbl_bin_interp.Graph`.
+
+### 3. The GROUNDED whole-forward draft-VM step count (the real Rel-1 number)
+`c4_min/selfhost/measure_whole_forward_steps.py` measures the draft-VM
+steps/element rate of **every** op (matmul + non-matmul) with the byte-exact
+self-host kernels, then walks the tiny model's real 153-node list:
+
+| portion | grounded draft-VM steps |
+|---|---|
+| MatMul | 51,551,552 |
+| **Non-matmul** (previously extrapolated) | **4,866,969** (8.6% of total) |
+| **WHOLE FORWARD** | **56,418,521** |
+
+vs the 2026-07-20 matmul-only extrapolation (~48M); the non-matmul portion is now
+**measured**, not guessed. Reference argmax on `[1,2,42,3]` = **`[0,1,20,3]`** (the
+byte-exact target from `nbl_bin_interp.Graph.run`).
+
+The whole forward cannot run as one monolithic byte-exact `ref_interpret` (tensor
+values > 255 overflow the byte store; the malloc heap exceeds the LEA byte window;
+and 56M steps is hours of pure Python) — so the number is a grounded **sum of
+measured per-op byte-exact rates**, each op validated byte-exact individually.
+Same methodology as `measure_matmul_steps_per_mac.py`, now covering non-matmul.
+
+### Honest boundary (int vs long precision)
+`onnx_runtime_c4subset.c` uses a **small** fixed-point SCALE (2^4) so a K-length
+dot product does not overflow 32-bit `int` — the shipped runtime uses `long`
+(64-bit) precisely to hold SCALE=2^16 products. The c4 *grammar* is now fully
+satisfied; a 64-bit-accurate int build would carry two 32-bit limbs per value (the
+`test_two_limb_fp32.py` path). This port demonstrates c4-grammar self-hosting of
+the whole runtime, not the 64-bit precision.
+
+### New files / tests
+- `c4_min/selfhost/_nonmatmul_ops_src.py` — c4-subset non-matmul ops + numpy refs
+  + `refword_interpret` (full-word VM with file-backed open/read/close).
+- `c4_min/selfhost/onnx_runtime_c4subset.c` — the WHOLE runtime in the c4 subset.
+- `c4_min/selfhost/measure_whole_forward_steps.py` — grounded whole-forward steps.
+- `test_nonmatmul_self_emulation.py` / `test_runtime_c4subset_compiles.py` /
+  `test_runtime_c4subset_run.py` / `test_whole_forward_steps.py` (37 new checks).
