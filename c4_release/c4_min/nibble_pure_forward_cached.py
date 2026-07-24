@@ -1004,6 +1004,20 @@ class BlockKVCacheBatched:
         self._global_head_idx: Optional[torch.Tensor] = None   # [Hg] long
         self._local_head_idx: Optional[torch.Tensor] = None    # [Hl] long
         self._local_window: Optional[int] = None
+        # -- CONTENT-BOUND global-head retention (opt-in; None = full history) -----
+        # Each GLOBAL head (memory-CAM / stack-pop / LEV) is an address-CAM that
+        # keys ONLY ``IS_STORE`` positions with a role-gate penalty (channel
+        # ``cR = ADDR_BITS+1`` in its head slice: a store row keys ~0 there, a
+        # non-store row keys ``-p`` = the huge PEN_GATE, so a load/pop/lev query
+        # scores ``-PEN`` on it -> softmax1 weight EXACTLY 0).  So a global head can
+        # only ever attend to STORE frames; register/code/other frames are provably
+        # inert and droppable BYTE-IDENTICALLY.  When ``_content_bound`` is set, the
+        # global-head commit keeps only the store rows the global heads can attend
+        # to -> the global cache is bounded by the WORKING SET (distinct live store
+        # addresses, after latest-write-wins eviction dedups superseded stores), NOT
+        # by step count.  ``_content_cR`` is the store-role gate channel index.
+        self._content_bound: bool = False
+        self._content_cR: Optional[int] = None
         # local-head cache (trimmed to last W positions).  self.K/V/pos above hold
         # ONLY the GLOBAL heads when split is active (so eviction only touches them).
         self.Kl: Optional[torch.Tensor] = None     # [1,Hl,Sl,HD]
@@ -1015,7 +1029,9 @@ class BlockKVCacheBatched:
         """True iff this cache is running the drop-KV local/global head split."""
         return self._local_window is not None
 
-    def set_head_groups(self, global_head_idx, local_window: int) -> None:
+    def set_head_groups(self, global_head_idx, local_window: int,
+                        content_bound: bool = False,
+                        content_cR: Optional[int] = None) -> None:
         """Enable the DROP-KV split: ``global_head_idx`` heads keep the FULL causal
         KV, every other head is LOCAL and keeps only the last ``local_window``
         ABSOLUTE positions (OLD rows DROPPED, not masked).
@@ -1024,6 +1040,16 @@ class BlockKVCacheBatched:
         the window is exactly 0 (softmax1 + huge exact-match/role scores + ALiBi
         recency drive the tail to ZFOD; measured window <= 28 tok < one 30-token VM
         step, W=64 is >2 steps), so the dropped rows contribute exactly 0.
+
+        ``content_bound`` (default False) additionally bounds the GLOBAL cache BY
+        CONTENT: each global head is an address-CAM that keys ONLY ``IS_STORE``
+        positions (channel ``content_cR = ADDR_BITS+1`` in its head slice: a store
+        row keys ~0 there, a non-store row keys ``-p`` = PEN_GATE, so a load query
+        scores ``-PEN`` on it -> softmax1 weight EXACTLY 0).  So a non-store frame is
+        provably inert for every global head and is dropped on commit, byte-
+        identically.  Combined with the latest-write-wins eviction (which dedups
+        superseded stores per address), the global cache is bounded by the WORKING
+        SET (distinct live addresses), NOT step count -> total KV runtime-independent.
         """
         dev = self.slopes.device
         g = torch.as_tensor(sorted(int(h) for h in global_head_idx),
@@ -1034,6 +1060,8 @@ class BlockKVCacheBatched:
         self._global_head_idx = g
         self._local_head_idx = l
         self._local_window = int(local_window)
+        self._content_bound = bool(content_bound)
+        self._content_cR = (int(content_cR) if content_cR is not None else None)
 
     def _trim_local(self) -> None:
         """Drop LOCAL-head cached rows older than the window (keep last W positions
@@ -1098,12 +1126,65 @@ class BlockKVCacheBatched:
         if g.numel() > 0:
             Kg_new = K_new.index_select(1, g)
             Vg_new = V_new.index_select(1, g)
+            if self._content_bound:
+                # CONTENT-BOUND: keep ONLY the store rows the global heads can ever
+                # attend to (a non-store row's role-gate key -> softmax1 weight 0,
+                # so dropping it is BYTE-IDENTICAL).  This bounds the global cache by
+                # the working set of live addresses instead of by step count.
+                keep = self._global_content_keep(Kg_new[0])   # [W'] bool over new rows
+                if not bool(keep.all()):
+                    keep_idx = torch.nonzero(keep, as_tuple=False).flatten()
+                    dropped = int(keep.numel() - keep_idx.numel())
+                    Kg_new = Kg_new.index_select(2, keep_idx)
+                    Vg_new = Vg_new.index_select(2, keep_idx)
+                    pos_new_g = pos_new.index_select(0, keep_idx)
+                    self.total_evicted += dropped
+                else:
+                    pos_new_g = pos_new
+            else:
+                pos_new_g = pos_new
+            if Kg_new.shape[2] == 0:
+                return                       # nothing store-attendable in this span
             if self.K is None:
-                self.K, self.V, self.pos = Kg_new, Vg_new, pos_new
+                self.K, self.V, self.pos = Kg_new, Vg_new, pos_new_g
             else:
                 self.K = torch.cat([self.K, Kg_new], dim=2)
                 self.V = torch.cat([self.V, Vg_new], dim=2)
-                self.pos = torch.cat([self.pos, pos_new], dim=0)
+                self.pos = torch.cat([self.pos, pos_new_g], dim=0)
+
+    def _global_content_keep(self, Kg: torch.Tensor) -> torch.Tensor:
+        """Return a ``[S]`` bool mask of the rows a GLOBAL head can EVER attend to.
+
+        ``Kg`` is ``[Hg, S, HD]`` — the global heads' projected keys.  Each global
+        head is an address-CAM whose store-role gate channel ``cR = ADDR_BITS+1``
+        (``self._content_cR``) keys a STORE row at ~0 and a NON-STORE row at ``-p``
+        (``p = sqrt(PEN_GATE/hs)`` >> 0): a load/pop/lev query keys ``+p`` there, so a
+        non-store row's score is ``p*(-p)*hs = -PEN`` and its softmax1 weight is
+        EXACTLY 0.  So a row is attendable iff its ``cR`` key is NOT the ``-p`` gate,
+        i.e. ``Kg[:, :, cR] > -p/2`` — the clean bimodal split (store ~0 vs -p).
+
+        A row is kept iff ANY global head can attend to it (all three global heads
+        share the SAME store-role gate structure, so this is a union == per-head).
+        ``p`` is inferred from the data (max gate magnitude) so no build constant is
+        hardcoded — the threshold sits strictly between the two modes (0 and -p).
+        """
+        cR = self._content_cR
+        if cR is None:
+            # Fallback: no cR channel given -> keep everything (no content drop).
+            return torch.ones(Kg.shape[1], dtype=torch.bool, device=Kg.device)
+        gate = Kg[:, :, cR]                             # [Hg, S]  store~0 / nonstore~-p
+        # p (the gate magnitude) = the largest -gate seen; threshold at -p/2 sits
+        # strictly between the store mode (0) and the non-store mode (-p).  If NO
+        # non-store row is present in this span (p ~ 0, gate all ~0), the split is
+        # undecidable so we conservatively keep every row (byte-safe: at worst we
+        # retain an already-store row, never drop an attendable one).
+        p = (-gate).clamp(min=0.0).max()
+        if float(p) <= 0.0:
+            return torch.ones(Kg.shape[1], dtype=torch.bool, device=Kg.device)
+        thr = -0.5 * p
+        # attendable for a head iff its gate is above the threshold (store row).
+        attendable = gate > thr                        # [Hg, S]
+        return attendable.any(dim=0)                    # [S] union across global heads
 
     def size(self) -> int:
         # For a split cache this is the GLOBAL-head cache size (the only cache

@@ -433,14 +433,18 @@ def run_bench(kind: str, args) -> int:
         from .local_attention import install_local_attention
         drop_kv = not args.local_mask_only
         la = install_local_attention(sparse, window=args.local_window,
-                                     drop_local_kv=drop_kv, verbose=True)
+                                     drop_local_kv=drop_kv,
+                                     content_bound_global=args.content_bound_global,
+                                     verbose=True)
         mode = "DROP-KV" if drop_kv else "MASK-ONLY"
+        cb = ("  +CONTENT-BOUND global (store-only cache, working-set bounded)"
+              if args.content_bound_global else "")
         print(f"  LOCAL-ATTN [{mode}]: window={la['window']}  "
               f"windowed {la['frac_windowed']*100:.1f}% of head-slots  "
               f"({la['n_global_head_slots']} global, {la['n_local_head_slots']} local)"
               + ("  -> local heads keep only last-W KV (cache ~Hg·S + Hl·W)"
-                 if drop_kv else "  -> full KV kept, windowed READ only (compute win)"),
-              flush=True)
+                 if drop_kv else "  -> full KV kept, windowed READ only (compute win)")
+              + cb, flush=True)
 
     # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
     #    (K vs amortized ms/step vs peak-VRAM vs forwards vs GPU-util). ---------
@@ -665,6 +669,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="with --local-window: keep the FULL KV cache and only WINDOW "
                          "the local heads' softmax read (compute win, no VRAM win). "
                          "The fallback for the default DROP-KV behavior.")
+    ap.add_argument("--content-bound-global", action="store_true",
+                    help="with --local-window (DROP-KV): bound the GLOBAL "
+                         "(memory/stack/LEV) cache BY CONTENT — each global head is "
+                         "an address-CAM that keys ONLY store frames (a non-store "
+                         "frame's role-gate key -> softmax1 weight 0), so its cache "
+                         "keeps only store rows, bounded by the WORKING SET (distinct "
+                         "live addresses, after latest-write-wins eviction), NOT step "
+                         "count.  Byte-identical.  Makes the TOTAL KV runtime-"
+                         "independent (the 2.4M-step self-emulation at constant mem).")
     args = ap.parse_args(argv)
     if args.kind == "mandel":
         if len(args.grid) < 3:
