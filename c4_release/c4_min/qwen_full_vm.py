@@ -100,6 +100,31 @@ def _div_longdiv() -> bool:
     return os.environ.get("C4_DIV_LONGDIV", "0") == "1"
 
 
+def _div_lean() -> bool:
+    """Radix-16 divide VARIANT selector (only takes effect on the radix-16 path,
+    i.e. when NOT ``C4_DIV_LONGDIV``).  DEFAULT ON (``C4_DIV_LEAN`` unset or ``1``)
+    -> the LEAN radix-16 digit-recurrence divide (``div_radix16_lean``, 80 blocks:
+    3-limb ``16^p``-recompose borrow) — the SHALLOWEST byte-exact divide.  OFF
+    (``C4_DIV_LEAN=0``) -> the HARDENED radix-16 variant (``div_radix16_hardened``,
+    88 blocks: nibble-lane Kogge-Stone borrow), retained as the escape hatch.
+
+    The DEFAULT was flipped from hardened to lean after the lean variant was
+    proven byte-exact IN-VM through the real fused Qwen forward: the 8-bit-IMM
+    DIV/MOD grid (288/288, dividends over byte edges + spread, divisors incl b==0)
+    matched the hardened control 288/288, and ``pytest -k muldiv`` passed under
+    both.  The c4 ISA feeds 8-bit immediates, so the lean variant's documented
+    fp32 residue floor on the LARGE-divisor 32-bit adversarial classes (why the
+    +8-block hardening exists standalone) is NOT exercised on this path; the
+    escape hatch (``C4_DIV_LEAN=0``) restores the hardened variant for any wide
+    divisor use.
+
+    The two variants allocate DIFFERENT LEANDIV scratch bands (lean B0/B1/RV vs
+    hardened G0/P0/G1/P1), so this flag MUST be read identically at layout-extend
+    time and builder time (both in ``QwenFullLayout`` and ``build``/``_block_specs``)
+    or ``L.D`` and the built blocks disagree."""
+    return os.environ.get("C4_DIV_LEAN", "1") != "0"
+
+
 def _kb_batched_prefix() -> bool:
     """KB-precompute (``k*b`` normalise) resolve selector, shared by the
     long-division fallback + the KB threshold table.  DEFAULT ON -> the batched
@@ -233,17 +258,26 @@ class QwenFullLayout:
         # the historical kwarg do not error.
         self.div_logsink = False
         # DIV/MOD default = the fp32-byte-exact radix-16 digit-recurrence divide
-        # (``div_radix16_hardened``, 88 blocks); ``C4_DIV_LONGDIV=1`` falls back to
-        # the base ALU long division (~262 blocks).  The radix-16 divide reads the
-        # SAME operands (AX=B, STACK0=A) and (via a copy block) writes the SAME
-        # ``L.ALU32.DIV_RES / MOD_RES`` the ax-mux reads, so the ax-mux is unchanged.
+        # (``div_radix16_lean``, 80 blocks — the DEFAULT since the lean grid was
+        # proven byte-exact in-VM; ``C4_DIV_LEAN=0`` selects the 88-block hardened
+        # variant); ``C4_DIV_LONGDIV=1`` falls back to the base ALU long division
+        # (~262 blocks).  The radix-16 divide reads the SAME operands (AX=B,
+        # STACK0=A) and (via a copy block) writes the SAME ``L.ALU32.DIV_RES /
+        # MOD_RES`` the ax-mux reads, so the ax-mux is unchanged.
         self.div_radix16 = bool(efficient_alu and subset.muldiv and not _div_longdiv())
         if efficient_alu and subset.muldiv:
             from . import nibble_alu32 as _A
             _A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod,
                                        shift_via_mul=self.shift_via_mul)
             if self.div_radix16:
-                from . import div_radix16_hardened as _DR
+                # LEAN (80 blocks, DEFAULT) vs HARDENED (88 blocks, C4_DIV_LEAN=0).
+                # The two allocate DIFFERENT LEANDIV bands, so the SAME module's
+                # extend_layout must run here AND at builder time (build/_block_specs)
+                # or L.D and the built blocks disagree.
+                if _div_lean():
+                    from . import div_radix16_lean as _DR
+                else:
+                    from . import div_radix16_hardened as _DR
                 _DR.extend_layout(L)   # allocate the LEANDIV scratch bands (pads L.D)
         # CODE-FROM-MEMORY bands: attach a fixed-width (code_size-INDEPENDENT) code
         # §Memory CAM key/query + value onto the pure-forward layout, BEFORE the CAM
@@ -596,12 +630,18 @@ def _block_specs(L, code_size, subset, efficient_alu=True,
             specs.append((name, spec))
         # DIV/MOD builder selection.  When the layout carries the LEANDIV bands
         # (radix-16 default, allocated by QwenFullLayout unless C4_DIV_LONGDIV=1)
-        # route DIV/MOD through the fp32-byte-exact radix-16 digit-recurrence
-        # divide (88 blocks) instead of the base ALU long division (~262).  Both
-        # write the shared L.ALU32.DIV_RES/MOD_RES the ax-mux reads (radix-16 via
-        # its result-copy block), so the ax-mux + housekeeping are unchanged.
+        # route DIV/MOD through the fp32 radix-16 digit-recurrence divide instead
+        # of the base ALU long division (~262).  Two radix-16 variants: LEAN
+        # (80 blocks, DEFAULT) or HARDENED (88 blocks, C4_DIV_LEAN=0).  The variant MUST
+        # match the one QwenFullLayout used to extend_layout (its bands differ), so
+        # the same _div_lean() gate selects the builder module here.  Both write the
+        # shared L.ALU32.DIV_RES/MOD_RES the ax-mux reads (via their result-copy
+        # block), so the ax-mux + housekeeping are unchanged.
         if getattr(L, "LEANDIV", None) is not None and not _div_longdiv():
-            from . import div_radix16_hardened as DIVMOD
+            if _div_lean():
+                from . import div_radix16_lean as DIVMOD
+            else:
+                from . import div_radix16_hardened as DIVMOD
         else:
             DIVMOD = A
         div_start = len(specs)
