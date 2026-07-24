@@ -33,6 +33,14 @@ measured ``steps/MAC`` is directly comparable to the draft VM's 101.
 CPU-only; the interpreter uses ``struct`` to fold each fp op to true IEEE-754
 single precision (identical to ``numpy.float32`` for finite values). numpy is
 used only by the tests / references.
+
+The vanilla BAKE of these ops (``FADD``/``FMUL``/``FLI``/``FSI`` as REAL weights
+inside the genuine ``blogspec_model.Transformer`` — softmax1 + ALiBi + SwiGLU +
+residual — so an fp32 MAC runs BYTE-THROUGH ``model.forward``) lives in
+``c4_min.native_fp32_baked`` (gated by ``C4_FP32_ALU``, default OFF; the integer
+VM golden is unaffected). This module remains the interpreter that MEASURES the
+steps/MAC; ``native_fp32_baked`` is the load-bearing "native fp32 is vanilla"
+proof.
 """
 from __future__ import annotations
 
