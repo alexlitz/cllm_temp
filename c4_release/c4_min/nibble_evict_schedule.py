@@ -81,7 +81,7 @@ class StoreEntry:
     addr: int               # the address it wrote (the content key on a mem head)
     val: int                # the value it stored (0 => a free/ZFOD zeroing row)
     evict_frame: Optional[int] = None   # frame at/after which this row is evictable
-    evict_reason: str = "live"          # "superseded" | "freed" | "live"
+    evict_reason: str = "live"          # "superseded" | "freed" | "popped" | "live"
 
 
 @dataclass
@@ -102,13 +102,15 @@ class EvictionSchedule:
     n_stores: int = 0
     n_superseded: int = 0
     n_freed: int = 0
+    n_popped: int = 0
     n_live: int = 0
 
 
 def build_eviction_schedule(draft, *, slope_min: float = None,
                             recency_eps: float = 1e-6,
                             zero_eps: float = 1e-9,
-                            supersession_only: bool = True) -> EvictionSchedule:
+                            supersession_only: bool = True,
+                            pop_free: Optional[bool] = None) -> EvictionSchedule:
     """Single O(stores + loads) liveness pass over the perfect draft.
 
     ``supersession_only`` (default True) is the BYTE-EXACT HYBRID mode: the schedule
@@ -224,6 +226,26 @@ def build_eviction_schedule(draft, *, slope_min: float = None,
                     e.evict_frame = freed_frame
                     e.evict_reason = "freed"
 
+    # 3b) POP-DRIVEN FREE (C4_STACK_POP_FREE, default OFF).  The stack is LIFO: on a
+    #     pop op (SP-increasing consumer — ADD/SUB/…/EQ/…/SI/SC pop one word; LEV
+    #     pops the frame; ADJ moves SP up) the popped slot is DEAD — its value has
+    #     been read into STACK0 and SP has moved above it, so NO future stack-head
+    #     query can address it again (a re-push would first bring SP back DOWN, which
+    #     is a NEW store row to that address that supersedes this one anyway).  The
+    #     content path keeps this row LIVE forever (a non-zero, non-superseded store
+    #     on a content-addressed head has a NO-OP recency horizon — see
+    #     ``nibble_kv_prune.prune`` ``content_addressed`` branch), so pop-driven free
+    #     is a STRICT super-set of the content path's store-survivor eviction.  It is
+    #     therefore NOT byte-identical by construction; it is byte-EXACT only because
+    #     the freed row is provably NEVER READ again (verified below + against the
+    #     draft's load log).  Gate: env ``C4_STACK_POP_FREE`` (arg overrides).
+    if pop_free is None:
+        import os
+        pop_free = os.environ.get("C4_STACK_POP_FREE", "0") \
+            not in ("0", "", "false", "False")
+    if pop_free:
+        _apply_pop_free(draft, entries, n_steps)
+
     # 4) tally + build the round-indexed drop map.
     for e in entries:
         if e.evict_frame is None:
@@ -233,9 +255,111 @@ def build_eviction_schedule(draft, *, slope_min: float = None,
             sched.n_superseded += 1
         elif e.evict_reason == "freed":
             sched.n_freed += 1
+        elif e.evict_reason == "popped":
+            sched.n_popped += 1
         sched.drop_at_frame.setdefault(e.evict_frame, []).append(e.position)
         sched.drop_position_at[e.position] = e.evict_frame
     return sched
+
+
+# ===========================================================================
+# POP-DRIVEN FREE — the structure-aware stack liveness pass (C4_STACK_POP_FREE).
+# ===========================================================================
+# Ops that CONSUME the stack top (pop one word, SP += 4) — the model's stack-head
+# query fires on exactly these (``IS_POP`` in ``nibble_pure_forward_complete``).
+_POP_OPS = frozenset({
+    "ADD", "SUB", "MUL", "DIV", "MOD",
+    "OR", "XOR", "AND", "SHL", "SHR",
+    "EQ", "NE", "LT", "GT", "LE", "GE",
+    "SI", "SC",
+})
+
+
+def _apply_pop_free(draft, entries: List[StoreEntry], n_steps: int) -> None:
+    """Mark each store-KV row DEAD at the step its slot is popped past the stack top.
+
+    Byte-EXACT (no reader after the free) is guaranteed by the SP timeline + the
+    draft's load log:
+
+      * A store to address ``A`` (frame ``fi``) is read by the STACK / LEV heads only
+        by the pop whose pre-step SP == A (its query is ``SP_QRY_BIN`` = the popped
+        address).  In the SP timeline the FIRST frame ``g > fi`` with ``sp[g] > A``
+        is exactly that consuming pop's frame (``sp[g]`` is the POST-pop SP).  The
+        pop AT ``g`` STILL reads the row (its query row is the frame BEFORE ``g``'s
+        frame is appended, i.e. it sees SP == A) — the a02e92ec caveat: **a freed PSH
+        row is live on the stack-head at the pop step itself**.  So the row survives
+        THROUGH ``g`` and is evictable only at ``g + 1``.
+      * The MEMORY head (LI/LC) can address ANY slot at ANY step (its query is the
+        arbitrary AX value).  So if the draft's ``load_log`` shows a LI/LC of ``A``
+        after the pop (and before this row is superseded), the row must live to that
+        load; we push the free frame past the last such load.
+
+    The row's ``evict_frame`` is set to the EARLIER of its existing (supersession)
+    frame and this pop-free frame — never later, so pop-free only ever frees rows
+    SOONER than the content path (which never frees a live store at all).
+
+    Complexity: the per-store "first frame with SP>addr" scan is bounded by the
+    store's LINGER window (it breaks at the consuming pop, ~a few frames later on a
+    tight push/pop loop), so the pass is O(stores * mean-linger) in practice — a
+    draft-TIME one-shot, off the perfect draft, with ZERO model forwards.
+    """
+    import collections
+    store_log = draft.store_log or {}
+    load_log = draft.load_log or {}
+    frames = draft.frames
+
+    # SP timeline: sp_by_frame[k] = SP AFTER step k (frame_idx k); frame 0 = init.
+    sp_by_frame: Dict[int, int] = {0: _sp_init(draft)}
+    for k, f in enumerate(frames):
+        sp_by_frame[k + 1] = int(f["sp"])
+    sp0 = sp_by_frame[0]
+
+    # Loads (LI/LC) grouped by address — the memory head can recall these at any step.
+    loads_by_addr: Dict[int, List[int]] = collections.defaultdict(list)
+    for lfi, laddr in load_log.items():
+        loads_by_addr[int(laddr)].append(int(lfi))
+
+    # Supersession frame per store (already computed on the entry, if any).
+    for e in entries:
+        addr = e.addr
+        sup = e.evict_frame if e.evict_reason == "superseded" else None
+        # first frame g > fi whose POST-step SP is strictly above this slot — the
+        # consuming pop's frame.  (SP is monotone within a call frame; a re-push to
+        # A first drops SP <= A again, so the FIRST g with sp>A is this row's pop.)
+        # Only scan up to supersession (past it the row is already handled) — the
+        # linger window, a few frames on a tight push/pop loop.
+        scan_end = sup if sup is not None else n_steps + 1
+        pop_g = None
+        for g in range(e.frame_idx + 1, scan_end):
+            if sp_by_frame.get(g, sp0) > addr:
+                pop_g = g
+                break
+        if pop_g is None:
+            continue                                # never popped past — leave as-is
+        free_frame = pop_g + 1                      # +1: the pop AT pop_g reads it
+        # a LI/LC recall of this address, after fi and before supersession, that lands
+        # at/after the tentative free must extend the free past that load (the memory
+        # head reads it there).
+        window_end = sup if sup is not None else n_steps + 1
+        blocking = [lfi for lfi in loads_by_addr.get(addr, ())
+                    if e.frame_idx < lfi < window_end and lfi >= free_frame]
+        if blocking:
+            free_frame = max(blocking) + 1
+        if free_frame > n_steps:
+            continue                                # freed only past the run — no gain
+        if sup is not None and free_frame >= sup:
+            continue                                # supersession already frees it >= as soon
+        e.evict_frame = free_frame
+        e.evict_reason = "popped"
+
+
+def _sp_init(draft) -> int:
+    """The initial SP the pure-forward driver seeds (SP=BP at the stack top).  This
+    is the reference top-of-stack the pop-liveness scan compares against for the
+    init-frame slot; the driver's ``SP_INIT`` is the authoritative value (the per-run
+    override, e.g. the bench's ``--sp-init 0xFC``, is applied to that module attr)."""
+    from c4_min.nibble_pure_forward_complete import SP_INIT
+    return int(SP_INIT)
 
 
 def positions_to_drop_through(sched: EvictionSchedule, up_to_frame: int) -> List[int]:
