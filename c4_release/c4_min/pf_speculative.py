@@ -180,6 +180,12 @@ class PFDraft:
     # its supersession by a same-address store — the deterministic eviction schedule
     # that replaces the O(S^2) content comparison.  None on drafts built without it.
     load_log: Dict[int, int] = None
+    # PART B (direct-CAM read): per-frame CAM reads as ``[(head, addr), ...]`` where
+    # head is "mem" (§Memory LI/LC), "pop" (stack head, incl. LEV's MEM[BP]) or "lev"
+    # (LEV return-PC head, MEM[BP+4]).  ``resolve_load_rows`` turns each into the exact
+    # KV store ROW its address resolves to (latest-write-wins), so the fast verify path
+    # can DIRECT-GATHER that row instead of running the O(K) softmax CAM score.
+    read_log: Dict[int, List[Tuple[str, int]]] = None
 
 
 # The immediate is baked as IMM_NIBS little-endian nibbles (a STATIC re-encoding of
@@ -226,6 +232,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     win_starts: List[int] = []
     out: List[int] = []                         # PRTF visible-output bytes
     prtf_steps: List[int] = []                  # step indices emitting a PRTF byte
+    read_log: Dict[int, List[Tuple[str, int]]] = {}  # frame_idx -> [(head, addr), ...]
     stk = 0                                     # STACK0 mirror (MEM_VAL of a frame)
     stream_len = len(tokens)                    # == 31 (BOS + init frame)
     frame_idx = 0                               # init frame is frame 0
@@ -243,6 +250,12 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         step_halted = False
         pop_val = stk                        # STACK0 default (unchanged if not a pop)
         load_addr = None                     # set by LI/LC (the address recalled)
+        # PART B (direct-CAM read): the address(es) this step CONTENT-ADDRESSES via a
+        # global CAM head, tagged by which head reads it — ``(head, addr)`` pairs.
+        # "mem" = the §Memory LI/LC head (query=AX), "pop" = the stack head
+        # (query=SP, or BP on LEV), "lev" = the LEV return-PC head (query=BP+4).  The
+        # resolver maps each to its latest superseding store row for the direct gather.
+        read_addrs: List[Tuple[str, int]] = []
         # --- the MODEL's transition (32-bit; IMM keeps the full nibble literal) --
         if op == isa.IMM:
             ax = imm & _IMM_MASK              # full 20-bit literal (model, not &0xFF)
@@ -251,6 +264,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         elif op == isa.PSH:
             sp -= 4; mem[sp] = ax & mask
         elif op in (isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD):
+            read_addrs.append(("pop", sp))    # stack head reads MEM[sp]
             v = mem.get(sp, 0) & mask; sp += 4; pop_val = v
             if op == isa.ADD:
                 ax = (v + ax) & mask
@@ -263,6 +277,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             else:
                 ax = ((v % ax) if ax else 0) & mask
         elif op in (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR):
+            read_addrs.append(("pop", sp))    # stack head reads MEM[sp]
             pop_val = mem.get(sp, 0); v = pop_val & 0xFF; sp += 4
             if op == isa.OR:
                 ax = (v | ax) & 0xFF
@@ -275,6 +290,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             else:
                 ax = (v >> ax) & 0xFF
         elif op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE):
+            read_addrs.append(("pop", sp))    # stack head reads MEM[sp]
             pop_val = mem.get(sp, 0); v = pop_val & 0xFF; sp += 4
             r = {isa.EQ: v == ax, isa.NE: v != ax, isa.LT: v < ax,
                  isa.GT: v > ax, isa.LE: v <= ax, isa.GE: v >= ax}[op]
@@ -289,8 +305,10 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             # rejected the model's CORRECT load.  Keep the draft consistent with the
             # store_log (the actual KV the model reads).
             load_addr = ax                     # the address this LI/LC recalled (KV read)
+            read_addrs.append(("mem", ax))     # §Memory head reads MEM[ax]
             ax = mem.get(ax, 0) & mask
         elif op in (isa.SI, isa.SC):
+            read_addrs.append(("pop", sp))     # stack head reads MEM[sp] (the store addr)
             addr = mem.get(sp, 0); pop_val = addr; sp += 4
             mem[addr] = ax & mask
         elif op == isa.JMP:
@@ -306,7 +324,10 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         elif op == ADJ:
             sp += 4 * imm
         elif op == isa.LEV:
-            sp = bp; bp = mem.get(sp, 0); pc = mem.get(sp + 4, 0); sp += 8
+            sp = bp
+            read_addrs.append(("pop", sp))     # stack head reads MEM[bp]   (saved BP)
+            read_addrs.append(("lev", sp + 4)) # lev head reads MEM[bp+4]   (return PC)
+            bp = mem.get(sp, 0); pc = mem.get(sp + 4, 0); sp += 8
         elif op == isa.PRTF:
             # I/O op (printf("%c", AX)): PC += 1 only, registers UNCHANGED — the
             # driver decodes this step's AX from the SAME KV-cached model row and
@@ -363,6 +384,8 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             store_log[frame_idx] = (s_addr, s_val)
         if load_addr is not None:
             load_log[frame_idx] = load_addr & 0xFFFFFFFF
+        if read_addrs:
+            read_log[frame_idx] = [(hd, a & 0xFFFFFFFF) for hd, a in read_addrs]
         cur_pc, cur_sp, cur_bp = pc, sp, bp
         if step_halted or not (0 <= pc < len(code)):
             halted = step_halted or (pc < 0 or pc >= len(code))
@@ -378,7 +401,8 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     return PFDraft(tokens=tokens, frames=frames, store_log=store_log,
                    step_count=len(frames), halted=halted,
                    final_ax_masked=final_ax, win_starts=win_starts,
-                   out=out, prtf_steps=prtf_steps, load_log=load_log)
+                   out=out, prtf_steps=prtf_steps, load_log=load_log,
+                   read_log=read_log)
 
 
 # ===========================================================================

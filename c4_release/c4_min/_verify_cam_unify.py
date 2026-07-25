@@ -110,6 +110,35 @@ def run_battery(model, L, tag):
     return ok_all
 
 
+def run_direct_battery(model, L, tag):
+    """PART B: the direct-index CAM read must be BYTE-IDENTICAL to the softmax CAM
+    read (decoded AX trace) on every program, plus report the O(K)->O(1) scoring
+    reduction."""
+    from c4_min.direct_cam_read import (
+        run_pure_forward_direct_cam, attention_flop_report)
+    from c4_min.pf_speculative import draft_pf_program
+    print(f"=== {tag} (direct-index CAM read vs softmax) ===", flush=True)
+    ok_all = True
+    tot_scores = tot_gathers = 0
+    for name, prog in PROGS.items():
+        code = asm(prog)
+        ref = ref_interpret(code, max_steps=64, mask=0xFF)
+        soft = run_pure_forward_complete(model, L, code, max_steps=64, mask=0xFF)
+        direct = run_pure_forward_direct_cam(model, L, code, max_steps=64, mask=0xFF)
+        ok = (soft == direct == ref)
+        ok_all &= ok
+        rep = attention_flop_report(
+            draft_pf_program(code, max_steps=64, mask=0xFFFFFFFF))
+        tot_scores += rep["total_softmax_row_scores"]
+        tot_gathers += rep["total_direct_row_gathers"]
+        print(f"  {name:16s} {'IDENTICAL' if ok else 'DIFFER'}  "
+              f"reads={rep['n_reads']} softmaxKscores={rep['total_softmax_row_scores']} "
+              f"directgathers={rep['total_direct_row_gathers']}", flush=True)
+    print(f"  TOTAL softmax row-scores={tot_scores}  direct gathers={tot_gathers}  "
+          f"scoring reduction={tot_scores / max(1, tot_gathers):.2f}x", flush=True)
+    return ok_all
+
+
 def main():
     torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
     t0 = time.time()
@@ -124,7 +153,13 @@ def main():
     ok = run_battery(model, L, "battery")
     print(f"battery {time.time()-t1:.1f}s -> "
           f"{'ALL PASS' if ok else 'SOME FAIL'}", flush=True)
-    sys.exit(0 if ok else 1)
+    ok_direct = True
+    if os.environ.get("C4_DIRECT_CAM_READ", "0") not in ("0", "", "false", "False"):
+        t2 = time.time()
+        ok_direct = run_direct_battery(model, L, "PART B")
+        print(f"direct battery {time.time()-t2:.1f}s -> "
+              f"{'ALL BYTE-IDENTICAL' if ok_direct else 'SOME DIFFER'}", flush=True)
+    sys.exit(0 if (ok and ok_direct) else 1)
 
 
 if __name__ == "__main__":

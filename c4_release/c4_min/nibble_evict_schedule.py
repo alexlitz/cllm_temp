@@ -238,6 +238,80 @@ def build_eviction_schedule(draft, *, slope_min: float = None,
     return sched
 
 
+# ===========================================================================
+# PART B: DRAFT-DIRECT CAM READ — per-read address -> exact resolved KV row.
+# ===========================================================================
+@dataclass
+class ResolvedRead:
+    """One CAM read the draft performs, resolved to the exact KV store row it reads.
+
+    ``head``       — "mem" (§Memory LI/LC), "pop" (stack head, incl. LEV's MEM[BP]),
+                     or "lev" (LEV return-PC head, MEM[BP+4]).
+    ``read_frame`` — the draft frame index whose step performs the read.
+    ``addr``       — the address queried (the CAM binary-address key).
+    ``store_frame``— the frame that stored the LATEST value to ``addr`` before the read
+                     (latest-write-wins, exactly the softmax1-CAM+ALiBi winner), or
+                     None when the address is UNWRITTEN (softmax1 +1 sink -> ZFOD 0).
+    ``store_position`` — the absolute stream position of that store's KV (MEM) row, or
+                     None for a ZFOD read.
+    ``value``      — the value the direct gather returns (the store's val, or 0 ZFOD).
+    """
+    head: str
+    read_frame: int
+    addr: int
+    store_frame: Optional[int]
+    store_position: Optional[int]
+    value: int
+
+
+def resolve_load_rows(draft) -> Dict[int, List[ResolvedRead]]:
+    """PART B: resolve every drafted CAM read to the exact KV row its address reads.
+
+    For each read ``(head, addr)`` at frame ``F`` (from ``draft.read_log``), find the
+    store to ``addr`` with the LARGEST frame ``< F`` (latest-write-wins).  That is
+    EXACTLY the row the softmax1-CAM+ALiBi head selects: the address CAM gives every
+    store to ``addr`` an identical top score, ALiBi's recency then picks the most
+    recent, and softmax1's +1 sink returns 0 when no store to ``addr`` exists (ZFOD).
+
+    A single O(stores + reads) pass: walk frames in order, keep the running "latest
+    store frame per address"; at each read frame, snapshot the current latest store
+    for its address.  Because the read at frame ``F`` sees only stores committed at
+    frames ``< F`` (the store's KV row precedes the read's query row in the causal
+    stream), we advance the running map to just-before ``F`` before resolving.
+
+    Returns ``{read_frame: [ResolvedRead, ...]}``.  The direct gather then reads
+    ``store_log[store_frame]``'s value (or 0) — no O(K) attention score at all.
+    """
+    store_log: Dict[int, Tuple[int, int]] = draft.store_log or {}
+    read_log: Dict[int, List[Tuple[str, int]]] = draft.read_log or {}
+    # latest store frame per address, built incrementally as we sweep frames.
+    latest: Dict[int, int] = {}
+    out: Dict[int, List[ResolvedRead]] = {}
+    # the union of all frames that either store or read, in ascending order.
+    all_frames = sorted(set(store_log) | set(read_log))
+    # a store at frame S becomes visible to any read at frame > S.  We process frames
+    # in order; at frame F we FIRST resolve reads (they see stores at frames < F), THEN
+    # commit F's own store (visible to later reads).  Since a frame is EITHER a store
+    # OR a read in this VM (a store frame carries no CAM read and vice-versa, except SI
+    # which reads then stores — handled: the pop read of the store ADDRESS at frame F
+    # resolves against stores < F, and F's value store is committed after), this order
+    # is exact.
+    for f in all_frames:
+        for (head, addr) in read_log.get(f, []):
+            sf = latest.get(addr)
+            if sf is None:
+                out.setdefault(f, []).append(
+                    ResolvedRead(head, f, addr, None, None, 0))
+            else:
+                sval = store_log[sf][1]
+                out.setdefault(f, []).append(
+                    ResolvedRead(head, f, addr, sf, store_row_position(sf), sval))
+        if f in store_log:
+            addr, _val = store_log[f]
+            latest[addr] = f
+    return out
+
+
 def positions_to_drop_through(sched: EvictionSchedule, up_to_frame: int) -> List[int]:
     """All store-row absolute positions whose eviction frame is ``<= up_to_frame``
     — the cumulative drop set the block-verify applies at the eviction round that
