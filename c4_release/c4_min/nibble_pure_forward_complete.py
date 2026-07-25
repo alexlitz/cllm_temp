@@ -1116,7 +1116,10 @@ def build_pure_forward_complete_model(code_size: int = 32,
             _zero_attn(model.blocks[bi].attn)
             _load_ffn(model.blocks[bi].ffn, spec, hidden)
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
-        bake_frame_ingest(model.blocks[0].attn, L, reg_bases)
+        # C4_INGEST_GQA (default OFF): 1-KV-head GQA ingest (byte-exact, 20 KV → 1).
+        from .nibble_pure_forward import bake_frame_ingest_gqa, ingest_gqa_enabled
+        (bake_frame_ingest_gqa if ingest_gqa_enabled()
+         else bake_frame_ingest)(model.blocks[0].attn, L, reg_bases)
         mem_block = _find(block_specs, "mem-cam")
         _bake_pf_memory_head(model.blocks[mem_block].attn, L, head=N_ROLES)
         stk_block = _find(block_specs, "stack-pop-cam")
