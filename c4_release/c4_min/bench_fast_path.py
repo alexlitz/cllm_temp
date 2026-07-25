@@ -473,6 +473,33 @@ def run_bench(kind: str, args) -> int:
               f"dead-attention blocks (output=x, no K/Q/V/W_o linears, no KV write); "
               f"{df['live_attention_blocks']} live blocks keep attention", flush=True)
 
+    # -- MATERIALIZE-DENSE (opt-in, the byte-exact forward win) --------------
+    # Densify the CSR FFN/attn weights ONCE onto the device so ``.linear`` stops
+    # re-running ``csr.to_dense()`` on EVERY forward (705 CSR densifies/forward was
+    # the launch-bound wall at small S).  Byte-identical (same F.linear GEMM, same
+    # accum order, L-inf=0).  Costs the full dense model VRAM (~5.8 GB lean).
+    if getattr(args, "materialize_dense", False) or getattr(args, "graph_fused", False):
+        if not device.startswith("cuda"):
+            print("  MATERIALIZE-DENSE requires CUDA; skipping", flush=True)
+        else:
+            t = time.time()
+            sparse.materialize_dense(device=device)
+            print(f"  MATERIALIZE-DENSE: densified all CSR weights onto {device} "
+                  f"in {time.time()-t:.1f}s (per-forward csr.to_dense eliminated, "
+                  f"byte-identical)", flush=True)
+
+    # -- CUDA-GRAPHED dead-segment forward (opt-in) --------------------------
+    # Collapse the ~235 dead-block FFN kernel LAUNCHES per forward: capture each
+    # contiguous dead-attention segment into a CUDA graph (replayed per verify-
+    # block).  The ~3 live-attention blocks stay eager.  Byte-identical (dead
+    # segment graphed output == eager fused chain, L-inf=0).  NOTE: only wins at
+    # SMALL span S (launch-bound); at the large verify spans the forward is
+    # GEMM-compute-bound so this is ~neutral (see report).
+    if getattr(args, "graph_fused", False):
+        if device.startswith("cuda"):
+            from .graphed_fused_forward import install_graphed_fused_forward
+            install_graphed_fused_forward(sparse, device, verbose=True)
+
     # -- K-SWEEP mode: reuse this ONE build to verify at each K, print the table
     #    (K vs amortized ms/step vs peak-VRAM vs forwards vs GPU-util). ---------
     if args.k_sweep:
@@ -714,6 +741,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "linears (the measured wall) + KV materialisation on the "
                          "dead blocks.  Byte-identical: a dead block's attention "
                          "output is x and its KV is provably never read.")
+    ap.add_argument("--materialize-dense", action="store_true",
+                    help="Densify the CSR FFN/attn weights ONCE onto the device so "
+                         ".linear stops re-running csr.to_dense() every forward (the "
+                         "launch-bound wall at small span S).  Byte-identical (same "
+                         "GEMM, L-inf=0).  Costs the full dense-model VRAM (~5.8 GB).")
+    ap.add_argument("--graph-fused", action="store_true",
+                    help="CUDA-GRAPH the dead-attention segments (requires "
+                         "--fuse-dead-blocks).  Densifies the CSR FFN weights ONCE "
+                         "(materialize_dense -> .linear stops re-running "
+                         "csr.to_dense per call, the launch-bound wall) and captures "
+                         "each contiguous dead-block FFN segment into a CUDA graph "
+                         "replayed per verify-block; the ~3 live-attention blocks "
+                         "stay eager.  Collapses the ~705 tiny-GEMM kernel LAUNCHES "
+                         "per forward to a few graph launches.  Byte-identical "
+                         "(graphed dead segment == eager fused chain, L-inf=0).")
     ap.add_argument("--content-bound-global", action="store_true",
                     help="with --local-window (DROP-KV): bound the GLOBAL "
                          "(memory/stack/LEV) cache BY CONTENT — each global head is "
