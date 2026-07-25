@@ -400,8 +400,20 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
     = ``x``), and the residual bands past the VM's ``D_used`` stay 0 on every token.
     This proves the SAME weights load and run byte-exact through a config that is
     shape-identical to the released 0.5B (only a subset that already ``fits_stock``
-    can be padded; a wider subset raises)."""
+    can be padded; a wider subset raises).
+
+    UNIFIED ALU UNIT SELECTION: the per-op ``C4_ADD_UNIT`` / ``C4_MUL_UNIT`` /
+    ``C4_DIV_UNIT`` registry flags (see ``c4_min.alu_units``) are projected onto the
+    legacy builder flags (``C4_DIV_LEAN`` / ``C4_DIV_LONGDIV`` / ``C4_MUL_LOOKAHEAD``)
+    HERE, before the layout + block builders read them, so the registry is the single
+    interface without touching the proven flag-read sites. With NO unit flag set this
+    is a NO-OP (byte-identical to golden)."""
     from transformers.models.qwen2 import Qwen2Model
+
+    # Non-invasive: project any C4_*_UNIT registry selection onto the legacy flags
+    # the layout/block builders already read. No-op (mutates nothing) when unset.
+    from . import alu_units as _AU
+    _AU.apply_to_env()
 
     QL = QwenFullLayout(code_size, subset, efficient_alu=efficient_alu,
                         recurrent_divmod=recurrent_divmod,
