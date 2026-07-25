@@ -317,22 +317,44 @@ def _force_bit2(L, bin_base, dim):
 
 
 # ===========================================================================
-# The STACK KV head: identical §Memory CAM as the LI/LC head, but keyed on the
-# STACK query band SP_QRY_BIN (address = SP) and enabled by IS_POP, writing the
-# retrieved value nibbles into the STACK0 band (the operand the ALU pops).
+# ONE address-CAM read head (the unification of the three §Memory KV heads).
 # ===========================================================================
-def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
-    """Bake the stack-pop KV head: query = SP_QRY_BIN, enable = IS_POP, value ->
-    STACK0 nibble band.  Same address CAM + ZFOD-bias + store-role + pop-enable
-    channels as ``_bake_pf_memory_head``, on a different head/query/dest."""
+# The model's three GLOBAL attention heads (§Memory KV head, stack-pop head, LEV
+# return-PC head) all compute the SAME operation — a binary-address softmax1 CAM
+# read of ``mem[addr]`` (latest-write-wins) — differing ONLY in three parameters:
+#
+#     head          query band     enable flag   value dest
+#     -----------   ------------   -----------   ----------
+#     §Memory LI    QRY_BIN        IS_LOAD       AX      (the loaded value)
+#     stack-pop     SP_QRY_BIN     IS_POP        STACK0  (the popped operand)
+#     LEV ret-PC    LEV_QRY_BIN    IS_LEV        LEV_RET (the saved return PC)
+#
+# So ONE parameterised bake (:func:`_bake_cam_head`) authors all three: the 32
+# ±smag address channels, the ZFOD bias, the store-role penalty, the read-enable
+# channel and the value relay are IDENTICAL; only ``qry_band`` / ``enable_flag`` /
+# ``value_dest`` change.  The three thin wrappers below select the trio.  This is a
+# pure structural dedup — the emitted weights are byte-IDENTICAL to the three
+# former hand-copied bakes (proven by the golden-hash gate).
+def _bake_cam_head(attn, L, head: int, qry_band: int, enable_flag: int,
+                   value_dest: int) -> None:
+    """Bake attention head ``head`` as a §Memory binary-address CAM read.
+
+    ``qry_band``    — the residual band holding the 32 query address bits.
+    ``enable_flag`` — the scalar flag (1.0) that arms the read for this op class.
+    ``value_dest``  — the nibble band the retrieved value is written into.
+
+    The KEY is always the store address (``ADDR_BIN``, ±smag); the store-flag /
+    ZFOD-bias / store-role-penalty channels are exactly ``_bake_pf_memory_head``'s
+    (§Memory) — only the query source, arm flag and value destination differ.
+    """
     from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
     from .blogspec_layout import NIB_PER_REG
     hs = attn.scale
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the IS_POP query flag is
-    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large SP/PC
+    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the enable query flag is
+    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large SP/BP/PC
     # cannot swamp the exact-address match (see PEN_GATE note).
     PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
@@ -342,23 +364,36 @@ def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     for b in range(ADDR_BITS):
         attn.W_k[base + b, L.ADDR_BIN + b] = 2.0 * smag
         attn.W_k[base + b, L.ONE] = -smag
-        attn.W_q[base + b, L.SP_QRY_BIN + b] = 2.0 * smag   # QUERY = SP address
+        attn.W_q[base + b, qry_band + b] = 2.0 * smag       # QUERY = this op's addr
         attn.W_q[base + b, L.ONE] = -smag
     cB = base + ADDR_BITS
-    attn.W_q[cB, L.IS_POP] = -qb            # ZFOD bias enabled by IS_POP
+    attn.W_q[cB, enable_flag] = -qb         # ZFOD bias enabled by the read flag
     attn.W_k[cB, L.IS_STORE] = kb
     cR = base + ADDR_BITS + 1
-    attn.W_q[cR, L.IS_POP] = p              # store-role penalty
+    attn.W_q[cR, enable_flag] = p           # store-role penalty
     attn.W_k[cR, L.ONE] = -p
     attn.W_k[cR, L.IS_STORE] = p
-    cL = base + ADDR_BITS + 2               # POP-enable: non-pop query -> sink
+    cL = base + ADDR_BITS + 2               # READ-enable: non-read query -> sink
     c = (PEN / hs) ** 0.5
     attn.W_q[cL, L.ONE] = c
-    attn.W_q[cL, L.IS_POP] = -c
+    attn.W_q[cL, enable_flag] = -c
     attn.W_k[cL, L.ONE] = -c
     for j in range(NIB_PER_REG):
         attn.W_v[base + ADDR_BITS + 3 + j, L.VAL_NIB + j] = 1.0
-        attn.W_o[L.STACK0 + j, base + ADDR_BITS + 3 + j] = 1.0   # -> STACK0, not AX
+        attn.W_o[value_dest + j, base + ADDR_BITS + 3 + j] = 1.0
+
+
+# ===========================================================================
+# The STACK KV head: identical §Memory CAM as the LI/LC head, but keyed on the
+# STACK query band SP_QRY_BIN (address = SP) and enabled by IS_POP, writing the
+# retrieved value nibbles into the STACK0 band (the operand the ALU pops).
+# ===========================================================================
+def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
+    """Bake the stack-pop KV head: query = SP_QRY_BIN, enable = IS_POP, value ->
+    STACK0 nibble band.  Same address CAM + ZFOD-bias + store-role + pop-enable
+    channels as ``_bake_pf_memory_head``, on a different head/query/dest."""
+    _bake_cam_head(attn, L, head, qry_band=L.SP_QRY_BIN,
+                   enable_flag=L.IS_POP, value_dest=L.STACK0)
 
 
 # ===========================================================================
@@ -387,40 +422,8 @@ def compile_stk_recompose(L, dim: int, hi_nibbles: int = 8) -> Dict[str, torch.T
 def _bake_lev_ret_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     """The LEV return-PC KV head: query = LEV_QRY_BIN (address = BP+4), enable =
     IS_LEV, value -> LEV_RET nibble band.  Same §Memory CAM as the stack head."""
-    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
-    from .blogspec_layout import NIB_PER_REG
-    hs = attn.scale
-    smag = (EFF / hs) ** 0.5
-    qb = (BIAS / hs) ** 0.5
-    kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the IS_LEV query flag is
-    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large BP/PC
-    # cannot swamp the exact-address match (see PEN_GATE note).
-    PEN = PEN_GATE
-    p = (PEN / hs) ** 0.5
-    attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
-    HD = attn.head_dim
-    base = head * HD
-    for b in range(ADDR_BITS):
-        attn.W_k[base + b, L.ADDR_BIN + b] = 2.0 * smag
-        attn.W_k[base + b, L.ONE] = -smag
-        attn.W_q[base + b, L.LEV_QRY_BIN + b] = 2.0 * smag
-        attn.W_q[base + b, L.ONE] = -smag
-    cB = base + ADDR_BITS
-    attn.W_q[cB, L.IS_LEV] = -qb
-    attn.W_k[cB, L.IS_STORE] = kb
-    cR = base + ADDR_BITS + 1
-    attn.W_q[cR, L.IS_LEV] = p
-    attn.W_k[cR, L.ONE] = -p
-    attn.W_k[cR, L.IS_STORE] = p
-    cL = base + ADDR_BITS + 2
-    c = (PEN / hs) ** 0.5
-    attn.W_q[cL, L.ONE] = c
-    attn.W_q[cL, L.IS_LEV] = -c
-    attn.W_k[cL, L.ONE] = -c
-    for j in range(NIB_PER_REG):
-        attn.W_v[base + ADDR_BITS + 3 + j, L.VAL_NIB + j] = 1.0
-        attn.W_o[L.LEV_RET + j, base + ADDR_BITS + 3 + j] = 1.0
+    _bake_cam_head(attn, L, head, qry_band=L.LEV_QRY_BIN,
+                   enable_flag=L.IS_LEV, value_dest=L.LEV_RET)
 
 
 # ===========================================================================
