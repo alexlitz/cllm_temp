@@ -222,6 +222,83 @@ def bake_frame_ingest(attn, L: PureForwardLayout, reg_bases: Dict[str, int]) -> 
 
 
 # ===========================================================================
+# GQA frame-ingest — 20 query heads sharing ONE KV head (the KV-cache reduction).
+#
+# The stock ``bake_frame_ingest`` gives each of the 20 heads a DISTINCT K slice (it
+# keys on ``ROLE+h``, a different role dim per head), so the KV cache stores 20
+# distinct K/V heads even though the 20 heads all read the SAME previous frame.  As
+# in stock Qwen's GQA (14 query / 2 KV), the query heads can share ONE KV head: the
+# shared K encodes ALL 20 role identities (so it records WHICH role each frame byte
+# holds) and the shared V is the token's two nibbles (already identical across the 20
+# heads).  Each of the 20 QUERY heads then sets its own Q to match the shared-K
+# channel for ITS role and routes the selected byte's nibbles to its register band.
+# Every head's K/V slice is byte-identical ⇒ the cache stores ONE KV head's worth
+# (20 KV heads → 1), while the 20 query reads stay byte-EXACT (proven vs the stock
+# ingest + ``isa.interpret`` through the real ``model.forward``).
+#
+# WHY QUERY HEADS STAY AT 20:  softmax1 selects ONE row per head (the role-CAM argmax),
+# and the 20 register bytes live at 20 DISTINCT frame-token positions.  A head whose
+# query matches SEVERAL roles splits its softmax weight across those byte tokens and
+# returns their AVERAGE — it cannot separate them (empirically: a 5-head "one per
+# register, 4-role query" gather decodes garbage).  So each distinct byte position
+# needs its own query-head selection; 20 is the minimum for full 5-register (×4-byte)
+# frame reconstruction.  (STACK0's 4 heads are load-bearing in the base pure-forward
+# model — the pushed ALU operand is reconstructed from the STACK0 frame mirror — so
+# 16 heads mis-reads ADD/SUB; the pure-forward-COMPLETE model instead supplies STACK0
+# via a separate stack-pop KV head, where the 4 ingest STACK0 heads could be elided.)
+# ===========================================================================
+def bake_frame_ingest_gqa(attn, L: PureForwardLayout,
+                          reg_bases: Dict[str, int]) -> None:
+    """GQA form of :func:`bake_frame_ingest`: 20 query heads, ONE shared KV head.
+
+    All 20 heads carry an IDENTICAL K/V projection (the shared KV head); only the
+    per-head Q + O differ.  Byte-exact frame reconstruction, KV-cache content
+    collapsed 20 → 1 distinct KV head.  Requires ``attn.head_dim >= N_ROLES + 3``.
+    """
+    hs = attn.scale
+    smag = (INGEST_EFF / hs) ** 0.5
+    PEN = 100.0 * INGEST_EFF
+    p = (PEN / hs) ** 0.5
+    HD = attn.head_dim
+    assert HD >= N_ROLES + 3, (
+        f"GQA ingest needs head_dim >= {N_ROLES + 3} (all role keys + penalty + "
+        f"2 value channels), got {HD}")
+    for w in (attn.W_q, attn.W_k, attn.W_v, attn.W_o):
+        w.zero_()
+    # SHARED K/V channel layout inside every head slice (identical across heads):
+    #   0..N_ROLES-1 : role-r match key (a byte token keys +smag on the role dim it holds)
+    #   N_ROLES      : query-exclusion penalty (non-frame-byte rows keyed -p; bytes 0)
+    #   N_ROLES+1/+2 : the token's two value nibbles (CUR_NIB+0 / CUR_NIB+1)
+    cPEN, cV0, cV1 = N_ROLES, N_ROLES + 1, N_ROLES + 2
+    for h in range(N_ROLES):
+        attn.alibi_slopes[h] = INGEST_RECENCY
+        base = h * HD
+        r_idx, bi = divmod(h, BYTES_PER_REG)
+        reg_base = reg_bases[INGEST_REGS[r_idx]]
+        # --- SHARED K (byte-identical for every head): all 20 role keys + penalty --
+        for r in range(N_ROLES):
+            attn.W_k[base + r, L.ROLE + r] = smag
+        attn.W_k[base + cPEN, L.ONE] = -p
+        attn.W_k[base + cPEN, L.IS_FRAME_BYTE] = p
+        # --- SHARED V (byte-identical for every head): the token's two nibbles -----
+        attn.W_v[base + cV0, L.CUR_NIB + 0] = 1.0
+        attn.W_v[base + cV1, L.CUR_NIB + 1] = 1.0
+        # --- PER-HEAD Q: select THIS head's role via the shared-K channel h + penalty
+        attn.W_q[base + h, L.ROLE + h] = smag
+        attn.W_q[base + cPEN, L.ONE] = p
+        # --- PER-HEAD O: write the selected byte's two nibbles into the register band
+        attn.W_o[reg_base + 2 * bi + 0, base + cV0] = 1.0
+        attn.W_o[reg_base + 2 * bi + 1, base + cV1] = 1.0
+
+
+def ingest_gqa_enabled() -> bool:
+    """``C4_INGEST_GQA`` (default OFF): use the 1-KV-head GQA ingest bake instead of
+    the stock 20-distinct-KV-head bake.  OFF ⇒ byte-identical to the golden build."""
+    import os
+    return os.environ.get("C4_INGEST_GQA", "0") not in ("0", "", "false", "False")
+
+
+# ===========================================================================
 # BUILD the pure-forward model: ingest attention on block 0 + the baked step.
 # ===========================================================================
 MEM_HEAD_CHANNELS = 51               # 32 addr + ZFOD + penalty + load-enable + 16 value
@@ -826,9 +903,12 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
         for bi, (name, spec) in enumerate(block_specs):
             _zero_attn(model.blocks[bi].attn)
             _load_ffn(model.blocks[bi].ffn, spec, hidden)
-        # block 0 attention = the frame-ingest CAM.
+        # block 0 attention = the frame-ingest CAM.  C4_INGEST_GQA (default OFF)
+        # swaps in the 1-KV-head GQA bake (byte-exact, 20 KV heads → 1).
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
-        bake_frame_ingest(model.blocks[0].attn, L, reg_bases)
+        _ingest = (bake_frame_ingest_gqa if ingest_gqa_enabled()
+                   else bake_frame_ingest)
+        _ingest(model.blocks[0].attn, L, reg_bases)
         if include_memory:
             # the §Memory KV head is the ATTENTION of the "mem-cam" block (index 2),
             # AFTER addr-expand has set QRY_BIN: it reads the load query, content-
