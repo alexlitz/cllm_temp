@@ -156,3 +156,15 @@ register_div_unit(AluUnit(
 map onto the legacy `C4_DIV_LEAN` / `C4_DIV_LONGDIV` flags (a genuinely new builder
 wire), extend the DIV branch of `apply_to_env` to route it — that is the one
 integration point.
+
+## 7. Shared PEEL sub-gadget (`op="peel"`)
+
+The three ADD / MUL / DIV units all contain the SAME per-iteration **peel** (the
+radix-16 nibble floor/mod split). [`alu_peel.py`](alu_peel.py) /
+[`ALU_PEEL.md`](ALU_PEEL.md) factor it into ONE shared stored block that every op
+references (routed through a canonical `ALU_PEEL` lane), and register it here as a
+fourth op family (`register_peel_units()` -> `op="peel"`, units `nibble15` /
+`nibble32` per kmax regime). It is gated behind `C4_SHARED_PEEL` (default OFF ==
+private per-op peels, byte-identical to golden) and is a **weight-count
+consolidation** (13 carry-round peel sites -> 3 distinct stored tensors -> 1
+shared), **not** a depth change — the fit selector's layer budget is unchanged.
