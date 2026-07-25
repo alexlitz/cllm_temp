@@ -53,7 +53,7 @@ from .nibble_vm import (
     S, RELU_S, SILU_S, SILU_HALF,
     compile_nibble_to_scalar, compile_pc_fetch, compile_code_select,
     base_dispatch_rules, compile_branch_delta, compile_fold, compile_ffn,
-    _empty_spec, _load_ffn, _zero_attn, _snap_lane,
+    _empty_spec, _load_ffn, _zero_attn, _snap_lane, _recompose_hi_nibbles,
 )
 from .blogspec_model import Transformer
 from . import nibble_pure_forward as PF
@@ -71,6 +71,28 @@ from .blogspec_memory import ADDR_BITS
 
 # opcode value for ADJ / LC / SC / NOP (canonical C4 values; base isa lacks ADJ).
 ADJ = isa.ADJ if hasattr(isa, "ADJ") else 7
+
+
+def _unify_cam_head_enabled() -> bool:
+    """PART A: unify the §Memory LI read into the stack-pop CAM head (``C4_UNIFY_CAM_HEAD``,
+    DEFAULT OFF).
+
+    The three global attention heads all run the SAME binary-address softmax1 CAM
+    read (``_bake_cam_head``); the §Memory LI head (query=QRY_BIN, enable=IS_LOAD)
+    and the stack-pop head (query=SP_QRY_BIN, enable=IS_POP) are MUTUALLY EXCLUSIVE
+    per step (LI/LC ∉ POP_OPS ∪ {LEV}), so they can share ONE head slot with the
+    query address MUXed by the opcode.  When ON: a mux FFN builds ``UNI_QRY_BIN``
+    (= QRY_BIN on a load, SP_QRY_BIN on a pop/LEV) and ``IS_MEMREAD`` (load OR pop);
+    the merged head at the stack-pop-cam block reads ``UNI_QRY_BIN`` -> ``UNI_VAL``,
+    and a demux FFN copies ``UNI_VAL`` -> AX (loads) / STACK0 (pops/LEV).  The
+    standalone mem-cam head is then DROPPED -> the live global-head count falls 3->2.
+    (It cannot reach 1: LEV reads MEM[BP] AND MEM[BP+4] in the SAME forward, two
+    distinct simultaneous addresses, so the LEV return-PC head stays a second head.)
+
+    DEFAULT OFF -> layout, blocks and weights are byte-IDENTICAL to the golden
+    3-head build; the golden/integer VM is unchanged with the gate off."""
+    import os
+    return os.environ.get("C4_UNIFY_CAM_HEAD", "0") not in ("0", "", "false", "False")
 
 # Number of nibbles the STATIC immediate-nibble program encoding carries per slot.
 # The corpus's largest VALUE literal is < 10^4 (< 16^4); 5 nibbles (< 16^5 ≈ 1.05M)
@@ -141,6 +163,14 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # (LEA/ENT/ADJ/JSR) read an EXACT integer offset instead of ``IMM``'s
         # large-literal PC-one-hot leak (#648/#660).  See ``compile_imm_clean``.
         self.IMM_CLEAN = self._scalar("IMM_CLEAN")
+        # PART A (C4_UNIFY_CAM_HEAD, default OFF): the merged-CAM-head scratch bands.
+        # Allocated ONLY when the flag is on, so the flag-OFF layout (and thus every
+        # baked weight / the golden hash) is byte-identical to the 3-head build.
+        if _unify_cam_head_enabled():
+            from .blogspec_layout import NIB_PER_REG as _NPR
+            self.UNI_QRY_BIN = self._band("UNI_QRY_BIN", ADDR_BITS)  # muxed read addr
+            self.UNI_VAL = self._band("UNI_VAL", _NPR)               # merged read value
+            self.IS_MEMREAD = self._scalar("IS_MEMREAD")            # IS_LOAD OR IS_POP
         while self._off % n_heads != 0:
             self._scalar(f"_pfcpad{self._off}")
         self.D = self._off
@@ -317,22 +347,44 @@ def _force_bit2(L, bin_base, dim):
 
 
 # ===========================================================================
-# The STACK KV head: identical §Memory CAM as the LI/LC head, but keyed on the
-# STACK query band SP_QRY_BIN (address = SP) and enabled by IS_POP, writing the
-# retrieved value nibbles into the STACK0 band (the operand the ALU pops).
+# ONE address-CAM read head (the unification of the three §Memory KV heads).
 # ===========================================================================
-def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
-    """Bake the stack-pop KV head: query = SP_QRY_BIN, enable = IS_POP, value ->
-    STACK0 nibble band.  Same address CAM + ZFOD-bias + store-role + pop-enable
-    channels as ``_bake_pf_memory_head``, on a different head/query/dest."""
+# The model's three GLOBAL attention heads (§Memory KV head, stack-pop head, LEV
+# return-PC head) all compute the SAME operation — a binary-address softmax1 CAM
+# read of ``mem[addr]`` (latest-write-wins) — differing ONLY in three parameters:
+#
+#     head          query band     enable flag   value dest
+#     -----------   ------------   -----------   ----------
+#     §Memory LI    QRY_BIN        IS_LOAD       AX      (the loaded value)
+#     stack-pop     SP_QRY_BIN     IS_POP        STACK0  (the popped operand)
+#     LEV ret-PC    LEV_QRY_BIN    IS_LEV        LEV_RET (the saved return PC)
+#
+# So ONE parameterised bake (:func:`_bake_cam_head`) authors all three: the 32
+# ±smag address channels, the ZFOD bias, the store-role penalty, the read-enable
+# channel and the value relay are IDENTICAL; only ``qry_band`` / ``enable_flag`` /
+# ``value_dest`` change.  The three thin wrappers below select the trio.  This is a
+# pure structural dedup — the emitted weights are byte-IDENTICAL to the three
+# former hand-copied bakes (proven by the golden-hash gate).
+def _bake_cam_head(attn, L, head: int, qry_band: int, enable_flag: int,
+                   value_dest: int) -> None:
+    """Bake attention head ``head`` as a §Memory binary-address CAM read.
+
+    ``qry_band``    — the residual band holding the 32 query address bits.
+    ``enable_flag`` — the scalar flag (1.0) that arms the read for this op class.
+    ``value_dest``  — the nibble band the retrieved value is written into.
+
+    The KEY is always the store address (``ADDR_BIN``, ±smag); the store-flag /
+    ZFOD-bias / store-role-penalty channels are exactly ``_bake_pf_memory_head``'s
+    (§Memory) — only the query source, arm flag and value destination differ.
+    """
     from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
     from .blogspec_layout import NIB_PER_REG
     hs = attn.scale
     smag = (EFF / hs) ** 0.5
     qb = (BIAS / hs) ** 0.5
     kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the IS_POP query flag is
-    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large SP/PC
+    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the enable query flag is
+    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large SP/BP/PC
     # cannot swamp the exact-address match (see PEN_GATE note).
     PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
@@ -342,23 +394,36 @@ def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     for b in range(ADDR_BITS):
         attn.W_k[base + b, L.ADDR_BIN + b] = 2.0 * smag
         attn.W_k[base + b, L.ONE] = -smag
-        attn.W_q[base + b, L.SP_QRY_BIN + b] = 2.0 * smag   # QUERY = SP address
+        attn.W_q[base + b, qry_band + b] = 2.0 * smag       # QUERY = this op's addr
         attn.W_q[base + b, L.ONE] = -smag
     cB = base + ADDR_BITS
-    attn.W_q[cB, L.IS_POP] = -qb            # ZFOD bias enabled by IS_POP
+    attn.W_q[cB, enable_flag] = -qb         # ZFOD bias enabled by the read flag
     attn.W_k[cB, L.IS_STORE] = kb
     cR = base + ADDR_BITS + 1
-    attn.W_q[cR, L.IS_POP] = p              # store-role penalty
+    attn.W_q[cR, enable_flag] = p           # store-role penalty
     attn.W_k[cR, L.ONE] = -p
     attn.W_k[cR, L.IS_STORE] = p
-    cL = base + ADDR_BITS + 2               # POP-enable: non-pop query -> sink
+    cL = base + ADDR_BITS + 2               # READ-enable: non-read query -> sink
     c = (PEN / hs) ** 0.5
     attn.W_q[cL, L.ONE] = c
-    attn.W_q[cL, L.IS_POP] = -c
+    attn.W_q[cL, enable_flag] = -c
     attn.W_k[cL, L.ONE] = -c
     for j in range(NIB_PER_REG):
         attn.W_v[base + ADDR_BITS + 3 + j, L.VAL_NIB + j] = 1.0
-        attn.W_o[L.STACK0 + j, base + ADDR_BITS + 3 + j] = 1.0   # -> STACK0, not AX
+        attn.W_o[value_dest + j, base + ADDR_BITS + 3 + j] = 1.0
+
+
+# ===========================================================================
+# The STACK KV head: identical §Memory CAM as the LI/LC head, but keyed on the
+# STACK query band SP_QRY_BIN (address = SP) and enabled by IS_POP, writing the
+# retrieved value nibbles into the STACK0 band (the operand the ALU pops).
+# ===========================================================================
+def _bake_stack_pop_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
+    """Bake the stack-pop KV head: query = SP_QRY_BIN, enable = IS_POP, value ->
+    STACK0 nibble band.  Same address CAM + ZFOD-bias + store-role + pop-enable
+    channels as ``_bake_pf_memory_head``, on a different head/query/dest."""
+    _bake_cam_head(attn, L, head, qry_band=L.SP_QRY_BIN,
+                   enable_flag=L.IS_POP, value_dest=L.STACK0)
 
 
 # ===========================================================================
@@ -387,40 +452,98 @@ def compile_stk_recompose(L, dim: int, hi_nibbles: int = 8) -> Dict[str, torch.T
 def _bake_lev_ret_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     """The LEV return-PC KV head: query = LEV_QRY_BIN (address = BP+4), enable =
     IS_LEV, value -> LEV_RET nibble band.  Same §Memory CAM as the stack head."""
-    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
+    _bake_cam_head(attn, L, head, qry_band=L.LEV_QRY_BIN,
+                   enable_flag=L.IS_LEV, value_dest=L.LEV_RET)
+
+
+# ===========================================================================
+# PART A (C4_UNIFY_CAM_HEAD): merge the §Memory LI read into the stack-pop head.
+# ===========================================================================
+def compile_unify_cam_prep(L: PureForwardCompleteLayout, dim: int) -> Dict[str, torch.Tensor]:
+    """Build the MERGED-CAM inputs (``C4_UNIFY_CAM_HEAD``): the muxed query address
+    ``UNI_QRY_BIN`` and the merged read-enable ``IS_MEMREAD``.
+
+    ``UNI_QRY_BIN = QRY_BIN`` on a load, ``= SP_QRY_BIN`` on a pop/LEV.  The two
+    query bands are set UNGATED (QRY_BIN = AX bits, SP_QRY_BIN = POP_ADDR bits every
+    step), so we do a FLAG-GATED copy of each: ``+ QRY_BIN·IS_LOAD`` and
+    ``+ SP_QRY_BIN·IS_POP``.  IS_LOAD and IS_POP are mutually exclusive, so exactly
+    one term is live and ``UNI_QRY_BIN`` holds the correct address.  ``IS_MEMREAD =
+    IS_LOAD OR IS_POP`` arms the merged head.  Runs AFTER stack-prep (both flags +
+    both query bands are set by then).  Self-clears ``UNI_QRY_BIN`` first (SET)."""
+    n = ADDR_BITS
+    # per output bit: 1 self-clear + 2 gated adds ; + 2 for IS_MEMREAD (clear + 2 ORs)
+    spec = _empty_spec(dim, n * 3 + 3)
+    u = 0
+    for b in range(n):
+        # self-clear UNI_QRY_BIN[b] (SET)
+        spec["W_up"][u, L.ONE] = S
+        spec["W_gate"][u, L.UNI_QRY_BIN + b] = 1.0
+        spec["W_down"][L.UNI_QRY_BIN + b, u] += -1.0 / SILU_S
+        u += 1
+        # + QRY_BIN[b] gated on IS_LOAD:  silu(S·IS_LOAD - S/2)·QRY_BIN[b]
+        spec["W_up"][u, L.IS_LOAD] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.QRY_BIN + b] = 1.0
+        spec["W_down"][L.UNI_QRY_BIN + b, u] += 1.0 / SILU_HALF
+        u += 1
+        # + SP_QRY_BIN[b] gated on IS_POP
+        spec["W_up"][u, L.IS_POP] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.SP_QRY_BIN + b] = 1.0
+        spec["W_down"][L.UNI_QRY_BIN + b, u] += 1.0 / SILU_HALF
+        u += 1
+    # IS_MEMREAD := IS_LOAD OR IS_POP  (mutually exclusive so the sum is a clean 0/1).
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.IS_MEMREAD] = 1.0
+    spec["W_down"][L.IS_MEMREAD, u] += -1.0 / SILU_S; u += 1
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.IS_LOAD] = 1.0
+    spec["W_down"][L.IS_MEMREAD, u] += 1.0 / SILU_S; u += 1
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.IS_POP] = 1.0
+    spec["W_down"][L.IS_MEMREAD, u] += 1.0 / SILU_S; u += 1
+    return spec
+
+
+def compile_unify_cam_demux(L: PureForwardCompleteLayout, dim: int) -> Dict[str, torch.Tensor]:
+    """Demux the merged-head value ``UNI_VAL`` into the right destination band
+    (``C4_UNIFY_CAM_HEAD``): ``AX += UNI_VAL`` on a load, ``STACK0 += UNI_VAL`` on a
+    pop/LEV.  Gated on IS_LOAD / IS_POP (mutually exclusive), so exactly one
+    destination is written and it receives the same nibbles the standalone §Memory
+    / stack head would have written directly.  ADD semantics (not SET): the merged
+    head is enabled only on a read, and the destination band was cleared by the same
+    upstream FFN (mem-prep clears AX on a load; stack-prep clears STACK0 on a pop),
+    exactly as in the 3-head build.
+
+    Then recompose ``AX_VAL`` from the (now updated) AX nibble band so the scalar
+    lane the dispatch reads reflects a loaded value — the exact role the mem-cam
+    block's ``compile_nibble_to_scalar`` recompose played after the standalone
+    §Memory head.  Idempotent on a non-load step (AX nibble band == step-input AX)."""
     from .blogspec_layout import NIB_PER_REG
-    hs = attn.scale
-    smag = (EFF / hs) ** 0.5
-    qb = (BIAS / hs) ** 0.5
-    kb = (BIAS / hs) ** 0.5
-    # Role-gate penalty (stays huge = 100·ADDR_BITS·EFF); the IS_LEV query flag is
-    # THRESHOLDED clean (``_flag_from_ops`` step) so a residue at a large BP/PC
-    # cannot swamp the exact-address match (see PEN_GATE note).
-    PEN = PEN_GATE
-    p = (PEN / hs) ** 0.5
-    attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
-    HD = attn.head_dim
-    base = head * HD
-    for b in range(ADDR_BITS):
-        attn.W_k[base + b, L.ADDR_BIN + b] = 2.0 * smag
-        attn.W_k[base + b, L.ONE] = -smag
-        attn.W_q[base + b, L.LEV_QRY_BIN + b] = 2.0 * smag
-        attn.W_q[base + b, L.ONE] = -smag
-    cB = base + ADDR_BITS
-    attn.W_q[cB, L.IS_LEV] = -qb
-    attn.W_k[cB, L.IS_STORE] = kb
-    cR = base + ADDR_BITS + 1
-    attn.W_q[cR, L.IS_LEV] = p
-    attn.W_k[cR, L.ONE] = -p
-    attn.W_k[cR, L.IS_STORE] = p
-    cL = base + ADDR_BITS + 2
-    c = (PEN / hs) ** 0.5
-    attn.W_q[cL, L.ONE] = c
-    attn.W_q[cL, L.IS_LEV] = -c
-    attn.W_k[cL, L.ONE] = -c
+    hi = _recompose_hi_nibbles()
+    spec = _empty_spec(dim, NIB_PER_REG * 2 + (1 + hi))
+    u = 0
     for j in range(NIB_PER_REG):
-        attn.W_v[base + ADDR_BITS + 3 + j, L.VAL_NIB + j] = 1.0
-        attn.W_o[L.LEV_RET + j, base + ADDR_BITS + 3 + j] = 1.0
+        # AX[j] += UNI_VAL[j] gated on IS_LOAD
+        spec["W_up"][u, L.IS_LOAD] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.UNI_VAL + j] = 1.0
+        spec["W_down"][L.AX + j, u] += 1.0 / SILU_HALF
+        u += 1
+        # STACK0[j] += UNI_VAL[j] gated on IS_POP
+        spec["W_up"][u, L.IS_POP] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.UNI_VAL + j] = 1.0
+        spec["W_down"][L.STACK0 + j, u] += 1.0 / SILU_HALF
+        u += 1
+    # AX_VAL := Σ 16^j · AX_nibble_j  (SET: self-clear then recompose)
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.AX_VAL] = 1.0
+    spec["W_down"][L.AX_VAL, u] += -1.0 / SILU_S; u += 1
+    for j in range(hi):
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.AX + j] = 1.0
+        spec["W_down"][L.AX_VAL, u] += (16.0 ** j) / SILU_S; u += 1
+    return spec
+
+
+def _bake_unified_cam_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
+    """The MERGED CAM head (``C4_UNIFY_CAM_HEAD``): query = UNI_QRY_BIN (muxed load /
+    pop address), enable = IS_MEMREAD, value -> UNI_VAL.  ONE head serving both the
+    §Memory LI read and the stack-pop read (never co-occur)."""
+    _bake_cam_head(attn, L, head, qry_band=L.UNI_QRY_BIN,
+                   enable_flag=L.IS_MEMREAD, value_dest=L.UNI_VAL)
 
 
 # ===========================================================================
@@ -998,11 +1121,22 @@ def build_pure_forward_complete_model(code_size: int = 32,
         ("imm-nib-fetch", compile_imm_nib_fetch(L, dim)),      # IMM_NIB <- CODE_IMM_NIB@PC
         ("imm-clean", compile_imm_clean(L, dim)),              # IMM_CLEAN <- round(IMM_NIB)
         ("mem-prep", compile_mem_prep(L, dim)),
-        ("mem-cam",  compile_nibble_to_scalar(L, dim)),          # ATTN=LI head
+        ("mem-cam",  compile_nibble_to_scalar(L, dim)),          # ATTN=LI head (dropped if UNIFY)
         ("pop-addr", compile_pop_addr(L, dim)),                  # POP_ADDR/LEV_ADDR
         ("stack-prep", compile_stack_prep(L, dim)),
         ("lev-addr4", _force_bit2(L, L.LEV_QRY_BIN, dim)),       # LEV_QRY_BIN += 4
-        ("stack-pop-cam", compile_stk_recompose(L, dim)),        # ATTN=stack+lev heads
+    ]
+    _unify = _unify_cam_head_enabled()
+    if _unify:
+        # PART A: build the muxed read address + merged enable BEFORE the merged head.
+        block_specs.append(("unify-cam-prep", compile_unify_cam_prep(L, dim)))
+    block_specs += [
+        ("stack-pop-cam", compile_stk_recompose(L, dim)),        # ATTN=stack+lev(+merged) heads
+    ]
+    if _unify:
+        # PART A: demux the merged-head value -> AX (load) / STACK0 (pop) + AX_VAL recompose.
+        block_specs.append(("unify-cam-demux", compile_unify_cam_demux(L, dim)))
+    block_specs += [
         ("cmp-compute", compile_cmp_compute(L, dim)),
         ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),
         ("alu-expand", A.compile_expand(L, dim)),
@@ -1120,11 +1254,19 @@ def build_pure_forward_complete_model(code_size: int = 32,
         from .nibble_pure_forward import bake_frame_ingest_gqa, ingest_gqa_enabled
         (bake_frame_ingest_gqa if ingest_gqa_enabled()
          else bake_frame_ingest)(model.blocks[0].attn, L, reg_bases)
-        mem_block = _find(block_specs, "mem-cam")
-        _bake_pf_memory_head(model.blocks[mem_block].attn, L, head=N_ROLES)
         stk_block = _find(block_specs, "stack-pop-cam")
-        _bake_stack_pop_head(model.blocks[stk_block].attn, L, head=N_ROLES + 1)
-        _bake_lev_ret_head(model.blocks[stk_block].attn, L, head=N_ROLES + 2)
+        if _unify:
+            # PART A: ONE merged head (head N_ROLES+1) serves BOTH the §Memory LI read
+            # and the stack-pop read (mutually exclusive), reading UNI_QRY_BIN ->
+            # UNI_VAL.  The standalone mem-cam LI head (head N_ROLES) is DROPPED, so
+            # the live global-head count is 2 (merged + LEV ret-PC) instead of 3.
+            _bake_unified_cam_head(model.blocks[stk_block].attn, L, head=N_ROLES + 1)
+            _bake_lev_ret_head(model.blocks[stk_block].attn, L, head=N_ROLES + 2)
+        else:
+            mem_block = _find(block_specs, "mem-cam")
+            _bake_pf_memory_head(model.blocks[mem_block].attn, L, head=N_ROLES)
+            _bake_stack_pop_head(model.blocks[stk_block].attn, L, head=N_ROLES + 1)
+            _bake_lev_ret_head(model.blocks[stk_block].attn, L, head=N_ROLES + 2)
     L._block_names = [n for n, _ in block_specs]
     # RECURRENCE: re-point ``model.blocks`` through the application order so the
     # forward applies the reused divmod iteration body N times (the stored blocks
