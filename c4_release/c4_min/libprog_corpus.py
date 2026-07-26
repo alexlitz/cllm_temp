@@ -352,7 +352,12 @@ class RefVM:
             elif op == SHL:
                 self.ax = (self._pop() << self.ax) & 0xFFFFFFFF
             elif op == SHR:
-                self.ax = (self._pop() >> self.ax) & 0xFFFFFFFF
+                # c4: ``a = *sp++ >> a`` on a SIGNED ``long long`` -> ARITHMETIC
+                # (sign-extending) right shift.  Read the popped 32-bit word as
+                # signed (sign bit 31) and sign-fill on the shift, then re-mask.
+                v = self._pop()
+                sv = v - (1 << 32) if v & (1 << 31) else v
+                self.ax = (sv >> self.ax) & 0xFFFFFFFF
             elif op in (EQ, NE, LT, GT, LE, GE):
                 v = self._pop()
                 r = {EQ: v == self.ax, NE: v != self.ax, LT: v < self.ax,
@@ -361,7 +366,11 @@ class RefVM:
             elif op == LI:
                 self.ax = self._lw(self.ax)
             elif op == LC:
-                self.ax = self.mem.get(self.ax, 0) & 0xFF
+                # c4: ``a = *(char *)a`` -> SIGNED char load.  A byte >= 0x80 is a
+                # negative char, sign-extended to the 32-bit register (LI stays an
+                # unsigned word load).  0x80 -> 0xFFFFFF80, 0xFF -> 0xFFFFFFFF.
+                b = self.mem.get(self.ax, 0) & 0xFF
+                self.ax = (b - 0x100 if b & 0x80 else b) & 0xFFFFFFFF
             elif op == SI:
                 self._sw(self._pop(), self.ax)
             elif op == SC:

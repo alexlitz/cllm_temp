@@ -244,8 +244,15 @@ def test_bitwise_family_pure_forward():
     model, L = build_pure_forward_model(code_size=20, include_memory=False,
                                         include_cmp=False, include_bitwise=True,
                                         include_muldiv=False)
+    # NB: the SHR operand is a POSITIVE byte (top bit clear, 0x70) on purpose.
+    # Both the neural SHR and ``isa.interpret`` are now c4-faithful ARITHMETIC, but
+    # they sign at DIFFERENT widths: ``isa.interpret`` is an 8-bit machine (sign bit
+    # 0x80, so a byte >= 0x80 is a negative char), whereas this pure-forward model
+    # is a 32-bit-nibble machine (sign bit 2^31, so a byte 0xF0 is +240, positive).
+    # A top-bit-clear byte (0x70 == +112 at BOTH widths) exercises the arithmetic
+    # SHR path while keeping the 8-bit-oracle comparison exact.  0x70 >> 3 == 0x0E.
     cases = [("OR", 0x0C, 0x03), ("XOR", 0xFF, 0x0F), ("AND", 0xF0, 0x3C),
-             ("SHL", 0x03, 2), ("SHR", 0xF0, 3)]
+             ("SHL", 0x03, 2), ("SHR", 0x70, 3)]
     for op, a, b in cases:
         code = isa.assemble(_push_op(a, b, op))
         trace = assert_no_python_compute(run_pure_forward, model, L, code)

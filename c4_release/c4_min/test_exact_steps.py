@@ -102,7 +102,9 @@ def test_flag_off_complete_model_unchanged():
     for k, v in sorted(model.state_dict().items()):
         h.update(k.encode())
         h.update(v.detach().cpu().numpy().tobytes())
-    assert h.hexdigest()[:16] == "a9484315fabcb30d", h.hexdigest()[:16]
+    # RE-BASELINED 2026-07 for the c4-faithful SHR-arithmetic + signed-LC fix (was
+    # ``a9484315fabcb30d`` when SHR was logical / LC unsigned).
+    assert h.hexdigest()[:16] == "914a12ffe9db84ab", h.hexdigest()[:16]
 
 
 if __name__ == "__main__":

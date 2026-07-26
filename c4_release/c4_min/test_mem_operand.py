@@ -114,7 +114,10 @@ def test_flag_off_complete_model_unchanged():
         h.update(k.encode())
         h.update(v.detach().cpu().numpy().tobytes())
     # the flag-OFF complete-model hash (captured at build); MAC is additive & gated.
-    assert h.hexdigest()[:16] == "a9484315fabcb30d"
+    # RE-BASELINED 2026-07 for the c4-faithful SHR-arithmetic + signed-LC fix (the
+    # tight-shifter ``build_sign_fill`` + the ``lc-sign-detect``/``lc-sign-extend``
+    # blocks): was ``a9484315fabcb30d`` (logical SHR / unsigned LC).
+    assert h.hexdigest()[:16] == "914a12ffe9db84ab"
 
 
 if __name__ == "__main__":

@@ -1,20 +1,24 @@
 """c4-fidelity SPEC for signed shifts (SHR/SHL) and char signedness (LC/SC).
 
-This file is the executable specification of *what our VMs do vs what real c4
-does* for the two ops whose signedness diverges from the c4 reference:
+This file is the executable specification for the two ops whose signedness
+matters vs the c4 reference:
 
-  * **SHR** — c4 does an ARITHMETIC (sign-extending) right shift on a 64-bit
+  * **SHR** — c4 does an ARITHMETIC (sign-extending) right shift on a signed
     ``long long`` (``#define int long long`` in c4.c; run loop ``a = *sp++ >> a``
-    with ``int *sp``).  Every one of our VMs does a LOGICAL (unsigned) right
-    shift (``(pop >> n) & MASK``), routed through the native unsigned DIV gadget
-    (``SHR x,n = x // 2**n``, see ``nibble_alu32`` §"SHIFT-VIA-MUL/DIV").
+    with ``int *sp``).  The DRAFT VMs (``isa.interpret`` 8-bit, ``ref_interpret``
+    32-bit, ``libprog_corpus.RefVM``) are FIXED to arithmetic SHR (the operand is
+    read SIGNED at the value width and the shift sign-fills).  The GOLDEN NEURAL
+    SHR (the TIGHT direct-8x8 shifter) is ALSO fixed to arithmetic via a
+    ``build_sign_fill`` block — byte-exact to c4 through the real forward (see
+    ``TestNeuralSHRIsArithmeticLikeC4``); this MOVES the golden fingerprint
+    (intended).  Only the OFF-by-default log-shifter fallback stays logical.
   * **LC** (load char) — c4 does ``a = *(char *)a`` = a SIGNED char load
-    (-128..127, sign-extended to 64 bits).  Every one of our VMs does an
-    UNSIGNED byte load (``mem[a] & 0xFF``, 0..255).
+    (-128..127, sign-extended).  The DRAFT VMs are FIXED to sign-extend a byte
+    >= 0x80 (LI stays an unsigned word load).
 
 ``SHL`` (logical left shift) and ``SC``/``SI`` (byte / word store, low bits
-only) MATCH c4 at the observable byte, and are covered here as the positive
-control so the file is a complete map, not just a divergence list.
+only) MATCH c4 at the observable byte, and are the positive controls so the file
+is a complete map.
 
 GROUND TRUTH is the real c4 interpreter, built from ``old/c4_original.c``
 (``#define int long long``; the canonical Bellard/Lorette c4).  The expected
@@ -25,12 +29,12 @@ re-capture, see ``_C4_GROUND_TRUTH`` docstring.
 
 Layout of the tests:
 
-  * ``TestMatchesC4``    — cases where OUR behavior == c4 (must pass).
-  * ``TestDivergesFromC4_*`` — cases where OUR behavior != c4 (``xfail(strict)``):
-    the assert is written as if we were c4-faithful, so the day someone makes
-    SHR arithmetic / LC signed these flip to XPASS and announce the fix.  A
-    companion ``*_documents_our_actual`` test PINS the CURRENT (divergent)
-    value so a silent semantics drift is still caught.
+  * ``TestMatchesC4``               — cases where OUR behavior == c4 (controls).
+  * ``TestArithmeticSHRMatchesC4`` /
+    ``TestSignedLCMatchesC4``        — the c4-faithful SHR / LC on the DRAFT VMs
+    (the fix landed; formerly ``xfail(strict)``, now plain asserts).
+  * ``TestNeuralSHRIsArithmeticLikeC4`` — the GOLDEN (tight) neural SHR, now
+    arithmetic through the real forward (byte-exact to c4).
 
 NB: this whole file is TESTS ONLY — it authors no weights and imports only the
 existing reference interpreters + the already-built shifter gadget, so the
@@ -123,9 +127,11 @@ class TestMatchesC4:
 
     @pytest.mark.parametrize("name,fn", list(_VMS_8.items()))
     def test_shr_positive_byte_matches(self, name, fn):
-        # 255 >> 1 == 127: sign bit of the byte is irrelevant here (top bit 0
-        # after the shift either way).  c4: (255>>1)&255 == 127.
-        assert fn(255, 1, "SHR") == 127, name
+        # POSITIVE byte (top bit clear): arithmetic and logical SHR coincide, so
+        # this is a clean positive control.  254 (0xFE) has bit7 set so it is a
+        # SIGNED char (-2) in the 8-bit fold -> use 100 (top bit clear, +100).
+        # c4: int 100>>1 == 50; char c=100; (c>>1)&255 == 50 (same, positive).
+        assert fn(100, 1, "SHR") == 50, name
 
     @pytest.mark.parametrize("name,fn", list(_VMS_8.items()))
     def test_shl_logical_byte_matches(self, name, fn):
@@ -159,64 +165,58 @@ class TestMatchesC4:
 
 
 # ===========================================================================
-# DIVERGING cases: OUR behavior != c4.  xfail(strict) — written c4-faithfully so
-# a real fix flips them to XPASS; a companion test pins our CURRENT value.
+# c4-FAITHFUL cases (FIXED): the draft VMs now do ARITHMETIC SHR + SIGNED LC, so
+# these MATCH real c4.  (Formerly ``xfail(strict)`` written c4-faithfully; the fix
+# landed so they are plain asserts now.  Companion ``*_now_matches_c4`` tests pin
+# the NEW c4-faithful value so a silent regression back to logical is caught.)
 # ===========================================================================
-class TestDivergesFromC4_SHR:
-    """SHR is LOGICAL for us, ARITHMETIC for c4 — diverges on negative operands.
+class TestArithmeticSHRMatchesC4:
+    """SHR is now ARITHMETIC (sign-extending) in every draft VM, like c4.
 
-    The ``xfail`` asserts encode c4's arithmetic-shift answer.  While we stay
-    logical they FAIL (as expected).  The ``*_documents_our_actual`` tests pin
-    the CURRENT logical value so a silent change is still caught.
+    c4: ``a = *sp++ >> a`` on a SIGNED ``long long`` -> the sign bit fills.  The
+    32-bit VMs read the operand's sign at bit 31; the 8-bit ``isa.interpret`` reads
+    it at bit 7 (the 8-bit fold IS one signed byte, i.e. a c4 ``char``), so a byte
+    >= 0x80 is a negative char.  All values verified against real c4 (see
+    ``_C4_GROUND_TRUTH``, captured from ``old/c4_original.c``).
     """
 
     # --- 32-bit int SHR on a negative value (0xFFFFFFFF == -1) ---------------
-    @pytest.mark.xfail(strict=True, reason="our SHR is logical; c4 is arithmetic "
-                       "(sign-extend). int -1>>1 == -1 (0xFFFFFFFF) in c4, "
-                       "0x7FFFFFFF for us.")
-    def test_shr_neg1_would_be_arithmetic_in_c4(self):
+    def test_shr_neg1_is_arithmetic(self):
         # c4: (long long)-1 >> 1 == -1 -> low32 0xFFFFFFFF.
         assert _corpus(0xFFFFFFFF, 1, "SHR") == 0xFFFFFFFF
 
-    def test_shr_neg1_documents_our_actual(self):
-        # PIN: our logical SHR of 0xFFFFFFFF >> 1 == 0x7FFFFFFF (top bit cleared).
-        assert _corpus(0xFFFFFFFF, 1, "SHR") == 0x7FFFFFFF
+    def test_shr_neg256_is_arithmetic(self):
+        # c4: int -256 (0xFFFFFF00) >> 4 == -16 -> low32 0xFFFFFFF0.
+        assert _corpus(0xFFFFFF00, 4, "SHR") == 0xFFFFFFF0
 
-    # --- char high-bit SHR reaching the printed low byte --------------------
-    @pytest.mark.xfail(strict=True, reason="8-bit: char 128 is -128 in c4; "
-                       "-128>>1 == -64, (&255)==192.  Our unsigned 128>>1==64.")
-    def test_char_128_shr1_would_be_192_in_c4(self):
-        # c4: char c=128 (==-128); (c>>1)&255 == 192.
+    # --- char high-bit SHR reaching the printed low byte (8-bit fold) -------
+    def test_char_128_shr1_is_192(self):
+        # c4: char c=128 (==-128); (c>>1)&255 == 192  (arith -128>>1 == -64).
         assert _isa8(128, 1, "SHR") == 192
 
-    def test_char_128_shr1_documents_our_actual(self):
-        # PIN: our unsigned 128 >> 1 == 64.
-        assert _isa8(128, 1, "SHR") == 64
+    def test_char_255_shr1_is_255(self):
+        # c4: char c=255 (==-1); (c>>1)&255 == 255  (arith -1>>1 == -1).
+        assert _isa8(255, 1, "SHR") == 255
 
     # --- large shift where sign-extension fills the whole low byte ----------
-    @pytest.mark.xfail(strict=True, reason="int -1>>25: c4 arithmetic keeps sign "
-                       "-> low byte 0xFF; our logical -> 0x7F.")
-    def test_int_neg1_shr25_low_byte_would_be_ff_in_c4(self):
-        # c4: -1 >> 25 == -1 -> low byte 0xFF.
-        assert (_corpus(0xFFFFFFFF, 25, "SHR") & 0xFF) == 0xFF
-
-    def test_int_neg1_shr25_documents_our_actual(self):
-        # PIN: our logical 0xFFFFFFFF >> 25 == 0x7F, low byte 0x7F (NOT 0xFF).
+    def test_int_neg1_shr25_low_byte_is_ff(self):
+        # c4: -1 >> 25 == -1 -> low byte 0xFF (sign kept across a large shift).
         got = _corpus(0xFFFFFFFF, 25, "SHR")
-        assert got == 0x7F
-        assert (got & 0xFF) == 0x7F
+        assert got == 0xFFFFFFFF
+        assert (got & 0xFF) == 0xFF
 
 
-class TestDivergesFromC4_LC:
-    """LC is an UNSIGNED byte load for us, a SIGNED char load for c4.
+class TestSignedLCMatchesC4:
+    """LC is now a SIGNED char load in every 32-bit draft VM, like c4.
 
-    Demonstrated on the 32-bit ``ref_interpret``: store a high-bit byte via SC,
-    load it via LC, then do arithmetic that exposes the sign.
+    c4: ``a = *(char *)a`` -> a byte >= 0x80 is a negative char, sign-extended to
+    the register.  Demonstrated on ``ref_interpret``: store a high-bit byte via SC,
+    load it via LC, then add so the sign shows in the low 32 bits.  LI stays an
+    unsigned word load (only LC is signed).
     """
 
     def _store_then_load_then_add(self, stored_byte, addend):
-        """mem[7]=stored_byte (SC); AX=mem[7] (LC); AX = AX + addend.  Returns AX
-        under our (unsigned-LC) reference."""
+        """mem[7]=stored_byte (SC); AX=mem[7] (signed LC); AX = AX + addend."""
         # SC does mem[pop()] = AX: push the address (7) first, then AX = value.
         prog = isa.assemble([
             ("IMM", 7),                   # AX = 7 (address)
@@ -224,82 +224,88 @@ class TestDivergesFromC4_LC:
             ("IMM", stored_byte & 0xFF),  # AX = byte to store
             ("SC", 0),                    # mem[7] = AX & 0xFF   (STACK0 popped)
             ("IMM", 7),                   # AX = 7 (address to load)
-            ("LC", 0),                    # AX = mem[7]  (UNSIGNED for us)
+            ("LC", 0),                    # AX = (signed char)mem[7]
             ("PSH", 0),                   # STACK0 = loaded value
             ("IMM", addend & 0xFF),       # AX = addend
             ("ADD", 0),                   # AX = loaded + addend
         ])
         return ref_interpret(prog, mask=0xFFFFFFFF)[-1]
 
-    @pytest.mark.xfail(strict=True, reason="LC signed: c4 loads 0x80 as -128; "
-                       "-128 + 0 == -128 (0xFFFFFF80).  We load it as +128.")
-    def test_lc_high_bit_would_sign_extend_in_c4(self):
+    def test_lc_high_bit_sign_extends(self):
         # c4: char at 0x80 -> -128; +0 -> -128 -> low32 0xFFFFFF80.
         assert self._store_then_load_then_add(0x80, 0) == 0xFFFFFF80
 
-    def test_lc_high_bit_documents_our_actual(self):
-        # PIN: our unsigned LC loads 0x80 as +128; +0 == 128.
-        assert self._store_then_load_then_add(0x80, 0) == 128
-
-    @pytest.mark.xfail(strict=True, reason="LC signed: c4 loads 0xFF as -1.")
-    def test_lc_ff_would_be_minus_one_in_c4(self):
-        # c4: char at 0xFF -> -1 -> low32 0xFFFFFFFF.
+    def test_lc_ff_is_minus_one(self):
+        # c4: char at 0xFF -> -1; +0 -> -1 -> low32 0xFFFFFFFF.
         assert self._store_then_load_then_add(0xFF, 0) == 0xFFFFFFFF
 
-    def test_lc_ff_documents_our_actual(self):
-        # PIN: our unsigned LC loads 0xFF as +255.
-        assert self._store_then_load_then_add(0xFF, 0) == 255
+    def test_lc_positive_byte_unchanged(self):
+        # c4: char at 0x7F -> +127 (top bit clear, no sign-extend); +0 -> 127.
+        assert self._store_then_load_then_add(0x7F, 0) == 127
 
 
 # ===========================================================================
-# NEURAL model: prove the BAKED SHR gadget agrees with the DRAFT VMs (logical)
-# and diverges from c4 (arithmetic) — via the real SwiGLU-plane forward.
+# NEURAL model: the PRODUCTION SHR gadget is now ARITHMETIC too (FIXED).
 #
-# The shifter_bakeoff nibble-granular SHR gadget IS the production shift-via-DIV
-# path's arithmetic on its residual planes (run_blocks = real forward).  Its
-# reference ``ref_shift32`` is ``(pop >> n) & 0xFFFFFFFF`` treating pop as an
-# UNSIGNED 32-bit value -> logical, exactly like the draft VMs.
+# The golden neural SHR is the TIGHT direct-8x8 nibble shifter (``C4_TIGHT_SHIFT``
+# ON, ``shift_tight_nibble`` + ``nibble_bitwise.tight_shift_stage_blocks``).  A
+# ``build_sign_fill`` block now sign-extends the top ``n`` bits after the logical
+# shift, so the BAKED SHR — through the real SwiGLU forward — is byte-exact c4
+# arithmetic.  This MOVES the golden ``_fingerprint_build`` hash (intended).
+#
+# (The ``shifter_bakeoff`` module is a separate DESIGN-BAKEOFF measurement tool
+# that stays LOGICAL — it is NOT on the production build path; its own test pins
+# it logical.  The ``C4_TIGHT_SHIFT=0`` LOG-SHIFTER fallback is also left logical —
+# off by default and unexercised — a documented gap in that fallback only.)
 # ===========================================================================
-class TestNeuralSHRIsLogicalLikeDraft:
-    """The baked neural SHR is logical/unsigned — same as the draft VMs, NOT c4."""
+class TestNeuralSHRIsArithmeticLikeC4:
+    """The GOLDEN (tight) neural SHR now sign-extends — byte-exact to c4, through
+    the real SwiGLU forward.  Verified against the c4 32-bit-signed reference."""
 
     @staticmethod
-    def _neural_shr(pop, n):
-        from c4_min import shifter_bakeoff as sb
-        blocks, L = sb.build_chunk_shr(4)          # nibble-granular SHR gadget
-        return sb.run_blocks(blocks, L, pop, n)
+    def _neural_tight_shr(pop, n):
+        from c4_min import isa as _isa
+        from c4_min import nibble_bitwise as bw
+        from c4_min.blogspec_layout import NibbleLayout
+        L = NibbleLayout()
+        weights = bw.compile_dispatch(L, bw.append_bitwise_shift_to_dispatch(L, _isa.SHR))
+        return bw.run_compiled(L, weights, pop, n)
 
     @staticmethod
-    def _c4_shr_arith(pop_as_signed32, n):
-        # c4 arithmetic >> on the signed 32-bit interpretation, low-32 view.
-        return (pop_as_signed32 >> n) & 0xFFFFFFFF
+    def _c4_shr_arith(pop, n):
+        # c4 ARITHMETIC >> on the 32-bit-signed interpretation, low-32 view.
+        sp = pop - (1 << 32) if pop & 0x80000000 else pop
+        return (sp >> n) & 0xFFFFFFFF if n < 32 else (sp >> 63) & 0xFFFFFFFF
 
-    @pytest.mark.parametrize("pop,n,signed", [
-        (0xFFFFFFFF, 1, -1),
-        (0xFFFFFFFF, 25, -1),
-        (0xFFFFFF00, 4, -256),      # -256
-        (0xFFFFFF80, 1, -128),      # what a SIGNED LC of 0x80 would feed SHR
+    @pytest.mark.parametrize("pop,n", [
+        (0xFFFFFFFF, 1), (0xFFFFFFFF, 25), (0xFFFFFF00, 4),
+        (0xFFFFFF80, 1), (0x80000000, 1), (0xDEADBEEF, 7),
     ])
-    def test_neural_shr_is_logical_diverges_from_c4(self, pop, n, signed):
-        neural = self._neural_shr(pop, n)
-        c4 = self._c4_shr_arith(signed, n)
-        # matches the LOGICAL reference ...
-        assert neural == (pop >> n) & 0xFFFFFFFF
-        # ... and therefore DIVERGES from c4's arithmetic answer.
-        assert neural != c4
+    def test_neural_tight_shr_is_arithmetic(self, pop, n):
+        neural = self._neural_tight_shr(pop, n)
+        # byte-exact to c4's ARITHMETIC (sign-extending) answer ...
+        assert neural == self._c4_shr_arith(pop, n)
+        # ... which (for these negative sources) DIFFERS from the old logical shift.
+        assert neural != (pop >> n) & 0xFFFFFFFF
 
-    def test_neural_shr_matches_c4_on_positive(self):
-        # positive operand: arithmetic == logical, so neural == c4 here.
-        assert self._neural_shr(255, 1) == 127 == self._c4_shr_arith(255, 1)
+    def test_neural_tight_shr_matches_on_positive(self):
+        # positive operand: arithmetic == logical, unchanged.
+        assert self._neural_tight_shr(255, 1) == 127 == self._c4_shr_arith(255, 1)
+
+    def test_shifter_bakeoff_tool_stays_logical(self):
+        # the shifter_bakeoff DESIGN tool is NOT the production path -> stays logical.
+        from c4_min import shifter_bakeoff as sb
+        blocks, L = sb.build_chunk_shr(4)
+        assert sb.run_blocks(blocks, L, 0xFFFFFFFF, 1) == 0x7FFFFFFF   # logical
 
 
 # ===========================================================================
-# CONSISTENCY: all our VMs agree WITH EACH OTHER (self-consistent, uniformly
-# c4-divergent) — the corpus is internally consistent, just not c4-faithful, so
-# nothing in the corpus expects c4's arithmetic SHR / signed LC.
+# CONSISTENCY: the draft VMs now agree WITH EACH OTHER on the c4-faithful
+# ARITHMETIC SHR (self-consistent, and c4-faithful after the fix).
 # ===========================================================================
-class TestOurVMsAgreeWithEachOther:
+class TestDraftVMsAgreeOnArithmeticSHR:
     @pytest.mark.parametrize("v,n", [(0xFFFFFFFF, 1), (0xFFFFFF00, 4), (255, 1)])
-    def test_corpus_shr_is_uniformly_logical(self, v, n):
-        # corpus SHR is logical unsigned across the board:
-        assert _corpus(v, n, "SHR") == (v >> n) & 0xFFFFFFFF
+    def test_corpus_shr_is_arithmetic(self, v, n):
+        # corpus SHR now sign-extends (arithmetic) — the c4-faithful answer:
+        sv = v - (1 << 32) if v & (1 << 31) else v
+        assert _corpus(v, n, "SHR") == (sv >> n) & 0xFFFFFFFF
