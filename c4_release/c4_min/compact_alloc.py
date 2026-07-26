@@ -540,8 +540,10 @@ def compact_model(model, L, probe_programs=None):
     # would truncate a head's projections, breaking the CAM. Compute the
     # required floor from the ORIGINAL weights and never shrink head_dim below
     # it (Fix #1 shrinks dim, never a head's live channels).
-    hd_floor = _required_head_dim(model, n_heads)
-    dim_floor = hd_floor * n_heads
+    # PER-BLOCK floor (see _required_dim_floor): a wide-ingest block-0 has 1 head
+    # so its channels are NOT multiplied by n_heads; uniform models get the old
+    # ``(max_local+1)*n_heads``.
+    dim_floor = _required_dim_floor(model, n_heads)
     if new_dim < dim_floor:
         new_dim = dim_floor
 
@@ -987,12 +989,21 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
     from .blogspec_model import Attn as _Attn, FFN as _FFN
 
     n_blocks = len(block_specs)
-    # The blocks that get a real dense ``Attn`` (a global CAM head): block 0 (frame
-    # ingest) + the CAM blocks the active unify flag bakes onto (mem-cam+stack-pop for
-    # the 3-head build; stack-pop only for C4_UNIFY_CAM_HEAD; stack-pop+lev-cam2 for
-    # C4_UNIFY_CAM_ONE).  ``cam_baked_blocks`` is the single authority (shared with the
-    # dense builder), so the streaming attention layout matches it exactly.
-    baked = {0} | pfc.cam_baked_blocks(block_specs)
+    block_names = [n for n, _ in block_specs]
+    # WIDE INGEST (C4_INGEST_WIDE): block 0's 20/21-head role-CAM ingest is replaced
+    # by a SINGLE query + SINGLE KV head on the "wide-gather" block (a 1-head Attn,
+    # head_dim=dim).  Block 0 ("wide-preroute") then carries NO attention (its dense
+    # attn is ZEROED — a param-free _ZeroAttn here).  Mirror the dense builder EXACTLY.
+    _wide = pfc.ingest_wide_enabled()
+    wide_gather_idx = block_names.index("wide-gather") if _wide else None
+    # The blocks that get a REAL dense ``Attn``: the ingest block (block 0 in the
+    # stock build, OR the 1-head wide-gather block when wide) + the CAM blocks the
+    # active unify flag bakes onto (mem-cam+stack-pop for the 3-head build; stack-pop
+    # only for C4_UNIFY_CAM_HEAD; stack-pop+lev-cam2 for C4_UNIFY_CAM_ONE).
+    # ``cam_baked_blocks`` is the single authority (shared with the dense builder), so
+    # the streaming attention layout matches it exactly.
+    ingest_idx = wide_gather_idx if _wide else 0
+    baked = {ingest_idx} | pfc.cam_baked_blocks(block_specs)
 
     # embedding + LM head (dense; embed is a gather, head is only used by .forward
     # which the liveness pass does not call for the block stack — but keep it real).
@@ -1014,9 +1025,17 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
         phys: List[_StreamBlock] = []
         for bi, (name, spec) in enumerate(block_specs):
             if bi in baked:
-                at = _Attn(dim, n_heads, max_seq)          # dense (zeroed) attn
-                for p in (at.W_q, at.W_k, at.W_v, at.W_o):
-                    p.zero_()
+                if _wide and bi == wide_gather_idx:
+                    # 1-head wide-ingest gather block (head_dim = dim), exactly as
+                    # the dense builder swaps in (_make_one_head_attn).  Every OTHER
+                    # baked block keeps the build-wide n_heads.
+                    at = pfc._make_one_head_attn(dim, max_seq)
+                    for p in (at.W_q, at.W_k, at.W_v, at.W_o):
+                        p.zero_()
+                else:
+                    at = _Attn(dim, n_heads, max_seq)      # dense (zeroed) attn
+                    for p in (at.W_q, at.W_k, at.W_v, at.W_o):
+                        p.zero_()
             else:
                 at = _ZeroAttn(dim, n_heads, max_seq)      # param-free identity
             hid = max(1, spec["W_up"].shape[0])
@@ -1027,7 +1046,18 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
 
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP,
                      "STACK0": L.STACK0}
-        pfc.bake_frame_ingest(phys[0].attn, L, reg_bases)
+        if _wide:
+            # WIDE: bake the single wide gather head onto the 1-head wide-gather
+            # block; block 0 (wide-preroute) stays a zero-attn identity.  No
+            # bake_frame_ingest (the 20/21-head role CAM is gone).
+            pfc.bake_wide_ingest_head(phys[wide_gather_idx].attn, L)
+        else:
+            # C4_INGEST_GQA (default OFF): 1-KV-head GQA ingest; else the stock
+            # 20/21-head role-CAM ingest on block 0.  Matches the dense builder.
+            from .nibble_pure_forward import (bake_frame_ingest_gqa,
+                                              ingest_gqa_enabled)
+            (bake_frame_ingest_gqa if ingest_gqa_enabled()
+             else pfc.bake_frame_ingest)(phys[0].attn, L, reg_bases)
         # Global address-CAM head(s): shared authority (honours C4_UNIFY_CAM_HEAD /
         # C4_UNIFY_CAM_ONE identically to the dense builder).
         pfc.bake_global_cam_heads(phys, L, block_specs)
@@ -1130,8 +1160,10 @@ def build_compact_sparse_streaming(code_size: int = 48,
         liveness = refine_liveness_empirically(liveness, first_nz, last_nz)
     new_slot, new_dim = color_dims(liveness)
 
-    hd_floor = _required_head_dim(model, n_heads)
-    dim_floor = hd_floor * n_heads
+    # PER-BLOCK head-channel floor: a wide-ingest block-0 has ``attn.n_heads==1``
+    # (head_dim=dim), so its floor is ``(max_local+1)*1`` — NOT ``*n_heads``; a
+    # uniform model gets exactly the old ``(max_local+1)*n_heads``.
+    dim_floor = _required_dim_floor(model, n_heads)
     if new_dim < dim_floor:
         new_dim = dim_floor
     if new_dim % n_heads != 0:
@@ -1173,11 +1205,16 @@ def build_compact_sparse_streaming(code_size: int = 48,
         src = model.phys_blocks[bi]
         with torch.no_grad():
             # -- one dense compact block (attention + this block's ragged FFN) --
-            cat = _Attn(new_dim, n_heads, max_seq)
+            # PER-BLOCK head count: the wide-ingest gather block carries a 1-head
+            # Attn (head_dim=new_dim); every other block keeps the build-wide
+            # ``n_heads``.  Read it from the SOURCE block's attn so the remap and
+            # the compact Attn shape match this block, not a uniform assumption.
+            blk_heads = getattr(src.attn, "n_heads", n_heads)
+            cat = _Attn(new_dim, blk_heads, max_seq)
             for p in (cat.W_q, cat.W_k, cat.W_v, cat.W_o):
                 p.zero_()
             if not getattr(src.attn, "is_zero", False):
-                _remap_attn(src.attn, cat, new_slot, new_dim, n_heads)
+                _remap_attn(src.attn, cat, new_slot, new_dim, blk_heads)
                 cat.alibi_slopes.copy_(src.attn.alibi_slopes)
                 cat.scale = src.attn.scale
             else:
@@ -1392,6 +1429,13 @@ def _rebuild_layout(pfc, code_size, n_heads, recurrent_divmod=False):
     present, so the bitwise band is always extended (no op-subset toggle)."""
     from . import nibble_pure_forward_complete as _pfc
     L = _pfc.PureForwardCompleteLayout(code_size, n_heads=n_heads)
+    # WIDE INGEST (C4_INGEST_WIDE): the dense builder allocates the 80-dim
+    # PREROUTE/GATHER band BEFORE the ALU/bitwise bands (see
+    # build_pure_forward_complete_model), so the block_specs address those dims.
+    # Mirror that ordering EXACTLY here or the reconstructed L's band offsets drift
+    # from the specs.  Flag-OFF this is never called ⇒ golden layout unchanged.
+    if _pfc.ingest_wide_enabled():
+        _pfc.extend_layout_for_wide_ingest(L)
     _pfc.A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)
     from . import nibble_bitwise as _bw
     _bw.extend_layout_for_bitwise(L)
@@ -1458,30 +1502,66 @@ def sparse_storage_bytes(sd: Dict[str, object]) -> int:
 # ---------------------------------------------------------------------------
 # Helpers.
 # ---------------------------------------------------------------------------
+def _block_max_local_channel(at, block_n_heads: int) -> int:
+    """Largest per-head LOCAL channel index this ONE attention block touches.
+
+    Q/K/V rows and W_o cols are head-partitioned in blocks of ``old_hd =
+    old_dim // block_n_heads`` — where ``block_n_heads`` is THIS block's own head
+    count (a wide-ingest block-0 has ``block_n_heads==1`` -> ``old_hd == dim`` and
+    its live value channels 0..41 sit in the SINGLE head partition).  Returns -1
+    for a param-free zero-attention block (no channels).
+    """
+    if getattr(at, "is_zero", False):
+        return -1
+    old_hd = at.W_q.shape[0] // block_n_heads
+    max_local = -1
+    for name in ("W_q", "W_k", "W_v"):
+        w = getattr(at, name)                        # rows head-partitioned
+        rows = torch.nonzero((w != 0).any(dim=1), as_tuple=False).flatten()
+        for r in rows.tolist():
+            max_local = max(max_local, r % old_hd)
+    wo = at.W_o                                       # cols head-partitioned
+    cols = torch.nonzero((wo != 0).any(dim=0), as_tuple=False).flatten()
+    for cix in cols.tolist():
+        max_local = max(max_local, cix % old_hd)
+    return max_local
+
+
+def _required_dim_floor(model, n_heads: int) -> int:
+    """Smallest packed ``new_dim`` that truncates NO live head channel — PER-BLOCK.
+
+    Each block with ``bn`` heads has packed ``head_dim = new_dim // bn`` after
+    the pack, so a live local channel ``c`` survives iff ``new_dim >= (c+1)*bn``.
+    The floor is the max of ``(max_local+1)*bn`` over every non-zero attention
+    block, reading EACH block's OWN head count (``attn.n_heads``, which the
+    wide-ingest 1-head block-0 sets to 1) — NOT the build-wide ``n_heads``.  For a
+    uniform-``n_heads`` model this is exactly the old ``(max_local+1)*n_heads``.
+    """
+    floor = 0
+    for blk in model.blocks:
+        at = blk.attn
+        bn = getattr(at, "n_heads", n_heads)
+        ml = _block_max_local_channel(at, bn)
+        if ml >= 0:
+            floor = max(floor, (ml + 1) * bn)
+    return floor
+
+
 def _required_head_dim(model, n_heads: int) -> int:
     """Largest per-head LOCAL channel that any block's attention touches, +1.
 
-    Q/K/V rows and W_o cols are head-partitioned in blocks of ``old_hd``. A head
-    only uses its first few local channels (the CAM channels); the packed
-    head_dim must be >= the max nonzero local-channel index + 1 so no live
-    channel is truncated when dim shrinks.
+    Q/K/V rows and W_o cols are head-partitioned in blocks of ``old_hd``.  Each
+    block is read with ITS OWN head count (``attn.n_heads``), so a per-block
+    head layout (wide-ingest's 1-head block-0) is measured correctly.  Kept for
+    back-compat; the pack floor uses :func:`_required_dim_floor` (per-block).
     """
-    old_dim = model.dim
-    old_hd = old_dim // n_heads
     max_local = 0
     for blk in model.blocks:
         at = blk.attn
-        if getattr(at, "is_zero", False):
-            continue                      # param-free zero-attention: no channels
-        for name in ("W_q", "W_k", "W_v"):
-            w = getattr(at, name)                    # rows head-partitioned
-            rows = torch.nonzero((w != 0).any(dim=1), as_tuple=False).flatten()
-            for r in rows.tolist():
-                max_local = max(max_local, r % old_hd)
-        wo = at.W_o                                   # cols head-partitioned
-        cols = torch.nonzero((wo != 0).any(dim=0), as_tuple=False).flatten()
-        for cix in cols.tolist():
-            max_local = max(max_local, cix % old_hd)
+        bn = getattr(at, "n_heads", n_heads)
+        ml = _block_max_local_channel(at, bn)
+        if ml >= 0:
+            max_local = max(max_local, ml)
     return max_local + 1
 
 
