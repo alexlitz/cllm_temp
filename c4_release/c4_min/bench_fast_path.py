@@ -173,6 +173,30 @@ def build_malloc(n: int):
     return code, ref_ax & 0xFFFFFFFF, None, f"malloc+memset+memcmp n={n} (equal->0)"
 
 
+def build_malloc_free(n: int):
+    """A malloc + memset + FREE (zero-tombstone) + RE-USE heap program — exercises the
+    heap free() -> zero-tombstone -> reclaim path (§689-691) the exact-evict schedule
+    must reclaim.  ``malloc(n)``, fill with 'A', ``free`` (writes 0 == the tombstone),
+    then re-fill the SAME buffer with 'B' (the reuse SUPERSEDES the tombstone), memcmp
+    the reused buffer against a second buffer also filled with 'B' (equal -> 0).  So a
+    live-heap slot is freed, its cell zeroed, then re-allocated and re-written — the
+    tombstone row must go dead (superseded by the reuse) and its cache slot reclaimed."""
+    import c4_min.nibble_runtime as R
+    n = max(1, n)
+    pa, pb = R.HEAP_BASE, R.HEAP_BASE + max(16, n + 8)
+    a = R.Asm()
+    a.splice(R.emit_malloc(pb - pa))                 # bump the heap
+    a.splice(R.emit_memset(pa, 0x41, n))             # fill A with 'A'
+    a.splice(R.emit_free(pa))                        # free(A): *(int*)pa = 0 (tombstone)
+    a.splice(R.emit_memset(pa, 0x42, n))             # REUSE A: refill with 'B' (supersede)
+    a.splice(R.emit_memset(pb, 0x42, n))             # fill B with 'B' (equal to reused A)
+    a.splice(R.emit_memcmp(pa, pb, n))               # all-equal -> 0
+    a.exit_()
+    code = a.instrs()
+    ref_ax, _ = R.ref_interpret_words(code, max_steps=200000)
+    return code, ref_ax & 0xFFFFFFFF, None, f"malloc+free+reuse+memcmp n={n} (equal->0)"
+
+
 def build_matmul(dim: int):
     """The self-emulation matmul: an NxN integer matmul on malloc'd pointer arrays
     (mul/add-heavy — the block-MoE has nothing to skip, so this stresses the

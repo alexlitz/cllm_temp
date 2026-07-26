@@ -461,7 +461,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                   evict_interval_steps: Optional[int] = None,
                   oom_backoff: bool = True,
                   min_block_steps: int = 4,
-                  evict_schedule: Optional[bool] = None) -> VerifyResult:
+                  evict_schedule: Optional[bool] = None,
+                  exact_evict: Optional[bool] = None) -> VerifyResult:
     """Verify the whole drafted stream on the SPARSE model in BLOCKS.
 
     Processes ``block_steps`` (== K) VM steps per batched ``forward_hidden_cached``.
@@ -529,6 +530,15 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     if evict_schedule is None:
         import os
         evict_schedule = os.environ.get("C4_EVICT_SCHEDULE", "0") not in ("0", "", "false", "False")
+    # EXACT O(steps) EVICTION (C4_EXACT_EVICT): unify supersession + free (pop-free +
+    # heap zero-tombstone) + last-read+1 into ONE liveness schedule off the draft, and
+    # drive ALL drops through it — NO O(S^2) content prune (evict_all_blocks_fused) at
+    # all.  Implies evict_schedule (the schedule is the drop authority).  Default OFF.
+    if exact_evict is None:
+        import os
+        exact_evict = os.environ.get("C4_EXACT_EVICT", "0") not in ("0", "", "false", "False")
+    if exact_evict:
+        evict_schedule = True                       # exact-evict IS a schedule mode
     sched = None
     if evict and evict_schedule:
         # the widest (smallest-slope) GLOBAL head sets the recency horizon for the
@@ -547,8 +557,19 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 continue
             m = float(sl.min())
             slope_min = m if slope_min is None else min(slope_min, m)
-        sched = build_eviction_schedule(draft, slope_min=slope_min,
-                                        recency_eps=recency_eps, zero_eps=zero_eps)
+        # In EXACT mode the last-read+1 pass is the SOLE liveness authority and
+        # subsumes the pop-free and freed-recency heuristics EXACTLY (a pop / tombstone
+        # consumer IS a resolved read, so ``last_read+1`` == the pop-free frame and
+        # correctly keeps a tombstone a later LI re-reads).  So we DISABLE the freed
+        # (``supersession_only=True`` skips the recency heuristic) and pop passes and
+        # let the exact fold compute min(supersession, last_read+1) per row.  In plain
+        # schedule mode only supersession is encoded (the content ``skip_mech1`` pass
+        # completes the O(S) zero-value/recency per-head).
+        sched = build_eviction_schedule(
+            draft, slope_min=slope_min, recency_eps=recency_eps, zero_eps=zero_eps,
+            supersession_only=True,
+            pop_free=(False if exact_evict else None),
+            exact_evict=exact_evict)
     sched_frames = sorted_evict_frames(sched) if sched is not None else []
     sched_ptr = 0                       # frontier into sched_frames (O(steps) walk)
     forwards = 0
@@ -837,19 +858,27 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 while sched_ptr < len(sched_frames) and sched_frames[sched_ptr] <= end:
                     drop_pos.extend(positions_new_at(sched, sched_frames[sched_ptr]))
                     sched_ptr += 1
-                # 1) SUPERSESSION drops from the draft (removes the O(S^2) mech-1).
+                # SUPERSESSION (+ exact-mode free/pop/last-read) drops from the draft.
                 keep_masks = (evict_all_blocks_scheduled(caches, drop_pos)
                               if drop_pos else [None] * n_blocks)
                 for b in range(n_blocks):
                     if keep_masks[b] is not None:
                         caches[b].apply_keep_mask(keep_masks[b])
-                # 2) the O(S) zero-value/recency mechanisms (2a/2b/3) — per-head,
-                # byte-exact, NO cdist/cosine (mech-1 skipped: the schedule already
-                # did supersession).  This handles the cross-head zero-value/recency
-                # decision the address-only schedule cannot see, so the KV survivor
-                # set matches the content path exactly on every head.
-                keep_masks = evict_all_blocks_fused(
-                    caches, cos_threshold, zero_eps, recency_eps, skip_mech1=True)
+                if exact_evict:
+                    # EXACT mode: the liveness schedule is the SOLE drop authority.
+                    # The unified min(supersession, free, last-read+1) already dropped
+                    # every provably-inert store row (n_read_after_free == 0 gate), so
+                    # there is NOTHING left for the O(S) content pass to do — and the
+                    # O(S^2) content prune (evict_all_blocks_fused) is dropped ENTIRELY.
+                    # This is what removes the ~40% eviction wall.
+                    keep_masks = [None] * n_blocks
+                else:
+                    # HYBRID schedule mode: the O(S) zero-value/recency mechanisms
+                    # (2a/2b/3) — per-head, byte-exact, NO cdist/cosine (mech-1 skipped:
+                    # the schedule already did supersession).  Handles the cross-head
+                    # zero-value/recency decision the address-only schedule can't see.
+                    keep_masks = evict_all_blocks_fused(
+                        caches, cos_threshold, zero_eps, recency_eps, skip_mech1=True)
             else:
                 # FUSED CONTENT eviction (#667/#670): ONE batched on-GPU decision for
                 # ALL n_blocks caches (the O(S^2) near-dup cdist/cosine over the live
@@ -881,6 +910,17 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         stats["max_cache_size"] = max(max_cache, _final_cache)
         stats["total_evicted"] = sum(c.total_evicted for c in caches)
         stats["forwards"] = forwards
+        # EXACT-EVICT liveness-schedule report (C4_EXACT_EVICT): the drop breakdown
+        # and the READ-AFTER-FREE audit — n_read_after_free MUST be 0 for byte-exact.
+        if sched is not None:
+            stats["sched_stores"] = sched.n_stores
+            stats["sched_superseded"] = sched.n_superseded
+            stats["sched_freed"] = sched.n_freed
+            stats["sched_popped"] = sched.n_popped
+            stats["sched_dead_unread"] = sched.n_dead_unread
+            stats["sched_live"] = sched.n_live
+            stats["sched_read_after_free"] = sched.n_read_after_free
+            stats["exact_evict"] = bool(exact_evict)
         stats["peak_vram_gb"] = vram_gb
         stats["evict_rounds"] = evict_rounds
         stats["effective_block_steps"] = eff_min_k
