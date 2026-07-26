@@ -299,6 +299,60 @@ def ingest_gqa_enabled() -> bool:
 
 
 # ===========================================================================
+# WIDE-VALUE single-head ingest — 1 QUERY head + 1 KV head (down from 20+1).
+#
+# CONFIRMS the user's hypothesis (refutes agent a8c09504's "20 query heads are the
+# minimum"): a8c09504's 5-head/4-role gather decoded garbage ONLY because it kept the
+# NARROW value projection — all registers write the SAME CUR_NIB band, so a multi-role
+# query averages them destructively.  The WIDE-VALUE case routes each (register, byte)
+# to its OWN band (a concatenation), so a SINGLE role-agnostic query attending to all
+# 20 frame-byte tokens returns  out = Σ_i w_i·V_i = [w_0·v_0 | w_1·v_1 | ... ] — a
+# SCALED CONCATENATION, not a blend.  A fixed downstream FFN rescales lane r by 1/wtot_r
+# (wtot_r = Σ_frames w_{f,r}, the FIXED positional weight fraction — length-invariant
+# because the huge match logit makes softmax1 scale-free in n_frames), and the nibble
+# argmax re-quant snaps the fp residue.  PROVEN byte-EXACT through the real FFN.forward +
+# Attn.forward (see ``c4_min/_wide_ingest_integrated.py``) on the a8c09504 battery incl.
+# multi-frame loops, both fp32 and fp64.
+#
+# Three in-weight stages (NO python compute): (A) a PRE-ROUTE SwiGLU FFN computes the
+# per-role product PREROUTE[2r+b] = CUR_NIB[b]·[ROLE==r] (the role⊙nibble gate a LINEAR
+# W_v cannot form — role & nibble are ADDED on the residual, never multiplied);
+# (B) the WIDE-value single head (role-agnostic query; V = identity copy of the 40
+# PREROUTE dims -> the scaled concat in a GATHER band); (C) a RESCALE FFN lane*=1/wtot_r.
+#
+# HONEST CAVEATS (both proven, both measured):
+#   * band WIDTH: PREROUTE(40)+GATHER(40) = 80 fresh dims (vs the 20-head bake's 0), and
+#     the wide head needs head_dim >= 2+40 = 42.  In the base build (dim=700, n_heads=20
+#     -> head_dim=35) the 40 value lanes DO NOT FIT one 35-ch head slice; the wide head
+#     needs n_heads=1 for block 0 (head_dim=dim) OR a widen — a genuine restructure, so
+#     this lands as a validated builder + probe, NOT yet swapped into build_pure_forward.
+#   * w_i degeneracy (fp32): the fixed 1/wtot rescale + latest-frame selection conflict
+#     bounds the ALiBi recency to a WINDOW.  fp32 byte-exact (8 DIFFERING loop frames):
+#     recency ~[0.12, 1.0], sweet spot ~0.5 (worst nibble residue ~0.002, margin ~0.498).
+#     recency > 1.0 fails (1/wtot too large x fp32-quantized value -> residue > 0.3);
+#     recency < 0.12 fails (earlier differing frames leak past the total-weight rescale).
+#     fp64 is byte-exact across the whole range (residue ~1.8e-15); the window is an fp32
+#     artifact.  The stock 20-head bake uses recency 6.0 (per-head role-CAM, no rescale),
+#     which is OUTSIDE this window — the wide head must use ~0.5.
+# ===========================================================================
+def ingest_wide_enabled() -> bool:
+    """``C4_INGEST_WIDE`` (default OFF): use the 1-query + 1-KV wide-value ingest.
+
+    OFF is a strict no-op (``build_pure_forward_model`` never consults this) ⇒ the
+    golden ``_fingerprint_build`` hash ``8f4dd780`` is unchanged.  ON is honoured only
+    by the validated wide-ingest builders + probe (``_wide_ingest_integrated.py``),
+    which need the 80-dim PREROUTE/GATHER band + a 1-head block-0 (a restructure of the
+    shared builder), so the production ``build_pure_forward_model`` still bakes the
+    20-head (or GQA) ingest until that restructure lands."""
+    import os
+    return os.environ.get("C4_INGEST_WIDE", "0") not in ("0", "", "false", "False")
+
+
+# Recommended ALiBi recency for the wide head (inside the fp32 byte-exact window).
+WIDE_INGEST_RECENCY = 0.5
+
+
+# ===========================================================================
 # BUILD the pure-forward model: ingest attention on block 0 + the baked step.
 # ===========================================================================
 MEM_HEAD_CHANNELS = 51               # 32 addr + ZFOD + penalty + load-enable + 16 value
