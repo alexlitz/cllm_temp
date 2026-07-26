@@ -78,21 +78,58 @@ def _attn_query_only(attn, x: torch.Tensor, q_idx: int) -> torch.Tensor:
     return out
 
 
-def _ffn_query_only(ffn, x: torch.Tensor, q_idx: int, routed: bool) -> torch.Tensor:
+def _ffn_forward_fp64(ffn, xq: torch.Tensor) -> torch.Tensor:
+    """SwiGLU FFN forward for a SINGLE query row in float64 (fp-STABLE decode).
+
+    The 1-row query-only GEMM the pos-sparse path uses selects a cuBLAS GEMV
+    kernel whose fp32 accumulation ORDER differs from the reference S-row GEMM.
+    For fp-FRAGILE FFN gadgets — notably ``lea-addr-nib``, whose frame-byte decode
+    sums ~1050 near-cancelling saturating-silu steps — that order flip crosses the
+    integer decode margin (measured: single-row fp32 gives AXB_LO=-21, the S-row
+    fp32 GEMM gives 12; fp64 gives 12 in BOTH — 12 is the true integer LEA_Q&0xFF).
+    So we run the SINGLE query row in float64: it is one D-vector (microseconds) and
+    computes the EXACT integer the decode intends, byte-exact to the S-row reference
+    for EVERY op (fp64 >= fp32 accuracy, and the downstream nibble decode integer-
+    snaps).  Only the resident dense weights are used (materialize_dense'd)."""
+    W_up = ffn.W_up.dense_resident if ffn.W_up.dense_resident is not None else ffn.W_up.dense
+    W_gate = ffn.W_gate.dense_resident if ffn.W_gate.dense_resident is not None else ffn.W_gate.dense
+    W_down = ffn.W_down.dense_resident if ffn.W_down.dense_resident is not None else ffn.W_down.dense
+    xq64 = xq.double()
+    up = F.linear(xq64, W_up.double()) + ffn.b_up.double()
+    gate = F.linear(xq64, W_gate.double()) + ffn.b_gate.double()
+    hidden = F.silu(up) * gate
+    out = xq64 + F.linear(hidden, W_down.double()) + ffn.b_down.double()
+    return out.to(xq.dtype)
+
+
+def _ffn_query_only(ffn, x: torch.Tensor, q_idx: int, routed: bool,
+                    fp64: bool = True) -> torch.Tensor:
     """Compute the FFN at ONLY the query row; other rows carry ``x`` unchanged.
 
     Byte-exact: the SwiGLU FFN is position-independent, and its residual add makes
-    the passthrough at a skipped row exactly the input ``x[row]``."""
+    the passthrough at a skipped row exactly the input ``x[row]``.  ``fp64`` (default
+    ON) runs the single query row's SwiGLU in float64 so the 1-row GEMV accumulation
+    matches the integer-exact reference (fixes the ``lea-addr-nib`` decode tie the
+    fp32 1-row kernel flips — see ``_ffn_forward_fp64``).  Routed (Top-1 MoE) FFNs
+    keep their own forward (their decode is not fp-fragile; the router picks <=K
+    dense rows)."""
     xq = x[:, q_idx:q_idx + 1]
-    fq = ffn.forward(xq) if not routed else ffn(xq)
+    if routed:
+        fq = ffn(xq)
+    elif fp64 and getattr(ffn, "W_up", None) is not None \
+            and hasattr(ffn.W_up, "dense_resident"):
+        fq = _ffn_forward_fp64(ffn, xq)
+    else:
+        fq = ffn.forward(xq)
     out = x.clone()
     out[:, q_idx:q_idx + 1] = fq
     return out
 
 
-def _block_query_only(blk, x: torch.Tensor, q_idx: int) -> torch.Tensor:
+def _block_query_only(blk, x: torch.Tensor, q_idx: int,
+                      fp64_ffn: bool = True) -> torch.Tensor:
     a = _attn_query_only(blk.attn, x, q_idx)
-    return _ffn_query_only(blk.ffn, a, q_idx, blk._routed)
+    return _ffn_query_only(blk.ffn, a, q_idx, blk._routed, fp64=fp64_ffn)
 
 
 class PositionSparseRunner:
