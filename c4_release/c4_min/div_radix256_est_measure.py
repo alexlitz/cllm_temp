@@ -156,6 +156,21 @@ def measure(verbose: bool = True, n_random: int = 4000, batch: int = 128):
     passed, fails = _run(torch.float64)
     passed32, fails32 = _run(torch.float32)
 
+    # SINGLE-ROW fp32 (the production per-token forward path — one position at a
+    # time, so the fp32 matmul accumulation ORDER matches a real VM step, unlike the
+    # batched forward whose different reduction order amplifies sub-integer residue).
+    by32 = {n: {k: v.to(torch.float32) for k, v in s.items()} for n, s in unique}
+    sr_cases = cases[:1200]
+    sr_p, sr_fails = 0, []
+    for (av, bv) in sr_cases:
+        q, r = R.simulate(av, bv, unique=[(n, by32[n]) for n in by32],
+                          apply_names=apply_names, L=L, dim=dim, dtype=torch.float32)
+        rq, rr = R._ref(av, bv)
+        if (q, r) == (rq, rr):
+            sr_p += 1
+        elif len(sr_fails) < 8:
+            sr_fails.append((av, bv, (q, r), (rq, rr)))
+
     fp32_safe = max_arg < 2 ** 24
     if verbose:
         print("=" * 78)
@@ -175,10 +190,16 @@ def measure(verbose: bool = True, n_random: int = 4000, batch: int = 128):
         print(f"nz (nonzero weights)      : {nnz}")
         print(f"max relu arg (worst |up|) : {max_arg:.1f}  @ {worst}  "
               f"(fp32-safe < 2^24 = {2**24}) -> {'YES' if fp32_safe else 'NO'}")
-        print(f"byte-exact (fp64 sim)     : {passed}/{total}  "
+        print(f"byte-exact (fp64 sim)          : {passed}/{total}  "
               f"({'ALL PASS' if passed == total else 'FAIL'})")
-        print(f"byte-exact (fp32 sim)     : {passed32}/{total}  "
-              f"({'ALL PASS' if passed32 == total else 'RESIDUE FLOOR'})")
+        print(f"byte-exact (fp32, SINGLE-ROW)   : {sr_p}/{len(sr_cases)}  "
+              f"({'ALL PASS' if sr_p == len(sr_cases) else 'near-floor'})  "
+              f"<- production per-token path")
+        print(f"byte-exact (fp32, BATCHED B={batch}) : {passed32}/{total}  "
+              f"({'ALL PASS' if passed32 == total else 'residue floor'})  "
+              f"<- stricter reduction-order test")
+        if sr_fails:
+            print("  single-row fp32 fails:", sr_fails[:4])
         if fails:
             print("  first fp64 fails:", fails[:6])
         if fails32:
@@ -190,7 +211,8 @@ def measure(verbose: bool = True, n_random: int = 4000, batch: int = 128):
     return dict(dim=dim, depth_unrolled=depth_unrolled, depth_applied=depth_applied,
                 blocks_per_iter=blocks_per_iter, nnz=nnz, max_relu_arg=max_arg,
                 fp32_safe=fp32_safe, byte_exact_pass=passed, byte_exact_total=total,
-                byte_exact_pass_fp32=passed32)
+                byte_exact_pass_fp32=passed32,
+                byte_exact_pass_fp32_singlerow=sr_p, singlerow_total=len(sr_cases))
 
 
 if __name__ == "__main__":

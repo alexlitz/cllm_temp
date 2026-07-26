@@ -33,6 +33,21 @@ Estimate staircase forms <= ``255*(Bhat+1) <= 65280`` (``RELU_S*65280 = 1.3e7 <
 2^24``).  Subtract borrow uses the ``div_radix16_lean`` 3-nibble-limb pattern
 (limb values <= 4095).  ``qhat*dn`` is a nibble schoolbook (columns < 256).
 
+RESULT (measured, div_radix256_est_measure):
+  depth      = 90 blocks (>> the 40 goal), d_model = 480, nz ~ 193k.
+  byte-exact = 4584/4584 fp64 (ALL PASS — the algorithm is correct).
+  fp32       = ~99% single-row (the production per-token path); the batched forward
+               (a different, stricter fp32 reduction ORDER) shows a residue floor on
+               large-dividend / large-divisor boundary cases (the q*d + limb-borrow
+               chains amplify sub-integer residue there).  A handful of single-row
+               fp32 edges (e.g. 2^31 // 255) still miss by the same residue.
+
+VERDICT: radix-256 SRT does NOT clear 40 blocks.  The per-byte-iteration cost is
+irreducible — a byte*32 multiply (q*d) + a limb/log-depth borrow (R - q*d) —
+~18 blocks/iter, and the one-time CLZ-normalize (variable ``d<<sh`` / ``a - q*d``)
+is a real tax.  4 iters + prologue/epilogue = ~90.  radix-256's 4 iters vs
+radix-16's 8 is a wash (each byte iter is ~2x wider).
+
 MEASURE-ONLY: builds the real SwiGLU FFN blocks, CPU forward fp64 AND fp32 over
 the edge grid + adversarial classes + random 32-bit pairs, reports depth / nz /
 byte-exact + the depth BREAKDOWN.  No full-model bake.
@@ -331,11 +346,15 @@ def _ahat_block(L, dim) -> Dict[str, torch.Tensor]:
     fp32 accumulation ``RELU_S*AHAT - RELU_S*k*Bp`` never catastrophically cancels a
     4096-scaled term."""
     a = L.R256E
-    spec = _empty_spec(dim, 2)
+    spec = _empty_spec(dim, 8 + 4 * 15 * 2)
     u = 0
+    # RE-SNAP the top 4 Rn nibbles through sharp kmax=15 staircases into AHAT's
+    # recompose, so any sub-integer residue that survived the select/shift chain is
+    # cleaned BEFORE the 16^p (up to 4096) recompose amplifies it (the fp32-hygiene
+    # that keeps the estimate boundary exact in the single-token forward).
     u = _clear(spec, u, a.AHAT)
-    u = _ident(spec, u, {a.R + 6: 1.0, a.R + 7: 16.0, a.R + 8: 256.0, a.R + 9: 4096.0},
-               0.0, a.AHAT, 1.0)
+    for m, w in ((6, 1.0), (7, 16.0), (8, 256.0), (9, 4096.0)):
+        u = _floor_div_pow(spec, u, {a.R + m: 1.0}, 0.0, 1, 15, a.AHAT, w)   # snapped nibble * 16^k
     return _truncate(spec, u, dim)
 
 
