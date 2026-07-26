@@ -72,19 +72,12 @@ def _hash_model(model) -> str:
 
 
 def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
-    import os
     # C4_INGEST_WIDE (default OFF): the 1-query/1-KV wide ingest restructures block 0
-    # (1-head Attn), which the STREAMING memory-optimizer's uniform-n_heads remap does
-    # not yet support.  Flag-ON we fingerprint the DENSE build_pure_forward_complete_
-    # model directly (it fully + correctly honours the wide flag) — the intended,
-    # MOVED flag-ON hash.  Flag-OFF is the UNCHANGED streaming path (golden 8f4dd780).
-    if os.environ.get("C4_INGEST_WIDE", "0") not in ("0", "", "false", "False"):
-        from c4_min.nibble_pure_forward_complete import (
-            build_pure_forward_complete_model)
-        model, L = build_pure_forward_complete_model(
-            code_size=code_size, recurrent_divmod=recurrent_divmod)
-        return _hash_model(model)
-
+    # to a 1-head Attn.  The STREAMING builder now carries a PER-BLOCK n_heads (the
+    # wide-gather block is 1-head; every other block keeps the build-wide n_heads), so
+    # the same streaming path is fingerprinted in BOTH states — flag-ON is the intended
+    # MOVED hash (packed-dim, differs from the dense build_pure_forward_complete_model
+    # hash by construction), flag-OFF is the UNCHANGED golden 8f4dd780.
     from c4_min.compact_alloc import build_compact_sparse_streaming
 
     model, L, stats = build_compact_sparse_streaming(
