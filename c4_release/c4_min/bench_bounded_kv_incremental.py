@@ -49,6 +49,7 @@ from . import isa
 from . import qwen_full_vm as Q
 from . import qwen_lean_forward as LF
 from . import qwen_lean_evict as EV
+from . import qwen_lean_evict_graphed as GEV
 
 
 # ---------------------------------------------------------------------------
@@ -99,16 +100,15 @@ def _sync(dev):
 
 
 # ---------------------------------------------------------------------------
-# Build the lean model.  NOTE: the incremental-decode eviction driver
-# (qwen_lean_evict) reads the BAKED-code layout (``L.CODE_OP[k]`` per instruction),
-# so it needs ``code_from_memory=False`` — the current ``Q.build`` default flipped
-# to ``code_from_memory=True`` (program in the KV §Memory), which the evict driver's
-# frame builders (_append_bos / _append_store / _append_reg_frame) do NOT yet
-# support (IndexError on ``L.CODE_OP[k]``).  See the report / test_qwen_lean_evict.
+# Build the lean model.  Uses the DEFAULT ``Q.build`` (``code_from_memory=True`` —
+# program in the KV §Memory as CODE frames, fetched@PC): the evict driver's frame
+# builders (_append_bos / _append_code_frames / _append_store / _append_reg_frame)
+# now support the code-from-memory layout (the CODE frames are seeded ONCE after BOS
+# and persist as TAG_CODE), so no ``code_from_memory=False`` workaround is needed.
 # ---------------------------------------------------------------------------
 def build_lean(device: torch.device, subset=Q.SUBSET_MEM_CMP, code_size: int = 24):
     warnings.filterwarnings("ignore")
-    vm = Q.build(code_size=code_size, subset=subset, code_from_memory=False)
+    vm = Q.build(code_size=code_size, subset=subset)      # code_from_memory=True default
     vm.embed = vm.embed.to(device)
     lean = LF.LeanQwenVM.from_full_vm(vm, device=device)
     return lean
@@ -347,6 +347,137 @@ def graph_potential(lean, device) -> None:
           f"decode bookkeeping (see [decompose]).", flush=True)
 
 
+# ===========================================================================
+# THE LANDED DRIVER: CUDA-graphed forward + vectorized bookkeeping, end-to-end.
+# Byte-exact vs the naive driver; ms/step vs S; per-step breakdown of what remains.
+# ===========================================================================
+def graphed_driver_curve(lean, device, step_counts: List[int], *,
+                         kind: str = "spin") -> None:
+    prog = _SPIN if kind == "spin" else _HEAP_LOOP
+    code = isa.assemble(prog)
+    print(f"\n{'='*76}\n[graphed-driver] LANDED CUDA-graph + vectorized bounded-KV "
+          f"ms/step vs S (kind={kind})\n{'='*76}", flush=True)
+    print("  run_program_lean_evict_graphed: the incremental forward is a CUDA-graph"
+          "\n  replay over the fixed bounded prefix; the per-step frame build + register"
+          "\n  decode are vectorised (template scatter + one batched value-argmax). "
+          "Byte-\n  exact vs the naive fresh-window driver.", flush=True)
+    # byte-exactness gate (graphed == naive) before timing.
+    ok = True
+    for name, p in _battery():
+        c = isa.assemble(p)
+        naive = LF.run_program_lean(lean, c, max_steps=2000)
+        rg = GEV.run_program_lean_evict_graphed(lean, c, max_steps=2000)
+        m = rg.ax_trace == naive["ax_trace"]
+        ok = ok and m
+        if not m:
+            print(f"  [byte-exact] {name} DIVERGES", flush=True)
+    print(f"  [byte-exact] graphed driver vs naive: "
+          f"{'ALL OK' if ok else 'DIVERGENCE — abort'}", flush=True)
+    if not ok:
+        return
+    # warmup (capture the graph + amortise first-forward alloc out of the timed window).
+    g = GEV.GraphedIncrementalForward(lean)
+    _ = GEV.run_program_lean_evict_graphed(lean, code, max_steps=50, graphed=g)
+    _ = EV.run_program_lean_evict(lean, code, max_steps=50, evict="async")
+    _sync(device)
+    print(f"\n  {'steps':>7} {'eager_ms':>10} {'graphed_ms':>11} {'speedup':>8} "
+          f"{'max_cache':>10}", flush=True)
+    print("  " + "-" * 54, flush=True)
+    rows = []
+    for n in step_counts:
+        _sync(device); t0 = time.time()
+        re = EV.run_program_lean_evict(lean, code, max_steps=n, evict="async",
+                                       prune_interval=120, watermark_rows=2048,
+                                       sample_every=max(1, n))
+        _sync(device); eager_ms = (time.time() - t0) / max(re.steps, 1) * 1e3
+        _sync(device); t0 = time.time()
+        rg = GEV.run_program_lean_evict_graphed(lean, code, max_steps=n, graphed=g,
+                                                sample_every=max(1, n))
+        _sync(device); grph_ms = (time.time() - t0) / max(rg.steps, 1) * 1e3
+        rows.append((rg.steps, grph_ms))
+        print(f"  {rg.steps:>7} {eager_ms:>10.3f} {grph_ms:>11.3f} "
+              f"{eager_ms/max(grph_ms,1e-9):>7.2f}x {rg.max_cache_rows:>10}", flush=True)
+    # flatness on the STEADY-STATE points (drop the smallest step count: its ms/step
+    # amortises the one-time graph capture + first-replay over fewer steps, so it reads
+    # a touch high — not an S-dependence).  The FLAT-in-S claim is about the bounded
+    # attention, which the larger runs measure cleanly.
+    steady = [m for _, m in rows[1:]] if len(rows) > 1 else [m for _, m in rows]
+    lo, hi = min(steady), max(steady)
+    spread = (hi - lo) / lo * 100 if lo else 0
+    verdict = ("FLAT in S (the graph did not change the bound; ~%.2f ms/step steady)"
+               % (sum(steady) / len(steady))
+               if spread < 12 else "GROWS with S (regression)")
+    print(f"\n  graphed ms/step steady-state (>= {rows[1][0] if len(rows)>1 else rows[0][0]} "
+          f"steps): min={lo:.3f} max={hi:.3f} spread={spread:.1f}%  ->  {verdict}",
+          flush=True)
+
+    # per-step breakdown of what the graphed driver spends (graph replay = the floor).
+    if device.type == "cuda":
+        _graphed_breakdown(lean, device, code, g)
+
+
+def _graphed_breakdown(lean, device, code, g) -> None:
+    """The per-step cost breakdown of the LANDED graphed driver: the CUDA-graph replay
+    (the launch-bound floor = the megakernel target) vs the residual vectorized
+    bookkeeping (frame build + batched decode)."""
+    # seed a fixed prefix + one captured graph, then time each component.
+    heap = EV.LeanKVCache(lean.n_layers, lean.device)
+    xb, pb, mb = EV._append_bos(lean, code)
+    with torch.no_grad():
+        _, np_ = lean.forward(xb, past=None, q_positions=pb)
+    heap.append(np_, mb)
+    npos = 1
+    if lean.code_from_memory:
+        xc, pc_, mc = EV._append_code_frames(lean, code, npos)
+        with torch.no_grad():
+            _, np_ = lean.forward(xc, past=heap.as_past(), q_positions=pc_)
+        heap.append(np_, mc)
+        npos += xc.shape[1]
+    g.set_prefix(heap.past, heap.size())
+    fb = GEV.VectorizedFrameBuilder(lean, code)
+    bs = GEV.BatchedSnap(lean.device)
+    reg = {"PC": 0, "AX": 5, "SP": 0xFC, "BP": 0xFC, "STACK0": 0}
+    L = lean.QL.L
+    x, pos = fb.build(reg, None, heap.size())
+    hidden = g.forward_frame(x, pos)
+    state = hidden[0, -1]
+    key = (heap.size(), x.shape[1])
+    t_replay = _timeit(lambda: g._graphs[key].graph.replay(), device, n=500, warmup=50)
+    t_build = _timeit(lambda: fb.build(reg, None, heap.size()), device, n=500, warmup=50)
+    t_dec = _timeit(lambda: bs.snap_many(
+        state[[L.PC_VAL, L.AX_VAL, L.SP_VAL, L.BP_VAL, L.STK_VAL]]),
+        device, n=500, warmup=50)
+
+    def full():
+        x2, p2 = fb.build(reg, None, heap.size())
+        h = g.forward_frame(x2, p2)
+        s = h[0, -1]
+        _ = bs.snap_many(s[[L.PC_VAL, L.AX_VAL, L.SP_VAL, L.BP_VAL, L.STK_VAL]])
+        _ = float(s[L.HALTED]) > 0.5
+    t_full = _timeit(full, device, n=500, warmup=50)
+    print(f"\n  per-step breakdown of the LANDED graphed driver ({lean.n_layers}L):",
+          flush=True)
+    print(f"    CUDA-graph replay (the {lean.n_layers}-layer kernel schedule) : "
+          f"{t_replay:7.3f} ms   <- the LAUNCH-BOUND FLOOR (megakernel target)",
+          flush=True)
+    print(f"    vectorized frame build (template scatter)      : {t_build:7.3f} ms",
+          flush=True)
+    print(f"    batched register decode (one fp64 value-argmax): {t_dec:7.3f} ms",
+          flush=True)
+    print(f"    FULL step (build + replay + decode)            : {t_full:7.3f} ms",
+          flush=True)
+    print(f"\n  What remains: the graph replay ({t_replay:.2f} ms) is the "
+          f"{lean.n_layers} SEQUENTIAL attn+MLP\n  sub-layers' kernel schedule — a "
+          f"fistful of tiny GEMM/softmax/RMSNorm kernels per\n  layer, each ~60 us to "
+          f"launch, run back-to-back inside the graph.  Collapsing THAT\n  to ~0.1 ms "
+          f"needs a fused MEGAKERNEL (one kernel for the whole bounded-cache step),\n"
+          f"  not a graph (which only removes the CPU launch overhead, not the "
+          f"GPU-side\n  sequential kernel latency).  The residual "
+          f"{max(t_full-t_replay,0):.2f} ms is the vectorized\n  frame build + the "
+          f"decode D2H sync (inherent to feeding the Python control loop).",
+          flush=True)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--device", default="cuda:0")
@@ -375,7 +506,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     t0 = time.time()
     lean = build_lean(device)
     print(f"[built] lean {lean.n_layers}L {lean.n_heads}h head_dim={lean.head_dim} "
-          f"dev={device} (code_from_memory=False; the evict driver's layout) "
+          f"dev={device} (code_from_memory={lean.code_from_memory}; the DEFAULT build) "
           f"build={time.time()-t0:.1f}s", flush=True)
 
     if not args.no_verify:
@@ -388,6 +519,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     curve_vs_S(lean, device, step_counts, kind=args.kind, evict=args.evict)
     decompose(lean, device)
     graph_potential(lean, device)
+    graphed_driver_curve(lean, device, step_counts, kind=args.kind)
     return 0
 
 

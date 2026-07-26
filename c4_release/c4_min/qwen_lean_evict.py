@@ -90,6 +90,7 @@ from .blogspec_layout import NIB_PER_REG
 from .nibble_pure_forward import SP_INIT
 from .qwen_full_vm import (
     CAM_REGS, _REG_TOKEN, _snap, _address_bits, _signed_imm,
+    _overlay_code_frames, _overlay_fetch_query,
 )
 from .qwen_lean_forward import LeanQwenVM
 
@@ -110,6 +111,9 @@ DEFAULT_WATERMARK_ROWS = 4096
 TAG_BOS = 0        # the position-0 ZFOD sink — kept forever
 TAG_REG = 1        # a register/STEP_END frame row — latest-write-wins, per-step
 TAG_STORE = 2      # a §Memory store row — live heap, address-CAM
+TAG_CODE = 3       # a §Memory CODE frame (code-from-memory) — the immutable program,
+                   # appended ONCE after BOS, content-addressed by the fetch CAM, KEPT
+                   # forever (like BOS; position-invariant on the slow RoPE lanes).
 
 
 @dataclass
@@ -391,15 +395,43 @@ class AsyncPruner:
 # ===========================================================================
 def _append_bos(lean: LeanQwenVM, code: List[isa.Instr]
                ) -> Tuple[torch.Tensor, torch.Tensor, List[_RowMeta]]:
-    """Build the BOS sink row (position 0)."""
+    """Build the BOS sink row (position 0).
+
+    In the baked-table layout (``code_from_memory=False``) the program lives in the
+    BOS row's ``CODE_OP[k]/CODE_IMM[k]`` bands (fetch@PC reads them off the query row's
+    own overlay, so the BOS carries the table).  In the default code-from-memory layout
+    (``L.CODE_OP`` length 1, program in the KV §Memory) the BOS is content-free and the
+    program is appended as separate CODE frames by :func:`_append_code_frames`."""
     L = lean.QL.L
     toks = torch.tensor([[V.BOS]], device=lean.device)
     x = lean.embed[toks].clone()
     x[0, 0, L.ONE] = 1.0
-    for k, ins in enumerate(code):
-        x[0, 0, L.CODE_OP[k]] = float(ins.op)
-        x[0, 0, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
+    if not lean.code_from_memory:
+        for k, ins in enumerate(code):
+            x[0, 0, L.CODE_OP[k]] = float(ins.op)
+            x[0, 0, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
     return x, torch.tensor([0], device=lean.device), [_RowMeta(TAG_BOS)]
+
+
+def _append_code_frames(lean: LeanQwenVM, code: List[isa.Instr], pos: int
+                        ) -> Tuple[torch.Tensor, torch.Tensor, List[_RowMeta]]:
+    """Build the §Memory CODE frames (code-from-memory) — one MEM row per instruction,
+    ``IS_CODE=1`` + ``CODE_KEY_BIN=bits(i)`` + ``CODE_OPV/CODE_IMMV``.  Appended ONCE
+    right after the BOS sink; the fetch CAM address-matches them at any future position
+    (content-addressed on the slow RoPE lanes, like the store log), so they PERSIST and
+    are TAG_CODE (never evicted).  Mirrors the naive window's ``_overlay_code_frames``
+    (:func:`qwen_full_vm._overlay_code_frames`), one instruction per row."""
+    L = lean.QL.L
+    n = len(code)
+    toks = torch.tensor([[V.MEM] * n], device=lean.device)
+    x = lean.embed[toks].clone()
+    for i in range(n):
+        x[0, i, L.ONE] = 1.0
+    # write the code frames at row 0, columns 0..n-1 (base_pos=0 in THIS sub-window).
+    _overlay_code_frames(x, L, code, base_pos=0)
+    positions = torch.arange(pos, pos + n, device=lean.device)
+    meta = [_RowMeta(TAG_CODE) for _ in range(n)]
+    return x, positions, meta
 
 
 def _append_store(lean: LeanQwenVM, code: List[isa.Instr], addr: int, val: int,
@@ -410,9 +442,10 @@ def _append_store(lean: LeanQwenVM, code: List[isa.Instr], addr: int, val: int,
     toks = torch.tensor([[V.MEM]], device=lean.device)
     x = lean.embed[toks].clone()
     x[0, 0, L.ONE] = 1.0
-    for k, ins in enumerate(code):
-        x[0, 0, L.CODE_OP[k]] = float(ins.op)
-        x[0, 0, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
+    if not lean.code_from_memory:
+        for k, ins in enumerate(code):
+            x[0, 0, L.CODE_OP[k]] = float(ins.op)
+            x[0, 0, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
     x[0, 0, L.IS_STORE] = 1.0
     for b, bit in enumerate(_address_bits(addr, ADDR_BITS)):
         x[0, 0, L.ADDR_BIN + b] = bit
@@ -429,15 +462,17 @@ def _append_reg_frame(lean: LeanQwenVM, code: List[isa.Instr], reg_state: dict,
     """Build the step's 5 register markers + STEP_END query row."""
     from .blogspec_memory import ADDR_BITS
     QL, L = lean.QL, lean.QL.L
+    cfm = lean.code_from_memory
     stream = [_REG_TOKEN[r] for r in CAM_REGS] + [V.STEP_END]
     toks = torch.tensor([stream], device=lean.device)
     x = lean.embed[toks].clone()
     Sn = x.shape[1]
     for i in range(Sn):
         x[0, i, L.ONE] = 1.0
-        for k, ins in enumerate(code):
-            x[0, i, L.CODE_OP[k]] = float(ins.op)
-            x[0, i, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
+        if not cfm:
+            for k, ins in enumerate(code):
+                x[0, i, L.CODE_OP[k]] = float(ins.op)
+                x[0, i, L.CODE_IMM[k]] = float(_signed_imm(ins.imm))
     for hh, reg in enumerate(CAM_REGS):
         p = hh
         for j, nv in enumerate(V.nibbles_of_value(reg_state[reg], NIB_PER_REG)):
@@ -446,6 +481,10 @@ def _append_reg_frame(lean: LeanQwenVM, code: List[isa.Instr], reg_state: dict,
         x[0, p, QL.IS_TOK] = 1.0
     for hh in range(len(CAM_REGS)):
         x[0, -1, QL.ROLE + hh] = 1.0
+    if cfm:
+        # code-from-memory: the STEP_END row also carries the fetch@PC query, which
+        # the code CAM address-matches against the persistent CODE frames.
+        _overlay_fetch_query(x, L, reg_state["PC"])
     if lean.subset.memory and load_addr is not None:
         x[0, -1, L.IS_LOAD] = 1.0
         for b, bit in enumerate(_address_bits(load_addr, ADDR_BITS)):
@@ -526,6 +565,16 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
     cache.append(new_past, mb)
     next_pos = 1
     tokens_since_prune = 0
+
+    # CODE-FROM-MEMORY: seed the immutable CODE frames ONCE, right after the BOS sink.
+    # They persist forever (TAG_CODE, never evicted) and are content-addressed by the
+    # fetch@PC query on every STEP_END row — mirroring the naive window's code frames.
+    if lean.code_from_memory:
+        xc, pc_, mc = _append_code_frames(lean, code, next_pos)
+        with torch.no_grad():
+            _, new_past = lean.forward(xc, past=cache.as_past(), q_positions=pc_)
+        cache.append(new_past, mc)
+        next_pos += xc.shape[1]
 
     max_rows = cache.size()
     max_bytes = cache.bytes()
