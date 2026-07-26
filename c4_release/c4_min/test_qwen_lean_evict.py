@@ -83,15 +83,28 @@ def test_evict_byte_identical_to_naive(lean_memcmp, name, code, evict):
 
 
 def test_register_loop_cache_is_bounded(lean_memcmp):
-    """A register-only loop keeps a CONSTANT cache (BOS + one frame = 7 rows) over
-    its whole run — the per-step register-frame supersession bounds it."""
-    code = _A([("IMM", 20), ("PSH", 0), ("IMM", 1), ("SUB", 0),
-               ("BNZ", 1), ("HALT", 0)])
+    """A register-only loop keeps a CONSTANT cache over its whole run — the per-step
+    register-frame supersession bounds it (independent of the step count).
+
+    The bound is a small CONSTANT set by the layout, NOT growing with steps:
+      * baked-table layout (``code_from_memory=False``): BOS + one 6-row register
+        frame = 7 rows;
+      * code-from-memory layout (the DEFAULT): the program also lives in the cache as
+        one persistent CODE frame per instruction (TAG_CODE, never evicted), so the
+        bound is BOS(1) + n_code CODE frames + one 6-row register frame.
+    Either way the cache is BOUNDED (constant, step-count-independent) — the point of
+    the eviction."""
+    prog = [("IMM", 20), ("PSH", 0), ("IMM", 1), ("SUB", 0),
+            ("BNZ", 1), ("HALT", 0)]
+    code = _A(prog)
+    n_code = len(code) if lean_memcmp.code_from_memory else 0
+    bound = 1 + n_code + 6                                # BOS + CODE frames + reg frame
     r = EV.run_program_lean_evict(lean_memcmp, code, max_steps=256, evict="async")
     assert r.steps == 82
-    assert r.max_cache_rows <= 8, r.max_cache_rows       # BOS + one frame (+ store)
-    # the cache never grew with the step count.
-    assert max(r.cache_size_trace) <= 8, r.cache_size_trace
+    assert r.max_cache_rows <= bound, (r.max_cache_rows, bound)
+    # the cache never grew with the step count (constant across the whole run).
+    assert max(r.cache_size_trace) <= bound, (r.cache_size_trace, bound)
+    assert min(r.cache_size_trace) == max(r.cache_size_trace), r.cache_size_trace
 
 
 def test_async_prune_reclaims_freed_rows(lean_memcmp):
