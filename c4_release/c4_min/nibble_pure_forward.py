@@ -1277,7 +1277,23 @@ _MEM_ADDR_LOCAL = [21, 22, 23, 24]
 _MEM_VAL_LOCAL = [25, 26, 27, 28]
 
 
-def make_overlay(code: List[isa.Instr], L: PureForwardLayout, store_frames=None):
+def _lay_store_row(x, L, p: int, addr: int, val: int) -> None:
+    """Tag stream position ``p`` as a §Memory store KV row: IS_STORE=1, the token
+    dropped from the ingest (IS_FRAME_BYTE=0), ADDR_BIN expanded from ``addr`` and
+    VAL_NIB from ``val``.  A ``val==0`` row is a ZFOD TOMBSTONE (a vanilla store of
+    0 — the model op the blog spec's free() performs, §689-691).  The CAM keys only
+    on these overlay bands (independent of the token id at ``p``), so a store row
+    can ride ANY position — this is what lets one step carry several store rows."""
+    x[0, p, L.IS_STORE] = 1.0
+    x[0, p, L.IS_FRAME_BYTE] = 0.0
+    for b, bit in enumerate(_address_bits(addr)):
+        x[0, p, L.ADDR_BIN + b] = bit
+    for j, nv in enumerate(V.nibbles_of_value(val & 0xFFFFFFFF, 16)):
+        x[0, p, L.VAL_NIB + j] = float(nv)
+
+
+def make_overlay(code: List[isa.Instr], L: PureForwardLayout, store_frames=None,
+                 frame_spare_stores=None):
     """Return an ``overlay(x)`` that writes, in-place on the embedded stream ``x``
     ([1,S,D]): the PROGRAM into the DATA bands at every position (so fetch@PC works
     at the last position), and the ROLE / IS_FRAME_BYTE frame-slot tags on each
@@ -1289,8 +1305,16 @@ def make_overlay(code: List[isa.Instr], L: PureForwardLayout, store_frames=None)
     ``IS_STORE=1`` + ``ADDR_BIN`` expanded from the frame's MEM addr bytes +
     ``VAL_NIB`` from the MEM val bytes. This is the §Memory store log riding in the
     emitted MEM tokens; marking which MEM token is a store is the driver's routing
-    bookkeeping (it fetched the op), exactly the ``KVMemory`` contract."""
+    bookkeeping (it fetched the op), exactly the ``KVMemory`` contract.
+
+    ``frame_spare_stores`` (optional ``{frame_idx: {local_pos: (addr, val)}}``) lays
+    EXTRA §Memory store rows on SPARE token positions of a frame — the VANILLA
+    IN-STEP TOMBSTONE path (``C4_VANILLA_TOMBSTONE``).  Each ``(addr, 0)`` is a real
+    zero-write tombstone freeing ``addr``; distributing N of them across the free /
+    return step's spare positions frees an N-slot frame in ONE step (0 extra STEPS).
+    ``None`` ⇒ byte-identical to the stock overlay (golden ``8f4dd780`` unchanged)."""
     store_frames = store_frames or set()
+    frame_spare_stores = frame_spare_stores or {}
 
     def overlay(x: torch.Tensor) -> None:
         Sn = x.shape[1]
@@ -1327,6 +1351,11 @@ def make_overlay(code: List[isa.Instr], L: PureForwardLayout, store_frames=None)
                     hi = int(x[0, pos + vloc, L.CUR_NIB + 1])
                     x[0, mem_pos, L.VAL_NIB + 2 * bi + 0] = float(lo)
                     x[0, mem_pos, L.VAL_NIB + 2 * bi + 1] = float(hi)
+            # VANILLA IN-STEP TOMBSTONES: extra store rows on this frame's SPARE
+            # positions (the free/return step's zero-writes, distributed across the
+            # token budget the register updates leave unused).
+            for local, (saddr, sval) in frame_spare_stores.get(frame_idx, {}).items():
+                _lay_store_row(x, L, pos + local, saddr, sval)
             pos += V.FRAME_LEN
             frame_idx += 1
         for role in range(N_ROLES):
@@ -1371,7 +1400,7 @@ def _emit_frame_from_state(state: torch.Tensor, L: PureForwardLayout,
 def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
                      max_steps: int = 512, verbose: bool = False,
                      collect_tokens: bool = False, fio=None, data_seg=None,
-                     mask: int = 0xFF):
+                     mask: int = 0xFF, frame_tombstones=None, report=None):
     """Execute ``code`` with the PURE-FORWARD step: every VM step is ONE
     ``model.forward`` over the growing token stream (state read from the prior
     frame by the block-0 attention; the op computed by the FFN weights), and the
@@ -1394,8 +1423,20 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
     ``data_seg`` (``{byte_addr: byte}``) seeds the read-only data segment.  When
     ``fio`` is None this argument is inert and the driver is byte-identical to the
     original.
-    """
+
+    VANILLA IN-STEP TOMBSTONE (``C4_VANILLA_TOMBSTONE``): ``frame_tombstones`` maps
+    ``emitted_frame_idx -> [free_addr, ...]`` — free addresses to tombstone (real
+    zero-writes) on that step's SPARE token positions (see
+    ``nibble_vanilla_tombstone``).  The driver distributes each frame's frees across
+    the slack the register updates leave unused (0 extra STEPS); it records each
+    zero-write in ``store_log`` so the cache manager / eviction schedule reclaims the
+    zeroed rows.  ``None`` (or the flag OFF) ⇒ byte-identical to the stock driver."""
     from . import nibble_filesys as _FS
+    from . import nibble_vanilla_tombstone as _TS
+    frame_tombstones = frame_tombstones or {}
+    _tomb_on = bool(frame_tombstones) and _TS.vanilla_tombstone_enabled()
+    frame_spare_stores: Dict[int, Dict[int, Tuple[int, int]]] = {}
+    tomb_spill: Dict[int, List[int]] = {}           # honest report of un-fit frees
     init_frame = build_frame_tokens(0, 0, SP_INIT, SP_INIT, 0)
     stream: List[int] = [V.BOS] + init_frame
     trace: List[int] = []
@@ -1403,10 +1444,13 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
     store_log: Dict[int, Tuple[int, int]] = {}      # frame_idx -> (addr, val) for file marshalling
     cur_pc = 0                                       # PC of the step about to run
     cur_sp = SP_INIT
+    prev_regs = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
     frame_idx = 0                                    # emitted-frame counter (0 = init)
     for _ in range(max_steps):
-        # the overlay marks past store frames (KV entries) + program + roles.
-        overlay = make_overlay(code, L, store_frames=store_frames)
+        # the overlay marks past store frames (KV entries) + program + roles + the
+        # in-step tombstones distributed onto spare frame positions (VANILLA free).
+        overlay = make_overlay(code, L, store_frames=store_frames,
+                               frame_spare_stores=(frame_spare_stores or None))
         toks = torch.tensor([stream])
         with torch.no_grad():
             x = model.embed[toks].clone()
@@ -1461,6 +1505,35 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
             state, L, is_store=is_store, store_addr=s_addr, store_val=s_val)
         trace.append(ax_byte)
         frame_idx += 1
+        # VANILLA IN-STEP TOMBSTONE: if frees are requested at this emitted frame,
+        # distribute them across the frame's SPARE token positions (0 extra steps).
+        # ``changed_regs`` = which registers moved this step -> which role-byte slots
+        # are NOT slack (a store row there would drop the byte from ingest; unchanged
+        # bytes fall back to the prior frame, so they ARE slack).
+        if _tomb_on and frame_idx in frame_tombstones:
+            cur_regs = {
+                "PC": npc, "AX": _snap_lane(state[L.AX_VAL]) & 0xFFFFFFFF,
+                "SP": sp, "BP": _snap_lane(state[L.BP_VAL]) & 0xFFFFFFFF,
+                "STACK0": _snap_lane(state[L.STK_VAL]) & 0xFFFFFFFF,
+            }
+            changed = {r for r in cur_regs if cur_regs[r] != prev_regs.get(r)}
+            # the frame's own MEM token is a live store this step -> reserve it.
+            spare, spill = _TS.distribute_tombstones(
+                list(frame_tombstones[frame_idx]), changed_regs=changed,
+                reserve_mem=is_store)
+            if spare:
+                frame_spare_stores[frame_idx] = spare
+                for _lp, (taddr, tval) in spare.items():
+                    store_log[frame_idx] = (taddr, tval)   # last-write bookkeeping
+            if spill:
+                tomb_spill[frame_idx] = spill
+            prev_regs = cur_regs
+        else:
+            prev_regs = {
+                "PC": npc, "AX": _snap_lane(state[L.AX_VAL]) & 0xFFFFFFFF,
+                "SP": sp, "BP": _snap_lane(state[L.BP_VAL]) & 0xFFFFFFFF,
+                "STACK0": _snap_lane(state[L.STK_VAL]) & 0xFFFFFFFF,
+            }
         if is_store:
             store_frames.add(frame_idx)             # this emitted frame is a KV entry
             store_log[frame_idx] = (s_addr, s_val)
@@ -1480,6 +1553,13 @@ def run_pure_forward(model, L: PureForwardLayout, code: List[isa.Instr],
         cur_sp = sp
         if halted or npc < 0 or npc >= len(code):
             break
+    if report is not None:
+        # honest tombstone report: which frame carried which zero-writes, and any
+        # frees that did NOT fit the step's slack (spill = would need a next step).
+        report["frame_spare_stores"] = frame_spare_stores
+        report["tomb_spill"] = tomb_spill
+        report["n_tombstones"] = sum(len(v) for v in frame_spare_stores.values())
+        report["n_spill"] = sum(len(v) for v in tomb_spill.values())
     if collect_tokens:
         return trace, stream
     return trace
