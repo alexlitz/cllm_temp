@@ -1,21 +1,32 @@
 """THE DELIVERABLE — a FULL-functionality neural VM where EVERY C4 instruction is
 NATIVE in-model (no subroutine dispatch), using the COMPACT efficient ALU (gated
-byte-schoolbook MUL + base-16 recurrent DIV-MOD, NO 45 GB lookup table), run VERY
+byte-schoolbook MUL + LEAN radix-16 DIV-MOD, NO 45 GB lookup table), run VERY
 FAST via CONDITIONAL BLOCK SPARSITY (per-op active-unit gather → dense cuBLAS GEMM).
 
-The whole model is genuinely fp32 (zero fp64 params); DIV/MOD are the fp32 base-16
-recurrent long division.
+The whole model is genuinely fp32 (zero fp64 params); DIV/MOD are the fp32 lean
+radix-16 digit-recurrence divide (``div_radix16_lean``, 80 blocks) — the DEFAULT
+since ``C4_DIV_LEAN`` was flipped on (byte-exact 875/875 standalone + 288/288 in-VM).
+
+THE CANONICAL FULL-ISA MODEL (see ``docs/CANONICAL_FULL_ISA_MODEL.md``): with the
+lean divide wired in, the full ISA is 107 applied blocks per DIV step (81 lean
+divide blocks + 26 shared/other-op), 44 stored under recurrent-divmod.  A non-DIV
+op block-skips the divide span (~7-26 blocks).  This 107-block model REPLACES the
+older "291 applied / 144 stored" quote (that was the base-16 long-division divide,
+now behind the ``C4_DIV_LONGDIV=1`` escape hatch) and the standalone
+``nibble_pure_forward_complete`` 238-block family (a SEPARATE model — see the note).
 
 Assembled from three verified pieces already in this tree:
 
   * ``qwen_full_vm.build(subset=SUBSET_FULL, efficient_alu=True,
     recurrent_divmod=True)`` — the FULL fused VM whose MUL/DIV/MOD are the
-    ``nibble_alu32`` fp32 gadgets (schoolbook byte MUL + base-16 recurrent long
-    division) instead of the 256×256×3 lookup table.  All ops NATIVE; no
-    subroutine dispatch.  This build is DEEP: 144 distinct blocks, 291 APPLIED
-    layers after the recurrent-divmod unroll, H=1728, I=2608 → ~14.7 GB dense FFN
-    weights (the lookup-table FULL VM was ~51.6 GB; both OOM a 24 GB card once the
-    per-forward activation is added, which is why block sparsity is required).
+    ``nibble_alu32`` fp32 gadgets (schoolbook byte MUL) + the ``div_radix16_lean``
+    80-block divide instead of the 256×256×3 lookup table.  All ops NATIVE; no
+    subroutine dispatch.  The lean-divide default is 44 distinct blocks, 107 APPLIED
+    layers per DIV step after the recurrent-divmod unroll (was 144/291 under the
+    retired long-division default; ``C4_DIV_LEAN=0`` → 45/115 hardened,
+    ``C4_DIV_LONGDIV=1`` → 58/205 base long division).  H=1728, I=2608 → the dense
+    FFN OOMs a 24 GB card once the per-forward activation is added, which is why
+    block sparsity is required.
 
   * ``perlayer_conditional_sparse.ConditionalBlockLean`` — the per-layer
     conditional-block kernel: it GATHERS the union of active FFN units for the
@@ -70,8 +81,8 @@ class FullNativeFast:
     cond: PC.ConditionalBlockLean        # the CONDITIONAL run model (active block, on GPU)
     active_units: List[torch.Tensor]     # per-layer union of active FFN units (byte-safe)
     device: str
-    n_layers_applied: int                # APPLIED layers per step (291 for recurrent divmod)
-    n_layers_stored: int                 # distinct blocks stored (144)
+    n_layers_applied: int                # APPLIED layers per DIV step (107 lean; live from build)
+    n_layers_stored: int                 # distinct blocks stored (44 lean; live from build)
     hidden_size: int
     intermediate: int                    # dense I per layer
     dense_gb: float                      # dense FFN weight footprint
@@ -489,7 +500,7 @@ def verify_full_isa(bundle: FullNativeFast, *, block_steps: int = 32,
     PRIMARY gate is ``cond_exact`` (conditional-block model == word reference).  As
     an extra byte-identity check of the sparse kernel, small programs (<=
     ``dense_check_max_steps`` VM steps) also cross-check conditional == DENSE; the
-    dense reference forward is a CPU 291-layer pass, so we skip it for long loops
+    dense reference forward is a CPU 107-layer pass, so we skip it for long loops
     (their correctness is already established by ``cond_exact``)."""
     progs = _isa_test_programs()
     results = {}
@@ -614,7 +625,7 @@ def measure(bundle: FullNativeFast, *, batches: Sequence[int] = (1, 16, 64, 128)
             if cuda:
                 free, _tot = torch.cuda.mem_get_info(torch.device(device))
                 # conservative estimate: residual + per-layer attention scores over
-                # the deep (291-layer) stack; a CUDA illegal-access from an over-large
+                # the deep (107-layer lean-divide) stack; a CUDA illegal-access from an over-large
                 # batch corrupts the context irrecoverably, so guard generously.
                 nh = bundle.cond.n_heads
                 est = (B * S * bundle.hidden_size * 4 * 8
@@ -665,23 +676,30 @@ def measure(bundle: FullNativeFast, *, batches: Sequence[int] = (1, 16, 64, 128)
 # DIVIDE integration state (honest report).
 # ===========================================================================
 def divide_integration_state() -> Dict[str, object]:
-    """Report the DIV/MOD divide the shipped fast VM uses: the fp32 base-16
-    recurrent long division (``qwen_full_vm.build(..., recurrent_divmod=True)``).
+    """Report the DIV/MOD divide the shipped fast VM uses: the fp32 LEAN radix-16
+    digit-recurrence divide (``div_radix16_lean``, DEFAULT ``C4_DIV_LEAN``, wired
+    into ``qwen_full_vm.build(..., recurrent_divmod=True)``).
 
     The historical fp64 LOG-SINK reciprocal divide has been RETIRED from the
     production path (the whole model is now genuinely fp32, zero fp64 params).  The
-    recurrent long division is byte-exact vs ``isa.interpret`` / Python //,% in
-    pure fp32, verified through the real forward by ``verify_full_isa``."""
+    lean radix-16 divide is byte-exact vs ``isa.interpret`` / Python //,% in pure
+    fp32 (875/875 standalone, 288/288 in-VM), verified through the real forward by
+    ``verify_full_isa``.  ``C4_DIV_LEAN=0`` restores the 88-block hardened variant;
+    ``C4_DIV_LONGDIV=1`` restores the base-16 long division (the retired default)."""
     return {
-        "divide": "fp32 base-16 recurrent long division (recurrent_divmod=True)",
+        "divide": "fp32 lean radix-16 digit-recurrence divide "
+                  "(div_radix16_lean, C4_DIV_LEAN default, recurrent_divmod=True)",
         "fp64_params": 0,
         "model_dtype": "torch.float32",
         "logsink_retired": "the fp64 log-sink reciprocal divide (nibble_logsink_*) "
                            "has been removed from the production path; DIV/MOD are the "
-                           "fp32 long division so the model is genuinely fp32-vanilla.",
-        "depth": "the DIV/MOD block group is the 262-iteration base-16 long division, "
-                 "reused as ONE iteration body under recurrent_divmod (291 applied "
-                 "layers for the full ISA, stored blocks << applied).",
+                           "fp32 lean radix-16 divide so the model is genuinely fp32-vanilla.",
+        "depth": "the lean radix-16 divide is 80 blocks (+1 result-copy relay = 81 "
+                 "lean divide blocks), reused as ONE 9-block iteration body under "
+                 "recurrent_divmod -> the full ISA is 107 APPLIED layers per DIV step "
+                 "(81 lean divide + 26 shared/other-op), 44 stored blocks; a non-DIV op "
+                 "block-skips the divide span.  (Was 291 applied / 262-block long "
+                 "division; that is now the C4_DIV_LONGDIV=1 escape hatch.)",
         "byte_exact": "8-bit DIV/MOD (the corpus / isa.interpret width) and the full "
                       "32-bit range are byte-exact through the real forward in fp32 "
                       "(incl b=1, b=2^32-1, b>a, div-by-zero) — verified by "
@@ -715,7 +733,7 @@ def deliver(device: str = "cuda:1", verbose: bool = True) -> Dict[str, object]:
     print("\nMEASURE — end-to-end ms/step via conditional sparsity:", flush=True)
     msummary = measure(bundle, verbose=verbose)
 
-    print("\nDIVIDE integration state (fp32 recurrent long division):", flush=True)
+    print("\nDIVIDE integration state (fp32 lean radix-16 divide):", flush=True)
     ls = divide_integration_state()
     for k, v in ls.items():
         print(f"  {k}: {v}", flush=True)
