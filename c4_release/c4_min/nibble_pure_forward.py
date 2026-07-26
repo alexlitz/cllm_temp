@@ -67,7 +67,7 @@ from .nibble_vm import (
     compile_fold, compile_ffn, _empty_spec, _load_ffn, _zero_attn,
     _snap_lane, VALVOCAB,
 )
-from .blogspec_model import Transformer, softmax1
+from .blogspec_model import Transformer, Attn, softmax1
 
 
 def _snap_nib(x: float) -> int:
@@ -338,18 +338,226 @@ def ingest_gqa_enabled() -> bool:
 def ingest_wide_enabled() -> bool:
     """``C4_INGEST_WIDE`` (default OFF): use the 1-query + 1-KV wide-value ingest.
 
-    OFF is a strict no-op (``build_pure_forward_model`` never consults this) ⇒ the
-    golden ``_fingerprint_build`` hash ``8f4dd780`` is unchanged.  ON is honoured only
-    by the validated wide-ingest builders + probe (``_wide_ingest_integrated.py``),
-    which need the 80-dim PREROUTE/GATHER band + a 1-head block-0 (a restructure of the
-    shared builder), so the production ``build_pure_forward_model`` still bakes the
-    20-head (or GQA) ingest until that restructure lands."""
+    OFF is a strict no-op (the builders skip the whole wide path) ⇒ the golden
+    ``_fingerprint_build`` hash ``8f4dd780`` is unchanged.  ON is WIRED into the
+    production ``build_pure_forward_model`` AND ``build_pure_forward_complete_model``:
+    it allocates the 80-dim PREROUTE/GATHER band, prepends the
+    ``wide-preroute | wide-gather | wide-snap`` blocks in front of block 0, and swaps
+    the wide-gather block's attention for a 1-head Attn carrying the single wide gather
+    head (block-0 ingest heads 20/21 → 1).  Byte-EXACT through ``run_pure_forward`` +
+    ``run_pure_forward_complete`` vs the stock 20-head build (the reconstruction is a
+    scaled concat the fixed 1/wtot rescale + nibble re-quant recover to the bit).  The
+    flag-ON fingerprint MOVES (intended); flag-OFF stays ``8f4dd780``."""
     import os
     return os.environ.get("C4_INGEST_WIDE", "0") not in ("0", "", "false", "False")
 
 
 # Recommended ALiBi recency for the wide head (inside the fp32 byte-exact window).
 WIDE_INGEST_RECENCY = 0.5
+
+
+# ===========================================================================
+# WIDE-INGEST BUILDERS (production form of ``_wide_ingest_integrated.py``).
+#
+# The three stages that replace the 20-head (or 1-KV GQA) role-CAM ingest with a
+# SINGLE query head + SINGLE KV head, wired into ``build_pure_forward_model`` /
+# ``build_pure_forward_complete_model`` behind ``C4_INGEST_WIDE`` (default OFF):
+#
+#   (A) ``compile_wide_preroute`` — a SwiGLU FFN block (attn zeroed) that computes
+#       ``PREROUTE[2r+b] = CUR_NIB[b]·[ROLE==r]`` on every frame-byte token.
+#   (B) ``bake_wide_ingest_head`` — the block-0 attention: ONE role-AGNOSTIC query
+#       head + ONE KV head (``V`` = identity copy of the 40 PREROUTE dims) whose
+#       ``W_o`` writes the scaled concat into the fresh GATHER band.  Needs
+#       ``head_dim >= 2 + 2*N_ROLES`` (= 42), which a 1-head block-0 (head_dim=dim)
+#       trivially satisfies.  ALiBi recency = ``WIDE_INGEST_RECENCY`` (0.5).
+#   (C) ``compile_wide_rescale`` — a SwiGLU FFN block that writes
+#       ``reg_nib[r,2*bi+b] = GATHER[2r+b] / wtot_r`` (self-clearing the reg band
+#       first), with ``wtot_r`` the FIXED positional weight fraction (baked at
+#       n_frames=1, length-invariant because the huge match logit makes softmax1
+#       scale-free in n_frames).
+#   (D) ``compile_wide_nibble_snap`` — an in-weight integer re-quant of the reg
+#       nibble band (the argmax the spec applies at decode).  LOAD-BEARING: the
+#       recompose weights nibble j by ``16^j``, so a ~1e-8 gather residue on a high
+#       nibble becomes ``~1.5e-3`` in the recomposed scalar — enough to shift the
+#       triangular-pulse opcode decode off its integer.  Snapping first keeps the
+#       recompose bit-clean.  The stock 20-head ingest writes exact nibbles so it
+#       never needs this.  The downstream recompose (``compile_nibble_to_scalar`` on
+#       the existing ingest+recompose block) then folds clean nibbles -> scalar.
+#
+# The block ORDER when the flag is ON becomes (in front of the stock block 0):
+#   wide-preroute (A) | wide-gather (B attn=wide head; C rescale FFN) | wide-snap (D)
+#   | ingest+recompose (the STOCK block 0, attn now ZEROED — gather moved to B).
+# So block 0's original 20 (or 21) ingest heads collapse to the ONE wide head on the
+# wide-gather block; block 0 itself carries no ingest attention.  +3 stored blocks
+# (flag-ON only); flag-OFF is a strict no-op (golden ``8f4dd780`` unchanged).
+# ===========================================================================
+def extend_layout_for_wide_ingest(L) -> None:
+    """Allocate the 80 fresh dims the wide ingest needs (flag-ON only):
+    ``PREROUTE`` (2*N_ROLES = 40, the per-(role, byte-half) role⊙nibble gate) +
+    ``GATHER`` (2*N_ROLES = 40, where the wide head's ``W_o`` writes the scaled
+    concat — separate from PREROUTE so the query row's own PREROUTE is never summed
+    into its gather).  Must be called BEFORE ``L.D`` is fixed by the head-dim pad."""
+    L.PREROUTE = L._band("PREROUTE", 2 * N_ROLES)
+    L.GATHER = L._band("GATHER", 2 * N_ROLES)
+
+
+def _wide_wtot_fractions(recency: float):
+    """``wtot_r = Σ_frames w_{f,r}`` for each role r — the FIXED rescale constants,
+    computed at n_frames=1 (length-invariant: the huge match logit ``INGEST_EFF``
+    makes softmax1 scale-free in n_frames, so the per-frame weight fraction of role r
+    is the same at any sequence length).  Same construction as
+    ``_wide_ingest_integrated._wtot_fractions`` at the bake length (BOS + one frame),
+    so the wired build reuses the reference physics exactly."""
+    M = INGEST_EFF
+    S_len = 1 + V.FRAME_LEN
+    qpos = S_len - 1
+    role_to_local = {rr: lc for lc, rr in _FRAME_ROLE_SLOTS.items()}
+    scores = torch.full((S_len,), -1e30, dtype=torch.float64)
+    for local in _FRAME_ROLE_SLOTS:
+        p = 1 + local
+        scores[p] = M - recency * abs(qpos - p)
+    wsm = softmax1(scores.unsqueeze(0)).squeeze(0)
+    return {r: float(wsm[1 + role_to_local[r]]) for r in range(N_ROLES)}
+
+
+def compile_wide_preroute(L, dim: int) -> Dict[str, torch.Tensor]:
+    """(A) SwiGLU: ``PREROUTE[2r+b] = CUR_NIB[b]·[ROLE==r]`` (the per-role gate a
+    LINEAR W_v cannot form — role & nibble are ADDED on the residual, never
+    multiplied).  One hidden unit per (role r, byte-half b):
+      gate = CUR_NIB[b]                     (the nibble value 0..15)
+      up   = S·(ROLE+r) - 0.5·S             (>0 iff ROLE==r; silu -> S else ~0)
+      down = 1/silu(0.5S) into PREROUTE[2r+b]
+    => hidden = silu(up)·gate = (ROLE==r ? S : 0)·nib ; down scales silu(0.5S)->1."""
+    n_units = 2 * N_ROLES
+    spec = _empty_spec(dim, n_units)
+    u = 0
+    for r in range(N_ROLES):
+        for b in range(2):
+            spec["W_gate"][u, L.CUR_NIB + b] = 1.0    # gate = the nibble value
+            spec["W_up"][u, L.ROLE + r] = S           # up = S iff ROLE==r ...
+            spec["b_up"][u] = -0.5 * S                # ... (silu(0.5S) on, ~0 off)
+            spec["W_down"][L.PREROUTE + 2 * r + b, u] = 1.0 / SILU_HALF
+            u += 1
+    return spec
+
+
+def compile_wide_rescale(L, reg_bases: Dict[str, int], dim: int,
+                         recency: float = WIDE_INGEST_RECENCY
+                         ) -> Dict[str, torch.Tensor]:
+    """(C) SwiGLU: ``reg_nib[r,2*bi+b] = GATHER[2r+b] / wtot_r`` (self-clearing the
+    register nibble band first, SET semantics).  ``wtot_r`` is the fixed positional
+    weight fraction from :func:`_wide_wtot_fractions`."""
+    wtot = _wide_wtot_fractions(recency)
+    reads = []                                        # (dst_nib_dim, src_gather_dim, inv)
+    for r in range(N_ROLES):
+        r_idx, bi = divmod(r, BYTES_PER_REG)
+        reg_base = reg_bases[INGEST_REGS[r_idx]]
+        inv = 1.0 / wtot[r]
+        for b in range(2):
+            reads.append((reg_base + 2 * bi + b, L.GATHER + 2 * r + b, inv))
+    clears = sorted({dst for dst, _, _ in reads})
+    n_units = len(clears) + len(reads)
+    spec = _empty_spec(dim, n_units)
+    u = 0
+    for dst in clears:                                # clear each reg nibble dim (SET)
+        spec["W_up"][u, L.ONE] = S
+        spec["W_gate"][u, dst] = 1.0
+        spec["W_down"][dst, u] += -1.0 / SILU_S
+        u += 1
+    for dst, src, inv in reads:                       # add GATHER[src]/wtot_r
+        spec["W_up"][u, L.ONE] = S
+        spec["W_gate"][u, src] = 1.0
+        spec["W_down"][dst, u] += inv / SILU_S
+        u += 1
+    return spec
+
+
+def compile_wide_nibble_snap(L, reg_bases: Dict[str, int], dim: int,
+                             n_nib: int = 8) -> Dict[str, torch.Tensor]:
+    """Re-quant (SNAP) each register nibble to its exact integer 0..15 IN WEIGHTS —
+    the argmax re-quant the spec applies at decode, done here on the residual so the
+    downstream recompose (``Σ 16^j·nib_j``) reads CLEAN nibbles.
+
+    WHY THIS IS LOAD-BEARING FOR THE WIDE INGEST: the wide gather leaves a ~1e-8
+    residue on the (all-zero) HIGH nibbles of a small register (the cross-frame
+    softmax weight the fixed 1/wtot rescale cannot cancel to the bit).  At the
+    nibble level that residue is far inside the 0.5 argmax-snap margin (the ingest is
+    byte-exact), but the recompose amplifies nibble j by ``16^j`` — nibble 4's 1e-8
+    residue becomes ``65536·1e-8 ≈ 1.5e-3`` in PC_VAL, enough to shift the
+    triangular-pulse opcode decode off its integer (OP_IS -> 0.98) and corrupt the
+    op.  The stock 20-head ingest writes exact nibbles so it never needs this; the
+    wide ingest does.  Snapping the nibble band BEFORE the recompose restores exact
+    integers, so PC_VAL/AX_VAL/… are bit-clean and every op decodes byte-identically.
+
+    Snap = a monotone 16-cell STAIRCASE: ``snap(v) = Σ_{t=1}^{15} ramp(v-(t-0.5))``
+    where each ``ramp`` is a sharp relu step (width ``w``) rising 0->1 across the
+    half-integer boundary.  For an integer-ish ``v ≈ n`` (n in 0..15) exactly ``n``
+    of the 15 steps are on, so the sum is ``n``.  SET semantics (self-clear first).
+    Residue-immune to any |residue| < 0.5 - w/2.  ``n_nib`` nibbles per register."""
+    from .nibble_vm import RELU_S
+    w = 0.2
+    regs = sorted({reg_bases[r] for r in INGEST_REGS})
+    dsts = [(rb + j) for rb in regs for j in range(n_nib)]
+    # per dst: 1 self-clear + 15 steps * 2 relu (rise/fall of each staircase step).
+    n_units = len(dsts) * (1 + 15 * 2)
+    spec = _empty_spec(dim, n_units)
+    u = 0
+    for dst in dsts:
+        spec["W_up"][u, L.ONE] = S                    # self-clear the nibble (SET)
+        spec["W_gate"][u, dst] = 1.0
+        spec["W_down"][dst, u] += -1.0 / SILU_S
+        u += 1
+        for t in range(1, 16):                        # 15 staircase steps at t-0.5
+            lo = t - 0.5
+            for idx, thr in enumerate((lo, lo + w)):
+                spec["W_up"][u, dst] = RELU_S
+                spec["b_up"][u] = -RELU_S * thr
+                spec["W_gate"][u, L.ONE] = 1.0
+                spec["W_down"][dst, u] += (1.0 if idx == 0 else -1.0) / (RELU_S * w)
+                u += 1
+    return spec
+
+
+def bake_wide_ingest_head(attn, L, recency: float = WIDE_INGEST_RECENCY) -> None:
+    """(B) ONE query head + ONE KV head on a 1-head block-0 (head_dim = dim).
+      K: match ch keys +smag on ONE (role-AGNOSTIC); penalty ch keys -p·ONE +
+         p·IS_FRAME_BYTE (a non-frame-byte / query row scores -p·hs, can never win).
+      Q: match ch +smag on ONE; penalty ch +p·ONE.
+      V: identity copy of the 40 PREROUTE dims into local value channels 2..41.
+      O: copy those value channels -> the FRESH GATHER band (0 on every row, so the
+         gather is the pure scaled concat with no query-row PREROUTE self-pollution).
+    Requires ``attn.n_heads == 1`` and ``head_dim >= 2 + 2*N_ROLES``."""
+    assert attn.n_heads == 1, "wide ingest head requires a 1-head block-0 attn"
+    HD = attn.head_dim
+    assert HD >= 2 + 2 * N_ROLES, (
+        f"wide ingest needs head_dim >= {2 + 2 * N_ROLES} (match + penalty + 40 "
+        f"value channels), got {HD}")
+    hs = attn.scale
+    smag = (INGEST_EFF / hs) ** 0.5
+    PEN = 100.0 * INGEST_EFF
+    p = (PEN / hs) ** 0.5
+    for w in (attn.W_q, attn.W_k, attn.W_v, attn.W_o):
+        w.zero_()
+    attn.alibi_slopes[0] = recency
+    cMATCH, cPEN = 0, 1
+    attn.W_k[cMATCH, L.ONE] = smag
+    attn.W_q[cMATCH, L.ONE] = smag
+    attn.W_k[cPEN, L.ONE] = -p
+    attn.W_k[cPEN, L.IS_FRAME_BYTE] = p
+    attn.W_q[cPEN, L.ONE] = p
+    for k in range(2 * N_ROLES):
+        vch = 2 + k
+        attn.W_v[vch, L.PREROUTE + k] = 1.0
+        attn.W_o[L.GATHER + k, vch] = 1.0
+
+
+def _make_one_head_attn(dim: int, max_seq_len: int):
+    """A fresh 1-head ``Attn`` (softmax1 + ALiBi) to swap into block 0 for the wide
+    ingest — head_dim = dim, so the 40 value channels fit.  Swapping a SINGLE block's
+    Attn keeps every OTHER block byte-identical (they retain their own multi-head
+    Attn with the build-wide n_heads)."""
+    return Attn(dim, n_heads=1, max_seq_len=max_seq_len,
+                positional="alibi", sink="softmax1")
 
 
 # ===========================================================================
@@ -887,6 +1095,17 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
     L = PureForwardLayout(code_size, n_heads=n_heads,
                           include_memory=include_memory, include_cmp=include_cmp,
                           include_muldiv=include_muldiv)
+    _wide = ingest_wide_enabled()
+    if _wide:
+        # 80 fresh dims (PREROUTE 40 + GATHER 40) for the 1-query/1-KV wide ingest.
+        # Allocated BEFORE dim is fixed; they fit in the d_model headroom.  Flag-OFF
+        # this is never called ⇒ the golden layout / hash is unchanged.  Re-fix L.D
+        # (pad to n_heads) so ``dim`` below includes the wide bands even when no other
+        # layout extension (bitwise) runs after this.
+        extend_layout_for_wide_ingest(L)
+        while L._off % n_heads != 0:
+            L._scalar(f"_widepad{L._off}")
+        L.D = L._off
     if include_bitwise:
         from . import nibble_bitwise as _bw
         _bw.extend_layout_for_bitwise(L)          # A_OH/B_OH/SHIFT_* bands
@@ -914,7 +1133,25 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
     # load; THEN the mem-cam block's ATTENTION runs the §Memory CAM (writes the loaded
     # value nibbles into the cleared AX band); a recompose refreshes AX_VAL; dispatch
     # does the PC/SP housekeeping. All inside ONE model.forward.
-    block_specs = [
+    reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
+    block_specs = []
+    if _wide:
+        # WIDE INGEST (C4_INGEST_WIDE): replace the 20/21-head role-CAM ingest with a
+        # SINGLE query + SINGLE KV head.  Three blocks IN FRONT of the stock block 0:
+        #   wide-preroute : attn zeroed, FFN = the ROLE⊙CUR_NIB per-role gate (A).
+        #   wide-gather   : attn = the 1-head wide gather (B, baked below); FFN = the
+        #                   1/wtot rescale GATHER -> reg nibble band (C).
+        #   wide-snap     : attn zeroed, FFN = integer re-quant of the reg nibbles so
+        #                   the recompose's 16^j amplification of a ~1e-8 gather residue
+        #                   can't shift PC_VAL/AX_VAL off their integer (opcode-decode).
+        # The stock "ingest+recompose" block then keeps its recompose FFN but its attn
+        # is ZEROED (the gather moved to wide-gather).
+        block_specs += [
+            ("wide-preroute", compile_wide_preroute(L, dim)),
+            ("wide-gather", compile_wide_rescale(L, reg_bases, dim)),
+            ("wide-snap", compile_wide_nibble_snap(L, reg_bases, dim)),
+        ]
+    block_specs += [
         ("ingest+recompose", compile_nibble_to_scalar(L, dim)),   # block 0 FFN
         ("pc-fetch",    compile_pc_fetch(L, dim)),
         ("code-select", compile_code_select(L, dim)),
@@ -957,12 +1194,21 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
         for bi, (name, spec) in enumerate(block_specs):
             _zero_attn(model.blocks[bi].attn)
             _load_ffn(model.blocks[bi].ffn, spec, hidden)
-        # block 0 attention = the frame-ingest CAM.  C4_INGEST_GQA (default OFF)
-        # swaps in the 1-KV-head GQA bake (byte-exact, 20 KV heads → 1).
-        reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
-        _ingest = (bake_frame_ingest_gqa if ingest_gqa_enabled()
-                   else bake_frame_ingest)
-        _ingest(model.blocks[0].attn, L, reg_bases)
+        if _wide:
+            # WIDE INGEST: swap the "wide-gather" block's Attn for a 1-head Attn
+            # (head_dim = dim) and bake the single wide gather head.  The stock
+            # "ingest+recompose" block's attn stays ZEROED (gather moved to wide-
+            # gather).  Swapping ONLY this block's Attn leaves every OTHER block's
+            # multi-head Attn (mem-cam, etc.) byte-identical.
+            gi = [i for i, (nm, _) in enumerate(block_specs) if nm == "wide-gather"][0]
+            model.blocks[gi].attn = _make_one_head_attn(dim, model.max_seq_len)
+            bake_wide_ingest_head(model.blocks[gi].attn, L)
+        else:
+            # block 0 attention = the frame-ingest CAM.  C4_INGEST_GQA (default OFF)
+            # swaps in the 1-KV-head GQA bake (byte-exact, 20 KV heads → 1).
+            _ingest = (bake_frame_ingest_gqa if ingest_gqa_enabled()
+                       else bake_frame_ingest)
+            _ingest(model.blocks[0].attn, L, reg_bases)
         if include_memory:
             # the §Memory KV head is the ATTENTION of the "mem-cam" block (index 2),
             # AFTER addr-expand has set QRY_BIN: it reads the load query, content-
@@ -970,6 +1216,7 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
             # into the AX nibble band (its FFN then refreshes AX_VAL).
             mem_block = [i for i, (nm, _) in enumerate(block_specs) if nm == "mem-cam"][0]
             _bake_pf_memory_head(model.blocks[mem_block].attn, L, head=N_ROLES)
+    L._block_names = [n for n, _ in block_specs]
     return model, L
 
 

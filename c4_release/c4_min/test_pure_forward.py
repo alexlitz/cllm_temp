@@ -46,7 +46,17 @@ def test_frame_ingest_reconstructs_registers_from_token_stream():
         overlay = make_overlay(isa.assemble([("IMM", 0), ("HALT", 0)]), L)
         x = model.embed[toks].clone()
         overlay(x)
-        state = model.blocks[0].attn(x)[0, -1]
+        # Stock ingest = block-0 attention.  Under C4_INGEST_WIDE the ingest is the
+        # wide-preroute | wide-gather | wide-snap chain up to (and incl.) the
+        # ingest+recompose block, so run through that chain instead of block-0 attn.
+        names = getattr(L, "_block_names", None)
+        if names and "wide-gather" in names:
+            stop = names.index("ingest+recompose")
+            for bi in range(stop + 1):
+                x = model.blocks[bi](x)
+            state = x[0, -1]
+        else:
+            state = model.blocks[0].attn(x)[0, -1]
         got = {}
         for name, base in (("pc", L.PC), ("ax", L.AX), ("sp", L.SP),
                            ("bp", L.BP), ("stk", L.STACK0)):
@@ -97,7 +107,14 @@ def test_token_stream_is_the_state():
 
 def test_one_head_per_register_byte():
     """The ingest uses exactly one gather head per (register, byte) = 20 heads;
-    the memory build adds one §Memory KV head (21 total)."""
+    the memory build adds one §Memory KV head (21 total).  Under C4_INGEST_WIDE the
+    ingest instead uses ONE query + ONE KV head (the wide-gather block)."""
+    import os
+    if os.environ.get("C4_INGEST_WIDE", "0") not in ("0", "", "false", "False"):
+        model_off, Loff = build_pure_forward_model(code_size=16, include_memory=False)
+        gi = Loff._block_names.index("wide-gather")
+        assert model_off.blocks[gi].attn.n_heads == 1     # 20 gather heads -> 1
+        return
     model_off, _ = build_pure_forward_model(code_size=16, include_memory=False)
     assert model_off.blocks[0].attn.n_heads == N_ROLES == 20
     model_on, _ = build_pure_forward_model(code_size=16, include_memory=True)
