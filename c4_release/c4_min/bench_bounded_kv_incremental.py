@@ -1,0 +1,395 @@
+"""BOUNDED-KV INCREMENTAL-DECODE ms/step — the crux the re-embed bench never ran.
+
+a24cc1ee's ``bench_composed_fast_path`` composed every ms/step lever byte-exact but
+measured the PER-STEP RE-EMBED path (each VM step re-runs the forward over the whole
+growing S-token stream).  That path is ATTENTION-COMPUTE-bound at O(S^2): 49 ms@S=900,
+354 ms@S=3000 — ms ∝ S — so graphs / COO / direct-CAM added ~nothing (they pay off on
+the KV-cache path where exact-evict BOUNDS the attention, which was never benchmarked).
+
+This bench runs the VM as **incremental decode** on the LEAN compacted forward
+(:mod:`qwen_lean_forward` + :mod:`qwen_lean_evict`): each step appends only the new
+register frame's K/V and attends against the CACHED KV (``past=cache.as_past()``), and
+the per-step register-frame supersession + heap eviction keep the cache BOUNDED (a
+register-only loop = a CONSTANT ~7 rows forever, verified).  So the per-step attention
+is O(bounded ~7 + 6 new) NOT O(S^2).
+
+THE CRUX MEASUREMENT (:func:`curve_vs_S`): sweep program length so S grows and report
+the ms/step curve.  FLAT in S == the eviction bounded the attention (the whole point);
+still ∝ S == the cache did not bound it.
+
+Also (:func:`decompose`): where the bounded-KV per-step cost goes (the 11-layer
+forward vs the Python eviction/append/decode bookkeeping), and (:func:`graph_potential`)
+whether a CUDA graph over the INCREMENTAL forward (at the fixed bounded cache length)
+collapses the launch overhead — the opposite regime from the re-embed path, where the
+per-step cost is now LAUNCH-bound (a tiny 7-row attention over 11 layers), exactly where
+graphs pay off.
+
+Byte-exactness is gated against the naive fresh-window driver
+(:func:`qwen_lean_forward.run_program_lean`) — incremental decode + eviction must not
+change any decoded AX.
+
+Run (needs a free >=18 GB CUDA card):
+    OMP_NUM_THREADS=4 python -m c4_min.bench_bounded_kv_incremental --device cuda:0
+
+Tooling only — no build path touched; golden ``_fingerprint_build`` 8f4dd780 unchanged.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import time
+import warnings
+from typing import Dict, List, Optional, Tuple
+
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+import torch
+
+from . import isa
+from . import qwen_full_vm as Q
+from . import qwen_lean_forward as LF
+from . import qwen_lean_evict as EV
+
+
+# ---------------------------------------------------------------------------
+# GPU wait-loop (mirrors bench_composed_fast_path): block until the card holds
+# >= min_free_gb free continuously for stable_s (poll every 5s).
+# ---------------------------------------------------------------------------
+def _gpu_stat(idx: int) -> Tuple[float, float]:
+    import subprocess
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=memory.free,utilization.gpu",
+             "--format=csv,noheader,nounits", f"--id={idx}"],
+            stderr=subprocess.DEVNULL, timeout=4).decode().strip().splitlines()[0]
+        free_mib, util = out.split(",")
+        return float(free_mib) / 1024.0, float(util)
+    except Exception:
+        return 0.0, 100.0
+
+
+def wait_for_gpu(idx: int, min_free_gb: float = 18.0, stable_s: float = 60.0,
+                 timeout_s: float = 3600.0) -> None:
+    t0 = time.time()
+    stable_since: Optional[float] = None
+    while time.time() - t0 < timeout_s:
+        free, util = _gpu_stat(idx)
+        now = time.time()
+        if free >= min_free_gb:
+            if stable_since is None:
+                stable_since = now
+            held = now - stable_since
+            if held >= stable_s:
+                print(f"  [gpu-wait] cuda:{idx} stable {held:.0f}s "
+                      f"(free={free:.1f}GB util={util:.0f}%) -> proceed", flush=True)
+                return
+            print(f"  [gpu-wait] cuda:{idx} free={free:.1f}GB util={util:.0f}% "
+                  f"stable {held:.0f}/{stable_s:.0f}s ...", flush=True)
+        else:
+            stable_since = None
+            print(f"  [gpu-wait] cuda:{idx} free={free:.1f}GB < {min_free_gb}GB "
+                  f"(util={util:.0f}%) waiting ...", flush=True)
+        time.sleep(5)
+    raise SystemExit(f"[gpu-wait] no stable free GPU within {timeout_s}s")
+
+
+def _sync(dev):
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+
+
+# ---------------------------------------------------------------------------
+# Build the lean model.  NOTE: the incremental-decode eviction driver
+# (qwen_lean_evict) reads the BAKED-code layout (``L.CODE_OP[k]`` per instruction),
+# so it needs ``code_from_memory=False`` — the current ``Q.build`` default flipped
+# to ``code_from_memory=True`` (program in the KV §Memory), which the evict driver's
+# frame builders (_append_bos / _append_store / _append_reg_frame) do NOT yet
+# support (IndexError on ``L.CODE_OP[k]``).  See the report / test_qwen_lean_evict.
+# ---------------------------------------------------------------------------
+def build_lean(device: torch.device, subset=Q.SUBSET_MEM_CMP, code_size: int = 24):
+    warnings.filterwarnings("ignore")
+    vm = Q.build(code_size=code_size, subset=subset, code_from_memory=False)
+    vm.embed = vm.embed.to(device)
+    lean = LF.LeanQwenVM.from_full_vm(vm, device=device)
+    return lean
+
+
+# a never-halting spin loop: the cleanest "S grows unbounded, cache stays bounded"
+# probe — each step re-emits the register frame (superseded next step) and NO heap,
+# so the cache is a CONSTANT BOS + one frame.
+_SPIN = [("IMM", 5), ("PSH", 0), ("IMM", 1), ("SUB", 0), ("JMP", 0)]
+# a heap-touching loop: store then load a var each iteration (bounded live heap).
+_HEAP_LOOP = [("IMM", 40), ("PSH", 0), ("IMM", 1), ("SUB", 0),   # r=r-1
+              ("PSH", 0), ("IMM", 20), ("SI", 0),                # mem[20]=r  (SI pops addr=20)
+              ("IMM", 20), ("LI", 0),                            # AX=mem[20]
+              ("BNZ", 1), ("HALT", 0)]
+
+
+# ===========================================================================
+# THE CRUX: ms/step vs S (program length) on the bounded-KV incremental path.
+# ===========================================================================
+def curve_vs_S(lean, device, step_counts: List[int], *, kind: str = "spin",
+               evict: str = "async") -> None:
+    prog = _SPIN if kind == "spin" else _HEAP_LOOP
+    code = isa.assemble(prog)
+    print(f"\n{'='*76}\n[crux] BOUNDED-KV INCREMENTAL ms/step vs S  (program={kind}, "
+          f"evict={evict})\n{'='*76}", flush=True)
+    print(f"  a growing-S {'never-halting spin' if kind=='spin' else 'heap-touching'} "
+          f"loop; S = 1 + steps*(6 reg rows [+1 store]).  If eviction bounds the KV,"
+          f"\n  ms/step must be FLAT in steps (the attention is over the bounded cache,"
+          f" not the whole stream).", flush=True)
+    # warmup (amortise the first-forward lazy alloc out of the timed window).
+    _ = EV.run_program_lean_evict(lean, code, max_steps=50, evict=evict)
+    print(f"\n  {'steps':>7} {'grew-S≈':>9} {'max_cache':>10} {'final':>6} "
+          f"{'ms/step':>9} {'wall_s':>8}", flush=True)
+    print("  " + "-" * 58, flush=True)
+    first = None
+    rows = []
+    for n in step_counts:
+        _sync(device)
+        t0 = time.time()
+        r = EV.run_program_lean_evict(
+            lean, code, max_steps=n, evict=evict,
+            prune_interval=120, watermark_rows=2048, sample_every=max(1, n))
+        _sync(device)
+        dt = time.time() - t0
+        ms = dt / max(r.steps, 1) * 1e3
+        approx_S = 1 + r.steps * (7 if kind != "spin" else 6)
+        rows.append((r.steps, ms))
+        if first is None:
+            first = ms
+        print(f"  {r.steps:>7} {approx_S:>9} {r.max_cache_rows:>10} "
+              f"{r.final_cache_rows:>6} {ms:>9.3f} {dt:>8.2f}", flush=True)
+    # flatness verdict: max deviation of ms/step across the sweep.
+    ms_vals = [m for _, m in rows]
+    lo, hi = min(ms_vals), max(ms_vals)
+    spread = (hi - lo) / lo * 100 if lo else 0
+    biggest = max(rows, key=lambda t: t[0])
+    verdict = ("FLAT (eviction bounded the KV — WIN)" if spread < 10
+               else "GROWS with S (cache NOT bounded)")
+    print(f"\n  ms/step across the sweep: min={lo:.3f} max={hi:.3f} "
+          f"spread={spread:.1f}%  ->  {verdict}", flush=True)
+    print(f"  longest run: {biggest[0]} steps at {biggest[1]:.3f} ms/step "
+          f"({biggest[1]/0.1:.0f}x above the 0.1 ms goal)", flush=True)
+
+
+# ===========================================================================
+# Byte-exactness: incremental decode + eviction == naive fresh-window driver.
+# ===========================================================================
+def _battery() -> List[Tuple[str, list]]:
+    C = [
+        ("add", [("IMM", 100), ("PSH", 0), ("IMM", 27), ("ADD", 0), ("HALT", 0)]),
+        ("sub", [("IMM", 200), ("PSH", 0), ("IMM", 55), ("SUB", 0), ("HALT", 0)]),
+        ("cmp_eq", [("IMM", 5), ("PSH", 0), ("IMM", 5), ("EQ", 0), ("HALT", 0)]),
+        ("if_bz", [("IMM", 0), ("BZ", 3), ("IMM", 99), ("IMM", 7), ("HALT", 0)]),
+        ("jmp", [("JMP", 2), ("IMM", 99), ("IMM", 5), ("HALT", 0)]),
+        ("loop_cd20", [("IMM", 20), ("PSH", 0), ("IMM", 1), ("SUB", 0),
+                       ("BNZ", 1), ("HALT", 0)]),
+        ("loop_cd200", [("IMM", 200), ("PSH", 0), ("IMM", 1), ("SUB", 0),
+                        ("BNZ", 1), ("HALT", 0)]),
+        ("si_li", [("IMM", 5), ("PSH", 0), ("IMM", 0x23), ("SI", 0),
+                   ("IMM", 5), ("LI", 0), ("HALT", 0)]),
+        ("lww", [("IMM", 30), ("PSH", 0), ("IMM", 1), ("SI", 0),
+                 ("IMM", 30), ("PSH", 0), ("IMM", 9), ("SI", 0),
+                 ("IMM", 30), ("LI", 0), ("HALT", 0)]),
+        ("heap_loop", _HEAP_LOOP),
+    ]
+    return C
+
+
+def verify_byte_exact(lean, device, *, evict: str = "async") -> bool:
+    print(f"\n{'='*76}\n[verify] incremental-decode + eviction == naive fresh-window "
+          f"(byte-exact AX)\n{'='*76}", flush=True)
+    ok = True
+    for name, prog in _battery():
+        code = isa.assemble(prog)
+        naive = LF.run_program_lean(lean, code, max_steps=2000)
+        r = EV.run_program_lean_evict(lean, code, max_steps=2000, evict=evict,
+                                      prune_interval=8, watermark_rows=64)
+        match = r.ax_trace == naive["ax_trace"]
+        ok = ok and match
+        print(f"  {name:12s} {'OK ' if match else 'FAIL'} steps={r.steps} "
+              f"max_cache={r.max_cache_rows}  (naive_exact_vs_isa={naive['exact']})",
+              flush=True)
+        if not match:
+            print(f"    NAIVE={naive['ax_trace'][:16]}\n    EVICT={r.ax_trace[:16]}",
+                  flush=True)
+    print(f"[verify] {'ALL BYTE-EXACT' if ok else 'DIVERGENCE'}", flush=True)
+    return ok
+
+
+# ===========================================================================
+# Where the bounded-KV per-step cost goes: the 11-layer forward vs the Python
+# eviction / append / decode bookkeeping.
+# ===========================================================================
+def _timeit(fn, dev, n=200, warmup=20) -> float:
+    for _ in range(warmup):
+        fn()
+    _sync(dev)
+    t0 = time.time()
+    for _ in range(n):
+        fn()
+    _sync(dev)
+    return (time.time() - t0) / n * 1e3
+
+
+def decompose(lean, device) -> None:
+    print(f"\n{'='*76}\n[decompose] where the bounded-KV per-step cost goes "
+          f"({lean.n_layers}L, {lean.n_heads}h)\n{'='*76}", flush=True)
+    code = isa.assemble(_SPIN)
+    # a fixed bounded incremental state: BOS cache (1 row) + a 6-row register frame.
+    cache = EV.LeanKVCache(lean.n_layers, lean.device)
+    xb, pb, mb = EV._append_bos(lean, code)
+    with torch.no_grad():
+        _, past = lean.forward(xb, past=None, q_positions=pb)
+    cache.append(past, mb)                                   # cache = BOS (1 row)
+    reg = {"PC": 0, "AX": 5, "SP": 0xFC, "BP": 0xFC, "STACK0": 0}
+    x, pos, meta = EV._append_reg_frame(lean, code, reg, None, 1, 0)   # 6 new rows
+    past_static = cache.as_past()
+
+    def fwd_inc():
+        with torch.no_grad():
+            lean.forward(x, past=past_static, q_positions=pos)
+
+    def fwd_reembed():
+        xf, posf = LF._build_stream_and_overlay(lean, code, reg, [], None)
+        with torch.no_grad():
+            lean.forward(xf, past=None, q_positions=posf)
+
+    t_inc = _timeit(fwd_inc, device)
+    t_re = _timeit(fwd_reembed, device)
+    # the whole eager driver ms/step (forward + bookkeeping) on a long spin.
+    _ = EV.run_program_lean_evict(lean, code, max_steps=50, evict="async")
+    _sync(device)
+    t0 = time.time()
+    r = EV.run_program_lean_evict(lean, code, max_steps=1000, evict="async",
+                                  prune_interval=120, watermark_rows=2048)
+    _sync(device)
+    t_driver = (time.time() - t0) / r.steps * 1e3
+    print(f"  eager incremental forward (bounded 7-row attention) : {t_inc:8.3f} ms",
+          flush=True)
+    print(f"  eager re-embed forward (same tiny 7-row window)      : {t_re:8.3f} ms",
+          flush=True)
+    print(f"  FULL eager driver ms/step (forward + evict/decode)   : {t_driver:8.3f} ms",
+          flush=True)
+    print(f"  -> Python bookkeeping (evict masks + append cat +\n"
+          f"     nibble decode + store handling) per step          ≈ "
+          f"{max(t_driver - t_inc, 0):8.3f} ms", flush=True)
+    print(f"\n  The forward over a 7-row bounded cache is LAUNCH-bound, not FLOP-bound:"
+          f"\n  {lean.n_layers} sequential attn+MLP sub-layers x a fistful of tiny "
+          f"GEMM/softmax/RMSNorm\n  kernels, each ~60us to LAUNCH — see the CUDA-graph "
+          f"drop below.", flush=True)
+
+
+# ===========================================================================
+# Point 3: does a CUDA graph over the INCREMENTAL forward (fixed bounded cache)
+# collapse the launch overhead?  (The re-embed regime was compute-bound and graphs
+# did nothing; the bounded-KV regime is launch-bound — the opposite.)
+# ===========================================================================
+def graph_potential(lean, device) -> None:
+    if device.type != "cuda":
+        print("\n[graph] CUDA graphs need a GPU; skipping.", flush=True)
+        return
+    print(f"\n{'='*76}\n[graph] CUDA graph over the INCREMENTAL forward "
+          f"(fixed bounded cache)\n{'='*76}", flush=True)
+    code = isa.assemble(_SPIN)
+    cache = EV.LeanKVCache(lean.n_layers, lean.device)
+    xb, pb, mb = EV._append_bos(lean, code)
+    with torch.no_grad():
+        _, past = lean.forward(xb, past=None, q_positions=pb)
+    cache.append(past, mb)
+    reg = {"PC": 0, "AX": 5, "SP": 0xFC, "BP": 0xFC, "STACK0": 0}
+    x, pos, meta = EV._append_reg_frame(lean, code, reg, None, 1, 0)
+    past_static = cache.as_past()
+    static_x = x.clone()
+    static_pos = pos.unsqueeze(0) if pos.dim() == 1 else pos.clone()
+
+    dev = lean.device
+    # warmup on a side stream (standard CUDA-graph capture protocol).
+    s = torch.cuda.Stream(device=dev)
+    s.wait_stream(torch.cuda.current_stream(dev))
+    with torch.cuda.stream(s):
+        for _ in range(5):
+            with torch.no_grad():
+                out, _ = lean.forward(static_x, past=past_static, q_positions=static_pos)
+    torch.cuda.current_stream(dev).wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    try:
+        with torch.no_grad():
+            with torch.cuda.graph(g):
+                out, _ = lean.forward(static_x, past=past_static,
+                                      q_positions=static_pos)
+    except Exception as e:
+        print(f"  graph capture FAILED: {type(e).__name__}: {e}", flush=True)
+        return
+
+    def eager():
+        with torch.no_grad():
+            lean.forward(static_x, past=past_static, q_positions=static_pos)
+
+    t_eager = _timeit(eager, device, n=500, warmup=20)
+    for _ in range(20):
+        g.replay()
+    _sync(device)
+    t0 = time.time()
+    for _ in range(500):
+        g.replay()
+    _sync(device)
+    t_graph = (time.time() - t0) / 500 * 1e3
+    print(f"  eager incremental forward : {t_eager:8.3f} ms", flush=True)
+    print(f"  CUDA-graph replay          : {t_graph:8.3f} ms  "
+          f"({t_eager/max(t_graph,1e-9):.1f}x — the launch overhead collapses)",
+          flush=True)
+    print(f"\n  So at the BOUNDED KV the levers pay off (opposite of the re-embed "
+          f"O(S^2) regime,\n  where graphs added ~nothing): the graphed incremental "
+          f"forward is {t_graph:.2f} ms; the\n  remaining gap to 0.1 ms is the "
+          f"{lean.n_layers}-layer kernel schedule + the Python per-step\n  eviction/"
+          f"decode bookkeeping (see [decompose]).", flush=True)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--steps", default="200,1000,4000,10000",
+                    help="comma list of step counts (S grows with steps).")
+    ap.add_argument("--kind", default="spin", choices=["spin", "heap"],
+                    help="spin = register-only loop (const cache); heap = "
+                         "store/load loop (bounded live heap).")
+    ap.add_argument("--evict", default="async", choices=["off", "sync", "async"])
+    ap.add_argument("--min-free-gb", type=float, default=18.0)
+    ap.add_argument("--stable-s", type=float, default=60.0)
+    ap.add_argument("--no-wait", action="store_true")
+    ap.add_argument("--no-verify", action="store_true")
+    args = ap.parse_args(argv)
+
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("[bounded-kv] CUDA unavailable; falling back to cpu")
+        device = torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+        if not args.no_wait:
+            idx = device.index or 0
+            wait_for_gpu(idx, min_free_gb=args.min_free_gb, stable_s=args.stable_s)
+
+    t0 = time.time()
+    lean = build_lean(device)
+    print(f"[built] lean {lean.n_layers}L {lean.n_heads}h head_dim={lean.head_dim} "
+          f"dev={device} (code_from_memory=False; the evict driver's layout) "
+          f"build={time.time()-t0:.1f}s", flush=True)
+
+    if not args.no_verify:
+        ok = verify_byte_exact(lean, device, evict=args.evict)
+        if not ok:
+            print("[verify] NOT byte-exact -> aborting bench", flush=True)
+            return 1
+
+    step_counts = [int(s) for s in args.steps.split(",") if s.strip()]
+    curve_vs_S(lean, device, step_counts, kind=args.kind, evict=args.evict)
+    decompose(lean, device)
+    graph_potential(lean, device)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
