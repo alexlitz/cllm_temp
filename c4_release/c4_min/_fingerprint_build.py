@@ -77,7 +77,14 @@ def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
     # wide-gather block is 1-head; every other block keeps the build-wide n_heads), so
     # the same streaming path is fingerprinted in BOTH states — flag-ON is the intended
     # MOVED hash (packed-dim, differs from the dense build_pure_forward_complete_model
-    # hash by construction), flag-OFF is the UNCHANGED golden 8f4dd780.
+    # hash by construction), flag-OFF is the golden.
+    #
+    # CURRENT GOLDEN (flag-OFF): 069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca
+    #   (short 069cc32f).  RE-BASELINED 2026-07 from 8f4dd780 by the c4-faithful
+    #   SHR-ARITHMETIC (tight-shifter ``build_sign_fill``) + SIGNED-LC
+    #   (``lc-sign-detect`` / ``lc-sign-extend``) fix — an INTENTIONAL move: the two
+    #   sign-fill gadgets fire only on OP_IS[SHR]∧sign / OP_IS[LC]∧high-bit, so every
+    #   non-shift / non-signed-char step (and thus the whole 1096 corpus) is unchanged.
     from c4_min.compact_alloc import build_compact_sparse_streaming
 
     model, L, stats = build_compact_sparse_streaming(

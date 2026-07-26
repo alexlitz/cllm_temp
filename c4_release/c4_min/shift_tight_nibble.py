@@ -111,6 +111,8 @@ class _TightLayout:
         self.FINE_CO = band(N_NIB)            # floor(prod / 16)  (carry, <= 7)
         # result:
         self.OUT_NIB = band(N_NIB)            # final result nibbles (post keep-gate)
+        # SHR ARITHMETIC sign-fill scratch (§Shifts, c4 ``a = *sp++ >> a`` signed):
+        self.SIGN = band(1)                   # sign = [IN_NIB[7] >= 8]  (bit 31 of pop)
         self.D = off
 
     def load(self, pop: int, n: int) -> torch.Tensor:
@@ -351,6 +353,71 @@ def build_assemble(L: "_TightLayout", left: bool) -> dict:
     return _truncate(spec, u, L.D)
 
 
+def _hi_r_mask(r: int) -> int:
+    """The high-``r``-bit mask of a nibble: ``((1<<r)-1) << (4-r)`` (r=1->8, 2->12,
+    3->14).  The partial sign-fill of the boundary nibble in an arithmetic SHR."""
+    return (((1 << r) - 1) << (4 - r)) & 0xF if r > 0 else 0
+
+
+def build_sign_prep(L: "_TightLayout") -> dict:
+    """Compute ``SIGN = [IN_NIB[7] >= 8]`` (bit 31 of the popped operand) in its OWN
+    block, BEFORE the fill-apply block reads it (every FFN unit reads the block
+    INPUT, so the sign detect and the sign-gated fill cannot share a block)."""
+    spec = _empty_spec(L.D, 4)
+    u = 0
+    u = _clear(spec, u, L.SIGN)
+    u = alu._step_ge(spec, u, {L.IN_NIB + (N_NIB - 1): 1.0}, 0.0, 8, L.SIGN, 1.0)
+    return _truncate(spec, u, L.D)
+
+
+def build_sign_fill(L: "_TightLayout") -> dict:
+    """SHR ARITHMETIC sign-fill (§Shifts — c4 ``a = *sp++ >> a`` on a SIGNED value).
+
+    The tight SHR above computes the LOGICAL right shift (shifted-in bits = 0).  c4
+    sign-EXTENDS: the top ``n`` bits take the source's sign bit.  Since the logical
+    shift leaves EXACTLY those top-``n`` bits as 0, the fill is a clean ADD of the
+    sign-fill mask into ``OUT_NIB`` (no bit overlap).  Decompose ``n = 4c + r``:
+
+      * SIGN = [IN_NIB[7] >= 8]            (bit 31 of the popped operand; ``build_sign_prep``)
+      * FULL fill (+15) into nibble j when  SIGN ∧ KEEP ∧ (c >= 8 - j)   (whole nibbles)
+      * PARTIAL fill (+hi_r_mask(r)) into nibble (7-c) when SIGN ∧ KEEP ∧ [r==m]  (boundary)
+      * n >= 32 (KEEP=0): SIGN -> the whole word is the sign, +15 into EVERY nibble
+        (the assemble block left OUT_NIB all-zero when KEEP=0).
+
+    Positive operand (SIGN=0) or SHL: no unit fires -> byte-identical to the logical
+    result.  ONE block after ``build_sign_prep``; reads only already-materialised
+    bands (SIGN, KEEP, C/CEQ, FEQ)."""
+    # unit budget: per nibble: full-fill (<=7 CEQ terms) + partial (3 r) + n>=32 (1).
+    spec = _empty_spec(L.D, N_NIB * 12 + 8)
+    u = 0
+    for j in range(N_NIB):
+        # FULL fill: +15 into nibble j when SIGN ∧ KEEP ∧ (c >= 8-j).  ``c >= 8-j``
+        # is realised via the CEQ one-hots: fire for each c-value k in {8-j .. 7}
+        # (one _guard per k, each a single 0/1 window band).  j=0 -> k>=8 -> none.
+        for k in range(8 - j, N_NIB):               # k = 8-j .. 7 (fully-shifted nibbles)
+            u = alu._guard(
+                spec, u,
+                [(L.SIGN, 1.0, 0.0), (L.KEEP, 1.0, 0.0), (L.CEQ + k, 1.0, 0.0)],
+                {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, 15.0)
+        # PARTIAL fill: +hi_r_mask(r) into the BOUNDARY nibble (7-c).  Nibble j is the
+        # boundary iff c == 7-j (CEQ[7-j]); amount is r-dependent (FEQ[r]).
+        k = 7 - j
+        if 0 <= k < N_NIB:
+            for m in range(1, FINE_MAX + 1):        # r = 1..3 (r=0 -> no partial fill)
+                msk = _hi_r_mask(m)
+                if msk:
+                    u = alu._guard(
+                        spec, u,
+                        [(L.SIGN, 1.0, 0.0), (L.KEEP, 1.0, 0.0),
+                         (L.CEQ + k, 1.0, 0.0), (L.FEQ + m, 1.0, 0.0)],
+                        {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, float(msk))
+        # n >= 32 (KEEP=0): SIGN -> the whole word is sign; +15 into every nibble
+        # (assemble left OUT_NIB all-zero under KEEP=0).  NOT-KEEP window = (1 - KEEP).
+        u = alu._guard(spec, u, [(L.SIGN, 1.0, 0.0), (L.KEEP, -1.0, 1.0)],
+                       {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, 15.0)
+    return _truncate(spec, u, L.D)
+
+
 # ===========================================================================
 # The assembled tight shifter.
 # ===========================================================================
@@ -374,6 +441,9 @@ def build_tight(op: int) -> Tuple[List[dict], "_TightLayout"]:
     blocks.append(build_fine_product(L))
     blocks.append(build_fine_peel(L))
     blocks.append(build_assemble(L, left))
+    if not left:                            # SHR is ARITHMETIC (c4 signed >>): sign-fill.
+        blocks.append(build_sign_prep(L))   # SIGN = [bit31 of pop]  (own block)
+        blocks.append(build_sign_fill(L))   # OUT_NIB += sign-fill mask
     return blocks, L
 
 

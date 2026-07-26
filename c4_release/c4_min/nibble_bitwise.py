@@ -289,10 +289,17 @@ def shl_gadget(pop: int, ax: int) -> int:
 
 
 def shr_gadget(pop: int, ax: int) -> int:
-    """32-bit ``pop >> ax`` (logical, §Shifts / §Chars) via the bitwise
-    LOG-SHIFTER: 5 conditional right-by-2**k stages gated on the AX bits,
-    ``ax >= 32 -> 0``.  Matches ``ref_interpret``'s ``(pop >> ax) & 0xFFFFFFFF``."""
-    return _log_shift(pop, ax, left=False)
+    """32-bit ``pop >> ax`` ARITHMETIC (c4 ``a = *sp++ >> a`` on a SIGNED value,
+    §Shifts / §Chars): the logical log-shift then a SIGN-FILL of the top ``ax``
+    bits when ``pop``'s bit 31 is set.  Matches the c4-faithful ``ref_interpret``
+    (32-bit signed): a negative source sign-extends; ``ax >= 32 -> -1`` for a
+    negative source (all sign bits), ``0`` for a non-negative source."""
+    log = _log_shift(pop, ax, left=False)
+    if pop & 0x80000000:                     # negative source -> sign-extend
+        fill = 0xFFFFFFFF if ax >= 32 else ((0xFFFFFFFF << (32 - ax)) & 0xFFFFFFFF
+                                            if ax > 0 else 0)
+        return (log | fill) & 0xFFFFFFFF
+    return log
 
 
 # ===========================================================================
@@ -635,7 +642,14 @@ def shift_stage_blocks(L: NibbleLayout, op: int) -> List[List[FFNRule]]:
     """The log-shifter as an ORDERED list of per-block rule lists (the shift is a
     pipeline — each mux stage reads the previous stage's buffer, so the stages
     CANNOT be one FFN block).  Order: keep bit, ``LOG_STAGES`` mux stages, then
-    the keep-gated recompose.  ``LOG_STAGES + 2`` blocks."""
+    the keep-gated recompose.  ``LOG_STAGES + 2`` blocks.
+
+    NB — SHR here is LOGICAL (the pre-tight fallback, ``C4_TIGHT_SHIFT=0``).  The
+    GOLDEN production SHR is the TIGHT shifter (``tight_shift_stage_blocks``), which
+    is ARITHMETIC (c4 signed ``>>``, via ``build_sign_fill``).  This legacy
+    log-shifter fallback is left LOGICAL (it is off by default and unexercised by
+    the test suite); the arithmetic reference ``shr_gadget`` therefore diverges from
+    this fallback on a negative source (documented gap in the OFF-by-default path)."""
     blocks: List[List[FFNRule]] = [list(shift_keep_rules(L))]
     for k in range(LOG_STAGES):
         blocks.append(log_shift_stage_rules(L, op, k))
@@ -684,6 +698,7 @@ _TIGHT_SCRATCH = (
     ("FINE_LO", 8),         # prod % 16
     ("FINE_CO", 8),         # floor(prod / 16)
     ("OUT_NIB", 8),         # final result nibbles (pre AX-recompose)
+    ("SIGN", 1),            # SHR arithmetic sign bit = [IN_NIB[7] >= 8]  (bit 31 of pop)
 )
 
 _TIGHT_N_NIB = 8                    # the tight design carries the low 32 bits in 8 nibbles.
@@ -807,6 +822,9 @@ def tight_shift_stage_blocks(L: NibbleLayout, op: int,
     blocks.append(_st.build_fine_product(A))
     blocks.append(_st.build_fine_peel(A))
     blocks.append(_st.build_assemble(A, left))
+    if not left:                                    # SHR is ARITHMETIC (c4 signed >>).
+        blocks.append(_st.build_sign_prep(A))       # SIGN = [bit31 of pop]  (own block)
+        blocks.append(_st.build_sign_fill(A))       # OUT_NIB += sign-fill mask
     blocks.append(tight_out_to_ax_rules(L, bands["OUT_NIB"], gate))
     return blocks
 
@@ -843,7 +861,7 @@ def unified_tight_shift_blocks(L: NibbleLayout, dim_ref: Callable[[], int],
     recompose_rules: List[FFNRule] = []
     for op in shift_ops:
         stage = tight_shift_stage_blocks(L, op, recompose_gate=L.OP_IS + op)
-        raw_specs, recompose = stage[:-1], stage[-1]     # blocks 0-6 raw; last = FFNRule recompose
+        raw_specs, recompose = stage[:-1], stage[-1]     # raw shift blocks; last = FFNRule recompose
         step_names = ([f"bw-tshift-{isa.NAMES[op]}-load",
                        f"bw-tshift-{isa.NAMES[op]}-amt1",
                        f"bw-tshift-{isa.NAMES[op]}-amt2",
@@ -851,6 +869,10 @@ def unified_tight_shift_blocks(L: NibbleLayout, dim_ref: Callable[[], int],
                        f"bw-tshift-{isa.NAMES[op]}-fprod",
                        f"bw-tshift-{isa.NAMES[op]}-fpeel",
                        f"bw-tshift-{isa.NAMES[op]}-asm"])
+        if op == isa.SHR:                                # arithmetic sign-fill (2 extra blocks)
+            step_names += [f"bw-tshift-{isa.NAMES[op]}-signprep",
+                           f"bw-tshift-{isa.NAMES[op]}-signfill"]
+        assert len(step_names) == len(raw_specs), (op, len(step_names), len(raw_specs))
         for name, spec in zip(step_names, raw_specs):
             named.append((name, spec))
         recompose_rules += recompose                     # already OP_IS-gated

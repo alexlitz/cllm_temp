@@ -202,6 +202,11 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # (LEA/ENT/ADJ/JSR) read an EXACT integer offset instead of ``IMM``'s
         # large-literal PC-one-hot leak (#648/#660).  See ``compile_imm_clean``.
         self.IMM_CLEAN = self._scalar("IMM_CLEAN")
+        # LC SIGNED CHAR (c4 ``a = *(char *)a``): a scratch flag = OP_IS[LC] AND the
+        # loaded byte's bit 7 (AX nibble 1 >= 8).  When set, the LC sign-extend block
+        # fills AX nibbles 2..7 with 0xF (byte >= 0x80 -> negative char, sign-extended
+        # to the 32-bit register).  LI stays an unsigned word load.
+        self.LC_SIGN = self._scalar("LC_SIGN")
         # PART A (C4_UNIFY_CAM_HEAD, default OFF): the merged-CAM-head scratch bands.
         # Allocated ONLY when the flag is on, so the flag-OFF layout (and thus every
         # baked weight / the golden hash) is byte-identical to the 3-head build.
@@ -591,6 +596,60 @@ def compile_unify_cam_demux(L: PureForwardCompleteLayout, dim: int) -> Dict[str,
         spec["W_down"][L.STACK0 + j, u] += 1.0 / SILU_HALF
         u += 1
     # AX_VAL := Σ 16^j · AX_nibble_j  (SET: self-clear then recompose)
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.AX_VAL] = 1.0
+    spec["W_down"][L.AX_VAL, u] += -1.0 / SILU_S; u += 1
+    for j in range(hi):
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.AX + j] = 1.0
+        spec["W_down"][L.AX_VAL, u] += (16.0 ** j) / SILU_S; u += 1
+    return spec
+
+
+def compile_lc_sign_detect(L: PureForwardCompleteLayout, dim: int) -> Dict[str, torch.Tensor]:
+    """``LC_SIGN = [OP_IS[LC] == 1  AND  AX_nib1 >= 8]`` — a signed-char LC whose
+    loaded byte has bit 7 set (c4 ``a = *(char *)a``, byte >= 0x80 -> negative).
+
+    Realised as a SINGLE sharp step over the combined form ``f = 16*OP_IS[LC] +
+    AX_nib1`` (AX_nib1 in 0..15, OP_IS[LC] in {0,1}):  ``f >= 24`` iff OP_IS[LC]==1
+    AND AX_nib1 >= 8  (LC + nib1<8 -> f<=23; LI (OP_IS[LC]=0) -> f<=15).  Its OWN
+    block, so the fill block (next) reads a materialised LC_SIGN."""
+    w = 0.5
+    spec = _empty_spec(dim, 3)
+    u = 0
+    # SET LC_SIGN := 0 first (self-clear), then the ramp step.
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.LC_SIGN] = 1.0
+    spec["W_down"][L.LC_SIGN, u] += -1.0 / SILU_S; u += 1
+    for i, thr in enumerate((24 - w, 24)):
+        spec["W_up"][u, L.OP_IS + isa.LC] = RELU_S * 16.0
+        spec["W_up"][u, L.AX + 1] = RELU_S * 1.0
+        spec["b_up"][u] = -RELU_S * thr
+        spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][L.LC_SIGN, u] += (1.0 if i == 0 else -1.0) / (RELU_S * w)
+        u += 1
+    return spec
+
+
+def compile_lc_sign_extend(L: PureForwardCompleteLayout, dim: int) -> Dict[str, torch.Tensor]:
+    """SIGN-EXTEND a signed-char LC: when ``LC_SIGN`` is set, fill AX nibbles 2..7
+    with 0xF (byte >= 0x80 -> the char is negative, sign-extended to the 32-bit
+    register: 0x80 -> 0xFFFFFF80, 0xFF -> 0xFFFFFFFF).  LI is untouched (LC_SIGN is
+    OP_IS[LC]-gated).  Then re-recompose ``AX_VAL`` from the sign-extended nibbles so
+    the scalar lane the dispatch/emit reads reflects the signed value.
+
+    The low 2 nibbles (the loaded byte) are already correct; nibbles 2..7 were 0 from
+    a byte-wide store, so SETting them to 15 under LC_SIGN is a clean fill."""
+    hi = _recompose_hi_nibbles()
+    spec = _empty_spec(dim, (8 - 2) + 1 + hi)
+    u = 0
+    for j in range(2, 8):
+        # AX[j] := 15 gated on LC_SIGN.  SET: the nibble is 0 for a byte load, so a
+        # gated +15 (silu-gate on LC_SIGN, value 15) sets it; on a non-LC-sign step
+        # (LC_SIGN=0) the gate is ~0 -> untouched.
+        spec["W_up"][u, L.LC_SIGN] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, L.ONE] = 15.0
+        spec["W_down"][L.AX + j, u] += 1.0 / SILU_HALF
+        u += 1
+    # AX_VAL := Σ 16^j · AX_nibble_j  (SET: self-clear then recompose) — reflect the
+    # now sign-extended high nibbles.
     spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.AX_VAL] = 1.0
     spec["W_down"][L.AX_VAL, u] += -1.0 / SILU_S; u += 1
     for j in range(hi):
@@ -1226,7 +1285,8 @@ def build_pure_forward_complete_model(code_size: int = 32,
     if _wide:
         # 80 fresh dims (PREROUTE 40 + GATHER 40) for the 1-query/1-KV wide ingest.
         # Allocated BEFORE dim is fixed; flag-OFF this is never called ⇒ the golden
-        # ``_fingerprint_build`` hash 8f4dd780 is unchanged.
+        # ``_fingerprint_build`` hash 069cc32f is unchanged (was 8f4dd780 before the
+        # 2026-07 c4-faithful SHR-arithmetic + signed-LC re-baseline).
         extend_layout_for_wide_ingest(L)
     A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
     from . import nibble_bitwise as _bw
@@ -1301,6 +1361,14 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # recomposes LEV_RET_VAL.  This is LEV's SECOND read (the return PC) on the SAME
         # head as the first (MEM[BP]) — one head index, two sequential blocks.
         block_specs.append(("lev-cam2", compile_lev_ret_recompose(L, dim)))
+    # LC SIGNED CHAR (c4 ``a = *(char *)a``): after the §Memory read has laid the
+    # loaded byte into AX, sign-extend it for LC (byte >= 0x80 -> negative char ->
+    # AX nibbles 2..7 filled with 0xF).  Two blocks: detect (LC_SIGN) then fill.  LI
+    # is untouched (LC_SIGN is OP_IS[LC]-gated); a non-LC step is a strict no-op.
+    block_specs += [
+        ("lc-sign-detect", compile_lc_sign_detect(L, dim)),
+        ("lc-sign-extend", compile_lc_sign_extend(L, dim)),
+    ]
     block_specs += [
         ("cmp-compute", compile_cmp_compute(L, dim)),
         ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),
@@ -1570,17 +1638,19 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
         elif op in (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR):
             # OR/XOR/AND stay 8-bit (per-nibble table over the loaded byte). SHL/SHR
             # honour ``mask``: the neural model computes them via the NATIVE 32-bit
-            # MUL/DIV gadgets (``x*2**n`` / ``x//2**n``, shift-via-mul), so the 32-bit
-            # proof (``mask=0xFFFFFFFF``) reads a full-width operand and masks the
-            # result to 32 bits (SHR is logical/unsigned as ``x < 2**32``).  At the
-            # 8-bit default (``mask=0xFF``) this is byte-identical to the prior fixed
-            # ``& 0xFF`` form.
+            # MUL/DIV gadgets (``x*2**n`` / ``x//2**n``, shift-via-mul).  SHL stays
+            # logical (c4 ``a = *sp++ << a`` matches at the observable byte).  SHR is
+            # ARITHMETIC in c4 (``a = *sp++ >> a`` on a SIGNED ``long long``): read
+            # the popped operand as SIGNED at the value width and sign-fill on the
+            # shift (Python ``>>`` on a negative already sign-extends), then re-mask.
             if op in (isa.SHL, isa.SHR):
                 v = mem.get(sp, 0) & mask; sp += 4
                 if op == isa.SHL:
                     ax = (v << ax) & mask
                 else:
-                    ax = (v >> ax) & mask
+                    _sign = (mask >> 1) + 1                  # 0x80 / 2^31 at the width
+                    sv = v - (mask + 1) if v & _sign else v  # signed operand
+                    ax = (sv >> ax) & mask
             else:
                 v = mem.get(sp, 0) & 0xFF; sp += 4
                 if op == isa.OR:
@@ -1603,8 +1673,15 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
             r = {isa.EQ: v == av, isa.NE: v != av, isa.LT: sv < sax,
                  isa.GT: sv > sax, isa.LE: sv <= sax, isa.GE: sv >= sax}[op]
             ax = 1 if r else 0
-        elif op in (isa.LI, isa.LC):
+        elif op == isa.LI:
             ax = mem.get(ax, 0) & 0xFF
+        elif op == isa.LC:
+            # c4: ``a = *(char *)a`` -> SIGNED char load.  A byte >= 0x80 is a
+            # negative char, sign-extended to the register (value) width; LI stays
+            # an unsigned byte load.  At mask=0xFF the byte is unchanged; at the
+            # 32-bit width 0x80 -> 0xFFFFFF80, 0xFF -> 0xFFFFFFFF.
+            b = mem.get(ax, 0) & 0xFF
+            ax = (b - 0x100 if b & 0x80 else b) & mask
         elif op in (isa.SI, isa.SC):
             addr = mem.get(sp, 0); sp += 4
             mem[addr] = ax & 0xFF

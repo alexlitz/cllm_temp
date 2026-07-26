@@ -147,7 +147,14 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
         elif op == SHL:
             ax = (pop() << ax) & MASK
         elif op == SHR:
-            ax = (pop() >> ax) & MASK
+            # c4: ``a = *sp++ >> a`` on a SIGNED ``long long`` -> ARITHMETIC
+            # (sign-extending) right shift.  Interpret the popped value as signed
+            # at the value width (sign bit = top bit of MASK); Python's ``>>`` on a
+            # negative int already sign-fills, then re-mask to the value width.
+            _sign = (MASK >> 1) + 1                     # 0x80 at MASK=0xFF
+            v = pop()
+            v = v - (MASK + 1) if v & _sign else v      # signed interpretation
+            ax = (v >> ax) & MASK
         elif op == EQ:
             ax = 1 if pop() == ax else 0
         elif op == NE:
@@ -170,7 +177,13 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
         elif op == LI:
             ax = mem[ax] & MASK
         elif op == LC:
-            ax = mem[ax] & MASK        # byte load (mem is byte-addressed here)
+            # c4: ``a = *(char *)a`` -> SIGNED char load (byte >= 0x80 is negative,
+            # sign-extended to the register width).  At MASK=0xFF the register IS
+            # one byte, so the sign-extended value re-masks back to the same byte;
+            # the signedness becomes observable only under a wider register (see
+            # ``ref_interpret`` / ``RefVM``, which sign-extend the byte to 32 bits).
+            b = mem[ax] & 0xFF
+            ax = (b - 0x100 if b & 0x80 else b) & MASK
         elif op == SI:
             mem[pop()] = ax & MASK
         elif op == SC:

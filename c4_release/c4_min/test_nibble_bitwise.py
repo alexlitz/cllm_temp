@@ -115,13 +115,18 @@ def test_perbit_path_drops_dead_operand_onehots():
 
 @pytest.mark.parametrize("op", [isa.SHL, isa.SHR])
 def test_log_shift_matches_ref_interpret_32bit(op):
-    """The log-shifter (through the real SwiGLU forward) is byte-identical to
-    ``nibble_pure_forward_complete.ref_interpret(mask=0xFFFFFFFF)`` — the full-width
-    unsigned shift ``(pop <</>> ax) & 0xFFFFFFFF`` with ``ax`` UNMASKED, so n>=32->0
-    — over the prompt's edge grid."""
+    """The shifter (through the real SwiGLU forward) is byte-identical to
+    ``nibble_pure_forward_complete.ref_interpret(mask=0xFFFFFFFF)`` over the edge
+    grid.  SHL is LOGICAL (``(pop << ax) & 0xFFFFFFFF``); SHR is ARITHMETIC (c4
+    ``a = *sp++ >> a`` on a SIGNED value — a negative source sign-extends, and
+    ``ax >= 32`` gives ``-1`` for a negative source / ``0`` otherwise)."""
     def ref32(pop, ax):
-        return ((pop << ax) if op == isa.SHL else (pop >> ax)) & 0xFFFFFFFF
-    xs = [0x80000000, 0xFFFFFFFF, 0xDEADBEEF, 0x1]
+        if op == isa.SHL:
+            return (pop << ax) & 0xFFFFFFFF if ax < 32 else 0
+        # arithmetic (sign-extending) right shift on the 32-bit-signed source.
+        sp = pop - (1 << 32) if pop & 0x80000000 else pop
+        return (sp >> ax) & 0xFFFFFFFF if ax < 32 else (sp >> 63) & 0xFFFFFFFF
+    xs = [0x80000000, 0xFFFFFFFF, 0xDEADBEEF, 0x1, 0x7FFFFFFF, 0xFFFFFF00]
     ns = [0, 1, 7, 15, 16, 31, 32, 40]
     cases = [(x, n) for x in xs for n in ns]
     got = _run_op_through_forward(op, cases)
