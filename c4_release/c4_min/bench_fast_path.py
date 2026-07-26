@@ -488,6 +488,20 @@ def run_bench(kind: str, args) -> int:
                   f"in {time.time()-t:.1f}s (per-forward csr.to_dense eliminated, "
                   f"byte-identical)", flush=True)
 
+    # -- STATIC BLOCK-SPARSE FFN (opt-in) ------------------------------------
+    # Replace the WASTEFUL dense FFN GEMMs (99.93% sparse, ~60% of forward compute)
+    # with a STATIC gather-scale-scatter (COO): the fixed nonzero pattern -> a fixed
+    # index program (few-FLOP, no zero-multiply). Runs AFTER materialize-dense (it
+    # reads the resident dense/CSR weights). Byte-exact up to fp-reduction order
+    # (rel residue ~1e-7 << the integer decode margin; the 1-nnz-per-row majority
+    # is bit-exact). At production span S~=961 this is ~2x faster than the dense FFN
+    # GEMM (STEP 3 microbench); the scattered nonzeros keep it well above the FLOP
+    # floor (see report). DEFAULT OFF -> golden byte-identical.
+    if getattr(args, "block_sparse_ffn", False):
+        from .block_sparse_ffn import install_block_sparse_ffn
+        bs = install_block_sparse_ffn(sparse, mode=args.block_sparse_mode,
+                                      verbose=True)
+
     # -- CUDA-GRAPHED dead-segment forward (opt-in) --------------------------
     # Collapse the ~235 dead-block FFN kernel LAUNCHES per forward: capture each
     # contiguous dead-attention segment into a CUDA graph (replayed per verify-
@@ -756,6 +770,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "stay eager.  Collapses the ~705 tiny-GEMM kernel LAUNCHES "
                          "per forward to a few graph launches.  Byte-identical "
                          "(graphed dead segment == eager fused chain, L-inf=0).")
+    ap.add_argument("--block-sparse-ffn", action="store_true",
+                    help="STATIC BLOCK-SPARSE FFN: replace the wasteful dense FFN "
+                         "GEMMs (99.93%% sparse) with a static gather-scale-scatter "
+                         "(COO) over the fixed nonzero pattern — few-FLOP, no zero-"
+                         "multiply. ~2x faster than the dense FFN GEMM at production "
+                         "span S~=961 (the scattered nonzeros keep it above the FLOP "
+                         "floor). Byte-exact up to fp-reduction order (rel ~1e-7 << "
+                         "decode margin). Compose with --materialize-dense.")
+    ap.add_argument("--block-sparse-mode", default="coo",
+                    choices=["coo", "dense_active"],
+                    help="block-sparse FFN form: coo (gather-scale-scatter, few-FLOP)"
+                         " or dense_active (compact dense sub-block, ~1%% useful).")
     ap.add_argument("--content-bound-global", action="store_true",
                     help="with --local-window (DROP-KV): bound the GLOBAL "
                          "(memory/stack/LEV) cache BY CONTENT — each global head is "
