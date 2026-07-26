@@ -81,7 +81,9 @@ class StoreEntry:
     addr: int               # the address it wrote (the content key on a mem head)
     val: int                # the value it stored (0 => a free/ZFOD zeroing row)
     evict_frame: Optional[int] = None   # frame at/after which this row is evictable
-    evict_reason: str = "live"          # "superseded" | "freed" | "popped" | "live"
+    evict_reason: str = "live"          # "superseded"|"freed"|"popped"|"dead_unread"|"live"
+    last_read_frame: Optional[int] = None  # the frame of this row's FINAL resolved read
+                                           # (None == never read; from resolve_load_rows)
 
 
 @dataclass
@@ -104,13 +106,22 @@ class EvictionSchedule:
     n_freed: int = 0
     n_popped: int = 0
     n_live: int = 0
+    # EXACT-EVICT mode bookkeeping (C4_EXACT_EVICT): a row dropped by the last-read+1
+    # rule (dead == past its final reader, resolved off ``resolve_load_rows``).
+    n_dead_unread: int = 0            # dropped by last-read+1 (never read again)
+    # read-after-free AUDIT: (store position, read frame) pairs where a read RESOLVES
+    # to a store row AT/AFTER that row's scheduled eviction frame — i.e. a row dropped
+    # while still read.  MUST be empty for byte-exactness (the a02e92ec bug guard).
+    n_read_after_free: int = 0
+    read_after_free: List[Tuple[int, int]] = field(default_factory=list)
 
 
 def build_eviction_schedule(draft, *, slope_min: float = None,
                             recency_eps: float = 1e-6,
                             zero_eps: float = 1e-9,
                             supersession_only: bool = True,
-                            pop_free: Optional[bool] = None) -> EvictionSchedule:
+                            pop_free: Optional[bool] = None,
+                            exact_evict: Optional[bool] = None) -> EvictionSchedule:
     """Single O(stores + loads) liveness pass over the perfect draft.
 
     ``supersession_only`` (default True) is the BYTE-EXACT HYBRID mode: the schedule
@@ -246,6 +257,30 @@ def build_eviction_schedule(draft, *, slope_min: float = None,
     if pop_free:
         _apply_pop_free(draft, entries, n_steps)
 
+    # 3c) EXACT O(steps) LAST-READ LIVENESS (C4_EXACT_EVICT, default OFF).  The perfect
+    #     draft's READ LOG resolves EVERY CAM read (mem/pop/lev) to the exact store row
+    #     it reads (latest-write-wins == the softmax1+ALiBi winner).  Inverting that
+    #     gives, per store row, the frame of its FINAL resolved read.  A row is
+    #     provably INERT once every reader that resolves to it has fired — so it is
+    #     evictable at ``last_read + 1`` (the a02e92ec caveat baked in: +1, so the row
+    #     survives THROUGH its last reader's step, never dropping a still-read row).  A
+    #     row that is NEVER read (no read resolves to it) is inert the instant it is
+    #     committed — evictable at ``store_frame + 1``.  This UNIFIES the three exact
+    #     mechanisms into the EARLIEST evict-frame:
+    #        min( supersession , free (pop-free + heap zero-tombstone) , last-read+1 ).
+    #     It is a STRICT super-set of the content path's store-survivor set (the content
+    #     path keeps a live non-zero store FOREVER — recency no-op on the address-CAM;
+    #     exact drops it once un-read), so the KV survivor SET is TIGHTER, but the
+    #     DECODED output is byte-identical because every dropped row is provably never
+    #     read again (n_read_after_free == 0 is the gate).  This is what lets the O(S^2)
+    #     content prune (evict_all_blocks_fused) be dropped ENTIRELY.
+    if exact_evict is None:
+        import os
+        exact_evict = os.environ.get("C4_EXACT_EVICT", "0") \
+            not in ("0", "", "false", "False")
+    if exact_evict:
+        _apply_exact_last_read(draft, entries, sched, n_steps)
+
     # 4) tally + build the round-indexed drop map.
     for e in entries:
         if e.evict_frame is None:
@@ -257,9 +292,96 @@ def build_eviction_schedule(draft, *, slope_min: float = None,
             sched.n_freed += 1
         elif e.evict_reason == "popped":
             sched.n_popped += 1
+        elif e.evict_reason == "dead_unread":
+            sched.n_dead_unread += 1
         sched.drop_at_frame.setdefault(e.evict_frame, []).append(e.position)
         sched.drop_position_at[e.position] = e.evict_frame
     return sched
+
+
+# ===========================================================================
+# EXACT O(steps) LAST-READ LIVENESS (C4_EXACT_EVICT).  Unifies supersession + free +
+# last-read into the single EARLIEST evict-frame per store row, off the perfect
+# draft's read log (``resolve_load_rows``).  ZERO model forwards, ZERO cdist/cosine.
+# ===========================================================================
+def _apply_exact_last_read(draft, entries: List[StoreEntry],
+                           sched: EvictionSchedule, n_steps: int) -> None:
+    """Fold the EXACT last-read+1 evict-frame into every store row, and AUDIT that no
+    read resolves to a row at/after its evict-frame (read-after-free == the a02e92ec
+    bug).  Mutates ``entries`` (evict_frame/reason/last_read_frame) and fills the
+    audit fields on ``sched``.
+
+    resolve_load_rows gives ``{read_frame: [ResolvedRead(store_frame, ...)]}`` — the
+    exact store each read hits.  We invert it to ``{store_frame: last_read_frame}``.
+    For a store row at frame ``fi``:
+
+      * ``last_read = max{ read_frame : read resolves to fi }`` (or None if unread).
+      * exact evict-frame candidate = ``last_read + 1`` (survive THROUGH the last
+        reader — the +1 is the a02e92ec caveat) or ``fi + 1`` if never read.
+      * final evict-frame = min(existing supersession/free/pop frame, this candidate)
+        — never LATER than the content path would, always past the last reader.
+
+    Byte-exactness proof is the AUDIT: for EVERY resolved read at frame ``r`` hitting
+    store position ``p``, assert the row's final evict-frame > r (it is still in the
+    cache at the read).  A violation is a read-after-free (recorded, count non-zero).
+    Because the eviction ROUND commits step ``end`` and drops rows with evict-frame <=
+    end, a row with evict-frame ``ef`` is present for any query at frame < ef; a read
+    at frame r needs ef > r, i.e. ef >= r+1 — which last_read+1 guarantees for THIS
+    row, and supersession/free only ever move ef EARLIER, so we must re-audit.
+    """
+    reads = resolve_load_rows(draft)          # {read_frame: [ResolvedRead,...]}
+    # invert: last resolved-read frame per store frame, and the full read set per
+    # store position (for the audit).
+    last_read_of_store: Dict[int, int] = {}
+    reads_of_position: Dict[int, List[int]] = {}
+    for rf in sorted(reads.keys()):
+        for r in reads[rf]:
+            if r.store_frame is None:
+                continue                       # ZFOD read (unwritten addr) — no row
+            sf = r.store_frame
+            prev = last_read_of_store.get(sf)
+            if prev is None or rf > prev:
+                last_read_of_store[sf] = rf
+            reads_of_position.setdefault(r.store_position, []).append(rf)
+
+    for e in entries:
+        lr = last_read_of_store.get(e.frame_idx)
+        e.last_read_frame = lr
+        # READ FLOOR: the row MUST survive through its final resolved reader (a02e92ec
+        # caveat).  Its earliest SAFE drop is ``last_read + 1`` (or ``store + 1`` when
+        # never read).  This is the ONLY per-row liveness bound the read log proves —
+        # it EXACTLY subsumes the pop-free frame (a pop is a resolved read, so its
+        # ``pop+1`` == ``last_read+1``) AND the correct handling of a zero-tombstone
+        # that a later LI re-reads (the freed-recency heuristic gets THAT wrong — it
+        # drops the tombstone at the recency horizon even though an LI reads it later,
+        # the read-after-free the audit catches).
+        read_floor = (lr + 1) if lr is not None else (e.frame_idx + 1)
+        # SUPERSESSION is subsumed by the read floor: latest-write-wins guarantees NO
+        # read resolves to this row at/after the superseding store, so this row's LAST
+        # read is strictly BEFORE its supersession, i.e. ``read_floor <= supersession``.
+        # Dropping at ``read_floor`` is therefore always <= the supersession frame AND
+        # always past the last reader — the EARLIEST safe drop.  So the exact
+        # evict-frame is simply ``read_floor`` for EVERY row (the freed / popped
+        # heuristic frames are discarded — read_floor already encodes both exactly).
+        # We keep the ``superseded`` reason label when the row WAS re-written (for the
+        # report), else ``dead_unread``.
+        was_superseded = (e.evict_reason == "superseded")
+        e.evict_frame = read_floor
+        e.evict_reason = "superseded" if was_superseded else "dead_unread"
+
+    # AUDIT: no read may resolve to a row at/after its scheduled evict-frame.  With the
+    # read floor this is 0 by construction (evict_frame >= last_read+1 > every read that
+    # resolves to the row, and supersession never precedes a resolving read); the audit
+    # is the PROOF, not a hope — a non-zero count means a read log / schedule bug.
+    pos_evict: Dict[int, int] = {e.position: e.evict_frame for e in entries}
+    for pos, rframes in reads_of_position.items():
+        ef = pos_evict.get(pos)
+        if ef is None:
+            continue                           # never evicted — always safe
+        for rf in rframes:
+            if rf >= ef:                       # read at/after the drop -> read-after-free
+                sched.n_read_after_free += 1
+                sched.read_after_free.append((pos, rf))
 
 
 # ===========================================================================

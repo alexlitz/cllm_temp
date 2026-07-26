@@ -117,7 +117,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"  DROP-KV + content-bound global installed (window={args.local_window})",
               flush=True)
 
-    def run(evict_schedule: bool):
+    def run(evict_schedule: bool, exact_evict: bool = False):
         # capture the caches (both eviction fns take caches as first arg).
         captured = {"caches": None}
         of, os_ = PS.evict_all_blocks_fused, PS.evict_all_blocks_scheduled
@@ -139,7 +139,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                    evict=True, mask=0xFFFFFFFF, stats=st, fast=True,
                                    collect_out=out, block_moe=args.block_moe,
                                    evict_interval_steps=args.evict_interval_steps,
-                                   evict_schedule=evict_schedule)
+                                   evict_schedule=evict_schedule,
+                                   exact_evict=exact_evict)
                 if _cuda:
                     torch.cuda.synchronize()
                 wall = time.time() - t0
@@ -152,8 +153,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("  running CONTENT-comparison eviction ...", flush=True)
     wc, vrc, stc, oc, posc = run(False)
-    print("  running SCHEDULE-driven eviction ...", flush=True)
+    print("  running SCHEDULE-driven eviction (supersession + O(S) content pass) ...",
+          flush=True)
     ws, vrs, sts, os_, poss = run(True)
+    print("  running EXACT O(steps) eviction (NO content prune at all) ...", flush=True)
+    wx, vrx, stx, ox, posx = run(True, exact_evict=True)
 
     def line(tag, wall, vr, st):
         tev = st.get("t_evict", 0.0)
@@ -165,33 +169,44 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"maxcache={vr.max_cache_size}  evicted={vr.total_evicted}", flush=True)
     line("content ", wc, vrc, stc)
     line("schedule", ws, vrs, sts)
-
-    tev_c, tev_s = stc.get("t_evict", 0.0), sts.get("t_evict", 0.0)
-    print(f"  --- EVICTION COST: content t_evict={tev_c:.3f}s -> schedule "
-          f"t_evict={tev_s:.3f}s  ({tev_c/max(tev_s,1e-9):.1f}x less eviction wall)",
+    line("exact   ", wx, vrx, stx)
+    print(f"  exact-schedule liveness: stores={stx.get('sched_stores')} "
+          f"sup={stx.get('sched_superseded')} dead_unread={stx.get('sched_dead_unread')} "
+          f"live={stx.get('sched_live')} | READ-AFTER-FREE={stx.get('sched_read_after_free')}",
           flush=True)
-    print(f"  --- ms/step: content {1000*wc/max(draft.step_count,1):.2f} -> "
-          f"schedule {1000*ws/max(draft.step_count,1):.2f}", flush=True)
 
-    # byte-identity
-    ax_ok = vrc.all_matched and vrs.all_matched
-    final_ok = (vrc.decoded_final_ax == vrs.decoded_final_ax == draft.final_ax_masked)
-    accept_ok = (vrc.accepted_steps == vrs.accepted_steps == draft.step_count)
-    out_ok = (oc == os_)
-    kv_ok = (posc == poss)
-    print(f"  --- BYTE-IDENTITY: accept={accept_ok}  final_ax={final_ok} "
-          f"(c={vrc.decoded_final_ax} s={vrs.decoded_final_ax} draft={draft.final_ax_masked})"
-          f"  out={out_ok}  KV-contents-match={kv_ok}", flush=True)
-    if not kv_ok:
-        for b, (a, bb) in enumerate(zip(posc, poss)):
-            if a != bb:
-                print(f"      block {b} DIFFERS: content={a}\n"
-                      f"                     schedule={bb}", flush=True)
-                break
-    ok = ax_ok and final_ok and accept_ok and out_ok and (kv_ok or args.classic)
-    print(f"  RESULT: {'OK' if ok else 'MISMATCH'}"
-          + ("  (classic: KV-contents differ by design — schedule governs only "
-             "store rows)" if args.classic and not kv_ok else ""), flush=True)
+    tev_c, tev_s, tev_x = (stc.get("t_evict", 0.0), sts.get("t_evict", 0.0),
+                           stx.get("t_evict", 0.0))
+    print(f"  --- EVICTION WALL: content t_evict={tev_c:.3f}s -> schedule "
+          f"{tev_s:.3f}s -> EXACT {tev_x:.3f}s  "
+          f"({tev_c/max(tev_x,1e-9):.1f}x less than content)", flush=True)
+    print(f"  --- ms/step: content {1000*wc/max(draft.step_count,1):.2f} -> "
+          f"schedule {1000*ws/max(draft.step_count,1):.2f} -> "
+          f"EXACT {1000*wx/max(draft.step_count,1):.2f}", flush=True)
+
+    # BYTE-EXACTNESS: the exact path drops rows past their last read, so its KV SET is
+    # strictly TIGHTER than the content path (NOT identical positions).  The gate is
+    # DECODED byte-exactness (AX / final / output) + ZERO read-after-free + bounded KV.
+    ax_ok = vrc.all_matched and vrs.all_matched and vrx.all_matched
+    final_ok = (vrc.decoded_final_ax == vrs.decoded_final_ax
+                == vrx.decoded_final_ax == draft.final_ax_masked)
+    accept_ok = (vrc.accepted_steps == vrs.accepted_steps
+                 == vrx.accepted_steps == draft.step_count)
+    out_ok = (oc == os_ == ox)
+    kv_sched_ok = (posc == poss)                     # schedule HYBRID == content
+    raf = stx.get("sched_read_after_free", -1)
+    raf_ok = (raf == 0)
+    bound_ok = (vrx.max_cache_size <= vrc.max_cache_size)
+    print(f"  --- BYTE-EXACT: accept={accept_ok}  final_ax={final_ok} "
+          f"(c={vrc.decoded_final_ax} s={vrs.decoded_final_ax} x={vrx.decoded_final_ax} "
+          f"draft={draft.final_ax_masked})  out={out_ok}", flush=True)
+    print(f"  --- EXACT audit: read_after_free={raf} ({'OK' if raf_ok else 'BUG'})  "
+          f"KV bounded (exact<=content): {bound_ok} "
+          f"(exact maxcache={vrx.max_cache_size} <= content {vrc.max_cache_size})  "
+          f"| schedule-HYBRID KV==content: {kv_sched_ok}", flush=True)
+    ok = (ax_ok and final_ok and accept_ok and out_ok and raf_ok and bound_ok
+          and (kv_sched_ok or args.classic))
+    print(f"  RESULT: {'OK' if ok else 'MISMATCH'}", flush=True)
     return 0 if ok else 1
 
 
