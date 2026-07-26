@@ -64,6 +64,9 @@ from .nibble_pure_forward import (
     compile_mem_prep, memory_dispatch_rules, MEM_HEAD_CHANNELS,
     _address_bits, _FRAME_ROLE_SLOTS, _MEM_MARKER_LOCAL,
     _MEM_ADDR_LOCAL, _MEM_VAL_LOCAL, SP_INIT, _flag_from_ops, _concat_specs,
+    ingest_wide_enabled, extend_layout_for_wide_ingest, compile_wide_preroute,
+    compile_wide_rescale, compile_wide_nibble_snap, bake_wide_ingest_head,
+    _make_one_head_attn,
 )
 from . import nibble_alu32 as A
 from .dsl import FFNRule, LinearExpr
@@ -1217,8 +1220,14 @@ def build_pure_forward_complete_model(code_size: int = 32,
     # is dropped: N_ROLES+2.  (C4_UNIFY_CAM_HEAD alone keeps N_ROLES+3 — it drops the
     # standalone mem-cam head but reuses its freed slot layout byte-identically.)
     _one = _unify_cam_one_enabled()
+    _wide = ingest_wide_enabled()
     n_heads = (N_ROLES + 2) if _one else (N_ROLES + 3)
     L = PureForwardCompleteLayout(code_size, n_heads=n_heads)
+    if _wide:
+        # 80 fresh dims (PREROUTE 40 + GATHER 40) for the 1-query/1-KV wide ingest.
+        # Allocated BEFORE dim is fixed; flag-OFF this is never called ⇒ the golden
+        # ``_fingerprint_build`` hash 8f4dd780 is unchanged.
+        extend_layout_for_wide_ingest(L)
     A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
     from . import nibble_bitwise as _bw
     _bw.extend_layout_for_bitwise(L)
@@ -1247,7 +1256,19 @@ def build_pure_forward_complete_model(code_size: int = 32,
     #   | stack-prep (pop addr) | stack-pop-cam (stack KV head -> STACK0) + recompose
     #   | cmp-compute | alu-expand | addsub | mul | divmod | ax-mux
     #   | [bitwise blocks] | dispatch | branch-delta | fold
-    block_specs: List[Tuple[str, Dict]] = [
+    reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
+    wide_blocks: List[Tuple[str, Dict]] = []
+    if _wide:
+        # WIDE INGEST (C4_INGEST_WIDE): replace the 20/21-head role-CAM ingest with a
+        # SINGLE query + SINGLE KV head — three blocks IN FRONT of the stock block 0
+        # (pre-route gate | wide gather+rescale | nibble snap), then the stock
+        # "ingest+recompose" keeps its recompose FFN with its attn ZEROED.
+        wide_blocks = [
+            ("wide-preroute", compile_wide_preroute(L, dim)),
+            ("wide-gather", compile_wide_rescale(L, reg_bases, dim)),
+            ("wide-snap", compile_wide_nibble_snap(L, reg_bases, dim)),
+        ]
+    block_specs: List[Tuple[str, Dict]] = wide_blocks + [
         ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
         ("pc-fetch",    compile_pc_fetch(L, dim)),
         ("code-select", compile_code_select(L, dim)),
@@ -1393,11 +1414,19 @@ def build_pure_forward_complete_model(code_size: int = 32,
         for bi, (name, spec) in enumerate(block_specs):
             _zero_attn(model.blocks[bi].attn)
             _load_ffn(model.blocks[bi].ffn, spec, hidden)
-        reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP, "STACK0": L.STACK0}
-        # C4_INGEST_GQA (default OFF): 1-KV-head GQA ingest (byte-exact, 20 KV → 1).
-        from .nibble_pure_forward import bake_frame_ingest_gqa, ingest_gqa_enabled
-        (bake_frame_ingest_gqa if ingest_gqa_enabled()
-         else bake_frame_ingest)(model.blocks[0].attn, L, reg_bases)
+        if _wide:
+            # WIDE INGEST: swap the "wide-gather" block's Attn for a 1-head Attn
+            # (head_dim = dim) and bake the single wide gather head; the stock
+            # "ingest+recompose" attn stays ZEROED (gather moved to wide-gather).
+            # Every OTHER block's multi-head Attn is byte-identical.
+            gi = [i for i, (nm, _) in enumerate(block_specs) if nm == "wide-gather"][0]
+            model.blocks[gi].attn = _make_one_head_attn(dim, model.max_seq_len)
+            bake_wide_ingest_head(model.blocks[gi].attn, L)
+        else:
+            # C4_INGEST_GQA (default OFF): 1-KV-head GQA ingest (byte-exact, 20 KV → 1).
+            from .nibble_pure_forward import bake_frame_ingest_gqa, ingest_gqa_enabled
+            (bake_frame_ingest_gqa if ingest_gqa_enabled()
+             else bake_frame_ingest)(model.blocks[0].attn, L, reg_bases)
         bake_global_cam_heads(model.blocks, L, block_specs)
     L._block_names = [n for n, _ in block_specs]
     # RECURRENCE: re-point ``model.blocks`` through the application order so the

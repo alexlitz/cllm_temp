@@ -39,7 +39,52 @@ def _hash_sw(h, name, sw):
     _hash_tensor(h, name, _sw_dense(sw))
 
 
+def _hash_model(model) -> str:
+    h = hashlib.sha256()
+    for nm in ("embed", "lm_head", "lm_bias"):
+        _hash_tensor(h, nm, getattr(model, nm, None))
+    h.update(f"n_blocks:{len(model.blocks)}\n".encode())
+    for bi, blk in enumerate(model.blocks):
+        h.update(f"block:{bi}\n".encode())
+        attn = getattr(blk, "attn", None)
+        if attn is not None:
+            _hash_tensor(h, f"b{bi}.attn.n_heads", torch.tensor([attn.n_heads]))
+            _hash_tensor(h, f"b{bi}.alibi", getattr(attn, "alibi_slopes", None))
+            for wn in ("W_q", "W_k", "W_v", "W_o"):
+                w = getattr(attn, wn)
+                if hasattr(w, "dense") or hasattr(w, "csr") or \
+                   hasattr(w, "dense_resident"):
+                    _hash_sw(h, f"b{bi}.attn.{wn}", w)
+                else:
+                    _hash_tensor(h, f"b{bi}.attn.{wn}", w)
+        ffn = getattr(blk, "ffn", None)
+        if ffn is not None:
+            for wn in ("W_up", "W_gate", "W_down"):
+                w = getattr(ffn, wn)
+                if hasattr(w, "dense") or hasattr(w, "csr") or \
+                   hasattr(w, "dense_resident"):
+                    _hash_sw(h, f"b{bi}.ffn.{wn}", w)
+                else:
+                    _hash_tensor(h, f"b{bi}.ffn.{wn}", w)
+            for bn in ("b_up", "b_gate", "b_down"):
+                _hash_tensor(h, f"b{bi}.ffn.{bn}", getattr(ffn, bn, None))
+    return h.hexdigest()
+
+
 def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
+    import os
+    # C4_INGEST_WIDE (default OFF): the 1-query/1-KV wide ingest restructures block 0
+    # (1-head Attn), which the STREAMING memory-optimizer's uniform-n_heads remap does
+    # not yet support.  Flag-ON we fingerprint the DENSE build_pure_forward_complete_
+    # model directly (it fully + correctly honours the wide flag) — the intended,
+    # MOVED flag-ON hash.  Flag-OFF is the UNCHANGED streaming path (golden 8f4dd780).
+    if os.environ.get("C4_INGEST_WIDE", "0") not in ("0", "", "false", "False"):
+        from c4_min.nibble_pure_forward_complete import (
+            build_pure_forward_complete_model)
+        model, L = build_pure_forward_complete_model(
+            code_size=code_size, recurrent_divmod=recurrent_divmod)
+        return _hash_model(model)
+
     from c4_min.compact_alloc import build_compact_sparse_streaming
 
     model, L, stats = build_compact_sparse_streaming(
