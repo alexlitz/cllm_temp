@@ -73,6 +73,38 @@ from .blogspec_memory import ADDR_BITS
 ADJ = isa.ADJ if hasattr(isa, "ADJ") else 7
 
 
+def _unify_cam_one_enabled() -> bool:
+    """PART A+ (``C4_UNIFY_CAM_ONE``, DEFAULT OFF): collapse the global address-CAM to
+    a SINGLE head INDEX — fold the LEV return-PC read onto the SAME merged head.
+
+    a17bf3b1 (``C4_UNIFY_CAM_HEAD``) merged the §Memory LI read + the stack-pop read
+    into ONE head, leaving 2 global heads (merged + a dedicated LEV ret-PC head).  It
+    concluded 2 is the floor because LEV reads ``MEM[BP]`` AND ``MEM[BP+4]`` in the
+    same forward — two distinct addresses — and it tied both to the merged head's
+    SINGLE query row.
+
+    The per-query-position insight (the same mechanism as the wide-value ingest): a
+    head has a query at EVERY row/block, and LEV's two reads land in DIFFERENT
+    registers.  Reuse the SAME head INDEX in TWO cam BLOCKS: the stack-pop-cam block
+    reads ``MEM[BP]`` (query=UNI_QRY_BIN=BP, dest=STACK0 -> BP) exactly as a17bf3b1
+    does, and a SECOND cam block (``lev-cam2``) RE-FIRES the SAME head index with
+    query=LEV_QRY_BIN (BP+4), enable=IS_LEV, dest=LEV_RET (the return PC).  The two
+    reads are now SEQUENTIAL BLOCKS, not simultaneous — one softmax per (head, row)
+    still holds — so the LEV return-PC head INDEX is DROPPED and the distinct
+    global-CAM head count is 1 (n_heads N_ROLES+3 -> N_ROLES+2).  On a non-LEV step
+    IS_LEV=0, so the second cam block's head is a pure softmax1 sink (contributes 0),
+    exactly as the standalone LEV head was on non-LEV steps.
+
+    BP+4 needs NO extra frame plumbing: LEV_QRY_BIN is already computed (pop-addr sets
+    LEV_ADDR=BP, and the ``lev-addr4`` block ripple-carries +4 into LEV_QRY_BIN) for
+    the a17bf3b1 build; ``C4_UNIFY_CAM_ONE`` reuses that exact band on the second block.
+
+    Implies the ``C4_UNIFY_CAM_HEAD`` merged path (UNI_* bands, mux/demux).  DEFAULT
+    OFF -> byte-IDENTICAL to golden (no UNI_* bands, n_heads unchanged)."""
+    import os
+    return os.environ.get("C4_UNIFY_CAM_ONE", "0") not in ("0", "", "false", "False")
+
+
 def _unify_cam_head_enabled() -> bool:
     """PART A: unify the §Memory LI read into the stack-pop CAM head (``C4_UNIFY_CAM_HEAD``,
     DEFAULT OFF).
@@ -86,12 +118,16 @@ def _unify_cam_head_enabled() -> bool:
     the merged head at the stack-pop-cam block reads ``UNI_QRY_BIN`` -> ``UNI_VAL``,
     and a demux FFN copies ``UNI_VAL`` -> AX (loads) / STACK0 (pops/LEV).  The
     standalone mem-cam head is then DROPPED -> the live global-head count falls 3->2.
-    (It cannot reach 1: LEV reads MEM[BP] AND MEM[BP+4] in the SAME forward, two
-    distinct simultaneous addresses, so the LEV return-PC head stays a second head.)
+    (a17bf3b1 held that it cannot reach 1: LEV reads MEM[BP] AND MEM[BP+4] in the SAME
+    forward.  ``C4_UNIFY_CAM_ONE`` refutes that by reusing the merged head INDEX in a
+    second cam block for the BP+4 read — see ``_unify_cam_one_enabled``.)
 
     DEFAULT OFF -> layout, blocks and weights are byte-IDENTICAL to the golden
-    3-head build; the golden/integer VM is unchanged with the gate off."""
+    3-head build; the golden/integer VM is unchanged with the gate off.
+    ``C4_UNIFY_CAM_ONE`` IMPLIES this (it needs the UNI_* bands + mux/demux)."""
     import os
+    if _unify_cam_one_enabled():
+        return True
     return os.environ.get("C4_UNIFY_CAM_HEAD", "0") not in ("0", "", "false", "False")
 
 # Number of nibbles the STATIC immediate-nibble program encoding carries per slot.
@@ -449,6 +485,28 @@ def compile_stk_recompose(L, dim: int, hi_nibbles: int = 8) -> Dict[str, torch.T
     return spec
 
 
+def compile_lev_ret_recompose(L, dim: int, hi_nibbles: int = 8) -> Dict[str, torch.Tensor]:
+    """Refresh ``LEV_RET_VAL`` from the ``LEV_RET`` nibble band (SET).  The
+    ``C4_UNIFY_CAM_ONE`` FFN of the SECOND cam block (``lev-cam2``): its attention
+    (the RE-FIRED merged head, query=BP+4) has just written the return-PC nibbles into
+    ``LEV_RET``, so recompose the scalar the LEV dispatch reads (``compile_stk_recompose``
+    at the stack-pop-cam block SET it to 0 because ``LEV_RET`` was still empty there —
+    the read is issued a block LATER on the reused head index).  Idempotent on a
+    non-LEV step (``LEV_RET`` stays 0 -> ``LEV_RET_VAL`` = 0)."""
+    spec = _empty_spec(dim, 1 + hi_nibbles)
+    u = 0
+    spec["W_up"][u, L.ONE] = S
+    spec["W_gate"][u, L.LEV_RET_VAL] = 1.0
+    spec["W_down"][L.LEV_RET_VAL, u] += -1.0 / SILU_S
+    u += 1
+    for j in range(hi_nibbles):
+        spec["W_up"][u, L.ONE] = S
+        spec["W_gate"][u, L.LEV_RET + j] = 1.0
+        spec["W_down"][L.LEV_RET_VAL, u] += (16.0 ** j) / SILU_S
+        u += 1
+    return spec
+
+
 def _bake_lev_ret_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     """The LEV return-PC KV head: query = LEV_QRY_BIN (address = BP+4), enable =
     IS_LEV, value -> LEV_RET nibble band.  Same §Memory CAM as the stack head."""
@@ -538,12 +596,82 @@ def compile_unify_cam_demux(L: PureForwardCompleteLayout, dim: int) -> Dict[str,
     return spec
 
 
+def compile_unify_stk_recompose(L, dim: int, hi_nibbles: int = 8) -> Dict[str, torch.Tensor]:
+    """Refresh ``STK_VAL`` from the ``STACK0`` nibble band AFTER the demux wrote it
+    (``C4_UNIFY_CAM_HEAD`` / ``C4_UNIFY_CAM_ONE``).  In the merged path the popped
+    value lands in ``STACK0`` only at the ``unify-cam-demux`` block (one block AFTER
+    the stack-pop-cam block whose FFN ``compile_stk_recompose`` runs), so the STK_VAL
+    that block recomposed is STALE (0).  The ALU reads ``STACK0`` nibbles directly
+    (so pop_add etc. are unaffected), but **LEV reads ``STK_VAL``** for ``BP=MEM[BP]``
+    — a stale STK_VAL made nested LEV set BP=0 (invisible on a single-frame return
+    that halts right after, but WRONG once an outer frame's BP must survive).  This
+    block re-recomposes STK_VAL from the demux-updated STACK0 (SET).  Idempotent on a
+    non-pop step (STACK0 == its step-input, so STK_VAL is unchanged)."""
+    spec = _empty_spec(dim, 1 + hi_nibbles)
+    u = 0
+    spec["W_up"][u, L.ONE] = S
+    spec["W_gate"][u, L.STK_VAL] = 1.0
+    spec["W_down"][L.STK_VAL, u] += -1.0 / SILU_S
+    u += 1
+    for j in range(hi_nibbles):
+        spec["W_up"][u, L.ONE] = S
+        spec["W_gate"][u, L.STACK0 + j] = 1.0
+        spec["W_down"][L.STK_VAL, u] += (16.0 ** j) / SILU_S
+        u += 1
+    return spec
+
+
 def _bake_unified_cam_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     """The MERGED CAM head (``C4_UNIFY_CAM_HEAD``): query = UNI_QRY_BIN (muxed load /
     pop address), enable = IS_MEMREAD, value -> UNI_VAL.  ONE head serving both the
     §Memory LI read and the stack-pop read (never co-occur)."""
     _bake_cam_head(attn, L, head, qry_band=L.UNI_QRY_BIN,
                    enable_flag=L.IS_MEMREAD, value_dest=L.UNI_VAL)
+
+
+def bake_global_cam_heads(blocks, L: PureForwardCompleteLayout, block_specs) -> None:
+    """Bake the global address-CAM head(s) onto ``blocks`` per the active unify flag.
+    ONE authority shared by ALL builders (the dense builder here + the two streaming
+    builders in ``compact_alloc``) so the head layout is identical across build paths.
+
+    ``blocks``       — the built block list (each ``.attn`` already zeroed).
+    ``block_specs``  — the ``(name, spec)`` list, for ``_find`` block-name lookup.
+
+    Three configurations (governed by the flags, all default OFF -> the 3-head build):
+      * ``C4_UNIFY_CAM_ONE``  : ONE head INDEX (N_ROLES+1) for EVERY global CAM read.
+        stack-pop-cam: merged head (UNI_QRY_BIN -> UNI_VAL: LI/LC + pop + LEV MEM[BP]).
+        lev-cam2: the SAME index re-fires (LEV_QRY_BIN=BP+4, IS_LEV -> LEV_RET).
+        Global-CAM head count = 1.  (n_heads = N_ROLES+2, so N_ROLES+1 is the last head.)
+      * ``C4_UNIFY_CAM_HEAD`` : merged head (N_ROLES+1) + dedicated LEV head (N_ROLES+2)
+        on stack-pop-cam.  Standalone mem-cam head dropped.  Count = 2.
+      * neither               : the golden 3-head build (mem-cam LI head N_ROLES +
+        stack-pop head N_ROLES+1 + LEV head N_ROLES+2).  Count = 3."""
+    stk = _find(block_specs, "stack-pop-cam")
+    if _unify_cam_one_enabled():
+        _bake_unified_cam_head(blocks[stk].attn, L, head=N_ROLES + 1)
+        lev2 = _find(block_specs, "lev-cam2")
+        _bake_cam_head(blocks[lev2].attn, L, head=N_ROLES + 1,
+                       qry_band=L.LEV_QRY_BIN, enable_flag=L.IS_LEV,
+                       value_dest=L.LEV_RET)
+    elif _unify_cam_head_enabled():
+        _bake_unified_cam_head(blocks[stk].attn, L, head=N_ROLES + 1)
+        _bake_lev_ret_head(blocks[stk].attn, L, head=N_ROLES + 2)
+    else:
+        mem = _find(block_specs, "mem-cam")
+        _bake_pf_memory_head(blocks[mem].attn, L, head=N_ROLES)
+        _bake_stack_pop_head(blocks[stk].attn, L, head=N_ROLES + 1)
+        _bake_lev_ret_head(blocks[stk].attn, L, head=N_ROLES + 2)
+
+
+def cam_baked_blocks(block_specs) -> set:
+    """The set of block indices that get a global CAM head baked (so the streaming
+    builder marks them as dense-attn).  Depends on the active unify flag."""
+    stk = _find(block_specs, "stack-pop-cam")
+    if _unify_cam_one_enabled():
+        return {stk, _find(block_specs, "lev-cam2")}
+    if _unify_cam_head_enabled():
+        return {stk}
+    return {_find(block_specs, "mem-cam"), stk}
 
 
 # ===========================================================================
@@ -1083,7 +1211,13 @@ def build_pure_forward_complete_model(code_size: int = 32,
     while the forward applies the same 262-long sequence.  Byte-identical DIV/MOD
     results to the unrolled build (gadget gate: 24/24).  This is a compute-SHAPE
     toggle (same op set, fewer stored blocks), NOT an op-subset toggle."""
-    n_heads = N_ROLES + 3          # 20 ingest + LI head + stack-pop head + lev head
+    # 20 ingest + LI head + stack-pop head + lev head = N_ROLES+3.  With
+    # C4_UNIFY_CAM_ONE the LEV ret-PC read rides the SAME merged head INDEX in a
+    # second cam block (see _unify_cam_one_enabled), so the dedicated LEV head index
+    # is dropped: N_ROLES+2.  (C4_UNIFY_CAM_HEAD alone keeps N_ROLES+3 — it drops the
+    # standalone mem-cam head but reuses its freed slot layout byte-identically.)
+    _one = _unify_cam_one_enabled()
+    n_heads = (N_ROLES + 2) if _one else (N_ROLES + 3)
     L = PureForwardCompleteLayout(code_size, n_heads=n_heads)
     A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
     from . import nibble_bitwise as _bw
@@ -1136,6 +1270,16 @@ def build_pure_forward_complete_model(code_size: int = 32,
     if _unify:
         # PART A: demux the merged-head value -> AX (load) / STACK0 (pop) + AX_VAL recompose.
         block_specs.append(("unify-cam-demux", compile_unify_cam_demux(L, dim)))
+        # PART A fix: re-recompose STK_VAL from the demux-updated STACK0 (the demux
+        # wrote STACK0 one block AFTER stack-pop-cam's stale STK_VAL recompose).  LEV
+        # reads STK_VAL for BP=MEM[BP]; without this a nested LEV sets BP=0.
+        block_specs.append(("unify-stk-recompose", compile_unify_stk_recompose(L, dim)))
+    if _one:
+        # PART A+ (C4_UNIFY_CAM_ONE): the SECOND cam block.  The SAME merged head INDEX
+        # re-fires here with query=LEV_QRY_BIN (BP+4), enable=IS_LEV -> LEV_RET; its FFN
+        # recomposes LEV_RET_VAL.  This is LEV's SECOND read (the return PC) on the SAME
+        # head as the first (MEM[BP]) — one head index, two sequential blocks.
+        block_specs.append(("lev-cam2", compile_lev_ret_recompose(L, dim)))
     block_specs += [
         ("cmp-compute", compile_cmp_compute(L, dim)),
         ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),
@@ -1254,19 +1398,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
         from .nibble_pure_forward import bake_frame_ingest_gqa, ingest_gqa_enabled
         (bake_frame_ingest_gqa if ingest_gqa_enabled()
          else bake_frame_ingest)(model.blocks[0].attn, L, reg_bases)
-        stk_block = _find(block_specs, "stack-pop-cam")
-        if _unify:
-            # PART A: ONE merged head (head N_ROLES+1) serves BOTH the §Memory LI read
-            # and the stack-pop read (mutually exclusive), reading UNI_QRY_BIN ->
-            # UNI_VAL.  The standalone mem-cam LI head (head N_ROLES) is DROPPED, so
-            # the live global-head count is 2 (merged + LEV ret-PC) instead of 3.
-            _bake_unified_cam_head(model.blocks[stk_block].attn, L, head=N_ROLES + 1)
-            _bake_lev_ret_head(model.blocks[stk_block].attn, L, head=N_ROLES + 2)
-        else:
-            mem_block = _find(block_specs, "mem-cam")
-            _bake_pf_memory_head(model.blocks[mem_block].attn, L, head=N_ROLES)
-            _bake_stack_pop_head(model.blocks[stk_block].attn, L, head=N_ROLES + 1)
-            _bake_lev_ret_head(model.blocks[stk_block].attn, L, head=N_ROLES + 2)
+        bake_global_cam_heads(model.blocks, L, block_specs)
     L._block_names = [n for n, _ in block_specs]
     # RECURRENCE: re-point ``model.blocks`` through the application order so the
     # forward applies the reused divmod iteration body N times (the stored blocks

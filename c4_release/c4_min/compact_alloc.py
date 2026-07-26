@@ -837,14 +837,9 @@ def build_compact_pure_forward_model(code_size: int = 48):
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP,
                      "STACK0": L.STACK0}
         pfc.bake_frame_ingest(model.blocks[0].attn, L, reg_bases)
-        mem_block = pfc._find(block_specs, "mem-cam")
-        pfc._bake_pf_memory_head(model.blocks[mem_block].attn, L,
-                                 head=pfc.N_ROLES)
-        stk_block = pfc._find(block_specs, "stack-pop-cam")
-        pfc._bake_stack_pop_head(model.blocks[stk_block].attn, L,
-                                 head=pfc.N_ROLES + 1)
-        pfc._bake_lev_ret_head(model.blocks[stk_block].attn, L,
-                               head=pfc.N_ROLES + 2)
+        # Global address-CAM head(s): shared authority (honours C4_UNIFY_CAM_HEAD /
+        # C4_UNIFY_CAM_ONE identically to the dense builder in nibble_pure_forward_complete).
+        pfc.bake_global_cam_heads(model.blocks, L, block_specs)
     L._block_names = [n for n, _ in block_specs]
 
     # Now run the dim-sharing compaction (Fix #1 + already-minimal FFN = Fix #2).
@@ -992,9 +987,12 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
     from .blogspec_model import Attn as _Attn, FFN as _FFN
 
     n_blocks = len(block_specs)
-    mem_block = pfc._find(block_specs, "mem-cam")
-    stk_block = pfc._find(block_specs, "stack-pop-cam")
-    baked = {0, mem_block, stk_block}
+    # The blocks that get a real dense ``Attn`` (a global CAM head): block 0 (frame
+    # ingest) + the CAM blocks the active unify flag bakes onto (mem-cam+stack-pop for
+    # the 3-head build; stack-pop only for C4_UNIFY_CAM_HEAD; stack-pop+lev-cam2 for
+    # C4_UNIFY_CAM_ONE).  ``cam_baked_blocks`` is the single authority (shared with the
+    # dense builder), so the streaming attention layout matches it exactly.
+    baked = {0} | pfc.cam_baked_blocks(block_specs)
 
     # embedding + LM head (dense; embed is a gather, head is only used by .forward
     # which the liveness pass does not call for the block stack — but keep it real).
@@ -1030,9 +1028,9 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP,
                      "STACK0": L.STACK0}
         pfc.bake_frame_ingest(phys[0].attn, L, reg_bases)
-        pfc._bake_pf_memory_head(phys[mem_block].attn, L, head=pfc.N_ROLES)
-        pfc._bake_stack_pop_head(phys[stk_block].attn, L, head=pfc.N_ROLES + 1)
-        pfc._bake_lev_ret_head(phys[stk_block].attn, L, head=pfc.N_ROLES + 2)
+        # Global address-CAM head(s): shared authority (honours C4_UNIFY_CAM_HEAD /
+        # C4_UNIFY_CAM_ONE identically to the dense builder).
+        pfc.bake_global_cam_heads(phys, L, block_specs)
 
         # APPLICATION order: for the recurrent-divmod build ``L._apply_order`` maps
         # the FULL application sequence onto the unique physical blocks (the reused
