@@ -194,24 +194,24 @@ def main(argv=None) -> int:
     results: List[Dict] = []
     total_steps = 0
     total_forwards = 0
-    # The MATVEC (scalar MACs) is depth-1 (fits the 1-slot STACK0), so it is the
-    # CLEAN self-forward: the composed K-batch trace must equal the K=1 sequential
-    # bounded reference EVERY step AND the final == isa == numpy.  The width>=2
-    # DOT/MATMUL programs park a partial product (stack DEPTH 2), which #702-walls
-    # the 1-slot STACK0 in BOTH the composed and the sequential bounded draft path —
-    # so we hold them to FINAL exactness (composed final == isa == numpy) and note
-    # the intermediate stack-depth divergence honestly (it is a draft-path property,
-    # not a composed-path bug; full intermediate exactness needs the KV-backed stack).
+    # The MATVEC (scalar MACs) is depth-1 (fits the 1-slot STACK0).  The width>=2
+    # DOT/MATMUL programs park a partial product (stack DEPTH 2).  With the #702
+    # KV-BACKED STACK (default C4_KV_STACK=1: every ALU pop reads MEM[SP] via the
+    # stack-pop address-CAM head — arbitrary depth, latest-write-wins — instead of
+    # the 1-slot STACK0 mirror), BOTH are now byte-exact at EVERY intermediate:
+    # composed == isa == numpy every step, not just the final.  So we require FULL
+    # per-step exactness (``seq_match``) for the dot/matmul too, not merely FINAL.
     mac_all_ok = True      # matvec: composed==seq==isa==numpy every step
-    deep_final_ok = True   # dot/matmul: composed FINAL == isa == numpy
+    deep_final_ok = True   # dot/matmul: composed == isa == numpy at EVERY step (KV stack)
     n_bad = 0
     t_run0 = time.perf_counter()
     last_log = t_run0
     for pi, (name, prog, seed, ref) in enumerate(programs):
-        # only the depth-1 MACs can skip the sequential ref (they are proven
-        # composed==seq==isa==numpy on the smaller run); dot/matmul always keep the
-        # ref so the #702 deep-stack note stays honest.
-        skip = a.skip_seq_ref and name.startswith("mac")
+        # ``skip_seq_ref`` sets seq=isa_trace, so ``seq_match`` = (composed == isa at
+        # EVERY step).  With the KV-backed stack the dot/matmul intermediates are
+        # byte-exact, so we can skip the slow K=1 sequential ref for them too and
+        # still assert full per-step exactness against isa/numpy.
+        skip = a.skip_seq_ref
         r = run_one(model, L, runner, name, prog, K=a.K, graph=a.graph,
                     seed_mem=seed, numpy_ref=ref, skip_seq_ref=skip)
         results.append(r)
@@ -222,7 +222,8 @@ def main(argv=None) -> int:
             ok = r["seq_match"] and r["final_exact"]
             mac_all_ok = mac_all_ok and ok
         else:
-            ok = r["final_exact"]          # deep-stack: final byte-exact vs isa/numpy
+            # KV-backed stack: require EVERY intermediate byte-exact, not just final.
+            ok = r["seq_match"] and r["final_exact"]
             deep_final_ok = deep_final_ok and ok
         if not ok:
             n_bad += 1
@@ -256,37 +257,34 @@ def main(argv=None) -> int:
     print("  (A) matvec  [%d x 1]: %d/%d scalar MAC rows FULLY byte-exact "
           "(composed==seq==isa==numpy, every step)"
           % (a.matvec_rows, n_mac - mac_bad, n_mac), flush=True)
-    # (B) the dot products — the matmul inner unit (final byte-exact; #702 deep-stack
-    # note below).
+    # (B) the dot products — the matmul inner unit.  #702 KV-backed stack: byte-exact
+    # at EVERY intermediate ADD (seq_match), not just the final.
     for (width, w, x, ref), r in zip(dot_meta,
             [rr for rr in results if rr["name"].startswith("dot")]):
-        print("  (B) dot%-2d w.x = %-3d  isa=%-3d model=%-3d  final_byte_exact=%s  "
-              "(%d steps, seq_match=%s)"
-              % (width, ref, r["isa_final"], r["got_final"], r["final_exact"],
-                 r["steps"], r["seq_match"]), flush=True)
+        print("  (B) dot%-2d w.x = %-3d  isa=%-3d model=%-3d  ALL_INTERMEDIATE_exact=%s"
+              "  (%d steps, final=%s)"
+              % (width, ref, r["isa_final"], r["got_final"],
+                 r["seq_match"] and r["final_exact"], r["steps"], r["final_exact"]),
+              flush=True)
     # (C) the small matmul.
     mm_results = [rr for rr in results if rr["name"].startswith("mm_row")]
     mm_got = [rr["got_final"] for rr in mm_results]
-    print("  (C) matmul [%dx%d]@[%d]: numpy=%s model=%s  final_byte_exact=%s"
-          % (M, N, N, mm_ref, mm_got,
-             mm_got == mm_ref and all(rr["final_exact"] for rr in mm_results)),
-          flush=True)
-    if not (mac_all_ok and deep_final_ok):
-        pass
-    # note the deep-stack intermediate divergence explicitly if it occurred.
+    mm_all_exact = (mm_got == mm_ref
+                    and all(rr["final_exact"] and rr["seq_match"] for rr in mm_results))
+    print("  (C) matmul [%dx%d]@[%d]: numpy=%s model=%s  ALL_INTERMEDIATE_exact=%s"
+          % (M, N, N, mm_ref, mm_got, mm_all_exact), flush=True)
+    # honesty guard: if any dot/matmul intermediate diverged (e.g. C4_KV_STACK=0),
+    # say so explicitly rather than silently passing on the final.
     deep_seq_div = any((not rr["seq_match"]) for rr in results
                        if not rr["name"].startswith("mac"))
     if deep_seq_div:
-        print("  NOTE: the width>=2 dot/matmul intermediate ADD frame differs from "
-              "isa in BOTH", flush=True)
-        print("        the composed AND the K=1 sequential bounded path (the #702 "
-              "1-slot STACK0", flush=True)
-        print("        deep-stack wall) — the composed path recovers the correct "
-              "FINAL result;", flush=True)
-        print("        full intermediate exactness needs the KV-backed stack path. "
-              "This is a", flush=True)
-        print("        draft-path property, NOT a composed-runner bug (matvec depth-1 "
-              "is exact).", flush=True)
+        print("  NOTE: a width>=2 dot/matmul INTERMEDIATE diverged from isa — the "
+              "#702 1-slot-STACK0", flush=True)
+        print("        deep-stack wall.  Enable the KV-backed stack (C4_KV_STACK=1, "
+              "the default): every", flush=True)
+        print("        ALU pop then reads MEM[SP] via the stack-pop address-CAM "
+              "(arbitrary depth) so", flush=True)
+        print("        EVERY intermediate is byte-exact, not just the final.", flush=True)
 
     print("", flush=True)
     print("  TOTAL VM steps EXECUTED to completion = %d" % total_steps, flush=True)
@@ -303,9 +301,9 @@ def main(argv=None) -> int:
 
     print("", flush=True)
     byte_exact = mac_all_ok and deep_final_ok
-    print("  BYTE-EXACT matvec (composed==seq==isa==numpy, EVERY step) : %s" % mac_all_ok, flush=True)
-    print("  BYTE-EXACT dot/matmul (composed FINAL == isa == numpy)    : %s" % deep_final_ok, flush=True)
-    print("  OVERALL BYTE-EXACT                                        : %s" % byte_exact, flush=True)
+    print("  BYTE-EXACT matvec (composed==seq==isa==numpy, EVERY step)      : %s" % mac_all_ok, flush=True)
+    print("  BYTE-EXACT dot/matmul (composed==isa==numpy, EVERY intermediate): %s" % deep_final_ok, flush=True)
+    print("  OVERALL BYTE-EXACT                                             : %s" % byte_exact, flush=True)
 
     if device.startswith("cuda"):
         peak = torch.cuda.max_memory_allocated(device) / 1e9

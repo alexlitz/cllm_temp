@@ -45,6 +45,42 @@ def step_block_skip_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# #702 KV-BACKED STACK.  A pop-consuming op (ADD/SUB/MUL/DIV/MOD, the bitwise/
+# shift/cmp set, SI/SC) reads its stack operand from ``MEM[SP]``.  The model's
+# stack-pop CAM head (``_bake_stack_pop_head``, query=SP address, enable=IS_POP,
+# dest=STACK0) content-addresses that store row in the persistent KV memory log —
+# the SAME log SI/SC/PSH write — and relays it to the STACK0 nibble band the ALU
+# reads.  That is a §Memory read at address SP: arbitrary stack DEPTH, latest-
+# write-wins, no 1-slot mirror.
+#
+# The block-skip schedule below historically OMITTED that head from the ALU ops
+# (only LEV ran it), so the ALU consumed the teacher-forced STACK0 MIRROR instead
+# — which tracks exactly ONE parked cell.  A width>=2 dot parks a partial product
+# (stack depth 2) and the mirror loses it, so every intermediate ADD that folds a
+# parked partial diverged (the #702 wall; finals happened to re-converge).  Adding
+# the KV stack-pop chain (``stack-prep`` arms IS_POP + clears STACK0, ``stack-pop-
+# cam`` gathers MEM[SP] into STACK0) to every pop-consumer makes the pop a true
+# KV read -> byte-exact at EVERY intermediate for arbitrary stack depth.
+#
+# Gate: ``C4_KV_STACK`` (default ON — the KV stack is the correct arbitrary-depth
+# semantics and is byte-exact on the depth-1 battery too, since a depth-1 mirror
+# value EQUALS the MEM[SP] the head recalls).  Set ``C4_KV_STACK=0`` to restore
+# the historical 1-slot-mirror schedule (depth-1 byte-identical; depth>=2 walls).
+# ---------------------------------------------------------------------------
+_KV_STACK_CHAIN = ["stack-prep", "stack-pop-cam"]
+_POP_CONSUMER_OPS = (
+    isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD,
+    isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR,
+    isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE,
+    isa.SI, isa.SC,
+)
+
+
+def kv_stack_enabled() -> bool:
+    return os.environ.get("C4_KV_STACK", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
 # The SOUND per-op live-block NAME schedule (from the cumulative-greedy ablation,
 # ``_step_block_skip_greedy`` on the code_size=32 build).  Resolved BY NAME so it
 # is robust to build/dim changes; names absent in a build are ignored.
@@ -164,11 +200,26 @@ def build_live_index(model, L) -> Dict[Optional[int], List[int]]:
     div_idx = [i for i, n in enumerate(names) if n.startswith("alu-div")]
     div_span = set(range(min(div_idx), max(div_idx) + 1)) if div_idx else set()
 
+    # #702 KV-backed stack: every pop-consuming op reads MEM[SP] via the stack-pop
+    # CAM head (arbitrary depth) rather than the 1-slot STACK0 mirror.  Inject the
+    # ``stack-prep`` + ``stack-pop-cam`` chain into those ops' live sets when the
+    # gate is on.  ``build_live_index`` already sorts each op's blocks by index, so
+    # the chain lands in its correct position (pop-addr(8) -> stack-prep(9) ->
+    # stack-pop-cam(11) -> alu-expand(16) ...); the head is IS_POP-gated so it is a
+    # no-op on a non-pop step.
+    kv_chain = idxs(_KV_STACK_CHAIN) if kv_stack_enabled() else set()
+
     out: Dict[Optional[int], List[int]] = {None: list(range(nb))}
     for op, nms in _LIVE_NAMES.items():
-        out[op] = sorted(idxs(nms))
+        base = idxs(nms)
+        if op in _POP_CONSUMER_OPS:
+            base = base | kv_chain
+        out[op] = sorted(base)
     for op in _SPAN_OPS:
-        out[op] = sorted(idxs(_SPAN_COMMON) | div_span)
+        base = idxs(_SPAN_COMMON) | div_span
+        if op in _POP_CONSUMER_OPS:
+            base = base | kv_chain
+        out[op] = sorted(base)
     return out
 
 
