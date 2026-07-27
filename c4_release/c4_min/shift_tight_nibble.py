@@ -448,6 +448,367 @@ def build_tight(op: int) -> Tuple[List[dict], "_TightLayout"]:
 
 
 # ===========================================================================
+# BARREL SHIFTER — a variable shift as ROUTING, in 4 blocks (down from the
+# 6/8-block tight pipeline above and the 17-block SHL+SHR unified fan-out).
+#
+# The tight pipeline above spends its depth on a chain of one-at-a-time stages:
+# ``load -> amt1 -> amt2(ceq) -> coarse -> fprod -> fpeel -> assemble`` (+2 sign
+# blocks for SHR).  Four of those stages are pure re-materialisation overhead
+# that a barrel shifter folds away:
+#
+#   * ``load``    (N = AX low byte, a SEPARATE block) — folded into the decode
+#     block, which reads the amount's linear form directly (``{AMT: 1.0}``
+#     standalone / ``{AX0: 1.0, AX1: 16.0}`` on the model).
+#   * ``amt1->amt2`` (scalar ``c`` THEN its one-hot ``ceq``, TWO blocks because
+#     ``ceq[k]=[c==k]`` reads the scalar ``c``) — folded into ONE block by
+#     emitting ``ceq[k]`` and ``feq[m]`` as equality PULSES on ``n`` DIRECTLY
+#     (``ceq[k] = [4k <= n < 4k+4]``, ``feq[m] = sum_k [n == 4k+m]``), removing
+#     the ``c -> ceq`` cross-block hop.
+#   * ``fprod->fpeel`` (product THEN peel, TWO blocks) — folded into ONE FINE
+#     block: the peel of ``coarse * 2**r`` is a ``feq[m]``-GATED floor-div
+#     staircase read straight off ``COARSE`` (no intermediate ``PROD`` band).
+#   * ``assemble + signprep + signfill`` (THREE blocks for SHR) — folded into
+#     ONE block: ``SIGN`` (= ``in_nib[7] >= 8``) is a source-only read recomputed
+#     inline, and the assemble adds + sign-fill adds + the ``KEEP``-gate all
+#     write ``OUT_NIB`` as deltas on the BLOCK INPUT, so they coexist.
+#
+# Net critical path: ``decode -> coarse -> fine -> assemble`` = 4 blocks for
+# EITHER direction (SHL fills 0 -> the sign-fill units simply never fire; SHR is
+# ARITHMETIC via the same block's sign-fill adds).  Byte-exact to
+# ``ref_shift32`` (logical SHL) / ``_ref_arith_shr`` (arithmetic SHR) — proven by
+# ``barrel_byte_exact`` over amounts 0..63, signed sources and the edge grid.
+# Flag-gated by ``C4_BARREL_SHIFT`` (default OFF); the tight pipeline stays the
+# golden default so the flag-OFF build is byte-identical.
+# ===========================================================================
+_RAMP_W = 0.25          # sharp-ramp half-width (matches nibble_alu32._RAMP_W).
+
+
+def barrel_enabled() -> bool:
+    """``C4_BARREL_SHIFT`` (DEFAULT OFF): route SHL/SHR through the 4-block barrel
+    shifter instead of the 6/8-block tight pipeline.  OFF -> the tight pipeline is
+    the golden default (flag-OFF build byte-identical)."""
+    import os
+    return os.environ.get("C4_BARREL_SHIFT", "0") not in ("0", "", "false", "False")
+
+
+class _BarrelLayout:
+    """The barrel shifter's own scratch (standalone measurement layout).  A ONE
+    lane, the 8 source nibbles, the amount one-hots computed DIRECT from ``n``, the
+    coarse-select output, the fine peel, and the result.  No scalar ``N``/``C``/``R``
+    band and no ``PROD`` band — those were the re-materialisation the barrel folds."""
+
+    def __init__(self):
+        off = 0
+
+        def band(sz):
+            nonlocal off
+            b = off
+            off += sz
+            return b
+
+        self.ONE = band(1)
+        self.IN_NIB = band(N_NIB)             # the 8 source nibbles (0..15)
+        self.AMT = band(1)                    # the raw shift amount n (a load slot)
+        # amount decode outputs (emitted DIRECT from AMT — no scalar c/r hop):
+        self.CEQ = band(N_NIB)                # ceq[k] = [c == k] = [4k <= n < 4k+4]
+        self.FEQ = band(FINE_MAX + 1)         # feq[m] = [r == m] = sum_k [n == 4k+m]
+        self.RNZ = band(1)                    # rnz = [r != 0]
+        self.KEEP = band(1)                   # keep = [n < 32]  (n>=32 -> 0)
+        self.SIGN = band(1)                   # sign = [in_nib[7] >= 8] (bit 31 of src)
+        # coarse-select output:
+        self.COARSE = band(N_NIB)             # coarse-shifted nibbles
+        # fine peel (direct off COARSE, feq-gated — no PROD band):
+        self.FINE_LO = band(N_NIB)            # (coarse * 2**shift) mod 16
+        self.FINE_CO = band(N_NIB)            # floor(coarse * 2**shift / 16)  (carry)
+        # result:
+        self.OUT_NIB = band(N_NIB)            # final result nibbles (post keep/sign)
+        self.D = off
+
+    def load(self, pop: int, n: int) -> torch.Tensor:
+        x = torch.zeros(self.D)
+        x[self.ONE] = 1.0
+        pop &= MASK32
+        x[self.AMT] = float(n)
+        for j in range(N_NIB):
+            x[self.IN_NIB + j] = float((pop >> (4 * j)) & 0xF)
+        return x
+
+    def decode(self, x: torch.Tensor) -> int:
+        val = 0
+        for j in range(N_NIB):
+            val |= (int(round(float(x[self.OUT_NIB + j]))) & 0xF) << (4 * j)
+        return val & MASK32
+
+
+def build_barrel_decode(L, left: bool, amt_terms: Dict[int, float],
+                        in_nib_base: int) -> dict:
+    """BLOCK 1 — the amount decode, emitting EVERYTHING off the raw amount ``n``
+    (``amt_terms`` is the linear form of ``n``: ``{AMT: 1.0}`` standalone, or
+    ``{AX0: 1.0, AX1: 16.0}`` on the model where ``n`` is the AX low byte).
+
+    Emits, all as PULSES / STEPS on ``n`` (no scalar ``c``/``r`` intermediary):
+      * ``ceq[k] = [c == k] = [4k <= n] - [4k+4 <= n]``  (k = 0..7)
+      * ``feq[m] = [r == m] = sum_{k=0..7} ([4k+m <= n] - [4k+m+1 <= n])``  (m = 0..3)
+      * ``rnz  = [r != 0] = sum_{m=1..3} feq[m]``  (rebuilt from the same point pulses)
+      * ``keep = [n < 32] = 1 - [n >= 32]``
+      * ``sign = [in_nib[7] >= 8]``  (bit 31 of the source; a source-only STEP that
+        the SHR sign-fill in ``build_barrel_assemble`` reads as a 0/1 window — it
+        cannot be an inline ``_guard`` window because ``[v >= 8]`` is not linear).
+
+    Direction-independent (the amount decode is shared); ``left`` is accepted for a
+    uniform signature.  All bands SET-cleared then written as deltas on the block
+    INPUT (so ``rnz`` reads the pulses, not the ``feq`` band this block writes)."""
+    # unit budget (each _step_ge = 2 relu units): ceq 8*(1+2*2) + feq 4*(1+8*2*2)
+    # + rnz (1+3*8*2*2) + keep (1+1+2) + sign (1+2) = 40 + 132 + 97 + 4 + 3; pad.
+    spec = _empty_spec(L.D, 8 * 5 + 4 * 33 + 97 + 8 + 4)
+    u = 0
+    # ceq[k] = [4k <= n < 4k+4]   (k = 0..7; n < 32 keeps c in 0..7).
+    for k in range(N_NIB):
+        u = _clear(spec, u, L.CEQ + k)
+        u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 4 * k, L.CEQ + k, 1.0)
+        u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 4 * k + 4, L.CEQ + k, -1.0)
+    # feq[m] = [n mod 4 == m] = sum_k [n == 4k+m]  (periodic -> sum of point pulses).
+    for m in range(FINE_MAX + 1):
+        u = _clear(spec, u, L.FEQ + m)
+        for k in range(N_NIB):                    # n < 32 -> 4k+m in 0..31
+            u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 4 * k + m, L.FEQ + m, 1.0)
+            u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 4 * k + m + 1, L.FEQ + m, -1.0)
+    # rnz = [r != 0] = sum_{m=1..3} feq[m]  (rebuilt from the SAME point pulses so it
+    # reads the block INPUT, not the feq band this block writes).
+    u = _clear(spec, u, L.RNZ)
+    for m in range(1, FINE_MAX + 1):
+        for k in range(N_NIB):
+            u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 4 * k + m, L.RNZ, 1.0)
+            u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 4 * k + m + 1, L.RNZ, -1.0)
+    # keep = [n < 32] = 1 - [n >= 32].
+    u = _clear(spec, u, L.KEEP)
+    u = alu._ident(spec, u, {L.ONE: 1.0}, 0.0, L.KEEP, 1.0)
+    u = alu._step_ge(spec, u, dict(amt_terms), 0.0, 32, L.KEEP, -1.0)
+    # sign = [in_nib[7] >= 8]  (bit 31 of the source; SHR arithmetic sign-fill).
+    u = _clear(spec, u, L.SIGN)
+    u = alu._step_ge(spec, u, {in_nib_base + (N_NIB - 1): 1.0}, 0.0, 8, L.SIGN, 1.0)
+    return _truncate(spec, u, L.D)
+
+
+def build_barrel_coarse(L, left: bool, in_nib_base: int) -> dict:
+    """BLOCK 2 — the DIRECT 8x8 coarse nibble select (identical construction to the
+    tight ``build_coarse_select``): ``COARSE[j] = sum_valid_k in_nib[j-/+k]*ceq[k]``.
+    ``in_nib_base`` is the source-nibble band (``L.IN_NIB`` standalone; ``L.STACK0``
+    on the model)."""
+    spec = _empty_spec(L.D, N_NIB * (N_NIB + 1))
+    u = 0
+    for j in range(N_NIB):
+        u = _clear(spec, u, L.COARSE + j)
+        for k in range(N_NIB):
+            src = (j - k) if left else (j + k)
+            if 0 <= src < N_NIB:
+                u = alu._guard(spec, u, [(L.CEQ + k, 1.0, 0.0)],
+                               {in_nib_base + src: 1.0}, 0.0, L.COARSE + j, 1.0)
+    return _truncate(spec, u, L.D)
+
+
+def _barrel_guard_relu(spec, u, gate_band, terms, const, dst_a, scale_a,
+                       dst_b, scale_b):
+    """``dst += scale * (gate * relu(terms.x + const))`` for a 0/1 ``gate``.
+
+    silu-gated: ``up`` carries the relu-slope form (``silu(RELU_S*form) ~=
+    RELU_S*relu(form)``), ``gate`` selects the 0/1 window band, so the product is
+    ``relu(form+const) * gate`` (0 when gate=0).  Routed to two destinations (the
+    peel's ``FINE_CO`` and ``FINE_LO``)."""
+    for band, coeff in terms.items():
+        spec["W_up"][u, band] += RELU_S * coeff
+    spec["b_up"][u] += RELU_S * const
+    spec["W_gate"][u, gate_band] = 1.0
+    spec["W_down"][dst_a, u] += scale_a / RELU_S
+    spec["W_down"][dst_b, u] += scale_b / RELU_S
+    return u + 1
+
+
+def _barrel_guarded_step(spec, u, gate_band, terms, thr, dst_a, scale_a,
+                         dst_b, scale_b):
+    """One ``gate``-ANDed step ``gate * [form >= thr]`` routed to TWO destinations.
+
+    The sharp unit ramp ``(relu(form-(c-w)) - relu(form-c))/w`` (``c = thr-0.5``,
+    same construction as ``_step_ge``) but each shoulder relu is silu-GATED on
+    ``gate_band`` so the whole step only fires when ``gate == 1``.  Used by the
+    fine peel: ``feq[m]``-gated ``[coarse*2**shift >= 16*kk]`` floor-div step."""
+    c = thr - 0.5
+    w = _RAMP_W
+    u = _barrel_guard_relu(spec, u, gate_band, terms, -(c - w),
+                           dst_a, scale_a / w, dst_b, scale_b / w)
+    u = _barrel_guard_relu(spec, u, gate_band, terms, -c,
+                           dst_a, -scale_a / w, dst_b, -scale_b / w)
+    return u
+
+
+def build_barrel_fine(L, left: bool) -> dict:
+    """BLOCK 3 — the fine sub-nibble shift, product AND peel FUSED into one block.
+
+    For each coarse nibble ``j`` and each fine amount ``m`` (1..3), gated on
+    ``feq[m]``, split ``p = COARSE[j] * 2**shift(m)`` (``shift = m`` for SHL,
+    ``4-m`` for SHR) into the low nibble ``FINE_LO[j] = p mod 16`` and the carry
+    ``FINE_CO[j] = floor(p / 16)``.  Because ``2**shift(m)`` is a CONSTANT once
+    ``m`` is fixed, ``p = 2**shift * COARSE[j]`` is a linear form in ``COARSE[j]``,
+    so the floor-div peel is a ``feq[m]``-GATED ``_step_ge`` staircase read straight
+    off ``COARSE`` — no intermediate ``PROD`` band, no separate product block.
+
+    ``m == 0`` (r=0): SHL 2**0 leaves the nibble whole -> a ``feq[0]``-gated
+    ``FINE_LO = COARSE`` copy; SHR 2**4 is the whole-nibble bypass, handled in
+    assemble via ``rnz`` (so no r=0 term is emitted here for SHR)."""
+    kmax = 120 // 16                                       # = 7 (p <= 15*8)
+    spec = _empty_spec(L.D, N_NIB * (2 + 1 + FINE_MAX * (1 + kmax * 4)))
+    u = 0
+    for j in range(N_NIB):
+        u = _clear(spec, u, L.FINE_LO + j)
+        u = _clear(spec, u, L.FINE_CO + j)
+        if left:
+            # r == 0 (SHL 2**0 = 1): FINE_LO = COARSE, FINE_CO = 0 — a feq[0]-gated
+            # copy so the whole-nibble term is present when r=0.
+            u = alu._guard(spec, u, [(L.FEQ + 0, 1.0, 0.0)],
+                           {L.COARSE + j: 1.0}, 0.0, L.FINE_LO + j, 1.0)
+        for m in range(1, FINE_MAX + 1):
+            shift = m if left else (4 - m)
+            pw = 1 << shift
+            # FINE_LO += (p mod 16)*feq[m]; FINE_CO += floor(p/16)*feq[m] where
+            # p = pw*COARSE[j] (<= 120).  Emit ONE feq[m]-gated floor-div staircase
+            # routed to BOTH: +floor into FINE_CO, -16*floor into FINE_LO, plus the
+            # raw p into FINE_LO (so FINE_LO = p - 16*floor = p mod 16).
+            u = alu._guard(spec, u, [(L.FEQ + m, 1.0, 0.0)],
+                           {L.COARSE + j: float(pw)}, 0.0, L.FINE_LO + j, 1.0)
+            for kk in range(1, kmax + 1):
+                u = _barrel_guarded_step(spec, u, L.FEQ + m,
+                                         {L.COARSE + j: float(pw)}, 16 * kk,
+                                         L.FINE_CO + j, 1.0, L.FINE_LO + j, -16.0)
+    return _truncate(spec, u, L.D)
+
+
+def build_barrel_assemble(L, left: bool, in_nib_base: int = 0) -> dict:
+    """BLOCK 4 — assemble the peeled parts + (SHR) the ARITHMETIC sign-fill, all
+    ``KEEP``-gated, into ``OUT_NIB`` in ONE block.  The sign-fill AND-gates on the
+    ``L.SIGN`` band (= ``[in_nib[7] >= 8]``) which the DECODE block materialised
+    (``[v>=8]`` is a step, not linear, so it cannot be an inline ``_guard`` window),
+    so no separate sign-prep block is needed.  ``in_nib_base`` is unused (kept for a
+    uniform builder signature).
+
+    SHL (``FINE_LO`` stays, ``FINE_CO`` flows UP):
+        OUT[j] = FINE_LO[j] + FINE_CO[j-1]        (KEEP-gated; SHL fills 0)
+    SHR (``FINE_CO`` stays, ``FINE_LO`` flows DOWN; ``rnz=0`` -> whole-nibble copy):
+        r!=0: OUT[j] = FINE_CO[j] + FINE_LO[j+1]  (KEEP & RNZ)
+        r==0: OUT[j] = COARSE[j]                  (KEEP & !RNZ)
+        + sign-fill (arithmetic, when SIGN): +15 into fully-shifted nibbles,
+          +hi_r_mask into the boundary nibble, +15 into every nibble when n>=32."""
+    spec = _empty_spec(L.D, N_NIB * 22)
+    u = 0
+    if left:
+        for j in range(N_NIB):
+            u = _clear(spec, u, L.OUT_NIB + j)
+            u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0)],
+                           {L.FINE_LO + j: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+            nb = j - 1
+            if 0 <= nb < N_NIB:
+                u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0)],
+                               {L.FINE_CO + nb: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        return _truncate(spec, u, L.D)
+    # SHR: assemble + arithmetic sign-fill.  ``SIGN`` (= [bit31 of source]) is the
+    # 0/1 band the decode block materialised (``[v >= 8]`` is a step, not linear, so
+    # it cannot be an inline _guard window); here it is a plain window AND term.
+    sign_win = (L.SIGN, 1.0, 0.0)
+    for j in range(N_NIB):
+        u = _clear(spec, u, L.OUT_NIB + j)
+        # r != 0: FINE_CO[j] + FINE_LO[j+1]   (KEEP & RNZ).
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0), (L.RNZ, 1.0, 0.0)],
+                       {L.FINE_CO + j: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        nb = j + 1
+        if 0 <= nb < N_NIB:
+            u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0), (L.RNZ, 1.0, 0.0)],
+                           {L.FINE_LO + nb: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        # r == 0: COARSE[j]  (KEEP & !RNZ) = COARSE*KEEP - COARSE*KEEP*RNZ.
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0)],
+                       {L.COARSE + j: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0), (L.RNZ, 1.0, 0.0)],
+                       {L.COARSE + j: 1.0}, 0.0, L.OUT_NIB + j, -1.0)
+        # --- ARITHMETIC sign-fill (SIGN inline) ---
+        # full fill +15 into nibble j when SIGN & KEEP & (c >= 8-j) = SIGN & KEEP & ceq[k], k>=8-j.
+        for k in range(8 - j, N_NIB):
+            u = alu._guard(spec, u,
+                           [sign_win, (L.KEEP, 1.0, 0.0), (L.CEQ + k, 1.0, 0.0)],
+                           {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, 15.0)
+        # partial fill into the boundary nibble (7-c): SIGN & KEEP & ceq[7-j] & feq[m].
+        kb = 7 - j
+        if 0 <= kb < N_NIB:
+            for m in range(1, FINE_MAX + 1):
+                msk = _hi_r_mask(m)
+                if msk:
+                    u = alu._guard(spec, u,
+                                   [sign_win, (L.KEEP, 1.0, 0.0),
+                                    (L.CEQ + kb, 1.0, 0.0), (L.FEQ + m, 1.0, 0.0)],
+                                   {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, float(msk))
+        # n >= 32 (KEEP=0): SIGN -> whole word is sign, +15 into every nibble.
+        u = alu._guard(spec, u, [sign_win, (L.KEEP, -1.0, 1.0)],
+                       {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, 15.0)
+    return _truncate(spec, u, L.D)
+
+
+def build_barrel(op: int) -> Tuple[List[dict], "_BarrelLayout"]:
+    """Assemble the 4-block barrel shifter for SHL/SHR (standalone measurement).
+
+    Blocks: ``decode -> coarse -> fine -> assemble``.  SHL is logical (fills 0);
+    SHR is ARITHMETIC (the assemble block folds in the sign-fill)."""
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"build_barrel: op {op} not SHL/SHR")
+    left = (op == isa.SHL)
+    L = _BarrelLayout()
+    _set_one(L.ONE)
+    blocks = [
+        build_barrel_decode(L, left, {L.AMT: 1.0}, L.IN_NIB),
+        build_barrel_coarse(L, left, L.IN_NIB),
+        build_barrel_fine(L, left),
+        build_barrel_assemble(L, left, L.IN_NIB),
+    ]
+    return blocks, L
+
+
+def run_barrel(blocks: List[dict], L: "_BarrelLayout", pop: int, n: int) -> int:
+    x = L.load(pop, n)
+    for w in blocks:
+        x = _apply(x, w)
+    return L.decode(x)
+
+
+def _ref_arith_shr(pop: int, n: int) -> int:
+    """c4 ARITHMETIC (sign-extending) right shift, low-32 view (== the tight SHR
+    and ``isa.interpret``'s signed ``>>`` at the 32-bit fold)."""
+    pop &= MASK32
+    sp = pop - (1 << 32) if pop & 0x80000000 else pop
+    return (sp >> n) & MASK32 if n < 32 else (sp >> 63) & MASK32
+
+
+def barrel_byte_exact(op: int, n_random: int = 400) -> Tuple[int, int, List[str]]:
+    """Byte-exact gate for the 4-block barrel over the edge grid + random (x, n).
+
+    SHL -> logical ``ref_shift32``.  SHR -> ARITHMETIC (c4 signed ``>>``,
+    ``_ref_arith_shr``).  Covers ``n`` 0..63 (both ``n<32`` and ``n>=32 -> 0``),
+    signed sources, shift-by-0."""
+    left = (op == isa.SHL)
+    blocks, L = build_barrel(op)
+    rng = random.Random(0xB4 + op)
+    edge_x = _EDGE_XS + [0xFFFFFF00, 0x7FFFFFFF, 0, 0xFFFFFF80]
+    cases: List[Tuple[int, int]] = [(x, n) for x in edge_x for n in _EDGE_NS]
+    for _ in range(n_random):
+        cases.append((rng.randint(0, MASK32), rng.randint(0, 0x3F)))
+    passed = 0
+    fails: List[str] = []
+    for x, n in cases:
+        want = ref_shift32(x, n, True) if left else _ref_arith_shr(x, n)
+        got = run_barrel(blocks, L, x, n)
+        if got == want:
+            passed += 1
+        elif len(fails) < 12:
+            fails.append(f"barrel {isa.NAMES[op]} x={x:#010x} n={n}: got {got:#010x} want {want:#010x}")
+    return passed, len(cases), fails
+
+
+# ===========================================================================
 # Forward + nz measurement.
 # ===========================================================================
 def _apply(x: torch.Tensor, w: Dict[str, torch.Tensor]) -> torch.Tensor:
