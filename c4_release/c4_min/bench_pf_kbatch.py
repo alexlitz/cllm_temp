@@ -138,10 +138,11 @@ def _apply_direct_cam(state, L, resolved):
 
 
 def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
-                 K: int, max_steps=200, seed_mem=None):
+                 K: int, max_steps=200, seed_mem=None, graph=False):
     """Verify the whole program K VM steps per forward on the bounded-KV path.
 
-    Returns (ax_trace, n_forwards)."""
+    ``graph=True`` routes through the MEGAKERNEL (CUDA-graphed passthrough-FFN
+    tail).  Returns (ax_trace, n_forwards)."""
     from .nibble_pure_forward_complete import make_overlay_complete
     stream, q_positions, ops, resolved_by_qpos, draft_ax, store_log = _prep_stream(
         model, L, code, max_steps=max_steps, seed_mem=seed_mem)
@@ -167,7 +168,10 @@ def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
         q_idxs = q_positions[s:e]
         span_ops = ops[s:e]
         with torch.no_grad():
-            x = runner.forward_span(x_full, span_ops, q_idxs)
+            if graph:
+                x = runner.forward_span_graphed(x_full, span_ops, q_idxs)
+            else:
+                x = runner.forward_span(x_full, span_ops, q_idxs)
         n_forwards += 1
         for q in q_idxs:
             state = x[0, q].clone()
@@ -242,12 +246,12 @@ runner_window = 64   # set from args in main()
 # ---------------------------------------------------------------------------
 # BYTE-EXACT verify: K-batch trace == sequential bounded trace, per K.
 # ---------------------------------------------------------------------------
-def verify_kbatch(model, L, runner, K: int, *, verbose=True) -> bool:
+def verify_kbatch(model, L, runner, K: int, *, verbose=True, graph=False) -> bool:
     ok = True
     for name, prog, seed in _battery():
         code = prog if (prog and isinstance(prog[0], isa.Instr)) else isa.assemble(prog)
         base = drive_seq_bounded(model, L, code, seed_mem=seed)
-        kb, _ = drive_kbatch(model, L, runner, code, K=K, seed_mem=seed)
+        kb, _ = drive_kbatch(model, L, runner, code, K=K, seed_mem=seed, graph=graph)
         n = min(len(base), len(kb))
         match = base[:n] == kb[:n] and len(base) == len(kb)
         ok = ok and match
@@ -261,7 +265,8 @@ def verify_kbatch(model, L, runner, K: int, *, verbose=True) -> bool:
     deep = _nested_prog(3, 4)
     draft = draft_pf_program(deep, max_steps=deep_steps, mask=0xFF)
     draft_ax = [f["ax"] & 0xFF for f in draft.frames]
-    kb, _ = drive_kbatch(model, L, runner, deep, K=K, seed_mem={}, max_steps=deep_steps)
+    kb, _ = drive_kbatch(model, L, runner, deep, K=K, seed_mem={},
+                         max_steps=deep_steps, graph=graph)
     n = min(len(kb), len(draft_ax))
     dmatch = kb[:n] == draft_ax[:n] and n > 0
     ok = ok and dmatch
@@ -374,7 +379,7 @@ def _count_flops_forward(model, L, runner, K, q_idxs, ops, D, window, n_store):
 
 
 def bench_K(model, L, runner, K: int, *, base_s: int, window: int, dev_idx: int,
-            n=30, warmup=8):
+            n=30, warmup=8, graph=False):
     dev = model.embed.device
     cuda = (dev.type == "cuda")
     op = isa.ADD    # a representative arith op (mid-size live-block set)
@@ -384,6 +389,8 @@ def bench_K(model, L, runner, K: int, *, base_s: int, window: int, dev_idx: int,
 
     def fwd():
         with torch.no_grad():
+            if graph:
+                return runner.forward_span_graphed(x0, ops, q_idxs)
             return runner.forward_span(x0, ops, q_idxs)
 
     t_fwd = _time_fn(fwd, n, warmup, cuda)
@@ -414,6 +421,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--stable-s", type=float, default=60.0)
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--no-verify", action="store_true")
+    ap.add_argument("--fp64-all", action="store_true",
+                    help="a39ae2c all-fp64 baseline (disable selective fp64)")
+    ap.add_argument("--graph", action="store_true",
+                    help="MEGAKERNEL: CUDA-graph the passthrough-FFN tail")
     ap.add_argument("--n", type=int, default=30)
     args = ap.parse_args(argv)
     runner_window = args.window
@@ -439,7 +450,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"[built] n_blocks={len(model.blocks)} dim={model.embed.shape[1]} "
           f"dev={device} build={time.time()-t0:.1f}s", flush=True)
 
-    runner = KBatchBoundedRunner(model, L, window=args.window)
+    runner = KBatchBoundedRunner(model, L, window=args.window,
+                                 selective_fp64=not args.fp64_all)
+    if args.fp64_all:
+        runner.set_fp64_blocks(None)
+    fp64_now = [bi for bi, kb in enumerate(runner.kblocks) if kb.b.fp64_ffn]
+    names = list(getattr(L, "_block_names", []))
+    fp64_names = [names[b] if b < len(names) else str(b) for b in fp64_now]
+    print(f"[fp64] {'ALL blocks (a39ae2c baseline)' if args.fp64_all else 'SELECTIVE'}: "
+          f"{len(fp64_now)}/{len(runner.kblocks)} blocks fp64 "
+          f"{fp64_now if not args.fp64_all else '(all)'} "
+          f"{fp64_names if not args.fp64_all else ''}", flush=True)
 
     Ks = [int(k) for k in args.K.split(",") if k.strip()]
 
@@ -449,7 +470,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"(window={args.window}), per K\n{'='*82}", flush=True)
         for K in Ks:
             print(f"  --- K={K} ---", flush=True)
-            ok = verify_kbatch(model, L, runner, K)
+            ok = verify_kbatch(model, L, runner, K, graph=args.graph)
             print(f"  K={K}: {'ALL BYTE-EXACT' if ok else 'DIVERGENCE FOUND'}",
                   flush=True)
             if not ok:
@@ -467,7 +488,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     results = []
     for K in Ks:
         r = bench_K(model, L, runner, K, base_s=args.base_s, window=args.window,
-                    dev_idx=idx, n=args.n)
+                    dev_idx=idx, n=args.n, graph=args.graph)
         results.append(r)
         print(f"  {r['K']:>4} {r['S']:>6} {r['kv_rows']:>7} {r['ms_forward']:10.3f} "
               f"{r['ms_eff_step']:10.4f} {r['util_pct']:8.3f} "

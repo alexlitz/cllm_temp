@@ -115,13 +115,21 @@ class BoundedBlock:
     Byte-exact to ``_block_query_only`` (dense-over-positions K/V) for the query row.
     """
 
-    def __init__(self, blk, window: int, store_dim: int):
+    def __init__(self, blk, window: int, store_dim: int, fp64_ffn: bool = True):
         self.blk = blk
         self.attn = blk.attn
         self.ffn = blk.ffn
         self.routed = blk._routed
         self.window = int(window)
         self.store_dim = int(store_dim)          # residual dim = L.IS_STORE
+        # SELECTIVE fp64 (#748): the query-row FFN runs fp64 ONLY on blocks whose
+        # nibble decode is fp-fragile (the LEA-snap / nested-deep gadgets a39ae2c
+        # pinned); every other block runs the query-row FFN in fp32.  The A5000 runs
+        # fp64 ~1/32 fp32, and Q=1->2 the per-block dense GEMM jumps ~8x, so fp32-ing
+        # the fp-robust blocks removes that penalty.  ``fp64_ffn`` gates it per-block;
+        # default True keeps the a39ae2c all-fp64 byte-exact baseline.  The analyzer
+        # (``analyze_fp64_blocks``) flips the fp32-safe blocks to False.
+        self.fp64_ffn = bool(fp64_ffn)
         A = blk.attn
         self.H, self.HD, self.D = A.n_heads, A.head_dim, A.dim
         self.scale = A.scale
@@ -131,19 +139,35 @@ class BoundedBlock:
         # a block is a pure passthrough (no live value head) -> attention output == x.
         self.is_passthrough = (self.local_idx.numel() == 0
                                and self.global_idx.numel() == 0)
+        # precompute the fp32 fused [W_gate; W_up] GEMM (one [2H,D] instead of two)
+        # for the fp32 path — cheap byte-neutral fusion that always applies fp32.
+        self._W_gu32 = None
+        if not self.routed and getattr(self.ffn, "W_up", None) is not None:
+            Wg, Wu = _dense(self.ffn.W_gate), _dense(self.ffn.W_up)
+            self._W_gu32 = torch.cat([Wg, Wu], dim=0).contiguous()
+            self._b_gu32 = torch.cat([self.ffn.b_gate, self.ffn.b_up], dim=0).contiguous()
+            self._W_down32 = _dense(self.ffn.W_down).contiguous()
+            self._Hdim = int(self.ffn.b_up.shape[0])
 
-    # -- FFN (query-row fp64, matching pos_sparse_forward) ------------------
+    # -- FFN (query row; fp64 on fp-fragile blocks, fp32 otherwise) --------
     def _ffn_qrow(self, aout):
         if self.routed:
             return self.ffn(aout)
         F_ = self.ffn
-        Wu, Wg, Wd = _dense(F_.W_up), _dense(F_.W_gate), _dense(F_.W_down)
-        xq64 = aout.double()
-        up = F.linear(xq64, Wu.double()) + F_.b_up.double()
-        gate = F.linear(xq64, Wg.double()) + F_.b_gate.double()
+        if self.fp64_ffn or self._W_gu32 is None:
+            Wu, Wg, Wd = _dense(F_.W_up), _dense(F_.W_gate), _dense(F_.W_down)
+            xq64 = aout.double()
+            up = F.linear(xq64, Wu.double()) + F_.b_up.double()
+            gate = F.linear(xq64, Wg.double()) + F_.b_gate.double()
+            hidden = F.silu(up) * gate
+            out = xq64 + F.linear(hidden, Wd.double()) + F_.b_down.double()
+            return out.to(aout.dtype)
+        # fp32 fused [W_gate; W_up] GEMM -> silu(up)*gate -> W_down.
+        gu = F.linear(aout, self._W_gu32) + self._b_gu32          # [...,2H]
+        gate = gu[..., :self._Hdim]
+        up = gu[..., self._Hdim:]
         hidden = F.silu(up) * gate
-        out = xq64 + F.linear(hidden, Wd.double()) + F_.b_down.double()
-        return out.to(aout.dtype)
+        return aout + F.linear(hidden, self._W_down32) + F_.b_down
 
     def _store_rows(self, x: torch.Tensor, q_idx: int) -> torch.Tensor:
         """Indices of rows a GLOBAL head can attend to: the store rows (IS_STORE!=0)
@@ -227,6 +251,14 @@ class BoundedPosSparseRunner:
 
     def live_count(self, op) -> int:
         return len(self.live_index.get(op, self.live_index[None]))
+
+    def set_fp64_blocks(self, block_idxs) -> None:
+        """SELECTIVE fp64: run the query-row FFN in fp64 ONLY on ``block_idxs``;
+        fp32 on every other block.  ``None`` -> ALL blocks fp64 (the a39ae2c
+        baseline).  Byte-exactness must be re-verified after any change."""
+        keep = None if block_idxs is None else set(int(b) for b in block_idxs)
+        for bi, bb in enumerate(self.bounded):
+            bb.fp64_ffn = True if keep is None else (bi in keep)
 
     def forward(self, x: torch.Tensor, op) -> torch.Tensor:
         live = self.live_index.get(op)
