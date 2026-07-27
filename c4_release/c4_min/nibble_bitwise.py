@@ -880,6 +880,156 @@ def unified_tight_shift_blocks(L: NibbleLayout, dim_ref: Callable[[], int],
     return named
 
 
+# ===========================================================================
+# §Shifts (BARREL) — the 4-block barrel shifter as the model's SHL/SHR.
+#
+# ``shift_tight_nibble.build_barrel`` proves a 4-block barrel shifter byte-exact
+# standalone (SHL logical + SHR arithmetic, amounts 0..63, signed sources).  It
+# collapses the 6/8-block tight pipeline to ``decode -> coarse -> fine ->
+# assemble`` (SHL and SHR are BOTH 4 blocks; the tight SHR was 8) by:
+#   * folding the amount ``load`` into ``decode`` (reads the AX low byte's linear
+#     form ``AX0 + 16*AX1`` directly),
+#   * emitting ``ceq``/``feq`` as PULSES on ``n`` (no scalar ``c``/``r`` hop),
+#   * fusing the fine product+peel into ONE ``feq``-gated floor-div block, and
+#   * folding assemble + sign-prep + sign-fill into ONE block (``SIGN`` is
+#     materialised in ``decode`` and read as a 0/1 window).
+# Here we RE-USE those exact builders over a ``_BarrelAdapter`` that maps the
+# ``_BarrelLayout`` band names onto the model's ``NibbleLayout`` (per-op private
+# scratch bands; ``IN_NIB`` -> ``STACK0``; the amount read from the AX nibbles).
+# Enabled by ``C4_BARREL_SHIFT`` (default OFF); OFF keeps the tight shifter
+# (golden) so the flag-OFF build is byte-identical.
+# ===========================================================================
+_BARREL_SCRATCH = (
+    # (_BarrelLayout-field, size)
+    ("CEQ", 8),             # ceq[k] = [c == k]
+    ("FEQ", 4),             # feq[m] = [r == m]
+    ("RNZ", 1),             # rnz = [r != 0]
+    ("KEEP", 1),            # keep = [n < 32]  (n>=32 -> 0)
+    ("SIGN", 1),            # sign = [in_nib[7] >= 8]  (bit 31 of source)
+    ("COARSE", 8),          # coarse-shifted nibbles
+    ("FINE_LO", 8),         # (coarse * 2**shift) mod 16
+    ("FINE_CO", 8),         # floor(coarse * 2**shift / 16)
+    ("OUT_NIB", 8),         # final result nibbles (pre AX-recompose)
+)
+
+
+def barrel_shift_enabled() -> bool:
+    """``C4_BARREL_SHIFT`` (DEFAULT OFF): route the model's SHL/SHR through the
+    4-block barrel shifter instead of the 6/8-block tight pipeline.  OFF -> the
+    tight shifter is the golden default (flag-OFF build byte-identical)."""
+    from . import shift_tight_nibble as _st
+    return _st.barrel_enabled()
+
+
+def _barrel_bands_attr(op: int) -> str:
+    """Per-op scratch-band dict attribute on ``L`` (SHL and SHR get PRIVATE scratch
+    bands so both directions coexist in the opcode-fanned unified model)."""
+    return f"_BARREL_BANDS_{isa.NAMES[op]}"
+
+
+def extend_layout_for_barrel_shift(L: NibbleLayout, op: int) -> Dict[str, int]:
+    """Allocate the barrel shifter's private scratch bands for ``op`` on the model
+    ``L``.  ``IN_NIB`` maps onto ``STACK0`` and the result is recomposed into ``AX``
+    by the final recompose, so only the intermediate scratch needs fresh bands.
+    Idempotent per op; refreshes ``L.D``.  Returns the field->base band map."""
+    attr = _barrel_bands_attr(op)
+    bands = getattr(L, attr, None)
+    if bands is not None:
+        return bands
+    bands = {}
+    for field, size in _BARREL_SCRATCH:
+        bands[field] = L._band(f"BARREL_{isa.NAMES[op]}_{field}", size)
+    setattr(L, attr, bands)
+    L.D = L._off
+    return bands
+
+
+class _BarrelAdapter:
+    """Presents the ``_BarrelLayout`` band-name interface the barrel builders read,
+    but every band points into the model's ``NibbleLayout`` (per-op scratch bands
+    from ``extend_layout_for_barrel_shift``; ``IN_NIB`` mapped onto ``STACK0``).
+    ``D``/``ONE`` are the MODEL's, so the builders emit specs sized to the real
+    residual.  ``AMT`` is unused (the model reads the amount from the AX nibbles)."""
+
+    def __init__(self, L: NibbleLayout, bands: Dict[str, int]):
+        self.D = L.D
+        self.ONE = L.ONE
+        self.IN_NIB = L.STACK0          # popped operand nibbles 0..7 (model band)
+        self.AMT = L.AX                 # unused by the model path (amt read via AX form)
+        for field, base in bands.items():
+            setattr(self, field, base)
+
+
+def barrel_shift_stage_blocks(L: NibbleLayout, op: int,
+                              recompose_gate: int = None) -> List:
+    """The 4-block BARREL shifter as an ordered block list on the model ``L`` (the
+    drop-in for :func:`tight_shift_stage_blocks`).
+
+    Re-uses the byte-exact builders from ``shift_tight_nibble.build_barrel_*`` over
+    a :class:`_BarrelAdapter`.  Blocks:
+
+        0    decode     (ceq/feq/rnz/keep/sign, ALL off the AX-low-byte form)
+        1    coarse     (DIRECT 8x8 nibble select from STACK0)
+        2    fine       (feq-gated product+peel, fused)
+        3    assemble   (KEEP-gated merge + SHR sign-fill, fused)
+        4    recompose  (OUT_NIB -> AX, opcode-gated)
+
+    The amount ``n`` is the AX low byte, read as the linear form ``AX0 + 16*AX1``
+    (no separate load block — the barrel's whole point).  Blocks 0-3 only touch this
+    op's PRIVATE scratch bands, so they run unconditionally alongside the other
+    direction; only the recompose is ``recompose_gate``-gated."""
+    if op not in (isa.SHL, isa.SHR):
+        raise ValueError(f"barrel_shift_stage_blocks: op {op} not SHL/SHR")
+    from . import shift_tight_nibble as _st
+    from . import nibble_alu32 as _alu
+
+    bands = extend_layout_for_barrel_shift(L, op)
+    left = (op == isa.SHL)
+    _alu._ONE = L.ONE                       # point the shared emitters' ONE lane at L.ONE
+    A = _BarrelAdapter(L, bands)
+    gate = L.ONE if recompose_gate is None else recompose_gate
+    amt_terms = {L.AX + 0: 1.0, L.AX + 1: 16.0}   # n = AX low byte (nibbles 0,1)
+
+    blocks: List = [
+        _st.build_barrel_decode(A, left, amt_terms, L.STACK0),
+        _st.build_barrel_coarse(A, left, L.STACK0),
+        _st.build_barrel_fine(A, left),
+        _st.build_barrel_assemble(A, left, L.STACK0),
+        tight_out_to_ax_rules(L, bands["OUT_NIB"], gate),
+    ]
+    return blocks
+
+
+def unified_barrel_shift_blocks(L: NibbleLayout, dim_ref: Callable[[], int],
+                                shift_ops=(isa.SHL, isa.SHR)) -> List[Tuple[str, dict]]:
+    """The BARREL shifter as named, opcode-gated FFN sub-blocks for the unified model
+    (the drop-in for ``unified_tight_shift_blocks`` when ``C4_BARREL_SHIFT`` is ON).
+
+    SHL and SHR each get PRIVATE barrel scratch bands, so their 4-block pipelines run
+    UNCONDITIONALLY side-by-side (touching only their own scratch); only the final
+    ``OUT_NIB -> AX`` recompose is opcode-gated and MERGED into one block.  4 blocks
+    per direction + 1 shared recompose = 9 blocks (vs the tight path's 17)."""
+    from .compile_ffn import compile_ffn as _compile_ffn
+    for op in shift_ops:
+        extend_layout_for_barrel_shift(L, op)
+    dim = dim_ref()
+    named: List[Tuple[str, dict]] = []
+    recompose_rules: List[FFNRule] = []
+    for op in shift_ops:
+        stage = barrel_shift_stage_blocks(L, op, recompose_gate=L.OP_IS + op)
+        raw_specs, recompose = stage[:-1], stage[-1]     # 4 raw blocks; last = FFNRule recompose
+        step_names = [f"bw-barrel-{isa.NAMES[op]}-decode",
+                      f"bw-barrel-{isa.NAMES[op]}-coarse",
+                      f"bw-barrel-{isa.NAMES[op]}-fine",
+                      f"bw-barrel-{isa.NAMES[op]}-asm"]
+        assert len(step_names) == len(raw_specs), (op, len(step_names), len(raw_specs))
+        for name, spec in zip(step_names, raw_specs):
+            named.append((name, spec))
+        recompose_rules += recompose                     # already OP_IS-gated
+    named.append(("bw-barrel-recompose", _compile_ffn(recompose_rules, dim)))
+    return named
+
+
 # NOTE: the DENSE per-nibble 256-entry (a,b) bitwise lookup table
 # (``bitwise_dispatch_rules``) and the DENSE per-value shift lookup table
 # (``shift_dispatch_rules``) have been REMOVED, as has the intermediate BARREL
@@ -910,6 +1060,9 @@ def append_bitwise_shift_to_dispatch(L: NibbleLayout, op: int) -> List:
     neither shift path has a MUL/DIV dependency.  In a real fan-out each block's
     rules are additionally gated on the opcode one-hot.
     """
+    if op in (isa.SHL, isa.SHR) and barrel_shift_enabled():
+        # BARREL shifter (C4_BARREL_SHIFT=1): 4 blocks, operand from STACK0 nibbles.
+        return barrel_shift_stage_blocks(L, op)
     if op in (isa.SHL, isa.SHR) and tight_shift_enabled():
         # TIGHT direct-8x8 shifter: operand fed as nibbles from STACK0 -> no planes.
         return tight_shift_stage_blocks(L, op)

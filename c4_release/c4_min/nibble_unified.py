@@ -350,7 +350,13 @@ def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
     # prior stage's buffer), stages are SEPARATE sequential FFN blocks; SHL and SHR
     # share the SH_STAGE buffers, both OP_IS-gated.
     if barrel_shift_ops:
-        if _bw.tight_shift_enabled():
+        if _bw.barrel_shift_enabled():
+            # BARREL shifter (C4_BARREL_SHIFT=1): 4 blocks/direction (vs the tight
+            # path's 6/8).  Private scratch per direction; recompose OP_IS-gated.
+            for name, spec in _bw.unified_barrel_shift_blocks(
+                    L, lambda: L.D, shift_ops=barrel_shift_ops):
+                blocks.append((name, spec))
+        elif _bw.tight_shift_enabled():
             for name, spec in _bw.unified_tight_shift_blocks(
                     L, lambda: L.D, shift_ops=barrel_shift_ops):
                 blocks.append((name, spec))

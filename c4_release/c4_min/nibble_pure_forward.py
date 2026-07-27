@@ -1109,10 +1109,14 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
     if include_bitwise:
         from . import nibble_bitwise as _bw
         _bw.extend_layout_for_bitwise(L)          # A_OH/B_OH/SHIFT_* bands
-        # TIGHT shifter (C4_TIGHT_SHIFT, default ON): allocate its private per-op
-        # scratch bands NOW, before ``dim`` is fixed below, so the tight shift blocks
-        # (compiled inside build_bitwise_blocks at the fixed ``dim``) address valid dims.
-        if _bw.tight_shift_enabled():
+        # SHIFTER scratch: allocate the active shifter's private per-op scratch bands
+        # NOW, before ``dim`` is fixed below, so the shift blocks (compiled inside
+        # build_bitwise_blocks at the fixed ``dim``) address valid dims.  BARREL
+        # (C4_BARREL_SHIFT=1) takes precedence over the TIGHT shifter (default ON).
+        if _bw.barrel_shift_enabled():
+            for _op in (isa.SHL, isa.SHR):
+                _bw.extend_layout_for_barrel_shift(L, _op)
+        elif _bw.tight_shift_enabled():
             for _op in (isa.SHL, isa.SHR):
                 _bw.extend_layout_for_tight_shift(L, _op)
         while L._off % n_heads != 0:

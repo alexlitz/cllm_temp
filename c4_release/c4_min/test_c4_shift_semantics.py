@@ -309,3 +309,79 @@ class TestDraftVMsAgreeOnArithmeticSHR:
         # corpus SHR now sign-extends (arithmetic) — the c4-faithful answer:
         sv = v - (1 << 32) if v & (1 << 31) else v
         assert _corpus(v, n, "SHR") == (sv >> n) & 0xFFFFFFFF
+
+
+# ===========================================================================
+# BARREL SHIFTER (C4_BARREL_SHIFT, default OFF): the 4-block variant of SHL/SHR
+# (down from the tight pipeline's 6/8 blocks).  These assert the barrel is
+# BYTE-IDENTICAL to c4's logical SHL / arithmetic SHR through the real SwiGLU
+# forward, and to the tight (golden) shifter it replaces.  Tests only author no
+# weights (they call the already-built gadget builders), so the flag-OFF golden
+# fingerprint 069cc32f is untouched.
+# ===========================================================================
+class TestBarrelShifterIsByteExact:
+    """The 4-block barrel shifter matches c4 (logical SHL / arithmetic SHR) and the
+    tight golden shifter, through the real SwiGLU forward."""
+
+    @staticmethod
+    def _barrel(op, pop, n):
+        from c4_min import nibble_bitwise as bw
+        from c4_min.blogspec_layout import NibbleLayout
+        import os
+        prev = os.environ.get("C4_BARREL_SHIFT")
+        os.environ["C4_BARREL_SHIFT"] = "1"
+        try:
+            L = NibbleLayout()
+            w = bw.compile_dispatch(L, bw.append_bitwise_shift_to_dispatch(L, op))
+            return bw.run_compiled(L, w, pop, n)
+        finally:
+            if prev is None:
+                os.environ.pop("C4_BARREL_SHIFT", None)
+            else:
+                os.environ["C4_BARREL_SHIFT"] = prev
+
+    @staticmethod
+    def _c4_shr_arith(pop, n):
+        sp = pop - (1 << 32) if pop & 0x80000000 else pop
+        return (sp >> n) & 0xFFFFFFFF if n < 32 else (sp >> 63) & 0xFFFFFFFF
+
+    def test_barrel_is_four_blocks_per_direction(self):
+        from c4_min import shift_tight_nibble as st
+        for op in (isa.SHL, isa.SHR):
+            blocks, _ = st.build_barrel(op)
+            assert len(blocks) == 4, (isa.NAMES[op], len(blocks))
+
+    @pytest.mark.parametrize("pop,n", [
+        (0xFFFFFFFF, 1), (0xFFFFFFFF, 25), (0xFFFFFF00, 4), (0xFFFFFF80, 1),
+        (0x80000000, 1), (0x80000000, 31), (0x80000000, 32), (0xDEADBEEF, 7),
+        (0x7FFFFFFF, 3), (0x1, 0), (0x1, 40),
+    ])
+    def test_barrel_shr_is_arithmetic_like_c4(self, pop, n):
+        assert self._barrel(isa.SHR, pop, n) == self._c4_shr_arith(pop, n)
+
+    @pytest.mark.parametrize("pop,n", [
+        (0x1, 8), (0xFF, 1), (0x03, 2), (0xDEADBEEF, 4), (0xFFFFFFFF, 0),
+        (0x1, 31), (0x1, 32), (0x1, 40),
+    ])
+    def test_barrel_shl_is_logical(self, pop, n):
+        want = (pop << n) & 0xFFFFFFFF if n < 32 else 0
+        assert self._barrel(isa.SHL, pop, n) == want
+
+    def test_barrel_equals_tight_golden(self):
+        # the barrel is byte-identical to the tight (golden) shifter it replaces,
+        # over a signed 32-bit battery (arithmetic SHR + logical SHL, amounts 0..39).
+        from c4_min import nibble_bitwise as bw
+        from c4_min.blogspec_layout import NibbleLayout
+        import os
+        for op in (isa.SHL, isa.SHR):
+            os.environ["C4_BARREL_SHIFT"] = "0"
+            Lt = NibbleLayout()
+            wt = bw.compile_dispatch(Lt, bw.append_bitwise_shift_to_dispatch(Lt, op))
+            os.environ["C4_BARREL_SHIFT"] = "1"
+            Lb = NibbleLayout()
+            wb = bw.compile_dispatch(Lb, bw.append_bitwise_shift_to_dispatch(Lb, op))
+            os.environ.pop("C4_BARREL_SHIFT", None)
+            for x in (0x80000000, 0xFFFFFFFF, 0xDEADBEEF, 0x1, 0xFFFFFF80, 0x89ABCDEF):
+                for n in (0, 1, 3, 7, 15, 16, 31, 32, 39):
+                    assert bw.run_compiled(Lb, wb, x, n) == bw.run_compiled(Lt, wt, x, n), \
+                        (isa.NAMES[op], hex(x), n)

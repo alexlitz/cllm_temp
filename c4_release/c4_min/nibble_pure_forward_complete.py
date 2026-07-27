@@ -1291,10 +1291,15 @@ def build_pure_forward_complete_model(code_size: int = 32,
     A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
     from . import nibble_bitwise as _bw
     _bw.extend_layout_for_bitwise(L)
-    # TIGHT shifter (C4_TIGHT_SHIFT, default ON): allocate its private per-op scratch
-    # bands NOW, before ``dim`` is fixed, so the tight shift blocks (compiled inside
-    # build_bitwise_blocks at the fixed ``dim``) address valid residual dims.
-    if _bw.tight_shift_enabled():
+    # SHIFTER scratch: allocate the active shifter's private per-op scratch bands NOW,
+    # before ``dim`` is fixed, so the shift blocks (compiled inside build_bitwise_blocks
+    # at the fixed ``dim``) address valid residual dims.  BARREL (C4_BARREL_SHIFT=1)
+    # takes precedence over the TIGHT shifter (default ON).  BARREL OFF -> the tight
+    # pre-extension is UNCHANGED, so the golden fingerprint 069cc32f is untouched.
+    if _bw.barrel_shift_enabled():
+        for _op in (isa.SHL, isa.SHR):
+            _bw.extend_layout_for_barrel_shift(L, _op)
+    elif _bw.tight_shift_enabled():
         for _op in (isa.SHL, isa.SHR):
             _bw.extend_layout_for_tight_shift(L, _op)
     while L._off % n_heads != 0:
