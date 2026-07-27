@@ -145,6 +145,102 @@ def _const_operand() -> bool:
     ``const_divmod_digitrec``).  DEFAULT OFF (``C4_CONST_OPERAND=1`` to enable) —
     wired as a detection hook; deferred to the GPU byte-exact run."""
     return os.environ.get("C4_CONST_OPERAND", "0") == "1"
+
+
+def _pack_memcam() -> bool:
+    """Drop the DEAD head-dim padding the pure-forward layout carries so the Qwen
+    residual floor is not inflated by it.  DEFAULT OFF (``C4_PACK_MEMCAM=1`` to
+    enable).
+
+    ``build_pure_forward_model`` pads its layout up to ``n_heads *
+    MEM_HEAD_CHANNELS`` (= 21*51 = 1071) so that the pure-forward ``Transformer``'s
+    §Memory head — which slices ``head_dim = dim // n_heads`` channels — has room
+    for its 51 local channels.  But ``QwenFullLayout`` only KEEPS the layout ``L``
+    from that call and DISCARDS the pure-forward ``Transformer`` model (it re-bakes
+    every attention head on the Qwen geometry ``head_dim=64, n_heads=14``).  So the
+    ~800 head-dim ``_hdpad`` scalars (and the other anonymous ``_*pad`` fill) are
+    NEVER read or written by any Qwen weight matrix or by the driver's per-position
+    overlay — they are pure dead residual width that pushes ``D_used`` (hence the
+    ``hidden_for`` floor) up unnecessarily (base+mem 1121 -> 1152, an 18-head model
+    instead of the 14-head stock).
+
+    When ON, ``QwenFullLayout`` COMPACTS the layout by removing every anonymous
+    ``_*pad`` scalar and renumbering all named bands + the ``L.<band>`` position
+    attributes densely.  The Qwen build reads the compacted positions, so the built
+    weights are byte-identical in VALUE (same magnitudes at the same, now-denser
+    dims) — only the residual is narrower.  A final pad to a multiple of
+    ``head_dim`` keeps the Qwen attention head partition valid.  Verified: LI/LC/SI/
+    SC + var_* round-trip byte-exact ON vs OFF; the ``_fingerprint_build`` golden (a
+    SEPARATE compact-alloc path) is unchanged flag-OFF."""
+    return os.environ.get("C4_PACK_MEMCAM", "0") == "1"
+
+
+# ``_*pad`` scalar-name prefixes the various layout builders use for anonymous
+# head-dim / alignment fill.  These carry NO role: never read/written by any Qwen
+# weight or the driver overlay (audited).  ``_pack_memcam`` drops exactly these.
+_PAD_NAME_PREFIXES = ("_hdpad", "_pfpad", "_widepad", "_bwpad", "_alupad",
+                      "_leanpad", "_pad")
+
+
+def _compact_layout_drop_pad(L, head_dim: int) -> int:
+    """Remove every anonymous ``_*pad`` scalar from ``L`` and renumber all remaining
+    named bands + every int position attribute (on ``L`` AND on its nested band-
+    holder objects like ``L.ALU32`` / ``L.LEANDIV``) densely, order-preserving.
+
+    Returns the number of dims removed.  ``L.D`` / ``L._off`` are reset to the
+    compacted extent, then padded up to a multiple of ``head_dim`` (so the Qwen
+    attention head partition stays valid).  Only the anonymous pad scalars move
+    OUT; every meaningful band keeps its width and relative order, so the Qwen
+    build addresses byte-identical weights at a narrower width.
+
+    A position attribute is remapped iff its value equals a band BASE in the OLD
+    layout (``old_bases``).  That discriminates a genuine dim offset from a same-
+    typed COUNT/width field (e.g. ``ALU32.RN`` / ``LEANDIV.RN``, a nibble count that
+    is provably NOT any band's base) — so counts are left untouched while every real
+    offset — including the ones the nested holders store under a DIFFERENT attribute
+    name than their band (``ALU32.A`` -> ``ALU_A``, ``LEANDIV.DIV_RES`` -> ``LR_DIV``)
+    — is moved."""
+    items = sorted(L._names.items(), key=lambda kv: kv[1][0])
+    old_bases = {b for (b, _w) in L._names.values()}
+    remap: Dict[int, int] = {}
+    new_names: Dict[str, Tuple[int, int]] = {}
+    new_off = 0
+    for name, (base, width) in items:
+        if any(name.startswith(p) for p in _PAD_NAME_PREFIXES):
+            continue                       # drop the dead pad scalar
+        remap[base] = new_off
+        new_names[name] = (new_off, width)
+        new_off += width
+    removed = L._off - new_off
+    L._names = new_names
+
+    def _remap_int_attrs(obj):
+        # Remap every int attr whose value is a KNOWN OLD BAND BASE (a real dim
+        # offset).  ``bool`` is excluded (it is an int subclass); a count/width that
+        # is not a band base (``RN``) is never in ``old_bases`` so it is left alone.
+        for attr, val in list(vars(obj).items()):
+            if attr.startswith("_") or isinstance(val, bool) or not isinstance(val, int):
+                continue
+            if val in old_bases:
+                setattr(obj, attr, remap[val])
+
+    _remap_int_attrs(L)
+    # Nested band-holder objects (ALU32, LEANDIV, and any other object attr that
+    # carries dim offsets) — remap their offsets too.
+    for _a, _v in list(vars(L).items()):
+        if _a.startswith("_") or not hasattr(_v, "__dict__"):
+            continue
+        if isinstance(_v, (int, float, str, bytes, list, dict, tuple, set)):
+            continue
+        _remap_int_attrs(_v)
+    # Reset extent + pad to a multiple of head_dim for the Qwen head partition.
+    L._off = new_off
+    while L._off % head_dim != 0:
+        L._scalar(f"_qpad{L._off}")
+    L.D = L._off
+    return removed
+
+
 QWEN_HEAD_DIM = 64
 
 # stock Qwen2.5-0.5B residual / FFN / layer / head budget (the fit ceiling).
@@ -294,6 +390,17 @@ class QwenFullLayout:
             L.IS_CODE = L._scalar("IS_CODE")       # code-frame flag (KEY gate)
             L.IS_FETCH = L._scalar("IS_FETCH")     # fetch-query flag (QUERY gate)
             L.D = L._off                           # extend the pure-forward width
+        # PACK-MEMCAM (``C4_PACK_MEMCAM``, DEFAULT OFF): the pure-forward layout pads
+        # itself up to ``n_heads*MEM_HEAD_CHANNELS`` for ITS OWN §Memory head — but this
+        # Qwen build DISCARDED that pure-forward Transformer and re-bakes attention on
+        # the Qwen geometry, so those ~800 head-dim ``_hdpad`` dims are dead weight
+        # inflating the residual floor.  Drop the anonymous pad scalars (renumbering
+        # every named band densely) BEFORE the CAM bands are appended, so the whole
+        # layout — and hence every block that reads ``L.<band>`` — addresses the same
+        # weights at a narrower width.  OFF -> byte-identical wider layout.
+        self.pack_memcam = _pack_memcam()
+        if self.pack_memcam:
+            _compact_layout_drop_pad(L, head_dim=QWEN_HEAD_DIM)
         # Append the CAM bands past the (possibly ALU-/code-extended) pure-forward bands.
         off = L.D
         self._names: Dict[str, Tuple[int, int]] = {}
