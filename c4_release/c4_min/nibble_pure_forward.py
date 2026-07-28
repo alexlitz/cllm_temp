@@ -1114,8 +1114,11 @@ def build_pure_forward_model(code_size: int = 32, include_memory: bool = True,
         # build_bitwise_blocks at the fixed ``dim``) address valid dims.  BARREL
         # (C4_BARREL_SHIFT=1) takes precedence over the TIGHT shifter (default ON).
         if _bw.barrel_shift_enabled():
-            for _op in (isa.SHL, isa.SHR):
-                _bw.extend_layout_for_barrel_shift(L, _op)
+            if _bw.barrel_unify_enabled():
+                _bw.extend_layout_for_barrel_unify(L)   # ONE shared scratch set
+            else:
+                for _op in (isa.SHL, isa.SHR):
+                    _bw.extend_layout_for_barrel_shift(L, _op)
         elif _bw.tight_shift_enabled():
             for _op in (isa.SHL, isa.SHR):
                 _bw.extend_layout_for_tight_shift(L, _op)

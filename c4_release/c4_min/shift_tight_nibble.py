@@ -768,6 +768,253 @@ def build_barrel(op: int) -> Tuple[List[dict], "_BarrelLayout"]:
     return blocks, L
 
 
+# ===========================================================================
+# UNIFIED barrel — ONE barrel for BOTH directions on SHARED scratch bands.
+#
+# The 4-block-per-direction barrel (``build_barrel_*``) runs SHL and SHR on
+# DISTINCT private scratch bands so they can co-exist unconditionally in the
+# opcode-fanned model (8 stage blocks + 1 recompose = 9).  But SHL and SHR are
+# MUTUALLY EXCLUSIVE at runtime (the opcode picks exactly one), and they share
+# the ENTIRE machinery except:
+#
+#   * DECODE  — direction-INDEPENDENT already (ceq/feq/rnz/keep/sign are a pure
+#     function of the amount ``n`` + the source sign; SHL simply never READS
+#     ``sign``).  -> one SHARED block, no gating.
+#   * COARSE  — the only structural difference is the neighbour ``src = j-k``
+#     (SHL) vs ``j+k`` (SHR).  Emit BOTH into ONE ``COARSE`` band, each term
+#     AND-gated on its opcode one-hot -> the inactive direction contributes 0.
+#   * FINE    — ``shift = m`` (SHL) vs ``4-m`` (SHR), a per-direction CONSTANT.
+#     Emit both op-gated floor-div staircases into the shared ``FINE_LO/CO``.
+#   * ASM     — SHL's plain 2-add (op-gated) + SHR's KEEP/RNZ merge + arithmetic
+#     sign-fill (op-gated) into the shared ``OUT_NIB``.
+#
+# Net: DECODE + COARSE + FINE + ASM = 4 stage blocks for BOTH directions (down
+# from 8), + 1 recompose = ~5 model blocks (vs 9).  Byte-exact: because exactly
+# one opcode one-hot is 1, the shared bands only ever carry the active direction.
+# ===========================================================================
+def _opwin(op_win):
+    """Normalise an optional opcode-gate window to a list (empty when None)."""
+    return [] if op_win is None else [op_win]
+
+
+def build_barrel_coarse_unified(L, in_nib_base: int, op_win_left, op_win_right) -> dict:
+    """UNIFIED coarse select: emit the SHL (``src=j-k``) AND SHR (``src=j+k``)
+    8x8 nibble selects into ONE ``COARSE`` band, each AND-gated on its opcode
+    one-hot (``op_win_left`` for SHL, ``op_win_right`` for SHR).  Exactly one
+    direction fires per step, so ``COARSE`` carries only the active shift."""
+    spec = _empty_spec(L.D, 2 * N_NIB * (N_NIB + 1))
+    u = 0
+    for j in range(N_NIB):
+        u = _clear(spec, u, L.COARSE + j)
+    for left, op_win in ((True, op_win_left), (False, op_win_right)):
+        for j in range(N_NIB):
+            for k in range(N_NIB):
+                src = (j - k) if left else (j + k)
+                if 0 <= src < N_NIB:
+                    u = alu._guard(spec, u, [(L.CEQ + k, 1.0, 0.0)] + _opwin(op_win),
+                                   {in_nib_base + src: 1.0}, 0.0, L.COARSE + j, 1.0)
+    return _truncate(spec, u, L.D)
+
+
+def build_barrel_fine_unified(L, op_win_left, op_win_right) -> dict:
+    """UNIFIED fine sub-nibble shift: emit BOTH directions' ``feq[m]``-gated
+    product+peel staircases into the shared ``FINE_LO``/``FINE_CO`` bands, each
+    additionally AND-gated on its opcode one-hot.  ``m==0`` (SHL 2**0) is a
+    ``feq[0]``-gated whole-nibble copy (SHL only; SHR r=0 is the assemble bypass)."""
+    kmax = 120 // 16                                       # = 7 (p <= 15*8)
+    per = N_NIB * (2 + 1 + FINE_MAX * (1 + kmax * 4))
+    spec = _empty_spec(L.D, 2 * per + N_NIB)
+    u = 0
+    for j in range(N_NIB):
+        u = _clear(spec, u, L.FINE_LO + j)
+        u = _clear(spec, u, L.FINE_CO + j)
+    for left, op_win in ((True, op_win_left), (False, op_win_right)):
+        ow = _opwin(op_win)
+        for j in range(N_NIB):
+            if left:
+                # r==0 (SHL 2**0=1): feq[0]-gated FINE_LO = COARSE.
+                u = alu._guard(spec, u, [(L.FEQ + 0, 1.0, 0.0)] + ow,
+                               {L.COARSE + j: 1.0}, 0.0, L.FINE_LO + j, 1.0)
+            for m in range(1, FINE_MAX + 1):
+                shift = m if left else (4 - m)
+                pw = 1 << shift
+                u = alu._guard(spec, u, [(L.FEQ + m, 1.0, 0.0)] + ow,
+                               {L.COARSE + j: float(pw)}, 0.0, L.FINE_LO + j, 1.0)
+                for kk in range(1, kmax + 1):
+                    # feq[m] & op -ANDed floor-div step routed to FINE_CO (+floor)
+                    # and FINE_LO (-16*floor), so FINE_LO = p - 16*floor = p mod 16.
+                    u = _barrel_guarded_step_multi(
+                        spec, u, [(L.FEQ + m, 1.0, 0.0)] + ow,
+                        {L.COARSE + j: float(pw)}, 16 * kk,
+                        L.FINE_CO + j, 1.0, L.FINE_LO + j, -16.0)
+    return _truncate(spec, u, L.D)
+
+
+_BARREL_AND_BIG = 1000.0    # penalty that relu-kills a shoulder unless all windows==1.
+
+
+def _barrel_guard_relu_and(spec, u, windows, terms, const, dst_a, scale_a,
+                           dst_b, scale_b):
+    """``dst += scale * (AND(windows) * relu(terms.x + const))`` for 0/1 ``windows``,
+    routed to two destinations.  The form goes through the silu-RELU ``up`` path
+    (so the value is a true ``relu``, unlike ``_guard`` whose value is linear); the
+    AND of the windows is encoded as an additive ``up`` penalty
+    ``BIG*(sum_windows - n)`` that is EXACTLY 0 when every window is 1 (clean ramp)
+    and ``<= -BIG`` otherwise (relu kills the shoulder).  gate = ONE."""
+    for band, coeff in terms.items():
+        spec["W_up"][u, band] += RELU_S * coeff
+    spec["b_up"][u] += RELU_S * const
+    n = len(windows)
+    for band, wcoeff, wconst in windows:
+        spec["W_up"][u, band] += RELU_S * _BARREL_AND_BIG * wcoeff
+        spec["b_up"][u] += RELU_S * _BARREL_AND_BIG * wconst
+    spec["b_up"][u] += -RELU_S * _BARREL_AND_BIG * n
+    spec["W_gate"][u, alu._ONE] = 1.0
+    spec["W_down"][dst_a, u] += scale_a / RELU_S
+    spec["W_down"][dst_b, u] += scale_b / RELU_S
+    return u + 1
+
+
+def _barrel_guarded_step_multi(spec, u, windows, terms, thr, dst_a, scale_a,
+                               dst_b, scale_b):
+    """One AND-of-windows -gated step ``AND(windows) * [form >= thr]`` routed to two
+    destinations.  The sharp unit ramp (two ``relu`` shoulders) with each shoulder
+    AND-gated on ALL ``windows`` via :func:`_barrel_guard_relu_and`, so the step
+    only fires when every window is 1 (``feq[m]`` AND the opcode one-hot)."""
+    c = thr - 0.5
+    w = _RAMP_W
+    u = _barrel_guard_relu_and(spec, u, windows, terms, -(c - w),
+                               dst_a, scale_a / w, dst_b, scale_b / w)
+    u = _barrel_guard_relu_and(spec, u, windows, terms, -c,
+                               dst_a, -scale_a / w, dst_b, -scale_b / w)
+    return u
+
+
+def build_barrel_assemble_unified(L, in_nib_base, op_win_left, op_win_right) -> dict:
+    """UNIFIED assemble: SHL's plain ``FINE_LO + FINE_CO(up)`` (op-gated left) AND
+    SHR's KEEP/RNZ merge + arithmetic sign-fill (op-gated right), both into the
+    shared ``OUT_NIB``.  Exactly one opcode fires, so ``OUT_NIB`` holds only the
+    active direction's result."""
+    spec = _empty_spec(L.D, N_NIB * 40)
+    u = 0
+    owl, owr = _opwin(op_win_left), _opwin(op_win_right)
+    for j in range(N_NIB):
+        u = _clear(spec, u, L.OUT_NIB + j)
+    # --- SHL (left): OUT[j] = FINE_LO[j] + FINE_CO[j-1]  (KEEP-gated; fills 0) ---
+    for j in range(N_NIB):
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0)] + owl,
+                       {L.FINE_LO + j: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        nb = j - 1
+        if 0 <= nb < N_NIB:
+            u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0)] + owl,
+                           {L.FINE_CO + nb: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+    # --- SHR (right): merge + arithmetic sign-fill ---
+    sign_win = (L.SIGN, 1.0, 0.0)
+    for j in range(N_NIB):
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0), (L.RNZ, 1.0, 0.0)] + owr,
+                       {L.FINE_CO + j: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        nb = j + 1
+        if 0 <= nb < N_NIB:
+            u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0), (L.RNZ, 1.0, 0.0)] + owr,
+                           {L.FINE_LO + nb: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        # r == 0: COARSE[j]  (KEEP & !RNZ) = COARSE*KEEP - COARSE*KEEP*RNZ.
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0)] + owr,
+                       {L.COARSE + j: 1.0}, 0.0, L.OUT_NIB + j, 1.0)
+        u = alu._guard(spec, u, [(L.KEEP, 1.0, 0.0), (L.RNZ, 1.0, 0.0)] + owr,
+                       {L.COARSE + j: 1.0}, 0.0, L.OUT_NIB + j, -1.0)
+        # full sign-fill +15 into nibble j when SIGN & KEEP & ceq[k], k >= 8-j.
+        for k in range(8 - j, N_NIB):
+            u = alu._guard(spec, u,
+                           [sign_win, (L.KEEP, 1.0, 0.0), (L.CEQ + k, 1.0, 0.0)] + owr,
+                           {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, 15.0)
+        # partial sign-fill into the boundary nibble (7-c): SIGN & KEEP & ceq[7-j] & feq[m].
+        kb = 7 - j
+        if 0 <= kb < N_NIB:
+            for m in range(1, FINE_MAX + 1):
+                msk = _hi_r_mask(m)
+                if msk:
+                    u = alu._guard(spec, u,
+                                   [sign_win, (L.KEEP, 1.0, 0.0),
+                                    (L.CEQ + kb, 1.0, 0.0), (L.FEQ + m, 1.0, 0.0)] + owr,
+                                   {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, float(msk))
+        # n >= 32 (KEEP=0): SIGN -> whole word is sign, +15 into every nibble.
+        u = alu._guard(spec, u, [sign_win, (L.KEEP, -1.0, 1.0)] + owr,
+                       {L.ONE: 1.0}, 0.0, L.OUT_NIB + j, 15.0)
+    return _truncate(spec, u, L.D)
+
+
+def build_barrel_unified(op_left: int = None, op_right: int = None):
+    """Assemble the UNIFIED 4-stage barrel (both directions, standalone).
+
+    ``op_left``/``op_right`` are IGNORED standalone (the two directions are gated
+    by ``L.OP_L``/``L.OP_R`` one-hots set by :meth:`_UnifiedBarrelLayout.load`);
+    they exist for the model-path signature.  Returns ``(blocks, L)`` where the
+    4 blocks are ``decode -> coarse -> fine -> assemble`` shared across SHL/SHR."""
+    L = _UnifiedBarrelLayout()
+    _set_one(L.ONE)
+    wl, wr = (L.OP_L, 1.0, 0.0), (L.OP_R, 1.0, 0.0)
+    blocks = [
+        build_barrel_decode(L, True, {L.AMT: 1.0}, L.IN_NIB),   # direction-independent
+        build_barrel_coarse_unified(L, L.IN_NIB, wl, wr),
+        build_barrel_fine_unified(L, wl, wr),
+        build_barrel_assemble_unified(L, L.IN_NIB, wl, wr),
+    ]
+    return blocks, L
+
+
+class _UnifiedBarrelLayout(_BarrelLayout):
+    """The unified barrel's scratch: the base ``_BarrelLayout`` bands + two opcode
+    one-hots ``OP_L`` (=1 for SHL) / ``OP_R`` (=1 for SHR) that gate the shared
+    coarse/fine/asm to the active direction."""
+
+    def __init__(self):
+        super().__init__()
+        off = self.D
+        self.OP_L = off
+        self.OP_R = off + 1
+        self.D = off + 2
+
+    def load(self, pop: int, n: int, left: bool = True) -> torch.Tensor:
+        x = torch.zeros(self.D)
+        x[self.ONE] = 1.0
+        pop &= MASK32
+        x[self.AMT] = float(n)
+        for j in range(N_NIB):
+            x[self.IN_NIB + j] = float((pop >> (4 * j)) & 0xF)
+        x[self.OP_L] = 1.0 if left else 0.0
+        x[self.OP_R] = 0.0 if left else 1.0
+        return x
+
+
+def run_barrel_unified(blocks, L: "_UnifiedBarrelLayout", pop: int, n: int,
+                       left: bool) -> int:
+    x = L.load(pop, n, left)
+    for w in blocks:
+        x = _apply(x, w)
+    return L.decode(x)
+
+
+def barrel_unified_byte_exact(n_random: int = 400):
+    """Byte-exact gate for the UNIFIED barrel over BOTH directions: SHL -> logical
+    ``ref_shift32``, SHR -> arithmetic ``_ref_arith_shr``, on the shared blocks."""
+    blocks, L = build_barrel_unified()
+    rng = random.Random(0xB4)
+    edge_x = _EDGE_XS + [0xFFFFFF00, 0x7FFFFFFF, 0, 0xFFFFFF80]
+    cases = [(x, n, left) for x in edge_x for n in _EDGE_NS for left in (True, False)]
+    for _ in range(n_random):
+        cases.append((rng.randint(0, MASK32), rng.randint(0, 0x3F), rng.random() < 0.5))
+    passed, fails = 0, []
+    for x, n, left in cases:
+        want = ref_shift32(x, n, True) if left else _ref_arith_shr(x, n)
+        got = run_barrel_unified(blocks, L, x, n, left)
+        if got == want:
+            passed += 1
+        elif len(fails) < 12:
+            nm = "SHL" if left else "SHR"
+            fails.append(f"unified {nm} x={x:#010x} n={n}: got {got:#010x} want {want:#010x}")
+    return passed, len(cases), fails
+
+
 def run_barrel(blocks: List[dict], L: "_BarrelLayout", pop: int, n: int) -> int:
     x = L.load(pop, n)
     for w in blocks:

@@ -1030,6 +1030,84 @@ def unified_barrel_shift_blocks(L: NibbleLayout, dim_ref: Callable[[], int],
     return named
 
 
+def barrel_unify_enabled() -> bool:
+    """``C4_BARREL_UNIFY`` (DEFAULT OFF, nested under ``C4_BARREL_SHIFT``): collapse
+    the 9-block SHL/SHR barrel into ONE shared 4-stage barrel (decode + coarse + fine
+    + asm, both directions gated by the opcode one-hot) + 1 recompose = 5 blocks.
+    OFF keeps the 9-block private-scratch barrel (byte-identical)."""
+    import os
+    return os.environ.get("C4_BARREL_UNIFY", "0") not in ("0", "", "false", "False")
+
+
+# The unified barrel needs ONE shared scratch band-set (not per-direction), plus
+# the two opcode one-hots that gate the shared coarse/fine/asm to the live shift.
+_BARREL_UNIFY_SCRATCH = _BARREL_SCRATCH   # same fields, but ONE shared copy
+
+
+def extend_layout_for_barrel_unify(L: NibbleLayout) -> Dict[str, int]:
+    """Allocate the UNIFIED barrel's SINGLE shared scratch band-set on ``L`` (one
+    ``CEQ``/``FEQ``/.../``OUT_NIB`` copy shared by SHL and SHR, since exactly one
+    fires per step).  Idempotent; refreshes ``L.D``.  Returns field->base band."""
+    bands = getattr(L, "_BARREL_UNIFY_BANDS", None)
+    if bands is not None:
+        return bands
+    bands = {}
+    for field, size in _BARREL_UNIFY_SCRATCH:
+        bands[field] = L._band(f"BARREL_UNIFY_{field}", size)
+    L._BARREL_UNIFY_BANDS = bands
+    L.D = L._off
+    return bands
+
+
+class _BarrelUnifyAdapter:
+    """Like :class:`_BarrelAdapter` but the two opcode one-hots ``OP_L``/``OP_R``
+    point at the model's ``OP_IS+SHL`` / ``OP_IS+SHR`` bands, so the shared
+    coarse/fine/asm builders gate each direction's terms on the live opcode."""
+
+    def __init__(self, L: NibbleLayout, bands: Dict[str, int]):
+        self.D = L.D
+        self.ONE = L.ONE
+        self.IN_NIB = L.STACK0
+        self.AMT = L.AX
+        self.OP_L = L.OP_IS + isa.SHL
+        self.OP_R = L.OP_IS + isa.SHR
+        for field, base in bands.items():
+            setattr(self, field, base)
+
+
+def unified_barrel_shift_blocks_merged(L: NibbleLayout, dim_ref: Callable[[], int],
+                                       shift_ops=(isa.SHL, isa.SHR)
+                                       ) -> List[Tuple[str, dict]]:
+    """The UNIFIED barrel as named FFN sub-blocks (``C4_BARREL_UNIFY`` ON): ONE
+    shared 4-stage barrel over SHL+SHR (each direction opcode-gated) + 1 recompose
+    = 5 blocks (vs the 9-block private-scratch barrel).  Requires BOTH SHL and SHR
+    in ``shift_ops`` (the whole point is to share their machinery)."""
+    from .compile_ffn import compile_ffn as _compile_ffn
+    from . import shift_tight_nibble as _st
+    from . import nibble_alu32 as _alu
+    if set(shift_ops) != {isa.SHL, isa.SHR}:
+        raise ValueError("unified barrel needs exactly {SHL, SHR}")
+    bands = extend_layout_for_barrel_unify(L)
+    _alu._ONE = L.ONE
+    A = _BarrelUnifyAdapter(L, bands)
+    dim = dim_ref()
+    wl, wr = (A.OP_L, 1.0, 0.0), (A.OP_R, 1.0, 0.0)
+    amt_terms = {L.AX + 0: 1.0, L.AX + 1: 16.0}   # n = AX low byte (nibbles 0,1)
+    named: List[Tuple[str, dict]] = [
+        ("bw-barrel-decode", _st.build_barrel_decode(A, True, amt_terms, L.STACK0)),
+        ("bw-barrel-coarse", _st.build_barrel_coarse_unified(A, L.STACK0, wl, wr)),
+        ("bw-barrel-fine", _st.build_barrel_fine_unified(A, wl, wr)),
+        ("bw-barrel-asm", _st.build_barrel_assemble_unified(A, L.STACK0, wl, wr)),
+    ]
+    # recompose: OUT_NIB -> AX, gated on (SHL | SHR).  Reuse the OP_IS-gated recompose
+    # for both ops (they share OUT_NIB, so ONE gate per op covers the shared band).
+    recompose_rules: List[FFNRule] = []
+    for op in shift_ops:
+        recompose_rules += tight_out_to_ax_rules(L, bands["OUT_NIB"], L.OP_IS + op)
+    named.append(("bw-barrel-recompose", _compile_ffn(recompose_rules, dim)))
+    return named
+
+
 # NOTE: the DENSE per-nibble 256-entry (a,b) bitwise lookup table
 # (``bitwise_dispatch_rules``) and the DENSE per-value shift lookup table
 # (``shift_dispatch_rules``) have been REMOVED, as has the intermediate BARREL
