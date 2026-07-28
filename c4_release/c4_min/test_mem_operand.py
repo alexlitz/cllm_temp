@@ -39,7 +39,13 @@ def _single_mac(model, L, a, b, acc=0, mask=0xFF):
 @pytest.fixture(scope="module")
 def model8():
     os.environ["C4_MEM_OPERAND"] = "1"
-    return MO.build_mem_operand_model(code_size=4)
+    # ``code_size`` sizes the CODE_OP/CODE_IMM/CODE_IMM_NIB program tables (one slot
+    # per instruction); the overlay writes ``len(code)`` slots, so it MUST be >= the
+    # longest program the fixture runs.  ``test_dot_product_composes`` runs a
+    # 4-MAC + HALT (5-instruction) dot product, so 4 over-indexed CODE_OP[4]
+    # (IndexError).  Size it to 8 for headroom (single-MAC's 2-instr program is
+    # unaffected — extra slots are just unused zero-op headroom).
+    return MO.build_mem_operand_model(code_size=8)
 
 
 def test_single_mac_byte_exact(model8):
