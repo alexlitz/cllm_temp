@@ -1297,8 +1297,11 @@ def build_pure_forward_complete_model(code_size: int = 32,
     # takes precedence over the TIGHT shifter (default ON).  BARREL OFF -> the tight
     # pre-extension is UNCHANGED, so the golden fingerprint 069cc32f is untouched.
     if _bw.barrel_shift_enabled():
-        for _op in (isa.SHL, isa.SHR):
-            _bw.extend_layout_for_barrel_shift(L, _op)
+        if _bw.barrel_unify_enabled():
+            _bw.extend_layout_for_barrel_unify(L)       # ONE shared scratch set
+        else:
+            for _op in (isa.SHL, isa.SHR):
+                _bw.extend_layout_for_barrel_shift(L, _op)
     elif _bw.tight_shift_enabled():
         for _op in (isa.SHL, isa.SHR):
             _bw.extend_layout_for_tight_shift(L, _op)

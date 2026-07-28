@@ -385,3 +385,104 @@ class TestBarrelShifterIsByteExact:
                 for n in (0, 1, 3, 7, 15, 16, 31, 32, 39):
                     assert bw.run_compiled(Lb, wb, x, n) == bw.run_compiled(Lt, wt, x, n), \
                         (isa.NAMES[op], hex(x), n)
+
+
+# ===========================================================================
+# UNIFIED BARREL (C4_BARREL_UNIFY, default OFF, nested under C4_BARREL_SHIFT):
+# ONE shared 4-stage barrel for BOTH directions (decode + coarse + fine + asm,
+# each direction opcode-gated) + 1 recompose = 5 blocks (vs the 9-block private-
+# scratch barrel).  These assert the unified barrel is BYTE-EXACT to c4 (logical
+# SHL / arithmetic SHR) through the real SwiGLU forward — the depth lever that
+# takes the full-C subroutine stored layers 23 -> 19.  Tests author no weights so
+# the flag-OFF golden fingerprint 069cc32f is untouched.
+# ===========================================================================
+class TestUnifiedBarrelIsByteExact:
+    """The UNIFIED 4-stage barrel (both directions shared) matches c4 through the
+    real SwiGLU forward, both standalone and on the model band-set (OP_IS-gated)."""
+
+    def test_unified_standalone_byte_exact(self):
+        from c4_min.shift_tight_nibble import barrel_unified_byte_exact
+        passed, total, fails = barrel_unified_byte_exact(n_random=400)
+        assert passed == total, fails[:6]
+
+    def test_unified_is_five_blocks(self):
+        import os
+        prev = (os.environ.get("C4_BARREL_SHIFT"), os.environ.get("C4_BARREL_UNIFY"))
+        os.environ["C4_BARREL_SHIFT"] = "1"
+        os.environ["C4_BARREL_UNIFY"] = "1"
+        try:
+            from c4_min import nibble_bitwise as bw
+            from c4_min.nibble_vm_layout import NibbleVMLayout
+            L = NibbleVMLayout(code_size=16)
+            bw.extend_layout_for_bitwise(L); L.D = L._off
+            bw.extend_layout_for_barrel_unify(L); L.D = L._off
+            blocks = bw.unified_barrel_shift_blocks_merged(L, lambda: L.D)
+            assert [n for n, _ in blocks] == [
+                "bw-barrel-decode", "bw-barrel-coarse", "bw-barrel-fine",
+                "bw-barrel-asm", "bw-barrel-recompose"], [n for n, _ in blocks]
+        finally:
+            for k, v in zip(("C4_BARREL_SHIFT", "C4_BARREL_UNIFY"), prev):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    @staticmethod
+    def _model_unified(op, pop, n):
+        import os
+        import torch
+        import torch.nn.functional as Fn
+        prev = (os.environ.get("C4_BARREL_SHIFT"), os.environ.get("C4_BARREL_UNIFY"))
+        os.environ["C4_BARREL_SHIFT"] = "1"
+        os.environ["C4_BARREL_UNIFY"] = "1"
+        try:
+            from c4_min import nibble_bitwise as bw
+            from c4_min.nibble_vm_layout import NibbleVMLayout
+            L = NibbleVMLayout(code_size=16)
+            bw.extend_layout_for_bitwise(L); L.D = L._off
+            bw.extend_layout_for_barrel_unify(L); L.D = L._off
+            blocks = bw.unified_barrel_shift_blocks_merged(L, lambda: L.D)
+
+            def apply(x, w):
+                up = Fn.linear(x, w["W_up"]) + w["b_up"]
+                gate = Fn.linear(x, w["W_gate"]) + w["b_gate"]
+                return x + Fn.linear(Fn.silu(up) * gate, w["W_down"], w["b_down"])
+
+            x = torch.zeros(L.D); x[L.ONE] = 1.0; pop &= 0xFFFFFFFF
+            for j in range(16):
+                x[L.STACK0 + j] = float((pop >> (4 * j)) & 0xF)
+                x[L.AX + j] = float((n >> (4 * j)) & 0xF)
+            x[L.OP_IS + op] = 1.0
+            for _, w in blocks:
+                x = apply(x, w)
+            val = 0
+            for j in range(16):
+                val |= (int(round(float(x[L.AX + j]))) & 0xF) << (4 * j)
+            return val & 0xFFFFFFFF
+        finally:
+            for k, v in zip(("C4_BARREL_SHIFT", "C4_BARREL_UNIFY"), prev):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    @staticmethod
+    def _c4_shr_arith(pop, n):
+        sp = pop - (1 << 32) if pop & 0x80000000 else pop
+        return (sp >> n) & 0xFFFFFFFF if n < 32 else (sp >> 63) & 0xFFFFFFFF
+
+    @pytest.mark.parametrize("pop,n", [
+        (0xFFFFFFFF, 1), (0xFFFFFFFF, 25), (0x80000000, 1), (0x80000000, 31),
+        (0x80000000, 32), (0xDEADBEEF, 7), (0x7FFFFFFF, 3), (0x1, 0), (0x1, 40),
+        (0xFFFFFF80, 1),
+    ])
+    def test_model_unified_shr_is_arithmetic_like_c4(self, pop, n):
+        assert self._model_unified(isa.SHR, pop, n) == self._c4_shr_arith(pop, n)
+
+    @pytest.mark.parametrize("pop,n", [
+        (0x1, 8), (0xFF, 1), (0x03, 2), (0xDEADBEEF, 4), (0xFFFFFFFF, 0),
+        (0x1, 31), (0x1, 32), (0x1, 40),
+    ])
+    def test_model_unified_shl_is_logical(self, pop, n):
+        want = (pop << n) & 0xFFFFFFFF if n < 32 else 0
+        assert self._model_unified(isa.SHL, pop, n) == want

@@ -353,8 +353,13 @@ def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
         if _bw.barrel_shift_enabled():
             # BARREL shifter (C4_BARREL_SHIFT=1): 4 blocks/direction (vs the tight
             # path's 6/8).  Private scratch per direction; recompose OP_IS-gated.
-            for name, spec in _bw.unified_barrel_shift_blocks(
-                    L, lambda: L.D, shift_ops=barrel_shift_ops):
+            # C4_BARREL_UNIFY collapses SHL+SHR into ONE shared 4-stage barrel + 1
+            # recompose = 5 blocks (needs both directions present to share).
+            if _bw.barrel_unify_enabled() and set(barrel_shift_ops) == {isa.SHL, isa.SHR}:
+                builder = _bw.unified_barrel_shift_blocks_merged
+            else:
+                builder = _bw.unified_barrel_shift_blocks
+            for name, spec in builder(L, lambda: L.D, shift_ops=barrel_shift_ops):
                 blocks.append((name, spec))
         elif _bw.tight_shift_enabled():
             for name, spec in _bw.unified_tight_shift_blocks(
