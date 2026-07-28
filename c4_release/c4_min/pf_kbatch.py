@@ -397,12 +397,32 @@ class KBatchBoundedRunner:
             gch = self._ffn_graphs.get(key)
             if gch is None:
                 D = x.shape[2]
-                gch = GraphedFFNChain(self.kblocks, seg, K, D, x.device, x.dtype)
-                if gch.try_capture():
+                # #758 FUSED GATHER-GATE-SCATTER megakernel: replace the tail's dense
+                # SwiGLU GEMV chain with the per-block PARALLEL Triton gather-scatter
+                # chain (each block touches only its ~1-nnz-per-unit reads, not
+                # D*Dff), CUDA-graphed as one replay.  ~2-3x on the DIV/MOD 186-block
+                # tail vs the dense-graphed chain; byte-exact at DECODE (residual
+                # L-inf ~1e-6 from multi-read/atomic accum order).  Falls back to the
+                # dense GraphedFFNChain if unavailable / capture fails.
+                from .fused_ffn_megakernel import (
+                    fused_ffn_megakernel_enabled, GraphedTritonBlockGSChain)
+                gch = None
+                if fused_ffn_megakernel_enabled():
+                    try:
+                        cand = GraphedTritonBlockGSChain(
+                            self.kblocks, seg, K, D, x.device, x.dtype)
+                        if cand.try_capture():
+                            gch = cand
+                    except Exception:
+                        gch = None
+                if gch is None:
+                    gch = GraphedFFNChain(self.kblocks, seg, K, D, x.device, x.dtype)
+                    if not gch.try_capture():
+                        gch = None
+                if gch is not None:
                     self._ffn_graphs[key] = gch
                 else:
                     self._graph_disabled.add(key)
-                    gch = None
         # eager prefix = every live block NOT in the graphed tail segment.
         eager = live if gch is None else live[:len(live) - len(seg)]
         store_dim = int(self.L.IS_STORE)
