@@ -1364,16 +1364,24 @@ void run_incremental(int S) {
         { float *tmp = xin; xin = xout; xout = tmp; }
     }
 
-    /* Only row -1 (the last query row, local index T-1) is read by the driver.
-     * Materialise the hidden output tensor [1,S,D] and write the exact last row;
-     * the other rows are left as whatever run() would leave (unused) — we zero
-     * them so a full read is deterministic. */
+    /* Materialise the hidden output tensor [1,S,D].  The single-step driver reads
+     * only row -1; the SPECULATIVE (batched-K) driver reads the K frame-end rows,
+     * all of which live in the freshly-computed tail [P..S-1].  So we write the
+     * EXACT block-stack output for EVERY tail row (positions P..S-1) into the
+     * output tensor, and zero the stable-prefix rows [0..P-1] (never read).  This
+     * is BYTE-EXACT: each tail row's value in xin is the same value the row would
+     * have as row -1 of a stream truncated there (causal attention → a row's
+     * output depends only on rows <= it), so row (P+i) here == the single-step
+     * decode of a stream that ended at P+i.  The row-(S-1) copy is bit-identical
+     * to the prior single-row behaviour. */
     {
         int rdim[3]; rdim[0] = 1; rdim[1] = S; rdim[2] = g_D;
+        int t;
         alloc_tensor(output_tid, DT_FLOAT, 3, rdim);
-        memset(tf[output_tid], 0, (long)S * g_D * sizeof(float));
-        memcpy(tf[output_tid] + (long)(S - 1) * g_D, xin + (long)(T - 1) * g_D,
-               g_D * sizeof(float));
+        if (P > 0) memset(tf[output_tid], 0, (long)P * g_D * sizeof(float));
+        for (t = 0; t < T; t = t + 1)
+            memcpy(tf[output_tid] + (long)(P + t) * g_D, xin + (long)t * g_D,
+                   g_D * sizeof(float));
     }
 
     /* update the stable prefix for the next step: rows [0..S-2] are now stable.
