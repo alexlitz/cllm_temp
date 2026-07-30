@@ -34,14 +34,27 @@ def _emit_prog_bytes(text: bytes):
     return prog
 
 
-def build_program(mode, text):
-    """Return (isa_code, seed_mem, expected_bytes) for a named utility mode."""
+def build_program(mode, text, io_mode="literal", n=8, stdin_text=""):
+    """Return (isa_code, seed_mem, expected_bytes) for a named utility mode.
+
+    ``io_mode`` selects HOW the utility does I/O:
+      * ``literal`` : the legacy IMM(b);PRTF(b) template (no §Memory read) — kept
+        for the existing echo build's byte-identity.
+      * ``strict``  : MODE 1 — the program pointer-walks §Memory (LC mem[ptr]),
+        one PRTF per byte.
+      * ``burst``   : MODE 2 — one PRTF whose AX is a pointer; the RUNTIME walks
+        §Memory (needs C4_IO_BURST / --io-burst at run time).
+    """
     from c4_min import isa
     if mode == "quine":
         from c4_min import quine_prtf as Q
         code, seed_mem, expected = Q.build_quine()
         return code, seed_mem, list(expected)
-    # echo / cat / yes are all the printf-of-literal template
+    if io_mode in ("strict", "burst"):
+        from c4_min.selfhost import _agent_io_progs as IOP
+        prog = IOP.build(mode, io_mode, text=text, n=n, stdin_text=stdin_text)
+        return assemble(prog.code), prog.seed_mem, list(prog.expected)
+    # legacy literal template: echo / cat / yes = printf-of-literal
     prog = _emit_prog_bytes(text.encode())
     return assemble(prog), {}, list(text.encode())
 
@@ -84,6 +97,14 @@ def layout_consts(L):
         OP_PSH=int(__import__("c4_min.isa", fromlist=["PSH"]).PSH),
         OP_JSR=int(__import__("c4_min.isa", fromlist=["JSR"]).JSR),
         OP_ENT=int(__import__("c4_min.isa", fromlist=["ENT"]).ENT),
+        # §File Operations opcodes (30-33): were MISSING — needed by the
+        # runtime I/O syscall dispatch (READ stdin->§Memory, OPEN/CLOS stubs).
+        OP_OPEN=int(__import__("c4_min.isa", fromlist=["OPEN"]).OPEN),
+        OP_READ=int(__import__("c4_min.isa", fromlist=["READ"]).READ),
+        OP_CLOS=int(__import__("c4_min.isa", fromlist=["CLOS"]).CLOS),
+        # memory-load opcodes (the pointer-walk reads in MODE 1 strict)
+        OP_LI=int(__import__("c4_min.isa", fromlist=["LI"]).LI),
+        OP_LC=int(__import__("c4_min.isa", fromlist=["LC"]).LC),
     )
     # frame role slots: FRAME_LEN-sized array, -1 for non-role slots
     role_of = [-1] * int(V.FRAME_LEN)
@@ -196,11 +217,19 @@ if __name__ == "__main__":
     ap.add_argument("--mode", default="echo",
                     help="echo|cat|yes|quine (echo/cat/yes = printf of --text)")
     ap.add_argument("--text", default="hello\n")
+    ap.add_argument("--io-mode", default="literal",
+                    choices=["literal", "strict", "burst"],
+                    help="literal=legacy IMM;PRTF; strict=MODE1 §Memory pointer-walk"
+                         "; burst=MODE2 runtime §Memory syscall")
+    ap.add_argument("--n", type=int, default=8, help="yes: repeat count")
+    ap.add_argument("--stdin", default="", help="cat: the stdin the program READs")
     args = ap.parse_args()
-    print(f"building compact full-ISA model + layout (mode={args.mode}) ...",
-          flush=True)
+    print(f"building compact full-ISA model + layout (mode={args.mode} "
+          f"io={args.io_mode}) ...", flush=True)
     L, embed = build_layout()
-    code, seed_mem, expected = build_program(args.mode, args.text)
+    code, seed_mem, expected = build_program(
+        args.mode, args.text, io_mode=args.io_mode, n=args.n,
+        stdin_text=args.stdin)
     print(f"  D={L.D}  vocab={embed.shape[0]}  code={len(code)} isa-ops  "
           f"seed_mem={len(seed_mem)}  expected={bytes(expected)!r}")
     consts, code2 = gen_header(args.out, L, embed, code, seed_mem)

@@ -10,9 +10,21 @@
  *     KV row (IS_STORE/ADDR_BIN/VAL_NIB) + the last-row all-ROLE ingest one-hot
  *   - the VM step loop: build residual [1,S,D], run_incremental(S), read x[0,-1]
  *   - byte-decode: _snap_lane (PC/SP/BP/STK/HALTED) + per-byte nibble argmax (AX)
- *   - I/O: PRTF -> write(1,&byte,1)   (READ/stdin hook present)
- * ONE static binary does echo/cat/yes/quine end-to-end in `--allc` mode: no serve
- * process, no per-step stdin/stdout tensor marshalling, no Python anywhere.
+ *   - I/O through §Memory (NOT hardcoded literals), TWO selectable modes:
+ *       MODE 1  STRICT  (default)         the PROGRAM pointer-walks §Memory: LC
+ *          mem[ptr] each step, PRTF the ONE decoded byte, ptr++ (faithful c4 VM
+ *          loop; one model forward per output byte).
+ *       MODE 2  BURST   (C4_IO_BURST=1 / --io-burst)   the RUNTIME does the whole
+ *          buffer in ONE op: PRTF-burst walks §Memory mem[ptr..NUL] -> stdout in a
+ *          C loop (one VM step / no per-byte think-frame); READ injects the whole
+ *          stdin buffer into §Memory as MEM-store KV in one op.  Byte-exact vs
+ *          MODE 1, far fewer forwards.
+ *     §File Ops: OP_READ/OP_OPEN/OP_CLOS are RUNTIME-owned syscalls (the model has
+ *     no rules for them) — the runtime marshals the args off the store-log stack,
+ *     performs the I/O, and overrides the decoded PC/SP/AX.  READ lays each byte
+ *     into §Memory as its own KV frame so a later LC reads it (both modes).
+ * ONE static binary does echo/cat/yes/eliza/quine end-to-end in `--allc` mode: no
+ * serve process, no per-step stdin/stdout tensor marshalling, no Python anywhere.
  *
  * BUILD (via selfhost/_agent_allc_gen.py -> allc_gen.h, then _agent_allc_build.sh):
  *   python -m c4_min.selfhost._agent_allc_gen --mode echo --out allc_gen.h
@@ -1664,6 +1676,57 @@ static long ac_mem_top(long sp) {
     return val;
 }
 
+/* ---- §Memory byte access for the I/O syscalls (PRTF/READ burst + strict) ----
+ * §Memory in the all-C VM is the store-log KV (ac_store_*): seed frames + every
+ * SI/SC/PSH store the VM has made.  ac_mem_read(addr) returns the latest-write byte
+ * at ``addr`` (latest-write-wins, same rule the model's memory CAM uses), i.e. the
+ * SAME byte the program's LC/LI would decode.  This is what makes the burst syscall
+ * (runtime C-loop over §Memory) byte-exact vs the strict per-byte pointer-walk. */
+static long ac_mem_read(long addr) {
+    long val = 0; int si;
+    addr &= 0xFFFFFFFFL;
+    for (si = 0; si < ac_nstore; si = si + 1)
+        if (ac_store_addr[si] == addr) val = ac_store_val[si];
+    return val & 0xFF;
+}
+
+/* I/O-burst mode (MODE 2): PRTF/READ do the WHOLE buffer in ONE op inside the
+ * runtime handler (a C loop over §Memory) with NO per-byte VM step / think-frame.
+ * Gated by env C4_IO_BURST=1 or --io-burst.  0 = strict per-byte (MODE 1). */
+static int ac_io_burst = 0;
+
+/* PRTF-burst: AX = pointer.  Walk §Memory mem[ptr], mem[ptr+1], ... until a NUL
+ * byte and write ALL of them to stdout in one go (a C loop in the opcode handler).
+ * Returns the number of bytes written.  8-bit pointer window: wrap at 256. */
+static int ac_prtf_burst(long ptr) {
+    unsigned char buf[512]; int n = 0; long a = ptr & 0xFF;
+    while (n < (int)sizeof(buf)) {
+        long b = ac_mem_read(a);
+        if (b == 0) break;              /* NUL terminator ends the C string */
+        buf[n++] = (unsigned char)b;
+        a = (a + 1) & 0xFF;             /* 8-bit pointer window */
+    }
+    if (n > 0) { ssize_t w = write(1, buf, n); (void)w; }
+    return n;
+}
+
+/* READ syscall: (fd, buf, n).  Read up to n bytes from stdin (fd 0 = neural
+ * input-KV) into the caller buffer ``dst`` in ONE op.  Returns the number of bytes
+ * actually read (short-read at EOF).  The caller lays each byte into §Memory as its
+ * OWN store frame (one MEM-store KV per byte, mirroring the pure-forward driver) so
+ * a later LC(buf+i) attends to exactly the byte the file delivered. */
+static int ac_read_syscall(long fd, long n, unsigned char *dst, int cap) {
+    int got = 0;
+    if (fd != 0) return 0;
+    if (n > (long)cap) n = (long)cap;
+    while (got < (int)n) {
+        ssize_t r = read(0, dst + got, (size_t)((int)n - got));
+        if (r <= 0) break;
+        got += (int)r;
+    }
+    return got;
+}
+
 /* run the WHOLE VM in C.  Prints PRTF bytes to stdout.  Returns the number of
  * steps executed.  Byte-exact to run_program in measure_incremental_windowed. */
 static int ac_run_vm(int max_steps) {
@@ -1725,6 +1788,57 @@ static int ac_run_vm(int max_steps) {
         imm = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_IMM[cur_pc] : 0;
         (void)imm;
 
+        /* ---- SYSCALL opcodes (READ/OPEN/CLOS): the ONE class NOT computed
+         * neurally (§Tool Use Mode — the model has no rules for them, so its
+         * forward's PC/AX for this row are meaningless).  The RUNTIME owns the
+         * effect: it marshals the args off the store-log stack, performs the I/O,
+         * OVERRIDES the registers (pc=cur_pc+1, sp+=popped, ax=result), and — for
+         * READ — lays each delivered byte into §Memory as its OWN MEM-store KV frame
+         * (one frame per byte, byte-identical to the pure-forward driver) so a later
+         * LC(buf+i) attends to exactly that byte.  This whole op is done here (before
+         * the normal single-frame build) and then we ``continue``. */
+        if (op == G_OP_READ || op == G_OP_OPEN || op == G_OP_CLOS) {
+            long syspc = cur_pc + 1, syssp = cur_sp, sysax = 0;
+            unsigned char rbuf[512]; int got = 0, bi; long buf = 0;
+            if (op == G_OP_READ) {
+                /* READ(fd=pop, buf=pop, n=AX): isa.interpret order = buf=pop() (TOP),
+                 * fd=pop() (next), n = pre-step AX. */
+                buf = ac_mem_top(cur_sp);               /* top of stack */
+                long fd = ac_mem_top(cur_sp + 4);       /* next slot down */
+                long n  = cur_ax & mask;                /* count from PRE-step AX */
+                got = ac_read_syscall(fd, n, rbuf, (int)sizeof(rbuf));
+                syssp = cur_sp + 8;                     /* two pops (fd, buf) */
+                sysax = got & mask;
+                if (getenv("ALLC_TRACE") && step < 64)
+                    fprintf(stderr, "  [READ] fd=%ld buf=%ld n=%ld -> %d bytes into "
+                            "§Memory (input-KV, one KV frame/byte)\n", fd, buf, n, got);
+            } else if (op == G_OP_OPEN) {
+                syssp = cur_sp + 4; sysax = 3;          /* stub fd */
+            } else {                                     /* CLOS */
+                syssp = cur_sp + 4; sysax = 0;
+            }
+            /* 1) the register frame for the syscall itself (no store) */
+            ac_build_frame(syspc, sysax, syssp, cur_bp, stk, 0, 0, 0);
+            frame_idx += 1;
+            /* 2) READ: one MEM-store KV frame per delivered byte */
+            for (bi = 0; bi < got; bi = bi + 1) {
+                long baddr = (buf + bi) & 0xFF, bval = rbuf[bi];
+                ac_build_frame(syspc, sysax, syssp, cur_bp, stk, baddr, bval, 1);
+                frame_idx += 1;
+                ac_store_addr[ac_nstore] = baddr;
+                ac_store_val[ac_nstore]  = bval;
+                ac_store_fidx[ac_nstore] = frame_idx;
+                ac_nstore += 1;
+            }
+            cur_pc = syspc; cur_sp = syssp; cur_ax = sysax;
+            if (getenv("ALLC_TRACE") && step < 16)
+                fprintf(stderr, "  step%d pc=%ld op=%d [SYSCALL] -> pc=%ld ax=%ld "
+                        "sp=%ld (+%d byte-frames)\n", step, cur_pc - 1, op, syspc,
+                        sysax, syssp, got);
+            if (syspc < 0 || syspc >= G_PROGLEN) { step = step + 1; break; }
+            continue;                                    /* next VM step */
+        }
+
         /* store bookkeeping (port of the driver's SI/PSH/JSR/ENT contract) */
         if (op == G_OP_SI || op == G_OP_SC) {
             is_store = 1; s_addr = ac_mem_top(cur_sp); s_val = ax & mask;
@@ -1751,11 +1865,25 @@ static int ac_run_vm(int max_steps) {
                     "store=%d@%ld=%ld\n", step, cur_pc, op, pc, ax & 0xFF, sp,
                     is_store, s_addr, s_val);
 
-        /* PRTF: emit the model's decoded AX byte-0 to stdout (visible output) */
+        /* ---- I/O syscalls: PRTF (write) and READ (stdin -> §Memory) ---- */
         if (op == G_OP_PRTF) {
-            unsigned char c = (unsigned char)(ax & 0xFF);
-            ssize_t w = write(1, &c, 1); (void)w;
+            if (ac_io_burst) {
+                /* MODE 2 (BURST): AX = pointer.  The RUNTIME walks §Memory
+                 * mem[ptr..NUL] and writes the WHOLE string to stdout in ONE op —
+                 * no per-byte VM step / think-frame. */
+                int nw = ac_prtf_burst(ax & 0xFF);
+                if (getenv("ALLC_TRACE") && step < 64)
+                    fprintf(stderr, "  [BURST PRTF] ptr=%ld -> %d bytes from "
+                            "§Memory (runtime C-loop)\n", ax & 0xFF, nw);
+            } else {
+                /* MODE 1 (STRICT): the PROGRAM already walked §Memory (LC mem[ptr])
+                 * so AX holds ONE decoded byte; emit it (one PRTF per byte). */
+                unsigned char c = (unsigned char)(ax & 0xFF);
+                ssize_t w = write(1, &c, 1); (void)w;
+            }
         }
+        /* READ/OPEN/CLOS syscalls are handled ABOVE (before the frame build) so
+         * their runtime-owned state override is reflected in the emitted frame. */
 
         cur_pc = pc; cur_sp = sp; cur_bp = bp; cur_ax = ax; (void)cur_ax;
         td = _now_ms();
@@ -1788,12 +1916,18 @@ int main(int argc, char **argv) {
         int is_allc = 0, max_steps = 20000, k;
         for (k = 1; k < argc; k = k + 1) {
             if (strcmp(argv[k], "--allc") == 0) is_allc = 1;
+            else if (strcmp(argv[k], "--io-burst") == 0) ac_io_burst = 1;
             else if (is_allc && argv[k][0] != '-') max_steps = atoi(argv[k]);
         }
+        /* env override (C4_IO_BURST=1) — same gate, for the measure harness */
+        if (getenv("C4_IO_BURST") && atoi(getenv("C4_IO_BURST"))) ac_io_burst = 1;
         if (is_allc) {
             int nsteps;
             a = 0; while (a < MAX_TENSORS) { tf[a] = 0; ti[a] = 0; a = a + 1; }
             SPARSE_ITERS = 0; DENSE_EQUIV_ITERS = 0;
+            fprintf(stderr, "allc: I/O mode = %s\n",
+                    ac_io_burst ? "BURST (MODE 2, runtime §Memory syscall)"
+                                : "STRICT (MODE 1, per-byte pointer-walk)");
             load(0);                       /* embedded blob */
             if (incr_discover())
                 fprintf(stderr, "allc: %d blocks H=%d HD=%d D=%d ffn<=%d "
