@@ -34,7 +34,7 @@ def _emit_prog_bytes(text: bytes):
     return prog
 
 
-def build_program(mode, text, io_mode="literal", n=8, stdin_text=""):
+def build_program(mode, text, io_mode="literal", n=8, stdin_text="", chunk_size=32):
     """Return (isa_code, seed_mem, expected_bytes) for a named utility mode.
 
     ``io_mode`` selects HOW the utility does I/O:
@@ -52,7 +52,8 @@ def build_program(mode, text, io_mode="literal", n=8, stdin_text=""):
         return code, seed_mem, list(expected)
     if io_mode in ("strict", "burst"):
         from c4_min.selfhost import _agent_io_progs as IOP
-        prog = IOP.build(mode, io_mode, text=text, n=n, stdin_text=stdin_text)
+        prog = IOP.build(mode, io_mode, text=text, n=n, stdin_text=stdin_text,
+                         chunk_size=chunk_size)
         return assemble(prog.code), prog.seed_mem, list(prog.expected)
     # legacy literal template: echo / cat / yes = printf-of-literal
     prog = _emit_prog_bytes(text.encode())
@@ -311,7 +312,10 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(C4MIN, "allc_gen.h"))
     ap.add_argument("--mode", default="echo",
-                    help="echo|cat|yes|quine (echo/cat/yes = printf of --text)")
+                    help="echo|cat|yes|quine|catchunk|keepheap "
+                         "(echo/cat/yes = printf of --text; catchunk = looping "
+                         "arbitrary-length streaming cat; keepheap = eviction "
+                         "keep-heap correctness test)")
     ap.add_argument("--text", default="hello\n")
     ap.add_argument("--io-mode", default="literal",
                     choices=["literal", "strict", "burst"],
@@ -319,13 +323,15 @@ if __name__ == "__main__":
                          "; burst=MODE2 runtime §Memory syscall")
     ap.add_argument("--n", type=int, default=8, help="yes: repeat count")
     ap.add_argument("--stdin", default="", help="cat: the stdin the program READs")
+    ap.add_argument("--chunk", type=int, default=32,
+                    help="catchunk: per-READ chunk size (<=200 for the 8-bit window)")
     args = ap.parse_args()
     print(f"building compact full-ISA model + layout (mode={args.mode} "
           f"io={args.io_mode}) ...", flush=True)
     L, embed = build_layout()
     code, seed_mem, expected = build_program(
         args.mode, args.text, io_mode=args.io_mode, n=args.n,
-        stdin_text=args.stdin)
+        stdin_text=args.stdin, chunk_size=args.chunk)
     print(f"  D={L.D}  vocab={embed.shape[0]}  code={len(code)} isa-ops  "
           f"seed_mem={len(seed_mem)}  expected={bytes(expected)!r}")
     consts, code2 = gen_header(args.out, L, embed, code, seed_mem)
