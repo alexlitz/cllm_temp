@@ -196,6 +196,93 @@ def build_cat(stdin_text: str, mode: str) -> IOProg:
 
 
 # ---------------------------------------------------------------------------
+# catchunk:  ARBITRARY-LENGTH streaming cat (Part B).  Loop: READ(fd=0, BUF, CHUNK)
+# a chunk into §Memory, NUL-terminate it, burst-print it, repeat until READ returns
+# 0 (EOF).  Each new READ turn writes the SAME addresses (BUF..BUF+CHUNK) -> the
+# previous chunk's store rows are SUPERSEDED (dropped by free-driven eviction), so an
+# arbitrary-size file streams through with the KV pinned at ~chunk+window (NO OOM).
+# ---------------------------------------------------------------------------
+def build_catchunk(mode: str, chunk: int = 32, stdin_text: str = "") -> IOProg:
+    """A LOOPING cat: read up to `chunk` bytes per turn into §Memory and print them,
+    until EOF.  `stdin_text` is only the reference oracle (the runtime reads real
+    stdin); expected == the whole stdin verbatim.  chunk<=~200 for the 8-bit window."""
+    assert 1 <= chunk <= 200, "chunk must fit the 8-bit §Memory window"
+    prog: List[Tuple[str, int]] = []
+
+    def E(name, imm=0):
+        prog.append((name, imm)); return len(prog) - 1
+
+    TOP = len(prog)
+    # READ(fd=0, buf=BUF, n=chunk): push fd, push buf, AX=chunk, READ -> AX=got
+    E("IMM", 0); E("PSH"); E("IMM", BUF); E("PSH"); E("IMM", chunk); E("READ")
+    bz = E("BZ", 0)                                  # got==0 -> EOF -> DONE
+    # NUL-terminate at BUF+got (READ left AX=got; ADD = popped + AX; SC stores AX at
+    # the pushed address):  AX=BUF+got, then mem[BUF+got]=0 so the burst stops there.
+    E("PSH")                                          # push got (current AX)
+    E("IMM", BUF); E("ADD")                           # AX = got + BUF = BUF+got (NUL addr)
+    E("PSH"); E("IMM", 0); E("SC")                    # push addr; AX=0; SC -> mem[addr]=0
+    # burst-print BUF (mode burst: one PRTF, runtime walks §Memory BUF..NUL)
+    if mode == "burst":
+        E("IMM", BUF); E("PRTF")
+    else:
+        # strict: relocate a print-loop of BUF inline (rare; burst is the streaming path)
+        body = _relocate(_strict_print_loop(BUF), len(prog))
+        body = body[:-1]                              # drop the loop's HALT (we JMP back)
+        prog += body
+    E("JMP", TOP)
+    DONE = len(prog)
+    E("HALT")
+    prog[bz] = ("BZ", DONE)
+    payload = stdin_text.encode("latin-1")
+    return IOProg(prog, {}, payload, payload, mode,
+                  note=f"catchunk chunk={chunk} ({mode})")
+
+
+# ---------------------------------------------------------------------------
+# keepheap:  the FREE-DRIVEN-EVICTION correctness test (Part A #2).  Write several
+# distinct §Memory addresses, then do ENOUGH "other work" (many dummy stores to a
+# scratch cell — each is a fresh VM step / frame) to blow PAST any recency window,
+# then LC-read the ORIGINAL addresses back and PRTF them.  If a live store were
+# evicted for being old, the read-back would return 0/garbage; a correct keep-heap
+# returns the stored bytes verbatim.  Byte-exact between base (full stream) and
+# --evict (compacted keep-set) is the proof that the LIVE HEAP survives eviction.
+# ---------------------------------------------------------------------------
+def build_keepheap(text: str, mode: str, churn: int = 8) -> IOProg:
+    """text = the payload bytes to store at distinct addresses then read back.
+    churn = number of dummy scratch stores between the writes and the reads (each is
+    ~1 VM step / frame ~30 tokens; the recency window is 60 tokens ~2 frames, so
+    churn>=3 forces the writes out of the window; default 8 = ~240 tokens behind, a
+    generous margin while keeping the BASE (full-stream) run tractable to compare)."""
+    payload = text.encode()
+    assert len(payload) < 40, "payload too long for the 8-bit window"
+    # store addresses 0x20, 0x21, ... one per payload byte (distinct, below SP/scratch)
+    HEAP = 0x20
+    SCRATCH = 0xE8            # dummy-churn cell (below SP_INIT=0xFC, above heap)
+    prog: List[Tuple[str, int]] = []
+
+    def E(name, imm=0):
+        prog.append((name, imm)); return len(prog) - 1
+
+    # 1) WRITE the payload: for each byte, mem[HEAP+i] = byte  (SI: push &addr, IMM v, SI)
+    for i, b in enumerate(payload):
+        E("IMM", (HEAP + i) & 0xFF); E("PSH"); E("IMM", int(b)); E("SI")
+
+    # 2) CHURN: `churn` dummy stores to SCRATCH (each a fresh frame -> pushes the
+    #    payload writes far behind the recency window).  These are LIVE stores too,
+    #    but all to the SAME address -> each supersedes the last, so only ONE survives
+    #    (proves supersede-eviction keeps the heap bounded while the reads still work).
+    for j in range(churn):
+        E("IMM", SCRATCH); E("PSH"); E("IMM", (j & 0xFF)); E("SI")
+
+    # 3) READ BACK the ORIGINAL heap addresses (now long past the window) and PRTF.
+    for i in range(len(payload)):
+        E("IMM", (HEAP + i) & 0xFF); E("LC"); E("PRTF")
+    E("HALT")
+    return IOProg(prog, {}, payload, b"", mode,
+                  note=f"keepheap {text!r} churn={churn} ({mode})")
+
+
+# ---------------------------------------------------------------------------
 # ELIZA:  READ a line from stdin (§Memory input-KV), prefix-match it against the
 # keyword table, PRTF the matching response (else fallback).  Both keyword +
 # response tables live in §Memory (seed_mem = data segment).
@@ -309,8 +396,9 @@ def _eliza_reference_reply(CE, rules, fallback, message):
 
 
 def build(mode_name: str, io_mode: str, text: str = "hello\n",
-          n: int = 8, stdin_text: str = "") -> IOProg:
-    """Dispatch a named utility (echo/yes/cat/eliza) in io_mode 'strict'/'burst'."""
+          n: int = 8, stdin_text: str = "", chunk_size: int = 32) -> IOProg:
+    """Dispatch a named utility (echo/yes/cat/eliza/catchunk/keepheap) in io_mode
+    'strict'/'burst'.  ``chunk_size`` = the per-READ chunk for the streaming catchunk."""
     if mode_name == "echo":
         return build_echo(text, io_mode)
     if mode_name == "yes":
@@ -319,4 +407,8 @@ def build(mode_name: str, io_mode: str, text: str = "hello\n",
         return build_eliza(stdin_text or text, io_mode)
     if mode_name == "cat":
         return build_cat(stdin_text or text, io_mode)
+    if mode_name == "catchunk":
+        return build_catchunk(io_mode, chunk=chunk_size, stdin_text=stdin_text)
+    if mode_name == "keepheap":
+        return build_keepheap(text, io_mode, churn=n)
     raise ValueError(f"unknown io prog mode {mode_name!r}")

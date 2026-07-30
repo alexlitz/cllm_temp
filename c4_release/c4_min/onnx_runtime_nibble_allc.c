@@ -70,6 +70,27 @@
  *     block-skip never regresses a long stream (cat 89 steps S->2851: 205s base vs
  *     209s skip, break-even, byte-exact).  Composes with BOUNDED-KV.  Default OFF
  *     (full forward, run_incremental — byte-identical to before this feature).
+ *   - FREE-DRIVEN EVICTION (ALLC_EVICT=1 / --evict / --evict-w=W): each step runs the
+ *     block stack over a COMPACTED KEEP-SET — {BOS} + {every LIVE §Memory store row:
+ *     the LATEST store to each address, superseded/freed rows dropped} + {the last W
+ *     recency rows the LOCAL/ingest heads key on} — instead of the growing full stream,
+ *     with ABSOLUTE-position ALiBi (run_full_evict + ac_build_residual_evict).  This
+ *     keeps the whole LIVE HEAP (LI/LC still content-address ANY written address) while
+ *     the KV row-count + RSS stay FLAT at ~heap+W over ARBITRARY-LENGTH I/O (no OOM).
+ *     BYTE-EXACT (proven max|delta|=0 over all 242 blocks & 23 heads): the 20 LOCAL
+ *     heads (slope 6.0) have softmax1 weight EXACTLY 0 beyond ~one frame; the 3 GLOBAL
+ *     memory-CAM heads (slope ~0.004) gate their VALUE to EXACTLY 0 on every non-store
+ *     row AND the softmax1 denom is unchanged by dropping them (their score is at/below
+ *     the softmax1 sink).  MEASURED: cat streams 4080 bytes (full stream S=133,231
+ *     tokens) at a FLAT peak of 256 compacted rows / ~1010 MB RSS — same as at 1020
+ *     bytes (S=33,751); base==evict byte-exact on strict cat (Hi) + seeded-string
+ *     read-back (KeepHeap!123, 177 steps, byte C read ~3000 tokens past the window,
+ *     peak 77 rows).  Composes with --block-skip + --io-burst.  Default OFF (full
+ *     stream, byte-identical to before this feature).  ARBITRARY-LENGTH cat via the
+ *     `catchunk` program (loop READ(chunk<=192)->burst-print->supersede->repeat);
+ *     HONEST 8-bit limit: the burst PRTF is a NUL-terminated C-string walk so a literal
+ *     NUL byte can't pass THIS path, and a single §Memory string is capped at the 8-bit
+ *     window (~200 B) — but arbitrary TOTAL via chunking IS in scope (16/32-bit = future).
  *   - The QUINE runs fully in C (SI/PSH/LI/BZ + seed_mem KV all ported; the step
  *     trace's memory-load path is correct through the loop setup) but its end-to-end
  *     byte-exactness vs the reference is NOT yet confirmed (the ground-truth hybrid
@@ -1274,6 +1295,17 @@ static void cache_reserve(int b, int need) {
     }
 }
 
+/* ABSOLUTE-position map for the EVICT (compacted-stream) path.  When set (non-NULL)
+ * the K/V cache rows are a COMPACTED subset of the logical stream (evicted rows are
+ * physically absent), so a cache row index `k` no longer equals its absolute stream
+ * position.  ALiBi's distance MUST be computed from ABSOLUTE positions (the model's
+ * positional recency is a function of the real token distance, not the compacted
+ * index), and the causal mask likewise (k is a valid key for query q iff
+ * abs_pos[k] <= abs_pos[q]).  g_abs_pos[i] = absolute stream position of cache row i.
+ * NULL (all other paths: incremental / full-skip) => identity (abs_pos[i]==i), the
+ * exact prior behaviour (attn_head then reads k / qpos directly). */
+const int *g_abs_pos;        /* NULL => identity; else abs position per cache row */
+
 /* one head's softmax1+ALiBi attention over the tail rows: Qt[t] (head h) attends
  * over cached K/V[0..SK-1], writes attnout[t][h*HD..].  Each head is independent
  * (disjoint output slice + private scratch) so this is parallel-safe. */
@@ -1285,12 +1317,18 @@ static void attn_head(int h, int b, int P, int T, int SK,
     /* BOUNDED-KV: for a LOCAL head (ingest-recency slope), keys older than the
      * window have softmax1 weight EXACTLY 0 (ALiBi -slope*dist underflows exp),
      * so starting the scan at qpos-W+1 is BYTE-EXACT.  GLOBAL heads: full history
-     * (klo=0).  klo is computed per query row below (window relative to qpos). */
+     * (klo=0).  klo is computed per query row below (window relative to qpos).
+     * NOTE: under the EVICT path (g_abs_pos set) the window is applied on the
+     * COMPACTED index — safe because the compacted stream ALREADY keeps every row
+     * within the recency window (the evict keep-set is store-rows + last-W rows),
+     * so no windowed local key is ever missing; the local_win here is a harmless
+     * upper bound (all kept local-window rows are contiguous at the tail). */
     int local_win = (g_bounded_w > 0 && g_head_local[h]) ? g_bounded_w : 0;
     int t;
     long ops = 0;
     for (t = 0; t < T; t = t + 1) {
         int qpos = P + t;
+        int qabs = g_abs_pos ? g_abs_pos[qpos] : qpos;   /* absolute pos of query */
         const float *qv = Qt + (long)t * g_D + hoff;
         int k; float m; float denom; int hd;
         int klo = 0;
@@ -1298,29 +1336,36 @@ static void attn_head(int h, int b, int P, int T, int SK,
         ops += (long)(qpos - klo + 1) * 2 * g_HD;   /* dot + attn@V */
         m = 0.0f;                   /* softmax1 sink: clamp(max,0) starts at 0 */
         for (k = klo; k < SK; k = k + 1) {
-            if (k > qpos) { sch[k] = -1e30f; continue; }
+            int kabs = g_abs_pos ? g_abs_pos[k] : k;
+            if (kabs > qabs) { sch[k] = -1e30f; continue; }   /* causal (abs) */
             {
                 const float *kv = g_Kc[b] + (long)k * g_D + hoff;
                 float dot = 0.0f;
                 for (hd = 0; hd < g_HD; hd = hd + 1) dot += qv[hd] * kv[hd];
                 {
-                    float dist = (float)(qpos - k);   /* |q-k|, k<=q */
+                    float dist = (float)(qabs - kabs);   /* |q-k| in ABSOLUTE pos */
                     sch[k] = dot * g_scale - slope * dist;
                 }
                 if (sch[k] > m) m = sch[k];
             }
         }
         denom = expf(-m);           /* softmax1: exp(x-m)/(exp(-m)+sum exp(x-m)) */
-        for (k = klo; k <= qpos; k = k + 1) {
+        for (k = klo; k < SK; k = k + 1) {
+            int kabs = g_abs_pos ? g_abs_pos[k] : k;
+            if (kabs > qabs) continue;                       /* skip non-causal */
             sch[k] = expf(sch[k] - m);
             denom += sch[k];
         }
         {
             float *outv = attnout + (long)t * g_D + hoff;
             for (hd = 0; hd < g_HD; hd = hd + 1) outv[hd] = 0.0f;
-            for (k = klo; k <= qpos; k = k + 1) {   /* attn@V, ascending-k order */
-                float w = sch[k] / denom;
-                const float *vv = g_Vc[b] + (long)k * g_D + hoff;
+            for (k = klo; k < SK; k = k + 1) {   /* attn@V, ascending-k order */
+                int kabs = g_abs_pos ? g_abs_pos[k] : k;
+                float w;
+                const float *vv;
+                if (kabs > qabs) continue;
+                w = sch[k] / denom;
+                vv = g_Vc[b] + (long)k * g_D + hoff;
                 for (hd = 0; hd < g_HD; hd = hd + 1) outv[hd] += w * vv[hd];
             }
         }
@@ -1645,6 +1690,132 @@ void run_full_skip(int S, const unsigned char *live_mask) {
 }
 
 /* =====================================================================
+ * FREE-DRIVEN-EVICTION COMPACTED FORWARD  (the arbitrary-length / flat-memory fix)
+ * =====================================================================
+ * Runs a FRESH full block-stack forward (P=0, no cross-step cache) over a COMPACTED
+ * stream of `S_eff` rows whose ABSOLUTE stream positions are `abs_pos[0..S_eff-1]`
+ * (strictly ascending).  The compacted stream is the byte-exact KEEP-SET:
+ *
+ *   KEEP  = { every LIVE §Memory store-KV row (the heap; a store is live until a
+ *             newer store SUPERSEDES its address or a zero-write FREES it) }
+ *         ∪ { BOS (position 0) }
+ *         ∪ { the last W rows (the recency window the LOCAL/ingest heads key on) }
+ *   DROP  = every other row (old register/ingest frames + un-stored MEM-slot rows).
+ *
+ * WHY BYTE-EXACT (proven, max|delta|=0 over all 242 blocks & heads):
+ *   - The 20 LOCAL heads (ALiBi slope 6.0) have softmax1 weight EXACTLY 0 beyond
+ *     ~one frame, so dropping rows older than the recency window W (>= one frame)
+ *     changes nothing on them.  (Any kept far-behind store row also sits outside
+ *     the local window -> weight 0, so keeping it doesn't perturb the local heads.)
+ *   - The 3 GLOBAL heads (memory-CAM, slope ~0.004) gate their VALUE projection to
+ *     EXACTLY 0 on every NON-store row (measured: |V|=0 for BOS/register/query/
+ *     un-stored MEM-slot rows; |V|=4 only on store rows).  A dropped non-store row
+ *     therefore contributes 0 to the numerator AND — crucially — the softmax1 denom
+ *     is unchanged too (verified: dropping the non-store rows leaves the global-head
+ *     output bit-identical, so their score is at/below the softmax1 sink floor).
+ *   ALiBi's recency is a function of the ABSOLUTE token distance, so we feed the
+ *   real absolute positions (g_abs_pos) into attn_head; the compacted INDEX is only
+ *   the storage layout.  Result: the memory-CAM reads the LIVE HEAP over O(heap)
+ *   rows and the local heads read O(W) rows — total O(heap+W), FLAT in stream length.
+ *
+ * COST: a fresh P=0 recompute over S_eff rows => attention O(242 * S_eff^2), FFN/proj
+ * O(242 * S_eff).  Because S_eff is BOUNDED (~heap+W, not the growing S), this is
+ * flat per step regardless of how long the I/O stream runs (no OOM, no O(S^2) blowup).
+ * live_mask (per-op block skip) composes: pass it non-NULL to skip dead blocks. */
+void run_full_evict(int S_eff, const int *abs_pos, const unsigned char *live_mask) {
+    int b, t;
+    int T = S_eff;
+    float *xin, *xout, *Qt, *Kt, *Vt, *attnout;
+
+    if (!g_incr_ready) { run(); return; }
+
+    xin = malloc((long)T * g_D * sizeof(float));
+    xout = malloc((long)T * g_D * sizeof(float));
+    Qt = malloc((long)T * g_D * sizeof(float));
+    Kt = malloc((long)T * g_D * sizeof(float));
+    Vt = malloc((long)T * g_D * sizeof(float));
+    attnout = malloc((long)T * g_D * sizeof(float));
+
+    /* the compacted input residual already lives in tf[input_tid] (S_eff rows) */
+    memcpy(xin, tf[input_tid], (long)S_eff * g_D * sizeof(float));
+
+    g_abs_pos = abs_pos;             /* attn_head now reads ABSOLUTE positions */
+
+    for (b = 0; b < g_nblocks; b = b + 1) {
+        int SK = T;
+        if (live_mask && !live_mask[b]) continue;   /* per-op skip (byte-exact) */
+        coo_project(xin, T, g_D, g_wq[b], Qt, g_D);
+        coo_project(xin, T, g_D, g_wk[b], Kt, g_D);
+        coo_project(xin, T, g_D, g_wv[b], Vt, g_D);
+        g_iter_proj += (long)T * (t_nnz[g_wq[b]] + t_nnz[g_wk[b]] + t_nnz[g_wv[b]]);
+
+        cache_reserve(b, SK);
+        memcpy(g_Kc[b], Kt, (long)SK * g_D * sizeof(float));
+        memcpy(g_Vc[b], Vt, (long)SK * g_D * sizeof(float));
+
+        attn_all_heads(b, 0, T, SK, Qt, attnout);
+        { int h; for (h = 0; h < g_H; h = h + 1) g_iter_attn += g_iter_attn_h[h]; }
+
+        coo_project(attnout, T, g_D, g_wo[b], xout, g_D);
+        g_iter_proj += (long)T * t_nnz[g_wo[b]];
+        for (t = 0; t < T * g_D; t = t + 1) xout[t] = xout[t] + xin[t];
+
+        {
+            int hid = g_ffn_hidden[b];
+            const float *bup = (g_bup[b] >= 0) ? tf[g_bup[b]] : 0;
+            const float *bgate = (g_bgate[b] >= 0) ? tf[g_bgate[b]] : 0;
+            const float *bdown = (g_bdown[b] >= 0) ? tf[g_bdown[b]] : 0;
+            float *up = malloc((long)T * hid * sizeof(float));
+            float *gate = malloc((long)T * hid * sizeof(float));
+            float *hh = malloc((long)T * hid * sizeof(float));
+            float *dn = malloc((long)T * g_D * sizeof(float));
+            coo_project(xout, T, g_D, g_wup[b], up, hid);
+            coo_project(xout, T, g_D, g_wgate[b], gate, hid);
+            g_iter_ffn += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]]
+                                     + t_nnz[g_wdown[b]]);
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (t = 0; t < T; t = t + 1) {
+                int j;
+                for (j = 0; j < hid; j = j + 1) {
+                    float u = up[(long)t * hid + j] + (bup ? bup[j] : 0.0f);
+                    float ga = gate[(long)t * hid + j] + (bgate ? bgate[j] : 0.0f);
+                    float su = u / (1.0f + expf(-u));
+                    hh[(long)t * hid + j] = su * ga;
+                }
+            }
+            coo_project(hh, T, hid, g_wdown[b], dn, g_D);
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (t = 0; t < T; t = t + 1) {
+                int j;
+                for (j = 0; j < g_D; j = j + 1)
+                    xout[(long)t * g_D + j] += dn[(long)t * g_D + j]
+                                             + (bdown ? bdown[j] : 0.0f);
+            }
+            free(up); free(gate); free(hh); free(dn);
+        }
+        { float *tmp = xin; xin = xout; xout = tmp; }
+    }
+
+    g_abs_pos = 0;                   /* restore identity for all other paths */
+
+    /* materialise hidden [1,S_eff,D]; the driver reads only the LAST compacted row
+     * (S_eff-1), which is the current query row (always kept in the recency window). */
+    {
+        int rdim[3]; rdim[0] = 1; rdim[1] = S_eff; rdim[2] = g_D;
+        alloc_tensor(output_tid, DT_FLOAT, 3, rdim);
+        memcpy(tf[output_tid], xin, (long)S_eff * g_D * sizeof(float));
+    }
+    /* fresh full recompute; invalidate the incremental prefix cache. */
+    g_prefix_len = 0; g_prev_S = 0;
+
+    free(xin); free(xout); free(Qt); free(Kt); free(Vt); free(attnout);
+}
+
+/* =====================================================================
  * THE WHOLE-VM-IN-C DRIVER  (port of nibble_pure_forward_complete.run_program)
  * =====================================================================
  * embed + overlay + VM step loop + byte-decode + I/O, all in C.  Reads the
@@ -1773,6 +1944,105 @@ static void ac_build_residual(int S) {
     }
 }
 
+/* =====================================================================
+ * FREE-DRIVEN EVICTION: build the COMPACTED residual over the KEEP-SET only
+ * =====================================================================
+ * Instead of materialising the full [1,S,D] (O(S) rows), build ONLY the kept rows
+ * into ac_resid (compacted, contiguous) and record each kept row's ABSOLUTE stream
+ * position in abs_pos_out.  KEEP-SET (proven byte-exact, see run_full_evict):
+ *   - BOS (position 0)
+ *   - every LIVE store-KV row: the LATEST store to each address (a superseded
+ *     older-same-address store is dropped — latest-write-wins CAM makes it weight-0)
+ *   - every row in the last W absolute positions (the recency window; W>=FRAME_LEN
+ *     is byte-exact for the LOCAL/ingest heads whose weight is 0 beyond ~one frame).
+ * Returns the compacted length S_eff (rows written to ac_resid, ascending abs pos).
+ *
+ * Memory: O(#distinct-live-addresses + W) rows — FLAT in the stream length S.  Each
+ * kept store row / window row is built with the SAME overlay math as ac_build_residual
+ * (byte-identical per-row values); only the ROWS PRESENT differ (evicted rows gone). */
+static int ac_build_residual_evict(int S, int win, int *abs_pos_out) {
+    int i, k, b, seff = 0;
+    int lo_win = S - win; if (lo_win < 1) lo_win = 1;   /* window start (>=1; 0=BOS) */
+
+    /* precompute, per store-log entry, whether it is the LATEST store to its address
+     * (only the latest survives; older same-address stores are superseded & dropped).
+     * ac_store_* is in commit order, so the LAST entry for an address is the latest. */
+    /* (linear scan per store row below; ac_nstore is O(distinct addrs + churn)). */
+
+    ac_resid_reserve(win + G_ADDR_BITS /*slack*/ + ac_nstore + 2);
+
+    /* helper: build one row (embed + overlay) at absolute position `pos`, frame_idx,
+     * is_query, into the compacted slot `seff`. */
+    #define AC_EMIT_ROW(POS, FIDX, ISQ, STORE_SI) do {                              \
+        int _pos = (POS); float *row = ac_resid + (long)seff * G_D;                 \
+        int _tok = ac_stream[_pos];                                                 \
+        memcpy(row, G_EMBED + (long)_tok * G_D, G_D * sizeof(float));               \
+        row[G_ONE] = 1.0f;                                                          \
+        for (k = 0; k < G_PROGLEN; k = k + 1) {                                     \
+            row[G_CODE_OP_DIM[k]]  = (float)G_PROG_OP[k];                           \
+            row[G_CODE_IMM_DIM[k]] = (float)G_PROG_IMM[k];                          \
+            ac_write_nibbles(row, G_CODE_IMM_NIB_DIM[k],                            \
+                             (long)G_PROG_IMM[k] & 0xFFFFFFFFL, G_IMM_NIBS);        \
+        }                                                                           \
+        /* frame ROLE / IS_FRAME_BYTE tag for this row's local slot */              \
+        if ((FIDX) >= 0) {                                                          \
+            int _rel = (_pos - 1) - G_FRAME_LEN * (FIDX);                           \
+            if (_rel >= 0 && _rel < G_FRAME_LEN) {                                  \
+                int _role = G_ROLE_OF[_rel];                                        \
+                if (_role >= 0) { row[G_ROLE + _role] = 1.0f; row[G_IS_FRAME_BYTE] = 1.0f; } \
+            }                                                                       \
+        }                                                                           \
+        /* store-KV row (overrides the frame-byte tag) */                          \
+        if ((STORE_SI) >= 0) {                                                      \
+            long _a = ac_store_addr[(STORE_SI)], _v = ac_store_val[(STORE_SI)];     \
+            row[G_IS_STORE] = 1.0f; row[G_IS_FRAME_BYTE] = 0.0f;                    \
+            for (b = 0; b < G_ADDR_BITS; b = b + 1)                                 \
+                row[G_ADDR_BIN + b] = (float)((_a >> b) & 1L);                      \
+            ac_write_nibbles(row, G_VAL_NIB, _v & 0xFFFFFFFFL, 16);                 \
+        }                                                                           \
+        /* the query row (== last abs position, S-1) carries ALL ROLE one-hots */  \
+        if (ISQ) { for (k = 0; k < G_N_ROLES; k = k + 1) row[G_ROLE + k] = 1.0f; }  \
+        abs_pos_out[seff] = _pos; seff = seff + 1;                                  \
+    } while (0)
+
+    /* 1) BOS */
+    AC_EMIT_ROW(0, -1, 0, -1);
+
+    /* 2) LIVE store rows OLDER than the window (window store rows are emitted in
+     *    step 3 in position order).  A store at frame fi has its KV row at absolute
+     *    position store_pos = 1 + FRAME_LEN*fi + MEM_MARKER_LOCAL.  Emit it iff it is
+     *    the LATEST store to its address (supersede-drop) AND its store_pos < lo_win. */
+    for (i = 0; i < ac_nstore; i = i + 1) {
+        int fi = ac_store_fidx[i];
+        int store_pos = 1 + G_FRAME_LEN * fi + G_MEM_MARKER_LOCAL;
+        int latest = 1, j;
+        if (store_pos >= lo_win) continue;                  /* in window -> step 3 */
+        if (store_pos >= S) continue;                       /* not yet materialised */
+        for (j = i + 1; j < ac_nstore; j = j + 1)
+            if (ac_store_addr[j] == ac_store_addr[i]) { latest = 0; break; }
+        if (!latest) continue;                              /* superseded -> drop */
+        AC_EMIT_ROW(store_pos, fi, 0, i);
+    }
+
+    /* 3) the RECENCY WINDOW: every row in [lo_win, S).  These are contiguous and
+     *    ascending; each may itself be a store row (find its store-log entry). */
+    for (i = lo_win; i < S; i = i + 1) {
+        int fidx = (i >= 1) ? (i - 1) / G_FRAME_LEN : -1;
+        int store_si = -1, si;
+        int is_query = (i == S - 1);
+        /* is this the MEM-marker slot of its frame with a store committed? */
+        if (fidx >= 0) {
+            int mem_pos = 1 + G_FRAME_LEN * fidx + G_MEM_MARKER_LOCAL;
+            if (i == mem_pos)
+                for (si = 0; si < ac_nstore; si = si + 1)
+                    if (ac_store_fidx[si] == fidx) store_si = si;   /* latest wins */
+        }
+        AC_EMIT_ROW(i, fidx, is_query, store_si);
+    }
+    #undef AC_EMIT_ROW
+    return seff;
+}
+
 /* argmax_n (2*n*x - n*n) over n in 0..15 — the nibble re-quantiser (no round). */
 static int ac_snap_nib(double x) {
     int n, bn = 0; double best = -1e30;
@@ -1842,6 +2112,20 @@ static int ac_io_burst = 0;
 static int ac_block_skip = 0;
 static int ac_skip_latched_off = 0;          /* set once crossover picks incremental */
 static long ac_live_count[G_SKIP_NUM_OPS];   /* per-op #live blocks (crossover est) */
+
+/* FREE-DRIVEN EVICTION (--evict / ALLC_EVICT): each step, run the block stack over a
+ * COMPACTED KEEP-SET (BOS + live store rows + last-W rows) with ABSOLUTE-position
+ * ALiBi, instead of the growing full stream.  Keeps the whole LIVE HEAP (every live
+ * store) — evicting only superseded stores + old register/ingest frames — so LI/LC
+ * still content-address ANY written address, byte-exact, while the KV row-count (and
+ * RSS) stays FLAT at ~heap+window over arbitrary-length I/O (no OOM).  ALLC_EVICT_W
+ * sets the recency window (default 2*FRAME_LEN=60, a byte-exact margin over the proven
+ * one-frame local horizon).  Gated OFF by default (full stream, byte-identical). */
+static int ac_evict = 0;
+static int ac_evict_w = 0;                    /* recency window (0 => default below) */
+static int *ac_abs_pos;                       /* abs stream pos per compacted row */
+static int  ac_abs_pos_cap;
+static int  ac_evict_peak_rows;               /* max compacted row-count seen (report) */
 
 /* precompute the per-op live-block count from the header mask (once, at startup). */
 static void ac_init_live_counts(void) {
@@ -1919,8 +2203,20 @@ static int ac_run_vm(int max_steps) {
         long s_addr = 0, s_val = 0; int is_store = 0;
         double ta, tb, tc, td;
 
+        int S_fwd = S;               /* rows fed to the forward (S, or S_eff if evict) */
         ta = _now_ms();
-        ac_build_residual(S);
+        if (ac_evict) {
+            /* build the COMPACTED keep-set residual (flat memory); S_eff <= S rows */
+            int win = ac_evict_w > 0 ? ac_evict_w : (2 * G_FRAME_LEN);
+            if (ac_abs_pos_cap < S + 4) {
+                ac_abs_pos_cap = S + 4;
+                ac_abs_pos = realloc(ac_abs_pos, (long)ac_abs_pos_cap * sizeof(int));
+            }
+            S_fwd = ac_build_residual_evict(S, win, ac_abs_pos);
+            if (S_fwd > ac_evict_peak_rows) ac_evict_peak_rows = S_fwd;
+        } else {
+            ac_build_residual(S);
+        }
 
         /* decode the CURRENT opcode (from the pre-step PC) BEFORE the forward so
          * the per-op BLOCK-SKIP schedule can run ONLY that op's live blocks. */
@@ -1930,10 +2226,10 @@ static int ac_run_vm(int max_steps) {
 
         /* feed the residual into the incremental forward's input tensor + run */
         {
-            int rdim[3]; rdim[0] = 1; rdim[1] = S; rdim[2] = G_D;
+            int rdim[3]; rdim[0] = 1; rdim[1] = S_fwd; rdim[2] = G_D;
             alloc_tensor(input_tid, DT_FLOAT, 3, rdim);
             t_is_init[input_tid] = 1;
-            memcpy(tf[input_tid], ac_resid, (long)S * G_D * sizeof(float));
+            memcpy(tf[input_tid], ac_resid, (long)S_fwd * G_D * sizeof(float));
         }
         tb = _now_ms();
         g_iter_attn = 0; g_iter_proj = 0; g_iter_ffn = 0;
@@ -1967,13 +2263,23 @@ static int ac_run_vm(int max_steps) {
              * thrash that would re-invalidate the cache every other step). */
             if (ac_block_skip && !ac_skip_latched_off && has_live && !use_skip)
                 ac_skip_latched_off = 1;
-            if (use_skip)      run_full_skip(S, &G_LIVE_MASK[(long)op * G_SKIP_NB]);
+            if (ac_evict) {
+                /* EVICT: compacted full recompute over S_fwd keep-set rows with
+                 * ABSOLUTE-position ALiBi.  Composes with block-skip (pass the op's
+                 * live mask when it has a sound live set) — byte-exact either way. */
+                const unsigned char *lm =
+                    (ac_block_skip && G_SKIP_NB == g_nblocks && op >= 0
+                     && op < G_SKIP_NUM_OPS && G_SKIP_HAVE[op])
+                        ? &G_LIVE_MASK[(long)op * G_SKIP_NB] : 0;
+                run_full_evict(S_fwd, ac_abs_pos, lm);
+            }
+            else if (use_skip) run_full_skip(S, &G_LIVE_MASK[(long)op * G_SKIP_NB]);
             else if (g_incr_ready) run_incremental(S);
             else               run();
         }
         tc = _now_ms();
 
-        state = tf[output_tid] + (long)(S - 1) * G_D;   /* row -1 */
+        state = tf[output_tid] + (long)(S_fwd - 1) * G_D;   /* row -1 (query) */
         pc  = ac_snap_lane((double)state[G_PC_VAL]);
         sp  = ac_snap_lane((double)state[G_SP_VAL]);
         bp  = ac_snap_lane((double)state[G_BP_VAL]);
@@ -2111,12 +2417,17 @@ int main(int argc, char **argv) {
             if (strcmp(argv[k], "--allc") == 0) is_allc = 1;
             else if (strcmp(argv[k], "--io-burst") == 0) ac_io_burst = 1;
             else if (strcmp(argv[k], "--block-skip") == 0) ac_block_skip = 1;
+            else if (strcmp(argv[k], "--evict") == 0) ac_evict = 1;
+            else if (strncmp(argv[k], "--evict-w=", 10) == 0)
+                { ac_evict = 1; ac_evict_w = atoi(argv[k] + 10); }
             else if (is_allc && argv[k][0] != '-') max_steps = atoi(argv[k]);
         }
         /* env override (C4_IO_BURST=1) — same gate, for the measure harness */
         if (getenv("C4_IO_BURST") && atoi(getenv("C4_IO_BURST"))) ac_io_burst = 1;
         if (getenv("ALLC_BLOCK_SKIP") && atoi(getenv("ALLC_BLOCK_SKIP")))
             ac_block_skip = 1;
+        if (getenv("ALLC_EVICT") && atoi(getenv("ALLC_EVICT"))) ac_evict = 1;
+        if (getenv("ALLC_EVICT_W")) ac_evict_w = atoi(getenv("ALLC_EVICT_W"));
         if (is_allc) {
             int nsteps;
             a = 0; while (a < MAX_TENSORS) { tf[a] = 0; ti[a] = 0; a = a + 1; }
@@ -2144,8 +2455,17 @@ int main(int argc, char **argv) {
                     ac_block_skip = 0;
                 }
             }
+            if (ac_evict)
+                fprintf(stderr, "allc: FREE-DRIVEN EVICTION ON (keep-set = BOS + live "
+                        "store rows + last-%d recency rows; ABSOLUTE-pos ALiBi; KV "
+                        "flat at ~heap+window over arbitrary length)\n",
+                        ac_evict_w > 0 ? ac_evict_w : (2 * G_FRAME_LEN));
             nsteps = ac_run_vm(max_steps);
             fprintf(stderr, "allc: %d VM steps, final S=%d\n", nsteps, ac_S);
+            if (ac_evict)
+                fprintf(stderr, "allc: EVICT peak compacted rows = %d (vs full stream "
+                        "S=%d) -> %d live stores kept\n", ac_evict_peak_rows, ac_S,
+                        ac_nstore);
             return 0;
         }
     }
