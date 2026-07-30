@@ -49,6 +49,27 @@
  *     GLOBAL (memory) heads stay full-history (exact); bounding them to store rows
  *     is the remaining lever (unimplemented — needs the store-row set, byte-exact
  *     risk).
+ *   - PER-OP BLOCK-SKIP (ALLC_BLOCK_SKIP=1 / --block-skip, #738): each step runs
+ *     ONLY the decoded opcode's LIVE blocks (run_full_skip) and passes the residual
+ *     straight through the skipped ones — BYTE-EXACT for the decode (verified: echo/
+ *     yes/cat identical base==skip; the torch harness _step_block_skip_verify proves
+ *     the same live-set byte-exact over the whole opcode corpus).  echo's ops (IMM=7/
+ *     PRTF=5/HALT=5 live of 242) drop the block-applies ~41x (3146 -> 77); MEASURED
+ *     wall echo 5.5s -> 0.65s (~8.5x), yes 1.9s -> 0.20s (~9.7x) — both SUB-SECOND.
+ *     The live table (G_LIVE_MASK/G_SKIP_HAVE/G_SKIP_NB in allc_gen.h) is a per-op
+ *     bitmask emitted by _agent_allc_gen.build_live_masks (from step_block_skip.
+ *     build_live_index).  DIV/MOD are operand-dependent -> the whole 188-block divmod
+ *     span (~1.3x).  Any op WITHOUT a live set (MALC/FREE/MSET/MCMP) runs all blocks
+ *     (byte-safe fallback).  COST model: run_full_skip is a fresh P=0 recompute over
+ *     the live blocks (attention O(live*S^2), no cross-step cache — the cache is NOT
+ *     skip-safe since the live set varies per step, changing every prefix row's
+ *     per-block input).  It is a large net win for SHORT/interactive streams (echo/
+ *     yes) but its O(S^2) attention loses to the incremental O(S) cache at large S;
+ *     so the driver AUTO-CROSSOVERS to run_incremental once live_count*S >= NB*31
+ *     and LATCHES there (S grows monotonically -> one cache rebuild, no thrash), so
+ *     block-skip never regresses a long stream (cat 89 steps S->2851: 205s base vs
+ *     209s skip, break-even, byte-exact).  Composes with BOUNDED-KV.  Default OFF
+ *     (full forward, run_incremental — byte-identical to before this feature).
  *   - The QUINE runs fully in C (SI/PSH/LI/BZ + seed_mem KV all ported; the step
  *     trace's memory-load path is correct through the loop setup) but its end-to-end
  *     byte-exactness vs the reference is NOT yet confirmed (the ground-truth hybrid
@@ -1508,6 +1529,122 @@ void run_incremental(int S) {
 }
 
 /* =====================================================================
+ * PER-OP BLOCK-SKIP FORWARD  (#738 port — byte-exact for decode)
+ * =====================================================================
+ * Runs the block stack over ALL S rows (fresh, P=0, no cross-step KV cache) but
+ * applies ONLY the decoded opcode's LIVE blocks; a SKIPPED block passes the
+ * residual straight through (xout=xin, no attn / no FFN).  This is the EXACT
+ * semantics of step_block_skip.StepBlockSkipRunner driven from the torch
+ * pure-forward driver (which also re-embeds fresh + skips per step, no cache), so
+ * it is byte-exact vs run_incremental at row -1 for every op whose live-set is a
+ * SUPERSET of its true decode-live set (verified end-to-end by the harness).
+ *
+ * WHY P=0 (no cache): the cross-step KV cache in run_incremental freezes a prefix
+ * row's per-block K/V at the step that row was the tail.  Under block-skip the
+ * live set VARIES per step, so a prefix row's per-block input differs from the
+ * current op's recompute — the cache is NOT block-skip-safe.  The block-COUNT
+ * reduction (242 -> ~8 for echo) is the contention-independent win here; it is
+ * orthogonal to the O(S) cache win and MUCH larger for the tiny-live-set I/O ops.
+ *
+ * live_mask: G_SKIP_NB bytes, live_mask[b]==1 -> run block b.  Caller guarantees
+ * G_SKIP_NB == g_nblocks. */
+void run_full_skip(int S, const unsigned char *live_mask) {
+    int b, t;
+    int T = S;                  /* recompute ALL rows */
+    float *xin, *xout, *Qt, *Kt, *Vt, *attnout;
+
+    if (!g_incr_ready) { run(); return; }
+
+    xin = malloc((long)T * g_D * sizeof(float));
+    xout = malloc((long)T * g_D * sizeof(float));
+    Qt = malloc((long)T * g_D * sizeof(float));
+    Kt = malloc((long)T * g_D * sizeof(float));
+    Vt = malloc((long)T * g_D * sizeof(float));
+    attnout = malloc((long)T * g_D * sizeof(float));
+
+    /* full input residual (all rows) */
+    memcpy(xin, tf[input_tid], (long)S * g_D * sizeof(float));
+
+    for (b = 0; b < g_nblocks; b = b + 1) {
+        int SK = T;
+        if (!live_mask[b]) continue;    /* SKIP: xout==xin, residual passes through
+                                         * (xin is already the running residual) */
+        /* Q/K/V projections for ALL rows (COO, ascending-r, byte-exact) */
+        coo_project(xin, T, g_D, g_wq[b], Qt, g_D);
+        coo_project(xin, T, g_D, g_wk[b], Kt, g_D);
+        coo_project(xin, T, g_D, g_wv[b], Vt, g_D);
+        g_iter_proj += (long)T * (t_nnz[g_wq[b]] + t_nnz[g_wk[b]] + t_nnz[g_wv[b]]);
+
+        /* K/V live in Qt-parallel buffers Kt/Vt (rows 0..SK-1).  Point the cache
+         * pointers at them for attn_head (which reads g_Kc[b]/g_Vc[b]); this call
+         * is a FULL recompute so the "cache" is exactly the freshly-projected K/V. */
+        cache_reserve(b, SK);
+        memcpy(g_Kc[b], Kt, (long)SK * g_D * sizeof(float));
+        memcpy(g_Vc[b], Vt, (long)SK * g_D * sizeof(float));
+
+        attn_all_heads(b, 0, T, SK, Qt, attnout);
+        { int h; for (h = 0; h < g_H; h = h + 1) g_iter_attn += g_iter_attn_h[h]; }
+
+        /* output projection + residual: xout = xin + attnout @ W_o */
+        coo_project(attnout, T, g_D, g_wo[b], xout, g_D);
+        g_iter_proj += (long)T * t_nnz[g_wo[b]];
+        for (t = 0; t < T * g_D; t = t + 1) xout[t] = xout[t] + xin[t];
+
+        /* SwiGLU FFN (identical to run_incremental) */
+        {
+            int hid = g_ffn_hidden[b];
+            const float *bup = (g_bup[b] >= 0) ? tf[g_bup[b]] : 0;
+            const float *bgate = (g_bgate[b] >= 0) ? tf[g_bgate[b]] : 0;
+            const float *bdown = (g_bdown[b] >= 0) ? tf[g_bdown[b]] : 0;
+            float *up = malloc((long)T * hid * sizeof(float));
+            float *gate = malloc((long)T * hid * sizeof(float));
+            float *hh = malloc((long)T * hid * sizeof(float));
+            float *dn = malloc((long)T * g_D * sizeof(float));
+            coo_project(xout, T, g_D, g_wup[b], up, hid);
+            coo_project(xout, T, g_D, g_wgate[b], gate, hid);
+            g_iter_ffn += (long)T * (t_nnz[g_wup[b]] + t_nnz[g_wgate[b]]
+                                     + t_nnz[g_wdown[b]]);
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (t = 0; t < T; t = t + 1) {
+                int j;
+                for (j = 0; j < hid; j = j + 1) {
+                    float u = up[(long)t * hid + j] + (bup ? bup[j] : 0.0f);
+                    float ga = gate[(long)t * hid + j] + (bgate ? bgate[j] : 0.0f);
+                    float su = u / (1.0f + expf(-u));
+                    hh[(long)t * hid + j] = su * ga;
+                }
+            }
+            coo_project(hh, T, hid, g_wdown[b], dn, g_D);
+            #ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+            #endif
+            for (t = 0; t < T; t = t + 1) {
+                int j;
+                for (j = 0; j < g_D; j = j + 1)
+                    xout[(long)t * g_D + j] += dn[(long)t * g_D + j]
+                                             + (bdown ? bdown[j] : 0.0f);
+            }
+            free(up); free(gate); free(hh); free(dn);
+        }
+        { float *tmp = xin; xin = xout; xout = tmp; }   /* out becomes next in */
+    }
+
+    /* materialise hidden [1,S,D]; the driver reads only row -1 (row S-1). */
+    {
+        int rdim[3]; rdim[0] = 1; rdim[1] = S; rdim[2] = g_D;
+        alloc_tensor(output_tid, DT_FLOAT, 3, rdim);
+        memcpy(tf[output_tid], xin, (long)S * g_D * sizeof(float));
+    }
+    /* block-skip runs a FRESH full recompute each step; it does NOT maintain the
+     * incremental prefix cache.  Invalidate it so a later non-skip step rebuilds. */
+    g_prefix_len = 0; g_prev_S = 0;
+
+    free(xin); free(xout); free(Qt); free(Kt); free(Vt); free(attnout);
+}
+
+/* =====================================================================
  * THE WHOLE-VM-IN-C DRIVER  (port of nibble_pure_forward_complete.run_program)
  * =====================================================================
  * embed + overlay + VM step loop + byte-decode + I/O, all in C.  Reads the
@@ -1695,6 +1832,27 @@ static long ac_mem_read(long addr) {
  * Gated by env C4_IO_BURST=1 or --io-burst.  0 = strict per-byte (MODE 1). */
 static int ac_io_burst = 0;
 
+/* PER-OP BLOCK-SKIP (#738): each step, run ONLY the decoded op's LIVE blocks
+ * (run_full_skip) instead of the full 242-block forward — the residual passes
+ * straight through the skipped blocks (byte-exact for decode).  echo's ops
+ * (IMM/PRTF/HALT) drop 242 -> ~7 live blocks (~34x fewer block applies).  Gated
+ * by env ALLC_BLOCK_SKIP=1 or --block-skip; 0 = full forward (run_incremental).
+ * Enabled only when the header's G_SKIP_NB matches the built g_nblocks (else the
+ * live table is stale for this model -> fall back to the full forward, byte-safe). */
+static int ac_block_skip = 0;
+static int ac_skip_latched_off = 0;          /* set once crossover picks incremental */
+static long ac_live_count[G_SKIP_NUM_OPS];   /* per-op #live blocks (crossover est) */
+
+/* precompute the per-op live-block count from the header mask (once, at startup). */
+static void ac_init_live_counts(void) {
+    int op, b;
+    for (op = 0; op < G_SKIP_NUM_OPS; op = op + 1) {
+        long c = 0;
+        for (b = 0; b < G_SKIP_NB; b = b + 1) c += G_LIVE_MASK[(long)op * G_SKIP_NB + b];
+        ac_live_count[op] = c;
+    }
+}
+
 /* PRTF-burst: AX = pointer.  Walk §Memory mem[ptr], mem[ptr+1], ... until a NUL
  * byte and write ALL of them to stdout in one go (a C loop in the opcode handler).
  * Returns the number of bytes written.  8-bit pointer window: wrap at 256. */
@@ -1764,6 +1922,12 @@ static int ac_run_vm(int max_steps) {
         ta = _now_ms();
         ac_build_residual(S);
 
+        /* decode the CURRENT opcode (from the pre-step PC) BEFORE the forward so
+         * the per-op BLOCK-SKIP schedule can run ONLY that op's live blocks. */
+        op  = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_OP[cur_pc] : -1;
+        imm = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_IMM[cur_pc] : 0;
+        (void)imm;
+
         /* feed the residual into the incremental forward's input tensor + run */
         {
             int rdim[3]; rdim[0] = 1; rdim[1] = S; rdim[2] = G_D;
@@ -1773,7 +1937,40 @@ static int ac_run_vm(int max_steps) {
         }
         tb = _now_ms();
         g_iter_attn = 0; g_iter_proj = 0; g_iter_ffn = 0;
-        if (g_incr_ready) run_incremental(S); else run();
+        {
+            /* BLOCK-SKIP: run only op's live blocks (byte-exact) if enabled, the
+             * header's live table matches this model (G_SKIP_NB==g_nblocks), and
+             * this op HAS a SOUND live set (G_SKIP_HAVE[op]).  Both paths are
+             * byte-exact for the decode; they differ only in COST:
+             *   - run_full_skip: P=0 recompute over ~live_count blocks -> attention
+             *     is O(live_count * S^2), but FFN/proj is O(live_count * S) (vs 242).
+             *   - run_incremental: O(S) attention over the CACHED prefix, but FFN/
+             *     proj over ALL 242 blocks (incl the wide DIV/MOD megablocks).
+             * CROSSOVER: skip wins while its attention estimate (live_count*S) is
+             * below the incremental tail estimate (NB * ~31).  S grows monotonically
+             * so the switch (if any) happens ONCE -> at most one cache rebuild, no
+             * thrash.  A skip step invalidates the cache (run_full_skip sets
+             * prev_S=0); the first incremental step after it rebuilds from P=0. */
+            int has_live = (ac_block_skip && g_incr_ready && !ac_skip_latched_off
+                            && G_SKIP_NB == g_nblocks
+                            && op >= 0 && op < G_SKIP_NUM_OPS && G_SKIP_HAVE[op]);
+            int use_skip = 0;
+            if (has_live) {
+                long lc = ac_live_count[op];
+                /* skip attention est ~ lc*S*S ; incremental est ~ NB*31*S.
+                 * -> skip cheaper while  lc*S < NB*31. */
+                use_skip = ((long)lc * S < (long)g_nblocks * 31);
+            }
+            /* LATCH: once ANY step (with a live set) prefers incremental at this S,
+             * S only grows -> skip never becomes optimal again.  Latch skip OFF so
+             * the incremental cache warms ONCE and stays warm (no per-op crossover
+             * thrash that would re-invalidate the cache every other step). */
+            if (ac_block_skip && !ac_skip_latched_off && has_live && !use_skip)
+                ac_skip_latched_off = 1;
+            if (use_skip)      run_full_skip(S, &G_LIVE_MASK[(long)op * G_SKIP_NB]);
+            else if (g_incr_ready) run_incremental(S);
+            else               run();
+        }
         tc = _now_ms();
 
         state = tf[output_tid] + (long)(S - 1) * G_D;   /* row -1 */
@@ -1783,10 +1980,6 @@ static int ac_run_vm(int max_steps) {
         stk = ac_snap_lane((double)state[G_STK_VAL]);
         halted = ((double)state[G_HALTED] > 0.5) ? 1 : 0;
         ax = ac_decode_reg(state, G_AX);
-
-        op  = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_OP[cur_pc] : -1;
-        imm = (cur_pc >= 0 && cur_pc < G_PROGLEN) ? G_PROG_IMM[cur_pc] : 0;
-        (void)imm;
 
         /* ---- SYSCALL opcodes (READ/OPEN/CLOS): the ONE class NOT computed
          * neurally (§Tool Use Mode — the model has no rules for them, so its
@@ -1917,10 +2110,13 @@ int main(int argc, char **argv) {
         for (k = 1; k < argc; k = k + 1) {
             if (strcmp(argv[k], "--allc") == 0) is_allc = 1;
             else if (strcmp(argv[k], "--io-burst") == 0) ac_io_burst = 1;
+            else if (strcmp(argv[k], "--block-skip") == 0) ac_block_skip = 1;
             else if (is_allc && argv[k][0] != '-') max_steps = atoi(argv[k]);
         }
         /* env override (C4_IO_BURST=1) — same gate, for the measure harness */
         if (getenv("C4_IO_BURST") && atoi(getenv("C4_IO_BURST"))) ac_io_burst = 1;
+        if (getenv("ALLC_BLOCK_SKIP") && atoi(getenv("ALLC_BLOCK_SKIP")))
+            ac_block_skip = 1;
         if (is_allc) {
             int nsteps;
             a = 0; while (a < MAX_TENSORS) { tf[a] = 0; ti[a] = 0; a = a + 1; }
@@ -1935,6 +2131,19 @@ int main(int argc, char **argv) {
                         g_ffn_hidden_max);
             else
                 fprintf(stderr, "allc: block layout not regular; full-recompute\n");
+            if (ac_block_skip) {
+                if (G_SKIP_NB == g_nblocks) {
+                    ac_init_live_counts();
+                    fprintf(stderr, "allc: BLOCK-SKIP ON (per-op live-set, "
+                            "G_SKIP_NB=%d matches %d blocks; auto-crossover to "
+                            "incremental at large S)\n", G_SKIP_NB, g_nblocks);
+                } else {
+                    fprintf(stderr, "allc: BLOCK-SKIP requested but G_SKIP_NB=%d "
+                            "!= %d blocks -> DISABLED (full forward, byte-safe)\n",
+                            G_SKIP_NB, g_nblocks);
+                    ac_block_skip = 0;
+                }
+            }
             nsteps = ac_run_vm(max_steps);
             fprintf(stderr, "allc: %d VM steps, final S=%d\n", nsteps, ac_S);
             return 0;
