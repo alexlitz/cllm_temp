@@ -118,6 +118,87 @@ def assemble(prog):
     return isa.assemble(prog)
 
 
+def build_live_masks(L):
+    """PER-OP BLOCK-SKIP table (#738) for the all-C VM.
+
+    Resolves ``step_block_skip.build_live_index`` (the cumulative-greedy + operand-
+    union SOUND per-op live-block NAME schedule) into a per-op bitmask over the
+    242-block block-stack — using the SAME ``L._block_names`` the C runtime's block
+    index ``b`` runs in order (both the .nblbin export and this header come from the
+    identical ``build_compact_pure_forward_model(code_size=48)`` build, so block
+    index ``b`` in C == ``model.blocks[b]`` == ``L._block_names[b]``).
+
+    Returns ``(num_ops, nb, have, mask_rows)`` where:
+      * ``num_ops`` = isa.NUM_OPS (opcode-one-hot band size; covers every op value)
+      * ``nb``      = number of blocks the table was built for (must == g_nblocks)
+      * ``have[op]``= 1 if op has a SOUND live set (skip it); 0 -> run ALL blocks
+                      (the byte-exact fallback for any op NOT in the table)
+      * ``mask_rows[op]`` = list[nb] of 0/1, 1 == block is LIVE (run it)
+
+    PRTF/OPEN/READ/CLOS/NOP are added here (NOT in the torch ``_LIVE_NAMES`` table):
+      * PRTF is a register-passthrough op (AX unchanged, PC+=1) whose SOUND live set
+        was derived by the same cumulative-greedy method (verified byte-exact) and
+        pinned by NAME below.
+      * OPEN/READ/CLOS are §File-Ops SYSCALLS — the all-C driver OWNS their effect
+        and DISCARDS the neural forward's PC/AX for that row (it overrides the regs
+        and ``continue``s before decoding).  So their forward output is never read;
+        the minimal frame-advance set is byte-exact (nothing downstream reads it).
+    """
+    from c4_min import isa
+    from c4_min.step_block_skip import build_live_index
+
+    class _FakeModel:
+        # build_live_index only needs len(model.blocks)
+        blocks = list(range(len(L._block_names)))
+
+    li = build_live_index(_FakeModel(), L)     # {op_or_None: sorted[block_idx]}
+    nb = len(L._block_names)
+    num_ops = int(isa.NUM_OPS)
+
+    # I/O + no-op ops NOT in the torch table.  PRTF pinned by NAME (greedy-derived,
+    # verified byte-exact).  SYSCALLS + NOP: frame-advance only (forward discarded).
+    name_to_idx = {}
+    for i, n in enumerate(L._block_names):
+        name_to_idx.setdefault(n, []).append(i)
+
+    def _idxs(name_list):
+        s = set()
+        for nm in name_list:
+            s.update(name_to_idx.get(nm, []))
+        return sorted(s)
+
+    # PRTF SOUND live set (register-passthrough; the greedy result — a superset of
+    # the frame-advance set that preserves AX through the residual).
+    _PRTF_NAMES = ["ingest+recompose", "pc-fetch", "code-select", "opcode-decode",
+                   "dispatch"]
+    # SYSCALL / NOP: forward output is discarded by the driver -> minimal advance set.
+    _SYS_NAMES = ["ingest+recompose", "pc-fetch", "code-select", "opcode-decode",
+                  "dispatch"]
+    extra = {
+        isa.PRTF: _idxs(_PRTF_NAMES),
+        isa.OPEN: _idxs(_SYS_NAMES),
+        isa.READ: _idxs(_SYS_NAMES),
+        isa.CLOS: _idxs(_SYS_NAMES),
+        isa.NOP: _idxs(_SYS_NAMES),
+    }
+
+    have = [0] * num_ops
+    mask_rows = [[0] * nb for _ in range(num_ops)]
+    for op in range(num_ops):
+        live = None
+        if op in li and li[op] is not None:
+            live = li[op]
+        elif op in extra:
+            live = extra[op]
+        if live is None:
+            continue                          # no live set -> run all (fallback)
+        have[op] = 1
+        for b in live:
+            if 0 <= b < nb:
+                mask_rows[op][b] = 1
+    return num_ops, nb, have, mask_rows
+
+
 def gen_header(out_path, L, embed, code, seed_mem=None):
     seed_mem = seed_mem or {}
     consts, role_of, code_op_dims, code_imm_dims, code_imm_nib_dims = layout_consts(L)
@@ -167,6 +248,21 @@ def gen_header(out_path, L, embed, code, seed_mem=None):
     else:
         ap("static const long G_SEED_ADDR[1] = { 0 };")
         ap("static const long G_SEED_VAL[1] = { 0 };")
+    ap("")
+    # ---- PER-OP BLOCK-SKIP table (#738): the SOUND per-op live-block mask over the
+    # block-stack, so the all-C forward runs ONLY the decoded op's live blocks and
+    # passes the residual straight through the skipped ones (byte-exact for decode).
+    num_ops, nb_skip, have, mask_rows = build_live_masks(L)
+    ap(f"#define G_SKIP_NUM_OPS {num_ops}")
+    ap(f"#define G_SKIP_NB {nb_skip}")
+    ap(f"static const int G_SKIP_HAVE[{num_ops}] = {{ "
+       + ",".join(str(h) for h in have) + " };")
+    # G_LIVE_MASK[op*nb + b] == 1 iff block b is LIVE for op (else skipped).  Rows
+    # for ops with have[op]==0 are all-zero and IGNORED (fallback = run all blocks).
+    ap(f"static const unsigned char G_LIVE_MASK[{num_ops}*{nb_skip}] = {{")
+    for op in range(num_ops):
+        ap(" " + ",".join(str(mask_rows[op][b]) for b in range(nb_skip)) + ",")
+    ap("};")
     ap("")
     ap("#endif")
     with open(out_path, "w") as f:
