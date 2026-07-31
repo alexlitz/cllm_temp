@@ -196,6 +196,39 @@ def windowed_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
         sc = sc.masked_fill(m.unsqueeze(0).unsqueeze(0), float("-inf"))
         a = softmax1(sc, dim=-1)
         out[:, idx] = torch.matmul(a, Vsel)
+        # WALL#6 ATTN DIAG (C4_WALL6_ATTN_DIAG=<abs_qpos>, additive/inert): for the
+        # GLOBAL heads only (window is None), if the target absolute query position is
+        # in this span, dump the top-attended key positions + weights so we can see
+        # whether the stack-pop CAM aliases a 1-bit-neighbor address.
+        import os as _osa
+        _tq = _osa.environ.get("C4_WALL6_ATTN_DIAG")
+        if _tq is not None and window is None:
+            try:
+                tq = int(_tq)
+                rad = int(_osa.environ.get("C4_WALL6_ATTN_RAD", "0"))
+                qpos_l = q_pos.tolist()
+                exact_pos = _osa.environ.get("C4_WALL6_EXACT_POS")   # a key pos to trace
+                exact_pos = int(exact_pos) if exact_pos else None
+                kpl = kpos_full.tolist()
+                for ri, qp in enumerate(qpos_l):
+                    if abs(qp - tq) > rad:
+                        continue
+                    for jj, hh in enumerate(idx.tolist()):
+                        w = a[0, jj, ri]                    # [Sk'] weights for this head/query
+                        raw = sc[0, jj, ri]                 # [Sk'] pre-softmax scores
+                        topw, topi = torch.topk(w, min(4, w.numel()))
+                        kp = kpos_full[topi].tolist()
+                        rawmax = float(raw.max())
+                        extra = ""
+                        if exact_pos is not None and exact_pos in kpl:
+                            ki = kpl.index(exact_pos)
+                            extra = (f" | exact_pos={exact_pos} raw_score={float(raw[ki]):.1f} "
+                                     f"weight={float(w[ki]):.6f} (rawmax={rawmax:.1f})")
+                        print(f"[attn-diag] qpos={qp} head={hh}: top keys(pos,weight)="
+                              f"{list(zip(kp, [round(float(x),4) for x in topw.tolist()]))} "
+                              f"sink_w={round(float(1.0 - w.sum()),4)} rawmax={rawmax:.1f}{extra}", flush=True)
+            except Exception as _e:
+                print(f"[attn-diag] err {_e}", flush=True)
 
     if isinstance(past_kv, _SplitPastKV):
         # DROP-KV: each head group reads its OWN cache (global full, local trimmed).

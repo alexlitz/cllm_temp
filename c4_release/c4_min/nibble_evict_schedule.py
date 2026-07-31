@@ -68,10 +68,15 @@ from c4_min.nibble_pure_forward import _MEM_MARKER_LOCAL
 
 
 # The absolute stream position of frame ``fi``'s store-KV (MEM marker) row.
-# tokens = [BOS] + frame0(init) + frame1 + ... ; frame fi occupies
-# [1 + FRAME_LEN*fi, 1 + FRAME_LEN*(fi+1)), and its MEM marker sits at +MEM_LOCAL.
-def store_row_position(frame_idx: int) -> int:
-    return 1 + V.FRAME_LEN * frame_idx + _MEM_MARKER_LOCAL
+# tokens = [BOS] + (code_off CODE tokens) + frame0(init) + frame1 + ... ; the
+# per-instruction leading CODE frames (CODE-FROM-MEMORY, C4_PF_CFM) are ONE token
+# each and precede EVERY register/store frame, so frame ``fi`` occupies
+# [1 + code_off + FRAME_LEN*fi, 1 + code_off + FRAME_LEN*(fi+1)) and its MEM marker
+# sits at + MEM_LOCAL.  On the baked path ``code_off == 0`` (byte-identical).  OMITTING
+# ``code_off`` in CFM mode shifted EVERY scheduled drop position by ``code_off`` (3976
+# for doom) — the schedule then dropped the WRONG cache rows (wall #6 root).
+def store_row_position(frame_idx: int, code_off: int = 0) -> int:
+    return 1 + code_off + V.FRAME_LEN * frame_idx + _MEM_MARKER_LOCAL
 
 
 @dataclass
@@ -171,13 +176,17 @@ def build_eviction_schedule(draft, *, slope_min: float = None,
     """
     store_log: Dict[int, Tuple[int, int]] = draft.store_log or {}
     sched = EvictionSchedule()
+    # CODE-FROM-MEMORY shifts every store row by the leading CODE-frame count; the drop
+    # positions MUST match the model's actual cache rows or the schedule evicts the
+    # wrong rows (wall #6).  0 on the baked path -> byte-identical.
+    code_off = int(getattr(draft, "code_off", 0) or 0)
 
     # 1) materialise every store-KV row in FRAME order.
     entries: List[StoreEntry] = []
     for fi in sorted(store_log.keys()):
         addr, val = store_log[fi]
         entries.append(StoreEntry(frame_idx=fi,
-                                  position=store_row_position(fi),
+                                  position=store_row_position(fi, code_off),
                                   addr=int(addr), val=int(val)))
     sched.stores = entries
     sched.n_stores = len(entries)
@@ -530,6 +539,7 @@ def resolve_load_rows(draft) -> Dict[int, List[ResolvedRead]]:
     """
     store_log: Dict[int, Tuple[int, int]] = draft.store_log or {}
     read_log: Dict[int, List[Tuple[str, int]]] = draft.read_log or {}
+    code_off = int(getattr(draft, "code_off", 0) or 0)   # CFM store-row shift (wall #6)
     # latest store frame per address, built incrementally as we sweep frames.
     latest: Dict[int, int] = {}
     out: Dict[int, List[ResolvedRead]] = {}
@@ -551,7 +561,7 @@ def resolve_load_rows(draft) -> Dict[int, List[ResolvedRead]]:
             else:
                 sval = store_log[sf][1]
                 out.setdefault(f, []).append(
-                    ResolvedRead(head, f, addr, sf, store_row_position(sf), sval))
+                    ResolvedRead(head, f, addr, sf, store_row_position(sf, code_off), sval))
         if f in store_log:
             addr, _val = store_log[f]
             latest[addr] = f
