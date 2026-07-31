@@ -139,7 +139,19 @@ def _unify_cam_head_enabled() -> bool:
 # small (each extra nibble/slot inflates the model residual dim — the wall-time and
 # memory driver).  A COMPUTED result (e.g. factorial) uses the full 8 AX nibbles via
 # the ALU; only the IMM LITERAL is bounded here.
-IMM_NIBS = 5
+#
+# ``C4_IMM_NIBS`` widens this to the FULL 32-bit literal (8 nibbles) for programs
+# carrying a >20-bit / negative constant baked as an unsigned 32-bit word — e.g.
+# doom's ``IMM -1`` (== 0xFFFFFFFF), which at 5 nibbles materializes as 0xFFFFF and
+# corrupts the sign of every ``expr * -1`` / ``- term`` in its fixed-point math.
+# DEFAULT 5 -> the corpus geometry + golden are byte-identical (every corpus literal
+# is < 16^5, so the extra-nibble bands are all-zero anyway when widened).  Widening
+# grows the CODE_IMM_NIB band (code_size × IMM_NIBS) and the residual dim; it is the
+# cheapest correct route for doom's negative literals (one gated constant, no
+# per-op weight rewrite — ``compile_imm_ax_nibbles`` already writes ``min(8, IMM_NIBS)``
+# nibbles verbatim into AX).
+import os as _os
+IMM_NIBS = int(_os.environ.get("C4_IMM_NIBS", "5"))
 
 
 # ===========================================================================
@@ -1210,14 +1222,15 @@ def compile_imm_ax_nibbles(L, dim: int) -> Dict[str, torch.Tensor]:
     full 32-bit literal lands in the canonical AX nibble band.  Gated on OP_IS[IMM].
     Runs AFTER the byte-nib writeback (which only wrote nibbles 0,1) and overwrites
     all 8 with the full value."""
-    spec = _empty_spec(dim, 8 + IMM_NIBS)
+    n_ax = min(8, IMM_NIBS)                          # AX carries at most 8 nibbles (32 bits)
+    spec = _empty_spec(dim, 8 + n_ax)
     u = 0
     g = L.OP_IS + isa.IMM
     for j in range(8):                              # clear ALL 8 AX nibbles gated
         spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
         spec["W_gate"][u, L.AX + j] = 1.0
         spec["W_down"][L.AX + j, u] += -1.0 / SILU_HALF; u += 1
-    for j in range(IMM_NIBS):                        # + IMM_NIB[j] into AX[j] (rest 0)
+    for j in range(n_ax):                            # + IMM_NIB[j] into AX[j] (rest 0)
         spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
         spec["W_gate"][u, L.IMM_NIB + j] = 1.0
         spec["W_down"][L.AX + j, u] += 1.0 / SILU_HALF; u += 1
