@@ -147,6 +147,23 @@ def _const_operand() -> bool:
     return os.environ.get("C4_CONST_OPERAND", "0") == "1"
 
 
+def _mem_addr_bits(default: Optional[int] = None) -> int:
+    """Number of §Memory address bits ``_bake_memory_cam`` KEYS onto RoPE lanes.
+
+    DEFAULT ``MEM_ADDR_BITS`` = 8 (byte-identical golden build; the 1096 corpus +
+    edge_corpus use 8-bit data addresses, so the ADDR_BIN upper bits are 0 and never
+    contribute — widening past 8 with all-zero upper bits is byte-neutral for those
+    programs too, but 8 is the historical default and keeps the weight matrices
+    literally identical).  Set ``C4_MEM_ADDR_BITS=<n>`` (or pass ``mem_addr_bits=`` to
+    ``build``) to WIDEN for 32-bit programs like doom (needs 18 bits; see the
+    ``MEM_ADDR_BITS`` module comment for the fidelity ceiling).  Clamped to the
+    physical band width (``ADDR_BITS``=32) and the lane budget in ``_bake_memory_cam``."""
+    if default is None:
+        default = MEM_ADDR_BITS
+    v = os.environ.get("C4_MEM_ADDR_BITS")
+    return default if v is None else int(v)
+
+
 def _pack_memcam() -> bool:
     """Drop the DEAD head-dim padding the pure-forward layout carries so the Qwen
     residual floor is not inflated by it.  DEFAULT OFF (``C4_PACK_MEMCAM=1`` to
@@ -275,6 +292,53 @@ CAM_REGS = ["PC", "AX", "SP", "BP", "STACK0"]
 # Δpos~500, so 12 bits key a PC up to 4095 (covers the full ~4000-instr c4 compiler
 # and every muldiv subroutine, code_size- and width-independent).
 CODE_ADDR_BITS = 12
+
+
+# ---------------------------------------------------------------------------
+# WIDE §Memory address CAM (WALL #1: doom's 32-bit addresses).
+#
+# ``_bake_memory_cam`` KEYS only ``MEM_ADDR_BITS`` of the 32 physically-carried
+# ``ADDR_BIN``/``QRY_BIN`` residual bits onto RoPE lanes.  The corpus + edge_corpus
+# use 8-bit data addresses, so 8 bits (256 keyspace) suffice and are the DEFAULT
+# (byte-identical to the historical build).  doom is 32-bit: its live addresses in
+# the first ~30k executed steps span 0xffb4..0x20a15 (data segment DATA_BASE=0x10000
+# heap + a descending stack near SP_INIT=0x10000), which need 18 bits to distinguish
+# without aliasing — under the 8-bit CAM ALL ~1088 distinct addresses fold to
+# addr&0xFF and collide (doom diverges at its first out-of-256 memory op).
+#
+# WIDENING is opt-in via ``C4_MEM_ADDR_BITS=<n>`` (or the ``mem_addr_bits=`` build
+# kwarg): it places ``n`` address bits on the SLOWEST ``n`` rotary pairs exactly like
+# the CODE CAM (lanes ``half-1-b``, near-identity RoPE), plus 3 control lanes (bias /
+# gate / code-exclusion) below them, keeping the fixed recency lane 3.  The physical
+# ``ADDR_BITS=32`` residual bands already carry every bit, so widening the KEYED count
+# is a pure ``_bake_memory_cam`` change — no D/param cost (the bands exist either way).
+#
+# FIDELITY CEILING (MEASURED, not projected — see _agent_doom_mem_addr_resolve.py):
+# the per-bit address dot decays with the store->load position distance Δ as
+# ``cos(freq_lane · Δ)``.  A bit ``b`` sits on the lane ``half-1-b`` whose RoPE freq
+# rises with ``b``; the SLOWEST lanes (theta=1e6) hold cos>=0.997 out to Δ~500, but a
+# high address bit (b>=14, freq>=2.4e-3) rotates PAST cos~0 by Δ~700.  So the reliably-
+# keyable width is a function of the recall DEPTH (how far back the matching store is):
+#
+#   depth<=50  : 8..18 bits all resolve doom's real loads 100% (18 covers the full
+#                18-bit span with ZERO aliasing — the clean target WITH eviction).
+#   depth<=213 : 14..16 bits resolve 100%; 18 drops to ~84%, 20 to ~48% (high lanes
+#                rotated); 8 bits aliases to ~89% (the WALL #1 bug).
+#   depth~4000 : only ~12 bits stay position-invariant (the CODE-CAM ceiling) — a raw
+#                store-log-before-code-frames window (Δ = n_code + n_store) is NOT
+#                wide-keyable for doom; the store log must sit ADJACENT to the query
+#                (reorder / eviction) so recalls stay shallow (doom median depth 3,
+#                p90 213).
+#
+# So: 16 bits is the widest reliable keying at doom's p90 recall depth (213); 18 bits
+# reaches the full zero-alias span ONLY when an evicting driver keeps the live store
+# log shallow (<=~50, well within the lean-evict cap).  Full 32 bits is NOT reliably
+# keyable at any non-trivial Δ (the fast address lanes rotate past cos~0).  doom needs
+# only 18 (its bits above 18 are constant 0).  The DRIVER side must ALSO widen (write
+# full-width addresses + reorder stores adjacent to the query); the corpus drivers keep
+# their 8-bit mask (byte-neutral for <256 addresses), and the doom harnesses
+# (_agent_doom_*.py) drive the wide path.
+MEM_ADDR_BITS = 8   # DEFAULT keyed width (byte-identical golden build; corpus 8-bit)
 
 
 @dataclass
@@ -478,7 +542,8 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
           efficient_alu: bool = True,
           recurrent_divmod: bool = False, pad_to_stock: bool = False,
           code_from_memory: bool = True, shift_via_mul: bool = True,
-          div_logsink: bool = False) -> QwenFullVM:
+          div_logsink: bool = False,
+          mem_addr_bits: Optional[int] = None) -> QwenFullVM:
     """Construct a genuine ``Qwen2Model`` whose layers ARE the fused VM step.
 
     The model is ALWAYS fp32 (``model_dtype == torch.float32``, zero fp64 params).
@@ -598,7 +663,8 @@ def build(code_size: int = 24, subset: Subset = SUBSET_BASE,
             cam_layers["code-cam"] = code_idx
         if subset.memory:
             mem_idx = block_names.index("mem-cam")
-            _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K)
+            _bake_memory_cam(qmodel.layers[mem_idx].self_attn, QL, arch, comp, K,
+                             mem_addr_bits=mem_addr_bits)
             cam_layers["mem-cam"] = mem_idx
 
     # RECURRENCE (recurrent divmod): re-point qmodel.layers through the apply order
@@ -1065,7 +1131,7 @@ def _bake_register_cam(attn, QL, arch, comp, K):
 # QRY_BIN; recency picks the latest store to the same address (latest-write-wins).
 # The loaded value nibbles (VAL_NIB) are copied into the AX nibble band.
 # ===========================================================================
-def _bake_memory_cam(attn, QL, arch, comp, K):
+def _bake_memory_cam(attn, QL, arch, comp, K, mem_addr_bits=None):
     """Address-matching KV read that is SINK-CLEAN under PLAIN Qwen softmax.
 
     Design constraint (differs from the softmax1 pure-forward): the BOS sink is a
@@ -1095,7 +1161,18 @@ def _bake_memory_cam(attn, QL, arch, comp, K):
     # match + control lanes on the SLOWEST rotary pairs (near-identity RoPE) keeps
     # the address dot position-invariant and the control gates un-rotated — the
     # fast rotary lanes (near lane 0) rotate too much to carry a stable content dot.
-    n_bits = min(8, ADDR_BITS, half - 3)
+    # WIDE-MEM-CAM (WALL #1, doom 32-bit): ``mem_addr_bits`` KEYS more of the 32
+    # physically-carried ADDR_BIN/QRY_BIN bits onto the next-slowest lanes (below the
+    # 8-bit set), pushing the control lanes down accordingly.  DEFAULT 8 -> the lanes
+    # + weights below are LITERALLY unchanged (byte-identical golden build); doom
+    # passes 18.  Clamp to the physical band width and leave >=1 lane above rec_lane 3
+    # for the 3 control lanes.  ``rec_lane=3`` (fixed) is NEVER an address lane, so the
+    # widened set must not reach it: cap so the lowest control lane (excl) stays > 3.
+    req = _mem_addr_bits() if mem_addr_bits is None else int(mem_addr_bits)
+    # Lane map: addr lanes = half-1 .. half-n_bits ; bias=half-1-n_bits,
+    # gate=half-2-n_bits, excl=half-3-n_bits ; rec_lane=3 (fixed).  Keep excl>3 (no
+    # collision with the recency lane): half-3-n_bits > 3  =>  n_bits <= half-7.
+    n_bits = min(req, ADDR_BITS, half - 7)  # half-7 = 25 for head_dim 64 (excl_lane >= 4)
     # Qwen attention divides the QK dot by sqrt(head_dim)=8, so the raw gains must be
     # large enough that the POST-scale exact-match margin dominates the sink. The
     # exact-match net score is (n_bits*G^2 - (n_bits-0.5)*G^2)/sqrt(hd) = 0.5*G^2/8;
