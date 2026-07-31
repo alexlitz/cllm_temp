@@ -60,7 +60,10 @@ from .nibble_pure_forward import SP_INIT
 from .qwen_full_vm import (
     CAM_REGS, _REG_TOKEN, _snap,
 )
-from .qwen_lean_forward import LeanQwenVM
+from .qwen_lean_forward import (
+    LeanQwenVM, interpret_with_functions, uses_functions,
+)
+from .qwen_lean_stack import LeanDataStack
 from . import qwen_lean_evict as EV
 
 
@@ -350,7 +353,8 @@ def _seed_prefix(lean: LeanQwenVM, code: List[isa.Instr]
 def run_program_lean_evict_graphed(
         lean: LeanQwenVM, code: List[isa.Instr], *, max_steps: int = 64,
         graphed: Optional["GraphedIncrementalForward"] = None,
-        sample_every: int = 1, verbose: bool = False) -> EV.EvictStats:
+        sample_every: int = 1, verbose: bool = False,
+        stack_depth: bool = True) -> EV.EvictStats:
     """Bounded-KV incremental decode with a CUDA-GRAPHED forward + VECTORIZED
     bookkeeping — the ~1.74 ms/step driver.
 
@@ -371,7 +375,8 @@ def run_program_lean_evict_graphed(
     subset = lean.subset
     L = lean.QL.L
     try:
-        ref_trace = isa.interpret(code, max_steps=max_steps)
+        ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                     if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
     except Exception:
         ref_trace = []
 
@@ -403,6 +408,7 @@ def run_program_lean_evict_graphed(
     ax_trace: List[int] = []
     cur_pc = 0
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
+    ds = LeanDataStack() if stack_depth else None    # real depth-N operand stack
     frame_idx = 0
 
     max_rows = heap.size() + len(CAM_REGS) + 1
@@ -417,6 +423,9 @@ def run_program_lean_evict_graphed(
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
             load_addr = prev["AX"] & 0xFF
+        # feed the TRUE top-of-stack into the register frame the model reads.
+        if ds is not None:
+            reg_state["STACK0"] = ds.top()
 
         # -- build the register frame (vectorised template scatter) at the growing pos.
         x, positions = fb.build(reg_state, load_addr, next_pos)
@@ -451,7 +460,8 @@ def run_program_lean_evict_graphed(
             if ret_pc is not None:
                 pc = ret_pc
         elif subset.memory and op in (isa.SI, isa.SC):
-            store_addr = _snap(state[L.STK_VAL]) & 0xFF
+            store_addr = ((ds.values[-1] & 0xFF) if (ds is not None and ds.values)
+                          else _snap(state[L.STK_VAL])) & 0xFF
             store_val = ax if op == isa.SI else (ax & 0xFF)
             # STRUCTURAL same-address supersession, then append the store row to the
             # prefix (heap cache) and RE-SEED the fixed prefix (which re-captures the
@@ -468,6 +478,11 @@ def run_program_lean_evict_graphed(
             dropped = heap.apply_keep(heap.keep_mask(heap_prune=True))
             total_evicted += dropped
             g.set_prefix(heap.past, heap.size())
+
+        # advance the real data stack (PSH pushes prev AX; a pop-op pops the top).
+        if ds is not None:
+            ds.apply(op, prev_ax=prev["AX"], model_ax=ax)
+            stk = ds.top()
 
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
         ax_trace.append(ax)

@@ -92,7 +92,10 @@ from .qwen_full_vm import (
     CAM_REGS, _REG_TOKEN, _snap, _address_bits, _signed_imm,
     _overlay_code_frames, _overlay_fetch_query,
 )
-from .qwen_lean_forward import LeanQwenVM
+from .qwen_lean_forward import (
+    LeanQwenVM, interpret_with_functions, uses_functions,
+)
+from .qwen_lean_stack import LeanDataStack
 
 
 # Default heap prune cadence (BLOG_SPEC §816: eviction runs every ~120 tokens).
@@ -517,7 +520,8 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
                            prune_interval: int = PRUNE_INTERVAL_TOKENS,
                            watermark_rows: int = DEFAULT_WATERMARK_ROWS,
                            sample_every: int = 1,
-                           verbose: bool = False) -> EvictStats:
+                           verbose: bool = False,
+                           stack_depth: bool = True) -> EvictStats:
     """Execute ``code`` on the lean fused VM with a PERSISTENT per-layer KV cache and
     BOUNDED eviction — the memory-bounded long-program driver.
 
@@ -544,8 +548,10 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
     # vs the naive lean driver, not vs isa.interpret, so a missing ref is fine.
     try:
         # match the oracle's step budget to the driver's so a long loop is not
-        # truncated at the default 256-step cap (#691 BUG 2).
-        ref_trace = isa.interpret(code, max_steps=max_steps)
+        # truncated at the default 256-step cap (#691 BUG 2).  Use the function-aware
+        # oracle for JSR/ENT/LEV programs (byte-identical otherwise).
+        ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                     if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
     except Exception:
         ref_trace = []
 
@@ -553,6 +559,7 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
     ax_trace: List[int] = []
     cur_pc = 0
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
+    ds = LeanDataStack() if stack_depth else None    # real depth-N operand stack
 
     cache = LeanKVCache(lean.n_layers, lean.device)
     pruner = AsyncPruner(lean.device, prune_interval, watermark_rows) \
@@ -603,6 +610,10 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
             load_addr = prev["AX"] & 0xFF
+        # feed the TRUE top-of-stack into the register frame the model reads (real
+        # depth-N stack; byte-identical to the 1-slot STK for depth<=1).
+        if ds is not None:
+            reg_state["STACK0"] = ds.top()
 
         # append THIS step's register frame (5 markers + STEP_END query) and decode.
         x, positions, meta = _append_reg_frame(
@@ -641,7 +652,8 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
             if ret_pc is not None:
                 pc = ret_pc
         elif subset.memory and op in (isa.SI, isa.SC):
-            store_addr = _snap(state[L.STK_VAL]) & 0xFF
+            store_addr = ((ds.values[-1] & 0xFF) if (ds is not None and ds.values)
+                          else _snap(state[L.STK_VAL])) & 0xFF
             store_val = ax if op == isa.SI else (ax & 0xFF)
             # STRUCTURAL same-address supersession (mirrors the naive driver's Python
             # ``store_log`` latest-write-wins compaction).  A newer store to the SAME
@@ -660,6 +672,11 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
             cache.append(new_past, ms)
             next_pos += 1
             tokens_since_prune += 1
+
+        # advance the real data stack (PSH pushes prev AX; a pop-op pops the top).
+        if ds is not None:
+            ds.apply(op, prev_ax=prev["AX"], model_ax=ax)
+            stk = ds.top()
 
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
         ax_trace.append(ax)

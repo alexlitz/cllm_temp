@@ -57,9 +57,11 @@ from . import isa
 from .qwen_lean_forward import (
     LeanQwenVM, CAM_REGS, SP_INIT,
     _build_stream_and_overlay, _build_spec_batch,
-    draft_program_lean, run_program_lean,
+    draft_program_lean, run_program_lean, LeanDraft,
+    interpret_with_functions, uses_functions,
     LeanSpecResult,
 )
+from .qwen_lean_stack import LeanDataStack, draft_program_lean_stackfn
 from .qwen_full_vm import _snap
 
 
@@ -226,25 +228,32 @@ class GraphedLeanForward:
 def run_program_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr],
                              max_steps: int = 64, graphed: "GraphedLeanForward" = None,
                              pad_window: Optional[int] = None,
-                             verbose: bool = False) -> Dict[str, object]:
+                             verbose: bool = False,
+                             stack_depth: bool = True) -> Dict[str, object]:
     """Naive one-forward-per-VM-step driver, but each forward is a CUDA-graph replay.
 
     Mirrors ``run_program_lean`` EXACTLY — same window build, same control loop, same
     decode — only ``lean.forward`` is swapped for the graphed replay.  Byte-identical
     to the eager naive driver.  ``graphed`` may be reused across programs to amortise
-    the capture; otherwise one is built here."""
+    the capture; otherwise one is built here.
+
+    ``stack_depth`` (default ``True``): keep a REAL depth-N Python operand stack
+    (see :mod:`qwen_lean_stack`) so depth-2+ stack expressions are byte-exact (the
+    #702 1-slot wall fix); byte-identical to the 1-slot path for depth<=1."""
     QL, L = lean.QL, lean.QL.L
     subset = lean.subset
     g = graphed or GraphedLeanForward(lean, pad_window=pad_window)
     # Match the oracle's step budget to the driver's so a long loop is not truncated
     # against a run-to-completion model trace (#691 BUG 2).
-    ref_trace = isa.interpret(code, max_steps=max_steps)
+    ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                 if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
 
     reg_state = {"PC": 0, "AX": 0, "SP": SP_INIT, "BP": SP_INIT, "STACK0": 0}
     store_log: List[dict] = []
     ax_trace: List[int] = []
     cur_pc = 0
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
+    ds = LeanDataStack() if stack_depth else None    # real depth-N operand stack
 
     for _ in range(max_steps):
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
@@ -252,6 +261,8 @@ def run_program_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr],
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
             load_addr = prev["AX"] & 0xFF
+        if ds is not None:
+            reg_state["STACK0"] = ds.top()
 
         x, positions = _build_stream_and_overlay(lean, code, reg_state, store_log, load_addr)
         hidden = g(x, positions)
@@ -281,11 +292,16 @@ def run_program_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr],
             if ret_pc is not None:
                 pc = ret_pc
         elif subset.memory and op in (isa.SI, isa.SC):
-            store_addr = _snap(state[L.STK_VAL])
+            store_addr = (ds.values[-1] & 0xFF) if (ds is not None and ds.values) \
+                else _snap(state[L.STK_VAL])
             store_val = ax if op == isa.SI else (ax & 0xFF)
             store_log = [s for s in store_log
                          if (s["addr"] & 0xFF) != (store_addr & 0xFF)]
             store_log.append({"addr": store_addr, "val": store_val})
+
+        if ds is not None:
+            ds.apply(op, prev_ax=prev["AX"], model_ax=ax)
+            stk = ds.top()
 
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
         ax_trace.append(ax)
@@ -303,7 +319,8 @@ def run_program_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr],
 def speculative_run_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr], *,
                                  block_steps: int = 32, max_steps: int = 4096,
                                  graphed: "GraphedLeanForward" = None,
-                                 verbose: bool = False) -> LeanSpecResult:
+                                 verbose: bool = False,
+                                 stack_depth: bool = True) -> LeanSpecResult:
     """Perfect-draft speculation with each block's batched forward run as a CUDA-graph
     replay.
 
@@ -312,13 +329,23 @@ def speculative_run_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr], *,
     per-step windows into one ``[B,Smax,H]`` forward — only that batched forward is a
     graph replay (the IDEAL fixed-shape replay target).  Byte-identical to the eager
     speculative driver.  Falls back to the graphed naive driver for out-of-slice
-    programs (functions)."""
+    programs (functions).
+
+    ``stack_depth`` (default ``True``): draft with a REAL depth-N operand stack so
+    depth-2+ stack expressions are byte-exact (the #702 1-slot wall fix)."""
     g = graphed or GraphedLeanForward(lean)
-    draft = draft_program_lean(lean, code, max_steps=max_steps)
+    if stack_depth:
+        ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                     if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
+        sd = draft_program_lean_stackfn(code, lean.subset, max_steps=max_steps,
+                                        ref_trace=ref_trace)
+        draft = LeanDraft(steps=sd.steps, ref_trace=sd.ref_trace, halted=sd.halted)
+    else:
+        draft = draft_program_lean(lean, code, max_steps=max_steps)
     ref_trace = draft.ref_trace
     if not draft.steps:
         r = run_program_lean_graphed(lean, code, max_steps=max_steps,
-                                     graphed=g, verbose=verbose)
+                                     graphed=g, verbose=verbose, stack_depth=stack_depth)
         n = r["steps"]
         return LeanSpecResult(
             status="PASS" if r["exact"] else "FAIL", ax_trace=r["ax_trace"],
@@ -326,6 +353,7 @@ def speculative_run_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr], *,
             naive_forwards=n, speedup=1.0, accepted=n, detail="naive-fallback")
 
     QL, L = lean.QL, lean.QL.L
+    n_code = len(code) if lean.code_from_memory else 0
     n_steps = len(draft.steps)
     ax_trace: List[int] = []
     forwards = 0
@@ -337,7 +365,8 @@ def speculative_run_lean_graphed(lean: LeanQwenVM, code: List[isa.Instr], *,
         forwards += 1
         for i, st in enumerate(slab):
             n_store = len(st["store_log"]) if lean.subset.memory else 0
-            qrow = (1 + n_store) + len(CAM_REGS)          # BOS + stores + 5 regs + STEP_END
+            # BOS + stores + [code frames] + 5 regs + STEP_END (n_code>0 in CFM mode).
+            qrow = (1 + n_store + n_code) + len(CAM_REGS)
             state = hidden[i, qrow]
             ax = lean.decode_ax(state, st["op"]) & 0xFF
             ax_trace.append(ax)

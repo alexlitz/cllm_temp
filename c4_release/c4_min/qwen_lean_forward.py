@@ -55,6 +55,7 @@ from .qwen_full_vm import (
     QwenFullVM, CAM_REGS, _REG_TOKEN, _snap, _address_bits, _signed_imm,
     _overlay_code_frames, _overlay_fetch_query,
 )
+from .qwen_lean_stack import LeanDataStack, draft_program_lean_stackfn
 
 # The efficient-ALU ops whose AX result is written to the AX NIBBLE band (the full
 # fp32 32-bit result), NOT the scalar AX_VAL — so the driver MUST decode their AX
@@ -509,13 +510,20 @@ def _build_stream_and_overlay(lean: LeanQwenVM, code: List[isa.Instr],
 
 
 def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 64,
-                     verbose: bool = False) -> Dict[str, object]:
+                     verbose: bool = False, stack_depth: bool = True) -> Dict[str, object]:
     """Execute ``code`` on the LEAN fused VM (one VM step = one lean forward).
 
     Byte-identical driver to ``qwen_full_vm.run_program`` — the register state
     round-trips through the windowed token stream, the op is computed in the SwiGLU
     MLPs, control-flow inside the forward.  Returns
-    ``{"ax_trace","ref_trace","exact","steps"}``."""
+    ``{"ax_trace","ref_trace","exact","steps"}``.
+
+    ``stack_depth`` (default ``True``): keep a REAL depth-N Python operand stack
+    driver-side (see :mod:`qwen_lean_stack`) so a depth-2+ stack expression
+    (``a*b + c*d``, ``mem[a] = x + y``, nested call args) is byte-exact — the
+    #702 1-slot STACK0 wall fix.  Byte-IDENTICAL to the historical 1-slot path
+    for depth<=1 programs (a 1-element stack's top == the single pushed value ==
+    the model's ``STK_VAL``).  Set ``False`` for the legacy 1-slot behaviour."""
     QL, L = lean.QL, lean.QL.L
     subset = lean.subset
     # Match the reference oracle's step budget to the driver's so a loop longer than
@@ -531,6 +539,7 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
     ax_trace: List[int] = []
     cur_pc = 0
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
+    ds = LeanDataStack() if stack_depth else None    # real depth-N operand stack
 
     for _ in range(max_steps):
         op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
@@ -538,6 +547,11 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
             load_addr = prev["AX"] & 0xFF
+        # feed the TRUE top-of-stack into the register frame the model reads (the
+        # model only ever needs the ONE top value per op).  For depth<=1 this is the
+        # same value the model's STK_VAL decode would carry, so byte-identical.
+        if ds is not None:
+            reg_state["STACK0"] = ds.top()
 
         x, positions = _build_stream_and_overlay(lean, code, reg_state, store_log, load_addr)
         with torch.no_grad():
@@ -570,11 +584,19 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
             if ret_pc is not None:
                 pc = ret_pc
         elif subset.memory and op in (isa.SI, isa.SC):
-            store_addr = _snap(state[L.STK_VAL])
+            # store ADDRESS: the real-stack top (depth-exact) or the model's 1-slot
+            # STK decode (legacy).  ``ds.apply`` below pops that address off the stack.
+            store_addr = (ds.values[-1] & 0xFF) if (ds is not None and ds.values) \
+                else _snap(state[L.STK_VAL])
             store_val = ax if op == isa.SI else (ax & 0xFF)
             store_log = [s for s in store_log
                          if (s["addr"] & 0xFF) != (store_addr & 0xFF)]
             store_log.append({"addr": store_addr, "val": store_val})
+
+        # advance the real data stack (PSH pushes prev AX; a pop-op pops the top).
+        if ds is not None:
+            ds.apply(op, prev_ax=prev["AX"], model_ax=ax)
+            stk = ds.top()
 
         reg_state = {"PC": pc, "AX": ax, "SP": sp, "BP": bp, "STACK0": stk}
         ax_trace.append(ax)
@@ -848,18 +870,30 @@ class LeanSpecResult:
 
 def speculative_run_lean(lean: LeanQwenVM, code: List[isa.Instr], *,
                          block_steps: int = 32, max_steps: int = 4096,
-                         verbose: bool = False) -> LeanSpecResult:
+                         verbose: bool = False, stack_depth: bool = True) -> LeanSpecResult:
     """Perfect-draft speculation on the lean forward.
 
     Drafts the whole program with the deterministic VM (free), then verifies
     ``block_steps`` steps per lean forward.  Each verified step decodes its AX at its
     STEP_END row; the program PASSes iff the decoded AX trace matches
     ``isa.interpret``.  Returns forwards-saved (``naive_forwards / forwards``).
-    Falls back to the naive per-step driver for out-of-slice programs (functions)."""
-    draft = draft_program_lean(lean, code, max_steps=max_steps)
+    Falls back to the naive per-step driver for out-of-slice programs (functions).
+
+    ``stack_depth`` (default ``True``): draft with a REAL depth-N operand stack
+    (see :mod:`qwen_lean_stack`) so a depth-2+ stack expression is byte-exact —
+    the #702 1-slot wall fix.  Byte-identical to the 1-slot draft for depth<=1."""
+    if stack_depth:
+        ref_trace = (interpret_with_functions(code, max_steps=max_steps)
+                     if uses_functions(code) else isa.interpret(code, max_steps=max_steps))
+        sd = draft_program_lean_stackfn(code, lean.subset, max_steps=max_steps,
+                                        ref_trace=ref_trace)
+        draft = LeanDraft(steps=sd.steps, ref_trace=sd.ref_trace, halted=sd.halted)
+    else:
+        draft = draft_program_lean(lean, code, max_steps=max_steps)
     ref_trace = draft.ref_trace
     if not draft.steps:
-        r = run_program_lean(lean, code, max_steps=max_steps, verbose=verbose)
+        r = run_program_lean(lean, code, max_steps=max_steps, verbose=verbose,
+                             stack_depth=stack_depth)
         n = r["steps"]
         return LeanSpecResult(
             status="PASS" if r["exact"] else "FAIL", ax_trace=r["ax_trace"],
