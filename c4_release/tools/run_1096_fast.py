@@ -355,6 +355,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Comma-separated ids/ranges (e.g. '0,5-9,42'). Overrides offset/limit.",
     )
     parser.add_argument(
+        "--full", action="store_true",
+        help="Score the COMBINED corpus (1096 C + 67 c4_min edge == 1163). The 10 C "
+             "edge cases run on the big-VM neural path like any 1096 program; the 57 "
+             "pre-assembled (asm) edge cases are 'skipped' here (big-VM path is "
+             "C-source-only) and verified on the c4_min pure-forward path. Default: "
+             "the 1096 only.",
+    )
+    parser.add_argument(
         "--chunk", type=int,
         default=int(os.environ.get("C4_BATCH_CHUNK", "32")),
         help="Programs per neural batch (default: env C4_BATCH_CHUNK or 32).",
@@ -391,26 +399,45 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     overall_t0 = time.monotonic()
 
-    from tests.test_suite_1000 import generate_test_programs
+    from tests.test_suite_1000 import (
+        generate_test_programs, generate_test_programs_full,
+        entry_source, entry_expected, entry_description,
+    )
 
-    all_tests = generate_test_programs()
+    all_tests = (generate_test_programs_full() if args.full
+                 else generate_test_programs())
     enumerated = list(enumerate(all_tests))
+
+    def _row(idx, e):
+        return (idx, entry_source(e), entry_expected(e), entry_description(e))
 
     if args.ids:
         wanted = set(_parse_ids(args.ids))
-        selected = [
-            (idx, src, exp, desc)
-            for idx, (src, exp, desc) in enumerated
-            if idx in wanted
-        ]
+        selected = [_row(idx, e) for idx, e in enumerated if idx in wanted]
     else:
         windowed = enumerated[args.offset:]
         if args.limit is not None:
             windowed = windowed[: args.limit]
-        selected = [(idx, src, exp, desc) for idx, (src, exp, desc) in windowed]
+        selected = [_row(idx, e) for idx, e in windowed]
+
+    # The big-VM neural runner is C-source-only (it decodes the 8-byte-word compiler
+    # bytecode, not the c4_min slot ISA), so pre-assembled (asm) edge entries
+    # (source is None) are reported 'skipped' (verified on the c4_min pure-forward
+    # path via c4_min/run_1096_pure_forward.py --full).
+    preassembled_skipped = [
+        ProgramResult(
+            idx=idx, description=desc, suite_expected=exp,
+            declarative_exit=None, declarative_steps=None, neural_exit=None,
+            status="skipped",
+            error="skipped: pre-assembled c4_min ISA (big-VM path is C-source-only)",
+        )
+        for (idx, src, exp, desc) in selected if src is None
+    ]
+    selected = [row for row in selected if row[1] is not None]
 
     print(
-        f"[1096-fast] selected={len(selected)} (of {len(all_tests)}) "
+        f"[1096-fast] selected={len(selected)} C-runnable "
+        f"(+{len(preassembled_skipped)} asm-skipped) of {len(all_tests)} total "
         f"chunk={args.chunk} spec_k={args.spec_k} "
         f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}",
         file=sys.stderr,
@@ -432,7 +459,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         max_context_window=int(args.max_context_window),
     )
 
-    all_results: List[ProgramResult] = oracle_errors + neural_results
+    all_results: List[ProgramResult] = (
+        oracle_errors + preassembled_skipped + neural_results
+    )
     all_results.sort(key=lambda r: r.idx)
 
     total_elapsed = time.monotonic() - overall_t0
@@ -440,11 +469,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     pass_n = sum(1 for r in all_results if r.status == "ok")
     fail_n = sum(1 for r in all_results if r.status == "fail")
     err_n = sum(1 for r in all_results if r.status == "error")
+    skip_n = sum(1 for r in all_results if r.status == "skipped")
 
     print(
         f"\n[1096-fast] SUMMARY "
         f"total={len(all_results)} "
-        f"pass={pass_n} fail={fail_n} error={err_n} "
+        f"pass={pass_n} fail={fail_n} error={err_n} skipped={skip_n} "
         f"wall={total_elapsed:.1f}s",
         file=sys.stderr,
         flush=True,
