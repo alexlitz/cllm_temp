@@ -617,7 +617,9 @@ def run_program_lean_evict(lean: LeanQwenVM, code: List[isa.Instr], *,
 
         state = hidden[0, -1]
         pc = _snap(state[L.PC_VAL])
-        ax = _snap(state[L.AX_VAL]) & 0xFF
+        # efficient-ALU MUL/DIV/MOD (+SHL/SHR under shift_via_mul) decode from the AX
+        # NIBBLE band (AX_VAL is the stale popped operand); see LeanQwenVM.decode_ax.
+        ax = lean.decode_ax(state, op) & 0xFF
         sp = _snap(state[L.SP_VAL])
         bp = _snap(state[L.BP_VAL])
         stk = _snap(state[L.STK_VAL])

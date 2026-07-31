@@ -201,7 +201,9 @@ def run_program_lean_stack(lean: LeanQwenVM, code: List[isa.Instr],
         state = hidden[0, -1]
 
         pc = _snap(state[L.PC_VAL])
-        ax = _snap(state[L.AX_VAL]) & 0xFF
+        # efficient-ALU MUL/DIV/MOD (+SHL/SHR under shift_via_mul) decode from the AX
+        # NIBBLE band (AX_VAL is the stale popped operand); see LeanQwenVM.decode_ax.
+        ax = lean.decode_ax(state, op) & 0xFF
         sp = _snap(state[L.SP_VAL])
         bp = _snap(state[L.BP_VAL])
 
@@ -274,7 +276,7 @@ def speculative_run_lean_stack(lean: LeanQwenVM, code: List[isa.Instr], *,
             n_store = len(st["store_log"]) if lean.subset.memory else 0
             qrow = (1 + n_store) + len(CAM_REGS)
             state = hidden[i, qrow]
-            ax = _snap(state[L.AX_VAL]) & 0xFF
+            ax = lean.decode_ax(state, st["op"]) & 0xFF
             ax_trace.append(ax)
             accepted += 1
     exact = ax_trace == ref_trace

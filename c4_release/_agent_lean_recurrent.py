@@ -70,7 +70,9 @@ def build_lean_recurrent(vm, device: str, dtype: torch.dtype = torch.float32
         n_heads=cfg.num_attention_heads, n_kv_heads=cfg.num_key_value_heads,
         head_dim=head_dim, rope_theta=cfg.rope_theta, rms_eps=cfg.rms_norm_eps,
         device=dev, dtype=dtype, QL=vm.QL, subset=vm.subset, inv_freq=inv_freq,
-        code_from_memory=vm.code_from_memory)
+        code_from_memory=vm.code_from_memory,
+        efficient_alu=getattr(vm, "efficient_alu", False),
+        shift_via_mul=getattr(vm, "shift_via_mul", False))
     lean.apply_order = apply_order
     return lean
 
