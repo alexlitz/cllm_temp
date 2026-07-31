@@ -51,7 +51,7 @@ from .nibble_pure_forward import (
 )
 from .nibble_pure_forward_complete import (
     PureForwardCompleteLayout, IMM_NIBS, _build_frame, _decode_reg_from_nibbles,
-    _mem_top,
+    _mem_top, CODE_ADDR_BITS,
 )
 from .nibble_kv_prune import MultiHeadKVCache, KVCache
 from .blogspec_layout import NIB_PER_REG
@@ -76,27 +76,46 @@ _KV_PRUNE_FULL_COSINE = os.environ.get("C4_KV_PRUNE_FULL_COSINE", "0") == "1"
 # ===========================================================================
 def apply_overlay_window(x_win: torch.Tensor, w_start: int, code, L,
                          store_log: Dict[int, Tuple[int, int]],
-                         is_last_row_query: bool) -> None:
+                         is_last_row_query: bool, code_off: int = 0) -> None:
     """In-place overlay of the window residual ``x_win`` ([1, W, D]).
 
     ``w_start`` is the ABSOLUTE stream position of ``x_win[:, 0]``.  Position 0 is
     the BOS row; positions ``1 + 30*f + local`` belong to frame ``f`` local slot
     ``local``.  Only rows inside the window are touched.
+
+    CODE-FROM-MEMORY (``code_off > 0``): positions ``1 .. code_off`` are leading CODE
+    frames (one per instruction) and the register/store frames begin at ``1 +
+    code_off`` (frame math shifts by ``code_off``).  Each code row gets IS_CODE +
+    CODE_KEY_BIN(addr) + CODE_OPV(op) + CODE_IMM_NIB_MEM(imm nibbles); the baked
+    per-position DATA-band program-in-data is NOT written (the program lives in the KV).
     """
+    _cfm = code_off > 0
     W = x_win.shape[1]
     for wi in range(W):
         p = w_start + wi
         x_win[0, wi, L.ONE] = 1.0
-        for k, ins in enumerate(code):
-            x_win[0, wi, L.CODE_OP[k]] = float(ins.op)
-            x_win[0, wi, L.CODE_IMM[k]] = float(ins.imm)
-            for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
-                x_win[0, wi, L.CODE_IMM_NIB[k] + j] = float(nv)
+        if not _cfm:
+            for k, ins in enumerate(code):
+                x_win[0, wi, L.CODE_OP[k]] = float(ins.op)
+                x_win[0, wi, L.CODE_IMM[k]] = float(ins.imm)
+                for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                    x_win[0, wi, L.CODE_IMM_NIB[k] + j] = float(nv)
         if p == 0:
             continue                       # BOS row carries no frame roles
-        # frame index + local slot for absolute position p.
-        f = (p - 1) // V.FRAME_LEN
-        local = (p - 1) % V.FRAME_LEN
+        if _cfm and 1 <= p <= code_off:
+            # CODE frame for instruction (p-1): the address-keyed KV code memory.
+            ins = code[p - 1]
+            x_win[0, wi, L.IS_CODE] = 1.0
+            x_win[0, wi, L.IS_FRAME_BYTE] = 0.0
+            for b in range(CODE_ADDR_BITS):
+                x_win[0, wi, L.CODE_KEY_BIN + b] = float(((p - 1) >> b) & 1)
+            x_win[0, wi, L.CODE_OPV] = float(ins.op)
+            for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                x_win[0, wi, L.CODE_IMM_NIB_MEM + j] = float(nv)
+            continue
+        # frame index + local slot for absolute position p (shifted past code frames).
+        f = (p - 1 - code_off) // V.FRAME_LEN
+        local = (p - 1 - code_off) % V.FRAME_LEN
         if local in _FRAME_ROLE_SLOTS:
             role = _FRAME_ROLE_SLOTS[local]
             x_win[0, wi, L.ROLE + role] = 1.0
