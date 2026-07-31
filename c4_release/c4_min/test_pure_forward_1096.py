@@ -158,6 +158,54 @@ def test_32bit_results_exceed_8_bits():
     assert all(e <= 0xFFFFFFFF for _n, e in over)
 
 
+# ==========================================================================
+# COMBINED CORPUS (1096 + 67 edge == 1163) — ONE gate, format-aware.
+# ==========================================================================
+# These run through the SAME combined entry point + the SAME format-agnostic scorer
+# the standalone scoreboard uses (``run_1096_pure_forward.score_entry``), so the
+# 1096 corpus and the folded c4_min edge suite are scored by ONE gate.  The REFERENCE
+# (golden) sub-gate is fast (pure-python ``ref_interpret`` / the I/O reference
+# contract, NO model build) and is always run here; the NEURAL sub-gate stays in the
+# opt-in edge/neural sample above (and in tests/test_suite_edge_ops.py) because a
+# model build is ~minutes.
+from tests.test_suite_1000 import (  # noqa: E402
+    generate_test_programs, generate_test_programs_full, generate_edge_corpus_entries,
+    CorpusEntry,
+)
+from c4_min.run_1096_pure_forward import score_entry  # noqa: E402
+
+
+def test_combined_corpus_is_1163_and_prefix_identical():
+    """The folded corpus is exactly 1163 (1096 C + 67 edge) and its first 1096
+    entries are byte-identical to the pristine ``generate_test_programs()``."""
+    base = generate_test_programs()
+    full = generate_test_programs_full()
+    assert len(base) == 1096
+    assert len(full) == 1163
+    assert full[:1096] == base
+    tail = full[1096:]
+    assert len(tail) == 67
+    assert all(isinstance(e, CorpusEntry) for e in tail)
+
+
+_EDGE_ENTRIES = generate_edge_corpus_entries()
+
+
+@pytest.mark.parametrize("entry", _EDGE_ENTRIES,
+                         ids=[e.edge_name for e in _EDGE_ENTRIES])
+def test_edge_case_reference_golden_byte_exact(entry):
+    """Every folded edge case is byte-exact vs the c4_min reference golden
+    (``ref_interpret`` / the I/O contract) through the canonical scorer — the cheap
+    always-run gate.  All 67 (incl. the neural-xfail SHR cases, which are byte-exact
+    vs the REFERENCE — they only diverge on the neural model) PASS here."""
+    from src.compiler import compile_c
+    idx = 1096 + _EDGE_ENTRIES.index(entry)
+    r = score_entry(idx, entry, model=None, L=None, compile_c=compile_c,
+                    step_cap=10000, guard=False, reference_only=True)
+    assert r.status == "PASS", (f"{entry.edge_name}: reference gate {r.status} "
+                                f"exp={r.expected} got={r.got_exit} {r.detail}")
+
+
 if __name__ == "__main__":
     import sys
     from src.compiler import compile_c

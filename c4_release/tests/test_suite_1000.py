@@ -600,6 +600,184 @@ def get_all_tests() -> List[Tuple[str, int, str]]:
     return generate_test_programs()
 
 
+# ==========================================================================
+# COMBINED CORPUS (1096 C programs + the c4_min edge-case suite) — ONE gate.
+# ==========================================================================
+# The canonical 1096 corpus above is C-SOURCE only: every entry is a
+# ``(source, expected, description)`` tuple compiled via ``src.compiler.compile_c``.
+# The c4_min edge-case suite (``c4_min/edge_corpus.py``) adds 67 cases covering the
+# 17 opcodes the 1096 corpus never touches (LC/SC/SHR/SHL/AND/OR/XOR/GE/BNZ/PRTF/
+# READ).  57 of those are HAND-ASSEMBLED c4_min ISA (they CANNOT be C source: the
+# c4_min compiler's 8-bit IMM fold makes a compiled signed-char shift diverge from
+# native c4 — ``char c=-1; c>>1`` compiles to ``255>>1==127`` not ``-1``), so they
+# carry a PRE-ASSEMBLED ``code`` payload instead of a source string.
+#
+# To fold both into ONE gate WITHOUT changing the existing 1096 C tuples, a richer
+# entry format is added ALONGSIDE the plain 3-tuple: a ``CorpusEntry`` carrying an
+# optional pre-assembled payload.  ``generate_test_programs_full()`` yields the
+# EXISTING 1096 plain tuples (byte-identical, first) followed by the 67 edge entries
+# as ``CorpusEntry`` objects.  Consumers use ``entry_source()`` / ``entry_code()`` /
+# ``entry_expected()`` / ``entry_description()`` (which accept BOTH a plain 3-tuple
+# and a CorpusEntry) to stay format-agnostic; ``entry_code()`` returns a
+# pre-assembled ``isa.Instr`` list for an asm entry and ``None`` for a C entry (feed
+# ``compile_c`` in that case).
+
+from dataclasses import dataclass, field  # noqa: E402
+from typing import Any, Dict, Optional  # noqa: E402
+
+
+@dataclass
+class CorpusEntry:
+    """A canonical corpus entry that MAY carry a pre-assembled c4_min payload.
+
+    ``source is not None``  -> a C program (compile via ``src.compiler.compile_c``);
+    identical role to a plain ``(source, expected, description)`` tuple.
+    ``code is not None``     -> a PRE-ASSEMBLED c4_min ISA program (a list of
+    ``isa.Instr``); skip ``compile_c`` and feed the ISA + ``data_seg``/``stdin``
+    straight to the c4_min runner.  Exactly one of ``source`` / ``code`` is set.
+    """
+    expected: int                          # golden 32-bit AX (masked & 0xFFFFFFFF)
+    description: str                        # cluster/id string (drives cluster_of)
+    source: Optional[str] = None           # C source (kind="c")
+    code: Optional[Any] = None             # pre-assembled List[isa.Instr] (kind="asm")
+    data_seg: Dict[int, int] = field(default_factory=dict)     # byte addr -> byte
+    seed_mem: Dict[int, int] = field(default_factory=dict)     # word addr -> value
+    stdin: bytes = b""                     # bytes a READ(fd=0) pulls
+    expected_stdout: Optional[bytes] = None  # golden PRTF byte stream (or None)
+    prtf_args: List[int] = field(default_factory=list)         # printf varargs
+    io: bool = False                       # needs the fio/stdin/data-seg path
+    max_steps: int = 64                    # per-program step cap hint
+    kind: str = "c"                        # "c" | "asm"  (provenance tag)
+    edge_name: str = ""                    # stable edge id (empty for the 1096)
+
+    # A CorpusEntry unpacks like the historical 3-tuple: ``src, exp, desc = entry``
+    # yields ``(source, expected, description)`` so any consumer that has NOT been
+    # made format-aware still sees the C fields (source is None for an asm entry —
+    # such a consumer would then fail to compile it, which is the correct signal
+    # that it needs to switch to ``entry_code()``).
+    def __iter__(self):
+        return iter((self.source, self.expected, self.description))
+
+
+def _edge_case_to_entry(case) -> "CorpusEntry":
+    """Adapt one ``c4_min.edge_corpus.EdgeCase`` -> a canonical ``CorpusEntry``.
+
+    ``kind="c"`` keeps its C source (compilable through the SAME ``compile_c``).
+    ``kind="asm"`` pre-assembles its ISA once (``case.code()`` == ``isa.assemble``)
+    and carries the resulting ``isa.Instr`` list so no consumer re-runs the
+    compiler on it.  The description is namespaced ``edge_<cluster>_<name>`` so
+    ``cluster_of`` groups edge cases into ``edge_<cluster>`` families distinct from
+    the 1096 clusters.
+    """
+    desc = f"edge_{case.cluster}_{case.name}: {case.note}" if case.note else \
+        f"edge_{case.cluster}_{case.name}"
+    if case.kind == "asm":
+        return CorpusEntry(
+            expected=case.expected & 0xFFFFFFFF, description=desc,
+            source=None, code=case.code(),
+            data_seg=dict(case.data_seg), seed_mem=dict(case.seed_mem),
+            stdin=bytes(case.stdin), expected_stdout=case.expected_stdout,
+            prtf_args=list(case.prtf_args), io=case.io, max_steps=case.max_steps,
+            kind="asm", edge_name=case.name)
+    # kind == "c": keep the source; C edge cases compile like any 1096 program.
+    return CorpusEntry(
+        expected=case.expected & 0xFFFFFFFF, description=desc,
+        source=case.body, code=None,
+        data_seg=dict(case.data_seg), seed_mem=dict(case.seed_mem),
+        stdin=bytes(case.stdin), expected_stdout=case.expected_stdout,
+        prtf_args=list(case.prtf_args), io=case.io, max_steps=case.max_steps,
+        kind="c", edge_name=case.name)
+
+
+def generate_edge_corpus_entries() -> "List[CorpusEntry]":
+    """The 67 c4_min edge cases adapted to canonical ``CorpusEntry`` objects.
+
+    Kept importable on its own (some consumers only want the edge tail).  Imports
+    ``c4_min.edge_corpus`` lazily so ``test_suite_1000`` has no hard c4_min import
+    when only the plain 1096 corpus is used.
+    """
+    from c4_min.edge_corpus import generate_edge_cases
+    return [_edge_case_to_entry(c) for c in generate_edge_cases()]
+
+
+def generate_test_programs_full() -> list:
+    """The COMBINED corpus: the existing 1096 C programs (plain 3-tuples, FIRST and
+    byte-identical to ``generate_test_programs()``) followed by the 67 c4_min edge
+    cases as ``CorpusEntry`` objects.  Total == 1096 + 67 == 1163.
+
+    The first 1096 entries are the SAME objects ``generate_test_programs()`` yields,
+    so ``list(generate_test_programs_full())[:1096] == generate_test_programs()`` is
+    guaranteed (the original golden/reference check is unchanged).  Consumers use the
+    ``entry_*`` accessors below to read either an original tuple or a CorpusEntry.
+    """
+    return list(generate_test_programs()) + list(generate_edge_corpus_entries())
+
+
+# --- format-agnostic accessors: work on BOTH a plain 3-tuple and a CorpusEntry ---
+def entry_source(entry) -> Optional[str]:
+    """C source string, or None for a pre-assembled (asm) entry."""
+    if isinstance(entry, CorpusEntry):
+        return entry.source
+    return entry[0]
+
+
+def entry_expected(entry) -> int:
+    if isinstance(entry, CorpusEntry):
+        return entry.expected
+    return entry[1]
+
+
+def entry_description(entry) -> str:
+    if isinstance(entry, CorpusEntry):
+        return entry.description
+    return entry[2]
+
+
+def entry_code(entry):
+    """Pre-assembled ``isa.Instr`` list for an asm entry, else None (compile the
+    source).  A plain 3-tuple never carries pre-assembled code."""
+    if isinstance(entry, CorpusEntry):
+        return entry.code
+    return None
+
+
+def entry_is_preassembled(entry) -> bool:
+    """True iff the entry carries a pre-assembled c4_min ISA payload (skip
+    ``compile_c``)."""
+    return isinstance(entry, CorpusEntry) and entry.code is not None
+
+
+def entry_io_kwargs(entry) -> dict:
+    """The I/O keyword bundle (``data_seg`` / ``seed_mem`` / ``stdin`` /
+    ``expected_stdout`` / ``prtf_args`` / ``io`` / ``max_steps``) for a CorpusEntry;
+    an empty dict for a plain tuple (which never carries I/O)."""
+    if not isinstance(entry, CorpusEntry):
+        return {}
+    return {
+        "data_seg": dict(entry.data_seg), "seed_mem": dict(entry.seed_mem),
+        "stdin": bytes(entry.stdin), "expected_stdout": entry.expected_stdout,
+        "prtf_args": list(entry.prtf_args), "io": entry.io,
+        "max_steps": entry.max_steps,
+    }
+
+
+def test_generate_test_programs_full_is_1163_and_prefix_identical():
+    """The combined corpus is 1163 and its first 1096 entries are byte-identical to
+    the pristine ``generate_test_programs()`` (the original golden reference)."""
+    base = generate_test_programs()
+    full = generate_test_programs_full()
+    assert len(base) == 1096
+    assert len(full) == 1163
+    assert full[:1096] == base                 # original 1096 UNCHANGED
+    # the tail is the 67 edge cases, all CorpusEntry
+    tail = full[1096:]
+    assert len(tail) == 67
+    assert all(isinstance(e, CorpusEntry) for e in tail)
+    n_asm = sum(1 for e in tail if e.kind == "asm")
+    n_c = sum(1 for e in tail if e.kind == "c")
+    assert (n_asm, n_c) == (57, 10), (n_asm, n_c)
+
+
 def test_generate_test_programs_is_reentrant_deterministic():
     first = generate_test_programs()
     second = generate_test_programs()

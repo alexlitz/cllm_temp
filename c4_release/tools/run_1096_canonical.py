@@ -259,18 +259,51 @@ def cluster_of(description: str) -> str:
 
 
 def _select(all_tests, ids_spec: Optional[str], offset: int, limit: Optional[int]):
+    """Select (idx, source, expected, description) rows, format-agnostic over a plain
+    3-tuple and a CorpusEntry.  ``source`` is ``None`` for a pre-assembled (asm) edge
+    entry; those are split out by ``_split_preassembled`` before the compile path (the
+    big-VM neural runner is C-source-only — its ISA is the 8-byte-word compiler
+    bytecode, not the c4_min slot ISA)."""
+    from tests.test_suite_1000 import (
+        entry_source, entry_expected, entry_description,
+    )
     enumerated = list(enumerate(all_tests))
+
+    def row(idx, e):
+        return (idx, entry_source(e), entry_expected(e), entry_description(e))
+
     if ids_spec:
         wanted = set(_parse_ids(ids_spec))
-        return [
-            (idx, src, exp, desc)
-            for idx, (src, exp, desc) in enumerated
-            if idx in wanted
-        ]
+        return [row(idx, e) for idx, e in enumerated if idx in wanted]
     windowed = enumerated[offset:]
     if limit is not None:
         windowed = windowed[:limit]
-    return [(idx, src, exp, desc) for idx, (src, exp, desc) in windowed]
+    return [row(idx, e) for idx, e in windowed]
+
+
+def _split_preassembled(selected):
+    """Partition selected rows into (c_rows, skipped) where ``skipped`` are the
+    pre-assembled (asm) edge entries (``source is None``).  The big-VM pure-neural
+    runner compiles C via ``src.compiler.compile_c`` and decodes the 8-byte-word
+    compiler bytecode; it CANNOT run a hand-assembled c4_min slot-ISA program, so
+    those 57 asm edge cases are reported as ``skipped`` (verified byte-exact on the
+    c4_min pure-forward path via ``c4_min/run_1096_pure_forward.py --full`` instead).
+    The 10 C edge cases compile + run like any 1096 program."""
+    c_rows, skipped = [], []
+    for (idx, src, exp, desc) in selected:
+        if src is None:
+            skipped.append(
+                ProgramResult(
+                    idx=idx, description=desc, suite_expected=exp,
+                    declarative_exit=None, declarative_steps=None,
+                    neural_exit=None, status="skipped",
+                    error="skipped: pre-assembled c4_min ISA (big-VM neural path is "
+                          "C-source-only; run c4_min/run_1096_pure_forward.py --full)",
+                )
+            )
+        else:
+            c_rows.append((idx, src, exp, desc))
+    return c_rows, skipped
 
 
 def _cluster_breakdown(
@@ -773,6 +806,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Comma-separated ids/ranges (e.g. '0,5-9,42'). Overrides offset/limit.",
     )
     parser.add_argument(
+        "--full", action="store_true",
+        help="Score the COMBINED corpus (1096 C + 67 c4_min edge == 1163) through "
+             "ONE gate. The 10 C edge cases compile + run on the big-VM neural path "
+             "like any 1096 program; the 57 pre-assembled (asm) edge cases are "
+             "reported 'skipped' here (big-VM path is C-source-only) and verified "
+             "byte-exact on the c4_min pure-forward path "
+             "(c4_min/run_1096_pure_forward.py --full). Default: the 1096 only.",
+    )
+    parser.add_argument(
         "--chunk", type=int,
         default=int(os.environ.get("C4_BATCH_CHUNK", "0")),
         help="Fixed programs per neural batch. Default 0 = MEMORY-SAFE "
@@ -887,13 +929,32 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     overall_t0 = time.monotonic()
 
-    from tests.test_suite_1000 import generate_test_programs
+    from tests.test_suite_1000 import (
+        generate_test_programs, generate_test_programs_full,
+    )
 
-    all_tests = generate_test_programs()
+    all_tests = (generate_test_programs_full() if args.full
+                 else generate_test_programs())
     selected = _select(all_tests, args.ids, args.offset, args.limit)
 
+    # Split off pre-assembled (asm) edge entries: the big-VM pure-neural runner is
+    # C-source-only (it decodes the 8-byte-word compiler bytecode, not the c4_min slot
+    # ISA), so the 57 asm edge cases are reported as 'skipped' here and verified on the
+    # c4_min pure-forward path instead. The 10 C edge cases compile + run like the 1096.
+    selected, preassembled_skipped = _split_preassembled(selected)
+    if preassembled_skipped:
+        print(
+            f"[1096-canonical] SKIPPING {len(preassembled_skipped)} pre-assembled "
+            f"(asm) edge case(s): the big-VM neural path is C-source-only. These are "
+            f"verified byte-exact on the c4_min pure-forward path "
+            f"(c4_min/run_1096_pure_forward.py --full).",
+            file=sys.stderr,
+            flush=True,
+        )
+
     print(
-        f"[1096-canonical] selected={len(selected)} (of {len(all_tests)}) "
+        f"[1096-canonical] selected={len(selected)} C-runnable "
+        f"(+{len(preassembled_skipped)} asm-skipped) of {len(all_tests)} total "
         f"chunk={'mem-safe' if args.chunk <= 0 else args.chunk} "
         f"mem_step_scale={args.mem_step_scale} "
         f"spec_k={args.spec_k} max_steps_cap={args.max_steps_cap} "
@@ -960,7 +1021,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     all_results: List[ProgramResult] = (
-        oracle_errors + skipped + neural_results
+        oracle_errors + skipped + preassembled_skipped + neural_results
     )
     all_results.sort(key=lambda r: r.idx)
 
