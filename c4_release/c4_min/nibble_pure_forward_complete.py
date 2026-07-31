@@ -535,7 +535,23 @@ def _bake_code_cam_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
     qb = kb = (BIAS * (CODE_ADDR_BITS - 1) / (ADDR_BITS - 1) / hs) ** 0.5
     PEN = PEN_GATE
     p = (PEN / hs) ** 0.5
-    attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
+    # RECALL HORIZON (wall #6): the §Memory ALiBi recency imposes a horizon of
+    # ``EFF/slope`` (= 500000) tokens — a far-back exact match scores ``EFF - slope·dist``
+    # and fades to the softmax1 sink once ``dist > EFF/slope``.  For the STACK / LI heads
+    # that horizon is load-bearing (latest-write-wins among SAME-address stores).  But the
+    # CODE frames are STATIC: exactly ONE code frame per PC (never re-emitted, never
+    # superseded), so there are NO same-address ties for recency to break — the code-CAM
+    # needs a PURE address match with NO distance decay.  With slope=1.0 the code fetch
+    # FADED once the query row crossed ~500000 tokens (doom step ~15,574 at token 500,746),
+    # so ``EFF - dist ≈ 0`` tipped below the sink -> the op didn't decode -> IS_POP unset ->
+    # the stack-pop CAM applied its -PEN gate and returned ZFOD -> the SI desynced.  Setting
+    # the code-CAM ALiBi slope to 0 removes the horizon (byte-exact: the address match is
+    # unique per PC), so the program fetches cleanly at ANY stream depth.  Kill-switch:
+    # ``C4_CODE_CAM_SLOPE`` overrides the slope (default 0.0); set to MEM_ALIBI_SLOPE to
+    # restore the pre-fix behaviour.
+    import os as _oscs
+    _cs = _oscs.environ.get("C4_CODE_CAM_SLOPE")
+    attn.alibi_slopes[head] = float(_cs) if _cs is not None else 0.0
     HD = attn.head_dim
     base = head * HD
     n_val = 1 + IMM_NIBS

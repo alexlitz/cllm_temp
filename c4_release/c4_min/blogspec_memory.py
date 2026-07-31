@@ -119,11 +119,18 @@ from .blogspec_model import Transformer
 #     extremely significant positional bias"), while the small ``MEM_ALIBI_SLOPE``
 #     only has to separate stores to the SAME address, which are ≥ one 30-token
 #     frame apart, so ``slope·30`` decisively favours the newer (latest-write-wins).
+import os as _os_bm
 ADDR_BITS = 32           # 4-byte aligned 32-bit addresses (§Memory)
-EFF = 500000.0           # post-scale per-bit match contribution (huge, §410); raised
-                         # 40k->500k (deep-recursion fix e52ab0c5) so the final LEV of a
-                         # deep recursion (rec_fib(12) store->load gap 250,839 tokens)
-                         # reads weight ~1 instead of fading to ZFOD 0.
+# EFF sets the recall HORIZON = EFF/slope tokens (a far-back exact-address match scores
+# ``EFF - slope·dist`` and fades to the softmax1 sink once ``dist > EFF/slope``).  Raised
+# 40k->500k (deep-recursion fix e52ab0c5) for rec_fib(12)'s 250,839-token LEV gap.  WALL#6:
+# doom's ~893,000-token stream (29,754 steps × 30) READS its data-segment map bytes (stored
+# at frame 0) via LC ~516,000+ tokens later — PAST the 500,000 horizon -> the LC faded to
+# ZFOD 0 (step 16,224).  ``C4_MEM_EFF`` overrides EFF so the horizon covers the FULL doom
+# stream; DEFAULT 500000 -> byte-IDENTICAL to golden (the corpus's deepest gap is 250,839 <
+# 500,000).  Raising EFF is recency-SAFE: the latest-write-wins margin is ``exp(slope·Δ)``
+# (Δ ≥ 1 frame = 30 tokens), INDEPENDENT of EFF — only the horizon scales.
+EFF = float(_os_bm.environ.get("C4_MEM_EFF", "500000.0"))
 BIAS = (ADDR_BITS - 1) * EFF   # constant subtracted from load↔store pairs (ZFOD)
 # Recency slope. Two constraints (§410 decoupling): (a) ``slope·Δ`` must decisively
 # prefer the newer of two same-address stores — the driver spaces store rows one

@@ -16,24 +16,42 @@ DOOM_CBG (content-bound-global 0/1, default 0 -> code frames persist), N_STEPS_C
 DOOM_PRIME_CHUNK (leading-context prime chunk, default 2048), DOOM_EVICT_INTERVAL,
 DOOM_EVICT (0/1).  Use C4_EXACT_EVICT=1 for the conservative eviction schedule.
 
-RESULT (2026-07-31, C4_PF_CFM):
-  * BUILD: doom (3976 instrs) builds at a FIXED dim=1392 (== the 64-instr model),
-    peak RSS 1.7 GB, 8 s, model VRAM ~0.01 GB — vs the baked >110 GB (never finished).
-    The residual dim is now INDEPENDENT of code_size (the scale wall is broken).
-  * CONTINUOUS MODEL RUN: the MODEL forward (verify_blocks over the draft) accepts
-    the first 15,574 steps BYTE-EXACT vs the draft (== ./c4 mechanism), ~3.5-7 ms/step,
-    then DIVERGES at step 15,574 — an eviction-INDEPENDENT (identical step across the
-    cosine / plain-schedule / exact-evict policies, ±content-bound) MEMORY/STACK-CAM
-    recency miss: doom writes stack slot addr 200 **1,777 times**, and the pop at step
-    15,573 (which needs the store val 1048575 = 0xFFFFF = doom's IMM -1 at 5 nibbles)
-    reads a STALE store among the 1,777 -> wrong MUL operand -> AX 69868 != 361758375
-    -> SP desync.  This is ORTHOGONAL to code-from-memory: the code CAM fetches PC
-    correctly at EVERY step (pc + bp always MATCH at the mismatch; only sp/ax diverge).
-    It is the documented ADDRESS-CAM fidelity window at deep address reuse (memory note
-    project_self_emulation_cost_reality), a SEPARATE wall from wall #5 (build scale).
-  So: wall #5 (build scale) is SOLVED (fixed dim, builds + fits); the continuous MODEL
-  reaches 15,574 / 29,754 = 52.3% of the way to the first printf byte-exact before the
-  memory-CAM recency wall.  The DRAFT (free) reaches the first printf 7/7 byte-exact."""
+RESULT (2026-07-31, C4_PF_CFM — WALL #6 SOLVED, run with
+        ``C4_EXACT_EVICT=1 C4_MEM_EFF=2000000``):
+  * BUILD: doom (3976 instrs) builds at a FIXED dim=1416, ~9 s (scale wall #5 SOLVED).
+  * CONTINUOUS MODEL RUN: the MODEL forward (verify_blocks over the draft) now accepts
+    ALL 30,200 steps BYTE-EXACT (accepted=30200/30200, matched=True), reaches the first
+    printf at step 29,754, and the MODEL EMITS 1b5b324a1b5b48 = 7/7 byte-exact vs
+    ``printf 'q' | ./c4 doom.c``.  ~18 ms/step, peak VRAM 23.2 GB (eff_K backed off to
+    25 under VRAM pressure).  THE WALL AT 15,574 IS BROKEN — doom runs continuously
+    byte-exact through ONE neural model to its first output.
+
+  WALL #6 root cause (three composed fixes, all additive, golden 069cc32f UNCHANGED):
+    (A) ``store_row_position`` OMITTED ``code_off`` in CFM mode -> the schedule/exact-evict
+        eviction dropped the WRONG cache rows (off by code_off=3976) -> exact-evict
+        diverged at step 431.  FIXED (nibble_evict_schedule.py): add code_off; now
+        exact-evict is byte-exact + SCALABLE (the O(S^2) cosine cdist OOMs at doom scale).
+    (B) The CODE-fetch CAM had ALiBi recency slope=1.0 -> a recall HORIZON of EFF/slope =
+        500,000 tokens.  The code frames sit at the START of the stream, so once the query
+        row crossed ~500,000 tokens (doom step ~15,574 at token 500,746) the code fetch
+        FADED to the softmax1 sink -> the op didn't decode -> IS_POP unset -> the stack-pop
+        CAM applied its -PEN_GATE and returned ZFOD -> the SI/pop desynced (the "stale MUL
+        operand"/AX-69868 symptom).  The code frames are UNIQUE per PC (no same-address
+        ties for recency to break), so slope=0 is byte-exact.  FIXED
+        (nibble_pure_forward_complete._bake_code_cam_head): code-CAM slope 1.0 -> 0.0
+        (kill-switch C4_CODE_CAM_SLOPE).  This alone advanced doom 15,574 -> 16,224.
+    (C) The MEM/STACK CAM's EFF=500,000 gave a 500,000-token recall horizon; doom's
+        ~893,000-token stream READS its data-segment map bytes (stored at frame 0) via LC
+        ~516,000+ tokens later -> PAST the horizon -> ZFOD 0 (step 16,224).  FIXED
+        (blogspec_memory.EFF via C4_MEM_EFF): raise EFF so the horizon covers the FULL
+        doom stream (2,000,000 tokens here).  Recency-SAFE: the latest-write-wins margin
+        exp(slope·Δ) is INDEPENDENT of EFF; only the horizon scales.  DEFAULT 500000 ->
+        byte-identical to golden (corpus deepest gap 250,839 < 500,000).
+    NOTES vs the original wall report: IMM_NIBS=8 does NOT move the divergence (rules out
+    IMM truncation — confirmed); the wall is eviction-INDEPENDENT (it reproduces with
+    eviction OFF); it is NOT a same-address stale-store SELECTION (the exact-address store
+    scored -PEN only because IS_POP was unset by the upstream code-fetch fade) — it is the
+    documented recall-HORIZON limit, now lifted for the whole doom stream."""
 import warnings; warnings.filterwarnings('ignore')
 import os, sys, time
 os.environ.setdefault('CUDA_VISIBLE_DEVICES','0')
@@ -41,6 +59,15 @@ os.environ.setdefault('OMP_NUM_THREADS','4')
 os.environ['C4_PF_CFM']='1'
 os.environ.setdefault('C4_DRAFT_CMP32','1')
 os.environ.setdefault('C4_MEM_ADDR_BITS','18')
+# WALL #6 fixes (composed so this reproduces the full byte-exact run out of the box):
+#   * C4_EXACT_EVICT=1  — byte-exact, SCALABLE eviction (the O(S^2) cosine cdist OOMs
+#     at doom scale); needs the store_row_position code_off fix (nibble_evict_schedule).
+#   * C4_MEM_EFF=2000000 — lift the §Memory recall HORIZON (EFF/slope) past doom's
+#     ~893,000-token stream so the data-segment LC reads don't fade to ZFOD (step 16,224).
+#   (The code-CAM slope=0 fix is default-ON in _bake_code_cam_head — kill-switch
+#    C4_CODE_CAM_SLOPE.)  All three leave golden 069cc32f UNCHANGED (gated / CFM-only).
+os.environ.setdefault('C4_EXACT_EVICT','1')
+os.environ.setdefault('C4_MEM_EFF','2000000')
 os.environ.setdefault('PYTORCH_ALLOC_CONF','expandable_segments:True')
 sys.path.insert(0,'/home/alexlitz/Documents/misc/c4_doom')
 import torch

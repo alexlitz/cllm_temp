@@ -993,6 +993,19 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 bad = (got_pc != want_pc or (got_ax & mask) != want_ax
                        or got_sp != want_sp or got_bp != want_bp)
             if bad:
+                # WALL#6 DIAG (C4_WALL6_DIAG=1, additive/inert by default): decode the
+                # model's STACK0 (pop operand) + all mem/pop register bands at the
+                # mismatch so we can localize the address-CAM stale read.
+                import os as _osd
+                if _osd.environ.get("C4_WALL6_DIAG", "0") == "1" and stats is not None:
+                    try:
+                        stk = _decode_reg_from_nibbles(state, L, L.STACK0)
+                    except Exception:
+                        stk = None
+                    fr_ = draft.frames[s]
+                    stats["diag_stack0_model"] = stk
+                    stats["diag_stk_draft"] = fr_.get("stk")
+                    stats["diag_op"] = fr_.get("op")
                 cache_now = max(max_cache, caches[0].size())
                 evicted_now = sum(c.total_evicted for c in caches)
                 vram_gb = peak_vram / (1024 ** 3)
