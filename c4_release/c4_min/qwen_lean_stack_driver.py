@@ -255,6 +255,7 @@ def speculative_run_lean_stack(lean: LeanQwenVM, code: List[isa.Instr], *,
             naive_forwards=n, speedup=1.0, accepted=n, detail="naive-fallback")
 
     QL, L = lean.QL, lean.QL.L
+    n_code = len(code) if lean.code_from_memory else 0
     n_steps = len(draft.steps)
     ax_trace: List[int] = []
     forwards = 0
@@ -274,7 +275,8 @@ def speculative_run_lean_stack(lean: LeanQwenVM, code: List[isa.Instr], *,
         forwards += 1
         for i, st in enumerate(slab):
             n_store = len(st["store_log"]) if lean.subset.memory else 0
-            qrow = (1 + n_store) + len(CAM_REGS)
+            # BOS + stores + [code frames] + 5 regs + STEP_END (n_code>0 in CFM mode).
+            qrow = (1 + n_store + n_code) + len(CAM_REGS)
             state = hidden[i, qrow]
             ax = lean.decode_ax(state, st["op"]) & 0xFF
             ax_trace.append(ax)
