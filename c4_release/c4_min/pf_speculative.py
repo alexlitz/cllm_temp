@@ -40,13 +40,36 @@ byte-for-byte what the token-by-token KV-cached driver produces (spot-checked in
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
+
+def _draft_cmp32() -> bool:
+    """DRAFT cmp/shift OPERAND width selector.  DEFAULT OFF (``C4_DRAFT_CMP32`` unset)
+    -> the historical 8-bit cmp/bitwise draft (``v & 0xFF``), byte-identical to every
+    prior corpus draft (the 1096/edge corpus operands are all < 256).  ON
+    (``C4_DRAFT_CMP32=1``) -> the draft compares the FULL 32-bit SIGNED operands
+    (``s32(pop_val)`` vs ``s32(ax)``), matching the MODEL's 32-bit signed cmp
+    (proven byte-exact vs the model in ``_agent_cmp_width_probe`` / ``_agent_cmp_signed_probe``:
+    255<256, 2048<=0, x>=0 all model-correct).  REQUIRED for programs whose loop
+    counters / operands cross the byte boundary (doom's ``i < CIRC==256`` init loops):
+    the 8-bit draft mis-decodes ``2048 <= 0`` as true (2048&0xFF==0) and never exits,
+    diverging from the model which correctly halts the loop.  Additive + gated: OFF
+    reproduces the exact old draft, so the whole existing corpus is byte-identical."""
+    return os.environ.get("C4_DRAFT_CMP32", "0") == "1"
+
+
+def _s32(v: int) -> int:
+    """Interpret ``v`` as a signed 32-bit two's-complement integer (C4's ``int``)."""
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
 from . import isa
 from . import blogspec_vocab as V
+from . import nibble_filesys as _FS   # OPEN/READ/CLOS/PRTF via the TOOL_CALL boundary
 from .nibble_pure_forward import (
     N_ROLES, _snap_lane, _FRAME_ROLE_SLOTS, _MEM_MARKER_LOCAL, _address_bits,
 )
@@ -199,7 +222,9 @@ _IMM_MASK = (1 << (4 * IMM_NIBS)) - 1       # 20-bit literal band (IMM_NIBS=5 ni
 
 
 def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
-                     mask: int = 0xFFFFFFFF) -> PFDraft:
+                     mask: int = 0xFFFFFFFF,
+                     data_seg: Optional[Dict[int, int]] = None,
+                     fio=None) -> PFDraft:
     """Run the MODEL's ISA transition and materialise the per-step 30-token frame
     stream + store_log — the exact token stream the pure-forward DRIVER emits.
 
@@ -209,33 +234,54 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     writes) so the drafted store_log is byte-identical to what the driver records.
 
     The transition matches the MODEL (not ``ref_interpret``):
-      * IMM keeps the full literal ``imm & _IMM_MASK`` (20-bit nibble band), NOT
-        ``imm & 0xFF`` — the model's ``compile_imm_ax_nibbles`` writes all fetched
+      * IMM keeps the full literal ``imm & _IMM_MASK`` (5- or 8-nibble band; see
+        ``C4_IMM_NIBS``) — the model's ``compile_imm_ax_nibbles`` writes all fetched
         nibbles;
       * LEA is folded to 8 bits (``compile_ax_byte_to_nibbles`` + ``_fold_ax_gated``);
-      * ADD/SUB/MUL/DIV/MOD are 32-bit (``mask``); cmp/bitwise are 8-bit;
+      * ADD/SUB/MUL/DIV/MOD are 32-bit (``mask``); cmp/bitwise are 8-bit by default,
+        or 32-bit signed under ``C4_DRAFT_CMP32`` (matching the model);
       * PSH/JSR/ENT/SI stores carry the full 32-bit AX (the KV memory value band).
+
+    ``data_seg`` ({addr: byte}) is the compiled program's DATA segment (string
+    literals etc.).  The driver (``run_pure_forward_cached``) seeds it as LEADING
+    KV store frames so a LC/LI from a data address recalls the byte before step 0;
+    the draft replicates that exactly (leading store frames + store_log entries)
+    so its own ``mem`` and the drafted stream/store_log the verifier feeds the model
+    agree.  ``None`` (default) -> no data segment (byte-identical to the old draft).
     """
     SP_INIT = _PFC.SP_INIT
+    cmp32 = _draft_cmp32()               # 32-bit signed cmp draft (default OFF)
     mem: Dict[int, int] = {}
     sp = bp = SP_INIT
     ax = pc = 0
-    # The driver's stream is [BOS] + init_frame, then one appended frame per step
-    # EXCEPT the HALT step's frame (the driver breaks BEFORE the append).  The init
-    # frame IS a real stream frame (frame_idx 0), so tokens must include it or every
-    # later position shifts by 30.
-    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
-    tokens: List[int] = [V.BOS] + init_frame
-    frames: List[Dict[str, int]] = []
+    # DATA-SEGMENT seed (leading KV store frames), matching run_pure_forward_cached:
+    # each data byte becomes one leading store frame recorded in store_log at frame
+    # idx k, and the init frame then sits at frame idx n_seed.  The draft's own `mem`
+    # is seeded too so a LC/LI reads the byte.
+    seed_frames: List[int] = []
     store_log: Dict[int, Tuple[int, int]] = {}
+    for k, (addr, val) in enumerate(sorted((data_seg or {}).items())):
+        a32, v32 = addr & 0xFFFFFFFF, val & 0xFFFFFFFF
+        seed_frames += _build_frame(0, 0, SP_INIT, SP_INIT, 0,
+                                    mem_addr=a32, mem_val=v32)
+        store_log[k] = (a32, v32)
+        mem[a32] = v32
+    n_seed = len(store_log)
+    # The driver's stream is [BOS] + seed_frames + init_frame, then one appended
+    # frame per step EXCEPT the HALT step's frame (the driver breaks BEFORE the
+    # append).  The init frame IS a real stream frame (frame_idx n_seed), so tokens
+    # must include it or every later position shifts by 30.
+    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+    tokens: List[int] = [V.BOS] + seed_frames + init_frame
+    frames: List[Dict[str, int]] = []
     load_log: Dict[int, int] = {}               # frame_idx -> loaded address (LI/LC)
     win_starts: List[int] = []
     out: List[int] = []                         # PRTF visible-output bytes
     prtf_steps: List[int] = []                  # step indices emitting a PRTF byte
     read_log: Dict[int, List[Tuple[str, int]]] = {}  # frame_idx -> [(head, addr), ...]
     stk = 0                                     # STACK0 mirror (MEM_VAL of a frame)
-    stream_len = len(tokens)                    # == 31 (BOS + init frame)
-    frame_idx = 0                               # init frame is frame 0
+    stream_len = len(tokens)                    # == 1 + n_seed*30 + 30
+    frame_idx = n_seed                          # init frame is frame n_seed
     halted = False
     steps = 0
     cur_pc, cur_sp, cur_bp = 0, SP_INIT, SP_INIT
@@ -256,6 +302,51 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         # (query=SP, or BP on LEV), "lev" = the LEV return-PC head (query=BP+4).  The
         # resolver maps each to its latest superseding store row for the direct gather.
         read_addrs: List[Tuple[str, int]] = []
+        # --- FILE OP (OPEN/READ/CLOS/PRTF): §Tool Use Mode.  When a ``fio`` is given
+        # the DRIVER services the whole op via the TOOL_CALL runner (the compiler-ABI
+        # dispatcher for the c4-compiler stack layout), exactly as run_pure_forward_cached
+        # does: it reads the args from the store_log, runs the op (printf appends the
+        # FORMATTED bytes to fio.runner.stdout; read lays the input bytes into memory),
+        # and returns (new_ax, new_sp, byte_stores).  The byte_stores become their OWN
+        # leading §Memory KV store frames (a later LC(addr) recalls the read byte).  This
+        # makes the draft reproduce the driver's I/O stream byte-for-byte — needed for
+        # doom's multi-arg printf("%c[2J%c[H", ESC, ESC) (7 stdout bytes, NOT 1). ------
+        if fio is not None and op in _FS.FILE_OPCODES:
+            new_ax, new_sp, byte_stores = _FS.dispatch_file_op_driver(
+                op, ax & 0xFFFFFFFF, imm, cur_sp, store_log, fio,
+                data_seg=data_seg, slot=4)
+            pc = cur_pc + 1                       # file ops advance PC by one (no branch)
+            sp = new_sp
+            bp = cur_bp
+            ax = new_ax & 0xFFFFFFFF
+            if op == isa.PRTF:
+                prtf_steps.append(len(frames))
+            # the primary register frame for this step, then one store frame per byte
+            # the op wrote to VM memory (READ's input bytes).
+            frames.append({"pc": pc, "ax": ax & mask, "sp": sp & 0xFFFFFFFF,
+                           "bp": bp & 0xFFFFFFFF, "stk": stk & 0xFFFFFFFF,
+                           "op": isa.NAMES.get(op, op), "is_store": False,
+                           "s_addr": 0, "s_val": 0, "is_halt": False,
+                           # §Tool Use Mode: the model's registers at a FILE-op row are
+                           # MEANINGLESS (the DRIVER services the op + overrides them), so
+                           # verify_blocks must NOT check them against these driver-side
+                           # post-dispatch values (e.g. PRTF's return = #bytes printed).
+                           "is_file": True})
+            win_starts.append(stream_len - 1)
+            frame_idx += 1
+            tokens += _build_frame(pc, ax, sp, bp, stk)
+            stream_len += V.FRAME_LEN
+            for (baddr, bval) in byte_stores:
+                frame_idx += 1
+                store_log[frame_idx] = (baddr & 0xFFFFFFFF, bval & 0xFF)
+                tokens += _build_frame(pc, ax, sp, bp, stk,
+                                       mem_addr=baddr & 0xFFFFFFFF, mem_val=bval & 0xFF)
+                stream_len += V.FRAME_LEN
+            cur_pc, cur_sp, cur_bp = pc, sp, bp
+            if not (0 <= pc < len(code)):
+                halted = (pc < 0 or pc >= len(code))
+                break
+            continue
         # --- the MODEL's transition (32-bit; IMM keeps the full nibble literal) --
         if op == isa.IMM:
             ax = imm & _IMM_MASK              # full 20-bit literal (model, not &0xFF)
@@ -291,9 +382,20 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
                 ax = (v >> ax) & 0xFF
         elif op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE):
             read_addrs.append(("pop", sp))    # stack head reads MEM[sp]
-            pop_val = mem.get(sp, 0); v = pop_val & 0xFF; sp += 4
-            r = {isa.EQ: v == ax, isa.NE: v != ax, isa.LT: v < ax,
-                 isa.GT: v > ax, isa.LE: v <= ax, isa.GE: v >= ax}[op]
+            pop_val = mem.get(sp, 0); sp += 4
+            if cmp32:
+                # 32-bit SIGNED cmp (matches the model; needed for operands > 255,
+                # e.g. doom's `i < CIRC==256` loop counters).  EQ/NE compare the full
+                # 32-bit words; the ordering ops compare the two's-complement signed
+                # integers.
+                a32, v32 = ax & 0xFFFFFFFF, pop_val & 0xFFFFFFFF
+                sa, sv = _s32(a32), _s32(v32)
+                r = {isa.EQ: v32 == a32, isa.NE: v32 != a32, isa.LT: sv < sa,
+                     isa.GT: sv > sa, isa.LE: sv <= sa, isa.GE: sv >= sa}[op]
+            else:
+                v = pop_val & 0xFF
+                r = {isa.EQ: v == ax, isa.NE: v != ax, isa.LT: v < ax,
+                     isa.GT: v > ax, isa.LE: v <= ax, isa.GE: v >= ax}[op]
             ax = 1 if r else 0
         elif op in (isa.LI, isa.LC):
             # The §Memory KV head relays ALL value nibbles the matching store wrote
@@ -318,7 +420,16 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         elif op == isa.BNZ:
             pc = imm if ax != 0 else pc
         elif op == isa.JSR:
-            sp -= 4; mem[sp] = (i + 1) & 0xFF; pc = imm
+            # The return PC is stored to KV memory (store_log s_val) at the FULL
+            # 32-bit width (see the store bookkeeping below), and the model's LEV
+            # recalls it from that KV row — so the draft's own ``mem`` must carry the
+            # full PC too, else a LEV returning to a >255 address (any program with
+            # >256 instructions, e.g. doom) reads a truncated PC and diverges.  The
+            # 8-bit form is preserved when cmp32 is OFF (the corpus is < 256 instrs,
+            # so ``& 0xFF`` == the full PC there -> byte-identical).
+            sp -= 4
+            mem[sp] = (i + 1) & (0xFFFFFFFF if cmp32 else 0xFF)
+            pc = imm
         elif op == isa.ENT:
             mem[sp - 4] = bp & 0xFFFFFFFF; sp -= 4; bp = sp; sp -= 4 * imm
         elif op == ADJ:
@@ -768,7 +879,17 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             # The HALT step emits NO frame (the driver breaks before the append) — it
             # only reads the final AX (the answer).  HALT leaves pc un-incremented in
             # the model (the draft advanced pc past it), so verify ONLY the AX there.
-            if fr.get("is_halt"):
+            if fr.get("is_file"):
+                # §Tool Use Mode: the DRIVER services OPEN/READ/CLOS/PRTF and OVERRIDES
+                # the model's registers for this row (the model never runs the printf /
+                # read).  The draft's frame carries the DRIVER's post-dispatch registers
+                # (e.g. PRTF's AX = #bytes printed = 7, not the on-top ESC=27 the model
+                # still shows), so verifying the model's decoded registers here is a
+                # false mismatch.  The output byte(s) are already produced by the draft's
+                # own compiler-ABI FileRunner (fio.runner.stdout), so this row is a
+                # driver-accepted no-op for speculation.
+                bad = False
+            elif fr.get("is_halt"):
                 bad = ((got_ax & mask) != want_ax)
             else:
                 bad = (got_pc != want_pc or (got_ax & mask) != want_ax
