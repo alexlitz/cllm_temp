@@ -429,6 +429,11 @@ def run_program_lean_evict_graphed(
         pc, ax, sp, bp, stk = bs.snap_many(
             state[[L.PC_VAL, L.AX_VAL, L.SP_VAL, L.BP_VAL, L.STK_VAL]])
         ax &= 0xFF
+        # efficient-ALU MUL/DIV/MOD (+SHL/SHR under shift_via_mul) write the result to
+        # the AX NIBBLE band (the scalar AX_VAL is the stale popped operand), so re-decode
+        # AX from the nibbles for those ops (the batched snap stays for the 4 other lanes).
+        if op in lean._nib_ax_ops():
+            ax = lean.decode_ax(state, op) & 0xFF
         halted = float(state[L.HALTED]) > 0.5
 
         if op == isa.JSR:

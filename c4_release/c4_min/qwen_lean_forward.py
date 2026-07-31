@@ -50,10 +50,18 @@ from . import isa
 from . import blogspec_vocab as V
 from .blogspec_layout import NIB_PER_REG
 from .nibble_pure_forward import SP_INIT
+from .nibble_pure_forward_complete import _decode_reg_from_nibbles
 from .qwen_full_vm import (
     QwenFullVM, CAM_REGS, _REG_TOKEN, _snap, _address_bits, _signed_imm,
     _overlay_code_frames, _overlay_fetch_query,
 )
+
+# The efficient-ALU ops whose AX result is written to the AX NIBBLE band (the full
+# fp32 32-bit result), NOT the scalar AX_VAL — so the driver MUST decode their AX
+# from the nibbles (residue-immune per-byte argmax), exactly as ``qwen_full_vm.
+# run_program`` does.  Reading AX_VAL for these ops returns a STALE value (the popped
+# second operand), which is why the lean driver decoded ``12 MUL 7 -> 7`` not 84.
+_NIB_AX_OPS_BASE = frozenset({isa.MUL, isa.DIV, isa.MOD})
 
 
 # ===========================================================================
@@ -252,6 +260,30 @@ class LeanQwenVM:
     subset: object
     inv_freq: torch.Tensor = field(default=None)
     code_from_memory: bool = False          # program in KV §Memory (fetch@PC), not baked
+    efficient_alu: bool = False             # native fp32 MUL/DIV/MOD gadgets present
+    shift_via_mul: bool = False             # SHL/SHR routed through the MUL/DIV gadgets
+
+    # ------------------------------------------------------------------
+    def _nib_ax_ops(self) -> frozenset:
+        """The ops whose AX must be decoded from the NIBBLE band (the efficient-ALU
+        MUL/DIV/MOD, plus SHL/SHR when routed through the MUL/DIV gadgets)."""
+        if not self.efficient_alu:
+            return frozenset()
+        ops = _NIB_AX_OPS_BASE
+        if self.shift_via_mul:
+            ops = ops | {isa.SHL, isa.SHR}
+        return ops
+
+    def decode_ax(self, state: torch.Tensor, op, mask: int = 0xFF) -> int:
+        """Decode AX from the model output ``state`` (hidden[row]) EXACTLY as
+        ``qwen_full_vm.run_program`` does: for the efficient-ALU nibble-band ops
+        (MUL/DIV/MOD, +SHL/SHR under shift_via_mul) the full 32-bit result lives in
+        the AX NIBBLE band -> per-byte argmax decode (residue-immune) & ``mask``;
+        every other op reads the scalar AX_VAL byte."""
+        L = self.QL.L
+        if op in self._nib_ax_ops():
+            return _decode_reg_from_nibbles(state, L, L.AX) & mask
+        return _snap(state[L.AX_VAL]) & 0xFF
 
     # ------------------------------------------------------------------
     @classmethod
@@ -296,7 +328,9 @@ class LeanQwenVM:
             n_heads=cfg.num_attention_heads, n_kv_heads=cfg.num_key_value_heads,
             head_dim=head_dim, rope_theta=cfg.rope_theta, rms_eps=cfg.rms_norm_eps,
             device=dev, dtype=dtype, QL=vm.QL, subset=vm.subset, inv_freq=inv_freq,
-            code_from_memory=vm.code_from_memory)
+            code_from_memory=vm.code_from_memory,
+            efficient_alu=getattr(vm, "efficient_alu", False),
+            shift_via_mul=getattr(vm, "shift_via_mul", False))
 
     # ------------------------------------------------------------------
     # LEAN forward — RoPE + RMSNorm + softmax + SwiGLU, no HF machinery.
@@ -511,7 +545,11 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
         state = hidden[0, -1]
 
         pc = _snap(state[L.PC_VAL])
-        ax = _snap(state[L.AX_VAL]) & 0xFF
+        # AX decode: the efficient-ALU MUL/DIV/MOD (+SHL/SHR under shift_via_mul) write
+        # the FULL 32-bit result to the AX NIBBLE band (the scalar AX_VAL holds the
+        # STALE popped operand), so decode those from the nibbles — byte-identical to
+        # qwen_full_vm.run_program's decode.  Every other op reads the AX_VAL byte.
+        ax = lean.decode_ax(state, op) & 0xFF
         sp = _snap(state[L.SP_VAL])
         bp = _snap(state[L.BP_VAL])
         stk = _snap(state[L.STK_VAL])
@@ -848,7 +886,8 @@ def speculative_run_lean(lean: LeanQwenVM, code: List[isa.Instr], *,
             # BOS + stores + [code frames] + 5 regs + STEP_END.
             qrow = (1 + n_store + n_code) + len(CAM_REGS)
             state = hidden[i, qrow]
-            ax = _snap(state[L.AX_VAL]) & 0xFF
+            # decode this step's op AX (nibble band for MUL/DIV/MOD, AX_VAL otherwise).
+            ax = lean.decode_ax(state, st["op"]) & 0xFF
             ax_trace.append(ax)
             accepted += 1
     exact = ax_trace == ref_trace
