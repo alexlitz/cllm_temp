@@ -155,6 +155,28 @@ IMM_NIBS = int(_os.environ.get("C4_IMM_NIBS", "5"))
 
 
 # ===========================================================================
+# CODE-FROM-MEMORY (C4_PF_CFM, DEFAULT OFF) — the program lives in the KV as
+# address-keyed CODE frames, fetched at PC by a 12-bit-address softmax1 CAM,
+# so the per-slot residual bands (CODE_OP[i]/CODE_IMM[i]/CODE_IMM_LO/HI[i]/
+# PC_IS[i]/CODE_IMM_NIB[i]) are NOT baked — the residual dim becomes INDEPENDENT
+# of code_size (the doom scale wall).  CRITICAL: the CAM value copies the code
+# frame's op scalar -> OP_VAL AND its IMM_NIBS immediate NIBBLES -> IMM_NIB
+# (nibble-wise, NOT a mod-256 scalar), so the pure-forward 20-bit-IMM
+# materialization survives (literals > 255 / negative sign survive).  DEFAULT
+# OFF -> the baked-table build is byte-identical (golden 069cc32f unchanged).
+# ===========================================================================
+CODE_ADDR_BITS = 12          # 4096 code addresses (doom = 3976 instrs < 2^12)
+
+
+def _pf_cfm_enabled() -> bool:
+    """``C4_PF_CFM`` (DEFAULT OFF): fetch the instruction at PC from an
+    address-keyed §Memory CODE-frame CAM instead of the baked CODE_OP[i]/PC_IS[i]
+    table, so the residual dim no longer scales with ``code_size``.  OFF -> the
+    baked table build is byte-IDENTICAL to golden."""
+    return _os.environ.get("C4_PF_CFM", "0") not in ("0", "", "false", "False")
+
+
+# ===========================================================================
 # The op groups (the stack contract).
 # ===========================================================================
 # POP-consuming ops: pop the stack top MEM[SP] into STACK0, op(STACK0, AX), SP+=4.
@@ -227,6 +249,24 @@ class PureForwardCompleteLayout(PureForwardLayout):
             self.UNI_QRY_BIN = self._band("UNI_QRY_BIN", ADDR_BITS)  # muxed read addr
             self.UNI_VAL = self._band("UNI_VAL", _NPR)               # merged read value
             self.IS_MEMREAD = self._scalar("IS_MEMREAD")            # IS_LOAD OR IS_POP
+        # CODE-FROM-MEMORY (C4_PF_CFM, DEFAULT OFF): the FIXED (code_size-independent)
+        # code-fetch CAM key/query + value bands.  When on, the layout is built with a
+        # SINGLE vestigial per-slot table (code_size=1) and the program lives in these
+        # code frames instead (the fetch@PC CAM), so the residual dim no longer scales
+        # with the program length.  OFF -> these bands are absent -> byte-identical.
+        self.CODE_KEY_BIN = self.CODE_QRY_BIN = None
+        self.CODE_OPV = self.IS_CODE = self.IS_FETCH = None
+        self.CODE_IMM_NIB_MEM = None
+        self.cfm = _pf_cfm_enabled()
+        if self.cfm:
+            self.CODE_KEY_BIN = self._band("CODE_KEY_BIN", CODE_ADDR_BITS)  # instr addr i (KEY)
+            self.CODE_QRY_BIN = self._band("CODE_QRY_BIN", CODE_ADDR_BITS)  # current PC (QUERY)
+            self.CODE_OPV = self._scalar("CODE_OPV")     # code-frame op (VALUE -> OP_VAL)
+            # the code frame's IMMEDIATE as IMM_NIBS nibbles (VALUE -> IMM_NIB): the
+            # nibble-wise fetch that KEEPS the 20-bit IMM (NOT a mod-256 scalar).
+            self.CODE_IMM_NIB_MEM = self._band("CODE_IMM_NIB_MEM", IMM_NIBS)
+            self.IS_CODE = self._scalar("IS_CODE")       # code-frame flag (KEY gate)
+            self.IS_FETCH = self._scalar("IS_FETCH")     # fetch-query flag (QUERY gate)
         while self._off % n_heads != 0:
             self._scalar(f"_pfcpad{self._off}")
         self.D = self._off
@@ -467,6 +507,72 @@ def _bake_cam_head(attn, L, head: int, qry_band: int, enable_flag: int,
     for j in range(NIB_PER_REG):
         attn.W_v[base + ADDR_BITS + 3 + j, L.VAL_NIB + j] = 1.0
         attn.W_o[value_dest + j, base + ADDR_BITS + 3 + j] = 1.0
+
+
+# ===========================================================================
+# CODE-FROM-MEMORY (C4_PF_CFM): the code-fetch CAM head.  The SAME softmax1 binary-
+# address CAM as ``_bake_cam_head``, but keyed on the CODE frames (KEY =
+# ``CODE_KEY_BIN`` = instruction address i, gated ``IS_CODE``; QUERY =
+# ``CODE_QRY_BIN`` = current PC, gated ``IS_FETCH``) and delivering the code frame's
+# op scalar -> ``OP_VAL`` and its IMM_NIBS immediate NIBBLES -> ``IMM_NIB`` (the
+# nibble-wise fetch that PRESERVES the 20-bit IMM — NO mod-256 scalar fold).  Every
+# code address appears at MOST once, so no recency tiebreak is needed.  Store frames
+# (``IS_STORE``) are pushed FAR below the sink so the two logs never collide.
+# ===========================================================================
+def _bake_code_cam_head(attn, L: PureForwardCompleteLayout, head: int) -> None:
+    """Bake the code-fetch CAM on ``attn`` head ``head`` (fetch mem_code[PC]).
+
+    Structurally identical to ``_bake_cam_head`` (per-bit address agreement +
+    ZFOD-bias + read-enable gate), on the CODE_ADDR_BITS-wide code address, with a
+    store-frame exclusion channel.  VALUE copies ``CODE_OPV`` -> ``OP_VAL`` and each
+    ``CODE_IMM_NIB_MEM[j]`` -> ``IMM_NIB[j]`` (nibble-wise -> 20-bit IMM survives)."""
+    from .blogspec_memory import EFF, BIAS, MEM_ALIBI_SLOPE, PEN_GATE
+    hs = attn.scale
+    smag = (EFF / hs) ** 0.5
+    # ZFOD bias for the CODE_ADDR_BITS-wide match (BIAS is authored for ADDR_BITS=32;
+    # scale it to the 12-bit code address so an EXACT match nets +EFF and any 1-bit
+    # mismatch nets < 0 -> softmax1's +1 sink gives 0 on a non-fetch / no-such-addr).
+    qb = kb = (BIAS * (CODE_ADDR_BITS - 1) / (ADDR_BITS - 1) / hs) ** 0.5
+    PEN = PEN_GATE
+    p = (PEN / hs) ** 0.5
+    attn.alibi_slopes[head] = MEM_ALIBI_SLOPE
+    HD = attn.head_dim
+    base = head * HD
+    n_val = 1 + IMM_NIBS
+    assert HD >= CODE_ADDR_BITS + 4 + n_val, (
+        f"code CAM needs head_dim >= {CODE_ADDR_BITS + 4 + n_val}, got {HD}")
+    # per-bit address agreement: q_b = smag*(2*QRY_BIN[b]-ONE), k_b = smag*(2*KEY_BIN[b]-ONE)
+    # gated so a NON-fetch query (IS_FETCH=0) and a non-code frame (IS_CODE=0) score 0.
+    for b in range(CODE_ADDR_BITS):
+        attn.W_k[base + b, L.CODE_KEY_BIN + b] = 2.0 * smag
+        attn.W_k[base + b, L.IS_CODE] = -smag
+        attn.W_q[base + b, L.CODE_QRY_BIN + b] = 2.0 * smag
+        attn.W_q[base + b, L.IS_FETCH] = -smag
+    cB = base + CODE_ADDR_BITS               # ZFOD bias (needs BOTH flags)
+    attn.W_q[cB, L.IS_FETCH] = -qb
+    attn.W_k[cB, L.IS_CODE] = kb
+    cR = base + CODE_ADDR_BITS + 1           # code-frame role penalty (non-code -> sink)
+    attn.W_q[cR, L.IS_FETCH] = p
+    attn.W_k[cR, L.ONE] = -p
+    attn.W_k[cR, L.IS_CODE] = p
+    cL = base + CODE_ADDR_BITS + 2           # FETCH-enable: non-fetch query -> sink
+    attn.W_q[cL, L.ONE] = p
+    attn.W_q[cL, L.IS_FETCH] = -p
+    attn.W_k[cL, L.ONE] = -p
+    # STORE-FRAME EXCLUSION: a store frame (IS_STORE=1) shares the token stream and
+    # would otherwise score at the sink (0); push it FAR below so store rows are
+    # INVISIBLE to the code CAM (the code and store logs never collide).
+    cX = base + CODE_ADDR_BITS + 3
+    if getattr(L, "IS_STORE", None) is not None:
+        attn.W_q[cX, L.ONE] = p
+        attn.W_k[cX, L.IS_STORE] = -p
+    # VALUE: op scalar -> OP_VAL ; immediate nibbles -> IMM_NIB (20-bit IMM survives).
+    v0 = base + CODE_ADDR_BITS + 4
+    attn.W_v[v0, L.CODE_OPV] = 1.0
+    attn.W_o[L.OP_VAL, v0] = 1.0
+    for j in range(IMM_NIBS):
+        attn.W_v[v0 + 1 + j, L.CODE_IMM_NIB_MEM + j] = 1.0
+        attn.W_o[L.IMM_NIB + j, v0 + 1 + j] = 1.0
 
 
 # ===========================================================================
@@ -735,6 +841,12 @@ def bake_global_cam_heads(blocks, L: PureForwardCompleteLayout, block_specs) -> 
         _bake_pf_memory_head(blocks[mem].attn, L, head=N_ROLES)
         _bake_stack_pop_head(blocks[stk].attn, L, head=N_ROLES + 1)
         _bake_lev_ret_head(blocks[stk].attn, L, head=N_ROLES + 2)
+    # CODE-FROM-MEMORY: bake the code-fetch CAM on the "code-select" block, on the
+    # LAST head index (past the 3 global CAM heads).  attn=code CAM; its FFN is a
+    # no-op (the CAM writes OP_VAL + IMM_NIB).
+    if _pf_cfm_enabled():
+        csel = _find(block_specs, "code-select")
+        _bake_code_cam_head(blocks[csel].attn, L, head=blocks[csel].attn.n_heads - 1)
 
 
 def cam_baked_blocks(block_specs) -> set:
@@ -742,10 +854,14 @@ def cam_baked_blocks(block_specs) -> set:
     builder marks them as dense-attn).  Depends on the active unify flag."""
     stk = _find(block_specs, "stack-pop-cam")
     if _unify_cam_one_enabled():
-        return {stk, _find(block_specs, "lev-cam2")}
-    if _unify_cam_head_enabled():
-        return {stk}
-    return {_find(block_specs, "mem-cam"), stk}
+        base = {stk, _find(block_specs, "lev-cam2")}
+    elif _unify_cam_head_enabled():
+        base = {stk}
+    else:
+        base = {_find(block_specs, "mem-cam"), stk}
+    if _pf_cfm_enabled():
+        base = base | {_find(block_specs, "code-select")}
+    return base
 
 
 # ===========================================================================
@@ -1125,6 +1241,64 @@ def compile_ax_byte_to_nibbles(L, dim: int, ops) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def _noop_spec(L, dim: int) -> Dict[str, torch.Tensor]:
+    """A single-unit no-op FFN (writes nothing) — used as the FFN of a cfm block
+    whose only job is to carry the code-fetch CAM head."""
+    spec = _empty_spec(dim, 1)
+    spec["W_up"][0, L.ONE] = 0.0
+    spec["W_gate"][0, L.ONE] = 0.0
+    return spec
+
+
+def compile_pc_fetch_cfm(L, dim: int) -> Dict[str, torch.Tensor]:
+    """CODE-FROM-MEMORY (C4_PF_CFM) pc-fetch: the fetch@PC *query* setup, replacing
+    the O(code_size) PC-one-hot table (``compile_pc_fetch``).
+
+    Computes:
+      * ``AX_ZERO = (AX == 0)`` (the BZ/BNZ predicate — still needed).
+      * ``CODE_QRY_BIN`` = bits(PC) from the PC nibble band (the CAM query address).
+      * ``IS_FETCH = 1`` (arms the code CAM every step).
+      * clears ``OP_VAL`` and ``IMM_NIB`` (SET), so the code CAM's additive write
+        (next block) lands cleanly on a zeroed lane.
+    NO PC one-hot is baked, so the residual dim is INDEPENDENT of code_size."""
+    from .nibble_vm import vm_two_limb
+    # CODE_QRY_BIN <- PC nibbles (first ceil(CODE_ADDR_BITS/4) nibbles suffice).
+    n_pc_nib = (CODE_ADDR_BITS + 3) // 4
+    qexp = compile_nibble_addr_expand(L, L.PC, L.CODE_QRY_BIN, dim, n_nibbles=n_pc_nib)
+    base_units = qexp["W_up"].shape[0]
+    # units: AX_ZERO(2: clear+ramp) + IS_FETCH(2: clear+set1) + clear OP_VAL(1)
+    #        + clear IMM_NIB band(IMM_NIBS)
+    spec = _empty_spec(dim, base_units + 2 + 2 + 1 + IMM_NIBS)
+    for k in ("W_up", "W_gate", "b_up"):
+        spec[k][:base_units] = qexp[k]
+    spec["W_down"][:, :base_units] = qexp["W_down"]
+    u = base_units
+    # AX_ZERO = relu(1 - AX_VAL)  (two-limb: relu(1 - AX_LO - AX_HI)).  Self-cleared
+    # first so it is idempotent across recurrent steps.
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.AX_ZERO] = 1.0
+    spec["W_down"][L.AX_ZERO, u] += -1.0 / SILU_S; u += 1
+    if vm_two_limb():
+        spec["W_up"][u, L.AX_LO] = -RELU_S
+        spec["W_up"][u, L.AX_HI] = -RELU_S
+    else:
+        spec["W_up"][u, L.AX_VAL] = -RELU_S
+    spec["b_up"][u] = RELU_S * 1.0
+    spec["W_gate"][u, L.ONE] = 1.0
+    spec["W_down"][L.AX_ZERO, u] += 1.0 / RELU_S; u += 1
+    # IS_FETCH := 1 (SET = self-clear then +1).
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.IS_FETCH] = 1.0
+    spec["W_down"][L.IS_FETCH, u] += -1.0 / SILU_S; u += 1
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.ONE] = 1.0
+    spec["W_down"][L.IS_FETCH, u] += 1.0 / SILU_S; u += 1
+    # clear OP_VAL + IMM_NIB band (SET, so the CAM writes cleanly next block).
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.OP_VAL] = 1.0
+    spec["W_down"][L.OP_VAL, u] += -1.0 / SILU_S; u += 1
+    for j in range(IMM_NIBS):
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.IMM_NIB + j] = 1.0
+        spec["W_down"][L.IMM_NIB + j, u] += -1.0 / SILU_S; u += 1
+    return spec
+
+
 def compile_imm_nib_fetch(L, dim: int) -> Dict[str, torch.Tensor]:
     """IMM_NIB[j] = Σ_i PC_IS[i]·CODE_IMM_NIB[i][j]  (j=0..7) — the same bilinear
     PC-one-hot product-select the scalar-IMM fetch uses, applied to the immediate's
@@ -1180,7 +1354,20 @@ def compile_imm_clean(L, dim: int) -> Dict[str, torch.Tensor]:
     # 3 low nibbles: signed 12-bit range [-2048, 2047] covers every corpus LEA/ENT/
     # ADJ slot offset (|·| <= a few) and every JSR PC target (< code_size).  Kept
     # small so the recompose coefficients (<= 16^3) do not amplify the silu residual.
-    n_nib = min(3, IMM_NIBS)
+    #
+    # LARGE-CODE (doom, code_size 3976): a JMP/JSR/branch PC target can EXCEED the
+    # 3-nibble signed range 2047 (doom's ``JMP 3652`` -> its top nibble 0xE>=8 would be
+    # mis-read as SIGN -> -444, corrupting the jump).  Widen ``n_nib`` so the SIGNED
+    # range ``[-2^(4n-1), 2^(4n-1))`` covers ``code_size`` positively — one more nibble
+    # per 4 address bits.  The corpus (code_size<=few-hundred, all targets<2047) keeps
+    # ``n_nib=3`` -> the golden IMM_CLEAN block is byte-IDENTICAL.  The extra-nibble
+    # coefficient (<= 16^3=4096) amplifies the silu ~1e-6 rel error to ~4e-3 absolute
+    # per cell (<< 0.5), so the recompose stays fp32-exact for the integer nibbles.
+    _tcs = getattr(L, "true_code_size", L.code_size)
+    _need = 1
+    while _tcs >= (1 << (4 * _need - 1)):        # signed top nibble -> range 2^(4n-1)
+        _need += 1
+    n_nib = min(max(3, _need), IMM_NIBS)
     thr = list(range(-1, 17))
     tu = {t: k for k, t in enumerate(thr)}
     n_thr = len(thr)
@@ -1293,8 +1480,15 @@ def build_pure_forward_complete_model(code_size: int = 32,
     # standalone mem-cam head but reuses its freed slot layout byte-identically.)
     _one = _unify_cam_one_enabled()
     _wide = ingest_wide_enabled()
+    _cfm = _pf_cfm_enabled()
+    # CODE-FROM-MEMORY adds ONE head (the code-fetch CAM); the per-slot table is
+    # vestigial (1 slot) since the program lives in the KV code frames.
     n_heads = (N_ROLES + 2) if _one else (N_ROLES + 3)
-    L = PureForwardCompleteLayout(code_size, n_heads=n_heads)
+    if _cfm:
+        n_heads += 1
+    pf_code_size = 1 if _cfm else code_size
+    L = PureForwardCompleteLayout(pf_code_size, n_heads=n_heads)
+    L.true_code_size = code_size            # the real program length (CAM addr space)
     if _wide:
         # 80 fresh dims (PREROUTE 40 + GATHER 40) for the 1-query/1-KV wide ingest.
         # Allocated BEFORE dim is fixed; flag-OFF this is never called ⇒ the golden
@@ -1349,12 +1543,25 @@ def build_pure_forward_complete_model(code_size: int = 32,
             ("wide-gather", compile_wide_rescale(L, reg_bases, dim)),
             ("wide-snap", compile_wide_nibble_snap(L, reg_bases, dim)),
         ]
+    # CODE-FROM-MEMORY (C4_PF_CFM): the fetch@PC is a KV code-frame CAM, NOT the
+    # O(code_size) baked PC-one-hot table.  pc-fetch sets the CAM query (CODE_QRY_BIN
+    # = bits(PC)) + AX_ZERO; code-select carries the code CAM head (attn) whose value
+    # writes OP_VAL + IMM_NIB (baked in ``bake_global_cam_heads``); imm-nib-fetch is a
+    # no-op (the CAM already delivered IMM_NIB).  Residual dim is code_size-independent.
+    if _cfm:
+        _pcf = compile_pc_fetch_cfm(L, dim)
+        _csel = _noop_spec(L, dim)          # attn = code CAM head; FFN no-op
+        _inf = _noop_spec(L, dim)           # CAM delivered IMM_NIB -> no fetch FFN
+    else:
+        _pcf = compile_pc_fetch(L, dim)
+        _csel = compile_code_select(L, dim)
+        _inf = compile_imm_nib_fetch(L, dim)
     block_specs: List[Tuple[str, Dict]] = wide_blocks + [
         ("ingest+recompose", compile_nibble_to_scalar(L, dim)),
-        ("pc-fetch",    compile_pc_fetch(L, dim)),
-        ("code-select", compile_code_select(L, dim)),
+        ("pc-fetch",    _pcf),
+        ("code-select", _csel),
         ("opcode-decode", compile_opcode_decode_pfc(L, dim)),  # + JSR/ENT/ADJ/LEV
-        ("imm-nib-fetch", compile_imm_nib_fetch(L, dim)),      # IMM_NIB <- CODE_IMM_NIB@PC
+        ("imm-nib-fetch", _inf),                               # IMM_NIB <- CODE_IMM_NIB@PC
         ("imm-clean", compile_imm_clean(L, dim)),              # IMM_CLEAN <- round(IMM_NIB)
         ("mem-prep", compile_mem_prep(L, dim)),
         ("mem-cam",  compile_nibble_to_scalar(L, dim)),          # ATTN=LI head (dropped if UNIFY)
@@ -1739,27 +1946,67 @@ def ref_interpret(code: List[isa.Instr], max_steps: int = 512,
 # BOTH the SI/SC program stores AND the stack pushes (PSH/JSR/ENT) — they are the
 # same kind of address-keyed write; the driver records (frame_idx -> (addr, val)).
 # ===========================================================================
+def _overlay_pf_code_frames(x, L, code: List[isa.Instr], base_pos: int = 1,
+                            row: int = 0) -> None:
+    """CODE-FROM-MEMORY: write the program into the KV as address-keyed CODE frames.
+
+    One frame per instruction i at ``x[row, base_pos + i]``: KEY = ``CODE_KEY_BIN``
+    = bits(i), VALUE = ``CODE_OPV`` (op) + ``CODE_IMM_NIB_MEM`` (the IMM_NIBS
+    immediate NIBBLES — 20-bit IMM preserved), gated ``IS_CODE=1``.  These PERSIST
+    (the address-keyed code memory the fetch CAM reads at PC), exactly like the
+    store log persists for LI/SI.  Guarded to the rows that actually exist so a
+    caller whose window omits the code rows (a short probe) is a no-op for the
+    missing frames."""
+    Sn = x.shape[1]
+    for i, ins in enumerate(code):
+        p = base_pos + i
+        if p >= Sn:
+            break
+        x[row, p, L.IS_CODE] = 1.0
+        x[row, p, L.IS_FRAME_BYTE] = 0.0
+        for b in range(CODE_ADDR_BITS):
+            x[row, p, L.CODE_KEY_BIN + b] = float((i >> b) & 1)
+        x[row, p, L.CODE_OPV] = float(ins.op)
+        for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+            x[row, p, L.CODE_IMM_NIB_MEM + j] = float(nv)
+
+
 def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
-                          store_log=None):
+                          store_log=None, frame_start: int = None):
     """``overlay(x)`` writes the program into the DATA bands at every position, the
     ROLE/IS_FRAME_BYTE frame-slot tags, and turns each stored frame's MEM token
     into a KV entry.  ``store_log`` maps ``frame_idx -> (addr, val)`` for every
-    emitted frame that wrote memory (a program store OR a stack push)."""
+    emitted frame that wrote memory (a program store OR a stack push).
+
+    CODE-FROM-MEMORY (C4_PF_CFM): the program lives in the KV as CODE frames on the
+    positions ``1 .. 1+len(code)`` (not in the per-position DATA bands), so the first
+    register/store frame begins at ``frame_start = 1 + len(code)``.  ``frame_start``
+    defaults to ``1`` (baked path, byte-identical) or ``1+len(code)`` under cfm."""
     store_log = store_log or {}
     from .blogspec_layout import NIB_PER_REG
+    _cfm = getattr(L, "cfm", False)
+    fstart = frame_start if frame_start is not None else (1 + len(code) if _cfm else 1)
 
     def overlay(x: torch.Tensor) -> None:
         Sn = x.shape[1]
         for i in range(Sn):
             x[0, i, L.ONE] = 1.0
-            for k, ins in enumerate(code):
-                x[0, i, L.CODE_OP[k]] = float(ins.op)
-                x[0, i, L.CODE_IMM[k]] = float(ins.imm)
-                # the immediate's low IMM_NIBS nibbles are part of the STATIC program
-                # encoding (a pure re-encoding of the constant, gathered at PC).
-                for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
-                    x[0, i, L.CODE_IMM_NIB[k] + j] = float(nv)
-        pos = 1
+            if not _cfm:
+                for k, ins in enumerate(code):
+                    x[0, i, L.CODE_OP[k]] = float(ins.op)
+                    x[0, i, L.CODE_IMM[k]] = float(ins.imm)
+                    # the immediate's low IMM_NIBS nibbles are part of the STATIC program
+                    # encoding (a pure re-encoding of the constant, gathered at PC).
+                    for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                        x[0, i, L.CODE_IMM_NIB[k] + j] = float(nv)
+        if _cfm:
+            # CODE-FROM-MEMORY: the program lives in the KV as address-keyed CODE
+            # frames on the leading positions after BOS.  Each is ONE row: IS_CODE=1,
+            # CODE_KEY_BIN=bits(addr i), CODE_OPV=op, CODE_IMM_NIB_MEM=imm nibbles.
+            # The fetch@PC query (IS_FETCH/CODE_QRY_BIN) is set by the pc-fetch FFN
+            # from the PC register — not here.  (Guarded to the available leading rows.)
+            _overlay_pf_code_frames(x, L, code, base_pos=1)
+        pos = fstart
         frame_idx = 0
         while pos + V.FRAME_LEN <= Sn:
             for local, role in _FRAME_ROLE_SLOTS.items():
@@ -1863,7 +2110,13 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
     # memory holds it before step 0; then BOS + the seed frames + the init frame.
     seed_frames, store_log = _seed_frames(seed_mem or {})
     n_seed = len(store_log)                        # number of leading data frames
-    stream: List[int] = [V.BOS] + seed_frames + init_frame
+    # CODE-FROM-MEMORY (C4_PF_CFM): the program lives in the KV as persistent CODE
+    # frames (one token per instruction, right after BOS).  The overlay writes their
+    # CODE_KEY_BIN/CODE_OPV/CODE_IMM_NIB_MEM bands; the token is a neutral MEM marker
+    # (IS_FRAME_BYTE=0 -> ingest ignores it; store CAM excludes IS_CODE rows).
+    _cfm = getattr(L, "cfm", False)
+    code_frame_toks: List[int] = [V.MEM] * len(code) if _cfm else []
+    stream: List[int] = [V.BOS] + code_frame_toks + seed_frames + init_frame
     vis_stream: List[int] = [V.BOS, V.THINK_START]
     trace: List[int] = []
     cur_pc = 0

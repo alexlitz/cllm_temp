@@ -75,7 +75,7 @@ from .nibble_pure_forward import (
 )
 from .nibble_pure_forward_complete import (
     PureForwardCompleteLayout, IMM_NIBS, _build_frame, _decode_reg_from_nibbles,
-    _mem_top, ADJ,
+    _mem_top, ADJ, CODE_ADDR_BITS, _pf_cfm_enabled,
 )
 import c4_min.nibble_pure_forward_complete as _PFC
 from .nibble_pure_forward_cached import (
@@ -124,11 +124,16 @@ def build_code_vec(code: List[isa.Instr], L: PureForwardCompleteLayout,
     """
     idx: List[int] = [L.ONE]
     vals: List[float] = [1.0]
-    for k, ins in enumerate(code):
-        idx.append(L.CODE_OP[k]); vals.append(float(ins.op))
-        idx.append(L.CODE_IMM[k]); vals.append(float(ins.imm))
-        for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
-            idx.append(L.CODE_IMM_NIB[k] + j); vals.append(float(nv))
+    if not _pf_cfm_enabled():
+        # BAKED path: the program is a row-INVARIANT program-in-data band.
+        for k, ins in enumerate(code):
+            idx.append(L.CODE_OP[k]); vals.append(float(ins.op))
+            idx.append(L.CODE_IMM[k]); vals.append(float(ins.imm))
+            for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                idx.append(L.CODE_IMM_NIB[k] + j); vals.append(float(nv))
+    # CODE-FROM-MEMORY: the program lives in the KV as per-position CODE frames (NOT a
+    # row-invariant band) — written per-row by ``apply_overlay_window_fast`` — so the
+    # row-invariant code_vec carries only ONE.
     return (torch.tensor(idx, device=device, dtype=torch.long),
             torch.tensor(vals, device=device, dtype=dtype))
 
@@ -136,7 +141,8 @@ def build_code_vec(code: List[isa.Instr], L: PureForwardCompleteLayout,
 def apply_overlay_window_fast(x_win: torch.Tensor, w_start: int, L,
                               store_log: Dict[int, Tuple[int, int]],
                               code_vec: Tuple[torch.Tensor, torch.Tensor],
-                              query_rows: Optional[List[int]] = None) -> None:
+                              query_rows: Optional[List[int]] = None,
+                              code=None, code_off: int = 0) -> None:
     """O(rows + code) in-place overlay of ``x_win`` ([1, W, D]) — byte-identical to
     ``apply_overlay_window`` but with the row-invariant code-in-data ASSIGNED by ONE
     broadcast indexed-write instead of a per-row re-scan.
@@ -146,7 +152,12 @@ def apply_overlay_window_fast(x_win: torch.Tensor, w_start: int, L,
     one-hots (the per-step query tag); if None, only the LAST row is a query row
     (the single-step window contract of
     ``apply_overlay_window(is_last_row_query=True)``).
+
+    CODE-FROM-MEMORY (``code_off > 0``): positions ``1 .. code_off`` are leading CODE
+    frames (written per-row from ``code``) and the register/store frame math shifts by
+    ``code_off``.  ``code_vec`` then carries only ONE (no baked program-in-data band).
     """
+    _cfm = code_off > 0
     W = x_win.shape[1]
     # 1) row-INVARIANT program-in-data + ONE: ONE broadcast ASSIGN over the code
     # dims (overwrites the embedding at those dims, exactly like the slow overlay's
@@ -158,8 +169,19 @@ def apply_overlay_window_fast(x_win: torch.Tensor, w_start: int, L,
         p = w_start + wi
         if p == 0:
             continue                       # BOS row carries no frame roles
-        f = (p - 1) // V.FRAME_LEN
-        local = (p - 1) % V.FRAME_LEN
+        if _cfm and 1 <= p <= code_off:
+            # CODE frame for instruction (p-1): the address-keyed KV code memory.
+            ins = code[p - 1]
+            x_win[0, wi, L.IS_CODE] = 1.0
+            x_win[0, wi, L.IS_FRAME_BYTE] = 0.0
+            for b in range(CODE_ADDR_BITS):
+                x_win[0, wi, L.CODE_KEY_BIN + b] = float(((p - 1) >> b) & 1)
+            x_win[0, wi, L.CODE_OPV] = float(ins.op)
+            for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                x_win[0, wi, L.CODE_IMM_NIB_MEM + j] = float(nv)
+            continue
+        f = (p - 1 - code_off) // V.FRAME_LEN
+        local = (p - 1 - code_off) % V.FRAME_LEN
         if local in _FRAME_ROLE_SLOTS:
             role = _FRAME_ROLE_SLOTS[local]
             x_win[0, wi, L.ROLE + role] = 1.0
@@ -209,6 +231,11 @@ class PFDraft:
     # KV store ROW its address resolves to (latest-write-wins), so the fast verify path
     # can DIRECT-GATHER that row instead of running the O(K) softmax CAM score.
     read_log: Dict[int, List[Tuple[str, int]]] = None
+    # CODE-FROM-MEMORY (C4_PF_CFM): number of leading CODE-frame rows (one token per
+    # instruction) prepended after BOS.  0 on the baked path (byte-identical).  The
+    # register/store frames then start at absolute position ``1 + code_off`` instead
+    # of ``1`` — the overlay's frame-position math shifts by this offset.
+    code_off: int = 0
 
 
 # The immediate is baked as IMM_NIBS little-endian nibbles (a STATIC re-encoding of
@@ -272,7 +299,14 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     # append).  The init frame IS a real stream frame (frame_idx n_seed), so tokens
     # must include it or every later position shifts by 30.
     init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
-    tokens: List[int] = [V.BOS] + seed_frames + init_frame
+    # CODE-FROM-MEMORY (C4_PF_CFM): prepend ONE token per instruction as leading CODE
+    # frames (the program lives in the KV, fetched at PC by the address CAM).  The
+    # register/store frames then begin at absolute position ``1 + code_off``.  The
+    # code-frame tokens are neutral MEM markers (the overlay writes their CODE bands;
+    # IS_FRAME_BYTE=0 -> ingest ignores them; the store CAM excludes IS_CODE rows).
+    code_off = len(code) if _pf_cfm_enabled() else 0
+    code_frame_toks: List[int] = [V.MEM] * code_off
+    tokens: List[int] = [V.BOS] + code_frame_toks + seed_frames + init_frame
     frames: List[Dict[str, int]] = []
     load_log: Dict[int, int] = {}               # frame_idx -> loaded address (LI/LC)
     win_starts: List[int] = []
@@ -513,7 +547,7 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
                    step_count=len(frames), halted=halted,
                    final_ax_masked=final_ax, win_starts=win_starts,
                    out=out, prtf_steps=prtf_steps, load_log=load_log,
-                   read_log=read_log)
+                   read_log=read_log, code_off=code_off)
 
 
 # ===========================================================================
@@ -573,7 +607,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                   oom_backoff: bool = True,
                   min_block_steps: int = 4,
                   evict_schedule: Optional[bool] = None,
-                  exact_evict: Optional[bool] = None) -> VerifyResult:
+                  exact_evict: Optional[bool] = None,
+                  prime_chunk: int = 2048) -> VerifyResult:
     """Verify the whole drafted stream on the SPARSE model in BLOCKS.
 
     Processes ``block_steps`` (== K) VM steps per batched ``forward_hidden_cached``.
@@ -740,6 +775,10 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     code_vec = (build_code_vec(code, L, model.embed.shape[1], dev,
                                dtype=model.embed.dtype) if fast else None)
 
+    # Holder for the primed leading-context boundary: step 0's span starts here (0 if
+    # no priming ran).  Set after the priming loop below.
+    _primed_start = [0]
+
     # --- one block-verify forward over steps [step, end) --------------------
     # Returns (hidden, new_kv, span_start, S, blocks_run).  Raises
     # torch.cuda.OutOfMemoryError (or RuntimeError with 'out of memory') so the
@@ -747,7 +786,12 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # after), so a retry is safe.  Block counts are RETURNED (not accumulated into
     # the running totals) so an OOM-retried block is not double-counted.
     def _forward_span(step, end):
-        span_start = 0 if step == 0 else draft.win_starts[step]
+        # When the leading context was PRIMED (cached in chunks), step 0's span starts
+        # AFTER the leading rows (they are already in the cache) instead of at 0.
+        if step == 0:
+            span_start = _primed_start[0]
+        else:
+            span_start = draft.win_starts[step]
         span_end = (draft.win_starts[end] + 1) if end < n_steps \
             else len(draft.tokens)
         span_toks = draft.tokens[span_start:span_end]
@@ -765,10 +809,12 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 # O(rows + code): broadcast the code-in-data, per-row roles, then
                 # tag exactly this block's query rows (byte-identical residual).
                 apply_overlay_window_fast(x, span_start, L, store_log, code_vec,
-                                          query_rows=q_local)
+                                          query_rows=q_local, code=code,
+                                          code_off=draft.code_off)
             else:
                 apply_overlay_window(x, span_start, code, L, store_log,
-                                     is_last_row_query=False)
+                                     is_last_row_query=False,
+                                     code_off=draft.code_off)
                 for wi in q_local:
                     for role in range(N_ROLES):
                         x[0, wi, L.ROLE + role] = 1.0
@@ -826,6 +872,58 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 c.K = c.K[:, :, :n0, :]
                 c.V = c.V[:, :, :n0, :]
                 c.pos = c.pos[:n0]
+
+    # ---- LEADING-CONTEXT PRIMING (large seed / code frames) -----------------
+    # The first step's query row sits at ``win_starts[0]`` — with a big DATA-SEGMENT
+    # seed (doom: 984 store frames ≈ 29.5k tokens) or CODE-FROM-MEMORY code frames
+    # (3976 rows) the leading FROZEN context is tens of thousands of rows.  Forwarding
+    # it as ONE span makes the local heads' dense score matrix ``[H, Sq, Sk]`` blow
+    # VRAM (O(lead^2)).  Instead prime the KV cache by forwarding the leading rows in
+    # ``prime_chunk``-sized causal chunks, committing each chunk's frozen KV — so the
+    # step spans below start with the cache already populated and no single forward
+    # sees the whole leading block.  These rows are all frozen context (no query row),
+    # byte-identical to committing them as part of the first span.
+    lead_end = draft.win_starts[0] if n_steps > 0 else len(draft.tokens)
+
+    def _prime_leading():
+        pos = 0
+        pc_ = int(max(1, prime_chunk))
+        while pos < lead_end:
+            ce = min(pos + pc_, lead_end)
+            span_toks = draft.tokens[pos:ce]
+            S = len(span_toks)
+            win_toks = torch.tensor([span_toks], device=dev)
+            q_positions = torch.arange(pos, pos + S, device=dev)
+            with torch.no_grad():
+                x = model.embed[win_toks].clone()
+                if fast:
+                    apply_overlay_window_fast(x, pos, L, store_log, code_vec,
+                                              query_rows=[], code=code,
+                                              code_off=draft.code_off)
+                else:
+                    apply_overlay_window(x, pos, code, L, store_log,
+                                         is_last_row_query=False,
+                                         code_off=draft.code_off)
+                past = [caches[b].as_past_kv() for b in range(n_blocks)]
+                _, new_kv = model.forward_hidden_cached(
+                    x, past_key_values=past, q_positions=q_positions, use_cache=True)
+                # commit ALL rows of this chunk (every row is frozen context).
+                for b in range(n_blocks):
+                    if new_kv[b] is None:
+                        continue
+                    K_all, V_all, pos_all = new_kv[b]
+                    caches[b].commit(K_all[:, :, -S:, :], V_all[:, :, -S:, :],
+                                     pos_all[-S:])
+            pos = ce
+        return pos
+
+    if lead_end > int(max(1, prime_chunk)):
+        n_primed = _prime_leading()
+        _primed_start[0] = lead_end          # step-0 span starts past the primed rows
+        if stats is not None:
+            stats["primed_leading_rows"] = n_primed
+        if is_cuda:
+            peak_vram = max(peak_vram, torch.cuda.max_memory_allocated(dev))
 
     cur_k = int(block_steps)
     eff_min_k = cur_k                       # smallest K actually run (OOM backoff)

@@ -304,6 +304,16 @@ def never_share_dims_from_layout(L) -> set:
         add_band(L.CODE_OP[k])
         add_band(L.CODE_IMM[k])
         add_band(L.CODE_IMM_NIB[k], _band_size(L, f"CODE_IMM_NIB_{k}"))
+    # CODE-FROM-MEMORY (C4_PF_CFM): the overlay writes the FIXED code-frame CAM bands
+    # (key/query/op/imm-nibbles + code/fetch flags) — never-share them so the driver's
+    # code-frame writes / the fetch query survive the liveness repack.
+    if getattr(L, "CODE_KEY_BIN", None) is not None:
+        add_band(L.CODE_KEY_BIN, _band_size(L, "CODE_KEY_BIN"))
+        add_band(L.CODE_QRY_BIN, _band_size(L, "CODE_QRY_BIN"))
+        add_band(L.CODE_OPV)
+        add_band(L.CODE_IMM_NIB_MEM, _band_size(L, "CODE_IMM_NIB_MEM"))
+        add_band(L.IS_CODE)
+        add_band(L.IS_FETCH)
     add_band(L.ROLE, _band_size(L, "ROLE"))
     add_band(L.IS_FRAME_BYTE)
     add_band(L.IS_STORE)
@@ -1428,7 +1438,13 @@ def _rebuild_layout(pfc, code_size, n_heads, recurrent_divmod=False):
     Mirrors ``build_pure_forward_complete_model``: the full op set is ALWAYS
     present, so the bitwise band is always extended (no op-subset toggle)."""
     from . import nibble_pure_forward_complete as _pfc
-    L = _pfc.PureForwardCompleteLayout(code_size, n_heads=n_heads)
+    # CODE-FROM-MEMORY (C4_PF_CFM): the dense builder builds the layout with a
+    # VESTIGIAL 1-slot per-instruction table (the program lives in the KV code
+    # frames) so the residual dim is code_size-INDEPENDENT.  Mirror that here or the
+    # reconstructed L's band offsets drift from the captured block_specs.
+    pf_code_size = 1 if _pfc._pf_cfm_enabled() else code_size
+    L = _pfc.PureForwardCompleteLayout(pf_code_size, n_heads=n_heads)
+    L.true_code_size = code_size
     # WIDE INGEST (C4_INGEST_WIDE): the dense builder allocates the 80-dim
     # PREROUTE/GATHER band BEFORE the ALU/bitwise bands (see
     # build_pure_forward_complete_model), so the block_specs address those dims.
