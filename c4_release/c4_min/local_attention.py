@@ -187,6 +187,20 @@ def windowed_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
         Ksel = K_full if pre_sel else K_full[:, idx]
         Vsel = V_full if pre_sel else V_full[:, idx]
         Qg = Q[:, idx]
+        # TRUE BANDED KERNEL (C4_BANDED_LOCAL_ATTN): for the LOCAL heads (window is an
+        # int W), score ONLY the last-W keys per query row — O(Sq*W), FLAT in S — via a
+        # sliding-band gather instead of materialising the full [B,Hl,Sq,Sk] matrix and
+        # masking it.  Byte-identical: the out-of-band weight is provably 0 (the masked
+        # path already sets it to -inf), so we simply never SCORE it.  GLOBAL heads
+        # (window is None) keep the full-causal matmul (they must reach far into the
+        # past — memory/stack/LEV).  See _agent_banded_local_attn.py.
+        import os as _osb
+        if window is not None and _osb.environ.get("C4_BANDED_LOCAL_ATTN", "0") == "1":
+            from ._agent_banded_local_attn import banded_local_context
+            out[:, idx] = banded_local_context(
+                Qg, Ksel, Vsel, q_pos, kpos_full,
+                self.alibi_slopes[idx], self.scale, int(window))
+            return
         sc = torch.matmul(Qg, Ksel.transpose(-2, -1)) * self.scale
         dist = (q_pos.unsqueeze(1) - kpos_full.unsqueeze(0)).float()   # signed [S,Sk']
         sc = sc - self.alibi_slopes[idx].view(1, -1, 1, 1) * dist.abs().unsqueeze(0)
