@@ -286,6 +286,17 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
             Ksel = K_full if pre_sel else K_full[:, hi]
             Vsel = V_full if pre_sel else V_full[:, hi]
             Qg = Q[:, hi]
+            # TRUE BANDED KERNEL (C4_BANDED_LOCAL_ATTN): the CAM blocks (2/7/11) still
+            # carry ~22 LOCAL ingest heads each; without banding THEY pay the O(S^2)
+            # masked-full local score even though direct-CAM removed the global one.
+            # Route the local (window is an int) group through the O(S*W) band — same
+            # byte-exact argument as windowed_forward's local branch.
+            if window is not None and os.environ.get("C4_BANDED_LOCAL_ATTN", "0") == "1":
+                from ._agent_banded_local_attn import banded_local_context
+                out[:, hi] = banded_local_context(
+                    Qg, Ksel, Vsel, q_pos, kpos_full,
+                    self.alibi_slopes[hi], self.scale, int(window))
+                return
             sc = torch.matmul(Qg, Ksel.transpose(-2, -1)) * self.scale
             dist = (q_pos.unsqueeze(1) - kpos_full.unsqueeze(0)).float()
             sc = sc - self.alibi_slopes[hi].view(1, -1, 1, 1) * dist.abs().unsqueeze(0)

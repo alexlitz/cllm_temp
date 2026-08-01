@@ -32,6 +32,68 @@ def _cached_ctx(sa, S, dim, seed=1):
     return kv
 
 
+# ---------------------------------------------------------------------------
+# TRUE BANDED KERNEL (C4_BANDED_LOCAL_ATTN): O(S*W) sliding-band vs the masked-full
+# O(S*Sk) local path — must be byte-identical (the out-of-band weight is provably 0,
+# so we simply never SCORE it; kept keys/ALiBi/causal/softmax1 are unchanged).
+# ---------------------------------------------------------------------------
+def _windowed_banded(sa, xq, past, qpos, on):
+    """Run windowed_forward with the banded flag ON/OFF (env-gated)."""
+    import os
+    prev = os.environ.get("C4_BANDED_LOCAL_ATTN")
+    os.environ["C4_BANDED_LOCAL_ATTN"] = "1" if on else "0"
+    try:
+        return LA.windowed_forward(sa, xq, past, qpos, True)[0]
+    finally:
+        if prev is None:
+            os.environ.pop("C4_BANDED_LOCAL_ATTN", None)
+        else:
+            os.environ["C4_BANDED_LOCAL_ATTN"] = prev
+
+
+def test_banded_equals_masked_full_local():
+    """Banded local kernel == the masked-full local path (all heads LOCAL, real window
+    that cuts keys).  Bit-identical modulo fp32 reduction order over the shorter row."""
+    sa, nh, dim = _mk_attn(seed=20)
+    S = 60
+    K, Vv, kpos = _cached_ctx(sa, S, dim, seed=21)
+    xq = torch.randn(1, 8, dim) * 0.1
+    qpos = torch.arange(S, S + 8)
+    sa._local_window = 12                                  # < span: the band is active
+    sa._global_head_mask = torch.zeros(nh, dtype=torch.bool)
+    full = _windowed_banded(sa, xq, (K, Vv, kpos), qpos, on=False)
+    band = _windowed_banded(sa, xq, (K, Vv, kpos), qpos, on=True)
+    assert float((full - band).abs().max()) < 1e-6, float((full - band).abs().max())
+
+
+def test_banded_equals_global_when_window_covers_span():
+    """Window covering the whole span -> banded == GLOBAL (the byte-exact production
+    invariant: a proven-local head's tail weight is 0, so band == full == global)."""
+    sa, nh, dim = _mk_attn(seed=22)
+    S = 30
+    K, Vv, kpos = _cached_ctx(sa, S, dim, seed=23)
+    xq = torch.randn(1, 4, dim) * 0.1
+    qpos = torch.arange(S, S + 4)
+    g = LA._global_forward(sa, xq, (K, Vv, kpos), qpos, True)[0]
+    sa._local_window = S + 8                               # window covers every key
+    sa._global_head_mask = torch.zeros(nh, dtype=torch.bool)
+    band = _windowed_banded(sa, xq, (K, Vv, kpos), qpos, on=True)
+    assert float((g - band).abs().max()) < 1e-6, float((g - band).abs().max())
+
+
+def test_banded_first_span_no_past():
+    """Banded == masked-full on the FIRST span (past_kv is None -> Knew only), the
+    prime-start / no-cache regime."""
+    sa, nh, dim = _mk_attn(seed=24)
+    xq = torch.randn(1, 50, dim) * 0.1
+    qpos = torch.arange(50)
+    sa._local_window = 16
+    sa._global_head_mask = torch.zeros(nh, dtype=torch.bool)
+    full = _windowed_banded(sa, xq, None, qpos, on=False)
+    band = _windowed_banded(sa, xq, None, qpos, on=True)
+    assert float((full - band).abs().max()) < 1e-6, float((full - band).abs().max())
+
+
 def test_windowed_equals_global_cached_all_local():
     """Cached path (q_positions given — the fast-path branch), all heads LOCAL, window
     covering the whole span -> byte-identical (this is the fast path's exact usage)."""
