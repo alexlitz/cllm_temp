@@ -365,7 +365,11 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
                            # MEANINGLESS (the DRIVER services the op + overrides them), so
                            # verify_blocks must NOT check them against these driver-side
                            # post-dispatch values (e.g. PRTF's return = #bytes printed).
-                           "is_file": True})
+                           "is_file": True,
+                           # DIRECT-CAM (additive): #extra store frames this file op emits
+                           # (READ input bytes) AFTER its primary frame, so the direct-CAM
+                           # frame_idx->step map can advance the frame counter past them.
+                           "n_byte_stores": len(byte_stores)})
             win_starts.append(stream_len - 1)
             frame_idx += 1
             tokens += _build_frame(pc, ax, sp, bp, stk)
