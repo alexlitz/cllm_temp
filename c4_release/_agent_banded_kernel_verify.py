@@ -15,7 +15,7 @@ os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from c4_min.blogspec_model import softmax1
-from c4_min._agent_banded_local_attn import banded_local_context
+from c4_min.banded_local_attn import banded_local_context
 
 
 def ref_masked_full(Qg, Ksel, Vsel, q_pos, kpos_full, slopes_g, scale, window):

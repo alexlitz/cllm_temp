@@ -292,7 +292,7 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
             # Route the local (window is an int) group through the O(S*W) band — same
             # byte-exact argument as windowed_forward's local branch.
             if window is not None and os.environ.get("C4_BANDED_LOCAL_ATTN", "0") == "1":
-                from ._agent_banded_local_attn import banded_local_context
+                from .banded_local_attn import banded_local_context
                 out[:, hi] = banded_local_context(
                     Qg, Ksel, Vsel, q_pos, kpos_full,
                     self.alibi_slopes[hi], self.scale, int(window))
