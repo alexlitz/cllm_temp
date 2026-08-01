@@ -578,6 +578,28 @@ def _forward_hidden_cached_skip(model, x, past_key_values, q_positions, skip_ran
     return hidden, new_caches
 
 
+def _forward_hidden_cached_mask(model, x, past_key_values, q_positions, run_mask):
+    """Run ONLY the blocks flagged True in ``run_mask`` (len == n_blocks); every
+    False block is an IDENTITY expert (residual passes straight through, its cache
+    entry is None).  Byte-identical to the full forward iff ``run_mask`` is a
+    SUPERSET of every step-in-the-span's true decode-live block set — the batched
+    block-MoE contract (a skipped block's attention is identity AND its FFN writes
+    only dead scratch no live block reads).  ``batched_block_skip`` builds the mask
+    as the union of the span's opcodes' live sets."""
+    n = len(model.blocks)
+    if past_key_values is None:
+        past_key_values = [None] * n
+    new_caches = [None] * n
+    hidden = x
+    for b in range(n):
+        if not run_mask[b]:
+            continue
+        hidden, kv = model.blocks[b](
+            hidden, past_kv=past_key_values[b], q_positions=q_positions, use_cache=True)
+        new_caches[b] = kv
+    return hidden, new_caches
+
+
 # ===========================================================================
 # 2. THE BLOCK-WISE PARALLEL VERIFIER — run the SPARSE model over the drafted
 #    stream in blocks, against the per-block KV cache + bounded eviction, and
@@ -768,6 +790,15 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         moe_span = resolve_divmod_span(L)
         _DM = {"DIV", "MOD"}
         divmod_step = [(draft.frames[s]["op"] in _DM) for s in range(n_steps)]
+    # BATCHED BLOCK-SKIP (C4_BATCHED_BLOCK_SKIP): per-span union block-MoE.  For each
+    # forward span, run only the UNION of that span's opcodes' live blocks (in
+    # model.blocks application coords) and skip the rest as identity passthrough.
+    # Byte-exact iff the union is a superset of every step's true decode-live set.
+    bbs_plan = None
+    bbs_stats = {"skip_blocks_run": 0, "skip_blocks_full": 0, "spans": 0}
+    from .batched_block_skip import batched_block_skip_enabled, BatchedBlockSkipPlan
+    if batched_block_skip_enabled():
+        bbs_plan = BatchedBlockSkipPlan(model, L)
     dev = torch.device(device)
     if is_cuda:
         # Reset the peak so ``peak_vram_gb`` reflects THIS verify's largest span
@@ -823,6 +854,17 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     for role in range(N_ROLES):
                         x[0, wi, L.ROLE + role] = 1.0
             past = [caches[b].as_past_kv() for b in range(n_blocks)]
+            # BATCHED BLOCK-SKIP: run only the union of this span's ops' live blocks.
+            if bbs_plan is not None:
+                span_ops = [draft.frames[s]["op"] for s in range(step, end)]
+                run_mask = bbs_plan.span_live_mask(span_ops).tolist()
+                hidden, new_kv = _forward_hidden_cached_mask(
+                    model, x, past, q_positions, run_mask)
+                blocks_run = int(sum(run_mask))
+                bbs_stats["skip_blocks_run"] += blocks_run
+                bbs_stats["skip_blocks_full"] += n_blocks
+                bbs_stats["spans"] += 1
+                return hidden, new_kv, span_start, S, blocks_run
             # BLOCK-MoE: skip the divmod span iff NO step in [step, end) is DIV/MOD.
             span_has_divmod = (moe_span is not None
                                and any(divmod_step[s] for s in range(step, end)))
@@ -1165,6 +1207,14 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         stats["blocks_full"] = blocks_full_total
         stats["block_moe_speedup"] = (blocks_full_total / max(blocks_run_total, 1)
                                       if block_moe else 1.0)
+        if bbs_plan is not None:
+            stats["bbs_blocks_run"] = bbs_stats["skip_blocks_run"]
+            stats["bbs_blocks_full"] = bbs_stats["skip_blocks_full"]
+            stats["bbs_spans"] = bbs_stats["spans"]
+            stats["bbs_block_reduction"] = (
+                bbs_stats["skip_blocks_full"] / max(bbs_stats["skip_blocks_run"], 1))
+            stats["bbs_mean_blocks_per_span"] = (
+                bbs_stats["skip_blocks_run"] / max(bbs_stats["spans"], 1))
         # eviction wall (the #667 bottleneck instrumentation): the fused on-GPU
         # prune should be a SMALL fraction of the fast wall (it was the dominant
         # cost with the per-block host-synced loop).  ``t_evict`` is measured with a
