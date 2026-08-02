@@ -108,6 +108,29 @@ def kb_batched() -> bool:
     return os.environ.get("C4_KB_BATCHED", "1") != "0"
 
 
+# ---------------------------------------------------------------------------
+# C4_RECURRENT_CORE — NESTED weight-tie inside the recurrent divmod body.
+#
+# DEFAULT OFF.  The recurrent divmod body already stores ONE iteration body and
+# applies it 8x (the OUTER recurrence, ``compile_divmod_blocks_recurrent``).
+# Within that ONE body the 6 QB carry-normalise rounds (``alu-div-qbc-*``) are
+# BYTE-IDENTICAL blocks (each is the same position-independent ``_carry_round_block(
+# L, dim, QB, QB, RN)`` — src==dst==QB, so applying it repeatedly just re-runs the
+# same in-place carry-propagate, exactly the intent of an N-round ripple).  This
+# flag ties those 6 into ONE stored block applied 6x (an INNER recurrence), so the
+# recurrent build stores 6-1=5 FEWER physical blocks with ZERO change to the applied
+# sequence -> byte-EXACT.  Kept OFF by default so the production/golden build is
+# unchanged; the census showed this is the ONLY remaining byte-identical tie in the
+# 95-physical-block recurrent build (all 63 non-divmod blocks are byte-DISTINCT).
+# ---------------------------------------------------------------------------
+def recurrent_core() -> bool:
+    """True iff the recurrent divmod body ties its 6 byte-identical QB carry-round
+    blocks into ONE stored block applied 6x (``C4_RECURRENT_CORE != '0'``, default
+    OFF).  Byte-EXACT: the tied block is position-independent (src==dst==QB), so
+    the applied sequence is unchanged; only the STORED physical-block set shrinks."""
+    return os.environ.get("C4_RECURRENT_CORE", "0") != "0"
+
+
 # ===========================================================================
 # Low-level SwiGLU unit emitters — all fp32-exact for integer arguments.
 # A hidden unit computes ``silu(up . x + b_up) * (gate . x + b_gate)`` and its
@@ -1110,14 +1133,39 @@ def compile_divmod_blocks_recurrent(L, dim, n_iters: int = 8):
     body = _divmod_iteration_body(L, dim)                  # the ONE reused body
     finalize = [("alu-div-finalize", _div_finalize_block(L, dim))]
 
+    # C4_RECURRENT_CORE: NESTED tie of the 6 byte-identical ``alu-div-qbc-*`` carry
+    # rounds into ONE stored ``alu-div-qbc`` block applied 6x per iteration.  The
+    # blocks are position-independent (src==dst==QB), so the applied SEQUENCE is
+    # unchanged -> byte-EXACT; only the STORED body shrinks by 5 blocks.
+    body_apply_names = [n for n, _ in body]               # per-iteration apply order
+    if recurrent_core():
+        qbc_specs = [(n, s) for n, s in body if n.startswith("alu-div-qbc-")]
+        if qbc_specs:
+            n_qbc = len(qbc_specs)
+            tied_name = "alu-div-qbc"
+            tied_spec = qbc_specs[0][1]                    # all 6 are byte-identical
+            # rebuild ``body`` (stored/unique) with ONE tied qbc block; rebuild the
+            # per-iteration apply order with the tied name repeated n_qbc times.
+            new_body, new_apply, inserted = [], [], False
+            for name, spec in body:
+                if name.startswith("alu-div-qbc-"):
+                    if not inserted:
+                        new_body.append((tied_name, tied_spec))
+                        new_apply += [tied_name] * n_qbc
+                        inserted = True
+                    # subsequent qbc-* are dropped from the stored set (tied).
+                else:
+                    new_body.append((name, spec))
+                    new_apply.append(name)
+            body, body_apply_names = new_body, new_apply
+
     unique = prefix + body + finalize                     # DISTINCT specs to store
     prefix_names = [n for n, _ in prefix]
-    body_names = [n for n, _ in body]
     # application order: prefix (once) | body x n_iters | finalize (once).  The
     # body names REPEAT so the loop reuses the shared iteration weights n_iters x.
     apply_names = list(prefix_names)
     for _ in range(n_iters):
-        apply_names += body_names
+        apply_names += body_apply_names
     apply_names.append("alu-div-finalize")
     return unique, apply_names
 
