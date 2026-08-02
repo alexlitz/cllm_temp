@@ -165,7 +165,24 @@ IMM_NIBS = int(_os.environ.get("C4_IMM_NIBS", "5"))
 # materialization survives (literals > 255 / negative sign survive).  DEFAULT
 # OFF -> the baked-table build is byte-identical (golden 069cc32f unchanged).
 # ===========================================================================
-CODE_ADDR_BITS = 12          # 4096 code addresses (doom = 3976 instrs < 2^12)
+# CODE_ADDR_BITS = number of code-address bits the softmax1 CODE CAM keys on (max
+# addressable program = 2^CODE_ADDR_BITS instructions).  DEFAULT 12 (4096; doom =
+# 3976 instrs < 2^12) keeps the historical build byte-identical (golden 069cc32f).
+# WIDEN via ``C4_CODE_ADDR_BITS=<n>`` (mirrors ``C4_MEM_ADDR_BITS`` / wall #1) for
+# programs with PC >> 4096 (e.g. a large Doom port).
+#
+# CEILING (this cfm path only): the code CAM head uses ALiBi slope 0.0 (see
+# ``_bake_code_cam_head`` — the code address is UNIQUE per PC so no recency decay)
+# and NO RoPE on its address lanes, so it is POSITION-INVARIANT by construction —
+# a distant code frame scores the SAME as a near one (UNLIKE the RoPE
+# ``qwen_full_vm._bake_code_cam``, whose fast rotary lanes DO cap the bits at a
+# fidelity ceiling).  So the ONLY limits here are (a) the head_dim budget
+# ``head_dim >= CODE_ADDR_BITS + 4 + (1+IMM_NIBS)`` (~48 bits at head_dim=58) and
+# (b) the softmax1 discriminability margin (the ZFOD bias, scaled per width in
+# ``_bake_code_cam_head``, must keep an exact match above the +1 sink and every
+# 1-bit mismatch below it).  Measured BYTE-EXACT through PC 99,999 at
+# ``C4_CODE_ADDR_BITS=20`` (see _agent_code_addr_bits.py).  Clamped by head_dim.
+CODE_ADDR_BITS = int(_os.environ.get("C4_CODE_ADDR_BITS", "12"))
 
 
 def _pf_cfm_enabled() -> bool:
@@ -279,15 +296,21 @@ class PureForwardCompleteLayout(PureForwardLayout):
 # Bit (4*j + t) = bit t of nibble j = sum over cells a of nibble j with bit t set.
 # ===========================================================================
 def compile_nibble_addr_expand(L, reg_base: int, bin_base: int, dim: int,
-                               n_nibbles: int = 8) -> Dict[str, torch.Tensor]:
+                               n_nibbles: int = 8,
+                               n_bits: int = None) -> Dict[str, torch.Tensor]:
     """``bin_base[4*j + t] = bit t of nibble j of the register at ``reg_base```` for
     j < n_nibbles, t in 0..3.  A nibble is 0..15; its one-hot over the 16 cells is
     the triangular pulse, and bit t is the sum of the cells whose index has bit t.
-    Self-clears each written bit lane first (SET)."""
+    Self-clears each written bit lane first (SET).
+
+    ``n_bits`` (default ``4*n_nibbles``) CAPS how many low bits are written into
+    ``bin_base`` — needed when the destination band is NARROWER than a nibble
+    boundary (e.g. a 13-bit ``CODE_QRY_BIN``: 4 nibbles decode PC but only 13 bits
+    may be written, else bits 13..15 spill into the NEXT band and corrupt it)."""
     thr = list(range(-1, 17))
     tu = {t: k for k, t in enumerate(thr)}
     n_thr = len(thr)
-    n_bits = 4 * n_nibbles
+    n_bits = (4 * n_nibbles) if n_bits is None else min(n_bits, 4 * n_nibbles)
     spec = _empty_spec(dim, n_nibbles * n_thr + n_bits)
     u = 0
     # relu bank per nibble (16-cell one-hot thresholds).
@@ -311,8 +334,10 @@ def compile_nibble_addr_expand(L, reg_base: int, bin_base: int, dim: int,
         for a in range(16):
             # one-hot(a) coefficient = tri pulse: +cell(a-1) -2cell(a) +cell(a+1).
             for t in range(4):
+                b = 4 * j + t
+                if b >= n_bits:        # NARROW destination band: don't spill
+                    continue
                 if (a >> t) & 1:
-                    b = 4 * j + t
                     spec["W_down"][bin_base + b, r0 + tu[a - 1]] += 1.0 / RELU_S
                     spec["W_down"][bin_base + b, r0 + tu[a]] += -2.0 / RELU_S
                     spec["W_down"][bin_base + b, r0 + tu[a + 1]] += 1.0 / RELU_S
@@ -1278,9 +1303,12 @@ def compile_pc_fetch_cfm(L, dim: int) -> Dict[str, torch.Tensor]:
         (next block) lands cleanly on a zeroed lane.
     NO PC one-hot is baked, so the residual dim is INDEPENDENT of code_size."""
     from .nibble_vm import vm_two_limb
-    # CODE_QRY_BIN <- PC nibbles (first ceil(CODE_ADDR_BITS/4) nibbles suffice).
+    # CODE_QRY_BIN <- PC nibbles (first ceil(CODE_ADDR_BITS/4) nibbles suffice).  Cap
+    # the written bits at CODE_ADDR_BITS so a non-nibble-aligned width (e.g. 13, 17,
+    # 18) does not spill the high bits of the top nibble into the NEXT band.
     n_pc_nib = (CODE_ADDR_BITS + 3) // 4
-    qexp = compile_nibble_addr_expand(L, L.PC, L.CODE_QRY_BIN, dim, n_nibbles=n_pc_nib)
+    qexp = compile_nibble_addr_expand(L, L.PC, L.CODE_QRY_BIN, dim,
+                                      n_nibbles=n_pc_nib, n_bits=CODE_ADDR_BITS)
     base_units = qexp["W_up"].shape[0]
     # units: AX_ZERO(2: clear+ramp) + IS_FETCH(2: clear+set1) + clear OP_VAL(1)
     #        + clear IMM_NIB band(IMM_NIBS)

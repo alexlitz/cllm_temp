@@ -291,7 +291,19 @@ CAM_REGS = ["PC", "AX", "SP", "BP", "STACK0"]
 # address bug).  The lowest-freq 12 rotary lanes (theta=1e6) stay cos>=0.997 even at
 # Δpos~500, so 12 bits key a PC up to 4095 (covers the full ~4000-instr c4 compiler
 # and every muldiv subroutine, code_size- and width-independent).
-CODE_ADDR_BITS = 12
+#
+# CONFIGURABLE (``C4_CODE_ADDR_BITS=<n>``, DEFAULT 12 -> byte-identical golden
+# 069cc32f; mirrors ``C4_MEM_ADDR_BITS`` / wall #1).  ``_bake_code_cam`` places the
+# n bits on the SLOWEST n rotary pairs (lanes ``half-1-b``) + 4 control lanes, so a
+# widen keys a longer program.  Because this is the RoPE path, the fidelity ceiling
+# is the rotary-lane one: a bit ``b`` on lane ``half-1-b`` rotates with a freq that
+# rises with ``b``, so a distant code frame's high address bits decay past cos~0 at a
+# Δpos that shrinks with b (the same curve wall #1 measured for the MEM CAM: ~12
+# reliable bits at Δ~program-length, up to ~16-18 when the fetch stays near the
+# frame).  The cfm pure-forward CODE CAM (``nibble_pure_forward_complete``) has NO
+# such ceiling — it uses ALiBi slope 0.0 + no RoPE, so it is position-invariant by
+# construction (that is the path the batched/doom verifier + direct-CAM run).
+CODE_ADDR_BITS = int(os.environ.get("C4_CODE_ADDR_BITS", "12"))
 
 
 # ---------------------------------------------------------------------------
@@ -1274,9 +1286,11 @@ def _bake_code_cam(attn, QL, arch, comp, K):
     q_w = attn.q_proj.weight; k_w = attn.k_proj.weight
     v_w = attn.v_proj.weight; o_w = attn.o_proj.weight
     half = hd // 2
-    # CODE_ADDR_BITS (16) address bits; keep them on the slowest rotary pairs (near-
-    # identity RoPE) so the address dot is position-invariant, exactly as the memory
-    # CAM does.  half=32 rotary pairs comfortably hold 16 bits + 2 control lanes.
+    # CODE_ADDR_BITS (DEFAULT 12, ``C4_CODE_ADDR_BITS``) address bits; keep them on the
+    # slowest rotary pairs (near-identity RoPE) so the address dot is position-invariant,
+    # exactly as the memory CAM does.  half=32 rotary pairs hold up to 29 bits + 3
+    # control lanes; the RoPE fidelity ceiling (not the lane count) is the real cap on
+    # how far a distant frame stays keyable (see the CODE_ADDR_BITS module comment).
     n_bits = min(CODE_ADDR_BITS, half - 3)
     G = 16.0                                  # per-bit agreement gain (same as mem CAM)
     # q = G*(2*QRY_BIN[b]-IS_FETCH), k = G*(2*KEY_BIN[b]-IS_CODE): on a fetch
