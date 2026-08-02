@@ -453,13 +453,18 @@ def remap_layout(L, new_slot: List[int], new_dim: int) -> None:
 
     # Rewrite the integer / list attributes. Any attribute whose value is a
     # valid old-dim index gets mapped; lists of such ints are mapped elementwise.
+    # NB: ``type(val) is int`` (NOT ``isinstance``) — a BOOL flag like ``cfm`` is
+    # an ``int`` subclass, so ``isinstance(False, int)`` is True and ``cfm=False``
+    # (== 0) would be clobbered to ``new_slot[0]`` (a real dim -> TRUTHY), which
+    # makes the pc-fetch overlay take the CFM branch with CODE_KEY_BIN==None and
+    # crash the default (C4_PF_CFM off) neural driver.  Bool flags are NOT dims.
     for attr, val in list(vars(L).items()):
         if attr.startswith("_"):
             continue
-        if isinstance(val, int) and 0 <= val < len(new_slot):
+        if type(val) is int and 0 <= val < len(new_slot):
             setattr(L, attr, new_slot[val])
         elif isinstance(val, list) and val and all(
-            isinstance(x, int) and 0 <= x < len(new_slot) for x in val
+            type(x) is int and 0 <= x < len(new_slot) for x in val
         ):
             setattr(L, attr, [new_slot[x] for x in val])
     L.D = new_dim
