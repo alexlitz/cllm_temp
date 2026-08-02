@@ -201,6 +201,26 @@ def windowed_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
                 Qg, Ksel, Vsel, q_pos, kpos_full,
                 self.alibi_slopes[idx], self.scale, int(window))
             return
+        # BYTE-EXACT FLASH (C4_FLASH_ATTN): tiled softmax1+ALiBi that NEVER
+        # materialises the [B,H,Sq,Sk] score matrix — the general O(S²)-memory fix
+        # for the GLOBAL heads (window is None: memory/stack/LEV must reach over the
+        # whole growing KV, no direct-CAM draft).  softmax1 == plain-softmax over a
+        # BOS-sink column (blogspec_model §40-44), so a standard flash kernel + the
+        # sink recovers it EXACTLY.  Un-cached FULL case -> SDPA mem-efficient
+        # (is_causal top-left == the reference); every other case -> the general
+        # online-softmax1 Triton kernel.  fp32 (~1e-6, below the nibble margin).
+        if _osb.environ.get("C4_FLASH_ATTN", "0") == "1" and Qg.is_cuda:
+            from .flash_softmax1 import flash_softmax1_context
+            Sq_ = Qg.shape[2]
+            Sk_ = Ksel.shape[2]
+            uncached_full = (window is None and Sq_ == Sk_
+                             and bool((kpos_full == q_pos).all())
+                             and bool((q_pos == torch.arange(
+                                 Sq_, device=q_pos.device)).all()))
+            out[:, idx] = flash_softmax1_context(
+                Qg, Ksel, Vsel, q_pos, kpos_full, self.alibi_slopes[idx],
+                self.scale, window=window, uncached_full=uncached_full)
+            return
         sc = torch.matmul(Qg, Ksel.transpose(-2, -1)) * self.scale
         dist = (q_pos.unsqueeze(1) - kpos_full.unsqueeze(0)).float()   # signed [S,Sk']
         sc = sc - self.alibi_slopes[idx].view(1, -1, 1, 1) * dist.abs().unsqueeze(0)
