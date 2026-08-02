@@ -952,23 +952,40 @@ def _snap_two_limb(lo_lane: torch.Tensor, hi_lane: torch.Tensor) -> int:
 VALVOCAB = 0x10100   # 0..0x100FF: covers SP/BP = 0x10000 ± small, plus head-room
 
 
+def _pc_wide_enabled() -> bool:
+    """``C4_PC_WIDE`` (#789, DEFAULT OFF): let the runtime register requant
+    (``_snap_lane``) decode a PC / SP / BP value BEYOND the ``VALVOCAB`` ≈ 0x10100
+    (~2^16) flat-argmax cap, so a large program (id-Doom: ~552,698 PCs, so PC
+    arithmetic must exceed 2^16) does not clip its PC/return address at ~65792.
+
+    The default flat argmax over ``0..VALVOCAB-1`` SATURATES any lane value >= 0x10100
+    to 0x100FF — the primary PC-saturation wall for a >2^16-PC program.  When on, the
+    snap uses the round-free integer snap (``floor(x+½)``, the exact argmax
+    equivalent, capped at the 32-bit word) that ``_snap_lane_bytes`` already provides
+    for the width-32 substrate — so PC / return-PC / branch-target values up to 2^32-1
+    decode exactly.  Runtime DECODE only (no model parameter) -> golden byte-neutral."""
+    return os.environ.get("C4_PC_WIDE", "0") not in ("0", "", "false", "False")
+
+
 def _snap_lane(lane: torch.Tensor) -> int:
     """The LM-head requant: emit the value token ``argmax_v (2·v·x − v²)`` over the
     value vocabulary — the exact-integer snap of the lane, NO ``round``. Vectorised
     so the wide vocab is a single argmax (the standard decode-step argmax).
 
-    Under ``C4_VM_WIDTH32`` the flat argmax (capped at ``VALVOCAB`` ≈ 0x10100)
-    would clip any value > ~65K, so the snap descends to ``_snap_lane_bytes``: the
-    integer snap (``floor(x+½)``, the round-free argmax equivalent) reduced to the
-    unsigned 32-bit word ``v mod 2^32``.  For width-32 this snaps only the SMALL
-    single-scalar lanes (PC < 4096, SP/BP ≈ 0x10000, all < 2^24 fp32-exact); the
-    wide DATA registers AX/STACK0 use ``_snap_two_limb`` on their two fp32 limbs.
+    Under ``C4_VM_WIDTH32`` (or ``C4_PC_WIDE``, #789) the flat argmax (capped at
+    ``VALVOCAB`` ≈ 0x10100) would clip any value > ~65K, so the snap descends to
+    ``_snap_lane_bytes``: the integer snap (``floor(x+½)``, the round-free argmax
+    equivalent) reduced to the unsigned 32-bit word ``v mod 2^32``.  For width-32 this
+    snaps only the SMALL single-scalar lanes (PC < 4096, SP/BP ≈ 0x10000, all < 2^24
+    fp32-exact); the wide DATA registers AX/STACK0 use ``_snap_two_limb`` on their two
+    fp32 limbs.  ``C4_PC_WIDE`` extends the SAME round-free snap to the base 8-bit
+    substrate so a >2^16-PC program (id-Doom) decodes PC/return-PC without clipping.
 
     This is a RUNTIME DECODE helper (Python-side, not a model parameter): the model
     is fully fp32, and this local argmax stays fp64 because the value vocab reaches
     ~0x10100 where ``v²`` ≈ 4.3e9 exceeds fp32's 2^24 integer precision (an fp32
     argmax mis-snaps SP/BP = 0x10000).  No fp64 model params are involved."""
-    if vm_width32():
+    if vm_width32() or _pc_wide_enabled():
         return _snap_lane_bytes(lane)
     x = float(lane)
     v = torch.arange(VALVOCAB, dtype=torch.float64)

@@ -229,3 +229,77 @@ class TestNeural32bit:
         assert got == g, (
             f"{case.name} ({case.op}): neural {got:#010x} != golden {g:#010x} "
             f":: {case.note}")
+
+
+# ---------------------------------------------------------------------------
+# GATE 4 (#790 run-phase gap closers): with the gated flags ON, the multi-byte
+# SHL/SHR (C4_SHIFT32) + the full-32-bit-tie EQ/NE/LT/GT/LE/GE (C4_CMP32) are
+# byte-exact vs the golden (so the documented ``neural_xfail`` cases become
+# PASSES).  SLOW (own model build with the flags on); opt-in via C4_AUDIT_NEURAL.
+# ---------------------------------------------------------------------------
+# The formerly-xfail SHL/SHR + comparison-tie cases the run-phase flags close.
+_GAP_OPS = {"SHL", "SHR", "EQ", "NE", "LT", "GT", "LE", "GE"}
+
+
+@pytest.mark.skipif(not _NEURAL,
+                    reason="set C4_AUDIT_NEURAL=1 to run the slow neural gate")
+class TestNeural32bitFlags:
+    @pytest.fixture(scope="class")
+    def model(self):
+        import c4_min.nibble_pure_forward as _PF
+        import c4_min.nibble_pure_forward_complete as _PFC
+        _PF.SP_INIT = 0xFC
+        _PFC.SP_INIT = 0xFC
+        os.environ["C4_PF_CFM"] = "1"
+        os.environ["C4_SHIFT32"] = "1"
+        os.environ["C4_CMP32"] = "1"
+        from c4_min.compact_alloc import build_compact_sparse_streaming
+        m, L, _ = build_compact_sparse_streaming(
+            code_size=48, compute_mode="dense_kernel")
+        return m, L
+
+    @pytest.mark.parametrize("case", [c for c in _CASES if c.op in _GAP_OPS],
+                             ids=[c.name for c in _CASES if c.op in _GAP_OPS])
+    def test_flags_close_gap(self, model, case):
+        import c4_min.nibble_pure_forward_complete as _PFC
+        m, L = model
+        tr = _PFC.run_pure_forward_complete(
+            m, L, case.code(), max_steps=case.max_steps, mask=M32,
+            seed_mem=dict(case.seed_mem) or None)
+        got = tr[-1] & M32 if tr else 0
+        g = case.golden()
+        # WITH the flags on, EVERY case (including the formerly-xfail ones) is exact.
+        assert got == g, (
+            f"{case.name} ({case.op}) with C4_SHIFT32+C4_CMP32: neural {got:#010x} "
+            f"!= golden {g:#010x} :: {case.note}")
+
+
+# ---------------------------------------------------------------------------
+# GATE 5 (#789 PC-arith walls): the two PC-saturation sites and their widening.
+# Pure unit checks (no model build) — always run.
+# ---------------------------------------------------------------------------
+def test_pc_wide_snap_lane_past_2_16():
+    """``_snap_lane`` clips a register value at ~VALVOCAB (0x10100 ~ 2^16) by
+    default (the runtime PC/SP/BP decode wall), and decodes exactly to 2^32-1 under
+    ``C4_PC_WIDE`` (#789).  The id-Doom port has ~552,698 PCs, so PC arithmetic must
+    exceed 2^16."""
+    import torch
+    import importlib
+    import c4_min.nibble_vm as NV
+    for v in (65792, 70000, 552698, 1048575):
+        lane = torch.tensor(float(v))
+        os.environ.pop("C4_PC_WIDE", None)
+        assert NV._snap_lane(lane) <= NV.VALVOCAB - 1, "flag-OFF should clip at VALVOCAB"
+        os.environ["C4_PC_WIDE"] = "1"
+        try:
+            assert NV._snap_lane(lane) == v, f"PC_WIDE should decode {v} exactly"
+        finally:
+            os.environ.pop("C4_PC_WIDE", None)
+
+
+def test_imm_clean_branch_target_range():
+    """The signed JMP/JSR/branch target reconstructed by ``compile_imm_clean`` spans
+    ``+-2^(4*C4_IMM_NIBS-1)`` (#789): the default 5 nibbles (+-524287) is SHORT of the
+    id-Doom 552,698 PC span, and 6 nibbles (+-8388607) covers it."""
+    assert (1 << (4 * 5 - 1)) - 1 < 552698   # IMM_NIBS=5 short of doom
+    assert (1 << (4 * 6 - 1)) - 1 >= 552698  # IMM_NIBS=6 covers doom

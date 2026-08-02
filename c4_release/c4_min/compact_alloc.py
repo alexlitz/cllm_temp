@@ -276,6 +276,17 @@ _NEVER_SHARE_NAMES: Tuple[str, ...] = (
                  # sidesteps that.  The default probe battery does not exercise
                  # frame-offset ops, so weight/empirical liveness alone would let it
                  # share a slot and get clobbered.
+    # SIGNED DIV/MOD (C4_DIVMOD_SIGNED, #790): the operand sign flags are written at
+    # the sd-sign block (BEFORE the ~200-block divide) and READ at sd-neg* (AFTER it),
+    # so they are live across the entire divmod span.  The default probe battery does
+    # not exercise a NEGATIVE-operand DIV/MOD, so the empirical liveness would shrink
+    # their interval and colour them onto a divmod-scratch slot that IS written during
+    # the divide -> the quotient sign (RES_SGN) gets clobbered.  Pin private slots.
+    # (Names absent in the flag-OFF build, so this is a no-op there.)
+    "ALU_SGN_A", "ALU_SGN_B", "ALU_RES_SGN",
+    # C4_CMP32 (#790): the per-nibble tie flag, written+read across the 3 cmp-nib-*
+    # blocks; the default battery does not exercise a full-32-bit tie so pin it too.
+    "NIB_EQ",
 )
 _NEVER_SHARE_PREFIXES: Tuple[str, ...] = ()
 

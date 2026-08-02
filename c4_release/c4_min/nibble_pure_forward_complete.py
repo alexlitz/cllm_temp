@@ -194,6 +194,44 @@ def _pf_cfm_enabled() -> bool:
 
 
 # ===========================================================================
+# RUN-PHASE 32-bit gap closers (#789 PC-arith, #790 32-bit op gaps).  Every one
+# is a GATED env flag DEFAULT-OFF: with all off the build is byte-IDENTICAL to
+# golden ``069cc32f``.  The Doom port (552,698 instrs, full 32-bit ops) needs
+# them ON; the 1096 corpus (8-bit, code_size < few-hundred) never trips them.
+# ===========================================================================
+def _shift32_enabled() -> bool:
+    """``C4_SHIFT32`` (DEFAULT OFF): keep the FULL 32-bit SHL/SHR result the tight
+    shifter already computes in the AX nibble band, instead of truncating it to the
+    low byte (the ``ax-byte-nib`` writeback + the low-byte ``bw-recompose``).  The
+    shifter (``shift_tight_nibble.tight_out_to_ax_rules``) writes all 8 AX nibbles
+    with ``pop </>> ax`` (32-bit, arithmetic SHR sign-fill) — the byte truncation was
+    the ONLY thing losing bits.  Doom's fixed-point ``>>`` is the #1 fast-path fix.
+    OFF -> SHL/SHR stay in ``byte_ax_ops`` (byte result) -> golden byte-IDENTICAL."""
+    return _os.environ.get("C4_SHIFT32", "0") not in ("0", "", "false", "False")
+
+
+def _cmp32_enabled() -> bool:
+    """``C4_CMP32`` (DEFAULT OFF): make the EQ/NE/LT/GT/LE/GE verdict robust to the
+    full 32-bit operand width by deciding equality from a PER-NIBBLE all-8-nibble
+    AND (``STACK0[j]==AX[j]`` for every j) rather than the noisy wide-scalar bump
+    ``Z(STK_VAL-AX_VAL)`` (whose ~1e-6 relative recompose residue reaches ~±1 at a
+    ~10^6-scale operand, mis-firing the tie).  On an exact 32-bit tie it forces
+    ``CMP_EQ=1`` and ``CMP_GT=CMP_LT=0``; the sign-corrected magnitude order (already
+    32-bit-exact for the DECISIVE sign/low-byte cases) is untouched off the tie.  OFF
+    -> the cmp blocks are byte-IDENTICAL to golden."""
+    return _os.environ.get("C4_CMP32", "0") not in ("0", "", "false", "False")
+
+
+def _divmod_signed_enabled() -> bool:
+    """``C4_DIVMOD_SIGNED`` (DEFAULT OFF): compute DIV/MOD with C4/native-c4 SIGNED
+    truncation-toward-zero semantics (quotient sign = sign(a)^sign(b), remainder sign
+    = sign(a), magnitudes from the unsigned base-16 long division) instead of the
+    golden's UNSIGNED floor.  Native c4 ``int`` is signed, so Doom's signed ``/`` /
+    ``%`` need this.  OFF -> DIV/MOD stay unsigned-floor -> golden byte-IDENTICAL."""
+    return _os.environ.get("C4_DIVMOD_SIGNED", "0") not in ("0", "", "false", "False")
+
+
+# ===========================================================================
 # The op groups (the stack contract).
 # ===========================================================================
 # POP-consuming ops: pop the stack top MEM[SP] into STACK0, op(STACK0, AX), SP+=4.
@@ -258,6 +296,13 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # fills AX nibbles 2..7 with 0xF (byte >= 0x80 -> negative char, sign-extended
         # to the 32-bit register).  LI stays an unsigned word load.
         self.LC_SIGN = self._scalar("LC_SIGN")
+        # C4_CMP32 (#790, default OFF): a scratch scalar = 1 iff STACK0 and AX are
+        # EQUAL across ALL 8 nibbles (a full 32-bit tie).  Used by the cmp override to
+        # make EQ/NE/GT/LE/GE robust to the wide-scalar recompose noise.  Allocated
+        # ONLY when the flag is on, so the flag-OFF layout / golden hash is unchanged.
+        self.NIB_EQ = None
+        if _cmp32_enabled():
+            self.NIB_EQ = self._scalar("NIB_EQ")
         # PART A (C4_UNIFY_CAM_HEAD, default OFF): the merged-CAM-head scratch bands.
         # Allocated ONLY when the flag is on, so the flag-OFF layout (and thus every
         # baked weight / the golden hash) is byte-identical to the 3-head build.
@@ -1644,6 +1689,24 @@ def build_pure_forward_complete_model(code_size: int = 32,
     block_specs += [
         ("cmp-compute", compile_cmp_compute(L, dim)),
         ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),
+    ]
+    if _cmp32_enabled():
+        # C4_CMP32 (#790): make EQ/NE/LT/GT/LE/GE robust to the full 32-bit tie by
+        # deciding equality from the residue-immune NIBBLE bands (NDIFF -> tie flag ->
+        # verdict override).  Three additive, UNGATED blocks touching only cmp scratch.
+        block_specs += [
+            ("cmp-nib-ndiff", compile_cmp_nib_ndiff(L, dim)),
+            ("cmp-nib-tie", compile_cmp_nib_tie(L, dim)),
+            ("cmp-nib-override", compile_cmp_nib_override(L, dim)),
+        ]
+    if _divmod_signed_enabled():
+        # C4_DIVMOD_SIGNED (#790): replace STACK0/AX with |a|/|b| (op-gated DIV|MOD)
+        # BEFORE alu-expand, so the UNSIGNED divider sees the magnitudes.  The signs
+        # (SGN_A/SGN_B/RES_SGN) are recorded here and consumed by the post-divide
+        # negate (sd-neg* below).  A non-DIV/MOD step is a strict no-op.
+        for name, spec in A.compile_divmod_sign_prep(L, dim):
+            block_specs.append((name, spec))
+    block_specs += [
         ("alu-expand", A.compile_expand(L, dim)),
     ]
     for name, spec in A.compile_addsub_blocks(L, dim):
@@ -1684,12 +1747,25 @@ def build_pure_forward_complete_model(code_size: int = 32,
             block_specs.append((name, spec))
     divmod_end = len(block_specs)                   # one past the last physical divmod block
     L._divmod_span = (divmod_start, divmod_end)     # block-MoE skip target (seam)
+    if _divmod_signed_enabled():
+        # C4_DIVMOD_SIGNED (#790): the unsigned divide wrote |a|//|b| into DIV_RES and
+        # |a|%|b| into MOD_RES; apply the C-truncation result signs (quotient <-
+        # RES_SGN on DIV, remainder <- SGN_A on MOD) BEFORE the ax-mux copies the
+        # active op's result into AX.
+        for name, spec in A.compile_divmod_sign_apply(L, dim):
+            block_specs.append((name, spec))
     block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=ALU_OPS)))
     from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
     for name, spec in build_bitwise_blocks(L, dim):
         block_specs.append((name, spec))
+    # C4_SHIFT32 (#790): recompose the FULL 32-bit SHL/SHR result into AX_VAL (the
+    # shifter already wrote all 8 AX nibbles) instead of the low byte, so the 32-bit
+    # shift survives.  OR/XOR/AND stay 8-bit (per-nibble table over the loaded byte,
+    # the golden semantics).  Flag OFF -> wide_ops empty -> byte-IDENTICAL.
+    _shift_wide = (isa.SHL, isa.SHR) if _shift32_enabled() else ()
     block_specs.append(("bw-recompose", _bw_recompose_spec(
-        L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR))))
+        L, dim, (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR),
+        wide_ops=_shift_wide)))
 
     # Dispatch: base ops MINUS the ALU ops (ax-mux writes AX) + memory + cmp +
     # callconv + ALU housekeeping + bitwise housekeeping.
@@ -1709,6 +1785,12 @@ def build_pure_forward_complete_model(code_size: int = 32,
     byte_ax_ops = [isa.IMM, isa.LEA] + \
                   [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] + \
                   [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR]
+    if _shift32_enabled():
+        # C4_SHIFT32 (#790): SHL/SHR keep their FULL 32-bit AX nibble result — the
+        # ``ax-byte-nib`` writeback must NOT clear nibbles 2..7 for them.  (OR/XOR/AND
+        # stay byte ops.)  The full result already lives in the AX nibble band from
+        # the tight shifter; the byte-nib block only clobbered it.
+        byte_ax_ops = [op for op in byte_ax_ops if op not in (isa.SHL, isa.SHR)]
     block_specs += [
         ("dispatch", compile_ffn(disp_rules, dim)),
         ("branch-delta", compile_branch_delta_clean(L, dim)),  # BZ/BNZ via IMM_CLEAN
@@ -1862,6 +1944,82 @@ def cmp_dispatch_rules_pop(L) -> List[FFNRule]:
 def _bitwise_pop_rules(L) -> List[FFNRule]:
     from .nibble_pure_forward import bitwise_dispatch_rules
     return bitwise_dispatch_rules(L)
+
+
+# ===========================================================================
+# C4_CMP32 (#790): PER-NIBBLE 32-bit equality, robust to wide-scalar noise.
+# The default cmp reads STK_VAL/AX_VAL (a 5-nibble ~20-bit recompose whose ~1e-6
+# relative silu residue reaches ~±1 at a ~10^6-scale operand), so an EXACT 32-bit
+# TIE (STK==AX) mis-fires the Z(STK_VAL-AX_VAL) bump / the MAG ramps.  These two
+# ADDITIVE blocks decide equality from the residue-immune NIBBLE bands directly
+# (each nibble is a small 0..15 integer, exact) and override the verdict on a tie.
+# Both are UNGATED FFNs (no OP_IS) — they only touch cmp scratch dims, which are
+# read only by the OP_IS-gated cmp writeback, so a non-cmp step is a strict no-op.
+# ===========================================================================
+def compile_cmp_nib_ndiff(L, dim: int) -> Dict[str, torch.Tensor]:
+    """``NIB_EQ := NDIFF = Σ_{j<8} |STACK0[j] - AX[j]|`` — the nibble-wise L1 distance
+    (a non-negative integer, 0 iff the two words are equal in EVERY nibble = a full
+    32-bit tie).  Each nibble is a small 0..15 integer so every ``relu`` is fp-exact.
+    SET (self-clears NIB_EQ first)."""
+    n = 8                                              # 8 nibbles = 32 bits
+    spec = _empty_spec(dim, 1 + 2 * n)                 # self-clear + 2 relu/nibble
+    u = 0
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.NIB_EQ] = 1.0
+    spec["W_down"][L.NIB_EQ, u] += -1.0 / SILU_S; u += 1
+    for j in range(n):
+        s, a = L.STACK0 + j, L.AX + j
+        spec["W_up"][u, s] = RELU_S; spec["W_up"][u, a] = -RELU_S     # +relu(s-a)
+        spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][L.NIB_EQ, u] += 1.0 / RELU_S; u += 1
+        spec["W_up"][u, a] = RELU_S; spec["W_up"][u, s] = -RELU_S     # +relu(a-s)
+        spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][L.NIB_EQ, u] += 1.0 / RELU_S; u += 1
+    return spec
+
+
+def compile_cmp_nib_tie(L, dim: int) -> Dict[str, torch.Tensor]:
+    """``NIB_EQ := relu(1 - NIB_EQ)`` — collapse the NDIFF distance into the clean
+    0/1 TIE flag (1 iff NDIFF==0, since NDIFF is a non-negative integer).  In place
+    (reads the NDIFF written by :func:`compile_cmp_nib_ndiff`, self-clears, rewrites
+    the clamped flag)."""
+    spec = _empty_spec(dim, 2)
+    u = 0
+    # self-clear NIB_EQ (subtract the OLD NDIFF, read from the block input).
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.NIB_EQ] = 1.0
+    spec["W_down"][L.NIB_EQ, u] += -1.0 / SILU_S; u += 1
+    # NIB_EQ += relu(1 - NDIFF_old).  Both units read the block INPUT (NDIFF_old), so
+    # the self-clear (also reading input) and this add compose to SET NIB_EQ = tie.
+    spec["W_up"][u, L.NIB_EQ] = -RELU_S; spec["b_up"][u] = RELU_S * 1.0
+    spec["W_gate"][u, L.ONE] = 1.0
+    spec["W_down"][L.NIB_EQ, u] += 1.0 / RELU_S; u += 1
+    return spec
+
+
+def compile_cmp_nib_override(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Override the cmp verdict on an exact 32-bit tie using the clean ``NIB_EQ``
+    tie flag (0/1, from :func:`compile_cmp_nib_tie`):
+
+        CMP_EQ := NIB_EQ                    (clean 0/1, replaces the noisy Z(d) bump)
+        CMP_GT := relu(CMP_GT_old - NIB_EQ)  (0 on a tie, unchanged otherwise)
+        CMP_LT := relu(CMP_LT_old - NIB_EQ)  (0 on a tie, unchanged otherwise)
+
+    ``CMP_*_old`` and ``NIB_EQ`` are both clean 0/1 read from the block INPUT, so
+    ``relu(old - tie)`` is exactly ``old AND NOT tie``.  SET (self-clears the three
+    verdict lanes first)."""
+    spec = _empty_spec(dim, 3 + 1 + 2)                  # 3 clears + EQ(1) + GT/LT(2)
+    u = 0
+    for lane in (L.CMP_EQ, L.CMP_GT, L.CMP_LT):         # self-clear (SET)
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
+        spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
+    # CMP_EQ := NIB_EQ (silu-identity read of the clean 0/1 flag).
+    spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.NIB_EQ] = 1.0
+    spec["W_down"][L.CMP_EQ, u] += 1.0 / SILU_S; u += 1
+    # CMP_GT := relu(CMP_GT_old - NIB_EQ) ; CMP_LT := relu(CMP_LT_old - NIB_EQ).
+    for old in (L.CMP_GT, L.CMP_LT):
+        spec["W_up"][u, old] = RELU_S; spec["W_up"][u, L.NIB_EQ] = -RELU_S
+        spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][old, u] += 1.0 / RELU_S; u += 1
+    return spec
 
 
 # ===========================================================================

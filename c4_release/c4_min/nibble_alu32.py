@@ -85,6 +85,17 @@ def mul_lookahead() -> bool:
     return os.environ.get("C4_MUL_LOOKAHEAD", "1") != "0"
 
 
+def _signed_divmod_enabled() -> bool:
+    """``C4_DIVMOD_SIGNED`` (#790, DEFAULT OFF): compute DIV/MOD with native-c4
+    SIGNED truncation-toward-zero semantics instead of the golden UNSIGNED floor.
+    The base-16 long divider is UNSIGNED, so signed div/mod is done by NEGATING each
+    negative operand to its magnitude BEFORE the divide (recording its sign) and
+    conditionally negating the quotient (sign = SGN_A^SGN_B) / remainder (sign =
+    SGN_A) AFTER — all via a two's-complement carry chain over the operand / result
+    nibble bands.  OFF -> DIV/MOD stay unsigned-floor -> golden byte-IDENTICAL."""
+    return os.environ.get("C4_DIVMOD_SIGNED", "0") not in ("0", "", "false", "False")
+
+
 # ---------------------------------------------------------------------------
 # C4_KB_BATCHED — the divide's KB-precompute (``KB[k]=k*b`` normalise) resolve.
 #
@@ -404,6 +415,18 @@ class ALU32Bands:
             self.KB_P0 = L._band("ALU_KB_P0", _NK * _RN)    # propagate lane, buffer 0
             self.KB_G1 = L._band("ALU_KB_G1", _NK * _RN)    # generate lane, buffer 1
             self.KB_P1 = L._band("ALU_KB_P1", _NK * _RN)    # propagate lane, buffer 1
+        # SIGNED DIV/MOD (C4_DIVMOD_SIGNED, #790) — the sign flags + the conditional
+        # two's-complement negate scratch.  Allocated LAST + only when the flag is on
+        # so the UNSIGNED (golden) build's L.D + every band offset are byte-identical.
+        self.signed_divmod = _signed_divmod_enabled()
+        if self.signed_divmod:
+            self.SGN_A = L._scalar("ALU_SGN_A")     # 1 iff dividend (STACK0) < 0 (bit 31)
+            self.SGN_B = L._scalar("ALU_SGN_B")     # 1 iff divisor  (AX)     < 0 (bit 31)
+            self.RES_SGN = L._scalar("ALU_RES_SGN")  # quotient sign = SGN_A ^ SGN_B
+            # ZCUM[j] = [ Σ_{k<j} nib_k == 0 ] (the two's-complement carry-in), 9 slots
+            # (j=0..8) for whichever register is being negated this block (STACK0/AX/
+            # DIV_RES/MOD_RES — one negate per block, so ONE shared scratch suffices).
+            self.ZCUM = L._band("ALU_ZCUM", 9)
 
 
 def extend_layout_for_alu32(L, recurrent_divmod: bool = False,
@@ -986,6 +1009,115 @@ def _div_finalize_block(L, dim) -> Dict[str, torch.Tensor]:
         # the quotient from the iteration blocks -> it IS in the block input).
         u = _guard(spec, u, [gz], {a.DIV_RES + c: -1.0}, 0.0, a.DIV_RES + c, 1.0)  # - BZ*DIV_RES
     return _truncate(spec, u, dim)
+
+
+# ===========================================================================
+# SIGNED DIV/MOD (C4_DIVMOD_SIGNED, #790) — the sign-magnitude wrapper around the
+# UNSIGNED base-16 long divider.  Native c4 ``int`` is signed and c4 divides with
+# C truncation-toward-zero, so:
+#   * |a| = a<0 ? -a : a  ,  |b| = b<0 ? -b : b     (negate operands before divide)
+#   * q = trunc(a/b) = (sign(a)^sign(b)) ? -(|a|//|b|) : |a|//|b|
+#   * r = a - q*b        = sign(a)       ? -(|a|%|b|) : |a|%|b|
+# The divider itself is UNCHANGED (it sees the magnitudes); two extra blocks do the
+# conditional two's-complement negate before (operands) and after (results).
+# ===========================================================================
+def _neg_zcum_block(L, dim, reg_base) -> Dict[str, torch.Tensor]:
+    """Materialise ``ZCUM[j] = [ Σ_{k<j} reg_nib_k == 0 ]`` (j=0..8) — the
+    two's-complement carry-in for negating the 8-nibble register at ``reg_base``.
+    ``ZCUM[0] = 1`` (empty sum), ``ZCUM[j] = relu(1 - Σ_{k<j} nib_k)`` (the nibbles
+    are non-negative, so the prefix sum is 0 iff every lower nibble is 0).  UNGATED
+    (writes only the private ZCUM scratch; the apply block is what gates on op/sign).
+    SET (self-clears ZCUM first)."""
+    a = L.ALU32
+    spec = _empty_spec(dim, 9 * 2 + 1)
+    u = 0
+    for j in range(9):
+        u = _clear(spec, u, a.ZCUM + j)
+    u = _ident(spec, u, {L.ONE: 1.0}, 0.0, a.ZCUM + 0, 1.0)      # ZCUM[0] = 1
+    for j in range(1, 9):
+        low = {reg_base + k: 1.0 for k in range(min(j, 8))}
+        u = _relu(spec, u, {b: -c for b, c in low.items()}, 1.0, a.ZCUM + j, 1.0)  # relu(1-Σ)
+    return _truncate(spec, u, dim)
+
+
+def _cond_negate_apply_block(L, dim, reg_base, sign_flag, gate_ops) -> Dict[str, torch.Tensor]:
+    """SET ``reg[j] := (sign AND op) ? twoscomp(reg)[j] : reg[j]`` for j=0..7.
+    ``twoscomp[j] = (15 - x_j) + ZCUM[j] - 16*ZCUM[j+1]`` (ZCUM from the PRIOR
+    :func:`_neg_zcum_block`).  In place: ``reg[j] += g*(y_j - x_j)`` where
+    ``g = sign_flag AND (any op in gate_ops)`` and ``y_j - x_j = (15 - 2*x_j) +
+    ZCUM[j] - 16*ZCUM[j+1]``.  Every value reads the block INPUT."""
+    a = L.ALU32
+    wins = [(sign_flag, 1.0, 0.0)] + [(L.OP_IS + op, 1.0, 0.0) for op in gate_ops]
+    # NOTE: gate_ops is OR'd — but _guard ANDs its windows.  With DIV and MOD both
+    # present the op-gate must be an OR.  Since exactly one op fires per step, we emit
+    # ONE _guard per op (each ANDs sign AND that op); their sum = sign AND (DIV|MOD).
+    spec = _empty_spec(dim, 8 * len(gate_ops) * 3 + 4)
+    u = 0
+    for op in gate_ops:
+        w = [(sign_flag, 1.0, 0.0), (L.OP_IS + op, 1.0, 0.0)]
+        for j in range(8):
+            # g*(15 - 2*x_j)
+            u = _guard(spec, u, w, {reg_base + j: -2.0}, 15.0, reg_base + j, 1.0)
+            # g*ZCUM[j]
+            u = _guard(spec, u, w, {a.ZCUM + j: 1.0}, 0.0, reg_base + j, 1.0)
+            # g*(-16*ZCUM[j+1])
+            u = _guard(spec, u, w, {a.ZCUM + j + 1: -16.0}, 0.0, reg_base + j, 1.0)
+    return _truncate(spec, u, dim)
+
+
+def compile_divmod_sign_prep(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+    """SIGNED DIV/MOD, PART 1 (before the unsigned divide): detect the operand signs
+    and replace STACK0 (dividend a) / AX (divisor b) with their MAGNITUDES |a|/|b|,
+    gated on DIV|MOD.  Blocks:
+      sd-sign  : SGN_A=[STACK0 nib7>=8], SGN_B=[AX nib7>=8], RES_SGN=SGN_A xor SGN_B.
+      sd-zca   : ZCUM for STACK0 ; sd-nega : negate STACK0 if SGN_A (DIV|MOD).
+      sd-zcb   : ZCUM for AX     ; sd-negb : negate AX     if SGN_B (DIV|MOD).
+    A non-DIV/MOD step is a strict no-op (every negate is op-gated; the sign lanes
+    are private scratch read only by these blocks)."""
+    a = L.ALU32
+    gate = [isa.DIV, isa.MOD]
+    # --- sd-sign : sign flags from the operand top nibble (>= 8). ---
+    sgn = _empty_spec(dim, 2 * 3)
+    u = 0
+    u = _clear(sgn, u, a.SGN_A)
+    u = _step_ge(sgn, u, {L.STACK0 + 7: 1.0}, 0.0, 8, a.SGN_A, 1.0)     # [STACK0 nib7>=8]
+    u = _clear(sgn, u, a.SGN_B)
+    u = _step_ge(sgn, u, {L.AX + 7: 1.0}, 0.0, 8, a.SGN_B, 1.0)         # [AX nib7>=8]
+    sgn = _truncate(sgn, u, dim)
+    # --- sd-ressgn : RES_SGN = SGN_A xor SGN_B — a SEPARATE block so the SGN_A/SGN_B
+    # it reads are the values sd-sign WROTE (a same-block read would see the stale
+    # block input, i.e. 0, and RES_SGN would never fire). ---
+    rs = _empty_spec(dim, 1 + 2 + 2)                    # clear + 2 _step_ge (2 units each)
+    u = 0
+    u = _clear(rs, u, a.RES_SGN)
+    u = _step_ge(rs, u, {a.SGN_A: 1.0, a.SGN_B: 1.0}, 0.0, 1, a.RES_SGN, 1.0)   # +[sum>=1]
+    u = _step_ge(rs, u, {a.SGN_A: 1.0, a.SGN_B: 1.0}, 0.0, 2, a.RES_SGN, -1.0)  # -[sum>=2]
+    rs = _truncate(rs, u, dim)
+    return [
+        ("sd-sign", sgn),
+        ("sd-ressgn", rs),
+        ("sd-zca", _neg_zcum_block(L, dim, L.STACK0)),
+        ("sd-nega", _cond_negate_apply_block(L, dim, L.STACK0, a.SGN_A, gate)),
+        ("sd-zcb", _neg_zcum_block(L, dim, L.AX)),
+        ("sd-negb", _cond_negate_apply_block(L, dim, L.AX, a.SGN_B, gate)),
+    ]
+
+
+def compile_divmod_sign_apply(L, dim) -> List[Tuple[str, Dict[str, torch.Tensor]]]:
+    """SIGNED DIV/MOD, PART 2 (after the unsigned divide, before ax-mux): the divider
+    wrote the UNSIGNED |a|//|b| into DIV_RES and |a|%|b| into MOD_RES.  Apply the
+    result signs:
+      * quotient  DIV_RES negated iff RES_SGN (= SGN_A xor SGN_B)  — gated on DIV.
+      * remainder MOD_RES negated iff SGN_A   (r has the dividend's sign)  — on MOD.
+    Only the ACTIVE op's result feeds AX (the ax-mux is op-gated), so negating both
+    is safe; we op-gate anyway so a DIV step never perturbs MOD_RES and vice-versa."""
+    a = L.ALU32
+    return [
+        ("sd-zcq", _neg_zcum_block(L, dim, a.DIV_RES)),
+        ("sd-negq", _cond_negate_apply_block(L, dim, a.DIV_RES, a.RES_SGN, [isa.DIV])),
+        ("sd-zcr", _neg_zcum_block(L, dim, a.MOD_RES)),
+        ("sd-negr", _cond_negate_apply_block(L, dim, a.MOD_RES, a.SGN_A, [isa.MOD])),
+    ]
 
 
 # ===========================================================================

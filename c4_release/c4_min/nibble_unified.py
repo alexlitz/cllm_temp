@@ -383,12 +383,20 @@ def build_bitwise_blocks(L, dim, barrel_shift_ops=(isa.SHL, isa.SHR)
 # ===========================================================================
 # BUILD the ONE unified Transformer.
 # ===========================================================================
-def _bw_recompose_spec(L, dim, ops) -> Dict[str, torch.Tensor]:
+def _bw_recompose_spec(L, dim, ops, wide_ops=()) -> Dict[str, torch.Tensor]:
     """Recompose the AX low byte (nibbles 0,1) into AX_VAL, GATED on the bitwise/
     shift ops, so a bitwise result written to the AX NIBBLE bands lands on the
     scalar AX_VAL the frame emit reads. SET: clear AX_VAL then add nib0 + 16*nib1
-    (only when an OP_IS[op] in ``ops`` is active)."""
-    spec = _empty_spec(dim, 3 * len(ops))
+    (only when an OP_IS[op] in ``ops`` is active).
+
+    ``wide_ops`` (a subset of ``ops``, default empty) recompose the FULL 32-bit
+    result (all 8 nibbles, Σ 16^j·nib_j) into AX_VAL instead of just the low byte —
+    used by the ``C4_SHIFT32`` SHL/SHR path so the shifter's 32-bit result survives
+    into the scalar AX_VAL (which the next step's cmp/branch reads).  ``wide_ops``
+    empty -> byte-IDENTICAL to the low-byte recompose (golden)."""
+    wide = set(wide_ops)
+    n_nib = {op: (8 if op in wide else 2) for op in ops}
+    spec = _empty_spec(dim, sum(1 + n_nib[op] for op in ops))
     u = 0
     for op in ops:
         g = L.OP_IS + op
@@ -396,14 +404,11 @@ def _bw_recompose_spec(L, dim, ops) -> Dict[str, torch.Tensor]:
         spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
         spec["W_gate"][u, L.AX_VAL] = 1.0
         spec["W_down"][L.AX_VAL, u] += -1.0 / SILU_HALF; u += 1
-        # + nib0 (gated).
-        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
-        spec["W_gate"][u, L.AX + 0] = 1.0
-        spec["W_down"][L.AX_VAL, u] += 1.0 / SILU_HALF; u += 1
-        # + 16*nib1 (gated).
-        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
-        spec["W_gate"][u, L.AX + 1] = 16.0
-        spec["W_down"][L.AX_VAL, u] += 1.0 / SILU_HALF; u += 1
+        # + Σ_{j<n} 16^j·nib_j (gated).  n=2 (low byte, golden) or 8 (full 32-bit).
+        for j in range(n_nib[op]):
+            spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+            spec["W_gate"][u, L.AX + j] = 16.0 ** j
+            spec["W_down"][L.AX_VAL, u] += 1.0 / SILU_HALF; u += 1
     return spec
 
 
