@@ -204,6 +204,27 @@ class SparseAttn:
         else:
             K, V, k_pos = Knew, Vnew, q_pos
 
+        # BYTE-EXACT FLASH (C4_FLASH_ATTN): tiled softmax1+ALiBi that never
+        # materialises the [B,H,Sq,Sk] score matrix — the O(S²)-memory fix for the
+        # un-windowed global forward.  softmax1 == plain-softmax over a BOS-sink
+        # column (blogspec_model §40-44) so a standard flash kernel + the sink
+        # recovers it EXACTLY.  fp32 (~1e-6, below the nibble-decode margin).  The
+        # un-cached FULL case (past_kv is None and q_positions is None: pos 0..S-1,
+        # top-left causal) uses SDPA mem-efficient; every other case the general
+        # online-softmax1 Triton kernel.
+        import os as _osf
+        if _osf.environ.get("C4_FLASH_ATTN", "0") == "1" and Q.is_cuda:
+            from .flash_softmax1 import flash_softmax1_context
+            uncached_full = (past_kv is None and q_positions is None)
+            ctx = flash_softmax1_context(
+                Q, K, V, q_pos, k_pos, self.alibi_slopes, self.scale,
+                window=None, uncached_full=uncached_full)
+            out = ctx.transpose(1, 2).contiguous().view(B, S, D)
+            out = x + self.W_o.linear(out)
+            if use_cache:
+                return out, (K, V, k_pos)
+            return out
+
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 
         if past_kv is None and q_positions is None:
