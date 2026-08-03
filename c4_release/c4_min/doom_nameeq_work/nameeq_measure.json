@@ -1,0 +1,21 @@
+{
+  "total_init_steps": 114852806,
+  "name_eq_calls": 403651,
+  "call_sites_in_image": 1,
+  "name_eq_c_steps": 34188939,
+  "native_nameeq_steps": 403651,
+  "step_reduction": 33785288,
+  "step_reduction_pct": 29.416162457537173,
+  "ms_per_step": 0.0074,
+  "old_frame_ms": 849910.7644,
+  "new_frame_ms": 599899.6332,
+  "speedup": 1.4167549325982818,
+  "static_battery_checked": 145,
+  "static_battery_fails": 0,
+  "observed_pairs_checked": 60,
+  "observed_pairs_fails": 0,
+  "name_eq_entry_pc": 548188,
+  "c4_toupper_entry_pc": 699,
+  "w_checknumforname_entry_pc": 548261,
+  "per_call_step_mean": 84.69925504953537
+}
