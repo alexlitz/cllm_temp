@@ -448,13 +448,31 @@ def _cluster_cmp() -> List[Case]:
         ("intmin_vs_intmax", INT_MIN, INT_MAX, "INT_MIN vs INT_MAX"),
         ("eq_big", 0x12345678, 0x12345678, "x vs x"),
         ("pos_vs_neg", 0x00000005, 0xFFFFFFFB, "5 vs -5"),
+        # WIDE-MAGNITUDE ORDER (#825, the doom step-30,850 GT wall): the decisive
+        # nibble sits in a HIGH byte, so the golden ``step(STK_VAL-AX_VAL)`` on the
+        # ~10^9-scale wide-scalar recompose collapses under fp32's 2^24 exact range.
+        # C4_CMP32's per-nibble lexicographic order decides these exactly.
+        ("doom_heap_ptr", 0x40001000, 0x00001000, "1073744896 vs 4096 (GT=1)"),
+        ("hi_byte_gt", 0x40000000, 0x3FFFFFFF, "hi-byte decides GT (2^30 vs 2^30-1)"),
+        ("hi_byte_lt", 0x01000000, 0x01000001, "hi-byte tie, low nibble LT"),
+        ("wide_pos_gt", 0x7FFFFF00, 0x00000100, "large pos vs small pos"),
+        ("both_neg_ord", 0xFFFFFF00, 0xFFFFFFF0, "-256 vs -16 (both neg, LT)"),
+        ("big_neg_vs_big_pos", 0x80001000, 0x40001000, "2^31-block neg vs pos"),
     ]
-    # (op, pair) combinations the NEURAL model gets wrong (measured 2026-08).
+    # (op, pair) combinations the NEURAL model gets wrong WITHOUT the C4_CMP32 order
+    # extension (measured 2026-08).  The wide-magnitude pairs are ALL xfail off-flag
+    # (the golden wide-scalar order collapses) and become PASSES under C4_CMP32.
+    _WIDE = {"doom_heap_ptr", "hi_byte_gt", "hi_byte_lt", "wide_pos_gt",
+             "both_neg_ord", "big_neg_vs_big_pos"}
     _NEURAL_CMP_XFAIL = {
         ("EQ", "eq_big"),
         ("NE", "neg_vs_pos"), ("NE", "intmin_vs_intmax"), ("NE", "eq_big"),
         ("GT", "eq_big"), ("LE", "eq_big"),
     }
+    # every order op on a wide pair is off-flag-broken (the high-byte order collapses).
+    for op in ("LT", "GT", "LE", "GE", "NE", "EQ"):
+        for pname in _WIDE:
+            _NEURAL_CMP_XFAIL.add((op, pname))
     for op in cmp_ops:
         for pname, a, b, note in pairs:
             cs.append(Case(f"{op.lower()}_{pname}", op,
