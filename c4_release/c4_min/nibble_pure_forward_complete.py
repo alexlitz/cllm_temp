@@ -1022,7 +1022,13 @@ def callconv_dispatch_rules(L) -> List[FFNRule]:
 def alu32_housekeeping_rules(L) -> List[FFNRule]:
     sp, pc = L.SP_VAL, L.PC_VAL
     rules = []
-    for op in ALU_OPS:
+    ops = list(ALU_OPS)
+    if isa.float_ops_enabled():
+        # C4_FLOAT_OPS: the float ops (F_ADD/F_SUB/F_MUL/F_DIV) also pop one 32-bit
+        # stack operand and advance PC — same housekeeping (SP += 4, PC += 1) as the
+        # integer ALU ops; the F_RES -> AX write is done by the float latch.
+        ops += [isa.F_ADD, isa.F_SUB, isa.F_MUL, isa.F_DIV]
+    for op in ops:
         rules.append(FFNRule([(L.OP_IS + op, 0.5, 1.5)],
                              {sp: LinearExpr.c(4.0), pc: LinearExpr.c(1.0)}))
     return rules
@@ -1036,14 +1042,18 @@ def compile_opcode_decode_pfc(L, dim: int) -> Dict[str, torch.Tensor]:
     no-ops.  This widens the decode so the callconv one-hots light up."""
     from .nibble_vm import BASE_OPS
     from .nibble_unified import compile_opcode_decode_ops
-    ops = sorted(set(BASE_OPS + PF.PF_MEM_OPS +
-                     [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] +
-                     [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR] +
-                     [isa.MUL, isa.DIV, isa.MOD] +
-                     [isa.JSR, isa.ENT, ADJ, isa.LEV] +      # + calling convention
-                     [isa.PRTF] +                            # + PRTF (I/O: PC += 1)
-                     [isa.NOP]))                             # + NOP (PC += 1 no-op)
-    return compile_opcode_decode_ops(L, dim, ops)
+    ops = set(BASE_OPS + PF.PF_MEM_OPS +
+              [isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE] +
+              [isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR] +
+              [isa.MUL, isa.DIV, isa.MOD] +
+              [isa.JSR, isa.ENT, ADJ, isa.LEV] +      # + calling convention
+              [isa.PRTF] +                            # + PRTF (I/O: PC += 1)
+              [isa.NOP])                              # + NOP (PC += 1 no-op)
+    if isa.float_ops_enabled():
+        # C4_FLOAT_OPS: decode the IEEE-754 single ops so OP_IS[F_ADD/F_SUB/F_MUL/
+        # F_DIV] light up for the float megablocks + latches.
+        ops |= {isa.F_ADD, isa.F_SUB, isa.F_MUL, isa.F_DIV}
+    return compile_opcode_decode_ops(L, dim, sorted(ops))
 
 
 def compile_ax_nib_split(L, dim: int) -> Dict[str, torch.Tensor]:
@@ -1587,6 +1597,13 @@ def build_pure_forward_complete_model(code_size: int = 32,
     A.extend_layout_for_alu32(L, recurrent_divmod=recurrent_divmod)  # ALU scratch bands
     from . import nibble_bitwise as _bw
     _bw.extend_layout_for_bitwise(L)
+    # NATIVE FLOAT (C4_FLOAT_OPS, default OFF): allocate the IEEE-754 single ALU
+    # scratch bands.  Flag OFF -> extend_layout_for_fp32 is never called ⇒ L.D and
+    # every band offset are byte-identical to the golden 069cc32f build.
+    _float = isa.float_ops_enabled()
+    if _float:
+        from . import nibble_fp32 as _fp
+        _fp.extend_layout_for_fp32(L)
     # SHIFTER scratch: allocate the active shifter's private per-op scratch bands NOW,
     # before ``dim`` is fixed, so the shift blocks (compiled inside build_bitwise_blocks
     # at the fixed ``dim``) address valid residual dims.  BARREL (C4_BARREL_SHIFT=1)
@@ -1755,6 +1772,14 @@ def build_pure_forward_complete_model(code_size: int = 32,
         for name, spec in A.compile_divmod_sign_apply(L, dim):
             block_specs.append((name, spec))
     block_specs.append(("ax-mux", A.compile_ax_mux(L, dim, ops=ALU_OPS)))
+    # NATIVE FLOAT (C4_FLOAT_OPS, default OFF): the IEEE-754 single F_ADD/F_SUB/
+    # F_MUL/F_DIV megablocks compute their result into F_RES and a per-op latch copies
+    # it into AX gated on OP_IS[F_*].  Runs AFTER the integer ax-mux so a float step's
+    # AX is set by the float latch.  Flag OFF -> no blocks added -> byte-identical.
+    if _float:
+        from . import nibble_fp32 as _fp
+        for name, spec in _fp.compile_all_fp_blocks(L, dim):
+            block_specs.append((name, spec))
     from .nibble_unified import build_bitwise_blocks, _bw_recompose_spec
     for name, spec in build_bitwise_blocks(L, dim):
         block_specs.append((name, spec))

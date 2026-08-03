@@ -118,7 +118,11 @@ class NibbleVMLayout:
         self.AX_ZERO = self._scalar("AX_ZERO")
         self.OP_VAL = self._scalar("OP_VAL")
         self.IMM = self._scalar("IMM")
-        self.OP_IS = self._band("OP_IS", isa.NUM_OPS)   # decoded opcode one-hot
+        # OP_IS band width: NUM_OPS (40, golden) normally; NUM_OPS_FLOAT (44) when
+        # C4_FLOAT_OPS is on so the gated F_ADD/F_SUB/F_MUL/F_DIV one-hots (opcodes
+        # 40..43) have a slot.  Flag OFF -> width 40 -> every downstream dim is
+        # byte-identical to the golden 069cc32f build.
+        self.OP_IS = self._band("OP_IS", isa.num_ops_effective())  # decoded opcode one-hot
 
         # The dispatch writes the next-state directly into the value lanes above
         # (SET semantics, per universal.py); the driver's frame round-trip

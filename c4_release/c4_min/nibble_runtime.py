@@ -346,6 +346,10 @@ def ref_interpret_words(code: List[isa.Instr], max_steps: int = 5000,
             ax = (pop() - ax) & 0xFFFFFFFF
         elif op == isa.MUL:
             ax = (pop() * ax) & 0xFFFFFFFF
+        elif op in isa.FLOAT_OPS:
+            # NATIVE IEEE-754 single: operands are RAW 32-bit float bit patterns
+            # (STACK0 = popped a, AX = b), result is the raw bits of ``a OP b``.
+            ax = isa.f32_op_bits(op, pop(), ax)
         elif op == isa.LT:
             ax = 1 if pop() < ax else 0
         elif op == isa.LI:
