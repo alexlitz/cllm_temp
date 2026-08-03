@@ -3,10 +3,10 @@
     "name": "NVIDIA RTX A5000",
     "sm": 64.0,
     "mem_gb": 25.283526656,
-    "peak_fp32_tflops": 17.3727868008989,
-    "peak_tf32_tflops": 44.19297238737386,
-    "peak_bf16_tflops": 87.11060546738044,
-    "hbm_bw_gbs": 681.6230705606622
+    "peak_fp32_tflops": 17.442071025956007,
+    "peak_tf32_tflops": 44.49487536990274,
+    "peak_bf16_tflops": 89.20061816009344,
+    "hbm_bw_gbs": 681.2083157545478
   },
   "model": {
     "blocks": 242,
@@ -28,96 +28,32 @@
     "4096": 0.0417
   },
   "forms": {
-    "coo": {
-      "1024": {
-        "eager_ms_step": 43.19686514014999,
-        "graph_ms_step": 33.379049940655634,
-        "ms_per_token": 0.03259672845767152,
-        "graph_replays": true,
-        "graph_replay_rel_err": 0.0,
-        "useful_tflops": 0.11558779602353828,
-        "pct_of_fp32_peak": 0.6653382519928095,
-        "peak_vram_gb": 0.386168832,
-        "speedup_vs_coo": 1.006235949187123,
-        "speedup_vs_dense": 2.144386977078655,
-        "n_ffn_swapped": 242
-      },
-      "4096": {
-        "eager_ms_step": 170.80337824299932,
-        "graph_ms_step": 170.20675797636312,
-        "ms_per_token": 0.04155438427157303,
-        "graph_replays": true,
-        "graph_replay_rel_err": 0.0,
-        "useful_tflops": 0.3389187506174754,
-        "pct_of_fp32_peak": 1.950860011704853,
-        "peak_vram_gb": 4.467595264,
-        "speedup_vs_coo": 1.0035042205769509,
-        "speedup_vs_dense": 1.7326691578307065,
-        "n_ffn_swapped": 242
-      }
-    },
     "delta": {
       "1024": {
-        "eager_ms_step": 19.47236793736617,
-        "graph_ms_step": 7.570456216732661,
-        "ms_per_token": 0.0073930236491529895,
+        "eager_ms_step": 18.69697691872716,
+        "graph_ms_step": 7.547545339912176,
+        "ms_per_token": 0.0073706497460079845,
         "graph_replays": true,
         "graph_replay_rel_err": 0.0,
-        "useful_tflops": 0.5096404636053979,
-        "pct_of_fp32_peak": 2.933556195941046,
-        "peak_vram_gb": 0.407325184,
-        "speedup_vs_coo": 4.436615051780318,
-        "speedup_vs_dense": 9.454859515836713,
-        "n_ffn_swapped": 242
-      },
-      "4096": {
-        "eager_ms_step": 65.40474652623136,
-        "graph_ms_step": 64.9502657353878,
-        "ms_per_token": 0.015856998470553663,
-        "graph_replays": true,
-        "graph_replay_rel_err": 0.0,
-        "useful_tflops": 0.8881605195430318,
-        "pct_of_fp32_peak": 5.112366425270796,
-        "peak_vram_gb": 4.483177984,
-        "speedup_vs_coo": 2.6297536748481507,
-        "speedup_vs_dense": 4.5405818846299,
+        "useful_tflops": 0.5111874976884729,
+        "pct_of_fp32_peak": 2.9307729393359385,
+        "peak_vram_gb": 0.384712192,
+        "speedup_vs_coo": 4.450082574845562,
+        "speedup_vs_dense": 9.48356012139344,
         "n_ffn_swapped": 242
       }
     }
   },
   "projection": {
-    "coo": {
-      "1024": {
-        "frame_steps": 6890000.0,
-        "frame_seconds": 224.59145907335676,
-        "frame_minutes": 3.743190984555946,
-        "clears_1min": false,
-        "ms_per_token_to_clear": 0.008708272859216255
-      },
-      "4096": {
-        "frame_steps": 6890000.0,
-        "frame_seconds": 286.30970763113817,
-        "frame_minutes": 4.77182846051897,
-        "clears_1min": false,
-        "ms_per_token_to_clear": 0.008708272859216255
-      }
-    },
     "delta": {
       "1024": {
         "frame_steps": 6890000.0,
-        "frame_seconds": 50.9379329426641,
-        "frame_minutes": 0.8489655490444016,
+        "frame_seconds": 50.78377674999501,
+        "frame_minutes": 0.8463962791665836,
         "clears_1min": true,
-        "ms_per_token_to_clear": 0.008708272859216255
-      },
-      "4096": {
-        "frame_steps": 6890000.0,
-        "frame_seconds": 109.25471946211474,
-        "frame_minutes": 1.8209119910352456,
-        "clears_1min": false,
         "ms_per_token_to_clear": 0.008708272859216255
       }
     }
   },
-  "block_k": 512
+  "block_k": 128
 }
