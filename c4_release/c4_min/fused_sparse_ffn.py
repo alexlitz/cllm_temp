@@ -431,3 +431,73 @@ class HybridFusedFFN:
 
     def forward(self, x):
         return self._impl.forward(x)
+
+
+# ---------------------------------------------------------------------------
+# INSTALL — swap every non-routed SparseBlock's FFN for the #808 fused DELTA
+# kernel (``FusedUpGateSiluDeltaFFN``: kernel-1 fuses up+gate+silu; kernel-2 adds
+# W_down @ hidden ONLY to the residual rows W_down writes, in place).  This is the
+# 0.0024/0.0074 ms/tok kernel measured in isolation; ``install_fused_delta_ffn``
+# wires it into the SAME forward the batched verify path drives, so it COMPOSES
+# with direct-CAM + banded local attention (which only touch attention).
+#
+# Drop-in for ``block_sparse_ffn.install_block_sparse_ffn`` (same swap contract:
+# a ``.ffn`` with a ``.forward(x)->x_out`` residual-add signature).  Byte-exact at
+# the nibble-snap margin (same nonzeros, fp-accum-order residue only).  A block
+# whose ``b_down != 0`` (the delta path asserts b_down==0) or whose dense-recompute
+# would blow up falls back to the 2-launch ``FusedUpGateSiluFFN`` (also fused,
+# hidden written ONCE).  Routed FFNs (Top1RoutedFFN) are kept dense.
+# ---------------------------------------------------------------------------
+def fused_delta_ffn_enabled() -> bool:
+    """``C4_FUSED_DELTA_FFN`` (DEFAULT OFF): install the #808 fused delta sparse-FFN
+    kernel on the verify-path blocks.  OFF -> the un-fused COO / dense FFN (byte-exact
+    golden path, 069cc32f unchanged)."""
+    import os
+    return os.environ.get("C4_FUSED_DELTA_FFN", "0") not in ("0", "", "false", "False")
+
+
+def install_fused_delta_ffn(model, device=None, *, block_k: int = 256,
+                            verbose: bool = False):
+    """Swap every non-routed block's FFN for the #808 fused DELTA kernel.
+
+    Returns a stats dict.  ``block_k`` is the Triton K-tile (span-column) size.
+    The delta form needs ``b_down == 0`` (true for the whole c4_min model — probed);
+    a block that violates it (or a routed FFN) is left as-is / uses the 2-launch
+    fallback.  Idempotent over shared FFN objects (a recurrent build's shared FFN is
+    converted once and reused)."""
+    if device is None:
+        device = model.embed.device
+    n_swapped = 0
+    n_routed = 0
+    n_fallback = 0
+    converted = {}
+    for b in model.blocks:
+        if getattr(b, "_routed", False):
+            n_routed += 1
+            continue
+        cur = b.ffn
+        if isinstance(cur, (FusedUpGateSiluDeltaFFN, FusedUpGateSiluFFN,
+                            FusedFullFFN, HybridFusedFFN)):
+            continue                              # already fused (shared object)
+        existing = converted.get(id(cur))
+        if existing is not None and existing[0] is cur:
+            b.ffn = existing[1]
+            continue
+        # b_down all-zero across the model -> the delta-in-place path applies.  A
+        # rare nonzero-b_down block would fail the delta assert, so fall back to the
+        # 2-launch fused form (which folds b_down explicitly) for it.
+        bd = cur.b_down.to(device).float()
+        if bool((bd != 0).sum() == 0):
+            fused = FusedUpGateSiluDeltaFFN(cur, device, block_k=block_k)
+        else:
+            fused = FusedUpGateSiluFFN(cur, device, block_k=block_k)
+            n_fallback += 1
+        converted[id(cur)] = (cur, fused)         # keep cur alive -> id stays valid
+        b.ffn = fused
+        n_swapped += 1
+    if verbose:
+        print(f"[fused-delta-ffn] swapped {n_swapped} distinct FFNs "
+              f"(delta={n_swapped - n_fallback}, 2-launch-fallback={n_fallback}, "
+              f"{n_routed} routed kept dense) block_k={block_k}", flush=True)
+    return {"swapped": n_swapped, "delta": n_swapped - n_fallback,
+            "fallback": n_fallback, "routed": n_routed, "block_k": block_k}
