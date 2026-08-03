@@ -835,12 +835,20 @@ class Compiler:
             is_inc = self.peek() == TokenType.INC
             self.advance()
             self.parse_expression(TokenType.INC)
+            # Prefix ++p/--p strides sizeof(*p): 1 for char* (base is CHAR),
+            # 8 otherwise (int*; char**/int** -> pointer element = 8).
+            # Non-pointers stride 1. Mirrors c4.c and the postfix ++/--,
+            # pointer +/- and [k] paths.
+            if self.expr_type >= PTR:
+                step = 1 if (self.expr_type - PTR) == CHAR else 8
+            else:
+                step = 1
             if self.code and (self.code[-1] & 0xFF) in (Op.LI, Op.LC):
                 is_char = (self.code[-1] & 0xFF) == Op.LC
                 self.code[-1] = int(Op.PSH)
                 self.emit(Op.LC if is_char else Op.LI)
             self.emit(Op.PSH)
-            self.emit(Op.IMM, 8 if self.expr_type >= PTR else 1)
+            self.emit(Op.IMM, step)
             self.emit(Op.ADD if is_inc else Op.SUB)
             self.emit(Op.SC if self.expr_type == CHAR else Op.SI)
 
@@ -1029,16 +1037,25 @@ class Compiler:
             elif self.peek() == TokenType.INC or self.peek() == TokenType.DEC:
                 is_inc = self.peek() == TokenType.INC
                 self.advance()
+                # p++/p-- strides sizeof(*p): 1 for char* (base is CHAR),
+                # 8 otherwise (int* -> sizeof(int)=8; char**/int** -> sizeof
+                # of a pointer = 8). Non-pointers stride 1. This mirrors
+                # c4.c (p++ adds sizeof(*p)) and the pointer +/- and [k]
+                # paths above.
+                if saved_type >= PTR:
+                    step = 1 if (saved_type - PTR) == CHAR else 8
+                else:
+                    step = 1
                 if self.code and (self.code[-1] & 0xFF) in (Op.LI, Op.LC):
                     is_char = (self.code[-1] & 0xFF) == Op.LC
                     self.code[-1] = int(Op.PSH)
                     self.emit(Op.LC if is_char else Op.LI)
                 self.emit(Op.PSH)
-                self.emit(Op.IMM, 8 if saved_type >= PTR else 1)
+                self.emit(Op.IMM, step)
                 self.emit(Op.ADD if is_inc else Op.SUB)
                 self.emit(Op.SC if saved_type == CHAR else Op.SI)
                 self.emit(Op.PSH)
-                self.emit(Op.IMM, 8 if saved_type >= PTR else 1)
+                self.emit(Op.IMM, step)
                 self.emit(Op.SUB if is_inc else Op.ADD)
 
             elif self.peek() == TokenType.BRAK:
