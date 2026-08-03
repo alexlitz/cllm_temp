@@ -108,6 +108,12 @@ class KBatchBoundedBlock:
 
     def __init__(self, blk, window: int, store_dim: int):
         self.b = BoundedBlock(blk, window, store_dim)
+        # SELF-EMU DIRECT-CAM (C4_SELFEMU_DIRECT_CAM): when armed, the global CAM
+        # heads DIRECT-GATHER the draft-resolved value (O(1)) instead of softmax1
+        # over the store rows (O(n_store)).  Populated by the runner via
+        # ``arm_direct_cam``; None -> the vanilla store-row softmax path.
+        self._dcam_kinds = None                # {head_idx: "mem"/"pop"/"lev"}
+        self._dcam_tbl = None                  # DirectCamTable
 
     # ------------------------------------------------------------------
     def _local_layout(self, q_t, W):
@@ -219,12 +225,21 @@ class KBatchBoundedBlock:
                 ctx_full[:, :, b.local_idx] = self._attend_dense(
                     x, q_t, b.local_idx, ki, vld, dst)
             if b.global_idx.numel() > 0:
-                if all_store is None:
-                    col = x[0, :, b.store_dim]
-                    all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
-                ki, vld, dst = self._store_layout(q_t, all_store)
-                ctx_full[:, :, b.global_idx] = self._attend_dense(
-                    x, q_t, b.global_idx, ki, vld, dst)
+                if self._dcam_kinds is not None:
+                    # SELF-EMU DIRECT-CAM: O(1) gather of the resolved value's V
+                    # vector per query row -> NO O(n_store) softmax over stores.
+                    from .selfemu_direct_cam import gather_global_ctx
+                    gctx = gather_global_ctx(
+                        self._dcam_kinds, self._dcam_tbl, q_idxs, b.global_idx,
+                        HD, x.device, ctx_full.dtype)          # [Q, nG, HD]
+                    ctx_full[:, :, b.global_idx] = gctx.unsqueeze(0)
+                else:
+                    if all_store is None:
+                        col = x[0, :, b.store_dim]
+                        all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
+                    ki, vld, dst = self._store_layout(q_t, all_store)
+                    ctx_full[:, :, b.global_idx] = self._attend_dense(
+                        x, q_t, b.global_idx, ki, vld, dst)
             ctx = ctx_full.reshape(B, Q, D)
             aout = xq + b.attn.W_o.linear(ctx)
         # FFN over the K query rows (one batched K-row FFN).
@@ -336,6 +351,30 @@ class KBatchBoundedRunner:
         keep = None if block_idxs is None else set(int(b) for b in block_idxs)
         for bi, kb in enumerate(self.kblocks):
             kb.b.fp64_ffn = True if keep is None else (bi in keep)
+
+    def arm_direct_cam(self, tbl) -> int:
+        """SELF-EMU DIRECT-CAM (C4_SELFEMU_DIRECT_CAM): arm the global CAM heads of
+        every block to DIRECT-GATHER the draft-resolved values in ``tbl``
+        (``selfemu_direct_cam.DirectCamTable``) instead of softmax1 over the store
+        rows.  Returns the number of blocks armed.  ``tbl=None`` disarms (back to the
+        softmax path)."""
+        from .selfemu_direct_cam import block_global_kinds
+        block_names = list(getattr(self.L, "_block_names", []))
+        n_armed = 0
+        for bi, kb in enumerate(self.kblocks):
+            if tbl is None or kb.b.global_idx.numel() == 0:
+                kb._dcam_kinds = None
+                kb._dcam_tbl = None
+                continue
+            kinds = block_global_kinds(bi, self.L, block_names, kb.b.global_idx)
+            if kinds:
+                kb._dcam_kinds = kinds
+                kb._dcam_tbl = tbl
+                n_armed += 1
+            else:
+                kb._dcam_kinds = None
+                kb._dcam_tbl = None
+        return n_armed
 
     def live_union(self, ops) -> List[int]:
         """The union of live blocks over the K ops (None -> full stack)."""

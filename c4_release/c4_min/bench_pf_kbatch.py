@@ -160,6 +160,15 @@ def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
         for q in q_positions:
             for role in range(N_ROLES):
                 x_full[0, q, L.ROLE + role] = 1.0
+    # SELF-EMU DIRECT-CAM (C4_SELFEMU_DIRECT_CAM): arm the runner's global CAM heads
+    # to DIRECT-GATHER the resolved values (O(1)) instead of softmax1 over the growing
+    # store set (O(n_store)).  The per-qpos resolved reads are already computed above.
+    from .selfemu_direct_cam import (selfemu_direct_cam_enabled,
+                                     build_direct_cam_table)
+    dcam_on = selfemu_direct_cam_enabled()
+    if dcam_on:
+        dcam_tbl = build_direct_cam_table(resolved_by_qpos)
+        runner.arm_direct_cam(dcam_tbl)
     trace: List[int] = []
     n_forwards = 0
     s = 0
@@ -178,6 +187,8 @@ def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
             state = _apply_direct_cam(state, L, resolved_by_qpos.get(q, []))
             trace.append(_decode_qrow(state.cpu(), L) & 0xFF)
         s = e
+    if dcam_on:
+        runner.arm_direct_cam(None)          # disarm (clean state between programs)
     return trace, n_forwards
 
 
