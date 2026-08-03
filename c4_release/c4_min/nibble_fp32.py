@@ -1361,7 +1361,7 @@ def _fp_div_shift_block(L, dim, k):
 
 
 _DIV_NIB = 8           # nibble columns for the 32-bit two's-complement subtract
-_DIV_CARRY_ROUNDS = 9  # carry-settle rounds (32-bit ripple + headroom)
+_DIV_CARRY_ROUNDS = 8  # carry-settle rounds (== nibble count: worst-case 0xF-chain ripple)
 
 
 def _fp_div_sncol_block(L, dim, k):
