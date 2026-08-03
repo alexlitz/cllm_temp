@@ -3,76 +3,36 @@
     "name": "NVIDIA RTX A5000",
     "sm": 64.0,
     "mem_gb": 25.283526656,
-    "peak_fp32_tflops": 17.28268589913606,
-    "peak_tf32_tflops": 43.89604090418029,
-    "peak_bf16_tflops": 90.1324801665842,
-    "hbm_bw_gbs": 682.5453792489475
+    "peak_fp32_tflops": 17.547509879719286,
+    "peak_tf32_tflops": 45.05733931436972,
+    "peak_bf16_tflops": 91.8583948612256,
+    "hbm_bw_gbs": 682.657933041153
   },
   "baseline_dense": {
     "1024": {
       "ms_per_token": 0.0699
-    },
-    "4096": {
-      "ms_per_token": 0.072
     }
   },
   "coo": {
     "1024": {
-      "eager_ms_step": 44.12452943623066,
-      "graph_ms_step": 33.558830954134464,
-      "ms_per_token": 0.03277229585364694,
+      "eager_ms_step": 40.20178740223248,
+      "graph_ms_step": 32.894210144877434,
+      "ms_per_token": 0.03212325209460687,
       "graph_replays": true,
       "graph_replay_rel_err": 0.0,
-      "useful_tflops": 0.1149685703078601,
-      "pct_of_fp32_peak": 0.6652239760580688,
+      "useful_tflops": 0.11729148683026923,
+      "pct_of_fp32_peak": 0.6684224008662908,
       "peak_vram_gb": 0.386168832,
       "baseline_dense_ms_per_token": 0.0699,
-      "speedup_vs_dense": 2.1328990898945963
-    },
-    "4096": {
-      "eager_ms_step": 171.5987031161785,
-      "graph_ms_step": 170.78809533268213,
-      "ms_per_token": 0.0416963123370806,
-      "graph_replays": true,
-      "graph_replay_rel_err": 0.0,
-      "useful_tflops": 0.3377651214367815,
-      "pct_of_fp32_peak": 1.9543554943254855,
-      "peak_vram_gb": 4.467595264,
-      "baseline_dense_ms_per_token": 0.072,
-      "speedup_vs_dense": 1.726771408894361
-    },
-    "8192": {
-      "eager_ms_step": 468.48,
-      "graph_ms_step": null,
-      "ms_per_token": 0.05719,
-      "graph_replays": false,
-      "graph_replay_note": "graph capture OOMs at K>=8192 (O(K^2) attn + [Dff,K] activations); eager only",
-      "useful_tflops": 0.4868,
-      "pct_of_fp32_peak": 2.821,
-      "peak_vram_gb": 16.974,
-      "baseline_dense_ms_per_token": 0.069,
-      "speedup_vs_dense": 1.207
+      "speedup_vs_dense": 2.175993881134327
     }
   },
   "projection": {
     "1024": {
       "frame_steps": 6890000.0,
-      "coo_frame_seconds": 225.8011184316274,
-      "coo_frame_minutes": 3.763351973860457,
+      "coo_frame_seconds": 221.32920693184133,
+      "coo_frame_minutes": 3.688820115530689,
       "dense_frame_minutes": 8.02685,
-      "clears_1min": false
-    },
-    "4096": {
-      "frame_steps": 6890000.0,
-      "coo_frame_seconds": 287.28759200248527,
-      "coo_frame_minutes": 4.788126533374754,
-      "dense_frame_minutes": 8.267999999999999,
-      "clears_1min": false
-    },
-    "8192": {
-      "frame_steps": 6890000.0,
-      "coo_frame_minutes": 6.57,
-      "dense_frame_minutes": 7.92,
       "clears_1min": false
     }
   },
@@ -90,42 +50,5 @@
       7,
       11
     ]
-  },
-  "attribution_K1024": {
-    "full_step_ms": 42.5,
-    "ffn_coo_ms": 38.9,
-    "ffn_coo_pct": 92,
-    "live_attn_ms": 5.27,
-    "live_attn_pct": 12,
-    "per_ffn_block_us": 160.7,
-    "coo_kernel_launches_per_step": 726,
-    "silu_glue_big_block_us": 134.1,
-    "note": "full-step is LAUNCH-BOUND: 726 sequential tiny Triton SpMM kernels (3 per FFN block) + per-block transpose/silu glue. This is why full-step 2.16x < per-block 7.5x."
-  },
-  "per_block_micro": {
-    "big_block_Dff": 4320,
-    "nnz_up_gate_down": "4320/4320/7920",
-    "K1024": {
-      "dense_us": 3420.5,
-      "coo_us": 451.8,
-      "speedup": 7.57
-    },
-    "K4096": {
-      "dense_us": 13283.4,
-      "coo_us": 1644.4,
-      "speedup": 8.08
-    }
-  },
-  "correctness": {
-    "worst_rel_linf": 0.0378,
-    "block": 239,
-    "source": "W_down fp accumulation-ORDER (35 nnz/row); up/gate ~3e-5",
-    "verdict": "byte-exact at nibble-snap decode margin (per #806)"
-  },
-  "headroom": {
-    "dense_padded_useful_pct_peak_K1024": 0.31,
-    "coo_useful_pct_peak_K1024": 0.665,
-    "recovered_factor": 2.15,
-    "note": "useful throughput 0.31%->0.665% of FP32 peak at K=1024 (2.15x more of peak recovered); dense-vs-useful FLOP gap is ~18000x (5.88 GFLOP dense-equiv / 0.326 MFLOP useful) \u2014 full-step COO recovers ~2.2x of the wall, remaining gap is the 726-launch overhead, not FLOPs."
   }
 }

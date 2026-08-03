@@ -1,0 +1,90 @@
+{
+  "all_byte_exact": true,
+  "state_hash_unchanged": true,
+  "state_hash_before": "f1cc6a90b5e98ce89bff9ce5fb909afc2d4ba6446e8fd3060f2068b94779331a",
+  "state_hash_after": "f1cc6a90b5e98ce89bff9ce5fb909afc2d4ba6446e8fd3060f2068b94779331a",
+  "per_program": {
+    "add": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 1200,
+      "ref_answer": 1200,
+      "matches_ref": true,
+      "steps": 5,
+      "first_diverge": null
+    },
+    "sub": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 7766,
+      "ref_answer": 7766,
+      "matches_ref": true,
+      "steps": 5,
+      "first_diverge": null
+    },
+    "mul": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 1000,
+      "ref_answer": 1000,
+      "matches_ref": true,
+      "steps": 5,
+      "first_diverge": null
+    },
+    "div": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 1428,
+      "ref_answer": 1428,
+      "matches_ref": true,
+      "steps": 5,
+      "first_diverge": null
+    },
+    "mod": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 3,
+      "ref_answer": 3,
+      "matches_ref": true,
+      "steps": 5,
+      "first_diverge": null
+    },
+    "cmp": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 1,
+      "ref_answer": 1,
+      "matches_ref": true,
+      "steps": 7,
+      "first_diverge": null
+    },
+    "var": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 1000,
+      "ref_answer": 1000,
+      "matches_ref": true,
+      "steps": 9,
+      "first_diverge": null
+    },
+    "func": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 1000,
+      "ref_answer": 1000,
+      "matches_ref": true,
+      "steps": 11,
+      "first_diverge": null
+    },
+    "doomslice": {
+      "trace_eq": true,
+      "answer_eq": true,
+      "fused_answer": 67997,
+      "ref_answer": 0,
+      "matches_ref": false,
+      "steps": 42,
+      "first_diverge": null
+    }
+  },
+  "block_k": 512
+}
