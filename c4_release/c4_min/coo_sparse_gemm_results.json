@@ -1,0 +1,54 @@
+{
+  "gpu": {
+    "name": "NVIDIA RTX A5000",
+    "sm": 64.0,
+    "mem_gb": 25.283526656,
+    "peak_fp32_tflops": 17.547509879719286,
+    "peak_tf32_tflops": 45.05733931436972,
+    "peak_bf16_tflops": 91.8583948612256,
+    "hbm_bw_gbs": 682.657933041153
+  },
+  "baseline_dense": {
+    "1024": {
+      "ms_per_token": 0.0699
+    }
+  },
+  "coo": {
+    "1024": {
+      "eager_ms_step": 40.20178740223248,
+      "graph_ms_step": 32.894210144877434,
+      "ms_per_token": 0.03212325209460687,
+      "graph_replays": true,
+      "graph_replay_rel_err": 0.0,
+      "useful_tflops": 0.11729148683026923,
+      "pct_of_fp32_peak": 0.6684224008662908,
+      "peak_vram_gb": 0.386168832,
+      "baseline_dense_ms_per_token": 0.0699,
+      "speedup_vs_dense": 2.175993881134327
+    }
+  },
+  "projection": {
+    "1024": {
+      "frame_steps": 6890000.0,
+      "coo_frame_seconds": 221.32920693184133,
+      "coo_frame_minutes": 3.688820115530689,
+      "dense_frame_minutes": 8.02685,
+      "clears_1min": false
+    }
+  },
+  "notes": [],
+  "model": {
+    "blocks": 242,
+    "dim": 1679,
+    "nnz_linears": 162917,
+    "sparse_flop_per_tok": 325834.0,
+    "dense_flop_per_tok": 5880025900.0,
+    "dense_flop_touched_per_tok": 490019508.0,
+    "eager_launches": 1219,
+    "live_blocks": [
+      0,
+      7,
+      11
+    ]
+  }
+}
