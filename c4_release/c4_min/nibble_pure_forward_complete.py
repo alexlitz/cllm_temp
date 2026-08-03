@@ -301,8 +301,19 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # make EQ/NE/GT/LE/GE robust to the wide-scalar recompose noise.  Allocated
         # ONLY when the flag is on, so the flag-OFF layout / golden hash is unchanged.
         self.NIB_EQ = None
+        # C4_CMP32 ORDER extension (#825): the per-nibble lexicographic-ORDER scratch.
+        # ``NGT[j]``/``NLT[j]``/``NEQ[j]`` are the per-nibble compare lanes (each nibble
+        # a small 0..15 integer, so every relu is fp-EXACT), and the override rewrites
+        # the UNSIGNED magnitude order ``MAG_GT``/``MAG_LT`` from a MSB-first
+        # lexicographic scan of those lanes — dodging the ~10^9-scale wide-scalar
+        # ``step(STK_VAL-AX_VAL)`` recompose that collapses to 0 past 2^24.  All under
+        # the flag, so the flag-OFF layout / golden hash is unchanged.
+        self.NGT = self.NLT = self.NEQ = None
         if _cmp32_enabled():
             self.NIB_EQ = self._scalar("NIB_EQ")
+            self.NGT = self._band("CMP_NGT", 8)   # [STACK0[j] > AX[j]] per nibble j
+            self.NLT = self._band("CMP_NLT", 8)   # [STACK0[j] < AX[j]] per nibble j
+            self.NEQ = self._band("CMP_NEQ", 8)   # [STACK0[j] == AX[j]] per nibble j
         # PART A (C4_UNIFY_CAM_HEAD, default OFF): the merged-CAM-head scratch bands.
         # Allocated ONLY when the flag is on, so the flag-OFF layout (and thus every
         # baked weight / the golden hash) is byte-identical to the 3-head build.
@@ -1705,6 +1716,18 @@ def build_pure_forward_complete_model(code_size: int = 32,
     ]
     block_specs += [
         ("cmp-compute", compile_cmp_compute(L, dim)),
+    ]
+    if _cmp32_enabled():
+        # C4_CMP32 ORDER extension (#825): recompute the UNSIGNED magnitude order
+        # (MAG_GT/MAG_LT) LEXICOGRAPHICALLY from the per-nibble bands BEFORE the
+        # signed finalize, so the finalize's sign correction reuses the (now
+        # fp-EXACT-at-any-magnitude) order.  This dodges the ~10^9-scale wide-scalar
+        # ``step(STK_VAL-AX_VAL)`` recompose that collapses past fp32's 2^24 range.
+        block_specs += [
+            ("cmp-nib-order-lanes", compile_cmp_nib_order_lanes(L, dim)),
+            ("cmp-nib-order-mag", compile_cmp_nib_order_mag(L, dim)),
+        ]
+    block_specs += [
         ("cmp-finalize", compile_cmp_signed_finalize(L, dim)),
     ]
     if _cmp32_enabled():
@@ -2044,6 +2067,98 @@ def compile_cmp_nib_override(L, dim: int) -> Dict[str, torch.Tensor]:
         spec["W_up"][u, old] = RELU_S; spec["W_up"][u, L.NIB_EQ] = -RELU_S
         spec["W_gate"][u, L.ONE] = 1.0
         spec["W_down"][old, u] += 1.0 / RELU_S; u += 1
+    return spec
+
+
+# ===========================================================================
+# C4_CMP32 ORDER extension (#825): the MSB-first LEXICOGRAPHIC magnitude order.
+# The golden MAG_GT/MAG_LT read ``step(STK_VAL - AX_VAL)`` on the WIDE-SCALAR
+# recompose (``Σ 16^j·nib_j``), which at a ~10^9-scale operand exceeds fp32's 2^24
+# exact range — a 1-ULP magnitude gap at 10^9 is unrepresentable, so the ramp
+# collapses to 0 and GT/LT/LE/GE mis-fire (the doom step-30,850 wall: GT(2^30 heap
+# ptr, 4096) gives 0 not 1).  These two ADDITIVE blocks recompute the UNSIGNED
+# magnitude order from the PER-NIBBLE bands (each nibble a small 0..15 integer, so
+# every relu is fp-EXACT) via a lexicographic scan from the MSB, then OVERWRITE
+# MAG_GT/MAG_LT.  They are inserted BEFORE ``compile_cmp_signed_finalize`` so the
+# EXISTING sign correction (``CMP_GT = clamp01(MAG_GT) + (SGN_AX - SGN_STK)``, and
+# the symmetric LT) reuses them verbatim — the signed verdict is unchanged in
+# structure, only the (now exact) magnitude order flows in.  Both are UNGATED FFNs
+# touching only cmp scratch (read only by the OP_IS-gated cmp writeback), so a
+# non-cmp step is a strict no-op.
+# ===========================================================================
+def compile_cmp_nib_order_lanes(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Per-nibble compare lanes, MSB-first-ready:
+
+        NGT[j] = [STACK0[j] >  AX[j]]   NLT[j] = [STACK0[j] <  AX[j]]
+        NEQ[j] = [STACK0[j] == AX[j]]                          (j = 0..7)
+
+    Each ``d = STACK0[j] - AX[j]`` is in [-15,15], so every relu staircase argument
+    is a small integer -> fp-EXACT.  ``NGT = relu(d) - relu(d-1) = [d>=1]``,
+    ``NLT = relu(-d) - relu(-d-1) = [d<=-1]``, ``NEQ = 1 - NGT - NLT = [d==0]``.
+    SET (self-clears each lane first)."""
+    n = 8
+    spec = _empty_spec(dim, n * (1 + 2 + 2 + 1 + 1 + 1))   # per nibble: clear*3 + gt(2)+lt(2)+eq(2)... generous
+    u = 0
+    for j in range(n):
+        s, a = L.STACK0 + j, L.AX + j
+        gt, lt, eq = L.NGT + j, L.NLT + j, L.NEQ + j
+        # self-clear the three lanes (SET).
+        for lane in (gt, lt, eq):
+            spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
+            spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
+        # NGT = relu(d) - relu(d-1)   (d = s-a); also feed NEQ -= NGT.
+        for idx, thr in enumerate((0.0, 1.0)):
+            spec["W_up"][u, s] = RELU_S; spec["W_up"][u, a] = -RELU_S
+            spec["b_up"][u] = -RELU_S * thr; spec["W_gate"][u, L.ONE] = 1.0
+            c = (1.0 if idx == 0 else -1.0)
+            spec["W_down"][gt, u] += c / RELU_S
+            spec["W_down"][eq, u] += -c / RELU_S      # NEQ -= NGT contribution
+            u += 1
+        # NLT = relu(-d) - relu(-d-1); also feed NEQ -= NLT.
+        for idx, thr in enumerate((0.0, 1.0)):
+            spec["W_up"][u, a] = RELU_S; spec["W_up"][u, s] = -RELU_S
+            spec["b_up"][u] = -RELU_S * thr; spec["W_gate"][u, L.ONE] = 1.0
+            c = (1.0 if idx == 0 else -1.0)
+            spec["W_down"][lt, u] += c / RELU_S
+            spec["W_down"][eq, u] += -c / RELU_S      # NEQ -= NLT contribution
+            u += 1
+        # NEQ += 1  ( => NEQ = 1 - NGT - NLT = [d==0] ).
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, L.ONE] = 1.0
+        spec["W_down"][eq, u] += 1.0 / SILU_S; u += 1
+    return spec
+
+
+def compile_cmp_nib_order_mag(L, dim: int) -> Dict[str, torch.Tensor]:
+    """Assemble the lexicographic UNSIGNED-magnitude order and OVERWRITE MAG_GT/MAG_LT:
+
+        MAG_GT = Σ_{i=7..0} ( NGT[i] AND NEQ[i+1] AND ... AND NEQ[7] )
+        MAG_LT = Σ_{i=7..0} ( NLT[i] AND NEQ[i+1] AND ... AND NEQ[7] )
+
+    The first (highest) nibble where STACK0 differs from AX decides the order; all
+    higher nibbles must tie (the NEQ window).  Exactly one product term fires (or
+    none, on a full tie), so each sum is a clean 0/1.  Each product is a multi-way
+    AND over 0/1 indicators, emitted as one guarded silu unit (``up = S·(Σw-(n-0.5))``
+    fires iff all windows are 1).  SET (self-clears MAG_GT/MAG_LT first).  These
+    read the residue-immune PER-NIBBLE lanes only, so at any magnitude the order is
+    fp-EXACT."""
+    n = 8
+    n_terms = n                         # one AND-product per nibble position i
+    spec = _empty_spec(dim, 2 + 2 * n_terms)   # 2 clears + n GT-products + n LT-products
+    u = 0
+    for lane in (L.MAG_GT, L.MAG_LT):           # self-clear (SET)
+        spec["W_up"][u, L.ONE] = S; spec["W_gate"][u, lane] = 1.0
+        spec["W_down"][lane, u] += -1.0 / SILU_S; u += 1
+    # MAG_GT / MAG_LT products, MSB-first.
+    for dst, decide in ((L.MAG_GT, L.NGT), (L.MAG_LT, L.NLT)):
+        for i in range(n - 1, -1, -1):
+            windows = [decide + i] + [L.NEQ + k for k in range(i + 1, n)]
+            m = len(windows)
+            for w in windows:
+                spec["W_up"][u, w] += S
+            spec["b_up"][u] += -S * (m - 0.5)
+            spec["W_gate"][u, L.ONE] = 1.0
+            spec["W_down"][dst, u] += 1.0 / SILU_HALF
+            u += 1
     return spec
 
 
