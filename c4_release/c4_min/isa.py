@@ -6,6 +6,8 @@ import from ``neural_vm``.
 """
 from __future__ import annotations
 
+import os
+import struct
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -39,6 +41,35 @@ MALC, FREE, MSET, MCMP = 34, 35, 36, 37
 NOP = 39
 HALT = 38  # alias EXIT
 
+# ---------------------------------------------------------------------------
+# NATIVE FLOATING-POINT (c4+FP ISA extension, C4_FLOAT_OPS, DEFAULT OFF).
+# IEEE-754 single (binary32) elementary ops as SINGLE opcodes, so the
+# efficient full-C90 float path is ONE VM op instead of the hundreds-of-steps
+# soft-float routine.  A float32 value is carried as its raw 32-bit int bit
+# pattern (``struct.pack('<f')`` bits); the ops decode/encode the bit pattern
+# and are correctly-rounded round-to-nearest-even, matching gcc.  These opcode
+# VALUES (40..43) sit ABOVE the golden NUM_OPS=40 opcode one-hot band, so the
+# baseline OP_IS layout is UNCHANGED when the flag is off; the flag widens the
+# band to ``NUM_OPS_FLOAT`` only when on (golden byte-identical off).  This is
+# the GENERAL-C90 lever — Doom uses ZERO float (fixed-point), so it is NOT a
+# Doom-capstone op.
+F_ADD, F_SUB, F_MUL, F_DIV = 40, 41, 42, 43
+NUM_OPS_FLOAT = 44   # OP_IS band width when C4_FLOAT_OPS is on (covers 0..43)
+
+
+def float_ops_enabled() -> bool:
+    """``C4_FLOAT_OPS`` (DEFAULT OFF): add the gated IEEE-754 single F_ADD/F_SUB/
+    F_MUL/F_DIV opcodes.  OFF -> the OP_IS band stays ``NUM_OPS`` wide and every
+    downstream layout dim is byte-identical to the golden 069cc32f build."""
+    return os.environ.get("C4_FLOAT_OPS", "0") not in ("0", "", "false", "False")
+
+
+def num_ops_effective() -> int:
+    """Width of the OP_IS opcode one-hot band for the CURRENT flag state:
+    ``NUM_OPS`` (40, golden) when C4_FLOAT_OPS is off, ``NUM_OPS_FLOAT`` (44)
+    when on.  The layout reads THIS so a flag-off build is byte-identical."""
+    return NUM_OPS_FLOAT if float_ops_enabled() else NUM_OPS
+
 NAMES = {
     LEA: "LEA", IMM: "IMM", JMP: "JMP", JSR: "JSR", BZ: "BZ", BNZ: "BNZ",
     ENT: "ENT", ADJ: "ADJ", LEV: "LEV", LI: "LI", LC: "LC", SI: "SI",
@@ -48,10 +79,88 @@ NAMES = {
     MUL: "MUL", DIV: "DIV", MOD: "MOD",
     OPEN: "OPEN", READ: "READ", CLOS: "CLOS", PRTF: "PRTF",
     MALC: "MALC", FREE: "FREE", MSET: "MSET", MCMP: "MCMP",
+    F_ADD: "F_ADD", F_SUB: "F_SUB", F_MUL: "F_MUL", F_DIV: "F_DIV",
     NOP: "NOP",
     HALT: "HALT",
 }
 BY_NAME = {v: k for k, v in NAMES.items()}
+
+
+# ---------------------------------------------------------------------------
+# IEEE-754 single (binary32) bit-exact reference — the byte-exact oracle for the
+# F_ADD/F_SUB/F_MUL/F_DIV megablocks.  A float32 VALUE is its raw 32-bit int bit
+# pattern (``struct.pack('<f')``); these helpers decode the bits, compute the op
+# with hardware round-to-nearest-even (via the CPU's own binary32 arithmetic,
+# which is correctly-rounded and matches gcc), and re-encode the result bits.
+# Python floats are binary64; casting the operands UP to binary64 and the result
+# DOWN to binary32 (``struct '<f'`` pack/unpack) reproduces the binary32 op
+# EXACTLY for the elementary ops (each is correctly-rounded, and the double
+# round double->... is not an issue because +,-,*,/ on two binary32 inputs are
+# computed exactly in binary64 then rounded once to binary32 — the classic
+# "double rounding is harmless for a single elementary op" result).
+# ---------------------------------------------------------------------------
+FLOAT_OPS = (F_ADD, F_SUB, F_MUL, F_DIV)
+
+
+def f32_from_bits(bits: int) -> float:
+    """Decode a raw 32-bit IEEE-754 single bit pattern into a Python float."""
+    return struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
+
+
+def bits_from_f32(x: float) -> int:
+    """Encode a Python float as the raw 32-bit IEEE-754 single bit pattern
+    (round-to-nearest-even to binary32, the hardware default).  A binary64 value
+    whose magnitude exceeds the largest finite binary32 rounds to a signed inf —
+    ``struct.pack('<f')`` raises ``OverflowError`` on that (and on inf/nan it is
+    fine), so we handle the overflow-to-inf case explicitly."""
+    try:
+        return struct.unpack("<I", struct.pack("<f", x))[0]
+    except OverflowError:
+        # magnitude above FLT_MAX rounds to signed inf (round-to-nearest-even:
+        # anything strictly past the FLT_MAX..inf midpoint, which pack already
+        # would have rounded to FLT_MAX below; OverflowError only fires when the
+        # rounded result IS inf).
+        import math
+        sign = 0x80000000 if math.copysign(1.0, x) < 0 else 0
+        return sign | 0x7F800000
+
+
+def f32_op_bits(op: int, a_bits: int, b_bits: int) -> int:
+    """Bit-exact IEEE-754 single ``a OP b`` on RAW bit-pattern operands, returning
+    the RAW result bit pattern.  ``a`` is the popped stack operand (first), ``b``
+    is AX (second) — matching the integer ALU convention ``ax = pop() OP ax``.
+    NaN is canonicalised to the standard quiet NaN 0x7FC00000 (as gcc/x86 do for
+    a produced NaN); division by zero yields the correctly-signed inf (or the
+    canonical NaN for 0/0)."""
+    a = f32_from_bits(a_bits)
+    b = f32_from_bits(b_bits)
+    try:
+        if op == F_ADD:
+            r = a + b
+        elif op == F_SUB:
+            r = a - b
+        elif op == F_MUL:
+            r = a * b
+        elif op == F_DIV:
+            r = a / b
+        else:
+            raise ValueError(f"not a float op: {op}")
+    except ZeroDivisionError:
+        # F_DIV by zero (Python raises instead of producing the IEEE result):
+        #   NaN / 0  -> propagate NaN (canonicalised);  0 / 0 -> canonical NaN;
+        #   finite x / 0 -> IEEE inf with sign(a)^sign(b).
+        import math
+        if a != a:                       # a is NaN
+            return 0x7FC00000
+        if a == 0.0:
+            return 0x7FC00000            # 0/0 -> NaN
+        sign = (a_bits >> 31) ^ (b_bits >> 31)
+        return (sign << 31) | 0x7F800000
+    out = bits_from_f32(r)
+    # canonicalise any produced NaN (payload/sign) to the x86/gcc quiet NaN.
+    if (out & 0x7F800000) == 0x7F800000 and (out & 0x007FFFFF) != 0:
+        return 0x7FC00000
+    return out & 0xFFFFFFFF
 
 
 @dataclass
