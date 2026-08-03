@@ -739,33 +739,52 @@ def _remap_attn(src, dst, new_slot, new_dim, n_heads):
     changes when ``dim`` shrinks, we re-lay the head partitions onto the new
     head_dim, zero-padding the local head channels (only the first few local
     channels are ever nonzero — see the CAM bakes).
+
+    SPARSE-RESIDENT: ``dst``'s weights are already zeroed by the caller, so we
+    write the re-laid head partitions DIRECTLY into ``dst`` and NEVER allocate a
+    second ``new_dim×new_dim`` ``out`` buffer.  For the whole-column remap we still
+    only build the tiny ``local×new_dim`` (Q/K/V) / ``new_dim×local`` (W_o) slice
+    per head — an O(new_dim × head_dim) transient instead of O(new_dim²).  This is
+    the term that made the non-CFM (dim∝code_size) build O(dim²) and drove the
+    ~108 GB doom peak; byte-identical (the written entries are unchanged).
     """
     old_dim = src.W_q.shape[0]
     old_hd = old_dim // n_heads
     new_hd = new_dim // n_heads
     assert new_hd >= 0
+    local = min(old_hd, new_hd)
     # Re-index the residual (input) axis of Q/K/V and the residual (output)
-    # axis of W_o; then re-lay the head partitions.
+    # axis of W_o; then re-lay the head partitions, writing straight into ``dst``.
     for name in ("W_q", "W_k", "W_v"):
         w = getattr(src, name)                      # [old_dim, old_dim]
-        w_res = _remap_in_cols(w, new_slot, new_dim)  # cols -> new residual
+        dw = getattr(dst, name)                     # [new_dim, new_dim] (pre-zeroed)
         # rows are head-partitioned; move head h's local channels to the new HD.
-        out = torch.zeros(new_dim, new_dim, dtype=w.dtype)
+        # Only ``local`` rows per head are copied — build the small remapped slice
+        # per head (cols -> new residual) and drop it straight into ``dst``.
         for h in range(n_heads):
-            local = min(old_hd, new_hd)
-            out[h * new_hd:h * new_hd + local] = \
-                w_res[h * old_hd:h * old_hd + local]
-        getattr(dst, name).copy_(out)
+            src_rows = w[h * old_hd:h * old_hd + local]           # [local, old_dim]
+            dw[h * new_hd:h * new_hd + local] = _remap_in_cols(
+                src_rows, new_slot, new_dim)                       # [local, new_dim]
     # W_o: [old_dim(res), old_dim(head)] -> rows re-indexed to residual, cols
-    # re-laid onto the new head partition.
+    # re-laid onto the new head partition.  Write directly into ``dst.W_o``.
     wo = src.W_o
-    out = torch.zeros(new_dim, new_dim, dtype=wo.dtype)
+    dwo = dst.W_o
     for h in range(n_heads):
-        local = min(old_hd, new_hd)
         block = wo[:, h * old_hd:h * old_hd + local]       # [old_dim, local]
         block = _remap_out_rows(block, new_slot, new_dim)   # rows -> residual
-        out[:, h * new_hd:h * new_hd + local] = block
-    dst.W_o.copy_(out)
+        dwo[:, h * new_hd:h * new_hd + local] = block
+
+
+def _new_ffn_from(FFN_cls, Wup, bup, Wgate, bgate, Wdown, bdown):
+    """Build an ``FFN`` shell and set its params DIRECTLY, WITHOUT ever allocating
+    the throwaway ``torch.zeros(hidden, dim)`` triple the ``FFN.__init__`` builds
+    (which ``_swap_ffn`` would immediately discard).  Sparse-resident: only the
+    real (ragged) weight tensors are ever held.  Byte-identical to
+    ``ff = FFN(dim, hidden); _swap_ffn(ff, ...)`` (same params, no zero garbage)."""
+    ff = FFN_cls.__new__(FFN_cls)
+    torch.nn.Module.__init__(ff)
+    _swap_ffn(ff, Wup, bup, Wgate, bgate, Wdown, bdown)
+    return ff
 
 
 def _swap_ffn(ffn, Wup, bup, Wgate, bgate, Wdown, bdown):
@@ -1064,10 +1083,9 @@ def _build_stream_intermediate(pfc, block_specs, dim, n_heads, vocab, max_seq, L
                         p.zero_()
             else:
                 at = _ZeroAttn(dim, n_heads, max_seq)      # param-free identity
-            hid = max(1, spec["W_up"].shape[0])
-            ffn = _FFN(dim, hid)
-            _swap_ffn(ffn, spec["W_up"], spec["b_up"], spec["W_gate"],
-                      spec["b_gate"], spec["W_down"], spec["b_down"])
+            # build the ragged FFN directly (no throwaway dim×hidden zeros).
+            ffn = _new_ffn_from(_FFN, spec["W_up"], spec["b_up"], spec["W_gate"],
+                                spec["b_gate"], spec["W_down"], spec["b_down"])
             phys.append(_StreamBlock(at, ffn))
 
         reg_bases = {"PC": L.PC, "AX": L.AX, "SP": L.SP, "BP": L.BP,
@@ -1166,6 +1184,43 @@ def build_compact_sparse_streaming(code_size: int = 48,
     vocab = captured["vocab"]
     max_seq = captured["max_seq_len"]
     n_blocks = len(block_specs)
+
+    # ---- BUILD-RSS GUARD (sparse-resident invariant) -----------------------
+    # The streaming build is O(one block) EXCEPT for the handful of BAKED
+    # attention blocks, whose dense ``[dim, dim]`` Q/K/V/O projections are the one
+    # term that scales O(dim²).  ``dim`` is FIXED (code_size-independent) under
+    # code-from-memory (``C4_PF_CFM=1``, the doom perf-fleet path — dim≈1392,
+    # peak≈1.5 GB), but WITHOUT CFM ``dim`` grows LINEARLY with code_size, so a
+    # doom-scale non-CFM build (code_size≈3978 → dim≈44000) would silently
+    # allocate ~90 GB of dense baked attention and starve the box into swap (the
+    # "scale wall" the CFM path was built to solve).  Estimate the dense baked-attn
+    # peak up front and FAIL FAST with actionable guidance instead of OOM-killing
+    # the machine — this is what lets the perf fleet run many model agents
+    # concurrently.  Byte-identity is untouched (this only aborts a build that
+    # would swap the box; a build that passes is bit-for-bit as before).  Ceiling
+    # is generous (C4_BUILD_RSS_CEIL_GB, default 24 GB) and can be lifted for a
+    # deliberate large dense build.
+    import os as _os_guard
+    if _os_guard.environ.get("C4_BUILD_RSS_GUARD", "1") != "0":
+        _ceil_gb = float(_os_guard.environ.get("C4_BUILD_RSS_CEIL_GB", "24"))
+        # dense baked attn = (#baked blocks) × 4 projections × dim² × 4 bytes.
+        _n_baked = len({0} | pfc.cam_baked_blocks(block_specs))
+        _attn_gb = _n_baked * 4 * dim * dim * 4 / 1e9
+        if _attn_gb > _ceil_gb:
+            _cfm_on = pfc._pf_cfm_enabled()
+            raise MemoryError(
+                f"c4_min streaming build would allocate ~{_attn_gb:.0f} GB of DENSE "
+                f"baked attention (dim={dim}, {_n_baked} baked blocks, "
+                f"code_size={code_size}), exceeding the {_ceil_gb:.0f} GB build-RSS "
+                f"ceiling — this would starve the box into swap.\n"
+                f"  * dim scales with code_size ONLY when code-from-memory is OFF"
+                f" (C4_PF_CFM is currently {'ON' if _cfm_on else 'OFF'}).\n"
+                f"  * FIX: set C4_PF_CFM=1 — the code-from-memory KV path makes dim "
+                f"FIXED (~1392) and code_size-independent, so the doom-scale build "
+                f"stays ~1.5 GB (the perf-fleet path).\n"
+                f"  * Or raise the ceiling deliberately with "
+                f"C4_BUILD_RSS_CEIL_GB=<gb> (or C4_BUILD_RSS_GUARD=0 to disable).")
+
     L = _rebuild_layout(pfc, code_size, n_heads,
                         recurrent_divmod=recurrent_divmod)
     L._apply_order = captured["apply_order"]     # None for non-recurrent builds
@@ -1255,9 +1310,9 @@ def build_compact_sparse_streaming(code_size: int = 48,
             Wup = _remap_in_cols(ff.W_up[keep], new_slot, new_dim)
             Wgate = _remap_in_cols(ff.W_gate[keep], new_slot, new_dim)
             Wdown = _remap_out_rows(ff.W_down[:, keep], new_slot, new_dim)
-            cff = _FFN(new_dim, max(1, keep.numel()))
-            _swap_ffn(cff, Wup, ff.b_up[keep], Wgate, ff.b_gate[keep],
-                      Wdown, _remap_vec(ff.b_down, new_slot, new_dim))
+            # build the compact FFN directly (no throwaway new_dim×hidden zeros).
+            cff = _new_ffn_from(_FFN, Wup, ff.b_up[keep], Wgate, ff.b_gate[keep],
+                                Wdown, _remap_vec(ff.b_down, new_slot, new_dim))
         # -- wrap this ONE dense block sparse, then free the dense block --
         dense_block = _StreamBlock(cat, cff)
         phys_sparse[bi] = SparseBlock(dense_block, density_thresh, min_numel, log,
