@@ -298,6 +298,23 @@ def ingest_gqa_enabled() -> bool:
     return os.environ.get("C4_INGEST_GQA", "0") not in ("0", "", "false", "False")
 
 
+def global_addr32_enabled() -> bool:
+    """``C4_GLOBAL_ADDR32`` (default OFF): expand the FULL 32-bit LI/LC load address
+    into ``QRY_BIN`` (all 8 nibbles of AX), matching the store key (``ADDR_BIN`` is
+    always the full 32 bits) and the stack-pop query (``SP_QRY_BIN`` already uses
+    ``n_nibbles=8``).  DEFAULT OFF -> the historical 8-bit ``compile_addr_expand``
+    (only the low byte of the load address is queried), byte-identical to the golden
+    build.  ON -> the load query covers bits 0..31 so a GLOBAL at a data-segment
+    address >= 256 (bit 8+ set, e.g. c4's ``DATA_BASE=0x10000``) content-addresses
+    its own store instead of aliasing the truncated ``addr & 0xFF`` (which for a
+    global at 0x100/0x400/0x10000 masks to 0 -> the zero-address ZFOD sink -> LI
+    reads 0 not the stored value).  Stack/local loads are unaffected (they already
+    matched at the low byte; the high bits they now also query are the SAME on the
+    store key)."""
+    import os
+    return os.environ.get("C4_GLOBAL_ADDR32", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # WIDE-VALUE single-head ingest — 1 QUERY head + 1 KV head (down from 20+1).
 #
@@ -600,7 +617,11 @@ def compile_mem_prep(L, dim: int) -> Dict[str, torch.Tensor]:
     specs.append(_flag_from_ops(L, L.IS_LOAD, [isa.LI, isa.LC], dim))
     # QRY_BIN <- AX_VAL bits (the load address). Ungated: QRY_BIN is only READ by the
     # CAM when IS_LOAD is set (the load-enable channel gates the whole head).
-    specs.append(compile_addr_expand(L, L.AX_VAL, L.QRY_BIN, dim))
+    # DEFAULT: only the low byte (n_bits=8) — historical golden.  C4_GLOBAL_ADDR32:
+    # expand the FULL 32-bit address so a GLOBAL at a data-seg address >= 256 matches
+    # its store (the store key ADDR_BIN is always full 32-bit); see global_addr32.
+    _qbits = 8 if not global_addr32_enabled() else 32
+    specs.append(compile_addr_expand(L, L.AX_VAL, L.QRY_BIN, dim, n_bits=_qbits))
     # clear AX nibble band on a load (so the CAM's additive write is a clean SET).
     specs.append(_clear_band_gated(L, L.AX, 8, dim, gate_ops=[isa.LI, isa.LC]))
     return _concat_specs(specs, dim)
