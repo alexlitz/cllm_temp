@@ -85,6 +85,72 @@ def set_batched_decode(v: Optional[bool]) -> None:
     global _BATCHED_DECODE
     _BATCHED_DECODE = v
 
+
+_GPU_VERIFY: Optional[bool] = None
+
+
+def _gpu_verify_enabled() -> bool:
+    """``C4_GPU_VERIFY`` (DEFAULT OFF): run the whole per-span decode+ACCEPT-COMPARE
+    on-GPU as ONE vectorized tensor op — batch-decode all K query rows (argmax over
+    the register nibbles), compare to the draft's per-step targets (resident on GPU),
+    and reduce to the accepted-prefix length with ONE host sync (a single
+    ``first_bad.item()``).  This removes the O(steps) host-side Python decode+compare
+    loop (~11 host syncs/step; ~330k GPU stalls over a doom program) that dominates
+    the whole-verify wall over the ~0.034 ms/step GPU forward.
+
+    Bit-identical to the scalar per-step path: the batched ``_snap_lane_batch`` /
+    ``_decode_reg_batch`` evaluate the SAME integer requant-argmax per row as the
+    scalar decode, and the compare is the SAME (pc/ax&mask/sp/bp equality, with
+    is_file rows a no-op and is_halt rows AX-only).  DEFAULT OFF -> the exact scalar
+    loop (golden 069cc32f unchanged)."""
+    if _GPU_VERIFY is not None:
+        return _GPU_VERIFY
+    return os.environ.get("C4_GPU_VERIFY", "0") not in ("0", "", "false", "False")
+
+
+def set_gpu_verify(v: Optional[bool]) -> None:
+    global _GPU_VERIFY
+    _GPU_VERIFY = v
+
+
+def _build_draft_targets(draft, device: str, mask: int):
+    """Materialise the draft's per-step ACCEPT targets as device-resident tensors
+    ONCE per verify (cached on the draft keyed by (device, mask)).  All are [n_steps]
+    long/bool tensors so the per-span compare is a single vectorized op with NO host
+    sync.  Cheap: the draft frames are already in host memory (the logical VM ran on
+    CPU); this is one pack + one HtoD copy amortised over the whole program."""
+    key = (device, int(mask))
+    cache = getattr(draft, "_gpu_targets", None)
+    if cache is not None and cache.get("_key") == key:
+        return cache
+    frames = draft.frames
+    n = len(frames)
+    want_pc = torch.empty(n, dtype=torch.long)
+    want_ax = torch.empty(n, dtype=torch.long)
+    want_sp = torch.empty(n, dtype=torch.long)
+    want_bp = torch.empty(n, dtype=torch.long)
+    is_halt = torch.zeros(n, dtype=torch.bool)
+    is_file = torch.zeros(n, dtype=torch.bool)
+    for i, fr in enumerate(frames):
+        want_pc[i] = fr["pc"]
+        want_ax[i] = fr["ax"] & mask
+        want_sp[i] = fr["sp"] & 0xFFFFFFFF
+        want_bp[i] = fr["bp"] & 0xFFFFFFFF
+        if fr.get("is_halt"):
+            is_halt[i] = True
+        if fr.get("is_file"):
+            is_file[i] = True
+    dev = torch.device(device)
+    cache = {
+        "_key": key,
+        "want_pc": want_pc.to(dev), "want_ax": want_ax.to(dev),
+        "want_sp": want_sp.to(dev), "want_bp": want_bp.to(dev),
+        "is_halt": is_halt.to(dev), "is_file": is_file.to(dev),
+    }
+    draft._gpu_targets = cache
+    return cache
+
+
 from . import isa
 from . import blogspec_vocab as V
 from . import nibble_filesys as _FS   # OPEN/READ/CLOS/PRTF via the TOOL_CALL boundary
@@ -1251,9 +1317,16 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # attention-identity) + frozen-skip (the region runs over K query rows) + CUDA.
     # Byte-exact; default OFF -> the eager per-block loop.
     _megastep = None
-    from .megastep_graph import megastep_graph_enabled, install_megastep_graph
-    if (frozen_skip and is_cuda and _dead_block_fusion_enabled()
-            and megastep_graph_enabled()):
+    # MEGAKERNEL install is lazy-imported ONLY when the flag is on — the module is an
+    # optional (uncommitted) session artifact, so an unconditional import would break
+    # the default (flag-OFF) verify.  Byte-identical: the megakernel is default OFF.
+    try:
+        from .megastep_graph import megastep_graph_enabled
+        _mega_on = megastep_graph_enabled()
+    except ImportError:
+        _mega_on = False
+    if (frozen_skip and is_cuda and _dead_block_fusion_enabled() and _mega_on):
+        from .megastep_graph import install_megastep_graph
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
@@ -1526,8 +1599,137 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         # ``_decode_reg_from_nibbles`` (probe: byte-exact, 15x faster on the decode).
         batched_decode = (_batched_decode_enabled() if _BATCHED_DECODE is None
                           else _BATCHED_DECODE)
+        # ============================================================================
+        # GPU-VERIFY (C4_GPU_VERIFY, default OFF): batch-decode ALL K query rows AND
+        # compare to the draft targets ENTIRELY on-GPU, reducing to the accepted-prefix
+        # length with ONE host sync per forward.  Replaces the O(K) host-side Python
+        # decode+compare loop (the ~0.2-0.32 ms/step wall over the 0.034 ms/step GPU
+        # forward).  Bit-identical to the scalar loop (same requant-argmax, same
+        # pc/ax&mask/sp/bp compare, is_file no-op, is_halt AX-only).
+        # ============================================================================
+        if _gpu_verify_enabled():
+            from .nibble_pure_forward_gpu import _decode_reg_batch, _snap_lane_batch
+            tgt = _build_draft_targets(draft, device, mask)
+            K_span = end - step
+            if _qordered[0]:
+                wi_idx = torch.arange(K_span, device=hidden.device, dtype=torch.long)
+            else:
+                wi_idx = torch.tensor(
+                    [draft.win_starts[s] - span_start for s in range(step, end)],
+                    device=hidden.device, dtype=torch.long)
+            qs_all = hidden[0].index_select(0, wi_idx)      # [K, D] device-resident
+            # DECODE-CHUNK (big-K): the per-row [rows, vocab] requant tensor is O(K)
+            # VRAM; decode in qrow-sized chunks (byte-exact per row) into device buffers.
+            _dchunk = _qrow_chunk(_cut_span_chunk() or K_span)
+            Kd = qs_all.shape[0]
+            _stepc = _dchunk if (_dchunk > 0 and Kd > _dchunk) else Kd
+            got_pc_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            got_sp_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            got_bp_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            got_ax_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            _lo = 0
+            while _lo < Kd:
+                _hi = min(_lo + _stepc, Kd)
+                qs = qs_all[_lo:_hi]
+                got_pc_t[_lo:_hi] = _snap_lane_batch(qs[:, L.PC_VAL])
+                got_sp_t[_lo:_hi] = _snap_lane_batch(qs[:, L.SP_VAL])
+                got_bp_t[_lo:_hi] = _snap_lane_batch(qs[:, L.BP_VAL])
+                got_ax_t[_lo:_hi] = _decode_reg_batch(qs, L.AX)
+                _lo = _hi
+            got_ax_m = got_ax_t & mask
+            w_pc = tgt["want_pc"][step:end]
+            w_ax = tgt["want_ax"][step:end]
+            w_sp = tgt["want_sp"][step:end]
+            w_bp = tgt["want_bp"][step:end]
+            f_file = tgt["is_file"][step:end]
+            f_halt = tgt["is_halt"][step:end]
+            # normal-row mismatch: any of pc/ax/sp/bp differs; halt-row: AX only;
+            # file-row: never bad (driver overrides the model's registers).
+            bad_normal = ((got_pc_t != w_pc) | (got_ax_m != w_ax)
+                          | (got_sp_t != w_sp) | (got_bp_t != w_bp))
+            bad = torch.where(f_halt, got_ax_m != w_ax, bad_normal)
+            bad = bad & (~f_file)                            # file rows are accepted
+            # first divergence: argmax over the bad mask (0 if none) — but distinguish
+            # "no bad" from "bad at index 0" via any().  ONE host sync for both.
+            any_bad_t = bad.any()
+            first_bad_t = torch.argmax(bad.to(torch.uint8))  # 0 when all-False
+            # accepted count within this span = first_bad if any bad else K.
+            n_ok_span = torch.where(any_bad_t, first_bad_t,
+                                    torch.tensor(K_span, device=bad.device))
+            # PRTF visible bytes for the ACCEPTED prefix of this span (vectorized): the
+            # model's decoded AX byte-0 at each accepted prtf step (byte-identical to the
+            # scalar path's collect_out.append).  Gather on GPU, one small copy.
+            prtf_bytes = None
+            if collect_out is not None and prtf_set:
+                _prtf_local = [s - step for s in range(step, end) if s in prtf_set]
+                if _prtf_local:
+                    _pl = torch.tensor(_prtf_local, device=bad.device, dtype=torch.long)
+                    prtf_bytes = (_pl, (got_ax_t & 0xFF).index_select(0, _pl))
+            # last-step AX: if this span covers the final step AND it is accepted.
+            last_ax_dev = None
+            if step <= n_steps - 1 < end:
+                last_ax_dev = got_ax_m[n_steps - 1 - step]
+            # ---- the SINGLE host sync per forward -------------------------------
+            n_ok = int(n_ok_span.item())
+            accepted += n_ok
+            if collect_out is not None and prtf_bytes is not None:
+                _pl, _pb = prtf_bytes
+                _pl_h = _pl.tolist()
+                _pb_h = _pb.tolist()
+                for _li, _lv in zip(_pl_h, _pb_h):
+                    if _li < n_ok:
+                        collect_out.append(int(_lv) & 0xFF)
+            if n_ok < K_span:
+                # MISMATCH inside this span: report the first divergence (byte-exact to
+                # the scalar path's first-mismatch abort).  Decode the exact got/want
+                # for the reporting dict (one small gather + sync — only on a real fail).
+                s_bad = step + n_ok
+                gp = int(got_pc_t[n_ok].item()); ga = int(got_ax_m[n_ok].item())
+                gs = int(got_sp_t[n_ok].item()); gb = int(got_bp_t[n_ok].item())
+                import os as _osd
+                if _osd.environ.get("C4_WALL6_DIAG", "0") == "1" and stats is not None:
+                    try:
+                        _st = hidden[0, draft.win_starts[s_bad] - span_start]
+                        stats["diag_stack0_model"] = _decode_reg_from_nibbles(
+                            _st, L, L.STACK0)
+                    except Exception:
+                        stats["diag_stack0_model"] = None
+                    stats["diag_stk_draft"] = draft.frames[s_bad].get("stk")
+                    stats["diag_op"] = draft.frames[s_bad].get("op")
+                cache_now = max(max_cache, caches[0].size())
+                evicted_now = sum(c.total_evicted for c in caches)
+                vram_gb = peak_vram / (1024 ** 3)
+                if stats is not None:
+                    stats["max_seq_len"] = max_seq
+                    stats["max_cache_size"] = cache_now
+                    stats["total_evicted"] = evicted_now
+                    stats["forwards"] = forwards
+                    stats["peak_vram_gb"] = vram_gb
+                    stats["evict_rounds"] = evict_rounds
+                    stats["effective_block_steps"] = eff_min_k
+                fr = draft.frames[s_bad]
+                return VerifyResult(
+                    accepted_steps=accepted, total_steps=n_steps,
+                    all_matched=False, forwards=forwards,
+                    first_mismatch={
+                        "step": s_bad, "query_pos": draft.win_starts[s_bad],
+                        "got": {"pc": gp, "ax": ga, "sp": gs, "bp": gb},
+                        "want": {"pc": fr["pc"], "ax": fr["ax"] & mask,
+                                 "sp": fr["sp"] & 0xFFFFFFFF,
+                                 "bp": fr["bp"] & 0xFFFFFFFF}},
+                    max_seq_len=max_seq, max_cache_size=cache_now,
+                    total_evicted=evicted_now, decoded_final_ax=None,
+                    peak_vram_gb=vram_gb, evict_rounds=evict_rounds,
+                    effective_block_steps=eff_min_k)
+            if last_ax_dev is not None:
+                last_got_ax = int(last_ax_dev.item())
+            # the whole span is verified on-GPU; skip the scalar per-step loop below and
+            # fall through to the SHARED post-span tail (sync + accounting + eviction).
+            _gpu_verified = True
+        else:
+            _gpu_verified = False
         pre_pc = pre_sp = pre_bp = pre_ax = None
-        if batched_decode:
+        if batched_decode and not _gpu_verified:
             from .nibble_pure_forward_gpu import _decode_reg_batch, _snap_lane_batch
             # STREAM mode: hidden is the compact query-ORDERED [1,K,D] (row j == step
             # step+j), so the gather is the identity 0..K-1; otherwise index by the
@@ -1564,7 +1766,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 _lo = _hi
 
         # decode + verify each step-query row of the block against the draft.
-        for s in range(step, end):
+        # (SKIPPED when the GPU-verify path above already verified the whole span.)
+        for s in (range(step, end) if not _gpu_verified else ()):
             if batched_decode:
                 _i = s - step
                 got_pc, got_sp, got_bp, got_ax = (
