@@ -52,9 +52,32 @@ default OFF -> the masked-full path is used and the golden is unchanged.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .blogspec_model import softmax1
+
+
+# ---------------------------------------------------------------------------
+# Sq-CHUNKING (big-K VRAM cap).  The band gather materialises the per-query
+# band ``[B, Hl, Sq, W, HD]`` of K/V vectors — O(Sq*W) memory, LINEAR in the span
+# but with a large ``W*Hl*HD`` constant (at W=64, Hl=20, HD~59 that is ~9 GB per
+# 60k-row span, the eff_K ceiling on a 24 GB card).  Because every query row's
+# banded context is INDEPENDENT of the others, we can process the Sq dimension in
+# CHUNKS and never hold more than one chunk's band at once — so the per-forward
+# band VRAM is bounded by ``chunk*W*Hl*HD`` REGARDLESS of the span length, which is
+# what lets eff_K be pushed far past the point where the whole-span band would OOM.
+# Byte-exact: chunking the query dim only splits an independent per-row computation;
+# each row's kept keys / ALiBi / softmax1 are identical to the un-chunked path.
+# ``C4_BANDED_SQ_CHUNK`` (default 8192 query rows/chunk) tunes the chunk; 0 disables
+# chunking (the original whole-span gather).
+# ---------------------------------------------------------------------------
+def _band_sq_chunk() -> int:
+    try:
+        return int(os.environ.get("C4_BANDED_SQ_CHUNK", "8192"))
+    except ValueError:
+        return 8192
 
 
 def banded_local_context(Qg: torch.Tensor, Ksel: torch.Tensor, Vsel: torch.Tensor,
@@ -76,6 +99,19 @@ def banded_local_context(Qg: torch.Tensor, Ksel: torch.Tensor, Vsel: torch.Tenso
     Returns the context ``[B, Hl, Sq, HD]`` — bit-identical to the masked-full path on
     the kept (in-band) keys.
     """
+    # Sq-CHUNK (big-K VRAM cap): process the query rows in chunks so the band gather
+    # never materialises more than one chunk's [B,Hl,chunk,W,HD] at once.  Byte-exact
+    # (per-query independence).  chunk<=0 or Sq<=chunk -> the whole-span path below.
+    chunk = _band_sq_chunk()
+    Sq_all = Qg.shape[2]
+    if chunk > 0 and Sq_all > chunk:
+        out = Qg.new_empty(Qg.shape)
+        for lo in range(0, Sq_all, chunk):
+            hi = min(lo + chunk, Sq_all)
+            out[:, :, lo:hi] = banded_local_context(
+                Qg[:, :, lo:hi], Ksel, Vsel, q_pos[lo:hi], kpos_full,
+                slopes_g, scale, window)
+        return out
     B, Hl, Sq, HD = Qg.shape
     Sk = Ksel.shape[2]
     dev = Qg.device

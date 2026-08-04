@@ -66,6 +66,54 @@ def direct_local_cam_enabled() -> bool:
     return os.environ.get("C4_DIRECT_LOCAL_CAM", "0") not in ("0", "", "false", "False")
 
 
+def _block0_sq_chunk() -> int:
+    """C4_BLOCK0_SQ_CHUNK (default 0 == OFF -> whole-span forward, byte-identical to the
+    prior direct-local path).  When > 0, the block-0 direct-local forward processes the
+    span's ``S = K*30`` rows in CHUNKS of this many rows, so it NEVER materialises the
+    full ``[1, H, S, HD]`` K/V/out tensors (nor the ``[1, S, D]`` out2 / W_o output) at
+    once — the ONLY per-forward tensors whose VRAM scales as O(K*30).
+
+    WHY THIS IS THE CAP-LIFTER.  Under ``frozen_skip`` (C4_FROZEN_ROW_SKIP) block 0 is the
+    SOLE block that runs over all S = K*30 rows (``_frozen_skip_cut`` == 1 on the doom
+    config): every OTHER block runs over the K query rows only (O(K)).  So block 0's
+    whole-span Q/K/V/out is the LAST O(K*30) tensor on the forward, and it is what caps
+    eff_K at ~8k on a 24 GB card (measured: 12.2 GB peak at K=8192, OOM at K=16384).
+    Chunking block 0's S axis holds block-0 peak at O(chunk*D) REGARDLESS of K, so the
+    per-forward VRAM stops scaling with K*30 and K can grow far past the ceiling.
+
+    BYTE-EXACT (by construction).  The direct-local forward is a PER-ROW independent map:
+    row ``i``'s residual is ``x[i] + W_o(out[i])`` where ``out[i]`` is the gathered
+    ingest-head value (query rows) or 0 (frozen rows), and its K/V is ``W_{k,v}(x[i])`` —
+    NONE of which reads any other row (the ingest heads are resolved by a direct gather,
+    NOT by scoring the span, so there is no cross-row attention).  Splitting the contiguous
+    S axis into chunks and reassembling the per-chunk residual / K / V is therefore
+    bit-identical to the whole-span forward (validated L-inf == 0 in the verify battery).
+    512 rows/chunk keeps block-0 peak flat.
+    """
+    try:
+        return int(os.environ.get("C4_BLOCK0_SQ_CHUNK", "0"))
+    except ValueError:
+        return 0
+
+
+def _block0_drop_dead_kv() -> bool:
+    """C4_BLOCK0_DROP_DEAD_KV (default 1 == ON when Sq-chunking): return a ``None`` cache
+    for block 0 in the chunked path instead of the full ``[1, H, S, HD]`` K/V.
+
+    Block 0's KV is PROVABLY DEAD under direct-local-CAM: (1) block 0's OWN future
+    attention is the direct GATHER (``direct_local_forward`` ignores ``past_kv`` entirely
+    — it resolves the ingest heads from the draft, never by scoring the cache), and (2) NO
+    OTHER block reads block-0's cache (the driver's per-block cache is strictly positional,
+    ``caches[b]`` <-> ``blocks[b]``).  So dropping it is byte-safe — the EXACT contract
+    ``dead_block_forward`` / the block-MoE skip already rely on (``_commit_span`` tolerates
+    a ``None`` new_kv; only ``caches[0].size()`` is read, and that feeds a cosmetic
+    ``max_cache_size`` STAT, never a score).  Dropping the dead K/V is the OTHER half of
+    the VRAM win: with it OFF the chunked path still holds the full K/V (only out/out2/W_o
+    are chunked); with it ON no O(K*30) K/V is held at all.  Set to 0 to force the full
+    (byte-identical) K/V cache in the chunked path."""
+    return os.environ.get("C4_BLOCK0_DROP_DEAD_KV", "1") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # 1. THE INGEST-HEAD MAP: which heads on block 0 are the register-ingest heads
 #    (recency slope == INGEST_RECENCY, a live value head), and which (register,
@@ -170,6 +218,26 @@ def _install_direct_local_forward(model, block_idx: int,
     if rf.pos.numel():
         pos_map[rf.pos.cpu()] = torch.arange(rf.pos.numel(), dtype=torch.long)
 
+    def _gather_out_chunk(out, q_pos_c, span_off, dev):
+        """Fill the per-chunk ingest-head output ``out`` [1,H,Sc,HD] by direct gather.
+        ``q_pos_c`` is the chunk's absolute positions; ``span_off`` maps a query row's
+        chunk-local index.  Identical gather math to the whole-span path, restricted to
+        the chunk's rows (per-row independent, so byte-identical)."""
+        pm = pos_map.to(dev)
+        clamped = q_pos_c.clamp(max=pm.numel() - 1)
+        row_idx = pm[clamped]                                 # [Sc], -1 for non-query
+        qmask = row_idx >= 0
+        if bool(qmask.any()):
+            sel = row_idx[qmask]                              # [nq] resolved-row indices
+            span_q = qmask.nonzero(as_tuple=False).flatten()  # [nq] chunk-local positions
+            lo = rf.nib_lo.to(dev).index_select(0, sel)       # [nq, N_ROLES]
+            hi = rf.nib_hi.to(dev).index_select(0, sel)       # [nq, N_ROLES]
+            heads = ing_heads_t.to(dev)                        # [n_ing] ingest head idx
+            h_idx = heads.unsqueeze(0).expand(sel.numel(), -1)      # [nq, n_ing]
+            r_idx2 = span_q.unsqueeze(1).expand(-1, heads.numel())  # [nq, n_ing]
+            out[0, h_idx, r_idx2, 0] = lo[:, heads]
+            out[0, h_idx, r_idx2, 1] = hi[:, heads]
+
     def direct_local_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
         H, HD = self.n_heads, self.head_dim
         B, S, D = x.shape
@@ -179,31 +247,50 @@ def _install_direct_local_forward(model, block_idx: int,
         else:
             q_pos = q_positions.to(device=dev, dtype=torch.long)
 
+        # ---- Sq-CHUNKED PATH (C4_BLOCK0_SQ_CHUNK > 0): the big-K VRAM cap lifter -----
+        # Process the span's S rows in chunks so we NEVER hold the full [1,H,S,HD]
+        # K/V/out (nor the [1,S,D] out2 / W_o output) at once.  Under frozen_skip block 0
+        # is the ONLY block over all S rows, so this is what stops the per-forward VRAM
+        # scaling as O(K*30).  Byte-exact: the forward is a per-row independent map.
+        chunk = _block0_sq_chunk()
+        if chunk > 0 and S > chunk:
+            res = x + 0.0                                     # residual buffer [1,S,D]
+            drop_kv = _block0_drop_dead_kv()
+            K_parts = [] if (use_cache and not drop_kv) else None
+            V_parts = [] if (use_cache and not drop_kv) else None
+            for lo0 in range(0, S, chunk):
+                hi0 = min(lo0 + chunk, S)
+                xc = x[:, lo0:hi0, :]                         # [1,Sc,D] view
+                Sc = hi0 - lo0
+                outc = xc.new_zeros(B, H, Sc, HD)
+                _gather_out_chunk(outc, q_pos[lo0:hi0], lo0, dev)
+                out2c = outc.transpose(1, 2).contiguous().view(B, Sc, D)
+                res[:, lo0:hi0, :] = xc + self.W_o.linear(out2c)
+                if K_parts is not None:
+                    K_parts.append(self.W_k.linear(xc).view(B, Sc, H, HD)
+                                   .transpose(1, 2))
+                    V_parts.append(self.W_v.linear(xc).view(B, Sc, H, HD)
+                                   .transpose(1, 2))
+                del outc, out2c
+            if not use_cache:
+                return res
+            if drop_kv:
+                # block 0's KV is DEAD under direct-local: its own future attention is the
+                # gather (ignores past_kv) and no other block reads block-0's cache, so a
+                # None cache is byte-safe (same contract as dead_block_forward).  This is
+                # the second half of the VRAM win — no full [1,H,S,HD] K/V is held at all.
+                return res, None
+            Knew = torch.cat(K_parts, dim=2)
+            Vnew = torch.cat(V_parts, dim=2)
+            return res, (Knew, Vnew, q_pos)
+
+        # ---- WHOLE-SPAN PATH (chunk OFF): byte-identical to the prior direct-local -----
         # K/V still projected + committed for the cache contract (the non-ingest heads
         # and a fallback); the ingest heads' OUTPUT is a pure vectorized gather.
         Knew = self.W_k.linear(x).view(B, S, H, HD).transpose(1, 2)
         Vnew = self.W_v.linear(x).view(B, S, H, HD).transpose(1, 2)
         out = x.new_zeros(B, H, S, HD)
-
-        # ---- VECTORIZED DIRECT GATHER (no Python per-row loop) ----
-        # map each span row's absolute position to its resolved-row index (-1 if not a
-        # query row); the query rows are exactly those with idx >= 0.
-        pm = pos_map.to(dev)
-        clamped = q_pos.clamp(max=pm.numel() - 1)
-        row_idx = pm[clamped]                                 # [S], -1 for non-query rows
-        qmask = row_idx >= 0
-        if bool(qmask.any()):
-            sel = row_idx[qmask]                              # [nq] resolved-row indices
-            span_q = qmask.nonzero(as_tuple=False).flatten()  # [nq] span row positions
-            lo = rf.nib_lo.to(dev).index_select(0, sel)       # [nq, N_ROLES]
-            hi = rf.nib_hi.to(dev).index_select(0, sel)       # [nq, N_ROLES]
-            heads = ing_heads_t.to(dev)                        # [n_ing] ingest head idx
-            # out[0, ing_heads, span_q, {0,1}] = {lo,hi}[:, role]  (role idx == head idx).
-            # Advanced-index with [nq, n_ing]-broadcast head & row index tensors.
-            h_idx = heads.unsqueeze(0).expand(sel.numel(), -1)      # [nq, n_ing]
-            r_idx2 = span_q.unsqueeze(1).expand(-1, heads.numel())  # [nq, n_ing]
-            out[0, h_idx, r_idx2, 0] = lo[:, heads]
-            out[0, h_idx, r_idx2, 1] = hi[:, heads]
+        _gather_out_chunk(out, q_pos, 0, dev)
 
         out2 = out.transpose(1, 2).contiguous().view(B, S, D)
         res = x + self.W_o.linear(out2)
