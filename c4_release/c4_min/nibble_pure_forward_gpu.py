@@ -68,7 +68,22 @@ from .blogspec_layout import NIB_PER_REG
 # ===========================================================================
 def _snap_lane_batch(lanes: torch.Tensor) -> torch.Tensor:
     """Batched ``argmax_v (2·v·x − v²)`` over the value vocab. ``lanes`` [N] ->
-    [N] long. Matches ``nibble_pure_forward._snap_lane`` per element."""
+    [N] long. Matches ``nibble_pure_forward._snap_lane`` per element.
+
+    Under ``C4_VM_WIDTH32`` / ``C4_PC_WIDE`` (#789) — and thus ``C4_SP_WIDE`` (#868,
+    whose signed SP/BP lane rides through the SAME wide DECODE) — the flat argmax
+    (capped at ``VALVOCAB`` ≈ 0x10100) would clip any lane > ~65K OR mis-snap a
+    NEGATIVE (signed SP_WIDE) lane to 0.  Mirror the scalar ``_snap_lane``: descend to
+    the round-free integer snap ``floor(x+½)`` reduced to the unsigned 32-bit word
+    ``v mod 2^32`` — so a wide PC / return-PC AND a below-init (2's-complement) SP/BP
+    decode byte-EXACT.  Bit-identical to the scalar ``_snap_lane`` per element."""
+    from .nibble_vm import vm_width32, _pc_wide_enabled
+    if vm_width32() or _pc_wide_enabled():
+        x = lanes.to(torch.float64)
+        # floor(x+0.5) for x>=0, -floor(-x+0.5) for x<0 (round-free, == argmax snap),
+        # then mod 2^32 (two's-complement unsigned word).
+        iv = torch.where(x >= 0, torch.floor(x + 0.5), -torch.floor(-x + 0.5))
+        return (iv.to(torch.long)) & 0xFFFFFFFF
     v = torch.arange(VALVOCAB, device=lanes.device, dtype=torch.float64)
     logits = 2.0 * lanes.to(torch.float64).unsqueeze(-1) * v - v * v
     return logits.argmax(dim=-1)
