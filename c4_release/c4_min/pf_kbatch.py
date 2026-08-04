@@ -303,12 +303,247 @@ class GraphedFFNChain:
             self._captured = True
         except Exception:
             self._captured = False
+            # a FAILED capture can leave the stream mid-capture; force a clean sync so
+            # the eager fallback runs on a healthy context (avoids the poisoned-context
+            # CUBLAS_STATUS_EXECUTION_FAILED cascade).
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
         return self._captured
 
     def run(self, xq: torch.Tensor) -> torch.Tensor:
         self.static_in.copy_(xq)
         self.graph.replay()
         return self.static_out
+
+
+# ---------------------------------------------------------------------------
+# WHOLE-STEP launch-collapse (#880 follow-up, C4_WHOLESTEP_GRAPH).
+#
+# ``forward_span_perrow_graphed`` still fires ~21 FFN graph replays + ~4 attention
+# launches per step (#880's ``_perrow_block_skip_CHECKPOINT``: 25 launches/step is
+# the new wall, NOT FFN GEMM FLOP).  The reason it can't be ONE graph: the per-row
+# row-SUBSET differs per FFN segment (each segment compacts to a DIFFERENT ``n_sub``
+# -> a different-shaped [1, n_sub, D] buffer -> a different graph), and the 3
+# attention blocks (0, 7, 11) read the S-dependent stream (dynamic shape, the #851
+# capture-invalidator).
+#
+# The fix: FIXED-SHAPE MASKED capture.  Instead of COMPACTING each segment to its
+# live-row subset (a shape that varies), we run the WHOLE passthrough-FFN chain over
+# a FIXED [1, K, D] buffer of ALL K query rows, and MASK each block's output to only
+# its live rows: ``out = where(rowmask_b, ffn_qrow(x), x)``.  A non-live row keeps
+# its input residual — EXACTLY what the per-row skip does (a skipped block is the
+# identity on that row).  The row-mask is a per-block [K,1] bool DEVICE BUFFER; a
+# new step copies fresh masks into those static buffers (no reshape -> the graph is
+# STABLE across steps -> ONE capture replays every step).  This is byte-exact to the
+# per-row path (live rows get the same FFN, dead rows unchanged) and collapses each
+# maximal FFN run BETWEEN attention blocks to ONE launch.  The 3 attention blocks
+# stay eager (S-dependent), so the per-step launch count drops from ~25 to
+# ``#attention_blocks + #FFN_spans`` (doom: 8), and the graph cache growth over 40
+# distinct batches collapses from +216 (per-row) to +5 (whole-step, keyed on (span,K)
+# not on the per-batch subset shapes).
+#
+# MEASURED VERDICT (A5000, doom mix, one DIV): launch-collapse WORKS (25 -> 8, cache
+# +216 -> +5) but is a ~2.6x wall LOSS (0.267 vs 0.104 ms/step @ K=128).  The masked
+# whole-step re-pays the UNION FLOP the per-row skip existed to kill — the 179-block
+# divmod span runs over ALL K rows, not the 1 DIV row (13.7ms masked-K128 vs 3.85ms
+# compacted-1row for that span alone).  The workload is launch-bound RELATIVE to the
+# COMPACTED FLOP; the union FLOP masking reintroduces is ~15-20x larger and BW-bound.
+# So whole-step launch-collapse does NOT beat #880.  Byte-exact (54/54 GPU AX trace);
+# gated C4_WHOLESTEP_GRAPH (default OFF); golden 7d19cdc3 unchanged.  See
+# ``_wholestep_graph_CHECKPOINT.md``.
+# ---------------------------------------------------------------------------
+class WholeStepFFNGraph:
+    """A CUDA graph of a maximal FFN-only block span run over ALL K query rows with a
+    per-block row-MASK.
+
+    ``run(xq, masks)`` copies the [1, K, D] residual + the per-block [K] row masks
+    into the static buffers and replays: each block ``bi`` computes
+    ``where(mask[bi], ffn_qrow_bi(x), x)`` so only its live rows change.  Fixed shape
+    (K, D) across steps -> ONE capture replays every step (masks vary, shapes don't).
+    """
+
+    def __init__(self, kblocks, span_block_idxs: List[int], K: int, D: int,
+                 device, dtype):
+        self.span = list(span_block_idxs)
+        self.K = K
+        self._kblocks = kblocks
+        self._captured = False
+        self.static_in = torch.zeros(1, K, D, device=device, dtype=dtype)
+        # one [K,1] mask per block in the span (all-True at capture time so every
+        # block's GEMM is exercised; the real per-step mask is copied in at run()).
+        self.static_masks = {bi: torch.ones(1, K, 1, device=device, dtype=torch.bool)
+                             for bi in self.span}
+
+        def _apply(inp):
+            x = inp
+            for bi in self.span:
+                fq = kblocks[bi].b._ffn_qrow(x)
+                x = torch.where(self.static_masks[bi], fq, x)
+            return x
+
+        self._apply = _apply
+
+    def _eager(self, xq, masks):
+        x = xq
+        for bi in self.span:
+            fq = self._kblocks[bi].b._ffn_qrow(x)
+            x = torch.where(masks[bi], fq, x)
+        return x
+
+    def try_capture(self) -> bool:
+        dev = self.static_in.device
+        try:
+            # stream + graph MUST be on the tensors' device (cuda:1 etc); the default
+            # ``torch.cuda.Stream()`` is on the CURRENT device -> a device mismatch
+            # invalidates the capture (cudaErrorStreamCaptureInvalidated).
+            with torch.cuda.device(dev):
+                s = torch.cuda.Stream(device=dev)
+                s.wait_stream(torch.cuda.current_stream(dev))
+                with torch.cuda.stream(s):
+                    with torch.no_grad():
+                        for _ in range(3):
+                            _ = self._apply(self.static_in)
+                torch.cuda.current_stream(dev).wait_stream(s)
+                torch.cuda.synchronize(dev)
+                self.graph = torch.cuda.CUDAGraph()
+                with torch.no_grad():
+                    with torch.cuda.graph(self.graph):
+                        self.static_out = self._apply(self.static_in)
+                torch.cuda.synchronize(dev)
+            self._captured = True
+        except Exception:
+            self._captured = False
+            # a FAILED capture can leave the stream mid-capture; force a clean sync so
+            # the eager fallback runs on a healthy context (avoids the poisoned-context
+            # CUBLAS_STATUS_EXECUTION_FAILED cascade).
+            try:
+                torch.cuda.synchronize(dev)
+            except Exception:
+                pass
+            return False
+        # VALIDATE the capture: a large block-chain graph can capture "successfully"
+        # yet replay WRONG (silent all-zeros at K=64 on this A5000 — the graph aborts
+        # in __exit__).  Replay on a SMALL probe (a 230-block SwiGLU chain over a large
+        # random input diverges numerically -> a false reject; a small input stays
+        # sane) and compare to the eager chain relative to its magnitude; a real
+        # mismatch (e.g. the zeros bug) REJECTS the graph (caller runs eager, which is
+        # byte-exact).
+        try:
+            probe = torch.randn_like(self.static_in) * 1e-2
+            allmask = {bi: torch.ones_like(self.static_masks[bi]) for bi in self.span}
+            with torch.no_grad():
+                ref = self._eager(probe, allmask)
+                got = self.run(probe, allmask)
+            scale = ref.abs().max().clamp_min(1e-6)
+            rel = (got - ref).abs().max() / scale
+            if not torch.isfinite(rel) or float(rel) > 1e-2:
+                self._captured = False
+        except Exception:
+            self._captured = False
+        return self._captured
+
+    def run(self, xq: torch.Tensor, masks: Dict[int, torch.Tensor]) -> torch.Tensor:
+        self.static_in.copy_(xq)
+        for bi in self.span:
+            self.static_masks[bi].copy_(masks[bi])
+        self.graph.replay()
+        return self.static_out
+
+
+class WholeStepCompactedGraph:
+    """A CUDA graph of a maximal FFN-only span run over a FIXED-CAPACITY COMPACTED
+    buffer of the span's live rows (the whole-step launch-collapse WITHOUT the union
+    FLOP).
+
+    The pure-masked ``WholeStepFFNGraph`` collapses the span to ONE launch but runs
+    every block over ALL K rows -> it re-pays the UNION FLOP the per-row block-skip
+    existed to kill (the 179-block divmod span over 128 rows, not the 1 DIV row).  At
+    doom sizes that FLOP is memory-BW-bound and DOMINATES (measured 13.7ms masked-K128
+    vs 3.85ms compacted-1row for the divmod span).
+
+    This variant instead COMPACTS the span's live rows into a fixed ``cap``-row buffer
+    (cap = a small bucket >= the span's live-row count, so the shape is STABLE across
+    steps), runs the block chain over ``[1, cap, D]`` with a per-block WITHIN-COMPACT
+    mask, and the caller scatters the live rows back.  FLOP = ``cap`` rows (small), and
+    the whole span is ONE graph launch.  ``run(xq_compact, masks_compact)`` where
+    ``xq_compact`` is the [1, cap, D] gathered+padded live-row buffer and
+    ``masks_compact[bi]`` is the [1, cap, 1] mask (True where that compacted slot is a
+    row block ``bi`` serves).  Byte-exact to the per-row skip (each block's FFN runs on
+    exactly its live rows; padded slots masked off)."""
+
+    def __init__(self, kblocks, span_block_idxs: List[int], cap: int, D: int,
+                 device, dtype):
+        self.span = list(span_block_idxs)
+        self.cap = cap
+        self._captured = False
+        self.static_in = torch.zeros(1, cap, D, device=device, dtype=dtype)
+        self.static_masks = {bi: torch.ones(1, cap, 1, device=device, dtype=torch.bool)
+                             for bi in self.span}
+
+        def _apply(inp):
+            x = inp
+            for bi in self.span:
+                fq = kblocks[bi].b._ffn_qrow(x)
+                x = torch.where(self.static_masks[bi], fq, x)
+            return x
+
+        self._apply = _apply
+
+    def try_capture(self) -> bool:
+        try:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                with torch.no_grad():
+                    for _ in range(3):
+                        _ = self._apply(self.static_in)
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.no_grad():
+                with torch.cuda.graph(self.graph):
+                    self.static_out = self._apply(self.static_in)
+            torch.cuda.synchronize()
+            self._captured = True
+        except Exception:
+            self._captured = False
+            # a FAILED capture can leave the stream mid-capture; force a clean sync so
+            # the eager fallback runs on a healthy context (avoids the poisoned-context
+            # CUBLAS_STATUS_EXECUTION_FAILED cascade).
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+        return self._captured
+
+    def run(self, xq: torch.Tensor, masks: Dict[int, torch.Tensor]) -> torch.Tensor:
+        self.static_in.copy_(xq)
+        for bi in self.span:
+            self.static_masks[bi].copy_(masks[bi])
+        self.graph.replay()
+        return self.static_out
+
+
+def _cap_bucket(n: int, K: int) -> int:
+    """Fixed capacity bucket for ``n`` live rows: the next power of two >= n, capped
+    at K (so the compacted-graph shape takes a SMALL fixed set of values -> a bounded
+    graph count, no per-batch subset growth)."""
+    if n <= 1:
+        return 1
+    c = 1
+    while c < n:
+        c <<= 1
+    return min(c, K)
+
+
+def wholestep_graph_enabled() -> bool:
+    """``C4_WHOLESTEP_GRAPH`` (DEFAULT OFF): collapse each maximal FFN-only block span
+    between attention blocks into ONE fixed-shape masked CUDA graph (whole-step
+    launch-collapse).  OFF -> the #880 per-chain grouped graphs."""
+    import os
+    return os.environ.get("C4_WHOLESTEP_GRAPH", "0") not in ("0", "", "false", "False")
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +582,11 @@ class KBatchBoundedRunner:
         # MEGAKERNEL graph cache: (live-schedule tuple, K) -> GraphedFFNChain over the
         # tail passthrough-FFN segment (built lazily on first use of that shape).
         self._ffn_graphs: Dict[Tuple, object] = {}
+        # WHOLE-STEP graph cache (C4_WHOLESTEP_GRAPH): (ffn-span tuple, K) ->
+        # WholeStepFFNGraph.  Keyed on K only (the row-mask is a device buffer, not a
+        # shape), so it stays at ~#ffn_spans entries — no per-batch subset growth.
+        self._ws_graphs: Dict[Tuple, object] = {}
+        self._ws_spans: Optional[List] = None
         self._graph_disabled: set = set()
 
     def _arm_lea_int_snap(self) -> int:
@@ -416,6 +656,331 @@ class KBatchBoundedRunner:
                 return list(range(self.n_blocks))
             s |= set(live)
         return sorted(s)
+
+    # ------------------------------------------------------------------
+    # #874 — PER-ROW block-skip (position-sparse block EXECUTION).
+    #
+    # ``forward_span`` runs the UNION of the K ops' live blocks for ALL K query
+    # rows.  But block ``bi`` only AFFECTS the decode of query row ``j`` iff
+    # ``ops[j]``'s own live set contains ``bi``.  For every OTHER row ``bi`` is a
+    # provable nil passthrough (its op does not use that block; the row carries its
+    # exact input residual — the SAME thing the union forward computes for it, since
+    # a skipped block's output for a row is that row's input residual).  So block
+    # ``bi`` need compute ONLY its LIVE rows.  The classic waste: a batch with one
+    # DIV makes the whole 188-block divmod span "live" for the WHOLE K-batch, so the
+    # union forward runs those 188 blocks for every ADD/PSH/LI row too — ~15x more
+    # FFN work than the per-op weighted number.  Per-row block-skip runs the DIV
+    # blocks ONLY on the (rare) DIV rows.
+    # ------------------------------------------------------------------
+    def per_block_rows(self, ops) -> Dict[int, List[int]]:
+        """``{block_idx: [row j in 0..K-1 whose op uses this block]}`` — the per-block
+        query-row mask.  A block absent from the map is used by NO row in this span
+        (fully skipped).  If any op is unknown (``None`` live -> full stack), that row
+        is live for EVERY block (safe fallback)."""
+        full = None
+        rows_by_block: Dict[int, List[int]] = {}
+        for j, op in enumerate(ops):
+            live = self.live_index.get(op)
+            if live is None:
+                if full is None:
+                    full = list(range(self.n_blocks))
+                live = full
+            for bi in live:
+                rows_by_block.setdefault(bi, []).append(j)
+        return rows_by_block
+
+    def forward_span_perrow(self, x: torch.Tensor, ops, q_idxs: List[int],
+                            all_store: Optional[torch.Tensor] = None
+                            ) -> torch.Tensor:
+        """PER-ROW block-skip forward_span (#874): each live block computes ONLY the
+        query rows whose op uses it, NOT the union of all K rows.
+
+        Byte-identical to the K=1 SINGLE-STEP decode: a row that skips block ``bi``
+        keeps its input residual at that block, which is EXACTLY what that row's op
+        computes in its OWN single-step forward (that op's block-skip schedule never
+        runs ``bi``).  The chain runs in block order over the shared in-place buffer,
+        so a row's residual entering block ``bi`` is the same as under its single-step
+        forward (every earlier block the row's op uses has already run for it, and
+        every earlier block it does NOT use left its residual untouched).
+
+        (NOTE: this is byte-exact to the TRUE per-step decode; the older UNION
+        ``forward_span`` is NOT for a mixed batch — its SHL/EQ ax-recompose blocks run
+        on, and corrupt, the AX band of the OTHER rows.  Per-row is both correct and
+        skips the FFN work of blocks a row does not use.)"""
+        store_dim = int(self.L.IS_STORE)
+        if all_store is None:
+            col = x[0, :, store_dim]
+            all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
+        rows_by_block = self.per_block_rows(ops)
+        with torch.no_grad():
+            buf = x.clone()
+            # iterate blocks in order; each runs ONLY its live rows (a subset of the
+            # K query rows).  Blocks used by no row are skipped entirely.
+            for bi in sorted(rows_by_block.keys()):
+                rows = rows_by_block[bi]
+                sub_q = [q_idxs[j] for j in rows]
+                sub_qt = torch.tensor(sub_q, device=x.device, dtype=torch.long)
+                buf = self.kblocks[bi].forward(buf, sub_q, all_store=all_store,
+                                               q_t=sub_qt, inplace=True)
+        return buf
+
+    # ------------------------------------------------------------------
+    # #874 GROUPED per-row block-skip: collapse the eager per-block launch overhead.
+    #
+    # The naive ``forward_span_perrow`` runs the SAME #block-forwards as the union (a
+    # block used by ANY row still launches once) — it only shrinks each GEMM to that
+    # block's live-row subset.  On the eager path the launch count, not the FLOP, is
+    # the wall, so the FLOP win does not show.  But the row-subsets are HIGHLY
+    # structured: in a K-batch with one DIV, the ~179 ``alu-div`` blocks ALL share the
+    # single DIV row's subset and are a consecutive PASSTHROUGH (FFN-only) run.  So we
+    # COMPACT those rows into a [1, n_sub, D] buffer and run that whole consecutive
+    # same-subset passthrough run as ONE FFN chain over n_sub rows (n_sub=1 for the
+    # lone-DIV case) — collapsing 179 x 64-row GEMMs to 179 x 1-row GEMMs, and (with a
+    # CUDA graph over the compacted chain) collapsing their launches too.  Byte-exact:
+    # a passthrough block's FFN is position-independent, so running it on the compacted
+    # live-row buffer and scattering back is identical to running it in place.
+    # ------------------------------------------------------------------
+    def _perrow_segments(self, ops):
+        """Partition the live blocks into ordered SEGMENTS, each a maximal run of
+        consecutive live blocks that are ALL passthrough (FFN-only) AND share the
+        IDENTICAL query-row subset — plus singleton segments for attention blocks or
+        subset boundaries.  Returns ``[(block_idxs, rows_tuple, is_ffn_chain)]`` in
+        block order."""
+        rows_by_block = self.per_block_rows(ops)
+        live = sorted(rows_by_block.keys())
+        segs: List[Tuple[List[int], Tuple[int, ...], bool]] = []
+        cur: List[int] = []
+        cur_rows: Optional[Tuple[int, ...]] = None
+        for bi in live:
+            rows = tuple(rows_by_block[bi])
+            is_pass = self.kblocks[bi].b.is_passthrough
+            if is_pass and cur and rows == cur_rows:
+                cur.append(bi)
+            else:
+                if cur:
+                    segs.append((cur, cur_rows, len(cur) >= 1 and
+                                 all(self.kblocks[b].b.is_passthrough for b in cur)))
+                cur = [bi]
+                cur_rows = rows
+        if cur:
+            segs.append((cur, cur_rows, all(self.kblocks[b].b.is_passthrough
+                                            for b in cur)))
+        return segs
+
+    def forward_span_perrow_graphed(self, x: torch.Tensor, ops, q_idxs: List[int],
+                                    all_store: Optional[torch.Tensor] = None,
+                                    graph: bool = True) -> torch.Tensor:
+        """GROUPED per-row forward_span (#874): consecutive same-row-subset passthrough
+        blocks run as ONE FFN chain over a COMPACTED [1, n_sub, D] buffer (n_sub = that
+        subset's row count), and — when ``graph`` — the tail such run is CUDA-graphed
+        (keyed on the block-run + n_sub).  Byte-exact to ``forward_span_perrow``: a
+        passthrough block's FFN is position-independent, so gather-run-scatter over the
+        live rows equals the in-place per-row run."""
+        store_dim = int(self.L.IS_STORE)
+        if all_store is None:
+            col = x[0, :, store_dim]
+            all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
+        segs = self._perrow_segments(ops)
+        with torch.no_grad():
+            buf = x.clone()
+            for seg_i, (blks, rows, is_ffn) in enumerate(segs):
+                sub_q = [q_idxs[j] for j in rows]
+                sub_qt = torch.tensor(sub_q, device=x.device, dtype=torch.long)
+                if is_ffn and len(blks) >= 1:
+                    # COMPACT the live rows, run the FFN chain over the small buffer,
+                    # scatter back.  (Position-independent FFN -> byte-exact.)
+                    xq = buf[:, sub_qt]                              # [1, n_sub, D]
+                    key = (tuple(blks), len(sub_q))
+                    gch = None
+                    # CUDA graphs are GPU-only; on CPU run the compacted chain eagerly
+                    # (still the per-row FLOP win, just no launch-collapse).
+                    if graph and x.is_cuda and key not in self._graph_disabled:
+                        gch = self._ffn_graphs.get(key)
+                        if gch is None:
+                            gch = GraphedFFNChain(self.kblocks, blks, len(sub_q),
+                                                  x.shape[2], x.device, x.dtype)
+                            if gch.try_capture():
+                                self._ffn_graphs[key] = gch
+                            else:
+                                gch = None
+                                self._graph_disabled.add(key)
+                    if gch is not None:
+                        fq = gch.run(xq)
+                    else:
+                        fq = xq
+                        for bi in blks:
+                            fq = self.kblocks[bi].b._ffn_qrow(fq)
+                    buf[:, sub_qt] = fq
+                else:
+                    # attention (or mixed) block: run individually over its subset.
+                    for bi in blks:
+                        buf = self.kblocks[bi].forward(
+                            buf, sub_q, all_store=all_store, q_t=sub_qt, inplace=True)
+        return buf
+
+    # ------------------------------------------------------------------
+    # WHOLE-STEP launch-collapse (C4_WHOLESTEP_GRAPH): ONE graph per FFN span.
+    # ------------------------------------------------------------------
+    def _wholestep_spans(self):
+        """The FIXED (op-independent) partition of the block stack into maximal
+        FFN-only spans separated by the attention blocks.  Returns
+        ``[("ffn", [block_idxs]) | ("attn", block_idx)]`` in block order.  This is
+        STRUCTURAL (attention blocks are 0/7/11 for doom, set by head layout), so it
+        is the SAME every step -> one graph per FFN span replays across the whole
+        self-emu."""
+        if getattr(self, "_ws_spans", None) is not None:
+            return self._ws_spans
+        spans: List[Tuple[str, object]] = []
+        cur: List[int] = []
+        for bi, kb in enumerate(self.kblocks):
+            if kb.b.is_passthrough:
+                cur.append(bi)
+            else:
+                if cur:
+                    spans.append(("ffn", cur))
+                    cur = []
+                spans.append(("attn", bi))
+        if cur:
+            spans.append(("ffn", cur))
+        self._ws_spans = spans
+        return spans
+
+    def forward_span_perrow_wholestep(self, x: torch.Tensor, ops, q_idxs: List[int],
+                                      all_store: Optional[torch.Tensor] = None,
+                                      graph: bool = True,
+                                      compact: bool = False) -> torch.Tensor:
+        """WHOLE-STEP per-row forward_span (C4_WHOLESTEP_GRAPH): each maximal FFN-only
+        block span (between attention blocks 0/7/11) runs as ONE CUDA graph — so the
+        per-step launch count drops from ~25 (per-chain grouped) to ``#attn_blocks +
+        #ffn_spans`` (doom: 6).  The 3 attention blocks stay eager (S-dependent).
+
+        ``compact=False`` (default): the MASKED variant runs the span over ALL K rows
+        with a per-block row-mask (``where(mask, ffn(x), x)``) — ONE stable graph per
+        span (keyed on (span, K)), so the launch collapses (25->8) AND the graph cache
+        stops growing.  BUT it re-pays the UNION FLOP the per-row skip existed to kill
+        (the 179-block divmod span over K rows, not the 1 DIV row), which at doom sizes
+        is memory-BW-bound and DOMINATES -> a ~2.6x wall LOSS vs #880 per-row-graphed.
+        ``compact=True`` (experimental, doesn't pan out): gather each span's live rows
+        into a fixed pow2-``cap`` buffer to keep FLOP minimal — but the span's row
+        subset is non-uniform across its blocks, so the union-cap is not ~1 and the
+        per-(span,cap) graph count/capture pressure grows; no win.
+
+        Byte-exact to ``forward_span_perrow`` (each block's FFN runs on exactly its
+        live rows; dead/padded rows keep their input).  Falls back to the eager masked
+        chain on CPU / capture failure (still byte-exact, just no launch-collapse)."""
+        store_dim = int(self.L.IS_STORE)
+        if all_store is None:
+            col = x[0, :, store_dim]
+            all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
+        D = x.shape[2]
+        K = len(q_idxs)
+        q_t = torch.tensor(q_idxs, device=x.device, dtype=torch.long)
+        rows_by_block = self.per_block_rows(ops)
+        spans = self._wholestep_spans()
+        with torch.no_grad():
+            buf = x.clone()
+            for kind, payload in spans:
+                if kind == "attn":
+                    bi = payload
+                    rows = rows_by_block.get(bi)
+                    if not rows:
+                        continue                     # attention block used by no row
+                    sub_q = [q_idxs[j] for j in rows]
+                    sub_qt = torch.tensor(sub_q, device=x.device, dtype=torch.long)
+                    buf = self.kblocks[bi].forward(
+                        buf, sub_q, all_store=all_store, q_t=sub_qt, inplace=True)
+                    continue
+                blks = payload
+                # union of the span's live rows (each block runs on its own subset of
+                # these; a row live for NO block in the span is skipped entirely).
+                span_rows = sorted(set().union(*(set(rows_by_block.get(bi, []))
+                                                 for bi in blks)))
+                if not span_rows:
+                    continue                          # span used by no row
+                if compact:
+                    self._run_span_compacted(buf, blks, span_rows, rows_by_block,
+                                             q_idxs, q_t, D, K, graph)
+                else:
+                    self._run_span_masked(buf, blks, rows_by_block, q_t, D, K,
+                                          x.device, graph)
+        return buf
+
+    def _run_span_masked(self, buf, blks, rows_by_block, q_t, D, K, device, graph):
+        """MASKED whole-step span: run every block over ALL K rows, mask the delta.
+        Re-pays the union FLOP (measurement variant)."""
+        masks = {}
+        for bi in blks:
+            rows = rows_by_block.get(bi, [])
+            t = torch.zeros(1, K, 1, device=device, dtype=torch.bool)
+            if rows:
+                t[0, torch.tensor(rows, device=device, dtype=torch.long), 0] = True
+            masks[bi] = t
+        xq = buf[:, q_t]                                          # [1, K, D]
+        key = ("mask", tuple(blks), K)
+        gch = self._ws_graph_for(
+            key, lambda: WholeStepFFNGraph(self.kblocks, blks, K, D, buf.device,
+                                           buf.dtype), graph and buf.is_cuda)
+        if gch is not None:
+            fq = gch.run(xq, masks)
+        else:
+            fq = xq
+            for bi in blks:
+                out = self.kblocks[bi].b._ffn_qrow(fq)
+                fq = torch.where(masks[bi], out, fq)
+        buf[:, q_t] = fq
+
+    def _run_span_compacted(self, buf, blks, span_rows, rows_by_block, q_idxs, q_t,
+                            D, K, graph):
+        """COMPACTED whole-step span: gather the span's live rows into a fixed-``cap``
+        buffer, run the block chain (per-block within-compact mask), scatter back.  FLOP
+        = cap rows (minimal), ONE graph launch for the whole span."""
+        n_live = len(span_rows)
+        cap = _cap_bucket(n_live, K)
+        dev = buf.device
+        # compacted input: the live rows, padded to cap (pad rows are all masked off).
+        comp_q = [q_idxs[j] for j in span_rows]
+        comp_qt = torch.tensor(comp_q, device=dev, dtype=torch.long)
+        xq = buf.new_zeros(1, cap, D)
+        xq[:, :n_live] = buf[:, comp_qt]
+        # per-block mask in the COMPACT index space: slot p (0..n_live-1) is live for
+        # block bi iff span_rows[p] is in rows_by_block[bi]; pad slots always masked.
+        row_pos = {r: p for p, r in enumerate(span_rows)}
+        masks = {}
+        for bi in blks:
+            t = torch.zeros(1, cap, 1, device=dev, dtype=torch.bool)
+            for r in rows_by_block.get(bi, []):
+                p = row_pos.get(r)
+                if p is not None:
+                    t[0, p, 0] = True
+            masks[bi] = t
+        key = ("compact", tuple(blks), cap)
+        gch = self._ws_graph_for(
+            key, lambda: WholeStepCompactedGraph(self.kblocks, blks, cap, D, dev,
+                                                 buf.dtype), graph and buf.is_cuda)
+        if gch is not None:
+            fq = gch.run(xq, masks)
+        else:
+            fq = xq
+            for bi in blks:
+                out = self.kblocks[bi].b._ffn_qrow(fq)
+                fq = torch.where(masks[bi], out, fq)
+        # scatter the live (non-pad) rows back.
+        buf[:, comp_qt] = fq[:, :n_live]
+
+    def _ws_graph_for(self, key, make, do_graph):
+        """Fetch-or-capture a whole-step graph under ``key`` (cached in ``_ws_graphs``);
+        None if graphing disabled / capture failed (caller runs eager)."""
+        if not do_graph or key in self._graph_disabled:
+            return None
+        gch = self._ws_graphs.get(key)
+        if gch is None:
+            gch = make()
+            if gch.try_capture():
+                self._ws_graphs[key] = gch
+            else:
+                self._graph_disabled.add(key)
+                return None
+        return gch
 
     def forward_span(self, x: torch.Tensor, ops, q_idxs: List[int]) -> torch.Tensor:
         live_set = set(self.live_union(ops))

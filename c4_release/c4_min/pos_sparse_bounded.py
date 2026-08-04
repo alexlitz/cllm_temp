@@ -166,6 +166,14 @@ class BoundedBlock:
             from .pos_sparse_forward import apply_int_lea_addr_nib
             return apply_int_lea_addr_nib(aout, self._lea_snap_dims)
         F_ = self.ffn
+        # FUSED-DELTA SPARSE FFN composition (#873, measurement-only branch): if the
+        # block's ffn was swapped for the #808 fused-delta / fused SwiGLU kernel
+        # (install_fused_delta_ffn), it exposes forward(x)->x+FFN(x) and NO W_up
+        # attribute; route the query-row FFN through it (byte-exact at the nibble
+        # margin per #808).  Composes with per-row block-skip (shrinks each LIVE
+        # block's FFN COMPUTE; per-row already picked the live blocks).
+        if getattr(F_, 'W_up', None) is None and hasattr(F_, 'forward'):
+            return F_.forward(aout)
         if self.fp64_ffn or self._W_gu32 is None:
             Wu, Wg, Wd = _dense(F_.W_up), _dense(F_.W_gate), _dense(F_.W_down)
             xq64 = aout.double()

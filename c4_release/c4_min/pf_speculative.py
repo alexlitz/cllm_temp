@@ -85,6 +85,72 @@ def set_batched_decode(v: Optional[bool]) -> None:
     global _BATCHED_DECODE
     _BATCHED_DECODE = v
 
+
+_GPU_VERIFY: Optional[bool] = None
+
+
+def _gpu_verify_enabled() -> bool:
+    """``C4_GPU_VERIFY`` (DEFAULT OFF): run the whole per-span decode+ACCEPT-COMPARE
+    on-GPU as ONE vectorized tensor op — batch-decode all K query rows (argmax over
+    the register nibbles), compare to the draft's per-step targets (resident on GPU),
+    and reduce to the accepted-prefix length with ONE host sync (a single
+    ``first_bad.item()``).  This removes the O(steps) host-side Python decode+compare
+    loop (~11 host syncs/step; ~330k GPU stalls over a doom program) that dominates
+    the whole-verify wall over the ~0.034 ms/step GPU forward.
+
+    Bit-identical to the scalar per-step path: the batched ``_snap_lane_batch`` /
+    ``_decode_reg_batch`` evaluate the SAME integer requant-argmax per row as the
+    scalar decode, and the compare is the SAME (pc/ax&mask/sp/bp equality, with
+    is_file rows a no-op and is_halt rows AX-only).  DEFAULT OFF -> the exact scalar
+    loop (golden 069cc32f unchanged)."""
+    if _GPU_VERIFY is not None:
+        return _GPU_VERIFY
+    return os.environ.get("C4_GPU_VERIFY", "0") not in ("0", "", "false", "False")
+
+
+def set_gpu_verify(v: Optional[bool]) -> None:
+    global _GPU_VERIFY
+    _GPU_VERIFY = v
+
+
+def _build_draft_targets(draft, device: str, mask: int):
+    """Materialise the draft's per-step ACCEPT targets as device-resident tensors
+    ONCE per verify (cached on the draft keyed by (device, mask)).  All are [n_steps]
+    long/bool tensors so the per-span compare is a single vectorized op with NO host
+    sync.  Cheap: the draft frames are already in host memory (the logical VM ran on
+    CPU); this is one pack + one HtoD copy amortised over the whole program."""
+    key = (device, int(mask))
+    cache = getattr(draft, "_gpu_targets", None)
+    if cache is not None and cache.get("_key") == key:
+        return cache
+    frames = draft.frames
+    n = len(frames)
+    want_pc = torch.empty(n, dtype=torch.long)
+    want_ax = torch.empty(n, dtype=torch.long)
+    want_sp = torch.empty(n, dtype=torch.long)
+    want_bp = torch.empty(n, dtype=torch.long)
+    is_halt = torch.zeros(n, dtype=torch.bool)
+    is_file = torch.zeros(n, dtype=torch.bool)
+    for i, fr in enumerate(frames):
+        want_pc[i] = fr["pc"]
+        want_ax[i] = fr["ax"] & mask
+        want_sp[i] = fr["sp"] & 0xFFFFFFFF
+        want_bp[i] = fr["bp"] & 0xFFFFFFFF
+        if fr.get("is_halt"):
+            is_halt[i] = True
+        if fr.get("is_file"):
+            is_file[i] = True
+    dev = torch.device(device)
+    cache = {
+        "_key": key,
+        "want_pc": want_pc.to(dev), "want_ax": want_ax.to(dev),
+        "want_sp": want_sp.to(dev), "want_bp": want_bp.to(dev),
+        "is_halt": is_halt.to(dev), "is_file": is_file.to(dev),
+    }
+    draft._gpu_targets = cache
+    return cache
+
+
 from . import isa
 from . import blogspec_vocab as V
 from . import nibble_filesys as _FS   # OPEN/READ/CLOS/PRTF via the TOOL_CALL boundary
@@ -698,6 +764,20 @@ def _dead_block_fusion_enabled() -> bool:
     return _os.environ.get("C4_DEAD_BLOCK_FUSION", "0") not in ("0", "", "false", "False")
 
 
+def _evict_timed_enabled() -> bool:
+    """``C4_EVICT_TIMED`` (DEFAULT OFF): drain (``torch.cuda.synchronize``) around each
+    eviction round so ``stats['evict_secs']`` is a clean wall breakdown.  This costs 2
+    host syncs PER eviction round — the last eviction host-sync cost once the scheduled
+    drop itself is GPU-vectorized (``evict_all_blocks_scheduled`` batched-nonzero).  OFF
+    (default) -> the eviction kernels are enqueued on the stream with NO explicit drain
+    (they still order correctly before the next forward's kernels — same stream), so
+    eviction adds ~ZERO host syncs per FORWARD.  ON -> the timed path (``evict_secs``
+    populated, at 2 syncs/round).  Byte-identical either way (a synchronize changes
+    only WHEN the host waits, never the compute)."""
+    import os as _os
+    return _os.environ.get("C4_EVICT_TIMED", "0") not in ("0", "", "false", "False")
+
+
 def _frozen_skip_enabled() -> bool:
     """``C4_FROZEN_ROW_SKIP`` (DEFAULT OFF): after the last block that reads a
     frozen (non-query) row's KV via a live LOCAL head (the frame-ingest block 0),
@@ -733,30 +813,251 @@ def _frozen_skip_cut(model) -> int:
     return max(cut, 1)
 
 
+def _cut_span_chunk() -> int:
+    """``C4_CUT_SPAN_CHUNK`` (default 0 == OFF -> the whole-span [0,cut) forward,
+    byte-identical to the prior frozen-skip path).  When > 0, the ``frozen_skip``
+    [0, cut) forward (block 0 = the frame-ingest, the SOLE block that runs over all
+    S = K*30 rows) is processed in CHUNKS of this many span rows, so it NEVER holds the
+    whole-span attention + FFN activations ([1, S, ffn_hidden] ~= 4 GB and the [1,S,D]
+    W_o output) at once — the LAST O(K*30) tensor on the composed forward and the true
+    eff_K cap (measured: block 0 over S rows peaks 16.8 GB at K=8192; blocks [cut,N)
+    over K query rows peak only 7.8 GB).
+
+    BYTE-EXACT + WHY IT NEEDS DIRECT-LOCAL + DROP-DEAD-KV.  Under direct-local-CAM block
+    0's attention is a PER-ROW direct gather (no cross-row score), and its FFN is per-row,
+    so block 0's output at row ``i`` depends ONLY on row ``i`` — chunking the S axis is
+    bit-identical.  Blocks [cut, N) already run on the K query rows only, so we need block
+    0's output ONLY at those query rows (frozen rows are never read downstream).  We run
+    block 0 chunk-by-chunk, keep each chunk's QUERY-row outputs, and drop the frozen rows'
+    outputs AND block 0's (provably-dead) KV.  Requires C4_DIRECT_LOCAL_CAM (per-row block
+    0) and C4_BLOCK0_DROP_DEAD_KV (else block 0 would need the full-span KV committed).
+    """
+    import os as _os
+    try:
+        return int(_os.environ.get("C4_CUT_SPAN_CHUNK", "0"))
+    except ValueError:
+        return 0
+
+
+def _qrow_chunk(default: int) -> int:
+    """``C4_QROW_CHUNK`` (default == the cut-span chunk value when unset): chunk the
+    blocks-[cut, N) stack over the K QUERY rows.  These blocks are per-row independent
+    (dead-attn identity / direct-CAM O(1) per-row gather + per-row FFN — no cross-row
+    attention), so chunking the K axis is byte-exact and holds the downstream FFN peak
+    at O(qchunk*ffn_hidden), FLAT in K.  This is the SECOND cap-lifter: with block 0
+    Sq-chunked AND the query-row FFN chunked, the ONLY tensor still O(K) is the [1,K,D]
+    block-0-output buffer + the [1,S,D] span embed (D, not ffn_hidden) — so K can grow
+    toward 100k-1M (the span embed is the residual floor, ~D*30 bytes/step).  Set 0 to
+    disable (whole-K query-row stack)."""
+    import os as _os
+    v = _os.environ.get("C4_QROW_CHUNK")
+    if v is None:
+        return int(default)
+    try:
+        return int(v)
+    except ValueError:
+        return int(default)
+
+
+def _stream_embed_enabled() -> bool:
+    """``C4_STREAM_EMBED`` (default OFF): build each block-0 S-chunk's embed + overlay ON
+    DEMAND inside the cut-span-chunk loop, so the full ``[1, S, D]`` span embed (the LAST
+    O(K*30) tensor once block 0 and the query-row FFN are chunked) is NEVER materialised —
+    only ``chunk`` rows of embed exist at a time.  This is the FINAL cap-lifter: with it,
+    the per-forward VRAM is O(chunk*D + K*D) (the block-0-output [1,K,D] buffer, at D not
+    ffn_hidden), so eff_K can go past 100k toward 1M on a 24GB card.  Requires
+    C4_CUT_SPAN_CHUNK (+ direct-local + drop-dead-kv); byte-exact (per-row embed+overlay,
+    same w_start math)."""
+    import os as _os
+    return _os.environ.get("C4_STREAM_EMBED", "0") not in ("0", "", "false", "False")
+
+
+def _stream_embed_chunk(ctx, lo0, hi0):
+    """Build ONE [1, hi0-lo0, D] chunk of the span's overlaid embed on demand (STREAM
+    mode) — the same embed gather + overlay the whole-span path does, restricted to span
+    rows [lo0, hi0).  Byte-exact: ``apply_overlay_window_*`` is a per-row write keyed by
+    the absolute position ``span_start + row``, so overlaying a chunk with its own
+    ``w_start = span_start + lo0`` and chunk-local query rows reproduces exactly those
+    rows' residual.  The full [1, S, D] span embed never exists — only a chunk at a time."""
+    embed = ctx["embed"]
+    span_start = ctx["span_start"]
+    win_toks = ctx["win_toks"]
+    xc = embed[win_toks[:, lo0:hi0]]                      # [1, hi0-lo0, D] fresh copy
+    # chunk-local query rows (absolute q positions that fall inside [lo0, hi0)).
+    q_local_chunk = [ql - lo0 for ql in ctx["q_local"] if lo0 <= ql < hi0]
+    _overlay = (apply_overlay_window_batched if ctx["overlay_batched"]
+                else apply_overlay_window_fast)
+    _overlay(xc, span_start + lo0, ctx["L"], ctx["store_log"], ctx["code_vec"],
+             query_rows=q_local_chunk, code=ctx["code"], code_off=ctx["code_off"])
+    return xc
+
+
+def _run_qstack(model, h, qp, cut, n, megastep=None):
+    """Forward the K query rows ``h [1,K,D]`` through the frozen-skip block region
+    ``[cut, n)`` — the dead-FFN + live-CAM chain — and return ``[1,K,D]``.
+
+    ``megastep`` (C4_FUSED_MEGABLOCK / C4_GRAPH_MEGAKERNEL): a ``MegaBlockRegion`` /
+    ``MegaStepGraph`` whose ``run(h, qp)`` runs the dead-FFN segments as ONE on-chip
+    fused/graphed launch (residual L2-resident) + the live CAM blocks eagerly —
+    byte-exact to the per-block loop (dead-block fusion makes attention the identity
+    on every dead block, so ``past_kv=None`` is correct; the mega-chain is the same
+    nonzeros in the same order).  ``None`` -> the eager per-block loop.
+
+    This is THE megablock wiring for the O(K) cut-span-chunk (giant-K) path: every
+    per-query-row-chunk block stack now routes through the megakernel (previously
+    ONLY the whole-span path did), so the megablock FIRES at giant K where the O(K)
+    band is essential.  Byte-exact; default OFF (megastep is None) -> unchanged."""
+    if megastep is not None:
+        return megastep.run(h, qp)
+    for b in range(cut, n):
+        h, _ = model.blocks[b](h, past_kv=None, q_positions=qp, use_cache=True)
+    return h
+
+
 def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
-                                       q_local_idx, cut):
+                                       q_local_idx, cut, megastep=None,
+                                       stream_ctx=None, block0_graph=None):
     """Run blocks [0, cut) over ALL rows (commit KV), then blocks [cut, N) over ONLY
     the query rows (``q_local_idx`` — window-local indices).  Returns
     ``(hidden_full, new_caches)`` where ``hidden_full`` is [1, S, D] with the QUERY
     rows overwritten by their fully-forwarded state (frozen rows left at their
     post-cut-block value, which the decode never reads).  ``new_caches[b]`` for
     b<cut is the full-row KV (committed as usual); for b>=cut it is None (that
-    block's KV is never re-read — dead-attn / direct-CAM)."""
+    block's KV is never re-read — dead-attn / direct-CAM).
+
+    ``megastep`` (C4_GRAPH_MEGAKERNEL): a ``MegaStepGraph`` that CUDA-graphs the
+    dead-FFN segments of the ``[cut, N)`` block loop into one-launch-per-segment
+    replays (byte-exact; the graphed FFN chain is the same dense GEMM in the same
+    order as the eager loop, attention identity throughout).  None -> the eager
+    per-block loop."""
     n = len(model.blocks)
     if past_key_values is None:
         past_key_values = [None] * n
     new_caches = [None] * n
+    qi = torch.tensor(q_local_idx, device=x.device, dtype=torch.long)
+    qp_q = q_positions.index_select(0, qi) if q_positions is not None else None
+
+    # ---- CUT-SPAN-CHUNKED PATH (C4_CUT_SPAN_CHUNK > 0): the big-K VRAM cap lifter -----
+    # Block 0 (= the [0,cut) blocks; cut==1 on doom) is the ONLY block over all S rows.
+    # It is per-row independent under direct-local-CAM, so run it in S-chunks and keep
+    # ONLY the query rows' block-0 output (frozen rows never read downstream); block 0's
+    # KV is dead so we commit None.  This holds block-0 peak at O(chunk*ffn_hidden) and
+    # removes the last O(K*30) activation on the forward.  Byte-exact (per-row map).
+    chunk = _cut_span_chunk()
+    # STREAM-EMBED: when the caller streams the embed, x is a THROWAWAY 1-row placeholder
+    # ([1,1,D]) and the true span length S comes from the stream context (win_toks); we
+    # build each chunk's [1,chunk,D] embed+overlay on demand so the full [1,S,D] never
+    # exists.  Otherwise x IS the pre-built [1,S,D] span embed and S = x.shape[1].
+    streaming = stream_ctx is not None
+    S = int(stream_ctx["win_toks"].shape[1]) if streaming else x.shape[1]
+    if chunk > 0 and S > chunk and cut >= 1:
+        from .direct_local_cam import _block0_drop_dead_kv
+        Dm = model.embed.shape[1]
+        # collect block-0 output at the query rows, chunk by chunk.
+        hq0 = model.embed.new_empty(1, qi.numel(), Dm)        # [1, K, D] block-0 out @ q
+        # absolute span-local position -> index into q_local (for query rows in a chunk).
+        qpos_to_qi = torch.full((S,), -1, device=hq0.device, dtype=torch.long)
+        qpos_to_qi[qi] = torch.arange(qi.numel(), device=hq0.device)
+        for lo0 in range(0, S, chunk):
+            hi0 = min(lo0 + chunk, S)
+            if streaming:
+                xc = _stream_embed_chunk(stream_ctx, lo0, hi0)   # [1, hi0-lo0, D]
+            else:
+                xc = x[:, lo0:hi0, :]
+            qpc = (q_positions[lo0:hi0] if q_positions is not None
+                   else torch.arange(stream_ctx["span_start"] + lo0,
+                                     stream_ctx["span_start"] + hi0,
+                                     device=hq0.device)) if streaming else \
+                  (q_positions[lo0:hi0] if q_positions is not None else None)
+            # BLOCK-0 GRAPH: replay the fixed-shape ingest attn + FFN body as ONE launch
+            # (the ingest gather is computed here, outside the graph, into the graph's
+            # static input; the graph does the W_o + SwiGLU GEMMs).  Byte-exact to the
+            # eager block-0 forward (same gather, same GEMM chain).  Only wired for the
+            # cut==1 doom ingest block; falls back to the eager loop otherwise.
+            if block0_graph is not None and cut == 1:
+                b0attn = model.blocks[0].attn
+                outc = b0attn.gather_ingest_out(xc, qpc)          # [1, H, Sc, HD]
+                hc = block0_graph.run(xc, outc)                   # [1, Sc, D]
+                del outc
+            else:
+                hc = xc
+                for b in range(cut):
+                    hc, _ = model.blocks[b](hc, past_kv=None, q_positions=qpc,
+                                            use_cache=True)
+            # scatter this chunk's QUERY rows into hq0.
+            local_q = qpos_to_qi[lo0:hi0]
+            m = local_q >= 0
+            if bool(m.any()):
+                hq0[0, local_q[m]] = hc[0, m.nonzero(as_tuple=False).flatten()]
+            del hc, xc
+        # blocks [cut, N) over the K query rows.  These blocks are ALSO per-row
+        # independent (dead-attn identity / direct-CAM O(1) per-row gather from the draft
+        # + per-row FFN — NO cross-query-row attention), so the K-query-row axis can be
+        # CHUNKED too.  This is what removes the LAST O(K) activation ([1, K, ffn_hidden]
+        # over ~241 blocks — the wall once block 0 is Sq-chunked) and lets K grow past
+        # ~24k toward 100k-1M: with query-row chunking the per-forward peak is
+        # O(qchunk*ffn_hidden), FLAT in K.  ``C4_QROW_CHUNK`` (default == the cut-span
+        # chunk) tunes it; the block-0 output ``hq0`` is [1,K,D] (cheap, D not ffn_hidden)
+        # so it is fine to hold whole while chunking the FFN stack.  Byte-exact (per-row).
+        qchunk = _qrow_chunk(chunk)
+        nq = hq0.shape[1]
+        _ = _block0_drop_dead_kv()   # documents the requirement; block-0 KV stays None
+        # OUTPUT buffer the caller's decode indexes.  In STREAM mode we return the K
+        # QUERY rows in DRAFT ORDER as a compact [1, K, D] (30x smaller than [1,S,D]) —
+        # the decode reads it by ``s - step`` (query order == q_local_idx order == hq0
+        # order), so the last O(K*30) tensor (the [1,S,D] span/output) is gone and only
+        # [1,K,D] remains: this is what lets K go past 100k toward 1M.  In non-stream mode
+        # x IS the [1,S,D] span embed and we scatter query rows in place (decode by
+        # span-local position, unchanged).  Byte-exact — the SAME query-row states either
+        # way; only the container shape + the decode's index basis differ.
+        if streaming:
+            hq = hq0
+            if qchunk > 0 and nq > qchunk:
+                for lo in range(0, nq, qchunk):
+                    hi = min(lo + qchunk, nq)
+                    hqc = hq0[:, lo:hi, :]
+                    qpc = qp_q[lo:hi] if qp_q is not None else None
+                    hqc = _run_qstack(model, hqc, qpc, cut, n, megastep)
+                    hq0[:, lo:hi, :] = hqc          # in-place into the [1,K,D] buffer
+                    del hqc
+                hq = hq0
+            else:
+                hq = _run_qstack(model, hq, qp_q, cut, n, megastep)
+            # tag the result so the caller's decode indexes by query order (s - step).
+            hq._c4_query_ordered = True    # note: attr may not persist through ops; the
+            return hq, new_caches           # caller keys on ``streaming`` instead (below).
+        out = x
+        if qchunk > 0 and nq > qchunk:
+            for lo in range(0, nq, qchunk):
+                hi = min(lo + qchunk, nq)
+                hqc = hq0[:, lo:hi, :]
+                qpc = qp_q[lo:hi] if qp_q is not None else None
+                hqc = _run_qstack(model, hqc, qpc, cut, n, megastep)
+                # scatter this query-row chunk's final state back in place.
+                out[:, qi[lo:hi], :] = hqc
+                del hqc
+            return out, new_caches
+        # whole-K query-row stack (qchunk off).
+        hq = _run_qstack(model, hq0, qp_q, cut, n, megastep)
+        # scatter the query rows' final state back IN PLACE into the output buffer (avoids
+        # a second [1,S,D] clone — the frozen rows are NEVER read by the decode; only the
+        # query rows are, and we overwrite exactly those).  new_caches[0] = None (dead KV)
+        # — byte-safe (drop-dead-kv required + audited).
+        out[:, qi, :] = hq
+        return out, new_caches
+
+    # ---- WHOLE-SPAN PATH (chunk OFF): byte-identical to the prior frozen-skip ----------
     hidden = x
     for b in range(cut):
         hidden, kv = model.blocks[b](
             hidden, past_kv=past_key_values[b], q_positions=q_positions, use_cache=True)
         new_caches[b] = kv
     # gather query rows + their absolute positions, forward ONLY them through [cut, N).
-    qi = torch.tensor(q_local_idx, device=hidden.device, dtype=torch.long)
     hq = hidden[:, qi, :]                                    # [1, K, D]
-    qp_q = q_positions.index_select(0, qi) if q_positions is not None else None
-    for b in range(cut, n):
-        hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q, use_cache=True)
+    # MEGAKERNEL: replay the dead-FFN-segment CUDA graphs (one launch/segment) + run
+    # the live CAM blocks eagerly — byte-exact to the per-block loop (megastep None ->
+    # the eager loop).
+    hq = _run_qstack(model, hq, qp_q, cut, n, megastep)
     # scatter the query rows' final state back into a full [1, S, D] so the caller's
     # decode loop (indexing by span-local query position) is unchanged.
     hidden = hidden.clone()
@@ -917,6 +1218,40 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                                     install_direct_local_cam)
     if direct_local_cam_enabled():
         _dlocal_tbl = install_direct_local_cam(model, L, draft, verbose=False)
+    # FUSED-DELTA SPARSE FFN (C4_FUSED_DELTA_FFN): with attention driven to ~ZERO
+    # by dead-block-fusion + direct-CAM/local, the composed step is FFN-bound (#869:
+    # the dense SwiGLU GEMM ``ampere_sgemm`` over the 99.9%-zero weights is ~67% of
+    # the 2.27 ms step, multiplying all the zeros — 0.167 GFLOP where the live nnz
+    # are 5.6K FLOP).  ``install_fused_delta_ffn`` swaps every non-routed block's
+    # dense SwiGLU for the #808/#841 fused-delta sparse-COO kernel (kernel-1 fuses
+    # up+gate+silu; kernel-2 adds W_down@hidden ONLY to the residual rows W_down
+    # writes, in place — touching only the ~1.3-nnz-per-unit weights).  It touches
+    # ONLY ``block.ffn`` (leaves the 4 live blocks' attention forwards installed
+    # above untouched), so it COMPOSES with dead-block-fusion + direct-CAM/local +
+    # bounded-KV.  Byte-exact at the nibble-snap margin (same nonzeros, fp-accum-
+    # order residue only — #808/#841 proved L-inf=0 at doom scale standalone).
+    # DEFAULT OFF -> the dense/COO golden path (069cc32f unchanged).
+    #
+    # PRECEDENCE vs the FUSED MEGABLOCK (C4_FUSED_MEGABLOCK).  The megablock is the
+    # STRONGER on-chip drop-in for the SAME dead-FFN [cut, N) region: it builds its own
+    # ``_MegaFFN`` from each block's ORIGINAL ``W_up/W_gate/W_down`` and runs the whole
+    # chain in-place, L2-resident.  ``install_fused_delta_ffn`` REPLACES ``block.ffn``
+    # with a ``FusedUpGateSiluDeltaFFN`` (no ``W_up`` attribute), which the megablock
+    # then can't read.  So when the megablock WILL fire (frozen-skip + dead-block-fusion
+    # + CUDA + flag on) it OWNS the dead-FFN region and we SKIP fused-delta entirely (it
+    # would only accelerate the same blocks the megablock already fuses more tightly, and
+    # would break the megablock's original-weight read).  Both are byte-exact dead-FFN
+    # accelerators; the megablock subsumes fused-delta on the query-row path.
+    try:
+        from .fused_megablock import fused_megablock_enabled as _fme
+    except ImportError:
+        _fme = lambda: False
+    _mega_will_fire = (_fme() and _frozen_skip_enabled()
+                       and device.startswith("cuda") and _dead_block_fusion_enabled())
+    from .fused_sparse_ffn import (fused_delta_ffn_enabled,
+                                   install_fused_delta_ffn)
+    if fused_delta_ffn_enabled() and not _mega_will_fire:
+        install_fused_delta_ffn(model, device=torch.device(device), verbose=False)
     store_log = draft.store_log
     n_steps = draft.step_count
     # SCHEDULE-DRIVEN eviction (C4_EVICT_SCHEDULE): precompute the deterministic
@@ -1029,10 +1364,83 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # direct-CAM (blocks past the cut don't read frozen-row KV).  Computed ONCE.
     frozen_skip = _frozen_skip_enabled()
     frozen_cut = _frozen_skip_cut(model) if frozen_skip else 0
+    # MEGAKERNEL (C4_GRAPH_MEGAKERNEL): CUDA-graph the post-cut dead-FFN segments of
+    # the frozen-skip query-row block loop (one graph launch per contiguous dead
+    # segment, live CAM blocks eager).  Requires dead-block-fusion (dead blocks are
+    # attention-identity) + frozen-skip (the region runs over K query rows) + CUDA.
+    # Byte-exact; default OFF -> the eager per-block loop.
+    _megastep = None
+    # MEGAKERNEL / FUSED MEGABLOCK install.  The two megakernel modules are
+    # lazy-imported (guarded) so a missing session artifact never breaks the default
+    # (flag-OFF) verify; both are now committed but the guard keeps the default path
+    # robust.  Byte-identical: both megakernels are default OFF.
+    #
+    # FUSED MEGABLOCK (C4_FUSED_MEGABLOCK): the on-chip in-place-delta dead-FFN
+    # megakernel — a stronger drop-in for the megastep graph (no per-block full-D
+    # residual copy, no hidden HBM buffer; the [D,K] residual stays L2-resident across
+    # the whole dead-FFN chain, all launches collapsed into one CUDA-graph replay).
+    # Takes PRECEDENCE over C4_GRAPH_MEGAKERNEL.  Byte-exact (nibble-snap margin).
+    try:
+        from .fused_megablock import (fused_megablock_enabled,
+                                      install_fused_megablock)
+        _fused_mega_on = fused_megablock_enabled()
+    except ImportError:
+        install_fused_megablock = None
+        _fused_mega_on = False
+    try:
+        from .megastep_graph import (megastep_graph_enabled,
+                                     install_megastep_graph)
+        _mega_on = megastep_graph_enabled()
+    except ImportError:
+        install_megastep_graph = None
+        _mega_on = False
+    if (frozen_skip and is_cuda and _dead_block_fusion_enabled()
+            and _fused_mega_on and install_fused_megablock is not None):
+        # CARRY SET.  Default = the FULL [cut, N) region (byte-identical superset: every
+        # dead block is fused, so the mega-chain reproduces the eager loop exactly, incl.
+        # the recurrent-divmod-tied blocks, which are NOT identity on the residual and so
+        # must NOT be dropped).  ``C4_MEGABLOCK_DOOM_LEAN=1`` opts into the DIV-free lean
+        # carry (drops the 179-block divmod span) — VALID ONLY on a build where the divmod
+        # blocks are provably identity on a DIV-free step (they are NOT on the recurrent-
+        # divmod build: measured Linf 116 >> the nibble decode margin -> garbage).  So the
+        # lean carry is OFF by default; the full carry is byte-exact (Linf ~0.09).
+        import os as _os
+        _lean = _os.environ.get("C4_MEGABLOCK_DOOM_LEAN", "0") not in (
+            "0", "", "false", "False")
+        _megastep = install_fused_megablock(model, device, frozen_cut,
+                                            L=(L if _lean else None), verbose=False)
+    elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
+            and _mega_on and install_megastep_graph is not None):
+        _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
+    # BLOCK-0 GRAPH (C4_GRAPH_BLOCK0): CUDA-graph block-0's S-chunked ingest attention +
+    # FFN per-chunk body into ONE fixed-shape replay per chunk.  Block 0 is the SOLE block
+    # over all S = K*30 span rows (the cut-span-chunk loop processes them in fixed-size
+    # chunks, launching block-0's whole forward per chunk on the host — the ~640-707 us
+    # host-dispatch wall).  Under direct-local-CAM block 0 is a per-row independent map, so
+    # its per-chunk body (gather -> W_o GEMM -> dense SwiGLU FFN) is fixed-shape and captures
+    # cleanly; one replay per chunk instead of ~13 launches.  Requires direct-local-CAM +
+    # cut-span-chunking (fixed chunk size) + CUDA.  Byte-exact; default OFF.
+    _block0_graph = None
+    try:
+        from .block0_graph import block0_graph_enabled, install_block0_graph
+        _b0g_on = block0_graph_enabled()
+    except ImportError:
+        install_block0_graph = None
+        _b0g_on = False
+    _cutc0 = _cut_span_chunk()
+    if (frozen_skip and is_cuda and _b0g_on and install_block0_graph is not None
+            and direct_local_cam_enabled() and _cutc0 > 0
+            and getattr(model.blocks[0].attn, "_direct_local_installed", False)):
+        _block0_graph = install_block0_graph(model, device, _cutc0, frozen_cut,
+                                             verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
     # pageable HtoD dispatches the profiler pinned as the span wall).
     _overlay_batched = _overlay_batched_enabled()
+    # EVICTION host-sync policy: the scheduled drop is now GPU-vectorized
+    # (evict_all_blocks_scheduled batched-nonzero, ~1 sync/size-group), so the only
+    # remaining per-round syncs are the OPTIONAL timing drains — gated OFF by default.
+    _evict_timed = _evict_timed_enabled()
     dev = torch.device(device)
     if is_cuda:
         # Reset the peak so ``peak_vram_gb`` reflects THIS verify's largest span
@@ -1047,6 +1455,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # Holder for the primed leading-context boundary: step 0's span starts here (0 if
     # no priming ran).  Set after the priming loop below.
     _primed_start = [0]
+
+    # STREAM-EMBED signal: set True by _forward_span when it returns the compact
+    # query-ORDERED [1,K,D] hidden (decode indexes by ``s - step`` instead of the
+    # span-local ``win_starts[s] - span_start``).  Reset each span.
+    _qordered = [False]
 
     # --- one block-verify forward over steps [step, end) --------------------
     # Returns (hidden, new_kv, span_start, S, blocks_run).  Raises
@@ -1067,14 +1480,37 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         S = len(span_toks)
         win_toks = torch.tensor([span_toks], device=dev)
         q_positions = torch.arange(span_start, span_start + S, device=dev)
+        q_local = [draft.win_starts[s] - span_start for s in range(step, end)]
+        # STREAM-EMBED (big-K): frozen_skip will build each block-0 S-chunk's embed +
+        # overlay on demand, so the full [1, S, D] span embed is NEVER built here.  Only
+        # for the frozen_skip path (block-MoE / block-skip paths still need the whole span).
+        _cutc = _cut_span_chunk()
+        _use_stream = (fast and frozen_skip and _stream_embed_enabled() and _cutc > 0
+                       and S > _cutc and bbs_plan is None and moe_span is None)
+        _qordered[0] = _use_stream
         with torch.no_grad():
-            x = model.embed[win_toks].clone()
+            if _use_stream:
+                x = model.embed[win_toks[:, :1]]              # [1,1,D] throwaway placeholder
+                _overlay = None                               # overlay done per-chunk
+            else:
+                # ``model.embed[win_toks]`` (advanced indexing) ALREADY returns a fresh
+                # copy (never a view of the embed table), so the ``.clone()`` is a
+                # redundant second [1, S, D] allocation — at big K (S = K*30) it DOUBLES the
+                # span-embed peak (measured: the clone transient is 5.6GB at K=16384) and is
+                # the top VRAM wall once block 0 is Sq-chunked.  Drop it on the big-K
+                # cut-span-chunk path (byte-identical — the gather copy is already private);
+                # keep the explicit clone on the default path so the golden memory behaviour
+                # is unchanged.
+                x = model.embed[win_toks]
+                if _cutc <= 0:
+                    x = x.clone()
             # overlay the span: program-in-data + frame roles + store KV entries.
             # The span's last row is NOT necessarily a query row, so overlay with
             # is_last_row_query=False, then explicitly re-tag EACH step's query row
             # with all-ROLE one-hots (the driver's per-step query tag).
-            q_local = [draft.win_starts[s] - span_start for s in range(step, end)]
-            if fast:
+            if _use_stream:
+                pass                                          # per-chunk overlay in frozen_skip
+            elif fast:
                 # O(rows + code): broadcast the code-in-data, per-row roles, then
                 # tag exactly this block's query rows (byte-identical residual).
                 _overlay = (apply_overlay_window_batched if _overlay_batched
@@ -1113,8 +1549,20 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             elif frozen_skip:
                 # blocks [0, cut) over all S rows; blocks [cut, N) over the K query
                 # rows only.  ~30x less FFN.  Byte-exact under direct-CAM.
+                # STREAM-EMBED (C4_STREAM_EMBED, big-K only): pass the chunk-builder so
+                # the block-0 S-chunk loop builds each chunk's embed+overlay ON DEMAND —
+                # the full [1, S, D] span embed (the last O(K*30) tensor) never exists.
+                stream_ctx = None
+                if _use_stream:
+                    stream_ctx = dict(
+                        win_toks=win_toks, span_start=span_start, code_vec=code_vec,
+                        q_local=q_local, code=code, code_off=draft.code_off,
+                        store_log=store_log, overlay_batched=_overlay_batched,
+                        embed=model.embed, L=L)
                 hidden, new_kv = _forward_hidden_cached_frozen_skip(
-                    model, x, past, q_positions, q_local, frozen_cut)
+                    model, x, past, q_positions, q_local, frozen_cut,
+                    megastep=_megastep, stream_ctx=stream_ctx,
+                    block0_graph=_block0_graph)
                 # cost accounting: cut blocks over S rows + (N-cut) over K query rows.
                 blocks_run = n_blocks
             else:
@@ -1261,31 +1709,181 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         # ``_decode_reg_from_nibbles`` (probe: byte-exact, 15x faster on the decode).
         batched_decode = (_batched_decode_enabled() if _BATCHED_DECODE is None
                           else _BATCHED_DECODE)
-        pre_pc = pre_sp = pre_bp = pre_ax = None
-        if batched_decode:
+        # ============================================================================
+        # GPU-VERIFY (C4_GPU_VERIFY, default OFF): batch-decode ALL K query rows AND
+        # compare to the draft targets ENTIRELY on-GPU, reducing to the accepted-prefix
+        # length with ONE host sync per forward.  Replaces the O(K) host-side Python
+        # decode+compare loop (the ~0.2-0.32 ms/step wall over the 0.034 ms/step GPU
+        # forward).  Bit-identical to the scalar loop (same requant-argmax, same
+        # pc/ax&mask/sp/bp compare, is_file no-op, is_halt AX-only).
+        # ============================================================================
+        if _gpu_verify_enabled():
             from .nibble_pure_forward_gpu import _decode_reg_batch, _snap_lane_batch
-            wi_idx = torch.tensor(
-                [draft.win_starts[s] - span_start for s in range(step, end)],
-                device=hidden.device, dtype=torch.long)
-            qs = hidden[0].index_select(0, wi_idx)      # [K, D] device-resident
-            pc_b = _snap_lane_batch(qs[:, L.PC_VAL])
-            sp_b = _snap_lane_batch(qs[:, L.SP_VAL])
-            bp_b = _snap_lane_batch(qs[:, L.BP_VAL])
-            ax_b = _decode_reg_batch(qs, L.AX)
-            dec = torch.stack([pc_b, sp_b, bp_b, ax_b], dim=1).cpu().tolist()
-            pre_pc = [d[0] for d in dec]
-            pre_sp = [d[1] for d in dec]
-            pre_bp = [d[2] for d in dec]
-            pre_ax = [d[3] for d in dec]
+            tgt = _build_draft_targets(draft, device, mask)
+            K_span = end - step
+            if _qordered[0]:
+                wi_idx = torch.arange(K_span, device=hidden.device, dtype=torch.long)
+            else:
+                wi_idx = torch.tensor(
+                    [draft.win_starts[s] - span_start for s in range(step, end)],
+                    device=hidden.device, dtype=torch.long)
+            qs_all = hidden[0].index_select(0, wi_idx)      # [K, D] device-resident
+            # DECODE-CHUNK (big-K): the per-row [rows, vocab] requant tensor is O(K)
+            # VRAM; decode in qrow-sized chunks (byte-exact per row) into device buffers.
+            _dchunk = _qrow_chunk(_cut_span_chunk() or K_span)
+            Kd = qs_all.shape[0]
+            _stepc = _dchunk if (_dchunk > 0 and Kd > _dchunk) else Kd
+            got_pc_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            got_sp_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            got_bp_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            got_ax_t = torch.empty(Kd, dtype=torch.long, device=hidden.device)
+            _lo = 0
+            while _lo < Kd:
+                _hi = min(_lo + _stepc, Kd)
+                qs = qs_all[_lo:_hi]
+                got_pc_t[_lo:_hi] = _snap_lane_batch(qs[:, L.PC_VAL])
+                got_sp_t[_lo:_hi] = _snap_lane_batch(qs[:, L.SP_VAL])
+                got_bp_t[_lo:_hi] = _snap_lane_batch(qs[:, L.BP_VAL])
+                got_ax_t[_lo:_hi] = _decode_reg_batch(qs, L.AX)
+                _lo = _hi
+            got_ax_m = got_ax_t & mask
+            w_pc = tgt["want_pc"][step:end]
+            w_ax = tgt["want_ax"][step:end]
+            w_sp = tgt["want_sp"][step:end]
+            w_bp = tgt["want_bp"][step:end]
+            f_file = tgt["is_file"][step:end]
+            f_halt = tgt["is_halt"][step:end]
+            # normal-row mismatch: any of pc/ax/sp/bp differs; halt-row: AX only;
+            # file-row: never bad (driver overrides the model's registers).
+            bad_normal = ((got_pc_t != w_pc) | (got_ax_m != w_ax)
+                          | (got_sp_t != w_sp) | (got_bp_t != w_bp))
+            bad = torch.where(f_halt, got_ax_m != w_ax, bad_normal)
+            bad = bad & (~f_file)                            # file rows are accepted
+            # first divergence: argmax over the bad mask (0 if none) — but distinguish
+            # "no bad" from "bad at index 0" via any().  ONE host sync for both.
+            any_bad_t = bad.any()
+            first_bad_t = torch.argmax(bad.to(torch.uint8))  # 0 when all-False
+            # accepted count within this span = first_bad if any bad else K.
+            n_ok_span = torch.where(any_bad_t, first_bad_t,
+                                    torch.tensor(K_span, device=bad.device))
+            # PRTF visible bytes for the ACCEPTED prefix of this span (vectorized): the
+            # model's decoded AX byte-0 at each accepted prtf step (byte-identical to the
+            # scalar path's collect_out.append).  Gather on GPU, one small copy.
+            prtf_bytes = None
+            if collect_out is not None and prtf_set:
+                _prtf_local = [s - step for s in range(step, end) if s in prtf_set]
+                if _prtf_local:
+                    _pl = torch.tensor(_prtf_local, device=bad.device, dtype=torch.long)
+                    prtf_bytes = (_pl, (got_ax_t & 0xFF).index_select(0, _pl))
+            # last-step AX: if this span covers the final step AND it is accepted.
+            last_ax_dev = None
+            if step <= n_steps - 1 < end:
+                last_ax_dev = got_ax_m[n_steps - 1 - step]
+            # ---- the SINGLE host sync per forward -------------------------------
+            n_ok = int(n_ok_span.item())
+            accepted += n_ok
+            if collect_out is not None and prtf_bytes is not None:
+                _pl, _pb = prtf_bytes
+                _pl_h = _pl.tolist()
+                _pb_h = _pb.tolist()
+                for _li, _lv in zip(_pl_h, _pb_h):
+                    if _li < n_ok:
+                        collect_out.append(int(_lv) & 0xFF)
+            if n_ok < K_span:
+                # MISMATCH inside this span: report the first divergence (byte-exact to
+                # the scalar path's first-mismatch abort).  Decode the exact got/want
+                # for the reporting dict (one small gather + sync — only on a real fail).
+                s_bad = step + n_ok
+                gp = int(got_pc_t[n_ok].item()); ga = int(got_ax_m[n_ok].item())
+                gs = int(got_sp_t[n_ok].item()); gb = int(got_bp_t[n_ok].item())
+                import os as _osd
+                if _osd.environ.get("C4_WALL6_DIAG", "0") == "1" and stats is not None:
+                    try:
+                        _st = hidden[0, draft.win_starts[s_bad] - span_start]
+                        stats["diag_stack0_model"] = _decode_reg_from_nibbles(
+                            _st, L, L.STACK0)
+                    except Exception:
+                        stats["diag_stack0_model"] = None
+                    stats["diag_stk_draft"] = draft.frames[s_bad].get("stk")
+                    stats["diag_op"] = draft.frames[s_bad].get("op")
+                cache_now = max(max_cache, caches[0].size())
+                evicted_now = sum(c.total_evicted for c in caches)
+                vram_gb = peak_vram / (1024 ** 3)
+                if stats is not None:
+                    stats["max_seq_len"] = max_seq
+                    stats["max_cache_size"] = cache_now
+                    stats["total_evicted"] = evicted_now
+                    stats["forwards"] = forwards
+                    stats["peak_vram_gb"] = vram_gb
+                    stats["evict_rounds"] = evict_rounds
+                    stats["effective_block_steps"] = eff_min_k
+                fr = draft.frames[s_bad]
+                return VerifyResult(
+                    accepted_steps=accepted, total_steps=n_steps,
+                    all_matched=False, forwards=forwards,
+                    first_mismatch={
+                        "step": s_bad, "query_pos": draft.win_starts[s_bad],
+                        "got": {"pc": gp, "ax": ga, "sp": gs, "bp": gb},
+                        "want": {"pc": fr["pc"], "ax": fr["ax"] & mask,
+                                 "sp": fr["sp"] & 0xFFFFFFFF,
+                                 "bp": fr["bp"] & 0xFFFFFFFF}},
+                    max_seq_len=max_seq, max_cache_size=cache_now,
+                    total_evicted=evicted_now, decoded_final_ax=None,
+                    peak_vram_gb=vram_gb, evict_rounds=evict_rounds,
+                    effective_block_steps=eff_min_k)
+            if last_ax_dev is not None:
+                last_got_ax = int(last_ax_dev.item())
+            # the whole span is verified on-GPU; skip the scalar per-step loop below and
+            # fall through to the SHARED post-span tail (sync + accounting + eviction).
+            _gpu_verified = True
+        else:
+            _gpu_verified = False
+        pre_pc = pre_sp = pre_bp = pre_ax = None
+        if batched_decode and not _gpu_verified:
+            from .nibble_pure_forward_gpu import _decode_reg_batch, _snap_lane_batch
+            # STREAM mode: hidden is the compact query-ORDERED [1,K,D] (row j == step
+            # step+j), so the gather is the identity 0..K-1; otherwise index by the
+            # span-local query position.  Both select the SAME K query-row states.
+            if _qordered[0]:
+                wi_idx = torch.arange(end - step, device=hidden.device, dtype=torch.long)
+            else:
+                wi_idx = torch.tensor(
+                    [draft.win_starts[s] - span_start for s in range(step, end)],
+                    device=hidden.device, dtype=torch.long)
+            qs_all = hidden[0].index_select(0, wi_idx)  # [K, D] device-resident
+            # DECODE-CHUNK (big-K): ``_snap_lane_batch`` / ``_decode_reg_batch`` build a
+            # per-row ``[rows, vocab]`` fp64 requant-logit tensor (vocab~256) — O(K) VRAM
+            # that OOMs at big K (58GB at K=131072).  It is per-ROW independent, so chunk
+            # the K query rows through the decode too (default == the qrow chunk).  Byte-
+            # exact: each row's argmax-requant is unchanged by the chunk boundary.
+            _dchunk = _qrow_chunk(_cut_span_chunk() or (end - step))
+            Kd = qs_all.shape[0]
+            pre_pc, pre_sp, pre_bp, pre_ax = [], [], [], []
+            _lo = 0
+            _stepc = _dchunk if (_dchunk > 0 and Kd > _dchunk) else Kd
+            while _lo < Kd:
+                _hi = min(_lo + _stepc, Kd)
+                qs = qs_all[_lo:_hi]
+                pc_b = _snap_lane_batch(qs[:, L.PC_VAL])
+                sp_b = _snap_lane_batch(qs[:, L.SP_VAL])
+                bp_b = _snap_lane_batch(qs[:, L.BP_VAL])
+                ax_b = _decode_reg_batch(qs, L.AX)
+                dec = torch.stack([pc_b, sp_b, bp_b, ax_b], dim=1).cpu().tolist()
+                pre_pc.extend(d[0] for d in dec)
+                pre_sp.extend(d[1] for d in dec)
+                pre_bp.extend(d[2] for d in dec)
+                pre_ax.extend(d[3] for d in dec)
+                _lo = _hi
 
         # decode + verify each step-query row of the block against the draft.
-        for s in range(step, end):
+        # (SKIPPED when the GPU-verify path above already verified the whole span.)
+        for s in (range(step, end) if not _gpu_verified else ()):
             if batched_decode:
                 _i = s - step
                 got_pc, got_sp, got_bp, got_ax = (
                     pre_pc[_i], pre_sp[_i], pre_bp[_i], pre_ax[_i])
             else:
-                wi = draft.win_starts[s] - span_start
+                wi = (s - step) if _qordered[0] else (draft.win_starts[s] - span_start)
                 state = hidden[0, wi]
                 got_pc = _snap_lane(state[L.PC_VAL])
                 got_sp = _snap_lane(state[L.SP_VAL])
@@ -1394,10 +1992,12 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             # ``evict``), then a boolean-mask compaction per block.  Byte-identical
             # survivor set to the per-block ``caches[b].evict`` loop; de-syncs the
             # deep-loop prune so the GPU stays busy (GPU util was 41% under the old
-            # per-block host-synced eviction).  Timed with a drain around the prune
-            # (a correctness barrier the next forward needs anyway); the forward /
-            # overlay wall is the remainder (t_fast - t_evict).
-            if is_cuda:
+            # per-block host-synced eviction).  OPTIONALLY timed with a drain around
+            # the prune (C4_EVICT_TIMED; 2 syncs/round) — OFF by default so eviction
+            # adds ~ZERO host syncs per forward (the scheduled drop is GPU-vectorized;
+            # the enqueued kernels order on the stream before the next forward with no
+            # explicit drain needed).  The forward/overlay wall is the remainder.
+            if is_cuda and _evict_timed:
                 torch.cuda.synchronize(dev)
             _t0 = _time.perf_counter()
             if sched is not None:
@@ -1443,7 +2043,7 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             for b in range(n_blocks):
                 if keep_masks[b] is not None:
                     caches[b].apply_keep_mask(keep_masks[b])
-            if is_cuda:
+            if is_cuda and _evict_timed:
                 torch.cuda.synchronize(dev)
             t_evict += _time.perf_counter() - _t0
             steps_since_evict = 0
