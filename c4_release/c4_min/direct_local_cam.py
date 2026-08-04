@@ -316,6 +316,12 @@ def _install_direct_local_forward(model, block_idx: int,
     attn.forward = direct_local_forward.__get__(attn, type(attn))
     attn.gather_ingest_out = gather_ingest_out.__get__(attn, type(attn))
     attn._direct_local_installed = True
+    # EXPOSE the resolved-frame gather internals so the whole-step graph (RUNG 2,
+    # C4_WHOLE_STEP_GRAPH) can precompute the per-chunk ingest nibbles + fold the gather
+    # into its CUDA graph (same rf / pos_map / ingest heads -> byte-identical).
+    attn._direct_local_rf = rf
+    attn._direct_local_pos_map = pos_map
+    attn._direct_local_ing_heads = ing_heads
 
 
 # ===========================================================================

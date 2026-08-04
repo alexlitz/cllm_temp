@@ -916,7 +916,8 @@ def _run_qstack(model, h, qp, cut, n, megastep=None):
 
 def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                        q_local_idx, cut, megastep=None,
-                                       stream_ctx=None, block0_graph=None):
+                                       stream_ctx=None, block0_graph=None,
+                                       whole_step_graph=None):
     """Run blocks [0, cut) over ALL rows (commit KV), then blocks [cut, N) over ONLY
     the query rows (``q_local_idx`` — window-local indices).  Returns
     ``(hidden_full, new_caches)`` where ``hidden_full`` is [1, S, D] with the QUERY
@@ -958,6 +959,39 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
         # absolute span-local position -> index into q_local (for query rows in a chunk).
         qpos_to_qi = torch.full((S,), -1, device=hq0.device, dtype=torch.long)
         qpos_to_qi[qi] = torch.arange(qi.numel(), device=hq0.device)
+        # WHOLE-STEP GRAPH (RUNG 2): precompute, ON THE HOST, per-chunk (chunk-local
+        # query rows -> hq0 destination) index pairs so the block-0 loop does NO
+        # bool(.any()) device sync (the membership is known from the draft's win_starts).
+        # ``qi`` are the span-local query rows; a chunk [lo0,hi0) owns the query rows in
+        # that range.  This kills the ~S/chunk (=~640) per-chunk host syncs.
+        _wsg = (whole_step_graph if (whole_step_graph is not None and cut == 1) else None)
+        _wsg_plan = None
+        if _wsg is not None:
+            from .whole_step_graph import Block0LoopPlan
+            _b0attn = model.blocks[0].attn
+            _pm = getattr(_b0attn, "_direct_local_pos_map", None)
+            _rf = getattr(_b0attn, "_direct_local_rf", None)
+            if _pm is not None and _rf is not None:
+                _wsg_plan = Block0LoopPlan(_rf, _pm, chunk, S,
+                                           stream_ctx["span_start"] if streaming
+                                           else 0,
+                                           q_positions, qpos_to_qi, hq0.device)
+                # host-side per-chunk query membership (from the draft's win_starts,
+                # via qpos_to_qi) — NO device sync in the loop below.
+                _chunk_qrows = {}      # lo0 -> (chunk_local_rows_t, hq0_dest_t)
+                _local_all = qpos_to_qi.cpu().tolist()
+                for _lo in range(0, S, chunk):
+                    _hi = min(_lo + chunk, S)
+                    _rows = [(p - _lo, _local_all[p]) for p in range(_lo, _hi)
+                             if _local_all[p] >= 0]
+                    if _rows:
+                        _cl = torch.tensor([r[0] for r in _rows], device=hq0.device,
+                                           dtype=torch.long)
+                        _dst = torch.tensor([r[1] for r in _rows], device=hq0.device,
+                                            dtype=torch.long)
+                        _chunk_qrows[_lo] = (_cl, _dst)
+            else:
+                _wsg = None
         for lo0 in range(0, S, chunk):
             hi0 = min(lo0 + chunk, S)
             if streaming:
@@ -969,6 +1003,19 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                      stream_ctx["span_start"] + hi0,
                                      device=hq0.device)) if streaming else \
                   (q_positions[lo0:hi0] if q_positions is not None else None)
+            # WHOLE-STEP GRAPH (RUNG 2): fold the ingest gather INTO the graph (static
+            # nibble inputs) + replay -> ONE graph launch + 3 static copies (no separate
+            # gather new_zeros/scatter, no sync).  Then a SYNC-FREE precomputed scatter.
+            if _wsg is not None:
+                Sc = hi0 - lo0
+                nib_lo, nib_hi = _wsg_plan.chunk_nibbles(qpc, Sc)
+                hc = _wsg.run(xc, nib_lo, nib_hi)                 # [1, Sc, D]
+                cq = _chunk_qrows.get(lo0)
+                if cq is not None:
+                    _cl, _dst = cq
+                    hq0[0, _dst] = hc[0, _cl]
+                del hc, xc
+                continue
             # BLOCK-0 GRAPH: replay the fixed-shape ingest attn + FFN body as ONE launch
             # (the ingest gather is computed here, outside the graph, into the graph's
             # static input; the graph does the W_o + SwiGLU GEMMs).  Byte-exact to the
@@ -1412,6 +1459,22 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
             and _mega_on and install_megastep_graph is not None):
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
+    # BLOCK-0 FUSED FFN (C4_BLOCK0_FUSED_FFN, RUNG 3): fold block-0's DENSE SwiGLU FFN
+    # into the fused-delta COO sparse kernel (block-0's FFN is Dff=33, 6 active down rows
+    # -> the dense GEMM wastes ~99.98% of its FLOPs on zeros).  MUST install BEFORE the
+    # block-0 graph captures so the graph bakes the sparse Triton kernels, not the dense
+    # cuBLAS GEMM.  Byte-exact at the nibble margin; default OFF.
+    _block0_fused_ffn = None
+    try:
+        from .block0_fused_ffn import (block0_fused_ffn_enabled,
+                                       install_block0_fused_ffn)
+        _b0ffn_on = block0_fused_ffn_enabled()
+    except ImportError:
+        install_block0_fused_ffn = None
+        _b0ffn_on = False
+    if (frozen_skip and is_cuda and _b0ffn_on
+            and install_block0_fused_ffn is not None):
+        _block0_fused_ffn = install_block0_fused_ffn(model, device, 0, verbose=False)
     # BLOCK-0 GRAPH (C4_GRAPH_BLOCK0): CUDA-graph block-0's S-chunked ingest attention +
     # FFN per-chunk body into ONE fixed-shape replay per chunk.  Block 0 is the SOLE block
     # over all S = K*30 span rows (the cut-span-chunk loop processes them in fixed-size
@@ -1433,6 +1496,31 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             and getattr(model.blocks[0].attn, "_direct_local_installed", False)):
         _block0_graph = install_block0_graph(model, device, _cutc0, frozen_cut,
                                              verbose=False)
+    # WHOLE-STEP GRAPH (C4_WHOLE_STEP_GRAPH, RUNG 2): collapse the block-0 S-chunk loop's
+    # per-chunk host dispatch (ingest gather + graph + bool(.any()) SYNC + hq0 scatter)
+    # into ONE CUDA-graph replay (gather+W_o+FFN fused) + a precomputed SYNC-FREE scatter
+    # per chunk.  Kills the ~640 per-chunk host syncs and the gather/scatter launch storm
+    # — the dominant (81%) block-0 host-dispatch wall.  Requires direct-local-CAM (the
+    # resolved-frame gather internals) + cut-span-chunk + CUDA.  Byte-exact; default OFF.
+    # SUPERSEDES the plain block-0 graph (this one also folds the gather + kills the sync).
+    _whole_step_graph = None
+    try:
+        from .whole_step_graph import (whole_step_graph_enabled,
+                                       install_whole_step_graph)
+        _wsg_on = whole_step_graph_enabled()
+    except ImportError:
+        install_whole_step_graph = None
+        _wsg_on = False
+    if (frozen_skip and is_cuda and _wsg_on and install_whole_step_graph is not None
+            and direct_local_cam_enabled() and _cutc0 > 0 and frozen_cut == 1
+            and getattr(model.blocks[0].attn, "_direct_local_installed", False)):
+        _b0attn = model.blocks[0].attn
+        _rf = getattr(_b0attn, "_direct_local_rf", None)
+        _ing = getattr(_b0attn, "_direct_local_ing_heads", None)
+        if _rf is not None and _ing is not None:
+            _whole_step_graph = install_whole_step_graph(
+                model, device, _cutc0, _rf, _ing, int(_rf.nib_lo.shape[1]),
+                cut=frozen_cut, verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
     # pageable HtoD dispatches the profiler pinned as the span wall).
@@ -1562,7 +1650,7 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 hidden, new_kv = _forward_hidden_cached_frozen_skip(
                     model, x, past, q_positions, q_local, frozen_cut,
                     megastep=_megastep, stream_ctx=stream_ctx,
-                    block0_graph=_block0_graph)
+                    block0_graph=_block0_graph, whole_step_graph=_whole_step_graph)
                 # cost accounting: cut blocks over S rows + (N-cut) over K query rows.
                 blocks_run = n_blocks
             else:

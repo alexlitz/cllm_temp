@@ -117,10 +117,16 @@ def _levers_on(cut_chunk):
     os.environ["C4_STREAM_EMBED"] = "1"
     # qrow chunk defaults to cut chunk; keep block-0 dead-kv drop on for giant K.
     os.environ["C4_BLOCK0_DROP_DEAD_KV"] = "1"
+    # RUNG 2 + RUNG 3 (this task): whole-step block-0 chunk-loop graph (folds the ingest
+    # gather + kills the ~640 per-chunk host syncs) + block-0 dense FFN -> fused-delta COO.
+    if os.environ.get("C4_RUNGS_23", "1") not in ("0", "", "false", "False"):
+        os.environ["C4_WHOLE_STEP_GRAPH"] = "1"
+        os.environ["C4_BLOCK0_FUSED_FFN"] = "1"
 
 
 def _levers_off():
-    for f in ALL_LEVERS + ["C4_BLOCK0_DROP_DEAD_KV", "C4_QROW_CHUNK"]:
+    for f in ALL_LEVERS + ["C4_BLOCK0_DROP_DEAD_KV", "C4_QROW_CHUNK",
+                           "C4_WHOLE_STEP_GRAPH", "C4_BLOCK0_FUSED_FFN"]:
         os.environ.pop(f, None)
 
 
