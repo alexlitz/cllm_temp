@@ -112,6 +112,47 @@ def precomputed_schedule_enabled() -> bool:
     return os.environ.get("C4_PRECOMPUTED_SCHEDULE", "0") not in ("0", "", "false", "False")
 
 
+def onchip_residual_enabled() -> bool:
+    """``C4_ONCHIP_RESIDUAL`` (DEFAULT OFF).  RESIDUAL-ON-CHIP lever for the
+    single-dispatch chunk pass: hold each chunk's residual on-chip across the WHOLE
+    block chain by KILLING the dense ``W_o.linear`` GEMMs (and their cam_out
+    transposes) that dominate the device time.
+
+    MEASURED (this task, cuda A5000, chunk=8192): of the ~28 ms/replay device time the
+    ``ampere_sgemm`` (the 3 live-CAM blocks' + block-0's ``W_o.linear`` — each a full
+    dense ``[C,1416]@[1416,1416]`` GEMM) is ~29% (~8.2 ms), plus the cam_out
+    ``.contiguous()`` transposes are a chunk of the elementwise band — yet each block's
+    ``cam_out`` (the precomputed direct-gather) is NONZERO in only 2-6 of the 1416
+    head-value dims, and each ``W_o`` has only 6-32 nonzeros, so ``W_o(cam_out)`` is
+    nonzero in only 2-10 residual dims.  The residual HBM round-trip the task hypothesised
+    is in fact tiny (~11 us/chunk); the wall is these DENSE GEMMs on ~99.997%-zero inputs.
+
+    THE LEVER (data-independent, so precomputable for the WHOLE batch ONCE): resolve every
+    ``W_o(cam_out)`` up front into a compact ``[K, n_out]`` delta table + its ``out_dims``
+    indices.  Block-0's ingest ``W_o`` contribution is FOLDED directly into the (also
+    precomputed) ``h0_table`` — block 0 becomes just ``ffn0(h0_folded)``, zero ingest
+    transpose/GEMM.  Each live block b's body becomes ``h[:, out_dims_b] += wo_delta_b;
+    h = ffn_b(h)`` — a tiny scatter-add instead of a dense GEMM, keeping the residual
+    ``[C,D]`` resident across the whole chain.  Byte-exact at the nibble-snap decode
+    margin (``W_o(x)`` over an x nonzero only at active-in dims is EXACTLY
+    ``x[:,active] @ W_o[:,active].T`` in fp — the zero terms are exact zeros; only the
+    fp-accumulation ORDER vs cuBLAS's full-width GEMM differs, below the integer decode
+    margin, the SAME contract the fused megablock already ships).  Requires
+    ``C4_PRECOMPUTED_SCHEDULE``.  OFF -> the dense ``W_o.linear`` per block."""
+    return os.environ.get("C4_ONCHIP_RESIDUAL", "0") not in ("0", "", "false", "False")
+
+
+def resident_batch_enabled() -> bool:
+    """``C4_RESIDENT_BATCH`` (DEFAULT OFF).  KILL-THE-SLICE-COPIES lever: when the whole
+    K-batch fits ONE chunk (``chunk >= K``) the single graph is captured DIRECTLY over
+    the resident whole-batch tables (padded to the chunk shape ONCE at build) so the
+    dispatch does ONE replay with NO per-chunk ``.copy_`` of the ``h0`` / ``ing`` / per-
+    live-block ``cam`` static inputs — the O(n_chunks) host/copy band the task targets.
+    For batches spanning several chunks it slice-copies as before.  Byte-identical (the
+    graph reads the same tensor values).  Requires ``C4_PRECOMPUTED_SCHEDULE``."""
+    return os.environ.get("C4_RESIDENT_BATCH", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # 1. THE COMPILED PER-ROW MAP.  block-0 (W_o + FFN) -> mega dead-FFN chain ->
 #    live CAM blocks (W_o + FFN) -> decode lanes, all fed by precomputed gathers.
@@ -147,6 +188,24 @@ class _LiveCamBlock:
         res = h + self.attn.W_o.linear(out2)
         return self.ffn.forward(res)
 
+    def forward_static_delta(self, h: torch.Tensor, wo_delta: torch.Tensor,
+                             out_dims: torch.Tensor) -> torch.Tensor:
+        """ON-CHIP path (C4_ONCHIP_RESIDUAL): ``h [1,C,D]``; ``wo_delta [C, n_out]`` the
+        PRECOMPUTED ``W_o(cam_out)`` at the block's ``n_out`` active output dims (the only
+        dims ``W_o(cam_out)`` is nonzero at — 2-10 of D).  Adds the delta into the residual
+        at those dims (no dense GEMM, no cam_out transpose) then runs the block FFN.
+        Byte-exact to ``forward_static`` at the decode margin: ``W_o(cam_out)`` restricted
+        to its nonzero output dims IS the full ``W_o.linear`` output (every other output
+        dim is exactly 0, contributing +0.0 to the residual add).
+
+        We ``index_add`` into a COPY of the incoming residual (a cheap ``[1,C,D]`` op, ~µs,
+        vs the ~2 ms dense GEMM it replaces) rather than mutating ``h`` in place — ``h`` may
+        alias the preceding mega-chain's persistent residual buffer, so an in-place write
+        would corrupt it; the copy keeps the on-chip win while staying alias-safe."""
+        res = h.clone()
+        res[0, :, out_dims] += wo_delta
+        return self.ffn.forward(res)
+
 
 class PrecomputedStepGraph:
     """Captures the WHOLE DIV-free per-row map for a fixed chunk size into ONE CUDA
@@ -158,7 +217,9 @@ class PrecomputedStepGraph:
 
     def __init__(self, model, L, device, chunk: int,
                  mega_region, live_blocks: List[_LiveCamBlock],
-                 live_order: List[int], mask: int = 0xFFFFFFFF):
+                 live_order: List[int], mask: int = 0xFFFFFFFF,
+                 onchip: bool = False,
+                 live_out_dims: Optional[Dict[int, torch.Tensor]] = None):
         self.model = model
         self.L = L
         self.device = torch.device(device)
@@ -178,11 +239,19 @@ class PrecomputedStepGraph:
         # list ourselves so we can substitute each live block's cam_out.
         self.live_blocks = {lb.block_idx: lb for lb in live_blocks}
         self.live_order = live_order        # block indices, ascending
+        # C4_ONCHIP_RESIDUAL: instead of a per-live-block ``[1,Hb,C,HDb]`` dense cam_out
+        # (transpose + dense W_o GEMM), the graph static input is the PRECOMPUTED compact
+        # ``[C, n_out_b]`` W_o(cam_out) delta, scatter-added into the residual at the block's
+        # ``live_out_dims[b]``.  Block-0's ingest W_o is FOLDED into h0 up front (no ing
+        # static input at all).  live_out_dims is None -> the dense (golden) path.
+        self.onchip = bool(onchip and live_out_dims is not None)
+        self.live_out_dims = live_out_dims or {}
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         # static buffers (allocated at capture)
         self._s_h0: Optional[torch.Tensor] = None
         self._s_ing: Optional[torch.Tensor] = None
-        self._s_cam: Dict[int, torch.Tensor] = {}
+        self._s_cam: Dict[int, torch.Tensor] = {}      # dense path
+        self._s_delta: Dict[int, torch.Tensor] = {}    # on-chip path ([C, n_out_b])
         self._s_pc = self._s_sp = self._s_bp = self._s_ax = None
         model.materialize_dense(device=str(self.device))
 
@@ -191,10 +260,18 @@ class PrecomputedStepGraph:
         from .nibble_pure_forward_gpu import _decode_reg_batch
         L = self.L
         C, D = self.chunk, self.D
-        # block 0: h = ffn0( h0 + W_o0( ingest_gather ) )
-        out2 = self._s_ing.transpose(1, 2).contiguous().view(1, C, D)
-        h = self._s_h0 + self.attn0.W_o.linear(out2)
-        h = self.ffn0.forward(h)                       # [1,C,D]
+        if self.onchip:
+            # block 0: h = ffn0( h0_folded ) — the W_o0(ingest) contribution is already
+            # folded into the resident h0 table (data-independent), so block 0 is just its
+            # FFN over the precomputed input.  No ingest transpose, no W_o0 GEMM.  ``SparseFFN
+            # .forward`` returns ``x + W_down(...)`` (a FRESH tensor, no in-place on x), so
+            # the region's later in-place delta scatter never touches the static h0 buffer.
+            h = self.ffn0.forward(self._s_h0)
+        else:
+            # block 0: h = ffn0( h0 + W_o0( ingest_gather ) )
+            out2 = self._s_ing.transpose(1, 2).contiguous().view(1, C, D)
+            h = self._s_h0 + self.attn0.W_o.linear(out2)
+            h = self.ffn0.forward(h)                       # [1,C,D]
         # the mega dead-FFN chain + live CAM blocks, in application order.  The
         # MegaBlockRegion.run interleaves the mega segments with live blocks eagerly; we
         # reproduce that ordering but SUBSTITUTE each live block's precomputed cam_out.
@@ -220,26 +297,46 @@ class PrecomputedStepGraph:
         cleanly and byte-identically into the single outer graph (same nonzeros, same
         order); this is the whole point — ONE graph for the WHOLE per-row map, not a
         replay-of-replays.  ``MegaBlockChain.run`` copies h into its persistent [D,K]
-        residual, runs the in-place delta chain, and returns [1,K,D] fp32."""
+        residual, runs the in-place delta chain, and returns [1,K,D] fp32.
+
+        C4_ONCHIP_RESIDUAL: each live block's dense ``W_o.linear(cam_out)`` (a full
+        ``[C,D]@[D,D]`` GEMM on a ~99.997%-zero cam_out) is replaced by a scatter-add of
+        the PRECOMPUTED compact delta into the residual (``forward_static_delta``), so the
+        residual stays on-chip across the whole chain — no per-live-block dense GEMM."""
         for kind, payload in self.mega.items:
             if kind == "mega":
                 h = payload.run(h)                      # eager kernels (capturable)
             else:  # 'live' block index
                 b = payload
                 lb = self.live_blocks[b]
-                h = lb.forward_static(h, self._s_cam[b])
+                if self.onchip:
+                    h = lb.forward_static_delta(h, self._s_delta[b],
+                                                self.live_out_dims[b])
+                else:
+                    h = lb.forward_static(h, self._s_cam[b])
         return h
 
-    def _capture(self):
-        C, D = self.chunk, self.D
-        self._s_h0 = torch.zeros(1, C, D, device=self.device)
-        self._s_ing = torch.zeros(1, self.H0, C, self.HD0, device=self.device)
-        for b, lb in self.live_blocks.items():
-            self._s_cam[b] = torch.zeros(1, lb.H, C, lb.HD, device=self.device)
+    def _alloc_out_lanes(self, C):
         self._s_pc = torch.zeros(C, dtype=torch.long, device=self.device)
         self._s_sp = torch.zeros(C, dtype=torch.long, device=self.device)
         self._s_bp = torch.zeros(C, dtype=torch.long, device=self.device)
         self._s_ax = torch.zeros(C, dtype=torch.long, device=self.device)
+
+    def _capture(self):
+        C, D = self.chunk, self.D
+        self._s_h0 = torch.zeros(1, C, D, device=self.device)
+        if self.onchip:
+            for b in self.live_blocks:
+                nout = int(self.live_out_dims[b].numel())
+                self._s_delta[b] = torch.zeros(C, nout, device=self.device)
+        else:
+            self._s_ing = torch.zeros(1, self.H0, C, self.HD0, device=self.device)
+            for b, lb in self.live_blocks.items():
+                self._s_cam[b] = torch.zeros(1, lb.H, C, lb.HD, device=self.device)
+        self._alloc_out_lanes(C)
+        self._do_capture()
+
+    def _do_capture(self):
         st = torch.cuda.Stream(device=self.device)
         st.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.stream(st):
@@ -253,25 +350,72 @@ class PrecomputedStepGraph:
                 self._body()
         self._graph = g
 
-    def replay(self, h0, ing, cam: Dict[int, torch.Tensor]):
+    def _capture_resident(self, h0, ing, cam, delta):
+        """C4_RESIDENT_BATCH: BIND the graph's inputs DIRECTLY to the resident whole-batch
+        views (no static input buffers, no per-chunk copy).  The chunk == the batch width,
+        captured ONCE; the single replay reads the resident tables in place.  Valid because
+        the whole batch fits one chunk, so there is exactly one (unchanging) replay."""
+        Sc = h0.shape[1]
+        self.chunk = Sc                         # graph shape == the resident batch width
+        self._s_h0 = h0                         # bind the resident h0 view
+        if self.onchip:
+            for b in self.live_blocks:
+                self._s_delta[b] = delta[b]     # [Sc, n_out_b] resident view
+        else:
+            self._s_ing = ing                   # [1,H0,Sc,HD0] resident view
+            for b in self.live_blocks:
+                self._s_cam[b] = cam[b]         # [1,Hb,Sc,HDb] resident view
+        self._alloc_out_lanes(Sc)
+        self._do_capture()
+        self._resident = True
+
+    def replay(self, h0, ing, cam: Dict[int, torch.Tensor],
+               delta: Optional[Dict[int, torch.Tensor]] = None,
+               resident: bool = False):
         """Fill the static inputs (ONE slice-copy each) and replay.  Returns the decoded
         ``(pc, sp, bp, ax)`` static lanes (views into the persistent buffers — the caller
-        copies them out before the next replay)."""
+        copies them out before the next replay).
+
+        On-chip: ``h0`` is the FOLDED query embed (already carries W_o0(ingest)); ``delta``
+        maps block -> ``[Sc, n_out_b]`` precomputed W_o(cam_out) delta; ``ing``/``cam`` are
+        ignored.  Dense: ``ing`` / ``cam`` as before.
+
+        ``resident`` (C4_RESIDENT_BATCH): the whole batch fits one chunk -> capture the graph
+        DIRECTLY over the resident views (``_capture_resident``), then just replay with NO
+        per-chunk input copy."""
+        if resident and self._graph is None:
+            self._capture_resident(h0, ing, cam, delta)
+            self._graph.replay()
+            Sc = h0.shape[1]
+            return (self._s_pc[:Sc], self._s_sp[:Sc], self._s_bp[:Sc], self._s_ax[:Sc])
+        if getattr(self, "_resident", False):
+            # already resident-captured; the resident view is bound — just replay.
+            self._graph.replay()
+            Sc = h0.shape[1]
+            return (self._s_pc[:Sc], self._s_sp[:Sc], self._s_bp[:Sc], self._s_ax[:Sc])
         if self._graph is None:
             self._capture()
         Sc = h0.shape[1]
         C = self.chunk
         if Sc == C:
             self._s_h0.copy_(h0)
-            self._s_ing.copy_(ing)
-            for b in self.live_blocks:
-                self._s_cam[b].copy_(cam[b])
+            if self.onchip:
+                for b in self.live_blocks:
+                    self._s_delta[b].copy_(delta[b])
+            else:
+                self._s_ing.copy_(ing)
+                for b in self.live_blocks:
+                    self._s_cam[b].copy_(cam[b])
         else:
             self._s_h0[:, :Sc].copy_(h0); self._s_h0[:, Sc:].zero_()
-            self._s_ing[:, :, :Sc].copy_(ing); self._s_ing[:, :, Sc:].zero_()
-            for b in self.live_blocks:
-                self._s_cam[b][:, :, :Sc].copy_(cam[b])
-                self._s_cam[b][:, :, Sc:].zero_()
+            if self.onchip:
+                for b in self.live_blocks:
+                    self._s_delta[b][:Sc].copy_(delta[b]); self._s_delta[b][Sc:].zero_()
+            else:
+                self._s_ing[:, :, :Sc].copy_(ing); self._s_ing[:, :, Sc:].zero_()
+                for b in self.live_blocks:
+                    self._s_cam[b][:, :, :Sc].copy_(cam[b])
+                    self._s_cam[b][:, :, Sc:].zero_()
         self._graph.replay()
         return (self._s_pc[:Sc], self._s_sp[:Sc], self._s_bp[:Sc], self._s_ax[:Sc])
 
@@ -292,6 +436,10 @@ class PrecomputedSchedule:
     want_ax: torch.Tensor
     is_halt: torch.Tensor           # [K] bool
     is_file: torch.Tensor           # [K] bool
+    # C4_ONCHIP_RESIDUAL (None when off): the compact precomputed W_o(cam_out) deltas.
+    onchip: bool = False
+    h0_folded: Optional[torch.Tensor] = None       # [K, D]  h0 + W_o0(ingest) (block-0 fold)
+    cam_delta_tables: Optional[Dict[int, torch.Tensor]] = None   # block -> [K, n_out_b]
 
 
 def _build_query_embed(model, L, code, draft, device) -> torch.Tensor:
@@ -374,6 +522,37 @@ def _build_cam_tables(model, L, draft, code, live_blocks, device
     return out
 
 
+def _wo_dense(model, block_idx: int, device) -> torch.Tensor:
+    """The block's ``W_o`` [D, D] dense (from the sparse/CSR weight)."""
+    from .fused_megablock import _dense_of
+    return _dense_of(model.blocks[block_idx].attn.W_o).to(device)
+
+
+def _build_wo_delta_table(cam_flat: torch.Tensor, Wo: torch.Tensor
+                          ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Precompute ``W_o(cam_out)`` for the WHOLE batch as a COMPACT ``[K, n_out]`` delta
+    table + the ``out_dims`` [n_out] it is nonzero at (C4_ONCHIP_RESIDUAL).
+
+    ``cam_flat`` [K, D] is the flattened head-value gather (the SAME dense ``out2`` the
+    eager ``forward_static`` builds); ``Wo`` [D, D].  ``W_o.linear(out2) = out2 @ Wo.T``.
+    Since ``out2`` is nonzero only at a handful of head-value dims and ``Wo`` has only a
+    few nonzeros, the product is nonzero only at ``out_dims``.  We compute the FULL exact
+    product ``cam_flat @ Wo.T`` (cheap ONCE for the whole batch, not per replay) and slice
+    the nonzero output columns.  Byte-exact: this is the identical fp product the dense
+    ``F.linear`` computes, then restricted to its (exactly-zero-elsewhere) support.
+
+    We use the whole-batch column support (any row nonzero) so ``out_dims`` is a single
+    fixed index set the captured graph can scatter — a per-row-varying support would break
+    the fixed-shape graph, and the extra always-zero columns cost nothing (they add +0.0)."""
+    full = cam_flat @ Wo.transpose(0, 1)          # [K, D] exact W_o(cam_out)
+    out_dims = (full.abs().sum(0) > 0).nonzero(as_tuple=False).flatten()
+    if out_dims.numel() == 0:
+        # degenerate (no active output) — keep one dim so the graph has a valid shape.
+        out_dims = torch.zeros(1, dtype=torch.long, device=full.device)
+    delta = full.index_select(1, out_dims).contiguous()   # [K, n_out]
+    return delta, out_dims
+
+
 def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
                    ) -> Tuple[PrecomputedSchedule, "PrecomputedStepGraph"]:
     """Precompute the WHOLE-batch schedule + build the single per-chunk step graph.
@@ -414,12 +593,38 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
     want_bp = torch.tensor([frames[s]["bp"] & 0xFFFFFFFF for s in range(n)], device=dev, dtype=torch.long)
     is_halt = torch.tensor([bool(frames[s].get("is_halt")) for s in range(n)], device=dev)
     is_file = torch.tensor([bool(frames[s].get("is_file")) for s in range(n)], device=dev)
+    # ---- C4_ONCHIP_RESIDUAL: precompute the compact W_o(cam_out) deltas ONCE ----
+    onchip = onchip_residual_enabled()
+    h0_folded = None
+    cam_delta_tables = None
+    live_out_dims = None
+    if onchip:
+        D = model.dim
+        # block-0 ingest fold: h0_folded = h0 + W_o0( ingest_flat ).  ingest_flat is the
+        # SAME dense [K,D] the eager block-0 builds (ing_table [K,H0,HD0] reshaped);
+        # W_o0(ingest_flat) = ingest_flat @ W_o0.T, folded into h0 up front so block 0 is
+        # just ffn0(h0_folded) at replay (no ingest transpose / W_o0 GEMM in the graph).
+        Wo0 = _wo_dense(model, 0, dev)
+        ing_flat = ing_table.reshape(n, D)                    # [K, D] (H0*HD0 == D)
+        h0_folded = h0_table + ing_flat @ Wo0.transpose(0, 1)
+        # each live block: compact [K, n_out_b] delta + its out_dims.
+        cam_delta_tables = {}
+        live_out_dims = {}
+        for lb in live_blocks:
+            b = lb.block_idx
+            cam_flat = cam_tables[b].reshape(n, D)            # [K, D]
+            Wo = _wo_dense(model, b, dev)
+            delta, out_dims = _build_wo_delta_table(cam_flat, Wo)
+            cam_delta_tables[b] = delta
+            live_out_dims[b] = out_dims
     sched = PrecomputedSchedule(
         n_steps=n, h0_table=h0_table, ing_table=ing_table, cam_tables=cam_tables,
         want_pc=want_pc, want_sp=want_sp, want_bp=want_bp, want_ax=want_ax,
-        is_halt=is_halt, is_file=is_file)
+        is_halt=is_halt, is_file=is_file, onchip=onchip, h0_folded=h0_folded,
+        cam_delta_tables=cam_delta_tables)
     chunk = _sched_chunk()
-    sg = PrecomputedStepGraph(model, L, dev, chunk, mega, live_blocks, live_order, mask)
+    sg = PrecomputedStepGraph(model, L, dev, chunk, mega, live_blocks, live_order, mask,
+                              onchip=onchip, live_out_dims=live_out_dims)
     return sched, sg
 
 
@@ -467,20 +672,34 @@ def run_verify(model, L, code, draft, device, *, mask: int = 0xFFFFFFFF,
     sched, sg = build_schedule(model, L, code, draft, dev, mask=mask)
     n = sched.n_steps
     chunk = sg.chunk
+    onchip = sched.onchip
     got_pc = torch.empty(n, dtype=torch.long, device=dev)
     got_sp = torch.empty(n, dtype=torch.long, device=dev)
     got_bp = torch.empty(n, dtype=torch.long, device=dev)
     got_ax = torch.empty(n, dtype=torch.long, device=dev)
     n_chunks = 0
     host_ops = 0
+    # in on-chip mode block 0 reads the FOLDED h0 (carries W_o0(ingest)); dense mode reads
+    # the raw h0 + the ingest table.
+    h0_src = sched.h0_folded if onchip else sched.h0_table
+    # ---- C4_RESIDENT_BATCH: whole batch fits ONE chunk -> capture the graph over VIEWS of
+    #      the resident tables (no per-chunk static-input copy) and do ONE replay. ----
+    resident = resident_batch_enabled() and n <= chunk
     # -------- THE SINGLE DISPATCH LOOP: O(n_chunks) host ops, ZERO per-op work -------
     for lo in range(0, n, chunk):
         hi = min(lo + chunk, n)
-        h0 = sched.h0_table[lo:hi].unsqueeze(0)                    # [1, C, D]
-        ing = sched.ing_table[lo:hi].permute(1, 0, 2).unsqueeze(0)  # [1, H0, C, HD0]
-        cam = {b: t[lo:hi].permute(1, 0, 2).unsqueeze(0)
-               for b, t in sched.cam_tables.items()}
-        pc_c, sp_c, bp_c, ax_c = sg.replay(h0, ing, cam)
+        h0 = h0_src[lo:hi].unsqueeze(0)                            # [1, C, D]
+        if onchip:
+            ing = None
+            cam = None
+            delta = {b: t[lo:hi] for b, t in sched.cam_delta_tables.items()}  # [Sc, n_out]
+            pc_c, sp_c, bp_c, ax_c = sg.replay(h0, ing, cam, delta=delta,
+                                               resident=resident)
+        else:
+            ing = sched.ing_table[lo:hi].permute(1, 0, 2).unsqueeze(0)  # [1, H0, C, HD0]
+            cam = {b: t[lo:hi].permute(1, 0, 2).unsqueeze(0)
+                   for b, t in sched.cam_tables.items()}
+            pc_c, sp_c, bp_c, ax_c = sg.replay(h0, ing, cam, resident=resident)
         got_pc[lo:hi].copy_(pc_c)
         got_sp[lo:hi].copy_(sp_c)
         got_bp[lo:hi].copy_(bp_c)
