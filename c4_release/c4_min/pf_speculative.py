@@ -682,6 +682,22 @@ def _forward_hidden_cached_skip(model, x, past_key_values, q_positions, skip_ran
     return hidden, new_caches
 
 
+def _dead_block_fusion_enabled() -> bool:
+    """``C4_DEAD_BLOCK_FUSION`` (DEFAULT OFF): bypass the WHOLE attention sublayer of
+    every DEAD-attention block (0 live-value heads) and score ONLY the live head-slots
+    on the rest.  A dead block's attention output is provably ``x`` (all heads
+    ``_zero_attn`` -> ``attn@V == 0``, ``W_o`` slice 0), so this is byte-exact.  It is
+    the ZERO-ATTENTION-COMPUTE lever (#856): the audit pinned the composed forward's
+    residual attention arithmetic entirely on the ~238 dead blocks' windowed/banded
+    local softmax (the 4 live blocks are already direct-CAM/direct-local resolved with
+    zero score); fusing them removes ALL of it -> the step is FFN + O(1) gathers.
+    Composes with direct-CAM/direct-local (the 4 live blocks carry live heads, so they
+    are never fused; their own forward is then installed on top).  OFF -> the windowed
+    softmax path (golden 069cc32f unchanged)."""
+    import os as _os
+    return _os.environ.get("C4_DEAD_BLOCK_FUSION", "0") not in ("0", "", "false", "False")
+
+
 def _frozen_skip_enabled() -> bool:
     """``C4_FROZEN_ROW_SKIP`` (DEFAULT OFF): after the last block that reads a
     frozen (non-query) row's KV via a live LOCAL head (the frame-ingest block 0),
@@ -869,6 +885,29 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # last local-attention floor.  Both DEFAULT OFF -> byte-identical to the softmax /
     # banded path (golden 069cc32f unchanged).  Kept alive on locals so the installed
     # forwards' resolved tables persist for the whole verify.
+    # ZERO-ATTENTION-COMPUTE (C4_DEAD_BLOCK_FUSION): the audit (#856) found the
+    # residual attention ARITHMETIC in the composed forward is NOT on the 4 live
+    # blocks (0=ingest, 2=code-select, 7=mem-cam, 11=stack-pop-cam — all fully
+    # resolved by direct-local / direct-CAM below, ZERO score/softmax) but on the
+    # ~238 DEAD-attention blocks (pc-fetch, opcode-decode, alu-*, the divmod span,
+    # …).  ``install_local_attention`` WINDOWS those blocks' zero-value local heads
+    # and routes them through the banded/masked softmax — but never SKIPS them, so
+    # each dead block still pays a full O(S·W) banded score+softmax+ctx over heads
+    # whose output is provably 0.  MEASURED: 33 GFLOP / 1666 softmax1 calls on a 402-
+    # step malloc verify — 100% of it dead-block waste.  ``install_dead_block_fusion``
+    # bypasses the ENTIRE attention sublayer of a 0-live-head block (output = x, no
+    # Q/K/V/W_o linear, no softmax, no KV write — proven L-inf=0), and
+    # ``install_live_head_attention`` scores ONLY the live head-slots on the rest.
+    # Composed with direct-CAM/direct-local (installed AFTER, on the 4 live blocks
+    # which are never fused since they carry live heads) this drives the composed
+    # step's attention-compute to EXACTLY ZERO — the step becomes FFN + O(1) gathers.
+    # Byte-exact (a dead block IS the identity on the residual); default OFF ->
+    # golden 069cc32f unchanged.
+    if _dead_block_fusion_enabled():
+        from .live_head_attention import (install_live_head_attention,
+                                          install_dead_block_fusion)
+        install_live_head_attention(model, verbose=False)
+        install_dead_block_fusion(model, verbose=False)
     _dcam_tbl = _dlocal_tbl = None
     from .direct_cam_batched import (direct_cam_batched_enabled,
                                      install_direct_cam_batched)
