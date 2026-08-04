@@ -343,7 +343,7 @@ int main(int argc, char **argv)
 
   if ((fd = open(*argv, 0)) < 0) { printf("could not open(%s)\n", *argv); return -1; }
 
-  poolsz = 256*1024; // arbitrary size
+  poolsz = 512*1024; // was 256*1024 (rswier default); bumped so transpile.c (~429KB emit) self-hosts. Output-neutral: larger arenas only — identical emission/execution for any program that fit the old size.
   if (!(sym = malloc(poolsz))) { printf("could not malloc(%d) symbol area\n", poolsz); return -1; }
   if (!(le = e = malloc(poolsz))) { printf("could not malloc(%d) text area\n", poolsz); return -1; }
   if (!(data = malloc(poolsz))) { printf("could not malloc(%d) data area\n", poolsz); return -1; }

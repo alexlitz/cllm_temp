@@ -83,9 +83,20 @@ def run(code: List[isa.Instr], data: Optional[List[int]] = None,
         elif op == isa.MUL:
             sp0 = loadw(sp); sp += CELL; ax = (sp0 * ax) & _MASK
         elif op == isa.DIV:
-            sp0 = loadw(sp); sp += CELL; ax = ((sp0 // ax) if ax else 0) & _MASK
+            # c4.c / C89: signed int division, TRUNCATING toward zero (NOT
+            # Python floor). Operands are read as signed 32-bit ints; the
+            # int() truncation matches ``a = *sp++ / a`` on ``int``.
+            sp0 = loadw(sp); sp += CELL
+            sv = sp0 - (1 << 32) if sp0 & 0x80000000 else sp0
+            sa = ax - (1 << 32) if ax & 0x80000000 else ax
+            ax = (int(sv / sa) if sa else 0) & _MASK
         elif op == isa.MOD:
-            sp0 = loadw(sp); sp += CELL; ax = ((sp0 % ax) if ax else 0) & _MASK
+            # C89 %: sign of the result follows the dividend (a - (a/b)*b with
+            # truncating division), matching gcc/c4.c on signed ints.
+            sp0 = loadw(sp); sp += CELL
+            sv = sp0 - (1 << 32) if sp0 & 0x80000000 else sp0
+            sa = ax - (1 << 32) if ax & 0x80000000 else ax
+            ax = ((sv - int(sv / sa) * sa) if sa else 0) & _MASK
         elif op in (isa.OR, isa.XOR, isa.AND):
             sp0 = loadw(sp); sp += CELL
             ax = (sp0 | ax) if op == isa.OR else (sp0 ^ ax) if op == isa.XOR else (sp0 & ax)

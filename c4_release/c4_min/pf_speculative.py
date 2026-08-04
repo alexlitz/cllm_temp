@@ -1317,16 +1317,36 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # attention-identity) + frozen-skip (the region runs over K query rows) + CUDA.
     # Byte-exact; default OFF -> the eager per-block loop.
     _megastep = None
-    # MEGAKERNEL install is lazy-imported ONLY when the flag is on — the module is an
-    # optional (uncommitted) session artifact, so an unconditional import would break
-    # the default (flag-OFF) verify.  Byte-identical: the megakernel is default OFF.
+    # MEGAKERNEL / FUSED MEGABLOCK install.  The two megakernel modules are
+    # lazy-imported (guarded) so a missing session artifact never breaks the default
+    # (flag-OFF) verify; both are now committed but the guard keeps the default path
+    # robust.  Byte-identical: both megakernels are default OFF.
+    #
+    # FUSED MEGABLOCK (C4_FUSED_MEGABLOCK): the on-chip in-place-delta dead-FFN
+    # megakernel — a stronger drop-in for the megastep graph (no per-block full-D
+    # residual copy, no hidden HBM buffer; the [D,K] residual stays L2-resident across
+    # the whole dead-FFN chain, all launches collapsed into one CUDA-graph replay).
+    # Takes PRECEDENCE over C4_GRAPH_MEGAKERNEL.  Byte-exact (nibble-snap margin).
     try:
-        from .megastep_graph import megastep_graph_enabled
+        from .fused_megablock import (fused_megablock_enabled,
+                                      install_fused_megablock)
+        _fused_mega_on = fused_megablock_enabled()
+    except ImportError:
+        install_fused_megablock = None
+        _fused_mega_on = False
+    try:
+        from .megastep_graph import (megastep_graph_enabled,
+                                     install_megastep_graph)
         _mega_on = megastep_graph_enabled()
     except ImportError:
+        install_megastep_graph = None
         _mega_on = False
-    if (frozen_skip and is_cuda and _dead_block_fusion_enabled() and _mega_on):
-        from .megastep_graph import install_megastep_graph
+    if (frozen_skip and is_cuda and _dead_block_fusion_enabled()
+            and _fused_mega_on and install_fused_megablock is not None):
+        _megastep = install_fused_megablock(model, device, frozen_cut, L=L,
+                                            verbose=False)
+    elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
+            and _mega_on and install_megastep_graph is not None):
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
