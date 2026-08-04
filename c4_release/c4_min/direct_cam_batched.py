@@ -237,9 +237,16 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
     the resolved V for ``cam_heads`` at query rows and defers every other head to
     the ordinary windowed forward already installed on the block."""
     attn = model.blocks[block_idx].attn
-    from .local_attention import windowed_forward
+    from .local_attention import windowed_forward, live_value_heads
     cam_head_ids = {h for (h, _k) in cam_heads}
     cam_kind = {h: k for (h, k) in cam_heads}
+    # LIVE-VALUE LOCAL heads (C4_DIRECT_CAM_LIVE_LOCAL, default ON when direct-CAM is):
+    # the set of local heads whose W_v/W_o are non-zero.  A _zero_attn local head's
+    # output is exactly 0, so we skip its banded score+gather (byte-exact).  OFF keeps
+    # the old behaviour (score every non-global head).
+    _live_local = None
+    if os.environ.get("C4_DIRECT_CAM_LIVE_LOCAL", "1") not in ("0", "", "false", "False"):
+        _live_local = set(int(h) for h in live_value_heads(attn))
 
     def direct_forward(self, x, past_kv=None, q_positions=None, use_cache=False):
         # Full head set for this block.
@@ -274,6 +281,15 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
 
         g_idx = torch.nonzero(gmask, as_tuple=False).flatten().tolist()
         l_idx = [h for h in range(H) if not bool(gmask[h])]
+        # LIVE-HEAD SKIP (byte-exact): a _zero_attn local head has W_v==W_o==0, so its
+        # attention output slice is EXACTLY 0 (== the pre-zeroed ``out``).  Running the
+        # banded score+gather for it is pure wasted memory-BW (the band gather
+        # materializes [Sq,W,HD] per head — gigabytes).  Restrict l_idx to the
+        # live-VALUE local heads; the dead ones keep out=0, byte-identical.  On the
+        # CAM blocks (7/11) this drops ~22 dead heads -> only the 1-2 direct-gathered
+        # global CAM heads remain live (the block's real per-step cost -> O(1)).
+        if _live_local is not None:
+            l_idx = [h for h in l_idx if h in _live_local]
         # split global heads into CAM (direct) and NON-CAM (still scored).
         g_cam = [h for h in g_idx if h in cam_head_ids]
         g_score = [h for h in g_idx if h not in cam_head_ids]

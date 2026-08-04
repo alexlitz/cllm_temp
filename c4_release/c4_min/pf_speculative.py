@@ -67,6 +67,24 @@ def _s32(v: int) -> int:
     v &= 0xFFFFFFFF
     return v - (1 << 32) if v & 0x80000000 else v
 
+
+# BATCHED per-span register decode.  ``None`` -> read the env flag; a test can force
+# it via ``set_batched_decode(True/False)``.  See the verify_blocks decode loop.
+_BATCHED_DECODE: Optional[bool] = None
+
+
+def _batched_decode_enabled() -> bool:
+    """``C4_BATCHED_DECODE`` (DEFAULT OFF): decode a verify span's query rows in ONE
+    device-side batched argmax + a single host copy, instead of ~11 per-step
+    ``float(state[dim])`` host<->device syncs.  Bit-identical (same integer argmax
+    requant); OFF reproduces the exact per-scalar path (byte-identical golden)."""
+    return os.environ.get("C4_BATCHED_DECODE", "0") not in ("0", "", "false", "False")
+
+
+def set_batched_decode(v: Optional[bool]) -> None:
+    global _BATCHED_DECODE
+    _BATCHED_DECODE = v
+
 from . import isa
 from . import blogspec_vocab as V
 from . import nibble_filesys as _FS   # OPEN/READ/CLOS/PRTF via the TOOL_CALL boundary
@@ -578,6 +596,72 @@ def _forward_hidden_cached_skip(model, x, past_key_values, q_positions, skip_ran
     return hidden, new_caches
 
 
+def _frozen_skip_enabled() -> bool:
+    """``C4_FROZEN_ROW_SKIP`` (DEFAULT OFF): after the last block that reads a
+    frozen (non-query) row's KV via a live LOCAL head (the frame-ingest block 0),
+    run the remaining blocks on ONLY the query rows.  Frozen columns' downstream
+    output is never decoded and never read cross-column (blocks 1..N are dead-attn
+    passthrough or direct-CAM'd whose live heads are GLOBAL and position-gathered,
+    not KV-reading), so this is BYTE-EXACT — the query-row decode is identical
+    (probe ``_agent_frozen_skip_probe``: 0/256 rows differ).  It cuts the FFN + block
+    stack from S~=30k span rows to K~=256 query rows (~30x less FFN work).  Requires
+    direct-CAM (else blocks 7/11 would read frozen-row KV)."""
+    import os as _os
+    return _os.environ.get("C4_FROZEN_ROW_SKIP", "0") not in ("0", "", "false", "False")
+
+
+def _frozen_skip_cut(model) -> int:
+    """The cut block index: run blocks [0, cut) on ALL rows (commit their KV), run
+    blocks [cut, N) on QUERY rows only.  ``cut`` = 1 + (index of the last block with
+    a live LOCAL head).  A block has a live local head iff it has a ``_global_head_mask``
+    AND some non-global head is a live-value head (``local_attention.live_value_heads``).
+    For the doom config the frame-ingest block 0 is the only such block -> cut = 1."""
+    from .local_attention import live_value_heads
+    cut = 0
+    for bi, blk in enumerate(model.blocks):
+        at = blk.attn
+        gmask = getattr(at, "_global_head_mask", None)
+        if gmask is None:
+            continue
+        live = set(int(h) for h in live_value_heads(at))
+        # a live head that is NOT global == a live LOCAL head (reads frozen-row KV).
+        local_live = any((h in live) and (not bool(gmask[h])) for h in range(at.n_heads))
+        if local_live:
+            cut = bi + 1
+    return max(cut, 1)
+
+
+def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
+                                       q_local_idx, cut):
+    """Run blocks [0, cut) over ALL rows (commit KV), then blocks [cut, N) over ONLY
+    the query rows (``q_local_idx`` — window-local indices).  Returns
+    ``(hidden_full, new_caches)`` where ``hidden_full`` is [1, S, D] with the QUERY
+    rows overwritten by their fully-forwarded state (frozen rows left at their
+    post-cut-block value, which the decode never reads).  ``new_caches[b]`` for
+    b<cut is the full-row KV (committed as usual); for b>=cut it is None (that
+    block's KV is never re-read — dead-attn / direct-CAM)."""
+    n = len(model.blocks)
+    if past_key_values is None:
+        past_key_values = [None] * n
+    new_caches = [None] * n
+    hidden = x
+    for b in range(cut):
+        hidden, kv = model.blocks[b](
+            hidden, past_kv=past_key_values[b], q_positions=q_positions, use_cache=True)
+        new_caches[b] = kv
+    # gather query rows + their absolute positions, forward ONLY them through [cut, N).
+    qi = torch.tensor(q_local_idx, device=hidden.device, dtype=torch.long)
+    hq = hidden[:, qi, :]                                    # [1, K, D]
+    qp_q = q_positions.index_select(0, qi) if q_positions is not None else None
+    for b in range(cut, n):
+        hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q, use_cache=True)
+    # scatter the query rows' final state back into a full [1, S, D] so the caller's
+    # decode loop (indexing by span-local query position) is unchanged.
+    hidden = hidden.clone()
+    hidden[:, qi, :] = hq
+    return hidden, new_caches
+
+
 def _forward_hidden_cached_mask(model, x, past_key_values, q_positions, run_mask):
     """Run ONLY the blocks flagged True in ``run_mask`` (len == n_blocks); every
     False block is an IDENTITY expert (residual passes straight through, its cache
@@ -815,6 +899,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     from .batched_block_skip import batched_block_skip_enabled, BatchedBlockSkipPlan
     if batched_block_skip_enabled():
         bbs_plan = BatchedBlockSkipPlan(model, L)
+    # FROZEN-ROW SKIP (C4_FROZEN_ROW_SKIP): after the last live-LOCAL-head block, run
+    # the remaining blocks on QUERY rows only (~30x less FFN).  Byte-exact with
+    # direct-CAM (blocks past the cut don't read frozen-row KV).  Computed ONCE.
+    frozen_skip = _frozen_skip_enabled()
+    frozen_cut = _frozen_skip_cut(model) if frozen_skip else 0
     dev = torch.device(device)
     if is_cuda:
         # Reset the peak so ``peak_vram_gb`` reflects THIS verify's largest span
@@ -890,6 +979,13 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 hidden, new_kv = _forward_hidden_cached_skip(
                     model, x, past, q_positions, skip_range)
                 blocks_run = n_blocks - (skip_range[1] - skip_range[0])
+            elif frozen_skip:
+                # blocks [0, cut) over all S rows; blocks [cut, N) over the K query
+                # rows only.  ~30x less FFN.  Byte-exact under direct-CAM.
+                hidden, new_kv = _forward_hidden_cached_frozen_skip(
+                    model, x, past, q_positions, q_local, frozen_cut)
+                # cost accounting: cut blocks over S rows + (N-cut) over K query rows.
+                blocks_run = n_blocks
             else:
                 hidden, new_kv = model.forward_hidden_cached(
                     x, past_key_values=past, q_positions=q_positions, use_cache=True)
@@ -1023,14 +1119,45 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         blocks_run_total += blk_run       # count only the SUCCEEDED block
         blocks_full_total += n_blocks
 
+        # BATCHED DECODE (C4_BATCHED_DECODE, default OFF): decode ALL query rows of
+        # this span in ONE device-side gather + argmax + a SINGLE host copy, instead
+        # of the per-step ``float(state[dim])`` scalar path (which host<->device syncs
+        # ~11 times PER STEP -> ~330k GPU stalls over a program).  Bit-identical: the
+        # batched ``_snap_lane_batch`` / ``_decode_reg_batch`` evaluate the SAME integer
+        # ``argmax_v (2vx - v^2)`` requant per row as the scalar ``_snap_lane`` /
+        # ``_decode_reg_from_nibbles`` (probe: byte-exact, 15x faster on the decode).
+        batched_decode = (_batched_decode_enabled() if _BATCHED_DECODE is None
+                          else _BATCHED_DECODE)
+        pre_pc = pre_sp = pre_bp = pre_ax = None
+        if batched_decode:
+            from .nibble_pure_forward_gpu import _decode_reg_batch, _snap_lane_batch
+            wi_idx = torch.tensor(
+                [draft.win_starts[s] - span_start for s in range(step, end)],
+                device=hidden.device, dtype=torch.long)
+            qs = hidden[0].index_select(0, wi_idx)      # [K, D] device-resident
+            pc_b = _snap_lane_batch(qs[:, L.PC_VAL])
+            sp_b = _snap_lane_batch(qs[:, L.SP_VAL])
+            bp_b = _snap_lane_batch(qs[:, L.BP_VAL])
+            ax_b = _decode_reg_batch(qs, L.AX)
+            dec = torch.stack([pc_b, sp_b, bp_b, ax_b], dim=1).cpu().tolist()
+            pre_pc = [d[0] for d in dec]
+            pre_sp = [d[1] for d in dec]
+            pre_bp = [d[2] for d in dec]
+            pre_ax = [d[3] for d in dec]
+
         # decode + verify each step-query row of the block against the draft.
         for s in range(step, end):
-            wi = draft.win_starts[s] - span_start
-            state = hidden[0, wi]
-            got_pc = _snap_lane(state[L.PC_VAL])
-            got_sp = _snap_lane(state[L.SP_VAL])
-            got_bp = _snap_lane(state[L.BP_VAL])
-            got_ax = _decode_reg_from_nibbles(state, L, L.AX)
+            if batched_decode:
+                _i = s - step
+                got_pc, got_sp, got_bp, got_ax = (
+                    pre_pc[_i], pre_sp[_i], pre_bp[_i], pre_ax[_i])
+            else:
+                wi = draft.win_starts[s] - span_start
+                state = hidden[0, wi]
+                got_pc = _snap_lane(state[L.PC_VAL])
+                got_sp = _snap_lane(state[L.SP_VAL])
+                got_bp = _snap_lane(state[L.BP_VAL])
+                got_ax = _decode_reg_from_nibbles(state, L, L.AX)
             fr = draft.frames[s]
             want_pc = fr["pc"]
             want_ax = fr["ax"] & mask
@@ -1061,7 +1188,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 import os as _osd
                 if _osd.environ.get("C4_WALL6_DIAG", "0") == "1" and stats is not None:
                     try:
-                        stk = _decode_reg_from_nibbles(state, L, L.STACK0)
+                        _st = hidden[0, draft.win_starts[s] - span_start]
+                        stk = _decode_reg_from_nibbles(_st, L, L.STACK0)
                     except Exception:
                         stk = None
                     fr_ = draft.frames[s]
