@@ -222,6 +222,92 @@ def apply_overlay_window_fast(x_win: torch.Tensor, w_start: int, L,
                 x_win[0, wi, L.ROLE + role] = 1.0
 
 
+def _overlay_batched_enabled() -> bool:
+    """``C4_OVERLAY_BATCHED`` (DEFAULT OFF): assemble the per-row overlay writes on
+    the HOST and push them to the device in ONE ``index_put_`` (2 HtoD copies:
+    flat-index + values) instead of the per-scalar ``x[0,wi,dim]=float`` loop (each
+    a tiny PAGEABLE HtoD).  The profiler pinned that loop as ~21k tiny HtoD/copy_
+    ops = ~36% CUDA / ~99% CPU-wall of the span (10s CPU vs 75ms CUDA), so this is
+    the real launch-collapse lever, NOT a whole-block megakernel (the block forward
+    is only ~75ms of GPU).  Byte-identical: it writes the SAME (row,dim)->float set
+    ``apply_overlay_window_fast`` writes, just as ONE batched device op."""
+    return os.environ.get("C4_OVERLAY_BATCHED", "0") not in ("0", "", "false", "False")
+
+
+def apply_overlay_window_batched(x_win: torch.Tensor, w_start: int, L,
+                                 store_log: Dict[int, Tuple[int, int]],
+                                 code_vec: Tuple[torch.Tensor, torch.Tensor],
+                                 query_rows: Optional[List[int]] = None,
+                                 code=None, code_off: int = 0) -> None:
+    """LAUNCH-COLLAPSED overlay — byte-identical to ``apply_overlay_window_fast``
+    but the per-row frame-role / store / query-tag scalar writes are ACCUMULATED on
+    the host into flat ``(index, value)`` arrays and applied in ONE device
+    ``index_put_`` (a single vectorised scatter) instead of ~21k per-scalar HtoD
+    dispatches.  The row-invariant code-in-data is still ONE broadcast assign.
+
+    Flat offset of ``x_win[0, wi, dim]`` (contiguous ``[1, W, D]``) is ``wi*D + dim``.
+    Because the fast overlay's per-row writes are all plain ASSIGNS (never ``+=``)
+    and never write the same (row,dim) twice within a row, a single scatter of the
+    accumulated (offset->value) pairs reproduces the exact residual — L-inf==0.
+    """
+    import numpy as _np
+    _cfm = code_off > 0
+    W = x_win.shape[1]
+    D = x_win.shape[2]
+    # 1) row-INVARIANT program-in-data + ONE — unchanged (already ONE broadcast op).
+    code_idx, code_vals = code_vec
+    x_win[0, :, code_idx] = code_vals
+    # 2) accumulate every per-row scalar (row,dim)->value on the HOST (no device op).
+    offs: List[int] = []
+    vals: List[float] = []
+    for wi in range(W):
+        p = w_start + wi
+        base = wi * D
+        if p == 0:
+            continue
+        if _cfm and 1 <= p <= code_off:
+            ins = code[p - 1]
+            offs.append(base + L.IS_CODE); vals.append(1.0)
+            offs.append(base + L.IS_FRAME_BYTE); vals.append(0.0)
+            for b in range(CODE_ADDR_BITS):
+                offs.append(base + L.CODE_KEY_BIN + b)
+                vals.append(float(((p - 1) >> b) & 1))
+            offs.append(base + L.CODE_OPV); vals.append(float(ins.op))
+            for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                offs.append(base + L.CODE_IMM_NIB_MEM + j); vals.append(float(nv))
+            continue
+        f = (p - 1 - code_off) // V.FRAME_LEN
+        local = (p - 1 - code_off) % V.FRAME_LEN
+        if local in _FRAME_ROLE_SLOTS:
+            role = _FRAME_ROLE_SLOTS[local]
+            offs.append(base + L.ROLE + role); vals.append(1.0)
+            offs.append(base + L.IS_FRAME_BYTE); vals.append(1.0)
+        if local == _MEM_MARKER_LOCAL and f in store_log:
+            addr, val = store_log[f]
+            offs.append(base + L.IS_STORE); vals.append(1.0)
+            offs.append(base + L.IS_FRAME_BYTE); vals.append(0.0)
+            for b, bit in enumerate(_address_bits(addr)):
+                offs.append(base + L.ADDR_BIN + b); vals.append(bit)
+            for j, nv in enumerate(V.nibbles_of_value(val & 0xFFFFFFFF, NIB_PER_REG)):
+                offs.append(base + L.VAL_NIB + j); vals.append(float(nv))
+    # 3) query-row all-ROLE tag.
+    q_iter = ([W - 1] if query_rows is None else query_rows)
+    for wi in q_iter:
+        base = wi * D
+        for role in range(N_ROLES):
+            offs.append(base + L.ROLE + role); vals.append(1.0)
+    if not offs:
+        return
+    # ONE HtoD each for the flat index + value arrays (built via numpy so the host
+    # side is a single vectorised buffer, not a python-list -> tensor per element),
+    # then ONE device scatter.  Replaces ~21k tiny pageable HtoD dispatches.
+    idx_t = torch.from_numpy(_np.asarray(offs, dtype=_np.int64)).to(
+        x_win.device, non_blocking=True)
+    val_t = torch.from_numpy(_np.asarray(vals, dtype=_np.float32)).to(
+        x_win.device, dtype=x_win.dtype, non_blocking=True)
+    x_win.view(-1).index_put_((idx_t,), val_t)
+
+
 # ===========================================================================
 # 1. THE PERFECT DRAFT — the reference VM run, materialised as the exact token
 #    stream + store_log the pure-forward DRIVER would emit.  ZERO model forwards.
@@ -904,6 +990,10 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # direct-CAM (blocks past the cut don't read frozen-row KV).  Computed ONCE.
     frozen_skip = _frozen_skip_enabled()
     frozen_cut = _frozen_skip_cut(model) if frozen_skip else 0
+    # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
+    # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
+    # pageable HtoD dispatches the profiler pinned as the span wall).
+    _overlay_batched = _overlay_batched_enabled()
     dev = torch.device(device)
     if is_cuda:
         # Reset the peak so ``peak_vram_gb`` reflects THIS verify's largest span
@@ -948,9 +1038,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             if fast:
                 # O(rows + code): broadcast the code-in-data, per-row roles, then
                 # tag exactly this block's query rows (byte-identical residual).
-                apply_overlay_window_fast(x, span_start, L, store_log, code_vec,
-                                          query_rows=q_local, code=code,
-                                          code_off=draft.code_off)
+                _overlay = (apply_overlay_window_batched if _overlay_batched
+                            else apply_overlay_window_fast)
+                _overlay(x, span_start, L, store_log, code_vec,
+                         query_rows=q_local, code=code,
+                         code_off=draft.code_off)
             else:
                 apply_overlay_window(x, span_start, code, L, store_log,
                                      is_last_row_query=False,
@@ -1055,9 +1147,11 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             with torch.no_grad():
                 x = model.embed[win_toks].clone()
                 if fast:
-                    apply_overlay_window_fast(x, pos, L, store_log, code_vec,
-                                              query_rows=[], code=code,
-                                              code_off=draft.code_off)
+                    _overlay = (apply_overlay_window_batched if _overlay_batched
+                                else apply_overlay_window_fast)
+                    _overlay(x, pos, L, store_log, code_vec,
+                             query_rows=[], code=code,
+                             code_off=draft.code_off)
                 else:
                     apply_overlay_window(x, pos, code, L, store_log,
                                          is_last_row_query=False,
