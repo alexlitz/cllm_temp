@@ -94,7 +94,8 @@ def _guard():
 ALL_LEVERS = ["C4_DEAD_BLOCK_FUSION", "C4_DIRECT_CAM_BATCHED", "C4_DIRECT_LOCAL_CAM",
               "C4_FLASH_ATTN", "C4_BANDED_LOCAL_ATTN", "C4_FROZEN_ROW_SKIP",
               "C4_CUT_SPAN_CHUNK", "C4_FUSED_MEGABLOCK", "C4_FUSED_DELTA_FFN",
-              "C4_OVERLAY_BATCHED", "C4_STREAM_EMBED", "C4_GRAPH_BLOCK0"]
+              "C4_OVERLAY_BATCHED", "C4_STREAM_EMBED", "C4_GRAPH_BLOCK0",
+              "C4_DIRECT_CAM_VEC"]
 
 
 def _levers_on(cut_chunk):
@@ -115,6 +116,12 @@ def _levers_on(cut_chunk):
     # builds each block-0 chunk's embed+overlay on demand (kills the last O(K*30)).
     os.environ["C4_OVERLAY_BATCHED"] = "1"
     os.environ["C4_STREAM_EMBED"] = "1"
+    # HOST-DISPATCH KILL: #871 vectorized CAM-output gather — replace the ~7272
+    # per-head/per-row ``_head_out_vec`` host calls (the pinned prime suspect) with a
+    # precomputed table + ONE index_select scatter.  Byte-exact (the gathered vector
+    # IS ``_head_out_vec`` at that position).  Banked default-OFF and never composed
+    # here; flipping it collapses the ~558us host gap's #1 contributor.
+    os.environ["C4_DIRECT_CAM_VEC"] = "1"
     # qrow chunk defaults to cut chunk; keep block-0 dead-kv drop on for giant K.
     os.environ["C4_BLOCK0_DROP_DEAD_KV"] = "1"
     # RUNG 2 + RUNG 3 (this task): whole-step block-0 chunk-loop graph (folds the ingest
