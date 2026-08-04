@@ -692,6 +692,22 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 g_idx, int(at._local_window),
                 content_bound=getattr(at, "_content_bound_global", False),
                 content_cR=getattr(at, "_store_gate_channel", None))
+    # DIRECT-CAM (C4_DIRECT_CAM_BATCHED): the GLOBAL memory/stack/LEV/code heads
+    # direct-gather the draft-resolved value per query row (no O(S) global score).
+    # DIRECT-LOCAL-CAM (C4_DIRECT_LOCAL_CAM): the block-0 register-ingest LOCAL heads
+    # direct-gather their resolved frame byte per query row (no windowed score) — the
+    # last local-attention floor.  Both DEFAULT OFF -> byte-identical to the softmax /
+    # banded path (golden 069cc32f unchanged).  Kept alive on locals so the installed
+    # forwards' resolved tables persist for the whole verify.
+    _dcam_tbl = _dlocal_tbl = None
+    from .direct_cam_batched import (direct_cam_batched_enabled,
+                                     install_direct_cam_batched)
+    if direct_cam_batched_enabled():
+        _dcam_tbl = install_direct_cam_batched(model, L, draft, code, verbose=False)
+    from .direct_local_cam import (direct_local_cam_enabled,
+                                    install_direct_local_cam)
+    if direct_local_cam_enabled():
+        _dlocal_tbl = install_direct_local_cam(model, L, draft, verbose=False)
     store_log = draft.store_log
     n_steps = draft.step_count
     # SCHEDULE-DRIVEN eviction (C4_EVICT_SCHEDULE): precompute the deterministic
