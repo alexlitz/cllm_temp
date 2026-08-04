@@ -386,6 +386,167 @@ class KBatchBoundedRunner:
             s |= set(live)
         return sorted(s)
 
+    # ------------------------------------------------------------------
+    # #874 — PER-ROW block-skip (position-sparse block EXECUTION).
+    #
+    # ``forward_span`` runs the UNION of the K ops' live blocks for ALL K query
+    # rows.  But block ``bi`` only AFFECTS the decode of query row ``j`` iff
+    # ``ops[j]``'s own live set contains ``bi``.  For every OTHER row ``bi`` is a
+    # provable nil passthrough (its op does not use that block; the row carries its
+    # exact input residual — the SAME thing the union forward computes for it, since
+    # a skipped block's output for a row is that row's input residual).  So block
+    # ``bi`` need compute ONLY its LIVE rows.  The classic waste: a batch with one
+    # DIV makes the whole 188-block divmod span "live" for the WHOLE K-batch, so the
+    # union forward runs those 188 blocks for every ADD/PSH/LI row too — ~15x more
+    # FFN work than the per-op weighted number.  Per-row block-skip runs the DIV
+    # blocks ONLY on the (rare) DIV rows.
+    # ------------------------------------------------------------------
+    def per_block_rows(self, ops) -> Dict[int, List[int]]:
+        """``{block_idx: [row j in 0..K-1 whose op uses this block]}`` — the per-block
+        query-row mask.  A block absent from the map is used by NO row in this span
+        (fully skipped).  If any op is unknown (``None`` live -> full stack), that row
+        is live for EVERY block (safe fallback)."""
+        full = None
+        rows_by_block: Dict[int, List[int]] = {}
+        for j, op in enumerate(ops):
+            live = self.live_index.get(op)
+            if live is None:
+                if full is None:
+                    full = list(range(self.n_blocks))
+                live = full
+            for bi in live:
+                rows_by_block.setdefault(bi, []).append(j)
+        return rows_by_block
+
+    def forward_span_perrow(self, x: torch.Tensor, ops, q_idxs: List[int],
+                            all_store: Optional[torch.Tensor] = None
+                            ) -> torch.Tensor:
+        """PER-ROW block-skip forward_span (#874): each live block computes ONLY the
+        query rows whose op uses it, NOT the union of all K rows.
+
+        Byte-identical to the K=1 SINGLE-STEP decode: a row that skips block ``bi``
+        keeps its input residual at that block, which is EXACTLY what that row's op
+        computes in its OWN single-step forward (that op's block-skip schedule never
+        runs ``bi``).  The chain runs in block order over the shared in-place buffer,
+        so a row's residual entering block ``bi`` is the same as under its single-step
+        forward (every earlier block the row's op uses has already run for it, and
+        every earlier block it does NOT use left its residual untouched).
+
+        (NOTE: this is byte-exact to the TRUE per-step decode; the older UNION
+        ``forward_span`` is NOT for a mixed batch — its SHL/EQ ax-recompose blocks run
+        on, and corrupt, the AX band of the OTHER rows.  Per-row is both correct and
+        skips the FFN work of blocks a row does not use.)"""
+        store_dim = int(self.L.IS_STORE)
+        if all_store is None:
+            col = x[0, :, store_dim]
+            all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
+        rows_by_block = self.per_block_rows(ops)
+        with torch.no_grad():
+            buf = x.clone()
+            # iterate blocks in order; each runs ONLY its live rows (a subset of the
+            # K query rows).  Blocks used by no row are skipped entirely.
+            for bi in sorted(rows_by_block.keys()):
+                rows = rows_by_block[bi]
+                sub_q = [q_idxs[j] for j in rows]
+                sub_qt = torch.tensor(sub_q, device=x.device, dtype=torch.long)
+                buf = self.kblocks[bi].forward(buf, sub_q, all_store=all_store,
+                                               q_t=sub_qt, inplace=True)
+        return buf
+
+    # ------------------------------------------------------------------
+    # #874 GROUPED per-row block-skip: collapse the eager per-block launch overhead.
+    #
+    # The naive ``forward_span_perrow`` runs the SAME #block-forwards as the union (a
+    # block used by ANY row still launches once) — it only shrinks each GEMM to that
+    # block's live-row subset.  On the eager path the launch count, not the FLOP, is
+    # the wall, so the FLOP win does not show.  But the row-subsets are HIGHLY
+    # structured: in a K-batch with one DIV, the ~179 ``alu-div`` blocks ALL share the
+    # single DIV row's subset and are a consecutive PASSTHROUGH (FFN-only) run.  So we
+    # COMPACT those rows into a [1, n_sub, D] buffer and run that whole consecutive
+    # same-subset passthrough run as ONE FFN chain over n_sub rows (n_sub=1 for the
+    # lone-DIV case) — collapsing 179 x 64-row GEMMs to 179 x 1-row GEMMs, and (with a
+    # CUDA graph over the compacted chain) collapsing their launches too.  Byte-exact:
+    # a passthrough block's FFN is position-independent, so running it on the compacted
+    # live-row buffer and scattering back is identical to running it in place.
+    # ------------------------------------------------------------------
+    def _perrow_segments(self, ops):
+        """Partition the live blocks into ordered SEGMENTS, each a maximal run of
+        consecutive live blocks that are ALL passthrough (FFN-only) AND share the
+        IDENTICAL query-row subset — plus singleton segments for attention blocks or
+        subset boundaries.  Returns ``[(block_idxs, rows_tuple, is_ffn_chain)]`` in
+        block order."""
+        rows_by_block = self.per_block_rows(ops)
+        live = sorted(rows_by_block.keys())
+        segs: List[Tuple[List[int], Tuple[int, ...], bool]] = []
+        cur: List[int] = []
+        cur_rows: Optional[Tuple[int, ...]] = None
+        for bi in live:
+            rows = tuple(rows_by_block[bi])
+            is_pass = self.kblocks[bi].b.is_passthrough
+            if is_pass and cur and rows == cur_rows:
+                cur.append(bi)
+            else:
+                if cur:
+                    segs.append((cur, cur_rows, len(cur) >= 1 and
+                                 all(self.kblocks[b].b.is_passthrough for b in cur)))
+                cur = [bi]
+                cur_rows = rows
+        if cur:
+            segs.append((cur, cur_rows, all(self.kblocks[b].b.is_passthrough
+                                            for b in cur)))
+        return segs
+
+    def forward_span_perrow_graphed(self, x: torch.Tensor, ops, q_idxs: List[int],
+                                    all_store: Optional[torch.Tensor] = None,
+                                    graph: bool = True) -> torch.Tensor:
+        """GROUPED per-row forward_span (#874): consecutive same-row-subset passthrough
+        blocks run as ONE FFN chain over a COMPACTED [1, n_sub, D] buffer (n_sub = that
+        subset's row count), and — when ``graph`` — the tail such run is CUDA-graphed
+        (keyed on the block-run + n_sub).  Byte-exact to ``forward_span_perrow``: a
+        passthrough block's FFN is position-independent, so gather-run-scatter over the
+        live rows equals the in-place per-row run."""
+        store_dim = int(self.L.IS_STORE)
+        if all_store is None:
+            col = x[0, :, store_dim]
+            all_store = torch.nonzero(col != 0, as_tuple=False).flatten()
+        segs = self._perrow_segments(ops)
+        with torch.no_grad():
+            buf = x.clone()
+            for seg_i, (blks, rows, is_ffn) in enumerate(segs):
+                sub_q = [q_idxs[j] for j in rows]
+                sub_qt = torch.tensor(sub_q, device=x.device, dtype=torch.long)
+                if is_ffn and len(blks) >= 1:
+                    # COMPACT the live rows, run the FFN chain over the small buffer,
+                    # scatter back.  (Position-independent FFN -> byte-exact.)
+                    xq = buf[:, sub_qt]                              # [1, n_sub, D]
+                    key = (tuple(blks), len(sub_q))
+                    gch = None
+                    # CUDA graphs are GPU-only; on CPU run the compacted chain eagerly
+                    # (still the per-row FLOP win, just no launch-collapse).
+                    if graph and x.is_cuda and key not in self._graph_disabled:
+                        gch = self._ffn_graphs.get(key)
+                        if gch is None:
+                            gch = GraphedFFNChain(self.kblocks, blks, len(sub_q),
+                                                  x.shape[2], x.device, x.dtype)
+                            if gch.try_capture():
+                                self._ffn_graphs[key] = gch
+                            else:
+                                gch = None
+                                self._graph_disabled.add(key)
+                    if gch is not None:
+                        fq = gch.run(xq)
+                    else:
+                        fq = xq
+                        for bi in blks:
+                            fq = self.kblocks[bi].b._ffn_qrow(fq)
+                    buf[:, sub_qt] = fq
+                else:
+                    # attention (or mixed) block: run individually over its subset.
+                    for bi in blks:
+                        buf = self.kblocks[bi].forward(
+                            buf, sub_q, all_store=all_store, q_t=sub_qt, inplace=True)
+        return buf
+
     def forward_span(self, x: torch.Tensor, ops, q_idxs: List[int]) -> torch.Tensor:
         live_set = set(self.live_union(ops))
         # IS_STORE is a STRUCTURAL input role tag (set by the overlay, not written by
