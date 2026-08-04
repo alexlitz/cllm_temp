@@ -138,11 +138,16 @@ def _apply_direct_cam(state, L, resolved):
 
 
 def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
-                 K: int, max_steps=200, seed_mem=None, graph=False):
+                 K: int, max_steps=200, seed_mem=None, graph=False, perrow=False,
+                 perrow_graphed=False, wholestep=False):
     """Verify the whole program K VM steps per forward on the bounded-KV path.
 
     ``graph=True`` routes through the MEGAKERNEL (CUDA-graphed passthrough-FFN
-    tail).  Returns (ax_trace, n_forwards)."""
+    tail); ``perrow=True`` routes through the #874 PER-ROW block-skip forward_span
+    (each block runs only the query rows whose op uses it, not the union of all K);
+    ``perrow_graphed=True`` routes through the GROUPED graphed per-row path (same
+    per-row skip, consecutive same-subset FFN runs compacted + CUDA-graphed).
+    Returns (ax_trace, n_forwards)."""
     from .nibble_pure_forward_complete import make_overlay_complete
     stream, q_positions, ops, resolved_by_qpos, draft_ax, store_log = _prep_stream(
         model, L, code, max_steps=max_steps, seed_mem=seed_mem)
@@ -177,7 +182,13 @@ def drive_kbatch(model, L, runner: KBatchBoundedRunner, code, *,
         q_idxs = q_positions[s:e]
         span_ops = ops[s:e]
         with torch.no_grad():
-            if graph:
+            if wholestep:
+                x = runner.forward_span_perrow_wholestep(x_full, span_ops, q_idxs)
+            elif perrow_graphed:
+                x = runner.forward_span_perrow_graphed(x_full, span_ops, q_idxs)
+            elif perrow:
+                x = runner.forward_span_perrow(x_full, span_ops, q_idxs)
+            elif graph:
                 x = runner.forward_span_graphed(x_full, span_ops, q_idxs)
             else:
                 x = runner.forward_span(x_full, span_ops, q_idxs)

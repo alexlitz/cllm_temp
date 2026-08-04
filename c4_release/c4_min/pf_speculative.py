@@ -734,14 +734,20 @@ def _frozen_skip_cut(model) -> int:
 
 
 def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
-                                       q_local_idx, cut):
+                                       q_local_idx, cut, megastep=None):
     """Run blocks [0, cut) over ALL rows (commit KV), then blocks [cut, N) over ONLY
     the query rows (``q_local_idx`` — window-local indices).  Returns
     ``(hidden_full, new_caches)`` where ``hidden_full`` is [1, S, D] with the QUERY
     rows overwritten by their fully-forwarded state (frozen rows left at their
     post-cut-block value, which the decode never reads).  ``new_caches[b]`` for
     b<cut is the full-row KV (committed as usual); for b>=cut it is None (that
-    block's KV is never re-read — dead-attn / direct-CAM)."""
+    block's KV is never re-read — dead-attn / direct-CAM).
+
+    ``megastep`` (C4_GRAPH_MEGAKERNEL): a ``MegaStepGraph`` that CUDA-graphs the
+    dead-FFN segments of the ``[cut, N)`` block loop into one-launch-per-segment
+    replays (byte-exact; the graphed FFN chain is the same dense GEMM in the same
+    order as the eager loop, attention identity throughout).  None -> the eager
+    per-block loop."""
     n = len(model.blocks)
     if past_key_values is None:
         past_key_values = [None] * n
@@ -755,8 +761,13 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
     qi = torch.tensor(q_local_idx, device=hidden.device, dtype=torch.long)
     hq = hidden[:, qi, :]                                    # [1, K, D]
     qp_q = q_positions.index_select(0, qi) if q_positions is not None else None
-    for b in range(cut, n):
-        hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q, use_cache=True)
+    if megastep is not None:
+        # MEGAKERNEL: replay the dead-FFN-segment CUDA graphs (one launch/segment)
+        # + run the live CAM blocks eagerly — byte-exact to the per-block loop.
+        hq = megastep.run(hq, qp_q)
+    else:
+        for b in range(cut, n):
+            hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q, use_cache=True)
     # scatter the query rows' final state back into a full [1, S, D] so the caller's
     # decode loop (indexing by span-local query position) is unchanged.
     hidden = hidden.clone()
@@ -917,6 +928,23 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                                     install_direct_local_cam)
     if direct_local_cam_enabled():
         _dlocal_tbl = install_direct_local_cam(model, L, draft, verbose=False)
+    # FUSED-DELTA SPARSE FFN (C4_FUSED_DELTA_FFN): with attention driven to ~ZERO
+    # by dead-block-fusion + direct-CAM/local, the composed step is FFN-bound (#869:
+    # the dense SwiGLU GEMM ``ampere_sgemm`` over the 99.9%-zero weights is ~67% of
+    # the 2.27 ms step, multiplying all the zeros — 0.167 GFLOP where the live nnz
+    # are 5.6K FLOP).  ``install_fused_delta_ffn`` swaps every non-routed block's
+    # dense SwiGLU for the #808/#841 fused-delta sparse-COO kernel (kernel-1 fuses
+    # up+gate+silu; kernel-2 adds W_down@hidden ONLY to the residual rows W_down
+    # writes, in place — touching only the ~1.3-nnz-per-unit weights).  It touches
+    # ONLY ``block.ffn`` (leaves the 4 live blocks' attention forwards installed
+    # above untouched), so it COMPOSES with dead-block-fusion + direct-CAM/local +
+    # bounded-KV.  Byte-exact at the nibble-snap margin (same nonzeros, fp-accum-
+    # order residue only — #808/#841 proved L-inf=0 at doom scale standalone).
+    # DEFAULT OFF -> the dense/COO golden path (069cc32f unchanged).
+    from .fused_sparse_ffn import (fused_delta_ffn_enabled,
+                                   install_fused_delta_ffn)
+    if fused_delta_ffn_enabled():
+        install_fused_delta_ffn(model, device=torch.device(device), verbose=False)
     store_log = draft.store_log
     n_steps = draft.step_count
     # SCHEDULE-DRIVEN eviction (C4_EVICT_SCHEDULE): precompute the deterministic
@@ -1029,6 +1057,16 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # direct-CAM (blocks past the cut don't read frozen-row KV).  Computed ONCE.
     frozen_skip = _frozen_skip_enabled()
     frozen_cut = _frozen_skip_cut(model) if frozen_skip else 0
+    # MEGAKERNEL (C4_GRAPH_MEGAKERNEL): CUDA-graph the post-cut dead-FFN segments of
+    # the frozen-skip query-row block loop (one graph launch per contiguous dead
+    # segment, live CAM blocks eager).  Requires dead-block-fusion (dead blocks are
+    # attention-identity) + frozen-skip (the region runs over K query rows) + CUDA.
+    # Byte-exact; default OFF -> the eager per-block loop.
+    _megastep = None
+    from .megastep_graph import megastep_graph_enabled, install_megastep_graph
+    if (frozen_skip and is_cuda and _dead_block_fusion_enabled()
+            and megastep_graph_enabled()):
+        _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
     # pageable HtoD dispatches the profiler pinned as the span wall).
@@ -1114,7 +1152,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 # blocks [0, cut) over all S rows; blocks [cut, N) over the K query
                 # rows only.  ~30x less FFN.  Byte-exact under direct-CAM.
                 hidden, new_kv = _forward_hidden_cached_frozen_skip(
-                    model, x, past, q_positions, q_local, frozen_cut)
+                    model, x, past, q_positions, q_local, frozen_cut,
+                    megastep=_megastep)
                 # cost accounting: cut blocks over S rows + (N-cut) over K query rows.
                 blocks_run = n_blocks
             else:
