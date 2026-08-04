@@ -94,7 +94,7 @@ def _guard():
 ALL_LEVERS = ["C4_DEAD_BLOCK_FUSION", "C4_DIRECT_CAM_BATCHED", "C4_DIRECT_LOCAL_CAM",
               "C4_FLASH_ATTN", "C4_BANDED_LOCAL_ATTN", "C4_FROZEN_ROW_SKIP",
               "C4_CUT_SPAN_CHUNK", "C4_FUSED_MEGABLOCK", "C4_FUSED_DELTA_FFN",
-              "C4_OVERLAY_BATCHED", "C4_STREAM_EMBED"]
+              "C4_OVERLAY_BATCHED", "C4_STREAM_EMBED", "C4_GRAPH_BLOCK0"]
 
 
 def _levers_on(cut_chunk):
@@ -107,6 +107,9 @@ def _levers_on(cut_chunk):
     os.environ["C4_FUSED_MEGABLOCK"] = "1"
     os.environ["C4_FUSED_DELTA_FFN"] = "1"
     os.environ["C4_CUT_SPAN_CHUNK"] = str(cut_chunk)
+    # BLOCK-0 GRAPH (lever 1): CUDA-graph block-0's S-chunked ingest attn+FFN per-chunk
+    # body — kills the ~640-707 us host dispatch over the chunk loop (the profiled wall).
+    os.environ["C4_GRAPH_BLOCK0"] = "1"
     # LAUNCH-COLLAPSE: batch the ~465K per-row overlay scalar HtoD copies into ONE
     # index_put_ (the profiled #1 wall, 28.6% of the composed step); stream-embed
     # builds each block-0 chunk's embed+overlay on demand (kills the last O(K*30)).

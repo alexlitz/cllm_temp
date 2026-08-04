@@ -298,7 +298,23 @@ def _install_direct_local_forward(model, block_idx: int,
             return res, (Knew, Vnew, q_pos)
         return res
 
+    def gather_ingest_out(self, x, q_positions):
+        """Fill + return the ingest-head gather ``out`` [1, H, S, HD] for the rows ``x``
+        [1, S, D] at absolute positions ``q_positions`` — the SAME direct-CAM scatter
+        the forward does, exposed so a CUDA-graph (block0_graph.Block0ChunkGraph) can
+        feed it as the graph's fixed-shape input (the graph does the W_o + FFN GEMMs).
+        Byte-identical to the gather inside ``direct_local_forward`` (same
+        ``_gather_out_chunk`` closure, same ``pos_map`` index math)."""
+        H, HD = self.n_heads, self.head_dim
+        B, S, _ = x.shape
+        dev = x.device
+        q_pos = q_positions.to(device=dev, dtype=torch.long)
+        out = x.new_zeros(B, H, S, HD)
+        _gather_out_chunk(out, q_pos, 0, dev)
+        return out
+
     attn.forward = direct_local_forward.__get__(attn, type(attn))
+    attn.gather_ingest_out = gather_ingest_out.__get__(attn, type(attn))
     attn._direct_local_installed = True
 
 

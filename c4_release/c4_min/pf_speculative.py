@@ -916,7 +916,7 @@ def _run_qstack(model, h, qp, cut, n, megastep=None):
 
 def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                        q_local_idx, cut, megastep=None,
-                                       stream_ctx=None):
+                                       stream_ctx=None, block0_graph=None):
     """Run blocks [0, cut) over ALL rows (commit KV), then blocks [cut, N) over ONLY
     the query rows (``q_local_idx`` — window-local indices).  Returns
     ``(hidden_full, new_caches)`` where ``hidden_full`` is [1, S, D] with the QUERY
@@ -969,10 +969,21 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                      stream_ctx["span_start"] + hi0,
                                      device=hq0.device)) if streaming else \
                   (q_positions[lo0:hi0] if q_positions is not None else None)
-            hc = xc
-            for b in range(cut):
-                hc, _ = model.blocks[b](hc, past_kv=None, q_positions=qpc,
-                                        use_cache=True)
+            # BLOCK-0 GRAPH: replay the fixed-shape ingest attn + FFN body as ONE launch
+            # (the ingest gather is computed here, outside the graph, into the graph's
+            # static input; the graph does the W_o + SwiGLU GEMMs).  Byte-exact to the
+            # eager block-0 forward (same gather, same GEMM chain).  Only wired for the
+            # cut==1 doom ingest block; falls back to the eager loop otherwise.
+            if block0_graph is not None and cut == 1:
+                b0attn = model.blocks[0].attn
+                outc = b0attn.gather_ingest_out(xc, qpc)          # [1, H, Sc, HD]
+                hc = block0_graph.run(xc, outc)                   # [1, Sc, D]
+                del outc
+            else:
+                hc = xc
+                for b in range(cut):
+                    hc, _ = model.blocks[b](hc, past_kv=None, q_positions=qpc,
+                                            use_cache=True)
             # scatter this chunk's QUERY rows into hq0.
             local_q = qpos_to_qi[lo0:hi0]
             m = local_q >= 0
@@ -1401,6 +1412,27 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
             and _mega_on and install_megastep_graph is not None):
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
+    # BLOCK-0 GRAPH (C4_GRAPH_BLOCK0): CUDA-graph block-0's S-chunked ingest attention +
+    # FFN per-chunk body into ONE fixed-shape replay per chunk.  Block 0 is the SOLE block
+    # over all S = K*30 span rows (the cut-span-chunk loop processes them in fixed-size
+    # chunks, launching block-0's whole forward per chunk on the host — the ~640-707 us
+    # host-dispatch wall).  Under direct-local-CAM block 0 is a per-row independent map, so
+    # its per-chunk body (gather -> W_o GEMM -> dense SwiGLU FFN) is fixed-shape and captures
+    # cleanly; one replay per chunk instead of ~13 launches.  Requires direct-local-CAM +
+    # cut-span-chunking (fixed chunk size) + CUDA.  Byte-exact; default OFF.
+    _block0_graph = None
+    try:
+        from .block0_graph import block0_graph_enabled, install_block0_graph
+        _b0g_on = block0_graph_enabled()
+    except ImportError:
+        install_block0_graph = None
+        _b0g_on = False
+    _cutc0 = _cut_span_chunk()
+    if (frozen_skip and is_cuda and _b0g_on and install_block0_graph is not None
+            and direct_local_cam_enabled() and _cutc0 > 0
+            and getattr(model.blocks[0].attn, "_direct_local_installed", False)):
+        _block0_graph = install_block0_graph(model, device, _cutc0, frozen_cut,
+                                             verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
     # pageable HtoD dispatches the profiler pinned as the span wall).
@@ -1529,7 +1561,8 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                         embed=model.embed, L=L)
                 hidden, new_kv = _forward_hidden_cached_frozen_skip(
                     model, x, past, q_positions, q_local, frozen_cut,
-                    megastep=_megastep, stream_ctx=stream_ctx)
+                    megastep=_megastep, stream_ctx=stream_ctx,
+                    block0_graph=_block0_graph)
                 # cost accounting: cut blocks over S rows + (N-cut) over K query rows.
                 blocks_run = n_blocks
             else:
