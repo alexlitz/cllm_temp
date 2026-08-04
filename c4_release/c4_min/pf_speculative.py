@@ -1207,6 +1207,30 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     GROWING-heap program (malloc) the cache tracks the live heap regardless of K, so
     K is genuinely cache-capped and the backoff finds the real ceiling.
     """
+    # PRECOMPUTED SCHEDULE + SINGLE DISPATCH (C4_PRECOMPUTED_SCHEDULE, default OFF).
+    # The whole K-batch verify as ONE precomputed schedule (compacted routing + all
+    # direct-CAM/direct-local gathers resolved up front + decode plan) + one graph-per-
+    # chunk dispatch — ZERO per-op Python in the loop (host syncs ~3600/forward -> O(1)).
+    # Byte-identical to this composed GPU-verify at every query row (same gathers, same
+    # GEMM chains, same requant decode+compare).  Requires CUDA + a DIV-free program
+    # (the divmod span is not carried); a DIV/MOD program falls through to the per-op
+    # path below.  Default OFF -> the per-op verify_blocks (golden 069cc32f unchanged).
+    import os as _osp
+    if (_osp.environ.get("C4_PRECOMPUTED_SCHEDULE", "0") not in ("0", "", "false", "False")
+            and device.startswith("cuda")):
+        _DM = {"DIV", "MOD"}
+        if not any(draft.frames[s].get("op") in _DM for s in range(draft.step_count)):
+            from .precomputed_schedule import run_verify as _ps_run
+            pr = _ps_run(model, L, code, draft, device, mask=mask,
+                         collect_out=collect_out, stats=stats)
+            if stats is not None:
+                stats.setdefault("forwards", 1)
+            return VerifyResult(
+                accepted_steps=pr.accepted_steps, total_steps=pr.total_steps,
+                all_matched=pr.all_matched, forwards=1,
+                first_mismatch=pr.first_mismatch,
+                max_seq_len=1 + draft.step_count * V.FRAME_LEN,
+                decoded_final_ax=pr.decoded_final_ax)
     n_blocks = len(model.blocks)
     H = model.blocks[0].attn.n_heads
     HD = model.blocks[0].attn.head_dim
