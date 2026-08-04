@@ -231,6 +231,82 @@ def _head_out_vec(kind: str, value, code_val, HD: int, device, dtype) -> torch.T
 #    the CAM head(s) DIRECT-GATHER the resolved V at query rows (no O(S) global
 #    score); every OTHER head runs the ordinary windowed attention.
 # ===========================================================================
+def _vec_cam_enabled() -> bool:
+    """C4_DIRECT_CAM_VEC (#871, DEFAULT OFF): precompute the CAM heads' resolved
+    output vectors as a dense ``[H_cam, n_query, HD]`` table + a ``pos_map`` gather,
+    replacing the per-row Python loop (``for ri, ap in enumerate(q_pos.tolist())`` +
+    per-row ``torch.zeros``/scalar-``float``/scatter) that #865 pinned as the
+    host-sync + tiny-op wall (``aten::fill_``/``copy_``/``_local_scalar_dense``
+    flood).  Byte-exact: the gathered vector is the SAME ``_head_out_vec`` per
+    position, just assembled once on the host and scattered in ONE vectorized op.
+    OFF (default) -> the per-row loop (the original path, golden 069cc32f
+    unchanged)."""
+    return os.environ.get("C4_DIRECT_CAM_VEC", "0") not in ("0", "", "false", "False")
+
+
+def _build_cam_out_table(cam_heads: List[Tuple[int, str]], tbl: ResolvedTable,
+                         HD: int) -> Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Precompute the CAM heads' resolved output vectors for the WHOLE program, once.
+
+    Returns ``(head_ids, pos, out_tab)`` where
+      * ``head_ids`` : LongTensor [n_cam]  the CAM head indices
+      * ``pos``      : LongTensor [n_read]  every absolute query-row position that
+                       ANY cam head reads at (union over kinds)
+      * ``out_tab``  : Float [n_cam, n_read, HD]  the head's ``_head_out_vec`` at that
+                       position (0 where that head does not read at that position)
+    A single ``pos_map`` gather (built in the forward) then scatters ``out_tab`` into
+    the query rows present in the span — NO per-row Python loop."""
+    import numpy as _np
+    head_ids = [h for (h, _k) in cam_heads]
+    kinds = [k for (_h, k) in cam_heads]
+    # union of positions any cam head resolves at.
+    pos_set = set()
+    for k in kinds:
+        if k == "code":
+            pos_set.update(tbl.code.keys())
+        else:
+            pos_set.update(tbl.by_kind(k).keys())
+    pos = sorted(pos_set)
+    if not pos:
+        return None
+    pos_index = {p: i for i, p in enumerate(pos)}
+    n_read = len(pos)
+    # VECTORIZED table build (no per-position torch.zeros / scalar-float — that inner
+    # loop was itself a ~39k-op aten::fill_ / _local_scalar_dense flood at install).
+    # Fill a flat numpy [n_cam, n_read, HD] buffer with vectorized nibble slices.
+    out_np = _np.zeros((len(head_ids), n_read, HD), dtype=_np.float32)
+    for ci, (h, k) in enumerate(zip(head_ids, kinds)):
+        if k == "code":
+            items = list(tbl.code.items())
+            if not items:
+                continue
+            rows = _np.fromiter((pos_index[p] for p, _cv in items), dtype=_np.int64,
+                                count=len(items))
+            ops = _np.fromiter((int(cv[0]) for _p, cv in items), dtype=_np.int64,
+                               count=len(items))
+            imms = _np.fromiter((int(cv[1]) & 0xFFFFFFFF for _p, cv in items),
+                                dtype=_np.int64, count=len(items))
+            v0 = CODE_ADDR_BITS + 4
+            out_np[ci, rows, v0] = ops.astype(_np.float32)
+            for j in range(IMM_NIBS):
+                out_np[ci, rows, v0 + 1 + j] = ((imms >> (4 * j)) & 0xF).astype(_np.float32)
+        else:
+            d = tbl.by_kind(k)
+            items = list(d.items())
+            if not items:
+                continue
+            rows = _np.fromiter((pos_index[p] for p, _v in items), dtype=_np.int64,
+                                count=len(items))
+            vals = _np.fromiter((int(v) & 0xFFFFFFFF for _p, v in items),
+                                dtype=_np.int64, count=len(items))
+            b0 = ADDR_BITS + 3
+            for j in range(NIB_PER_REG):
+                out_np[ci, rows, b0 + j] = ((vals >> (4 * j)) & 0xF).astype(_np.float32)
+    out_tab = torch.from_numpy(out_np)
+    return (torch.tensor(head_ids, dtype=torch.long),
+            torch.tensor(pos, dtype=torch.long), out_tab)
+
+
 def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, str]],
                             tbl: ResolvedTable):
     """Bind a direct-CAM forward onto ``model.blocks[block_idx].attn`` that gathers
@@ -240,6 +316,25 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
     from .local_attention import windowed_forward, live_value_heads
     cam_head_ids = {h for (h, _k) in cam_heads}
     cam_kind = {h: k for (h, k) in cam_heads}
+    # VECTORIZED CAM-output table (C4_DIRECT_CAM_VEC): precompute the resolved output
+    # per (cam head, position) ONCE + build a dense pos_map for O(1) gather-scatter.
+    # Restrict to cam heads that are GLOBAL on this block (the original per-row loop
+    # only wrote ``g_cam`` = cam_head_ids ∩ global heads; the CAM heads are global by
+    # construction, but keep the filter so the vec path is loop-equivalent regardless).
+    _vec = _vec_cam_enabled()
+    _gmask0 = getattr(attn, "_global_head_mask", None)
+    if _vec and _gmask0 is not None:
+        _cam_heads_g = [(h, k) for (h, k) in cam_heads if bool(_gmask0[h])]
+    else:
+        _cam_heads_g = cam_heads
+    _cam_tab = _build_cam_out_table(_cam_heads_g, tbl, attn.head_dim) if _vec else None
+    _cam_head_t = _cam_pos_map = _cam_out = None
+    if _cam_tab is not None:
+        _cam_head_t, _cam_pos, _cam_out = _cam_tab
+        _maxp = int(_cam_pos.max().item()) if _cam_pos.numel() else -1
+        _cam_pos_map = torch.full((_maxp + 2,), -1, dtype=torch.long)
+        if _cam_pos.numel():
+            _cam_pos_map[_cam_pos] = torch.arange(_cam_pos.numel(), dtype=torch.long)
     # LIVE-VALUE LOCAL heads (C4_DIRECT_CAM_LIVE_LOCAL, default ON when direct-CAM is):
     # the set of local heads whose W_v/W_o are non-zero.  A _zero_attn local head's
     # output is exactly 0, so we skip its banded score+gather (byte-exact).  OFF keeps
@@ -369,21 +464,40 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
         # A query row carries all-ROLE tags; the CAM heads' softmax winner V is the
         # resolved value's nibble vector.  Non-query rows (frozen context) keep out=0
         # for the CAM heads (their output is discarded; only K/V matters for them).
-        qpos_list = q_pos.tolist()
-        for h in g_cam:
-            kind = cam_kind[h]
-            d = None if kind == "code" else tbl.by_kind(kind)
-            for ri, ap in enumerate(qpos_list):
-                if kind == "code":
-                    cv = tbl.code.get(ap)
-                    if cv is None:
-                        continue            # not a fetch row (frozen ctx) -> sink 0
-                    vec = _head_out_vec("code", None, cv, HD, x.device, out.dtype)
-                else:
-                    if ap not in d:
-                        continue            # this head didn't read at this step -> 0
-                    vec = _head_out_vec(kind, d[ap], None, HD, x.device, out.dtype)
-                out[0, h, ri] = vec
+        if _cam_out is not None:
+            # VECTORIZED (C4_DIRECT_CAM_VEC): map each span row's abs position -> its
+            # precomputed-table row (-1 if not resolved), then scatter the whole
+            # [n_cam, nq, HD] output block in ONE op — NO per-row Python loop, NO
+            # per-row torch.zeros / scalar-float / host-sync.  Byte-identical: the
+            # gathered vector IS _head_out_vec at that position.
+            pm = _cam_pos_map.to(x.device)
+            clamped = q_pos.clamp(max=pm.numel() - 1)
+            row_idx = pm[clamped]                              # [S], -1 non-resolved
+            qmask = row_idx >= 0
+            if bool(qmask.any()):
+                sel = row_idx[qmask]                           # [nq] table-row indices
+                span_q = qmask.nonzero(as_tuple=False).flatten()  # [nq] span rows
+                heads = _cam_head_t.to(x.device)               # [n_cam]
+                vecs = _cam_out.to(device=x.device, dtype=out.dtype)  # [n_cam, nr, HD]
+                gathered = vecs.index_select(1, sel)           # [n_cam, nq, HD]
+                # out[0, heads, span_q, :] = gathered  (advanced index, one write).
+                out[0, heads.unsqueeze(1), span_q.unsqueeze(0), :] = gathered
+        else:
+            qpos_list = q_pos.tolist()
+            for h in g_cam:
+                kind = cam_kind[h]
+                d = None if kind == "code" else tbl.by_kind(kind)
+                for ri, ap in enumerate(qpos_list):
+                    if kind == "code":
+                        cv = tbl.code.get(ap)
+                        if cv is None:
+                            continue        # not a fetch row (frozen ctx) -> sink 0
+                        vec = _head_out_vec("code", None, cv, HD, x.device, out.dtype)
+                    else:
+                        if ap not in d:
+                            continue        # this head didn't read at this step -> 0
+                        vec = _head_out_vec(kind, d[ap], None, HD, x.device, out.dtype)
+                    out[0, h, ri] = vec
 
         out2 = out.transpose(1, 2).contiguous().view(B, S, D)
         res = x + self.W_o.linear(out2)
