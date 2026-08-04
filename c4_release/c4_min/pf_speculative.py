@@ -928,6 +928,23 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                                     install_direct_local_cam)
     if direct_local_cam_enabled():
         _dlocal_tbl = install_direct_local_cam(model, L, draft, verbose=False)
+    # FUSED-DELTA SPARSE FFN (C4_FUSED_DELTA_FFN): with attention driven to ~ZERO
+    # by dead-block-fusion + direct-CAM/local, the composed step is FFN-bound (#869:
+    # the dense SwiGLU GEMM ``ampere_sgemm`` over the 99.9%-zero weights is ~67% of
+    # the 2.27 ms step, multiplying all the zeros — 0.167 GFLOP where the live nnz
+    # are 5.6K FLOP).  ``install_fused_delta_ffn`` swaps every non-routed block's
+    # dense SwiGLU for the #808/#841 fused-delta sparse-COO kernel (kernel-1 fuses
+    # up+gate+silu; kernel-2 adds W_down@hidden ONLY to the residual rows W_down
+    # writes, in place — touching only the ~1.3-nnz-per-unit weights).  It touches
+    # ONLY ``block.ffn`` (leaves the 4 live blocks' attention forwards installed
+    # above untouched), so it COMPOSES with dead-block-fusion + direct-CAM/local +
+    # bounded-KV.  Byte-exact at the nibble-snap margin (same nonzeros, fp-accum-
+    # order residue only — #808/#841 proved L-inf=0 at doom scale standalone).
+    # DEFAULT OFF -> the dense/COO golden path (069cc32f unchanged).
+    from .fused_sparse_ffn import (fused_delta_ffn_enabled,
+                                   install_fused_delta_ffn)
+    if fused_delta_ffn_enabled():
+        install_fused_delta_ffn(model, device=torch.device(device), verbose=False)
     store_log = draft.store_log
     n_steps = draft.step_count
     # SCHEDULE-DRIVEN eviction (C4_EVICT_SCHEDULE): precompute the deterministic
