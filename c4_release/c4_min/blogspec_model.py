@@ -57,6 +57,7 @@ use to embed the VM into a real Qwen2 (see ``qwen_embed``).
 from __future__ import annotations
 
 import math
+import os as _os_env
 
 import torch
 import torch.nn as nn
@@ -262,6 +263,41 @@ class Attn(nn.Module):
             k_pos = torch.cat([pos_cache.to(x.device), q_pos], dim=0)
         else:
             K, V, k_pos = Knew, Vnew, q_pos
+
+        # BYTE-EXACT FLASH ATTENTION (C4_FLASH_ATTN, default OFF).  The default
+        # un-cached forward below materialises the FULL [B,H,S,S] score matrix and
+        # softmax1's it in one shot — O(S^2) memory.  For the CFM pure-forward path
+        # (run_pure_forward_complete: ONE growing token stream re-run per VM step)
+        # that quadratic matrix is the wall on the long control/loop/function cases
+        # (S grows to tens of thousands of tokens -> OOM / minutes-per-step, on GPU
+        # AND CPU).  softmax1 == plain-softmax over a BOS-sink column (§40-44/§491),
+        # so a standard tiled flash kernel (never materialising [Sq,Sk]) + the sink
+        # recovers it EXACTLY.  On CUDA: the SDPA mem-efficient + LSE-rescale kernel
+        # (un-cached full case) or the Triton online-softmax1 kernel (cached / windowed
+        # case).  On CPU: the chunked online-softmax1 reference (processes K in 1024-key
+        # chunks -> O(S) memory, never the [Sq,Sk] matrix), which is what the #839 CFM
+        # battery runs on.  Both fp32, ~1e-6 (below the nibble decode margin).  Gated on
+        # the baked VM config (ALiBi + softmax1); no stored weight is touched -> golden
+        # 069cc32f byte-identical (flag OFF).
+        if (self.positional == "alibi" and self.sink == "softmax1" and B == 1
+                and _os_env.environ.get("C4_FLASH_ATTN", "0") == "1"):
+            from .flash_softmax1 import flash_softmax1_context, _chunked_reference
+            uncached_full = (past_kv is None and q_positions is None)
+            slopes = self.alibi_slopes.to(x.device)
+            if x.is_cuda:
+                ctx = flash_softmax1_context(
+                    Q, K, V, q_pos, k_pos, slopes, self.scale,
+                    window=None, uncached_full=uncached_full)
+            else:
+                # CPU: the SDPA/Triton kernels are CUDA-only; the chunked online-softmax1
+                # reference is the O(S)-memory byte-exact path for both the un-cached full
+                # and the cached/windowed cases (positions handled via q_pos/k_pos).
+                ctx = _chunked_reference(Q, K, V, q_pos, k_pos, slopes, self.scale, None)
+            out = ctx.transpose(1, 2).contiguous().view(B, S, D)
+            out = x + F.linear(out, self.W_o)
+            if use_cache:
+                return out, (K, V, k_pos)
+            return out
 
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
 

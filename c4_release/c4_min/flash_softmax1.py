@@ -65,32 +65,44 @@ except Exception:                                   # pragma: no cover
 # ===========================================================================
 # SDPA backend (un-cached full case): ALiBi-fold + mem-efficient flash + LSE.
 # ===========================================================================
+def _align8(n):
+    """Next multiple of 8 >= n.  The mem-efficient SDPA kernel requires the last
+    (head) dim of Q/K/V to be 8-byte-stride aligned (a multiple of 8 for fp32);
+    an arbitrary VM head_dim (e.g. 90) or the ALiBi-folded HD+4 (94) is not, so we
+    zero-pad up to the next multiple of 8.  Zero padding lanes contribute 0 to the
+    Q·K dot and 0 to the context, so the result over the real dims is unchanged."""
+    return (n + 7) & ~7
+
+
 def _fold_alibi_qk(Q, K, q_pos, k_pos, slopes, scale):
-    """Return ``(Qx, Kx)`` with ALiBi ``-slope·(q_pos-k_pos)`` folded into 4 extra
-    head dims (2 carry ALiBi, 2 are zero padding so ``HD+4`` stays a multiple of 4,
-    which the mem-efficient kernel requires).
+    """Return ``(Qx, Kx)`` with ALiBi ``-slope·(q_pos-k_pos)`` folded into 2 extra
+    head dims, then zero-padded so the last dim is a multiple of 8 (the mem-efficient
+    kernel's alignment requirement — an arbitrary VM head_dim like 90 is not aligned).
 
     ``(Qx·Kx)·scale`` = ``(Q·K)·scale - slope·(q_pos - k_pos)`` on the causal region
     (where ``q_pos >= k_pos`` so ``|q-k| = q-k``).  We need the extra dot to equal
     ``-slope·(q-k)/scale`` so that after SDPA multiplies by ``scale`` it is exactly
     the ALiBi term:  ``extra = (-slope/scale)·q_pos + (slope/scale)·k_pos``.  Split as
-    ``Q_extra = [(-c)·q_pos, 1, 0, 0]``, ``K_extra = [1, c·k_pos, 0, 0]`` with
-    ``c = slope/scale`` per head.
+    ``Q_extra = [(-c)·q_pos, 1]``, ``K_extra = [1, c·k_pos]`` with ``c = slope/scale``
+    per head; the trailing zero pad (to the mult-of-8) contributes 0 to the dot.
     """
     B, H, Sq, HD = Q.shape
     Sk = K.shape[2]
     dev, dt = Q.device, Q.dtype
+    HD_A = _align8(HD + 2)                              # aligned padded head dim
+    npad = HD_A - HD - 2                                # trailing zero-pad lanes
     c = (slopes / scale).to(dt).view(1, H, 1)                       # [1,H,1]
     ones_q = torch.ones(1, H, Sq, device=dev, dtype=dt)
-    zeros_q = torch.zeros(1, H, Sq, device=dev, dtype=dt)
     ones_k = torch.ones(1, H, Sk, device=dev, dtype=dt)
-    zeros_k = torch.zeros(1, H, Sk, device=dev, dtype=dt)
     qpf = q_pos.view(1, 1, Sq).to(dt)
     kpf = k_pos.view(1, 1, Sk).to(dt)
-    qe = torch.stack([(-c) * qpf, ones_q, zeros_q, zeros_q], dim=-1)   # [1,H,Sq,4]
-    ke = torch.stack([ones_k, c * kpf, zeros_k, zeros_k], dim=-1)      # [1,H,Sk,4]
-    qe = qe.expand(B, H, Sq, 4)
-    ke = ke.expand(B, H, Sk, 4)
+    qe_cols = [(-c) * qpf, ones_q]                     # [1,H,Sq] each
+    ke_cols = [ones_k, c * kpf]
+    for _ in range(npad):
+        qe_cols.append(torch.zeros(1, H, Sq, device=dev, dtype=dt))
+        ke_cols.append(torch.zeros(1, H, Sk, device=dev, dtype=dt))
+    qe = torch.stack(qe_cols, dim=-1).expand(B, H, Sq, 2 + npad)    # [B,H,Sq,pad]
+    ke = torch.stack(ke_cols, dim=-1).expand(B, H, Sk, 2 + npad)
     Qx = torch.cat([Q, qe], dim=-1).contiguous()
     Kx = torch.cat([K, ke], dim=-1).contiguous()
     return Qx, Kx
@@ -105,14 +117,25 @@ def sdpa_flash_softmax1(Q, K, V, q_pos, k_pos, slopes, scale):
     reference causal.  ALiBi is folded into the Q/K dims; the softmax1 ``+1`` sink
     is recovered by ``·sigmoid(LSE)`` (LSE returned by the mem-efficient kernel).
 
-    Returns the context ``[B, H, Sq, HD]``.
+    Returns the context ``[B, H, Sq, HD]`` (over the REAL head dims only — the V
+    alignment pad is sliced off).
     """
     B, H, Sq, HD = Q.shape
     Qx, Kx = _fold_alibi_qk(Q, K, q_pos, k_pos, slopes, scale)
-    Vc = V.contiguous()
+    # V must also be 8-aligned in the last dim (kernel requirement); zero-pad it and
+    # slice the pad off the output.  The pad lanes get context 0 (dropped).
+    HDV = V.shape[-1]
+    HDV_A = _align8(HDV)
+    if HDV_A != HDV:
+        Vc = torch.cat(
+            [V, torch.zeros(B, H, V.shape[2], HDV_A - HDV,
+                            device=V.device, dtype=V.dtype)], dim=-1).contiguous()
+    else:
+        Vc = V.contiguous()
     # aten mem-efficient attention -> (out, logsumexp, philox_seed, philox_offset).
     out, lse, _, _ = torch.ops.aten._scaled_dot_product_efficient_attention(
         Qx, Kx, Vc, None, True, is_causal=True, scale=scale)
+    out = out[..., :HDV]                               # drop the V alignment pad
     lse = lse[..., :Sq]                                # kernel pads LSE to mult-of-32
     return out * torch.sigmoid(lse).unsqueeze(-1)
 
