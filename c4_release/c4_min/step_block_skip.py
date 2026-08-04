@@ -209,14 +209,25 @@ def build_live_index(model, L) -> Dict[Optional[int], List[int]]:
     # no-op on a non-pop step.
     kv_chain = idxs(_KV_STACK_CHAIN) if kv_stack_enabled() else set()
 
+    # WIDE-INGEST (C4_INGEST_WIDE): the 1-query/1-KV wide ingest restructures block 0's
+    # frame ingest into three PREPENDED blocks (``wide-preroute`` computes the per-role
+    # role⊙nibble product, ``wide-gather`` is the single wide-value head that does the
+    # scaled-concat gather, ``wide-snap`` rescales+re-quantises).  They run BEFORE
+    # ``ingest+recompose`` and are part of EVERY step's frame ingest, so the per-op
+    # block-skip schedule (authored for the stock 20-head ``ingest+recompose`` block)
+    # MUST include them or the ingest is skipped and every op decodes garbage.  Injected
+    # into every op's live set (and the None/full fallback already covers them).  Absent
+    # in a stock build -> ``idxs`` returns {} -> byte-identical to the golden schedule.
+    wide_ingest = idxs(["wide-preroute", "wide-gather", "wide-snap"])
+
     out: Dict[Optional[int], List[int]] = {None: list(range(nb))}
     for op, nms in _LIVE_NAMES.items():
-        base = idxs(nms)
+        base = idxs(nms) | wide_ingest
         if op in _POP_CONSUMER_OPS:
             base = base | kv_chain
         out[op] = sorted(base)
     for op in _SPAN_OPS:
-        base = idxs(_SPAN_COMMON) | div_span
+        base = idxs(_SPAN_COMMON) | div_span | wide_ingest
         if op in _POP_CONSUMER_OPS:
             base = base | kv_chain
         out[op] = sorted(base)
