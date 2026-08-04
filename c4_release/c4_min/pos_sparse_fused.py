@@ -18,7 +18,9 @@ the full-238 dense-over-positions reference by ``bench_pos_sparse_composed``:
     Q stays a 1-row GEMM (Q is 1 row, K/V are S rows — different M).  ~8 -> ~5
     kernels/block.  Byte-exact: a concatenated linear is the same per-row dot
     products, just co-scheduled.  The FFN runs in fp64 on the single query row (the
-    ``lea-addr-nib`` fp-fragile-decode fix, see ``pos_sparse_forward``).
+    ``lea-addr-nib`` fp-fragile-decode fix, see ``pos_sparse_forward``) — OR, under
+    ``C4_LEA_INT_SNAP``, the fragile block uses an EXACT-INTEGER nibble decode and
+    every other block runs fp32, so ZERO fp64 remains (byte-exact; #870).
 
   LEVEL 2 — WHOLE-STEP CUDA GRAPH (``PosSparseStepGraph``).  Capture the ENTIRE
     per-op live-block schedule (all FusedBlocks) into ONE CUDA graph per op-class
@@ -59,16 +61,34 @@ class FusedBlock:
     Precomputes:
       * ``W_kv`` = ``cat([W_k, W_v], 0)`` — one [2D, D] S-row GEMM (was two).
       * ``W_gu`` = ``cat([W_gate, W_up], 0)`` — one [2H, D] 1-row GEMM (was two),
-        stored in fp64 (the query-row FFN runs fp64 for the fragile decode fix).
-    Attention Q / scores / softmax / W_o stay 1-row (fp32).  FFN W_down is 1-row fp64.
+        in BOTH fp64 (the default fragile-decode fix) and fp32 (used when
+        ``C4_LEA_INT_SNAP`` is on).
+    Attention Q / scores / softmax / W_o stay 1-row (fp32).
+
+    FFN dtype:
+      * default (``C4_LEA_INT_SNAP`` off): the query-row SwiGLU runs fp64 (the
+        ``lea-addr-nib`` fragile-decode fix — see ``pos_sparse_forward``).
+      * ``C4_LEA_INT_SNAP`` on (``_int_snap_mode``): the fragile ``lea-addr-nib``
+        block is computed with the EXACT-INTEGER nibble split of ``LEA_Q & 0xFF``
+        (``apply_int_lea_addr_nib``) and every OTHER block runs fp32 — ZERO fp64,
+        byte-exact to the fp64 path.
     A routed (Top-1 MoE) FFN is NOT fused (its dispatch picks <=K dense rows); it
     keeps its own forward.
     """
 
-    def __init__(self, blk):
+    def __init__(self, blk, lea_snap_dims=None):
         self.attn = blk.attn
         self.ffn = blk.ffn
         self.routed = blk._routed
+        # INTEGER LEA-address snap (C4_LEA_INT_SNAP, #870): a tuple of residual-dim
+        # indices set by the runner for the ``lea-addr-nib`` block; when armed the
+        # query-row FFN is the exact-integer nibble split of ``LEA_Q & 0xFF`` (no
+        # fp64, no ~768-step silu decode).  None -> the fp64 SwiGLU.
+        self._lea_snap_dims = lea_snap_dims
+        # when the int-snap is armed on ANY block, the whole runner is in int-snap
+        # mode -> the fragile block uses the int path, every other block runs fp32
+        # (no fp64 anywhere).  Set by the runner build loop.
+        self._int_snap_mode = False
         A = blk.attn
         self.H, self.HD, self.D = A.n_heads, A.head_dim, A.dim
         self.scale = A.scale
@@ -77,13 +97,22 @@ class FusedBlock:
         self.W_kv = torch.cat([Wk, Wv], dim=0).contiguous()          # [2D, D]
         self.W_q = _resident(A.W_q)
         self.W_o = _resident(A.W_o)
+        self.W_gu32 = None
         if not self.routed:
             F_ = blk.ffn
             Wg, Wu = _resident(F_.W_gate), _resident(F_.W_up)
-            self.W_gu64 = torch.cat([Wg, Wu], dim=0).double().contiguous()   # [2H, D]
-            self.b_gu64 = torch.cat([F_.b_gate, F_.b_up], dim=0).double().contiguous()
-            self.W_down64 = _resident(F_.W_down).double().contiguous()
+            gu = torch.cat([Wg, Wu], dim=0).contiguous()                     # [2H, D]
+            b_gu = torch.cat([F_.b_gate, F_.b_up], dim=0).contiguous()
+            Wd = _resident(F_.W_down).contiguous()
+            self.W_gu64 = gu.double().contiguous()
+            self.b_gu64 = b_gu.double().contiguous()
+            self.W_down64 = Wd.double().contiguous()
             self.b_down64 = F_.b_down.double().contiguous()
+            # fp32 fused weights (for the non-fragile blocks when C4_LEA_INT_SNAP is on).
+            self.W_gu32 = gu
+            self.b_gu32 = b_gu
+            self.W_down32 = Wd
+            self.b_down32 = F_.b_down
             self.Hdim = F_.b_up.shape[0]
 
     def to(self, device):
@@ -96,6 +125,10 @@ class FusedBlock:
             self.b_gu64 = self.b_gu64.to(device)
             self.W_down64 = self.W_down64.to(device)
             self.b_down64 = self.b_down64.to(device)
+            self.W_gu32 = self.W_gu32.to(device)
+            self.b_gu32 = self.b_gu32.to(device)
+            self.W_down32 = self.W_down32.to(device)
+            self.b_down32 = self.b_down32.to(device)
         return self
 
     def forward(self, x: torch.Tensor, q_idx: int,
@@ -120,9 +153,21 @@ class FusedBlock:
         aout = xq + F.linear(ctx, self.W_o)                          # [B,1,D]
         out = x.clone()
         out[:, q_idx:q_idx + 1] = aout
-        # -- FFN (fp64 single row) -----------------------------------------
+        # -- FFN (query row) -----------------------------------------------
         if self.routed:
             fq = self.ffn(aout)
+        elif self._int_snap_mode:
+            # C4_LEA_INT_SNAP: the fragile ``lea-addr-nib`` block uses the exact
+            # INTEGER nibble split (no fp64); every other block runs fp32.
+            if self._lea_snap_dims is not None:
+                from .pos_sparse_forward import apply_int_lea_addr_nib
+                fq = apply_int_lea_addr_nib(aout, self._lea_snap_dims)
+            else:
+                gu = F.linear(aout, self.W_gu32) + self.b_gu32      # [B,1,2H]
+                gate = gu[..., :self.Hdim]
+                up = gu[..., self.Hdim:]
+                hidden = F.silu(up) * gate
+                fq = aout + F.linear(hidden, self.W_down32) + self.b_down32
         else:
             xq64 = aout.double()
             gu = F.linear(xq64, self.W_gu64) + self.b_gu64          # [B,1,2H]
@@ -143,7 +188,22 @@ class FusedPosSparseRunner:
         self.live_index = build_live_index(model, L)
         self.n_blocks = len(model.blocks)
         dev = model.embed.device
-        self.fused = [FusedBlock(b).to(dev) for b in model.blocks]
+        # INTEGER LEA-address snap (C4_LEA_INT_SNAP, #870): under the flag the fragile
+        # ``lea-addr-nib`` block is computed in exact integer arithmetic and every
+        # other block runs fp32 -> ZERO fp64.  Default OFF -> the fp64 path.
+        from .pos_sparse_forward import (lea_int_snap_enabled, resolve_lea_snap_dims,
+                                         LEA_ADDR_NIB_BLOCK_NAME)
+        int_snap = lea_int_snap_enabled()
+        dims = resolve_lea_snap_dims(L) if int_snap else None
+        names = list(getattr(L, "_block_names", []))
+        self.fused = []
+        for bi, b in enumerate(model.blocks):
+            snap = dims if (dims is not None and bi < len(names)
+                            and names[bi] == LEA_ADDR_NIB_BLOCK_NAME
+                            and not b._routed) else None
+            fb = FusedBlock(b, lea_snap_dims=snap).to(dev)
+            fb._int_snap_mode = int_snap and dims is not None
+            self.fused.append(fb)
 
     def live_count(self, op) -> int:
         return len(self.live_index.get(op, self.live_index[None]))

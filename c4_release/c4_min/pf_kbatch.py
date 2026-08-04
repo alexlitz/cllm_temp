@@ -339,10 +339,37 @@ class KBatchBoundedRunner:
         if selective_fp64:
             self.fp64_idxs = default_fp64_block_idxs(L, self.n_blocks)
             self.set_fp64_blocks(self.fp64_idxs)
+        # INTEGER LEA-address snap (C4_LEA_INT_SNAP, #870): when the flag is on, the
+        # ONLY fp64 block (``lea-addr-nib``) is computed EXACTLY in integer arithmetic
+        # instead of fp64 -> ZERO fp64 in the forward.  Arms the int path on that
+        # block (and drops its fp64_ffn).  Byte-exact; default OFF -> unchanged.
+        self._arm_lea_int_snap()
         # MEGAKERNEL graph cache: (live-schedule tuple, K) -> GraphedFFNChain over the
         # tail passthrough-FFN segment (built lazily on first use of that shape).
         self._ffn_graphs: Dict[Tuple, object] = {}
         self._graph_disabled: set = set()
+
+    def _arm_lea_int_snap(self) -> int:
+        """Arm the integer LEA-address snap on the ``lea-addr-nib`` block(s) when
+        ``C4_LEA_INT_SNAP`` is set.  Returns the number of blocks armed."""
+        from .pos_sparse_forward import (lea_int_snap_enabled, resolve_lea_snap_dims,
+                                         LEA_ADDR_NIB_BLOCK_NAME)
+        for kb in self.kblocks:
+            kb.b._lea_snap_dims = None
+        if not lea_int_snap_enabled():
+            return 0
+        dims = resolve_lea_snap_dims(self.L)
+        if dims is None:
+            return 0
+        names = list(getattr(self.L, "_block_names", []))
+        n = 0
+        for bi, kb in enumerate(self.kblocks):
+            if bi < len(names) and names[bi] == LEA_ADDR_NIB_BLOCK_NAME \
+                    and not kb.b.routed:
+                kb.b._lea_snap_dims = dims
+                kb.b.fp64_ffn = False        # exact integer path -> no fp64 needed
+                n += 1
+        return n
 
     def set_fp64_blocks(self, block_idxs) -> None:
         """SELECTIVE fp64 (#748): run the query-row FFN in fp64 ONLY on
@@ -350,6 +377,10 @@ class KBatchBoundedRunner:
         (the a39ae2c all-fp64 baseline).  Byte-exactness must be re-verified."""
         keep = None if block_idxs is None else set(int(b) for b in block_idxs)
         for bi, kb in enumerate(self.kblocks):
+            # a block armed with the integer LEA snap NEVER runs fp64 (it is exact).
+            if getattr(kb.b, "_lea_snap_dims", None) is not None:
+                kb.b.fp64_ffn = False
+                continue
             kb.b.fp64_ffn = True if keep is None else (bi in keep)
 
     def arm_direct_cam(self, tbl) -> int:
