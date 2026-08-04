@@ -764,6 +764,20 @@ def _dead_block_fusion_enabled() -> bool:
     return _os.environ.get("C4_DEAD_BLOCK_FUSION", "0") not in ("0", "", "false", "False")
 
 
+def _evict_timed_enabled() -> bool:
+    """``C4_EVICT_TIMED`` (DEFAULT OFF): drain (``torch.cuda.synchronize``) around each
+    eviction round so ``stats['evict_secs']`` is a clean wall breakdown.  This costs 2
+    host syncs PER eviction round — the last eviction host-sync cost once the scheduled
+    drop itself is GPU-vectorized (``evict_all_blocks_scheduled`` batched-nonzero).  OFF
+    (default) -> the eviction kernels are enqueued on the stream with NO explicit drain
+    (they still order correctly before the next forward's kernels — same stream), so
+    eviction adds ~ZERO host syncs per FORWARD.  ON -> the timed path (``evict_secs``
+    populated, at 2 syncs/round).  Byte-identical either way (a synchronize changes
+    only WHEN the host waits, never the compute)."""
+    import os as _os
+    return _os.environ.get("C4_EVICT_TIMED", "0") not in ("0", "", "false", "False")
+
+
 def _frozen_skip_enabled() -> bool:
     """``C4_FROZEN_ROW_SKIP`` (DEFAULT OFF): after the last block that reads a
     frozen (non-query) row's KV via a live LOCAL head (the frame-ingest block 0),
@@ -878,6 +892,28 @@ def _stream_embed_chunk(ctx, lo0, hi0):
     return xc
 
 
+def _run_qstack(model, h, qp, cut, n, megastep=None):
+    """Forward the K query rows ``h [1,K,D]`` through the frozen-skip block region
+    ``[cut, n)`` — the dead-FFN + live-CAM chain — and return ``[1,K,D]``.
+
+    ``megastep`` (C4_FUSED_MEGABLOCK / C4_GRAPH_MEGAKERNEL): a ``MegaBlockRegion`` /
+    ``MegaStepGraph`` whose ``run(h, qp)`` runs the dead-FFN segments as ONE on-chip
+    fused/graphed launch (residual L2-resident) + the live CAM blocks eagerly —
+    byte-exact to the per-block loop (dead-block fusion makes attention the identity
+    on every dead block, so ``past_kv=None`` is correct; the mega-chain is the same
+    nonzeros in the same order).  ``None`` -> the eager per-block loop.
+
+    This is THE megablock wiring for the O(K) cut-span-chunk (giant-K) path: every
+    per-query-row-chunk block stack now routes through the megakernel (previously
+    ONLY the whole-span path did), so the megablock FIRES at giant K where the O(K)
+    band is essential.  Byte-exact; default OFF (megastep is None) -> unchanged."""
+    if megastep is not None:
+        return megastep.run(h, qp)
+    for b in range(cut, n):
+        h, _ = model.blocks[b](h, past_kv=None, q_positions=qp, use_cache=True)
+    return h
+
+
 def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                        q_local_idx, cut, megastep=None,
                                        stream_ctx=None):
@@ -970,16 +1006,12 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                     hi = min(lo + qchunk, nq)
                     hqc = hq0[:, lo:hi, :]
                     qpc = qp_q[lo:hi] if qp_q is not None else None
-                    for b in range(cut, n):
-                        hqc, _ = model.blocks[b](hqc, past_kv=None, q_positions=qpc,
-                                                 use_cache=True)
+                    hqc = _run_qstack(model, hqc, qpc, cut, n, megastep)
                     hq0[:, lo:hi, :] = hqc          # in-place into the [1,K,D] buffer
                     del hqc
                 hq = hq0
             else:
-                for b in range(cut, n):
-                    hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q,
-                                            use_cache=True)
+                hq = _run_qstack(model, hq, qp_q, cut, n, megastep)
             # tag the result so the caller's decode indexes by query order (s - step).
             hq._c4_query_ordered = True    # note: attr may not persist through ops; the
             return hq, new_caches           # caller keys on ``streaming`` instead (below).
@@ -989,17 +1021,13 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                 hi = min(lo + qchunk, nq)
                 hqc = hq0[:, lo:hi, :]
                 qpc = qp_q[lo:hi] if qp_q is not None else None
-                for b in range(cut, n):
-                    hqc, _ = model.blocks[b](hqc, past_kv=None, q_positions=qpc,
-                                             use_cache=True)
+                hqc = _run_qstack(model, hqc, qpc, cut, n, megastep)
                 # scatter this query-row chunk's final state back in place.
                 out[:, qi[lo:hi], :] = hqc
                 del hqc
             return out, new_caches
         # whole-K query-row stack (qchunk off).
-        hq = hq0
-        for b in range(cut, n):
-            hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q, use_cache=True)
+        hq = _run_qstack(model, hq0, qp_q, cut, n, megastep)
         # scatter the query rows' final state back IN PLACE into the output buffer (avoids
         # a second [1,S,D] clone — the frozen rows are NEVER read by the decode; only the
         # query rows are, and we overwrite exactly those).  new_caches[0] = None (dead KV)
@@ -1015,13 +1043,10 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
         new_caches[b] = kv
     # gather query rows + their absolute positions, forward ONLY them through [cut, N).
     hq = hidden[:, qi, :]                                    # [1, K, D]
-    if megastep is not None:
-        # MEGAKERNEL: replay the dead-FFN-segment CUDA graphs (one launch/segment)
-        # + run the live CAM blocks eagerly — byte-exact to the per-block loop.
-        hq = megastep.run(hq, qp_q)
-    else:
-        for b in range(cut, n):
-            hq, _ = model.blocks[b](hq, past_kv=None, q_positions=qp_q, use_cache=True)
+    # MEGAKERNEL: replay the dead-FFN-segment CUDA graphs (one launch/segment) + run
+    # the live CAM blocks eagerly — byte-exact to the per-block loop (megastep None ->
+    # the eager loop).
+    hq = _run_qstack(model, hq, qp_q, cut, n, megastep)
     # scatter the query rows' final state back into a full [1, S, D] so the caller's
     # decode loop (indexing by span-local query position) is unchanged.
     hidden = hidden.clone()
@@ -1195,9 +1220,26 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # bounded-KV.  Byte-exact at the nibble-snap margin (same nonzeros, fp-accum-
     # order residue only — #808/#841 proved L-inf=0 at doom scale standalone).
     # DEFAULT OFF -> the dense/COO golden path (069cc32f unchanged).
+    #
+    # PRECEDENCE vs the FUSED MEGABLOCK (C4_FUSED_MEGABLOCK).  The megablock is the
+    # STRONGER on-chip drop-in for the SAME dead-FFN [cut, N) region: it builds its own
+    # ``_MegaFFN`` from each block's ORIGINAL ``W_up/W_gate/W_down`` and runs the whole
+    # chain in-place, L2-resident.  ``install_fused_delta_ffn`` REPLACES ``block.ffn``
+    # with a ``FusedUpGateSiluDeltaFFN`` (no ``W_up`` attribute), which the megablock
+    # then can't read.  So when the megablock WILL fire (frozen-skip + dead-block-fusion
+    # + CUDA + flag on) it OWNS the dead-FFN region and we SKIP fused-delta entirely (it
+    # would only accelerate the same blocks the megablock already fuses more tightly, and
+    # would break the megablock's original-weight read).  Both are byte-exact dead-FFN
+    # accelerators; the megablock subsumes fused-delta on the query-row path.
+    try:
+        from .fused_megablock import fused_megablock_enabled as _fme
+    except ImportError:
+        _fme = lambda: False
+    _mega_will_fire = (_fme() and _frozen_skip_enabled()
+                       and device.startswith("cuda") and _dead_block_fusion_enabled())
     from .fused_sparse_ffn import (fused_delta_ffn_enabled,
                                    install_fused_delta_ffn)
-    if fused_delta_ffn_enabled():
+    if fused_delta_ffn_enabled() and not _mega_will_fire:
         install_fused_delta_ffn(model, device=torch.device(device), verbose=False)
     store_log = draft.store_log
     n_steps = draft.step_count
@@ -1343,8 +1385,19 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         _mega_on = False
     if (frozen_skip and is_cuda and _dead_block_fusion_enabled()
             and _fused_mega_on and install_fused_megablock is not None):
-        _megastep = install_fused_megablock(model, device, frozen_cut, L=L,
-                                            verbose=False)
+        # CARRY SET.  Default = the FULL [cut, N) region (byte-identical superset: every
+        # dead block is fused, so the mega-chain reproduces the eager loop exactly, incl.
+        # the recurrent-divmod-tied blocks, which are NOT identity on the residual and so
+        # must NOT be dropped).  ``C4_MEGABLOCK_DOOM_LEAN=1`` opts into the DIV-free lean
+        # carry (drops the 179-block divmod span) — VALID ONLY on a build where the divmod
+        # blocks are provably identity on a DIV-free step (they are NOT on the recurrent-
+        # divmod build: measured Linf 116 >> the nibble decode margin -> garbage).  So the
+        # lean carry is OFF by default; the full carry is byte-exact (Linf ~0.09).
+        import os as _os
+        _lean = _os.environ.get("C4_MEGABLOCK_DOOM_LEAN", "0") not in (
+            "0", "", "false", "False")
+        _megastep = install_fused_megablock(model, device, frozen_cut,
+                                            L=(L if _lean else None), verbose=False)
     elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
             and _mega_on and install_megastep_graph is not None):
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
@@ -1352,6 +1405,10 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
     # pageable HtoD dispatches the profiler pinned as the span wall).
     _overlay_batched = _overlay_batched_enabled()
+    # EVICTION host-sync policy: the scheduled drop is now GPU-vectorized
+    # (evict_all_blocks_scheduled batched-nonzero, ~1 sync/size-group), so the only
+    # remaining per-round syncs are the OPTIONAL timing drains — gated OFF by default.
+    _evict_timed = _evict_timed_enabled()
     dev = torch.device(device)
     if is_cuda:
         # Reset the peak so ``peak_vram_gb`` reflects THIS verify's largest span
@@ -1902,10 +1959,12 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             # ``evict``), then a boolean-mask compaction per block.  Byte-identical
             # survivor set to the per-block ``caches[b].evict`` loop; de-syncs the
             # deep-loop prune so the GPU stays busy (GPU util was 41% under the old
-            # per-block host-synced eviction).  Timed with a drain around the prune
-            # (a correctness barrier the next forward needs anyway); the forward /
-            # overlay wall is the remainder (t_fast - t_evict).
-            if is_cuda:
+            # per-block host-synced eviction).  OPTIONALLY timed with a drain around
+            # the prune (C4_EVICT_TIMED; 2 syncs/round) — OFF by default so eviction
+            # adds ~ZERO host syncs per forward (the scheduled drop is GPU-vectorized;
+            # the enqueued kernels order on the stream before the next forward with no
+            # explicit drain needed).  The forward/overlay wall is the remainder.
+            if is_cuda and _evict_timed:
                 torch.cuda.synchronize(dev)
             _t0 = _time.perf_counter()
             if sched is not None:
@@ -1951,7 +2010,7 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             for b in range(n_blocks):
                 if keep_masks[b] is not None:
                     caches[b].apply_keep_mask(keep_masks[b])
-            if is_cuda:
+            if is_cuda and _evict_timed:
                 torch.cuda.synchronize(dev)
             t_evict += _time.perf_counter() - _t0
             steps_since_evict = 0

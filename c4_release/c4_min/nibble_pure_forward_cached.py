@@ -1000,16 +1000,27 @@ def evict_all_blocks_fused(caches, cos_threshold: float, zero_eps: float,
 # set is untouched.  See ``nibble_evict_schedule`` for the derivation.
 # ===========================================================================
 def evict_all_blocks_scheduled(caches, drop_positions):
-    """Compute per-block keep-MASKS that DROP exactly the scheduled dead store rows.
+    """Compute per-block keep-INDICES that DROP exactly the scheduled dead store rows.
 
     ``drop_positions`` is a 1-D long tensor (or list) of ABSOLUTE stream positions
     the liveness schedule says are now dead.  Returns a ``[n_blocks]`` list where
-    entry ``b`` is a boolean ``[S_b]`` keep-mask (True = keep) ON ``caches[b].K``'s
+    entry ``b`` is a LONG keep-index tensor (surviving row indices) ON ``caches[b].K``'s
     device, or ``None`` if that block drops nothing.  The whole decision is one
-    ``torch.isin`` per block over its position axis — NO content comparison, NO
+    ``torch.isin`` over the stacked position axis — NO content comparison, NO
     per-head near-dup matmul.  Byte-identical survivor set to the content path on
     the store rows (see module docstring).
-    """
+
+    FULLY GPU-VECTORIZED (this task): the per-block ``bool(dead.any())`` early-exit —
+    ONE host sync PER BLOCK (~242/round -> ~2,700 syncs / 19K steps, the dominant
+    eviction host-sync wall) — is REMOVED.  Live blocks are grouped by cache size,
+    each size-group stacks its positions into ONE ``[Ltot, S]`` tensor, runs ONE
+    batched ``isin`` -> keep-mask, and a SINGLE batched ``nonzero`` + ONE
+    ``counts.tolist()`` (ONE host sync PER SIZE-GROUP, typically 1 in the
+    lockstep-commit common case) yields the per-block LONG keep-indices.  These feed
+    ``apply_keep_mask``'s sync-FREE ``index_select`` compaction (the boolean-mask path
+    it took before forced a second per-block sync).  Net: eviction host syncs drop
+    from O(n_blocks) per round to O(#size-groups) ~= 1 per round.  Byte-identical
+    survivor SET (same rows kept, only the decision is de-synced)."""
     n_blocks = len(caches)
     result = [None] * n_blocks
     if n_blocks == 0:
@@ -1025,12 +1036,32 @@ def evict_all_blocks_scheduled(caches, drop_positions):
         drop_positions = drop_positions.to(dev)
     if drop_positions.numel() == 0:
         return result
+    # group live blocks by their current cache size S (they share S in the
+    # lockstep-commit common case -> ONE group; diverge only after earlier prunes).
+    by_size: Dict[int, List[int]] = {}
     for b in live:
-        pos = caches[b].pos.to(dev)
-        dead = torch.isin(pos, drop_positions)     # [S_b] rows the schedule kills
-        if not bool(dead.any()):
-            continue                               # this block keeps everything
-        result[b] = ~dead                          # keep-mask (True = survive)
+        by_size.setdefault(int(caches[b].pos.shape[0]), []).append(b)
+    for S, blocks_S in by_size.items():
+        if S == 0:
+            continue
+        Ltot = len(blocks_S)
+        # ONE stacked [Ltot, S] position tensor -> ONE batched isin -> keep-mask.
+        pos = torch.stack([caches[b].pos.to(dev) for b in blocks_S], dim=0)  # [Ltot,S]
+        dead = torch.isin(pos, drop_positions)                # [Ltot,S] scheduled dead
+        keep_all = ~dead                                      # [Ltot,S] survivors
+        # SINGLE batched compaction: ONE nonzero gives every surviving (row, col)
+        # pair; the per-row survivor COUNTS come from the same pass.  ONE host
+        # transfer (the counts) instead of Ltot per-block ``any()`` syncs.
+        kept_counts = keep_all.sum(dim=1)                     # [Ltot] on device
+        pairs = torch.nonzero(keep_all, as_tuple=False)       # [T,2]=(row,col)
+        cols = pairs[:, 1]                                    # surviving col idx
+        counts_l = kept_counts.tolist()                       # 1 sync / size-group
+        off = 0
+        for i, b in enumerate(blocks_S):
+            k = counts_l[i]
+            if k < S:                                         # this block dropped rows
+                result[b] = cols[off:off + k]                 # long keep-idx on dev
+            off += k
     return result
 
 
