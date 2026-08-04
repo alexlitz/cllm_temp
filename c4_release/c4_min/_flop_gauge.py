@@ -221,8 +221,19 @@ def _attn_flops(block, B, Sq, Sk) -> Tuple[float, float]:
     attn = getattr(block, "attn", None)
     if attn is None:
         return 0.0, 0.0
-    H = int(getattr(attn, "n_heads", 0) or 0)
+    # ZERO-ATTENTION-COMPUTE (#856): a dead-block-fused block runs NO score/context
+    # (its attention output is x); a live-head-attn block scores ONLY its live heads.
+    if getattr(attn, "_dead_block_fused", False):
+        return 0.0, 0.0
+    lmask = getattr(attn, "_live_head_mask", None)
     HD = int(getattr(attn, "head_dim", 0) or 0)
+    if lmask is not None:
+        H = int(lmask.sum().item())
+        if H == 0 or HD == 0:
+            return 0.0, 0.0
+        macs = 2.0 * float(B) * H * Sq * Sk * HD
+        return 2.0 * macs, 2.0 * macs
+    H = int(getattr(attn, "n_heads", 0) or 0)
     if H == 0 or HD == 0:
         return 0.0, 0.0
     # scores Q@Kᵀ : [B,H,Sq,HD]x[B,H,HD,Sk] -> 2*B*H*Sq*Sk*HD
@@ -436,6 +447,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--block-sparse", dest="block_sparse", action="store_true",
                     default=True, help="install COO block-sparse FFN (default on)")
     ap.add_argument("--no-block-sparse", dest="block_sparse", action="store_false")
+    ap.add_argument("--dead-fusion", action="store_true",
+                    help="install live-head-attn + dead-block-fusion (#856 zero-attn "
+                         "compute): dead blocks output x (no score), live blocks score "
+                         "only live heads -> the FFN-only floor")
     a = ap.parse_args(argv)
 
     _mem_guard(where="startup")
@@ -476,6 +491,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         install_block_sparse_ffn(model, mode="coo", verbose=False)
         if cuda:
             model.to(device)
+    if a.dead_fusion:
+        from .live_head_attention import (install_live_head_attention,
+                                          install_dead_block_fusion)
+        st1 = install_live_head_attention(model, verbose=False)
+        st2 = install_dead_block_fusion(model, verbose=False)
+        print(f"  [dead-fusion] live-head slots={st1['live_head_slots']}/"
+              f"{st1['total_head_slots']}; fused {st2['fused_blocks']} dead blocks "
+              f"(#856 zero-attn compute)", flush=True)
     _mem_guard(where="post-install")
 
     from .step_block_skip import StepBlockSkipRunner
