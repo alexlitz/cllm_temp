@@ -1252,8 +1252,18 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # attention-identity) + frozen-skip (the region runs over K query rows) + CUDA.
     # Byte-exact; default OFF -> the eager per-block loop.
     _megastep = None
+    # FUSED MEGABLOCK (C4_FUSED_MEGABLOCK): the on-chip in-place-delta dead-FFN
+    # megakernel — a stronger drop-in for the megastep graph (no per-block full-D
+    # residual copy, no hidden HBM buffer; the [D,K] residual stays L2-resident across
+    # the whole dead-FFN chain, all launches collapsed into one CUDA-graph replay).
+    # Takes precedence over C4_GRAPH_MEGAKERNEL.  Byte-exact (nibble-snap margin).
+    from .fused_megablock import fused_megablock_enabled, install_fused_megablock
     from .megastep_graph import megastep_graph_enabled, install_megastep_graph
     if (frozen_skip and is_cuda and _dead_block_fusion_enabled()
+            and fused_megablock_enabled()):
+        _megastep = install_fused_megablock(model, device, frozen_cut, L=L,
+                                            verbose=False)
+    elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
             and megastep_graph_enabled()):
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
