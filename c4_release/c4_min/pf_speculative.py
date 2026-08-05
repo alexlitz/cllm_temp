@@ -898,6 +898,36 @@ def _forward_hidden_cached_skip(model, x, past_key_values, q_positions, skip_ran
     return hidden, new_caches
 
 
+def faithful_attn_evict_enabled() -> bool:
+    """``C4_FAITHFUL_ATTN_EVICT`` (DEFAULT OFF): the GENUINELY-COMPUTING path.
+
+    Runs the REAL softmax1+ALiBi attention verify — the model's OWN query
+    INDEPENDENTLY resolves every memory read's ADDRESS *and* VALUE (no
+    ``resolve_load_rows(draft)`` injection) — made tractable at doom's KV scale by
+    scoring over the EVICTED / bounded KV cache (``exact_evict`` liveness schedule)
+    instead of the full O(S) store log that OOMs.
+
+    This is the resolution of the faithfulness/speed tension the fast-path audit
+    (``DOOM_FASTPATH_FAITHFULNESS_AUDIT_2026_08_05.md``) found: the direct-CAM fast
+    path is DRAFT-TRUSTED for the memory-read resolution (a self-consistent wrong
+    draft is ACCEPTED — scenario E), whereas the softmax path independently
+    recomputes it (a wrong read is CAUGHT).  The un-composed softmax path OOMs at
+    doom scale (O(S) score over 150k-262k rows); composing it with EVICTION bounds
+    the cache to ~1-10K live rows (evicted entries contribute ~0 to softmax1 by the
+    latest-write-wins / ALiBi + ZFOD identity), so real-attention-over-evicted ==
+    real-attention-over-full-log, byte-exact.
+
+    When ON this flag OVERRIDES the B-class draft-trust levers to their GENUINE
+    forms (direct-CAM / direct-local / frozen-row-skip forced OFF — those inject or
+    depend on the draft's resolved rows), while KEEPING every A-class faithful lever
+    (dead-block fusion, fused-delta FFN, fused megablock, bounded + evicted KV,
+    banded/flash local attention).  The result is the real transformer attention,
+    scored over the bounded survivors.  DEFAULT OFF -> the golden 069cc32f path
+    (this flag is inert when unset)."""
+    import os as _os
+    return _os.environ.get("C4_FAITHFUL_ATTN_EVICT", "0") not in ("0", "", "false", "False")
+
+
 def _dead_block_fusion_enabled() -> bool:
     """``C4_DEAD_BLOCK_FUSION`` (DEFAULT OFF): bypass the WHOLE attention sublayer of
     every DEAD-attention block (0 live-value heads) and score ONLY the live head-slots
@@ -939,6 +969,13 @@ def _frozen_skip_enabled() -> bool:
     stack from S~=30k span rows to K~=256 query rows (~30x less FFN work).  Requires
     direct-CAM (else blocks 7/11 would read frozen-row KV)."""
     import os as _os
+    # FAITHFUL-ATTN-EVICT: the genuine CAM heads (blocks 2/7/11) SCORE the frozen
+    # rows' KV (that IS the memory the model's query retrieves), so frozen-row-skip is
+    # UNSAFE on this path — the docstring's "direct-CAM'd whose live heads are GLOBAL
+    # and position-gathered" premise does not hold when the global heads genuinely
+    # score.  Force it OFF so the faithful path reads the full committed frozen KV.
+    if faithful_attn_evict_enabled():
+        return False
     return _os.environ.get("C4_FROZEN_ROW_SKIP", "0") not in ("0", "", "false", "False")
 
 
@@ -1366,8 +1403,14 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # (the divmod span is not carried); a DIV/MOD program falls through to the per-op
     # path below.  Default OFF -> the per-op verify_blocks (golden 069cc32f unchanged).
     import os as _osp
+    # FAITHFUL-ATTN-EVICT forces the per-op verify path: the precomputed schedule
+    # resolves the direct-CAM/direct-local gathers UP FRONT off the draft (B-class
+    # draft-trust) and compacts the routing, neither of which is the genuine softmax
+    # the faithful path runs.  So even if C4_PRECOMPUTED_SCHEDULE is ambiently set,
+    # faithful mode falls through to the real per-op scored path below.
     if (_osp.environ.get("C4_PRECOMPUTED_SCHEDULE", "0") not in ("0", "", "false", "False")
-            and device.startswith("cuda")):
+            and device.startswith("cuda")
+            and not faithful_attn_evict_enabled()):
         _DM = {"DIV", "MOD"}
         if not any(draft.frames[s].get("op") in _DM for s in range(draft.step_count)):
             from .precomputed_schedule import run_verify as _ps_run
@@ -1490,6 +1533,12 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     if exact_evict is None:
         import os
         exact_evict = os.environ.get("C4_EXACT_EVICT", "0") not in ("0", "", "false", "False")
+        # FAITHFUL-ATTN-EVICT implies the exact-evict liveness schedule: the whole
+        # point is to run the GENUINE softmax over the EVICTED / bounded cache, so the
+        # eviction policy is the schedule drop.  A caller may still pass exact_evict
+        # explicitly to override.
+        if faithful_attn_evict_enabled():
+            exact_evict = True
     if exact_evict:
         evict_schedule = True                       # exact-evict IS a schedule mode
     sched = None

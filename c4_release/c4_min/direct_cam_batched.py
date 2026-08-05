@@ -79,7 +79,15 @@ def direct_cam_batched_enabled() -> bool:
     verify_blocks span.  OFF -> the vanilla softmax1+ALiBi global-CAM score (byte-
     exact golden path).  ON -> the CAM blocks' global heads direct-gather the draft-
     resolved value per query row (no O(S) score) -> the ~39% global-CAM wall + the
-    O(S) score-matrix VRAM pressure (which caps eff_K) collapse."""
+    O(S) score-matrix VRAM pressure (which caps eff_K) collapse.
+
+    OVERRIDE: ``C4_FAITHFUL_ATTN_EVICT`` (the genuinely-computing path) forces this
+    OFF — direct-CAM is the exact B-class draft-trust lever the faithful path
+    replaces with the model's own genuine softmax query.  So even if a caller left
+    C4_DIRECT_CAM_BATCHED set (e.g. the composed lever set), faithful mode reverts
+    the CAM heads to real scoring over the (evicted, bounded) cache."""
+    if os.environ.get("C4_FAITHFUL_ATTN_EVICT", "0") not in ("0", "", "false", "False"):
+        return False
     return os.environ.get("C4_DIRECT_CAM_BATCHED", "0") not in ("0", "", "false", "False")
 
 
