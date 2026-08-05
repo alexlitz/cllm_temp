@@ -76,6 +76,44 @@ def faithful_single_dispatch_enabled() -> bool:
     return os.environ.get("C4_FAITHFUL_SINGLE_DISPATCH", "0") not in ("0", "", "false", "False")
 
 
+def _faithful_precompute_cache_enabled() -> bool:
+    """``C4_FAITHFUL_PRECOMPUTE_CACHE`` (DEFAULT OFF).  BUILD-REDUCTION for the CONTINUOUS
+    render.  The faithful value-verify PRECOMPUTE (``build_faithful_precompute`` — the heavy
+    ``_genuine_value_at`` latest-write-wins over the committed store-log at every draft read
+    address, ~1.1 us/step on the build thread) is a PURE function of the IMMUTABLE draft
+    (store-log + frames + win_starts + the draft's resolved read addr/val + code routing).  In
+    a continuous render the SAME draft is re-drafted every frame, so the store-log PREFIX is
+    unchanged and the genuine re-resolution is IDENTICAL every frame.  Cache the resolved
+    ``FaithfulPrecompute`` ONCE on the draft (keyed by the reused plan identity + store-log
+    identity + mask + n — see ``_precompute_cache_key``) and REUSE it per frame instead of
+    re-resolving.
+
+    This is the value-verify analog of ``C4_SCHED_CACHE_RESOLVED`` for the schedule build: it
+    turns the per-frame value-precompute into a one-time cost, dropping the faithful build
+    thread below the dispatch (dispatch-bound).  Byte-identical (the SAME immutable arrays —
+    ``FaithfulPrecompute`` is read-only in ``verify_faithful_fast``, which only gathers/compares
+    and never mutates it).  DEFAULT OFF -> the per-frame re-resolve."""
+    return os.environ.get("C4_FAITHFUL_PRECOMPUTE_CACHE", "0") not in ("0", "", "false", "False")
+
+
+def _precompute_cache_key(draft, plan: "FaithfulPlan", n: int, mask: int) -> tuple:
+    """A cheap identity key for ALL inputs the precompute depends on.  The result is a pure
+    function of ``(plan.draft_addr/val/code_addr, plan committed stores, store_log, frames,
+    win_starts, mask, n)`` — so the key must capture the PLAN (which carries the draft's resolved
+    read addr/val/code + the committed store arrays) AND the store-log, not the store-log alone.
+
+    We key on ``id(plan)`` + the store-log identity + n/mask/step_count.  In the steady-state
+    continuous harness ``PipelinedScheduleBuilder`` builds the plan ONCE (``__init__``) and reuses
+    that same object every frame, so ``id(plan)`` is stable -> cache hits; and the plan is a pure
+    function of the immutable draft.  A DIFFERENT plan (different resolved reads / a new draft) is
+    a different object -> new id -> MISS -> recompute (never a stale hit).  ``id(store_log)`` +
+    ``len`` additionally guards against a same-object plan whose backing store-log was mutated in
+    place (a genuinely new committed prefix)."""
+    sl = draft.store_log or {}
+    return (id(plan), id(sl), len(sl), int(n), int(mask),
+            int(getattr(draft, "step_count", n)))
+
+
 # ===========================================================================
 # 1. The band each live CAM block's QUERY is decoded from, per head kind.
 # ===========================================================================
@@ -362,7 +400,19 @@ def build_faithful_precompute(draft, plan: FaithfulPlan, win_starts: np.ndarray,
     The heavy work is the single vectorized ``_genuine_value_at`` latest-write-wins over the
     committed stores at every draft read address (the ~1.9 us/step the critical path used to
     pay AFTER the dispatch).  The critical path then only gathers + compares
-    (``verify_faithful_fast``)."""
+    (``verify_faithful_fast``).
+
+    ``C4_FAITHFUL_PRECOMPUTE_CACHE`` (DEFAULT OFF): in a CONTINUOUS render the result is a pure
+    function of the IMMUTABLE store-log, so cache it ONCE on the draft (keyed by store-log
+    identity + mask + n) and reuse it per frame — dropping this ~1.1 us/step build-thread cost
+    to a one-time cost after frame 0.  Byte-identical (the returned object is immutable + read
+    only in ``verify_faithful_fast``)."""
+    _cache = _faithful_precompute_cache_enabled()
+    if _cache:
+        key = _precompute_cache_key(draft, plan, n, mask)
+        cached = getattr(draft, "_faithful_precompute_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]                          # hit: reuse the immutable precompute
     ws = np.asarray(win_starts[:n], dtype=np.int64)
     read_frame = _read_frame_of_step(draft, n)
     amask = (1 << ADDR_BITS) - 1
@@ -410,9 +460,15 @@ def build_faithful_precompute(draft, plan: FaithfulPlan, win_starts: np.ndarray,
                             dtype=np.int64, count=cpos.shape[0])
     else:
         cstep = np.zeros(0, dtype=np.int64); caddr = np.zeros(0, dtype=np.int64)
-    return FaithfulPrecompute(n=n, mask=mask, steps=steps, draft_addr=draft_addr,
-                              draft_val=draft_val, pre_genuine=pre_genuine,
-                              code_steps=cstep, code_addr=caddr)
+    result = FaithfulPrecompute(n=n, mask=mask, steps=steps, draft_addr=draft_addr,
+                                draft_val=draft_val, pre_genuine=pre_genuine,
+                                code_steps=cstep, code_addr=caddr)
+    if _cache:
+        try:
+            draft._faithful_precompute_cache = (key, result)     # one-time; reused per frame
+        except Exception:
+            pass
+    return result
 
 
 def verify_faithful_fast(pre: FaithfulPrecompute,
@@ -491,4 +547,5 @@ def verify_faithful_fast(pre: FaithfulPrecompute,
 
 __all__ = ["faithful_single_dispatch_enabled", "FaithfulPlan", "build_faithful_plan",
            "FaithfulVerdict", "verify_faithful", "_qry_band", "_genuine_value_at",
-           "FaithfulPrecompute", "build_faithful_precompute", "verify_faithful_fast"]
+           "FaithfulPrecompute", "build_faithful_precompute", "verify_faithful_fast",
+           "_faithful_precompute_cache_enabled"]

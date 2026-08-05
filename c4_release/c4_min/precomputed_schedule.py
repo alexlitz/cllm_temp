@@ -1383,6 +1383,20 @@ def sched_pipeline_enabled() -> bool:
     return os.environ.get("C4_SCHED_PIPELINE", "0") not in ("0", "", "false", "False")
 
 
+def _faithful_precompute_thread_enabled() -> bool:
+    """``C4_FAITHFUL_PRECOMPUTE_THREAD`` (DEFAULT OFF).  Run the faithful value-verify
+    PRECOMPUTE (``build_faithful_precompute``, the ~1.1 us/step genuine latest-write-wins
+    re-resolution) on a SECOND inner thread inside ``PipelinedScheduleBuilder._run``,
+    CONCURRENT with the schedule-table build (which is itself ~90% GIL-releasing numpy + GPU
+    ops on the dedicated build stream) — instead of serializing the two on the one build
+    thread.  So the build thread's steady-state cost becomes ``max(precompute, schedule-build)``
+    rather than their sum, keeping the faithful build below the dispatch when the precompute is
+    NOT cached (a genuinely re-drafting continuous render).  Both are GIL-releasing so they
+    overlap on separate CPython threads; the precompute is joined before the swap.  Byte-
+    identical (same numpy, same result); DEFAULT OFF -> serial precompute-then-build."""
+    return os.environ.get("C4_FAITHFUL_PRECOMPUTE_THREAD", "0") not in ("0", "", "false", "False")
+
+
 class PipelinedScheduleBuilder:
     """Double-buffered background-thread schedule builder for the CONTINUOUS render loop.
 
@@ -1431,6 +1445,9 @@ class PipelinedScheduleBuilder:
         # exactly like the schedule build.  The critical path then only does the cheap
         # vectorized model-vs-precomputed compare (``verify_faithful_fast``).
         self.faithful = bool(faithful)
+        # C4_FAITHFUL_PRECOMPUTE_THREAD: overlap the value-precompute with the schedule build
+        # on a second inner thread (the lever for the uncached / genuinely-redrafting case).
+        self._precompute_on_thread = bool(faithful) and _faithful_precompute_thread_enabled()
         self._plan = None
         self._ws = None
         if self.faithful:
@@ -1464,9 +1481,29 @@ class PipelinedScheduleBuilder:
 
     def _run(self):
         try:
-            # the faithful value-verify re-resolution — pure numpy, releases the GIL, so it
-            # overlaps the previous frame's replay on the calling (default) stream.
-            precomp = self._build_precompute() if self.faithful else None
+            # the faithful value-verify re-resolution — pure numpy, releases the GIL.  The
+            # schedule build below is also ~90% GIL-releasing numpy + GPU ops on the build
+            # stream.  By DEFAULT the two run SERIALLY on this thread (precompute first, then
+            # the schedule build); with C4_FAITHFUL_PRECOMPUTE_THREAD the precompute runs on a
+            # SECOND inner thread CONCURRENT with the schedule build so they OVERLAP EACH OTHER
+            # (the build thread's steady-state cost becomes max(precompute, schedule-build)
+            # instead of their sum).  With C4_FAITHFUL_PRECOMPUTE_CACHE the precompute is a
+            # cheap cache-hit copy after frame 0, so serialization is already free — the second
+            # thread is the lever for the UNCACHED (genuinely re-drafting) case.
+            precomp_thr = None
+            precomp_box = {}
+            if self.faithful and self._precompute_on_thread:
+                def _pc():
+                    try:
+                        precomp_box["v"] = self._build_precompute()
+                    except BaseException as e:       # surface at the join below
+                        precomp_box["e"] = e
+                precomp_thr = self._threading.Thread(target=_pc, name="faithful-precompute",
+                                                     daemon=True)
+                precomp_thr.start()
+            precomp = None
+            if self.faithful and precomp_thr is None:
+                precomp = self._build_precompute()
             with torch.cuda.stream(self._build_stream):
                 with torch.no_grad():
                     sched = build_schedule_tables_only(
@@ -1477,6 +1514,11 @@ class PipelinedScheduleBuilder:
                 ev = torch.cuda.Event()
                 ev.record(self._build_stream)
                 self._done_event = ev
+            if precomp_thr is not None:
+                precomp_thr.join()                   # the two overlapped; join before swap
+                if "e" in precomp_box:
+                    raise precomp_box["e"]
+                precomp = precomp_box.get("v")
             self._result = sched
             self._precomp_next = precomp
         except BaseException as e:                 # surface build errors at wait()
