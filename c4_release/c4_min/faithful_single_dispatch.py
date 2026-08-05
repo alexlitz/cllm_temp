@@ -416,6 +416,19 @@ def build_faithful_precompute(draft, plan: FaithfulPlan, win_starts: np.ndarray,
     ws = np.asarray(win_starts[:n], dtype=np.int64)
     read_frame = _read_frame_of_step(draft, n)
     amask = (1 << ADDR_BITS) - 1
+    # C4_HASH_CAM: build the GENUINE O(1) address hash index over the committed stores ONCE,
+    # and resolve every read's latest-write-wins value via an O(1) hash probe (+ a per-address
+    # frame bisect) instead of the O(log S) searchsorted over uniq_addr in _genuine_value_at.
+    # Byte-identical per-read result; only the address->slot resolution ALGORITHM changes.
+    from .hash_cam import hash_cam_enabled, build_hash_index, resolve_value_hashed
+    _hash_cam = hash_cam_enabled()
+    _hash_index = (build_hash_index(plan.store_frames, plan.store_addr, plan.store_val)
+                   if _hash_cam else None)
+
+    def _resolve(addr_arr, rf_arr):
+        if _hash_cam:
+            return resolve_value_hashed(addr_arr, rf_arr, _hash_index)
+        return _genuine_value_at(addr_arr, rf_arr, plan)
     steps: Dict[str, np.ndarray] = {}
     draft_addr: Dict[str, np.ndarray] = {}
     draft_val: Dict[str, np.ndarray] = {}
@@ -440,8 +453,9 @@ def build_faithful_precompute(draft, plan: FaithfulPlan, win_starts: np.ndarray,
         dv = np.fromiter((int(val_d.get(int(p), 0)) & mask for p in pos_arr),
                          dtype=np.int64, count=pos_arr.shape[0])
         rf = read_frame[step_arr]
-        # THE HEAVY PART (vectorized latest-write-wins at the DRAFT address).
-        pg = _genuine_value_at(da, rf, plan)
+        # THE HEAVY PART (latest-write-wins at the DRAFT address).  C4_HASH_CAM routes this
+        # through the O(1) hash resolver; else the O(log S) searchsorted (_genuine_value_at).
+        pg = _resolve(da, rf)
         steps[kind] = step_arr
         draft_addr[kind] = da
         draft_val[kind] = dv
