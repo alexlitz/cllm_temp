@@ -55,6 +55,27 @@ def fused_megablock_enabled() -> bool:
     return os.environ.get("C4_FUSED_MEGABLOCK", "0") not in ("0", "", "false", "False")
 
 
+def fused_hidden_enabled() -> bool:
+    """``C4_FFN_FUSED_HIDDEN`` (DEFAULT OFF): keep each dead-FFN block's ``[Dff,K]`` hidden
+    activation ON-CHIP (recomputed in registers per active output row) instead of writing
+    it to and reading it back from HBM between the up/gate kernel and the down kernel.
+
+    THE DISPATCH LEVER (this task).  The profiler proved the dead-FFN mega-chain runs at
+    only 19% of the A5000's 768 GB/s HBM peak, and **92% of the bytes moved per step is
+    the ``[Dff,K]`` hidden-activation scratch** round-tripping HBM (the 2-kernel delta path
+    ``_fused_upgate_silu_kernel`` WRITES it, ``_down_delta_inplace_kernel`` READS it).  This
+    flag switches the dead-FFN blocks to the single ``_fused_hidden_delta_kernel``: one
+    program per active output row recomputes ONLY the hidden columns W_down reads, in
+    registers, from the input residual, and never materialises ``[Dff,K]`` in HBM.
+
+    BYTE-EXACT (default OFF): the recompute walks the SAME CSRs in the SAME order, and reads
+    up/gate from a SEPARATE input buffer than the delta-write target (no read-after-write
+    hazard) — so the arithmetic is bit-identical to the 2-kernel path (which is itself
+    nibble-margin byte-exact to the eager COO FFN).  OFF -> the 2-kernel HBM-hidden path
+    (069cc32f unchanged)."""
+    return os.environ.get("C4_FFN_FUSED_HIDDEN", "0") not in ("0", "", "false", "False")
+
+
 def _resid_dtype() -> "torch.dtype":
     """``C4_MEGABLOCK_RESID`` (lever 3, DEFAULT fp32 == byte-exact): the resident
     residual buffer dtype.  ``bf16`` halves the residual buffer's L2/HBM footprint
@@ -164,6 +185,27 @@ class _MegaFFN:
         bd = ffn.b_down.to(device).float()
         self._down_bias_zero = bool((bd != 0).sum() == 0)
         self.b_down = bd
+        # FUSED-HIDDEN (C4_FFN_FUSED_HIDDEN): the single-kernel form recomputes each read
+        # hidden row on the fly and delta-writes the residual IN PLACE.  To keep it
+        # byte-exact despite the 47/49 blocks that WRITE a residual dim they also READ as an
+        # FFN input (a read-after-write hazard), up/gate must read the PRE-BLOCK residual.
+        # We snapshot ONLY the (small) set of residual dims up/gate read into a compact
+        # ``[n_in, K]`` buffer BEFORE the delta write, and remap the up/gate CSR column
+        # indices to snapshot-local rows.  n_in is tiny (4-148 vs D=1392), so the snapshot
+        # is far cheaper than a full-[D,K] copy AND eliminates the [Dff,K] hidden HBM buffer.
+        in_cols = torch.nonzero(((Wu != 0).any(dim=0) | (Wg != 0).any(dim=0)),
+                                as_tuple=False).flatten()
+        self.in_cols = in_cols.to(torch.int64).contiguous()   # residual dims to snapshot
+        self.n_in = int(in_cols.numel())
+        # remap: residual-dim -> snapshot-local row (dense LUT over D, built once).
+        remap = torch.full((self.dim,), -1, dtype=torch.int32, device=device)
+        if self.n_in:
+            remap[in_cols] = torch.arange(self.n_in, dtype=torch.int32, device=device)
+        # up/gate CSRs with columns REMAPPED to snapshot-local indices.
+        self.up_col_snap = remap[self.up_col.to(torch.int64)].contiguous() \
+            if self.up_col.numel() else self.up_col
+        self.gt_col_snap = remap[self.gt_col.to(torch.int64)].contiguous() \
+            if self.gt_col.numel() else self.gt_col
 
     def run_inplace(self, y: torch.Tensor, K: int,
                     h_scratch: Optional[torch.Tensor] = None):
@@ -192,6 +234,40 @@ class _MegaFFN:
         if not self._down_bias_zero:
             y += self.b_down.view(self.dim, 1)
 
+    def run_fused(self, y: torch.Tensor, K: int, snap_scratch=None):
+        """FUSED-HIDDEN form (C4_FFN_FUSED_HIDDEN): update the residual ``y [D,K]`` IN
+        PLACE with this block's FFN delta, WITHOUT ever materialising the ``[Dff,K]`` hidden
+        in HBM.
+
+        (1) SNAPSHOT the small set of residual dims up/gate read (``in_cols``, ~4-148) into a
+            compact ``[n_in,K]`` buffer — this is the ORIGINAL pre-block residual for the
+            hidden recompute (dodges the write-after-read hazard for the 47/49 blocks whose
+            W_down output rows overlap their W_up/W_gate input dims).
+        (2) the fused kernel: one program per active output row recomputes each read hidden
+            row IN REGISTERS from the snapshot, and adds ``W_down @ hidden`` to ``y`` in place.
+        No full-[D,K] copy, no [Dff,K] HBM hidden.  Byte-exact to ``run_inplace`` (same CSRs,
+        same accumulation order; the snapshot is a value-identical copy of the read dims)."""
+        from .fused_sparse_ffn import _fused_hidden_delta_snap_kernel
+        if self.n_active and self.n_in:
+            # snapshot y[in_cols] -> xs [n_in, K]  (index_select is a coalesced gather).
+            if snap_scratch is not None and snap_scratch.shape[1] == K \
+                    and snap_scratch.shape[0] >= self.n_in:
+                xs = snap_scratch[:self.n_in]
+                torch.index_select(y, 0, self.in_cols, out=xs)
+            else:
+                xs = torch.index_select(y, 0, self.in_cols)
+            g = (self.n_active, triton.cdiv(K, self.block_k))
+            _fused_hidden_delta_snap_kernel[g](
+                self.active_rows, self.dn_crow, self.dn_col, self.dn_val,
+                self.up_crow, self.up_col_snap, self.up_val,
+                self.gt_crow, self.gt_col_snap, self.gt_val,
+                xs, self.b_up, self.b_gate, y, K,
+                xs.stride(0), xs.stride(1), y.stride(0), y.stride(1),
+                BLOCK_K=self.block_k,
+            )
+        if not self._down_bias_zero:
+            y += self.b_down.view(self.dim, 1)
+
 
 class MegaBlockChain:
     """The DIV-free dead-FFN megakernel: run a contiguous list of DEAD-FFN blocks
@@ -213,6 +289,14 @@ class MegaBlockChain:
                  resid_dtype: Optional[torch.dtype] = None):
         self.model = model
         self.device = torch.device(device)
+        # C4_MEGABLOCK_BLOCK_K (perf-tuning knob, byte-neutral): override the Triton K-tile
+        # size for the dead-FFN kernels (default 64).  Larger tiles = fewer programs / more
+        # per-program K-columns (better coalescing on the [Dff/n_in,K] loads); smaller tiles
+        # = more parallelism.  Byte-exact for any value (only the tiling changes, not the
+        # arithmetic).  Applies to BOTH the 2-kernel and the fused-hidden paths.
+        _bk_env = os.environ.get("C4_MEGABLOCK_BLOCK_K", "")
+        if _bk_env.strip().isdigit():
+            block_k = int(_bk_env)
         self.block_k = block_k
         self.blocks = block_list
         self.D = model.dim
@@ -235,8 +319,15 @@ class MegaBlockChain:
             self._ffns.append(mf)
         # shared hidden scratch width = max Dff over all blocks
         self._max_hid = max((mf.Dff for mf in self._ffns), default=1)
-        # persistent residual + hidden scratch, lazy per K
-        self._bufs: dict = {}      # K -> (resid [D,K], h_scratch [max_hid,K])
+        # FUSED-HIDDEN (C4_FFN_FUSED_HIDDEN): keep each block's [Dff,K] hidden ON-CHIP
+        # (recompute in registers) instead of round-tripping it through HBM.  The fused
+        # form snapshots ONLY the small set of residual dims up/gate read (max n_in over
+        # the chain) into a shared [max_in,K] scratch before the in-place delta write — no
+        # full-[D,K] copy, no [Dff,K] HBM hidden buffer.
+        self._fused_hidden = fused_hidden_enabled()
+        self._max_in = max((mf.n_in for mf in self._ffns), default=1)
+        # persistent residual + scratch, lazy per K
+        self._bufs: dict = {}      # K -> (resid [D,K], h_scratch [max_hid,K], snap [max_in,K])
         self._graphs: dict = {}    # K -> (graph, static_in [D,K], static_out [D,K])
         self.n_captures = 0
 
@@ -245,14 +336,30 @@ class MegaBlockChain:
         if bufs is None:
             y = torch.empty(self.D, K, device=self.device, dtype=self.resid_dtype)
             hs = torch.empty(self._max_hid, K, device=self.device, dtype=torch.float32)
-            self._bufs[K] = bufs = (y, hs)
+            # snapshot scratch for the fused-hidden path (only the ~n_in read dims; only
+            # allocated when the fused path is on -> the 2-kernel path pays no extra VRAM).
+            snap = (torch.empty(self._max_in, K, device=self.device, dtype=torch.float32)
+                    if self._fused_hidden else None)
+            self._bufs[K] = bufs = (y, hs, snap)
         return bufs
 
     def _run_chain(self, y: torch.Tensor, K: int) -> torch.Tensor:
-        """In-place delta over the shared residual buffer ``y [D,K]``."""
-        _, hs = self._get_bufs(K)
-        for mf in self._ffns:
-            mf.run_inplace(y, K, h_scratch=hs)
+        """Run the dead-FFN chain over the residual buffer ``y [D,K]``, IN PLACE.
+
+        Default (2-kernel path): each block writes its [Dff,K] hidden to HBM then reads it
+        back (the profiler's dominant 92%-of-bytes round-trip).
+
+        FUSED-HIDDEN path (C4_FFN_FUSED_HIDDEN): each block SNAPSHOTS only the small set of
+        residual dims up/gate read, then a single kernel recomputes the hidden IN REGISTERS
+        from that snapshot and adds the FFN delta to ``y`` in place — no [Dff,K] HBM hidden
+        buffer, no full-[D,K] copy.  Byte-exact to the 2-kernel path."""
+        _, hs, snap = self._get_bufs(K)
+        if not self._fused_hidden:
+            for mf in self._ffns:
+                mf.run_inplace(y, K, h_scratch=hs)
+        else:
+            for mf in self._ffns:
+                mf.run_fused(y, K, snap_scratch=snap)
         return y
 
     def run(self, hq: torch.Tensor) -> torch.Tensor:
@@ -262,20 +369,19 @@ class MegaBlockChain:
         chain in place (no per-block copy) — the residual stays in one buffer across
         all blocks."""
         B, K, D = hq.shape
-        y, _ = self._get_bufs(K)
+        y, _, _ = self._get_bufs(K)
         y.copy_(hq.reshape(K, D).transpose(0, 1))     # single [D,K] load into resident buf
         out = self._run_chain(y, K)
         # cast back to the caller's fp32 at the boundary (bf16 is chain-internal only)
         return out.transpose(0, 1).reshape(1, K, D).to(hq.dtype)
 
     def _capture(self, K: int):
-        y, hs = self._get_bufs(K)
+        y, hs, _ = self._get_bufs(K)
         static_in = torch.zeros(self.D, K, device=self.device, dtype=torch.float32)
 
         def chain():
             y.copy_(static_in)
-            for mf in self._ffns:
-                mf.run_inplace(y, K, h_scratch=hs)
+            self._run_chain(y, K)
             return y
 
         s = torch.cuda.Stream(device=self.device)

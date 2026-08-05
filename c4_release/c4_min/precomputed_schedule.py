@@ -1198,6 +1198,131 @@ def build_schedule_tables_only(model, L, code, draft, device, sg, mask: int = 0x
     return sched
 
 
+# ===========================================================================
+# 4. THE TRUE OVERLAP: build(N+1) on a background THREAD + dedicated CUDA streams,
+#    concurrent with the graph replay of frame N (C4_SCHED_PIPELINE).
+# ===========================================================================
+def sched_pipeline_enabled() -> bool:
+    """``C4_SCHED_PIPELINE`` (DEFAULT OFF).  TRUE double-buffer overlap: run the frame
+    N+1 schedule BUILD (the ~90%-CPU numpy resolve + the H2D uploads + the small W_o-delta
+    GEMMs) on a BACKGROUND THREAD bound to a DEDICATED CUDA build stream, CONCURRENT with
+    the frame-N graph REPLAY on the default compute stream.
+
+    WHY the naive ``with torch.cuda.stream(side): build()`` in the harness did NOT overlap
+    (measured 2% gain, not the ~max(build,dispatch) the double-buffer promises): the build
+    is ~90% CPU numpy (``_resolve_reads_vec`` / the frame-decode loop / the token
+    ``np.asarray``) + H2D copies — a ``torch.cuda.stream`` context only redirects GPU
+    KERNEL LAUNCHES, it does NOT make CPU work run off the calling thread.  So the whole
+    CPU build ran to completion on the main thread BEFORE the dispatch replay was ever
+    issued — they serialized on the CPython thread, not on the GPU.
+
+    THE FIX (this builder):
+      (a) THREAD: the build runs in a real ``threading.Thread``.  Every heavy numpy op
+          (``lexsort`` / ``searchsorted`` / bit-shift scatter / ``np.asarray`` of the
+          ~30·n-token stream) releases the GIL, so the main thread proceeds to issue the
+          frame-N replay launches concurrently.
+      (b) STREAM: inside the thread the current stream is set to a dedicated ``build``
+          stream, so the build's GPU ops (embed gather, the H2D ``.to(device)`` copies,
+          the W_o-delta GEMMs) are enqueued on a SEPARATE stream from the default compute
+          stream the replay uses — they overlap on the GPU (subject to SM availability),
+          and the H2D copies do not serialize behind the replay's compute.
+      (c) EVENT SYNC AT THE SWAP ONLY: ``wait()`` joins the thread, then records a build
+          event and makes the default stream ``wait_event`` it, so the next frame's replay
+          (which reads the freshly-built buffer) is ordered strictly AFTER the build
+          completes — no reading a half-built buffer.  Correctness == serial (the swap is
+          the only synchronization point).
+
+    Byte-identical to the serial build (same numpy, same H2D values); DEFAULT OFF."""
+    return os.environ.get("C4_SCHED_PIPELINE", "0") not in ("0", "", "false", "False")
+
+
+class PipelinedScheduleBuilder:
+    """Double-buffered background-thread schedule builder for the CONTINUOUS render loop.
+
+    Usage (the harness / render loop drives it)::
+
+        pb = PipelinedScheduleBuilder(model, L, code, draft, device, sg, mask)
+        cur = pb.build_blocking()          # frame 0 (no overlap possible yet)
+        pb.start()                         # kick off frame 1's build on the thread
+        while rendering:
+            dispatch(cur)                  # frame-N replay on the default stream (overlaps)
+            nxt = pb.wait()                # join the build thread + event-sync the swap
+            del cur; cur = nxt
+            pb.start()                     # kick off frame N+2's build
+
+    The build thread owns a dedicated CUDA build stream; ``wait`` event-syncs the default
+    stream to the build stream so the returned schedule is fully materialized before the
+    caller replays over it.  ``draft`` is a fixed trace in this steady-state harness (the
+    continuous loop re-drafts per real frame; here the build cost — the target — is the
+    same tensor work regardless), so the thread re-runs ``build_schedule_tables_only``."""
+
+    def __init__(self, model, L, code, draft, device, sg, mask: int = 0xFFFFFFFF):
+        import threading
+        self._threading = threading
+        self.model = model
+        self.L = L
+        self.code = code
+        self.draft = draft
+        self.device = torch.device(device)
+        self.sg = sg
+        self.mask = mask
+        # dedicated build stream: the build's GPU ops (embed gather / H2D / W_o GEMMs) run
+        # on ``_build_stream`` so they do NOT serialize behind the default compute stream the
+        # graph replay uses (priority 0 == least-priority default, so the replay is never
+        # preempted by build kernels — the build kernels fill replay idle cycles).
+        self._build_stream = torch.cuda.Stream(device=self.device)
+        self._thread: Optional["threading.Thread"] = None
+        self._result: Optional[PrecomputedSchedule] = None
+        self._exc: Optional[BaseException] = None
+        self._done_event: Optional[torch.cuda.Event] = None
+
+    def build_blocking(self) -> PrecomputedSchedule:
+        """Frame-0 build (no concurrent dispatch yet); runs on the caller thread/stream."""
+        return build_schedule_tables_only(self.model, self.L, self.code, self.draft,
+                                          self.device, self.sg, mask=self.mask)
+
+    def _run(self):
+        try:
+            with torch.cuda.stream(self._build_stream):
+                with torch.no_grad():
+                    sched = build_schedule_tables_only(
+                        self.model, self.L, self.code, self.draft, self.device,
+                        self.sg, mask=self.mask)
+                # record completion on the BUILD stream; the caller's default stream will
+                # wait on this event at the swap so the replay reads a fully-built buffer.
+                ev = torch.cuda.Event()
+                ev.record(self._build_stream)
+                self._done_event = ev
+            self._result = sched
+        except BaseException as e:                 # surface build errors at wait()
+            self._exc = e
+
+    def start(self):
+        """Kick off the NEXT frame's build on the background thread + build stream.  Returns
+        immediately; the caller then issues the current frame's replay (which overlaps)."""
+        assert self._thread is None, "a build is already in flight; call wait() first"
+        self._result = None
+        self._exc = None
+        self._done_event = None
+        self._thread = self._threading.Thread(target=self._run, name="sched-build",
+                                              daemon=True)
+        self._thread.start()
+
+    def wait(self) -> PrecomputedSchedule:
+        """Join the build thread and EVENT-SYNC the default stream to the build stream so the
+        freshly-built schedule is fully materialized before the caller replays over it."""
+        assert self._thread is not None, "no build in flight; call start() first"
+        self._thread.join()
+        self._thread = None
+        if self._exc is not None:
+            raise self._exc
+        # order the default (replay) stream strictly AFTER the build completed on the build
+        # stream — the ONLY synchronization point (no reading a half-built buffer).
+        if self._done_event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._done_event)
+        return self._result
+
+
 def _sched_chunk() -> int:
     """``C4_SCHED_CHUNK`` (default 4096): the per-chunk query-row batch the single graph
     processes.  Bigger amortizes the (already O(1)) per-chunk host op over more rows; the
@@ -1316,4 +1441,5 @@ def run_verify(model, L, code, draft, device, *, mask: int = 0xFFFFFFFF,
 
 __all__ = ["precomputed_schedule_enabled", "PrecomputedSchedule",
            "PrecomputedStepGraph", "build_schedule", "build_schedule_tables_only",
-           "run_verify", "PrecomputedResult"]
+           "run_verify", "PrecomputedResult",
+           "sched_pipeline_enabled", "PipelinedScheduleBuilder"]
