@@ -56,6 +56,26 @@ HALT = 38  # alias EXIT
 F_ADD, F_SUB, F_MUL, F_DIV = 40, 41, 42, 43
 NUM_OPS_FLOAT = 44   # OP_IS band width when C4_FLOAT_OPS is on (covers 0..43)
 
+# ---------------------------------------------------------------------------
+# EMIT (in-transformer JIT, ``C4_CFM_EMIT``, DEFAULT OFF).  The CFM-path analog
+# of ``nibble_compiler.EMIT`` (value 30 on the bespoke handoff ISA — a value that
+# is OPEN here).  EMIT APPENDS / rewrites a CODE frame into the SAME KV §Memory
+# the fetch@PC CAM reads: the produced instruction's op rides AX, its imm rides
+# STACK0, and the EMIT instruction's OWN immediate is the TARGET code address to
+# write — ``code[IMM] := Instr(op=AX, imm=STACK0)`` (mirror of
+# ``nibble_compiler.compile_emit_store``: ``CODE_WORD[IMM] := AX + 256*STACK0``).
+# Because ``_bake_code_cam`` is an address-keyed CAM over ALL code frames, a
+# runtime-appended frame becomes fetchable by PC with NO residual-width (D)
+# growth — the program-length-INDEPENDENT JIT the bespoke fixed-width ``CODE_WORD``
+# band (program size capped by D) lacks.  EMIT is NOT a neural dispatch op (no FFN
+# rule decodes it): the driver services it (like JSR/ENT/LEV/SI/SC) by reading the
+# model's AX/STACK0 and mutating the runtime code list.  Its VALUE (45) sits ABOVE
+# both NUM_OPS (40) and NUM_OPS_FLOAT (44), so the OP_IS one-hot band width
+# (``num_ops_effective``) is UNCHANGED whether or not EMIT is used -> the golden
+# 069cc32f layout/build stays byte-identical (EMIT only ever appears in the driver
+# + this reference oracle, never in the baked weights).
+EMIT = 45
+
 
 def float_ops_enabled() -> bool:
     """``C4_FLOAT_OPS`` (DEFAULT OFF): add the gated IEEE-754 single F_ADD/F_SUB/
@@ -80,6 +100,7 @@ NAMES = {
     OPEN: "OPEN", READ: "READ", CLOS: "CLOS", PRTF: "PRTF",
     MALC: "MALC", FREE: "FREE", MSET: "MSET", MCMP: "MCMP",
     F_ADD: "F_ADD", F_SUB: "F_SUB", F_MUL: "F_MUL", F_DIV: "F_DIV",
+    EMIT: "EMIT",
     NOP: "NOP",
     HALT: "HALT",
 }
@@ -188,7 +209,7 @@ def assemble(prog: List[Tuple[str, int]]) -> List[Instr]:
 
 
 def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
-              out: list = None, stdin=None):
+              out: list = None, stdin=None, mem_init: dict = None):
     """Reference 8-bit interpreter. Returns list of AX values emitted per step.
 
     Stack grows downward from ``mem_size`` (top). ``pop`` reads stack[SP] then SP+=1.
@@ -211,8 +232,17 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
     sp = mem_size          # empty stack
     pc = 0
     mem = [0] * mem_size
+    # ``mem_init`` pre-seeds the data §Memory (the input "file" a compiler reads via
+    # LI/LC) — the reference analog of the CFM driver's pre-seeded store_log.
+    if mem_init:
+        for a, v in mem_init.items():
+            mem[a % mem_size] = v & MASK
     stack = [0] * (mem_size + 1)
     emitted = []
+    # EMIT mutates ``code`` in place (writes the just-produced bytecode into the
+    # code array a later JMP runs), so work on a private copy — the caller's list
+    # stays pristine and re-runnable, matching the model driver's own runtime copy.
+    code = list(code)
 
     def push(v):
         nonlocal sp
@@ -320,6 +350,18 @@ def interpret(code: List[Instr], mem_size: int = 256, max_steps: int = 256,
             pc = imm if ax == 0 else pc
         elif op == BNZ:
             pc = imm if ax != 0 else pc
+        elif op == EMIT:
+            # In-transformer JIT: rewrite the code slot at ``imm`` to the produced
+            # instruction whose op rides AX and whose imm rides the stack top
+            # (STACK0), then POP that immediate.  ``code`` is mutated in place, so
+            # a later JMP to the emitted region runs the freshly-produced bytecode
+            # (self-modifying / just-compiled code).  Byte-exact analog of the CFM
+            # driver's EMIT service + ``nibble_compiler.compile_emit_store``.
+            produced_imm = pop()                  # STACK0 -> produced instruction imm
+            produced_op = ax & MASK               # AX     -> produced instruction op
+            while imm >= len(code):
+                code.append(Instr(NOP, 0))        # grow into the reserved JIT region
+            code[imm] = Instr(produced_op, produced_imm)
         elif op == HALT:
             emitted.append(ax)
             break
