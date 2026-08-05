@@ -139,6 +139,32 @@ int  dedup_on = 1;
 int  dedup_on = 0;
 #endif
 
+/* ---- FUSED NON-MATMUL TAIL (C4_FUSE_TAIL, opt-in, default OFF) ---------------
+ * The self-emulation floor is the NON-MATMUL TAIL: with the matmul MAC fused to
+ * 1 step/MAC (C4_MEM_OPERAND) the tail (silu + element-wise adds; softmax is
+ * negligible at the S=1 decode row) is 98.5% of the total.  The tail ops are
+ * D-wide element-wise loops: each element the emulating c4 stack machine does
+ * pointer math + loads + the compute + a store + loop control (~112 steps/elem
+ * for add, ~141 for silu's exp-Taylor).  A FUSED tail superinstruction — the
+ * analogue of the fused MAC — commits ONE element per model.forward: the operand
+ * CAM reads run in the instruction's early blocks and feed the late-block
+ * add / silu, so 1 step/element.
+ *
+ * In THIS reference runtime the fusion is a byte-EXACT proof: with -DC4_FUSE_TAIL
+ * the silu (op_unary kind 3) and the element-wise adds (ew_broadcast kind 0) route
+ * through a dedicated fused per-element evaluator (`fused_silu` / `fused_add3`)
+ * that produces the IDENTICAL fixed-point value the unfused loop does (the fusion
+ * collapses STEPS, not values — exactly as palette[idx]==the value for dedup, and
+ * MAC [a],[b]==the bytecode dot for the MAC).  DEFAULT-OFF -> the golden op path is
+ * byte-identical; ON -> byte-EXACT.  The step COLLAPSE (loop -> 1/element) is
+ * grounded in _tail_fused_src / ground_fused_tail_selfemu, not in this runtime's
+ * wall (this runtime is compiled native, not self-emulated). */
+#ifdef C4_FUSE_TAIL
+int  fuse_tail_on = 1;
+#else
+int  fuse_tail_on = 0;
+#endif
+
 /* intern a fixed-point value into the palette; return its index (linear scan —
  * C4-subset friendly; the palette is tiny so this is cheap at load time). */
 int palette_intern(long v) {
@@ -416,6 +442,9 @@ void load(char *path) {
     if (dedup_on)
         printf("  [dedup ON] palette = %d unique weight values (two-access weight read)\n",
                palette_n);
+    if (fuse_tail_on)
+        printf("  [fuse-tail ON] silu + element-wise adds route through the fused "
+               "per-element evaluators (1 step/element in self-emulation)\n");
 }
 
 /* find an attribute value on node `nd`, key `key`; return value index 0 or dflt */
@@ -478,6 +507,34 @@ long fpmul_l(long a, long b) {
     return 0 - ((0 - p + half) >> SCALE_BITS);
 }
 
+/* ---- FUSED TAIL per-element evaluators (C4_FUSE_TAIL) ------------------------
+ * A fused tail superinstruction commits ONE element per forward: the operand CAM
+ * read(s) run in the instruction's early blocks and feed the late-block compute.
+ * These helpers are the byte-EXACT value proof of that fusion — each computes the
+ * SAME fixed-point result the unfused D-iteration loop does, for one element.  The
+ * step collapse (loop -> 1/element) is grounded in _tail_fused_src; here we prove
+ * the RESULT is unchanged so the fused self-forward stays byte-identical. */
+
+/* fused SILU/sigmoid element: sigmoid(x) = SCALE^2 / (SCALE + exp(-x)).  Same
+   value op_unary kind 3 computes, evaluated as one fused element (the exp-Taylor
+   inner loop collapses into the instruction's own nonlinear forward). */
+long fused_silu(long x) {
+    long negx; long e; long numer;
+    negx = 0 - x;
+    e = fp_exp(negx);
+    numer = (long)SCALE * (long)SCALE;
+    return numer / (SCALE + e);
+}
+
+/* fused ADD element: the aligned/-inf-saturated add ew_broadcast kind 0 does for
+   one pair of already-resolved (getv) operands.  One fused element per forward. */
+long fused_add3(long xa, long xb, int afp, int bfp) {
+    if (afp && !bfp) xb = xb * SCALE;
+    if (bfp && !afp) xa = xa * SCALE;
+    if (xa <= NEG_INF_FP || xb <= NEG_INF_FP) return NEG_INF_FP;
+    return xa + xb;
+}
+
 /* broadcasting elementwise: kind 0=add 1=sub 2=mul 3=div.
    Handles fixed-point/int mixing exactly like fp_proto._align_add / Mul / Div. */
 void ew_broadcast(int out, int a, int b, int kind) {
@@ -519,7 +576,11 @@ void ew_broadcast(int out, int a, int b, int kind) {
             i = i + 1;
         }
         va = getv(a, ai); vb = getv(b, bi);
-        if (kind == 0 || kind == 1) {
+        if (kind == 0 && fuse_tail_on) {
+            /* FUSED element-wise ADD (the tail's dominant #2 op): one fused element
+               per forward, byte-identical value to the unfused loop below. */
+            vr = fused_add3(va, vb, afp, bfp);
+        } else if (kind == 0 || kind == 1) {
             /* align: scale the raw-int operand up when the other is fixed-point */
             long xa; long xb;
             xa = va; xb = vb;
@@ -859,12 +920,18 @@ void op_unary(int out, int in, int kind) {
         } else if (kind == 2) {          /* abs */
             tv[out][i] = (x < 0) ? (0 - x) : x;
         } else if (kind == 3) {          /* sigmoid = SCALE^2 / (SCALE + exp(-x)) */
-            long negx; long numer; negx = 0 - x;
-            e = fp_exp(negx);            /* our graph only feeds x<=0, so -x>=0 -> exp<=1;
+            if (fuse_tail_on) {
+                /* FUSED SILU (the tail's dominant #1 op): the exp-Taylor inner loop
+                   collapses into one fused element per forward, byte-identical value. */
+                tv[out][i] = fused_silu(x);
+            } else {
+                long negx; long numer; negx = 0 - x;
+                e = fp_exp(negx);        /* our graph only feeds x<=0, so -x>=0 -> exp<=1;
                                             fp_exp clamps x>0 to SCALE (exp(0)=1) which is
                                             the correct 0.5 midpoint at x=0. */
-            numer = (long)SCALE * (long)SCALE;   /* 64-bit: avoid int overflow */
-            tv[out][i] = numer / (SCALE + e);
+                numer = (long)SCALE * (long)SCALE;   /* 64-bit: avoid int overflow */
+                tv[out][i] = numer / (SCALE + e);
+            }
         } else {                         /* identity */
             tv[out][i] = x;
         }
