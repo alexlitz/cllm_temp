@@ -48,6 +48,43 @@ def multigpu_ksplit_enabled() -> bool:
     return os.environ.get("C4_MULTIGPU_KSPLIT", "0") not in ("0", "", "false", "False")
 
 
+def multigpu_frames_enabled() -> bool:
+    """``C4_MULTIGPU_FRAMES`` (DEFAULT OFF): FRAME-LEVEL 2-GPU parallelism.
+
+    The K-split (``C4_MULTIGPU_KSPLIT``) splits ONE frame's rows across two devices and
+    got only ~1.06x — NOT because of sync/split overhead but because the per-frame wall is
+    COMPUTE-BOUND (the ~238-block dead-FFN chain graph replay scales ~linearly in K: 15K
+    rows -> ~30 ms, 120K rows -> ~273 ms, ~constant ~2.0-2.3 us/step).  Splitting one
+    compute-bound frame's rows makes each device do HALF the rows in ~half the time, but
+    the two halves must both finish before the frame is assembled, so the frame wall is
+    ``max`` of the two halves ≈ the single-GPU half-frame wall — no throughput gain when
+    the whole frame already fits ONE chunk on one card (the doom render-reduced frame does).
+
+    The draft is byte-exact and runs AHEAD, so frames N, N+1, N+2, ... are ALL known before
+    any is verified.  This lever assigns WHOLE FRAMES to the two GPUs round-robin: GPU 0
+    verifies frame N while GPU 1 verifies frame N+1, one worker per GPU (each an independent
+    ``CUDA_VISIBLE_DEVICES``-pinned subprocess so ``cuda:0`` is a DISTINCT card), and the
+    parent collects the finished frames IN ORDER.  Each GPU runs a FULL independent
+    compute-bound frame, so the fixed per-frame compute is paid CONCURRENTLY on two frames
+    -> ~2x frame throughput (the robust ≥1 fps path, unlike the K-split).
+
+    DEFAULT OFF -> the single-GPU faithful/fast single-dispatch (golden 069cc32f unchanged).
+    """
+    return os.environ.get("C4_MULTIGPU_FRAMES", "0") not in ("0", "", "false", "False")
+
+
+def assign_frames_roundrobin(n_frames: int, n_dev: int = 2):
+    """Round-robin whole-frame -> device assignment: frame f -> device ``f % n_dev``.
+    Returns ``per_dev`` : list (one entry per device) of the frame indices that device owns,
+    in ascending order.  The parent collects frames in GLOBAL order (0,1,2,...) by pulling
+    from the owning device's ordered output queue -- assembling the render IDENTICALLY to a
+    sequential single-GPU render (each frame is a pure independent function of its draft)."""
+    per_dev = [[] for _ in range(n_dev)]
+    for f in range(n_frames):
+        per_dev[f % n_dev].append(f)
+    return per_dev
+
+
 # ===========================================================================
 # 1. DEVICE-INDEPENDENT full-frame numpy resolution (shared across shards).
 # ===========================================================================
@@ -385,4 +422,4 @@ def split_rows(n: int, n_dev: int = 2) -> List[Tuple[int, int]]:
 
 __all__ = ["multigpu_ksplit_enabled", "build_schedule_tables_shard", "_DeviceShard",
            "ShardVerdict", "reduce_verdicts", "split_rows", "_resolve_full_frame_numpy",
-           "slice_precompute"]
+           "slice_precompute", "multigpu_frames_enabled", "assign_frames_roundrobin"]
