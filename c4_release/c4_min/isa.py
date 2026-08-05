@@ -56,6 +56,17 @@ HALT = 38  # alias EXIT
 F_ADD, F_SUB, F_MUL, F_DIV = 40, 41, 42, 43
 NUM_OPS_FLOAT = 44   # OP_IS band width when C4_FLOAT_OPS is on (covers 0..43)
 
+# ---------------------------------------------------------------------------
+# NATIVE DOOM RENDER-MACRO opcodes (gated, DEFAULT OFF).  44/45 = BLIT/MEMCPY
+# (doom_blit, C4_DOOM_BLIT); 46 = NAMEEQ (doom_nameeq, C4_DOOM_NAMEEQ); 47 =
+# DRAWSPAN (doom_drawspan, C4_DOOM_DRAWSPAN) -- the V_DrawPatch column-copy
+# render macro.  These opcode VALUES sit ABOVE the golden NUM_OPS=40 opcode
+# one-hot band, so the baseline OP_IS layout is UNCHANGED when the gates are
+# off; DRAWSPAN's gate widens the band to ``NUM_OPS_DRAWSPAN`` only when on
+# (golden byte-identical off).  The op SEMANTICS live in ``c4_min.doom_drawspan``.
+DRAWSPAN = 47
+NUM_OPS_DRAWSPAN = 48   # OP_IS band width when C4_DOOM_DRAWSPAN is on (covers 0..47)
+
 
 def float_ops_enabled() -> bool:
     """``C4_FLOAT_OPS`` (DEFAULT OFF): add the gated IEEE-754 single F_ADD/F_SUB/
@@ -64,11 +75,28 @@ def float_ops_enabled() -> bool:
     return os.environ.get("C4_FLOAT_OPS", "0") not in ("0", "", "false", "False")
 
 
+def drawspan_enabled() -> bool:
+    """``C4_DOOM_DRAWSPAN`` (DEFAULT OFF): add the gated DRAWSPAN render-macro
+    opcode (47).  OFF -> the OP_IS band stays at its non-DRAWSPAN width and every
+    downstream layout dim is byte-identical to the golden 069cc32f build.  The
+    canonical gate + op semantics live in ``c4_min.doom_drawspan``; this mirror
+    keeps ``isa`` self-contained (no import cycle) for the OP_IS band sizing."""
+    return os.environ.get("C4_DOOM_DRAWSPAN", "0") not in ("0", "", "false", "False")
+
+
 def num_ops_effective() -> int:
     """Width of the OP_IS opcode one-hot band for the CURRENT flag state:
-    ``NUM_OPS`` (40, golden) when C4_FLOAT_OPS is off, ``NUM_OPS_FLOAT`` (44)
-    when on.  The layout reads THIS so a flag-off build is byte-identical."""
-    return NUM_OPS_FLOAT if float_ops_enabled() else NUM_OPS
+    ``NUM_OPS`` (40, golden) normally; widened to ``NUM_OPS_FLOAT`` (44) when
+    C4_FLOAT_OPS is on and/or to ``NUM_OPS_DRAWSPAN`` (48) when C4_DOOM_DRAWSPAN
+    is on (the DRAWSPAN opcode-47 one-hot needs a slot).  The band is the MAX of
+    the enabled extensions, so the gates compose.  The layout reads THIS, so a
+    flag-off build is byte-identical to golden 069cc32f."""
+    width = NUM_OPS
+    if float_ops_enabled():
+        width = max(width, NUM_OPS_FLOAT)
+    if drawspan_enabled():
+        width = max(width, NUM_OPS_DRAWSPAN)
+    return width
 
 NAMES = {
     LEA: "LEA", IMM: "IMM", JMP: "JMP", JSR: "JSR", BZ: "BZ", BNZ: "BNZ",

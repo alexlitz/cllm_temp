@@ -85,6 +85,19 @@ def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
     #   (``lc-sign-detect`` / ``lc-sign-extend``) fix — an INTENTIONAL move: the two
     #   sign-fill gadgets fire only on OP_IS[SHR]∧sign / OP_IS[LC]∧high-bit, so every
     #   non-shift / non-signed-char step (and thus the whole 1096 corpus) is unchanged.
+    #
+    # C4_DOOM_DRAWSPAN (default OFF): the native DRAWSPAN render-macro opcode (47,
+    #   ``c4_min.doom_drawspan``) that fuses Doom's V_DrawPatch column-copy loop.
+    #   OFF -> ``isa.num_ops_effective`` stays NUM_OPS=40, so the OP_IS one-hot band
+    #   and every downstream layout dim are byte-identical -> flag-OFF fingerprint
+    #   is UNCHANGED at the golden 069cc32f (the escape-hatch golden).  ON ->
+    #   ``num_ops_effective`` widens to NUM_OPS_DRAWSPAN=48 so the opcode-47 one-hot
+    #   has a slot (the SAME lever NUM_OPS_FLOAT uses), which is an INTENTIONAL move
+    #   of the fingerprint (wider OP_IS band by construction, exactly like the
+    #   8f4dd780→069cc32f precedent above):
+    #     C4_DOOM_DRAWSPAN=1 fingerprint: 2f69350f81d05c43df28d4c63bb78c0a2e32dd1aae07f05c7af3611fb67e164c
+    #       (short 2f69350f).  DELIBERATE — do NOT treat as a regression; the
+    #       flag-OFF 069cc32f remains the golden gate.
     from c4_min.compact_alloc import build_compact_sparse_streaming
 
     model, L, stats = build_compact_sparse_streaming(
