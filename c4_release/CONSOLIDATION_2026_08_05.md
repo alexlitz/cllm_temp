@@ -78,3 +78,87 @@ flag-OFF golden `069cc32f` is re-verified byte-identical after the full set.
 - `8e6946e7` / `6b5e15d8` NOT merged — already ancestors of `cddf79f2`.
 - Float-ops flag-ON fingerprint is not re-recorded here (only its band-widen to
   `NUM_OPS_FLOAT=44` is documented in `isa.py`); out of scope for the flag-OFF gate.
+
+---
+
+# Second consolidation pass — 2026-08-05 (faithfulness levers)
+
+Folds the two session-VERIFIED **faithfulness** levers on top of
+`consolidate-0.5b` @ `10991626`. Both change the **verify PATH** (how the
+speculative accept/reject compare runs) — **not** the weights — so every
+flag-OFF golden is re-verified byte-identical, and both flag-ON builds are
+also byte-identical (build-invariant, runtime-only).
+
+- **Base:** `consolidate-0.5b-2026-07-22` @ `10991626` (tip; carries the first
+  consolidation pass above + the composed perf stack + CFM base).
+- **Both levers based on** `e472b882`, already an ancestor of `10991626`.
+
+## Golden gate (re-verified on CPU via `python -m c4_min._fingerprint_build`)
+
+| Gate | Expected | Result |
+|------|----------|--------|
+| default (all flags OFF) | `069cc32f…` | **`069cc32f…` PASS** |
+| CFM (`C4_PF_CFM=1`)     | `7d19cdc3…` | **`7d19cdc3…` PASS** |
+| `C4_FAITHFUL_ATTN_EVICT=1` (path, not weights) | `069cc32f…` | **`069cc32f…` PASS** |
+| `C4_DIRECT_CAM_VERIFY_ADDR=1` (path, not weights) | `069cc32f…` | **`069cc32f…` PASS** |
+
+## Levers composed (this pass)
+
+| Lever | Flag (default OFF) | Source commit | Merge commit | Flag-ON fingerprint |
+|-------|--------------------|---------------|--------------|---------------------|
+| Faithful attention over the EVICTED cache (real softmax1+ALiBi verify — the model's OWN query independently resolves every memory read's address+value; tractable via the exact-evict liveness schedule) | `C4_FAITHFUL_ATTN_EVICT` | `9d9b8ec0` (branch `worktree-agent-a34bdb10635c848f9`, ⊇ `e472b882`) | `601af2ab` | path-invariant (verify path only, no weight change) → `069cc32f` |
+| O(1) INDEPENDENT address verify on the direct-CAM fast path (decode the model's OWN queried CAM address from its computed query sign-pattern; compare to the draft's resolved addr; O(1) per read, mismatch → terminal FAIL) | `C4_DIRECT_CAM_VERIFY_ADDR` | `aa85a9d2` (branch `worktree-agent-a20f69212b510615b`, ⊇ `e472b882`) | `aba99b8f` | path-invariant (verify path only, no weight change) → `069cc32f` |
+
+### Files touched (this pass)
+
+- `C4_FAITHFUL_ATTN_EVICT` (`9d9b8ec0`): `pf_speculative.py` (adds
+  `faithful_attn_evict_enabled()` + forces the per-op scored verify path /
+  exact-evict schedule / frozen-row-skip OFF when ON), `direct_cam_batched.py`
+  + `direct_local_cam.py` (faithful mode OVERRIDES the draft-trust CAM levers
+  to their genuine-scoring forms), `FAITHFUL_ATTN_EVICT_2026_08_05.md` (doc),
+  `_agent_faithful_evict_{byteexact,doom_cost,repro}.py` (3 verify/probe
+  scripts).
+- `C4_DIRECT_CAM_VERIFY_ADDR` (`aa85a9d2`): `direct_cam_batched.py` (adds
+  `verify_addr_enabled()`, `ResolvedTable.addr`/`code_addr`/`addr_sink`,
+  `DivergenceSink`, `_decode_model_query_addr`, and the O(1) sign-decode
+  address check in `_install_direct_forward`), `pf_speculative.py` (adds the
+  `addr_sink` poll after each verify span → terminal `kind='cam_addr'` FAIL),
+  `DOOM_FASTPATH_ADDR_VERIFY_2026_08_05.md` (doc),
+  `_agent_verify_addr_experiment.py` (experiment script).
+
+## Conflicts resolved (this pass)
+
+- **Both levers edit `direct_cam_batched.py` and `pf_speculative.py`'s
+  `verify_blocks`** — the expected conflict. They add DIFFERENT, non-adjacent
+  verify hooks:
+  - `direct_cam_batched.py`: `C4_FAITHFUL_ATTN_EVICT` inserts its override
+    INSIDE `direct_cam_batched_enabled()` (before its `return`); the addr
+    lever inserts a NEW `verify_addr_enabled()` function AFTER that return, plus
+    the `ResolvedTable`/`DivergenceSink`/decode/forward additions. Git's `ort`
+    strategy auto-merged cleanly (distinct regions). **Verified by inspection:
+    BOTH mechanisms present and preserved** — `direct_cam_batched_enabled()`
+    keeps the faithful override at lines 89-90, `verify_addr_enabled()` is
+    intact at lines 94-121.
+  - `pf_speculative.py`: `C4_FAITHFUL_ATTN_EVICT` gates the EARLY part of
+    `verify_blocks` (`faithful_attn_evict_enabled()` def ~L901; per-op-path /
+    exact-evict / frozen-skip forcing ~L977/L1413/L1540); the addr lever adds
+    the `_dcam_tbl.addr_sink` poll LATER in the same function (~L2017-2064).
+    Non-overlapping → auto-merged cleanly. **Verified:** `_dcam_tbl` is
+    installed at L1480 (`install_direct_cam_batched`, which populates
+    `addr_sink` only when `verify_addr_enabled()`) and read by the addr poll at
+    L2023 — the two hooks coexist correctly.
+- **Non-interference confirmed:** each mechanism is behind its OWN default-OFF
+  flag. `C4_FAITHFUL_ATTN_EVICT=1` forces the direct-CAM levers OFF (so there
+  are no direct-CAM reads for the addr-verify to inspect — the two paths are
+  mutually exclusive by construction, not conflicting). Spot-checked:
+  all four `*_enabled()` predicates return `False` when unset; the faithful
+  flag forces `direct_cam_batched_enabled()`/`direct_local_cam_enabled()` to
+  `False`; the addr flag toggles `verify_addr_enabled()` independently.
+
+## Notes (this pass)
+
+- Shared files already present on `10991626` from the first pass
+  (`DOOM_FASTPATH_FAITHFULNESS_AUDIT_2026_08_05.md`,
+  `SELFEMU_FASTPATH_TRANSFER_FINDINGS.md`, `_agent_selfemu_bigws.py`) were NOT
+  re-added — both feature branches carried identical copies, so the merges were
+  no-ops for those paths.
