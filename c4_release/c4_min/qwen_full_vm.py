@@ -100,6 +100,24 @@ def _div_longdiv() -> bool:
     return os.environ.get("C4_DIV_LONGDIV", "0") == "1"
 
 
+def _cfm_emit_enabled() -> bool:
+    """``C4_CFM_EMIT`` (DEFAULT OFF): the in-transformer JIT on the GOLDEN CFM path.
+
+    ON -> the CFM driver (``run_program`` / ``qwen_lean_forward.run_program_lean``)
+    services the ``isa.EMIT`` opcode (value 45, ABOVE the OP_IS band so the golden
+    069cc32f build is byte-identical) by APPENDING / rewriting a CODE frame into the
+    SAME KV §Memory the fetch@PC CAM (``_bake_code_cam``) reads: the produced
+    instruction word is read from the reconstructed input registers (op<-AX,
+    imm<-STACK0), the target code address is the EMIT immediate, and the new frame
+    joins the runtime code list ``_overlay_code_frames`` writes -> fetchable by PC
+    next step with NO residual-width (D) growth (program-length INDEPENDENT, unlike
+    the bespoke fixed-width ``CODE_WORD`` band).  A same-address re-emit OVERWRITES
+    the slot (latest-write-wins by construction — one code frame per address, so no
+    CAM recency tiebreak is needed).  OFF -> the read-only code path is byte-
+    identical to the historical CFM driver."""
+    return os.environ.get("C4_CFM_EMIT", "0") not in ("0", "", "false", "False")
+
+
 def _div_lean() -> bool:
     """Radix-16 divide VARIANT selector (only takes effect on the radix-16 path,
     i.e. when NOT ``C4_DIV_LONGDIV``).  DEFAULT ON (``C4_DIV_LEAN`` unset or ``1``)
@@ -1583,16 +1601,53 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
     _POP_OPS = {isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD, isa.AND, isa.OR,
                 isa.XOR, isa.SHL, isa.SHR, isa.EQ, isa.NE, isa.LT, isa.GT,
                 isa.LE, isa.GE}
+    # RUNTIME code list — the in-transformer JIT's writable code §Memory (a private
+    # mutable copy EMIT rewrites; ``_build_stream_and_overlay`` overlays THIS as the
+    # code frames the fetch@PC CAM reads).  Flag-off it equals ``code`` (byte-exact).
+    emit_on = _cfm_emit_enabled() and vm.code_from_memory
+    run_code = list(code)
 
     for _ in range(max_steps):
-        op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
+        op = run_code[cur_pc].op if 0 <= cur_pc < len(run_code) else None
         prev = dict(reg_state)
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
             load_addr = prev["AX"] & 0xFF            # 8-bit load address (corpus slice)
 
-        x = _build_stream_and_overlay(vm, code, reg_state, store_log, load_addr)
+        x = _build_stream_and_overlay(vm, run_code, reg_state, store_log, load_addr)
         state = _forward(vm, x)
+
+        # EMIT (in-transformer JIT, C4_CFM_EMIT): a driver-serviced control op (like
+        # JSR/ENT/LEV — EMIT has no FFN dispatch rule).  The model FETCHED this EMIT
+        # from the code CAM (proving fetch@PC serves runtime-appended frames) + the
+        # register CAM reconstructed the input state; the driver reads the produced
+        # word from the input registers (op<-AX, imm<-STACK0), writes/overwrites the
+        # code frame at the EMIT immediate, and bumps PC.  Byte-exact vs isa.interpret.
+        if emit_on and op == isa.EMIT:
+            produced_op = prev["AX"] & 0xFF
+            produced_imm = prev["STACK0"] & 0xFF
+            target = run_code[cur_pc].imm
+            while target >= len(run_code):
+                run_code.append(isa.Instr(isa.NOP, 0))
+            run_code[target] = isa.Instr(produced_op, produced_imm)
+            # EMIT pops the immediate it consumed off the KV-backed stack.
+            new_stk = 0
+            if spill_stack_to_kv and stack_kv:
+                _psaddr, _ = stack_kv.pop()
+                store_log = [s for s in store_log
+                             if (s["addr"] & 0xFF) != (_psaddr & 0xFF)]
+                new_stk = stack_kv[-1][1] if stack_kv else 0
+            pc = cur_pc + 1
+            reg_state = {"PC": pc, "AX": prev["AX"], "SP": (prev["SP"] + 1) & 0xFFFFFFFF,
+                         "BP": prev["BP"], "STACK0": new_stk}
+            ax_trace.append(prev["AX"])
+            if verbose:
+                print(f"  step pc={cur_pc} op=EMIT  -> code[{target}]="
+                      f"({isa.NAMES.get(produced_op, produced_op)} {produced_imm}) pc={pc}")
+            cur_pc = pc
+            if cur_pc < 0 or cur_pc >= len(run_code):
+                break
+            continue
 
         pc = _snap(state[L.PC_VAL])
         # AX decode: for the efficient-ALU ops (MUL/DIV/MOD) the ax-mux writes the
@@ -1673,7 +1728,7 @@ def run_program(vm: QwenFullVM, code: List[isa.Instr], max_steps: int = 64,
             print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):5s} -> "
                   f"pc={pc} ax={ax} sp={sp} bp={bp} stk={stk} halt={halted}")
         cur_pc = pc
-        if halted or cur_pc < 0 or cur_pc >= len(code):
+        if halted or cur_pc < 0 or cur_pc >= len(run_code):
             break
     return {"ax_trace": ax_trace, "ref_trace": ref_trace,
             "exact": ax_trace == ref_trace, "steps": len(ax_trace)}

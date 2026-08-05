@@ -175,6 +175,81 @@ def _down_delta_inplace_kernel(
     tl.store(yp, tl.load(yp, mask=k_mask, other=0.0) + acc, mask=k_mask)
 
 
+# ---------------------------------------------------------------------------
+# KERNEL 2c — FUSED-HIDDEN down DELTA in-place.  The single-kernel form that keeps
+#   the [Dff,K] hidden ON-CHIP: one program per (ACTIVE output row prog, K-tile).
+#   For each hidden col W_down[prog,:] reads, it RECOMPUTES that hidden value
+#   (silu(up)*gate) on the fly IN REGISTERS from a SNAPSHOT ``xs [n_in,K]`` of the
+#   residual dims up/gate read (taken BEFORE any delta write), and adds Wdown[prog,h]*h
+#   to y_ptr[d] IN PLACE.  This eliminates the [Dff,K] HBM hidden buffer the 2-kernel
+#   path (_fused_upgate_silu_kernel WRITES it, _down_delta_inplace_kernel READS it)
+#   round-trips — the profiler's 92%-of-bytes dominant term — WITHOUT a full-[D,K] copy
+#   (the snapshot is only the n_in ~4-148 read dims, remapped to snapshot-local cols).
+#
+#   BYTE-EXACT vs the 2-kernel delta path:
+#     * up/gate read the SNAPSHOT xs (the PRE-BLOCK residual value of the read dims),
+#       NEVER the in-place-updated y — so the recompute sees the SAME clean residual
+#       kernel-1 saw (no read-after-write hazard, though 47/49 blocks WRITE a residual dim
+#       they READ as an FFN input): the read source (snapshot) and the write target (y)
+#       are SEPARATE buffers.
+#     * the per-output-row accumulation order is IDENTICAL: it walks the SAME W_down CSR
+#       (col-sorted), and each recomputed hidden walks the SAME W_up/W_gate CSR — so the
+#       fp-accumulation is bit-identical to computing h once (kernel-1) then reducing it
+#       (kernel-2).  Only the (already byte-exact) COO-vs-cuBLAS residue remains.
+#   RECOMPUTE: a hidden col read by R active rows is recomputed R times.  MEASURED blowup
+#   over the DIV-free doom region = 1.29x hidden-compute nnz (compute is 350x below the
+#   HBM floor, so this is ~free) — the trade is 1.29x nearly-free compute for eliminating
+#   ALL 59 KB/K-col of hidden HBM traffic.
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_hidden_delta_snap_kernel(
+    active_row_ptr,                            # [n_active] residual dim of each prog
+    dn_crow_ptr, dn_col_ptr, dn_val_ptr,       # CSR of W_down over ACTIVE rows [n_active, Dff]
+    up_crow_ptr, up_col_ptr, up_val_ptr,       # CSR of W_up [Dff, n_in] (cols SNAPSHOT-local)
+    gt_crow_ptr, gt_col_ptr, gt_val_ptr,       # CSR of W_gate [Dff, n_in] (cols SNAPSHOT-local)
+    x_ptr,                                     # SNAPSHOT xs [n_in, K] (read for up/gate)
+    bup_ptr, bgt_ptr,                          # [Dff]
+    y_ptr,                                     # residual [D, K] (updated IN PLACE, += delta)
+    K,
+    stride_xd, stride_xk,
+    stride_yd, stride_yk,
+    BLOCK_K: tl.constexpr,
+):
+    prog = tl.program_id(0)
+    kblk = tl.program_id(1)
+    k_off = kblk * BLOCK_K + tl.arange(0, BLOCK_K)
+    k_mask = k_off < K
+    d = tl.load(active_row_ptr + prog)         # actual residual dim W_down writes
+
+    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+    ds = tl.load(dn_crow_ptr + prog)
+    de = tl.load(dn_crow_ptr + prog + 1)
+    for p in range(ds, de):
+        hcol = tl.load(dn_col_ptr + p)         # hidden index
+        wdn = tl.load(dn_val_ptr + p)
+        # recompute hidden[hcol, ktile] = silu(up)*gate  IN REGISTERS from the snapshot.
+        up = tl.zeros([BLOCK_K], dtype=tl.float32) + tl.load(bup_ptr + hcol)
+        us = tl.load(up_crow_ptr + hcol)
+        ue = tl.load(up_crow_ptr + hcol + 1)
+        for q in range(us, ue):
+            c = tl.load(up_col_ptr + q)
+            v = tl.load(up_val_ptr + q)
+            up += v * tl.load(x_ptr + c * stride_xd + k_off * stride_xk, mask=k_mask, other=0.0)
+        gate = tl.zeros([BLOCK_K], dtype=tl.float32) + tl.load(bgt_ptr + hcol)
+        gsq = tl.load(gt_crow_ptr + hcol)
+        geq = tl.load(gt_crow_ptr + hcol + 1)
+        for q in range(gsq, geq):
+            c = tl.load(gt_col_ptr + q)
+            v = tl.load(gt_val_ptr + q)
+            gate += v * tl.load(x_ptr + c * stride_xd + k_off * stride_xk, mask=k_mask, other=0.0)
+        h = (up * tl.sigmoid(up)) * gate
+        acc += wdn * h
+    # add the FFN delta to the residual at row d IN PLACE (up/gate read the SNAPSHOT xs,
+    # never y, so this in-place write cannot corrupt any program's hidden recompute).
+    yp = y_ptr + d * stride_yd + k_off * stride_yk
+    tl.store(yp, tl.load(yp, mask=k_mask, other=0.0) + acc, mask=k_mask)
+
+
 def _csr(w_dense: torch.Tensor):
     """Return (crow[M+1], col[nnz] int32, val[nnz] fp32) CSR of [M,D] dense w,
     row-sorted + col-sorted (stable, deterministic accumulation order)."""
