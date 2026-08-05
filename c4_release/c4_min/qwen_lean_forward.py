@@ -40,6 +40,7 @@ into ``LeanQwenVM.forward`` + ``speculative_run_lean`` without touching the bake
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -63,6 +64,23 @@ from .qwen_lean_stack import LeanDataStack, draft_program_lean_stackfn
 # run_program`` does.  Reading AX_VAL for these ops returns a STALE value (the popped
 # second operand), which is why the lean driver decoded ``12 MUL 7 -> 7`` not 84.
 _NIB_AX_OPS_BASE = frozenset({isa.MUL, isa.DIV, isa.MOD})
+
+
+def _cfm_emit_enabled() -> bool:
+    """``C4_CFM_EMIT`` (DEFAULT OFF): the in-transformer JIT on the GOLDEN CFM path.
+
+    ON -> the CFM driver services the ``isa.EMIT`` opcode (opcode 45, above the
+    OP_IS band so the golden 069cc32f build is byte-identical) by APPENDING /
+    rewriting a CODE frame into the SAME KV §Memory the fetch@PC CAM reads: it
+    reads the produced instruction word from the model output (op<-AX, imm<-STACK0)
+    and the target code address from the EMIT instruction's own immediate, then
+    updates a RUNTIME code list that ``_overlay_code_frames`` writes next step.
+    Because ``_bake_code_cam`` is an address-keyed CAM over ALL code frames, the
+    runtime-appended frame is fetchable by PC with NO residual-width (D) growth —
+    program-length-INDEPENDENT, unlike the bespoke fixed-width ``CODE_WORD`` band
+    (``nibble_compiler``).  OFF -> the read-only code path is byte-identical to the
+    historical CFM driver (EMIT never appears in a golden program)."""
+    return os.environ.get("C4_CFM_EMIT", "0") not in ("0", "", "false", "False")
 
 
 # ===========================================================================
@@ -111,6 +129,9 @@ def interpret_with_functions(code: List[isa.Instr], mem_size: int = 256,
     mem = [0] * mem_size
     stack = [0] * (mem_size + 1)
     emitted = []
+    # EMIT mutates ``code`` in place (self-modifying / just-compiled code); work on
+    # a private copy so the caller's list stays pristine (matches isa.interpret).
+    code = list(code)
     # (ret_pc, saved_bp) frames — the SAME two-slot abstraction the fused VM
     # driver pushes/pops alongside the token stream.
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
@@ -206,6 +227,12 @@ def interpret_with_functions(code: List[isa.Instr], mem_size: int = 256,
                 bp = saved_bp
             if ret_pc is not None:
                 pc = ret_pc
+        elif op == isa.EMIT:
+            produced_imm = pop()                      # STACK0 -> produced imm
+            produced_op = ax & isa.MASK               # AX     -> produced op
+            while imm >= len(code):
+                code.append(isa.Instr(isa.NOP, 0))
+            code[imm] = isa.Instr(produced_op, produced_imm)
         elif op == isa.NOP:
             pass
         elif op == isa.HALT:
@@ -541,8 +568,16 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
     call_stack: List[Tuple[Optional[int], Optional[int]]] = []
     ds = LeanDataStack() if stack_depth else None    # real depth-N operand stack
 
+    # RUNTIME code list — the in-transformer JIT's writable code §Memory.  A private
+    # mutable copy of ``code`` that EMIT rewrites (self-modifying / just-compiled
+    # code); ``_build_stream_and_overlay`` overlays THIS as the code frames the
+    # fetch@PC CAM reads, so a runtime-appended frame is fetched by PC next step with
+    # no D growth.  When C4_CFM_EMIT is off this equals ``code`` (byte-identical).
+    emit_on = _cfm_emit_enabled() and lean.code_from_memory
+    run_code = list(code)
+
     for _ in range(max_steps):
-        op = code[cur_pc].op if 0 <= cur_pc < len(code) else None
+        op = run_code[cur_pc].op if 0 <= cur_pc < len(run_code) else None
         prev = dict(reg_state)
         load_addr = None
         if subset.memory and op in (isa.LI, isa.LC):
@@ -553,10 +588,49 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
         if ds is not None:
             reg_state["STACK0"] = ds.top()
 
-        x, positions = _build_stream_and_overlay(lean, code, reg_state, store_log, load_addr)
+        x, positions = _build_stream_and_overlay(lean, run_code, reg_state, store_log, load_addr)
         with torch.no_grad():
             hidden, _ = lean.forward(x, past=None, q_positions=positions)
         state = hidden[0, -1]
+
+        # EMIT (in-transformer JIT, C4_CFM_EMIT): a driver-serviced control op — like
+        # JSR/ENT/LEV, the driver owns its PC/SP bookkeeping (EMIT has NO FFN dispatch
+        # rule, so the model's post-EMIT scalars are undefined).  The model still ran:
+        # it FETCHED this EMIT instruction from the code CAM (proving fetch@PC serves
+        # runtime-appended frames) and the register CAM reconstructed the input state.
+        # The produced instruction word is read from the RECONSTRUCTED input registers
+        # (op<-AX, imm<-STACK0), the target address is the EMIT immediate, and the new
+        # code frame joins ``run_code`` -> fetchable by PC next step (byte-exact vs
+        # isa.interpret's EMIT).  Same-address re-emit OVERWRITES the slot (latest-
+        # write-wins by construction: one frame per address, no CAM recency needed).
+        if emit_on and op == isa.EMIT:
+            produced_op = prev["AX"] & 0xFF
+            produced_imm = (ds.top() if ds is not None else prev["STACK0"]) & 0xFF
+            target = run_code[cur_pc].imm
+            while target >= len(run_code):
+                run_code.append(isa.Instr(isa.NOP, 0))
+            run_code[target] = isa.Instr(produced_op, produced_imm)
+            # advance the real data stack: EMIT pops the immediate it consumed
+            # (EMIT is not in POP_OPS, so pop the ``ds.values`` top directly).
+            if ds is not None:
+                if ds.values:
+                    ds.values.pop()
+                stk = ds.top()
+            else:
+                stk = 0
+            pc = cur_pc + 1
+            sp = (prev["SP"] + 1) & 0xFFFFFFFF          # pop the produced immediate
+            reg_state = {"PC": pc, "AX": prev["AX"], "SP": sp,
+                         "BP": prev["BP"], "STACK0": stk}
+            ax_trace.append(prev["AX"])
+            if verbose:
+                print(f"  step pc={cur_pc} op=EMIT  -> code[{target}]="
+                      f"({isa.NAMES.get(produced_op, produced_op)} {produced_imm}) "
+                      f"pc={pc} sp={sp} stk={stk}")
+            cur_pc = pc
+            if cur_pc < 0 or cur_pc >= len(run_code):
+                break
+            continue
 
         pc = _snap(state[L.PC_VAL])
         # AX decode: the efficient-ALU MUL/DIV/MOD (+SHL/SHR under shift_via_mul) write
@@ -604,7 +678,7 @@ def run_program_lean(lean: LeanQwenVM, code: List[isa.Instr], max_steps: int = 6
             print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):5s} -> "
                   f"pc={pc} ax={ax} sp={sp} bp={bp} stk={stk} halt={halted}")
         cur_pc = pc
-        if halted or cur_pc < 0 or cur_pc >= len(code):
+        if halted or cur_pc < 0 or cur_pc >= len(run_code):
             break
     return {"ax_trace": ax_trace, "ref_trace": ref_trace,
             "exact": ax_trace == ref_trace, "steps": len(ax_trace)}
