@@ -1403,7 +1403,8 @@ class PipelinedScheduleBuilder:
     continuous loop re-drafts per real frame; here the build cost — the target — is the
     same tensor work regardless), so the thread re-runs ``build_schedule_tables_only``."""
 
-    def __init__(self, model, L, code, draft, device, sg, mask: int = 0xFFFFFFFF):
+    def __init__(self, model, L, code, draft, device, sg, mask: int = 0xFFFFFFFF,
+                 faithful: bool = False):
         import threading
         self._threading = threading
         self.model = model
@@ -1420,16 +1421,52 @@ class PipelinedScheduleBuilder:
         self._build_stream = torch.cuda.Stream(device=self.device)
         self._thread: Optional["threading.Thread"] = None
         self._result: Optional[PrecomputedSchedule] = None
+        self._precomp = None                       # the faithful precompute for this frame
         self._exc: Optional[BaseException] = None
         self._done_event: Optional[torch.cuda.Event] = None
+        # FAITHFUL SINGLE-DISPATCH: also PIPELINE the value-verify's genuine value
+        # re-resolution.  It is a PURE function of the store-log — knowable BEFORE the
+        # dispatch — so it runs on THIS build thread (GIL-releasing numpy: lexsort /
+        # searchsorted latest-write-wins), concurrent with the previous frame's replay,
+        # exactly like the schedule build.  The critical path then only does the cheap
+        # vectorized model-vs-precomputed compare (``verify_faithful_fast``).
+        self.faithful = bool(faithful)
+        self._plan = None
+        self._ws = None
+        if self.faithful:
+            import numpy as _np
+            from .faithful_single_dispatch import build_faithful_plan
+            # the plan (committed store arrays + draft addr/val/code dicts) is fixed per
+            # draft — build it ONCE; the per-frame precompute re-resolves the genuine values.
+            self._plan = build_faithful_plan(model, L, code, draft)
+            self._ws = _np.asarray(draft.win_starts[:draft.step_count], dtype=_np.int64)
+
+    def _build_precompute(self):
+        """The faithful value-verify precompute (GIL-releasing numpy) — the piece we moved
+        off the critical path onto this build thread."""
+        from .faithful_single_dispatch import build_faithful_precompute
+        return build_faithful_precompute(self.draft, self._plan, self._ws,
+                                         self.draft.step_count, mask=self.mask)
 
     def build_blocking(self) -> PrecomputedSchedule:
-        """Frame-0 build (no concurrent dispatch yet); runs on the caller thread/stream."""
+        """Frame-0 build (no concurrent dispatch yet); runs on the caller thread/stream.
+        Also builds the frame-0 faithful precompute (stored in ``self._precomp``)."""
+        if self.faithful:
+            self._precomp = self._build_precompute()
         return build_schedule_tables_only(self.model, self.L, self.code, self.draft,
                                           self.device, self.sg, mask=self.mask)
 
+    def last_precompute(self):
+        """The faithful precompute matching the schedule the last ``wait``/``build_blocking``
+        returned (None when not faithful).  The critical path passes this to
+        ``verify_faithful_fast`` with the dispatch's decoded model addresses."""
+        return self._precomp
+
     def _run(self):
         try:
+            # the faithful value-verify re-resolution — pure numpy, releases the GIL, so it
+            # overlaps the previous frame's replay on the calling (default) stream.
+            precomp = self._build_precompute() if self.faithful else None
             with torch.cuda.stream(self._build_stream):
                 with torch.no_grad():
                     sched = build_schedule_tables_only(
@@ -1441,6 +1478,7 @@ class PipelinedScheduleBuilder:
                 ev.record(self._build_stream)
                 self._done_event = ev
             self._result = sched
+            self._precomp_next = precomp
         except BaseException as e:                 # surface build errors at wait()
             self._exc = e
 
@@ -1449,6 +1487,7 @@ class PipelinedScheduleBuilder:
         immediately; the caller then issues the current frame's replay (which overlaps)."""
         assert self._thread is None, "a build is already in flight; call wait() first"
         self._result = None
+        self._precomp_next = None
         self._exc = None
         self._done_event = None
         self._thread = self._threading.Thread(target=self._run, name="sched-build",
@@ -1457,7 +1496,8 @@ class PipelinedScheduleBuilder:
 
     def wait(self) -> PrecomputedSchedule:
         """Join the build thread and EVENT-SYNC the default stream to the build stream so the
-        freshly-built schedule is fully materialized before the caller replays over it."""
+        freshly-built schedule is fully materialized before the caller replays over it.  Also
+        swaps in the freshly-built faithful precompute (``last_precompute``)."""
         assert self._thread is not None, "no build in flight; call start() first"
         self._thread.join()
         self._thread = None
@@ -1467,6 +1507,7 @@ class PipelinedScheduleBuilder:
         # stream — the ONLY synchronization point (no reading a half-built buffer).
         if self._done_event is not None:
             torch.cuda.current_stream(self.device).wait_event(self._done_event)
+        self._precomp = self._precomp_next
         return self._result
 
 
@@ -1604,7 +1645,8 @@ def run_faithful_verify(model, L, code, draft, device, *, mask=0xFFFFFFFF,
     verify_blocks fallback)."""
     import numpy as _np
     import time as _time
-    from .faithful_single_dispatch import build_faithful_plan, verify_faithful
+    from .faithful_single_dispatch import (build_faithful_plan,
+                                           build_faithful_precompute, verify_faithful_fast)
     dev = torch.device(device)
     _DM = {"DIV", "MOD"}
     for s in range(draft.step_count):
@@ -1655,16 +1697,25 @@ def run_faithful_verify(model, L, code, draft, device, *, mask=0xFFFFFFFF,
                                torch.tensor(n, device=dev)).item())
     t_fast = _time.perf_counter() - t0
     # ---- GENUINE verify (routing / address / value from the model's query) ----
+    # PIPELINED SPLIT: the genuine value re-resolution (latest-write-wins over the committed
+    # store-log) is a PURE function of the store-log — knowable BEFORE the dispatch — so it is
+    # done as a DRAFT-ONLY precompute (``build_faithful_precompute``, GIL-releasing numpy) that
+    # in the continuous render loop rides on the background build thread (concurrent with the
+    # prior frame's replay, via ``PipelinedScheduleBuilder``).  The critical path here only
+    # does the cheap fully-vectorized model-vs-precomputed compare (``verify_faithful_fast``).
+    ws = _np.asarray(draft.win_starts[:n], dtype=_np.int64)
     t0 = _time.perf_counter()
     plan = build_faithful_plan(model, L, code, draft)
+    pre = build_faithful_precompute(draft, plan, ws, n, mask=mask)
+    t_precomp = _time.perf_counter() - t0
     model_addrs = {}
     for (b, hh, knd), chunks in per_head.items():
         full = _np.zeros(n, dtype=_np.int64)
         for (lo, hi, arr) in chunks:
             full[lo:hi] = arr[:hi - lo]
         model_addrs[(b, knd)] = full
-    ws = _np.asarray(draft.win_starts[:n], dtype=_np.int64)
-    verdict = verify_faithful(draft, plan, model_addrs, ws, mask=mask)
+    t0 = _time.perf_counter()
+    verdict = verify_faithful_fast(pre, model_addrs)
     t_verify = _time.perf_counter() - t0
     n_ok_gen = verdict.first_bad_step if not verdict.ok else n
     n_ok = min(n_ok_reg, n_ok_gen)
@@ -1682,7 +1733,8 @@ def run_faithful_verify(model, L, code, draft, device, *, mask=0xFFFFFFFF,
         stats["host_ops_per_forward"] = host_ops
         stats["chunk"] = chunk
         stats["fast_dispatch_secs"] = t_fast
-        stats["faithful_verify_secs"] = t_verify
+        stats["faithful_precompute_secs"] = t_precomp    # pipelined onto the build thread
+        stats["faithful_verify_secs"] = t_verify         # the residual critical-path compare
         stats["faithful_addr_checked"] = verdict.n_addr_checked
         stats["faithful_value_checked"] = verdict.n_value_checked
         stats["faithful_routing_checked"] = verdict.n_routing_checked

@@ -302,5 +302,193 @@ def verify_faithful(draft, plan: FaithfulPlan,
                            n_value_checked=n_val, n_routing_checked=n_rt)
 
 
+# ===========================================================================
+# 4. THE PIPELINED + VECTORIZED VERIFY.  Split ``verify_faithful`` into a heavy
+#    DRAFT-ONLY precompute (the latest-write-wins value re-resolution) that is a PURE
+#    function of the store-log — knowable BEFORE the dispatch, so it runs on the
+#    GIL-releasing build thread CONCURRENT with the previous frame's graph replay — and a
+#    cheap fully-VECTORIZED (no Python per-read loop) model-vs-precomputed compare on the
+#    critical path.
+#
+# WHY the pipelined/vectorized verdict is byte-identical to ``verify_faithful``:
+#   The genuine value re-resolution is ``latest_write_wins(addr, committed stores)``.
+#   ``verify_faithful`` keys it on the MODEL's decoded address; here we precompute it at
+#   the DRAFT's claimed address (known pre-dispatch).  The VALUE check only contributes at
+#   a step where the query is ARMED (model_addr != 0), and:
+#     * armed & address MATCHES (model_addr == draft_addr): the two addresses are the SAME,
+#       so ``genuine(model_addr) == genuine(draft_addr) == pre_genuine`` — identical value.
+#     * armed & address MISMATCHES: the ADDRESS check ``_note``s that step (address is
+#       scored before value per head), and ``_note`` keeps the LOWEST step and the FIRST
+#       kind at a tie, so the reported (step, kind) is the address one in BOTH forms — the
+#       value check at that already-failing step is dominated either way.
+#   So the reported (first_bad_step, kind) verdict is identical; only a dominated
+#   value-DETAIL at an already-address-failing step could differ (never the verdict).
+#   GENUINENESS is preserved: ``pre_genuine`` is the independent latest-write-wins over the
+#   COMMITTED stores (rejects the value-stale draft — scenario E value layer), and the
+#   address layer (rejects the wrong-address draft — scenario E address layer) is unchanged.
+# ===========================================================================
+@dataclass
+class FaithfulPrecompute:
+    """DRAFT-ONLY precomputed verify state (build-thread, pre-dispatch).
+
+    Per CAM kind (mem/pop/lev/uni) dense int64 arrays over the READS the draft declares
+    for that kind (one entry per query step that reads that kind, in step order):
+      ``steps[kind]``       : step index of each read.
+      ``draft_addr[kind]``  : draft's claimed read address (the address-check target).
+      ``draft_val[kind]``   : draft's injected read value (the fast decode trusts this).
+      ``pre_genuine[kind]`` : GENUINE latest-write-wins value at ``draft_addr`` over the
+                              COMMITTED stores (== ``genuine(model_addr)`` once the address
+                              check passes — the value-check target).  This latest-write-wins
+                              re-resolution is the heavy (~90%) numpy work, done ONCE here on
+                              the build thread instead of on the critical path.
+    Plus routing: ``code_steps`` / ``code_addr`` (the PC the draft routed).  ``n`` = steps."""
+    n: int
+    mask: int
+    steps: Dict[str, np.ndarray]
+    draft_addr: Dict[str, np.ndarray]
+    draft_val: Dict[str, np.ndarray]
+    pre_genuine: Dict[str, np.ndarray]
+    code_steps: np.ndarray
+    code_addr: np.ndarray
+
+
+def build_faithful_precompute(draft, plan: FaithfulPlan, win_starts: np.ndarray,
+                              n: int, mask: int = 0xFFFFFFFF) -> FaithfulPrecompute:
+    """Precompute the per-read genuine VALUE re-resolution + the compare targets from the
+    DRAFT + store-log ALONE (no model output).  A PURE function of the store-log, so it
+    runs on the GIL-releasing build thread concurrent with the previous frame's graph
+    replay.
+
+    The heavy work is the single vectorized ``_genuine_value_at`` latest-write-wins over the
+    committed stores at every draft read address (the ~1.9 us/step the critical path used to
+    pay AFTER the dispatch).  The critical path then only gathers + compares
+    (``verify_faithful_fast``)."""
+    ws = np.asarray(win_starts[:n], dtype=np.int64)
+    read_frame = _read_frame_of_step(draft, n)
+    amask = (1 << ADDR_BITS) - 1
+    steps: Dict[str, np.ndarray] = {}
+    draft_addr: Dict[str, np.ndarray] = {}
+    draft_val: Dict[str, np.ndarray] = {}
+    pre_genuine: Dict[str, np.ndarray] = {}
+    # position -> step (each step has a unique query row win_start).
+    pos_to_step = {int(ws[s]): s for s in range(n)}
+    for kind in ("mem", "pop", "lev", "uni"):
+        addr_d = plan.draft_addr.get(kind, {})
+        if not addr_d:
+            continue
+        val_d = plan.draft_val.get(kind, {})
+        pos_arr = np.fromiter((p for p in addr_d.keys() if p in pos_to_step),
+                              dtype=np.int64, count=-1)
+        if pos_arr.shape[0] == 0:
+            continue
+        step_arr = np.fromiter((pos_to_step[int(p)] for p in pos_arr),
+                               dtype=np.int64, count=pos_arr.shape[0])
+        order = np.argsort(step_arr, kind="stable")
+        step_arr = step_arr[order]; pos_arr = pos_arr[order]
+        da = np.fromiter((int(addr_d[int(p)]) & amask for p in pos_arr),
+                         dtype=np.int64, count=pos_arr.shape[0])
+        dv = np.fromiter((int(val_d.get(int(p), 0)) & mask for p in pos_arr),
+                         dtype=np.int64, count=pos_arr.shape[0])
+        rf = read_frame[step_arr]
+        # THE HEAVY PART (vectorized latest-write-wins at the DRAFT address).
+        pg = _genuine_value_at(da, rf, plan)
+        steps[kind] = step_arr
+        draft_addr[kind] = da
+        draft_val[kind] = dv
+        pre_genuine[kind] = (pg & mask).astype(np.int64)
+    # ROUTING (code) targets — dense over the steps with a code fetch.
+    ca = plan.code_addr
+    if ca:
+        cmask = (1 << CODE_ADDR_BITS) - 1
+        cpos = np.fromiter((p for p in ca.keys() if p in pos_to_step),
+                           dtype=np.int64, count=-1)
+        cstep = np.fromiter((pos_to_step[int(p)] for p in cpos),
+                            dtype=np.int64, count=cpos.shape[0])
+        corder = np.argsort(cstep, kind="stable")
+        cstep = cstep[corder]; cpos = cpos[corder]
+        caddr = np.fromiter((int(ca[int(p)]) & cmask for p in cpos),
+                            dtype=np.int64, count=cpos.shape[0])
+    else:
+        cstep = np.zeros(0, dtype=np.int64); caddr = np.zeros(0, dtype=np.int64)
+    return FaithfulPrecompute(n=n, mask=mask, steps=steps, draft_addr=draft_addr,
+                              draft_val=draft_val, pre_genuine=pre_genuine,
+                              code_steps=cstep, code_addr=caddr)
+
+
+def verify_faithful_fast(pre: FaithfulPrecompute,
+                         model_addrs: Dict[Tuple[int, str], np.ndarray]) -> FaithfulVerdict:
+    """CRITICAL-PATH verify: a fully-VECTORIZED (no per-read Python loop) compare of the
+    model's decoded query addresses against the DRAFT-precomputed targets (``pre``).
+
+    Byte-identical first-divergence verdict to ``verify_faithful`` (see the module-4
+    equivalence note).  ``pre`` already carries the heavy value re-resolution done on the
+    build thread; here we only gather the model addresses at the read steps and compare."""
+    n = pre.n
+    mask = pre.mask
+    first_bad = n
+    bad_kind = None
+    bad_detail = None
+    n_addr = n_val = n_rt = 0
+
+    def _note(step, kind, detail):
+        nonlocal first_bad, bad_kind, bad_detail
+        if step < first_bad:
+            first_bad = step
+            bad_kind = kind
+            bad_detail = detail
+
+    amask = (1 << ADDR_BITS) - 1
+    cmask = (1 << CODE_ADDR_BITS) - 1
+    for (bi, kind), maddr in model_addrs.items():
+        maddr = np.asarray(maddr, dtype=np.int64)
+        if kind == "code":
+            cs = pre.code_steps
+            if cs.shape[0] == 0:
+                continue
+            m = maddr[cs] & cmask
+            da = pre.code_addr
+            n_rt += cs.shape[0]
+            bad = (m != 0) & (m != da)
+            if bad.any():
+                j = int(np.argmax(bad))       # first bad in step order (cs is sorted)
+                _note(int(cs[j]), "routing", {"head": bi, "model_pc": int(m[j]),
+                                              "draft_pc": int(da[j])})
+            continue
+        step_arr = pre.steps.get(kind)
+        if step_arr is None or step_arr.shape[0] == 0:
+            continue
+        da = pre.draft_addr[kind]
+        dv = pre.draft_val[kind]
+        pg = pre.pre_genuine[kind]
+        m = maddr[step_arr] & amask
+        armed = m != 0
+        n_addr += step_arr.shape[0]
+        n_val += int(armed.sum())
+        # ADDRESS: armed AND model != draft.
+        addr_bad = armed & (m != da)
+        if addr_bad.any():
+            j = int(np.argmax(addr_bad))
+            _note(int(step_arr[j]), "cam_addr", {"head": bi, "kind": kind,
+                                                 "model_addr": int(m[j]),
+                                                 "draft_addr": int(da[j])})
+        # VALUE: armed AND genuine(draft_addr) != draft's injected value.
+        val_bad = armed & (pg != dv)
+        if val_bad.any():
+            j = int(np.argmax(val_bad))
+            _note(int(step_arr[j]), "cam_value", {"head": bi, "kind": kind,
+                                                  "model_value": int(pg[j]),
+                                                  "draft_value": int(dv[j]),
+                                                  "model_addr": int(m[j])})
+
+    if first_bad >= n:
+        return FaithfulVerdict(ok=True, first_bad_step=None, kind=None, detail=None,
+                               n_addr_checked=n_addr, n_value_checked=n_val,
+                               n_routing_checked=n_rt)
+    return FaithfulVerdict(ok=False, first_bad_step=int(first_bad), kind=bad_kind,
+                           detail=bad_detail, n_addr_checked=n_addr,
+                           n_value_checked=n_val, n_routing_checked=n_rt)
+
+
 __all__ = ["faithful_single_dispatch_enabled", "FaithfulPlan", "build_faithful_plan",
-           "FaithfulVerdict", "verify_faithful", "_qry_band", "_genuine_value_at"]
+           "FaithfulVerdict", "verify_faithful", "_qry_band", "_genuine_value_at",
+           "FaithfulPrecompute", "build_faithful_precompute", "verify_faithful_fast"]

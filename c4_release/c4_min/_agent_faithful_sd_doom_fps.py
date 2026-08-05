@@ -45,6 +45,7 @@ from c4_min.lib_neural import build_lib_model_streaming
 from c4_min.tight_attn_compose import install_composed, uninstall_composed
 from c4_min import precomputed_schedule as PS
 from c4_min.faithful_single_dispatch import (build_faithful_plan, verify_faithful,
+                                             build_faithful_precompute, verify_faithful_fast,
                                              _read_frame_of_step)
 from run_c4_min import (data_segment, tag_compiler_syscalls,
                         install_compiler_abi_file_dispatcher)
@@ -171,16 +172,21 @@ def _dispatch_with_qaddr(sched, sg, dev, n):
 
 
 def _serial_frame(sg, sched_builder, dev, n, faithful, plan, ws, draft, mask):
-    """One serial frame: build tables + dispatch (+ value-verify if faithful).  Returns
-    (build_s, dispatch_s, verify_s)."""
+    """One serial frame: build tables (+ faithful value-verify PRECOMPUTE) + dispatch (+ the
+    cheap vectorized value-verify COMPARE if faithful).  Returns (build_s, dispatch_s,
+    verify_s).  ``build_s`` now INCLUDES the genuine value re-resolution precompute (pure
+    numpy — a draft-only function of the store-log — which in TRUE-PIPE overlaps the prior
+    frame's replay on the build thread); only the cheap ``verify_faithful_fast`` compare
+    stays on the critical path (``verify_s``)."""
     t0=time.perf_counter()
     s2 = sched_builder()
+    pre = build_faithful_precompute(draft, plan, ws, n, mask=mask) if faithful else None
     torch.cuda.synchronize(dev); b=time.perf_counter()-t0
     torch.cuda.synchronize(dev); t0=time.perf_counter()
     if faithful:
         _p,_s,_bp,_a,ma = _dispatch_with_qaddr(s2, sg, dev, n)
         torch.cuda.synchronize(dev); d=time.perf_counter()-t0
-        t0=time.perf_counter(); verify_faithful(draft, plan, ma, ws, mask=mask); v=time.perf_counter()-t0
+        t0=time.perf_counter(); verify_faithful_fast(pre, ma); v=time.perf_counter()-t0
     else:
         _dispatch(s2, sg, dev, n)
         torch.cuda.synchronize(dev); d=time.perf_counter()-t0; v=0.0
@@ -222,18 +228,27 @@ def _measure_one(model, L, code, draft, device, chunk, n_frames, faithful):
     torch.cuda.synchronize(dev)
     if faithful:
         pc,sp,bp2,ax,ma=_dispatch_with_qaddr(s_ser,sg,dev,n); ax=ax&mask
-        vd=verify_faithful(draft, plan, ma, ws, mask=mask)
+        pre_ser=build_faithful_precompute(draft, plan, ws, n, mask=mask)
+        vd=verify_faithful_fast(pre_ser, ma)
+        # cross-check: the pipelined/vectorized verdict == the original verify_faithful.
+        vd_ref=verify_faithful(draft, plan, ma, ws, mask=mask)
+        assert (vd.ok==vd_ref.ok and vd.first_bad_step==vd_ref.first_bad_step
+                and vd.kind==vd_ref.kind), f"pipelined verdict != verify_faithful: {vd} vs {vd_ref}"
     else:
         pc,sp,bp2,ax=_dispatch(s_ser,sg,dev,n); ax=ax&mask; vd=None
     bad=(((pc!=s_ser.want_pc)|(ax!=(s_ser.want_ax&mask))|(sp!=s_ser.want_sp)|(bp2!=s_ser.want_bp)))
     bad=torch.where(s_ser.is_halt, ax!=(s_ser.want_ax&mask), bad)&(~s_ser.is_file)
     nbad=int(bad.sum())
     del s_ser; gc.collect(); torch.cuda.empty_cache()
-    # TRUE-PIPE.
+    # TRUE-PIPE.  The faithful value-verify PRECOMPUTE (the genuine latest-write-wins value
+    # re-resolution) now rides on the SAME background build thread as the schedule build
+    # (``faithful=True`` -> ``PipelinedScheduleBuilder`` runs ``build_faithful_precompute`` on
+    # its thread concurrent with the prior frame's replay).  Only the cheap vectorized
+    # ``verify_faithful_fast`` compare (model addrs vs precompute) stays on the critical path.
     os.environ["C4_SCHED_PIPELINE"]="1"
     WARMUP=2
-    pb = PS.PipelinedScheduleBuilder(model, L, code, draft, dev, sg, mask=mask)
-    cur = pb.build_blocking(); torch.cuda.synchronize(dev); pb.start()
+    pb = PS.PipelinedScheduleBuilder(model, L, code, draft, dev, sg, mask=mask, faithful=faithful)
+    cur = pb.build_blocking(); pre_cur=pb.last_precompute(); torch.cuda.synchronize(dev); pb.start()
     walls=[]; tot=n_frames+WARMUP
     for i2 in range(tot):
         torch.cuda.synchronize(dev); tf=time.perf_counter()
@@ -241,9 +256,11 @@ def _measure_one(model, L, code, draft, device, chunk, n_frames, faithful):
             _p,_s,_b,_a,ma=_dispatch_with_qaddr(cur,sg,dev,n)
         else:
             _dispatch(cur,sg,dev,n)
-        nxt=pb.wait(); del cur; cur=nxt
+        # the cheap vectorized compare uses THIS frame's precompute (built on the prior
+        # thread iteration), overlapped-hidden; then join the build thread + swap.
+        if faithful: verify_faithful_fast(pre_cur, ma)
+        nxt=pb.wait(); del cur; cur=nxt; pre_cur=pb.last_precompute()
         if i2<tot-1: pb.start()
-        if faithful: verify_faithful(draft, plan, ma, ws, mask=mask)
         torch.cuda.synchronize(dev); walls.append(time.perf_counter()-tf)
     del cur; gc.collect(); torch.cuda.empty_cache()
     os.environ.pop("C4_SCHED_PIPELINE", None)

@@ -98,6 +98,59 @@ serial ratio.
 
 VRAM peak (faithful graph only): **14.4 GB** at chunk 131072 (fits the 24 GB card).
 
+## THE FIX — value-verify PIPELINED + VECTORIZED (2026-08-05, gate still default-OFF)
+
+The genuine value re-resolution (latest-write-wins over the committed store-log) is a **pure
+function of the store-log — knowable BEFORE the dispatch**.  So it is split into:
+1. **A DRAFT-ONLY PRECOMPUTE** (`build_faithful_precompute`, `faithful_single_dispatch.py:355`)
+   — the heavy vectorized `_genuine_value_at` latest-write-wins at every read address, done on
+   the GIL-releasing background build thread CONCURRENT with the previous frame's replay
+   (`PipelinedScheduleBuilder(..., faithful=True)`, `precomputed_schedule.py:1407`,`1433`,`1469`,
+   `1510` — its `_run` now also runs `build_faithful_precompute`, `wait()` swaps it in).
+2. **A CHEAP VECTORIZED CRITICAL-PATH COMPARE** (`verify_faithful_fast`,
+   `faithful_single_dispatch.py:418`) — no Python per-read loop; one `maddr[step_arr]` gather +
+   `armed & (m!=da)` / `armed & (pg!=dv)` array compares + `argmax` first-divergence.
+
+Byte-identical first-divergence verdict to `verify_faithful` (equivalence proof — module-4
+note in `faithful_single_dispatch.py`): the value check only fires at ARMED steps, and where
+the address MATCHES `genuine(model_addr)==genuine(draft_addr)==pre_genuine`; where it
+MISMATCHES the address `_note` dominates the same step.  Verified byte-for-byte on the whole
+DIV-free battery + the 6315-step loop + the 40 000-step doom slice (`vd == vd_ref` assertion in
+`_agent_faithful_sd_doom_fps.py`, and the pure-numpy `_agent_faithful_pipe_equiv.py` across 6
+scenarios).
+
+### MEASURED — the value-verify came off the critical path (CPU-only A/B, contention-immune)
+
+`_agent_faithful_valueverify_ab.py` (40 000-step real-doom, identical verdict):
+
+| | old critical path | new critical path | pipelined onto build thread |
+|---|---|---|---|
+| value-verify | 1.393 µs/step (`verify_faithful`) | **0.0047 µs/step** (`verify_faithful_fast`) | 1.110 µs/step (`build_faithful_precompute`, hidden) |
+
+→ **298× less** on the critical path (1.393 → 0.0047 µs/step); the heavy re-resolution is
+hidden under the next frame's build+dispatch on the pipeline thread.  In the full fps harness
+the critical-path value-verify measures **0.006 µs/step** (was 1.92).
+
+### fps — projection at the doc's UNCONTENDED fast dispatch (1.88 µs/step) + in-graph addr (+0.73)
+
+| faithful critical path | µs/step | fps @ 358,058 |
+|---|---|---|
+| OLD (value-verify on critical path) | 1.88 + 0.73 + 1.92 = 4.53 | 0.617 (≈ the 0.562 above) |
+| **NEW (value-verify pipelined+vectorized)** | 1.88 + 0.73 + 0.005 = **2.615** | **1.068 fps** |
+
+**Verdict: with the value-verify off the critical path the genuine faithful single-dispatch
+crosses ~1 fps (1.07 fps projected at the uncontended fast baseline)** — matching the fast
+path's ~0.98 fps.  The remaining faithful-vs-fast delta is the in-graph address decode
+(+0.73 µs/step), which was already deemed acceptable.
+
+CAVEAT (honesty): the live end-to-end fps re-measurement on THIS machine could not reproduce
+the doc's uncontended 1.88 µs/step fast dispatch — a persistent background GPU job inflated the
+fast dispatch to ~5.6 µs/step, so the absolute live fps (fast 0.42 fps, faithful 0.22 fps
+TRUE-PIPE) is contention-bound and NOT comparable to the doc's clean-A5000 numbers.  The
+value-verify removal (298×) and the byte-exact/genuine verdicts ARE contention-immune (pure
+CPU) and are the load-bearing results; the 1.07-fps figure is the projection at the doc's own
+uncontended dispatch baseline.  VRAM peak (faithful graph) unchanged at 13.9 GB @ chunk 131072.
+
 ## Composition — what composed cleanly vs needed new work
 
 * **ADDRESS verify (`aa85a9d2`)**: the sign-decode (`_decode_model_query_addr`) and the

@@ -73,8 +73,18 @@ def main():
     model_addrs[(7, "mem")][li] = 200           # the model's decoded query addr = 200
 
     verdict = verify_faithful(d, plan, model_addrs, ws, mask=0xFFFFFFFF)
-    print(f"[verify] ok={verdict.ok} first_bad_step={verdict.first_bad_step} "
+    print(f"[verify]      ok={verdict.ok} first_bad_step={verdict.first_bad_step} "
           f"kind={verdict.kind} detail={verdict.detail}", flush=True)
+    # PIPELINED/VECTORIZED path (the fix): the same catch via the precompute + fast compare.
+    from c4_min.faithful_single_dispatch import (build_faithful_precompute,
+                                                 verify_faithful_fast)
+    pre = build_faithful_precompute(d, plan, ws, n, mask=0xFFFFFFFF)
+    verdict_pipe = verify_faithful_fast(pre, model_addrs)
+    print(f"[verify-PIPE] ok={verdict_pipe.ok} first_bad_step={verdict_pipe.first_bad_step} "
+          f"kind={verdict_pipe.kind} detail={verdict_pipe.detail}", flush=True)
+    assert (verdict.ok == verdict_pipe.ok and verdict.first_bad_step == verdict_pipe.first_bad_step
+            and verdict.kind == verdict_pipe.kind), "pipelined verdict != verify_faithful!"
+    verdict = verdict_pipe            # headline on the PIPELINED path (the shipped one)
     rf = _read_frame_of_step(d, n)
     gv = _genuine_value_at(np.array([200]), np.array([rf[li]]), plan)
     print(f"[genuine] latest-write-wins over committed stores at model-addr 200 = "
