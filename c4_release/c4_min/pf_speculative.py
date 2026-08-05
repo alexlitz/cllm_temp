@@ -300,6 +300,94 @@ def _overlay_batched_enabled() -> bool:
     return os.environ.get("C4_OVERLAY_BATCHED", "0") not in ("0", "", "false", "False")
 
 
+def _overlay_precompute_enabled() -> bool:
+    """``C4_OVERLAY_PRECOMPUTE`` (DEFAULT ON): precompute the POSITION-INVARIANT part
+    of the overlay scatter plan ONCE per program (a CSR-like ``pos -> [(dim,val)]``
+    over absolute positions) instead of re-running the per-row Python loop (frame-role
+    tags / store addr-bits+val-nibbles / code-frame writes) on EVERY chunk of EVERY
+    forward.  The profiler pinned that loop (``apply_overlay_window_batched`` 0.17 s
+    tottime + ~823k ``list.append``) as the dominant remaining per-forward host wall
+    once the CAM gather + weight-densify were fixed.  The plan is a PURE function of
+    ``(w_start+wi)`` (the draft's static store_log / code), so precomputing it once and
+    SLICING ``[w_start, w_start+W)`` per chunk is byte-identical (same (row,dim)->val
+    set).  Only the tiny per-chunk QUERY-ROW all-ROLE tag (part 3) stays runtime (it
+    depends on which rows are query rows in the chunk).  OFF -> the per-row loop."""
+    return os.environ.get("C4_OVERLAY_PRECOMPUTE", "1") not in ("0", "", "false", "False")
+
+
+# module-level cache of the position-invariant overlay plan, keyed by the identities
+# of the (immutable-per-program) store_log / L / code so different programs don't
+# collide.  Value: (n_pos, pos_ptr[np.int64 n_pos+1], pos_dim[np.int64 nnz],
+#                    pos_val[np.float32 nnz]).
+_OVERLAY_PLAN_CACHE: Dict[tuple, object] = {}
+
+
+def _build_overlay_plan(w_end: int, L, store_log, code, code_off):
+    """Build (or extend) the POSITION-INVARIANT overlay plan for absolute positions
+    ``[0, w_end)`` and cache it.  Mirrors ``apply_overlay_window_*``'s per-row writes
+    EXACTLY (minus the query-row all-ROLE tag, part 3, which is chunk-dependent) so the
+    sliced application is byte-identical.  Returns ``(pos_ptr, pos_dim, pos_val)``
+    numpy arrays: ``pos``'s (dim,val) pairs are ``pos_dim[pos_ptr[pos]:pos_ptr[pos+1]]``
+    / ``pos_val[...]``."""
+    import numpy as _np
+    # Key on the program's IDENTITY *and* cheap content signatures (len/code_off) so a
+    # freed-then-reused id() can never alias a different program's plan.  Single-entry
+    # cache (the verifier processes one program's chunks contiguously): a key miss
+    # clears the stale plan.
+    key = (id(store_log), id(L), int(code_off), id(code),
+           len(store_log), int(getattr(L, "ROLE", 0)))
+    cached = _OVERLAY_PLAN_CACHE.get(key)
+    if cached is not None and cached[0] >= w_end:
+        return cached[1], cached[2], cached[3]
+    if cached is None:
+        _OVERLAY_PLAN_CACHE.clear()             # new program -> drop the prior plan
+    # OVER-BUILD to a generous ceiling so a chunked span (growing w_start per chunk)
+    # triggers ONE full build, not a rebuild per chunk (else O(span^2/chunk) host work).
+    # The plan is capped by the program's last stored/coded position anyway.
+    max_store_f = max(store_log.keys(), default=-1)
+    prog_end = (1 + int(code_off) + (max_store_f + 2) * V.FRAME_LEN)
+    w_end = min(max(w_end, prog_end), max(w_end * 2, w_end + 65536))
+    # (re)build over [0, w_end).  code_off / store_log are static per program.
+    _cfm = code_off > 0
+    dims: List[int] = []
+    valz: List[float] = []
+    ptr = _np.zeros(w_end + 1, dtype=_np.int64)
+    for p in range(w_end):
+        if p == 0:
+            ptr[p + 1] = len(dims)
+            continue
+        if _cfm and 1 <= p <= code_off:
+            ins = code[p - 1]
+            dims.append(L.IS_CODE); valz.append(1.0)
+            dims.append(L.IS_FRAME_BYTE); valz.append(0.0)
+            for b in range(CODE_ADDR_BITS):
+                dims.append(L.CODE_KEY_BIN + b); valz.append(float(((p - 1) >> b) & 1))
+            dims.append(L.CODE_OPV); valz.append(float(ins.op))
+            for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+                dims.append(L.CODE_IMM_NIB_MEM + j); valz.append(float(nv))
+            ptr[p + 1] = len(dims)
+            continue
+        f = (p - 1 - code_off) // V.FRAME_LEN
+        local = (p - 1 - code_off) % V.FRAME_LEN
+        if local in _FRAME_ROLE_SLOTS:
+            role = _FRAME_ROLE_SLOTS[local]
+            dims.append(L.ROLE + role); valz.append(1.0)
+            dims.append(L.IS_FRAME_BYTE); valz.append(1.0)
+        if local == _MEM_MARKER_LOCAL and f in store_log:
+            addr, val = store_log[f]
+            dims.append(L.IS_STORE); valz.append(1.0)
+            dims.append(L.IS_FRAME_BYTE); valz.append(0.0)
+            for b, bit in enumerate(_address_bits(addr)):
+                dims.append(L.ADDR_BIN + b); valz.append(bit)
+            for j, nv in enumerate(V.nibbles_of_value(val & 0xFFFFFFFF, NIB_PER_REG)):
+                dims.append(L.VAL_NIB + j); valz.append(float(nv))
+        ptr[p + 1] = len(dims)
+    pos_dim = _np.asarray(dims, dtype=_np.int64)
+    pos_val = _np.asarray(valz, dtype=_np.float32)
+    _OVERLAY_PLAN_CACHE[key] = (w_end, ptr, pos_dim, pos_val)
+    return ptr, pos_dim, pos_val
+
+
 def apply_overlay_window_batched(x_win: torch.Tensor, w_start: int, L,
                                  store_log: Dict[int, Tuple[int, int]],
                                  code_vec: Tuple[torch.Tensor, torch.Tensor],
@@ -323,7 +411,44 @@ def apply_overlay_window_batched(x_win: torch.Tensor, w_start: int, L,
     # 1) row-INVARIANT program-in-data + ONE — unchanged (already ONE broadcast op).
     code_idx, code_vals = code_vec
     x_win[0, :, code_idx] = code_vals
-    # 2) accumulate every per-row scalar (row,dim)->value on the HOST (no device op).
+    # 2) POSITION-INVARIANT per-row scalars (frame-role / store / code).
+    if _overlay_precompute_enabled():
+        # FAST: slice the precomputed whole-program plan for [w_start, w_start+W) and
+        # remap abs pos -> chunk-local flat offset in ONE vectorized numpy pass (no
+        # per-row Python loop / ~823k appends).  Byte-identical (same (dim,val) set).
+        ptr, pos_dim, pos_val = _build_overlay_plan(w_start + W, L, store_log, code,
+                                                    code_off)
+        s0 = ptr[w_start]                        # nnz start of the first row (pos w_start)
+        s1 = ptr[w_start + W]                     # nnz end of the last row (pos w_start+W-1)
+        if s1 > s0:
+            dim_sl = pos_dim[s0:s1]
+            val_sl = pos_val[s0:s1]
+            # per-nnz absolute position -> chunk-local row wi = pos - w_start.
+            counts = _np.diff(ptr[w_start:w_start + W + 1])       # [W] nnz per row
+            wi_per = _np.repeat(_np.arange(W, dtype=_np.int64), counts)
+            base_off = (wi_per * D + dim_sl).astype(_np.int64)
+        else:
+            base_off = _np.empty(0, dtype=_np.int64)
+            val_sl = _np.empty(0, dtype=_np.float32)
+        # 3) query-row all-ROLE tag (chunk-dependent — stays runtime, tiny).
+        q_iter = ([W - 1] if query_rows is None else query_rows)
+        if q_iter:
+            roles = _np.arange(N_ROLES, dtype=_np.int64) + L.ROLE
+            q_arr = _np.asarray(q_iter, dtype=_np.int64)
+            q_off = ((q_arr[:, None] * D) + roles[None, :]).reshape(-1)
+            q_val = _np.ones(q_off.size, dtype=_np.float32)
+            offs_np = _np.concatenate([base_off, q_off])
+            vals_np = _np.concatenate([val_sl, q_val])
+        else:
+            offs_np, vals_np = base_off, val_sl
+        if offs_np.size == 0:
+            return
+        idx_t = torch.from_numpy(offs_np).to(x_win.device, non_blocking=True)
+        val_t = torch.from_numpy(vals_np).to(x_win.device, dtype=x_win.dtype,
+                                             non_blocking=True)
+        x_win.view(-1).index_put_((idx_t,), val_t)
+        return
+    # LEGACY per-row loop (C4_OVERLAY_PRECOMPUTE=0).
     offs: List[int] = []
     vals: List[float] = []
     for wi in range(W):
@@ -916,7 +1041,8 @@ def _run_qstack(model, h, qp, cut, n, megastep=None):
 
 def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                        q_local_idx, cut, megastep=None,
-                                       stream_ctx=None, block0_graph=None):
+                                       stream_ctx=None, block0_graph=None,
+                                       whole_step_graph=None):
     """Run blocks [0, cut) over ALL rows (commit KV), then blocks [cut, N) over ONLY
     the query rows (``q_local_idx`` — window-local indices).  Returns
     ``(hidden_full, new_caches)`` where ``hidden_full`` is [1, S, D] with the QUERY
@@ -958,6 +1084,39 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
         # absolute span-local position -> index into q_local (for query rows in a chunk).
         qpos_to_qi = torch.full((S,), -1, device=hq0.device, dtype=torch.long)
         qpos_to_qi[qi] = torch.arange(qi.numel(), device=hq0.device)
+        # WHOLE-STEP GRAPH (RUNG 2): precompute, ON THE HOST, per-chunk (chunk-local
+        # query rows -> hq0 destination) index pairs so the block-0 loop does NO
+        # bool(.any()) device sync (the membership is known from the draft's win_starts).
+        # ``qi`` are the span-local query rows; a chunk [lo0,hi0) owns the query rows in
+        # that range.  This kills the ~S/chunk (=~640) per-chunk host syncs.
+        _wsg = (whole_step_graph if (whole_step_graph is not None and cut == 1) else None)
+        _wsg_plan = None
+        if _wsg is not None:
+            from .whole_step_graph import Block0LoopPlan
+            _b0attn = model.blocks[0].attn
+            _pm = getattr(_b0attn, "_direct_local_pos_map", None)
+            _rf = getattr(_b0attn, "_direct_local_rf", None)
+            if _pm is not None and _rf is not None:
+                _wsg_plan = Block0LoopPlan(_rf, _pm, chunk, S,
+                                           stream_ctx["span_start"] if streaming
+                                           else 0,
+                                           q_positions, qpos_to_qi, hq0.device)
+                # host-side per-chunk query membership (from the draft's win_starts,
+                # via qpos_to_qi) — NO device sync in the loop below.
+                _chunk_qrows = {}      # lo0 -> (chunk_local_rows_t, hq0_dest_t)
+                _local_all = qpos_to_qi.cpu().tolist()
+                for _lo in range(0, S, chunk):
+                    _hi = min(_lo + chunk, S)
+                    _rows = [(p - _lo, _local_all[p]) for p in range(_lo, _hi)
+                             if _local_all[p] >= 0]
+                    if _rows:
+                        _cl = torch.tensor([r[0] for r in _rows], device=hq0.device,
+                                           dtype=torch.long)
+                        _dst = torch.tensor([r[1] for r in _rows], device=hq0.device,
+                                            dtype=torch.long)
+                        _chunk_qrows[_lo] = (_cl, _dst)
+            else:
+                _wsg = None
         for lo0 in range(0, S, chunk):
             hi0 = min(lo0 + chunk, S)
             if streaming:
@@ -969,6 +1128,19 @@ def _forward_hidden_cached_frozen_skip(model, x, past_key_values, q_positions,
                                      stream_ctx["span_start"] + hi0,
                                      device=hq0.device)) if streaming else \
                   (q_positions[lo0:hi0] if q_positions is not None else None)
+            # WHOLE-STEP GRAPH (RUNG 2): fold the ingest gather INTO the graph (static
+            # nibble inputs) + replay -> ONE graph launch + 3 static copies (no separate
+            # gather new_zeros/scatter, no sync).  Then a SYNC-FREE precomputed scatter.
+            if _wsg is not None:
+                Sc = hi0 - lo0
+                nib_lo, nib_hi = _wsg_plan.chunk_nibbles(qpc, Sc)
+                hc = _wsg.run(xc, nib_lo, nib_hi)                 # [1, Sc, D]
+                cq = _chunk_qrows.get(lo0)
+                if cq is not None:
+                    _cl, _dst = cq
+                    hq0[0, _dst] = hc[0, _cl]
+                del hc, xc
+                continue
             # BLOCK-0 GRAPH: replay the fixed-shape ingest attn + FFN body as ONE launch
             # (the ingest gather is computed here, outside the graph, into the graph's
             # static input; the graph does the W_o + SwiGLU GEMMs).  Byte-exact to the
@@ -1160,6 +1332,30 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     GROWING-heap program (malloc) the cache tracks the live heap regardless of K, so
     K is genuinely cache-capped and the backoff finds the real ceiling.
     """
+    # PRECOMPUTED SCHEDULE + SINGLE DISPATCH (C4_PRECOMPUTED_SCHEDULE, default OFF).
+    # The whole K-batch verify as ONE precomputed schedule (compacted routing + all
+    # direct-CAM/direct-local gathers resolved up front + decode plan) + one graph-per-
+    # chunk dispatch — ZERO per-op Python in the loop (host syncs ~3600/forward -> O(1)).
+    # Byte-identical to this composed GPU-verify at every query row (same gathers, same
+    # GEMM chains, same requant decode+compare).  Requires CUDA + a DIV-free program
+    # (the divmod span is not carried); a DIV/MOD program falls through to the per-op
+    # path below.  Default OFF -> the per-op verify_blocks (golden 069cc32f unchanged).
+    import os as _osp
+    if (_osp.environ.get("C4_PRECOMPUTED_SCHEDULE", "0") not in ("0", "", "false", "False")
+            and device.startswith("cuda")):
+        _DM = {"DIV", "MOD"}
+        if not any(draft.frames[s].get("op") in _DM for s in range(draft.step_count)):
+            from .precomputed_schedule import run_verify as _ps_run
+            pr = _ps_run(model, L, code, draft, device, mask=mask,
+                         collect_out=collect_out, stats=stats)
+            if stats is not None:
+                stats.setdefault("forwards", 1)
+            return VerifyResult(
+                accepted_steps=pr.accepted_steps, total_steps=pr.total_steps,
+                all_matched=pr.all_matched, forwards=1,
+                first_mismatch=pr.first_mismatch,
+                max_seq_len=1 + draft.step_count * V.FRAME_LEN,
+                decoded_final_ax=pr.decoded_final_ax)
     n_blocks = len(model.blocks)
     H = model.blocks[0].attn.n_heads
     HD = model.blocks[0].attn.head_dim
@@ -1412,6 +1608,22 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     elif (frozen_skip and is_cuda and _dead_block_fusion_enabled()
             and _mega_on and install_megastep_graph is not None):
         _megastep = install_megastep_graph(model, device, frozen_cut, verbose=False)
+    # BLOCK-0 FUSED FFN (C4_BLOCK0_FUSED_FFN, RUNG 3): fold block-0's DENSE SwiGLU FFN
+    # into the fused-delta COO sparse kernel (block-0's FFN is Dff=33, 6 active down rows
+    # -> the dense GEMM wastes ~99.98% of its FLOPs on zeros).  MUST install BEFORE the
+    # block-0 graph captures so the graph bakes the sparse Triton kernels, not the dense
+    # cuBLAS GEMM.  Byte-exact at the nibble margin; default OFF.
+    _block0_fused_ffn = None
+    try:
+        from .block0_fused_ffn import (block0_fused_ffn_enabled,
+                                       install_block0_fused_ffn)
+        _b0ffn_on = block0_fused_ffn_enabled()
+    except ImportError:
+        install_block0_fused_ffn = None
+        _b0ffn_on = False
+    if (frozen_skip and is_cuda and _b0ffn_on
+            and install_block0_fused_ffn is not None):
+        _block0_fused_ffn = install_block0_fused_ffn(model, device, 0, verbose=False)
     # BLOCK-0 GRAPH (C4_GRAPH_BLOCK0): CUDA-graph block-0's S-chunked ingest attention +
     # FFN per-chunk body into ONE fixed-shape replay per chunk.  Block 0 is the SOLE block
     # over all S = K*30 span rows (the cut-span-chunk loop processes them in fixed-size
@@ -1433,6 +1645,31 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             and getattr(model.blocks[0].attn, "_direct_local_installed", False)):
         _block0_graph = install_block0_graph(model, device, _cutc0, frozen_cut,
                                              verbose=False)
+    # WHOLE-STEP GRAPH (C4_WHOLE_STEP_GRAPH, RUNG 2): collapse the block-0 S-chunk loop's
+    # per-chunk host dispatch (ingest gather + graph + bool(.any()) SYNC + hq0 scatter)
+    # into ONE CUDA-graph replay (gather+W_o+FFN fused) + a precomputed SYNC-FREE scatter
+    # per chunk.  Kills the ~640 per-chunk host syncs and the gather/scatter launch storm
+    # — the dominant (81%) block-0 host-dispatch wall.  Requires direct-local-CAM (the
+    # resolved-frame gather internals) + cut-span-chunk + CUDA.  Byte-exact; default OFF.
+    # SUPERSEDES the plain block-0 graph (this one also folds the gather + kills the sync).
+    _whole_step_graph = None
+    try:
+        from .whole_step_graph import (whole_step_graph_enabled,
+                                       install_whole_step_graph)
+        _wsg_on = whole_step_graph_enabled()
+    except ImportError:
+        install_whole_step_graph = None
+        _wsg_on = False
+    if (frozen_skip and is_cuda and _wsg_on and install_whole_step_graph is not None
+            and direct_local_cam_enabled() and _cutc0 > 0 and frozen_cut == 1
+            and getattr(model.blocks[0].attn, "_direct_local_installed", False)):
+        _b0attn = model.blocks[0].attn
+        _rf = getattr(_b0attn, "_direct_local_rf", None)
+        _ing = getattr(_b0attn, "_direct_local_ing_heads", None)
+        if _rf is not None and _ing is not None:
+            _whole_step_graph = install_whole_step_graph(
+                model, device, _cutc0, _rf, _ing, int(_rf.nib_lo.shape[1]),
+                cut=frozen_cut, verbose=False)
     # LAUNCH-COLLAPSE (C4_OVERLAY_BATCHED): assemble the overlay's per-row scalar
     # writes on the host and push them in ONE index_put_ (kills the ~21k tiny
     # pageable HtoD dispatches the profiler pinned as the span wall).
@@ -1562,7 +1799,7 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 hidden, new_kv = _forward_hidden_cached_frozen_skip(
                     model, x, past, q_positions, q_local, frozen_cut,
                     megastep=_megastep, stream_ctx=stream_ctx,
-                    block0_graph=_block0_graph)
+                    block0_graph=_block0_graph, whole_step_graph=_whole_step_graph)
                 # cost accounting: cut blocks over S rows + (N-cut) over K query rows.
                 blocks_run = n_blocks
             else:

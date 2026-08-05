@@ -172,31 +172,42 @@ def build_resolved_frames(draft, device="cpu") -> ResolvedFrames:
     Role index == head index (``bake_frame_ingest``: head ``h`` -> role ``h``).
     """
     import torch as _t
+    import numpy as _np
     toks = draft.tokens
     FL = V.FRAME_LEN
     NR = len(_ROLE_TO_LOCAL)
+    n = draft.step_count
     # role -> frame-local slot, as a fixed vector for a vectorized frame decode.
     local_of_role = _t.tensor([_ROLE_TO_LOCAL[r] for r in range(NR)], dtype=_t.long)
-    positions = []
-    bytes_rows = []                          # each: [NR] int byte per role
-    tk = _t.tensor(toks, dtype=_t.long)
-    for s in range(draft.step_count):
-        qpos = draft.win_starts[s]
-        fstart = qpos - FL + 1
-        if fstart >= 0 and toks[fstart] == V.REG_PC:
-            row = tk[fstart + local_of_role]         # [NR] token ids (== byte values)
-            row = _t.where((row >= 0) & (row <= 255), row, _t.zeros_like(row))
-        else:
-            row = _t.zeros(NR, dtype=_t.long)
-        positions.append(qpos)
-        bytes_rows.append(row)
-    if bytes_rows:
-        B = _t.stack(bytes_rows, 0)                  # [n_query, NR]
-    else:
-        B = _t.zeros(0, NR, dtype=_t.long)
+    # numpy the token list ONCE (``np.asarray`` is ~2-4x faster than ``torch.tensor`` for a
+    # multi-million-element Python list — the whole-frame token stream is ~30*n tokens, so
+    # this list->tensor conversion is a real one-time build cost the giant-K exposes).
+    tk = _t.from_numpy(_np.asarray(toks, dtype=_np.int64))
+    T = tk.numel()
+    pos = _t.from_numpy(_np.asarray(draft.win_starts[:n], dtype=_np.int64))  # [n] query-row abs positions
+    if n == 0:
+        z = _t.zeros(0, NR, dtype=_t.float32)
+        return ResolvedFrames(pos.to(device), z, z.clone())
+    # FULLY VECTORIZED frame decode (replaces the per-step Python loop + per-step gather —
+    # the O(n_steps) build the whole-frame giant-K exposes).  For each step the ingest
+    # heads read the latest complete frame ENDING before the query row, i.e. starting at
+    # ``fstart = qpos - FL + 1``; valid iff fstart>=0 AND toks[fstart]==REG_PC.  Build the
+    # [n, NR] gather index fstart[:,None] + local_of_role, clamp-gather, then mask invalid
+    # rows to zero.  Byte-identical to the loop (same slots, same REG_PC guard, same
+    # 0..255 clamp).
+    fstart = pos - (FL - 1)                                   # [n]
+    valid = fstart >= 0
+    fs_c = fstart.clamp_min(0)
+    # REG_PC guard at the frame start (only where fstart is in-range).
+    head_tok = tk[fs_c.clamp_max(T - 1)]                      # [n]
+    valid = valid & (head_tok == V.REG_PC)
+    gather_idx = fs_c[:, None] + local_of_role[None, :]       # [n, NR]
+    gather_idx = gather_idx.clamp_(0, T - 1)
+    B = tk[gather_idx]                                        # [n, NR] token ids == bytes
+    B = _t.where((B >= 0) & (B <= 255), B, _t.zeros_like(B))
+    B = _t.where(valid[:, None], B, _t.zeros_like(B))         # invalid step rows -> 0
     nib_lo = (B & 0xF).to(dtype=_t.float32)
     nib_hi = ((B >> 4) & 0xF).to(dtype=_t.float32)
-    pos = _t.tensor(positions, dtype=_t.long)
     return ResolvedFrames(pos.to(device), nib_lo.to(device), nib_hi.to(device))
 
 
@@ -316,6 +327,12 @@ def _install_direct_local_forward(model, block_idx: int,
     attn.forward = direct_local_forward.__get__(attn, type(attn))
     attn.gather_ingest_out = gather_ingest_out.__get__(attn, type(attn))
     attn._direct_local_installed = True
+    # EXPOSE the resolved-frame gather internals so the whole-step graph (RUNG 2,
+    # C4_WHOLE_STEP_GRAPH) can precompute the per-chunk ingest nibbles + fold the gather
+    # into its CUDA graph (same rf / pos_map / ingest heads -> byte-identical).
+    attn._direct_local_rf = rf
+    attn._direct_local_pos_map = pos_map
+    attn._direct_local_ing_heads = ing_heads
 
 
 # ===========================================================================
