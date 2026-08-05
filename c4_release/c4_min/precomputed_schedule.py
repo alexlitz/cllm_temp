@@ -1058,6 +1058,19 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
     live_order = sorted(chm.keys())
     # PRECOMPUTE the whole-batch tables (vectorized where possible).
     onchip = onchip_residual_enabled()
+    sched, live_out_dims = _build_schedule_tables(model, L, code, draft, dev, live_blocks,
+                                                  onchip, mask)
+    chunk = _sched_chunk()
+    sg = PrecomputedStepGraph(model, L, dev, chunk, mega, live_blocks, live_order, mask,
+                              onchip=onchip, live_out_dims=live_out_dims)
+    return sched, sg
+
+
+def _build_schedule_tables(model, L, code, draft, dev, live_blocks, onchip, mask):
+    """Build the O(n) whole-batch schedule TABLES (query embed + ingest + CAM gather + decode
+    targets + on-chip W_o deltas).  Shared by ``build_schedule`` (first frame, also builds the
+    graph) and ``build_schedule_tables_only`` (continuous frames, reuses the captured graph).
+    Returns ``(PrecomputedSchedule, live_out_dims)``."""
     fast = _sched_fast_build()
     gpu_build = _sched_gpu_build()               # C4_SCHED_GPU_BUILD (deep vectorization)
     # ON-CHIP FAST BUILD: the dense ``[K, Hb, HDb]`` cam_tables (~623 MB/block, 99.7% zeros)
@@ -1118,7 +1131,12 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
         # just ffn0(h0_folded) at replay (no ingest transpose / W_o0 GEMM in the graph).
         Wo0 = _wo_dense(model, 0, dev)
         ing_flat = ing_table.reshape(n, D)                    # [K, D] (H0*HD0 == D)
-        h0_folded = h0_table + ing_flat @ Wo0.transpose(0, 1)
+        # IN-PLACE fold into h0_table (it is dead after this — the onchip replay reads only
+        # h0_folded), so no separate 2.6 GB h0_folded allocation.  addmm_ avoids the [K,D]
+        # matmul temporary too.
+        h0_table.addmm_(ing_flat, Wo0.transpose(0, 1))
+        h0_folded = h0_table
+        del ing_flat
         # each live block: compact [K, n_out_b] delta + its out_dims.
         cam_delta_tables = {}
         live_out_dims = {}
@@ -1135,26 +1153,49 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
                 vals = torch.from_numpy(vals_np).to(dev)                 # [K, n_active]
                 cols = torch.from_numpy(cols_np).to(dev)                 # [n_active]
                 Wo_sub = Wo.index_select(1, cols)                        # [D, n_active]
-                full = vals @ Wo_sub.transpose(0, 1)                     # [K, D] exact W_o(cam)
-                out_dims = (full.abs().sum(0) > 0).nonzero(as_tuple=False).flatten()
+                # SUPPORT-FIRST (VRAM-frugal): out_dims = the output dims W_o(cam) CAN be
+                # nonzero at = the rows of Wo with any nonzero over the active cam columns
+                # (data-independent — a [D, n_active] reduction, NOT a [K, D] matmul).  Then
+                # build the compact delta ``vals @ Wo_sub[out_dims].T`` = [K, n_out] DIRECTLY
+                # (n_out is a handful), never materializing the 2.44 GB [K, D] product.  Byte-
+                # exact: every column NOT in out_dims is exactly 0 for every row (same set the
+                # full-product .abs().sum(0)>0 selects — a row is nonzero only where Wo_sub is).
+                out_dims = (Wo_sub.abs().sum(1) > 0).nonzero(as_tuple=False).flatten()
                 if out_dims.numel() == 0:
-                    out_dims = torch.zeros(1, dtype=torch.long, device=full.device)
-                delta = full.index_select(1, out_dims).contiguous()
-                del vals, Wo_sub, full
+                    out_dims = torch.zeros(1, dtype=torch.long, device=vals.device)
+                delta = (vals @ Wo_sub.index_select(0, out_dims).transpose(0, 1)).contiguous()
+                del vals, Wo_sub
             else:
                 cam_flat = cam_tables[b].reshape(n, D)            # [K, D]
                 delta, out_dims = _build_wo_delta_table(cam_flat, Wo)
             cam_delta_tables[b] = delta
             live_out_dims[b] = out_dims
+    # ON-CHIP replay reads ONLY h0_folded + cam_delta_tables — ing_table / cam_tables are
+    # dead after the fold/delta build, so drop them (a big VRAM saving: ing_table is [K,D],
+    # freeing ~2.6 GB — critical for the continuous double-buffer where two schedules coexist).
+    if onchip:
+        ing_table = None
+        cam_tables = {}
     sched = PrecomputedSchedule(
         n_steps=n, h0_table=h0_table, ing_table=ing_table, cam_tables=cam_tables,
         want_pc=want_pc, want_sp=want_sp, want_bp=want_bp, want_ax=want_ax,
         is_halt=is_halt, is_file=is_file, onchip=onchip, h0_folded=h0_folded,
         cam_delta_tables=cam_delta_tables)
-    chunk = _sched_chunk()
-    sg = PrecomputedStepGraph(model, L, dev, chunk, mega, live_blocks, live_order, mask,
-                              onchip=onchip, live_out_dims=live_out_dims)
-    return sched, sg
+    return sched, live_out_dims
+
+
+def build_schedule_tables_only(model, L, code, draft, device, sg, mask: int = 0xFFFFFFFF
+                               ) -> "PrecomputedSchedule":
+    """Rebuild the O(n) schedule TABLES for a frame, REUSING an already-built (and captured)
+    ``PrecomputedStepGraph`` ``sg`` — the honest per-frame BUILD cost in a CONTINUOUS stream
+    (the megablock install + live-block map + graph capture are one-time; only the tables
+    recur per frame).  Returns a fresh ``PrecomputedSchedule`` whose tables the SAME captured
+    ``sg`` replays over.  Byte-identical tables to ``build_schedule``."""
+    dev = torch.device(device)
+    live_blocks = list(sg.live_blocks.values())
+    sched, _lod = _build_schedule_tables(model, L, code, draft, dev, live_blocks,
+                                         sg.onchip, mask)
+    return sched
 
 
 def _sched_chunk() -> int:
@@ -1274,5 +1315,5 @@ def run_verify(model, L, code, draft, device, *, mask: int = 0xFFFFFFFF,
 
 
 __all__ = ["precomputed_schedule_enabled", "PrecomputedSchedule",
-           "PrecomputedStepGraph", "build_schedule", "run_verify",
-           "PrecomputedResult"]
+           "PrecomputedStepGraph", "build_schedule", "build_schedule_tables_only",
+           "run_verify", "PrecomputedResult"]
