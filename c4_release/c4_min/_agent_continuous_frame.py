@@ -43,7 +43,8 @@ COMPOSED = ["C4_DEAD_BLOCK_FUSION", "C4_DIRECT_CAM_BATCHED", "C4_DIRECT_LOCAL_CA
             "C4_FLASH_ATTN", "C4_BANDED_LOCAL_ATTN", "C4_FUSED_MEGABLOCK",
             "C4_DIRECT_CAM_VEC"]
 LEVERS = ["C4_ONCHIP_RESIDUAL", "C4_RESIDENT_BATCH", "C4_PRECOMPUTED_SCHEDULE",
-          "C4_SCHED_CHUNK", "C4_SCHED_FAST_BUILD", "C4_SCHED_GPU_BUILD"]
+          "C4_SCHED_CHUNK", "C4_SCHED_FAST_BUILD", "C4_SCHED_GPU_BUILD",
+          "C4_FFN_FUSED_HIDDEN", "C4_MEGABLOCK_BLOCK_K"]
 
 
 def _levers_on(chunk, gpu_build=True):
@@ -55,6 +56,10 @@ def _levers_on(chunk, gpu_build=True):
     os.environ["C4_SCHED_FAST_BUILD"] = "1"
     os.environ["C4_SCHED_GPU_BUILD"] = "1" if gpu_build else "0"
     os.environ["C4_SCHED_CHUNK"] = str(chunk)
+    # FFN-hidden fusion (c1685e15): single-kernel on-chip [Dff,K] hidden delta + K-tile knob.
+    # Cuts the fused-megablock dispatch 2.544->1.502 us/step; requires C4_FUSED_MEGABLOCK.
+    os.environ["C4_FFN_FUSED_HIDDEN"] = "1"
+    os.environ["C4_MEGABLOCK_BLOCK_K"] = "512"
 
 
 def _levers_off():
