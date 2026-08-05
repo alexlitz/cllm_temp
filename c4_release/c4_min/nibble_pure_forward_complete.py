@@ -193,6 +193,18 @@ def _pf_cfm_enabled() -> bool:
     return _os.environ.get("C4_PF_CFM", "0") not in ("0", "", "false", "False")
 
 
+def _cfm_emit_enabled() -> bool:
+    """``C4_CFM_EMIT`` (DEFAULT OFF): the in-transformer JIT on the DIRECT-CAM code
+    path.  The driver services ``isa.EMIT`` (value 45) as a control op (no FFN
+    dispatch rule, like JSR/ENT/LEV): the model FETCHES the EMIT instruction from
+    the code CAM, the register CAM reconstructs the input state, and the driver
+    reads the produced word from the input registers (op<-AX, imm<-STACK0), overlays
+    a runtime CODE frame at the EMIT immediate keyed bits(addr) on the WIDE
+    (``CODE_ADDR_BITS``, position-invariant) direct-CAM lanes, and bumps PC.  EMIT
+    adds NO baked weights, so flag-ON is byte-identical to golden 069cc32f."""
+    return _os.environ.get("C4_CFM_EMIT", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # RUN-PHASE 32-bit gap closers (#789 PC-arith, #790 32-bit op gaps).  Every one
 # is a GATED env flag DEFAULT-OFF: with all off the build is byte-IDENTICAL to
@@ -2313,8 +2325,41 @@ def _overlay_pf_code_frames(x, L, code: List[isa.Instr], base_pos: int = 1,
             x[row, p, L.CODE_IMM_NIB_MEM + j] = float(nv)
 
 
+def _overlay_pf_runtime_code_frames(x, L, runtime_frames, base_pos: int = 1,
+                                    row: int = 0) -> int:
+    """RUNTIME (EMIT-emitted) code frames on the DIRECT-CAM path.
+
+    ``runtime_frames`` maps ``addr -> Instr`` for every instruction the running
+    program produced with ``isa.EMIT`` at a code ADDRESS that is NOT one of the
+    original ``1..len(code)`` positional rows (i.e. a HIGH address, up to
+    ``2^CODE_ADDR_BITS``).  Each is written as ONE COMPACT physical code-frame row
+    (KEY = ``CODE_KEY_BIN`` = bits(addr), VALUE = op + imm nibbles, IS_CODE=1) —
+    the physical row index is independent of the (possibly huge) logical address:
+    the fetch@PC CAM (``_bake_code_cam_head``, ALiBi slope 0) matches PURELY on the
+    ``CODE_ADDR_BITS``-wide address key, so a frame keyed bits(440000) resolves
+    fetch@PC=440000 at a compact row with NO positional decay.  THIS is what lifts
+    the RoPE ~12-16-bit ceiling: the address key rides the position-invariant
+    direct-CAM lanes, not the slow rotary ones.  Returns the number of rows written."""
+    Sn = x.shape[1]
+    n = 0
+    for addr, ins in runtime_frames.items():
+        p = base_pos + n
+        if p >= Sn:
+            break
+        x[row, p, L.IS_CODE] = 1.0
+        x[row, p, L.IS_FRAME_BYTE] = 0.0
+        for b in range(CODE_ADDR_BITS):
+            x[row, p, L.CODE_KEY_BIN + b] = float((addr >> b) & 1)
+        x[row, p, L.CODE_OPV] = float(ins.op)
+        for j, nv in enumerate(V.nibbles_of_value(ins.imm & 0xFFFFFFFF, IMM_NIBS)):
+            x[row, p, L.CODE_IMM_NIB_MEM + j] = float(nv)
+        n += 1
+    return n
+
+
 def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
-                          store_log=None, frame_start: int = None):
+                          store_log=None, frame_start: int = None,
+                          runtime_frames=None, code_rows: int = None):
     """``overlay(x)`` writes the program into the DATA bands at every position, the
     ROLE/IS_FRAME_BYTE frame-slot tags, and turns each stored frame's MEM token
     into a KV entry.  ``store_log`` maps ``frame_idx -> (addr, val)`` for every
@@ -2323,11 +2368,29 @@ def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
     CODE-FROM-MEMORY (C4_PF_CFM): the program lives in the KV as CODE frames on the
     positions ``1 .. 1+len(code)`` (not in the per-position DATA bands), so the first
     register/store frame begins at ``frame_start = 1 + len(code)``.  ``frame_start``
-    defaults to ``1`` (baked path, byte-identical) or ``1+len(code)`` under cfm."""
+    defaults to ``1`` (baked path, byte-identical) or ``1+len(code)`` under cfm.
+
+    ``runtime_frames`` (in-transformer JIT, ``C4_CFM_EMIT``): an ``{addr -> Instr}``
+    map of instructions the running program produced with ``isa.EMIT`` at a HIGH code
+    address (past the ``1..len(code)`` positional rows).  They are overlaid as COMPACT
+    address-keyed code frames right after the positional code rows — one physical row
+    per distinct high address, keyed bits(addr) on the position-invariant direct-CAM
+    lanes — so a HIGH-address emit stays fetchable with NO positional decay.  The
+    register frames then begin AFTER these runtime rows (``frame_start`` moves past
+    ``1 + len(code) + len(runtime_frames)``)."""
     store_log = store_log or {}
+    runtime_frames = runtime_frames or {}
     from .blogspec_layout import NIB_PER_REG
     _cfm = getattr(L, "cfm", False)
-    fstart = frame_start if frame_start is not None else (1 + len(code) if _cfm else 1)
+    # ``code_rows`` = how many POSITIONAL code rows exist physically (defaults to
+    # len(code)).  Under EMIT, ``code`` (= run_code) may GROW past the reserved
+    # positional rows for a high-address emit — those high entries live in
+    # ``runtime_frames`` as compact address-keyed rows, NOT positional ones — so the
+    # positional overlay is capped at ``code_rows`` (the original program length).
+    _n_pos = code_rows if code_rows is not None else len(code)
+    _n_rt = len(runtime_frames) if _cfm else 0
+    fstart = (frame_start if frame_start is not None
+              else (1 + _n_pos + _n_rt if _cfm else 1))
 
     def overlay(x: torch.Tensor) -> None:
         Sn = x.shape[1]
@@ -2347,7 +2410,15 @@ def make_overlay_complete(code: List[isa.Instr], L: PureForwardCompleteLayout,
             # CODE_KEY_BIN=bits(addr i), CODE_OPV=op, CODE_IMM_NIB_MEM=imm nibbles.
             # The fetch@PC query (IS_FETCH/CODE_QRY_BIN) is set by the pc-fetch FFN
             # from the PC register — not here.  (Guarded to the available leading rows.)
-            _overlay_pf_code_frames(x, L, code, base_pos=1)
+            _overlay_pf_code_frames(x, L, code[:_n_pos], base_pos=1)
+            # RUNTIME (EMIT) code frames: compact address-keyed rows for HIGH-address
+            # emits, right after the positional code rows.  The fetch@PC CAM matches on
+            # the CODE_ADDR_BITS-bit address key alone (ALiBi slope 0), so their
+            # physical row is position-invariant -> a 440000-address emit fetches at a
+            # compact row with no positional decay.
+            if runtime_frames:
+                _overlay_pf_runtime_code_frames(x, L, runtime_frames,
+                                                base_pos=1 + _n_pos)
         pos = fstart
         frame_idx = 0
         while pos + V.FRAME_LEN <= Sn:
@@ -2573,6 +2644,205 @@ def run_pure_forward_complete(model, L: PureForwardCompleteLayout,
     if collect_tokens:
         return trace, stream
     return trace
+
+
+def run_pure_forward_complete_emit(model, L: PureForwardCompleteLayout,
+                                   code: List[isa.Instr], max_steps: int = 512,
+                                   verbose: bool = False, seed_mem=None,
+                                   mask: int = 0xFF, n_rt_pool: int = 32):
+    """DIRECT-CAM in-transformer JIT: ``run_pure_forward_complete`` + ``isa.EMIT``.
+
+    Same APPEND-ONLY pure-forward step (one ``model.forward`` per VM step, state read
+    from the register CAM at the latest frame, the store log persistent), but
+    ``isa.EMIT`` is serviced as a DRIVER control op (no FFN dispatch rule) exactly as
+    JSR/ENT/LEV are: the model FETCHES the EMIT instruction from the code CAM (proving
+    fetch@PC serves runtime-appended frames), the register CAM reconstructs the input
+    state, and the driver reads the produced word off the model-reconstructed INPUT
+    registers (op<-AX, imm<-STACK0), writes it into a private mutable code copy
+    ``run_code[target]`` AND — when ``target`` is a HIGH address past the
+    ``1..len(code)`` positional rows — into ``runtime_frames``, a COMPACT
+    ``{addr -> Instr}`` map overlaid as address-keyed code frames on the
+    position-invariant direct-CAM lanes.
+
+    THE CEILING LIFT: the fetch@PC CAM (``_bake_code_cam_head``, ALiBi slope 0,
+    ``CODE_ADDR_BITS`` wide) matches on the ``CODE_ADDR_BITS``-bit address key ALONE,
+    so a runtime frame keyed bits(440000) resolves fetch@PC=440000 at a COMPACT
+    physical row with NO positional decay — the RoPE ~12-16-bit ceiling (slow rotary
+    lanes) is lifted to the full ``CODE_ADDR_BITS`` range.  ``n_rt_pool`` compact
+    runtime code-frame rows are RESERVED up-front (right after the positional code
+    rows) so the append-only frame geometry stays stable as EMIT fills them.
+
+    Same-address re-emit OVERWRITES the slot (``run_code`` in place; ``runtime_frames``
+    is a dict) -> latest-write-wins by CONSTRUCTION (one frame per address), so no CAM
+    recency tiebreak is needed — the SAME contract 8e6946e7 used on the RoPE path.
+
+    Returns ``{"ax_trace", "ref_trace", "exact", "steps", "produced_code",
+    "runtime_frames", "max_emit_addr"}``.  ``ref_trace`` is ``isa.interpret`` (the c4
+    oracle) over the initial ``code`` with the ``seed_mem`` data segment preloaded."""
+    if not _cfm_emit_enabled():
+        raise RuntimeError("run_pure_forward_complete_emit requires C4_CFM_EMIT=1")
+    if not getattr(L, "cfm", False):
+        raise RuntimeError("EMIT needs the CFM (C4_PF_CFM=1) direct-CAM code path")
+
+    mem_init = dict(seed_mem or {})
+    ref_trace = isa.interpret(list(code), max_steps=max_steps, mem_init=mem_init or None)
+
+    # PRE-SEED the data §Memory (the "input file" a loaded compiler reads via LI/LC)
+    # as leading STORE frames — the same seed-frame mechanism the read-only path uses.
+    seed_frames, store_log = _seed_frames(seed_mem or {})
+    n_seed = len(store_log)
+    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+
+    n_code = len(code)                             # positional code rows never shrink
+    # STREAM (append-only): BOS | code rows | RESERVED runtime code rows | seed data
+    # frames | init frame | ... step frames.  The reserved runtime rows are neutral MEM
+    # tokens until EMIT fills them (the overlay writes IS_CODE + bits(addr) into the
+    # used ones); reserving them up-front keeps every later position STABLE across
+    # steps (the register CAM latest-write-wins; the store CAM persistent).
+    code_frame_toks: List[int] = ([V.MEM] * n_code + [V.MEM] * n_rt_pool)
+    stream: List[int] = [V.BOS] + code_frame_toks + seed_frames + init_frame
+
+    run_code = list(code)                          # mutable positional code (low-addr)
+    runtime_frames: Dict[int, isa.Instr] = {}      # HIGH-address emits: addr -> Instr
+    # A HIGH-address emit lives ONLY in ``runtime_frames`` (a compact dict), never in a
+    # giant ``run_code`` list — the direct-CAM address key decouples logical address
+    # from physical row, so a 2^20 target costs one dict slot + one KV row, not 2^20
+    # list entries.  ``_fetch`` mirrors the model's code CAM: positional rows for
+    # addr < n_code, the runtime dict for high addrs (else NOP == "no such frame").
+    def _fetch(pc: int) -> isa.Instr:
+        if 0 <= pc < len(run_code):
+            return run_code[pc]
+        return runtime_frames.get(pc, isa.Instr(isa.NOP, 0))
+
+    def _reachable(pc: int) -> bool:
+        return (0 <= pc < len(run_code)) or (pc in runtime_frames)
+
+    trace: List[int] = []
+    cur_pc = 0
+    cur_sp = cur_bp = SP_INIT
+    cur_ax = 0
+    frame_idx = n_seed
+    max_emit_addr = -1
+
+    for _ in range(max_steps):
+        if len(runtime_frames) > n_rt_pool:
+            raise RuntimeError(f"EMIT produced {len(runtime_frames)} runtime frames "
+                               f"> reserved pool {n_rt_pool}; raise n_rt_pool")
+        overlay = make_overlay_complete(run_code, L, store_log=store_log,
+                                        runtime_frames=runtime_frames,
+                                        code_rows=n_code,
+                                        frame_start=1 + n_code + n_rt_pool)
+        toks = torch.tensor([stream])
+        with torch.no_grad():
+            x = model.embed[toks].clone()
+            overlay(x)
+            for blk in model.blocks:
+                x = blk(x)
+        state = x[0, -1]
+
+        ins = _fetch(cur_pc)
+        op, imm = ins.op, ins.imm
+        pc = _snap_lane(state[L.PC_VAL])
+        sp = _snap_lane(state[L.SP_VAL])
+        bp = _snap_lane(state[L.BP_VAL])
+        stk = _snap_lane(state[L.STK_VAL])
+        halted = float(state[L.HALTED]) > 0.5
+        ax = _decode_reg_from_nibbles(state, L, L.AX)
+
+        # HIGH-ADDRESS CONTROL FLOW (driver bookkeeping, keeps the model build byte-
+        # identical to golden 069cc32f): a JMP/BZ/BNZ TARGET rides the fetched
+        # instruction's immediate (IMM_CLEAN), whose SIGNED nibble width is sized for
+        # the corpus code_size — a target above that range folds in the model's PC
+        # decode (a 4096-target -> 0).  The BRANCH DECISION is the model's (its AX
+        # predicate + PC transition are correct); only the target VALUE needs the wide
+        # immediate.  So the driver recomputes the taken target from the fetched imm
+        # (exactly as it already derives EMIT's target + store addresses from the
+        # fetched instruction) — no model weight changes, so C4_CFM_EMIT stays golden.
+        # The model still FETCHES the branch instruction from the code CAM and computes
+        # AX; this only widens the driver's PC bookkeeping past IMM_CLEAN's range.
+        if op == isa.JMP:
+            pc = imm & ((1 << CODE_ADDR_BITS) - 1)
+        elif op == isa.BZ:
+            pc = (imm & ((1 << CODE_ADDR_BITS) - 1)) if (ax & mask) == 0 else (cur_pc + 1)
+        elif op == isa.BNZ:
+            pc = (imm & ((1 << CODE_ADDR_BITS) - 1)) if (ax & mask) != 0 else (cur_pc + 1)
+
+        # ---- EMIT: driver-serviced control op (no FFN rule) --------------------
+        # The model FETCHED this EMIT from the code CAM; the register CAM reconstructed
+        # AX + STACK0.  op<-AX, imm<-STACK0(popped); target = EMIT imm.  We use the
+        # PRE-step (driver-tracked) registers for the produced word — the driver-service
+        # contract 8e6946e7 uses (the model's PC/AX for the EMIT row itself are the
+        # control op's, not a computed transition).
+        if op == isa.EMIT:
+            produced_op = cur_ax & 0xFF            # AX rides the produced op
+            produced_imm = _mem_top(store_log, cur_sp) & 0xFF   # STACK0 rides imm
+            target = imm
+            produced = isa.Instr(produced_op, produced_imm)
+            if target < n_code:                    # LOW addr -> positional row (in place)
+                while target >= len(run_code):
+                    run_code.append(isa.Instr(isa.NOP, 0))
+                run_code[target] = produced
+            else:                                  # HIGH addr -> position-invariant frame
+                runtime_frames[target] = produced  # latest-write-wins (dict compaction)
+                max_emit_addr = max(max_emit_addr, target)
+            # EMIT pops the immediate it consumed off the KV-backed stack: drop the
+            # LATEST (highest frame_idx == the current top-of-stack, latest-write-wins)
+            # store frame at MEM[cur_sp], SP += 4 (the pop).
+            _pop_fi = None
+            for fi in sorted(store_log):
+                if fi > n_seed and store_log[fi][0] == cur_sp:
+                    _pop_fi = fi
+            if _pop_fi is not None:
+                del store_log[_pop_fi]
+            new_sp = (cur_sp + 4) & 0xFFFFFFFF
+            new_pc = cur_pc + 1
+            trace.append(cur_ax & mask)
+            # the EMIT step still emits a (neutral) frame so the stream stays a clean
+            # frame grid: PC advances by one, registers otherwise unchanged.
+            frame_idx += 1
+            stream += _build_frame(new_pc, cur_ax, new_sp, cur_bp, 0)
+            if verbose:
+                print(f"  step pc={cur_pc} op=EMIT -> code[{target}]="
+                      f"({isa.NAMES.get(produced_op, produced_op)} {produced_imm}) "
+                      f"pc={new_pc} (runtime_frame={target >= n_code})", flush=True)
+            cur_pc, cur_sp = new_pc, new_sp
+            # cur_ax/cur_bp unchanged by EMIT.
+            if not _reachable(cur_pc):
+                break
+            continue
+
+        # store bookkeeping (same SI store contract as run_pure_forward_complete).
+        s_addr = s_val = 0
+        is_store = False
+        if op in (isa.SI, isa.SC):
+            is_store = True; s_addr = _mem_top(store_log, cur_sp); s_val = ax & mask
+        elif op == isa.PSH:
+            is_store = True; s_addr = cur_sp - 4; s_val = ax & mask
+        elif op == isa.JSR:
+            is_store = True; s_addr = cur_sp - 4; s_val = (cur_pc + 1) & 0xFFFFFFFF
+        elif op == isa.ENT:
+            is_store = True; s_addr = cur_sp - 4; s_val = cur_bp & 0xFFFFFFFF
+        frame = _build_frame(pc, ax, sp, bp, stk,
+                             mem_addr=(s_addr if is_store else 0),
+                             mem_val=(s_val if is_store else 0))
+        trace.append(ax & mask)
+        frame_idx += 1
+        if is_store:
+            store_log[frame_idx] = (s_addr, s_val)
+        stream += frame
+        if verbose:
+            print(f"  step pc={cur_pc} op={isa.NAMES.get(op, op):4s} -> "
+                  f"pc'={pc} ax={ax & 0xFF} sp={sp} bp={bp} stk={stk} "
+                  f"store={'Y' if is_store else '.'}@{s_addr}={s_val} halt={halted}",
+                  flush=True)
+        cur_pc, cur_sp, cur_bp, cur_ax = pc, sp, bp, ax
+        if halted or not _reachable(pc):
+            break
+
+    return {"ax_trace": trace, "ref_trace": ref_trace,
+            "exact": trace == ref_trace, "steps": len(trace),
+            "produced_code": run_code, "runtime_frames": dict(runtime_frames),
+            "max_emit_addr": max_emit_addr}
 
 
 def _decode_reg_from_nibbles(state: torch.Tensor, L, reg_base: int) -> int:
