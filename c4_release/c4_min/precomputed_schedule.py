@@ -164,6 +164,42 @@ def resident_batch_enabled() -> bool:
     return os.environ.get("C4_RESIDENT_BATCH", "0") not in ("0", "", "false", "False")
 
 
+def attn_megablock_enabled() -> bool:
+    """``C4_ATTN_MEGABLOCK`` (DEFAULT OFF).  The ATTENTION-BLOCK analog of the FFN
+    fused-megablock/wave-batch: collapse the 3 live-CAM attention blocks' per-block work
+    (a full ``[K,D]`` residual CLONE + a DENSE ``F.linear`` W_up/W_gate/W_down + full-width
+    ``silu`` over ~4096-wide activations, run as 3 SEPARATE tile/launch-bound blocks) into
+    the SAME single ``[D,K]``-resident sparse fused-hidden megakernel path the dead-FFN
+    chain uses.
+
+    THE LEVER (this task).  On the on-chip precomputed-schedule path the live-CAM blocks are
+    ``h = ffn_b( h[:,out_dims_b] += wo_delta_b )``.  The dominant cost is NOT the tiny
+    ``W_o(cam_out)`` scatter (2-10 dims) nor the tiny FFN nnz (0/99/54 across the 3 blocks) —
+    it is that ``SparseFFN.forward`` runs a DENSE ``F.linear`` producing a full ``[K, Dff]``
+    intermediate (Dff~4096), then full-width ``silu``/bias/multiply over it, PLUS an
+    ``h.clone()`` of the whole ``[1,K,D]`` residual per block AND a ``[1,K,D]<->[D,K]``
+    transpose at every mega<->live boundary (the profiler pins elementwise 37% + silu 20% +
+    clone 11% + memcpy 5% = ~73% of the whole step body on this ~99.996%-zero FFN).
+
+    C4_ATTN_MEGABLOCK routes each live block's FFN through the block's own ``_MegaFFN.run_fused``
+    (identical to the dead-FFN chain's fused-hidden kernel: it computes ONLY the active output
+    rows and snapshots only the read residual dims — no full-width silu, no ``[Dff,K]`` HBM
+    hidden, no clone) on the region's SINGLE persistent ``[D,K]`` residual, and does the
+    ``W_o(cam_out)`` inject as an in-place scatter-add into ``y[out_dims,:]`` on that same
+    buffer.  The whole region (mega segments + live-CAM FFN + live-CAM delta) then runs on ONE
+    resident ``[D,K]`` — the mega<->live transposes collapse to ONE transpose in + ONE out for
+    the whole region (vs one per boundary), the 3 per-live clones vanish, and the dense
+    full-width FFN becomes the sparse active-only megakernel.
+
+    BYTE-EXACT (verified L-inf=0 on real doom streams): ``_MegaFFN.run_fused`` computes the
+    IDENTICAL ``x + W_down(silu(W_up x + b_up)*(W_gate x + b_gate)) + b_down`` on the SAME
+    ``(x + wo_delta)`` as ``forward_static_delta`` (same CSR nonzeros, same accumulation
+    order); the in-place ``[D,K]`` scatter is the transpose of the ``[1,K,D]`` one.  Requires
+    ``C4_PRECOMPUTED_SCHEDULE`` + ``C4_ONCHIP_RESIDUAL`` (the delta path) + ``C4_FUSED_MEGABLOCK``.
+    OFF -> the per-live dense-FFN clone path (069cc32f unchanged)."""
+    return os.environ.get("C4_ATTN_MEGABLOCK", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # 1. THE COMPILED PER-ROW MAP.  block-0 (W_o + FFN) -> mega dead-FFN chain ->
 #    live CAM blocks (W_o + FFN) -> decode lanes, all fed by precomputed gathers.
@@ -281,6 +317,26 @@ class PrecomputedStepGraph:
             for b, lb in self.live_blocks.items():
                 for (hh, knd) in lb.cam_heads:
                     self._faithful_heads.append((b, int(hh), knd, _n_addr_bits(knd)))
+        # C4_ATTN_MEGABLOCK: fuse the live-CAM FFNs into the region's single [D,K] resident
+        # residual via the SAME sparse fused-hidden kernel the dead-FFN chain uses (no dense
+        # F.linear/full-width silu, no per-live clone, no per-boundary transpose).  Requires
+        # the on-chip delta path; when faithful is on we keep the (cheap) non-fused path so the
+        # in-graph W_q(x) decode reads the untransposed [1,C,D] residual unchanged.
+        self._attn_mega = bool(attn_megablock_enabled() and self.onchip and not self._faithful)
+        self._live_mffn: Dict[int, object] = {}
+        self._live_max_n_in = 0
+        if self._attn_mega:
+            from .fused_megablock import _MegaFFN
+            # _MegaFFN honors C4_MEGABLOCK_BLOCK_K internally; pass the same default (64) the
+            # dead-FFN chain does so the live FFN uses the SAME tile as the mega segments.
+            _bk_env = os.environ.get("C4_MEGABLOCK_BLOCK_K", "")
+            _bk = int(_bk_env) if _bk_env.strip().isdigit() else 64
+            max_n_in = 1
+            for b, lb in self.live_blocks.items():
+                mf = _MegaFFN(lb.ffn, str(self.device), _bk)
+                self._live_mffn[b] = mf
+                max_n_in = max(max_n_in, mf.n_in)
+            self._live_max_n_in = max_n_in
 
     # -- the fixed-shape whole-step body over the static buffers ----------------
     def _body(self):
@@ -299,6 +355,13 @@ class PrecomputedStepGraph:
             out2 = self._s_ing.transpose(1, 2).contiguous().view(1, C, D)
             h = self._s_h0 + self.attn0.W_o.linear(out2)
             h = self.ffn0.forward(h)                       # [1,C,D]
+        # C4_ATTN_MEGABLOCK: run the whole region on one [D,C] buffer AND decode straight from
+        # that [D,C] residual (the decode lanes are ROW slices y[dim,:] — contiguous — so the
+        # [D,C]->[1,C,D] OUTPUT transpose is eliminated too, on top of the fused region).
+        if self._attn_mega:
+            y = self._run_region_fused_dk(h)               # [D, C] region residual
+            self._decode_from_dk(y)
+            return y
         # the mega dead-FFN chain + live CAM blocks, in application order.  The
         # MegaBlockRegion.run interleaves the mega segments with live blocks eagerly; we
         # reproduce that ordering but SUBSTITUTE each live block's precomputed cam_out.
@@ -330,6 +393,8 @@ class PrecomputedStepGraph:
         ``[C,D]@[D,D]`` GEMM on a ~99.997%-zero cam_out) is replaced by a scatter-add of
         the PRECOMPUTED compact delta into the residual (``forward_static_delta``), so the
         residual stays on-chip across the whole chain — no per-live-block dense GEMM."""
+        if self._attn_mega:
+            return self._run_region_fused(h)
         for kind, payload in self.mega.items:
             if kind == "mega":
                 h = payload.run(h)                      # eager kernels (capturable)
@@ -346,6 +411,74 @@ class PrecomputedStepGraph:
                 else:
                     h = lb.forward_static(h, self._s_cam[b])
         return h
+
+    def _run_region_fused(self, h: torch.Tensor) -> torch.Tensor:
+        """ATTN-MEGABLOCK (C4_ATTN_MEGABLOCK): the ATTENTION-block analog of the FFN
+        fused-megablock.  Run the WHOLE region (mega dead-FFN segments + live-CAM FFNs +
+        live-CAM W_o(cam_out) injects) on ONE persistent ``[D,C]`` residual, IN PLACE:
+
+          * ONE transpose ``[1,C,D] -> [D,C]`` in and ONE ``[D,C] -> [1,C,D]`` out for the
+            WHOLE region (vs one ``[D,K]<->[1,K,D]`` transpose at EVERY mega<->live boundary
+            in the per-block path);
+          * each mega segment runs its fused-hidden chain in place on the shared buffer
+            (``run_chain_inplace_ext``) — no copy into/out of the chain's own buffer;
+          * each live block: scatter-add the precomputed ``W_o(cam_out)`` delta into
+            ``y[out_dims,:]`` (transpose of the ``[C,n_out]`` delta), then run the block's
+            FFN through the SAME sparse ``_MegaFFN.run_fused`` kernel (active-rows only, no
+            full-width ``F.linear``/``silu``, no ``[Dff,K]`` HBM hidden, no ``h.clone()``).
+
+        BYTE-EXACT to ``_run_region`` (on-chip): ``_MegaFFN.run_fused`` is the identical FFN
+        arithmetic on the identical ``(x + wo_delta)`` (verified L-inf=0 on real doom streams);
+        the ``[D,C]`` scatter is the transpose of the ``[1,C,D]`` one; the mega segments run
+        the identical kernel stream on the identical residual values."""
+        y = self._run_region_fused_dk(h)              # [D, C]
+        return y.transpose(0, 1).unsqueeze(0).contiguous()
+
+    def _run_region_fused_dk(self, h: torch.Tensor) -> torch.Tensor:
+        """The fused region, returning the ``[D,C]`` residual (NO output transpose).  See
+        ``_run_region_fused`` for the contract; the decode reads this ``[D,C]`` buffer
+        directly (row slices) via ``_decode_from_dk``."""
+        C = h.shape[1]
+        y = h[0].transpose(0, 1).contiguous()        # [D, C] region-resident residual (one in-transpose)
+        snap = None
+        if self._live_max_n_in:
+            snap = torch.empty(self._live_max_n_in, C, device=y.device, dtype=torch.float32)
+        for kind, payload in self.mega.items:
+            if kind == "mega":
+                payload.run_chain_inplace_ext(y, C)   # in-place on the shared [D,C] buffer
+            else:  # live CAM block
+                b = payload
+                out_dims = self.live_out_dims[b]      # [n_out] residual dims (D-space)
+                # W_o(cam_out) inject: add the precomputed [C, n_out] delta at y[out_dims, :].
+                y[out_dims, :] += self._s_delta[b].transpose(0, 1)
+                mf = self._live_mffn[b]
+                mf.run_fused(y, C, snap_scratch=snap)
+        return y
+
+    def _decode_from_dk(self, y: torch.Tensor):
+        """Decode PC/SP/BP/AX straight from the ``[D,C]`` region residual ``y`` — the decode
+        lanes are ROW slices ``y[dim, :]`` (contiguous), so no ``[D,C]->[1,C,D]`` transpose is
+        needed.  Byte-identical to ``_body``'s decode (same lane values, same snap/AX decode)."""
+        L = self.L
+        self._s_pc.copy_(_snap_lane_light(y[L.PC_VAL, :]))
+        self._s_sp.copy_(_snap_lane_light(y[L.SP_VAL, :]))
+        self._s_bp.copy_(_snap_lane_light(y[L.BP_VAL, :]))
+        ax = self._decode_reg_batch_dk(y, L.AX) & self.mask
+        self._s_ax.copy_(ax)
+
+    @staticmethod
+    def _decode_reg_batch_dk(y: torch.Tensor, reg_base: int) -> torch.Tensor:
+        """``_decode_reg_batch`` for a ``[D,C]`` residual: read the 8 nibble ROWS
+        ``y[reg_base + 2*bi + {0,1}, :]`` (each a contiguous [C] lane) and assemble the
+        [C] register value.  Bit-identical to ``_decode_reg_batch`` on the transposed
+        ``[C,D]`` (same nibble snap ``_snap_nib_batch``, same byte assembly)."""
+        from .nibble_pure_forward_gpu import _snap_nib_batch
+        vals = torch.zeros(y.shape[1], dtype=torch.long, device=y.device)
+        for bi in range(4):
+            lo = _snap_nib_batch(y[reg_base + 2 * bi + 0, :])
+            hi = _snap_nib_batch(y[reg_base + 2 * bi + 1, :])
+            vals |= (lo + 16 * hi) << (8 * bi)
+        return vals
 
     def _decode_qaddr_at(self, b, lb, h):
         """In-graph sign-decode of the model's queried address at live block ``b`` from its

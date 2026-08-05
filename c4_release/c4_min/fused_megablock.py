@@ -559,6 +559,16 @@ class MegaBlockChain:
                 mf.run_fused(y, K, snap_scratch=snap)
         return y
 
+    def run_chain_inplace_ext(self, y_ext: torch.Tensor, K: int) -> None:
+        """ATTN-MEGABLOCK (C4_ATTN_MEGABLOCK): run this segment's dead-FFN chain IN PLACE on
+        an EXTERNALLY-owned ``[D,K]`` residual ``y_ext`` (the region's single persistent
+        buffer), using this chain's own hidden/snap scratch.  No per-segment copy into/out of
+        this chain's private ``y`` — the whole region keeps ONE resident ``[D,K]`` across all
+        mega segments AND the live-CAM FFNs, so the mega<->live transposes + per-live clones
+        are eliminated.  Byte-exact: ``_run_chain`` is the SAME kernel stream on the SAME
+        residual values, independent of which buffer object holds them."""
+        self._run_chain(y_ext, K)
+
     def run(self, hq: torch.Tensor) -> torch.Tensor:
         """hq [1,K,D] -> [1,K,D] after the dead-FFN chain (eager, no graph).
 
