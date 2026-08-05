@@ -62,7 +62,14 @@ def direct_local_cam_enabled() -> bool:
     """C4_DIRECT_LOCAL_CAM (DEFAULT OFF): direct-index gather for the block-0
     register-ingest heads in the batched verify span.  OFF -> the banded/softmax ingest
     (byte-exact golden path).  ON -> each ingest head direct-gathers its resolved frame
-    byte per query row (no windowed score) -> the last local-attention floor collapses."""
+    byte per query row (no windowed score) -> the last local-attention floor collapses.
+
+    OVERRIDE: ``C4_FAITHFUL_ATTN_EVICT`` forces this OFF so block-0's ingest heads
+    genuinely score the emitted-token frame (the register-ingest read is then
+    independently recomputed, not draft-injected) — part of the genuinely-computing
+    path."""
+    if os.environ.get("C4_FAITHFUL_ATTN_EVICT", "0") not in ("0", "", "false", "False"):
+        return False
     return os.environ.get("C4_DIRECT_LOCAL_CAM", "0") not in ("0", "", "false", "False")
 
 
