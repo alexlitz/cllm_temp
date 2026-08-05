@@ -32,6 +32,7 @@ from c4_min.pf_speculative import draft_pf_program
 from c4_min.tight_attn_compose import install_composed, uninstall_composed
 from c4_min.bench_fast_path import build_nested
 from c4_min import precomputed_schedule as PS
+from c4_min.precomputed_schedule import PipelinedScheduleBuilder  # noqa: F401
 
 RENDER_REDUCED_FRAME = 358_058
 RAW_FRAME = 6_889_264
@@ -140,7 +141,11 @@ def measure(model, L, code, draft, device, chunk, n_frames=5):
           f"= {pf_serial*1e3:8.2f} ms/frame  ({b/n*1e6:.3f} + {d/n*1e6:.3f} us/step)",
           flush=True)
 
-    # ---- PIPELINED continuous: build(N+1) on a side stream || dispatch(N) graph replay. ----
+    # ---- NAIVE-PIPELINED continuous (the base harness's attempt): build(N+1) inside a
+    #      ``with torch.cuda.stream(side)`` || dispatch(N).  This does NOT overlap because
+    #      the build is ~90% CPU numpy — a cuda.stream context only redirects GPU kernel
+    #      launches, so the CPU build fully completes on the main thread BEFORE dispatch is
+    #      even issued.  Kept as the DEMONSTRATION of the serialization bug. ----
     side = torch.cuda.Stream(device=dev)
     cur = PS.build_schedule_tables_only(model, L, code, draft, dev, sg, mask=mask)
     torch.cuda.synchronize(dev)
@@ -154,11 +159,70 @@ def measure(model, L, code, draft, device, chunk, n_frames=5):
     torch.cuda.synchronize(dev)
     pf_pipe = (time.perf_counter() - t_all0) / n_frames
     del cur; gc.collect(); torch.cuda.empty_cache()
-    print(f"  PIPELINED continuous: build(N+1)||dispatch(N) double-buffer "
-          f"= {pf_pipe*1e3:8.2f} ms/frame  (~max(build,dispatch))", flush=True)
+    print(f"  NAIVE-PIPE continuous: build(N+1)@cuda.stream||dispatch(N) "
+          f"= {pf_pipe*1e3:8.2f} ms/frame  (does NOT overlap — CPU build serializes)",
+          flush=True)
+
+    # ---- TRUE-PIPELINED continuous (C4_SCHED_PIPELINE): build(N+1) on a BACKGROUND THREAD
+    #      + dedicated build stream || dispatch(N) graph replay on the default stream.  The
+    #      numpy build releases the GIL so the main thread issues the replay concurrently;
+    #      the build's GPU ops run on a separate stream; event-sync only at the swap.
+    #
+    #      HONEST STEADY-STATE: the first ~2 frames warm the pipeline (frame 0 has no
+    #      overlap; frame 1 fills the double-buffer + first-replay allocator warmup), so a
+    #      continuous render (thousands of frames) is dominated by the STEADY-STATE frame.
+    #      We time each frame individually and report the steady-state MEDIAN (warmup
+    #      discarded), the number the real-time doom loop actually sustains. ----
+    os.environ["C4_SCHED_PIPELINE"] = "1"
+    WARMUP = 2
+    pb = PS.PipelinedScheduleBuilder(model, L, code, draft, dev, sg, mask=mask)
+    cur = pb.build_blocking()                # frame 0 (no overlap possible yet)
+    torch.cuda.synchronize(dev)
+    pb.start()                               # kick off frame 1's build on the thread
+    frame_walls = []
+    total_frames = n_frames + WARMUP
+    for i in range(total_frames):
+        torch.cuda.synchronize(dev); t_f0 = time.perf_counter()
+        _dispatch(cur, sg, dev, n)           # frame-N replay (overlaps the thread's build)
+        nxt = pb.wait()                      # join build thread + event-sync the swap
+        del cur; cur = nxt
+        if i < total_frames - 1:
+            pb.start()                       # kick off frame N+2's build
+        torch.cuda.synchronize(dev); frame_walls.append(time.perf_counter() - t_f0)
+    del cur; gc.collect(); torch.cuda.empty_cache()
+    steady = sorted(frame_walls[WARMUP:])
+    pf_thread = steady[len(steady) // 2]     # steady-state MEDIAN (warmup discarded)
+    pf_thread_mean_all = sum(frame_walls) / len(frame_walls)
+    print(f"  TRUE-PIPE  continuous: build(N+1)@thread+stream||dispatch(N) double-buffer "
+          f"= {pf_thread*1e3:8.2f} ms/frame  (steady-state median; ~max(build,dispatch) "
+          f"= {max(b,d)*1e3:.2f} ms)", flush=True)
+    print(f"             per-frame walls (ms): {[round(x*1e3) for x in frame_walls]}"
+          f"  [first {WARMUP} = warmup, discarded]  all-mean {pf_thread_mean_all*1e3:.1f}",
+          flush=True)
+
+    # ---- BYTE-EXACT: the thread-built schedule dispatch == the serial-built schedule
+    #      dispatch (per-step AX/PC/SP/BP L-inf=0).  The overlap must NOT change results —
+    #      the double-buffer swap must be correctly synchronized (no half-built read). ----
+    s_ser = PS.build_schedule_tables_only(model, L, code, draft, dev, sg, mask=mask)
+    torch.cuda.synchronize(dev)
+    ser_pc, ser_sp, ser_bp, ser_ax = _dispatch(s_ser, sg, dev, n)
+    torch.cuda.synchronize(dev)
+    pb2 = PS.PipelinedScheduleBuilder(model, L, code, draft, dev, sg, mask=mask)
+    pb2.start()
+    s_thr = pb2.wait()                       # thread-built + event-synced schedule
+    thr_pc, thr_sp, thr_bp, thr_ax = _dispatch(s_thr, sg, dev, n)
+    torch.cuda.synchronize(dev)
+    linf = max(int((ser_pc != thr_pc).sum()), int((ser_sp != thr_sp).sum()),
+               int((ser_bp != thr_bp).sum()), int((ser_ax != thr_ax).sum()))
+    print(f"  [BYTE-EXACT] thread-pipe vs serial decode mismatches (PC/SP/BP/AX) = {linf}"
+          f"  ({'L-inf=0 OK' if linf == 0 else 'MISMATCH!'})", flush=True)
+    del s_ser, s_thr, ser_pc, ser_sp, ser_bp, ser_ax, thr_pc, thr_sp, thr_bp, thr_ax
+    gc.collect(); torch.cuda.empty_cache()
+    os.environ.pop("C4_SCHED_PIPELINE", None)
     _levers_off()
     return {"build_s": b, "dispatch_s": d, "serial_s": pf_serial, "pipe_s": pf_pipe,
-            "capture_s": t_capture, "peak_gb": peak, "chunk": int(sg.chunk), "n": n}
+            "thread_s": pf_thread, "capture_s": t_capture, "peak_gb": peak,
+            "chunk": int(sg.chunk), "n": n}
 
 
 def _load_draft(outer, inner):
@@ -212,11 +276,15 @@ def main(argv=None):
     for label, fsteps in (("render-reduced", RENDER_REDUCED_FRAME), ("raw", RAW_FRAME)):
         ser = r["serial_s"] * (fsteps / n)
         pip = r["pipe_s"] * (fsteps / n)
+        thr = r["thread_s"] * (fsteps / n)
         print(f"    {label:>15} ({fsteps:>9} steps):", flush=True)
-        print(f"        SERIAL    {ser:8.4f} s/frame  {1.0/ser:7.2f} fps  "
+        print(f"        SERIAL     {ser:8.4f} s/frame  {1.0/ser:7.2f} fps  "
               f"{ser/REALTIME_S:6.2f}x 1s  {ser/FPS35_S:7.1f}x 35fps", flush=True)
-        print(f"        PIPELINED {pip:8.4f} s/frame  {1.0/pip:7.2f} fps  "
+        print(f"        NAIVE-PIPE {pip:8.4f} s/frame  {1.0/pip:7.2f} fps  "
               f"{pip/REALTIME_S:6.2f}x 1s  {pip/FPS35_S:7.1f}x 35fps", flush=True)
+        print(f"        TRUE-PIPE  {thr:8.4f} s/frame  {1.0/thr:7.2f} fps  "
+              f"{thr/REALTIME_S:6.2f}x 1s  {thr/FPS35_S:7.1f}x 35fps"
+              f"   {'>=1 fps!' if 1.0/thr >= 1.0 else '<1 fps'}", flush=True)
     print(f"\n  VRAM peak {r['peak_gb']:.1f} GB @ chunk {r['chunk']}  (24 GB ceiling)",
           flush=True)
     print("\n=== CONTINUOUS STEADY-STATE COMPLETE ===", flush=True)
