@@ -117,6 +117,40 @@ int   n_tensors;
 int   input_tid;
 int   output_tid;
 
+/* ---- WEIGHT DEDUP (C4_DEDUP_WEIGHTS, opt-in, default OFF) --------------------
+ * The emulated transformer's weights are a tiny PALETTE of unique values replicated
+ * ~100x (198,610 nonzeros -> 1,895 unique).  With -DC4_DEDUP_WEIGHTS the runtime
+ * stores each float(=fixed-point) INITIALIZER's payload as a PALETTE INDEX (an int
+ * into `palette[]`) instead of the value, and a matmul weight read is the TWO-ACCESS
+ * chained indirection  `i = tv[a][flat]; W = palette[i]`  (the second chained load).
+ * This ADDS one load per weight fetch (the honest dedup cost) while collapsing the
+ * value storage to the palette.  DEFAULT-OFF -> the golden weight path (direct
+ * `tv[a][flat]`) is byte-identical; ON -> byte-EXACT (palette[idx]==the value).
+ * Non-weight (int64) tensors + runtime intermediates are never deduped. */
+#ifndef PALETTE_MAX
+#define PALETTE_MAX 4096                 /* >= 1,895 unique weight values */
+#endif
+long palette[PALETTE_MAX];               /* the unique fixed-point weight values */
+int  palette_n;                          /* number of distinct values stored */
+int  t_deduped[MAX_TENSORS];             /* 1 => tv[i] holds palette INDICES */
+#ifdef C4_DEDUP_WEIGHTS
+int  dedup_on = 1;
+#else
+int  dedup_on = 0;
+#endif
+
+/* intern a fixed-point value into the palette; return its index (linear scan —
+ * C4-subset friendly; the palette is tiny so this is cheap at load time). */
+int palette_intern(long v) {
+    int i;
+    i = 0;
+    while (i < palette_n) { if (palette[i] == v) return i; i = i + 1; }
+    if (palette_n >= PALETTE_MAX) { printf("palette overflow (>%d)\n", PALETTE_MAX); exit(1); }
+    palette[palette_n] = v;
+    palette_n = palette_n + 1;
+    return palette_n - 1;
+}
+
 /* ---- node table ---- */
 int n_op[MAX_NODES];
 int n_nin[MAX_NODES];
@@ -270,9 +304,13 @@ int prod(int rank, int *dims) {
     return p;
 }
 
-/* allocate a runtime tensor's storage for the given shape + dtype/isfp */
+/* allocate a runtime tensor's storage for the given shape + dtype/isfp.  Resets
+ * t_deduped: a freshly COMPUTED tensor (matmul/add/...) holds VALUES, not palette
+ * indices.  The structural COPY ops (gather/reshape/transpose/concat/unsqueeze) that
+ * move a deduped payload verbatim re-assert t_deduped[out]=t_deduped[in] afterwards. */
 void alloc_tensor(int tid, int dtype, int isfp, int rank, int *dims) {
     int sz; int i;
+    t_deduped[tid] = 0;
     t_dtype[tid] = dtype;
     t_isfp[tid] = isfp;
     t_rank[tid] = rank;
@@ -324,13 +362,27 @@ void load(char *path) {
             /* float initializer -> fixed-point payload (t_isfp=1);
                int64 initializer -> raw int payload (t_isfp=0) */
             alloc_tensor(i, dt, (dt == DT_FLOAT) ? 1 : 0, rank, dims);
+            t_deduped[i] = 0;
             if (dt == DT_FLOAT) {
-                j = 0; while (j < ne) { tv[i][j] = rd_f32_fp(f); j = j + 1; }
+                if (dedup_on) {
+                    /* DEDUP: store the palette INDEX (an int), not the value.  The
+                       matmul weight read then chains  i=tv[a][flat]; W=palette[i]. */
+                    j = 0;
+                    while (j < ne) {
+                        long v; v = rd_f32_fp(f);
+                        tv[i][j] = (long)palette_intern(v);
+                        j = j + 1;
+                    }
+                    t_deduped[i] = 1;
+                } else {
+                    j = 0; while (j < ne) { tv[i][j] = rd_f32_fp(f); j = j + 1; }
+                }
             } else {
                 j = 0; while (j < ne) { tv[i][j] = rd_i64(f); j = j + 1; }
             }
         } else {
             t_dtype[i] = -1; t_isfp[i] = 0; t_rank[i] = 0; t_size[i] = 0;
+            t_deduped[i] = 0;
         }
         i = i + 1;
     }
@@ -361,6 +413,9 @@ void load(char *path) {
     fclose(f);
     printf("loaded %s: %d tensors, %d nodes (in=%d out=%d) [fixed-point 16.16]\n",
            path, n_tensors, n_nodes, input_tid, output_tid);
+    if (dedup_on)
+        printf("  [dedup ON] palette = %d unique weight values (two-access weight read)\n",
+               palette_n);
 }
 
 /* find an attribute value on node `nd`, key `key`; return value index 0 or dflt */
@@ -393,8 +448,25 @@ int attr_val(int nd, int key, int idx) {
     return 0;
 }
 
-/* raw payload access (either fixed-point or raw int, per t_isfp) */
-long getv(int tid, int flat) { return tv[tid][flat]; }
+/* DEDUP-aware payload access.  For a deduped tensor (an initializer whose payload
+ * was interned into `palette[]` at load time) this is the TWO-ACCESS chained load
+ * `i = tv[tid][flat]; W = palette[i]` (the second chained load is the dedup cost);
+ * for a non-deduped tensor (dedup OFF, an int64 tensor, or a runtime intermediate)
+ * it is the plain single load.  Byte-EXACT either way (palette[idx] == the value).
+ * Routing ALL value reads through here keeps every op — matmul, add/mul, gather,
+ * reduce — reading the resolved value, so the whole forward is byte-identical. */
+long getv(int tid, int flat) {
+    if (t_deduped[tid]) {
+        int idx;
+        idx = (int)tv[tid][flat];       /* load 1: the palette index for this slot */
+        return palette[idx];            /* load 2: the value at that palette slot */
+    }
+    return tv[tid][flat];               /* direct (golden) single load */
+}
+
+/* the matmul weight fetch — the SAME two-access chained load, named for the MAC
+ * loop where the dedup step-cost is measured (see _matmul_dedup_src). */
+long get_wt(int tid, int flat) { return getv(tid, flat); }
 
 /* fixed-point multiply where we know the result should stay fixed-point:
    (a_fp * b_fp) >> SCALE_BITS with round-to-nearest.  a,b are long. */
@@ -531,7 +603,10 @@ void op_matmul(int out, int a, int b) {
                 acc = 0;
                 r = 0;
                 while (r < K) {
-                    acc = acc + tv[a][aoff + p * K + r] * tv[b][boff + r * N + q];
+                    /* DEDUP-aware operand fetch: a deduped weight tensor resolves
+                       via `palette[tv[...]]` (the two-access chained load); a
+                       runtime intermediate / dedup-OFF reads directly.  Byte-exact. */
+                    acc = acc + get_wt(a, aoff + p * K + r) * get_wt(b, boff + r * N + q);
                     r = r + 1;
                 }
                 if (afp && bfp) {
@@ -566,6 +641,9 @@ void op_gather(int out, int data, int ind, int axis) {
     i = axis + 1; while (i < dr) { rdims[rank] = t_dims[data][i]; rank = rank + 1; i = i + 1; }
     if (rank == 0) { rdims[0] = 1; rank = 1; }
     alloc_tensor(out, t_dtype[data], t_isfp[data], rank, rdims);
+    /* Gather copies data payload VERBATIM: if `data` is a deduped (palette-indexed)
+       weight, the gathered rows are still palette indices -> propagate the flag. */
+    t_deduped[out] = t_deduped[data];
 
     o = 0;
     while (o < outer) {
@@ -602,6 +680,7 @@ void op_reshape(int out, int in, int shp) {
     if (neg >= 0) rdims[neg] = t_size[in] / known;
     sz = t_size[in];
     alloc_tensor(out, t_dtype[in], t_isfp[in], rank, rdims);
+    t_deduped[out] = t_deduped[in];      /* verbatim payload copy: indices stay indices */
     i = 0;
     while (i < sz) { tv[out][i] = tv[in][i]; i = i + 1; }
 }
@@ -617,6 +696,7 @@ void op_transpose(int out, int in, int nd, int *perm) {
     i = 0; while (i < rank) { odims[i] = idims[perm[i]]; i = i + 1; }
     strides_of(rank, idims, ist);
     alloc_tensor(out, t_dtype[in], t_isfp[in], rank, odims);
+    t_deduped[out] = t_deduped[in];      /* verbatim payload permute: indices stay indices */
     strides_of(rank, odims, ost);
     sz = t_size[in];
     i = 0; while (i < rank) { idx[i] = 0; i = i + 1; }
@@ -672,7 +752,9 @@ void op_concat(int nd, int out, int axis) {
                     int dstf; int srcf;
                     dstf = (o * total + off + k) * inner + aa;
                     srcf = (o * seg + k) * inner + aa;
-                    tv[out][dstf] = tv[cin][srcf];
+                    /* Concat may mix deduped + non-deduped inputs, so RESOLVE each
+                       source to its VALUE via getv (out is left non-deduped). */
+                    tv[out][dstf] = getv(cin, srcf);
                     aa = aa + 1;
                 }
                 k = k + 1;
@@ -708,6 +790,7 @@ void op_unsqueeze(int out, int in, int axtid) {
     }
     sz = (rank == 0) ? 1 : t_size[in];
     alloc_tensor(out, t_dtype[in], t_isfp[in], newrank, rdims);
+    t_deduped[out] = t_deduped[in];      /* verbatim payload copy: indices stay indices */
     i = 0;
     while (i < sz) { tv[out][i] = tv[in][i]; i = i + 1; }
 }
