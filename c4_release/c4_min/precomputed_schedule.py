@@ -200,6 +200,33 @@ def attn_megablock_enabled() -> bool:
     return os.environ.get("C4_ATTN_MEGABLOCK", "0") not in ("0", "", "false", "False")
 
 
+def block0_dk_enabled() -> bool:
+    """``C4_BLOCK0_DK`` (DEFAULT OFF).  Fold block-0 DIRECTLY into the ``[D,K]`` fused region
+    (eliminates the last ``[1,C,D]->[D,C]`` input transpose — ~19% of the ATTN_MEGABLOCK step).
+
+    WITHOUT this flag, ``C4_ATTN_MEGABLOCK`` runs block-0's FFN in the natural ``[1,C,D]``
+    layout (``h = ffn0.forward(h0) -> [1,C,D]``) and then transposes ``h[0] -> [D,C]`` to enter
+    the fused ``[D,K]`` chain.  That transpose is captured IN the graph body, so it runs EVERY
+    replay (the profiler pins it ~19% of the ON step, the single ``copy/clone`` bucket).
+
+    WITH ``C4_BLOCK0_DK``, block-0's FFN is treated as just another sparse block in the
+    ``[D,K]`` region: the resident h0 table is stored TRANSPOSED (``[D,K]``, ``h0_folded_dk``),
+    the graph's static ``_s_h0`` is bound/filled in ``[D,C]`` layout (a plain slice-copy of the
+    ``[D,K]`` table — NO transpose), block-0's FFN runs IN PLACE on that ``[D,C]`` buffer via the
+    SAME ``_MegaFFN.run_fused`` kernel the dead-FFN chain and the live-CAM blocks use, and the
+    region decode reads the ``[D,C]`` rows directly.  The ``[1,C,D]->[D,C]`` transpose vanishes
+    from the graph body entirely (the ONE-TIME ``[K,D]->[D,K]`` table transpose moves to the
+    O(build) frame prep, overlapped by the pipeline / amortized across the whole chunk's replay).
+
+    BYTE-EXACT: ``_MegaFFN.run_fused(y[D,C])`` on the transposed h0 computes the IDENTICAL
+    ``x + W_down(silu(W_up x + b_up)*(W_gate x + b_gate)) + b_down`` block-0 FFN (same CSR
+    nonzeros, same per-output accumulation order) as ``ffn0.forward(h0[1,C,D])`` — the ``[D,C]``
+    residual is the transpose of the ``[1,C,D]`` one, so every decoded lane value is identical
+    (fp-accum-order residue only, below the nibble-snap margin).  Requires ``C4_ATTN_MEGABLOCK``.
+    OFF -> the ATTN_MEGABLOCK block-0-output-transpose path (069cc32f unchanged)."""
+    return os.environ.get("C4_BLOCK0_DK", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # 1. THE COMPILED PER-ROW MAP.  block-0 (W_o + FFN) -> mega dead-FFN chain ->
 #    live CAM blocks (W_o + FFN) -> decode lanes, all fed by precomputed gathers.
@@ -323,8 +350,13 @@ class PrecomputedStepGraph:
         # the on-chip delta path; when faithful is on we keep the (cheap) non-fused path so the
         # in-graph W_q(x) decode reads the untransposed [1,C,D] residual unchanged.
         self._attn_mega = bool(attn_megablock_enabled() and self.onchip and not self._faithful)
+        # C4_BLOCK0_DK: fold block-0 into the [D,K] region (kill the last input transpose).  The
+        # static h0 buffer is [D,C] and block-0's FFN runs in place via _MegaFFN.run_fused — so the
+        # graph body has NO [1,C,D]<->[D,C] transpose at all.  Requires the fused [D,K] region.
+        self._block0_dk = bool(block0_dk_enabled() and self._attn_mega)
         self._live_mffn: Dict[int, object] = {}
         self._live_max_n_in = 0
+        self._block0_mffn = None
         if self._attn_mega:
             from .fused_megablock import _MegaFFN
             # _MegaFFN honors C4_MEGABLOCK_BLOCK_K internally; pass the same default (64) the
@@ -336,6 +368,11 @@ class PrecomputedStepGraph:
                 mf = _MegaFFN(lb.ffn, str(self.device), _bk)
                 self._live_mffn[b] = mf
                 max_n_in = max(max_n_in, mf.n_in)
+            if self._block0_dk:
+                # block-0's FFN as a [D,K] sparse block (same fused-hidden kernel).  It runs
+                # FIRST on the region's shared [D,C] residual (the transposed folded h0).
+                self._block0_mffn = _MegaFFN(self.ffn0, str(self.device), _bk)
+                max_n_in = max(max_n_in, self._block0_mffn.n_in)
             self._live_max_n_in = max_n_in
 
     # -- the fixed-shape whole-step body over the static buffers ----------------
@@ -343,6 +380,13 @@ class PrecomputedStepGraph:
         from .nibble_pure_forward_gpu import _decode_reg_batch
         L = self.L
         C, D = self.chunk, self.D
+        # C4_BLOCK0_DK: block-0 is already in the [D,C] region.  ``_s_h0`` is the TRANSPOSED
+        # folded h0 ([D,C]); run block-0's FFN + the whole region IN PLACE on it with NO
+        # [1,C,D]<->[D,C] transpose anywhere in the body, and decode from the [D,C] rows.
+        if self._block0_dk:
+            y = self._run_region_fused_dk(self._s_h0, block0=True)   # [D, C]
+            self._decode_from_dk(y)
+            return y
         if self.onchip:
             # block 0: h = ffn0( h0_folded ) — the W_o0(ingest) contribution is already
             # folded into the resident h0 table (data-independent), so block 0 is just its
@@ -434,15 +478,27 @@ class PrecomputedStepGraph:
         y = self._run_region_fused_dk(h)              # [D, C]
         return y.transpose(0, 1).unsqueeze(0).contiguous()
 
-    def _run_region_fused_dk(self, h: torch.Tensor) -> torch.Tensor:
+    def _run_region_fused_dk(self, h: torch.Tensor, block0: bool = False) -> torch.Tensor:
         """The fused region, returning the ``[D,C]`` residual (NO output transpose).  See
         ``_run_region_fused`` for the contract; the decode reads this ``[D,C]`` buffer
-        directly (row slices) via ``_decode_from_dk``."""
-        C = h.shape[1]
-        y = h[0].transpose(0, 1).contiguous()        # [D, C] region-resident residual (one in-transpose)
+        directly (row slices) via ``_decode_from_dk``.
+
+        ``block0`` (C4_BLOCK0_DK): ``h`` is the ``[D,C]`` transposed folded h0 (NOT ``[1,C,D]``),
+        so the region residual is a plain ``[D,C]`` COPY of it (no ``[1,C,D]->[D,C]`` transpose),
+        and block-0's FFN runs FIRST as another sparse ``run_fused`` block on the shared buffer —
+        byte-exact to ``ffn0.forward(h0).transpose`` (same CSR, same accumulation order)."""
+        if block0:
+            C = h.shape[1]
+            y = h.clone()                             # [D, C] resident residual (NO transpose)
+        else:
+            C = h.shape[1]
+            y = h[0].transpose(0, 1).contiguous()    # [D, C] region-resident residual (one in-transpose)
         snap = None
         if self._live_max_n_in:
             snap = torch.empty(self._live_max_n_in, C, device=y.device, dtype=torch.float32)
+        if block0 and self._block0_mffn is not None:
+            # block-0's FFN as the first [D,C] sparse block (y := x + W_down(silu(W_up x)*gate)).
+            self._block0_mffn.run_fused(y, C, snap_scratch=snap)
         for kind, payload in self.mega.items:
             if kind == "mega":
                 payload.run_chain_inplace_ext(y, C)   # in-place on the shared [D,C] buffer
@@ -554,7 +610,10 @@ class PrecomputedStepGraph:
 
     def _capture(self):
         C, D = self.chunk, self.D
-        self._s_h0 = torch.zeros(1, C, D, device=self.device)
+        # C4_BLOCK0_DK: the static h0 buffer is [D,C] (transposed) so the graph body never
+        # transposes.  Filled from a [D,K] folded-h0 table via a plain slice-copy at replay.
+        self._s_h0 = (torch.zeros(D, C, device=self.device) if self._block0_dk
+                      else torch.zeros(1, C, D, device=self.device))
         if self.onchip:
             for b in self.live_blocks:
                 nout = int(self.live_out_dims[b].numel())
@@ -636,6 +695,11 @@ class PrecomputedStepGraph:
                 self._s_ing.copy_(ing)
                 for b in self.live_blocks:
                     self._s_cam[b].copy_(cam[b])
+        elif self._block0_dk:
+            # [D,C] static buffer: fill the first Sc COLUMNS from the [D,Sc] h0 slice, zero rest.
+            self._s_h0[:, :Sc].copy_(h0); self._s_h0[:, Sc:].zero_()
+            for b in self.live_blocks:
+                self._s_delta[b][:Sc].copy_(delta[b]); self._s_delta[b][Sc:].zero_()
         else:
             self._s_h0[:, :Sc].copy_(h0); self._s_h0[:, Sc:].zero_()
             if self.onchip:
