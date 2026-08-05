@@ -452,10 +452,15 @@ def _build_query_embed(model, L, code, draft, device) -> torch.Tensor:
     role).  This is EXACTLY what ``apply_overlay_window_fast`` writes on a query row
     (code_vec assign + all-ROLE tag) on top of ``model.embed[qtok]`` — byte-identical."""
     from .pf_speculative import build_code_vec
+    import numpy as _np
     toks = draft.tokens
     ws = draft.win_starts
     n = draft.step_count
-    qtok = torch.tensor([toks[ws[s]] for s in range(n)], device=device, dtype=torch.long)
+    # the query-row token per step (toks[win_starts[s]]) via ``np.fromiter`` (n reads, no
+    # full 30*n-token list conversion), then ONE host->device transfer — no slow
+    # torch.tensor(python-list) at K.
+    qtok = torch.from_numpy(
+        _np.fromiter((toks[ws[s]] for s in range(n)), dtype=_np.int64, count=n)).to(device)
     h0 = model.embed[qtok].clone()                 # [K, D]  fresh copy
     # code_vec: ONE broadcast assign over the code dims (same idx/vals every row).
     code_idx, code_vals = build_code_vec(code, L, model.embed.shape[1], device,
@@ -489,13 +494,21 @@ def _build_ingest_table(model, L, draft, device) -> torch.Tensor:
     return tab
 
 
-def _build_cam_tables(model, L, draft, code, live_blocks, device
-                      ) -> Dict[int, torch.Tensor]:
-    """Each live CAM block's direct-gather in head-value space ``[K, Hb, HDb]``.
+def _sched_fast_build() -> bool:
+    """``C4_SCHED_FAST_BUILD`` (DEFAULT ON): build the per-step CAM gather tables with a
+    VECTORIZED numpy nibble-scatter (one dense buffer per (block, head), scattered at the
+    resolved step rows) instead of the per-step Python ``for s in range(n): _head_out_vec``
+    loop.  At 358 K steps the old loop is ~1.4 M ``torch.zeros(HD)`` + per-nibble Python
+    calls — the O(n_steps) one-time build cost the whole-frame giant-K exposes.  The
+    scatter is byte-identical (the SAME nibbles at the SAME value slots ``_head_out_vec``
+    writes).  OFF -> the original per-step loop (kept as the byte-exact cross-check)."""
+    return os.environ.get("C4_SCHED_FAST_BUILD", "1") not in ("0", "", "false", "False")
 
-    Reuses ``direct_cam_batched`` to resolve, per step, each CAM head's exact
-    ``_head_out_vec`` (byte-identical to the eager ``direct_forward`` scatter) — the
-    per-op ``_head_out_vec`` loop, done here ONCE for the whole batch as a dense table."""
+
+def _build_cam_tables_loop(model, L, draft, code, live_blocks, device
+                           ) -> Dict[int, torch.Tensor]:
+    """The ORIGINAL per-step Python loop (kept as the byte-exact reference for the
+    vectorized builder).  Resolves, per step, each CAM head's exact ``_head_out_vec``."""
     from .direct_cam_batched import (build_resolved_table, _head_out_vec)
     tbl = build_resolved_table(draft, code)
     ws = draft.win_starts
@@ -519,6 +532,161 @@ def _build_cam_tables(model, L, draft, code, live_blocks, device
                     vec = _head_out_vec(kind, d[ap], None, HDb, device, tab.dtype)
                 tab[s, h] = vec
         out[lb.block_idx] = tab
+    return out
+
+
+def _build_cam_sparse(draft, code, live_blocks):
+    """Build the live-CAM gather as a COMPACT SPARSE representation (no dense
+    ``[K, Hb, HDb]`` tensor): for each block a numpy ``vals[K, n_active_cols]`` of the
+    active head-value NIBBLES + the ``active_cols`` flat-slot indices (flat = head*HDb +
+    slot) they map to.  The dense ``[K, Hb, HDb]`` cam_out is exactly ``scatter(vals into
+    active_cols)`` — 99.7% zeros — so the compact form carries the SAME information at ~50x
+    less memory (the ~16 nibble slots per active head, not 24*59 dims).  Vectorized numpy
+    scatter (``C4_SCHED_FAST_BUILD``).  Returns ``{block: (vals[K,nc] np.float32, active_cols
+    [nc] np.int64, HDb)}``."""
+    import numpy as _np
+    from .direct_cam_batched import build_resolved_table, CODE_ADDR_BITS, ADDR_BITS
+    from .nibble_pure_forward_complete import IMM_NIBS
+    from .blogspec_layout import NIB_PER_REG
+    tbl = build_resolved_table(draft, code)
+    n = draft.step_count
+    ws = _np.asarray(draft.win_starts, dtype=_np.int64)
+
+    def _rows_for(positions):
+        if not positions:
+            return None
+        p = _np.fromiter(positions, dtype=_np.int64, count=len(positions))
+        idx = _np.searchsorted(ws, p)
+        ok = (idx < n) & (ws[idx.clip(0, n - 1)] == p)
+        return idx[ok], ok
+
+    out = {}
+    for lb in live_blocks:
+        Hb, HDb = lb.H, lb.HD
+        # active flat columns (head*HDb + slot) + a per-column filler into a compact buffer.
+        col_of = {}                             # flat_col -> compact index
+        col_list = []
+        # first pass: enumerate the active columns this block writes.
+        for (h, kind) in lb.cam_heads:
+            if kind == "code":
+                v0 = CODE_ADDR_BITS + 4
+                slots = [v0] + [v0 + 1 + j for j in range(IMM_NIBS)]
+            else:
+                b0 = ADDR_BITS + 3
+                slots = [b0 + j for j in range(NIB_PER_REG)]
+            for sl in slots:
+                fc = h * HDb + sl
+                if fc not in col_of:
+                    col_of[fc] = len(col_list); col_list.append(fc)
+        nc = len(col_list)
+        vals = _np.zeros((n, nc), dtype=_np.float32)
+        for (h, kind) in lb.cam_heads:
+            if kind == "code":
+                items = list(tbl.code.items())
+                if not items:
+                    continue
+                r = _rows_for([p for p, _cv in items])
+                if r is None:
+                    continue
+                rows, ok = r
+                cv = [items[i][1] for i in range(len(items)) if ok[i]]
+                ops = _np.fromiter((int(o) for (o, _im) in cv), dtype=_np.int64, count=len(cv))
+                imms = _np.fromiter((int(im) & 0xFFFFFFFF for (_o, im) in cv),
+                                    dtype=_np.int64, count=len(cv))
+                v0 = CODE_ADDR_BITS + 4
+                vals[rows, col_of[h * HDb + v0]] = ops.astype(_np.float32)
+                for j in range(IMM_NIBS):
+                    vals[rows, col_of[h * HDb + v0 + 1 + j]] = \
+                        ((imms >> (4 * j)) & 0xF).astype(_np.float32)
+            else:
+                items = list(tbl.by_kind(kind).items())
+                if not items:
+                    continue
+                r = _rows_for([p for p, _v in items])
+                if r is None:
+                    continue
+                rows, ok = r
+                vv = _np.fromiter((int(items[i][1]) & 0xFFFFFFFF
+                                   for i in range(len(items)) if ok[i]),
+                                  dtype=_np.int64, count=int(ok.sum()))
+                b0 = ADDR_BITS + 3
+                for j in range(NIB_PER_REG):
+                    vals[rows, col_of[h * HDb + b0 + j]] = ((vv >> (4 * j)) & 0xF).astype(_np.float32)
+        out[lb.block_idx] = (vals, _np.asarray(col_list, dtype=_np.int64), HDb)
+    return out
+
+
+def _build_cam_tables(model, L, draft, code, live_blocks, device
+                      ) -> Dict[int, torch.Tensor]:
+    """Each live CAM block's direct-gather in head-value space ``[K, Hb, HDb]``.
+
+    VECTORIZED (``C4_SCHED_FAST_BUILD``, default ON): resolve every read of the draft ONCE
+    (``build_resolved_table``), then for each (block, head) scatter the resolved value's
+    nibbles into a dense numpy ``[K, HDb]`` buffer at the reading STEP rows — ONE build,
+    no per-step Python loop / per-step ``torch.zeros(HD)`` alloc.  Byte-identical to the
+    per-step ``_head_out_vec`` scatter (same slots, same nibbles).  This is the O(n_steps)
+    build the whole-frame giant-K exposes; the numpy scatter makes it a draft-fast one-time
+    cost.  OFF -> ``_build_cam_tables_loop`` (the original loop, the byte-exact reference)."""
+    if not _sched_fast_build():
+        return _build_cam_tables_loop(model, L, draft, code, live_blocks, device)
+    import numpy as _np
+    from .direct_cam_batched import build_resolved_table, CODE_ADDR_BITS, ADDR_BITS
+    from .nibble_pure_forward_complete import IMM_NIBS
+    from .blogspec_layout import NIB_PER_REG
+    tbl = build_resolved_table(draft, code)
+    n = draft.step_count
+    # win_starts is strictly increasing (each step has a unique query row); build the
+    # abs-position -> step-index inverse via searchsorted so a resolver keyed by abs pos
+    # maps directly to step rows (vectorized, no per-step dict lookup).
+    ws = _np.asarray(draft.win_starts, dtype=_np.int64)      # [n], strictly increasing
+
+    def _rows_for(positions):
+        """Map a list of absolute query-row positions to their step-row indices (the ones
+        that are actually a step's own query row — always true for resolver keys)."""
+        if not positions:
+            return None
+        p = _np.fromiter(positions, dtype=_np.int64, count=len(positions))
+        idx = _np.searchsorted(ws, p)
+        ok = (idx < n) & (ws[idx.clip(0, n - 1)] == p)
+        return idx[ok], p[ok], ok
+
+    out: Dict[int, torch.Tensor] = {}
+    for lb in live_blocks:
+        Hb, HDb = lb.H, lb.HD
+        buf = _np.zeros((n, Hb, HDb), dtype=_np.float32)
+        for (h, kind) in lb.cam_heads:
+            if kind == "code":
+                items = list(tbl.code.items())
+                if not items:
+                    continue
+                r = _rows_for([p for p, _cv in items])
+                if r is None:
+                    continue
+                rows, _pk, ok = r
+                cv = [items[i][1] for i in range(len(items)) if ok[i]]
+                ops = _np.fromiter((int(o) for (o, _im) in cv), dtype=_np.int64, count=len(cv))
+                imms = _np.fromiter((int(im) & 0xFFFFFFFF for (_o, im) in cv),
+                                    dtype=_np.int64, count=len(cv))
+                v0 = CODE_ADDR_BITS + 4
+                buf[rows, h, v0] = ops.astype(_np.float32)
+                for j in range(IMM_NIBS):
+                    buf[rows, h, v0 + 1 + j] = ((imms >> (4 * j)) & 0xF).astype(_np.float32)
+            else:
+                d = tbl.by_kind(kind)
+                items = list(d.items())
+                if not items:
+                    continue
+                r = _rows_for([p for p, _v in items])
+                if r is None:
+                    continue
+                rows, _pk, ok = r
+                vals = _np.fromiter((int(items[i][1]) & 0xFFFFFFFF
+                                     for i in range(len(items)) if ok[i]),
+                                    dtype=_np.int64, count=int(ok.sum()))
+                b0 = ADDR_BITS + 3
+                for j in range(NIB_PER_REG):
+                    buf[rows, h, b0 + j] = ((vals >> (4 * j)) & 0xF).astype(_np.float32)
+        out[lb.block_idx] = torch.from_numpy(buf).to(device)
     return out
 
 
@@ -581,20 +749,44 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
     live_blocks = [_LiveCamBlock(model, bi, heads) for bi, heads in sorted(chm.items())]
     live_order = sorted(chm.keys())
     # PRECOMPUTE the whole-batch tables (vectorized where possible).
+    onchip = onchip_residual_enabled()
+    fast = _sched_fast_build()
+    # ON-CHIP FAST BUILD: the dense ``[K, Hb, HDb]`` cam_tables (~623 MB/block, 99.7% zeros)
+    # are ONLY used to compute the compact ``W_o(cam_out)`` delta, then discarded (replay
+    # uses the delta).  So skip materializing them on GPU entirely — build the delta DIRECTLY
+    # from the compact sparse nibble form (a ``[K, n_active_cols] @ [n_active_cols, n_out]``
+    # tiny GEMM instead of a ``[K, D] @ [D, D]`` dense one on a 99.7%-zero input).  This is the
+    # dominant build cost (~62% of the schedule build) at whole-frame K.  OFF (or non-onchip):
+    # the dense cam_tables path (unchanged).
     h0_table = _build_query_embed(model, L, code, draft, dev)          # [K, D]
     ing_table = _build_ingest_table(model, L, draft, dev)             # [K, H0, HD0]
-    cam_tables = _build_cam_tables(model, L, draft, code, live_blocks, dev)
-    # decode targets (per step) — the K=1 reference the verify compares against.
+    if onchip and fast:
+        cam_sparse = _build_cam_sparse(draft, code, live_blocks)      # {b: (vals,cols,HDb)}
+        cam_tables = {}                                               # dense not materialized
+    else:
+        cam_sparse = None
+        cam_tables = _build_cam_tables(model, L, draft, code, live_blocks, dev)
+    # decode targets (per step) — the K=1 reference the verify compares against.  ONE pass
+    # over frames (not 6 separate range(n) comprehensions) into numpy, one host->device xfer
+    # each — draft-fast at 358 K steps.
     n = draft.step_count
     frames = draft.frames
-    want_pc = torch.tensor([frames[s]["pc"] for s in range(n)], device=dev, dtype=torch.long)
-    want_ax = torch.tensor([frames[s]["ax"] & mask for s in range(n)], device=dev, dtype=torch.long)
-    want_sp = torch.tensor([frames[s]["sp"] & 0xFFFFFFFF for s in range(n)], device=dev, dtype=torch.long)
-    want_bp = torch.tensor([frames[s]["bp"] & 0xFFFFFFFF for s in range(n)], device=dev, dtype=torch.long)
-    is_halt = torch.tensor([bool(frames[s].get("is_halt")) for s in range(n)], device=dev)
-    is_file = torch.tensor([bool(frames[s].get("is_file")) for s in range(n)], device=dev)
+    import numpy as _np
+    _pc = _np.empty(n, dtype=_np.int64); _ax = _np.empty(n, dtype=_np.int64)
+    _sp = _np.empty(n, dtype=_np.int64); _bp = _np.empty(n, dtype=_np.int64)
+    _hl = _np.empty(n, dtype=_np.bool_); _fl = _np.empty(n, dtype=_np.bool_)
+    for s in range(n):
+        f = frames[s]
+        _pc[s] = f["pc"]; _ax[s] = f["ax"] & mask
+        _sp[s] = f["sp"] & 0xFFFFFFFF; _bp[s] = f["bp"] & 0xFFFFFFFF
+        _hl[s] = bool(f.get("is_halt")); _fl[s] = bool(f.get("is_file"))
+    want_pc = torch.from_numpy(_pc).to(dev)
+    want_ax = torch.from_numpy(_ax).to(dev)
+    want_sp = torch.from_numpy(_sp).to(dev)
+    want_bp = torch.from_numpy(_bp).to(dev)
+    is_halt = torch.from_numpy(_hl).to(dev)
+    is_file = torch.from_numpy(_fl).to(dev)
     # ---- C4_ONCHIP_RESIDUAL: precompute the compact W_o(cam_out) deltas ONCE ----
-    onchip = onchip_residual_enabled()
     h0_folded = None
     cam_delta_tables = None
     live_out_dims = None
@@ -612,9 +804,26 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
         live_out_dims = {}
         for lb in live_blocks:
             b = lb.block_idx
-            cam_flat = cam_tables[b].reshape(n, D)            # [K, D]
             Wo = _wo_dense(model, b, dev)
-            delta, out_dims = _build_wo_delta_table(cam_flat, Wo)
+            if cam_sparse is not None:
+                # DIRECT sparse->delta: full[:, c] = sum_a vals[:,a] * Wo[c, active_cols[a]]
+                # = vals @ Wo[:, active_cols].T (all D output cols; inactive cam cols are
+                # exactly 0 so dropping them is exact).  Then slice the nonzero output dims.
+                # A [K, n_active] @ [n_active, D] tiny GEMM — no dense [K,D] cam_flat, no
+                # [K,D]@[D,D] GEMM on a 99.7%-zero input.
+                vals_np, cols_np, _HDb = cam_sparse[b]
+                vals = torch.from_numpy(vals_np).to(dev)                 # [K, n_active]
+                cols = torch.from_numpy(cols_np).to(dev)                 # [n_active]
+                Wo_sub = Wo.index_select(1, cols)                        # [D, n_active]
+                full = vals @ Wo_sub.transpose(0, 1)                     # [K, D] exact W_o(cam)
+                out_dims = (full.abs().sum(0) > 0).nonzero(as_tuple=False).flatten()
+                if out_dims.numel() == 0:
+                    out_dims = torch.zeros(1, dtype=torch.long, device=full.device)
+                delta = full.index_select(1, out_dims).contiguous()
+                del vals, Wo_sub, full
+            else:
+                cam_flat = cam_tables[b].reshape(n, D)            # [K, D]
+                delta, out_dims = _build_wo_delta_table(cam_flat, Wo)
             cam_delta_tables[b] = delta
             live_out_dims[b] = out_dims
     sched = PrecomputedSchedule(
