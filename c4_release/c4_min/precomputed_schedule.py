@@ -97,10 +97,21 @@ def _snap_lane_light(lanes: torch.Tensor) -> torch.Tensor:
     ``_snap_lane_bytes`` uses — WHEN the lane is within 0.5 of an in-range integer (always
     true for PC/SP/BP: near-integer register images < VALVOCAB).  Validated byte-identical
     (5000 random near-integer lanes + exact ints, 0 diffs).  No 4 GB vocab tensor, so the
-    whole-step map (block chain + decode) captures into ONE graph at big chunk."""
+    whole-step map (block chain + decode) captures into ONE graph at big chunk.
+
+    WIDE-PC / WIDTH32 (``C4_PC_WIDE`` / ``C4_VM_WIDTH32`` / ``C4_SP_WIDE``, e.g. doom's
+    547k-instruction program whose PC / return-PC / below-init SP exceed VALVOCAB≈65792):
+    mirror ``_snap_lane_batch``'s wide branch EXACTLY — the round-free ``floor(x+½)`` snap
+    reduced to the unsigned 32-bit word ``& 0xFFFFFFFF`` (NO VALVOCAB clamp, which would
+    truncate a wide PC to 65791).  Bit-identical to ``_snap_lane_batch`` per element in
+    BOTH regimes; the flags are default-OFF so the golden (narrow-PC) path is unchanged."""
     from .nibble_pure_forward import VALVOCAB
+    from .nibble_vm import vm_width32, _pc_wide_enabled
     x = lanes.to(torch.float64)
     iv = torch.where(x >= 0, torch.floor(x + 0.5), -torch.floor(-x + 0.5)).to(torch.long)
+    if vm_width32() or _pc_wide_enabled():
+        # wide lane: unsigned 32-bit word, no VALVOCAB clamp (matches _snap_lane_batch).
+        return iv & 0xFFFFFFFF
     return iv.clamp_(0, VALVOCAB - 1)
 
 
@@ -563,6 +574,19 @@ def _sched_fast_build() -> bool:
     scatter is byte-identical (the SAME nibbles at the SAME value slots ``_head_out_vec``
     writes).  OFF -> the original per-step loop (kept as the byte-exact cross-check)."""
     return os.environ.get("C4_SCHED_FAST_BUILD", "1") not in ("0", "", "false", "False")
+
+
+def _sched_cache_resolved() -> bool:
+    """``C4_SCHED_CACHE_RESOLVED`` (DEFAULT OFF).  BUILD-REDUCTION for the CONTINUOUS render:
+    the query-embed gather + ingest-nibble decode + CAM-sparse latest-write-wins resolution
+    are pure functions of the IMMUTABLE draft, so cache the RESOLVED numpy/torch arrays ONCE
+    (on the draft, keyed by device/mask) and COPY them per frame instead of re-resolving on
+    every ``build_schedule_tables_only``.  The profiler pins that resolution (cam_sparse 56% +
+    ingest 16% at doom n=120K) as the dominant per-frame BUILD cost, so caching turns the
+    build into a copy + the GPU W_o-delta GEMM (the dispatch-bound residual).  Byte-identical
+    (same arrays); DEFAULT OFF -> the per-frame re-resolve.  This is the composed stack's
+    build-bound lever (build 2.9 > dispatch 1.9 us/step on real doom)."""
+    return os.environ.get("C4_SCHED_CACHE_RESOLVED", "0") not in ("0", "", "false", "False")
 
 
 def _sched_gpu_build() -> bool:
@@ -1082,19 +1106,48 @@ def _build_schedule_tables(model, L, code, draft, dev, live_blocks, onchip, mask
     # the dense cam_tables path (unchanged).
     # C4_SCHED_GPU_BUILD: convert the ~30*n-token stream to numpy ONCE, shared by the
     # query-embed + ingest-table + frame-decode builds (three consumers, one conversion).
-    toks_np = _draft_tokens_np(draft) if gpu_build else None
-    h0_table = _build_query_embed(model, L, code, draft, dev, toks_np=toks_np)   # [K, D]
-    ing_table = _build_ingest_table(model, L, draft, dev, toks_np=toks_np)      # [K, H0, HD0]
+    # ---- C4_SCHED_CACHE_RESOLVED: the RESOLVED-GATHER cache (build-reduction lever) ----
+    # The query-embed ``qtok`` gather, the ingest-nibble frame decode, and the CAM-sparse
+    # latest-write-wins resolution (``_resolve_reads_vec`` lexsort/searchsorted + the value-
+    # nibble scatter) are ALL pure functions of the IMMUTABLE draft — the profiler pins them
+    # as ~73% of the doom per-frame build (cam_sparse 56% + ingest 16% at n=120K).  In a
+    # CONTINUOUS render the SAME draft is rebuilt every frame, so cache the resolved arrays
+    # ONCE (keyed by device+mask) and COPY them per frame instead of re-resolving.  The GPU
+    # W_o-delta GEMM (which reads cam_sparse) + the block-0 fold still recur (they are the
+    # dispatch-bound residual); the CPU resolution becomes a one-time cost.  Byte-identical
+    # (same arrays); DEFAULT OFF -> the per-frame re-resolve (composed number unchanged).
+    _cache_resolved = _sched_cache_resolved()
+    _rc = getattr(draft, "_resolved_cache", None) if _cache_resolved else None
+    _rc_key = (str(dev), int(mask), bool(onchip), bool(gpu_build))
+    if _rc is not None and _rc.get("_key") != _rc_key:
+        _rc = None
+    toks_np = _draft_tokens_np(draft) if (gpu_build or _cache_resolved) else None
+    if _rc is not None:
+        h0_table = _rc["h0_table"].clone()               # fresh copy (fold mutates it)
+        ing_table = _rc["ing_table"]                     # read-only after build
+    else:
+        h0_table = _build_query_embed(model, L, code, draft, dev, toks_np=toks_np)   # [K, D]
+        ing_table = _build_ingest_table(model, L, draft, dev, toks_np=toks_np)      # [K, H0, HD0]
     if onchip and fast:
         # C4_SCHED_GPU_BUILD: collapse the resolve_load_rows -> build_resolved_table ->
         # _build_cam_sparse Python-dict chain into one vectorized numpy pass (the dominant
         # ~70% of the schedule build at whole-frame K).  OFF -> the Python-dict _build_cam_sparse.
-        cam_sparse = (_build_cam_sparse_gpu(draft, code, live_blocks, dev) if gpu_build
-                      else _build_cam_sparse(draft, code, live_blocks))  # {b: (vals,cols,HDb)}
+        if _rc is not None:
+            cam_sparse = _rc["cam_sparse"]              # cached resolved (vals/cols/HDb)
+        else:
+            cam_sparse = (_build_cam_sparse_gpu(draft, code, live_blocks, dev) if gpu_build
+                          else _build_cam_sparse(draft, code, live_blocks))  # {b:(vals,cols,HDb)}
         cam_tables = {}                                               # dense not materialized
     else:
         cam_sparse = None
         cam_tables = _build_cam_tables(model, L, draft, code, live_blocks, dev)
+    # populate the resolved-gather cache (one-time; keyed by device/mask/onchip/gpu_build).
+    if _cache_resolved and _rc is None:
+        try:
+            draft._resolved_cache = {"_key": _rc_key, "h0_table": h0_table.clone(),
+                                     "ing_table": ing_table, "cam_sparse": cam_sparse}
+        except Exception:
+            pass
     # decode targets (per step) — the K=1 reference the verify compares against.  ONE pass
     # over frames (not 6 separate range(n) comprehensions) into numpy, one host->device xfer
     # each — draft-fast at 358 K steps.
@@ -1196,6 +1249,131 @@ def build_schedule_tables_only(model, L, code, draft, device, sg, mask: int = 0x
     sched, _lod = _build_schedule_tables(model, L, code, draft, dev, live_blocks,
                                          sg.onchip, mask)
     return sched
+
+
+# ===========================================================================
+# 4. THE TRUE OVERLAP: build(N+1) on a background THREAD + dedicated CUDA streams,
+#    concurrent with the graph replay of frame N (C4_SCHED_PIPELINE).
+# ===========================================================================
+def sched_pipeline_enabled() -> bool:
+    """``C4_SCHED_PIPELINE`` (DEFAULT OFF).  TRUE double-buffer overlap: run the frame
+    N+1 schedule BUILD (the ~90%-CPU numpy resolve + the H2D uploads + the small W_o-delta
+    GEMMs) on a BACKGROUND THREAD bound to a DEDICATED CUDA build stream, CONCURRENT with
+    the frame-N graph REPLAY on the default compute stream.
+
+    WHY the naive ``with torch.cuda.stream(side): build()`` in the harness did NOT overlap
+    (measured 2% gain, not the ~max(build,dispatch) the double-buffer promises): the build
+    is ~90% CPU numpy (``_resolve_reads_vec`` / the frame-decode loop / the token
+    ``np.asarray``) + H2D copies — a ``torch.cuda.stream`` context only redirects GPU
+    KERNEL LAUNCHES, it does NOT make CPU work run off the calling thread.  So the whole
+    CPU build ran to completion on the main thread BEFORE the dispatch replay was ever
+    issued — they serialized on the CPython thread, not on the GPU.
+
+    THE FIX (this builder):
+      (a) THREAD: the build runs in a real ``threading.Thread``.  Every heavy numpy op
+          (``lexsort`` / ``searchsorted`` / bit-shift scatter / ``np.asarray`` of the
+          ~30·n-token stream) releases the GIL, so the main thread proceeds to issue the
+          frame-N replay launches concurrently.
+      (b) STREAM: inside the thread the current stream is set to a dedicated ``build``
+          stream, so the build's GPU ops (embed gather, the H2D ``.to(device)`` copies,
+          the W_o-delta GEMMs) are enqueued on a SEPARATE stream from the default compute
+          stream the replay uses — they overlap on the GPU (subject to SM availability),
+          and the H2D copies do not serialize behind the replay's compute.
+      (c) EVENT SYNC AT THE SWAP ONLY: ``wait()`` joins the thread, then records a build
+          event and makes the default stream ``wait_event`` it, so the next frame's replay
+          (which reads the freshly-built buffer) is ordered strictly AFTER the build
+          completes — no reading a half-built buffer.  Correctness == serial (the swap is
+          the only synchronization point).
+
+    Byte-identical to the serial build (same numpy, same H2D values); DEFAULT OFF."""
+    return os.environ.get("C4_SCHED_PIPELINE", "0") not in ("0", "", "false", "False")
+
+
+class PipelinedScheduleBuilder:
+    """Double-buffered background-thread schedule builder for the CONTINUOUS render loop.
+
+    Usage (the harness / render loop drives it)::
+
+        pb = PipelinedScheduleBuilder(model, L, code, draft, device, sg, mask)
+        cur = pb.build_blocking()          # frame 0 (no overlap possible yet)
+        pb.start()                         # kick off frame 1's build on the thread
+        while rendering:
+            dispatch(cur)                  # frame-N replay on the default stream (overlaps)
+            nxt = pb.wait()                # join the build thread + event-sync the swap
+            del cur; cur = nxt
+            pb.start()                     # kick off frame N+2's build
+
+    The build thread owns a dedicated CUDA build stream; ``wait`` event-syncs the default
+    stream to the build stream so the returned schedule is fully materialized before the
+    caller replays over it.  ``draft`` is a fixed trace in this steady-state harness (the
+    continuous loop re-drafts per real frame; here the build cost — the target — is the
+    same tensor work regardless), so the thread re-runs ``build_schedule_tables_only``."""
+
+    def __init__(self, model, L, code, draft, device, sg, mask: int = 0xFFFFFFFF):
+        import threading
+        self._threading = threading
+        self.model = model
+        self.L = L
+        self.code = code
+        self.draft = draft
+        self.device = torch.device(device)
+        self.sg = sg
+        self.mask = mask
+        # dedicated build stream: the build's GPU ops (embed gather / H2D / W_o GEMMs) run
+        # on ``_build_stream`` so they do NOT serialize behind the default compute stream the
+        # graph replay uses (priority 0 == least-priority default, so the replay is never
+        # preempted by build kernels — the build kernels fill replay idle cycles).
+        self._build_stream = torch.cuda.Stream(device=self.device)
+        self._thread: Optional["threading.Thread"] = None
+        self._result: Optional[PrecomputedSchedule] = None
+        self._exc: Optional[BaseException] = None
+        self._done_event: Optional[torch.cuda.Event] = None
+
+    def build_blocking(self) -> PrecomputedSchedule:
+        """Frame-0 build (no concurrent dispatch yet); runs on the caller thread/stream."""
+        return build_schedule_tables_only(self.model, self.L, self.code, self.draft,
+                                          self.device, self.sg, mask=self.mask)
+
+    def _run(self):
+        try:
+            with torch.cuda.stream(self._build_stream):
+                with torch.no_grad():
+                    sched = build_schedule_tables_only(
+                        self.model, self.L, self.code, self.draft, self.device,
+                        self.sg, mask=self.mask)
+                # record completion on the BUILD stream; the caller's default stream will
+                # wait on this event at the swap so the replay reads a fully-built buffer.
+                ev = torch.cuda.Event()
+                ev.record(self._build_stream)
+                self._done_event = ev
+            self._result = sched
+        except BaseException as e:                 # surface build errors at wait()
+            self._exc = e
+
+    def start(self):
+        """Kick off the NEXT frame's build on the background thread + build stream.  Returns
+        immediately; the caller then issues the current frame's replay (which overlaps)."""
+        assert self._thread is None, "a build is already in flight; call wait() first"
+        self._result = None
+        self._exc = None
+        self._done_event = None
+        self._thread = self._threading.Thread(target=self._run, name="sched-build",
+                                              daemon=True)
+        self._thread.start()
+
+    def wait(self) -> PrecomputedSchedule:
+        """Join the build thread and EVENT-SYNC the default stream to the build stream so the
+        freshly-built schedule is fully materialized before the caller replays over it."""
+        assert self._thread is not None, "no build in flight; call start() first"
+        self._thread.join()
+        self._thread = None
+        if self._exc is not None:
+            raise self._exc
+        # order the default (replay) stream strictly AFTER the build completed on the build
+        # stream — the ONLY synchronization point (no reading a half-built buffer).
+        if self._done_event is not None:
+            torch.cuda.current_stream(self.device).wait_event(self._done_event)
+        return self._result
 
 
 def _sched_chunk() -> int:
@@ -1316,4 +1494,5 @@ def run_verify(model, L, code, draft, device, *, mask: int = 0xFFFFFFFF,
 
 __all__ = ["precomputed_schedule_enabled", "PrecomputedSchedule",
            "PrecomputedStepGraph", "build_schedule", "build_schedule_tables_only",
-           "run_verify", "PrecomputedResult"]
+           "run_verify", "PrecomputedResult",
+           "sched_pipeline_enabled", "PipelinedScheduleBuilder"]
