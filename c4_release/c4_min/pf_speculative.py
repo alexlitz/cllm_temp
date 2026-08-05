@@ -1937,6 +1937,65 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
         blocks_run_total += blk_run       # count only the SUCCEEDED block
         blocks_full_total += n_blocks
 
+        # ============================================================================
+        # DIRECT-CAM ADDRESS VERIFY (C4_DIRECT_CAM_VERIFY_ADDR): the direct-CAM forward
+        # decoded the model's OWN queried address for every CAM read in this span and
+        # reported any mismatch vs the draft's resolved address into ``_dcam_tbl.addr_sink``.
+        # An address the MODEL would NOT have selected is a genuine divergence — turn it
+        # into the SAME terminal FAIL the register/token compare uses (first-divergence
+        # stop).  This closes the "address draft-TRUSTED" gap (scenario E of the audit):
+        # a self-consistent wrong-address draft is now CAUGHT, not rubber-stamped.  O(1)
+        # per read, so the large-KV speedup is untouched.
+        _addr_sink = getattr(_dcam_tbl, "addr_sink", None) if _dcam_tbl is not None else None
+        if _addr_sink is not None and _addr_sink.hit is not None:
+            _h = _addr_sink.hit
+            _qpos = int(_h["query_pos"])
+            # map the divergent read's query position back to its step (its step's own
+            # query row is at draft.win_starts[s]).  Resolve it robustly by inverse
+            # lookup over ALL steps (a span's forward can
+            # touch a read's query row before that step is register-verified, so the
+            # divergent step may be >= the current ``end``; search the whole win_starts).
+            _ws_to_step = getattr(draft, "_ws_to_step_cache", None)
+            if _ws_to_step is None:
+                _ws_to_step = {ws: s for s, ws in enumerate(draft.win_starts)}
+                try:
+                    draft._ws_to_step_cache = _ws_to_step
+                except Exception:
+                    pass
+            _s_bad = _ws_to_step.get(_qpos)
+            if _s_bad is None:
+                _s_bad = min(step, n_steps - 1)   # defensive: never mis-report OK
+            accepted = min(accepted, _s_bad)      # accept only up to the divergence
+            cache_now = max(max_cache, caches[0].size())
+            evicted_now = sum(c.total_evicted for c in caches)
+            vram_gb = peak_vram / (1024 ** 3)
+            if stats is not None:
+                stats["max_seq_len"] = max_seq
+                stats["max_cache_size"] = cache_now
+                stats["total_evicted"] = evicted_now
+                stats["forwards"] = forwards
+                stats["peak_vram_gb"] = vram_gb
+                stats["evict_rounds"] = evict_rounds
+                stats["effective_block_steps"] = eff_min_k
+                stats["cam_addr_divergence"] = dict(_h)
+            _fr = draft.frames[_s_bad]
+            return VerifyResult(
+                accepted_steps=accepted, total_steps=n_steps,
+                all_matched=False, forwards=forwards,
+                first_mismatch={
+                    "step": _s_bad, "query_pos": _qpos, "kind": "cam_addr",
+                    "cam_head": _h["head"], "cam_kind": _h["kind"],
+                    "got": {"addr": _h["model_addr"]},
+                    "want": {"addr": _h["draft_addr"]},
+                    "detail": (f"direct-CAM read at step {_s_bad}: model query "
+                               f"addr={_h['model_addr']} != draft resolved "
+                               f"addr={_h['draft_addr']} (head {_h['head']} "
+                               f"kind={_h['kind']})")},
+                max_seq_len=max_seq, max_cache_size=cache_now,
+                total_evicted=evicted_now, decoded_final_ax=None,
+                peak_vram_gb=vram_gb, evict_rounds=evict_rounds,
+                effective_block_steps=eff_min_k)
+
         # BATCHED DECODE (C4_BATCHED_DECODE, default OFF): decode ALL query rows of
         # this span in ONE device-side gather + argmax + a SINGLE host copy, instead
         # of the per-step ``float(state[dim])`` scalar path (which host<->device syncs

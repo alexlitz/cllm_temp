@@ -83,6 +83,36 @@ def direct_cam_batched_enabled() -> bool:
     return os.environ.get("C4_DIRECT_CAM_BATCHED", "0") not in ("0", "", "false", "False")
 
 
+def verify_addr_enabled() -> bool:
+    """C4_DIRECT_CAM_VERIFY_ADDR (DEFAULT OFF): on each direct-CAM read, INDEPENDENTLY
+    verify the READ ADDRESS against the model's OWN computed query — O(1) per read, no
+    O(n_store) softmax.
+
+    The faithfulness gap (DOOM_FASTPATH_FAITHFULNESS_AUDIT_2026_08_05.md, scenario E):
+    the direct-CAM path resolves each read's address->row->value entirely from
+    ``resolve_load_rows(draft)`` and injects it; the model's ``W_q`` query for the CAM
+    heads is COMPUTED (``Q = W_q.linear(x)``) but then DISCARDED.  A self-consistent
+    wrong draft (store_log + frames + tokens all agree on a wrong value/address) is
+    therefore ACCEPTED 7/7 — the address is draft-TRUSTED, never independently checked.
+
+    But the model DOES compute the query, and the query IS the binary address key: for
+    a CAM head, ``Q[base+b] = smag*(2*qry_bit[b] - 1)`` (``_bake_cam_head``), so
+    ``sign(Q[base+b])`` decodes the address bit ``b`` the model is looking for.  This
+    lever, when ON, decodes the model's OWN queried address from that sign pattern at
+    each resolved query row and compares it against the draft's ``ResolvedRead.addr``.
+    A single ADDR_BITS-wide bit compare per read (O(1), NOT O(n_store)) — the large-KV
+    speedup is untouched.  On mismatch it flags a divergence into the same terminal-FAIL
+    path the register/token compare uses (``VerifyResult.first_mismatch``,
+    ``kind='cam_addr'``).
+
+    Converts "address DRAFT-TRUSTED" -> "address INDEPENDENTLY VERIFIED".  A
+    self-consistent value swap AT the correct address is STILL trusted (re-deriving the
+    value requires the full O(S) softmax gather over the stores — that is the
+    full-attention job, out of scope here).  DEFAULT OFF -> byte-identical to the
+    unverified direct-CAM path (golden 069cc32f unchanged)."""
+    return os.environ.get("C4_DIRECT_CAM_VERIFY_ADDR", "0") not in ("0", "", "false", "False")
+
+
 # ===========================================================================
 # 1. THE CAM-HEAD MAP: which (block_idx, head_idx) is each global CAM read, and
 #    which destination band + head class it drives.  Mirrors
@@ -130,7 +160,11 @@ class ResolvedTable:
 
     ``mem/pop/lev/uni[pos]`` -> the resolved value (int) at the step whose query row
     is at abs stream position ``pos`` (absent == that head is a pure softmax1 sink
-    at that step -> ZFOD 0 output).  ``code[pos]`` -> ``(op, imm)`` (one fetch/step)."""
+    at that step -> ZFOD 0 output).  ``code[pos]`` -> ``(op, imm)`` (one fetch/step).
+
+    ``addr[kind][pos]`` -> the ADDRESS the draft claims the read resolves to (the CAM
+    binary-address key); ``code_addr[pos]`` -> the PC the code fetch queries.  These are
+    what C4_DIRECT_CAM_VERIFY_ADDR checks against the model's OWN decoded query address."""
 
     def __init__(self):
         self.mem: Dict[int, int] = {}
@@ -138,9 +172,39 @@ class ResolvedTable:
         self.lev: Dict[int, int] = {}
         self.uni: Dict[int, int] = {}
         self.code: Dict[int, Tuple[int, int]] = {}
+        # DRAFT-CLAIMED ADDRESS per read (for O(1) address verification).  Keyed the
+        # same as the value dicts: ``addr[kind][pos]`` is the address the draft's
+        # ``resolve_load_rows`` used to select the resolved row at that query position.
+        self.addr: Dict[str, Dict[int, int]] = {"mem": {}, "pop": {}, "lev": {}, "uni": {}}
+        self.code_addr: Dict[int, int] = {}
+        # populated by ``install_direct_cam_batched`` when C4_DIRECT_CAM_VERIFY_ADDR is on.
+        self.addr_sink: Optional["DivergenceSink"] = None
 
     def by_kind(self, kind: str) -> Dict:
         return getattr(self, kind)
+
+    def addr_by_kind(self, kind: str) -> Dict[int, int]:
+        return self.code_addr if kind == "code" else self.addr[kind]
+
+
+class DivergenceSink:
+    """A mutable holder the direct-CAM forward writes an ADDRESS divergence into and
+    ``verify_blocks`` polls after the forward.
+
+    ``hit`` records the FIRST (lowest absolute query position) address mismatch seen:
+    ``{"query_pos", "head", "kind", "model_addr", "draft_addr"}``.  Kept per-run on the
+    ``ResolvedTable`` so a fresh install starts clean."""
+
+    def __init__(self):
+        self.hit: Optional[dict] = None
+
+    def report(self, query_pos: int, head: int, kind: str,
+               model_addr: int, draft_addr: int) -> None:
+        # keep the earliest (causal-prefix) divergence — the verify path stops at the
+        # first bad step, so the lowest query position is the one that matters.
+        if self.hit is None or query_pos < self.hit["query_pos"]:
+            self.hit = {"query_pos": int(query_pos), "head": int(head), "kind": kind,
+                        "model_addr": int(model_addr), "draft_addr": int(draft_addr)}
 
 
 def _n_seed(draft) -> int:
@@ -188,7 +252,11 @@ def build_resolved_table(draft, code: List[isa.Instr]) -> ResolvedTable:
             d = tbl.by_kind(r.head) if r.head in ("mem", "pop", "lev", "uni") else None
             if d is not None:
                 d[pos] = r.value & 0xFFFFFFFF
-    # CODE FETCH@PC: recover the pre-step PC per step and record (op, imm).
+                # DRAFT-CLAIMED ADDRESS for this read (the CAM key resolve_load_rows
+                # used) — checked against the model's own decoded query under
+                # C4_DIRECT_CAM_VERIFY_ADDR.
+                tbl.addr[r.head][pos] = int(r.addr) & 0xFFFFFFFF
+    # CODE FETCH@PC: recover the pre-step PC per step and record (op, imm) + the PC key.
     if _pf_cfm_enabled():
         pc = 0
         for step in range(draft.step_count):
@@ -196,6 +264,7 @@ def build_resolved_table(draft, code: List[isa.Instr]) -> ResolvedTable:
             if 0 <= pc < len(code):
                 ins = code[pc]
                 tbl.code[draft.win_starts[step]] = (int(ins.op), int(ins.imm))
+                tbl.code_addr[draft.win_starts[step]] = int(pc)
             pc = fr["pc"]                    # post-step pc -> next step's pre-step pc
     return tbl
 
@@ -224,6 +293,36 @@ def _head_out_vec(kind: str, value, code_val, HD: int, device, dtype) -> torch.T
         for j, nv in enumerate(V.nibbles_of_value(value & 0xFFFFFFFF, NIB_PER_REG)):
             out[b0 + j] = float(nv)
     return out
+
+
+# ===========================================================================
+# 3b. THE O(1) ADDRESS CHECK (C4_DIRECT_CAM_VERIFY_ADDR): decode the MODEL's OWN
+#     queried address from its computed query Q and compare it to the draft's addr.
+# ===========================================================================
+def _n_addr_bits(kind: str) -> int:
+    """Number of binary address-key bits the CAM head keys on: ADDR_BITS (32) for the
+    memory/stack/lev/uni heads, CODE_ADDR_BITS (12) for the code-fetch head."""
+    return CODE_ADDR_BITS if kind == "code" else ADDR_BITS
+
+
+def _decode_model_query_addr(Qh_rows: torch.Tensor, n_bits: int) -> torch.Tensor:
+    """Decode the MODEL's OWN queried address from its computed per-head query.
+
+    ``Qh_rows`` : Float [nq, HD] — the CAM head's query vector at ``nq`` query rows
+    (``Q[0, head, rows]``).  ``_bake_cam_head`` writes, per address bit ``b``,
+    ``Q[base+b] = 2*smag*qry_bit[b] - smag*1 = smag*(2*qry_bit[b]-1)`` (``smag>0``), so
+    at an ARMED read row ``sign(Q[..., b])`` decodes the queried address bit ``b``
+    EXACTLY: ``>0`` ⟺ bit=1, ``<0`` ⟺ bit=0.  (The code head is structurally identical
+    on ``CODE_ADDR_BITS`` bits: ``Q[base+b]=2*smag*CODE_QRY_BIN[b]-smag*IS_FETCH``, and
+    at a fetch row IS_FETCH=1 so the same sign decode holds.)
+
+    Returns a LongTensor [nq] of the decoded addresses — O(nq * n_bits), NOT O(n_store).
+    NOTE the residual bits ``> 0``: ``bit = (Q[...,b] > 0)``; strict ``>`` maps the
+    negative -smag to 0 and the positive +smag to 1 (an exact address query is never a
+    tie at 0 — smag is the sqrt of EFF/scale, ~hundreds)."""
+    bits = (Qh_rows[:, :n_bits] > 0).to(torch.long)          # [nq, n_bits]
+    weights = (1 << torch.arange(n_bits, device=Qh_rows.device, dtype=torch.long))
+    return (bits * weights.unsqueeze(0)).sum(dim=1)          # [nq]
 
 
 # ===========================================================================
@@ -308,14 +407,19 @@ def _build_cam_out_table(cam_heads: List[Tuple[int, str]], tbl: ResolvedTable,
 
 
 def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, str]],
-                            tbl: ResolvedTable):
+                            tbl: ResolvedTable, sink: Optional["DivergenceSink"] = None):
     """Bind a direct-CAM forward onto ``model.blocks[block_idx].attn`` that gathers
     the resolved V for ``cam_heads`` at query rows and defers every other head to
-    the ordinary windowed forward already installed on the block."""
+    the ordinary windowed forward already installed on the block.
+
+    When ``sink`` is not None (C4_DIRECT_CAM_VERIFY_ADDR), the forward ALSO decodes the
+    model's OWN queried address from the computed query ``Q`` at each resolved query row
+    and reports any mismatch vs the draft's ``tbl.addr`` into ``sink`` — O(1) per read."""
     attn = model.blocks[block_idx].attn
     from .local_attention import windowed_forward, live_value_heads
     cam_head_ids = {h for (h, _k) in cam_heads}
     cam_kind = {h: k for (h, k) in cam_heads}
+    _verify_addr = sink is not None
     # VECTORIZED CAM-output table (C4_DIRECT_CAM_VEC): precompute the resolved output
     # per (cam head, position) ONCE + build a dense pos_map for O(1) gather-scatter.
     # Restrict to cam heads that are GLOBAL on this block (the original per-row loop
@@ -388,6 +492,68 @@ def _install_direct_forward(model, block_idx: int, cam_heads: List[Tuple[int, st
         # split global heads into CAM (direct) and NON-CAM (still scored).
         g_cam = [h for h in g_idx if h in cam_head_ids]
         g_score = [h for h in g_idx if h not in cam_head_ids]
+
+        # ---- O(1) ADDRESS VERIFICATION (C4_DIRECT_CAM_VERIFY_ADDR) ------------------
+        # The direct gather below OVERWRITES the CAM heads' output with the draft-
+        # resolved value, DISCARDING the model's own query.  Before that, INDEPENDENTLY
+        # check that the address the draft resolved this read to is the address the
+        # MODEL's OWN query is asking for: decode ``Q[0, h, row, :n_bits]``'s sign
+        # pattern (the binary address key) and compare to ``tbl.addr``.  O(n_bits) per
+        # read (NOT O(n_store) — no softmax over the cache).  On mismatch, report into
+        # the divergence sink; verify_blocks turns it into a terminal FAIL (the same
+        # first-divergence path the register/token compare uses).  A wrong-ADDRESS draft
+        # (even a self-consistent one) is thus CAUGHT; a value swap AT the correct
+        # address is still trusted (re-deriving the value is the full-softmax job).
+        if _verify_addr and g_cam:
+            # host-copy the span's absolute query positions ONCE (not per head).
+            qpos_cpu = q_pos.detach().to("cpu").tolist()
+            for h in g_cam:
+                kind = cam_kind[h]
+                # CODE head is EXCLUDED: its query address is the PC, which the register-
+                # transition compare ALREADY verifies independently (``got_pc != want_pc``
+                # at every step).  A wrong code-fetch address is a wrong PC -> caught by
+                # the existing register check.  (Its query encoding at the value-injection
+                # row also differs from the memory heads' ``smag*(2*bit-1)`` sign pattern
+                # -- the PC->CODE_QRY_BIN FFN feeds a different row -- so a sign-decode here
+                # would false-positive.)  The genuinely draft-trusted, NON-register-covered
+                # address is the ``mem`` LOAD address (LI/LC ``mem[addr]``); pop/lev key on
+                # SP/BP+4 (register-derived) and are verified here for defence in depth.
+                if kind == "code":
+                    continue
+                addr_d = tbl.addr_by_kind(kind)
+                if not addr_d:
+                    continue
+                # rows on THIS span where the draft says head h reads (abs pos in addr_d).
+                sel_rows = [ri for ri, ap in enumerate(qpos_cpu) if ap in addr_d]
+                if not sel_rows:
+                    continue
+                n_bits = _n_addr_bits(kind)
+                ri_t = torch.tensor(sel_rows, device=x.device, dtype=torch.long)
+                Qh = Q[0, h].index_select(0, ri_t)            # [nq, HD] model's query
+                model_addr = _decode_model_query_addr(Qh, n_bits).to("cpu").tolist()
+                for k_i, ri in enumerate(sel_rows):
+                    ap = qpos_cpu[ri]
+                    da = int(addr_d[ap]) & ((1 << n_bits) - 1)
+                    ma = int(model_addr[k_i])
+                    # FIRE only when the model ASSERTS a NON-ZERO address that DISAGREES
+                    # with the draft.  Rationale (block-7-input residual view):
+                    #  * ``ma != 0`` means the model's ``QRY_BIN`` residual is genuinely
+                    #    populated with a computed address here (the ±smag bit pattern is
+                    #    real) -> a disagreement is a REAL divergence (the wrong-address
+                    #    draft the audit targets; proven caught in the experiment).
+                    #  * ``ma == 0`` is AMBIGUOUS at this residual view: it is EITHER a
+                    #    genuine address-0 read (then da==0 and there is no mismatch) OR a
+                    #    row whose ``QRY_BIN`` is not asserted at block-7 input under the
+                    #    batched/recurrent span (the address-computation FFN's result is
+                    #    not in THIS residual view) -> the model is not asserting an
+                    #    address here, so we must NOT false-fail.  Skipping ``ma==0``
+                    #    mismatches is the CONSERVATIVE choice (never a false positive);
+                    #    the honest limit is a draft that resolves a read to a non-zero
+                    #    address the model would have read as 0 -- indistinguishable from
+                    #    an unasserted query and therefore NOT caught here (documented
+                    #    scope).
+                    if ma != 0 and ma != da:
+                        sink.report(ap, h, kind, ma, int(addr_d[ap]))
 
         def _attend(heads, K_full, V_full, kpos_full, window):
             if not heads:
@@ -538,13 +704,19 @@ def install_direct_cam_batched(model, L: PureForwardCompleteLayout,
     import c4_min.sparse_forward as _SF
     _ORIG_ATTN_FORWARD = _SF.SparseAttn.forward
     tbl = build_resolved_table(draft, code)
+    # O(1) ADDRESS VERIFICATION sink (C4_DIRECT_CAM_VERIFY_ADDR).  When ON, the forward
+    # reports any address the draft resolved that the model's OWN query disagrees with;
+    # verify_blocks polls ``tbl.addr_sink`` after each span and turns a hit into a FAIL.
+    sink = DivergenceSink() if verify_addr_enabled() else None
+    tbl.addr_sink = sink
     chm = cam_head_map(model, L)
     for bi, heads in chm.items():
-        _install_direct_forward(model, bi, heads, tbl)
+        _install_direct_forward(model, bi, heads, tbl, sink=sink)
     if verbose:
         n_mem, n_pop, n_lev = len(tbl.mem), len(tbl.pop), len(tbl.lev)
         print(f"[direct-cam] installed on blocks {sorted(chm)} "
               f"heads={ {bi:[h for h,_ in hs] for bi,hs in chm.items()} }  "
-              f"resolved mem={n_mem} pop={n_pop} lev={n_lev} code={len(tbl.code)}",
+              f"resolved mem={n_mem} pop={n_pop} lev={n_lev} code={len(tbl.code)}"
+              f"{'  [addr-verify ON]' if sink is not None else ''}",
               flush=True)
     return tbl
