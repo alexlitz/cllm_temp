@@ -76,11 +76,25 @@ class SparseWeight:
         given) so ``linear`` reuses it instead of re-running ``csr.to_dense()`` on
         every forward.  Bit-identical to ``dense_kernel`` (same GEMM, same tensor).
         Only meaningful for a sparse weight; a dense-kept weight is already resident.
-        """
+
+        IDEMPOTENT (host-wall kill): if the resident dense already exists (on the
+        right device) this is a NO-OP — do NOT re-run ``csr.to_dense()``.  The
+        profiler pinned ``materialize_dense``'s ``csr.to_dense()`` (3358 calls /
+        0.35 s in one composed forward) as a top host consumer because the block-0 /
+        whole-step graph builders each call the model-level ``materialize_dense``,
+        which re-densified EVERY sparse weight on each invocation even though the
+        resident copy was already present.  The resident tensor is IDENTICAL across
+        calls -> byte-exact."""
         if not self.is_sparse:
             if device is not None and self.dense is not None:
                 self.dense = self.dense.to(device)
             return
+        import os as _os
+        _idem = _os.environ.get("C4_MATERIALIZE_IDEMPOTENT", "1") \
+            not in ("0", "", "false", "False")
+        dr = self.dense_resident
+        if _idem and dr is not None and (device is None or str(dr.device) == str(device)):
+            return                             # already resident on the right device
         d = self.csr.to_dense()
         if device is not None:
             d = d.to(device)

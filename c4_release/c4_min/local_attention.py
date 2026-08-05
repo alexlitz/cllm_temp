@@ -89,7 +89,23 @@ def live_value_heads(attn) -> List[int]:
     """Heads with a NON-TRIVIAL value output: W_v rows (input-dim slice
     ``h·HD..(h+1)·HD``) non-zero AND W_o cols (same slice) non-zero.  A head not in
     this list outputs 0 (``x + W_o·0``) no matter which keys it reads.  CPU-only
-    (structural nnz), so no GPU dense transient."""
+    (structural nnz), so no GPU dense transient.
+
+    MEMOIZED (host-wall kill): this is a PURE STRUCTURAL property of ``W_v``/``W_o``
+    (weights never change during a run), yet it was recomputed on EVERY verify call
+    for all 242 blocks — each call densifying the sparse ``W_v``/``W_o``
+    (``.cpu().to_dense()``) + a per-head Python nnz loop.  The profiler pinned this
+    (``.cpu()`` 2428 calls / 1.25 s + ``live_value_heads`` 0.82 s / ``to_dense`` /
+    ``sum``) as the DOMINANT composed-step host wall once the CAM gather was
+    vectorized.  Cache the result on the ``attn`` instance keyed by the identity of
+    its weight objects; a weight swap (never happens mid-run) invalidates it.  The
+    returned value is IDENTICAL to the uncached computation -> byte-exact."""
+    import os as _os
+    _memo = _os.environ.get("C4_LIVE_HEADS_MEMO", "1") not in ("0", "", "false", "False")
+    key = (id(getattr(attn, "W_v", None)), id(getattr(attn, "W_o", None)))
+    cached = getattr(attn, "_live_value_heads_cache", None)
+    if _memo and cached is not None and cached[0] == key:
+        return list(cached[1])
     H, HD = attn.n_heads, attn.head_dim
     wv = _dense_cpu(attn.W_v)
     wo = _dense_cpu(attn.W_o)
@@ -98,6 +114,11 @@ def live_value_heads(attn) -> List[int]:
         sl = slice(h * HD, (h + 1) * HD)
         if int((wv[sl, :] != 0).sum()) > 0 and int((wo[:, sl] != 0).sum()) > 0:
             live.append(h)
+    if _memo:
+        try:
+            attn._live_value_heads_cache = (key, list(live))
+        except Exception:
+            pass                               # non-attr-settable objects: no cache
     return live
 
 
