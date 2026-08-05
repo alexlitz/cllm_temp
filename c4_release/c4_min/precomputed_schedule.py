@@ -265,6 +265,22 @@ class PrecomputedStepGraph:
         self._s_delta: Dict[int, torch.Tensor] = {}    # on-chip path ([C, n_out_b])
         self._s_pc = self._s_sp = self._s_bp = self._s_ax = None
         model.materialize_dense(device=str(self.device))
+        # FAITHFUL SINGLE-DISPATCH (C4_FAITHFUL_SINGLE_DISPATCH): also decode the
+        # model's OWN query address at each live CAM block IN the same graph (one
+        # extra W_q(x) + sign-decode per live block, near-zero marginal — the block's
+        # W_q(x) would otherwise be discarded).  The verify then rides on the one fast
+        # dispatch pass (no second megachain forward).  ``_faithful_heads`` : list of
+        # (block_idx, head_idx, kind, n_bits) to decode; ``_s_qaddr`` : per-key output
+        # lane [C] long.  OFF -> the plain fast graph (byte-identical).
+        from .faithful_single_dispatch import faithful_single_dispatch_enabled
+        self._faithful = bool(faithful_single_dispatch_enabled())
+        self._faithful_heads = []
+        self._s_qaddr = {}
+        if self._faithful:
+            from .direct_cam_batched import _n_addr_bits
+            for b, lb in self.live_blocks.items():
+                for (hh, knd) in lb.cam_heads:
+                    self._faithful_heads.append((b, int(hh), knd, _n_addr_bits(knd)))
 
     # -- the fixed-shape whole-step body over the static buffers ----------------
     def _body(self):
@@ -320,6 +336,10 @@ class PrecomputedStepGraph:
             else:  # 'live' block index
                 b = payload
                 lb = self.live_blocks[b]
+                # FAITHFUL: decode the model's OWN query address at THIS block's genuine
+                # input residual (before the draft cam_out inject overwrites it), IN-graph.
+                if self._faithful:
+                    self._decode_qaddr_at(b, lb, h)
                 if self.onchip:
                     h = lb.forward_static_delta(h, self._s_delta[b],
                                                 self.live_out_dims[b])
@@ -327,11 +347,77 @@ class PrecomputedStepGraph:
                     h = lb.forward_static(h, self._s_cam[b])
         return h
 
+    def _decode_qaddr_at(self, b, lb, h):
+        """In-graph sign-decode of the model's queried address at live block ``b`` from its
+        genuine input residual ``h`` (``sign(W_q(x))`` per address bit == the model's
+        binary-address key).  Writes each CAM head's decoded address into ``_s_qaddr``."""
+        Bx, Cx, Dx = h.shape
+        Q = lb.attn.W_q.linear(h).view(Bx, Cx, lb.H, lb.HD)
+        for (hh, knd) in lb.cam_heads:
+            n_bits = self._n_bits_of.get((b, hh), None)
+            if n_bits is None:
+                continue
+            Qh = Q[0, :, hh, :n_bits]                       # [C, n_bits]
+            bits = (Qh > 0).to(torch.long)
+            w = (1 << torch.arange(n_bits, device=h.device, dtype=torch.long))
+            self._s_qaddr[(b, hh, knd)].copy_((bits * w.unsqueeze(0)).sum(dim=1))
+
+    def decode_model_query_addrs(self, h0, ing, cam, delta=None):
+        """FAITHFUL VERIFY (C4_FAITHFUL_SINGLE_DISPATCH): run the SAME fused per-row map
+        EAGERLY (not graphed) and, at each live CAM block's INPUT residual, compute the
+        model's OWN query ``Q = W_q.linear(h)`` and sign-decode its queried address per
+        CAM head.  Returns ``{(block_idx, head_idx): LongTensor[C]}`` -- the model's
+        decoded query address at every query row for that head (0 when the query band is
+        not asserted in this residual view).
+
+        This is the model's GENUINE computation feeding the independent routing/address/
+        value verify: the same block-0 + mega dead-FFN chain + prior-live-block residual
+        the fast graph runs, byte-identically (same kernels, same order), but stopping to
+        read ``W_q(x)`` before each live CAM block overwrites the head-value slot.  The
+        sign decode is exactly ``direct_cam_batched._decode_model_query_addr`` (the query
+        for bit b is ``Q[.., head, b] = smag*(2*bit-1)``)."""
+        from .direct_cam_batched import _decode_model_query_addr, _n_addr_bits
+        # block 0 (identical to _body).
+        if self.onchip:
+            h = self.ffn0.forward(h0)
+        else:
+            B, C, D = h0.shape
+            out2 = ing.transpose(1, 2).contiguous().view(1, C, D)
+            h = h0 + self.attn0.W_o.linear(out2)
+            h = self.ffn0.forward(h)
+        out = {}
+        for kind, payload in self.mega.items:
+            if kind == "mega":
+                h = payload.run(h)                       # eager kernels (same as graph)
+            else:  # 'live' block index
+                b = payload
+                lb = self.live_blocks[b]
+                attn = lb.attn
+                # the model's OWN query at THIS block's genuine input residual.
+                Bx, Cx, Dx = h.shape
+                Q = attn.W_q.linear(h).view(Bx, Cx, lb.H, lb.HD)   # [1,C,H,HD]
+                for (hh, knd) in lb.cam_heads:
+                    n_bits = _n_addr_bits(knd)
+                    Qh = Q[0, :, hh, :]                            # [C, HD]
+                    out[(b, hh, knd)] = _decode_model_query_addr(Qh, n_bits)
+                # advance the residual exactly as the graph does (inject the draft gather
+                # -- byte-identical to _run_region; the verify already read Q pre-inject).
+                if self.onchip:
+                    h = lb.forward_static_delta(h, delta[b], self.live_out_dims[b])
+                else:
+                    h = lb.forward_static(h, cam[b])
+        return out
+
     def _alloc_out_lanes(self, C):
         self._s_pc = torch.zeros(C, dtype=torch.long, device=self.device)
         self._s_sp = torch.zeros(C, dtype=torch.long, device=self.device)
         self._s_bp = torch.zeros(C, dtype=torch.long, device=self.device)
         self._s_ax = torch.zeros(C, dtype=torch.long, device=self.device)
+        if self._faithful:
+            self._n_bits_of = {(b, hh): nb for (b, hh, knd, nb) in self._faithful_heads}
+            self._s_qaddr = {(b, hh, knd): torch.zeros(C, dtype=torch.long,
+                                                       device=self.device)
+                             for (b, hh, knd, nb) in self._faithful_heads}
 
     def _capture(self):
         C, D = self.chunk, self.D
@@ -429,6 +515,14 @@ class PrecomputedStepGraph:
                     self._s_cam[b][:, :, Sc:].zero_()
         self._graph.replay()
         return (self._s_pc[:Sc], self._s_sp[:Sc], self._s_bp[:Sc], self._s_ax[:Sc])
+
+    def last_qaddr(self, Sc):
+        """FAITHFUL: the model's decoded query addresses from the LAST replay's in-graph
+        sign-decode.  ``{(block, head, kind): LongTensor[Sc]}`` (empty when not faithful).
+        Valid only until the next replay overwrites the lanes (the caller copies out)."""
+        if not self._faithful:
+            return {}
+        return {k: v[:Sc] for k, v in self._s_qaddr.items()}
 
 
 # ===========================================================================
@@ -1492,7 +1586,131 @@ def run_verify(model, L, code, draft, device, *, mask: int = 0xFFFFFFFF,
         n_chunks=n_chunks, host_ops_per_forward=host_ops)
 
 
+def run_faithful_verify(model, L, code, draft, device, *, mask=0xFFFFFFFF,
+                        collect_out=None, stats=None):
+    """FAITHFUL SINGLE-DISPATCH (C4_FAITHFUL_SINGLE_DISPATCH): the FAST fused single
+    dispatch made GENUINE — ONE dispatch pass produces BOTH the byte-exact register
+    decode AND the model's own decoded query addresses (in-graph ``sign(W_q(x))`` at each
+    live CAM block, near-zero marginal since that block's ``W_q(x)`` would be discarded).
+    We then independently verify every draft-derived quantity (routing op / read address /
+    read value) against that genuine computation with a first-divergence terminal FAIL.
+
+    Returns a ``PrecomputedResult`` identical to ``run_verify`` on correct execution, but
+    ``accepted_steps`` is clipped to the first step where EITHER the register compare OR
+    the genuine routing/address/value check diverges (so a self-consistent wrong draft is
+    REJECTED, unlike the plain fast path).  The value re-resolution is latest-write-wins
+    over the committed (evicted / bounded) stores at the MODEL's address — the
+    ``C4_FAITHFUL_ATTN_EVICT`` mechanism, wired into the single dispatch (not the slow
+    verify_blocks fallback)."""
+    import numpy as _np
+    import time as _time
+    from .faithful_single_dispatch import build_faithful_plan, verify_faithful
+    dev = torch.device(device)
+    _DM = {"DIV", "MOD"}
+    for s in range(draft.step_count):
+        if draft.frames[s].get("op") in _DM:
+            raise ValueError("run_faithful_verify: DIV/MOD step — use verify_blocks")
+    t0 = _time.perf_counter()
+    sched, sg = build_schedule(model, L, code, draft, dev, mask=mask)
+    n = sched.n_steps
+    chunk = sg.chunk
+    onchip = sched.onchip
+    got_pc = torch.empty(n, dtype=torch.long, device=dev)
+    got_sp = torch.empty(n, dtype=torch.long, device=dev)
+    got_bp = torch.empty(n, dtype=torch.long, device=dev)
+    got_ax = torch.empty(n, dtype=torch.long, device=dev)
+    h0_src = sched.h0_folded if onchip else sched.h0_table
+    resident = resident_batch_enabled() and n <= chunk
+    per_head = {}          # (block, head, kind) -> list of (lo, hi, np arr)
+    n_chunks = 0
+    host_ops = 0
+    for lo in range(0, n, chunk):
+        hi = min(lo + chunk, n)
+        h0 = h0_src[lo:hi].unsqueeze(0)
+        if onchip:
+            ing = None; cam = None
+            delta = {b: t[lo:hi] for b, t in sched.cam_delta_tables.items()}
+            pc_c, sp_c, bp_c, ax_c = sg.replay(h0, ing, cam, delta=delta, resident=resident)
+        else:
+            ing = sched.ing_table[lo:hi].permute(1, 0, 2).unsqueeze(0)
+            cam = {b: t[lo:hi].permute(1, 0, 2).unsqueeze(0)
+                   for b, t in sched.cam_tables.items()}
+            pc_c, sp_c, bp_c, ax_c = sg.replay(h0, ing, cam, resident=resident)
+        got_pc[lo:hi].copy_(pc_c); got_sp[lo:hi].copy_(sp_c)
+        got_bp[lo:hi].copy_(bp_c); got_ax[lo:hi].copy_(ax_c)
+        # the in-graph decoded model query addresses for this chunk.
+        for key, t in sg.last_qaddr(hi - lo).items():
+            per_head.setdefault(key, []).append(
+                (lo, hi, t.detach().to("cpu").numpy().astype("int64")))
+        n_chunks += 1; host_ops += 1
+    got_ax = got_ax & mask
+    # ---- REGISTER compare (byte-exact, exactly run_verify) ----
+    bad_normal = ((got_pc != sched.want_pc) | (got_ax != sched.want_ax)
+                  | (got_sp != sched.want_sp) | (got_bp != sched.want_bp))
+    bad = torch.where(sched.is_halt, got_ax != sched.want_ax, bad_normal)
+    bad = bad & (~sched.is_file)
+    any_bad = bad.any()
+    first_bad = torch.argmax(bad.to(torch.uint8))
+    n_ok_reg = int(torch.where(any_bad, first_bad,
+                               torch.tensor(n, device=dev)).item())
+    t_fast = _time.perf_counter() - t0
+    # ---- GENUINE verify (routing / address / value from the model's query) ----
+    t0 = _time.perf_counter()
+    plan = build_faithful_plan(model, L, code, draft)
+    model_addrs = {}
+    for (b, hh, knd), chunks in per_head.items():
+        full = _np.zeros(n, dtype=_np.int64)
+        for (lo, hi, arr) in chunks:
+            full[lo:hi] = arr[:hi - lo]
+        model_addrs[(b, knd)] = full
+    ws = _np.asarray(draft.win_starts[:n], dtype=_np.int64)
+    verdict = verify_faithful(draft, plan, model_addrs, ws, mask=mask)
+    t_verify = _time.perf_counter() - t0
+    n_ok_gen = verdict.first_bad_step if not verdict.ok else n
+    n_ok = min(n_ok_reg, n_ok_gen)
+    # PRTF visible bytes for the accepted prefix (byte-identical to verify_blocks).
+    if collect_out is not None and draft.prtf_steps:
+        prtf = sorted(int(s) for s in draft.prtf_steps if s < n_ok)
+        if prtf:
+            pl = torch.tensor(prtf, device=dev, dtype=torch.long)
+            pb = (got_ax & 0xFF).index_select(0, pl).tolist()
+            collect_out.extend(int(v) & 0xFF for v in pb)
+    all_matched = (n_ok == n)
+    final_ax = int(got_ax[n - 1].item()) if all_matched and n > 0 else None
+    if stats is not None:
+        stats["n_chunks"] = n_chunks
+        stats["host_ops_per_forward"] = host_ops
+        stats["chunk"] = chunk
+        stats["fast_dispatch_secs"] = t_fast
+        stats["faithful_verify_secs"] = t_verify
+        stats["faithful_addr_checked"] = verdict.n_addr_checked
+        stats["faithful_value_checked"] = verdict.n_value_checked
+        stats["faithful_routing_checked"] = verdict.n_routing_checked
+        stats["faithful_ok"] = (n_ok == n)
+    first_mismatch = None
+    if not all_matched:
+        s = n_ok
+        if n_ok_gen <= n_ok_reg and not verdict.ok:
+            first_mismatch = {"step": s, "query_pos": int(ws[s]) if s < n else None,
+                              "kind": verdict.kind, "detail": verdict.detail}
+            if stats is not None:
+                stats["faithful_divergence"] = dict(first_mismatch)
+        else:
+            first_mismatch = {
+                "step": s, "query_pos": draft.win_starts[s],
+                "got": {"pc": int(got_pc[s].item()), "ax": int(got_ax[s].item()),
+                        "sp": int(got_sp[s].item()), "bp": int(got_bp[s].item())},
+                "want": {"pc": int(sched.want_pc[s].item()),
+                         "ax": int(sched.want_ax[s].item()),
+                         "sp": int(sched.want_sp[s].item()),
+                         "bp": int(sched.want_bp[s].item())}}
+    return PrecomputedResult(
+        accepted_steps=n_ok, total_steps=n, all_matched=all_matched,
+        decoded_final_ax=final_ax, first_mismatch=first_mismatch,
+        n_chunks=n_chunks, host_ops_per_forward=host_ops)
+
+
 __all__ = ["precomputed_schedule_enabled", "PrecomputedSchedule",
            "PrecomputedStepGraph", "build_schedule", "build_schedule_tables_only",
-           "run_verify", "PrecomputedResult",
+           "run_verify", "run_faithful_verify", "PrecomputedResult",
            "sched_pipeline_enabled", "PipelinedScheduleBuilder"]

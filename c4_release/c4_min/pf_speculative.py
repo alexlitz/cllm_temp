@@ -1408,12 +1408,23 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     # draft-trust) and compacts the routing, neither of which is the genuine softmax
     # the faithful path runs.  So even if C4_PRECOMPUTED_SCHEDULE is ambiently set,
     # faithful mode falls through to the real per-op scored path below.
+    # FAITHFUL SINGLE-DISPATCH (C4_FAITHFUL_SINGLE_DISPATCH): keep the FAST single
+    # dispatch but make it GENUINE — independently verify routing / read-address /
+    # read-value against the MODEL's own computation (the C4_FAITHFUL_ATTN_EVICT value
+    # re-resolution wired into the single dispatch, NOT the verify_blocks fallback).  It
+    # does NOT force single-dispatch off (unlike faithful-attn-evict); it rides on it.
+    from .faithful_single_dispatch import faithful_single_dispatch_enabled as _fsd
+    _faithful_sd = (_fsd() and device.startswith("cuda")
+                    and not faithful_attn_evict_enabled())
     if (_osp.environ.get("C4_PRECOMPUTED_SCHEDULE", "0") not in ("0", "", "false", "False")
             and device.startswith("cuda")
-            and not faithful_attn_evict_enabled()):
+            and (_faithful_sd or not faithful_attn_evict_enabled())):
         _DM = {"DIV", "MOD"}
         if not any(draft.frames[s].get("op") in _DM for s in range(draft.step_count)):
-            from .precomputed_schedule import run_verify as _ps_run
+            if _faithful_sd:
+                from .precomputed_schedule import run_faithful_verify as _ps_run
+            else:
+                from .precomputed_schedule import run_verify as _ps_run
             pr = _ps_run(model, L, code, draft, device, mask=mask,
                          collect_out=collect_out, stats=stats)
             if stats is not None:
