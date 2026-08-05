@@ -62,6 +62,17 @@ def _draft_cmp32() -> bool:
     return os.environ.get("C4_DRAFT_CMP32", "0") == "1"
 
 
+def _draft_shift32() -> bool:
+    """DRAFT SHL/SHR width selector.  DEFAULT OFF (``C4_SHIFT32`` unset) -> the historical
+    8-bit shift draft (``(v & 0xFF) </>> ax & 0xFF``), byte-identical to every prior corpus
+    draft.  ON (``C4_SHIFT32=1``) -> the draft shifts the FULL 32-bit operand (``pop </>> ax``
+    at 32-bit width, arithmetic SHR sign-fill), matching the MODEL's ``C4_SHIFT32`` tight
+    shifter.  REQUIRED for doom's fixed-point shifts and the #829 pow2 DIV->SHR reduction
+    (a 32-bit divide reduced to a shift; the 8-bit floor mis-computes it).  Additive + gated:
+    OFF reproduces the exact 8-bit draft, so the whole existing corpus is byte-identical."""
+    return os.environ.get("C4_SHIFT32", "0") == "1"
+
+
 def _s32(v: int) -> int:
     """Interpret ``v`` as a signed 32-bit two's-complement integer (C4's ``int``)."""
     v &= 0xFFFFFFFF
@@ -702,17 +713,31 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
                 ax = ((v % ax) if ax else 0) & mask
         elif op in (isa.OR, isa.XOR, isa.AND, isa.SHL, isa.SHR):
             read_addrs.append(("pop", sp))    # stack head reads MEM[sp]
-            pop_val = mem.get(sp, 0); v = pop_val & 0xFF; sp += 4
-            if op == isa.OR:
-                ax = (v | ax) & 0xFF
-            elif op == isa.XOR:
-                ax = (v ^ ax) & 0xFF
-            elif op == isa.AND:
-                ax = (v & ax) & 0xFF
-            elif op == isa.SHL:
-                ax = (v << ax) & 0xFF
+            pop_val = mem.get(sp, 0); sp += 4
+            if op in (isa.SHL, isa.SHR) and _draft_shift32():
+                # 32-bit SHL/SHR (matches the model's C4_SHIFT32 tight shifter:
+                # ``pop </>> ax`` at full width, arithmetic SHR sign-fill).  REQUIRED for
+                # doom's fixed-point shifts AND the #829 pow2 DIV->SHR / MOD->AND reduction
+                # (which turns a 32-bit divide into a 32-bit shift; the 8-bit floor would
+                # mis-compute ``519 >> 3`` as 0 instead of 64).  Gated: OFF -> the 8-bit
+                # floor (byte-identical to the existing corpus draft).
+                v32 = pop_val & 0xFFFFFFFF
+                if op == isa.SHL:
+                    ax = (v32 << (ax & 31)) & 0xFFFFFFFF
+                else:
+                    ax = (_s32(v32) >> (ax & 31)) & 0xFFFFFFFF
             else:
-                ax = (v >> ax) & 0xFF
+                v = pop_val & 0xFF
+                if op == isa.OR:
+                    ax = (v | ax) & 0xFF
+                elif op == isa.XOR:
+                    ax = (v ^ ax) & 0xFF
+                elif op == isa.AND:
+                    ax = (v & ax) & 0xFF
+                elif op == isa.SHL:
+                    ax = (v << ax) & 0xFF
+                else:
+                    ax = (v >> ax) & 0xFF
         elif op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE):
             read_addrs.append(("pop", sp))    # stack head reads MEM[sp]
             pop_val = mem.get(sp, 0); sp += 4
