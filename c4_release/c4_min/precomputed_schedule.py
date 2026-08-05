@@ -442,7 +442,23 @@ class PrecomputedSchedule:
     cam_delta_tables: Optional[Dict[int, torch.Tensor]] = None   # block -> [K, n_out_b]
 
 
-def _build_query_embed(model, L, code, draft, device) -> torch.Tensor:
+def _draft_tokens_np(draft):
+    """``np.asarray(draft.tokens)`` — the ONE full ~30*n-token stream conversion (a real
+    O(tokens) one-time cost the whole-frame giant-K exposes).  Cached on the draft so the
+    query-embed + ingest-table + frame-decode builds SHARE it (three consumers, one
+    conversion) under C4_SCHED_GPU_BUILD."""
+    import numpy as _np
+    tk = getattr(draft, "_tokens_np_cache", None)
+    if tk is None:
+        tk = _np.asarray(draft.tokens, dtype=_np.int64)
+        try:
+            draft._tokens_np_cache = tk
+        except Exception:
+            pass
+    return tk
+
+
+def _build_query_embed(model, L, code, draft, device, toks_np=None) -> torch.Tensor:
     """The per-step query-row block-0 input ``[K, D]``: ``embed[qtok] + query_overlay``.
 
     A step's query row token is ``draft.tokens[win_starts[step]]`` (the REG_PC role
@@ -456,11 +472,17 @@ def _build_query_embed(model, L, code, draft, device) -> torch.Tensor:
     toks = draft.tokens
     ws = draft.win_starts
     n = draft.step_count
-    # the query-row token per step (toks[win_starts[s]]) via ``np.fromiter`` (n reads, no
-    # full 30*n-token list conversion), then ONE host->device transfer — no slow
-    # torch.tensor(python-list) at K.
-    qtok = torch.from_numpy(
-        _np.fromiter((toks[ws[s]] for s in range(n)), dtype=_np.int64, count=n)).to(device)
+    if toks_np is not None:
+        # C4_SCHED_GPU_BUILD: gather qtok from the shared token array via a vectorized
+        # index (win_starts) — no per-step Python generator.  Byte-identical.
+        ws_np = _np.asarray(ws[:n], dtype=_np.int64)
+        qtok = torch.from_numpy(toks_np[ws_np]).to(device)
+    else:
+        # the query-row token per step (toks[win_starts[s]]) via ``np.fromiter`` (n reads,
+        # no full 30*n-token list conversion), then ONE host->device transfer — no slow
+        # torch.tensor(python-list) at K.
+        qtok = torch.from_numpy(
+            _np.fromiter((toks[ws[s]] for s in range(n)), dtype=_np.int64, count=n)).to(device)
     h0 = model.embed[qtok].clone()                 # [K, D]  fresh copy
     # code_vec: ONE broadcast assign over the code dims (same idx/vals every row).
     code_idx, code_vals = build_code_vec(code, L, model.embed.shape[1], device,
@@ -472,7 +494,39 @@ def _build_query_embed(model, L, code, draft, device) -> torch.Tensor:
     return h0
 
 
-def _build_ingest_table(model, L, draft, device) -> torch.Tensor:
+def _resolved_frame_nibs_vec(draft, toks_np, device):
+    """The vectorized frame-decode inner of ``build_resolved_frames`` WITHOUT the
+    ``ResolvedFrames`` object's O(n) ``pos_to_local`` Python dict (unused by the schedule
+    build).  Returns ``(nib_lo, nib_hi)`` [K, N_ROLES] on ``device``.  Shares the token
+    array ``toks_np`` (C4_SCHED_GPU_BUILD).  Byte-identical to ``build_resolved_frames``'s
+    nibbles (same fstart / REG_PC guard / 0..255 clamp)."""
+    from .direct_local_cam import _ROLE_TO_LOCAL
+    import numpy as _np
+    FL = V.FRAME_LEN
+    NR = len(_ROLE_TO_LOCAL)
+    n = draft.step_count
+    local_of_role = _np.asarray([_ROLE_TO_LOCAL[r] for r in range(NR)], dtype=_np.int64)
+    T = toks_np.shape[0]
+    if n == 0:
+        z = torch.zeros(0, NR, dtype=torch.float32, device=device)
+        return z, z.clone()
+    pos = _np.asarray(draft.win_starts[:n], dtype=_np.int64)          # [n]
+    fstart = pos - (FL - 1)
+    valid = fstart >= 0
+    fs_c = _np.clip(fstart, 0, None)
+    head_tok = toks_np[_np.clip(fs_c, 0, T - 1)]
+    valid = valid & (head_tok == V.REG_PC)
+    gather_idx = fs_c[:, None] + local_of_role[None, :]              # [n, NR]
+    gather_idx = _np.clip(gather_idx, 0, T - 1)
+    B = toks_np[gather_idx]                                          # [n, NR]
+    B = _np.where((B >= 0) & (B <= 255), B, 0)
+    B = _np.where(valid[:, None], B, 0)
+    nib_lo = (B & 0xF).astype(_np.float32)
+    nib_hi = ((B >> 4) & 0xF).astype(_np.float32)
+    return (torch.from_numpy(nib_lo).to(device), torch.from_numpy(nib_hi).to(device))
+
+
+def _build_ingest_table(model, L, draft, device, toks_np=None) -> torch.Tensor:
     """The block-0 ingest gather, per step, in head-value space ``[K, H0, HD0]``.
 
     The ingest head ``h`` writes ``[nib_lo[h], nib_hi[h], 0, ...]`` into its head-value
@@ -483,14 +537,20 @@ def _build_ingest_table(model, L, draft, device) -> torch.Tensor:
     attn0 = model.blocks[0].attn
     head_map = ingest_head_map(attn0)              # {head: (r,bi)}; head==role index
     ing_heads = sorted(head_map)
-    rf = build_resolved_frames(draft, device=device)   # nib_lo/nib_hi [K, N_ROLES]
-    K = rf.nib_lo.shape[0]
+    if toks_np is not None:
+        # C4_SCHED_GPU_BUILD: skip the ResolvedFrames pos_to_local O(n) dict (unused here)
+        # + share the token array — byte-identical nibbles.
+        nib_lo, nib_hi = _resolved_frame_nibs_vec(draft, toks_np, device)
+    else:
+        rf = build_resolved_frames(draft, device=device)   # nib_lo/nib_hi [K, N_ROLES]
+        nib_lo, nib_hi = rf.nib_lo, rf.nib_hi
+    K = nib_lo.shape[0]
     H0, HD0 = attn0.n_heads, attn0.head_dim
     tab = torch.zeros(K, H0, HD0, device=device)
     heads_t = torch.tensor(ing_heads, device=device, dtype=torch.long)
     # role index == head index: gather nib_lo/hi[:, head] into slot 0/1.
-    tab[:, heads_t, 0] = rf.nib_lo[:, heads_t]
-    tab[:, heads_t, 1] = rf.nib_hi[:, heads_t]
+    tab[:, heads_t, 0] = nib_lo[:, heads_t]
+    tab[:, heads_t, 1] = nib_hi[:, heads_t]
     return tab
 
 
@@ -503,6 +563,254 @@ def _sched_fast_build() -> bool:
     scatter is byte-identical (the SAME nibbles at the SAME value slots ``_head_out_vec``
     writes).  OFF -> the original per-step loop (kept as the byte-exact cross-check)."""
     return os.environ.get("C4_SCHED_FAST_BUILD", "1") not in ("0", "", "false", "False")
+
+
+def _sched_gpu_build() -> bool:
+    """``C4_SCHED_GPU_BUILD`` (DEFAULT OFF).  The DEEP build vectorization: collapse the
+    three-stage Python-dict CAM pipeline (``resolve_load_rows`` -> ``build_resolved_table``
+    -> ``_build_cam_sparse``) AND the per-step ``decode_targets`` frame loop into ONE
+    vectorized numpy pass over flat arrays, plus a torch device gather for the value-nibble
+    scatter.  Profiled (n=364 K): that three-stage chain is ~70% of the schedule build
+    (cam_sparse 32% + resolve_load_rows 20% + build_resolved_table 18%) — each stage
+    builds/iterates a Python dict keyed by absolute position, all O(reads+stores+steps)
+    CPython.  The vectorized form does the SAME latest-write-wins resolution as a stable
+    argsort + per-address ``searchsorted`` (no per-read ``ResolvedRead`` dataclass, no
+    position-keyed dict), maps read frame -> step -> query row by a single vectorized
+    ``searchsorted``, and scatters the resolved value nibbles into the compact
+    ``vals[K, n_active]`` arrays with vectorized bit-shifts — byte-identical to the
+    per-read scatter ``_build_cam_sparse`` does (same active columns, same nibbles, same
+    step rows).  OFF -> the Python-dict path (``_build_cam_sparse`` / the decode loop),
+    the byte-exact cross-check.  Requires ``C4_SCHED_FAST_BUILD`` + ``C4_ONCHIP_RESIDUAL``
+    (the compact-sparse -> W_o-delta on-chip path)."""
+    return os.environ.get("C4_SCHED_GPU_BUILD", "0") not in ("0", "", "false", "False")
+
+
+def _draft_read_store_arrays(draft):
+    """Flatten ``draft.read_log`` / ``store_log`` into numpy arrays ONCE (the only
+    O(reads+stores) Python touch), returning
+      reads:  (rframe[R], rhead_code[R], raddr[R])   head_code: mem=0 pop=1 lev=2 uni=3
+      stores: (sframe[S], saddr[S], sval[S])         (ascending sframe)
+    ``rhead_code`` lets the resolver process all heads together; the caller filters per
+    live-block head kind.  Mirrors ``resolve_load_rows``' inputs exactly."""
+    import numpy as _np
+    _HC = {"mem": 0, "pop": 1, "lev": 2, "uni": 3}
+    read_log = draft.read_log or {}
+    store_log = draft.store_log or {}
+    # reads (order within a frame preserved; frames in ascending order for determinism).
+    rf_l, rh_l, ra_l = [], [], []
+    for f in sorted(read_log):
+        for (head, addr) in read_log[f]:
+            hc = _HC.get(head)
+            if hc is None:
+                continue
+            rf_l.append(f); rh_l.append(hc); ra_l.append(addr & 0xFFFFFFFF)
+    rframe = _np.asarray(rf_l, dtype=_np.int64)
+    rhead = _np.asarray(rh_l, dtype=_np.int64)
+    raddr = _np.asarray(ra_l, dtype=_np.int64)
+    sf_l = sorted(store_log)
+    sframe = _np.asarray(sf_l, dtype=_np.int64)
+    saddr = _np.fromiter((store_log[f][0] & 0xFFFFFFFF for f in sf_l),
+                         dtype=_np.int64, count=len(sf_l))
+    sval = _np.fromiter((store_log[f][1] & 0xFFFFFFFF for f in sf_l),
+                        dtype=_np.int64, count=len(sf_l))
+    return (rframe, rhead, raddr), (sframe, saddr, sval)
+
+
+def _resolve_reads_vec(reads, stores):
+    """VECTORIZED latest-write-wins: for each read ``(rframe, raddr)`` return the value of
+    the store to the SAME address with the LARGEST store frame ``< rframe`` (0 if none —
+    the softmax1 +1-sink ZFOD).  Byte-identical to ``resolve_load_rows``' per-read
+    ``latest.get(addr)`` walk (a store at frame S is visible to a read at frame > S; the
+    VM never has a store and a read at the SAME frame resolving against each other — SI
+    reads then stores at DISTINCT frames, and the store is committed after the read).
+
+    Method: group stores by address via a stable argsort on ``(saddr, sframe)``; within
+    each address group the store frames are ascending, so a read's winner is the store at
+    ``searchsorted(group_frames, rframe, 'left') - 1`` (the last store frame strictly
+    ``< rframe``).  A single vectorized pass, no per-read Python."""
+    import numpy as _np
+    rframe, rhead, raddr = reads
+    sframe, saddr, sval = stores
+    R = rframe.shape[0]
+    val = _np.zeros(R, dtype=_np.int64)
+    if R == 0 or sframe.shape[0] == 0:
+        return val
+    # stable sort stores by (addr, frame); frames within an addr group are then ascending.
+    order = _np.lexsort((sframe, saddr))          # primary saddr, secondary sframe
+    s_addr_s = saddr[order]
+    s_frame_s = sframe[order]
+    s_val_s = sval[order]
+    # group boundaries per distinct address in the sorted store array.
+    uniq_addr, grp_start = _np.unique(s_addr_s, return_index=True)
+    grp_end = _np.empty_like(grp_start)
+    grp_end[:-1] = grp_start[1:]
+    grp_end[-1] = s_addr_s.shape[0]
+    # map each read address to its store group (or -1 if the address was never stored).
+    gi = _np.searchsorted(uniq_addr, raddr)
+    in_range = gi < uniq_addr.shape[0]
+    matched = _np.zeros(R, dtype=_np.bool_)
+    matched[in_range] = uniq_addr[gi[in_range]] == raddr[in_range]
+    ridx = _np.nonzero(matched)[0]
+    if ridx.shape[0] == 0:
+        return val
+    g = gi[ridx]                                  # group index per matched read
+    gs = grp_start[g]; ge = grp_end[g]
+    # within [gs, ge) the frames s_frame_s are ascending; find the last frame < rframe.
+    # searchsorted over the WHOLE sorted-frame array restricted to the group window:
+    # local position = searchsorted(s_frame_s[gs:ge], rframe, 'left') - 1.
+    rfr = rframe[ridx]
+    # vectorized per-group searchsorted via a global searchsorted on a group-shifted key:
+    # build a monotone global key = group*BIG + frame so a single searchsorted respects
+    # both the group and the ascending frame order.
+    BIG = int(s_frame_s.max()) + int(rfr.max()) + 2 if s_frame_s.size else 1
+    # per-store group id (== group index of each sorted store), then a globally-ascending
+    # key = group*BIG + frame so a single searchsorted respects both group and frame order.
+    store_group = _np.searchsorted(uniq_addr, s_addr_s)
+    store_key = store_group * BIG + s_frame_s
+    read_key = g * BIG + rfr
+    loc = _np.searchsorted(store_key, read_key, side="left") - 1
+    # a valid winner must fall inside the read's own group window [gs, ge).
+    ok = loc >= gs
+    good = ridx[ok]
+    val[good] = s_val_s[loc[ok]]
+    return val
+
+
+def _build_cam_sparse_gpu(draft, code, live_blocks, device):
+    """C4_SCHED_GPU_BUILD: the vectorized CAM-sparse build.  Produces the SAME
+    ``{block: (vals[K,nc] float32, active_cols[nc] int64, HDb)}`` compact form
+    ``_build_cam_sparse`` does, but resolves the reads with ``_resolve_reads_vec`` and
+    scatters value nibbles with vectorized bit-shifts (no per-position Python dict, no
+    ``np.fromiter`` over dict generators).  ``vals`` are returned on the CPU (numpy) —
+    the W_o-delta step reads them to device; the heavy per-step resolution is what moved
+    to array ops.  Byte-identical to ``_build_cam_sparse``."""
+    import numpy as _np
+    from .direct_cam_batched import CODE_ADDR_BITS, ADDR_BITS, _n_seed
+    from .nibble_pure_forward_complete import IMM_NIBS, _pf_cfm_enabled
+    from .blogspec_layout import NIB_PER_REG
+
+    _HC = {"mem": 0, "pop": 1, "lev": 2, "uni": 3}
+    n = draft.step_count
+    ws = _np.asarray(draft.win_starts[:n], dtype=_np.int64)          # [n] query-row abs pos
+
+    # ---- read/store arrays + vectorized latest-write-wins ----
+    reads, stores = _draft_read_store_arrays(draft)
+    rframe, rhead, raddr = reads
+    rval = _resolve_reads_vec(reads, stores)                         # [R] resolved value
+
+    # ---- map each read frame -> its STEP (the query row it decodes) ----
+    # replay the frame counter EXACTLY as _frame_to_step: frame_idx starts at n_seed,
+    # advances +1 per step (primary frame) then + n_byte_stores for a file step.  The
+    # per-step primary frame index is thus a cumulative sum; build it vectorized.
+    n_seed = _n_seed(draft)
+    frames = draft.frames
+    # n_byte_stores per step (0 unless a file step); tiny Python touch (one attr per step).
+    nbs = _np.zeros(n, dtype=_np.int64)
+    # only file steps carry n_byte_stores; scan is unavoidable but a single cheap pass.
+    for s in range(n):
+        f = frames[s]
+        if f.get("is_file"):
+            nbs[s] = int(f.get("n_byte_stores", 0) or 0)
+    # primary frame index of step s = n_seed + 1 + s + sum(nbs[:s])
+    prefix = _np.zeros(n, dtype=_np.int64)
+    if n > 1:
+        prefix[1:] = _np.cumsum(nbs[:-1])
+    primary_frame = n_seed + 1 + _np.arange(n, dtype=_np.int64) + prefix   # [n]
+    # invert: read frame -> step via searchsorted (primary_frame is strictly increasing).
+    # a read frame that is NOT a primary frame (a store frame) maps to no step -> drop.
+    ridx = _np.searchsorted(primary_frame, rframe)
+    okr = (ridx < n)
+    okr[okr] &= (primary_frame[ridx[okr]] == rframe[okr])
+    step_of_read = _np.where(okr, ridx.clip(0, n - 1), -1)           # step index or -1
+
+    # ---- CODE FETCH@PC: per-step (op, imm) resolved from the pre-step PC ----
+    code_op = None; code_imm = None
+    if _pf_cfm_enabled():
+        # pre-step PC per step: pc0=0, pc[s] = frames[s-1]["pc"].  One cheap Python pass to
+        # pull the post-step pc array (frames are dicts), then shift.
+        post_pc = _np.fromiter((int(frames[s]["pc"]) for s in range(n)),
+                               dtype=_np.int64, count=n)
+        pre_pc = _np.empty(n, dtype=_np.int64)
+        pre_pc[0] = 0
+        if n > 1:
+            pre_pc[1:] = post_pc[:-1]
+        in_code = (pre_pc >= 0) & (pre_pc < len(code))
+        # code ops/imms as arrays (len(code) is tiny vs n).
+        op_arr = _np.asarray([int(ins.op) for ins in code], dtype=_np.int64)
+        imm_arr = _np.asarray([int(ins.imm) & 0xFFFFFFFF for ins in code], dtype=_np.int64)
+        code_op = _np.where(in_code, op_arr[pre_pc.clip(0, len(code) - 1)], -1)
+        code_imm = _np.where(in_code, imm_arr[pre_pc.clip(0, len(code) - 1)], 0)
+
+    # ---- scatter into the compact per-block vals[K, n_active] ----
+    out = {}
+    for lb in live_blocks:
+        Hb, HDb = lb.H, lb.HD
+        col_of = {}; col_list = []
+        for (h, kind) in lb.cam_heads:
+            if kind == "code":
+                v0 = CODE_ADDR_BITS + 4
+                slots = [v0] + [v0 + 1 + j for j in range(IMM_NIBS)]
+            else:
+                b0 = ADDR_BITS + 3
+                slots = [b0 + j for j in range(NIB_PER_REG)]
+            for sl in slots:
+                fc = h * HDb + sl
+                if fc not in col_of:
+                    col_of[fc] = len(col_list); col_list.append(fc)
+        nc = len(col_list)
+        vals = _np.zeros((n, nc), dtype=_np.float32)
+        for (h, kind) in lb.cam_heads:
+            if kind == "code":
+                if code_op is None:
+                    continue
+                have = code_op >= 0                     # steps with an in-range fetch
+                rows = _np.nonzero(have)[0]
+                if rows.size == 0:
+                    continue
+                ops = code_op[rows]; imms = code_imm[rows]
+                v0 = CODE_ADDR_BITS + 4
+                vals[rows, col_of[h * HDb + v0]] = ops.astype(_np.float32)
+                for j in range(IMM_NIBS):
+                    vals[rows, col_of[h * HDb + v0 + 1 + j]] = \
+                        ((imms >> (4 * j)) & 0xF).astype(_np.float32)
+            else:
+                hc = _HC[kind]
+                # this head's reads: matching head code AND a valid step.
+                sel = (rhead == hc) & okr
+                if not sel.any():
+                    continue
+                rows = step_of_read[sel]
+                vv = rval[sel]
+                b0 = ADDR_BITS + 3
+                for j in range(NIB_PER_REG):
+                    vals[rows, col_of[h * HDb + b0 + j]] = \
+                        ((vv >> (4 * j)) & 0xF).astype(_np.float32)
+        out[lb.block_idx] = (vals, _np.asarray(col_list, dtype=_np.int64), HDb)
+    return out
+
+
+def _decode_targets_gpu(draft, mask, device):
+    """C4_SCHED_GPU_BUILD: vectorized decode-target extraction.  The frames are Python
+    dicts, so a SINGLE pass over ``frames`` pulls all six fields (pc/ax/sp/bp/is_halt/
+    is_file) into preallocated numpy arrays at once — iterating the Python dict list ONCE
+    (vs six separate ``np.fromiter`` generators, 6x the per-dict Python overhead) — then ONE
+    host->device transfer per lane.  Byte-identical to the per-step loop in
+    ``build_schedule`` (same fields, same masks)."""
+    import numpy as _np
+    n = draft.step_count
+    frames = draft.frames
+    _pc = _np.empty(n, dtype=_np.int64); _ax = _np.empty(n, dtype=_np.int64)
+    _sp = _np.empty(n, dtype=_np.int64); _bp = _np.empty(n, dtype=_np.int64)
+    _hl = _np.empty(n, dtype=_np.bool_); _fl = _np.empty(n, dtype=_np.bool_)
+    for s in range(n):
+        f = frames[s]
+        _pc[s] = f["pc"]; _ax[s] = f["ax"] & mask
+        _sp[s] = f["sp"] & 0xFFFFFFFF; _bp[s] = f["bp"] & 0xFFFFFFFF
+        _hl[s] = f.get("is_halt") or False; _fl[s] = f.get("is_file") or False
+    dev = torch.device(device)
+    return (torch.from_numpy(_pc).to(dev), torch.from_numpy(_ax).to(dev),
+            torch.from_numpy(_sp).to(dev), torch.from_numpy(_bp).to(dev),
+            torch.from_numpy(_hl).to(dev), torch.from_numpy(_fl).to(dev))
 
 
 def _build_cam_tables_loop(model, L, draft, code, live_blocks, device
@@ -750,7 +1058,21 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
     live_order = sorted(chm.keys())
     # PRECOMPUTE the whole-batch tables (vectorized where possible).
     onchip = onchip_residual_enabled()
+    sched, live_out_dims = _build_schedule_tables(model, L, code, draft, dev, live_blocks,
+                                                  onchip, mask)
+    chunk = _sched_chunk()
+    sg = PrecomputedStepGraph(model, L, dev, chunk, mega, live_blocks, live_order, mask,
+                              onchip=onchip, live_out_dims=live_out_dims)
+    return sched, sg
+
+
+def _build_schedule_tables(model, L, code, draft, dev, live_blocks, onchip, mask):
+    """Build the O(n) whole-batch schedule TABLES (query embed + ingest + CAM gather + decode
+    targets + on-chip W_o deltas).  Shared by ``build_schedule`` (first frame, also builds the
+    graph) and ``build_schedule_tables_only`` (continuous frames, reuses the captured graph).
+    Returns ``(PrecomputedSchedule, live_out_dims)``."""
     fast = _sched_fast_build()
+    gpu_build = _sched_gpu_build()               # C4_SCHED_GPU_BUILD (deep vectorization)
     # ON-CHIP FAST BUILD: the dense ``[K, Hb, HDb]`` cam_tables (~623 MB/block, 99.7% zeros)
     # are ONLY used to compute the compact ``W_o(cam_out)`` delta, then discarded (replay
     # uses the delta).  So skip materializing them on GPU entirely — build the delta DIRECTLY
@@ -758,10 +1080,17 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
     # tiny GEMM instead of a ``[K, D] @ [D, D]`` dense one on a 99.7%-zero input).  This is the
     # dominant build cost (~62% of the schedule build) at whole-frame K.  OFF (or non-onchip):
     # the dense cam_tables path (unchanged).
-    h0_table = _build_query_embed(model, L, code, draft, dev)          # [K, D]
-    ing_table = _build_ingest_table(model, L, draft, dev)             # [K, H0, HD0]
+    # C4_SCHED_GPU_BUILD: convert the ~30*n-token stream to numpy ONCE, shared by the
+    # query-embed + ingest-table + frame-decode builds (three consumers, one conversion).
+    toks_np = _draft_tokens_np(draft) if gpu_build else None
+    h0_table = _build_query_embed(model, L, code, draft, dev, toks_np=toks_np)   # [K, D]
+    ing_table = _build_ingest_table(model, L, draft, dev, toks_np=toks_np)      # [K, H0, HD0]
     if onchip and fast:
-        cam_sparse = _build_cam_sparse(draft, code, live_blocks)      # {b: (vals,cols,HDb)}
+        # C4_SCHED_GPU_BUILD: collapse the resolve_load_rows -> build_resolved_table ->
+        # _build_cam_sparse Python-dict chain into one vectorized numpy pass (the dominant
+        # ~70% of the schedule build at whole-frame K).  OFF -> the Python-dict _build_cam_sparse.
+        cam_sparse = (_build_cam_sparse_gpu(draft, code, live_blocks, dev) if gpu_build
+                      else _build_cam_sparse(draft, code, live_blocks))  # {b: (vals,cols,HDb)}
         cam_tables = {}                                               # dense not materialized
     else:
         cam_sparse = None
@@ -772,20 +1101,24 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
     n = draft.step_count
     frames = draft.frames
     import numpy as _np
-    _pc = _np.empty(n, dtype=_np.int64); _ax = _np.empty(n, dtype=_np.int64)
-    _sp = _np.empty(n, dtype=_np.int64); _bp = _np.empty(n, dtype=_np.int64)
-    _hl = _np.empty(n, dtype=_np.bool_); _fl = _np.empty(n, dtype=_np.bool_)
-    for s in range(n):
-        f = frames[s]
-        _pc[s] = f["pc"]; _ax[s] = f["ax"] & mask
-        _sp[s] = f["sp"] & 0xFFFFFFFF; _bp[s] = f["bp"] & 0xFFFFFFFF
-        _hl[s] = bool(f.get("is_halt")); _fl[s] = bool(f.get("is_file"))
-    want_pc = torch.from_numpy(_pc).to(dev)
-    want_ax = torch.from_numpy(_ax).to(dev)
-    want_sp = torch.from_numpy(_sp).to(dev)
-    want_bp = torch.from_numpy(_bp).to(dev)
-    is_halt = torch.from_numpy(_hl).to(dev)
-    is_file = torch.from_numpy(_fl).to(dev)
+    if gpu_build:
+        want_pc, want_ax, want_sp, want_bp, is_halt, is_file = _decode_targets_gpu(
+            draft, mask, dev)
+    else:
+        _pc = _np.empty(n, dtype=_np.int64); _ax = _np.empty(n, dtype=_np.int64)
+        _sp = _np.empty(n, dtype=_np.int64); _bp = _np.empty(n, dtype=_np.int64)
+        _hl = _np.empty(n, dtype=_np.bool_); _fl = _np.empty(n, dtype=_np.bool_)
+        for s in range(n):
+            f = frames[s]
+            _pc[s] = f["pc"]; _ax[s] = f["ax"] & mask
+            _sp[s] = f["sp"] & 0xFFFFFFFF; _bp[s] = f["bp"] & 0xFFFFFFFF
+            _hl[s] = bool(f.get("is_halt")); _fl[s] = bool(f.get("is_file"))
+        want_pc = torch.from_numpy(_pc).to(dev)
+        want_ax = torch.from_numpy(_ax).to(dev)
+        want_sp = torch.from_numpy(_sp).to(dev)
+        want_bp = torch.from_numpy(_bp).to(dev)
+        is_halt = torch.from_numpy(_hl).to(dev)
+        is_file = torch.from_numpy(_fl).to(dev)
     # ---- C4_ONCHIP_RESIDUAL: precompute the compact W_o(cam_out) deltas ONCE ----
     h0_folded = None
     cam_delta_tables = None
@@ -798,7 +1131,12 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
         # just ffn0(h0_folded) at replay (no ingest transpose / W_o0 GEMM in the graph).
         Wo0 = _wo_dense(model, 0, dev)
         ing_flat = ing_table.reshape(n, D)                    # [K, D] (H0*HD0 == D)
-        h0_folded = h0_table + ing_flat @ Wo0.transpose(0, 1)
+        # IN-PLACE fold into h0_table (it is dead after this — the onchip replay reads only
+        # h0_folded), so no separate 2.6 GB h0_folded allocation.  addmm_ avoids the [K,D]
+        # matmul temporary too.
+        h0_table.addmm_(ing_flat, Wo0.transpose(0, 1))
+        h0_folded = h0_table
+        del ing_flat
         # each live block: compact [K, n_out_b] delta + its out_dims.
         cam_delta_tables = {}
         live_out_dims = {}
@@ -815,26 +1153,49 @@ def build_schedule(model, L, code, draft, device, mask: int = 0xFFFFFFFF
                 vals = torch.from_numpy(vals_np).to(dev)                 # [K, n_active]
                 cols = torch.from_numpy(cols_np).to(dev)                 # [n_active]
                 Wo_sub = Wo.index_select(1, cols)                        # [D, n_active]
-                full = vals @ Wo_sub.transpose(0, 1)                     # [K, D] exact W_o(cam)
-                out_dims = (full.abs().sum(0) > 0).nonzero(as_tuple=False).flatten()
+                # SUPPORT-FIRST (VRAM-frugal): out_dims = the output dims W_o(cam) CAN be
+                # nonzero at = the rows of Wo with any nonzero over the active cam columns
+                # (data-independent — a [D, n_active] reduction, NOT a [K, D] matmul).  Then
+                # build the compact delta ``vals @ Wo_sub[out_dims].T`` = [K, n_out] DIRECTLY
+                # (n_out is a handful), never materializing the 2.44 GB [K, D] product.  Byte-
+                # exact: every column NOT in out_dims is exactly 0 for every row (same set the
+                # full-product .abs().sum(0)>0 selects — a row is nonzero only where Wo_sub is).
+                out_dims = (Wo_sub.abs().sum(1) > 0).nonzero(as_tuple=False).flatten()
                 if out_dims.numel() == 0:
-                    out_dims = torch.zeros(1, dtype=torch.long, device=full.device)
-                delta = full.index_select(1, out_dims).contiguous()
-                del vals, Wo_sub, full
+                    out_dims = torch.zeros(1, dtype=torch.long, device=vals.device)
+                delta = (vals @ Wo_sub.index_select(0, out_dims).transpose(0, 1)).contiguous()
+                del vals, Wo_sub
             else:
                 cam_flat = cam_tables[b].reshape(n, D)            # [K, D]
                 delta, out_dims = _build_wo_delta_table(cam_flat, Wo)
             cam_delta_tables[b] = delta
             live_out_dims[b] = out_dims
+    # ON-CHIP replay reads ONLY h0_folded + cam_delta_tables — ing_table / cam_tables are
+    # dead after the fold/delta build, so drop them (a big VRAM saving: ing_table is [K,D],
+    # freeing ~2.6 GB — critical for the continuous double-buffer where two schedules coexist).
+    if onchip:
+        ing_table = None
+        cam_tables = {}
     sched = PrecomputedSchedule(
         n_steps=n, h0_table=h0_table, ing_table=ing_table, cam_tables=cam_tables,
         want_pc=want_pc, want_sp=want_sp, want_bp=want_bp, want_ax=want_ax,
         is_halt=is_halt, is_file=is_file, onchip=onchip, h0_folded=h0_folded,
         cam_delta_tables=cam_delta_tables)
-    chunk = _sched_chunk()
-    sg = PrecomputedStepGraph(model, L, dev, chunk, mega, live_blocks, live_order, mask,
-                              onchip=onchip, live_out_dims=live_out_dims)
-    return sched, sg
+    return sched, live_out_dims
+
+
+def build_schedule_tables_only(model, L, code, draft, device, sg, mask: int = 0xFFFFFFFF
+                               ) -> "PrecomputedSchedule":
+    """Rebuild the O(n) schedule TABLES for a frame, REUSING an already-built (and captured)
+    ``PrecomputedStepGraph`` ``sg`` — the honest per-frame BUILD cost in a CONTINUOUS stream
+    (the megablock install + live-block map + graph capture are one-time; only the tables
+    recur per frame).  Returns a fresh ``PrecomputedSchedule`` whose tables the SAME captured
+    ``sg`` replays over.  Byte-identical tables to ``build_schedule``."""
+    dev = torch.device(device)
+    live_blocks = list(sg.live_blocks.values())
+    sched, _lod = _build_schedule_tables(model, L, code, draft, dev, live_blocks,
+                                         sg.onchip, mask)
+    return sched
 
 
 def _sched_chunk() -> int:
@@ -954,5 +1315,5 @@ def run_verify(model, L, code, draft, device, *, mask: int = 0xFFFFFFFF,
 
 
 __all__ = ["precomputed_schedule_enabled", "PrecomputedSchedule",
-           "PrecomputedStepGraph", "build_schedule", "run_verify",
-           "PrecomputedResult"]
+           "PrecomputedStepGraph", "build_schedule", "build_schedule_tables_only",
+           "run_verify", "PrecomputedResult"]

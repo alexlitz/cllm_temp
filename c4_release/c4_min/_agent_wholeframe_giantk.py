@@ -51,7 +51,7 @@ COMPOSED = ["C4_DEAD_BLOCK_FUSION", "C4_DIRECT_CAM_BATCHED", "C4_DIRECT_LOCAL_CA
             "C4_FLASH_ATTN", "C4_BANDED_LOCAL_ATTN", "C4_FUSED_MEGABLOCK",
             "C4_DIRECT_CAM_VEC"]
 LEVERS = ["C4_ONCHIP_RESIDUAL", "C4_RESIDENT_BATCH", "C4_PRECOMPUTED_SCHEDULE",
-          "C4_SCHED_CHUNK", "C4_SCHED_FAST_BUILD"]
+          "C4_SCHED_CHUNK", "C4_SCHED_FAST_BUILD", "C4_SCHED_GPU_BUILD"]
 
 
 def _composed_on():
@@ -59,7 +59,7 @@ def _composed_on():
         os.environ[f] = "1"
 
 
-def _lever(onchip, resident, chunk, fast_build):
+def _lever(onchip, resident, chunk, fast_build, gpu_build=True):
     for f, v in (("C4_ONCHIP_RESIDUAL", onchip), ("C4_RESIDENT_BATCH", resident)):
         if v:
             os.environ[f] = "1"
@@ -67,6 +67,9 @@ def _lever(onchip, resident, chunk, fast_build):
             os.environ.pop(f, None)
     os.environ["C4_SCHED_CHUNK"] = str(chunk)
     os.environ["C4_SCHED_FAST_BUILD"] = "1" if fast_build else "0"
+    # C4_SCHED_GPU_BUILD: the deep-vectorized on-device build (default ON here, the fast
+    # path).  Only meaningful with fast_build + onchip (the compact-sparse -> W_o-delta path).
+    os.environ["C4_SCHED_GPU_BUILD"] = "1" if (gpu_build and fast_build) else "0"
 
 
 def _clear_levers():
@@ -98,11 +101,12 @@ def _vram_gb():
 # instrumented single-dispatch: separate BUILD (schedule + graph capture) from
 # DISPATCH (the replay loop) from DECODE (the compare + reduction + DtoH).
 # ---------------------------------------------------------------------------
-def _timed_run(model, L, code, draft, device, chunk, onchip, resident, fast_build):
+def _timed_run(model, L, code, draft, device, chunk, onchip, resident, fast_build,
+               gpu_build=True):
     """Run the precomputed-schedule single dispatch, timing build / capture / dispatch /
     decode SEPARATELY.  Returns (result, timings_us_per_step_dict, wall_total_s)."""
     _composed_on()
-    _lever(onchip, resident, chunk, fast_build)
+    _lever(onchip, resident, chunk, fast_build, gpu_build=gpu_build)
     dev = torch.device(device)
     n = draft.step_count
     mask = 0xFFFFFFFF
@@ -200,6 +204,142 @@ def _timed_run(model, L, code, draft, device, chunk, onchip, resident, fast_buil
 
 
 # ---------------------------------------------------------------------------
+# CONTINUOUS steady-state: capture the graph ONCE, then run build+dispatch for SEVERAL
+# consecutive frames back-to-back and report the honest per-frame time with the one-time
+# capture amortized OUT.  This is the real-time-relevant number the 4.11 s single-shot
+# obscures (a continuous doom render keeps the graph resident across frames — only the
+# per-frame schedule BUILD + graph REPLAY recur).  Optionally PIPELINE build(N+1) with
+# dispatch(N) via a double-buffer so continuous per-frame -> ~max(build, dispatch).
+# ---------------------------------------------------------------------------
+def _continuous_steady_state(model, L, code, draft, device, chunk, resident, gpu_build,
+                             n_frames=4, pipeline=False):
+    """Returns a dict: mean per-frame BUILD s, DISPATCH s, and continuous per-frame s
+    (build+dispatch, capture amortized out) over ``n_frames`` consecutive frames on the
+    SAME captured graph.  ``pipeline=True`` overlaps build(N+1) with dispatch(N) on a
+    second CUDA stream (double-buffer) so continuous per-frame -> ~max(build, dispatch).
+
+    Retries with a HALVED graph chunk on OOM (the earlier gpu/dict comparison runs leave
+    CUDA-graph pools resident; a smaller graph chunk fits alongside them — byte-identical,
+    the schedule is still built ONCE, the ONE graph replays over more chunks)."""
+    from c4_min import precomputed_schedule as PS
+    dev = torch.device(device)
+    n = draft.step_count
+    mask = 0xFFFFFFFF
+    while True:
+        try:
+            return _continuous_steady_state_at(model, L, code, draft, device, chunk,
+                                               resident and n <= chunk, gpu_build,
+                                               n_frames, pipeline, dev, n, mask)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" not in str(e).lower() or chunk <= 8192:
+                raise
+            _clear_levers(); gc.collect(); torch.cuda.empty_cache()
+            chunk //= 2
+            print(f"      [continuous OOM -> retry chunk={chunk}]", flush=True)
+
+
+def _continuous_steady_state_at(model, L, code, draft, device, chunk, resident, gpu_build,
+                                n_frames, pipeline, dev, n, mask):
+    from c4_min import precomputed_schedule as PS
+    _composed_on()
+    _lever(True, resident, chunk, True, gpu_build=gpu_build)
+
+    # ---- capture the graph ONCE (build a schedule, do one dispatch to capture). ----
+    sched, sg = PS.build_schedule(model, L, code, draft, dev, mask=mask)
+    onchip_ = sched.onchip
+    h0_src = sched.h0_folded if onchip_ else sched.h0_table
+    resident_ = resident and n <= sg.chunk
+
+    def _dispatch_once(sched_, sg_):
+        got_pc = torch.empty(n, dtype=torch.long, device=dev)
+        got_sp = torch.empty(n, dtype=torch.long, device=dev)
+        got_bp = torch.empty(n, dtype=torch.long, device=dev)
+        got_ax = torch.empty(n, dtype=torch.long, device=dev)
+        h0s = sched_.h0_folded if onchip_ else sched_.h0_table
+        for lo in range(0, n, sg_.chunk):
+            hi = min(lo + sg_.chunk, n)
+            h0 = h0s[lo:hi].unsqueeze(0)
+            if onchip_:
+                delta = {b: t[lo:hi] for b, t in sched_.cam_delta_tables.items()}
+                pc_c, sp_c, bp_c, ax_c = sg_.replay(h0, None, None, delta=delta,
+                                                    resident=resident_)
+            else:
+                ing = sched_.ing_table[lo:hi].permute(1, 0, 2).unsqueeze(0)
+                cam = {b: t[lo:hi].permute(1, 0, 2).unsqueeze(0)
+                       for b, t in sched_.cam_tables.items()}
+                pc_c, sp_c, bp_c, ax_c = sg_.replay(h0, ing, cam, resident=resident_)
+            got_pc[lo:hi].copy_(pc_c); got_sp[lo:hi].copy_(sp_c)
+            got_bp[lo:hi].copy_(bp_c); got_ax[lo:hi].copy_(ax_c)
+        return got_pc, got_sp, got_bp, got_ax
+
+    # producing replay = graph capture (one-time, amortized out).  Then FREE the initial
+    # schedule's tables (the captured graph ``sg`` has its OWN static buffers — resident=False
+    # multi-chunk — so it no longer needs ``sched``'s tables; each continuous frame rebuilds
+    # its own tables and reuses the SAME captured ``sg``).  This keeps VRAM at ONE schedule.
+    torch.cuda.synchronize(dev)
+    _dispatch_once(sched, sg)
+    torch.cuda.synchronize(dev)
+    del sched
+    gc.collect(); torch.cuda.empty_cache()
+
+    # ---- continuous frames: rebuild the schedule tables ONLY + replay the SAME captured
+    # graph ``sg``.  ``_build_schedule_tables_only`` builds the O(n) tables WITHOUT
+    # re-installing the megablock / re-creating (and re-capturing) the graph — the honest
+    # per-frame BUILD.  Free each frame's tables before the next build (one schedule at a
+    # time -> no 2x VRAM). ----
+    if not pipeline:
+        build_s = []; disp_s = []
+        s2 = None
+        for _ in range(n_frames):
+            del s2; gc.collect(); torch.cuda.empty_cache()
+            torch.cuda.synchronize(dev); t0 = time.perf_counter()
+            s2 = PS.build_schedule_tables_only(model, L, code, draft, dev, sg, mask=mask)
+            torch.cuda.synchronize(dev); build_s.append(time.perf_counter() - t0)
+            torch.cuda.synchronize(dev); t0 = time.perf_counter()
+            _dispatch_once(s2, sg)      # replay the ALREADY-captured graph over frame N tables
+            torch.cuda.synchronize(dev); disp_s.append(time.perf_counter() - t0)
+        del s2; gc.collect(); torch.cuda.empty_cache()
+        b = sum(build_s) / len(build_s)
+        d = sum(disp_s) / len(disp_s)
+        per_frame = b + d
+        mode = "serial"
+    else:
+        # DOUBLE-BUFFER PIPELINE: build(N+1) on a side stream while dispatch(N) replays the
+        # graph.  The build is CPU/numpy + small device transfers (independent of the graph
+        # replay's kernels), so overlapping them hides the smaller of the two.  We measure
+        # the wall of n_frames of (issue build(N+1) async || dispatch(N)) -> ~max(build,disp).
+        side = torch.cuda.Stream(device=dev)
+        # prime: build frame 0's tables (reusing the captured graph sg; sched freed above).
+        cur = PS.build_schedule_tables_only(model, L, code, draft, dev, sg, mask=mask)
+        torch.cuda.synchronize(dev)
+        build_s = []; disp_s = []
+        t_all0 = time.perf_counter()
+        nxt_holder = {}
+        for i in range(n_frames):
+            # start build(N+1) on the side stream (concurrent with dispatch(N)).
+            tb0 = time.perf_counter()
+            with torch.cuda.stream(side):
+                nxt_holder["s"] = PS.build_schedule_tables_only(model, L, code, draft, dev,
+                                                               sg, mask=mask)
+            tb = time.perf_counter() - tb0
+            # dispatch(N) on the default stream (the captured graph replay).
+            td0 = time.perf_counter()
+            _dispatch_once(cur, sg)
+            td = time.perf_counter() - td0
+            torch.cuda.synchronize(dev)      # both streams done for this frame
+            build_s.append(tb); disp_s.append(td)
+            cur = nxt_holder["s"]            # frame N's tables freed here (double-buffer)
+        torch.cuda.synchronize(dev)
+        per_frame = (time.perf_counter() - t_all0) / n_frames
+        b = sum(build_s) / len(build_s)
+        d = sum(disp_s) / len(disp_s)
+        mode = "pipelined"
+    _clear_levers()
+    return {"build_s": b, "dispatch_s": d, "per_frame_s": per_frame,
+            "n": n, "mode": mode, "n_frames": n_frames}
+
+
+# ---------------------------------------------------------------------------
 def find_big_divfree(model, L, device, target=RENDER_REDUCED_FRAME):
     """Find the largest DIV-free program that fully verifies (accepted==step_count),
     aiming near `target` steps.  Try nested loops (byte-safe) of increasing size.  The
@@ -265,46 +405,50 @@ def byte_exact(model, L, device):
     progs.append(("nested_12_28", build_nested(12, 28)[0]))   # deep nested loop
     all_ok = True
     install_composed(model, verbose=False)
-    print(f"{'prog':>18} {'steps':>7} {'fast(acc,fin,m)':>20} {'loop(acc,fin,m)':>20} "
-          f"{'Linf':>5} {'ok':>4}", flush=True)
+    print(f"{'prog':>18} {'steps':>7} {'gpu(acc,fin,m)':>20} {'loop(acc,fin,m)':>20} "
+          f"{'Lgpu':>5} {'Ldict':>6} {'ok':>4}", flush=True)
     try:
         for name, code in progs:
             draft = draft_pf_program(code, max_steps=200000, mask=0xFFFFFFFF)
             if not draft.halted:
                 continue
             chunk = max(4096, draft.step_count)
-            # FAST build (vectorized), on-chip + resident.
+            # GPU-BUILD (deep-vectorized), on-chip + resident.
+            rg, _ = _timed_run(model, L, code, draft, device, chunk,
+                               onchip=True, resident=True, fast_build=True, gpu_build=True)
+            # DICT-FAST build (numpy-dict, gpu_build OFF), on-chip + resident.
             rf, _ = _timed_run(model, L, code, draft, device, chunk,
-                               onchip=True, resident=True, fast_build=True)
+                               onchip=True, resident=True, fast_build=True, gpu_build=False)
             # LOOP build (original per-step loop), on-chip + resident.
             rl, _ = _timed_run(model, L, code, draft, device, chunk,
-                               onchip=True, resident=True, fast_build=False)
-            # per-step AX/PC/SP/BP L-inf between fast and loop builds (byte-exact check).
-            linf = 0
+                               onchip=True, resident=True, fast_build=False, gpu_build=False)
+            # per-step AX/PC/SP/BP L-inf: gpu-vs-dict AND dict-vs-loop (byte-exact chain).
+            linf_gpu = 0    # gpu-build vs dict-build
+            linf_dict = 0   # dict-build vs loop-build
             for k in ("got_pc", "got_sp", "got_bp", "got_ax"):
-                d = (rf[k] != rl[k]).sum().item()
-                linf = max(linf, d)
-            f = (rf["accepted_steps"], rf["final_ax"], rf["all_matched"])
-            g = (rl["accepted_steps"], rl["final_ax"], rl["all_matched"])
-            draft_exact = (rf["all_matched"] and rf["accepted_steps"] == draft.step_count
-                           and rf["final_ax"] == draft.final_ax_masked)
-            ok = (f == g) and (linf == 0) and draft_exact
+                linf_gpu = max(linf_gpu, (rg[k] != rf[k]).sum().item())
+                linf_dict = max(linf_dict, (rf[k] != rl[k]).sum().item())
+            g = (rg["accepted_steps"], rg["final_ax"], rg["all_matched"])
+            lo = (rl["accepted_steps"], rl["final_ax"], rl["all_matched"])
+            draft_exact = (rg["all_matched"] and rg["accepted_steps"] == draft.step_count
+                           and rg["final_ax"] == draft.final_ax_masked)
+            ok = (g == lo) and (linf_gpu == 0) and (linf_dict == 0) and draft_exact
             all_ok = all_ok and ok
-            print(f"{name:>18} {draft.step_count:>7} {str(f):>20} {str(g):>20} "
-                  f"{linf:>5} {'OK' if ok else 'FAIL':>4}", flush=True)
+            print(f"{name:>18} {draft.step_count:>7} {str(g):>20} {str(lo):>20} "
+                  f"{linf_gpu:>5} {linf_dict:>6} {'OK' if ok else 'FAIL':>4}", flush=True)
             if not ok:
-                print(f"    fast first_mismatch={rf['first_mismatch']}", flush=True)
+                print(f"    gpu first_mismatch={rg['first_mismatch']}", flush=True)
                 print(f"    loop first_mismatch={rl['first_mismatch']}", flush=True)
             _guard()
     finally:
         uninstall_composed(model)
-    print(f"\n  -> {'ALL BYTE-EXACT (Linf=0)' if all_ok else 'DIVERGENCE FOUND'}",
+    print(f"\n  -> {'ALL BYTE-EXACT (Linf=0: gpu==dict==loop==K=1 ref)' if all_ok else 'DIVERGENCE FOUND'}",
           flush=True)
     return all_ok
 
 
 # ---------------------------------------------------------------------------
-def measure_wholeframe(model, L, device, name, code, draft):
+def measure_wholeframe(model, L, device, name, code, draft, skip_loop_build=True):
     n = draft.step_count
     fv, tv = _vram_gb()
     print(f"\n=== TASK 1-3: WHOLE-FRAME GIANT-K single dispatch — '{name}', {n} DIV-free "
@@ -315,11 +459,12 @@ def measure_wholeframe(model, L, device, name, code, draft):
         # Try chunk >= n (whole frame = ONE resident single-chunk graph).  If that OOMs the
         # graph capture / FFN activation, fall back to the largest chunk that fits — the
         # single-dispatch model still holds (schedule built ONCE, graph replays per chunk).
-        def _try(chunk, resident, fast_build):
+        def _try(chunk, resident, fast_build, gpu_build=True):
             gc.collect(); torch.cuda.empty_cache()
             try:
                 return _timed_run(model, L, code, draft, device, chunk,
-                                  onchip=True, resident=resident, fast_build=fast_build)
+                                  onchip=True, resident=resident, fast_build=fast_build,
+                                  gpu_build=gpu_build)
             except torch.cuda.OutOfMemoryError as e:
                 _clear_levers()
                 gc.collect(); torch.cuda.empty_cache()
@@ -375,36 +520,49 @@ def measure_wholeframe(model, L, device, name, code, draft):
         # cam_tables path OOMs at the vec-build's chunk — a fair build-cost comparison.  (The
         # dense loop-build materialises 3x ~2.6 GB dense cam_tables + a [K,D]@[D,D] GEMM, so
         # the vec/sparse build ALSO cuts build VRAM, enabling the larger graph chunk.)
-        print("\n  --- build minimization (C4_SCHED_FAST_BUILD): loop vs vectorized ---",
+        print("\n  --- build minimization: GPU-build vs dict-build vs loop-build ---",
               flush=True)
         _guard()
-        rf, tf = _try(chunk, resident=resident, fast_build=True)
-        print(f"    vec-build  : build {tf['build_s']*1e3:9.1f} ms  "
+        # GPU-BUILD (deep-vectorized, C4_SCHED_GPU_BUILD): the default fast path.
+        rf, tf = _try(chunk, resident=resident, fast_build=True, gpu_build=True)
+        print(f"    gpu-build  : build {tf['build_s']*1e3:9.1f} ms  "
               f"({tf['build_us']:8.2f} us/step)  chunk={chunk}  matched={rf['all_matched']}",
               flush=True)
         gc.collect(); torch.cuda.empty_cache(); _guard()
-        loop_chunk = chunk
+        # DICT-BUILD (numpy-sparse, gpu_build OFF): the prior fast path (baseline 5.05).
+        _rd = _try(chunk, resident=resident, fast_build=True, gpu_build=False)
+        rd, td = _rd if _rd is not None else (None, None)
+        if td is not None:
+            print(f"    dict-build : build {td['build_s']*1e3:9.1f} ms  "
+                  f"({td['build_us']:8.2f} us/step)  chunk={chunk}  matched={rd['all_matched']}"
+                  f"   -> GPU-build speedup {td['build_s']/max(tf['build_s'],1e-9):.2f}x "
+                  f"({td['build_us']:.2f} -> {tf['build_us']:.2f} us/step)", flush=True)
+        gc.collect(); torch.cuda.empty_cache(); _guard()
+        # LOOP-BUILD (original per-step, dense cam_tables) — OOMs at whole-frame K; only
+        # attempt when explicitly requested (slow OOM-retry cascade).
         rl = tl = None
-        while rl is None and loop_chunk >= 8192:
-            r = _try(loop_chunk, resident=(resident and loop_chunk >= n), fast_build=False)
-            if r is not None:
-                rl, tl = r
-                break
-            print(f"    [loop-build OOM @ chunk={loop_chunk} — dense cam_tables path; "
-                  f"retry smaller]", flush=True)
-            loop_chunk //= 2
-            gc.collect(); torch.cuda.empty_cache()
-        if tl is not None:
-            print(f"    loop-build : build {tl['build_s']*1e3:9.1f} ms  "
-                  f"({tl['build_us']:8.2f} us/step)  chunk={loop_chunk}  "
-                  f"matched={rl['all_matched']}", flush=True)
-            print(f"    -> BUILD speedup {tl['build_s']/max(tf['build_s'],1e-9):.2f}x "
-                  f"({tl['build_us']:.1f} -> {tf['build_us']:.1f} us/step)  "
-                  f"[vec/sparse build also fits a {chunk//loop_chunk}x larger graph chunk]",
-                  flush=True)
+        loop_chunk = chunk
+        if not skip_loop_build:
+            while rl is None and loop_chunk >= 8192:
+                r = _try(loop_chunk, resident=(resident and loop_chunk >= n), fast_build=False,
+                         gpu_build=False)
+                if r is not None:
+                    rl, tl = r
+                    break
+                print(f"    [loop-build OOM @ chunk={loop_chunk} — dense cam_tables path; "
+                      f"retry smaller]", flush=True)
+                loop_chunk //= 2
+                gc.collect(); torch.cuda.empty_cache()
+            if tl is not None:
+                print(f"    loop-build : build {tl['build_s']*1e3:9.1f} ms  "
+                      f"({tl['build_us']:8.2f} us/step)  chunk={loop_chunk}  "
+                      f"matched={rl['all_matched']}", flush=True)
+            else:
+                print(f"    loop-build : OOM at every chunk (dense cam_tables too big) — the "
+                      f"vec/sparse build is REQUIRED at this K", flush=True)
         else:
-            print(f"    loop-build : OOM at every chunk (dense cam_tables too big) — the "
-                  f"vec/sparse build is REQUIRED at this K", flush=True)
+            print(f"    loop-build : [skipped — OOMs at whole-frame K, dense cam_tables "
+                  f"3x2.6GB won't fit; --no-skip-loop-build to force]", flush=True)
 
         # ---- the honest per-frame breakdown (vectorized build, on-chip, resident) ----
         t = tf
@@ -458,6 +616,39 @@ def measure_wholeframe(model, L, device, name, code, draft):
         print(f"    {t['e2e_s']*1e3:.2f} ms/frame = {t['e2e_s']:.4f} s/frame  "
               f"{1.0/t['e2e_s']:.2f} fps  vs 1s={t['e2e_s']:.3f}x  "
               f"vs 35fps={t['e2e_s']/FPS35_S:.1f}x  (n={n} steps)", flush=True)
+
+        # ================================================================
+        # HONEST CONTINUOUS STEADY-STATE (capture amortized OUT): the real-time number.
+        # Capture the graph ONCE, then measure build+dispatch over consecutive frames.
+        # ================================================================
+        print(f"\n  === HONEST CONTINUOUS STEADY-STATE (capture amortized out) ===",
+              flush=True)
+        gc.collect(); torch.cuda.empty_cache(); _guard()
+        cs = _continuous_steady_state(model, L, code, draft, device, chunk, resident,
+                                      gpu_build=True, n_frames=4, pipeline=False)
+        b_ss, d_ss, pf_ss = cs["build_s"], cs["dispatch_s"], cs["per_frame_s"]
+        print(f"    serial   : build {b_ss*1e3:8.2f} ms + dispatch {d_ss*1e3:8.2f} ms "
+              f"= {pf_ss*1e3:8.2f} ms/frame  (n={n})", flush=True)
+        gc.collect(); torch.cuda.empty_cache(); _guard()
+        cp = _continuous_steady_state(model, L, code, draft, device, chunk, resident,
+                                      gpu_build=True, n_frames=4, pipeline=True)
+        pf_pipe = cp["per_frame_s"]
+        print(f"    pipelined: build(N+1)||dispatch(N) double-buffer "
+              f"= {pf_pipe*1e3:8.2f} ms/frame  (~max(build,dispatch); "
+              f"build {cp['build_s']*1e3:.1f} disp {cp['dispatch_s']*1e3:.1f})", flush=True)
+        # extrapolate the CONTINUOUS per-frame (build + dispatch scale ~linearly in n).
+        print(f"\n    --- CONTINUOUS per-frame @ target step counts (capture amortized "
+              f"out) ---", flush=True)
+        for label, fsteps in (("render-reduced", RENDER_REDUCED_FRAME), ("raw", RAW_FRAME)):
+            pf_ser = pf_ss * (fsteps / n)
+            pf_pip = pf_pipe * (fsteps / n)
+            print(f"    {label:>15} ({fsteps:>9} steps): "
+                  f"serial {pf_ser:.4f} s/frame ({1.0/pf_ser:6.2f} fps, "
+                  f"{pf_ser/REALTIME_S:.2f}x 1s, {pf_ser/FPS35_S:.1f}x 35fps)  |  "
+                  f"pipelined {pf_pip:.4f} s/frame ({1.0/pf_pip:6.2f} fps, "
+                  f"{pf_pip/REALTIME_S:.2f}x 1s)", flush=True)
+        t["cont_serial_s"] = pf_ss; t["cont_pipe_s"] = pf_pipe
+        t["cont_build_s"] = b_ss; t["cont_dispatch_s"] = d_ss
         return t
     finally:
         uninstall_composed(model)
@@ -469,6 +660,8 @@ def main(argv=None):
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--skip-byte-exact", action="store_true")
     ap.add_argument("--target", type=int, default=RENDER_REDUCED_FRAME)
+    ap.add_argument("--no-skip-loop-build", action="store_true",
+                    help="force the (slow, OOMs @ whole-frame K) loop-build comparison")
     args = ap.parse_args(argv)
     _guard()
     device = args.device
@@ -495,7 +688,8 @@ def main(argv=None):
         print("  no large DIV-free program found", flush=True)
     else:
         name, code, draft = big
-        measure_wholeframe(model, L, device, name, code, draft)
+        measure_wholeframe(model, L, device, name, code, draft,
+                           skip_loop_build=not args.no_skip_loop_build)
     print(f"\n{'=== WHOLE-FRAME GIANT-K COMPLETE ===' if ok else '=== BYTE-EXACT FAILED ==='}",
           flush=True)
     return 0 if ok else 1
