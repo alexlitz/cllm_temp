@@ -5,6 +5,7 @@
 ## Quick Navigation
 
 ### Core Architecture
+- [DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md](DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md) - **★ Finalization capstone** — Doom + a general C toolchain byte-exact on the transformer (default golden `7d4afe61`)
 - [README.md](README.md) - Main architecture overview
 - [OPCODE_TABLE.md](OPCODE_TABLE.md) - Complete opcode reference
 - [C4_NATIVE_VM.md](C4_NATIVE_VM.md) - Native C4 VM implementation

@@ -4,8 +4,9 @@ Where does the DOOM-specific work end and the GENERAL c4-VM core (the one that r
 program — Mandelbrot, the 1096 corpus, a quine, self-emulation) begin? This maps the
 boundary at the FLAG level and the MODULE level and gives the honest verdict.
 
-Generated 2026-08-06. Golden `069cc32f` re-confirmed intact
-(`python -m c4_min._fingerprint_build`). **Docs-only.**
+Generated 2026-08-06. Default golden `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON — the
+general-correctness fix; `069cc32f` is the `C4_BP_RESTORE_HIBYTE=0` rollback), re-confirmed
+intact (`python -m c4_min._fingerprint_build`). **Docs-only.**
 
 Companion: [`DOOM_FLAG_REGISTRY.md`](DOOM_FLAG_REGISTRY.md) (per-flag table),
 [`FLAG_REGISTRY.md`](FLAG_REGISTRY.md) (`neural_vm/` + `tools/` flags),
@@ -19,9 +20,10 @@ Companion: [`DOOM_FLAG_REGISTRY.md`](DOOM_FLAG_REGISTRY.md) (per-flag table),
 
 1. **By-flag:** every doom / perf-stack lever is a **DEFAULT-OFF** `C4_*` env flag. With
    all doom flags OFF (the default), the build IS the general VM and the golden
-   fingerprint is `069cc32f` (verified). The two golden-MOVING doom flags
-   (`C4_DOOM_DRAWSPAN`, `C4_INGEST_WIDE`) are also DEFAULT-OFF, so `069cc32f` is the
-   flag-OFF general-core golden.
+   fingerprint is `7d4afe61` (verified) — this is the default build with the
+   general-correctness fix `C4_BP_RESTORE_HIBYTE` DEFAULT-ON (`=0` rolls back to the
+   pre-fix `069cc32f`). The two golden-MOVING doom flags (`C4_DOOM_DRAWSPAN`,
+   `C4_INGEST_WIDE`) are also DEFAULT-OFF, so `7d4afe61` is the flag-OFF general-core golden.
 2. **By-module:** the doom render macros live in **dedicated modules** (`doom_*.py`) and
    the general core (`isa.py`, `qwen_full_vm.py`, `qwen_vanilla_vm.py`,
    `nibble_pure_forward_complete.py`, the compiler/transpiler) **does not import a single
@@ -40,8 +42,8 @@ DEFAULT-**ON** (`C4_SCHED_FAST_BUILD`, `C4_DIRECT_CAM_LIVE_LOCAL`,
 `C4_BLOCK0_DROP_DEAD_KV`, `C4_MATERIALIZE_IDEMPOTENT`, `C4_OVERLAY_PRECOMPUTE`,
 `C4_KV_STACK`, `C4_LEA_Q_SNAP`, `C4_LIVE_HEADS_MEMO`) — but they are all
 registry-classified `byte-exact` execution/runtime knobs (they change HOW the forward is
-scheduled, not WHAT weights exist), and the golden `069cc32f` is computed WITH them at
-their defaults. They are general-VM perf infrastructure, not doom-specific.
+scheduled, not WHAT weights exist), and the default golden `7d4afe61` is computed WITH them
+at their defaults. They are general-VM perf infrastructure, not doom-specific.
 
 ---
 
@@ -53,7 +55,7 @@ their defaults. They are general-VM perf infrastructure, not doom-specific.
 |---|---|---|
 | `C4_DOOM_FAST` | ★ one-toggle composite for the whole byte-exact fast-doom stack (19 members) | byte-exact |
 | `C4_DOOM_DRAWCOL` | native DRAWCOL / DRAWSPANF render-macro opcodes (48/49) — textured wall column / floor span | byte-exact (band widens only on) |
-| `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — V_DrawPatch column copy | **golden-MOVING on** (`2f69350f…`); OFF = `069cc32f` |
+| `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — V_DrawPatch column copy | **golden-MOVING on** (ON `2f69350f…` measured on the old `069cc32f` base; shifts under the new default); OFF = the default `7d4afe61` |
 | `C4_DOOM_BLIT` | doom framebuffer blit macro | byte-exact |
 | `C4_DOOM_NAMEEQ` | fused 8-char WAD lump-name compare (#828) | byte-exact |
 | `C4_DOOM_FIXEDPOINT` | native fixed-point MAC for the doom renderer | byte-exact |
@@ -143,8 +145,9 @@ substrate the 1096 corpus and the `neural_vm/`-era campaign run on.
   `DRAWSPANF = 49` and the float ops (40-43) all sit above the golden 40-band and only
   widen it (`NUM_OPS_DRAWSPAN=48`, `NUM_OPS_DRAWCOL=50`, `NUM_OPS_FLOAT=44`) when their
   DEFAULT-OFF gate fires. So with doom off the ISA one-hot layout is byte-identical.
-- **Golden gate:** `c4_min._fingerprint_build` = `069cc32f…c0ca` with everything at
-  defaults — this IS the general VM, and it is what Mandelbrot runs on.
+- **Golden gate:** `c4_min._fingerprint_build` = `7d4afe61` with everything at
+  defaults (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON) — this IS the general VM, and it is what
+  Mandelbrot runs on byte-exact (`=0` rolls back to the pre-fix `069cc32f`).
 - **Mandelbrot uses the general build:** `mandelbrot_native.py` / `lean_mandelbrot.py` /
   `_mandel_run.py` bake through `qwen_full_vm.build` / the compact streaming build with
   NO doom flag — the general-program byte-exactness proof (per the consolidate commit
@@ -157,8 +160,9 @@ substrate the 1096 corpus and the `neural_vm/`-era campaign run on.
 
 **Yes — on both axes.**
 
-- **Excludable by flag:** unset every `C4_DOOM_*` (the default) → the general VM, golden
-  `069cc32f`. `C4_DOOM_FAST=1 C4_BLOCK0_DK=0` shows even the composite honors per-member
+- **Excludable by flag:** unset every `C4_DOOM_*` (the default) → the general VM, default
+  golden `7d4afe61` (`=0` on `C4_BP_RESTORE_HIBYTE` rolls back to `069cc32f`).
+  `C4_DOOM_FAST=1 C4_BLOCK0_DK=0` shows even the composite honors per-member
   opt-out (`setdefault` semantics).
 - **Excludable by module:** you could delete the `doom_*.py` files and the general core
   still imports and builds (nothing imports them). The only residue would be the two
@@ -176,5 +180,7 @@ hazard flagged in `DOOM_FLAG_REGISTRY.md`, not a doom/general entanglement.
 
 ## Golden safety
 
-Golden `069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca` re-confirmed.
+Default golden `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON) re-confirmed; the
+`C4_BP_RESTORE_HIBYTE=0` rollback build is
+`069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca`.
 This doc adds no build/weight change.

@@ -5,7 +5,8 @@ How does `qwen_full_vm.build(subset, code_size, …)` (and the vanilla-loop anal
 the op-set it must cover, which stock HF (Qwen2) configs can host which subset, and is it
 Qwen2-only or could it target other HF architectures?
 
-Generated 2026-08-06. Golden `069cc32f` re-confirmed intact. **Docs-only.** The shape
+Generated 2026-08-06. Default golden `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON;
+`069cc32f` is the `=0` rollback) re-confirmed intact. **Docs-only.** The shape
 table below was produced by MATERIALIZING / accounting the REAL builders on this branch
 (`f5f31bd8`), not copied from an older doc.
 
@@ -195,6 +196,8 @@ res = S.fit(target="stock-0.5b", ops=S.FULL, minimize="depth")   # honestly INFE
 
 ## Golden safety
 
-Golden `069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca` re-confirmed
-via `python -m c4_min._fingerprint_build`. The base-subset build + spec accounting above
-materialize/inspect models but write no repo state. This doc adds no build/weight change.
+Default golden `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON) re-confirmed
+via `python -m c4_min._fingerprint_build`; the `C4_BP_RESTORE_HIBYTE=0` rollback build is
+`069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca`. The base-subset build +
+spec accounting above materialize/inspect models but write no repo state. This doc adds no
+build/weight change.

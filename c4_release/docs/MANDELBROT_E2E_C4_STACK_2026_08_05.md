@@ -3,7 +3,10 @@
 Can we run a Mandelbrot on the c4 transformer in reasonable time, and is the
 draft / HF path there today? Measured across **compile → draft → transformer →
 HF-config**, plus the float caveat. Read-only measurement (authors NO weights;
-golden `069cc32f` untouched). Harness: `c4_min/_agent_mandelbrot_e2e.py`.
+golden untouched — this 2026-08-05 snapshot was taken against the then-default golden
+`069cc32f`, which is now the `C4_BP_RESTORE_HIBYTE=0` rollback; the default golden moved to
+`7d4afe61` on 2026-08-06 when the general-correctness fix went DEFAULT-ON).
+Harness: `c4_min/_agent_mandelbrot_e2e.py`.
 
 ## TL;DR
 
@@ -123,7 +126,7 @@ every multiply/divide is a native integer MUL/DIV on the 32-bit ALU. No soft-flo
 subroutine and no native-FP32 opcode is exercised.
 
 For reference, a genuinely-float Mandelbrot would pay the #800 cost: native-FP32
-(`C4_FLOAT_OPS`, default OFF, golden `069cc32f` unchanged) is bit-exact on
+(`C4_FLOAT_OPS`, default OFF, default golden `7d4afe61` unchanged) is bit-exact on
 normal×normal (f32add 620/676, misses = ±0/subnormal specials) but the byte-exact
 `F_DIV` is a ~26-step restoring-division megablock (deep). Fixed-point sidesteps all
 of it — one MUL + one DIV per complex multiply — which is exactly why the c4

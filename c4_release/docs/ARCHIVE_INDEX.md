@@ -6,8 +6,9 @@ prior-session perf levers, and the findings/measurement branches. It answers the
 question "is old / superseded work preserved and indexed, or is it about to be
 GC'd?".
 
-Generated 2026-08-06. Golden `069cc32f` (re-confirmed intact via
-`c4_min._fingerprint_build`). **Docs-only; no weight/build change.**
+Generated 2026-08-06. Default golden `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON;
+`069cc32f` is the `C4_BP_RESTORE_HIBYTE=0` rollback build), re-confirmed intact via
+`c4_min._fingerprint_build`. **Docs-only; no weight/build change.**
 
 Companion docs:
 - [`DOC_ARCHIVE_MANIFEST_2026_07_23.md`](DOC_ARCHIVE_MANIFEST_2026_07_23.md) — archives
@@ -149,8 +150,9 @@ git fsck --no-reflogs --unreachable 2>/dev/null | awk '/^unreachable commit/{pri
 
 ## Golden safety
 
-- Golden fingerprint `069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca`
-  (short `069cc32f`) re-confirmed via `python -m c4_min._fingerprint_build`.
+- Default golden fingerprint `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON) re-confirmed
+  via `python -m c4_min._fingerprint_build`; the `C4_BP_RESTORE_HIBYTE=0` rollback build is
+  `069cc32fa7cecfbceae448a7dbf6e2140b3db6cf6857c8accec5639b9c55c0ca` (short `069cc32f`).
 - Every negative-result / lever branch above lands its work behind a **DEFAULT-OFF**
   `C4_*` flag, so even if merged the golden flag-OFF gate is unchanged by construction.
 - This doc adds no build/weight change.

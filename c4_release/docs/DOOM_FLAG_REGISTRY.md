@@ -51,8 +51,8 @@ are deliberately omitted.
 
 `C4_DOOM_FAST=1` turns on the whole byte-exact winning fast-doom stack with ONE flag
 (module `c4_min/doom_fast.py`, helper `expand_doom_fast()`).  Every member is a
-DEFAULT-OFF `byte-exact` flag below, so the composite is golden-safe (`069cc32f`
-unchanged unset AND set).  Members are set with `setdefault` semantics — a member you
+DEFAULT-OFF `byte-exact` flag below, so the composite is golden-safe (the default golden
+`7d4afe61` unchanged unset AND set).  Members are set with `setdefault` semantics — a member you
 set BY HAND (incl. `=0` to opt out) always wins.  The 19 members are:
 
 ```
@@ -231,8 +231,8 @@ docs task).
 ### Build-family selectors (DOOM/perf-fleet build — `doom-build`, golden gate unchanged)
 
 These change the DOOM recurrent build's ISA/semantics (`build_lib_model_streaming` /
-`qwen_full_vm`) but not the `build_compact_sparse_streaming` golden gate, so `069cc32f`
-is unchanged.  Several are MUTUALLY-EXCLUSIVE or interacting build-family selectors
+`qwen_full_vm`) but not the `build_compact_sparse_streaming` golden gate, so the default
+golden `7d4afe61` is unchanged.  Several are MUTUALLY-EXCLUSIVE or interacting build-family selectors
 (the audit's Q4(d)) — e.g. `C4_DIV_LONGDIV` overrides `C4_DIV_LEAN`.
 
 | flag | purpose | default | depends | golden |
@@ -275,6 +275,25 @@ The pre-fix golden **`069cc32f`** is the `C4_BP_RESTORE_HIBYTE=0` escape-hatch b
 | `C4_INGEST_WIDE` | 1-query/1-KV wide ingest — restructures block-0 to a 1-head packed-dim Attn | unset→off | — | **golden-MOVING** (ON hash ≠ default golden; packed-dim by construction) |
 | `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — widens NUM_OPS 40→48 | unset→off | — | **golden-MOVING** (wider OP_IS band; ON `2f69350f…` was measured on the `069cc32f` base, shifts under the new default) |
 
+### Golden-migration CANDIDATES (general-correctness, DEFAULT-OFF today)
+
+Levers that fix a general-program correctness gap and are NOT yet default-ON, but ARE
+migration candidates — the same "gate-and-flip" precedent `C4_BP_RESTORE_HIBYTE` just set
+(it moved `069cc32f → 7d4afe61`). Flipping one of these to DEFAULT-ON would MOVE the golden
+again (the fingerprint changes because the ALU semantics change).
+
+| flag | purpose | default | depends | golden |
+|---|---|---|---|---|
+| `C4_SIGNED_DIVMOD` (real env name `C4_DIVMOD_SIGNED`, #790) | signed trunc-toward-zero `DIV`/`MOD` (C4/C convention) instead of the golden UNSIGNED base-16 floor divide — negate each negative operand to its magnitude before the divide, conditionally negate quotient (`SGN_A^SGN_B`) / remainder (`SGN_A`) after, via a two's-complement carry chain over the operand/result nibble bands. **Closes the last C90 failure class** (signed-negative `DIV`/`MOD`, the only non-100% conformance class). | unset→off | — | **golden-migration candidate** (OFF → DIV/MOD stay unsigned-floor → golden byte-IDENTICAL `7d4afe61`; flipping DEFAULT-ON would MOVE the golden, like `C4_BP_RESTORE_HIBYTE` did) |
+
+> Note: the env flag the code actually reads is `C4_DIVMOD_SIGNED`
+> (`nibble_alu32.py::_signed_divmod_enabled`, `nibble_pure_forward_complete.py`) — it also
+> appears in the Build-family selectors table above as the `doom-build` DIV/MOD-semantics
+> knob. It is repeated here because, as the general-correctness lever that closes the last
+> C90 class, it is a golden-migration candidate, not merely a doom-build selector.
+> `C4_SIGNED_DIVMOD` is the general-scope alias name used in the capstone; there is no
+> separate env read for it — set `C4_DIVMOD_SIGNED=1`.
+
 ### CFM / build-mode / I/O / misc
 
 | flag | purpose | default | depends | golden |
@@ -312,6 +331,7 @@ Noted here as future "should-be-flag" items; NOT changed (would move the doom bu
 
 ## Golden / safety
 
-- Golden `069cc32f…c0ca` re-confirmed UNCHANGED with `C4_DOOM_FAST` unset AND with all
-  19 members active (`c4_min._fingerprint_build`).  This registry + `doom_fast.py` add
-  NO build-path / weight changes.
+- The default golden `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON) re-confirmed UNCHANGED
+  with `C4_DOOM_FAST` unset AND with all 19 members active (`c4_min._fingerprint_build`);
+  the `C4_BP_RESTORE_HIBYTE=0` escape-hatch build is likewise `069cc32f…c0ca` in both
+  states.  This registry + `doom_fast.py` add NO build-path / weight changes.
