@@ -569,12 +569,75 @@ class PFDraft:
 _IMM_MASK = (1 << (4 * IMM_NIBS)) - 1       # 20-bit literal band (IMM_NIBS=5 nibbles)
 
 
+@dataclass
+class PFResumeState:
+    """A CHECKPOINT of the logical-VM interpreter at a step boundary — everything the
+    deterministic transition needs to CONTINUE drafting byte-identically.
+
+    Task #814/#866 (checkpoint-resume for multi-million-step doom runs): the draft is
+    a self-contained deterministic interpreter, so its FUTURE token stream / frames /
+    store_log are a pure function of THIS state.  Saving it lets a run be killed after
+    step ``steps`` and RESUMED from here — the resumed continuation is byte-identical
+    to an uninterrupted run (same registers -> same control flow, same ``mem`` +
+    ``store_log`` -> same memory reads, same stream offsets -> same overlay math).
+
+    The fields mirror the ``draft_pf_program`` locals verbatim.  ``mem`` /
+    ``store_log`` are the heavy part (the VM memory image + KV write log); everything
+    else is O(1) scalars or short logs.  ``tokens`` / ``frames`` / ``win_starts`` etc.
+    hold the emitted PREFIX so a resumed window can present the full token context the
+    schedule/verify resolve against (the same prefix the uninterrupted run had).
+    ``json_safe()`` returns a dict of only JSON-serialisable primitives; the runner
+    persists it with ``numpy`` for the two big dicts."""
+    # scalar registers / counters (the whole control + framing state)
+    pc: int
+    ax: int
+    sp: int
+    bp: int
+    stk: int
+    cur_pc: int
+    cur_sp: int
+    cur_bp: int
+    steps: int
+    frame_idx: int
+    stream_len: int
+    n_seed: int
+    code_off: int
+    halted: bool
+    # heavy state: the VM memory image + the KV write log (both {int:...})
+    mem: Dict[int, int]
+    store_log: Dict[int, Tuple[int, int]]
+    load_log: Dict[int, int]
+    read_log: Dict[int, List[Tuple[str, int]]]
+    # emitted prefix (the token stream + decoded frames up to `steps`)
+    tokens: List[int]
+    frames: List[Dict[str, int]]
+    win_starts: List[int]
+    out: List[int]
+    prtf_steps: List[int]
+    # config guard (a resume MUST use the same draft-width flags)
+    cmp32: bool
+    shift32: bool
+    imm_nibs: int
+    sp_init: int
+
+
 def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
                      mask: int = 0xFFFFFFFF,
                      data_seg: Optional[Dict[int, int]] = None,
-                     fio=None) -> PFDraft:
+                     fio=None,
+                     resume: Optional["PFResumeState"] = None,
+                     capture_state: bool = False) -> PFDraft:
     """Run the MODEL's ISA transition and materialise the per-step 30-token frame
     stream + store_log — the exact token stream the pure-forward DRIVER emits.
+
+    ``resume`` (Task #814/#866, DEFAULT ``None`` -> byte-identical old path): a
+    ``PFResumeState`` checkpoint from a prior (bounded) call — the interpreter is
+    RE-SEEDED from it and drafts steps ``resume.steps .. max_steps`` INSTEAD of
+    starting fresh.  Because the transition is deterministic, the resumed draft's
+    tokens/frames/store_log are byte-identical to the tail of an uninterrupted
+    ``draft_pf_program(code, max_steps=...)`` (proven L-inf=0 by the runner).  The
+    returned ``PFDraft`` carries the FULL stream (checkpoint prefix + the newly drafted
+    tail), so a schedule/verify over it is indistinguishable from the uninterrupted run.
 
     This is the *logical VM* of BLOG_SPEC §Speculation: the plain deterministic
     C4 interpreter, so it is ~free relative to a model forward.  It reproduces the
@@ -599,47 +662,76 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     """
     SP_INIT = _PFC.SP_INIT
     cmp32 = _draft_cmp32()               # 32-bit signed cmp draft (default OFF)
-    mem: Dict[int, int] = {}
-    sp = bp = SP_INIT
-    ax = pc = 0
-    # DATA-SEGMENT seed (leading KV store frames), matching run_pure_forward_cached:
-    # each data byte becomes one leading store frame recorded in store_log at frame
-    # idx k, and the init frame then sits at frame idx n_seed.  The draft's own `mem`
-    # is seeded too so a LC/LI reads the byte.
-    seed_frames: List[int] = []
-    store_log: Dict[int, Tuple[int, int]] = {}
-    for k, (addr, val) in enumerate(sorted((data_seg or {}).items())):
-        a32, v32 = addr & 0xFFFFFFFF, val & 0xFFFFFFFF
-        seed_frames += _build_frame(0, 0, SP_INIT, SP_INIT, 0,
-                                    mem_addr=a32, mem_val=v32)
-        store_log[k] = (a32, v32)
-        mem[a32] = v32
-    n_seed = len(store_log)
-    # The driver's stream is [BOS] + seed_frames + init_frame, then one appended
-    # frame per step EXCEPT the HALT step's frame (the driver breaks BEFORE the
-    # append).  The init frame IS a real stream frame (frame_idx n_seed), so tokens
-    # must include it or every later position shifts by 30.
-    init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
-    # CODE-FROM-MEMORY (C4_PF_CFM): prepend ONE token per instruction as leading CODE
-    # frames (the program lives in the KV, fetched at PC by the address CAM).  The
-    # register/store frames then begin at absolute position ``1 + code_off``.  The
-    # code-frame tokens are neutral MEM markers (the overlay writes their CODE bands;
-    # IS_FRAME_BYTE=0 -> ingest ignores them; the store CAM excludes IS_CODE rows).
-    code_off = len(code) if _pf_cfm_enabled() else 0
-    code_frame_toks: List[int] = [V.MEM] * code_off
-    tokens: List[int] = [V.BOS] + code_frame_toks + seed_frames + init_frame
-    frames: List[Dict[str, int]] = []
-    load_log: Dict[int, int] = {}               # frame_idx -> loaded address (LI/LC)
-    win_starts: List[int] = []
-    out: List[int] = []                         # PRTF visible-output bytes
-    prtf_steps: List[int] = []                  # step indices emitting a PRTF byte
-    read_log: Dict[int, List[Tuple[str, int]]] = {}  # frame_idx -> [(head, addr), ...]
-    stk = 0                                     # STACK0 mirror (MEM_VAL of a frame)
-    stream_len = len(tokens)                    # == 1 + n_seed*30 + 30
-    frame_idx = n_seed                          # init frame is frame n_seed
-    halted = False
-    steps = 0
-    cur_pc, cur_sp, cur_bp = 0, SP_INIT, SP_INIT
+    if resume is not None:
+        # RESUME (Task #814/#866): re-seed the interpreter from a checkpoint and draft
+        # the tail.  The draft-width flags MUST match the checkpoint (a different
+        # cmp32/shift32/IMM_NIBS/SP_INIT would produce a different transition and break
+        # byte-exactness), so assert them.
+        assert resume.cmp32 == cmp32, (
+            f"resume cmp32={resume.cmp32} != current {cmp32} (set C4_DRAFT_CMP32 to match)")
+        assert resume.shift32 == _draft_shift32(), (
+            "resume shift32 mismatch (set C4_SHIFT32 to match the checkpoint)")
+        assert resume.imm_nibs == IMM_NIBS, (
+            f"resume IMM_NIBS={resume.imm_nibs} != current {IMM_NIBS} (set C4_IMM_NIBS)")
+        assert resume.sp_init == SP_INIT, (
+            f"resume SP_INIT={resume.sp_init:#x} != current {SP_INIT:#x}")
+        assert resume.code_off == (len(code) if _pf_cfm_enabled() else 0), (
+            "resume code_off mismatch (C4_PF_CFM / code length differs)")
+        mem = dict(resume.mem)
+        store_log = dict(resume.store_log)
+        load_log = dict(resume.load_log)
+        read_log = {k: list(v) for k, v in resume.read_log.items()}
+        tokens = list(resume.tokens)
+        frames = [dict(f) for f in resume.frames]
+        win_starts = list(resume.win_starts)
+        out = list(resume.out)
+        prtf_steps = list(resume.prtf_steps)
+        pc, ax, sp, bp, stk = (resume.pc, resume.ax, resume.sp, resume.bp, resume.stk)
+        cur_pc, cur_sp, cur_bp = resume.cur_pc, resume.cur_sp, resume.cur_bp
+        steps, frame_idx, stream_len = resume.steps, resume.frame_idx, resume.stream_len
+        n_seed, code_off, halted = resume.n_seed, resume.code_off, resume.halted
+    else:
+        mem: Dict[int, int] = {}
+        sp = bp = SP_INIT
+        ax = pc = 0
+        # DATA-SEGMENT seed (leading KV store frames), matching run_pure_forward_cached:
+        # each data byte becomes one leading store frame recorded in store_log at frame
+        # idx k, and the init frame then sits at frame idx n_seed.  The draft's own `mem`
+        # is seeded too so a LC/LI reads the byte.
+        seed_frames: List[int] = []
+        store_log: Dict[int, Tuple[int, int]] = {}
+        for k, (addr, val) in enumerate(sorted((data_seg or {}).items())):
+            a32, v32 = addr & 0xFFFFFFFF, val & 0xFFFFFFFF
+            seed_frames += _build_frame(0, 0, SP_INIT, SP_INIT, 0,
+                                        mem_addr=a32, mem_val=v32)
+            store_log[k] = (a32, v32)
+            mem[a32] = v32
+        n_seed = len(store_log)
+        # The driver's stream is [BOS] + seed_frames + init_frame, then one appended
+        # frame per step EXCEPT the HALT step's frame (the driver breaks BEFORE the
+        # append).  The init frame IS a real stream frame (frame_idx n_seed), so tokens
+        # must include it or every later position shifts by 30.
+        init_frame = _build_frame(0, 0, SP_INIT, SP_INIT, 0)
+        # CODE-FROM-MEMORY (C4_PF_CFM): prepend ONE token per instruction as leading CODE
+        # frames (the program lives in the KV, fetched at PC by the address CAM).  The
+        # register/store frames then begin at absolute position ``1 + code_off``.  The
+        # code-frame tokens are neutral MEM markers (the overlay writes their CODE bands;
+        # IS_FRAME_BYTE=0 -> ingest ignores them; the store CAM excludes IS_CODE rows).
+        code_off = len(code) if _pf_cfm_enabled() else 0
+        code_frame_toks: List[int] = [V.MEM] * code_off
+        tokens: List[int] = [V.BOS] + code_frame_toks + seed_frames + init_frame
+        frames: List[Dict[str, int]] = []
+        load_log: Dict[int, int] = {}               # frame_idx -> loaded address (LI/LC)
+        win_starts: List[int] = []
+        out: List[int] = []                         # PRTF visible-output bytes
+        prtf_steps: List[int] = []                  # step indices emitting a PRTF byte
+        read_log: Dict[int, List[Tuple[str, int]]] = {}  # frame_idx -> [(head, addr), ...]
+        stk = 0                                     # STACK0 mirror (MEM_VAL of a frame)
+        stream_len = len(tokens)                    # == 1 + n_seed*30 + 30
+        frame_idx = n_seed                          # init frame is frame n_seed
+        halted = False
+        steps = 0
+        cur_pc, cur_sp, cur_bp = 0, SP_INIT, SP_INIT
     while steps < max_steps:
         if not (0 <= pc < len(code)):
             break
@@ -891,11 +983,31 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         stream_len += V.FRAME_LEN
 
     final_ax = frames[-1]["ax"] if frames else 0
-    return PFDraft(tokens=tokens, frames=frames, store_log=store_log,
-                   step_count=len(frames), halted=halted,
-                   final_ax_masked=final_ax, win_starts=win_starts,
-                   out=out, prtf_steps=prtf_steps, load_log=load_log,
-                   read_log=read_log, code_off=code_off)
+    d = PFDraft(tokens=tokens, frames=frames, store_log=store_log,
+                step_count=len(frames), halted=halted,
+                final_ax_masked=final_ax, win_starts=win_starts,
+                out=out, prtf_steps=prtf_steps, load_log=load_log,
+                read_log=read_log, code_off=code_off)
+    if capture_state:
+        # Task #814/#866: expose the interpreter state so the caller can CHECKPOINT it
+        # and RESUME a bounded run.  Only meaningful when the draft stopped on the
+        # step-cap (``not halted``); a halted draft has no continuation.  The state
+        # mirrors the loop locals exactly (see PFResumeState) so a re-seeded draft is
+        # byte-identical to the uninterrupted tail.
+        d.resume_state = PFResumeState(
+            pc=pc, ax=ax, sp=sp, bp=bp, stk=stk,
+            cur_pc=cur_pc, cur_sp=cur_sp, cur_bp=cur_bp,
+            steps=steps, frame_idx=frame_idx, stream_len=stream_len,
+            n_seed=n_seed, code_off=code_off, halted=halted,
+            mem=dict(mem), store_log=dict(store_log),
+            load_log=dict(load_log),
+            read_log={k: list(v) for k, v in read_log.items()},
+            tokens=list(tokens), frames=[dict(f) for f in frames],
+            win_starts=list(win_starts), out=list(out),
+            prtf_steps=list(prtf_steps),
+            cmp32=cmp32, shift32=_draft_shift32(), imm_nibs=IMM_NIBS,
+            sp_init=SP_INIT)
+    return d
 
 
 # ===========================================================================
