@@ -1,9 +1,10 @@
 # Doom (and a general C compiler) on a vanilla transformer — honest capstone
 
-*2026-08-06. Golden `069cc32f` (doom pure-forward, flags-OFF). This document is the
-honest coherent record: what was built, what genuinely works, the measured numbers,
-and — deliberately — the projections that turned out wrong and how measurement
-corrected them.*
+*2026-08-06. Golden `7d4afe61` (doom pure-forward, the general-correctness fix
+default-ON; rollback `C4_BP_RESTORE_HIBYTE=0` → the historical `069cc32f`). This
+document is the honest coherent record: what was built, what genuinely works, the
+measured numbers, and — deliberately — the projections that turned out wrong and how
+measurement corrected them.*
 
 ## 1. Thesis, in one paragraph
 
@@ -77,8 +78,11 @@ build; the hardened build is far more general.
 
 - **C90 conformance on the hardened build: _[pending — a7ccc9bc]_** (old vanilla ~14%;
   expected substantially higher given Mandelbrot).
-- **Golden migration** to default the correctness fix: **_[pending — a88a2e23; new golden
-  TBD, rollback via `C4_BP_RESTORE_HIBYTE=0` → `069cc32f`]_**.
+- **Golden migration DONE:** the correctness fix (`C4_BP_RESTORE_HIBYTE`, the fp32-safe
+  5-nibble LEV recompose) is now **default-ON** — the doom-build golden moved
+  `069cc32f → 7d4afe61` (verified: doom 30000/30000 + Mandelbrot byte-exact ship by
+  default, no flag). Rollback is byte-identical to the old golden via
+  `C4_BP_RESTORE_HIBYTE=0` → `069cc32f`.
 
 ## 6. Performance — measured to its floor (and the corrections)
 
