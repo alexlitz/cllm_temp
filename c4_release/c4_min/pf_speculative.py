@@ -2183,8 +2183,19 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                         _st = hidden[0, draft.win_starts[s_bad] - span_start]
                         stats["diag_stack0_model"] = _decode_reg_from_nibbles(
                             _st, L, L.STACK0)
-                    except Exception:
+                        # raw lane / nibble dump for the BP-restore high-byte probe
+                        stats["diag_bp_val_lane"] = float(_st[L.BP_VAL].item())
+                        stats["diag_stk_val_lane"] = float(_st[L.STK_VAL].item())
+                        stats["diag_stack0_nibs"] = [
+                            round(float(_st[L.STACK0 + j].item()), 4)
+                            for j in range(16)]
+                        stats["diag_lev_ret_val"] = float(_st[L.LEV_RET_VAL].item())
+                        stats["diag_bp_nibs"] = [
+                            round(float(_st[L.BP + j].item()), 4)
+                            for j in range(16)]
+                    except Exception as _e:
                         stats["diag_stack0_model"] = None
+                        stats["diag_exc"] = repr(_e)
                     stats["diag_stk_draft"] = draft.frames[s_bad].get("stk")
                     stats["diag_op"] = draft.frames[s_bad].get("op")
                 cache_now = max(max_cache, caches[0].size())
@@ -2302,8 +2313,16 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     try:
                         _st = hidden[0, draft.win_starts[s] - span_start]
                         stk = _decode_reg_from_nibbles(_st, L, L.STACK0)
-                    except Exception:
+                        stats["diag_bp_val_lane"] = float(_st[L.BP_VAL].item())
+                        stats["diag_stk_val_lane"] = float(_st[L.STK_VAL].item())
+                        stats["diag_lev_ret_val"] = float(_st[L.LEV_RET_VAL].item())
+                        stats["diag_stack0_nibs"] = [
+                            round(float(_st[L.STACK0 + j].item()), 4) for j in range(16)]
+                        stats["diag_bp_nibs"] = [
+                            round(float(_st[L.BP + j].item()), 4) for j in range(16)]
+                    except Exception as _e:
                         stk = None
+                        stats["diag_exc"] = repr(_e)
                     fr_ = draft.frames[s]
                     stats["diag_stack0_model"] = stk
                     stats["diag_stk_draft"] = fr_.get("stk")
