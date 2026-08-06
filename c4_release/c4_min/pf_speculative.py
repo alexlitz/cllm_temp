@@ -835,7 +835,15 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             # full-address reference.  ``& mask`` (full 32-bit) keeps the drafted AX equal
             # to the model's wide result; ``_s32``-style negative offsets ripple naturally.
             if lea_wide:
-                ax = (bp + 4 * imm) & mask
+                # SIGN-EXTEND the immediate (``_s32``): c4 local/param offsets are
+                # NEGATIVE (e.g. ``LEA -1`` = 0xFFFFFFFF), and the model's wide-LEA
+                # reads them through the SIGNED ``IMM_CLEAN`` scalar (two's-complement
+                # sign correction), so ``BP + 4*(-1) = BP - 4`` (a param slot), NOT
+                # ``BP + 4*0xFFFFFFFF``.  Without this the wide draft mis-addresses every
+                # frame parameter and diverges from native c4 at the first negative-offset
+                # LEA (the deep-recursion wall).  The folded byte-0 path below is
+                # unaffected (``4*imm & 0xFF`` == ``4*_s32(imm) & 0xFF``).
+                ax = (bp + 4 * _s32(imm)) & mask
             else:
                 ax = (bp + 4 * imm) & 0xFF
         elif op == isa.PSH:
