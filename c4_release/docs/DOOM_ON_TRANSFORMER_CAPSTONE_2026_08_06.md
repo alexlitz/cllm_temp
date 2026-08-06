@@ -23,9 +23,10 @@ Doom is the stress test.
   LEV/JSR, ADD/SUB/MUL/DIV/MOD, the bitwise + shift + compare ops, I/O) is hand-authored
   as declarative FFN/attention rules, lowered to weights. Values are 8 nibbles (32-bit)
   in the residual; memory is content-addressed (softmax1 + ALiBi latest-write-wins).
-- **The C toolchain.** A c4 compiler + a C→c4 transpiler (self-hosting on the VM), a
-  C90 preprocessor + soft-float lib, native FP/fixed-point ISA extensions. Doom is
-  compiled/transpiled through this, not hand-lowered.
+- **The C toolchain.** A c4 compiler + a C→c4 transpiler (a genuine recursive-descent
+  compiler runs byte-exact *on the transformer itself* — §5), a C90 preprocessor +
+  soft-float lib, native FP/fixed-point ISA extensions. Doom is compiled/transpiled
+  through this, not hand-lowered.
 - **The Rust draft + speculation.** A native-speed byte-exact c4 VM (~665M steps/s)
   drafts the whole run; the transformer verifies K steps per dispatch (giant-K). This
   is what makes the outer VM loop parallel — the step-to-step serial dependency is the
@@ -40,9 +41,14 @@ Doom is the stress test.
   transpiler-generated engine.
 - **Gameplay frame:** a full 3D E1M5 view **renders** — player spawns, BSP walk, walls,
   floors — and matches gcc's *geometry exactly* (R_DrawColumn/Span/BSP/AddLine/
-  StoreWallRange counts identical). **86.9% byte-exact vs gcc**; the residual is a
-  ±1–3 colormap-shade rounding tail plus a mid-wipe capture artifact (the captured frame
-  is the one-time title→level screen-melt, not a steady frame). Reaching it took ~a dozen
+  StoreWallRange counts identical). **87.05% byte-exact on a steady frame** (158/200 rows
+  byte-perfect). A steady-frame capture dissolved the earlier ±1–3 "colormap" tail entirely —
+  it was **not** a rounding bug but a mid-wipe melt artifact (the first captures were the
+  one-time title→level screen-melt). The sole steady residual is a wall-texture miss (rows
+  66–107): `R_InitTextures` reads the `maptexture_t` patchcount at the wrong byte offset (the
+  obsolete `columndirectory` pointer); the correct offset parses byte-identically to gcc but
+  exposes a *latent* `R_GenerateComposite` heap over-write, so it is documented and gated.
+  Reaching this took ~a dozen
   fixes of one bug class: the c4 compiler's `&arr[i*n+c]` scaling, `+=`/`|=` transpiled
   to plain `=`, arithmetic-vs-logical shift, 2D-array flattening, byte-vs-int strides,
   and an `I_GetTime` stack-corruption that had silently stopped the game sim from
@@ -86,6 +92,16 @@ honestly bounded: it is an 8-bit-immediate machine, so c4's 32-bit frame-relativ
 functions/locals/loops (i.e. a real Doom *module*) are out of reach here and belong to the
 32-bit code-from-memory route, not this in-weights compiler.
 
+**And the 32-bit route runs a real compiler byte-exact on the transformer.** A hand-written
+recursive-descent c4 compiler (`minic.c` — tokenizer + precedence-climbing `expr()`), compiled
+to c4 bytecode and run *as a program* on the 32-bit doom transformer (code-from-memory), emits
+correct bytecode with the model verifying **every step byte-exact**: `2+3*4` →
+`IMM 2;PSH;IMM 3;PSH;IMM 4;MUL;ADD;LEV` (1882/1882 steps accepted), operator precedence, and
+depth-6 nested-paren recursion (4746 steps). The single wall to a real Doom *module* is now
+pinpointed: the model's **8-bit LEA local-address decode** (`(BP+4·imm) mod 256`) caps the stack
+at ~6 recursion levels — widening it to the full-32-bit address decode (the #854 migration) is
+the one change that unblocks real modules. Golden unchanged; behind default-OFF flags.
+
 - **C90 conformance on the hardened build: 166/170 byte-exact = 97.6%** (of cases run;
   battery still draining the heaviest positive-arith tail, no new failure classes) — up
   from the old **vanilla ~14%**. Measured per-case vs the faithful `native_c4` oracle
@@ -94,7 +110,7 @@ functions/locals/loops (i.e. a real Doom *module*) are out of reach here and bel
   strings/control/cmp/bitwise/promote/overflow/enum/bitfield/seqpoint/arrays/loops/
   linkage/storage/expr) except **one**: signed-negative `DIV`/`MOD` (4 cases) — the
   nibble ALU does unsigned base-16 long division where gcc does signed trunc-toward-zero.
-  One negate-by-dividend-sign wrapper closes it; nothing else diverges across the corpus.
+  A sign-magnitude wrapper (`C4_DIVMOD_SIGNED`, #790) closes it; nothing else diverges across the corpus.
   Harness + corpus committed under `id_port/c90_e2e/` (test-only, golden untouched).
 - **Golden migration DONE:** the correctness fix (`C4_BP_RESTORE_HIBYTE`, the fp32-safe
   5-nibble LEV recompose) is now **default-ON** — the doom-build golden moved
@@ -120,7 +136,7 @@ step (#841: all levers in ONE forward, FFN 72% / attention 28% / decode 1% of 2.
 → 0.788 µs/step with block-0 fold, byte-exact) + the exact statement of what 6.89 M
 steps/s would require live in [`PERF_LADDER_FINAL.md`](PERF_LADDER_FINAL.md). Then it stops:
 
-- **Per-step is tapped.** The FFN is sparse-COO (median Dff≈138, ~8 active rows/block);
+- **Per-step is tapped.** The FFN is sparse-COO (median Dff≈40, ~8 active rows/block);
   a dense bf16 tensor-core FFN is **11.8× slower** because the useful work is 0.099% of
   the dense rectangle — sparse-COO is the byte-exact optimum. Precision buys nothing
   (efficiency-bound, not bandwidth-bound; and PC exceeds bf16's exact-integer range).
@@ -146,7 +162,8 @@ re-measured.
 - The full mid-game trace is not stepped end-to-end through the transformer (the draft
   hits an unimplemented `MALC` opcode + ~700 GB KV to reach the render span); verification
   is byte-exact on tractable 120K-step windows + measured-per-step calibration.
-- The gameplay frame is 87% vs gcc (rounding tail + a mid-wipe capture artifact), not 100%.
+- The steady gameplay frame is 87.05% byte-exact vs gcc (158/200 rows perfect); the residual is
+  a wall-texture maptexture-offset miss whose fix exposes a latent composite-heap bug (gated), not 100%.
 - Numbers here are one A5000; multi-GPU is linear (frame-level).
 
 ## 8. What this is
