@@ -87,6 +87,24 @@ EMIT = 45
 DRAWSPAN = 47
 NUM_OPS_DRAWSPAN = 48   # OP_IS band width when C4_DOOM_DRAWSPAN is on (covers 0..47)
 
+# ---------------------------------------------------------------------------
+# NATIVE DOOM GAMEPLAY RENDER-MACRO opcodes DRAWCOL / DRAWSPANF (gated, DEFAULT
+# OFF).  These are the 3D-view analogs of the title's DRAWSPAN (V_DrawPatch)
+# fold: the per-pixel TEXTURE-MAPPED fill loops that dominate a healthy gameplay
+# frame.  48 = DRAWCOL (``R_DrawColumn`` -- a texture-mapped VERTICAL wall column:
+# a fixed-point source-texel walk ``frac += fracstep`` / ``src[(frac>>16)&127]``,
+# a colormap/light lookup ``cmap[...]``, and a strided dest byte write
+# ``dest += SCREENWIDTH``); 49 = DRAWSPANF (``R_DrawSpan`` -- a texture-mapped
+# HORIZONTAL floor/ceiling span: a 2D u,v walk ``xfrac/yfrac += step``, the same
+# colormap lookup, and a CONTIGUOUS dest byte write ``*dest++``).  Both sit ABOVE
+# the golden NUM_OPS=40 band AND above DRAWSPAN (47), so the baseline OP_IS layout
+# and the DRAWSPAN layout are UNCHANGED when the gate is off; the
+# ``C4_DOOM_DRAWCOL`` gate widens the band to ``NUM_OPS_DRAWCOL`` only when on
+# (golden byte-identical off).  The op SEMANTICS live in ``c4_min.doom_drawcol``.
+DRAWCOL = 48
+DRAWSPANF = 49
+NUM_OPS_DRAWCOL = 50   # OP_IS band width when C4_DOOM_DRAWCOL is on (covers 0..49)
+
 
 def float_ops_enabled() -> bool:
     """``C4_FLOAT_OPS`` (DEFAULT OFF): add the gated IEEE-754 single F_ADD/F_SUB/
@@ -104,18 +122,32 @@ def drawspan_enabled() -> bool:
     return os.environ.get("C4_DOOM_DRAWSPAN", "0") not in ("0", "", "false", "False")
 
 
+def drawcol_enabled() -> bool:
+    """``C4_DOOM_DRAWCOL`` (DEFAULT OFF): add the gated GAMEPLAY render-macro
+    opcodes DRAWCOL (48, R_DrawColumn) + DRAWSPANF (49, R_DrawSpan).  OFF -> the
+    OP_IS band stays at its non-DRAWCOL width and every downstream layout dim is
+    byte-identical to the golden 069cc32f build.  The canonical gate + op
+    semantics live in ``c4_min.doom_drawcol``; this mirror keeps ``isa``
+    self-contained (no import cycle) for the OP_IS band sizing."""
+    return os.environ.get("C4_DOOM_DRAWCOL", "0") not in ("0", "", "false", "False")
+
+
 def num_ops_effective() -> int:
     """Width of the OP_IS opcode one-hot band for the CURRENT flag state:
     ``NUM_OPS`` (40, golden) normally; widened to ``NUM_OPS_FLOAT`` (44) when
-    C4_FLOAT_OPS is on and/or to ``NUM_OPS_DRAWSPAN`` (48) when C4_DOOM_DRAWSPAN
-    is on (the DRAWSPAN opcode-47 one-hot needs a slot).  The band is the MAX of
-    the enabled extensions, so the gates compose.  The layout reads THIS, so a
-    flag-off build is byte-identical to golden 069cc32f."""
+    C4_FLOAT_OPS is on, to ``NUM_OPS_DRAWSPAN`` (48) when C4_DOOM_DRAWSPAN is on
+    (the DRAWSPAN opcode-47 one-hot needs a slot), and to ``NUM_OPS_DRAWCOL``
+    (50) when C4_DOOM_DRAWCOL is on (the DRAWSPANF opcode-49 one-hot needs a
+    slot).  The band is the MAX of the enabled extensions, so the gates compose.
+    The layout reads THIS, so a flag-off build is byte-identical to golden
+    069cc32f."""
     width = NUM_OPS
     if float_ops_enabled():
         width = max(width, NUM_OPS_FLOAT)
     if drawspan_enabled():
         width = max(width, NUM_OPS_DRAWSPAN)
+    if drawcol_enabled():
+        width = max(width, NUM_OPS_DRAWCOL)
     return width
 
 NAMES = {
