@@ -135,7 +135,7 @@ def _unify_cam_head_enabled() -> bool:
 
 
 def _bp_restore_hibyte_nibs() -> int:
-    """``C4_BP_RESTORE_HIBYTE`` (DEFAULT OFF): how many nibbles the LEV/pop STK_VAL /
+    """``C4_BP_RESTORE_HIBYTE`` (DEFAULT ON): how many nibbles the LEV/pop STK_VAL /
     BP_VAL / LEV_RET_VAL scalar recomposes read.
 
     The frame-pointer-restore path (``compile_stk_recompose`` / ``compile_unify_stk_recompose``
@@ -151,15 +151,22 @@ def _bp_restore_hibyte_nibs() -> int:
     (``_decode_reg_from_nibbles``) is CORRECT on the SAME nibbles — only the wide-scalar
     recompose amplifies the residue.
 
-    ON: read ``_recompose_hi_nibbles()`` nibbles — the SAME fp32-safe count the base
-    ``compile_nibble_to_scalar`` uses for EVERY other register (5 in fp32: coeff ≤ 16^4 =
-    2^16 < 2^24 fp32-exact; 8 in fp64/width32).  The dropped high nibbles j∈[5,7] carry only
-    residue (a real saved-BP / return-PC in these programs fits bits 0..19), so the value is
-    UNCHANGED for a clean value and residue-immune for a residue-laden one.  DEFAULT OFF ->
-    byte-identical golden (the doom golden ``069cc32f`` never hits the residue: its saved
-    BPs decode clean at 8 nibbles too)."""
+    DEFAULT (ON): read ``_recompose_hi_nibbles()`` nibbles — the SAME fp32-safe count the
+    base ``compile_nibble_to_scalar`` uses for EVERY other register (5 in fp32: coeff ≤
+    16^4 = 2^16 < 2^24 fp32-exact; 8 in fp64/width32).  The dropped high nibbles j∈[5,7]
+    carry only residue (a real saved-BP / return-PC in these programs fits bits 0..19), so
+    the value is UNCHANGED for a clean value and residue-immune for a residue-laden one.
+    This is the general-program-correctness default: MANDELBROT is fully byte-exact
+    (interior/escape/boundary all match oracle) and DOOM stays byte-exact (its saved BPs
+    decode clean at both 5 and 8 nibbles).  DEFAULT-ON golden ``_fingerprint_build`` =
+    ``7d4afe61`` (fewer FFN units: the recompose reads 5 nibbles not 8, so each of the 3
+    recompose ops drops 3 hi-nibble units).
+
+    ESCAPE HATCH (``C4_BP_RESTORE_HIBYTE=0``): revert to the old ``hi_nibbles=8``
+    recompose — the pre-fix golden ``069cc32f`` (byte-identical to the historical
+    doom-build golden), for rollback + old-byte-identity checks."""
     import os
-    if os.environ.get("C4_BP_RESTORE_HIBYTE", "0") in ("0", "", "false", "False"):
+    if os.environ.get("C4_BP_RESTORE_HIBYTE", "1") in ("0", "false", "False"):
         return 8
     from .nibble_vm import _recompose_hi_nibbles
     return _recompose_hi_nibbles()

@@ -8,7 +8,9 @@ c4_min doom flags were undocumented** in the canonical registry).
 
 Source of truth: the per-flag `*_enabled()` docstring at each `os.environ.get` site +
 [`c4_min/DOOM_PARAM_PRECISION_FLAG_AUDIT_2026_08_05.md`](../c4_min/DOOM_PARAM_PRECISION_FLAG_AUDIT_2026_08_05.md)
-+ the `REALTIME_SETUP.md` recipe.  Generated 2026-08-05, golden `069cc32f`.
++ the `REALTIME_SETUP.md` recipe.  Generated 2026-08-05; golden RE-BASELINED 2026-08-06
+to `7d4afe61` (the `C4_BP_RESTORE_HIBYTE` DEFAULT-ON flip; `069cc32f` is the
+`C4_BP_RESTORE_HIBYTE=0` escape-hatch build).
 
 Scope note: this lists the ~113 PRODUCTION flags read in non-agent, non-bench, non-test
 `c4_min` modules.  The `_agent_*` / `bench_*` scratch scripts read many more one-off
@@ -24,21 +26,24 @@ are deliberately omitted.
   (absent ⇒ False).
 - **DEPENDS** — flags that must ALSO be on for this one to have effect (the audit's
   undocumented dependency chains).  `—` = standalone.
-- **GOLDEN** — impact on the byte-identity gate:
-  - **`byte-exact`** — DEFAULT-OFF runtime/perf lever; the golden fingerprint
-    `069cc32f` (`c4_min._fingerprint_build`, `build_compact_sparse_streaming`,
-    non-recurrent long-div) is UNCHANGED whether the flag is on or off.  The overwhelming
-    majority.  These are compute-fusion / schedule / attention levers proven L-inf=0.
+- **GOLDEN** — impact on the byte-identity gate.  The current default golden fingerprint
+  (`c4_min._fingerprint_build`, `build_compact_sparse_streaming`, non-recurrent long-div)
+  is **`7d4afe61`** (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON); the pre-fix **`069cc32f`** is the
+  `C4_BP_RESTORE_HIBYTE=0` escape-hatch build.
+  - **`byte-exact`** — DEFAULT-OFF runtime/perf lever; the golden fingerprint is
+    UNCHANGED whether the flag is on or off.  The overwhelming majority.  These are
+    compute-fusion / schedule / attention levers proven L-inf=0.
   - **`doom-build`** — a BUILD-FAMILY selector for the DOOM/perf-fleet recurrent build
     (`build_lib_model_streaming` / `qwen_full_vm`).  It CHANGES the doom-build weights
     (a different, wider ISA — 32-bit ALU / wide addr / lean-divide / recurrent core),
-    but does NOT touch the golden `build_compact_sparse_streaming` gate, so `069cc32f`
+    but does NOT touch the `build_compact_sparse_streaming` golden gate, so the golden
     is unchanged.  These pick the semantics of the doom run itself; several are
     mutually-exclusive or interacting build-family selectors.
-  - **`golden-MOVING`** — flipping this MOVES the golden fingerprint `069cc32f` itself
-    (a wider OP_IS band / repacked block-0).  Only 2: `C4_INGEST_WIDE`,
-    `C4_DOOM_DRAWSPAN`.  Both are DEFAULT-OFF, so `069cc32f` is the flag-OFF golden;
-    their ON hashes are documented in `_fingerprint_build.py`.
+  - **`golden-MOVING`** — flipping this MOVES the golden fingerprint itself (a
+    hi/lo-nibble recompose width / wider OP_IS band / repacked block-0).  Now 3:
+    `C4_BP_RESTORE_HIBYTE` (DEFAULT-ON — it OWNS the current `7d4afe61` golden, and
+    `=0` rolls back to `069cc32f`), `C4_INGEST_WIDE`, `C4_DOOM_DRAWSPAN` (the latter two
+    DEFAULT-OFF).  ON hashes are documented in `_fingerprint_build.py`.
 
 ---
 
@@ -259,12 +264,16 @@ is unchanged.  Several are MUTUALLY-EXCLUSIVE or interacting build-family select
 | `C4_TIGHT_SHIFT` | tight-nibble shifter | 1 (on) | — | doom-build |
 | `C4_INGEST_GQA` | grouped-query ingest attention | unset→off | — | doom-build |
 
-### Golden-MOVING (moves `069cc32f` itself — DEFAULT-OFF, so golden is the flag-OFF state)
+### Golden-MOVING (moves the fingerprint itself)
+
+The current default golden is **`7d4afe61`** (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON, 2026-08-06).
+The pre-fix golden **`069cc32f`** is the `C4_BP_RESTORE_HIBYTE=0` escape-hatch build.
 
 | flag | purpose | default | depends | golden |
 |---|---|---|---|---|
-| `C4_INGEST_WIDE` | 1-query/1-KV wide ingest — restructures block-0 to a 1-head packed-dim Attn | unset→off | — | **golden-MOVING** (ON hash ≠ 069cc32f; packed-dim by construction) |
-| `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — widens NUM_OPS 40→48 | unset→off | — | **golden-MOVING** (ON = `2f69350f…`, wider OP_IS band) |
+| `C4_BP_RESTORE_HIBYTE` | LEV/pop scalar recompose reads fp32-safe 5 nibbles (not fp64-only 8) — general-program-correctness fix; makes Mandelbrot fully byte-exact, doom stays byte-exact | **1 (on)** | — | **golden-MOVING** (DEFAULT-ON golden = `7d4afe61`; `=0` reverts to the pre-fix `069cc32f` escape-hatch build) |
+| `C4_INGEST_WIDE` | 1-query/1-KV wide ingest — restructures block-0 to a 1-head packed-dim Attn | unset→off | — | **golden-MOVING** (ON hash ≠ default golden; packed-dim by construction) |
+| `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — widens NUM_OPS 40→48 | unset→off | — | **golden-MOVING** (wider OP_IS band; ON `2f69350f…` was measured on the `069cc32f` base, shifts under the new default) |
 
 ### CFM / build-mode / I/O / misc
 
