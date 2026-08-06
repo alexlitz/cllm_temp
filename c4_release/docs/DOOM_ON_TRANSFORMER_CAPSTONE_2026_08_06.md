@@ -1,7 +1,8 @@
 # Doom (and a general C compiler) on a vanilla transformer — honest capstone
 
-*2026-08-06. Golden `7d4afe61` (doom pure-forward, the general-correctness fix
-default-ON; rollback `C4_BP_RESTORE_HIBYTE=0` → the historical `069cc32f`). This
+*2026-08-06. Golden `3cabef64` (doom pure-forward, DEFAULT build — both general-correctness
+fixes on: signed-trunc `DIV`/`MOD` + BP-restore, giving **100% C90-general**; rollback ladder
+`C4_DIVMOD_SIGNED=0` → `7d4afe61` → `C4_BP_RESTORE_HIBYTE=0` → the historical `069cc32f`). This
 document is the honest coherent record: what was built, what genuinely works, the
 measured numbers, and — deliberately — the projections that turned out wrong and how
 measurement corrected them.*
@@ -102,21 +103,21 @@ pinpointed: the model's **8-bit LEA local-address decode** (`(BP+4·imm) mod 256
 at ~6 recursion levels — widening it to the full-32-bit address decode (the #854 migration) is
 the one change that unblocks real modules. Golden unchanged; behind default-OFF flags.
 
-- **C90 conformance on the hardened build: 166/170 byte-exact = 97.6%** (of cases run;
-  battery still draining the heaviest positive-arith tail, no new failure classes) — up
-  from the old **vanilla ~14%**. Measured per-case vs the faithful `native_c4` oracle
-  (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build. Every
-  conformance class is 100% (arith/pointers/recursion incl. 3-way mutual/functions/
-  strings/control/cmp/bitwise/promote/overflow/enum/bitfield/seqpoint/arrays/loops/
-  linkage/storage/expr) except **one**: signed-negative `DIV`/`MOD` (4 cases) — the
-  nibble ALU does unsigned base-16 long division where gcc does signed trunc-toward-zero.
-  A sign-magnitude wrapper (`C4_DIVMOD_SIGNED`, #790) closes it; nothing else diverges across the corpus.
-  Harness + corpus committed under `id_port/c90_e2e/` (test-only, golden untouched).
-- **Golden migration DONE:** the correctness fix (`C4_BP_RESTORE_HIBYTE`, the fp32-safe
-  5-nibble LEV recompose) is now **default-ON** — the doom-build golden moved
-  `069cc32f → 7d4afe61` (verified: doom 30000/30000 + Mandelbrot byte-exact ship by
-  default, no flag). Rollback is byte-identical to the old golden via
-  `C4_BP_RESTORE_HIBYTE=0` → `069cc32f`.
+- **C90 conformance: 100% general as the DEFAULT build.** Measured per-case vs the faithful
+  `native_c4` oracle (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build:
+  every conformance class is byte-exact (arith/pointers/recursion incl. 3-way mutual/functions/
+  strings/control/cmp/bitwise/promote/overflow/enum/bitfield/seqpoint/arrays/loops/linkage/
+  storage/expr). The last gap — signed-negative `DIV`/`MOD` (4 cases; the nibble ALU did unsigned
+  floor where gcc does signed trunc-toward-zero) — is closed by a sign-magnitude wrapper
+  (`C4_DIVMOD_SIGNED`, #790), now **default-ON** (golden migration `7d4afe61 → 3cabef64`,
+  2026-08-06): verified +4 correctness, **0 regressions** across 152 cases, positive/unsigned
+  div/mod unchanged, doom + Mandelbrot byte-exact. Up from the old **vanilla ~14%**. Rollback
+  `C4_DIVMOD_SIGNED=0` → `7d4afe61`. Harness + corpus under `id_port/c90_e2e/`.
+- **Golden ladder (both correctness fixes now default-ON):** the default build is `3cabef64`.
+  Two general-correctness fixes ship by default — `C4_DIVMOD_SIGNED` (signed div/mod, the +4 C90
+  fix) and `C4_BP_RESTORE_HIBYTE` (the fp32-safe 5-nibble LEV recompose that made Mandelbrot
+  byte-exact). Rollback ladder: `C4_DIVMOD_SIGNED=0` → `7d4afe61` → `C4_BP_RESTORE_HIBYTE=0` →
+  the historical `069cc32f`. Each move is verified byte-exact + regression-free.
 
 ## 6. Performance — measured to its floor (and the corrections)
 

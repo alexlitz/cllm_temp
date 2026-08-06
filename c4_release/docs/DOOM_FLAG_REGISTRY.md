@@ -249,7 +249,7 @@ golden `7d4afe61` is unchanged.  Several are MUTUALLY-EXCLUSIVE or interacting b
 | `C4_CMP32` | 32-bit compare | unset→off | — | doom-build |
 | `C4_CMP32_ORDER` | 32-bit compare byte-order fix (#826) | 1 (in doom scripts) | `C4_CMP32` | doom-build |
 | `C4_SHIFT32` | 32-bit shift | unset→off | — | doom-build |
-| `C4_DIVMOD_SIGNED` | signed divmod | unset→off | — | doom-build |
+| `C4_DIVMOD_SIGNED` | signed trunc-toward-zero divmod (#790) — the +4 C90-general fix; see Golden-MOVING | **1 (on)** | — | **golden-MOVING** (DEFAULT-ON golden = `3cabef64`; `=0` → `7d4afe61`) |
 | `C4_DIV_LEAN` | lean divide gadget (default doom divide) | 1 (on) | — | doom-build |
 | `C4_DIV_LONGDIV` | long-division divide gadget (OVERRIDES `C4_DIV_LEAN`) | unset→off | — | doom-build |
 | `C4_LOGSINK_DIV` | fp64 log-sink divide variant | unset→off | — | doom-build |
@@ -266,12 +266,14 @@ golden `7d4afe61` is unchanged.  Several are MUTUALLY-EXCLUSIVE or interacting b
 
 ### Golden-MOVING (moves the fingerprint itself)
 
-The current default golden is **`7d4afe61`** (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON, 2026-08-06).
-The pre-fix golden **`069cc32f`** is the `C4_BP_RESTORE_HIBYTE=0` escape-hatch build.
+The current default golden is **`3cabef64`** (both `C4_DIVMOD_SIGNED` and `C4_BP_RESTORE_HIBYTE`
+DEFAULT-ON, 2026-08-06 → 100% C90-general). Rollback ladder: `C4_DIVMOD_SIGNED=0` → **`7d4afe61`**
+→ `C4_BP_RESTORE_HIBYTE=0` → the historical **`069cc32f`**.
 
 | flag | purpose | default | depends | golden |
 |---|---|---|---|---|
-| `C4_BP_RESTORE_HIBYTE` | LEV/pop scalar recompose reads fp32-safe 5 nibbles (not fp64-only 8) — general-program-correctness fix; makes Mandelbrot fully byte-exact, doom stays byte-exact | **1 (on)** | — | **golden-MOVING** (DEFAULT-ON golden = `7d4afe61`; `=0` reverts to the pre-fix `069cc32f` escape-hatch build) |
+| `C4_DIVMOD_SIGNED` | signed trunc-toward-zero DIV/MOD (#790) — the last C90-general fix (+4, 0 regressions) | **1 (on)** | — | **golden-MOVING** (DEFAULT-ON golden = `3cabef64`; `=0` → `7d4afe61`) |
+| `C4_BP_RESTORE_HIBYTE` | LEV/pop scalar recompose reads fp32-safe 5 nibbles (not fp64-only 8) — general-program-correctness fix; makes Mandelbrot fully byte-exact, doom stays byte-exact | **1 (on)** | — | **golden-MOVING** (middle rung: with `C4_DIVMOD_SIGNED=0` → `7d4afe61`; `=0` reverts to the pre-fix `069cc32f`) |
 | `C4_INGEST_WIDE` | 1-query/1-KV wide ingest — restructures block-0 to a 1-head packed-dim Attn | unset→off | — | **golden-MOVING** (ON hash ≠ default golden; packed-dim by construction) |
 | `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — widens NUM_OPS 40→48 | unset→off | — | **golden-MOVING** (wider OP_IS band; ON `2f69350f…` was measured on the `069cc32f` base, shifts under the new default) |
 | `C4_DOOM_DRAWCOL` | native DRAWCOL/DRAWSPANF gameplay render-macro opcodes (48/49) — 3D analog of the DRAWSPAN patch fold; widens NUM_OPS | unset→off | — | **golden-MOVING** (wider OP_IS band by construction; default-OFF golden `069cc32f`/`7d4afe61` unchanged) |

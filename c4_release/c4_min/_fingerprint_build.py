@@ -79,9 +79,15 @@ def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
     # MOVED hash (packed-dim, differs from the dense build_pure_forward_complete_model
     # hash by construction), flag-OFF is the golden.
     #
-    # CURRENT GOLDEN (default): 7d4afe61a12fc7aecfb9bed97adc4a50bccfae88e83dc6076c881a63b4874e44
-    #   (short 7d4afe61).  RE-BASELINED 2026-08-06 from 069cc32f by the DEFAULT-ON flip of
-    #   ``C4_BP_RESTORE_HIBYTE`` (a general-program-correctness fix, see
+    # CURRENT GOLDEN (default): 3cabef6479d183296384b99d25caec9ecd6bc9b2a0f1511d6c89a3689a5ae7b2
+    #   (short 3cabef64).  RE-BASELINED 2026-08-06 from 7d4afe61 by the DEFAULT-ON flip of
+    #   ``C4_DIVMOD_SIGNED`` (#790 — the last C90-general fix: signed trunc-toward-zero DIV/MOD via
+    #   the ``compile_divmod_sign_prep``/``compile_divmod_sign_apply`` sign-magnitude wrapper in
+    #   ``nibble_alu32``; +4 C90 correctness, 0 regressions, doom + Mandelbrot byte-exact).
+    #   ROLLBACK LADDER: ``C4_DIVMOD_SIGNED=0`` -> 7d4afe61 -> ``C4_BP_RESTORE_HIBYTE=0`` -> 069cc32f.
+    #
+    #   7d4afe61 (the ``C4_DIVMOD_SIGNED=0`` rung) was itself RE-BASELINED 2026-08-06 from 069cc32f
+    #   by the DEFAULT-ON flip of ``C4_BP_RESTORE_HIBYTE`` (a general-program-correctness fix, see
     #   ``nibble_pure_forward_complete._bp_restore_hibyte_nibs``): the three LEV/pop scalar
     #   recomposes (``compile_stk_recompose`` / ``compile_unify_stk_recompose`` /
     #   ``compile_lev_ret_recompose``) now read the fp32-safe ``_recompose_hi_nibbles()`` = 5
@@ -103,8 +109,8 @@ def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
     #   ``c4_min.doom_drawspan``) that fuses Doom's V_DrawPatch column-copy loop.
     #   OFF -> ``isa.num_ops_effective`` stays NUM_OPS=40, so the OP_IS one-hot band
     #   and every downstream layout dim are byte-identical -> the DRAWSPAN-OFF
-    #   fingerprint is the golden (7d4afe61 by default; 069cc32f with
-    #   ``C4_BP_RESTORE_HIBYTE=0``).  ON -> ``num_ops_effective`` widens to
+    #   fingerprint is the golden (3cabef64 by default; 7d4afe61 with ``C4_DIVMOD_SIGNED=0``;
+    #   069cc32f with ``C4_DIVMOD_SIGNED=0 C4_BP_RESTORE_HIBYTE=0``).  ON -> ``num_ops_effective`` widens to
     #   NUM_OPS_DRAWSPAN=48 so the opcode-47 one-hot has a slot (the SAME lever
     #   NUM_OPS_FLOAT uses), which is an INTENTIONAL move of the fingerprint (wider
     #   OP_IS band by construction):
