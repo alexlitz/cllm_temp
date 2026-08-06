@@ -98,10 +98,15 @@ recursive-descent c4 compiler (`minic.c` — tokenizer + precedence-climbing `ex
 to c4 bytecode and run *as a program* on the 32-bit doom transformer (code-from-memory), emits
 correct bytecode with the model verifying **every step byte-exact**: `2+3*4` →
 `IMM 2;PSH;IMM 3;PSH;IMM 4;MUL;ADD;LEV` (1882/1882 steps accepted), operator precedence, and
-depth-6 nested-paren recursion (4746 steps). The single wall to a real Doom *module* is now
-pinpointed: the model's **8-bit LEA local-address decode** (`(BP+4·imm) mod 256`) caps the stack
-at ~6 recursion levels — widening it to the full-32-bit address decode (the #854 migration) is
-the one change that unblocks real modules. Golden unchanged; behind default-OFF flags.
+depth-6 nested-paren recursion (4746 steps). **That wall — the model's 8-bit LEA local-address
+decode (`(BP+4·imm) mod 256`, which capped the stack at ~6 levels) — is now broken** by a
+full-32-bit LEA decode (`C4_LEA_WIDE` + the fine-grained wide set, #854): minic compiles **12-level
+recursion byte-exact** (8280/8280 accepted, emitted bytecode == gcc — *double* the old wall) and a
+**real Doom-constant leaf function** (`320*200-(65536-(8192+…))` with SCREENWIDTH/FRACUNIT/etc.,
+= 59458) **byte-exact** (7120/7120) on the 32-bit transformer. Wide-LEA is a byte-exact *superset*
+of the 8-bit fold (it matches the native-c4 32-bit oracle where the fold is wrong), flag-gated with
+the golden preserved OFF. So a real Doom *module* is now within reach on the 32-bit route —
+bounded by compose/perf/scale, not by correctness. Golden unchanged; behind default-OFF flags.
 
 - **C90 conformance: 100% general as the DEFAULT build.** Measured per-case vs the faithful
   `native_c4` oracle (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build:
