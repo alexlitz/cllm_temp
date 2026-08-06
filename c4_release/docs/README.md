@@ -28,6 +28,8 @@ Let's dive into how it works.
 > C90 conformance 97.6% → 100%, and a compiler-in-weights covering arithmetic + all six C
 > comparisons + Doom fixed-point shifts) — see
 > [`DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md`](DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md).
+> To **reproduce** each result yourself (copy-pasteable commands + expected hashes),
+> see [`RUN_RECIPES.md`](RUN_RECIPES.md).
 
 ---
 
