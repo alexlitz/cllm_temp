@@ -274,6 +274,7 @@ The pre-fix golden **`069cc32f`** is the `C4_BP_RESTORE_HIBYTE=0` escape-hatch b
 | `C4_BP_RESTORE_HIBYTE` | LEV/pop scalar recompose reads fp32-safe 5 nibbles (not fp64-only 8) — general-program-correctness fix; makes Mandelbrot fully byte-exact, doom stays byte-exact | **1 (on)** | — | **golden-MOVING** (DEFAULT-ON golden = `7d4afe61`; `=0` reverts to the pre-fix `069cc32f` escape-hatch build) |
 | `C4_INGEST_WIDE` | 1-query/1-KV wide ingest — restructures block-0 to a 1-head packed-dim Attn | unset→off | — | **golden-MOVING** (ON hash ≠ default golden; packed-dim by construction) |
 | `C4_DOOM_DRAWSPAN` | native DRAWSPAN render-macro opcode (47) — widens NUM_OPS 40→48 | unset→off | — | **golden-MOVING** (wider OP_IS band; ON `2f69350f…` was measured on the `069cc32f` base, shifts under the new default) |
+| `C4_DOOM_DRAWCOL` | native DRAWCOL/DRAWSPANF gameplay render-macro opcodes (48/49) — 3D analog of the DRAWSPAN patch fold; widens NUM_OPS | unset→off | — | **golden-MOVING** (wider OP_IS band by construction; default-OFF golden `069cc32f`/`7d4afe61` unchanged) |
 
 ### Golden-migration CANDIDATES (general-correctness, DEFAULT-OFF today)
 
@@ -284,15 +285,15 @@ again (the fingerprint changes because the ALU semantics change).
 
 | flag | purpose | default | depends | golden |
 |---|---|---|---|---|
-| `C4_SIGNED_DIVMOD` (real env name `C4_DIVMOD_SIGNED`, #790) | signed trunc-toward-zero `DIV`/`MOD` (C4/C convention) instead of the golden UNSIGNED base-16 floor divide — negate each negative operand to its magnitude before the divide, conditionally negate quotient (`SGN_A^SGN_B`) / remainder (`SGN_A`) after, via a two's-complement carry chain over the operand/result nibble bands. **Closes the last C90 failure class** (signed-negative `DIV`/`MOD`, the only non-100% conformance class). | unset→off | — | **golden-migration candidate** (OFF → DIV/MOD stay unsigned-floor → golden byte-IDENTICAL `7d4afe61`; flipping DEFAULT-ON would MOVE the golden, like `C4_BP_RESTORE_HIBYTE` did) |
+| `C4_DIVMOD_SIGNED` (#790; canonical env flag — the doc/capstone also calls it `C4_SIGNED_DIVMOD`, an alias with NO separate env read) | signed trunc-toward-zero `DIV`/`MOD` (C4/C convention) instead of the golden UNSIGNED base-16 floor divide — negate each negative operand to its magnitude before the divide, conditionally negate quotient (`SGN_A^SGN_B`) / remainder (`SGN_A`) after, via a two's-complement carry chain over the operand/result nibble bands. **Closes the last C90 failure class** (signed-negative `DIV`/`MOD`, the only non-100% conformance class). | unset→off | — | **golden-migration candidate** (OFF → DIV/MOD stay unsigned-floor → golden byte-IDENTICAL `7d4afe61`; flipping DEFAULT-ON would MOVE the golden, like `C4_BP_RESTORE_HIBYTE` did) |
 
-> Note: the env flag the code actually reads is `C4_DIVMOD_SIGNED`
+> Note: the CANONICAL env flag the code actually reads is `C4_DIVMOD_SIGNED`
 > (`nibble_alu32.py::_signed_divmod_enabled`, `nibble_pure_forward_complete.py`) — it also
 > appears in the Build-family selectors table above as the `doom-build` DIV/MOD-semantics
 > knob. It is repeated here because, as the general-correctness lever that closes the last
 > C90 class, it is a golden-migration candidate, not merely a doom-build selector.
-> `C4_SIGNED_DIVMOD` is the general-scope alias name used in the capstone; there is no
-> separate env read for it — set `C4_DIVMOD_SIGNED=1`.
+> `C4_SIGNED_DIVMOD` is ONLY a general-scope doc/capstone alias name; there is no
+> separate env read for it — always set `C4_DIVMOD_SIGNED=1`.
 
 ### CFM / build-mode / I/O / misc
 
@@ -310,6 +311,10 @@ again (the fingerprint changes because the ALU semantics change).
 | `C4_SELF_EMU_JSON` | self-emulation JSON output path | ? | — | byte-exact (harness) |
 | `C4_SELF_EMU_REPS` | self-emulation timing reps | 3 | — | byte-exact (harness) |
 | `C4_DIM_COALESCE`* | dim-coalesce (perf-fleet build; referenced in scripts) | — | — | doom-build |
+| `C4_GENUINE_STRUCTURED_ATTN` | fuller-genuine memory read (model's own softmax1+ALiBi over the reconstructed physical winner K/V) instead of trusting the draft's store_log value atom (`genuine_structured_attn.py`) | unset→off | — | byte-exact `069cc32f` (flag-gated faithfulness lever) |
+| `C4_MEM_EFF` | memory recall recency-horizon EFF (ALiBi recency window) override (`blogspec_memory.py`) | `500000.0` | — | byte-exact when horizon covers the program (sizing knob, not semantics) |
+| `C4_CODE_CAM_SLOPE` | code-segment CAM ALiBi slope override for the LI/LC address query (`nibble_pure_forward_complete.py`) | unset→built-in | — | byte-exact (tuning knob; unset uses the baked slope) |
+| `C4_BUILD_RSS_GUARD` / `C4_BUILD_RSS_CEIL_GB` | build-time RSS guard on/off and ceiling in GB — OOM safety on the streaming build (`compact_alloc.py`) | `1` (on) / (ceiling GB) | — | byte-exact (build memory-safety infra, output-neutral) |
 
 `*` referenced in agent/bench scripts, not a production module read — included for
 completeness of the audit cross-reference.
