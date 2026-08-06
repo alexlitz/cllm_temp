@@ -421,11 +421,24 @@ def build_faithful_precompute(draft, plan: FaithfulPlan, win_starts: np.ndarray,
     # frame bisect) instead of the O(log S) searchsorted over uniq_addr in _genuine_value_at.
     # Byte-identical per-read result; only the address->slot resolution ALGORITHM changes.
     from .hash_cam import hash_cam_enabled, build_hash_index, resolve_value_hashed
-    _hash_cam = hash_cam_enabled()
+    # C4_GENUINE_STRUCTURED_ATTN: the FULLER-genuine structured read.  When ON it RUNS the
+    # model's softmax1+ALiBi attention over the ONE hash-resolved winner store row (physical
+    # K/V reconstructed from the store residual via the baked W_q/W_k/W_v/W_o), instead of the
+    # store_log[frame][1] value atom the hash/searchsorted resolvers return.  It needs the hash
+    # index (the O(1) key-resolution), so it implies the hash build.  Byte-identical per-read
+    # result on a correct committed store-log; only the value DERIVATION becomes a genuine model
+    # recompute (more of the read is computed by the model's own weights + softmax1).
+    from .genuine_structured_attn import (genuine_structured_attn_enabled,
+                                          genuine_structured_value, cam_numerics)
+    _gsa = genuine_structured_attn_enabled()
+    _hash_cam = hash_cam_enabled() or _gsa
     _hash_index = (build_hash_index(plan.store_frames, plan.store_addr, plan.store_val)
                    if _hash_cam else None)
+    _gsa_num = cam_numerics() if _gsa else None
 
     def _resolve(addr_arr, rf_arr):
+        if _gsa:
+            return genuine_structured_value(addr_arr, rf_arr, _hash_index, _gsa_num, mask=mask)
         if _hash_cam:
             return resolve_value_hashed(addr_arr, rf_arr, _hash_index)
         return _genuine_value_at(addr_arr, rf_arr, plan)
