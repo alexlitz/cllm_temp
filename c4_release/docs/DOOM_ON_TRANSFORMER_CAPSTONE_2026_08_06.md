@@ -114,7 +114,11 @@ Honest numbers, one A5000, byte-exact, on the render-reduced frames:
 
 The lever ladder (all byte-exact, default-OFF, golden-safe): doom-active block-skip →
 FFN wave-batch → WAD-hash frame → attention megakernel → block-0 fold → render
-superinstruction (DRAWCOL/DRAWSPANF) → 2-GPU frame-level. Then it stops:
+superinstruction (DRAWCOL/DRAWSPANF) → 2-GPU frame-level. The DEFINITIVE measured ladder
+table (each rung: what it does, measured factor, byte-exact y/n) + the composed full VM
+step (#841: all levers in ONE forward, FFN 72% / attention 28% / decode 1% of 2.49 µs/step
+→ 0.788 µs/step with block-0 fold, byte-exact) + the exact statement of what 6.89 M
+steps/s would require live in [`PERF_LADDER_FINAL.md`](PERF_LADDER_FINAL.md). Then it stops:
 
 - **Per-step is tapped.** The FFN is sparse-COO (median Dff≈138, ~8 active rows/block);
   a dense bf16 tensor-core FFN is **11.8× slower** because the useful work is 0.099% of
