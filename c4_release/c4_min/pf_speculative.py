@@ -73,6 +73,21 @@ def _draft_shift32() -> bool:
     return os.environ.get("C4_SHIFT32", "0") == "1"
 
 
+def _draft_read_to_mem() -> bool:
+    """DRAFT READ-into-memory selector.  DEFAULT OFF (``C4_DRAFT_READ_TO_MEM`` unset)
+    -> the historical draft: a READ syscall's input bytes are laid into ``store_log``
+    (the KV the MODEL recalls) and the token stream, but NOT into the draft's own
+    ``mem`` dict.  ON (``C4_DRAFT_READ_TO_MEM=1``) -> also write each read byte into the
+    draft ``mem`` so a later ``LC``/``LI`` in the DRAFT reads the byte (matching the true
+    VM / the model, which recalls it from the store_log KV).  REQUIRED for a program
+    that reads a buffer from stdin/a file and then re-reads every byte (a c4-compiler
+    tokenizing its C source): the OFF draft reads 0 for ``src[i]`` and diverges from the
+    model.  doom's single ``read(0,buf,1)`` never re-reads the byte, so its draft is
+    byte-identical either way; gated OFF keeps the whole existing corpus + doom draft
+    byte-identical."""
+    return os.environ.get("C4_DRAFT_READ_TO_MEM", "0") == "1"
+
+
 def _s32(v: int) -> int:
     """Interpret ``v`` as a signed 32-bit two's-complement integer (C4's ``int``)."""
     v &= 0xFFFFFFFF
@@ -683,6 +698,15 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             for (baddr, bval) in byte_stores:
                 frame_idx += 1
                 store_log[frame_idx] = (baddr & 0xFFFFFFFF, bval & 0xFF)
+                # C4_DRAFT_READ_TO_MEM (default OFF): also lay READ's input bytes into
+                # the draft's OWN `mem` dict so a later LC/LI(src[i]) in the DRAFT reads
+                # the byte (not 0).  The model already recalls it from store_log KV; this
+                # only fixes the draft-side oracle for programs that read stdin/a file and
+                # then re-read every byte (a c4-compiler reading its C source).  doom's
+                # single read(0,buf,1) never re-reads, so its draft is unaffected either
+                # way; gated OFF keeps the corpus/doom draft byte-identical.
+                if _draft_read_to_mem():
+                    mem[baddr & 0xFFFFFFFF] = bval & 0xFF
                 tokens += _build_frame(pc, ax, sp, bp, stk,
                                        mem_addr=baddr & 0xFFFFFFFF, mem_val=bval & 0xFF)
                 stream_len += V.FRAME_LEN

@@ -80,8 +80,21 @@ if _PKG_PARENT not in sys.path:
 # imports THIS module, which re-pins SP_INIT — so this value is in force at draft time.
 import c4_min.nibble_pure_forward as _PF        # noqa: E402
 import c4_min.nibble_pure_forward_complete as _PFC  # noqa: E402
-_PF.SP_INIT = 0xFC
-_PFC.SP_INIT = 0xFC
+# C4_SP_INIT (default 0xFC): the stack base.  0xFC keeps the whole 1096 corpus + doom
+# in an 8-bit-addressable stack window [4,252] (the LM value-head _snap_lane argmax
+# over v>=0 can't represent a NEGATIVE SP, so it must not underflow 0).  A DEEP
+# recursive-descent program (a c4-compiler parsing nested expressions) drives SP far
+# below 0 at 0xFC and the frame collapses -> the SP-WIDE stack wall.  Raise it (e.g.
+# C4_SP_INIT=0xF000 = 61440 bytes of stack below the data segment at 0x10000) to give
+# the recursion room.  This is an ADDRESS choice fed to the draft + the model's SP
+# register decode; addr32 mode carries the full 32-bit SP, so the KV store/recall works
+# — but the LEA/LI LOCAL-address decode window and the value-head SP snap must cover the
+# larger range (validated empirically per program).  DEFAULT 0xFC == byte-identical to
+# the whole existing corpus/doom (their SP never crosses the 8-bit window).
+import os as _os_spinit
+_SP_INIT = int(_os_spinit.environ.get("C4_SP_INIT", "0xFC"), 0)
+_PF.SP_INIT = _SP_INIT
+_PFC.SP_INIT = _SP_INIT
 
 from c4_min import isa  # noqa: E402
 from c4_min.nibble_pure_forward_complete import (  # noqa: E402
