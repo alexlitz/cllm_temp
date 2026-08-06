@@ -1,0 +1,8 @@
+[minic-wide] SP_INIT=0xf000 lea_wide=True fine_grained=True
+[minic-wide] compiler instrs=752 input='/tmp/t853/d12.c' (69 bytes) K=200
+[minic-wide] draft steps=8280 halted=True code_off=752 n_prtf=38 REF_OUTPUT=b'1 1\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n13 0\n1 2\n25 0\n8 0\n' wall=0.23s
+[minic-wide] built dim=1464 blocks=263 build=21s peakRSS=1.8GB
+[minic-wide] verify_blocks matched=True forwards=76 accepted=8280/8280 wall=237.6s ms/step=28.7 eff_K=50 peak_vram=18.5GB
+[minic-wide] MODEL accepted all 8280 steps byte-exact: True
+[minic-wide] WIDE-LEA COMPILER-ON-32BIT-TRANSFORMER byte-exact: True
+[minic-wide] emitted bytecode:
