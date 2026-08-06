@@ -19,6 +19,7 @@ default with `python -m c4_min._fingerprint_build` → `7d4afe61`. See
 ### C-toolchain status
 - [CAPSTONE_TOOLCHAIN_STATUS.md](CAPSTONE_TOOLCHAIN_STATUS.md) — which C-toolchain claims hold via the byte-exact CPU / native c4 execution (compiler + transpiler), audited against a native `./c4` oracle.
 - [SELFHOST_BASELINE.md](SELFHOST_BASELINE.md) — the real self-hosting C compiler the #848/#853 transformer route targets, and whether a CPU-VM form of it exists.
+- [FLOAT_STATUS.md](FLOAT_STATUS.md) — soft-float / native FP ISA status: fixed-point (Mandelbrot) + a genuine `float` C program bit-exact via the soft-float ABI + native `C4_FLOAT_OPS` opcodes; honest gaps (softfloat lib source in `c4_doom`, no `double` opcode, subnormals deferred).
 
 ### Performance
 - [PERF_LADDER_FINAL.md](PERF_LADDER_FINAL.md) — definitive honest perf ladder (#841 + #849): every number measured (on stated GPU/frame) or explicitly labelled a projection.
