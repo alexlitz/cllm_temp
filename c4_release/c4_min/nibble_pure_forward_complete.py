@@ -1217,6 +1217,26 @@ def compile_lea_q_reduce(L, dim: int) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def _fine_grained_wide_enabled() -> bool:
+    """The DOOM-PROVEN fine-grained full-32-bit config: every per-concern wide flag ON
+    EXCEPT the buggy two-limb ``C4_VM_WIDTH32`` value substrate.  DEFAULT OFF (all six
+    flags off -> golden ``069cc32f`` byte-identical).
+
+    Umbrella = ``C4_CMP32 ∧ C4_SHIFT32 ∧ C4_PC_WIDE ∧ C4_GLOBAL_ADDR32 ∧ C4_SP_WIDE ∧
+    C4_DIVMOD_SIGNED``.  This is the config that gives 7/7 signed compares, 0 CMP
+    divergences, and correct signed DIV/MOD/SHL/SHR (evidence: /tmp/c4_stage1
+    ``regcheck_doomcfg.txt`` 7/7 vs the ``C4_VM_WIDTH32``-substrate ``regcheck_*``
+    2/7 — the two-limb value substrate REGRESSES signed CMP ``GT(5,-5)→0`` /
+    ``NE(5,-5)→0`` and SHIFT because it recomposes a wide scalar with ~1e-6 residue
+    that reaches ~±1 at ~10^6-scale operands and mis-fires the sign/tie).  It is the
+    #854 Stage-2 target and the substrate the wide-LEA is now gated onto (below)."""
+    from .nibble_vm import _pc_wide_enabled, sp_wide_enabled
+    from .nibble_pure_forward import global_addr32_enabled
+    return (_cmp32_enabled() and _shift32_enabled() and _pc_wide_enabled()
+            and global_addr32_enabled() and sp_wide_enabled()
+            and _divmod_signed_enabled())
+
+
 def _lea_wide_enabled() -> bool:
     """WIDE (full-32-bit) LEA on the CFM/lean path (#824 ``C4_LEA_WIDE`` ported into
     the ``build_pure_forward_complete_model`` builder).  DEFAULT OFF.
@@ -1230,22 +1250,32 @@ def _lea_wide_enabled() -> bool:
     ``LEA 40`` off ``BP = 0x10000`` folds to ``0xa0`` instead of the full ``0x100a0``,
     and any load through it reads the wrong cell.
 
-    ON (whenever the width-32 substrate is enabled, ``vm_width32()``; compose with
-    ``C4_SP_WIDE`` for the full BP recompose and ``C4_GLOBAL_ADDR32`` for the wide
-    load address) the ``lea-wide`` blocks below recompute the FULL address
-    ``AX = BP + 4·imm`` across all 4 bytes via a nibble-domain byte-ripple-add
-    (every intermediate < 512 -> fp32-EXACT, no wide-scalar recompose), matching the
-    unified builder and the full-address Rust c4vm32 reference.  The byte-0 result is
-    identical to the folded path (``ax-byte-nib`` already wrote AX nibbles 0,1 =
-    ``(BP_low+4·imm)&0xFF``); the wide blocks OVERWRITE AX nibbles 2..7 with bytes
-    1..3 of the full sum (carry-propagated from byte 0), gated on OP_IS[LEA].
+    ON the ``lea-wide`` blocks below recompute the FULL address ``AX = BP + 4·imm``
+    across all 4 bytes via a nibble-domain byte-ripple-add (every intermediate < 512 ->
+    fp32-EXACT, no wide-scalar recompose), matching the unified builder and the
+    full-address Rust c4vm32 reference.  The byte-0 result is identical to the folded
+    path (``ax-byte-nib`` already wrote AX nibbles 0,1 = ``(BP_low+4·imm)&0xFF``); the
+    wide blocks OVERWRITE AX nibbles 2..7 with bytes 1..3 of the full sum
+    (carry-propagated from byte 0), gated on OP_IS[LEA].
 
-    Gated STRICTLY on ``vm_width32()``: OFF (the golden 069cc32f flags-off build) the
-    ``lea-wide`` scratch bands are never allocated and the blocks are never appended,
-    so the layout / every baked weight / the golden fingerprint are byte-identical.
-    Kill-switch ``C4_LEA_WIDE=0`` forces the fold even under width-32 (escape hatch)."""
-    from .nibble_vm import vm_width32
-    if not vm_width32():
+    GATE (#854 re-gate, decoupled from the buggy substrate): the wide-LEA activates iff
+    ``C4_LEA_WIDE!=0`` AND the DOOM-PROVEN fine-grained wide set is enabled
+    (``_fine_grained_wide_enabled()``: ``C4_CMP32 ∧ C4_SHIFT32 ∧ C4_PC_WIDE ∧
+    C4_GLOBAL_ADDR32 ∧ C4_SP_WIDE ∧ C4_DIVMOD_SIGNED``).  It requires ``C4_SP_WIDE`` for
+    the full BP recompose and ``C4_GLOBAL_ADDR32`` for the wide load address to be
+    MEANINGFUL, and it must NOT require the two-limb ``C4_VM_WIDTH32`` value substrate —
+    that substrate REGRESSES signed CMP (``GT(5,-5)→0`` / ``NE(5,-5)→0``) and SHIFT
+    (see ``_fine_grained_wide_enabled``), while the fine-grained set gives 7/7 signed
+    compares and 0 CMP divergences.  This decouples the CORRECT wide-LEA from the broken
+    substrate: the folded golden path is unchanged, and the doom fine-grained config now
+    gets BOTH correct signed CMP AND the wide frame address.
+
+    OFF (the golden 069cc32f flags-off build, or any config missing a fine-grained
+    flag) the ``lea-wide`` scratch bands are never allocated and the blocks are never
+    appended, so the layout / every baked weight / the golden fingerprint are
+    byte-identical.  Kill-switch ``C4_LEA_WIDE=0`` forces the fold even under the full
+    fine-grained set (escape hatch)."""
+    if not _fine_grained_wide_enabled():
         return False
     return _os.environ.get("C4_LEA_WIDE", "1") != "0"
 

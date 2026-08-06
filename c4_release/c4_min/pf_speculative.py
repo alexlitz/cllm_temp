@@ -650,8 +650,10 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         nibbles;
       * LEA is folded to 8 bits by default (``compile_ax_byte_to_nibbles`` +
         ``_fold_ax_gated``), or the FULL 32-bit frame address ``BP + 4*imm`` under the
-        wide gate (``_lea_wide_enabled`` — ``vm_width32() and C4_LEA_WIDE!=0``), matching
-        a42384's ``lea-wide`` model blocks and the Rust c4vm32 full-address reference;
+        wide gate (``_lea_wide_enabled`` — ``C4_LEA_WIDE!=0`` AND the fine-grained wide
+        set ``C4_CMP32 ∧ C4_SHIFT32 ∧ C4_PC_WIDE ∧ C4_GLOBAL_ADDR32 ∧ C4_SP_WIDE ∧
+        C4_DIVMOD_SIGNED``, #854 — NOT the buggy ``C4_VM_WIDTH32`` substrate), matching
+        the model's ``lea-wide`` blocks and the Rust c4vm32 full-address reference;
       * ADD/SUB/MUL/DIV/MOD are 32-bit (``mask``); cmp/bitwise are 8-bit by default,
         or 32-bit signed under ``C4_DRAFT_CMP32`` (matching the model);
       * PSH/JSR/ENT/SI stores carry the full 32-bit AX (the KV memory value band).
@@ -825,7 +827,8 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
             # OFF): the model's ``compile_ax_byte_to_nibbles`` writes only AX byte 0, so
             # the draft mirrors the fold ``& 0xFF`` (byte-identical to every prior draft;
             # golden 069cc32f / CFM 7d19cdc3 untouched).  WIDE (``_lea_wide_enabled`` —
-            # the SAME gate a42384's model port uses: ``vm_width32() and C4_LEA_WIDE!=0``):
+            # the SAME gate the model port uses: ``C4_LEA_WIDE!=0`` AND the fine-grained
+            # wide set, NOT ``C4_VM_WIDTH32``; re-gated #854):
             # the ``lea-wide`` blocks recompute the FULL 32-bit address (byte-ripple ADD,
             # sign-extended imm), so ``LEA 40`` off BP=0x10000 -> 0x100a0 and ``LEA -18``
             # -> BP-72 (0xffb8 low half) — matching the wide model AND the Rust c4vm32
