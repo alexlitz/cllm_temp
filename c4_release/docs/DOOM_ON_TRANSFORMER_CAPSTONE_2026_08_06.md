@@ -76,8 +76,26 @@ the high nibbles (`0x10000`→`0xFEEF`); fixed to the fp32-safe 5-nibble recompo
 (`C4_BP_RESTORE_HIBYTE`). The earlier "general programs diverge at ~14%" was the *vanilla*
 build; the hardened build is far more general.
 
-- **C90 conformance on the hardened build: _[pending — a7ccc9bc]_** (old vanilla ~14%;
-  expected substantially higher given Mandelbrot).
+**The weights are also a C compiler.** Separately from *running* compiled bytecode, a
+compiler-in-weights build (`BakedCompilerMachine`) reads C *source*, emits c4 bytecode,
+and runs it — one transformer forward per VM step — with the produced arithmetic core
+verified **byte-identical to native `./c4`**. It now covers arithmetic **plus all six C
+comparisons plus Doom fixed-point `SHL`/`SHR`** (`1<<4`→16, `7>>2`→1). This substrate is
+honestly bounded: it is an 8-bit-immediate machine, so c4's 32-bit frame-relative locals
+(`LEA -8` = `0xfffff800`), `ENT`/`LEV`, and jump targets >255 are unencodable — named
+functions/locals/loops (i.e. a real Doom *module*) are out of reach here and belong to the
+32-bit code-from-memory route, not this in-weights compiler.
+
+- **C90 conformance on the hardened build: 166/170 byte-exact = 97.6%** (of cases run;
+  battery still draining the heaviest positive-arith tail, no new failure classes) — up
+  from the old **vanilla ~14%**. Measured per-case vs the faithful `native_c4` oracle
+  (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build. Every
+  conformance class is 100% (arith/pointers/recursion incl. 3-way mutual/functions/
+  strings/control/cmp/bitwise/promote/overflow/enum/bitfield/seqpoint/arrays/loops/
+  linkage/storage/expr) except **one**: signed-negative `DIV`/`MOD` (4 cases) — the
+  nibble ALU does unsigned base-16 long division where gcc does signed trunc-toward-zero.
+  One negate-by-dividend-sign wrapper closes it; nothing else diverges across the corpus.
+  Harness + corpus committed under `id_port/c90_e2e/` (test-only, golden untouched).
 - **Golden migration DONE:** the correctness fix (`C4_BP_RESTORE_HIBYTE`, the fp32-safe
   5-nibble LEV recompose) is now **default-ON** — the doom-build golden moved
   `069cc32f → 7d4afe61` (verified: doom 30000/30000 + Mandelbrot byte-exact ship by
