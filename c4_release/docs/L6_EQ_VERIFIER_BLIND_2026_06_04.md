@@ -5,7 +5,7 @@ Worktree: `/tmp/c4-l6-eq-fix/c4_release/`
 Branch: `l6-eq-fix` (off `0863d7cb` on `speedup-cache-and-buckets`)
 Author: agent (Claude Opus 4.7)
 Brief: §"Recommended next step" of
-[`EQ_BLOCK_DIFF_2026_06_04.md`](EQ_BLOCK_DIFF_2026_06_04.md) — attempt
+[`EQ_BLOCK_DIFF_2026_06_04.md`](archive/EQ_BLOCK_DIFF_2026_06_04.md) — attempt
 the L6 EQ(17,17) byte-1 corruption fix.
 
 ## TL;DR

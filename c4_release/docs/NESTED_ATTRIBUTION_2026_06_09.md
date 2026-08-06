@@ -208,15 +208,15 @@ Wave S1 memory cluster + S2 LEA.
 
 ## Cross-references
 
-- [`1096_CUMULATIVE_PASS_COUNTS_2026_06_07.md`](1096_CUMULATIVE_PASS_COUNTS_2026_06_07.md)
+- [`1096_CUMULATIVE_PASS_COUNTS_2026_06_07.md`](archive/1096_CUMULATIVE_PASS_COUNTS_2026_06_07.md)
   — base 50/50 fail measurement.
-- [`EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md`](EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md)
+- [`EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md`](archive/EDGE_ABSDIFF_BOOL_ATTRIBUTION_2026_06_07.md)
   — prior `nested_quad` attribution under Bug #26/#33; Wave C5 (BZ
   re-fire) + Wave C7 (post-LEV AX) definitions.
 - [`BUG_CATALOG.md`](BUG_CATALOG.md) — Bug #26 (`absdiff_` /
   `nested_quad_` dead categories), Bug #33 (post-LEV AX corruption,
   primary attribution for this cluster).
-- [`1096_LOOP_RECURSION_SAMPLE_2026_06_07.md`](1096_LOOP_RECURSION_SAMPLE_2026_06_07.md)
+- [`1096_LOOP_RECURSION_SAMPLE_2026_06_07.md`](archive/1096_LOOP_RECURSION_SAMPLE_2026_06_07.md)
   — rec_factorial pass-through pattern (`n! → n`), structurally
   identical to `nested_quad(n) → n`.
 - Memory note `project_l10_psh_addr_ent_bug.md` — L10 PSH addr0_e0

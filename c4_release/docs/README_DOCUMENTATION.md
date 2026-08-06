@@ -1,218 +1,117 @@
 # Documentation Index
 
-**Purpose**: Central index of all documentation in the C4 Neural VM project
+**Purpose**: Central index of the documentation in the C4 Neural VM project.
 
-## Quick Navigation
-
-### Core Architecture
-- [DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md](DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md) - **★ Finalization capstone** — Doom + a general C toolchain byte-exact on the transformer (default golden `7d4afe61`)
-- [README.md](README.md) - Main architecture overview
-- [OPCODE_TABLE.md](OPCODE_TABLE.md) - Complete opcode reference
-- [C4_NATIVE_VM.md](C4_NATIVE_VM.md) - Native C4 VM implementation
-
-### Weight Setting & Compilation
-- [WEIGHT_SETTING_APPROACHES.md](WEIGHT_SETTING_APPROACHES.md) - **NEW** Hand-set vs compiled weights comparison
-- [WEIGHT_COMPILER_DESIGN.md](WEIGHT_COMPILER_DESIGN.md) - Compiler design philosophy
-- [WEIGHT_COMPILER_PRIMITIVES.md](WEIGHT_COMPILER_PRIMITIVES.md) - Primitive operations
-- [GRAPH_WEIGHT_COMPILER.md](GRAPH_WEIGHT_COMPILER.md) - Graph-based compilation
-- [NEURAL_COMPILER.md](NEURAL_COMPILER.md) - Neural compilation approach
-
-### Testing & Validation
-- [MEMORY_TEST_COVERAGE.md](MEMORY_TEST_COVERAGE.md) - **NEW** Memory test analysis
-- [TESTING_CHECKLIST.md](TESTING_CHECKLIST.md) - Testing checklist
-- [CHECKLIST_STATUS.md](CHECKLIST_STATUS.md) - Current status
-- [C4_OPCODE_STATUS.md](C4_OPCODE_STATUS.md) - Opcode implementation status
-
-### Specialized Features
-- [IO_ATTENTION_MECHANISM.md](IO_ATTENTION_MECHANISM.md) - I/O handling
-- [KV_CACHE_EVICTION.md](KV_CACHE_EVICTION.md) - Cache eviction strategies
-- [EVICTION_ALGORITHM.md](EVICTION_ALGORITHM.md) - Eviction algorithm details
-- [SPECULATIVE_DECODING.md](SPECULATIVE_DECODING.md) - Speculative execution
-- [NEURAL_QUINE.md](NEURAL_QUINE.md) - Self-replicating programs
-
-### Optimization & Efficiency
-- [COMPUTATIONAL_EFFICIENCY.md](COMPUTATIONAL_EFFICIENCY.md) - Efficiency analysis
-- [SPARSE_EFFICIENCY.md](SPARSE_EFFICIENCY.md) - Sparse matrix optimization
-- [ALU_OPTIMIZATION_ANALYSIS.md](ALU_OPTIMIZATION_ANALYSIS.md) - ALU optimizations
-- [ALU_CHUNK_CONFIGS.md](ALU_CHUNK_CONFIGS.md) - ALU configuration
-- [PRECISION_ADAPTATION.md](PRECISION_ADAPTATION.md) - Numerical precision
-
-### Export & Deployment
-- [ONNX_EXPORT.md](ONNX_EXPORT.md) - ONNX export guide
-- [BUNDLER_GUIDE.md](BUNDLER_GUIDE.md) - Creating standalone executables
-- [PROGRAM_BAKING.md](PROGRAM_BAKING.md) - Baking programs into weights
-- [BAKED_COMPILER.md](BAKED_COMPILER.md) - Compiler baked into model
-
-### Examples & Guides
-- [MANDELBROT_EXAMPLE.md](MANDELBROT_EXAMPLE.md) - Mandelbrot set renderer
-- [ARGV_SETUP.md](ARGV_SETUP.md) - Command-line argument handling
-- [TOOL_CALLING.md](TOOL_CALLING.md) - Tool use integration
-
-### Project Management
-- [DOCUMENT_FIXES.md](DOCUMENT_FIXES.md) - Documentation fixes log
-- [DOCUMENT_CHECKLISTS.md](DOCUMENT_CHECKLISTS.md) - Documentation checklists
-- [POTENTIAL_PROJECTS.md](POTENTIAL_PROJECTS.md) - Future project ideas
-
-### Advanced Topics
-- [SELF_HOSTING.md](SELF_HOSTING.md) - Self-hosting C4 compiler
-- [QUINE.md](QUINE.md) - Quine implementation
-- [VANILLA_GENERATION.md](VANILLA_GENERATION.md) - Standard generation mode
-- [SOFTMAX_TOGGLE_PLAN.md](SOFTMAX_TOGGLE_PLAN.md) - Softmax configuration
-
-## Recent Additions (2026-04-07)
-
-### New Documentation
-
-1. **WEIGHT_SETTING_APPROACHES.md** - Comprehensive comparison of weight setting methods
-   - Hand-set weights: ~2,000 lines (including helpers)
-   - Compiled weights: 3,704 lines
-   - Code examples, use cases, migration path
-
-2. **MEMORY_TEST_COVERAGE.md** - Memory test analysis and gaps
-   - Current test coverage analysis
-   - Identified gaps in memory testing
-   - Recommendations for new tests
-   - Memory mechanism implementation details
-
-## Documentation by Category
-
-### For New Contributors
-
-**Start here**:
-1. [README.md](README.md) - Understand the architecture
-2. [OPCODE_TABLE.md](OPCODE_TABLE.md) - Learn the instruction set
-3. [TESTING_CHECKLIST.md](TESTING_CHECKLIST.md) - Run tests
-4. [WEIGHT_SETTING_APPROACHES.md](WEIGHT_SETTING_APPROACHES.md) - Understand weight configuration
-
-### For Researchers
-
-**Architectural deep dives**:
-- [NEURAL_COMPILER.md](NEURAL_COMPILER.md)
-- [IO_ATTENTION_MECHANISM.md](IO_ATTENTION_MECHANISM.md)
-- [COMPUTATIONAL_EFFICIENCY.md](COMPUTATIONAL_EFFICIENCY.md)
-- [WEIGHT_COMPILER_DESIGN.md](WEIGHT_COMPILER_DESIGN.md)
-
-### For Developers
-
-**Implementation guides**:
-- [BUNDLER_GUIDE.md](BUNDLER_GUIDE.md)
-- [ONNX_EXPORT.md](ONNX_EXPORT.md)
-- [PROGRAM_BAKING.md](PROGRAM_BAKING.md)
-- [MANDELBROT_EXAMPLE.md](MANDELBROT_EXAMPLE.md)
-
-### For Testing
-
-**Test-related documentation**:
-- [MEMORY_TEST_COVERAGE.md](MEMORY_TEST_COVERAGE.md) - Memory tests
-- [TESTING_CHECKLIST.md](TESTING_CHECKLIST.md) - Test checklist
-- [C4_OPCODE_STATUS.md](C4_OPCODE_STATUS.md) - Opcode status
-- [`../neural_vm/tests/README_MEMORY_TESTS.md`](../neural_vm/tests/README_MEMORY_TESTS.md) - Memory stress tests
-
-## Documentation Standards
-
-### File Naming
-- Use UPPERCASE_WITH_UNDERSCORES.md for documentation files
-- Use README.md for directory-specific guides
-- Use lowercase_with_underscores.md for code-related docs
-
-### Structure
-- Start with # Title
-- Include "Date" and "Status" if applicable
-- Use ## for major sections
-- Include code examples with syntax highlighting
-- Add cross-references to related docs
-
-### Updates
-- Update DOCUMENT_FIXES.md when fixing documentation
-- Add entries to this index when creating new docs
-- Keep status markers (✅ ⚠️ ❌) consistent
-
-## Test Documentation Location
-
-**Test-specific docs** are in the test directories:
-- `neural_vm/tests/README_MEMORY_TESTS.md` - Memory stress test guide
-- `tests/STATUS.md` - Test suite status
-- `tests/COMPACTION_TEST_PLAN.md` - Compaction tests
-
-## Contributing to Documentation
-
-### Adding New Documentation
-
-1. Create file in appropriate location (`docs/` for architecture, test dirs for tests)
-2. Follow naming conventions
-3. Add entry to this index
-4. Update DOCUMENT_FIXES.md if fixing existing docs
-5. Cross-reference related documents
-
-### Updating Existing Documentation
-
-1. Make changes
-2. Update "Date" field if present
-3. Add entry to DOCUMENT_FIXES.md
-4. Check cross-references still valid
-
-## Auto-Generated Documentation
-
-Some documentation is auto-generated:
-- ALU configuration tables
-- Opcode reference tables
-- Weight dimension mappings
-
-See individual files for generation scripts.
-
-## External Resources
-
-- [C4 Compiler Original](https://github.com/rswier/c4) - Original C4 implementation
-- [Anthropic Research](https://www.anthropic.com/research) - Transformer research
-- [ONNX Documentation](https://onnx.ai/onnx/) - ONNX format reference
-
-## Documentation TODOs
-
-- [ ] Add tutorial for creating custom opcodes
-- [ ] Document weight initialization strategies
-- [ ] Add performance benchmarking guide
-- [ ] Create troubleshooting guide
-- [ ] Document KV cache strategies in detail
-
-## Recently Moved Files
-
-Files moved from root to `docs/` (2026-04-07):
-- `WEIGHT_SETTING_APPROACHES.md` → `docs/WEIGHT_SETTING_APPROACHES.md`
-- `MEMORY_TEST_COVERAGE_ANALYSIS.md` → `docs/MEMORY_TEST_COVERAGE.md`
-
-## Quick Reference Card
-
-### Running Tests
-```bash
-# All tests
-pytest neural_vm/tests/ tests/ -v
-
-# Memory stress tests
-pytest neural_vm/tests/test_memory_stress.py -v
-
-# Opcode tests
-pytest neural_vm/tests/test_opcodes.py -v
-```
-
-### Building Documentation
-```bash
-# Generate opcode table
-python tools/generate_opcode_table.py > docs/OPCODE_TABLE.md
-
-# Update status
-python tools/check_opcode_status.py > docs/C4_OPCODE_STATUS.md
-```
-
-### Exporting Model
-```bash
-# Export to ONNX
-python tools/export_onnx.py --output model.onnx
-
-# Bundle executable
-python bundler/bundle_onnx_standard.py
-```
+**Golden ledger**: default build `7d4afe61` (`C4_BP_RESTORE_HIBYTE` DEFAULT-ON — the
+general-correctness fix). Rollback `069cc32f` (`C4_BP_RESTORE_HIBYTE=0`). The pure-neural
+`neural_vm/` 35-token golden is `e50521f3` (all campaign flags off). Sanity-check the
+default with `python -m c4_min._fingerprint_build` → `7d4afe61`. See
+[FLAG_REGISTRY.md](FLAG_REGISTRY.md) / [DOOM_FLAG_REGISTRY.md](DOOM_FLAG_REGISTRY.md).
 
 ---
 
-**Last Updated**: 2026-04-07
+## Finalization (2026-08-06 capstone)
+
+### Flagship + reproduction
+- [DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md](DOOM_ON_TRANSFORMER_CAPSTONE_2026_08_06.md) — **★ THE capstone.** Doom (and a general C toolchain) byte-exact on a vanilla-shaped transformer; honest record of what works, the measured numbers, and the projections measurement corrected.
+- [RUN_RECIPES.md](RUN_RECIPES.md) — copy-pasteable quickstart to re-run every headline result (CPU recipes verified by running).
+
+### C-toolchain status
+- [CAPSTONE_TOOLCHAIN_STATUS.md](CAPSTONE_TOOLCHAIN_STATUS.md) — which C-toolchain claims hold via the byte-exact CPU / native c4 execution (compiler + transpiler), audited against a native `./c4` oracle.
+- [SELFHOST_BASELINE.md](SELFHOST_BASELINE.md) — the real self-hosting C compiler the #848/#853 transformer route targets, and whether a CPU-VM form of it exists.
+
+### Performance
+- [PERF_LADDER_FINAL.md](PERF_LADDER_FINAL.md) — definitive honest perf ladder (#841 + #849): every number measured (on stated GPU/frame) or explicitly labelled a projection.
+- [`../c4_min/COMPOSED_FULL_STEP_841.md`](../c4_min/COMPOSED_FULL_STEP_841.md) — #841 composed full VM step, measured end-to-end and byte-exact vs the unfused reference, with attention/FFN/decode breakdown.
+
+### Flags & goldens
+- [DOOM_FLAG_REGISTRY.md](DOOM_FLAG_REGISTRY.md) — every `c4_min/` doom perf-fleet + pure-forward `C4_*` flag (default golden `7d4afe61` / rollback `069cc32f`).
+- [FLAG_REGISTRY.md](FLAG_REGISTRY.md) — every `neural_vm/` + `tools/` `C4_*` flag (campaign config; neural_vm golden `e50521f3`).
+
+### Doom vs general boundary
+- [DOOM_VS_GENERAL_BOUNDARY.md](DOOM_VS_GENERAL_BOUNDARY.md) — where DOOM-specific work ends and the general c4-VM core begins, at the flag and module level.
+- [HF_MODEL_FIT.md](HF_MODEL_FIT.md) — how `qwen_full_vm.build(...)` scales `(n_layers, hidden, intermediate)` to the op-set, and which stock HF (Qwen2) configs host which subset.
+- [ARCHIVE_INDEX.md](ARCHIVE_INDEX.md) — read-only audit index of unmerged branch work (negative results, prior-session perf levers, findings/measurement branches).
+
+---
+
+## Architecture & spec
+
+- [README.md](README.md) — main architecture overview
+- [OPCODE_TABLE.md](OPCODE_TABLE.md) — complete opcode reference
+- [BLOG_SPEC.md](BLOG_SPEC.md) — the authoritative build spec (follow exactly)
+- [AGENT_CONTEXT.md](AGENT_CONTEXT.md) — contributor/agent orientation
+- [PROBE_GROUNDTRUTH_2026_06_10.md](PROBE_GROUNDTRUTH_2026_06_10.md) — block↔layer map + spec_k=0 ground-truth probe
+- [CAMPAIGN_SUMMARY.md](CAMPAIGN_SUMMARY.md) — the 1096-pass campaign narrative
+- [CONSOLIDATION_REPORT.md](CONSOLIDATION_REPORT.md) — consolidation state of the codebase
+
+## Declarative weight-authoring (mandatory reading before writing an op)
+
+- [FFN_RULE_MIGRATION_PATTERN.md](FFN_RULE_MIGRATION_PATTERN.md) — FFN DSL: `FFNRule.constant_write` / `gated_write`, byte-identity gate
+- [ATTENTION_HEAD_IR_MIGRATION_PATTERN.md](ATTENTION_HEAD_IR_MIGRATION_PATTERN.md) — attention DSL: `DeclarativeAttentionHeadSpec`, `AP`/`AO`
+- [HOW_TO_ADD_A_CORRECTIVE_OP.md](HOW_TO_ADD_A_CORRECTIVE_OP.md) — 8-step recipe for a new corrective op
+- [BUILDING_BLOCKS_DSL.md](BUILDING_BLOCKS_DSL.md) — BLOG_SPEC §504-568 → constructor mapping
+- [RESIDUAL_BAND_REGISTRY_2026_06_13.md](RESIDUAL_BAND_REGISTRY_2026_06_13.md) — op-local over-width residual bands
+- [DIM_OWNERSHIP_REGISTRY.md](DIM_OWNERSHIP_REGISTRY.md) — `(layer, scope, identifier, column)` claim registry
+- [PHASE_7_FULLY_DYNAMIC_PLAN.md](PHASE_7_FULLY_DYNAMIC_PLAN.md) — current wave acceptance criteria
+
+## Weight-compiler design
+
+- [WEIGHT_SETTING_APPROACHES.md](WEIGHT_SETTING_APPROACHES.md) — hand-set vs compiled weights
+- [WEIGHT_COMPILER_DESIGN.md](WEIGHT_COMPILER_DESIGN.md) — compiler design philosophy
+- [WEIGHT_COMPILER_PRIMITIVES.md](WEIGHT_COMPILER_PRIMITIVES.md) — primitive operations
+- [GRAPH_WEIGHT_COMPILER.md](GRAPH_WEIGHT_COMPILER.md) — graph-based compilation
+
+## Testing & verification
+
+- [TESTING_CHECKLIST.md](TESTING_CHECKLIST.md) — testing checklist
+- [MEMORY_TEST_COVERAGE.md](MEMORY_TEST_COVERAGE.md) — memory test analysis and gaps
+- [CPU_FULL_TRACE_TRUTHFUL_2026_06_17.md](CPU_FULL_TRACE_TRUTHFUL_2026_06_17.md) — the CPU self-check that reproduces GPU framing verdicts
+- [CROSS_OP_ATTENTION_LINT_2026_06_17.md](CROSS_OP_ATTENTION_LINT_2026_06_17.md) — shared-head softmax regression lint
+- [`../neural_vm/tests/README_MEMORY_TESTS.md`](../neural_vm/tests/README_MEMORY_TESTS.md) — memory stress test guide
+- [TEST_PRUNE_MAP.md](TEST_PRUNE_MAP.md) — dead-fixture / legacy-test prune map
+
+## Project management
+
+- [DOCUMENT_FIXES.md](DOCUMENT_FIXES.md) — documentation fixes log
+
+---
+
+## Notes on this index
+
+- This index was rebuilt on 2026-08-06 during docs finalization. It lists only docs
+  whose target files exist. A prior version linked ~27 architecture files
+  (`C4_NATIVE_VM.md`, `NEURAL_COMPILER.md`, `IO_ATTENTION_MECHANISM.md`,
+  `KV_CACHE_EVICTION.md`, `ONNX_EXPORT.md`, `BUNDLER_GUIDE.md`, `MANDELBROT_EXAMPLE.md`,
+  `SELF_HOSTING.md`, `QUINE.md`, `SPECULATIVE_DECODING.md`, …) that no longer exist in
+  `docs/`; those dead links were dropped rather than left dangling. Historical
+  attribution / status docs live in [`archive/`](archive/) and
+  [ARCHIVE_INDEX.md](ARCHIVE_INDEX.md).
+- There are ~330 dated design/attribution docs in `docs/` beyond the curated list above.
+  This index curates the load-bearing entrypoints; use the finalization capstone and the
+  authoring-pattern guides as the front door, and browse `docs/` (and `docs/archive/`)
+  directly for the historical debugging record.
+
+## Documentation standards
+
+- **File naming**: `UPPERCASE_WITH_UNDERSCORES.md` for docs; `README.md` for
+  directory guides.
+- **Structure**: start with `# Title`; include a date and status line; use `##` for
+  major sections; cross-reference related docs (and verify the link resolves).
+- **Updates**: log fixes in [DOCUMENT_FIXES.md](DOCUMENT_FIXES.md); add an entry here
+  when creating a new load-bearing doc; keep status markers (✅ ⚠️ ❌) consistent.
+- **Golden discipline**: any docs/analysis change must leave the default golden
+  `7d4afe61` unchanged (`python -m c4_min._fingerprint_build`). Any weight-affecting
+  change must intend the hash it produces.
+
+## External resources
+
+- [C4 Compiler Original](https://github.com/rswier/c4) — original C4 implementation
+- [Anthropic Research](https://www.anthropic.com/research) — transformer research
+- [ONNX Documentation](https://onnx.ai/onnx/) — ONNX format reference
+
+---
+
+**Last Updated**: 2026-08-06 (docs finalization: index rebuilt, dead links pruned,
+finalization capstone docs integrated)
 **Maintainer**: See git history
