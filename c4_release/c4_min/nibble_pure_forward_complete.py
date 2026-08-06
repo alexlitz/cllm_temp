@@ -273,12 +273,12 @@ def _cmp32_enabled() -> bool:
 
 
 def _divmod_signed_enabled() -> bool:
-    """``C4_DIVMOD_SIGNED`` (DEFAULT OFF): compute DIV/MOD with C4/native-c4 SIGNED
+    """``C4_DIVMOD_SIGNED`` (DEFAULT ON — golden 3cabef64): compute DIV/MOD with C4/native-c4 SIGNED
     truncation-toward-zero semantics (quotient sign = sign(a)^sign(b), remainder sign
     = sign(a), magnitudes from the unsigned base-16 long division) instead of the
     golden's UNSIGNED floor.  Native c4 ``int`` is signed, so Doom's signed ``/`` /
-    ``%`` need this.  OFF -> DIV/MOD stay unsigned-floor -> golden byte-IDENTICAL."""
-    return _os.environ.get("C4_DIVMOD_SIGNED", "0") not in ("0", "", "false", "False")
+    ``%`` need this.  C4_DIVMOD_SIGNED=0 -> unsigned-floor rollback == the pre-migration golden 7d4afe61."""
+    return _os.environ.get("C4_DIVMOD_SIGNED", "1") not in ("0", "", "false", "False")
 
 
 # ===========================================================================
