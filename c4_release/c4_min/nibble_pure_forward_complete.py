@@ -133,6 +133,37 @@ def _unify_cam_head_enabled() -> bool:
         return True
     return os.environ.get("C4_UNIFY_CAM_HEAD", "0") not in ("0", "", "false", "False")
 
+
+def _bp_restore_hibyte_nibs() -> int:
+    """``C4_BP_RESTORE_HIBYTE`` (DEFAULT OFF): how many nibbles the LEV/pop STK_VAL /
+    BP_VAL / LEV_RET_VAL scalar recomposes read.
+
+    The frame-pointer-restore path (``compile_stk_recompose`` / ``compile_unify_stk_recompose``
+    / ``compile_lev_ret_recompose``) recomposes the saved BP / return-PC popped from the
+    KV store into its wide scalar lane as ``VAL = Σ_j 16^j·nibble_j``.  Historically it
+    HARDCODED 8 nibbles — the ``C4_VM_WIDTH32`` fp64 count, where ``16^7`` is exact — but
+    the doom/mandelbrot build runs the recompose in **fp32**, where ``16^7 = 2^28`` is far
+    past fp32's 2^24 unit precision.  A saved BP like ``0x10000`` (SP_INIT) arrives with a
+    clean nibble-4 but a ~1e-6 CAM-read RESIDUE on the high nibbles j=5,6,7 (which SHOULD
+    be 0).  The 8-nibble recompose weights that residue by ``16^7 ≈ 2.7e8`` → a −256/−16/−1
+    error, dragging ``0x10000`` down to ``0xFEEF`` (65536 → 65263, the mandelbrot boundary
+    step-688 LEV divergence).  The residue-immune per-byte-argmax decode
+    (``_decode_reg_from_nibbles``) is CORRECT on the SAME nibbles — only the wide-scalar
+    recompose amplifies the residue.
+
+    ON: read ``_recompose_hi_nibbles()`` nibbles — the SAME fp32-safe count the base
+    ``compile_nibble_to_scalar`` uses for EVERY other register (5 in fp32: coeff ≤ 16^4 =
+    2^16 < 2^24 fp32-exact; 8 in fp64/width32).  The dropped high nibbles j∈[5,7] carry only
+    residue (a real saved-BP / return-PC in these programs fits bits 0..19), so the value is
+    UNCHANGED for a clean value and residue-immune for a residue-laden one.  DEFAULT OFF ->
+    byte-identical golden (the doom golden ``069cc32f`` never hits the residue: its saved
+    BPs decode clean at 8 nibbles too)."""
+    import os
+    if os.environ.get("C4_BP_RESTORE_HIBYTE", "0") in ("0", "", "false", "False"):
+        return 8
+    from .nibble_vm import _recompose_hi_nibbles
+    return _recompose_hi_nibbles()
+
 # Number of nibbles the STATIC immediate-nibble program encoding carries per slot.
 # The corpus's largest VALUE literal is < 10^4 (< 16^4); 5 nibbles (< 16^5 ≈ 1.05M)
 # is generous headroom while keeping the CODE_IMM_NIB band (code_size × IMM_NIBS)
@@ -1703,7 +1734,7 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # PART A: build the muxed read address + merged enable BEFORE the merged head.
         block_specs.append(("unify-cam-prep", compile_unify_cam_prep(L, dim)))
     block_specs += [
-        ("stack-pop-cam", compile_stk_recompose(L, dim)),        # ATTN=stack+lev(+merged) heads
+        ("stack-pop-cam", compile_stk_recompose(L, dim, hi_nibbles=_bp_restore_hibyte_nibs())),  # ATTN=stack+lev(+merged) heads
     ]
     if _unify:
         # PART A: demux the merged-head value -> AX (load) / STACK0 (pop) + AX_VAL recompose.
@@ -1711,13 +1742,15 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # PART A fix: re-recompose STK_VAL from the demux-updated STACK0 (the demux
         # wrote STACK0 one block AFTER stack-pop-cam's stale STK_VAL recompose).  LEV
         # reads STK_VAL for BP=MEM[BP]; without this a nested LEV sets BP=0.
-        block_specs.append(("unify-stk-recompose", compile_unify_stk_recompose(L, dim)))
+        block_specs.append(("unify-stk-recompose",
+                            compile_unify_stk_recompose(L, dim, hi_nibbles=_bp_restore_hibyte_nibs())))
     if _one:
         # PART A+ (C4_UNIFY_CAM_ONE): the SECOND cam block.  The SAME merged head INDEX
         # re-fires here with query=LEV_QRY_BIN (BP+4), enable=IS_LEV -> LEV_RET; its FFN
         # recomposes LEV_RET_VAL.  This is LEV's SECOND read (the return PC) on the SAME
         # head as the first (MEM[BP]) — one head index, two sequential blocks.
-        block_specs.append(("lev-cam2", compile_lev_ret_recompose(L, dim)))
+        block_specs.append(("lev-cam2",
+                            compile_lev_ret_recompose(L, dim, hi_nibbles=_bp_restore_hibyte_nibs())))
     # LC SIGNED CHAR (c4 ``a = *(char *)a``): after the §Memory read has laid the
     # loaded byte into AX, sign-extend it for LC (byte >= 0x80 -> negative char ->
     # AX nibbles 2..7 filled with 0xF).  Two blocks: detect (LC_SIGN) then fill.  LI

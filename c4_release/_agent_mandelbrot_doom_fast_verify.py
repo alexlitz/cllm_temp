@@ -63,11 +63,27 @@ so LEV/BP restore is structurally correct.  The (-10,5) divergence is DATA-DEPEN
   WRAPPED-NEGATIVE signed values (AX reaches -3/-50/...) into the stack/mem KV.  The
   interior pixel keeps every value small/non-negative and never trips it.
 
-FIX TARGET: the BP-restore memory-value decode on LEV (the ``L.BP_VAL`` / "pop"-head
-MEM[BP] read) — the high-byte carry of a 3-byte saved-BP value under accumulated
-signed KV traffic.  This is the AX/BP high-byte 0xFF-leak family, surfacing on the
-frame-pointer restore rather than an AX arithmetic op — a REAL model decode wall, not
-the vanilla build's address-CAM aliasing.
+FIX (2026-08-06, ``C4_BP_RESTORE_HIBYTE``, DEFAULT OFF)
+------------------------------------------------------
+ROOT CAUSE (probed at the step-688 query row): the saved-BP nibble band is CORRECT
+(``_decode_reg_from_nibbles(STACK0) == 65536``), but the LEV/pop scalar recompose
+(``compile_stk_recompose`` / ``compile_unify_stk_recompose`` / ``compile_lev_ret_recompose``
+in ``nibble_pure_forward_complete``) HARDCODED ``hi_nibbles=8`` — the ``C4_VM_WIDTH32``
+fp64 count, where ``16^7`` is exact — while THIS build runs the recompose in **fp32**.
+The CAM read leaves a ~1e-6 RESIDUE on the high nibbles j=5,6,7 (which should be 0);
+the 8-nibble recompose weights that residue by ``16^5..16^7`` (up to 2.7e8) → a
+−256/−16/−1 error, dragging ``0x10000`` down to ``0xFEEF`` (65536 → 65263).  The base
+``compile_nibble_to_scalar`` (every OTHER register) already reads the fp32-safe
+``_recompose_hi_nibbles()`` = 5 (coeff ≤ 16^4 = 2^16 < 2^24) — only the three LEV/pop
+recomposes were inconsistent.
+
+FIX: gate the three LEV/pop recomposes to read ``_recompose_hi_nibbles()`` nibbles
+(=5 in fp32) under ``C4_BP_RESTORE_HIBYTE=1``.  The dropped high nibbles carried only
+residue (a real saved-BP / return-PC fits bits 0..19).  Flag-ON: boundary (-10,5) →
+4237/4237 byte-exact, interior (0,0) → 4201/4201, escape (-33,0) → 508/508.  DEFAULT
+OFF → golden ``069cc32f`` UNCHANGED and doom byte-exact (doom's LEV values decode clean
+at 8 nibbles too: max saved-BP=0xF4, max return-PC=0xE60, both fit the 5-nibble range,
+so doom is byte-exact flag-ON as well, 30000/30000).
 """
 from __future__ import annotations
 
