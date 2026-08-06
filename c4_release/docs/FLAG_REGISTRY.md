@@ -1,5 +1,11 @@
 # C4_* FLAG REGISTRY
 
+> **SCOPE: `neural_vm/` + `tools/` ONLY.** The `c4_min/` doom perf-fleet + pure-forward
+> VM flags (the `C4_DOOM_FAST` composite, the megablock / direct-CAM / schedule / precision
+> / build-family levers, and the `C4_WHOLE_STEP_GRAPH` vs `C4_WHOLESTEP_GRAPH` collision)
+> are inventoried SEPARATELY in [`DOOM_FLAG_REGISTRY.md`](DOOM_FLAG_REGISTRY.md). This file
+> does NOT cover them.
+
 Canonical inventory of every `C4_*` environment flag consulted at runtime
 (`os.environ.get` / `.setdefault` / `os.environ[...]`) across `neural_vm/` and
 `tools/`. Generated 2026-07-03 (golden `b4d2ab27...`, campaign is DEFAULT for
