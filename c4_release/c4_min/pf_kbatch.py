@@ -541,7 +541,15 @@ def _cap_bucket(n: int, K: int) -> int:
 def wholestep_graph_enabled() -> bool:
     """``C4_WHOLESTEP_GRAPH`` (DEFAULT OFF): collapse each maximal FFN-only block span
     between attention blocks into ONE fixed-shape masked CUDA graph (whole-step
-    launch-collapse).  OFF -> the #880 per-chain grouped graphs."""
+    launch-collapse).  OFF -> the #880 per-chain grouped graphs.
+
+    ⚠ NAMING COLLISION — DO NOT CONFUSE with ``C4_WHOLE_STEP_GRAPH`` (WITH a second
+    underscore) in ``whole_step_graph.py::whole_step_graph_enabled``.  That is a DIFFERENT
+    flag: it collapses BLOCK-0's per-chunk S-chunk loop, whereas THIS flag
+    (``C4_WHOLESTEP_GRAPH``, no underscore) collapses the FFN-only block SPANS.  Separate
+    levers, separate read-sites; there is intentionally NO alias between them.  Grep for
+    BOTH spellings before renaming either.  See docs/DOOM_FLAG_REGISTRY.md (collision
+    section)."""
     import os
     return os.environ.get("C4_WHOLESTEP_GRAPH", "0") not in ("0", "", "false", "False")
 

@@ -76,7 +76,15 @@ def whole_step_graph_enabled() -> bool:
     """``C4_WHOLE_STEP_GRAPH`` (DEFAULT OFF): collapse the block-0 S-chunk loop's
     per-chunk host dispatch (gather + graph + sync + scatter) into ONE CUDA-graph
     replay + precomputed sync-free scatter per chunk.  OFF -> the per-chunk eager loop
-    (byte-identical golden path)."""
+    (byte-identical golden path).
+
+    ⚠ NAMING COLLISION — DO NOT CONFUSE with ``C4_WHOLESTEP_GRAPH`` (NO second
+    underscore) in ``pf_kbatch.py::wholestep_graph_enabled``.  That is a DIFFERENT flag:
+    it collapses each maximal FFN-only block SPAN between attention blocks into one masked
+    CUDA graph (#880), whereas THIS flag (``C4_WHOLE_STEP_GRAPH``, with the underscore)
+    collapses BLOCK-0's per-chunk S-chunk loop.  They are separate levers with separate
+    read-sites; there is intentionally NO alias between them.  Grep for BOTH spellings
+    before renaming either.  See docs/DOOM_FLAG_REGISTRY.md (collision section)."""
     return os.environ.get("C4_WHOLE_STEP_GRAPH", "0") not in ("0", "", "false", "False")
 
 
