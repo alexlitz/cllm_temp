@@ -648,7 +648,10 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
       * IMM keeps the full literal ``imm & _IMM_MASK`` (5- or 8-nibble band; see
         ``C4_IMM_NIBS``) — the model's ``compile_imm_ax_nibbles`` writes all fetched
         nibbles;
-      * LEA is folded to 8 bits (``compile_ax_byte_to_nibbles`` + ``_fold_ax_gated``);
+      * LEA is folded to 8 bits by default (``compile_ax_byte_to_nibbles`` +
+        ``_fold_ax_gated``), or the FULL 32-bit frame address ``BP + 4*imm`` under the
+        wide gate (``_lea_wide_enabled`` — ``vm_width32() and C4_LEA_WIDE!=0``), matching
+        a42384's ``lea-wide`` model blocks and the Rust c4vm32 full-address reference;
       * ADD/SUB/MUL/DIV/MOD are 32-bit (``mask``); cmp/bitwise are 8-bit by default,
         or 32-bit signed under ``C4_DRAFT_CMP32`` (matching the model);
       * PSH/JSR/ENT/SI stores carry the full 32-bit AX (the KV memory value band).
@@ -662,6 +665,13 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
     """
     SP_INIT = _PFC.SP_INIT
     cmp32 = _draft_cmp32()               # 32-bit signed cmp draft (default OFF)
+    # WIDE LEA draft (#824, re-gated #854): mirror the MODEL's gate EXACTLY by importing
+    # ``_lea_wide_enabled`` (``C4_LEA_WIDE!=0`` AND the fine-grained wide set — NOT the
+    # buggy ``C4_VM_WIDTH32`` substrate) — reusing the SAME predicate (not a copy)
+    # guarantees the draft folds iff the model folds, in BOTH configs.  DEFAULT OFF ->
+    # LEA drafts folded ``& 0xFF`` (byte-identical golden).  Computed once here so it is
+    # available on both the RESUME and the fresh-start path below.
+    lea_wide = _PFC._lea_wide_enabled()  # full 32-bit ``BP + 4*imm`` when ON
     if resume is not None:
         # RESUME (Task #814/#866): re-seed the interpreter from a checkpoint and draft
         # the tail.  The draft-width flags MUST match the checkpoint (a different
@@ -811,7 +821,20 @@ def draft_pf_program(code: List[isa.Instr], max_steps: int = 300000,
         if op == isa.IMM:
             ax = imm & _IMM_MASK              # full 20-bit literal (model, not &0xFF)
         elif op == isa.LEA:
-            ax = (bp + 4 * imm) & 0xFF
+            # LEA = frame-relative pointer ``AX = BP + 4*imm``.  DEFAULT (folded, #824
+            # OFF): the model's ``compile_ax_byte_to_nibbles`` writes only AX byte 0, so
+            # the draft mirrors the fold ``& 0xFF`` (byte-identical to every prior draft;
+            # golden 069cc32f / CFM 7d19cdc3 untouched).  WIDE (``_lea_wide_enabled`` —
+            # the SAME gate a42384's model port uses: ``vm_width32() and C4_LEA_WIDE!=0``):
+            # the ``lea-wide`` blocks recompute the FULL 32-bit address (byte-ripple ADD,
+            # sign-extended imm), so ``LEA 40`` off BP=0x10000 -> 0x100a0 and ``LEA -18``
+            # -> BP-72 (0xffb8 low half) — matching the wide model AND the Rust c4vm32
+            # full-address reference.  ``& mask`` (full 32-bit) keeps the drafted AX equal
+            # to the model's wide result; ``_s32``-style negative offsets ripple naturally.
+            if lea_wide:
+                ax = (bp + 4 * imm) & mask
+            else:
+                ax = (bp + 4 * imm) & 0xFF
         elif op == isa.PSH:
             sp -= 4; mem[sp] = ax & mask
         elif op in (isa.ADD, isa.SUB, isa.MUL, isa.DIV, isa.MOD):

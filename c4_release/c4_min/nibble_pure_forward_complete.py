@@ -326,6 +326,18 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # steps -- avoids the large-q GPU sparse accumulation error (the #680 deep-read-
         # back miss).  The address decode takes its low byte via ``a & 0xFF``.
         self.LEA_Q = self._scalar("LEA_Q")                    # signed BP_low+4*imm [-256,511]
+        # WIDE LEA (C4_LEA_WIDE, DEFAULT OFF — see ``_lea_wide_enabled``): the full
+        # 32-bit frame address ``AX = BP + 4*imm`` computed byte-by-byte with a carry
+        # chain, so a frame-relative pointer keeps its high bytes (``LEA 40`` off
+        # BP=0x10000 -> 0x100a0, not the folded 0xa0).  Allocated ONLY under the wide
+        # flag; OFF -> these bands are absent -> the layout / golden hash is byte-
+        # identical (the golden 069cc32f flags-off build never widens the substrate).
+        self.LEAW_A = self.LEAW_B = self.LEAW_C = self.LEAW_U16 = None
+        if _lea_wide_enabled():
+            self.LEAW_A = self._band("LEAW_A", 4)    # operand A bytes = BP bytes 0..3
+            self.LEAW_B = self._band("LEAW_B", 4)    # operand B bytes = (4*imm) bytes 0..3
+            self.LEAW_C = self._band("LEAW_C", 5)    # carry chain C[0]=0 .. C[4]=drop
+            self.LEAW_U16 = self._scalar("LEAW_U16")  # u16 = (4*imm) mod 2^16 scratch
         # FULL 32-bit IMM: the immediate's 8 nibbles are part of the STATIC program
         # encoding (CODE_IMM_NIB[i][j], written by the overlay from the bytecode —
         # a pure re-encoding of the constant, no runtime compute), gathered at PC
@@ -1205,6 +1217,39 @@ def compile_lea_q_reduce(L, dim: int) -> Dict[str, torch.Tensor]:
     return spec
 
 
+def _lea_wide_enabled() -> bool:
+    """WIDE (full-32-bit) LEA on the CFM/lean path (#824 ``C4_LEA_WIDE`` ported into
+    the ``build_pure_forward_complete_model`` builder).  DEFAULT OFF.
+
+    The CFM LEA pipeline (dispatch ``AX = BP_LOW + 4·imm`` -> ``fold-lea`` &0xFF ->
+    ``lea-q-reduce`` -> ``lea-addr-nib`` -> ``ax-byte-nib``) UNCONDITIONALLY folds the
+    frame address to its LOW BYTE (``AX = (BP + 4·imm) & 0xFF``), regardless of the
+    wide flags — the wide-LEA branch that the UNIFIED builder carries
+    (``nibble_vm.base_dispatch_rules``: ``lea_bp = full BP if w32``, and the two-limb
+    ``AX_LO = BP + IMM_LO``) was never ported here.  So a frame-relative pointer
+    ``LEA 40`` off ``BP = 0x10000`` folds to ``0xa0`` instead of the full ``0x100a0``,
+    and any load through it reads the wrong cell.
+
+    ON (whenever the width-32 substrate is enabled, ``vm_width32()``; compose with
+    ``C4_SP_WIDE`` for the full BP recompose and ``C4_GLOBAL_ADDR32`` for the wide
+    load address) the ``lea-wide`` blocks below recompute the FULL address
+    ``AX = BP + 4·imm`` across all 4 bytes via a nibble-domain byte-ripple-add
+    (every intermediate < 512 -> fp32-EXACT, no wide-scalar recompose), matching the
+    unified builder and the full-address Rust c4vm32 reference.  The byte-0 result is
+    identical to the folded path (``ax-byte-nib`` already wrote AX nibbles 0,1 =
+    ``(BP_low+4·imm)&0xFF``); the wide blocks OVERWRITE AX nibbles 2..7 with bytes
+    1..3 of the full sum (carry-propagated from byte 0), gated on OP_IS[LEA].
+
+    Gated STRICTLY on ``vm_width32()``: OFF (the golden 069cc32f flags-off build) the
+    ``lea-wide`` scratch bands are never allocated and the blocks are never appended,
+    so the layout / every baked weight / the golden fingerprint are byte-identical.
+    Kill-switch ``C4_LEA_WIDE=0`` forces the fold even under width-32 (escape hatch)."""
+    from .nibble_vm import vm_width32
+    if not vm_width32():
+        return False
+    return _os.environ.get("C4_LEA_WIDE", "1") != "0"
+
+
 def _lea_q_snap_enabled() -> bool:
     """The LEA_Q integer-SNAP (deep-context residue fix, #705).  DEFAULT ON.
 
@@ -1374,6 +1419,189 @@ def compile_lea_addr_nib(L, dim: int) -> Dict[str, torch.Tensor]:
                 spec["W_down"][lane, m_lo] += -val
                 spec["W_down"][lane, p_hi] += -val
                 spec["W_down"][lane, m_hi] += val
+    return spec
+
+
+# LEA immediate window: IMM_CLEAN is exact in [-2048, 2047] (CLEAN_NIBS=3), so
+# 4*imm is in [-8192, 8188].  ``LEA_IMM4_BIAS`` shifts 4*imm into the non-negative
+# range [0, 16380] so a SMALL-coefficient (<=256) staircase computes floor(4*imm/256)
+# WITHOUT the fp32-lethal 65536-scale two's-complement indicator (a 65536*[.] step's
+# ~1e-5 silu residue amplifies to ~0.8 absolute — the off-by-one seen with the naive
+# u16 form).  Every coefficient here stays <= 256, so the residue amplification is
+# < 3e-3 << 0.5 and the split is fp32-EXACT.
+_LEA_IMM4_BIAS = 8192
+_LEA_F_OFF = _LEA_IMM4_BIAS // 256          # 32 : floor((4*imm+BIAS)/256) - 32 = floor(4*imm/256)
+
+
+def compile_lea_wide_operands(L, dim: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA, block 1/3 (C4_LEA_WIDE): set operand A = BP bytes and the SIGNED
+    ``f = floor(4*imm / 256)`` scratch (the low addend split runs the next block),
+    LEA-gated (every band 0 on a non-LEA op -> byte-identical off-LEA).
+
+      LEAW_A[i] = BP byte i = BP_nib[2i] + 16*BP_nib[2i+1]   (i=0..3, clean nibbles)
+      LEAW_U16  = f = floor(4*imm / 256)  in [-32, 31]  (signed; computed via the
+                  bias-shifted small-coefficient staircase, see ``_LEA_IMM4_BIAS``).
+
+    ``4*imm`` from the EXACT signed ``IMM_CLEAN`` (leak-free, reconstructed in the
+    ``imm-clean`` block; |4*imm| <= 8188).  The two low addend bytes (B0/B1) and the
+    sign-fill bytes (B2/B3) are finished in ``compile_lea_wide_split`` from this f +
+    4*imm, all with coefficients <= 256 (fp32-EXACT — no 65536-scale indicator)."""
+    g = L.OP_IS + isa.LEA
+    a, f = L.LEAW_A, L.LEAW_U16
+    imm4b = {L.IMM_CLEAN: 4.0, L.ONE: float(_LEA_IMM4_BIAS)}   # (4*imm + BIAS) in [0,16380]
+    spec = _empty_spec(dim, 4 * 2 + 2 + 64 * 2)
+    u = 0
+
+    def clear(band):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, band] = 1.0
+        spec["W_down"][band, u] += -1.0 / SILU_HALF; u += 1
+
+    def add_lin(terms, const, band, scale):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        for bd, c in terms.items():
+            spec["W_gate"][u, bd] += c
+        spec["b_gate"][u] += const
+        spec["W_down"][band, u] += scale / SILU_HALF; u += 1
+
+    def floor_div_ge(terms, m, kmax, band, scale):    # band += scale*floor((terms)/m)
+        nonlocal u
+        for k in range(1, kmax + 1):
+            c, w = k * m - 0.5, 0.2
+            for tt, tc in ((c - w, scale), (c, -scale)):
+                for bd, cf in terms.items():
+                    spec["W_up"][u, bd] += RELU_S * cf
+                spec["b_up"][u] += -RELU_S * tt
+                spec["W_gate"][u, g] = 1.0
+                spec["W_down"][band, u] += tc / (RELU_S * w); u += 1
+
+    # A[i] = BP byte i (clean BP nibbles).
+    for i in range(4):
+        clear(a + i)
+        add_lin({L.BP + 2 * i: 1.0, L.BP + 2 * i + 1: 16.0}, 0.0, a + i, 1.0)
+    # f = floor(4*imm/256) = floor((4*imm+BIAS)/256) - BIAS/256.  (4*imm+BIAS) in [0,16380]
+    # -> floor <= 63 (kmax=64).  All coefficients <= 256 -> fp32-exact.
+    clear(f)
+    add_lin({L.ONE: 1.0}, 0.0, f, -float(_LEA_F_OFF))          # - 32
+    floor_div_ge(imm4b, 256, 64, f, 1.0)                      # + floor((4*imm+BIAS)/256)
+    return spec
+
+
+def compile_lea_wide_split(L, dim: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA, block 2/3 (C4_LEA_WIDE): finish the SIGN-EXTENDED addend bytes from
+    ``4*imm`` and the signed ``f = floor(4*imm/256)`` scratch (computed the previous
+    block), LEA-gated.  All coefficients <= 256 (fp32-EXACT):
+
+        neg     = [4*imm < 0] = [f < 0]                       (sharp 0/1 step)
+        LEAW_B0 = 4*imm - 256*f          in [0, 255]          (low byte)
+        LEAW_B1 = f + 256*neg            in [0, 255]          (second byte, two's-compl)
+        LEAW_B2 = LEAW_B3 = 255*neg      (sign fill: 0x00 for imm>=0, 0xFF for imm<0)
+    """
+    g = L.OP_IS + isa.LEA
+    b, f = L.LEAW_B, L.LEAW_U16
+    imm4 = {L.IMM_CLEAN: 4.0}
+    spec = _empty_spec(dim, 3 + 2 + 2 + 2 * 2 + 2 * 3)
+    u = 0
+
+    def clear(band):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, band] = 1.0
+        spec["W_down"][band, u] += -1.0 / SILU_HALF; u += 1
+
+    def add_lin(terms, const, band, scale):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        for bd, c in terms.items():
+            spec["W_gate"][u, bd] += c
+        spec["b_gate"][u] += const
+        spec["W_down"][band, u] += scale / SILU_HALF; u += 1
+
+    def step_lt0(terms, band, scale):              # band += scale*[form < 0] = scale*(1-[form>=0])
+        nonlocal u
+        add_lin({L.ONE: 1.0}, 0.0, band, scale)    # + scale
+        c, w = -0.5, 0.2                           # [form >= 0] ramp at -0.5
+        for k, t in enumerate((c - w, c)):
+            for bd, cf in terms.items():
+                spec["W_up"][u, bd] += RELU_S * cf
+            spec["b_up"][u] += -RELU_S * t
+            spec["W_gate"][u, g] = 1.0
+            spec["W_down"][band, u] += (-scale if k == 0 else scale) / (RELU_S * w)
+            u += 1
+
+    # B0 = 4*imm - 256*f  (f = floor(4*imm/256), so this is 4*imm mod 256 in [0,255]).
+    clear(b + 0)
+    add_lin(imm4, 0.0, b + 0, 1.0)                 # + 4*imm
+    add_lin({f: 1.0}, 0.0, b + 0, -256.0)          # - 256*f
+    # B1 = f + 256*neg   (neg = [4*imm<0]; f in [-32,31] -> B1 in [0,255]).
+    clear(b + 1)
+    add_lin({f: 1.0}, 0.0, b + 1, 1.0)             # + f
+    step_lt0(imm4, b + 1, 256.0)                   # + 256*[4*imm<0]
+    # B2 = B3 = 255*neg  (sign fill).
+    for hb in (b + 2, b + 3):
+        clear(hb)
+        step_lt0(imm4, hb, 255.0)
+    return spec
+
+
+def compile_lea_wide_byte(L, dim: int, i: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA, byte ``i`` of the ripple ADD ``AX = BP + 4*imm`` (C4_LEA_WIDE),
+    LEA-gated.  ONE block per byte (like the ALU add chain) because the carry lane
+    ``LEAW_C[i+1]`` written here is READ as ``LEAW_C[i]`` by the NEXT byte's block —
+    the carry ripples through the residual across blocks (a unit only sees the block
+    INPUT, so producer and consumer must be different blocks).
+
+        sum_i = A[i] + B[i] + carry_i        (carry_0 = 0)
+        AX_nib[2i]   = sum_i mod 16
+        AX_nib[2i+1] = floor(sum_i/16) mod 16
+        LEAW_C[i+1]  = [sum_i >= 256]         (carry-out)
+    Every sum_i < 512 -> fp32-EXACT.  SET (clears each dst first), gated on OP_IS[LEA]
+    so a non-LEA op is untouched (byte-identical off-LEA)."""
+    g = L.OP_IS + isa.LEA
+    a, b, cc = L.LEAW_A, L.LEAW_B, L.LEAW_C
+    spec = _empty_spec(dim, 200)
+    u = 0
+    terms = {a + i: 1.0, b + i: 1.0}
+    if i > 0:
+        terms[cc + i] = 1.0                         # + carry_in from previous byte's block
+
+    def clear(band):
+        nonlocal u
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, band] = 1.0
+        spec["W_down"][band, u] += -1.0 / SILU_HALF; u += 1
+
+    def step_ge(thr, band, scale):                  # band += scale*[sum >= thr]
+        nonlocal u
+        c, w = thr - 0.5, 0.2
+        for k, t in enumerate((c - w, c)):
+            for bd, cf in terms.items():
+                spec["W_up"][u, bd] += RELU_S * cf
+            spec["b_up"][u] += -RELU_S * t
+            spec["W_gate"][u, g] = 1.0
+            spec["W_down"][band, u] += (scale if k == 0 else -scale) / (RELU_S * w)
+            u += 1
+
+    def floor_div(m, kmax, band, scale):            # band += scale*floor(sum/m)
+        for k in range(1, kmax + 1):
+            step_ge(k * m, band, scale)
+
+    # carry-out first (needed for the next byte): [sum >= 256]
+    clear(cc + i + 1)
+    step_ge(256, cc + i + 1, 1.0)
+    # low nibble = sum - 16*floor(sum/16)   (sum in [0,511])
+    clear(L.AX + 2 * i)
+    for bd, cf in terms.items():                    # + sum
+        spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+        spec["W_gate"][u, bd] = cf
+        spec["W_down"][L.AX + 2 * i, u] += 1.0 / SILU_HALF; u += 1
+    floor_div(16, 32, L.AX + 2 * i, -16.0)
+    # high nibble = floor(sum/16) - 16*floor(sum/256)
+    clear(L.AX + 2 * i + 1)
+    floor_div(16, 32, L.AX + 2 * i + 1, 1.0)
+    floor_div(256, 2, L.AX + 2 * i + 1, -16.0)
     return spec
 
 
@@ -1916,6 +2144,20 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # (corpus values up to ~10000) survive into the canonical AX nibble band.
         ("imm-ax-nib", compile_imm_ax_nibbles(L, dim)),
     ]
+    if _lea_wide_enabled():
+        # WIDE LEA (C4_LEA_WIDE, #824 ported): overwrite the folded byte-0-only AX with
+        # the FULL 32-bit frame address ``AX = BP + 4*imm`` via a nibble-domain
+        # byte-ripple ADD (operands -> low-byte split -> 4 per-byte add blocks).  Runs
+        # AFTER ``ax-byte-nib`` (which wrote the folded byte 0); byte 0 is re-derived
+        # identically here and bytes 1..3 are widened.  All LEA-gated -> non-LEA ops
+        # untouched.  Flag OFF -> none of these blocks exist -> golden 069cc32f build
+        # byte-identical.
+        block_specs += [
+            ("lea-wide-operands", compile_lea_wide_operands(L, dim)),  # A=BP bytes, B2/B3, u16
+            ("lea-wide-split", compile_lea_wide_split(L, dim)),        # B0=u16%256, B1=u16//256
+        ]
+        block_specs += [(f"lea-wide-b{i}", compile_lea_wide_byte(L, dim, i))
+                        for i in range(4)]                             # ripple add -> AX nibbles
     n_blocks = len(block_specs)
     # ---- application order (recurrence) ----------------------------------
     # The model STORES ``n_blocks`` distinct blocks but APPLIES them in
