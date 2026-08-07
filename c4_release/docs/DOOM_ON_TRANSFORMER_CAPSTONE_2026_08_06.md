@@ -178,6 +178,12 @@ steps/s would require live in [`PERF_LADDER_FINAL.md`](PERF_LADDER_FINAL.md). Th
   63% of the render is PSH/LEA/LI pointer-walking, the cost of a stack VM, not a bug.
 - **Real-time gameplay** would need folding the *traversals* (not just the pixel fill) or
   much more hardware. It is a hardware/step-count statement, not an algorithmic one.
+- **Multi-frame byte-exact + resume, measured (#847).** Four consecutive 50K-step Doom frame-windows
+  render byte-exact end-to-end on the transformer (`accept bad=0`, VRAM 15.3 GB bounded), with a
+  checkpoint at each frame boundary and byte-identical resume across a boundary (a cross-process kill
+  *and* an L-inf=0 identity over 100K rows). At the steady per-step floor (~3.2 µs, CUDA-graph re-used,
+  flat as the trace grows), 100 raw frames project to **~36 min (1-GPU) / ~18 min (2-GPU)** — minutes,
+  not days.
 
 **Corrections made this session (measurement over projection):** self-emu "seconds" was
 really 16 s (fused); 2-GPU K-split was 1.06× not the projected 1.7× (frame-level gave the
@@ -190,9 +196,11 @@ re-measured.
 ## 7. Honest limitations
 
 - Gameplay is genuine and byte-exact but ~0.21 fps; real-time is out of reach on one card.
-- The full mid-game trace is not stepped end-to-end through the transformer (the draft
-  hits an unimplemented `MALC` opcode + ~700 GB KV to reach the render span); verification
-  is byte-exact on tractable 120K-step windows + measured-per-step calibration.
+- The full mid-game trace to one specific *deep* render span isn't stepped end-to-end (the draft
+  hits an unimplemented `MALC` opcode + ~700 GB KV to reach it); but **consecutive frames from a real
+  snapshot render byte-exact with checkpoint/resume** (#847: 4×50K-step windows, `accept bad=0`,
+  L-inf=0 resume proven), and 100 frames project to ~36 min on one GPU — a compute statement, not a
+  correctness one.
 - The steady gameplay frame is now **100% byte-exact** vs gcc (200/200 rows, sha `54edb39f`); a
   separate latent bump-allocator bug (`Z_ChangeTag2` at leveltime 2) still blocks a clean *multi*-frame
   run past the first steady frame.
