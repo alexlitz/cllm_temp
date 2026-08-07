@@ -58,19 +58,20 @@ int  loc;       /* running local slot counter within a function */
 /* single chars use their ascii; two-char use 256+ */
 int P_EQ; int P_NE; /* == != */
 
-/* ---------- emit ---------- */
+/* ---------- emit ----------
+ * We accumulate into code[] (flat op/imm words) and PRINT ONLY AT THE END, after
+ * every forward branch (BZ/BNZ/JMP) target has been backpatched.  Printing at
+ * emit-time would freeze the placeholder-0 targets before they are fixed up. */
 int emitw(int w) {
     code[ec] = w;
     ec = ec + 1;
     return 0;
 }
 int emit1(int op) {
-    printf("%d %d\n", op, 0);
     emitw(op); emitw(0);
     return 0;
 }
 int emit2(int op, int imm) {
-    printf("%d %d\n", op, imm);
     emitw(op); emitw(imm);
     return 0;
 }
@@ -412,16 +413,16 @@ int parse_params(int *pnp) {
         if (tk == 3 && tkval == ',') next();
     }
     next();  /* consume ')' */
-    /* FRAME LAYOUT (byte-addressed, matches the c4_min draft's ENT/LEV/LEA):
-     *   after `arg0;PSH ... argK;PSH JSR; ENT nl`:
-     *     bp+0  = saved bp        bp+4  = return PC
-     *     bp+8  = LAST pushed arg (argK)   bp+8+4*j = (K-j)-th ...
+    /* FRAME LAYOUT (matches the c4_min draft: LEA imm -> bp + 4*imm, i.e. imm is a
+     * WORD/slot index; ENT nl does sp -= 4*nl; the stack grows down by one 4-byte
+     * word per slot).  After `arg0;PSH ... argK;PSH JSR; ENT nl`:
+     *     bp+4*0 = saved bp      bp+4*1 = return PC
+     *     bp+4*2 = LAST pushed arg (argK)   bp+4*(2+j) = ...
      *   args are pushed in SOURCE order (arg0 first), so the FIRST source arg is
-     *   deepest: param i (0-based) sits at byte offset 8 + 4*(np-1-i).
-     * We store the LEA operand = that byte offset. */
+     *   deepest: param i (0-based) sits at SLOT 2 + (np-1-i) = (np+1) - i. */
     i = 0;
     while (i < np) {
-        sym_add(pkeys[i], 3, 8 + 4 * (np - 1 - i));   /* Loc, LEA byte offset */
+        sym_add(pkeys[i], 3, (np + 1) - i);   /* Loc, LEA word-slot operand */
         i = i + 1;
     }
     *pnp = np;
@@ -441,9 +442,9 @@ int parse_locals(int base) {
         while (more == 1) {
             if (tk != 2) { more = 0; }
             else {
-                /* local slot: below bp, byte-addressed.  local #(nl+1) at bp-4*(nl+1).
-                 * LEA operand = -4*(nl+1). */
-                sym_add(tkval, 3, 0 - (4 * (nl + 1)));
+                /* local slot: below bp.  LEA imm -> bp + 4*imm, so local #(nl+1) at
+                 * SLOT -(nl+1) resolves to bp - 4*(nl+1).  distinct from params (>0). */
+                sym_add(tkval, 3, 0 - (nl + 1));
                 nl = nl + 1;
                 next();                  /* consume the name */
                 if (tk == 3 && tkval == ',') { next(); }   /* another name follows */
@@ -529,6 +530,13 @@ int main() {
             if (tk == 3 && tkval == '=') { next(); /* skip initializer NUM */ next(); }
             if (tk == 3 && tkval == ';') next();
         }
+    }
+
+    /* emit the finished (fully backpatched) bytecode as "op imm\n" pairs */
+    n = 0;
+    while (n < ec) {
+        printf("%d %d\n", code[n], code[n + 1]);
+        n = n + 2;
     }
     return 0;
 }
