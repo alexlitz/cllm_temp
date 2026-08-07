@@ -42,14 +42,15 @@ Doom is the stress test.
   transpiler-generated engine.
 - **Gameplay frame:** a full 3D E1M5 view **renders** — player spawns, BSP walk, walls,
   floors — and matches gcc's *geometry exactly* (R_DrawColumn/Span/BSP/AddLine/
-  StoreWallRange counts identical). **87.05% byte-exact on a steady frame** (158/200 rows
-  byte-perfect). A steady-frame capture dissolved the earlier ±1–3 "colormap" tail entirely —
-  it was **not** a rounding bug but a mid-wipe melt artifact (the first captures were the
-  one-time title→level screen-melt). The sole steady residual is a wall-texture miss (rows
-  66–107): `R_InitTextures` reads the `maptexture_t` patchcount at the wrong byte offset (the
-  obsolete `columndirectory` pointer); the correct offset parses byte-identically to gcc but
-  exposes a *latent* `R_GenerateComposite` heap over-write, so it is documented and gated.
-  Reaching this took ~a dozen
+  StoreWallRange counts identical). **96.85% byte-exact on a steady frame** (158/200 rows
+  byte-perfect; 61985/64000 bytes). The earlier ±1–3 "colormap" tail was **not** a rounding bug
+  but a mid-wipe melt artifact (the first captures were the one-time title→level screen-melt); a
+  steady-frame capture dissolves it. Landing the wall textures — a `compile_c` double-index scaling
+  bug in `R_GetColumn` (`texturecolumnlump[tex][col]` lowered with a byte stride instead of the
+  8-byte word stride) — fixed the horizon black band (3565 → 6 px) *and* the `R_RenderPlayerView`
+  crash. The remaining ~3% is a *single* well-characterized bug: the wall texels are textured but
+  horizontally **phase-shifted by a column or two** (a fixed-point offset in the `rw_offset` /
+  `finetangent` / `R_ScaleFromGlobalAngle` chain). Reaching this took ~a dozen
   fixes of one bug class: the c4 compiler's `&arr[i*n+c]` scaling, `+=`/`|=` transpiled
   to plain `=`, arithmetic-vs-logical shift, 2D-array flattening, byte-vs-int strides,
   and an `I_GetTime` stack-corruption that had silently stopped the game sim from
@@ -168,8 +169,8 @@ re-measured.
 - The full mid-game trace is not stepped end-to-end through the transformer (the draft
   hits an unimplemented `MALC` opcode + ~700 GB KV to reach the render span); verification
   is byte-exact on tractable 120K-step windows + measured-per-step calibration.
-- The steady gameplay frame is 87.05% byte-exact vs gcc (158/200 rows perfect); the residual is
-  a wall-texture maptexture-offset miss whose fix exposes a latent composite-heap bug (gated), not 100%.
+- The steady gameplay frame is 96.85% byte-exact vs gcc (158/200 rows perfect); the residual is a
+  single wall-column phase-offset bug (the `rw_offset`/`finetangent` fixed-point chain), not 100%.
 - Numbers here are one A5000; multi-GPU is linear (frame-level).
 
 ## 8. What this is
