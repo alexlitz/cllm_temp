@@ -1,7 +1,8 @@
 # Doom (and a general C compiler) on a vanilla transformer — honest capstone
 
-*2026-08-06. Golden `3cabef64` (doom pure-forward, DEFAULT build — both general-correctness
-fixes on: signed-trunc `DIV`/`MOD` + BP-restore, giving **100% C90-general**; rollback ladder
+*2026-08-07. Golden `174ece66` (doom pure-forward, DEFAULT build — full-32-bit **wide addresses** +
+all general-correctness fixes on: signed-trunc `DIV`/`MOD` + BP-restore → **100% C90-general** *and*
+real modules / deep recursion natively; rollback ladder: unset the 5 wide flags → `3cabef64` →
 `C4_DIVMOD_SIGNED=0` → `7d4afe61` → `C4_BP_RESTORE_HIBYTE=0` → the historical `069cc32f`). This
 document is the honest coherent record: what was built, what genuinely works, the
 measured numbers, and — deliberately — the projections that turned out wrong and how
@@ -110,14 +111,17 @@ full-32-bit LEA decode (`C4_LEA_WIDE` + the fine-grained wide set, #854): minic 
 recursion byte-exact** (8280/8280 accepted, emitted bytecode == gcc — *double* the old wall) and a
 **real Doom-constant leaf function** (`320*200-(65536-(8192+…))` with SCREENWIDTH/FRACUNIT/etc.,
 = 59458) **byte-exact** (7120/7120) on the 32-bit transformer. Wide-LEA is a byte-exact *superset*
-of the 8-bit fold (it matches the native-c4 32-bit oracle where the fold is wrong), flag-gated with
-the golden preserved OFF. And it does: a whole **4-function C module** (`minic_mod.c` — a real
+of the 8-bit fold (it matches the native-c4 32-bit oracle where the fold is wrong), and — after a
+residue fix (`compile_imm_clean_snap`) that made doom render byte-exact even in the below-init BP
+regime (168→0) — it is now the **DEFAULT build** (wide-address golden `174ece66`; unset the 5 wide
+flags to roll back to `3cabef64`). And it does: a whole **4-function C module** (`minic_mod.c` — a real
 whole-module compiler with a symbol table + frame codegen, over globals, params, real locals,
 `if`/`while`, and a 3-deep inter-function call chain) then runs **byte-exact on the transformer** —
 `mod3.c`: 53553/53553 steps accepted, native `exit(67)` matches (a 3-function module 34254/34254).
 So the loop-closing capstone is **reached at the module level**; the gap to a *full* 90K-step Doom
 module is pure VRAM/scale (the monolithic verify OOMs a 24 GB card past ~54K steps → the #814
-checkpoint runner is the follow-on vehicle), **not correctness**. Golden unchanged; behind default-OFF flags.
+checkpoint runner is the follow-on vehicle), **not correctness** — and it all runs on the *default*
+build now that wide addresses are default-ON.
 
 - **C90 conformance: 100% general as the DEFAULT build.** Measured per-case vs the faithful
   `native_c4` oracle (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build:

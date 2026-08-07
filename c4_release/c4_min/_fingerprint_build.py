@@ -79,8 +79,15 @@ def fingerprint(code_size: int = 32, recurrent_divmod: bool = False) -> str:
     # MOVED hash (packed-dim, differs from the dense build_pure_forward_complete_model
     # hash by construction), flag-OFF is the golden.
     #
-    # CURRENT GOLDEN (default): 3cabef6479d183296384b99d25caec9ecd6bc9b2a0f1511d6c89a3689a5ae7b2
-    #   (short 3cabef64).  RE-BASELINED 2026-08-06 from 7d4afe61 by the DEFAULT-ON flip of
+    # CURRENT GOLDEN (default): 174ece66edff1bb5ab8e9213e484bb1b9560f44ab6c23077a366491543d05637
+    #   (short 174ece66).  RE-BASELINED 2026-08-07 from 3cabef64 by the DEFAULT-ON flip of the
+    #   WIDE-ADDRESS set (C4_CMP32/C4_SHIFT32/C4_PC_WIDE/C4_GLOBAL_ADDR32/C4_SP_WIDE) + the wide-LEA
+    #   fp32 residue fix (``compile_imm_clean_snap``): full-32-bit addresses are now the DEFAULT (real
+    #   modules / deep recursion; doom render byte-exact, 168->0 in the just-below-init BP regime).
+    #   ROLLBACK: unset the 5 wide flags (``C4_CMP32=0 C4_SHIFT32=0 C4_PC_WIDE=0 C4_GLOBAL_ADDR32=0
+    #   C4_SP_WIDE=0``) -> 3cabef64.
+    #
+    #   3cabef64 (the wide-flags-off rung) was RE-BASELINED 2026-08-06 from 7d4afe61 by the DEFAULT-ON flip of
     #   ``C4_DIVMOD_SIGNED`` (#790 — the last C90-general fix: signed trunc-toward-zero DIV/MOD via
     #   the ``compile_divmod_sign_prep``/``compile_divmod_sign_apply`` sign-magnitude wrapper in
     #   ``nibble_alu32``; +4 C90 correctness, 0 regressions, doom + Mandelbrot byte-exact).

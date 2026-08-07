@@ -266,9 +266,11 @@ golden `7d4afe61` is unchanged.  Several are MUTUALLY-EXCLUSIVE or interacting b
 
 ### Golden-MOVING (moves the fingerprint itself)
 
-The current default golden is **`3cabef64`** (both `C4_DIVMOD_SIGNED` and `C4_BP_RESTORE_HIBYTE`
-DEFAULT-ON, 2026-08-06 → 100% C90-general). Rollback ladder: `C4_DIVMOD_SIGNED=0` → **`7d4afe61`**
-→ `C4_BP_RESTORE_HIBYTE=0` → the historical **`069cc32f`**.
+The current default golden is **`174ece66`** (full-32-bit WIDE ADDRESSES + `C4_DIVMOD_SIGNED` +
+`C4_BP_RESTORE_HIBYTE` all DEFAULT-ON, 2026-08-07 → real modules/deep recursion natively + 100%
+C90-general). Rollback ladder: unset the 5 wide flags (`C4_CMP32=0 C4_SHIFT32=0 C4_PC_WIDE=0
+C4_GLOBAL_ADDR32=0 C4_SP_WIDE=0`) → **`3cabef64`** → `C4_DIVMOD_SIGNED=0` → **`7d4afe61`** →
+`C4_BP_RESTORE_HIBYTE=0` → the historical **`069cc32f`**.
 
 | flag | purpose | default | depends | golden |
 |---|---|---|---|---|
