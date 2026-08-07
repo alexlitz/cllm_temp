@@ -121,10 +121,12 @@ flags to roll back to `3cabef64`). And it does: a whole **4-function C module** 
 whole-module compiler with a symbol table + frame codegen, over globals, params, real locals,
 `if`/`while`, and a 3-deep inter-function call chain) then runs **byte-exact on the transformer** —
 `mod3.c`: 53553/53553 steps accepted, native `exit(67)` matches (a 3-function module 34254/34254).
-So the loop-closing capstone is **reached at the module level**; the gap to a *full* 90K-step Doom
-module is pure VRAM/scale (the monolithic verify OOMs a 24 GB card past ~54K steps → the #814
-checkpoint runner is the follow-on vehicle), **not correctness** — and it all runs on the *default*
-build now that wide addresses are default-ON.
+So the loop-closing capstone is **complete**: a full 5-function DIV/MOD-using Doom-fixed-point module
+(`dmod.c`, 89,741 steps) runs **to completion byte-exact** on the transformer under bounded 2.1 GB VRAM
+— **direct-CAM** direct-gathers each memory read instead of scoring an O(steps) growing cache (and, being
+divmod-agnostic, carries the DIV/MOD span), matching native `exit(40)`; #814's checkpoint/resume chunked
+replay verifies it byte-exact across window boundaries too. It all runs on the *default* build now that
+wide addresses are default-ON.
 
 - **C90 conformance: 100% general as the DEFAULT build.** Measured per-case vs the faithful
   `native_c4` oracle (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build:
