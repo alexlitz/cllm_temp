@@ -333,11 +333,22 @@ class PureForwardCompleteLayout(PureForwardLayout):
         # flag; OFF -> these bands are absent -> the layout / golden hash is byte-
         # identical (the golden 069cc32f flags-off build never widens the substrate).
         self.LEAW_A = self.LEAW_B = self.LEAW_C = self.LEAW_U16 = None
+        self.IMM_CLEAN_SNAP = None
         if _lea_wide_enabled():
             self.LEAW_A = self._band("LEAW_A", 4)    # operand A bytes = BP bytes 0..3
             self.LEAW_B = self._band("LEAW_B", 4)    # operand B bytes = (4*imm) bytes 0..3
             self.LEAW_C = self._band("LEAW_C", 5)    # carry chain C[0]=0 .. C[4]=drop
             self.LEAW_U16 = self._scalar("LEAW_U16")  # u16 = (4*imm) mod 2^16 scratch
+            # IMM_CLEAN_SNAP: the wide-LEA reads ``4*imm`` from the immediate; the folded
+            # path (``compile_lea_q_reduce`` + ``compile_lea_q_snap``) recomputes it EXACT
+            # from the nibble bands, but the wide path historically read the silu-recomposed
+            # ``IMM_CLEAN`` SCALAR, which at DEEP context carries a residue up to ~0.26 (the
+            # SAME class ``compile_lea_addr_nib`` documents: "even IMM_CLEAN ... carry a
+            # residue that, amplified 4x, drifts q across a cell boundary at a deep read-back")
+            # -> 4x -> ~1.0 -> a wrong LEA byte (the #854 0xFF__-BP wide-LEA divergence).
+            # This scratch holds the nearest-INTEGER snap of IMM_CLEAN so the wide operand
+            # /split blocks read a residue-FREE 4*imm.  Allocated ONLY under the wide flag.
+            self.IMM_CLEAN_SNAP = self._scalar("IMM_CLEAN_SNAP")
         # FULL 32-bit IMM: the immediate's 8 nibbles are part of the STATIC program
         # encoding (CODE_IMM_NIB[i][j], written by the overlay from the bytecode —
         # a pure re-encoding of the constant, no runtime compute), gathered at PC
@@ -1463,6 +1474,78 @@ _LEA_IMM4_BIAS = 8192
 _LEA_F_OFF = _LEA_IMM4_BIAS // 256          # 32 : floor((4*imm+BIAS)/256) - 32 = floor(4*imm/256)
 
 
+def compile_imm_clean_snap(L, dim: int) -> Dict[str, torch.Tensor]:
+    """WIDE LEA (C4_LEA_WIDE), pre-block: SNAP the immediate to an EXACT INTEGER in the
+    dedicated ``IMM_CLEAN_SNAP`` scratch, so the wide operand/split blocks read a
+    residue-FREE ``4*imm`` (the #854 fp32 wide-LEA fix).
+
+    ``compile_imm_clean`` reconstructs ``IMM_CLEAN`` from ``IMM_NIB`` via a TRIANGULAR
+    one-hot, which INTERPOLATES near an integer: at DEEP context the ``IMM_NIB`` nibbles
+    themselves carry a residue (the deep PC one-hot; measured ``IMM_NIB0=11.9997`` in the
+    ``_lea_q_snap`` note), so ``IMM_CLEAN`` arrives sub-integer (measured ``6.7422`` for a
+    true ``7`` in the composed doom-render path).  The wide-LEA reads ``4*imm`` from that
+    scalar -> the 4x amplifies the ~0.26 residue to ~1.0 -> the ripple-add byte crosses a
+    16-cell boundary and the model decodes the WRONG frame address (``AX=0xffeb`` where the
+    draft computes ``0xffdc``) whenever BP sits in the just-below-init ``0xFF__`` stack
+    regime (doom's SP_INIT=0x10000 frame area).  This is the SAME residue class the folded
+    path already fixes with ``compile_lea_q_snap`` (which SNAPS the ``IMM_NIB`` nibbles via
+    a SHARP half-integer-step round), but the wide path was never covered — mandelbrot /
+    minic avoid it only because they use C4_SP_INIT=0xF000 (BP above ``0xFF__``).
+
+    Fix: re-derive the immediate here with the SAME residue-immune nearest-integer round
+    ``rnd(nib) = Σ_{v=1..15} step(nib >= v-0.5)`` the folded ``compile_lea_q_snap`` uses (a
+    SHARP UNIT silu-step staircase — a nibble with residue << 0.5 sits >> 1/RELU_S from
+    every edge, so each step is a clean 0/1 and the sum is the EXACT nearest integer, unlike
+    the triangular pulse which reproduces the residue).  The signed value uses the SAME
+    ``n_nib`` / signed-top-nibble convention as ``compile_imm_clean`` so ``IMM_CLEAN_SNAP``
+    equals ``round(IMM_CLEAN)`` exactly.  LEA-gated (0 on non-LEA -> byte-identical off-LEA;
+    and the whole block only exists under the wide flag, so the golden flag-OFF layout /
+    hash is untouched)."""
+    g = L.OP_IS + isa.LEA
+    dst = L.IMM_CLEAN_SNAP
+    # SAME signed width as compile_imm_clean (covers every corpus/doom LEA/JSR immediate).
+    _tcs = getattr(L, "true_code_size", L.code_size)
+    _need = 1
+    while _tcs >= (1 << (4 * _need - 1)):
+        _need += 1
+    n_nib = min(max(3, _need), IMM_NIBS)
+    top = n_nib - 1
+    edges = [v - 0.5 for v in range(1, 16)]            # 15 half-integer edges per nibble
+    # units: n_nib * (15 edges * 2 relu) + 1 self-clear.
+    spec = _empty_spec(dim, n_nib * (len(edges) * 2) + 1)
+    u = 0
+    step_base = {}
+    for j in range(n_nib):
+        step_base[j] = {}
+        for e in edges:
+            base = u
+            for jj in range(2):                        # step(nib>=e) = silu(z)-silu(z-1)
+                spec["W_up"][u, L.IMM_NIB + j] = RELU_S
+                spec["b_up"][u] = -RELU_S * e - (0.0 if jj == 0 else 1.0)
+                spec["W_gate"][u, g] = 1.0             # gate on LEA -> 0 off-LEA
+                u += 1
+            step_base[j][e] = base
+    # SET: self-clear IMM_CLEAN_SNAP (gated on LEA) so recurrent steps are idempotent.
+    spec["W_up"][u, g] = S; spec["b_up"][u] = -S * 0.5
+    spec["W_gate"][u, dst] = 1.0
+    spec["W_down"][dst, u] += -1.0 / SILU_HALF; u += 1
+    # recompose the SIGNED integer: dst += Σ_j 16^j · rnd(IMM_NIB[j]); the TOP nibble is
+    # SIGNED (subtract 16·16^top when nib_top >= 8), matching compile_imm_clean's a-16.
+    base = 1
+    for j in range(n_nib):
+        for e in edges:                                # rnd(nib) = Σ_v step(nib>=v-0.5)
+            p, m = step_base[j][e], step_base[j][e] + 1
+            spec["W_down"][dst, p] += float(base)      # +step -> +1 per crossed edge
+            spec["W_down"][dst, m] += -float(base)     # -step (silu@e-1) -> UNIT step
+        base *= 16
+    # two's-complement sign of the TOP nibble: subtract 16^n_nib when nib_top >= 8 (i.e.
+    # the top nibble's edge-7.5 step is ON).  base is now 16^n_nib.
+    p, m = step_base[top][7.5], step_base[top][7.5] + 1
+    spec["W_down"][dst, p] += -float(base)
+    spec["W_down"][dst, m] += float(base)
+    return spec
+
+
 def compile_lea_wide_operands(L, dim: int) -> Dict[str, torch.Tensor]:
     """WIDE LEA, block 1/3 (C4_LEA_WIDE): set operand A = BP bytes and the SIGNED
     ``f = floor(4*imm / 256)`` scratch (the low addend split runs the next block),
@@ -1472,13 +1555,16 @@ def compile_lea_wide_operands(L, dim: int) -> Dict[str, torch.Tensor]:
       LEAW_U16  = f = floor(4*imm / 256)  in [-32, 31]  (signed; computed via the
                   bias-shifted small-coefficient staircase, see ``_LEA_IMM4_BIAS``).
 
-    ``4*imm`` from the EXACT signed ``IMM_CLEAN`` (leak-free, reconstructed in the
-    ``imm-clean`` block; |4*imm| <= 8188).  The two low addend bytes (B0/B1) and the
-    sign-fill bytes (B2/B3) are finished in ``compile_lea_wide_split`` from this f +
-    4*imm, all with coefficients <= 256 (fp32-EXACT — no 65536-scale indicator)."""
+    ``4*imm`` from the EXACT-INTEGER ``IMM_CLEAN_SNAP`` (``compile_imm_clean_snap`` snaps
+    the deep-context IMM residue to the nearest integer — the #854 wide-LEA fix; without it
+    the raw silu-recomposed ``IMM_CLEAN`` scalar's ~0.26 residue is amplified 4x and the
+    frame byte crosses a cell edge in the ``0xFF__`` BP regime); |4*imm| <= 8188.  The two
+    low addend bytes (B0/B1) and the sign-fill bytes (B2/B3) are finished in
+    ``compile_lea_wide_split`` from this f + 4*imm, all with coefficients <= 256
+    (fp32-EXACT — no 65536-scale indicator)."""
     g = L.OP_IS + isa.LEA
     a, f = L.LEAW_A, L.LEAW_U16
-    imm4b = {L.IMM_CLEAN: 4.0, L.ONE: float(_LEA_IMM4_BIAS)}   # (4*imm + BIAS) in [0,16380]
+    imm4b = {L.IMM_CLEAN_SNAP: 4.0, L.ONE: float(_LEA_IMM4_BIAS)}   # (4*imm + BIAS) in [0,16380]
     spec = _empty_spec(dim, 4 * 2 + 2 + 64 * 2)
     u = 0
 
@@ -1531,7 +1617,7 @@ def compile_lea_wide_split(L, dim: int) -> Dict[str, torch.Tensor]:
     """
     g = L.OP_IS + isa.LEA
     b, f = L.LEAW_B, L.LEAW_U16
-    imm4 = {L.IMM_CLEAN: 4.0}
+    imm4 = {L.IMM_CLEAN_SNAP: 4.0}   # #854: EXACT-INTEGER 4*imm (residue-free, see snap block)
     spec = _empty_spec(dim, 3 + 2 + 2 + 2 * 2 + 2 * 3)
     u = 0
 
@@ -2183,6 +2269,11 @@ def build_pure_forward_complete_model(code_size: int = 32,
         # untouched.  Flag OFF -> none of these blocks exist -> golden 069cc32f build
         # byte-identical.
         block_specs += [
+            # #854: SNAP the deep-context IMM residue to an exact integer BEFORE the wide
+            # operand/split blocks read 4*imm (the raw silu-recomposed IMM_CLEAN scalar's
+            # ~0.26 residue is amplified 4x and mis-fires a frame-byte cell in the 0xFF__ BP
+            # regime).  LEA-gated; runs immediately before lea-wide-operands.
+            ("imm-clean-snap", compile_imm_clean_snap(L, dim)),
             ("lea-wide-operands", compile_lea_wide_operands(L, dim)),  # A=BP bytes, B2/B3, u16
             ("lea-wide-split", compile_lea_wide_split(L, dim)),        # B0=u16%256, B1=u16//256
         ]
