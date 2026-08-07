@@ -42,15 +42,18 @@ Doom is the stress test.
   transpiler-generated engine.
 - **Gameplay frame:** a full 3D E1M5 view **renders** — player spawns, BSP walk, walls,
   floors — and matches gcc's *geometry exactly* (R_DrawColumn/Span/BSP/AddLine/
-  StoreWallRange counts identical). **96.85% byte-exact on a steady frame** (158/200 rows
-  byte-perfect; 61985/64000 bytes). The earlier ±1–3 "colormap" tail was **not** a rounding bug
-  but a mid-wipe melt artifact (the first captures were the one-time title→level screen-melt); a
-  steady-frame capture dissolves it. Landing the wall textures — a `compile_c` double-index scaling
-  bug in `R_GetColumn` (`texturecolumnlump[tex][col]` lowered with a byte stride instead of the
-  8-byte word stride) — fixed the horizon black band (3565 → 6 px) *and* the `R_RenderPlayerView`
-  crash. The remaining ~3% is a *single* well-characterized bug: the wall texels are textured but
-  horizontally **phase-shifted by a column or two** (a fixed-point offset in the `rw_offset` /
-  `finetangent` / `R_ScaleFromGlobalAngle` chain). Reaching this took ~a dozen
+  StoreWallRange counts identical). **99.86% byte-exact on a steady frame** (186/200 rows
+  byte-perfect; 63913/64000 bytes — the c4 frame's non-zero count now *matches* gcc exactly). The
+  earlier ±1–3 "colormap" tail was **not** a rounding bug but a mid-wipe melt artifact; a steady
+  capture dissolves it. Two `compile_c` lowering bugs closed the wall render: a double-index scaling
+  bug in `R_GetColumn` (`texturecolumnlump[tex][col]` lowered with a byte stride, not the 8-byte
+  word stride) — which fixed the horizon black band (3565 → 6 px) *and* the `R_RenderPlayerView`
+  crash — and a **signed-vs-unsigned angle compare** in `R_StoreWallRange`'s `rw_offset` (the c4 VM's
+  `>`/`<` are signed, so `angle_t > ANG180` fired spuriously → wrong `finesine` index → a ~one-column
+  wall-texture phase shift; fixed with the port's `__ugt`/`__uge` helpers). The **entire wall-render
+  path is now byte-exact**; the last 0.14% (87 bytes) is precisely isolated to **sprite pixels** (the
+  E1M1-spawn THING sprites — a separate `R_ProjectSprite`/`R_DrawVisSprite` path), not the wall.
+  Reaching this took ~a dozen
   fixes of one bug class: the c4 compiler's `&arr[i*n+c]` scaling, `+=`/`|=` transpiled
   to plain `=`, arithmetic-vs-logical shift, 2D-array flattening, byte-vs-int strides,
   and an `I_GetTime` stack-corruption that had silently stopped the game sim from
@@ -106,8 +109,13 @@ recursion byte-exact** (8280/8280 accepted, emitted bytecode == gcc — *double*
 **real Doom-constant leaf function** (`320*200-(65536-(8192+…))` with SCREENWIDTH/FRACUNIT/etc.,
 = 59458) **byte-exact** (7120/7120) on the 32-bit transformer. Wide-LEA is a byte-exact *superset*
 of the 8-bit fold (it matches the native-c4 32-bit oracle where the fold is wrong), flag-gated with
-the golden preserved OFF. So a real Doom *module* is now within reach on the 32-bit route —
-bounded by compose/perf/scale, not by correctness. Golden unchanged; behind default-OFF flags.
+the golden preserved OFF. And it does: a whole **4-function C module** (`minic_mod.c` — a real
+whole-module compiler with a symbol table + frame codegen, over globals, params, real locals,
+`if`/`while`, and a 3-deep inter-function call chain) then runs **byte-exact on the transformer** —
+`mod3.c`: 53553/53553 steps accepted, native `exit(67)` matches (a 3-function module 34254/34254).
+So the loop-closing capstone is **reached at the module level**; the gap to a *full* 90K-step Doom
+module is pure VRAM/scale (the monolithic verify OOMs a 24 GB card past ~54K steps → the #814
+checkpoint runner is the follow-on vehicle), **not correctness**. Golden unchanged; behind default-OFF flags.
 
 - **C90 conformance: 100% general as the DEFAULT build.** Measured per-case vs the faithful
   `native_c4` oracle (itself 193/193 == gcc-15), L-inf=0, on the lean sparse-streaming CFM build:
@@ -169,8 +177,8 @@ re-measured.
 - The full mid-game trace is not stepped end-to-end through the transformer (the draft
   hits an unimplemented `MALC` opcode + ~700 GB KV to reach the render span); verification
   is byte-exact on tractable 120K-step windows + measured-per-step calibration.
-- The steady gameplay frame is 96.85% byte-exact vs gcc (158/200 rows perfect); the residual is a
-  single wall-column phase-offset bug (the `rw_offset`/`finetangent` fixed-point chain), not 100%.
+- The steady gameplay frame is 99.86% byte-exact vs gcc (186/200 rows perfect; the wall render is
+  fully byte-exact); the last 0.14% is a separate THING-sprite draw (`R_ProjectSprite`), not 100%.
 - Numbers here are one A5000; multi-GPU is linear (frame-level).
 
 ## 8. What this is
