@@ -38,7 +38,6 @@ os.environ.setdefault('C4_IMM_NIBS', '6')
 os.environ.setdefault('C4_MEM_ADDR_BITS', '18')
 os.environ.setdefault('C4_EXACT_EVICT', '1')
 os.environ.setdefault('C4_MEM_EFF', '2000000')
-os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 WT = os.path.dirname(os.path.abspath(__file__))
@@ -113,8 +112,14 @@ def main():
         sparse = sparse.to(dev)
     from c4_min.local_attention import install_local_attention
     from c4_min.live_head_attention import install_dead_block_fusion
+    # content_bound_global=True bounds the GLOBAL-head KV cache to store-role rows
+    # (memory-CAM/stack-pop/LEV), so the O(S^2) global-attention matmul stays
+    # tractable at tens of thousands of steps (a monolithic unbounded pass OOMs the
+    # 24 GB GPU at ~90k steps).  Byte-exactness is preserved: the dropped rows carry
+    # zero attention weight for the global heads.
+    cbg = os.environ.get('C4_CONTENT_BOUND_GLOBAL', '1') == '1'
     install_local_attention(sparse, window=window, drop_local_kv=True,
-                            content_bound_global=False, verbose=False)
+                            content_bound_global=cbg, verbose=False)
     install_dead_block_fusion(sparse, verbose=False)
 
     # ---- VERIFY (fast big-K): the MODEL must accept every draft step ----
