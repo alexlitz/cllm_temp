@@ -257,7 +257,7 @@ def _shift32_enabled() -> bool:
     with ``pop </>> ax`` (32-bit, arithmetic SHR sign-fill) — the byte truncation was
     the ONLY thing losing bits.  Doom's fixed-point ``>>`` is the #1 fast-path fix.
     OFF -> SHL/SHR stay in ``byte_ax_ops`` (byte result) -> golden byte-IDENTICAL."""
-    return _os.environ.get("C4_SHIFT32", "0") not in ("0", "", "false", "False")
+    return _os.environ.get("C4_SHIFT32", "1") not in ("0", "", "false", "False")
 
 
 def _cmp32_enabled() -> bool:
@@ -269,7 +269,7 @@ def _cmp32_enabled() -> bool:
     ``CMP_EQ=1`` and ``CMP_GT=CMP_LT=0``; the sign-corrected magnitude order (already
     32-bit-exact for the DECISIVE sign/low-byte cases) is untouched off the tie.  OFF
     -> the cmp blocks are byte-IDENTICAL to golden."""
-    return _os.environ.get("C4_CMP32", "0") not in ("0", "", "false", "False")
+    return _os.environ.get("C4_CMP32", "1") not in ("0", "", "false", "False")
 
 
 def _divmod_signed_enabled() -> bool:

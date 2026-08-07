@@ -70,7 +70,7 @@ def _draft_shift32() -> bool:
     shifter.  REQUIRED for doom's fixed-point shifts and the #829 pow2 DIV->SHR reduction
     (a 32-bit divide reduced to a shift; the 8-bit floor mis-computes it).  Additive + gated:
     OFF reproduces the exact 8-bit draft, so the whole existing corpus is byte-identical."""
-    return os.environ.get("C4_SHIFT32", "0") == "1"
+    return os.environ.get("C4_SHIFT32", "1") != "0"
 
 
 def _draft_read_to_mem() -> bool:

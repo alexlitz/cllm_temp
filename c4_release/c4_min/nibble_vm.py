@@ -232,7 +232,7 @@ def sp_wide_enabled() -> bool:
     Only the SP/BP lanes change; PC/AX/STACK0 are untouched.  DEFAULT OFF -> byte-
     identical golden.  For an UNBOUNDED (|SP| >= 2^20) stack the next widening is a
     genuinely TWO-LIMB SP (separate limb snap, like AX/STACK0's ``_snap_two_limb``)."""
-    return os.environ.get("C4_SP_WIDE", "0") not in ("0", "", "false", "False")
+    return os.environ.get("C4_SP_WIDE", "1") not in ("0", "", "false", "False")
 
 
 def _fold_modulus() -> int:
@@ -1013,7 +1013,7 @@ def _pc_wide_enabled() -> bool:
     equivalent, capped at the 32-bit word) that ``_snap_lane_bytes`` already provides
     for the width-32 substrate — so PC / return-PC / branch-target values up to 2^32-1
     decode exactly.  Runtime DECODE only (no model parameter) -> golden byte-neutral."""
-    return os.environ.get("C4_PC_WIDE", "0") not in ("0", "", "false", "False")
+    return os.environ.get("C4_PC_WIDE", "1") not in ("0", "", "false", "False")
 
 
 def _snap_lane(lane: torch.Tensor) -> int:
