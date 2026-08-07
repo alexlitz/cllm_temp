@@ -42,17 +42,19 @@ Doom is the stress test.
   transpiler-generated engine.
 - **Gameplay frame:** a full 3D E1M5 view **renders** — player spawns, BSP walk, walls,
   floors — and matches gcc's *geometry exactly* (R_DrawColumn/Span/BSP/AddLine/
-  StoreWallRange counts identical). **99.86% byte-exact on a steady frame** (186/200 rows
-  byte-perfect; 63913/64000 bytes — the c4 frame's non-zero count now *matches* gcc exactly). The
+  StoreWallRange counts identical). **99.96% byte-exact on a steady frame** (195/200 rows
+  byte-perfect; 63972/64000 bytes — the c4 frame's non-zero count now *matches* gcc exactly). The
   earlier ±1–3 "colormap" tail was **not** a rounding bug but a mid-wipe melt artifact; a steady
   capture dissolves it. Two `compile_c` lowering bugs closed the wall render: a double-index scaling
   bug in `R_GetColumn` (`texturecolumnlump[tex][col]` lowered with a byte stride, not the 8-byte
   word stride) — which fixed the horizon black band (3565 → 6 px) *and* the `R_RenderPlayerView`
   crash — and a **signed-vs-unsigned angle compare** in `R_StoreWallRange`'s `rw_offset` (the c4 VM's
   `>`/`<` are signed, so `angle_t > ANG180` fired spuriously → wrong `finesine` index → a ~one-column
-  wall-texture phase shift; fixed with the port's `__ugt`/`__uge` helpers). The **entire wall-render
-  path is now byte-exact**; the last 0.14% (87 bytes) is precisely isolated to **sprite pixels** (the
-  E1M1-spawn THING sprites — a separate `R_ProjectSprite`/`R_DrawVisSprite` path), not the wall.
+  wall-texture phase shift; fixed with the port's `__ugt`/`__uge` helpers). The **entire wall *and*
+  sprite render path is now byte-exact** (two more `compile_c` double-index byte-scale bugs fixed —
+  `R_ProjectSprite`'s `sprframe` index + `R_DrawSprite`'s silhouette clip); the last 0.04% (28 bytes)
+  is a single animated pickup sprite (ARM1 green armor, drawn one animation frame behind gcc) — a
+  `P_MobjThinker` tic-count divergence in the gameplay/thinker path, not the render.
   Reaching this took ~a dozen
   fixes of one bug class: the c4 compiler's `&arr[i*n+c]` scaling, `+=`/`|=` transpiled
   to plain `=`, arithmetic-vs-logical shift, 2D-array flattening, byte-vs-int strides,
@@ -177,8 +179,9 @@ re-measured.
 - The full mid-game trace is not stepped end-to-end through the transformer (the draft
   hits an unimplemented `MALC` opcode + ~700 GB KV to reach the render span); verification
   is byte-exact on tractable 120K-step windows + measured-per-step calibration.
-- The steady gameplay frame is 99.86% byte-exact vs gcc (186/200 rows perfect; the wall render is
-  fully byte-exact); the last 0.14% is a separate THING-sprite draw (`R_ProjectSprite`), not 100%.
+- The steady gameplay frame is 99.96% byte-exact vs gcc (195/200 rows perfect; the wall *and* sprite
+  render paths are fully byte-exact); the last 0.04% is one animated pickup sprite drawn a frame
+  behind gcc — a `P_MobjThinker` tic-count divergence in the game sim, not the render.
 - Numbers here are one A5000; multi-GPU is linear (frame-level).
 
 ## 8. What this is
