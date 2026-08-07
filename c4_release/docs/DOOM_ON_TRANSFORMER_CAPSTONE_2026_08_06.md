@@ -64,6 +64,11 @@ Doom is the stress test.
   to plain `=`, arithmetic-vs-logical shift, 2D-array flattening, byte-vs-int strides,
   and an `I_GetTime` stack-corruption that had silently stopped the game sim from
   ticking.
+- **Playable, not just rendered.** The same c4 Doom port is now a coherent, fully-playable FPS loop on
+  the native c4 VM: the player self-arms and fires an animated pistol (raise/bob/muzzle-flash/hitscan),
+  walks and is blocked by walls, monsters spawn→wake→chase→attack, doors open on use, and pickups grant
+  items — running stably across a full E1M1 demo, with the 100% byte-exact render frame + title unchanged.
+  (This is the native c4 VM / interactive path, distinct from the transformer byte-exact-render story.)
 
 ## 4. Genuine computation — not draft replay
 
