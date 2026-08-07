@@ -1496,20 +1496,24 @@ def compile_imm_clean_snap(L, dim: int) -> Dict[str, torch.Tensor]:
     ``rnd(nib) = Σ_{v=1..15} step(nib >= v-0.5)`` the folded ``compile_lea_q_snap`` uses (a
     SHARP UNIT silu-step staircase — a nibble with residue << 0.5 sits >> 1/RELU_S from
     every edge, so each step is a clean 0/1 and the sum is the EXACT nearest integer, unlike
-    the triangular pulse which reproduces the residue).  The signed value uses the SAME
-    ``n_nib`` / signed-top-nibble convention as ``compile_imm_clean`` so ``IMM_CLEAN_SNAP``
-    equals ``round(IMM_CLEAN)`` exactly.  LEA-gated (0 on non-LEA -> byte-identical off-LEA;
-    and the whole block only exists under the wide flag, so the golden flag-OFF layout /
-    hash is untouched)."""
+    the triangular pulse which reproduces the residue).
+
+    ``n_nib`` is FIXED at 3 (signed 12-bit, ``[-2048, 2047]``): a LEA immediate is a FRAME
+    slot offset — always tiny (id-Doom: min -26, max 9), unlike a JSR PC target — so 3
+    nibbles cover every LEA imm, and, crucially, the ``rnd`` recompose coefficient stays
+    ``<= 16^2 = 256`` (NOT ``16^3=4096``): a 4096-coefficient rnd unit amplifies the silu
+    ~1e-6 residue by ~4096 and, summed over 15 edges × several nibbles, exceeds 0.5 (the
+    off-by-one seen with a 4-nibble recompose).  With ``<= 256`` the amplified residue is
+    ``256·15·1e-6 ≈ 4e-3 << 0.5`` -> fp32-EXACT.  The signed top nibble (a SHARP step at
+    edge 7.5, coefficient ``16^3=4096=2^12`` exact — a sharp 0/1 step carries NO residue)
+    matches ``compile_imm_clean``'s ``a-16`` convention so ``IMM_CLEAN_SNAP`` equals
+    ``round(IMM_CLEAN)`` for every LEA immediate.  LEA-gated (0 on non-LEA -> byte-identical
+    off-LEA; and the whole block only exists under the wide flag, so the golden flag-OFF
+    layout / hash is untouched)."""
     g = L.OP_IS + isa.LEA
     dst = L.IMM_CLEAN_SNAP
-    # SAME signed width as compile_imm_clean (covers every corpus/doom LEA/JSR immediate).
-    _tcs = getattr(L, "true_code_size", L.code_size)
-    _need = 1
-    while _tcs >= (1 << (4 * _need - 1)):
-        _need += 1
-    n_nib = min(max(3, _need), IMM_NIBS)
-    top = n_nib - 1
+    n_nib = 3                                          # signed 12-bit: covers every LEA imm,
+    top = n_nib - 1                                    # keeps rnd coeff <= 16^2=256 (fp32-safe)
     edges = [v - 0.5 for v in range(1, 16)]            # 15 half-integer edges per nibble
     # units: n_nib * (15 edges * 2 relu) + 1 self-clear.
     spec = _empty_spec(dim, n_nib * (len(edges) * 2) + 1)
@@ -1539,7 +1543,8 @@ def compile_imm_clean_snap(L, dim: int) -> Dict[str, torch.Tensor]:
             spec["W_down"][dst, m] += -float(base)     # -step (silu@e-1) -> UNIT step
         base *= 16
     # two's-complement sign of the TOP nibble: subtract 16^n_nib when nib_top >= 8 (i.e.
-    # the top nibble's edge-7.5 step is ON).  base is now 16^n_nib.
+    # the top nibble's edge-7.5 step is ON).  base is now 16^n_nib (=4096, a 2^12 SHARP-step
+    # coefficient -> exact 0/1, no residue).
     p, m = step_base[top][7.5], step_base[top][7.5] + 1
     spec["W_down"][dst, p] += -float(base)
     spec["W_down"][dst, m] += float(base)
