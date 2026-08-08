@@ -717,6 +717,98 @@ def _clever_applied_depth(op_class: str, axes) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# MACHINERY families for the STANDARD (feed-forward, UNROLLED) accounting.
+#
+# In a STANDARD feed-forward transformer the FFN stack must CONTAIN every op's
+# machinery — the active op is data-dependent (conditionally applied at run time),
+# so a layer cannot be re-used across ops the way a LOOPED / Universal-Transformer
+# re-applies one cell.  Each op's digit-extraction places are therefore DISTINCT
+# stored layers, and the network's n_layers is the SUMMED unrolled depth across
+# all the distinct machinery families.
+#
+# We group the ops into machinery families (finer than the accumulator-bound
+# _OP_CLASS, which coarsely maps bitwise/memory/trivial into "add"): each family
+# has its own datapath, so each family's unrolled place-depth is stored ONCE.
+# Ops WITHIN a family (e.g. ADD and SUB, or the six CMPs) share the family's
+# decode structurally, so they are counted once — but the arith / mul / div /
+# bitwise / memory / trivial FAMILIES are all genuinely distinct machinery that
+# must all be present, so their depths SUM.  This is the honest floor for "the
+# feed-forward network contains every op".
+#
+#   arith  — the whole-value / radix-limb ingest + difference-min digit-extract
+#            (ADD/SUB/CMP/SHL/SHR + frame-adds + memory-address adds share it).
+#            depth = the arith family's decode places (whole-value 11 / limb 8).
+#   div    — long-division digit-extract (DIV/MOD).  depth 10 (whole) / 8 (limb).
+#   mul    — the widest: 64-bit product digit-extract.  depth 20 (whole) / 16 (limb).
+#   bitwise— a per-nibble 16x16 LUT applied once per nibble (OR/XOR/AND).  depth 8.
+#   memory — the shared content-addressed CAM read/write (LI/LC/SI/SC).  depth 1.
+#   trivial— register move / stack write / no-op (IMM/PSH/NOP/HALT).  depth 1.
+#
+# NB the +1 finalize/writeback per family is folded into the place-depths (the
+# doc numbers already include ingest+finalize), so the family depth IS the stored
+# layer count that family contributes.
+_MACHINERY_FAMILY: Dict[str, str] = {}     # op -> machinery family
+for _o in ("ADD", "SUB"):
+    _MACHINERY_FAMILY[_o] = "arith"
+for _o in ("EQ", "NE", "LT", "GT", "LE", "GE"):
+    _MACHINERY_FAMILY[_o] = "arith"        # CMP is a sign read on the shared decode
+for _o in ("SHL", "SHR"):
+    _MACHINERY_FAMILY[_o] = "arith"
+for _o in ("LEA", "JMP", "JSR", "BZ", "BNZ", "ENT", "ADJ", "LEV"):
+    _MACHINERY_FAMILY[_o] = "arith"        # frame ops are address adds on the decode
+for _o in ("MUL",):
+    _MACHINERY_FAMILY[_o] = "mul"
+for _o in ("DIV", "MOD"):
+    _MACHINERY_FAMILY[_o] = "div"
+for _o in ("OR", "XOR", "AND"):
+    _MACHINERY_FAMILY[_o] = "bitwise"
+for _o in ("LI", "LC", "SI", "SC"):
+    _MACHINERY_FAMILY[_o] = "memory"
+for _o in ("IMM", "PSH", "NOP", "HALT"):
+    _MACHINERY_FAMILY[_o] = "trivial"
+
+
+def _family_unrolled_depth(family: str, axes) -> int:
+    """The #DISTINCT stored layers one machinery FAMILY contributes to a STANDARD
+    (unrolled) feed-forward network, at the family's clever axes.
+
+    arith / div / mul: the digit-extract place count (whole-value decimal or
+    radix-limb).  bitwise: the per-nibble LUT depth (8).  memory: the shared CAM
+    read/write (1).  trivial: a register move (1)."""
+    if family == "arith":
+        return _clever_applied_depth("add", axes)
+    if family == "div":
+        return _clever_applied_depth("div", axes)
+    if family == "mul":
+        return _clever_applied_depth("mul", axes)
+    if family == "bitwise":
+        # OR/XOR/AND: a 16x16 nibble LUT applied once per nibble; depth 8 (32-bit).
+        return 8
+    if family == "memory":
+        return 1                            # one shared CAM touch
+    if family == "trivial":
+        return 1                            # register move / stack write
+    return 1
+
+
+def summed_unrolled_depth(config) -> Tuple[int, Dict[str, int]]:
+    """The STANDARD feed-forward transformer's n_layers for a clever ``OpConfig``:
+    the SUMMED unrolled depth across all DISTINCT machinery families (each family's
+    digit-extraction places are stored distinctly — the active op is data-dependent,
+    so the network must contain every op's machinery, and no cell is re-used the way
+    a LOOPED model re-applies one).  Returns ``(total, per_family_depth)``."""
+    from . import opconfig as OC
+    per_family: Dict[str, int] = {}
+    for op in OC.ALL_OPS:
+        fam = _MACHINERY_FAMILY[op]
+        if fam in per_family:
+            continue                        # count each family ONCE (deepest member)
+        per_family[fam] = _family_unrolled_depth(fam, config.for_op(op))
+    total = sum(per_family.values())
+    return total, per_family
+
+
 @dataclass
 class OpConfigGeometry:
     """The geometry an ``OpConfig`` implies, reported for the fitter table."""
@@ -726,25 +818,39 @@ class OpConfigGeometry:
     recurrence: str
     hidden: int
     intermediate: int
-    stored_layers: int              # distinct stored cells / blocks
+    stored_layers: int              # distinct stored layers (STANDARD: n_layers;
+                                    #   LOOPED: the few reused cells)
     applied_depth: int              # deepest per-op unroll (per forward)
     params_estimate: int
     fits_stock_0_5b: bool
     binding: str                    # "" if fits, else the binding axis
+    looped_transformer: bool = False  # model MODE (True == UT / looped)
+    model_mode: str = "standard-feedforward"  # human label for the mode
     note: str = ""
 
 
 def account_opconfig(config, code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH
                      ) -> OpConfigGeometry:
-    """Size an ``opconfig.OpConfig`` into a geometry row.
+    """Size an ``opconfig.OpConfig`` into a geometry row, HONESTLY per model mode.
+
+    The critical distinction (see the module docstring + TOGGLE_SCHEMA.md §honesty):
 
     * DEFAULT (nibble/fp32/unrolled): routes to the REAL nibble solver's FULL
       geometry (the golden build width/depth) — hidden ~3008, does NOT fit 0.5B.
-    * clever whole-value (fp64/fp128, digit-extract/whole_value, tied): ONE narrow
-      reused cell floored to the Qwen GQA head partition (896), APPLIED depth = the
-      deepest op's digit-extract places (DIV 10 / MUL 20) — FITS 0.5B width/shape.
-    * bf16 radix-16 digit-extract tied (min-walltime): same narrow-cell shape, the
-      radix-limb depth (8-16 limbs) — the realtime config; FITS 0.5B width/shape.
+
+    * clever, ``looped_transformer=False`` (STANDARD feed-forward): weight-TIED
+      recurrence is ILLEGAL for a standard transformer, so the tied axis is
+      DOWNGRADED to unrolled and the network must CONTAIN every op's machinery as
+      DISTINCT stored layers.  ``stored_layers`` = the SUMMED unrolled depth across
+      all machinery families (``summed_unrolled_depth``); it is narrow + shallow
+      vs nibble (digit-extract << the 189-block nibble long-division) but its
+      ~tens-to-hundreds of DISTINCT layers STILL exceed stock 0.5B's 24 → fits
+      WIDTH, does NOT fit DEPTH → does NOT fit stock 0.5B as a standard transformer.
+
+    * clever, ``looped_transformer=True`` (LOOPED / Universal-Transformer): the few
+      reused cells are STORED (~6) and re-applied ``depth`` times.  This fits a
+      0.5B-WIDTH checkpoint, but as a DIFFERENT (UT) architecture — NOT stock
+      feed-forward Qwen2.  Labelled Universal-Transformer.
     """
     from . import opconfig as OC
 
@@ -769,10 +875,11 @@ def account_opconfig(config, code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH
             recurrence="unrolled", hidden=acc.hidden, intermediate=acc.intermediate,
             stored_layers=acc.stored_layers, applied_depth=acc.applied_depth,
             params_estimate=acc.params_estimate, fits_stock_0_5b=fits,
-            binding=binding,
+            binding=binding, looped_transformer=False,
+            model_mode="standard-feedforward",
             note="the production nibble build (routes through the real fit solver)")
 
-    # --- CLEVER path: narrow reused cell, cost in APPLIED depth --------------
+    # --- CLEVER path -----------------------------------------------------------
     # hidden floored to the Qwen GQA head partition (14 q-heads x 64 = 896); the
     # clever cell's residual is a handful of dims (value axis + flags + work lanes).
     HEAD_DIM = arch.head_dim
@@ -781,69 +888,123 @@ def account_opconfig(config, code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH
     d_used = 4 + 8                                   # value/flag axis + ~8 work lanes
     hidden = max(hidden_floor, -(-(d_used + 1) // HEAD_DIM) * HEAD_DIM)
 
-    # Precision set across the op-set + deepest applied depth.
+    # Precision set across the op-set + deepest single-op applied depth + decode fan.
     precs = set()
     max_applied = 1
     max_decode_fan = 1
     extraction = config.base.extraction
-    recurrence = config.base.recurrence
     for op in OC.ALL_OPS:
         ax = config.for_op(op)
         cls = OC._OP_CLASS[op]
         precs.add(ax.precision)
         max_applied = max(max_applied, _clever_applied_depth(cls, ax))
-        # decode fan = the difference-min candidate vector (radix) or decimal 10.
         fan = ax.radix if ax.extraction == "digit_extract" else 10
         max_decode_fan = max(max_decode_fan, fan)
     # bitwise LUT rides alongside (256-unit FFN table); floor the intermediate to
     # the head partition, cap by the widest block (bitwise 256 or the decode fan).
     intermediate = max(max_decode_fan, 256, QHEADS * HEAD_DIM, 8)
-    stored_cells = 6            # ingest / ADD·CMP·shift / DIV / MUL / bitwise-LUT / CAM
+    prec_set = "/".join(sorted(precs, key=lambda p: PRECISIONS_ORDER.index(p)))
 
+    if config.looped_transformer:
+        # ===== LOOPED / Universal-Transformer: few STORED cells, applied N ======
+        recurrence = "tied"
+        stored_cells = 6        # ingest / ADD·CMP·shift / DIV / MUL / bitwise-LUT / CAM
+        # A UT checkpoint fits the stock 0.5B WIDTH+SHAPE, but it is a DIFFERENT
+        # architecture (a loop), not stock feed-forward Qwen2.  We record that it
+        # fits the checkpoint WIDTH; the honest verdict is labelled UT, not "stock".
+        fits = (hidden <= _STOCK_0_5B.hidden
+                and intermediate <= _STOCK_0_5B.intermediate
+                and stored_cells <= _STOCK_0_5B.layers)
+        binding = "" if fits else "hidden"
+        params = _param_estimate(hidden, intermediate, stored_cells, arch)
+        note = (f"LOOPED / Universal-Transformer (NOT stock feed-forward Qwen2): "
+                f"{stored_cells} reused cells re-applied per forward (deepest single "
+                f"op {max_applied}). Fits a 0.5B-WIDTH UT checkpoint (hidden {hidden}"
+                f"<=896, inter {intermediate}<=4864, stored {stored_cells}<=24), but "
+                f"the STANDARD feed-forward version must UNROLL and does NOT fit.")
+        return OpConfigGeometry(
+            label=_opcfg_label(config, prec_set, looped=True),
+            precision_set=prec_set, extraction=extraction, recurrence=recurrence,
+            hidden=hidden, intermediate=intermediate, stored_layers=stored_cells,
+            applied_depth=max_applied, params_estimate=params,
+            fits_stock_0_5b=fits, binding=binding, looped_transformer=True,
+            model_mode="LOOPED / Universal-Transformer", note=note)
+
+    # ===== STANDARD feed-forward (unrolled): n_layers = SUMMED unrolled depth =====
+    recurrence = "unrolled"
+    # tied on a standard model is illegal — force-downgrade so the reported geometry
+    # is what a standard transformer would ACTUALLY have to store.
+    ff_config = OC.force_standard_feedforward(config)
+    n_layers, per_family = summed_unrolled_depth(ff_config)
+    stored_layers = n_layers
+    # The active op is data-dependent, so ALL family machinery is present, but only
+    # ONE op fires per forward → applied depth per forward = the deepest single op.
+    applied = max_applied
     fits = (hidden <= _STOCK_0_5B.hidden
             and intermediate <= _STOCK_0_5B.intermediate
-            and stored_cells <= _STOCK_0_5B.layers)
-    binding = "" if fits else ("applied depth (per-forward unroll)"
-                               if max_applied > _STOCK_0_5B.layers else "hidden")
-    prec_set = "/".join(sorted(precs, key=lambda p: PRECISIONS_ORDER.index(p)))
-    params = _param_estimate(hidden, intermediate, stored_cells, arch)
-    # applied_depth is the DEEPEST SINGLE op's reused-cell unroll; the SUMMED
-    # per-forward depth over a program's op stream exceeds 24 (the recurrence
-    # tradeoff — fits the CHECKPOINT width/shape, not a single stock forward).
-    applied_note = (f"FITS the stock 0.5B WIDTH+SHAPE (hidden {hidden}<=896, "
-                    f"inter {intermediate}<=4864, stored {stored_cells}<=24); "
-                    f"deepest single-op unroll {max_applied}, summed program APPLIED "
-                    "depth exceeds 24 (recurrence: fits the checkpoint, not one forward)")
+            and stored_layers <= _STOCK_0_5B.layers)
+    # binding: depth first (it is the expected blocker — tens-to-hundreds > 24).
+    if fits:
+        binding = ""
+    elif stored_layers > _STOCK_0_5B.layers:
+        binding = "depth (stored layers)"
+    elif hidden > _STOCK_0_5B.hidden:
+        binding = "hidden"
+    else:
+        binding = "intermediate"
+    params = _param_estimate(hidden, intermediate, stored_layers, arch)
+    fam_str = " + ".join(f"{k} {v}" for k, v in per_family.items())
+    note = (f"STANDARD feed-forward (tied illegal -> UNROLLED): the FFN stack must "
+            f"CONTAIN every op's machinery as DISTINCT layers. n_layers = summed "
+            f"unrolled depth = {fam_str} = {n_layers}. NARROWER + SHALLOWER than "
+            f"nibble (hidden {hidden}<=896; digit-extract << the 189-block nibble "
+            f"long-division) but {n_layers} distinct layers still EXCEED stock 0.5B's "
+            f"24 -> fits WIDTH, NOT DEPTH -> does NOT fit stock 0.5B as a standard "
+            f"transformer. Only the LOOPED (UT) variant fits a 0.5B-width checkpoint.")
     return OpConfigGeometry(
-        label=_opcfg_label(config, prec_set),
+        label=_opcfg_label(config, prec_set, looped=False),
         precision_set=prec_set, extraction=extraction, recurrence=recurrence,
-        hidden=hidden, intermediate=intermediate, stored_layers=stored_cells,
-        applied_depth=max_applied, params_estimate=params,
-        fits_stock_0_5b=fits, binding=binding, note=applied_note)
+        hidden=hidden, intermediate=intermediate, stored_layers=stored_layers,
+        applied_depth=applied, params_estimate=params,
+        fits_stock_0_5b=fits, binding=binding, looped_transformer=False,
+        model_mode="standard-feedforward", note=note)
 
 
 PRECISIONS_ORDER = ("int8", "fp16", "bf16", "fp32", "fp64", "fp128")
 
 
-def _opcfg_label(config, prec_set: str) -> str:
+def _opcfg_label(config, prec_set: str, looped: bool = False) -> str:
     base = config.base
-    return (f"opcfg {prec_set}-{base.extraction}-{base.recurrence}-FULL")
+    if looped:
+        recur = "tied-LOOPED-UT"
+    else:
+        recur = "unrolled-stdFF"
+    return (f"opcfg {prec_set}-{base.extraction}-{recur}-FULL")
 
 
 def opconfig_geometry_table(configs, code_size: int = 24,
                             arch: QwenArch = QWEN2_5_ARCH) -> str:
-    """Render the geometry table for a list of (name, OpConfig) pairs."""
+    """Render the geometry table for a list of (name, OpConfig) pairs.
+
+    The ``fit0.5B`` column is the HONEST per-mode verdict: a STANDARD feed-forward
+    clever config reports its SUMMED unrolled ``stored`` layer count (does NOT fit
+    on DEPTH); a LOOPED (UT) config reports its few reused cells (fits a 0.5B-WIDTH
+    UT checkpoint, marked ``UT`` — NOT stock feed-forward)."""
     rows = [(name, account_opconfig(cfg, code_size=code_size, arch=arch))
             for name, cfg in configs]
-    hdr = (f"{'config':46s} {'prec':>12s} {'extract':>13s} {'recur':>8s} "
-           f"{'hidden':>6s} {'inter':>6s} {'stored':>6s} {'applied':>7s} "
-           f"{'params':>8s} {'fit0.5B':>8s}")
+    hdr = (f"{'config':40s} {'mode':>10s} {'prec':>12s} {'extract':>13s} "
+           f"{'recur':>16s} {'hidden':>6s} {'inter':>6s} {'stored':>6s} "
+           f"{'applied':>7s} {'params':>8s} {'fit0.5B':>10s}")
     lines = [hdr, "-" * len(hdr)]
     for name, g in rows:
-        fit = "YES" if g.fits_stock_0_5b else f"no({g.binding.split()[0]})"
+        if g.fits_stock_0_5b:
+            fit = "UT-width" if g.looped_transformer else "YES"
+        else:
+            fit = f"no({g.binding.split()[0]})"
+        mode = "loop/UT" if g.looped_transformer else "std-FF"
         lines.append(
-            f"{name[:46]:46s} {g.precision_set[:12]:>12s} {g.extraction[:13]:>13s} "
-            f"{g.recurrence[:8]:>8s} {g.hidden:6d} {g.intermediate:6d} "
-            f"{g.stored_layers:6d} {g.applied_depth:7d} {_h(g.params_estimate):>8s} "
-            f"{fit:>8s}")
+            f"{name[:40]:40s} {mode:>10s} {g.precision_set[:12]:>12s} "
+            f"{g.extraction[:13]:>13s} {g.recurrence[:16]:>16s} {g.hidden:6d} "
+            f"{g.intermediate:6d} {g.stored_layers:6d} {g.applied_depth:7d} "
+            f"{_h(g.params_estimate):>8s} {fit:>10s}")
     return "\n".join(lines)

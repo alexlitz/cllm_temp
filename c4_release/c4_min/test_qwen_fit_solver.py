@@ -173,6 +173,90 @@ def test_tradeoff_table_and_summary_render():
     assert "Binding" in S.best_summary(inf)
 
 
+# =========================================================================== #
+# OPCONFIG geometry — HONEST per model-mode accounting (recurrence honesty).
+#
+# The KEY correctness the fix installs: a STANDARD feed-forward transformer CANNOT
+# weight-tie, so its clever geometry is the SUMMED UNROLLED depth (does NOT fit
+# stock 0.5B on DEPTH); only the LOOPED / Universal-Transformer variant reuses a
+# few cells and fits a 0.5B-WIDTH checkpoint (labelled UT, not stock feed-forward).
+# =========================================================================== #
+from c4_min import opconfig as OC
+
+
+def test_default_opconfig_routes_to_nibble_full_geometry():
+    g = S.account_opconfig(OC.DEFAULT)
+    assert g.hidden == 3008 and not g.fits_stock_0_5b   # nibble FULL blocked by WIDTH
+    assert g.binding == "hidden"
+    assert g.looped_transformer is False
+
+
+def test_clever_standard_feedforward_unrolls_and_fails_on_depth():
+    # min_params_config is a LOOPED/UT config; the STANDARD feed-forward version
+    # UNROLLS -> n_layers = summed unrolled depth -> exceeds stock 0.5B's 24 layers.
+    ff = OC.force_standard_feedforward(OC.min_params_config())
+    g = S.account_opconfig(ff)
+    assert g.looped_transformer is False
+    assert g.recurrence == "unrolled"
+    # summed unrolled depth = arith 11 + div 10 + mul 20 + bitwise 8 + mem 1 + triv 1
+    n, fam = S.summed_unrolled_depth(ff)
+    assert n == 51 and g.stored_layers == 51
+    assert fam == {"arith": 11, "div": 10, "mul": 20, "bitwise": 8,
+                   "memory": 1, "trivial": 1}
+    # fits WIDTH (896<=896) but NOT DEPTH (51 > 24) -> does NOT fit stock 0.5B.
+    assert g.hidden == 896 and g.intermediate <= S._STOCK_0_5B.intermediate
+    assert not g.fits_stock_0_5b
+    assert g.binding == "depth (stored layers)"
+
+
+def test_clever_looped_ut_fits_0_5b_width_as_ut_not_stock():
+    g = S.account_opconfig(OC.min_params_config())     # tied / looped / UT
+    assert g.looped_transformer is True
+    assert g.recurrence == "tied"
+    assert g.stored_layers == 6                          # few reused cells
+    assert g.applied_depth == 20                         # deepest single op (MUL fp128)
+    assert g.fits_stock_0_5b                             # fits a 0.5B-WIDTH UT checkpoint
+    assert "Universal-Transformer" in g.model_mode
+    assert "NOT stock feed-forward" in g.note
+
+
+def test_bf16_radix16_standard_vs_looped():
+    looped = OC.min_walltime_config()
+    std = OC.force_standard_feedforward(looped)
+    gl = S.account_opconfig(looped)
+    gs = S.account_opconfig(std)
+    # LOOPED fits 0.5B width; STANDARD unrolled does not (depth).
+    assert gl.fits_stock_0_5b and gl.looped_transformer
+    assert not gs.fits_stock_0_5b and gs.binding == "depth (stored layers)"
+    # radix-16 limb depths: arith 8 + div 8 + mul 16 + bitwise 8 + mem 1 + triv 1 = 42
+    n, _ = S.summed_unrolled_depth(std)
+    assert n == 42 and gs.stored_layers == 42
+
+
+def test_standard_ff_unrolled_is_shallower_and_narrower_than_nibble():
+    # clever-UNROLLED is BOTH narrower (896 vs 3008) AND shallower (51 vs 123) than
+    # nibble FULL — the digit-extract depth is far less than the 189-block nibble
+    # long division — yet still exceeds 24 layers, so it does NOT fit stock 0.5B.
+    nib = S.account_opconfig(OC.DEFAULT)
+    clv = S.account_opconfig(OC.force_standard_feedforward(OC.min_params_config()))
+    assert clv.hidden < nib.hidden                       # narrower
+    assert clv.stored_layers < nib.stored_layers         # shallower
+    assert clv.stored_layers > S._STOCK_0_5B.layers       # but still > 24
+    assert not clv.fits_stock_0_5b and not nib.fits_stock_0_5b
+
+
+def test_opconfig_geometry_table_shows_honest_per_mode_verdict():
+    configs = [
+        ("nibble-fp32", OC.DEFAULT),
+        ("clever-fp64-UNROLLED", OC.force_standard_feedforward(OC.min_params_config())),
+        ("clever-fp64-TIED", OC.min_params_config()),
+    ]
+    tbl = S.opconfig_geometry_table(configs)
+    assert "mode" in tbl and "std-FF" in tbl and "loop/UT" in tbl
+    assert "no(depth)" in tbl        # the standard-FF clever row fails on DEPTH
+    assert "UT-width" in tbl         # the looped row fits a UT-width checkpoint
+
+
 @pytest.mark.slow
 def test_bake_rejects_estimate_only_configs():
     with pytest.raises(NotImplementedError):

@@ -28,12 +28,32 @@ The four axes (per opcode)
     ``tied`` (one reused cell applied ``depth`` times — STORED shrinks, APPLIED
     unchanged; the Universal-Transformer fold).
 
+    HONESTY CONSTRAINT (``looped_transformer``): weight-TIED recurrence is a
+    *looped* / Universal-Transformer implementation — the SAME stored cell is
+    re-applied ``depth`` times per forward.  A STANDARD feed-forward transformer
+    (like the released Qwen2.5-0.5B: 24 DISTINCT decoder layers, each applied
+    exactly once) has NO loop, so it CANNOT weight-tie: it must UNROLL every place
+    into a distinct stored layer.  ``recurrence='tied'`` is therefore ONLY legal
+    when the model is declared ``looped_transformer=True``; on a standard
+    feed-forward model the validator rejects (or, with ``force=True``, downgrades)
+    ``tied`` → ``unrolled``.  Counting ``tied`` as a param-win for a STOCK
+    feed-forward checkpoint is dishonest — see ``TOGGLE_SCHEMA.md`` §honesty.
+
+The MODEL MODE (``looped_transformer``)
+=======================================
+``OpConfig.looped_transformer`` (default ``False`` = a STANDARD feed-forward
+transformer, matching stock Qwen2) declares whether the target architecture is a
+LOOPED / Universal-Transformer (a single stored cell re-applied ``depth`` times)
+or a standard feed-forward stack (distinct layer per place, each applied once).
+It is the gate that makes ``tied`` legal.
+
 The DEFAULT
 ===========
 Every op defaults to ``precision=fp32, radix=16 (nibble base), extraction=nibble,
-recurrence=unrolled`` — i.e. the production nibble-c4 build.  ``DEFAULT`` (a plain
-``OpConfig`` with an empty per-op override dict) resolves to exactly that for
-every op, so ``DEFAULT`` == the golden ``174ece66`` build config (the resolver
+recurrence=unrolled`` — i.e. the production nibble-c4 build — and the model mode
+defaults to ``looped_transformer=False`` (standard feed-forward).  ``DEFAULT`` (a
+plain ``OpConfig`` with an empty per-op override dict) resolves to exactly that
+for every op, so ``DEFAULT`` == the golden ``174ece66`` build config (the resolver
 never touches the build unless a non-default override is present).
 
 The ``C4_OPCFG_*`` env flags
@@ -49,6 +69,11 @@ is overridable per op::
 A bare ``C4_OPCFG_ALL_PRECISION=bf16`` (op = ``ALL``) sets the axis for every op
 (individual per-op flags override it).  With NO ``C4_OPCFG_*`` flag set, the
 resolver returns ``DEFAULT`` and the build is byte-identical to golden.
+
+``C4_OPCFG_LOOPED_TRANSFORMER=1`` declares the MODEL MODE as a LOOPED /
+Universal-Transformer (making ``recurrence=tied`` legal); unset/0 == a STANDARD
+feed-forward transformer (the default), on which ``tied`` is rejected — see
+``validate``.
 """
 from __future__ import annotations
 
@@ -215,9 +240,17 @@ class OpConfig:
     """A per-op toggle configuration.  ``overrides`` maps an op name -> a partial
     dict of axis overrides; ``base`` is the fallback axis config for any op NOT in
     ``overrides``.  ``DEFAULT`` == ``OpConfig()`` == the golden build.
+
+    ``looped_transformer`` (default ``False``) is the MODEL-MODE field: ``False``
+    declares a STANDARD feed-forward transformer (distinct layer per place, each
+    applied once — stock Qwen2), ``True`` declares a LOOPED / Universal-Transformer
+    (one stored cell re-applied ``depth`` times).  It gates whether the
+    weight-TIED recurrence axis is legal: ``recurrence='tied'`` requires
+    ``looped_transformer=True`` (see ``validate``).
     """
     base: AxisConfig = field(default_factory=lambda: DEFAULT_AXES)
     overrides: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    looped_transformer: bool = False
 
     def for_op(self, op: str) -> AxisConfig:
         """The fully-resolved ``AxisConfig`` for ``op`` (base + any override)."""
@@ -230,7 +263,10 @@ class OpConfig:
         return replace(self.base, **ov)
 
     def is_default(self) -> bool:
-        """True iff every op resolves to ``DEFAULT_AXES`` (== golden build)."""
+        """True iff every op resolves to ``DEFAULT_AXES`` AND the model is a
+        standard feed-forward transformer (== golden build)."""
+        if self.looped_transformer:
+            return False
         if self.base != DEFAULT_AXES:
             return False
         return all(self.for_op(op) == DEFAULT_AXES for op in ALL_OPS)
@@ -298,12 +334,54 @@ def validate_axes(op: str, axes: AxisConfig) -> None:
             f"'{_OP_CLASS[op]}' bound). Lower the radix or raise precision.")
 
 
+def _tied_ops(config: OpConfig) -> Tuple[str, ...]:
+    """The ops whose resolved recurrence is ``tied`` (incl. the base)."""
+    tied = [op for op in ALL_OPS if config.for_op(op).recurrence == "tied"]
+    return tuple(tied)
+
+
 def validate(config: OpConfig) -> None:
     """Validate every op's resolved axes in ``config`` (raise on the first bad
-    one)."""
+    one), AND enforce the MODEL-MODE honesty constraint:
+
+      * ``recurrence='tied'`` (weight-tied recurrence) is a LOOPED /
+        Universal-Transformer implementation and is ONLY legal when the model is
+        declared ``looped_transformer=True``.  A STANDARD feed-forward transformer
+        (``looped_transformer=False``, e.g. stock Qwen2.5-0.5B — 24 distinct
+        layers each applied once) has no loop to re-apply a tied cell, so it MUST
+        unroll.  A ``tied`` axis on a standard model is REJECTED here (use
+        ``force_standard_feedforward()`` to downgrade ``tied`` → ``unrolled``, or
+        set ``looped_transformer=True`` to declare a UT model explicitly).
+    """
     validate_axes("ADD", config.base)  # base must itself be a coherent config
     for op in ALL_OPS:
         validate_axes(op, config.for_op(op))
+    if not config.looped_transformer:
+        tied = _tied_ops(config)
+        if tied:
+            raise OpConfigError(
+                "recurrence='tied' requires a LOOPED / Universal-Transformer model "
+                "(looped_transformer=True): a standard feed-forward transformer "
+                "cannot re-apply a weight-tied cell, it must UNROLL. Offending ops: "
+                f"{tied}. Either set looped_transformer=True (declare a UT model) or "
+                "call force_standard_feedforward(config) to downgrade tied->unrolled.")
+
+
+def force_standard_feedforward(config: OpConfig) -> OpConfig:
+    """Return a copy of ``config`` coerced to a STANDARD feed-forward model:
+    ``looped_transformer=False`` and every ``recurrence='tied'`` axis downgraded to
+    ``'unrolled'`` (the only honest recurrence for a stock feed-forward checkpoint).
+    Use this to turn a UT/looped config into what a standard transformer would
+    actually have to store (distinct layer per place)."""
+    new_base = replace(config.base, recurrence="unrolled") \
+        if config.base.recurrence == "tied" else config.base
+    new_over: Dict[str, Dict[str, object]] = {}
+    for op, ov in config.overrides.items():
+        ov2 = dict(ov)
+        if ov2.get("recurrence") == "tied":
+            ov2["recurrence"] = "unrolled"
+        new_over[op] = ov2
+    return OpConfig(base=new_base, overrides=new_over, looped_transformer=False)
 
 
 def max_safe_radix(op: str, precision: str) -> int:
@@ -361,9 +439,15 @@ def resolve(env: Optional[Dict[str, str]] = None,
                 extraction=DEFAULT_AXES.extraction,
                 recurrence=DEFAULT_AXES.recurrence)
     overrides: Dict[str, Dict[str, object]] = {}
+    # MODEL-MODE flag: C4_OPCFG_LOOPED_TRANSFORMER=1 declares a LOOPED / UT model
+    # (makes recurrence='tied' legal); unset/0 == standard feed-forward (default).
+    looped_raw = env.get("C4_OPCFG_LOOPED_TRANSFORMER", "0")
+    looped = looped_raw not in ("0", "", "false", "False", "no", "off")
     for key, val in env.items():
         if not key.startswith("C4_OPCFG_"):
             continue
+        if key == "C4_OPCFG_LOOPED_TRANSFORMER":
+            continue                             # handled above (not an <OP>_<AXIS>)
         rest = key[len("C4_OPCFG_"):]           # e.g. "DIV_PRECISION"
         # split on the LAST underscore so multi-word ops would still parse (all
         # current op names are single-token, but ALL/axis split is unambiguous).
@@ -383,7 +467,8 @@ def resolve(env: Optional[Dict[str, str]] = None,
         else:
             raise OpConfigError(f"{key!r}: unknown op {op!r}; known: ALL, {ALL_OPS}")
 
-    cfg = OpConfig(base=AxisConfig(**base), overrides=overrides)
+    cfg = OpConfig(base=AxisConfig(**base), overrides=overrides,
+                   looped_transformer=looped)
     if validate_result:
         validate(cfg)
     return cfg
@@ -395,7 +480,13 @@ def resolve(env: Optional[Dict[str, str]] = None,
 def min_params_config() -> OpConfig:
     """MIN-PARAMS corner (clever_minparam_alu): whole-value fp64 (fp128 for MUL),
     difference-min digit-extract, tied recurrence — ~4 scalars/op, slow fp64
-    datapath.  ADD/SUB/DIV/MOD/CMP/frame fp64; MUL fp128."""
+    datapath.  ADD/SUB/DIV/MOD/CMP/frame fp64; MUL fp128.
+
+    ``tied`` recurrence is a LOOPED / Universal-Transformer implementation, so this
+    config is declared ``looped_transformer=True``.  Its ~4-scalar param win is a
+    UT-checkpoint claim, NOT a stock feed-forward Qwen2 claim — a standard
+    feed-forward model must UNROLL (see ``force_standard_feedforward`` /
+    ``qwen_fit_solver.account_opconfig``)."""
     ov: Dict[str, Dict[str, object]] = {}
     for op in ALL_OPS:
         ov[op] = dict(precision="fp64", extraction="whole_value",
@@ -404,7 +495,7 @@ def min_params_config() -> OpConfig:
                      recurrence="tied")
     return OpConfig(base=AxisConfig(precision="fp64", radix=10,
                                     extraction="whole_value", recurrence="tied"),
-                    overrides=ov)
+                    overrides=ov, looped_transformer=True)
 
 
 def min_walltime_config() -> OpConfig:
@@ -412,7 +503,11 @@ def min_walltime_config() -> OpConfig:
     recurrence — the measured tensor-core sweet spot (~13x faster than the fp64
     cell on MUL/DIV).  radix 16 keeps MUL depth 16 / DIV depth 8 while staying
     exact under bf16's 2^8 ceiling (DIV boundary r^2=256=ceiling; MUL uses fp16 to
-    hold its 1904 column peak)."""
+    hold its 1904 column peak).
+
+    ``tied`` recurrence is a LOOPED / Universal-Transformer implementation, so this
+    config is declared ``looped_transformer=True`` (a UT-style checkpoint, not
+    stock feed-forward Qwen2)."""
     ov: Dict[str, Dict[str, object]] = {}
     for op in ALL_OPS:
         ov[op] = dict(precision="bf16", radix=16, extraction="digit_extract",
@@ -422,4 +517,4 @@ def min_walltime_config() -> OpConfig:
                      recurrence="tied")
     return OpConfig(base=AxisConfig(precision="bf16", radix=16,
                                     extraction="digit_extract", recurrence="tied"),
-                    overrides=ov)
+                    overrides=ov, looped_transformer=True)

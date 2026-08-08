@@ -254,14 +254,30 @@ ops (TOGGLE_SCHEMA.md §7), so a non-default value changes the *sized/accounted*
 | `C4_OPCFG_<OP>_PRECISION` | datapath dtype for `<OP>`: `int8`/`fp16`/`bf16`/`fp32`/`fp64`/`fp128` (exact-int ceilings 2^7…2^64) | `fp32` (== golden) | — | **golden-MOVING** (non-`fp32`/non-nibble selects a clever op construction; DEFAULT `fp32` == `174ece66`) |
 | `C4_OPCFG_<OP>_RADIX` | value/limb base `r>=2` (nibble = 16); bounded by precision headroom for the op (add ~2r, cmp ~r, mul ~r²·L, div ~r²) | `16` (nibble base) | precision (validator rejects a radix overflowing the ceiling) | **golden-MOVING** (non-16 or non-nibble extraction changes the limb decomposition; DEFAULT 16 == `174ece66`) |
 | `C4_OPCFG_<OP>_EXTRACTION` | readout: `nibble` (production 4-bit lanes) · `digit_extract` (MSB-first difference-min decode) · `whole_value` (one hi-prec scalar) | `nibble` (== golden) | — | **golden-MOVING** (non-`nibble` selects the clever digit/whole-value construction; DEFAULT `nibble` == `174ece66`) |
-| `C4_OPCFG_<OP>_RECURRENCE` | `unrolled` (one stored layer/place) · `tied` (one reused cell applied depth×, STORED shrinks) | `unrolled` (== golden) | — | **golden-MOVING** (`tied` weight-ties the per-place cell; DEFAULT `unrolled` == `174ece66`) |
+| `C4_OPCFG_<OP>_RECURRENCE` | `unrolled` (one stored layer/place) · `tied` (one reused cell applied depth×, STORED shrinks) — **`tied` REQUIRES `C4_OPCFG_LOOPED_TRANSFORMER=1` (a looped/UT model)** | `unrolled` (== golden) | `C4_OPCFG_LOOPED_TRANSFORMER` for `tied` | **golden-MOVING** (`tied` weight-ties the per-place cell — only legal on a looped/UT model; DEFAULT `unrolled` == `174ece66`) |
+| `C4_OPCFG_LOOPED_TRANSFORMER` | model MODE: `1` = a LOOPED / Universal-Transformer (re-applies one stored cell `depth`× per forward — makes `tied` legal); `0`/unset = a STANDARD feed-forward transformer (stock Qwen2 — 24 distinct layers each applied once, so `tied` is REJECTED → must UNROLL) | `0` (standard feed-forward == golden) | — | **golden-MOVING** when `1` (declares a different architecture) |
 | `C4_OPCFG_ALL_<AXIS>` | set `<AXIS>` for EVERY op (the base); individual `C4_OPCFG_<OP>_<AXIS>` override it | (unset → per-axis default) | — | **golden-MOVING** when any axis ≠ default |
+
+**Recurrence requires a looped/UT implementation (the honesty rule).** Weight-tied
+recurrence (`tied`) is only legitimate on a LOOPED / Universal-Transformer that
+re-applies one stored cell `depth`× per forward. The released **Qwen2.5-0.5B is a
+STANDARD feed-forward transformer (24 distinct layers, each applied once)** and so
+**cannot use recurrence** — the validator REJECTS `tied` unless
+`C4_OPCFG_LOOPED_TRANSFORMER=1`. On a standard feed-forward model the honest clever
+geometry UNROLLS: `n_layers` = the summed unrolled depth (**51 layers / ~217M params**
+for clever-fp64-FULL, **42 / ~179M** for bf16-radix16-FULL), which exceeds 24 → does
+**NOT fit stock 0.5B as a standard transformer** (fits WIDTH, not DEPTH). The
+~4-scalar / ~6-cell "fits stock 0.5B" claim is a **LOOPED / Universal-Transformer
+claim only** (a 0.5B-**width** UT checkpoint, a different architecture). See
+[`TOGGLE_SCHEMA.md`](TOGGLE_SCHEMA.md) §4/§7 + [`ALL_OPS_MINPARAM.md`](ALL_OPS_MINPARAM.md).
 
 The **two Pareto corners** as named configs (TOGGLE_SCHEMA.md §3):
 `opconfig.min_params_config()` = fp64/fp128 whole-value tied (~4 scalars/op,
 min-PARAMS); `opconfig.min_walltime_config()` = bf16 radix-16 digit-extract tied
-(~13× faster on mul/div, min-WALLTIME realtime). The low-precision speedup is a
-**narrow-VM lever** — the current wide VM is memory-bound, where bf16 nets ~1.0×.
+(~13× faster on mul/div, min-WALLTIME realtime). **Both are declared
+`looped_transformer=True` — they are Universal-Transformer checkpoints, NOT stock
+feed-forward Qwen2.** The low-precision speedup is a **narrow-VM lever** — the
+current wide VM is memory-bound, where bf16 nets ~1.0×.
 
 ### Build-family selectors (DOOM/perf-fleet build — `doom-build`, golden gate unchanged)
 

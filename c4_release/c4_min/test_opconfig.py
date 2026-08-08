@@ -28,6 +28,9 @@ def test_default_is_the_nibble_fp32_build():
     assert OC.DEFAULT_AXES == OC.AxisConfig(
         precision="fp32", radix=16, extraction="nibble", recurrence="unrolled")
     assert OC.DEFAULT.is_default()
+    # DEFAULT is a STANDARD feed-forward transformer (matches stock Qwen2), NOT a
+    # looped / Universal-Transformer.
+    assert OC.DEFAULT.looped_transformer is False
     for op in OC.ALL_OPS:
         assert OC.DEFAULT.for_op(op) == OC.DEFAULT_AXES
     assert OC.DEFAULT.non_default_ops() == {}
@@ -139,11 +142,13 @@ def test_resolve_per_op_flags():
         "C4_OPCFG_DIV_RADIX": "16",
         "C4_OPCFG_DIV_EXTRACTION": "whole_value",
         "C4_OPCFG_DIV_RECURRENCE": "tied",
+        "C4_OPCFG_LOOPED_TRANSFORMER": "1",   # tied recurrence -> declare looped/UT
     }
     cfg = OC.resolve(env=env)
     div = cfg.for_op("DIV")
     assert div.precision == "fp64" and div.radix == 16
     assert div.extraction == "whole_value" and div.recurrence == "tied"
+    assert cfg.looped_transformer is True
     # every OTHER op stays at DEFAULT.
     assert cfg.for_op("ADD") == OC.DEFAULT_AXES
     assert not cfg.is_default()
@@ -155,6 +160,7 @@ def test_resolve_all_flag_sets_the_base_and_per_op_wins():
            "C4_OPCFG_ALL_RADIX": "16",
            "C4_OPCFG_ALL_EXTRACTION": "digit_extract",
            "C4_OPCFG_ALL_RECURRENCE": "tied",
+           "C4_OPCFG_LOOPED_TRANSFORMER": "1",   # tied recurrence -> declare looped/UT
            "C4_OPCFG_MUL_PRECISION": "fp16"}       # per-op wins over ALL
     cfg = OC.resolve(env=env)
     assert cfg.for_op("ADD").precision == "bf16"
@@ -196,6 +202,9 @@ def test_min_params_config_is_fp64_fp128_whole_value_tied():
     assert cfg.for_op("ADD").recurrence == "tied"
     assert cfg.for_op("MUL").precision == "fp128"   # 64-bit product needs fp128
     assert not cfg.is_default()
+    # tied recurrence is a LOOPED / Universal-Transformer implementation, so the
+    # config MUST declare looped_transformer=True (else validate() rejects it).
+    assert cfg.looped_transformer is True
 
 
 def test_min_walltime_config_is_bf16_radix16_digit_tied():
@@ -208,3 +217,66 @@ def test_min_walltime_config_is_bf16_radix16_digit_tied():
     assert cfg.for_op("MUL").precision == "fp16"    # MUL column peak needs fp16
     assert cfg.for_op("DIV").precision == "bf16"    # DIV r^2=256 boundary OK
     assert not cfg.is_default()
+    assert cfg.looped_transformer is True           # tied -> looped / UT
+
+
+# =========================================================================== #
+# MODEL MODE — recurrence='tied' requires a looped / Universal-Transformer.
+# A STANDARD feed-forward transformer (stock Qwen2) cannot weight-tie: it unrolls.
+# =========================================================================== #
+def _tied_all(looped: bool) -> OC.OpConfig:
+    """A whole-value fp64 tied config with the given model mode."""
+    ov = {op: dict(precision="fp64", extraction="whole_value", recurrence="tied")
+          for op in OC.ALL_OPS}
+    return OC.OpConfig(
+        base=OC.AxisConfig(precision="fp64", radix=10, extraction="whole_value",
+                           recurrence="tied"),
+        overrides=ov, looped_transformer=looped)
+
+
+def test_tied_on_standard_feedforward_is_rejected():
+    # tied recurrence on a STANDARD feed-forward model (looped_transformer=False) is
+    # dishonest (there is no loop to re-apply the cell) -> validate() must reject it.
+    std = _tied_all(looped=False)
+    with pytest.raises(OC.OpConfigError) as exc:
+        OC.validate(std)
+    msg = str(exc.value)
+    assert "tied" in msg and "looped_transformer" in msg and "UNROLL" in msg
+
+
+def test_tied_on_looped_transformer_is_allowed():
+    # the SAME tied config is legal once the model is declared looped / UT.
+    ut = _tied_all(looped=True)
+    OC.validate(ut)                                  # no raise
+    assert ut.looped_transformer is True
+    assert not ut.is_default()
+
+
+def test_force_standard_feedforward_downgrades_tied_to_unrolled():
+    ut = _tied_all(looped=True)
+    ff = OC.force_standard_feedforward(ut)
+    assert ff.looped_transformer is False
+    for op in OC.ALL_OPS:
+        assert ff.for_op(op).recurrence == "unrolled"
+    OC.validate(ff)                                  # now a legal standard-FF config
+
+
+def test_looped_config_declared_standard_is_default_false():
+    # a looped model is NEVER the golden default (golden is standard feed-forward).
+    ut = _tied_all(looped=True)
+    assert ut.is_default() is False
+    # even an all-DEFAULT-axes config with looped_transformer=True is not "default".
+    looped_default_axes = OC.OpConfig(looped_transformer=True)
+    assert looped_default_axes.is_default() is False
+
+
+def test_resolve_looped_transformer_flag():
+    # C4_OPCFG_LOOPED_TRANSFORMER declares the model mode.  tied REQUIRES it.
+    with pytest.raises(OC.OpConfigError):
+        OC.resolve(env={"C4_OPCFG_ALL_RECURRENCE": "tied"})   # tied, standard-FF -> reject
+    cfg = OC.resolve(env={"C4_OPCFG_ALL_RECURRENCE": "tied",
+                          "C4_OPCFG_LOOPED_TRANSFORMER": "1"})
+    assert cfg.looped_transformer is True
+    assert cfg.for_op("ADD").recurrence == "tied"
+    # the flag alone (no tied axis) does not perturb the default axes.
+    assert OC.resolve(env={"C4_OPCFG_LOOPED_TRANSFORMER": "0"}).is_default()

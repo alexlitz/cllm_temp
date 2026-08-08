@@ -165,38 +165,60 @@ older `HF_MODEL_FIT.md` snapshot — 3008/123/60 vs 2944/107/44 — because this
 worktree branch differs from `f5f31bd8`; the solver is the authority for the
 current tree.)
 
-### CLEVER op-set geometry (this construction)
+### CLEVER op-set geometry (this construction) — TWO honest modes
 
-Each config is ONE narrow reused cell (STORED = 1 block), hidden floored at the
-Qwen GQA head partition (14 q-heads × 64 = **896**), intermediate = the
-difference-min decode fan (≤16) or the bitwise LUT block (256), both floored to
-the same 896 head-partition minimum. The COST is APPLIED depth (recurrence).
+**Recurrence requires a LOOPED / Universal-Transformer.** The stock released
+**Qwen2.5-0.5B is a STANDARD feed-forward transformer** (24 distinct decoder layers,
+each applied once), so it **cannot weight-tie** — it must UNROLL. The clever
+geometry therefore has two honest modes; hidden is floored at the Qwen GQA head
+partition (14 q-heads × 64 = **896**) in both.
 
-| config | precision | hidden | intermediate | STORED | applied depth | note |
-|--------|-----------|-------:|-------------:|-------:|--------------:|------|
-| clever-fp64 (ADD/SUB/DIV/MOD/CMP/shift/frame) | fp64 | 896 | 896 | 1 | 10 | one reused fp64 decode cell; deepest op DIV depth 10 |
-| clever-fp128 (+MUL 64-bit product) | fp128 | 896 | 896 | 1 | 20 | MUL fp128 whole product, depth 20 |
-| fp32-clever (nibble-serial recurrence) | fp32 | 896 | 896 | 1 | 8 | nibble-serial recurrent cell, depth = nibble count (8) |
+**(a) STANDARD feed-forward (UNROLLED)** — the active op is data-dependent
+(conditionally applied at run time), so the feed-forward network must CONTAIN every
+op's machinery as DISTINCT stored layers. `n_layers` = the **summed unrolled depth**
+across all machinery families (arith / div / mul / bitwise / memory / trivial).
+
+| config | precision | hidden | intermediate | STORED n_layers (unrolled) | distinct params | fits stock 0.5B (24 layers)? |
+|--------|-----------|-------:|-------------:|---------------------------:|----------------:|:----------------------------:|
+| clever-fp64-FULL (whole-value) | fp64/fp128 | 896 | 896 | **51** = arith 11 + div 10 + mul 20 + bitwise 8 + mem 1 + trivial 1 | ~**217M** | **NO — depth** (51 > 24) |
+| bf16-radix16-FULL (digit-extract) | fp16/bf16 | 896 | 896 | **42** = arith 8 + div 8 + mul 16 + bitwise 8 + mem 1 + trivial 1 | ~**179M** | **NO — depth** (42 > 24) |
+
+clever-UNROLLED is **narrower AND shallower than nibble** (896 < 3008; 51 < 123 —
+the digit-extraction depth is far less than the **189-block nibble long-division**),
+but its **tens-to-hundreds of DISTINCT layers still exceed stock 0.5B's 24** → it
+**fits WIDTH, NOT DEPTH → does NOT fit stock 0.5B as a standard transformer.**
+
+**(b) LOOPED / Universal-Transformer (TIED)** — one reused cell re-applied `depth`
+times per forward. STORED shrinks to a handful of cells; the cost is APPLIED depth.
+
+| config | precision | hidden | intermediate | STORED (reused cells) | applied depth | fits a 0.5B-WIDTH UT checkpoint? |
+|--------|-----------|-------:|-------------:|----------------------:|--------------:|:-------------------------------:|
+| clever-fp64-FULL (whole-value, tied) | fp64/fp128 | 896 | 896 | ~**6** | 20 (MUL) | **YES — as a UT model, NOT stock feed-forward Qwen2** |
+| bf16-radix16-FULL (digit-extract, tied) | fp16/bf16 | 896 | 896 | ~**6** | 16 (MUL) | **YES — UT-width checkpoint, not stock feed-forward** |
 
 (+ the bitwise LUT block adds an intermediate-256 FFN table; the shared memory CAM
 adds one attention head of ~10 weights. Neither perturbs the 896 hidden floor.)
 
-### Does clever-FULL fit stock 0.5B? — YES for the checkpoint shape
+### Does clever-FULL fit stock 0.5B? — NO as a standard transformer; only as a LOOPED/UT checkpoint
 
-**clever-FULL FITS the stock 0.5B WIDTH + STORED-LAYER shape:** hidden 896 ≤ 896,
-intermediate ≤ 4864 (widest block is the 256-unit bitwise LUT), STORED ≈ 6
-distinct cells (ingest / ADD·CMP·shift / DIV / MUL / bitwise-LUT / CAM) ≤ 24.
+- **As a STANDARD feed-forward transformer (what stock Qwen2.5-0.5B is): NO.** The
+  network must UNROLL (no loop to re-apply a tied cell), so `n_layers` = **51**
+  (clever-fp64-FULL) / **42** (bf16-radix16-FULL) distinct stored layers, which
+  **exceeds the 24 stock layers**. It fits the stock 0.5B **WIDTH** (hidden 896 ≤ 896,
+  intermediate ≤ 4864) but **NOT the DEPTH** — the binding constraint is **depth**,
+  not width.
+- **As a LOOPED / Universal-Transformer: YES for the WIDTH,** as a **different
+  architecture.** The tied variant stores ~6 reused cells (≤ 24) and re-applies them
+  per forward (deepest single op = MUL depth 20), so it fits a 0.5B-**width** UT
+  checkpoint — but a UT is **not** the released stock feed-forward Qwen2. The
+  ~4-scalar / ~6-cell param win is a **UT-checkpoint claim only.**
 
-**But APPLIED depth exceeds a single stock forward:** the recurrence unrolls DIV
-to 10 and MUL to 20 per op (summed over the program's ops → far past 24). So
-clever-FULL fits the **checkpoint** (the released 0.5B width + layer count host
-the weights), at the cost of **many APPLIED steps per forward** — the standard
-Universal-Transformer recurrence tradeoff.
-
-This is the exact inverse of the nibble build's failure mode: nibble FULL is
-blocked by **WIDTH** (hidden ~3008 > 896); clever FULL trades all of that width
-for **DEPTH-in-time** and so fits the stock 0.5B width where nibble cannot — the
-whole-value + recurrence levers move the cost off the width axis entirely.
+This corrects the earlier "clever-FULL FITS stock 0.5B" phrasing, which counted
+`tied` recurrence as a param-win for a stock feed-forward checkpoint — a model that
+cannot actually use recurrence. Nibble FULL is blocked by **WIDTH** (hidden ~3008 >
+896); clever-UNROLLED trades that width for DEPTH but its unrolled depth still
+overshoots stock 0.5B's 24 layers. Recurrence buys the depth-fit **only** by
+switching to a looped/UT architecture.
 
 ---
 
