@@ -346,6 +346,23 @@ def test_depth_bound_binds():
     assert r.geometry.stored_layers == 51
 
 
+def test_forwards_per_step_meets_depth_bound_kv_neutral():
+    # standard-FF unrolled fp64 = 51 stored layers > max_layers 24 (fails depth at
+    # F=1).  Re-booking depth into the autoregressive loop with forwards_per_step=3
+    # needs only ceil(51/3)=17 stored layers <= 24 -> FITS, and KV is CONSERVED
+    # (the layers<->forwards trade is KV-neutral in the solver).
+    ff = OC.force_standard_feedforward(OC.min_params_config())
+    base = dict(max_layers=24, max_hidden=4096, max_intermediate=200000,
+                kv_budget_bytes=10 ** 15, seq_len=512, batch=1)
+    r1 = S.solve_opconfig(ff, S.FitConstraints(**base))                       # F=1
+    r3 = S.solve_opconfig(ff, S.FitConstraints(forwards_per_step=3, **base))  # F=3
+    assert not r1.fits and r1.binding_constraint == "depth (max_layers)"
+    assert r3.fits and r3.binding_constraint is None       # forwards rescues depth
+    assert r3.kv_bytes == r1.kv_bytes                      # KV-neutral
+    assert "forwards_per_step=3" in r3.notes
+    assert r3.slack.layers == 24 - 17                      # ceil(51/3)=17 effective
+
+
 def test_width_hidden_bound_binds():
     # DEFAULT nibble hidden=3008 > max_hidden 896; depth/inter/KV roomy -> hidden.
     con = S.FitConstraints(max_hidden=896, max_layers=10 ** 6,

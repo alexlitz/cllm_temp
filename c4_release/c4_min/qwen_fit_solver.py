@@ -1081,6 +1081,13 @@ class FitConstraints:
       * ``seq_len`` / ``batch`` — the KV-cache sizing context (default 2048 / 1).
       * ``n_heads`` / ``head_dim`` — KV-cache head geometry override (default from
                               the arch's num_key_value_heads / head_dim).
+      * ``forwards_per_step`` — the DEPTH lever: run the SAME network ``F`` forward
+                              passes per VM step (the autoregressive digit-per-token
+                              loop) so the required depth D is met by only
+                              ``ceil(D/F)`` STORED physical layers.  KV-neutral here
+                              (applied depth spread over F forwards => seq*F, and
+                              (D/F)*(seq*F) == D*seq).  Default 1 == distinct-layers.
+                              See ``forwards_per_step.py`` for the full (L,F) model.
     """
     precision: Optional[str] = None
     max_layers: Optional[int] = None
@@ -1091,6 +1098,7 @@ class FitConstraints:
     batch: int = 1
     n_heads: Optional[int] = None
     head_dim: Optional[int] = None
+    forwards_per_step: int = 1
 
     def kv_heads(self, arch: QwenArch) -> int:
         """The KV-cache head count (override or the arch's GQA KV heads)."""
@@ -1181,6 +1189,15 @@ def solve_opconfig(config, constraints: FitConstraints,
     """
     g = account_opconfig(config, code_size=code_size, arch=arch)
 
+    # --- forwards-per-step: re-book stored depth into the autoregressive loop ----
+    # Running the SAME network F forwards/VM-step needs only ceil(D/F) PHYSICAL
+    # stored layers, so the DEPTH constraint is checked against that (F=1 == the
+    # distinct-layer default, byte-identical to before).  KV is CONSERVED: applied
+    # depth spread over F forwards => seq*F, and (D/F)*(seq*F) == D*seq, so KV is
+    # sized on the applied depth exactly as before (forwards_per_step-invariant).
+    fps = max(1, constraints.forwards_per_step)
+    effective_stored_layers = -(-g.stored_layers // fps)   # ceil(stored_layers / F)
+
     # --- KV bytes, sized on the APPLIED depth (the loop unrolls into the cache) ---
     kv_prec = _kv_precision_for(config, constraints.precision)
     n_heads = constraints.kv_heads(arch)
@@ -1197,12 +1214,13 @@ def solve_opconfig(config, constraints: FitConstraints,
     viol: List[Tuple[str, float, str]] = []   # (axis, relative_overshoot, relax_axis)
 
     if constraints.max_layers is not None:
-        slack.layers = constraints.max_layers - g.stored_layers
+        slack.layers = constraints.max_layers - effective_stored_layers
         if slack.layers < 0:
             viol.append(("depth (max_layers)",
-                         g.stored_layers / max(1, constraints.max_layers),
-                         "max_layers (raise) / recurrence=tied+looped_transformer "
-                         "(fewer stored cells) / shallower extraction"))
+                         effective_stored_layers / max(1, constraints.max_layers),
+                         "max_layers (raise) / forwards_per_step (re-book depth into "
+                         "the AR loop) / recurrence=tied+looped_transformer (fewer "
+                         "stored cells) / shallower extraction"))
     if constraints.max_hidden is not None:
         slack.hidden = constraints.max_hidden - g.hidden
         if slack.hidden < 0:
@@ -1239,6 +1257,11 @@ def solve_opconfig(config, constraints: FitConstraints,
         note = radix_note if binding.startswith("precision") else ""
         if binding == "precision (invalid radix)":
             note = radix_note
+
+    if fps > 1:
+        note = (f"forwards_per_step={fps}: depth met by {effective_stored_layers} "
+                f"stored layers x {fps} forwards/step (re-booked from "
+                f"{g.stored_layers} distinct; KV-neutral). " + note).strip()
 
     return JointFitResult(
         fits=fits, geometry=g, kv_bytes=kv_bytes, n_layers_kv=n_layers_kv,
