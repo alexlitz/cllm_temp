@@ -279,6 +279,22 @@ actually renders is the **production nibble VM** — a separate, wider track now
 ~1.3–2.6 fps whose realtime path is kernel-efficiency × multi-GPU × a render-macro
 step-fold, not these clever-cell levers.)
 
+**Update — compact scoring clears 35 fps (measured, byte-exact).** The ~3×-short
+residual above was the **candidate-scoring** term, not the FFN: a dense radix-`r`
+difference-min LUT costs ~20 ms/layer at r=4096 (~10× the FFN), which is what inverts
+the large-radix depth win. Replacing it with **compact scoring** — a radix-independent
+decode (`direct` O(1), `two_level` ~2√r, or `log_radix` ~2log₂r) so the FFN band is 32
+not 4096 — removes the blowup and lets radix-4096 / depth-15 run clean. Measured on the
+358K frame (`examples/clever_compact_scoring_realtime.py`): **fp32 byte-exact 24.1 fps
+(1-GPU) / 48.3 fps (2-GPU, real 2× scaling) — clears 35 fps byte-exact on 2 GPUs**;
+bf16 (throughput proxy) 53.6 / 105.7 fps. Byte-exact holds wherever the dtype carries
+the DIV r² accumulator (fp32 ≤ radix 4096), via a precision-robust diffmin tie-break.
+The 1-GPU byte-exact gap (24→35) is per-layer GEMM traffic; a framing-fold
+superinstruction (depth 15→~3) clears 35 on 1 GPU alone. **Two honest caveats: this is
+the clever ALU *datapath* at a Doom step-count, not the Doom *program* (running real
+Doom on it is a port); and it's *batched* throughput, so a single realtime stream still
+needs the frame's own (render) parallelism to feed the batch.**
+
 ---
 
 ## 7. Constraining the solver: precision + depth + width + KV together
