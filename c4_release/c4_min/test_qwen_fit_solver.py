@@ -278,3 +278,218 @@ def test_bake_base_geometry_matches_accounting():
     assert m["stored_layers"] == acc.stored_layers
     assert m["applied_depth"] == acc.applied_depth
     assert m["hidden_size"] == acc.hidden and acc.hidden < 4864  # small, memory-safe
+
+
+# =========================================================================== #
+# JOINT HARD-CONSTRAINT SOLVER — precision + depth + width + KV-cache budget, all
+# checked at once, wired to opconfig's per-op AxisConfig.  Reports the binding
+# constraint (and the axis to relax) on infeasibility, and the precision<->KV<->
+# depth coupling (min_kv_precision).  See docs/SOLVER_CONSTRAINTS.md.
+# =========================================================================== #
+
+# A KV budget context that is comfortably ROOMY for the fits-all test (looped fp64,
+# tiny seq/batch), and geometry caps at the 0.5B budget.
+_ROOMY = dict(max_hidden=896, max_intermediate=4864, max_layers=24,
+              kv_budget_bytes=256 * 1024 * 1024, seq_len=512, batch=1)
+
+
+def test_precision_bytes_helper():
+    assert OC.precision_bytes("int8") == 1
+    assert OC.precision_bytes("fp16") == 2 == OC.precision_bytes("bf16")
+    assert OC.precision_bytes("fp32") == 4
+    assert OC.precision_bytes("fp64") == 8
+    assert OC.precision_bytes("fp128") == 16
+    with pytest.raises(OC.OpConfigError):
+        OC.precision_bytes("nope")
+
+
+def test_kv_formula_matches_hand_computation():
+    # KV = 2 * n_layers_kv * n_heads * head_dim * seq * batch * precision_bytes.
+    kv = S.kv_cache_bytes(n_layers_kv=20, n_heads=2, head_dim=64, seq_len=512,
+                          batch=1, precision="fp64")
+    assert kv == 2 * 20 * 2 * 64 * 512 * 1 * 8
+    # int8 is 1/8 the bytes/elem of fp64 at the same geometry.
+    kv8 = S.kv_cache_bytes(20, 2, 64, 512, 1, "int8")
+    assert kv8 * 8 == kv
+
+
+# ---- (a) a config that fits ALL FOUR hard constraints simultaneously --------
+def test_solve_opconfig_fits_all_four_constraints():
+    # looped/UT fp64 whole-value: hidden 896, stored 6, applied 20 — fits 0.5B width
+    # + depth, roomy KV, precision fp64 valid.
+    cfg = OC.min_params_config()
+    con = S.FitConstraints(precision="fp64", **_ROOMY)
+    r = S.solve_opconfig(cfg, con)
+    assert r.fits
+    assert r.binding_constraint is None and r.relax_axis is None
+    # KV sized on APPLIED depth (20), NOT the 6 stored cells.
+    assert r.n_layers_kv == r.geometry.applied_depth == 20
+    assert r.kv_bytes == S.kv_cache_bytes(20, 2, 64, 512, 1, "fp64")
+    # every slack non-negative.
+    assert r.slack.layers >= 0 and r.slack.hidden >= 0
+    assert r.slack.intermediate >= 0 and r.slack.kv_bytes >= 0
+    assert r.slack.radix_valid is True
+
+
+# ---- (b) EACH constraint individually binding -------------------------------
+def test_depth_bound_binds():
+    # standard-FF unrolled fp64 = 51 stored layers > max_layers 24, everything else
+    # roomy -> depth binds.
+    ff = OC.force_standard_feedforward(OC.min_params_config())
+    con = S.FitConstraints(max_layers=24, max_hidden=4096, max_intermediate=200000,
+                           kv_budget_bytes=10 ** 15, seq_len=512, batch=1)
+    r = S.solve_opconfig(ff, con)
+    assert not r.fits
+    assert r.binding_constraint == "depth (max_layers)"
+    assert "max_layers" in r.relax_axis
+    assert r.slack.layers < 0
+    assert r.geometry.stored_layers == 51
+
+
+def test_width_hidden_bound_binds():
+    # DEFAULT nibble hidden=3008 > max_hidden 896; depth/inter/KV roomy -> hidden.
+    con = S.FitConstraints(max_hidden=896, max_layers=10 ** 6,
+                           max_intermediate=10 ** 9, kv_budget_bytes=10 ** 15,
+                           seq_len=1, batch=1)
+    r = S.solve_opconfig(OC.DEFAULT, con)
+    assert not r.fits and r.binding_constraint == "width (max_hidden)"
+    assert r.slack.hidden < 0 and "max_hidden" in r.relax_axis
+
+
+def test_width_intermediate_bound_binds():
+    # DEFAULT nibble intermediate=7920 > max_intermediate 100; else roomy -> inter.
+    con = S.FitConstraints(max_hidden=10 ** 6, max_layers=10 ** 6,
+                           max_intermediate=100, kv_budget_bytes=10 ** 15,
+                           seq_len=1, batch=1)
+    r = S.solve_opconfig(OC.DEFAULT, con)
+    assert not r.fits and r.binding_constraint == "width (max_intermediate)"
+    assert r.slack.intermediate < 0
+
+
+def test_kv_bound_binds():
+    # looped fp64 fits width+depth+precision, but a huge seq/batch overruns a tiny
+    # KV budget -> KV binds.
+    cfg = OC.min_params_config()
+    con = S.FitConstraints(precision="fp64", max_layers=24, max_hidden=896,
+                           max_intermediate=4864, kv_budget_bytes=1024,
+                           seq_len=8192, batch=64)
+    r = S.solve_opconfig(cfg, con)
+    assert not r.fits and r.binding_constraint == "kv_cache (kv_budget_bytes)"
+    assert r.slack.kv_bytes < 0
+    assert "lower precision" in r.relax_axis  # the KV-shrink relaxation is surfaced
+
+
+def test_precision_forces_invalid_radix_binds():
+    # DIV at radix 4096 needs fp32's 2^24 ceiling (r^2 = 16.7M); requiring int8
+    # (ceiling 127) makes the radix INVALID -> precision binds.  (Keep every OTHER
+    # op whole_value so ONLY the DIV radix is the invalid-radix bind.)
+    ov = {op: dict(precision="int8", extraction="whole_value") for op in OC.ALL_OPS}
+    ov["DIV"] = dict(precision="int8", radix=4096, extraction="digit_extract")
+    bad = OC.OpConfig(base=OC.AxisConfig(precision="int8", extraction="whole_value"),
+                      overrides=ov)
+    con = S.FitConstraints(precision="int8", max_layers=10 ** 6, max_hidden=10 ** 6,
+                           max_intermediate=10 ** 9, kv_budget_bytes=10 ** 15)
+    r = S.solve_opconfig(bad, con)
+    assert not r.fits and r.binding_constraint == "precision (invalid radix)"
+    assert r.slack.radix_valid is False
+    assert "DIV" in r.notes and "overflows int8" in r.notes
+
+
+def test_multiple_binds_reports_most_binding_first():
+    # DEFAULT nibble overshoots hidden (3008 vs 896) AND depth (123 vs 24); the
+    # LARGEST relative overshoot (depth 123/24=5.1x > hidden 3008/896=3.4x) is
+    # reported as THE binding constraint.
+    con = S.FitConstraints(max_hidden=896, max_layers=24, max_intermediate=10 ** 9,
+                           kv_budget_bytes=10 ** 15, seq_len=1, batch=1)
+    r = S.solve_opconfig(OC.DEFAULT, con)
+    assert not r.fits
+    assert r.binding_constraint == "depth (max_layers)"   # bigger relative overshoot
+
+
+# ---- (c) precision<->KV coupling: min_kv_precision picks correctly -----------
+def test_min_kv_precision_fp64_wins_at_small_seq_batch():
+    # TINY seq/batch: KV is negligible, so the seq-independent stored-param depth
+    # dominates -> the FEW-LAYER fp64 whole-value config wins (natural mode).
+    res = S.min_kv_precision(S.FitConstraints(seq_len=4, batch=1))
+    assert res.best_precision == "fp64"
+    # fp64 row is the FEW-layer one; int8 is the MANY-layer one.
+    by = {r.precision: r for r in res.frontier}
+    assert by["fp64"].stored_layers < by["int8"].stored_layers
+    assert by["fp64"].bytes_per_elem == 8 and by["int8"].bytes_per_elem == 1
+    assert by["fp64"].total_bytes <= by["int8"].total_bytes
+
+
+def test_min_kv_precision_int8_wins_at_large_seq_batch():
+    # HUGE seq/batch: KV dominates total memory, so the tiny-bytes/elem int8 config
+    # wins DESPITE its many layers / greater applied depth.
+    res = S.min_kv_precision(S.FitConstraints(seq_len=16384, batch=128))
+    assert res.best_precision == "int8"
+    by = {r.precision: r for r in res.frontier}
+    # int8 has MORE applied depth than fp64 but WINS on total because of bytes/elem.
+    assert by["int8"].applied_depth > by["fp64"].applied_depth
+    assert by["int8"].kv_bytes < by["fp64"].kv_bytes       # 1 byte/elem << 8
+    assert by["int8"].total_bytes < by["fp64"].total_bytes
+
+
+def test_min_kv_precision_surfaces_the_depth_coupling():
+    # The HONEST coupling: LOWER precision -> LOWER radix ceiling -> MORE applied
+    # depth.  int8's DIV radix ceiling (8) is far below fp32's (4096), so int8's
+    # applied depth EXCEEDS fp32's — the depth cost of dropping precision.
+    res = S.min_kv_precision(S.FitConstraints(seq_len=1024, batch=1))
+    by = {r.precision: r for r in res.frontier}
+    assert by["int8"].max_safe_radix_div < by["fp32"].max_safe_radix_div
+    assert by["int8"].applied_depth > by["fp32"].applied_depth   # more limbs=deeper
+    assert by["fp64"].max_safe_radix_div is None                 # whole-value
+
+
+def test_min_kv_precision_pure_kv_objective_ranks_by_depth_times_bytes():
+    # objective='kv': ranks by applied_depth * bytes/elem (the seq*batch factor is
+    # common).  int8 (22*1=22) beats fp64 (20*8=160) on pure per-token KV.
+    res = S.min_kv_precision(S.FitConstraints(seq_len=2048, batch=8), objective="kv")
+    assert res.best_precision == "int8"
+    by = {r.precision: r for r in res.frontier}
+    assert by["int8"].kv_bytes < by["fp64"].kv_bytes
+
+
+# ---- (d) looped vs unrolled: SAME KV (applied depth), DIFFERENT stored params -
+def test_looped_vs_unrolled_same_kv_diff_params():
+    looped = OC.min_params_config()                       # tied/UT: stored 6
+    unrolled = OC.force_standard_feedforward(looped)      # unrolled: stored 51
+    con = S.FitConstraints(precision="fp64", seq_len=1024, batch=4,
+                           max_layers=10 ** 6, max_hidden=10 ** 6,
+                           max_intermediate=10 ** 9, kv_budget_bytes=10 ** 18)
+    rl = S.solve_opconfig(looped, con)
+    ru = S.solve_opconfig(unrolled, con)
+    # SAME applied depth -> SAME KV (the loop unrolls into the cache; stored-cell
+    # reduction does NOT shrink KV).
+    assert rl.n_layers_kv == ru.n_layers_kv == 20
+    assert rl.kv_bytes == ru.kv_bytes
+    # DIFFERENT stored params (looped stores fewer distinct cells).
+    assert rl.geometry.stored_layers == 6 and ru.geometry.stored_layers == 51
+    assert rl.geometry.params_estimate < ru.geometry.params_estimate
+
+
+def test_joint_result_summary_and_table_render():
+    r = S.solve_opconfig(OC.min_params_config(),
+                         S.FitConstraints(precision="fp64", **_ROOMY))
+    assert "FITS" in r.summary()
+    inf = S.solve_opconfig(OC.DEFAULT,
+                           S.FitConstraints(max_hidden=896, seq_len=1, batch=1))
+    assert "INFEASIBLE" in inf.summary() and inf.binding_constraint in inf.summary()
+    tbl = S.min_kv_precision(S.FitConstraints(seq_len=4, batch=1)).table()
+    assert "prec" in tbl and "KV" in tbl and "total" in tbl and "WIN" in tbl
+
+
+def test_kv_heads_default_to_gqa_kv_head_count():
+    # KV cache is keyed on the GQA KEY-VALUE heads (2 for 0.5B), NOT the 14 query
+    # heads — the honest cache head count.
+    con = S.FitConstraints(seq_len=128, batch=1)
+    assert con.kv_heads(S.QWEN2_5_ARCH) == 2         # num_key_value_heads
+    assert con.kv_head_dim(S.QWEN2_5_ARCH) == 64
+    # an explicit override wins.  Pin precision=fp64 so KV bytes/elem is fp64 (the
+    # config's own deepest op is MUL@fp128, which the solver otherwise sizes KV on).
+    con2 = S.FitConstraints(precision="fp64", seq_len=128, batch=1, n_heads=14,
+                            head_dim=64)
+    assert con2.kv_heads(S.QWEN2_5_ARCH) == 14
+    r = S.solve_opconfig(OC.min_params_config(), con2)
+    assert r.kv_bytes == S.kv_cache_bytes(20, 14, 64, 128, 1, "fp64")

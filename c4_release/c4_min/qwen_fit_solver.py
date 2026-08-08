@@ -1008,3 +1008,414 @@ def opconfig_geometry_table(configs, code_size: int = 24,
             f"{g.intermediate:6d} {g.stored_layers:6d} {g.applied_depth:7d} "
             f"{_h(g.params_estimate):>8s} {fit:>10s}")
     return "\n".join(lines)
+
+
+# ===========================================================================
+# JOINT HARD-CONSTRAINT SOLVER — precision + depth + width + KV-cache budget, all
+# at once, wired to opconfig's per-op AxisConfig.
+#
+# The four axes above (WIDTH / DEPTH / STEPS / PRECISION) size a geometry; this
+# section takes a concrete ``opconfig.OpConfig`` (per-op {precision, radix,
+# extraction, recurrence}) + a ``FitConstraints`` box and checks EVERY hard
+# constraint SIMULTANEOUSLY, reporting the binding constraint (and the axis to
+# relax) on infeasibility.  See docs/SOLVER_CONSTRAINTS.md.
+# ===========================================================================
+
+# --- KV-cache size.  THE nuance to get right (see docs/SOLVER_CONSTRAINTS.md) ---
+#
+#   KV_bytes = 2 (K+V) * n_layers_kv * n_heads * head_dim * seq_len * batch
+#              * precision_bytes
+#
+# CRITICAL: the KV cache grows with the number of layer-APPLICATIONS AT INFERENCE,
+# NOT the number of DISTINCT STORED cells.  A LOOPED / Universal-Transformer stores
+# few cells (~6) but RE-APPLIES them ``applied_depth`` times per forward; each
+# application writes its OWN K and V into the cache (the loop UNROLLS into the
+# cache at run time).  So:
+#
+#     n_layers_kv = APPLIED depth   (in BOTH standard-FF and looped/UT modes)
+#
+# The stored-param reduction from looping does NOT reduce KV.  Weight-tying shrinks
+# the PARAMETER footprint (fewer distinct cells) but the KV footprint is set by how
+# many times a cell is APPLIED, which is unchanged.  This is why a looped and an
+# unrolled model with the same applied depth pay IDENTICAL KV but different stored
+# params (test_looped_vs_unrolled_same_kv_diff_params).
+#
+# n_heads defaults to the arch's KEY-VALUE head count (GQA: Qwen2.5-0.5B caches 2 KV
+# heads x 64 dim, NOT the 14 query heads) — the honest KV-cache head count — but is
+# overridable in FitConstraints for a non-GQA accounting.
+
+
+def kv_cache_bytes(n_layers_kv: int, n_heads: int, head_dim: int, seq_len: int,
+                   batch: int, precision: str) -> int:
+    """KV-cache size in bytes.
+
+    ``KV = 2 (K+V) * n_layers_kv * n_heads * head_dim * seq_len * batch *
+    precision_bytes``.  ``n_layers_kv`` MUST be the APPLIED depth (layer
+    applications at inference), NOT the stored-cell count — a looped/UT model
+    unrolls into the cache and pays KV for its applied depth (see the module
+    header + docs/SOLVER_CONSTRAINTS.md)."""
+    from . import opconfig as OC
+    pb = OC.precision_bytes(precision)
+    return 2 * n_layers_kv * n_heads * head_dim * seq_len * batch * pb
+
+
+@dataclass
+class FitConstraints:
+    """A JOINT hard-constraint box: precision + depth + width + KV-cache budget.
+
+    All caps are optional (``None`` == no cap on that axis).  ``kv_budget_bytes``
+    with ``seq_len`` / ``batch`` bounds the KV-cache footprint; ``n_heads`` /
+    ``head_dim`` default to the arch's KEY-VALUE head geometry (the honest GQA KV
+    head count) when left ``None``.
+
+      * ``precision``       — the REQUIRED datapath precision (int8/fp16/bf16/fp32/
+                              fp64/fp128).  Used both to VALIDATE the config's radix
+                              (via opconfig.max_safe_radix — too-low precision at a
+                              given radix is an INVALID-RADIX bind) and to size KV
+                              bytes/elem.  ``None`` == accept the config's own per-op
+                              precisions.
+      * ``max_layers``      — cap on n_layers (STORED distinct decoder layers).
+      * ``max_hidden``      — cap on hidden_size.
+      * ``max_intermediate``— cap on intermediate_size (FFN width).
+      * ``kv_budget_bytes`` — cap on the KV-cache footprint in bytes.
+      * ``seq_len`` / ``batch`` — the KV-cache sizing context (default 2048 / 1).
+      * ``n_heads`` / ``head_dim`` — KV-cache head geometry override (default from
+                              the arch's num_key_value_heads / head_dim).
+    """
+    precision: Optional[str] = None
+    max_layers: Optional[int] = None
+    max_hidden: Optional[int] = None
+    max_intermediate: Optional[int] = None
+    kv_budget_bytes: Optional[int] = None
+    seq_len: int = 2048
+    batch: int = 1
+    n_heads: Optional[int] = None
+    head_dim: Optional[int] = None
+
+    def kv_heads(self, arch: QwenArch) -> int:
+        """The KV-cache head count (override or the arch's GQA KV heads)."""
+        return self.n_heads if self.n_heads is not None else arch.num_key_value_heads
+
+    def kv_head_dim(self, arch: QwenArch) -> int:
+        return self.head_dim if self.head_dim is not None else arch.head_dim
+
+
+@dataclass
+class ConstraintSlack:
+    """Per-constraint slack (cap - required); negative == VIOLATED."""
+    precision: Optional[str] = None            # required vs config precision note
+    layers: Optional[int] = None
+    hidden: Optional[int] = None
+    intermediate: Optional[int] = None
+    kv_bytes: Optional[int] = None
+    radix_valid: Optional[bool] = None         # None == not checked; False == invalid
+
+
+@dataclass
+class JointFitResult:
+    """The joint-constraint solve outcome."""
+    fits: bool
+    geometry: OpConfigGeometry                 # required (n_layers, hidden, inter, ...)
+    kv_bytes: int
+    n_layers_kv: int                           # APPLIED depth (what KV is sized on)
+    binding_constraint: Optional[str]          # None if fits; else the tightest bind
+    relax_axis: Optional[str]                  # the axis to relax (None if fits)
+    slack: ConstraintSlack
+    constraints: FitConstraints
+    notes: str = ""
+
+    def summary(self) -> str:
+        if self.fits:
+            return (f"FITS: n_layers={self.geometry.stored_layers} "
+                    f"hidden={self.geometry.hidden} "
+                    f"intermediate={self.geometry.intermediate} "
+                    f"KV={_h(self.kv_bytes)}B (applied depth {self.n_layers_kv})")
+        return (f"INFEASIBLE — binding constraint: {self.binding_constraint}. "
+                f"Relax: {self.relax_axis}. {self.notes}")
+
+
+def _radix_valid_under(config, precision: Optional[str]) -> Tuple[bool, str]:
+    """Is every op's radix EXACT under ``precision`` (the precision<->radix
+    coupling)?  For a whole_value op the radix does not bound the datapath, so it is
+    always valid.  Returns (ok, note).  ``precision=None`` checks each op's OWN
+    precision instead."""
+    from . import opconfig as OC
+    for op in OC.ALL_OPS:
+        ax = config.for_op(op)
+        prec = precision if precision is not None else ax.precision
+        if ax.extraction == "whole_value":
+            continue                              # radix labels readout, not datapath
+        ceiling = OC.PRECISION_CEILING[prec]
+        am = OC.acc_max(op, ax.radix)
+        if am > ceiling:
+            return (False,
+                    f"{op}: radix {ax.radix} overflows {prec} exact-int ceiling "
+                    f"{ceiling} (accMax {am} > {ceiling}) -> lower radix or raise "
+                    f"precision")
+    return (True, "")
+
+
+def _kv_precision_for(config, override: Optional[str]) -> str:
+    """The precision KV bytes/elem are sized on: the FitConstraints override if
+    given, else the config's DEEPEST op precision (the widest dtype the cache must
+    hold — MUL's fp128 etc.)."""
+    if override is not None:
+        return override
+    from . import opconfig as OC
+    precs = {config.for_op(op).precision for op in OC.ALL_OPS}
+    return max(precs, key=lambda p: OC.precision_bytes(p))
+
+
+def solve_opconfig(config, constraints: FitConstraints,
+                   code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH
+                   ) -> JointFitResult:
+    """JOINTLY solve/validate ``config`` (an opconfig.OpConfig) against ALL of
+    ``constraints`` — precision, depth (max_layers), width (max_hidden +
+    max_intermediate) AND the KV-cache budget — at once.
+
+    Returns a ``JointFitResult`` with the required geometry, the KV bytes (sized on
+    the APPLIED depth — the looped/UT loop unrolls into the cache), each
+    constraint's slack, and (on infeasibility) the BINDING constraint plus the axis
+    to relax.  When several constraints are violated the binding one is the axis
+    with the LARGEST relative overshoot (most-binding-first).
+    """
+    g = account_opconfig(config, code_size=code_size, arch=arch)
+
+    # --- KV bytes, sized on the APPLIED depth (the loop unrolls into the cache) ---
+    kv_prec = _kv_precision_for(config, constraints.precision)
+    n_heads = constraints.kv_heads(arch)
+    head_dim = constraints.kv_head_dim(arch)
+    n_layers_kv = g.applied_depth
+    kv_bytes = kv_cache_bytes(n_layers_kv, n_heads, head_dim,
+                              constraints.seq_len, constraints.batch, kv_prec)
+
+    # --- precision<->radix validity (a too-low precision at a given radix binds) ---
+    radix_ok, radix_note = _radix_valid_under(config, constraints.precision)
+
+    # --- per-constraint slack (cap - required); negative == violated -------------
+    slack = ConstraintSlack()
+    viol: List[Tuple[str, float, str]] = []   # (axis, relative_overshoot, relax_axis)
+
+    if constraints.max_layers is not None:
+        slack.layers = constraints.max_layers - g.stored_layers
+        if slack.layers < 0:
+            viol.append(("depth (max_layers)",
+                         g.stored_layers / max(1, constraints.max_layers),
+                         "max_layers (raise) / recurrence=tied+looped_transformer "
+                         "(fewer stored cells) / shallower extraction"))
+    if constraints.max_hidden is not None:
+        slack.hidden = constraints.max_hidden - g.hidden
+        if slack.hidden < 0:
+            viol.append(("width (max_hidden)",
+                         g.hidden / max(1, constraints.max_hidden),
+                         "max_hidden (raise) / narrower extraction"))
+    if constraints.max_intermediate is not None:
+        slack.intermediate = constraints.max_intermediate - g.intermediate
+        if slack.intermediate < 0:
+            viol.append(("width (max_intermediate)",
+                         g.intermediate / max(1, constraints.max_intermediate),
+                         "max_intermediate (raise) / smaller radix/LUT extraction"))
+    if constraints.kv_budget_bytes is not None:
+        slack.kv_bytes = constraints.kv_budget_bytes - kv_bytes
+        if slack.kv_bytes < 0:
+            viol.append(("kv_cache (kv_budget_bytes)",
+                         kv_bytes / max(1, constraints.kv_budget_bytes),
+                         "kv_budget_bytes (raise) / lower precision (fewer bytes/"
+                         "elem) / shallower applied depth / smaller seq_len,batch"))
+    slack.radix_valid = radix_ok
+    if constraints.precision is not None:
+        slack.precision = constraints.precision
+        if not radix_ok:
+            # a hard bind: the required precision cannot hold the op's radix exactly.
+            viol.append(("precision (invalid radix)", float("inf"),
+                         "precision (raise) / radix (lower) — " + radix_note))
+
+    fits = not viol
+    binding, relax, note = None, None, ""
+    if not fits:
+        # most-binding-first: the axis with the LARGEST relative overshoot.
+        viol.sort(key=lambda v: v[1], reverse=True)
+        binding, _over, relax = viol[0]
+        note = radix_note if binding.startswith("precision") else ""
+        if binding == "precision (invalid radix)":
+            note = radix_note
+
+    return JointFitResult(
+        fits=fits, geometry=g, kv_bytes=kv_bytes, n_layers_kv=n_layers_kv,
+        binding_constraint=binding, relax_axis=relax, slack=slack,
+        constraints=constraints, notes=note)
+
+
+# ===========================================================================
+# PRECISION <-> KV <-> DEPTH coupling: min_kv_precision.
+#
+# The three-way coupling the search must HONESTLY account:
+#
+#   * LOWER precision  -> FEWER bytes/elem in the KV cache (int8=1 vs fp64=8),
+#   * BUT lower precision -> a LOWER exact-int radix CEILING (opconfig.max_safe_radix)
+#     -> MORE digits/limbs per value -> MORE applied depth -> MORE layer-applications
+#     -> MORE KV (and more stored params in an unrolled model).
+#
+# So dropping precision does NOT monotonically shrink KV: it trades bytes/elem
+# against applied depth.  ``min_kv_precision`` searches the precisions, builds the
+# HONEST geometry for each (radix pinned to that precision's max-safe value, so the
+# depth reflects the ceiling), and returns the precision minimizing the TOTAL
+# inference-memory footprint = stored-param bytes + KV bytes.  Because KV scales
+# with seq_len*batch but the stored params do NOT, the winner FLIPS with the
+# seq_len/batch regime: at small seq/batch the (seq-independent) stored-param depth
+# dominates and the SHALLOW fp64 whole-value config wins; at large seq/batch the KV
+# term dominates and the tiny-bytes/elem int8 config wins — honestly accounting BOTH
+# effects.  See docs/SOLVER_CONSTRAINTS.md §coupling for the worked table.
+# ===========================================================================
+_KV_SEARCH_PRECISIONS = ("int8", "bf16", "fp16", "fp32", "fp64")
+
+# The whole-value precisions (a single 64-bit-mantissa scalar holds the value, no
+# limb decomposition); their NATURAL model mode is LOOPED/UT (the min-params corner:
+# few reused cells).  The finite-radix precisions limb-decompose (digit_extract);
+# their NATURAL "many layers" mode is the STANDARD-FF unrolled stack.
+_WHOLE_VALUE_PRECISIONS = ("fp64", "fp128")
+
+
+def _natural_looped(precision: str) -> bool:
+    """The NATURAL model mode for a precision when comparing precisions honestly:
+    the whole-value precisions (fp64/fp128) are looped/UT (few cells — the
+    min-params corner, "FEW LAYERS"); the finite-radix precisions are standard-FF
+    unrolled ("MANY LAYERS", one distinct stored layer per limb place)."""
+    return precision in _WHOLE_VALUE_PRECISIONS
+
+
+def _honest_geometry_at_precision(precision: str, looped: bool,
+                                  code_size: int, arch: QwenArch) -> OpConfigGeometry:
+    """Build the HONEST geometry for an all-ops config at ``precision``: radix pinned
+    to that precision's max-safe value (so applied depth reflects the exact-int
+    ceiling), digit_extract for the finite-radix precisions, whole_value for the
+    64-bit-mantissa precisions (fp64/fp128) where a single scalar holds the value."""
+    from . import opconfig as OC
+    if precision in ("fp64", "fp128"):
+        # whole-value: one high-precision scalar per value, fixed decimal digit depth.
+        ov = {op: dict(precision=precision, extraction="whole_value",
+                       recurrence=("tied" if looped else "unrolled"))
+              for op in OC.ALL_OPS}
+        ov["MUL"] = dict(precision="fp128", extraction="whole_value",
+                         recurrence=("tied" if looped else "unrolled"))
+        base = OC.AxisConfig(precision=precision, radix=10, extraction="whole_value",
+                             recurrence=("tied" if looped else "unrolled"))
+        cfg = OC.OpConfig(base=base, overrides=ov, looped_transformer=looped)
+    else:
+        # digit_extract at the max-safe radix for the DIV bound (the r^2 coupling is
+        # the tightest of the ALU ops that limb-decompose).
+        r = OC.max_safe_radix("DIV", precision)
+        ov = {op: dict(precision=precision, radix=r, extraction="digit_extract",
+                       recurrence=("tied" if looped else "unrolled"))
+              for op in OC.ALL_OPS}
+        base = OC.AxisConfig(precision=precision, radix=r, extraction="digit_extract",
+                             recurrence=("tied" if looped else "unrolled"))
+        cfg = OC.OpConfig(base=base, overrides=ov, looped_transformer=looped)
+    return account_opconfig(cfg, code_size=code_size, arch=arch)
+
+
+@dataclass
+class KvPrecisionRow:
+    """One precision's honest cost on the precision<->KV<->depth frontier."""
+    precision: str
+    applied_depth: int          # layer-applications (what KV is sized on)
+    stored_layers: int
+    max_safe_radix_div: Optional[int]  # the radix ceiling driving depth (None=whole)
+    bytes_per_elem: int
+    kv_bytes: int               # KV cache at (seq_len, batch)
+    param_bytes: int            # stored-param footprint at this precision
+    total_bytes: int            # param_bytes + kv_bytes (the ranked objective)
+
+
+@dataclass
+class KvPrecisionResult:
+    """``min_kv_precision`` outcome: the winner + the full frontier."""
+    best_precision: str
+    frontier: List[KvPrecisionRow]      # ranked ascending by total_bytes
+    seq_len: int
+    batch: int
+    objective: str                       # "total" (params+KV) or "kv" (KV only)
+    mode: str = "natural"                # "natural" | "looped" | "unrolled"
+
+    def table(self) -> str:
+        hdr = (f"{'prec':>6s} {'bytes/e':>7s} {'radixDIV':>8s} {'applied':>7s} "
+               f"{'stored':>6s} {'KV':>9s} {'params':>9s} {'total':>9s}")
+        lines = [f"seq_len={self.seq_len} batch={self.batch} "
+                 f"objective={self.objective} mode={self.mode}", hdr, "-" * len(hdr)]
+        for r in self.frontier:
+            rad = "whole" if r.max_safe_radix_div is None else str(r.max_safe_radix_div)
+            star = "  <== WIN" if r.precision == self.best_precision else ""
+            lines.append(
+                f"{r.precision:>6s} {r.bytes_per_elem:7d} {rad:>8s} "
+                f"{r.applied_depth:7d} {r.stored_layers:6d} {_h(r.kv_bytes):>9s} "
+                f"{_h(r.param_bytes):>9s} {_h(r.total_bytes):>9s}{star}")
+        return "\n".join(lines)
+
+
+def min_kv_precision(constraints: FitConstraints, mode: str = "natural",
+                     looped: Optional[bool] = None,
+                     objective: str = "total", code_size: int = 24,
+                     arch: QwenArch = QWEN2_5_ARCH,
+                     precisions: Sequence[str] = _KV_SEARCH_PRECISIONS
+                     ) -> KvPrecisionResult:
+    """Search precisions and return the one minimizing KV cost, HONESTLY accounting
+    BOTH the precision<->KV coupling (lower precision = fewer bytes/elem) AND the
+    precision<->depth coupling (lower precision = lower radix ceiling = more applied
+    depth = more layer-applications = more KV + more stored params).
+
+    ``objective``:
+      * ``"total"`` (default) — minimize stored-param bytes + KV bytes (the total
+        inference-memory footprint).  The winner FLIPS with the seq_len/batch regime
+        (small -> fp64/whole-value's FEW-LAYER stored depth wins; large -> int8's
+        tiny bytes/elem wins), because KV scales with seq*batch but stored params do
+        not.
+      * ``"kv"`` — minimize the KV bytes ALONE (applied_depth * bytes/elem * the
+        seq*batch factor); the seq*batch factor is common so this ranks by
+        applied_depth * bytes/elem, the pure per-token KV cost.
+
+    ``mode`` selects the model MODE per precision:
+      * ``"natural"`` (default) — each precision at its HONEST natural mode: the
+        whole-value precisions (fp64/fp128) as LOOPED/UT (the min-params corner:
+        FEW stored cells, big bytes/elem), the finite-radix precisions as STANDARD-FF
+        UNROLLED (MANY distinct stored layers, small bytes/elem).  This is the
+        fp64(few-layers) vs int8(many-layers) tradeoff the brief asks for; the
+        total-footprint winner flips with seq_len/batch.
+      * ``"looped"`` — force every precision LOOPED/UT (few cells).
+      * ``"unrolled"`` — force every precision STANDARD-FF unrolled.
+    ``looped=True/False`` is a back-compat override for ``mode`` (True==looped,
+    False==unrolled).  Returns the winner + the full ranked frontier
+    (``KvPrecisionResult.table()`` renders it)."""
+    from . import opconfig as OC
+    if looped is not None:
+        mode = "looped" if looped else "unrolled"
+    if mode not in ("natural", "looped", "unrolled"):
+        raise ValueError(f"mode {mode!r} not in ('natural','looped','unrolled')")
+    rows: List[KvPrecisionRow] = []
+    n_heads = constraints.kv_heads(arch)
+    head_dim = constraints.kv_head_dim(arch)
+    for prec in precisions:
+        if mode == "natural":
+            prec_looped = _natural_looped(prec)
+        else:
+            prec_looped = (mode == "looped")
+        g = _honest_geometry_at_precision(prec, prec_looped, code_size, arch)
+        radix_div = None if prec in ("fp64", "fp128") else OC.max_safe_radix("DIV", prec)
+        kv = kv_cache_bytes(g.applied_depth, n_heads, head_dim,
+                            constraints.seq_len, constraints.batch, prec)
+        pbytes = g.params_estimate * OC.precision_bytes(prec)
+        total = pbytes + kv
+        rows.append(KvPrecisionRow(
+            precision=prec, applied_depth=g.applied_depth,
+            stored_layers=g.stored_layers, max_safe_radix_div=radix_div,
+            bytes_per_elem=OC.precision_bytes(prec), kv_bytes=kv,
+            param_bytes=pbytes, total_bytes=total))
+    if objective == "total":
+        rows.sort(key=lambda r: (r.total_bytes, r.kv_bytes, r.bytes_per_elem))
+    elif objective == "kv":
+        rows.sort(key=lambda r: (r.kv_bytes, r.total_bytes, r.bytes_per_elem))
+    else:
+        raise ValueError(f"objective {objective!r} not in ('total', 'kv')")
+    return KvPrecisionResult(
+        best_precision=rows[0].precision, frontier=rows,
+        seq_len=constraints.seq_len, batch=constraints.batch, objective=objective,
+        mode=mode)

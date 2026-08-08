@@ -104,6 +104,31 @@ PRECISION_CEILING: Dict[str, int] = {
     "fp128": 1 << 64,       # 1.8e19 (x86-64 longdouble, 64-bit effective mantissa)
 }
 
+# STORAGE bytes per element per precision — the on-the-wire / in-cache footprint of
+# ONE datapath scalar (NOT the exact-int ceiling above, which is a representable-value
+# bound).  Used by the fitter's KV-cache size budget: KV bytes scale linearly with
+# this.  int8=1, fp16/bf16=2, fp32=4, fp64=8, fp128=16 (the x86-64 80-bit long double
+# occupies 16 aligned bytes).
+PRECISION_BYTES: Dict[str, int] = {
+    "int8": 1,
+    "fp16": 2,
+    "bf16": 2,
+    "fp32": 4,
+    "fp64": 8,
+    "fp128": 16,
+}
+
+
+def precision_bytes(precision: str) -> int:
+    """Storage bytes per element for ``precision`` (int8=1, fp16/bf16=2, fp32=4,
+    fp64=8, fp128=16).  This is the datapath/cache footprint of one scalar, the KV
+    size-budget multiplier — distinct from ``PRECISION_CEILING`` (the exact-integer
+    representability bound)."""
+    if precision not in PRECISION_BYTES:
+        raise OpConfigError(
+            f"unknown precision {precision!r}; known: {sorted(PRECISION_BYTES)}")
+    return PRECISION_BYTES[precision]
+
 # =========================================================================== #
 # Op names (the config keys).  Mirror c4_min.isa; kept as plain strings so
 # opconfig has no heavy import + so ``ALL`` is a valid pseudo-op key for flags.
