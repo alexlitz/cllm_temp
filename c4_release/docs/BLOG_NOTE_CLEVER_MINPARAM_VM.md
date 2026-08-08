@@ -225,6 +225,16 @@ looped / 26,119 unrolled** for the full ISA (vs the nibble build's 210,018).
 slowest datapath; min-WALLTIME = bf16 radix-16 digit_extract (**0.009 ms/step**,
 fastest), 25,624 nonzero. Opposite corners; neither realtime.
 
+The **full 64-row `precision × radix × extraction × mode` census** is in
+[`docs/CLEVER_NONZERO_CONFIG_TABLE.md`](CLEVER_NONZERO_CONFIG_TABLE.md)
+(regen: `examples/clever_nonzero_table.py`). Its structure: the **bitwise LUT
+dominates every unrolled total** (2,974 for the OR+AND+XOR triple per layer →
+23,792 unrolled), arithmetic collapses to 2,091 unrolled / 153 looped, memory = 10,
+and looped is ~8× smaller than unrolled (each cell stored once). 8 configs are
+pruned for radix-over-precision-ceiling — int8 caps at radix 2, bf16 at radix 4 for
+a *single-precision* whole ISA, so the min-walltime bf16-r16 corner is valid only
+via a mixed-precision MUL→fp16 override.
+
 **Realtime verdict — NO, and the honest why.** A realizable *full-width* vanilla
 feed-forward clever transformer does **not** render Doom in real time at any
 precision — best case ~0.31 fps (bf16), **~100× short** of 30 fps (~500× on the raw
