@@ -160,25 +160,29 @@ store-once benefit without a Universal Transformer.
 
 The three ways to realize a digit-extraction depth **D**:
 
-| lever | where the depth lives | network | tokens/step | KV cache | vanilla? |
-|---|---|---|--:|---|---|
-| **distinct layers (unrolled)** | within one forward | deep (D layers) | few | small | vanilla arch, but too deep for stock 24 |
-| **looped layers (UT)** | within one forward, tied ×D | shallow stored | few | pays *applied*-depth KV | ✗ Universal Transformer |
-| **forwards / tokens (autoregressive)** | across D forwards, 1 digit/token | **shallow — fits stock 24** | **+D per step** | **grows with D × steps** | ✓ standard AR loop |
+| lever | where the depth lives | stored layers | forwards/step | KV cache | vanilla? |
+|---|---|--:|--:|---|---|
+| **distinct layers (unrolled)** | within one forward | D (deep) | 1 | ∝ D·seq | vanilla arch, but too deep for stock 24 |
+| **looped layers (UT)** | within one forward, tied ×D | few | 1 | ∝ D·seq (applied) | ✗ Universal Transformer |
+| **forwards / tokens (autoregressive)** | across D forwards, 1 digit/token | **few — fits stock 24** | **D** | **∝ D·seq (ties deep)** | ✓ standard AR loop |
 
 Compute is conserved — ~D layer-applications per step in every row — so this does
 **not** cut FLOPs; it **re-books the depth from parameter-storage / physical-depth
-into sequence-length / KV.** The trade-offs:
+into sequence-length.** The trade-offs (as the `forwards_per_step` module makes
+precise):
 
-- **Fitting a vanilla checkpoint:** forwards-per-step *wins* — shallow network,
-  stock architecture, no tying.
-- **KV / memory:** forwards-per-step *loses* — every extra digit-token lengthens
-  the sequence, so KV ∝ (digits × steps). Same precision↔KV↔depth coupling as §7,
-  now with the depth living in seq_len.
-- **Realtime latency:** distinct-layers is usually *faster* — D layers run in one
-  forward (one kernel-launch chain, one KV read), whereas D forwards pay D
-  launch-chains + D KV re-reads and batch worse. Forwards-per-step is more
-  launch/occupancy-bound.
+- **Fitting a vanilla checkpoint:** forwards-per-step *wins* — a shallow network
+  of `ceil(D/F)` stored layers, stock architecture, no weight-tying.
+- **KV / memory — essentially a *tie* (this corrects an earlier draft):** KV ∝
+  n_layers × seq_len, so deep (`D` layers × base_seq) and shallow (`ceil(D/F)`
+  layers × `F`·base_seq) both come out to **`D·base_seq`** at exact splits — the
+  layers↔forwards trade is **KV-neutral**, creeping up only at non-exact
+  (ceil-rounded) splits. Forwards-per-step does *not* cost you memory.
+- **Realtime latency — the *actual* price:** distinct-layers is usually *faster* —
+  `D` layers run in one forward (one kernel-launch chain, one KV read), whereas
+  `D` forwards pay `D` launch-chains + `D` KV re-reads and batch worse. **This
+  launch/occupancy cost — not KV — is what forwards-per-step trades for fitting a
+  vanilla checkpoint.**
 
 So the lever exists and it is the *right* one for "fits a real vanilla model" — but
 it pays the depth back in KV and per-step forward count. That is exactly why the
@@ -216,10 +220,12 @@ the raw frame needs a render-macro step-fold independent of the cell cost.
 The network-size solver now takes **joint** hard constraints — precision, max
 depth (layers), max width (hidden), and a **KV-cache byte budget** — and reports
 the binding one. It also models the §5 trade: the required effective depth D can
-be met by **layers** (deep network, small KV) **or by forwards/tokens** (shallow
-network, KV ∝ D × steps), and the solver costs each — so a depth-bound *layer*
-budget can be traded for a longer *sequence* budget, and vice-versa. The KV
-formula:
+be met by **layers** (deep network, `D` stored) **or by forwards/tokens** (shallow
+network, `ceil(D/F)` stored — KV-neutral, same `D·seq`), and the solver costs each.
+Wired as `FitConstraints.forwards_per_step`: the depth constraint is checked against
+`ceil(D/F)` stored layers, so re-booking depth into the autoregressive loop rescues
+a depth-bound config (e.g. the 51-layer clever-fp64 full ISA fits a 24-layer budget
+at `F=3` → `ceil(51/3)=17`). The KV formula:
 
 **KV_bytes = 2 (K+V) × n_layers × n_heads × head_dim × seq_len × batch × bytes(precision)**
 
