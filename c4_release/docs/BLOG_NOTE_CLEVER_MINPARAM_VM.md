@@ -245,10 +245,10 @@ is not.
 
 ---
 
-## 7. Constraining the solver: precision + depth + width + KV together  *(pending)*
+## 7. Constraining the solver: precision + depth + width + KV together
 
-> Filled from the solver extension (`c4_min/qwen_fit_solver.py`,
-> `docs/SOLVER_CONSTRAINTS.md`).
+> `c4_min/qwen_fit_solver.py` (`FitConstraints` / `solve_opconfig`),
+> `docs/SOLVER_CONSTRAINTS.md`; `forwards_per_step` in `c4_min/forwards_per_step.py`.
 
 The network-size solver now takes **joint** hard constraints — precision, max
 depth (layers), max width (hidden), and a **KV-cache byte budget** — and reports
