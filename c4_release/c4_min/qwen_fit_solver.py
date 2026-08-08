@@ -671,3 +671,179 @@ def measure_built(vm) -> Dict[str, int]:
         "applied_depth": int(vm.n_applied or cfg.num_hidden_layers),
         "num_attention_heads": int(cfg.num_attention_heads),
     }
+
+
+# ===========================================================================
+# OPCONFIG-AWARE GEOMETRY — size ANY per-op {precision, radix, extraction,
+# recurrence} config (c4_min.opconfig.OpConfig) into (n_layers, hidden,
+# intermediate, stored, applied, fits-stock).  This is the FITTER wiring the
+# toggle system needs: the DEFAULT (nibble/fp32) config routes to the REAL
+# nibble solver above (byte-exact golden geometry); the non-default (clever
+# digit-extract / whole-value) configs are accounted from the completed
+# min-param construction (ALL_OPS_MINPARAM.md + CLEVER_MINPARAM_ALU.md), whose
+# cost is a NARROW reused cell paid in APPLIED depth, not width.
+# ===========================================================================
+# Stock Qwen2.5-0.5B budget (the fits-stock gate).
+_STOCK_0_5B = STOCK_TARGETS["stock-0.5b"]
+
+# The clever construction's per-op APPLIED depth (digit-extract places / limb
+# steps), from the completed docs.  Keyed by (extraction, op-class).  Decimal
+# digit-extract: ADD/SUB 11, DIV/MOD 10, MUL 20, CMP/frame 1.  Nibble-serial /
+# radix-limb: ~8 base-16 limbs.  The DEEPEST op sets the reused-cell APPLIED
+# depth reported (the cost of a single op's forward-unroll).
+_CLEVER_DEPTH_DIGIT = {           # decimal MSB-first digit-extract (whole-value)
+    "add": 11, "cmp": 1, "div": 10, "mul": 20,
+}
+
+
+def _limb_depth(radix: int, bits: int = 32) -> int:
+    """#base-`radix` limbs for a `bits`-bit value (radix-limb / nibble depth)."""
+    import math
+    if radix < 2:
+        return bits
+    return max(1, math.ceil(bits / math.log2(radix)))
+
+
+def _clever_applied_depth(op_class: str, axes) -> int:
+    """APPLIED per-op depth (reused-cell unroll count) for one op's axes."""
+    if axes.extraction == "whole_value":
+        # MSB-first decimal digit-extract; deepest op sets the cell depth.
+        return _CLEVER_DEPTH_DIGIT.get(op_class, 1)
+    if axes.extraction == "digit_extract":
+        # radix-limb decode: #base-`radix` limbs of the RESULT width.
+        result_bits = 64 if op_class == "mul" else 32
+        return _limb_depth(axes.radix, result_bits)
+    # nibble (the production build): the nibble solver owns depth; sentinel 0.
+    return 0
+
+
+@dataclass
+class OpConfigGeometry:
+    """The geometry an ``OpConfig`` implies, reported for the fitter table."""
+    label: str
+    precision_set: str              # e.g. "fp64/fp128" or "fp32(nibble)"
+    extraction: str
+    recurrence: str
+    hidden: int
+    intermediate: int
+    stored_layers: int              # distinct stored cells / blocks
+    applied_depth: int              # deepest per-op unroll (per forward)
+    params_estimate: int
+    fits_stock_0_5b: bool
+    binding: str                    # "" if fits, else the binding axis
+    note: str = ""
+
+
+def account_opconfig(config, code_size: int = 24, arch: QwenArch = QWEN2_5_ARCH
+                     ) -> OpConfigGeometry:
+    """Size an ``opconfig.OpConfig`` into a geometry row.
+
+    * DEFAULT (nibble/fp32/unrolled): routes to the REAL nibble solver's FULL
+      geometry (the golden build width/depth) — hidden ~3008, does NOT fit 0.5B.
+    * clever whole-value (fp64/fp128, digit-extract/whole_value, tied): ONE narrow
+      reused cell floored to the Qwen GQA head partition (896), APPLIED depth = the
+      deepest op's digit-extract places (DIV 10 / MUL 20) — FITS 0.5B width/shape.
+    * bf16 radix-16 digit-extract tied (min-walltime): same narrow-cell shape, the
+      radix-limb depth (8-16 limbs) — the realtime config; FITS 0.5B width/shape.
+    """
+    from . import opconfig as OC
+
+    # --- DEFAULT (nibble) path: the REAL nibble solver FULL geometry ---------
+    if config.is_default():
+        acc = account(FitConfig(ops=FULL, muldiv_strategy="efficient-ALU-unrolled",
+                                precision=32, code_size=code_size, arch=arch))
+        fits = (acc.hidden <= _STOCK_0_5B.hidden
+                and acc.intermediate <= _STOCK_0_5B.intermediate
+                and acc.stored_layers <= _STOCK_0_5B.layers)
+        binding = ""
+        if not fits:
+            if acc.hidden > _STOCK_0_5B.hidden:
+                binding = "hidden"
+            elif acc.stored_layers > _STOCK_0_5B.layers:
+                binding = "depth (stored layers)"
+            else:
+                binding = "intermediate"
+        return OpConfigGeometry(
+            label="nibble-fp32-FULL (DEFAULT / golden 174ece66)",
+            precision_set="fp32 (nibble 4-bit lanes)", extraction="nibble",
+            recurrence="unrolled", hidden=acc.hidden, intermediate=acc.intermediate,
+            stored_layers=acc.stored_layers, applied_depth=acc.applied_depth,
+            params_estimate=acc.params_estimate, fits_stock_0_5b=fits,
+            binding=binding,
+            note="the production nibble build (routes through the real fit solver)")
+
+    # --- CLEVER path: narrow reused cell, cost in APPLIED depth --------------
+    # hidden floored to the Qwen GQA head partition (14 q-heads x 64 = 896); the
+    # clever cell's residual is a handful of dims (value axis + flags + work lanes).
+    HEAD_DIM = arch.head_dim
+    QHEADS = arch.num_attention_heads
+    hidden_floor = QHEADS * HEAD_DIM
+    d_used = 4 + 8                                   # value/flag axis + ~8 work lanes
+    hidden = max(hidden_floor, -(-(d_used + 1) // HEAD_DIM) * HEAD_DIM)
+
+    # Precision set across the op-set + deepest applied depth.
+    precs = set()
+    max_applied = 1
+    max_decode_fan = 1
+    extraction = config.base.extraction
+    recurrence = config.base.recurrence
+    for op in OC.ALL_OPS:
+        ax = config.for_op(op)
+        cls = OC._OP_CLASS[op]
+        precs.add(ax.precision)
+        max_applied = max(max_applied, _clever_applied_depth(cls, ax))
+        # decode fan = the difference-min candidate vector (radix) or decimal 10.
+        fan = ax.radix if ax.extraction == "digit_extract" else 10
+        max_decode_fan = max(max_decode_fan, fan)
+    # bitwise LUT rides alongside (256-unit FFN table); floor the intermediate to
+    # the head partition, cap by the widest block (bitwise 256 or the decode fan).
+    intermediate = max(max_decode_fan, 256, QHEADS * HEAD_DIM, 8)
+    stored_cells = 6            # ingest / ADD·CMP·shift / DIV / MUL / bitwise-LUT / CAM
+
+    fits = (hidden <= _STOCK_0_5B.hidden
+            and intermediate <= _STOCK_0_5B.intermediate
+            and stored_cells <= _STOCK_0_5B.layers)
+    binding = "" if fits else ("applied depth (per-forward unroll)"
+                               if max_applied > _STOCK_0_5B.layers else "hidden")
+    prec_set = "/".join(sorted(precs, key=lambda p: PRECISIONS_ORDER.index(p)))
+    params = _param_estimate(hidden, intermediate, stored_cells, arch)
+    # applied_depth is the DEEPEST SINGLE op's reused-cell unroll; the SUMMED
+    # per-forward depth over a program's op stream exceeds 24 (the recurrence
+    # tradeoff — fits the CHECKPOINT width/shape, not a single stock forward).
+    applied_note = (f"FITS the stock 0.5B WIDTH+SHAPE (hidden {hidden}<=896, "
+                    f"inter {intermediate}<=4864, stored {stored_cells}<=24); "
+                    f"deepest single-op unroll {max_applied}, summed program APPLIED "
+                    "depth exceeds 24 (recurrence: fits the checkpoint, not one forward)")
+    return OpConfigGeometry(
+        label=_opcfg_label(config, prec_set),
+        precision_set=prec_set, extraction=extraction, recurrence=recurrence,
+        hidden=hidden, intermediate=intermediate, stored_layers=stored_cells,
+        applied_depth=max_applied, params_estimate=params,
+        fits_stock_0_5b=fits, binding=binding, note=applied_note)
+
+
+PRECISIONS_ORDER = ("int8", "fp16", "bf16", "fp32", "fp64", "fp128")
+
+
+def _opcfg_label(config, prec_set: str) -> str:
+    base = config.base
+    return (f"opcfg {prec_set}-{base.extraction}-{base.recurrence}-FULL")
+
+
+def opconfig_geometry_table(configs, code_size: int = 24,
+                            arch: QwenArch = QWEN2_5_ARCH) -> str:
+    """Render the geometry table for a list of (name, OpConfig) pairs."""
+    rows = [(name, account_opconfig(cfg, code_size=code_size, arch=arch))
+            for name, cfg in configs]
+    hdr = (f"{'config':46s} {'prec':>12s} {'extract':>13s} {'recur':>8s} "
+           f"{'hidden':>6s} {'inter':>6s} {'stored':>6s} {'applied':>7s} "
+           f"{'params':>8s} {'fit0.5B':>8s}")
+    lines = [hdr, "-" * len(hdr)]
+    for name, g in rows:
+        fit = "YES" if g.fits_stock_0_5b else f"no({g.binding.split()[0]})"
+        lines.append(
+            f"{name[:46]:46s} {g.precision_set[:12]:>12s} {g.extraction[:13]:>13s} "
+            f"{g.recurrence[:8]:>8s} {g.hidden:6d} {g.intermediate:6d} "
+            f"{g.stored_layers:6d} {g.applied_depth:7d} {_h(g.params_estimate):>8s} "
+            f"{fit:>8s}")
+    return "\n".join(lines)

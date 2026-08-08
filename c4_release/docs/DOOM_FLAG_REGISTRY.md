@@ -8,9 +8,11 @@ c4_min doom flags were undocumented** in the canonical registry).
 
 Source of truth: the per-flag `*_enabled()` docstring at each `os.environ.get` site +
 [`c4_min/DOOM_PARAM_PRECISION_FLAG_AUDIT_2026_08_05.md`](../c4_min/DOOM_PARAM_PRECISION_FLAG_AUDIT_2026_08_05.md)
-+ the `REALTIME_SETUP.md` recipe.  Generated 2026-08-05; golden RE-BASELINED 2026-08-06
-to `7d4afe61` (the `C4_BP_RESTORE_HIBYTE` DEFAULT-ON flip; `069cc32f` is the
-`C4_BP_RESTORE_HIBYTE=0` escape-hatch build).
++ the `REALTIME_SETUP.md` recipe.  Generated 2026-08-05; golden RE-BASELINED 2026-08-07
+to **`174ece66`** (full-32-bit WIDE ADDRESSES + `C4_DIVMOD_SIGNED` + `C4_BP_RESTORE_HIBYTE`
+all DEFAULT-ON — confirmed via `python -m c4_min._fingerprint_build`).  Rollback ladder:
+unset the 5 wide flags → `3cabef64` → `C4_DIVMOD_SIGNED=0` → `7d4afe61` →
+`C4_BP_RESTORE_HIBYTE=0` → `069cc32f` (see the Golden-MOVING section for the full ladder).
 
 Scope note: this lists the ~113 PRODUCTION flags read in non-agent, non-bench, non-test
 `c4_min` modules.  The `_agent_*` / `bench_*` scratch scripts read many more one-off
@@ -227,6 +229,39 @@ docs task).
 | `C4_FP32_ALU` | fp32 ALU baked path | unset→off | — | doom-build |
 | `C4_FLOAT_OPS` | enable float ALU ops in the ISA | unset→off | — | doom-build (widens NUM_OPS) |
 | `C4_FIXED_MAC_DISCRETE` | native fixed-point discrete MAC | unset→off | — | doom-build |
+
+### Per-op TOGGLE schema (`C4_OPCFG_*` — the 4-axis config system)
+
+The first-class per-opcode `{precision, radix, extraction, recurrence}` config
+(`c4_min/opconfig.py`, wired into the fitter `qwen_fit_solver.account_opconfig` +
+documented in [`TOGGLE_SCHEMA.md`](TOGGLE_SCHEMA.md)). Grammar:
+`C4_OPCFG_<OP>_<AXIS>=<value>`, where `<OP>` is an op name (`DIV`/`MUL`/…) or `ALL`
+(sets the base for every op; per-op flags override), and `<AXIS>` is one of the four
+below.
+
+**Golden convention (§golden-safety):** the DEFAULT (every axis unset) == the current
+nibble / fp32 build == golden **`174ece66`** — with NO `C4_OPCFG_*` flag set the
+resolver returns DEFAULT and the build is byte-IDENTICAL. Setting ANY non-default
+axis value is a **golden-MOVING** toggle: it selects a clever/low-precision op
+construction (whole-value fp64/fp128, or radix-limb bf16/fp16) with a DIFFERENT
+weight footprint by construction. **NOTE:** these are today a CONFIG + FITTER +
+ACCOUNTING surface — the byte-exact doom VM is **not yet rebuilt** with the clever
+ops (TOGGLE_SCHEMA.md §7), so a non-default value changes the *sized/accounted* build
++ the fitter geometry, but does not yet re-bake the running golden VM.
+
+| flag | purpose | default | depends | golden |
+|---|---|---|---|---|
+| `C4_OPCFG_<OP>_PRECISION` | datapath dtype for `<OP>`: `int8`/`fp16`/`bf16`/`fp32`/`fp64`/`fp128` (exact-int ceilings 2^7…2^64) | `fp32` (== golden) | — | **golden-MOVING** (non-`fp32`/non-nibble selects a clever op construction; DEFAULT `fp32` == `174ece66`) |
+| `C4_OPCFG_<OP>_RADIX` | value/limb base `r>=2` (nibble = 16); bounded by precision headroom for the op (add ~2r, cmp ~r, mul ~r²·L, div ~r²) | `16` (nibble base) | precision (validator rejects a radix overflowing the ceiling) | **golden-MOVING** (non-16 or non-nibble extraction changes the limb decomposition; DEFAULT 16 == `174ece66`) |
+| `C4_OPCFG_<OP>_EXTRACTION` | readout: `nibble` (production 4-bit lanes) · `digit_extract` (MSB-first difference-min decode) · `whole_value` (one hi-prec scalar) | `nibble` (== golden) | — | **golden-MOVING** (non-`nibble` selects the clever digit/whole-value construction; DEFAULT `nibble` == `174ece66`) |
+| `C4_OPCFG_<OP>_RECURRENCE` | `unrolled` (one stored layer/place) · `tied` (one reused cell applied depth×, STORED shrinks) | `unrolled` (== golden) | — | **golden-MOVING** (`tied` weight-ties the per-place cell; DEFAULT `unrolled` == `174ece66`) |
+| `C4_OPCFG_ALL_<AXIS>` | set `<AXIS>` for EVERY op (the base); individual `C4_OPCFG_<OP>_<AXIS>` override it | (unset → per-axis default) | — | **golden-MOVING** when any axis ≠ default |
+
+The **two Pareto corners** as named configs (TOGGLE_SCHEMA.md §3):
+`opconfig.min_params_config()` = fp64/fp128 whole-value tied (~4 scalars/op,
+min-PARAMS); `opconfig.min_walltime_config()` = bf16 radix-16 digit-extract tied
+(~13× faster on mul/div, min-WALLTIME realtime). The low-precision speedup is a
+**narrow-VM lever** — the current wide VM is memory-bound, where bf16 nets ~1.0×.
 
 ### Build-family selectors (DOOM/perf-fleet build — `doom-build`, golden gate unchanged)
 
