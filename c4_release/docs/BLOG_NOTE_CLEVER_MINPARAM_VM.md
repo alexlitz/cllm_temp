@@ -253,6 +253,32 @@ full-width realization is what's ~1000× too slow. That total-nonzero is tiny
 exactly the **sparse-but-wide** gap: the information is small, the *realized* matmul
 is not.
 
+### Optimized: narrowing to the true width closes most of the gap (measured)
+
+The dense-eager 896-wide numbers are **not** the achievable floor — they multiply
+zeros. Rebuilding the SAME byte-exact clever stack at the VM's *true* state width +
+fusing it (`examples/clever_optimized_realtime.py`, `docs/CLEVER_OPTIMIZED_REALTIME.md`):
+
+| lever | speedup |
+|---|--:|
+| narrow width 896 → **d_model 32** (peak 23 concurrent live dims → pow2 32) | **19.3×** |
+| `torch.compile` fusion | 1.77× |
+| shallower 42-layer (min-walltime depth) | 1.22× |
+| int8 (`torch._int_mm`) | **0.55× — SLOWER**, not realized at saturating batch |
+| CUDA-graph | 1.01× — *not* launch-bound |
+
+Net **34–49×** over dense-eager → **8.3–10.2 render fps**, byte-exact (9/9 op
+families at d=32). Adaptive precision matters: the Doom op-mix runs bf16/fp16-exact,
+so it never pays the **19.7×** fp64 whole-value tax. Still **~3× short of 30 fps**,
+and the wall is now the **depth** — 42–51 real transformer blocks per step
+(compute/bandwidth-bound, *not* launch, *not* attention). Closing the last 3× needs a
+*shallower* stack (fewer digit-layers via **larger radix**, §3) or a non-transformer
+datapath — width is no longer the bottleneck. (Caveat: this is the clever VM running
+op-*cells* at a Doom step-count, not the Doom *program*. The byte-exact Doom that
+actually renders is the **production nibble VM** — a separate, wider track now at
+~1.3–2.6 fps whose realtime path is kernel-efficiency × multi-GPU × a render-macro
+step-fold, not these clever-cell levers.)
+
 ---
 
 ## 7. Constraining the solver: precision + depth + width + KV together
@@ -313,6 +339,8 @@ ISA becomes a **~3,200-non-zero (looped) / ~26,000 (unrolled)** vanilla transfor
 — paying for it in **depth** (as distinct layers, a genuine loop, or
 forwards-per-step in the autoregressive loop — all vanilla, all compute-conserved)
 and in a **bitwise-LUT floor** floats can't dissolve. The catch the measurement
-exposed: those few thousand non-zeros live inside full 896-wide blocks run every
-step, so the *realized* model is **~100× off Doom realtime** — the fix is a
-**narrow** per-digit cell, not the depth-mode.
+exposed: those few thousand non-zeros live inside full 896-wide blocks, so the
+*realized dense* model is **~100× off Doom realtime** — but **narrowing to the true
+state width (d=32) + fusion recovers 34–49×** to **~3× short**, and the last 3× is a
+shallower stack (larger radix), not the depth-mode. (Actual byte-exact *Doom* runs
+on the wider production nibble VM, ~1.3–2.6 fps, a separate realtime track.)
