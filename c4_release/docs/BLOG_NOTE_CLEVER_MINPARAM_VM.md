@@ -295,6 +295,16 @@ the clever ALU *datapath* at a Doom step-count, not the Doom *program* (running 
 Doom on it is a port); and it's *batched* throughput, so a single realtime stream still
 needs the frame's own (render) parallelism to feed the batch.**
 
+*Honest-attention check (`examples/clever_honest_attn_realtime.py`):* composing the
+VM's real **O(1) direct-CAM memory-read** attention (the CAM heads `LI/LC/SI/SC` use to
+read the heap, over the 262K-entry per-lane Doom heap where an O(S) scan OOMs at 64 GiB)
+onto every step leaves it at **24.84 fps 1-GPU / 48.16 fps 2-GPU byte-exact** — the
+memory read is only **~5.7% of the step, S-independent** (0.15–0.76% for the bare gather;
+the rest is the value-band routing). So 35 fps still clears on 2 GPUs *with* the honest
+attention in. (The T=1 self-attention fold is load-bearing — the unfused full-softmax
+drops it to ~12 fps — but that fold is byte-exact-*legitimate*: softmax over one position
+= 1 ⇒ o = v, so 0.21 ms is the correct value, not a shortcut.)
+
 ---
 
 ## 7. Constraining the solver: precision + depth + width + KV together
