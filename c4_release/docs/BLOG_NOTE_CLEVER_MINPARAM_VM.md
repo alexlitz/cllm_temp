@@ -139,7 +139,55 @@ just avoids re-storing them.** (It also does *not* reduce the KV cache — see �
 
 ---
 
-## 5. Precision × total-non-zeros × realtime  *(measured — table pending)*
+## 5. Getting depth from forwards-per-step — the vanilla resolution
+
+§4 left a tension: the digit-chain wants ~51 layers, but a *distinct-layer* stack
+that deep doesn't fit a stock 24-layer model, and *weight-tying* it is only honest
+for a Universal Transformer. There is a **third** place to put the depth — the
+**autoregressive token loop.** Extract one digit per *emitted token* (per forward
+pass) instead of per *layer*, threading the running remainder through the KV cache
+/ token stream between forwards.
+
+This is the natural fit for a transformer VM, which **already emits ~30 tokens per
+VM step** — each token is already a forward pass. Spreading the digit-extraction
+across those forwards keeps the network **shallow** (a couple of layers,
+comfortably inside a stock 24-layer 0.5B) while realizing arbitrary effective
+depth in the **sequence**. Crucially, **this recurrence is the ordinary
+autoregressive loop — re-invoking the same weights per token, which every language
+model already does — not an exotic tied-layer architecture.** So it is genuinely
+*vanilla*, and it is the honest resolution of §4's recurrence question: you get the
+store-once benefit without a Universal Transformer.
+
+The three ways to realize a digit-extraction depth **D**:
+
+| lever | where the depth lives | network | tokens/step | KV cache | vanilla? |
+|---|---|---|--:|---|---|
+| **distinct layers (unrolled)** | within one forward | deep (D layers) | few | small | vanilla arch, but too deep for stock 24 |
+| **looped layers (UT)** | within one forward, tied ×D | shallow stored | few | pays *applied*-depth KV | ✗ Universal Transformer |
+| **forwards / tokens (autoregressive)** | across D forwards, 1 digit/token | **shallow — fits stock 24** | **+D per step** | **grows with D × steps** | ✓ standard AR loop |
+
+Compute is conserved — ~D layer-applications per step in every row — so this does
+**not** cut FLOPs; it **re-books the depth from parameter-storage / physical-depth
+into sequence-length / KV.** The trade-offs:
+
+- **Fitting a vanilla checkpoint:** forwards-per-step *wins* — shallow network,
+  stock architecture, no tying.
+- **KV / memory:** forwards-per-step *loses* — every extra digit-token lengthens
+  the sequence, so KV ∝ (digits × steps). Same precision↔KV↔depth coupling as §7,
+  now with the depth living in seq_len.
+- **Realtime latency:** distinct-layers is usually *faster* — D layers run in one
+  forward (one kernel-launch chain, one KV read), whereas D forwards pay D
+  launch-chains + D KV re-reads and batch worse. Forwards-per-step is more
+  launch/occupancy-bound.
+
+So the lever exists and it is the *right* one for "fits a real vanilla model" — but
+it pays the depth back in KV and per-step forward count. That is exactly why the
+solver (§7) must let the depth budget be satisfied by **layers OR forwards**, and
+cost each accordingly.
+
+---
+
+## 6. Precision × total-non-zeros × realtime  *(measured — table pending)*
 
 > Filled from the measurement build (`examples/`, `docs/CLEVER_REALTIME_MEASURED.md`).
 > Columns: precision · radix · extraction · mode · n_layers · hidden · dense
@@ -160,14 +208,18 @@ the raw frame needs a render-macro step-fold independent of the cell cost.
 
 ---
 
-## 6. Constraining the solver: precision + depth + width + KV together  *(pending)*
+## 7. Constraining the solver: precision + depth + width + KV together  *(pending)*
 
 > Filled from the solver extension (`c4_min/qwen_fit_solver.py`,
 > `docs/SOLVER_CONSTRAINTS.md`).
 
 The network-size solver now takes **joint** hard constraints — precision, max
 depth (layers), max width (hidden), and a **KV-cache byte budget** — and reports
-the binding one. The KV formula:
+the binding one. It also models the §5 trade: the required effective depth D can
+be met by **layers** (deep network, small KV) **or by forwards/tokens** (shallow
+network, KV ∝ D × steps), and the solver costs each — so a depth-bound *layer*
+budget can be traded for a longer *sequence* budget, and vice-versa. The KV
+formula:
 
 **KV_bytes = 2 (K+V) × n_layers × n_heads × head_dim × seq_len × batch × bytes(precision)**
 
@@ -184,7 +236,7 @@ solver searches (`min_kv_precision`).
 
 ---
 
-## 7. One-line summary
+## 8. One-line summary
 
 Replace stored arithmetic tables with a float's own precision + attention's own
 positional structure + one shared digit-extractor, and a 210,018-non-zero 8-bit
