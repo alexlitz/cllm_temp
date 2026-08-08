@@ -176,13 +176,19 @@ precise):
 - **KV / memory — essentially a *tie* (this corrects an earlier draft):** KV ∝
   n_layers × seq_len, so deep (`D` layers × base_seq) and shallow (`ceil(D/F)`
   layers × `F`·base_seq) both come out to **`D·base_seq`** at exact splits — the
-  layers↔forwards trade is **KV-neutral**, creeping up only at non-exact
-  (ceil-rounded) splits. Forwards-per-step does *not* cost you memory.
+  layers↔forwards trade is **KV-neutral**. *Measured:* full-frame KV is identical;
+  under a **bounded eviction window** SHALLOW is **16× smaller** (only the layer
+  ratio survives) — so windowed, the vanilla-fit config is the KV *winner*.
 - **Realtime latency — the *actual* price:** distinct-layers is usually *faster* —
   `D` layers run in one forward (one kernel-launch chain, one KV read), whereas
-  `D` forwards pay `D` launch-chains + `D` KV re-reads and batch worse. **This
-  launch/occupancy cost — not KV — is what forwards-per-step trades for fitting a
-  vanilla checkpoint.**
+  `D` forwards pay `D` launch-chains + `D` KV re-reads and batch worse. *Measured*
+  (D=48, real 0.5B-shape blocks): the tax is **small** — DEEP is only **1.01×
+  (fp32) / 1.07× (bf16)** faster than SHALLOW×16-forwards at the same effective
+  depth. So **vanilla-fit does NOT cost you realtime relative to the deep form** —
+  the per-digit-layer *width* (§6) gates absolute fps, not the depth-mode. (Launch
+  floor ≈ 1.5 ms fp32 / 5.9 ms bf16 per forward, paid F× → 2.8% of the step in
+  fp32 but 28% in bf16: the faster the datapath, the more the fixed launch tax
+  shows.)
 
 So the lever exists and it is the *right* one for "fits a real vanilla model" — but
 it pays the depth back in KV and per-step forward count. That is exactly why the
@@ -191,24 +197,51 @@ cost each accordingly.
 
 ---
 
-## 6. Precision × total-non-zeros × realtime  *(measured — table pending)*
+## 6. Precision × total-non-zeros × realtime — MEASURED
 
-> Filled from the measurement build (`examples/`, `docs/CLEVER_REALTIME_MEASURED.md`).
-> Columns: precision · radix · extraction · mode · n_layers · hidden · dense
-> params · **total non-zeros** · ms/step (measured, GPU) · fps · realtime?
-> Corners: min-NON-ZERO (fp64 whole-value + digit-extract) and min-WALLTIME
-> (bf16 radix-16). Precision throughput anchors already measured:
-> **bf16 ≈ 5.4× fp32 · int8 ≈ 2.7× (4× not realized on A5000) · fp64 ≈ 0.02× fp32.**
+All rows measured on an idle RTX A5000 (real torch cells — **14/14 op families
+byte-exact** on 2–3k random 32-bit operands each: real embed/ALiBi/softmax1 ingest,
+ADD/SUB/DIV/MOD/MUL, all six compares, shifts, the real 16×16-nibble-LUT bitwise
+FFN, and the real attention-CAM memory ops). Doom step-counts: render-reduced
+358,058, raw 6,889,264. `ms/step` = one forward of the **whole** layer stack — a
+standard feed-forward transformer runs its entire stack every VM step.
+(`examples/clever_realtime_*.py`, `docs/CLEVER_REALTIME_MEASURED.md`.)
 
-`<<INSERT MEASURED PRECISION TABLE>>`
+| precision | radix | extraction | mode | n_lay | hidden | dense | **total nonzero** | ms/step | render fps | realtime? |
+|---|--:|---|---|--:|--:|--:|--:|--:|--:|:--:|
+| fp64 | 10 | whole_value | unrolled | 51 | 896 | 217M | **26,119** | 1.081 | 0.003 | ❌ |
+| fp64 | 10 | whole_value | looped/UT | 6 | 896 | 26M | **3,183** | 1.081 | 0.003 | ❌ |
+| fp32 | 10 | whole_value | unrolled | 51 | 896 | 217M | 26,119 | 0.039 | 0.073 | ❌ |
+| **bf16** | 16 | digit_extract | unrolled | 42 | 896 | 179M | 25,624 | **0.009** | **0.312** | ❌ |
+| bf16 | 16 | digit_extract | looped/UT | 6 | 896 | 26M | 3,183 | 0.009 | 0.312 | ❌ |
+| int8 | 4 | digit_extract | unrolled | 92 | 896 | — | 28,374 | 0.020 | 0.137 | ❌ |
+| fp128 | 10 | whole_value | unrolled | 51 | 896 | 217M | 26,119 | 1.081 | 0.003 | ❌ (fp64 floor) |
 
-**Realizability, stated plainly:** the unrolled clever full ISA *is* a genuine
-vanilla feed-forward transformer — ~51 layers, hidden 896, ~217M dense params
-(smaller than 0.5B's 494M but deeper), order-10³ total non-zeros, no recurrence,
-no exotic ops (attention + FFN + ALiBi + softmax1 + difference-min head). Whether
-it renders Doom in real time byte-exact is the measurement above; the current
-*proven* byte-exact Doom is the wide nibble build at ~1 fps (memory-bound), and
-the raw frame needs a render-macro step-fold independent of the cell cost.
+**Measured total-nonzero** (correcting my earlier ~1–4K estimate — it came in
+higher, as flagged, once the FFN-realized LUT + projections are counted): **3,183
+looped / 26,119 unrolled** for the full ISA (vs the nibble build's 210,018).
+
+**Two Pareto corners:** min-NONZERO = fp64/fp128 whole_value (**3,183** looped),
+slowest datapath; min-WALLTIME = bf16 radix-16 digit_extract (**0.009 ms/step**,
+fastest), 25,624 nonzero. Opposite corners; neither realtime.
+
+**Realtime verdict — NO, and the honest why.** A realizable *full-width* vanilla
+feed-forward clever transformer does **not** render Doom in real time at any
+precision — best case ~0.31 fps (bf16), **~100× short** of 30 fps (~500× on the raw
+frame). The wall is **not** the arithmetic: a standard feed-forward transformer
+runs its **entire 42–51-layer × 896-wide stack every VM step** (9–1081 µs/step
+measured), which is **~1000× the isolated-cell cost** (~0.04 µs/op). The earlier
+`CLEVER_DOOM_REALTIME.md` ~69 fps projection used the *cell's* throughput, not the
+realizable *model's* — **this measurement corrects that projection.**
+
+**But the realtime lever is WIDTH, not depth-mode.** What gates absolute fps is the
+**per-digit-layer width**: a full 896-wide Qwen block per digit costs ~1000× a
+narrow difference-min cell. So a realizable vanilla transformer *could* reach
+realtime **iff the per-digit cell is narrowed** to its few active dims — the
+full-width realization is what's ~1000× too slow. That total-nonzero is tiny
+(3,183) while walltime is dominated by the 896²-dense tensors the block carries is
+exactly the **sparse-but-wide** gap: the information is small, the *realized* matmul
+is not.
 
 ---
 
@@ -238,14 +271,38 @@ the radix ceiling → more digits → more depth → **more layers → more KV**
 KV-minimizing precision is not simply "the smallest one"; it's a frontier the
 solver searches (`min_kv_precision`).
 
-`<<INSERT MEASURED SOLVER CONSTRAINT TABLE>>`
+**Worked constraint table** (`solve_opconfig`; caps: max_layers 24, hidden 896,
+inter 4864, KV 256 MiB, seq 2048, batch 1; KV sized on the GQA 2×64 KV-heads):
+
+| config | n_lay | hidden | applied (KV depth) | KV | fits? | binds |
+|---|--:|--:|--:|--:|:--:|---|
+| nibble-fp32 (default) | 123 | 3008 | 123 | 257.9M | ❌ | depth (+width) |
+| clever-fp64 looped/UT | 6 | 896 | 20 | 167.8M | ✅ | — |
+| clever-fp64 std-FF unrolled | 51 | 896 | 20 | 167.8M | ❌ | depth |
+| clever-fp64 std-FF **+ forwards_per_step=3** | **17** | 896 | 20 | 167.8M | ✅ | — |
+| bf16-r16 looped/UT | 6 | 896 | 16 | 16.8M | ✅ | — |
+
+The looped and unrolled clever-fp64 twins pay **identical KV** (167.8M, applied
+depth 20) but 26M vs 217M params — weight-tying cuts params, not KV. The
+`forwards_per_step=3` row is the §5 lever: it re-books the 51-layer depth into
+`ceil(51/3)=17` stored layers and clears the 24-layer cap **KV-neutrally**, as a
+plain vanilla autoregressive loop.
+
+**`min_kv_precision` frontier** (the coupling in action): tiny seq/batch →
+**fp64 wins** (KV negligible, few-layer depth dominates); huge seq/batch →
+**int8 wins** (KV dominates — 1 byte/elem beats fp64's 8 despite int8's lower radix
+ceiling forcing more depth).
 
 ---
 
 ## 8. One-line summary
 
 Replace stored arithmetic tables with a float's own precision + attention's own
-positional structure + one shared digit-extractor, and a 210,018-non-zero 8-bit
-ISA becomes an order-10³-non-zero vanilla transformer — paying for it in **depth**
-(not recurrence, unless you genuinely build a loop) and in a **bitwise-LUT floor**
-that floats can't dissolve.
+positional structure + one shared digit-extractor, and a **210,018-non-zero** 8-bit
+ISA becomes a **~3,200-non-zero (looped) / ~26,000 (unrolled)** vanilla transformer
+— paying for it in **depth** (as distinct layers, a genuine loop, or
+forwards-per-step in the autoregressive loop — all vanilla, all compute-conserved)
+and in a **bitwise-LUT floor** floats can't dissolve. The catch the measurement
+exposed: those few thousand non-zeros live inside full 896-wide blocks run every
+step, so the *realized* model is **~100× off Doom realtime** — the fix is a
+**narrow** per-digit cell, not the depth-mode.
