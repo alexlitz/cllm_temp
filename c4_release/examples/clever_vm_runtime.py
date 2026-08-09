@@ -129,12 +129,13 @@ class DirectCAMMemory:
     LATEST write whose address matches the query (recency = highest log index),
     ZFOD 0 if none.  This is exactly the latest-write-wins direct-CAM."""
 
-    def __init__(self, B: int, device):
+    def __init__(self, B: int, device, dtype=FP):
         self.B = B
         self.device = device
-        self.addrs: List[torch.Tensor] = []      # each (B,) fp32
-        self.vals: List[torch.Tensor] = []       # each (B,) fp32
-        self.active: List[torch.Tensor] = []     # each (B,) fp32 {0,1}: did lane write?
+        self.dtype = dtype                       # FP (fp32) default; fp64 for 32-bit values
+        self.addrs: List[torch.Tensor] = []      # each (B,) dtype
+        self.vals: List[torch.Tensor] = []       # each (B,) dtype
+        self.active: List[torch.Tensor] = []     # each (B,) dtype {0,1}: did lane write?
 
     def write(self, addr: torch.Tensor, val: torch.Tensor, active: torch.Tensor):
         """Append a write frame.  ``active`` (B,) {0,1} masks which lanes wrote
@@ -148,7 +149,7 @@ class DirectCAMMemory:
         """Latest-write-wins gather: for each lane, the val of the highest-index
         active write whose addr == query_addr; 0 if none (ZFOD).  fp32-exact."""
         B = self.B
-        out = torch.zeros(B, dtype=FP, device=self.device)
+        out = torch.zeros(B, dtype=self.dtype, device=self.device)
         found = torch.zeros(B, dtype=torch.bool, device=self.device)
         # walk newest -> oldest; take the first (newest) match per lane (recency).
         for i in range(len(self.addrs) - 1, -1, -1):
@@ -170,11 +171,12 @@ class CodeCAM:
     it as dense fp32 op/imm tables (the byte-exact collapse of the address-CAM at
     unique keys: identical values, S-independent per-lane bandwidth)."""
 
-    def __init__(self, code: List[isa.Instr], device):
+    def __init__(self, code: List[isa.Instr], device, dtype=FP):
         self.n = len(code)
-        self.op = torch.tensor([float(ins.op) for ins in code], dtype=FP, device=device)
+        self.dtype = dtype
+        self.op = torch.tensor([float(ins.op) for ins in code], dtype=dtype, device=device)
         self.imm = torch.tensor([float(ins.imm & 0xFFFFFFFF) for ins in code],
-                                dtype=FP, device=device)
+                                dtype=dtype, device=device)
         self.device = device
 
     def fetch(self, pc: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -186,7 +188,7 @@ class CodeCAM:
         safe = idx.clamp(0, max(self.n - 1, 0))
         op = self.op[safe]
         imm = self.imm[safe]
-        return op, imm, in_range.to(FP)
+        return op, imm, in_range.to(self.dtype)
 
 
 # =========================================================================== #
@@ -205,13 +207,15 @@ class CleverVM:
     """The min-param fp32 clever fetch-decode-execute machine (Phase 1)."""
 
     def __init__(self, code: List[isa.Instr], B: int = 1, device="cpu",
-                 mask: int = MASK8):
+                 mask: int = MASK8, dtype=FP):
         self.device = torch.device(device)
         self.B = B
         self.mask = mask
-        self.code = CodeCAM(code, self.device)
-        self.mem = DirectCAMMemory(B, self.device)
-        z = lambda v: torch.full((B,), float(v), dtype=FP, device=self.device)
+        self.dtype = dtype                       # fp32 default (8-bit values, exact);
+        #                                          fp64 for full 32-bit values (>2^24).
+        self.code = CodeCAM(code, self.device, dtype=dtype)
+        self.mem = DirectCAMMemory(B, self.device, dtype=dtype)
+        z = lambda v: torch.full((B,), float(v), dtype=dtype, device=self.device)
         self.PC = z(0)
         self.SP = z(SP_INIT)
         self.BP = z(SP_INIT)
@@ -227,9 +231,10 @@ class CleverVM:
         (a CAM read is the same regardless of which op wins) and fed to the
         relevant candidates — the shared-datapath read."""
         B, dev, m = self.B, self.device, self.mask
+        DT = self.dtype
         PC, SP, BP, AX = self.PC, self.SP, self.BP, self.AX
-        z = torch.zeros(B, dtype=FP, device=dev)
-        one = torch.ones(B, dtype=FP, device=dev)
+        z = torch.zeros(B, dtype=DT, device=dev)
+        one = torch.ones(B, dtype=DT, device=dev)
         pc_next = PC + 1.0                                   # default sequential bump
         i_idx = PC                                           # this instr's address (for JSR)
 
@@ -275,12 +280,12 @@ class CleverVM:
         for op in (isa.EQ, isa.NE, isa.LT, isa.GT, isa.LE, isa.GE):
             nSP[op] = SP + 4.0
         v = stk_top
-        nAX[isa.EQ] = (v == AX).to(FP)
-        nAX[isa.NE] = (v != AX).to(FP)
-        nAX[isa.LT] = (v < AX).to(FP)
-        nAX[isa.GT] = (v > AX).to(FP)
-        nAX[isa.LE] = (v <= AX).to(FP)
-        nAX[isa.GE] = (v >= AX).to(FP)
+        nAX[isa.EQ] = (v == AX).to(DT)
+        nAX[isa.NE] = (v != AX).to(DT)
+        nAX[isa.LT] = (v < AX).to(DT)
+        nAX[isa.GT] = (v > AX).to(DT)
+        nAX[isa.LE] = (v <= AX).to(DT)
+        nAX[isa.GE] = (v >= AX).to(DT)
         # JMP: pc = imm
         nPC[isa.JMP] = imm_f
         # BZ: pc = imm if ax==0 else pc+1  (gated PC mux)
@@ -336,7 +341,7 @@ class CleverVM:
         alive = (~self.halted) & (in_range > 0.5)
 
         # UPDATE: commit registers only for alive lanes (frozen lanes unchanged).
-        af = alive.to(FP)
+        af = alive.to(self.dtype)
         self.PC = torch.where(alive, pc_c, self.PC)
         self.SP = torch.where(alive, sp_c, self.SP)
         self.BP = torch.where(alive, bp_c, self.BP)
