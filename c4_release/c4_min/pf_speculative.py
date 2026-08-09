@@ -139,6 +139,111 @@ def set_gpu_verify(v: Optional[bool]) -> None:
     _GPU_VERIFY = v
 
 
+# ===========================================================================
+# VALIDITY GUARD (C4_VERIFY_VALIDITY, default OFF).
+#
+# The register decode (``_snap_nib`` / ``_snap_lane``) is a difference-MIN argmax:
+# it ALWAYS returns the closest in-domain integer (a nibble in 0..15, or a value
+# lane floored to the nearest int mod 2^32), with NO check that the model's lane was
+# actually near a valid quantised value.  An OUT-OF-DOMAIN lane — a precision-broken
+# ALU result past the fp32 exact-int ceiling (2^24), or a garbage/undefined value —
+# is therefore SILENTLY SNAPPED to a wrong integer and, if that snap happens to equal
+# the (also-wrong) draft frame, silently ACCEPTED.  The accept compare cannot see this
+# because it only compares the two snapped integers, never the pre-snap lane quality.
+#
+# The guard adds a per-query-row VALIDITY check that is INDEPENDENT of the draft:
+#   * each register NIBBLE lane must sit within ``tol`` of its snapped integer AND
+#     within [0-tol, 15+tol] (a confident one-hot, not a smeared/garbage lane);
+#   * each value lane (PC/SP/BP) must be a near-integer within the fp32 EXACT-INT
+#     ceiling |x| <= 2^24 (past that the difference-min floor is not reliable — the
+#     radix config sits right at the 2^24 boundary), unless the wide (fp64) decode is
+#     active (``C4_PC_WIDE`` / ``C4_VM_WIDTH32``), which is exact to 2^32.
+# A row that fails is surfaced as an EXPLICIT reject (``kind="invalid"``) — NOT
+# silently accepted — so an invalid / out-of-domain step is flagged, not rubber-
+# stamped.  Default OFF -> byte-identical to the golden accept path.
+# ===========================================================================
+_VERIFY_VALIDITY: Optional[bool] = None
+_VALIDITY_NIB_TOL = 0.30        # max |lane - snapped nibble| for a confident nibble
+_VALIDITY_LANE_TOL = 0.30       # max |lane - round(lane)| for a confident value lane
+_FP32_EXACT_INT = float(1 << 24)  # fp32 loses integer exactness past 2^24
+
+
+def _verify_validity_enabled() -> bool:
+    """``C4_VERIFY_VALIDITY`` (DEFAULT OFF): flag a query row whose decoded register
+    lanes are OUT-OF-DOMAIN (a smeared nibble one-hot, or a value lane that is not a
+    near-integer / is past the fp32 exact-int ceiling) as an EXPLICIT reject instead of
+    silently snapping it via the difference-min argmax.  OFF -> byte-identical golden."""
+    if _VERIFY_VALIDITY is not None:
+        return _VERIFY_VALIDITY
+    return os.environ.get("C4_VERIFY_VALIDITY", "0") not in ("0", "", "false", "False")
+
+
+def set_verify_validity(v: Optional[bool]) -> None:
+    global _VERIFY_VALIDITY
+    _VERIFY_VALIDITY = v
+
+
+def _row_validity_reason(state, L, mask: int, wide: bool) -> Optional[str]:
+    """Return None if the query-row register lanes are all in-domain (confident), else
+    a short string naming the first out-of-domain lane.  ``state`` is a [D] tensor (one
+    query row).  Scalar (host) path — used by the per-step verify loop.
+
+    Checks the AX (masked) register nibbles + the PC/SP/BP value lanes.  A nibble lane
+    must sit within ``_VALIDITY_NIB_TOL`` of an integer in [0,15]; a value lane must be
+    a near-integer within the fp32 exact-int ceiling (unless ``wide`` = fp64 decode)."""
+    # AX register nibbles (8 nibbles, low 4 bytes; respect the mask's active bytes).
+    n_bytes = 4
+    for bi in range(n_bytes):
+        if not ((mask >> (8 * bi)) & 0xFF):
+            continue                       # byte masked out — not decoded/compared
+        for half in range(2):
+            x = float(state[L.AX + 2 * bi + half])
+            n = max(0, min(15, round(x)))
+            if abs(x - n) > _VALIDITY_NIB_TOL:
+                return f"AX byte{bi} nib{half} lane={x:.3f} (not a confident nibble)"
+    ceil_ = float(1 << 32) if wide else _FP32_EXACT_INT
+    for name, base in (("PC", L.PC_VAL), ("SP", L.SP_VAL), ("BP", L.BP_VAL)):
+        x = float(state[base])
+        r = round(x)
+        if abs(x - r) > _VALIDITY_LANE_TOL:
+            return f"{name} lane={x:.3f} (not a near-integer)"
+        if abs(x) > ceil_:
+            return f"{name} lane={x:.1f} exceeds exact-int ceiling {ceil_:.0f}"
+    return None
+
+
+def _batch_validity_bad(qs_all, L, mask: int, wide: bool) -> torch.Tensor:
+    """Vectorized validity check over a span's query rows.  ``qs_all`` is [K, D].
+    Returns a [K] bool tensor: True where the row's register lanes are OUT-OF-DOMAIN
+    (a smeared nibble or a non-near-integer / past-ceiling value lane).  Byte-parity
+    with ``_row_validity_reason`` (same tolerances / ceiling)."""
+    dev = qs_all.device
+    bad = torch.zeros(qs_all.shape[0], dtype=torch.bool, device=dev)
+    for bi in range(4):
+        if not ((mask >> (8 * bi)) & 0xFF):
+            continue
+        for half in range(2):
+            x = qs_all[:, L.AX + 2 * bi + half]
+            n = torch.clamp(torch.round(x), 0, 15)
+            bad |= (x - n).abs() > _VALIDITY_NIB_TOL
+    ceil_ = float(1 << 32) if wide else _FP32_EXACT_INT
+    for base in (L.PC_VAL, L.SP_VAL, L.BP_VAL):
+        x = qs_all[:, base]
+        bad |= (x - torch.round(x)).abs() > _VALIDITY_LANE_TOL
+        bad |= x.abs() > ceil_
+    return bad
+
+
+def _wide_decode_active() -> bool:
+    """True when the value-lane decode is the wide (fp64, exact-to-2^32) snap rather
+    than the fp32 difference-min floor — so the exact-int ceiling is 2^32 not 2^24."""
+    try:
+        from .nibble_vm import vm_width32, _pc_wide_enabled
+        return bool(vm_width32() or _pc_wide_enabled())
+    except Exception:
+        return False
+
+
 def _build_draft_targets(draft, device: str, mask: int):
     """Materialise the draft's per-step ACCEPT targets as device-resident tensors
     ONCE per verify (cached on the draft keyed by (device, mask)).  All are [n_steps]
@@ -1608,6 +1713,9 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
     n_blocks = len(model.blocks)
     H = model.blocks[0].attn.n_heads
     HD = model.blocks[0].attn.head_dim
+    # VALIDITY GUARD state (C4_VERIFY_VALIDITY, default OFF -> byte-identical golden).
+    _validity_on = _verify_validity_enabled()
+    _wide_dec = _wide_decode_active()
     caches = [BlockKVCacheBatched(H, HD, model.blocks[b].attn.alibi_slopes)
               for b in range(n_blocks)]
     # DROP-KV local attention: if ``install_local_attention(..., drop_local_kv=True)``
@@ -2310,6 +2418,14 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                           | (got_sp_t != w_sp) | (got_bp_t != w_bp))
             bad = torch.where(f_halt, got_ax_m != w_ax, bad_normal)
             bad = bad & (~f_file)                            # file rows are accepted
+            # VALIDITY GUARD (C4_VERIFY_VALIDITY): an out-of-domain row (smeared nibble
+            # one-hot / non-near-integer value lane / past the exact-int ceiling) is a
+            # reject EVEN IF its silently-snapped integer happens to equal the draft —
+            # so a precision-broken / undefined step is flagged, never rubber-stamped.
+            invalid = None
+            if _validity_on:
+                invalid = _batch_validity_bad(qs_all, L, mask, _wide_dec) & (~f_file)
+                bad = bad | invalid
             # first divergence: argmax over the bad mask (0 if none) — but distinguish
             # "no bad" from "bad at index 0" via any().  ONE host sync for both.
             any_bad_t = bad.any()
@@ -2347,6 +2463,14 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                 s_bad = step + n_ok
                 gp = int(got_pc_t[n_ok].item()); ga = int(got_ax_m[n_ok].item())
                 gs = int(got_sp_t[n_ok].item()); gb = int(got_bp_t[n_ok].item())
+                # distinguish an INVALID (out-of-domain) reject from a plain register
+                # MISMATCH — the validity guard rejects a row whose snapped registers
+                # may even equal the draft.
+                _kind = "mismatch"
+                _reason = None
+                if invalid is not None and bool(invalid[n_ok].item()):
+                    _kind = "invalid"
+                    _reason = _row_validity_reason(qs_all[n_ok], L, mask, _wide_dec)
                 import os as _osd
                 if _osd.environ.get("C4_WALL6_DIAG", "0") == "1" and stats is not None:
                     try:
@@ -2380,15 +2504,19 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     stats["evict_rounds"] = evict_rounds
                     stats["effective_block_steps"] = eff_min_k
                 fr = draft.frames[s_bad]
+                _mm = {
+                    "step": s_bad, "query_pos": draft.win_starts[s_bad],
+                    "kind": _kind,
+                    "got": {"pc": gp, "ax": ga, "sp": gs, "bp": gb},
+                    "want": {"pc": fr["pc"], "ax": fr["ax"] & mask,
+                             "sp": fr["sp"] & 0xFFFFFFFF,
+                             "bp": fr["bp"] & 0xFFFFFFFF}}
+                if _reason is not None:
+                    _mm["invalid_reason"] = _reason
                 return VerifyResult(
                     accepted_steps=accepted, total_steps=n_steps,
                     all_matched=False, forwards=forwards,
-                    first_mismatch={
-                        "step": s_bad, "query_pos": draft.win_starts[s_bad],
-                        "got": {"pc": gp, "ax": ga, "sp": gs, "bp": gb},
-                        "want": {"pc": fr["pc"], "ax": fr["ax"] & mask,
-                                 "sp": fr["sp"] & 0xFFFFFFFF,
-                                 "bp": fr["bp"] & 0xFFFFFFFF}},
+                    first_mismatch=_mm,
                     max_seq_len=max_seq, max_cache_size=cache_now,
                     total_evicted=evicted_now, decoded_final_ax=None,
                     peak_vram_gb=vram_gb, evict_rounds=evict_rounds,
@@ -2474,6 +2602,17 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
             else:
                 bad = (got_pc != want_pc or (got_ax & mask) != want_ax
                        or got_sp != want_sp or got_bp != want_bp)
+            # VALIDITY GUARD (C4_VERIFY_VALIDITY): flag an out-of-domain row (a smeared
+            # nibble / non-near-integer value lane / past the exact-int ceiling) as an
+            # EXPLICIT reject even if its silently-snapped registers match the draft.
+            _invalid_reason = None
+            if _validity_on and not fr.get("is_file"):
+                _st = (hidden[0, (s - step) if _qordered[0]
+                                 else (draft.win_starts[s] - span_start)]
+                       if batched_decode else state)
+                _invalid_reason = _row_validity_reason(_st, L, mask, _wide_dec)
+                if _invalid_reason is not None:
+                    bad = True
             if bad:
                 # WALL#6 DIAG (C4_WALL6_DIAG=1, additive/inert by default): decode the
                 # model's STACK0 (pop operand) + all mem/pop register bands at the
@@ -2508,15 +2647,19 @@ def verify_blocks(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
                     stats["peak_vram_gb"] = vram_gb
                     stats["evict_rounds"] = evict_rounds
                     stats["effective_block_steps"] = eff_min_k
+                _mm = {
+                    "step": s, "query_pos": draft.win_starts[s],
+                    "kind": ("invalid" if _invalid_reason is not None else "mismatch"),
+                    "got": {"pc": got_pc, "ax": got_ax & mask,
+                            "sp": got_sp, "bp": got_bp},
+                    "want": {"pc": want_pc, "ax": want_ax,
+                             "sp": want_sp, "bp": want_bp}}
+                if _invalid_reason is not None:
+                    _mm["invalid_reason"] = _invalid_reason
                 return VerifyResult(
                     accepted_steps=accepted, total_steps=n_steps,
                     all_matched=False, forwards=forwards,
-                    first_mismatch={
-                        "step": s, "query_pos": draft.win_starts[s],
-                        "got": {"pc": got_pc, "ax": got_ax & mask,
-                                "sp": got_sp, "bp": got_bp},
-                        "want": {"pc": want_pc, "ax": want_ax,
-                                 "sp": want_sp, "bp": want_bp}},
+                    first_mismatch=_mm,
                     max_seq_len=max_seq, max_cache_size=cache_now,
                     total_evicted=evicted_now, decoded_final_ax=None,
                     peak_vram_gb=vram_gb, evict_rounds=evict_rounds,
@@ -2742,6 +2885,27 @@ def speculative_run(model, L: PureForwardCompleteLayout, code: List[isa.Instr],
        expected.  A verify mismatch is a genuine FAIL (model argmax != draft),
        reported with the step/position.  A draft that never HALTs within
        ``max_steps`` is a TIMEOUT.
+
+    SOUNDNESS (the speculative-decode contract).  The TRANSFORMER is authoritative:
+    ``verify_blocks`` runs the model's OWN forward over the drafted context, DECODES
+    each step-query row's register state from the model hidden (``_snap_lane`` /
+    ``_decode_reg_from_nibbles``), and ACCEPTS a step ONLY when the model's decoded
+    registers equal the draft's (first-mismatch abort).  It NEVER copies the draft into
+    the answer — ``decoded_final_ax`` is the MODEL's decoded AX at the last step (proven
+    == the draft only because the accept check passed).  So a BAD / corrupted draft
+    causes REJECTIONS (a lower accepted prefix, more forwards — slower), NEVER a wrong
+    accepted result.  This was empirically validated (42/42 corruption cases: flipping
+    AX/PC/SP/BP/operand as the accept target AND as the frozen-context INPUT the model
+    attends to always rejected, output L-inf=0 vs golden; see
+    ``_agent_spec_soundness_audit`` / ``_agent_spec_validity_proof``).
+
+    Because the draft comes from the SAME deterministic ISA transition the model's
+    weights implement, a perfect draft NEVER mismatches; a mismatch is therefore a
+    genuine model-vs-reference divergence (a real bug) and is correctly surfaced as a
+    terminal FAIL rather than silently continued.  (The optional ``C4_VERIFY_VALIDITY``
+    guard additionally rejects an OUT-OF-DOMAIN step — a smeared nibble / non-near-
+    integer / past-2^24 value lane the difference-min decode would otherwise silently
+    snap — as an explicit ``kind="invalid"`` reject.)
 
     ``block_steps`` (== K), ``evict_interval_steps``, ``oom_backoff`` and
     ``min_block_steps`` are passed straight to ``verify_blocks`` (see its docstring

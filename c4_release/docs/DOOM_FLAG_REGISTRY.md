@@ -203,6 +203,7 @@ docs task).
 | `C4_BATCHED_DECODE` | batched speculative decode | unset→off | — | byte-exact |
 | `C4_DRAFT_CMP32` | 32-bit cmp in the draft path | unset→off | — | byte-exact |
 | `C4_GPU_VERIFY` | GPU verify path | unset→off | — | byte-exact |
+| `C4_VERIFY_VALIDITY` | reject out-of-domain query rows (smeared nibble / non-near-integer / past-2^24 lane) as an EXPLICIT `kind="invalid"` reject instead of silently difference-min-snapping them | unset→off | — | byte-exact (never false-rejects a valid row) |
 | `C4_OVERLAY_BATCHED` | batched overlay | unset→off | — | byte-exact |
 | `C4_OVERLAY_PRECOMPUTE` | precompute the overlay | 1 (on) | — | byte-exact |
 | `C4_POS_SPARSE` | position-sparse bounded forward | unset→off | — | byte-exact |
