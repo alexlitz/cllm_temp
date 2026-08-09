@@ -307,7 +307,46 @@ drops it to ~12 fps — but that fold is byte-exact-*legitimate*: softmax over o
 
 ---
 
-## 7. Constraining the solver: precision + depth + width + KV together
+## 7. The fp32 tricks — a min-param VM byte-exact with no fp64/fp128
+
+The whole-value construction wants fp64 (a 32-bit integer only sits exactly in a float
+up to 2⁵³) and, for MUL's 64-bit product, fp128 (2⁶⁴) — which GPUs don't have. But
+**Doom is integer + 16.16 fixed-point — no floats** — so there's no *data* reason for
+high precision; it's purely the clever VM's encoding. Four tricks make the entire ISA
+byte-exact in plain **fp32** (GPU-native, ~7.16× the wide VM's per-lane-step):
+
+**1. Limb MUL — the fp128-killer.** Never form the 64-bit product as one scalar. Do MUL
+in **8-bit limbs** (radix-256): each partial product ≤ 255² = 65,025 and the worst
+column accumulator is **260,864 — a 64× margin under fp32's 2²⁴ exact-integer ceiling**.
+Deeper (more limb rounds), but every value stays fp32-exact — `FixedMul`/`FixedDiv` over
+Doom's actual 16.16 ranges verify L∞=0. (The whole-value form at radix 4096 has a column
+peak ~50M > 2²⁴ — *that's* the fp128-forcing shape the limb form sidesteps.)
+
+**2. Compact candidate scoring.** The difference-min decode scores every candidate digit
+against a radix-`r` table — at radix 4096 that dense LUT is ~20 ms/layer (~10× the FFN)
+and *inverts* the large-radix depth win. Replace it with a **radix-independent decode** —
+`direct` (O(1) floor), `two_level` (coarse+fine ~2√r), or `log_radix` (~2·log₂r) — so the
+FFN band is **32, not 4096**, and a larger radix finally cuts layers without cost.
+
+**3. Precision-robust tie-break.** The difference-min `argmin` needs a bias to break ties
+deterministically, and the production cell's `1e-12` bias is *below fp32 epsilon* — so it
+silently mis-ties in fp32. Using **`cand/(4r)`** as the bias keeps the tie-break above
+fp32 resolution — this is exactly what makes the fp32 rows genuinely byte-exact rather
+than throughput proxies.
+
+**4. O(1) direct-CAM memory.** Reads resolve by **address decode** (one gather), not an
+O(S) softmax scan over the heap KV — **S-independent**, and the *only* feasible form at
+Doom's per-lane ~262K-entry heap (an O(S) scan is a 64 GiB per-lane store that OOMs).
+~5.7% of the step, byte-exact vs an O(S) reference.
+
+**Result:** the **entire Doom op set is fp32 byte-exact with no fp64/fp128** — full
+64-bit MUL, `FixedMul`/`FixedDiv`, DIV/MOD at radix 4096, all ALU/CMP/shift/bitwise/memory
+— measured L∞=0 (`examples/clever_fp32_fullops.py`, `clever_honest_attn_realtime.py`). The
+precision "wall" was never Doom's; it was the whole-value encoding, and these four tricks
+remove it. (Caveat carried from §6: this is the clever *datapath* at a Doom step-count,
+batched — not the Doom *program*, which needs the runtime built.)
+
+## 8. Constraining the solver: precision + depth + width + KV together
 
 > `c4_min/qwen_fit_solver.py` (`FitConstraints` / `solve_opconfig`),
 > `docs/SOLVER_CONSTRAINTS.md`; `forwards_per_step` in `c4_min/forwards_per_step.py`.
@@ -357,7 +396,7 @@ ceiling forcing more depth).
 
 ---
 
-## 8. One-line summary
+## 9. One-line summary
 
 Replace stored arithmetic tables with a float's own precision + attention's own
 positional structure + one shared digit-extractor, and a **210,018-non-zero** 8-bit
