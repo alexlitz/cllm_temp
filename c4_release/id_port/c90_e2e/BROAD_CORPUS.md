@@ -56,17 +56,21 @@ are `gcc_skip` and excluded from the in-subset denominator.
 ```
 corpus total (attempted):        337
   gcc-rejected (excluded/skip):   23   (no valid oracle)
-  out-of-subset (by-design):      28   (B3 fnptr / B9 varargs / float / longlong)
-  IN-SUBSET (judged):            286
+  out-of-subset (by-design):      34   (B3 fnptr / B9 varargs / float / longlong)
+  IN-SUBSET (judged):            280
   ------------------------------------
-  IN-SUBSET PASS (pre-fix):      207/286 = 72.4%
+  IN-SUBSET PASS:                208/280 = 74.3%   (after the C10 do-while fix)
 ```
 
-The 117 hand cases are at 95.7% (they were authored to the transpiler's known
-surface); the broad c-testsuite portion drops the aggregate to ~72% because it
-exercises constructs the Doom-scoped transpiler never had to lower.  **That drop
-IS the finding** — the broad corpus surfaces the transpiler's real conformance
-gaps beyond the hand-tuned set.
+The 117 hand cases stay at 112/117 = 95.7% (they were authored to the
+transpiler's known surface, 0 regression); the broad c-testsuite portion drops
+the aggregate to ~74% because it exercises constructs the Doom-scoped transpiler
+never had to lower.  **That drop IS the finding** — the broad corpus surfaces the
+transpiler's real conformance gaps beyond the hand-tuned set.
+
+(Pre-fix baseline was 207/286 = 72.4%; the C10 unbraced-do-while fix added 2 and
+the runner now correctly buckets the hand fnptr/varargs cases as out-of-subset,
+so the denominator is 280.)
 
 See `BROAD_CORPUS_BUG_CLASSES.md` for the NEW bug classes (beyond B1..B9) the
 broad corpus exposes, minimal reproducers, and the prioritized fix list.

@@ -1,9 +1,9 @@
 {
-  "in_subset_total": 286,
-  "in_subset_pass": 207,
-  "in_subset_fail": 79,
-  "in_subset_pass_rate": 0.7237762237762237,
-  "out_of_subset_total": 28,
+  "in_subset_total": 280,
+  "in_subset_pass": 208,
+  "in_subset_fail": 72,
+  "in_subset_pass_rate": 0.7428571428571429,
+  "out_of_subset_total": 34,
   "gcc_skipped": 23,
   "corpus_total": 337,
   "results": [
@@ -997,7 +997,7 @@
     },
     {
       "suite": "hand",
-      "oos": null,
+      "oos": "B3_fnptr",
       "name": "fp_call",
       "category": "fnptr",
       "stage": "compile_error",
@@ -1011,7 +1011,7 @@
     },
     {
       "suite": "hand",
-      "oos": null,
+      "oos": "B3_fnptr",
       "name": "fp_apply",
       "category": "fnptr",
       "stage": "compile_error",
@@ -1025,7 +1025,7 @@
     },
     {
       "suite": "hand",
-      "oos": null,
+      "oos": "B3_fnptr",
       "name": "fp_table",
       "category": "fnptr",
       "stage": "compile_error",
@@ -1039,7 +1039,7 @@
     },
     {
       "suite": "hand",
-      "oos": null,
+      "oos": "B3_fnptr",
       "name": "fp_dispatch",
       "category": "fnptr",
       "stage": "compile_error",
@@ -1170,7 +1170,7 @@
     },
     {
       "suite": "hand",
-      "oos": null,
+      "oos": "B9_varargs",
       "name": "va_sum",
       "category": "varargs",
       "stage": "compile_error",
@@ -1184,7 +1184,7 @@
     },
     {
       "suite": "hand",
-      "oos": null,
+      "oos": "B9_varargs",
       "name": "va_printf",
       "category": "varargs",
       "stage": "PASS",
@@ -1629,14 +1629,13 @@
       "oos": null,
       "name": "cts_00008",
       "category": "loops",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: do at line 15",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint x;\n\n\t\n\n\tx = 50;\n\tdo \n\t\tx = x - 1;\n\twhile(x);\n\treturn x;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2275,7 +2274,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp29ziavp6/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp29ziavp6/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpsqqdb0oa/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpsqqdb0oa/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -2327,7 +2326,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpj1k2k9gq/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // line comment\n      | ^\n/tmp/tmpj1k2k9gq/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpi_yq87_2/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // line comment\n      | ^\n/tmp/tmpi_yq87_2/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -2876,14 +2875,13 @@
       "oos": null,
       "name": "cts_00101",
       "category": "loops",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: do at line 14",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint c;\n\n  \n  c = 0;\n  do\n    ;\n  while (0);\n  return c;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3283,7 +3281,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpzmqixi9e/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpzmqixi9e/case.c:8:4: error: C++ style comments are not allowed in ISO C90\n    8 |    // this is also a comment sayhello();\n      |    ^\n/tmp/tmpzmqixi9e/case.c:8:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpinfnqra_/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpinfnqra_/case.c:8:4: error: C++ style comments are not allowed in ISO C90\n    8 |    // this is also a comment sayhello();\n      |    ^\n/tmp/tmpinfnqra_/case.c:8:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3296,7 +3294,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpz0oc1u4w/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpz0oc1u4w/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp0u27dyv7/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp0u27dyv7/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3620,7 +3618,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpsprg7iew/case.c:15:1: error: C++ style comments are not allowed in ISO C90\n   15 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpsprg7iew/case.c:15:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpxl0kqs8p/case.c:15:1: error: C++ style comments are not allowed in ISO C90\n   15 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpxl0kqs8p/case.c:15:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3633,7 +3631,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpnp1lkxo4/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpnp1lkxo4/case.c:21:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpew9mukmf/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpew9mukmf/case.c:21:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3646,7 +3644,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpvmlphetg/case.c:29:1: error: C++ style comments are not allowed in ISO C90\n   29 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpvmlphetg/case.c:29:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpg5j_yy4h/case.c:29:1: error: C++ style comments are not allowed in ISO C90\n   29 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpg5j_yy4h/case.c:29:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3659,7 +3657,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpfl6vfkz8/case.c:35:1: error: C++ style comments are not allowed in ISO C90\n   35 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpfl6vfkz8/case.c:35:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp605qvv45/case.c:35:1: error: C++ style comments are not allowed in ISO C90\n   35 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp605qvv45/case.c:35:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3672,7 +3670,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp0cqawai0/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp0cqawai0/case.c:24:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpdfo2fqs7/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpdfo2fqs7/case.c:24:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3685,7 +3683,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpc1wz7r0d/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpc1wz7r0d/case.c:24:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpunhp1cwv/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpunhp1cwv/case.c:24:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3698,7 +3696,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpqrh4gy1k/case.c:5:17: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 undeclared here (not in a function)\n    5 | void foor(int x[restrict 5]);\n      |                 ^~~~~~~~\n/tmp/tmpqrh4gy1k/case.c:5:25: error: expected \u00e2\u0080\u0098]\u00e2\u0080\u0099 before numeric constant\n    5 | void foor(int x[restrict 5]);\n      |                         ^~\n      |                         ]\n/tmp/tmpqrh4gy1k/case.c:9:16: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 unde",
+      "detail": "gcc-compile: /tmp/tmpdoq8bkxi/case.c:5:17: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 undeclared here (not in a function)\n    5 | void foor(int x[restrict 5]);\n      |                 ^~~~~~~~\n/tmp/tmpdoq8bkxi/case.c:5:25: error: expected \u00e2\u0080\u0098]\u00e2\u0080\u0099 before numeric constant\n    5 | void foor(int x[restrict 5]);\n      |                         ^~\n      |                         ]\n/tmp/tmpdoq8bkxi/case.c:9:16: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 unde",
       "bug_class": ""
     },
     {
@@ -3711,7 +3709,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmppm6w_ewp/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmppm6w_ewp/case.c:40:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp8aj62tsg/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp8aj62tsg/case.c:40:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3724,7 +3722,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpcf28_v3f/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpcf28_v3f/case.c:40:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp625_prnh/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp625_prnh/case.c:40:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3737,7 +3735,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpxalznsn_/case.c:14:1: error: C++ style comments are not allowed in ISO C90\n   14 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpxalznsn_/case.c:14:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmppuz232i9/case.c:14:1: error: C++ style comments are not allowed in ISO C90\n   14 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmppuz232i9/case.c:14:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3750,7 +3748,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpksajfi9y/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpksajfi9y/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp4_49du4b/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp4_49du4b/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3763,7 +3761,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpvf4wecy4/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpvf4wecy4/case.c:21:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpqbwx8i1s/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpqbwx8i1s/case.c:21:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3856,7 +3854,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp35f48_rp/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp35f48_rp/case.c:6:4: error: C++ style comments are not allowed in ISO C90\n    6 |    // variables\n      |    ^\n/tmp/tmp35f48_rp/case.c:6:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpfrhcfvqo/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpfrhcfvqo/case.c:6:4: error: C++ style comments are not allowed in ISO C90\n    6 |    // variables\n      |    ^\n/tmp/tmpfrhcfvqo/case.c:6:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3883,7 +3881,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp6jbz18so/case.c:5:1: error: C++ style comments are not allowed in ISO C90\n    5 | //Swap integer values by array indexes\n      | ^\n/tmp/tmp6jbz18so/case.c:5:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp6u_u53q4/case.c:5:1: error: C++ style comments are not allowed in ISO C90\n    5 | //Swap integer values by array indexes\n      | ^\n/tmp/tmp6u_u53q4/case.c:5:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4265,7 +4263,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpg7rtc8ng/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // This program is designed to test some arm64-specific things, such as the\n      | ^\n/tmp/tmpg7rtc8ng/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpr1lxat6u/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // This program is designed to test some arm64-specific things, such as the\n      | ^\n/tmp/tmpr1lxat6u/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4320,7 +4318,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp_bggmk__/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp_bggmk__/case.c:21:4: error: C++ style comments are not allowed in ISO C90\n   21 |    //printf (\"tcc has %s %s\\n\", s, q.data);\n      |    ^\n/tmp/tmp_bggmk__/case.c:21:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpmp0v6ogv/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpmp0v6ogv/case.c:21:4: error: C++ style comments are not allowed in ISO C90\n   21 |    //printf (\"tcc has %s %s\\n\", s, q.data);\n      |    ^\n/tmp/tmpmp0v6ogv/case.c:21:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4361,7 +4359,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp7advw81j/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp7advw81j/case.c:11:1: error: C++ style comments are not allowed in ISO C90\n   11 | //    printf(\"n+1 = %d\\n\", 0xe+1);\n      | ^\n/tmp/tmp7advw81j/case.c:11:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp8n50hwpx/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp8n50hwpx/case.c:11:1: error: C++ style comments are not allowed in ISO C90\n   11 | //    printf(\"n+1 = %d\\n\", 0xe+1);\n      | ^\n/tmp/tmp8n50hwpx/case.c:11:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4430,7 +4428,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp5k6tx_sc/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp5k6tx_sc/case.c:277:3: error: C++ style comments are not allowed in ISO C90\n  277 |   //printf(\"q: %s\\n\", q);\n      |   ^\n/tmp/tmp5k6tx_sc/case.c:277:3: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp9fyquhw5/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp9fyquhw5/case.c:277:3: error: C++ style comments are not allowed in ISO C90\n  277 |   //printf(\"q: %s\\n\", q);\n      |   ^\n/tmp/tmp9fyquhw5/case.c:277:3: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4485,7 +4483,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp3xpjqc_h/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // this file contains BMP chars encoded in UTF-8\n      | ^\n/tmp/tmp3xpjqc_h/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpf5d_k_zo/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // this file contains BMP chars encoded in UTF-8\n      | ^\n/tmp/tmpf5d_k_zo/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     }
   ]
