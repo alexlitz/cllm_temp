@@ -21,12 +21,19 @@ enum` + `int`/`char`; EVERYTHING else (`for`, `do`, `switch`, `goto`, `break`,
 | out-of-subset (B3 fnptr / B9 varargs / float / long-long, by design) | 34 |
 | **IN-SUBSET judged** | **280** |
 | IN-SUBSET PASS (pre-fix) | 207/286 (72.4%) |
-| **IN-SUBSET PASS (after C10 do-while fix)** | **208/280 (74.3%)** |
+| IN-SUBSET PASS (after C10 do-while fix) | 208/280 (74.3%) |
+| IN-SUBSET PASS (measured baseline, task #880 STORAGE) | 210/282 (74.5%) |
+| **IN-SUBSET PASS (after C11 preproc-cond + C16 designated-init fixes)** | **220/282 (78.0%)** |
 
-The 117 hand cases stay at 112/117 = 95.7% (0 regression).  The ~74% aggregate is
-the c-testsuite portion pulling the transpiler onto un-lowered constructs.
-(The out-of-subset bucket grew 28->34 once the runner correctly classified the
-hand corpus's own fnptr/varargs cases as by-design boundary.)
+The 117 hand cases stay at 113/113 in-subset = 100% (0 regression).  The ~78%
+aggregate is the c-testsuite portion pulling the transpiler onto un-lowered
+constructs.  (The out-of-subset bucket grew 28->34 once the runner correctly
+classified the hand corpus's own fnptr/varargs cases as by-design boundary.)
+
+STORAGE cluster (task #880): 8 of the 9 in-subset storage failures fixed
+(+10 overall — the C11 preprocessor evaluator also fixed cts_00071/cts_00188 in
+other categories).  Doom linked transpiled output BYTE-IDENTICAL (0 regression).
+Remaining storage fail = cts_00201 (function-like macro token-paste, C12/OOB).
 
 ## NEW classes (C10..C21) — minimal reproducers + priority
 
@@ -110,25 +117,38 @@ int main(){ char a[10]; strcpy(a,"hi"); return a[0]; }       /* port CERR 'Undef
 Fix path: add C4 stdlib implementations (they are trivial byte loops) OR a
 transpiler shim.  Affects: `cts_00040 cts_00179 cts_00180 cts_00186`.
 
-### C11 — preprocessor conditionals (`#if/#elif/#ifdef/#ifndef`)   **P2/OOB**
-The transpiler does NOT run a full C preprocessor; `#if 0/#elif 1` branches and
-`#ifdef FOO` gating are not evaluated, so guarded decls vanish -> `Undefined: x`.
-The Doom port feeds ALREADY-PREPROCESSED source, so this is out-of-subset for the
-source-flattener, but the c-testsuite ships raw sources.
+### C11 — preprocessor conditionals (`#if/#elif/#ifdef/#ifndef`)  ✅ FIXED
+`#if 0/#elif 1` branches and `#ifdef FOO` gating were not evaluated: guarded
+decls either LEAKED their raw body (`XXX` -> c4 SyntaxError) or the false branch
+was kept unconditionally (`strip_if_zero_blocks` only special-cased literal
+`#if 0`).  **FIXED** (c4_doom `transpile.py` `eval_pp_conditionals`): a
+top-to-bottom preprocessor-conditional evaluator tracks the live `#define`/
+`#undef` table AS IT SCANS (a `#define` can gate a LATER `#ifdef`), evaluates
+`#if`/`#elif` constant-expressions (`defined()` + macro substitution + the C
+arithmetic/boolean operator subset; undefined identifier -> 0), and drops
+dead-branch bodies.  Runs BEFORE object-like macro inlining so `#if X` sees the
+raw macro.  Unevaluable `#if`/`#elif` default TRUE (keep body) -> a real-Doom
+platform guard is never silently dropped; the Doom linked output is BYTE-IDENTICAL.
 ```c
 #if 0
 X
 #elif 1
 int x = 0;
 #endif
-int main(){ return x; }                                       /* port CERR 'Undefined: x' */
+int main(){ return x; }                                       /* gcc 0, port now 0 */
 ```
-Affects: `cts_00062 cts_00063 cts_00068 cts_00069 cts_00070 cts_00071 cts_00074`.
+Affects: `cts_00062 cts_00063 cts_00068 cts_00069 cts_00070 cts_00074` (+ cross-
+category `cts_00071 cts_00188`).  All now PASS.
 
 ### C12 — function-like macros (`#define ADD(X,Y) ...`)   **P2/OOB**
-Object-like `#define` is handled; function-like macros are not expanded, so
-`ADD(1,2)` becomes a call to an undefined function.  Same preprocessor boundary
-as C11.
+Object-like `#define` is handled; MULTI-arg function-like macros (and `##`
+token-paste) are not expanded, so `ADD(1,2)` becomes a call to an undefined
+function.  (`header_macros` DOES expand Doom's SINGLE-arg function-like macros —
+SHORT/LONG/MTOF — so those work.)  `cts_00201` needs 2-arg macros + `##`
+token-paste (`#define CAT2(a,b) a##b`): this is the macro-EXPANSION path (NOT
+storage/init), and extending `header_macros._expand_fnlike` risks the byte-exact
+Doom build, so it is OUT-OF-SUBSET for the STORAGE cluster (task #880) — deferred
+to the preprocessor owner.
 ```c
 #define ADD(X,Y) (X+Y)
 int main(){ return ADD(1,2)-3; }                              /* port CERR 'Undefined function: ADD' */
@@ -141,15 +161,23 @@ imply 64-bit width (the c4 word IS 64-bit, so it would diverge from gcc -m32's
 32-bit int anyway).  Borderline out-of-subset.
 Affects: `cts_00104 cts_00214`.
 
-### C16 — C99 designated inits / compound literals / C11 anon members   **OOB**
-`struct S s = {.b=2,.a=1};`, `arr[2]={[1]={3,4},[0]={1,2}}`, the compound
-literal `&(struct S){1,2}`, and C11 ANONYMOUS (nameless) struct/union members
-(`struct S2 { int a; union { int c; int d; }; };`) are all **C99/C11**, NOT C90;
-gcc -std=c90 accepts them as extensions (with -w) but they are out of the stated
-C90 subset.  Document, don't fix.
-Affects (struct cluster): `cts_00048 cts_00049 cts_00148` (designated init) ·
-`cts_00149 cts_00150` (compound literal + designated init) · `cts_00046 cts_00050`
-(C11 anonymous members).
+### C16 — C99 designated initializers (`.field=` / `[i]=`)
+The 1-D ARRAY designated form `int a[]={5,[2]=2,3}` / `int arr[3]={[2]=2,[0]=0,
+[1]=1}` is now LOWERED ✅ (c4_doom `transpile.py` `_resolve_designated_1d`, #880
+storage cluster): `[idx]=val` designators resolve to explicit (index,value)
+pairs (a designator sets the running position to idx; a later plain element
+lands at idx+1; holes default 0; `[]` size = max-index+1).  gcc -std=c90 accepts
+these as an extension and the c-testsuite ships them, so the harness judges them
+in-subset.  Affects (fixed): `cts_00092 cts_00147`.
+
+The STRUCT designated form `struct S s={.b=2,.a=1}`, NESTED array-of-struct
+`arr[2]={[1]={3,4},[0]={1,2}}`, the compound literal `&(struct S){1,2}`, and C11
+ANONYMOUS (nameless) struct/union members (`struct S2 { int a; union { int c;
+int d; }; };`) remain **OOB** — all C99/C11, NOT C90; gcc -std=c90 accepts them
+as extensions (with -w) but they are out of the stated C90 subset.  Document,
+don't fix.  Affects (struct cluster): `cts_00048 cts_00049 cts_00148` (struct
+designated init) · `cts_00149 cts_00150` (compound literal + designated init) ·
+`cts_00046 cts_00050` (C11 anonymous members).
 
 ### C21 — bit-fields (`int f : N;`) + preproc member-rename   **OOB**
 `enum tree_code code : 8;` / `unsigned flag : 1;` bit-fields have no representation
