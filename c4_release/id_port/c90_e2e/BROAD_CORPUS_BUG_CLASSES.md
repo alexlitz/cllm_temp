@@ -22,18 +22,57 @@ enum` + `int`/`char`; EVERYTHING else (`for`, `do`, `switch`, `goto`, `break`,
 | **IN-SUBSET judged** | **280** |
 | IN-SUBSET PASS (pre-fix) | 207/286 (72.4%) |
 | IN-SUBSET PASS (after C10 do-while fix) | 208/280 (74.3%) |
-| IN-SUBSET PASS (measured baseline, task #880 STORAGE) | 210/282 (74.5%) |
-| **IN-SUBSET PASS (after C11 preproc-cond + C16 designated-init fixes)** | **220/282 (78.0%)** |
+| IN-SUBSET PASS (measured baseline, task #880 clusters) | 210/282 (74.5%) |
+| IN-SUBSET PASS (STORAGE cluster alone: C11 preproc-cond + C16 1-D designated) | 220/282 (78.0%) |
+| IN-SUBSET PASS (STRUCT cluster alone: C15/C17) | 222/282 (78.7%) |
+| IN-SUBSET PASS (MISC+goto cluster alone: C19 + decl splits) | 215/282 (76.2%) |
+| IN-SUBSET PASS (libc cluster alone: corpus-scoped C90 libc) | 213/282 (75.5%) |
+| **IN-SUBSET PASS (all clusters MERGED — task-c90-merge-880)** | *(measured by the merged re-run; see MERGED_CONFORMANCE below)* |
 
-The 117 hand cases stay at 113/113 in-subset = 100% (0 regression).  The ~78%
-aggregate is the c-testsuite portion pulling the transpiler onto un-lowered
-constructs.  (The out-of-subset bucket grew 28->34 once the runner correctly
-classified the hand corpus's own fnptr/varargs cases as by-design boundary.)
+The four #880 clusters each landed on their own branch off the same ~210/282
+baseline, so their individual deltas overlap in the denominator; the MERGED
+figure below is the authoritative post-consolidation number.  The 117 hand cases
+stay at 100% in-subset (now 122 with the goto/decl regression cases, 118/118
+PASS, 0 regression across all clusters).  The aggregate is the c-testsuite
+portion pulling the transpiler onto un-lowered constructs.  (The out-of-subset
+bucket grew 28->34 once the runner correctly classified the hand corpus's own
+fnptr/varargs cases as by-design boundary.)
 
-STORAGE cluster (task #880): 8 of the 9 in-subset storage failures fixed
-(+10 overall — the C11 preprocessor evaluator also fixed cts_00071/cts_00188 in
-other categories).  Doom linked transpiled output BYTE-IDENTICAL (0 regression).
-Remaining storage fail = cts_00201 (function-like macro token-paste, C12/OOB).
+Per-cluster contributions (all measured, 0 regression each):
+* **STORAGE** — 8 of 9 in-subset storage failures fixed (+10; the C11
+  preprocessor `#if/#elif` evaluator also fixed cts_00071/cts_00188 elsewhere).
+  Remaining storage fail = cts_00201 (function-like macro token-paste, C12/OOB).
+* **STRUCT** — C15 global struct-value init + C17 anon-inline aggregates (+12);
+  also corrected a latent doom struct-value bug (cheatseq_t/event_t/menu_t).
+* **MISC+goto** — C19 goto edge forms + tentative/mixed declarators (+5); goto
+  category now 7/7.
+* **libc** — corpus-scoped C90 str*/stdlib/stdio (+3); NOT linked into doom.
+Doom transpiled output BYTE-IDENTICAL under every cluster (only the benign,
+provably-identical goto guard-split + the struct-value *correctness* fix differ).
+
+### task #880 delta (MISC cluster + C19 goto edge forms) — measured
+
++5 in-subset (210 -> 215), 0 regression (case-by-case JSON diff of the full 337
+corpus: every previously-PASS case still PASSes; only the 5 target cases flipped
+compile_error/MISMATCH -> PASS).  The `goto` category is now 7/7 (0 fail).  Fixed
+in `c4_doom/id_port/transpile.py`:
+
+* **C19 goto edge forms (3)** — `cts_00010` (dead + consecutive labels
+  `start:`/`next: foo:` that are not goto targets), `cts_00199` (a `goto` inside
+  a bare `{ }` block did not skip the rest of THAT block), `cts_00207` f1 (a
+  label that is the immediate body of an unbraced `if(0) label: stmt` was not
+  recognised and would orphan the header / wrongly fall through).
+* **MISC declaration edge forms (2)** — `cts_00096` (`int x, x=3, x;` tentative
+  redeclarations collapse to one decl + deferred init), `cts_00121`
+  (`int f(int a), g(int a), a;` mixed prototype/variable decl drops the
+  prototypes, keeps `int a;`).
+
+Doom no-regression: the goto byte-exact suite (`verify_goto.py`) is 6/6 with
+IDENTICAL shas; the whole-Doom transpile is byte-identical except a benign
+goto-guard split in the 4 goto modules (f_finale/p_enemy/p_map/r_bsp), where a
+rewritten-goto block `{ st=K; jmp=1; }` now guards each assignment
+(`{ if(jmp==0){st=K;} if(jmp==0){jmp=1;} }`) — semantically identical since jmp==0
+on block entry, and the 6/6 runtime byte-exact suite confirms it.
 
 ## NEW classes (C10..C21) — minimal reproducers + priority
 
@@ -94,18 +133,32 @@ Also FIXED alongside the struct cluster: `fold_float_literals` no longer eats
 the member dots of a struct chain (`s2.s1.x` tokenised as `2.`/`1.` and lost its
 dots -> `s2s1x`); forward struct declarations `struct TAG;` are erased.
 
-### C19 — goto-label lowering edge forms   **P1**
-The goto->state-machine rewrite leaves some labels in the output (`start:`,
-`foo:`) that the c4 front-end (no labels) rejects, and one case (`cts_00199`)
-takes a wrong fallthrough after a `goto`.  The label-lift misses labels that are
-immediately targets / at function tail / consecutive.
+### C19 — goto-label lowering edge forms  ✅ FIXED (task #880)
+The goto->state-machine rewrite left some labels in the output (`start:`,
+`foo:`) that the c4 front-end (no labels) rejects, one case (`cts_00199`) took a
+wrong fallthrough after a `goto`, and one (`cts_00207` f1) had a label as an
+unbraced-`if` branch body.
 ```c
 int main(){ start: goto next; return 1; success: return 0;
-            next: foo: goto success; return 1; }             /* gcc 0, port CERR 'Undefined: start' */
+            next: foo: goto success; return 1; }             /* gcc 0, was CERR 'Undefined: start' */
 ```
-Fix path: harden `_lift_one_label` / `rewrite_gotos` for tail + consecutive
-labels; audit the fallthrough guard.  HIGH regression risk (goto ×4 hand cases
-pass) — test carefully.  Affects: `cts_00010 cts_00199 cts_00207`.
+**FIXED** (`c4_doom/id_port/transpile.py`), three independent root causes:
+1. `_strip_dead_labels` — erase any `LABEL:` that no `goto` targets (dead /
+   consecutive labels `start:`, `next: foo:`); a shared lookbehind
+   `_LABEL_DEF_RE` recognises labels after `)` (unbraced branch) and after `:`
+   (consecutive).  Fixes `cts_00010`.
+2. `_guard_stmt_recursive` bare-`{}`-block case — a `goto` inside a bare block
+   now skips the rest of THAT block (was: only the segment's top level guarded).
+   Fixes `cts_00199`.
+3. `_brace_labelled_branches` — a label that is the immediate body of an unbraced
+   `if/while/for` (`if(0) label: stmt`) is braced so the existing nested-label
+   lift produces the correct conditional-body semantics.  Fixes `cts_00207` f1.
+
+HIGH regression risk was real (goto is byte-exact in Doom).  Verified: 4 hand
+goto + 3 new C19 regression cases (`gt_dead_and_consecutive_labels`,
+`gt_into_block_skip_rest`, `gt_label_in_if_branch`) PASS, and the Doom goto
+byte-exact suite (`verify_goto.py`) is 6/6 with IDENTICAL shas.  Was:
+`cts_00010 cts_00199 cts_00207`.
 
 ### C18 — missing libc functions   **P2**
 `calloc`, `strcpy`, `strncpy`, `strcmp`, `sprintf` are not in the c4 stdlib, so
@@ -194,6 +247,29 @@ implicit-flattening residual, not a clean struct-lowering bug.
 Wide literals are out-of-subset (the c4 VM is byte-oriented).
 Affects: `cts_00098`.
 
+### C21 — MISC cluster (assorted declaration / preprocessor / literal)  (task #880)
+The `misc` category's in-subset failures resolve into TWO genuine transpiler bugs
+(now FIXED) and SIX out-of-subset (preprocessor / wide-char) cases (documented,
+NOT fixed — they need a real C preprocessor or a wide-char VM, both out of the
+stated C90-subset / Doom-source-flattener boundary).
+
+* ✅ **`cts_00096` — repeated-name tentative global** `int x, x = 3, x;`.  Legal
+  C90 tentative definitions; the c4 front-end rejects the redeclaration.  FIXED:
+  `split_multi_declarator_globals` now collapses repeated declarator names to one
+  `int x;` + a deferred `x = 3;` init.  Narrow: the distinct-name-with-init form
+  (`int a=1, b=2;`) keeps the original verbatim behaviour, so whole-Doom transpile
+  stays byte-identical (am_map static-local hoist unchanged).
+* ✅ **`cts_00121` — mixed prototype + variable global decl**
+  `int f(int a), g(int a), a;`.  FIXED: `split_mixed_global_prototype_decls` drops
+  the prototype declarators (c4 needs no forward decls; `reorder_functions` orders
+  the definitions) and keeps the variable as `int a;`.
+* **`cts_00065 cts_00066 cts_00122` — function-like macros** (`#define ADD(X,Y)`,
+  empty-arg `F(,1)`).  **OOB (C12)** — needs a real preprocessor.
+* **`cts_00141` — `##` token-paste macro**.  **OOB (C12)**.
+* **`cts_00071` — `#undef` + `#ifdef` gating**.  **OOB (C11)**.
+* **`cts_00098` — `L'\0'` wide-char literal**.  **OOB (C14)** — the c4 VM is
+  byte-oriented.
+
 ### C20 — semantic MISMATCHes (not CERR)
 * `cts_00184` — `printf("%d", sizeof(char))` prints `8` (c4 word) vs `1` (x86).
   This is the documented **sizeof-gap**, a false-fail; the loader should tag it
@@ -202,22 +278,35 @@ Affects: `cts_00098`.
 * `cts_00171` — `NULL` in a printed string context renders `0`; a `#define NULL`
   / string-literal detail (P2, preprocessor-adjacent).
 * `cts_00206` — uses `signal`/`abort` (SIGABRT exit 12); libc signal, **OOB**.
-* `cts_00199 cts_00215` — genuine goto/switch fallthrough lowering divergences
-  (see C19 / switch); **P1**.
+* `cts_00199` — ✅ FIXED (task #880, see C19: goto inside a bare block now skips
+  the rest of that block).  `cts_00215` — genuine switch fallthrough lowering
+  divergence (see switch); **P1**.
 
 ## Prioritized remaining list (for follow-up agents, one class each)
 
+<<<<<<< HEAD
 1. **C15 global struct-value init** — ✅ FIXED (#880).
 2. **C17 anonymous-inline local/global struct/union** — ✅ FIXED (#880).
 3. **C19 goto-label edge forms** (P1, ~3 cases) — harden label-lift for tail/
    consecutive labels + the fallthrough guard; HIGH regression risk.
+=======
+1. **C15 global struct-value init** (P1, ~6 cases) — extend B2/B6 to file-scope
+   struct-value decls.
+2. **C17 anonymous-inline local struct/union** (P1, ~4 cases) — synthesize an
+   offset table for the tagless inline aggregate.
+3. ~~**C19 goto-label edge forms**~~ ✅ FIXED (task #880) — dead/consecutive
+   labels, goto-in-bare-block, label-as-unbraced-if-branch; Doom goto byte-exact
+   6/6 unchanged.
+>>>>>>> task880-misc-goto-rel
 4. **C18 missing libc** (P2, ~4 cases) — add `str*`/`calloc`/`sprintf` to the c4
    stdlib.
 5. **C11/C12 preprocessor** (P2/OOB, ~13 cases) — a real `#if`/`#elif`/function-
    macro pass, OR reclassify as out-of-subset (Doom feeds preprocessed source).
 6. **C13/C14/C16/C20-signal** — out-of-subset; document as the honest boundary.
 
-The clean P0 (do-while) is fixed; everything else in-subset is P1 (multi-part
-struct/goto lowering) or P2 (preprocessor/libc).  The honest out-of-subset
-boundary is: function pointers (B3), user varargs (B9), float/double, long-long,
-wide chars, C99 designated inits, signal/setjmp libc, and a full C preprocessor.
+The clean P0 (do-while) and P1-goto (C19) are fixed, plus the two clean MISC
+declaration bugs (C21: `cts_00096` tentative-redecl, `cts_00121` mixed
+prototype/var).  Everything else in-subset is P1 (multi-part struct lowering) or
+P2 (preprocessor/libc).  The honest out-of-subset boundary is unchanged: function
+pointers (B3), user varargs (B9), float/double, long-long, wide chars, C99
+designated inits, signal/setjmp libc, and a full C preprocessor.
