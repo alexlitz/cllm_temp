@@ -1,14 +1,14 @@
 {
   "summary": {
-    "pass": 89,
+    "pass": 91,
     "mismatch": 7,
     "compileE": 19,
     "sizeof": 0,
     "transpE": 0,
     "vmE": 0
   },
-  "pass_rate": 0.7739130434782608,
-  "total": 115,
+  "pass_rate": 0.7777777777777778,
+  "total": 117,
   "results": [
     {
       "name": "md_2d_local",
@@ -86,6 +86,17 @@
       "gcc_exit": 5,
       "gcc_stdout": "",
       "port_exit": 5,
+      "port_stdout": "",
+      "detail": "",
+      "bug_class": ""
+    },
+    {
+      "name": "md_manual_stride",
+      "category": "multidim",
+      "stage": "PASS",
+      "gcc_exit": 3,
+      "gcc_stdout": "",
+      "port_exit": 3,
       "port_stdout": "",
       "detail": "",
       "bug_class": ""
@@ -891,6 +902,17 @@
       "detail": "SyntaxError: Bad identifier: inc",
       "bug_class": "",
       "transpiled": "int inc(int x){return x+1;}\n\nint dec(int x){return x-1;}\n\nint c4_static_init()\n{\n\n}\n\nint main(){\nint op;\nint r;\n\n   op=inc; r=op(5); op=dec; r=op(r); return r; }\n"
+    },
+    {
+      "name": "un_local_anon",
+      "category": "union",
+      "stage": "PASS",
+      "gcc_exit": 68,
+      "gcc_stdout": "",
+      "port_exit": 68,
+      "port_stdout": "",
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "un_int_char",

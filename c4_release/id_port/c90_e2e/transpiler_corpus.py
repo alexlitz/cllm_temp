@@ -57,6 +57,9 @@ CORPUS = [
     ("md_2d_transpose", "multidim",
      "int main(){ int a[2][3]; int b[3][2]; int i; int j; for(i=0;i<2;i++) for(j=0;j<3;j++) a[i][j]=i*3+j; for(i=0;i<2;i++) for(j=0;j<3;j++) b[j][i]=a[i][j]; return b[2][1]; }",
      5, False),
+    ("md_manual_stride", "multidim",       # DOOM idiom: malloc + explicit i*W+j -- SHOULD pass
+     "int main(){ int *m; int i; int j; m=malloc(9*8); for(i=0;i<3;i++) for(j=0;j<3;j++) m[i*3+j]=(i==j)?1:0; return m[0]+m[4]+m[8]; }",
+     3, False),
 
     # =====================================================================
     # pointer arithmetic / pointer-to-pointer  (Class-1/3 stride)
@@ -265,9 +268,11 @@ CORPUS = [
      "int inc(int x){return x+1;} int dec(int x){return x-1;} int main(){ int (*op)(int); int r; op=inc; r=op(5); op=dec; r=op(r); return r; }", 5, False),
 
     # =====================================================================
-    # unions
+    # unions  (transpiler supports only the DOOM LOCAL-ANONYMOUS idiom)
     # =====================================================================
-    ("un_int_char", "union",
+    ("un_local_anon", "union",             # DOOM w_wad idiom: SHOULD pass
+     "int main(){ union {char s[8]; int x[2];} u; u.x[0]=0x41424344; return u.s[0]&0xFF; }", 0x44, False),
+    ("un_int_char", "union",               # tagged union: limitation probe
      "union U{int i; char c[4];}; int main(){ union U u; u.i=0x41424344; return u.c[0]&0xFF; }", 0x44, False),
     ("un_reuse", "union",
      "union U{int a; int b;}; int main(){ union U u; u.a=100; return u.b; }", 100, False),
