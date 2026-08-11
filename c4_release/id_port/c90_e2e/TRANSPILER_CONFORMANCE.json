@@ -1,13 +1,13 @@
 {
   "summary": {
-    "pass": 91,
-    "mismatch": 7,
-    "compileE": 19,
-    "sizeof": 0,
+    "pass": 111,
+    "sizeof": 1,
+    "compileE": 5,
+    "mismatch": 0,
     "transpE": 0,
     "vmE": 0
   },
-  "pass_rate": 0.7777777777777778,
+  "pass_rate": 0.9572649572649573,
   "total": 117,
   "results": [
     {
@@ -24,38 +24,35 @@
     {
       "name": "md_2d_sum",
       "category": "multidim",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 10,
       "gcc_stdout": "",
-      "port_exit": 14,
+      "port_exit": 10,
       "port_stdout": "",
-      "detail": "exit gcc=10 port=14",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){\nint *a;\nint s;\n\n    a = malloc((2) * sizeof(int));\n\n   a[0][0]=1; a[0][1]=2; a[1][0]=3; a[1][1]=4; s=a[0][0]+a[0][1]+a[1][0]+a[1][1]; return s; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "md_3d",
       "category": "multidim",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 43,
       "gcc_stdout": "",
-      "port_exit": 0,
+      "port_exit": 43,
       "port_stdout": "",
-      "detail": "exit gcc=43 port=0",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){\nint *a;\n\n    a = malloc((2) * sizeof(int));\n\n  a[1][1][1]=42; a[0][0][0]=1; return a[1][1][1]+a[0][0][0]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "md_row_major",
       "category": "multidim",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 3,
       "gcc_stdout": "",
-      "port_exit": 1,
+      "port_exit": 3,
       "port_stdout": "",
-      "detail": "exit gcc=3 port=1",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){\nint *m;\nint i;\nint j;\n\n    m = malloc((3) * sizeof(int));\n\n    i=0;\n    while (i<3) {\nj=0;\n    while (j<3) {\nm[i][j]=(i==j)?1:0;\n    j++;\n    }\n    i++;\n    } return m[0][0]+m[1][1]+m[2][2]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "md_global_2d",
@@ -269,50 +266,46 @@
     {
       "name": "st_tag_local",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 7,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 7,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct P{int x; int y;}; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ struct P p; p[0]=3; p[1]=4; return p[0]+p[1]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "st_tag_ptr",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 30,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 30,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct P{int x; int y;}; \n\nint c4_static_init()\n{\n\n}\n\nint main(){\nint *q;\n\n struct P p;  p[0]=10; q=&p; q[1]=20; return p[0]+p[1]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "st_typedef_local",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 7,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 7,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: P at line 6",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){ P p; p.x=3; p.y=4; return p.x+p.y; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "st_sizeof",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 8,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 16,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct P{int x; int y;}; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ return (2 * sizeof(int)); }\n"
+      "detail": "sizeof gap: gcc(m32)=8 port(word8)=16 (EXPECTED)",
+      "bug_class": "c4_x86_sizeof_gap"
     },
     {
       "name": "ca_plus",
@@ -438,14 +431,13 @@
     {
       "name": "ca_on_field",
       "category": "compound",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 30,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 30,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct S{int x;}; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ struct S s; s[0]=5; s[0] = (s[0]) + (10); s[0] = (s[0]) * (2); return s[0]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "ca_on_deref",
@@ -692,14 +684,13 @@
     {
       "name": "sw_no_break_default",
       "category": "switch",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 30,
       "gcc_stdout": "",
-      "port_exit": 10,
+      "port_exit": 30,
       "port_stdout": "",
-      "detail": "exit gcc=30 port=10",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){\nint x;\nint r;\nint __swv1;\nint __swm1;\nint __swb1;\n\n   x=5; r=0; \n  \n{ __swv1 = (x); __swm1 = 0; __swb1 = 0;\nif ((__swb1 == 0) && (__swm1 || __swv1 == (1))) { __swm1 = 1;  r=1; __swb1 = 1; }\nif ((__swb1 == 0) && (__swm1 || __swv1 == (6))) { __swm1 = 1;  r = (r) + (20);  }\nif (__swb1 == 0 && __swm1 == 0) {  r = (r) + (10); }\n}\n return r; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "sw_in_loop",
@@ -917,50 +908,46 @@
     {
       "name": "un_int_char",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 68,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 68,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "union U{int i; char c[4];}; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ union U u; u.i=0x41424344; return u.c[0]&0xFF; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "un_reuse",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 100,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 100,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "union U{int a; int b;}; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ union U u; u.a=100; return u.b; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "un_in_struct",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 77,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 77,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct S{ int tag; char *val; val = malloc(4 + 8); }; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ struct S s; s[0]=1; s[1]=77; return s[1]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "un_two_view",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 4,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 4,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "union U{ int words[2]; char bytes[8]; }; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ union U u; u.words[0]=0x01020304; return u.bytes[0]&0xFF; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "en_basic",
@@ -976,14 +963,13 @@
     {
       "name": "en_explicit",
       "category": "enum",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 122,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 122,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: A at line 6",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){ return A+B+11+D; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "en_as_index",
@@ -999,14 +985,13 @@
     {
       "name": "en_in_switch",
       "category": "enum",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 42,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 42,
       "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 12 at line 6",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){ enum State s; s=1; \nif ((s) == (0)) {\n return 0;\n}\nelse if ((s) == (1)) {\n return 42;\n}\nelse if ((s) == (2)) {\n return 99; \n}\n return -1; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "va_sum",
@@ -1177,14 +1162,13 @@
     {
       "name": "sg_static_local",
       "category": "storage",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 3,
       "gcc_stdout": "",
-      "port_exit": 1,
+      "port_exit": 3,
       "port_stdout": "",
-      "detail": "exit gcc=3 port=1",
-      "bug_class": "",
-      "transpiled": "int counter(){\nint n;\n\n  n = 0; n++; return n; }\n\nint c4_static_init()\n{\n\n}\n\nint main(){ counter(); counter(); return counter(); }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "sg_static_arr",
@@ -1200,26 +1184,24 @@
     {
       "name": "sg_global_string",
       "category": "storage",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 89,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 89,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 20 at line 1",
-      "bug_class": "",
-      "transpiled": "char *msg = \"XYZ\"; \n\nint c4_static_init()\n{\n\n}\n\nint main(){ return msg[1]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "sg_multi_global",
       "category": "storage",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 123,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 123,
       "port_stdout": "",
-      "detail": "SyntaxError: Unexpected token: 11 at line 5",
-      "bug_class": "",
-      "transpiled": "int a;\n\nint c4_static_init()\n{\n    a = 1; int b=2; int c=3;\n}\n\nint main(){ c4_static_init(); return a*100+b*10+c; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "sg_char_arr_init",
@@ -1235,14 +1217,13 @@
     {
       "name": "sg_2d_global_init",
       "category": "storage",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 5,
       "gcc_stdout": "",
-      "port_exit": 0,
+      "port_exit": 5,
       "port_stdout": "",
-      "detail": "exit gcc=5 port=0",
-      "bug_class": "",
-      "transpiled": "int *m; \n\n// --- generated static initializers ---\n\nint m_init()\n{\n    m = malloc(((2) * (2)) * sizeof(int));\n    m[0] = 1;\n    m[1] = 2;\n    m[2] = 3;\n    m[3] = 4;\n}\n\nint c4_static_init()\n{\n    m_init();\n}\n\nint main(){ c4_static_init(); return m[1][0]+m[0][1]; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "pg_bubble_sort",
@@ -1258,26 +1239,24 @@
     {
       "name": "pg_matrix_mul",
       "category": "programs",
-      "stage": "MISMATCH",
+      "stage": "PASS",
       "gcc_exit": 50,
       "gcc_stdout": "",
-      "port_exit": 0,
+      "port_exit": 50,
       "port_stdout": "",
-      "detail": "exit gcc=50 port=0",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint main(){\nint *a;\nint *b;\nint *c;\nint i;\nint j;\nint k;\n\n    a = malloc((2) * sizeof(int));\n    b = malloc((2) * sizeof(int));\n    c = malloc((2) * sizeof(int));\n\n       a[0][0]=1;a[0][1]=2;a[1][0]=3;a[1][1]=4; b[0][0]=5;b[0][1]=6;b[1][0]=7;b[1][1]=8; i=0;\n    while (i<2) {\nj=0;\n    while (j<2) {\n c[i][j]=0; k=0;\n    while (k<2) {\nc[i][j] = (c[i][j]) + (a[i][k]*b[k][j]);\n    k++;\n    } \n    j++;\n    }\n    i++;\n    } return c[1][1]&0xFF; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "pg_linked_list",
       "category": "programs",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 30,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 30,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct Node{ int val; int next; }; struct Node pool[10]; \n\nint c4_static_init()\n{\n\n}\n\nint main(){\nint head;\nint i;\nint sum;\n\n    i=0;\n    while (i<5) {\n (pool + (i) * 2)[0]=(i+1)*2; (pool + (i) * 2)[1]=i+1; \n    i++;\n    } (pool + (4) * 2)[1]=-1; head=0; sum=0; while(head!=-1){ sum = (sum) + ((pool + (head) * 2)[0]); head=(pool + (head) * 2)[1]; } return sum; }\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "name": "pg_stack_machine",
