@@ -1110,6 +1110,13 @@ class Compiler:
                 self.emit(Op.SUB if is_inc else Op.ADD)
 
             elif self.peek() == TokenType.BRAK:
+                # Capture the token immediately before this `[` BEFORE consuming
+                # the index expression (self.pos still points at `[`). Used below
+                # to tell a compound index `a[i][j]` (prev == `]`) from a bare
+                # single index `arr[k]` (prev == identifier / `)`).
+                _prev_before_brak = (
+                    self.tokens[self.pos - 1][0] if self.pos >= 1 else None
+                )
                 self.advance()
                 self.emit(Op.PSH)
                 self.parse_expression(TokenType.ASSIGN)
@@ -1124,9 +1131,46 @@ class Compiler:
                         self.emit(Op.PSH)
                         self.emit(Op.IMM, elem_size)
                         self.emit(Op.MUL)
-                self.emit(Op.ADD)
-                self.expr_type = saved_type - PTR if saved_type >= PTR else saved_type
-                self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+                    self.emit(Op.ADD)
+                    self.expr_type = saved_type - PTR
+                    self.emit(Op.LI if self.expr_type != CHAR else Op.LC)
+                else:
+                    # Indexing a NON-pointer value `v[k]`.  In strict C this is a
+                    # type error (c4.c prints "pointer type expected" and exits),
+                    # but the flattened Doom port uses two distinct idioms that
+                    # both land here, and they want OPPOSITE strides:
+                    #
+                    #  (a) COMPOUND index `tbl[i][j]` where `tbl` is single-star
+                    #      `int*` (a flat table of block POINTERS stored as words).
+                    #      `tbl[i]` has type int (the pointer VALUE), and the inner
+                    #      `[j]` must scale by the WORD size (8) to read the int at
+                    #      `block + j*8`.  Byte-striding it was the dominant
+                    #      compound-index bug (dropped the ×8, needed a hand
+                    #      `((int*)tbl[i])[j]` cast at every render call site:
+                    #      R_GetColumn, R_DrawSprite ds[9]/ds[10], sprites[..][..]).
+                    #
+                    #  (b) SINGLE index `arr[k]` on a bare-`int` global that holds a
+                    #      malloc'd base pointer (`int players; players=malloc(...)`;
+                    #      likewise playeringame/wminfo/... ).  The port already
+                    #      encodes these subscripts in the units the surrounding
+                    #      code expects (byte offsets — `players[i*74+field]`), so
+                    #      this MUST retain the historical stride-1 (byte) lowering;
+                    #      word-scaling it corrupts the whole player/game state.
+                    #
+                    # Discriminate structurally: a compound index (a) has a `]`
+                    # immediately before this `[` (the outer subscript just
+                    # closed); a bare-array index (b) has an identifier / `)`
+                    # there.  Only (a) gets the ×8 word scale.  Genuine char
+                    # blocks (e.g. `myargv` holding `char*`) use an explicit
+                    # `(char*)` cast at the site so they take the byte-stride
+                    # pointer branch above.
+                    if _prev_before_brak == TokenType.RBRACKET:
+                        self.emit(Op.PSH)
+                        self.emit(Op.IMM, 8)
+                        self.emit(Op.MUL)
+                    self.emit(Op.ADD)
+                    self.expr_type = INT
+                    self.emit(Op.LI)
 
             else:
                 break
