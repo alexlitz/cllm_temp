@@ -183,6 +183,10 @@ CORPUS = [
      "int main(){ int i; int s; i=0; s=0; do{ s+=i; i++; }while(i<5); return s; }", 10, False),
     ("lp_do_while_break", "loops",
      "int main(){ int i; int s; i=0; s=0; do{ if(i==3) break; s+=i; i++; }while(i<100); return s; }", 3, False),
+    ("lp_do_while_unbraced", "loops",       # C10: unbraced single-statement do-while
+     "int main(){ int x; x=50; do x=x-1; while(x); return x; }", 0, False),
+    ("lp_do_while_unbraced_nested", "loops",# C10: nested unbraced do-while
+     "int main(){ int i; int j; int c; i=0; c=0; do { j=0; do c++; while(++j<3); } while(++i<2); return c; }", 6, False),
     ("lp_nested_break", "loops",
      "int main(){ int i; int j; int c; c=0; for(i=0;i<5;i++){ for(j=0;j<5;j++){ if(j==2) break; c++; } } return c; }", 10, False),
     ("lp_nested_continue", "loops",
