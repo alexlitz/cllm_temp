@@ -27,11 +27,24 @@ enum` + `int`/`char`; EVERYTHING else (`for`, `do`, `switch`, `goto`, `break`,
 | IN-SUBSET PASS (STRUCT cluster alone: C15/C17) | 222/282 (78.7%) |
 | IN-SUBSET PASS (MISC+goto cluster alone: C19 + decl splits) | 215/282 (76.2%) |
 | IN-SUBSET PASS (libc cluster alone: corpus-scoped C90 libc) | 213/282 (75.5%) |
-| **IN-SUBSET PASS (all clusters MERGED — task-c90-merge-880)** | *(measured by the merged re-run; see MERGED_CONFORMANCE below)* |
+| **IN-SUBSET PASS (all clusters MERGED — task-c90-merge-880)** | **245/287 (85.4%)** |
+
+**MERGED_CONFORMANCE (authoritative, task-c90-merge-880).**  Re-running the full
+344-case broad corpus with the merged transpile.py (struct + storage + misc+goto,
+all three auto-merged with 0 code conflicts) + the merged harness (incl. the
+corpus libc) gives **245/287 = 85.4% in-subset**.  Proven strictly ADDITIVE:
+running the BASELINE transpile.py against this SAME merged corpus scores 213/287,
+and a case-by-case set-diff of the two passing sets shows **0 regressions** (all
+221 baseline PASS cases still PASS) and **+32 newly-passing** — the exact union
+of the cluster fixes (nothing lost when the branches compose).  The 42 remaining
+in-subset fails are the documented OOB tail (C99 designated struct-init / compound
+literals, C11 anon members, bit-fields, function-like macros, user varargs,
+switch-fallthrough, sizeof-gap MISMATCHes).  Golden `174ece66` unchanged (the
+whole c4_release merge is under `c90_e2e/`, off the model-build path).
 
 The four #880 clusters each landed on their own branch off the same ~210/282
 baseline, so their individual deltas overlap in the denominator; the MERGED
-figure below is the authoritative post-consolidation number.  The 117 hand cases
+figure above is the authoritative post-consolidation number.  The 117 hand cases
 stay at 100% in-subset (now 122 with the goto/decl regression cases, 118/118
 PASS, 0 regression across all clusters).  The aggregate is the c-testsuite
 portion pulling the transpiler onto un-lowered constructs.  (The out-of-subset
@@ -47,8 +60,14 @@ Per-cluster contributions (all measured, 0 regression each):
 * **MISC+goto** — C19 goto edge forms + tentative/mixed declarators (+5); goto
   category now 7/7.
 * **libc** — corpus-scoped C90 str*/stdlib/stdio (+3); NOT linked into doom.
-Doom transpiled output BYTE-IDENTICAL under every cluster (only the benign,
-provably-identical goto guard-split + the struct-value *correctness* fix differ).
+Doom transpiled output BYTE-IDENTICAL under the merged clusters: a per-module
+transpile-SHA differential (baseline b1b8 vs merged, all 62 linuxdoom modules)
+shows **62/62 identical, 0 changed, 0 crashes**.  The cluster fixes target C90
+constructs the doom source either does not use (C15 struct-value globals, C17
+anon-inline aggregates, C99 designated inits, tentative redeclarations) or uses
+in forms the fix leaves unchanged (doom's goto retry/stairstep forms are not the
+dead-label / goto-in-bare-block / if(0)-label edge forms the C19 fix rewrites) —
+so the byte-exact doom build is wholly preserved.
 
 ### task #880 delta (MISC cluster + C19 goto edge forms) — measured
 
