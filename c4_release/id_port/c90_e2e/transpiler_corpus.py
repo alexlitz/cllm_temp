@@ -212,6 +212,14 @@ CORPUS = [
      None, False),  # expect filled below via gcc oracle only (deterministic though)
     ("gt_error_cleanup", "goto",
      "int main(){ int r; r=0; if(r==0) goto err; return 1; err: return 42; }", 42, False),
+    # C19 edge forms (task #880): dead/consecutive labels, goto-out-of-block,
+    # label as an unbraced if-branch body.  Guard the c4_doom transpile.py C19 fix.
+    ("gt_dead_and_consecutive_labels", "goto",   # cts_00010: start:/foo: not targets
+     "int main(){ start: goto next; return 1; success: return 0; next: foo: goto success; return 1; }", 0, False),
+    ("gt_into_block_skip_rest", "goto",          # cts_00199 joe: goto in a bare block
+     "int main(){ int r; r=0; { r=1; goto out; r=99; } out: return r; }", 1, False),
+    ("gt_label_in_if_branch", "goto",            # cts_00207 f1: label = unbraced if-body
+     "int main(){ int n; int c; n=2; c=0; if(0) lab: c++; if(n-- == 0) return c; goto lab; }", 2, False),
 
     # =====================================================================
     # switch / case / default incl fallthrough
@@ -354,6 +362,13 @@ CORPUS = [
      "char buf[4] = {'a','b','c',0}; int main(){ return buf[2]; }", ord('c'), False),
     ("sg_2d_global_init", "storage",
      "int m[2][2] = {{1,2},{3,4}}; int main(){ return m[1][0]+m[0][1]; }", 5, False),
+    # MISC global-declaration edge forms (task #880) -- guard the c4_doom
+    # transpile.py multi-declarator/prototype fixes.
+    ("sg_tentative_redecl_global", "storage",    # cts_00096: `int x, x=7, x;`
+     "int x, x = 7, x; int main(){ if(x!=7) return 1; x=3; return x; }", 3, False),
+    ("sg_mixed_proto_var_decl", "storage",        # cts_00121: proto+var in one decl
+     "int f(int a), g(int a), a; int main(){ return f(5)-g(2)+a; } "
+     "int f(int a){ return a; } int g(int a){ return a; }", 3, False),
 
     # =====================================================================
     # small real programs (integration)
