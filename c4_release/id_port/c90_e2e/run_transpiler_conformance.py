@@ -18,7 +18,8 @@ import json
 import sys
 from collections import defaultdict, OrderedDict
 
-sys.path.insert(0, "/tmp/wt_transpiler_c90/c4_release/id_port/c90_e2e")
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transpiler_harness import run_case, Result
 from transpiler_corpus import CORPUS
 

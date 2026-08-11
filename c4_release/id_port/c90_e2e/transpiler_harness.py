@@ -42,10 +42,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # --- import paths: transpile.py (c4_doom) + src.compiler + c4vm (c4_doom) -----
+# Override with C4_DOOM_IDPORT (points at c4_doom/id_port: transpile.py + c4vm.py
+# + struct_engine.py) and C4_RELEASE_ROOT (points at c4_release: src/compiler.py).
+# The transpiler baseline is the ``task-transpiler-c90-b1b8`` branch (95.7% on the
+# 117-case hand corpus); set both env vars to that branch's worktrees.
 DOOM_IDPORT = os.environ.get("C4_DOOM_IDPORT",
-                             "/tmp/wt_doom_c90/id_port")
+                             "/tmp/wt_c90_doom_mine/id_port")
 C4_RELEASE = os.environ.get("C4_RELEASE_ROOT",
-                            "/tmp/wt_transpiler_c90/c4_release")
+                            "/tmp/wt_c90_rel_mine/c4_release")
 for p in (DOOM_IDPORT, C4_RELEASE):
     if p not in sys.path:
         sys.path.insert(0, p)
