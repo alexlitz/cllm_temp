@@ -1,11 +1,11 @@
 {
-  "in_subset_total": 280,
-  "in_subset_pass": 208,
-  "in_subset_fail": 72,
-  "in_subset_pass_rate": 0.7428571428571429,
+  "in_subset_total": 282,
+  "in_subset_pass": 222,
+  "in_subset_fail": 60,
+  "in_subset_pass_rate": 0.7872340425531915,
   "out_of_subset_total": 34,
   "gcc_skipped": 23,
-  "corpus_total": 337,
+  "corpus_total": 339,
   "results": [
     {
       "suite": "hand",
@@ -614,6 +614,32 @@
       "gcc_exit": 3,
       "gcc_stdout": "",
       "port_exit": 3,
+      "port_stdout": "",
+      "detail": "",
+      "bug_class": ""
+    },
+    {
+      "suite": "hand",
+      "oos": null,
+      "name": "lp_do_while_unbraced",
+      "category": "loops",
+      "stage": "PASS",
+      "gcc_exit": 0,
+      "gcc_stdout": "",
+      "port_exit": 0,
+      "port_stdout": "",
+      "detail": "",
+      "bug_class": ""
+    },
+    {
+      "suite": "hand",
+      "oos": null,
+      "name": "lp_do_while_unbraced_nested",
+      "category": "loops",
+      "stage": "PASS",
+      "gcc_exit": 6,
+      "gcc_stdout": "",
+      "port_exit": 6,
       "port_stdout": "",
       "detail": "",
       "bug_class": ""
@@ -1747,14 +1773,13 @@
       "oos": null,
       "name": "cts_00017",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: struct at line 12",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint x;\nint y;\n\n\tstruct {   } s;\n\t\n\ts.x = 3;\n\ts.y = 5;\n\treturn s.y - s.x - 2; \n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2077,42 +2102,39 @@
       "oos": null,
       "name": "cts_00042",
       "category": "union",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 1 at line 12",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nchar *u;\n\n\t u = malloc(4 + 8);\n\tu.a = 1;\n\tu.b = 3;\n\t\n\tif (u.a != 3 || u.b != 3)\n\t\treturn 1;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00043",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 1 at line 13",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain() {\nint *v;\n\n    v = malloc((3) * sizeof(int));\n\n    v[0] = 1;\n    v.nest.y = 2;\n    v.nest.z = 3;\n    if (v[0] + v.nest.y + v.nest.z != 6)\n        return 1;\n    return 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
       "oos": null,
       "name": "cts_00044",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct T;\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *v;\n\n    v = malloc((1) * sizeof(int));\n\n\t{  }\n\tv[0] = 2;\n\tif(v[0] != 2)\n\t\treturn 1;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2146,14 +2168,13 @@
       "oos": null,
       "name": "cts_00047",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 52 at line 1",
-      "bug_class": "",
-      "transpiled": "struct { int a; int b; int c; } s = {1, 2, 3};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif (s.a != 1)\n\t\treturn 1;\n\tif (s.b != 2)\n\t\treturn 2;\n\tif (s.c != 3)\n\t\treturn 3;\n\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2165,9 +2186,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
+      "detail": "SyntaxError: Expected 56, got 2 at line 8",
       "bug_class": "",
-      "transpiled": "struct S s = { .b = 2, .a = 1};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\treturn 0;\n}\n"
+      "transpiled": "int *s;\n\n// --- generated static initializers ---\n\nint s_init()\n{\n    s = malloc((1) * (2) * sizeof(int));\n    s[(0) * (2) + 0] = .b = 2;\n    s[(0) * (2) + 1] = .a = 1;\n}\n\nint c4_static_init()\n{\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\treturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2179,9 +2200,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 3",
+      "detail": "SyntaxError: Expected 56, got 2 at line 10",
       "bug_class": "",
-      "transpiled": "int x;\n\nstruct S s = { .p = &x, .a = 1};\n\nint c4_static_init()\n{\n    x = 10;\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(*s[1] != 10)\n\t\treturn 2;\n\treturn 0;\n}\n"
+      "transpiled": "int x;\n\nint *s;\n\n// --- generated static initializers ---\n\nint s_init()\n{\n    s = malloc((1) * (2) * sizeof(int));\n    s[(0) * (2) + 0] = .p = &x;\n    s[(0) * (2) + 1] = .a = 1;\n}\n\nint c4_static_init()\n{\n    x = 10;\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(*s[1] != 10)\n\t\treturn 2;\n\treturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2193,9 +2214,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
+      "detail": "SyntaxError: Expected 51, got 1 at line 25",
       "bug_class": "",
-      "transpiled": "struct S2 v = {1, 2, 3, {4, 5}};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif(v[0] != 1)\n\t\treturn 1;\n\tif(v[1] != 2)\n\t\treturn 2;\n\tif(v.c != 3 || v.d != 3)\n\t\treturn 3;\n\tif(v[2] != 4)\n\t\treturn 4;\n\tif(v[3] != 5)\n\t\treturn 5;\n\t\n\treturn 0;\n}\n"
+      "transpiled": "int *v;\n\n// --- generated static initializers ---\n\nint v_init()\n{\n    v = malloc((1) * (4) * sizeof(int));\n    v[(0) * (4) + 0] = 1;\n    v[(0) * (4) + 1] = 2;\n    v[(0) * (4) + 2] = 3;\n}\n\nint c4_static_init()\n{\n    v_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(v[0] != 1)\n\t\treturn 1;\n\tif(v[1] != 2)\n\t\treturn 2;\n\tif(v.c != 3 || v.d != 3)\n\t\treturn 3;\n\tif(v[2] != 4)\n\t\treturn 4;\n\tif(v[3] != 5)\n\t\treturn 5;\n\t\n\treturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -2229,14 +2250,13 @@
       "oos": null,
       "name": "cts_00053",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: s1x at line 15",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *s1;\nint *s2;\n\n    s1 = malloc((1) * sizeof(int));\n    s2 = malloc((1) * sizeof(int));\n\n\ts1x = 1;\n\t{\n\n\t\ts2y = 1;\n\t\tif (s1x - s2y != 0)\n\t\t\treturn 1;\n\t}\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2274,7 +2294,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpsqqdb0oa/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpsqqdb0oa/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpxpbktft1/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpxpbktft1/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -2326,7 +2346,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpi_yq87_2/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // line comment\n      | ^\n/tmp/tmpi_yq87_2/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpxnnkg2vd/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // line comment\n      | ^\n/tmp/tmpxnnkg2vd/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -2718,9 +2738,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
+      "detail": "SyntaxError: Expected 56, got 11 at line 7",
       "bug_class": "",
-      "transpiled": "struct S s = { &zero };\n\nstruct \n\nint\nzero()\n{\n\treturn 0;\n}\n\nS *\nanon()\n{\n\treturn &s;\n}\n\nfty\ngo()\n{\n\treturn &anon;\n}\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\treturn go()()->zerofunc();\n}\n"
+      "transpiled": "int *s;\n\nstruct \n\n// --- generated static initializers ---\n\nint\nzero()\n{\n\treturn 0;\n}\n\nS *\nanon()\n{\n\treturn &s;\n}\n\nfty\ngo()\n{\n\treturn &anon;\n}\n\nint s_init()\n{\n    s = malloc((1) * (1) * sizeof(int));\n    s[(0) * (1) + 0] = &zero;\n}\n\nint c4_static_init()\n{\n    s_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\treturn go()()->zerofunc();\n}\n"
     },
     {
       "suite": "cts",
@@ -2740,14 +2760,13 @@
       "oos": null,
       "name": "cts_00091",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "S a[1] = {{1, {2, 3}}};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif ((a + (0) * 3)[0] != 1)\n\t\treturn 1;\n\tif ((((a + (0) * 3) + 1))[0] != 2)\n\t\treturn 2;\n\tif ((((a + (0) * 3) + 1))[1] != 3)\n\t\treturn 3;\n\t\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -2941,14 +2960,13 @@
       "oos": null,
       "name": "cts_00106",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: s2s1x at line 13",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint *s2;\n\n    s2 = malloc((1) * sizeof(int));\n\n\ts2s1x = 1;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3099,14 +3117,13 @@
       "oos": null,
       "name": "cts_00118",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Undefined: struct at line 11",
-      "bug_class": "",
-      "transpiled": "int c4_static_init()\n{\n\n}\n\nint\nmain()\n{\nint x;\n\n\tstruct {  } s = { 0 };\n\treturn s.x;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3126,14 +3143,13 @@
       "oos": null,
       "name": "cts_00120",
       "category": "enum",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 52 at line 1",
-      "bug_class": "",
-      "transpiled": "struct {\n\t\n} s;\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3248,14 +3264,13 @@
       "oos": null,
       "name": "cts_00129",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 1 at line 25",
-      "bug_class": "",
-      "transpiled": "int *s2;\n\nint c4_static_init()\n{\n    s2 = malloc((3) * sizeof(int));\n}\n\nint\nmain()\n{\nint __ent0; int __gx0; int __jmp0; int __st0; \nint *s; c4_static_init();\n\n__st0 = 0;\n__gx0 = 0;\nwhile (__gx0 == 0) {\n__ent0 = __st0;\nif (__ent0 == 0) { __jmp0 = 0;\nif (__jmp0 == 0) { s = malloc((3) * sizeof(int)); }\nif (__jmp0 == 0) { { __st0 = 1; __jmp0 = 1; } }\nif (__jmp0 == 0) { {\n\t\t\t\n\t\t\treturn s;\n\t\t} }\nif (__jmp0 == 0) { return s[2] + (s + 2).s1s; }\n\n if (__jmp0 == 0) { __st0 = 1; } }\nif (__ent0 == 1) { __jmp0 = 0;\nif (__jmp0 == 0) { {\n\t\t\treturn 0;\n\t\t} }\nif (__jmp0 == 0) { return 1; }\n\n if (__jmp0 == 0) { __st0 = 2; } }\nif (__st0 >= 2) { __gx0 = 1; }\n}\n\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3281,7 +3296,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpinfnqra_/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpinfnqra_/case.c:8:4: error: C++ style comments are not allowed in ISO C90\n    8 |    // this is also a comment sayhello();\n      |    ^\n/tmp/tmpinfnqra_/case.c:8:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp8umro06h/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp8umro06h/case.c:8:4: error: C++ style comments are not allowed in ISO C90\n    8 |    // this is also a comment sayhello();\n      |    ^\n/tmp/tmp8umro06h/case.c:8:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3294,7 +3309,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp0u27dyv7/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp0u27dyv7/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmppo1cw80k/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmppo1cw80k/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3476,14 +3491,13 @@
       "oos": null,
       "name": "cts_00146",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "PASS",
       "gcc_exit": 0,
       "gcc_stdout": "",
-      "port_exit": null,
+      "port_exit": 0,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
-      "bug_class": "",
-      "transpiled": "struct S s = {1, 2};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\treturn 0;\n}\n"
+      "detail": "",
+      "bug_class": ""
     },
     {
       "suite": "cts",
@@ -3509,9 +3523,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
+      "detail": "SyntaxError: Unexpected token: 42 at line 8",
       "bug_class": "",
-      "transpiled": "struct S arr[2] = {[1] = {3, 4}, [0] = {1, 2}};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif((arr + (0) * 2)[0] != 1)\n\t\treturn 1;\n\tif((arr + (0) * 2)[1] != 2)\n\t\treturn 2;\n\tif((arr + (1) * 2)[0] != 3)\n\t\treturn 3;\n\tif((arr + (1) * 2)[1] != 4)\n\t\treturn 4;\n\treturn 0;\n}\n"
+      "transpiled": "int *arr;\n\n// --- generated static initializers ---\n\nint arr_init()\n{\n    arr = malloc((2) * (2) * sizeof(int));\n    arr[(0) * (2) + 0] = [1] = {3, 4};\n    arr[(1) * (2) + 0] = [0] = {1, 2};\n}\n\nint c4_static_init()\n{\n    arr_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif((arr + (0) * 2)[0] != 1)\n\t\treturn 1;\n\tif((arr + (0) * 2)[1] != 2)\n\t\treturn 2;\n\tif((arr + (1) * 2)[0] != 3)\n\t\treturn 3;\n\tif((arr + (1) * 2)[1] != 4)\n\t\treturn 4;\n\treturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -3537,9 +3551,9 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
+      "detail": "SyntaxError: Expected 56, got 20 at line 2",
       "bug_class": "",
-      "transpiled": "struct S1 gs1 = { .a = 1, 2 };\nint *s = &(struct S2) {\n\t{.b = 2, .a = 1},\n\t&gs1,\n\t{[0] = 1,  1+1}\n};\n\nint c4_static_init()\n{\n\n}\n\nint\nmain()\n{\n\tif(s->s1a != 1)\n\t\treturn 1;\n\tif(s->s1b != 2)\n\t\treturn 2;\n\tif(((int *)(s[2]))[0] != 1)\n\t\treturn 3;\n\tif(((int *)(s[2]))[1] != 2)\n\t\treturn 4;\n\tif(((s + 3))[0] != 1)\n\t\treturn 5;\n\tif(((s + 3))[1] != 2)\n\t\treturn 6;\n\treturn 0;\n}\n"
+      "transpiled": "int *gs1;\nint *s = &(struct S2) {\n\t{.b = 2, .a = 1},\n\t&gs1,\n\t{[0] = 1,  1+1}\n};\n\n// --- generated static initializers ---\n\nint gs1_init()\n{\n    gs1 = malloc((1) * (2) * sizeof(int));\n    gs1[(0) * (2) + 0] = .a = 1;\n    gs1[(0) * (2) + 1] = 2;\n}\n\nint c4_static_init()\n{\n    gs1_init();\n}\n\nint\nmain()\n{ c4_static_init();\n\tif(s[0] != 1)\n\t\treturn 1;\n\tif(s[1] != 2)\n\t\treturn 2;\n\tif(((int *)(s[2]))[0] != 1)\n\t\treturn 3;\n\tif(((int *)(s[2]))[1] != 2)\n\t\treturn 4;\n\tif(((s + 3))[0] != 1)\n\t\treturn 5;\n\tif(((s + 3))[1] != 2)\n\t\treturn 6;\n\treturn 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -3618,7 +3632,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpxl0kqs8p/case.c:15:1: error: C++ style comments are not allowed in ISO C90\n   15 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpxl0kqs8p/case.c:15:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmph20sp6c8/case.c:15:1: error: C++ style comments are not allowed in ISO C90\n   15 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmph20sp6c8/case.c:15:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3631,7 +3645,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpew9mukmf/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpew9mukmf/case.c:21:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp4l2lkj2b/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp4l2lkj2b/case.c:21:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3644,7 +3658,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpg5j_yy4h/case.c:29:1: error: C++ style comments are not allowed in ISO C90\n   29 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpg5j_yy4h/case.c:29:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpjhd6csh7/case.c:29:1: error: C++ style comments are not allowed in ISO C90\n   29 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpjhd6csh7/case.c:29:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3657,7 +3671,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp605qvv45/case.c:35:1: error: C++ style comments are not allowed in ISO C90\n   35 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp605qvv45/case.c:35:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp2xyzmy53/case.c:35:1: error: C++ style comments are not allowed in ISO C90\n   35 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp2xyzmy53/case.c:35:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3670,7 +3684,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpdfo2fqs7/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpdfo2fqs7/case.c:24:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpj5xi11px/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpj5xi11px/case.c:24:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3683,7 +3697,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpunhp1cwv/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpunhp1cwv/case.c:24:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpdbtw4bam/case.c:24:1: error: C++ style comments are not allowed in ISO C90\n   24 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpdbtw4bam/case.c:24:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3696,7 +3710,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpdoq8bkxi/case.c:5:17: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 undeclared here (not in a function)\n    5 | void foor(int x[restrict 5]);\n      |                 ^~~~~~~~\n/tmp/tmpdoq8bkxi/case.c:5:25: error: expected \u00e2\u0080\u0098]\u00e2\u0080\u0099 before numeric constant\n    5 | void foor(int x[restrict 5]);\n      |                         ^~\n      |                         ]\n/tmp/tmpdoq8bkxi/case.c:9:16: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 unde",
+      "detail": "gcc-compile: /tmp/tmp6yafhuta/case.c:5:17: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 undeclared here (not in a function)\n    5 | void foor(int x[restrict 5]);\n      |                 ^~~~~~~~\n/tmp/tmp6yafhuta/case.c:5:25: error: expected \u00e2\u0080\u0098]\u00e2\u0080\u0099 before numeric constant\n    5 | void foor(int x[restrict 5]);\n      |                         ^~\n      |                         ]\n/tmp/tmp6yafhuta/case.c:9:16: error: \u00e2\u0080\u0098restrict\u00e2\u0080\u0099 unde",
       "bug_class": ""
     },
     {
@@ -3709,7 +3723,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp8aj62tsg/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp8aj62tsg/case.c:40:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpetkth_bx/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpetkth_bx/case.c:40:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3722,7 +3736,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp625_prnh/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp625_prnh/case.c:40:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpnsi8er1g/case.c:40:1: error: C++ style comments are not allowed in ISO C90\n   40 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpnsi8er1g/case.c:40:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3735,7 +3749,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmppuz232i9/case.c:14:1: error: C++ style comments are not allowed in ISO C90\n   14 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmppuz232i9/case.c:14:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpvpkv3pd0/case.c:14:1: error: C++ style comments are not allowed in ISO C90\n   14 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpvpkv3pd0/case.c:14:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3748,7 +3762,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp4_49du4b/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmp4_49du4b/case.c:18:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpyc18po5z/case.c:18:1: error: C++ style comments are not allowed in ISO C90\n   18 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpyc18po5z/case.c:18:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3761,7 +3775,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpqbwx8i1s/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpqbwx8i1s/case.c:21:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpsuas9uom/case.c:21:1: error: C++ style comments are not allowed in ISO C90\n   21 | // vim: set expandtab ts=4 sw=3 sts=3 tw=80 :\n      | ^\n/tmp/tmpsuas9uom/case.c:21:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3854,7 +3868,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpfrhcfvqo/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpfrhcfvqo/case.c:6:4: error: C++ style comments are not allowed in ISO C90\n    6 |    // variables\n      |    ^\n/tmp/tmpfrhcfvqo/case.c:6:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpsnc8cnca/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpsnc8cnca/case.c:6:4: error: C++ style comments are not allowed in ISO C90\n    6 |    // variables\n      |    ^\n/tmp/tmpsnc8cnca/case.c:6:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -3881,7 +3895,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp6u_u53q4/case.c:5:1: error: C++ style comments are not allowed in ISO C90\n    5 | //Swap integer values by array indexes\n      | ^\n/tmp/tmp6u_u53q4/case.c:5:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp_ipsz241/case.c:5:1: error: C++ style comments are not allowed in ISO C90\n    5 | //Swap integer values by array indexes\n      | ^\n/tmp/tmp_ipsz241/case.c:5:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4263,7 +4277,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpr1lxat6u/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // This program is designed to test some arm64-specific things, such as the\n      | ^\n/tmp/tmpr1lxat6u/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpi9ikqwx3/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // This program is designed to test some arm64-specific things, such as the\n      | ^\n/tmp/tmpi9ikqwx3/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4271,14 +4285,14 @@
       "oos": null,
       "name": "cts_00205",
       "category": "structarr",
-      "stage": "compile_error",
+      "stage": "MISMATCH",
       "gcc_exit": 0,
       "gcc_stdout": "cases[0].c[0]=73400320\ncases[0].c[1]=262144\ncases[0].c[2]=805567999\ncases[0].c[3]=-1\ncases[0].b=1\ncases[0].e=2\ncases[0].k=1\n\ncases[1].c[0]=879754751\ncases[1].c[1]=262144\ncases[1].c[2]=262144\ncases[1].c[3]=805567999\ncases[1].b=2\ncases[1].e=3\ncases[1].k=2\n\ncases[2].c[0]=879754751\ncases[2].c[1]=805567999\ncases[2].c[2]=262144\ncases[2].c[3]=805567999\ncases[2].b=1\ncases[2].e=3\ncases[2].k=2\n\ncases[3].c[0]=879754751\ncases[3].c[1]=805830143\ncases[3].c[2]=524288\ncases[3].c[3]=-1\ncases[3].b=1\ncases[3].e=2\ncases[3].k=1\n\ncases[4].c[0]=879754751\ncases[4].c[1]=805830143\ncases[4].c[2]=1048576\ncases[4].c[3]=805830143\ncases[4].b=1\ncases[4].e=3\ncases[4].k=1\n\ncases[5].c[0]=879754751\ncases[5].c[1]=805830143\ncases[5].c[2]=262144\ncases[5].c[3]=262144\ncases[5].b=1\ncases[5].e=3\ncases[5].k=1\n\ncases[6].c[0]=73400320\ncases[6].c[1]=807403007\ncases[6].c[2]=807403007\ncases[6].c[3]=-1\ncases[6].b=1\ncases[6].e=2\ncases[6].k=1\n\ncases[7].c[0]=839122431\ncases[7].c[1]=2097152\ncases[7].c[2]=807403007\ncases[7].c[3]=-1\ncases[7].b=0\ncases[7].e=2\ncases[7].k=1\n\ncases[8].c[0]=67108864\ncases[8].c[1]=807403007\ncases[8].c[2]=134217728\ncases[8].c[3]=-1\ncases[8].b=0\ncases[8].e=2\ncases[8].k=0\n\n",
-      "port_exit": null,
-      "port_stdout": "",
-      "detail": "SyntaxError: Expected 56, got 2 at line 1",
+      "port_exit": 0,
+      "port_stdout": "((cases + (0) * 7))[0]=73400320\n(cases + (0) * 7)[4]=0\n(cases + (0) * 7)[5]=0\n(cases + (0) * 7)[6]=0\n\n((cases + (1) * 7))[0]=262144\n(cases + (1) * 7)[4]=0\n(cases + (1) * 7)[5]=0\n(cases + (1) * 7)[6]=0\n\n((cases + (2) * 7))[0]=805567999\n(cases + (2) * 7)[4]=0\n(cases + (2) * 7)[5]=0\n(cases + (2) * 7)[6]=0\n\n((cases + (3) * 7))[0]=-1\n(cases + (3) * 7)[4]=0\n(cases + (3) * 7)[5]=0\n(cases + (3) * 7)[6]=0\n\n((cases + (4) * 7))[0]=1\n(cases + (4) * 7)[4]=0\n(cases + (4) * 7)[5]=0\n(cases + (4) * 7)[6]=0\n\n((cases + (5) * 7))[0]=2\n(cases + (5) * 7)[4]=0\n(cases + (5) * 7)[5]=0\n(cases + (5) * 7)[6]=0\n\n((cases + (6) * 7))[0]=1\n(cases + (6) * 7)[4]=0\n(cases + (6) * 7)[5]=0\n(cases + (6) * 7)[6]=0\n\n((cases + (7) * 7))[0]=879754751\n(cases + (7) * 7)[4]=0\n(cases + (7) * 7)[5]=0\n(cases + (7) * 7)[6]=0\n\n((cases + (8) * 7))[0]=262144\n(cases + (8) * 7)[4]=0\n(cases + (8) * 7)[5]=0\n(cases + (8) * 7)[6]=0\n\n((cases + (9) * 7))[0]=262144\n(cases + (9) * 7)[4]=0\n(cases + (9) * 7)[5]=0\n(cases + (9) * 7)[6]=0\n\n((cases + (10) * 7))[0]=805567999\n(cases + (10) * 7)[4]=0\n(cases + (10) * 7)[5]=0\n(cases + (10) * 7)[6]=0\n\n((cases + (11) * 7))[0]=2\n(cases + (11) * 7)[4]=0\n(cases + (11) * 7)[5]=0\n(cases + (11) * 7)[6]=0\n\n((cases + (12) * 7))[0]=3\n(cases + (12) * 7)[4]=0\n(cases + (12) * 7)[5]=0\n(cases + (12) * 7)[6]=0\n\n((cases + (13) * 7))[0]=2\n(cases + (13) * 7)[4]=0\n(cases + (13) * 7)[5]=0\n(cases + (13) * 7)[6]=0\n\n((cases + (14) * 7))[0]=879754751\n(cases + (14) * 7)[4]=0\n(cases + (14) * 7)[5]=0\n(cases + (14) * 7)[6]=0\n\n((cases + (15) * 7))[0]=805567999\n(cases + (15) * 7)[4]=0\n(cases + (15) * 7)[5]=0\n(cases + (15) * 7)[6]=0\n\n((cases + (16) * 7))[0]=262144\n(cases + (16) * 7)[4]=0\n(cases + (16) * 7)[5]=0\n(cases + (16) * 7)[6]=0\n\n((cases + (17) * 7))[0]=805567999\n(cases + (17) * 7)[4]=0\n(cases + (17) * 7)[5]=0\n(cases + (17) * 7)[6]=0\n\n((cases + (18) * 7))[0]=1\n(cases + (18) * 7)[4]=0\n(cases + (18) * 7)[5]=0\n(cases + (18) * 7)[6]=0\n\n((cases + (19) * 7))[0]=3\n(cases + (19) * 7)[4]=0\n(cases + (19) * 7)[5]=0\n(cases + (19) * 7)[6]=0\n\n((cases + (20) * 7))[0]=2\n(cases + (20) * 7)[4]=0\n(cases + (20) * 7)[5]=0\n(cases + (20) * 7)[6]=0\n\n((cases + (21) * 7))[0]=879754751\n(cases + (21) * 7)[4]=0\n(cases + (21) * 7)[5]=0\n(cases + (21) * 7)[6]=0\n\n((cases + (22) * 7))[0]=805830143\n(cases + (22) * 7)[4]=0\n(cases + (22) * 7)[5]=0\n(cases + (22) * 7)[6]=0\n\n((cases + (23) * 7))[0]=524288\n(cases + (23) * 7)[4]=0\n(cases + (23) * 7)[5]=0\n(cases + (23) * 7)[6]=0\n\n((cases + (24) * 7))[0]=-1\n(cases + (24) * 7)[4]=0\n(cases + (24) * 7)[5]=0\n(cases + (24) * 7)[6]=0\n\n((cases + (25) * 7))[0]=1\n(cases + (25) * 7)[4]=0\n(cases + (25) * 7)[5]=0\n(cases + (25) * 7)[6]=0\n\n((cases + (26) * 7))[0]=2\n(cases + (26) * 7)[4]=0\n(cases + (26) * 7)[5]=0\n(cases + (26) * 7)[6]=0\n\n((cases + (27) * 7))[0]=1\n(cases + (27) * 7)[4]=0\n(cases + (27) * 7)[5]=0\n(cases + (27) * 7)[6]=0\n\n((cases + (28) * 7))[0]=879754751\n(cases + (28) * 7)[4]=0\n(cases + (28) * 7)[5]=0\n(cases + (28) * 7)[6]=0\n\n((cases + (29) * 7))[0]=805830143\n(cases + (29) * 7)[4]=0\n(cases + (29) * 7)[5]=0\n(cases + (29) * 7)[6]=0\n\n((cases + (30) * 7))[0]=1048576\n(cases + (30) * 7)[4]=0\n(cases + (30) * 7)[5]=0\n(cases + (30) * 7)[6]=0\n\n((cases + (31) * 7))[0]=805830143\n(cases + (31) * 7)[4]=0\n(cases + (31) * 7)[5]=0\n(cases + (31) * 7)[6]=0\n\n((cases + (32) * 7))[0]=1\n(cases + (32) * 7)[4]=0\n(cases + (32) * 7)[5]=0\n(cases + (32) * 7)[6]=0\n\n((cases + (33) * 7))[0]=3\n(cases + (33) * 7)[4]=0\n(cases + (33) * 7)[5]=0\n(cases + (33) * 7)[6]=0\n\n((cases + (34) * 7))[0]=1\n(cases + (34) * 7)[4]=0\n(cases + (34) * 7)[5]=0\n(cases + (34) * 7)[6]=0\n\n((cases + (35) * 7))[0]=879754751\n(cases + (35) * 7)[4]=0\n(cases + (35) * 7)[5]=0\n(cases + (35) * 7)[6]=0\n\n((cases + (36) * 7))[0]=805830143\n(cases + (36) * 7)[4]=0\n(cases + (36) * 7)[5]=0\n(cases + (36) * 7)[6]=0\n\n((cases + (37) * 7))[0]=262144\n(cases + (37) * 7)[4]=0\n(cases + (37) * 7)[5]=0\n(cases + (37) * 7)[6]=0\n\n((cases + (38) * 7))[0]=262144\n(cases + (38) * 7)[4]=0\n(cases + (38) * 7)[5]=0\n(cases + (38) * 7)[6]=0\n\n((cases + (39) * 7))[0]=1\n(cases + (39) * 7)[4]=0\n(cases + (39) * 7)[5]=0\n(cases + (39) * 7)[6]=0\n\n((cases + (40) * 7))[0]=3\n(cases + (40) * 7)[4]=0\n(cases + (40) * 7)[5]=0\n(cases + (40) * 7)[6]=0\n\n((cases + (41) * 7))[0]=1\n(cases + (41) * 7)[4]=0\n(cases + (41) * 7)[5]=0\n(cases + (41) * 7)[6]=0\n\n((cases + (42) * 7))[0]=73400320\n(cases + (42) * 7)[4]=0\n(cases + (42) * 7)[5]=0\n(cases + (42) * 7)[6]=0\n\n((cases + (43) * 7))[0]=807403007\n(cases + (43) * 7)[4]=0\n(cases + (43) * 7)[5]=0\n(cases + (43) * 7)[6]=0\n\n((cases + (44) * 7))[0]=807403007\n(cases + (44) * 7)[4]=0\n(cases + (44) * 7)[5]=0\n(cases + (44) * 7)[6]=0\n\n((cases + (45) * 7))[0]=-1\n(cases + (45) * 7)[4]=0\n(cases + (45) * 7)[5]=0\n(cases + (45) * 7)[6]=0\n\n((cases + (46) * 7))[0]=1\n(cases + (46) * 7)[4]=0\n(cases + (46) * 7)[5]=0\n(cases + (46) * 7)[6]=0\n\n((cases + (47) * 7))[0]=2\n(cases + (47) * 7)[4]=0\n(cases + (47) * 7)[5]=0\n(cases + (47) * 7)[6]=0\n\n((cases + (48) * 7))[0]=1\n(cases + (48) * 7)[4]=0\n(cases + (48) * 7)[5]=0\n(cases + (48) * 7)[6]=0\n\n((cases + (49) * 7))[0]=839122431\n(cases + (49) * 7)[4]=0\n(cases + (49) * 7)[5]=0\n(cases + (49) * 7)[6]=0\n\n((cases + (50) * 7))[0]=2097152\n(cases + (50) * 7)[4]=0\n(cases + (50) * 7)[5]=0\n(cases + (50) * 7)[6]=0\n\n((cases + (51) * 7))[0]=807403007\n(cases + (51) * 7)[4]=0\n(cases + (51) * 7)[5]=0\n(cases + (51) * 7)[6]=0\n\n((cases + (52) * 7))[0]=-1\n(cases + (52) * 7)[4]=0\n(cases + (52) * 7)[5]=0\n(cases + (52) * 7)[6]=0\n\n((cases + (53) * 7))[0]=0\n(cases + (53) * 7)[4]=0\n(cases + (53) * 7)[5]=0\n(cases + (53) * 7)[6]=0\n\n((cases + (54) * 7))[0]=2\n(cases + (54) * 7)[4]=0\n(cases + (54) * 7)[5]=0\n(cases + (54) * 7)[6]=0\n\n((cases + (55) * 7))[0]=1\n(cases + (55) * 7)[4]=0\n(cases + (55) * 7)[5]=0\n(cases + (55) * 7)[6]=0\n\n((cases + (56) * 7))[0]=67108864\n(cases + (56) * 7)[4]=0\n(cases + (56) * 7)[5]=0\n(cases + (56) * 7)[6]=0\n\n((cases + (57) * 7))[0]=807403007\n(cases + (57) * 7)[4]=0\n(cases + (57) * 7)[5]=0\n(cases + (57) * 7)[6]=0\n\n((cases + (58) * 7))[0]=134217728\n(cases + (58) * 7)[4]=0\n(cases + (58) * 7)[5]=0\n(cases + (58) * 7)[6]=0\n\n((cases + (59) * 7))[0]=-1\n(cases + (59) * 7)[4]=0\n(cases + (59) * 7)[5]=0\n(cases + (59) * 7)[6]=0\n\n((cases + (60) * 7))[0]=0\n(cases + (60) * 7)[4]=0\n(cases + (60) * 7)[5]=0\n(cases + (60) * 7)[6]=0\n\n((cases + (61) * 7))[0]=2\n(cases + (61) * 7)[4]=0\n(cases + (61) * 7)[5]=0\n(cases + (61) * 7)[6]=0\n\n((cases + (62) * 7))[0]=0\n(cases + (62) * 7)[4]=0\n(cases + (62) * 7)[5]=0\n(cases + (62) * 7)[6]=0\n\n",
+      "detail": "stdout gcc='cases[0].c[0]=73400320\\ncases[0].c[1]=262144\\ncases[0].c[2]=805567999\\ncases[0].c[3]=-1\\ncases[0].b=1\\ncases[0].e=2\\ncases[0].k=1\\n\\ncases[1].c[0]=879754751\\ncases[1].c[1]=262144\\ncases[1].c[2]=262144\\ncases[1].c[3]=805567999\\ncases[1].b=2\\ncases[1].e=3\\ncases[1].k=2\\n\\ncases[2].c[0]=879754751\\ncases[2].c[1]=805567999\\ncases[2].c[2]=262144\\ncases[2].c[3]=805567999\\ncases[2].b=1\\ncases[2].e=3\\ncases[2].k=2\\n\\ncases[3].c[0]=879754751\\ncases[3].c[1]=805830143\\ncases[3].c[2]=524288\\ncases[3].c[3]=-1\\ncases[3].b=1\\ncases[3].e=2\\ncases[3].k=1\\n\\ncases[4].c[0]=879754751\\ncases[4].c[1]=805830143\\ncases[4].c[2]=1048576\\ncases[4].c[3]=805830143\\ncases[4].b=1\\ncases[4].e=3\\ncases[4].k=1\\n\\ncases[5].c[0]=879754751\\ncases[5].c[1]=805830143\\ncases[5].c[2]=262144\\ncases[5].c[3]=262144\\ncases[5].b=1\\ncases[5].e=3\\ncases[5].k=1\\n\\ncases[6].c[0]=73400320\\ncases[6].c[1]=807403007\\ncases[6].c[2]=807403007\\ncases[6].c[3]=-1\\ncases[6].b=1\\ncases[6].e=2\\ncases[6].k=1\\n\\ncases[7].c[0]=839122431\\ncases[7].c[1]=2097152\\ncases[7].c[2]=807403007\\ncases[7].c[3]=-1\\ncases[7].b=0\\ncases[7].e=2\\ncases[7].k=1\\n\\ncases[8].c[0]=67108864\\ncases[8].c[1]=807403007\\ncases[8].c[2]=134217728\\ncases[8].c[3]=-1\\ncases[8].b=0\\ncases[8].e=2\\ncases[8].k=0\\n\\n' port='((cases + (0) * 7))[0]=73400320\\n(cases + (0) * 7)[4]=0\\n(cases + (0) * 7)[5]=0\\n(cases + (0) * 7)[6]=0\\n\\n((cases + (1) * 7))[0]=262144\\n(cases + (1) * 7)[4]=0\\n(cases + (1) * 7)[5]=0\\n(cases + (1) * 7)[6]=0\\n\\n((cases + (2) * 7))[0]=805567999\\n(cases + (2) * 7)[4]=0\\n(cases + (2) * 7)[5]=0\\n(cases + (2) * 7)[6]=0\\n\\n((cases + (3) * 7))[0]=-1\\n(cases + (3) * 7)[4]=0\\n(cases + (3) * 7)[5]=0\\n(cases + (3) * 7)[6]=0\\n\\n((cases + (4) * 7))[0]=1\\n(cases + (4) * 7)[4]=0\\n(cases + (4) * 7)[5]=0\\n(cases + (4) * 7)[6]=0\\n\\n((cases + (5) * 7))[0]=2\\n(cases + (5) * 7)[4]=0\\n(cases + (5) * 7)[5]=0\\n(cases + (5) * 7)[6]=0\\n\\n((cases + (6) * 7))[0]=1\\n(cases + (6) * 7)[4]=0\\n(cases + (6) * 7)[5]=0\\n(cases + (6) * 7)[6]=0\\n\\n((cases + (7) * 7))[0]=879754751\\n(cases + (7) * 7)[4]=0\\n(cases + (7) * 7)[5]=0\\n(cases + (7) * 7)[6]=0\\n\\n((cases + (8) * 7))[0]=262144\\n(cases + (8) * 7)[4]=0\\n(cases + (8) * 7)[5]=0\\n(cases + (8) * 7)[6]=0\\n\\n((cases + (9) * 7))[0]=262144\\n(cases + (9) * 7)[4]=0\\n(cases + (9) * 7)[5]=0\\n(cases + (9) * 7)[6]=0\\n\\n((cases + (10) * 7))[0]=805567999\\n(cases + (10) * 7)[4]=0\\n(cases + (10) * 7)[5]=0\\n(cases + (10) * 7)[6]=0\\n\\n((cases + (11) * 7))[0]=2\\n(cases + (11) * 7)[4]=0\\n(cases + (11) * 7)[5]=0\\n(cases + (11) * 7)[6]=0\\n\\n((cases + (12) * 7))[0]=3\\n(cases + (12) * 7)[4]=0\\n(cases + (12) * 7)[5]=0\\n(cases + (12) * 7)[6]=0\\n\\n((cases + (13) * 7))[0]=2\\n(cases + (13) * 7)[4]=0\\n(cases + (13) * 7)[5]=0\\n(cases + (13) * 7)[6]=0\\n\\n((cases + (14) * 7))[0]=879754751\\n(cases + (14) * 7)[4]=0\\n(cases + (14) * 7)[5]=0\\n(cases + (14) * 7)[6]=0\\n\\n((cases + (15) * 7))[0]=805567999\\n(cases + (15) * 7)[4]=0\\n(cases + (15) * 7)[5]=0\\n(cases + (15) * 7)[6]=0\\n\\n((cases + (16) * 7))[0]=262144\\n(cases + (16) * 7)[4]=0\\n(cases + (16) * 7)[5]=0\\n(cases + (16) * 7)[6]=0\\n\\n((cases + (17) * 7))[0]=805567999\\n(cases + (17) * 7)[4]=0\\n(cases + (17) * 7)[5]=0\\n(cases + (17) * 7)[6]=0\\n\\n((cases + (18) * 7))[0]=1\\n(cases + (18) * 7)[4]=0\\n(cases + (18) * 7)[5]=0\\n(cases + (18) * 7)[6]=0\\n\\n((cases + (19) * 7))[0]=3\\n(cases + (19) * 7)[4]=0\\n(cases + (19) * 7)[5]=0\\n(cases + (19) * 7)[6]=0\\n\\n((cases + (20) * 7))[0]=2\\n(cases + (20) * 7)[4]=0\\n(cases + (20) * 7)[5]=0\\n(cases + (20) * 7)[6]=0\\n\\n((cases + (21) * 7))[0]=879754751\\n(cases + (21) * 7)[4]=0\\n(cases + (21) * 7)[5]=0\\n(cases + (21) * 7)[6]=0\\n\\n((cases + (22) * 7))[0]=805830143\\n(cases + (22) * 7)[4]=0\\n(cases + (22) * 7)[5]=0\\n(cases + (22) * 7)[6]=0\\n\\n((cases + (23) * 7))[0]=524288\\n(cases + (23) * 7)[4]=0\\n(cases + (23) * 7)[5]=0\\n(cases + (23) * 7)[6]=0\\n\\n((cases + (24) * 7))[0]=-1\\n(cases + (24) * 7)[4]=0\\n(cases + (24) * 7)[5]=0\\n(cases + (24) * 7)[6]=0\\n\\n((cases + (25) * 7))[0]=1\\n(cases + (25) * 7)[4]=0\\n(cases + (25) * 7)[5]=0\\n(cases + (25) * 7)[6]=0\\n\\n((cases + (26) * 7))[0]=2\\n(cases + (26) * 7)[4]=0\\n(cases + (26) * 7)[5]=0\\n(cases + (26) * 7)[6]=0\\n\\n((cases + (27) * 7))[0]=1\\n(cases + (27) * 7)[4]=0\\n(cases + (27) * 7)[5]=0\\n(cases + (27) * 7)[6]=0\\n\\n((cases + (28) * 7))[0]=879754751\\n(cases + (28) * 7)[4]=0\\n(cases + (28) * 7)[5]=0\\n(cases + (28) * 7)[6]=0\\n\\n((cases + (29) * 7))[0]=805830143\\n(cases + (29) * 7)[4]=0\\n(cases + (29) * 7)[5]=0\\n(cases + (29) * 7)[6]=0\\n\\n((cases + (30) * 7))[0]=1048576\\n(cases + (30) * 7)[4]=0\\n(cases + (30) * 7)[5]=0\\n(cases + (30) * 7)[6]=0\\n\\n((cases + (31) * 7))[0]=805830143\\n(cases + (31) * 7)[4]=0\\n(cases + (31) * 7)[5]=0\\n(cases + (31) * 7)[6]=0\\n\\n((cases + (32) * 7))[0]=1\\n(cases + (32) * 7)[4]=0\\n(cases + (32) * 7)[5]=0\\n(cases + (32) * 7)[6]=0\\n\\n((cases + (33) * 7))[0]=3\\n(cases + (33) * 7)[4]=0\\n(cases + (33) * 7)[5]=0\\n(cases + (33) * 7)[6]=0\\n\\n((cases + (34) * 7))[0]=1\\n(cases + (34) * 7)[4]=0\\n(cases + (34) * 7)[5]=0\\n(cases + (34) * 7)[6]=0\\n\\n((cases + (35) * 7))[0]=879754751\\n(cases + (35) * 7)[4]=0\\n(cases + (35) * 7)[5]=0\\n(cases + (35) * 7)[6]=0\\n\\n((cases + (36) * 7))[0]=805830143\\n(cases + (36) * 7)[4]=0\\n(cases + (36) * 7)[5]=0\\n(cases + (36) * 7)[6]=0\\n\\n((cases + (37) * 7))[0]=262144\\n(cases + (37) * 7)[4]=0\\n(cases + (37) * 7)[5]=0\\n(cases + (37) * 7)[6]=0\\n\\n((cases + (38) * 7))[0]=262144\\n(cases + (38) * 7)[4]=0\\n(cases + (38) * 7)[5]=0\\n(cases + (38) * 7)[6]=0\\n\\n((cases + (39) * 7))[0]=1\\n(cases + (39) * 7)[4]=0\\n(cases + (39) * 7)[5]=0\\n(cases + (39) * 7)[6]=0\\n\\n((cases + (40) * 7))[0]=3\\n(cases + (40) * 7)[4]=0\\n(cases + (40) * 7)[5]=0\\n(cases + (40) * 7)[6]=0\\n\\n((cases + (41) * 7))[0]=1\\n(cases + (41) * 7)[4]=0\\n(cases + (41) * 7)[5]=0\\n(cases + (41) * 7)[6]=0\\n\\n((cases + (42) * 7))[0]=73400320\\n(cases + (42) * 7)[4]=0\\n(cases + (42) * 7)[5]=0\\n(cases + (42) * 7)[6]=0\\n\\n((cases + (43) * 7))[0]=807403007\\n(cases + (43) * 7)[4]=0\\n(cases + (43) * 7)[5]=0\\n(cases + (43) * 7)[6]=0\\n\\n((cases + (44) * 7))[0]=807403007\\n(cases + (44) * 7)[4]=0\\n(cases + (44) * 7)[5]=0\\n(cases + (44) * 7)[6]=0\\n\\n((cases + (45) * 7))[0]=-1\\n(cases + (45) * 7)[4]=0\\n(cases + (45) * 7)[5]=0\\n(cases + (45) * 7)[6]=0\\n\\n((cases + (46) * 7))[0]=1\\n(cases + (46) * 7)[4]=0\\n(cases + (46) * 7)[5]=0\\n(cases + (46) * 7)[6]=0\\n\\n((cases + (47) * 7))[0]=2\\n(cases + (47) * 7)[4]=0\\n(cases + (47) * 7)[5]=0\\n(cases + (47) * 7)[6]=0\\n\\n((cases + (48) * 7))[0]=1\\n(cases + (48) * 7)[4]=0\\n(cases + (48) * 7)[5]=0\\n(cases + (48) * 7)[6]=0\\n\\n((cases + (49) * 7))[0]=839122431\\n(cases + (49) * 7)[4]=0\\n(cases + (49) * 7)[5]=0\\n(cases + (49) * 7)[6]=0\\n\\n((cases + (50) * 7))[0]=2097152\\n(cases + (50) * 7)[4]=0\\n(cases + (50) * 7)[5]=0\\n(cases + (50) * 7)[6]=0\\n\\n((cases + (51) * 7))[0]=807403007\\n(cases + (51) * 7)[4]=0\\n(cases + (51) * 7)[5]=0\\n(cases + (51) * 7)[6]=0\\n\\n((cases + (52) * 7))[0]=-1\\n(cases + (52) * 7)[4]=0\\n(cases + (52) * 7)[5]=0\\n(cases + (52) * 7)[6]=0\\n\\n((cases + (53) * 7))[0]=0\\n(cases + (53) * 7)[4]=0\\n(cases + (53) * 7)[5]=0\\n(cases + (53) * 7)[6]=0\\n\\n((cases + (54) * 7))[0]=2\\n(cases + (54) * 7)[4]=0\\n(cases + (54) * 7)[5]=0\\n(cases + (54) * 7)[6]=0\\n\\n((cases + (55) * 7))[0]=1\\n(cases + (55) * 7)[4]=0\\n(cases + (55) * 7)[5]=0\\n(cases + (55) * 7)[6]=0\\n\\n((cases + (56) * 7))[0]=67108864\\n(cases + (56) * 7)[4]=0\\n(cases + (56) * 7)[5]=0\\n(cases + (56) * 7)[6]=0\\n\\n((cases + (57) * 7))[0]=807403007\\n(cases + (57) * 7)[4]=0\\n(cases + (57) * 7)[5]=0\\n(cases + (57) * 7)[6]=0\\n\\n((cases + (58) * 7))[0]=134217728\\n(cases + (58) * 7)[4]=0\\n(cases + (58) * 7)[5]=0\\n(cases + (58) * 7)[6]=0\\n\\n((cases + (59) * 7))[0]=-1\\n(cases + (59) * 7)[4]=0\\n(cases + (59) * 7)[5]=0\\n(cases + (59) * 7)[6]=0\\n\\n((cases + (60) * 7))[0]=0\\n(cases + (60) * 7)[4]=0\\n(cases + (60) * 7)[5]=0\\n(cases + (60) * 7)[6]=0\\n\\n((cases + (61) * 7))[0]=2\\n(cases + (61) * 7)[4]=0\\n(cases + (61) * 7)[5]=0\\n(cases + (61) * 7)[6]=0\\n\\n((cases + (62) * 7))[0]=0\\n(cases + (62) * 7)[4]=0\\n(cases + (62) * 7)[5]=0\\n(cases + (62) * 7)[6]=0\\n\\n'",
       "bug_class": "",
-      "transpiled": "PT cases[] = {\n ((int)4194304 +(int)2097152 +(int)67108864), (int)262144, (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), -1, 1,2,1,\n ((int)+4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), (int)262144, (int)262144, (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), 2,3,2,\n ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), (int)262144, (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), 1,3,2,\n ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), (int)524288, -1, 1,2,1,\n ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), (int)1048576, (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), 1,3,1,\n ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), (int)262144, (int)262144, 1,3,1,\n ((int)4194304 +(int)2097152 +(int)67108864), ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), -1, 1,2,1,\n (int)33554432 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536), (int)2097152, ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), -1, 0,2,1,\n (int)67108864, ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536)), (int)134217728, -1, 0,2,0,\n};\n\nint c4_static_init()\n{\n\n}\n\nint main() {\nint i;\nint j;\n\n    \n\n    j=0;\n    while (j < 63) {\n\n\ti=0;\n    while (i < sizeof(int)/sizeof(int)) {\nprintf(\"((cases + (%d) * 7))[%d]=%ld\\n\", j, i, ((cases + (j) * 7))[i]);\n    i++;\n    }\n\n\tprintf(\"(cases + (%d) * 7)[4]=%ld\\n\", j, (cases + (j) * 7)[4]);\n\tprintf(\"(cases + (%d) * 7)[5]=%ld\\n\", j, (cases + (j) * 7)[5]);\n\tprintf(\"(cases + (%d) * 7)[6]=%ld\\n\", j, (cases + (j) * 7)[6]);\n\tprintf(\"\\n\");\n    \n    j++;\n    }\n    return 0;\n}\n"
+      "transpiled": "int *cases;\n\n// --- generated static initializers ---\n\nint cases_init()\n{\n    cases = malloc((63) * (7) * sizeof(int));\n    cases[(0) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864);\n    cases[(1) * (7) + 0] = (int)262144;\n    cases[(2) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(3) * (7) + 0] = -1;\n    cases[(4) * (7) + 0] = 1;\n    cases[(5) * (7) + 0] = 2;\n    cases[(6) * (7) + 0] = 1;\n    cases[(7) * (7) + 0] = ((int)+4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(8) * (7) + 0] = (int)262144;\n    cases[(9) * (7) + 0] = (int)262144;\n    cases[(10) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(11) * (7) + 0] = 2;\n    cases[(12) * (7) + 0] = 3;\n    cases[(13) * (7) + 0] = 2;\n    cases[(14) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(15) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(16) * (7) + 0] = (int)262144;\n    cases[(17) * (7) + 0] = (((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(18) * (7) + 0] = 1;\n    cases[(19) * (7) + 0] = 3;\n    cases[(20) * (7) + 0] = 2;\n    cases[(21) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(22) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(23) * (7) + 0] = (int)524288;\n    cases[(24) * (7) + 0] = -1;\n    cases[(25) * (7) + 0] = 1;\n    cases[(26) * (7) + 0] = 2;\n    cases[(27) * (7) + 0] = 1;\n    cases[(28) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(29) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(30) * (7) + 0] = (int)1048576;\n    cases[(31) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(32) * (7) + 0] = 1;\n    cases[(33) * (7) + 0] = 3;\n    cases[(34) * (7) + 0] = 1;\n    cases[(35) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864)+( (int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(36) * (7) + 0] = (int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(37) * (7) + 0] = (int)262144;\n    cases[(38) * (7) + 0] = (int)262144;\n    cases[(39) * (7) + 0] = 1;\n    cases[(40) * (7) + 0] = 3;\n    cases[(41) * (7) + 0] = 1;\n    cases[(42) * (7) + 0] = ((int)4194304 +(int)2097152 +(int)67108864);\n    cases[(43) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(44) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(45) * (7) + 0] = -1;\n    cases[(46) * (7) + 0] = 1;\n    cases[(47) * (7) + 0] = 2;\n    cases[(48) * (7) + 0] = 1;\n    cases[(49) * (7) + 0] = (int)33554432 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536);\n    cases[(50) * (7) + 0] = (int)2097152;\n    cases[(51) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(52) * (7) + 0] = -1;\n    cases[(53) * (7) + 0] = 0;\n    cases[(54) * (7) + 0] = 2;\n    cases[(55) * (7) + 0] = 1;\n    cases[(56) * (7) + 0] = (int)67108864;\n    cases[(57) * (7) + 0] = ((int)1048576 +(int)524288 +(int)262144 +(((int)1 +(int)256 +(int)4 +(int)8 +(int)16 +(int)64 +(int)128 +(int)268435456 +(int)536870912 +(int)1024 +(int)4096 +(int)8192 +(int)16384)+((int)2 +(int)131072 +(int)2048)+(int)32 +(int)32768 +(int)65536));\n    cases[(58) * (7) + 0] = (int)134217728;\n    cases[(59) * (7) + 0] = -1;\n    cases[(60) * (7) + 0] = 0;\n    cases[(61) * (7) + 0] = 2;\n    cases[(62) * (7) + 0] = 0;\n}\n\nint c4_static_init()\n{\n    cases_init();\n}\n\nint main() {\nint i;\nint j; c4_static_init();\n\n    \n\n    j=0;\n    while (j < 63) {\n\n\ti=0;\n    while (i < sizeof(int)/sizeof(int)) {\nprintf(\"((cases + (%d) * 7))[%d]=%ld\\n\", j, i, ((cases + (j) * 7))[i]);\n    i++;\n    }\n\n\tprintf(\"(cases + (%d) * 7)[4]=%ld\\n\", j, (cases + (j) * 7)[4]);\n\tprintf(\"(cases + (%d) * 7)[5]=%ld\\n\", j, (cases + (j) * 7)[5]);\n\tprintf(\"(cases + (%d) * 7)[6]=%ld\\n\", j, (cases + (j) * 7)[6]);\n\tprintf(\"\\n\");\n    \n    j++;\n    }\n    return 0;\n}\n"
     },
     {
       "suite": "cts",
@@ -4318,7 +4332,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpmp0v6ogv/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpmp0v6ogv/case.c:21:4: error: C++ style comments are not allowed in ISO C90\n   21 |    //printf (\"tcc has %s %s\\n\", s, q.data);\n      |    ^\n/tmp/tmpmp0v6ogv/case.c:21:4: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpjxt2ytyf/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpjxt2ytyf/case.c:21:4: error: C++ style comments are not allowed in ISO C90\n   21 |    //printf (\"tcc has %s %s\\n\", s, q.data);\n      |    ^\n/tmp/tmpjxt2ytyf/case.c:21:4: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4359,7 +4373,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp8n50hwpx/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp8n50hwpx/case.c:11:1: error: C++ style comments are not allowed in ISO C90\n   11 | //    printf(\"n+1 = %d\\n\", 0xe+1);\n      | ^\n/tmp/tmp8n50hwpx/case.c:11:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpow13axrd/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpow13axrd/case.c:11:1: error: C++ style comments are not allowed in ISO C90\n   11 | //    printf(\"n+1 = %d\\n\", 0xe+1);\n      | ^\n/tmp/tmpow13axrd/case.c:11:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4428,7 +4442,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmp9fyquhw5/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmp9fyquhw5/case.c:277:3: error: C++ style comments are not allowed in ISO C90\n  277 |   //printf(\"q: %s\\n\", q);\n      |   ^\n/tmp/tmp9fyquhw5/case.c:277:3: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmpwdovh_np/case.c: In function \u00e2\u0080\u0098main\u00e2\u0080\u0099:\n/tmp/tmpwdovh_np/case.c:277:3: error: C++ style comments are not allowed in ISO C90\n  277 |   //printf(\"q: %s\\n\", q);\n      |   ^\n/tmp/tmpwdovh_np/case.c:277:3: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     },
     {
@@ -4483,7 +4497,7 @@
       "gcc_stdout": "",
       "port_exit": null,
       "port_stdout": "",
-      "detail": "gcc-compile: /tmp/tmpf5d_k_zo/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // this file contains BMP chars encoded in UTF-8\n      | ^\n/tmp/tmpf5d_k_zo/case.c:1:1: note: (this will be reported only once per input file)\n",
+      "detail": "gcc-compile: /tmp/tmp84_f656w/case.c:1:1: error: C++ style comments are not allowed in ISO C90\n    1 | // this file contains BMP chars encoded in UTF-8\n      | ^\n/tmp/tmp84_f656w/case.c:1:1: note: (this will be reported only once per input file)\n",
       "bug_class": ""
     }
   ]

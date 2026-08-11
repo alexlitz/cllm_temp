@@ -45,29 +45,47 @@ int main(){ int x; x=50; do x=x-1; while(x); return x; }   /* gcc 0, port now 0 
 ```
 Affects: `cts_00008 cts_00101`.  Both now PASS.
 
-### C15 — global struct-VALUE initialization   **P1**
-`struct S s = {1,2};` at file scope is left completely unlowered: the tagged def
-survives, the brace-init is not deferred into `c4_static_init`, and `s.a`/`s.b`
-never lower.  B6 handled scalar/array global init but not struct-VALUE globals.
+### C15 — global struct-VALUE initialization   ✅ FIXED
+`struct S s = {1,2};` at file scope was left completely unlowered: the tagged
+def survived, the brace-init was not deferred into `c4_static_init`, and
+`s.a`/`s.b` never lowered.  B6 handled scalar/array global init but not
+struct-VALUE globals.
 ```c
 struct S { int a; int b; }; struct S s = {1, 2};
-int main(){ return (s.a==1 && s.b==2) ? 0 : 1; }           /* gcc 0, port CERR */
+int main(){ return (s.a==1 && s.b==2) ? 0 : 1; }           /* gcc 0, port now 0 */
 ```
-Fix path: extend the B2 struct-value machinery + B6 deferred-init to global
-struct-value decls (erase def, allocate/emit field words, lower access).
-Affects: `cts_00047 cts_00049 cts_00050 cts_00118 cts_00146 cts_00153` (+ nested).
+**FIXED** (c4_doom `transpile.py` #880): `lower_struct_array_initializers` now
+matches tagged `struct TAG`/bare-alias types (was `_t`-only) AND treats a SCALAR
+struct value (`struct S s = {..}`) as ONE element placed at field offsets, not
+a mis-strided array (the old path landed field 2 at offset SIZE — also a latent
+bug for doom's cheatseq_t/event_t/menu_t globals, now corrected).
+Affects (now PASS): `cts_00047 cts_00091 cts_00118 cts_00146` (+ the nested
+tagged case `cts_00106`).  Still OOB: `cts_00048 cts_00049 cts_00050 cts_00148
+cts_00149 cts_00150 cts_00153` — C99 designated-init / compound-literals / C11
+anon-members / preproc member-rename (see C16 below + the OOB roster).
 
-### C17 — anonymous-inline LOCAL struct / union   **P1**
+### C17 — anonymous-inline LOCAL/GLOBAL struct / union   ✅ FIXED
 `struct { int x; int y; } s;` (tagless, no typedef) as a local: the transpiler
-half-lowers it (hoists `int x; int y;` but leaves `struct { } s;` and unlowered
-`s.x`) because the per-file struct contract does not capture the tagless inline
-aggregate.  Same for `union { int a; int b; } u;`.
+half-lowered it (hoisted `int x; int y;` but left `struct { } s;` and unlowered
+`s.x`) because the per-file struct contract did not capture the tagless inline
+aggregate.  Same for `union { int a; int b; } u;` and the global form.
 ```c
-int main(){ struct { int x; int y; } s; s.x=3; s.y=5; return s.y-s.x-2; }  /* gcc 0, port CERR */
+int main(){ struct { int x; int y; } s; s.x=3; s.y=5; return s.y-s.x-2; }  /* gcc 0, port now 0 */
 ```
-Fix path: give `lower_local_struct_values` / `lower_local_unions` an
-anonymous-aggregate offset table synthesized from the inline `{...}` body.
-Affects: `cts_00017 cts_00042 cts_00043 cts_00046`.
+**FIXED** (c4_doom `transpile.py` #880): new `lower_anonymous_aggregates` pass
+rewrites each tagless inline aggregate variable decl to a synthetic TAGGED form
+(`struct __anonvar_N { .. }; struct __anonvar_N s;`) + a contract layout (union
+= all members @ offset 0), so the ordinary tagged-struct machinery lowers it.
+A UNION with ARRAY members (doom's w_wad/i_video byte-overlay) is left to
+`lower_local_unions` (byte-identity of the doom build preserved).  A block-scoped
+tagged struct SHADOW (`struct T{int y;}s2;` redefining a differently-shaped `T`)
+also gets its own synthetic layout.
+Affects (now PASS): `cts_00017 cts_00042 cts_00043 cts_00044 cts_00053`.
+Still OOB: `cts_00046 cts_00050` — C11 ANONYMOUS (nameless) members, not C90.
+
+Also FIXED alongside the struct cluster: `fold_float_literals` no longer eats
+the member dots of a struct chain (`s2.s1.x` tokenised as `2.`/`1.` and lost its
+dots -> `s2s1x`); forward struct declarations `struct TAG;` are erased.
 
 ### C19 — goto-label lowering edge forms   **P1**
 The goto->state-machine rewrite leaves some labels in the output (`start:`,
@@ -123,11 +141,26 @@ imply 64-bit width (the c4 word IS 64-bit, so it would diverge from gcc -m32's
 32-bit int anyway).  Borderline out-of-subset.
 Affects: `cts_00104 cts_00214`.
 
-### C16 — C99 designated initializers (`.field=` / `[i]=`)   **OOB**
-`struct S s = {.b=2,.a=1};` and `arr[2]={[1]={3,4},[0]={1,2}}` are **C99**, not
-C90; gcc -std=c90 accepts them as an extension but they are out of the stated
+### C16 — C99 designated inits / compound literals / C11 anon members   **OOB**
+`struct S s = {.b=2,.a=1};`, `arr[2]={[1]={3,4},[0]={1,2}}`, the compound
+literal `&(struct S){1,2}`, and C11 ANONYMOUS (nameless) struct/union members
+(`struct S2 { int a; union { int c; int d; }; };`) are all **C99/C11**, NOT C90;
+gcc -std=c90 accepts them as extensions (with -w) but they are out of the stated
 C90 subset.  Document, don't fix.
-Affects: `cts_00048 cts_00148`.
+Affects (struct cluster): `cts_00048 cts_00049 cts_00148` (designated init) ·
+`cts_00149 cts_00150` (compound literal + designated init) · `cts_00046 cts_00050`
+(C11 anonymous members).
+
+### C21 — bit-fields (`int f : N;`) + preproc member-rename   **OOB**
+`enum tree_code code : 8;` / `unsigned flag : 1;` bit-fields have no representation
+in the byte-word c4 VM (no sub-word bit packing).  `cts_00153`'s `#define x f` /
+`#define y() f` renames a struct MEMBER through a function-like macro — a real
+preprocessor pass (P2), out of scope for a Doom source-flattener.
+Affects (struct cluster): `cts_00218` (bit-field) · `cts_00153` (preproc member
+macro).  Note `cts_00205` (J-interpreter `PT cases[]`) now COMPILES + RUNS (was
+CERR) but MISMATCHes on `%ld`-of-`long` (the c4 word=8 vs x86 `long`=4 sizeof
+gap) plus a flat brace-less nested-array `c[4]` initializer — a sizeof-gap +
+implicit-flattening residual, not a clean struct-lowering bug.
 
 ### C14 — wide char / string literals (`L'x'` / `L"..."`)   **OOB**
 Wide literals are out-of-subset (the c4 VM is byte-oriented).
@@ -146,10 +179,8 @@ Affects: `cts_00098`.
 
 ## Prioritized remaining list (for follow-up agents, one class each)
 
-1. **C15 global struct-value init** (P1, ~6 cases) — extend B2/B6 to file-scope
-   struct-value decls.
-2. **C17 anonymous-inline local struct/union** (P1, ~4 cases) — synthesize an
-   offset table for the tagless inline aggregate.
+1. **C15 global struct-value init** — ✅ FIXED (#880).
+2. **C17 anonymous-inline local/global struct/union** — ✅ FIXED (#880).
 3. **C19 goto-label edge forms** (P1, ~3 cases) — harden label-lift for tail/
    consecutive labels + the fallthrough guard; HIGH regression risk.
 4. **C18 missing libc** (P2, ~4 cases) — add `str*`/`calloc`/`sprintf` to the c4
