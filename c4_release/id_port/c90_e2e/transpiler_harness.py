@@ -50,6 +50,8 @@ DOOM_IDPORT = os.environ.get("C4_DOOM_IDPORT",
                              "/tmp/wt_c90_doom_mine/id_port")
 C4_RELEASE = os.environ.get("C4_RELEASE_ROOT",
                             "/tmp/wt_c90_rel_mine/c4_release")
+# this harness's own directory (holds the CORPUS-SCOPED corpus_libc.c4)
+HARNESS_DIR = os.path.dirname(os.path.abspath(__file__))
 for p in (DOOM_IDPORT, C4_RELEASE):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -205,6 +207,19 @@ def run_port(src: str, stdin: bytes, timeout_cycles: int = 40_000_000) -> Result
         if not stdlib_path.exists():
             stdlib_path = Path(C4_RELEASE) / "src" / "stdlib" / "memory.c4"
         stdlib = stdlib_path.read_text() if stdlib_path.exists() else ""
+        # CORPUS-SCOPED C90 libc: standard-library functions (calloc/strcpy/
+        # strcmp/strlen/sprintf/...) the c-testsuite cases call that memory.c4
+        # does NOT provide.  This is appended ONLY here in the harness -- it is
+        # NOT part of the shared c4 build stdlib and is NOT linked into the Doom
+        # build (Doom supplies its own libc via id_port/doom_libc.c), so the
+        # byte-exact Doom path (golden 174ece66) is untouched.  It defines only
+        # functions memory.c4 lacks (no malloc/free/memset/memcmp duplicates).
+        corpus_libc_path = Path(HARNESS_DIR) / "corpus_libc.c4"
+        corpus_libc = corpus_libc_path.read_text() if corpus_libc_path.exists() else ""
+        if corpus_libc:
+            # concat order: memory.c4 first (owns __heap_ptr, rewritten below),
+            # then the corpus libc.  The heap-base .replace() targets memory.c4.
+            stdlib = stdlib + "\n" + corpus_libc
         full = tsrc + ("\n" + stdlib if stdlib else "")
         if stdlib:
             probe = Compiler()

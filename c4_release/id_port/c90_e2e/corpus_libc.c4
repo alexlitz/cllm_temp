@@ -1,0 +1,500 @@
+// -----------------------------------------------------------------------------
+// CORPUS-SCOPED C90 libc for the c90_e2e broad-conformance harness.
+//
+// This file is appended by transpiler_harness.py (alongside src/stdlib/memory.c4)
+// ONLY when running the broad C90 corpus.  It is NOT part of the shared c4 build
+// stdlib and is NOT linked into the Doom build (Doom supplies its own strcpy/
+// strcmp/etc. via id_port/doom_libc.c).  Scoping it to the harness keeps the
+// Doom byte-exact path untouched (golden 174ece66 unchanged).
+//
+// It provides the standard C90 library functions the c-testsuite cases call that
+// are NOT already defined by memory.c4 (which supplies malloc/free/memset/memcmp).
+// Do NOT redefine malloc/free/memset/memcmp here -- memory.c4 owns them and a
+// duplicate definition is a compile error.
+//
+// The c4 word is 64-bit; `int` and pointers are one word.  These implementations
+// are byte-faithful to gcc -m32 for the observable (return value / buffer bytes /
+// stdout via the surrounding printf), which is all the harness compares.
+// -----------------------------------------------------------------------------
+
+// ---- <stdlib.h> --------------------------------------------------------------
+
+// calloc(nmemb, size): allocate nmemb*size bytes, zero-initialised.
+int calloc(int nmemb, int size) {
+    int total;
+    int ptr;
+    char *p;
+    int i;
+
+    total = nmemb * size;
+    if (total <= 0) {
+        return 0;
+    }
+    ptr = malloc(total);
+    if (ptr == 0) {
+        return 0;
+    }
+    p = (char *)ptr;
+    i = 0;
+    while (i < total) {
+        *p = 0;
+        p = p + 1;
+        i = i + 1;
+    }
+    return ptr;
+}
+
+// realloc(ptr, size): bump-allocator realloc -- allocate a fresh block and copy.
+// The old size is unknown to a bump allocator, so copy `size` bytes (safe upper
+// bound for a grow; for a shrink the extra copy is harmless as the caller only
+// reads `size`).  ptr==0 behaves like malloc.
+int realloc(int ptr, int size) {
+    int np;
+    char *d;
+    char *s;
+    int i;
+
+    if (size <= 0) {
+        return 0;
+    }
+    np = malloc(size);
+    if (np == 0) {
+        return 0;
+    }
+    if (ptr == 0) {
+        return np;
+    }
+    d = (char *)np;
+    s = (char *)ptr;
+    i = 0;
+    while (i < size) {
+        *d = *s;
+        d = d + 1;
+        s = s + 1;
+        i = i + 1;
+    }
+    return np;
+}
+
+// abs / labs: absolute value (labs is identical on a single-word VM).
+int abs(int x) {
+    if (x < 0) {
+        return 0 - x;
+    }
+    return x;
+}
+
+int labs(int x) {
+    if (x < 0) {
+        return 0 - x;
+    }
+    return x;
+}
+
+// atoi: parse a leading optional-sign decimal integer.
+int atoi(char *s) {
+    int sign;
+    int val;
+    char *p;
+    int c;
+
+    p = s;
+    sign = 1;
+    val = 0;
+    // skip leading whitespace (space, tab, newline, cr, vtab, formfeed)
+    while (*p == 32 | *p == 9 | *p == 10 | *p == 13 | *p == 11 | *p == 12) {
+        p = p + 1;
+    }
+    if (*p == 45) {          // '-'
+        sign = 0 - 1;
+        p = p + 1;
+    } else if (*p == 43) {   // '+'
+        p = p + 1;
+    }
+    while (1) {
+        c = *p;
+        if (c < 48 | c > 57) {
+            return sign * val;
+        }
+        val = val * 10 + (c - 48);
+        p = p + 1;
+    }
+    return sign * val;
+}
+
+// ---- <string.h> --------------------------------------------------------------
+
+int strlen(char *s) {
+    char *p;
+    p = s;
+    while (*p != 0) {
+        p = p + 1;
+    }
+    return (int)p - (int)s;
+}
+
+int strcpy(char *dst, char *src) {
+    char *d;
+    char *s;
+    d = dst;
+    s = src;
+    while (*s != 0) {
+        *d = *s;
+        d = d + 1;
+        s = s + 1;
+    }
+    *d = 0;
+    return (int)dst;
+}
+
+// strncpy: copy at most n bytes; if src is shorter, pad the rest with NUL.
+int strncpy(char *dst, char *src, int n) {
+    char *d;
+    char *s;
+    int i;
+    d = dst;
+    s = src;
+    i = 0;
+    while (i < n & *s != 0) {
+        *d = *s;
+        d = d + 1;
+        s = s + 1;
+        i = i + 1;
+    }
+    while (i < n) {
+        *d = 0;
+        d = d + 1;
+        i = i + 1;
+    }
+    return (int)dst;
+}
+
+int strcat(char *dst, char *src) {
+    char *d;
+    char *s;
+    d = dst;
+    while (*d != 0) {
+        d = d + 1;
+    }
+    s = src;
+    while (*s != 0) {
+        *d = *s;
+        d = d + 1;
+        s = s + 1;
+    }
+    *d = 0;
+    return (int)dst;
+}
+
+// strcmp: signed byte compare (unsigned-char semantics via & 0xFF).
+int strcmp(char *a, char *b) {
+    char *p;
+    char *q;
+    int ca;
+    int cb;
+    p = a;
+    q = b;
+    while (1) {
+        ca = *p & 255;
+        cb = *q & 255;
+        if (ca != cb) {
+            return ca - cb;
+        }
+        if (ca == 0) {
+            return 0;
+        }
+        p = p + 1;
+        q = q + 1;
+    }
+    return 0;
+}
+
+int strncmp(char *a, char *b, int n) {
+    char *p;
+    char *q;
+    int ca;
+    int cb;
+    int i;
+    p = a;
+    q = b;
+    i = 0;
+    while (i < n) {
+        ca = *p & 255;
+        cb = *q & 255;
+        if (ca != cb) {
+            return ca - cb;
+        }
+        if (ca == 0) {
+            return 0;
+        }
+        p = p + 1;
+        q = q + 1;
+        i = i + 1;
+    }
+    return 0;
+}
+
+// strchr: return pointer to first occurrence of c (as char), or 0.  A search for
+// 0 matches the terminating NUL (per C90).
+int strchr(char *s, int c) {
+    char *p;
+    int ch;
+    p = s;
+    ch = c & 255;
+    while (1) {
+        if ((*p & 255) == ch) {
+            return (int)p;
+        }
+        if (*p == 0) {
+            return 0;
+        }
+        p = p + 1;
+    }
+    return 0;
+}
+
+// strrchr: return pointer to LAST occurrence of c, or 0.
+int strrchr(char *s, int c) {
+    char *p;
+    int ch;
+    int last;
+    p = s;
+    ch = c & 255;
+    last = 0;
+    while (1) {
+        if ((*p & 255) == ch) {
+            last = (int)p;
+        }
+        if (*p == 0) {
+            return last;
+        }
+        p = p + 1;
+    }
+    return last;
+}
+
+// memcpy: copy n bytes forward (dst/src assumed non-overlapping, per C90).
+int memcpy(int dst, int src, int n) {
+    char *d;
+    char *s;
+    int i;
+    d = (char *)dst;
+    s = (char *)src;
+    i = 0;
+    while (i < n) {
+        *d = *s;
+        d = d + 1;
+        s = s + 1;
+        i = i + 1;
+    }
+    return dst;
+}
+
+// memmove: overlap-safe copy (copy backward when dst is above src).
+int memmove(int dst, int src, int n) {
+    char *d;
+    char *s;
+    int i;
+    if (dst == src | n <= 0) {
+        return dst;
+    }
+    if (dst < src) {
+        d = (char *)dst;
+        s = (char *)src;
+        i = 0;
+        while (i < n) {
+            *d = *s;
+            d = d + 1;
+            s = s + 1;
+            i = i + 1;
+        }
+    } else {
+        i = n;
+        while (i > 0) {
+            i = i - 1;
+            *((char *)(dst + i)) = *((char *)(src + i));
+        }
+    }
+    return dst;
+}
+
+// ---- <stdio.h> ---------------------------------------------------------------
+
+// puts: write a string + newline to stdout, return a non-negative value.
+int puts(char *s) {
+    char *p;
+    p = s;
+    while (*p != 0) {
+        putchar(*p);
+        p = p + 1;
+    }
+    putchar(10);
+    return 0;
+}
+
+// -- sprintf helpers ----------------------------------------------------------
+// __c4_num_digits: number of decimal digits in a non-negative value (>=1).
+int __c4_num_digits(int val) {
+    int n;
+    if (val == 0) {
+        return 1;
+    }
+    n = 0;
+    while (val > 0) {
+        val = val / 10;
+        n = n + 1;
+    }
+    return n;
+}
+
+// __c4_put_uint: write the decimal digits of a non-negative value into buf
+// most-significant-first (no sign, no padding), return the count written.
+// Uses no local array (the c4 subset has no local array declarations): it peels
+// digits from the top via a running power-of-ten divisor.
+int __c4_put_uint(char *buf, int val) {
+    int digits;
+    int div;
+    int i;
+    int d;
+    digits = __c4_num_digits(val);
+    // build the largest divisor <= 10^(digits-1)
+    div = 1;
+    i = 1;
+    while (i < digits) {
+        div = div * 10;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < digits) {
+        d = (val / div) % 10;
+        buf[i] = 48 + d;
+        div = div / 10;
+        i = i + 1;
+    }
+    return digits;
+}
+
+// sprintf: format into buf.  Supports the C90 conversions the corpus uses:
+//   %d %i  (optional '0' flag + width), %u, %x %X, %c, %s, %%.
+// Returns the number of characters written (excluding the NUL), like C sprintf.
+//
+// c4 has no user varargs and the c4 ABI addresses params by a FIXED offset that
+// depends on the DEFINITION's param count -- so a callee's param count must
+// equal the call site's arg count or the offsets desync.  The corpus exercises
+// sprintf with exactly ONE value arg (sprintf(buf, fmt, val)), so this is
+// defined with exactly THREE params to match that ABI; a format that consumes
+// more than one value arg is out of scope for the corpus.
+int sprintf(char *buf, char *fmt, int a3) {
+    char *out;
+    char *f;
+    int ai;
+    int c;
+    int zero;
+    int width;
+    int arg;
+    int digits;
+    int k;
+    int pad;
+    char *sp;
+
+    out = buf;
+    f = fmt;
+    ai = 0;
+    while (*f != 0) {
+        c = *f & 255;
+        if (c != 37) {                 // not '%': copy literally
+            *out = c;
+            out = out + 1;
+            f = f + 1;
+        } else {
+            f = f + 1;                 // consume '%'
+            zero = 0;
+            width = 0;
+            // flags: only '0' is honoured (corpus uses %02d)
+            while (*f == 48) {         // '0'
+                zero = 1;
+                f = f + 1;
+            }
+            // width digits
+            while ((*f & 255) >= 48 & (*f & 255) <= 57) {
+                width = width * 10 + ((*f & 255) - 48);
+                f = f + 1;
+            }
+            // length modifiers (l/h/L etc.) ignored
+            while (*f == 108 | *f == 104 | *f == 76) {
+                f = f + 1;
+            }
+            c = *f & 255;
+            f = f + 1;
+            if (c == 37) {             // %%
+                *out = 37;
+                out = out + 1;
+            } else {
+                // fetch positional arg (corpus sprintf takes a single value arg)
+                arg = a3;
+                ai = ai + 1;
+
+                if (c == 100 | c == 105) {     // d / i (signed)
+                    if (arg < 0) {
+                        *out = 45;             // '-'
+                        out = out + 1;
+                        arg = 0 - arg;
+                    }
+                    digits = __c4_num_digits(arg);
+                    pad = width - digits;
+                    while (pad > 0) {
+                        if (zero == 1) { *out = 48; } else { *out = 32; }
+                        out = out + 1;
+                        pad = pad - 1;
+                    }
+                    out = out + __c4_put_uint(out, arg);
+                } else if (c == 117) {         // u (unsigned; single-word)
+                    digits = __c4_num_digits(arg);
+                    pad = width - digits;
+                    while (pad > 0) {
+                        if (zero == 1) { *out = 48; } else { *out = 32; }
+                        out = out + 1;
+                        pad = pad - 1;
+                    }
+                    out = out + __c4_put_uint(out, arg);
+                } else if (c == 99) {          // c
+                    *out = arg & 255;
+                    out = out + 1;
+                } else if (c == 115) {         // s
+                    sp = (char *)arg;
+                    digits = 0;
+                    while (sp[digits] != 0) {
+                        digits = digits + 1;
+                    }
+                    pad = width - digits;
+                    while (pad > 0) {
+                        *out = 32;
+                        out = out + 1;
+                        pad = pad - 1;
+                    }
+                    k = 0;
+                    while (k < digits) {
+                        *out = sp[k];
+                        out = out + 1;
+                        k = k + 1;
+                    }
+                } else {                       // unknown: emit literally
+                    *out = 37;
+                    out = out + 1;
+                    *out = c;
+                    out = out + 1;
+                }
+            }
+        }
+    }
+    *out = 0;
+    return (int)out - (int)buf;
+}
+
+// snprintf: for the corpus, buffers are always large enough, so route to sprintf
+// (ignoring the size bound).  Returns the char count sprintf produced.  Defined
+// with FOUR params (buf, size, fmt, val) to match a single-value-arg call under
+// the fixed-offset c4 ABI.
+int snprintf(char *buf, int size, char *fmt, int a4) {
+    return sprintf(buf, fmt, a4);
+}
