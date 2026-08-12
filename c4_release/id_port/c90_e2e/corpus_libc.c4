@@ -19,6 +19,17 @@
 
 // ---- <stdlib.h> --------------------------------------------------------------
 
+// abort(): the c-torture suite calls abort() on a self-check FAILURE.  gcc's
+// libc abort() raises SIGABRT -> the process exits with code 134 (128+6).  The
+// c4 VM has no signal delivery, so we emulate the OBSERVABLE (exit 134) via the
+// exit syscall.  A byte-EXACT port never reaches abort() on a passing case, so
+// this only fires when the port genuinely diverges (correctly a FAIL), and it
+// makes the failing-case exit code match the gcc oracle's 134.
+int abort() {
+    exit(134);
+    return 0;
+}
+
 // calloc(nmemb, size): allocate nmemb*size bytes, zero-initialised.
 int calloc(int nmemb, int size) {
     int total;
